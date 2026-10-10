@@ -2,9 +2,10 @@
 
 A map of what stands between this tree and "builds and passes the fixture-tier gates on a DGX Spark", written for a
 person who owns one. Every claim about the code cites `path:line` as of main `6b630e5e` (sections 1–3.5; a line re-read
-on 2026-10-11 is at `61039d6e`) or `61039d6e` (sections 3.6, 7 and 8); a thing that was not seen is marked `[unverified]`, a number that is computed here is marked
-`[derived]`. The maintainers ran nothing on a Spark. A contributor's readings on two DGX Sparks are in section 1 and marked
-`[#13]` ([issue #13](https://github.com/midagedev/bloomery/issues/13)).
+on 2026-10-11 is at `61039d6e`) or `61039d6e` (sections 3.6 and 7; section 8's code citations were re-read at `cce176c5`);
+a thing that was not seen is marked `[unverified]`, a number that is computed here is marked `[derived]`. The maintainers
+ran nothing on a Spark. A contributor's readings on two DGX Sparks are in section 1 and marked `[#13]`
+([issue #13](https://github.com/midagedev/bloomery/issues/13)).
 
 Two earlier documents already sized this work: [`docs/research/machine-axes.md`](../research/machine-axes.md) (the
 `machineaxes` memo, 2026-09-27; its round names `sparkprep` S1–S4, `archkey`, `isarefuse` and "M1–M3" are used below) and
@@ -15,7 +16,8 @@ citations here are re-read. Related: [`new-model.md`](new-model.md) (the other c
 **Where it stands (2026-10-11).** P0 is in main ([#14](https://github.com/midagedev/bloomery/pull/14)). P1's `qdot`
 part is [#15](https://github.com/midagedev/bloomery/pull/15), reviewed. P2's pool invariant is
 [#16](https://github.com/midagedev/bloomery/pull/16), in review. The maintainers are finishing the unified tier, which
-section 7 needs. Section 8 is a design in progress. The Spark-prep rounds of the earlier memo:
+section 7 needs. Section 8 is the design for several Sparks: sourced link facts and derived bands, nothing run on two
+Sparks. The Spark-prep rounds of the earlier memo:
 
 | Round (memo name) | What | In the tree today |
 |---|---|---|
@@ -188,7 +190,8 @@ irrelevant to a whole-on-card run that never starts a host service.
 Placement assumes a discrete card, a PCIe host tier and an NVMe tier (`crates/placement/src/placement.rs:223-229`:
 `Machine { cards, tiers, host }`; there is no pool field at main, and the only `unified` under `crates/placement/src` is
 the cgroup reader's "unified hierarchy", `workstation.rs:726-747`; [#16](https://github.com/midagedev/bloomery/pull/16)
-adds `Machine::unified`, section 3.6).
+adds `Machine::unified`, section 3.6, and for several Sparks `host` and `unified` move into `nodes[0]` of a per-node
+`Machine`, section 8.2).
 
 **The double count, concretely.** Three readers see one pool:
 `cuDeviceTotalMem` (`crates/gpu/src/lib.rs:1789`), `cuMemGetInfo` (`:1995`, `:2302`: the card's `free_bytes`, which caps the
@@ -203,7 +206,7 @@ with the pool read as `MemAvailable` (plus what the load will drop), not `cuMemG
 
 | Term | On the Spark |
 |---|---|
-| H2D promotion over PCIe (`cuMemcpyHtoDAsync`, `crates/gpu/src/host/xstream.rs:1156,1194`; the staging rings `:267,694,1493`) | vanishes as a PCIe cost; a copy from pageable memory into a `cudaMalloc` buffer is still a DRAM-to-DRAM copy at half the pool's rate (reads and writes both cross it: 21.2 GB in ~0.16 s `[derived]`), negligible beside the file read |
+| H2D promotion over PCIe (`cuMemcpyHtoDAsync`, `crates/gpu/src/host/xstream.rs:1223,1261` at `cce176c5`; the staging rings `:283,760,1614`) | vanishes as a PCIe cost; a copy from pageable memory into a `cudaMalloc` buffer is still a DRAM-to-DRAM copy at half the pool's rate (reads and writes both cross it: 21.2 GB in ~0.16 s `[derived]`), negligible beside the file read |
 | Router D2H handoff and the host service protocol (`host/mod.rs:1-60`) | unused when no layer has host experts; works on `cuMemHostAlloc` pages (`host/tier.rs:561`, `xstream.rs:267`), the allocator NVIDIA recommends; correctness on Spark `[unverified]` |
 | CPU expert compute | stays possible but pointless: 20 Arm cores against 48 SMs on the same bytes. It is the path the fixture tier exercises (3.4) |
 | The pool's bandwidth | stays, as the single term (section 2) |
@@ -315,7 +318,7 @@ must exist before a contributor can start; "contributor" is what the Spark's own
 | **P2** a real model runs (the pool invariant: [#16](https://github.com/midagedev/bloomery/pull/16), section 3.6) | Clef-Flash, then Qwen3-30B-A3B and Qwen3.6-35B-A3B, answer from `bloomery-serve` on the Spark with a clean plan and `PoolOver` holding; a placement unit gate holds Σ card + host ≤ pool; the published P2 tape replayed byte for byte once it exists (answer 14) | `crates/placement/src/placement.rs` (`unified: Option<UnifiedPool>`), `workstation.rs` (`unified_of`, `host_of`), `crates/gpu/src/lib.rs` (`census` reads `CU_DEVICE_ATTRIBUTE_INTEGRATED`; free bytes from `MemAvailable` on an integrated device) | M | **Contributor** (`bloomery-placement` is a pure crate: the invariant is testable off the box); the shape is answer 11. **Maintainers first** for the tape clause: the P2 tape and its reference rows (answer 14) |
 | **P3** Spark-specific speed | the section 2 term measured; a Spark table with its own ruler; `--arch sm_121` rows | `justfile` + `tools/gate.sh` arch owner (S3), `ptx-shapes.tsv` per-arch rows, the fork's per-triple key (S2), `crates/threads` P/E split, `timing-card.sh` single-card mode | L | **Maintainers**: `archkey` and S2 (they touch every recipe and the fork pin). **Contributor**: the measurement, the table |
 | **P4** above the pool | a model larger than the pool (V4.1, GLM-5.3-Flash `UD-Q4_K_XL`) answers on one Spark with its overflow on the NVMe tier, the card computing the tier's experts from their slots; the section 7 term measured | the unified tier's slot seam (section 7), `crates/gpu/src/host/nvtier.rs`, the card leg | L | **Maintainers first**: the unified tier and its integrated-device seam. **Contributor**: the read-rate measurement, then runs and extends the seam on the Spark |
-| **P5** several Sparks (×2, ×4) | a model plans and runs across N linked Sparks under the section 8 criteria, N = 2 first; a placement unit gate holds the criteria at N = 1, 2, 4 | `crates/placement` (nodes and their link in `Machine`), the transport (section 8) | L | **Maintainers first**: the node/link shape and the criteria. **Contributor**: the link measurements on two Sparks, the transport, the N = 2 run |
+| **P5** several Sparks (×2, ×4) | a model plans and runs across N linked Sparks under the section 8 criteria, N = 2 first: split (a), the star, with raw verbs and a pump thread a node (8.5, 8.6); the placement unit gate `nodes_scale` holds the criteria at N = 1, 2, 3 and 4 (8.8) | `crates/placement` (`Machine { cards, tiers, nodes, fabric }`, `nodes_scale`), `crates/gpu/src/host/{mod,tier}.rs` (monotonic words, a `Link` seam), the transport (8.6) | L | **Maintainers first**: single-node P1 (the host-tier protocol on Arm); #16 with its doc line, then `host` and `unified` into `nodes[0]`; the per-node `Machine` and `nodes_scale`; the monotonic-word change and the `Link` seam; the `libibverbs` decision under `just deny` (8.9). **Contributor**: the two measurements of 8.9 (`ib_write_bw` / `ib_write_lat`, then the GPU flag ping-pong probe, which takes N as an argument), then the transport and the N = 2 run |
 
 Order inside P0: gate the import and the 39 functions first (the crate then compiles with every call site still behind
 `has_features`), then the predicate split of Q1, then `attn.rs`, then `ops.rs`. Each step can be checked by the cross check
@@ -364,7 +367,9 @@ The aarch64 build of P0 and the readings of section 1 are the contributor's reco
 ([#13](https://github.com/midagedev/bloomery/issues/13), [#14](https://github.com/midagedev/bloomery/pull/14)); the
 maintainers' checks ran on x86_64. Still open: LLVM 21 and `sm_121` PTX; the host-tier protocol's correctness on Arm
 (its spin sites, section 3.1); whether `fixture generate` needs only a source header; fixture fill determinism on
-aarch64; the card's read rate over pageable memory (section 7); the NVMe read rate on a Spark; every fact of section 8.
+aarch64; the card's read rate over pageable memory (section 7); the NVMe read rate on a Spark; of section 8, the latency of
+a direct link, small-message bandwidth in protocol mode, `cuStreamWaitValue32` on a page the NIC wrote, the hit rates, S₁,
+BW and the switch hop (8.10). Its link facts (8.1) are sourced.
 
 ## 7. Above the pool: the card computes the NVMe tier
 
@@ -408,46 +413,461 @@ bound by the tier's misses, whose flow model is the unified tier's.
 
 ## 8. Several Sparks (×2, ×4)
 
-Two or four Sparks can be linked through their NICs (ConnectX-7 `[unverified]`: no page section 1 read names it). The
-port count, the link rate, whether ×4 needs a switch, GPUDirect RDMA support on GB10 and NVIDIA's documented use of
-linked Sparks are `[unverified]` here; a design round is reading NVIDIA's pages, and this section takes its numbers when
-it reports. The contributor has two Sparks `[#13]`.
+This section is the result of a read-only design round (2026-10-11): no code, no run. The facts in 8.1 are NVIDIA's
+pages (two forum rows excepted, marked "user"), each with its URL and quoted line. Every figure in 8.4 and 8.7 is
+`[derived]` from section 2's cost model, the repo's byte counts and the assumptions stated once in 8.4. Nothing was
+measured on two Sparks. The contributor has two Sparks `[#13]`.
 
-**The shape.** A node is one unified machine (section 3.6). N nodes are a list with a link topology (a direct pair, or a
-switch), and no code is special to N = 2. With one node in the list the plan is exactly section 3.6's.
+### 8.1 Link facts
 
-**Three ways to split a model.** L is the layer count, `t_hop` one message's one-way latency on the link. Per decode
-token a message carries a hidden vector or a few rows of them, tens of KB, so the link's bytes are small and its latency
-is the term `[derived]`. A prompt is different: its bytes over the link grow with P (the prompt column), which is why
-today's prompt path moves the experts to the activations instead of the activations to the experts
-(`crates/gpu/src/host/xstream.rs:5-19`):
+Read by `curl` on 2026-10-11, with a text search for each quoted string. The two rows marked "user" are forum posts by
+users, not NVIDIA.
 
-| Split | Attention and KV | Per decode token | Per prompt of P tokens `[derived]` | What scales with N |
+| Fact | Exact text | Source |
+|---|---|---|
+| Ports and rate | "Each DGX Spark has two QSFP ports (sometimes called “ConnectX-7 ports”) on the back of the device. Each port provides up to 200 Gigabits per second (Gb/s), but the incoming speed is also determined by the cable that you use." | <https://docs.nvidia.com/dgx/dgx-spark/spark-clustering.html> |
+| Ports, hardware page | "2x QSFP Network connectors (ConnectX-7)" | <https://docs.nvidia.com/dgx/dgx-spark/hardware.html> |
+| Ethernet only | "The QSFP ports support Ethernet configuration only." (so RoCE, not InfiniBand: `[derived]` reading) | spark-clustering.html |
+| NIC to SoC | "The NIC connects independently to the two external QSFP ports, and it connects to the SoC through two independent PCIe Gen 5 x4 links." | spark-clustering.html |
+| ×2 direct, ×3 direct, ×4 with a switch | "It supports up to three DGX Spark systems connected directly through cables, and up to four systems when using a switch." | spark-clustering.html |
+| ×2: one cable | "One QSFP cable for direct 200GbE connection between two devices"; "Full bandwidth can be achieved with just one QSFP cable." | <https://raw.githubusercontent.com/NVIDIA/dgx-spark-playbooks/main/nvidia/connect-two-sparks/README.md> |
+| ×3: a ring, both ports | "1. Node1 (Port0) to Node2 (Port1) 2. Node2 (Port0) to Node3 (Port1) 3. Node3 (Port0) to Node1 (Port1)"; "Each CX7 port provides full 200GbE bandwidth." | <https://raw.githubusercontent.com/NVIDIA/dgx-spark-playbooks/main/nvidia/connect-three-sparks/README.md> |
+| ×4: a switch, one port a node | "Configure four DGX Spark systems for high-speed inter-node communication using 200Gbps QSFP connections through a QSFP switch."; "QSFP switch with at least 4 QSFP56-DD ports (at least 200Gbps each)"; "One cable per spark" | <https://raw.githubusercontent.com/NVIDIA/dgx-spark-playbooks/main/nvidia/multi-sparks-through-switch/README.md> |
+| No GPUDirect RDMA on GB10 | "the system memory returned by the pinned device memory allocators (e.g. cudaMalloc) cannot be coherently accessed by the CPU complex nor by I/O peripherals like PCI Express devices (e.g. the Mellanox NIC). Hence the GPUDirect RDMA technology is not supported, and the mechanisms for direct I/O based on that technology, for example nvidia-peermem (for DOCA-Host), dma-buf or GDRCopy, do not work." | <https://docs.nvidia.com/dgx/dgx-spark-porting-guide/porting/cuda.html> |
+| What to use instead | "for Linux RDMA applications based on the ib verbs library, we suggest to allocate the communication buffers with the cudaHostAlloc API and to register them with the ib_reg_mr function." | cuda.html |
+| Rate NVIDIA measured, one rail each | `ib_write_bw` at 65536 bytes: "92.57" and "97.28" Gb/s on the two RoCE devices of one cable, "Total throughput = 92.57 + 97.28 = 189.85 Gbps". The run printed "Number of qps : 1", "TX depth : 128", "Mtu : 1024[B]" and "PCIe relax order: ON": a pipelined stream with relaxed ordering on, not one message in flight | <https://raw.githubusercontent.com/NVIDIA/dgx-spark-playbooks/main/nvidia/connect-two-sparks/assets/performance_benchmarking_guide.md> |
+| One rail, about 100 Gb/s (user) | "TCP tests or IB tests on a single sub-interface will max out at ~100 GBps, but NCCL is able to use both and achieve full 200G." The unit is Gb/s: the same sentence says "full 200G", and NVIDIA's rows above read 92.57 and 97.28 Gb/s a rail | <https://forums.developer.nvidia.com/t/369673.json>, a user reply |
+| One rail alone (user) | "Rail 1 alone: 109.28 Gbit/s"; "Both rails, Gigabyte to ASUS: 98.02 + 98.02 = 196.04 Gbit/s" (two GB10 boxes of other makers, one cable) | <https://forums.developer.nvidia.com/t/376298.json>, a user report |
+| Latency | the guide names the `ib_write_lat` and `ib_read_lat` commands and prints no value. No source gives a latency for a direct link | `[unverified]` |
+| Write order without relaxed ordering | "relaxed ordering has the following impact: RDMA write-after-write message order is no longer guaranteed"; "a completion still ensures that all data is visible, including data from prior transfers." | <https://raw.githubusercontent.com/linux-rdma/rdma-core/master/libibverbs/man/ibv_reg_mr.3> |
+| Arm ordering | "some reorderings cannot happen on x86_64 but can happen on ARM"; "Multithreaded applications however must explicitly make use of memory barriers to ensure correct operation." | <https://docs.nvidia.com/dgx/dgx-spark-porting-guide/porting/memorder.html> |
+| What NVIDIA runs on linked Sparks: tensor parallel | two Sparks, vLLM: "Start the vLLM inference server with tensor parallelism across both nodes." with `--tensor-parallel-size 2`; TRT-LLM: "Qwen3-235B-A22B (two Sparks only)" with `--tp_size 2`; four: "If you are running with four or more sparks, you can comfortably run this model with tensor parallelism." | <https://raw.githubusercontent.com/NVIDIA/dgx-spark-playbooks/main/nvidia/vllm/README.md>, <https://raw.githubusercontent.com/NVIDIA/dgx-spark-playbooks/main/nvidia/trt-llm/README.md> |
+
+Derived from the rows above:
+- **A node's NIC cap is fixed by its SoC links, not by its port count `[derived]`.** Both ports reach the SoC over the
+  same two Gen 5 x4 links (2 × 15.75 GB/s raw a direction `[derived: 32 GT/s a lane, 128b/130b]`). One cable measured
+  189.85 Gb/s = 23.7 GB/s a direction, and one RoCE device with one QP saw 92.57 Gb/s = 11.6 GB/s. A ring of three (both
+  ports) and a switch do not raise the cap. Every node, the stage node included, has about 23.7 GB/s a direction
+  whatever N is.
+- One decode message (at most 131 KB, 8.4) rides one rail. A prompt batch can stripe over both rails.
+- A GPU cannot post to the NIC: without GPUDirect, the paths where a kernel rings the doorbell (IBGDA, NVSHMEM) rest on
+  the peer mapping that cuda.html says does not work (that no such path works on GB10 is `[unverified]`). A host thread
+  posts every send.
+
+### 8.2 The shape
+
+A node is one unified machine (section 3.6). A remote GB10 does what a tier card does today: it computes routed experts
+in place from a handoff and returns rows. `Device::Card(i)` over `all_cards()` already names such a card, so the second
+node is a node, not a new device kind. It cannot be a tier with a link cost on today's `Machine`: #16's `PoolOver` sums
+every card of `all_cards()` into one pool, so a remote tier would be charged to node 0's pool, and node 1's host-side
+rows and arena to node 0's host.
+
+The owner shape. None of it is in the tree (`Machine` is `{ cards, tiers, host }` at main,
+`crates/placement/src/placement.rs:223-229`; #16 adds `unified`):
+
+```rust
+pub struct Card { /* … */ pub node: usize }       // an index into Machine::nodes; 0 is this process's node
+pub struct Machine { pub cards: Vec<Card>, pub tiers: Vec<Card>,
+                     pub nodes: Vec<Node>,        // nodes[0]: #16's `host` and `unified` move here
+                     pub fabric: Fabric }
+pub struct Node { pub host: Host, pub unified: Option<UnifiedPool>,
+                  pub nic: u64 }                  // bytes/s a direction, the SoC side (8.1: about 23.7 GB/s)
+pub enum Fabric { Alone,                          // N = 1: every machine today
+                  Pair { link: Link },            // N = 2, one cable
+                  Ring { link: Link },            // N = 3, both ports
+                  Switch { link: Link, hop_ns: u64 } } // N = 4: NVIDIA's ×4 is switched
+pub struct Link { pub rail: u64 /* bytes/s, one message */, pub round_trip_ns: u64 }
+```
+
+- **#16 lands as it is**, with one doc line on `unified` and `host`: "this process's node", so nothing reads them as
+  machine-wide. The maintainers then move both into `nodes[0]`: a move-class change in a pure crate, every caller
+  through one accessor, before any remote node exists. With one node in the list the plan is exactly section 3.6's.
+- `CardOver` stays per card. `HostOver` and `PoolOver` run once per node, over the cards whose `node` matches.
+  `HostNeed` gains no field and is evaluated per node.
+- **Node 1's figures come from a remote census.** The census reads only this process's CUDA devices. Node 1's `CardSpec`
+  and its `MemAvailable` reading must reach node 0 over the control channel before `plan_tiers` runs.
+- **One rule term, common to every family.** A tier takes "each layer's next ids after the stage's prefix"
+  (`crates/placement/src/placement/workstation.rs:352-362`). Over a link the rule spreads the hot ids to reach the read
+  share s that balances `Sh + s·R = λ·BW + (1 − s)·R` per layer (terms in 8.4). A, Sh and R come from the plan's own
+  tensor bytes and roles, so no model supplies them. On the box's PCIe the same formula holds with the lane's rate, so
+  it is one owner for both machines, not a Spark branch.
+- **With the unified tier.** The second node is a compute site with its own residency, not one more tier in the read
+  path: reading a remote V4.1 expert costs 16.8 MB / 11.6 GB/s = 1.4 ms, against 16.8 MB / 219 GB/s = 77 µs to compute
+  it in place `[derived]`. The tier's ledger gains a node column, (node, id) to state. Node 1 runs its own books over
+  its own pool, arena and file copy. On a unified node a card slot and a host segment collapse (section 7), so a node's
+  states are pool, arena and file. One new move is pool of node 0 to pool of node 1: a link copy of an expert (0.7–1.4
+  ms) on a background lane, at a step boundary, rare. The router's counts go to node 1 once a window for its arena
+  eviction and drive the cross-node balance. The unified tier's per-node byte ledger, plan-time rule and prefetch rounds
+  are the ones this touches. None needs to change now.
+
+### 8.3 Three ways to split a model
+
+L is the layer count, `t_hop` one message's one-way latency on the link. Per decode token a message carries a hidden
+vector or a few rows of them, tens of KB, so the link's bytes are small and its latency is the term `[derived]`. A
+prompt is different: its bytes over the link grow with P, which is why today's prompt path moves the experts to the
+activations (`crates/gpu/src/host/xstream.rs:5-19`) and no expert ever crosses the link in (a).
+
+| Split | Attention and KV | Per decode token | Per prompt batch of P = 4096 tokens `[derived]` | What scales with N |
 |---|---|---|---|---|
-| (a) remote expert tiers: plan (b′) (`crates/placement/src/placement/workstation.rs:352-362`), one stage node runs every layer and the head, each other node holds and computes a share of the experts, the link in place of PCIe | on the stage node | about 2·L messages to each remote node, all through the stage node's NIC (today's tier protocol per tier layer: the handoff image out and the rows back, with a go and a done word, `crates/gpu/src/host/tier.rs:6-11`; four bus crossings, since the host-mapped page is the intermediary) | per layer the image, about P × n_embd B as q8_1, out and the rows, P × n_used × n_embd × 4 B, back: 0.94 GB a layer at P = 4096 with n_embd 7168 and n_used 8; or the expert bytes once per prompt unit, when the experts move to the stage node as today | capacity, and the expert bytes each node reads; the stage node's NIC carries every message, so it can become the max resource as N grows |
-| (b) pipeline by layers | each node holds its layers' KV | N − 1 messages | P × n_embd × 2 B at each of the N − 1 node boundaries | capacity only: one request still walks the nodes in turn; several requests fill the pipeline |
+| (a) remote expert tiers: plan (b′) (`crates/placement/src/placement/workstation.rs:352-362`): one stage node runs every layer and the head, each other node holds and computes a share of the experts, the link in place of PCIe | on the stage node | about 2·L messages to each remote node, all through the stage node's NIC (today's tier protocol per tier layer: the handoff image out and the rows back, with a go and a done word, `crates/gpu/src/host/tier.rs:6-11`) | per layer the image out (P × n_embd values: q8_1 for V4.1, f32 for GLM and Qwen3.8) and the rows back (one f32 row of n_embd per remote slot, about k/2 a token); out + back a batch: V4.1 11.0 GB (back 10.1), GLM 14.1 GB (back 11.3), Qwen3.8 12.1 GB (back 10.1) | capacity, and the expert bytes each node reads; the stage node's NIC carries every message, so it can become the max resource as N grows |
+| (b) pipeline by layers | each node holds its layers' KV | N − 1 messages | P × 16 × n_embd B (the 4 hc streams in f32) at each of the N − 1 node boundaries: V4.1 336 MB, GLM 268 MB, Qwen3.8 168 MB | capacity only: one request still walks the nodes in turn; several requests fill the pipeline |
 | (c) expert-parallel: every node computes its share of each layer's experts in parallel | every node runs attention on the same hidden state, so the KV cache is held N times; without that, (c) is (a) | about 2·L messages per node pair, spread over the NICs | per layer every node's partial sums, P × n_embd × 4 B, to each other node | capacity and the per-node byte term, if the expert bytes are balanced |
 
 Decode on one Spark is bound by the pool's bytes (section 2). (a) and (c) split those bytes over the nodes and add the
-latency term; (b) adds latency and splits no bytes for one request.
+latency term; (b) adds latency and splits no bytes for one request. (d), tensor parallel, is what NVIDIA documents: 8.5.
 
-**Scaling criteria.** Each one is a numeric condition that a `bloomery-placement` unit gate holds on synthetic machines
-at N = 1, 2 and 4 (a pure crate: it runs on a Mac). The bands come with the design round's numbers:
-1. The link's latency term stays under a stated share of the step at every N.
-2. The per-node pool bytes, the KV cache's share included (the attention column), are balanced within a stated band.
-3. No node's NIC is the max resource in the per-token resource timeline: per node and layer, its messages × the
-   per-message cost plus its bytes / rate stay under the layer's byte time at that N. A star of remote tiers around
-   one stage node loses this first, at the stage node's NIC.
-4. Prefill: `pp tok/s @ P = 512 and 4096` at each N, with the prompt column's bytes over the link under the prompt's
-   compute time; the prompt path is judged on it like the decode path.
-5. No host thread stands on the per-layer path. Today's go is a card-side store inside a captured graph
-   (`crates/gpu/src/host/tier.rs:37-47`); over a NIC that is device-initiated RDMA, whose GB10 support is
-   `[unverified]`, or a host proxy 2·L times a token.
-6. N = 1 plans exactly as a single Spark.
-7. A node that stops signalling ends the request by name, as a lost tier card does today
-   (`crates/gpu/src/host/tier.rs:49-50`); no failover.
+### 8.4 Bands `[derived]`
 
-**First step, N = 2.** The contributor measures one-way latency and bandwidth for 16–64 KB messages between two Sparks
-over the transport the design picks (NCCL or RDMA verbs), with each node's card reading and writing the buffers. What
-carries to N = 4 unchanged: the node list, the link term in the cost model, the transport, and the unit gate's
-criteria; what N = 4 adds is the topology.
+**Assumptions, stated once.** Every figure below holds under them; none was measured on a Spark.
+- **BW**, the pool read of our kernels: 219 GB/s, the 80 % of 273 GB/s that section 2 assumes (band 200–235). It is
+  section 2's one term, unmeasured.
+- **λ**, the exposed round trip a layer, link and protocol: 25–70 µs. Terms: two one-way RDMA trips of 3–8 µs `[assumed:
+  no direct-link source]`; send serialization 0.5–1.4 µs and rows serialization 4.4–11.3 µs at 11.6 GB/s (51–131 KB);
+  two pump wake-ups of 1–3 µs `[assumed]`; two stream-wait passes of 2–5 µs `[assumed]`; the tier graph's copy nodes
+  (`c_node` 0.85 µs, `docs/plan.md:71`). The one measured protocol number in the repo is the host-tier bridge floor,
+  21–36 µs a layer on PCIe (`docs/plan.md:78`).
+- **U**, the usable pool a node for model, KV and scratch: about 115 GB `[assumed]`. Section 1 reads 116.6–116.9 GiB
+  (125 GB) of idle `MemAvailable` on a Spark `[#13]` and #16 reads it at plan time, so U is a cautious planning figure.
+- **NVMe**: 6.77 GB/s, our box's drive at queue depth 16 (`docs/cards/qdsweep.card`). A Spark's drive rate is
+  `[unverified]`.
+- N = 4 adds a 1.5 µs switch hop and 1 µs for a further post `[assumed]`.
+- The non-byte "rest" of a step (launch chain and latency, 2.6–4.4 ms a token, section 2) is not in the bands. It lowers
+  every absolute figure by about 5–15 % and moves the ratios by under 5 % `[derived at the GLM and Qwen3.8 midpoints]`.
+- V4.1 and GLM hit rates on one node (ρ₁ 0.6–0.75 and 0.75–0.9) and on two (ρ₂ 0.93–0.98) are `[assumed]`. The V4.1 and
+  GLM bands are only as good as they are.
+- The (a) figures come from a Monte Carlo of the per-layer window: each routed slot lands on node j with the ownership
+  probability the rule picks, and the window is the max over the nodes of `Sh + slots·e` (node 0) or `λ + hop + posts +
+  rows ingress + slots·e` (a remote). Node 0's share is optimized: 0.55–0.72 at N = 2 for Qwen3.8 and 0.07–0.15 at N = 4
+  for GLM and V4.1. The script moves into `tools/` beside the gate (8.8).
+
+**Model terms** `[derived]` from each model's tensor table (file sizes: `docs/models.md`):
+
+| Term | V4.1 `Q3_K_M` | GLM-5.3-Flash `UD-Q4_K_XL` | Qwen3.8 `UD-Q4_K_XL` |
+|---|---|---|---|
+| MoE layers L | 40 | 42 | 48 |
+| `n_embd` | 5120 | 4096 | 2560 |
+| experts / top-k k / expert ff | 384 / 6 / 2304 | 288 / 8 / 2048 | 512 / 10 / 640 |
+| bytes an expert | 16.77 MB | 15.20 MB | 3.17 MB |
+| R, routed bytes read a token (k × e × L) | 4.03 GB | 5.11 GB | 1.52 GB |
+| Sh, shared and dense FFN a token | 0.8–1.5 GB | 1.4 GB | 0.14 GB |
+| A, attention, norms, router and head a token | 3.2–5.8 GB | 4.7–8.2 GB | 3.4–4.4 GB |
+| file; fits | 347.3 GB; neither one nor two Sparks | 199.7 GB; two, not one | 111.3 GB; one, marginal |
+
+**The per-layer model.** A layer is `attention → router → handoff → [node 0: shared + its routed share ‖ node 1: λ + its
+routed share] → join`. The next layer's attention needs the join, so node 1 idles through node 0's attention.
+- (a) per token: `t = A/BW + max(Sh + s·R, λ·BW·L + (1−s)·R)/BW`. With s balanced, `t = A/BW + (Sh + R)/(2·BW) + L·λ/2`.
+- **Routing imbalance.** A node owns a fixed set of experts, and a token's k slots fall on the two nodes about
+  Binomial(k, ½). The join waits for the larger half: E|X − k/2| is 0.94 slots at k = 6, 1.09 at k = 8 and 1.23 at k =
+  10, which is 2.87 ms (V4.1), 3.19 ms (GLM) and 0.85 ms (Qwen3.8) a token. With two requests the union averages it
+  down. In a prompt it is negligible. The lever that removes it: copy the hot experts to both nodes and pick the node
+  per token (Qwen3.8 has the room; the handoff kernel must write places per token).
+- Gain over one node, when the model fits it: `ΔT = L·(F_l/BW − λ)/2 − L·Δ_l/BW`, with `F_l = (Sh + R)/L` and Δ_l the
+  per-layer imbalance. The break-even per-layer round trip is `λ* = (F_l − 2·Δ_l)/BW`: **Qwen3.8 122 µs, GLM 556 µs,
+  V4.1 410–490 µs**.
+- (b) with one request in flight: the wall is the sum of the nodes plus the hops. With two in flight, the max.
+- (c) with one request equals (a) at a fixed s = 0.5, and both nodes carry the dense weights. With two requests,
+  attention is data-parallel (one request a node) and the all-to-all runs both ways: `t = (A + Sh + R(2)/2)/BW + L·λ`,
+  with R(2) the routed bytes of the two tokens' union.
+
+**Capacity** (pools N × about 115 GB):
+
+| N | V4.1 (needs about 268 GB resident) | GLM (about 203 GB) | Qwen3.8 (about 114 GB) |
+|---|---|---|---|
+| 1 | no: about 154 GB of routed on NVMe | no: about 88 GB on NVMe | yes, marginal |
+| 2 | no: about 43 GB on NVMe ((b): about 19 GB a node) | yes, about 25 GB spare | yes |
+| 4 | yes, about 190 GB spare ((b) about 67 GB a stage; (c) adds 6 GB of dense a node) | yes ((c) adds 11.4 GB of dense a node) | yes |
+
+For Qwen3.8 at N = 2 under (a), node 0 holds about 75 GB (4.5 non-routed + 28.8 PLE + about 39 routed + KV) against
+about 114 GB on one node, and node 1 about 40 GB.
+
+**Decode, tok/s, one request / N requests in flight (total):**
+
+| Split | N | V4.1 | GLM | Qwen3.8 |
+|---|---|---|---|---|
+| one node | 1 | 3.5–5.6 (NVMe) | 3.9–8.3 (NVMe) | 36.1–43.3 |
+| (a) star | 2 | 15.6–29.1 (with NVMe) / 21–40 | 17.5–24.9 / 28.4–37.4 | 37.8–47.8 / 65.7–80.4 |
+| (a) star | 4 | 25.8–39.2 / 70.3–91.7 | 19.3–29.2 / 54.1–70.7 | 38.8–50.7 / 122.7–151.2 |
+| (b) pipeline | 2 | 10.7–21.1 / 21–42 | 14.9–19.6 / 29.8–39.1 | 36–43 / 72–87 |
+| (b) pipeline | 4 | 20.0–26.1 / 80–105 | 14.9–19.6 / 59.5–78.1 | 36–43 / 144–173 |
+| (c) EP, data-parallel attention | 2 | about (a) / 35.1–46.1 pool only, the NVMe term on top | about (a) / 26.8–35.2 | about (a) / 62.0–78.3 |
+| (c) EP | 4 | about (a) / 65.6–84.6 | about (a) / 50.7–65.6 | about (a) / 119.7–149.8 |
+
+- One node with two requests in flight, for comparison: Qwen3.8 58.5–67.6, GLM 4.4–9.6, V4.1 3.8–6.0 tok/s in total.
+- (b) with one request is the one-node pool time plus N one-way hops, whatever N is.
+- For V4.1 the NVMe term dominates the one-node and N = 2 columns. The ratio is only as good as ρ₂. The unified tier's
+  prefetch is the lever that hides it.
+- For Qwen3.8, A is 67–73 % of the bytes, so (a) gains 1.05–1.10× at one request on two nodes.
+
+**Prompt, P = 4096, in units of S₁** (one node's in-pool prompt rate at this P, a rate of a card and model pair;
+**S₁ is unmeasured on a Spark**) **and the absolute cap that binds:**
+
+| Split | N = 2 | N = 4 | Cap that binds |
+|---|---|---|---|
+| (a) star | V4.1 1.47, GLM 1.43, Qwen3.8 1.17–1.22 × S₁ | 1.92, 1.82, 1.28–1.37 × S₁ | Amdahl on node 0's attention, `1/(1−φ+φ/N)` with φ the FFN share of the active parameters (V4.1 0.64, GLM 0.60, Qwen3.8 0.29–0.36); then node 0's NIC ingress, `nic / (L·k·(N−1)/N·4·n_embd)`: V4.1 9,644, GLM 8,610 and Qwen3.8 9,644 tok/s at N = 2; 6,429, 5,740 and 6,429 at N = 4 |
+| (b) pipeline | 1.78 × S₁ | 2.91 × S₁ | the bubble, `N·m/(m+N−1)` with m = 8 ubatches; the NIC never binds (at most 1.0 GB a batch) |
+| (c) EP, N prompts at once | about N × S₁ less the all-to-all | same | each node's NIC: 7,527 / 4,305 / 4,822 tok/s a node at N = 2 and 5,018 / 2,870 / 3,215 at N = 4 (V4.1 / GLM / Qwen3.8) |
+| one node, NVMe-bound | — | — | V4.1 at most 178 tok/s (154 GB at 6.77 GB/s = 22.7 s a batch); GLM at most 315 (13 s). At N = 2, V4.1 at most 1,280 (43 GB over two drives) |
+
+- **The fit term is larger than any of these.** One Spark reads the routed set it lacks from NVMe on every batch,
+  because P = 4096 touches nearly every expert: V4.1 about 154 GB, 23 s at 6.77 GB/s, against about 3.2 s on two Sparks
+  under (a) (about 43 GB over two drives); GLM 88 GB, 13 s, against 0 on two.
+- (a)'s link time a prompt token on both rails is 104 µs (V4.1, Qwen3.8) to 116 µs (GLM). It sits under a prompt's
+  compute when it overlaps per ubatch: the box's fastest P = 4096 prompt, Qwen3.8 on the A6000, is 1,673 tok/s = 598 µs
+  a token (`README.md`), and a Spark is not faster `[assumed]`.
+
+**Link bytes and messages per decode token, one request:**
+
+| Split | N = 2 | N = 4 | Who carries it |
+|---|---|---|---|
+| (a) star | V4.1 3.08 MB, 80 messages; GLM 3.99 MB, 84; Qwen3.8 2.45 MB, 95 | V4.1 4.98 MB, 211; GLM 6.84 MB, 237; Qwen3.8 3.98 MB, 250 | all on node 0's NIC; per layer at most 2·min(k, N−1) messages |
+| (b) pipeline | one boundary (16·n_embd B: 82, 66, 41 KB) and a token id | N − 1 boundaries and a token id | spread: each NIC one in, one out |
+| (c) EP | as (a) with uniform ownership | as (a) | spread: each node at most 4(N−1) a layer |
+
+**One GLM decode layer under (a), one request, N = 2 (midpoints), the resource timeline:**
+
+| Resource | Busy | Note |
+|---|---|---|
+| Node 0 pool and SMs | 0.70 ms attention (154 MB) + 0.38 ms window (shared + s·R) | serial: the attention is on the critical path |
+| Node 1 pool and SMs | 0.33 ms (its routed share) | idle through node 0's attention: 31 % busy |
+| Link | 16 KB out and 64 KB back: 1.4 + 5.6 µs of wire + 2 × 3–8 µs | under node 0's window when λ < λ* |
+| Host CPU | a pump on each node, about 2 µs a layer each | a spinning core, as the host tier's service is today |
+| NVMe | 0 | everything in the pools |
+
+The wall is A plus the max of the two FFN halves, not the sum of the five resources. Flow levers checked: **asynchrony**
+(stagger two requests so node 1 works during node 0's attention) loses to batching them, because node 0 would read the
+attention weights twice (a GLM layer for two requests: 1.70 ms staggered, 1.34 ms batched); **bulk** is already one
+message each way a layer; **SIMT** over the batch is the existing columns form (`Chain::Cols`). The only lever left on
+the serial A is tensor parallel (8.5).
+
+**Which resource is the max, and where each split stops scaling:**
+- **(a), one request.** The floor is `A/BW + L·(λ + e/BW)`: the attention is never split, and the routing imbalance
+  keeps the window from falling as 1/N (the FFN window gains only 1.1–1.5× from N = 2 to 4). Latency: `L·λ` inside the
+  FFN window, half-shadowed at N = 2; at N = 4 node 0 keeps few slots (about 0.1 for GLM and V4.1), a remote is always
+  the max and the term is fully exposed: 1.2–3.1 ms.
+  - Qwen3.8 stops at N = 2: N = 4 adds 2.6–6 %.
+  - GLM gains 10–17 % at N = 4; its ceiling at the A/BW floor is 27–46.5 tok/s.
+  - V4.1 keeps scaling to N = 4 because the NVMe term leaves; its floor is 38–68 tok/s.
+  - The star does not stop on the NIC in decode (at most 131 KB a layer, 5.5 µs of serialization against layers of 0.4
+    ms or more). It stops on the NIC only in prompt: (N−1)/N of the rows arrive at node 0, so its cap falls from about
+    9.6k to 6.4k tok/s.
+  - The max resource at every N is node 0's pool on the serial attention. In the FFN window it is a remote node's
+    imbalance plus λ. In prompt it is node 0's attention compute, then its NIC ingress.
+- **(b)** never scales one request, and each node adds a hop (at most 40 µs in all). It scales throughput linearly while
+  the requests in flight are at least N, and the prompt as `N·m/(m+N−1)`. It stops when m < N. One request: the sum of
+  all pools; N requests: the slowest stage.
+- **(c)** scales throughput with N requests, but every node re-reads the dense weights, the all-to-all latency is
+  exposed (`L·λ`, 1.0–3.4 ms), and each node's NIC caps its prompt (2,870 tok/s a node for GLM at N = 4).
+
+### 8.5 Recommendation, and tensor parallel
+
+1. **(a), the star, for one request: plan (b′) with the second Spark as the expert tier and the link in place of PCIe.**
+   - It keeps the bits. The join already reads one f32 row per routed slot from the tier
+     (`crates/gpu/src/host/tier.rs:19-23`), so moving those bytes over RDMA moves no float.
+   - Every family already has a tier path: `TierAct::Q8` for V4.1 (`crates/gpu-deepseek41/src/body.rs:2613`),
+     `TierAct::F32` for GLM (`crates/gpu-glm5next/src/tier.rs:461`) and Qwen3.8
+     (`crates/gpu/src/arch/qwen3moe/tier38.rs:563`). It needs no new device kind.
+   - **The gain comes from fit, not from a second memory bus.** Per decode layer (a) halves only the FFN bytes;
+     attention stays serial on node 0. GLM (fits two Sparks, not one): 17.5–24.9 tok/s against 3.9–8.3 on one,
+     NVMe-bound. V4.1 (fits neither): the NVMe share of routed reads falls from about 25–40 % to 2–7 % and the rate from
+     3.5–5.6 to 15.6–29.1 tok/s, on assumed hit rates. Qwen3.8 (fits one): 1.05–1.10× at one request, and the real gain
+     is room, node 0 dropping from about 114 to about 75 GB, which frees context.
+2. **(b), pipeline by layers, as a second mode on the same node shape**, for several requests in flight: with two
+   requests it ties or edges (a), and it is the better prompt split (1.78 × S₁ at N = 2). It fits the shape as two stage
+   cards with layer ranges on two nodes (`cards` is already in stage order, and plan (b) staged V4.1 on both PCIe
+   cards).
+3. **(c) is left out.** Two stage cards that each run all layers for different requests and share experts are a replica
+   kind, which the shape does not have.
+
+**Tensor parallel, TP = 2, is what NVIDIA documents** (8.1: vLLM `--tensor-parallel-size 2`, TRT-LLM `--tp_size 2`).
+`[derived]` `t = (A + Sh + R)/(2·BW) + L·m·λ` with m sync points a layer. At m = 2 on two nodes it reads GLM 25–36 tok/s
+and Qwen3.8 49–71 tok/s at one request, which beats (a) where A dominates. It shards every family's attention and dense
+kernels (an MLA latent cache replicated), changes the float sum order (a row-parallel all-reduce; column-only splits
+avoid that but take 2–4 gathers a layer), and needs an NCCL-class all-reduce every layer. It is the ceiling to remember,
+not the first step: a per-family rewrite against "Common code first". Whether to take it instead is the maintainers'
+decision.
+
+### 8.6 Transport
+
+**Raw verbs (rdma-core) under our own word protocol, with one host pump thread per node.** NCCL is the fabric check
+(`all_gather_perf` per NVIDIA's NCCL playbook), and the fallback only if the probe of 8.9 shows our pump path slower
+than NCCL's point to point. Without GPUDirect NCCL stages through host bounce buffers with its proxy thread `[derived
+from the cuda.html line; NCCL internals unverified]`, and a send or receive kernel per message would occupy SMs. The
+handoff image already lives in `cuMemHostAlloc` pages (`crates/gpu/src/host/tier.rs:561`), which is what 8.1's "what to
+use instead" asks for, so the NIC reads the same LPDDR with no copy. The protocol stays `host/mod.rs`'s alone
+(`crates/gpu/src/host/mod.rs:56-58`), behind a `Link` seam with two impls: the shared page (PCIe, identity, a move-class
+change) and mirrored pages (RDMA). A raw-verbs build adds `libibverbs`, whose licence under `just deny` is
+`[unverified]`.
+
+What `crates/gpu/src/host/mod.rs` and `tier.rs` need to cross a node:
+1. **Two pages, one a node.** Every word keeps one writer node. The link mirrors a region one way, one RDMA write a
+   message.
+2. **Monotonic single-writer words.** Today the go counter is added to by the stage and taken back by the tier, and the
+   done counter the other way (`tier.rs:14-18`): two writers, at different times. A mirrored absolute write would erase
+   the remote decrement. Each becomes a generation the writer stores and the reader waits on with greater-or-equal. This
+   is box-provable first on PCIe: the bits are identical and the wait condition changes.
+3. **A pump thread a node.** The card cannot post to the NIC. The pump load-acquires the go generation (Arm needs an
+   explicit acquire: the memorder row) before posting. The card's system-scope barrier before go
+   (`crates/gpu/src/host/mod.rs:20-24`) orders the image before the word.
+4. **Data before flag across the NIC.** Register the pages without `IBV_ACCESS_RELAXED_ORDERING`, so write-after-write
+   order holds (the `ibv_reg_mr` row), with the flag last on the same QP. Or use write-with-immediate, where the remote
+   pump writes the flag after the completion: one more hop, ordered by the completion rule. NVIDIA's perftest ran with
+   relaxed ordering on, so its bandwidth is not protocol-mode bandwidth.
+5. **The remote is another process.** Node 1 runs a tier server: it loads its experts from its own copy of the file,
+   captures its graphs from the go order it is sent at load, and launches a replay on a "replay r of chain c" message,
+   which the first image can carry (today the stage process launches the tier's graph, `tier.rs:36-41`). Before the
+   plan, the same channel carries node 1's census to node 0.
+6. **Loss.** The go deadline already names a lost tier (`tier.rs:48-53`, `CardLost`). A down link also means the stage
+   cannot write `RELEASE` to node 1's words, so node 1 needs its own deadline that drains its streams.
+7. **Faults and sequence.** The tier's fault-word copy already rides before its signal (`tier.rs:41-43`). The handoff's
+   sequence word detects a stale or doubled image across the mirror.
+
+### 8.7 Scaling criteria
+
+One numbered list. Criteria 1–8 are numeric conditions that the unit gate of 8.8 holds on synthetic machines at N = 1,
+2, 3 and 4; criteria 9–11 are held by runs and review. The planner gains a predictor, `Plan::predict(&Workload) ->
+Prediction { step, per_node: { pool, nic, msgs_per_layer } }`. It reads the plan's own tensor bytes and roles, the card
+spec's BW, the nodes' `nic` and the fabric's `Link`, and needs no model file and no per-model code. The workload carries
+decode at n in {1, N} and the prompt at P = 4096 with its S₁ (a rate of a card and model pair, so on the workload, not
+the card spec). The thresholds come from a machine parameter, `ruler`: the useful-gain line is 2 × the machine's 95 %
+interval. The box's default is 2 % (A6000, SD 0.6 %); a Spark's own A/A sets its value (section 3.5). Our ruler is never
+baked in.
+
+**Only criterion 1 refuses a plan**, as `CardOver` and `HostOver` do. Criteria 2–7 are **objectives** (6 is a structural
+assertion): the planner chooses which nodes it uses, the ownership and later the prompt mode to meet them, and where it
+cannot it names why (`NodeIdle { reason }`, a prompt-mode note). An unset `--place` on four Sparks still plans. Criteria
+8–11 carry over from the earlier list and are not in S1–S6 of the design round.
+
+1. **Pool (S2-i), the one hard refusal.** Every node's planned need is at most its pool: `PoolOver` per node. Today's
+   `PoolOver` charges every card to one pool.
+2. **Link share (S1), objective.** The exposed link term is at most 10 % of the predicted step; drop nodes until it
+   holds. N = 2 to 4 gains 3–17 % of the step under (a), and a link term above 10 % cancels it where A dominates.
+3. **Fill (S2-ii), objective.** The remote nodes' fills are within 10 % of each other, and node 0 keeps its KV reserve.
+   Uneven fills move heat to one remote.
+4. **Balance (S3), objective.** The max over the nodes of the predicted FFN read time is at most (1 + 2.5 × ruler) times
+   the rule's optimum. The window is 25–50 % of the step at N = 2, so 5 % of it is 1.25–2.5 % of the step.
+5. **NIC (S4), objective.** Every node's NIC is busy at most 50 % of the decode step and of the predicted prompt batch;
+   where it is not, the prompt mode moves (a later (b) mode, or a remote weighted sum where its float class is
+   accepted). At ρ = 0.5 the M/D/1 mean wait is half a 64 KB message, at most 3 µs, inside λ's band. A star of remote
+   tiers around one stage node loses this first, at the stage node's NIC, in prompt.
+6. **Messages (S5), structural.** Per layer at the busiest node: at most 2·min(k, N−1) for (a), 2 for (b), 4(N−1) for
+   (c), never O(k·N); messages × `c_post` (1 µs `[assumed]`) at most 2 % of the layer. One message per slot would be 30
+   posts a layer for Qwen3.8 at N = 4. A unit assertion.
+7. **Never slower (S6), objective.** Each node used gains at least 2 × ruler (2 % on the box) over the plan without it;
+   otherwise `NodeIdle { reason }`. A smaller gain cannot be confirmed by an A/B.
+8. **N = 1 plans exactly as a single Spark** (gate clause 1).
+9. **Prefill.** `pp tok/s @ P = 512 and 4096` at each N is measured and judged like decode, in the machine's own table;
+   the prompt predictor of criterion 5 is checked against it. It is a run criterion, not a unit-gate clause.
+10. **Host threads.** One pump thread a node posts every send, because no GPU path to the NIC works on GB10 (8.1, 8.6).
+    Its cost, two wake-ups of 1–3 µs a layer, is inside λ, so criteria 2 and 6 hold it. No other host thread stands on
+    the per-layer path. This replaces the earlier "no host thread" wording.
+11. **A lost node ends the request by name**, as a lost tier card does today (`tier.rs:48-53`): the go deadline names
+    it, and node 1's own deadline drains its streams (8.6, item 6). No failover.
+
+**Where each fires** `[derived]`, one row per model, N in {1, 2, 3, 4}, λ in {25, 70} µs, A low and high, and the prompt
+at S₁ in {1,000, 3,000} tok/s (the pins of the gate in 8.8):
+
+| Model | Decode step (ms), N = 1 → 2 → 3 → 4, λ 25 / 70, A low | Criterion 2 fires | Criterion 7 fires | Criterion 5 fires (prompt) |
+|---|---|---|---|---|
+| Qwen3.8 | 23.1 → 20.9 / 21.9 → 20.1 / 21.4 → 19.7 / 21.2 | N = 4, λ 70, A low (2.34 ms exposed = 11 %) | N = 3 at λ 70 with A high; N = 4 in every cell (node 3 gains under 2 %) | N ≥ 3 at S₁ 3,000 (busy 51–64 %) |
+| GLM | 51.2 → 40.3 / 41.3 → 36.3 / 37.6 → 34.3 / 35.9 | never | never | N ≥ 3 at S₁ 3,000 (77–95 %) |
+| V4.1 (pool only) | 38.2 → 30.1 / 31.1 → 27.0 / 28.3 → 25.5 / 26.9 | never | never | N ≥ 3 at S₁ 3,000 (72–90 %) |
+
+Nothing fires at S₁ = 1,000. At N = 2 nothing fires except GLM's prompt, which sits on the 50 % line (4,286 against
+8,610): the gate's boundary case, at ≤ and not <.
+
+### 8.8 The gate: `nodes_scale`
+
+None of this exists yet. It is what the maintainers build with the shape of 8.2. `nodes_scale` is a set of unit tests in
+`crates/placement`, a pure crate, so `just mac-test` and the box's lib gate both run it.
+- **Machines.** `workstation::spark_nodes(n, fabric)` builds synthetic GB10 nodes (`integrated: true`, a 115 GB pool,
+  `nic` 23.7 GB/s): N = 1 `Alone`, 2 `Pair`, 3 `Ring`, 4 `Switch`. `Link` is set at λ = 25 and 70 µs and `ruler` at the
+  box default.
+- **Models.** Three synthetic shapes carry 8.4's terms for V4.1, GLM and Qwen3.8 (L, `n_embd`, k, e, A low and high,
+  Sh). No file is read.
+- **Expected sets.** The table of 8.7, pinned from a derivation script that moves into `tools/` beside the gate with its
+  own self-test, so the pins have one derivation.
+- **Clauses:**
+  1. `n1_is_today`: every N = 1 plan equals today's plan byte for byte.
+  2. `pool_per_node`: criterion 1 refuses V4.1 whole at N = 2 and places it whole at N = 4. No other machine is refused.
+  3. `read_balance`: criterion 4 holds on every plan.
+  4. `link_share`: criterion 2 holds on the chosen plan. Qwen3.8 at N = 4, λ 70, A low uses at most 3 nodes.
+  5. `nic_not_max`: criterion 5 either holds or carries the named prompt-mode note, exactly in the cells of the "fires"
+     column.
+  6. `messages_o_n`: criterion 6.
+  7. `never_slower`: `NodeIdle` names exactly the cells of criterion 7's column, and no chosen plan is slower than its
+     N − 1 plan.
+- **FAIL-first, one mutant a clause:**
+  - M1: `PoolOver` over `all_cards()` into node 0's pool → clause 2 red at N ≥ 2.
+  - M2: plan only `nodes[..2]` (a hidden 2) → clause 2 red, because V4.1 is not whole at N = 4.
+  - M3: the tier rule by prefix (today's) → clause 3 red at N ≥ 2.
+  - M4: λ = 0 in the predictor → clauses 4 and 7 red, because node 3 is used for Qwen3.8.
+  - M5: drop the NIC term → clause 5 red, because no note appears in its cells.
+  - M6: charge a node term at N = 1 → clause 1 red.
+  - M7: `ruler` fixed at 2 % instead of read from the machine → clause 7 red on a synthetic machine whose ruler is 4 %
+    (Qwen3.8 at N = 2 then gains under 8 % and must name node 1 idle).
+
+### 8.9 First step
+
+**Maintainers first.**
+1. Single-node P1 is the precondition: the host-tier protocol's correctness on Arm is still open (section 6). Two nodes
+   add a protocol layer on top of it.
+2. Agree the per-node shape of 8.2 and land #16 with its doc line. Then move `host` and `unified` into `nodes[0]`, a
+   move-class change, before any remote node.
+3. The monotonic-word change in `host/mod.rs` and `tier.rs` (8.6, item 2): a protocol change, the module owner's. It is
+   bit-identical on PCIe: one owning-gate run and a same-lease A/B on the box.
+4. A `Link` seam where the tier page is written and read: a move-class change, `ptx-scan` identical.
+5. Decide the `libibverbs` dependency under `just deny`.
+
+**The contributor's first step needs no engine code.** On two Sparks, one cable, one rail, under a prediction card
+(`tools/ref/card.py` format; their own table, the machine named). The probe takes N from the command line from the
+start, so nothing in it assumes a pair.
+1. **Fabric.** `ib_write_bw -s 65536` and `ib_write_lat -s 16384` and `-s 65536` on one RoCE device, both directions.
+   Then `all_gather_perf` per NVIDIA's NCCL playbook.
+   - Expected bandwidth 92–109 Gb/s a rail (11.6–13.7 GB/s): NVIDIA's 92.57 and 97.28 and the user's 109.28 (8.1). Below
+     90 Gb/s a rail `[a decision line, not a source: the 90 Gb/s line of the N = 4 switch check below, applied to the
+     direct link]` the cable, MTU or ordering setup is wrong: fix it before the probe.
+   - Expected one-way latency as perftest prints it: 4–10 µs at 16 KB and 8–14 µs at 64 KB `[derived from an assumed 3–8
+     µs base]`. Above 10 µs at 16 KB, λ's band of 25–70 µs is low by twice the excess `[derived]`: redo 8.4 before
+     trusting criterion 2.
+2. **The protocol probe** (a small bin, contributor-sized).
+   - Node 0's kernel writes a 16 KB image and a go generation into a `cudaHostAlloc` page registered with `ibv_reg_mr`
+     (strict ordering). A pump posts one RDMA write. Node 1's stream waits on its page (greater-or-equal), runs a null
+     kernel and writes 64 KB of rows and a generation. Its pump posts back, and node 0's stream wait passes.
+   - 10⁵ iterations, p50 and p99. Every 64-byte line of the image carries the sequence, and the probe counts the stale
+     lines seen after the flag.
+   - **Expected λ_probe p50 = 18–40 µs `[derived]`.** The engine's λ is λ_probe plus 7–30 µs: the tier graph's copy-in
+     and copy-out nodes, the stage's handoff, go and wait memops and the join. That gives the 25–70 µs of 8.4. Expected
+     stale lines: 0.
+   - Decision rule on λ_probe, against the break-even λ* per model (8.4: Qwen3.8 122 µs, GLM 556 µs, V4.1 410–490 µs):
+     - **at most 40 µs** (engine at most 70 µs): (a) as predicted; Qwen3.8 1.05–1.10× at one request; GLM and V4.1 are
+       decided by fit.
+     - **40–120 µs**: (a) only for the models that do not fit one Spark (GLM, V4.1). Qwen3.8 sits near its λ* of 122 µs,
+       so it stays on one node.
+     - **over 120 µs**: the pump or wake-up path is wrong; fix it before any engine work.
+     - **stale lines over 0**: switch to write-with-immediate and measure again.
+3. Then the single-node term section 2 names (sustained BW), which sets every band above.
+
+**What carries from N = 2 to N = 4 unchanged:** the pump threads, the strict-order registration, the generation waits
+and the stale-line check, the pair λ, each node's NIC cap (the same SoC links) and the per-node census over the control
+channel.
+
+**What N = 4 adds:**
+- **A switch health check first.** `ib_write_bw` through the switch at 90 Gb/s a rail or more, before anything else. The
+  switch's own settings can hold a link far under line rate, and no source here measures a switched Spark
+  `[unverified]`.
+- **The switch hop**, measured as λ_switch − λ_pair. Expected +0.5–2 µs `[assumed]`.
+- **A fan-out and fan-in mode in the probe.** Node 0 posts to 3 peers and takes 3 rows messages. Expected λ_fanout =
+  λ_pair + 2 µs of posts + 3 × 61 KB / 23.7 GB/s ingress (7.7 µs) ≈ λ_pair + 10 µs `[derived]`.
+
+### 8.10 Still open
+
+- GLM's A band (4.7–8.2 GB a token) is wide: the file minus routed leaves about 3.5 GB that the tensor shapes do not
+  explain. A header read of the `UD-Q4_K_XL` file's non-routed tensors closes it on a Mac.
+- V4.1's hit rates ρ₁ and ρ₂ are assumptions. A Mac-only replay of the route trace at the two room sizes could replace
+  them before any Spark run.
+- Whether `cuStreamWaitValue32` on a `cudaHostAlloc` page written by the NIC behaves on GB10 is `[unverified]`. The
+  probe answers it.
+- Unverified besides: a latency for a direct link, small-message (16–64 KB) bandwidth in protocol mode (strict ordering,
+  one message in flight; at least 4.8–5.6 µs of serialization on one rail plus the one-way latency `[derived]`), the
+  switch hop, BW, S₁, and the Spark drive's NVMe rate.
+- Whether to take tensor parallel first instead of (a) is the maintainers' decision (8.5).
