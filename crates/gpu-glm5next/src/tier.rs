@@ -33,11 +33,12 @@ use bloomery_gpu_deepseek41::router::glm5next::{N_EXPERT, N_USED};
 use bloomery_gpu_deepseek41::span::{span, span_mut};
 use cuda_core::DeviceBuffer;
 use gguf::{GgmlType, Split};
+use model::arch::names::routed_stacks;
 use model::placement::Plan;
 use models::{Ffn, LayerSpec};
 
 use crate::body::prefill::CHUNK;
-use crate::ffn::{CardStacks, stack_names, unrun};
+use crate::ffn::{CardStacks, unrun};
 
 /// What the tier's errors name.
 const WHAT: &str = "glm5next tier";
@@ -183,7 +184,7 @@ impl GlmTier {
         for l in run.clone() {
             let k = set.on_tier(l)?;
             if k == 0 {
-                if let Some(n) = stack_names(l).iter().find(|n| w.get(n).is_some()) {
+                if let Some(n) = routed_stacks(l).iter().find(|n| w.get(n).is_some()) {
                     return Err(GpuError::Tensor {
                         what: WHAT,
                         name: n.clone(),

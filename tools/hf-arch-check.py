@@ -173,7 +173,7 @@ TYPE_PLACES = {
              ("crates/placement/src/placement.rs", "pub fn of(ty: GgmlType) -> Option<CardFormat>"),
              ("crates/qdot/src/lib.rs", "pub fn supports(w: GgmlType) -> bool")),
     "glm": (("crates/model/src/arch/glm5next/place.rs", "pub fn card_routed(ty: GgmlType)"),
-            ("crates/gpu-glm5next/src/ffn.rs", "GgmlType::Q4_K => kq.enqueue_gate_up_q4k"),
+            ("crates/gpu/src/card_leg.rs", "match kernels::gate_up(st.gate.ty)"),
             ("crates/gpu-glm5next/src/body.rs", "if table.ty() != GgmlType::Q8_0"),
             ("crates/qdot/src/lib.rs", "pub fn supports(w: GgmlType) -> bool")),
     "qwen38": (("crates/model/src/arch/qwen35moe/place.rs", "pub fn card_routed(ty: GgmlType)"),
