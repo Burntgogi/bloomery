@@ -51,7 +51,7 @@ pub fn num_image_tokens(n_llm_h: usize, n_llm_w: usize) -> usize {
 /// `llm_grid`: the aligner's token grid over a patch grid of this pixel size,
 /// `ceil((best // patch) / downsample)` per axis (an int divided by an int, then ceiled).
 #[must_use]
-pub fn llm_grid(best_h: usize, best_w: usize, p: &GridParams) -> (usize, usize) {
+fn llm_grid(best_h: usize, best_w: usize, p: &GridParams) -> (usize, usize) {
     let axis = |best: usize| ((best / p.patch) as f64 / p.downsample as f64).ceil() as usize;
     (axis(best_h), axis(best_w))
 }
@@ -76,6 +76,17 @@ fn solve_resize_ratio(height: usize, width: usize, p: &GridParams) -> (usize, us
     (snap(height), snap(width))
 }
 
+/// A plan at pixel size `best_h`×`best_w`, with the token grid that size gives.
+fn plan_at(best_h: usize, best_w: usize, p: &GridParams) -> GridPlan {
+    let (n_llm_h, n_llm_w) = llm_grid(best_h, best_w, p);
+    GridPlan {
+        n_llm_h,
+        n_llm_w,
+        best_h,
+        best_w,
+    }
+}
+
 /// `safe_resize`: shrink the pixel size until the image costs at most `max_tokens`.
 fn safe_resize(
     height: usize,
@@ -84,23 +95,12 @@ fn safe_resize(
     best_w: usize,
     p: &GridParams,
 ) -> GridPlan {
-    let (n_llm_h, n_llm_w) = llm_grid(best_h, best_w, p);
-    if num_image_tokens(n_llm_h, n_llm_w) <= p.max_tokens {
-        return GridPlan {
-            n_llm_h,
-            n_llm_w,
-            best_h,
-            best_w,
-        };
+    let plan = plan_at(best_h, best_w, p);
+    if num_image_tokens(plan.n_llm_h, plan.n_llm_w) <= p.max_tokens {
+        return plan;
     }
     let (best_h, best_w) = solve_resize_ratio(height, width, p);
-    let (n_llm_h, n_llm_w) = llm_grid(best_h, best_w, p);
-    GridPlan {
-        n_llm_h,
-        n_llm_w,
-        best_h,
-        best_w,
-    }
+    plan_at(best_h, best_w, p)
 }
 
 /// `plan_image_grid`: the resize plan for an image of `width`×`height` pixels.
@@ -129,9 +129,9 @@ mod tests {
         min_pixels: 295_936,
     };
 
-    /// The four rows of the research table (visionres §1), taken from the reference code itself.
+    /// Four image sizes planned by the reference code itself: the pixel size and the span length.
     #[test]
-    fn research_table() {
+    fn plans_of_four_image_sizes() {
         for (w, h, best_w, best_h, tokens) in [
             (448, 448, 546, 546, 184),
             (1024, 1024, 1036, 1036, 652),

@@ -131,7 +131,7 @@ fn store(out: &mut [u8], acc: [i32; 3]) {
 /// `Image.resize((width, height), Image.BICUBIC)` of an RGB image, as Pillow computes it. A size
 /// equal to the input's is a copy, as in Pillow.
 #[must_use]
-pub fn resize_bicubic(src: &Rgb8, width: usize, height: usize) -> Rgb8 {
+pub(crate) fn resize_bicubic(src: &Rgb8, width: usize, height: usize) -> Rgb8 {
     if (width, height) == (src.width, src.height) {
         return src.clone();
     }
@@ -199,6 +199,24 @@ pub fn resize_bicubic(src: &Rgb8, width: usize, height: usize) -> Rgb8 {
     horizontal.unwrap_or_else(|| src.clone())
 }
 
+/// A pad needs pixels to place and room to place them: an empty image or canvas is refused as a
+/// size.
+fn nonempty(
+    width: usize,
+    height: usize,
+    canvas_w: usize,
+    canvas_h: usize,
+) -> Result<(), VisionError> {
+    if width == 0 || height == 0 || canvas_w == 0 || canvas_h == 0 {
+        return Err(VisionError::Size {
+            width,
+            height,
+            detail: "an empty image or canvas has no pad".to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// Where a pad puts an image of `width`×`height` on a `best_w`×`best_h` canvas: the size it is
 /// resized to, and the offset of the paste.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -218,14 +236,7 @@ impl PadGeometry {
         best_w: usize,
         best_h: usize,
     ) -> Result<PadGeometry, VisionError> {
-        let size_err = |detail: &str| VisionError::Size {
-            width,
-            height,
-            detail: detail.to_string(),
-        };
-        if width == 0 || height == 0 || best_w == 0 || best_h == 0 {
-            return Err(size_err("an empty image or canvas has no pad"));
-        }
+        nonempty(width, height, best_w, best_h)?;
         let im_ratio = width as f64 / height as f64;
         let dest_ratio = best_w as f64 / best_h as f64;
         let (mut rw, mut rh) = (best_w, best_h);
@@ -245,7 +256,11 @@ impl PadGeometry {
             }
         }
         if rw == 0 || rh == 0 {
-            return Err(size_err("contain() rounds one side to 0 pixels"));
+            return Err(VisionError::Size {
+                width,
+                height,
+                detail: "contain() rounds one side to 0 pixels".to_string(),
+            });
         }
         let (mut off_x, mut off_y) = (0, 0);
         if (rw, rh) != (best_w, best_h) {
@@ -272,13 +287,7 @@ impl PadGeometry {
         target_w: usize,
         target_h: usize,
     ) -> Result<PadGeometry, VisionError> {
-        if width == 0 || height == 0 || target_w == 0 || target_h == 0 {
-            return Err(VisionError::Size {
-                width,
-                height,
-                detail: "an empty image or canvas has no pad".to_string(),
-            });
-        }
+        nonempty(width, height, target_w, target_h)?;
         let scale_w = target_w as f32 / width as f32;
         let scale_h = target_h as f32 / height as f32;
         // `std::min(a, b)` is `(b < a) ? b : a`.
