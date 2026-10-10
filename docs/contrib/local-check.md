@@ -136,5 +136,10 @@ they are published as one dataset. The download is those sets: 6.48 GB in 17 set
 1. Row 5 and 6: do you accept a card that is neither the 3090 nor the A6000 and an arch other than `sm_86` for
    contributor evidence, and which fixture gates must stay on named cards?
 2. Row 10: where do fixtures and the `fx_` sets live, and may a contributor regenerate fixtures from headers?
+   **Answered 2026-10-11, the first half:** the `fx_` sets are public at
+   <https://huggingface.co/datasets/midagedev/bloomery-refsets> (17 sets, 6.48 GB, with each base model's licence;
+   `dgx-spark.md` section 5, answer 3). Whether `fixture generate` needs only a source header is still open
+   (`dgx-spark.md` section 6).
 3. Is a local mode (`BLOOMERY_BOX_LOCAL`) acceptable in the maintainers' own `box.sh`, given the guard and lease rules around it, or
    should the local path be a separate script?
+   **Answered 2026-10-11:** in `box.sh`, as `BLOOMERY_BOX_LOCAL=1` (`dgx-spark.md` section 5, answer 10).
