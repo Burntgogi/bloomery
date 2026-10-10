@@ -61,10 +61,12 @@
 //! - `refusals_before_any_load`: `--ctx 1 --parallel 2` — a split that
 //!   leaves a slot no position — exits non-zero within [`REFUSE_WITHIN`],
 //!   its stderr names the split and no `load` record is printed. On a
-//!   census of two cards, `--place bp` exits non-zero the same way with the
-//!   plan's tier-card refusal; on one card the `bp` half is a `deferred(two cards)` line.
-//!   FAIL-first: a seat that takes a slot of no position is still running at
-//!   the bound and the clause is red.
+//!   census of two cards, `--place bp` exits non-zero the same way, its stderr
+//!   holding the text of `PlaceError::Tier` for the tier card the placement
+//!   names ([`tier_refusal`]); on one card the `bp` half is a
+//!   `deferred(two cards)` line. FAIL-first: a seat that takes a slot of no
+//!   position is still running at the bound and the clause is red; a tier
+//!   refusal that names another card or tier is red.
 //! - `slots_total_is_planned`: the plan counts every slot's positions. At
 //!   the default context `c` (the first clause's), `--parallel 2 --ctx c
 //!   --plan` exits 0 and its `parallel` line splits it (`slots=2
@@ -77,15 +79,22 @@
 //!   running at the bound; the refusal half is red.
 //!
 //! One server, `--ctx` [`CTX`], `--parallel 1`, `--port 0`, its answers the one
-//! slot's:
+//! slot's. It plans at the gate card's bytes: `BLOOMERY_CARD_BUDGET` is
+//! [`gate_budget`] (`RTX_3090`'s usable bytes), so on the A6000 it holds the
+//! card and host experts the session's gate plan holds (`shared/gate_card.rs`
+//! plans the 3090's bytes on any one card). Every comparison of ids below is
+//! between runs of one plan:
 //!
 //! - `load_and_listen`: the `load` record comes before the `listening`
-//!   record; the load names `arch=mimo2`, `slots=1`, `card_experts=0`,
-//!   `host_experts` [`HOST_EXPERTS`], `layers` [`LAYERS`] and `ctx` [`CTX`];
+//!   record; the load names `arch=mimo2`, `slots=1`, `layers` [`LAYERS`] and
+//!   `ctx` [`CTX`], and the experts the `plan` record of the same run names:
+//!   `card_experts` above 0 (the seat's one-slot plan puts experts on the
+//!   card) and `host_experts`, which with the card's make [`ROUTED_EXPERTS`];
 //!   the `listening` record names `ctx` [`CTX`] and `slots=1`. A server that
 //!   never listens is this clause red, its stderr printed, and the clauses
-//!   that need it skipped by name. FAIL-first: a seat that plans an expert on
-//!   the card names `card_experts` above 0.
+//!   that need it skipped by name. FAIL-first: a load whose `card_experts`
+//!   is not its plan's (0 against a plan that names experts, or one off) is
+//!   red.
 //! - `completion_ids`: `/completion` at temperature 0, [`N`] tokens, of the
 //!   batch set's ids (`refset::arch::mimo2::BATCH`, read through its family),
 //!   of [`PROSE`] (`/tokenize`) and of the chat turn the server's own
@@ -116,34 +125,45 @@
 //!
 //! Then the server is stopped by its handle and waited for (its host set is
 //! free before the next load), and one server of `--parallel 2` over `2 ·`
-//! [`CTX`] positions (a slot of [`CTX`]) answers the same prompts together:
+//! [`CTX`] positions (a slot of [`CTX`]) answers the same prompts together.
+//! A second slot's stores take card room, so the one-slot server's budget
+//! would plan it fewer card experts, and another card/host split answers
+//! other ids. Its `BLOOMERY_CARD_BUDGET` is therefore the one-slot server's
+//! plus one slot's stores: the room the experts are planned in is the same,
+//! and so is the split:
 //!
-//! - `two_slots_decode_as_one_slot_runs`: its `load` record names `slots=2`
-//!   and `ctx` [`CTX`], its `listening` record `slots=2`, its `parallel` line
-//!   the split, and its resident bytes exceed the one-slot server's by exactly
-//!   one slot's stores (the plan's own count, `KvLayout::bytes` over the
-//!   layers at [`CTX`]). Two rounds, each of two requests in flight together
-//!   at `cache_prompt: false` — the batch prompt with the prose prompt, then
-//!   the prose prompt with the batch prompt started first — answer each
-//!   prompt's ids bit for bit as the one-slot server answered them, the two
-//!   requests of a round on different slots (`id_slot`), and the server's
+//! - `two_slots_decode_as_one_slot_runs`: its `plan` record names the
+//!   one-slot server's `card_experts`, `host_experts` and `n_l` range (the
+//!   same plan), its `load` record `slots=2` and `ctx` [`CTX`], its
+//!   `listening` record `slots=2`, its `parallel` line the split, and its
+//!   resident bytes exceed the one-slot server's by exactly one slot's stores
+//!   (the plan's own count, `KvLayout::bytes` over the layers at [`CTX`]).
+//!   Two rounds, each of two requests in flight together at
+//!   `cache_prompt: false` — the batch prompt with the prose prompt, then the
+//!   prose prompt with the batch prompt started first — answer each prompt's
+//!   ids bit for bit as the one-slot server answered them, the two requests
+//!   of a round on different slots (`id_slot`), and the server's
 //!   `swaps_total` is 0 or absent (the slots are resident, no state is
 //!   parked). The one-slot server's ids are the session's
 //!   (`server_ids_are_the_session_ids`), so this is the session's ids by
 //!   transitivity, and a second server is the only added load. FAIL-first: a
 //!   `swap_seq` that exchanges nothing leaves both slots on the live stores,
 //!   the slots overwrite each other's rows and the ids move; a `seq_bytes`
-//!   of 0 leaves the resident bytes short of the stores.
+//!   of 0 leaves the resident bytes short of the stores; a budget without
+//!   the added stores plans another split and the plan line is red.
 //!
 //! Then, with both servers stopped:
 //!
 //! - `server_ids_are_the_session_ids`: the session opened in process at [`CTX`]
-//!   on the gate card (`shared/mimo2_open.rs`), each of the three prompts
-//!   fed as the server feeds it — the prompt less its last id, then a step of
-//!   the last, then `N − 1` steps at argmax — answers the server's ids bit for
-//!   bit; the batch prompt's first id is ik's argmax at the set's last
-//!   position or a named tie inside the e2e gate's rule (`ik_last`,
-//!   `tie_allowed`). On a census of two or more cards (a child started by
+//!   on the gate card (`shared/mimo2_open.rs`) plans the split of the
+//!   one-slot server's `plan` record (`card_experts`, `host_experts`, the
+//!   `n_l` range: the server ran at the gate card's bytes, which the gate
+//!   plan is), each of the three prompts fed as the server feeds it — the
+//!   prompt less its last id, then a step of the last, then `N − 1` steps at
+//!   argmax — answers the server's ids bit for bit; the batch prompt's first
+//!   id is ik's argmax at the set's last position or a named tie inside the
+//!   e2e gate's rule (`ik_last`, `tie_allowed`). FAIL-first: a session on
+//!   another split (the gate plan's budget moved) is red on the plan line. On a census of two or more cards (a child started by
 //!   hand) the two session clauses are a `deferred(one card)` line: the gate
 //!   plan (`shared/gate_card.rs`) runs on one visible card.
 //! - `ids_see_an_id_short`: the same session fed a prompt one id short does
@@ -188,6 +208,7 @@ mod gate {
     use std::process::ExitStatus;
     use std::time::{Duration, Instant};
 
+    use bloomery_gpu_gates::generate::Place;
     use bloomery_gpu_gates::record::{self, Log};
     use bloomery_gpu_gates::serve_client::{
         Answer, PrefixTurns, Served, agree, chat_is_those_ids, check, curl, edit_and_extension,
@@ -196,7 +217,8 @@ mod gate {
     use bloomery_gpu_gates::{GateError, RefManifest, checks_failed, data_dir, ref_model_path};
     use bloomery_levers::CARD_BUDGET;
     use gguf::Split;
-    use model::arch::mimo2::place::PlanInputs;
+    use model::arch::mimo2::place::{PlaceError, PlanInputs};
+    use model::placement::workstation::RTX_3090;
     use refset::arch::mimo2::{BATCH, IK};
     use serde_json::{Value, json};
 
@@ -214,11 +236,11 @@ mod gate {
     const CTX: usize = 4160;
 
     /// The routed layers and experts a layer holds, from the header: the
-    /// dense layer 0 and 47 routed layers of 256 experts each, all on the
-    /// host: 47 · 256.
+    /// dense layer 0 and 47 routed layers of 256 experts each, the card's and
+    /// the host's together: 47 · 256.
     const ROUTED_LAYERS: u64 = 47;
     const EXPERTS_PER_LAYER: u64 = 256;
-    const HOST_EXPERTS: u64 = ROUTED_LAYERS * EXPERTS_PER_LAYER;
+    const ROUTED_EXPERTS: u64 = ROUTED_LAYERS * EXPERTS_PER_LAYER;
 
     /// The model's layers, the dense one included.
     const LAYERS: u64 = 48;
@@ -260,13 +282,34 @@ mod gate {
     /// in.
     const PLAN_REFUSAL: [&str; 2] = ["the plan's dense trunk alone needs", "KV"];
 
-    /// The words the plan's tier-card refusal names (`PlacementError::
-    /// HostRoutedTier`): the tier card, and the plan that keeps every routed
-    /// expert on the host.
-    const TIER_REFUSAL: [&str; 2] = [
-        "tier card",
-        "this plan puts every routed expert on the host",
-    ];
+    /// The card budget of the servers whose ids are compared: the gate
+    /// card's usable bytes, the bytes `shared/gate_card.rs` plans the session
+    /// on whichever card is in view, so a server on the A6000 plans the
+    /// session's split.
+    fn gate_budget() -> u64 {
+        RTX_3090.usable_bytes()
+    }
+
+    /// The text the seat prints for a `--place bp` it refuses: the flag's
+    /// prefix and `PlaceError::Tier`, the refusal of a machine with an expert
+    /// tier card (the program hangs no expert tier), for the first tier card
+    /// the placement names, tier 0.
+    ///
+    /// # Errors
+    /// No card of the census for `bp`, or a placement with no tier card.
+    fn tier_refusal() -> Result<String, GateError> {
+        let place = Place::Bp.on_host()?;
+        let card = place
+            .tier_cards()
+            .first()
+            .map(|c| (*c).to_owned())
+            .ok_or("the bp placement names no tier card")?;
+        Ok(format!(
+            "--place {}: {}",
+            Place::Bp.name(),
+            PlaceError::Tier { card, tier: 0 }
+        ))
+    }
 
     /// The server loads the whole host set: up to this many polls a second
     /// from a cold page cache.
@@ -342,6 +385,32 @@ mod gate {
         args: &[&str],
         pin: Option<&str>,
     ) -> Result<(Served, PathBuf), GateError> {
+        spawn_levered(dir, name, file, args, (pin, None))
+    }
+
+    /// [`spawn_pinned`] with the machine `off` and `BLOOMERY_CARD_BUDGET` of
+    /// `budget` bytes: the plan takes `min(usable, budget)` of the card, so a
+    /// server on the A6000 plans a smaller card's room ([`gate_budget`]).
+    fn spawn_budgeted(
+        dir: &Path,
+        name: &str,
+        file: &Path,
+        args: &[&str],
+        budget: u64,
+    ) -> Result<(Served, PathBuf), GateError> {
+        spawn_levered(dir, name, file, args, (Some("off"), Some(budget)))
+    }
+
+    /// `bloomery-serve --model mimo2 -m <file> <args>` with the residency
+    /// machine and the card budget as `(pin, budget)` say, whatever the
+    /// gate's own environment holds of them.
+    fn spawn_levered(
+        dir: &Path,
+        name: &str,
+        file: &Path,
+        args: &[&str],
+        (pin, budget): (Option<&str>, Option<u64>),
+    ) -> Result<(Served, PathBuf), GateError> {
         let d = dir.join(name);
         std::fs::create_dir_all(&d)?;
         let mut all = vec!["--model", "mimo2", "-m", utf8(file)?];
@@ -350,17 +419,42 @@ mod gate {
         if let Some(word) = pin {
             cmd.env(bloomery_levers::RESIDENCY, word);
         }
+        if let Some(bytes) = budget {
+            cmd.env(bloomery_levers::CARD_BUDGET, bytes.to_string());
+        }
         Ok((Served::spawn_cmd(cmd, &all, &d)?, d))
     }
 
-    /// [`spawn_pinned`] with the machine `off`.
-    fn spawn(
-        dir: &Path,
-        name: &str,
-        file: &Path,
-        args: &[&str],
-    ) -> Result<(Served, PathBuf), GateError> {
-        spawn_pinned(dir, name, file, args, Some("off"))
+    /// The card/host split a `plan` record names: the experts on each side
+    /// and the range of experts a held layer keeps. Equal splits answer equal
+    /// ids; the card budget is not part of it, two plans reach one split from
+    /// different budgets.
+    #[derive(Debug, PartialEq, Eq)]
+    struct Planned {
+        card: u64,
+        host: u64,
+        n_l: String,
+    }
+
+    impl Planned {
+        fn of(plan: &record::Fields) -> Result<Planned, GateError> {
+            Ok(Planned {
+                card: plan.u64("card_experts")?,
+                host: plan.u64("host_experts")?,
+                n_l: plan.word("n_l")?.to_owned(),
+            })
+        }
+    }
+
+    /// A plan's `n_l` word (`record::plan`'s): the least and the greatest
+    /// count among the layers that keep any expert on the card.
+    fn n_l_range(n_l: &[u64]) -> String {
+        let held = || n_l.iter().copied().filter(|&n| n > 0);
+        format!(
+            "{}..{}",
+            held().min().unwrap_or(0),
+            held().max().unwrap_or(0)
+        )
     }
 
     /// A server run to its exit within `within`: its status (`None`: still
@@ -698,12 +792,13 @@ mod gate {
             &SPLIT_REFUSAL,
         )?;
         if cards >= 2 {
+            let want = tier_refusal()?;
             pass &= refusal(
                 dir,
                 file,
                 "refuse-bp",
                 &["--place", "bp", "--port", "0"],
-                &TIER_REFUSAL,
+                &[&want],
             )?;
             check(ok, "refusals_before_any_load", pass);
         } else {
@@ -799,6 +894,8 @@ mod gate {
         chat: Answer,
         /// The one-slot server's `load` record's resident bytes.
         resident: u64,
+        /// The split of the one-slot server's `plan` record.
+        planned: Planned,
     }
 
     /// The server's clauses on the one that listens, `load_and_listen` to the
@@ -811,11 +908,12 @@ mod gate {
         ok: &mut bool,
     ) -> Result<Option<Answers>, GateError> {
         let ctx = CTX.to_string();
-        let (mut s, d) = spawn(
+        let (mut s, d) = spawn_budgeted(
             dir,
             "serve",
             file,
             &["--ctx", &ctx, "--parallel", "1", "--port", "0"],
+            gate_budget(),
         )?;
         let err_log = d.join("server.err");
         let addr = match s.address(&err_log, LISTEN_POLLS, Duration::from_secs(1)) {
@@ -845,16 +943,21 @@ mod gate {
         let records = server_log(&err_log, record::BLOOMERY_SERVE_MIMO2)?;
         let load = records.one(&record::LOAD_MIMO2)?;
         let listen = records.one(&record::LISTENING_MIMO2)?;
+        let plan = records.one(&record::PLAN)?;
+        let planned = Planned::of(&plan)?;
         let loaded = load.word("arch")? == "mimo2"
             && load.u64("slots")? == 1
-            && load.u64("card_experts")? == 0
-            && load.u64("host_experts")? == HOST_EXPERTS
+            && planned.card > 0
+            && load.u64("card_experts")? == planned.card
+            && load.u64("host_experts")? == planned.host
+            && planned.card + planned.host == ROUTED_EXPERTS
             && load.u64("layers")? == LAYERS
             && load.u64("ctx")? == CTX as u64;
         let listening = listen.u64("ctx")? == CTX as u64 && listen.u64("slots")? == 1;
         println!(
-            "server {} at {addr}; load record {:?}; listening record {:?}",
+            "server {} at {addr}; plan record {:?}; load record {:?}; listening record {:?}",
             file.display(),
+            plan.line(),
             load.line(),
             listen.line()
         );
@@ -903,6 +1006,7 @@ mod gate {
             prose,
             chat,
             resident: load.u64("resident_bytes")?,
+            planned,
         }))
     }
 
@@ -968,11 +1072,19 @@ mod gate {
     ) -> Result<(), GateError> {
         const NAME: &str = "two_slots_decode_as_one_slot_runs";
         let total = (2 * CTX).to_string();
-        let (mut s, d) = spawn(
+        // One more sequence's stores, by the plan's own layout.
+        let split = Split::open(file).map_err(|e| format!("open {}: {e}", file.display()))?;
+        let store_bytes = PlanInputs::describe(&split)?
+            .kv
+            .bytes(0..LAYERS as usize, CTX as u64);
+        // The one-slot server's budget and the room the second slot's stores
+        // take: the experts are planned in the same room, so on the same split.
+        let (mut s, d) = spawn_budgeted(
             dir,
             "serve-two",
             file,
             &["--ctx", &total, "--parallel", "2", "--port", "0"],
+            gate_budget() + store_bytes,
         )?;
         let err_log = d.join("server.err");
         let addr = match s.address(&err_log, LISTEN_POLLS, Duration::from_secs(1)) {
@@ -991,11 +1103,7 @@ mod gate {
         let records = server_log(&err_log, record::BLOOMERY_SERVE_MIMO2)?;
         let load = records.one(&record::LOAD_MIMO2)?;
         let listen = records.one(&record::LISTENING_MIMO2)?;
-        // One more sequence's stores, by the plan's own layout.
-        let split = Split::open(file).map_err(|e| format!("open {}: {e}", file.display()))?;
-        let store_bytes = PlanInputs::describe(&split)?
-            .kv
-            .bytes(0..LAYERS as usize, CTX as u64);
+        let planned = Planned::of(&records.one(&record::PLAN)?)?;
         let stderr = std::fs::read_to_string(&err_log).unwrap_or_default();
         // `pass=turns` as at `slots_total_is_planned`.
         let line = format!(
@@ -1003,16 +1111,19 @@ mod gate {
             2 * CTX
         );
         let resident = load.u64("resident_bytes")?;
-        let loaded = load.u64("slots")? == 2
+        let same_plan = planned == one.planned;
+        let loaded = same_plan
+            && load.u64("slots")? == 2
             && load.u64("ctx")? == CTX as u64
             && listen.u64("slots")? == 2
             && listen.u64("ctx")? == CTX as u64
             && stderr.lines().any(|l| l == line)
             && resident == one.resident + store_bytes;
         println!(
-            "two-slot server at {addr}; load record {:?}; listening record {:?}; resident \
-             {resident} B against the one-slot server's {} B and one slot's stores \
-             {store_bytes} B: {loaded}",
+            "two-slot server at {addr}; plan {planned:?} against the one-slot server's {:?}: \
+             {same_plan}; load record {:?}; listening record {:?}; resident {resident} B \
+             against the one-slot server's {} B and one slot's stores {store_bytes} B: {loaded}",
+            one.planned,
             load.line(),
             listen.line(),
             one.resident
@@ -1095,11 +1206,22 @@ mod gate {
         crate::gate_card::init()?;
         let (mut session, opened) = open(file, levers, CTX)?;
         let m = session.model_mut();
-        // The session's plan keeps every routed expert on the host, as the
-        // server's load record says.
-        let planned: u64 = opened.n_l.iter().sum();
-        println!("session plan: {planned} card experts");
-        let mut same = planned == 0;
+        // The session's gate plan splits the experts as the one-slot server's
+        // plan record does: a split the ids are not held to is no comparison.
+        let card: u64 = opened.n_l.iter().sum();
+        let host = ROUTED_EXPERTS.checked_sub(card).ok_or_else(|| {
+            format!("the session's plan puts {card} card experts, past the file's {ROUTED_EXPERTS}")
+        })?;
+        let ours = Planned {
+            card,
+            host,
+            n_l: n_l_range(&opened.n_l),
+        };
+        let mut same = ours == a.planned;
+        println!(
+            "session plan {ours:?} against the server's {:?}: {same}",
+            a.planned
+        );
         let mut moved = 0usize;
         for (name, ans) in [("batch", &a.batch), ("prose", &a.prose), ("chat", &a.chat)] {
             let (ours, first) = session_ids(m, &ans.prompt, N)?;
