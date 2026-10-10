@@ -470,6 +470,12 @@ box-gc *ARGS='--kill':
     if [ "$rc" = 66 ]; then echo "box-gc: this track has no remote directory on the box (box.sh rc 66): nothing ran there, nothing to collect"; rc=0; fi
     exit "$rc"
 
+# Dry run of the reference-set dataset's publisher on the box: every `fx_` set's family, files, bytes and sha256 under $BLOOMERY_DATA,
+# the sets left out and why. Writes into /tmp on the box only, uploads nothing, opens no card, builds nothing; it syncs the script, so it
+# waits for a sitting like any box command (tools/refset-publish.sh).
+refset-publish-dry:
+    ./tools/box.sh 'bash tools/refset-publish.sh --dry-run --out /tmp/refset-publish-dry'
+
 # 박스에 남은 트랙 디렉터리를 로컬 워크트리와 대조한다. 인자 없이 목록, `just box-tracks --remove NAME…`로 준 이름만 삭제(그때도 stale일 때).
 box-tracks *ARGS:
     ./tools/box-tracks.sh {{ARGS}}

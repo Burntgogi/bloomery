@@ -1,0 +1,7 @@
+# The model and licence of each fixture family, for the dataset README. Where `fixture fetch` reads a family's files from (repo, quant,
+# revision) is the fixture table in crates/model/src/bin/fixture.rs (SPECS) and is not copied here. Every family that
+# tools/refset-publish.sh publishes needs a row; the family names are the architectures of crates/refset/src/fixture.rs DIRS.
+# arch<TAB>model<TAB>licence<TAB>licence link (the model card of the source repo)
+deepseek41	DeepSeek V4.1 Flash	MIT	https://huggingface.co/vcruz305/DeepSeek-V4.1-Flash-GGUF
+glm5next	GLM-5.3-Flash	MIT	https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF
+qwen4exp	Qwen3.8-Flash-Next	Qwen Community License 1.0	https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF

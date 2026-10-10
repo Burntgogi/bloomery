@@ -83,24 +83,40 @@ aarch64 Linux runs T0 only until the host compiles there (`docs/contrib/dgx-spar
 ## Fixtures: what a contributor would download
 
 The fixture tier is what makes a family's gates runnable without the 100 GB to 350 GB real files
-(`tools/ref/ref-paths.sh:33-46`). Measured on the box with `du -sh` on 2026-10-10 (read-only): `glm5next` 8.0 GB,
-`qwen38` 11 GB, `v41` 16 GB, `v41-r8` (the V4.1 sidecar) 7.3 GB, and the 18 reference-set directories `fx_*` under
-`/root/bloomery-data` 6.4 GB: about 49 GB together, not the 12 GB one family suggests. Three families have a fixture
-(`crates/refset/src/fixture.rs:33-37`); MiMo and the older families do not.
+(`tools/ref/ref-paths.sh:33-46`). Three families have a fixture (`crates/refset/src/fixture.rs:33-37`); MiMo and the
+older families do not. Measured on the box with `du -sh` on 2026-10-10 (read-only): `glm5next` 8.0 GB, `qwen38`
+11 GB, `v41` 16 GB, `v41-r8` (the V4.1 sidecar) 7.3 GB. A contributor does not download those files: `fixture
+generate` writes random weights whose bytes are a function of the seed and the source header alone
+(`crates/model/src/fixture/mod.rs:29`) and hashes headers only (`plan.rs:224`), so a family's fixture is made again
+from the source repo's headers. Measured by the `fxfetch` round: `fixture fetch` made the qwen38 fixture (with its MTP
+draft), the v41 fixture (with the r8 sidecar) and the glm5next fixture (at its pinned revision) byte-identical to the
+files on the box. What a contributor cannot make is the `fx_` reference sets: they are ik's output, and
+they are published as one dataset. The download is those sets: 6.48 GB in 17 sets and 29,941 files (the dry run of 2026-10-10, `just refset-publish-dry`;
+`du -sh` of the `fx_*` directories said 6.4 GB). Published after 0.2.10.
 
-- **Two ways to get them.** Download the published files, or regenerate: `fixture generate` writes random weights whose
-  bytes are a function of the seed and the source header alone (`crates/model/src/fixture/mod.rs:29`) and hashes headers
-  only (`plan.rs:224`), so the bulk of the 35 GB is reproducible from the real files' headers. It needs a real split
-  file opened, so whether a headers-only partial download suffices is `[unverified]` (`tools/ref/gguf-ranges.py` reads
-  headers by range). The `fx_` sets are ik's output and cannot be regenerated without an ik build: they would be
-  published, 6.4 GB.
+1. **Make the fixture of each family** (the verb is added by `fxfetch`):
+
+       fixture fetch <family> /models/fixtures/<dir>
+
+   The family's source (repo, quant, revision) is its row of the fixture table in `crates/model/src/bin/fixture.rs`
+   (`SPECS`, or the path `fxfetch` reports); it is not copied here. `<family>` and `<dir>` are the pairs of
+   `crates/refset/src/fixture.rs` DIRS (the dataset README lists them). It reads a few MB per shard by HTTP Range.
+   The V4.1 DSpark draft fixture cannot be fetched (its source is the maintainers' own copy), and no set of it is
+   published.
+2. **Download the reference sets** into `$BLOOMERY_DATA`. The dataset mirrors that directory, so this one command is the
+   install (`--include` takes one family's sets; the dataset README lists them by name):
+
+       hf download --repo-type dataset midagedev/bloomery-refsets --local-dir "$BLOOMERY_DATA"
+
+   `just refset-publish-dry` is the maintainers' dry run of the dataset (`tools/refset-publish.sh`): it lists every
+   file with its sha256 and says which sets are left out (the fixture variants and the DSpark draft sets) and why.
+   The upload is a separate step after the 0.2.10 tag.
+
 - **The path is part of the identity.** A set's `# model` line states the first shard's full path `{root}/{dir}/{file}`
   (`crates/refset/src/fixture.rs:96-107`), so sets dumped under `/models/fixtures` are stale under another root even
-  though `BLOOMERY_FIXTURE_ROOT` moves the files (`:23`). The cheap fix is that the contributor makes `/models/fixtures`
-  exist (a symlink; needs root once). Keying the identity on `bloomery.fixture.source_header_sha256` (`plan.rs:224`)
-  instead touches every family's check: M, the maintainers' design, `[unverified]` beyond that.
-- **Where.** Not decided. Candidates: a Hugging Face dataset under the maintainers' account (`tools/ref` already
-  range-reads the hub, `tools/hf-arch-check.py`), or release assets. The maintainers decide (open question).
+  though `BLOOMERY_FIXTURE_ROOT` moves the files (`:23`). The contributor makes `/models/fixtures` exist (a symlink;
+  needs root once). Keying the identity on `bloomery.fixture.source_header_sha256` (`plan.rs:224`) instead touches
+  every family's check: M, the maintainers' design, `[unverified]` beyond that.
 
 ## Order and sizes
 

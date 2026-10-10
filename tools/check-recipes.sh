@@ -525,6 +525,16 @@ blk_fixturevariants() {
   done
   echo "check-recipes: fixture variants ok ($n row(s): $tags )"
 }
+# refset-publish.sh's assignment of the fx_ sets to a family (never by name), its named error on a set it cannot place, its
+# left-out block (variant, DSpark) and its --upload refusal, on a fake tree, no box.
+blk_refsetpublish() {
+  if ! rpt=$(bash "$(dirname "$0")/refset-publish.sh" --self-test 2>&1); then
+    echo "$rpt" >&2
+    echo "check-recipes: the refset-publish self-test failed" >&2
+    return 1
+  fi
+  echo "${rpt##*$'\n'}"
+}
 # Every #[test] in the workspace is run by some gate-* or lab-* recipe's cargo test call on the box: its
 # target, the features its path's cfgs need, its name filter and its #[ignore] (tools/recipes.py
 # orphan-tests). A test no gate runs is neither a test nor a gate: without gate-ds41-bind, gpu-gates' bind
@@ -540,7 +550,7 @@ blk_orphan() {
 
 BLOCKS=(selftest smoke cardorder cardtests lease boxtracks loadgroups lcppfit coldblocks slotsarm lcppwarm q38srv
   maccheck gatebatch gpugate stackwatch ptxspill scanargs narrowscan ldsscan mutantrun macstatic carry pytools boxqcodes fixturevariants
-  orphan)
+  refsetpublish orphan)
 for b in "${BLOCKS[@]}"; do
   ( set +e; blk_$b > "$B/$b.out" 2>&1; echo $? > "$B/$b.rc" ) & # set +e: a red block writes its own rc
 done

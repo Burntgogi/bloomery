@@ -1,0 +1,70 @@
+---
+pretty_name: bloomery reference sets
+license: other
+tags:
+  - bloomery
+  - test-fixtures
+---
+
+# bloomery reference sets
+
+The oracle files of the fixture tier of [bloomery](https://github.com/midagedev/bloomery): intermediate tensors
+that ik_llama.cpp dumped while it ran bloomery's fixture models. A fixture is a GGUF with random weights and the
+shape of a real model. The sets are raw little-endian f32 tensors plus a `MANIFEST.tsv` each. They hold no model
+weights. bloomery's gates compare the engine against them.
+
+Sets: @SET_COUNT@. Files: @FILE_COUNT@. Size: @TOTAL_GB@ GB.
+
+@FAMILY_TABLE@
+
+## Make the fixture files
+
+The sets belong to fixtures, and the fixtures are not in this repo. `fixture fetch` makes one
+from the headers of its source model's files (a few MB per shard); its table of sources is in the bloomery repo
+(`crates/model/src/bin/fixture.rs`, `SPECS`):
+
+```
+@FETCH_COMMANDS@
+```
+
+The DeepSeek V4.1 DSpark draft fixture cannot be fetched, so no set of it is here. The set
+`ref-mtp/fx_qwen4exp_prose64_n64_k1` also names the fixture's MTP draft file,
+`/models/fixtures/qwen38/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf`, which `fixture fetch` makes with the fixture.
+
+## The path is part of the identity
+
+A set states the fixture it was dumped from by its full path, `/models/fixtures/<dir>/<file>`. Make the fixtures at
+those paths. On a machine without `/models`, make `/models/fixtures` a symlink to where you keep them.
+
+## Put the sets in place
+
+The repo mirrors `$BLOOMERY_DATA`: a set is `fx_.../<file>` or `ref-mtp/fx_.../<file>`, the path the gates read. One
+download is the whole install:
+
+```
+hf download --repo-type dataset @REPO@ --local-dir "$BLOOMERY_DATA"
+```
+
+To take one family, name its sets with `--include`. The sets of each family:
+
+@SET_LIST@
+
+Optional check, from `$BLOOMERY_DATA`: `sha256sum --quiet -c SHA256SUMS`. It lists every file of the repo, so on a
+partial download it reports the files you did not take as missing. The download also puts `README.md` and
+`SHA256SUMS` in `$BLOOMERY_DATA`.
+
+## Licences
+
+Each fixture takes its shape from the header of one source model, and each set holds outputs of an engine that ran
+that fixture. The source models' licences are below. Read them before you reuse a set outside bloomery's gates.
+
+@LICENCE_LIST@
+
+The fixture files are not here and hold no weights of the source models.
+
+## Left out
+
+Not published, because they cannot be remade off the maintainers' machine byte for byte, or their source is not
+verified:
+
+@LEFT_OUT@
