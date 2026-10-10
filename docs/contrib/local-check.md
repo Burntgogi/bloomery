@@ -14,7 +14,7 @@ Mac").
 
 - **Pure crates:** `python3 tools/recipes.py pure-crates` derives the list (today `bloomery-decision`, `-hf`, `-jinja`,
   `-levers`, `-models`, `-placement`, `-refset`, `-runtime`, `-sampler`, `-serve`, `-tokenizer`, `-vision`);
-  `just mac-test` runs `cargo test -p` on each natively on a Mac (`tools/mac-check.sh:1-12`).
+  `just mac-test` runs `cargo test -p` on each natively on a Mac (`tools/mac-check.sh:1-15`).
 - **The Mac static tier:** `just mac-static [BASE]` runs fmt-check, clippy as an x86_64-linux cross check, the scoped
   build shapes (`recipes.py combos`) and every `tools/check-*.sh` in two lanes (`tools/mac-static.sh:1-15`).
 - **The host tier, x86_64 Linux, no card, no model file:** `python3 tools/recipes.py host-nightly` prints one unit a
