@@ -117,7 +117,7 @@ The recipes' own lines and the tool headers (`tools/gate-batch.sh`, `tools/recip
   change reaches, no kernel moved, and the landing batch is the gates that run the changed host path plus the static
   checks; `just narrow BASE [HEAD]` scans the covering bin set (`tools/recipes.py scan-set`, every kernel carrier) with
   `--no-jit` on both sides and prints that list and why (`just affected BASE --narrow --scan BASE_LOG NEW_LOG …` by
-  hand). A kernel, a launch or a byte formula moved runs the whole list. Always `just ptx-scan <bin> --features …`. A
+  hand; a round's uncommitted tree: `tools/narrow-scan.sh BASE --worktree`). A kernel, a launch or a byte formula moved runs the whole list. Always `just ptx-scan <bin> --features …`. A
   `--no-jit` scan (no card, no gate lock) proves only a move: a pair with one narrows when it is identical and is
   refused by name otherwise; the add and occupancy classes and `gate-ptx-spill` read the JIT columns and take the full
   scan.
