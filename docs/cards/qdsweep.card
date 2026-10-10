@@ -1,0 +1,107 @@
+# unitier R4 (arenaunion), design Q10 item 1 `nvqdsweep` (worker2, round qdsweep, 2026-10-11). Place at
+# docs/cards/qdsweep.card in the tree that runs the sitting (card.py lease reads only that path).
+#
+# What the run is for. R4 reads the prompt union from the NVMe tier's arena: 256.1 distinct paged ids a layer
+# at P = 512, 38.5 GB over 48 layers [read: claim.md:94], each id as three O_DIRECT parts of ~1.04 MB
+# [derived: bytes=801177600 of a 256-expert range batch / (256 x 3), r0-sit.log row `arm=cache case=range`].
+# A fill worker reads its picks part by part with one blocking pread at a time [read: nvtier.rs:1612-1665,
+# fill_pick], so the fill's queue depth (QD) is the number of workers in flight, and `probe_nvread --threads Q`
+# runs exactly that shape (its directN arm: Q workers, one pread each at a time, probe_nvread.rs:731-748).
+# One range batch (256 experts, 801.2 MB) is one union layer (256.1 ids x 3.134 MB = 802.6 MB [derived]).
+#
+# Terms already fixed by arithmetic, so the run need not measure them:
+#   link ceiling      PCIe Gen4 x4: 16 GT/s x 4 x 128/130 / 8 = 7.88 GB/s raw [derived from the box's sysfs,
+#                     current_link_speed=16.0 GT/s PCIe, current_link_width=4, read 2026-10-11]; payload rate
+#                     below that. The design's 8-11 GB/s at QD 16-32 [design.md:248, :915] is above the link and
+#                     cannot occur on this drive; the band here is capped at 7.5 [assumption: ~0.95 of raw].
+#   4 MiB reference   6.12 GB/s one thread [read: rig-log 09-29#odmax; nvtier-read.sh:58-59]. A 4 MiB pread is
+#                     split by the block layer at max_sectors_kb=1280 [read: box sysfs] into ~4 commands, so it
+#                     is a QD ~4 rate at 1.25 MiB, not a QD1 rate at part size. It is each run's own reference
+#                     (`arm=drive case=range`), never a QD1 value.
+#   QD1 part rate     r1 = 2.9 GB/s [read: r0-sit.log direct1 k1/k2/k3 medians 2.868/2.805/2.786, voided
+#                     sitting; the gate's decode fills, fill_bytes / fill_ns = 26,612,019,200 / 8,993,829,680 =
+#                     2.96 GB/s, g-gate-gpu-nvtier.log:41, one to two picks a call]. R0's range direct1 read
+#                     2.203 (p10 1.42), in a window whose reference read 4.506 and whose drive count was 1.37x
+#                     the probe's ask [read: r0-sit.log]: contended, a lower edge.
+#   plateau           R_p: lower edge 6.19 [read: r0-sit.log directN range at 8 threads, contended], upper edge
+#                     7.5 [assumption, above]; the point 6.8 is the midpoint [derived].
+# The curve: R(Q) = ((Q r1)^-4 + R_p^-4)^(-1/4), r1 = 2.9, R_p = 6.8 [assumption: the p = 4 knee shape; the
+# 2.9 is latency-bound, so R grows ~linearly in Q until the link]. Per Q, the P = 512 union's drive time is
+# 38.5 GB / R and one layer's read is 0.8026 GB / R; the layer's compute c is 120-200 ms [read: design.md:875,
+# derived there, not measured], cut to 120-155 by the measured wall: today's P = 512 prompt takes 7.4456 s for 48
+# layers and holds all the compute, so c <= 155 ms [derived: 7.4456 / 48]. The union hides under compute when
+# 0.8026 GB / R <= c, i.e. R >= 6.7 GB/s (c = 120) down to 5.2 GB/s (c = 155).
+#
+#   Q   R point  R band      union 38.5 GB / R        a layer 0.8026 GB / R    vs c = 120..155 ms
+#   1   2.9      2.2..3.9    13.4 s (9.9..17.5)       279 ms (206..365)        never hidden: par fails
+#   2   5.2      4.4..7.1    7.4 s (5.4..8.8)         154 ms (113..182)        hidden only at c >= 154 (the edge)
+#   4   6.6      5.6..7.5    5.8 s (5.1..6.9)         121 ms (107..143)        hidden for c >= 121
+#   8   6.8      6.2..7.5    5.7 s (5.1..6.2)         118 ms (107..129)        hidden
+#   16  6.8      6.2..7.5    5.7 s (5.1..6.2)         118 ms (107..129)        hidden (the decisive row)
+#   32  6.8      6.2..7.5    5.7 s (5.1..6.2)         118 ms (107..129)        hidden
+# Bands: Q = 1 lo is R0's range direct1, hi is R0's k-class direct1 scaled by the sitting's reference state
+# 6.12 / 4.506 = 1.36 (2.87 x 1.36 = 3.9) [derived]; Q = 2 lo is 2 x 2.2, hi the link region; Q >= 4 lo from
+# R0's QD 8 median under contention, hi 7.5. The R4 entry's "9.93 s at QD1" [design.md:1059] used 60.77 GB at
+# 6.12 GB/s; at part-size QD1 the P = 512 union (38.5 GB) is predicted 13.4 s, against 7.45 s today.
+# Against the run's own reference (the `arm=drive case=range` median of the same run, 6.12 expected) the curve is
+# R(1)/drive 0.47 [2.9 / 6.12] and R(16)/drive 1.11 [6.8 / 6.12] [derived]; the decisions below read these ratios,
+# because six runs in a row can drift and the runner accepts any reference from 5.51 to 6.73.
+#
+# The one term the derivation cannot fix is where the latency-bound line meets the link: r1 and R_p are read
+# from a voided, contended sitting. R(16) is the statistic; the other five rows place the knee and the QD1 value.
+# Wall [derived from r0-sit.log, whose probe took 21 s at 8 threads]: 6 rows x ~22-25 s plus ~3 s a runner
+# invocation = ~2.7 min of lease; the build is cached or 2-5 min before it, outside the lease. The command's
+# bounds: build 420 s, each run 200 s + 10 s: worst case 430 + 6 x 210 = 1690 s = 28 min, under the 30-minute rule.
+# The first run that exits non-zero stops the sitting: R0's drive count was 1.37x its ask and was never traced to a
+# caught reader [read: specs/worker2/nvread/report.md section 0, an arithmetic attribution; nvreadfix/report.md:79:
+# the fatal reconcile has never run in a sitting], so a [drive-mismatch] with no foreign reader in the witness may be
+# the instrument's own over-read and would void every row alike.
+kind: profile
+question: at what fill width Q does the tier drive stop gaining on the ~1.04 MB O_DIRECT part reads R4's union
+  issues, and is its plateau high enough that one layer's 0.80 GB union read hides under the layer's compute, so
+  R4's P = 512 wall claim holds without the design's 8-11 GB/s?
+term: R(16), the median over 16 range batches of (a batch's 801.2 MB of parts / the wall of the directN arm),
+  16 O_DIRECT workers each holding one pread of a ~1.04 MB part, a batch being one layer's experts [256, 512)
+  over the gate, up and down stacks (768 parts, a layer drawn from a printed seed), Qwen3.8 UD-Q4_K_XL on
+  /models (nvme0n1, PCIe Gen4 x4), card-free; probe_nvread's row `nvread arm=directN case=range threads=16
+  median=` of one run; the same arm at Q = 1, 2, 4, 8, 32 in the same sitting and seed, the O_DIRECT direct1
+  row (QD1) and `arm=drive` (4 MiB, one thread) of every run as its reference, and `case=k32` (96 parts of 32
+  random experts, one per layer) beside the range as the random-id class
+unit: GB/s
+predict: 6.2..7.5
+condition: one sitting of six `bash tools/ref/nvtier-read.sh --seed S --ks 32 --batches 32 --threads Q` runs, Q in
+  the order 4, 1, 32, 2, 16, 8 (a drive that drifts over the sitting then reads as scatter, not as a slope), the
+  same seed S for every row so every row reads the same layers and experts, under the lead's sitting hold
+  (BLOOMERY_HOLD_OWNER) so no box.sh command enters between rows; each run takes the lease with this card
+  (lease_take, a timeout on every child) and prints its own witness blocks, `[reconcile]` and `[reclaim]`
+  lines; the probe runs under --lease (rows carry lease=true); directN, direct1 and drive read with O_DIRECT, so
+  the page cache never serves them, and the cache arm's pages are dropped per batch by the probe's own
+  MADV_DONTNEED and posix_fadvise(DONTNEED) on that batch's runs, mincore-checked 0 resident before its read (no
+  global drop_caches); the runner refuses with 75 while any process maps a file of the model directory; a row
+  counts only with its `arm=drive case=range` within 6.12 GB/s +- 10 % (the runner's [reference-off] absent) and
+  `[reconcile]` ratio 0.95..1.05 (no [drive-mismatch]: no other reader on nvme0n1), else it reruns once, and the
+  command stops at the first run that exits non-zero; all output goes to /tmp (nvme1n1), nothing is written to the
+  drive under test
+decide-in: R(16) inside the band: size R4's fill from the measured curve and drop the design's 8-11 GB/s. The
+  fill's width is the knee Q*, the smallest Q whose range median over its run's drive median is within 5 % of
+  Q = 32's same ratio (predicted 4; the ratios cancel the drive's drift between runs); at Q* <= 4
+  the lane's four threads (crates/gpu/src/host/lane.rs:47 LANE_THREADS) are the off-pool reader, above 4 the
+  union gets a reader of its own at Q* threads, and a fill batch holds at least ceil(Q*/3) ids (three parts
+  each). Ensure-ahead is depth 1 when 0.8026 GB / R(Q*) <= the layer's compute c (c read off R4's first arm,
+  derived 120..155 ms), depth 2 when 0.8026 GB / p10 of R(Q*) > c; R4's P = 512 wall is written as 48 x
+  max(0.8026 GB / R(Q*), c), and the QD1 par is stated false unless R(1) >= 0.8026 GB / c (predicted R(1) 2.2..3.9
+  against 5.2..6.7 needed), an absolute wall claim, so not scaled by the reference
+decide-below: R(16) under 6.2: split on R(16) over its run's drive median. Under 1.0 (predicted 1.11), 1 MB parts
+  plateau under the drive's own 4 MiB rate: R4's reader reads the union's adjacent ids as one run (requests of
+  4 MiB and up, the `drive` arm's shape) and the wall is recomputed as 38.5 GB over that rate before any QD is
+  chosen. At 1.0 or above the drive was in a lower state (a reference of 5.5-6.1 is in band): carry the curve's
+  shape in ratios, take the absolute rates from a rerun once in a quiet window
+decide-above: R(16) above 7.5: up to 7.88 (the link's raw rate) the link carries more than assumed, carry it as
+  measured and re-derive the break-even; above 7.88 is an instrument fault (bytes not read from the drive): read
+  the `[reconcile]` ratio (under 0.95 says bytes served without reading nvme0n1) and rerun once with another seed
+# result 2026-10-11 (lead's sitting, A6000 box, lease, seed 20261011, after the nvtier-read reference re-pin d3d833e3;
+#   three earlier sittings voided: an unset witness variable, then the old 6.12 reference band):
+#   R(Q) GB/s, directN case=range median [p10..p90]: QD1 2.513 [2.263..3.080], QD2 4.153 [3.828..4.733],
+#   QD4 5.666 [5.237..6.379], QD8 6.482 [3.969..6.861], QD16 6.769 [6.425..6.987], QD32 6.715 [6.331..6.988];
+#   drive reference 4.64..4.75, reconcile 0.9993 each run. R(16) 6.77 inside 6.2..7.5: decide-in. The knee sits
+#   at QD8, not QD4 (predicted 6.6 at QD4, measured 5.67), and QD1 is 2.51, under the predicted 2.9.
