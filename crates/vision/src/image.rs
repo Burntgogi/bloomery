@@ -120,7 +120,7 @@ impl Rgb8 {
             .set_strict_mode(true)
             .jpeg_set_out_colorspace(ColorSpace::RGB);
         let mut decoder = JpegDecoder::new_with_options(ZCursor::new(bytes), options);
-        let decode = |e: zune_jpeg::errors::DecodeErrors| VisionError::Decode(e.to_string());
+        let decode = |e: zune_jpeg::errors::DecodeErrors| VisionError::Decode(format!("JPEG: {e}"));
         decoder.decode_headers().map_err(decode)?;
         let Some(coded) = decoder.input_colorspace() else {
             return Err(VisionError::Decode(
@@ -159,14 +159,14 @@ impl Rgb8 {
         decoder.set_transformations(png::Transformations::EXPAND);
         let mut reader = decoder
             .read_info()
-            .map_err(|e| VisionError::Decode(e.to_string()))?;
+            .map_err(|e| VisionError::Decode(format!("PNG: {e}")))?;
         let size = reader
             .output_buffer_size()
             .ok_or_else(|| VisionError::Decode("the PNG's frame size overflows".into()))?;
         let mut buf = vec![0u8; size];
         let info = reader
             .next_frame(&mut buf)
-            .map_err(|e| VisionError::Decode(e.to_string()))?;
+            .map_err(|e| VisionError::Decode(format!("PNG: {e}")))?;
         let (width, height) = (info.width as usize, info.height as usize);
         if info.bit_depth != png::BitDepth::Eight {
             return Err(VisionError::Format(format!(
@@ -279,6 +279,19 @@ mod tests {
                     assert!(msg.contains(&format!("a {name} file")), "{msg}");
                 }
                 other => panic!("{name}: {other:?}"),
+            }
+        }
+    }
+
+    /// A decoder library's refusal says which format's decoder it came from.
+    #[test]
+    fn a_decoder_refusal_names_its_format() {
+        let png = b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR";
+        let jpeg = [0xFF, 0xD8, 0xFF, 0xD9];
+        for (bytes, prefix) in [(&png[..], "PNG: "), (&jpeg[..], "JPEG: ")] {
+            match Rgb8::from_bytes(bytes) {
+                Err(VisionError::Decode(msg)) => assert!(msg.starts_with(prefix), "{msg}"),
+                other => panic!("{prefix}{other:?}"),
             }
         }
     }

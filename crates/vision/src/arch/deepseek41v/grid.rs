@@ -104,8 +104,26 @@ fn safe_resize(
 }
 
 /// `plan_image_grid`: the resize plan for an image of `width`×`height` pixels.
+///
+/// # Panics
+///
+/// When `p` has no plan: `patch` or `downsample` 0, or `max_tokens` below the tokens of the
+/// smallest grid, one cell ([`num_image_tokens`] of 1×1). [`super::Hparams`] only builds legal
+/// params; a hand-built [`GridParams`] is the caller's contract.
 #[must_use]
 pub fn plan_image_grid(width: usize, height: usize, p: &GridParams) -> GridPlan {
+    assert!(
+        p.patch > 0 && p.downsample > 0,
+        "the plan needs patch and downsample of at least 1, got patch {} and downsample {}",
+        p.patch,
+        p.downsample
+    );
+    let floor = num_image_tokens(1, 1);
+    assert!(
+        p.max_tokens >= floor,
+        "max_tokens {} is below {floor}, the tokens of the smallest grid (one cell)",
+        p.max_tokens
+    );
     let (mut width, mut height) = (width, height);
     let pixels = width * height;
     if 0 < pixels && pixels < p.min_pixels {
@@ -149,6 +167,41 @@ mod tests {
                 "{w}x{h}"
             );
         }
+    }
+
+    /// Params no plan exists for panic by name at the entry: a budget below the one-cell grid's
+    /// tokens, a zero patch, a zero downsample. Not an underflow or a division by zero deeper in,
+    /// and not a plan of no pixels.
+    #[test]
+    fn params_with_no_plan_are_refused_by_name() {
+        let refusal = |p: GridParams| -> String {
+            match std::panic::catch_unwind(|| plan_image_grid(448, 448, &p)) {
+                Ok(plan) => panic!("{p:?} planned {plan:?}"),
+                Err(e) => e
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| e.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+                    .expect("a text panic"),
+            }
+        };
+        for max_tokens in 0..num_image_tokens(1, 1) {
+            let said = refusal(GridParams { max_tokens, ..V41 });
+            assert!(said.contains("max_tokens"), "{max_tokens}: {said}");
+        }
+        let said = refusal(GridParams { patch: 0, ..V41 });
+        assert!(said.contains("patch"), "{said}");
+        let said = refusal(GridParams {
+            downsample: 0,
+            ..V41
+        });
+        assert!(said.contains("downsample"), "{said}");
+        let one_cell = GridParams {
+            max_tokens: num_image_tokens(1, 1),
+            ..V41
+        };
+        let plan = plan_image_grid(448, 448, &one_cell);
+        assert!(num_image_tokens(plan.n_llm_h, plan.n_llm_w) <= one_cell.max_tokens);
+        assert!(plan.n_llm_h * plan.n_llm_w > 0, "{plan:?}");
     }
 
     /// `max_cells` and `max_patches` hold for every plan and are met. A boundary sweep, not an

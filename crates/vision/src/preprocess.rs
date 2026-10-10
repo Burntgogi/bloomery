@@ -115,6 +115,13 @@ pub fn patchify(image: &Rgb8, plan: GridPlan, layout: PatchLayout) -> Result<Pat
         height: image.height,
         detail,
     };
+    let frame = image.width.saturating_mul(image.height).saturating_mul(3);
+    if image.data.len() != frame {
+        return Err(size_err(format!(
+            "{} data bytes where the frame has {frame}",
+            image.data.len()
+        )));
+    }
     let group = s * m;
     if image.width != plan.best_w
         || image.height != plan.best_h
@@ -372,6 +379,27 @@ mod tests {
             e,
             "image size 48x32: the plan is 48x32 in groups of 2x2 16-pixel patches"
         );
+    }
+
+    /// A buffer that is not the frame's length is refused as a size, by name: a short one would
+    /// index past its end and a long one would lose its tail unread.
+    #[test]
+    fn a_buffer_of_the_wrong_length_is_refused() {
+        let whole = image(8, 6, |_, _, _| 0);
+        for (name, len) in [
+            ("long", whole.data.len() + 3),
+            ("short", whole.data.len() - 3),
+        ] {
+            let mut img = whole.clone();
+            img.data.resize(len, 0);
+            let Err(e) = patchify(&img, plan(8, 6), PatchLayout::row_major(2)) else {
+                panic!("{name}: {len} bytes for an 8x6 frame were cut");
+            };
+            assert_eq!(
+                e.to_string(),
+                format!("image size 8x6: {len} data bytes where the frame has 144")
+            );
+        }
     }
 
     /// A layout with a zero side or frame count is a configuration error, not a size one: it is
