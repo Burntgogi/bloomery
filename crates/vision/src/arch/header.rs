@@ -88,20 +88,28 @@ pub(crate) fn counts<const N: usize>(
 ) -> Result<[usize; N], VisionError> {
     let mut out = [0usize; N];
     for (slot, (key, want, from)) in out.iter_mut().zip(table) {
-        let v = need(m, key)?;
-        let got = v
-            .as_unsigned()
-            .ok_or_else(|| refusal(key, format!("is {v:?}, not a count")))?;
+        let got = need_count(m, key)?;
         if got != want {
             return Err(refusal(
                 key,
                 format!("is {got}; {projector} runs {want} ({from})"),
             ));
         }
-        *slot =
-            usize::try_from(got).map_err(|_| refusal(key, format!("{got} does not fit usize")))?;
+        *slot = count_to_usize(key, got)?;
     }
     Ok(out)
+}
+
+/// The value of a count key: an unsigned integer of any stored width.
+fn need_count(m: &impl Meta, key: &str) -> Result<u64, VisionError> {
+    let v = need(m, key)?;
+    v.as_unsigned()
+        .ok_or_else(|| refusal(key, format!("is {v:?}, not a count")))
+}
+
+/// A count as a `usize`, refused by key when it does not fit.
+fn count_to_usize(key: &str, got: u64) -> Result<usize, VisionError> {
+    usize::try_from(got).map_err(|_| refusal(key, format!("{got} does not fit usize")))
 }
 
 /// A count key that may hold any positive multiple of `unit`: the width a kernel's tile takes.
@@ -112,17 +120,14 @@ pub(crate) fn count_multiple(
     unit: u64,
     why: &str,
 ) -> Result<usize, VisionError> {
-    let v = need(m, key)?;
-    let got = v
-        .as_unsigned()
-        .ok_or_else(|| refusal(key, format!("is {v:?}, not a count")))?;
+    let got = need_count(m, key)?;
     if got == 0 || !got.is_multiple_of(unit) {
         return Err(refusal(
             key,
             format!("is {got}; {why} a positive multiple of {unit}"),
         ));
     }
-    usize::try_from(got).map_err(|_| refusal(key, format!("{got} does not fit usize")))
+    count_to_usize(key, got)
 }
 
 /// The layer-norm epsilon, an f32 key that must equal `want`; `source` names what uses it.

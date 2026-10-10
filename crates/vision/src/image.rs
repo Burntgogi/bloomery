@@ -148,17 +148,7 @@ impl Rgb8 {
         } else {
             pixels
         };
-        if data.len() != width * height * 3 {
-            return Err(VisionError::Decode(format!(
-                "{} RGB bytes for a {width}x{height} frame",
-                data.len()
-            )));
-        }
-        Ok(Rgb8 {
-            width,
-            height,
-            data,
-        })
+        Rgb8::from_decoded(width, height, data)
     }
 
     /// Decode a PNG file's bytes to RGB, as the reference's `Image.open(...).convert("RGB")`.
@@ -213,6 +203,11 @@ impl Rgb8 {
                 )));
             }
         }
+        Rgb8::from_decoded(width, height, data)
+    }
+
+    /// A decoder's output as an image, refused when its byte count is not the frame's.
+    fn from_decoded(width: usize, height: usize, data: Vec<u8>) -> Result<Rgb8, VisionError> {
         if data.len() != width * height * 3 {
             return Err(VisionError::Decode(format!(
                 "{} RGB bytes for a {width}x{height} frame",
