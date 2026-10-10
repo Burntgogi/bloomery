@@ -11,6 +11,7 @@ use super::Hparams;
 use super::tensors::{Home, expected};
 
 pub use crate::arch::card::CardBytes;
+use crate::arch::card::activation_bytes;
 
 /// The encoder's bytes on its card for a file of `hp` (module doc).
 #[must_use]
@@ -83,20 +84,22 @@ impl ScratchLens {
     /// Bytes on the card: four per `cs` value, two per value of every other buffer.
     #[must_use]
     pub fn bytes(&self) -> u64 {
-        let bf16 = [
-            self.patches,
-            self.xa,
-            self.xb,
-            self.h,
-            self.qkv,
-            self.att,
-            self.u,
-            self.act,
-            self.un,
-            self.hh,
-            self.rows,
-        ];
-        4 * self.cs as u64 + 2 * bf16.iter().map(|&v| v as u64).sum::<u64>()
+        activation_bytes(
+            self.cs,
+            [
+                self.patches,
+                self.xa,
+                self.xb,
+                self.h,
+                self.qkv,
+                self.att,
+                self.u,
+                self.act,
+                self.un,
+                self.hh,
+                self.rows,
+            ],
+        )
     }
 }
 

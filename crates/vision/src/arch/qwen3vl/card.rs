@@ -16,6 +16,7 @@ use super::size::TokenLimits;
 use super::tensors::{Export, expected};
 use super::{Hparams, TEMPORAL_FRAMES, names};
 pub use crate::arch::card::CardBytes;
+use crate::arch::card::activation_bytes;
 
 /// The tower of a file of `hp` at `limits` image tokens (module doc).
 #[must_use]
@@ -99,7 +100,7 @@ impl ScratchLens {
     /// The buffers of the largest plan `limits` allow.
     #[must_use]
     pub fn of(hp: &Hparams, limits: TokenLimits) -> ScratchLens {
-        let tokens = limits.max_tokens();
+        let tokens = limits.max();
         let n = tokens * hp.merge * hp.merge;
         let merged = hp.dim * hp.merge * hp.merge;
         ScratchLens {
@@ -122,19 +123,21 @@ impl ScratchLens {
     /// Bytes on the card: four per `cs` value, two per value of every other buffer.
     #[must_use]
     pub fn bytes(&self) -> u64 {
-        let bf16 = [
-            self.patches,
-            self.pos,
-            self.xa,
-            self.xb,
-            self.h,
-            self.qkv,
-            self.att,
-            self.u,
-            self.hh,
-            self.rows,
-        ];
-        4 * self.cs as u64 + 2 * bf16.iter().map(|&v| v as u64).sum::<u64>()
+        activation_bytes(
+            self.cs,
+            [
+                self.patches,
+                self.pos,
+                self.xa,
+                self.xb,
+                self.h,
+                self.qkv,
+                self.att,
+                self.u,
+                self.hh,
+                self.rows,
+            ],
+        )
     }
 }
 

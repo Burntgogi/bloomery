@@ -34,12 +34,6 @@ impl TokenLimits {
         max: MAX_TOKENS,
     };
 
-    /// The most tokens an image takes.
-    #[must_use]
-    pub const fn max_tokens(self) -> usize {
-        self.max
-    }
-
     /// `min` and `max` tokens; each at least 1 and `min` at most `max`.
     pub fn new(min: usize, max: usize) -> Result<TokenLimits, VisionError> {
         if min == 0 || max == 0 || min > max {
@@ -58,7 +52,7 @@ impl TokenLimits {
 
     /// The most tokens an image takes.
     #[must_use]
-    pub fn max(self) -> usize {
+    pub const fn max(self) -> usize {
         self.max
     }
 }
