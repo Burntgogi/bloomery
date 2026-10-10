@@ -218,8 +218,8 @@ use app::{OpenLog, RowsLog, Session, SessionError};
 use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::model::{SlotRows, StepMode};
 use bloomery_gpu_gates::bind::{
-    CacheRam, ChatSurface, Listen, Seat, SeatEngine, SlotPassRow, SlotStep, Vocab, bind_server,
-    model_props, note_line, parallel_line, placement_of, slots_given,
+    CacheRam, ChatSurface, Listen, Pass, Seat, SeatEngine, SlotPassRow, SlotStep, Vocab,
+    bind_server, model_props, note_line, parallel_line, placement_of, slots_given,
 };
 use bloomery_gpu_gates::generate::{Place, mode_name, with_cards};
 use bloomery_gpu_gates::record::{self, Record};
@@ -330,12 +330,10 @@ impl Rounds {
         }
     }
 
-    /// The `parallel` line's `pass=` word: `one` or `turns`.
-    fn word(self) -> &'static str {
-        match self {
-            Rounds::Steps | Rounds::Windows => "one",
-            Rounds::Turns => "turns",
-        }
+    /// The shape the `parallel` line names for `slots` slots: the rounds
+    /// that run as one pass are [`Pass::One`].
+    fn pass(self, slots: usize) -> Pass {
+        Pass::of(slots, self != Rounds::Turns)
     }
 }
 
@@ -941,7 +939,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         slots,
         rule.ctx,
         from,
-        Some(Rounds::of(draft_off.is_none()).word()),
+        Rounds::of(draft_off.is_none()).pass(slots),
     );
     if a.plan_only {
         // The records before the load are out; nothing was opened on a card.

@@ -133,9 +133,10 @@
 //! (a slot's round runs whether the others stream), so `--park-ram` is
 //! refused by name — resident slots hold their state on the card, in the
 //! plan. A `parallel` line on stderr names the rule (`slots`), the slots,
-//! the split they serve and what set the count (`from`: the `--parallel`
+//! the split they serve, what set the count (`from`: the `--parallel`
 //! flag, a set `--ctx-size`, the default, `route-trace`, or `paged`, the rule
-//! below).
+//! below) and the shape of a round of several slots (`pass=one`, or
+//! `pass=turns` under `--place bp`, which runs the slots a slot at a time).
 //! `--queue-depth Q` bounds the requests that wait for a slot.
 //!
 //! A plan that pages host experts through the NVMe tier's RAM arena (a room
@@ -320,8 +321,8 @@ use bloomery_gpu::host::route_trace::RouteTrace;
 use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::model::StepMode;
 use bloomery_gpu_gates::bind::{
-    CacheRam, ChatSurface, Listen, Seat, SeatEngine, SlotPassRow, SlotStep, Vocab, bind_server,
-    model_props, note_line, parallel_line, placement_of,
+    CacheRam, ChatSurface, Listen, Pass, Seat, SeatEngine, SlotPassRow, SlotStep, Vocab,
+    bind_server, model_props, note_line, parallel_line, placement_of,
 };
 use bloomery_gpu_gates::generate::{BreakEven, Place};
 use bloomery_gpu_gates::nodes::count_kinds;
@@ -1604,10 +1605,14 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         "{} message_start={MESSAGE_START} in_vocab={has_start} in_template={in_template}",
         cache.line()
     );
+    // The rounds of several slots, decided once (the open takes it through
+    // `SeatArgs`): one pass of the busy rows, a slot at a time beside an
+    // expert tier card ([`Place38::tiered`]).
+    let pass = Pass::of(slots, !a.place.tiered());
     // The slots the seat serves ([`Session::add_slots`]): the flag's, one
     // beside a set `--ctx-size`, or 2 — one drafted pass a slot a round,
     // nothing parked.
-    parallel_line(slots, rule.ctx, from, None);
+    parallel_line(slots, rule.ctx, from, pass);
     if mtp {
         let be = break_even_of(a.place);
         eprintln!(
@@ -1662,7 +1667,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     // bound only lowers the context the rule read, which leaves the card
     // more experts and the host fewer, so a paged load of several columns
     // — slots stepped together, or a draft — is the seat's own breach.
-    if plan.host.nvme_arena_bytes > 0 && ((slots > 1 && !a.place.tiered()) || mtp) {
+    if plan.host.nvme_arena_bytes > 0 && (pass.together(slots) || mtp) {
         return Err(format!(
             "the load's plan pages host experts through the NVMe tier's {} B RAM arena at \
              {slots} slots, the draft {}: the one-column rule read another plan",
@@ -1737,6 +1742,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         place: a.place,
         ctx,
         slots,
+        pass,
         experts,
         plan_levers,
         room: inputs.room.clone(),
@@ -1864,6 +1870,9 @@ struct SeatArgs {
     /// The resident sequences the plan counted and the load makes
     /// ([`Session::add_slots`] after the captures).
     slots: usize,
+    /// The shape of a round of several slots, which the `parallel` line
+    /// named and the open runs.
+    pass: Pass,
     experts: Experts,
     plan_levers: PlanLevers,
     /// The host's room and its reading as the main thread's plans took them
@@ -2153,11 +2162,11 @@ impl Q38 {
                 })?
             }
         };
-        // The rounds of several slots, decided once: one pass of the busy
-        // rows where the body runs one, the drafted rounds on a drafted load
-        // and the plain rounds on a plain one.
-        let pass_of_slots = a.slots > 1 && !a.place.tiered();
-        if a.slots > 1 && a.place.tiered() {
+        // The rounds of several slots, decided once (`SeatArgs::pass`): one
+        // pass of the busy rows where the body runs one, the drafted rounds
+        // on a drafted load and the plain rounds on a plain one.
+        let pass_of_slots = a.pass.together(a.slots);
+        if a.pass == Pass::Turns {
             eprintln!(
                 "bloomery-serve-qwen38: --place {}: the rounds of several slots run a slot at a \
                  time: the body runs no pass of several slots beside an expert tier card",

@@ -86,7 +86,12 @@
 //!   `ctx` line's own context times the slots — with the word that set the
 //!   count (`from`: `flag`, the `--parallel`; `ctx`, a set `--ctx-size`
 //!   under no `--parallel`, the one-slot rule the `ctx` clause holds too;
-//!   `default`);
+//!   `default`); and the slots clause's server (`--place gate`, two slots,
+//!   no expert tier card) names the shape of its rounds, `pass=one`
+//!   (`slots_parallel_line_names_one_pass`; FAIL-first: the word printed
+//!   `turns`). No server here runs `--place bp`, the one placement that
+//!   prints `pass=turns` for the seat (`Pass::of` in `bind`'s unit test
+//!   holds the word);
 //! - the slots clause ([`slots_flow_together`], a server of its own under
 //!   `BLOOMERY_DRAFT=mtp`, `BLOOMERY_RESIDENCY=off`, the fixed window — the
 //!   clauses that compare draft counts across two runs of a server hold it,
@@ -1676,6 +1681,12 @@ mod gate {
             .map(str::to_owned))
     }
 
+    /// The value of `key` on one of the seat's `key=value` lines.
+    fn word_of<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+        line.split_whitespace()
+            .find_map(|w| w.strip_prefix(key)?.strip_prefix('='))
+    }
+
     /// The `parallel` line's rule against its own terms (the module header):
     /// under `slots` the line's slots are the flag's (`--parallel`'s value,
     /// the caller naming it) or the default's (2), and the split the line
@@ -1684,10 +1695,7 @@ mod gate {
     /// `total` the slots' sum. `None` a line that is not the seat's;
     /// `Some(false)` a rule whose terms do not hold.
     fn parallel_agrees(line: &str, flag: Option<usize>) -> Option<bool> {
-        let field = |k: &str| {
-            line.split_whitespace()
-                .find_map(|w| w.strip_prefix(k)?.strip_prefix('='))
-        };
+        let field = |k: &str| word_of(line, k);
         let rule = field("rule")?;
         let slots: usize = field("slots")?.parse().ok()?;
         let slot_ctx: usize = field("slot_ctx")?.parse().ok()?;
@@ -1962,6 +1970,7 @@ mod gate {
                 );
                 for name in [
                     "slots_parallel_line_names_the_rule",
+                    "slots_parallel_line_names_one_pass",
                     "slots_load_names_the_split",
                     "slots_alone_ids_stay",
                     "slots_alone_draft_counts_stay",
@@ -1984,6 +1993,13 @@ mod gate {
             &mut ok,
             "slots_parallel_line_names_the_rule",
             line.contains("rule=slots") && parallel_agrees(&line, Some(2)) == Some(true),
+        );
+        // The round's shape the seat's open runs (`--place gate`: no expert
+        // tier card, so the slots step as one pass).
+        check(
+            &mut ok,
+            "slots_parallel_line_names_one_pass",
+            word_of(&line, "pass") == Some("one"),
         );
         // (v4) The load names the split, the `listening` record the same,
         // and /props the slot ctx.

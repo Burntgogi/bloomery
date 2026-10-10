@@ -624,8 +624,9 @@ mod gate {
             file,
             &["--parallel", "2", "--ctx", &c_arg],
         )?;
+        // `pass=turns`: the seat's `Pass::of(slots, false)`, it overrides no `Seat::step_slots`.
         let want = format!(
-            "parallel rule=slots slots=2 slot_ctx={} total={} from=flag",
+            "parallel rule=slots slots=2 slot_ctx={} total={} from=flag pass=turns",
             c / 2,
             2 * (c / 2)
         );
@@ -887,8 +888,9 @@ mod gate {
             .kv
             .bytes(0..LAYERS as usize, CTX as u64);
         let stderr = std::fs::read_to_string(&err_log).unwrap_or_default();
+        // `pass=turns` as at `slots_total_is_planned`.
         let line = format!(
-            "parallel rule=slots slots=2 slot_ctx={CTX} total={} from=flag",
+            "parallel rule=slots slots=2 slot_ctx={CTX} total={} from=flag pass=turns",
             2 * CTX
         );
         let resident = load.u64("resident_bytes")?;

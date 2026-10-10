@@ -104,7 +104,8 @@
 //! into `<dir>/slots`:
 //!
 //! - its `parallel` line names the rule, the two slots, the default context
-//!   a slot and their total; its `slots` line two sequences made of two
+//!   a slot, their total and the shape of a round (`pass=one`: no draft);
+//!   its `slots` line two sequences made of two
 //!   planned; `/props`' `n_ctx` the default context;
 //! - (s5) two greedy requests (`ignore_eos`, `cache_prompt: false`), each
 //!   alone, then both posted at once: each request's ids are its alone ids,
@@ -2048,12 +2049,13 @@ mod gate {
         let whole = served_positions()?;
         println!("slots: {parallel}; {made}; /props n_ctx {n_ctx:?}");
         let mut ok = true;
+        // `pass=one`: no draft here, so the seat's `Pass::of(slots, draft == Draft::Off)`.
         check(
             &mut ok,
             "slots_name_a_whole_context_each",
             parallel
                 == format!(
-                    "parallel rule=slots slots=2 slot_ctx={whole} total={} from=flag",
+                    "parallel rule=slots slots=2 slot_ctx={whole} total={} from=flag pass=one",
                     2 * whole
                 )
                 && made.starts_with("slots made=2 planned=2 ")

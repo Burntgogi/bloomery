@@ -323,15 +323,61 @@ pub fn slots_given(
     Ok((slots, from))
 }
 
+/// The shape a seat's round of several slots runs in, decided once at the
+/// open: the busy slots' rows as one pass of the body, or a select and a
+/// step (a pass, drafted) a slot in turn ([`step_rows_in_turn`],
+/// [`pass_rows_in_turn`]). The one owner of the `parallel` line's `pass=`
+/// word; every seat passes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pass {
+    /// One pass of the busy rows (or a load of one slot, which runs no round
+    /// of several).
+    One,
+    /// A select and a step a slot.
+    Turns,
+}
+
+impl Pass {
+    /// The shape of a load of `slots` slots whose body runs a round of
+    /// several as one pass when `one_pass`; one slot is [`Pass::One`]
+    /// whatever the body does.
+    pub fn of(slots: usize, one_pass: bool) -> Pass {
+        if slots > 1 && !one_pass {
+            Pass::Turns
+        } else {
+            Pass::One
+        }
+    }
+
+    /// Whether a round of `slots` slots runs as one pass of the busy rows:
+    /// several slots, and the shape [`Pass::One`].
+    pub fn together(self, slots: usize) -> bool {
+        slots > 1 && self == Pass::One
+    }
+
+    /// The `parallel` line's `pass=` word.
+    pub fn word(self) -> &'static str {
+        match self {
+            Pass::One => "one",
+            Pass::Turns => "turns",
+        }
+    }
+}
+
+/// The text of [`parallel_line`].
+fn parallel_text(slots: usize, slot_ctx: usize, from: &str, pass: Pass) -> String {
+    format!(
+        "parallel rule=slots slots={slots} slot_ctx={slot_ctx} total={} from={from} pass={}",
+        slots * slot_ctx,
+        pass.word()
+    )
+}
+
 /// The `parallel` line a seat prints before its load: the slots, a slot's
 /// context, the total, what set the count (`from`), and the shape of a round
-/// (`pass`) where the seat has one.
-pub fn parallel_line(slots: usize, slot_ctx: usize, from: &str, pass: Option<&str>) {
-    let pass = pass.map_or_else(String::new, |p| format!(" pass={p}"));
-    eprintln!(
-        "parallel rule=slots slots={slots} slot_ctx={slot_ctx} total={} from={from}{pass}",
-        slots * slot_ctx
-    );
+/// of several slots (`pass`).
+pub fn parallel_line(slots: usize, slot_ctx: usize, from: &str, pass: Pass) {
+    eprintln!("{}", parallel_text(slots, slot_ctx, from, pass));
 }
 
 /// `/props`' placement of `plan` on `machine`: its cards by nvidia-smi
@@ -2756,6 +2802,37 @@ mod tests {
     /// The checkpoints a load's sequences pin grow one [`HOST_BUDGET`] a
     /// sequence ([`checkpoint_bytes`]), the bytes the machine's checkpoint
     /// reserve carries.
+    /// The `parallel` line names the shape a round of several slots runs
+    /// in: one slot is `one` whatever the body does, several slots are `one`
+    /// where the body runs one pass of the busy rows and `turns` where it
+    /// does not, and `together` is the several-slots one-pass fact the seats
+    /// size their rounds by.
+    #[test]
+    fn the_parallel_line_names_the_shape_of_a_round() {
+        use super::{Pass, parallel_text};
+        for (slots, one_pass, want) in [
+            (1, true, Pass::One),
+            (1, false, Pass::One),
+            (2, true, Pass::One),
+            (2, false, Pass::Turns),
+        ] {
+            assert_eq!(Pass::of(slots, one_pass), want, "slots {slots} {one_pass}");
+        }
+        assert!(!Pass::One.together(1));
+        assert!(Pass::One.together(2));
+        assert!(!Pass::Turns.together(2));
+        assert_eq!(Pass::One.word(), "one");
+        assert_eq!(Pass::Turns.word(), "turns");
+        assert_eq!(
+            parallel_text(2, 4096, "flag", Pass::One),
+            "parallel rule=slots slots=2 slot_ctx=4096 total=8192 from=flag pass=one"
+        );
+        assert_eq!(
+            parallel_text(2, 7, "default", Pass::Turns),
+            "parallel rule=slots slots=2 slot_ctx=7 total=14 from=default pass=turns"
+        );
+    }
+
     #[test]
     fn checkpoint_bytes_grow_a_budget_a_sequence() {
         use crate::residency38::checkpoint_bytes;

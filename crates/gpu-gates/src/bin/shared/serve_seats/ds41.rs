@@ -93,8 +93,10 @@
 //! host's usable bytes past its tensors, ring shadows and reserves); and
 //! `--park-ram` is refused by name: resident slots hold their state in the
 //! plan. A `parallel` line on stderr names the rule (`slots`), the slots, a
-//! slot's context, the total and what set the count (`flag`, `default`, or
-//! one slot under the DSpark draft and under a route trace); a `slots` line
+//! slot's context, the total, what set the count (`flag`, `default`, or
+//! one slot under the DSpark draft and under a route trace) and the shape of
+//! a round of several slots (`pass=one` with no draft, `pass=turns` under
+//! the lookup draft); a `slots` line
 //! after the load names each sequence's card and page-locked host bytes.
 //! `--queue-depth Q` bounds the requests that wait for a slot. Several slots
 //! are refused by name under the DSpark draft (its window is one sequence's,
@@ -194,8 +196,8 @@ use bloomery_gpu_deepseek41::body::{self, Body, Deepseek41Model, PAIR_ROWS, SeqS
 use bloomery_gpu_deepseek41::draft::DraftBody;
 use bloomery_gpu_deepseek41::swap;
 use bloomery_gpu_gates::bind::{
-    CacheRam, ChatSurface, Listen, Seat, SeatEngine, SlotStep, Vocab, bind_server, model_props,
-    nvidia_smi_index, parallel_line, placement_of,
+    CacheRam, ChatSurface, Listen, Pass, Seat, SeatEngine, SlotStep, Vocab, bind_server,
+    model_props, nvidia_smi_index, parallel_line, placement_of,
 };
 use bloomery_gpu_gates::generate::{Place, PlaceWhy, mode_name};
 use bloomery_gpu_gates::record::{self, Record};
@@ -523,7 +525,11 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let (slots, from) = slot_count(a.parallel, draft, levers.route_trace().is_some())?;
     // Before anything is read or planned: a context no slot can serve.
     let ctx = slot_ctx(a.ctx, slots)?;
-    parallel_line(slots.get(), ctx, from, None);
+    // The rounds of several slots, decided once (the open takes it through
+    // `SeatArgs`): one pass of the busy rows with no draft, else the fallback
+    // loop ([`V41::one_pass`]).
+    let pass = Pass::of(slots.get(), draft == Draft::Off);
+    parallel_line(slots.get(), ctx, from, pass);
     // The encoder's file is read before the plan, which reserves its bytes.
     #[cfg(feature = "vision")]
     let vision_seat = vision_of(&a, cfg.body.prefill)?;
@@ -599,6 +605,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         place: a.place,
         ctx,
         slots,
+        pass,
         cfg,
         pin_main: levers.pin_main(),
         want_top_k: inputs.hp.indexer.top_k,
@@ -810,6 +817,9 @@ struct SeatArgs {
     ctx: usize,
     /// The resident sequences the plan counts and the load makes.
     slots: NonZeroUsize,
+    /// The shape of a round of several slots, which the `parallel` line
+    /// named and the open runs.
+    pass: Pass,
     cfg: body::OpenCfg,
     pin_main: bool,
     /// The file's `top_k` and layer count, from its headers.
@@ -1151,7 +1161,7 @@ impl V41 {
             s,
             ctx: a.ctx,
             draft,
-            one_pass: a.slots.get() > 1 && a.draft == Draft::Off,
+            one_pass: a.pass.together(a.slots.get()),
             stats: a.stats,
             #[cfg(feature = "vision")]
             vision,

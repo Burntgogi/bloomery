@@ -104,7 +104,7 @@ use app::arch::mimo2::Mimo2Cfg;
 use app::{Loaded, OpenArgs, OpenLog, Session, SessionError};
 use bloomery_gpu::model::StepMode;
 use bloomery_gpu_gates::bind::{
-    ChatSurface, Listen, Seat, SeatEngine, Vocab, bind_server, model_props, note_line,
+    ChatSurface, Listen, Pass, Seat, SeatEngine, Vocab, bind_server, model_props, note_line,
     parallel_line, placement_of, slots_given,
 };
 use bloomery_gpu_gates::generate::{CTX_GRAN, Place, trained_ctx};
@@ -558,7 +558,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
             .map_or_else(|| "none".to_owned(), |t| t.to_string())
     );
     record::plan(place.name(), &machine, &plan).eprint();
-    parallel_line(slots, slot_ctx, from, None);
+    parallel_line(slots, slot_ctx, from, Pass::of(slots, false));
     if a.plan_only {
         // The records before the load are out; nothing was opened on a card.
         std::process::exit(0);

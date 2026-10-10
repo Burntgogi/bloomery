@@ -114,8 +114,10 @@
 //! prints a `slots round` record naming its command, rows, passes and the
 //! slots the seat serves. `--parallel 1` is exactly the one-sequence server.
 //! A `parallel` line on stderr before the load names the rule (`slots`), the
-//! slots, a slot's context, the total and what set the count (`from`: the
-//! `--parallel` flag, a set `--ctx`, the default). `--queue-depth Q` bounds
+//! slots, a slot's context, the total, what set the count (`from`: the
+//! `--parallel` flag, a set `--ctx`, the default) and the shape of a round of
+//! several slots (`pass`: `one`, or `turns` on a load that keeps routed
+//! experts on the host tier). `--queue-depth Q` bounds
 //! the requests that wait for a slot; `--park-ram`
 //! is refused by name: the resident slots hold no parked state the flag
 //! could budget.
@@ -140,8 +142,8 @@ use bloomery_gpu::arch::qwen3moe::{Body, Body35, KvQ8, Open35, Qwen35moeModel};
 use bloomery_gpu::model::{GpuModel, MAX_PASS_ROWS, Slots, StepMode};
 use bloomery_gpu::{Gpu, Qwen3moeModel};
 use bloomery_gpu_gates::bind::{
-    ChatSurface, Listen, Seat, SeatEngine, SlotStep, Vocab, bind_server, note_line, parallel_line,
-    slots_given,
+    ChatSurface, Listen, Pass, Seat, SeatEngine, SlotStep, Vocab, bind_server, note_line,
+    parallel_line, slots_given,
 };
 use bloomery_gpu_gates::generate::Place;
 use bloomery_gpu_gates::record::{self, Record};
@@ -626,11 +628,13 @@ impl<B: Body3> Q3<B> {
     /// The model of the file at `path` in graph mode by `load`
     /// ([`Body3::open`]), its step captured and, unless placed, its passes,
     /// `slots` resident sequences parked after them (each capturing on its
-    /// first use), the session over it; the `load` record on stderr.
+    /// first use), the session over it; the `load` record on stderr. The
+    /// opened body is held to `pass`, the shape the `parallel` line named.
     fn open(
         path: &Path,
         ctx: usize,
         slots: usize,
+        pass: Pass,
         load: Q3Load,
         levers: &Levers,
         kv: KvQ8,
@@ -641,6 +645,16 @@ impl<B: Body3> Q3<B> {
         m.set_mode(StepMode::Graph);
         let nodes = m.capture_step()?;
         let placed = B::placed(&m)?;
+        let ran = pass_of::<B>(slots, placed);
+        if ran != pass {
+            return Err(format!(
+                "the `parallel` line named pass={} and the load runs pass={}: the plan's host \
+                 experts and the opened body's placement disagree",
+                pass.word(),
+                ran.word()
+            )
+            .into());
+        }
         if !placed {
             B::capture_passes(&mut m)?;
         }
@@ -664,7 +678,7 @@ impl<B: Body3> Q3<B> {
         Ok(Q3 {
             s,
             ctx,
-            one_pass: slots > 1 && !placed && B::ONE_PASS,
+            one_pass: ran.together(slots),
             stats: levers.step_stats(),
         })
     }
@@ -782,6 +796,31 @@ enum Q3Load {
         total: usize,
         why: Option<&'static str>,
     },
+}
+
+impl Q3Load {
+    /// Whether the open runs routed experts on the host tier ([`Body3::placed`]
+    /// reads the same fact off the opened body): only a placed plan with host
+    /// experts does — `open_qwen3` and `open_qwen35` load the whole model on a
+    /// plan with none.
+    fn host_tier(&self, levers: &Levers) -> Result<bool, GateError> {
+        match self {
+            Q3Load::Whole(_) => Ok(false),
+            Q3Load::Placed { q, total, .. } => {
+                let plan = q.plan(*total, &PlanLevers::from_levers(levers)?)?;
+                Ok(plan.host.experts > 0)
+            }
+        }
+    }
+}
+
+/// The shape of a round of `slots` slots on body `B` whose load `placed` its
+/// experts on the host tier or not: one pass of the busy rows on a body that
+/// runs one ([`Body3::ONE_PASS`]) beside no host tier, else the fallback loop
+/// (a select and a step a slot). The one owner of the rule, which the
+/// `parallel` line names ahead of the load and the open holds the load to.
+fn pass_of<B: Body3>(slots: usize, placed: bool) -> Pass {
+    Pass::of(slots, B::ONE_PASS && !placed)
 }
 
 /// What the `arch` file loads as at `total` positions for `parallel`
@@ -929,9 +968,16 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     if matches!(arch, Arch::Qwen35moe) {
         q3place::checkpoints_fit(seqs35(slots), matches!(load, Q3Load::Placed { .. }))?;
     }
+    // The shape of a round of several slots, from the plan's host experts
+    // ([`Q3Load::host_tier`]); the open holds the opened body to it.
+    let host_tier = load.host_tier(&levers)?;
+    let pass = match arch {
+        Arch::Qwen3moe => pass_of::<Body>(slots, host_tier),
+        _ => pass_of::<Body35>(slots, host_tier),
+    };
     // The slots the seat serves, one line before the load (`from` names what
     // set the count).
-    parallel_line(slots, slot_ctx, from, None);
+    parallel_line(slots, slot_ctx, from, pass);
     drop(split);
     let vocab = Arc::new(Vocab::new(Tokenizer::from_gguf(&path)?)?);
     let open = path.clone();
@@ -942,7 +988,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     .to_owned();
     let engine = match arch {
         Arch::Qwen3moe => SeatEngine::spawn(
-            move || Q3::<Body>::open(&open, slot_ctx, slots, load, &levers, kv),
+            move || Q3::<Body>::open(&open, slot_ctx, slots, pass, load, &levers, kv),
             slot_ctx,
             vocab,
             device,
@@ -950,7 +996,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
             0,
         )?,
         _ => SeatEngine::spawn(
-            move || Q3::<Body35>::open(&open, slot_ctx, slots, load, &levers, kv),
+            move || Q3::<Body35>::open(&open, slot_ctx, slots, pass, load, &levers, kv),
             slot_ctx,
             vocab,
             device,
