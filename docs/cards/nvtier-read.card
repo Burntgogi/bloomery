@@ -9,6 +9,8 @@
 # References, written after a functional run (not a result) had shown direct1 over the range far under
 # 6.12: direct1 (a 1 MB pread a part, one in flight: first-byte latency plus the transfer) 3.4..4.6; `drive`
 # (4 MiB requests on one thread) 5.5..6.7. The request size odmax read at is not confirmed here.
+# Corrected 2026-10-11: odmax timed V4.1 swap-source copies, not this arm; the `drive` arm read 4.506, 4.446
+# and 4.614 GB/s in its three runs (R0, two qdsweep runs), so its reference is 4.53 ± 10 % (tools/ref/nvtier-read.sh).
 # The decision statistic: a decode layer with a miss reads 1.5 experts on average [derived: 22.3 misses a
 # token over 14.5 layers with a miss, the design's keep+prep+seat replay at 22 GB], so `case=k2 arm=cache`
 # decides against the band; k1 and k3 bracket it and say which term moved (first-byte latency, or bandwidth).
@@ -40,7 +42,7 @@ condition: one lease (tools/ref/nvtier-read.sh through `just time-nvread`: lease
   and no readahead overread; the runner's `[reclaim]` line shows no direct scan or allocation stall across
   the round, and no `[cpu-busy]` or `[mem-full]` tag stands, or the cache arm's rate is read with that tag
   (the box's page cache is usually full, so the cache arm's allocations can meet reclaim); the O_DIRECT
-  reference valid, `arm=drive case=range` within 10 % of 6.12 GB/s (rig-log 09-29#odmax), or the run
+  reference valid, `arm=drive case=range` within 10 % of 4.53 GB/s (qdsweep 2026-10-11; 6.12 before, misattributed), or the run
   measured the drive's state, not the path. The small-k direct rows read bytes the drive served a moment
   earlier in the batch: upper bounds, not references
 decide-in: when the `case=k2 arm=cache` median is in the band (the statistic the three decisions read), build R2 as specced (the page-cache tier through engram's RowTable) and carry the k1..k3 medians

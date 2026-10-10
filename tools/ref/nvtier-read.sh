@@ -54,8 +54,11 @@ source "${BASH_SOURCE[0]%/*}/drive-read.sh"
 
 # The O_DIRECT reference's band: `arm=drive case=range` outside REF_GBS ± REF_TOL read the drive in another
 # state than the sitting's bands were derived for, and the sitting is void (docs/cards/nvtier-read.card).
-# REF_GBS is the drive's own 4 MiB sequential read rate [measured, rig-log 09-29#odmax].
-REF_GBS=6.12
+# REF_GBS is this arm's own rate: 4 MiB O_DIRECT requests on one thread over a 256-expert range of the Qwen3.8
+# file, the mean of the two qdsweep runs that read it under the lease (4.446 GB/s at load 37, 4.614 at load 11).
+# PIN(2026-10-11): was 6.12 from rig-log 09-29#odmax, which timed V4.1 swap-source copies, not this arm's
+# requests; this arm read 4.45..4.61 in all three runs it made (R0 4.506), never near 6.12.
+REF_GBS=4.53
 REF_TOL=0.10
 
 # ref_judge <round> <probe-output-file>: the round's reference judge. Reads the `arm=drive case=range` row's
@@ -74,7 +77,7 @@ ref_judge() {
     lo = ref * (1 - tol); hi = ref * (1 + tol)
     eps = 0.0005  # half the last printed digit of the median: a red line never shows a median inside the band
     if (med + 0 >= lo - eps && med + 0 <= hi + eps) exit 0
-    printf "[reference-off] round %d: arm=drive case=range median %s GB/s outside %.3f..%.3f (%.2f GB/s ± %.0f %%, rig-log 09-29#odmax): the sitting is void (docs/cards/nvtier-read.card)\n", round, med, lo, hi, ref, tol * 100
+    printf "[reference-off] round %d: arm=drive case=range median %s GB/s outside %.3f..%.3f (%.2f GB/s ± %.0f %%, qdsweep 2026-10-11): the sitting is void (docs/cards/nvtier-read.card)\n", round, med, lo, hi, ref, tol * 100
     exit 1
   }'
 }
@@ -101,7 +104,7 @@ reconcile_round() {
 }
 
 # self_test: `nvtier-read.sh --self-test`, the two round judges on fixed text (the r0 sitting's rows and
-# numbers: the reference 4.506 GB/s against 6.12 ± 10 %, the ratio 1.3718) beside a green round, before any
+# numbers: the reconcile ratio 1.3718) beside a green round, before any
 # check, lease or run (it runs on the Mac). One line per check, `ok <name>` or `FAIL <name>: …`; the last
 # line is the verdict.
 self_test() {
@@ -123,22 +126,21 @@ self_test() {
 probe_nvread: 48 layers x 512 experts, 8 threads, seed 121455004442980, lease true
 nvread arm=cache case=range experts=256 threads=8 batches=16 warmup=2 redraws=0 bytes=801177600 span_bytes=804323328 read_bytes=14448328704 median=5.900 p10=5.758 p90=6.746 ms=128.560 seed=121455004442980 lease=true
 nvread arm=directN case=range experts=256 threads=8 batches=16 warmup=2 redraws=0 bytes=801177600 span_bytes=804323328 read_bytes=14448328704 median=6.189 p10=4.304 p90=6.895 ms=127.094 seed=121455004442980 lease=true
-nvread arm=drive case=range experts=256 threads=8 batches=16 warmup=2 redraws=0 bytes=801177600 span_bytes=801189888 read_bytes=14391926784 median=6.117 p10=5.758 p90=6.746 ms=174.660 seed=121455004442980 lease=true
+nvread arm=drive case=range experts=256 threads=8 batches=16 warmup=2 redraws=0 bytes=801177600 span_bytes=801189888 read_bytes=14391926784 median=4.614 p10=4.135 p90=5.152 ms=174.660 seed=121455004442980 lease=true
 ROWS
   rc=0; out=$(ref_judge 1 "$f") || rc=$?
   row reference-in-band 0 ''
   rc=0; out=$(reconcile_round 1 243964771106 244084822226 61466173440 nvme0n1 '') || rc=$?
   row reconcile-ratio-1 0 "[reconcile] round 1: drive read 61466173440 B, probe asked 61466173440 B, ratio 1.0000"
-  # The r0 sitting's reference: 4.506 GB/s, under 6.12 - 10 % — the decoy rows in band must not read as the
-  # reference.
-  sed -e 's/ median=6.117 p10=5.758 p90=6.746 ms=174.660 / median=4.506 p10=2.954 p90=5.217 ms=174.660 /' "$f" > "$f.2" && mv "$f.2" "$f"
+  # A drive below the band (4.000): the decoy rows in band must not read as the reference.
+  sed -e 's/ median=4.614 p10=4.135 p90=5.152 ms=174.660 / median=4.000 p10=2.954 p90=4.217 ms=174.660 /' "$f" > "$f.2" && mv "$f.2" "$f"
   rc=0; out=$(ref_judge 1 "$f") || rc=$?
-  row reference-off-4.506 1 "[reference-off] round 1: arm=drive case=range median 4.506 GB/s outside 5.508..6.732 (6.12 GB/s ± 10 %, rig-log 09-29#odmax): the sitting is void (docs/cards/nvtier-read.card)"
-  # The band's other side, and its edge: 6.800 is out, a median at the printed hi itself is in.
-  sed -e 's/ median=4.506 / median=6.800 /' "$f" > "$f.2" && mv "$f.2" "$f"
+  row reference-off-4.000 1 "[reference-off] round 1: arm=drive case=range median 4.000 GB/s outside 4.077..4.983 (4.53 GB/s ± 10 %, qdsweep 2026-10-11): the sitting is void (docs/cards/nvtier-read.card)"
+  # The band's other side: the old pin's 6.117, which this arm never read; the printed hi itself is in.
+  sed -e 's/ median=4.000 / median=6.117 /' "$f" > "$f.2" && mv "$f.2" "$f"
   rc=0; out=$(ref_judge 1 "$f") || rc=$?
-  row reference-off-6.800 1 "[reference-off] round 1: arm=drive case=range median 6.800 GB/s outside 5.508..6.732 (6.12 GB/s ± 10 %, rig-log 09-29#odmax): the sitting is void (docs/cards/nvtier-read.card)"
-  sed -e 's/ median=6.800 / median=6.732 /' "$f" > "$f.2" && mv "$f.2" "$f"
+  row reference-off-6.117 1 "[reference-off] round 1: arm=drive case=range median 6.117 GB/s outside 4.077..4.983 (4.53 GB/s ± 10 %, qdsweep 2026-10-11): the sitting is void (docs/cards/nvtier-read.card)"
+  sed -e 's/ median=6.117 / median=4.983 /' "$f" > "$f.2" && mv "$f.2" "$f"
   rc=0; out=$(ref_judge 1 "$f") || rc=$?
   row reference-at-hi-in-band 0 ''
   # No reference row at all: the probe printed no arm=drive row.
