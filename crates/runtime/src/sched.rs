@@ -32,7 +32,12 @@
 //!   serve when the group holds two units or more (the next item is another
 //!   unit's, so nothing it reads waits on this serve) and after the back
 //!   otherwise (it reads this back's output). A batch has no end: the call's
-//!   head follows its last group.
+//!   head follows its last group. A program whose shadow waits on copies the
+//!   host issues after its front's download declares [`BatchOrder::Fronts`]
+//!   instead ([`LayerProgram::BATCH_ORDER`]): every unit's first front goes
+//!   first, and each item's back is followed by the front of the same unit's
+//!   next layer — the other units' fronts of this layer are already in
+//!   flight, so no front sits between a shadow and its serve.
 //!
 //! Either way, while the host serves item `x` the card holds `x`'s shadow
 //! ahead of `x`'s back.
@@ -61,6 +66,24 @@ pub struct Overlap {
     pub port: PortKind,
 }
 
+/// How a [`PortKind::Batch`] walk orders the fronts of the items after the
+/// first against the serves. [`order`] of a step walk has one order and takes
+/// no kind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BatchOrder {
+    /// The next item's front goes ahead of this item's serve when the group
+    /// holds two units or more, after its back otherwise (the module
+    /// comment's rule).
+    Ahead,
+    /// Every unit's first front goes ahead of all serves; then per item `x`
+    /// its shadow, its serve, its back and the front of item `x + units` —
+    /// the same unit's next layer. At one unit this is [`BatchOrder::Ahead`]'s
+    /// order: the next front follows the back it reads. A port takes it only
+    /// where it can hold that many items in flight
+    /// ([`Port::open_ordered`]).
+    Fronts,
+}
+
 /// A unit and a layer, both counted from 0 within the walk.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct At {
@@ -83,21 +106,29 @@ pub enum Item {
 }
 
 /// The walk of `o` over `layers` layers, in enqueue order (the module
-/// comment's rule). Allocation-free: each entry is computed from its index.
+/// comment's rule), a batch walk in [`BatchOrder::Ahead`]'s order.
+/// Allocation-free: each entry is computed from its index.
 pub fn order(o: Overlap, layers: usize) -> impl Iterator<Item = Item> {
-    (0..).map_while(move |k| nth(o, layers, k))
+    order_in(o, layers, BatchOrder::Ahead)
 }
 
-/// Entry `k` of [`order`], `None` past the last.
-fn nth(o: Overlap, layers: usize, k: usize) -> Option<Item> {
+/// [`order`] with the batch walk's order named; a step walk has one order
+/// and ignores `batch`.
+pub fn order_in(o: Overlap, layers: usize, batch: BatchOrder) -> impl Iterator<Item = Item> {
+    (0..).map_while(move |k| nth(o, layers, batch, k))
+}
+
+/// Entry `k` of [`order_in`], `None` past the last.
+fn nth(o: Overlap, layers: usize, batch: BatchOrder, k: usize) -> Option<Item> {
     let u = o.units;
     if k < u {
         return Some(Item::Begin(k));
     }
     let k = k - u;
-    match o.port {
-        PortKind::Step => step_nth(u, layers, k),
-        PortKind::Batch => batch_nth(u, layers, k),
+    match (o.port, batch) {
+        (PortKind::Step, _) => step_nth(u, layers, k),
+        (PortKind::Batch, BatchOrder::Ahead) => ahead_nth(u, layers, k),
+        (PortKind::Batch, BatchOrder::Fronts) => fronts_nth(u, layers, k),
     }
 }
 
@@ -141,9 +172,10 @@ fn step_nth(u: usize, layers: usize, k: usize) -> Option<Item> {
     })
 }
 
-/// Entry `k` after the begins of a batch walk: the front of item 0, then four
-/// entries per item — three for the last, which has no next front.
-fn batch_nth(u: usize, layers: usize, k: usize) -> Option<Item> {
+/// Entry `k` after the begins of a batch walk in [`BatchOrder::Ahead`]'s
+/// order: the front of item 0, then four entries per item — three for the
+/// last, which has no next front.
+fn ahead_nth(u: usize, layers: usize, k: usize) -> Option<Item> {
     use Item::{Back, Front, Serve, Shadow};
     let n = u * layers;
     let at = |x: usize| At {
@@ -171,6 +203,43 @@ fn batch_nth(u: usize, layers: usize, k: usize) -> Option<Item> {
     items.into_iter().flatten().nth(j)
 }
 
+/// Entry `k` after the begins of a batch walk in [`BatchOrder::Fronts`]'s
+/// order: the fronts of the first `u` items, then per item its shadow, its
+/// serve and its back, and — for the first `n − u` items — the front of item
+/// `x + u`, so those carry four entries and the last `u` carry three.
+fn fronts_nth(u: usize, layers: usize, k: usize) -> Option<Item> {
+    use Item::{Back, Front, Serve, Shadow};
+    let n = u * layers;
+    let at = |x: usize| At {
+        unit: x % u,
+        layer: x / u,
+    };
+    if n == 0 {
+        return None;
+    }
+    if k < u {
+        return Some(Front(at(k)));
+    }
+    let k = k - u;
+    let with_next = n - u;
+    if k < 4 * with_next {
+        let x = k / 4;
+        return Some(match k % 4 {
+            0 => Shadow(at(x)),
+            1 => Serve(at(x)),
+            2 => Back(at(x)),
+            _ => Front(at(x + u)),
+        });
+    }
+    let k = k - 4 * with_next;
+    let x = with_next + k / 3;
+    (x < n).then(|| match k % 3 {
+        0 => Shadow(at(x)),
+        1 => Serve(at(x)),
+        _ => Back(at(x)),
+    })
+}
+
 /// Why a walk did not start, or a pass of resident slots has no point.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Refused {
@@ -182,6 +251,10 @@ pub enum Refused {
     Serve(At),
     /// A pass of resident slots with no slot in it ([`slot_lanes`]).
     NoSlots,
+    /// A batch order the walk's port does not lay out: a step port has one
+    /// order, and a batch port takes [`BatchOrder::Fronts`] only by
+    /// overriding [`Port::open_ordered`].
+    Order { order: BatchOrder, port: PortKind },
 }
 
 impl fmt::Display for Refused {
@@ -205,6 +278,10 @@ impl fmt::Display for Refused {
                 at.unit, at.layer
             ),
             Refused::NoSlots => write!(f, "a pass of 0 resident slots: no lane to lay out"),
+            Refused::Order { order, port } => write!(
+                f,
+                "a walk in the {order:?} order through a {port:?} port, which does not lay it out"
+            ),
         }
     }
 }
@@ -219,6 +296,20 @@ pub trait Port {
     /// A walk of `o` begins: the port refuses by name a point it cannot lay
     /// out.
     fn open(&mut self, o: Overlap) -> Result<(), Self::Error>;
+
+    /// A walk of `o` in the batch order `order` begins. The default takes
+    /// [`BatchOrder::Ahead`] — what [`Port::open`] opens — and refuses every
+    /// other order by name, so a port lays out an order only by overriding
+    /// this; an override opens [`BatchOrder::Ahead`] as [`Port::open`] does.
+    fn open_ordered(&mut self, o: Overlap, order: BatchOrder) -> Result<(), Self::Error> {
+        match order {
+            BatchOrder::Ahead => self.open(o),
+            order => Err(Self::refused(Refused::Order {
+                order,
+                port: Self::KIND,
+            })),
+        }
+    }
 
     /// Serve `at`'s host leg; [`PortKind::Batch`] only.
     fn serve(&mut self, at: At) -> Result<(), Self::Error> {
@@ -238,6 +329,10 @@ pub type Error<P> = <<P as LayerProgram>::Port as Port>::Error;
 /// under capture.
 pub trait LayerProgram {
     type Port: Port;
+
+    /// The order a batch walk of this program lays out its items in
+    /// ([`BatchOrder`]); a step walk has one and is refused any other.
+    const BATCH_ORDER: BatchOrder = BatchOrder::Ahead;
 
     /// Unit `unit`'s start, before its first layer.
     fn begin(&mut self, unit: usize) -> Result<(), Error<Self>> {
@@ -275,9 +370,10 @@ pub trait LayerProgram {
     }
 }
 
-/// Run `prog` over `layers` layers in the order of `o` ([`order`]), `port`
-/// opened first and serving the [`Item::Serve`] entries of the layers with a
-/// host leg ([`LayerProgram::host_leg`]).
+/// Run `prog` over `layers` layers in the order of `o` and the program's
+/// batch order ([`order_in`], [`LayerProgram::BATCH_ORDER`]), `port` opened
+/// first ([`Port::open_ordered`]) and serving the [`Item::Serve`] entries of
+/// the layers with a host leg ([`LayerProgram::host_leg`]).
 pub fn walk<P: LayerProgram>(
     o: Overlap,
     layers: usize,
@@ -297,8 +393,15 @@ pub fn walk<P: LayerProgram>(
             cols: o.cols,
         }));
     }
-    port.open(o)?;
-    for item in order(o, layers) {
+    let batch = P::BATCH_ORDER;
+    if batch != BatchOrder::Ahead && o.port != PortKind::Batch {
+        return Err(<P::Port as Port>::refused(Refused::Order {
+            order: batch,
+            port: o.port,
+        }));
+    }
+    port.open_ordered(o, batch)?;
+    for item in order_in(o, layers, batch) {
         match item {
             Item::Begin(u) => prog.begin(u)?,
             Item::Front(at) => prog.front(port, at)?,
@@ -438,6 +541,30 @@ mod tests {
         v
     }
 
+    fn walked_in(o: Overlap, layers: usize, batch: BatchOrder) -> Vec<Item> {
+        order_in(o, layers, batch).collect()
+    }
+
+    /// A prompt group in [`BatchOrder::Fronts`]'s shape as nested loops, over
+    /// `g` batches: every batch's start, the fronts of the first layer's `g`
+    /// items, then per layer-batch its shadow, its serve, its back and the
+    /// front of the item `g` after it.
+    fn today_fronts(layers: usize, g: usize) -> Vec<Item> {
+        let mut v: Vec<Item> = (0..g).map(Begin).collect();
+        let items: Vec<(usize, usize)> = (0..layers)
+            .flat_map(|i| (0..g).map(move |j| (i, j)))
+            .collect();
+        let route = |&(i, j): &(usize, usize)| Front(at(j, i));
+        v.extend(items.iter().take(g).map(route));
+        for (x, &(i, j)) in items.iter().enumerate() {
+            v.extend([Shadow(at(j, i)), Serve(at(j, i)), Back(at(j, i))]);
+            if let Some(n) = items.get(x + g) {
+                v.push(route(n));
+            }
+        }
+        v
+    }
+
     /// T-a on two layers, written out: the four walks today's code runs.
     #[test]
     fn the_four_walks_on_two_layers() {
@@ -539,6 +666,111 @@ mod tests {
                         today_pair(layers, g),
                         "{g} rows, {layers} layers"
                     );
+                }
+            }
+        }
+    }
+
+    /// [`BatchOrder::Fronts`] on two units and two layers, written out: both
+    /// of the first layer's fronts ahead of every serve, and each back
+    /// followed by the front of its unit's next layer — no front between a
+    /// shadow and its serve.
+    #[test]
+    fn fronts_on_two_units_and_two_layers() {
+        let (a0, a1, b0, b1) = (at(0, 0), at(1, 0), at(0, 1), at(1, 1));
+        assert_eq!(
+            walked_in(group(2), 2, BatchOrder::Fronts),
+            [
+                Begin(0),
+                Begin(1),
+                Front(a0),
+                Front(a1),
+                Shadow(a0),
+                Serve(a0),
+                Back(a0),
+                Front(b0),
+                Shadow(a1),
+                Serve(a1),
+                Back(a1),
+                Front(b1),
+                Shadow(b0),
+                Serve(b0),
+                Back(b0),
+                Shadow(b1),
+                Serve(b1),
+                Back(b1)
+            ]
+        );
+    }
+
+    /// The fronts order over every shape: the nested loop against
+    /// [`order_in`], for layer counts 0 through 43 and groups up to
+    /// `GROUP_MAX`.
+    #[test]
+    fn fronts_is_its_loop() {
+        for layers in 0..=43 {
+            for g in 1..=8 {
+                assert_eq!(
+                    walked_in(group(g), layers, BatchOrder::Fronts),
+                    today_fronts(layers, g),
+                    "group of {g}, {layers} layers"
+                );
+            }
+        }
+    }
+
+    /// One unit has no other unit's front to hold ahead: the fronts order is
+    /// the order of today's walk, which GLM's group of one and the step walks
+    /// keep (`order_is_todays_walks`).
+    #[test]
+    fn fronts_at_one_unit_is_todays_order() {
+        for layers in 0..=43 {
+            assert_eq!(
+                walked_in(group(1), layers, BatchOrder::Fronts),
+                today_group(layers, 1),
+                "{layers} layers"
+            );
+            assert_eq!(
+                walked_in(group(1), layers, BatchOrder::Fronts),
+                walked(group(1), layers),
+                "{layers} layers"
+            );
+        }
+    }
+
+    /// What every fronts walk keeps, from the entries alone: each item has one
+    /// front, shadow, serve and back in that order; its unit's next layer's
+    /// front follows its back (the front reads the back's output); a layer's
+    /// fronts run in unit order (a recurrent state advances unit by unit);
+    /// and no front sits between a shadow and its serve.
+    #[test]
+    fn fronts_keeps_each_items_order() {
+        for layers in 1..=12 {
+            for g in 1..=8 {
+                let v = walked_in(group(g), layers, BatchOrder::Fronts);
+                let pos = |want: Item| {
+                    let mut hits = v.iter().enumerate().filter(|&(_, &i)| i == want);
+                    let first = hits.next().map(|(p, _)| p);
+                    assert!(hits.next().is_none(), "{want:?} twice: {g} units");
+                    first.unwrap_or_else(|| panic!("{want:?} missing: {g} units, {layers} layers"))
+                };
+                for layer in 0..layers {
+                    for unit in 0..g {
+                        let a = at(unit, layer);
+                        let (f, s, e, b) =
+                            (pos(Front(a)), pos(Shadow(a)), pos(Serve(a)), pos(Back(a)));
+                        assert!(f < s && s < e && e < b, "{a:?}: {g} units");
+                        assert!(
+                            !v[s..e].iter().any(|i| matches!(i, Front(_))),
+                            "a front between {a:?}'s shadow and serve: {g} units"
+                        );
+                        if layer + 1 < layers {
+                            assert!(b < pos(Front(at(unit, layer + 1))), "{a:?}: {g} units");
+                        }
+                        if unit + 1 < g {
+                            assert!(f < pos(Front(at(unit + 1, layer))), "{a:?}: {g} units");
+                        }
+                    }
                 }
             }
         }
@@ -671,6 +903,171 @@ mod tests {
         );
         assert_eq!(port.0.opened, None);
         assert_eq!(port.serve(at(0, 1)), Err(Refused::Serve(at(0, 1))));
+    }
+
+    /// A port that takes any order it is given, a batch port (`B`) or a step
+    /// port: it opens the walk in the order it is given.
+    struct TakesFronts<const B: bool>(Rec, Option<BatchOrder>);
+
+    impl<const B: bool> Port for TakesFronts<B> {
+        type Error = Refused;
+        const KIND: PortKind = if B { PortKind::Batch } else { PortKind::Step };
+
+        fn open(&mut self, o: Overlap) -> Result<(), Refused> {
+            self.open_ordered(o, BatchOrder::Ahead)
+        }
+
+        fn open_ordered(&mut self, o: Overlap, order: BatchOrder) -> Result<(), Refused> {
+            self.0.opened = Some(o);
+            self.1 = Some(order);
+            Ok(())
+        }
+
+        fn serve(&mut self, at: At) -> Result<(), Refused> {
+            self.0.seen.push(Serve(at));
+            Ok(())
+        }
+
+        fn refused(why: Refused) -> Refused {
+            why
+        }
+    }
+
+    trait Seen {
+        fn rec(&mut self) -> &mut Rec;
+    }
+
+    impl<const B: bool> Seen for RecPort<B> {
+        fn rec(&mut self) -> &mut Rec {
+            &mut self.0
+        }
+    }
+
+    impl<const B: bool> Seen for TakesFronts<B> {
+        fn rec(&mut self) -> &mut Rec {
+            &mut self.0
+        }
+    }
+
+    /// A program that declares [`BatchOrder::Fronts`] over any recording port.
+    struct FrontsProg<P>(std::marker::PhantomData<P>);
+
+    impl<P: Port<Error = Refused> + Seen> LayerProgram for FrontsProg<P> {
+        type Port = P;
+        const BATCH_ORDER: BatchOrder = BatchOrder::Fronts;
+
+        fn front(&mut self, port: &mut P, at: At) -> Result<(), Refused> {
+            port.rec().seen.push(Front(at));
+            Ok(())
+        }
+
+        fn shadow(&mut self, port: &mut P, at: At) -> Result<(), Refused> {
+            port.rec().seen.push(Shadow(at));
+            Ok(())
+        }
+
+        fn back(&mut self, port: &mut P, at: At) -> Result<(), Refused> {
+            port.rec().seen.push(Back(at));
+            Ok(())
+        }
+    }
+
+    /// A program that declares the fronts order walks it, its port opened in
+    /// that order, and a program that declares none keeps [`BatchOrder::Ahead`].
+    #[test]
+    fn walk_runs_the_declared_order() {
+        let parts = |v: Vec<Item>| -> Vec<Item> {
+            v.into_iter()
+                .filter(|i| !matches!(i, Begin(_) | End(_)))
+                .collect()
+        };
+        for units in 1..=3 {
+            let mut port = TakesFronts::<true>(Rec::default(), None);
+            let mut prog = FrontsProg::<TakesFronts<true>>(std::marker::PhantomData);
+            walk(group(units), 5, &mut port, &mut prog).unwrap();
+            assert_eq!(port.0.opened, Some(group(units)));
+            assert_eq!(port.1, Some(BatchOrder::Fronts));
+            assert_eq!(
+                port.0.seen,
+                parts(walked_in(group(units), 5, BatchOrder::Fronts)),
+                "{units} units"
+            );
+            let mut port = TakesFronts::<true>(Rec::default(), None);
+            walk(group(units), 5, &mut port, &mut Plain).unwrap();
+            assert_eq!(port.1, Some(BatchOrder::Ahead));
+            assert_eq!(
+                port.0.seen,
+                parts(walked(group(units), 5)),
+                "{units} units, no order declared"
+            );
+        }
+    }
+
+    /// A program with no [`LayerProgram::BATCH_ORDER`] over a batch
+    /// [`TakesFronts`].
+    struct Plain;
+
+    impl LayerProgram for Plain {
+        type Port = TakesFronts<true>;
+
+        fn front(&mut self, port: &mut TakesFronts<true>, at: At) -> Result<(), Refused> {
+            port.0.seen.push(Front(at));
+            Ok(())
+        }
+
+        fn shadow(&mut self, port: &mut TakesFronts<true>, at: At) -> Result<(), Refused> {
+            port.0.seen.push(Shadow(at));
+            Ok(())
+        }
+
+        fn back(&mut self, port: &mut TakesFronts<true>, at: At) -> Result<(), Refused> {
+            port.0.seen.push(Back(at));
+            Ok(())
+        }
+    }
+
+    /// The fronts order is refused by name, before the port opens or any
+    /// part runs, by a step overlap — even through a step port that takes
+    /// any order — and by a batch port that has not overridden
+    /// [`Port::open_ordered`].
+    #[test]
+    fn fronts_refused_by_name() {
+        let mut port = TakesFronts::<false>(Rec::default(), None);
+        let mut prog = FrontsProg::<TakesFronts<false>>(std::marker::PhantomData);
+        let e = walk(step(2), 3, &mut port, &mut prog).expect_err("fronts on a step walk");
+        assert_eq!(
+            e,
+            Refused::Order {
+                order: BatchOrder::Fronts,
+                port: PortKind::Step
+            }
+        );
+        assert!(
+            e.to_string().contains("Fronts order through a Step port"),
+            "{e}"
+        );
+        assert_eq!((port.0.opened, port.1, port.0.seen.len()), (None, None, 0));
+        let mut port = RecPort::<false>(Rec::default());
+        let mut prog = FrontsProg::<RecPort<false>>(std::marker::PhantomData);
+        let e = walk(step(2), 3, &mut port, &mut prog).expect_err("fronts on a plain step port");
+        assert_eq!(
+            e,
+            Refused::Order {
+                order: BatchOrder::Fronts,
+                port: PortKind::Step
+            }
+        );
+        let mut port = RecPort::<true>(Rec::default());
+        let mut prog = FrontsProg::<RecPort<true>>(std::marker::PhantomData);
+        let e = walk(group(2), 3, &mut port, &mut prog).expect_err("fronts on a plain batch port");
+        assert_eq!(
+            e,
+            Refused::Order {
+                order: BatchOrder::Fronts,
+                port: PortKind::Batch
+            }
+        );
+        assert_eq!((port.0.opened, port.0.seen.len()), (None, 0));
     }
 
     /// A pass of resident slots: one slot is the step and two the pair,

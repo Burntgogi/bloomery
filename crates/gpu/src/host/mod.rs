@@ -1123,38 +1123,65 @@ impl<H: HostExperts> HostTier<H> {
         counts: &mut Vec<u32>,
         cap: usize,
     ) -> Result<swap::CallPick, GpuError> {
-        self.count_routed(key, counts, "HostTier::call_pick_routed")?;
+        self.pick_routed(stream, key, counts, cap, (1, "HostTier::call_pick_routed"))
+    }
+
+    /// [`HostTier::call_pick_routed`] with every routed id counted `scale`
+    /// times: a walk whose units share one pick per layer prices it at the
+    /// group's width — the first unit's routing, standing for `scale` units
+    /// of its width — so the pick's floor and the ring's rule read the
+    /// group's counts. Refused by name as `call_pick_routed` is, and a
+    /// `scale` of 0 or a count past `u32`.
+    pub fn call_pick_routed_scaled(
+        &mut self,
+        stream: &CudaStream,
+        key: BatchKey,
+        counts: &mut Vec<u32>,
+        cap: usize,
+        scale: u32,
+    ) -> Result<swap::CallPick, GpuError> {
+        self.pick_routed(
+            stream,
+            key,
+            counts,
+            cap,
+            (scale, "HostTier::call_pick_routed_scaled"),
+        )
+    }
+
+    /// The pick of [`HostTier::call_pick_routed`] and its scaled form:
+    /// `(scale, what)` the count scale and the name its refusals carry.
+    fn pick_routed(
+        &mut self,
+        stream: &CudaStream,
+        key: BatchKey,
+        counts: &mut Vec<u32>,
+        cap: usize,
+        (scale, what): (u32, &'static str),
+    ) -> Result<swap::CallPick, GpuError> {
+        self.count_routed(key, counts, scale, what)?;
         self.call_pick(stream, key.layer, counts, cap)
     }
 
-    /// `key`'s routed ids ([`HostTier::routed_ids`]) counted into `counts`,
-    /// one count per expert of the slot map, the caller's buffer, reused.
-    /// Refused by name as `what`: a routed id past the map's experts.
+    /// `key`'s routed ids ([`HostTier::routed_ids`]) counted `scale` times
+    /// each into `counts`, one count per expert of the slot map, the
+    /// caller's buffer, reused ([`count_ids`]). Refused by name as `what`.
     fn count_routed(
         &mut self,
         key: BatchKey,
         counts: &mut Vec<u32>,
+        scale: u32,
         what: &'static str,
     ) -> Result<(), GpuError> {
         let n_expert = self.slots.n_expert();
-        counts.clear();
-        counts.resize(n_expert, 0);
-        for &id in self.routed_ids(key)? {
-            let c = usize::try_from(id)
-                .ok()
-                .and_then(|i| counts.get_mut(i))
-                .ok_or_else(|| {
-                    GpuError::shape(
-                        what,
-                        format!(
-                            "layer {}: a routed id {id} of {n_expert} experts",
-                            key.layer
-                        ),
-                    )
-                })?;
-            *c += 1;
-        }
-        Ok(())
+        count_ids(
+            self.routed_ids(key)?,
+            key.layer,
+            n_expert,
+            scale,
+            counts,
+            what,
+        )
     }
 
     /// [`HostTier::call_pick`] under the stream rule's walk: `key`'s routed
@@ -1178,8 +1205,54 @@ impl<H: HostExperts> HostTier<H> {
         card_tail_us_per_pick: f64,
         ret: xsplit::ReturnCost,
     ) -> Result<swap::CallPick, GpuError> {
-        const WHAT: &str = "HostTier::call_pick_walk";
-        self.count_routed(key, counts, WHAT)?;
+        self.pick_walk(
+            stream,
+            key,
+            counts,
+            (k, card_tail_us_per_pick, ret),
+            (1, "HostTier::call_pick_walk"),
+        )
+    }
+
+    /// [`HostTier::call_pick_walk`] with every routed id counted `scale`
+    /// times ([`HostTier::call_pick_routed_scaled`]): the walk, the floor and
+    /// the backlog bound are priced at the group's width, and the stream
+    /// rule's counts the caller reuses for the layer's stream are the same
+    /// scaled counts.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "call_pick_walk's arguments and the group's count scale (rust-quality R8)"
+    )]
+    pub fn call_pick_walk_scaled(
+        &mut self,
+        stream: &CudaStream,
+        key: BatchKey,
+        counts: &mut Vec<u32>,
+        k: xsplit::Constants,
+        card_tail_us_per_pick: f64,
+        ret: xsplit::ReturnCost,
+        scale: u32,
+    ) -> Result<swap::CallPick, GpuError> {
+        self.pick_walk(
+            stream,
+            key,
+            counts,
+            (k, card_tail_us_per_pick, ret),
+            (scale, "HostTier::call_pick_walk_scaled"),
+        )
+    }
+
+    /// The pick of [`HostTier::call_pick_walk`] and its scaled form:
+    /// `(scale, what)` the count scale and the name its refusals carry.
+    fn pick_walk(
+        &mut self,
+        stream: &CudaStream,
+        key: BatchKey,
+        counts: &mut Vec<u32>,
+        (k, card_tail_us_per_pick, ret): (xsplit::Constants, f64, xsplit::ReturnCost),
+        (scale, what): (u32, &'static str),
+    ) -> Result<swap::CallPick, GpuError> {
+        self.count_routed(key, counts, scale, what)?;
         let mut host = Vec::new();
         if let Some(row) = self.slots.row(key.layer) {
             for (id, &e) in (0u32..).zip(row) {
@@ -1189,9 +1262,9 @@ impl<H: HostExperts> HostTier<H> {
             }
         }
         let unit = xsplit::unit_constants(&k, card_tail_us_per_pick, counts, &host)
-            .map_err(|e| GpuError::shape(WHAT, format!("layer {}: {e}", key.layer)))?;
+            .map_err(|e| GpuError::shape(what, format!("layer {}: {e}", key.layer)))?;
         let plan = xsplit::admit_walk(counts, &host, &unit, swap::RING_SLOTS as u64, ret)
-            .map_err(|e| GpuError::shape(WHAT, format!("layer {}: {e}", key.layer)))?;
+            .map_err(|e| GpuError::shape(what, format!("layer {}: {e}", key.layer)))?;
         self.call_floor(plan.floor)?;
         if plan.backlog > 0 {
             self.call_backlog(plan.backlog)?;
@@ -1452,8 +1525,23 @@ impl<H: HostExperts> HostTier<H> {
         self.xstream.as_ref()?.ring_layer(layer)
     }
 
-    /// Layer `layer`'s card route has run on `stream`
-    /// ([`xstream::XStream::read`]); nothing without a stream.
+    /// Unit `key` joins layer `key.layer`'s stream
+    /// ([`xstream::XStream::share`]): its serve leaves out the same streamed
+    /// experts, and the stream stays open for its card route's read. Refused
+    /// by name without a stream and by the stream's refusals.
+    pub fn xstream_share(&mut self, layer: usize, key: BatchKey) -> Result<(), GpuError> {
+        self.xstream
+            .as_mut()
+            .ok_or(GpuError::state(
+                "HostTier::xstream_share",
+                "an expert stream (HostTier::xstream_start)",
+            ))?
+            .share(layer, key)
+    }
+
+    /// One unit's card route of layer `layer` has run on `stream`
+    /// ([`xstream::XStream::read`]), the layer's stream closing at its
+    /// group's last unit; nothing without a stream.
     pub fn xstream_read(&mut self, layer: usize, stream: &CudaStream) -> Result<(), GpuError> {
         match self.xstream.as_mut() {
             Some(x) => x.read(layer, stream),
@@ -2832,10 +2920,52 @@ pub fn name_refusal(r: &Refusal, fault: Option<Fault>) -> GpuError {
     )
 }
 
+/// `ids` counted `scale` times each into `counts`: one count per expert of
+/// a map of `n_expert` experts, the caller's buffer, cleared and resized.
+/// Refused by name as `what`, naming `layer`: a `scale` of 0 (counts that
+/// say no expert is routed), a routed id past the map's experts, and a count
+/// past `u32`; a refusal leaves `counts` as far as it got.
+fn count_ids(
+    ids: &[u32],
+    layer: usize,
+    n_expert: usize,
+    scale: u32,
+    counts: &mut Vec<u32>,
+    what: &'static str,
+) -> Result<(), GpuError> {
+    if scale == 0 {
+        return Err(GpuError::shape(
+            what,
+            format!("layer {layer}: a routed count scale of 0"),
+        ));
+    }
+    counts.clear();
+    counts.resize(n_expert, 0);
+    for &id in ids {
+        let c = usize::try_from(id)
+            .ok()
+            .and_then(|i| counts.get_mut(i))
+            .ok_or_else(|| {
+                GpuError::shape(
+                    what,
+                    format!("layer {layer}: a routed id {id} of {n_expert} experts"),
+                )
+            })?;
+        *c = c.checked_add(scale).ok_or_else(|| {
+            GpuError::shape(
+                what,
+                format!("layer {layer}: expert {id}'s count past u32 at scale {scale}"),
+            )
+        })?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        Drain, PassKind, SERVED_TIERS, await_within, drain_of, pass_kept, refuse_tier_count,
+        Drain, PassKind, SERVED_TIERS, await_within, count_ids, drain_of, pass_kept,
+        refuse_tier_count,
     };
     use crate::GpuError;
     use std::time::Duration;
@@ -2907,6 +3037,36 @@ mod tests {
             err.to_string()
                 .contains("the host tier serves one tier card; N >= 2 lands"),
             "{err}"
+        );
+    }
+
+    /// A routed count is the ids' tally times the scale: scale 1 is the one
+    /// unit's counts, scale `s` the group's `s` units of that width; a scale
+    /// of 0, an id past the map and a count past `u32` are refused by name.
+    #[test]
+    fn routed_counts_scale_with_the_group() {
+        let ids = [3, 1, 3, 3, 0];
+        let mut counts = vec![9; 2];
+        count_ids(&ids, 5, 4, 1, &mut counts, "t").expect("scale 1");
+        assert_eq!(counts, [1, 1, 0, 3]);
+        count_ids(&ids, 5, 4, 2, &mut counts, "t").expect("scale 2");
+        assert_eq!(counts, [2, 2, 0, 6]);
+        let past = count_ids(&[4], 5, 4, 1, &mut counts, "t").expect_err("an id past the map");
+        assert!(
+            past.to_string()
+                .contains("layer 5: a routed id 4 of 4 experts"),
+            "{past}"
+        );
+        let zero = count_ids(&ids, 5, 4, 0, &mut counts, "t").expect_err("scale 0");
+        assert!(
+            zero.to_string().contains("a routed count scale of 0"),
+            "{zero}"
+        );
+        let big = count_ids(&[2, 2], 5, 4, u32::MAX / 2 + 1, &mut counts, "t")
+            .expect_err("a count past u32");
+        assert!(
+            big.to_string().contains("expert 2's count past u32"),
+            "{big}"
         );
     }
 

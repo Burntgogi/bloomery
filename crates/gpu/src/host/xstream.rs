@@ -36,6 +36,12 @@
 //! half's rows are written when its layer streams, after the host has seen
 //! the download of a layer past the half's last reader.
 //!
+//! **The group.** A walk whose units share one pick a layer holds one stream
+//! for them all ([`XStream::share`]): the layer's exclusion set stands for
+//! every unit's serve, and the stream closes, and its half is released, at the
+//! last unit's read ([`XStream::read`]), so a call's end refuses a layer read
+//! by fewer units than its group.
+//!
 //! **The lane.** Fill threads copy each streamed expert's source bytes into
 //! a pinned staging ring ([`XCfg::staging_slots`] slots); the copy stream
 //! waits for each slot's staged word, copies the parts into the ring and
@@ -242,10 +248,12 @@ pub fn land_batch_size(n: usize) -> usize {
 /// Per layer of a map, the landing batches' map rows (host-mapped,
 /// device-visible, one a batch past a leading batch-0 row) and events: the
 /// pool both landing paths write their [`LandBatch`]s through. A layer's
-/// rows are written by the host at its landing (before the card route's
-/// launches that read them are enqueued) and read by that layer's route
-/// alone, which the walk's order has the host seen complete — the front's
-/// download of the layer after it — before any later landing rewrites them.
+/// rows are written by the host at its landing (before the launches that read
+/// them are enqueued) and read by the card routes of that layer's units in
+/// that walk alone: the layer's next landing is the next walk's pick, which
+/// the host runs only after it has seen the next walk's first-unit download of
+/// the layer complete, and the engine stream runs that download after every
+/// card route of this walk.
 pub struct LandRows {
     rows: MappedHost,
     /// Per layer, [`LAND_BATCHES`] events.
@@ -364,6 +372,56 @@ const WORD_STRIDE: usize = 64;
 struct Batch {
     half: usize,
     n: usize,
+}
+
+/// The units of a walk that share one layer's stream in an open call: the
+/// unit the stream was made for ([`XStream::layer`]) and the ones that joined
+/// it ([`XStream::share`]), and how many of their card routes have read it
+/// ([`XStream::read`]). A group of one is the unit alone.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Group {
+    units: Vec<BatchKey>,
+    reads: usize,
+}
+
+impl Group {
+    /// The group a stream made for `unit` starts.
+    fn of(unit: BatchKey) -> Group {
+        Group {
+            units: vec![unit],
+            reads: 0,
+        }
+    }
+
+    /// Whether `unit` is in the group.
+    fn holds(&self, unit: BatchKey) -> bool {
+        self.units.contains(&unit)
+    }
+
+    /// `unit` joins the group. Refused, with the reason: no unit has a stream
+    /// in this call, a card route has read the stream already (the group's
+    /// size is closed at its first read, or the layer would close early), or
+    /// `unit` is in the group.
+    fn join(&mut self, unit: BatchKey) -> Result<(), &'static str> {
+        if self.units.is_empty() {
+            return Err("no unit streams it in this call");
+        }
+        if self.reads > 0 {
+            return Err("a card route has read its stream already");
+        }
+        if self.holds(unit) {
+            return Err("that unit is in its group already");
+        }
+        self.units.push(unit);
+        Ok(())
+    }
+
+    /// One unit's card route has read the stream; whether that was the
+    /// group's last.
+    fn read(&mut self) -> bool {
+        self.reads += 1;
+        self.reads >= self.units.len()
+    }
 }
 
 /// One expert's staging for a fill thread: staging slot `slot`, `ticket` its
@@ -586,14 +644,14 @@ pub struct XStream {
     issued: u64,
     /// Per layer the stream of the unit's walk, until its read.
     cur: Vec<Option<Batch>>,
-    /// Per layer the streamed ids of the layer's last unit in the open call,
-    /// ascending, and that unit's key: the host serve's exclusion set, for
-    /// that unit's serve alone. The serve of a unit's layer runs after its
-    /// card route's read (`runtime::sched`'s batch order), so the set stands
-    /// past the read; a unit the walk takes no stream for (one narrower than
-    /// the pick's floor) has another key and reads none.
+    /// Per layer the streamed ids of the layer's last stream in the open
+    /// call, ascending, and its group of units: the host serve's exclusion
+    /// set, for those units' serves alone. The serve of a unit's layer runs
+    /// after its card route's read (`runtime::sched`'s batch orders), so the
+    /// set stands past the read; a unit the walk takes no stream for (one
+    /// narrower than the pick's floor) is in no group and reads none.
     excl: Vec<Vec<u32>>,
-    excl_unit: Vec<Option<BatchKey>>,
+    groups: Vec<Group>,
     /// A call is open ([`XStream::begin_call`] to [`XStream::end_call`]).
     open: bool,
     /// The rule's scratch.
@@ -713,7 +771,7 @@ impl XStream {
             issued: 0,
             cur: vec![None; layers],
             excl: vec![Vec::new(); layers],
-            excl_unit: vec![None; layers],
+            groups: vec![Group::default(); layers],
             open: false,
             split: Split::default(),
             rank: Vec::new(),
@@ -852,7 +910,7 @@ impl XStream {
         for e in &mut self.excl {
             e.clear();
         }
-        self.excl_unit.fill(None);
+        self.groups.fill(Group::default());
         self.open = true;
     }
 
@@ -915,7 +973,7 @@ impl XStream {
                 ),
             ));
         }
-        self.excl_unit[layer] = Some(unit);
+        self.groups[layer] = Group::of(unit);
         self.excl[layer].clear();
         // The unit's own share over the host set the pick left: the counts
         // the union still serves, the experts it still lists. The rule's
@@ -1000,10 +1058,11 @@ impl XStream {
         // SAFETY: the half's two rows are `e` words each at
         // `(2 · half + r) · e · 4` of the rows page (`HALVES · 2 · e · 4`
         // bytes, page-aligned): inside it and 4-aligned. The card's last
-        // reads of this half were the card route of the stream two back,
-        // which the engine stream ran before the download of a later layer
-        // the host has already waited for (the caller's count), so nothing
-        // reads these words while they are written.
+        // reads of this half were the card routes of the stream two back, the
+        // last unit's of its group ([`XStream::read`]), which the engine
+        // stream ran before the download of a later layer the host has
+        // already waited for (the caller's count), so nothing reads these
+        // words while they are written.
         let (ring, union) = unsafe {
             (
                 std::slice::from_raw_parts_mut(
@@ -1263,48 +1322,102 @@ impl XStream {
         Ok(())
     }
 
+    /// Unit `unit` joins layer `layer`'s stream, made by the layer's
+    /// [`XStream::layer`] for another unit of the same walk: its serve leaves
+    /// out the same streamed experts ([`XStream::excluded`]), and the stream
+    /// stays open until the unit's card route has read it too
+    /// ([`XStream::read`]). A walk whose units share one pick a layer joins
+    /// each later unit right after the layer's [`XStream::layer`], before any
+    /// card route reads. Refused by name: outside a call, a unit of another
+    /// layer than `layer`, a layer outside the stream's, a layer no unit
+    /// streams in this call, a unit already in the group, and a layer whose
+    /// stream a card route has read already.
+    pub fn share(&mut self, layer: usize, unit: BatchKey) -> Result<(), GpuError> {
+        const WHAT: &str = "XStream::share";
+        if !self.open {
+            return Err(GpuError::protocol(
+                WHAT,
+                format!("layer {layer} shared outside a call (XStream::begin_call)"),
+            ));
+        }
+        if unit.layer != layer {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "unit {unit:?} of layer {} shared into layer {layer}",
+                    unit.layer
+                ),
+            ));
+        }
+        let group = self
+            .groups
+            .get_mut(layer)
+            .ok_or_else(|| GpuError::shape(WHAT, format!("layer {layer} outside the stream's")))?;
+        group
+            .join(unit)
+            .map_err(|why| GpuError::protocol(WHAT, format!("layer {layer}: {why}")))
+    }
+
     /// The streamed experts of `unit`'s layer, ascending: the host serve of
-    /// that unit leaves them out. Empty for a unit the layer's last
-    /// [`XStream::layer`] did not take, when that unit streams nothing, and
-    /// outside a call.
+    /// that unit leaves them out. Empty for a unit outside the layer's last
+    /// stream's group ([`XStream::layer`], [`XStream::share`]), when that
+    /// unit streams nothing, and outside a call.
     #[must_use]
     pub fn excluded(&self, unit: BatchKey) -> &[u32] {
-        if !self.open || self.excl_unit.get(unit.layer) != Some(&Some(unit)) {
+        if !self.open || !self.groups.get(unit.layer).is_some_and(|g| g.holds(unit)) {
             return &[];
         }
         self.excl.get(unit.layer).map_or(&[], Vec::as_slice)
     }
 
-    /// Layer `layer`'s stream has had its last read on the engine stream
-    /// `engine` (its card route): the half's read event is recorded there,
-    /// which the half's next stream waits for, and the layer's stream
-    /// closes; its exclusion set stands for the unit's serve. Nothing for a
-    /// layer that streamed nothing.
+    /// One unit's card route of layer `layer` has run on the engine stream
+    /// `engine`: the layer's stream has had its last read once every unit of
+    /// its group has called this — one call a unit, in the order the units'
+    /// card routes were enqueued. At the group's last unit the half's read
+    /// event is recorded on `engine`, which the half's next stream waits for,
+    /// and the layer's stream closes (its ring view is gone); before it the
+    /// stream stays open for the units still to read, and the half stays
+    /// held. The exclusion set stands for the units' serves either way.
+    /// Nothing for a layer that streamed nothing.
     pub fn read(&mut self, layer: usize, engine: &CudaStream) -> Result<(), GpuError> {
-        let Some(b) = self.cur.get_mut(layer).and_then(Option::take) else {
+        let Some(Some(b)) = self.cur.get(layer) else {
             return Ok(());
         };
-        self.used[b.half].record(engine)?;
+        let half = b.half;
+        if !self.groups[layer].read() {
+            return Ok(());
+        }
+        self.cur[layer] = None;
+        self.used[half].record(engine)?;
         Ok(())
     }
 
     /// End the call: a staging failure is refused by name, every layer's
-    /// stream must have been read; the call's report.
+    /// stream must have been read by every unit of its group; the call's
+    /// report.
     pub fn end_call(&mut self) -> Result<XReport, GpuError> {
         const WHAT: &str = "XStream::end_call";
         let t0 = Instant::now();
         self.open = false;
+        let unread = self.cur.iter().position(Option::is_some).map(|l| {
+            let g = &self.groups[l];
+            (l, g.reads, g.units.len())
+        });
         for e in &mut self.excl {
             e.clear();
         }
-        self.excl_unit.fill(None);
+        self.groups.fill(Group::default());
         self.refuse_failure(WHAT)?;
-        if let Some(l) = self.cur.iter().position(Option::is_some) {
+        if let Some((l, reads, units)) = unread {
             self.cur.iter_mut().for_each(|c| *c = None);
-            return Err(GpuError::protocol(
-                WHAT,
-                format!("layer {l}'s stream had no read before the call's end"),
-            ));
+            let detail = match reads {
+                0 => format!("layer {l}'s stream had no read before the call's end"),
+                _ => format!(
+                    "layer {l}'s stream was read by {reads} of its {units} units before the \
+                     call's end"
+                ),
+            };
+            return Err(GpuError::protocol(WHAT, detail));
         }
         let fresh = self.fresh_report();
         let mut r = std::mem::replace(&mut self.report, fresh);
@@ -1661,5 +1774,60 @@ mod tests {
             balance_cut(&stream[..10], &counts, &k, side(0, 0.0, 0.0)),
             5
         );
+    }
+
+    /// Unit `set` of layer 3 in a block of four-row units.
+    fn unit_key(set: usize) -> BatchKey {
+        BatchKey {
+            layer: 3,
+            set,
+            at: 4 * set,
+            u: 4 * set + 4,
+        }
+    }
+
+    /// A group takes the units that join it and closes at the last unit's
+    /// read: the first of two reads leaves the stream open, the second ends
+    /// it, and a unit outside the group is not in it (mutants: a join that
+    /// adds no unit, a read that closes at the first).
+    #[test]
+    fn a_group_closes_at_its_last_units_read() {
+        let mut g = Group::of(unit_key(0));
+        assert!(g.holds(unit_key(0)) && !g.holds(unit_key(1)));
+        g.join(unit_key(1)).expect("a second unit joins");
+        assert!(g.holds(unit_key(0)) && g.holds(unit_key(1)));
+        assert!(!g.holds(unit_key(2)));
+        assert!(!g.read(), "one of two units has read");
+        assert!(g.read(), "the group's last unit's read closes the stream");
+    }
+
+    /// A unit alone is today's stream: its one read closes it.
+    #[test]
+    fn a_group_of_one_closes_at_its_read() {
+        let mut g = Group::of(unit_key(0));
+        assert!(g.read());
+    }
+
+    /// A join is refused by name when no unit streams the layer, when a card
+    /// route has read the stream already (the size of the group would grow
+    /// under a read that already closed it), and for a unit already in it.
+    #[test]
+    fn a_join_is_refused_by_its_reason() {
+        let mut none = Group::default();
+        assert_eq!(
+            none.join(unit_key(1)),
+            Err("no unit streams it in this call")
+        );
+        let mut g = Group::of(unit_key(0));
+        assert_eq!(
+            g.join(unit_key(0)),
+            Err("that unit is in its group already")
+        );
+        g.read();
+        assert_eq!(
+            g.join(unit_key(1)),
+            Err("a card route has read its stream already")
+        );
+        assert!(!g.holds(unit_key(1)));
     }
 }

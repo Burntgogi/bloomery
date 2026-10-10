@@ -33,6 +33,7 @@ pub mod qsa;
 pub mod sched;
 pub mod seqstate;
 mod speculative;
+pub mod splitwalk;
 pub mod state;
 mod stop;
 pub mod stores;

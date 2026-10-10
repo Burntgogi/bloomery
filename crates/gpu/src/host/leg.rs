@@ -12,22 +12,29 @@
 //! A batch walk may hold several units (a prompt group's batches): the
 //! port's two exchange sets are taken in turn by its downloads, serves and
 //! uploads, a serve taking the oldest download not served, so the walk's
-//! order — the next item's front ahead of this item's serve — keeps at most
-//! two layer-batches in flight. The leg's one `hsum` holds one item's sums
-//! at a time: item `x + 1`'s upload is enqueued after item `x`'s back read
-//! them (`runtime::sched`'s batch order puts `x`'s back before `x + 1`'s
-//! serve and, for a tiered layer, before `x + 1`'s join).
+//! order — the next item's front ahead of this item's serve, or under
+//! [`BatchOrder::Fronts`] each unit's front ahead of the serves — keeps at
+//! most two layer-batches in flight, and the leg refuses by name a walk in
+//! the fronts order of more than two units. The leg's one `hsum` holds one
+//! item's sums at a time: item `x + 1`'s upload is enqueued after item `x`'s
+//! back read them (`runtime::sched`'s batch orders put `x`'s back before
+//! `x + 1`'s serve and, for a tiered layer, before `x + 1`'s join). Units
+//! that sit side by side in one block of rows ([`BatchLeg::set_unit_rows`])
+//! name their own rows: a unit's copies, serve and upload touch tokens
+//! `at .. u` of the block and of `hsum` alone, so its sums never overlap
+//! another unit's.
 //! A batch walk whose layer's card sum reads the tier's rows (GLM) leaves
 //! the upload to its join ([`BatchLeg::join_tiered`]): the serve does not
 //! upload a tier layer, and the join settles the tiers, enqueues the sum over
 //! their rows, then the upload.
 
 use cuda_core::{CudaStream, DeviceBuffer};
-use runtime::sched::{At, Overlap, Port, PortKind, Refused};
+use runtime::sched::{At, BatchOrder, Overlap, Port, PortKind, Refused};
 
 use super::batch::{BatchKey, ServeTimes, UnionCols};
 use super::{HostExperts, HostTier};
 use crate::GpuError;
+use std::ops::Range;
 use std::time::{Duration, Instant};
 
 /// What a walk the leg refuses names.
@@ -133,21 +140,66 @@ pub trait LegTimer {
     fn end_walk(&mut self) -> Result<(), GpuError>;
 }
 
-/// `at`'s exchange key over `cols` columns: the unit the batch's label
-/// within its group ([`BatchKey::set`]), its tokens `0 .. cols`.
-fn batch_key(at: At, cols: usize) -> BatchKey {
+/// `at`'s exchange key over the block rows `rows`: the unit the batch's label
+/// within its group ([`BatchKey::set`]), its tokens `rows`.
+fn batch_key(at: At, rows: Range<usize>) -> BatchKey {
     BatchKey {
         layer: at.layer,
         set: at.unit,
-        at: 0,
-        u: cols,
+        at: rows.start,
+        u: rows.end,
     }
 }
 
-/// What [`BatchLeg`]'s [`Port::open`] refuses by name: no unit, a walk's
-/// columns outside `1..=cap`, or units' own columns (`unit_cols`) that are not
-/// one entry a unit, each in `1..=` the walk's columns.
-fn refuse_open(o: Overlap, cap: usize, unit_cols: Option<&[usize]>) -> Result<(), GpuError> {
+/// Where each unit of a batch walk sits in the block its layers' routing and
+/// sums are held in: the walk's columns, and a unit's own columns or its own
+/// rows when the walk set them. A unit's rows are `0 .. cols` of its own
+/// block unless the walk set rows, which place the units side by side in one
+/// block.
+#[derive(Clone, Copy, Default)]
+struct UnitShape<'a> {
+    /// The open walk's columns.
+    cols: usize,
+    /// Each unit's columns, when the walk set them.
+    unit_cols: Option<&'a [usize]>,
+    /// Each unit's rows of the block, when the walk set them.
+    unit_rows: Option<&'a [Range<usize>]>,
+}
+
+impl UnitShape<'_> {
+    /// Unit `unit`'s rows: its own when the walk set them, else `0 ..` its
+    /// columns (its own when the walk set them, else the walk's).
+    fn rows_of(&self, unit: usize) -> Range<usize> {
+        if let Some(r) = self.unit_rows.and_then(|r| r.get(unit)) {
+            return r.clone();
+        }
+        let cols = self
+            .unit_cols
+            .and_then(|c| c.get(unit).copied())
+            .unwrap_or(self.cols);
+        0..cols
+    }
+
+    /// `at`'s exchange key over its unit's rows.
+    fn key(&self, at: At) -> BatchKey {
+        batch_key(at, self.rows_of(at.unit))
+    }
+}
+
+/// What [`BatchLeg`]'s [`Port::open_ordered`] refuses by name: no unit, a
+/// walk's columns outside `1..=cap`, units' own columns (`shape.unit_cols`)
+/// that are not one entry a unit, each in `1..=` the walk's columns, units'
+/// own rows (`shape.unit_rows`) that are not one non-empty range a unit,
+/// ascending and not overlapping, each no wider than the walk's columns and
+/// ending within `cap` rows (the port's sets and `hsum` hold the block's
+/// rows), both lists set, and the fronts order ([`BatchOrder::Fronts`]) for
+/// more than two units (the port has two exchange sets).
+fn refuse_open(
+    o: Overlap,
+    order: BatchOrder,
+    cap: usize,
+    shape: &UnitShape<'_>,
+) -> Result<(), GpuError> {
     if o.units == 0 || !(1..=cap).contains(&o.cols) {
         return Err(GpuError::Shape {
             what: WHAT_BATCH,
@@ -158,13 +210,46 @@ fn refuse_open(o: Overlap, cap: usize, unit_cols: Option<&[usize]>) -> Result<()
             ),
         });
     }
-    if let Some(c) = unit_cols
+    if order == BatchOrder::Fronts && o.units > 2 {
+        return Err(GpuError::Shape {
+            what: WHAT_BATCH,
+            detail: format!(
+                "a walk of {} units in the {order:?} order; the port has two exchange sets, \
+                 which hold the fronts of two units at most",
+                o.units
+            ),
+        });
+    }
+    if shape.unit_cols.is_some() && shape.unit_rows.is_some() {
+        return Err(GpuError::Shape {
+            what: WHAT_BATCH,
+            detail: "units' columns and units' rows both set; a walk names its units' shape \
+                     once"
+                .into(),
+        });
+    }
+    if let Some(c) = shape.unit_cols
         && (c.len() != o.units || c.iter().any(|&n| !(1..=o.cols).contains(&n)))
     {
         return Err(GpuError::Shape {
             what: WHAT_BATCH,
             detail: format!(
                 "units of {c:?} columns for a walk of {} units of up to {} columns",
+                o.units, o.cols
+            ),
+        });
+    }
+    if let Some(r) = shape.unit_rows
+        && (r.len() != o.units
+            || r.iter()
+                .any(|r| r.is_empty() || r.len() > o.cols || r.end > cap)
+            || r.windows(2).any(|w| w[0].end > w[1].start))
+    {
+        return Err(GpuError::Shape {
+            what: WHAT_BATCH,
+            detail: format!(
+                "units of rows {r:?} for a walk of {} units of up to {} columns over {cap} rows; \
+                 the rows of a unit are one non-empty range each, ascending and apart",
                 o.units, o.cols
             ),
         });
@@ -185,16 +270,16 @@ fn nanos(d: Duration) -> u64 {
 /// ([`BatchLeg::key`]): the program's download names it, the walk's serve
 /// serves it and uploads its sums. A unit's columns are the walk's unless
 /// the walk set each unit's own ([`BatchLeg::set_unit_cols`]: a group's last
-/// batch may be shorter).
+/// batch may be shorter). Units that share one block of rows name their own
+/// rows instead ([`BatchLeg::set_unit_rows`]): the key `(l, u, r.start ..
+/// r.end)`.
 pub struct BatchLeg<'a, H: HostExperts> {
     stream: &'a CudaStream,
     hybrid: &'a mut HostTier<H>,
     hsum: &'a mut DeviceBuffer<f32>,
     cap: usize,
-    /// The open walk's columns.
-    cols: usize,
-    /// Each unit's columns, when the walk set them.
-    unit_cols: Option<&'a [usize]>,
+    /// The units' columns or rows, and the open walk's columns.
+    shape: UnitShape<'a>,
     /// The walk's timing, when it set one ([`BatchLeg::set_timer`]).
     timer: Option<&'a mut dyn LegTimer>,
 }
@@ -214,8 +299,7 @@ impl<'a, H: HostExperts> BatchLeg<'a, H> {
             hybrid,
             hsum,
             cap,
-            cols: 0,
-            unit_cols: None,
+            shape: UnitShape::default(),
             timer: None,
         }
     }
@@ -227,18 +311,22 @@ impl<'a, H: HostExperts> BatchLeg<'a, H> {
     }
 
     /// Each unit's own columns, unit `u` the `u`-th: the next walk's
-    /// [`Port::open`] refuses by name a list that is not one entry a unit,
-    /// each in `1..=` the walk's columns.
+    /// [`Port::open_ordered`] refuses by name a list that is not one entry a
+    /// unit, each in `1..=` the walk's columns.
     pub fn set_unit_cols(&mut self, cols: &'a [usize]) {
-        self.unit_cols = Some(cols);
+        self.shape.unit_cols = Some(cols);
     }
 
-    /// Unit `unit`'s columns: its own when the walk set them, else the
-    /// walk's.
-    fn cols_of(&self, unit: usize) -> usize {
-        self.unit_cols
-            .and_then(|c| c.get(unit).copied())
-            .unwrap_or(self.cols)
+    /// Each unit's own rows of the block the walk's routing and sums are held
+    /// in, unit `u` the `u`-th: unit `u`'s key names tokens `rows[u]`, so its
+    /// download, serve and upload copy those rows of the block and of the
+    /// leg's `hsum` and no other. The next walk's [`Port::open_ordered`]
+    /// refuses by name a list that is not one non-empty range a unit,
+    /// ascending and not overlapping, each no wider than the walk's columns
+    /// and ending within the leg's `cap` rows, and a walk that set the units'
+    /// columns as well.
+    pub fn set_unit_rows(&mut self, rows: &'a [Range<usize>]) {
+        self.shape.unit_rows = Some(rows);
     }
 
     /// The tier, for a layer program's download.
@@ -251,16 +339,17 @@ impl<'a, H: HostExperts> BatchLeg<'a, H> {
         self.stream
     }
 
-    /// The host sums the last upload sent, `cols` rows of the model width.
+    /// The host sums the last upload sent: its unit's rows of the model
+    /// width, at the unit's own row offsets in the buffer.
     pub fn hsum(&self) -> &DeviceBuffer<f32> {
         self.hsum
     }
 
-    /// `at`'s exchange key over its unit's columns: the unit is the batch's
+    /// `at`'s exchange key over its unit's rows: the unit is the batch's
     /// label within its group, and the port picks its exchange set in turn.
     #[must_use]
     pub fn key(&self, at: At) -> BatchKey {
-        batch_key(at, self.cols_of(at.unit))
+        self.shape.key(at)
     }
 
     /// Mark `site` of `at`'s part on the stream, in the architecture's own
@@ -351,14 +440,20 @@ impl<H: HostExperts> Port for BatchLeg<'_, H> {
     type Error = GpuError;
     const KIND: PortKind = PortKind::Batch;
 
-    /// One unit or more of `1..=cap` columns — each unit's own columns, when
-    /// the walk set them, one a unit in `1..=` the walk's — both sets of the
-    /// port free ([`HostTier::begin_group`], once a walk: the walk is eager,
-    /// and its caller leaves nothing of an earlier walk in flight); any other
-    /// point is refused by name.
+    /// [`Port::open_ordered`] in [`BatchOrder::Ahead`]'s order.
     fn open(&mut self, o: Overlap) -> Result<(), GpuError> {
-        refuse_open(o, self.cap, self.unit_cols)?;
-        self.cols = o.cols;
+        self.open_ordered(o, BatchOrder::Ahead)
+    }
+
+    /// One unit or more of `1..=cap` columns — each unit's own columns or its
+    /// own rows of the block, when the walk set them — in either batch order,
+    /// the fronts order for two units at most, both sets of the port free
+    /// ([`HostTier::begin_group`], once a walk: the walk is eager, and its
+    /// caller leaves nothing of an earlier walk in flight); any other point
+    /// is refused by name.
+    fn open_ordered(&mut self, o: Overlap, order: BatchOrder) -> Result<(), GpuError> {
+        refuse_open(o, order, self.cap, &self.shape)?;
+        self.shape.cols = o.cols;
         self.hybrid.begin_group()
     }
 
@@ -390,7 +485,7 @@ impl<H: HostExperts> Port for BatchLeg<'_, H> {
         t.served(ServeNote {
             layer: at.layer,
             unit: at.unit,
-            cols: key.u,
+            cols: key.u - key.at,
             slots: after
                 .batch_host_slots
                 .saturating_sub(before.batch_host_slots),
@@ -417,27 +512,41 @@ mod tests {
     use runtime::sched::{self, LayerProgram};
 
     /// The batch port's exchange under a walk's order, keyed as the leg keys
-    /// it: each front downloads its item, each serve serves and uploads it,
-    /// each back reads the sums the upload sent.
+    /// it ([`UnitShape`], the leg's own keying) and opened as the leg opens
+    /// ([`refuse_open`]): each front downloads its item, each serve serves and
+    /// uploads it, each back reads the sums the upload sent.
     struct Exchange<'a> {
         stream: &'a CudaStream,
         port: &'a mut BatchPort,
         hsum: &'a mut DeviceBuffer<f32>,
-        cols: &'a [usize],
+        cap: usize,
+        n_embd: usize,
+        shape: UnitShape<'a>,
+        /// Each serve's activations as the port handed them: the item, and
+        /// how many values.
+        served: Vec<(At, usize)>,
     }
 
     impl Port for Exchange<'_> {
         type Error = GpuError;
         const KIND: PortKind = PortKind::Batch;
 
-        fn open(&mut self, _: Overlap) -> Result<(), GpuError> {
+        fn open(&mut self, o: Overlap) -> Result<(), GpuError> {
+            self.open_ordered(o, BatchOrder::Ahead)
+        }
+
+        fn open_ordered(&mut self, o: Overlap, order: BatchOrder) -> Result<(), GpuError> {
+            refuse_open(o, order, self.cap, &self.shape)?;
+            self.shape.cols = o.cols;
             self.port.begin();
             Ok(())
         }
 
         fn serve(&mut self, at: At) -> Result<(), GpuError> {
-            let key = batch_key(at, self.cols[at.unit]);
+            let key = self.shape.key(at);
+            let mut values = 0;
             self.port.serve(key, |layer, x, _, _, sums| {
+                values = x.data().len();
                 // Each sum is the row's own value plus the layer: the back
                 // reads which item's sums it got.
                 for (s, v) in sums.iter_mut().zip(x.data()) {
@@ -445,6 +554,7 @@ mod tests {
                 }
                 Ok(())
             })?;
+            self.served.push((at, values));
             self.port.upload(self.stream, self.hsum, key)
         }
 
@@ -453,29 +563,48 @@ mod tests {
         }
     }
 
-    /// Each item's rows, `unit + 1` everywhere, and the sums each back read.
-    struct Items<'a> {
-        x: [DeviceBuffer<f32>; 3],
+    /// The blocks the units' rows are read from (unit `u` reads
+    /// `x[x_of[u]]`, whose rows hold `unit + 1` everywhere), and the sums
+    /// each back read, from its unit's rows of `hsum`. `FRONTS` walks in
+    /// [`BatchOrder::Fronts`]'s order.
+    struct Items<'a, const FRONTS: bool> {
+        x: Vec<DeviceBuffer<f32>>,
+        x_of: Vec<usize>,
         w: DeviceBuffer<f32>,
         ids: DeviceBuffer<u32>,
         backs: Vec<(At, Vec<f32>)>,
         port: std::marker::PhantomData<Exchange<'a>>,
     }
 
-    impl<'a> LayerProgram for Items<'a> {
+    impl<'a, const FRONTS: bool> LayerProgram for Items<'a, FRONTS> {
         type Port = Exchange<'a>;
+        const BATCH_ORDER: BatchOrder = if FRONTS {
+            BatchOrder::Fronts
+        } else {
+            BatchOrder::Ahead
+        };
 
         fn front(&mut self, port: &mut Exchange<'a>, at: At) -> Result<(), GpuError> {
-            let key = batch_key(at, port.cols[at.unit]);
+            let key = port.shape.key(at);
+            let x = &self.x[self.x_of[at.unit]];
             port.port
-                .download(port.stream, [&self.x[at.unit], &self.w], &self.ids, key)
+                .download(port.stream, [x, &self.w], &self.ids, key)
         }
 
         fn back(&mut self, port: &mut Exchange<'a>, at: At) -> Result<(), GpuError> {
-            let n = 2 * port.cols[at.unit];
+            let (n, rows) = (port.n_embd, port.shape.rows_of(at.unit));
             let got = port.hsum.to_host_vec(port.stream)?;
-            self.backs.push((at, got[..n].to_vec()));
+            self.backs
+                .push((at, got[rows.start * n..rows.end * n].to_vec()));
             Ok(())
+        }
+    }
+
+    fn walk(units: usize, cols: usize) -> Overlap {
+        Overlap {
+            units,
+            cols,
+            port: PortKind::Batch,
         }
     }
 
@@ -485,41 +614,134 @@ mod tests {
     /// outside the walk's columns.
     #[test]
     fn open_takes_one_unit_or_more_and_refuses_the_rest() {
-        let walk = |units, cols| Overlap {
-            units,
-            cols,
-            port: PortKind::Batch,
-        };
+        let ahead = BatchOrder::Ahead;
+        let none = UnitShape::default();
         for units in [1, 2, 3, 8] {
-            refuse_open(walk(units, 512), 512, None)
+            refuse_open(walk(units, 512), ahead, 512, &none)
                 .unwrap_or_else(|e| panic!("a walk of {units} units: {e}"));
         }
-        refuse_open(walk(3, 512), 512, Some(&[512, 512, 1]))
+        let cols = |c| UnitShape {
+            unit_cols: Some(c),
+            ..UnitShape::default()
+        };
+        refuse_open(walk(3, 512), ahead, 512, &cols(&[512, 512, 1]))
             .expect("three units, the last of one column");
         let refused = [
-            (walk(0, 512), None, "0 units of 512 columns"),
-            (walk(2, 0), None, "2 units of 0 columns"),
-            (walk(2, 513), None, "2 units of 513 columns"),
+            (walk(0, 512), none, "0 units of 512 columns"),
+            (walk(2, 0), none, "2 units of 0 columns"),
+            (walk(2, 513), none, "2 units of 513 columns"),
             (
                 walk(3, 512),
-                Some(&[512, 512][..]),
+                cols(&[512, 512]),
                 "units of [512, 512] columns",
             ),
-            (
-                walk(2, 512),
-                Some(&[512, 0][..]),
-                "units of [512, 0] columns",
-            ),
+            (walk(2, 512), cols(&[512, 0]), "units of [512, 0] columns"),
             (
                 walk(2, 256),
-                Some(&[256, 512][..]),
+                cols(&[256, 512]),
                 "units of [256, 512] columns",
             ),
         ];
-        for (o, cols, want) in refused {
-            let e = refuse_open(o, 512, cols).expect_err(want);
+        for (o, shape, want) in refused {
+            let e = refuse_open(o, ahead, 512, &shape).expect_err(want);
             assert!(e.to_string().contains(want), "{want}: {e}");
         }
+    }
+
+    /// Units that share one block name their rows: the leg opens a walk of
+    /// units whose rows are one non-empty range each, ascending, apart,
+    /// within the walk's columns and the leg's rows, and refuses by name a
+    /// list of another length, an empty range, a range past the leg's rows,
+    /// ranges that overlap or descend, a unit wider than the walk's columns,
+    /// and a walk that set the units' columns too.
+    #[test]
+    fn open_takes_unit_rows_and_refuses_the_rest() {
+        let ahead = BatchOrder::Ahead;
+        let rows = |r| UnitShape {
+            unit_rows: Some(r),
+            ..UnitShape::default()
+        };
+        refuse_open(walk(2, 256), ahead, 512, &rows(&[0..256, 256..512]))
+            .expect("two halves of the block");
+        refuse_open(walk(2, 3), ahead, 5, &rows(&[0..3, 3..5])).expect("an odd block");
+        let whole = 0..512;
+        refuse_open(
+            walk(1, 512),
+            ahead,
+            512,
+            &rows(std::slice::from_ref(&whole)),
+        )
+        .expect("one unit of the block");
+        let both = UnitShape {
+            unit_cols: Some(&[256, 256]),
+            unit_rows: Some(&[0..256, 256..512]),
+            ..UnitShape::default()
+        };
+        let refused = [
+            (walk(3, 256), rows(&[0..256, 256..512]), "units of rows"),
+            (walk(2, 256), rows(&[0..256, 256..256]), "units of rows"),
+            (walk(2, 256), rows(&[0..256, 300..513]), "units of rows"),
+            (walk(2, 256), rows(&[0..256, 255..400]), "units of rows"),
+            (walk(2, 256), rows(&[256..512, 0..256]), "units of rows"),
+            (walk(2, 200), rows(&[0..256, 256..400]), "units of rows"),
+            (
+                walk(2, 256),
+                both,
+                "units' columns and units' rows both set",
+            ),
+        ];
+        for (o, shape, want) in refused {
+            let e = refuse_open(o, ahead, 512, &shape).expect_err(want);
+            assert!(e.to_string().contains(want), "{want}: {e}");
+        }
+    }
+
+    /// The fronts order holds the fronts of its units in flight beside each
+    /// other: one unit or two fit the port's two sets, three are refused by
+    /// name; the other order takes any group.
+    #[test]
+    fn the_fronts_order_is_refused_past_two_units() {
+        let none = UnitShape::default();
+        for units in [1, 2] {
+            refuse_open(walk(units, 512), BatchOrder::Fronts, 512, &none)
+                .unwrap_or_else(|e| panic!("{units} units in the fronts order: {e}"));
+        }
+        for units in [3, 8] {
+            let e = refuse_open(walk(units, 512), BatchOrder::Fronts, 512, &none)
+                .expect_err("the fronts order of more than two units");
+            let want = format!("{units} units in the Fronts order");
+            assert!(e.to_string().contains(&want), "{want}: {e}");
+            refuse_open(walk(units, 512), BatchOrder::Ahead, 512, &none)
+                .unwrap_or_else(|e| panic!("{units} units ahead: {e}"));
+        }
+    }
+
+    /// A unit's key is its own rows of the block: the walk's columns from row
+    /// 0 unless the walk set the unit's columns (from row 0) or its rows (at
+    /// their offsets), and the unit and layer are the item's.
+    #[test]
+    fn a_units_key_is_its_own_rows() {
+        let at = |unit, layer| At { unit, layer };
+        let key = |layer, set, at, u| BatchKey { layer, set, at, u };
+        let plain = UnitShape {
+            cols: 4,
+            ..UnitShape::default()
+        };
+        assert_eq!(plain.key(at(1, 3)), key(3, 1, 0, 4));
+        let narrow = UnitShape {
+            cols: 4,
+            unit_cols: Some(&[4, 3]),
+            ..UnitShape::default()
+        };
+        assert_eq!(narrow.key(at(0, 0)), key(0, 0, 0, 4));
+        assert_eq!(narrow.key(at(1, 2)), key(2, 1, 0, 3));
+        let split = UnitShape {
+            cols: 3,
+            unit_rows: Some(&[0..3, 3..5]),
+            ..UnitShape::default()
+        };
+        assert_eq!(split.key(at(0, 7)), key(7, 0, 0, 3));
+        assert_eq!(split.key(at(1, 7)), key(7, 1, 3, 5));
     }
 
     /// A three-unit group walked across a layer boundary — unit 2 of layer
@@ -539,9 +761,10 @@ mod tests {
             DeviceBuffer::from_host(&stream, &vec![(u + 1) as f32; cap * n_embd]).expect("x")
         };
         let cols = [4, 4, 3];
-        let (backs, items_x, w, ids) = {
-            let mut items = Items {
-                x: [x(0), x(1), x(2)],
+        let (backs, served, items_x, w, ids) = {
+            let mut items = Items::<false> {
+                x: vec![x(0), x(1), x(2)],
+                x_of: vec![0, 1, 2],
                 w: DeviceBuffer::from_host(&stream, &[1.0f32; 4]).expect("w"),
                 ids: DeviceBuffer::from_host(&stream, &[0u32; 4]).expect("ids"),
                 backs: Vec::new(),
@@ -551,15 +774,17 @@ mod tests {
                 stream: &stream,
                 port: &mut port,
                 hsum: &mut hsum,
-                cols: &cols,
+                cap,
+                n_embd,
+                shape: UnitShape {
+                    unit_cols: Some(&cols),
+                    ..UnitShape::default()
+                },
+                served: Vec::new(),
             };
-            let o = Overlap {
-                units: 3,
-                cols: 4,
-                port: PortKind::Batch,
-            };
-            sched::walk(o, 2, &mut ex, &mut items).expect("a three-unit walk over two layers");
-            (items.backs, items.x, items.w, items.ids)
+            sched::walk(walk(3, 4), 2, &mut ex, &mut items)
+                .expect("a three-unit walk over two layers");
+            (items.backs, ex.served, items.x, items.w, items.ids)
         };
         let want: Vec<(At, Vec<f32>)> = (0..2)
             .flat_map(|layer| (0..3).map(move |unit| At { unit, layer }))
@@ -569,24 +794,95 @@ mod tests {
             })
             .collect();
         assert_eq!(backs, want);
+        assert!(
+            served
+                .iter()
+                .all(|&(at, values)| values == n_embd * cols[at.unit]),
+            "a serve's activations are its unit's columns: {served:?}"
+        );
+        let key = |unit| BatchKey {
+            layer: 0,
+            set: unit,
+            at: 0,
+            u: 4,
+        };
         port.begin();
         for (unit, x) in items_x.iter().take(2).enumerate() {
-            port.download(&stream, [x, &w], &ids, batch_key(At { unit, layer: 0 }, 4))
+            port.download(&stream, [x, &w], &ids, key(unit))
                 .expect("a download into a free set");
         }
         let third = port
-            .download(
-                &stream,
-                [&items_x[2], &w],
-                &ids,
-                batch_key(At { unit: 2, layer: 0 }, 4),
-            )
+            .download(&stream, [&items_x[2], &w], &ids, key(2))
             .expect_err("a third download while two sets are in flight");
         assert!(
             third
                 .to_string()
                 .contains("both sets hold a layer not uploaded yet"),
             "{third}"
+        );
+        stream.synchronize().expect("the stream");
+    }
+
+    /// Two units side by side in one block of five rows — unit 0 the first
+    /// three, unit 1 the last two — walked in the fronts order over two
+    /// layers through the port's two sets: every serve takes its unit's rows
+    /// of the block and no others, each unit's sums land in its own rows of
+    /// `hsum`, and each back reads its own unit's sums. The block's rows
+    /// hold `unit + 1`, so a key at another unit's rows reads the other
+    /// unit's sums.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_two_units_at_row_offsets_keep_their_sums_apart() {
+        let (ctx, stream) = crate::capsync::fresh_stream(0).expect("CUDA device 0 with a stream");
+        let (n_embd, cap) = (2, 5);
+        let mut port = BatchPort::new(&ctx, n_embd, 1, cap).expect("a batch port");
+        let mut hsum = DeviceBuffer::<f32>::zeroed(&stream, cap * n_embd).expect("hsum");
+        let rows = [0..3, 3..5];
+        let block: Vec<f32> = rows
+            .iter()
+            .enumerate()
+            .flat_map(|(unit, r)| vec![(unit + 1) as f32; n_embd * r.len()])
+            .collect();
+        let mut items = Items::<true> {
+            x: vec![DeviceBuffer::from_host(&stream, &block).expect("the block")],
+            x_of: vec![0, 0],
+            w: DeviceBuffer::from_host(&stream, &[1.0f32; 5]).expect("w"),
+            ids: DeviceBuffer::from_host(&stream, &[0u32; 5]).expect("ids"),
+            backs: Vec::new(),
+            port: std::marker::PhantomData,
+        };
+        let mut ex = Exchange {
+            stream: &stream,
+            port: &mut port,
+            hsum: &mut hsum,
+            cap,
+            n_embd,
+            shape: UnitShape {
+                unit_rows: Some(&rows),
+                ..UnitShape::default()
+            },
+            served: Vec::new(),
+        };
+        sched::walk(walk(2, 3), 2, &mut ex, &mut items)
+            .expect("a two-unit walk over two layers in the fronts order");
+        let want: Vec<(At, Vec<f32>)> = sched::order_in(walk(2, 3), 2, BatchOrder::Fronts)
+            .filter_map(|i| match i {
+                sched::Item::Back(at) => Some(at),
+                _ => None,
+            })
+            .map(|at| {
+                let v = (at.unit + 1 + at.layer) as f32;
+                (at, vec![v; n_embd * rows[at.unit].len()])
+            })
+            .collect();
+        assert_eq!(items.backs.len(), 4);
+        assert_eq!(items.backs, want);
+        assert!(
+            ex.served
+                .iter()
+                .all(|&(at, values)| values == n_embd * rows[at.unit].len()),
+            "a serve's activations are its unit's rows: {:?}",
+            ex.served
         );
         stream.synchronize().expect("the stream");
     }

@@ -46,6 +46,14 @@
 //! - end: a call's end with a stream no read has closed is refused by name,
 //!   and one whose streams were all read returns the call's experts and
 //!   bytes.
+//! - shared: two units of one layer share its stream: the second unit joins
+//!   after the layer's stream is made, its serve leaves out the same
+//!   experts, the first unit's read leaves the stream open for the second's
+//!   (its ring view stays) and the second's closes it, and a call's end with
+//!   a layer read by one of its two units is refused by name; a join is
+//!   refused outside a call, into another layer, twice, and after a read
+//!   (mutants: a join that adds no unit, a read that closes at the first, an
+//!   end that forgets the second unit's read).
 //! - backlog deadline: a lane whose one fill thread is held in its source
 //!   past the deadline, fed more jobs than its staging slots, is a named
 //!   error within the deadline and a half (its mutant: the wait without its
@@ -255,6 +263,17 @@ mod gate {
             set: 0,
             at: 0,
             u: COLS,
+        }
+    }
+
+    /// Unit `set` of layer `l` in a block of two 64-row units: its rows are
+    /// the walk's key of the unit at that offset.
+    fn unit_key(l: usize, set: usize) -> BatchKey {
+        BatchKey {
+            layer: l,
+            set,
+            at: set * COLS,
+            u: (set + 1) * COLS,
         }
     }
 
@@ -522,6 +541,64 @@ mod gate {
             verdict(end_ok)
         );
         ok &= end_ok;
+
+        // shared: units 0 and 1 of layer 0 in one block of two 64-row units.
+        let (a, b) = (key(0), unit_key(0, 1));
+        let refused_outside = x.share(0, b).is_err();
+        x.begin_call();
+        let first = x.layer(
+            stream,
+            a,
+            COLS,
+            &counts(UNIT_A),
+            (&host(), 0),
+            (&stage(), N_CARD),
+        )?;
+        let alone = x.excluded(b).is_empty();
+        let refused_layer = x.share(1, b).is_err();
+        x.share(0, b)?;
+        let twice = x.share(0, b).is_err();
+        let same_set = !x.excluded(b).is_empty() && x.excluded(b) == x.excluded(a);
+        x.read(0, stream)?;
+        let open_after_first = x.ring_layer(0).is_some();
+        let refused_after_read = x.share(0, unit_key(0, 2)).is_err();
+        let short = match x.end_call() {
+            Err(e) => {
+                let s = e.to_string();
+                s.contains("layer 0") && s.contains("read by 1 of its 2 units")
+            }
+            Ok(_) => false,
+        };
+        x.begin_call();
+        unit(&mut x, stream, 0, &counts(UNIT_A))?;
+        x.share(0, b)?;
+        x.read(0, stream)?;
+        x.read(0, stream)?;
+        let closed_at_last = x.ring_layer(0).is_none();
+        let standing = !x.excluded(b).is_empty() && x.excluded(a) == x.excluded(b);
+        let report = x.end_call()?;
+        let shared_ok = first.streamed > 0
+            && refused_outside
+            && refused_layer
+            && twice
+            && refused_after_read
+            && alone
+            && same_set
+            && open_after_first
+            && short
+            && closed_at_last
+            && standing
+            && report.layers == 1;
+        println!(
+            "shared: before the join unit 1 reads no set {alone}; the join is refused outside a \
+             call {refused_outside}, into another layer {refused_layer}, twice {twice} and \
+             after a read {refused_after_read}; after it both units leave out the same set \
+             {same_set}; the first read leaves the stream open {open_after_first}; the call's \
+             end with one of two reads is refused by name {short}; the second read closes it \
+             {closed_at_last} and the set stands for the serves {standing} {}",
+            verdict(shared_ok)
+        );
+        ok &= shared_ok;
         drop(x);
 
         // backlog deadline
@@ -579,7 +656,8 @@ mod gate {
                 "gate_xstream: PASS — the stream is the rule's set cut at the half in rank order, \
                  its rows and exclusion set say so, the engine stream reads a batch's slots only \
                  once that batch's copies have landed (a batch a third of them), a half's next \
-                 stream waits for the half's read, an unread stream refuses the call's end, a \
+                 stream waits for the half's read, an unread stream refuses the call's end, \
+                 units of a layer share its stream and close it at the last read, a \
                  stuck lane is a named error within its deadline, and a ring with no room is \
                  refused by its own name."
             );
