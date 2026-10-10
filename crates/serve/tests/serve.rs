@@ -2403,9 +2403,18 @@ fn hw_metrics_count_cached_prompt_tokens() {
         "the fixture: each request's cache work takes {slow} ms or more: {}",
         sum("cache_ms")
     );
-    assert_eq!(
+    // PIN(2026-10-11): the server adds each request's cache_ms as it books
+    // it and the test sums the replies in its own order; f64 addition is not
+    // associative, so the totals agree within the sum's rounding, 3 adds of
+    // half an ulp of the running sum each: 3·ε·Σ. A request left out moves
+    // the total by its cache_ms, at least SLOW.
+    let (got, want) = (
         metric(&body, "prompt_cache_seconds_total"),
-        sum("cache_ms") / 1e3
+        sum("cache_ms") / 1e3,
+    );
+    assert!(
+        (got - want).abs() <= 3.0 * f64::EPSILON * want,
+        "prompt_cache_seconds_total {got} against the requests' {want}"
     );
     let longest = replies
         .iter()
