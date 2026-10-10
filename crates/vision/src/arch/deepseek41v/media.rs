@@ -104,8 +104,8 @@ mod tests {
     }
 
     /// A 448×448 image is scaled up to the 546×546 grid: 13×13 aligner tokens, 184 positions with
-    /// the delimiters (the research table's first row), and the span the expansion makes has the
-    /// length `image_span` gives the plan.
+    /// the delimiters, and the span the expansion makes has the length `image_span` gives the
+    /// plan.
     #[test]
     fn prepare_gives_the_plans_span() {
         let m = Media::new(V41);

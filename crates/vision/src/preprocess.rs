@@ -201,7 +201,7 @@ mod tests {
         t
     }
 
-    /// The cut V4.1 had before the layout: patches row-major, channel, row, column inside.
+    /// The plain raster cut: patches row-major, channel, row, column inside.
     fn row_major_reference(image: &Rgb8, s: usize) -> Vec<u16> {
         let table: Vec<u16> = (0..=255u8).map(normalize).collect();
         let mut out = Vec::new();
@@ -220,9 +220,9 @@ mod tests {
         out
     }
 
-    /// Row-major with one frame is the cut V4.1 had, on several shapes and patch sizes.
+    /// Row-major with one frame is the plain raster cut, on several shapes and patch sizes.
     #[test]
-    fn row_major_layout_is_the_former_cut() {
+    fn row_major_layout_is_the_raster_cut() {
         for (s, w, h) in [
             (14, 42, 28),
             (14, 14, 70),
