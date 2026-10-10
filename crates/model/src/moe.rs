@@ -1668,6 +1668,46 @@ pub enum TierError {
         ids: usize,
         slots: usize,
     },
+    /// A batch pin was refused: the tier's own error, naming what it
+    /// pinned.
+    #[error("layer {layer}: pinning a batch of experts: {source}")]
+    Pin {
+        layer: usize,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+}
+
+/// How a claim places the slots it takes and the ids it finds filled in the
+/// tier's LRU books ([`TierSlots::ensure_as`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Claim {
+    /// A decode step's claim: every id the call names takes a fresh tick, a
+    /// miss as a hit.
+    Step,
+    /// A claim that holds what it takes: a fresh tick like [`Claim::Step`],
+    /// a kind of its own so a caller can count what it kept.
+    Keep,
+    /// A claim that does not displace the hot set: a miss enters at the cold
+    /// end and is the first victim, oldest first, before any hot slot; a hit
+    /// on a hot id refreshes it and a hit on a transient leaves it cold. A
+    /// later [`Claim::Step`] or [`Claim::Keep`] hit turns a transient hot.
+    Transient,
+}
+
+/// A batch of experts pinned in the tier's slots ([`TierSlots::pin`]): the
+/// ids stay unevictable until the guard drops.
+#[must_use = "the pin lasts until the guard drops"]
+pub struct TierPin<'a> {
+    _held: Box<dyn Send + 'a>,
+}
+
+impl<'a> TierPin<'a> {
+    /// A guard over `held`, whose drop unpins the batch.
+    pub fn new(held: impl Send + 'a) -> TierPin<'a> {
+        TierPin {
+            _held: Box::new(held),
+        }
+    }
 }
 
 /// The RAM arena a host layer's routed experts read from beside the file
@@ -1679,8 +1719,17 @@ pub enum TierError {
 /// gpu side's; the choice which expert reads where is the layer's
 /// ([`HostLayer::experts_into`]), not the arena's.
 pub trait TierSlots: Send + Sync {
-    /// Fill the slots of `layer`'s `ids` the tier does not already hold.
-    fn ensure(&self, layer: usize, ids: &[u32]) -> Result<(), TierError>;
+    /// Fill the slots of `layer`'s `ids` the tier does not already hold, the
+    /// call placed in the books as `claim` says.
+    fn ensure_as(&self, layer: usize, ids: &[u32], claim: Claim) -> Result<(), TierError>;
+    /// [`TierSlots::ensure_as`] as a decode step claims ([`Claim::Step`]).
+    fn ensure(&self, layer: usize, ids: &[u32]) -> Result<(), TierError> {
+        self.ensure_as(layer, ids, Claim::Step)
+    }
+    /// Pin `layer`'s `ids`, each of which the tier must hold filled: none is
+    /// a victim of a later claim until the guard drops. Refused by name when
+    /// an id is past the layer's experts or unfilled; nothing is pinned then.
+    fn pin<'a>(&'a self, layer: usize, ids: &[u32]) -> Result<TierPin<'a>, TierError>;
     /// Layer `layer`, expert `id`, part `part`'s bytes as the tier holds
     /// them; `None` when its slot is unfilled.
     fn slot(&self, layer: usize, id: u32, part: usize) -> Option<&[u8]>;
@@ -2699,9 +2748,22 @@ mod tests {
     }
 
     impl super::TierSlots for MockTier {
-        fn ensure(&self, layer: usize, ids: &[u32]) -> Result<(), super::TierError> {
+        fn ensure_as(
+            &self,
+            layer: usize,
+            ids: &[u32],
+            _claim: super::Claim,
+        ) -> Result<(), super::TierError> {
             self.ensured.lock().unwrap().push((layer, ids.to_vec()));
             Ok(())
+        }
+
+        fn pin<'a>(
+            &'a self,
+            _layer: usize,
+            _ids: &[u32],
+        ) -> Result<super::TierPin<'a>, super::TierError> {
+            Ok(super::TierPin::new(()))
         }
 
         fn slot(&self, layer: usize, id: u32, part: usize) -> Option<&[u8]> {

@@ -48,6 +48,14 @@
 //! on the lane's own thread ([`NvTier::ensure_here`]) and never on the pool,
 //! whose one dispatch mutex is the chain's: beside the chain the lane takes
 //! only the books' lock, for claims, pins and publishes that wait on nothing.
+//!
+//! A call's claim kind ([`Claim`]) places what it takes in the books. A
+//! step's and a keep's slots take a fresh tick; a transient's enter at the
+//! cold end (tick 0 and a sequence number in claim order), so the next miss
+//! takes the oldest transient before any hot slot, and a later step or keep
+//! hit turns a transient hot. A batch pin ([`NvTier::pin`]) counts the ids
+//! of a batch in the same open-read counts a lane's read does, so the books
+//! take none of them until the guard drops.
 
 use std::ops::Range;
 use std::os::unix::fs::FileExt;
@@ -59,7 +67,7 @@ use std::time::Instant;
 
 use engram::direct::{AnonMap, DIRECT_ALIGN, DirectFile, aligned_span};
 use gguf::Split;
-use model::moe::{TierError, TierSlots};
+use model::moe::{Claim, TierError, TierPin, TierSlots};
 use model::placement::host_lock::{HostFile, HostSet, PageDrop, page_bytes};
 use model::placement::paged_drop::{Mark, drop_runs, overlap_of};
 use model::placement::{
@@ -136,16 +144,19 @@ pub(crate) fn slots_of(
 enum NoSlot {
     /// Every slot is filling: two ensures raced the layer.
     Filling,
-    /// No slot is free and every filled one is pinned by a lane's open read:
-    /// the arena's floor does not cover the reads open beside the call.
+    /// No slot is free and every filled one is pinned by a lane's open read
+    /// or a batch pin, or is one of a transient call's own ids: the arena's
+    /// floor does not cover the pins open beside the call.
     Pinned,
 }
 
-/// The slot a miss takes: the first free one, else the least recently used
-/// filled one `pinned` does not name — a filling slot is never the arena's to
-/// take, its fill owns it, and a pinned one is being read. Refused by name
-/// when none is left, never waited for and never overwritten: all filling is
-/// the race of two ensures, all the rest pinned the floor's.
+/// The slot a miss takes: the first free one, else the victim of the filled
+/// ones `pinned` does not name — the oldest transient (the least `seq`: a
+/// transient sits at tick 0), else the least recently used. A filling slot is
+/// never the arena's to take, its fill owns it, and a pinned one is being
+/// read. Refused by name when none is left, never waited for and never
+/// overwritten: all filling is the race of two ensures, all the rest pinned
+/// the floor's.
 fn pick_slot(slots: &[SlotBook], pinned: impl Fn(&SlotBook) -> bool) -> Result<usize, NoSlot> {
     if let Some(k) = slots
         .iter()
@@ -161,7 +172,12 @@ fn pick_slot(slots: &[SlotBook], pinned: impl Fn(&SlotBook) -> bool) -> Result<u
     };
     filled()
         .filter(|(_, s)| !pinned(s))
-        .min_by_key(|(_, s)| s.tick.load(Ordering::Relaxed))
+        .min_by_key(|(_, s)| {
+            (
+                s.tick.load(Ordering::Relaxed),
+                s.seq.load(Ordering::Relaxed),
+            )
+        })
         .map(|(k, _)| k)
         .ok_or(if filled().next().is_some() {
             NoSlot::Pinned
@@ -173,37 +189,45 @@ fn pick_slot(slots: &[SlotBook], pinned: impl Fn(&SlotBook) -> bool) -> Result<u
 /// What one `ensure` claimed under the books' lock: the slots to fill, the
 /// filled slots it let go (their pages to return) and the ids it did not
 /// find filled.
-struct Claim {
+struct Claimed {
     picks: Vec<Pick>,
     evicted: Vec<usize>,
     misses: u64,
 }
 
 /// The books' pass of one `ensure` over layer `layer`'s `ids`: ids the plan's
-/// host segment holds are skipped, a filled one's tick is refreshed, every other
-/// takes a slot — the first free, else the least recently used filled one,
-/// which it evicts — and is marked filling. Pure over the books: no read, no
-/// page returned. The `seen` marks are this call's alone; a mark that
-/// outlived its call would skip an expert evicted since, and its slot would
-/// read unfilled. Refused by name before any slot is claimed, the books and
-/// the slots as they were: an id past the layer's experts, and a call naming
-/// more distinct ids of the arena than the layer's slots
+/// host segment holds are skipped, a filled one is placed as `kind` says (a
+/// fresh tick; a transient under [`Claim::Transient`] keeps its cold place),
+/// every other takes a slot — the first free, else the victim
+/// ([`pick_slot`]), which it evicts — and is marked filling. A transient
+/// call's own ids are never its victims: a hit on a transient keeps its cold
+/// place, the first place a later miss of the call would look. Pure over the
+/// books: no read, no page returned. The `seen` marks are this call's alone;
+/// a mark that outlived its call would skip an expert evicted since, and its
+/// slot would read unfilled. Refused by name before any slot is claimed, the
+/// books and the slots as they were: an id past the layer's experts, and a
+/// call naming more distinct ids of the arena than the layer's slots
 /// ([`TierError::TooManyIds`], the seam's own refusal) — a union reads every
 /// id it names at once, so a claim past the slots would evict one of the
-/// call's own ids before the call reads it. A miss that finds every slot
-/// filling is the race refusal: two ensures raced the layer.
+/// call's own ids before the call reads it. A miss that finds no slot to take
+/// gives back what the call had taken and refuses: all slots filling is the
+/// race refusal (two ensures raced the layer), all the rest pinned the
+/// floor's.
 fn claim_slots(
     layer: usize,
     arena: &LayerArena,
     books: &mut Books,
     ids: &[u32],
-) -> Result<Claim, GpuError> {
+    kind: Claim,
+) -> Result<Claimed, GpuError> {
     const WHAT: &str = "NvTier::ensure";
     let n = arena.n_expert as usize;
-    if books.seen.len() != n {
-        books.seen.resize(n, false);
+    for marks in [&mut books.seen, &mut books.named] {
+        if marks.len() != n {
+            marks.resize(n, false);
+        }
+        marks.fill(false);
     }
-    books.seen.fill(false);
     let mut distinct = 0usize;
     for &id in ids {
         if id as usize >= n {
@@ -212,11 +236,10 @@ fn claim_slots(
                 format!("expert {id} is past the {n} experts"),
             ));
         }
-        if !arena.host.contains(&id) && !std::mem::replace(&mut books.seen[id as usize], true) {
+        if !arena.host.contains(&id) && !std::mem::replace(&mut books.named[id as usize], true) {
             distinct += 1;
         }
     }
-    books.seen.fill(false);
     if distinct > arena.slots.len() {
         return Err(GpuError::from(model::ModelError::Tier(
             TierError::TooManyIds {
@@ -226,7 +249,7 @@ fn claim_slots(
             },
         )));
     }
-    let mut claim = Claim {
+    let mut claim = Claimed {
         picks: Vec::new(),
         evicted: Vec::new(),
         misses: 0,
@@ -237,35 +260,92 @@ fn claim_slots(
             continue;
         }
         if let Some(slot) = arena.filled(id) {
-            books.tick += 1;
-            arena.slots[slot].tick.store(books.tick, Ordering::Relaxed);
+            let book = &arena.slots[slot];
+            if kind != Claim::Transient || book.seq.load(Ordering::Relaxed) == 0 {
+                books.tick += 1;
+                book.tick.store(books.tick, Ordering::Relaxed);
+                book.seq.store(0, Ordering::Relaxed);
+            }
             continue;
         }
         claim.misses += 1;
-        let slot = pick_slot(&arena.slots, |s| arena.pins(s)).map_err(|why| match why {
-            NoSlot::Filling => {
-                GpuError::shape(WHAT, "every slot is filling: two ensures raced a layer")
+        let own = |s: &SlotBook| {
+            kind == Claim::Transient && books.named[s.id.load(Ordering::Relaxed) as usize]
+        };
+        let slot = match pick_slot(&arena.slots, |s| arena.pins(s) || own(s)) {
+            Ok(slot) => slot,
+            Err(why) => {
+                unclaim(arena, &claim.picks);
+                return Err(match why {
+                    NoSlot::Filling => {
+                        GpuError::shape(WHAT, "every slot is filling: two ensures raced a layer")
+                    }
+                    NoSlot::Pinned => GpuError::shape(
+                        WHAT,
+                        format!(
+                            "layer {layer}: no slot is free and every filled one is pinned by a \
+                             lane's read or a batch pin: the arena's {} slots do not cover the \
+                             pins open beside a call",
+                            arena.slots.len()
+                        ),
+                    ),
+                });
             }
-            NoSlot::Pinned => GpuError::shape(
-                WHAT,
-                format!(
-                    "layer {layer}: no slot is free and every filled one is pinned by a lane's \
-                     read: the arena's {} slots do not cover the reads open beside a call",
-                    arena.slots.len()
-                ),
-            ),
-        })?;
-        if arena.slots[slot].state.load(Ordering::Relaxed) == FILLED {
-            let gone = arena.slots[slot].id.load(Ordering::Relaxed);
+        };
+        let book = &arena.slots[slot];
+        let gone = (book.state.load(Ordering::Relaxed) == FILLED).then(|| {
+            let gone = book.id.load(Ordering::Relaxed);
             arena.of_id[gone as usize].store(0, Ordering::Relaxed);
             claim.evicted.push(slot);
-        }
-        arena.slots[slot].state.store(FILLING, Ordering::Relaxed);
-        arena.slots[slot].id.store(id, Ordering::Relaxed);
+            gone
+        });
+        book.state.store(FILLING, Ordering::Relaxed);
+        book.id.store(id, Ordering::Relaxed);
         arena.of_id[at].store(slot as u32 + 1, Ordering::Relaxed);
-        claim.picks.push(Pick { slot, id });
+        claim.picks.push(Pick { slot, id, gone });
     }
     Ok(claim)
+}
+
+/// Give back what a refused claim took, last pick first: a slot that held an
+/// id holds it filled again, with the tick and sequence word it had (a claim
+/// writes none before its fill publishes), and a free one is free.
+fn unclaim(arena: &LayerArena, picks: &[Pick]) {
+    for p in picks.iter().rev() {
+        let book = &arena.slots[p.slot];
+        arena.of_id[p.id as usize].store(0, Ordering::Relaxed);
+        match p.gone {
+            Some(gone) => {
+                book.id.store(gone, Ordering::Relaxed);
+                book.state.store(FILLED, Ordering::Relaxed);
+                arena.of_id[gone as usize].store(p.slot as u32 + 1, Ordering::Relaxed);
+            }
+            None => book.state.store(FREE, Ordering::Relaxed),
+        }
+    }
+}
+
+/// The picks a fill read, published under the books' lock: each slot's place
+/// in the books as `kind` says — a fresh tick and no sequence word, or tick 0
+/// and the next sequence number, the oldest transient the least — then
+/// filled.
+fn publish(arena: &LayerArena, books: &mut Books, picks: &[Pick], kind: Claim) {
+    for p in picks {
+        let book = &arena.slots[p.slot];
+        match kind {
+            Claim::Transient => {
+                books.seq += 1;
+                book.tick.store(0, Ordering::Relaxed);
+                book.seq.store(books.seq, Ordering::Relaxed);
+            }
+            Claim::Step | Claim::Keep => {
+                books.tick += 1;
+                book.tick.store(books.tick, Ordering::Relaxed);
+                book.seq.store(0, Ordering::Relaxed);
+            }
+        }
+        book.state.store(FILLED, Ordering::Relaxed);
+    }
 }
 
 /// Where part `part` of the expert slot at byte `slot_off` of the mapping
@@ -448,6 +528,61 @@ impl LayerArena {
         Ok(())
     }
 
+    /// Whether the reads open of expert `id` are slot reads, not the
+    /// mapping's: a read opened unfilled is counted in `mapped`, so any open
+    /// read past those found the slot filled, and a batch pin counts as one.
+    /// Refused by name as `what` past the layer's experts and with no read
+    /// open.
+    fn slot_read(&self, layer: usize, id: u32, what: &'static str) -> Result<bool, GpuError> {
+        let open = self.reading(layer, id, what)?.load(Ordering::Acquire);
+        if open == 0 {
+            return Err(GpuError::protocol(
+                what,
+                format!("layer {layer} expert {id}: a slot read with no read open"),
+            ));
+        }
+        Ok(open > self.mapped[id as usize].load(Ordering::Acquire))
+    }
+
+    /// Pin the filled slots of `ids` against the victim pick until the guard
+    /// drops: each distinct id the arena serves counts one in its open reads,
+    /// as a lane's open read of a filled slot does. All or none: refused by
+    /// name as `what` for an id past the layer's experts and for one with no
+    /// filled slot — a pin on an unfilled id would read as a lane's mapping
+    /// read. The caller holds the books' lock, so no claim sees the ids half
+    /// pinned or takes a slot between the check and the count.
+    fn pin_batch<'a>(
+        &'a self,
+        layer: usize,
+        ids: &[u32],
+        what: &'static str,
+    ) -> Result<BatchPin<'a>, GpuError> {
+        let mut held: Vec<u32> = ids
+            .iter()
+            .copied()
+            .filter(|id| !self.host.contains(id))
+            .collect();
+        held.sort_unstable();
+        held.dedup();
+        for &id in &held {
+            self.reading(layer, id, what)?;
+            if self.filled(id).is_none() {
+                return Err(GpuError::protocol(
+                    what,
+                    format!("layer {layer} expert {id}: a batch pin of an unfilled slot"),
+                ));
+            }
+        }
+        for &id in &held {
+            self.open(layer, id, what)?;
+        }
+        Ok(BatchPin {
+            arena: self,
+            layer,
+            ids: held,
+        })
+    }
+
     /// Close a lane's read of expert `id` ([`LayerArena::open`]): refused by
     /// name as `what` past the layer's experts and with no read open — never
     /// a count wrapped past zero.
@@ -485,21 +620,52 @@ impl LayerArena {
     }
 }
 
+/// A batch of pinned ids ([`LayerArena::pin_batch`]): the drop closes the
+/// reads it opened. A count already at zero is a broken invariant (a read
+/// ended that was never opened), so the drop panics by name after it has
+/// closed the rest, unless the thread is already unwinding.
+struct BatchPin<'a> {
+    arena: &'a LayerArena,
+    layer: usize,
+    ids: Vec<u32>,
+}
+
+impl Drop for BatchPin<'_> {
+    fn drop(&mut self) {
+        let mut broken = None;
+        for &id in &self.ids {
+            if let Err(e) = self.arena.close(self.layer, id, "NvTier::pin") {
+                broken.get_or_insert(e);
+            }
+        }
+        if let Some(e) = broken
+            && !std::thread::panicking()
+        {
+            panic!("{e}");
+        }
+    }
+}
+
 struct SlotBook {
     state: AtomicU32,
     /// The slot's expert, +1 semantics none: written under the books'
     /// lock, read by an evicting pass.
     id: AtomicU32,
     /// The slot's LRU tick: written under the books' lock, read by the
-    /// victim pick.
+    /// victim pick. A transient's is 0, below every hot tick.
     tick: AtomicU64,
+    /// A transient's place among the transients, oldest first, from 1; 0 for
+    /// a hot slot. Written under the books' lock, read by the victim pick
+    /// and the hit rule.
+    seq: AtomicU64,
 }
 
-/// What the books picked for one miss: the slot to fill and, when it held
-/// an expert, the id it let go.
+/// What the books picked for one miss: the slot to fill, the id the call
+/// wants in it and, when the slot held an expert, the id it let go.
 struct Pick {
     slot: usize,
     id: u32,
+    gone: Option<u32>,
 }
 
 /// The tier's counters ([`NvTier::stats`]).
@@ -693,10 +859,15 @@ impl Drop for NvTier {
     }
 }
 
+#[derive(Default)]
 struct Books {
     tick: u64,
+    /// The last transient's sequence number.
+    seq: u64,
     /// The dedup pass's seen marks, reused across calls.
     seen: Vec<bool>,
+    /// The ids the current call names, for a transient call's victim pick.
+    named: Vec<bool>,
 }
 
 /// The arena's mapping as the pool's fill workers reach it.
@@ -923,6 +1094,7 @@ impl NvTier {
                     state: AtomicU32::new(FREE),
                     id: AtomicU32::new(u32::MAX),
                     tick: AtomicU64::new(0),
+                    seq: AtomicU64::new(0),
                 })
                 .collect();
         }
@@ -952,10 +1124,7 @@ impl NvTier {
             shared: SharedArena(map.as_ptr() as *mut u8),
             map,
             by_layer: arenas,
-            books: Mutex::new(Books {
-                tick: 0,
-                seen: Vec::new(),
-            }),
+            books: Mutex::new(Books::default()),
             stats: Stats::default(),
             budget: plan.host.nvme_arena_bytes,
             slots: count,
@@ -1155,14 +1324,7 @@ impl NvTier {
         if arena.host.contains(&id) {
             return Ok(None);
         }
-        let open = arena.reading(layer, id, WHAT)?.load(Ordering::Acquire);
-        if open == 0 {
-            return Err(GpuError::protocol(
-                WHAT,
-                format!("layer {layer} expert {id}: a slot read with no read open"),
-            ));
-        }
-        if open <= arena.mapped[id as usize].load(Ordering::Acquire) {
+        if !arena.slot_read(layer, id, WHAT)? {
             return Ok(None);
         }
         let slot = arena.filled(id).ok_or_else(|| {
@@ -1213,7 +1375,7 @@ impl NvTier {
     /// staged). Done under the books' lock, so no claim takes the slot
     /// between its freeing and its pages' return. Refused by name: a layer
     /// the arena does not cover, an id past its experts, and an id a lane
-    /// has open — the landing follows its copy's staging.
+    /// has open or a batch pins — the landing follows its copy's staging.
     pub fn release(&self, layer: usize, id: u32) -> Result<u64, GpuError> {
         const WHAT: &str = "NvTier::release";
         let arena = self.arena_of(layer, WHAT)?;
@@ -1237,7 +1399,7 @@ impl NvTier {
         if arena.reading(layer, id, WHAT)?.load(Ordering::Acquire) > 0 {
             return Err(GpuError::protocol(
                 WHAT,
-                format!("layer {layer} expert {id}: freed while a lane has it open"),
+                format!("layer {layer} expert {id}: freed while a lane or a batch pin has it open"),
             ));
         }
         arena.slots[slot].state.store(FREE, Ordering::Relaxed);
@@ -1250,6 +1412,21 @@ impl NvTier {
             .dontneed(arena.slot_off(slot), arena.slot_bytes)
             .map_err(|e| GpuError::plan(WHAT, e))?;
         Ok(arena.slot_bytes as u64)
+    }
+
+    /// Pin layer `layer`'s `ids`, each of which the arena must hold filled,
+    /// until the guard drops: no claim takes a pinned id's slot, and
+    /// [`NvTier::release`] refuses it. Done under the books' lock, so a claim
+    /// either ran before the pin or sees it. Refused by name, nothing pinned:
+    /// a layer the arena does not cover, an id past its experts and an id
+    /// with no filled slot. A pin counts as a lane's open read of a filled
+    /// slot, so [`NvTier::staged_slot`] reads the same beside one. Ids of the
+    /// plan's host segment are the mapping's and pin nothing.
+    pub fn pin(&self, layer: usize, ids: &[u32]) -> Result<TierPin<'_>, GpuError> {
+        const WHAT: &str = "NvTier::pin";
+        let arena = self.arena_of(layer, WHAT)?;
+        let _books = self.books.lock().unwrap_or_else(|e| e.into_inner());
+        arena.pin_batch(layer, ids, WHAT).map(TierPin::new)
     }
 
     /// Layer `layer`'s drop, on this thread: every id the arena serves
@@ -1441,7 +1618,14 @@ impl NvTier {
     /// failed is freed, never lent half-filled. An id the plan's host
     /// segment holds is the mapping's and is skipped ([`NvTier::serves`]).
     pub fn ensure(&self, layer: usize, ids: &[u32]) -> Result<(), GpuError> {
-        self.ensure_by(layer, ids, FillBy::Pool)
+        self.ensure_as(layer, ids, Claim::Step)
+    }
+
+    /// [`NvTier::ensure`] with the call placed in the books as `claim` says:
+    /// [`Claim::Step`] and [`Claim::Keep`] take a fresh tick, [`Claim::Transient`]
+    /// enters its misses at the cold end, where they are the first victims.
+    pub fn ensure_as(&self, layer: usize, ids: &[u32], claim: Claim) -> Result<(), GpuError> {
+        self.ensure_by(layer, ids, FillBy::Pool, claim)
     }
 
     /// [`NvTier::ensure`] with every read on the calling thread, one pick
@@ -1451,11 +1635,17 @@ impl NvTier {
     /// parts at queue depth 1 either way; the books' claim and publish are
     /// `ensure`'s.
     pub fn ensure_here(&self, layer: usize, ids: &[u32]) -> Result<(), GpuError> {
-        self.ensure_by(layer, ids, FillBy::Caller)
+        self.ensure_by(layer, ids, FillBy::Caller, Claim::Step)
     }
 
-    fn ensure_by(&self, layer: usize, ids: &[u32], by: FillBy) -> Result<(), GpuError> {
-        self.fill_missing(layer, ids, by)?;
+    fn ensure_by(
+        &self,
+        layer: usize,
+        ids: &[u32],
+        by: FillBy,
+        claim: Claim,
+    ) -> Result<(), GpuError> {
+        self.fill_missing(layer, ids, by, claim)?;
         if self.audit.get().is_some() {
             self.audit_slots(layer, ids)?;
         }
@@ -1541,14 +1731,20 @@ impl NvTier {
 
     /// The misses of `ids` read into their slots ([`NvTier::ensure`]), the
     /// reads on `by`.
-    fn fill_missing(&self, layer: usize, ids: &[u32], by: FillBy) -> Result<(), GpuError> {
+    fn fill_missing(
+        &self,
+        layer: usize,
+        ids: &[u32],
+        by: FillBy,
+        kind: Claim,
+    ) -> Result<(), GpuError> {
         const WHAT: &str = "NvTier::ensure";
         let Some(arena) = self.by_layer.get(layer).and_then(|l| l.as_ref()) else {
             return Err(GpuError::state(WHAT, "the layer's arena"));
         };
         let claim = {
             let mut books = self.books.lock().unwrap_or_else(|e| e.into_inner());
-            claim_slots(layer, arena, &mut books, ids)?
+            claim_slots(layer, arena, &mut books, ids, kind)?
         };
         self.stats.misses.fetch_add(claim.misses, Ordering::Relaxed);
         for &slot in &claim.evicted {
@@ -1574,13 +1770,7 @@ impl NvTier {
         })?;
         {
             let mut books = self.books.lock().unwrap_or_else(|e| e.into_inner());
-            for p in &picks {
-                books.tick += 1;
-                arena.slots[p.slot]
-                    .tick
-                    .store(books.tick, Ordering::Relaxed);
-                arena.slots[p.slot].state.store(FILLED, Ordering::Relaxed);
-            }
+            publish(arena, &mut books, &picks, kind);
         }
         let bytes: u64 = picks
             .iter()
@@ -1706,8 +1896,15 @@ fn seam_error(layer: usize, ids: &[u32], e: GpuError) -> TierError {
 }
 
 impl TierSlots for NvTier {
-    fn ensure(&self, layer: usize, ids: &[u32]) -> Result<(), TierError> {
-        NvTier::ensure(self, layer, ids).map_err(|e| seam_error(layer, ids, e))
+    fn ensure_as(&self, layer: usize, ids: &[u32], claim: Claim) -> Result<(), TierError> {
+        NvTier::ensure_as(self, layer, ids, claim).map_err(|e| seam_error(layer, ids, e))
+    }
+
+    fn pin<'a>(&'a self, layer: usize, ids: &[u32]) -> Result<TierPin<'a>, TierError> {
+        NvTier::pin(self, layer, ids).map_err(|e| TierError::Pin {
+            layer,
+            source: Box::new(e),
+        })
     }
 
     fn slot(&self, layer: usize, id: u32, part: usize) -> Option<&[u8]> {
@@ -1727,6 +1924,7 @@ mod tests {
         layer_bases, pick_slot, slots_of, window_bytes, window_span,
     };
     use engram::direct::{DIRECT_ALIGN, aligned_span};
+    use model::moe::Claim;
     use std::sync::atomic::{AtomicU32, AtomicU64};
 
     fn book(state: u32, tick: u64) -> SlotBook {
@@ -1734,6 +1932,7 @@ mod tests {
             state: AtomicU32::new(state),
             id: AtomicU32::new(u32::MAX),
             tick: AtomicU64::new(tick),
+            seq: AtomicU64::new(0),
         }
     }
 
@@ -1881,15 +2080,12 @@ mod tests {
     #[test]
     fn an_open_read_keeps_its_slot_out_of_the_lru() {
         let arena = arena_of(4, 2);
-        let mut books = super::Books {
-            tick: 0,
-            seen: Vec::new(),
-        };
-        let first = super::claim_slots(0, &arena, &mut books, &[0, 1]).unwrap();
+        let mut books = super::Books::default();
+        let first = super::claim_slots(0, &arena, &mut books, &[0, 1], Claim::Step).unwrap();
         fill_claimed(&arena, &mut books, &first);
         // Expert 0 is the least recently used and a lane has it open.
         arena.open(0, 0, "test").expect("the lane's open");
-        let evict = super::claim_slots(0, &arena, &mut books, &[2]).unwrap();
+        let evict = super::claim_slots(0, &arena, &mut books, &[2], Claim::Step).unwrap();
         assert_eq!(evict.evicted.len(), 1);
         assert!(arena.filled(0).is_some(), "the pinned slot stays filled");
         assert!(arena.filled(1).is_none(), "the next oldest was taken");
@@ -1897,7 +2093,7 @@ mod tests {
         // Every filled slot pinned: refused by name, nothing moved.
         arena.open(0, 2, "test").expect("a second lane's open");
         let tick = books.tick;
-        let e = super::claim_slots(0, &arena, &mut books, &[3])
+        let e = super::claim_slots(0, &arena, &mut books, &[3], Claim::Step)
             .map(|_| ())
             .unwrap_err()
             .to_string();
@@ -1907,8 +2103,310 @@ mod tests {
         // The ends unpin: the slot is the LRU's again.
         arena.close(0, 0, "test").expect("the end");
         arena.close(0, 2, "test").expect("the end");
-        let again = super::claim_slots(0, &arena, &mut books, &[3]).unwrap();
+        let again = super::claim_slots(0, &arena, &mut books, &[3], Claim::Step).unwrap();
         assert_eq!(again.evicted.len(), 1, "an unpinned slot goes again");
+    }
+
+    /// `ids` claimed as `kind` and filled, as a call's claim and its fill's
+    /// join do.
+    fn ensure_as(
+        arena: &super::LayerArena,
+        books: &mut super::Books,
+        ids: &[u32],
+        kind: Claim,
+    ) -> super::Claimed {
+        let c = super::claim_slots(0, arena, books, ids, kind).unwrap();
+        fill_claimed_as(arena, books, &c, kind);
+        c
+    }
+
+    /// The ids the arena holds filled, ascending.
+    fn filled_ids(arena: &super::LayerArena) -> Vec<u32> {
+        (0..arena.n_expert)
+            .filter(|&id| arena.filled(id).is_some())
+            .collect()
+    }
+
+    /// A transient miss enters at the cold end and is the first victim,
+    /// whatever claim takes the next slot: transients go oldest first (the
+    /// order their call claimed them in), and only then the least recently
+    /// used hot slot.
+    #[test]
+    fn a_transient_claim_is_the_first_victim() {
+        let arena = arena_of(8, 4);
+        let mut books = super::Books::default();
+        ensure_as(&arena, &mut books, &[0, 1], Claim::Step);
+        // Expert 3 is claimed before 2, so it is the older transient.
+        ensure_as(&arena, &mut books, &[3, 2], Claim::Transient);
+        assert_eq!(filled_ids(&arena), [0, 1, 2, 3]);
+        // A transient claim's miss takes the oldest transient too.
+        ensure_as(&arena, &mut books, &[4], Claim::Transient);
+        assert_eq!(filled_ids(&arena), [0, 1, 2, 4], "3 was the oldest");
+        // Expert 0 is the least recently used, and still outlives them all.
+        ensure_as(&arena, &mut books, &[5], Claim::Step);
+        assert_eq!(filled_ids(&arena), [0, 1, 4, 5], "2 was the next oldest");
+        ensure_as(&arena, &mut books, &[6], Claim::Step);
+        assert_eq!(filled_ids(&arena), [0, 1, 5, 6], "the last transient");
+        ensure_as(&arena, &mut books, &[7], Claim::Step);
+        assert_eq!(filled_ids(&arena), [1, 5, 6, 7], "no transient: the LRU");
+    }
+
+    /// A keep claim takes a fresh tick like a step, so every transient goes
+    /// before it, though it is older than the hot slots beside it; with no
+    /// transient left it is the least recently used.
+    #[test]
+    fn a_keep_claim_outlives_every_transient() {
+        let arena = arena_of(8, 4);
+        let mut books = super::Books::default();
+        ensure_as(&arena, &mut books, &[1], Claim::Keep);
+        ensure_as(&arena, &mut books, &[0, 2], Claim::Transient);
+        ensure_as(&arena, &mut books, &[3], Claim::Step);
+        ensure_as(&arena, &mut books, &[4], Claim::Keep);
+        assert_eq!(
+            filled_ids(&arena),
+            [1, 2, 3, 4],
+            "0 was the oldest transient"
+        );
+        ensure_as(&arena, &mut books, &[5], Claim::Step);
+        assert_eq!(filled_ids(&arena), [1, 3, 4, 5], "2 was the last transient");
+        ensure_as(&arena, &mut books, &[6], Claim::Step);
+        assert_eq!(
+            filled_ids(&arena),
+            [3, 4, 5, 6],
+            "the kept id is the LRU now"
+        );
+    }
+
+    /// A step or keep hit on a transient gives it a fresh tick and turns it
+    /// hot: it leaves the cold end, and is the least recently used only by
+    /// its new tick.
+    #[test]
+    fn a_step_hit_turns_a_transient_hot() {
+        for hit in [Claim::Step, Claim::Keep] {
+            let arena = arena_of(8, 3);
+            let mut books = super::Books::default();
+            ensure_as(&arena, &mut books, &[0], Claim::Step);
+            ensure_as(&arena, &mut books, &[1, 2], Claim::Transient);
+            let c = ensure_as(&arena, &mut books, &[1], hit);
+            assert_eq!(c.misses, 0, "{hit:?}: a hit");
+            // Expert 2 is the only transient left.
+            ensure_as(&arena, &mut books, &[3], Claim::Step);
+            assert_eq!(filled_ids(&arena), [0, 1, 3], "{hit:?}: 1 is hot, 2 went");
+            // Expert 1's tick is newer than 0's: 0 is the LRU.
+            ensure_as(&arena, &mut books, &[4], Claim::Step);
+            assert_eq!(filled_ids(&arena), [1, 3, 4], "{hit:?}: the LRU is 0");
+        }
+    }
+
+    /// A transient hit on a hot id refreshes it (it stays hot, and is no
+    /// longer the LRU), and on a transient leaves it where it was, the first
+    /// victim.
+    #[test]
+    fn a_transient_hit_never_demotes_a_hot_id_nor_warms_a_transient() {
+        let arena = arena_of(8, 3);
+        let mut books = super::Books::default();
+        ensure_as(&arena, &mut books, &[0, 1], Claim::Step);
+        ensure_as(&arena, &mut books, &[2], Claim::Transient);
+        let c = ensure_as(&arena, &mut books, &[0, 2], Claim::Transient);
+        assert_eq!(c.misses, 0, "both hit");
+        ensure_as(&arena, &mut books, &[3], Claim::Step);
+        assert_eq!(filled_ids(&arena), [0, 1, 3], "2 is still the first victim");
+        // Expert 0 was refreshed after 1: 1 is the LRU now.
+        ensure_as(&arena, &mut books, &[4], Claim::Step);
+        assert_eq!(filled_ids(&arena), [0, 3, 4], "the hot hit stayed hot");
+    }
+
+    /// A transient call's own ids are never its victims, whatever order it
+    /// names them in: a transient it hits keeps its cold place, where its
+    /// own misses would look first.
+    #[test]
+    fn a_transient_call_never_evicts_its_own_ids() {
+        for names in [[0, 3], [3, 0]] {
+            let arena = arena_of(8, 3);
+            let mut books = super::Books::default();
+            ensure_as(&arena, &mut books, &[2], Claim::Step);
+            ensure_as(&arena, &mut books, &[0, 1], Claim::Transient);
+            // Expert 0 is the oldest transient and the call names it.
+            let c = ensure_as(&arena, &mut books, &names, Claim::Transient);
+            assert_eq!((c.misses, c.evicted.len()), (1, 1), "{names:?}");
+            assert_eq!(filled_ids(&arena), [0, 2, 3], "{names:?}: 1 went, not 0");
+        }
+    }
+
+    /// A pinned batch is no victim, hot or transient, whatever its age: the
+    /// next oldest unpinned slot goes. A lane's open read and a batch pin
+    /// count one each, so dropping the guard leaves the lane's read pinning.
+    #[test]
+    fn a_pinned_batch_is_never_a_victim() {
+        let arena = arena_of(8, 4);
+        let mut books = super::Books::default();
+        ensure_as(&arena, &mut books, &[0, 1, 2, 3], Claim::Step);
+        // Experts 0 and 1 are the two least recently used.
+        let pin = arena.pin_batch(0, &[1, 0, 1], "test").expect("a batch pin");
+        ensure_as(&arena, &mut books, &[4], Claim::Step);
+        ensure_as(&arena, &mut books, &[5], Claim::Step);
+        assert_eq!(
+            filled_ids(&arena),
+            [0, 1, 4, 5],
+            "2 and 3 went, not 0 and 1"
+        );
+        drop(pin);
+        ensure_as(&arena, &mut books, &[6], Claim::Step);
+        assert_eq!(
+            filled_ids(&arena),
+            [1, 4, 5, 6],
+            "the guard's drop: 0 is the LRU"
+        );
+
+        // A pinned transient outranks the transient-first rule.
+        let arena = arena_of(8, 4);
+        let mut books = super::Books::default();
+        ensure_as(&arena, &mut books, &[0], Claim::Step);
+        ensure_as(&arena, &mut books, &[1, 2, 3], Claim::Transient);
+        let pin = arena.pin_batch(0, &[1], "test").expect("a batch pin");
+        ensure_as(&arena, &mut books, &[4], Claim::Step);
+        assert_eq!(filled_ids(&arena), [0, 1, 3, 4], "2 went, not the pinned 1");
+        // A lane's read on the same id keeps it pinned past the guard.
+        arena.open(0, 1, "test").expect("the lane's open");
+        drop(pin);
+        ensure_as(&arena, &mut books, &[5], Claim::Step);
+        assert_eq!(filled_ids(&arena), [0, 1, 4, 5], "3 went: the lane pins 1");
+        arena.close(0, 1, "test").expect("the lane's end");
+        ensure_as(&arena, &mut books, &[6], Claim::Transient);
+        assert_eq!(
+            filled_ids(&arena),
+            [0, 4, 5, 6],
+            "1 is the oldest transient"
+        );
+    }
+
+    /// With every filled slot pinned a claim is refused by name, whatever
+    /// its kind, and gives back what it had taken: a call whose first miss
+    /// takes the one unpinned slot and whose second finds none leaves no
+    /// slot filling, the evicted id filled again and the books as they were.
+    #[test]
+    fn every_slot_pinned_is_refused_by_name() {
+        let arena = arena_of(8, 3);
+        let mut books = super::Books::default();
+        ensure_as(&arena, &mut books, &[0, 1, 2], Claim::Step);
+        let pin = arena.pin_batch(0, &[0, 1, 2], "test").expect("a batch pin");
+        let tick = books.tick;
+        for kind in [Claim::Step, Claim::Keep, Claim::Transient] {
+            let e = super::claim_slots(0, &arena, &mut books, &[3], kind)
+                .map(|_| ())
+                .unwrap_err()
+                .to_string();
+            assert!(
+                e.contains("pinned by a lane's read or a batch pin"),
+                "{kind:?}: {e}"
+            );
+        }
+        assert_eq!(books.tick, tick, "the books' tick stands");
+        assert_eq!(filled_ids(&arena), [0, 1, 2]);
+        drop(pin);
+
+        // One unpinned slot, two misses: the first takes it, the second is
+        // refused, and the first's slot is given back.
+        let pin = arena.pin_batch(0, &[0, 1], "test").expect("a batch pin");
+        let e = super::claim_slots(0, &arena, &mut books, &[3, 4], Claim::Step)
+            .map(|_| ())
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("pinned by a lane's read or a batch pin"), "{e}");
+        let filling = arena
+            .slots
+            .iter()
+            .filter(|s| s.state.load(std::sync::atomic::Ordering::Relaxed) == FILLING)
+            .count();
+        assert_eq!(filling, 0, "no slot is left filling");
+        assert_eq!(
+            filled_ids(&arena),
+            [0, 1, 2],
+            "the evicted id is filled again"
+        );
+        assert!(arena.filled(3).is_none() && arena.filled(4).is_none());
+        // The slot is claimable again: one miss fits.
+        let c = super::claim_slots(0, &arena, &mut books, &[3], Claim::Step).unwrap();
+        assert_eq!((c.picks.len(), c.evicted.len()), (1, 1));
+        drop(pin);
+    }
+
+    /// A pin names what it refuses and pins nothing then: an id with no
+    /// filled slot, and an id past the experts; an id of the host segment is
+    /// the mapping's and pins nothing.
+    #[test]
+    fn a_pin_of_an_unfilled_or_unknown_id_is_refused_and_pins_nothing() {
+        let mut arena = arena_of(8, 2);
+        arena.host = 6..8;
+        let mut books = super::Books::default();
+        ensure_as(&arena, &mut books, &[0, 1], Claim::Step);
+        match arena.pin_batch(7, &[0, 5], "test") {
+            Err(crate::GpuError::Protocol { what, detail }) => {
+                assert_eq!(what, "test");
+                assert!(
+                    detail.contains("layer 7 expert 5") && detail.contains("unfilled"),
+                    "{detail}"
+                );
+            }
+            other => panic!("an unfilled id is refused, got {:?}", other.map(|_| ())),
+        }
+        assert!(
+            arena.pin_batch(7, &[0, 99], "test").is_err(),
+            "an id past the experts"
+        );
+        let open = |id| {
+            arena
+                .reading(7, id, "test")
+                .unwrap()
+                .load(std::sync::atomic::Ordering::Relaxed)
+        };
+        assert_eq!((open(0), open(1)), (0, 0), "the refusals moved no count");
+        let pin = arena
+            .pin_batch(7, &[6, 7], "test")
+            .expect("host ids pin nothing");
+        assert_eq!((open(6), open(7)), (0, 0));
+        drop(pin);
+    }
+
+    /// A batch pin counts as a lane's read of a filled slot: beside a lane's
+    /// read of the same id, opened filled or opened unfilled (the mapping's)
+    /// and filled since, the open reads classify as slot reads without a
+    /// refusal, and a pin alone is never read as a mapping read.
+    #[test]
+    fn a_lane_read_and_a_batch_pin_on_one_id_read_as_a_slot() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let arena = arena_of(4, 2);
+        let mut books = super::Books::default();
+        ensure_as(&arena, &mut books, &[0], Claim::Step);
+        arena
+            .open(0, 0, "test")
+            .expect("a lane opens the filled id");
+        let pin = arena.pin_batch(0, &[0], "test").expect("a batch pin");
+        assert!(arena.slot_read(0, 0, "test").unwrap(), "a slot read");
+        drop(pin);
+        arena.close(0, 0, "test").expect("the lane's end");
+        // A lane opens id 1 unfilled: the mapping's read. A fill and a pin
+        // follow: the open reads are no longer all the mapping's.
+        arena
+            .open(0, 1, "test")
+            .expect("a lane opens the unfilled id");
+        arena.mapped[1].fetch_add(1, Relaxed);
+        assert!(
+            !arena.slot_read(0, 1, "test").unwrap(),
+            "the mapping's read"
+        );
+        ensure_as(&arena, &mut books, &[1], Claim::Step);
+        let pin = arena.pin_batch(0, &[1], "test").expect("a batch pin");
+        assert!(
+            arena.slot_read(0, 1, "test").unwrap(),
+            "the slot is filled and pinned"
+        );
+        drop(pin);
+        assert!(
+            !arena.slot_read(0, 1, "test").unwrap(),
+            "the mapping's read again"
+        );
+        assert!(arena.slot_read(0, 2, "test").is_err(), "no read open");
     }
 
     /// Disjoint arena and mapping ranges pass; an arena range that names a
@@ -1972,16 +2470,18 @@ mod tests {
     }
 
     /// Mark what a call claimed as filled, as the fill's join does.
-    fn fill_claimed(arena: &super::LayerArena, books: &mut super::Books, c: &super::Claim) {
-        for p in &c.picks {
-            books.tick += 1;
-            arena.slots[p.slot]
-                .tick
-                .store(books.tick, std::sync::atomic::Ordering::Relaxed);
-            arena.slots[p.slot]
-                .state
-                .store(FILLED, std::sync::atomic::Ordering::Relaxed);
-        }
+    fn fill_claimed(arena: &super::LayerArena, books: &mut super::Books, c: &super::Claimed) {
+        fill_claimed_as(arena, books, c, Claim::Step);
+    }
+
+    /// [`fill_claimed`] for a call claimed as `kind`.
+    fn fill_claimed_as(
+        arena: &super::LayerArena,
+        books: &mut super::Books,
+        c: &super::Claimed,
+        kind: Claim,
+    ) {
+        super::publish(arena, books, &c.picks, kind);
     }
 
     /// A layer's drop keeps the pages of an id a lane has open: its mark is
@@ -2020,20 +2520,17 @@ mod tests {
     #[test]
     fn an_evicted_id_is_refilled_by_a_later_call() {
         let arena = arena_of(4, 2);
-        let mut books = super::Books {
-            tick: 0,
-            seen: Vec::new(),
-        };
-        let first = super::claim_slots(0, &arena, &mut books, &[0, 1]).unwrap();
+        let mut books = super::Books::default();
+        let first = super::claim_slots(0, &arena, &mut books, &[0, 1], Claim::Step).unwrap();
         assert_eq!((first.picks.len(), first.misses), (2, 2));
         fill_claimed(&arena, &mut books, &first);
         // Expert 2 takes the slot of the least recently used, expert 0.
-        let evict = super::claim_slots(0, &arena, &mut books, &[2]).unwrap();
+        let evict = super::claim_slots(0, &arena, &mut books, &[2], Claim::Step).unwrap();
         assert_eq!(evict.evicted.len(), 1);
         fill_claimed(&arena, &mut books, &evict);
         assert!(arena.filled(0).is_none(), "expert 0 was evicted");
         // The call that needs expert 0 again claims a slot for it.
-        let again = super::claim_slots(0, &arena, &mut books, &[0]).unwrap();
+        let again = super::claim_slots(0, &arena, &mut books, &[0], Claim::Step).unwrap();
         assert_eq!(again.picks.len(), 1, "an evicted id is refilled");
         fill_claimed(&arena, &mut books, &again);
         assert!(arena.filled(0).is_some(), "its slot reads filled");
@@ -2049,17 +2546,14 @@ mod tests {
     fn a_call_past_the_slots_is_refused_before_any_claim() {
         use model::moe::TierError;
         let arena = arena_of(4, 1);
-        let mut books = super::Books {
-            tick: 0,
-            seen: Vec::new(),
-        };
+        let mut books = super::Books::default();
         // One slot, id 1 already filled; the call names three distinct ids
         // of the arena (id 2 twice, counted once), one of them the filled
         // one — the union reads them all at once.
-        let first = super::claim_slots(7, &arena, &mut books, &[1]).unwrap();
+        let first = super::claim_slots(7, &arena, &mut books, &[1], Claim::Step).unwrap();
         fill_claimed(&arena, &mut books, &first);
         let tick = books.tick;
-        let e = super::claim_slots(7, &arena, &mut books, &[1, 0, 2, 2])
+        let e = super::claim_slots(7, &arena, &mut books, &[1, 0, 2, 2], Claim::Step)
             .map(|_| ())
             .unwrap_err();
         match &e {
@@ -2109,7 +2603,7 @@ mod tests {
         arena.slots[0]
             .state
             .store(FILLING, std::sync::atomic::Ordering::Relaxed);
-        let raced = super::claim_slots(7, &arena, &mut books, &[3])
+        let raced = super::claim_slots(7, &arena, &mut books, &[3], Claim::Step)
             .map(|_| ())
             .unwrap_err()
             .to_string();
