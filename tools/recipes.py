@@ -26,6 +26,10 @@ network, never rewrites Cargo.lock), and the sources as text. It builds nothing 
 BASE and HEAD — a round's tree is never committed. `A..B` compares two commits exactly; both sides
 are read from `git archive` copies, so the graph is the one those commits had.
 
+A recipe that a row of tools/fixture-variants.tsv lists also prints its variant item, `NAME@BLOOMERY_FIXTURE_VARIANT=<tag>`, as a line of
+its own and in the `recipes:` line (a batch `--list` takes the first word of the line). A row that was added or edited prints the items of its
+recipes whether or not the diff selected them: the variant's file lives outside the repository, so the row is what a change to it is.
+
 A recipe's inputs are:
   - the files of every cargo target it builds or tests: the target's own module tree (`mod`,
     `#[path]`, `include_str!`/`include_bytes!`/`include!`), its package's lib, the libs of its
@@ -1729,6 +1733,7 @@ def cmd_affected(args: argparse.Namespace) -> int:
         rng = f"{a_rev[:9]}..{b_rev[:9]}" if b_rev else f"{a_rev[:9]}..(working tree)"
         nar = narrow(changed, a, b, scans, rows, tables) if args.narrow else None
         narrowed = nar is not None and not nar.full
+        vitems = variant_items(list(nar.picks) if narrowed else [s.recipe for s in sels], a, b, changed, prefix) if prefix == GATE_PREFIX else []
         if narrowed:
             print(f"affected: {rng} — {len(changed)} changed files, {len(nar.picks)} of {total} {prefix or ''}recipes selected "
                   f"(narrowed from {len(sels)} by ptx-scan){weekly}")
@@ -1742,11 +1747,12 @@ def cmd_affected(args: argparse.Namespace) -> int:
             for line in nar.files:
                 print(f"narrow: file {line}")
         if narrowed:
-            width = max([len(n) for n in nar.picks] + [len(t.recipe) for t in trig] + [10])
+            width = max([len(n) for n in nar.picks] + [len(i) for i, _ in vitems] + [len(t.recipe) for t in trig] + [10])
             for n, why in nar.picks.items():
                 print(f"  {n:<{width}}  {why}")
+            print_variants(vitems, width)
             print_triggers(trig, width)
-            print("recipes: " + " ".join([*nar.picks, *(t.recipe for t in trig)]))
+            print("recipes: " + " ".join([*nar.picks, *(i for i, _ in vitems), *(t.recipe for t in trig)]))
             print("always: " + " ".join(ALWAYS))
             let_out = "; ".join(v.line() for v in nar.verdicts)
             out = [s.recipe for s in sels if s.recipe not in nar.picks]
@@ -1754,12 +1760,13 @@ def cmd_affected(args: argparse.Namespace) -> int:
             for n in out:
                 print(f"  - {n}  (ptx-scan {let_out})")
         else:
-            width = max([len(s.recipe) for s in sels] + [len(t.recipe) for t in trig] + [10])
+            width = max([len(s.recipe) for s in sels] + [len(i) for i, _ in vitems] + [len(t.recipe) for t in trig] + [10])
             for s in sels:
                 more_n = f" (+{len(s.files) - 1})" if len(s.files) > 1 else ""
                 print(f"  {s.recipe:<{width}}  {s.files[0]}{more_n}  [{s.why}]")
+            print_variants(vitems, width)
             print_triggers(trig, width)
-            print("recipes: " + " ".join([*(s.recipe for s in sels), *(t.recipe for t in trig)]))
+            print("recipes: " + " ".join([*(s.recipe for s in sels), *(i for i, _ in vitems), *(t.recipe for t in trig)]))
             print("always: " + " ".join(ALWAYS))
         print(f"unmapped ({len(unmapped)}):")
         for u in unmapped:
@@ -1806,6 +1813,43 @@ def print_triggers(trig: list["Trigger"], width: int) -> None:
     for t in trig:
         more_n = f" (+{len(t.files) - 1})" if len(t.files) > 1 else ""
         print(f"  {t.recipe:<{width}}  {t.files[0]}{more_n}  [{t.why}]")
+
+
+def print_variants(vitems: list[tuple[str, str]], width: int) -> None:
+    """The variant items of an `affected` list, one line each in the shape of a recipe's line: a batch `--list` takes the first word."""
+    for item, why in vitems:
+        print(f"  {item:<{width}}  [{why}]")
+
+
+def variant_items_self_test(expect) -> None:
+    """The variant items of an `affected` list: a selected recipe that a row lists gets its `NAME@BLOOMERY_FIXTURE_VARIANT=<tag>` item beside
+    it; a recipe the diff did not select gets one only when its row changed; a side with no table has none. Each clause is red on an
+    expansion that prints nothing."""
+    import types
+
+    def side(table: str | None, recipes: tuple[str, ...] = ("gate-a", "gate-b", "lint")) -> Side:
+        tree = types.SimpleNamespace(exists=lambda rel: table is not None and rel == VARIANT_TABLE, read=lambda rel: table or "")
+        return types.SimpleNamespace(tree=tree, recipes={r: None for r in recipes})  # type: ignore[return-value]
+
+    row = "v1\tfam\ttrunk\tx=q4_K\tgate-a gate-b lint\twhy"
+    edited = row.replace("x=q4_K", "x=q5_K")
+    t = f"# c\n{row}\n"
+    want_a = ("gate-a@BLOOMERY_FIXTURE_VARIANT=v1", "variant v1: its row lists gate-a, which is selected")
+    got = variant_items(["gate-a"], side(t), side(t), [], GATE_PREFIX)
+    expect(got == [want_a], f"a selected recipe a row lists gets its variant item beside it: {got}")
+    expect(variant_items(["gate-c"], side(t), side(t), [], GATE_PREFIX) == [], "a recipe no row lists, or one the diff did not select, got a variant item")
+    got = variant_items([], side(t), side(f"# c\n{edited}\n"), [VARIANT_TABLE], GATE_PREFIX)
+    expect([i for i, _ in got] == ["gate-a@BLOOMERY_FIXTURE_VARIANT=v1", "gate-b@BLOOMERY_FIXTURE_VARIANT=v1"] and all("its row in" in w for _, w in got),
+           f"an edited row selects its recipes' variant items though the diff selected none (a recipe outside the gate- prefix stays out): {got}")
+    expect(variant_items([], side(t), side(t), [VARIANT_TABLE], GATE_PREFIX) == [], "an unchanged row was reported as changed")
+    got = variant_items([], side(None), side(t), [VARIANT_TABLE], GATE_PREFIX)
+    expect([i for i, _ in got] == ["gate-a@BLOOMERY_FIXTURE_VARIANT=v1", "gate-b@BLOOMERY_FIXTURE_VARIANT=v1"], f"a row added where the base had no table: {got}")
+    expect(variant_items(["gate-a"], side(t), side(None), [], GATE_PREFIX) == [], "a side with no table got variant items")
+    try:
+        variant_items(["gate-a"], side(t), side("v1\tfam\n"), [], GATE_PREFIX)
+        expect(False, "a malformed row was accepted")
+    except RecipeError as e:
+        expect("six tab-separated columns" in str(e), f"a malformed row's error: {e}")
 
 
 def depinfo_only(side: Side) -> list[str]:
@@ -5318,12 +5362,19 @@ def cmd_orphan_tests(args: argparse.Namespace) -> int:
 
 KEY_VERSION = "bloomery-gate-key 1"
 MANIFEST_VERSION = "box-manifest 1"
-MAC_ENV = ("BLOOMERY_BOX", "BLOOMERY_CARD", "BLOOMERY_DATA", "BLOOMERY_MODEL", "BLOOMERY_REF_MODEL", "BLOOMERY_TIER", "BLOOMERY_V41_MODEL")
+MAC_ENV = ("BLOOMERY_BOX", "BLOOMERY_CARD", "BLOOMERY_DATA", "BLOOMERY_FIXTURE_VARIANT", "BLOOMERY_MODEL", "BLOOMERY_REF_MODEL", "BLOOMERY_TIER", "BLOOMERY_V41_MODEL")
 # The fixture tier's files (tools/ref/ref-paths.sh: one directory a family under it). Its rows belong to the keys of fixture-tier
 # items only: a real item must not rerun because a fixture was regenerated, and a fixture item must, whatever a fixture file's
 # directory is called — so the box manifest lists every file under it, subdirectories included, and no file's literal
 # brings it into a real item's key (KeyContext.literal_dirs).
 FIXTURE_ROOT = "/models/fixtures"
+# A fixture variant (tools/fixture-variants.tsv, tools/ref/ref-paths.sh): the family's fixture requantized to a tag's type map, its files
+# below VARIANT_ROOT/<tag>, beside the fixture root and not under it (every file under FIXTURE_ROOT is in every fixture-tier item's
+# key). An item's key holds no variant's rows unless it runs under that tag (BLOOMERY_FIXTURE_VARIANT=<tag>): then its own
+# directory's, and the tag's row of the table. A re-requant or an edit of the row moves that item's key and no other's, and a
+# variant written moves no other item's.
+VARIANT_ROOT = "/models/fixture-variants"
+VARIANT_TABLE = "tools/fixture-variants.tsv"
 
 
 def tier_of(values: list[str], mac: str | None) -> str:
@@ -5335,6 +5386,72 @@ def tier_of(values: list[str], mac: str | None) -> str:
         if k == "BLOOMERY_TIER":
             tier = v or "real"
     return tier
+
+
+def variant_of(values: list[str], mac: str | None) -> str:
+    """The variant an item runs under: the last BLOOMERY_FIXTURE_VARIANT=<tag> entry of `values` (the box env, then the item's env),
+    else the Mac's; empty is none, as in tools/box.sh."""
+    tag = mac or ""
+    for e in values:
+        k, _, v = e.partition("=")
+        if k == "BLOOMERY_FIXTURE_VARIANT":
+            tag = v
+    return tag
+
+
+def variant_table_row(root: str, tag: str) -> str | None:
+    """The line of VARIANT_TABLE whose first column is `tag`, None when the table names none (or is not there)."""
+    try:
+        with open(os.path.join(root, VARIANT_TABLE), encoding="utf-8") as fh:
+            for ln in fh.read().splitlines():
+                if ln and not ln.startswith("#") and ln.split("\t", 1)[0] == tag:
+                    return ln
+    except OSError:
+        return None
+    return None
+
+
+def variant_table_rows(side: Side | None) -> dict[str, tuple[list[str], str]]:
+    """{tag: (recipes, the row's text)} of `side`'s VARIANT_TABLE: `tag, family, scope, map, recipes, why`, tab-separated, `#` lines
+    and blanks skipped. A side without the table, or no side, holds none; a row that is not six columns is a named error."""
+    if side is None or not side.tree.exists(VARIANT_TABLE):
+        return {}
+    rows: dict[str, tuple[list[str], str]] = {}
+    for ln in side.tree.read(VARIANT_TABLE).splitlines():
+        if not ln.strip() or ln.startswith("#"):
+            continue
+        cols = ln.split("\t")
+        if len(cols) != 6 or not cols[0] or not cols[4].split():
+            raise RecipeError(f"{VARIANT_TABLE}: the row {ln[:60]!r} is not `tag, family, scope, map, recipes, why` (six tab-separated columns, recipes named)")
+        rows[cols[0]] = (cols[4].split(), ln)
+    return rows
+
+
+def variant_items(picked: list[str], a: Side | None, b: Side, changed: list[str], prefix: str) -> list[tuple[str, str]]:
+    """The fixture-variant items of an `affected` list, `(item, why)` in the table's order: `NAME@BLOOMERY_FIXTURE_VARIANT=<tag>` for each
+    recipe of `picked` that a row of the table lists, and for each recipe of a row whose text moved between the two sides (a row added or
+    edited) whether or not the diff selected it: the variant's file is not in the repository, so the row is what a change to the
+    variant is. A recipe the justfile does not have, or that `prefix` leaves out, is skipped (check-recipes holds the table to the justfile)."""
+    old = variant_table_rows(a)
+    out = []
+    for tag, (recipes, text) in variant_table_rows(b).items():
+        moved = VARIANT_TABLE in changed and old.get(tag, ([], ""))[1] != text
+        for r in recipes:
+            if r not in b.recipes or not r.startswith(prefix):
+                continue
+            if r in picked:
+                out.append((f"{r}@BLOOMERY_FIXTURE_VARIANT={tag}", f"variant {tag}: its row lists {r}, which is selected"))
+            elif moved:
+                out.append((f"{r}@BLOOMERY_FIXTURE_VARIANT={tag}", f"variant {tag}: its row in {VARIANT_TABLE} changed"))
+    return out
+
+
+def own_variant_row(path: str, variant: str) -> bool:
+    """Whether a manifest row of VARIANT_ROOT is `variant`'s own: the directory itself (an absent or empty one is named so), or a path
+    in the tag's directory. The rows of the other tags' directories are not."""
+    return path == VARIANT_ROOT or (path + "/").startswith(f"{VARIANT_ROOT}/{variant}/")
+
+
 KEY_GLOBALS = ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo/config.toml", ".cargo/cuda-oxide.toml"]
 # tools/box.sh's rsync excludes (target/ and .git/ at any depth; *.ptx, *.ll, .oxide-artifacts/ at the
 # root), plus per-checkout noise no gate reads that would split the key by checkout: a worktree's .git
@@ -6082,7 +6199,7 @@ class KeyContext:
     def literal_dirs(self, rel: str) -> frozenset[str]:
         if rel not in self._lit:
             found = file_model_literal_dirs(os.path.join(self.side.tree.root, rel)) if scans_for_models(rel) else frozenset()
-            self._lit[rel] = found - {FIXTURE_ROOT}
+            self._lit[rel] = found - {FIXTURE_ROOT, VARIANT_ROOT}
         return self._lit[rel]
 
     def model_scope(self, names: list[str], files: set[str], eff: list[str], envs: list[str], argv: list[str]) -> tuple[dict[str, str], set[str]]:
@@ -6118,6 +6235,9 @@ class KeyContext:
         if tier_of(eff, self.env.get("BLOOMERY_TIER")) == "fixture":
             dirs.setdefault(FIXTURE_ROOT, "the fixture tier")
             need.add(FIXTURE_ROOT)
+        if variant_of(eff, self.env.get("BLOOMERY_FIXTURE_VARIANT")):
+            dirs.setdefault(VARIANT_ROOT, "BLOOMERY_FIXTURE_VARIANT")
+            need.add(VARIANT_ROOT)
         for w in envs + argv:
             for v in w.split(","):
                 d = model_dir_of(v.split("=", 1)[-1])
@@ -6306,6 +6426,12 @@ class KeyContext:
                 card = v
         parts += [f"item\targs\t{json.dumps(argv)}", f"item\tboxenv\t{' '.join(eff)}", f"item\tcard\t{card}"]
         parts += self.mac
+        variant = variant_of(eff, self.env.get("BLOOMERY_FIXTURE_VARIANT"))
+        if variant:
+            row = variant_table_row(tree.root, variant)
+            if row is None:
+                return [], f"{VARIANT_TABLE} names no variant {variant!r}, which the item runs under (BLOOMERY_FIXTURE_VARIANT)", None, ""
+            parts.append(f"variant\t{variant}\t{sha256_text(row)}")
         # The manifest lists every model directory any item can open; this item's key holds the rows of
         # its own only, so a directory another gate names (a fixture, a profile) does not move it.
         dirs, need = self.model_scope(names, files, eff, envs, argv)
@@ -6315,6 +6441,8 @@ class KeyContext:
             if f[0] in ("model", "model-dir") and len(f) > 1:
                 d = model_dir_of(f[1])
                 if d is not None and d not in dirs:
+                    continue
+                if d == VARIANT_ROOT and not own_variant_row(f[1], variant):
                     continue
                 listed.add(d)
             parts.append(f"box\t{ln}")
@@ -6666,7 +6794,7 @@ def model_dirs(root: str = ROOT) -> set[str]:
     for prof in sorted(glob.glob(os.path.join(root, "tools/ref/models/*.sh"))):
         dirs |= profile_dirs(root, os.path.relpath(prof, root), env)
     dirs |= {d for d in map(model_dir_of, os.environ.values()) if d}
-    return dirs | tree_model_dirs(root) | {FIXTURE_ROOT}
+    return dirs | tree_model_dirs(root) | {FIXTURE_ROOT, VARIANT_ROOT}
 
 
 def model_dir_rows(d: str, recurse: bool) -> list[tuple]:
@@ -6703,7 +6831,7 @@ def manifest_model_rows(d: str, fixture_root: str = FIXTURE_ROOT) -> list[tuple]
         return [("model-dir", d, "absent")]
     if not os.listdir(d):
         return [("model-dir", d, "empty")]
-    return model_dir_rows(d, d == fixture_root)
+    return model_dir_rows(d, d in (fixture_root, VARIANT_ROOT))
 
 
 def cmd_box_manifest(args: argparse.Namespace) -> int:
@@ -7214,6 +7342,55 @@ def key_self_test(expect, real: Side) -> None:
         expect(all(keys(sa, environ=fx_env)[k] != fix_before[k] for k in items), "a fixture file rewritten (its size) moved no fixture-tier key")
         write_manifest(manifest)
         expect(keys(sa) == base, "the base manifest, restored, keys another way")
+        # A fixture variant's files (VARIANT_ROOT, beside FIXTURE_ROOT) belong to the keys of the items that run under its tag: no other
+        # item's key moves with them, an item under the tag moves with its own directory's rows and its table row, and not with another tag's.
+        vdirs = lambda tag: [f"model\t{VARIANT_ROOT}/{tag}\tdir", f"model\t{VARIANT_ROOT}/{tag}/glm5next\tdir"]  # noqa: E731
+        vfile = lambda tag, size: f"model\t{VARIANT_ROOT}/{tag}/glm5next/g-00001-of-00001.gguf\t{size}\t1\t2\t3"  # noqa: E731
+        vtable = os.path.join(roots[0], VARIANT_TABLE)
+        with open(vtable, encoding="utf-8") as fh:
+            vtable_old = fh.read()
+        row_a = "iq4xs\tglm5next\ttrunk\tffn_up_exps=iq3_s\tgate-gpu-q4k-sel\tprobe"
+        row_b = "other\tglm5next\ttrunk\tffn_up_exps=iq3_s\tgate-gpu-q4k-sel\tprobe"
+        venv = {"BLOOMERY_TIER": "fixture", "BLOOMERY_FIXTURE_VARIANT": "iq4xs"}
+        vparts = lambda e, box="": [p for p in KeyContext(sa, mf, box, e, settings=settings).parts(items["gpu"])[0] if p.startswith("variant\t")]  # noqa: E731
+        variant_free = [ln for ln in fixture_free if not ln.startswith(f"model-dir\t{VARIANT_ROOT}\t")]
+        try:
+            with open(vtable, "w", encoding="utf-8") as fh:
+                fh.write(f"# probe\n{row_a}\n{row_b}\n")
+            # The table is a file of the tree (a tree-scope key holds it): the probe table moves those keys, so the clauses below compare
+            # against the keys taken with the probe table in place and no variant rows in the manifest.
+            write_manifest(variant_free + [fx_file, "# end"])
+            real_plain, fix_plain = keys(sa), keys(sa, environ=fx_env)
+            err = keys(sa, environ=venv)["gpu"]
+            expect(err.startswith("error") and VARIANT_ROOT in err, f"an item under a variant keyed with no row for {VARIANT_ROOT}: {err}")
+            both = variant_free + [fx_file] + vdirs("iq4xs") + [vfile("iq4xs", 100)] + vdirs("other") + [vfile("other", 100), "# end"]
+            write_manifest(both)
+            expect(keys(sa) == real_plain, "a variant's files moved a key of a real-tier item")
+            expect(keys(sa, environ=fx_env) == fix_plain, "a variant's files moved a key of a fixture-tier item that runs under no variant")
+            with_files = keys(sa, environ=venv)
+            expect(not any(v.startswith("error") for v in with_files.values()), f"an item under a variant: {with_files}")
+            expect(all(with_files[k] != fix_plain[k] for k in items), "an item under a variant keys like the fixture tier's item")
+            write_manifest([ln.replace(f"iq4xs/glm5next/g-00001-of-00001.gguf\t100", f"iq4xs/glm5next/g-00001-of-00001.gguf\t101") for ln in both])
+            expect(all(keys(sa, environ=venv)[k] != with_files[k] for k in items), "a variant file rewritten (its size) moved no key of the item under its tag")
+            write_manifest([ln.replace(f"other/glm5next/g-00001-of-00001.gguf\t100", f"other/glm5next/g-00001-of-00001.gguf\t101") for ln in both])
+            expect(keys(sa, environ=venv) == with_files and keys(sa) == real_plain and keys(sa, environ=fx_env) == fix_plain,
+                   "another variant's file rewritten moved a key that does not run under it")
+            row = vparts(venv)
+            expect(len(row) == 1 and row[0] == f"variant\tiq4xs\t{sha256_text(row_a)}", f"the item under a variant holds its table row as a key part: {row}")
+            expect(vparts(fx_env) == [] and vparts({}) == [], "an item under no variant holds a variant part")
+            expect(vparts({}, "BLOOMERY_TIER=fixture BLOOMERY_FIXTURE_VARIANT=iq4xs") == row, "a BLOOMERY_BOX_ENV entry names the variant as the Mac's does")
+            with open(vtable, "w", encoding="utf-8") as fh:
+                fh.write(f"# probe\n{row_a} edited\n{row_b}\n")
+            expect(vparts(venv) != row, "an edit of the variant's table row moved no key part")
+            with open(vtable, "w", encoding="utf-8") as fh:
+                fh.write(f"# probe\n{row_b}\n")
+            err = keys(sa, environ=venv)["gpu"]
+            expect(err.startswith("error") and "names no variant 'iq4xs'" in err, f"a variant the table does not name was keyed: {err}")
+        finally:
+            with open(vtable, "w", encoding="utf-8") as fh:
+                fh.write(vtable_old)
+            write_manifest(manifest)
+        expect(keys(sa) == base, "the base manifest, restored after the variant clauses, keys another way")
         for i in range(1, nfixed - 1):
             mut = list(manifest)
             mut[i] = mut[i] + "x"
@@ -7287,9 +7464,12 @@ def key_self_test(expect, real: Side) -> None:
         rows = [p for p in c.parts(items["mac"])[0] if p.startswith(("box\tmodel\t", "box\tmodel-dir\t"))]
         all_rows = [ln for ln in manifest if ln.startswith(("model\t", "model-dir\t"))]
         tier_rows = [ln for ln in all_rows if model_dir_of(ln.split("\t")[1]) == FIXTURE_ROOT]
-        expect(len(rows) == len(all_rows) - len(tier_rows), f"a whole-tree item holds {len(rows)} model rows, not the manifest's all but the fixture tier's {len(tier_rows)}")
+        variant_rows = [ln for ln in all_rows if model_dir_of(ln.split("\t")[1]) == VARIANT_ROOT]
+        expect(len(rows) == len(all_rows) - len(tier_rows) - len(variant_rows),
+               f"a whole-tree item holds {len(rows)} model rows, not the manifest's all but the fixture tier's {len(tier_rows)} and the variants' {len(variant_rows)}")
         fx_rows = [p for p in KeyContext(sa, mf, "BLOOMERY_TIER=fixture", {}, settings=settings).parts(items["mac"])[0] if p.startswith(("box\tmodel\t", "box\tmodel-dir\t"))]
-        expect(len(fx_rows) == len(all_rows), f"a whole-tree item of the fixture tier holds {len(fx_rows)} model rows, not the manifest's all")
+        expect(len(fx_rows) == len(all_rows) - len(variant_rows),
+               f"a whole-tree item of the fixture tier holds {len(fx_rows)} model rows, not the manifest's all but the variants' {len(variant_rows)}")
         penv = {k: v for k, v in os.environ.items() if k not in ("BLOOMERY_REF_MODEL", "BLOOMERY_V41_MODEL", "BLOOMERY_DSPARK_MODEL")}
         for prof in sorted(glob.glob(os.path.join(roots[0], "tools/ref/models/*.sh"))):
             rel = os.path.relpath(prof, roots[0])
@@ -8784,6 +8964,7 @@ def self_test() -> int:
 
     # affected --narrow
     narrow_self_test(expect, side)
+    variant_items_self_test(expect)
 
     # the scan set
     scan_set_self_test(expect, side)

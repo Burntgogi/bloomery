@@ -146,6 +146,15 @@
 #      outside one), a missing script, a recipe that is both real-only and solo-real (a fixture-tier placement it never uses), a
 #      fixture table this runner cannot read, a failed `opens` call, and a box.sh command that holds an inline tier guard (a test of
 #      BLOOMERY_TIER and an `exit 66`) instead of the real-only call.
+#   variant items: `NAME@BLOOMERY_FIXTURE_VARIANT=<tag>` runs NAME on the fixture variant <tag> (tools/fixture-variants.tsv: the family's
+#      fixture requantized to a type map, written by `just fixture-requant`). The item env is the batch's usual one: tools/box.sh
+#      resolves the variant's files and the sets of that variant from it, the key holds the variant's file rows and its table
+#      row (tools/recipes.py), and the times file keeps the item apart. Named errors: a tag the table does not name, a recipe the
+#      tag's row does not list, and, in the fixture tier, a recipe whose family is not the tag's. A variant is a fixture, so the
+#      real tier opens none (tools/ref/ref-paths.sh exits 64): there a variant item is deferred by name (class D, kind `variant`),
+#      in no lane, never run and never red, written to DIR/deferred.list in the --list format so a `--tier fixture` batch takes
+#      exactly that set. Its run.log line is `<item> rc=deferred variant lane=- deferred=1` and the DONE line counts `deferred=` (an
+#      item counts one) and `variant=<n>` beside `deferred_list=<path>`.
 #   --tier real|fixture (default real; BLOOMERY_TIER in the environment names the same, and the two must agree): the tier
 #      the batch runs in, passed to every item as BLOOMERY_TIER=fixture in its BLOOMERY_BOX_ENV — tools/box.sh resolves each
 #      item's model file from it (the family's fixture, tools/ref/ref-paths.sh); a family with none is a deferred item (above,
@@ -597,6 +606,9 @@ x-glm:
 [group('solo')]
 x-q:
     BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'bash tools/gpu-gate.sh xq'
+
+vr-q:
+    BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gen_vq'
 
 [group('solo')]
 x-v41:
@@ -1817,6 +1829,68 @@ FP
   if [ ! -e "$t/target/c-nf-none/deferred.list" ]; then pass 'no-fixture run: a batch that deferred nothing writes no list'
   else fail 'no-fixture run: a batch that deferred nothing writes no list' "$(cat "$t/target/c-nf-none/deferred.list")"; fi
   want_not '  … and its DONE line has none of the deferral fields' "$t/target/c-nf-none/run.log" '^DONE .*(real_only|no_fixture|deferred_list)='
+  # variant items (the header's variant paragraph): the tag is the table's, the recipe the row's, the family the tag's; in the real tier
+  # the item is deferred by name (kind variant), in the fixture tier it runs with the tag in its box env. vt is a qwen4exp variant
+  # of vr-q, vt2 a variant of another family that also lists vr-q, vt3 one that lists only ro-any.
+  printf '%s\n' '# probe table' "vt	qwen4exp	trunk	ffn_up_exps=iq3_s	vr-q	probe" "vt2	deepseek41	trunk	ffn_up_exps=iq3_s	vr-q	probe" \
+    "vt3	qwen4exp	trunk	ffn_up_exps=iq3_s	ro-any	probe" "vt4	qwen4exp	trunk	ffn_up_exps=iq3_s	gate-x	probe" > "$t/tools/fixture-variants.tsv"
+  check 'variant: a tag the table does not name is a named error' 65 'sets BLOOMERY_FIXTURE_VARIANT=nope; tools/fixture-variants.tsv names no such variant' \
+    "${gb[@]}" --tier fixture --dry-run 'vr-q@BLOOMERY_FIXTURE_VARIANT=nope'
+  check '  … a recipe the tag'"'"'s row does not list' 65 'its row lists vr-q, not plain-any' "${gb[@]}" --tier fixture --dry-run 'plain-any@BLOOMERY_FIXTURE_VARIANT=vt'
+  check '  … in the real tier too' 65 'its row lists vr-q, not plain-any' "${gb[@]}" --dry-run 'plain-any@BLOOMERY_FIXTURE_VARIANT=vt'
+  check '  … a recipe of another family than the tag'"'"'s, in the fixture tier' 65 'under the variant vt2 of family deepseek41, and vr-q runs family qwen4exp' \
+    "${gb[@]}" --tier fixture --dry-run 'vr-q@BLOOMERY_FIXTURE_VARIANT=vt2'
+  check '  … in the fixture tier a variant item is placed as usual, the tag in its box env' 0 '^lane [AB]  vr-q.*BLOOMERY_FIXTURE_VARIANT=vt' \
+    "${gb[@]}" --tier fixture --dry-run 'vr-q@BLOOMERY_FIXTURE_VARIANT=vt'
+  out=$("${gb[@]}" --dry-run 'vr-q@BLOOMERY_FIXTURE_VARIANT=vt' plain-any 2>&1) || fail 'variant: the real dry run failed' "$out"
+  if grep -q '^lane -  vr-q' <<< "$out" && grep -q 'deferred to a fixture-tier batch (variant), never run in the real tier — ' <<< "$out" \
+    && grep -q '^lane [AB]  plain-any ' <<< "$out" && grep -q 'dry run — 1 items (and 1 deferred to a fixture-tier batch: a variant is a fixture)' <<< "$out" \
+    && grep -q '1 item(s) deferred to a fixture-tier batch (a variant is a fixture: the real tier opens none), in no lane (DONE: deferred=1, and the list .*/deferred.list): vr-q' <<< "$out"; then
+    pass 'variant: the real dry run names the item as deferred (variant), beside the one that runs'
+  else fail 'variant: the real dry run names the item as deferred (variant), beside the one that runs' "$out"; fi
+  # `just affected` prints a variant item as a line of its own (tools/recipes.py variant_items): a list takes its first word.
+  printf '%s\n' 'affected: a..b — 1 changed file, 1 of 6 gate-recipes selected' '  gate-x  crates/x/src/lib.rs  [lib x]' \
+    '  gate-x@BLOOMERY_FIXTURE_VARIANT=vt4  [variant vt4: its row lists gate-x, which is selected]' 'recipes: gate-x gate-x@BLOOMERY_FIXTURE_VARIANT=vt4' 'unmapped (0):' > "$t/aff-variant.txt"
+  out=$("${gb[@]}" --dry-run --list "$t/aff-variant.txt" 2>&1) || fail 'variant: the list of an affected output with a variant item failed' "$out"
+  if grep -q '^lane [AB X]  gate-x ' <<< "$out" && grep -q '^lane -  gate-x-2 .*BLOOMERY_FIXTURE_VARIANT=vt4' <<< "$out"; then pass 'variant: a list taken from affected output holds the plain item and defers its variant item (real tier)'
+  else fail 'variant: a list taken from affected output holds the plain item and defers its variant item (real tier)' "$out"; fi
+  rc=$(steal_case vr-real "steal-bal	B	a6000	10	$d" -- 'vr-q@BLOOMERY_FIXTURE_VARIANT=vt' steal-bal)
+  printf '%s' "$rc" > "$t/rc-vr-real"
+  rc_ok 'variant run: a real batch with a variant item ends green' vr-real 2
+  want 'variant run: the item has its own line' "$t/target/c-vr-real/run.log" '^vr-q rc=deferred variant lane=- deferred=1 item=vr-q@BLOOMERY_FIXTURE_VARIANT=vt$'
+  want 'variant run: the DONE line counts it and names the list' "$t/target/c-vr-real/run.log" \
+    '^DONE total=2 red=0 skipped=0 wall=[0-9]+s laneA=[0-9]+s laneB=[0-9]+s deferred=1 variant=1 deferred_list=[^ ]*/c-vr-real/deferred.list$'
+  want_no_row 'variant run: the batch never called the recipe' "$t/fake-state/box.log" '$2 ~ /gen_vq$/'
+  want 'variant run: DIR/deferred.list holds the item text, with its comment' "$t/target/c-vr-real/deferred.list" '^vr-q@BLOOMERY_FIXTURE_VARIANT=vt$'
+  want '  … and the comment of its kind' "$t/target/c-vr-real/deferred.list" '^# variant: '
+  check 'variant run: a fixture batch takes exactly that list (the item placed, the tag in its box env)' 0 '^lane [AB]  vr-q.*BLOOMERY_FIXTURE_VARIANT=vt' \
+    "${gb[@]}" --tier fixture --dry-run --list "$t/target/c-vr-real/deferred.list"
+  rc=$(steal_case vr-fx "steal-bal	B	a6000	10	$d" -- --tier fixture 'vr-q@BLOOMERY_FIXTURE_VARIANT=vt' steal-bal)
+  printf '%s' "$rc" > "$t/rc-vr-fx"
+  rc_ok 'variant run: a fixture batch runs the variant item' vr-fx 2
+  want_row 'variant run: its box call carries the tag and the tier' "$t/fake-state/box.log" '$1 ~ /BLOOMERY_FIXTURE_VARIANT=vt/ && $1 ~ /BLOOMERY_TIER=fixture/ && $2 ~ /gen_vq$/'
+  want 'variant run: the times row is an entry of its own' "$t/times-vr-fx.tsv" "$(printf '^vr-q@BLOOMERY_FIXTURE_VARIANT=vt,BLOOMERY_TIER=fixture\t')"
+  want_not 'variant run: … and nothing is deferred' "$t/target/c-vr-fx/run.log" '^DONE .*variant='
+  # A chain member (v41-load, class C in the real tier) given as a variant item is deferred and joins no chain: it feeds no lane, so a
+  # real batch of it and one plain item starts the plain item's lane alone. vt5's family is not read: the real tier skips that check.
+  printf '%s\n' "vt5	deepseek41	trunk	ffn_up_exps=iq3_s	v41-any	probe" >> "$t/tools/fixture-variants.tsv"
+  out=$("${gb[@]}" --dry-run 'v41-any@BLOOMERY_FIXTURE_VARIANT=vt5' plain-any 2>&1) || fail 'variant chain: the real dry run failed' "$out"
+  if grep -q '^lane -  v41-any' <<< "$out" && grep -q '^lane [AB]  plain-any ' <<< "$out" && ! grep -q 'the chain is fed by' <<< "$out"; then
+    pass 'variant chain: the real dry run defers a chain member'"'"'s variant item and names no chain feeders'
+  else fail 'variant chain: the real dry run defers a chain member'"'"'s variant item and names no chain feeders' "$out"; fi
+  mutant_of vr-nodefer 's|^    if variant and tier == "real":$|    if False and variant and tier == "real":|' '^    if False and variant and tier == "real":$'
+  rc=$(MTAG=vr-nodefer steal_case vr-chm "steal-bal	B	a6000	10	$d" "v41-any	B	a6000	2	$d" -- 'v41-any@BLOOMERY_FIXTURE_VARIANT=vt5' steal-bal)
+  printf '%s' "$rc" > "$t/rc-vr-chm"
+  if grep -Eq '^v41-any rc=0 [0-9]+s try=1 lane=[AB]( |$)' "$t/target/c-vr-chm/run.log" 2> /dev/null && [ -e "$t/target/c-vr-chm/lane-A.pid" ]; then pass 'variant chain mutant: without the override the variant item is placed as a chain member'
+  else fail 'variant chain mutant: without the override the variant item is placed as a chain member' "rc $rc, $(tail -1 "$t/out-vr-chm.log" 2> /dev/null)"; fi
+  rc=$(steal_case vr-chain "steal-bal	B	a6000	10	$d" -- 'v41-any@BLOOMERY_FIXTURE_VARIANT=vt5' steal-bal)
+  printf '%s' "$rc" > "$t/rc-vr-chain"
+  rc_ok 'variant chain: a real batch of the variant item and a plain one ends green' vr-chain 2
+  want 'variant chain: the variant item is deferred, in no lane' "$t/target/c-vr-chain/run.log" '^v41-any rc=deferred variant lane=- deferred=1 item=v41-any@BLOOMERY_FIXTURE_VARIANT=vt5$'
+  want 'variant chain: the plain item ran in lane B' "$t/target/c-vr-chain/run.log" '^steal-bal rc=0 [0-9]+s try=1 lane=B( |$)'
+  want_absent 'variant chain: it fed no lane, so lane A never started' "$t/target/c-vr-chain/lane-A.pid"
+  want 'variant chain: the DONE line carries laneA=0s' "$t/target/c-vr-chain/run.log" '^DONE total=2 red=0 .* laneA=0s .*variant=1( |$)'
+  want_no_row 'variant chain: the batch never called the chain member' "$t/fake-state/box.log" '$2 ~ /gen_x$/'
   # real-file (the header's deferred paragraph, kind 3): a recipe of a family whose fixture row is `self` and whose targets reach the gate
   # fence is deferred in the fixture tier. The fake recipes.py answers `opens` from opens.tsv and logs each call. rf-q3 (qwen3moe) and
   # rf-def (the default profile) are self families the fake says open; rf-none is a self family it says reaches nothing; rf-q4 has a
@@ -3170,6 +3244,31 @@ def family(name):
     return default_profile()
 
 
+VARIANT_ROWS = []
+
+
+def variant_rows():
+    """{tag: (family, recipes)} of tools/fixture-variants.tsv (`tag, family, scope, map, recipes, why`, tab-separated; `#` lines and
+    blanks skipped), read once and only when an item names a variant. A table this reader does not understand is a named error."""
+    if not VARIANT_ROWS:
+        path = os.path.join(root, "tools/fixture-variants.tsv")
+        try:
+            with open(path, encoding="utf-8") as fh:
+                lines = fh.read().splitlines()
+        except OSError as e:
+            fail(f"{path} cannot be read ({e.strerror}): an item's BLOOMERY_FIXTURE_VARIANT is checked against it")
+        rows = {}
+        for ln in lines:
+            if not ln.strip() or ln.startswith("#"):
+                continue
+            cols = ln.split("\t")
+            if len(cols) != 6 or not cols[0] or not cols[4].split():
+                fail(f"{path}: the row {ln[:60]!r} is not `tag, family, scope, map, recipes, why` (six tab-separated columns, recipes named)")
+            rows[cols[0]] = (cols[1], cols[4].split())
+        VARIANT_ROWS.append(rows)
+    return VARIANT_ROWS[0]
+
+
 FIXTURE_TABLE = []
 
 
@@ -3368,6 +3467,7 @@ for item, at in zip(raw_items, where):
         errors.append(f"{at}: {name!r} is not a recipe in the justfile")
         continue
     envs = []
+    variant = None
     if env is not None:
         for kv in env.split(","):
             k, eq, v = kv.partition("=")
@@ -3377,6 +3477,15 @@ for item, at in zip(raw_items, where):
                 errors.append(f"{at}: {item!r} sets BLOOMERY_GATE_CARD; with two lanes the card is the runner's (use --lanes 1)")
             elif k == "BLOOMERY_TIER":
                 errors.append(f"{at}: {item!r} sets BLOOMERY_TIER; the tier is the batch's (--tier), as it decides the item's lane")
+            elif k == "BLOOMERY_FIXTURE_VARIANT":
+                vrow = variant_rows().get(v)
+                if vrow is None:
+                    errors.append(f"{at}: {item!r} sets BLOOMERY_FIXTURE_VARIANT={v}; tools/fixture-variants.tsv names no such variant")
+                elif name not in vrow[1]:
+                    errors.append(f"{at}: {item!r} sets BLOOMERY_FIXTURE_VARIANT={v}; its row lists {' '.join(vrow[1])}, not {name}")
+                else:
+                    variant = (v, vrow[0])
+                    envs.append(f"{k}={v}")
             else:
                 envs.append(f"{k}={v}")
     argv = []
@@ -3402,6 +3511,9 @@ for item, at in zip(raw_items, where):
     if lane in ("T", "R"):
         errors.append(f"{at}: {reason}")
         continue
+    if variant and tier == "fixture" and family(name) != variant[1]:
+        errors.append(f"{at}: {item!r} runs under the variant {variant[0]} of family {variant[1]}, and {name} runs family {family(name)}")
+        continue
     arm = solo_arm(name, argv)
     if arm:
         flag, b, solo_n = arm
@@ -3421,6 +3533,10 @@ for item, at in zip(raw_items, where):
         continue
     exp, esrc = expected(tkey)
     cls, kind, cards, labels = placement(name, lane, lanes)
+    if variant and tier == "real":
+        # A variant is a fixture: the real tier opens none (tools/ref/ref-paths.sh exits 64), so the item is deferred to a fixture batch.
+        cls, kind, cards, labels = "D", "variant", ["-"], ["none"]
+        reason = f"BLOOMERY_FIXTURE_VARIANT={variant[0]}: a variant is a fixture, which the real tier opens none of"
     rflags, rbytes = RESOURCES.get(name, ("-", 0))
     if tier == "fixture":
         rbytes = 0  # the fixture tier's loads are the tree's small files: the pack sums nothing there
@@ -3554,17 +3670,22 @@ fi
 N=${#R_REC[@]}
 ND=${#DP_STEM[@]}
 NT=$((N + ND)) # every item of the batch: the ones that run and the ones deferred
-ND_RO=0 ND_NF=0 ND_RF=0 # of those, the real-only gates, the gates of a family with no fixture and the real-file ones
+ND_RO=0 ND_NF=0 ND_RF=0 ND_VR=0 # of those, the real-only gates, the gates of a family with no fixture, the real-file ones and the variant items (real tier)
 for ((i = 0; i < ND; i++)); do
   case ${DP_KIND[$i]} in
     real-only) ND_RO=$((ND_RO + 1)) ;;
     no-fixture) ND_NF=$((ND_NF + 1)) ;;
     real-file) ND_RF=$((ND_RF + 1)) ;;
-    *) RC=70 die "plan: a deferred item of the kind '${DP_KIND[$i]}' (${DP_STEM[$i]}): the kinds are real-only, no-fixture and real-file" ;;
+    variant) ND_VR=$((ND_VR + 1)) ;;
+    *) RC=70 die "plan: a deferred item of the kind '${DP_KIND[$i]}' (${DP_STEM[$i]}): the kinds are real-only, no-fixture, real-file and variant" ;;
   esac
 done
 DEFER_NOTE=''
-[ "$ND" = 0 ] || DEFER_NOTE=" (and $ND deferred to the real tier: $ND_RO real-only, $ND_NF of a family with no fixture, $ND_RF real-file)"
+if [ "$ND_VR" != 0 ]; then
+  DEFER_NOTE=" (and $ND_VR deferred to a fixture-tier batch: a variant is a fixture)"
+elif [ "$ND" != 0 ]; then
+  DEFER_NOTE=" (and $ND deferred to the real tier: $ND_RO real-only, $ND_NF of a family with no fixture, $ND_RF real-file)"
+fi
 for ((i = 0; i < N; i++)); do
   rec_get "$i" name env args cards
   R_C0+=("${#C_ITEM[@]}")
@@ -4004,7 +4125,11 @@ predicted() { # the plan's lane sums, derived from the times file
   fi
   echo "gate-batch: predicted $PREDICTED (derived: $how)"
   [ "$SUM_NDEF" = 0 ] || echo "gate-batch: $SUM_NDEF item(s) expected at the ${DEFAULT_S} s default (no row in the times file): $SUM_DEF"
-  [ "$ND" = 0 ] || echo "gate-batch: $ND item(s) deferred to the real tier ($ND_RO real-only, $ND_NF of a family with no fixture, $ND_RF real-file), in no lane (DONE: deferred=+$ND, and the list $OUT/deferred.list): ${DP_STEM[*]}"
+  if [ "$ND_VR" != 0 ]; then
+    echo "gate-batch: $ND_VR item(s) deferred to a fixture-tier batch (a variant is a fixture: the real tier opens none), in no lane (DONE: deferred=$ND, and the list $OUT/deferred.list): ${DP_STEM[*]}"
+  else
+    [ "$ND" = 0 ] || echo "gate-batch: $ND item(s) deferred to the real tier ($ND_RO real-only, $ND_NF of a family with no fixture, $ND_RF real-file), in no lane (DONE: deferred=+$ND, and the list $OUT/deferred.list): ${DP_STEM[*]}"
+  fi
 }
 
 # The GPU hold (the header's «The GPU hold»). The box-side writer is tools/gpu-gate.sh --gpuhold, reached through box.sh with
@@ -4138,7 +4263,11 @@ if [ "$DRY" = 1 ]; then
     echo "gate-batch: the chain is fed by $fed: a lane takes a member whose candidates include its card, and a lane with no item and no such member does not start"
   fi
   for ((i = 0; i < ND; i++)); do
-    printf 'lane -  %-28s %s\n        deferred to the real tier (%s), never run in the fixture tier — %s\n' "${DP_STEM[$i]}" "$(def_cmd_of "$i")" "${DP_KIND[$i]}" "${DP_WHY[$i]}"
+    if [ "${DP_KIND[$i]}" = variant ]; then
+      printf 'lane -  %-28s %s\n        deferred to a fixture-tier batch (%s), never run in the real tier — %s\n' "${DP_STEM[$i]}" "$(def_cmd_of "$i")" "${DP_KIND[$i]}" "${DP_WHY[$i]}"
+    else
+      printf 'lane -  %-28s %s\n        deferred to the real tier (%s), never run in the fixture tier — %s\n' "${DP_STEM[$i]}" "$(def_cmd_of "$i")" "${DP_KIND[$i]}" "${DP_WHY[$i]}"
+    fi
   done
   predicted
   hold_say
@@ -4157,7 +4286,11 @@ if [ "$SKIP_N" -lt "$N" ]; then
     *) echo "$lease" >&2; RC=70 die "the start check through box.sh failed (rc $rc; 70 from the guard: the lease cannot be tested)" ;;
   esac
 elif [ "$N" = 0 ]; then
-  echo "gate-batch: every item is deferred to the real tier — nothing runs on the box, so no lease check"
+  if [ "$ND_VR" != 0 ]; then
+    echo "gate-batch: every item is deferred to a fixture-tier batch — nothing runs on the box, so no lease check"
+  else
+    echo "gate-batch: every item is deferred to the real tier — nothing runs on the box, so no lease check"
+  fi
 else
   echo "gate-batch: every item skips — nothing runs on the box, so no lease check"
 fi
@@ -4190,11 +4323,16 @@ done
 DEFER_LIST=$OUT/deferred.list
 if [ "$ND" != 0 ]; then
   { # the deferred items in --list format, so a real-tier batch takes exactly this set (`--list DIR/deferred.list`)
-    echo "# gate-batch --tier fixture: the $ND item(s) it deferred to the real tier, one per line (the --list format)"
-    for kind in real-only no-fixture real-file; do
+    if [ "$TIER" = fixture ]; then
+      echo "# gate-batch --tier fixture: the $ND item(s) it deferred to the real tier, one per line (the --list format)"
+    else
+      echo "# gate-batch: the $ND item(s) it deferred to a fixture-tier batch, one per line (the --list format; --tier fixture takes them)"
+    fi
+    for kind in real-only no-fixture real-file variant; do
       case $kind in
         real-only) [ "$ND_RO" = 0 ] || echo "# real-only: no fixture-tier conversion (bash tools/ref/real-only.sh in the recipe's box command)" ;;
         no-fixture) [ "$ND_NF" = 0 ] || echo "# no-fixture: the recipe's family has no row in the fixture table of tools/ref/ref-paths.sh (box.sh exits 66)" ;;
+        variant) [ "$ND_VR" = 0 ] || echo "# variant: the item runs on a fixture variant (tools/fixture-variants.tsv); the real tier opens none (tools/ref/ref-paths.sh exits 64)" ;;
         real-file) [ "$ND_RF" = 0 ] || echo "# real-file: the recipe's family runs on its real file (its fixture-table row is self) and a target of the recipe reaches the fixture fence (tools/recipes.py opens), which refuses that file" ;;
       esac
       for ((i = 0; i < ND; i++)); do
@@ -4779,6 +4917,8 @@ if [ "$TIER" = fixture ]; then
   [ "$ND_NF" = 0 ] || done_line="$done_line no_fixture=$ND_NF"
   [ "$ND_RF" = 0 ] || done_line="$done_line real_file=$ND_RF"
   [ "$ND" = 0 ] || done_line="$done_line deferred_list=$DEFER_LIST"
+elif [ "$ND_VR" != 0 ]; then
+  done_line="$done_line deferred=$ND_VR variant=$ND_VR deferred_list=$DEFER_LIST"
 fi
 echo "$done_line" >> "$RUNLOG"
 echo "$done_line"
