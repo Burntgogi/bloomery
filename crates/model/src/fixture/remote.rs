@@ -1,0 +1,657 @@
+//! A fixture's source read from a Hugging Face repo by HTTP Range: the bytes of a fixture are
+//! a function of the seed and the source's headers alone (the module header), so a source
+//! file is a sparse file of its listed size whose first bytes are the header, and the data
+//! region costs no disk.
+//!
+//! [`sparse_shard`] reads one shard's header through a range reader: a first range, grown
+//! until the header parses (`gguf` reports where its bytes ran out) and the data base is in
+//! hand, then written at the front of a file extended to the listing's size. The file is
+//! held to the listing: a header whose tensors end past that size, or more than an alignment
+//! before it, is [`RemoteError::Size`]. [`sparse_set`] does that for each file of a listed
+//! set through the hf crate's client, the one HTTP path.
+
+use std::error::Error;
+use std::fs::{self, OpenOptions};
+use std::io;
+use std::path::{Path, PathBuf};
+
+use gguf::{Gguf, LoadError};
+use hf::fetch::Client;
+use hf::{Entry, HfError};
+
+/// The bytes the first range of a header read asks for; a tokenizer's arrays make a header
+/// several MiB, so a second request is the common case for a first shard.
+pub const FIRST_RANGE: u64 = 4 << 20;
+
+/// The most a header may be: a length past it is a corrupt file, not a header to read.
+pub const MAX_HEADER: u64 = 256 << 20;
+
+/// Reads `len` bytes of a remote file from byte `from`, exactly.
+pub type ReadRange<'a> = dyn FnMut(u64, u64) -> Result<Vec<u8>, Box<dyn Error>> + 'a;
+
+#[derive(Debug, thiserror::Error)]
+pub enum RemoteError {
+    #[error(transparent)]
+    Hf(#[from] HfError),
+    #[error("fixture fetch reads the hub's listing; HF_HUB_OFFLINE is set")]
+    Offline,
+    #[error("{file}: reading {len} bytes at {from}: {source}")]
+    Read {
+        file: String,
+        from: u64,
+        len: u64,
+        source: Box<dyn Error>,
+    },
+    #[error("{file}: a range of {len} bytes at {from} came back as {got} bytes")]
+    ShortRead {
+        file: String,
+        from: u64,
+        len: u64,
+        got: u64,
+    },
+    #[error("{path}: {op}: {source}")]
+    Io {
+        path: PathBuf,
+        op: &'static str,
+        source: io::Error,
+    },
+    #[error("{file}: the header does not parse: {source}")]
+    Header { file: String, source: LoadError },
+    #[error("{file}: the header runs past the file's {size} bytes")]
+    PastEnd { file: String, size: u64 },
+    #[error("{file}: the header is longer than {MAX_HEADER} bytes")]
+    HeaderTooLong { file: String },
+    #[error(
+        "{file}: the listing says {listed} bytes, and tensor {tensor} of its header ends at {end}"
+    )]
+    ListedShort {
+        file: String,
+        listed: u64,
+        tensor: String,
+        end: u64,
+    },
+    #[error(
+        "{file}: the listing says {listed} bytes, and the header's tensors end at {end} \
+         (alignment {align})"
+    )]
+    ListedLong {
+        file: String,
+        listed: u64,
+        end: u64,
+        align: u64,
+    },
+}
+
+/// What one shard's read took.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeaderStat {
+    /// The shard's header bytes: everything before its data base.
+    pub header: u64,
+    /// Range requests made.
+    pub reads: u32,
+}
+
+fn io_err(path: &Path, op: &'static str, source: io::Error) -> RemoteError {
+    RemoteError::Io {
+        path: path.to_path_buf(),
+        op,
+        source,
+    }
+}
+
+/// `file`'s header, `size` bytes in all, written to `dest` as a sparse file of `size` bytes
+/// whose first bytes are the header; `read` is the range reader of the remote file. The
+/// header is read in growing prefixes: each is written to `dest` and opened by `gguf`, whose
+/// answer says what is missing — a read that ran out (`Truncated`: at least that many more
+/// bytes, and at least double), or a header that parsed but whose tensors lie past the
+/// prefix (`OutOfBounds` carries the data base). The data base's alignment padding is part
+/// of the header; it is read too. A file `size` long that is not a GGUF is
+/// [`RemoteError::Header`], a header that does not end inside the file
+/// [`RemoteError::PastEnd`].
+pub fn sparse_shard(
+    dest: &Path,
+    file: &str,
+    size: u64,
+    first: u64,
+    read: &mut ReadRange<'_>,
+) -> Result<HeaderStat, RemoteError> {
+    let mut have: Vec<u8> = Vec::new();
+    let mut reads = 0u32;
+    let mut fetch = |have: &mut Vec<u8>, to: u64| -> Result<(), RemoteError> {
+        let (from, len) = (have.len() as u64, to - have.len() as u64);
+        let bytes = read(from, len).map_err(|source| RemoteError::Read {
+            file: file.to_string(),
+            from,
+            len,
+            source,
+        })?;
+        if bytes.len() as u64 != len {
+            return Err(RemoteError::ShortRead {
+                file: file.to_string(),
+                from,
+                len,
+                got: bytes.len() as u64,
+            });
+        }
+        have.extend_from_slice(&bytes);
+        reads += 1;
+        Ok(())
+    };
+    let mut want = first.min(size);
+    let base = loop {
+        if (have.len() as u64) < want {
+            fetch(&mut have, want)?;
+        }
+        fs::write(dest, &have).map_err(|e| io_err(dest, "write the prefix", e))?;
+        match Gguf::open(dest) {
+            Ok(g) => break g.data_base(),
+            Err(LoadError::OutOfBounds { base, .. }) => break base,
+            Err(LoadError::Truncated { at, need, .. }) => {
+                if want >= size {
+                    return Err(RemoteError::PastEnd {
+                        file: file.to_string(),
+                        size,
+                    });
+                }
+                let next = want.saturating_mul(2).max(at.saturating_add(need));
+                if next > MAX_HEADER {
+                    return Err(RemoteError::HeaderTooLong {
+                        file: file.to_string(),
+                    });
+                }
+                want = next.min(size);
+            }
+            Err(source) => {
+                return Err(RemoteError::Header {
+                    file: file.to_string(),
+                    source,
+                });
+            }
+        }
+    };
+    // A file with no tensor may end inside the padding; the header is what the file has.
+    let header = base.min(size);
+    if header > MAX_HEADER {
+        return Err(RemoteError::HeaderTooLong {
+            file: file.to_string(),
+        });
+    }
+    if (have.len() as u64) < header {
+        fetch(&mut have, header)?;
+    }
+    have.truncate(header as usize);
+    fs::write(dest, &have).map_err(|e| io_err(dest, "write the header", e))?;
+    OpenOptions::new()
+        .write(true)
+        .open(dest)
+        .and_then(|f| f.set_len(size))
+        .map_err(|e| io_err(dest, "extend to the listed size", e))?;
+    check_size(dest, file, size)?;
+    Ok(HeaderStat { header, reads })
+}
+
+/// The sparse file at `dest` opens, and the listing's `size` is what its header says: the
+/// last tensor ends at most an alignment's padding before it.
+fn check_size(dest: &Path, file: &str, size: u64) -> Result<(), RemoteError> {
+    let g = match Gguf::open(dest) {
+        Ok(g) => g,
+        Err(LoadError::OutOfBounds {
+            name,
+            base,
+            off,
+            nbytes,
+            ..
+        }) => {
+            return Err(RemoteError::ListedShort {
+                file: file.to_string(),
+                listed: size,
+                tensor: name,
+                end: base + off + nbytes,
+            });
+        }
+        Err(source) => {
+            return Err(RemoteError::Header {
+                file: file.to_string(),
+                source,
+            });
+        }
+    };
+    let base = g.data_base();
+    // A file with no tensor may end inside its header's padding: the header is all it has.
+    let end = g
+        .iter_tensors()
+        .map(|t| base + t.offset + t.nbytes)
+        .max()
+        .unwrap_or(size.min(base));
+    if size
+        .checked_sub(end)
+        .is_none_or(|extra| extra >= g.alignment())
+    {
+        return Err(RemoteError::ListedLong {
+            file: file.to_string(),
+            listed: size,
+            end,
+            align: g.alignment(),
+        });
+    }
+    Ok(())
+}
+
+/// Each of `files` (entries of `repo`'s listing at revision `rev`) as a sparse file named by
+/// its own file name under `dir`: the header read by range through `client`, the data region
+/// a hole. Calls `progress` after each file. The paths, in `files`' order.
+pub fn sparse_set(
+    client: &Client,
+    repo: &str,
+    rev: &str,
+    files: &[Entry],
+    dir: &Path,
+    progress: &mut dyn FnMut(&Entry, &HeaderStat),
+) -> Result<Vec<PathBuf>, RemoteError> {
+    files
+        .iter()
+        .map(|e| {
+            let dest = dir.join(e.name());
+            let stat = sparse_shard(&dest, &e.path, e.size, FIRST_RANGE, &mut |from, len| {
+                client
+                    .fetch_range(repo, rev, &e.path, from, len)
+                    .map_err(Into::into)
+            })?;
+            progress(e, &stat);
+            Ok(dest)
+        })
+        .collect()
+}
+
+/// A fixture written at `out` taken down: its directory, and its sidecar file at `sidecar` and
+/// the sidecar's directory when that holds nothing else (it is never the directory of a file
+/// the writer did not make).
+pub fn remove_fixture(out: &Path, sidecar: Option<&Path>) -> Result<(), RemoteError> {
+    fs::remove_dir_all(out).map_err(|e| io_err(out, "remove the fixture", e))?;
+    if let Some(side) = sidecar {
+        match fs::remove_file(side) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(io_err(side, "remove the sidecar", e)),
+        }
+        if let Some(dir) = side.parent() {
+            match fs::remove_dir(dir) {
+                Ok(()) => {}
+                // Something else lives there: not ours to remove.
+                Err(e) if e.kind() == io::ErrorKind::DirectoryNotEmpty => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(io_err(dir, "remove the sidecar's directory", e)),
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gguf::write::{Layout, TensorDecl, Writer};
+    use gguf::{GENERAL_ARCHITECTURE, Value};
+    use std::cell::RefCell;
+
+    fn scratch(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("fixture-remote-{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).expect("scratch dir");
+        d
+    }
+
+    /// A GGUF of `n_tokens` tokenizer strings (a header of about `n_tokens * 30` bytes) and
+    /// `tensors` F32 tensors of 8 values each, whole in memory.
+    fn gguf_bytes(n_tokens: usize, tensors: usize) -> Vec<u8> {
+        let tokens: Vec<Value> = (0..n_tokens)
+            .map(|i| Value::String(format!("token-{i:020}")))
+            .collect();
+        let kvs = vec![
+            (
+                GENERAL_ARCHITECTURE.to_string(),
+                Value::String("llama".into()),
+            ),
+            ("tokenizer.ggml.tokens".to_string(), Value::Array(tokens)),
+        ];
+        let decls: Vec<TensorDecl> = (0..tensors)
+            .map(|i| TensorDecl {
+                name: format!("t{i}"),
+                dims: vec![8],
+                type_id: 0,
+                nbytes: 32,
+            })
+            .collect();
+        let layout = Layout::new(&kvs, decls).expect("layout");
+        let mut w = Writer::new(Vec::new(), layout).expect("writer");
+        for i in 0..tensors {
+            w.tensor(&format!("t{i}"), &[i as u8 + 1; 32])
+                .expect("tensor");
+        }
+        w.finish().expect("finish")
+    }
+
+    /// The header length of `file`, as `gguf` reads it from the whole file.
+    fn data_base(file: &[u8], dir: &Path) -> u64 {
+        let p = dir.join("whole.gguf");
+        fs::write(&p, file).expect("whole file");
+        Gguf::open(&p).expect("whole file opens").data_base()
+    }
+
+    /// A range reader over `file` that records each request.
+    fn reader<'a>(
+        file: &'a [u8],
+        log: &'a RefCell<Vec<(u64, u64)>>,
+    ) -> impl FnMut(u64, u64) -> Result<Vec<u8>, Box<dyn Error>> + 'a {
+        move |from, len| {
+            log.borrow_mut().push((from, len));
+            let end = from.checked_add(len).filter(|&e| e <= file.len() as u64);
+            match end {
+                Some(e) => Ok(file[from as usize..e as usize].to_vec()),
+                None => Err(format!("range {from}+{len} is past the end").into()),
+            }
+        }
+    }
+
+    #[test]
+    fn a_header_longer_than_the_first_range_is_read_whole() {
+        let d = scratch("long");
+        let file = gguf_bytes(4000, 3);
+        let base = data_base(&file, &d);
+        assert!(
+            base > 3 * 4096,
+            "the header ({base}) must outrun the first range"
+        );
+        let log = RefCell::new(Vec::new());
+        let dest = d.join("shard.gguf");
+        let stat = sparse_shard(
+            &dest,
+            "m.gguf",
+            file.len() as u64,
+            4096,
+            &mut reader(&file, &log),
+        )
+        .expect("sparse shard");
+        assert_eq!(stat.header, base);
+        assert!(stat.reads >= 2, "{:?}", log.borrow());
+        assert_eq!(fs::metadata(&dest).expect("stat").len(), file.len() as u64);
+        let got = fs::read(&dest).expect("read");
+        assert_eq!(got[..base as usize], file[..base as usize]);
+        assert!(
+            got[base as usize..].iter().all(|&b| b == 0),
+            "the data is a hole"
+        );
+        // Each request starts where the last ended, and the range at least doubles: the
+        // requests are the doublings from the first range to the header, plus the padding.
+        let log = log.borrow();
+        assert!(log.windows(2).all(|w| w[1].0 == w[0].0 + w[0].1), "{log:?}");
+        let doublings = base.div_ceil(4096).next_power_of_two().ilog2() as usize;
+        assert!(
+            log.len() <= doublings + 2,
+            "{} requests: {log:?}",
+            log.len()
+        );
+    }
+
+    #[test]
+    fn a_header_inside_the_first_range_is_one_request() {
+        let d = scratch("short");
+        let file = gguf_bytes(4, 2);
+        let base = data_base(&file, &d);
+        let log = RefCell::new(Vec::new());
+        let stat = sparse_shard(
+            &d.join("s.gguf"),
+            "m.gguf",
+            file.len() as u64,
+            FIRST_RANGE,
+            &mut reader(&file, &log),
+        )
+        .expect("sparse shard");
+        // The file is smaller than the first range: one request for all of it.
+        assert_eq!((stat.header, stat.reads), (base, 1));
+        assert_eq!(*log.borrow(), [(0, file.len() as u64)]);
+    }
+
+    #[test]
+    fn the_padding_of_the_data_base_is_part_of_the_header() {
+        let d = scratch("padding");
+        let file = gguf_bytes(40, 2);
+        let base = data_base(&file, &d);
+        // The first range ends one byte before the data base, past the last tensor-info byte.
+        let log = RefCell::new(Vec::new());
+        let stat = sparse_shard(
+            &d.join("s.gguf"),
+            "m.gguf",
+            file.len() as u64,
+            base - 1,
+            &mut reader(&file, &log),
+        )
+        .expect("sparse shard");
+        assert_eq!(stat.header, base);
+        assert_eq!(
+            fs::read(d.join("s.gguf")).expect("read")[..base as usize],
+            file[..base as usize]
+        );
+    }
+
+    #[test]
+    fn the_sparse_set_opens_through_split_open() {
+        let d = scratch("split");
+        let mut files = Vec::new();
+        for i in 0..2u16 {
+            let kvs = vec![
+                (
+                    GENERAL_ARCHITECTURE.to_string(),
+                    Value::String("llama".into()),
+                ),
+                ("split.no".to_string(), Value::U16(i)),
+                ("split.count".to_string(), Value::U16(2)),
+                ("split.tensors.count".to_string(), Value::I32(2)),
+                (
+                    "tokenizer.ggml.tokens".to_string(),
+                    Value::Array(
+                        (0..3000)
+                            .map(|n| Value::String(format!("tok-{n:016}")))
+                            .collect(),
+                    ),
+                ),
+            ];
+            let decl = TensorDecl {
+                name: format!("t{i}"),
+                dims: vec![8],
+                type_id: 0,
+                nbytes: 32,
+            };
+            let mut w = Writer::new(Vec::new(), Layout::new(&kvs, vec![decl]).expect("layout"))
+                .expect("writer");
+            w.tensor(&format!("t{i}"), &[i as u8 + 1; 32])
+                .expect("tensor");
+            files.push(w.finish().expect("finish"));
+        }
+        let log = RefCell::new(Vec::new());
+        for (i, file) in files.iter().enumerate() {
+            let name = format!("m-{:05}-of-00002.gguf", i + 1);
+            sparse_shard(
+                &d.join(&name),
+                &name,
+                file.len() as u64,
+                1024,
+                &mut reader(file, &log),
+            )
+            .expect("sparse shard");
+        }
+        let split = gguf::Split::open(d.join("m-00001-of-00002.gguf")).expect("split opens");
+        assert_eq!(split.shard_count(), 2);
+        assert_eq!(split.tensor_count(), 2);
+        assert_eq!(split.architecture(), Some("llama"));
+        let (s, info) = split.find("t1").expect("t1");
+        assert_eq!((s, info.nbytes), (1, 32));
+        // Its header is the real one; its data is a hole of the listed size.
+        let real = gguf::Gguf::open(d.join("m-00002-of-00002.gguf")).expect("shard");
+        assert_eq!(real.mapping().len() as u64, files[1].len() as u64);
+        assert!(real.data(info).expect("data").iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn a_listing_that_disagrees_with_the_header_is_named() {
+        let d = scratch("size");
+        let file = gguf_bytes(40, 3);
+        let log = RefCell::new(Vec::new());
+        for (listed, what) in [
+            (file.len() as u64 - 8, "shorter"),
+            (file.len() as u64 + 64, "longer"),
+        ] {
+            let got = sparse_shard(
+                &d.join("s.gguf"),
+                "m.gguf",
+                listed,
+                FIRST_RANGE,
+                &mut |from, len| {
+                    // The reader serves the real bytes within the real file; a listing
+                    // longer than the file reads zeros past its end.
+                    let mut v = vec![0u8; len as usize];
+                    let end = file.len().min((from + len) as usize);
+                    if (from as usize) < end {
+                        v[..end - from as usize].copy_from_slice(&file[from as usize..end]);
+                    }
+                    log.borrow_mut().push((from, len));
+                    Ok(v)
+                },
+            );
+            match (got, what) {
+                (Err(RemoteError::ListedShort { listed: l, end, .. }), "shorter") => {
+                    assert_eq!((l, end), (listed, file.len() as u64));
+                }
+                (
+                    Err(RemoteError::ListedLong {
+                        listed: l,
+                        end,
+                        align,
+                        ..
+                    }),
+                    "longer",
+                ) => {
+                    assert_eq!((l, end, align), (listed, file.len() as u64, 32));
+                }
+                (other, _) => panic!("{what}: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_file_with_no_tensor_may_end_inside_its_padding() {
+        let d = scratch("nopad");
+        for n in 40..80 {
+            let file = gguf_bytes(n, 0);
+            let end = file.iter().rposition(|&b| b != 0).expect("a nonzero byte") + 1;
+            if end == file.len() {
+                continue;
+            }
+            // The listing's size is the header without its padding, as a shard-1 header of
+            // no tensors is published.
+            let cut = &file[..end];
+            let log = RefCell::new(Vec::new());
+            let stat = sparse_shard(
+                &d.join("s.gguf"),
+                "m.gguf",
+                cut.len() as u64,
+                FIRST_RANGE,
+                &mut reader(cut, &log),
+            )
+            .expect("sparse shard");
+            assert_eq!(stat.header, cut.len() as u64);
+            assert_eq!(fs::read(d.join("s.gguf")).expect("read"), cut);
+            return;
+        }
+        panic!("no header size left padding to cut");
+    }
+
+    #[test]
+    fn a_removed_fixture_takes_its_sidecar_and_only_what_the_writer_made() {
+        let d = scratch("remove");
+        let (out, side_dir) = (d.join("fx"), d.join("fx-r8"));
+        fs::create_dir_all(out.join("draft")).expect("out");
+        fs::write(out.join("a.gguf"), b"x").expect("shard");
+        fs::write(out.join("draft/d.gguf"), b"x").expect("draft");
+        fs::create_dir_all(&side_dir).expect("sidecar dir");
+        let side = side_dir.join("fx-r8.gguf");
+        fs::write(&side, b"x").expect("sidecar");
+        remove_fixture(&out, Some(&side)).expect("remove");
+        assert!(!out.exists() && !side_dir.exists());
+        // A sidecar directory that holds a file the writer did not make stays.
+        fs::create_dir_all(&out).expect("out");
+        fs::create_dir_all(&side_dir).expect("sidecar dir");
+        fs::write(&side, b"x").expect("sidecar");
+        fs::write(side_dir.join("other.gguf"), b"y").expect("other");
+        remove_fixture(&out, Some(&side)).expect("remove");
+        assert!(!out.exists() && !side.exists());
+        assert!(side_dir.join("other.gguf").exists());
+        // No sidecar: the directory alone; a missing sidecar file is not an error.
+        fs::create_dir_all(&out).expect("out");
+        remove_fixture(&out, None).expect("remove");
+        assert!(!out.exists());
+    }
+
+    #[test]
+    fn a_file_that_is_not_gguf_and_a_header_past_the_end_are_named() {
+        let d = scratch("bad");
+        let log = RefCell::new(Vec::new());
+        let junk = vec![0x41u8; 5000];
+        match sparse_shard(
+            &d.join("j.gguf"),
+            "j.gguf",
+            junk.len() as u64,
+            FIRST_RANGE,
+            &mut reader(&junk, &log),
+        ) {
+            Err(RemoteError::Header { source, .. }) => {
+                assert!(matches!(source, LoadError::BadMagic(_)), "{source}");
+            }
+            other => panic!("{other:?}"),
+        }
+        // A file cut inside its header: the listing says it ends there.
+        let file = gguf_bytes(400, 1);
+        let cut = &file[..2000];
+        match sparse_shard(
+            &d.join("c.gguf"),
+            "c.gguf",
+            cut.len() as u64,
+            512,
+            &mut reader(cut, &log),
+        ) {
+            Err(RemoteError::PastEnd { size, .. }) => assert_eq!(size, 2000),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_reader_error_and_a_short_body_are_named() {
+        let d = scratch("read");
+        let file = gguf_bytes(40, 1);
+        match sparse_shard(
+            &d.join("e.gguf"),
+            "e.gguf",
+            file.len() as u64,
+            64,
+            &mut |_, _| Err("the hub said no".into()),
+        ) {
+            Err(RemoteError::Read {
+                from, len, source, ..
+            }) => {
+                assert_eq!((from, len), (0, 64));
+                assert_eq!(source.to_string(), "the hub said no");
+            }
+            other => panic!("{other:?}"),
+        }
+        match sparse_shard(
+            &d.join("s.gguf"),
+            "s.gguf",
+            file.len() as u64,
+            64,
+            &mut |_, len| Ok(vec![0; len as usize - 1]),
+        ) {
+            Err(RemoteError::ShortRead { len, got, .. }) => assert_eq!((len, got), (64, 63)),
+            other => panic!("{other:?}"),
+        }
+    }
+}

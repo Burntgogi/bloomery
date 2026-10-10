@@ -93,6 +93,13 @@ pub enum HfError {
         got: String,
         want: String,
     },
+    #[error("{file}: a range of {want} bytes at {from} came back as {got} bytes")]
+    Range {
+        file: String,
+        from: u64,
+        want: u64,
+        got: u64,
+    },
     #[error("curl {what}: {why}")]
     Curl { what: String, why: String },
     #[error("curl {what}: {why} (the network, not the hub, refused)")]

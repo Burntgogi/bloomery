@@ -332,11 +332,17 @@ impl Client {
     /// Every file of `repo`'s main branch, each page of the listing
     /// followed to its last.
     pub fn listing(&self, repo: &str) -> Result<Vec<Entry>, HfError> {
+        self.listing_at(repo, "main")
+    }
+
+    /// [`Client::listing`] of `repo` at revision `rev` (a branch, a tag or a
+    /// commit hash).
+    pub fn listing_at(&self, repo: &str, rev: &str) -> Result<Vec<Entry>, HfError> {
         let headers = self
             .root
             .join(format!(".listing-{}.headers", std::process::id()));
         fs::create_dir_all(&self.root).map_err(|e| HfError::io(&self.root, e))?;
-        let mut url = format!("{}/api/models/{repo}/tree/main?recursive=true", self.base);
+        let mut url = format!("{}/api/models/{repo}/tree/{rev}?recursive=true", self.base);
         let mut out = Vec::new();
         loop {
             let body = self.curl(
@@ -473,6 +479,50 @@ impl Client {
             digest: &got,
         });
         Ok(dest.to_path_buf())
+    }
+
+    /// The `len` bytes of `path` in `repo` at revision `rev` (`main`, or a
+    /// commit hash) from byte `from`, read by HTTP Range: the same curl,
+    /// token and errors as every other call, nothing cached and nothing
+    /// checked against the listing's digest. A hub that
+    /// ignores the range and answers the whole file is stopped by its
+    /// `Content-Length` (`--max-filesize`) instead of being read; a body of
+    /// another length than `len` is [`HfError::Range`], so the caller clips
+    /// `len` to the file's listed size first.
+    pub fn fetch_range(
+        &self,
+        repo: &str,
+        rev: &str,
+        path: &str,
+        from: u64,
+        len: u64,
+    ) -> Result<Vec<u8>, HfError> {
+        let url = format!("{}/{repo}/resolve/{rev}/{path}", self.base);
+        let what = format!("range {from}+{len} of {url}");
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+        let range = format!("{from}-{}", from + len - 1);
+        let max = len.to_string();
+        let body = self.curl(
+            &what,
+            &[
+                "--range".as_ref(),
+                range.as_ref(),
+                "--max-filesize".as_ref(),
+                max.as_ref(),
+                url.as_ref(),
+            ],
+        )?;
+        if body.len() as u64 != len {
+            return Err(HfError::Range {
+                file: format!("{repo}/{path}"),
+                from,
+                want: len,
+                got: body.len() as u64,
+            });
+        }
+        Ok(body)
     }
 
     /// curl from the end of `part` to the end of the file, a `Progress`
@@ -1012,6 +1062,90 @@ mod tests {
     }
 
     #[test]
+    fn a_range_is_the_files_bytes_at_that_offset() {
+        let d = scratch("range");
+        let body = content();
+        let (c, _) = served(&d, "a/b", "dir/m.gguf", &body);
+        let got = c
+            .fetch_range("a/b", "main", "dir/m.gguf", 1000, 4096)
+            .expect("range");
+        assert_eq!(got, body[1000..5096]);
+        let last = body.len() as u64 - 7;
+        assert_eq!(
+            c.fetch_range("a/b", "main", "dir/m.gguf", last, 7)
+                .expect("tail"),
+            body[body.len() - 7..]
+        );
+        assert!(
+            c.fetch_range("a/b", "main", "dir/m.gguf", 0, 0)
+                .expect("none")
+                .is_empty()
+        );
+        // Nothing is cached or marked by a range read.
+        assert!(!d.join("cache").join("a/b/dir/m.gguf").exists());
+    }
+
+    #[test]
+    fn a_range_past_the_end_or_of_a_missing_file_is_a_named_error() {
+        let d = scratch("range-bad");
+        let body = content();
+        let (c, _) = served(&d, "a/b", "m.gguf", &body);
+        let at = body.len() as u64 - 10;
+        match c.fetch_range("a/b", "main", "m.gguf", at, 100) {
+            Err(HfError::Range {
+                from, want, got, ..
+            }) => assert_eq!((from, want, got), (at, 100, 10)),
+            other => panic!("{other:?}"),
+        }
+        match c.fetch_range("a/b", "main", "absent.gguf", 0, 16) {
+            Err(HfError::Curl { what, .. }) => assert!(what.contains("absent.gguf"), "{what}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_revision_names_the_listing_and_the_range() {
+        let d = scratch("range-rev");
+        let (c, _) = served(&d, "a/b", "m.gguf", b"main bytes");
+        let rev = d.join("hub/a/b/resolve/0123abc");
+        fs::create_dir_all(&rev).expect("rev dir");
+        fs::write(rev.join("m.gguf"), b"older bytes").expect("rev file");
+        assert_eq!(
+            c.fetch_range("a/b", "0123abc", "m.gguf", 6, 5)
+                .expect("range"),
+            b"bytes"
+        );
+        assert_eq!(
+            c.fetch_range("a/b", "main", "m.gguf", 5, 5).expect("range"),
+            b"bytes"
+        );
+        let tree = d.join("hub/api/models/a/b/tree");
+        fs::create_dir_all(&tree).expect("tree dir");
+        let json = |size: u64| {
+            format!(
+                "[{{\"type\":\"file\",\"path\":\"m.gguf\",\"size\":{size},\"lfs\":{{\"oid\":\"{}\",\"size\":{size}}}}}]",
+                "0".repeat(64)
+            )
+        };
+        fs::write(tree.join("main"), json(10)).expect("main listing");
+        fs::write(tree.join("0123abc"), json(11)).expect("rev listing");
+        assert_eq!(c.listing("a/b").expect("main")[0].size, 10);
+        assert_eq!(c.listing_at("a/b", "0123abc").expect("rev")[0].size, 11);
+    }
+
+    #[test]
+    fn a_hub_that_ignores_the_range_is_refused_not_read() {
+        let d = scratch("range-ignored");
+        static WHOLE: [u8; 5000] = [7; 5000];
+        // A hub that ignores `Range` answers the whole file, status 200.
+        let c = answering_with("200 OK", &WHOLE, &d.join("cache"));
+        match c.fetch_range("a/b", "main", "m.gguf", 0, 100) {
+            Err(HfError::Curl { why, .. }) => assert!(why.starts_with("exit 63"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
     fn a_missing_file_is_curls_named_error() {
         let d = scratch("missing");
         let (c, mut e) = served(&d, "a/b", "m.gguf", b"x");
@@ -1047,6 +1181,11 @@ mod tests {
 
     /// A hub on a local port that answers every request with `status`.
     fn answering(status: &'static str, root: &Path) -> Client {
+        answering_with(status, b"", root)
+    }
+
+    /// A hub on a local port that answers every request with `status` and `body`.
+    fn answering_with(status: &'static str, body: &'static [u8], root: &Path) -> Client {
         use std::io::Write as _;
         let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = l.local_addr().expect("addr").port();
@@ -1057,8 +1196,10 @@ mod tests {
                 let _ = c.read(&mut buf);
                 let _ = write!(
                     c,
-                    "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
                 );
+                let _ = c.write_all(body);
             }
         });
         Client {

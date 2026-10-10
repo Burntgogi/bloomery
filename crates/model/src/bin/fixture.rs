@@ -4,6 +4,7 @@
 //!
 //!     fixture plan <real first shard> [--draft <real draft>] [flags]
 //!     fixture generate <real first shard> <out dir> [--draft <real draft>] [flags]
+//!     fixture fetch <family | repo[:quant]> <out dir> [--rev R] [flags]
 //!     fixture verify <fixture first shard> [--source <real first shard>]
 //!                    [--draft-source <real draft>]
 //!     fixture variant-rules <fixture first shard> --tag T [--table FILE]
@@ -19,46 +20,127 @@
 //! for a file holding only those tensors (it carries `bloomery.fixture.subset`). `plan` writes
 //! nothing. `generate` refuses an existing `<out dir>`, writes into `<out dir>.tmp.<pid>` and
 //! renames it on success; a whole fixture of a family with an r8 sidecar then gets it, beside the
-//! directory (`r8file::sidecar_path`), and a failed sidecar takes the directory down. `verify`
-//! takes the source from `--source`, else the spec's default, and checks the spec's draft fixture
-//! when it exists, against `--draft-source`, else the spec's default draft, and a whole fixture's
-//! sidecar. `variant-rules` prints what the quantizer is run with to make variant T of the fixture:
-//! a `custom-q<TAB>` line (its `--custom-q` argument, which names every tensor) and an
-//! `override-kv<TAB>` line (the tag's stamp), after the map's expansion over the fixture; it
-//! refuses a row that retypes nothing. `variant-check` holds a written variant to its source: the
-//! same header but for the tag, the same shards and shapes, the map's types, and every other
-//! tensor's bytes equal. The table is `--table`, else `tools/fixture-variants.tsv` under the
-//! working directory. A flag its verb does not take, a flag given twice, `--draft-tensors` without
-//! `--draft` and `--draft-source` with no draft fixture are refused. One line per tensor, a
-//! summary line, and exit status 1 with the error on any failure.
+//! directory (`r8file::sidecar_path`), and a failed sidecar takes the directory down. `fetch` is
+//! `generate` with the real files read from a Hugging Face repo by HTTP Range, for a machine that
+//! has none: the fixture's bytes are a function of the seed and the source's headers
+//! (`model::fixture`), so each shard of the set the quant names becomes a sparse file of its
+//! listed size with its header (fetched through the hf crate's client) at the front, in a
+//! directory beside `<out dir>` that is removed afterwards; the family's draft is the repo's
+//! file its family's source row names, when the row has one (a row can say its draft is not
+//! fetchable, and `fetch` then skips it by name). A family name (`v41`, `qwen38`, `glm5next`)
+//! reads its row of [`SOURCES`]: repo, quant and revision; a `<repo>:<quant>` takes `main`.
+//! After writing, it runs `verify`'s check against the sparse sources it still holds, and a
+//! fixture that fails it is removed with its sidecar, so a failed fetch leaves nothing.
+//! It takes `generate`'s flags but `--draft`, and `--rev R` (a commit hash, tag or branch of the
+//! repo; overrides the row's): a source rewritten upstream has another header, so its fixture
+//! is the one of the revision it was made from. `verify` takes the source from `--source`, else the spec's default, and checks
+//! the spec's draft fixture when it exists, against `--draft-source`, else the spec's default
+//! draft, and a whole fixture's sidecar. `variant-rules` prints what the quantizer is run with to
+//! make variant T of the fixture: a `custom-q<TAB>` line (its `--custom-q` argument, which names
+//! every tensor) and an `override-kv<TAB>` line (the tag's stamp), after the map's expansion over
+//! the fixture; it refuses a row that retypes nothing. `variant-check` holds a written variant to
+//! its source: the same header but for the tag, the same shards and shapes, the map's types, and
+//! every other tensor's bytes equal. The table is `--table`, else `tools/fixture-variants.tsv`
+//! under the working directory. A flag its verb does not take, a flag given twice,
+//! `--draft-tensors` without `--draft` and `--draft-source` with no draft fixture are refused. One
+//! line per tensor, a summary line, and exit status 1 with the error on any failure.
 
 use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use gguf::Split;
+use hf::fetch::Client;
+use hf::{Entry, RepoRef};
 use model::arch::deepseek41::fixture as v41;
 use model::arch::glm5next::fixture as glm5;
 use model::arch::qwen35moe::fixture as qwen38;
 use model::fixture::{
-    self, DEFAULT_SEED, FilePlan, FixtureSpec, Options, PlannedTensor, Sample, TensorStat,
-    VARIANT_TABLE,
+    self, DEFAULT_SEED, FilePlan, FixtureError, FixtureSpec, HeaderStat, Options, PlannedTensor,
+    RemoteError, Sample, TensorStat, VARIANT_TABLE,
 };
 use model::placement::card_budget;
 
 const USAGE: &str = "usage: fixture plan <real first shard> [--draft <real draft>] [flags]
        fixture generate <real first shard> <out dir> [--draft <real draft>] [flags]
+       fixture fetch <family | repo[:quant]> <out dir> [--rev R] [flags]
        fixture verify <fixture first shard> [--source <real first shard>] [--draft-source <real draft>]
        fixture variant-rules <fixture first shard> --tag T [--table FILE]
        fixture variant-check <variant first shard> --source <fixture first shard> --tag T [--table FILE]
-flags of plan and generate: --seed N --card-budget B --shard-bytes B --tensors a,b,... --draft-tensors a,b,...";
+flags of plan and generate: --seed N --card-budget B --shard-bytes B --tensors a,b,... --draft-tensors a,b,...
+flags of fetch: the same but --draft, and --rev R";
 
 /// Every family's spec, found by the architecture it declares.
 const SPECS: [fn() -> FixtureSpec; 3] = [v41::spec, qwen38::spec, glm5::spec];
 
+/// Where a family's draft fixture comes from on the hub.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DraftSource {
+    /// The family has no draft file.
+    None,
+    /// The draft is this file name in the target's repo.
+    File(&'static str),
+    /// No public file is the draft's source; the reason, said when `fetch` skips it.
+    NotFetchable(&'static str),
+}
+
+/// The hub source a family's fixture is made from: `fixture fetch <family> <out dir>` reads
+/// the row, and an explicit `<repo>:<quant>` overrides it.
+struct Source {
+    spec: fn() -> FixtureSpec,
+    /// The name `fetch` takes: the family's directory under the fixture root.
+    family: &'static str,
+    repo: &'static str,
+    quant: &'static str,
+    /// The repo revision the fixture's source header is the header of (`main` when `None`).
+    rev: Option<&'static str>,
+    draft: DraftSource,
+}
+
+/// One row per entry of [`SPECS`].
+const SOURCES: [Source; 3] = [
+    Source {
+        spec: v41::spec,
+        family: "v41",
+        repo: "vcruz305/DeepSeek-V4.1-Flash-GGUF",
+        quant: "Q3_K_M",
+        rev: None,
+        draft: DraftSource::NotFetchable(
+            "the draft fixture is made from our own DSpark copy, and no public file has its header",
+        ),
+    },
+    Source {
+        spec: qwen38::spec,
+        family: "qwen38",
+        repo: "unsloth/Qwen3.8-Flash-Next-GGUF",
+        quant: "UD-Q4_K_XL",
+        rev: None,
+        draft: DraftSource::File("mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf"),
+    },
+    Source {
+        spec: glm5::spec,
+        family: "glm5next",
+        repo: "unsloth/GLM-5.3-Flash-GGUF",
+        quant: "UD-Q4_K_XL",
+        // unsloth's later rewrite of shard 1 renamed `glm5next` to `glm5-next`; this is the
+        // commit before, whose header the fixture was made from.
+        rev: Some("621d456e93"),
+        draft: DraftSource::None,
+    },
+];
+
 /// The flags `plan` and `generate` take.
 const PLAN_FLAGS: [&str; 6] = [
     "--draft",
+    "--seed",
+    "--card-budget",
+    "--shard-bytes",
+    "--tensors",
+    "--draft-tensors",
+];
+/// The flags `fetch` takes: `generate`'s but the local draft, which the repo's own file replaces.
+const FETCH_FLAGS: [&str; 6] = [
+    "--rev",
     "--seed",
     "--card-budget",
     "--shard-bytes",
@@ -91,6 +173,7 @@ fn run(args: &[String]) -> Res<()> {
     };
     let takes: &[&str] = match cmd.as_str() {
         "plan" | "generate" => &PLAN_FLAGS,
+        "fetch" => &FETCH_FLAGS,
         "verify" => &VERIFY_FLAGS,
         "variant-rules" => &RULES_FLAGS,
         "variant-check" => &CHECK_FLAGS,
@@ -100,6 +183,7 @@ fn run(args: &[String]) -> Res<()> {
     match (cmd.as_str(), a.paths.as_slice()) {
         ("plan", [source]) => plan(source, &a),
         ("generate", [source, out]) => generate(source, out, &a),
+        ("fetch", [repo, out]) => fetch(repo, out, &a),
         ("verify", [first]) => verify(first, &a),
         ("variant-rules", [source]) => variant_rules(source, &a),
         ("variant-check", [variant]) => variant_check(variant, &a),
@@ -115,6 +199,7 @@ struct Args {
     draft_source: Option<String>,
     tag: Option<String>,
     table: Option<String>,
+    rev: Option<String>,
     seed: Option<u64>,
     card_budget: Option<u64>,
     shard_bytes: Option<u64>,
@@ -132,6 +217,7 @@ impl Args {
             draft_source: None,
             tag: None,
             table: None,
+            rev: None,
             seed: None,
             card_budget: None,
             shard_bytes: None,
@@ -159,6 +245,7 @@ impl Args {
                 "--draft-source" => a.draft_source = Some(value()?),
                 "--tag" => a.tag = Some(value()?),
                 "--table" => a.table = Some(value()?),
+                "--rev" => a.rev = Some(value()?),
                 "--seed" => {
                     let v = value()?;
                     a.seed = Some(
@@ -179,7 +266,7 @@ impl Args {
         if let Some(f) = seen.iter().find(|f| !takes.contains(*f)) {
             return Err(format!("{cmd} does not take {f}\n{USAGE}").into());
         }
-        if a.draft_tensors.is_some() && a.draft.is_none() {
+        if cmd != "fetch" && a.draft_tensors.is_some() && a.draft.is_none() {
             return Err(format!("--draft-tensors needs --draft\n{USAGE}").into());
         }
         Ok(a)
@@ -344,20 +431,24 @@ fn generate(source: &str, out: &str, a: &Args) -> Res<()> {
             .map_or("planned".to_string(), |b| b.to_string()),
         a.draft.as_deref().unwrap_or("none")
     );
+    write_fixture(&spec, &split, draft.as_ref(), out, &opts)
+}
+
+/// `spec`'s fixture of `split` (and `draft`) into `out`, a line per tensor and the summary.
+fn write_fixture(
+    spec: &FixtureSpec,
+    split: &Split,
+    draft: Option<&Split>,
+    out: &str,
+    opts: &Options,
+) -> Res<()> {
     let mut line = |t: &TensorStat| {
         println!(
             "fixture: tensor {} type={} bytes={} file={} gen_secs={:.3} write_secs={:.3}",
             t.name, t.ty, t.bytes, t.file, t.gen_secs, t.write_secs
         );
     };
-    let s = fixture::generate(
-        &spec,
-        &split,
-        draft.as_ref(),
-        Path::new(out),
-        &opts,
-        &mut line,
-    )?;
+    let s = fixture::generate(spec, split, draft, Path::new(out), opts, &mut line)?;
     println!(
         "fixture: generate done tensors={} bytes={} file_bytes={} card_budget={} gen_secs={:.2} \
          write_secs={:.2} sync_secs={:.2} secs={:.2} peak_rss_kib={} out={}",
@@ -384,11 +475,180 @@ fn generate(source: &str, out: &str, a: &Args) -> Res<()> {
     Ok(())
 }
 
+/// `generate` from the source `repo` (`<owner>/<name>[:<quant>]`) names, its headers read by
+/// range. The sources live in `<out>.fetch.<pid>`, removed whether or not the run succeeds.
+fn fetch(target: &str, out: &str, a: &Args) -> Res<()> {
+    let (r, rev) = match SOURCES.iter().find(|s| s.family == target) {
+        Some(s) => (
+            RepoRef {
+                repo: s.repo.to_string(),
+                quant: Some(s.quant.to_string()),
+            },
+            a.rev.as_deref().or(s.rev).unwrap_or("main"),
+        ),
+        None => (RepoRef::parse(target)?, a.rev.as_deref().unwrap_or("main")),
+    };
+    let out_path = Path::new(out);
+    if out_path
+        .try_exists()
+        .map_err(|e| format!("stat {out}: {e}"))?
+    {
+        return Err(FixtureError::Exists {
+            path: out_path.to_path_buf(),
+        }
+        .into());
+    }
+    let mut tmp = out_path.as_os_str().to_owned();
+    tmp.push(format!(".fetch.{}", std::process::id()));
+    let tmp = PathBuf::from(tmp);
+    std::fs::create_dir(&tmp).map_err(|e| format!("create {}: {e}", tmp.display()))?;
+    let done = fetch_into(&r, rev, out, a, &tmp);
+    match (done, std::fs::remove_dir_all(&tmp)) {
+        (done, Ok(())) => done,
+        (Ok(()), Err(e)) => Err(format!("remove {}: {e}", tmp.display()).into()),
+        (Err(e), Err(c)) => Err(format!("{e}; and removing {} failed: {c}", tmp.display()).into()),
+    }
+}
+
+/// The body of [`fetch`], the sparse sources under `tmp`.
+fn fetch_into(r: &RepoRef, rev: &str, out: &str, a: &Args, tmp: &Path) -> Res<()> {
+    let client = Client::new(tmp.to_path_buf())?;
+    if client.offline {
+        return Err(RemoteError::Offline.into());
+    }
+    let entries = client.listing_at(&r.repo, rev)?;
+    let sets = hf::gguf_sets(&r.repo, &entries)?;
+    let set = hf::pick(&r.repo, &sets, r.quant.as_deref())?;
+    println!(
+        "fixture: fetch {r}@{rev} -> {out} set={} shards={} bytes={}",
+        set.name,
+        set.files.len(),
+        set.bytes()
+    );
+    let dir = tmp.join("source");
+    std::fs::create_dir(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    let mut note = |e: &Entry, s: &HeaderStat| {
+        println!(
+            "fixture: fetch {} size={} header={} reads={}",
+            e.path, e.size, s.header, s.reads
+        );
+    };
+    let first = fixture::sparse_set(&client, &r.repo, rev, &set.files, &dir, &mut note)?
+        .swap_remove(0)
+        .to_string_lossy()
+        .into_owned();
+    let split = open(&first)?;
+    println!(
+        "fixture: fetch source header sha256={}",
+        fixture::header_sha256(&split)
+    );
+    let spec = spec_of(&split, &first)?;
+    let row = SOURCES
+        .iter()
+        .find(|s| (s.spec)().arch == spec.arch)
+        .ok_or_else(|| format!("{first}: the {} family has no row in SOURCES", spec.arch))?;
+    let mut draft_path: Option<String> = None;
+    let draft = match row.draft {
+        DraftSource::None => None,
+        DraftSource::NotFetchable(why) => {
+            println!("fixture: fetch draft skipped, not fetchable: {why}");
+            None
+        }
+        DraftSource::File(name) => match hf::mtp_draft(&r.repo, &entries, name)? {
+            Some(e) => {
+                let one = std::slice::from_ref(e);
+                let p = fixture::sparse_set(&client, &r.repo, rev, one, &dir, &mut note)?
+                    .swap_remove(0);
+                println!("fixture: fetch draft {}", e.path);
+                draft_path = Some(p.to_string_lossy().into_owned());
+                Some(open(&p.to_string_lossy())?)
+            }
+            None => {
+                return Err(format!(
+                    "{}@{rev} holds no {name}, the draft of the {} family",
+                    r.repo, row.family
+                )
+                .into());
+            }
+        },
+    };
+    if a.draft_tensors.is_some() && draft.is_none() {
+        return Err(format!(
+            "--draft-tensors needs a draft, and the {} family has none to fetch",
+            row.family
+        )
+        .into());
+    }
+    let opts = a.options(&spec);
+    println!(
+        "fixture: generate {} -> {out} seed={} card_budget={}",
+        r.repo,
+        opts.seed,
+        opts.card_budget
+            .map_or("planned".to_string(), |b| b.to_string()),
+    );
+    write_fixture(&spec, &split, draft.as_ref(), out, &opts)?;
+    // The written fixture is held to the sources still on disk, as `verify` would hold it;
+    // one that is not leaves nothing behind.
+    let checked = first_shard(Path::new(out), spec.stem).and_then(|fx_first| {
+        let first_str = fx_first.to_string_lossy().into_owned();
+        let fx = open(&first_str)?;
+        verify_fixture(&first_str, &fx, &spec, &first, draft_path.as_deref())?;
+        Ok(fx_first)
+    });
+    match checked {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            let sidecar = match (&spec.sidecar, first_shard(Path::new(out), spec.stem)) {
+                (Some(_), Ok(f)) => fixture::sidecar_path(&f).ok(),
+                _ => None,
+            };
+            match fixture::remove_fixture(Path::new(out), sidecar.as_deref()) {
+                Ok(()) => Err(e),
+                Err(c) => Err(format!("{e}; and removing the fixture failed: {c}").into()),
+            }
+        }
+    }
+}
+
+/// The first shard of the fixture `<stem>-00001-of-NNNNN.gguf` in `dir`.
+fn first_shard(dir: &Path, stem: &str) -> Res<PathBuf> {
+    let prefix = format!("{stem}-00001-of-");
+    let mut hits = Vec::new();
+    for e in std::fs::read_dir(dir).map_err(|e| format!("read {}: {e}", dir.display()))? {
+        let e = e.map_err(|e| format!("read {}: {e}", dir.display()))?;
+        let name = e.file_name().to_string_lossy().into_owned();
+        if name.starts_with(&prefix) && name.ends_with(".gguf") {
+            hits.push(e.path());
+        }
+    }
+    match hits.len() {
+        1 => Ok(hits.remove(0)),
+        n => Err(format!(
+            "{}: {n} files named {prefix}*.gguf, expected one",
+            dir.display()
+        )
+        .into()),
+    }
+}
+
 fn verify(first: &str, a: &Args) -> Res<()> {
     let fx = open(first)?;
     let spec = spec_of(&fx, first)?;
     let source = a.source.clone().unwrap_or_else(spec.default_source);
-    let real = open(&source)?;
+    verify_fixture(first, &fx, &spec, &source, a.draft_source.as_deref())
+}
+
+/// The fixture `fx` (opened from `first`) held to `source`, and its draft fixture, when it has
+/// one, to `draft_source`, else the spec's default draft.
+fn verify_fixture(
+    first: &str,
+    fx: &Split,
+    spec: &FixtureSpec,
+    source: &str,
+    draft_source: Option<&str>,
+) -> Res<()> {
+    let real = open(source)?;
     let dir = Path::new(first)
         .parent()
         .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
@@ -399,7 +659,7 @@ fn verify(first: &str, a: &Args) -> Res<()> {
             .map_err(|e| format!("stat {}: {e}", p.display()))?,
         None => false,
     };
-    if !has_draft && let Some(src) = &a.draft_source {
+    if !has_draft && let Some(src) = draft_source {
         return Err(match &draft_path {
             Some(p) => format!(
                 "--draft-source {src} names a draft source, but {} does not exist",
@@ -414,9 +674,8 @@ fn verify(first: &str, a: &Args) -> Res<()> {
     }
     let draft = match (&draft_path, spec.draft) {
         (Some(p), Some(ds)) if has_draft => {
-            let src = a
-                .draft_source
-                .clone()
+            let src = draft_source
+                .map(str::to_string)
                 .or_else(ds.default_source)
                 .ok_or_else(|| {
                     format!(
@@ -447,7 +706,7 @@ fn verify(first: &str, a: &Args) -> Res<()> {
         );
     };
     let pair = draft.as_ref().map(|(d, r)| (d, r));
-    let (t, d) = fixture::verify(&spec, &fx, &real, pair, &mut line)?;
+    let (t, d) = fixture::verify(spec, fx, &real, pair, &mut line)?;
     println!(
         "fixture: verify done tensors={} blocks={} subset={} draft_tensors={}",
         t.tensors,
@@ -513,4 +772,40 @@ fn variant_check(variant: &str, a: &Args) -> Res<()> {
         row.tag, s.tensors, s.retyped, s.copied_bytes, s.shards
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_spec_has_one_source_row_and_v41s_draft_is_not_fetchable() {
+        for spec in SPECS.iter().map(|f| f()) {
+            let rows: Vec<&Source> = SOURCES
+                .iter()
+                .filter(|s| (s.spec)().arch == spec.arch)
+                .collect();
+            assert_eq!(rows.len(), 1, "{}: {} source rows", spec.arch, rows.len());
+            let row = rows[0];
+            assert!(RepoRef::parse(&format!("{}:{}", row.repo, row.quant)).is_ok());
+            // A family with a draft fixture says where the draft comes from, and one without
+            // says there is none.
+            assert_eq!(
+                spec.draft.is_none(),
+                row.draft == DraftSource::None,
+                "{}: the draft row and the spec disagree",
+                spec.arch
+            );
+        }
+        assert_eq!(SOURCES.len(), SPECS.len());
+        let names: std::collections::HashSet<_> = SOURCES.iter().map(|s| s.family).collect();
+        assert_eq!(names.len(), SOURCES.len(), "family names are unique");
+        let v41 = SOURCES.iter().find(|s| s.family == "v41").expect("v41 row");
+        assert!(matches!(v41.draft, DraftSource::NotFetchable(_)));
+        let glm = SOURCES
+            .iter()
+            .find(|s| s.family == "glm5next")
+            .expect("glm row");
+        assert_eq!(glm.rev, Some("621d456e93"));
+    }
 }

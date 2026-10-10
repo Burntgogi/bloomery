@@ -257,6 +257,7 @@ name = "bloomery-model"
 version = "0.1.0"
 dependencies = [
  "bloomery-gguf",
+ "bloomery-hf",
  "bloomery-levers",
  "bloomery-models",
  "bloomery-placement",

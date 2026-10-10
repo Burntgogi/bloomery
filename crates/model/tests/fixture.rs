@@ -1665,6 +1665,62 @@ fn toy_spec() -> FixtureSpec {
     }
 }
 
+/// What `fixture fetch` leans on: a source whose header is real and whose data is a hole. The
+/// generator and `verify` read the source's header alone, so the fixture written from the
+/// sparse source is the one written from the whole file and `verify` against the sparse source
+/// passes, and a source whose header has one byte changed is refused by the source-header
+/// check.
+#[test]
+fn fixture_reads_only_the_sources_header() {
+    let guard = dir("sparse-source");
+    let d = &guard.0;
+    let src = toy_source(&d.join("toy-00001-of-00001.gguf"));
+    let g = src.shard(0).unwrap();
+    let header = g.header_bytes().to_vec();
+    let sparse_dir = d.join("sparse");
+    std::fs::create_dir_all(&sparse_dir).unwrap();
+    let sparse_path = sparse_dir.join("toy-00001-of-00001.gguf");
+    let write_sparse = |path: &Path, header: &[u8]| {
+        std::fs::write(path, header).unwrap();
+        File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_len(g.mapping().len() as u64)
+            .unwrap();
+        Split::open(path).unwrap()
+    };
+    let sparse = write_sparse(&sparse_path, &header);
+    let spec = toy_spec();
+    let opts = Options {
+        seed: 3,
+        ..spec.options()
+    };
+    let whole = d.join("from-whole");
+    let hole = d.join("from-sparse");
+    fixture::generate(&spec, &src, None, &whole, &opts, &mut |_| {}).unwrap();
+    fixture::generate(&spec, &sparse, None, &hole, &opts, &mut |_| {}).unwrap();
+    let name = "toy-fixture-00001-of-00001.gguf";
+    assert_eq!(
+        std::fs::read(whole.join(name)).unwrap(),
+        std::fs::read(hole.join(name)).unwrap(),
+        "the fixture is a function of the header"
+    );
+    let fx = Split::open(hole.join(name)).unwrap();
+    fixture::verify(&spec, &fx, &sparse, None, &mut |_, _| {}).unwrap();
+    // The low byte of the last element of `toy.per_layer`, a value the header holds.
+    let key = b"toy.per_layer";
+    let at = header.windows(key.len()).position(|w| w == key).unwrap() + key.len() + 4 + 4 + 8 + 12;
+    let mut edited = header.clone();
+    assert_eq!(edited[at], 13);
+    edited[at] = 14;
+    let other = write_sparse(&sparse_dir.join("toy-edited-00001-of-00001.gguf"), &edited);
+    match fixture::verify(&spec, &fx, &other, None, &mut |_, _| {}) {
+        Err(FixtureError::SourceMismatch { key, .. }) => assert_eq!(key, KEY_SOURCE_SHA256),
+        other => panic!("{other:?}"),
+    }
+}
+
 /// Contract 6: a second family.
 #[test]
 fn fixture_second_family() {
