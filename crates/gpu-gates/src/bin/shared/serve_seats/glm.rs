@@ -223,8 +223,9 @@ use bloomery_gpu_gates::bind::{
 };
 use bloomery_gpu_gates::generate::{Place, mode_name, with_cards};
 use bloomery_gpu_gates::record::{self, Record};
+use bloomery_gpu_gates::residency::PlanRoom;
 use bloomery_gpu_gates::residency38::{
-    GLM_CARD, checkpoints_reserved, glm_machine, plan_tier, residency_room, residency_set,
+    GLM_CARD, checkpoints_reserved, glm_machine, residency_room, residency_set,
 };
 use bloomery_gpu_gates::{GateError, gpu_census, ref_model_path};
 use bloomery_gpu_glm5next::{
@@ -239,7 +240,7 @@ use model::arch::glm5next::place::{
 };
 use model::placement::churn::ChurnPool;
 use model::placement::slots::{SplitError, split_ctx};
-use model::placement::workstation::{HostNeed, MARGIN, TierBatchBytes, host_available};
+use model::placement::workstation::{HostNeed, MARGIN, TierBatchBytes};
 use model::placement::{Machine, Plan, PlanLevers};
 use runtime::Target;
 use runtime::seqstate::Why;
@@ -618,16 +619,17 @@ fn residency_at(
         ResidencyLever::Unset(pick) => {
             // The load refuses a host set past `MemAvailable` before any
             // upload; the default leaves the pool out instead.
+            let room = PlanRoom::new(plan, GLM_CARD, beside);
             let mem_left = match pick.word {
                 "off" => 0,
-                _ => i128::from(host_available()?) - i128::from(HostNeed::of(plan, beside).bytes()),
+                _ => room.mem_left()?,
             };
             let pick = glm_residency_at_plan(
                 pick,
-                plan.n_l.iter().copied(),
-                plan_tier(plan),
-                |pinned| ChurnPool::of(plan, GLM_CARD, pinned).map(|pool| pool.bytes),
-                plan.host.headroom_bytes - i128::from(beside),
+                room.card_experts(),
+                room.tier(),
+                |pinned| room.pool_bytes(pinned),
+                room.headroom(),
                 mem_left,
             )
             .map_err(|e| format!("BLOOMERY_RESIDENCY unset: the churn pool: {e}"))?;

@@ -13,10 +13,11 @@
 use crate::GateError;
 use crate::generate::Place;
 use crate::record::{self, Record};
+use crate::residency::PlanRoom;
 use bloomery_gpu::host::swap::Residency;
 use bloomery_levers::{PlanTier, RESIDENCY38_SPARES, Residency38Pick, residency38_at_plan};
 use model::placement::churn::ChurnPool;
-use model::placement::workstation::{HostNeed, TierBatchBytes, host_available};
+use model::placement::workstation::TierBatchBytes;
 use model::placement::{Machine, Plan};
 use runtime::seqstate::HOST_BUDGET;
 
@@ -59,7 +60,7 @@ pub const CHECKPOINTS_RESERVE: &str = "checkpoints";
 /// `machine`'s host with the checkpoints `seqs` pin reserved: a
 /// [`CHECKPOINTS_RESERVE`] row of [`checkpoint_bytes`] of its slots when
 /// they take checkpoints, nothing when they take none. The one owner of a
-/// load's checkpoint bytes: the plan's host need ([`HostNeed::bytes`]
+/// load's checkpoint bytes: the plan's host need (`HostNeed::bytes`
 /// counts every reserve) holds them, so the load's host check, the NVMe
 /// tier's floor and arena, the unset residency rule's room ([`mem_left_38`])
 /// and the prompt cache's default budget (`CacheRam`) count them once, and a
@@ -99,7 +100,7 @@ pub fn checkpoints_reserved(machine: &Machine) -> u64 {
 }
 
 /// What the host's available bytes leave the unset residency rule's room
-/// past the plan's host `need` ([`HostNeed::bytes`]), the load's
+/// past the plan's host `need` (`HostNeed::bytes`), the load's
 /// checkpoints inside it ([`reserve_checkpoints`]).
 #[must_use]
 pub fn mem_left_38(available: u64, need: u64) -> i128 {
@@ -190,15 +191,14 @@ pub fn residency38(
                     // bytes before any upload; the default leaves the pool
                     // out instead. The need holds the load's checkpoints
                     // ([`reserve_checkpoints`]), as `CacheRam`'s does.
-                    let available = host_available()?;
-                    let need = HostNeed::of(plan, 0).bytes();
+                    let room = PlanRoom::new(plan, CARD38, 0);
                     residency38_at_plan(
-                        plan.n_l.iter().copied(),
+                        room.card_experts(),
                         plan.host.experts,
-                        plan_tier(plan),
-                        |pinned| ChurnPool::of(plan, CARD38, pinned).map(|pool| pool.bytes),
-                        plan.host.headroom_bytes,
-                        mem_left_38(available, need),
+                        room.tier(),
+                        |pinned| room.pool_bytes(pinned),
+                        room.headroom(),
+                        room.mem_left()?,
                     )
                     .map_err(|e| format!("BLOOMERY_RESIDENCY unset: the churn pool: {e}"))?
                 }

@@ -16,7 +16,8 @@
 //! - `attn`: the attention sub-layer;
 //! - `ffn`: the dense block and the routed block around its host leg;
 //! - `card`: the routed block's card experts, one run for the step and for a
-//!   prompt batch.
+//!   prompt batch;
+//! - `swap`: the stack table the residency machine's file source reads.
 //!
 //! What each layer's launches take, and the step's node counts, are facts of
 //! the file's description (`model::arch::mimo2::program`), where their tests
@@ -29,6 +30,7 @@ pub mod body;
 mod card;
 mod ffn;
 mod program;
+mod swap;
 
 pub use body::prefill::{
     FLASH_ROWS, PrefillMode, PromptBytes, T_MAX, feed, prefill, prefill_group, prefill_mode,

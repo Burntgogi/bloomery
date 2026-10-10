@@ -86,6 +86,15 @@
 //! cut (`Seat::splits` marks nowhere). The seat runs no prompt cache: a save
 //! and a resume are refused by name.
 //!
+//! `BLOOMERY_RESIDENCY` is the common machine's lever: set, its word as given
+//! (refused by name beside `--prefill steps`, and where the plan's card slots
+//! leave it no room); unset, the serving word on every placement but `gate`,
+//! which the plan then keeps, moves or turns `off` with why
+//! ([`bloomery_levers::residency_unset`], [`residency::at_plan`]). Its
+//! `residency lever` record (and, under `mid`, the `residency host` record of
+//! the churn pool) comes before the plan's own. Under `mid` the experts the
+//! card holds are the machine's to move by use, in the host leg's shadow.
+//!
 //! The levers this seat acts on ([`ACTS_ON`]) are parsed once, at `main`
 //! (`bloomery_levers::at_main`), which refuses by name a lever set outside
 //! them: the plan's card budget, the host set's load settings, and
@@ -102,6 +111,7 @@ use std::time::Instant;
 
 use app::arch::mimo2::Mimo2Cfg;
 use app::{Loaded, OpenArgs, OpenLog, Session, SessionError};
+use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::model::StepMode;
 use bloomery_gpu_gates::bind::{
     ChatSurface, Listen, Pass, Seat, SeatEngine, Vocab, bind_server, model_props, note_line,
@@ -109,9 +119,10 @@ use bloomery_gpu_gates::bind::{
 };
 use bloomery_gpu_gates::generate::{CTX_GRAN, Place, trained_ctx};
 use bloomery_gpu_gates::record::{self, Record};
-use bloomery_gpu_gates::{GateError, gpu_census, ref_model_path};
+use bloomery_gpu_gates::residency38::{residency_room, residency_set};
+use bloomery_gpu_gates::{GateError, gpu_census, ref_model_path, residency};
 use bloomery_gpu_mimo2::{Body, Mimo2Model, PrefillMode};
-use bloomery_levers::HostCfg;
+use bloomery_levers::{HostCfg, ResidencyAt, ResidencyWhy};
 use gguf::Split;
 use model::arch::Arch;
 use model::arch::mimo2::place::PlanInputs;
@@ -132,9 +143,11 @@ const USAGE: &str = "usage: bloomery-serve --model mimo2 [-m PATH | --hf <repo>[
 
 /// The levers this seat acts on: the plan's card budget and the host set's
 /// load settings, which the open reads (`PlanLevers::from_levers`,
-/// `Levers::host`), the engine thread's pin and the host legs' lane rule.
+/// `Levers::host`), the residency machine's word, the engine thread's pin and
+/// the host legs' lane rule.
 pub const ACTS_ON: &[&str] = &[
     bloomery_levers::CARD_BUDGET,
+    bloomery_levers::RESIDENCY,
     bloomery_levers::HOST_POPULATE,
     bloomery_levers::HOST_LOCK,
     bloomery_levers::CARD_DONTNEED,
@@ -314,6 +327,8 @@ struct OpenSeat {
     host: HostCfg,
     pin_main: bool,
     prefill: PrefillMode,
+    /// The residency the load runs, resolved against the plan.
+    residency: Residency,
 }
 
 /// The open's records: the plan's expert counts are kept until the slots are
@@ -405,6 +420,7 @@ impl Mimo {
                 place: a.plan,
                 host: a.host,
                 prefill: a.prefill,
+                residency: a.residency,
                 group: 1,
                 slots: a.slots,
             },
@@ -531,6 +547,23 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let chosen = Place::choose_untiered(a.place, &census, "mimo2")?;
     chosen.record().eprint();
     let place = chosen.place;
+    // `BLOOMERY_RESIDENCY`: set as given, else the serving word on a serving
+    // placement, which the plan below keeps, moves or turns off. The steps
+    // feed ends a decode pass per prompt id, which the machine's rule counts.
+    let pick = levers.residency_at(ResidencyAt {
+        serving_place: place != Place::Gate,
+        check_finite: false,
+        route_trace: false,
+        prefill_steps: a.prefill == PrefillMode::Steps,
+    });
+    if pick.why == ResidencyWhy::Set && pick.word != "off" && a.prefill == PrefillMode::Steps {
+        return Err(format!(
+            "BLOOMERY_RESIDENCY={} is refused beside --prefill steps (each prompt id would end \
+             a pass the rule counts)",
+            pick.word
+        )
+        .into());
+    }
     let tier = (!place.tier_cards().is_empty()).then_some(NO_BATCH);
     let machine = place.machine(None, tier)?(inputs.model.layers);
     let n = NonZeroUsize::new(slots).ok_or("--parallel 0: the server serves no slot")?;
@@ -557,7 +590,17 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         rule.trained
             .map_or_else(|| "none".to_owned(), |t| t.to_string())
     );
+    let pick = residency::at_plan(&plan, 0, pick)?;
+    record::residency_lever(pick).eprint();
+    if let Some(d) = pick.why.detail() {
+        eprintln!("{d}");
+    }
     record::plan(place.name(), &machine, &plan).eprint();
+    let residency = Residency::parse(pick.word)?;
+    if pick.why == ResidencyWhy::Set {
+        residency_room(&plan, residency, pick.word)?;
+    }
+    residency_set(&plan, 0, residency, pick.word, 0, Record::eprint)?;
     parallel_line(slots, slot_ctx, from, Pass::of(slots, false));
     if a.plan_only {
         // The records before the load are out; nothing was opened on a card.
@@ -581,6 +624,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         host: levers.host(),
         pin_main: levers.pin_main(),
         prefill: a.prefill,
+        residency,
     };
     let engine = SeatEngine::spawn(move || Mimo::open(open), slot_ctx, vocab, card, props, 0)?;
     let server = bind_server(

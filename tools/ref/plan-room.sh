@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # The plan room: the one owner of the host room `just records-refresh` plans V4.1's placement (a) under.
 #
-# generate_ds41 --plan resolves the unset residency word against two bounds (crates/gpu-gates/src/residency41.rs): the
+# generate_ds41 --plan resolves the unset residency word against two bounds (crates/gpu-gates/src/residency.rs): the
 # plan's host headroom, the workstation's plan room less the plan's host need (HostNeed::machine_room), and mem_left, the
 # host's room less the same need. At the room R = PLAN_ROOM mem_left is the headroom exactly, so the headroom alone
 # decides; at any larger room mem_left passes the headroom, and the pick and every record --plan prints stay the same. A

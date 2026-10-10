@@ -26,15 +26,27 @@
 //! hand on a census of two prints `deferred(one card) …` for the two session
 //! clauses. A `deferred(…)` line is a half that did not run, never a pass.
 //!
-//! The seat serves resident slots (`--parallel N`), every routed expert on the
-//! host tier, the prompt fed in batches (bit for bit the decode steps), and a
-//! later request keeps any prefix it shares with what its slot holds. Every server is `bloomery-serve --model mimo2 -m
-//! <file> …` beside this binary, `BLOOMERY_REF_MODEL` removed from its
-//! environment. Logs per server in `<dir>/<name>/` (`server.err`, the
+//! The seat serves resident slots (`--parallel N`), the routed experts the plan
+//! puts on the card and the rest on the host tier, the prompt fed in batches
+//! (bit for bit the decode steps), and a later request keeps any prefix it
+//! shares with what its slot holds. Every server is `bloomery-serve --model
+//! mimo2 -m <file> …` beside this binary, `BLOOMERY_REF_MODEL` removed from its
+//! environment and `BLOOMERY_RESIDENCY=off`, except in
+//! `residency_default_is_the_machine`: the ids a server answers are compared
+//! with a static session's and a one-slot server's, which the residency
+//! machine's adapting split would move. Logs per server in `<dir>/<name>/` (`server.err`, the
 //! responses).
 //!
 //! Without a load:
 //!
+//! - `residency_default_is_the_machine`: `--plan` at [`CTX`] with no
+//!   `BLOOMERY_RESIDENCY` prints the `residency lever` record at `mid-p0-s1`
+//!   with why `place` ahead of the plan record, and the `residency host`
+//!   record of the churn pool after it; at the seat's default context (the
+//!   KV planes take the card, the plan holds no expert to spare) the common
+//!   rule prints `off` with why `no_room` and no pool; under
+//!   `BLOOMERY_RESIDENCY=off` it prints `off` with why `set` and no pool
+//!   record.
 //! - `plan_only_names_its_default`: `--plan` with no `--place`, `--ctx` or
 //!   `--parallel` exits 0 and prints `place unset` (the word `a`), the plan
 //!   record and the `parallel` line, in that order, and no `load` or
@@ -319,18 +331,36 @@ mod gate {
     }
 
     /// `bloomery-serve --model mimo2 -m <file> <args>` beside this binary,
-    /// its logs in `<dir>/<name>/`.
+    /// its logs in `<dir>/<name>/`, `BLOOMERY_RESIDENCY` as `pin` says: the
+    /// ids the servers answer are compared with a static session's and a
+    /// one-slot server's, which the residency machine's adapting split would
+    /// move, so every server but the default's own clause runs it `off`.
+    fn spawn_pinned(
+        dir: &Path,
+        name: &str,
+        file: &Path,
+        args: &[&str],
+        pin: Option<&str>,
+    ) -> Result<(Served, PathBuf), GateError> {
+        let d = dir.join(name);
+        std::fs::create_dir_all(&d)?;
+        let mut all = vec!["--model", "mimo2", "-m", utf8(file)?];
+        all.extend_from_slice(args);
+        let mut cmd = serve_cmd()?;
+        if let Some(word) = pin {
+            cmd.env(bloomery_levers::RESIDENCY, word);
+        }
+        Ok((Served::spawn_cmd(cmd, &all, &d)?, d))
+    }
+
+    /// [`spawn_pinned`] with the machine `off`.
     fn spawn(
         dir: &Path,
         name: &str,
         file: &Path,
         args: &[&str],
     ) -> Result<(Served, PathBuf), GateError> {
-        let d = dir.join(name);
-        std::fs::create_dir_all(&d)?;
-        let mut all = vec!["--model", "mimo2", "-m", utf8(file)?];
-        all.extend_from_slice(args);
-        Ok((Served::spawn_cmd(serve_cmd()?, &all, &d)?, d))
+        spawn_pinned(dir, name, file, args, Some("off"))
     }
 
     /// A server run to its exit within `within`: its status (`None`: still
@@ -342,7 +372,18 @@ mod gate {
         args: &[&str],
         within: Duration,
     ) -> Result<(Option<ExitStatus>, PathBuf), GateError> {
-        let (mut s, d) = spawn(dir, name, file, args)?;
+        run_pinned(dir, name, file, args, (within, Some("off")))
+    }
+
+    /// [`run_to_exit`] under `BLOOMERY_RESIDENCY` as `pin` says ([`spawn_pinned`]).
+    fn run_pinned(
+        dir: &Path,
+        name: &str,
+        file: &Path,
+        args: &[&str],
+        (within, pin): (Duration, Option<&str>),
+    ) -> Result<(Option<ExitStatus>, PathBuf), GateError> {
+        let (mut s, d) = spawn_pinned(dir, name, file, args, pin)?;
         let t = Instant::now();
         let status = loop {
             if let Some(st) = s.child.try_wait()? {
@@ -364,9 +405,20 @@ mod gate {
         file: &Path,
         args: &[&str],
     ) -> Result<(Option<ExitStatus>, Log, String), GateError> {
+        plan_pinned(dir, name, file, args, Some("off"))
+    }
+
+    /// [`plan_run`] under `BLOOMERY_RESIDENCY` as `pin` says.
+    fn plan_pinned(
+        dir: &Path,
+        name: &str,
+        file: &Path,
+        args: &[&str],
+        pin: Option<&str>,
+    ) -> Result<(Option<ExitStatus>, Log, String), GateError> {
         let mut all = args.to_vec();
         all.push("--plan");
-        let (status, err) = run_to_exit(dir, name, file, &all, PLAN_WITHIN)?;
+        let (status, err) = run_pinned(dir, name, file, &all, (PLAN_WITHIN, pin))?;
         let text = std::fs::read_to_string(&err).unwrap_or_default();
         println!(
             "{name}: {} --plan: {}",
@@ -542,6 +594,63 @@ mod gate {
             ok,
             "plan_only_names_its_default",
             exits && in_order && word_a && no_load && default_ok,
+        );
+        Ok(())
+    }
+
+    /// `residency_default_is_the_machine` (the module header): `--plan` at
+    /// [`CTX`] with no residency word prints the `residency lever` record at
+    /// the serving word and why `place`, ahead of the plan, and the `residency
+    /// host` record of the churn pool after it; at the seat's default context,
+    /// whose KV planes leave the plan no card expert to spare, the common
+    /// rule turns it `off` (why `no_room`) with no pool; and under
+    /// `BLOOMERY_RESIDENCY=off` it prints `off` and why `set`, and no pool.
+    fn residency_default_is_the_machine(
+        dir: &Path,
+        file: &Path,
+        ok: &mut bool,
+    ) -> Result<(), GateError> {
+        let ctx = CTX.to_string();
+        let (status, log, _) = plan_pinned(dir, "plan-residency", file, &["--ctx", &ctx], None)?;
+        let (lever, plan, host) = (
+            log.first(&record::RESIDENCY_LEVER)?,
+            log.first(&record::PLAN)?,
+            log.first(&record::RESIDENCY_HOST)?,
+        );
+        let word = match &lever {
+            Some(l) => l.word("residency")? == "mid-p0-s1" && l.word("why")? == "place",
+            None => false,
+        };
+        let in_order = matches!(
+            (&lever, &plan, &host),
+            (Some(l), Some(p), Some(h)) if l.at() < p.at() && p.at() < h.at()
+        );
+        let (_, wide, _) = plan_pinned(dir, "plan-residency-default-ctx", file, &[], None)?;
+        let no_room = match wide.first(&record::RESIDENCY_LEVER)? {
+            Some(l) => l.word("residency")? == "off" && l.word("why")? == "no_room",
+            None => false,
+        } && wide.first(&record::RESIDENCY_HOST)?.is_none();
+        let (_, off_log, _) = plan_pinned(
+            dir,
+            "plan-residency-off",
+            file,
+            &["--ctx", &ctx],
+            Some("off"),
+        )?;
+        let off = match off_log.first(&record::RESIDENCY_LEVER)? {
+            Some(l) => l.word("residency")? == "off" && l.word("why")? == "set",
+            None => false,
+        } && off_log.first(&record::RESIDENCY_HOST)?.is_none();
+        let exits = status.is_some_and(|s| s.success());
+        println!(
+            "residency default: exit 0 {exits}; at ctx {ctx} the lever record is mid-p0-s1 (place), \
+             then the plan, then the pool {word} {in_order}; at the default context it is off \
+             (no_room) with no pool {no_room}; set off prints off (set) and no pool {off}"
+        );
+        check(
+            ok,
+            "residency_default_is_the_machine",
+            exits && word && in_order && no_room && off,
         );
         Ok(())
     }
@@ -1065,12 +1174,13 @@ mod gate {
 
         if a.after_refusals {
             println!(
-                "plan_only_names_its_default, refusals_before_any_load, slots_total_is_planned: run by \
-                 the parent of this child"
+                "plan_only_names_its_default, residency_default_is_the_machine, \
+                 refusals_before_any_load, slots_total_is_planned: run by the parent of this child"
             );
             after_refusals(&a.dir, &file, &levers, cards, &mut ok)?;
         } else {
             plan_only_names_its_default(&a.dir, &file, &mut ok)?;
+            residency_default_is_the_machine(&a.dir, &file, &mut ok)?;
             refusals_before_any_load(&a.dir, &file, cards, &mut ok)?;
             slots_total_is_planned(&a.dir, &file, &mut ok)?;
             if cards >= 2 {

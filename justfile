@@ -2094,7 +2094,8 @@ gate-mimo2-meta:
 # output distance printed; (t) the argmax after each step set's prompt (the two 4-token sets, then the 1,024- and
 # 4,096-position ones) ik's or a named tie. There is no fixture file for it yet, so it is a weekly (selected by its
 # trigger rows in tools/gate-paths.tsv and its own text) and a fixture-tier run is refused by name (66). `--only
-# s|p|c|t` runs one clause on the load and `--step-sets short|long` takes (t)'s sets by length. Loads the whole host
+# s|p|c|t` runs one clause on the load, `--only r` the residency machine's clauses on a load of their own, and
+# `--step-sets short|long` takes (t)'s sets by length. Loads the whole host
 # set: alone in a batch, and under the big-load lock the V4.1 loads take.
 [group('solo')]
 [group('v41-load')]

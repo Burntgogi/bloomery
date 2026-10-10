@@ -68,8 +68,28 @@
 //!   leaves both slots on the live stores and H1 is red; a `seq_bytes` of 0
 //!   is red at H3.
 //!
-//! `--only s|p|c|t|b|slots` runs one clause on the load (`slots` on its own
-//! loads); `--step-sets short` takes
+//! - (r) adaptive expert residency, the common machine on MiMo's slot map
+//!   (`bloomery_gpu::host::swap`, the stack table `bloomery_gpu_mimo2::swap`):
+//!   off, the load of the clauses above runs no machine (`residency_source`
+//!   and the tier's machine unset: its slot map is the load's for its life);
+//!   unset, the serving default on this plan is the machine
+//!   (`bloomery_levers::residency_unset`, `residency::at_plan`: the seat's own
+//!   two calls; its `residency lever` record printed), and off beside `--place
+//!   gate` and the steps feed; on, a load of its own at the word the unset
+//!   resolved to, fed in batches: every routed layer's three parts are an
+//!   MXFP4 expert's bytes ([`PART_BYTES`], read back through the source), a
+//!   history of [`R_PROMPT`] prompt ids and [`R_STEPS`] greedy steps run twice
+//!   from a clear gives the same tokens and logits, its boundaries end the
+//!   prompt (0 rows kept) and each step (1 kept), and flips land
+//!   (`residency_clauses`: c1, passes); the batch set's free-running tokens on
+//!   the map use has built are (c)'s, in its band; and the reset brings the
+//!   live sets back to the seed (c7) and the slot map to where a clear left
+//!   it. FAIL-first: `Body::residency_parts` of `None` leaves the machine
+//!   unstarted (the structure line, c1 and c7 red); a history that counts no
+//!   flip is red at c1; a reset that does nothing is red at the map's return.
+//!
+//! `--only s|p|c|t|b|slots|r` runs one clause on the load (`slots` and `r` on
+//! their own loads); `--step-sets short` takes
 //! (t)'s two 4-token sets only, `--step-sets long` the 1,024- and
 //! 4,096-position sets only, `--step-sets d1k` the 1,024-position one,
 //! `--step-sets all` (the default) all four; it goes with `--only t`, `--only
@@ -116,6 +136,14 @@ mod e2e;
 mod mimo2_open;
 
 #[cfg(feature = "mimo2")]
+#[allow(
+    dead_code,
+    reason = "the residency clauses serve several gates; each takes the helpers it reads"
+)]
+#[path = "shared/residency_clauses.rs"]
+mod residency_clauses;
+
+#[cfg(feature = "mimo2")]
 mod gate {
     use crate::e2e::{elapsed, ik_last, layer_rels, layer_table, same_bits, set_open, word_after};
     use crate::mimo2_open::{N_VOCAB, Opened, last_argmax, open};
@@ -123,12 +151,17 @@ mod gate {
     use std::path::Path;
     use std::time::Instant;
 
+    use app::Session;
+    use bloomery_gpu::host::PassKind;
+    use bloomery_gpu::host::swap::{Residency, SwapSource};
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu_gates::nodes::count_kinds;
+    use bloomery_gpu_gates::record;
+    use bloomery_gpu_gates::residency;
     use bloomery_gpu_gates::slots_gate::{self, Derived, SlotsAdapter};
     use bloomery_gpu_gates::{Fnv1a64, GateError, RefManifest, checks_failed, data_dir, verdict};
     use bloomery_gpu_mimo2::{Body, Mimo2Model, PrefillMode, feed, set_prefill, set_taps};
-    use bloomery_levers::CARD_BUDGET;
+    use bloomery_levers::{CARD_BUDGET, ResidencyAt, ResidencyWhy};
     use cuda_core::sys;
     use gguf::Split;
     use model::arch::mimo2::place::PlanInputs;
@@ -138,6 +171,10 @@ mod gate {
     use refset::arch::mimo2::{BATCH, D1K, D4096, IK, MODEL, STEP4, STEP4_EVERY_NODE};
     use refset::family::Family;
     use runtime::layer::FfnKind;
+    use runtime::{Out, Target as _, Want};
+
+    use crate::mimo2_open::open_with;
+    use crate::residency_clauses::{c1_clause_with, c7_clause, passes_clause, seeds};
 
     /// Cache rows: the 4,096-position set's step at position 4,096, with a
     /// margin of whole 64 positions.
@@ -605,8 +642,15 @@ mod gate {
             let machine = crate::gate_card::plan_gate(self.inputs.model.layers);
             let plan = self.plan(&machine, n)?;
             let t = Instant::now();
-            let mut m =
-                Body::open_placed_slots(file, &plan, &self.inputs, 0, self.levers.host(), n)?;
+            let mut m = Body::open_placed_slots(
+                file,
+                &plan,
+                &self.inputs,
+                0,
+                self.levers.host(),
+                Residency::Off,
+                n,
+            )?;
             set_prefill(&mut m, PrefillMode::Batch)?;
             println!(
                 "slots load resident_bytes={} ctx={SLOT_CTX} slots={slots} in {:.1} s (runtime \
@@ -734,7 +778,15 @@ mod gate {
         let machine = crate::gate_card::plan_gate(a.inputs.model.layers);
         let plan = a.plan(&machine, NonZeroUsize::MIN)?;
         let two = NonZeroUsize::new(slots_gate::STREAMS).ok_or("no slots")?;
-        let refused = Body::open_placed_slots(file, &plan, &a.inputs, 0, a.levers.host(), two);
+        let refused = Body::open_placed_slots(
+            file,
+            &plan,
+            &a.inputs,
+            0,
+            a.levers.host(),
+            Residency::Off,
+            two,
+        );
         let named = matches!(&refused, Err(e) if e.to_string().contains("the plan counts"));
         println!(
             "(sp) a load of {} sequences by a plan of one is refused by name {named} {}",
@@ -772,6 +824,238 @@ mod gate {
         Ok(ok)
     }
 
+    // ------------------------------------------------- (r) residency
+
+    /// Prompt ids of (r)'s history (the 1,024-position set's head) and the
+    /// greedy steps after it.
+    const R_PROMPT: usize = 24;
+    const R_STEPS: usize = 32;
+
+    /// One routed expert's part, each of the three: a gate or up part is
+    /// `EXPERT_FF` rows of `HIDDEN / 32` 17-byte `block_mxfp4`s, the down
+    /// `HIDDEN` rows of `EXPERT_FF / 32`: the same bytes.
+    const EXPERT_FF: usize = 2048;
+    const PART_BYTES: usize = EXPERT_FF * (HIDDEN / 32) * 17;
+
+    /// What a history saw: the prompt's argmax, every step's argmax and
+    /// logits FNV, each boundary's ended pass (its kind and kept rows) and the
+    /// flips that landed there, and the host map's stage view after its clear,
+    /// where those flips started from.
+    struct History {
+        first: u32,
+        tokens: Vec<u32>,
+        fnvs: Vec<u64>,
+        passes: Vec<(PassKind, usize)>,
+        landings: Vec<usize>,
+        start: Vec<u32>,
+    }
+
+    impl History {
+        fn landed(&self) -> usize {
+            self.landings.iter().sum()
+        }
+
+        /// The runs' contents, not where each began.
+        fn same(&self, o: &History) -> bool {
+            (
+                &self.first,
+                &self.tokens,
+                &self.fnvs,
+                &self.passes,
+                &self.landings,
+            ) == (&o.first, &o.tokens, &o.fnvs, &o.passes, &o.landings)
+        }
+    }
+
+    /// The history from a clear ([`Session::clear`], the residency back to its
+    /// seed): the prompt call, then [`R_STEPS`] greedy steps.
+    fn history(s: &mut Session<Body>, ids: &[u32]) -> Result<History, GateError> {
+        s.clear()?;
+        s.model_mut()
+            .body_parts("(r) history")?
+            .2
+            .take_residency_passes();
+        let start = s.model().body("(r) history")?.hybrid().slots().stage_view();
+        let mut next = s.prompt(ids, Want::Argmax)?.argmax();
+        let mut h = History {
+            first: next,
+            tokens: Vec::with_capacity(R_STEPS),
+            fnvs: Vec::with_capacity(R_STEPS),
+            passes: Vec::new(),
+            landings: Vec::new(),
+            start,
+        };
+        for _ in 0..R_STEPS {
+            let out = s.step(next, Want::Logits)?;
+            if let Out::Logits { row, .. } = out {
+                h.fnvs.push(Fnv1a64::default().f32s(row).value());
+            }
+            next = out.argmax();
+            h.tokens.push(next);
+        }
+        let passes = s
+            .model_mut()
+            .body_parts("(r) history")?
+            .2
+            .take_residency_passes();
+        h.landings = passes.iter().map(|(_, r)| r.landed).collect();
+        h.passes = passes.iter().map(|&(k, r)| (k, r.kept)).collect();
+        println!(
+            "history: prompt {R_PROMPT} + {R_STEPS} steps, {} boundaries, {} flips landed",
+            h.passes.len(),
+            h.landed()
+        );
+        Ok(h)
+    }
+
+    /// (r) off: the load of the clauses above runs no machine, its slot map the
+    /// load's for its life.
+    fn residency_off(m: &Mimo2Model) -> Result<bool, GateError> {
+        let body = m.body("(r) off")?;
+        let (source, machine) = (
+            body.residency_source().is_some(),
+            body.hybrid().swap().is_some(),
+        );
+        let ok = !source && !machine;
+        println!(
+            "(r) off: source {source}, machine {machine} (want neither) {}",
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
+    /// (r) unset on the plan of the gate placement, the seat's own two calls
+    /// ([`residency::at_plan`] over `levers.residency_at`): the serving word
+    /// is the machine, and the gate placement and the steps feed are off.
+    /// Returns the word the load runs and whether the clause held.
+    fn residency_unset(
+        levers: &bloomery_levers::Levers,
+        inputs: &PlanInputs,
+    ) -> Result<(Residency, bool), GateError> {
+        let machine = crate::gate_card::plan_gate(inputs.model.layers);
+        let plan = inputs
+            .plan(&machine, CTX as u64, &PlanLevers::from_levers(levers)?)
+            .map_err(|e| format!("(r) the plan: {e}"))?;
+        let at = |serving_place, prefill_steps| {
+            levers.residency_at(ResidencyAt {
+                serving_place,
+                check_finite: false,
+                route_trace: false,
+                prefill_steps,
+            })
+        };
+        let serving = residency::at_plan(&plan, 0, at(true, false))?;
+        record::residency_lever(serving).print();
+        if let Some(d) = serving.why.detail() {
+            println!("{d}");
+        }
+        let word = Residency::parse(serving.word)?;
+        let on = matches!(word, Residency::Mid { .. })
+            && matches!(
+                serving.why,
+                ResidencyWhy::Place | ResidencyWhy::Shrunk { .. }
+            );
+        let fixed = residency::at_plan(&plan, 0, at(false, false))?;
+        let steps = residency::at_plan(&plan, 0, at(true, true))?;
+        let off = (fixed.word, fixed.why) == ("off", ResidencyWhy::FixedPlace)
+            && (steps.word, steps.why) == ("off", ResidencyWhy::PrefillSteps);
+        println!(
+            "(r) unset: the serving word {} ({}), beside the gate placement {} and the steps feed \
+             {} {}",
+            serving.word,
+            serving.why.name(),
+            fixed.word,
+            steps.word,
+            verdict(on && off)
+        );
+        Ok((word, on && off))
+    }
+
+    /// (r) on: a load at `residency` fed in batches (module doc).
+    fn residency_on(
+        levers: &bloomery_levers::Levers,
+        residency: Residency,
+        man: &RefManifest,
+        toks: &[u32],
+    ) -> Result<bool, GateError> {
+        let (mut s, _) = open_with(Path::new(MODEL), levers, CTX, PrefillMode::Batch, residency)?;
+        s.model_mut().body_parts("(r) on")?.2.log_residency(0);
+        let mut ok = true;
+        {
+            let body = s.model().body("(r) on")?;
+            let started = body.hybrid().swap().is_some();
+            let source = body
+                .residency_source()
+                .ok_or("(r) on: the load runs no source")?;
+            let mut card_layers = 0usize;
+            let mut parts_ok = true;
+            for l in body.host_run() {
+                let parts = source.part_bytes(l);
+                if parts.is_empty() {
+                    continue;
+                }
+                card_layers += 1;
+                parts_ok &= parts == [PART_BYTES; 3]
+                    && (0..3).all(|p| {
+                        source
+                            .card_bytes(l, 0, p)
+                            .is_ok_and(|b| b.len() == PART_BYTES)
+                    });
+            }
+            let structure = started && card_layers > 0 && parts_ok && !source.unpacks();
+            println!(
+                "(r) on: machine started {started}, {card_layers} layers hold card parts of \
+                 {PART_BYTES} B each, all so {parts_ok} {}",
+                verdict(structure)
+            );
+            ok &= structure;
+        }
+        let (_, _, _, long, _) = set_open((D1K, &IK), None)?;
+        let ids = long
+            .get(..R_PROMPT)
+            .ok_or("the 1,024-position prompt is short")?;
+        let first = history(&mut s, ids)?;
+        ok &= passes_clause(&first.passes, R_STEPS);
+        let again = history(&mut s, ids)?;
+        ok &= c1_clause_with(first.tokens.len(), first.landed(), first.same(&again), true);
+        ok &= free(s.model_mut(), man, toks)?;
+        let r = s
+            .residency_reset()?
+            .ok_or("(r) on: the load runs no residency machine")?;
+        let body = s.model().body("(r) on")?;
+        let machine = body
+            .hybrid()
+            .swap()
+            .ok_or("(r) on: the load runs no machine")?;
+        let seed = seeds(machine, body.hybrid().slots().layers())?;
+        ok &= c7_clause(&r, machine, &seed);
+        let back = body.hybrid().slots().stage_view() == first.start;
+        println!("c7: the reset's slot map is the clear's {}", verdict(back));
+        Ok(ok && back)
+    }
+
+    /// (r) on its own loads: the unset word on the gate placement's plan, then
+    /// a load at it ([`residency_on`]).
+    fn residency_arm(levers: &bloomery_levers::Levers) -> Result<bool, GateError> {
+        let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
+        let inputs = PlanInputs::read(&file)?;
+        drop(file);
+        let (word, mut ok) = residency_unset(levers, &inputs)?;
+        let man = RefManifest::open(&data_dir().join(BATCH), &IK)?;
+        let (_, toks, _) = man.step()?;
+        let toks = toks.to_vec();
+        if matches!(word, Residency::Mid { .. }) {
+            ok &= residency_on(levers, word, &man, &toks)?;
+        } else {
+            println!(
+                "(r) on: the unset word is off, no machine to load {}",
+                verdict(false)
+            );
+            ok = false;
+        }
+        Ok(ok)
+    }
+
     // ------------------------------------------------------------ selectors
 
     /// Which clause a run takes.
@@ -785,6 +1069,9 @@ mod gate {
         B,
         /// The resident slots' clauses ([`slots`]), on loads of their own.
         Slots,
+        /// The residency machine's clauses ([`residency_arm`]), on a load of
+        /// its own.
+        Residency,
     }
 
     /// Which step sets (t) and (b) take.
@@ -821,7 +1108,7 @@ mod gate {
         }
     }
 
-    /// `--only s|p|c|t|b|slots`, or every clause.
+    /// `--only s|p|c|t|b|slots|r`, or every clause.
     fn only() -> Result<Only, GateError> {
         match word_after("--only") {
             None => Ok(Only::All),
@@ -832,7 +1119,8 @@ mod gate {
                 Some("t") => Ok(Only::T),
                 Some("b") => Ok(Only::B),
                 Some("slots") => Ok(Only::Slots),
-                other => Err(format!("--only is s, p, c, t, b or slots, not {other:?}").into()),
+                Some("r") => Ok(Only::Residency),
+                other => Err(format!("--only is s, p, c, t, b, slots or r, not {other:?}").into()),
             },
         }
     }
@@ -873,6 +1161,12 @@ mod gate {
             let t = Instant::now();
             let ok = slots(&levers)?;
             elapsed("(slots)", &t);
+            return if ok { Ok(()) } else { Err(checks_failed()) };
+        }
+        if only == Only::Residency {
+            let t = Instant::now();
+            let ok = residency_arm(&levers)?;
+            elapsed("(r)", &t);
             return if ok { Ok(()) } else { Err(checks_failed()) };
         }
         let (mut s, opened) = open(Path::new(MODEL), &levers, CTX)?;
@@ -947,11 +1241,16 @@ mod gate {
             println!("batch feed ({}): {} ran", sets.name(), ran.join(" "));
         }
         if only == Only::All {
-            // The slots' loads take the card with the main one dropped.
+            ok &= residency_off(s.model())?;
+            // The slots' and the residency's loads take the card with the main
+            // one dropped.
             drop(s);
             let t = Instant::now();
             ok &= slots(&levers)?;
             elapsed("(slots)", &t);
+            let t = Instant::now();
+            ok &= residency_arm(&levers)?;
+            elapsed("(r)", &t);
         }
         if ok { Ok(()) } else { Err(checks_failed()) }
     }

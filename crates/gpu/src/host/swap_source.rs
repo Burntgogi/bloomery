@@ -362,7 +362,8 @@ struct LayerParts {
 
 /// What the per-layer parts check reads of one stack name's resident weight
 /// ([`Weights::get`]): `None` when the load holds no weight of the name,
-/// else the resident stack's K-quant type, its words and rows, and its
+/// else the resident stack's file-block type (`DevWeight::KQuant`: a K-quant,
+/// IQ, Q5_1, Q8_0 or MXFP4 stack as the file stores its blocks), its words and rows, and its
 /// buffer's device address. `ty` is `None` — and the words and rows stand
 /// unread — for a weight of another device format, which the check refuses
 /// beside its layer's other parts.
@@ -1138,6 +1139,37 @@ mod tests {
                 assert_eq!(slots, 6);
             }
             other => panic!("layer 1 holds its own parts, not layer 0's, got {other:?}"),
+        }
+    }
+
+    /// An MXFP4 stack is its file's 17-byte blocks, 32 values each, so a part
+    /// is `file_bytes / experts` whatever the type: a gate or up expert is 2,048
+    /// rows of 4,096 values (128 blocks of 17 bytes a row), the down 4,096 rows of
+    /// 2,048 (64 blocks), the three parts the same 4,456,448 bytes, the rows a
+    /// whole number of words, and a card of three experts holds three slots.
+    #[test]
+    fn mxfp4_stacks_hold_whole_experts_in_three_equal_parts() {
+        const PER: u64 = 2048 * 128 * 17;
+        let names = names(&["layer.1.gate", "layer.1.up", "layer.1.down"]);
+        let types = [GgmlType::MXFP4; 3];
+        let t = [
+            stack(1, "layer.1.gate", GgmlType::MXFP4, &[4096, 2048, 8], PER),
+            stack(1, "layer.1.up", GgmlType::MXFP4, &[4096, 2048, 8], PER),
+            stack(1, "layer.1.down", GgmlType::MXFP4, &[2048, 4096, 8], PER),
+        ];
+        let tensors: Vec<Option<&ModelTensor>> = t.iter().map(Some).collect();
+        // Three card experts: 3 · 2,048 rows of 544 words, and 3 · 4,096 rows of 272.
+        let found = [
+            resident(GgmlType::MXFP4, 3 * 2048 * 544, 3 * 2048),
+            resident(GgmlType::MXFP4, 3 * 2048 * 544, 3 * 2048),
+            resident(GgmlType::MXFP4, 3 * 4096 * 272, 3 * 4096),
+        ];
+        match layer_parts(1, &names, &types, &found, &tensors, 8) {
+            Ok(Some((parts, slots))) => {
+                assert_eq!(parts, vec![4_456_448; 3]);
+                assert_eq!(slots, 3);
+            }
+            other => panic!("an MXFP4 layer holds three equal parts, got {other:?}"),
         }
     }
 

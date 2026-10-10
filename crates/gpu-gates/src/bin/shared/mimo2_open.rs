@@ -12,6 +12,7 @@ use std::time::Instant;
 
 use app::arch::mimo2::Mimo2Cfg;
 use app::{Loaded, OpenArgs, OpenLog, Session, SessionError};
+use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::model::StepMode;
 use bloomery_gpu_gates::GateError;
 use bloomery_gpu_gates::flip::tie_allowed;
@@ -82,17 +83,31 @@ impl OpenLog<Body> for Log {
 }
 
 /// The session of `file` at `ctx` positions on the gate placement
-/// (`crate::gate_card::plan_gate`), its prompts fed one step an id.
+/// (`crate::gate_card::plan_gate`), its prompts fed one step an id, no
+/// residency machine.
 pub fn open(
     file: &Path,
     levers: &bloomery_levers::Levers,
     ctx: usize,
 ) -> Result<(Session<Body>, Opened), GateError> {
+    open_with(file, levers, ctx, PrefillMode::Steps, Residency::Off)
+}
+
+/// [`open`] with its prompts fed as `prefill` says, under `residency`: the
+/// steps feed is refused by name beside a machine.
+pub fn open_with(
+    file: &Path,
+    levers: &bloomery_levers::Levers,
+    ctx: usize,
+    prefill: PrefillMode,
+    residency: Residency,
+) -> Result<(Session<Body>, Opened), GateError> {
     let split = Split::open(file).map_err(|e| format!("open {}: {e}", file.display()))?;
     let cfg = Mimo2Cfg {
         place: PlanLevers::from_levers(levers)?,
         host: levers.host(),
-        prefill: PrefillMode::Steps,
+        prefill,
+        residency,
         group: 1,
         slots: NonZeroUsize::MIN,
     };

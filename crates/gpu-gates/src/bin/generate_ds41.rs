@@ -352,7 +352,7 @@ mod drive {
         write_table,
     };
     use bloomery_gpu_gates::record::{self, Record};
-    use bloomery_gpu_gates::{Fnv1a64, GateError, data_dir, ref_model_path, residency41};
+    use bloomery_gpu_gates::{Fnv1a64, GateError, data_dir, ref_model_path, residency};
     use bloomery_levers::{
         CARD_BUDGET, CARD_DONTNEED, CED, CHECK_FINITE, DRAFT, ENGRAM_HELPER, GEN_SLOTS, HOST_LANES,
         HOST_LOCK, HOST_POPULATE, HOSTSTREAM, Levers, MTP_WIDTH, PIN_MAIN, PREFILL, PREFILL_GROUP,
@@ -1134,7 +1134,7 @@ mod drive {
     /// `machine`, the run's `--ctx`, the placement's levers and the resident
     /// `slots` — the open plans with (`Loaded::open` one sequence,
     /// [`open_slots`] several), for the unset residency word to resolve
-    /// against ([`residency41::at_plan`]). Deterministic and milliseconds.
+    /// against ([`residency::at_plan`]). Deterministic and milliseconds.
     /// Returns the plan's per-layer card experts, for the open's own plan to
     /// be checked against ([`Log::plan`]), and the word the plan left.
     fn pre_plan(
@@ -1155,7 +1155,7 @@ mod drive {
             None => inputs.plan(&machine, ctx, place_levers),
         }
         .map_err(|e| GpuError::plan(WHAT, e))?;
-        let pick = residency41::at_plan(&plan, pick)?;
+        let pick = residency::at_plan(&plan, 0, pick)?;
         Ok((Some(plan.n_l.clone()), pick))
     }
 

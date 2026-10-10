@@ -28,7 +28,7 @@
 //! as `generate_ds41` prints them,
 //! then `listening on http://<addr>` once the model is loaded and the port is
 //! bound (`--port 0` binds a free one). `BLOOMERY_RESIDENCY` unset resolves
-//! against the plan the seat prints (`residency41::at_plan`): the plan-side
+//! against the plan the seat prints (`residency::at_plan`): the plan-side
 //! detail on the line beside the lever record when the plan moved or refused
 //! the word. Sampling is the sampler crate's chain
 //! with no repetition penalty; `temperature <= 0` is the engine's argmax, the
@@ -202,7 +202,7 @@ use bloomery_gpu_gates::bind::{
 use bloomery_gpu_gates::generate::{Place, PlaceWhy, mode_name};
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::residency38::{Seqs, checkpoints_reserved, reserve_checkpoints};
-use bloomery_gpu_gates::{GateError, ref_model_path, residency41};
+use bloomery_gpu_gates::{GateError, ref_model_path, residency};
 use bloomery_levers::{ResidencyAt, ResidencyPick, ResidencyWhy};
 use gguf::Split;
 use model::arch::deepseek41::place::PlanInputs;
@@ -731,7 +731,7 @@ fn route_trace(
 /// `slots` resident sequences of `ctx` positions each
 /// (`PlanInputs::plan_with_slots`), on stderr. The
 /// unset residency word resolves against that plan first
-/// ([`residency41::at_plan`]), its `residency lever` record — the plan-side
+/// ([`residency::at_plan`]), its `residency lever` record — the plan-side
 /// detail on the line beside it when the plan moved or refused the word —
 /// before the plan's own record; under the word it resolved to the churn
 /// pool's record follows the plan's, a set word's pool refused by name when
@@ -777,7 +777,7 @@ fn print_plan(
                 },
             )
         })?;
-    let pick = residency41::at_plan(&plan, pick)?;
+    let pick = residency::at_plan(&plan, 0, pick)?;
     record::residency_lever(pick).eprint();
     if let Some(d) = pick.why.detail() {
         eprintln!("{d}");

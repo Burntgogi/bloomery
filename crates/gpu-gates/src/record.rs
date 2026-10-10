@@ -3046,11 +3046,15 @@ pub static BLOOMERY_SERVE_QWEN3: &[&Kind] = &[
 
 /// What the MiMo seat of `bloomery-serve` prints, all on stderr: the
 /// placement and why (`place unset`), a `--hf` fetch's lines (printed by the
-/// server before the seat registers), the plan, the load, the address and
-/// each request's note of the prefix it kept less of than it shared.
+/// server before the seat registers), the residency lever's word and why, the
+/// plan, the churn pool's share of the host under `mid`, the load, the
+/// address and each request's note of the prefix it kept less of than it
+/// shared.
 pub static BLOOMERY_SERVE_MIMO2: &[&Kind] = &[
+    &RESIDENCY_LEVER,
     &PLACE_UNSET,
     &PLAN,
+    &RESIDENCY_HOST,
     &HF_OFFLINE,
     &HF_SET,
     &HF_FILE,

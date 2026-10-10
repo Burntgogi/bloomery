@@ -1,7 +1,8 @@
 //! The MiMo-V2.6-Flash session: [`Body`] behind the session's traits, planned
-//! once by its placement (every routed expert on the host tier) and loaded by
-//! gpumodel's constructor ([`Body::open_placed`]).
-//!
+//! once by its placement (the routed experts the card experts read by the
+//! expert rule, the rest on the host tier) and loaded by gpumodel's
+//! constructor ([`Body::open_placed_slots`]), under adaptive expert residency
+//! or not ([`Mimo2Cfg::residency`]).//!
 //! A prompt is fed as the configuration says ([`Mimo2Cfg::prefill`]): in
 //! batches ([`bloomery_gpu_mimo2::prefill`]) or one decode step an id
 //! ([`GpuModel::step`]), the two leaving the same bits. The caches are per
@@ -14,6 +15,7 @@
 
 use std::num::NonZeroUsize;
 
+use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::{GpuError, GpuModel};
 use bloomery_gpu_mimo2::{Body, PrefillMode};
 use bloomery_levers::HostCfg;
@@ -32,8 +34,12 @@ pub struct Mimo2Cfg {
     pub place: PlanLevers,
     /// The host set's read-in and lock, and the file pages' release.
     pub host: HostCfg,
-    /// How a prompt is fed: in batches, or one decode step per id.
+    /// How a prompt is fed: in batches, or one decode step per id (refused by
+    /// name beside a residency machine).
     pub prefill: PrefillMode,
+    /// The adaptive expert residency the load runs ([`Residency::Off`]: the
+    /// load's slot map for the model's life).
+    pub residency: Residency,
     /// Batches a prompt group runs layer by layer
     /// ([`bloomery_gpu_mimo2::set_prefill_group`]).
     pub group: usize,
@@ -89,7 +95,7 @@ impl Open for Body {
         plan: &Plan<'_>,
         cfg: &Mimo2Cfg,
     ) -> Result<GpuModel<Body>, GpuError> {
-        Body::open_placed_slots(file, plan, inputs, 0, cfg.host, cfg.slots)
+        Body::open_placed_slots(file, plan, inputs, 0, cfg.host, cfg.residency, cfg.slots)
     }
 
     /// The configuration's feed and group; the batch feed's buffers made

@@ -141,8 +141,7 @@ mod gate {
     use bloomery_gpu_gates::record;
     use bloomery_gpu_gates::tier::{self, Tag};
     use bloomery_gpu_gates::{
-        Fnv1a64, GREEDY_MARGIN, GateError, checks_failed, data_dir, ref_model_path, residency41,
-        verdict,
+        Fnv1a64, GREEDY_MARGIN, GateError, checks_failed, data_dir, ref_model_path, verdict,
     };
     use bloomery_levers::{
         CARD_DONTNEED, ENGRAM_HELPER, HOST_POPULATE, R8, ResidencyAt, residency_unset,
@@ -601,7 +600,7 @@ mod gate {
     /// `static`, on its own load: two V4.1 loads never stand at once): the
     /// word the V4.1 seat runs with `BLOOMERY_RESIDENCY` unset on the plan
     /// this load makes — `residency_unset` at a serving placement, then
-    /// [`residency41::at_plan`], the seat's own two calls — loaded under
+    /// [`bloomery_gpu_gates::residency::at_plan`], the seat's own two calls — loaded under
     /// `cfg` otherwise, every seed layer pinning that word's P, and `c1` on
     /// it (`residency::c1_alone`). Where the plan's host takes the churn pool
     /// at P 0 the word is `mid-p0-s1`; where it does not, the first P whose
@@ -632,7 +631,7 @@ mod gate {
             serving_place: true,
             ..ResidencyAt::FIXED
         });
-        let pick = residency41::at_plan(&plan, unset)?;
+        let pick = bloomery_gpu_gates::residency::at_plan(&plan, 0, unset)?;
         record::residency_lever(pick).print();
         if let Some(d) = pick.why.detail() {
             println!("{d}");

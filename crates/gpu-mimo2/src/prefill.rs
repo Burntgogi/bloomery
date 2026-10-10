@@ -57,7 +57,7 @@ use bloomery_gpu::flash_gqa::{GqaK192Args, HEAD, HEAD_K192, window_segments};
 use bloomery_gpu::head::Head;
 use bloomery_gpu::host::BatchLeg;
 use bloomery_gpu::host::run::HostRun;
-use bloomery_gpu::host::served::read_fault;
+use bloomery_gpu::host::served::{prompt_pass, read_fault, refuse_steps_feed};
 use bloomery_gpu::kquant::Act;
 use bloomery_gpu::rope_neox::K192Args;
 use bloomery_gpu::weights::Weights;
@@ -351,12 +351,18 @@ fn check_call(m: &Mimo2Model, ids: &[u32]) -> Result<u32, GpuError> {
 /// Feed `ids` from where `m` stands by the body's mode ([`set_prefill`]) and
 /// return the argmax after the last: [`prefill`] or the steps, each call
 /// refused by name before anything runs when it would pass the stores'
-/// positions, so neither feed stops part of the way there.
+/// positions, so neither feed stops part of the way there. The batch call is
+/// one residency pass ([`prompt_pass`]); the steps feed is refused by name
+/// while a residency machine runs ([`refuse_steps_feed`]).
 pub fn feed(m: &mut Mimo2Model, ids: &[u32]) -> Result<u32, GpuError> {
     check_call(m, ids)?;
-    match m.body(WHAT)?.prompt.mode {
-        PrefillMode::Batch => prefill(m, ids),
-        PrefillMode::Steps => m.step(ids),
+    let body = m.body(WHAT)?;
+    match body.prompt.mode {
+        PrefillMode::Batch => prompt_pass(m, |m| prefill(m, ids)),
+        PrefillMode::Steps => {
+            refuse_steps_feed(body.residency)?;
+            m.step(ids)
+        }
     }
 }
 

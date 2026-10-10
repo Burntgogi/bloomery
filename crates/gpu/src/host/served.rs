@@ -16,10 +16,10 @@ use crate::GpuError;
 use crate::fault::read_cards;
 use crate::host::HostExperts;
 use crate::host::PassKind;
-use crate::host::swap::{BoundaryAt, ResetReport};
+use crate::host::swap::{BoundaryAt, ResetReport, Residency};
 use crate::host::swap_source::ResidencyGlue;
 use crate::hybrid::{Chain, HostResidency, Hybrid, Refusal};
-use crate::model::HostServed;
+use crate::model::{ChainBody, GpuModel, HostServed};
 use crate::tensor::DeviceTensor;
 
 /// A body whose host tier is a [`Hybrid`]: what the shared [`HostServed`]
@@ -169,5 +169,39 @@ pub fn read_fault<E: HostExperts>(
     match read_cards(&[gpu.fault()?, tier]) {
         Some(fault) => Err(GpuError::fault(what, fault)),
         None => Ok(false),
+    }
+}
+
+/// A prompt call `run` of `m` as one residency pass: its boundary before it
+/// and none inside ([`GpuModel::pass_boundary`]), so the slot map is one map
+/// for the whole call, and 0 rows kept after it, whatever it returned — the
+/// residency rule counts decode rows only, and the batch service notes no id.
+/// Nothing more on a load with no residency machine.
+pub fn prompt_pass<B: ChainBody, T>(
+    m: &mut GpuModel<B>,
+    run: impl FnOnce(&mut GpuModel<B>) -> Result<T, GpuError>,
+) -> Result<T, GpuError> {
+    m.pass_boundary()?;
+    let r = run(m);
+    let kept = m.keep_rows(KeptRows::prefix(0), PassKind::Prompt);
+    // The call's own error first: a keep refused after a failed call is its echo.
+    let v = r?;
+    kept?;
+    Ok(v)
+}
+
+/// The steps feed of a prompt call under `residency`, refused by name when a
+/// machine runs: each prompt id would end a decode pass the residency rule
+/// counts, where a prompt call keeps 0 rows ([`prompt_pass`]).
+pub fn refuse_steps_feed(residency: Residency) -> Result<(), GpuError> {
+    match residency {
+        Residency::Off => Ok(()),
+        Residency::Mid { .. } => Err(GpuError::Shape {
+            what: "BLOOMERY_PREFILL",
+            detail: "steps beside BLOOMERY_RESIDENCY: each prompt id would end a decode pass \
+                     the residency rule counts, where the prompt call keeps 0 rows; use \
+                     BLOOMERY_PREFILL=batch or BLOOMERY_RESIDENCY=off"
+                .to_string(),
+        }),
     }
 }

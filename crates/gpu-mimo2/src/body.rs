@@ -33,11 +33,14 @@ use std::sync::Arc;
 
 use bloomery_gpu::flash_gqa::{self, FlashGqaKernels, HEAD, HEAD_K192};
 use bloomery_gpu::head::Head;
+use bloomery_gpu::host::PassKind;
 use bloomery_gpu::host::handoff::HandoffKernels;
 use bloomery_gpu::host::run::{HostRun, HostWidths};
 use bloomery_gpu::host::served::{ResidencyParts, TierBody};
+use bloomery_gpu::host::swap::{PassReport, Residency};
+use bloomery_gpu::host::swap_source::{FileSwap, ResidencyGlue, ResidencySpec};
 use bloomery_gpu::hybrid::{Boundary, BoundaryShape, Chain, HostResidency, Hybrid, SlotMap};
-use bloomery_gpu::model::{ChainBody, Rollback, Slots, StepMode, refuse_scratch_past};
+use bloomery_gpu::model::{ChainBody, HostServed, Rollback, Slots, StepMode, refuse_scratch_past};
 use bloomery_gpu::rope_neox::{ROT_K192, RopeNeoxKernels};
 use bloomery_gpu::rope_table::{RopeRows, RopeSpec, RopeTable};
 use bloomery_gpu::weights::{DevWeight, Weights};
@@ -59,6 +62,7 @@ use crate::attn::{AttnNames, checked_sinks};
 use crate::card::CardExperts;
 use crate::ffn::{FfnNames, routed_layers};
 use crate::program;
+use crate::swap;
 
 #[path = "prefill.rs"]
 pub mod prefill;
@@ -302,8 +306,9 @@ pub struct Body {
     stores: Vec<Store>,
     /// One table a distinct rope base.
     ropes: Vec<RopeBase>,
-    /// The slot map's card copy, the host run's rows: every entry the host
-    /// mark. The host tier holds the host copy.
+    /// The slot map's card copy, the host run's rows. The host tier holds the
+    /// host copy, and the residency machine, when the load runs one, moves
+    /// both.
     slots: Arc<DeviceTensor<u32>>,
     embd: Embedding,
     /// Each layer's output after the last step, when a gate armed them.
@@ -316,6 +321,13 @@ pub struct Body {
     /// ([`Body::open_placed_slots`]), and the ones made so far.
     slots_planned: usize,
     slots_made: usize,
+    /// The load's residency side ([`ResidencyGlue`]): the machine's source and
+    /// shape, which [`HostServed::start_residency`] starts once the body's
+    /// pieces are sized; [`ResidencyGlue::off`] under [`Residency::Off`].
+    residency_glue: ResidencyGlue,
+    /// The residency the body was loaded with: `off` keeps the load's slot map
+    /// for the model's life.
+    residency: Residency,
 }
 
 /// The walk's parts, lent apart from the host tier.
@@ -490,11 +502,11 @@ impl Body {
     /// Card `card` of `plan`, which `inputs` made, resident: the layers' weights
     /// the plan puts on the card, the stores at the plan's `ctx_max`, the host
     /// tier over every routed layer and the embedding as a host row; the load's
-    /// slot map for the model's life. Refused by name (module doc): a plan of
-    /// other than one card or with an expert tier, card experts the resident
-    /// stacks do not hold, a layer or a width no kernel here runs, routed
-    /// layers that are not one run, stores whose bytes are not the plan's, and
-    /// the machine's own refusals at the load.
+    /// slot map for the model's life ([`Residency::Off`]). Refused by name
+    /// (module doc): a plan of other than one card or with an expert tier,
+    /// card experts the resident stacks do not hold, a layer or a width no
+    /// kernel here runs, routed layers that are not one run, stores whose
+    /// bytes are not the plan's, and the machine's own refusals at the load.
     pub fn open_placed(
         file: Split,
         plan: &Plan<'_>,
@@ -502,7 +514,15 @@ impl Body {
         card: usize,
         host: HostCfg,
     ) -> Result<Mimo2Model, GpuError> {
-        Body::open_placed_slots(file, plan, inputs, card, host, NonZeroUsize::MIN)
+        Body::open_placed_slots(
+            file,
+            plan,
+            inputs,
+            card,
+            host,
+            Residency::Off,
+            NonZeroUsize::MIN,
+        )
     }
 
     /// [`Body::open_placed`] by a plan that counts `slots` resident
@@ -512,28 +532,44 @@ impl Body {
     /// name ([`Slots::new_seq`]) — a sequence the plan did not count is card
     /// memory nothing reserved. A plan that counts another number of
     /// sequences is refused by name at the load.
+    ///
+    /// Under `residency` ([`ResidencySpec`]) the host set also holds each
+    /// layer's churn pool ([`GpuModel::load_placed_with`]) and the body starts
+    /// the machine over its slot map once its pieces are sized
+    /// ([`HostServed::start_residency`]); [`Residency::Off`] keeps the load's
+    /// slot map for the model's life.
     pub fn open_placed_slots(
         file: Split,
         plan: &Plan<'_>,
         inputs: &PlanInputs,
         card: usize,
         host: HostCfg,
+        residency: Residency,
         slots: NonZeroUsize,
     ) -> Result<Mimo2Model, GpuError> {
-        GpuModel::load_placed(
+        let spec = ResidencySpec {
+            lever: residency,
+            delay: swap::LIVE_DELAY,
+            deadline: swap::DEADLINE,
+            top_k: N_USED,
+            max_rows: swap::LOAD_ROWS,
+            stacks: Arc::new(swap::stacks(inputs)?),
+        };
+        GpuModel::load_placed_with(
             file,
             plan,
             card,
             host,
+            spec,
             |_, _, _, _| Ok(()),
-            |gpu, file, w, set| {
+            |gpu, file, w, set, glue| {
                 Body::load(
                     gpu,
-                    Arc::new(file),
+                    Arc::clone(file),
                     w,
                     (plan, inputs, card),
                     host,
-                    set,
+                    (set, glue, residency),
                     slots,
                 )
             },
@@ -543,14 +579,15 @@ impl Body {
     /// The body of card `card`: its layers' programs and values from the
     /// plan's description, the stores at the plan's `ctx_max`, the step's
     /// buffers, the slot map the plan's routed segments make and the host tier
-    /// over the routed run.
+    /// over the routed run. `residency` is the host set the load read in, the
+    /// residency glue and the lever it was made under.
     fn load(
         gpu: &Gpu,
         file: Arc<Split>,
         w: &Weights,
         (plan, inputs, card): (&Plan<'_>, &PlanInputs, usize),
         host: HostCfg,
-        residency: HostResidency,
+        (set, glue, lever): (HostResidency, ResidencyGlue, Residency),
         seqs: NonZeroUsize,
     ) -> Result<Body, GpuError> {
         let (hp, spec) = (&inputs.hp, &inputs.spec);
@@ -682,7 +719,7 @@ impl Body {
         )?;
         let mut hybrid = Hybrid::new(boundary, map, experts, run.len())?;
         hybrid.watch_fault(gpu.fault_word())?;
-        hybrid.keep_residency(residency);
+        hybrid.keep_residency(set);
         let embd = Embedding::new(file, dims.embd)?;
         if embd.table.n_vocab() != hp.n_vocab {
             return Err(shape(format!(
@@ -691,7 +728,7 @@ impl Body {
                 hp.n_vocab
             )));
         }
-        let body = Body {
+        let mut body = Body {
             hybrid,
             layers,
             cfg,
@@ -709,6 +746,8 @@ impl Body {
             prompt: PromptState::new(),
             slots_planned: seqs.get(),
             slots_made: 1,
+            residency_glue: glue,
+            residency: lever,
         };
         refuse_scratch_past(
             WHAT,
@@ -718,6 +757,9 @@ impl Body {
             "the step's buffers, the card experts' buffers, the rope tables, the host \
              boundary, the slot map's copy",
         )?;
+        // Last: the machine frees each layer's spare slots, and every piece
+        // above sized itself from the load's map, capacity = live.
+        body.start_residency(gpu)?;
         Ok(body)
     }
 
@@ -827,6 +869,26 @@ impl Body {
     /// The host tier, for a gate's instrument or test seam.
     pub fn hybrid_mut(&mut self) -> &mut Hybrid<HostRun> {
         &mut self.hybrid
+    }
+
+    /// Keep every residency boundary's report from now on, for
+    /// [`Body::take_residency_passes`]: a binary that prints the `residency
+    /// pass` records, or a gate that counts flips, asks once, with the
+    /// boundaries it takes at most between two takes, `passes`.
+    pub fn log_residency(&mut self, passes: usize) {
+        self.residency_glue.log_passes(passes);
+    }
+
+    /// The residency machine's source, when the load runs one.
+    #[must_use]
+    pub fn residency_source(&self) -> Option<&FileSwap> {
+        self.residency_glue.source()
+    }
+
+    /// The residency boundaries' reports since the last take, in order, each
+    /// with the kind of the pass it ended.
+    pub fn take_residency_passes(&mut self) -> Vec<(PassKind, PassReport)> {
+        self.residency_glue.take_passes()
     }
 
     /// Arm (or disarm) the per-layer taps: after each layer the chain copies
@@ -970,14 +1032,26 @@ impl TierBody for Body {
         &mut self.hybrid
     }
 
-    /// MiMo runs no residency machine: the load's slot map for the model's
-    /// life.
     fn residency_parts(&mut self) -> Option<ResidencyParts<'_, HostRun>> {
-        None
+        Some(ResidencyParts {
+            glue: &mut self.residency_glue,
+            hybrid: &mut self.hybrid,
+            slots: &self.slots,
+        })
     }
 
     fn serve_chain(&mut self, chain: Chain) -> Result<(), GpuError> {
         self.hybrid.serve_captured_of(chain)
+    }
+}
+
+impl Drop for Body {
+    /// The residency machine stops before any field frees card or pinned
+    /// memory ([`Hybrid::stop_swap`]): the host tier is the first field and
+    /// stops it in its own drop, and this holds that order as the machine's
+    /// rule rather than the field list's.
+    fn drop(&mut self) {
+        self.hybrid.stop_swap();
     }
 }
 
@@ -1043,7 +1117,8 @@ impl Slots for Body {
     /// device work. Nothing is in flight to drain first: every call ends on
     /// a synchronized readback (the token, the prompt's fault word), and the
     /// host tier keeps no state of a sequence (the rows of a step are
-    /// consumed inside it, and no residency machine runs).
+    /// consumed inside it, and a residency machine's map and boundaries are the
+    /// load's, counted by passes whichever slot runs them).
     fn swap_seq(&mut self, _gpu: &Gpu, seq: &mut Seq) -> Result<(), GpuError> {
         std::mem::swap(&mut self.stores, &mut seq.stores);
         Ok(())
