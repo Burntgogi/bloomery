@@ -1,0 +1,58 @@
+# T1 R1c's same-lease A/B: the split prompt walk (one ubatch walked as two units of half its rows, each unit's next
+# front enqueued ahead of the shadows in unit order, one pick a card layer from the first unit's counts at twice,
+# the expert stream shared by the group) against the same binary with the walk off. Derived on the Mac
+# (design-t1 t1sim.py/t1sim3.py, an event model of the engine's in-order stream, copy stream and walk thread over
+# the evaluator's per-layer terms): on the A6000 plan (a) at P 4096 the walk is card-stream bound after the split
+# (F 25.12 + D 1.91 + U 1.68 + B 0.24 + tail 4.54 = 33.5 ms a layer against 50.7 today): +47 % at the evaluator's
+# copies (12.24 ms), +42 % at q0's (16.8 ms, the A-chain binds); applied to the measured base (1,673, rel028-ab)
+# the low edge is +36 %. The width rule (runtime::splitwalk::pays at wide38's SPLIT_COSTS, the card row cost
+# scaled to the A6000's 84 SMs) splits P 4096 and P 2048 and not P 512 on this plan [derived: 7.07 us x 4096 =
+# 28,959 us against 1.5 x (2,600 + 5.7 x listed + 920) <= 1.5 x (3,520 + 5.7 x 512) = 9,658 us at the most host
+# experts a layer of 512; at P 512, 3,620 us against at least 5,280 us].
+# Runner (the lead's): BLOOMERY_AB_ROUNDS=2 BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/t1-split-pp.card'
+#   just depth-gpu-qwen4exp prose:4096 prose:4096@BLOOMERY_SPLIT_WALK=off prose:512 prose:512@BLOOMERY_SPLIT_WALK=off
+#   BLOOMERY_AB_LOAD=arm, and an untimed functional run of the bare arm under BLOOMERY_STEP_STATS=1 for the
+#   condition's records. The ratio line's bare arm is the changed one (the rule), the @off arm the base.
+kind: ab
+question: does walking a P 4096 ubatch as two units hide the card's serial front under the host union on the A6000?
+term: pp tok/s @ prose:4096, ctx 4352, A6000, plan (a), every lever unset (residency mid-p0-s1, split, MTP draft),
+  UD-Q4_K_XL, unset (the split walk by its width rule) against BLOOMERY_SPLIT_WALK=off, paired by round
+unit: %
+predict: +36..+47
+rounds: 2
+sd: 0.78 % derived from rig-log 10-09#rel028-ab (P 4096 ratio 1.193 +- 0.021 at 4 paired rounds, paired SD 1.11 %,
+  over sqrt(2) for one run), prefill1-ab.card's derivation
+condition: one lease, BLOOMERY_AB_LOAD=arm, BLOOMERY_STEP_STATS=1 on a third untimed arm only; every split arm's
+  P 4096 call carries two units a ubatch (stat prompt lb rows unit=0 and unit=1, 2,048 columns each, stat prompt
+  split walks=1 ubatches=2), one call stream pick a card layer, and on every layer unit 0's card_gap_ms at least
+  unit 1's card_front_ms + card_down_ms (the fronts' order in effect); every off arm one unit (unit=0 rows only,
+  walks equal to ubatches; its card_gap_ms is the stream's wait for the shadow's enqueue, and card_shadow_ms runs
+  from the shadow's first launch on both arms); the P 512 arms one unit on both sides (the rule does not split
+  there); no [cold], [cpu-busy] or [other-busy] row. prose:512 rides beside, recorded not judged (0 % by the
+  rule's answer)
+decide-in: land R1c with the walk on by its rule; the A6000 row is card-stream bound: the next lever is the card
+  front (ppgap levers 3 and 4), and R2 (the walk's price) only if the untimed arm reads the A-chain above the stream
+decide-below: read the untimed arm's per-unit rows: unit 0's card_gap_ms short of unit 1's front and download
+  means the order is not in effect (a shadow wait ahead of the front); copies past F(B) mean the A-chain binds:
+  open R2 before landing the default
+decide-above: the base was host- or copy-bound more than the model says: re-fit the A6000 terms from the untimed
+  arm before the 3090 row is predicted
+# result 2026-10-11 (the lead's A/B, one lease, A6000, plan (a), 2 rounds; sources: the lead's ab-split.log, t1miss's miss-report):
+#   pp tok/s @ prose:4096: split 2100.4 against off 1666.5 = +26.0 % (r1 +27.0, r2 +25.1), below the band +36..+47 by
+#   value, so decide-below's trigger is read from the records, not the value. prose:512 +0.3 % (one unit on both
+#   sides, the rule's answer). Decode after the split prompt: pass ratio 0.973, tok/s ratio 0.926: the MTP verify-width
+#   mix of two 95-96 token samples (width-4 passes 33.4-33.7 ms in both arms), not a pass-speed effect.
+# t1miss, the one term the band put low: the card's tail (the shared expert and the card route) is 8.1 ms a layer at
+#   4,096 rows (4.05 a 2,048-row unit; GDN layers 4.07, QSA 4.01), not the header's 4.54: the route is per-column bound
+#   (about 57 columns an expert, 3.6 ms a unit against 1.4 ms of weight reads), so the second unit pays it in full.
+#   With 8.1 the event model closes both arms (off 51.19 against 51.2 measured; split F 25.35 + D 1.96 + U 1.68 +
+#   B 0.26 + tail 8.1 = 37.4 of 40.6 ms a layer, the stream 92 % busy). F, D and B matched the header within 1 %.
+#   The rest of the miss: per-layer kinds 1.7 ms, the QSA fronts' imbalance (A 9, B 32 ms) and B's +27 % host slots
+#   1.3, the walk thread's pick and enqueue 0.4.
+# condition read from the untimed functional arm (contended: box load 22-23, read for structure, not for ms): two
+#   units a ubatch with 2,048 columns on 48 of 48 layers, one call stream pick a card layer (48), unit 0's card_gap_ms
+#   at least unit 1's front and download on 48 of 48 (margin min 0.00, mean 16.07 ms), the copies at most 0.4 % of
+#   the wall in the replay: the order is in effect and the A-chain does not bind.
+# next action taken: decide-in. R1c lands with the walk on; the next levers by derived pass-through are the card front
+#   and the card route's per-column cost (78 % of a card ms reaches the wall), then the host union and pick/enqueue
+#   (35-37 %); R2 stays closed. The 3090 row's prediction carries the same low tail [derived, not checked there].

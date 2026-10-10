@@ -99,6 +99,9 @@ pub struct ServeNote {
     pub cols: usize,
     /// Host slots the union listed.
     pub slots: u64,
+    /// Host slots the columns listed whose expert the expert stream's
+    /// exclusion set left out.
+    pub excluded: u64,
     /// The union's per-expert column counts.
     pub union_cols: UnionCols,
     /// The union call's wall.
@@ -278,8 +281,13 @@ pub struct BatchLeg<'a, H: HostExperts> {
     hybrid: &'a mut HostTier<H>,
     hsum: &'a mut DeviceBuffer<f32>,
     cap: usize,
-    /// The units' columns or rows, and the open walk's columns.
-    shape: UnitShape<'a>,
+    /// The open walk's columns.
+    cols: usize,
+    /// Each unit's columns, when the walk set them.
+    unit_cols: Option<&'a [usize]>,
+    /// Each unit's rows of the block, when the walk set them: the leg's own
+    /// copy, so a walk that cuts its rows as it starts can name them.
+    unit_rows: Option<Vec<Range<usize>>>,
     /// The walk's timing, when it set one ([`BatchLeg::set_timer`]).
     timer: Option<&'a mut dyn LegTimer>,
 }
@@ -299,7 +307,9 @@ impl<'a, H: HostExperts> BatchLeg<'a, H> {
             hybrid,
             hsum,
             cap,
-            shape: UnitShape::default(),
+            cols: 0,
+            unit_cols: None,
+            unit_rows: None,
             timer: None,
         }
     }
@@ -314,7 +324,7 @@ impl<'a, H: HostExperts> BatchLeg<'a, H> {
     /// [`Port::open_ordered`] refuses by name a list that is not one entry a
     /// unit, each in `1..=` the walk's columns.
     pub fn set_unit_cols(&mut self, cols: &'a [usize]) {
-        self.shape.unit_cols = Some(cols);
+        self.unit_cols = Some(cols);
     }
 
     /// Each unit's own rows of the block the walk's routing and sums are held
@@ -324,9 +334,18 @@ impl<'a, H: HostExperts> BatchLeg<'a, H> {
     /// refuses by name a list that is not one non-empty range a unit,
     /// ascending and not overlapping, each no wider than the walk's columns
     /// and ending within the leg's `cap` rows, and a walk that set the units'
-    /// columns as well.
-    pub fn set_unit_rows(&mut self, rows: &'a [Range<usize>]) {
-        self.shape.unit_rows = Some(rows);
+    /// columns as well. The leg keeps its own copy of the list.
+    pub fn set_unit_rows(&mut self, rows: &[Range<usize>]) {
+        self.unit_rows = Some(rows.to_vec());
+    }
+
+    /// The units' columns or rows the walk set, and the open walk's columns.
+    fn shape(&self) -> UnitShape<'_> {
+        UnitShape {
+            cols: self.cols,
+            unit_cols: self.unit_cols,
+            unit_rows: self.unit_rows.as_deref(),
+        }
     }
 
     /// The tier, for a layer program's download.
@@ -349,7 +368,7 @@ impl<'a, H: HostExperts> BatchLeg<'a, H> {
     /// label within its group, and the port picks its exchange set in turn.
     #[must_use]
     pub fn key(&self, at: At) -> BatchKey {
-        self.shape.key(at)
+        self.shape().key(at)
     }
 
     /// Mark `site` of `at`'s part on the stream, in the architecture's own
@@ -452,8 +471,8 @@ impl<H: HostExperts> Port for BatchLeg<'_, H> {
     /// caller leaves nothing of an earlier walk in flight); any other point
     /// is refused by name.
     fn open_ordered(&mut self, o: Overlap, order: BatchOrder) -> Result<(), GpuError> {
-        refuse_open(o, order, self.cap, &self.shape)?;
-        self.shape.cols = o.cols;
+        refuse_open(o, order, self.cap, &self.shape())?;
+        self.cols = o.cols;
         self.hybrid.begin_group()
     }
 
@@ -489,6 +508,9 @@ impl<H: HostExperts> Port for BatchLeg<'_, H> {
             slots: after
                 .batch_host_slots
                 .saturating_sub(before.batch_host_slots),
+            excluded: after
+                .batch_excluded_slots
+                .saturating_sub(before.batch_excluded_slots),
             union_cols,
             union_ns: after.batch_ns.saturating_sub(before.batch_ns),
             times,

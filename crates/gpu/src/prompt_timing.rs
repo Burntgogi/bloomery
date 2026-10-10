@@ -21,7 +21,10 @@ const WHAT: &str = "prompt batch walk timing";
 /// them: the front's first launch, the front's last launch before the route's
 /// downloads, the downloads' end (the card route, on a card layer, and the
 /// shared expert's launches follow), the shared expert's last launch, the
-/// sums' upload, the gated sum.
+/// sums' upload, the gated sum. A walk whose shadow can follow another
+/// unit's parts on the stream (`runtime::sched::BatchOrder::Fronts`) also
+/// marks the shadow's first launch ([`Mark::ShadowStart`]); a walk that does
+/// not leaves it unrecorded.
 #[derive(Clone, Copy)]
 pub enum Mark {
     Front = 0,
@@ -30,10 +33,11 @@ pub enum Mark {
     Shadow = 3,
     Upload = 4,
     Back = 5,
+    ShadowStart = 6,
 }
 
 /// The marks one layer-batch's card time reads, one a part boundary.
-const MARKS: usize = 6;
+const MARKS: usize = 7;
 
 /// `d` in whole nanoseconds, saturating.
 #[must_use]
@@ -41,9 +45,10 @@ pub fn nanos(d: Duration) -> u64 {
     u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
 }
 
-/// One layer-batch of a walk in progress: the serve's host time and the
-/// union's per-expert column counts. The card times and the parts' enqueue
-/// walls are read once the walk's last mark is waited for.
+/// One layer-batch of a walk in progress: the serve's host time, the
+/// union's per-expert column counts and the host slots the expert stream's
+/// exclusion left out. The card times and the parts' enqueue walls are read
+/// once the walk's last mark is waited for.
 struct Served {
     unit: usize,
     layer: usize,
@@ -54,6 +59,7 @@ struct Served {
     m_hot: usize,
     cols_hot: usize,
     m_sq: u64,
+    excluded: u64,
     wait_ns: u64,
     union_ns: u64,
     serve_ns: u64,
@@ -75,6 +81,8 @@ pub struct PromptLb {
     /// The prompt's batch, from 0: the batches the walks before ran, plus
     /// the unit within its walk.
     pub b: u64,
+    /// The unit within its walk.
+    pub unit: usize,
     pub layer: usize,
     /// The unit's columns.
     pub cols: usize,
@@ -90,6 +98,9 @@ pub struct PromptLb {
     pub cols_hot: usize,
     /// `Σ m²` over the listed experts.
     pub m_sq: u64,
+    /// Host slots the columns listed whose expert the expert stream sent to
+    /// the card, which the serve left out.
+    pub excluded: u64,
     pub wait_ns: u64,
     pub union_ns: u64,
     pub serve_ns: u64,
@@ -98,9 +109,16 @@ pub struct PromptLb {
     pub enqueue_ns: u64,
     pub front_ms: f64,
     pub down_ms: f64,
+    /// From the shadow's first launch where the walk marks it
+    /// ([`Mark::ShadowStart`]), else from the downloads' end, to the shadow's
+    /// last launch.
     pub shadow_ms: f64,
     pub upload_ms: f64,
     pub back_ms: f64,
+    /// Where the walk marks its shadow's first launch: the stream's time from
+    /// the downloads' end to it — the other units' parts the walk's order put
+    /// between them.
+    pub gap_ms: Option<f64>,
 }
 
 /// A prompt's batch walks under the armed timing: the batches and
@@ -113,6 +131,8 @@ pub struct PromptLb {
 pub struct PromptStats {
     /// Batches walked, a unit each.
     pub ubatches: u64,
+    /// The walks those batches ran in.
+    pub walks: u64,
     pub prologue_ns: u64,
     pub walk_ns: u64,
     pub fault_ns: u64,
@@ -133,7 +153,11 @@ pub struct PromptTiming {
     done: Vec<PromptLb>,
     /// The host wall the parts took to enqueue, a (layer, unit) each.
     enqueue_ns: Vec<u64>,
+    /// The sites the walk in progress recorded, a bit a [`Mark`], a (layer,
+    /// unit) each.
+    recorded: Vec<u8>,
     batches: u64,
+    walks: u64,
     prologue_ns: u64,
     walk_ns: u64,
     fault_ns: u64,
@@ -168,7 +192,9 @@ impl PromptTiming {
             rows: Vec::new(),
             done: Vec::new(),
             enqueue_ns: vec![0; layers * units],
+            recorded: vec![0; layers * units],
             batches: 0,
+            walks: 0,
             prologue_ns: 0,
             walk_ns: 0,
             fault_ns: 0,
@@ -207,6 +233,7 @@ impl PromptTiming {
         }
         Some(PromptStats {
             ubatches: std::mem::take(&mut self.batches),
+            walks: std::mem::take(&mut self.walks),
             prologue_ns: std::mem::take(&mut self.prologue_ns),
             walk_ns: std::mem::take(&mut self.walk_ns),
             fault_ns: std::mem::take(&mut self.fault_ns),
@@ -235,7 +262,8 @@ impl PromptTiming {
 
     /// Mark `site` of `at` on the stream, in [`Mark`]'s layout.
     fn record(&mut self, stream: &CudaStream, at: At, site: usize) -> Result<(), GpuError> {
-        let i = self.slot(at)? * MARKS + site;
+        let slot = self.slot(at)?;
+        let i = slot * MARKS + site;
         let Some(mark) = self.marks.get(i).filter(|_| site < MARKS) else {
             return Err(GpuError::shape(
                 WHAT,
@@ -243,6 +271,7 @@ impl PromptTiming {
             ));
         };
         mark.record(stream)?;
+        self.recorded[slot] |= 1 << site;
         self.last = Some(i);
         Ok(())
     }
@@ -271,8 +300,15 @@ impl PromptTiming {
             let span = |a: Mark, b: Mark| -> Result<f64, GpuError> {
                 Ok(f64::from(m[a as usize].elapsed_ms(&m[b as usize])?))
             };
+            let started = self.recorded[i] & (1 << Mark::ShadowStart as usize) != 0;
+            let shadow_from = if started {
+                Mark::ShadowStart
+            } else {
+                Mark::Down
+            };
             self.done.push(PromptLb {
                 b: self.batches + row.unit as u64,
+                unit: row.unit,
                 layer: row.layer,
                 cols: row.cols,
                 slots: row.slots,
@@ -281,19 +317,25 @@ impl PromptTiming {
                 m_hot: row.m_hot,
                 cols_hot: row.cols_hot,
                 m_sq: row.m_sq,
+                excluded: row.excluded,
                 wait_ns: row.wait_ns,
                 union_ns: row.union_ns,
                 serve_ns: row.serve_ns,
                 enqueue_ns: self.enqueue_ns[i],
                 front_ms: span(Mark::Front, Mark::FrontEnd)?,
                 down_ms: span(Mark::FrontEnd, Mark::Down)?,
-                shadow_ms: span(Mark::Down, Mark::Shadow)?,
+                shadow_ms: span(shadow_from, Mark::Shadow)?,
                 upload_ms: span(Mark::Shadow, Mark::Upload)?,
                 back_ms: span(Mark::Upload, Mark::Back)?,
+                gap_ms: started
+                    .then(|| span(Mark::Down, Mark::ShadowStart))
+                    .transpose()?,
             });
         }
         self.enqueue_ns.fill(0);
+        self.recorded.fill(0);
         self.batches += self.walk_units as u64;
+        self.walks += 1;
         self.walk_ns += wall;
         Ok(())
     }
@@ -320,6 +362,7 @@ impl LegTimer for PromptTiming {
             m_hot: note.union_cols.m_hot,
             cols_hot: note.union_cols.cols_hot,
             m_sq: note.union_cols.m_sq,
+            excluded: note.excluded,
             wait_ns: note.times.wait_ns,
             union_ns: note.union_ns,
             serve_ns: note.serve_ns,
@@ -353,6 +396,7 @@ impl LegTimer for PromptTiming {
         }
         self.rows.clear();
         self.enqueue_ns.fill(0);
+        self.recorded.fill(0);
         self.walk_units = units;
         self.last = None;
         self.walk_t0 = Some(Instant::now());

@@ -54,6 +54,14 @@
 //!   refused outside a call, into another layer, twice, and after a read
 //!   (mutants: a join that adds no unit, a read that closes at the first, an
 //!   end that forgets the second unit's read).
+//! - fronts: the batch walk's declared order ([`GROUP_WALK_ORDER`]) driven over
+//!   one layer of two units, with every fill thread held [`LANE_HOLD`] a job:
+//!   the first unit's shadow picks the layer's stream and waits for its
+//!   first batch's landing on the engine stream, and the second unit's front
+//!   is marked on that stream before the landing's mark, by at least half
+//!   the hold — the landing waits behind the second unit's front, never the
+//!   front behind the landing (mutant: the order `Ahead`, whose second
+//!   front follows the first unit's shadow).
 //! - backlog deadline: a lane whose one fill thread is held in its source
 //!   past the deadline, fed more jobs than its staging slots, is a named
 //!   error within the deadline and a half (its mutant: the wait without its
@@ -83,11 +91,13 @@ mod gate {
     use bloomery_gpu::host::slots::HOST;
     use bloomery_gpu::host::swap::{Piece, SwapSource, Transform};
     use bloomery_gpu::host::xstream::{
-        Costs, PARTS, RingLayer, XCfg, XSTREAM_ROOM, XStream, land_batch_size, stream_tail,
+        Costs, GROUP_WALK_ORDER, PARTS, RingLayer, XCfg, XSTREAM_ROOM, XStream, land_batch_size,
+        stream_tail,
     };
     use bloomery_gpu::{Gpu, GpuError, HostFlags};
     use bloomery_gpu_gates::{GateError, checks_failed, verdict};
     use cuda_core::{CudaStream, DeviceBuffer, sys};
+    use runtime::sched::{Item, Overlap, PortKind, order_in};
     use runtime::xsplit::{Constants, Split};
 
     const L: usize = 2;
@@ -599,6 +609,60 @@ mod gate {
             verdict(shared_ok)
         );
         ok &= shared_ok;
+
+        // fronts: layer 0 of two units in the walk's declared order, the
+        // lane held past the first unit's shadow.
+        let new_event = || ctx.new_event(Some(sys::CUevent_flags_enum_CU_EVENT_DEFAULT));
+        let (origin, front_b, landed_a) = (new_event()?, new_event()?, new_event()?);
+        x.begin_call();
+        x.delay_lane(LANE_HOLD);
+        origin.record(stream)?;
+        let mut streamed = 0;
+        let mut batches = 0;
+        let walk = Overlap {
+            units: 2,
+            cols: COLS,
+            port: PortKind::Batch,
+        };
+        for item in order_in(walk, 1, GROUP_WALK_ORDER) {
+            match item {
+                Item::Front(at) if at.unit == 1 => front_b.record(stream)?,
+                Item::Shadow(at) if at.unit == 0 => {
+                    streamed = unit(&mut x, stream, 0, &counts(UNIT_A))?.streamed;
+                    x.share(0, unit_key(0, 1))?;
+                    let r = x
+                        .ring_layer(0)
+                        .ok_or("a ring view of a layer that streamed")?;
+                    batches = r.batches.len();
+                    let e = r
+                        .batches
+                        .first()
+                        .and_then(|b| b.event.as_deref())
+                        .ok_or("a landing event on the layer's first batch")?;
+                    stream.wait(e)?;
+                    landed_a.record(stream)?;
+                    x.wait_layer(stream, 0)?;
+                }
+                Item::Back(_) => x.read(0, stream)?,
+                _ => {}
+            }
+        }
+        x.delay_lane(Duration::ZERO);
+        stream.synchronize()?;
+        let (t_front, t_landed) = (origin.elapsed_ms(&front_b)?, origin.elapsed_ms(&landed_a)?);
+        x.end_call()?;
+        let lead_ms = LANE_HOLD.as_secs_f32() * 500.0;
+        let fronts_ok = streamed > 0 && batches > 1 && t_landed - t_front >= lead_ms;
+        println!(
+            "fronts: the walk's declared order {GROUP_WALK_ORDER:?} over one layer of two units, every \
+             fill thread held {LANE_HOLD:?} a job: {streamed} slots streamed in {batches} \
+             batches, the second unit's front marked {:.1} ms before the first unit's first \
+             batch lands (want at least {:.1}) {}",
+            t_landed - t_front,
+            lead_ms,
+            verdict(fronts_ok)
+        );
+        ok &= fronts_ok;
         drop(x);
 
         // backlog deadline
@@ -657,7 +721,8 @@ mod gate {
                  its rows and exclusion set say so, the engine stream reads a batch's slots only \
                  once that batch's copies have landed (a batch a third of them), a half's next \
                  stream waits for the half's read, an unread stream refuses the call's end, \
-                 units of a layer share its stream and close it at the last read, a \
+                 units of a layer share its stream and close it at the last read, the \
+                 walk's order marks a unit's front before its sibling's landing, a \
                  stuck lane is a named error within its deadline, and a ring with no room is \
                  refused by its own name."
             );

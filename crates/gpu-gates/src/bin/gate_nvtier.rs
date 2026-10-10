@@ -131,6 +131,11 @@
 //!   less releases — are the ones the seam finds filled and the resident
 //!   bytes hold, within the fills the lane's threads had in flight at the
 //!   read.
+//! - `split` (the split walk, `Body38::set_split_walk`): the paged arm's
+//!   load walks its ubatches as one unit and refuses a split by the width
+//!   rule by name (an NVMe-paged plan), its cut left one unit; the all-RAM
+//!   arm's load takes the rule (mutant: the load's paged call removed — the
+//!   paged arm takes the rule too).
 //! - `census` (the instrument the next rounds read): each phase's
 //!   `tier census` record — the paged arm's prompt call and its steps, the
 //!   `stepunion` arms' passes — with its picks a token by where they were
@@ -187,8 +192,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use app::Session;
-use bloomery_gpu::arch::qwen3moe::Body38;
 use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for;
+use bloomery_gpu::arch::qwen3moe::{Body38, SplitWalk};
 use bloomery_gpu::host::census::TierCensus;
 use bloomery_gpu::host::lane::{LANE_THREADS, LaneStats};
 use bloomery_gpu::host::nvtier::{DropRuns, NvTier, NvTierStats, advice_disjoint};
@@ -295,6 +300,9 @@ struct ArmRun {
     /// The tier's and the lane's counters at the steps' start and end, on a
     /// load with a tier.
     steps: Option<Span>,
+    /// The cut the load set ([`SplitWalk`]), and the refusal of a split by
+    /// the width rule asked of the load right after it (`None`: taken).
+    split_walk: (SplitWalk, Option<String>),
 }
 
 /// The counters of a span: the tier's and the lane's at its start and at
@@ -441,6 +449,18 @@ fn arm(
     let model = Body38::open_placed_residency(file, &plan, &inputs, 0, host, ub, residency, 1)?;
     let mut s = Session::from_model(model, CTX as u32);
     s.model_mut().body_parts(NAME)?.2.log_residency(0);
+    // `split`: the load's cut, then the rule's split asked of it, the cut set
+    // back after it either way.
+    let split_walk = {
+        let b = s.model_mut().body_parts(NAME)?.2;
+        let cut = b.split_walk();
+        let asked = b
+            .set_split_walk(SplitWalk::Rule)
+            .err()
+            .map(|e| e.to_string());
+        b.set_split_walk(cut)?;
+        (cut, asked)
+    };
     let tier = s.model().body(NAME)?.nvme_tier().cloned();
     if audit {
         tier.as_ref()
@@ -496,6 +516,7 @@ fn arm(
         steps_from: 0,
         step_ns: Vec::with_capacity(STEPS),
         steps: None,
+        split_walk,
     };
     let note = |s: &mut Session<Body38>, run: &mut ArmRun| -> Result<(), GateError> {
         for (_, r) in take_passes(s)? {
@@ -1383,6 +1404,33 @@ fn run() -> Result<(), GateError> {
         verdict(bits)
     );
     pass &= bits;
+
+    let refused = paged
+        .split_walk
+        .1
+        .as_deref()
+        .is_some_and(|e| e.contains("BLOOMERY_SPLIT_WALK") && e.contains("NVMe-paged"));
+    let split = paged.split_walk.0 == SplitWalk::Off
+        && refused
+        && ram.split_walk == (SplitWalk::Rule, None);
+    println!(
+        "split: the paged arm's load walks {:?} and a split by the rule is {} (want Off, refused \
+         naming the lever and an NVMe-paged plan); the all-RAM arm's load walks {:?}, the rule's \
+         split {} (want Rule, taken): {}",
+        paged.split_walk.0,
+        paged
+            .split_walk
+            .1
+            .as_deref()
+            .map_or_else(|| "taken".to_string(), |e| format!("refused: {e}")),
+        ram.split_walk.0,
+        ram.split_walk
+            .1
+            .as_deref()
+            .map_or_else(|| "taken".to_string(), |e| format!("refused: {e}")),
+        verdict(split)
+    );
+    pass &= split;
 
     let tier = paged.tier.as_ref().ok_or("the paged arm built no arena")?;
     // `room`: the loaded tier's arena, the plan's host need and the churn

@@ -30,7 +30,6 @@ use std::path::{Path, PathBuf};
 
 mod registry;
 use registry::REGISTRY;
-pub use registry::XSTREAM;
 pub use registry::{
     CARD_BUDGET, CARD_DONTNEED, CED, CHECK_FINITE, DRAFT, ENGRAM_HELPER, GEN_SLOTS, GEN_SLOTS_MAX,
     HOST_LANES, HOST_LANES_DEFAULT, HOST_LOCK, HOST_POPULATE, HOST_ROOM, HOSTSTREAM, LANE_PREFETCH,
@@ -38,6 +37,7 @@ pub use registry::{
     NVTIER_READ, PIN_MAIN, PREFILL, PREFILL_GROUP, PREFILL_GROUP_DEFAULT, PREFILL_GROUP_MAX,
     QWEN3_KV, QWEN38_EXPERTS, R8, RESIDENCY, ROUTE_TRACE, SPIN, STEP_STATS, THREADS,
 };
+pub use registry::{SPLIT_WALK, XSTREAM};
 
 #[cfg(test)]
 mod tests;
@@ -934,6 +934,18 @@ impl Levers {
     #[must_use]
     pub fn xstream(&self) -> Option<&'static str> {
         self.word(XSTREAM)
+    }
+
+    /// `BLOOMERY_SPLIT_WALK`: a Qwen3.8 prompt walks a ubatch the width rule
+    /// finds wide enough as two units; `None` when unset, which the load
+    /// resolves.
+    #[must_use]
+    pub fn split_walk(&self) -> Option<bool> {
+        match self.entry(SPLIT_WALK).value {
+            None => None,
+            Some(Value::Flag(b)) => Some(b),
+            ref v => panic!("{SPLIT_WALK} holds {v:?}, not a flag"),
+        }
     }
 
     /// `BLOOMERY_LANE_PREFETCH`: the host union's row-lane packs prefetch

@@ -36,14 +36,25 @@
 //!   run, which take any row count;
 //! - every routed expert the host union over the unit's columns.
 //!
-//! Units. The walk cuts its rows into units ([`unit_rows`]; it cuts one unit
-//! of every row) and a part reads and writes a unit's rows through windows of
-//! them ([`UnitRows38`]) at the unit's first row: the embedding's ids, rows,
-//! positions and key counts, the residual streams, the PLE rows, the
-//! feed-forward input, the routed slots and weights, the mixers' and the
-//! block's outputs, the shared expert's output, the card sum and the host
-//! sums. A unit also carries its width, first position, rows that select
-//! nothing, current stream buffer and one-expert table. What a part holds
+//! Units. The walk cuts its rows into units ([`unit_rows`]): one unit of
+//! every row, or — the split walk ([`SplitWalk`], `BLOOMERY_SPLIT_WALK`) —
+//! two of `⌈m/2⌉` and `⌊m/2⌋` rows where the width rule
+//! (`runtime::splitwalk::pays` at [`SPLIT_COSTS`]) says the second unit's
+//! front under the first unit's host service pays for its union call; a load
+//! with an expert tier or an NVMe-paged plan walks one unit, and a split
+//! asked of it is refused by name. A part reads and writes a unit's rows
+//! through windows of them ([`UnitRows38`]) at the unit's first row: the
+//! embedding's ids, rows, positions and key counts, the residual streams,
+//! the PLE rows, the feed-forward input, the routed slots and weights, the
+//! mixers' and the block's outputs, the shared expert's output, the card
+//! sum, the host sums and the mixes' combine weights (which one site leaves
+//! for the next, a part apart: [`UnitHc`]). A unit also carries its width,
+//! first position, rows that select nothing, current stream buffer and
+//! one-expert table (the second unit its own, filled for its width). The
+//! walk declares [`BatchOrder::Fronts`]: both units' first fronts, then per
+//! (layer, unit) the shadow, the serve, the back and the unit's next front,
+//! so the second unit's front runs on the card while the host waits for the
+//! first unit's download and serves its union. What a part holds
 //! only inside its own launches (the mixes' and the mixers' scratch, the
 //! activations' quantizations, the router's, the selection's and the card
 //! route's runs) is one set the units share: one unit's part runs its
@@ -105,13 +116,19 @@
 //! instead of the route waiting for them all, and the serve's union and the
 //! card route both run under the moved map. Under `split` the expert stream
 //! ([`crate::host::xstream`]) then sends the host experts its rule picks to
-//! a half of its ring for this unit alone, its copies batched the same way,
+//! a half of its ring for the layer's units, its copies batched the same way,
 //! and the card route runs a second set of its launches over that half
 //! ([`CardRoute38::enqueue`]'s ring pass, a GEMM batch a landing batch)
 //! before the card sum, which reads the stack's places and the ring's
 //! together; the serve's union leaves the streamed experts out. The route is
 //! then the layer's reader of the call ([`WideParts::stream_read`]), which the
-//! next ubatch's pick and the ring's next use of the half copy behind. The
+//! next ubatch's pick and the ring's next use of the half copy behind. A
+//! split walk picks once a layer, at its first unit, from that unit's
+//! counts at twice (the group's width): the second unit shares the pick's
+//! landings and the stream's ring and exclusion
+//! (`HostTier::xstream_share`), its card route runs over the pick the first
+//! unit held for it, and its read is the layer's last; the layer's return is
+//! owed at the last unit's back, once every unit's host service ran. The
 //! call's placement stays for the decode after it, unless the call returns to
 //! its start (a decode history before it): then the call's last unit returns
 //! each layer once its host service has run, asked at the next layer's
@@ -143,7 +160,7 @@ use crate::host::BatchLeg;
 use crate::host::handoff::Places;
 use crate::host::run::HostRun;
 use crate::host::swap::{CallPick, CallReport};
-use crate::host::xstream::{LandBatch, RingLayer, XLayer, XMode, XReport};
+use crate::host::xstream::{GROUP_WALK_ORDER, LandBatch, RingLayer, XLayer, XMode, XReport};
 use crate::linear::conv::ConvArgs;
 use crate::linear::delta::{DeltaArgs, DeltaLanesArgs};
 use crate::linear::norm_gate::NormGateArgs;
@@ -160,7 +177,8 @@ use crate::tensor::{DeviceTensor, Window};
 use cuda_core::{CudaEvent, CudaStream, DeviceBuffer};
 use gguf::quant::GgmlType;
 use runtime::hc_gated::Geometry;
-use runtime::sched::{self, At, LayerProgram, Overlap, PortKind};
+use runtime::sched::{self, At, BatchOrder, LayerProgram, Overlap, PortKind};
+use runtime::splitwalk::{self, LoadKind, SplitCosts};
 use runtime::xsplit::ReturnCost;
 use std::mem::ManuallyDrop;
 
@@ -170,6 +188,38 @@ const WHAT: &str = "qwen4exp ubatch walk";
 /// The indexer keys a select keeps, as `qsa::scored` takes them.
 const KEPT_U32: u32 = geo::KEPT as u32;
 const _: () = assert!(KEPT_U32 as usize == geo::KEPT);
+
+/// How a ubatch walk cuts its rows into units (`BLOOMERY_SPLIT_WALK`,
+/// [`super::body38::Body38::set_split_walk`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SplitWalk {
+    /// One unit of every row: the walk the lever's `off` keeps.
+    Off,
+    /// Two units of `⌈m/2⌉` and `⌊m/2⌋` rows where the width rule pays
+    /// (`runtime::splitwalk::pays` at [`SPLIT_COSTS`]), one unit otherwise.
+    Rule,
+    /// Two units at every walk of two rows or more, whatever the rule says:
+    /// a gate's arm.
+    Every,
+}
+
+/// The width rule's costs on a card of [`SPLIT_COSTS_SMS`] streaming
+/// multiprocessors: the card's time a row of one layer's front on the
+/// A6000, and the high edge of the band the prompt-union records fit for one
+/// more union call a layer, its cost per listed expert and the second
+/// front's enqueue — the edge where a split pays least, so the rule splits
+/// only a walk that pays at every fit in the band. A card of another count
+/// scales the card's time by its multiprocessors ([`Wide38::new`]; its clock
+/// is not read).
+pub const SPLIT_COSTS: SplitCosts = SplitCosts {
+    card_row_us: 7.07,
+    call_us: 2600.0,
+    listing_us: 5.7,
+    enqueue_us: 920.0,
+};
+
+/// The streaming multiprocessors [`SPLIT_COSTS`]' card time is the time of.
+const SPLIT_COSTS_SMS: f64 = 84.0;
 
 /// The rows of a selecting layer's unit of `m` rows from position `pos0`
 /// that select nothing — every key below their count, the prefill flash's
@@ -235,6 +285,9 @@ struct UnitSpans {
     sh_y: Span,
     acc: Span,
     hsum: Span,
+    /// The wide mixes' combine weights, `STREAMS` a token: what a unit's
+    /// inject site leaves for its next site's combine, across its parts.
+    wgt: Span,
 }
 
 impl UnitSpans {
@@ -255,6 +308,7 @@ impl UnitSpans {
             sh_y: Span::rows(r0, m, hidden),
             acc: Span::rows(r0, m, hidden),
             hsum: Span::rows(r0, m, hidden),
+            wgt: Span::rows(r0, m, geo::STREAMS),
         }
     }
 }
@@ -286,6 +340,45 @@ fn unit_rows(m: usize, widths: &[usize]) -> Result<Vec<(usize, usize)>, GpuError
 const fn unit_dense(dense: usize, r0: usize, m: usize) -> usize {
     let rest = dense.saturating_sub(r0);
     if rest < m { rest } else { m }
+}
+
+/// A split under `w` refused by name on a load the width rule does not
+/// price (`runtime::splitwalk::refuse`): one with an expert tier or an
+/// NVMe-paged plan. [`SplitWalk::Off`] is taken on every load.
+fn refuse_split(load: LoadKind, w: SplitWalk) -> Result<(), GpuError> {
+    if w == SplitWalk::Off {
+        return Ok(());
+    }
+    splitwalk::refuse(load)
+        .map_err(|e| GpuError::shape("BLOOMERY_SPLIT_WALK", format!("{w:?}: {e}")))
+}
+
+/// The widths of a walk of `m` rows cut under `w` on a load of kind `load`
+/// whose rule costs are `costs`, `host` the most host-resident routed
+/// experts a layer holds ([`WideParts::widths`]): `⌈m/2⌉` and `⌊m/2⌋` when
+/// the cut splits, else `m`. A split on a load the rule does not price is
+/// refused by name ([`refuse_split`]).
+fn unit_widths(
+    m: usize,
+    w: SplitWalk,
+    (load, costs): (LoadKind, &SplitCosts),
+    host: usize,
+) -> Result<Vec<usize>, GpuError> {
+    let two = m >= 2
+        && match w {
+            SplitWalk::Off => false,
+            SplitWalk::Every => true,
+            SplitWalk::Rule => {
+                host > 0
+                    && splitwalk::pays(m, costs, host, geo::N_USED)
+                        .map_err(|e| GpuError::shape(WHAT, format!("{m} rows: {e}")))?
+            }
+        };
+    if !two {
+        return Ok(vec![m]);
+    }
+    refuse_split(load, w)?;
+    Ok(vec![m.div_ceil(2), m / 2])
 }
 
 /// The window of `at` over `parent`, refused by name when `parent` ends
@@ -342,6 +435,11 @@ struct UnitRows38 {
     /// the card.
     acc: Option<Win<f32>>,
     hsum: Win<f32>,
+    /// The unit's rows of the wide mixes' combine weights ([`UnitHc`]).
+    wgt: Span,
+    /// The unit's rows of a selecting layer the prefill flash ran and those
+    /// the selection did, once a selecting layer's front ran.
+    split: Option<(usize, usize)>,
 }
 
 impl UnitRows38 {
@@ -369,6 +467,9 @@ impl UnitRows38 {
             ));
         }
         let at = UnitSpans::of(r0, m);
+        // The combine weights' window is made at each mix ([`UnitHc`]); its
+        // rows are checked here, before any launch.
+        rows_of("the mixes' combine weights", &x.hc.wgt, at.wgt)?;
         Ok(UnitRows38 {
             r0,
             m,
@@ -397,7 +498,39 @@ impl UnitRows38 {
                 .map(|r| rows_of("the card sum", &r.acc, at.acc))
                 .transpose()?,
             hsum: rows_of("hsum", hsum, at.hsum)?,
+            wgt: at.wgt,
+            split: None,
         })
+    }
+}
+
+/// The wide mixes' scratch with its combine weights on one unit's rows: a
+/// mix reads the weights the unit's last inject site left and writes its own
+/// there, so two units' weights never meet, whatever parts of the other unit
+/// run between a unit's two sites. Dropped, the scratch holds its own
+/// weights again.
+struct UnitHc<'s> {
+    hc: &'s mut HcWideScratch,
+    own: Option<DeviceBuffer<f32>>,
+}
+
+impl<'s> UnitHc<'s> {
+    /// `hc` with the unit's rows `wgt` of its combine weights in place of
+    /// the whole buffer; refused by name past the buffer's rows.
+    fn on(hc: &'s mut HcWideScratch, wgt: Span) -> Result<UnitHc<'s>, GpuError> {
+        let w = rows_of("the mixes' combine weights", &hc.wgt, wgt)?;
+        let own = std::mem::replace(&mut hc.wgt, ManuallyDrop::into_inner(w));
+        Ok(UnitHc { hc, own: Some(own) })
+    }
+}
+
+impl Drop for UnitHc<'_> {
+    fn drop(&mut self) {
+        if let Some(own) = self.own.take() {
+            // The window frees nothing: its parts are given back, the words
+            // stay the scratch's own buffer's.
+            drop(std::mem::replace(&mut self.hc.wgt, own).into_raw_parts());
+        }
     }
 }
 
@@ -1136,12 +1269,14 @@ impl CardRoute38 {
 /// What a ubatch walk reads and writes besides the arena: the one-expert
 /// tables, the GEMMs' activations, the wide mixes' scratch, the indexer keys
 /// token-major, the walk's routed slots, the last walk's last unit and its cut
-/// of its selecting layers' rows.
+/// of its selecting layers' rows, and how the walks cut their rows into units.
 pub(super) struct Wide38 {
     /// The most rows a unit holds.
     pub(super) rows: usize,
-    /// The one-expert tables the units' widths fill, one a width a walk
-    /// cuts ([`UnitRows38`]'s `route`).
+    /// The one-expert tables the units fill, unit `i` the `i`-th
+    /// ([`UnitRows38`]'s `route`): the first for up to `rows` slots, the
+    /// second, on an arena of two rows or more, for the second unit of a
+    /// split walk, at most half of them.
     dense: Vec<GemmRoute>,
     /// q8 of the model-width rows (a mix's output, the PLE rows, the shared
     /// expert's input), of the attention-width rows (the output
@@ -1169,12 +1304,23 @@ pub(super) struct Wide38 {
     /// The last walk's last unit, whose rows the head reads; its windows
     /// stay valid until the next walk replaces it.
     last: Option<UnitRows38>,
+    /// How the walks cut their rows ([`SplitWalk`]), and what the load keeps
+    /// its routed experts on, which the rule prices only when resident.
+    split_walk: SplitWalk,
+    load: LoadKind,
+    /// The width rule's costs on this card ([`SPLIT_COSTS`] at its
+    /// multiprocessors).
+    split_costs: SplitCosts,
+    /// The units the last walk ran; 0 before a walk.
+    pub(super) walked_units: usize,
 }
 
 impl Wide38 {
     /// The walk's own buffers for units of up to `rows` rows over `card`'s
     /// card experts: the card route's buffers beside them when a layer has
-    /// card experts, made for an expert tier's join when `tiered`. Load-time
+    /// card experts, made for an expert tier's join when `tiered`; the walks
+    /// cut by the width rule on a load with no expert tier, as one unit on
+    /// one with it ([`Wide38::paged`] for an NVMe-paged plan). Load-time
     /// only.
     pub(super) fn new(
         stream: &CudaStream,
@@ -1188,9 +1334,19 @@ impl Wide38 {
         let card = (card.card_layers() > 0)
             .then(|| CardRoute38::new(stream, rows, card, tiered))
             .transpose()?;
+        let mut dense = vec![GemmRoute::new(stream, rows, 1)?];
+        if rows >= 2 {
+            dense.push(GemmRoute::new(stream, rows / 2, 1)?);
+        }
+        let sms = f64::from(stream.context().multiprocessor_count()?);
+        let (split_walk, load) = if tiered {
+            (SplitWalk::Off, LoadKind::Tier)
+        } else {
+            (SplitWalk::Rule, LoadKind::Resident)
+        };
         Ok(Wide38 {
             rows,
-            dense: vec![GemmRoute::new(stream, rows, 1)?],
+            dense,
             act_hid: GemmAct32::new(stream, rows, geo::HIDDEN)?,
             act_attn: GemmAct32::new(stream, rows, geo::ATTN)?,
             act_ff: GemmAct32::new(stream, rows, geo::FF)?,
@@ -1203,7 +1359,39 @@ impl Wide38 {
             card,
             split: None,
             last: None,
+            split_walk,
+            load,
+            split_costs: SplitCosts {
+                card_row_us: SPLIT_COSTS.card_row_us * SPLIT_COSTS_SMS / sms,
+                ..SPLIT_COSTS
+            },
+            walked_units: 0,
         })
+    }
+
+    /// The load's plan pages routed experts to the NVMe tier: the walks cut
+    /// as one unit, and a split is refused by name
+    /// ([`Wide38::set_split_walk`]). Load-time only.
+    pub(super) fn paged(&mut self) {
+        if self.load == LoadKind::Resident {
+            self.load = LoadKind::Paged;
+        }
+        self.split_walk = SplitWalk::Off;
+    }
+
+    /// How the walks cut their rows from the next walk on. A split
+    /// ([`SplitWalk::Rule`], [`SplitWalk::Every`]) is refused by name on a
+    /// load with an expert tier or an NVMe-paged plan
+    /// (`runtime::splitwalk::refuse`), the cut left as it was.
+    pub(super) fn set_split_walk(&mut self, w: SplitWalk) -> Result<(), GpuError> {
+        refuse_split(self.load, w)?;
+        self.split_walk = w;
+        Ok(())
+    }
+
+    /// How the walks cut their rows.
+    pub(super) fn split_walk(&self) -> SplitWalk {
+        self.split_walk
     }
 
     /// Device bytes, the route taps left out.
@@ -1292,7 +1480,8 @@ fn gemm_q8(
 }
 
 /// The wide mix of `site` over `m` columns of `res`, after `before`, into
-/// `mixed`.
+/// `mixed`, the scratch's combine weights on the unit's rows `wgt`
+/// ([`UnitHc`]).
 #[allow(
     clippy::too_many_arguments,
     reason = "one site's streams, rule, width, sink, scratch, table and output (rust-quality R8)"
@@ -1304,9 +1493,10 @@ fn mix(
     before: Before<'_>,
     m: usize,
     fault: FaultSink,
-    (scratch, dense): (&mut HcWideScratch, &GemmRoute),
+    (scratch, wgt, dense): (&mut HcWideScratch, Span, &GemmRoute),
     mixed: &mut DeviceBuffer<f32>,
 ) -> Result<(), GpuError> {
+    let hc = UnitHc::on(scratch, wgt)?;
     let w = c.w;
     let (down_qs, down_d) = q8(w, &site.down)?;
     let (up_qs, up_d) = q8(w, &site.up)?;
@@ -1330,7 +1520,7 @@ fn mix(
             eps: c.eps,
             m,
             fault,
-            scratch,
+            scratch: &mut *hc.hc,
             gemm: &c.k.g32,
             dense,
             mixed,
@@ -1374,13 +1564,16 @@ impl WideParts<'_> {
                 Before::Init { y: &u.emb },
                 m,
                 sink,
-                (&mut x.hc, &x.dense[u.route]),
+                (&mut x.hc, u.wgt, &x.dense[u.route]),
                 &mut s.mixed,
             )?;
         } else if let Some(pp) = &p.ple {
             let prev = gpu.layer_sink(l - 1)?;
-            c.k.hcw
-                .enqueue_combine(stream, &mut u.res[u.cur], &u.y, m, prev, &x.hc)?;
+            {
+                let hc = UnitHc::on(&mut x.hc, u.wgt)?;
+                c.k.hcw
+                    .enqueue_combine(stream, &mut u.res[u.cur], &u.y, m, prev, &*hc.hc)?;
+            }
             let w = c.w;
             let pl = &mut s.ple;
             c.k.g32
@@ -1437,7 +1630,7 @@ impl WideParts<'_> {
                 Before::Plain,
                 m,
                 sink,
-                (&mut x.hc, dense),
+                (&mut x.hc, u.wgt, dense),
                 &mut s.mixed,
             )?;
         } else {
@@ -1448,7 +1641,7 @@ impl WideParts<'_> {
                 Before::Combine { y: &u.y },
                 m,
                 sink,
-                (&mut x.hc, &x.dense[u.route]),
+                (&mut x.hc, u.wgt, &x.dense[u.route]),
                 &mut s.mixed,
             )?;
         }
@@ -1466,7 +1659,7 @@ impl WideParts<'_> {
             }
             (Mixer38::Qsa(q), Store38::Qsa { kv, raw, pooled }) => {
                 let split = qsa(c, q, (kv, raw, pooled), (s, x), u, sink)?;
-                x.split = Some(split);
+                u.split = Some(split);
                 Ok(())
             }
             _ => Err(GpuError::shape(
@@ -1489,7 +1682,7 @@ impl WideParts<'_> {
             Before::Combine { y: &u.y },
             u.m,
             sink,
-            (&mut x.hc, &x.dense[u.route]),
+            (&mut x.hc, u.wgt, &x.dense[u.route]),
             &mut u.ffn_x,
         )
     }
@@ -2141,10 +2334,21 @@ pub(super) struct Gemm38<'a> {
 }
 
 /// The walk's layer program over its units: the schedule names the unit of
-/// each part, which runs over that unit's windows.
+/// each part, which runs over that unit's windows. A split walk's first unit
+/// picks for the layer and the later units read its pick: `held` keeps the
+/// layer's landing batches until the last unit's card route has read them.
 struct UnitWalk<'w, 'a> {
     p: &'w mut WideParts<'a>,
     units: Vec<UnitRows38>,
+    held: Option<Held>,
+}
+
+/// The first unit's pick of a layer, for the later units' card routes: the
+/// layer, its landing batches, and whether the layer streams.
+struct Held {
+    layer: usize,
+    land: Vec<LandBatch>,
+    streams: bool,
 }
 
 /// The walk's unit `at.unit` of `units`, refused by name past them.
@@ -2157,13 +2361,15 @@ fn unit_at(units: &mut [UnitRows38], at: At) -> Result<&mut UnitRows38, GpuError
 
 impl<'a> Gemm38<'a> {
     /// Walk every layer through `leg`: the walk's `m` rows cut into units
-    /// ([`unit_rows`]; one unit of all of them), each unit's one-expert
-    /// table filled for its width first. A walk of no row, or past the
-    /// arena's rows or the armed route taps', is refused by name before any
-    /// launch (`Body38::plan_gemm` refuses the taps' first, before the call
-    /// moves anything; this is the windows' own guard). Once every layer is
-    /// walked, armed taps record the walk's positions, and the last unit
-    /// stays for the head.
+    /// ([`WideParts::widths`], [`unit_rows`]), the leg keyed by each unit's
+    /// rows, each unit's one-expert table filled for its width first, the
+    /// units' items in [`BatchOrder::Fronts`]' order. A walk of no row, or
+    /// past the arena's rows or the armed route taps', is refused by name
+    /// before any launch (`Body38::plan_gemm` refuses the taps' first, before
+    /// the call moves anything; this is the windows' own guard). Once every
+    /// layer is walked, armed taps record the walk's positions, the units'
+    /// cuts of the selecting layers' rows add up to the walk's, and the last
+    /// unit stays for the head.
     pub(super) fn walk(&mut self, leg: &mut BatchLeg<'a, HostRun>) -> Result<(), GpuError> {
         let m = self.p.m;
         let taps = self.p.x.taps.as_ref().map_or(usize::MAX, |t| t.rows);
@@ -2180,13 +2386,16 @@ impl<'a> Gemm38<'a> {
         let gpu = self.p.c.gpu;
         self.p.x.split = None;
         self.p.x.last = None;
+        self.p.x.walked_units = 0;
         if let Some(t) = self.p.x.taps.as_mut() {
             t.walked = None;
         }
-        let cut = unit_rows(m, &[m])?;
+        let cut = unit_rows(m, &self.p.widths()?)?;
+        let rows: Vec<std::ops::Range<usize>> = cut.iter().map(|&(r0, w)| r0..r0 + w).collect();
+        leg.set_unit_rows(&rows);
         let mut units = Vec::with_capacity(cut.len());
-        for at in cut {
-            units.push(UnitRows38::new(&self.p, leg.hsum(), at, 0)?);
+        for (route, at) in cut.into_iter().enumerate() {
+            units.push(UnitRows38::new(&self.p, leg.hsum(), at, route)?);
         }
         for u in &units {
             self.p.c.k.gemm.enqueue_route_dense(
@@ -2206,9 +2415,19 @@ impl<'a> Gemm38<'a> {
         let mut walker = UnitWalk {
             p: &mut self.p,
             units,
+            held: None,
         };
         sched::walk(o, layers, leg, &mut walker)?;
-        let UnitWalk { units, .. } = walker;
+        let UnitWalk { units, held, .. } = walker;
+        if let Some(h) = held {
+            return Err(GpuError::protocol(
+                WHAT,
+                format!(
+                    "layer {}'s pick held past the walk: a unit's card route did not read it",
+                    h.layer
+                ),
+            ));
+        }
         // The last layer's return: no front follows it in the walk, so its
         // copies are the end's.
         if let Some(l) = self.p.stream.owed.take() {
@@ -2218,6 +2437,10 @@ impl<'a> Gemm38<'a> {
         if let Some(t) = self.p.x.taps.as_mut() {
             t.walked = Some((self.p.pos0, m));
         }
+        self.p.x.split = units
+            .iter()
+            .try_fold((0, 0), |(d, s), u| u.split.map(|(ud, us)| (d + ud, s + us)));
+        self.p.x.walked_units = units.len();
         self.p.x.last = units.into_iter().last();
         Ok(())
     }
@@ -2243,7 +2466,7 @@ impl<'a> Gemm38<'a> {
             Before::Combine { y: &u.y },
             m,
             fault,
-            (hc, &dense[u.route]),
+            (hc, u.wgt, &dense[u.route]),
             &mut s.mixed,
         )?;
         // Row m − 1 of `mixed` (1 <= m <= rows, the walk refused anything
@@ -2256,8 +2479,26 @@ impl<'a> Gemm38<'a> {
 }
 
 impl<'a> WideParts<'a> {
+    /// The widths of the walk's units ([`SplitWalk`]): `⌈m/2⌉` and `⌊m/2⌋`
+    /// rows when the cut splits a walk of two rows or more — every such walk
+    /// under [`SplitWalk::Every`], one the width rule pays for under
+    /// [`SplitWalk::Rule`] (`runtime::splitwalk::pays` at the card's
+    /// [`SPLIT_COSTS`], over the most host-resident routed experts a layer
+    /// holds; a load with none has no union to hide a front under) — else
+    /// one unit of all `m`. A split on a load the rule does not price is
+    /// refused by name (the setter refused it already).
+    fn widths(&self) -> Result<Vec<usize>, GpuError> {
+        let x = &*self.x;
+        let host = (0..self.plans.len())
+            .map(|l| geo::EXPERTS.saturating_sub(self.card.n_card(l)))
+            .max()
+            .unwrap_or(0);
+        unit_widths(self.m, x.split_walk, (x.load, &x.split_costs), host)
+    }
+
     /// Under host streaming, on a layer with card experts, the layer's pick
-    /// before its card route, for a unit of `m` rows: the host waits for the
+    /// before its card route, for the first unit of `m` rows of a walk of
+    /// `units` units: the host waits for the
     /// front's download of the unit's routed ids, counts them, and the
     /// residency machine's pick (`SwapMachine::call_pick`) sends the pool's
     /// coldest residents to the host and copies the unit's hottest host
@@ -2274,18 +2515,30 @@ impl<'a> WideParts<'a> {
     /// ([`crate::host::HostTier::xstream_layer`]): the host experts its rule
     /// sends to the card stream into a half of its ring, its copies batched
     /// the same way, and the serve leaves them out; the layer's ring view
-    /// for its card route is returned. Nothing else, and nothing in a unit
+    /// for its card route is returned. Nothing else, and nothing in a walk
     /// narrower than the gate the pick admits from.
+    ///
+    /// One pick a layer for the walk's units: the first unit's routed ids
+    /// count `units` times each (the group's width, `units · m`), so the
+    /// pick, its floor and the stream's rule price the group; under `split`
+    /// every later unit joins the layer's stream
+    /// ([`crate::host::HostTier::xstream_share`]) before any card route
+    /// reads it, so its serve leaves out the same experts and the stream
+    /// stays open for its card route. A later unit's card route reads the
+    /// same landing batches and ring ([`UnitWalk`]'s `held`).
     fn stream_pick(
         &mut self,
         port: &mut BatchLeg<'a, HostRun>,
         at: At,
-        m: usize,
+        (m, units): (usize, usize),
     ) -> Result<(Option<RingLayer>, Vec<LandBatch>), GpuError> {
         let l = at.layer;
         if !self.stream.on || !self.card.has(l) {
             return Ok((None, Vec::new()));
         }
+        let scale = u32::try_from(units)
+            .map_err(|_| GpuError::shape(WHAT, format!("a walk of {units} units")))?;
+        let group = units * m;
         let split = self.stream.split;
         // The walk only where the lane probed: its gate is the least width
         // whose picks could pay a first admit, derived without the tail (the
@@ -2297,9 +2550,9 @@ impl<'a> WideParts<'a> {
             Some(k) if split => runtime::xsplit::walk_gate(k),
             _ => STREAM_FLOOR,
         };
-        // A unit of fewer rows than the gate gives no expert a count the
+        // A walk of fewer rows than the gate gives no expert a count the
         // pick admits (a call's last ubatch can be one).
-        if m < gate as usize {
+        if group < gate as usize {
             return Ok((None, Vec::new()));
         }
         let key = port.key(at);
@@ -2307,17 +2560,22 @@ impl<'a> WideParts<'a> {
         let ret = self.return_cost(port, l);
         let s = &mut *self.stream;
         let mut pick = match (split, k) {
-            (true, Some(k)) => port.hybrid().call_pick_walk(
+            (true, Some(k)) => port.hybrid().call_pick_walk_scaled(
                 stream,
                 key,
                 &mut s.counts,
                 k,
                 s.card_tail_us_per_pick,
                 ret,
+                scale,
             )?,
-            _ => port
-                .hybrid()
-                .call_pick_routed(stream, key, &mut s.counts, usize::MAX)?,
+            _ => port.hybrid().call_pick_routed_scaled(
+                stream,
+                key,
+                &mut s.counts,
+                usize::MAX,
+                scale,
+            )?,
         };
         // The no-probe floor witness: the pick admitted from the stream
         // floor rather than the walk's measured plan.
@@ -2330,8 +2588,12 @@ impl<'a> WideParts<'a> {
         }
         let x = port
             .hybrid()
-            .xstream_layer(stream, key, m, &s.counts, admitted)?;
+            .xstream_layer(stream, key, group, &s.counts, admitted)?;
         s.layers.push((s.ubatch, x));
+        for unit in 1..units {
+            let other = port.key(At { unit, layer: l });
+            port.hybrid().xstream_share(l, other)?;
+        }
         Ok((port.hybrid().xstream_ring(l), land))
     }
 
@@ -2379,18 +2641,28 @@ impl<'a> WideParts<'a> {
         }
     }
 
-    /// Under host streaming, on a layer with card experts, the layer's last
-    /// read of its slots in the call so far, after its card route
-    /// (`SwapMachine::call_reader`): the next ubatch's pick of the layer
-    /// copies behind it; under `split` the read of its stream's half too
-    /// ([`crate::host::HostTier::xstream_read`]), which the half's next
-    /// stream copies behind. Nothing else.
-    fn stream_read(&mut self, port: &mut BatchLeg<'a, HostRun>, l: usize) -> Result<(), GpuError> {
+    /// Under host streaming, on a layer with card experts, a unit's read of
+    /// the layer after its card route. The walk's `last` unit's is the
+    /// layer's last read of its slots in the call so far
+    /// (`SwapMachine::call_reader`): the next ubatch's pick of the layer and
+    /// the call's return copies of it wait behind that read — recorded at an
+    /// earlier unit, they would land while a later unit's route reads the
+    /// slots. Under `split` every unit reads the layer's stream
+    /// ([`crate::host::HostTier::xstream_read`]), which closes at the
+    /// group's last, the half's next stream copying behind it. Nothing else.
+    fn stream_read(
+        &mut self,
+        port: &mut BatchLeg<'a, HostRun>,
+        l: usize,
+        last: bool,
+    ) -> Result<(), GpuError> {
         if !self.stream.on || !self.card.has(l) {
             return Ok(());
         }
         let stream = self.c.gpu.stream();
-        port.hybrid().call_reader(l, stream)?;
+        if last {
+            port.hybrid().call_reader(l, stream)?;
+        }
         if self.stream.split {
             port.hybrid().xstream_read(l, stream)?;
         }
@@ -2400,6 +2672,14 @@ impl<'a> WideParts<'a> {
 
 impl<'a> LayerProgram for UnitWalk<'_, 'a> {
     type Port = BatchLeg<'a, HostRun>;
+
+    /// Every unit's first front ahead of the shadows, then each unit's next
+    /// front after its back: a unit's front runs on the card while the host
+    /// serves the other's union, and the layer's fronts run in unit order —
+    /// the delta layers' recurrent state and conv ring and the selecting
+    /// layers' pooled keys advance unit by unit. At one unit, the order of
+    /// the walk of one unit.
+    const BATCH_ORDER: BatchOrder = GROUP_WALK_ORDER;
 
     /// The layer up to its router, the mix into the unit's `ffn_x`, then
     /// the download of the unit's activations and routed slots — on a tier
@@ -2441,25 +2721,62 @@ impl<'a> LayerProgram for UnitWalk<'_, 'a> {
     /// the d2h would queue behind the route's card GEMMs and the host tier
     /// would start late by their whole time. Under host streaming the shared
     /// expert comes first, so the card runs it while the host counts and
-    /// picks; then the layer's pick (and stream) and the route, its GEMM
-    /// batches each behind the landing batch it reads
-    /// ([`WideParts::stream_pick`]), the route the layer's last read of its
-    /// slots in the call ([`WideParts::stream_read`]).
+    /// picks; then the layer's pick (and stream), the first unit's alone
+    /// ([`WideParts::stream_pick`]), and the route, its GEMM batches each
+    /// behind the landing batch it reads — a later unit's over the first
+    /// unit's pick, held for it — then the unit's read
+    /// ([`WideParts::stream_read`]), the last unit's the layer's last read of
+    /// its slots in the call. The shadow's first launch is marked for the
+    /// walk's timer: the order puts the other unit's parts between a unit's
+    /// download and its shadow.
     fn shadow(&mut self, port: &mut BatchLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
         let l = at.layer;
         let enq = port.part_start();
+        let units = self.units.len();
+        let held = &mut self.held;
         let u = unit_at(&mut self.units, at)?;
         let p = &mut *self.p;
-        let r = if p.stream.on {
-            p.shared(u, l)
-                .and_then(|()| p.stream_return(port, at))
-                .and_then(|()| p.stream_pick(port, at, u.m))
-                .and_then(|(ring, land)| p.route_card(u, l, ring.as_ref(), &land))
-                .and_then(|()| p.stream_read(port, l))
-        } else {
-            p.route_card(u, l, None, &[]).and_then(|()| p.shared(u, l))
-        }
-        .and_then(|()| port.mark(at, Mark::Shadow as usize));
+        let last = at.unit + 1 == units;
+        let r = port
+            .mark(at, Mark::ShadowStart as usize)
+            .and_then(|()| {
+                if !p.stream.on {
+                    return p.route_card(u, l, None, &[]).and_then(|()| p.shared(u, l));
+                }
+                p.shared(u, l)?;
+                p.stream_return(port, at)?;
+                let (ring, land) = if at.unit == 0 {
+                    p.stream_pick(port, at, (u.m, units))?
+                } else {
+                    let h = held.take().filter(|h| h.layer == l).ok_or_else(|| {
+                        GpuError::protocol(
+                            WHAT,
+                            format!(
+                                "unit {}'s card route of layer {l} with no pick of the layer's \
+                                 first unit held",
+                                at.unit
+                            ),
+                        )
+                    })?;
+                    let ring = if h.streams {
+                        port.hybrid().xstream_ring(l)
+                    } else {
+                        None
+                    };
+                    (ring, h.land)
+                };
+                let streams = ring.is_some();
+                p.route_card(u, l, ring.as_ref(), &land)?;
+                if !last {
+                    *held = Some(Held {
+                        layer: l,
+                        land,
+                        streams,
+                    });
+                }
+                p.stream_read(port, l, last)
+            })
+            .and_then(|()| port.mark(at, Mark::Shadow as usize));
         port.part_end(at, enq);
         r
     }
@@ -2472,6 +2789,7 @@ impl<'a> LayerProgram for UnitWalk<'_, 'a> {
     fn back(&mut self, port: &mut BatchLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
         let l = at.layer;
         let enq = port.part_start();
+        let units = self.units.len();
         let u = unit_at(&mut self.units, at)?;
         let p = &mut *self.p;
         let joined = if p.tier_k(l) > 0 {
@@ -2482,9 +2800,10 @@ impl<'a> LayerProgram for UnitWalk<'_, 'a> {
         let r = joined
             .and_then(|()| p.shared_add(u, l))
             .and_then(|()| port.mark(at, Mark::Back as usize));
-        // The layer's host service has run: in the returning call's last walk
-        // its return is due, asked at the next layer's shadow.
-        if r.is_ok() && p.returns_here() && p.card.has(l) {
+        // The layer's host service has run for every unit once its last
+        // unit's back runs: in the returning call's last walk its return is
+        // due, asked at the next layer's shadow.
+        if r.is_ok() && at.unit + 1 == units && p.returns_here() && p.card.has(l) {
             p.stream.owed = Some(l);
         }
         port.part_end(at, enq);
@@ -2553,12 +2872,15 @@ pub(super) fn route_taps_host(
 
 #[cfg(test)]
 mod tests {
-    use super::{Span, UnitSpans, geo, unit_dense, unit_rows};
+    use super::{
+        LoadKind, SPLIT_COSTS, Span, SplitWalk, UnitSpans, geo, refuse_split, unit_dense,
+        unit_rows, unit_widths,
+    };
 
     /// Each of a unit's windows with the words a row of the buffer it cuts:
-    /// `Arena38`'s, `Wide38`'s, the card route's, the input record's and the
-    /// leg's layouts.
-    fn fields(u: &UnitSpans) -> [(&'static str, Span, usize); 13] {
+    /// `Arena38`'s, `Wide38`'s, the card route's, the input record's, the
+    /// leg's and the wide mixes' layouts.
+    fn fields(u: &UnitSpans) -> [(&'static str, Span, usize); 14] {
         let (hidden, wide, slots) = (geo::HIDDEN, geo::STREAMS * geo::HIDDEN, geo::N_USED + 1);
         [
             ("tok", u.tok, 1),
@@ -2574,6 +2896,7 @@ mod tests {
             ("sh_y", u.sh_y, hidden),
             ("acc", u.acc, hidden),
             ("hsum", u.hsum, hidden),
+            ("wgt", u.wgt, geo::STREAMS),
         ]
     }
 
@@ -2670,5 +2993,55 @@ mod tests {
             assert_eq!(got, want, "{dense} of {m} rows in {widths:?}");
             assert_eq!(got.iter().sum::<usize>(), dense, "{dense} of {m} rows");
         }
+    }
+
+    /// A split is refused by name on a load with an expert tier and on an
+    /// NVMe-paged plan, under the rule and under every walk; one unit is
+    /// taken on every load, and a resident load takes either split.
+    #[test]
+    fn a_split_is_refused_by_name_on_a_tier_load_and_a_paged_plan() {
+        for (load, want) in [
+            (LoadKind::Tier, "tier load"),
+            (LoadKind::Paged, "NVMe-paged"),
+        ] {
+            for w in [SplitWalk::Rule, SplitWalk::Every] {
+                let e = refuse_split(load, w).expect_err("a split the rule does not price");
+                let text = e.to_string();
+                assert!(
+                    text.contains("BLOOMERY_SPLIT_WALK") && text.contains(want),
+                    "{load:?} {w:?}: {text}"
+                );
+                // The rule splits 4,096 rows over 512 host experts, every
+                // walk splits 8.
+                let m = if w == SplitWalk::Rule { 4096 } else { 8 };
+                let cut = unit_widths(m, w, (load, &SPLIT_COSTS), 512)
+                    .expect_err("the cut refuses it too");
+                assert!(cut.to_string().contains(want), "{load:?} {w:?}: {cut}");
+            }
+            refuse_split(load, SplitWalk::Off).expect("one unit on every load");
+            assert_eq!(
+                unit_widths(8, SplitWalk::Off, (load, &SPLIT_COSTS), 512).expect("one unit"),
+                [8]
+            );
+        }
+        for w in [SplitWalk::Off, SplitWalk::Rule, SplitWalk::Every] {
+            refuse_split(LoadKind::Resident, w).expect("a resident load takes every cut");
+        }
+    }
+
+    /// The cut: one unit off, at one row and where the rule does not pay (or
+    /// no layer holds a host expert); `⌈m/2⌉` and `⌊m/2⌋` under every walk and
+    /// where the rule pays — a full ubatch on the costs' card splits, a
+    /// 512-row walk does not.
+    #[test]
+    fn a_walk_splits_in_halves_where_its_cut_says() {
+        let at = |m, w, host| unit_widths(m, w, (LoadKind::Resident, &SPLIT_COSTS), host);
+        assert_eq!(at(4096, SplitWalk::Off, 512).unwrap(), [4096]);
+        assert_eq!(at(1, SplitWalk::Every, 512).unwrap(), [1]);
+        assert_eq!(at(7, SplitWalk::Every, 512).unwrap(), [4, 3]);
+        assert_eq!(at(3001, SplitWalk::Every, 0).unwrap(), [1501, 1500]);
+        assert_eq!(at(4096, SplitWalk::Rule, 512).unwrap(), [2048, 2048]);
+        assert_eq!(at(512, SplitWalk::Rule, 512).unwrap(), [512]);
+        assert_eq!(at(4096, SplitWalk::Rule, 0).unwrap(), [4096]);
     }
 }

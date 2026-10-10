@@ -59,6 +59,7 @@ pub use mtp38::{
 };
 pub use placed::Placed;
 pub use taps35::{Delta35Run, Ffn35Run, Gqa35Run, Layer35Run, Mixer35Run, StoreHost};
+pub use wide38::{SPLIT_COSTS, SplitWalk};
 
 /// Qwen3.6-35B-A3B on one card.
 pub type Qwen35moeModel = crate::GpuModel<Body35>;

@@ -188,6 +188,16 @@
 //!   the one ubatch again with the walk's timing armed
 //!   (`GpuModel::set_prompt38_stats`) writes the same bits, and its record
 //!   holds one ubatch and a row for every layer with every card span read;
+//!   the one ubatch by the split walk (`SplitWalk::Every`: two units of
+//!   half its rows, each layer's fronts in unit order) leaves the same bits
+//!   and the same cut of the selecting rows, as does the split walk of its
+//!   first ids at an odd count (`⌈m/2⌉` and `⌊m/2⌋` rows) against one unit
+//!   of them, and with its timing
+//!   armed the same bits again, a record of one walk of two batches, a row
+//!   per layer and unit (the unit's half of the columns, its slots every
+//!   column's), and on every layer the second unit's front and download
+//!   between the first unit's download and its shadow (every other clause
+//!   loads with the split walk off);
 //!   the step after the ubatch as (t) holds a step set. A slot map with a
 //!   routed expert on a tier card (planted, `Body38::plant_slot_map`) is
 //!   refused by name — the walk, the layer and the count — by each of the
@@ -320,7 +330,7 @@ mod gate {
     use crate::qwen38_open::{Open38, Opened38, PlanFacts};
 
     use bloomery_gpu::arch::qwen3moe::{
-        Body38, LayerKind38, Prompt38, Qwen38Model, RouteTap, Store38Host, TargetRows,
+        Body38, LayerKind38, Prompt38, Qwen38Model, RouteTap, SplitWalk, Store38Host, TargetRows,
     };
     use bloomery_gpu::head::Head;
     use bloomery_gpu::host::batch::HOT_COLS;
@@ -461,6 +471,19 @@ mod gate {
     /// each whatever its types: 1151 + 5·48 and 1235 + 5·48.
     const REAL_NODES_DECODE_CARD: usize = 1391;
     const REAL_NODES_VERIFY_CARD: usize = 1475;
+
+    // PIN(2026-10-11): the split prompt walk moves none of the counts
+    // above: it orders the eager ubatch walk's parts (`GROUP_WALK_ORDER`), and
+    // the captured decode and verify run no ubatch. No gate counts the
+    // eager walk's launches; a second unit adds, per layer, the parts'
+    // launches that do not run by `ROUTE_ROWS` (the router, the card
+    // route and the select runs split the same rows into the same runs at
+    // 4,096 positions): a delta layer's 32 kernels (the attention mix 8,
+    // the mixer 10, the feed-forward mix 8, the shared expert 5, the gated
+    // sum 1) and 4 stream copies (the download's x, ids and weights, the
+    // upload's sum); a selecting layer's 35 (its mixer 13) and 4, one more
+    // for a unit with dense rows (the prefill flash); layer 1's PLE site 6
+    // more, layer 0's embedding 1 more.
 
     /// The gate's one reading of what the run is made from: the model file
     /// (`ref_model_path`, a whole fixture under the fixture tier), the host
@@ -749,7 +772,13 @@ mod gate {
             p.row_reserve_bytes,
             cfg().plan_levers.card_budget_bytes
         );
-        let o = planned.open()?;
+        let mut o = planned.open()?;
+        // Every clause walks its ubatches as one unit, the split walk's own
+        // clauses ([`gemm_split`]) aside, which set it and set it back.
+        o.model
+            .body_parts("open_at")?
+            .2
+            .set_split_walk(SplitWalk::Off)?;
         println!(
             "load resident_bytes={} ctx={CTX} layers={} in {:.1} s (runtime value)",
             o.model.resident_bytes(),
@@ -3046,6 +3075,185 @@ mod gate {
             true,
         );
         ok &= gemm_timed(m, &prefill, &one)?;
+        ok &= gemm_split(m, &prefill, &one, split)?;
+        Ok(ok)
+    }
+
+    /// The split walk ([`SplitWalk::Every`]) on D3K's prefill: one ubatch
+    /// walked as two units of half its rows leaves the one unit's last
+    /// token, logits and every store bit for bit (a token's bits do not
+    /// depend on the unit it lands in, and a layer's fronts run in unit
+    /// order); the units' cut of the selecting layers' rows adds up to the
+    /// one unit's `one_split`. Then [`gemm_split_odd`] and
+    /// [`gemm_split_timed`]. The cut set back to one unit either way.
+    fn gemm_split(
+        m: &mut Qwen38Model,
+        prefill: &[u32],
+        one: &Run,
+        one_split: Option<(usize, usize)>,
+    ) -> Result<bool, GateError> {
+        let set = |m: &mut Qwen38Model, w| -> Result<(), GateError> {
+            Ok(m.body_parts("gemm_split")?.2.set_split_walk(w)?)
+        };
+        set(m, SplitWalk::Every)?;
+        let r = (|| -> Result<bool, GateError> {
+            fresh(m)?;
+            let tok = m.prompt38(prefill, Prompt38::Gemm)?;
+            let b = m.body("gemm_split")?;
+            let (units, split) = (b.ubatch_units(), b.ubatch_split());
+            let logits = m.logits()?;
+            let (st, ring) = stores(m)?;
+            let two = Run {
+                tokens: vec![tok],
+                logits: vec![logits],
+                taps: Vec::new(),
+                routes: Vec::new(),
+                stores: st,
+                ple_ring: ring,
+            };
+            let shape_ok = units == 2 && split.is_some() && split == one_split;
+            println!(
+                "gemm {D3K}: the split walk of {} ids: {units} units (want 2), the selecting \
+                 layers' rows by the prefill flash and by the selection {split:?} (the one \
+                 unit's {one_split:?}) {}",
+                prefill.len(),
+                verdict(shape_ok)
+            );
+            let bits_ok = same_run(
+                &format!("D3K by a split walk of two units vs one unit ({D3K})"),
+                &two,
+                one,
+                true,
+            );
+            let odd_ok = gemm_split_odd(m, prefill)?;
+            Ok(shape_ok && bits_ok && odd_ok && gemm_split_timed(m, prefill, &two)?)
+        })();
+        set(m, SplitWalk::Off)?;
+        r
+    }
+
+    /// The split walk at an odd count — D3K's prefill less its last id when
+    /// the prefill's count is even — against one unit of the same ids: two
+    /// units of `⌈m/2⌉` and `⌊m/2⌋` rows (the second unit's one-expert table
+    /// filled for a row fewer than the first's), the last token, logits and
+    /// every store bit for bit. Leaves the split walk set.
+    fn gemm_split_odd(m: &mut Qwen38Model, prefill: &[u32]) -> Result<bool, GateError> {
+        let odd = &prefill[..prefill.len() - usize::from(prefill.len().is_multiple_of(2))];
+        let run = |m: &mut Qwen38Model, w| -> Result<(Run, usize), GateError> {
+            m.body_parts("gemm_split_odd")?.2.set_split_walk(w)?;
+            fresh(m)?;
+            let tok = m.prompt38(odd, Prompt38::Gemm)?;
+            let units = m.body("gemm_split_odd")?.ubatch_units();
+            let logits = m.logits()?;
+            let (stores, ple_ring) = stores(m)?;
+            let run = Run {
+                tokens: vec![tok],
+                logits: vec![logits],
+                taps: Vec::new(),
+                routes: Vec::new(),
+                stores,
+                ple_ring,
+            };
+            Ok((run, units))
+        };
+        let (one, one_units) = run(m, SplitWalk::Off)?;
+        let (two, two_units) = run(m, SplitWalk::Every)?;
+        let units_ok = one_units == 1 && two_units == 2;
+        println!(
+            "gemm {D3K}: its first {} ids, an odd count: {two_units} units by the split walk, \
+             {one_units} by one unit (want 2 and 1) {}",
+            odd.len(),
+            verdict(units_ok)
+        );
+        let bits_ok = same_run(
+            &format!(
+                "D3K's first {} ids by a split walk of two units vs one unit",
+                odd.len()
+            ),
+            &two,
+            &one,
+            true,
+        );
+        Ok(units_ok && bits_ok)
+    }
+
+    /// The split walk with its timing armed: the same bits as unarmed, and
+    /// its record one walk of two batches with a row per layer and unit —
+    /// each unit's columns its half, its slots every column's [`N_USED`] —
+    /// in the fronts order: on every layer the stream ran the second unit's
+    /// front and download between the first unit's download and its shadow
+    /// (the first unit's `card_gap_ms` holds the second's `card_front_ms`
+    /// and `card_down_ms`), so the second unit's front never waits behind
+    /// the first's card route.
+    fn gemm_split_timed(
+        m: &mut Qwen38Model,
+        prefill: &[u32],
+        two: &Run,
+    ) -> Result<bool, GateError> {
+        m.set_prompt38_stats(true)?;
+        let r = (|| -> Result<_, GateError> {
+            fresh(m)?;
+            let tok = m.prompt38(prefill, Prompt38::Gemm)?;
+            let logits = m.logits()?;
+            let (st, ring) = stores(m)?;
+            Ok((tok, logits, st, ring, m.take_prompt38_stats()?))
+        })();
+        m.set_prompt38_stats(false)?;
+        let (tok, logits, st, ring, stats) = r?;
+        let timed = Run {
+            tokens: vec![tok],
+            logits: vec![logits],
+            taps: Vec::new(),
+            routes: Vec::new(),
+            stores: st,
+            ple_ring: ring,
+        };
+        let mut ok = same_run(
+            "D3K by a split walk, timing armed vs unarmed",
+            &timed,
+            two,
+            true,
+        );
+        let stats = stats.ok_or("the timed split walk kept no record")?;
+        let layers = n_layer();
+        let widths = [prefill.len().div_ceil(2), prefill.len() / 2];
+        let rows_ok = stats.ubatches == 2
+            && stats.walks == 1
+            && stats.rows.len() == 2 * layers
+            && stats.rows.iter().all(|r| {
+                r.unit < 2
+                    && r.cols == widths[r.unit]
+                    && r.slots == r.cols as u64 * N_USED as u64
+                    && r.excluded == 0
+            });
+        // The first unit's gap holds the second's front and download, to the
+        // events' resolution.
+        const EVENT_MS: f64 = 0.002;
+        let mut out_of_order = Vec::new();
+        for l in 0..layers {
+            let row = |u: usize| stats.rows.iter().find(|r| r.layer == l && r.unit == u);
+            let (Some(a), Some(b)) = (row(0), row(1)) else {
+                out_of_order.push(l);
+                continue;
+            };
+            let gap = a.gap_ms.unwrap_or(0.0);
+            if gap + EVENT_MS < b.front_ms + b.down_ms || b.gap_ms.is_none() {
+                out_of_order.push(l);
+            }
+        }
+        let order_ok = out_of_order.is_empty();
+        println!(
+            "gemm {D3K}: the timed split walk's record: {} batch(es) (want 2) in {} walk(s) (want \
+             1), {} rows (want {}), each a unit's half of the columns, every column's slots on the \
+             host {rows_ok}; layers whose first unit's gap does not hold the second unit's front \
+             and download {out_of_order:?} (want none) {order_ok}: {}",
+            stats.ubatches,
+            stats.walks,
+            stats.rows.len(),
+            2 * layers,
+            verdict(rows_ok && order_ok)
+        );
+        ok &= rows_ok && order_ok;
         Ok(ok)
     }
 

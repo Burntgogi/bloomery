@@ -396,6 +396,7 @@ fn accessors_read_their_rows() {
             (QWEN38_EXPERTS, "card"),
             (HOSTSTREAM, "on"),
             (XSTREAM, "split"),
+            (SPLIT_WALK, "off"),
             (QWEN3_KV, "q8_0"),
             (LANE_PREFETCH, "on"),
             (HOST_LANES, "flat"),
@@ -429,6 +430,7 @@ fn accessors_read_their_rows() {
     assert_eq!(set.qwen3_kv_set(), Some("q8_0"));
     assert_eq!(set.hoststream(), Some(true));
     assert_eq!(set.xstream(), Some("split"));
+    assert_eq!(set.split_walk(), Some(false));
     assert!(set.lane_prefetch());
     assert_eq!(set.host_lanes(), HostLanes::Flat);
     assert_eq!(set.gen_slots(), 2);
@@ -473,6 +475,7 @@ fn accessors_read_their_rows() {
             QWEN38_EXPERTS,
             HOSTSTREAM,
             XSTREAM,
+            SPLIT_WALK,
             QWEN3_KV,
             LANE_PREFETCH,
             HOST_LANES,

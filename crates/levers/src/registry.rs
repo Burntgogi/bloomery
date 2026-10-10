@@ -32,6 +32,7 @@ pub const MTP_WIDTH: &str = "BLOOMERY_MTP_WIDTH";
 pub const RESIDENCY: &str = "BLOOMERY_RESIDENCY";
 pub const HOSTSTREAM: &str = "BLOOMERY_HOSTSTREAM";
 pub const XSTREAM: &str = "BLOOMERY_XSTREAM";
+pub const SPLIT_WALK: &str = "BLOOMERY_SPLIT_WALK";
 pub const ROUTE_TRACE: &str = "BLOOMERY_ROUTE_TRACE";
 pub const QWEN38_EXPERTS: &str = "BLOOMERY_QWEN38_EXPERTS";
 pub const QWEN3_KV: &str = "BLOOMERY_QWEN3_KV";
@@ -733,6 +734,31 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               name beside `BLOOMERY_RESIDENCY=off` and on a qwen3moe or qwen35moe file, `split` on \
               a load with an expert tier. The load line prints `xstream=`, \
               every streamed layer an `xstream` record, every call `xstream end`.",
+        site: Site::Parsed {
+            left: &[],
+            phase: Phase::Load,
+        },
+    },
+    LeverSpec {
+        name: SPLIT_WALK,
+        class: Class::A,
+        kind: Kind::OnOff,
+        default: Unset::Means(
+            "Qwen3.8: the width rule's walk on a load whose routed experts sit on the cards and \
+             in host memory alone, today's walk on a load with an expert tier or an NVMe-paged \
+             plan",
+        ),
+        doc: "Qwen3.8 prompt calls fed by ubatches: `on` walks a ubatch the width rule \
+              (`runtime::splitwalk::pays`) finds wide enough as two units of half its rows — \
+              each unit's next front enqueued ahead of the other's card route, so the card runs \
+              one unit's front while the host serves the other's union, the layer's fronts in \
+              unit order, one residency pick and one expert stream a layer for both units. \
+              Unstreamed, a token's bits do not move; streamed, the call's pick and stream are \
+              priced from the first unit's routing. `off` walks every ubatch as one unit, the \
+              same-binary arm. Unset is `on` on a load whose routed experts sit on the cards \
+              and in host memory alone and `off` on a load with an expert tier (`--place bp`) or \
+              an NVMe-paged plan, whose costs the rule does not price; `on` there is refused by \
+              name at the load.",
         site: Site::Parsed {
             left: &[],
             phase: Phase::Load,

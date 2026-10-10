@@ -112,6 +112,30 @@
 //!   [`GREEDY_MARGIN`](bloomery_gpu_gates::GREEDY_MARGIN); either way the
 //!   call returns in its walk, admits, sends its admits back and leaves every
 //!   live set where the history left it.
+//! - `units` (the split walk, `Body38::set_split_walk`'s `Every`, against
+//!   one unit; every other clause walks one unit): from a clear, the first
+//!   [`UNITS_PROMPT`] ids of the qwen4exp prose corpus as one prompt call,
+//!   the walk's timing and route taps armed, then [`STREAM_STEPS`] greedy
+//!   steps, with the call's streaming off, `admit` and `split`. The call
+//!   picks once a card layer, at the layers one unit picks at (the group's
+//!   pick, from the first unit's counts at twice); every layer-batch's
+//!   slots — the host's its serve listed, those it left out to the stream,
+//!   and the card's by the taps against the slot map the call left — are
+//!   its columns' every slot, each unit's columns its half; under `split`
+//!   each layer's streamed columns are twice the first unit's left-out
+//!   slots (one unit's: once), and the second unit leaves slots out too
+//!   (the group shares the stream); on every layer the stream ran the
+//!   second unit's front and download between the first unit's download
+//!   and its shadow. Off, the split walk's logits and greedy ids are one
+//!   unit's bit for bit; streamed, they agree as `stream`'s rule allows.
+//!   Mutants: a pick per unit (the pick count); no share of the stream
+//!   (the second unit's left-out slots); the stream read at the first unit
+//!   only (the call's end refuses a layer read by one of its two units, by
+//!   name); the walk in today's order (the order).
+//! - `history_split_on`: `history_split` with the split walk on for the
+//!   walk and its twin, both calls walked as two units, under its rule
+//!   (mutant: the return owed at every unit's back — the next unit's shadow
+//!   asks for a layer its sibling has not served, refused by name).
 //! - `slots_drafted`: a drafted pass of two slots' verify rows folds each
 //!   slot's accepted rows — slot 0 keeping one of its three rows, slot 1
 //!   two of theirs — so the boundary that ends it reports 3 kept rows as
@@ -155,8 +179,9 @@ mod gate {
 
     use app::Session;
     use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for;
-    use bloomery_gpu::arch::qwen3moe::{Body38, Qwen38Model, XSTREAM_COSTS};
+    use bloomery_gpu::arch::qwen3moe::{Body38, Qwen38Model, SplitWalk, XSTREAM_COSTS};
     use bloomery_gpu::host::PassKind;
+    use bloomery_gpu::host::slots::Slot;
     use bloomery_gpu::host::swap::{CallPick, CallReport, PassReport, Residency, SlotState};
     use bloomery_gpu::host::xstream::{Costs, XLayer, XMode, XReport};
     use bloomery_gpu_gates::record;
@@ -198,6 +223,13 @@ mod gate {
         host_us_per_col: 1000.0,
         ..XSTREAM_COSTS
     };
+    /// The `units` clause's prompt: the `stream` clause's, one ubatch the
+    /// split walk cuts into two units of half its rows.
+    const UNITS_PROMPT: usize = STREAM_PROMPT;
+    /// A token's routed slots, the file's top-k.
+    const N_USED: u64 = 10;
+    /// The stream's event marks, to their resolution [ms].
+    const EVENT_MS: f64 = 0.002;
 
     /// The machine's card plan of `inputs` on `card`.
     fn plan_of<'m>(
@@ -493,20 +525,38 @@ mod gate {
         })
     }
 
+    /// A run's greedy facts [`agree`] reads: the prompt call's last logits
+    /// row, every greedy id (the call's first) and each id's top-1 margin.
+    struct Greedy<'r> {
+        logits: &'r [f32],
+        tokens: &'r [u32],
+        margins: &'r [f32],
+    }
+
+    impl StreamRun {
+        fn greedy(&self) -> Greedy<'_> {
+            Greedy {
+                logits: &self.logits,
+                tokens: &self.tokens,
+                margins: &self.margins,
+            }
+        }
+    }
+
     /// How a streamed run `on` agrees with the unstreamed `off` (the card and
     /// the host sum a token's experts in another split): the prompt's last
     /// logits row's max |diff|, within [`GREEDY_MARGIN`]; where the greedy
     /// ids first part, if anywhere; and whether they are equal or part at a
     /// near tie (`on`'s top-1 margin there below it).
-    fn agree(on: &StreamRun, off: &StreamRun) -> (f32, bool, Option<usize>, bool) {
+    fn agree(on: &Greedy<'_>, off: &Greedy<'_>) -> (f32, bool, Option<usize>, bool) {
         let dlogit = on
             .logits
             .iter()
-            .zip(&off.logits)
+            .zip(off.logits)
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
         let logits_ok = on.logits.len() == off.logits.len() && dlogit < GREEDY_MARGIN;
-        let parted = on.tokens.iter().zip(&off.tokens).position(|(a, b)| a != b);
+        let parted = on.tokens.iter().zip(off.tokens).position(|(a, b)| a != b);
         let ids_ok = on.tokens.len() == off.tokens.len()
             && parted.is_none_or(|i| on.margins.get(i).is_some_and(|&m| m < GREEDY_MARGIN));
         (dlogit, logits_ok, parted, ids_ok)
@@ -547,7 +597,7 @@ mod gate {
             && off.xlayers.is_empty()
             && off.xend.is_none();
         let count_ok = a.excluded == columns(&a) && b.excluded == columns(&b) && off.excluded == 0;
-        let (dlogit, logits_ok, parted, ids_ok) = agree(&a, &off);
+        let (dlogit, logits_ok, parted, ids_ok) = agree(&a.greedy(), &off.greedy());
         let key = |r: &StreamRun| -> Vec<(usize, usize, usize, usize, u64, u64)> {
             r.xlayers
                 .iter()
@@ -625,7 +675,7 @@ mod gate {
         let admitted = on.end.map_or(0, |r| r.admitted);
         let map_ok = on.moved > 0 && off.moved == 0 && admitted > 0 && !on.open && !off.open;
         let slots_ok = on.first_slots < off.first_slots;
-        let (dlogit, logits_ok, parted, ids_ok) = agree(&on, &off);
+        let (dlogit, logits_ok, parted, ids_ok) = agree(&on.greedy(), &off.greedy());
         // A prompt too short for the floor opens no call.
         let short_ids = prose_ids("qwen4exp", Body38::STREAM_FLOOR as usize - 1)?;
         s.clear()?;
@@ -913,6 +963,375 @@ mod gate {
         Ok(ok)
     }
 
+    /// `history_split_on`: the `history_split` call with the split walk on
+    /// ([`SplitWalk::Every`]) for the walk and its twin alike — the 64-id
+    /// prompt before the history and the call each walked as two units —
+    /// under the same rule: the call returns in its walk (its last unit's
+    /// back owes each layer's return, so no return asks for a layer one
+    /// unit still has to serve), admits, sends its admits back and leaves
+    /// every live set where the history left it; where every pick is the
+    /// twin's the logits are the twin's bit for bit, else within
+    /// [`GREEDY_MARGIN`]; both calls walked two units (mutant: the return
+    /// owed at every unit's back — the next unit's shadow asks for a layer
+    /// its sibling has not served, refused by name).
+    fn history_split_on_clause(s: &mut Session<Body38>) -> Result<bool, GateError> {
+        set_stream(s, XMode::Split)?;
+        s.model_mut()
+            .body_parts(NAME)?
+            .2
+            .set_xstream_costs(SPLIT_COSTS)?;
+        set_stream(s, XMode::Off)?;
+        let set = |s: &mut Session<Body38>, w| -> Result<(), GateError> {
+            Ok(s.model_mut().body_parts(NAME)?.2.set_split_walk(w)?)
+        };
+        let units = |s: &Session<Body38>| -> Result<usize, GateError> {
+            Ok(s.model().body(NAME)?.ubatch_units())
+        };
+        set(s, SplitWalk::Every)?;
+        let r = (|| -> Result<_, GateError> {
+            let walk = history_run(s, XMode::Split, SPLIT_PROMPT, false)?;
+            let walk_units = units(s)?;
+            let twin = history_run(s, XMode::Split, SPLIT_PROMPT, true)?;
+            Ok((walk, walk_units, twin, units(s)?))
+        })();
+        set(s, SplitWalk::Off)?;
+        let (walk, walk_units, twin, twin_units) = r?;
+        let same_picks = pick_keys(&walk.picks) == pick_keys(&twin.picks);
+        let dprompt = max_diff(&walk.prompt, &twin.prompt);
+        let dstep = max_diff(&walk.step, &twin.step);
+        let bits = same_bits(&walk.prompt, &twin.prompt) && same_bits(&walk.step, &twin.step);
+        let values_ok = if same_picks {
+            bits
+        } else {
+            dprompt < GREEDY_MARGIN && dstep < GREEDY_MARGIN
+        };
+        // The step after the call is a ubatch of none: the units read are
+        // the call's.
+        let units_ok = walk_units == 2 && twin_units == 2;
+        let ok = !walk.end.kept
+            && !twin.end.kept
+            && walk.end.admitted > 0
+            && walk.end.restored > 0
+            && twin.end.restored > 0
+            && walk.end.return_us > 0
+            && twin.end.return_us == 0
+            && walk.back
+            && twin.back
+            && values_ok
+            && units_ok;
+        println!(
+            "history_split_on: the {SPLIT_PROMPT}-id split call by the split walk, its return in \
+             the walk / at its end: {walk_units} / {twin_units} units (want 2), {} / {} experts \
+             admitted, restored {} / {}, kept {} / {}, the walk's return time {} / {} us, every \
+             layer's live set back {} / {}; the picks the twin's {same_picks}, the prompt's last \
+             logits and the first step's max|diff| {dprompt} / {dstep} (bit for bit {bits}; \
+             under {GREEDY_MARGIN} where a pick parts) {values_ok}: {}",
+            walk.end.admitted,
+            twin.end.admitted,
+            walk.end.restored,
+            twin.end.restored,
+            walk.end.kept,
+            twin.end.kept,
+            walk.end.return_us,
+            twin.end.return_us,
+            walk.back,
+            twin.back,
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
+    /// A layer-batch of a `units` run: its layer and unit, its columns, the
+    /// host slots its serve listed and those it left out to the expert
+    /// stream, the first unit's stream gap, and — by the route taps against
+    /// the slot map the call left — its slots on the card and in all.
+    struct UnitRow {
+        layer: usize,
+        unit: usize,
+        cols: usize,
+        host: u64,
+        excluded: u64,
+        card: u64,
+        all: u64,
+    }
+
+    /// One `units` run ([`units_run`]).
+    struct UnitsRun {
+        tokens: Vec<u32>,
+        logits: Vec<f32>,
+        margins: Vec<f32>,
+        units: usize,
+        picks: Vec<(usize, CallPick)>,
+        xlayers: Vec<(usize, XLayer)>,
+        rows: Vec<UnitRow>,
+        /// The layers whose first unit's stream gap — from its download to
+        /// its shadow — does not hold the second unit's front and download.
+        out_of_order: Vec<usize>,
+    }
+
+    impl UnitsRun {
+        fn greedy(&self) -> Greedy<'_> {
+            Greedy {
+                logits: &self.logits,
+                tokens: &self.tokens,
+                margins: &self.margins,
+            }
+        }
+
+        /// The host slots the serves of `unit` left out at `layer`.
+        fn excluded(&self, layer: usize, unit: usize) -> u64 {
+            self.rows
+                .iter()
+                .filter(|r| r.layer == layer && r.unit == unit)
+                .map(|r| r.excluded)
+                .sum()
+        }
+    }
+
+    /// One run of the `units` clause from a clear: the prompt call's
+    /// streaming `mode`, its one ubatch walked under `walk` with the walk's
+    /// timing and route taps armed, then [`STREAM_STEPS`] greedy steps;
+    /// every setting back off after it.
+    fn units_run(
+        s: &mut Session<Body38>,
+        ids: &[u32],
+        mode: XMode,
+        walk: SplitWalk,
+    ) -> Result<UnitsRun, GateError> {
+        let n = ids.len();
+        s.clear()?;
+        take_passes(s)?;
+        set_stream(s, mode)?;
+        let arm = |s: &mut Session<Body38>, on: bool| -> Result<(), GateError> {
+            let (gpu, _, b) = s.model_mut().body_parts(NAME)?;
+            b.set_split_walk(if on { walk } else { SplitWalk::Off })?;
+            b.set_ubatch_route_taps(gpu, if on { n } else { 0 })?;
+            Ok(s.model_mut().set_prompt38_stats(on)?)
+        };
+        arm(s, true)?;
+        let r = units_prompt(s, ids);
+        let disarmed = arm(s, false);
+        let mut run = r?;
+        disarmed?;
+        let mut next = run.tokens[0];
+        for _ in 0..STREAM_STEPS {
+            let out = s.step(next, Want::Logits)?;
+            next = out.argmax();
+            if let Out::Logits { row, .. } = out {
+                run.margins.push(margin(row)?);
+            }
+            run.tokens.push(next);
+        }
+        take_passes(s)?;
+        set_stream(s, XMode::Off)?;
+        Ok(run)
+    }
+
+    /// [`units_run`]'s prompt call and what it read back before any step:
+    /// the walk's units, its picks and `xstream` records, and a row per
+    /// layer-batch — each unit's half of the taps' ids counted against the
+    /// slot map the call left (a step's boundary may move it) beside the
+    /// serve's counts — and the units' order on the stream.
+    fn units_prompt(s: &mut Session<Body38>, ids: &[u32]) -> Result<UnitsRun, GateError> {
+        let n = ids.len();
+        let out = s.prompt(ids, Want::Logits)?;
+        let next = out.argmax();
+        let Out::Logits { row, .. } = out else {
+            return Err("the prompt call returned no logits row".into());
+        };
+        let logits = row.to_vec();
+        let margins = vec![margin(&logits)?];
+        let (gpu, _, b) = s.model_mut().body_parts(NAME)?;
+        let units = b.ubatch_units();
+        let widths = if units == 2 {
+            vec![n.div_ceil(2), n / 2]
+        } else {
+            vec![n]
+        };
+        let taps = b.ubatch_route_taps(gpu, 0, n)?;
+        // Each (layer, unit)'s slots on the card, and all its slots.
+        let mut card: Vec<Vec<(u64, u64)>> = Vec::new();
+        {
+            let map = b.hybrid().slots();
+            let mut t0 = 0;
+            for (u, &w) in widths.iter().enumerate() {
+                for tap in &taps[t0..t0 + w] {
+                    if card.len() < tap.len() {
+                        card.resize(tap.len(), vec![(0, 0); widths.len()]);
+                    }
+                    for (l, r) in tap.iter().enumerate() {
+                        let on_card = r
+                            .ids
+                            .iter()
+                            .filter(|&&id| {
+                                matches!(map.slot(l, id), Some(Slot::Card(_) | Slot::Tier { .. }))
+                            })
+                            .count();
+                        card[l][u].0 += on_card as u64;
+                        card[l][u].1 += r.ids.len() as u64;
+                    }
+                }
+                t0 += w;
+            }
+        }
+        let (picks, _) = b.take_stream_records();
+        let (xlayers, _) = b.take_xstream_records();
+        let stats = s
+            .model_mut()
+            .take_prompt38_stats()?
+            .ok_or("the prompt call's walk kept no timing record")?;
+        let mut rows = Vec::with_capacity(stats.rows.len());
+        for r in &stats.rows {
+            let (on_card, all) = card
+                .get(r.layer)
+                .and_then(|c| c.get(r.unit))
+                .copied()
+                .ok_or_else(|| format!("a timing row of layer {} unit {}", r.layer, r.unit))?;
+            rows.push(UnitRow {
+                layer: r.layer,
+                unit: r.unit,
+                cols: r.cols,
+                host: r.slots,
+                excluded: r.excluded,
+                card: on_card,
+                all,
+            });
+        }
+        let mut out_of_order = Vec::new();
+        if units == 2 {
+            for l in 0..card.len() {
+                let row = |u: usize| stats.rows.iter().find(|r| r.layer == l && r.unit == u);
+                let in_order = match (row(0), row(1)) {
+                    (Some(a), Some(b)) => {
+                        a.gap_ms.unwrap_or(0.0) + EVENT_MS >= b.front_ms + b.down_ms
+                            && b.gap_ms.is_some()
+                    }
+                    _ => false,
+                };
+                if !in_order {
+                    out_of_order.push(l);
+                }
+            }
+        }
+        Ok(UnitsRun {
+            tokens: vec![next],
+            logits,
+            margins,
+            units,
+            picks,
+            xlayers,
+            rows,
+            out_of_order,
+        })
+    }
+
+    /// `units`: the split walk ([`SplitWalk::Every`]) against one unit, from
+    /// a clear each, the prompt call's streaming off, `admit` and `split`.
+    /// Its call picks once a card layer (the group's pick: unit 0's counts
+    /// at twice, the same layers as one unit's); every layer-batch's slots —
+    /// the host's its serve listed, those it left out to the stream and the
+    /// card's by the route taps against the map the call left — are its
+    /// columns' every slot, each unit's columns its half; under `split` each
+    /// layer's streamed columns are twice the first unit's left-out slots
+    /// and the second unit left out slots too (the shared stream); on every
+    /// layer the second unit's front and download ran between the first
+    /// unit's download and its shadow; off, the split walk's bits are one
+    /// unit's, streamed it agrees with one unit as the stream rule allows
+    /// (`stream`'s rule). Mutants: a pick per unit (the pick count); no
+    /// share of the stream (the second unit's left-out slots); the stream
+    /// read at the first unit (the call's end refuses a layer read by one of
+    /// its two units, by name); the walk in today's order (the order).
+    fn units_clause(s: &mut Session<Body38>) -> Result<bool, GateError> {
+        let ids = prose_ids("qwen4exp", UNITS_PROMPT)?;
+        set_stream(s, XMode::Split)?;
+        s.model_mut()
+            .body_parts(NAME)?
+            .2
+            .set_xstream_costs(SPLIT_COSTS)?;
+        set_stream(s, XMode::Off)?;
+        let widths = [ids.len().div_ceil(2), ids.len() / 2];
+        let mut ok = true;
+        for mode in [XMode::Off, XMode::Admit, XMode::Split] {
+            let off = units_run(s, &ids, mode, SplitWalk::Off)?;
+            let on = units_run(s, &ids, mode, SplitWalk::Every)?;
+            let layers_of = |r: &UnitsRun| -> Vec<usize> {
+                let mut l: Vec<usize> = r.picks.iter().map(|(_, p)| p.layer).collect();
+                l.sort_unstable();
+                l
+            };
+            let (on_layers, off_layers) = (layers_of(&on), layers_of(&off));
+            let distinct = on_layers.windows(2).all(|w| w[0] < w[1]);
+            let streams = mode != XMode::Off;
+            let picks_ok = on_layers == off_layers
+                && distinct
+                && on.picks.iter().all(|(u, _)| *u == 0)
+                && on_layers.is_empty() != streams;
+            let sum_ok = |r: &UnitsRun, w: &[usize]| {
+                r.rows.len() == w.len() * r.rows.iter().map(|x| x.layer + 1).max().unwrap_or(0)
+                    && r.rows.iter().all(|x| {
+                        x.unit < w.len()
+                            && x.cols == w[x.unit]
+                            && x.all == x.cols as u64 * N_USED
+                            && x.host + x.excluded + x.card == x.all
+                    })
+            };
+            let slots_ok = on.units == 2
+                && off.units == 1
+                && sum_ok(&on, &widths)
+                && sum_ok(&off, &[ids.len()]);
+            // The stream prices unit 0's counts at twice: its streamed
+            // columns are twice what unit 0's serve left out.
+            let streamed = |r: &UnitsRun, twice: u64| {
+                r.xlayers
+                    .iter()
+                    .all(|(_, x)| x.streamed_columns == twice * r.excluded(x.layer, 0))
+            };
+            let shared: u64 = on
+                .rows
+                .iter()
+                .filter(|r| r.unit == 1)
+                .map(|r| r.excluded)
+                .sum();
+            let share_ok = if mode == XMode::Split {
+                !on.xlayers.is_empty() && streamed(&on, 2) && streamed(&off, 1) && shared > 0
+            } else {
+                on.xlayers.is_empty() && on.rows.iter().all(|r| r.excluded == 0)
+            };
+            let order_ok = on.out_of_order.is_empty();
+            let (dlogit, logits_ok, parted, ids_ok) = agree(&on.greedy(), &off.greedy());
+            let values_ok = if streams {
+                logits_ok && ids_ok
+            } else {
+                same_bits(&on.logits, &off.logits) && on.tokens == off.tokens
+            };
+            let clause_ok = picks_ok && slots_ok && share_ok && order_ok && values_ok;
+            println!(
+                "units ({}): a {}-id prompt call by the split walk / one unit: {} / {} units, \
+                 picks at {} / {} card layers, one a layer, the group's {picks_ok}; every \
+                 layer-batch's host, left-out and card slots its columns' every slot, each unit's \
+                 columns its half {slots_ok}; the second unit's left-out slots {shared}, each \
+                 layer's streamed columns twice the first unit's left-out {share_ok}; layers out \
+                 of the fronts' order {:?} {order_ok}; the prompt's last logits max|diff| \
+                 {dlogit}, the greedy ids parted at {parted:?} ({}) {values_ok}: {}",
+                mode.word(),
+                ids.len(),
+                on.units,
+                off.units,
+                on_layers.len(),
+                off_layers.len(),
+                on.out_of_order,
+                if streams {
+                    "under the stream rule"
+                } else {
+                    "bit for bit"
+                },
+                verdict(clause_ok)
+            );
+            ok &= clause_ok;
+        }
+        Ok(ok)
+    }
+
     /// The load the slots clauses share: planned for the two slots it serves
     /// ([`PlanInputs::plan_with_slots`]; the gate's own load plans one, and
     /// a pass of several slots on it is refused by name), opened after the
@@ -944,7 +1363,9 @@ mod gate {
             Body38::open_placed_residency(file, &plan, inputs, 0, host, ub, residency, 2)?,
             CTX as u32,
         );
-        s.model_mut().body_parts(NAME)?.2.log_residency(0);
+        let b = s.model_mut().body_parts(NAME)?.2;
+        b.log_residency(0);
+        b.set_split_walk(SplitWalk::Off)?;
         take_passes(&mut s)?;
         s.add_slots(2)?;
         Ok(s)
@@ -1093,7 +1514,11 @@ mod gate {
             open(path, &inputs, machine.clone(), residency, host, ub)?,
             CTX as u32,
         );
-        s.model_mut().body_parts(NAME)?.2.log_residency(0);
+        // Every clause walks its ubatches as one unit, the split walk's own
+        // (`units`, `history_split_on`) aside, which set it and set it back.
+        let b = s.model_mut().body_parts(NAME)?.2;
+        b.log_residency(0);
+        b.set_split_walk(SplitWalk::Off)?;
         println!("load in {:.1} s", t0.elapsed().as_secs_f64());
         let seeds = seeds(&s)?;
 
@@ -1183,6 +1608,8 @@ mod gate {
         pass &= history_clause(&mut s)?;
         pass &= split_clause(&mut s)?;
         pass &= history_split_clause(&mut s)?;
+        pass &= units_clause(&mut s)?;
+        pass &= history_split_on_clause(&mut s)?;
         // The gate's load is done: the card holds one load, and the slots
         // clauses bring their own.
         drop(s);

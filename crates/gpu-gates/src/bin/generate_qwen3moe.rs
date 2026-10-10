@@ -373,7 +373,7 @@ mod cli {
     use bloomery_gpu::arch::qwen3moe::ubatch::{ImageWrite, ubatch_for, ubatch_size};
     use bloomery_gpu::arch::qwen3moe::{
         Body, Body35, Body38, KvQ8, Open35, PrefillPath, PrefillPlan, PrefillStep, Prompt38,
-        Qwen35moeModel, Qwen38Model,
+        Qwen35moeModel, Qwen38Model, SplitWalk,
     };
     use bloomery_gpu::host::PassKind;
     use bloomery_gpu::host::route_trace::RouteTrace;
@@ -1230,6 +1230,7 @@ mod cli {
             bloomery_levers::RESIDENCY,
             bloomery_levers::HOSTSTREAM,
             bloomery_levers::XSTREAM,
+            bloomery_levers::SPLIT_WALK,
             bloomery_levers::GEN_SLOTS,
         ];
         if std::env::args().any(|a| a == "--place") {
@@ -1489,6 +1490,13 @@ mod cli {
             return Err(
                 "BLOOMERY_XSTREAM moves a qwen4exp prompt's host experts to the card; a qwen3moe \
                  or qwen35moe plan holds every one on the card"
+                    .into(),
+            );
+        }
+        if family != Family::Qwen38 && levers.split_walk().is_some() {
+            return Err(
+                "BLOOMERY_SPLIT_WALK cuts a qwen4exp ubatch walk into two units; a qwen3moe or \
+                 qwen35moe prompt walks no units"
                     .into(),
             );
         }
@@ -2337,7 +2345,9 @@ mod cli {
     }
 
     /// `BLOOMERY_XSTREAM` on the load and its `xstream=` line, by the rule
-    /// the Qwen3.8 serve seat shares ([`xstream38`]); `BLOOMERY_HOSTSTREAM`
+    /// the Qwen3.8 serve seat shares ([`xstream38`]); `BLOOMERY_SPLIT_WALK`
+    /// set, the walks' cut (`on` the width rule's, refused by name on a load
+    /// the rule does not price; unset, the load's own); `BLOOMERY_HOSTSTREAM`
     /// set here is refused by name.
     fn stream38(
         m: &mut Qwen38Model,
@@ -2355,6 +2365,9 @@ mod cli {
         let (gpu, _, body) = m.body_parts("generate_qwen3moe")?;
         let line = xstream38(gpu, body, levers.xstream(), stage38(place), residency)?;
         println!("{line}");
+        if let Some(on) = levers.split_walk() {
+            body.set_split_walk(if on { SplitWalk::Rule } else { SplitWalk::Off })?;
+        }
         Ok(())
     }
 

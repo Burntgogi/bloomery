@@ -71,6 +71,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use cuda_core::{CudaContext, CudaEvent, CudaStream, DeviceBuffer, sys};
+use runtime::sched::BatchOrder;
 use runtime::xsplit::{self, Constants, Split};
 
 use super::batch::BatchKey;
@@ -204,6 +205,13 @@ pub struct XReport {
     /// Host microseconds the end took.
     pub end_us: u64,
 }
+
+/// The order a batch walk of several units over one shared stream runs in:
+/// every unit's first front ahead of the shadows, so the first unit's wait
+/// for its landings sits behind the other units' fronts and never in front
+/// of them ([`BatchOrder::Fronts`]). A walk that shares the stream declares
+/// it as its [`runtime::sched::LayerProgram::BATCH_ORDER`].
+pub const GROUP_WALK_ORDER: BatchOrder = BatchOrder::Fronts;
 
 /// The most landing batches a layer's copies split into ([`land_batch_size`]
 /// keeps the count at or under it).

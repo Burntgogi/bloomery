@@ -64,7 +64,11 @@
 //!   from a clear the first [`PROMPT_4K`] ids as one prompt call (one ubatch
 //!   of two card-route runs, the tier's block route over both) and
 //!   [`PROMPT_STEPS`] greedy steps, bit for bit the reference's as under
-//!   `--union`.
+//!   `--union`; on the reference the same call by the split walk
+//!   (`SplitWalk::Every`: two units of half its rows, the host streaming off)
+//!   bit for bit its one-unit run, the walk two units; on the tier load the
+//!   split walk set by the rule refused by name (a tier load), the load's
+//!   own cut one unit. Every load opens with the split walk off.
 //! - `--lost`: on the last load, the tier's stream held behind a host flag
 //!   before a step — the tier stops signalling: within the go deadline and
 //!   its grace the step fails naming the lost card, the host tier is
@@ -104,7 +108,7 @@ mod gate {
     use app::Session;
     use bloomery_gpu::HostFlags;
     use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for;
-    use bloomery_gpu::arch::qwen3moe::{Body38, Prompt38, Qwen38Model};
+    use bloomery_gpu::arch::qwen3moe::{Body38, Prompt38, Qwen38Model, SplitWalk};
     use bloomery_gpu::host::swap::{PassReport, Residency};
     use bloomery_gpu::host::tier::{TierAct, TierCard, TierSet};
     use bloomery_gpu::host::xstream::XMode;
@@ -322,7 +326,9 @@ mod gate {
             m.resident_bytes()
         );
         let mut s = Session::from_model(m, u32::try_from(ctx)?);
-        s.model_mut().body_parts(NAME)?.2.log_residency(0);
+        let b = s.model_mut().body_parts(NAME)?.2;
+        b.log_residency(0);
+        b.set_split_walk(SplitWalk::Off)?;
         Ok(s)
     }
 
@@ -884,6 +890,20 @@ mod gate {
         Ok(run)
     }
 
+    /// [`prompt_run`] with the host streaming off by the split walk
+    /// ([`SplitWalk::Every`]), and the units the prompt call's walk ran; the
+    /// cut set back to one unit either way.
+    fn split_run(s: &mut Session<Body38>, ids: &[u32]) -> Result<(Run, usize), GateError> {
+        let set = |s: &mut Session<Body38>, w| -> Result<(), GateError> {
+            Ok(s.model_mut().body_parts(NAME)?.2.set_split_walk(w)?)
+        };
+        set(s, SplitWalk::Every)?;
+        let r = prompt_run(s, ids, false)
+            .and_then(|run| Ok((run, s.model().body(NAME)?.ubatch_units())));
+        set(s, SplitWalk::Off)?;
+        r
+    }
+
     /// From a clear, `ids` as one explicit ubatch prompt call
     /// ([`Prompt38::Gemm`]: the reference load would take the pass below
     /// eight ids) and [`PROMPT_STEPS`] greedy steps: the call's argmax, then
@@ -1032,15 +1052,54 @@ mod gate {
             return Err("the reference load holds a tier card".into());
         }
         let want = prompt_run(&mut r, &ids, false)?;
+        let (on, units) = split_run(&mut r, &ids)?;
+        let split_ok = same(
+            &format!("the reference's {PROMPT_4K}-id prompt call by the split walk vs one unit"),
+            &want,
+            &on,
+        ) && units == 2;
+        println!(
+            "the reference's split walk ran {units} units (want 2): {}",
+            verdict(units == 2)
+        );
         drop(r);
         let mut t = open(path, &plan, inputs, (host, ub, CTX_4K), Residency::Off)?;
+        let refused = refuses_split(&mut t)?;
         let (got, served) = served_prompt(&mut t, &ids)?;
         let ok = same(
             &format!("two cards, a {PROMPT_4K}-id prompt call at {CTX_4K} positions"),
             &want,
             &got,
         );
-        Ok(batch_precondition(served, Some(&tl)) && ok && tight)
+        let one = t.model().body(NAME)?.ubatch_units() == 1;
+        println!(
+            "the tier load's prompt call ran {} unit(s) (want 1): {}",
+            t.model().body(NAME)?.ubatch_units(),
+            verdict(one)
+        );
+        Ok(batch_precondition(served, Some(&tl)) && ok && tight && split_ok && refused && one)
+    }
+
+    /// The split walk by the rule set on a tier load: refused by name (a
+    /// tier load), the load's cut left one unit.
+    fn refuses_split(t: &mut Session<Body38>) -> Result<bool, GateError> {
+        let b = t.model_mut().body_parts(NAME)?.2;
+        let e = b.set_split_walk(SplitWalk::Rule);
+        let named = e.as_ref().is_err_and(|e| {
+            e.to_string().contains("BLOOMERY_SPLIT_WALK") && e.to_string().contains("tier load")
+        });
+        let kept = b.split_walk() == SplitWalk::Off;
+        println!(
+            "the split walk by the rule on the tier load: {} (want refused, naming the lever and a \
+             tier load), the cut {:?} (want Off): {}",
+            match &e {
+                Ok(()) => "set".to_string(),
+                Err(e) => format!("refused: {e}"),
+            },
+            b.split_walk(),
+            verdict(named && kept)
+        );
+        Ok(named && kept)
     }
 
     /// `generate_qwen3moe`'s first record of `kind` of a short run of `ids`

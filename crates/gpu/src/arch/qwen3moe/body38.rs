@@ -116,7 +116,7 @@ use super::swap38::{self, DEADLINE, LIVE_DELAY};
 use super::tier38::{TierSide38, open_tier};
 use super::ubatch::UBATCH as UBATCH_MOST;
 use super::wide38::{
-    Gemm38, STREAM_FLOOR, Stream38, Wide38, WideForce, WideParts, WideTaps, dense_rows,
+    Gemm38, STREAM_FLOOR, SplitWalk, Stream38, Wide38, WideForce, WideParts, WideTaps, dense_rows,
     route_taps_host,
 };
 use crate::checkpoint::Checkpoints;
@@ -1419,7 +1419,7 @@ impl Body38 {
         let tier = (!tiers.is_empty())
             .then(|| TierSide38::new(gpu, &map))
             .transpose()?;
-        let wide = Wide38::new(stream, ub, &card, tier.is_some())?;
+        let mut wide = Wide38::new(stream, ub, &card, tier.is_some())?;
         let wide_bytes = (wa.bytes() + wr.bytes() + wide_hsum.num_bytes() + wide.bytes()) as u64;
         if wide_bytes > counted {
             return Err(GpuError::shape(
@@ -1455,6 +1455,9 @@ impl Body38 {
         experts.attach_tier(arena)?;
         residency_glue.attach_tier(experts.tier())?;
         let nvme_tier = experts.tier().cloned();
+        if nvme_tier.is_some() {
+            wide.paged();
+        }
         experts.prepare_union(host_cols)?;
         // The plan reserves the tier's block scratch for blocks of the batch
         // port's columns: the block route's bytes there.
@@ -1890,6 +1893,29 @@ impl Body38 {
         }
         self.stream.mode = Some(mode);
         Ok(())
+    }
+
+    /// How the ubatch walks cut their rows (`BLOOMERY_SPLIT_WALK`,
+    /// [`SplitWalk`]) from the next walk on. The load sets
+    /// [`SplitWalk::Rule`] on a load whose routed experts sit on the cards
+    /// and in host memory alone and [`SplitWalk::Off`] on one with an expert
+    /// tier or an NVMe-paged plan; a split there is refused by name, the cut
+    /// left as it was.
+    pub fn set_split_walk(&mut self, w: SplitWalk) -> Result<(), GpuError> {
+        self.wide.set_split_walk(w)
+    }
+
+    /// How the ubatch walks cut their rows ([`Body38::set_split_walk`]).
+    #[must_use]
+    pub fn split_walk(&self) -> SplitWalk {
+        self.wide.split_walk()
+    }
+
+    /// The units the last ubatch walk ran (two for a split walk); 0 before
+    /// a walk since the load. Gate use.
+    #[must_use]
+    pub fn ubatch_units(&self) -> usize {
+        self.wide.walked_units
     }
 
     /// Whether a returning prompt call ([`super::wide38`]'s module doc) runs
@@ -3102,7 +3128,7 @@ impl GpuModel<Body38> {
     pub fn set_prompt38_stats(&mut self, on: bool) -> Result<(), GpuError> {
         let (gpu, _, body) = self.body_parts("qwen4exp set_prompt38_stats")?;
         body.wide_timing = if on {
-            Some(PromptTiming::new(gpu.context(), body.plans.len(), 1)?)
+            Some(PromptTiming::new(gpu.context(), body.plans.len(), 2)?)
         } else {
             None
         };
