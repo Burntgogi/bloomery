@@ -22,8 +22,20 @@
     <key>PATH</key>
     <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
   </dict>
+  <!-- Event-driven: launchd runs the job when a state file changes (a writer's start, end or landing), throttled to
+       one run per ThrottleInterval; the interval is only the fallback for gh-side changes (new PRs and comments). -->
+  <key>WatchPaths</key>
+  <array>
+    <string>@HOME@/.cache/bloomery/board/KICK</string>
+    <string>@HOME@/.cache/bloomery/board/release.json</string>
+    <string>@HOME@/.cache/bloomery/board/trains</string>
+    <string>@HOME@/.cache/bloomery/board/workers</string>
+    <string>@HOME@/.cache/bloomery/board/batch</string>
+  </array>
+  <key>ThrottleInterval</key>
+  <integer>15</integer>
   <key>StartInterval</key>
-  <integer>120</integer>
+  <integer>600</integer>
   <key>RunAtLoad</key>
   <true/>
   <key>StandardOutPath</key>

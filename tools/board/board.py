@@ -625,7 +625,7 @@ def render(b, now):
     when = local(now).strftime("%Y-%m-%d %H:%M %z")
     piece, caption = mood(b, now)
     L = ["```text", *PIECES[piece], ascii_cut(caption, ART_COLS), "```", "",
-         "_Rewritten every 2 minutes by `tools/board/board.py`: state files, `gh` and `git log` only, no LLM. "
+         "_Rewritten on every train, batch and worker change by `tools/board/board.py`: state files, `gh` and `git log` only, no LLM. "
          f"Rendered {when}._", ""]
     L += release_lines(b, now)
 
