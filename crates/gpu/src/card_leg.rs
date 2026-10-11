@@ -663,7 +663,12 @@ mod tests {
                 data.push(bytes);
             }
         }
-        let dir = std::env::temp_dir().join(format!("bloomery-card-leg-{}", std::process::id()));
+        // One file per call: the tests run on parallel threads, and a second
+        // File::create of a path the first test still maps is a SIGBUS.
+        static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let call = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("bloomery-card-leg-{}-{call}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("a temp dir");
         let path = dir.join("stacks.gguf");
         let layout = Layout::new(&[], decls.clone()).expect("a layout");
