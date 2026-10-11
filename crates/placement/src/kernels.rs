@@ -445,21 +445,29 @@ pub const fn embed(ty: GgmlType) -> Option<EmbedEntry> {
 /// Whether the common card leg (`crates/gpu/src/card_leg.rs`) launches the
 /// gate·up entry of a routed gate or up stack of type `ty`: the table's
 /// [`gate_up`] row, for the entries whose launchers read a `Q8Act` of more
-/// columns than a run uses. The IQ3_XXS, IQ4_XS and Q8_0 rows have a launcher
-/// of that shape and no arm in the leg yet.
+/// columns than a run uses. The Q8_0 row has a launcher of that shape and no
+/// arm in the leg yet.
 #[must_use]
 pub const fn card_gate_up_runs(ty: GgmlType) -> bool {
     matches!(
         gate_up(ty),
-        Some(GateUpEntry::Q4k | GateUpEntry::Q5k | GateUpEntry::Mxfp4)
+        Some(
+            GateUpEntry::Q4k
+                | GateUpEntry::Q5k
+                | GateUpEntry::Mxfp4
+                | GateUpEntry::Iq3xxs
+                | GateUpEntry::Iq4xs
+        )
     )
 }
 
 /// Whether the common card leg launches the down entry of a routed down stack
-/// of type `ty`: the table's [`down`] row, for the entries that read the
-/// 128-value [`DownAct::Q8Act`] the leg quantizes and take an activation of
-/// more columns than a run uses. The Q6_K launcher still reads exactly one
-/// column a slot; the Q5_0, Q5_1, Q8_0 and IQ4_NL rows read [`DownAct::Q8Blocks32`].
+/// of type `ty`: the table's [`down`] row, for the entries whose launchers take
+/// an activation of more columns than a run uses, with the form the leg
+/// quantizes for them: the 128-value [`DownAct::Q8Act`] (Q4_K, Q5_K, MXFP4) or
+/// the 32-value [`DownAct::Q8Blocks32`] (Q5_1, Q8_0, IQ4_NL). The Q6_K launcher
+/// takes such an activation and has no arm in the leg yet; the Q5_0 row reads
+/// the packed layout, not the file's blocks.
 #[must_use]
 pub const fn card_down_runs(ty: GgmlType) -> bool {
     matches!(
@@ -467,6 +475,9 @@ pub const fn card_down_runs(ty: GgmlType) -> bool {
         Some((
             DownEntry::Q4k | DownEntry::Q5k | DownEntry::Mxfp4,
             DownAct::Q8Act
+        )) | Some((
+            DownEntry::Q5_1 | DownEntry::Q8_0 | DownEntry::Iq4nl,
+            DownAct::Q8Blocks32
         ))
     )
 }
@@ -729,9 +740,11 @@ mod tests {
         }
     }
 
-    /// The leg checks each role by its own rule: the sets coincide today, and a
-    /// type whose table row the leg has no arm for is in neither (the i-quant
-    /// and Q8_0 gate·up rows, the Q6_K down row).
+    /// The leg checks each role by its own rule: the gate·up and down sets
+    /// differ (the i-quant gate·up types have no down row, the 32-value-block
+    /// down types no gate·up row), and a type whose table row the leg has no
+    /// arm for is in neither (the Q8_0 gate·up row, the Q6_K and Q5_0 down
+    /// rows).
     #[test]
     fn the_leg_admits_each_role_by_its_own_rule() {
         let gate_up_runs: Vec<GgmlType> = ALL
@@ -741,13 +754,29 @@ mod tests {
         let down_runs: Vec<GgmlType> = ALL.into_iter().filter(|&ty| card_down_runs(ty)).collect();
         assert_eq!(
             gate_up_runs,
-            [GgmlType::Q4_K, GgmlType::Q5_K, GgmlType::MXFP4]
+            [
+                GgmlType::Q4_K,
+                GgmlType::Q5_K,
+                GgmlType::MXFP4,
+                GgmlType::IQ3_XXS,
+                GgmlType::IQ4_XS
+            ]
         );
-        assert_eq!(down_runs, [GgmlType::Q4_K, GgmlType::Q5_K, GgmlType::MXFP4]);
-        for ty in [GgmlType::IQ3_XXS, GgmlType::IQ4_XS, GgmlType::Q8_0] {
-            assert!(gate_up(ty).is_some() && !card_gate_up_runs(ty), "{ty:?}");
+        assert_eq!(
+            down_runs,
+            [
+                GgmlType::Q5_1,
+                GgmlType::Q8_0,
+                GgmlType::Q4_K,
+                GgmlType::Q5_K,
+                GgmlType::MXFP4,
+                GgmlType::IQ4_NL
+            ]
+        );
+        assert!(gate_up(GgmlType::Q8_0).is_some() && !card_gate_up_runs(GgmlType::Q8_0));
+        for ty in [GgmlType::Q6_K, GgmlType::Q5_0] {
+            assert!(down(ty).is_some() && !card_down_runs(ty), "{ty:?}");
         }
-        assert!(down(GgmlType::Q6_K).is_some() && !card_down_runs(GgmlType::Q6_K));
     }
 
     /// A type id the enum does not name has no row in any operation.

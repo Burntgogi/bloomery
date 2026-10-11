@@ -232,7 +232,9 @@ impl Q6kSelKernels {
     /// as expert `sel[s]`'s rows against `act` column `s`. `w` is the whole
     /// stack as its byte stream in u32 words (`w.rows()` rows, a positive
     /// multiple of `rows_per_expert`, row `r` at byte `r · 210 · n_sb`, the
-    /// tail zero-padded); `act` holds exactly `n_slots` columns. An id
+    /// tail zero-padded); `act` holds at least `n_slots` columns: column `s`
+    /// is read for `s < n_slots`, so a cap-sized activation serves a smaller
+    /// batch. An id
     /// `>= n_experts` leaves its slot of `y` untouched, and one that is not
     /// [`HOST`] raises [`FaultSite::ExpertId`] on the owning `Gpu`'s fault
     /// word as an unlabelled launch ([`LAYER_NONE`]: the launcher knows no
@@ -253,11 +255,11 @@ impl Q6kSelKernels {
     ) -> Result<(), GpuError> {
         let what = "enqueue_gemv_q6k_sel";
         let n_sb = act.n_sb();
-        if act.m() != n_slots {
+        if act.m() < n_slots {
             return Err(GpuError::shape(
                 what,
                 format!(
-                    "one activation column per slot: act.m() = {} must equal n_slots = {n_slots}",
+                    "an activation column per slot: act.m() = {} must be at least n_slots = {n_slots}",
                     act.m()
                 ),
             ));

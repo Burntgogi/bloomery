@@ -7,8 +7,10 @@
 //! - the gate·up `_sel` of the entry [`kernels::gate_up`] names for the
 //!   stacks' type, the activation rule a launch argument, slot `s` against
 //!   column `s / slots_per_col`, writing `h` (`ff` rows a slot);
-//! - the q8_1 of the card slots' `h` columns (`Q4kSelKernels::
-//!   enqueue_quantize_sel`; a slot the run places off the card is left alone);
+//! - the q8_1 of the card slots' `h` columns in the form the down entry reads
+//!   ([`DownAct`]: `Q4kSelKernels::enqueue_quantize_sel` for 128-value
+//!   blocks, `Q5Kernels::enqueue_quantize_q8_sel` for 32-value blocks; a slot
+//!   the run places off the card is left alone);
 //! - the down `_sel` of the entry [`kernels::down`] names, writing `down`
 //!   (`n` rows a slot).
 //!
@@ -23,21 +25,29 @@
 //! `sel` (the handoff's, or a batch's `CardSlotKernels::enqueue_places`), what
 //! the sum is combined with (a shared expert, the residual, the host tier's
 //! rows) or its own sum where the common one is not its rule (the expert
-//! tier's rows beside the card's, another slot count), and the routing
-//! weights.
+//! tier's rows beside the card's, another slot count or weight pitch), and
+//! the routing weights. A caller whose down rows live in a buffer of its own
+//! (the expert tier's staged rows) runs [`CardLeg::enqueue_rows`].
 //!
 //! The run launches the entries [`kernels::card_gate_up_runs`] and
 //! [`kernels::card_down_runs`] admit, each stack by its role: those whose
 //! launchers read an activation of more columns than a run uses (a
 //! [`LegBufs`] sized for `cap` tokens serves a unit of fewer in one launch).
+//! The buffers hold the down's activation in one form ([`LegBufs::for_down`]);
+//! a stack whose down entry reads the other is refused by name before the
+//! first launch.
 //! A stack of any other type is refused by name when the stacks are read
 //! ([`LegStacks::of`]), and an entry the table names but the run has no arm
 //! for is refused by name at the launch.
 
 use crate::card_slots::{CardAcc, CardSlotKernels};
+use crate::iq_sel::{IqDown, IqGateUp, IqSelKernels};
 use crate::kquant::{Act, GateUpAct, KquantKernels, SelDown};
 use crate::mxfp4_sel::Mxfp4SelKernels;
 use crate::q4k_sel::QuantSel;
+use crate::q5::Q8Blocks32;
+use crate::q5_1_sel::{Q51SelDown, Q51SelKernels};
+use crate::q8_0_sel32::{Q80SelDown, Q80SelKernels};
 use crate::weights::{DevWeight, Weights};
 use crate::{DeviceTensor, Gpu, GpuError, Q8Act};
 use cuda_core::{CudaStream, DeviceBuffer};
@@ -68,25 +78,63 @@ impl LegShape {
     }
 }
 
+/// The card slots' q8_1 columns in the form a down entry reads.
+enum ActH {
+    Q8Act(Q8Act),
+    Blocks32(Q8Blocks32),
+}
+
+impl ActH {
+    fn form(&self) -> DownAct {
+        match self {
+            ActH::Q8Act(_) => DownAct::Q8Act,
+            ActH::Blocks32(_) => DownAct::Q8Blocks32,
+        }
+    }
+
+    fn bytes(&self) -> usize {
+        match self {
+            ActH::Q8Act(a) => a.device_bytes(),
+            ActH::Blocks32(a) => a.q.num_bytes() + a.s8.num_bytes() + a.d8.num_bytes(),
+        }
+    }
+}
+
 /// One run's buffers for up to `shape.cap` tokens: the normed rows' q8_1 form,
 /// the gate·up's rows, the card slots' q8_1 columns and the down's rows.
 pub struct LegBufs {
     shape: LegShape,
     act_x: Q8Act,
     h: DeviceBuffer<f32>,
-    act_h: Q8Act,
+    act_h: ActH,
     down: DeviceBuffer<f32>,
 }
 
 impl LegBufs {
-    /// The buffers for runs of `shape`. Load-time or first-prompt only.
+    /// The buffers for runs of `shape` whose down entries read [`DownAct::
+    /// Q8Act`] (the K-quant and MXFP4 downs). Load-time or first-prompt only.
     pub fn new(stream: &CudaStream, shape: LegShape) -> Result<LegBufs, GpuError> {
+        LegBufs::for_down(stream, shape, DownAct::Q8Act)
+    }
+
+    /// The buffers for runs of `shape` whose down entries read `act`, the form
+    /// [`kernels::down`] names for the stacks' type. Load-time or first-prompt
+    /// only.
+    pub fn for_down(
+        stream: &CudaStream,
+        shape: LegShape,
+        act: DownAct,
+    ) -> Result<LegBufs, GpuError> {
         let slots = shape.slots();
+        let act_h = match act {
+            DownAct::Q8Act => ActH::Q8Act(Q8Act::with_slots(stream, slots, shape.ff)?),
+            DownAct::Q8Blocks32 => ActH::Blocks32(Q8Blocks32::with_slots(stream, shape.ff, slots)?),
+        };
         Ok(LegBufs {
             shape,
             act_x: Q8Act::with_tier_cols(stream, shape.cap, shape.n)?,
             h: DeviceBuffer::zeroed(stream, slots * shape.ff)?,
-            act_h: Q8Act::with_slots(stream, slots, shape.ff)?,
+            act_h,
             down: DeviceBuffer::zeroed(stream, slots * shape.n)?,
         })
     }
@@ -97,14 +145,11 @@ impl LegBufs {
         self.shape
     }
 
-    /// Device bytes of the buffers: [`leg_bytes`] of their shape, as
-    /// allocated.
+    /// Device bytes of the buffers: [`leg_bytes_for`] of their shape and
+    /// form, as allocated.
     #[must_use]
     pub fn bytes(&self) -> usize {
-        self.act_x.device_bytes()
-            + self.h.num_bytes()
-            + self.act_h.device_bytes()
-            + self.down.num_bytes()
+        self.act_x.device_bytes() + self.h.num_bytes() + self.act_h.bytes() + self.down.num_bytes()
     }
 
     /// The down rows of the last run: `n` values a slot, slot-major, the
@@ -116,18 +161,34 @@ impl LegBufs {
     }
 }
 
-/// Device bytes a [`LegBufs`] of `shape` allocates, counted before it does:
-/// the normed rows' q8_1 form (`cap` columns of `n`), the gate·up's rows, the
-/// card slots' q8_1 columns (`cap · slots_per_col` of `ff`) and the down's
-/// rows.
+/// Device bytes a [`LegBufs::new`] of `shape` allocates, counted before it
+/// does: [`leg_bytes_for`] of the [`DownAct::Q8Act`] form.
 #[must_use]
 pub fn leg_bytes(shape: LegShape) -> usize {
+    leg_bytes_for(shape, DownAct::Q8Act)
+}
+
+/// Device bytes a [`LegBufs::for_down`] of `shape` and `act` allocates,
+/// counted before it does: the normed rows' q8_1 form (`cap` columns of `n`),
+/// the gate·up's rows, the card slots' q8_1 columns (`cap · slots_per_col` of
+/// `ff`) and the down's rows.
+#[must_use]
+pub fn leg_bytes_for(shape: LegShape, act: DownAct) -> usize {
     let slots = shape.slots();
     let f = size_of::<f32>();
-    q8_act_bytes(shape.cap, shape.n)
-        + f * slots * shape.ff
-        + q8_act_bytes(slots, shape.ff)
-        + f * slots * shape.n
+    let act_h = match act {
+        DownAct::Q8Act => q8_act_bytes(slots, shape.ff),
+        DownAct::Q8Blocks32 => q8_blocks32_bytes(slots, shape.ff),
+    };
+    q8_act_bytes(shape.cap, shape.n) + f * slots * shape.ff + act_h + f * slots * shape.n
+}
+
+/// Device bytes of a [`Q8Blocks32`] of `cols` columns of `k` values (a multiple
+/// of 32): per column `256 · ceil(k_blocks / 32)` words of `q` and `k_blocks`
+/// values each of `s8` and `d8`, of 4 bytes, `k_blocks = k / 32`.
+const fn q8_blocks32_bytes(cols: usize, k: usize) -> usize {
+    let k_blocks = k / 32;
+    cols * 4 * (256 * k_blocks.div_ceil(32) + 2 * k_blocks)
 }
 
 /// Device bytes of a [`Q8Act`] of `cols` columns of `k` values (a multiple of
@@ -264,22 +325,38 @@ pub struct LegSum<'a> {
 pub struct CardLeg {
     kquant: KquantKernels,
     mxfp4: Mxfp4SelKernels,
+    q51: Q51SelKernels,
+    q80: Q80SelKernels,
+    iq: IqSelKernels,
     slots: CardSlotKernels,
+}
+
+/// The buffers of a [`LegBufs`] a run writes besides its down rows.
+struct Scratch<'a> {
+    shape: LegShape,
+    act_x: &'a mut Q8Act,
+    h: &'a mut DeviceBuffer<f32>,
+    act_h: &'a mut ActH,
 }
 
 impl CardLeg {
     /// The modules on `gpu`. Load-time only.
     pub fn load(gpu: &Gpu) -> Result<CardLeg, GpuError> {
+        let (ctx, word) = (gpu.context(), gpu.fault_word());
         Ok(CardLeg {
-            kquant: KquantKernels::load(gpu.context(), gpu.fault_word())?,
-            mxfp4: Mxfp4SelKernels::load(gpu.context(), gpu.fault_word())?,
-            slots: CardSlotKernels::load(gpu.context())?,
+            kquant: KquantKernels::load(ctx, word)?,
+            mxfp4: Mxfp4SelKernels::load(ctx, word)?,
+            q51: Q51SelKernels::load(ctx, word)?,
+            q80: Q80SelKernels::load(ctx, word)?,
+            iq: IqSelKernels::load(ctx, word)?,
+            slots: CardSlotKernels::load(ctx)?,
         })
     }
 
     /// Enqueue on `gpu`'s stream the four launches (module doc) of `run` into
     /// `bufs`, and with `sum` the card slots' sum after them; `run.m` outside
-    /// `1..=bufs.shape().cap`, or a sum over a slot count the sum has no entry
+    /// `1..=bufs.shape().cap`, a down entry that reads the other activation
+    /// form than `bufs` holds, or a sum over a slot count the sum has no entry
     /// for, is refused by name before the first launch. Asynchronous,
     /// allocation-free, capturable.
     pub fn enqueue(
@@ -289,33 +366,118 @@ impl CardLeg {
         run: &LegRun<'_>,
         sum: Option<LegSum<'_>>,
     ) -> Result<(), GpuError> {
-        let LegShape {
-            cap,
-            slots_per_col,
-            n,
-            ff,
-        } = bufs.shape;
+        let LegBufs {
+            shape,
+            act_x,
+            h,
+            act_h,
+            down,
+        } = bufs;
+        let shape = *shape;
+        if sum.is_some() {
+            Slots::of(shape.slots_per_col).map_err(|e| GpuError::Shape {
+                what: WHAT,
+                detail: format!("the card sum: {e}"),
+            })?;
+        }
+        let scratch = Scratch {
+            shape,
+            act_x,
+            h,
+            act_h,
+        };
+        self.launch(gpu, scratch, run, down)?;
+        let Some(LegSum { w, acc }) = sum else {
+            return Ok(());
+        };
+        let a = CardAcc {
+            down,
+            w,
+            sel: run.sel,
+            n: shape.n,
+            m: run.m,
+            n_card: run.n_card,
+            n_used: shape.slots_per_col,
+        };
+        self.slots.enqueue_card_acc(gpu.stream(), &a, acc)
+    }
+
+    /// [`CardLeg::enqueue`]'s four launches, the down rows written to `down`
+    /// (`shape.n` values a slot, slot-major, at least `m · slots_per_col`
+    /// slots) instead of `bufs`'s own: for a caller whose rows live in a
+    /// buffer of its own, and which sums them itself. Asynchronous,
+    /// allocation-free, capturable.
+    pub fn enqueue_rows(
+        &self,
+        gpu: &Gpu,
+        bufs: &mut LegBufs,
+        run: &LegRun<'_>,
+        down: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let LegBufs {
+            shape,
+            act_x,
+            h,
+            act_h,
+            ..
+        } = bufs;
+        let scratch = Scratch {
+            shape: *shape,
+            act_x,
+            h,
+            act_h,
+        };
+        self.launch(gpu, scratch, run, down)
+    }
+
+    /// The four launches of `run` into `scratch` and `down`.
+    fn launch(
+        &self,
+        gpu: &Gpu,
+        scratch: Scratch<'_>,
+        run: &LegRun<'_>,
+        down: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let Scratch {
+            shape:
+                LegShape {
+                    cap,
+                    slots_per_col,
+                    n,
+                    ff,
+                },
+            act_x,
+            h,
+            act_h,
+        } = scratch;
         if run.m == 0 || run.m > cap {
             return Err(GpuError::Shape {
                 what: WHAT,
                 detail: format!("a run of {} tokens in buffers of {cap}", run.m),
             });
         }
-        if sum.is_some() {
-            Slots::of(slots_per_col).map_err(|e| GpuError::Shape {
+        let st = run.stacks;
+        if let Some((_, form)) = kernels::down(st.down.ty)
+            && form != act_h.form()
+        {
+            return Err(GpuError::Shape {
                 what: WHAT,
-                detail: format!("the card sum: {e}"),
-            })?;
+                detail: format!(
+                    "the down stack {} of {} reads {form:?} columns; the buffers hold {:?}",
+                    st.down.name,
+                    st.down.ty,
+                    act_h.form()
+                ),
+            });
         }
         let stream = gpu.stream();
         let fault = gpu.layer_sink(run.layer)?;
-        let st = run.stacks;
         let slots = run.m * slots_per_col;
-        gpu.enqueue_quantize_q8_1_cols(run.normed, &mut bufs.act_x, run.m, run.layer)?;
+        gpu.enqueue_quantize_q8_1_cols(run.normed, act_x, run.m, run.layer)?;
         let a = GateUpAct {
             wg: st.gate.w,
             wu: st.up.w,
-            act: &bufs.act_x,
+            act: act_x,
             sel: run.sel,
             n_slots: slots,
             rows_per_expert: ff,
@@ -323,66 +485,102 @@ impl CardLeg {
             rule: run.rule,
         };
         match kernels::gate_up(st.gate.ty) {
-            Some(GateUpEntry::Q4k) => {
-                self.kquant
-                    .enqueue_gate_up_q4k(stream, &a, fault, &mut bufs.h)?
-            }
-            Some(GateUpEntry::Q5k) => {
-                self.kquant
-                    .enqueue_gate_up_q5k(stream, &a, fault, &mut bufs.h)?
-            }
-            Some(GateUpEntry::Mxfp4) => {
-                self.mxfp4.enqueue_gate_up(stream, &a, fault, &mut bufs.h)?
+            Some(GateUpEntry::Q4k) => self.kquant.enqueue_gate_up_q4k(stream, &a, fault, h)?,
+            Some(GateUpEntry::Q5k) => self.kquant.enqueue_gate_up_q5k(stream, &a, fault, h)?,
+            Some(GateUpEntry::Mxfp4) => self.mxfp4.enqueue_gate_up(stream, &a, fault, h)?,
+            Some(GateUpEntry::Iq3xxs | GateUpEntry::Iq4xs) => {
+                let iq = IqGateUp {
+                    ty: st.gate.ty,
+                    wg: a.wg,
+                    wu: a.wu,
+                    act: a.act,
+                    sel: a.sel,
+                    n_slots: a.n_slots,
+                    rows_per_expert: a.rows_per_expert,
+                    slots_per_col: a.slots_per_col,
+                    rule: a.rule,
+                };
+                self.iq.enqueue_gate_up(stream, &iq, fault, h)?;
             }
             _ => return Err(st.gate.unrun()),
         }
         let q = QuantSel {
-            x: &bufs.h,
+            x: h,
             cols: 0..slots,
             sel: run.sel,
             n_card: run.n_card,
         };
-        gpu.q4k_sel()
-            .enqueue_quantize_sel(stream, &q, fault, &mut bufs.act_h)?;
-        let d = SelDown {
-            w: st.down.w,
-            act: &bufs.act_h,
-            sel: run.sel,
-            n_slots: slots,
-            rows_per_expert: n,
-        };
-        match kernels::down(st.down.ty) {
-            Some((DownEntry::Q4k, DownAct::Q8Act)) => gpu.q4k_sel().enqueue_gemv_q4k_sel(
-                stream,
-                d.w,
-                d.act,
-                d.sel,
-                d.n_slots,
-                d.rows_per_expert,
-                &mut bufs.down,
-            )?,
-            Some((DownEntry::Q5k, DownAct::Q8Act)) => {
-                self.kquant
-                    .enqueue_gemv_q5k_sel(stream, &d, fault, &mut bufs.down)?
+        match act_h {
+            ActH::Q8Act(act) => gpu.q4k_sel().enqueue_quantize_sel(stream, &q, fault, act)?,
+            ActH::Blocks32(act) => gpu.q5().enqueue_quantize_q8_sel(stream, &q, act, fault)?,
+        }
+        let w = st.down.w;
+        let (sel, rows_per_expert) = (run.sel, n);
+        match (kernels::down(st.down.ty), &*act_h) {
+            (Some((DownEntry::Q4k, DownAct::Q8Act)), ActH::Q8Act(act)) => {
+                gpu.q4k_sel().enqueue_gemv_q4k_sel(
+                    stream,
+                    w,
+                    act,
+                    sel,
+                    slots,
+                    rows_per_expert,
+                    down,
+                )?;
             }
-            Some((DownEntry::Mxfp4, DownAct::Q8Act)) => {
-                self.mxfp4.enqueue_down(stream, &d, fault, &mut bufs.down)?
+            (Some((DownEntry::Q5k, DownAct::Q8Act)), ActH::Q8Act(act)) => {
+                let d = SelDown {
+                    w,
+                    act,
+                    sel,
+                    n_slots: slots,
+                    rows_per_expert,
+                };
+                self.kquant.enqueue_gemv_q5k_sel(stream, &d, fault, down)?;
+            }
+            (Some((DownEntry::Mxfp4, DownAct::Q8Act)), ActH::Q8Act(act)) => {
+                let d = SelDown {
+                    w,
+                    act,
+                    sel,
+                    n_slots: slots,
+                    rows_per_expert,
+                };
+                self.mxfp4.enqueue_down(stream, &d, fault, down)?;
+            }
+            (Some((DownEntry::Q5_1, DownAct::Q8Blocks32)), ActH::Blocks32(act)) => {
+                let d = Q51SelDown {
+                    w,
+                    act,
+                    sel,
+                    n_slots: slots,
+                    rows_per_expert,
+                };
+                self.q51.enqueue_gemv_q5_1_sel(stream, &d, fault, down)?;
+            }
+            (Some((DownEntry::Q8_0, DownAct::Q8Blocks32)), ActH::Blocks32(act)) => {
+                let d = Q80SelDown {
+                    w,
+                    act,
+                    sel,
+                    n_slots: slots,
+                    rows_per_expert,
+                };
+                self.q80.enqueue_gemv_q8_0_sel32(stream, &d, fault, down)?;
+            }
+            (Some((DownEntry::Iq4nl, DownAct::Q8Blocks32)), ActH::Blocks32(act)) => {
+                let d = IqDown {
+                    w,
+                    act,
+                    sel,
+                    n_slots: slots,
+                    rows_per_expert,
+                };
+                self.iq.enqueue_down(stream, &d, fault, down)?;
             }
             _ => return Err(st.down.unrun()),
         }
-        let Some(LegSum { w, acc }) = sum else {
-            return Ok(());
-        };
-        let a = CardAcc {
-            down: &bufs.down,
-            w,
-            sel: run.sel,
-            n,
-            m: run.m,
-            n_card: run.n_card,
-            n_used: slots_per_col,
-        };
-        self.slots.enqueue_card_acc(stream, &a, acc)
+        Ok(())
     }
 }
 
@@ -630,5 +828,110 @@ mod tests {
                 );
             }
         }
+    }
+    /// The buffers of each activation form hold the bytes [`leg_bytes_for`]
+    /// counts for their shape.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_the_buffers_hold_the_counted_bytes_of_each_form() {
+        let gpu = Gpu::with_device(0).expect("a Gpu on device 0");
+        let shape = LegShape {
+            cap: CAP,
+            slots_per_col: SPC,
+            n: N,
+            ff: FF,
+        };
+        for form in [DownAct::Q8Act, DownAct::Q8Blocks32] {
+            let bufs = LegBufs::for_down(gpu.stream(), shape, form).expect("the buffers");
+            assert_eq!(bufs.bytes(), leg_bytes_for(shape, form), "{form:?}");
+        }
+        let bufs = LegBufs::new(gpu.stream(), shape).expect("the buffers");
+        assert_eq!(bufs.bytes(), leg_bytes(shape));
+    }
+
+    /// A run whose down entry reads the other activation form than the
+    /// buffers hold is refused by name before the first launch (the down's
+    /// rows stay as they were), and [`CardLeg::enqueue_rows`] writes the rows
+    /// [`CardLeg::enqueue`] writes into the caller's buffer, leaving the
+    /// buffers' own as they were.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_the_leg_refuses_the_other_form_and_writes_the_callers_rows() {
+        let gpu = Gpu::with_device(0).expect("a Gpu on device 0");
+        let stream = gpu.stream();
+        let leg = CardLeg::load(&gpu).expect("the leg");
+        let ty = GgmlType::Q4_K;
+        let w = weights(&gpu, [ty, GgmlType::Q5_K]);
+        let names = [
+            format!("gate_{ty}"),
+            format!("up_{ty}"),
+            format!("down_{ty}"),
+        ];
+        let stacks = LegStacks::of(&w, [&names[0], &names[1], &names[2]]).expect("the stacks");
+        let host_normed: Vec<f32> = (0..CAP * N)
+            .map(|i| ((i * 2654435761usize) % 2001) as f32 / 1000.0 - 1.0)
+            .collect();
+        let normed = DeviceBuffer::from_host(stream, &host_normed).expect("the normed rows");
+        let sel = DeviceBuffer::from_host(stream, &SEL).expect("the places");
+        let shape = LegShape {
+            cap: CAP,
+            slots_per_col: SPC,
+            n: N,
+            ff: FF,
+        };
+        let run = LegRun {
+            layer: 0,
+            stacks: &stacks,
+            normed: &normed,
+            m: CAP,
+            sel: &sel,
+            n_card: N_CARD,
+            rule: Act::SiluMul,
+        };
+        let sentinel = vec![SENT; CAP * SPC * N];
+
+        let mut other = LegBufs::for_down(stream, shape, DownAct::Q8Blocks32).expect("buffers");
+        other
+            .down
+            .copy_from_host(stream, &sentinel)
+            .expect("sentinel");
+        let refused = leg.enqueue(&gpu, &mut other, &run, None);
+        assert!(
+            matches!(&refused, Err(GpuError::Shape { what: WHAT, .. })),
+            "a Q8Blocks32 buffer for a Q4_K down: {refused:?}"
+        );
+        let rows = other.down.to_host_vec(stream).expect("the rows");
+        assert!(rows.iter().all(|v| *v == SENT), "a refused run wrote rows");
+
+        let mut own = LegBufs::new(stream, shape).expect("buffers");
+        own.down
+            .copy_from_host(stream, &sentinel)
+            .expect("sentinel");
+        leg.enqueue(&gpu, &mut own, &run, None).expect("the run");
+        let want = own.down.to_host_vec(stream).expect("the rows");
+        let mut elsewhere = LegBufs::new(stream, shape).expect("buffers");
+        elsewhere
+            .down
+            .copy_from_host(stream, &sentinel)
+            .expect("sentinel");
+        let mut mine = DeviceBuffer::from_host(stream, &sentinel).expect("the caller's rows");
+        leg.enqueue_rows(&gpu, &mut elsewhere, &run, &mut mine)
+            .expect("the run into the caller's rows");
+        let got = mine.to_host_vec(stream).expect("the rows");
+        assert!(
+            gpu.take_fault().expect("the fault word").is_none(),
+            "a fault"
+        );
+        assert!(
+            got.iter()
+                .zip(&want)
+                .all(|(g, w)| g.to_bits() == w.to_bits()),
+            "enqueue_rows wrote other rows than enqueue"
+        );
+        let own_rows = elsewhere.down.to_host_vec(stream).expect("the rows");
+        assert!(
+            own_rows.iter().all(|v| *v == SENT),
+            "enqueue_rows wrote the buffers' own rows"
+        );
     }
 }

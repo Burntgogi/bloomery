@@ -27,7 +27,9 @@
 //!    `iq4_nl_row_dot32_host` per lane plus the butterfly — at m ∈ {1, 2, 4,
 //!    8} columns × 10 slots a column, ids repeating an expert inside a
 //!    column and across columns, `HOST` included. `HOST` rows stay at the
-//!    sentinel; a rerun is bit-identical.
+//!    sentinel; a rerun is bit-identical; the down over an activation of twice
+//!    the slots' columns (the first the exact-width one's) writes the same
+//!    bits.
 //! 2. **Cross-layout, bits.** Under the same rule at m = 8, `h` equals
 //!    `act::apply` of `iq3_xxs_rows` / `iq4_xs_rows` over `IqFormat::repack`
 //!    of the same gate and up rows (the plane kernels, one launch an expert
@@ -1265,7 +1267,13 @@ mod gate {
             let bits = bits_equal(&y, &host);
             let rerun = bits_equal(&y, &again);
             let sentinel = host_slots_sent(&sel, &y, st.rpe);
-            ok &= bits && rerun && sentinel && fault.is_none() && fault2.is_none();
+            // An activation of more columns than slots serves the launch.
+            let mut x_wide = x.clone();
+            x_wide.extend(seeded(n_slots * st.k(), 9301 + m as u32, -2.0, 4.0));
+            let (act_wide, _) = blocks32_cols(&c.gpu, &x_wide, st.k(), 2 * n_slots)?;
+            let (y_wide, fault_wide) = down(c, st, w, &act_wide, &sel)?;
+            let wide = bits_equal(&y_wide, &y) && fault_wide.is_none();
+            ok &= bits && rerun && sentinel && wide && fault.is_none() && fault2.is_none();
 
             // Clause 3: the f64 dot of dequant_row's row with the f32
             // column, the module doc's bound, over the sampled rows.
@@ -1317,13 +1325,14 @@ mod gate {
             rel = (err_max / ref_max).max(rel);
             println!(
                 "nl[k={} experts={} rpe={} slots={n_slots}] host_rule_bits={} rerun={} \
-                 host_slots_sentinel={} f64_band={} fault=\"{}\" {}{}",
+                 host_slots_sentinel={} wide_act={} f64_band={} fault=\"{}\" {}{}",
                 st.k(),
                 st.experts,
                 st.rpe,
                 verdict(bits),
                 verdict(rerun),
                 verdict(sentinel),
+                verdict(wide),
                 verdict(in_bound),
                 shown(&fault),
                 mismatch("host_rule", &y, &host),

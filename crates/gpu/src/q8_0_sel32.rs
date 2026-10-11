@@ -229,7 +229,9 @@ pub struct Q80SelDown<'a> {
     /// `block_q8_0` bytes as words ([`stream_cols`] words a row, `w.rows()` a
     /// positive multiple of `rows_per_expert`).
     pub w: &'a DeviceTensor<u32>,
-    /// One 32-value q8_1 column per slot: `act.m() == n_slots`.
+    /// At least `n_slots` 32-value q8_1 columns: column `s` is read for `s <
+    /// n_slots` and the rest are not touched, so a cap-sized activation serves
+    /// a smaller batch.
     pub act: &'a Q8Blocks32,
     /// At least `n_slots` ids, read on the device at each launch.
     pub sel: &'a DeviceBuffer<u32>,
@@ -309,13 +311,12 @@ impl Q80SelKernels {
                 ),
             ));
         }
-        if n_slots == 0 || a.act.m() != n_slots || a.sel.len() < n_slots || y.len() < n_slots * rpe
-        {
+        if n_slots == 0 || a.act.m() < n_slots || a.sel.len() < n_slots || y.len() < n_slots * rpe {
             return Err(GpuError::shape(
                 what,
                 format!(
-                    "{n_slots} slots (at least one): one activation column a slot (act.m() {}), \
-                     an id a slot (sel.len() {}), y.len() {} >= n_slots*rows_per_expert = {}",
+                    "{n_slots} slots (at least one): an activation column a slot (act.m() {} >= \
+                     n_slots), an id a slot (sel.len() {}), y.len() {} >= n_slots*rows_per_expert = {}",
                     a.act.m(),
                     a.sel.len(),
                     y.len(),

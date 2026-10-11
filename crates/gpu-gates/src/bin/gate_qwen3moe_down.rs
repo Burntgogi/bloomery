@@ -7,7 +7,9 @@
 //!    2048-row experts; for a sel vector with a repeated id, slot `s` equals
 //!    `q6k_gemv` over expert `sel[s]`'s rows alone against a one-column
 //!    activation quantized from column `s` alone, bit for bit; an id past
-//!    the stack leaves its slot untouched; a rerun is bit-identical.
+//!    the stack leaves its slot untouched; a rerun is bit-identical; an
+//!    activation of twice the slots' columns (the first the exact-width one's)
+//!    writes the same bits and one of fewer columns than slots is refused.
 //! 2. The kernel's arithmetic on the real K = 768 stacks (630-byte rows,
 //!    every other row at 2 mod 4): each slot against the f64 dot of the
 //!    dequantized rows with the q8_1-reconstructed activation within
@@ -138,6 +140,28 @@ mod gate {
         // host-served slot and raises nothing.
         let fault = gpu.take_fault()?;
         let want_fault = Fault::at(LAYER_NONE, FaultSite::ExpertId);
+        // An activation of more columns than slots serves the launch; one of
+        // fewer is refused by name.
+        let mut x_wide = x.clone();
+        x_wide.extend(activations(k_out, 4, 6329));
+        let act_wide = quantize(&gpu, &x_wide, 8, k_out)?;
+        let mut y_wide = DeviceBuffer::from_host(stream, &vec![SENT; 4 * rpe])?;
+        q6.enqueue_gemv_q6k_sel(stream, &stack, &act_wide, &sel, 4, rpe, &mut y_wide)?;
+        stream.synchronize()?;
+        let wide_same = bits_equal(&y_wide.to_host_vec(stream)?, &runs[0]);
+        let act_few = quantize(&gpu, &x[..2 * k_out], 2, k_out)?;
+        let few_refused = matches!(
+            q6.enqueue_gemv_q6k_sel(stream, &stack, &act_few, &sel, 4, rpe, &mut y_wide),
+            Err(bloomery_gpu::GpuError::Shape {
+                what: "enqueue_gemv_q6k_sel",
+                ..
+            })
+        );
+        println!(
+            "body wide_act cols=8 slots=4 bit_identical={wide_same} two_columns_refused={few_refused} {}",
+            verdict(wide_same && few_refused)
+        );
+        ok &= wide_same && few_refused;
         let untouched = |s: usize| {
             yo[s * rpe..(s + 1) * rpe]
                 .iter()

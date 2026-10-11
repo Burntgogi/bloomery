@@ -50,9 +50,10 @@
 //!    untouched; a rerun bit-identical. On 2560 × 640: a captured launch replays
 //!    as one node and follows overwritten ids; an id past the stack raises
 //!    `ExpertId` and leaves its slot as it was; a NaN in a column raises
-//!    `Q5Quant` from the quantizer and the down adds no fault; the launcher
-//!    refuses an activation of another K, a column count other than the slots
-//!    and a non-dividing expert size.
+//!    `Q5Quant` from the quantizer and the down adds no fault; an activation
+//!    of twice the slots' columns serves the launch with the exact-width
+//!    launch's rows bit for bit; the launcher refuses an activation of another
+//!    K, fewer columns than the slots and a non-dividing expert size.
 //! 8. q8_0: the Q8_0 entries (`q8_0_gemv_sel`, `kq_gate_up_act_q8_0`) over rows
 //!    in the file's 34-byte block layout, synthetic codes over all 256 byte
 //!    values. Clause 1 against `dequant_row(Q8_0)` at K = 256, 768, 1280, 2304
@@ -104,9 +105,10 @@
 //!     raises `ExpertId` and leaves its slot as it was; a NaN in a column
 //!     raises `Q5Quant` from the quantizer and the down adds no fault; a NaN
 //!     `d` in an odd block of one row NaNs that row of each slot on its expert
-//!     and nothing else, with no fault; the launcher refuses an activation of
-//!     another K, a column count other than the slots, a non-dividing expert
-//!     size and a stack of Q5_1's row width. Mutants, each red here: the odd
+//!     and nothing else, with no fault; an activation of twice the slots'
+//!     columns serves the launch with the exact-width launch's rows bit for
+//!     bit; the launcher refuses an activation of another K, fewer columns than
+//!     the slots, a non-dividing expert size and a stack of Q5_1's row width. Mutants, each red here: the odd
 //!     block's `d` read from the low half (the band), the parity of a block
 //!     taken in its row (the band at 64 × 1120), the `HOST` slot not skipped
 //!     (the untouched slot), `ExpertId` not raised (the past-stack fault).
@@ -945,7 +947,8 @@ mod gate {
              swiglu_clamp on the down's sums bit for bit; Walk A over Q4_K is q4k_gemv_sel bit \
              for bit on 6 K; q5_1_gemv_sel within {KERNEL_BAND:e} of the f64 dequant_row \
              reference and q5_1_gemv of the packed expert bit for bit at 4 shapes, HOST \
-             untouched, graph replay, expert_id past the stack, q5_quant on a NaN column; \
+             untouched, graph replay, expert_id past the stack, q5_quant on a NaN column, a \
+             wider activation bit for bit; \
              the Q8_0 entries within the band at 8 shapes (GLM's dense and shared \
              FFN among them) with their probe decoding as the host, their gate·up the rule on \
              their down's sums, their faults as Q5_K's, and each launcher refusing the other \
@@ -956,7 +959,8 @@ mod gate {
              f32_product named, the launchers' refusals; q8_0_gemv_sel32 within \
              {KERNEL_BAND:e} of the f64 dequant_row reference at 5 shapes (odd blocks a row \
              among them), HOST untouched, graph replay, expert_id past the stack, q5_quant on a \
-             NaN column, a NaN scale NaNs its rows, the launcher's refusals; the grouped entries at \
+             NaN column, a NaN scale NaNs its rows, a wider activation bit for bit, the launcher's \
+             refusals; the grouped entries at \
              GLM's routed shapes: the gather, the Q4_K and Q5_K gate·up and the Q5_K down by tiles \
              each their _sel's bit for bit, HOST untouched, the launchers' refusals"
         );
@@ -1852,8 +1856,37 @@ mod gate {
             shown(fd),
             verdict(pass)
         );
+        ok &= check_wider_act32(c, "q5_1", (&x, k), |a| down51(c, &st, a, &SEL51))?;
         ok &= check_q5_1_host_contract(c, &st, &act)?;
         Ok(ok)
+    }
+
+    /// Clauses 7 and 11's wider activation: `2 · SEL51.len()` columns, the first
+    /// `SEL51.len()` the exact-width activation's (`x`, rows of `k`) and the
+    /// rest no slot's, serve the down launch `run`: its rows are the
+    /// exact-width launch's, bit for bit, and it raises no fault.
+    fn check_wider_act32(
+        c: &Ctx,
+        label: &str,
+        (x, k): (&[f32], usize),
+        run: impl Fn(&Q8Blocks32) -> Result<(Vec<f32>, Option<Fault>), GateError>,
+    ) -> Result<bool, GateError> {
+        let n = SEL51.len();
+        let mut wide_x = x[..n * k].to_vec();
+        wide_x.extend(activations(k, n, 6551));
+        let (exact, _) = quantize51(c, &wide_x, n, k)?;
+        let (wide, _) = quantize51(c, &wide_x, 2 * n, k)?;
+        let (want, _) = run(&exact)?;
+        let (got, fault) = run(&wide)?;
+        let same = bits_equal(&got, &want);
+        let pass = same && fault.is_none();
+        println!(
+            "{label}_wide_act cols={} slots={n} bit_identical={same} fault=\"{}\" {}",
+            2 * n,
+            shown(fault),
+            verdict(pass)
+        );
+        Ok(pass)
     }
 
     /// Clause 7's refusals: each a `Shape` error of the launcher.
@@ -2765,6 +2798,9 @@ mod gate {
             shown(fs),
             verdict(pass)
         );
+        ok &= check_wider_act32(c, "q8_0_sel32", (&x, k), |a| {
+            down80(c, &st.w, rpe, a, &SEL51)
+        })?;
         ok &= check_q8_0_sel32_host_contract(c, &st, &act)?;
         Ok(ok)
     }
