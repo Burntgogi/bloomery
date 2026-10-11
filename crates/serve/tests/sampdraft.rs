@@ -10,12 +10,12 @@
 mod common;
 
 use std::net::SocketAddr;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use common::{get, post, start_sampling};
 use serde_json::{Value, json};
-use serve::mock::MockCall;
+use serve::mock::{Hold, MockCall};
 use serve::{
     DraftMock, Drafted, Engine, EngineError, Sampler, SamplerFactory, SamplerRefused,
     SamplingParams, Tokenizer,
@@ -385,100 +385,6 @@ fn hw_a_banned_id_or_a_forced_close_steps() {
     }
 }
 
-/// The prompt entries' hold: until it opens, every `prefill` blocks.
-#[derive(Default)]
-struct Hold {
-    state: Mutex<(usize, bool)>,
-    cv: Condvar,
-}
-
-impl Hold {
-    fn enter(&self) {
-        let mut g = self.state.lock().expect("the hold");
-        g.0 += 1;
-        self.cv.notify_all();
-        while !g.1 {
-            g = self.cv.wait(g).expect("the hold");
-        }
-    }
-
-    fn reached(&self, n: usize) -> bool {
-        let g = self.state.lock().expect("the hold");
-        let (g, _) = self
-            .cv
-            .wait_timeout_while(g, BOUND, |s| s.0 < n)
-            .expect("the hold");
-        g.0 >= n
-    }
-
-    fn open(&self) {
-        self.state.lock().expect("the hold").1 = true;
-        self.cv.notify_all();
-    }
-}
-
-/// [`DraftMock`] behind a [`Hold`] in `prefill`, every other call forwarded,
-/// the sampled pass and its declaration with them.
-struct Held {
-    inner: DraftMock,
-    hold: Arc<Hold>,
-}
-
-impl Engine for Held {
-    fn tokenizer(&self) -> Arc<dyn Tokenizer> {
-        self.inner.tokenizer()
-    }
-    fn prefill(&mut self, ids: &[u32]) -> Result<(), EngineError> {
-        self.hold.enter();
-        self.inner.prefill(ids)
-    }
-    fn next(&mut self, last: u32, out: Option<&mut [f32]>) -> Result<u32, EngineError> {
-        self.inner.next(last, out)
-    }
-    fn advance(&mut self, last: u32, out: &mut Vec<u32>) -> Result<Drafted, EngineError> {
-        self.inner.advance(last, out)
-    }
-    fn advance_rows(&self) -> usize {
-        self.inner.advance_rows()
-    }
-    fn advance_sampled(
-        &mut self,
-        last: u32,
-        history: Vec<u32>,
-        sampler: Sampler,
-        out: &mut Vec<u32>,
-    ) -> (Result<Drafted, EngineError>, Vec<u32>, Sampler) {
-        self.inner.advance_sampled(last, history, sampler, out)
-    }
-    fn drafts_sampled(&self) -> bool {
-        self.inner.drafts_sampled()
-    }
-    fn slots(&self) -> usize {
-        self.inner.slots()
-    }
-    fn select_slot(&mut self, slot: usize) -> Result<(), EngineError> {
-        self.inner.select_slot(slot)
-    }
-    fn slot_drafts(&self) -> bool {
-        self.inner.slot_drafts()
-    }
-    fn reset(&mut self) -> Result<(), EngineError> {
-        self.inner.reset()
-    }
-    fn keepable(&self, n: usize) -> usize {
-        self.inner.keepable(n)
-    }
-    fn cut(&mut self, n: usize) -> Result<(), EngineError> {
-        self.inner.cut(n)
-    }
-    fn ctx_max(&self) -> usize {
-        self.inner.ctx_max()
-    }
-    fn describe(&self) -> String {
-        self.inner.describe()
-    }
-}
-
 /// Waits until `requests_deferred` reaches `n`.
 fn wait_deferred(addr: SocketAddr, n: f64) {
     let deadline = Instant::now() + BOUND;
@@ -505,10 +411,10 @@ fn wait_deferred(addr: SocketAddr, n: f64) {
 fn hw_beside_another_busy_slot_a_sampled_request_steps() {
     let (dlog, plog) = (log(), log());
     let hold = Arc::new(Hold::default());
-    let held = Held {
-        inner: drafting(4096).with_slots(2).logged(Arc::clone(&dlog)),
-        hold: Arc::clone(&hold),
-    };
+    let held = drafting(4096)
+        .with_slots(2)
+        .logged(Arc::clone(&dlog))
+        .holding(Arc::clone(&hold));
     let addr = start_sampling(Box::new(held), 2, penalised());
     let plain = serve(drafting(4096).without_sampled(), &plog);
     let long = json!({"prompt": "abcabcabc", "n_predict": 400, "temperature": 0,
@@ -517,7 +423,10 @@ fn hw_beside_another_busy_slot_a_sampled_request_steps() {
     short["cache_prompt"] = json!(false);
     short["return_tokens"] = json!(true);
     let a = std::thread::spawn(move || post(addr, "/completion", &long));
-    assert!(hold.reached(1), "the long prompt never reached the engine");
+    assert!(
+        hold.reached(1, BOUND),
+        "the long prompt never reached the engine"
+    );
     let b = {
         let short = short.clone();
         std::thread::spawn(move || post(addr, "/completion", &short))
