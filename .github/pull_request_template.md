@@ -28,7 +28,3 @@ need the maintainers' workstation, and a maintainer runs those (CONTRIBUTING.md,
 ## Hardware (if the change is for a machine)
 
 <!-- `--version`, card, driver, CPU, RAM, and what you ran on it. Your numbers carry their conditions. -->
-
-## AI help
-
-<!-- Say whether AI helped and with which parts. You have read the diff and can explain it. -->
