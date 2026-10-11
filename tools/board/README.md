@@ -1,6 +1,6 @@
 # Status board
 
-One pinned GitHub issue whose body `board.py` rewrites every 10 minutes from state files, `gh` and `git log`. No LLM runs
+One pinned GitHub issue whose body `board.py` rewrites every 2 minutes from state files, `gh` and `git log`. No LLM runs
 in it. Contributors read the same page: where a PR stands, what is landing.
 
     python3 tools/board/board.py                  # print the body
@@ -88,7 +88,7 @@ prose such as "token limits" and "tokenize" in a title is not.
 
 ## Install
 
-The agent runs `board.py --publish` every 600 s, as the gh account that owns the repo (`gh auth token --user`, read from the
+The agent runs `board.py --publish` every 120 s, as the gh account that owns the repo (`gh auth token --user`, read from the
 keyring at run time; launchd runs no shell hook, so it cannot rely on the active account).
 
     ISSUE=<the pinned issue's number>; REPO=$HOME/repo/bloomery

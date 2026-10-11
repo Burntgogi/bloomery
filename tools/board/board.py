@@ -584,6 +584,9 @@ def mood(b, now):
     for x in b.batches:
         if batch_status(x, now) == "running":
             return "furnace", f"{label(x)}: {batch_counts(x)[1]}/{x.start.get('total', '?')} green, running"
+    moving = [t for t in b.trains if t.state != "landed"]
+    if moving:  # a train in flight whose batch writes no events yet
+        return "furnace", f"{moving[0].name}: {moving[0].state}"
     if cur and cur.done and not red and recent:
         return "bloom", f"{label(cur)}: {done}/{total} done, 0 red"
     landed = [t for t in b.trains if t.state == "landed" and (now - t.at).total_seconds() <= BLOOM_S]
@@ -622,7 +625,7 @@ def render(b, now):
     when = local(now).strftime("%Y-%m-%d %H:%M %z")
     piece, caption = mood(b, now)
     L = ["```text", *PIECES[piece], ascii_cut(caption, ART_COLS), "```", "",
-         "_Rewritten every 10 minutes by `tools/board/board.py`: state files, `gh` and `git log` only, no LLM. "
+         "_Rewritten every 2 minutes by `tools/board/board.py`: state files, `gh` and `git log` only, no LLM. "
          f"Rendered {when}._", ""]
     L += release_lines(b, now)
 
@@ -1149,6 +1152,8 @@ def self_test():
             ("nothing at all is idle", board(), None, "quiet: nothing running")):
             piece, caption = mood(bd, now)
             c.check(f"art: {name}", (piece == want if want else piece in IDLE) and caption == cap and piece in PIECES, f"{piece!r} {caption!r}")
+        c.check("art: a train in flight with no batch events is the furnace",
+                mood(board(trains=[Train("train5", "t5", "x", [], "batch", "", now)]), now) == ("furnace", "train5: batch"), "")
         c.check("art: a train's name captions a batch on its branch", mood(board(trains=[Train("train3", "b", "x", [], "batch", "", now)], batches=[batch(60, [0])]), now)[1] == "train3: 1/5 green, running", "")
         days = [mood(board(), now + dt.timedelta(days=d))[0] for d in range(len(IDLE))]
         c.check("art: idle rotates through every resting piece by date, one piece a day", sorted(days) == sorted(IDLE) and mood(board(), now)[0] == mood(board(), now + dt.timedelta(hours=1))[0], days)
