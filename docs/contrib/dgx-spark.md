@@ -110,7 +110,9 @@ resource's time (or at most bytes plus the latency part), not the sum of five. C
   with 13.9 GB of the idle `MemAvailable` (116.6 GiB = 125.2 GB, section 1) left for KV and runtime `[derived from #13]`.
 
 **The one term a run must settle, with its expected value:** the sustained read rate of our decode gemv kernels on the
-LPDDR5x with the CPU idle. Expected 200–235 GB/s (73–86 % of 273) `[assumed, no Spark number exists]`. Decision rule: at or
+LPDDR5x with the CPU idle. Expected 200–235 GB/s (73–86 % of 273). A plain read kernel measured 233 GB/s on `cuMemAlloc` memory (0.85 of 273)
+and 235 GB/s on write-combined `cuMemHostAlloc` pages ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6102768921));
+our gemv kernels' own rate is still unread. Decision rule: at or
 above 200 the decode flow is byte-bound and P3 kernel work predicts 0 beyond byte-saving levers; below 160, look at page
 size, TLB reach and clocks (`nvidia-smi` clock-event reasons) before any kernel work. Everything else in this file is
 settled by reading.
@@ -519,8 +521,8 @@ latency term; (b) adds latency and splits no bytes for one request. (d), tensor 
 ### 8.4 Bands `[derived]`
 
 **Assumptions, stated once.** Every figure below holds under them; none was measured on a Spark.
-- **BW**, the pool read of our kernels: 219 GB/s, the 80 % of 273 GB/s that section 2 assumes (band 200–235). It is
-  section 2's one term, unmeasured.
+- **BW**, the pool read of our kernels: 219 GB/s, the 80 % of 273 GB/s that section 2 assumes (band 200–235). A plain
+  read kernel measured 233 GB/s on `cuMemAlloc` memory (#13); our kernels' own rate, section 2's one term, is unread.
 - **λ**, the exposed round trip a layer, link and protocol: 25–70 µs. Terms: two one-way RDMA trips of 3–8 µs `[assumed:
   no direct-link source]`; send serialization 0.5–1.4 µs and rows serialization 4.4–11.3 µs at 11.6 GB/s (51–131 KB);
   two pump wake-ups of 1–3 µs `[assumed]`; two stream-wait passes of 2–5 µs `[assumed]`; the tier graph's copy nodes
