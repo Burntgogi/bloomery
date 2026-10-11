@@ -816,6 +816,44 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = --self-test ]; then
   check bin "$(lcpp_srv_bin)" /t/build/bin/llama-server
   check bin-own "$(LCPPSRV=/s/llama-server lcpp_srv_bin)" /s/llama-server
   t=$(mktemp -d "${TMPDIR:-/tmp}/lcpp-warm-self-test.XXXXXX")
+  # Every stub server this self-test starts is kept by the pid lcpp_srv_spawn captured (never found by
+  # pattern), in STUB_PIDS until lcpp_srv_stop has stopped it, and in $t/stubs.pid for the leftover check.
+  # The EXIT trap stops each kept one that is still a running job of this shell (so a pid the system
+  # reused for another process is never signalled), so a failed start, a check that returns early or an
+  # interrupt leaves no stub behind: TERM first (timeout passes it on, and without timeout the pid is the
+  # stub itself; the stub exits clean on it), KILL after 5 s if it is still up, then wait. The top shell's trap also removes $t; a subshell's leaves it.
+  STUB_PIDS=()
+  eval "$(declare -f lcpp_srv_spawn | sed '1s/^lcpp_srv_spawn/lcpp_srv_spawn_one/')"
+  lcpp_srv_spawn() {
+    lcpp_srv_spawn_one "$@"
+    STUB_PIDS+=("$SRV_PID")
+    echo "$SRV_PID" >> "$t/stubs.pid"
+  }
+  eval "$(declare -f lcpp_srv_stop | sed '1s/^lcpp_srv_stop/lcpp_srv_stop_one/')"
+  lcpp_srv_stop() {
+    local p stopped=${SRV_PID:-} kept=()
+    lcpp_srv_stop_one
+    for p in "${STUB_PIDS[@]}"; do [ "$p" = "$stopped" ] || kept+=("$p"); done
+    STUB_PIDS=("${kept[@]}")
+  }
+  stub_reap() {
+    local p k jobs_up
+    jobs_up=" $(jobs -p | tr '\n' ' ') "
+    for p in "${STUB_PIDS[@]}"; do
+      case $jobs_up in *" $p "*) ;; *) continue ;; esac
+      kill "$p" 2> /dev/null
+      for ((k = 0; k < 25; k++)); do kill -0 "$p" 2> /dev/null || break; sleep 0.2; done
+      ! kill -0 "$p" 2> /dev/null || kill -KILL "$p" 2> /dev/null
+      wait "$p" 2> /dev/null
+    done
+  }
+  stub_guard() {
+    trap "stub_reap${1:+; rm -rf \"\$t\"}" EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    trap 'exit 129' HUP
+  }
+  stub_guard top
   # The stub server: --help lists the flags; otherwise it binds 127.0.0.1 at a kernel-picked port, prints
   # llama_context's n_ctx line (the -c it was given, STUB_SRV_NCTX in its place, none under STUB_SRV_NOCTX),
   # the listening line and answers /health and /completion with timings. STUB_SRV_BADN answers with one
@@ -878,8 +916,10 @@ EOF
     lcpp_srv_request 1,2,3 1 20 && r=0 || r=1
     check pp "$r|$SRV_PROMPT_TPS|$SRV_PRED_N" "0|30.0|1"
     check same "$(lcpp_srv_same 1,2,3 1,2,3)|$(lcpp_srv_same 1,2,3 1,5,3)|$(lcpp_srv_same 1,2 1,2,3)" "same|differs at 1|differs at 2"
+    stopped_pid=$SRV_PID
     lcpp_srv_stop
-    check stopped "$(kill -0 "$SRV_PID" 2> /dev/null && echo up || echo down)" down
+    check stopped "$(kill -0 "$stopped_pid" 2> /dev/null && echo up || echo down)" down
+    check stopped-dropped "$(printf ' %s ' "${STUB_PIDS[@]}" | grep -c " $stopped_pid ")" 0
   else
     check start "$SRV_WHY" ""
   fi
@@ -917,6 +957,8 @@ EOF
     shift 2
     (sleep 1; timeout --kill-after=10 "$bound" env "$@" "${SRV_CMD[@]}" > "$log" 2>&1) &
     SRV_PID=$!
+    STUB_PIDS+=("$SRV_PID")
+    echo "$SRV_PID" >> "$t/stubs.pid"
   }
   echo 'main: listening on http://127.0.0.1:0' > "$t/log"
   lcpp_srv_start 20 "$t/log" STUB_SRV_EXIT=1 && r=0 || r=1
@@ -963,7 +1005,22 @@ EOF
   check xc-drop "$(printf 'lcppsrv+k34@prose|512|1|9\nlcppsrv+k34@prose|4096|1|9\nlcppsrv+t16@prose|512|3|9\nlcppsrv|512|1|9\n' | xc_drop | paste -sd';' -)" "lcppsrv+k34@prose|4096|1|9;lcppsrv+t16@prose|512|3|9"
   XC_SRV=()
   check xc-none "$(xc_table)" ""
-  rm -rf "$t"
+  # leftover: a subshell under the same guard starts a stub and exits without lcpp_srv_stop, as a failed
+  # check or an interrupt would. Then no stub of the whole run may still be up.
+  lcpp_srv_cmd "$t/llama-server" /m.gguf 256 -ngl 99 -fit off
+  n_before=$(wc -l < "$t/stubs.pid")
+  (
+    STUB_PIDS=()
+    stub_guard
+    lcpp_srv_start 20 "$t/log" || exit 3
+    kill -0 "$SRV_PID" 2> /dev/null || exit 4
+    exit 0
+  )
+  r=$?
+  check left-started "$r|$(($(wc -l < "$t/stubs.pid") - n_before))" "0|1"
+  up=()
+  while read -r p; do ! kill -0 "$p" 2> /dev/null || up+=("$p"); done < "$t/stubs.pid"
+  check leftover "${up[*]}" ""
   echo "self-test: $([ "$fails" = 0 ] && echo ok || echo FAIL) ($fails failures)"
   [ "$fails" = 0 ]
   exit
