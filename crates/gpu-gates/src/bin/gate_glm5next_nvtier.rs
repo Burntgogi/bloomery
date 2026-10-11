@@ -57,9 +57,9 @@ mod gate {
     use app::{Loaded, Open, Session};
     use bloomery_gpu::host::nvtier::NvTier;
     use bloomery_gpu::model::StepMode;
-    use bloomery_gpu_gates::residency38::{glm_seqs, reserve_checkpoints};
+    use bloomery_gpu_gates::residency38::{Seqs, reserve_checkpoints};
     use bloomery_gpu_gates::{Fnv1a64, GateError, prose_ids, tier};
-    use bloomery_gpu_glm5next::{Body, PrefillMode};
+    use bloomery_gpu_glm5next::{Body, PrefillMode, checkpoint_price};
     use bloomery_levers::{HostCfg, ResidencyAt, residency_unset};
     use gguf::Split;
     use model::arch::glm5next::hparams::Hparams;
@@ -112,11 +112,15 @@ mod gate {
                 .count()
         }
 
-        /// The gate placement of `layers`, its checkpoints reserved once.
-        fn machine(layers: usize) -> Machine {
-            let mut machine = crate::gate_card::plan_gate(layers);
-            reserve_checkpoints(&mut machine, glm_seqs(1));
-            machine
+        /// The gate placement of `inputs`' layers, its checkpoints reserved once at the gate's context.
+        fn machine(inputs: &PlanInputs) -> Result<Machine, GateError> {
+            let mut machine = crate::gate_card::plan_gate(inputs.model.layers);
+            reserve_checkpoints(
+                &mut machine,
+                Seqs::priced(1, checkpoint_price(inputs)?),
+                u64::try_from(CTX)?,
+            )?;
+            Ok(machine)
         }
 
         /// The open's configuration: the host set as the levers say, the r8 pair off.
@@ -140,7 +144,7 @@ mod gate {
             arm: Arm,
         ) -> Result<Result<(PlanFacts, u64), PlacementError>, GateError> {
             let inputs = self.inputs(file, arm)?;
-            let machine = Glm::machine(inputs.model.layers);
+            let machine = Glm::machine(&inputs)?;
             match inputs.plan_nextn(&machine, u64::try_from(CTX)?, &self.place, nextn) {
                 Ok(plan) => Ok(Ok((
                     PlanFacts::of(&plan.plan)?,
@@ -244,7 +248,7 @@ mod gate {
         fn plan(&self, arm: Arm) -> Result<Result<PlanFacts, PlacementError>, GateError> {
             let file = Split::open(&self.path).map_err(|e| format!("open: {e}"))?;
             let inputs = self.inputs(&file, arm)?;
-            let machine = Glm::machine(inputs.model.layers);
+            let machine = Glm::machine(&inputs)?;
             match inputs.plan(&machine, u64::try_from(CTX)?, &self.place) {
                 Ok(plan) => Ok(Ok(PlanFacts::of(&plan)?)),
                 Err(PlaceError::Placement(e)) => Ok(Err(e)),
@@ -255,7 +259,7 @@ mod gate {
         fn load(&self, arm: Arm, _r8: bool) -> Result<Session<Body>, GateError> {
             let file = Split::open(&self.path).map_err(|e| format!("open: {e}"))?;
             let inputs = self.inputs(&file, arm)?;
-            let machine = Glm::machine(inputs.model.layers);
+            let machine = Glm::machine(&inputs)?;
             let cfg = self.cfg();
             let plan = <Body as Open>::plan(&inputs, &machine, CTX, &cfg)?;
             let mut model = <Body as Open>::open(file, &inputs, &plan, &cfg)?;
@@ -288,7 +292,7 @@ mod gate {
         fn unset_residency(&self, arm: Arm) -> Result<(String, &'static str), GateError> {
             let file = Split::open(&self.path).map_err(|e| format!("open: {e}"))?;
             let inputs = self.inputs(&file, arm)?;
-            let machine = Glm::machine(inputs.model.layers);
+            let machine = Glm::machine(&inputs)?;
             let plan = inputs.plan(&machine, u64::try_from(CTX)?, &self.place)?;
             let unset = residency_unset(ResidencyAt {
                 serving_place: true,
