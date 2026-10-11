@@ -711,8 +711,8 @@ writers), and `crates/serve/src/{promptcache,swap,engine,sched}.rs` and `crates/
 reaches disk: §5.6). `residency38.rs`'s "checkpoints" are host RAM reservations for recurrent state. The residency rule starts
 every process from the id-prefix seed (`swaprule.rs:1-30`; `adaptive-picks.md` ledger 3.7 lists "the user's own routing,
 persisted" as an unopened idea), the state of a running residency resets only by an explicit call (`registry.rs:602`), the width
-chooser's profile crosses requests inside the process only (`width.rs:448-500`), and the one retired file, `BLOOMERY_HOT_LIST`
-(`registry.rs:230-243`), was a placement list learned in-sample. The only per-model derived file is the r8 weight sidecar
+chooser's profile crosses requests inside the process only (`width.rs:448-500`), and no placement file is read at load
+(`registry.rs:230-243` refuses the retired name). The only per-model derived file is the r8 weight sidecar
 (`docs/BUILD.md:141`), beside the model directory and not run state. The `tierlift` and `tiercut` worktrees add no state file
 (their diffs: `placed.rs`/`model.rs`, a gate and the justfile); unitier's own uncommitted work, if any, is not visible from here.
 
