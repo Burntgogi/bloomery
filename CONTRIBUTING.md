@@ -55,9 +55,12 @@ defect it guards.
 
 **Numbers carry their conditions.** Write `tok/s @ n=96, depth 4096, RTX A6000`, not `29 tok/s`; a derived number says
 [derived]. Our own numbers come from the lease runners in `tools/ref/`, which run only on the maintainers' box today
-(they take a lease under `/root` and pick the timing card by name). Your speed number is your own: give its conditions
-and how you measured it, and never mix it into our tables. The Spark map has the plan for timing on another machine
-(`docs/contrib/dgx-spark.md`).
+(they take a lease under `/root` and pick the timing card by name). A number from your own NVIDIA card counts as
+evidence for your PR on that card when it carries: the `nvidia-smi` line (card and driver), both commit hashes, the
+model file, and the commands with their output. For a small difference, running each side twice in turn helps. Such a
+number decides your PR on that card. It stays in your PR, in a table of its own, never mixed into ours; where we measure
+another card differently, both stand, and the change is gated by the card fact that separates them. The Spark map has
+the plan for timing on another machine (`docs/contrib/dgx-spark.md`).
 
 **Use AI freely, for the code and for talking with us.** Much of bloomery was written with AI help, and the
 maintainers write every reply, review and issue with AI help too. Assume everything here is AI-assisted, on both sides;

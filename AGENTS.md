@@ -29,9 +29,12 @@ To run or evaluate bloomery rather than develop it, read the README's "Status" s
 - **Both cards are ours.** A compute process on either card that is not one of our rounds is a surprise to
   investigate. **Timed numbers are taken on the A6000** (the 3090 fell off the bus under load, Xid 79): the timing
   runners pin it through `TIMING_GPU` (override `BLOOMERY_TIMING_GPU`), and every witness block opens with the card
-  name and power limit. 3090 numbers from before 2026-09-22 and A6000 numbers never share a table. A model that does
-  not fit one card may carry a separate "A6000+3090" table: the reference engine gets the same two cards (`-ts`) in the
-  same lease, the 3090 stays at its 250 W cap, the witness blocks check for Xid before and after. The 3090 is the
+  name and power limit. 3090 numbers from before 2026-09-22 and A6000 numbers never share a table. A contributor's
+  number from their own NVIDIA card is admissible for their PR on that card when it carries CONTRIBUTING.md's evidence
+  list; it decides that card, never fills our tables, and a card we measure differently is separated by the card fact
+  (a gate on that fact, not a veto). A model that does not fit one card may carry a separate "A6000+3090" table: the
+  reference engine gets the same two cards (`-ts`) in the same lease, the 3090 stays at its 250 W cap, the witness
+  blocks check for Xid before and after. The 3090 is the
   card of the public numbers, not of the gates: a functional gate takes either card unless a fact pins it. A gate bin
   that runs the gate plan (the 3090's bytes, `workstation::plan_gate`, the plan the README's 3090 rows are measured
   at) plans those bytes on the card it holds (`crates/gpu-gates/src/bin/shared/gate_card.rs`), so its pins hold on
