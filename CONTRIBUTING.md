@@ -62,8 +62,8 @@ and how you measured it, and never mix it into our tables. The Spark map has the
 **Use AI freely, for the code and for talking with us.** Much of bloomery was written with AI help, and the
 maintainers write every reply, review and issue with AI help too. Assume everything here is AI-assisted, on both sides;
 you do not need to say so. Let an AI draft your issues, comments and pull requests in whatever language is easiest for
-you, Korean included. Point your agent at `AGENTS.md` first. Two things stay yours: you have read the diff and can
-explain it, and you paste only output from commands you actually ran.
+you, Korean included. Point your agent at `AGENTS.md` first. What we look at is the result: a simple design, code
+quality, and that it works.
 
 **Pull requests for your own hardware are especially welcome** (other cards, CPUs, memory sizes, native Windows). Name
 the machine (`--version`, card, driver, CPU, RAM) and what you ran on it, and let the new path follow from what the
