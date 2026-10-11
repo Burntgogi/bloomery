@@ -897,6 +897,49 @@ class Tree:
     _CFG = re.compile(r"^#\[\s*cfg\s*\((.*)\)\s*\]$")
 
     @staticmethod
+    def lead_attrs(s: str) -> tuple[list[str], str]:
+        """The one-line outer attributes `s` opens with, each `#[…]` whole, and the item after them:
+        `#[cfg(test)] mod x;` is `(["#[cfg(test)]"], "mod x;")`, `#[cfg(test)] // why` is
+        `(["#[cfg(test)]"], "")`. A `/* … */` closed on the line between or after them is skipped,
+        and a bracket inside a string literal (`\\"` escapes counted) does not count. An attribute
+        whose `]` is not on the line, a raw string in one, or a `/*` left open is `([], s)`: the
+        caller reads the line as before."""
+        attrs: list[str] = []
+        rest = s
+        while rest.startswith("#["):
+            depth, quoted, escaped, end = 0, False, False, None
+            for i, ch in enumerate(rest):
+                if quoted:
+                    if escaped:
+                        escaped = False
+                    elif ch == "\\":
+                        escaped = True
+                    elif ch == '"':
+                        quoted = False
+                elif ch == '"':
+                    if i > 0 and rest[i - 1] in "r#":
+                        return [], s
+                    quoted = True
+                elif ch == "[":
+                    depth += 1
+                elif ch == "]":
+                    depth -= 1
+                    if depth == 0:
+                        end = i + 1
+                        break
+            if end is None:
+                return [], s
+            attrs.append(rest[:end])
+            rest = rest[end:].lstrip()
+            while rest.startswith("/*") and "*/" in rest:
+                rest = rest[rest.index("*/") + 2 :].lstrip()
+            if rest.startswith("/*"):
+                return [], s
+        if rest.startswith("//"):
+            rest = ""
+        return (attrs, rest) if attrs else ([], s)
+
+    @staticmethod
     def cfg_test(attr: str) -> bool:
         """Whether a one-line `#[cfg(…)]` holds in test builds only: `test`, or `all(…)` with `test`
         among its own items. Any other predicate (`any(test, …)`, `not(…)`, a feature) does not, and a
@@ -982,6 +1025,19 @@ class Tree:
                     (acc.test_files if here else acc.files).add(p)
                 else:
                     self.unresolved.append(f"{rel}: include of {inc} ({p} not found)")
+            # `#[cfg(test)] mod x;`, `#[path = "x.rs"] mod x;`, `#[cfg(test)] #[path = "x.rs"]`: each
+            # one-line attribute counts as if on a line of its own, then the item after them is read
+            attrs, rest = self.lead_attrs(s)
+            for a in attrs:
+                am = self._PATH.fullmatch(a)
+                if am:
+                    pending_path = am.group(1)
+                pending_test = pending_test or self.cfg_test(a)
+                pending_off = pending_off or self.cfg_off(a, features)
+            if attrs and not rest:
+                continue
+            if attrs:
+                line, s = line[:indent] + rest, rest
             pm = self._PATH.search(line)
             m = self._MOD.match(line)
             im = self._INLINE.match(line)
@@ -8970,11 +9026,19 @@ def self_test() -> int:
             '#[cfg(all(feature = "x", test))]\n#[path = "a.rs"]\nmod a_again;\nmod a;\n#[cfg(test)]\nmod tests;\n'
             '#[cfg(all(test, feature = "x"))]\nmod c;\n#[cfg(any(test, feature = "x"))]\nmod b;\n#[cfg(test)]\n'
             '#[allow(dead_code)]\nmod inline {\n    const I: &str = include_str!("../data/inline.txt");\n}\n'
-            'const N: &str = include_str!("../data/normal.txt");\n',
+            'const N: &str = include_str!("../data/normal.txt");\n'
+            # one-line attributed modules: the attributes count as on lines of their own
+            '#[cfg(test)] mod one_t;\n#[path = "one_p.rs"] mod one_path;\n'
+            '#[cfg(test)] #[path = "one_tp.rs"] pub(crate) mod one_both;\n'
+            '#[cfg(test)] mod one_inline {\n    const O: &str = include_str!("../data/one_inline.txt");\n}\n'
+            '#[cfg(feature = "off")] mod one_off;\n#[cfg(feature = "off")]\nmod two_off;\n#[doc = "a ] b"] mod one_doc;\n#[doc = "x\\\\"] mod one_esc;\n'
+            '#[cfg(test)] /* why */ mod one_cmt;\n#[cfg(test)] #[path = "one_two.rs"] // the item is below\nmod one_two_mod;\n',
         )
         put("p/src/tests.rs", 'mod deep;\nconst T: &str = include_str!("../data/test.txt");\n')
         put("p/src/tests/deep.rs", 'const D: &str = "../tools/deep.txt";\nconst M: &str = "../q/src/main.rs";\n')
-        for f in ("p/src/a.rs", "p/src/b.rs", "p/src/c.rs", "p/data/normal.txt", "p/data/test.txt", "p/data/inline.txt", "tools/deep.txt", "q/src/main.rs"):
+        for f in ("p/src/a.rs", "p/src/b.rs", "p/src/c.rs", "p/data/normal.txt", "p/data/test.txt", "p/data/inline.txt", "tools/deep.txt", "q/src/main.rs",
+                  "p/src/one_t.rs", "p/src/one_p.rs", "p/src/one_tp.rs", "p/data/one_inline.txt", "p/src/one_off.rs", "p/src/two_off.rs", "p/src/one_doc.rs",
+                  "p/src/one_esc.rs", "p/src/one_cmt.rs", "p/src/one_two.rs"):
             put(f)
 
         def pkg(name: str, kind: str, src: str, deps: list[str]) -> dict:
@@ -8989,8 +9053,9 @@ def self_test() -> int:
 
         meta = {"workspace_root": tmp, "workspace_members": ["p", "q"], "packages": [pkg("p", "lib", "src/lib.rs", []), pkg("q", "bin", "src/main.rs", ["p"])]}
         st = Tree(tmp, meta)
-        only_test = {"p/src/tests.rs", "p/src/tests/deep.rs", "p/src/c.rs", "p/data/test.txt", "p/data/inline.txt", "tools/deep.txt"}
-        built = {"p/src/lib.rs", "p/src/a.rs", "p/src/b.rs", "p/data/normal.txt"}
+        only_test = {"p/src/tests.rs", "p/src/tests/deep.rs", "p/src/c.rs", "p/data/test.txt", "p/data/inline.txt", "tools/deep.txt",
+                     "p/src/one_t.rs", "p/src/one_tp.rs", "p/data/one_inline.txt", "p/src/one_cmt.rs", "p/src/one_two.rs"}
+        built = {"p/src/lib.rs", "p/src/a.rs", "p/src/b.rs", "p/data/normal.txt", "p/src/one_p.rs", "p/src/one_doc.rs", "p/src/one_esc.rs"}
         lib, libtest, dep = (set(st.target_files(*t, [])) for t in (("p", "lib", None), ("p", "libtest", None), ("q", "bin", "q")))
         expect(built <= lib and not lib & only_test, f"cfg(test) walk: the lib build reads {sorted(lib & only_test)}, misses {sorted(built - lib)}")
         expect(built | only_test <= libtest, f"cfg(test) walk: the lib tests miss {sorted((built | only_test) - libtest)}")
@@ -8999,6 +9064,8 @@ def self_test() -> int:
         # read — the module walk of whatever compiles it is its only route in (q's own bin keeps its
         # file, as every target keeps its own; p's views must not gain it)
         expect("q/src/main.rs" not in lib | libtest, "a .rs literal of a workspace package is an input")
+        for view, name in ((lib, "lib"), (libtest, "lib tests"), (dep, "a dependent")):
+            expect(("p/src/one_off.rs" in view) == ("p/src/two_off.rs" in view), f"cfg(test) walk: {name} reads a #[cfg(feature)] module on one line other than on two")
         expect(not st.unresolved, f"cfg(test) walk: unresolved {st.unresolved[:2]}")
 
     # pure crates: the cfg reader, then a synthetic workspace with a lock file — a device root reached
