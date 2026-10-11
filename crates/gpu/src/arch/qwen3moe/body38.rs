@@ -4947,7 +4947,8 @@ mod tests {
     /// ring (112,640 f32) and the PLE ring (174,080 f32): 130,162,688 B, one
     /// derivation for the sequences' `Checkpoints` and the plan's price,
     /// spaced at the 4,096-token ubatch, so a slot of 2,048 positions pins
-    /// one point, one of 10,240 three, and the host budget fits 32.
+    /// two points (a whole call's one and the previous call's end), one of
+    /// 10,240 four, and the host budget fits 32.
     #[test]
     fn a_checkpoint_copies_the_delta_layers_lane_ring_and_the_ple_ring() {
         let lens = checkpoint_lens(36);
@@ -4957,7 +4958,7 @@ mod tests {
         assert_eq!(checkpoint_bytes(36), 130_162_688);
         assert_eq!(checkpoint_price38(36).point_bytes, 130_162_688);
         assert_eq!(checkpoint_price38(36).every, 4_096);
-        for (ctx, points) in [(2_048u64, 1u64), (10_240, 3), (1 << 20, 32)] {
+        for (ctx, points) in [(2_048u64, 2u64), (10_240, 4), (1 << 20, 32)] {
             assert_eq!(
                 checkpoint_budget38(36, ctx).expect("a budget"),
                 points * 130_162_688,

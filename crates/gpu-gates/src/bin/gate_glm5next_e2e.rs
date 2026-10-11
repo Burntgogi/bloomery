@@ -2586,12 +2586,15 @@ mod gate {
         );
         ok &= bits;
         // The load's sequence holds the points one prompt call over its
-        // context takes, the multiples of the spacing below it and its end.
-        let want = CTX.div_ceil(CHECKPOINT_EVERY as usize);
+        // context takes, the multiples of the spacing below it and its end,
+        // and the previous call's end.
+        // PIN(2026-10-11): one more than the whole call's points, so a second
+        // call keeps the first call's end, the point clause (kp) restores.
+        let want = CTX.div_ceil(CHECKPOINT_EVERY as usize) + 1;
         let held = c.capacity() == want;
         println!(
             "keep ({feed}): the load's sequence holds {} checkpoints at {CTX} positions (want \
-             {want}, the points one prompt call over them takes) {}",
+             {want}, the points one prompt call over them takes and the call before's end) {}",
             c.capacity(),
             verdict(held)
         );

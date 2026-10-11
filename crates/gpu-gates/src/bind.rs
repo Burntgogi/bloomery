@@ -4552,9 +4552,9 @@ mod tests {
         /// they are made: `gate-gpu-lib`) and the budget one sequence's
         /// `Checkpoints` is made with is the price's at the slot's context.
         /// A point of 73,728,000 B (Qwen3.6-35B-A3B) or 130,162,688 B
-        /// (Qwen3.8-Flash-Next) spaced 4,096 apart takes one point in a slot
-        /// of 2,048 positions and three in 10,240 — not the 4 GiB of the
-        /// default a slot.
+        /// (Qwen3.8-Flash-Next) spaced 4,096 apart takes two points in a slot
+        /// of 2,048 positions and four in 10,240 (a whole call's points and
+        /// the previous call's end) — not the 4 GiB of the default a slot.
         #[test]
         fn a_qwen_machine_reserves_its_familys_budget_at_each_context() {
             for point_bytes in [73_728_000u64, 130_162_688] {
@@ -4563,10 +4563,10 @@ mod tests {
                     every: 4_096,
                 };
                 for (total, slots, points) in [
-                    (4_096u64, 2usize, 1u64),
-                    (20_480, 2, 3),
-                    (10_240, 1, 3),
-                    (81_920, 4, 5),
+                    (4_096u64, 2usize, 2u64),
+                    (20_480, 2, 4),
+                    (10_240, 1, 4),
+                    (81_920, 4, 6),
                 ] {
                     let slot = total / slots as u64;
                     let mut m = machine(1_000);
@@ -4608,9 +4608,9 @@ mod tests {
 
         /// A GLM load's machine (`glm_machine`, the one its offer, plans and
         /// open take) reserves every slot's checkpoints at the body's budget
-        /// for the load's context: at 4,096 positions that is the 8 points
+        /// for the load's context: at 4,096 positions that is the 9 points
         /// one prompt call over it takes (the marks 512 to 3,584 and its
-        /// end), not the 4 GiB of the default, one budget at one slot and
+        /// end) and the previous call's end, not the 4 GiB of the default, one budget at one slot and
         /// three at three. At one slot the prompt cache's default budget is
         /// the one the load's single sequence left when the term sat beside
         /// the need (half of the reading past need, pool and one budget); at
@@ -4625,7 +4625,7 @@ mod tests {
                 let m = glm_machine(Place::A, None, slots, GLM_PRICE, 4_096)
                     .expect("plan (a)'s machine")(layers);
                 let reserved = checkpoints_reserved(&m);
-                assert_eq!(reserved, slots_u64 * 8 * GLM_POINT, "{slots} slots");
+                assert_eq!(reserved, slots_u64 * 9 * GLM_POINT, "{slots} slots");
                 assert_ne!(reserved, slots_u64 * HOST_BUDGET, "{slots} slots");
                 let c = CacheRam::at(
                     None,
@@ -4636,24 +4636,25 @@ mod tests {
                     reserved,
                 )
                 .expect("the budget");
-                let beside_one = (available - need - pool - 8 * GLM_POINT) / 2;
+                let beside_one = (available - need - pool - 9 * GLM_POINT) / 2;
                 assert_eq!(
                     c.ram,
-                    beside_one - (slots_u64 - 1) * 8 * GLM_POINT / 2,
+                    beside_one - (slots_u64 - 1) * 9 * GLM_POINT / 2,
                     "{slots} slots"
                 );
             }
         }
 
         /// A GLM load's reserve follows the context it is granted: a slot
-        /// holds the points one prompt call over its context takes, 1 at 512
-        /// positions, 8 at 4,096, and past 11,264 positions the 23 that
+        /// holds the points one prompt call over its context takes and the
+        /// previous call's end, 2 at 512 positions, 9 at 4,096, and past
+        /// 10,752 positions the 23 that
         /// `HOST_BUDGET` fits — less than `HOST_BUDGET` itself, which is not a
         /// multiple of a checkpoint. A second declaration on a machine, by
         /// either owner, is a panic by name.
         #[test]
         fn a_glm_reserve_follows_the_granted_context() {
-            for (ctx, points) in [(512u64, 1u64), (4_096, 8), (11_265, 23), (16_384, 23)] {
+            for (ctx, points) in [(512u64, 2u64), (4_096, 9), (10_753, 23), (16_384, 23)] {
                 let m =
                     glm_machine(Place::A, None, 2, GLM_PRICE, ctx).expect("plan (a)'s machine")(4);
                 assert_eq!(
@@ -4695,7 +4696,7 @@ mod tests {
             };
             let e = e.to_string();
             assert!(
-                e.contains(&format!("reserves {} B of checkpoints", 2 * GLM_POINT))
+                e.contains(&format!("reserves {} B of checkpoints", 2 * 2 * GLM_POINT))
                     && e.contains(&format!("pin up to {} B", 2 * 23 * GLM_POINT)),
                 "{e}"
             );

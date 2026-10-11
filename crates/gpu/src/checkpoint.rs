@@ -836,8 +836,9 @@ mod tests {
     use super::*;
 
     /// A sequence's checkpoints hold the points one prompt call over its
-    /// context takes: stores of 7 f32s spaced 512 apart make 1 point at 512
-    /// positions, 8 at 4,096 (the marks 512 to 3,584 and the end), each of
+    /// context takes and the previous call's end: stores of 7 f32s spaced
+    /// 512 apart make 2 points at 512 positions, 9 at 4,096 (the marks 512 to
+    /// 3,584, the end and one more), each of
     /// `point_bytes`, the ledger exactly the budget's slots; a context past
     /// the u32 positions is refused by name.
     #[test]
@@ -845,7 +846,7 @@ mod tests {
     fn hw_a_sequence_holds_the_budget_of_its_context() {
         let (ctx, _stream) = crate::capsync::fresh_stream(0).expect("CUDA device 0 with a stream");
         let lens = vec![4, 3];
-        for (positions, points) in [(512usize, 1usize), (4_096, 8)] {
+        for (positions, points) in [(512usize, 2usize), (4_096, 9)] {
             let c = Checkpoints::sequence(&ctx, lens.clone(), positions, 512).expect("checkpoints");
             assert_eq!(c.capacity(), points, "{positions} positions");
             assert_eq!(c.bytes(), point_bytes(&lens));

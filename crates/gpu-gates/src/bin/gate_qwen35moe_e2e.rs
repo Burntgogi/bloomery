@@ -2010,13 +2010,25 @@ mod gate {
 
         // One checkpoint's bytes and slots against their derivation: each
         // delta layer's state (N_V heads of HEAD_V x HEAD_V f32) and conv
-        // ring (RING_ROWS rows of C), and the host budget's share of them.
+        // ring (RING_ROWS rows of C), and the slots the load's budget holds.
+        // PIN(2026-10-11): the slots were "at least 9" of the fixed 4 GiB
+        // budget; the budget now follows the load's context: the points one
+        // prompt call over KCTX takes at the ubatch's spacing (its multiples
+        // below KCTX and its end, KCTX.div_ceil(ubatch)) and the previous
+        // call's end, under the copies 4 GiB fits. An exact pin, by the
+        // budget's specification, not a relaxation.
         let c = m.body("gate_qwen35moe_e2e")?.checkpoints();
         let want_bytes = N_DELTA * (N_V * HEAD_V * HEAD_V + RING_ROWS * C) * 4;
-        let points_ok = c.bytes() == want_bytes as u64 && c.capacity() >= 9;
+        let every = m.ubatch()?;
+        let fit = runtime::seqstate::capacity(runtime::seqstate::HOST_BUDGET, want_bytes as u64)
+            .map_err(|e| e.to_string())?;
+        let want_slots = (KCTX.div_ceil(every) + 1).min(fit);
+        let points_ok = c.bytes() == want_bytes as u64 && c.capacity() == want_slots;
         println!(
             "checkpoints: one copy {} bytes (want {want_bytes}, derived: a delta layer's state \
-             {} f32 and ring {} f32), {} slots of one copy the host budget holds {}",
+             {} f32 and ring {} f32), {} slots of one copy at {KCTX} positions (want \
+             {want_slots}: a call over them at the ubatch {every}'s spacing and the call before's \
+             end) {}",
             c.bytes(),
             N_V * HEAD_V * HEAD_V,
             RING_ROWS * C,

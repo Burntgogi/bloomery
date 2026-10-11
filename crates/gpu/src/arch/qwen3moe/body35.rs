@@ -2640,7 +2640,7 @@ mod tests {
         assert!(lens.chunks(2).all(|c| c == [32 * 128 * 128, 11 * 8192]));
         assert_eq!(point_bytes(&lens), 73_728_000);
         let price = price(&lens, 4_096);
-        assert_eq!(price.budget(2_048), Ok(73_728_000));
-        assert_eq!(price.budget(10_240), Ok(3 * 73_728_000));
+        assert_eq!(price.budget(2_048), Ok(2 * 73_728_000));
+        assert_eq!(price.budget(10_240), Ok(4 * 73_728_000));
     }
 }

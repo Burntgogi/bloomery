@@ -89,11 +89,15 @@ pub struct Price {
 impl Price {
     /// The host bytes one sequence's checkpoints hold at most in a load of
     /// `ctx` positions: the points one prompt call over the whole context
-    /// takes ([`marks`] from 0 to `ctx`), no more than [`HOST_BUDGET`] fits
-    /// ([`capacity`]). A ledger of this budget is made of exactly that many
-    /// slots, so it is the bound on what the sequence pins; a later call's
-    /// start and end points past the whole-context ones displace the least
-    /// recently used ([`Ledger::take`]), never grow the pin. Refused by name
+    /// takes ([`marks`] from 0 to `ctx`) and one more, no more than
+    /// [`HOST_BUDGET`] fits ([`capacity`]). The one more keeps the previous
+    /// call's end: two calls that share the context take at most the inner
+    /// multiples below `ctx` (one fewer than the whole call's points) and the
+    /// two ends, so the point a resumed prefix needs, where the call before
+    /// ended, is never the one displaced. A ledger of this budget is made of
+    /// exactly that many slots, so it is the bound on what the sequence pins;
+    /// a later call's points past them displace the least recently used
+    /// ([`Ledger::take`]), never grow the pin. Refused by name
     /// for a context of no positions or past the u32 positions, and a
     /// checkpoint [`capacity`] refuses.
     pub fn budget(self, ctx: u64) -> Result<u64, CheckpointError> {
@@ -105,7 +109,8 @@ impl Price {
 /// [`Price::budget`] over a context of `ctx` u32 positions.
 fn budget_for(ctx: u32, every: u32, point_bytes: u64) -> Result<u64, CheckpointError> {
     let fit = capacity(HOST_BUDGET, point_bytes)?;
-    let held = fit.min(marks(0, ctx, every).len());
+    let whole = marks(0, ctx, every).len();
+    let held = if whole == 0 { 0 } else { fit.min(whole + 1) };
     u64::try_from(held)
         .ok()
         .and_then(|n| n.checked_mul(point_bytes))
@@ -1214,33 +1219,71 @@ mod tests {
         assert!(Ledger::new(0).is_err());
     }
 
+    /// Two prompt calls that share a short context keep the first call's end:
+    /// the point a resumed prefix of the first call comes back to stands
+    /// after the second call took its own end.
+    #[test]
+    fn a_second_call_keeps_the_first_calls_end() {
+        let price = Price {
+            point_bytes: 1 << 20,
+            every: 4_096,
+        };
+        for ctx in [64u64, 4_096, 10_240] {
+            let budget = price.budget(ctx).expect("a budget");
+            let mut l = Ledger::new(capacity(budget, price.point_bytes).expect("a capacity"))
+                .expect("a ledger");
+            let (first, end) = (
+                u32::try_from(ctx / 2).expect("a position"),
+                u32::try_from(ctx).expect("a position"),
+            );
+            for at in marks(0, first, price.every)
+                .into_iter()
+                .chain(marks(first, end, price.every))
+            {
+                l.take(at).expect("a point");
+                l.applied();
+            }
+            assert!(
+                l.positions().contains(&first),
+                "ctx {ctx}: {:?}",
+                l.positions()
+            );
+            assert!(
+                l.positions().contains(&end),
+                "ctx {ctx}: {:?}",
+                l.positions()
+            );
+        }
+    }
+
     /// A sequence's budget at a context is the points one prompt call over
-    /// the whole of it takes, `HOST_BUDGET`'s fit the ceiling: a point is
-    /// 179,372,032 bytes (34 recurrent layers), so a context of 4,096 holds
-    /// the marks 512 to 3,584 and its end (8 points), the cap of 23 binds from
-    /// 11,265 positions, and the ledger made of the budget has that capacity.
+    /// the whole of it takes and the previous call's end, `HOST_BUDGET`'s fit
+    /// the ceiling: a point is 179,372,032 bytes (34 recurrent layers), so a
+    /// context of 4,096 holds the marks 512 to 3,584, its end and one more (9
+    /// points), the cap of 23 binds from 10,753 positions, and the ledger made
+    /// of the budget has that capacity.
     #[test]
     fn budget_follows_the_points_a_whole_prompt_takes() {
         const POINT: u64 = 179_372_032;
         for (ctx, points) in [
-            (1, 1),
-            (512, 1),
-            (513, 2),
-            (4_096, 8),
-            (11_264, 22),
-            (11_265, 23),
+            (1, 2),
+            (512, 2),
+            (513, 3),
+            (4_096, 9),
+            (10_752, 22),
+            (10_753, 23),
             (16_384, 23),
         ] {
             let budget = budget_for(ctx, 512, POINT).expect("a budget");
             assert_eq!(budget, points * POINT, "ctx {ctx}");
             assert_eq!(capacity(budget, POINT), Ok(points as usize), "ctx {ctx}");
         }
-        assert_eq!(budget_for(4_096, 512, POINT), Ok(1_434_976_256));
+        assert_eq!(budget_for(4_096, 512, POINT), Ok(1_614_348_288));
         assert_eq!(budget_for(16_384, 512, POINT), Ok(4_125_556_736));
         assert_eq!(
             budget_for(2_048, 0, POINT),
-            Ok(POINT),
-            "no inner marks: the end"
+            Ok(2 * POINT),
+            "no inner marks: the end and the previous call's"
         );
         assert_eq!(budget_for(100_000, 512, 73_728_000), Ok(58 * 73_728_000));
     }
@@ -1294,7 +1337,7 @@ mod tests {
         };
         assert_eq!(Q35.point_bytes, 73_728_000);
         assert_eq!(Q38.point_bytes, 130_162_688);
-        for (price, points) in [(Q35, [1, 1, 2, 3, 58]), (Q38, [1, 1, 2, 3, 32])] {
+        for (price, points) in [(Q35, [2, 2, 3, 4, 58]), (Q38, [2, 2, 3, 4, 32])] {
             for (ctx, want) in [2_048, 4_096, 4_097, 10_240, 1 << 20]
                 .into_iter()
                 .zip(points)
@@ -1308,10 +1351,10 @@ mod tests {
                 );
             }
         }
-        assert_eq!(pinned(2, Q35.budget(2_048).expect("a budget")), 147_456_000);
+        assert_eq!(pinned(2, Q35.budget(2_048).expect("a budget")), 294_912_000);
         assert_eq!(
             pinned(2, Q38.budget(10_240).expect("a budget")),
-            780_976_128
+            1_041_301_504
         );
     }
 
