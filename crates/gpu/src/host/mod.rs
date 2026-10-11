@@ -810,6 +810,9 @@ pub struct HostTier<H> {
     /// seam for the slots harness's poison clauses, never set on a serving
     /// path.
     planted: Option<String>,
+    /// The first layer the body's step and verify run without this tier's
+    /// service, when they run one ([`HostTier::mark_unserved`]).
+    unserved: Option<usize>,
     health: Health,
     /// Which experts each layer's card stack holds; the host serves the rest.
     slots: SlotMap,
@@ -890,6 +893,7 @@ impl<H: HostExperts> HostTier<H> {
             experts,
             fault: None,
             planted: None,
+            unserved: None,
             health: Health::default(),
             slots,
             step: StepPort::new(boundary, layers),
@@ -913,7 +917,9 @@ impl<H: HostExperts> HostTier<H> {
     /// machine's tally and holds its staging window open while the pool waits
     /// for a go. The machine frees each layer's spare slots now, so every
     /// piece that sizes itself from the map's capacity is made first.
-    /// Load-time only; a second machine is refused by name.
+    /// Load-time only; a second machine is refused by name, and so is a
+    /// machine on a load whose step runs a layer without the service
+    /// ([`HostTier::mark_unserved`]), before any slot moves.
     pub fn start_swap(
         &mut self,
         ctx: &Arc<CudaContext>,
@@ -922,6 +928,16 @@ impl<H: HostExperts> HostTier<H> {
         source: Arc<dyn swap::SwapSource>,
         cfg: swap::MachineCfg,
     ) -> Result<(), GpuError> {
+        if let Some(l) = self.unserved {
+            return Err(GpuError::shape(
+                "HostTier::start_swap",
+                format!(
+                    "a residency machine on a load whose step runs layer {l} without the host \
+                     service, to which the machine moves card experts: the load was made without \
+                     one (its residency glue had no source)"
+                ),
+            ));
+        }
         if self.swap.is_some() {
             return Err(GpuError::state(
                 "HostTier::start_swap",
@@ -1643,11 +1659,32 @@ impl<H: HostExperts> HostTier<H> {
         Ok(())
     }
 
+    /// The body's step and verify run layer `l` without this tier's service
+    /// (no go, no wait): from here on [`HostTier::attach_route_trace`]
+    /// refuses a trace, which the service writes, and
+    /// [`HostTier::start_swap`] a residency machine, which moves card experts
+    /// to the service. Load-time only.
+    pub(crate) fn mark_unserved(&mut self, l: usize) {
+        self.unserved.get_or_insert(l);
+    }
+
     /// Attach `trace`: from here on every one-row step's service records
     /// its routed ids into it ([`route_trace`]), and a prompt batch's
     /// service is refused by name. The trace must cover the slot map's
-    /// layers and experts; a second trace is refused.
+    /// layers and experts; a second trace is refused, and so is a trace on
+    /// a load whose step runs a layer without the service
+    /// ([`HostTier::mark_unserved`]).
     pub fn attach_route_trace(&mut self, trace: RouteTrace) -> Result<(), GpuError> {
+        if let Some(l) = self.unserved {
+            return Err(GpuError::shape(
+                "HostTier::attach_route_trace",
+                format!(
+                    "a route trace on a load whose step runs layer {l} without the host \
+                     service, which writes the trace: the load's HostCfg::route_trace was false \
+                     (Levers::host sets it from BLOOMERY_ROUTE_TRACE)"
+                ),
+            ));
+        }
         if self.step.trace.is_some() {
             return Err(GpuError::shape(
                 "HostTier::attach_route_trace",

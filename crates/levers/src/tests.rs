@@ -367,7 +367,8 @@ fn accessors_read_their_rows() {
             populate: true,
             lock: false,
             card_dontneed: true,
-            r8: true
+            r8: true,
+            route_trace: false
         }
     );
 
@@ -440,7 +441,8 @@ fn accessors_read_their_rows() {
             populate: false,
             lock: true,
             card_dontneed: false,
-            r8: false
+            r8: false,
+            route_trace: true
         }
     );
 

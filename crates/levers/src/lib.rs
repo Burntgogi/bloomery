@@ -975,7 +975,7 @@ impl Levers {
     }
 
     /// The host tier's load settings: [`HOST_POPULATE`], [`HOST_LOCK`],
-    /// [`CARD_DONTNEED`] and [`R8`].
+    /// [`CARD_DONTNEED`], [`R8`], and whether [`ROUTE_TRACE`] is set.
     #[must_use]
     pub fn host(&self) -> HostCfg {
         HostCfg {
@@ -983,6 +983,7 @@ impl Levers {
             lock: self.flag(HOST_LOCK),
             card_dontneed: self.flag(CARD_DONTNEED),
             r8: self.flag(R8),
+            route_trace: self.route_trace().is_some(),
         }
     }
 
@@ -2175,6 +2176,10 @@ pub struct HostCfg {
     /// sidecar when there is one; `false` reads the source's, the
     /// same-binary arm.
     pub r8: bool,
+    /// The load is made for a route trace ([`ROUTE_TRACE`] set,
+    /// [`Levers::host`]): a Qwen3.8 load, which can run a layer without its
+    /// host leg, keeps every one, where the host service writes the trace.
+    pub route_trace: bool,
 }
 
 /// How the host tier's row dispatch lays its units over the pool

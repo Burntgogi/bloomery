@@ -27,6 +27,13 @@
 //!   experts, plus the gated shared expert into `y`, the next site's combine
 //!   input.
 //!
+//! A layer the load runs without a host leg ([`Card38::hostless`]: every
+//! routed expert on the card, no residency machine, no route trace) has
+//! none in the step and the verify: its handoff writes the row's image and
+//! the card's places and no go follows, its back has no wait, the host is
+//! not told of it, and the host's sum it adds is zeros
+//! ([`Card38::zero_sum`]), what the host writes for an empty list.
+//!
 //! On a load with an expert tier (`tier38`) the step and the verify serve
 //! its layers: a tier layer's handoff is `ds41_ffn_handoff_10_cols_tier`
 //! (the step's of one column), which also writes the tier's places and the
@@ -45,7 +52,8 @@
 //! them the go and the wait, stream memory-operation batches
 //! ([`STEP_MEMOPS`] a layer) — and the card leg's [`CARD_LAUNCHES`] on a
 //! layer with card experts ([`TIER_CARD_LAUNCHES`] on a tier layer); then
-//! the head's mix, projection and argmax.
+//! the head's mix, projection and argmax. A layer without a host leg
+//! ([`Card38::hostless`]) has no go and no wait.
 
 use super::body::ATTN_SCALE_256;
 use super::card38::{CARD_LAUNCHES, Card38, TIER_CARD_LAUNCHES};
@@ -109,7 +117,8 @@ pub(super) const MIX_LAUNCHES: usize = 2 * 3;
 /// shared expert's four, the wait and the gated sum.
 pub(super) const FFN_LAUNCHES: usize = 1 + 1 + 1 + 4 + 1 + 1;
 /// Of the block's launches, the stream memory-operation batches: the go and
-/// the wait.
+/// the wait, which a layer without a host leg ([`Card38::hostless`]) goes
+/// without.
 pub(super) const STEP_MEMOPS: usize = 2;
 /// The head: its mix, the projection and the argmax.
 pub(super) const HEAD_LAUNCHES: usize = 3 + 2;
@@ -177,9 +186,14 @@ fn walk_launches(
                 Mixer38::Gdn(_) => GDN_LAUNCHES + usize::from(rows) * GDN_ROWS_LAUNCHES,
                 Mixer38::Qsa(_) => QSA_LAUNCHES + usize::from(rows) * QSA_ROWS_LAUNCHES,
             };
+            let ffn = if card.hostless(l) {
+                FFN_LAUNCHES - STEP_MEMOPS
+            } else {
+                FFN_LAUNCHES
+            };
             MIX_LAUNCHES
                 + mixer
-                + FFN_LAUNCHES
+                + ffn
                 + p.ple.as_ref().map_or(0, |_| PLE_LAUNCHES)
                 + match (card.has(l), tier.is_some_and(|t| t.k(l) > 0)) {
                     (true, true) => TIER_CARD_LAUNCHES,
@@ -682,6 +696,7 @@ impl Parts38<'_> {
     /// with the router's slots (eleven a column, the shared expert's last)
     /// and the go: on a tier layer `ds41_ffn_handoff_10_cols_tier` with the
     /// tier's go, else `plain` — the walk's own launch — and the plain go.
+    /// A layer without a host leg ([`Card38::hostless`]) has no go.
     fn handoff_go(
         &mut self,
         hy: &mut crate::hybrid::Hybrid<HostRun>,
@@ -707,6 +722,9 @@ impl Parts38<'_> {
         let Some(t) = tier else {
             let target = hy.boundary_mut().handoff_target_of(0)?;
             plain(&self.c.k.handoff, &h, target, &mut s.sel)?;
+            if self.card.hostless(l) {
+                return Ok(());
+            }
             return hy.boundary().enqueue_go_of(stream, l, 0);
         };
         let targets = hy.tier_handoff(0, STAGE_TIER)?;
@@ -727,7 +745,8 @@ impl Parts38<'_> {
     /// host's, and on a tier layer the tier's too — then the block's output
     /// into `y`: on a tier layer the join over both cards' slots with the
     /// combine ([`Card38::enqueue_tier_join`]), else the shared add over the
-    /// host's sum ([`Parts38::shared_add`]).
+    /// host's sum ([`Parts38::shared_add`]). A layer without a host leg
+    /// ([`Card38::hostless`]) has no wait and adds zeros for the host's sum.
     fn step_back(
         &mut self,
         hy: &mut crate::hybrid::Hybrid<HostRun>,
@@ -736,9 +755,12 @@ impl Parts38<'_> {
         let stream = self.c.gpu.stream();
         let n_tier = self.tier_k(l);
         if n_tier == 0 {
+            if self.card.hostless(l) {
+                return self.shared_add(l, None);
+            }
             let b = hy.boundary();
             b.enqueue_back_of(stream, 0)?;
-            return self.shared_add(l, b.hsum_of(0)?);
+            return self.shared_add(l, Some(b.hsum_of(0)?));
         }
         hy.enqueue_tier_back(stream, l, 0)?;
         let (hy, s) = (&*hy, &mut *self.s);
@@ -757,10 +779,15 @@ impl Parts38<'_> {
         )
     }
 
-    /// Layer `l`'s block output into `y`: the host's routed sum `hsum`, on a
-    /// layer with card experts the card's, plus the shared expert's output
-    /// times its gate weight.
-    fn shared_add(&mut self, l: usize, hsum: &DeviceBuffer<f32>) -> Result<(), GpuError> {
+    /// Layer `l`'s block output into `y`: the host's routed sum `hsum`
+    /// (`None`: the card's zeros, [`Card38::zero_sum`]), on a layer with card
+    /// experts the card's, plus the shared expert's output times its gate
+    /// weight.
+    fn shared_add(&mut self, l: usize, hsum: Option<&DeviceBuffer<f32>>) -> Result<(), GpuError> {
+        let hsum = match hsum {
+            Some(h) => h,
+            None => self.card.zero_sum()?,
+        };
         let sink = self.c.gpu.layer_sink(l)?;
         let s = &mut *self.s;
         let (stream, q38) = (self.c.gpu.stream(), &self.c.k.q38);
@@ -1517,10 +1544,13 @@ impl<'a> LayerProgram for Step38<'a> {
     }
 
     /// The wait, the gated sum, and the host tier told the layer is enqueued
-    /// (an eager step is served there).
+    /// (an eager step is served there), on a layer with a host leg.
     fn back(&mut self, port: &mut StepLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
         let l = at.layer;
         self.p.step_back(port.hybrid(), l)?;
+        if self.p.card.hostless(l) {
+            return Ok(());
+        }
         port.hybrid().row_enqueued(l, 0)
     }
 
@@ -1611,10 +1641,14 @@ impl<'a> LayerProgram for Verify38<'a> {
     }
 
     /// The wait, the gated sum over the `m` columns' host sums, and the host
-    /// tier told the layer is enqueued (an eager verify is served there).
+    /// tier told the layer is enqueued (an eager verify is served there), on
+    /// a layer with a host leg.
     fn back(&mut self, port: &mut StepLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
         let l = at.layer;
         self.p.step_back(port.hybrid(), l)?;
+        if self.p.card.hostless(l) {
+            return Ok(());
+        }
         port.hybrid().row_enqueued(l, 0)
     }
 
@@ -1726,6 +1760,6 @@ impl<'a> LayerProgram for Pass38<'a> {
 
     /// The gated sum over the host sums the walk's serve uploaded.
     fn back(&mut self, port: &mut BatchLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
-        self.p.shared_add(at.layer, port.hsum())
+        self.p.shared_add(at.layer, Some(port.hsum()))
     }
 }
