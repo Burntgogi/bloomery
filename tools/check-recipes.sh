@@ -350,6 +350,17 @@ blk_macstatic() {
   fi
   echo "${mst##*$'\n'}"
 }
+# mac-remote.sh sends a tree to the second Mac and runs mac-static there: its argument, config-file, track-name,
+# dirty-tree, lock and ledger rules, and (on macOS) the whole flow against a stub ssh that runs the "remote" in a
+# fake home, are tested here, no remote and no cargo.
+blk_macremote() {
+  if ! mrm=$(bash "$(dirname "$0")/mac-remote.sh" --self-test 2>&1); then
+    echo "$mrm" >&2
+    echo "check-recipes: the mac-remote self-test failed" >&2
+    return 1
+  fi
+  echo "${mrm##*$'\n'}"
+}
 # carry.sh is the release's carry check (tools/release/carry.tsv against the commit released): its carried, lacking,
 # pending, unknown-hash and malformed-row verdicts in a temp git repo, no box. The release-build recipe runs it before
 # its box command: a recipe that stops calling it ends the check silently, so the call is held here.
@@ -620,7 +631,7 @@ PY
 }
 
 BLOCKS=(selftest smoke cardorder cardtests lease boxtracks loadgroups lcppfit coldblocks slotsarm lcppwarm q38srv
-  maccheck gatebatch gpugate stackwatch ptxspill scanargs narrowscan ldsscan mutantrun macstatic carry pytools boxqcodes fixturevariants
+  maccheck gatebatch gpugate stackwatch ptxspill scanargs narrowscan ldsscan mutantrun macstatic macremote carry pytools boxqcodes fixturevariants
   refsetpublish orphan archowner)
 for b in "${BLOCKS[@]}"; do
   ( set +e; blk_$b > "$B/$b.out" 2>&1; echo $? > "$B/$b.rc" ) & # set +e: a red block writes its own rc

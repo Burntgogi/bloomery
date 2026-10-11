@@ -83,6 +83,12 @@ mac-test:
 mac-static *ARGS:
     ./tools/mac-static.sh {{ARGS}}
 
+# `just mac-static BASE` for this tree on the second Mac (idle, 10 cores), its output and exit code back here: a round runs
+# `just remote-static BASE` instead of `just mac-static BASE` when this Mac's load decides the wall of the latter. The second
+# Mac runs at most two at once, a third waits for a slot. Setup tools/mac-remote/SETUP.md; the owner is tools/mac-remote.sh.
+remote-static *ARGS:
+    ./tools/mac-remote.sh {{ARGS}}
+
 # An off-box check for a contributor: fmt, the pure crates' tests, the Python tool self-tests and every tools/check-*.sh
 # (T0, any OS with the pinned nightly), plus the host-nightly units on x86_64 Linux with no card (T1, the default there).
 # `just contrib-check --tier t0|t1`. One line per unit, then a DONE line; docs/contrib/local-check.md. The owner is tools/contrib-check.sh.
