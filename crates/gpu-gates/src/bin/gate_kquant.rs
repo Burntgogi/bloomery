@@ -73,7 +73,7 @@
 //!     experts, three slots the host serves (their gate·up rows poisoned NaN):
 //!     the Q4_K gate·up `_sel` (640 × 2560, a column a token), the card
 //!     columns' 32-value q8_1 (`q5_quantize_q8_sel`), the Q5_1 down `_sel`
-//!     (2560 × 640), the card sum (`q38_card_acc`) and the combine with the
+//!     (2560 × 640), the card sum (`ds41_ffn_card_acc_10`) and the combine with the
 //!     host's sum and the gated shared expert (`q38_card_shared_add`). The
 //!     quantizer's card columns are the plain quantizer's bytes of the same
 //!     columns, its host columns keep a pattern written before it, and it
@@ -87,8 +87,8 @@
 //!     the card that is not `HOST` raises `ExpertId` in the quantizer (its
 //!     column not read) and in the card sum (its token NaN), a `HOST` place
 //!     in neither, each launch alone over NaN host columns; the launchers
-//!     refuse a card of no expert, weights at a pitch of ten, columns past the
-//!     scratch and a slot past the weights.
+//!     refuse weights at a pitch of ten, the quantizer a card of no expert,
+//!     columns past the scratch and a slot past the weights.
 //! 11. q8_0_sel32: the Q8_0 down `_sel` of 32-value blocks
 //!     (`bloomery_gpu::q8_0_sel32`, the file's `block_q8_0` bytes resident as
 //!     one word stream) over clause 7's seven experts and ten slots, at the
@@ -143,6 +143,7 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(feature = "gpu")]
 mod gate {
+    use bloomery_gpu::card_slots::{CardAcc, CardSlotKernels};
     use bloomery_gpu::hybrid::HOST;
     use bloomery_gpu::kquant::sel::{ROWS_PER_BLOCK, THREADS, gemv_sel_body};
     use bloomery_gpu::kquant::walk::{iter_term, row_dot, row_dot_1col};
@@ -154,7 +155,7 @@ mod gate {
     use bloomery_gpu::q5::{Q8Blocks32, pack_q5_1};
     use bloomery_gpu::q5_1_sel::{BLOCK_WORDS, Q51SelDown, Q51SelKernels};
     use bloomery_gpu::q8_0_sel32::{Q80SelDown, Q80SelKernels, stream_cols};
-    use bloomery_gpu::q38::{CardAccArgs, CardSharedAddArgs, Q38Kernels, SLOTS, W_PITCH};
+    use bloomery_gpu::q38::{CardSharedAddArgs, Q38Kernels, SLOTS, W_PITCH};
     use bloomery_gpu::{
         DeviceTensor, Fault, FaultSink, FaultSite, Gpu, GpuError, LAYER_NONE, Q8Act, col_sums,
     };
@@ -2089,6 +2090,7 @@ mod gate {
     /// and weights, and every launch's output.
     struct Leg38 {
         q38: Q38Kernels,
+        slots: CardSlotKernels,
         gate: Stack,
         up: Stack,
         down: Stack51,
@@ -2111,6 +2113,7 @@ mod gate {
             let x = activations(N38, M38, 9101);
             Ok(Leg38 {
                 q38: Q38Kernels::load(c.gpu.context())?,
+                slots: CardSlotKernels::load(c.gpu.context())?,
                 gate: Stack::with_experts(c, "q38_gate", GgmlType::Q4_K, E38, FF38, N38, 0x38a1)?,
                 up: Stack::with_experts(c, "q38_up", GgmlType::Q4_K, E38, FF38, N38, 0x38a2)?,
                 down: Stack51::new(c, N38, FF38, 0x38a3)?,
@@ -2159,19 +2162,18 @@ mod gate {
                 rows_per_expert: N38,
             };
             c.q51.enqueue_gemv_q5_1_sel(s, &d, sink, &mut self.y_down)?;
-            self.q38.enqueue_card_acc(
-                s,
-                CardAccArgs {
-                    down: &self.y_down,
-                    w: &self.w,
-                    sel: &self.sel,
-                    n: N38,
-                    m: M38,
-                    n_card: E38,
-                    fault: sink,
-                    acc: &mut self.acc,
-                },
-            )?;
+            let a = CardAcc {
+                down: &self.y_down,
+                w: &self.w,
+                sel: &self.sel,
+                n: N38,
+                m: M38,
+                n_card: E38,
+                n_used: SLOTS,
+                w_pitch: W_PITCH,
+                fault: sink,
+            };
+            self.slots.enqueue_card_acc(s, &a, &mut self.acc)?;
             self.q38.enqueue_card_shared_add(
                 s,
                 CardSharedAddArgs {
@@ -2420,19 +2422,18 @@ mod gate {
             );
             // The card sum: token 0 the rule's; token 1 the rule's, or NaN
             // where its slot 1 is stray.
-            leg.q38.enqueue_card_acc(
-                stream,
-                CardAccArgs {
-                    down: &leg.y_down,
-                    w: &leg.w,
-                    sel,
-                    n: N38,
-                    m: M38,
-                    n_card: E38,
-                    fault: sink,
-                    acc: &mut leg.acc,
-                },
-            )?;
+            let a = CardAcc {
+                down: &leg.y_down,
+                w: &leg.w,
+                sel,
+                n: N38,
+                m: M38,
+                n_card: E38,
+                n_used: SLOTS,
+                w_pitch: W_PITCH,
+                fault: sink,
+            };
+            leg.slots.enqueue_card_acc(stream, &a, &mut leg.acc)?;
             stream.synchronize()?;
             let af = c.gpu.take_fault()?;
             let acc = leg.acc.to_host_vec(stream)?;
@@ -2461,22 +2462,18 @@ mod gate {
         let sink = c.gpu.unlabelled_sink();
         let slots = SEL38.len();
         let w10 = DeviceBuffer::from_host(stream, &[0.5f32; M38 * SLOTS])?;
-        let mut r_acc = Vec::with_capacity(2);
-        for (w, n_card) in [(&leg.w, 0), (&w10, E38)] {
-            r_acc.push(leg.q38.enqueue_card_acc(
-                stream,
-                CardAccArgs {
-                    down: &leg.y_down,
-                    w,
-                    sel: &leg.sel,
-                    n: N38,
-                    m: M38,
-                    n_card,
-                    fault: sink,
-                    acc: &mut leg.acc,
-                },
-            ));
-        }
+        let a = CardAcc {
+            down: &leg.y_down,
+            w: &w10,
+            sel: &leg.sel,
+            n: N38,
+            m: M38,
+            n_card: E38,
+            n_used: SLOTS,
+            w_pitch: W_PITCH,
+            fault: sink,
+        };
+        let r_pitch10 = leg.slots.enqueue_card_acc(stream, &a, &mut leg.acc);
         let mut r_quant = Vec::with_capacity(2);
         for (cols, n_card) in [(0..slots, 0), (1..slots + 1, E38)] {
             let q = QuantSel {
@@ -2506,16 +2503,16 @@ mod gate {
                 y: &mut leg.y,
             },
         );
-        let [r_card0, r_pitch10]: [Result<(), GpuError>; 2] = r_acc
-            .try_into()
-            .map_err(|_| "gate_kquant: two card-sum cases")?;
         let [r_quant_card0, r_quant_past]: [Result<(), GpuError>; 2] = r_quant
             .try_into()
             .map_err(|_| "gate_kquant: two quantizer cases")?;
-        let cases: [(&str, &str, Result<(), GpuError>); 5] = [
-            ("q38::enqueue_card_acc", "a_card_of_no_expert", r_card0),
+        // PIN(2026-10-11): the card sum's "a card of no expert" refusal left with
+        // Qwen3.8's own launcher: the common sum serves a card of no expert as
+        // zeros (V4.1's layers with no card experts), and card_slots.rs's hw
+        // test holds that; Qwen3.8 keeps `q38_shared_add` for such a layer.
+        let cases: [(&str, &str, Result<(), GpuError>); 4] = [
             (
-                "q38::enqueue_card_acc",
+                "ds41_ffn_card_acc_10",
                 "weights_at_a_pitch_of_10",
                 r_pitch10,
             ),
