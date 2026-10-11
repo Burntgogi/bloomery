@@ -990,6 +990,46 @@ ratio slots bin: bin:t@BLOOMERY_GEN_SLOTS=2 has no ours aggregate arm on its pro
   eq drive-col-foreign "$(drive_col 5 1000005 nvme0n1)" ' | drive_read_bytes 512000000 (nvme0n1)'
   eq drive-col-quiet "$(drive_col 5 5 nvme0n1)" ' | drive_read_bytes 0 (nvme0n1)'
   eq drive-col-rows "$(grep -c '\$PROBE_COL\$DRIVE_COL\$COLD_TAG' "$me")" 2
+  # The arm's lines and the greedy text check (cold-blocks.sh) on a fake arm output, each runner's row path
+  # being a box run: every record line of the schema survives (an `nvtier` line, which the runner's own
+  # list once lost), a line of no kind and a step line of no kind of this schema do not.
+  # shellcheck source=tools/ref/cold-blocks.sh
+  source "${me%/*}/cold-blocks.sh"
+  local nv rp fake hx hy
+  sample_rec() { python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import records; print(records.sample_line(records.load(sys.argv[2]).by_name[sys.argv[3]]))' "${me%/*}/../bloomery" "$1" "$2"; }
+  nv=$(sample_rec generate_qwen3moe nvtier) rp=$(sample_rec generate_qwen3moe residency_pass)
+  fake=$(printf '%s\n' 'load arch=stub ctx=256' 'capture graph_nodes=10' 'step 0 6 1000' 'step 1 7 1001' 'time prompt n=6 ms=1.0000 tok/s=1.00 passes=1 kind=gemm' 'stat prompt ubatch_tokens=0 (no ubatch ran)' "$rp" 'a line of no kind' 'tokens [1000, 1001]' "$nv")
+  arm_lines generate_qwen3moe "$fake"
+  eq arm-lines-nvtier "$(grep -cxF -- "$nv" <<< "$ARM_KEPT")" 1
+  eq arm-lines-kept "$(grep -cxF -e "$rp" -e 'tokens [1000, 1001]' -e 'step 0 6 1000' -e 'load arch=stub ctx=256' -e 'stat prompt ubatch_tokens=0 (no ubatch ran)' <<< "$ARM_KEPT")" 5
+  eq arm-lines-dropped "$(grep -cF -e 'no kind' -e 'step 1 7' <<< "$ARM_KEPT")" 0
+  eq arm-lines-order "$(grep -nxF -e "$rp" -e "$nv" <<< "$ARM_KEPT" | cut -d: -f1 | paste -sd' ' -)" '6 8'
+  arm_lines no_such_bin x
+  eq arm-lines-no-schema "$?:${ARM_WHY%%no schema for no_such_bin*}" '1:records.py did not keep the arm'"'"'s lines: records.py: '
+  # The greedy text check: arms on one prompt that part print `differ` with each arm's md5 and count in the
+  # summary; equal ids print `equal`; a lone arm, or arms on other prompts or slot counts, compare to nothing.
+  TK_ROWS='' TK_SHOWN=','
+  hx=$(printf '1000,1001\n' | md5sum | cut -c1-12) hy=$(printf '1000,1002\n' | md5sum | cut -c1-12)
+  tk_add 1 lcg6 ours 'tokens [1000, 1001]'
+  tk_add 1 lcg6 ours@K=V 'tokens [1000, 1002]'
+  tk_add 1 lcg6.s2 bin:t 'tokens [1000, 1001] slot=0'
+  tk_add 2 lcg6 ours 'tokens [1000, 1001]'
+  tk_add 2 lcg6 ours@K=V 'tokens [1000, 1001]'
+  tk_add 3 lcg6 ours 'tokens [1000, 1001]'
+  tk_add 4 lcg6 ours 'tokens [1000, 1001]'
+  tk_add 4 lcg6 bin:t ''
+  eq tokens-differ "$(tk_line 1)" "tokens r1: differ lcg6 ours=$hx ours@K=V=$hy"
+  eq tokens-equal "$(tk_line 2)" 'tokens r2: equal'
+  eq tokens-alone "$(tk_line 3)" ''
+  eq tokens-none "$(tk_line 4)" "tokens r4: differ lcg6 ours=$hx bin:t=none"
+  eq tokens-once "$(tk_round 1; tk_round 1)" "tokens r1: differ lcg6 ours=$hx ours@K=V=$hy"
+  eq tokens-summary "$(tk_summary)" 'tokens-differ rounds: 2 of 3 (arms on one prompt, P and n whose greedy ids differ)'
+  TK_ROWS='' TK_SHOWN=','
+  tk_add 1 lcg6.s2 ours 'tokens [1, 2] slot=0'$'\n''tokens [3, 4] slot=1'
+  tk_add 1 lcg6.s2 bin:t 'tokens [1, 2] slot=0'$'\n''tokens [3, 5] slot=1'
+  eq tokens-slots "$(tk_line 1 | sed 's/=[0-9a-f]\{12\}/=H/g')" 'tokens r1: differ lcg6.s2 ours=H bin:t=H'
+  # Each runner keeps its arm's lines through arm_lines and feeds the text check; none keeps a list of its own.
+  eq arm-lines-wired "$(for b in qwen3moe ds41 glm5next; do grep -c "arm_lines generate_$b \"\$out\"" "${me%/*}/depth-$b.sh"; grep -c '^ *tk_add "\$r" ' "${me%/*}/depth-$b.sh"; grep -c '^ *tk_summary' "${me%/*}/depth-$b.sh"; grep -c "echo \"\$out\" | grep -E '^(" "${me%/*}/depth-$b.sh"; done | paste -sd' ' -)" '1 1 1 0 1 1 1 0 1 1 1 0'
   rm -rf "$pt"
   echo "self-test: $([ "$fails" = 0 ] && echo ok || echo FAIL) ($checks checks, $fails failures)"
   [ "$fails" = 0 ]
@@ -2130,13 +2170,12 @@ ours_post() {
     return 0
   fi
   mtp+=$RS_COL
-  # The prompt_ids line is the whole prompt; the load, capture, step-0, time prompt and stat prompt
-  # lines are the arm's configuration, the prefill's time and its host prologue; under
-  # BLOOMERY_STEP_STATS the ubatch walk's split and per-layer-batch records follow, then each generated
-  # step's host counters and their summary (the host slots a step, from which the residency hit reads).
-  # An MTP arm's window walls and kept rows, a residency arm's boundaries and the greedy ids stay in the
-  # log beside the row that sums them.
-  echo "$out" | grep -E '^(load|capture|step 0|time prompt|stat prompt|stat step|stat summary|residency pass|mtp summary|time pass|tokens) '
+  # The log keeps every record line of generate_qwen3moe's schema and the plain lines cold-blocks.sh
+  # names (arm_lines): the plan, load and capture, the prefill's time, the ubatch walk's records, each
+  # generated step's host counters and their summary, an MTP arm's windows, a residency arm's boundaries,
+  # the NVMe tier's counters and the greedy ids, beside the row that sums them.
+  arm_lines generate_qwen3moe "$out" || { arm_fail "$(fail_round "$r")" "$label" "d=$dep" "$rc" "$ARM_WHY" "$out"; return 0; }
+  [ -z "$ARM_KEPT" ] || printf '%s\n' "$ARM_KEPT"
   warmcol=$(echo "$smoke" | sed -n 's/.* warm=\([0-9]*\).*/\1/p')
   nodes=$(echo "$out" | sed -n 's/^capture graph_nodes=\([0-9]*\).*/\1/p')
   [ -n "$nodes" ] || nodes=$(sed -n 's/^capture graph_nodes=\([0-9]*\).*/\1/p' <<< "${LG_HEADER:-}")
@@ -2188,6 +2227,10 @@ ours_post() {
   [ -z "$pps" ] || pass_sums+=("$label|$dep|$r|$pps|$CPU_BUSY_TAG$OTHER_BUSY_TAG$COLD_TAG$PROBE_TAG")
   [ -z "$PP_N" ] || pp_sums+=("$label|$PP_N|$r|$PP_TPS|$CPU_BUSY_TAG$OTHER_BUSY_TAG$COLD_TAG$PROBE_TAG")
   res_sums_add "$label" "$dep" "$r"
+  # The greedy text check: every counted row of the model's own engine, lever and bin: arms included.
+  local tkids=lcg
+  [ -z "${A_TOK[$i]}" ] || tkids=prose
+  tk_add "$r" "$(tk_key "$tkids" "$dep" "${A_SLOTS[$i]}" "${A_MODEL[$i]}")" "$label" "$out"
   # The greedy cross-check's ours side: the plain rows (no NAME=VALUE list) of this tree's binary.
   case ${A_KIND[$i]}:$label in
     ours:ours) xc_add ours lcg "$dep" "$r" "$label" "$(sed -n 's/^tokens //p' <<< "$out" | tail -n 1)" ;;
@@ -2466,13 +2509,18 @@ if [ "$ORDER" = rotate ]; then
     ROW_TAG=ROW
     echo "[warmup] ${ARMS[0]} ran once before round 1 and is discarded (the WARMUP or FAIL r0 row above)"
   fi
-  for r in $(seq "$ROUNDS"); do run_round "$r" "${!ARMS[@]}"; done
+  for r in $(seq "$ROUNDS"); do
+    run_round "$r" "${!ARMS[@]}"
+    tk_round "$r"
+  done
 else
   blocks_run
+  tk_rounds
 fi
 echo
 echo "cpu-busy rows: $busy_rows of $n_rows (BLOOMERY_CPU_BUSY_PCT=${CPU_BUSY_PCT}% over [$CPU_BUSY_COMMS])"
 echo "other-busy rows: $other_rows of $n_rows (a compute process on the other card as the arm started)"
+tk_summary
 echo "cold rows: $cold_rows of $n_rows (the measured window's majflt × ${COLD_US} µs ≥ ${COLD_PCT} % of that window)"
 echo "probe-off rows: $probe_rows of $n_rows (an ours row whose load probed lane_gbs under ${PROBE_QUIET_LO} GB/s: a lighter prompt plan than its pair's)"
 warm_rows_summary

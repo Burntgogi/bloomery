@@ -267,8 +267,9 @@
 # load or warm-up, which a whole-process count cannot tell apart. The witness still prints the page
 # cache and the fault count before and after every arm. BLOOMERY_GEN_WARM (generate_ds41 --warm) trims
 # our arm's first steps.
-# With BLOOMERY_STEP_STATS=1 (BLOOMERY_BOX_ENV on the Mac side) our arm's `stat summary` line is
-# echoed with its load lines; the per-step `stat step` lines stay in the arm's output only.
+# Our arm's log lines are every record line of generate_ds41's schema (cold-blocks.sh arm_lines), the
+# per-step `step`, `time step` and, under BLOOMERY_STEP_STATS=1 (BLOOMERY_BOX_ENV on the Mac side),
+# `stat step` lines included.
 #
 # Prefill. pp_tok/s is P over the wall of processing a P-token prompt, in each engine's terms:
 #   ours     generate_ds41's `time prompt` row: before the first fed step to after the readback of
@@ -515,7 +516,8 @@ ours_row() {
     return 1
   fi
   pp_col "$kind" || return
-  echo "$out" | grep -E '^(plan|load|capture|fed|prefill|stat prefill|stat summary|time prompt|call|arm|residency host|residency lever) '
+  arm_lines generate_ds41 "$out" || { FAIL_WHY=$ARM_WHY; return 1; }
+  [ -z "$ARM_KEPT" ] || printf '%s\n' "$ARM_KEPT"
   # `time step` rows are one position each; under BLOOMERY_DRAFT the rows are `time pass … positions=1|2`
   # and the `draft summary` line carries the positions-per-second rate the verdict reads.
   DRAFT=
@@ -1764,6 +1766,10 @@ ours_post() {
   counted || return 0
   count_row
   res_sums_add "$label" "$dep" "$r"
+  # The greedy text check: every counted row of the model's own engine, lever and bin: arms included.
+  local tkids=lcg
+  [ "${A_KIND[$i]}" != corpus ] || tkids=$label
+  tk_add "$r" "$(tk_key "$tkids" "$dep" "${A_SLOTS[$i]}")" "$label" "$out"
   # The greedy cross-check's ours side: this tree's plain arms (no NAME=VALUE list), on their ids.
   case ${A_KIND[$i]}:$label in
     ours:ours) xc_add ours lcg "$dep" "$r" "$label" "$XC_TOK" ;;
@@ -2122,13 +2128,18 @@ if [ "$ORDER" = rotate ]; then
     ROW_TAG=ROW
     echo "[warmup] ${ARMS[0]} ran once before round 1 and is discarded (the WARMUP or FAIL r0 row above): the lease's first process reads the model's pages cold"
   fi
-  for r in $(seq "$ROUNDS"); do run_round "$r" "${!ARMS[@]}"; done
+  for r in $(seq "$ROUNDS"); do
+    run_round "$r" "${!ARMS[@]}"
+    tk_round "$r"
+  done
 else
   blocks_run
+  tk_rounds
 fi
 echo
 echo "cpu-busy rows: $busy_rows of $n_rows (BLOOMERY_CPU_BUSY_PCT=${CPU_BUSY_PCT}% over [$CPU_BUSY_COMMS])"
 echo "other-busy rows: $other_rows of $n_rows (a compute process on the other card as the arm started)"
+tk_summary
 echo "cold rows: $cold_rows of $n_rows (the measured window's majflt × ${COLD_US} µs ≥ ${COLD_PCT} % of that window)"
 warm_rows_summary
 # The greedy cross-check (lcpp-warm.sh), before the tables: a server row whose first id parts from ours

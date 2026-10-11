@@ -1,6 +1,7 @@
 # shellcheck shell=bash
-# The depth runners' fault witness, engine blocks and failed arms (depth-ds41.sh, depth-qwen3moe.sh): what
-# the two share of the cold tag, of BLOOMERY_AB_ORDER=blocks and of their FAIL rows, one copy. Sourced;
+# The depth runners' fault witness, engine blocks and failed arms (depth-ds41.sh, depth-qwen3moe.sh,
+# depth-glm5next.sh): what they share of the cold tag, of BLOOMERY_AB_ORDER=blocks, of their FAIL rows, of
+# the lines an arm keeps in the log and of the greedy text check, one copy. Sourced;
 # it defines constants and functions and runs nothing. What a runner's own engines decide stays in that
 # runner: which block an arm belongs to (arm_block), how many token ids its process draws (arm_draws),
 # the timed window's start (REF_MARK, the `fed` line), why an arm failed and the header text that
@@ -46,6 +47,16 @@
 #               how an arm runs once more: a reference process again, a fresh load of the arm's prime and
 #               the arm, one more timed request to the same server.
 # Off (0, the default) nothing runs or prints differently: no prime, no retry, no line of its own.
+#
+# The arm's lines. An arm's output is long; what enters the log is every line of a record kind the arm's
+# binary declares (arm_lines: records.py keep, which reads tools/bloomery/schema/<bin>.jsonl, so a kind
+# added to the binary is kept with no edit here) and ARM_PLAIN, the lines of no kind. In output order.
+#
+# The greedy text check. Every counted row of the model's own engine adds the md5 of its generated ids
+# (tk_add); a round's arms on one prompt, P, slot count and model are compared (tk_round, tk_rounds), and
+# the summary counts the rounds whose arms parted (tk_summary). A `tokens` line is the whole text of an
+# arm, so equal ids here is the condition a speed ratio between the arms needs. Reference engines are out
+# (lcpp-warm.sh's cross-check holds them to ours').
 #
 # The runner defines, before arm_fail: ARM_FAIL_STEM, and CPU_BUSY_TAG and OTHER_BUSY_TAG (lease.sh,
 # timing-card.sh). Before failed_tally: sums and pp_sums, its decode and prefill records `label|key|…`.
@@ -519,3 +530,88 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = --self-test ]; then
   [ "$fails" = 0 ]
   exit
 fi
+
+# The lines of no record kind that an arm's output keeps, each `<head>|<why>`: a line is kept when it opens
+# with the head and a space. A kind added to a schema leaves this list (records.py keep keeps it).
+ARM_PLAIN=(
+  'load|generate_qwen3moe prints a load line no kind of its schema reads, and the library prints `load host_tier` lines (records.py NOT_RECORDS)'
+  'capture|the captured graph'"'"'s node count: no kind of generate_qwen3moe'"'"'s schema'
+  'step 0|token 0 and the feed'"'"'s wall: no kind of generate_qwen3moe'"'"'s schema'
+  'time prompt|the prefill'"'"'s wall and kind: no kind of generate_qwen3moe'"'"'s schema'
+  'stat prompt|the ubatch walk'"'"'s totals line: no kind (its `split` and `lb` rows are kinds)'
+  'tokens|the greedy ids, which the text check and the cross-check read: no kind of generate_qwen3moe'"'"'s schema'
+)
+# arm_plain_re: ARM_PLAIN's heads as the ERE records.py keep takes.
+arm_plain_re() {
+  local e re=''
+  for e in "${ARM_PLAIN[@]}"; do re="$re|${e%%|*}"; done
+  printf '^(%s) ' "${re#|}"
+}
+# arm_lines <bin> <output>: the lines of <output> that <bin>'s checked-in schema reads, and ARM_PLAIN's, in
+# order, into ARM_KEPT. Returns 1 with ARM_WHY when records.py cannot read its schema.
+ARM_KEPT='' ARM_WHY=''
+arm_lines() {
+  local got
+  ARM_KEPT=''
+  got=$(python3 "$RS_RECORDS" keep --bin "$1" --also "$(arm_plain_re)" - <<< "$2" 2>&1) || {
+    ARM_WHY="records.py did not keep the arm's lines: $got"
+    return 1
+  }
+  ARM_KEPT=$got
+}
+
+# The greedy text check's rows, TK_ROWS: `<round>|<key>|<label>|<hash>` a line. tk_hash <output>: the md5
+# (12 hex) of the arm's ids, one `tokens` line a slot (the ` slot=<j>` tag, brackets and spaces dropped),
+# `none` when it printed none. tk_key <ids> <dep> [<slots> [<model>]]: the arms that fed one prompt share a
+# key. tk_add <round> <key> <label> <output>.
+TK_ROWS='' TK_SHOWN=','
+tk_hash() {
+  local ids
+  ids=$(sed -n 's/^tokens //p' <<< "$1" | sed 's/ slot=[0-9]*$//' | tr -d '[] ')
+  if [ -z "$ids" ]; then echo none; else printf '%s\n' "$ids" | md5sum | cut -c1-12; fi
+}
+tk_key() { echo "$1$2${3:+.s$3}${4:+.m${4##*/}}"; }
+tk_add() { TK_ROWS="$TK_ROWS$1|$2|$3|$(tk_hash "$4")"$'\n'; }
+# tk_line <round>: `tokens r<R>: equal`, or `tokens r<R>: differ <key> <label>=<hash> ...` (the groups that
+# parted, ` ;` between them), nothing when no two arms of the round fed one prompt.
+tk_line() {
+  printf '%s' "$TK_ROWS" | awk -F'|' -v r="$1" '
+    $1 == r {
+      if (!($2 in n)) order[++k] = $2
+      n[$2]++
+      ent[$2] = ent[$2] " " $3 "=" $4
+      if (!(($2, $4) in seen)) { seen[$2, $4] = 1; distinct[$2]++ }
+    }
+    END {
+      for (i = 1; i <= k; i++) {
+        g = order[i]
+        if (n[g] < 2) continue
+        compared++
+        if (distinct[g] > 1) { bad++; diff = diff (diff == "" ? "" : " ;") " " g ent[g] }
+      }
+      if (compared == 0) exit
+      if (bad == 0) print "tokens r" r ": equal"
+      else print "tokens r" r ": differ" diff
+    }'
+}
+# tk_round <round>: that round's line, once. tk_rounds: every round's, in order (a blocks run, whose rounds
+# finish together). tk_summary: the closing count, over the rounds that had a pair.
+tk_round() {
+  local line
+  case $TK_SHOWN in *",$1,"*) return 0 ;; esac
+  line=$(tk_line "$1")
+  [ -z "$line" ] || { echo "$line"; TK_SHOWN="$TK_SHOWN$1,"; }
+}
+tk_rounds() {
+  local r
+  for r in $(printf '%s' "$TK_ROWS" | cut -d'|' -f1 | sort -un); do tk_round "$r"; done
+}
+tk_summary() {
+  local r line n=0 k=0
+  for r in $(printf '%s' "$TK_ROWS" | cut -d'|' -f1 | sort -un); do
+    line=$(tk_line "$r")
+    [ -z "$line" ] || n=$((n + 1))
+    case $line in *": differ"*) k=$((k + 1)) ;; esac
+  done
+  echo "tokens-differ rounds: $k of $n (arms on one prompt, P and n whose greedy ids differ)"
+}

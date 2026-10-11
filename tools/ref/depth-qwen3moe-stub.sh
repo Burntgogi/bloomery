@@ -100,6 +100,10 @@
 #   res-nolever  the copy with the residency kinds, 6@BLOOMERY_RESIDENCY=mid-p148-s1 with no STUB_GEN_RES (the stub
 #                prints no lever record): a FAIL row naming the missing record, rc 1, never a row with no column.
 #   cpu-guard    STUB_CPU_BUSY=1 (every CPU sample 99 %), 6 lcpp:6: both rows [cpu-busy], `cpu-busy rows: 2 of 2`.
+#   tokens-check STUB_GEN_NVTIER=1, 6 6@STUB_GEN_TOKEN0=7, two rounds: every arm's `nvtier` record in the log (4), a
+#                `tokens r<R>: differ lcg6 ours=<md5> ours@STUB_GEN_TOKEN0=7=<md5>` line a round (the round's order) and
+#                `tokens-differ rounds: 2 of 2`; the same with 6 6@STUB_GEN_PASSES=4 (one ids): `tokens r<R>: equal`
+#                twice and `tokens-differ rounds: 0 of 2`.
 #   profile-3090 the real models/qwen4exp.sh: -ncmoe 43 with the 3090 as the timing card, 26 with the A6000 or
 #                none; another card with no 3090 UUID resolved: refused by name, rc 64.
 #                DEPTH_QWEN3MOE_PROFILE names another copy of the profile (FAIL-first).
@@ -189,6 +193,7 @@ cp "$ROOT/crates/levers/src/registry.rs" "$T/crates/levers/src/"
 # The copy's one row of its own, STUB_GEN_PASSES (the stub engine's pass count): a lever arm sets a registry
 # row, and the mtp-pass-ratio case's lever arm sets this one.
 echo '// LeverSpec { name: "STUB_GEN_PASSES", site: Site::Parsed } (the stub test'"'"'s own row)' >> "$T/crates/levers/src/registry.rs"
+echo '// LeverSpec { name: "STUB_GEN_TOKEN0", site: Site::Parsed } (the stub test'"'"'s own row: the tokens-check case'"'"'s lever arm)' >> "$T/crates/levers/src/registry.rs"
 echo 'lease_take() { echo "[stub] no lease: the stub test'"'"'s copy of lease.sh takes nothing"; }' >> "$T/tools/ref/lease.sh"
 # STUB_CPU_BUSY=1: every CPU sample reads 99 % of one cpu from a stub process (the cpu-guard case).
 # shellcheck disable=SC2016 # written into the stub tree's lease.sh, expanded there
@@ -453,6 +458,7 @@ for k in "${!arms[@]}"; do
     echo "SMOKE mode=graph prompt_tokens=$depth depth=$depth seeded=false generated=$n warm=0 steps=$((n - 1)) p50_ms=5.0000 mean_ms=5.0000 tok/s(p50)=200.00 ctx=$ctx"
   fi
 done
+[ -z "${STUB_GEN_NVTIER:-}" ] || echo "nvtier budget=1 paged=1 misses=1 fills=1 fill_bytes=1 fill_ns=1 evictions=1 resident_bytes=1 buffered_reads=1 buffered_bytes=1 drops=1 drop_bytes=1 drop_ns=1 union_small=1 union_batched=1 union_fills=1 union_hits=1 keep_claims=1 transient_claims=1"
 EOF
 cp "$T/target/release/generate_qwen3moe" "$T/base/target/release/generate_qwen3moe"
 # The stub llama-server: tools/ref/stub-llama-server.py (its docstring has what it answers and the cases).
@@ -1165,6 +1171,23 @@ elif want cpu-guard "$L" 1 '^ROW r1 ours d=6 .*\[cpu-busy\]' &&
   want cpu-guard "$L" 1 '^ROW r1 lcpp d=6 .*\[cpu-busy\]' &&
   want cpu-guard "$L" 1 '^cpu-busy rows: 2 of 2 '; then
   pass cpu-guard
+fi
+
+L=$tmp/tokens-check.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=2 STUB_GEN_NVTIER=1 -- 6 6@STUB_GEN_TOKEN0=7
+if [ "$RC" != 0 ]; then
+  fail tokens-check "rc $RC, want 0" "$L"
+elif want tokens-check "$L" 4 '^nvtier budget=1 paged=1 ' &&
+  want tokens-check "$L" 2 '^tokens r[12]: differ lcg6 (ours=[0-9a-f]{12} ours@STUB_GEN_TOKEN0=7=[0-9a-f]{12}|ours@STUB_GEN_TOKEN0=7=[0-9a-f]{12} ours=[0-9a-f]{12})$' &&
+  want tokens-check "$L" 1 '^tokens-differ rounds: 2 of 2 \(arms on one prompt, P and n whose greedy ids differ\)$'; then
+  L=$tmp/tokens-equal.log
+  stub_run "$L" BLOOMERY_AB_ROUNDS=2 -- 6 6@STUB_GEN_PASSES=4
+  if [ "$RC" != 0 ]; then
+    fail tokens-check "equal ids: rc $RC, want 0" "$L"
+  elif want tokens-check "$L" 2 '^tokens r[12]: equal$' &&
+    want tokens-check "$L" 1 '^tokens-differ rounds: 0 of 2 '; then
+    pass tokens-check
+  fi
 fi
 
 # The real qwen4exp profile's 3090 line: -ncmoe 43 when the timing card is the 3090, 26 otherwise, and a

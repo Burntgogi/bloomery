@@ -1056,7 +1056,8 @@ run_arm() {
         fail_row "" "${r_tag#r}" "$i" 0 "the arm runs BLOOMERY_RESIDENCY=$(res_asked "$i"), and generate_glm5next's checked-in schema (tools/bloomery/schema/generate_glm5next.jsonl) declares no residency record, so its row cannot carry them: refresh the schema from the binary that prints them (just records-refresh)" "$out"
         return
       fi
-      echo "$out" | grep -E '^(plan|load|capture|fed|step 0|time prompt) '
+      arm_lines generate_glm5next "$out" || { fail_row "" "${r_tag#r}" "$i" 0 "$ARM_WHY" "$out"; return; }
+      [ -z "$ARM_KEPT" ] || printf '%s\n' "$ARM_KEPT"
       local h10 t10 uniq tps tps50 agg
       # An aggregate arm's series are its rounds.
       [ -z "$nslots" ] || SERIES=$(paste -d' ' <(printf '%s\n' "$SP_MS") <(printf '%s\n' "$SP_KIND") | awk '$2 == "slots" { print $1 }')
@@ -1090,6 +1091,8 @@ run_arm() {
       if [ -n "$nslots" ]; then sums+=("$label|$dep|$r|$agg|$nslots"); else sums+=("$label|$dep|$r|$tps"); fi
       pp_sums+=("$label|$PP_N|$r|$PP_TPS")
       res_sums_add "$label" "$dep" "$r"
+      # The greedy text check: every counted row of the model's own engine, the drafted run included.
+      tk_add "$r" "$(tk_key prose "$dep" "$nslots")" "$label" "$out"
       # The drafted run's ids are held to ours' as a server row's are; it is never the ours side. A lever
       # arm is in no cross-check: its lever may move the arithmetic.
       case $label in
@@ -1289,11 +1292,13 @@ for grp in 0 1; do
       [ "$WARMUP" = 0 ] || [ "$grp" = 1 ] || [ "$r" != 1 ] || srv_glm "${A_ENG[$i]}" || run_arm WARMUP 0 "$i"
       run_row "$r" "$i"
     done
+    tk_round "$r"
   done
 done
 
 echo
 echo "arm runs: $n_rows (FAIL rows included); rows tagged [cpu-busy] $busy_rows, [other-busy] $other_rows, [cold] $cold_rows; cold re-runs $retry_rows, FAIL-cold $fail_cold"
+tk_summary
 # The greedy cross-check (lcpp-warm.sh), before the tables: a server row whose first id parts from ours
 # joins the failed arms and its label drops out of the means and ratios at that depth or P (xc_drop); a
 # later id's part is a [xcheck-tail] line and stays.

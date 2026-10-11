@@ -16,6 +16,9 @@ it). A reader names a kind and a field; the syntax is this file's and record.rs'
   records.py tail [--bin B] FILE KIND...         the lines of those kinds after the file's last record of any
                                                  other kind, as printed, in order: what a process prints
                                                  between one unit of its output and the next
+  records.py keep [--bin B] [--also ERE] FILE    the lines of FILE (`-` for stdin) that a kind reads, whole
+                                                 or loose, in order, and those ERE matches (searched in
+                                                 the line): what a runner keeps of an arm's output
   records.py check [--bin B] FILE...             the lines a kind's head opens that no kind reads whole:
                                                  read loose, or not at all (exit 1 when there is one)
   records.py --self-test                         every kind's line read whole, and `check`'s passes
@@ -311,6 +314,27 @@ def cmd_lines(argv):
     return 0
 
 
+def cmd_keep(argv):
+    bin_name, rest = take_bin(argv)
+    also = None
+    if rest[:1] == ["--also"]:
+        if len(rest) < 2:
+            usage()
+        try:
+            also = re.compile(rest[1])
+        except re.error as e:
+            refuse(f"--also {rest[1]!r} is no regular expression: {e}")
+        rest = rest[2:]
+    if len(rest) != 1:
+        usage()
+    schema = load(bin_name)
+    text = sys.stdin.read() if rest[0] == "-" else Path(rest[0]).read_text(errors="replace")
+    for line in text.splitlines():
+        if schema.read_line(line) is not None or (also is not None and also.search(line)):
+            print(line)
+    return 0
+
+
 def cmd_tail(argv):
     bin_name, rest = take_bin(argv)
     if len(rest) < 2:
@@ -467,6 +491,15 @@ def self_test():
     recs = read([reset, step, "a line of no kind", reset, reset], schema=schema)
     assert [r.line for r in tail(recs, "residency_reset")] == [reset, reset], recs
     assert tail(read([reset, step], schema=schema), "residency_reset") == []
+    # keep: every line a kind reads (the whole or loose), in order; a line of no kind only through --also
+    kept, real_stdin = io.StringIO(), sys.stdin
+    sys.stdin = io.StringIO("\n".join([reset, "a line of no kind", step, "load resident_bytes=1", "tokens extra", "x"]) + "\n")
+    try:
+        with contextlib.redirect_stdout(kept):
+            cmd_keep(["--bin", DEFAULT_BIN, "--also", "^(tokens|x) ", "-"])
+    finally:
+        sys.stdin = real_stdin
+    assert kept.getvalue().splitlines() == [reset, step, "load resident_bytes=1", "tokens extra"], kept.getvalue()
     # refresh checks every file before it writes one: a marker no record follows refuses the whole
     # stdin by name, the schema and the earlier marker's file included, and nothing is returned
     root = SCHEMA_DIR.parent.parent.parent
@@ -497,7 +530,7 @@ def main(argv):
     if argv == ["--self-test"]:
         return self_test()
     cmds = {"parse": cmd_parse, "lines": cmd_lines, "tail": cmd_tail, "sh": cmd_sh, "check": cmd_check,
-            "refresh": cmd_refresh}
+            "refresh": cmd_refresh, "keep": cmd_keep}
     if not argv or argv[0] not in cmds:
         usage()
     return cmds[argv[0]](argv[1:])
