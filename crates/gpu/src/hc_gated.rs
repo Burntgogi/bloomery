@@ -77,6 +77,9 @@ use std::sync::Arc;
 pub const STREAMS: usize = 4;
 /// The bottleneck's width of that instance.
 pub const RANK: usize = 320;
+/// Values a norm thread loads at once: the stream is walked in chunks of
+/// this many values a thread.
+const NORM_CHUNK: usize = 16;
 const _: () = assert!(
     INSTANCES.len() == 1
         && INSTANCES[0].streams as usize == STREAMS
@@ -314,6 +317,118 @@ unsafe fn up_mix_value<const M: usize>(
     }
 }
 
+/// One block of `hc_gated_norm_4` and `hc_gated_norm_4w`, which say what it
+/// computes: stream `s` of column `c`, this thread `tid` of its
+/// [`NORM_THREADS`]. A thread walks its values `tid`, `tid + NORM_THREADS`
+/// and on in chunks of [`NORM_CHUNK`]: a pass loads a chunk's values, then
+/// uses them in that order.
+///
+/// # Safety
+/// The entry's launch contract holds: `res` and `xn` hold `m * 4 * hidden`
+/// values, `gamma` `4 * hidden`, `y` `(combine + init) * m * hidden`, `wgt`
+/// `combine * m * 4`, and `combine + init <= 1`. `c < m`, `s < 4`, `tid <
+/// NORM_THREADS`, every thread of the block calls it, and `ws` is as
+/// [`block_sum`] asks. The block owns stream `s` of column `c` of `res` and
+/// `xn`, and each thread its values `tid + k * NORM_THREADS` of them.
+#[inline(always)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
+)]
+unsafe fn norm_stream(
+    y: &[f32],
+    wgt: &[f32],
+    gamma: &[f32],
+    (hidden, eps): (u32, f32),
+    (combine, init): (u32, u32),
+    fault: FaultSink,
+    (res, xn): (&mut DisjointSlice<f32>, &mut DisjointSlice<f32>),
+    (s, c, tid): (usize, usize, usize),
+    ws: *mut f32,
+) {
+    let hid = hidden as usize;
+    let base = (c * STREAMS + s) * hid;
+    let w = if combine == 1 {
+        // SAFETY: c * 4 + s < m * 4 <= wgt.len() when combine is 1.
+        unsafe { *wgt.get_unchecked(c * STREAMS + s) }
+    } else {
+        0.0
+    };
+    let reads_y = combine == 1 || init == 1;
+    let mut acc = 0.0f32;
+    let mut i0 = tid;
+    while i0 < hid {
+        let (mut xv, mut yv) = ([0.0f32; NORM_CHUNK], [0.0f32; NORM_CHUNK]);
+        for j in 0..NORM_CHUNK {
+            thread::__unroll_config::<0>();
+            let i = i0 + j * NORM_THREADS;
+            if i < hid {
+                // SAFETY: base + i < m * 4 * hidden <= res.len(), this
+                // thread's own value (# Safety).
+                xv[j] = unsafe { *res.get_unchecked_mut(base + i) };
+                if reads_y {
+                    // SAFETY: c * hidden + i < m * hidden <= y.len() when
+                    // combine or init is 1.
+                    yv[j] = unsafe { *y.get_unchecked(c * hid + i) };
+                }
+            }
+        }
+        for j in 0..NORM_CHUNK {
+            thread::__unroll_config::<0>();
+            let i = i0 + j * NORM_THREADS;
+            if i < hid {
+                let x = if combine == 1 {
+                    f32::mul_add(w, yv[j], xv[j])
+                } else if init == 1 {
+                    yv[j]
+                } else {
+                    xv[j]
+                };
+                if reads_y {
+                    // SAFETY: base + i < m * 4 * hidden <= res.len(), this
+                    // thread's own value (# Safety).
+                    unsafe { *res.get_unchecked_mut(base + i) = x };
+                }
+                acc = f32::mul_add(x, x, acc);
+            }
+        }
+        i0 += NORM_CHUNK * NORM_THREADS;
+    }
+    // SAFETY: every thread of the block is here, and `ws` is as
+    // `block_sum` asks (# Safety).
+    let sum = unsafe { block_sum(acc, tid, ws) };
+    if tid == 0 && !sum.is_finite() {
+        fault.raise(SITE);
+    }
+    let r = 1.0 / (sum / hidden as f32 + eps).sqrt();
+    let mut i0 = tid;
+    while i0 < hid {
+        let (mut xv, mut gv) = ([0.0f32; NORM_CHUNK], [0.0f32; NORM_CHUNK]);
+        for j in 0..NORM_CHUNK {
+            thread::__unroll_config::<0>();
+            let i = i0 + j * NORM_THREADS;
+            if i < hid {
+                // SAFETY: base + i < m * 4 * hidden <= res.len(), this
+                // thread's own value, which it wrote or read in the first
+                // pass (# Safety).
+                xv[j] = unsafe { *res.get_unchecked_mut(base + i) };
+                // SAFETY: s * hidden + i < 4 * hidden <= gamma.len().
+                gv[j] = unsafe { *gamma.get_unchecked(s * hid + i) };
+            }
+        }
+        for j in 0..NORM_CHUNK {
+            thread::__unroll_config::<0>();
+            let i = i0 + j * NORM_THREADS;
+            if i < hid {
+                // SAFETY: base + i < m * 4 * hidden <= xn.len(), this
+                // thread's own value (# Safety).
+                unsafe { *xn.get_unchecked_mut(base + i) = (xv[j] * r) * gv[j] };
+            }
+        }
+        i0 += NORM_CHUNK * NORM_THREADS;
+    }
+}
+
 // ---------------------------------------------------------------- kernels
 
 #[cuda_module]
@@ -364,51 +479,25 @@ mod hc_kernels {
         if c >= m as usize {
             return; // block-uniform
         }
-        let tid = thread::threadIdx_x() as usize;
-        let hid = hidden as usize;
-        let base = (c * STREAMS + s) * hid;
         // SAFETY: this block's own shared allocation, reached without a
-        // reference; `block_sum` is its only user.
+        // reference; `norm_stream`'s `block_sum` is its only user.
         let ws = unsafe { SharedArray::as_raw_mut_ptr(&raw mut WS) };
-        let w = if combine == 1 {
-            // SAFETY: c·4 + s < m·4 <= wgt.len().
-            unsafe { *wgt.get_unchecked(c * STREAMS + s) }
-        } else {
-            0.0
-        };
-        let mut acc = 0.0f32;
-        let mut i = tid;
-        while i < hid {
-            // SAFETY: base + i < m·4·hidden <= res.len(), c·hidden + i <
-            // m·hidden <= y.len(); this block owns stream s of column c and
-            // this thread value i of it.
-            let x = unsafe {
-                let r = res.get_unchecked_mut(base + i);
-                if combine == 1 {
-                    *r = f32::mul_add(w, *y.get_unchecked(c * hid + i), *r);
-                } else if init == 1 {
-                    *r = *y.get_unchecked(c * hid + i);
-                }
-                *r
-            };
-            acc = f32::mul_add(x, x, acc);
-            i += NORM_THREADS;
-        }
-        // SAFETY: `ws` is NORM_WARPS f32 of this block's shared memory.
-        let sum = unsafe { block_sum(acc, tid, ws) };
-        if tid == 0 && !sum.is_finite() {
-            fault.raise(SITE);
-        }
-        let r = 1.0 / (sum / hidden as f32 + eps).sqrt();
-        let mut i = tid;
-        while i < hid {
-            // SAFETY: as above; s·hidden + i < 4·hidden <= gamma.len(). The
-            // value was written by this thread in the pass above.
-            unsafe {
-                let x = *res.get_unchecked_mut(base + i);
-                *xn.get_unchecked_mut(base + i) = (x * r) * *gamma.get_unchecked(s * hid + i);
-            }
-            i += NORM_THREADS;
+        let tid = thread::threadIdx_x() as usize;
+        // SAFETY: the launch contract above holds, c < m, s < 4 and tid <
+        // 256 (the contract's block), every thread of the block is here,
+        // and `ws` is this block's NORM_WARPS f32.
+        unsafe {
+            norm_stream(
+                y,
+                wgt,
+                gamma,
+                (hidden, eps),
+                (combine, init),
+                fault,
+                (&mut res, &mut xn),
+                (s, c, tid),
+                ws,
+            );
         }
     }
 
@@ -1019,7 +1108,7 @@ mod hc_wide_kernels {
     use super::*;
 
     /// [`hc_kernels::hc_gated_norm_4`] over any number of columns: block `b`
-    /// is stream `b % 4` of column `b / 4`, the same body.
+    /// is stream `b % 4` of column `b / 4`, the same body ([`norm_stream`]).
     #[kernel]
     #[launch_bounds(256)]
     #[launch_contract(
@@ -1057,53 +1146,25 @@ mod hc_wide_kernels {
         if c >= m as usize {
             return; // block-uniform
         }
-        let tid = thread::threadIdx_x() as usize;
-        let hid = hidden as usize;
-        let base = (c * STREAMS + s) * hid;
         // SAFETY: this block's own shared allocation, reached without a
-        // reference; `block_sum` is its only user.
+        // reference; `norm_stream`'s `block_sum` is its only user.
         let ws = unsafe { SharedArray::as_raw_mut_ptr(&raw mut WS) };
-        let w = if combine == 1 {
-            // SAFETY: c·4 + s < m·4 <= wgt.len().
-            unsafe { *wgt.get_unchecked(c * STREAMS + s) }
-        } else {
-            0.0
-        };
-        let mut acc = 0.0f32;
-        let mut i = tid;
-        while i < hid {
-            // SAFETY: base + i < m·4·hidden <= res.len(), c·hidden + i <
-            // m·hidden <= y.len(); this block owns stream s of column c and
-            // this thread value i of it.
-            let x = unsafe {
-                let r = res.get_unchecked_mut(base + i);
-                if combine == 1 {
-                    *r = f32::mul_add(w, *y.get_unchecked(c * hid + i), *r);
-                } else if init == 1 {
-                    *r = *y.get_unchecked(c * hid + i);
-                }
-                *r
-            };
-            acc = f32::mul_add(x, x, acc);
-            i += NORM_THREADS;
-        }
-        // SAFETY: `ws` is NORM_WARPS f32 of this block's shared memory.
-        let sum = unsafe { block_sum(acc, tid, ws) };
-        if tid == 0 && !sum.is_finite() {
-            fault.raise(SITE);
-        }
-        let r = 1.0 / (sum / hidden as f32 + eps).sqrt();
-        let mut i = tid;
-        while i < hid {
-            // SAFETY: base + i < m·4·hidden <= res.len(), xn.len(), and
-            // s·hidden + i < 4·hidden <= gamma.len(), by the launch contract;
-            // this thread wrote res[base + i] in the pass above and is the
-            // only writer of xn[base + i].
-            unsafe {
-                let x = *res.get_unchecked_mut(base + i);
-                *xn.get_unchecked_mut(base + i) = (x * r) * *gamma.get_unchecked(s * hid + i);
-            }
-            i += NORM_THREADS;
+        let tid = thread::threadIdx_x() as usize;
+        // SAFETY: the launch contract above holds, c < m, s < 4 and tid <
+        // 256 (the contract's block), every thread of the block is here,
+        // and `ws` is this block's NORM_WARPS f32.
+        unsafe {
+            norm_stream(
+                y,
+                wgt,
+                gamma,
+                (hidden, eps),
+                (combine, init),
+                fault,
+                (&mut res, &mut xn),
+                (s, c, tid),
+                ws,
+            );
         }
     }
 
