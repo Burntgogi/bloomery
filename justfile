@@ -2298,7 +2298,7 @@ gate-gpu-glm5next-mtp:
 # arm's, the room under the floor and the arena under its floor each refused by name, the NextN plan refused at the room the
 # draft layer's routed experts leave under the floor and planned above it, and the unset residency `off` with why `paged`.
 # Each arm's room and arena reach the plan through PlanInputs, so no environment crosses the tiers. The fixture tier runs on
-# the `iq4xs` variant (tools/fixture-variants.tsv: every routed layer on the host). Group solo-real, reason r1 (the real tier
+# the `q6kdown` variant (tools/fixture-variants.tsv: every routed layer on the host). Group solo-real, reason r1 (the real tier
 # loads the whole file twice), balanced over the cards in the fixture tier, under the big-load lock the V4.1 loads take.
 [group('solo-real')]
 [group('v41-load')]
