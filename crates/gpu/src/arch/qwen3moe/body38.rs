@@ -176,9 +176,10 @@ pub type Qwen38Model = GpuModel<Body38>;
 
 /// A Qwen3.8 sequence state on the host ([`GpuModel::seq_save`]): the
 /// shared positional rows and recurrent stores with their PLE histories
-/// ([`SeqState<History>`]), and on a load with the draft the layer's side
-/// beside them ([`DraftRows38`]) — its store rows and the two arenas' rows,
-/// so a sequence put back after another ran drafts as if none had.
+/// ([`SeqState<History>`]), on a load with the draft its store rows among
+/// the positional rows, and the layer's side beside them ([`DraftRows38`]:
+/// the positions its store holds and the two arenas' rows), so a sequence
+/// put back after another ran drafts as if none had.
 pub struct Seq38 {
     state: Arc<SeqState<History>>,
     draft: Option<DraftRows38>,
@@ -2295,7 +2296,7 @@ impl Body38 {
             return Ok(());
         }
         let lane = self.lane.lane();
-        let mut c = Copied::of(&mut self.stores, &mut self.ple_ring, lane, None)?;
+        let mut c = Copied::of(&mut self.stores, &mut self.ple_ring, lane, None, None)?;
         self.ckpt.apply(stream, &mut c.list())?;
         drop(c);
         self.restamp(stream, lane, self.held)
@@ -2342,7 +2343,7 @@ impl Body38 {
             ));
         }
         let lane = self.lane.lane();
-        let mut c = Copied::of(&mut self.stores, &mut self.ple_ring, lane, None)?;
+        let mut c = Copied::of(&mut self.stores, &mut self.ple_ring, lane, None, None)?;
         let take = self.ckpt.take(stream, pos, &mut c.list());
         drop(c);
         match take {
@@ -2423,13 +2424,14 @@ impl Body38 {
 
     /// What every save takes before its copy: the sequence state at `pos`,
     /// where the stores stand (a waiting cut carried out first), the draft's
-    /// side read (blocking), the PLE history and the checkpoints' pick for
-    /// `pos` ([`Checkpoints::save_points`]) as the state's host values, the
-    /// stores lent, and `take` (the copy, on the engine stream or on a lane)
-    /// run on them. The K/V planes' rows, the raw keys' and the pooled keys'
-    /// of positions below `pos`, the recurrent stores at `pos` and at each
-    /// picked point, each with its PLE history. Refused by name while a verify
-    /// waits, after a call failed past its launch, when the history
+    /// side read (its arenas' rows, blocking), the PLE history and the
+    /// checkpoints' pick for `pos` ([`Checkpoints::save_points`]) as the
+    /// state's host values, the stores lent, and `take` (the copy, on the
+    /// engine stream or on a lane) run on them. The K/V planes' rows, the raw
+    /// keys' and the pooled keys' of positions below `pos`, the draft's
+    /// store rows of the same positions, the recurrent stores at `pos` and at
+    /// each picked point, each with its PLE history. Refused by name while a
+    /// verify waits, after a call failed past its launch, when the history
     /// disagrees, and for a picked point with no PLE history.
     fn take_state<R>(
         &mut self,
@@ -2484,14 +2486,15 @@ impl Body38 {
             })
             .collect::<Result<Vec<(u32, History)>, GpuError>>()?;
         let lane = self.lane.lane();
-        // The draft's rows read the draft's store and the arenas, none of the
-        // copies below, and `Copied`'s drop holds its borrow to the end.
+        // The draft's side reads the arenas, none of the stores lent below,
+        // and `Copied`'s drop holds its borrow to the end.
         let draft = self.draft_rows(stream, pos)?;
         let mut c = Copied::of(
             &mut self.stores,
             &mut self.ple_ring,
             lane,
             Some((self.ctx, pos as usize)),
+            self.mtp.as_mut(),
         )?;
         let (positional, mut recurrent) = c.list_split();
         let lent = Lent {
@@ -2515,9 +2518,9 @@ impl Body38 {
     }
 
     /// [`Body38::save_state`] with the copy on `lane`'s stream into its
-    /// pinned staging ([`SeqState::save_async`]): the state and its copy in
-    /// flight, or [`NoRoom`], nothing begun. The draft's side is read here,
-    /// blocking.
+    /// pinned staging ([`SeqState::save_async`]), the draft's store rows in
+    /// it: the state and its copy in flight, or [`NoRoom`], nothing begun.
+    /// The draft's arenas' rows are read here, blocking.
     fn save_state_async(
         &mut self,
         stream: &CudaStream,
@@ -2538,9 +2541,9 @@ impl Body38 {
     }
 
     /// The draft's side of a sequence state at `pos` ([`DraftRows38`]);
-    /// `None` on a load without the draft: the store's rows and the step's
-    /// and the pass's arena rows, each the positions below `pos` — the ones
-    /// a walk can read. Refused by name when the store holds positions past
+    /// `None` on a load without the draft: the positions the store holds and
+    /// the step's and the pass's arena rows, each below `pos`, the ones a
+    /// walk can read. Refused by name when the store holds positions past
     /// `pos` or an arena's rows reach past it: a state's rows are the
     /// positions the model stands at, and a record past them is a verify's
     /// rejected tail or an anchor row the commit or the snapshot's caller
@@ -2579,7 +2582,6 @@ impl Body38 {
         let pass = rows(TargetRows::Pass, PASS_ROWS)?;
         Ok(Some(DraftRows38 {
             held: u32::try_from(held).unwrap_or(u32::MAX),
-            store: d.store_host(stream, held)?,
             step,
             pass,
         }))
@@ -2624,11 +2626,12 @@ impl Body38 {
 
     /// `d` put back on a model whose state of `n` positions is put back
     /// as its first `at` ([`Body38::draft_rows`]' rows): the step's and the
-    /// pass's arenas their rows, the ubatch's none, and the draft's store
-    /// holding `d`'s positions when `at` is `n`. A cut to `at < n` is what a
-    /// whole put-back and [`Body38::cut`] leave: the arenas' records cut to
-    /// `at` and the draft's store forgotten, none of its rows copied. Refused
-    /// by name, as [`Body38::draft_fits`] refuses, before any copy. Blocking.
+    /// pass's arenas their rows, the ubatch's none, and the draft's store,
+    /// whose rows the state's positional rows put back, holding `d`'s
+    /// positions when `at` is `n`. A cut to `at < n` is what a whole put-back
+    /// and [`Body38::cut`] leave: the arenas' records cut to `at` and the
+    /// draft's store forgotten. Refused by name, as [`Body38::draft_fits`]
+    /// refuses, before any copy. Blocking.
     fn put_draft_rows(
         &mut self,
         stream: &CudaStream,
@@ -2658,7 +2661,7 @@ impl Body38 {
             "an MTP draft (Body38::open_placed_mtp)",
         ))?;
         if at == n {
-            draft.adopt_store(stream, d.held as usize, &d.store)?;
+            draft.adopt(d.held as usize)?;
         } else {
             draft.forget();
         }
@@ -2710,6 +2713,7 @@ impl Body38 {
                 &mut self.ple_ring,
                 lane,
                 Some((self.ctx, n as usize)),
+                self.mtp.as_mut(),
             )?;
             let (positional, mut recurrent) = c.list_split();
             let mut lent = Lent {
@@ -3770,8 +3774,9 @@ impl GpuModel<Body38> {
 
 impl GpuModel<Body38> {
     /// The sequence state on the host ([`Seq38`], `checkpoint::saved`): the
-    /// positional rows below the model's position, the recurrent stores
-    /// there and at the last checkpoint below it, each with its PLE history.
+    /// positional rows below the model's position (on a load with the draft,
+    /// its store's rows among them), the recurrent stores there and at the
+    /// last checkpoint below it, each with its PLE history.
     /// A waiting cut is carried out first. Refused by name on a poisoned
     /// model, while a verify waits for its commit, and after a call failed
     /// past its launch.
@@ -3788,8 +3793,8 @@ impl GpuModel<Body38> {
     /// ([`SeqState::save_async`]): the state and its copy in flight, which
     /// the model's rows are not cut, reset or replaced before; or [`NoRoom`],
     /// nothing begun, when the staging holds no free extent for it. The
-    /// draft's side is read here, blocking. Refused by name as
-    /// [`GpuModel::seq_save`] refuses.
+    /// draft's store rows are in the copy; its arenas' rows are read here,
+    /// blocking. Refused by name as [`GpuModel::seq_save`] refuses.
     pub fn seq_save_async(
         &mut self,
         lane: &SaveLane,
@@ -4425,7 +4430,8 @@ impl Body38 {
 /// The stores a checkpoint copies, lent for one call ([`Copied::of`]), and
 /// a sequence state's positional rows beside them.
 struct Copied<'a> {
-    /// Each selecting layer's rows of the positions the call carries.
+    /// Each selecting layer's rows of the positions the call carries, then
+    /// the draft's store rows of the same positions.
     spans: Vec<Spans<'a>>,
     /// Each delta layer's committed state lane and conv ring, in layer
     /// order.
@@ -4440,13 +4446,23 @@ impl<'a> Copied<'a> {
     /// — and, with `rows` (`(ctx, n)`), each selecting layer's rows of
     /// positions below `n`: its K and V planes' (`[N_KV][ctx][HEAD]` each),
     /// its raw keys' (`[ctx][IDX_DIM]`) and its pooled keys' of the pools
-    /// those positions reach.
+    /// those positions reach; then `draft`'s store rows of the same
+    /// positions ([`Mtp38::store_spans`]).
     fn of(
         stores: &'a mut [Store38],
         ple: &'a mut DeviceBuffer<f32>,
         lane: u32,
         rows: Option<(usize, usize)>,
+        draft: Option<&'a mut Mtp38>,
     ) -> Result<Copied<'a>, GpuError> {
+        // A draft's rows are the positions' rows: without the positions
+        // there is nothing of the draft to copy, and taking it would drop it.
+        if rows.is_none() && draft.is_some() {
+            return Err(GpuError::state(
+                "qwen38::copied",
+                "the positions a draft store's rows are copied for",
+            ));
+        }
         let len = GDN.state_len();
         let mut c = Copied {
             spans: Vec::new(),
@@ -4476,6 +4492,9 @@ impl<'a> Copied<'a> {
                     }
                 }
             }
+        }
+        if let (Some((_, n)), Some(d)) = (rows, draft) {
+            c.spans.extend(d.store_spans(n)?);
         }
         Ok(c)
     }

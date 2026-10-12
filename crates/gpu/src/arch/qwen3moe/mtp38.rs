@@ -98,6 +98,7 @@ use super::router::{RouterDims, RouterOut};
 use super::scratch::{IN_IDS, IN_POS0, Inbox, KvPlanes, f32_view, param_view, put_input};
 use super::scratch38::{PASS_ROWS, VERIFY_ROWS};
 use crate::card_slots::CardAcc;
+use crate::checkpoint::saved::Spans;
 use crate::fault::Fault;
 use crate::flash_gqa::{GqaArgs, partials_ms_len, partials_v_len_256};
 use crate::gemm::{Gemm32Args, Gemm32Weight, GemmAct32, GemmInput, GemmRoute};
@@ -495,45 +496,28 @@ impl Mtp38 {
         Ok((plane(k)?, plane(v)?))
     }
 
-    /// The store's rows `rows` (`store_host`'s position-major shape, both
-    /// planes) at positions `0..n` put back, the store counted at `n`: the
-    /// side of a sequence state adopted by a put-back
-    /// (`Body38::put_draft_rows`). Refused by name when the rows do not
-    /// cover `n` positions. Blocking.
-    pub(super) fn adopt_store(
-        &mut self,
-        stream: &CudaStream,
-        n: usize,
-        rows: &(Vec<u16>, Vec<u16>),
-    ) -> Result<(), GpuError> {
-        let want = n * geo::N_KV * geo::HEAD;
-        if n > self.ctx || rows.0.len() != want || rows.1.len() != want {
+    /// The store's rows of the positions below `n` as a sequence state
+    /// carries them ([`Spans::by_position`]): the K and the V plane, each
+    /// `[n_kv][ctx][head]`, so a prefix of the state moves only its own rows.
+    pub(super) fn store_spans(&mut self, n: usize) -> Result<[Spans<'_>; 2], GpuError> {
+        let stride = self.ctx * geo::HEAD;
+        let (k, v) = self.store.f16_mut(WHAT)?;
+        Ok([
+            Spans::by_position(k, geo::N_KV, stride, n, geo::HEAD)?,
+            Spans::by_position(v, geo::N_KV, stride, n, geo::HEAD)?,
+        ])
+    }
+
+    /// The store counted at `n` positions, whose rows a sequence state's
+    /// put-back wrote ([`Mtp38::store_spans`]): the side of the state adopted
+    /// (`Body38::put_draft_rows`). Refused by name past the store.
+    pub(super) fn adopt(&mut self, n: usize) -> Result<(), GpuError> {
+        if n > self.ctx {
             return Err(GpuError::shape(
                 WHAT,
-                format!(
-                    "the store's rows at 0..{n} of a store of {}: {} and {} values",
-                    self.ctx,
-                    rows.0.len(),
-                    rows.1.len()
-                ),
+                format!("{n} positions adopted by a store of {}", self.ctx),
             ));
         }
-        let (ctx, head) = (self.ctx, geo::HEAD);
-        let plane = |rows: &[u16], buf: &mut DeviceBuffer<u16>| -> Result<(), GpuError> {
-            let mut all = buf.to_host_vec(stream)?;
-            for p in 0..n {
-                for kv in 0..geo::N_KV {
-                    let at = (p * geo::N_KV + kv) * head;
-                    let to = (kv * ctx + p) * head;
-                    all[to..to + head].copy_from_slice(&rows[at..at + head]);
-                }
-            }
-            buf.copy_from_host(stream, &all)?;
-            Ok(())
-        };
-        let (k, v) = self.store.f16_mut(WHAT)?;
-        plane(&rows.0, k)?;
-        plane(&rows.1, v)?;
         self.held = n;
         Ok(())
     }
@@ -839,10 +823,9 @@ impl Held38 {
     }
 }
 
-/// What a sequence state carries of the draft beside the target's own
-/// stores ([`Body38::draft_rows`]): the store's K and V rows below its
-/// `held` positions ([`Mtp38::held`], position-major as `store_host`
-/// gathers them), and the step's and the pass's arena rows with the
+/// What a sequence state carries of the draft beside its positional rows,
+/// which hold the store's ([`Mtp38::store_spans`]): the positions the store
+/// holds ([`Mtp38::held`]), and the step's and the pass's arena rows with the
 /// positions they hold ([`Held38`]) — the target's hidden rows a draft's
 /// waiting rows read when it rejoins the sequence. The ubatch walk's rows
 /// are not carried: after a resume that arena holds no position, and a walk
@@ -850,7 +833,6 @@ impl Held38 {
 #[derive(Clone, Debug)]
 pub struct DraftRows38 {
     pub(super) held: u32,
-    pub(super) store: (Vec<u16>, Vec<u16>),
     pub(super) step: (Held38, Vec<f32>),
     pub(super) pass: (Held38, Vec<f32>),
 }
@@ -859,8 +841,7 @@ impl DraftRows38 {
     /// The host bytes it holds.
     #[must_use]
     pub fn bytes(&self) -> usize {
-        (self.store.0.len() + self.store.1.len()) * size_of::<u16>()
-            + (self.step.1.len() + self.pass.1.len()) * size_of::<f32>()
+        (self.step.1.len() + self.pass.1.len()) * size_of::<f32>()
     }
 }
 
