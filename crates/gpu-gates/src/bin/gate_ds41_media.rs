@@ -57,6 +57,17 @@
 //! - **(vi) Refusals.** By name: media under the steps feed (the engine's
 //!   `prefill_media` and `Session::prompt_media` both), a span the call
 //!   does not hold whole, and a cut inside a span.
+//! - **(vii) Seat.** One prompt with the set's image twice (two spans in one
+//!   batch), the serve seat's media call against the body's, opening no tower:
+//!   the reference arm is this gate's own spans and `body::prefill_media`, run
+//!   first; the owner arm is the seat's path over the set's aligner rows —
+//!   `vision_seat::span_rows_of` with the library splice
+//!   (`ds41_media::splice`, each image's grid from its own prepare of the
+//!   set's PNG), then `vision_seat::Encoded::prompt` over the library
+//!   builder (`ds41_media::spans`), the one prompt call. The builder's spans
+//!   equal this gate's (positions, row bits and kinds: the engine reads no
+//!   kind past its shape check, so only this equality sees one), and the two
+//!   calls leave the same greedy token and a bit-identical last hidden row.
 //!
 //! Every clause is self-consistency — the engine against a rule the gate computes from the
 //! model's own tensors, over the vision set's rows as inputs — so the fixture tier runs all of
@@ -69,7 +80,9 @@
 //! `token_embd`, every position picking with the text bias, the span's
 //! Start and End separators left on the text bias, real engram rows hashed
 //! at the media positions, a state save that drops the spans, a refusal
-//! removed — are source edits this gate goes red on, one clause each.
+//! removed — are source edits this gate goes red on, one clause each; (vii)'s are
+//! the span order, the rows and the kinds a seat's prompt step or builder hands
+//! the call.
 
 #[cfg(not(feature = "deepseek41"))]
 fn main() {
@@ -102,12 +115,14 @@ mod gate {
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu::{DeviceTensor, Gpu, GpuError};
     use bloomery_gpu_deepseek41::body::{
-        self, BatchSeam, BatchSeamKind, Deepseek41Model, MediaKind, MediaSpan, PrefillMode, Span41,
+        self, BatchSeam, BatchSeamKind, Body, Deepseek41Model, MediaKind, MediaSpan, PrefillMode,
+        Span41,
     };
     use bloomery_gpu_deepseek41::router::{N_EXPERT, N_USED};
     use bloomery_gpu_deepseek41::span::span;
     use bloomery_gpu_gates::ds41_media;
     use bloomery_gpu_gates::tier;
+    use bloomery_gpu_gates::vision_seat;
     use bloomery_gpu_gates::{
         Fnv1a64, GateError, checks_failed, data_dir, prose_ids, split_f32, verdict,
     };
@@ -121,8 +136,11 @@ mod gate {
     use model::arch::deepseek41::names;
     use model::placement::workstation;
     use refset::arch::deepseek41v::{VISION, VISION_SET};
-    use refset::vision::VisionSet;
+    use refset::vision::{Image as SetImage, VisionSet};
     use runtime::Want;
+    use vision::arch::deepseek41v::Hparams as EncoderHparams;
+    use vision::arch::deepseek41v::media::Media;
+    use vision::{MediaModel, Prepared, Rgb8};
 
     const NAME: &str = "gate_ds41_media";
     /// The image whose aligner rows the gate feeds: the set's full-tap image.
@@ -134,6 +152,11 @@ mod gate {
     /// The dead-window clause's steps: the three that see the span, and one
     /// past them.
     const DEAD_STEPS: usize = 4;
+    /// The seat clause's prompt: this many text ids, the image's span, [`SEAT_GAP`] text ids, the
+    /// span again, [`SEAT_POST`] text ids (one batch: the sum with two spans is below `T_MAX`).
+    const SEAT_PRE: usize = 40;
+    const SEAT_GAP: usize = 24;
+    const SEAT_POST: usize = 16;
 
     // ------------------------------------------------------------ the feed
 
@@ -163,8 +186,53 @@ mod gate {
         }
     }
 
-    /// The vision oracle set's image as the feed, with the model's `n_embd`.
-    fn read_feed(hp: &Hparams) -> Result<(Feed, usize), GateError> {
+    /// What the seat clause rebuilds a span from: the set image's aligner rows as the tower
+    /// would write them, the file's delimiter rows, and the image as its model's prepare made it
+    /// (the plan's grid and `span_len`, from the image's own PNG).
+    struct Source {
+        aligner: Vec<u16>,
+        delims: ds41_media::Delims,
+        prepared: Prepared,
+    }
+
+    /// The image `img` of the set as the seat's prepare makes it, from its PNG and the resize
+    /// parameters of `mmproj`, held to the set's own plan: the grid, the patch grid and the
+    /// span's positions.
+    fn prepare(mmproj: &gguf::Gguf, img: &SetImage) -> Result<Prepared, GateError> {
+        let png = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tools/ref/vision/images")
+            .join(&img.name);
+        let bytes = std::fs::read(&png).map_err(|e| format!("{}: {e}", png.display()))?;
+        let media = Media::new(EncoderHparams::read(mmproj)?.grid());
+        let prepared = media.prepare(&Rgb8::from_png(&bytes)?)?;
+        let (plan, p) = (prepared.patches.plan, &prepared.patches);
+        if (plan.n_llm_h, plan.n_llm_w, prepared.span_len)
+            != (img.n_llm_h, img.n_llm_w, img.n_tokens)
+            || (p.n_vit_h, p.n_vit_w) != (img.n_vit_h, img.n_vit_w)
+        {
+            return Err(format!(
+                "{}: the prepare plans a {}x{} grid of {} positions on {}x{} patches, the set's \
+                 {}x{} of {} on {}x{}",
+                img.name,
+                plan.n_llm_h,
+                plan.n_llm_w,
+                prepared.span_len,
+                p.n_vit_h,
+                p.n_vit_w,
+                img.n_llm_h,
+                img.n_llm_w,
+                img.n_tokens,
+                img.n_vit_h,
+                img.n_vit_w
+            )
+            .into());
+        }
+        Ok(prepared)
+    }
+
+    /// The vision oracle set's image as the feed and the seat clause's source, with the model's
+    /// `n_embd`.
+    fn read_feed(hp: &Hparams) -> Result<(Feed, Source, usize), GateError> {
         let dir = match std::env::var("BLOOMERY_VISION_SET") {
             Ok(set) => data_dir().join("ref-vision").join(set),
             Err(_) => VISION.path(VISION_SET),
@@ -220,11 +288,17 @@ mod gate {
         let mmproj = gguf::Gguf::open(&set.mmproj)?;
         let d = ds41_media::delims(&mmproj, n_embd)?;
         let (rows, kinds) = ds41_media::span_rows(&aligner, (h, w), n_embd, &d)?;
+        let prepared = prepare(&mmproj, img)?;
         Ok((
             Feed {
                 rows,
                 kinds,
                 token: set.image_token_id,
+            },
+            Source {
+                aligner,
+                delims: d,
+                prepared,
             },
             n_embd,
         ))
@@ -695,6 +769,95 @@ mod gate {
         Ok(ids)
     }
 
+    // ------------------------------------------------- the serve seat's call
+
+    /// (vii): the serve seat's media call held to the body's, on one prompt with the set's image
+    /// twice (spans at `SEAT_PRE` and after `SEAT_GAP` more text ids). Two arms over the same
+    /// ids, no tower: the reference arm is the gate's own spans ([`Feed::span`]) and
+    /// `body::prefill_media`, run first; the owner arm is the seat's path — the image seat's
+    /// `span_rows_of` over the set's aligner rows with the library splice
+    /// ([`ds41_media::splice`], each image's grid from its own prepare), then
+    /// [`vision_seat::Encoded::prompt`] over the library builder ([`ds41_media::spans`]), the
+    /// one prompt call. The builder's spans equal the gate's (positions, row bits and kinds: the
+    /// engine reads no kind past its shape check, so only this equality sees one), and the two
+    /// calls leave the same greedy token and a bit-identical last hidden row.
+    fn seat_call(
+        s: &mut Session<Body>,
+        source: &Source,
+        feed: &Feed,
+        n_embd: usize,
+        text: &[u32],
+    ) -> Result<bool, GateError> {
+        let span = feed.len();
+        let at = [SEAT_PRE, SEAT_PRE + span + SEAT_GAP];
+        let mut ids = Vec::with_capacity(at[1] + span + SEAT_POST);
+        ids.extend_from_slice(&text[..SEAT_PRE]);
+        ids.extend(std::iter::repeat_n(feed.token, span));
+        ids.extend_from_slice(&text[SEAT_PRE..SEAT_PRE + SEAT_GAP]);
+        ids.extend(std::iter::repeat_n(feed.token, span));
+        ids.extend_from_slice(&text[SEAT_PRE + SEAT_GAP..SEAT_PRE + SEAT_GAP + SEAT_POST]);
+        if ids.len() > body::T_MAX {
+            return Err(format!(
+                "{NAME}: the seat clause's prompt of {} ids passes one batch ({})",
+                ids.len(),
+                body::T_MAX
+            )
+            .into());
+        }
+        // The reference arm: the gate's own spans, the body's call.
+        let spans = [feed.span(at[0]), feed.span(at[1])];
+        s.model_mut().reset()?;
+        let body_next = body::prefill_media(s.model_mut(), &ids, &spans)?;
+        let body_row = s.model().head_normed()?;
+        // The owner arm: the rows the seat's encode would read back, here the set's aligner rows
+        // for each image.
+        let rows = vision_seat::span_rows_of(
+            at.map(|start| vision_seat::Image::of(start, &source.prepared)),
+            n_embd,
+            |_| Ok::<_, std::convert::Infallible>(source.aligner.clone()),
+            ds41_media::splice(n_embd, &source.delims),
+        )?;
+        let encoded = vision_seat::Encoded::from_rows(rows);
+        let built = ds41_media::spans(encoded.rows());
+        let same_spans = built.len() == spans.len()
+            && built.iter().zip(&spans).all(|(a, b)| {
+                a.span.at == b.span.at && a.span.rows == b.span.rows && a.kinds == b.kinds
+            });
+        println!(
+            "{NAME}: (vii) the seat's builder over the set's image twice: {} spans of {} \
+             positions at {at:?}, positions, row bits and kinds equal the gate's own: {}",
+            built.len(),
+            span,
+            verdict(same_spans)
+        );
+        s.model_mut().reset()?;
+        let seat = match encoded.prompt(s, &ids, ds41_media::spans) {
+            Ok(next) => next,
+            Err(e) => {
+                println!(
+                    "{NAME}: (vii) the seat's prompt call over the same rows refused: {e}: {}",
+                    verdict(false)
+                );
+                return Ok(false);
+            }
+        };
+        let seat_row = s.model().head_normed()?;
+        let same_bits = seat_row.len() == body_row.len()
+            && seat_row
+                .iter()
+                .zip(&body_row)
+                .all(|(a, b)| a.to_bits() == b.to_bits());
+        let pass = seat == body_next && same_bits;
+        println!(
+            "{NAME}: (vii) the seat's media call against the body's over {} ids: argmax {seat} vs \
+             {body_next}, last hidden row ({} values) bit-identical {same_bits}: {}",
+            ids.len(),
+            seat_row.len(),
+            verdict(pass)
+        );
+        Ok(same_spans && pass)
+    }
+
     // ------------------------------------------------------------ the gate
 
     pub fn run() -> Result<(), GateError> {
@@ -722,7 +885,7 @@ mod gate {
             .map(|e| e.layer_ids.clone())
             .ok_or("the model file has no engram sites")?;
         let ngram = hp.engram.as_ref().map_or(0, |e| e.max_ngram);
-        let (feed, n_embd) = read_feed(&hp)?;
+        let (feed, source, n_embd) = read_feed(&hp)?;
         let file = Split::open(&path).map_err(|e| format!("open {path}: {e}"))?;
         let t = std::time::Instant::now();
         let mut m = body::open(
@@ -1147,6 +1310,10 @@ mod gate {
         let m = s.model_mut();
         m.body_parts(NAME)?.2.set_prefill_mode(PrefillMode::Batch);
         m.reset()?;
+
+        // (vii): the serve seat's call, on the session the model now stands in.
+        crate::ds41_tier::sc("(vii) seat: the image seat's media call equals the body's")?;
+        ok &= seat_call(&mut s, &source, &feed, n_embd, &corpus)?;
 
         println!("{NAME}: {}", tier::tally_line());
         if ok {

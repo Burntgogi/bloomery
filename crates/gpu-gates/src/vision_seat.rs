@@ -895,6 +895,16 @@ pub struct Encoded<K = ()> {
 }
 
 impl<K> Encoded<K> {
+    /// The rows of a media call read back elsewhere than [`Resident::encode_with`], wrapped to
+    /// take [`Encoded::prompt`]: a gate that holds a seat's prompt step to its body without a
+    /// tower (`gate_ds41_media`: the vision set's aligner rows, spliced by [`span_rows_of`])
+    /// builds its [`SpanRows`] and hands them here. It only wraps: the prompt call over the rows
+    /// is [`Encoded::prompt`], the one call, and a seat's rows come from its tower.
+    #[must_use]
+    pub fn from_rows(rows: SpanRows<K>) -> Encoded<K> {
+        Encoded { rows }
+    }
+
     /// The call's rows and each span's ranges of them.
     #[must_use]
     pub fn rows(&self) -> &SpanRows<K> {

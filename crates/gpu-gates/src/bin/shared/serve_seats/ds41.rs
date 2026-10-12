@@ -862,7 +862,7 @@ struct Vision {
 impl Vision {
     /// Step (e) of the seat's media call ([`vision_seat::Resident::encode_with`]): every feed's
     /// image encoded on the resident encoder, its aligner rows read back as bf16 and spliced
-    /// ([`ds41_media::span_rows`]: the delimiter rows around the aligner's, the kind of each
+    /// ([`ds41_media::splice`]: the delimiter rows around the aligner's, the kind of each
     /// position), all in one pair of buffers, with `model`'s card bound back after the tower. The
     /// aligner emits the plan's token grid, one row a cell.
     fn encode(
@@ -876,9 +876,7 @@ impl Vision {
             feeds
                 .iter()
                 .map(|f| vision_seat::Image::of(f.at, &f.prepared)),
-            |aligner, p| {
-                ds41_media::span_rows(aligner, (p.plan.n_llm_h, p.plan.n_llm_w), n_embd, delims)
-            },
+            ds41_media::splice(n_embd, delims),
         )
     }
 }
@@ -1174,16 +1172,7 @@ impl Seat for V41 {
         }
         let encoded = v.encode(s.model().gpu().context(), feeds)?;
         // Each span borrows its own ranges of the call's one pair of buffers.
-        let next = encoded.prompt(s, ids, |r| {
-            r.media_spans()
-                .into_iter()
-                .zip(&r.ats)
-                .map(|(span, a)| body::Span41 {
-                    span,
-                    kinds: &r.kinds[a.kinds.clone()],
-                })
-                .collect()
-        })?;
+        let next = encoded.prompt(s, ids, ds41_media::spans)?;
         self.print_passes()?;
         Ok(next)
     }
