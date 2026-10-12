@@ -290,7 +290,7 @@ fn the_all_scope_reaches_the_nextn_layer() {
 #[test]
 fn a_map_that_bites_nothing_is_refused() {
     let d = Dir::new();
-    let src = open(&write(&d.0, "s", &source_kvs(), &source_tensors(), 1));
+    let src = open(&write(&d.0, "s", &source_kvs(), &source_tensors(), 2));
     let with = |map: &[(&str, GgmlType)]| Row {
         map: map.iter().map(|(r, t)| ((*r).to_string(), *t)).collect(),
         ..the_row()
@@ -346,7 +346,7 @@ fn a_tensor_already_at_the_type_is_left_out() {
         .position(|t| t.name == two)
         .expect("layer 2's down");
     tensors[at] = t(two.clone(), &[256, 2, 3], GgmlType::IQ4_XS, 1, 8);
-    let src = open(&write(&d.0, "s", &source_kvs(), &tensors, 1));
+    let src = open(&write(&d.0, "s", &source_kvs(), &tensors, 2));
     let got = expand(&the_row(), &src).expect("an expansion");
     let names: Vec<&str> = got.iter().map(|r| r.name.as_str()).collect();
     assert!(
