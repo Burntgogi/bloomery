@@ -99,13 +99,34 @@ impl PlanInputs {
     /// [`PlanInputs::read`] without the refusal of unimplemented features: the
     /// file as it is, for a reader that only describes it, and the host's
     /// room ([`workstation::host_available_read`]) and the arena's given
-    /// bytes, a room that cannot be read refused by name.
+    /// bytes, a room that cannot be read refused by name. The room is read
+    /// after the file's description, through the same steps as
+    /// [`PlanInputs::describe_in`].
     pub fn describe(split: &Split) -> Result<PlanInputs, PlacementError> {
+        Self::describe_with(split, || {
+            workstation::host_available_read().map_err(PlacementError::HostRoom)
+        })
+    }
+
+    /// The file's description with `room` as the host's room, no host read
+    /// for it: another machine's plan checked from this one, `room` that
+    /// machine's bytes and how they were read. The arena is still this
+    /// process's `BLOOMERY_NVTIER_BYTES`, as in [`PlanInputs::describe`].
+    pub fn describe_in(split: &Split, room: (u64, HostRead)) -> Result<PlanInputs, PlacementError> {
+        Self::describe_with(split, || Ok(room))
+    }
+
+    /// The file's hyperparameters, roles, spec and KV layout, then the room
+    /// `room` gives, then the arena, the first that fails being the error.
+    fn describe_with(
+        split: &Split,
+        room: impl FnOnce() -> Result<(u64, HostRead), PlacementError>,
+    ) -> Result<PlanInputs, PlacementError> {
         let hp = Hparams::read(split)?;
         let model = roles::classify(split, &hp)?;
         let spec = spec::spec_of(&hp, &model, spec::chat(split)?)?;
         let kv = KvLayout::from_file(split, &hp)?;
-        let room = workstation::host_available_read().map_err(PlacementError::HostRoom)?;
+        let room = room()?;
         let arena = workstation::nvtier_arena_given().map_err(PlacementError::HostRoom)?;
         Ok(PlanInputs {
             hp,
