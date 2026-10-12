@@ -1,5 +1,5 @@
 place unset place=a why=one card
-residency lever residency=mid-p3-s1 why=shrunk
+residency lever residency=mid-p3-s1 why=pool_shrunk
 parallel rule=slots slots=2 slot_ctx=16384 total=32768 from=default pass=one
 plan place=a card=A6000 ctx_max=32768 card_experts=2668 (44750684160 B) host_experts=12692 (214016901120 B) host_shadow=1342177280 B n_l=70..71 on 38 layers card_budget=none paged=0 arena=0 arena_slots=0 room=263376371712 plan_room=263376371712 card_free=50668240896 devices=[stage:A6000:cuda0:50952404992] cuda_order=unset(FASTEST_FIRST)
 residency host residency=mid-p3-s1 hosted=hosted pinned=3 churn_experts=2554 churn_bytes=42838548480 headroom=43437910016 headroom_after=599361536
