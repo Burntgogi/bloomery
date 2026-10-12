@@ -46,12 +46,6 @@ language is not one of the reasons: the kernels are Rust (274 of them, through
   default). The card served 18 % of the routed calls with it off; with streaming it served 57 % over the first
   16 steps and 71 % over the last 16 ([rig-log](https://github.com/midagedev/rig-log/blob/main/log/2026-09-30.md#residency-clip)).
 
-<p align="center">
-  <a href="https://github.com/midagedev/rig-log/blob/main/assets/residency-explainer-v5.mp4">
-    <img src="https://raw.githubusercontent.com/midagedev/rig-log/main/assets/residency-explainer-v5-poster.png" width="420" alt="Adaptive expert residency explainer (42 s video)">
-  </a>
-</p>
-
 - **The card and the CPU work on a prompt at once (V4.1).** A prompt runs in batches of up to 512 positions:
   every routed expert a batch calls is read once for the whole batch. Batching took P = 512 from 30.7 to
   91 tok/s against one position at a time ([rig-log](https://github.com/midagedev/rig-log/blob/main/log/2026-09-25.md#ds41batch-pp)). Two batches stay in
