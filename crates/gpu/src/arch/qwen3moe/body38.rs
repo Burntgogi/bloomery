@@ -1293,7 +1293,7 @@ impl Body38 {
             deadline: DEADLINE,
             top_k: geo::N_USED,
             max_rows: PASS_ROWS,
-            stacks: Arc::new(swap38::stacks(&inputs.model)?),
+            stacks: Arc::new(swap38::stacks(&inputs.model, plan)?),
         };
         GpuModel::load_placed_with(
             file,
@@ -1455,7 +1455,7 @@ impl Body38 {
             n,
             geo::EXPERTS,
         )?);
-        let stacks = swap38::stacks(&inputs.model)?;
+        let stacks = swap38::stacks(&inputs.model, plan)?;
         // A residency machine moves experts to the host after the load, and
         // the host service writes a route trace: either keeps every host leg.
         let keep_host = residency_glue.source().is_some() || host.route_trace;

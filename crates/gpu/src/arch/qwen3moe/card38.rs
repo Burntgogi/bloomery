@@ -64,6 +64,7 @@ use crate::{Gpu, GpuError};
 use cuda_core::DeviceBuffer;
 use gguf::GgmlType;
 use model::arch::names::routed_stacks;
+use model::placement::accepts::{self, Program};
 use model::placement::kernels::DownAct;
 
 /// What the map check's refusals name.
@@ -361,21 +362,20 @@ pub(super) fn leg_layers(
 }
 
 /// Layer `l`'s gate·up and down types as `stacks` lists them, refused by
-/// name unless the card leg runs them: the gate and up Q4_K, Q5_K, IQ3_XXS
-/// or IQ4_XS, the down Q5_1, Q8_0 or IQ4_NL.
+/// name unless the card leg runs them ([`accepts::leg_runs`] of Qwen3.8's
+/// program: the table checked every layer the plan cards when it was built).
 fn leg_types(stacks: &Qwen38Stacks, l: usize) -> Result<(GgmlType, GgmlType), GpuError> {
     match stacks.pair(l) {
-        Some(
-            p @ (
-                GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::IQ3_XXS | GgmlType::IQ4_XS,
-                GgmlType::Q5_1 | GgmlType::Q8_0 | GgmlType::IQ4_NL,
-            ),
-        ) => Ok(p),
+        Some(p @ (gate_up, down))
+            if accepts::leg_runs(Program::Qwen38Body, [gate_up, gate_up, down]) == Some(true) =>
+        {
+            Ok(p)
+        }
         other => Err(GpuError::shape(
             WHAT,
             format!(
-                "layer {l}'s card experts in gate·up and down types {other:?}: the card leg runs a \
-                 Q4_K, Q5_K, IQ3_XXS or IQ4_XS gate and up and a Q5_1, Q8_0 or IQ4_NL down"
+                "layer {l}'s card experts in gate·up and down types {other:?}: the card leg \
+                 does not run them (swap38::stacks names its types)"
             ),
         )),
     }
