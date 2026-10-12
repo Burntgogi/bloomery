@@ -393,7 +393,11 @@ impl PlaceQ3 {
         )?;
         Ok(PlaceQ3 {
             place,
-            arch: "qwen35moe",
+            arch: if file.architecture() == Some("qwen35") {
+                "qwen35"
+            } else {
+                "qwen35moe"
+            },
             inputs,
             kv: o.kv,
             seqs,
