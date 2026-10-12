@@ -3474,17 +3474,40 @@ fn quantize_q82x4_col(x: &[f32], out: &mut [u8]) {
 }
 
 /// One 32-value block of the q8_2 family: (codes, bf16 d bits, i16 isum),
-/// byte-identical to the scalar loops in `quantize_q82x4_col`. `v * id` is a
-/// plain multiply (no FMA); `id` is [`q82_inverse`]'s, so every product is
-/// finite and [`v_nearest_int`] exact; the codes are the saturating packs of
-/// the unsaturated ints — the scalar's clamp — and the sum is over those
-/// ints, as the scalar's.
+/// byte-identical to the scalar loops in `quantize_q82x4_col`: [`quantize_q8_block_avx2`]
+/// under the bf16 scale and [`q82_inverse`]'s multiplier.
 ///
 /// # Safety
 /// AVX2 must be available on the target; `x` is the fixed 32-value block.
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn quantize_q82_block_avx2(x: &[f32; 32]) -> ([u8; 32], u16, i16) {
+    // SAFETY: AVX2 present per contract.
+    let (codes, t, isum) = unsafe {
+        quantize_q8_block_avx2(x, |amax| {
+            let t = fp32_to_bf16_bits(amax / 127.0);
+            (t, q82_inverse(t))
+        })
+    };
+    (codes, t, isum as i16)
+}
+
+/// One 32-value q8 block under the scale rule `rule`: `rule(amax)` gives the
+/// block's stored scale bits and its code multiplier `id`, and the result is
+/// (codes, scale bits, i32 sum of the unsaturated codes). `v * id` is a plain
+/// multiply (no FMA); `id` is finite, so every product is finite and
+/// [`v_nearest_int`] exact; the codes are the saturating packs of the
+/// unsaturated ints, the scalar's clamp. A NaN or an infinity in the block is
+/// refused by name ([`non_finite_activation`]).
+///
+/// # Safety
+/// AVX2 must be available on the target; `x` is the fixed 32-value block.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn quantize_q8_block_avx2(
+    x: &[f32; 32],
+    rule: impl FnOnce(f32) -> (u16, f32),
+) -> ([u8; 32], u16, i32) {
     // SAFETY: AVX2 present per contract; loads stay inside the fixed 32-value
     // block, the one store goes to a local array.
     unsafe {
@@ -3503,9 +3526,9 @@ unsafe fn quantize_q82_block_avx2(x: &[f32; 32]) -> ([u8; 32], u16, i16) {
         if _mm256_movemask_ps(unord) != 0 || !amax.is_finite() {
             non_finite_activation(x);
         }
-        // The bf16 scale round-trip stays scalar: one conversion per block.
-        let t = fp32_to_bf16_bits(amax / 127.0);
-        let idv = _mm256_set1_ps(q82_inverse(t));
+        // The scale rule stays scalar: one conversion per block.
+        let (t, id) = rule(amax);
+        let idv = _mm256_set1_ps(id);
         let mut qi = [_mm256_setzero_si256(); 4];
         for (j, q) in qi.iter_mut().enumerate() {
             // SAFETY: 8-lane load at 8*j <= 24, inside the block.
@@ -3523,12 +3546,12 @@ unsafe fn quantize_q82_block_avx2(x: &[f32; 32]) -> ([u8; 32], u16, i16) {
         // SAFETY: 32-byte store into the local 32-byte array.
         _mm256_storeu_si256(codes.as_mut_ptr() as *mut __m256i, c);
         // i32 sum of the 32 unsaturated ints; exact in any order at these
-        // magnitudes, then the scalar's `as i16`.
+        // magnitudes.
         let isum = hsum_i32(_mm256_add_epi32(
             _mm256_add_epi32(qi[0], qi[1]),
             _mm256_add_epi32(qi[2], qi[3]),
         ));
-        (codes, t, isum as i16)
+        (codes, t, isum)
     }
 }
 

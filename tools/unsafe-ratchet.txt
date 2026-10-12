@@ -299,7 +299,10 @@ placement 0 0 0
 # the scale-lane shuffle), each unsafe fn with its SAFETY line, and the two dispatch arms each.
 # PIN(2026-10-11): qdot 128 -> 130 blocks, 72 -> 73 fns, a new kernel, not old code relaxed: the Q6_K tile (one
 # unsafe fn, so +1 fn and its body's 1 block) and the dispatch arm that calls it (+1 block), each with its SAFETY line.
-qdot 130 73 0
+# PIN(2026-10-12): qdot 130 -> 131 blocks, 73 -> 74 fns, a moved body, not old code relaxed: the q8_2 block
+# encoder's steps move into quantize_q8_block_avx2 (one unsafe fn, its body's block), which the q8_2 block calls in
+# one block, each with its SAFETY line.
+qdot 131 74 0
 refset 0 0 0
 runtime 0 0 0
 sampler 4 4 1
