@@ -333,7 +333,8 @@ mod qwen38_open;
 
 #[cfg(feature = "gpu")]
 mod gate {
-    use std::time::Instant;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
     use crate::e2e::{
         argmax, first_flip_layers, flips_report, ik_last, layer_rels, layer_table, on_path,
@@ -349,11 +350,12 @@ mod gate {
     use bloomery_gpu::host::PassKind;
     use bloomery_gpu::host::batch::HOT_COLS;
     use bloomery_gpu::host::handoff::{HandoffKernels, Places};
-    use bloomery_gpu::host::swap::Residency;
+    use bloomery_gpu::host::route_trace::{RouteTrace, TraceHeader};
+    use bloomery_gpu::host::swap::{MachineCfg, Piece, Residency, SwapSource};
     use bloomery_gpu::hybrid::{HOST, Slot, SlotMap};
     use bloomery_gpu::model::{ChainBody, StepMode};
     use bloomery_gpu::qsa::POOL_TILE;
-    use bloomery_gpu::{Fault, FaultSite, GpuError, LAYER_HEAD};
+    use bloomery_gpu::{DeviceTensor, Fault, FaultSite, GpuError, LAYER_HEAD};
     use bloomery_gpu_gates::act_rule::{Arm, site_rel};
     use bloomery_gpu_gates::flip::{self, Flip};
     use bloomery_gpu_gates::nodes::count_kinds;
@@ -375,6 +377,7 @@ mod gate {
     use refset::arch::qwen4exp::fixture;
     use refset::arch::qwen4exp::{BATCH, D1K, D3K, IK, MODEL, STEP4, STEP4_EVERY_NODE};
     use runtime::swaprule::KeptRows;
+    use runtime::swaprule::SwapParams;
 
     /// Cache rows: D3K's step at position 3,000, with room.
     const CTX: usize = 3072;
@@ -543,6 +546,16 @@ mod gate {
 
     fn memops() -> usize {
         shape().memops()
+    }
+
+    /// The layers `plan` puts every routed expert of on the card: the
+    /// gate's load (no residency machine, no route trace) runs them without
+    /// the host leg ([`Shape::memops_card`]).
+    fn hostless(plan: &PlanFacts) -> usize {
+        plan.n_l
+            .iter()
+            .filter(|&&n| n == cfg().n_expert as u64)
+            .count()
     }
 
     fn nodes_verify() -> usize {
@@ -1887,7 +1900,7 @@ mod gate {
     /// batch mem ops, its argmax and handoff launches.
     fn verify_structure<const T: usize>(
         m: &mut Qwen38Model,
-        want: usize,
+        (want, want_memops): (usize, usize),
     ) -> Result<bool, GateError> {
         let nodes = m.capture_rows::<T>()?;
         let counted = m.body("verify_structure")?.verify_launches(T);
@@ -1903,7 +1916,7 @@ mod gate {
         let argmax = named(&|n| n.contains("argmax"));
         let cols = named(&|n| n == "ds41_ffn_handoff_10_cols");
         let one = named(&|n| n == "ds41_ffn_handoff_10");
-        let (want_memops, layers) = (memops(), n_layer());
+        let layers = n_layer();
         let ok = nodes == want
             && counted == want
             && b == want_memops
@@ -1922,7 +1935,8 @@ mod gate {
     }
 
     /// One verify of `T` rows kept to `k`, against `refs[k − 1]`: the case,
-    /// its structure of services, and a failed call named, not aborting.
+    /// its structure of services (`served` each, one a layer with a host
+    /// leg), and a failed call named, not aborting.
     fn verify_case<const T: usize>(
         m: &mut Qwen38Model,
         toks: &[u32],
@@ -1930,6 +1944,7 @@ mod gate {
         next: u32,
         k: usize,
         refs: &[VRun],
+        served_want: usize,
     ) -> Result<bool, GateError> {
         let label = format!("T={T} k={k}");
         let run = (|| -> Result<(VRun, [u64; 3], u32), GateError> {
@@ -1959,13 +1974,12 @@ mod gate {
         let all = refs.last().ok_or("the reference of four rows")?;
         let rows_ok = v.tokens[..] == all.tokens[..T]
             && (0..T).all(|r| same_bits(&v.logits[r], &all.logits[r]));
-        let layers = n_layer();
-        let services = served == [layers as u64; 3];
+        let services = served == [served_want as u64; 3];
         ok &= rows_ok && services;
         println!(
             "verify {label}: every row's token and logits bit for bit the steps' {rows_ok}; the \
-             replay's services, host calls and Cols services {served:?} (want {layers} each: \
-             one go, one union call and one wait a layer) {}",
+             replay's services, host calls and Cols services {served:?} (want {served_want} \
+             each: one go, one union call and one wait a layer with a host leg) {}",
             verdict(rows_ok && services)
         );
         Ok(ok)
@@ -1974,20 +1988,20 @@ mod gate {
     fn verify_clause(m: &mut Qwen38Model, toks: &[u32]) -> Result<bool, GateError> {
         let (rows, next) = verify_rows(toks)?;
         let mut ok = true;
-        ok &= verify_structure::<2>(m, nodes_verify())?;
-        ok &= verify_structure::<3>(m, nodes_verify())?;
-        ok &= verify_structure::<4>(m, nodes_verify())?;
+        ok &= verify_structure::<2>(m, (nodes_verify(), memops()))?;
+        ok &= verify_structure::<3>(m, (nodes_verify(), memops()))?;
+        ok &= verify_structure::<4>(m, (nodes_verify(), memops()))?;
         let refs = (1..=LANES)
             .map(|k| ref_run(m, Prefix::Steps(&toks[..PREFIX]), &[&rows[..k]], next))
             .collect::<Result<Vec<_>, _>>()?;
         for k in 1..=2 {
-            ok &= verify_case::<2>(m, toks, rows, next, k, &refs)?;
+            ok &= verify_case::<2>(m, toks, rows, next, k, &refs, n_layer())?;
         }
         for k in 1..=3 {
-            ok &= verify_case::<3>(m, toks, rows, next, k, &refs)?;
+            ok &= verify_case::<3>(m, toks, rows, next, k, &refs, n_layer())?;
         }
         for k in 1..=4 {
-            ok &= verify_case::<4>(m, toks, rows, next, k, &refs)?;
+            ok &= verify_case::<4>(m, toks, rows, next, k, &refs, n_layer())?;
         }
         // A second verify from a moved lane: four rows kept to three (lane 2),
         // then four more kept whole (lanes 2, 3, 0, 1: the word to 1).
@@ -3520,9 +3534,11 @@ mod gate {
     /// (k) structure under the card plan, against the plan's own counts: the
     /// body runs the leg on exactly the layers the plan holds routed experts
     /// on, the captured step holds the header's node count plus the leg's
-    /// five launches on each of them, [`memops`] of them batch mem ops, as
-    /// the program counts. In the fixture tier the plan is also held to its
-    /// contract: the header's budget puts half the experts
+    /// five launches on each of them, less the go and the wait of each layer
+    /// the load runs without the host leg ([`hostless`]), and the rest of the
+    /// layers' goes and waits as batch mem ops, as the program counts. In the
+    /// fixture tier the plan is also held to its contract: the header's
+    /// budget puts half the experts
     /// (`n_expert / 2`) on the card of every card layer — a budget one
     /// granule off leaves a layer one expert short.
     fn card_structure(m: &mut Qwen38Model, plan: &PlanFacts) -> Result<bool, GateError> {
@@ -3532,8 +3548,8 @@ mod gate {
         let kernel = sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_KERNEL;
         let memop = sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_BATCH_MEM_OP;
         let ([k, b], other) = count_kinds(&m.step_graph_nodes()?, [kernel, memop]);
-        let want_nodes = shape().nodes_decode_card(plan.card_layers);
-        let want_memops = memops();
+        let want_memops = shape().memops_card(hostless(plan));
+        let want_nodes = shape().nodes_decode_card(plan.card_layers) - (memops() - want_memops);
         let ok = layers == plan.card_layers
             && nodes == want_nodes
             && counted == want_nodes
@@ -3774,7 +3790,9 @@ mod gate {
     /// kept whole returns every row's token and logits bit for bit the
     /// steps' — the leg's kernels are independent per slot and column; each
     /// verify's graph holds the header's verify nodes plus the leg's five
-    /// launches on each of the plan's card layers.
+    /// launches on each of the plan's card layers, less the go and the wait
+    /// of each layer it runs without the host leg ([`hostless`]), and its
+    /// replay serves each other layer on the host once.
     fn card_rows(m: &mut Qwen38Model, toks: &[u32], plan: &PlanFacts) -> Result<bool, GateError> {
         let eager = run_steps(m, toks, StepMode::Eager, true)?;
         let graph = run_steps(m, toks, StepMode::Graph, true)?;
@@ -3791,7 +3809,11 @@ mod gate {
             &graph,
             true,
         );
-        let want = shape().nodes_verify_card(plan.card_layers);
+        let want_memops = shape().memops_card(hostless(plan));
+        let want = (
+            shape().nodes_verify_card(plan.card_layers) - (memops() - want_memops),
+            want_memops,
+        );
         ok &= verify_structure::<2>(m, want)?;
         ok &= verify_structure::<3>(m, want)?;
         ok &= verify_structure::<4>(m, want)?;
@@ -3799,9 +3821,10 @@ mod gate {
         let refs = (1..=LANES)
             .map(|k| ref_run(m, Prefix::Steps(&toks[..PREFIX]), &[&rows[..k]], next))
             .collect::<Result<Vec<_>, _>>()?;
-        ok &= verify_case::<2>(m, toks, rows, next, 2, &refs)?;
-        ok &= verify_case::<3>(m, toks, rows, next, 3, &refs)?;
-        ok &= verify_case::<4>(m, toks, rows, next, 4, &refs)?;
+        let served = n_layer() - hostless(plan);
+        ok &= verify_case::<2>(m, toks, rows, next, 2, &refs, served)?;
+        ok &= verify_case::<3>(m, toks, rows, next, 3, &refs, served)?;
+        ok &= verify_case::<4>(m, toks, rows, next, 4, &refs, served)?;
         Ok(ok)
     }
 
@@ -3954,6 +3977,244 @@ mod gate {
         ok &= guarded("rows", &mut m, |m| card_rows(m, toks, &plan))?;
         ok &= guarded("gemm", &mut m, |m| card_gemm(m, man, toks))?;
         Ok(ok)
+    }
+
+    /// (k) (iv): the plan with no card budget. In the fixture tier it puts
+    /// every routed expert on the card, so the gate's load runs every layer
+    /// without the host leg ([`hostless`]); in the real tier the card's memory
+    /// decides how many layers it puts whole, which the clause prints and does
+    /// not require (on a card the file does not fit, both loads below keep
+    /// every host leg). Its captured step holds the batch mem ops of the
+    /// layers with a host leg, and (ii) holds under its counts
+    /// ([`card_rows`]). Against the same plan loaded keeping every host leg
+    /// (`HostCfg::route_trace` set: the load is made for a route trace),
+    /// whose step holds every layer's go and wait and whose verify replay
+    /// serves every layer on the host: five graph and five eager steps and a
+    /// verify of four rows kept whole, every token, logits row and store bit
+    /// for bit. A load that runs a layer without the host leg refuses a route
+    /// trace and a residency machine by name ([`whole_refusals`]). A load
+    /// that fails is a named FAIL.
+    fn card_whole(toks: &[u32]) -> Result<bool, GateError> {
+        let fixture = Tier::from_env()? == Tier::Fixture;
+        let levers = PlanLevers {
+            card_budget_bytes: None,
+        };
+        let (rows, next) = verify_rows(toks)?;
+        // One load of the plan: its step's batch mem ops, then the runs, and
+        // on the load without every host leg its refusals; `None` after a
+        // load's named failure.
+        let arm = |route_trace: bool| -> Result<Option<_>, GateError> {
+            let opened = (|| -> Result<Opened38, GateError> {
+                Open38 {
+                    card: card()?,
+                    ctx: CTX,
+                    ub: bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for(CTX)?,
+                    experts: Experts::Card,
+                    slots: 1,
+                    plan_levers: &levers,
+                    host: HostCfg {
+                        route_trace,
+                        ..cfg().host
+                    },
+                    room: None,
+                    residency: Residency::Off,
+                }
+                .plan(open_split()?)?
+                .open()
+            })();
+            let Opened38 { model: mut m, plan } = match opened {
+                Ok(o) => o,
+                Err(e) => {
+                    println!(
+                        "card leg whole plan: the load{} FAILED: {e} {}",
+                        if route_trace {
+                            " keeping every host leg"
+                        } else {
+                            ""
+                        },
+                        verdict(false)
+                    );
+                    return Ok(None);
+                }
+            };
+            m.capture_step()?;
+            let memop = sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_BATCH_MEM_OP;
+            let ([b], _) = count_kinds(&m.step_graph_nodes()?, [memop]);
+            let whole = hostless(&plan);
+            let rows_ok = route_trace || card_rows(&mut m, toks, &plan)?;
+            let graph = run_steps(&mut m, toks, StepMode::Graph, true)?;
+            let eager = run_steps(&mut m, toks, StepMode::Eager, true)?;
+            Prefix::Steps(&toks[..PREFIX]).feed(&mut m)?;
+            let verified = verify::<LANES>(&mut m, rows, LANES, StepMode::Graph, Some(next))?;
+            let refused = if route_trace {
+                true
+            } else if whole == 0 {
+                println!(
+                    "card leg whole plan: no layer runs without the host leg, no refusal to hold"
+                );
+                true
+            } else {
+                whole_refusals(&mut m)?
+            };
+            Ok(Some((
+                whole,
+                b,
+                rows_ok && refused,
+                [graph, eager],
+                verified,
+            )))
+        };
+        let Some((whole, b, own_ok, runs, (v, served))) = arm(false)? else {
+            return Ok(false);
+        };
+        let Some((_, kb, _, kept, (kv, kserved))) = arm(true)? else {
+            return Ok(false);
+        };
+        let premise = !fixture || whole == n_layer();
+        let counts = premise
+            && b == shape().memops_card(whole)
+            && kb == memops()
+            && served == [(n_layer() - whole) as u64; 3]
+            && kserved == [n_layer() as u64; 3];
+        println!(
+            "card leg whole plan: {whole} of {} layers without the host leg{}; batch_mem_op {b} \
+             (want {}), with every host leg kept {kb} (want {}); the verify replay's services, \
+             host calls and Cols services {served:?} (want {} each), with every host leg kept \
+             {kserved:?} (want {} each) {}",
+            n_layer(),
+            if fixture {
+                format!(" (want {}: the fixture fits the card)", n_layer())
+            } else {
+                " (the real tier does not require it: the card's memory decides)".to_string()
+            },
+            shape().memops_card(whole),
+            memops(),
+            n_layer() - whole,
+            n_layer(),
+            verdict(counts)
+        );
+        let mut ok = counts && own_ok;
+        for (mode, (a, k)) in ["graph", "eager"].iter().zip(runs.iter().zip(&kept)) {
+            let label = format!("whole plan: {mode} steps vs host legs kept");
+            ok &= same_run(&label, a, k, false);
+        }
+        let pos = PREFIX + LANES;
+        ok &= same_vrun("whole plan vs host legs kept", &v, &kv, pos, kv.lane);
+        Ok(ok)
+    }
+
+    /// (k) (iv)'s refusals on a load that runs a layer without the host leg:
+    /// a route trace attached after the load (`HostTier::attach_route_trace`)
+    /// and a residency machine started after it (`HostTier::start_swap`),
+    /// each refused by name, its line printing the refusal. The machine's
+    /// source holds no part of any layer ([`NoParts`]).
+    fn whole_refusals(m: &mut Qwen38Model) -> Result<bool, GateError> {
+        const WHAT: &str = "card leg whole plan";
+        let (gpu, _, body) = m.body_parts(WHAT)?;
+        let tier = body.hybrid_mut();
+        let (layers, n_expert) = (tier.slots().layers(), tier.slots().n_expert());
+        let dir =
+            std::env::temp_dir().join(format!("gate_qwen4exp_e2e-whole-{}", std::process::id()));
+        let trace = RouteTrace::create(
+            &dir,
+            TraceHeader {
+                model: cfg().path.clone(),
+                arch: "qwen4exp".to_owned(),
+                build: "gate_qwen4exp_e2e".to_owned(),
+                n_expert,
+                n_used: N_USED,
+                first_layer: layers.start,
+                n_layer: layers.len(),
+                extra: Vec::new(),
+            },
+        )?;
+        let traced = tier.attach_route_trace(trace);
+        drop(tier.take_route_trace());
+        std::fs::remove_dir_all(&dir)?;
+        let view = Arc::new(DeviceTensor::upload(
+            gpu.stream(),
+            &tier.slots().stage_view(),
+            layers.len(),
+            n_expert,
+        )?);
+        let machine = MachineCfg {
+            params: SwapParams::mid(1),
+            pinned: vec![0; layers.len()],
+            top_k: N_USED,
+            max_rows: LANES,
+            unrouted: Vec::new(),
+            deadline: Duration::from_secs(10),
+        };
+        let swapped = tier.start_swap(
+            gpu.context(),
+            gpu.stream(),
+            view,
+            Arc::new(NoParts),
+            machine,
+        );
+        tier.stop_swap();
+        let mut ok = true;
+        for (asked, entry, got) in [
+            ("a route trace", "HostTier::attach_route_trace", traced),
+            ("a residency machine", "HostTier::start_swap", swapped),
+        ] {
+            let named = matches!(&got, Err(GpuError::Shape { what, detail })
+                if *what == entry && detail.contains("without the host service"));
+            ok &= named;
+            println!(
+                "{WHAT}: {asked} after the load -> {} {}",
+                match &got {
+                    Ok(()) => "taken".to_string(),
+                    Err(e) => e.to_string(),
+                },
+                verdict(named)
+            );
+        }
+        Ok(ok)
+    }
+
+    /// The source [`whole_refusals`] hands a residency machine: no part of any
+    /// layer, so the machine stages nothing; any read is refused by name.
+    struct NoParts;
+
+    impl NoParts {
+        fn refused(what: &'static str) -> GpuError {
+            GpuError::Shape {
+                what,
+                detail: "a source with no part of any layer".to_owned(),
+            }
+        }
+    }
+
+    impl SwapSource for NoParts {
+        fn part_bytes(&self, _layer: usize) -> &[usize] {
+            &[]
+        }
+
+        fn source(&self, _layer: usize, _id: u32, _part: usize) -> Result<Piece<'_>, GpuError> {
+            Err(Self::refused("NoParts::source"))
+        }
+
+        fn dest(
+            &self,
+            _layer: usize,
+            _part: usize,
+            _slot: u32,
+        ) -> Result<sys::CUdeviceptr, GpuError> {
+            Err(Self::refused("NoParts::dest"))
+        }
+
+        fn prepare_victim(&self, _layer: usize, _id: u32) -> Result<(), GpuError> {
+            Err(Self::refused("NoParts::prepare_victim"))
+        }
+
+        fn host_resident(&self, _layer: usize, _id: u32) -> Result<bool, GpuError> {
+            Err(Self::refused("NoParts::host_resident"))
+        }
+
+        fn release_host(&self, _layer: usize, _id: u32) -> Result<u64, GpuError> {
+            Err(Self::refused("NoParts::release_host"))
+        }
     }
 
     // ---------------------------------------------------- (r) refusals
@@ -5467,6 +5728,7 @@ mod gate {
         ok &= slots_two(Experts::Host)?;
         tier::sc("(k) the card leg: structure, places rule, vs the host plan, rows, ubatch walk")?;
         ok &= card_leg(&toks, &eager, &man)?;
+        ok &= card_whole(&toks)?;
         println!("{}", tier::tally_line());
         tier::expect_fixture_oracle("gate_qwen4exp_e2e", FX_ORACLE)?;
         if ok { Ok(()) } else { Err(checks_failed()) }
