@@ -1,0 +1,7 @@
+command: cargo clippy --locked --no-deps -p bloomery-hip-spike --all-targets -- -D warnings
+   Compiling bloomery-hip-spike v0.1.0 (<local>/bloomery-native-contributions-20261013/step2-main/labs/hip-native/host)
+    Checking libc v0.2.190
+    Checking thiserror v2.0.21
+    Checking memmap2 v0.9.11
+    Checking bloomery-gguf v0.1.0 (<local>/bloomery-native-contributions-20261013/step2-main/crates/gguf)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.29s

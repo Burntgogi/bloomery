@@ -1,0 +1,20 @@
+[
+  {
+    "branch": "contribution/flash-tier-cost-main-20261013",
+    "sha": "3291449dd6ad32bbcba786f86d72b41c32ced7ea",
+    "source": "https://github.com/Burntgogi/bloomery/tree/3291449dd6ad32bbcba786f86d72b41c32ced7ea",
+    "compare": "https://github.com/midagedev/bloomery/compare/main...Burntgogi:bloomery:contribution/flash-tier-cost-main-20261013"
+  },
+  {
+    "branch": "contribution/native-hip-spike-main-20261013",
+    "sha": "5c449b6b87f280c59179566853bf95ed68e77e3a",
+    "source": "https://github.com/Burntgogi/bloomery/tree/5c449b6b87f280c59179566853bf95ed68e77e3a",
+    "compare": "https://github.com/midagedev/bloomery/compare/main...Burntgogi:bloomery:contribution/native-hip-spike-main-20261013"
+  },
+  {
+    "branch": "contribution/qwen35-generation-main-20261013",
+    "sha": "f680f9f5adf019c4afb3c6289a2401c5fc9f22b1",
+    "source": "https://github.com/Burntgogi/bloomery/tree/f680f9f5adf019c4afb3c6289a2401c5fc9f22b1",
+    "compare": "https://github.com/midagedev/bloomery/compare/main...Burntgogi:bloomery:contribution/qwen35-generation-main-20261013"
+  }
+]

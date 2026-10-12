@@ -1,0 +1,1 @@
+check-comments: ok (807 files, 122536 comment lines; tools/ cites no doc by line number, 0 allowed by CITE_ALLOW; no retired word, 1 line(s) allowed by WORD_ALLOW)

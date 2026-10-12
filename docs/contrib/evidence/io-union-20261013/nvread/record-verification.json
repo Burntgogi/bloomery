@@ -1,0 +1,9 @@
+{
+  "runs": 12,
+  "records": 72,
+  "same_seed_draws_equal": true,
+  "same_seed_request_bytes_equal": true,
+  "all_reconciled": true,
+  "page_cache_rows_emitted": false,
+  "default_mode_failure_preserved": true
+}

@@ -1,0 +1,106 @@
+command: cargo test --locked -p bloomery-decision
+   Compiling rawpointer v0.2.1
+   Compiling serde_json v1.0.151
+   Compiling bloomery-vision v0.1.0 (<local>/bloomery-native-contributions-20261013/step3-main/crates/vision)
+   Compiling matrixmultiply v0.3.11
+   Compiling bloomery-jinja v0.1.0 (<local>/bloomery-native-contributions-20261013/step3-main/crates/jinja)
+   Compiling bloomery-decision v0.1.0 (<local>/bloomery-native-contributions-20261013/step3-main/crates/decision)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.17s
+     Running unittests src/lib.rs (<local>/bloomery-native-contributions-20261013/step3/target/debug/build/bloomery-decision/b971bba8b7f03011/out/decision-b971bba8b7f03011)
+
+running 54 tests
+test answer::tests::confidence_is_llama_cpps ... ok
+test answer::tests::mismatched_logits_are_refused ... ok
+test answer::tests::a_tie_goes_to_the_first_option_in_request_order ... ok
+test answer::tests::the_body_has_the_release_shape ... ok
+test encode::tests::no_image_is_no_media_piece ... ok
+test answer::tests::neumaier_sum_matches_python ... ok
+test encode::tests::the_state_is_cut_to_what_the_schema_leaves ... ok
+test encode::tests::the_text_entry_refuses_images ... ok
+test encode::tests::spans_cover_the_rendered_pieces ... ok
+test encode::tests::a_placeholder_in_the_text_is_refused ... ok
+test encode::tests::counts_and_tokenizer_are_checked ... ok
+test encode::tests::an_empty_question_span_is_refused ... ok
+test encode::tests::images_join_the_prompt_before_the_state ... ok
+test encode::tests::the_media_ids_count_in_what_the_schema_leaves ... ok
+test encode::tests::non_string_instructions_render_as_json ... ok
+test head::tests::a_config_is_recognised_by_its_keys_alone ... ok
+test json::tests::malformed_input_is_refused ... ok
+test json::tests::integers_stay_exact_and_floats_are_python_floats ... ok
+test json::tests::strings_decode_escapes_and_pairs ... ok
+test gguf_head::tests::a_trunk_alone_has_no_head ... ok
+test answer::tests::round4_is_pythons ... ok
+test ops::tests::erf_and_gelu_match_known_values ... ok
+test release::clef::tests::the_layouts_are_consistent ... ok
+test release::lev::tests::the_scale_has_two_ratings_or_more ... ok
+test head::tests::the_config_reads_and_refuses_by_name ... ok
+test gguf_head::tests::the_stored_scales_are_the_f32_formula_within_two_ulps ... ok
+test json::tests::duplicate_keys_keep_first_position_and_last_value ... ok
+test head::tests::a_missing_or_extra_weight_is_refused_by_name ... ok
+test json::tests::python_only_literals_are_refused_by_name ... ok
+test render::tests::dumps_keeps_order_unsorted ... ok
+test render::tests::float_repr_is_pythons ... ok
+test render::tests::render_is_python_dumps ... ok
+test request::tests::images_are_taken_in_llama_cpps_order_and_out_of_the_state ... ok
+test request::tests::a_state_without_image_parts_is_unchanged ... ok
+test ops::tests::layer_norm_and_softmax ... ok
+test request::tests::choice_options_sort_by_code_point ... ok
+test gguf_head::tests::every_head_name_maps_to_the_tensors_clef_py_writes ... ok
+test request::tests::media_is_checked ... ok
+test release::lev::tests::the_buckets_are_llama_cpps ... ok
+test request::tests::question_order_is_request_order_and_unknown_keys_pass ... ok
+test request::tests::noul_defaults_and_overrides ... ok
+test request::tests::refusals_are_named ... ok
+test request::tests::strict_rules_are_llama_cpps_checks ... ok
+test request::tests::rules_order_the_options_and_describe_the_noul ... ok
+test safetensors::tests::overlapping_ranges_are_refused ... ok
+test request::tests::score_levels_are_indexed ... ok
+test safetensors::tests::reads_bf16_f16_f32_and_scalars ... ok
+test safetensors::tests::refuses_unknown_dtypes_and_bad_ranges ... ok
+test ops::tests::attention_matches_f64 ... ok
+test gguf_head::tests::a_file_without_its_whole_head_is_refused_by_name ... ok
+test gguf_head::tests::a_clef_file_scores_as_the_release_head ... ok
+test head::tests::forward_scores_every_option_and_checks_its_inputs ... ok
+test gguf_head::tests::a_q8_0_head_is_within_its_block_bound_of_the_release ... ok
+test ops::tests::linear_matches_f64_on_every_split ... ok
+
+test result: ok. 54 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.73s
+
+     Running unittests src/bin/decision_answer.rs (<local>/bloomery-native-contributions-20261013/step3/target/debug/build/bloomery-decision/f31e792c6ec839ef/out/decision_answer-f31e792c6ec839ef)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/decision_encode.rs (<local>/bloomery-native-contributions-20261013/step3/target/debug/build/bloomery-decision/a2e21aa5a275f54c/out/decision_encode-a2e21aa5a275f54c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/clef.rs (<local>/bloomery-native-contributions-20261013/step3/target/debug/build/bloomery-decision/838c19181a808f3c/out/clef-838c19181a808f3c)
+
+running 6 tests
+test hw_clef_answer_matches_the_release ... ignored, needs the Clef reference under $BLOOMERY_DATA; just gate-decision-clef
+test hw_clef_head_matches_the_f64_referee ... ignored, needs the Clef reference under $BLOOMERY_DATA; just gate-decision-clef
+test hw_clef_ids_equal_the_release ... ignored, needs the Clef reference under $BLOOMERY_DATA and the Flash GGUF; just gate-decision-clef
+test hw_clef_image_ids_equal_the_release ... ignored, needs set D under $BLOOMERY_DATA/clefvis/ref and the Flash GGUF; just gate-decision-clef
+test hw_clef_layout_head_scores_as_the_release_head ... ignored, needs the Clef reference under $BLOOMERY_DATA and the clef-layout GGUF; just gate-decision-clef
+test hw_clef_layout_tensors_are_the_releases_within_q8_0 ... ignored, needs the clef-layout GGUF and the release's head; just gate-decision-clef
+
+test result: ok. 0 passed; 0 failed; 6 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/lev.rs (<local>/bloomery-native-contributions-20261013/step3/target/debug/build/bloomery-decision/01d592ccb77e3ad0/out/lev-01d592ccb77e3ad0)
+
+running 3 tests
+test hw_lev_ids_equal_mainline ... ignored, needs the lev reference under $BLOOMERY_DATA and the lev GGUF; just gate-decision-lev
+test lev_answer_math ... ok
+test lev_policy ... ok
+
+test result: ok. 2 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests decision
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s

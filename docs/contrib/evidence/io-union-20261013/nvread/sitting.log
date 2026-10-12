@@ -1,0 +1,59 @@
+[lease] card: docs/cards/nvread-contributor.card sha256=c9779aa17be1a6eac2835964ea511409cc7fcedd7fea07d137d023a723e0bd8a
+[lease] card | # Contributor host-only calibration; this is not the maintainer drive's reference band.
+[lease] card | # Eight blocking workers can hide up to eight serial request latencies [derived ceiling,
+[lease] card | # assuming equal requests and no bandwidth cap]. Shared bandwidth, CPU work and joining
+[lease] card | # can leave the ratio near or below one. No inference speed is predicted by this card.
+[lease] card | kind: calibration
+[lease] card | question: how does this contributor's SSD read expert batches as blocking read workers increase?
+[lease] card | term: probe_nvread k8 directN median GB/s at threads 8 divided by threads 1, same seed per round,
+[lease] card |   alongside all directN k1,k2,k4,k8 and contiguous range reference rows, under --direct-only
+[lease] card | unit: ratio
+[lease] card | predict: 1.0..8.0
+[lease] card | reason: collect a drive-specific worker-count curve and request-size reference for the paged verify IO term
+[lease] card | condition: existing lease-hold runner with a contributor lock directory; no GPU timed or opened;
+[lease] card |   explicit direct-only mode with aligned O_DIRECT reads and no buffered fallback; three rounds with rotated
+[lease] card |   worker order and the same draws within each round; drive counters, pressure and foreign-process IO
+[lease] card |   recorded around each child; no page-cache arm or mincore cold claim is made;
+[lease] card |   neither drive/controller caches nor other services are reset;
+[lease] card |   a read-byte reconciliation outside five percent marks the run contaminated, retaining its output
+[lease] card | decide-in: carry the drive-specific curve into the paged IO discussion, separately from native inference
+[lease] card | decide-below: examine worker overhead and recorded contention before proposing deeper IO queues
+[lease] card | decide-above: audit byte accounting, warm-drive effects and the instrument before using the ratio
+[lease] card: ok kind=calibration (no ruler: not an ab card)
+[lease] held by pid 764059 at 2026-10-12T18:55:23Z
+[lease] netdata: not active
+[lease-hold] command: timeout --kill-after=10 600 python3 <local>/bloomery-native-contributions-20261013/followup/nvread-sweep.py --tree <local>/bloomery-native-contributions-20261013/step1-main --binary <local>/bloomery-native-contributions-20261013/step1/target/release/probe_nvread --out <local>/bloomery-native-contributions-20261013/followup/evidence/nvread
+--- witness pre 2026-10-12T18:55:23Z epoch 1791831323 ---
+    loadavg: 13.86 8.79 8.12 15/1361 764092
+    pressure-cpu: some avg10=3.56 avg60=9.91 avg300=11.73 total=3305724567
+    pressure-io: some avg10=0.01 avg60=0.10 avg300=0.41 total=254548042
+    meminfo cached/free kB: 14484004 4428956
+    pgmajfault: 12903960
+timeout: failed to run command ‘nvidia-smi’: No such file or directory
+    gpu-apps: unavailable (rc 127)
+    busiest: strata 429% | ps 100% | chrome-remote-d 7.3% | bash 5.6% |
+    lock-holder-pid: 764059
+r1-t1: rc=0 rows=6 device/probe=1.0009735023973507 reconciled=True
+r1-t2: rc=0 rows=6 device/probe=1.000315511857313 reconciled=True
+r1-t4: rc=0 rows=6 device/probe=1.0007577677940598 reconciled=True
+r1-t8: rc=0 rows=6 device/probe=1.0010786730164551 reconciled=True
+r2-t2: rc=0 rows=6 device/probe=1.0002675741674028 reconciled=True
+r2-t4: rc=0 rows=6 device/probe=1.0000181846521536 reconciled=True
+r2-t8: rc=0 rows=6 device/probe=1.0000207824596041 reconciled=True
+r2-t1: rc=0 rows=6 device/probe=1.0000337714968566 reconciled=True
+r3-t4: rc=0 rows=6 device/probe=1.0000205102961688 reconciled=True
+r3-t8: rc=0 rows=6 device/probe=1.000064094675527 reconciled=True
+r3-t1: rc=0 rows=6 device/probe=1.0001179342029698 reconciled=True
+r3-t2: rc=0 rows=6 device/probe=1.000187156452539 reconciled=True
+--- witness post 2026-10-12T18:55:33Z epoch 1791831333 ---
+    loadavg: 13.00 8.78 8.12 32/1356 764458
+    pressure-cpu: some avg10=2.82 avg60=8.75 avg300=11.41 total=3306050826
+    pressure-io: some avg10=3.95 avg60=0.99 avg300=0.59 total=255226131
+    meminfo cached/free kB: 14484892 4393732
+    pgmajfault: 12903963
+timeout: failed to run command ‘nvidia-smi’: No such file or directory
+    gpu-apps: unavailable (rc 127)
+    busiest: strata 444% | chrome-remote-d 7.3% | Xorg 3.3% | codex 2.9% |
+    lock-holder-pid: 764059
+[lease-hold] rc=0 held=10 s
+[lease] released at 2026-10-12T18:55:33Z

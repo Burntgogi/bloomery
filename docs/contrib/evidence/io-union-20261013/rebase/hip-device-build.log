@@ -1,0 +1,3 @@
+command: cargo -Zbuild-std=core build --locked --release --target amdgcn-amd-amdhsa -p bloomery-hip-spike-device
+   Compiling bloomery-hip-spike-device v0.1.0 (<local>/bloomery-native-contributions-20261013/step2-main/labs/hip-native/device)
+    Finished `release` profile [optimized] target(s) in 0.33s

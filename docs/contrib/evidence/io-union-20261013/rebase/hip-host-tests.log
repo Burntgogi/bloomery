@@ -1,0 +1,9 @@
+command: cargo test --locked -p bloomery-hip-spike
+   Compiling bloomery-hip-spike v0.1.0 (<local>/bloomery-native-contributions-20261013/step2-main/labs/hip-native/host)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.12s
+     Running unittests src/main.rs (<local>/bloomery-native-contributions-20261013/step2/labs/hip-native/target/debug/build/bloomery-hip-spike/c17a7ee7ef53ef9d/out/bloomery_hip_spike-c17a7ee7ef53ef9d)
+
+running 1 test
+test tests::refuses_invalid_shapes_and_truncated_weights ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s

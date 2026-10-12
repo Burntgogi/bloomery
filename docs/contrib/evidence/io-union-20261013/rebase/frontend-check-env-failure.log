@@ -1,0 +1,30 @@
+command: cargo check --locked -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2 --bin bloomery-serve --bin generate_qwen3moe --example qwen35_admission
+    Checking bloomery-levers v0.1.0 (<local>/bloomery-native-contributions-20261013/step3-main/crates/levers)
+    Checking bloomery-gguf v0.1.0 (<local>/bloomery-native-contributions-20261013/step3-main/crates/gguf)
+   Compiling cuda-bindings v0.4.0 (https://github.com/midagedev/cuda-oxide.git?rev=87bc951864b79f723b4da9c11fa229f5600aefcb#87bc9518)
+   Compiling cuda-core v0.4.0 (https://github.com/midagedev/cuda-oxide.git?rev=87bc951864b79f723b4da9c11fa229f5600aefcb#87bc9518)
+    Checking bloomery-hf v0.1.0 (<local>/bloomery-native-contributions-20261013/step3-main/crates/hf)
+    Checking bloomery-jinja v0.1.0 (<local>/bloomery-native-contributions-20261013/step3-main/crates/jinja)
+   Compiling bloomery-serve v0.3.1 (<local>/bloomery-native-contributions-20261013/step3-main/crates/serve)
+    Checking bloomery-sampler v0.1.0 (<local>/bloomery-native-contributions-20261013/step3-main/crates/sampler)
+error: failed to run custom build command for `cuda-bindings v0.4.0 (https://github.com/midagedev/cuda-oxide.git?rev=87bc951864b79f723b4da9c11fa229f5600aefcb#87bc9518)`
+
+Caused by:
+  process didn't exit successfully: `<local>/bloomery-native-contributions-20261013/step3/target/debug/build/cuda-bindings/7a27d33d968ee61f/out/build_script_build` (exit status: 1)
+  --- stdout
+  cargo:rerun-if-changed=wrapper.h
+  cargo:rerun-if-changed=toolkit_target.rs
+  cargo:rerun-if-env-changed=CUDA_TOOLKIT_PATH
+  cargo:rerun-if-env-changed=CUDA_HOME
+  cargo:rerun-if-env-changed=CUDA_TOOLKIT_TARGET_DIR
+  cargo:rerun-if-env-changed=CUTILE_SETUP_DIAGNOSTICS
+
+  --- stderr
+  Neither CUDA_TOOLKIT_PATH nor CUDA_HOME is set, and no CUDA 13.0+ toolkit was found in default locations:
+    - /usr/local/cuda-13.3: /usr/local/cuda-13.3 is not a directory
+    - /usr/local/cuda-13.2: /usr/local/cuda-13.2 is not a directory
+    - /usr/local/cuda-13: /usr/local/cuda-13 is not a directory
+    - /usr/local/cuda: /usr/local/cuda is not a directory
+    - /opt/cuda: /opt/cuda is not a directory
+  Set CUDA_TOOLKIT_PATH or CUDA_HOME to a CUDA 13.0+ toolkit directory.
+warning: build failed, waiting for other jobs to finish...

@@ -1,0 +1,1519 @@
+{
+  "placement": "0-47:64",
+  "policy": {
+    "rule": "static"
+  },
+  "sets": [
+    {
+      "directory": "<local>/bloomery-contributions/issue31-evidence/data/router/prose-verified8192",
+      "header": {
+        "model": "<local>/Strata-data/models/IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf",
+        "model_file": "Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf",
+        "arch": "qwen4exp",
+        "build": "llama-prefill-gre-fb4b2737-local-adapter",
+        "ids": "<local>/bloomery-contributions/issue31-evidence/corpora/prose.ids",
+        "ids_md5": "95ee78d18f59219f3c99682fa079db00",
+        "ids_lines": "10069",
+        "tokens": "8192",
+        "chunk": "2048",
+        "chunks": "4",
+        "n_ctx": "2048",
+        "n_batch": "256",
+        "n_ubatch": "256",
+        "n_threads": "10\t10",
+        "n_expert": "512",
+        "n_expert_used": "10",
+        "schedule": "top-k-only",
+        "flags": "-m <local>/Strata-data/models/IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf --expect-arch qwen4exp --ids <local>/bloomery-contributions/issue31-evidence/corpora/prose.ids --out <local>/bloomery-contributions/issue31-evidence/data/router/prose-verified8192 --chunk 2048 --max-tokens 8192 --top-k-only -c 2048 -b 256 -ub 256 -ngl 0 -t 10 -tb 10",
+        "load_s": "1.7",
+        "wall_s": "430.1",
+        "run_tok_per_s": "19.05\t(this run's own wall rate over the decode calls, not an engine speed)",
+        "majflt": "5817"
+      },
+      "tokens": 8192,
+      "chunk": 2048,
+      "card_by_layer": {
+        "0": 64,
+        "1": 64,
+        "2": 64,
+        "3": 64,
+        "4": 64,
+        "5": 64,
+        "6": 64,
+        "7": 64,
+        "8": 64,
+        "9": 64,
+        "10": 64,
+        "11": 64,
+        "12": 64,
+        "13": 64,
+        "14": 64,
+        "15": 64,
+        "16": 64,
+        "17": 64,
+        "18": 64,
+        "19": 64,
+        "20": 64,
+        "21": 64,
+        "22": 64,
+        "23": 64,
+        "24": 64,
+        "25": 64,
+        "26": 64,
+        "27": 64,
+        "28": 64,
+        "29": 64,
+        "30": 64,
+        "31": 64,
+        "32": 64,
+        "33": 64,
+        "34": 64,
+        "35": 64,
+        "36": 64,
+        "37": 64,
+        "38": 64,
+        "39": 64,
+        "40": 64,
+        "41": 64,
+        "42": 64,
+        "43": 64,
+        "44": 64,
+        "45": 64,
+        "46": 64,
+        "47": 64
+      },
+      "host_slots_per_row": 416.8123779296875,
+      "rows": [
+        {
+          "k": 1,
+          "windows": 8192,
+          "mean": 1.0,
+          "p10": 1.0,
+          "p90": 1.0,
+          "pooled": 1.0,
+          "union": 416.8123779296875,
+          "predict": 1.0,
+          "slots": 416.8123779296875,
+          "per_layer": {
+            "0": {
+              "union": 71330,
+              "slots": 71330,
+              "expert_bytes": 1868800,
+              "union_bytes": 133301504000,
+              "slot_bytes": 133301504000
+            },
+            "1": {
+              "union": 71223,
+              "slots": 71223,
+              "expert_bytes": 1305600,
+              "union_bytes": 92988748800,
+              "slot_bytes": 92988748800
+            },
+            "2": {
+              "union": 71632,
+              "slots": 71632,
+              "expert_bytes": 1868800,
+              "union_bytes": 133865881600,
+              "slot_bytes": 133865881600
+            },
+            "3": {
+              "union": 74315,
+              "slots": 74315,
+              "expert_bytes": 1305600,
+              "union_bytes": 97025664000,
+              "slot_bytes": 97025664000
+            },
+            "4": {
+              "union": 74873,
+              "slots": 74873,
+              "expert_bytes": 1868800,
+              "union_bytes": 139922662400,
+              "slot_bytes": 139922662400
+            },
+            "5": {
+              "union": 71800,
+              "slots": 71800,
+              "expert_bytes": 1408000,
+              "union_bytes": 101094400000,
+              "slot_bytes": 101094400000
+            },
+            "6": {
+              "union": 69588,
+              "slots": 69588,
+              "expert_bytes": 1305600,
+              "union_bytes": 90854092800,
+              "slot_bytes": 90854092800
+            },
+            "7": {
+              "union": 66046,
+              "slots": 66046,
+              "expert_bytes": 1305600,
+              "union_bytes": 86229657600,
+              "slot_bytes": 86229657600
+            },
+            "8": {
+              "union": 73178,
+              "slots": 73178,
+              "expert_bytes": 1868800,
+              "union_bytes": 136755046400,
+              "slot_bytes": 136755046400
+            },
+            "9": {
+              "union": 69100,
+              "slots": 69100,
+              "expert_bytes": 1408000,
+              "union_bytes": 97292800000,
+              "slot_bytes": 97292800000
+            },
+            "10": {
+              "union": 69835,
+              "slots": 69835,
+              "expert_bytes": 1408000,
+              "union_bytes": 98327680000,
+              "slot_bytes": 98327680000
+            },
+            "11": {
+              "union": 75120,
+              "slots": 75120,
+              "expert_bytes": 1305600,
+              "union_bytes": 98076672000,
+              "slot_bytes": 98076672000
+            },
+            "12": {
+              "union": 71350,
+              "slots": 71350,
+              "expert_bytes": 1510400,
+              "union_bytes": 107767040000,
+              "slot_bytes": 107767040000
+            },
+            "13": {
+              "union": 65671,
+              "slots": 65671,
+              "expert_bytes": 1305600,
+              "union_bytes": 85740057600,
+              "slot_bytes": 85740057600
+            },
+            "14": {
+              "union": 70703,
+              "slots": 70703,
+              "expert_bytes": 1408000,
+              "union_bytes": 99549824000,
+              "slot_bytes": 99549824000
+            },
+            "15": {
+              "union": 69431,
+              "slots": 69431,
+              "expert_bytes": 1510400,
+              "union_bytes": 104868582400,
+              "slot_bytes": 104868582400
+            },
+            "16": {
+              "union": 70873,
+              "slots": 70873,
+              "expert_bytes": 1305600,
+              "union_bytes": 92531788800,
+              "slot_bytes": 92531788800
+            },
+            "17": {
+              "union": 74212,
+              "slots": 74212,
+              "expert_bytes": 1510400,
+              "union_bytes": 112089804800,
+              "slot_bytes": 112089804800
+            },
+            "18": {
+              "union": 70645,
+              "slots": 70645,
+              "expert_bytes": 1868800,
+              "union_bytes": 132021376000,
+              "slot_bytes": 132021376000
+            },
+            "19": {
+              "union": 69870,
+              "slots": 69870,
+              "expert_bytes": 1408000,
+              "union_bytes": 98376960000,
+              "slot_bytes": 98376960000
+            },
+            "20": {
+              "union": 70235,
+              "slots": 70235,
+              "expert_bytes": 1868800,
+              "union_bytes": 131255168000,
+              "slot_bytes": 131255168000
+            },
+            "21": {
+              "union": 71602,
+              "slots": 71602,
+              "expert_bytes": 1510400,
+              "union_bytes": 108147660800,
+              "slot_bytes": 108147660800
+            },
+            "22": {
+              "union": 71104,
+              "slots": 71104,
+              "expert_bytes": 1868800,
+              "union_bytes": 132879155200,
+              "slot_bytes": 132879155200
+            },
+            "23": {
+              "union": 73939,
+              "slots": 73939,
+              "expert_bytes": 1868800,
+              "union_bytes": 138177203200,
+              "slot_bytes": 138177203200
+            },
+            "24": {
+              "union": 72981,
+              "slots": 72981,
+              "expert_bytes": 1868800,
+              "union_bytes": 136386892800,
+              "slot_bytes": 136386892800
+            },
+            "25": {
+              "union": 69391,
+              "slots": 69391,
+              "expert_bytes": 1408000,
+              "union_bytes": 97702528000,
+              "slot_bytes": 97702528000
+            },
+            "26": {
+              "union": 70195,
+              "slots": 70195,
+              "expert_bytes": 1510400,
+              "union_bytes": 106022528000,
+              "slot_bytes": 106022528000
+            },
+            "27": {
+              "union": 74305,
+              "slots": 74305,
+              "expert_bytes": 1305600,
+              "union_bytes": 97012608000,
+              "slot_bytes": 97012608000
+            },
+            "28": {
+              "union": 70760,
+              "slots": 70760,
+              "expert_bytes": 2329600,
+              "union_bytes": 164842496000,
+              "slot_bytes": 164842496000
+            },
+            "29": {
+              "union": 65634,
+              "slots": 65634,
+              "expert_bytes": 1971200,
+              "union_bytes": 129377740800,
+              "slot_bytes": 129377740800
+            },
+            "30": {
+              "union": 70516,
+              "slots": 70516,
+              "expert_bytes": 2329600,
+              "union_bytes": 164274073600,
+              "slot_bytes": 164274073600
+            },
+            "31": {
+              "union": 69608,
+              "slots": 69608,
+              "expert_bytes": 1766400,
+              "union_bytes": 122955571200,
+              "slot_bytes": 122955571200
+            },
+            "32": {
+              "union": 69681,
+              "slots": 69681,
+              "expert_bytes": 2329600,
+              "union_bytes": 162328857600,
+              "slot_bytes": 162328857600
+            },
+            "33": {
+              "union": 74121,
+              "slots": 74121,
+              "expert_bytes": 1868800,
+              "union_bytes": 138517324800,
+              "slot_bytes": 138517324800
+            },
+            "34": {
+              "union": 69965,
+              "slots": 69965,
+              "expert_bytes": 2329600,
+              "union_bytes": 162990464000,
+              "slot_bytes": 162990464000
+            },
+            "35": {
+              "union": 71506,
+              "slots": 71506,
+              "expert_bytes": 2176000,
+              "union_bytes": 155597056000,
+              "slot_bytes": 155597056000
+            },
+            "36": {
+              "union": 69843,
+              "slots": 69843,
+              "expert_bytes": 1715200,
+              "union_bytes": 119794713600,
+              "slot_bytes": 119794713600
+            },
+            "37": {
+              "union": 71829,
+              "slots": 71829,
+              "expert_bytes": 2329600,
+              "union_bytes": 167332838400,
+              "slot_bytes": 167332838400
+            },
+            "38": {
+              "union": 71052,
+              "slots": 71052,
+              "expert_bytes": 1971200,
+              "union_bytes": 140057702400,
+              "slot_bytes": 140057702400
+            },
+            "39": {
+              "union": 72877,
+              "slots": 72877,
+              "expert_bytes": 1868800,
+              "union_bytes": 136192537600,
+              "slot_bytes": 136192537600
+            },
+            "40": {
+              "union": 76085,
+              "slots": 76085,
+              "expert_bytes": 1510400,
+              "union_bytes": 114918784000,
+              "slot_bytes": 114918784000
+            },
+            "41": {
+              "union": 69064,
+              "slots": 69064,
+              "expert_bytes": 1715200,
+              "union_bytes": 118458572800,
+              "slot_bytes": 118458572800
+            },
+            "42": {
+              "union": 70384,
+              "slots": 70384,
+              "expert_bytes": 1971200,
+              "union_bytes": 138740940800,
+              "slot_bytes": 138740940800
+            },
+            "43": {
+              "union": 76009,
+              "slots": 76009,
+              "expert_bytes": 2329600,
+              "union_bytes": 177070566400,
+              "slot_bytes": 177070566400
+            },
+            "44": {
+              "union": 69987,
+              "slots": 69987,
+              "expert_bytes": 2176000,
+              "union_bytes": 152291712000,
+              "slot_bytes": 152291712000
+            },
+            "45": {
+              "union": 68604,
+              "slots": 68604,
+              "expert_bytes": 1715200,
+              "union_bytes": 117669580800,
+              "slot_bytes": 117669580800
+            },
+            "46": {
+              "union": 69732,
+              "slots": 69732,
+              "expert_bytes": 1971200,
+              "union_bytes": 137455718400,
+              "slot_bytes": 137455718400
+            },
+            "47": {
+              "union": 72723,
+              "slots": 72723,
+              "expert_bytes": 2176000,
+              "union_bytes": 158245248000,
+              "slot_bytes": 158245248000
+            }
+          },
+          "payload": {
+            "union_bytes": 5965376486400,
+            "slot_bytes": 5965376486400,
+            "saved_bytes": 0,
+            "pooled": 1.0,
+            "union_bytes_per_window": 728195371.875,
+            "slot_bytes_per_window": 728195371.875
+          }
+        },
+        {
+          "k": 2,
+          "windows": 8188,
+          "mean": 0.8313124917527854,
+          "p10": 0.7433090024330901,
+          "p90": 0.9171668667466987,
+          "pooled": 0.8312094170292559,
+          "union": 692.9124328285295,
+          "predict": 0.9578060984002884,
+          "slots": 833.6195652173913,
+          "per_layer": {
+            "0": {
+              "union": 137750,
+              "slots": 142588,
+              "expert_bytes": 1868800,
+              "union_bytes": 257427200000,
+              "slot_bytes": 266468454400
+            },
+            "1": {
+              "union": 124242,
+              "slots": 142376,
+              "expert_bytes": 1305600,
+              "union_bytes": 162210355200,
+              "slot_bytes": 185886105600
+            },
+            "2": {
+              "union": 127668,
+              "slots": 143196,
+              "expert_bytes": 1868800,
+              "union_bytes": 238585958400,
+              "slot_bytes": 267604684800
+            },
+            "3": {
+              "union": 117189,
+              "slots": 148557,
+              "expert_bytes": 1305600,
+              "union_bytes": 153001958400,
+              "slot_bytes": 193956019200
+            },
+            "4": {
+              "union": 125411,
+              "slots": 149669,
+              "expert_bytes": 1868800,
+              "union_bytes": 234368076800,
+              "slot_bytes": 279701427200
+            },
+            "5": {
+              "union": 121480,
+              "slots": 143532,
+              "expert_bytes": 1408000,
+              "union_bytes": 171043840000,
+              "slot_bytes": 202093056000
+            },
+            "6": {
+              "union": 118934,
+              "slots": 139113,
+              "expert_bytes": 1305600,
+              "union_bytes": 155280230400,
+              "slot_bytes": 181625932800
+            },
+            "7": {
+              "union": 113604,
+              "slots": 132022,
+              "expert_bytes": 1305600,
+              "union_bytes": 148321382400,
+              "slot_bytes": 172367923200
+            },
+            "8": {
+              "union": 117111,
+              "slots": 146282,
+              "expert_bytes": 1868800,
+              "union_bytes": 218857036800,
+              "slot_bytes": 273371801600
+            },
+            "9": {
+              "union": 109758,
+              "slots": 138130,
+              "expert_bytes": 1408000,
+              "union_bytes": 154539264000,
+              "slot_bytes": 194487040000
+            },
+            "10": {
+              "union": 116040,
+              "slots": 139596,
+              "expert_bytes": 1408000,
+              "union_bytes": 163384320000,
+              "slot_bytes": 196551168000
+            },
+            "11": {
+              "union": 122481,
+              "slots": 150165,
+              "expert_bytes": 1305600,
+              "union_bytes": 159911193600,
+              "slot_bytes": 196055424000
+            },
+            "12": {
+              "union": 124561,
+              "slots": 142630,
+              "expert_bytes": 1510400,
+              "union_bytes": 188136934400,
+              "slot_bytes": 215428352000
+            },
+            "13": {
+              "union": 111203,
+              "slots": 131268,
+              "expert_bytes": 1305600,
+              "union_bytes": 145186636800,
+              "slot_bytes": 171383500800
+            },
+            "14": {
+              "union": 119254,
+              "slots": 141346,
+              "expert_bytes": 1408000,
+              "union_bytes": 167909632000,
+              "slot_bytes": 199015168000
+            },
+            "15": {
+              "union": 103972,
+              "slots": 138791,
+              "expert_bytes": 1510400,
+              "union_bytes": 157039308800,
+              "slot_bytes": 209629926400
+            },
+            "16": {
+              "union": 111227,
+              "slots": 141668,
+              "expert_bytes": 1305600,
+              "union_bytes": 145217971200,
+              "slot_bytes": 184961740800
+            },
+            "17": {
+              "union": 123416,
+              "slots": 148348,
+              "expert_bytes": 1510400,
+              "union_bytes": 186407526400,
+              "slot_bytes": 224064819200
+            },
+            "18": {
+              "union": 123332,
+              "slots": 141224,
+              "expert_bytes": 1868800,
+              "union_bytes": 230482841600,
+              "slot_bytes": 263919411200
+            },
+            "19": {
+              "union": 115690,
+              "slots": 139670,
+              "expert_bytes": 1408000,
+              "union_bytes": 162891520000,
+              "slot_bytes": 196655360000
+            },
+            "20": {
+              "union": 116338,
+              "slots": 140404,
+              "expert_bytes": 1868800,
+              "union_bytes": 217412454400,
+              "slot_bytes": 262386995200
+            },
+            "21": {
+              "union": 118919,
+              "slots": 143135,
+              "expert_bytes": 1510400,
+              "union_bytes": 179615257600,
+              "slot_bytes": 216191104000
+            },
+            "22": {
+              "union": 126427,
+              "slots": 142142,
+              "expert_bytes": 1868800,
+              "union_bytes": 236266777600,
+              "slot_bytes": 265634969600
+            },
+            "23": {
+              "union": 120718,
+              "slots": 147807,
+              "expert_bytes": 1868800,
+              "union_bytes": 225597798400,
+              "slot_bytes": 276221721600
+            },
+            "24": {
+              "union": 120363,
+              "slots": 145890,
+              "expert_bytes": 1868800,
+              "union_bytes": 224934374400,
+              "slot_bytes": 272639232000
+            },
+            "25": {
+              "union": 114011,
+              "slots": 138710,
+              "expert_bytes": 1408000,
+              "union_bytes": 160527488000,
+              "slot_bytes": 195303680000
+            },
+            "26": {
+              "union": 119530,
+              "slots": 140317,
+              "expert_bytes": 1510400,
+              "union_bytes": 180538112000,
+              "slot_bytes": 211934796800
+            },
+            "27": {
+              "union": 123977,
+              "slots": 148532,
+              "expert_bytes": 1305600,
+              "union_bytes": 161864371200,
+              "slot_bytes": 193923379200
+            },
+            "28": {
+              "union": 124472,
+              "slots": 141450,
+              "expert_bytes": 2329600,
+              "union_bytes": 289969971200,
+              "slot_bytes": 329521920000
+            },
+            "29": {
+              "union": 111813,
+              "slots": 131194,
+              "expert_bytes": 1971200,
+              "union_bytes": 220405785600,
+              "slot_bytes": 258609612800
+            },
+            "30": {
+              "union": 119173,
+              "slots": 140968,
+              "expert_bytes": 2329600,
+              "union_bytes": 277625420800,
+              "slot_bytes": 328399052800
+            },
+            "31": {
+              "union": 105704,
+              "slots": 139144,
+              "expert_bytes": 1766400,
+              "union_bytes": 186715545600,
+              "slot_bytes": 245783961600
+            },
+            "32": {
+              "union": 110406,
+              "slots": 139290,
+              "expert_bytes": 2329600,
+              "union_bytes": 257201817600,
+              "slot_bytes": 324489984000
+            },
+            "33": {
+              "union": 122104,
+              "slots": 148166,
+              "expert_bytes": 1868800,
+              "union_bytes": 228187955200,
+              "slot_bytes": 276892620800
+            },
+            "34": {
+              "union": 120735,
+              "slots": 139864,
+              "expert_bytes": 2329600,
+              "union_bytes": 281264256000,
+              "slot_bytes": 325827174400
+            },
+            "35": {
+              "union": 116723,
+              "slots": 142946,
+              "expert_bytes": 2176000,
+              "union_bytes": 253989248000,
+              "slot_bytes": 311050496000
+            },
+            "36": {
+              "union": 112580,
+              "slots": 139617,
+              "expert_bytes": 1715200,
+              "union_bytes": 193097216000,
+              "slot_bytes": 239471078400
+            },
+            "37": {
+              "union": 119216,
+              "slots": 143590,
+              "expert_bytes": 2329600,
+              "union_bytes": 277725593600,
+              "slot_bytes": 334507264000
+            },
+            "38": {
+              "union": 125100,
+              "slots": 142037,
+              "expert_bytes": 1971200,
+              "union_bytes": 246597120000,
+              "slot_bytes": 279983334400
+            },
+            "39": {
+              "union": 111847,
+              "slots": 145683,
+              "expert_bytes": 1868800,
+              "union_bytes": 209019673600,
+              "slot_bytes": 272252390400
+            },
+            "40": {
+              "union": 115961,
+              "slots": 152096,
+              "expert_bytes": 1510400,
+              "union_bytes": 175147494400,
+              "slot_bytes": 229725798400
+            },
+            "41": {
+              "union": 110139,
+              "slots": 138069,
+              "expert_bytes": 1715200,
+              "union_bytes": 188910412800,
+              "slot_bytes": 236815948800
+            },
+            "42": {
+              "union": 118156,
+              "slots": 140695,
+              "expert_bytes": 1971200,
+              "union_bytes": 232909107200,
+              "slot_bytes": 277337984000
+            },
+            "43": {
+              "union": 120805,
+              "slots": 151945,
+              "expert_bytes": 2329600,
+              "union_bytes": 281427328000,
+              "slot_bytes": 353971072000
+            },
+            "44": {
+              "union": 113683,
+              "slots": 139907,
+              "expert_bytes": 2176000,
+              "union_bytes": 247374208000,
+              "slot_bytes": 304437632000
+            },
+            "45": {
+              "union": 110831,
+              "slots": 137144,
+              "expert_bytes": 1715200,
+              "union_bytes": 190097331200,
+              "slot_bytes": 235229388800
+            },
+            "46": {
+              "union": 116005,
+              "slots": 139394,
+              "expert_bytes": 1971200,
+              "union_bytes": 228669056000,
+              "slot_bytes": 274773452800
+            },
+            "47": {
+              "union": 123508,
+              "slots": 145370,
+              "expert_bytes": 2176000,
+              "union_bytes": 268753408000,
+              "slot_bytes": 316325120000
+            }
+          },
+          "payload": {
+            "union_bytes": 9922047769600,
+            "slot_bytes": 11924868480000,
+            "saved_bytes": 2002820710400,
+            "pooled": 0.8320467253991887,
+            "union_bytes_per_window": 1211779160.9184172,
+            "slot_bytes_per_window": 1456383546.6536396
+          }
+        },
+        {
+          "k": 4,
+          "windows": 8180,
+          "mean": 0.6929836484711633,
+          "p10": 0.5908278737343657,
+          "p90": 0.7811735941320294,
+          "pooled": 0.6928269162915616,
+          "union": 1155.103056234719,
+          "predict": 0.8876447463336858,
+          "slots": 1667.2317848410758,
+          "per_layer": {
+            "0": {
+              "union": 261853,
+              "slots": 284911,
+              "expert_bytes": 1868800,
+              "union_bytes": 489350886400,
+              "slot_bytes": 532441676800
+            },
+            "1": {
+              "union": 222111,
+              "slots": 284474,
+              "expert_bytes": 1305600,
+              "union_bytes": 289988121600,
+              "slot_bytes": 371409254400
+            },
+            "2": {
+              "union": 228598,
+              "slots": 286120,
+              "expert_bytes": 1868800,
+              "union_bytes": 427203942400,
+              "slot_bytes": 534701056000
+            },
+            "3": {
+              "union": 184993,
+              "slots": 296818,
+              "expert_bytes": 1305600,
+              "union_bytes": 241526860800,
+              "slot_bytes": 387525580800
+            },
+            "4": {
+              "union": 210504,
+              "slots": 299052,
+              "expert_bytes": 1868800,
+              "union_bytes": 393389875200,
+              "slot_bytes": 558868377600
+            },
+            "5": {
+              "union": 207582,
+              "slots": 286784,
+              "expert_bytes": 1408000,
+              "union_bytes": 292275456000,
+              "slot_bytes": 403791872000
+            },
+            "6": {
+              "union": 208264,
+              "slots": 277967,
+              "expert_bytes": 1305600,
+              "union_bytes": 271909478400,
+              "slot_bytes": 362913715200
+            },
+            "7": {
+              "union": 199215,
+              "slots": 263779,
+              "expert_bytes": 1305600,
+              "union_bytes": 260095104000,
+              "slot_bytes": 344389862400
+            },
+            "8": {
+              "union": 190100,
+              "slots": 292259,
+              "expert_bytes": 1868800,
+              "union_bytes": 355258880000,
+              "slot_bytes": 546173619200
+            },
+            "9": {
+              "union": 173945,
+              "slots": 275986,
+              "expert_bytes": 1408000,
+              "union_bytes": 244914560000,
+              "slot_bytes": 388588288000
+            },
+            "10": {
+              "union": 193490,
+              "slots": 278904,
+              "expert_bytes": 1408000,
+              "union_bytes": 272433920000,
+              "slot_bytes": 392696832000
+            },
+            "11": {
+              "union": 197850,
+              "slots": 300032,
+              "expert_bytes": 1305600,
+              "union_bytes": 258312960000,
+              "slot_bytes": 391721779200
+            },
+            "12": {
+              "union": 217419,
+              "slots": 284973,
+              "expert_bytes": 1510400,
+              "union_bytes": 328389657600,
+              "slot_bytes": 430423219200
+            },
+            "13": {
+              "union": 186577,
+              "slots": 262267,
+              "expert_bytes": 1305600,
+              "union_bytes": 243594931200,
+              "slot_bytes": 342415795200
+            },
+            "14": {
+              "union": 197220,
+              "slots": 282428,
+              "expert_bytes": 1408000,
+              "union_bytes": 277685760000,
+              "slot_bytes": 397658624000
+            },
+            "15": {
+              "union": 151340,
+              "slots": 277307,
+              "expert_bytes": 1510400,
+              "union_bytes": 228583936000,
+              "slot_bytes": 418844492800
+            },
+            "16": {
+              "union": 169383,
+              "slots": 283043,
+              "expert_bytes": 1305600,
+              "union_bytes": 221146444800,
+              "slot_bytes": 369540940800
+            },
+            "17": {
+              "union": 202501,
+              "slots": 296395,
+              "expert_bytes": 1510400,
+              "union_bytes": 305857510400,
+              "slot_bytes": 447675008000
+            },
+            "18": {
+              "union": 216525,
+              "slots": 282180,
+              "expert_bytes": 1868800,
+              "union_bytes": 404641920000,
+              "slot_bytes": 527337984000
+            },
+            "19": {
+              "union": 189531,
+              "slots": 279074,
+              "expert_bytes": 1408000,
+              "union_bytes": 266859648000,
+              "slot_bytes": 392936192000
+            },
+            "20": {
+              "union": 192744,
+              "slots": 280535,
+              "expert_bytes": 1868800,
+              "union_bytes": 360199987200,
+              "slot_bytes": 524263808000
+            },
+            "21": {
+              "union": 201758,
+              "slots": 285991,
+              "expert_bytes": 1510400,
+              "union_bytes": 304735283200,
+              "slot_bytes": 431960806400
+            },
+            "22": {
+              "union": 226556,
+              "slots": 284009,
+              "expert_bytes": 1868800,
+              "union_bytes": 423387852800,
+              "slot_bytes": 530756019200
+            },
+            "23": {
+              "union": 194428,
+              "slots": 295322,
+              "expert_bytes": 1868800,
+              "union_bytes": 363347046400,
+              "slot_bytes": 551897753600
+            },
+            "24": {
+              "union": 198171,
+              "slots": 291482,
+              "expert_bytes": 1868800,
+              "union_bytes": 370341964800,
+              "slot_bytes": 544721561600
+            },
+            "25": {
+              "union": 184631,
+              "slots": 277144,
+              "expert_bytes": 1408000,
+              "union_bytes": 259960448000,
+              "slot_bytes": 390218752000
+            },
+            "26": {
+              "union": 201902,
+              "slots": 280350,
+              "expert_bytes": 1510400,
+              "union_bytes": 304952780800,
+              "slot_bytes": 423440640000
+            },
+            "27": {
+              "union": 202538,
+              "slots": 296769,
+              "expert_bytes": 1305600,
+              "union_bytes": 264433612800,
+              "slot_bytes": 387461606400
+            },
+            "28": {
+              "union": 217458,
+              "slots": 282620,
+              "expert_bytes": 2329600,
+              "union_bytes": 506590156800,
+              "slot_bytes": 658391552000
+            },
+            "29": {
+              "union": 188629,
+              "slots": 262120,
+              "expert_bytes": 1971200,
+              "union_bytes": 371825484800,
+              "slot_bytes": 516690944000
+            },
+            "30": {
+              "union": 198220,
+              "slots": 281668,
+              "expert_bytes": 2329600,
+              "union_bytes": 461773312000,
+              "slot_bytes": 656173772800
+            },
+            "31": {
+              "union": 157022,
+              "slots": 278008,
+              "expert_bytes": 1766400,
+              "union_bytes": 277363660800,
+              "slot_bytes": 491073331200
+            },
+            "32": {
+              "union": 171100,
+              "slots": 278302,
+              "expert_bytes": 2329600,
+              "union_bytes": 398594560000,
+              "slot_bytes": 648332339200
+            },
+            "33": {
+              "union": 200496,
+              "slots": 296038,
+              "expert_bytes": 1868800,
+              "union_bytes": 374686924800,
+              "slot_bytes": 553235814400
+            },
+            "34": {
+              "union": 211154,
+              "slots": 279463,
+              "expert_bytes": 2329600,
+              "union_bytes": 491904358400,
+              "slot_bytes": 651037004800
+            },
+            "35": {
+              "union": 192096,
+              "slots": 285612,
+              "expert_bytes": 2176000,
+              "union_bytes": 418000896000,
+              "slot_bytes": 621491712000
+            },
+            "36": {
+              "union": 184178,
+              "slots": 278958,
+              "expert_bytes": 1715200,
+              "union_bytes": 315902105600,
+              "slot_bytes": 478468761600
+            },
+            "37": {
+              "union": 201941,
+              "slots": 286911,
+              "expert_bytes": 2329600,
+              "union_bytes": 470441753600,
+              "slot_bytes": 668387865600
+            },
+            "38": {
+              "union": 222814,
+              "slots": 283801,
+              "expert_bytes": 1971200,
+              "union_bytes": 439210956800,
+              "slot_bytes": 559428531200
+            },
+            "39": {
+              "union": 173330,
+              "slots": 291079,
+              "expert_bytes": 1868800,
+              "union_bytes": 323919104000,
+              "slot_bytes": 543968435200
+            },
+            "40": {
+              "union": 178410,
+              "slots": 303887,
+              "expert_bytes": 1510400,
+              "union_bytes": 269470464000,
+              "slot_bytes": 458990924800
+            },
+            "41": {
+              "union": 177056,
+              "slots": 275876,
+              "expert_bytes": 1715200,
+              "union_bytes": 303686451200,
+              "slot_bytes": 473182515200
+            },
+            "42": {
+              "union": 200512,
+              "slots": 281096,
+              "expert_bytes": 1971200,
+              "union_bytes": 395249254400,
+              "slot_bytes": 554096435200
+            },
+            "43": {
+              "union": 192387,
+              "slots": 303602,
+              "expert_bytes": 2329600,
+              "union_bytes": 448184755200,
+              "slot_bytes": 707271219200
+            },
+            "44": {
+              "union": 187080,
+              "slots": 279560,
+              "expert_bytes": 2176000,
+              "union_bytes": 407086080000,
+              "slot_bytes": 608322560000
+            },
+            "45": {
+              "union": 181483,
+              "slots": 274027,
+              "expert_bytes": 1715200,
+              "union_bytes": 311279641600,
+              "slot_bytes": 470011110400
+            },
+            "46": {
+              "union": 194142,
+              "slots": 278530,
+              "expert_bytes": 1971200,
+              "union_bytes": 382692710400,
+              "slot_bytes": 549038336000
+            },
+            "47": {
+              "union": 207506,
+              "slots": 290443,
+              "expert_bytes": 2176000,
+              "union_bytes": 451533056000,
+              "slot_bytes": 632003968000
+            }
+          },
+          "payload": {
+            "union_bytes": 16544174515200,
+            "slot_bytes": 23826372249600,
+            "saved_bytes": 7282197734400,
+            "pooled": 0.694363973746685,
+            "union_bytes_per_window": 2022515221.9070904,
+            "slot_bytes_per_window": 2912759443.7163815
+          }
+        },
+        {
+          "k": 8,
+          "windows": 8164,
+          "mean": 0.5703111575016082,
+          "p10": 0.48404255319148937,
+          "p90": 0.6469710534168904,
+          "pooled": 0.5701628713410115,
+          "union": 1901.1937775600195,
+          "predict": 0.7829243155700928,
+          "slots": 3334.4748897599216,
+          "per_layer": {
+            "0": {
+              "union": 479566,
+              "slots": 568765,
+              "expert_bytes": 1868800,
+              "union_bytes": 896212940800,
+              "slot_bytes": 1062908032000
+            },
+            "1": {
+              "union": 392406,
+              "slots": 567818,
+              "expert_bytes": 1305600,
+              "union_bytes": 512325273600,
+              "slot_bytes": 741343180800
+            },
+            "2": {
+              "union": 399394,
+              "slots": 571167,
+              "expert_bytes": 1868800,
+              "union_bytes": 746387507200,
+              "slot_bytes": 1067396889600
+            },
+            "3": {
+              "union": 286982,
+              "slots": 592468,
+              "expert_bytes": 1305600,
+              "union_bytes": 374683699200,
+              "slot_bytes": 773526220800
+            },
+            "4": {
+              "union": 345511,
+              "slots": 596941,
+              "expert_bytes": 1868800,
+              "union_bytes": 645690956800,
+              "slot_bytes": 1115563340800
+            },
+            "5": {
+              "union": 347622,
+              "slots": 572439,
+              "expert_bytes": 1408000,
+              "union_bytes": 489451776000,
+              "slot_bytes": 805994112000
+            },
+            "6": {
+              "union": 361378,
+              "slots": 554861,
+              "expert_bytes": 1305600,
+              "union_bytes": 471815116800,
+              "slot_bytes": 724426521600
+            },
+            "7": {
+              "union": 346106,
+              "slots": 526490,
+              "expert_bytes": 1305600,
+              "union_bytes": 451875993600,
+              "slot_bytes": 687385344000
+            },
+            "8": {
+              "union": 308489,
+              "slots": 583324,
+              "expert_bytes": 1868800,
+              "union_bytes": 576504243200,
+              "slot_bytes": 1090115891200
+            },
+            "9": {
+              "union": 274297,
+              "slots": 550906,
+              "expert_bytes": 1408000,
+              "union_bytes": 386210176000,
+              "slot_bytes": 775675648000
+            },
+            "10": {
+              "union": 319777,
+              "slots": 556684,
+              "expert_bytes": 1408000,
+              "union_bytes": 450246016000,
+              "slot_bytes": 783811072000
+            },
+            "11": {
+              "union": 314903,
+              "slots": 598901,
+              "expert_bytes": 1305600,
+              "union_bytes": 411137356800,
+              "slot_bytes": 781925145600
+            },
+            "12": {
+              "union": 371360,
+              "slots": 568823,
+              "expert_bytes": 1510400,
+              "union_bytes": 560902144000,
+              "slot_bytes": 859150259200
+            },
+            "13": {
+              "union": 309059,
+              "slots": 523448,
+              "expert_bytes": 1305600,
+              "union_bytes": 403507430400,
+              "slot_bytes": 683413708800
+            },
+            "14": {
+              "union": 318219,
+              "slots": 563777,
+              "expert_bytes": 1408000,
+              "union_bytes": 448052352000,
+              "slot_bytes": 793798016000
+            },
+            "15": {
+              "union": 215848,
+              "slots": 553533,
+              "expert_bytes": 1510400,
+              "union_bytes": 326016819200,
+              "slot_bytes": 836056243200
+            },
+            "16": {
+              "union": 251198,
+              "slots": 564947,
+              "expert_bytes": 1305600,
+              "union_bytes": 327964108800,
+              "slot_bytes": 737594803200
+            },
+            "17": {
+              "union": 326284,
+              "slots": 591602,
+              "expert_bytes": 1510400,
+              "union_bytes": 492819353600,
+              "slot_bytes": 893555660800
+            },
+            "18": {
+              "union": 374327,
+              "slots": 563276,
+              "expert_bytes": 1868800,
+              "union_bytes": 699542297600,
+              "slot_bytes": 1052650188800
+            },
+            "19": {
+              "union": 304227,
+              "slots": 557039,
+              "expert_bytes": 1408000,
+              "union_bytes": 428351616000,
+              "slot_bytes": 784310912000
+            },
+            "20": {
+              "union": 315713,
+              "slots": 559985,
+              "expert_bytes": 1868800,
+              "union_bytes": 590004454400,
+              "slot_bytes": 1046499968000
+            },
+            "21": {
+              "union": 342217,
+              "slots": 570901,
+              "expert_bytes": 1510400,
+              "union_bytes": 516884556800,
+              "slot_bytes": 862288870400
+            },
+            "22": {
+              "union": 396387,
+              "slots": 566931,
+              "expert_bytes": 1868800,
+              "union_bytes": 740768025600,
+              "slot_bytes": 1059480652800
+            },
+            "23": {
+              "union": 307842,
+              "slots": 589480,
+              "expert_bytes": 1868800,
+              "union_bytes": 575295129600,
+              "slot_bytes": 1101620224000
+            },
+            "24": {
+              "union": 321848,
+              "slots": 581809,
+              "expert_bytes": 1868800,
+              "union_bytes": 601469542400,
+              "slot_bytes": 1087284659200
+            },
+            "25": {
+              "union": 294026,
+              "slots": 553219,
+              "expert_bytes": 1408000,
+              "union_bytes": 413988608000,
+              "slot_bytes": 778932352000
+            },
+            "26": {
+              "union": 334785,
+              "slots": 559576,
+              "expert_bytes": 1510400,
+              "union_bytes": 505659264000,
+              "slot_bytes": 845183590400
+            },
+            "27": {
+              "union": 322634,
+              "slots": 592374,
+              "expert_bytes": 1305600,
+              "union_bytes": 421230950400,
+              "slot_bytes": 773403494400
+            },
+            "28": {
+              "union": 370581,
+              "slots": 564150,
+              "expert_bytes": 2329600,
+              "union_bytes": 863305497600,
+              "slot_bytes": 1314243840000
+            },
+            "29": {
+              "union": 313315,
+              "slots": 523178,
+              "expert_bytes": 1971200,
+              "union_bytes": 617606528000,
+              "slot_bytes": 1031288473600
+            },
+            "30": {
+              "union": 322896,
+              "slots": 562230,
+              "expert_bytes": 2329600,
+              "union_bytes": 752218521600,
+              "slot_bytes": 1309771008000
+            },
+            "31": {
+              "union": 229388,
+              "slots": 554947,
+              "expert_bytes": 1766400,
+              "union_bytes": 405190963200,
+              "slot_bytes": 980258380800
+            },
+            "32": {
+              "union": 260353,
+              "slots": 555523,
+              "expert_bytes": 2329600,
+              "union_bytes": 606518348800,
+              "slot_bytes": 1294146380800
+            },
+            "33": {
+              "union": 326101,
+              "slots": 590916,
+              "expert_bytes": 1868800,
+              "union_bytes": 609417548800,
+              "slot_bytes": 1104303820800
+            },
+            "34": {
+              "union": 364749,
+              "slots": 557818,
+              "expert_bytes": 2329600,
+              "union_bytes": 849719270400,
+              "slot_bytes": 1299492812800
+            },
+            "35": {
+              "union": 311664,
+              "slots": 570077,
+              "expert_bytes": 2176000,
+              "union_bytes": 678180864000,
+              "slot_bytes": 1240487552000
+            },
+            "36": {
+              "union": 299104,
+              "slots": 556813,
+              "expert_bytes": 1715200,
+              "union_bytes": 513023180800,
+              "slot_bytes": 955045657600
+            },
+            "37": {
+              "union": 339917,
+              "slots": 572747,
+              "expert_bytes": 2329600,
+              "union_bytes": 791870643200,
+              "slot_bytes": 1334271411200
+            },
+            "38": {
+              "union": 388010,
+              "slots": 566527,
+              "expert_bytes": 1971200,
+              "union_bytes": 764845312000,
+              "slot_bytes": 1116738022400
+            },
+            "39": {
+              "union": 267327,
+              "slots": 581029,
+              "expert_bytes": 1868800,
+              "union_bytes": 499580697600,
+              "slot_bytes": 1085826995200
+            },
+            "40": {
+              "union": 273663,
+              "slots": 606584,
+              "expert_bytes": 1510400,
+              "union_bytes": 413340595200,
+              "slot_bytes": 916184473600
+            },
+            "41": {
+              "union": 282691,
+              "slots": 550709,
+              "expert_bytes": 1715200,
+              "union_bytes": 484871603200,
+              "slot_bytes": 944576076800
+            },
+            "42": {
+              "union": 333889,
+              "slots": 561077,
+              "expert_bytes": 1971200,
+              "union_bytes": 658161996800,
+              "slot_bytes": 1105994982400
+            },
+            "43": {
+              "union": 300778,
+              "slots": 606028,
+              "expert_bytes": 2329600,
+              "union_bytes": 700692428800,
+              "slot_bytes": 1411802828800
+            },
+            "44": {
+              "union": 303445,
+              "slots": 558073,
+              "expert_bytes": 2176000,
+              "union_bytes": 660296320000,
+              "slot_bytes": 1214366848000
+            },
+            "45": {
+              "union": 293912,
+              "slots": 547015,
+              "expert_bytes": 1715200,
+              "union_bytes": 504117862400,
+              "slot_bytes": 938240128000
+            },
+            "46": {
+              "union": 318854,
+              "slots": 556030,
+              "expert_bytes": 1971200,
+              "union_bytes": 628525004800,
+              "slot_bytes": 1096046336000
+            },
+            "47": {
+              "union": 338304,
+              "slots": 579698,
+              "expert_bytes": 2176000,
+              "union_bytes": 736149504000,
+              "slot_bytes": 1261422848000
+            }
+          },
+          "payload": {
+            "union_bytes": 27202630400000,
+            "slot_bytes": 47559803878400,
+            "saved_bytes": 20357173478400,
+            "pooled": 0.5719668329489156,
+            "union_bytes_per_window": 3332022341.989221,
+            "slot_bytes_per_window": 5825551675.453209
+          }
+        }
+      ]
+    }
+  ],
+  "payload_source": "GGUF quantized gate/up/down weight payload, excluding scales, alignment, runtime repacking and cache policy"
+}

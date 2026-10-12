@@ -1,0 +1,1 @@
+check-loads: 75 #[cuda_module] families, every load through the shared slot

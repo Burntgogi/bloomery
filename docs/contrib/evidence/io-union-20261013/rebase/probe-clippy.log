@@ -1,0 +1,39 @@
+    Checking typenum v1.20.1
+    Checking cfg-if v1.0.5
+    Checking cpufeatures v0.2.17
+    Checking memchr v2.8.3
+    Checking bloomery-levers v0.1.0 (<local>/bloomery-native-contributions-20261013/step1-main/crates/levers)
+    Checking foldhash v0.1.5
+    Checking itoa v1.0.18
+    Checking equivalent v1.0.2
+    Checking libc v0.2.190
+    Checking thiserror v2.0.21
+    Checking zmij v1.0.23
+    Checking serde_core v1.0.229
+    Checking hashbrown v0.17.1
+    Checking crc32fast v1.5.2
+    Checking hashbrown v0.15.5
+    Checking indexmap v2.14.2
+    Checking generic-array v0.14.7
+    Checking memmap2 v0.9.11
+    Checking bloomery-threads v0.1.0 (<local>/bloomery-native-contributions-20261013/step1-main/crates/threads)
+    Checking object v0.36.7
+    Checking bloomery-gguf v0.1.0 (<local>/bloomery-native-contributions-20261013/step1-main/crates/gguf)
+    Checking block-buffer v0.10.4
+    Checking crypto-common v0.1.7
+    Checking digest v0.10.7
+    Checking sha2 v0.10.9
+    Checking sha1 v0.10.7
+    Checking bloomery-tokenizer v0.1.0 (<local>/bloomery-native-contributions-20261013/step1-main/crates/tokenizer)
+    Checking bloomery-qdot v0.1.0 (<local>/bloomery-native-contributions-20261013/step1-main/crates/qdot)
+    Checking bloomery-engram v0.1.0 (<local>/bloomery-native-contributions-20261013/step1-main/crates/engram)
+    Checking bloomery-refset v0.1.0 (<local>/bloomery-native-contributions-20261013/step1-main/crates/refset)
+    Checking bloomery-models v0.1.0 (<local>/bloomery-native-contributions-20261013/step1-main/crates/models)
+    Checking bloomery-placement v0.1.0 (<local>/bloomery-native-contributions-20261013/step1-main/crates/placement)
+    Checking bloomery-runtime v0.1.0 (<local>/bloomery-native-contributions-20261013/step1-main/crates/runtime)
+    Checking serde_json v1.0.151
+    Checking bloomery-hf v0.1.0 (<local>/bloomery-native-contributions-20261013/step1-main/crates/hf)
+    Checking bloomery-model v0.1.0 (<local>/bloomery-native-contributions-20261013/step1-main/crates/model)
+    Checking oxide-artifacts v0.2.1
+    Checking bloomery-gpu-gates v0.3.1 (<local>/bloomery-native-contributions-20261013/step1-main/crates/gpu-gates)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 7.60s

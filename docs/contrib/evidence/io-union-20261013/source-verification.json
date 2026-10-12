@@ -1,0 +1,8 @@
+{
+  "all_verified": true,
+  "refs": {
+    "refs/heads/contribution/flash-tier-cost-main-20261013": "3291449dd6ad32bbcba786f86d72b41c32ced7ea",
+    "refs/heads/contribution/native-hip-spike-main-20261013": "5c449b6b87f280c59179566853bf95ed68e77e3a",
+    "refs/heads/contribution/qwen35-generation-main-20261013": "f680f9f5adf019c4afb3c6289a2401c5fc9f22b1"
+  }
+}

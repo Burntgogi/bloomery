@@ -1,0 +1,322 @@
+[
+  {
+    "case": "code-p0",
+    "k": 1,
+    "windows": 8192,
+    "payload_ratio": 1.0,
+    "union_bytes_per_window": 838144000.0,
+    "repeated_bytes_per_window": 838144000.0,
+    "counts_ratio": 1.0,
+    "byte_only_break_even_tokens_per_pass": 1.0
+  },
+  {
+    "case": "code-p0",
+    "k": 2,
+    "windows": 8188,
+    "payload_ratio": 0.8272984415711536,
+    "union_bytes_per_window": 1386790450.024426,
+    "repeated_bytes_per_window": 1676288000.0,
+    "counts_ratio": 0.8276464032730826,
+    "byte_only_break_even_tokens_per_pass": 1.6545968831423072
+  },
+  {
+    "case": "code-p0",
+    "k": 4,
+    "windows": 8180,
+    "payload_ratio": 0.672999941750444,
+    "union_bytes_per_window": 2256283452.7139363,
+    "repeated_bytes_per_window": 3352576000.0,
+    "counts_ratio": 0.6731653677669112,
+    "byte_only_break_even_tokens_per_pass": 2.691999767001776
+  },
+  {
+    "case": "code-p0",
+    "k": 8,
+    "windows": 8164,
+    "payload_ratio": 0.5374774991043415,
+    "union_bytes_per_window": 3603868328.0744734,
+    "repeated_bytes_per_window": 6705152000.0,
+    "counts_ratio": 0.5374117696594807,
+    "byte_only_break_even_tokens_per_pass": 4.299819992834732
+  },
+  {
+    "case": "code-p128",
+    "k": 1,
+    "windows": 8192,
+    "payload_ratio": 1.0,
+    "union_bytes_per_window": 623124887.5,
+    "repeated_bytes_per_window": 623124887.5,
+    "counts_ratio": 1.0,
+    "byte_only_break_even_tokens_per_pass": 1.0
+  },
+  {
+    "case": "code-p128",
+    "k": 2,
+    "windows": 8188,
+    "payload_ratio": 0.8264063256042754,
+    "union_bytes_per_window": 1029897764.1426477,
+    "repeated_bytes_per_window": 1246236545.18808,
+    "counts_ratio": 0.8266667191650834,
+    "byte_only_break_even_tokens_per_pass": 1.6528126512085508
+  },
+  {
+    "case": "code-p128",
+    "k": 4,
+    "windows": 8180,
+    "payload_ratio": 0.6718963224086971,
+    "union_bytes_per_window": 1674689533.4963324,
+    "repeated_bytes_per_window": 2492482065.5256724,
+    "counts_ratio": 0.6718951291607762,
+    "byte_only_break_even_tokens_per_pass": 2.6875852896347885
+  },
+  {
+    "case": "code-p128",
+    "k": 8,
+    "windows": 8164,
+    "payload_ratio": 0.5367472439667829,
+    "union_bytes_per_window": 2675658539.1474767,
+    "repeated_bytes_per_window": 4984950680.646742,
+    "counts_ratio": 0.5364791467894807,
+    "byte_only_break_even_tokens_per_pass": 4.293977951734263
+  },
+  {
+    "case": "code-p256",
+    "k": 1,
+    "windows": 8192,
+    "payload_ratio": 1.0,
+    "union_bytes_per_window": 408249606.25,
+    "repeated_bytes_per_window": 408249606.25,
+    "counts_ratio": 1.0,
+    "byte_only_break_even_tokens_per_pass": 1.0
+  },
+  {
+    "case": "code-p256",
+    "k": 2,
+    "windows": 8188,
+    "payload_ratio": 0.8264294174765304,
+    "union_bytes_per_window": 674769883.7322911,
+    "repeated_bytes_per_window": 816488219.6384953,
+    "counts_ratio": 0.8263203932651214,
+    "byte_only_break_even_tokens_per_pass": 1.6528588349530609
+  },
+  {
+    "case": "code-p256",
+    "k": 4,
+    "windows": 8180,
+    "payload_ratio": 0.6721630118490916,
+    "union_bytes_per_window": 1097623881.8581908,
+    "repeated_bytes_per_window": 1632972749.9266503,
+    "counts_ratio": 0.6715571364467503,
+    "byte_only_break_even_tokens_per_pass": 2.688652047396366
+  },
+  {
+    "case": "code-p256",
+    "k": 8,
+    "windows": 8164,
+    "payload_ratio": 0.5377765617553797,
+    "union_bytes_per_window": 1756293625.477707,
+    "repeated_bytes_per_window": 3265842638.7065163,
+    "counts_ratio": 0.5367371096844987,
+    "byte_only_break_even_tokens_per_pass": 4.3022124940430375
+  },
+  {
+    "case": "code-p64",
+    "k": 1,
+    "windows": 8192,
+    "payload_ratio": 1.0,
+    "union_bytes_per_window": 730195503.125,
+    "repeated_bytes_per_window": 730195503.125,
+    "counts_ratio": 1.0,
+    "byte_only_break_even_tokens_per_pass": 1.0
+  },
+  {
+    "case": "code-p64",
+    "k": 2,
+    "windows": 8188,
+    "payload_ratio": 0.8270683473662441,
+    "union_bytes_per_window": 1207842935.8085003,
+    "repeated_bytes_per_window": 1460390715.779189,
+    "counts_ratio": 0.8273331465468544,
+    "byte_only_break_even_tokens_per_pass": 1.6541366947324883
+  },
+  {
+    "case": "code-p64",
+    "k": 4,
+    "windows": 8180,
+    "payload_ratio": 0.6728251915989548,
+    "union_bytes_per_window": 1965181612.1271393,
+    "repeated_bytes_per_window": 2920790773.98533,
+    "counts_ratio": 0.6728541716484198,
+    "byte_only_break_even_tokens_per_pass": 2.6913007663958193
+  },
+  {
+    "case": "code-p64",
+    "k": 8,
+    "windows": 8164,
+    "payload_ratio": 0.5374305748898386,
+    "union_bytes_per_window": 3139447354.8260655,
+    "repeated_bytes_per_window": 5841586804.899559,
+    "counts_ratio": 0.5372198312176601,
+    "byte_only_break_even_tokens_per_pass": 4.299444599118709
+  },
+  {
+    "case": "prose-p0",
+    "k": 1,
+    "windows": 8192,
+    "payload_ratio": 1.0,
+    "union_bytes_per_window": 838144000.0,
+    "repeated_bytes_per_window": 838144000.0,
+    "counts_ratio": 1.0,
+    "byte_only_break_even_tokens_per_pass": 1.0
+  },
+  {
+    "case": "prose-p0",
+    "k": 2,
+    "windows": 8188,
+    "payload_ratio": 0.8315947466516102,
+    "union_bytes_per_window": 1393992294.6751344,
+    "repeated_bytes_per_window": 1676288000.0,
+    "counts_ratio": 0.8307990097296857,
+    "byte_only_break_even_tokens_per_pass": 1.6631894933032203
+  },
+  {
+    "case": "prose-p0",
+    "k": 4,
+    "windows": 8180,
+    "payload_ratio": 0.6936027443755572,
+    "union_bytes_per_window": 2325355914.327628,
+    "repeated_bytes_per_window": 3352576000.0,
+    "counts_ratio": 0.6921384729013855,
+    "byte_only_break_even_tokens_per_pass": 2.774410977502229
+  },
+  {
+    "case": "prose-p0",
+    "k": 8,
+    "windows": 8164,
+    "payload_ratio": 0.5709077369372278,
+    "union_bytes_per_window": 3828023154.140127,
+    "repeated_bytes_per_window": 6705152000.0,
+    "counts_ratio": 0.5691932250837008,
+    "byte_only_break_even_tokens_per_pass": 4.567261895497823
+  },
+  {
+    "case": "prose-p128",
+    "k": 1,
+    "windows": 8192,
+    "payload_ratio": 1.0,
+    "union_bytes_per_window": 610975984.375,
+    "repeated_bytes_per_window": 610975984.375,
+    "counts_ratio": 1.0,
+    "byte_only_break_even_tokens_per_pass": 1.0
+  },
+  {
+    "case": "prose-p128",
+    "k": 2,
+    "windows": 8188,
+    "payload_ratio": 0.8336510871280306,
+    "union_bytes_per_window": 1018666073.6687835,
+    "repeated_bytes_per_window": 1221933359.6482658,
+    "counts_ratio": 0.8327433026608041,
+    "byte_only_break_even_tokens_per_pass": 1.6673021742560612
+  },
+  {
+    "case": "prose-p128",
+    "k": 4,
+    "windows": 8180,
+    "payload_ratio": 0.696922921555503,
+    "union_bytes_per_window": 1703156051.2469437,
+    "repeated_bytes_per_window": 2443822693.398533,
+    "counts_ratio": 0.6952499456820028,
+    "byte_only_break_even_tokens_per_pass": 2.787691686222012
+  },
+  {
+    "case": "prose-p128",
+    "k": 8,
+    "windows": 8164,
+    "payload_ratio": 0.5750255779747907,
+    "union_bytes_per_window": 2810476614.9926505,
+    "repeated_bytes_per_window": 4887568001.567859,
+    "counts_ratio": 0.5730379757404548,
+    "byte_only_break_even_tokens_per_pass": 4.600204623798326
+  },
+  {
+    "case": "prose-p256",
+    "k": 1,
+    "windows": 8192,
+    "payload_ratio": 1.0,
+    "union_bytes_per_window": 404991909.375,
+    "repeated_bytes_per_window": 404991909.375,
+    "counts_ratio": 1.0,
+    "byte_only_break_even_tokens_per_pass": 1.0
+  },
+  {
+    "case": "prose-p256",
+    "k": 2,
+    "windows": 8188,
+    "payload_ratio": 0.8330805390304501,
+    "union_bytes_per_window": 674768217.2936004,
+    "repeated_bytes_per_window": 809967566.9760625,
+    "counts_ratio": 0.8321413359321403,
+    "byte_only_break_even_tokens_per_pass": 1.6661610780609002
+  },
+  {
+    "case": "prose-p256",
+    "k": 4,
+    "windows": 8180,
+    "payload_ratio": 0.6960066084644216,
+    "union_bytes_per_window": 1127461601.9559903,
+    "repeated_bytes_per_window": 1619900713.9364302,
+    "counts_ratio": 0.69424536642375,
+    "byte_only_break_even_tokens_per_pass": 2.7840264338576866
+  },
+  {
+    "case": "prose-p256",
+    "k": 8,
+    "windows": 8164,
+    "payload_ratio": 0.5740273213849372,
+    "union_bytes_per_window": 1859687785.987261,
+    "repeated_bytes_per_window": 3239719986.673199,
+    "counts_ratio": 0.5718944856028578,
+    "byte_only_break_even_tokens_per_pass": 4.592218571079497
+  },
+  {
+    "case": "prose-p64",
+    "k": 1,
+    "windows": 8192,
+    "payload_ratio": 1.0,
+    "union_bytes_per_window": 728195371.875,
+    "repeated_bytes_per_window": 728195371.875,
+    "counts_ratio": 1.0,
+    "byte_only_break_even_tokens_per_pass": 1.0
+  },
+  {
+    "case": "prose-p64",
+    "k": 2,
+    "windows": 8188,
+    "payload_ratio": 0.8320467253991887,
+    "union_bytes_per_window": 1211779160.9184172,
+    "repeated_bytes_per_window": 1456383546.6536396,
+    "counts_ratio": 0.8312094170292559,
+    "byte_only_break_even_tokens_per_pass": 1.6640934507983773
+  },
+  {
+    "case": "prose-p64",
+    "k": 4,
+    "windows": 8180,
+    "payload_ratio": 0.694363973746685,
+    "union_bytes_per_window": 2022515221.9070904,
+    "repeated_bytes_per_window": 2912759443.7163815,
+    "counts_ratio": 0.6928269162915616,
+    "byte_only_break_even_tokens_per_pass": 2.77745589498674
+  },
+  {
+    "case": "prose-p64",
+    "k": 8,
+    "windows": 8164,
+    "payload_ratio": 0.5719668329489156,
+    "union_bytes_per_window": 3332022341.989221,
+    "repeated_bytes_per_window": 5825551675.453209,
+    "counts_ratio": 0.5701628713410115,
+    "byte_only_break_even_tokens_per_pass": 4.575734663591325
+  }
+]

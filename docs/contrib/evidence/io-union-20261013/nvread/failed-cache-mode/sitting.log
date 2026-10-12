@@ -1,0 +1,57 @@
+[lease] card: docs/cards/nvread-contributor.card sha256=7a6f630185ac561b19dc9705dd56e8a795cfcdd438a96e45858e5b047726f91b
+[lease] card | # Contributor host-only calibration; this is not the maintainer drive's reference band.
+[lease] card | # Eight blocking workers can hide up to eight serial request latencies [derived ceiling,
+[lease] card | # assuming equal requests and no bandwidth cap]. Shared bandwidth, CPU work and joining
+[lease] card | # can leave the ratio near or below one. No inference speed is predicted by this card.
+[lease] card | kind: calibration
+[lease] card | question: how does this contributor's SSD read expert batches as blocking read workers increase?
+[lease] card | term: probe_nvread k8 directN median GB/s at threads 8 divided by threads 1, same seed per round,
+[lease] card |   alongside all cache/direct1/directN k1,k2,k4,k8 and contiguous range reference rows
+[lease] card | unit: ratio
+[lease] card | predict: 1.0..8.0
+[lease] card | reason: collect a drive-specific worker-count curve and request-size reference for the paged verify IO term
+[lease] card | condition: existing lease-hold runner with a contributor lock directory; no GPU timed or opened;
+[lease] card |   existing probe_nvread mincore cold/full checks and aligned O_DIRECT reads; three rounds with rotated
+[lease] card |   worker order and the same draws within each round; drive counters, pressure and foreign-process IO
+[lease] card |   recorded around each child; neither drive/controller caches nor other services are reset;
+[lease] card |   a read-byte reconciliation outside five percent marks the run contaminated, retaining its output
+[lease] card | decide-in: carry the drive-specific curve into the paged IO discussion, separately from native inference
+[lease] card | decide-below: examine worker overhead and recorded contention before proposing deeper IO queues
+[lease] card | decide-above: audit byte accounting, warm-drive effects and the instrument before using the ratio
+[lease] card: ok kind=calibration (no ruler: not an ab card)
+[lease] held by pid 736618 at 2026-10-12T18:51:52Z
+[lease] netdata: not active
+[lease-hold] command: timeout --kill-after=10 600 python3 <local>/bloomery-native-contributions-20261013/followup/nvread-sweep.py --tree <local>/bloomery-native-contributions-20261013/step1-main --binary <local>/bloomery-native-contributions-20261013/step1/target/release/probe_nvread --out <local>/bloomery-native-contributions-20261013/followup/evidence/nvread
+--- witness pre 2026-10-12T18:51:52Z epoch 1791831112 ---
+    loadavg: 4.26 6.23 7.47 5/1375 736659
+    pressure-cpu: some avg10=27.39 avg60=11.22 avg300=7.71 total=3268170576
+    pressure-io: some avg10=0.44 avg60=1.90 avg300=0.83 total=254263070
+    meminfo cached/free kB: 13273776 6403224
+    pgmajfault: 12887786
+timeout: failed to run command ‘nvidia-smi’: No such file or directory
+    gpu-apps: unavailable (rc 127)
+    busiest: strata 181% | chrome-remote-d 7.3% | kworker/0:3-eve 3.6% | Xorg 3.3% |
+    lock-holder-pid: 736618
+r1-t1: rc=1 rows=6 device/probe=2.475253484681473 reconciled=False
+command: <local>/bloomery-native-contributions-20261013/step1/target/release/probe_nvread --ks 1,2,4,8 --threads 1 --batches 32 --warmup 2 --range-from 480 --range-batches 4 --seed 11071 --lease
+probe_nvread: 48 layers x 512 experts, 1 threads, seed 11071, lease true
+nvread arm=cache case=k1 experts=1 threads=1 batches=32 warmup=2 redraws=8 bytes=1697600 span_bytes=1709568 read_bytes=58470400 median=0.806 p10=0.738 p90=0.961 ms=2.017 seed=11071 lease=true draws=[18:101,2:3,22:112,24:249,29:124,15:424,31:338,10:401,36:144,10:139,15:137,33:481,15:454,20:457,26:324,28:75,23:340,27:39,24:502,33:228,6:417,21:396,31:499,5:205,2:335,10:122,10:193,8:110,29:122,31:342,20:30,32:351,3:401,17:503]
+nvread arm=direct1 case=k1 experts=1 threads=1 batches=32 warmup=2 redraws=8 bytes=1697600 span_bytes=1709568 read_bytes=58470400 median=1.588 p10=1.332 p90=1.900 ms=1.078 seed=11071 lease=true
+nvread arm=directN case=k1 experts=1 threads=1 batches=32 warmup=2 redraws=8 bytes=1697600 span_bytes=1709568 read_bytes=58470400 median=1.535 p10=1.411 p90=1.781 ms=1.102 seed=11071 lease=true
+nvread arm=cache case=k2 experts=2 threads=1 batches=32 warmup=2 redraws=19 bytes=3372800 span_bytes=3395840 read_bytes=116178944 median=0.815 p10=0.683 p90=0.935 ms=4.102 seed=11071 lease=true draws=[19:368,30:197,30:15,25:363,27:7,2:431,31:17,2:387,16:482,3:149,39:38,33:327,10:150,28:207,8:27,10:202,30:216,12:235,23:216,17:26,31:15,0:491,3:489,11:340,36:366,7:109,25:126,0:206,1:199,20:461,33:465,25:389,4:57,34:183,34:383,4:112,20:440,35:136,10:484,17:420,4:87,15:271,8:443,28:81,9:185,10:414,5:381,14:476,5:348,12:438,4:487,35:48,10:323,25:452,4:504,12:501,12:474,36:131,33:377,11:138,3:298,9:379,37:307,36:463,34:216,26:408,1:101,26:355]
+nvread arm=direct1 case=k2 experts=2 threads=1 batches=32 warmup=2 redraws=19 bytes=3372800 span_bytes=3395840 read_bytes=116178944 median=1.490 p10=1.123 p90=1.802 ms=2.179 seed=11071 lease=true
+nvread arm=directN case=k2 experts=2 threads=1 batches=32 warmup=2 redraws=19 bytes=3372800 span_bytes=3395840 read_bytes=116178944 median=1.421 p10=1.205 p90=1.712 ms=2.283 seed=11071 lease=true
+probe_nvread: 51 batches redrawn because dropped runs stayed resident (the last: 140 pages): another process holds or maps this file's pages
+
+--- witness post 2026-10-12T18:51:53Z epoch 1791831113 ---
+    loadavg: 4.26 6.23 7.47 6/1375 736913
+    pressure-cpu: some avg10=27.14 avg60=11.70 avg300=7.84 total=3268476540
+    pressure-io: some avg10=0.36 avg60=1.83 avg300=0.82 total=254305530
+    meminfo cached/free kB: 13295456 6304704
+    pgmajfault: 12888485
+timeout: failed to run command ‘nvidia-smi’: No such file or directory
+    gpu-apps: unavailable (rc 127)
+    busiest: strata 182% | chrome-remote-d 7.3% | kworker/0:3-eve 3.5% | Xorg 3.3% |
+    lock-holder-pid: 736618
+[lease-hold] rc=1 held=1 s
+[lease] released at 2026-10-12T18:51:53Z

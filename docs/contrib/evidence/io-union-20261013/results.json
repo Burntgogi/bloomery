@@ -1,0 +1,107 @@
+{
+  "repository": "https://github.com/midagedev/bloomery",
+  "upstream_main": "eb186d979602a3e150967541ffb86bfea157866b",
+  "tasks": [
+    {
+      "number": 1,
+      "name": "Rebase all three contribution branches",
+      "status": "source_and_host_checks_complete",
+      "worktrees": [
+        {
+          "step": 1,
+          "original_commit": "b948a27d5e76ed8852aa4b3bfb3445ae58f6a69a",
+          "rebased_commit": "fd6f5daf97cb6a9c6311fc6eaf621f9544f83fb1",
+          "branch": "contribution/flash-tier-cost-main-20261013",
+          "diff": " crates/gpu-gates/src/bin/probe_nvread.rs        | 151 ++++++++++++++++--------\n docs/cards/nvread-contributor.card              |  20 ++++\n docs/contrib/nvread-worker-curve-20261013.md    |  48 ++++++++\n docs/contrib/qwen38-read-ahead-cost-20261013.md |  58 +++++++++\n docs/contrib/qwen38-window-union-20261013.md    |  33 ++++++\n tools/ref/router-coverage.py                    | 111 +++++++++++++++--\n tools/ref/window-union.py                       | 100 +++++++++++++++-\n 7 files changed, 460 insertions(+), 61 deletions(-)\n",
+          "final_commit": "3291449dd6ad32bbcba786f86d72b41c32ced7ea",
+          "clean": true
+        },
+        {
+          "step": 2,
+          "original_commit": "3a17df85726f5cff6ee9428f1d93920478c355fc",
+          "rebased_commit": "126a2ce42be04fa233a74c4d56a7cb7695dabb1c",
+          "branch": "contribution/native-hip-spike-main-20261013",
+          "diff": " Cargo.toml                        |   2 +-\n labs/hip-native/.gitignore        |   1 +\n labs/hip-native/Cargo.lock        |  92 ++++++++\n labs/hip-native/Cargo.toml        |   9 +\n labs/hip-native/README.md         |  56 +++++\n labs/hip-native/device/Cargo.toml |   9 +\n labs/hip-native/device/src/lib.rs | 187 +++++++++++++++\n labs/hip-native/host/Cargo.toml   |   9 +\n labs/hip-native/host/build.rs     |   8 +\n labs/hip-native/host/src/main.rs  | 474 ++++++++++++++++++++++++++++++++++++++\n 10 files changed, 846 insertions(+), 1 deletion(-)\n",
+          "final_commit": "5c449b6b87f280c59179566853bf95ed68e77e3a",
+          "clean": true
+        },
+        {
+          "step": 3,
+          "original_commit": "a98f4ee8e617277e21274572ef22ce134aa20a04",
+          "rebased_commit": "983b915363483dcef08ee96bc5c9c9e62e5d24d8",
+          "branch": "contribution/qwen35-generation-main-20261013",
+          "diff": " crates/gpu-gates/examples/qwen35_admission.rs      |  59 +++++++++\n crates/gpu-gates/src/bin/bloomery_serve.rs         |  24 ++--\n crates/gpu-gates/src/bin/generate_qwen3moe.rs      |  10 +-\n crates/gpu-gates/src/bin/shared/qwen3moe_place.rs  |   6 +-\n .../gpu-gates/src/bin/shared/serve_seats/qwen3.rs  |  64 +++++-----\n crates/gpu-gates/src/lib.rs                        |   1 +\n crates/gpu-gates/src/qwen_seat.rs                  |  70 ++++++++++\n docs/contrib/qwen35-generation-20261013.md         | 142 +++++++++++++++++++++\n tools/gate-paths.tsv                               |   2 +-\n tools/hf-arch-check.py                             |   6 +-\n 10 files changed, 335 insertions(+), 49 deletions(-)\n",
+          "final_commit": "f680f9f5adf019c4afb3c6289a2401c5fc9f22b1",
+          "clean": true
+        }
+      ],
+      "native_cuda_execution": false,
+      "hip_gpu_rerun": false,
+      "prediction_json_unchanged": true
+    },
+    {
+      "number": 2,
+      "name": "SSD worker-count and expert batch calibration",
+      "status": "complete_with_recorded_concurrent_CPU_load",
+      "probe_mode": "explicit O_DIRECT only; default cache mode retained",
+      "runs": 12,
+      "records": 72,
+      "worker_counts": [
+        1,
+        2,
+        4,
+        8
+      ],
+      "batch_sizes": [
+        1,
+        2,
+        4,
+        8
+      ],
+      "all_reconciled": true,
+      "quiet_repeat_needed_for_performance_decisions": true,
+      "native_serving_throughput": false,
+      "report": "nvread-report.md"
+    },
+    {
+      "number": 3,
+      "name": "Byte-weighted multi-row expert unions",
+      "status": "complete_for_existing_CPU_input_traces",
+      "corpora": [
+        "prose",
+        "code"
+      ],
+      "tokens_per_corpus": 8192,
+      "layers": 48,
+      "window_rows": [
+        1,
+        2,
+        4,
+        8
+      ],
+      "assumed_card_prefixes": [
+        0,
+        64,
+        128,
+        256
+      ],
+      "native_decode_trace": false,
+      "speculative_acceptance_modelled": false,
+      "report": "union-report.md"
+    }
+  ],
+  "checks": {
+    "frontend_check": true,
+    "frontend_clippy_zero_warnings": true,
+    "hip_host_test_and_clippy": true,
+    "hip_device_build": true,
+    "probe_tests": 6,
+    "probe_clippy_zero_warnings": true,
+    "qwen_real_file_admission": "expected refusal, 314 items",
+    "qwen_full_recipe_check": true,
+    "analyzer_full_recipe_check": true,
+    "initial_analyzer_failure": "Unchanged batch mock single-call count failed once; full rerun passed without changing runner or thresholds."
+  },
+  "source_pushed_to_fork": true,
+  "new_upstream_pr_or_issue_comment_created": false
+}

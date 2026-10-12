@@ -1,0 +1,20 @@
+command: cargo test --locked -p bloomery-hip-spike
+   Compiling proc-macro2 v1.0.107
+   Compiling unicode-ident v1.0.27
+   Compiling quote v1.0.47
+   Compiling libc v0.2.190
+   Compiling thiserror v2.0.21
+   Compiling bloomery-hip-spike v0.1.0 (<local>/bloomery-native-contributions-20261013/step2-main/labs/hip-native/host)
+   Compiling syn v3.0.9
+   Compiling memmap2 v0.9.11
+   Compiling thiserror-impl v2.0.21
+   Compiling bloomery-gguf v0.1.0 (<local>/bloomery-native-contributions-20261013/step2-main/crates/gguf)
+error: linking with `cc` failed: exit status: 1
+  |
+  = note:  "cc" "-m64" "<local>/bloomery-native-contributions-20261013/step2/labs/hip-native/target/debug/build/bloomery-hip-spike/c17a7ee7ef53ef9d/out/rustcVUIW4q/symbols.o" "<31 object files omitted>" "-Wl,--as-needed" "-Wl,-Bdynamic" "-lamdhip64" "-Wl,-Bstatic" "<local>/bloomery-native-contributions-20261013/step2/labs/hip-native/target/debug/build/bloomery-gguf/8528fb0602820047/out/libgguf-8528fb0602820047.rlib" "<local>/bloomery-native-contributions-20261013/step2/labs/hip-native/target/debug/build/thiserror/890d1822d9ffdabb/out/libthiserror-890d1822d9ffdabb.rlib" "<local>/bloomery-native-contributions-20261013/step2/labs/hip-native/target/debug/build/memmap2/72b64abbd09978d9/out/libmemmap2-72b64abbd09978d9.rlib" "<local>/bloomery-native-contributions-20261013/step2/labs/hip-native/target/debug/build/libc/dce9739dd25972a7/out/liblibc-dce9739dd25972a7.rlib" "<sysroot>/lib/rustlib/x86_64-unknown-linux-gnu/lib/{libtest-*,libgetopts-*,librustc_std_workspace_std-*,libstd-*,libpanic_unwind-*,libobject-*,libmemchr-*,libaddr2line-*,libgimli-*,libcfg_if-*,librustc_demangle-*,libstd_detect-*,libhashbrown-*,librustc_std_workspace_alloc-*,libminiz_oxide-*,libadler2-*,libunwind-*,liblibc-*,librustc_std_workspace_core-*,liballoc-*,libcore-*,libcompiler_builtins-*}.rlib" "-Wl,-Bdynamic" "-lgcc_s" "-lutil" "-lrt" "-lpthread" "-lm" "-ldl" "-lc" "-L" "<local>/bloomery-native-contributions-20261013/step2/labs/hip-native/target/debug/build/bloomery-hip-spike/c17a7ee7ef53ef9d/out/rustcVUIW4q/raw-dylibs" "-B<sysroot>/lib/rustlib/x86_64-unknown-linux-gnu/bin/gcc-ld" "-fuse-ld=lld" "-Wl,--eh-frame-hdr" "-Wl,-z,noexecstack" "-L" "<local>/Strata/.venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx110X_dgpu/lib" "-L" "<sysroot>/lib/rustlib/x86_64-unknown-linux-gnu/lib" "-o" "<local>/bloomery-native-contributions-20261013/step2/labs/hip-native/target/debug/build/bloomery-hip-spike/c17a7ee7ef53ef9d/out/bloomery_hip_spike-c17a7ee7ef53ef9d" "-Wl,--gc-sections" "-pie" "-Wl,-z,relro,-z,now" "-nodefaultlibs" "-Wl,-rpath,<local>/Strata/.venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx110X_dgpu/lib"
+  = note: some arguments are omitted. use `--verbose` to show all linker arguments
+  = note: rust-lld: error: unable to find library -lamdhip64
+          clang: error: linker command failed with exit code 1 (use -v to see invocation)
+
+
+error: could not compile `bloomery-hip-spike` (bin "bloomery-hip-spike" test) due to 1 previous error

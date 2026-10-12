@@ -1,0 +1,43 @@
+command: cargo test --locked -p bloomery-models
+   Compiling bloomery-gguf v0.1.0 (<local>/bloomery-native-contributions-20261013/step3-main/crates/gguf)
+   Compiling bloomery-models v0.1.0 (<local>/bloomery-native-contributions-20261013/step3-main/crates/models)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.75s
+     Running unittests src/lib.rs (<local>/bloomery-native-contributions-20261013/step3/target/debug/build/bloomery-models/cdd485449ae786a6/out/models-cdd485449ae786a6)
+
+running 19 tests
+test headpick::tests::a_row_list_is_refused_by_name ... ok
+test shape::tests::a_pair_of_widths_no_row_holds_is_refused_by_name ... ok
+test shape::tests::no_two_router_rows_overlap ... ok
+test shape::tests::the_biased_sigmoid_rule_is_glm_5_3_flashs ... ok
+test shape::tests::the_k192_row_takes_its_groups_only ... ok
+test tests::swiglu_limit_is_zero_without_a_limit_and_the_limit_with_one ... ok
+test shape::tests::the_shape_follows_the_description ... ok
+test shape::tests::a_norm_argument_row_serves_both_norms_and_only_it ... ok
+test shape::tests::every_model_the_tree_runs_selects_its_router ... ok
+test shape::tests::glm_5_3_flash_router_is_its_row ... ok
+test shape::tests::mimo_v2_router_is_its_row_beside_glms ... ok
+test shape::tests::mimo_v2_selects_the_k192_row ... ok
+test shape::tests::a_window_sinks_or_value_scale_is_refused_by_name ... ok
+test headpick::tests::a_row_list_reads ... ok
+test shape::tests::a_width_between_rows_is_refused ... ok
+test shape::tests::an_attention_no_flash_takes_is_refused ... ok
+test shape::tests::every_attention_the_tree_runs_selects_its_flash ... ok
+test shape::tests::gqa_rows_are_distinct_and_packed_rows_divide ... ok
+test shape::tests::a_top_k_outside_the_row_is_refused ... ok
+
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/head_coverage.rs (<local>/bloomery-native-contributions-20261013/step3/target/debug/build/bloomery-models/dd8730a2598db852/out/head_coverage-dd8730a2598db852)
+
+running 3 tests
+test break_even_is_the_derived_one ... ok
+test every_set_misses_less_than_the_break_even ... ok
+test held_out_text_is_not_a_build_input ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
+
+   Doc-tests models
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s

@@ -1,0 +1,8 @@
+# The machine lease's trace (tools/ref/lease.sh). /var/log/netdata-lease-gate.log stays the timing source
+# (take and free at 0.5-2 s); this file adds the owner, the card and the pid.
+# <utc> take id=<epoch>.<pid> epoch=<s> pid=<runner pid> owner=<tree> [job=<queue job>] runner=<script> timing_gpu=<uuid[,uuid]|none> card_file=<card>
+# <utc> free id=<id> epoch=<s> held_s=<s> by=waiter|next-take   (next-take: no waiter line came first, the waiter died or the lease was free for less than one 0.5 s probe; held_s is an upper bound)
+# <utc> let_go id=<id> still_held=0|1|?   (tools/ref/lease-hold.sh exited; the lease may be held on by what it left running)
+2026-10-12T18:51:52Z take id=1791831112.736618 epoch=1791831112 pid=736618 owner=step1-main runner=lease-hold.sh timing_gpu=none card_file=docs/cards/nvread-contributor.card
+2026-10-12T18:51:53Z let_go id=1791831112.736618 still_held=0
+2026-10-12T18:51:53Z free id=1791831112.736618 epoch=1791831113 held_s=1 by=waiter

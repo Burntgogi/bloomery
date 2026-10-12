@@ -1,0 +1,20 @@
+# window-union — n_l 0-47:128, card list id prefix, k 1,2,4,8, policy static
+
+## prose-verified8192: 8192 tokens, chunk 2048, 48 layers, card 6144 experts (n_l 128..128), model Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf, build llama-prefill-gre-fb4b2737-local-adapter
+host slots per row 350.3 of 480
+k	windows	predict	mean	p10	p90	pooled	union/window	slots/window
+1	8192	1.000	1.000	1.000	1.000	1.000	350.3	350.3
+payload k=1 union_bytes=5005115264000 slot_bytes=5005115264000 saved_bytes=0 pooled=1.0
+2	8188	0.959	0.833	0.746	0.917	0.833	583.4	700.5
+payload k=2 union_bytes=8340837811200 slot_bytes=10005190348800 saved_bytes=1664352537600 pooled=0.8336510871280306
+4	8180	0.890	0.695	0.594	0.783	0.695	974.1	1401.0
+payload k=4 union_bytes=13931816499200 slot_bytes=19990469632000 saved_bytes=6058653132800 pooled=0.696922921555503
+8	8164	0.787	0.573	0.488	0.649	0.573	1605.6	2802.0
+payload k=8 union_bytes=22944731084800 slot_bytes=39902105164800 saved_bytes=16957374080000 pooled=0.5750255779747907
+layers	k=1	k=2	k=4	k=8	slots/row
+0-7	1.000	0.865	0.757	0.651	59.7
+8-15	1.000	0.821	0.672	0.543	58.1
+16-23	1.000	0.838	0.700	0.578	57.7
+24-31	1.000	0.835	0.691	0.561	58.0
+32-39	1.000	0.826	0.688	0.568	57.2
+40-47	1.000	0.811	0.663	0.535	59.6

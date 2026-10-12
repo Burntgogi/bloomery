@@ -1,0 +1,40 @@
+{
+  "tree": "<local>/bloomery-native-contributions-20261013/step1-main",
+  "commit": "fd6f5daf97cb6a9c6311fc6eaf621f9544f83fb1",
+  "binary": "<local>/bloomery-native-contributions-20261013/step1/target/release/probe_nvread",
+  "binary_sha256": "b6bca31cc44879ba77fd24306fd384a2bc792f52d844ff7ee9b548bebcb86990",
+  "model": "<local>/Strata-data/models/IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf",
+  "model_bytes": 47039860096,
+  "device": "nvme0n1",
+  "drive_model": "WD PC SN740 SDDPTQD-1T00",
+  "attachment": "NVMe; model filesystem ext4",
+  "queue": {
+    "scheduler": "[none] mq-deadline",
+    "read_ahead_kb": "128",
+    "max_sectors_kb": "128"
+  },
+  "rounds": 3,
+  "batches": 32,
+  "warmup": 2,
+  "ks": [
+    1,
+    2,
+    4,
+    8
+  ],
+  "threads": [
+    1,
+    2,
+    4,
+    8
+  ],
+  "range_from": 480,
+  "range_batches": 4,
+  "scope": "Native probe file IO only. Workers are an upper bound on outstanding blocking requests, not measured hardware queue depth. Fixed cache/direct1/directN/drive arm order; SSD/controller caches not reset. Foreign load is recorded, not stopped.",
+  "lease_directory": "<local>/.cache/bloomery-contributor-locks",
+  "kernel": "7.0.0-38-generic",
+  "probe_source_sha256": "a792090ccbfe2f429472615a61cc09ed8e65e5246492ecdf78c71fef76cfffba",
+  "probe_diff_from_main": "",
+  "working_tree_status": " M tools/ref/window-union.py\n?? docs/cards/nvread-contributor.card\n?? docs/contrib/qwen38-window-union-20261013.md\n",
+  "sweep_script_sha256": "b6368762ba66869fa7bf6a41312df2f4dbdd4b01fc0fbdcf5a85b5269d7c1273"
+}

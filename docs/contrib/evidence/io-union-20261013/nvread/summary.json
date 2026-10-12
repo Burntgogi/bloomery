@@ -1,0 +1,669 @@
+{
+  "rows": [
+    {
+      "case": "k1",
+      "arm": "directN",
+      "threads": 1,
+      "round_medians_GBps": [
+        1.314,
+        1.12,
+        1.404
+      ],
+      "median_of_round_medians_GBps": 1.314,
+      "range_GBps": [
+        1.12,
+        1.404
+      ],
+      "median_of_round_medians_ms": 1.256,
+      "round_medians_ms": [
+        1.256,
+        1.42,
+        1.221
+      ]
+    },
+    {
+      "case": "k1",
+      "arm": "directN",
+      "threads": 2,
+      "round_medians_GBps": [
+        1.692,
+        1.648,
+        1.895
+      ],
+      "median_of_round_medians_GBps": 1.692,
+      "range_GBps": [
+        1.648,
+        1.895
+      ],
+      "median_of_round_medians_ms": 0.94,
+      "round_medians_ms": [
+        1.067,
+        0.94,
+        0.884
+      ]
+    },
+    {
+      "case": "k1",
+      "arm": "directN",
+      "threads": 4,
+      "round_medians_GBps": [
+        2.435,
+        2.617,
+        2.194
+      ],
+      "median_of_round_medians_GBps": 2.435,
+      "range_GBps": [
+        2.194,
+        2.617
+      ],
+      "median_of_round_medians_ms": 0.713,
+      "round_medians_ms": [
+        0.713,
+        0.693,
+        0.822
+      ]
+    },
+    {
+      "case": "k1",
+      "arm": "directN",
+      "threads": 8,
+      "round_medians_GBps": [
+        2.435,
+        2.364,
+        2.264
+      ],
+      "median_of_round_medians_GBps": 2.364,
+      "range_GBps": [
+        2.264,
+        2.435
+      ],
+      "median_of_round_medians_ms": 0.742,
+      "round_medians_ms": [
+        0.705,
+        0.742,
+        0.759
+      ]
+    },
+    {
+      "case": "k2",
+      "arm": "directN",
+      "threads": 1,
+      "round_medians_GBps": [
+        1.498,
+        1.153,
+        1.38
+      ],
+      "median_of_round_medians_GBps": 1.38,
+      "range_GBps": [
+        1.153,
+        1.498
+      ],
+      "median_of_round_medians_ms": 2.499,
+      "round_medians_ms": [
+        2.499,
+        2.917,
+        2.454
+      ]
+    },
+    {
+      "case": "k2",
+      "arm": "directN",
+      "threads": 2,
+      "round_medians_GBps": [
+        1.849,
+        2.327,
+        2.183
+      ],
+      "median_of_round_medians_GBps": 2.183,
+      "range_GBps": [
+        1.849,
+        2.327
+      ],
+      "median_of_round_medians_ms": 1.552,
+      "round_medians_ms": [
+        1.813,
+        1.466,
+        1.552
+      ]
+    },
+    {
+      "case": "k2",
+      "arm": "directN",
+      "threads": 4,
+      "round_medians_GBps": [
+        2.825,
+        2.574,
+        2.561
+      ],
+      "median_of_round_medians_GBps": 2.574,
+      "range_GBps": [
+        2.561,
+        2.825
+      ],
+      "median_of_round_medians_ms": 1.341,
+      "round_medians_ms": [
+        1.341,
+        1.339,
+        1.35
+      ]
+    },
+    {
+      "case": "k2",
+      "arm": "directN",
+      "threads": 8,
+      "round_medians_GBps": [
+        2.835,
+        2.776,
+        2.503
+      ],
+      "median_of_round_medians_GBps": 2.776,
+      "range_GBps": [
+        2.503,
+        2.835
+      ],
+      "median_of_round_medians_ms": 1.311,
+      "round_medians_ms": [
+        1.311,
+        1.298,
+        1.422
+      ]
+    },
+    {
+      "case": "k4",
+      "arm": "directN",
+      "threads": 1,
+      "round_medians_GBps": [
+        1.339,
+        1.15,
+        1.423
+      ],
+      "median_of_round_medians_GBps": 1.339,
+      "range_GBps": [
+        1.15,
+        1.423
+      ],
+      "median_of_round_medians_ms": 5.093,
+      "round_medians_ms": [
+        5.093,
+        6.117,
+        4.792
+      ]
+    },
+    {
+      "case": "k4",
+      "arm": "directN",
+      "threads": 2,
+      "round_medians_GBps": [
+        2.127,
+        2.346,
+        1.889
+      ],
+      "median_of_round_medians_GBps": 2.127,
+      "range_GBps": [
+        1.889,
+        2.346
+      ],
+      "median_of_round_medians_ms": 3.188,
+      "round_medians_ms": [
+        3.188,
+        2.871,
+        3.708
+      ]
+    },
+    {
+      "case": "k4",
+      "arm": "directN",
+      "threads": 4,
+      "round_medians_GBps": [
+        2.617,
+        3.195,
+        2.711
+      ],
+      "median_of_round_medians_GBps": 2.711,
+      "range_GBps": [
+        2.617,
+        3.195
+      ],
+      "median_of_round_medians_ms": 2.592,
+      "round_medians_ms": [
+        2.592,
+        2.143,
+        2.667
+      ]
+    },
+    {
+      "case": "k4",
+      "arm": "directN",
+      "threads": 8,
+      "round_medians_GBps": [
+        3.381,
+        3.361,
+        2.124
+      ],
+      "median_of_round_medians_GBps": 3.361,
+      "range_GBps": [
+        2.124,
+        3.381
+      ],
+      "median_of_round_medians_ms": 2.069,
+      "round_medians_ms": [
+        2.029,
+        2.069,
+        3.27
+      ]
+    },
+    {
+      "case": "k8",
+      "arm": "directN",
+      "threads": 1,
+      "round_medians_GBps": [
+        1.275,
+        1.111,
+        1.333
+      ],
+      "median_of_round_medians_GBps": 1.275,
+      "range_GBps": [
+        1.111,
+        1.333
+      ],
+      "median_of_round_medians_ms": 11.011,
+      "round_medians_ms": [
+        11.011,
+        12.064,
+        10.397
+      ]
+    },
+    {
+      "case": "k8",
+      "arm": "directN",
+      "threads": 2,
+      "round_medians_GBps": [
+        2.081,
+        2.275,
+        2.279
+      ],
+      "median_of_round_medians_GBps": 2.275,
+      "range_GBps": [
+        2.081,
+        2.279
+      ],
+      "median_of_round_medians_ms": 6.392,
+      "round_medians_ms": [
+        6.768,
+        5.897,
+        6.392
+      ]
+    },
+    {
+      "case": "k8",
+      "arm": "directN",
+      "threads": 4,
+      "round_medians_GBps": [
+        3.188,
+        3.241,
+        2.666
+      ],
+      "median_of_round_medians_GBps": 3.188,
+      "range_GBps": [
+        2.666,
+        3.241
+      ],
+      "median_of_round_medians_ms": 4.401,
+      "round_medians_ms": [
+        4.401,
+        4.162,
+        5.148
+      ]
+    },
+    {
+      "case": "k8",
+      "arm": "directN",
+      "threads": 8,
+      "round_medians_GBps": [
+        3.703,
+        3.645,
+        2.567
+      ],
+      "median_of_round_medians_GBps": 3.645,
+      "range_GBps": [
+        2.567,
+        3.703
+      ],
+      "median_of_round_medians_ms": 3.808,
+      "round_medians_ms": [
+        3.808,
+        3.7,
+        5.437
+      ]
+    },
+    {
+      "case": "range",
+      "arm": "directN",
+      "threads": 1,
+      "round_medians_GBps": [
+        2.181,
+        1.798,
+        2.113
+      ],
+      "median_of_round_medians_GBps": 2.113,
+      "range_GBps": [
+        1.798,
+        2.181
+      ],
+      "median_of_round_medians_ms": 32.55,
+      "round_medians_ms": [
+        24.924,
+        32.55,
+        32.895
+      ]
+    },
+    {
+      "case": "range",
+      "arm": "directN",
+      "threads": 2,
+      "round_medians_GBps": [
+        2.372,
+        2.569,
+        2.632
+      ],
+      "median_of_round_medians_GBps": 2.569,
+      "range_GBps": [
+        2.372,
+        2.632
+      ],
+      "median_of_round_medians_ms": 23.348,
+      "round_medians_ms": [
+        22.751,
+        24.249,
+        23.348
+      ]
+    },
+    {
+      "case": "range",
+      "arm": "directN",
+      "threads": 4,
+      "round_medians_GBps": [
+        3.974,
+        3.597,
+        3.658
+      ],
+      "median_of_round_medians_GBps": 3.658,
+      "range_GBps": [
+        3.597,
+        3.974
+      ],
+      "median_of_round_medians_ms": 18.114,
+      "round_medians_ms": [
+        13.758,
+        18.114,
+        18.675
+      ]
+    },
+    {
+      "case": "range",
+      "arm": "directN",
+      "threads": 8,
+      "round_medians_GBps": [
+        4.547,
+        2.68,
+        4.131
+      ],
+      "median_of_round_medians_GBps": 4.131,
+      "range_GBps": [
+        2.68,
+        4.547
+      ],
+      "median_of_round_medians_ms": 16.222,
+      "round_medians_ms": [
+        12.425,
+        24.236,
+        16.222
+      ]
+    },
+    {
+      "case": "range",
+      "arm": "drive",
+      "threads": 1,
+      "round_medians_GBps": [
+        2.972,
+        2.332,
+        2.986
+      ],
+      "median_of_round_medians_GBps": 2.972,
+      "range_GBps": [
+        2.332,
+        2.986
+      ],
+      "median_of_round_medians_ms": 20.01,
+      "round_medians_ms": [
+        18.639,
+        25.744,
+        20.01
+      ]
+    },
+    {
+      "case": "range",
+      "arm": "drive",
+      "threads": 2,
+      "round_medians_GBps": [
+        3.281,
+        3.207,
+        3.093
+      ],
+      "median_of_round_medians_GBps": 3.207,
+      "range_GBps": [
+        3.093,
+        3.281
+      ],
+      "median_of_round_medians_ms": 19.262,
+      "round_medians_ms": [
+        17.481,
+        19.262,
+        22.21
+      ]
+    },
+    {
+      "case": "range",
+      "arm": "drive",
+      "threads": 4,
+      "round_medians_GBps": [
+        3.31,
+        3.163,
+        3.164
+      ],
+      "median_of_round_medians_GBps": 3.164,
+      "range_GBps": [
+        3.163,
+        3.31
+      ],
+      "median_of_round_medians_ms": 19.425,
+      "round_medians_ms": [
+        17.315,
+        19.425,
+        21.017
+      ]
+    },
+    {
+      "case": "range",
+      "arm": "drive",
+      "threads": 8,
+      "round_medians_GBps": [
+        3.315,
+        2.044,
+        3.139
+      ],
+      "median_of_round_medians_GBps": 3.139,
+      "range_GBps": [
+        2.044,
+        3.315
+      ],
+      "median_of_round_medians_ms": 19.536,
+      "round_medians_ms": [
+        17.157,
+        29.738,
+        19.536
+      ]
+    }
+  ],
+  "reconciliation": [
+    {
+      "round": 1,
+      "threads": 1,
+      "foreign": [
+        {
+          "pid": 731262,
+          "comm": "strata",
+          "read_bytes": 1372160,
+          "cpu_percent": 1076.4720796323702
+        }
+      ],
+      "reconcile_ratio": 1.0009735023973507
+    },
+    {
+      "round": 1,
+      "threads": 2,
+      "foreign": [
+        {
+          "pid": 731262,
+          "comm": "strata",
+          "read_bytes": 475136,
+          "cpu_percent": 1068.537907654282
+        }
+      ],
+      "reconcile_ratio": 1.000315511857313
+    },
+    {
+      "round": 1,
+      "threads": 4,
+      "foreign": [
+        {
+          "pid": 731262,
+          "comm": "strata",
+          "read_bytes": 1146880,
+          "cpu_percent": 1092.412310241835
+        }
+      ],
+      "reconcile_ratio": 1.0007577677940598
+    },
+    {
+      "round": 1,
+      "threads": 8,
+      "foreign": [
+        {
+          "pid": 731262,
+          "comm": "strata",
+          "read_bytes": 1634304,
+          "cpu_percent": 1079.3162757005357
+        }
+      ],
+      "reconcile_ratio": 1.0010786730164551
+    },
+    {
+      "round": 2,
+      "threads": 2,
+      "foreign": [
+        {
+          "pid": 731262,
+          "comm": "strata",
+          "read_bytes": 417792,
+          "cpu_percent": 1085.077387306162
+        }
+      ],
+      "reconcile_ratio": 1.0002675741674028
+    },
+    {
+      "round": 2,
+      "threads": 4,
+      "foreign": [
+        {
+          "pid": 731262,
+          "comm": "strata",
+          "read_bytes": 24576,
+          "cpu_percent": 1086.649575161588
+        }
+      ],
+      "reconcile_ratio": 1.0000181846521536
+    },
+    {
+      "round": 2,
+      "threads": 8,
+      "foreign": [
+        {
+          "pid": 731262,
+          "comm": "strata",
+          "read_bytes": 28672,
+          "cpu_percent": 485.8949748353878
+        }
+      ],
+      "reconcile_ratio": 1.0000207824596041
+    },
+    {
+      "round": 2,
+      "threads": 1,
+      "foreign": [
+        {
+          "pid": 731262,
+          "comm": "strata",
+          "read_bytes": 49152,
+          "cpu_percent": 199.0660572801044
+        }
+      ],
+      "reconcile_ratio": 1.0000337714968566
+    },
+    {
+      "round": 3,
+      "threads": 4,
+      "foreign": [
+        {
+          "pid": 731262,
+          "comm": "strata",
+          "read_bytes": 28672,
+          "cpu_percent": 360.6489431596057
+        }
+      ],
+      "reconcile_ratio": 1.0000205102961688
+    },
+    {
+      "round": 3,
+      "threads": 8,
+      "foreign": [
+        {
+          "pid": 731262,
+          "comm": "strata",
+          "read_bytes": 98304,
+          "cpu_percent": 1064.7709757867708
+        }
+      ],
+      "reconcile_ratio": 1.000064094675527
+    },
+    {
+      "round": 3,
+      "threads": 1,
+      "foreign": [
+        {
+          "pid": 731262,
+          "comm": "strata",
+          "read_bytes": 184320,
+          "cpu_percent": 1070.7268272281194
+        }
+      ],
+      "reconcile_ratio": 1.0001179342029698
+    },
+    {
+      "round": 3,
+      "threads": 2,
+      "foreign": [
+        {
+          "pid": 731262,
+          "comm": "strata",
+          "read_bytes": 294912,
+          "cpu_percent": 1054.602885306075
+        }
+      ],
+      "reconcile_ratio": 1.000187156452539
+    }
+  ],
+  "all_reconciled": true,
+  "total_probe_read_bytes": 18773016576,
+  "total_device_read_bytes": 18778923008
+}

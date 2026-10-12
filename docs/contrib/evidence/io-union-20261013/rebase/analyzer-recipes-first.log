@@ -1,0 +1,575 @@
+check-recipes: tools/gate-paths.tsv: 110 gate rows held to the derivation, 22 rows with exceptions naming 196 gates
+self-test: ok (153 gate recipes, 0 failures)
+check-recipes: 65 timed recipes, 31 build in their box command after the card precheck
+check-recipes: 6 timed recipes build in a just dependency before their box command, where the precheck cannot come first: ab-decode (build-decode); measure-decode (build-decode); measure-engram (build-engram); measure-profile (build-decode); measure-sweep (build-decode); perf-decode (build-decode)
+card-tests: 630 tests, 0 failed
+self-test: ok (0 failures)
+box-tracks: self-test ok
+self-test: ok (0 failures)
+self-test: ok (0 failures)
+self-test: ok (0 failures)
+self-test: ok (34 checks, 0 failures)
+self-test: ok (0 failures)
+q38-3090-server.sh: self-test ok
+mac-check: self-test ok
+ok classes: an any-form v41-load recipe is a chain member over both cards
+ok classes: an any-form recipe outside the group stays balanced
+ok classes: solo wins over v41-load
+ok classes: a host recipe with device code is balanced with no card forced
+ok classes: a timed name in a comment of the body is not a timed recipe
+ok classes: a timed script in command position is
+ok classes: a recipe that runs a batch is refused
+ok dry run: the chain member pins no card — the lane that takes it decides
+ok dry run: both V4.1 loads are the chain
+ok order: lane X by family, V4.1 first, then first appearance
+ok order: lane B longest first, not in list order
+ok items: a batch as an item is refused by name
+ok items: a solo recipe's arm through another recipe is refused, naming the solo recipe
+ok items: other ARGS of the same binary pass
+ok list: just affected output behind just's echoed line takes its recipe lines
+ok list: a narrowed affected output runs the recipes it keeps
+ok list: a narrowed affected output does not run a left-out recipe
+ok list: a weekly recipe a trigger named in affected output runs
+ok weekly: a weekly recipe with no group is balanced
+ok weekly: a solo weekly recipe runs alone
+ok weekly: nothing but the weekly-* recipes
+ok weekly: with items, a named error
+ok list: any other line above the affected: header is a malformed item
+ok steal: a contended lane A and an idle lane B end green
+ok steal: the balanced item runs in lane B
+ok steal: its box call carries the A6000 card
+ok steal: its times row names lane B and the A6000
+ok steal: the ledger records it under the A6000 key
+ok steal: fixed items end green
+ok steal: the fixed 3090 item stays in lane A on the 3090
+ok steal: its run.log line names lane A
+ok steal: the fixed no-card item stays in lane A
+ok steal: no fixed call reached the A6000
+ok steal: a held timing lease ends green
+ok steal: the thief probed the lease
+ok steal: the balanced item stayed off the A6000
+ok steal: no call reached the A6000 under the lease
+ok steal: the dry run names the balanced item movable
+ok steal: the dry run leaves a fixed item unmarked
+ok chain: two any-form members end green
+ok chain: no two members overlap (the mutex)
+mutant ch-nomutex: s|^  mkdir "$CHAIN_MUTEX" 2> /dev/null \|\| return 1$|  true # MUTANT ch-nomutex|
+ok chain mutant: without the mutex the members overlap
+ok chain: a lane-B chain run ends green
+ok chain: the any-form member ran in lane B
+ok chain: its times row names lane B and the A6000
+ok chain: the ledger records it under the A6000 key
+ok chain: its box call carries the A6000 card
+mutant ch-pina: s|^  local lane=\$1 i card cards$|  local lane=$1 i card cards; [ "$lane" = B ] \&\& return 1 # MUTANT ch-pina|
+ok chain mutant: members pinned to lane A never reach lane B (the batch waits without end)
+ok chain: a 3090-only and an A6000-pick member end green
+ok chain: the 3090-only member runs in lane A
+ok chain: the A6000-pick member runs in lane B
+ok chain: no card of the batch reached the pick member
+mutant ch-anywant: s|^  want=$(lane_card "$1")$|  want=3090 # MUTANT ch-anywant|
+ok chain mutant: every card reading 3090 lets a lane take a member it may not
+ok chain: a two-family chain with lane X ends green
+ok chain: the families group (X's first family last, the record order inside one only)
+mutant ch-recorder: s|key=lambda k: (fam_order.index(fams\[k\]), k))|key=lambda k: k)  # MUTANT ch-recorder|
+ok chain mutant: record order interleaves the families
+ok chain: a family held by one-card members ends green
+ok chain: a lane does not open the next family while the current one holds an unclaimed member
+ok chain: a pool item and a plain one end green
+ok chain: a pool item never overlaps a member
+ok chain: an untagged item runs beside a member
+mutant ch-nopool: s|^tagged_neighbour() { #.*$|tagged_neighbour() { return 1 # MUTANT ch-nopool|
+ok chain mutant: without the pool rule the item overlaps a member
+ok chain: a big-host item ends green
+ok chain: a big-host item never overlaps a member
+ok chain mutant: without the rule a big-host item overlaps a member
+ok chain: a gap between two members ends green
+ok chain: a big-host item ready in the gap does not start there
+mutant ch-noclaim: s|^    claimed "\$i" \|\| return 1$|    true # MUTANT ch-noclaim|
+ok chain mutant: without the unstarted half the item starts in the gap
+ok chain: a member green on one key ends green
+ok chain: it skips at 0 s, at its green key
+ok chain: and nothing ran on the 3090
+mutant ch-noskip: s|green = \[j for j, s in enumerate(states) if s == "skip"\]|green = [] # MUTANT ch-noskip|
+ok chain mutant: without the skip placement the member runs although it is green
+ok chain: a lane item green on one key ends green
+ok chain: … and its skip is recorded once
+mutant ch-lskip: s|^          claim_item "\$i" "\$lane" \|\| continue # the other lane skipped it first.*$|          true # MUTANT ch-lskip|
+ok chain mutant: without the claim a green lane item skips again and again
+ok chain: a lane killed with the mutex ends the batch by name
+mutant ch-deaf: s|^      \*) dead_now="\$dead_now \$lane"; continue ;;$|      *) continue ;; # MUTANT ch-deaf|
+ok chain mutant: a deaf watch leaves the batch waiting without end
+ok chain: both lanes killed at once end the batch by name
+ok chain: the predicted line carries chain= and the phase-1 derivation
+mutant ch-nopred: s| chain=\${SUM_C}s||
+ok chain mutant: the predicted line without chain=
+ok chain: a longest-first take ends green
+ok chain: the free lane takes the longest-est item first
+mutant ch-lptrev: s|^    if \[ "\$exp" -gt "\$be" \]; then best=\$j be=\$exp; fi$|    if [ "$be" -lt 0 ] \|\| [ "$exp" -lt "$be" ]; then best=$j be=$exp; fi # MUTANT ch-lptrev|
+ok chain mutant: a reversed take starts the short item first
+ok board: the start event carries the item count, tier, lanes, mode, predicted wall, tree and branch
+ok board: one item event per item
+ok board: a run item event names the item, rc, seconds and lane
+ok board: the ledger skip is an item event with rc skip
+ok board: the done event holds the DONE line's fields
+ok board: the file holds the start, the three items and the done, nothing else
+ok board: an unwritable board directory leaves the batch green
+ok board: and its item line is the one it always printed
+ok board: the failure costs one stderr line
+mutant board-noitem: s|^  board_event item name=.*rc="\$rcl".*$|  true # MUTANT board-noitem|
+ok board mutant: without run_item's event the run item leaves none
+ok chain only: a list of one any-form member ends green
+ok chain only: the member is recorded, on a lane that took it
+FAIL chain only: the member ran once and no lane invented a call: 2 lines match / gen_/ in /tmp/gate-batch-test.KiUckK/fake-state/ran.log, want 1
+ok chain only: the DONE line carries both lanes
+mutant ch-nofeed: s|^chain_feeds() { #.*$|chain_feeds() { return 1 # MUTANT ch-nofeed|
+ok chain only mutant: without the feed rule no lane starts and the count check names it
+ok chain only: a list of one 3090-only member ends green
+ok chain only: the 3090-only member runs in lane A
+ok chain only: lane B never started for it
+ok chain only: its DONE line carries laneB=0s
+ok chain only: a list of one A6000-pick member ends green
+ok chain only: the pick member runs in lane B
+ok chain only: lane A never started for it
+ok chain only: its DONE line carries laneA=0s
+ok chain: a list whose items all sit in lane A ends green
+ok chain: its fixed item ran in lane A
+ok chain: lane B started for the A6000 pick
+ok dry run: a list of one any-form member names both lanes as the chain's feeders
+ok dry run: a 3090-only member is fed by lane A alone
+ok dry run: an A6000 pick is fed by lane B alone
+ok dry run: a list with no member names no chain feeders
+ok pack: two one-card items that fit end green
+ok pack: the two items ran side by side, one a card
+ok pack: the second take ran on the free card (the 3090)
+ok pack: both rows name lane X and the card each took
+ok pack: a pair over the budget ends green (serially)
+ok pack: the pair over the budget never overlapped
+mutant pk-nobudget: s|^      sumb=\$((sumb + R_BYTES\[i\]))$|      sumb=0 # MUTANT pk-nobudget|
+ok pack mutant: without the budget the pair overlaps
+ok pack: an m item first ends green
+ok pack: nothing ran beside the m item
+ok pack: an m item behind a longer one ends green
+ok pack: the m item waited for the host alone
+mutant pk-nom: s|^          \[ "\$mrun" = 0 \] \|\| continue # and nothing starts beside one$|          true # MUTANT pk-nom|
+ok pack mutant: without the m rule an item runs beside it
+mutant pk-nomw: s|^          \[ "\$nrun" = 0 \] \|\| continue # an m item starts with nothing else running$|          true # MUTANT pk-nomw|
+ok pack mutant: without the wait the m item starts beside a running one
+ok pack: a both-cards item ends green
+ok pack: a both-cards item ran alone
+ok pack: a box-pick item ends green
+ok pack: the box-pick item ran
+ok pack: the box-pick item took no card env from the pack
+ok pack: the box-pick item's line ends ledger=recorded
+mutant pk-noguard: s|^      case " \$cards " in \*" \$card "\*) switch_candidate "\$i" "\$card" ;; esac$|      case $card in 3090 \| a6000) switch_candidate "$i" "$card" ;; esac # MUTANT pk-noguard|
+ok pack mutant: without the guard the box-pick item takes a card env
+ok pack mutant: … and its line ends ledger=changed
+ok pack: the predicted laneX= is the pack wall (a fitting pair)
+ok pack: … and a pair over the budget serializes (laneX=6s)
+ok pack: the dry run names each X item's simulated take
+ok pack: a fixture pair over the budget ends green
+ok pack: the fixture tier sums no bytes (its loads are the small fixtures)
+ok pack: a solo recipe with no resource row is a named error
+ok pack: a row for a recipe that is not solo is a named error
+ok pool: two pool items in two lanes end green
+ok pool: two pool items never overlap (the mutex)
+mutant pk-nopool: s|^pool_take() { until mkdir "\$POOL_MUTEX" 2> /dev/null; do sleep 1; done; }$|pool_take() { true; } # MUTANT pk-nopool|
+ok pool mutant: without the mutex the two pool items overlap
+ok budget: a bound two scripts deep is read (the refusal names it)
+mutant bt-nohind: s|^    follow_scripts = True$|    follow_scripts = False # MUTANT bt-nohind|
+ok budget mutant: one hop deep, the bound is invisible (unchecked)
+ok budget: an item past 0.75x its bound is a named 65
+ok budget: --over-budget-ok passes it
+ok budget: the dry run names the refused and the unchecked
+mutant ch-nobudget: s|if len(calls) == 1 and calls\[0\]\[1\] > 0 and exp \* 4 > calls\[0\]\[1\] \* 3:|if False: # MUTANT ch-nobudget|
+ok budget mutant: without the check the over-budget item runs
+mutant rec-more: s|else "", held,$|else "", held, "extra",  # MUTANT rec-more|
+ok record: a writer that gains a field is a named 70 at the first read
+mutant rec-less: s|else "", held,$|else "",  # MUTANT rec-less|
+ok record: a writer that loses a field is a named 70 at the first read
+mutant rec-nocount: s|^  \[ \$((\${#_d} + 1)) = .*$|  true # MUTANT rec-nocount|;s|else "", held,$|else "", held, "extra",  # MUTANT rec-more|
+ok record mutant: the no-count copy carries the gaining writer
+ok record mutant: without the count, rec_get does not name the gained field
+mutant rec-name: s|^      rec_get "\$i" cls$|      rec_get "$i" clss # MUTANT rec-name|
+ok record: a field name the list does not hold is a named 70
+mutant rec-noname: s|^      rec_get "\$i" cls$|      rec_get "$i" clss # MUTANT rec-name|;s|^    \[ "\$_k" -lt .*$|    true # MUTANT rec-noname|
+ok record mutant: the no-name-check copy carries the misnamed call
+ok record mutant: without the name check the misnamed read names no field
+ok tier: a solo-real recipe is alone in the real tier (the pack takes either card)
+ok tier: … and balanced over both cards in the fixture tier
+ok tier: a solo-real v41-load recipe is alone in the real tier (solo wins)
+ok tier: … and balanced in the fixture tier, the v41-load group pinning no lane
+ok tier: a plain v41-load recipe is a chain member in the real tier
+ok tier: … and is balanced in the fixture tier, which takes no load lock
+ok tier: a 3090-only v41-load recipe stays in lane A in the fixture tier
+ok tier: a solo recipe is alone in both tiers
+ok tier: the real tier names nothing in the box env: lane X, no BLOOMERY_TIER, no card (the pack decides)
+ok tier: the fixture tier passes BLOOMERY_TIER=fixture to the item, which lane A or B runs
+ok tier: the real tier leaves BLOOMERY_TIER out of every command
+ok tier: BLOOMERY_TIER in the environment is the batch tier
+ok tier: a BLOOMERY_TIER entry of the caller box env is the batch tier too, once
+ok tier: --tier other than real or fixture: 64, named
+ok tier: --tier without a value: 64
+ok tier: the flag and the environment naming two tiers: 64, named
+ok tier: the flag and the box env naming two tiers: 64, named
+ok tier: an item's own BLOOMERY_TIER is refused: the tier is the batch's
+ok tier: a real item expects its real rows
+ok tier: a fixture item expects its own rows
+ok tier: solo-real with solo: a named error
+ok tier: solo-real with a 3090-only gpu-gate.sh call: a named error
+ok tier: solo-real with no gpu-gate.sh call: a named error
+ok tier: solo-real with a box.sh card pick: a named error
+ok tier: solo-real with host: a named error
+ok tier: a solo-real recipe's arm handed through another recipe is refused in the fixture tier
+ok   … and in the real tier
+ok   … while the recipe's own item with its flag runs in lane A or B in the fixture tier
+ok   … and alone in the real tier
+ok tier run: a fixture batch ends green
+ok tier run: its box call carries BLOOMERY_TIER=fixture
+ok tier run: its item line counts the deferred clauses
+ok tier run: the DONE line totals them
+ok tier run: the times row is an entry of its own
+ok tier run: the plan's key call and the recheck both carry the tier
+ok tier run: a fixture batch whose gates defer nothing ends green
+ok tier run: … its DONE line totals 0
+ok tier run: … and its item line counts none
+ok tier run: the same item in the real tier ends green
+ok tier run: … and none of its calls names the tier
+ok tier run: … and the DONE line counts no deferrals
+ok tier run: … though its line does
+ok real-only: in the real tier the recipe is placed by its calls, as without the dependency
+ok   … and a solo recipe stays alone
+ok real-only: in the fixture tier the recipe is deferred, in no lane
+ok   … a solo one too (the group beats solo there)
+ok   … and one that reaches the guard through another recipe, by closure
+ok real-only: the real dry run places it as usual
+ok real-only: the fixture dry run names both deferred items beside the one that runs
+ok real-only: a deferred item adds nothing to the lane sums (plain-any alone: its 45 s default, no fixture row)
+ok real-only: an item's ARGS are still checked by just
+ok real-only run: a fixture batch with two deferred items ends green
+ok real-only run: the deferred item has its own line
+ok   … a solo one too
+ok real-only run: the DONE line counts them in deferred= (with the clauses) and in real_only=
+ok real-only run: the batch never called a deferred recipe
+ok   … and wrote no times row for it
+ok   … nor a ledger record
+ok real-only run: a batch of deferred items only ends green
+ok real-only run: … its DONE line
+ok real-only run: … says nothing ran on the box
+ok real-only run: … and made no box call at all
+ok real-only run: the real tier runs the recipe
+ok   … through its box call
+ok   … and its DONE line has no real_only=
+ok fixture-only: in the fixture tier the recipe is placed by its calls, as without the call
+ok   … and a solo recipe stays alone
+ok fixture-only: in the real tier the recipe is deferred, in no lane
+ok   … a solo, v41-load one too (the deferral beats both groups there)
+ok   … and one that reaches the call through another recipe, by closure
+ok fixture-only: the fixture dry run places it as usual
+ok fixture-only: the real dry run names both deferred items beside the one that runs
+ok fixture-only: a deferred item adds nothing to the lane sums (plain-any alone: its 10 s row in the times file)
+ok fixture-only: an item's ARGS are still checked by just
+ok fixture-only run: a real batch with two deferred items ends green
+ok fixture-only run: the deferred item has its own line
+ok   … a solo one too
+ok fixture-only run: the DONE line counts them in deferred= and in fixture_only=
+ok fixture-only run: the item that is not deferred ran
+ok fixture-only run: the batch never called a deferred recipe
+ok   … and wrote no times row for it
+ok   … nor a ledger record
+ok fixture-only run: DIR/deferred.list holds the two items, with the comment of the kind
+ok fixture-only run: a fixture batch takes exactly that list (both items placed)
+ok   … the solo one alone in lane X
+ok fixture-only run: a batch of deferred items only ends green
+ok fixture-only run: … its DONE line
+ok fixture-only run: … says nothing ran on the box
+ok fixture-only run: … and made no box call at all
+ok fixture-only run: the fixture tier runs the recipe, beside a real-only item it defers
+ok   … through its box call, with the tier
+ok   … and its DONE line counts the real-only item, not a fixture-only one
+ok   … with no fixture_only= in it
+ok no-fixture: in the real tier a recipe of a family with no fixture is placed as usual
+ok   … in the fixture tier it is deferred, named by its family
+ok   … a family with a fixture directory runs (qwen4exp)
+ok   … a family whose real file stands runs (the default profile)
+ok   … a family named by closure runs (deepseek41)
+ok   … and a recipe that is both is real-only (the declared fact wins)
+ok no-fixture: the fixture dry run names the family item as deferred (no-fixture)
+ok no-fixture: an ARGS error of a deferred item is still named, and nothing ran
+ok no-fixture run: a fixture batch with a real-only and a no-fixture item ends green
+ok no-fixture run: the family item has its own line
+ok   … beside the real-only one
+ok no-fixture run: the DONE line counts both kinds and names the list
+ok no-fixture run: the batch never called either recipe
+ok no-fixture run: DIR/deferred.list holds the two items, real-only first, with a comment for each kind
+ok no-fixture run: a real-tier batch takes exactly that list (both items placed as usual)
+ok no-fixture run: … two items, none deferred
+ok no-fixture run: a deferred item with env keeps its item text in the list
+ok no-fixture run: a batch that deferred nothing writes no list
+ok   … and its DONE line has none of the deferral fields
+ok variant: a tag the table does not name is a named error
+ok   … a recipe the tag's row does not list
+ok   … in the real tier too
+ok   … a recipe of another family than the tag's, in the fixture tier
+ok   … in the fixture tier a variant item is placed as usual, the tag in its box env
+ok variant: the real dry run names the item as deferred (variant), beside the one that runs
+ok variant: a list taken from affected output holds the plain item and defers its variant item (real tier)
+ok variant run: a real batch with a variant item ends green
+ok variant run: the item has its own line
+ok variant run: the DONE line counts it and names the list
+ok variant run: the batch never called the recipe
+ok variant run: DIR/deferred.list holds the item text, with its comment
+ok   … and the comment of its kind
+ok variant run: a fixture batch takes exactly that list (the item placed, the tag in its box env)
+ok variant run: a fixture batch runs the variant item
+ok variant run: its box call carries the tag and the tier
+ok variant run: the times row is an entry of its own
+ok variant run: … and nothing is deferred
+ok fixture-only run: a real batch with a variant item and a fixture-only one ends green
+ok   … each deferred item carries its own kind
+ok   … the fixture-only one too
+ok   … and the DONE line counts both kinds
+ok   … with the notes of both kinds in DIR/deferred.list
+ok   … both
+ok variant chain: the real dry run defers a chain member's variant item and names no chain feeders
+mutant vr-nodefer: s|^    if variant and tier == "real":$|    if False and variant and tier == "real":|
+ok variant chain mutant: without the override the variant item is placed as a chain member
+ok variant chain: a real batch of the variant item and a plain one ends green
+ok variant chain: the variant item is deferred, in no lane
+ok variant chain: the plain item ran in lane B
+ok variant chain: it fed no lane, so lane A never started
+ok variant chain: the DONE line carries laneA=0s
+ok variant chain: the batch never called the chain member
+ok real-file: a family whose row is self (qwen3moe) and a target that reaches the fence is deferred, naming the family, the target and the site
+ok   … so is one of the default profile
+ok   … a self-family recipe the fake says reaches nothing is placed as usual
+ok   … a family with a fixture directory is never real-file, whatever the fake says (qwen4exp)
+ok   … and the kinds before it keep their precedence (real-only, no-fixture)
+ok   … no-fixture too
+ok real-file: in the real tier the same recipe is placed by its calls
+ok real-file: the fixture dry run names both real-file items beside the ones that run
+ok real-file: one opens call for the batch, over the self-family recipes the earlier kinds leave
+ok real-file: in the real tier opens is never called
+ok real-file: an opens call that fails is a named error in the fixture tier, 65
+ok   … a dry run too
+ok   … so is an answer that is not a line per recipe
+ok   … or a line that is neither opens nor none
+ok   … a batch whose items are all of other kinds asks nothing and runs
+ok   … the real tier never asks, so it never fails there
+ok real-file run: a failed opens ends the batch with 65 before anything ran (no box call, no run.log)
+ok real-file run: a fixture batch with a real-file item beside the other kinds ends green
+ok real-file run: the item has its own line
+ok   … beside the other two kinds
+ok real-file run: the DONE line counts it in deferred= and in real_file=
+ok real-file run: the batch never called the recipe
+ok   … and wrote no times row for it
+ok   … nor a ledger record
+ok real-file run: DIR/deferred.list holds the three items, real-file in a third section after no-fixture, with its own comment
+ok real-file run: a real-tier batch takes that list and places the item as usual (no opens call)
+ok real-file run: a batch of real-file items only: its DONE line
+ok   … has no other kind in it
+ok   … and made no box call at all
+ok real-file: the tree's own recipes.py reaches the fence for a gate that opens the model, and not for one that opens none
+ok no-fixture: a ref-paths.sh with no fixture table: a named error
+ok   … the real tier never reads it
+ok no-fixture: a table whose *) row is not none: a named error
+ok no-fixture: the tree's own tools/ref/ref-paths.sh is a table this runner reads
+ok real-only: a call that names another recipe: a named error
+ok real-only: a box command that does not open with the call: a named error
+ok real-only: a second box command with no call: a named error
+ok real-only: a call outside a single-quoted box command: a named error
+ok real-only: a call to a script that is not in the tree: a named error
+ok real-only: with solo-real: a named error
+ok fixture-only: a call that names another recipe: a named error
+ok fixture-only: a box command that does not open with the call: a named error
+ok fixture-only: a second box command with no call: a named error
+ok fixture-only: a call outside a single-quoted box command: a named error
+ok fixture-only: a call to a script that is not in the tree: a named error
+ok fixture-only: with solo-real: a named error
+ok fixture-only: a recipe that holds both calls itself: a named error
+ok fixture-only: a recipe whose dependencies hold one class each: a named error
+ok   … in the fixture tier too, and counted
+ok inline guard: a recipe that only branches on the tier (no exit 66) is placed as usual
+ok inline guard: a box command with a BLOOMERY_TIER test and an exit 66 and no call is a named error, 65
+ok   … counted, with nothing run
+ok   … a guard that stops the real tier is told the fixture-only call too
+ok   … in the real tier too
+ok   … and for a batch that names another recipe
+ok inline guard: a batch run ends with 65 before anything ran (no box call, no run.log)
+ok   … a box command that holds the call is not flagged, whatever else it tests
+ok   … nor one that holds the fixture-only call
+ok   … an escaped quote inside the box command does not hide the guard
+ok real-only guard: BLOOMERY_TIER=fixture stops it by name, exit 66
+ok   … the real tier passes
+ok   … and so does no tier, or an empty one
+ok   … a tier that is neither is refused, 64
+ok   … a call with no recipe name is a usage error, 64
+ok fixture-only guard: BLOOMERY_TIER=real stops it by name, exit 66
+ok   … so does no tier
+ok   … and an empty one
+ok   … the fixture tier passes
+ok   … a tier that is neither is refused, 64
+ok   … a call with no recipe name is a usage error, 64
+ok one card: a solo-real recipe with BLOOMERY_CARD=a6000 is alone in the real tier
+ok   … and fixed to the A6000 lane in the fixture tier
+ok one card: the fixture dry run puts it in lane B with no card forced, and not movable
+ok one card: a fixture batch with it ends green
+ok one card: it ran in lane B
+ok   … with the tier and no card of the batch in its env
+ok one card: its times row names lane B and the A6000
+ok hold: a --ledger batch of two lanes ends green
+ok hold: it names the hold up, and down
+ok   … and down
+ok hold: both items ran, each under its own batch's hold file
+ok   … none without its owner in the env and the hold in place
+ok   … every item call carries BLOOMERY_BATCH_OWNER in its box env
+ok   … and BLOOMERY_V41_CLASS=1, the lead's class on the V4.1 load queue
+ok   … the class is in no key call
+ok   … and the caller's own box env reached the key calls
+ok   … the owner is in no key call
+ok   … the ledger recorded both
+ok   … the owner is in no ledger line
+ok   … nor in a times row
+ok   … and run.log carries no hold line
+ok   … every hold call went read-only, with no guard wait
+ok   … one up
+ok   … at least two beats (5 s of an item at 1 s)
+ok   … one down
+ok   … the heartbeat logged its beats
+ok   … the hold was up when each item ended (a finished lane did not take it down)
+ok   … and absent at none of them
+ok   … and the hold file is gone once the batch ends
+ok   … and the heartbeat is gone
+ok no hold: a --round-ledger batch ends green
+ok   … its item ran
+ok   … with no owner and no hold file
+ok   … no call carries an owner or a class
+ok   … no hold call, no heartbeat pid
+ok   … and a --ledger batch with --no-gpu-hold ends green
+ok   … with no owner and no hold file
+ok   … no call carries an owner
+ok   … but every item call carries class 1, hold or none
+ok   … no hold call, no heartbeat pid
+ok hold: a red batch (rc 1) takes it down
+ok   … through the down call
+ok stop: the hold was up while the item ran
+ok   … TERM to the batch ends it (130), takes the hold down and ends the heartbeat
+ok   … and says it stopped
+ok hold: a batch that ends through die (a lane killed: 70) takes it down
+ok stop: a batch killed outright leaves its hold up, and its heartbeat ends within a beat
+ok   … and logs why
+ok hold: a hold taken down by hand: the heartbeat stops after the beat that finds it gone, and creates nothing
+ok   … and logs why
+ok hold: another batch's fresh hold: not starting, 75, named
+ok   … its hold stays, and the refused start left no run.log
+ok   … and no item ran
+ok hold: a stale hold of another batch is taken over, and the batch ends green
+ok   … the takeover is named
+ok   … and the hold is down at the end
+ok yield: a round batch with a hold-blocked item ends green (not red)
+ok yield: the item ends rc=yield naming the hold's owner, not retried
+ok yield: the DONE line counts it in yielded=
+ok yield: one call, then no retry — it never starts in a gap the lead leaves
+ok   … and the lane moved on to its next item
+ok yield: no rc 75 line for it
+ok yield: and no ledger record
+ok yield: no times row for a yielded item
+ok yield: a plain card-lock rc 75 keeps today's retry (try=11, red)
+ok yield: the lead's --ledger batch keeps waiting (try=11, red)
+ok yield: and its DONE line counts no yielded=
+ok hold: a batch whose every item skips ends green
+ok   … and puts no hold up
+ok dry run: a --ledger batch prints the hold it would take
+ok   … --no-gpu-hold says it is off
+ok   … a --round-ledger batch says none
+ok hold: --no-gpu-hold without --ledger: 64, named
+ok hold: --no-gpu-hold with --round-ledger: 64, named
+ok hold: a heartbeat period that is not whole seconds: 64, named
+ok cold: a registry or git crate compiled in the final try, and only there
+ok cold: its row goes to the cold file, never into the median
+ok waits: the guard, the batch hold, the card lock and the V4.1 load lock of the final try
+ok hold75: the owner of the try's hold-bound line, and nothing else
+ok group without the export: a named error
+ok export without the group: a named error
+ok host with solo and a card gate: a named error
+ok weekly: a justfile with no weekly-* recipe is a named error
+ok disk: above the floor, the verdict line and a dry run that proceeds
+ok disk: below the floor, a real run stops with 69 and the named line
+ok disk: below the floor, the real run's OUT is not created
+ok disk: a failing df is a named 69 in a dry run too
+ok disk: df output that does not parse is a named 69
+ok disk: BLOOMERY_MIN_FREE_GIB=abc is a named 64
+ok disk: BLOOMERY_MIN_FREE_GIB=0 is a named 64 too
+ok disk: a positive override raises the floor (the fake disk is below it)
+ok disk: below the floor, --dry-run prints the verdict and exits 0
+ok disk: the default OUT is $HOME/.cache/bloomery/batches/<tree>/<stamp>
+ok canary: the dry run prints the stage right after its header, naming the canary items
+ok canary: the canary items head the run order
+ok canary: --no-canary says the stage is off
+ok canary: a list with no canary item says there is no stage
+ok canary: a canary recipe in a class of its own is a named error
+ok canary: a red canary item ends the batch rc 1
+ok canary: the DONE line names the canary item and the unrun count
+ok canary: the other lane's item recorded nothing
+ok canary: the red item is named on stdout
+mutant canary-nohook: s|^  if \[ "\$CANARY" = 1 \] \&\& \[ -z "\$yowner" \].*$|  true # MUTANT canary-nohook|
+ok canary mutant: without the hook the other lane's item runs
+ok canary mutant: … and no canary DONE
+ok canary: --no-canary leaves a red canary item an ordinary red (rc 1)
+ok canary: --no-canary: both items record, the DONE line has no canary token
+ok canary: --no-canary: the other lane's item ran
+ok canary: a green stage ends green
+ok canary: … the canary item ran first
+ok canary: … and the DONE line carries no canary token
+ok canary: a canary item the ledger skips ends the batch green
+ok canary: … and the run says no canary item runs
+ok tier=: a real-tier batch ends green
+ok tier=: its item line says tier=real, behind lane=
+ok tier=: its DONE line says tier=real, behind red=
+ok tier=: a fixture batch with a deferred item ends green
+ok tier=: … its item line says tier=fixture
+ok tier=: … the deferred item's line says tier=fixture
+ok tier=: … its DONE line says tier=fixture
+ok tier=: a batch whose item the ledger skips ends green
+ok tier=: … the skip line says tier=real, behind lane=
+ok wait-hold: bare it takes the default bound and leaves the next word to the items
+ok wait-hold: a number after it is the bound
+ok wait-hold: … and the item beside it is still planned
+ok wait-hold: without the flag a dry run says nothing of it
+ok wait-hold: a batch that meets a busy box waits, then ends green
+ok wait-hold: … naming what is up at a busy poll, in the guard's style
+ok wait-hold: … a line for each poll
+ok wait-hold: … starting on the second quiet poll in a row
+ok wait-hold: … on the fourth poll: two busy, two quiet
+ok wait-hold: … each a READONLY call (no sync under a sitting)
+ok wait-hold: … every poll came before the first box call of the batch (the ledger's manifest read)
+ok wait-hold: an idle box ends green
+ok wait-hold: … after one poll, no wait
+ok wait-hold: … and prints no wait line
+ok wait-hold: still busy at the bound: rc 75
+ok wait-hold: … naming the bound and that nothing started
+ok wait-hold: … after polling more than once, with no run.log
+ok wait-hold: without the flag the start check is unchanged and ends green
+ok wait-hold: … and made no poll
+ok wait-hold: a remote dir that is not there yet (66) takes the plain call, and the batch ends green
+ok wait-hold: … the plain call was the first box call
+ok wait-hold: a lease that cannot be tested: rc 70
+ok wait-hold: … named
+gate-batch self-test: 541 of 542 ok
+check-recipes: the gate-batch self-test failed
+gpu-gate self-test: 100 of 100 ok
+stack-watch self-test: ok
+ptx-scan: self-test ok (13 cases, 0 failed)
+ptx-spill-check: self-test ok
+scan-args: self-test ok (38 cases, 0 failed)
+narrow-scan: self-test ok (71 cases, 0 failed)
+lds-scan: self-test ok (7 cases, 0 failed)
+mutant-run: self-test ok
+mac-static: self-test ok
+mac-remote: self-test ok (the flow against a fake remote needs macOS: skipped on Linux)
+carry: self-test ok (19 cases)
+check-recipes: 44 tool self-tests ok
+boxq codes 80, 81, 83-85: no other tool or recipe produces them
+check-recipes: fixture variants ok (4 row(s):  iq4xs q2kxl glmffnkq q6kdown )
+refset-publish: self-test ok
+orphan-tests: ok (2230 tests, each run by a gate-* or lab-* recipe)
+check-recipes: arch owner ok (150 recipe lines build with --arch {{arch}}, 12 fixtures)
