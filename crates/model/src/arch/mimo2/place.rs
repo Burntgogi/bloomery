@@ -238,7 +238,7 @@ impl PlanInputs {
             routed_rule(Program::Mimo2Body),
         )?;
         let need = HostNeed::of(&plan, 0).bytes();
-        let room = plan.host.plan_at(&self.room);
+        let room = plan.plan_at(&self.room);
         placement::expert_nvme_tier(&mut plan, room, self.arena)?;
         if plan.host.nvme_expert_bytes > 0 {
             return Err(PlaceError::NoNvmeTier {
