@@ -99,7 +99,7 @@ contrib-check *ARGS:
 check-recipes:
     ./tools/check-recipes.sh
 
-# BASE(기본 main)나 A..B 사이에 바뀐 파일을 입력으로 읽는 gate-* 레시피 목록 — 맥에서, 빌드 없이, 아무것도 돌리지 않는다(tools/affected-gates.sh).
+# The gate-* recipes that read a file changed since the merge-base with BASE (default main), or in A..B (from merge-base(A, B) to B, as `git diff A...B`) — on the Mac, no build, runs nothing (tools/affected-gates.sh).
 # `--narrow --scan BASE_LOG NEW_LOG …` (ptx-scan logs of the base and the change): the gates that run the changed host path.
 affected BASE='main' *ARGS:
     ./tools/affected-gates.sh {{BASE}} {{ARGS}}
@@ -1360,6 +1360,14 @@ gate-refset:
 refset-check *ARGS:
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh refset-check && __s=$(. tools/ref/ref-paths.sh && printf %s "$DSPARK_MODEL") && export BLOOMERY_DSPARK_MODEL="$__s" && cargo build --release -p bloomery-refset --bin refset-check && bash tools/host-gate.sh refset-check {{ARGS}}'
 
+# The type census's header stubs: from tools/census/stubs.tsv (`python3 tools/type-census.py pin` writes it), the first
+# header_bytes bytes of each real file are fetched from the hub at the row's revision, checked against header_sha256,
+# written at ROOT/<org>/<repo>/<file> as a sparse file of file_bytes, and read back and checked again. ROOT is a
+# directory on the box that does not exist or is empty (e.g. /models/census-stubs-<revision tag>): a rebuild goes to a
+# new one. It reads the hub only: no card, no lock, not timed.
+census-stubs ROOT:
+    ./tools/box.sh 'python3 tools/type-census.py build "{{ROOT}}" tools/census/stubs.tsv'
+
 # V4.1 호스트 스텝 계획: 디코드 걷기 단위 시험(위치 2,101개)을 돈 뒤, V4.1 오라클 세트(배치 세트와 디코드 스텝 세트)의
 # 그래프 입력 전부를 계획과 비트 단위로 대조한다. 어떤 검사도 맡지 않은 입력은 빨강이다. 호스트 전용(카드·게이트 락 없음).
 gate-ds41-plan:
@@ -2013,8 +2021,9 @@ gate-gpu-p8b *ARGS:
 # PTX 스캔(계측기, 게이트 아님): 게이트 바이너리가 싣고 있는 디바이스 코드의 엔트리별
 # 디포·로컬 왕복·블록 폭 표. 디포를 가진 엔트리가 먼저 나온다. 단언은 gate_p5/gate_p4가 한다 — 머리글 참조.
 # 바이너리의 cargo 피처는 `--features`로 준다(기본 gpu). V4.1 게이트 바이너리는 `--features deepseek41`.
-# 끝의 두 열(jit_regs·jit_local)은 드라이버 JIT가 실제로 잡은 값이다. oxart_jit가 모듈을 카드에 올려 읽으므로
-# 게이트 락(tools/gpu-gate.sh) 아래서 돈다.
+# The jit_regs and jit_local columns are the values the driver JIT actually assigned; the ld.global.scalar, ld.global.v2 and
+# ld.global.v4 columns follow them. oxart_jit loads the modules onto the card to read them, so a full scan runs under the
+# gate lock (tools/gpu-gate.sh).
 # `--no-jit`: the driver JIT is not built or run, so the scan takes no card lock and waits on no landing batch's GPU hold.
 # The banner names `jit=skipped(no-jit)` and both JIT columns read `skipped(no-jit)`. The md5 block and the ptxas columns
 # are as in a full scan: that proves a move (`just affected --narrow` reads such a pair as identical or refuses it by name).
