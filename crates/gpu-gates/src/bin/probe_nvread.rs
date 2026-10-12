@@ -3,7 +3,7 @@
 //! no card.
 //!
 //!     probe_nvread --range-from <id> [--ks 1,2,3] [--batches N] [--warmup W]
-//!                  [--threads T] [--range-batches R] [--seed S] [--lease]
+//!                  [--threads T] [--range-batches R] [--seed S] [--lease] [--direct-only]
 //!
 //! The model is the file the gates open (`BLOOMERY_REF_MODEL`, which
 //! `just time-nvread` exports under the qwen4exp profile). Each layer's three
@@ -49,6 +49,12 @@
 //! `mincore` finds nothing of an expert resident, after a populate everything.
 //! An undefined input (a file of another architecture, a stack missing from a
 //! layer, an `--range-from` past the experts) is a named error.
+//!
+//! `--direct-only` measures only the worker pool's `directN` arm, once per
+//! batch, plus the contiguous `drive` arm after each range batch. It does no
+//! page-cache populate or eviction and does not require a cold mincore result:
+//! DirectFile opens O_DIRECT with no buffered fallback. This mode measures
+//! file reads rather than the page-cache path; it does not reset drive caches.
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -103,7 +109,9 @@ fn run() -> Result<(), GateError> {
         )
         .into());
     }
-    rig.prove_instrument()?;
+    if !a.direct_only {
+        rig.prove_instrument()?;
+    }
     for &k in &a.ks {
         if k > rig.layers {
             return Err(format!(
@@ -130,6 +138,7 @@ struct Args {
     range_batches: usize,
     seed: u64,
     lease: bool,
+    direct_only: bool,
 }
 
 impl Args {
@@ -143,11 +152,16 @@ impl Args {
             range_batches: 16,
             seed: 0x6E76_7265_6164,
             lease: false,
+            direct_only: false,
         };
         let mut it = args;
         while let Some(flag) = it.next() {
             if flag == "--lease" {
                 a.lease = true;
+                continue;
+            }
+            if flag == "--direct-only" {
+                a.direct_only = true;
                 continue;
             }
             let value = it.next().ok_or_else(|| format!("{flag} needs a value"))?;
@@ -594,6 +608,45 @@ impl Rig {
         self.drop_parts(&part)
     }
 
+    /// A seeded batch without changing its page-cache residency.
+    fn draw_batch(
+        &self,
+        shape: Shape,
+        draw: &mut Draw,
+        used: &mut [bool],
+    ) -> Result<(Vec<Part>, Vec<String>), GateError> {
+        match shape {
+            Shape::Runs(k) => {
+                let mut parts = Vec::new();
+                let mut labels = Vec::new();
+                for layer in distinct_layers(draw, self.layers, k) {
+                    let id = draw.below(self.experts);
+                    parts.extend(self.run_parts(layer, id));
+                    labels.push(format!("{layer}:{id}"));
+                }
+                Ok((parts, labels))
+            }
+            Shape::Range(from) => {
+                let free: Vec<usize> = (0..self.layers).filter(|&l| !used[l]).collect();
+                if free.is_empty() {
+                    return Err("every layer's range was drawn or refused".into());
+                }
+                let layer = free[draw.below(free.len())];
+                used[layer] = true;
+                let mut parts = Vec::new();
+                for s in 0..STACKS.len() {
+                    for id in from..self.experts {
+                        parts.push(Part {
+                            t: layer * STACKS.len() + s,
+                            id: id as u32,
+                        });
+                    }
+                }
+                Ok((parts, vec![layer.to_string()]))
+            }
+        }
+    }
+
     /// The drawn batch of `shape`, its picks as labels, its parts dropped and
     /// checked cold; `redraws` counts the draws refused because a page stayed
     /// resident.
@@ -606,36 +659,7 @@ impl Rig {
         cap: usize,
     ) -> Result<(Vec<Part>, Vec<String>), GateError> {
         loop {
-            let (parts, labels) = match shape {
-                Shape::Runs(k) => {
-                    let mut parts = Vec::new();
-                    let mut labels = Vec::new();
-                    for layer in distinct_layers(draw, self.layers, k) {
-                        let id = draw.below(self.experts);
-                        parts.extend(self.run_parts(layer, id));
-                        labels.push(format!("{layer}:{id}"));
-                    }
-                    (parts, labels)
-                }
-                Shape::Range(from) => {
-                    let free: Vec<usize> = (0..self.layers).filter(|&l| !used[l]).collect();
-                    if free.is_empty() {
-                        return Err("every layer's range was drawn or refused".into());
-                    }
-                    let layer = free[draw.below(free.len())];
-                    used[layer] = true;
-                    let mut parts = Vec::new();
-                    for s in 0..STACKS.len() {
-                        for id in from..self.experts {
-                            parts.push(Part {
-                                t: layer * STACKS.len() + s,
-                                id: id as u32,
-                            });
-                        }
-                    }
-                    (parts, vec![layer.to_string()])
-                }
-            };
+            let (parts, labels) = self.draw_batch(shape, draw, used)?;
             self.drop_parts(&parts)?;
             let (resident, _) = self.pages(&parts)?;
             if resident == 0 {
@@ -747,27 +771,36 @@ impl Rig {
         Ok(t0.elapsed().as_nanos() as u64)
     }
 
-    /// One batch of cold parts through the arms.
-    fn batch(&mut self, parts: &[Part], shape: Shape) -> Result<Sample, GateError> {
+    /// One batch through the selected arms.
+    fn batch(
+        &mut self,
+        parts: &[Part],
+        shape: Shape,
+        direct_only: bool,
+    ) -> Result<Sample, GateError> {
         let mut s = Sample {
             bytes: parts.iter().map(|p| self.tables[p.t].row_bytes()).sum(),
             ns: [0; 4],
             asked: [0; 4],
         };
-        s.ns[0] = self.cache_arm(parts)?;
-        let (resident, total) = self.pages(parts)?;
-        if resident != total {
-            return Err(format!(
-                "after the cache arm {resident} of {total} spanned pages are resident: the read did not land whole"
-            )
-            .into());
+        if !direct_only {
+            s.ns[0] = self.cache_arm(parts)?;
+            let (resident, total) = self.pages(parts)?;
+            if resident != total {
+                return Err(format!(
+                    "after the cache arm {resident} of {total} spanned pages are resident: the read did not land whole"
+                )
+                .into());
+            }
+            s.asked[0] = total * self.tables[parts[0].t].page_bytes();
+            self.drop_parts(parts)?;
         }
-        s.asked[0] = total * self.tables[parts[0].t].page_bytes();
-        self.drop_parts(parts)?;
         let reads = self.reads(parts)?;
-        s.asked[1] = reads.iter().map(|r| r.span as u64).sum();
-        s.asked[2] = s.asked[1];
-        s.ns[1] = self.direct1_arm(&reads)?;
+        s.asked[2] = reads.iter().map(|r| r.span as u64).sum();
+        if !direct_only {
+            s.asked[1] = s.asked[2];
+            s.ns[1] = self.direct1_arm(&reads)?;
+        }
         s.ns[2] = self.directn_arm(&reads)?;
         if let Shape::Range(_) = shape {
             let big = self.contiguous_reads(parts)?;
@@ -791,8 +824,12 @@ impl Rig {
         let mut asked = [0u64; 4];
         let mut draws = Vec::new();
         for i in 0..total {
-            let (parts, labels) = self.cold_batch(shape, draw, &mut used, &mut redraws, cap)?;
-            let s = self.batch(&parts, shape)?;
+            let (parts, labels) = if a.direct_only {
+                self.draw_batch(shape, draw, &mut used)?
+            } else {
+                self.cold_batch(shape, draw, &mut used, &mut redraws, cap)?
+            };
+            let s = self.batch(&parts, shape, a.direct_only)?;
             for (all, one) in asked.iter_mut().zip(s.asked) {
                 *all += one;
             }
@@ -807,6 +844,9 @@ impl Rig {
             3
         };
         for (i, arm) in ARMS.into_iter().take(arms).enumerate() {
+            if a.direct_only && i < 2 {
+                continue;
+            }
             let mut rates: Vec<f64> = samples
                 .iter()
                 .map(|s| s.bytes as f64 / s.ns[i] as f64)
@@ -835,7 +875,7 @@ impl Rig {
                 .f("ms", median(&walls))
                 .u("seed", a.seed)
                 .w("lease", a.lease);
-            if i == 0 {
+            if i == 0 || (a.direct_only && i == 2) {
                 row.csv("draws", &draws).print();
             } else {
                 row.print();
@@ -848,6 +888,19 @@ impl Rig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn direct_only_is_explicit_and_keeps_argument_bounds() {
+        let args = |words: &[&str]| Args::parse(words.iter().map(|s| (*s).to_owned()));
+        assert!(!args(&["--range-from", "480"]).unwrap().direct_only);
+        assert!(
+            args(&["--direct-only", "--range-from", "480"])
+                .unwrap()
+                .direct_only
+        );
+        assert!(args(&["--direct-only"]).is_err());
+        assert!(args(&["--direct-only", "--range-from", "480", "--threads", "0"]).is_err());
+    }
 
     #[test]
     fn partition_covers_every_item_once_in_even_ranges() {

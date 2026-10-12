@@ -1,0 +1,20 @@
+# Contributor host-only calibration; this is not the maintainer drive's reference band.
+# Eight blocking workers can hide up to eight serial request latencies [derived ceiling,
+# assuming equal requests and no bandwidth cap]. Shared bandwidth, CPU work and joining
+# can leave the ratio near or below one. No inference speed is predicted by this card.
+kind: calibration
+question: how does this contributor's SSD read expert batches as blocking read workers increase?
+term: probe_nvread k8 directN median GB/s at threads 8 divided by threads 1, same seed per round,
+  alongside all directN k1,k2,k4,k8 and contiguous range reference rows, under --direct-only
+unit: ratio
+predict: 1.0..8.0
+reason: collect a drive-specific worker-count curve and request-size reference for the paged verify IO term
+condition: existing lease-hold runner with a contributor lock directory; no GPU timed or opened;
+  explicit direct-only mode with aligned O_DIRECT reads and no buffered fallback; three rounds with rotated
+  worker order and the same draws within each round; drive counters, pressure and foreign-process IO
+  recorded around each child; no page-cache arm or mincore cold claim is made;
+  neither drive/controller caches nor other services are reset;
+  a read-byte reconciliation outside five percent marks the run contaminated, retaining its output
+decide-in: carry the drive-specific curve into the paged IO discussion, separately from native inference
+decide-below: examine worker overhead and recorded contention before proposing deeper IO queues
+decide-above: audit byte accounting, warm-drive effects and the instrument before using the ratio
