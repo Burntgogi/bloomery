@@ -15,7 +15,7 @@ use crate::generate::Place;
 use crate::record::{self, Record};
 use crate::residency::PlanRoom;
 use bloomery_gpu::host::swap::Residency;
-use bloomery_levers::{RESIDENCY38_SPARES, Residency38Pick, residency38_at_plan};
+use bloomery_levers::{ChurnHosting, RESIDENCY38_SPARES, Residency38Pick, residency38_at_plan};
 use model::placement::churn::ChurnPool;
 use model::placement::workstation::TierBatchBytes;
 use model::placement::{Machine, Plan};
@@ -219,8 +219,8 @@ pub fn residency38(
     lever: Lever38<'_>,
     emit: fn(Record),
 ) -> Result<Residency, GateError> {
-    let (residency, word) = match lever {
-        Lever38::Set(r, word) => (r, word.to_owned()),
+    let (residency, word, hosting) = match lever {
+        Lever38::Set(r, word) => (r, word.to_owned(), ChurnHosting::Hosted),
         Lever38::Unset(pre) => {
             let pick = match pre {
                 Some(off) => off,
@@ -248,10 +248,10 @@ pub fn residency38(
                     spares: RESIDENCY38_SPARES,
                 },
             };
-            (residency, pick.word())
+            (residency, pick.word(), pick.pool())
         }
     };
-    residency_set(plan, CARD38, residency, &word, 0, emit)
+    residency_set(plan, CARD38, residency, hosting, &word, 0, emit)
 }
 
 /// A load of `plan` under `residency`, the word `word` names, whatever the
@@ -265,6 +265,7 @@ pub fn residency_set(
     plan: &Plan<'_>,
     card: usize,
     residency: Residency,
+    hosting: ChurnHosting,
     word: &str,
     beside: u64,
     emit: fn(Record),
@@ -274,7 +275,9 @@ pub fn residency_set(
     };
     let pool = ChurnPool::of(plan, card, pinned)
         .map_err(|e| format!("BLOOMERY_RESIDENCY={word}: the churn pool: {e}"))?;
-    emit(record::residency_host_beside(word, &pool, plan, beside));
+    emit(record::residency_host_beside(
+        word, hosting, &pool, plan, beside,
+    ));
     Ok(residency)
 }
 

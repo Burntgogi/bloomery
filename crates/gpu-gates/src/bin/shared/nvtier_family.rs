@@ -135,8 +135,8 @@ impl std::fmt::Display for RoomFacts {
 pub enum Unset {
     /// The serving word as it is, why `place`.
     Kept,
-    /// The serving word at a higher P the pool fits, why `shrunk`: `mid-p<q>-s<spares>`, `1 <= q <= ceiling`.
-    Shrunk { ceiling: usize, spares: usize },
+    /// The serving word at its P 0 with the churn pool unhosted, why `pool_unhosted`.
+    Unhosted,
     /// `off`, with this why's name.
     Off(&'static str),
 }
@@ -149,35 +149,30 @@ impl Unset {
     /// - no layer holds a card expert (`:1287`): `off`, `no_card_experts`;
     /// - the fewest layer cannot hold P 0 and the spares (`:1294-1306`, `fewest < spares + 1`, and half of it is
     ///   under the minimum P): `off`, `no_room`;
-    /// - the pool at P 0 fits the headroom and what `MemAvailable` leaves (`:1333-1337`): the word as it is;
-    /// - else the pool at the last count fits (`:1350-1361`, the pool only shrinks as the count grows): `shrunk`
-    ///   to some `q` in `1..=fewest - spares - 1`;
-    /// - else `off` (`:1362`): `host_short` where the headroom is under that pool (`:1320-1325`), else
-    ///   `mem_short`.
+    /// - the pool at P 0 fits the headroom and what `MemAvailable` leaves: the word as it is;
+    /// - else the word as it is with the pool unhosted, why `pool_unhosted`: the host side never moves P.
     #[must_use]
     pub fn serving(room: &RoomFacts) -> Unset {
         let Some(fewest) = room.fewest else {
             return Unset::Off("no_card_experts");
         };
-        let Some(ceiling) = usize::try_from(fewest)
+        if usize::try_from(fewest)
             .ok()
             .and_then(|f| f.checked_sub(room.spares + 1))
-        else {
+            .is_none()
+        {
             return Unset::Off("no_room");
-        };
+        }
         let fits =
             |pool: u64| room.headroom >= i128::from(pool) && room.mem_left >= i128::from(pool);
+        // PIN(2026-10-12): a pool that did not fit raised P to the first count whose pool fit
+        // (`shrunk`), or turned the word `off` (`host_short`, `mem_short`) where none did; a 64 GB host
+        // decoded far faster with the pool left out at P 0 than at the raised P (churn.md), so the host
+        // side keeps P 0 and leaves the pool unhosted.
         if fits(room.pool_first) {
             Unset::Kept
-        } else if ceiling >= 1 && fits(room.pool_last) {
-            Unset::Shrunk {
-                ceiling,
-                spares: room.spares,
-            }
-        } else if room.headroom < i128::from(room.pool_last) {
-            Unset::Off("host_short")
         } else {
-            Unset::Off("mem_short")
+            Unset::Unhosted
         }
     }
 
@@ -188,14 +183,7 @@ impl Unset {
         why != "paged"
             && match *self {
                 Unset::Kept => word == RESIDENCY_SERVING && why == "place",
-                Unset::Shrunk { ceiling, spares } => {
-                    why == "shrunk"
-                        && matches!(
-                            residency_word(word),
-                            Some(ResidencyWord::Mid { pinned, spares: s })
-                                if (1..=ceiling).contains(&pinned) && s == spares
-                        )
-                }
+                Unset::Unhosted => word == RESIDENCY_SERVING && why == "pool_unhosted",
                 Unset::Off(name) => word == "off" && why == name,
             }
     }
@@ -205,9 +193,7 @@ impl std::fmt::Display for Unset {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Unset::Kept => write!(f, "{RESIDENCY_SERVING:?}, why \"place\""),
-            Unset::Shrunk { ceiling, spares } => {
-                write!(f, "mid-p1..{ceiling}-s{spares}, why \"shrunk\"")
-            }
+            Unset::Unhosted => write!(f, "{RESIDENCY_SERVING:?}, why \"pool_unhosted\""),
             Unset::Off(name) => write!(f, "\"off\", why {name:?}"),
         }
     }

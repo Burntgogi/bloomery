@@ -3515,7 +3515,8 @@ mod tests {
     /// the load's machine reserves ([`reserve_checkpoints`]) once: a churn
     /// pool that fits past the need of a load that declares none does not
     /// fit past the same plan's need on a machine that reserves two slots',
-    /// and the pick turns `MemShort`, naming the room the reserve leaves.
+    /// and the pick keeps P 0 with the pool unhosted, naming the room the
+    /// reserve leaves.
     #[test]
     fn the_residency38_room_reads_the_reserved_need() {
         use crate::residency38::{Seqs, checkpoints_reserved, mem_left_38, reserve_checkpoints};
@@ -3560,23 +3561,24 @@ mod tests {
         assert_eq!(pick(mem_left_38(available, none)).pinned, Some(0));
         let two = terms + declared(Seqs::priced(2, price));
         assert_eq!(two - none, 2 * slot);
+        // PIN(2026-10-12): the pool past the reserved need turned the word
+        // `off` (`MemShort`); a 64 GB host decoded far faster with the pool
+        // left out at P 0, so the word keeps P 0 with the pool unhosted.
         let short = pick(mem_left_38(available, two));
+        assert_eq!(short.pinned, Some(0));
+        assert_eq!(short.pool(), bloomery_levers::ChurnHosting::Unhosted);
+        let bloomery_levers::Residency38Why::Unhosted(pool) = short.why else {
+            panic!(
+                "the pool past the reserved need is unhosted: {:?}",
+                short.why
+            );
+        };
+        assert_eq!(pool.needs, 10u64 << 30);
         assert_eq!(
-            short.why,
-            bloomery_levers::Residency38Why::MemShort {
-                needs: 10u64 << 30,
-                leaves: i128::from(available) - i128::from(terms) - i128::from(2 * slot),
-            }
+            pool.mem_left,
+            i128::from(available) - i128::from(terms) - i128::from(2 * slot)
         );
-        assert_eq!(
-            short.why.to_string(),
-            format!(
-                "unset: the churn pool needs {} B, MemAvailable leaves {} B past the plan's host \
-                 need",
-                10u64 << 30,
-                i128::from(available) - i128::from(two)
-            )
-        );
+        assert_eq!(pool.mem_left, i128::from(available) - i128::from(two));
     }
 
     mod media {

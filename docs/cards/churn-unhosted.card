@@ -1,0 +1,41 @@
+# Churn: an unset residency keeps its P when the unpaged churn pool does not fit the host, and the pool is unhosted (its
+# victims served from the file mapping, counted in rereads and unresident). Host-only rule (no kernel moved), so this is
+# the dispatch-path A/B AGENTS.md asks for, two builds: this tree's generate_qwen3moe against main f9706dbd's, the base
+# built with `just build-decode` in its own worktree and remote dir.
+#
+# [derived] The box has 256 GB, so MemAvailable never binds; only headroom = HOST_ROOM - need does. Window:
+# need < HOST_ROOM < need + pool(P=0). gate_qwen38_serve: 27 GiB pages, 40 GiB does not. Card experts a layer at plan a on
+# the A6000 about 297 (docs/performance.md, mid-p148-s1 = fewest/2), 3.16 MB an expert (refill-decode.card): pool(P=0) =
+# 48 x 297 x 3.16 MB = 45 GB, far past the headroom at 40G (about 4..10 GB). The base arm climbs to the first P whose pool
+# fits (about mid-p231..270-s1), the change arm keeps mid-p0-s1 with the pool unhosted. The lead confirms the need with a
+# `--plan` print before the sitting.
+#
+# [derived] #46 (a 64 GB host, RTX 5090, Qwen3.8 UD-Q4_K_XL): P 0 with the pool out decoded 99.0 tok/s against 54.4 at the
+# climbed P 114 (x1.82). The box's plan a holds about 58 % of the experts on the card (297/512) against #46's 24 %, so the
+# moves matter less, and BLOOMERY_CARD_DONTNEED's default drops the card segments' pages at load, so the change arm's first
+# victim reads come from NVMe (about 1.3 ms per 3.16 MB on the machine's thread): +15..+50 (churn.md, the advisor's band).
+kind: ab
+question: does an unset residency that keeps P 0 with the churn pool unhosted decode faster than the same word raised to
+  the first P whose hosted pool fits the plan's host headroom, on a plan a whose headroom takes the plan and not the pool?
+term: decode tok/s @ n=1024, prose 512 (the corpus's first 512 ids), A6000, plan a, BLOOMERY_RESIDENCY unset,
+  BLOOMERY_HOST_ROOM=40G, BLOOMERY_DRAFT=off, one slot; this tree's generate_qwen3moe against main f9706dbd's,
+  (ours - base) / base, paired by round
+unit: %
+predict: +15..+50
+rounds: 6
+sd: 2.6 % rig-log 09-30#q38seed-ab, the residency-only P 512 pair 1.056 ± 0.059 over 4 rounds (paired SD 3.7 %,
+  / sqrt 2), as refill-decode.card; Qwen3.8's plain decode under the residency scatters past the 0.6 % default
+condition: one lease; both builds with their Cargo.lock current; BLOOMERY_DECODE_N=1024 in BLOOMERY_BOX_ENV (the runner's
+  `n=` field reads 1024 in both arms) and every arm a fresh process (BLOOMERY_AB_LOAD=arm), the order rotated each round,
+  one warm-up round discarded (a `WARMUP r0` row in the log); no [cpu-busy], [other-busy] or [cold] row and no Xid in either
+  witness. The base arm's `residency unset` record names a word mid-p<P>-s1 with P above 0 and the climb's why (the plan's
+  room moves the word's pinned experts p0→p<P>); the change arm's names mid-p0-s1 with the pool not hosted, and its
+  `residency host` record reads hosted=unhosted. The change arm's `residency pass` records sum unresident > 0 and
+  rereads > 0, and neither arm ends on an Unresident error. Same greedy tokens are not required (the word differs)
+decide-in: land the rule with its fixture batch and write the row to rig-log (decode tok/s both arms, the ratio and its
+  interval, the base arm's P, the change arm's rereads and unresident sums and wait_us)
+decide-above: past +50 the climbed P cost more than the moves' share at plan a predicts: read the base arm's P and
+  each arm's host experts a token before the rig-log row, and land the rule as decide-in
+decide-below: read the base arm's P first (a small climb means the shape did not reproduce #46), then the change arm's
+  wait_us, then rereads ns a victim (the box drive under BLOOMERY_CARD_DONTNEED's default). The structural change lands
+  either way as the contract rewrite, with the measured number in rig-log; a loss stops the landing for a reading round

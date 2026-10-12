@@ -273,7 +273,7 @@ use bloomery_gpu_glm5next::{
     seq_bytes, seq_lane, seq_resume, seq_resume_prefix, seq_save, seq_save_async,
 };
 use bloomery_levers::{
-    GlmAt, GlmPick, ResidencyPick, ResidencyWhy, glm_residency_at_plan, glm_unset,
+    ChurnHosting, GlmAt, GlmPick, ResidencyPick, ResidencyWhy, glm_residency_at_plan, glm_unset,
 };
 use gguf::Split;
 use model::arch::glm5next::place::{
@@ -714,7 +714,15 @@ fn residency_at(
             (Residency::parse(pick.word)?, pick.word)
         }
     };
-    residency_set(plan, GLM_CARD, r, word, beside, Record::eprint)
+    residency_set(
+        plan,
+        GLM_CARD,
+        r,
+        ChurnHosting::Hosted,
+        word,
+        beside,
+        Record::eprint,
+    )
 }
 
 struct Args {

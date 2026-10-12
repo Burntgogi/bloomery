@@ -259,8 +259,7 @@ mod gate {
             GlmWhy::NoCardExperts => "no_card_experts",
             GlmWhy::NoRoom { .. } => "no_room",
             GlmWhy::Moved { .. } => "shrunk",
-            GlmWhy::HostShort { .. } => "host_short",
-            GlmWhy::MemShort { .. } => "mem_short",
+            GlmWhy::Unhosted(_) => "pool_unhosted",
         }
     }
 

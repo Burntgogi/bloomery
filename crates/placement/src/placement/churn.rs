@@ -5,11 +5,14 @@
 //! it in and locks it in its host set (`HostSet::of_known`, `bloomery-model`'s
 //! `placement::host_lock`) beside the plan's host segments, the plan's host
 //! headroom ([`super::HostTotals::headroom_bytes`], the one budget) takes its
-//! bytes, and the host serves a victim from resident pages. Where the load's
-//! residency spec says unhosted (`bloomery_levers::ChurnHosting`), the set
-//! only knows the pool: the host serves a victim from the file's mapping,
-//! read back at a page fault's cost and counted in the machine's rereads and
-//! unresident sends. A stack the plan pages to the NVMe tier adds nothing:
+//! bytes, and the host serves a victim from resident pages. Where an unset
+//! word kept its P because the pool fit neither the headroom nor what
+//! `MemAvailable` leaves, the load's residency spec says unhosted
+//! (`bloomery_levers::ChurnHosting`) and the set only knows the pool: the
+//! host serves a victim from the file's mapping, read back at a page fault's
+//! cost and counted in the machine's `rereads` and `unresident` sends —
+//! measured on a 64 GB host at no decode cost against the P a hosted pool
+//! would have raised. A stack the plan pages to the NVMe tier adds nothing:
 //! its victims are the tier's arena's ([`super::expert_nvme_tier`]).
 
 use super::{Device, ExpertList, PlacementError, Plan, Role, per_expert};

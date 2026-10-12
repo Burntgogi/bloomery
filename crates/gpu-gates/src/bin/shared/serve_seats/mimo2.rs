@@ -128,7 +128,7 @@ use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::residency38::{residency_room, residency_set};
 use bloomery_gpu_gates::{GateError, gpu_census, ref_model_path, residency};
 use bloomery_gpu_mimo2::{Body, Mimo2Model, PrefillMode};
-use bloomery_levers::{HostCfg, ResidencyAt, ResidencyWhy};
+use bloomery_levers::{ChurnHosting, HostCfg, ResidencyAt, ResidencyWhy};
 use gguf::Split;
 use model::arch::Arch;
 use model::arch::mimo2::place::PlanInputs;
@@ -654,7 +654,15 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     if pick.why == ResidencyWhy::Set {
         residency_room(&plan, residency, pick.word)?;
     }
-    residency_set(&plan, 0, residency, pick.word, 0, Record::eprint)?;
+    residency_set(
+        &plan,
+        0,
+        residency,
+        ChurnHosting::Hosted,
+        pick.word,
+        0,
+        Record::eprint,
+    )?;
     parallel_line(slots, slot_ctx, from, Pass::of(slots, ONE_PASS));
     if a.plan_only {
         // The records before the load are out; nothing was opened on a card.

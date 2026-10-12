@@ -39,6 +39,7 @@ use bloomery_gpu::host::xstream::{XLayer, XReport};
 use bloomery_gpu::hybrid::HostResidency;
 #[cfg(feature = "gpu")]
 use bloomery_gpu::prompt_timing::PromptStats;
+use bloomery_levers::ChurnHosting;
 use model::placement::{Machine, Plan, arena_slots};
 
 /// The schema's version, the first line of `--records-schema`.
@@ -1921,7 +1922,10 @@ pub static RESIDENCY_LEVER: Kind = Kind {
     head: "residency lever",
     doc: "What BLOOMERY_RESIDENCY resolved to before the load: the word the load runs by, and why: \
           set, or unset and what picked it (place: the serving placement's default; off under \
-          fixed_place, check_finite, route_trace or prefill_steps, where the machine does not run).",
+          fixed_place, check_finite, route_trace or prefill_steps, where the machine does not run; \
+          on the plan, shrunk where its card slots moved P, off under no_card_experts or no_room, \
+          and pool_unhosted where the churn pool at P fits neither the plan's host headroom nor \
+          what MemAvailable leaves: the word keeps P and the load does not host the pool).",
     parts: &[key("residency", Word, ""), key("why", Word, "")],
 };
 
@@ -1933,8 +1937,9 @@ pub static RESIDENCY_UNSET: Kind = Kind {
     doc: "What BLOOMERY_RESIDENCY unset resolved to in generate_qwen3moe: the word the load runs \
           by (off, or mid-p<P>-s1 on plan (a), P half the plan's fewest card experts a layer) \
           and why, the condition that picked it (the placement, the flags, the file, or the plan: \
-          no card expert, no room, or the churn pool past the plan's host headroom or past what \
-          MemAvailable leaves).",
+          no card expert, no room, or — the word kept at P — the churn pool past the plan's host \
+          headroom or past what MemAvailable leaves: the pool is not hosted, its victims are \
+          served from the file).",
     parts: &[key("residency", Word, ""), key("why", Text, "")],
 };
 
@@ -1943,12 +1948,15 @@ pub static RESIDENCY_UNSET: Kind = Kind {
 pub static RESIDENCY_HOST: Kind = Kind {
     name: "residency_host",
     head: "residency host",
-    doc: "Adaptive residency's host share, from the plan before the load: the lever's word, the \
-          seed experts a layer kept on the stage card, the churn pool (the stage card's experts \
-          past them, which the load's host set holds too) and its bytes, and the plan's host \
-          headroom before and after the pool and any bytes the load hosts beside the plan.",
+    doc: "Adaptive residency's host share, from the plan before the load: the lever's word, \
+          whether the load hosts the churn pool (hosted: its host set reads it in and locks it; \
+          unhosted: the set only knows it, a victim is read back from the file), the seed experts \
+          a layer kept on the stage card, the churn pool (the stage card's experts past them) and \
+          its bytes, and the plan's host headroom before and after a hosted pool and any bytes \
+          the load hosts beside the plan.",
     parts: &[
         key("residency", Word, ""),
+        key("hosted", Word, ""),
         key("pinned", U64, ""),
         key("churn_experts", U64, ""),
         key("churn_bytes", U64, "B"),
@@ -2775,8 +2783,9 @@ pub static RESIDENCY_UNSET_GLM: Kind = Kind {
     head: "residency unset",
     doc: "What BLOOMERY_RESIDENCY unset resolved to on the GLM seat, after the plan line: the word \
           the load runs by and why (--place a, or what left it off: --place gate, stores short of \
-          a window, the step feed, or the plan: no card expert, no room, or the churn pool past \
-          the plan's host headroom or past what MemAvailable leaves).",
+          a window, the step feed, or the plan: no card expert, no room, or — the word kept at P — \
+          the churn pool past the plan's host headroom or past what MemAvailable leaves: the pool \
+          is not hosted, its victims are served from the file).",
     parts: &[key("residency", Word, ""), key("why", Text, "")],
 };
 
@@ -3599,29 +3608,34 @@ pub fn residency_host(
     pool: &model::placement::churn::ChurnPool,
     plan: &Plan<'_>,
 ) -> Record {
-    residency_host_beside(residency, pool, plan, 0)
+    residency_host_beside(residency, ChurnHosting::Hosted, pool, plan, 0)
 }
 
-/// [`residency_host`] of a load whose host set also holds `beside` bytes the
-/// plan does not count (a draft layer's experts hosted beside the plan's
-/// own): `headroom_after` is the plan's headroom less the pool and them, the
-/// sum the machine's `ChurnPool::check_beside` holds to 0 or more.
+/// [`residency_host`] of a load that hosts the pool as `hosting` says and
+/// whose host set also holds `beside` bytes the plan does not count (a draft
+/// layer's experts hosted beside the plan's own): `headroom_after` is the
+/// plan's headroom less them and a hosted pool, the sum the machine's
+/// `ChurnPool::check_beside` (`check_known_beside` for an unhosted pool)
+/// holds to 0 or more.
 pub fn residency_host_beside(
     residency: &str,
+    hosting: ChurnHosting,
     pool: &model::placement::churn::ChurnPool,
     plan: &Plan<'_>,
     beside: u64,
 ) -> Record {
+    let (hosted, after) = match hosting {
+        ChurnHosting::Hosted => ("hosted", pool.headroom_after(plan)),
+        ChurnHosting::Unhosted => ("unhosted", plan.host.headroom_bytes),
+    };
     Record::new(&RESIDENCY_HOST)
         .w("residency", residency)
+        .w("hosted", hosted)
         .u("pinned", pool.pinned)
         .u("churn_experts", pool.experts)
         .u("churn_bytes", pool.bytes)
         .u("headroom", plan.host.headroom_bytes)
-        .u(
-            "headroom_after",
-            pool.headroom_after(plan) - i128::from(beside),
-        )
+        .u("headroom_after", after - i128::from(beside))
 }
 
 /// A residency boundary's record, of a machine driven directly
