@@ -45,3 +45,12 @@ An SDK shipped outside `/opt/rocm` may need additional library directories. Each
 The experiment demonstrates a Rust device-code route that preserves the project's language choice. It does not yet connect AMD buffers to `Gpu`, `GpuModel`, an app session or `bloomery-serve`. A native backend needs a common contract for buffer windows, streams/events, kernel launches and capture, while retaining the existing model forward and expert placement owners. Compile-time selection should keep vendor dispatch out of the hot per-operator path.
 
 Next operator work should match the original activation layouts and cover GDN/QSA, routed experts, PLE and state reset/checkpoint semantics. The CUDA path must retain its existing gates; AMD numerical and end-to-end gates must use AMD hardware. Wider hardware coverage, graph capture and performance tuning follow correctness. The whole-model libllama adapter is not part of this native backend proposal.
+
+## Rebase verification
+
+The follow-up branch rebases this lab onto upstream main `eb186d979602a3e150967541ffb86bfea157866b`.
+Host tests, host clippy with warnings denied and the `gfx1100` Rust device build pass with the pinned
+nightly. The host and device sources are unchanged from the reported operator experiment. These are
+build and host checks; the GPU numerical experiment has not been repeated after this rebase. The
+original six GPU cases remain evidence for their original source snapshot, and whole-model serving
+remains unverified.
