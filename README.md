@@ -121,18 +121,18 @@ paged from NVMe.
 
 ## Numbers
 
-**0.3.0's release check: one request at the serving defaults** (every lever unset, no `--parallel`,
+**0.3.1's release check: one request at the serving defaults** (every lever unset, no `--parallel`,
 `--ctx-size 16384`), greedy, thinking off, RTX A6000 (+ RTX 3090 for `bp`), one load per row, the release
-candidate's `bloomery-serve`. Prompt sizes are the server's prompt tokens.
+candidate's `bloomery-serve`. Prompt sizes are the server's prompt tokens. The `a` row of Qwen3.8 is 0.3.0's check.
 
 | Model, place | Long prompt: tokens, prefill tok/s, first token | Decode after it | Short prompt decode |
 |---|---|---|---|
-| Qwen3.8 `UD-Q4_K_XL`, `a` | 5,673, 1,693, 3.38 s | 75.1 tok/s | 86.3 tok/s |
-| Qwen3.8 `UD-Q4_K_XL`, `bp` | 5,673, 1,700, 3.36 s | 80.5 tok/s | 97.3 tok/s |
-| Qwen3.6-35B-A3B `UD-Q4_K_XL`, unset (picks `a`) | 5,673, 7,122, 0.81 s | 115 tok/s | 118 tok/s |
-| GLM-5.3-Flash `UD-IQ4_XS`, unset (picks `a`) | 5,548, 108, 51.2 s | 24.4 tok/s | 23.7 tok/s |
-| DeepSeek-V4.1-Flash `Q3_K_M`, unset (picks `a`) | 5,644, 407, 13.9 s | 42.4 tok/s | 41.1 tok/s |
-| MiMo-V2.6-Flash `MXFP4`, unset (picks `a`) | 5,620, 106, 52.9 s | 34.0 tok/s | 37.7 tok/s |
+| Qwen3.8 `UD-Q4_K_XL`, `a` (0.3.0) | 5,673, 1,693, 3.38 s | 75.1 tok/s | 86.3 tok/s |
+| Qwen3.8 `UD-Q4_K_XL`, `bp` | 5,673, 1,707, 3.35 s | 84.3 tok/s | 94.0 tok/s |
+| Qwen3.6-35B-A3B `UD-Q4_K_XL`, unset (picks `a`) | 5,673, 7,083, 0.81 s | 115.0 tok/s | 117.5 tok/s |
+| GLM-5.3-Flash `UD-IQ4_XS`, unset (picks `bp`) | 5,548, 172, 32.3 s | 35.1 tok/s | 35.0 tok/s |
+| DeepSeek-V4.1-Flash `Q3_K_M`, unset (picks `a`) | 5,642, 403, 14.0 s | 41.9 tok/s | 42.7 tok/s |
+| MiMo-V2.6-Flash `MXFP4`, unset (picks `a`) | 5,620, 104, 53.9 s | 34.8 tok/s | 36.1 tok/s |
 
 **Two requests at once** (`--parallel 2`, both busy) after a 512-token prompt, decode tok/s of both together, and
 one request's decode at depth 4096. Measured on 0.3.0 (2026-10-12), on a 32-core AVX2 host with 8 DDR4 channels and
