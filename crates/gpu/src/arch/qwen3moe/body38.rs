@@ -4439,6 +4439,14 @@ impl<'a> Copied<'a> {
         rows: Option<(usize, usize)>,
         draft: Option<&'a mut Mtp38>,
     ) -> Result<Copied<'a>, GpuError> {
+        // A draft's rows are the positions' rows: without the positions
+        // there is nothing of the draft to copy, and taking it would drop it.
+        if rows.is_none() && draft.is_some() {
+            return Err(GpuError::state(
+                "qwen38::copied",
+                "the positions a draft store's rows are copied for",
+            ));
+        }
         let len = GDN.state_len();
         let mut c = Copied {
             spans: Vec::new(),
