@@ -1142,7 +1142,10 @@ impl<B: ChainBody> GpuModel<B> {
     /// every eager step or pass here ([`HostServed::at_boundary`] at
     /// [`BoundaryAt::Launch`]: the boundary a step made ahead of this pass
     /// taken, else made now). Nothing for a body with no host service.
+    /// Refused by name first while a pass of several slots waits for its
+    /// commit ([`GpuModel::refuse_if_slots_wait`]): no pass opens inside it.
     pub fn pass_boundary(&mut self) -> Result<(), GpuError> {
+        self.refuse_if_slots_wait("GpuModel::pass_boundary")?;
         let _busy = watchdog::busy(&self.watch, watchdog::PASS_BOUNDARY, self.reads);
         self.boundary_at(BoundaryAt::Launch { reads: self.reads })
     }
