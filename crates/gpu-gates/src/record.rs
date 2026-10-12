@@ -3051,7 +3051,13 @@ pub static BLOOMERY_CHAT: &[&Kind] = &[
 
 /// What `bloomery-serve-ds41` prints, all on stderr, and the rounds of
 /// several slots and the calls of one a `BLOOMERY_STEP_STATS` run counts.
+/// The `hf` lines are the `--hf` repo's projector fetch, which runs after the
+/// seat registers ([`crate::model_file::hf_projector`]).
 pub static BLOOMERY_SERVE_DS41: &[&Kind] = &[
+    &HF_OFFLINE,
+    &HF_FILE,
+    &HF_PROGRESS,
+    &HF_DONE,
     &PLACE_UNSET,
     &PLAN,
     &CACHE_CONFIG,
@@ -3161,11 +3167,16 @@ pub static BLOOMERY_SERVE_MIMO2: &[&Kind] = &[
 /// listening line, the reuse records the checkpoint rule answers, the
 /// draft's joins, the residency machine's records, and the rounds of several
 /// slots and the calls of one a `BLOOMERY_STEP_STATS` run counts, and the image encoder's `vision`
-/// record under `--mmproj`.
+/// record under `--mmproj`. The `hf` lines are the `--hf` repo's projector fetch, which runs after
+/// the seat registers ([`crate::model_file::hf_projector`]).
 pub static BLOOMERY_SERVE_GLM: &[&Kind] = &[
     &RESIDENCY_LEVER,
     &DRAFT_UNSET_GLM,
     &DRAFT_YIELD,
+    &HF_OFFLINE,
+    &HF_FILE,
+    &HF_PROGRESS,
+    &HF_DONE,
     &PLACE_UNSET,
     &PLAN,
     &RESIDENCY_UNSET_GLM,
@@ -3869,6 +3880,25 @@ mod tests {
                 set.iter().any(|k| k.name == VISION.name),
                 "the {seat} seat does not register the vision record"
             );
+        }
+    }
+
+    /// Every seat whose `--hf` repo's projector is fetched after its `record::at_main`
+    /// ([`crate::model_file::hf_projector`]) registers each line that fetch prints.
+    #[test]
+    fn the_seats_that_fetch_the_hf_projector_register_its_lines() {
+        for (seat, set) in [
+            ("ds41", BLOOMERY_SERVE_DS41),
+            ("qwen3", BLOOMERY_SERVE_QWEN3),
+            ("glm", BLOOMERY_SERVE_GLM),
+        ] {
+            for kind in [&HF_OFFLINE, &HF_FILE, &HF_PROGRESS, &HF_DONE] {
+                assert!(
+                    set.iter().any(|k| k.name == kind.name),
+                    "the {seat} seat does not register the {} record",
+                    kind.name
+                );
+            }
         }
     }
 
