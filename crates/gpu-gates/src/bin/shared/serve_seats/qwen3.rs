@@ -177,7 +177,7 @@ use bloomery_gpu_gates::bind::{
     ChatSurface, Listen, Pass, Seat, SeatEngine, SlotStep, Vocab, arm_screen, bind_server,
     default_slots_fit, note_line, parallel_line, slots_given,
 };
-use bloomery_gpu_gates::generate::{CTX_GRAN, Place};
+use bloomery_gpu_gates::generate::Place;
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::vision_seat::{self, Opened, PleImage, TextFacts};
 use bloomery_gpu_gates::{GateError, gpu_census, ref_model_path};
@@ -187,7 +187,7 @@ use model::arch::Arch;
 use model::arch::qwen35moe::hparams::Hparams;
 use model::placement::PlanLevers;
 use model::placement::ctx::SlotCtx;
-use model::placement::workstation::{CardSpec, MARGIN};
+use model::placement::workstation::CardSpec;
 use runtime::Target as _;
 #[cfg(feature = "vision")]
 use serve::media::{MediaFeed, SharedMediaModel};
@@ -203,13 +203,13 @@ const USAGE: &str = "usage: bloomery-serve --model qwen3 [-m PATH | --hf <repo>[
                      [--api-key-file FNAME]";
 
 /// The context a slot takes before the rule grows it: the base the margin
-/// counts against, `generate_qwen3moe`'s default.
-const BASE_SLOT_CTX: usize = 4096;
+/// counts against ([`q3place::SERVE_RULE`]).
+const BASE_SLOT_CTX: usize = q3place::SERVE_RULE.base;
 
 /// The context a slot takes when `--ctx` is unset: the common rule's answer
 /// (`placement::ctx::default_slot_ctx`) for `parallel` resident slots, the
-/// constants its own — [`BASE_SLOT_CTX`] a slot, steps of
-/// [`CTX_GRAN`], a margin of `MARGIN` card expert bytes — over the
+/// constants [`q3place::SERVE_RULE`]'s — [`BASE_SLOT_CTX`] a slot, steps of
+/// `CTX_GRAN`, a margin of `MARGIN` card expert bytes — over the
 /// file's trained context as the cap (the base when it states none). The
 /// probes plan the load the file takes on `a`'s card: the whole model while
 /// its whole-fit verdict takes the base a slot — weights, the cache of every
@@ -236,11 +236,7 @@ fn default_ctx(
 ) -> Result<SlotCtx, GateError> {
     let (media, encoder) = images_of(vision);
     let plan_levers = PlanLevers::from_levers(levers)?;
-    let rule = q3place::SlotRule {
-        base: BASE_SLOT_CTX,
-        step: CTX_GRAN,
-        margin: MARGIN,
-    };
+    let rule = q3place::SERVE_RULE;
     let before = q3place::reads();
     let found = match arch {
         Arch::Qwen3moe => {

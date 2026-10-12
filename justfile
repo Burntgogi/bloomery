@@ -1052,6 +1052,12 @@ gate-gpu-qwen3moe-experts:
 gate-gpu-qwen3moe-e2e:
     BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3moe_e2e'
 
+# qwen3moe routed types under the --place-unset defaults: for every type the host's routed kernels run, a crafted
+# two-layer header planned by the CLI's and the serve seat's defaults (plan only: no weight loaded, no model file opened,
+# so the fixture tier runs it). A refusal, or card experts of a type the card table does not run, fails by name.
+gate-gpu-qwen3moe-types:
+    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_types && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3moe_types'
+
 # ik CPU의 greedy 연속(프롬프트 0–7, 32토큰)을 $BLOOMERY_DATA/qwen3moe/greedy/에. 프롬프트마다 CPU 임대를 잡는다.
 ik-greedy-qwen3moe:
     BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'for p in 0 1 2 3 4 5 6 7; do GEN=32 PROMPT=$p bash tools/ref/ik-greedy.sh || exit $?; done'

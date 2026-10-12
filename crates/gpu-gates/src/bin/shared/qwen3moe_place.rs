@@ -40,7 +40,7 @@ use bloomery_gpu::model::{GpuModel, Slots};
 use bloomery_gpu::rope_neox::q8_plane_lens;
 use bloomery_gpu::{Gpu, Qwen3moeModel};
 use bloomery_gpu_gates::GateError;
-use bloomery_gpu_gates::generate::{Place, PlaceWhy};
+use bloomery_gpu_gates::generate::{CTX_GRAN, Place, PlaceWhy};
 use bloomery_gpu_gates::image_plan;
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::residency38::{checkpoints_pinned, reserve_checkpoints};
@@ -860,6 +860,20 @@ pub struct SlotRule {
     pub step: usize,
     pub margin: u64,
 }
+
+/// The qwen3 serve seat's rule: a slot's base `generate_qwen3moe`'s default
+/// context (4096), steps of [`CTX_GRAN`], a margin of
+/// [`workstation::MARGIN`] card expert bytes. The seat and
+/// `gate_qwen3moe_types` read this one.
+#[allow(
+    dead_code,
+    reason = "the serve seat and gate_qwen3moe_types read it; the CLI includes the planner without a seat"
+)]
+pub const SERVE_RULE: SlotRule = SlotRule {
+    base: 4096,
+    step: CTX_GRAN,
+    margin: workstation::MARGIN,
+};
 
 /// A default context and the load it was searched over.
 #[allow(
