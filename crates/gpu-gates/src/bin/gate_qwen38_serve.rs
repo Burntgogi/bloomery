@@ -1200,14 +1200,21 @@ mod gate {
 
         /// Under the draft, a request of `sent` ids that kept `at` by a cut or
         /// a prefix put back with the draft rejoined there: no draft-off line,
-        /// no `mtp keep` record, and it drafted. Its join: one at `at` that
-        /// walked the rejoined row when ids are left for a prompt call past
-        /// `at`; none when one id is left, which the first step feeds, the
-        /// step walking the rejoined row with it and printing no record (as a
-        /// request that ended on its first step and is extended by one id).
+        /// no `mtp keep` record, and it drafted. Its joins when ids are left
+        /// for a prompt call past `at`: the first at `at`, walking the
+        /// rejoined row, and one more at the start of each further call of
+        /// the same prompt (a prompt fed beside another slot's windows runs
+        /// in more than one call), each walking the draft up to it and
+        /// skipping nothing; none when one id is left, which the first step
+        /// feeds, the step walking the rejoined row with it and printing no
+        /// record (as a request that ended on its first step and is extended
+        /// by one id).
+        // PIN(2026-10-13): the joins after the first are each later call of the prompt; was one
+        // join only, which a cut prompt fed in two calls beside a drafted request's windows failed
+        // while its ids and drafts were right.
         fn rejoined_at(&self, at: u64, sent: usize) -> bool {
             let join = if sent as u64 > at + 1 {
-                self.joined_at(at)
+                self.joined_from(at)
             } else {
                 self.joins.is_empty()
             };
@@ -1225,6 +1232,17 @@ mod gate {
             matches!(self.joins.as_slice(), [j] if j.start == start
                 && j.caught_up >= 1
                 && j.skipped == "none")
+        }
+
+        /// The joins printed for this request: the first at `start`, the
+        /// starts rising, each walking the draft up to it and skipping nothing.
+        fn joined_from(&self, start: u64) -> bool {
+            self.joins.first().is_some_and(|j| j.start == start)
+                && self.joins.windows(2).all(|w| w[0].start < w[1].start)
+                && self
+                    .joins
+                    .iter()
+                    .all(|j| j.caught_up >= 1 && j.skipped == "none")
         }
     }
 
