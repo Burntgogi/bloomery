@@ -29,12 +29,14 @@
 //!   width and the model's image input; [`Resident::span_rows`] encodes a media call's images and
 //!   reads them back as the rows a prompt call splices. The seat gives only its model's splice of
 //!   one image's rows.
-//! * [`Resident::encode`] and [`Encoded::prompt`] — the two steps of a merger seat's media call,
-//!   the one place the seats' rows pass between the readback and the prompt call: the images
-//!   encoded on the model's card and read back as [`Encoded`] rows (a reference reads them with
-//!   [`Encoded::rows`]), then the one prompt call over the spans the seat's builder makes of them
-//!   ([`app::Session::prompt_media`]). What a seat does beside them (GLM's draft turn-off between
-//!   the two) and how its spans are made stay the seat's.
+//! * [`Resident::encode_with`] and [`Encoded::prompt`] — the two steps of a seat's media call
+//!   (GLM, Qwen3.6 and V4.1; Clef takes the first and makes its own hidden-state call), the one
+//!   place the seats' rows pass between the readback and the prompt call: the images encoded on the model's card and read back as [`Encoded`] rows
+//!   with the seat's own splice and kinds ([`Resident::encode`] is the merger towers' splice,
+//!   [`merged_cells`]; a reference reads the rows with [`Encoded::rows`]), then the one prompt
+//!   call over the spans the seat's builder makes of them ([`app::Session::prompt_media`]). What
+//!   a seat does beside them (GLM's draft turn-off between the two, V4.1's draft refusal before
+//!   them) and how its splice and spans are made stay the seat's.
 //! * [`SpanRows::media_spans`] and [`SpanRows::image_spans`] — the call's spans as the plain
 //!   [`MediaSpan`]s of a body that takes nothing beside a span's positions and rows, and as the
 //!   [`ImageSpan`]s of a body that also takes each image's token grid, which [`span_rows_of`]
@@ -857,42 +859,55 @@ impl Resident {
         span_rows(&mut *self.tower, &self.stream, images, self.n_embd, splice)
     }
 
-    /// Step (e) of a merger tower's media call: `images` encoded and read back as the rows the
-    /// prompt call splices — [`Resident::span_rows`] with [`merged_cells`] (one row a cell of each
-    /// grid, the ids carry the delimiters), the tower's card bound for the calls and `model`, the
-    /// context the seat's body runs on, bound back after them ([`on_encoder_card`]). The prompt
-    /// call over them is [`Encoded::prompt`].
+    /// Step (e) of a seat's media call: `images` encoded and read back as the rows the prompt call
+    /// splices — [`Resident::span_rows`] with the seat's own `splice` (what its spans add around
+    /// the cells' rows, and the kind of each position), the tower's card bound for the calls and
+    /// `model`, the context the seat's body runs on, bound back after them
+    /// ([`on_encoder_card`]). The prompt call over them is [`Encoded::prompt`].
+    pub fn encode_with<'a, K>(
+        &mut self,
+        model: &CudaContext,
+        images: impl IntoIterator<Item = Image<'a>>,
+        splice: impl FnMut(&[u16], &Patches) -> Result<(Vec<u16>, Vec<K>), GateError>,
+    ) -> Result<Encoded<K>, GateError> {
+        let rows = on_encoder_card(model, || self.span_rows(images, splice))?;
+        Ok(Encoded { rows })
+    }
+
+    /// [`Resident::encode_with`] of a merger tower's span: [`merged_cells`] (one row a cell of
+    /// each grid, the ids carry the delimiters).
     pub fn encode<'a>(
         &mut self,
         model: &CudaContext,
         images: impl IntoIterator<Item = Image<'a>>,
     ) -> Result<Encoded, GateError> {
-        let rows = on_encoder_card(model, || self.span_rows(images, merged_cells))?;
-        Ok(Encoded { rows })
+        self.encode_with(model, images, merged_cells)
     }
 }
 
-/// The rows of one merger media call, read back by [`Resident::encode`] and not yet spliced into
-/// a prompt call. [`Encoded::rows`] lends them read-only; [`Encoded::prompt`] makes the one call
-/// that splices them and consumes them, so no later read can see what it did to its own copy.
+/// The rows of one media call, read back by [`Resident::encode_with`] ([`Resident::encode`] for a
+/// merger tower: `K = ()`) and not yet spliced into a prompt call; `K` is the kind a seat's splice
+/// gives each position. [`Encoded::rows`] lends them read-only; [`Encoded::prompt`] makes the one
+/// call that splices them and consumes them, so no later read can see what it did to its own copy.
 #[derive(Debug)]
-pub struct Encoded {
-    rows: SpanRows<()>,
+pub struct Encoded<K = ()> {
+    rows: SpanRows<K>,
 }
 
-impl Encoded {
+impl<K> Encoded<K> {
     /// The call's rows and each span's ranges of them.
     #[must_use]
-    pub fn rows(&self) -> &SpanRows<()> {
+    pub fn rows(&self) -> &SpanRows<K> {
         &self.rows
     }
 
     /// Step (p) of a media call, the only place a seat's rows pass on their way to the prompt
     /// call: `build` makes the body's spans of the rows (the seat's own: [`SpanRows::media_spans`]
     /// for a body that takes nothing beside positions and rows, [`SpanRows::image_spans`] for one
-    /// that takes each image's grid), then one [`app::Session::prompt_media`] of `ids` over them,
-    /// the greedy token after the last id. It is the call's one residency pass: a body's own
-    /// `prefill_media` is never called beside it.
+    /// that takes each image's grid, the rows with their kinds for one that checks a splice
+    /// shape), then one [`app::Session::prompt_media`] of `ids` over them, the greedy token after
+    /// the last id. It is the call's one residency pass: a body's own `prefill_media` is never
+    /// called beside it.
     pub fn prompt<B, F>(
         self,
         s: &mut app::Session<B>,
@@ -901,7 +916,7 @@ impl Encoded {
     ) -> Result<u32, GateError>
     where
         B: MediaBody,
-        F: for<'r> FnOnce(&'r SpanRows<()>) -> Vec<B::Span<'r>>,
+        F: for<'r> FnOnce(&'r SpanRows<K>) -> Vec<B::Span<'r>>,
     {
         let rows = self.rows;
         let spans = build(&rows);

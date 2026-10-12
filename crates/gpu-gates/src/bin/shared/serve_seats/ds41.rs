@@ -226,6 +226,8 @@ use tokenizer::Tokenizer;
 #[cfg(feature = "vision")]
 use bloomery_gpu_gates::ds41_media;
 #[cfg(feature = "vision")]
+use cuda_core::CudaContext;
+#[cfg(feature = "vision")]
 use serve::media::MediaFeed;
 #[cfg(feature = "vision")]
 use vision_seat::{Opened, PleImage, TextFacts};
@@ -858,17 +860,19 @@ struct Vision {
 
 #[cfg(feature = "vision")]
 impl Vision {
-    /// Every feed's image encoded on the resident encoder, its aligner rows read back as bf16
-    /// and spliced ([`ds41_media::span_rows`]), all in one pair of buffers — the rows, the
-    /// kinds, and each span's positions, rows and kinds as ranges of them
-    /// ([`vision_seat::Resident::span_rows`]). The aligner emits the plan's token grid, one
-    /// row a cell.
-    fn span_rows(
+    /// Step (e) of the seat's media call ([`vision_seat::Resident::encode_with`]): every feed's
+    /// image encoded on the resident encoder, its aligner rows read back as bf16 and spliced
+    /// ([`ds41_media::span_rows`]: the delimiter rows around the aligner's, the kind of each
+    /// position), all in one pair of buffers, with `model`'s card bound back after the tower. The
+    /// aligner emits the plan's token grid, one row a cell.
+    fn encode(
         &mut self,
+        model: &CudaContext,
         feeds: &[MediaFeed],
-    ) -> Result<vision_seat::SpanRows<body::MediaKind>, GateError> {
+    ) -> Result<vision_seat::Encoded<body::MediaKind>, GateError> {
         let (n_embd, delims) = (self.resident.n_embd(), &self.delims);
-        self.resident.span_rows(
+        self.resident.encode_with(
+            model,
             feeds
                 .iter()
                 .map(|f| vision_seat::Image::of(f.at, &f.prepared)),
@@ -1140,8 +1144,10 @@ impl Seat for V41 {
 
     /// Each feed's image encoded on the resident encoder, its aligner rows
     /// read back as bf16 and spliced — the one assembly [`ds41_media`] gives
-    /// the media gate — into one prompt call ([`Session::prompt_media`]),
-    /// the model's card bound back between the two ([`vision_seat::on_encoder_card`]).
+    /// the media gate — ([`Vision::encode`]), then one prompt call over the
+    /// spans of those rows, each with its positions' kinds
+    /// ([`vision_seat::Encoded::prompt`], the body's `prefill_media`); the
+    /// encode binds the model's card back before the prompt call.
     /// The lookup draft rebuilds its tables
     /// from the target's history at its next pass, as after any prompt call;
     /// the DSpark draft is refused by name (its window is fed by the prompt
@@ -1166,20 +1172,18 @@ impl Seat for V41 {
             Served::Lookup(_, follows) => *follows = false,
             Served::Off => {}
         }
+        let encoded = v.encode(s.model().gpu().context(), feeds)?;
         // Each span borrows its own ranges of the call's one pair of buffers.
-        let vision_seat::SpanRows { rows, kinds, ats } =
-            vision_seat::on_encoder_card(s.model().gpu().context(), || v.span_rows(feeds))?;
-        let spans: Vec<body::Span41<'_>> = ats
-            .iter()
-            .map(|a| body::Span41 {
-                span: body::MediaSpan {
-                    at: a.positions.clone(),
-                    rows: &rows[a.rows.clone()],
-                },
-                kinds: &kinds[a.kinds.clone()],
-            })
-            .collect();
-        let next = s.prompt_media(ids, &spans, Want::Argmax)?.argmax();
+        let next = encoded.prompt(s, ids, |r| {
+            r.media_spans()
+                .into_iter()
+                .zip(&r.ats)
+                .map(|(span, a)| body::Span41 {
+                    span,
+                    kinds: &r.kinds[a.kinds.clone()],
+                })
+                .collect()
+        })?;
         self.print_passes()?;
         Ok(next)
     }
