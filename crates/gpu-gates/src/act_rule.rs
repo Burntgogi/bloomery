@@ -216,7 +216,8 @@ impl SiteRel {
 /// - ik: `gguf::quant::activation_format`'s table, the weight type's `vec_dot_type` — Q3_K,
 ///   IQ2_XS, IQ3_S, IQ3_XXS and IQ4_XS read q8_K blocks of [`QK_K`] values, as Q2_K does, Q4_K, Q5_K, Q6_K, Q8_0, Q5_1 and
 ///   IQ4_NL q8_2 blocks of [`crate::ik_q8_2::QK`], F32 f32 — which ggml applies whatever the
-///   column count. The iqk matmul's `is_dequant_better` changes the weight's form, not the
+///   column count. The table's one q8_0 row, Q2_0, is mainline's, and no ik dot reads it:
+///   `None`. The iqk matmul's `is_dequant_better` changes the weight's form, not the
 ///   activation's, and only from 32 columns up (64 for Q6_K), so a batch under 32 columns runs
 ///   the weight's own dot on that form.
 /// - Ours: the form each launch reads. A dense site is `crates/gpu/src/site.rs`'s
@@ -243,6 +244,8 @@ pub fn site_rel(ty: GgmlType, arm: Arm) -> Option<SiteRel> {
     let ik = match activation_format(ty).ok()? {
         Some(ActivationFormat::Q8K) => Some(QK_K),
         Some(ActivationFormat::Q8_2X4) => Some(crate::ik_q8_2::QK),
+        // Q2_0's column, mainline's alone: no ik dot reads q8_0 blocks, so ik has no side to count.
+        Some(ActivationFormat::Q8_0) => return None,
         None => None,
     };
     let rel = |block: Option<usize>| block.map_or(0.0, q8_rel);
