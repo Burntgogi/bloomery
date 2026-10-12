@@ -8,7 +8,7 @@
     tools/ref/router-coverage.py oracle <set> <oracle set dir>
     tools/ref/router-coverage.py bursts <set> [<set>...] [--window 512] [--n-l <spec>] [--layers 2-39]
     tools/ref/router-coverage.py predict <set> [--n 4,8,16,32] [--layers 2-39] [--positions all|gen]
-                                 [--genre G[,G...]] [--tiers CARD,POOL ...]
+                                 [--genre G[,G...]] [--tiers CARD,POOL ...] [--expert-bytes FILE] [--json FILE]
     tools/ref/router-coverage.py --self-test
 
 A set is a directory router_trace wrote under $BLOOMERY_DATA/router/: counts.tsv, topk-<layer>.u16
@@ -547,7 +547,29 @@ def tier_spec(text):
     return c, p
 
 
-def predict(set_dir, n_list, keep=None, positions="all", genre=None, tiers=()):
+def read_expert_bytes(path):
+    """An explicit payload profile: bytes_by_layer maps layer numbers to one expert's bytes.
+    The source names the layout being counted; GGUF payload bytes are not padded arena or physical IO bytes."""
+    import json
+    try:
+        with open(path, encoding="utf-8") as f:
+            obj = json.load(f)
+        values = obj["bytes_by_layer"]
+        if not isinstance(values, dict) or not isinstance(obj.get("source"), str) or not obj["source"].strip():
+            raise ValueError("needs bytes_by_layer and a nonempty source")
+        out = {}
+        for key, value in values.items():
+            if not isinstance(key, str) or not key.isdigit() or str(int(key)) != key:
+                raise ValueError(f"layer {key!r} is not a canonical nonnegative integer")
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise ValueError(f"layer {key}: expert bytes must be a positive integer")
+            out[int(key)] = value
+        return out, obj["source"]
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        raise SetError(f"{path}: invalid expert payload profile: {e}") from None
+
+
+def predict(set_dir, n_list, keep=None, positions="all", genre=None, tiers=(), expert_bytes=None):
     try:
         import numpy as np
     except ImportError:
@@ -562,6 +584,12 @@ def predict(set_dir, n_list, keep=None, positions="all", genre=None, tiers=()):
     bad = [m for m in targets if m not in s["layers"] or m - 1 not in s["layers"]]
     if bad or not targets:
         raise SetError(f"{set_dir}: --layers {bad}: a predicted layer and the one before it must be in the set")
+    if expert_bytes is not None:
+        missing = [m for m in targets if m not in expert_bytes]
+        if missing or any(not isinstance(v, int) or isinstance(v, bool) or v <= 0 for v in expert_bytes.values()):
+            raise SetError(f"expert bytes: missing predicted layers {missing}, or nonpositive/noninteger bytes")
+        if not tiers:
+            raise SetError("expert bytes: --tiers is required to identify NVMe candidates")
     learn, held, said = predict_spans(s, positions, genre)
     if not all(b > a for a, b in learn + held):
         raise SetError(f"{set_dir}: an empty learn or held-out span ({said})")
@@ -623,6 +651,7 @@ def predict(set_dir, n_list, keep=None, positions="all", genre=None, tiers=()):
           f"{said}.\n")
     table = {"freq": [], "cooccur": [], "cooccur in-sample": []}
     acc = {t: {} for t in tiers}
+    byte_acc = {t: {} for t in tiers}
     P = 0
     for m in targets:
         a, b = layer(m - 1), layer(m)
@@ -648,9 +677,17 @@ def predict(set_dir, n_list, keep=None, positions="all", genre=None, tiers=()):
                     cand = E - ex.sum(axis=1)
                     row = acc[spec].setdefault((name, ranker), [0, [0] * len(n_list), [0] * len(n_list)])
                     row[0] += int(sel.sum())
+                    cost = None
+                    if expert_bytes is not None and name == "NVMe":
+                        cost = byte_acc[spec].setdefault(ranker, [0, [0] * len(n_list), [0] * len(n_list)])
+                        cost[0] += int(sel.sum()) * expert_bytes[m]
                     for i, n in enumerate(n_list):
-                        row[1][i] += int((pl < n).sum())
-                        row[2][i] += int(np.minimum(cand, n).sum())
+                        hit, read = int((pl < n).sum()), int(np.minimum(cand, n).sum())
+                        row[1][i] += hit
+                        row[2][i] += read
+                        if cost is not None:
+                            cost[1][i] += hit * expert_bytes[m]
+                            cost[2][i] += read * expert_bytes[m]
     L = len(targets)
     n_cols = " | ".join(f"n={n}" for n in n_list)
     print(f"### recall@n of all selections (%)\n\n| ranker | {n_cols} |\n|---|" + "---:|" * len(n_list))
@@ -662,6 +699,9 @@ def predict(set_dir, n_list, keep=None, positions="all", genre=None, tiers=()):
     for j, m in enumerate(targets):
         print(f"| {m} | " + " | ".join(pct(table[k][j][i]) for k in table for i in range(len(n_list))) + " |")
     print()
+    result = {"positions": P, "layers": targets, "n_expert": E, "n_used": K,
+              "split": said, "n": list(n_list), "recall": {
+                  k: [sum(r[i] for r in v) / L for i in range(len(n_list))] for k, v in table.items()}, "tiers": []}
     for spec, rows_ in acc.items():
         (ck, cn), (pk, pn) = spec
         sel = P * L * K
@@ -675,6 +715,28 @@ def predict(set_dir, n_list, keep=None, positions="all", genre=None, tiers=()):
             print(f"| {name} | {pct(miss / sel)} | {ranker} | " + " | ".join(
                 f"{pct(h / miss) if miss else '-'} | {pct(h / r) if r else '-'}" for h, r in zip(hits, reads)) + " |")
         print()
+        item = {"card": f"{ck}{cn}", "pool": f"{pk}{pn}", "classes": [
+            {"class": name, "ranker": ranker, "demand": miss, "hits": hits, "reads": reads}
+            for (name, ranker), (miss, hits, reads) in rows_.items()], "nvme_payload_cost": []}
+        if expert_bytes is not None:
+            print("NVMe payload cost [derived]: each position starts its top-n candidates outside the pool. "
+                  "A useful read replaces one demand read; unused reads add traffic. No cache admission, "
+                  "latency overlap, aligned IO, or engine throughput is simulated.\n")
+            print("| ranker | n | demand bytes | ahead bytes | useful bytes | wasted bytes | total bytes | read amplification |")
+            print("|---|---:|---:|---:|---:|---:|---:|---:|")
+            for ranker, (demand, useful, ahead) in byte_acc[spec].items():
+                for n, hit, read in zip(n_list, useful, ahead):
+                    total = demand - hit + read
+                    ratio = total / demand if demand else None
+                    row = {"ranker": ranker, "n": n, "demand_bytes": demand, "ahead_bytes": read,
+                           "useful_bytes": hit, "wasted_bytes": read - hit, "total_bytes": total,
+                           "read_amplification": ratio}
+                    item["nvme_payload_cost"].append(row)
+                    print(f"| {ranker} | {n} | {demand} | {read} | {hit} | {read-hit} | {total} | "
+                          f"{f'{ratio:.3f}' if ratio is not None else '-'} |")
+            print()
+        result["tiers"].append(item)
+    return result
 
 
 def read_oracle(oracle_dir):
@@ -947,6 +1009,34 @@ def self_test():
                         "| NVMe | 50.0 | freq | 25.0 | 25.0 | 50.0 | 25.0 |",
                         "| NVMe | 50.0 | cooccur | 50.0 | 50.0 | 100.0 | 50.0 |"):
                 assert row in out, (row, out)
+            with redirect_stdout(io.StringIO()):
+                cost = predict(nxt, (1, 2), tiers=[tier_spec("n2,n4")], expert_bytes={1: 10})
+            gold = [r for r in cost["tiers"][0]["nvme_payload_cost"] if r["ranker"] == "cooccur"]
+            assert [(r["demand_bytes"], r["ahead_bytes"], r["useful_bytes"], r["wasted_bytes"],
+                     r["total_bytes"], r["read_amplification"]) for r in gold] == [
+                         (80, 80, 40, 40, 120, 1.5), (80, 160, 80, 80, 160, 2.0)], gold
+            for profile in ({}, {1: 0}, {1: True}, {1: -1}):
+                try:
+                    with redirect_stdout(io.StringIO()):
+                        predict(nxt, (2,), tiers=[tier_spec("n2,n4")], expert_bytes=profile)
+                    raise AssertionError(f"invalid expert bytes accepted: {profile}")
+                except SetError:
+                    pass
+            import json
+            payload_path = os.path.join(tmp, "expert-bytes.json")
+            with open(payload_path, "w", encoding="utf-8") as f:
+                json.dump({"source": "fixture payload", "bytes_by_layer": {"1": 10}}, f)
+            assert read_expert_bytes(payload_path) == ({1: 10}, "fixture payload")
+            for bad_profile in ({"source": "fixture", "bytes_by_layer": {"01": 10}},
+                                {"source": "fixture", "bytes_by_layer": {"1": True}},
+                                {"source": "", "bytes_by_layer": {"1": 10}}):
+                with open(payload_path, "w", encoding="utf-8") as f:
+                    json.dump(bad_profile, f)
+                try:
+                    read_expert_bytes(payload_path)
+                    raise AssertionError(f"invalid profile file accepted: {bad_profile}")
+                except SetError:
+                    pass
             # the id-prefix card p2 is {0, 1} here too; pool n7 leaves expert 7 the one NVMe candidate, so each
             # position starts one read, not two: it serves both NVMe selections (7 in {6, 7}) of 8 reads
             buf = io.StringIO()
@@ -1017,7 +1107,7 @@ def main(argv):
             sets, opts, tiers = [], {}, []
             it = iter(argv[1:])
             for a in it:
-                if a in ("--n", "--layers", "--positions", "--genre", "--tiers"):
+                if a in ("--n", "--layers", "--positions", "--genre", "--tiers", "--expert-bytes", "--json"):
                     v = next(it, None)
                     if v is None:
                         raise SetError(f"{a} takes a value")
@@ -1031,9 +1121,16 @@ def main(argv):
                     sets.append(a)
             if len(sets) != 1 or opts.get("--positions", "all") not in ("all", "gen"):
                 raise SetError("predict: one set, and --positions all or gen")
-            predict(sets[0], tuple(int(n) for n in opts.get("--n", "4,8,16,32").split(",")),
+            profile, source = read_expert_bytes(opts["--expert-bytes"]) if "--expert-bytes" in opts else (None, None)
+            result = predict(sets[0], tuple(int(n) for n in opts.get("--n", "4,8,16,32").split(",")),
                     layer_list(opts["--layers"]) if "--layers" in opts else None, opts.get("--positions", "all"),
-                    opts.get("--genre"), tiers)
+                    opts.get("--genre"), tiers, profile)
+            if "--json" in opts:
+                import json
+                result["payload_source"] = source
+                with open(opts["--json"], "w", encoding="utf-8") as f:
+                    json.dump(result, f, indent=2, allow_nan=False)
+                    f.write("\n")
             return 0
         if len(argv) >= 2 and argv[0] == "bursts":
             sets, opts = [], {}
