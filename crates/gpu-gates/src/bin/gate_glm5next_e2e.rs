@@ -5621,6 +5621,17 @@ mod gate {
     /// of 128 values at the largest crest, in q²: `d²/4` with `d²/12` = (2q)².
     const WIDE_Q8: f64 = 12.0;
 
+    /// The least down-input term [`wide_terms`] takes, in q². A block's term
+    /// is `12·c²/128` for its crest `c` (largest magnitude over RMS): a flat
+    /// block (`c = 1`) gives 12/128 = 0.094, one nonzero value (`c² = 128`)
+    /// gives [`WIDE_Q8`]. The down's input is a SwiGLU product, whose least
+    /// layer term on the real file's every-node set (the routed experts'
+    /// product, the same SwiGLU of the same normed input) is 2.58; the floor
+    /// is a tenth of it, above a flat block's, so a tap that reads a constant
+    /// or near-constant buffer is refused by name instead of narrowing the
+    /// band toward the K-quant terms alone.
+    const DOWN_FLOOR: f64 = 0.258;
+
     /// One layer's tapped rows for [`Crest::of`]: their width and values.
     type TapRows<'a> = Option<(usize, &'a [f32])>;
 
@@ -5699,12 +5710,20 @@ mod gate {
     /// [`gemm_bands`]' terms: per layer, the gate·up and the down input's
     /// term the run's crest gives (`gate_up[l]`, `down[l]`, [`Crest::at`])
     /// where they read q8_1 blocks of 128 (`wide[l]`); an input of q8_1
-    /// blocks of 128 with no tap is refused by name.
+    /// blocks of 128 with no tap, and a down input whose term is under
+    /// [`DOWN_FLOOR`], are refused by name.
     fn wide_terms(
         wide: &[[bool; 2]],
         (gate_up, down): (&[Option<f64>], &[Option<f64>]),
     ) -> Result<Vec<[Option<f64>; 2]>, GateError> {
         let pick = |l: usize, what: &str, wide: bool, x: Option<f64>| match (wide, x) {
+            (true, Some(x)) if what == "down" && !(x >= DOWN_FLOOR) => {
+                Err(GateError::from(format!(
+                    "layer {l}: the down input's crest term {x:.3} q² is under its floor \
+                     {DOWN_FLOOR} q² (a SwiGLU product's blocks are far from flat): the tap \
+                     reads no SwiGLU rows"
+                )))
+            }
             (true, Some(x)) => Ok(Some(x)),
             (true, None) => Err(GateError::from(format!(
                 "layer {l}: a {what} of q8_1 blocks of 128 with no feed-forward tap"
