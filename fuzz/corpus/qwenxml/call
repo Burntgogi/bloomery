@@ -1,0 +1,6 @@
+앞<tool_call>
+<function=f>
+<parameter=s>🙂<x></parameter>
+<parameter=n>42</parameter>
+</function>
+</tool_call> 뒤

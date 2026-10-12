@@ -1,0 +1,2 @@
+앞<tool_call>{"name":"f","arguments":{"s":"🙂<x>","n":42}}</tool_call>
+<tool_call>{"name":"f","arguments":{}}</tool_call> 뒤
