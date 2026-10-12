@@ -4650,7 +4650,9 @@ mod gate {
             ),
             (
                 "a prompt call",
-                refused_by(&prompt, GLM_BODY, waits),
+                // A prompt call opens its residency pass first, and the
+                // model's boundary refuses it while the slots wait.
+                refused_by(&prompt, "GpuModel::pass_boundary", waits),
                 outcome(&prompt),
             ),
             (
