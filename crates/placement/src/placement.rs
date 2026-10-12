@@ -380,6 +380,7 @@ impl CardFormat {
             | GgmlType::IQ1_M
             | GgmlType::TQ1_0
             | GgmlType::TQ2_0
+            | GgmlType::Q2_0
             | GgmlType::Unknown(_) => None,
         }
     }
