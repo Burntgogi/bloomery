@@ -88,7 +88,9 @@ older families do not. Measured on the box with `du -sh` on 2026-10-10 (read-onl
 11 GB, `v41` 16 GB, `v41-r8` (the V4.1 sidecar) 7.3 GB. A contributor does not download those files: `fixture
 generate` writes random weights whose bytes are a function of the seed and the source header alone
 (`crates/model/src/fixture/mod.rs:29`) and hashes headers only (`plan.rs:224`), so a family's fixture is made again
-from the source repo's headers. Measured by the `fxfetch` round: `fixture fetch` made the qwen38 fixture (with its MTP
+from the source repo's headers, each grown to its file's listed length as a sparse file, since the loader refuses a
+file too short to hold its tensors (`dgx-spark.md` section 3.4).
+Measured by the `fxfetch` round: `fixture fetch` made the qwen38 fixture (with its MTP
 draft), the v41 fixture (with the r8 sidecar) and the glm5next fixture (at its pinned revision) byte-identical to the
 files on the box. What a contributor cannot make is the `fx_` reference sets: they are ik's output, and
 they are published as one dataset. The download is those sets: 6.48 GB in 17 sets and 29,941 files (the dry run of 2026-10-10, `just refset-publish-dry`;
@@ -138,8 +140,11 @@ they are published as one dataset. The download is those sets: 6.48 GB in 17 set
 2. Row 10: where do fixtures and the `fx_` sets live, and may a contributor regenerate fixtures from headers?
    **Answered 2026-10-11, the first half:** the `fx_` sets are public at
    <https://huggingface.co/datasets/midagedev/bloomery-refsets> (17 sets, 6.48 GB, with each base model's licence;
-   `dgx-spark.md` section 5, answer 3). Whether `fixture generate` needs only a source header is still open
-   (`dgx-spark.md` section 6).
+   `dgx-spark.md` section 5, answer 3).
+   **Answered 2026-10-12, the second half:** yes, from headers grown to each file's listed length as sparse files,
+   which is what `fixture fetch` writes; `fixture generate` reads no tensor data, but the loader refuses a file too
+   short to hold its tensors, such as a header cut at the data offset (`dgx-spark.md` section 3.4,
+   [#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6117747643)).
 3. Is a local mode (`BLOOMERY_BOX_LOCAL`) acceptable in the maintainers' own `box.sh`, given the guard and lease rules around it, or
    should the local path be a separate script?
    **Answered 2026-10-11:** in `box.sh`, as `BLOOMERY_BOX_LOCAL=1` (`dgx-spark.md` section 5, answer 10).
