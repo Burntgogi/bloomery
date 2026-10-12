@@ -1994,10 +1994,10 @@ FP
   rc=$(steal_case fo-re "steal-bal	B	a6000	10	$d" -- fo-any steal-bal fo-solo)
   printf '%s' "$rc" > "$t/rc-fo-re"
   rc_ok 'fixture-only run: a real batch with two deferred items ends green' fo-re 3
-  want 'fixture-only run: the deferred item has its own line' "$t/target/c-fo-re/run.log" '^fo-any rc=deferred fixture-only lane=- deferred=1$'
-  want '  … a solo one too' "$t/target/c-fo-re/run.log" '^fo-solo rc=deferred fixture-only lane=- deferred=1$'
+  want 'fixture-only run: the deferred item has its own line' "$t/target/c-fo-re/run.log" '^fo-any rc=deferred fixture-only lane=- tier=real deferred=1$'
+  want '  … a solo one too' "$t/target/c-fo-re/run.log" '^fo-solo rc=deferred fixture-only lane=- tier=real deferred=1$'
   want 'fixture-only run: the DONE line counts them in deferred= and in fixture_only=' "$t/target/c-fo-re/run.log" \
-    '^DONE total=3 red=0 skipped=0 wall=[0-9]+s laneA=[0-9]+s laneB=[0-9]+s deferred=2 fixture_only=2 deferred_list=[^ ]*/c-fo-re/deferred.list$'
+    '^DONE total=3 red=0 tier=real skipped=0 wall=[0-9]+s laneA=[0-9]+s laneB=[0-9]+s deferred=2 fixture_only=2 deferred_list=[^ ]*/c-fo-re/deferred.list$'
   want_row 'fixture-only run: the item that is not deferred ran' "$t/fake-state/box.log" '$2 ~ /gen_b$/'
   want_no_row 'fixture-only run: the batch never called a deferred recipe' "$t/fake-state/box.log" '$2 ~ /gen_fo$|gen_fs$/'
   want_no_row '  … and wrote no times row for it' "$t/times-fo-re.tsv" '$1 ~ /^fo-/'
@@ -2011,7 +2011,7 @@ FP
   rc=$(steal_case fo-all "steal-bal	B	a6000	10	$d" -- fo-any fo-solo)
   printf '%s' "$rc" > "$t/rc-fo-all"
   rc_ok 'fixture-only run: a batch of deferred items only ends green' fo-all 2
-  want 'fixture-only run: … its DONE line' "$t/target/c-fo-all/run.log" '^DONE total=2 red=0 skipped=0 wall=[0-9]+s laneA=0s laneB=0s deferred=2 fixture_only=2 deferred_list=[^ ]*/deferred.list$'
+  want 'fixture-only run: … its DONE line' "$t/target/c-fo-all/run.log" '^DONE total=2 red=0 tier=real skipped=0 wall=[0-9]+s laneA=0s laneB=0s deferred=2 fixture_only=2 deferred_list=[^ ]*/deferred.list$'
   want 'fixture-only run: … says nothing ran on the box' "$t/out-fo-all.log" '^gate-batch: every item is deferred to a fixture-tier batch — nothing runs on the box, so no lease check$'
   want_no_row 'fixture-only run: … and made no box call at all' "$t/fake-state/box.log" '1'
   rc=$(steal_case fo-fx "steal-bal	B	a6000	10	$d" -- --tier fixture fo-any ro-any steal-bal)
@@ -2019,7 +2019,7 @@ FP
   rc_ok 'fixture-only run: the fixture tier runs the recipe, beside a real-only item it defers' fo-fx 3
   want_row '  … through its box call, with the tier' "$t/fake-state/box.log" '$1 ~ /BLOOMERY_TIER=fixture/ && $2 ~ /gen_fo$/'
   want '  … and its DONE line counts the real-only item, not a fixture-only one' "$t/target/c-fo-fx/run.log" \
-    '^DONE total=3 red=0 skipped=0 wall=[0-9]+s laneA=[0-9]+s laneB=[0-9]+s deferred=1 real_only=1 deferred_list=[^ ]*/c-fo-fx/deferred.list$'
+    '^DONE total=3 red=0 tier=fixture skipped=0 wall=[0-9]+s laneA=[0-9]+s laneB=[0-9]+s deferred=1 real_only=1 deferred_list=[^ ]*/c-fo-fx/deferred.list$'
   want_not '  … with no fixture_only= in it' "$t/target/c-fo-fx/run.log" '^DONE .*fixture_only='
   # fxonly:end A
   # no-fixture (the header's deferred paragraph, kind 2): a family the fixture table of tools/ref/ref-paths.sh does not name is deferred
@@ -2111,10 +2111,10 @@ FP
   rc=$(steal_case fo-vr "steal-bal	B	a6000	10	$d" -- 'vr-q@BLOOMERY_FIXTURE_VARIANT=vt' fo-any steal-bal)
   printf '%s' "$rc" > "$t/rc-fo-vr"
   rc_ok 'fixture-only run: a real batch with a variant item and a fixture-only one ends green' fo-vr 3
-  want '  … each deferred item carries its own kind' "$t/target/c-fo-vr/run.log" '^vr-q rc=deferred variant lane=- deferred=1 item=vr-q@BLOOMERY_FIXTURE_VARIANT=vt$'
-  want '  … the fixture-only one too' "$t/target/c-fo-vr/run.log" '^fo-any rc=deferred fixture-only lane=- deferred=1$'
+  want '  … each deferred item carries its own kind' "$t/target/c-fo-vr/run.log" '^vr-q rc=deferred variant lane=- tier=real deferred=1 item=vr-q@BLOOMERY_FIXTURE_VARIANT=vt$'
+  want '  … the fixture-only one too' "$t/target/c-fo-vr/run.log" '^fo-any rc=deferred fixture-only lane=- tier=real deferred=1$'
   want '  … and the DONE line counts both kinds' "$t/target/c-fo-vr/run.log" \
-    '^DONE total=3 red=0 skipped=0 wall=[0-9]+s laneA=[0-9]+s laneB=[0-9]+s deferred=2 variant=1 fixture_only=1 deferred_list=[^ ]*/c-fo-vr/deferred.list$'
+    '^DONE total=3 red=0 tier=real skipped=0 wall=[0-9]+s laneA=[0-9]+s laneB=[0-9]+s deferred=2 variant=1 fixture_only=1 deferred_list=[^ ]*/c-fo-vr/deferred.list$'
   want '  … with the notes of both kinds in DIR/deferred.list' "$t/target/c-fo-vr/deferred.list" '^# variant: '
   want '  … both' "$t/target/c-fo-vr/deferred.list" '^# fixture-only: '
   # fxonly:end A2
