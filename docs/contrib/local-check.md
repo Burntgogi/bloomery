@@ -17,7 +17,7 @@ Mac").
   `just mac-test` runs `cargo test -p` on each natively on a Mac (`tools/mac-check.sh:1-15`).
 - **The Mac static tier:** `just mac-static [BASE]` runs fmt-check, clippy as an x86_64-linux cross check, the scoped
   build shapes (`recipes.py combos`) and every `tools/check-*.sh` in two lanes (`tools/mac-static.sh:1-15`).
-- **The host tier, x86_64 Linux, no card, no model file:** `python3 tools/recipes.py host-nightly` prints one unit a
+- **The host tier, x86_64 or aarch64 Linux, no card, no model file:** `python3 tools/recipes.py host-nightly` prints one unit a
   line, `name<TAB>command` (`bloomery-app`, `-gguf`, `-model`, `-qdot`, `-threads`, ... each `bash tools/gate.sh --release
   --locked -p <crate> --no-fail-fast`, then every `tools/check-*.sh` and `recipes-self-test`); `--excluded` names the six
   device crates it leaves out. `tools/nightly/run.sh` runs that list nightly on a VPS that is not the box and its header
@@ -37,14 +37,15 @@ Mac").
 
 `just contrib-check [--tier t0|t1]` is a recipe that calls one script, `tools/contrib-check.sh` (`just check-recipes`
 forbids a test recipe with `||` or a bare `cargo test`, so the logic lives in the script). The default tier is T1 on
-x86_64 Linux and T0 elsewhere; `--tier t2` prints `T2 is not built yet` and exits 64, and `--tier t1` on another host is a
-named 64. The script reads every list from its owner and copies none: the pure crates from `recipes.py pure-crates`, the
-Python self-tests from the `selftests=(` array of `tools/check-recipes.sh`, the host units from `recipes.py host-nightly`.
+x86_64 Linux and T0 elsewhere; `--tier t2` prints `T2 is not built yet` and exits 64, and `--tier t1` on a host other than
+x86_64 or aarch64 Linux is a named 64. The script reads every list from its owner and copies none: the pure crates
+from `recipes.py pure-crates`, the Python self-tests from the `selftests=(` array of `tools/check-recipes.sh`, the host
+units from `recipes.py host-nightly`.
 
 | Tier | Where | Runs |
 |---|---|---|
 | T0 | any OS with the pinned nightly (rustup, rustfmt) | `cargo fmt --all -- --check`; `cargo test -p <crate>` for each crate of `recipes.py pure-crates`; `python3 tools/recipes.py --self-test`; each Python tool self-test `check-recipes.sh` lists; every `tools/check-*.sh`. None of the check scripts is left out: each reads the tree and runs no cargo and no box command, `host-nightly` runs the same set, and all ran green on a Mac. The earlier draft of this page excluded `check-rustflags` as the maintainers' after a CPU change; it holds `.cargo/config.toml` against `.cargo/cuda-oxide.toml` and never reads this machine's CPU, so it runs |
-| T1 | x86_64 Linux, no card needed | T0, then every unit of `recipes.py host-nightly` that T0 did not already run under the same name (the check scripts and `recipes-self-test` run once), each `bash tools/gate.sh --release --locked -p <crate>` under a bound (`CONTRIB_UNIT_BOUND`, default 1200 s). Needs what `tools/nightly/install.sh` lists: the CUDA 13.3 headers, libclang for bindgen, python3-numpy and python3-pil |
+| T1 | x86_64 or aarch64 Linux, no card needed | T0, then every unit of `recipes.py host-nightly` that T0 did not already run under the same name (the check scripts and `recipes-self-test` run once), each `bash tools/gate.sh --release --locked -p <crate>` under a bound (`CONTRIB_UNIT_BOUND`, default 1200 s). Needs what `tools/nightly/install.sh` lists: the CUDA 13.3 headers, libclang for bindgen, python3-numpy and python3-pil |
 | T2 | T1 plus an NVIDIA card and fixtures | **not built.** The fixture-tier family gates: `just affected BASE`, run serially under `BLOOMERY_TIER=fixture`; a recipe the tier refuses by name (rc 66 from `tools/ref/real-only.sh` or `ref-paths.sh`; `gate-batch.sh` counts such items as `deferred`) is printed `DEFER`, never counted green (`tools/ref/fixture-only.sh` stops only the real tier, so a fixture-only recipe runs here) |
 
 `RUSTFLAGS`: on x86_64 Linux the script sets `-C target-cpu=native` for every cargo unit unless `RUSTFLAGS` is already set
@@ -63,7 +64,7 @@ is shown to fail first.
 Not built, still designed: the `--base` and `--require T2` flags, a `report.txt` per run (the header and the log directory
 carry its facts), the `SKIP`/`DEFER` unit states (no unit is skipped in T0 or T1), a call of `mac-static` on a Mac (it needs
 the maintainers' Mac environment file; `just mac-static` stays the Mac's static tier beside this command), and the T2 tier.
-aarch64 Linux runs T0 only until the host compiles there (`docs/contrib/dgx-spark.md`).
+aarch64 Linux runs T0 by default and T1 with `--tier t1` (`docs/contrib/dgx-spark.md`).
 
 ## The box assumptions T2 must bypass
 

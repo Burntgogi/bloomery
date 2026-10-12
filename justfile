@@ -90,7 +90,8 @@ remote-static *ARGS:
     ./tools/mac-remote.sh {{ARGS}}
 
 # An off-box check for a contributor: fmt, the pure crates' tests, the Python tool self-tests and every tools/check-*.sh
-# (T0, any OS with the pinned nightly), plus the host-nightly units on x86_64 Linux with no card (T1, the default there).
+# (T0, any OS with the pinned nightly), plus the host-nightly units on x86_64 or aarch64 Linux with no card (T1, the
+# default on x86_64).
 # `just contrib-check --tier t0|t1`. One line per unit, then a DONE line; docs/contrib/local-check.md. The owner is tools/contrib-check.sh.
 contrib-check *ARGS:
     ./tools/contrib-check.sh {{ARGS}}

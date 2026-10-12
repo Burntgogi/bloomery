@@ -15,7 +15,7 @@ The `cargo-oxide` install on a clean host has not been run yet (`docs/BUILD.md:3
 - **Pure crates, any OS.** `python3 tools/recipes.py pure-crates` lists them (`bloomery-serve`, `-tokenizer`, `-jinja`,
   `-hf`, `-refset`, `-placement`, `-levers`, `-runtime`, `-sampler`, `-decision`, `-models`, `-vision`); `cargo test -p
   <crate>` runs one. `bloomery-serve` has a mock engine, so the HTTP API is testable with no model.
-- **The host tier, x86_64 Linux, no card.** `python3 tools/recipes.py host-nightly` prints the units the nightly runs
+- **The host tier, x86_64 or aarch64 Linux, no card.** `python3 tools/recipes.py host-nightly` prints the units the nightly runs
   (`tools/nightly/run.sh`): a `cargo test --release` per crate that reaches no card, then every `tools/check-*.sh`.
   The build targets Zen 3 (`.cargo/config.toml:8`) and may stop with an illegal instruction on another CPU
   (`docs/BUILD.md:51`): set `RUSTFLAGS='-C target-cpu=native'` (`just contrib-check` does this for you; the nightly's own Zen 1 host sets `x86-64-v3`, `tools/nightly/run.sh:55`). A host with
