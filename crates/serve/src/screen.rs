@@ -9,29 +9,32 @@
 //! one decimal. A row is read from the last line of its record's head, so the
 //! order of lines of different heads does not move it; a fact whose record
 //! the start did not print is left off, and two records that name different
-//! placements are not joined. `NO_COLOR` (set and not empty) and `TERM=dumb`
+//! placements are not joined. A record the start printed whose value the
+//! screen could not read as a number is named on an `unread` row, never left
+//! off as if it had not been printed. `NO_COLOR` (set and not empty) and `TERM=dumb`
 //! draw it without colour; `TERM=dumb` or a locale that does not name UTF-8
 //! draws it in plain ASCII.
 
+use std::cell::RefCell;
 use std::io::IsTerminal;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// How the screen is drawn: with colour, and with UTF-8 glyphs or plain ASCII.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Style {
-    pub color: bool,
-    pub utf8: bool,
+struct Style {
+    color: bool,
+    utf8: bool,
 }
 
 /// The terminal variables [`Style::of`] reads, each as set (`None` unset).
 #[derive(Clone, Copy, Debug, Default)]
-pub struct TermVars<'a> {
-    pub term: Option<&'a str>,
-    pub no_color: Option<&'a str>,
-    pub lc_all: Option<&'a str>,
-    pub lc_ctype: Option<&'a str>,
-    pub lang: Option<&'a str>,
+struct TermVars<'a> {
+    term: Option<&'a str>,
+    no_color: Option<&'a str>,
+    lc_all: Option<&'a str>,
+    lc_ctype: Option<&'a str>,
+    lang: Option<&'a str>,
 }
 
 impl Style {
@@ -39,7 +42,7 @@ impl Style {
     /// `TERM` is `dumb`; UTF-8 when the first non-empty of `LC_ALL`,
     /// `LC_CTYPE` and `LANG` names it, and never on a `dumb` terminal.
     #[must_use]
-    pub fn of(v: TermVars<'_>) -> Style {
+    fn of(v: TermVars<'_>) -> Style {
         fn set(x: Option<&str>) -> Option<&str> {
             x.filter(|x| !x.is_empty())
         }
@@ -60,7 +63,7 @@ impl Style {
 
     /// The style of the process's terminal variables ([`Style::of`]).
     #[must_use]
-    pub fn of_terminal() -> Style {
+    fn of_terminal() -> Style {
         let term = std::env::var_os("TERM");
         let no_color = std::env::var_os("NO_COLOR");
         let lc_all = std::env::var_os("LC_ALL");
@@ -114,7 +117,7 @@ pub fn note(line: &str) {
 /// Draws the screen of the noted lines on stderr, once, and disarms: the
 /// server calls it when it begins to serve. Unarmed, or with no `listening`
 /// line noted, it draws nothing.
-pub fn draw() {
+pub(crate) fn draw() {
     ACTIVE.store(false, Ordering::Release);
     let Some((style, lines)) = tape().take() else {
         return;
@@ -131,16 +134,77 @@ fn tape() -> std::sync::MutexGuard<'static, Option<(Style, Vec<String>)>> {
 /// The literal every seat's `listening` record carries before its address.
 const LISTENING: &str = " listening on http://";
 
+/// The records the screen could not read a value of, in the order met.
+#[derive(Default)]
+struct Unread(RefCell<Vec<String>>);
+
+impl Unread {
+    /// Names the record `line` is, once.
+    fn note(&self, line: &str) {
+        let name = if line.contains(LISTENING) {
+            "listening"
+        } else {
+            line.split(' ').next().unwrap_or(line)
+        };
+        let mut names = self.0.borrow_mut();
+        if !names.iter().any(|n| n == name) {
+            names.push(name.to_owned());
+        }
+    }
+}
+
+/// The noted record lines the screen is drawn from, and the records it could
+/// not read a value of on the way.
+struct Start<'a, S> {
+    lines: &'a [S],
+    unread: Unread,
+}
+
+impl<'a, S: AsRef<str>> Start<'a, S> {
+    fn new(lines: &'a [S]) -> Self {
+        Start {
+            lines,
+            unread: Unread::default(),
+        }
+    }
+
+    fn line(&'a self, text: &'a str) -> Line<'a> {
+        Line {
+            text,
+            unread: &self.unread,
+        }
+    }
+
+    /// The last noted line that starts with `head` and carries ` key=`.
+    fn last(&'a self, head: &str, key: &str) -> Option<Line<'a>> {
+        self.lines
+            .iter()
+            .map(|l| self.line(l.as_ref()))
+            .rfind(|l| l.text.starts_with(head) && l.text(key).is_some())
+    }
+
+    /// The last line that carries the `listening` literal.
+    fn listening(&'a self) -> Option<Line<'a>> {
+        self.lines
+            .iter()
+            .map(|l| self.line(l.as_ref()))
+            .rfind(|l| l.text.contains(LISTENING))
+    }
+}
+
 /// One record line as printed, read by key.
 #[derive(Clone, Copy)]
-struct Line<'a>(&'a str);
+struct Line<'a> {
+    text: &'a str,
+    unread: &'a Unread,
+}
 
 impl<'a> Line<'a> {
     /// The text after ` key=`, up to the next ` name=` or the line's end.
     fn text(self, key: &str) -> Option<&'a str> {
         let pat = format!(" {key}=");
-        let start = self.0.find(&pat)? + pat.len();
-        let rest = &self.0[start..];
+        let start = self.text.find(&pat)? + pat.len();
+        let rest = &self.text[start..];
         Some(rest[..next_key(rest)].trim_end())
     }
 
@@ -149,15 +213,25 @@ impl<'a> Line<'a> {
         self.text(key)?.split_whitespace().next()
     }
 
-    /// `key`'s first word as a whole number.
+    /// `key`'s first word as a whole number; a word that is none is noted as
+    /// unread.
     fn num(self, key: &str) -> Option<u64> {
-        self.word(key)?.parse().ok()
+        let n = self.word(key)?.parse().ok();
+        if n.is_none() {
+            self.unread.note(self.text);
+        }
+        n
     }
 
-    /// The `(<n> B)` written beside `key`'s value.
+    /// The `(<n> B)` written beside `key`'s value, `None` where the value has
+    /// no parenthesis; a byte figure that is none is noted as unread.
     fn bytes_beside(self, key: &str) -> Option<u64> {
         let (_, inner) = self.text(key)?.split_once('(')?;
-        inner.strip_suffix(" B)")?.parse().ok()
+        let n = inner.strip_suffix(" B)").and_then(|b| b.parse().ok());
+        if n.is_none() {
+            self.unread.note(self.text);
+        }
+        n
     }
 
     /// Whether this line may be joined to the `listening` line's placement
@@ -186,14 +260,6 @@ fn next_key(rest: &str) -> usize {
         i = at + 1;
     }
     rest.len()
-}
-
-/// The last noted line that starts with `head` and carries ` key=`.
-fn last<'a, S: AsRef<str>>(lines: &'a [S], head: &str, key: &str) -> Option<Line<'a>> {
-    lines
-        .iter()
-        .map(|l| Line(l.as_ref()))
-        .rfind(|l| l.0.starts_with(head) && l.text(key).is_some())
 }
 
 /// `b` bytes in GiB, one decimal.
@@ -226,32 +292,46 @@ struct Marks {
 /// The screen's facts from the records `lines` holds: the seat's name and
 /// address from its `listening` line, `None` without one.
 fn facts<S: AsRef<str>>(lines: &[S], m: Marks) -> Option<Facts> {
-    let listen = lines
-        .iter()
-        .map(|l| Line(l.as_ref()))
-        .rfind(|l| l.0.contains(LISTENING))?;
-    let (head, addr) = listen.0.split_once(LISTENING)?;
+    let start = Start::new(lines);
+    let listen = start.listening()?;
+    let (head, addr) = listen.text.split_once(LISTENING)?;
     let seat = head.split(':').next()?.trim().to_owned();
     let addr = addr.trim().to_owned();
     let place = listen.word("place");
     let mut rows = vec![("url", format!("http://{addr}"))];
-    rows.extend(seat_rows(lines, listen, m));
-    let plan = last(lines, "plan ", "place").filter(|l| l.same_place(place));
-    let load = last(lines, "load ", "resident_bytes").filter(|l| l.same_place(place));
-    rows.extend(where_rows(lines, plan, load, m));
-    rows.extend(context_row(lines, listen, m));
-    if let Some(ram) = last(lines, "cache ", "ram").and_then(|c| c.num("ram")) {
+    rows.extend(seat_rows(&start, listen, m));
+    let plan = start.last("plan ", "place").filter(|l| l.same_place(place));
+    let load = start
+        .last("load ", "resident_bytes")
+        .filter(|l| l.same_place(place));
+    rows.extend(where_rows(&start, plan, load, m));
+    rows.extend(context_row(&start, listen, m));
+    if let Some(ram) = start.last("cache ", "ram").and_then(|c| c.num("ram")) {
         rows.push(match ram {
             0 => ("cache", "no prompt cache".to_owned()),
             r => ("cache", format!("{} of prompt cache in RAM", gib(r))),
         });
     }
-    let secs = load
-        .and_then(|l| l.0.rsplit_once(" in "))
-        .and_then(|(_, t)| t.split_once(" s"))
-        .and_then(|(s, _)| s.parse::<f64>().ok().map(|_| s));
-    if let Some(s) = secs {
-        rows.push(("loaded", format!("in {s} s")));
+    if let Some(load) = load {
+        let secs = load
+            .text
+            .rsplit_once(" in ")
+            .and_then(|(_, t)| t.split_once(" s"))
+            .and_then(|(s, _)| s.parse::<f64>().ok().map(|_| s));
+        match secs {
+            Some(s) => rows.push(("loaded", format!("in {s} s"))),
+            None => start.unread.note(load.text),
+        }
+    }
+    let unread = start.unread.0.borrow();
+    if !unread.is_empty() {
+        rows.push((
+            "unread",
+            format!(
+                "{}: a value is no number, see the record line",
+                unread.join(", ")
+            ),
+        ));
     }
     Some(Facts { seat, addr, rows })
 }
@@ -259,14 +339,15 @@ fn facts<S: AsRef<str>>(lines: &[S], m: Marks) -> Option<Facts> {
 /// The rows the `listening` line itself holds: the placement (with the
 /// `place unset` record's why when it names the same one), the
 /// architecture, and a decide seat's model and head.
-fn seat_rows<S: AsRef<str>>(
-    lines: &[S],
+fn seat_rows<'a, S: AsRef<str>>(
+    start: &'a Start<'a, S>,
     listen: Line<'_>,
     m: Marks,
 ) -> Vec<(&'static str, String)> {
     let mut rows = Vec::new();
     if let Some(place) = listen.word("place") {
-        let why = last(lines, "place unset ", "why")
+        let why = start
+            .last("place unset ", "why")
             .filter(|p| p.word("place") == Some(place))
             .and_then(|p| p.text("why"));
         rows.push((
@@ -295,8 +376,8 @@ fn seat_rows<S: AsRef<str>>(
 /// resident bytes), every plan card when there are several, the tier card,
 /// the host's experts and the NVMe tier — the arena the load was granted
 /// from its `nvtier` record, else the plan's, named as planned.
-fn where_rows<S: AsRef<str>>(
-    lines: &[S],
+fn where_rows<'a, S: AsRef<str>>(
+    start: &'a Start<'a, S>,
     plan: Option<Line<'_>>,
     load: Option<Line<'_>>,
     m: Marks,
@@ -331,7 +412,7 @@ fn where_rows<S: AsRef<str>>(
     if let Some(host) = experts(p, "host_experts") {
         rows.push(("host", host));
     }
-    let nvtier = last(lines, "nvtier ", "arena_granted");
+    let nvtier = start.last("nvtier ", "arena_granted");
     let granted = nvtier.and_then(|n| Some((n.num("paged")?, n.num("arena_granted")?)));
     match (granted, p.num("paged"), p.num("arena")) {
         (Some((paged, granted)), _, _) => {
@@ -362,13 +443,13 @@ fn where_rows<S: AsRef<str>>(
 
 /// The slots and their context: the `parallel` line's, else the
 /// `listening` line's.
-fn context_row<S: AsRef<str>>(
-    lines: &[S],
+fn context_row<'a, S: AsRef<str>>(
+    start: &'a Start<'a, S>,
     listen: Line<'_>,
     m: Marks,
 ) -> Option<(&'static str, String)> {
     let (dot, times) = (m.dot, m.times);
-    let parallel = last(lines, "parallel ", "slots");
+    let parallel = start.last("parallel ", "slots");
     let text = match parallel.and_then(|p| Some((p.num("slots")?, p.word("slot_ctx")?))) {
         Some((1, ctx)) => format!("1 slot {dot} {ctx} positions"),
         Some((n, ctx)) => match parallel.and_then(|p| p.word("total")) {
@@ -467,7 +548,7 @@ const RESET: &str = "\x1b[0m";
 /// The screen of the record lines `lines` in `style`, or `None` when they
 /// hold no `listening` line.
 #[must_use]
-pub fn render<S: AsRef<str>>(lines: &[S], style: Style) -> Option<String> {
+fn render<S: AsRef<str>>(lines: &[S], style: Style) -> Option<String> {
     let marks = if style.utf8 {
         Marks {
             dot: "·",
@@ -619,14 +700,38 @@ mod tests {
         text.lines().collect()
     }
 
+    fn golden_path(name: &str) -> String {
+        format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"))
+    }
+
+    fn read_golden(name: &str) -> String {
+        let path = golden_path(name);
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"))
+    }
+
+    /// `got` is the golden text `tests/fixtures/<name>`. The goldens are
+    /// written by this run itself, from the fixed starts above:
+    /// `SCREEN_BLESS=1 cargo test -p bloomery-serve --lib screen::` rewrites
+    /// them, and `git diff` shows what moved; any other value is refused.
+    fn golden(name: &str, got: &str) {
+        match std::env::var("SCREEN_BLESS").as_deref() {
+            Err(_) => assert_eq!(got, read_golden(name), "the golden {name}"),
+            Ok("1") => {
+                let path = golden_path(name);
+                std::fs::write(&path, got).unwrap_or_else(|e| panic!("{path}: {e}"));
+            }
+            Ok(other) => panic!("SCREEN_BLESS={other}: only 1 rewrites the goldens"),
+        }
+    }
+
     /// The screen of a fixed start, in UTF-8 and in ASCII, each the golden
     /// text; with colour, the same screen once the escapes are taken out.
     #[test]
     fn renders_the_golden_screens() {
         let got = render(&lines(START), UTF8).expect("the start has a listening line");
-        assert_eq!(got, include_str!("../tests/fixtures/screen-utf8.txt"));
+        golden("screen-utf8.txt", &got);
         let got = render(&lines(START), ASCII).expect("the start has a listening line");
-        assert_eq!(got, include_str!("../tests/fixtures/screen-ascii.txt"));
+        golden("screen-ascii.txt", &got);
         assert!(got.is_ascii(), "the ASCII screen holds a byte past ASCII");
 
         let colored = render(
@@ -653,7 +758,7 @@ mod tests {
     #[test]
     fn renders_the_granted_arena() {
         let got = render(&lines(START38), UTF8).expect("the start has a listening line");
-        assert_eq!(got, include_str!("../tests/fixtures/screen-qwen38.txt"));
+        golden("screen-qwen38.txt", &got);
         let no_nvtier: Vec<&str> = lines(START38)
             .into_iter()
             .filter(|l| !l.starts_with("nvtier "))
@@ -682,15 +787,17 @@ mod tests {
                     .any(|h| l.starts_with(h))
             })
             .collect();
-        let golden = include_str!("../tests/fixtures/screen-missing.txt");
-        assert_eq!(render(&missing, ASCII).unwrap(), golden);
+        golden("screen-missing.txt", &render(&missing, ASCII).unwrap());
         let reversed: Vec<&str> = missing.iter().rev().copied().collect();
-        assert_eq!(render(&reversed, ASCII).unwrap(), golden);
+        assert_eq!(
+            render(&reversed, ASCII).unwrap(),
+            read_golden("screen-missing.txt")
+        );
 
         let reversed: Vec<&str> = lines(START).into_iter().rev().collect();
         assert_eq!(
             render(&reversed, UTF8).unwrap(),
-            include_str!("../tests/fixtures/screen-utf8.txt")
+            read_golden("screen-utf8.txt")
         );
     }
 
@@ -741,15 +848,108 @@ mod tests {
         assert!(got.contains("2 slots x 8192 positions"), "{got}");
     }
 
-    /// A load wall that is no number leaves the `loaded` row off.
-    #[test]
-    fn a_wall_that_is_no_number_is_left_off() {
-        let start: Vec<String> = lines(START)
+    /// `text` as lines, the first line that starts with `head` with `from`
+    /// replaced by `to`.
+    fn mutated(text: &str, head: &str, from: &str, to: &str) -> Vec<String> {
+        let mut done = false;
+        lines(text)
             .into_iter()
-            .map(|l| l.replace(" in 41.2 s ", " in soon s "))
-            .collect();
-        let got = render(&start, ASCII).unwrap();
-        assert!(!got.contains("| loaded "), "{got}");
+            .map(|l| {
+                if !done && l.starts_with(head) {
+                    assert!(l.contains(from), "{from} is not in {l}");
+                    done = true;
+                    l.replacen(from, to, 1)
+                } else {
+                    l.to_owned()
+                }
+            })
+            .collect()
+    }
+
+    /// A value the screen shows as a number that is none (or, beside a
+    /// count, a byte figure that is none) leaves what it would have shown
+    /// off, and the `unread` row names the record: a record the start did
+    /// print and the screen could not read is told, not left off as if the
+    /// start had never printed it.
+    #[test]
+    fn a_value_that_is_no_number_is_named_not_filled_in() {
+        for (start, head, from, to, gone, record) in [
+            (
+                START,
+                "load ",
+                " in 41.2 s ",
+                " in soon s ",
+                "| loaded ",
+                "load",
+            ),
+            (
+                START,
+                "load ",
+                "resident_bytes=48318382080",
+                "resident_bytes=lots",
+                " resident",
+                "load",
+            ),
+            (
+                START,
+                "plan ",
+                "card_experts=2668 (",
+                "card_experts=many (",
+                "2668",
+                "plan",
+            ),
+            (
+                START,
+                "plan ",
+                "(44750684160 B)",
+                "(lots B)",
+                "(41.7 GiB)",
+                "plan",
+            ),
+            (
+                START,
+                "parallel ",
+                "slots=2 ",
+                "slots=two ",
+                "slots",
+                "parallel",
+            ),
+            (
+                START,
+                "cache ",
+                "ram=8589934592",
+                "ram=lots",
+                "| cache ",
+                "cache",
+            ),
+            (
+                START38,
+                "nvtier ",
+                "paged=107374182400",
+                "paged=lots",
+                "| nvme ",
+                "nvtier",
+            ),
+        ] {
+            let start = mutated(start, head, from, to);
+            let got = render(&start, ASCII).unwrap();
+            assert!(
+                !got.contains(gone),
+                "{gone} from a {record} value that is no number:\n{got}"
+            );
+            assert!(
+                got.lines()
+                    .any(|l| l.contains("| unread ") && l.contains(record)),
+                "no unread row naming {record}:\n{got}"
+            );
+        }
+        for start in [START, START38] {
+            let got = render(&lines(start), ASCII).unwrap();
+            assert!(
+                !got.contains("| unread "),
+                "an unread row from a clean start:\n{got}"
+            );
+        }
     }
 
     /// Several plan cards: the `devices` row is the plan's whole list.
