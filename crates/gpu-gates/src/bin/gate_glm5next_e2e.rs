@@ -399,7 +399,7 @@
 //! `--only media-seat` is (sm), the serve seat's media call (`shared/glm5next_media.rs`'s `seat`, behind the
 //! `vision` feature, which the bin's `required-features` leave out): our tower's rows of two procedural
 //! images (the fixture's encoder file, seated as `bloomery-serve --mmproj` seats it), through the seat's own
-//! steps (`Resident::span_rows`, `Session::prompt_media`), held to `prefill_media` called with spans put
+//! steps (`Resident::encode`, `Encoded::prompt`), held to `prefill_media` called with spans put
 //! together from the images' sizes — the same argmax and a bit-identical last hidden row — with a control
 //! that lies away from the media call and the tower's refusal of a grid past its cap by name. It declares
 //! no fixture-oracle clause, and the real tier fails it by name before any load (0 clauses).

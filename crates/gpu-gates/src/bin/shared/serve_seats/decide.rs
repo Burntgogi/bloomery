@@ -67,7 +67,7 @@ use std::time::Instant;
 use bloomery_gpu::GpuError;
 use bloomery_gpu::arch::qwen3moe::ubatch::UBATCH;
 use bloomery_gpu::arch::qwen3moe::{Body35, PrefillPath, Qwen35moeModel};
-use bloomery_gpu::media::{ImageSpan, MediaBody, MediaSpan};
+use bloomery_gpu::media::{ImageSpan, MediaBody};
 use bloomery_gpu_gates::generate::Place;
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::vision_seat::{self, EncoderSeat, PleImage, TextFacts};
@@ -257,8 +257,11 @@ impl Backbone {
     }
 
     /// [`Backbone::hidden`] of `ids` whose image spans `images` place: each image encoded on the
-    /// resident tower and read back, then one media prompt call with the rows spliced in. The
-    /// hidden states, the prompt call's wall and the tower's wall (encode and readback) in ms.
+    /// resident tower and read back ([`vision_seat::Resident::encode`]), then one media call with
+    /// the rows spliced in, which reads the hidden states, not a prompt call's argmax
+    /// ([`vision_seat::Encoded::prompt`] is the argmax call). The seat's own part is each image's
+    /// grid, the image's merged-token plan. The hidden states, the media call's wall and the
+    /// tower's wall (encode and readback) in ms.
     pub fn hidden_media(
         &mut self,
         ids: &[u32],
@@ -270,26 +273,18 @@ impl Backbone {
             .ok_or("an image request on a server with no encoder (--mmproj)")?;
         self.body.reset()?;
         let t = Instant::now();
-        let vision_seat::SpanRows { rows, ats, .. } = tower.merged_rows(
+        let encoded = tower.encode(
             self.body.context(),
             images
                 .iter()
                 .map(|i| vision_seat::Image::of(i.at, i.prepared)),
         )?;
         let tower_ms = t.elapsed().as_secs_f64() * 1e3;
-        // Each span borrows its own range of the call's one buffer of rows; its grid is the
-        // image's merged-token plan (`vision::GridPlan::span_grid`).
-        let spans: Vec<ImageSpan<'_>> = ats
+        let grids: Vec<(usize, usize)> = images
             .iter()
-            .zip(images)
-            .map(|(at, image)| ImageSpan {
-                span: MediaSpan {
-                    at: at.positions.clone(),
-                    rows: &rows[at.rows.clone()],
-                },
-                grid: image.prepared.patches.plan.span_grid(),
-            })
+            .map(|i| i.prepared.patches.plan.span_grid())
             .collect();
+        let spans = encoded.rows().image_spans(&grids);
         let t = Instant::now();
         let hidden = self.body.prefill_hidden_media(ids, &spans)?;
         Ok((hidden, t.elapsed().as_secs_f64() * 1e3, tower_ms))
@@ -312,7 +307,7 @@ mod image {
     use bloomery_gpu_gates::GateError;
     use std::time::Instant;
 
-    use bloomery_gpu_gates::vision_seat::{Image, Opened, ScratchHome, SpanRows};
+    use bloomery_gpu_gates::vision_seat::{Encoded, Image, Opened, ScratchHome};
     use cuda_core::CudaContext;
     use serve::media::MediaModel;
 
@@ -331,11 +326,11 @@ mod image {
             match *self {}
         }
 
-        pub fn merged_rows<'a>(
+        pub fn encode<'a>(
             &mut self,
             _: &CudaContext,
             _: impl IntoIterator<Item = Image<'a>>,
-        ) -> Result<SpanRows<()>, GateError> {
+        ) -> Result<Encoded, GateError> {
             match *self {}
         }
     }

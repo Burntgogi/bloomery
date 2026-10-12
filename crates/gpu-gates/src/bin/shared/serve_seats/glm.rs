@@ -285,8 +285,6 @@ use model::placement::slots::{SplitError, split_ctx};
 use model::placement::workstation::{HostNeed, MARGIN, TierBatchBytes};
 use model::placement::{Machine, Plan, PlanLevers};
 use runtime::Target;
-#[cfg(feature = "vision")]
-use runtime::Want;
 use runtime::seqstate::{Price, Why};
 use runtime::width::Mode as WidthMode;
 use serve::flag::number;
@@ -1633,18 +1631,19 @@ impl Seat for Glm {
         self.vision.as_ref().map(vision_seat::Resident::media)
     }
 
-    /// The selected slot's draft turned off ([`MEDIA_DRAFT_OFF_WHY`]; a slot already off stays as
-    /// it is, its reason and its record told once), each feed's image encoded on the resident
-    /// encoder and read back as bf16, one row a cell of its grid and nothing around them
-    /// ([`vision_seat::Resident::merged_rows`]: the ids carry the delimiters), then one prompt
-    /// call with the rows in place of their positions' embeddings ([`Session::prompt_media`], the
-    /// body's `prefill_media`), the model's card bound back between the two.
+    /// Each feed's image encoded on the resident encoder and read back as bf16, one row a cell of
+    /// its grid and nothing around them ([`vision_seat::Resident::encode`]: the ids carry the
+    /// delimiters), then the selected slot's draft turned off ([`MEDIA_DRAFT_OFF_WHY`]; a slot
+    /// already off stays as it is, its reason and its record told once; an image the tower
+    /// refuses leaves the draft on), then one prompt call with the rows in place of their
+    /// positions' embeddings ([`vision_seat::Encoded::prompt`], the body's `prefill_media`); the
+    /// encode binds the model's card back before the prompt call.
     #[cfg(feature = "vision")]
     fn prefill_media(&mut self, ids: &[u32], feeds: &[MediaFeed]) -> Result<u32, GateError> {
         let Some(v) = self.vision.as_mut() else {
             return Err("no --mmproj: this seat serves no image".into());
         };
-        let rows = v.merged_rows(
+        let encoded = v.encode(
             self.s.model().gpu().context(),
             feeds
                 .iter()
@@ -1654,10 +1653,7 @@ impl Seat for Glm {
         if !self.drafted.is_off(sel) {
             self.drafted.turn_off(sel, MEDIA_DRAFT_OFF_WHY)?;
         }
-        let next = self
-            .s
-            .prompt_media(ids, &rows.media_spans(), Want::Argmax)?
-            .argmax();
+        let next = encoded.prompt(&mut self.s, ids, |rows| rows.media_spans())?;
         self.print_passes()?;
         Ok(next)
     }

@@ -193,12 +193,6 @@ use runtime::Target as _;
 use serve::media::{MediaFeed, SharedMediaModel};
 use serve::{CacheNote, EngineProps, Saved, ServeError};
 use tokenizer::Tokenizer;
-#[cfg(feature = "vision")]
-use {
-    bloomery_gpu::media::{ImageSpan, MediaSpan},
-    runtime::Want,
-    std::ops::Range,
-};
 
 const NAME: &str = "bloomery-serve-qwen3";
 
@@ -498,32 +492,25 @@ trait Body3: Slots<Seq: 'static> + app::Prompt + app::Keep + Sized + 'static {
         let _ = (s, rows);
         Err("a round of several slots as one pass: this body runs its slots in turns".into())
     }
-    /// One prompt call of `ids` with `images` spliced in, the greedy token after the last id.
-    /// Refused by the default: only a qwen35moe file's body takes images.
+    /// One prompt call of `ids` with the `encoded` rows of the call's images spliced in, `grids`
+    /// the token grid `(nx, ny)` of each image (`vision::GridPlan::span_grid` holds the order);
+    /// the greedy token after the last id. Refused by the default: only a qwen35moe file's body
+    /// takes images.
     #[cfg(feature = "vision")]
     fn prompt_media(
         s: &mut app::Session<Self>,
         ids: &[u32],
-        images: &[Placed<'_>],
+        encoded: vision_seat::Encoded,
+        grids: &[(usize, usize)],
     ) -> Result<u32, GateError> {
-        let _ = (s, ids);
+        let _ = (s, ids, encoded);
         Err(format!(
             "a prompt with {} images: a {} file takes no image input",
-            images.len(),
+            grids.len(),
             Self::ARCH
         )
         .into())
     }
-}
-
-/// One image of a media call as a body takes it: the positions its span holds in the call's ids,
-/// its rows (`n_embd` bf16 values a position) and its token grid `(nx, ny)`, `nx` tokens along a
-/// line and `ny` lines (`vision::GridPlan::span_grid` holds the order).
-#[cfg(feature = "vision")]
-struct Placed<'a> {
-    at: Range<usize>,
-    rows: &'a [u16],
-    grid: (usize, usize),
 }
 
 impl Body3 for Body {
@@ -704,7 +691,7 @@ impl Body3 for Body35 {
         super::rounds::step_rows_one_pass(s, rows)
     }
 
-    /// The session's media call ([`app::Session::prompt_media`]): each image's span of the call
+    /// The session's media call ([`vision_seat::Encoded::prompt`]): each image's span of the call
     /// takes its rows in place of its positions' embeddings and shifts the sequence's rotation
     /// table by its grid, an `(nx, ny)` of positions in raster order. The architecture's own fact
     /// is the grid; the rows are the tower's.
@@ -712,19 +699,10 @@ impl Body3 for Body35 {
     fn prompt_media(
         s: &mut app::Session<Body35>,
         ids: &[u32],
-        images: &[Placed<'_>],
+        encoded: vision_seat::Encoded,
+        grids: &[(usize, usize)],
     ) -> Result<u32, GateError> {
-        let spans: Vec<ImageSpan<'_>> = images
-            .iter()
-            .map(|p| ImageSpan {
-                span: MediaSpan {
-                    at: p.at.clone(),
-                    rows: p.rows,
-                },
-                grid: p.grid,
-            })
-            .collect();
-        Ok(s.prompt_media(ids, &spans, Want::Argmax)?.argmax())
+        encoded.prompt(s, ids, |rows| rows.image_spans(grids))
     }
 }
 
@@ -855,31 +833,25 @@ impl<B: Body3> Seat for Q3<B> {
 
     /// Each feed's image encoded on the resident encoder and read back as bf16, one row a cell of
     /// its grid and nothing around them ([`vision_seat::merged_cells`]: the tokens carry the
-    /// delimiters; [`vision_seat::Resident::merged_rows`]), then one prompt call with the images
-    /// spliced in ([`Body3::prompt_media`]), the model's card bound back between the two.
+    /// delimiters; [`vision_seat::Resident::encode`]), then one prompt call with the images
+    /// spliced in ([`Body3::prompt_media`]); the encode binds the model's card back before the
+    /// prompt call. The seat's own part is each image's grid, the image's merged-token plan.
     #[cfg(feature = "vision")]
     fn prefill_media(&mut self, ids: &[u32], feeds: &[MediaFeed]) -> Result<u32, GateError> {
         let Some(v) = self.vision.as_mut() else {
             return Err("no --mmproj: this seat serves no image".into());
         };
-        let vision_seat::SpanRows { rows, ats, .. } = v.merged_rows(
+        let encoded = v.encode(
             self.s.model().gpu().context(),
             feeds
                 .iter()
                 .map(|f| vision_seat::Image::of(f.at, &f.prepared)),
         )?;
-        // Each span borrows its own range of the call's one buffer of rows; its grid is the
-        // image's merged-token plan (`vision::GridPlan::span_grid`).
-        let images: Vec<Placed<'_>> = ats
+        let grids: Vec<(usize, usize)> = feeds
             .iter()
-            .zip(feeds)
-            .map(|(a, f)| Placed {
-                at: a.positions.clone(),
-                rows: &rows[a.rows.clone()],
-                grid: f.prepared.patches.plan.span_grid(),
-            })
+            .map(|f| f.prepared.patches.plan.span_grid())
             .collect();
-        B::prompt_media(&mut self.s, ids, &images)
+        B::prompt_media(&mut self.s, ids, encoded, &grids)
     }
 
     fn step(&mut self, last: u32) -> Result<u32, GateError> {

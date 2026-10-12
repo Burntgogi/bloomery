@@ -2258,7 +2258,7 @@ gate-gpu-glm5next-media:
 # The serve seat's media call of the same fixture (`bloomery-serve --mmproj` on a GLM file), gate_glm5next_e2e's `--only media-seat`
 # ((sm), `shared/glm5next_media.rs`'s `seat`, built with the `vision` feature the other recipes leave out): the encoder file of
 # the fixture's image sets, seated as the seat seats it and loaded as its resident tower; two procedural images of known grids
-# encoded on it and spliced through the seat's own steps (`Resident::span_rows`, `Session::prompt_media`), held to
+# encoded on it and spliced through the seat's own steps (`Resident::encode`, `Encoded::prompt`), held to
 # `prefill_media` called with spans put together from the images' sizes, the same argmax and a bit-identical last hidden row; a
 # control without the rows that lies away from it; and the tower's refusal by name of a grid past its cap. No oracle: the
 # numbers' quality is the tower's gate's and (im)'s. Fixture tier only: on the real tier the bin fails by name before any load

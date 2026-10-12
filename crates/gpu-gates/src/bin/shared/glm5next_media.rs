@@ -185,11 +185,14 @@ pub fn media_clause(m: &mut Glm5nextModel) -> Result<bool, GateError> {
 }
 
 /// (sm): the serve seat's media call (`bloomery-serve --mmproj` on a GLM file) against the body's own,
-/// on our tower's rows of procedural images. The seat's steps are the resident encoder's
-/// `merged_rows` (the one call the Qwen3 and GLM seats make for their rows), then
-/// `Session::prompt_media` over the spans the rows make (`serve_seats::glm`'s `prefill_media`); the
-/// body's call is `prefill_media` with spans put together from the images' known sizes. The numbers' quality is the tower's gate's and (im)'s, not this
-/// one's: any image will do.
+/// on our tower's rows of procedural images. The seat's call is the owner's two steps
+/// (`vision_seat`): the resident encoder's `Resident::encode`, then `Encoded::prompt` with the
+/// `media_spans` builder, the steps `serve_seats::glm`'s `prefill_media` runs. What stays outside
+/// the owner, and so outside this clause, is that seat's own glue: the feeds' `Image` list, the
+/// selected slot's draft turn-off between the two steps, and `print_passes` after them
+/// (`weekly-gpu-glm5next-media-serve` runs the seat). The body's call is `prefill_media` with
+/// spans put together from the images' known sizes, never from the owner's builder. The numbers'
+/// quality is the tower's gate's and (im)'s, not this one's: any image will do.
 #[cfg(feature = "vision")]
 pub mod seat {
     use std::path::Path;
@@ -202,7 +205,6 @@ pub mod seat {
     };
     use bloomery_gpu_gates::{GateError, verdict};
     use bloomery_gpu_glm5next::{Body, prefill, prefill_media, set_prefill_media};
-    use runtime::Want;
     use vision::Prepared;
     use vision::Rgb8;
     use vision::arch::glm5v::{
@@ -349,7 +351,7 @@ pub mod seat {
         let small = opened(mmproj, SMALL_CAP, n_embd, vocab)?;
         let mut narrow = Resident::open(&ctx, &small)?;
         let from = s.model().pos();
-        let refused = narrow.merged_rows(&ctx, [Image::of(starts[0], &images[0])]);
+        let refused = narrow.encode(&ctx, [Image::of(starts[0], &images[0])]);
         let named = matches!(
             &refused,
             Err(e) if e.to_string().contains("does not fit the tower's buffers")
@@ -370,15 +372,16 @@ pub mod seat {
         ok &= named && stood;
         drop(narrow);
 
-        // The seat's steps: both images encoded on the resident encoder in one call, read back as bf16
-        // rows, one a cell of each grid, then one prompt call over the spans those rows make.
-        let rows = tower.merged_rows(
+        // The seat's encode step: both images encoded on the resident encoder in one call and read
+        // back as bf16 rows, one a cell of each grid.
+        let encoded = tower.encode(
             &ctx,
             images
                 .iter()
                 .zip(&starts)
                 .map(|(p, &start)| Image::of(start, p)),
         )?;
+        let rows = encoded.rows();
         let finite = rows.rows.iter().all(|&b| bf16(b).is_finite());
         let alive = rows.rows.iter().any(|&b| bf16(b) != 0.0);
         println!(
@@ -389,13 +392,10 @@ pub mod seat {
             verdict(finite && alive && rows.rows.len() == tokens.iter().sum::<usize>() * n_embd)
         );
         ok &= finite && alive && rows.rows.len() == tokens.iter().sum::<usize>() * n_embd;
-        s.model_mut().reset()?;
-        let seat_next = s
-            .prompt_media(&ids, &rows.media_spans(), Want::Argmax)?
-            .argmax();
-        let seat_row = s.model().head_normed()?;
 
         // The body's call on the same rows, its spans put together from the images' known sizes.
+        // It runs before the seat's prompt step, which consumes the rows: nothing that step does
+        // to its own copy reaches this one.
         let mut first = 0;
         let spans: Vec<MediaSpan<'_>> = tokens
             .iter()
@@ -412,6 +412,12 @@ pub mod seat {
         s.model_mut().reset()?;
         let body_next = prefill_media(s.model_mut(), &ids, &spans)?;
         let body_row = s.model().head_normed()?;
+
+        // The seat's prompt step, the owner's: one prompt call over the spans its builder makes of
+        // the rows. The seat's own part is the encode's image list and the builder (`media_spans`).
+        s.model_mut().reset()?;
+        let seat_next = encoded.prompt(s, &ids, |r| r.media_spans())?;
+        let seat_row = s.model().head_normed()?;
         let same_bits = seat_row.len() == body_row.len()
             && seat_row
                 .iter()

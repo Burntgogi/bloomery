@@ -69,8 +69,9 @@ bloomery-decision = { path = "../decision", optional = true }
 serde_json = { version = "=1.0.151", optional = true }
 # `generate_ds41` drives the V4.1 session (`bloomery-app`, its `deepseek41` feature) through the
 # generation loop and the drafts of `bloomery-runtime`; `generate_qwen3moe` runs its arms through
-# the session (the `gpu` feature, no model crate of the session's). Named only by those bins: the
-# library never names the session crate, which names the V4.1 device crate under `deepseek41`.
+# the session (the `gpu` feature, no model crate of the session's); the library's `vision_seat`
+# names it for an image seat's prompt call (`Encoded::prompt`). The session crate names the V4.1
+# device crate under `deepseek41`.
 bloomery-app = { path = "../app", optional = true }
 bloomery-runtime = { path = "../runtime", optional = true }
 # The V4.1 image encoder on the card and its host crate: the device encoder is reached
