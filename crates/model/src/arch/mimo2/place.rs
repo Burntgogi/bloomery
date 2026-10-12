@@ -9,7 +9,10 @@
 //! ([`card_routed`]) and keeps the rest of every layer's experts on the host
 //! ([`placement::plan_routed`], the path the other hybrid families plan by),
 //! every layer's KV planes full whatever its window, and refuses by name a
-//! machine that hangs an expert tier card and a context of no position.
+//! machine that hangs an expert tier card, a context of no position and a
+//! host room that cannot hold the host experts: the body serves no NVMe
+//! expert tier, so a plan that pages one ([`PlaceError::NoNvmeTier`]) would
+//! load experts nothing serves.
 
 use std::num::NonZeroUsize;
 
@@ -22,6 +25,7 @@ use super::{roles, spec};
 use crate::arch::chat_of;
 use crate::arch::coverage;
 use crate::placement::accepts::{Program, routed_rule};
+use crate::placement::workstation::{self, HostNeed, HostRead};
 use crate::placement::{
     self, CardFormat, KvBytes, Machine, ModelTensors, PlacementError, Plan, PlanLevers,
     Unimplemented, Violation, checked, joined,
@@ -39,7 +43,7 @@ pub fn card_routed(ty: GgmlType) -> Option<CardFormat> {
 }
 
 /// What a plan of a mimo2 file is made from, read from its headers.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct PlanInputs {
     /// The file's hyperparameters.
     pub hp: Hparams,
@@ -49,6 +53,20 @@ pub struct PlanInputs {
     pub spec: ModelSpec,
     /// Each trunk layer's KV bytes.
     pub kv: KvLayout,
+    /// The host's available bytes when the inputs were read, with the
+    /// reading that decided ([`workstation::host_available_read`]): the
+    /// routed experts the room cannot hold follow it to the NVMe tier
+    /// ([`placement::expert_nvme_tier`]), which the body does not serve, so
+    /// such a plan is refused ([`PlaceError::NoNvmeTier`]). A gate that
+    /// plans an arm by a room of its own sets it, read [`HostRead::Given`].
+    ///
+    /// The plan is made at [`workstation::plan_room`]: a read room less
+    /// [`workstation::HOST_DRIFT`], a given room as given.
+    pub room: (u64, HostRead),
+    /// The arena's bytes `BLOOMERY_NVTIER_BYTES` gave the split dial
+    /// ([`workstation::nvtier_arena_given`]), `None` unset; the split takes it
+    /// as its `given`. A gate that plans an arm by an arena of its own sets it.
+    pub arena: Option<u64>,
 }
 
 /// Why a plan was refused.
@@ -75,6 +93,24 @@ pub enum PlaceError {
     /// A context of no position: no plane, nothing to serve.
     #[error("ctx_max 0: a plan serves at least one position")]
     CtxZero,
+    /// The host room cannot hold the host experts, so the plan pages some to
+    /// the NVMe expert tier. The body builds its host run without that tier
+    /// (`HostRun::build`, not the common `host_run` that attaches it), so the
+    /// paged experts would load into nothing that serves them.
+    #[error(
+        "the host need {need} B passes the room, so the plan pages {paged} B of routed experts \
+         to the NVMe expert tier{room}, and the MiMo engine serves no NVMe expert tier; free \
+         host memory (the room is the host's available bytes, or BLOOMERY_HOST_ROOM where set)"
+    )]
+    NoNvmeTier {
+        /// The routed-expert bytes the plan leaves on the NVMe tier.
+        paged: u64,
+        /// The host need before any expert is paged ([`HostNeed::bytes`]).
+        need: u64,
+        /// The room the plan was made at, as the plan names it
+        /// ([`placement::HostTotals::room_clause`]).
+        room: String,
+    },
 }
 
 impl PlanInputs {
@@ -105,19 +141,40 @@ impl PlanInputs {
     }
 
     /// [`PlanInputs::read`] without the refusals: the file as it is, for a
-    /// gate that plans or describes a file whatever the coverage list holds.
+    /// gate that plans or describes a file whatever the coverage list holds,
+    /// and the host's room ([`workstation::host_available_read`]) and the
+    /// arena's given bytes, a room that cannot be read refused by name.
     pub fn describe(split: &Split) -> Result<PlanInputs, PlacementError> {
         let hp = Hparams::read(split)?;
         let model = roles::classify(split, &hp)?;
         let chat = chat_of(split, spec::TOOLS, Some(models::ReasoningFormat::ThinkSpan))?;
         let spec = spec::spec_of(&hp, &model, chat)?;
         let kv = KvLayout::of(&hp);
+        let room = workstation::host_available_read().map_err(PlacementError::HostRoom)?;
+        let arena = workstation::nvtier_arena_given().map_err(PlacementError::HostRoom)?;
         Ok(PlanInputs {
             hp,
             model,
             spec,
             kv,
+            room,
+            arena,
         })
+    }
+
+    /// The same inputs at an unbounded host room (`HostRead::Given` of every
+    /// byte, no arena): the plan they make pages no expert to the NVMe tier,
+    /// so what it holds on the card is the card's alone. The card probe of
+    /// the default context's search; a machine whose card shares the host's
+    /// memory has no such plan, and the ladder
+    /// ([`placement::ctx::Veto::Ladder`]) does not ask this one.
+    #[must_use]
+    pub fn room_free(&self) -> PlanInputs {
+        PlanInputs {
+            room: (u64::MAX, HostRead::Given),
+            arena: None,
+            ..self.clone()
+        }
     }
 
     /// Every feature of the file the engine does not run, as
@@ -130,8 +187,9 @@ impl PlanInputs {
     /// the placement's `levers`: the expert rule on the layers whose routed
     /// stacks [`card_routed`] runs, each such layer's id prefix on the card
     /// as far as its budget holds them, the rest on the host; refused by name
-    /// a context of no position, a machine that hangs an expert tier card
-    /// and a context whose KV planes do not fit the card.
+    /// a context of no position, a machine that hangs an expert tier card,
+    /// a context whose KV planes do not fit the card and a host room under the
+    /// host experts' need ([`PlanInputs::plan_with_slots`]).
     pub fn plan<'a>(
         &'a self,
         machine: &'a Machine,
@@ -147,6 +205,13 @@ impl PlanInputs {
     /// [`PlanInputs::seq_terms`]), refused as [`PlanInputs::plan`] refuses.
     /// A sequence holds nothing beside its stores, so the card's kv class is
     /// `slots` sequences' stores.
+    ///
+    /// The host experts are held to the room the inputs name
+    /// ([`PlanInputs::room`]): a room under the host need runs the common
+    /// NVMe tier split ([`placement::expert_nvme_tier`], which refuses a room
+    /// under the tier's floor by name), and a plan that comes out paging any
+    /// routed expert is refused ([`PlaceError::NoNvmeTier`]), for the body
+    /// serves no such tier.
     pub fn plan_with_slots<'a>(
         &'a self,
         machine: &'a Machine,
@@ -164,7 +229,7 @@ impl PlanInputs {
             });
         }
         let kv = self.seq_terms().slots_of(slots.get() as u64);
-        let plan = placement::plan_routed(
+        let mut plan = placement::plan_routed(
             &self.model,
             machine,
             ctx_max,
@@ -172,6 +237,16 @@ impl PlanInputs {
             levers,
             routed_rule(Program::Mimo2Body),
         )?;
+        let need = HostNeed::of(&plan, 0).bytes();
+        let room = plan.host.plan_at(&self.room);
+        placement::expert_nvme_tier(&mut plan, room, self.arena)?;
+        if plan.host.nvme_expert_bytes > 0 {
+            return Err(PlaceError::NoNvmeTier {
+                paged: plan.host.nvme_expert_bytes,
+                need,
+                room: plan.host.room_clause(),
+            });
+        }
         checked(plan).map_err(PlaceError::Broken)
     }
 
@@ -242,7 +317,7 @@ mod tests {
         Stores, card_routed,
     };
     use crate::arch::synthetic::{V, header_shaped};
-    use crate::placement::workstation;
+    use crate::placement::workstation::{self, HostRead};
 
     /// A layer's plane: its own KV-head count's key and value rows in f16 a
     /// position — a window layer's plane is as full as a full layer's, and at
@@ -387,6 +462,59 @@ mod tests {
             inputs.plan(&machine, 0, &levers),
             Err(PlaceError::CtxZero)
         ));
+    }
+
+    /// A host room under the host experts' need is refused by name: the need,
+    /// the bytes the plan pages, the room the plan was made at, and that the
+    /// engine serves no NVMe expert tier. The serve gate holds the fixed words
+    /// (`gate_mimo2_serve`'s `NO_TIER_REFUSAL`).
+    #[test]
+    fn a_room_under_the_host_need_is_refused_by_name() {
+        let err = PlaceError::NoNvmeTier {
+            paged: 1_073_741_824,
+            need: 150_000_000_000,
+            room: "; the plan was made at a reading of 149000000000 B (plan room 149000000000 B)"
+                .to_owned(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "the host need 150000000000 B passes the room, so the plan pages 1073741824 B of \
+             routed experts to the NVMe expert tier; the plan was made at a reading of \
+             149000000000 B (plan room 149000000000 B), and the MiMo engine serves no NVMe \
+             expert tier; free host memory (the room is the host's available bytes, or \
+             BLOOMERY_HOST_ROOM where set)"
+        );
+    }
+
+    /// The card probe's inputs are the file's at an unbounded given room and
+    /// no arena, and nothing else changes.
+    #[test]
+    fn room_free_unbounds_the_room_alone() {
+        let path = header_shaped(
+            "mimo2-place-room-free",
+            "mimo2",
+            &keys(),
+            &[
+                ("tokenizer.ggml.pre", V::Str("qwen2")),
+                ("tokenizer.chat_template", V::Str("{{ messages }}")),
+            ],
+            &tensors(),
+        );
+        let split = Split::open(&path).expect("the synthetic header opens");
+        let mut inputs = PlanInputs::describe(&split).expect("the synthetic header describes");
+        let _ = std::fs::remove_file(&path);
+        inputs.room = (7, HostRead::MemAvailable);
+        inputs.arena = Some(3);
+        let free = inputs.room_free();
+        assert_eq!(free.room, (u64::MAX, HostRead::Given));
+        assert_eq!(free.arena, None);
+        assert_eq!(free.hp, inputs.hp);
+        assert_eq!(free.model.layers, inputs.model.layers);
+        assert_eq!(
+            inputs.room,
+            (7, HostRead::MemAvailable),
+            "the original stays"
+        );
     }
 
     /// The small header of the `hparams` tests' keys with its next-token

@@ -268,8 +268,12 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               bytes: the placed loads' host-need check, the residency rules' room and the \
               Qwen3.8 plan's tiers, where the routed experts a room cannot hold are planned \
               on the NVMe tier; a room under that tier's floor is refused with the room, the \
-              floor and the need. On a device that allocates from host memory it is also the \
-              device's free bytes, which the census and the load-time allocation fits read.",
+              floor and the need. The MiMo plan reads it too and serves no NVMe expert tier, \
+              so it refuses a room that cannot hold its host experts, naming the room and \
+              the need, and its default context is the card's deepest, the floor where the \
+              room cannot hold that one. On a device that allocates from host memory it is \
+              also the device's free bytes, which the census and the load-time allocation \
+              fits read.",
         site: Site::Parsed {
             left: &[],
             phase: Phase::Load,

@@ -3,7 +3,8 @@
 //! none ([`default_slot_ctx_by_card`], over [`fit_of`]'s largest context the
 //! plan holds), the prompt-cache guard that bounds it by the budget the plan
 //! leaves at each context ([`within_cache`]), the search over a context grid
-//! the mimo2 default runs ([`searched`]) and the slot count a `--ctx` flag
+//! the mimo2 default runs ([`searched`], and [`searched_by_card`] where a host
+//! room reads in) and the slot count a `--ctx` flag
 //! buys ([`slots_of`]) — more positions on the card push card experts to the
 //! host, and decode crawls, so a context the flag did not name never trades
 //! away more than the margin of stage-card expert bytes, and never misses the
@@ -51,6 +52,12 @@
 //! answer is the first rung, from the default down to the base, whose state
 //! holds the budget there, and it changes only where the budget crosses one
 //! rung's state.
+//!
+//! The grid search ([`searched`]) is the same class where its plan reads the
+//! host room: a search over a `fits` that plans at the room read would take
+//! the largest grid context the reading holds, one step of the grid at a time.
+//! [`searched_by_card`] searches over the card's plan (an unbounded room), then
+//! asks the room once, at the context it found.
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
@@ -316,7 +323,8 @@ fn scan<E>(
 }
 
 /// What decided a default context ([`SlotCtx::rule`]): the card holds fewer
-/// than a base context.
+/// than a base context ([`default_slot_ctx`]), or, in the grid search
+/// ([`searched_by_card`]), fewer than the trained one.
 pub const RULE_CARD: &str = "card";
 /// No multiple of the step past the base is within the margin.
 pub const RULE_BASE: &str = "base";
@@ -331,6 +339,13 @@ pub const RULE_HOST: &str = "host";
 /// The unified pool's reading took a lower rung of the halving ladder than the
 /// top one ([`Veto::Ladder`]), the base itself the lowest.
 pub const RULE_POOL: &str = "pool";
+/// The file's trained context stands ([`searched_by_card`]): the card holds it
+/// and the host room does not veto it (under [`Veto::Ladder`], the top rung).
+pub const RULE_TRAINED: &str = "trained";
+/// The floor, nothing deeper to take ([`searched_by_card`]): the file states no
+/// trained context, or no plan stands at the floor (the seat's own plan call
+/// then refuses it by name).
+pub const RULE_FLOOR: &str = "floor";
 
 /// How far a default the host room vetoed falls ([`default_slot_ctx_by_card`]):
 /// the placement's fact, never a model's ([`Veto::of`]).
@@ -890,6 +905,110 @@ pub fn searched<E>(
         }
     }
     Ok(Some(lo))
+}
+
+/// The context [`searched_by_card`] chose and the word for what decided it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GridCtx {
+    /// The context, in the grid's own units.
+    pub ctx: usize,
+    /// What decided it: [`RULE_TRAINED`], [`RULE_CARD`], [`RULE_HOST`],
+    /// [`RULE_POOL`] or [`RULE_FLOOR`].
+    pub rule: &'static str,
+}
+
+/// The grid search of [`searched`], decided by the card: the host room may
+/// veto its answer, never choose it. `card` is the plan at an unbounded host
+/// room standing at a context; `read` is the plan at the room read standing
+/// there. `veto` is the placement's fact ([`Veto::of`]).
+///
+/// A file that states no `trained` context takes the `floor` ([`RULE_FLOOR`]),
+/// one at or under the floor is its own answer ([`RULE_TRAINED`]); neither is
+/// probed. Otherwise:
+///
+/// - [`Veto::Binary`] (the card has memory of its own): `c*` is [`searched`]
+///   over `card`, [`RULE_FLOOR`] where nothing stands at the floor. A `c*` at
+///   the floor is the answer unasked of `read` ([`RULE_CARD`]). Above it
+///   `read(c*)` decides: `c*` stands ([`RULE_TRAINED`] when it is the trained
+///   context, else [`RULE_CARD`]), or the answer is the floor ([`RULE_HOST`]).
+/// - [`Veto::Ladder`] (the card shares the host's memory, so no plan is
+///   independent of the room and `card` is not asked): the first rung of the
+///   halving ladder from `trained` down to the floor ([`rungs`]; the lower
+///   rungs are multiples of `gran`) that `read` takes: the top rung
+///   [`RULE_TRAINED`], a lower one [`RULE_POOL`]; no rung takes it, the floor
+///   ([`RULE_FLOOR`]).
+///
+/// Stable by construction. A search over `read` alone takes the largest grid
+/// context the reading holds, and the host need grows with every grid step
+/// (each position's KV plane moves card experts to the host), so two readings
+/// a few hundred megabytes apart land on different steps: the answer rides
+/// the room across the whole band between the floor's need and the card's
+/// context's. Under [`Veto::Binary`] the answer is `c*` or the floor, both
+/// fixed by the card and the file, and the room enters through one
+/// comparison, at the host bytes `c*` needs past the floor's
+/// (`need(c*) − need(floor)`): a reading's noise changes the answer only
+/// where the reading lies within that noise of that one room. Under
+/// [`Veto::Ladder`] the answer is a rung, and the noise changes it only
+/// within itself of one rung's need, of which there are
+/// `⌈log2(trained / floor)⌉ + 1`.
+///
+/// `card` is asked as [`searched`] asks its `fits` (the floor, the trained
+/// context, then a halving between), and `read` once under [`Veto::Binary`]
+/// and at most once a rung under [`Veto::Ladder`].
+///
+/// # Errors
+/// The first error `card` or `read` returns.
+pub fn searched_by_card<E>(
+    trained: Option<usize>,
+    floor: usize,
+    gran: usize,
+    veto: Veto,
+    card: &dyn Fn(usize) -> Result<bool, E>,
+    read: &dyn Fn(usize) -> Result<bool, E>,
+) -> Result<GridCtx, E> {
+    let at_floor = GridCtx {
+        ctx: floor,
+        rule: RULE_FLOOR,
+    };
+    let Some(trained) = trained else {
+        return Ok(at_floor);
+    };
+    if trained <= floor {
+        return Ok(GridCtx {
+            ctx: trained,
+            rule: RULE_TRAINED,
+        });
+    }
+    match veto {
+        Veto::Binary => {
+            let Some(star) = searched(Some(trained), floor, gran, card)? else {
+                return Ok(at_floor);
+            };
+            if star > floor && !read(star)? {
+                return Ok(GridCtx {
+                    ctx: floor,
+                    rule: RULE_HOST,
+                });
+            }
+            Ok(GridCtx {
+                ctx: star,
+                rule: if star >= trained {
+                    RULE_TRAINED
+                } else {
+                    RULE_CARD
+                },
+            })
+        }
+        Veto::Ladder => {
+            for (i, rung) in rungs(trained, floor, gran).into_iter().enumerate() {
+                if read(rung)? {
+                    let rule = if i == 0 { RULE_TRAINED } else { RULE_POOL };
+                    return Ok(GridCtx { ctx: rung, rule });
+                }
+            }
+            Ok(at_floor)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2457,5 +2576,296 @@ mod tests {
             "2 GiB, 12 layers"
         );
         assert!(answer(PER_ROW, 12, 1 << 31) > Some(FLOOR));
+    }
+
+    /// MiMo-V2.6-Flash on the 3090, one plan a context a slot total: the
+    /// host needs [`MIMO_N0`] bytes at the floor and [`MIMO_PER`] more a
+    /// position (222,720 B: each position's KV plane over the trunk moves that
+    /// many expert bytes from the card to the host), and the KV planes fill
+    /// the card past [`MIMO_CARD_EDGE`] positions, where its plan is refused.
+    const MIMO_N0: u64 = 145_000_000_000;
+    const MIMO_PER: u64 = 222_720;
+    const MIMO_FLOOR: usize = 4096;
+    const MIMO_GRAN: usize = 1024;
+    const MIMO_TRAINED: usize = 262_144;
+    const MIMO_CARD_EDGE: usize = 70_656;
+    /// The slack the sweeps cover past the floor's need: 0 to 20 GB.
+    const MIMO_SWEEP: u64 = 20_000_000_000;
+
+    /// The host bytes the model's plan needs at `c >= floor` positions.
+    fn mimo_need(c: usize) -> u64 {
+        MIMO_N0 + MIMO_PER * (c - MIMO_FLOOR) as u64
+    }
+
+    /// The card's plan stands at `c`: the room it is made at plays no part.
+    fn mimo_card(c: usize) -> Result<bool, Infallible> {
+        Ok(c <= MIMO_CARD_EDGE)
+    }
+
+    /// The plan at `room` stands at `c`: the host holds its need.
+    fn mimo_read(room: u64) -> impl Fn(usize) -> Result<bool, Infallible> {
+        move |c| Ok(mimo_need(c) <= room)
+    }
+
+    /// The grid default of the card rule at `room`.
+    fn mimo_by_card(veto: Veto, room: u64) -> GridCtx {
+        let Ok(got) = searched_by_card(
+            Some(MIMO_TRAINED),
+            MIMO_FLOOR,
+            MIMO_GRAN,
+            veto,
+            &mimo_card,
+            &mimo_read(room),
+        );
+        got
+    }
+
+    /// The room-read search: the largest grid context the room holds, the
+    /// floor where none does.
+    fn mimo_naive(room: u64) -> usize {
+        let Ok(got) = searched(Some(MIMO_TRAINED), MIMO_FLOOR, MIMO_GRAN, &mimo_read(room));
+        got.unwrap_or(MIMO_FLOOR)
+    }
+
+    /// The total length, in bytes of slack past the floor's need, of the set
+    /// where `answer` differs from its answer a reading of [`DRIFT`] higher
+    /// gives, sampled on [`GRID`] over [`MIMO_SWEEP`].
+    fn mimo_moved(answer: impl Fn(u64) -> usize) -> u64 {
+        (0..=MIMO_SWEEP / GRID)
+            .map(|i| i * GRID)
+            .filter(|&slack| answer(MIMO_N0 + slack) != answer(MIMO_N0 + slack + DRIFT))
+            .count() as u64
+            * GRID
+    }
+
+    /// The grid default moves only across one threshold of the host's slack
+    /// [FAIL-first: the room-read search moves over the whole band, see the
+    /// last assertion]. Under [`Veto::Binary`] the card's context is 70,656
+    /// and the floor's plan needs 145 GB, so the host holds the card's
+    /// context from a slack of 222,720 × 66,560 = 14,824,243,200 B and every
+    /// answer is that context (`card`) or the floor (`host`). Over a slack from
+    /// 0 to 20 GB the set where the answer differs from the answer a reading
+    /// of 778,326,016 B higher gives is the one band under the threshold, at
+    /// most that reading and one grid step long. The room-read search steps
+    /// 228,065,280 B of slack a grid step, so it differs everywhere.
+    #[test]
+    fn grid_default_moves_only_across_one_threshold() {
+        const STAR: u64 = MIMO_PER * (MIMO_CARD_EDGE - MIMO_FLOOR) as u64;
+        assert_eq!(STAR, 14_824_243_200, "the threshold");
+        assert_eq!(
+            mimo_need(MIMO_CARD_EDGE) - mimo_need(MIMO_FLOOR),
+            STAR,
+            "the threshold is the card's context's need past the floor's"
+        );
+        let held = mimo_by_card(Veto::Binary, MIMO_N0 + STAR);
+        assert_eq!(
+            held,
+            GridCtx {
+                ctx: MIMO_CARD_EDGE,
+                rule: RULE_CARD
+            },
+            "the card's context at the byte the host holds it"
+        );
+        let under = mimo_by_card(Veto::Binary, MIMO_N0 + STAR - 1);
+        assert_eq!(
+            under,
+            GridCtx {
+                ctx: MIMO_FLOOR,
+                rule: RULE_HOST
+            },
+            "the floor a byte under it"
+        );
+        for slack in (0..=MIMO_SWEEP).step_by(GRID as usize) {
+            let got = mimo_by_card(Veto::Binary, MIMO_N0 + slack);
+            assert!(
+                [held, under].contains(&got),
+                "slack {slack}: {got:?} is neither the card's context nor the floor"
+            );
+        }
+        let by_card = mimo_moved(|room| mimo_by_card(Veto::Binary, room).ctx);
+        assert!(
+            by_card <= DRIFT + GRID,
+            "{by_card} B of slack answer differently across the reading"
+        );
+        let naive = mimo_moved(mimo_naive);
+        assert!(
+            naive > 2 * DRIFT,
+            "{naive} B for the room-read search: the model no longer shows the defect"
+        );
+    }
+
+    /// On a unified pool every answer is a rung of the halving ladder from
+    /// the trained context, the largest one the read room holds, and the card
+    /// is never asked; the top rung is `trained`, a lower one `pool`, and
+    /// where the floor's plan does not stand either the floor is the answer
+    /// by `floor`. The answer moves only across a rung's need: over a slack
+    /// from 0 to 60 GB, six rungs past the floor, each with a band of at most
+    /// the reading and one grid step.
+    #[test]
+    fn grid_default_on_a_unified_pool_is_a_rung() {
+        let rungs = rungs(MIMO_TRAINED, MIMO_FLOOR, MIMO_GRAN);
+        assert_eq!(
+            rungs,
+            [262_144, 131_072, 65_536, 32_768, 16_384, 8192, 4096]
+        );
+        let asked = Cell::new(false);
+        let card = |c: usize| -> Result<bool, Infallible> {
+            asked.set(true);
+            panic!("the card is asked at {c} on a unified machine")
+        };
+        let ladder = |room: u64| {
+            let Ok(got) = searched_by_card(
+                Some(MIMO_TRAINED),
+                MIMO_FLOOR,
+                MIMO_GRAN,
+                Veto::Ladder,
+                &card,
+                &mimo_read(room),
+            );
+            got
+        };
+        let sweep = 60_000_000_000;
+        let mut moved = 0;
+        for slack in (0..=sweep).step_by(GRID as usize) {
+            let room = MIMO_N0 + slack;
+            let got = ladder(room);
+            let want = rungs
+                .iter()
+                .copied()
+                .find(|&r| mimo_need(r) <= room)
+                .expect("the floor's plan stands from a slack of 0");
+            assert_eq!(got.ctx, want, "slack {slack}");
+            assert_eq!(
+                got.rule,
+                if want == MIMO_TRAINED {
+                    RULE_TRAINED
+                } else {
+                    RULE_POOL
+                },
+                "slack {slack}"
+            );
+            moved += u64::from(got.ctx != ladder(room + DRIFT).ctx) * GRID;
+        }
+        assert!(!asked.get(), "a unified machine asks no card");
+        assert!(
+            moved <= 6 * (DRIFT + GRID),
+            "{moved} B of slack answer differently across the reading"
+        );
+        // Under the floor's need nothing stands: the floor, by its own word.
+        assert_eq!(
+            ladder(MIMO_N0 - 1),
+            GridCtx {
+                ctx: MIMO_FLOOR,
+                rule: RULE_FLOOR
+            }
+        );
+    }
+
+    /// Without a trained context deeper than the floor the card and the room
+    /// are not asked, and the answer is [`searched`]'s: none is the floor
+    /// (`floor`), a trained context at or under the floor its own (`trained`).
+    #[test]
+    fn grid_default_without_a_deeper_context_is_searched() {
+        let never = |c: usize| -> Result<bool, Infallible> { panic!("probed at {c}") };
+        for veto in [Veto::Binary, Veto::Ladder] {
+            let run = |trained: Option<usize>| {
+                let Ok(got) =
+                    searched_by_card(trained, MIMO_FLOOR, MIMO_GRAN, veto, &never, &never);
+                got
+            };
+            for (trained, want) in [
+                (None, (MIMO_FLOOR, RULE_FLOOR)),
+                (Some(MIMO_FLOOR), (MIMO_FLOOR, RULE_TRAINED)),
+                (Some(2048), (2048, RULE_TRAINED)),
+            ] {
+                let got = run(trained);
+                assert_eq!((got.ctx, got.rule), want, "{veto:?}, trained {trained:?}");
+                let Ok(found) = searched(trained, MIMO_FLOOR, MIMO_GRAN, &never);
+                assert_eq!(
+                    found.unwrap_or(MIMO_FLOOR),
+                    got.ctx,
+                    "{veto:?}, {trained:?}"
+                );
+            }
+        }
+    }
+
+    /// Under [`Veto::Binary`] the room is asked once, at the card's context,
+    /// and only when it is past the floor: a card that holds the floor alone
+    /// answers it unasked (`card`), one that holds nothing answers the floor
+    /// (`floor`), one that holds the trained context answers it (`trained`)
+    /// unless the room refuses it (`host`).
+    #[test]
+    fn grid_default_asks_the_room_once_at_the_cards_context() {
+        let asked = Count::new();
+        let run = |edge: usize, room_holds: bool| {
+            asked.0.set(0);
+            let cards = Count::new();
+            let card = |c: usize| {
+                cards.take();
+                Ok::<_, Infallible>(c <= edge)
+            };
+            let read = |c: usize| {
+                asked.take();
+                assert!(c > MIMO_FLOOR, "the room is asked at the floor");
+                Ok::<_, Infallible>(room_holds)
+            };
+            let Ok(got) = searched_by_card(
+                Some(MIMO_TRAINED),
+                MIMO_FLOOR,
+                MIMO_GRAN,
+                Veto::Binary,
+                &card,
+                &read,
+            );
+            (got, asked.0.get())
+        };
+        let card = |ctx| GridCtx {
+            ctx,
+            rule: RULE_CARD,
+        };
+        assert_eq!(
+            run(MIMO_FLOOR, true),
+            (card(MIMO_FLOOR), 0),
+            "the floor alone"
+        );
+        assert_eq!(
+            run(0, true),
+            (
+                GridCtx {
+                    ctx: MIMO_FLOOR,
+                    rule: RULE_FLOOR
+                },
+                0
+            ),
+            "nothing stands"
+        );
+        assert_eq!(
+            run(70_000, true),
+            (card(70_656 - 1024), 1),
+            "the grid under the edge"
+        );
+        assert_eq!(
+            run(70_000, false),
+            (
+                GridCtx {
+                    ctx: MIMO_FLOOR,
+                    rule: RULE_HOST
+                },
+                1
+            ),
+            "refused by the room"
+        );
+        let trained = |holds| GridCtx {
+            ctx: MIMO_TRAINED,
+            rule: if holds { RULE_TRAINED } else { RULE_HOST },
+        };
+        assert_eq!(
+            run(MIMO_TRAINED, true),
+            (trained(true), 1),
+            "the trained context"
+        );
+        let (host, probes) = run(MIMO_TRAINED, false);
+        assert_eq!((host.ctx, host.rule, probes), (MIMO_FLOOR, RULE_HOST, 1));
     }
 }

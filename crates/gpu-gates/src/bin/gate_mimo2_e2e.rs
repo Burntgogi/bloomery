@@ -190,6 +190,7 @@ mod gate {
     use model::arch::mimo2::program::{AttnArgs, step_launches};
     use model::arch::models::Mixer;
     use model::placement::PlanLevers;
+    use model::placement::workstation::{HostRead, PLAN_ROOM};
     use refset::arch::mimo2::{BATCH, D1K, D4096, IK, MODEL, STEP4, STEP4_EVERY_NODE};
     use refset::family::Family;
     use runtime::layer::FfnKind;
@@ -270,6 +271,16 @@ mod gate {
         }
     }
 
+    /// [`PlanInputs::read`] of `file` at this workstation's plan room with
+    /// nothing loaded ([`PLAN_ROOM`], read [`HostRead::Given`]): no reading of
+    /// the box's available bytes enters a plan this gate holds to a pin, and
+    /// the plan is the unpaged one the pins were taken at.
+    fn read_inputs(file: &Split) -> Result<PlanInputs, GateError> {
+        let mut inputs = PlanInputs::read(file)?;
+        inputs.room = (PLAN_ROOM, HostRead::Given);
+        Ok(inputs)
+    }
+
     /// Layer `l`'s attention arguments as the description says them: the
     /// header's own facts, read apart from the program's mapping.
     fn described(inputs: &PlanInputs, l: usize) -> Result<AttnArgs, GateError> {
@@ -287,7 +298,7 @@ mod gate {
 
     fn structure(m: &Mimo2Model, o: &Opened) -> Result<bool, GateError> {
         let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
-        let inputs = PlanInputs::read(&file)?;
+        let inputs = read_inputs(&file)?;
         drop(file);
         let body = m.body("structure")?;
         let kinds = body.kinds();
@@ -913,7 +924,7 @@ mod gate {
     /// at [`SLOT_CTX`] positions of its own, the main load dropped first.
     fn slots(levers: &bloomery_levers::Levers) -> Result<bool, GateError> {
         let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
-        let inputs = PlanInputs::read(&file)?;
+        let inputs = read_inputs(&file)?;
         drop(file);
         // Two streams of distinct ids and lengths: the batch set's five
         // tokens, and the head of the 1,024-position set's prompt.
@@ -1275,7 +1286,7 @@ mod gate {
         word: Residency,
     ) -> Result<bool, GateError> {
         let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
-        let inputs = PlanInputs::read(&file)?;
+        let inputs = read_inputs(&file)?;
         drop(file);
         let man = RefManifest::open(&data_dir().join(BATCH), &IK)?;
         let (_, a, _) = man.step()?;
@@ -1362,7 +1373,7 @@ mod gate {
     /// a load at it ([`residency_on`]).
     fn residency_arm(levers: &bloomery_levers::Levers) -> Result<bool, GateError> {
         let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
-        let inputs = PlanInputs::read(&file)?;
+        let inputs = read_inputs(&file)?;
         drop(file);
         let (word, mut ok) = residency_unset(levers, &inputs)?;
         let man = RefManifest::open(&data_dir().join(BATCH), &IK)?;

@@ -40,6 +40,23 @@
 //!
 //! Without a load:
 //!
+//! - `host_room_vetoes_the_default`: the default context is the card's and
+//!   the host room only vetoes it. Every `--plan` child whose output a clause
+//!   compares with another child's runs under `BLOOMERY_HOST_ROOM` =
+//!   `PLAN_ROOM`, this workstation's host room with nothing loaded, so no
+//!   reading of the box's available bytes enters a comparison. At that room
+//!   the default's `ctx rule=` line and the plan's `ctx_max` equal
+//!   `plan_only_names_its_default`'s, and the rule is `card` or `trained`.
+//!   Under a room halfway between the host need of the floor's plan and of
+//!   the default's (two plans made here at `PLAN_ROOM`, `HostNeed::of`) the
+//!   line is `ctx rule=host` at the floor, a slot's share of [`CTX_FLOOR`],
+//!   and the plan's `ctx_max` is that share. Under a room a GiB under the
+//!   floor plan's need the process exits non-zero within [`REFUSE_WITHIN`],
+//!   its stderr holds the words of `PlaceError::NoNvmeTier` and the room, and
+//!   no `load` record is printed. FAIL-first, by reading: on a seat whose
+//!   plan reads no room `BLOOMERY_HOST_ROOM` moves nothing, so all three
+//!   runs print the box's own default; the `rule=host` half and the refusal
+//!   are red.
 //! - `residency_default_is_the_machine`: `--plan` at [`CTX`] with no
 //!   `BLOOMERY_RESIDENCY` prints the `residency lever` record at `mid-p0-s1`
 //!   with why `place` ahead of the plan record, and the `residency host`
@@ -235,6 +252,7 @@ mod mimo2_open;
 #[cfg(all(feature = "mimo2", feature = "glm5next"))]
 mod gate {
     use std::io::{BufRead, BufReader};
+    use std::num::NonZeroUsize;
     use std::path::{Path, PathBuf};
     use std::process::ExitStatus;
     use std::time::{Duration, Instant};
@@ -249,7 +267,8 @@ mod gate {
     use bloomery_levers::CARD_BUDGET;
     use gguf::Split;
     use model::arch::mimo2::place::{PlaceError, PlanInputs};
-    use model::placement::workstation::RTX_3090;
+    use model::placement::PlanLevers;
+    use model::placement::workstation::{HostNeed, HostRead, PLAN_ROOM, RTX_3090};
     use refset::arch::mimo2::{BATCH, IK};
     use serde_json::{Value, json};
 
@@ -328,6 +347,18 @@ mod gate {
     /// the dense trunk's need, which the KV term counts every slot's stores
     /// in.
     const PLAN_REFUSAL: [&str; 2] = ["the plan's dense trunk alone needs", "KV"];
+
+    /// The words the refusal of a host room that cannot hold the host experts
+    /// names (`PlaceError::NoNvmeTier`): the experts paged to the NVMe tier,
+    /// and that the engine serves none. The paged bytes and the need move with
+    /// the room, so the gate holds the fixed words and the room it gave.
+    const NO_TIER_REFUSAL: [&str; 2] = [
+        "routed experts to the NVMe expert tier",
+        "the MiMo engine serves no NVMe expert tier",
+    ];
+
+    /// How far under the floor plan's host need the refused room sits.
+    const SHORT_OF_NEED: u64 = 1 << 30;
 
     /// The card budget of the servers whose ids are compared: the gate
     /// card's usable bytes, the bytes `shared/gate_card.rs` plans the session
@@ -420,24 +451,39 @@ mod gate {
         json!([{ "role": "user", "content": EDIT_A }])
     }
 
-    /// `bloomery-serve --model mimo2 -m <file> <args>` beside this binary,
-    /// its logs in `<dir>/<name>/`, `BLOOMERY_RESIDENCY` as `pin` says: the
-    /// ids the servers answer are compared with a static session's and a
-    /// one-slot server's, which the residency machine's adapting split would
-    /// move, so every server but the default's own clause runs it `off`.
-    fn spawn_pinned(
-        dir: &Path,
-        name: &str,
-        file: &Path,
-        args: &[&str],
-        pin: Option<&str>,
-    ) -> Result<(Served, PathBuf), GateError> {
-        spawn_levered(dir, name, file, args, (pin, None))
+    /// The levers a server this gate starts runs under, whatever the gate's
+    /// own environment holds of them; an unset field leaves the lever as the
+    /// environment has it.
+    #[derive(Clone, Copy, Default)]
+    struct Pins<'a> {
+        /// `BLOOMERY_RESIDENCY`: every server but
+        /// `residency_default_is_the_machine`'s runs it `off`, for the ids a
+        /// server answers are compared with a static session's and a
+        /// one-slot server's, which the residency machine's adapting split
+        /// would move.
+        residency: Option<&'a str>,
+        /// `BLOOMERY_CARD_BUDGET` in bytes: the plan takes `min(usable,
+        /// budget)` of the card.
+        budget: Option<u64>,
+        /// `BLOOMERY_HOST_ROOM` in bytes: the host room the plan reads. Set
+        /// for `--plan` and refusal children only; a loaded server keeps the
+        /// host's own reading, for the lever also replaces the load's
+        /// host-need check.
+        room: Option<u64>,
     }
 
-    /// [`spawn_pinned`] with the machine `off` and `BLOOMERY_CARD_BUDGET` of
-    /// `budget` bytes: the plan takes `min(usable, budget)` of the card, so a
-    /// server on the A6000 plans a smaller card's room ([`gate_budget`]).
+    /// The residency machine `off`, nothing else pinned.
+    const OFF: Pins<'static> = Pins {
+        residency: Some("off"),
+        budget: None,
+        room: None,
+    };
+
+    /// `bloomery-serve --model mimo2 -m <file> <args>` beside this binary, its
+    /// logs in `<dir>/<name>/`, with the machine `off` and
+    /// `BLOOMERY_CARD_BUDGET` of `budget` bytes: the plan takes `min(usable,
+    /// budget)` of the card, so a server on the A6000 plans a smaller card's
+    /// room ([`gate_budget`]).
     fn spawn_budgeted(
         dir: &Path,
         name: &str,
@@ -445,29 +491,35 @@ mod gate {
         args: &[&str],
         budget: u64,
     ) -> Result<(Served, PathBuf), GateError> {
-        spawn_levered(dir, name, file, args, (Some("off"), Some(budget)))
+        let pins = Pins {
+            budget: Some(budget),
+            ..OFF
+        };
+        spawn_levered(dir, name, file, args, pins)
     }
 
-    /// `bloomery-serve --model mimo2 -m <file> <args>` with the residency
-    /// machine and the card budget as `(pin, budget)` say, whatever the
-    /// gate's own environment holds of them.
+    /// `bloomery-serve --model mimo2 -m <file> <args>` beside this binary, its
+    /// logs in `<dir>/<name>/`, under `pins`.
     fn spawn_levered(
         dir: &Path,
         name: &str,
         file: &Path,
         args: &[&str],
-        (pin, budget): (Option<&str>, Option<u64>),
+        pins: Pins<'_>,
     ) -> Result<(Served, PathBuf), GateError> {
         let d = dir.join(name);
         std::fs::create_dir_all(&d)?;
         let mut all = vec!["--model", "mimo2", "-m", utf8(file)?];
         all.extend_from_slice(args);
         let mut cmd = serve_cmd()?;
-        if let Some(word) = pin {
+        if let Some(word) = pins.residency {
             cmd.env(bloomery_levers::RESIDENCY, word);
         }
-        if let Some(bytes) = budget {
+        if let Some(bytes) = pins.budget {
             cmd.env(bloomery_levers::CARD_BUDGET, bytes.to_string());
+        }
+        if let Some(bytes) = pins.room {
+            cmd.env(bloomery_levers::HOST_ROOM, bytes.to_string());
         }
         Ok((Served::spawn_cmd(cmd, &all, &d)?, d))
     }
@@ -504,27 +556,17 @@ mod gate {
         )
     }
 
-    /// A server run to its exit within `within`: its status (`None`: still
-    /// running at the bound, killed) and its stderr's path.
-    fn run_to_exit(
-        dir: &Path,
-        name: &str,
-        file: &Path,
-        args: &[&str],
-        within: Duration,
-    ) -> Result<(Option<ExitStatus>, PathBuf), GateError> {
-        run_pinned(dir, name, file, args, (within, Some("off")))
-    }
-
-    /// [`run_to_exit`] under `BLOOMERY_RESIDENCY` as `pin` says ([`spawn_pinned`]).
+    /// A server of `args` under `pins` run to its exit within `within`: its
+    /// status (`None`: still running at the bound, killed) and its stderr's
+    /// path.
     fn run_pinned(
         dir: &Path,
         name: &str,
         file: &Path,
         args: &[&str],
-        (within, pin): (Duration, Option<&str>),
+        (within, pins): (Duration, Pins<'_>),
     ) -> Result<(Option<ExitStatus>, PathBuf), GateError> {
-        let (mut s, d) = spawn_pinned(dir, name, file, args, pin)?;
+        let (mut s, d) = spawn_levered(dir, name, file, args, pins)?;
         let status = wait_exit(&mut s, within)?;
         Ok((status, d.join("server.err")))
     }
@@ -545,27 +587,34 @@ mod gate {
         }
     }
 
-    /// `--plan` of `args`: its exit status and the log of its stderr.
+    /// `--plan` of `args` at [`PLAN_ROOM`], this workstation's host room with
+    /// nothing loaded, given: the plan the clauses compare with one another's
+    /// is the same whatever the box's `MemAvailable` reads. Its exit status
+    /// and the log of its stderr.
     fn plan_run(
         dir: &Path,
         name: &str,
         file: &Path,
         args: &[&str],
     ) -> Result<(Option<ExitStatus>, Log, String), GateError> {
-        plan_pinned(dir, name, file, args, Some("off"))
+        let pins = Pins {
+            room: Some(PLAN_ROOM),
+            ..OFF
+        };
+        plan_pinned(dir, name, file, args, pins)
     }
 
-    /// [`plan_run`] under `BLOOMERY_RESIDENCY` as `pin` says.
+    /// `--plan` of `args` under `pins`.
     fn plan_pinned(
         dir: &Path,
         name: &str,
         file: &Path,
         args: &[&str],
-        pin: Option<&str>,
+        pins: Pins<'_>,
     ) -> Result<(Option<ExitStatus>, Log, String), GateError> {
         let mut all = args.to_vec();
         all.push("--plan");
-        let (status, err) = run_pinned(dir, name, file, &all, (PLAN_WITHIN, pin))?;
+        let (status, err) = run_pinned(dir, name, file, &all, (PLAN_WITHIN, pins))?;
         let text = std::fs::read_to_string(&err).unwrap_or_default();
         println!(
             "{name}: {} --plan: {}",
@@ -666,12 +715,25 @@ mod gate {
         Ok(())
     }
 
-    /// `plan_only_names_its_default` (the module header).
+    /// What a `--plan` with no flag printed of the default context: the `ctx`
+    /// line and the plan's `ctx_max` (a slot's share of the total).
+    struct Defaulted {
+        ctx_line: String,
+        ctx_max: u64,
+    }
+
+    /// The first `ctx rule=` line of a seat's stderr.
+    fn ctx_line(text: &str) -> Option<&str> {
+        text.lines().find(|l| l.starts_with("ctx rule="))
+    }
+
+    /// `plan_only_names_its_default` (the module header): the default it
+    /// printed, `None` when it printed none.
     fn plan_only_names_its_default(
         dir: &Path,
         file: &Path,
         ok: &mut bool,
-    ) -> Result<(), GateError> {
+    ) -> Result<Option<Defaulted>, GateError> {
         let trained = trained_ctx(file)?;
         let (status, log, text) = plan_run(dir, "plan", file, &[])?;
         let place = log.first(&record::PLACE_UNSET)?;
@@ -764,6 +826,129 @@ mod gate {
             "plan_only_names_its_default",
             exits && in_order && word_a && no_load && default_ok,
         );
+        Ok(ctx_max
+            .zip(ctx_line(&text))
+            .map(|(ctx_max, line)| Defaulted {
+                ctx_line: line.to_owned(),
+                ctx_max,
+            }))
+    }
+
+    /// The host bytes the seat's plan of `file` needs at `slot_ctx` positions
+    /// a slot, [`DEFAULT_SLOTS`] slots, on the placement a flagless `--plan`
+    /// takes (`a`) at [`PLAN_ROOM`]: the plan the server prints, made here.
+    fn default_plan_need(
+        file: &Path,
+        levers: &bloomery_levers::Levers,
+        slot_ctx: u64,
+    ) -> Result<u64, GateError> {
+        let split = Split::open(file).map_err(|e| format!("open {}: {e}", file.display()))?;
+        let mut inputs = PlanInputs::describe(&split)?;
+        inputs.room = (PLAN_ROOM, HostRead::Given);
+        let machine = Place::A.on_host()?.machine(None, None)?(inputs.model.layers);
+        let slots = NonZeroUsize::new(usize::try_from(DEFAULT_SLOTS)?).ok_or("no default slot")?;
+        let plan =
+            inputs.plan_with_slots(&machine, slot_ctx, &PlanLevers::from_levers(levers)?, slots)?;
+        Ok(HostNeed::of(&plan, 0).bytes())
+    }
+
+    /// `host_room_vetoes_the_default` (the module header); `base` is the
+    /// default `plan_only_names_its_default` printed.
+    fn host_room_vetoes_the_default(
+        dir: &Path,
+        file: &Path,
+        levers: &bloomery_levers::Levers,
+        base: Option<&Defaulted>,
+        ok: &mut bool,
+    ) -> Result<(), GateError> {
+        let Some(base) = base else {
+            println!("host_room_vetoes_the_default: no default to hold the rooms to");
+            check(ok, "host_room_vetoes_the_default", false);
+            return Ok(());
+        };
+        // (i) At the plan room the default is the card's context, the one
+        // `plan_only_names_its_default` printed.
+        let (status, log, text) = plan_run(dir, "plan-room-default", file, &[])?;
+        let line = ctx_line(&text);
+        let ctx_max = match log.first(&record::PLAN)? {
+            Some(p) => Some(p.u64("ctx_max")?),
+            None => None,
+        };
+        let card_rule = line
+            .is_some_and(|l| l.starts_with("ctx rule=card ") || l.starts_with("ctx rule=trained "));
+        let same = status.is_some_and(|s| s.success())
+            && line == Some(base.ctx_line.as_str())
+            && ctx_max == Some(base.ctx_max);
+        println!(
+            "host room, at {PLAN_ROOM} B: the default {line:?} at ctx_max {ctx_max:?} is \
+             plan_only's {:?} at {} {same}; it is the card's context {card_rule}",
+            base.ctx_line, base.ctx_max
+        );
+        let floor_slot = CTX_FLOOR / DEFAULT_SLOTS;
+        if base.ctx_max <= floor_slot {
+            println!(
+                "skip host_room_vetoes_the_default (the veto and the refusal): the default {} a \
+                 slot is not past the floor's {floor_slot}, no deeper context for a room to veto",
+                base.ctx_max
+            );
+            check(ok, "host_room_vetoes_the_default", same && card_rule);
+            return Ok(());
+        }
+        // (ii) A room between the floor plan's host need and the default
+        // plan's: the card's context needs more than the room holds, the
+        // floor's does not.
+        let (need_floor, need_default) = (
+            default_plan_need(file, levers, floor_slot)?,
+            default_plan_need(file, levers, base.ctx_max)?,
+        );
+        if need_default <= need_floor {
+            return Err(format!(
+                "the default's plan needs {need_default} B of host, not more than the floor's \
+                 {need_floor} B: the model's host need no longer grows with the context"
+            )
+            .into());
+        }
+        let between = need_floor + (need_default - need_floor) / 2;
+        let pins = |room| Pins {
+            room: Some(room),
+            ..OFF
+        };
+        let (status, log, text) = plan_pinned(dir, "plan-room-between", file, &[], pins(between))?;
+        let want =
+            format!("ctx rule=host ctx={floor_slot} slots={DEFAULT_SLOTS} total={CTX_FLOOR} ");
+        let vetoed = status.is_some_and(|s| s.success())
+            && ctx_line(&text).is_some_and(|l| l.starts_with(&want))
+            && match log.first(&record::PLAN)? {
+                Some(p) => p.u64("ctx_max")? == floor_slot,
+                None => false,
+            };
+        println!(
+            "host room {between} B (the floor's need {need_floor} B, the default's {need_default} \
+             B): the line {:?} starts {want:?} at ctx_max {floor_slot} {vetoed}",
+            ctx_line(&text)
+        );
+        if !vetoed {
+            println!("plan-room-between stderr:\n{text}");
+        }
+        // (iii) A room a GiB under the floor plan's need cannot hold even the
+        // floor: refused by name before any load.
+        let short = need_floor - SHORT_OF_NEED;
+        let reading = format!("a reading of {short} B");
+        let refused = refusal_under(
+            dir,
+            file,
+            "refuse-room",
+            &["--plan"],
+            (
+                &[NO_TIER_REFUSAL[0], NO_TIER_REFUSAL[1], reading.as_str()],
+                pins(short),
+            ),
+        )?;
+        check(
+            ok,
+            "host_room_vetoes_the_default",
+            same && card_rule && vetoed && refused,
+        );
         Ok(())
     }
 
@@ -780,7 +965,13 @@ mod gate {
         ok: &mut bool,
     ) -> Result<(), GateError> {
         let ctx = CTX.to_string();
-        let (status, log, _) = plan_pinned(dir, "plan-residency", file, &["--ctx", &ctx], None)?;
+        let (status, log, _) = plan_pinned(
+            dir,
+            "plan-residency",
+            file,
+            &["--ctx", &ctx],
+            Pins::default(),
+        )?;
         let (lever, plan, host) = (
             log.first(&record::RESIDENCY_LEVER)?,
             log.first(&record::PLAN)?,
@@ -794,18 +985,18 @@ mod gate {
             (&lever, &plan, &host),
             (Some(l), Some(p), Some(h)) if l.at() < p.at() && p.at() < h.at()
         );
-        let (_, wide, _) = plan_pinned(dir, "plan-residency-default-ctx", file, &[], None)?;
+        let (_, wide, _) = plan_pinned(
+            dir,
+            "plan-residency-default-ctx",
+            file,
+            &[],
+            Pins::default(),
+        )?;
         let no_room = match wide.first(&record::RESIDENCY_LEVER)? {
             Some(l) => l.word("residency")? == "off" && l.word("why")? == "no_room",
             None => false,
         } && wide.first(&record::RESIDENCY_HOST)?.is_none();
-        let (_, off_log, _) = plan_pinned(
-            dir,
-            "plan-residency-off",
-            file,
-            &["--ctx", &ctx],
-            Some("off"),
-        )?;
+        let (_, off_log, _) = plan_pinned(dir, "plan-residency-off", file, &["--ctx", &ctx], OFF)?;
         let off = match off_log.first(&record::RESIDENCY_LEVER)? {
             Some(l) => l.word("residency")? == "off" && l.word("why")? == "set",
             None => false,
@@ -835,7 +1026,18 @@ mod gate {
         args: &[&str],
         want: &[&str],
     ) -> Result<bool, GateError> {
-        let (status, err) = run_to_exit(dir, name, file, args, REFUSE_WITHIN)?;
+        refusal_under(dir, file, name, args, (want, OFF))
+    }
+
+    /// [`refusal`] with the server under `pins`.
+    fn refusal_under(
+        dir: &Path,
+        file: &Path,
+        name: &str,
+        args: &[&str],
+        (want, pins): (&[&str], Pins<'_>),
+    ) -> Result<bool, GateError> {
+        let (status, err) = run_pinned(dir, name, file, args, (REFUSE_WITHIN, pins))?;
         let text = std::fs::read_to_string(&err).unwrap_or_default();
         let log = server_log(&err, record::BLOOMERY_SERVE_MIMO2)?;
         let no_load = log.first(&record::LOAD_MIMO2)?.is_none();
@@ -946,8 +1148,11 @@ mod gate {
         let plan_at_no_room = |name: &str, args: &[&str]| -> Result<(bool, bool), GateError> {
             let mut all = args.to_vec();
             all.push("--plan");
-            let (mut s, d) =
-                spawn_levered(dir, name, file, &all, (Some("off"), Some(NO_ROOM_BUDGET)))?;
+            let pins = Pins {
+                budget: Some(NO_ROOM_BUDGET),
+                ..OFF
+            };
+            let (mut s, d) = spawn_levered(dir, name, file, &all, pins)?;
             let status = wait_exit(&mut s, PLAN_WITHIN)?;
             let text = std::fs::read_to_string(d.join("server.err")).unwrap_or_default();
             let refused = status.is_some_and(|st| !st.success())
@@ -1428,13 +1633,15 @@ mod gate {
 
         if a.after_refusals {
             println!(
-                "plan_only_names_its_default, residency_default_is_the_machine, \
-                 refusals_before_any_load, slots_total_is_planned, \
-                 default_second_slot_never_costs_a_load: run by the parent of this child"
+                "plan_only_names_its_default, host_room_vetoes_the_default, \
+                 residency_default_is_the_machine, refusals_before_any_load, \
+                 slots_total_is_planned, default_second_slot_never_costs_a_load: run by the \
+                 parent of this child"
             );
             after_refusals(&a.dir, &file, &levers, cards, &mut ok)?;
         } else {
-            plan_only_names_its_default(&a.dir, &file, &mut ok)?;
+            let base = plan_only_names_its_default(&a.dir, &file, &mut ok)?;
+            host_room_vetoes_the_default(&a.dir, &file, &levers, base.as_ref(), &mut ok)?;
             residency_default_is_the_machine(&a.dir, &file, &mut ok)?;
             refusals_before_any_load(&a.dir, &file, cards, &mut ok)?;
             slots_total_is_planned(&a.dir, &file, &mut ok)?;

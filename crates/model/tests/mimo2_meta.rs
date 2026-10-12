@@ -197,8 +197,11 @@ fn hw_mimo2_plan() {
     let mut o = String::new();
     let mut b = Vec::new();
     let split = Split::open(MIMO).unwrap_or_else(|e| panic!("open {MIMO}: {e}"));
-    let inputs = model::arch::mimo2::place::PlanInputs::describe(&split)
+    let mut inputs = model::arch::mimo2::place::PlanInputs::describe(&split)
         .unwrap_or_else(|e| panic!("plan inputs of {MIMO}: {e}"));
+    // The room is this workstation's with nothing loaded, given: the pins below hold the
+    // unpaged plan, whatever the box's `MemAvailable` reads now.
+    inputs.room = (workstation::PLAN_ROOM, workstation::HostRead::Given);
     let layers = inputs.hp.n_trunk;
     let ctx: u64 = 4160;
     let _ = writeln!(o, "file {MIMO}, {layers} trunk layers, ctx {ctx}");

@@ -63,26 +63,34 @@
 //! reserve is zero bytes.
 //!
 //! `--ctx` is the total the slots split (`--ctx 0` is refused); with one slot
-//! it is one request's context. Unset, it is the file's trained context
-//! (`<arch>.context_length`) capped to the largest total whose plan stands,
-//! searched on a grid of `generate::CTX_GRAN` positions from the floor
-//! [`CTX`]; a file that states no trained context takes the floor, and one
+//! it is one request's context. Unset, the card decides it and the host room
+//! only vetoes it (`placement::ctx::searched_by_card`): the file's trained
+//! context (`<arch>.context_length`) capped to the largest total whose plan
+//! stands on the card, searched on a grid of `generate::CTX_GRAN` positions
+//! from the floor [`CTX`] over the plan at an unbounded host room; then the
+//! plan at the room read must stand at that total too (the routed experts a
+//! longer context moves to the host must fit the room), else the answer is
+//! the floor. A file that states no trained context takes the floor, and one
 //! stderr line names a cap that binds. The routed experts the plan puts on
 //! the card take the room the stores leave, so a longer context leaves fewer
 //! of them there; the default caps at the plan's own fit and applies no
-//! expert margin (`placement::ctx::default_slot_ctx_by_card`, which the GLM seat
-//! takes).
+//! expert margin. On a machine whose card shares the host's memory the room
+//! is the card's, no plan is independent of it, and the answer is the first
+//! rung of a halving ladder from the trained context whose plan the room read
+//! holds. The plan reads the host room (`BLOOMERY_HOST_ROOM` replaces the
+//! reading) and refuses by name a room that cannot hold the host experts: the
+//! body serves no NVMe expert tier (`PlaceError::NoNvmeTier`).
 //!
 //! The records on stderr, in order: `place unset` (word and why), one `ctx`
-//! line (the rule — `set`, `trained`, `card` or `floor` —, a slot's context,
-//! the slots, the total and the trained context), the `plan` record (its
-//! `ctx_max` a slot's), the `parallel` line (`rule=slots slots=N slot_ctx=C
-//! total=N·C from=<word> pass=one`); then the `load` record (architecture,
-//! resident bytes of every slot, a slot's context, slots, layers, the routed
-//! experts the plan keeps on the host and on the card, the step graph's nodes
-//! and the load's wall) and, once the port is bound, the `listening` record
-//! (`record::BLOOMERY_SERVE_MIMO2`). `--plan` ends the process after
-//! the `parallel` line, nothing loaded. An engine error ends the process with
+//! line (the rule — `set`, `trained`, `card`, `host`, `pool` or `floor` —, a
+//! slot's context, the slots, the total and the trained context), the `plan`
+//! record (its `ctx_max` a slot's), the `parallel` line (`rule=slots
+//! slots=N slot_ctx=C total=N·C from=<word> pass=one`); then the `load`
+//! record (architecture, resident bytes of every slot, a slot's context,
+//! slots, layers, the routed experts the plan keeps on the host and on the
+//! card, the step graph's nodes and the load's wall) and, once the port is
+//! bound, the `listening` record (`record::BLOOMERY_SERVE_MIMO2`). `--plan`
+//! ends the process after the `parallel` line, nothing loaded. An engine error ends the process with
 //! the crash block and exit code 70, as every seat's.
 //!
 //! A request keeps the longest prefix it shares with what the slot holds
@@ -132,6 +140,7 @@ use bloomery_levers::{ChurnHosting, HostCfg, ResidencyAt, ResidencyWhy};
 use gguf::Split;
 use model::arch::Arch;
 use model::arch::mimo2::place::PlanInputs;
+use model::placement::ctx::{RULE_CARD, RULE_HOST, RULE_POOL, Veto, searched_by_card};
 use model::placement::slots::{SplitError, split_ctx};
 use model::placement::workstation::TierBatchBytes;
 use model::placement::{Machine, Plan, PlanLevers};
@@ -283,20 +292,28 @@ fn slot_ctx_of(total: usize, slots: usize) -> Result<usize, GateError> {
 struct CtxRule {
     ctx: usize,
     /// `set` (`--ctx`), `trained` (the file's own context stands), `card`
-    /// (the plan stands to a context under it) or `floor` ([`CTX`]: a file
-    /// that states no trained context, or a plan that stands nowhere at the
-    /// floor, which the load's own plan call then refuses by name).
+    /// (the card's plan stands to a context under it), `host` (the host room
+    /// vetoed the card's context, so the floor stands), `pool` (a machine
+    /// whose card shares the host's memory: a rung of the halving ladder
+    /// under the trained context) or `floor` ([`CTX`]: a file that states no
+    /// trained context, or a plan that stands nowhere at the floor, which the
+    /// load's own plan call then refuses by name).
     rule: &'static str,
     trained: Option<usize>,
 }
 
 /// The seat's total context, the positions its slots split: `set` as given,
 /// else the file's trained context capped to the largest on the [`CTX_GRAN`]
-/// grid whose plan stands (`placement::ctx::searched`). The plan counts every
-/// slot's stores at a slot's share of the total
-/// ([`PlanInputs::plan_with_slots`]). The plan reads no host room (its inputs
-/// hold none and the machine's host is the workstation's figure), so no
-/// reading moves the search and there is no room for a second probe to veto.
+/// grid whose plan stands on the card, the host room only vetoing it
+/// (`placement::ctx::searched_by_card`). The plan counts every slot's stores
+/// at a slot's share of the total ([`PlanInputs::plan_with_slots`]) and reads
+/// the host room, so a probe plans a total twice: `card`, at an unbounded
+/// room ([`PlanInputs::room_free`]), and `read`, at the room read. The search
+/// runs over `card`; `read` is asked once, at its answer, and a refusal
+/// there is the floor, so a reading's noise moves the answer only near the
+/// one room that holds the answer's host bytes past the floor's. Where the
+/// card shares the host's memory ([`Veto::of`]) the room is the card's and
+/// the answer is a rung of a halving ladder `read` takes.
 fn ctx_of(
     set: Option<usize>,
     split: &Split,
@@ -313,18 +330,26 @@ fn ctx_of(
             trained,
         });
     }
-    let fits = |c: usize| -> Result<bool, GateError> {
+    let fits = |inputs: &PlanInputs, c: usize| -> Result<bool, GateError> {
         let share = slot_ctx_of(c, slots.get())
             .ok()
             .and_then(|s| u64::try_from(s).ok());
         Ok(share.is_some_and(|s| inputs.plan_with_slots(machine, s, levers, slots).is_ok()))
     };
-    let (ctx, rule) = match model::placement::ctx::searched(trained, CTX, CTX_GRAN, &fits)? {
-        Some(c) if trained.is_some_and(|t| c >= t) => (c, "trained"),
-        Some(c) => (c, "card"),
-        None => (CTX, "floor"),
-    };
-    Ok(CtxRule { ctx, rule, trained })
+    let free = inputs.room_free();
+    let found = searched_by_card(
+        trained,
+        CTX,
+        CTX_GRAN,
+        Veto::of(machine),
+        &|c| fits(&free, c),
+        &|c| fits(inputs, c),
+    )?;
+    Ok(CtxRule {
+        ctx: found.ctx,
+        rule: found.rule,
+        trained,
+    })
 }
 
 /// The MiMo session on the engine thread and the positions each slot's
@@ -642,11 +667,18 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         })?;
     let n = NonZeroUsize::new(slots).ok_or("--parallel 0: the server serves no slot")?;
     let ctx = rule.ctx;
-    if let (Some(trained), "card") = (rule.trained, rule.rule) {
-        eprintln!(
-            "{NAME}: --ctx defaults to {ctx} of the file's {trained} trained positions (the plan \
-             stands to there; pass --ctx to choose)"
-        );
+    if let Some(trained) = rule.trained {
+        let bound = match rule.rule {
+            RULE_CARD => Some("the plan stands to there"),
+            RULE_HOST | RULE_POOL => Some("the host room holds the plan to there"),
+            _ => None,
+        };
+        if let Some(bound) = bound {
+            eprintln!(
+                "{NAME}: --ctx defaults to {ctx} of the file's {trained} trained positions \
+                 ({bound}; pass --ctx to choose)"
+            );
+        }
     }
     eprintln!(
         "ctx rule={} ctx={slot_ctx} slots={slots} total={} trained={}",
