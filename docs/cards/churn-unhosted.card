@@ -3,12 +3,23 @@
 # the dispatch-path A/B AGENTS.md asks for, two builds: this tree's generate_qwen3moe against main f9706dbd's, the base
 # built with `just build-decode` in its own worktree and remote dir.
 #
-# [derived] The box has 256 GB, so MemAvailable never binds; only headroom = HOST_ROOM - need does. Window:
-# need < HOST_ROOM < need + pool(P=0). gate_qwen38_serve: 27 GiB pages, 40 GiB does not. Card experts a layer at plan a on
-# the A6000 about 297 (docs/performance.md, mid-p148-s1 = fewest/2), 3.16 MB an expert (refill-decode.card): pool(P=0) =
-# 48 x 297 x 3.16 MB = 45 GB, far past the headroom at 40G (about 4..10 GB). The base arm climbs to the first P whose pool
-# fits (about mid-p231..270-s1), the change arm keeps mid-p0-s1 with the pool unhosted. The lead confirms the need with a
-# `--plan` print before the sitting.
+# [derived, corrected 2026-10-13 by churn4's code read] The term BLOOMERY_HOST_ROOM moves on an unsplit plan is
+# mem_left = host_available() - need (workstation.rs:22): headroom does not track HOST_ROOM there (placement.rs:3295 is
+# machine_room - need; expert_nvme_tier returns early at :3034). Window: need < HOST_ROOM < need + pool(P=0). Card experts a
+# layer at plan a on the A6000 about 297 (docs/performance.md, mid-p148-s1 = fewest/2), 3.16 MB an expert
+# (refill-decode.card): pool(P=0) = 48 x 297 x 3.16 MB = 45 GB. HOST_ROOM is NOT a fixed 40G: at 40G the real plan may
+# split (page), and a paged stack's pool is 0 by rule, so no climb would arise; the room is derived as the fixture clause
+# churn_unhosted derives it -- one `--plan` run at HOST_ROOM=1048576M (M/G only; 2^40 B) reads the `cache` line's need and
+# the `residency host` record's churn bytes, then HOST_ROOM = need + churn_bytes/2 -- and the plan at that room must print
+# an unpaged (unsplit) plan. The base arm then climbs to the first P whose pool fits (about mid-p231..270-s1, or turns off
+# as pool_unhostable where none fits; both are the old rule), the change arm keeps mid-p0-s1 with the pool unhosted.
+#
+# The two arms CAN decode different text: both run residency at different P, a move decides whether an expert's rows run
+# on the card or the host, and the two sides sum in different orders, so the ids follow the moves (refill-decode.card's own
+# note on the r4d sitting). On a paged or churning plan the text sets the cost, so this card runs under the forced id
+# stream (forceids, the next train) or not at all as a ratio: without forceids the sitting is a structural check only --
+# the base arm's `residency unset` shows the climb, the change arm's shows pool_unhosted at P 0 with `residency pass`
+# moves landed and rereads + unresident > 0 -- and the tok/s ratio is not claimed.
 #
 # [derived] #46 (a 64 GB host, RTX 5090, Qwen3.8 UD-Q4_K_XL): P 0 with the pool out decoded 99.0 tok/s against 54.4 at the
 # climbed P 114 (x1.82). The box's plan a holds about 58 % of the experts on the card (297/512) against #46's 24 %, so the
@@ -25,7 +36,7 @@ predict: +15..+50
 rounds: 6
 sd: 2.6 % rig-log 09-30#q38seed-ab, the residency-only P 512 pair 1.056 ± 0.059 over 4 rounds (paired SD 3.7 %,
   / sqrt 2), as refill-decode.card; Qwen3.8's plain decode under the residency scatters past the 0.6 % default
-condition: one lease; both builds with their Cargo.lock current; BLOOMERY_DECODE_N=1024 in BLOOMERY_BOX_ENV (the runner's
+condition: forceids on in both arms (the same id stream; without it the run is the structural check above and no ratio is written); one lease; both builds with their Cargo.lock current; BLOOMERY_DECODE_N=1024 in BLOOMERY_BOX_ENV (the runner's
   `n=` field reads 1024 in both arms) and every arm a fresh process (BLOOMERY_AB_LOAD=arm), the order rotated each round,
   one warm-up round discarded (a `WARMUP r0` row in the log); no [cpu-busy], [other-busy] or [cold] row and no Xid in either
   witness. The base arm's `residency unset` record names a word mid-p<P>-s1 with P above 0 and the climb's why (the plan's
