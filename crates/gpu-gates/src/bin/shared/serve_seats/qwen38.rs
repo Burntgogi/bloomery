@@ -89,12 +89,13 @@
 //!
 //! The prompt cache (llama-server's `--cache-ram`, in MiB; 0 turns it off)
 //! holds the slot's sequence state when a request of another session takes
-//! the slot: the positional rows (K/V, raw and pooled keys) of the held
-//! positions, the recurrent stores at the held position and at the last
-//! prompt call's end, each with its PLE history, and under the draft the
-//! layer's side (`Seq38`): its store rows and the step's and the pass's
-//! arena rows with the positions they hold, the draft's waiting rows beside
-//! them ([`SlotDrafts::park`]). A returning session's state comes back
+//! the slot: the positional rows (K/V, raw and pooled keys, and under the
+//! draft its store's rows) of the held positions, the recurrent stores at
+//! the held position and at the last prompt call's end, each with its PLE
+//! history, and under the draft the layer's side (`Seq38`): the positions
+//! its store holds and the step's and the pass's arena rows with the
+//! positions they hold, the draft's waiting rows beside them
+//! ([`SlotDrafts::park`]). A returning session's state comes back
 //! whole, and its checkpoints are those two points. Its default is the
 //! lesser of `bind::CACHE_RAM_CAP` and half of what `MemAvailable` leaves at
 //! load past the plan's host need, the residency's churn pool and the
