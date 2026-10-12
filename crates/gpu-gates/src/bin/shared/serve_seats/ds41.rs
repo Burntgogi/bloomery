@@ -167,7 +167,7 @@
 //! device code; a build without it refuses the flag by name, and the seat
 //! serves no image): the file is the V4.1 encoder's GGUF, opened at load and
 //! refused by name when it is not ([`vision_seat::Projector`]'s checks, and
-//! [`vision_seat::open_tower`]'s), and the encoder is resident from then
+//! [`vision_seat::Resident::open`]'s), and the encoder is resident from then
 //! on — on a card this process holds that the placement's plan leaves off it
 //! (the 3090 under `--place a` here, at no cost to the plan), else on the
 //! stage card as a named reserve the plan's fit counts
@@ -910,7 +910,7 @@ impl Saved for Ds41Saved {
 
 /// The resident image encoder of `--mmproj` ([`Vision`]), opened on the seat
 /// the plan picked ([`vision_seat::EncoderSeat`]): the tower loaded on its card
-/// ([`vision_seat::open_tower`]) — refused by name when the file is not the V4.1
+/// ([`vision_seat::Resident::open`]) — refused by name when the file is not the V4.1
 /// encoder's, or when its uploads are not the card figure the plan reserved — the
 /// delimiter rows of its file read once, and the prompt batch's media half
 /// made ([`body::prepare_media`]). The `vision` record that follows the load

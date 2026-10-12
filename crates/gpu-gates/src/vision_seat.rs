@@ -16,7 +16,7 @@
 //!   input, and the row width; [`Projector::check_text`] holds it against the text model, every
 //!   mismatch refused by name.
 //! * [`open_seat`] — the flags to the opened encoder: the projector held against the text model and
-//!   seated for the plan ([`Opened`]); [`open_tower`] loads its tower on that card.
+//!   seated for the plan ([`Opened`]); [`Resident::open`] loads its tower on that card.
 //! * [`EncoderSeat`] — where the tower sits: the smallest card outside the plan, else a reserve on
 //!   the stage card ([`reserve_on`] puts the same reserve into a placed plan and a whole-fit probe).
 //! * [`RESERVE`], [`reserve_on`], [`reserve_in`], [`with_reserve`], [`refusal`] and
@@ -26,9 +26,9 @@
 //!   of a sequence for a media load.
 //! * [`on_encoder_card`] — binds the tower's card for a tower call and the model's card back.
 //! * [`Resident`] — a serve seat's resident encoder: the tower on its card, its stream, the row
-//!   width and the model's image input; [`Resident::span_rows`] encodes a media call's images and
-//!   reads them back as the rows a prompt call splices. The seat gives only its model's splice of
-//!   one image's rows.
+//!   width and the model's image input; [`Resident::encode_with`] encodes a media call's images
+//!   and reads them back as the rows a prompt call splices. The seat gives only its model's splice
+//!   of one image's rows.
 //! * [`Resident::encode_with`] and [`Encoded::prompt`] — the two steps of a seat's media call
 //!   (GLM, Qwen3.6 and V4.1; Clef takes the first and makes its own hidden-state call), the one
 //!   place the seats' rows pass between the readback and the prompt call: the images encoded on the model's card and read back as [`Encoded`] rows
@@ -41,9 +41,8 @@
 //!   [`MediaSpan`]s of a body that takes nothing beside a span's positions and rows, and as the
 //!   [`ImageSpan`]s of a body that also takes each image's token grid, which [`span_rows_of`]
 //!   records in each span ([`SpanAt::grid`]) from the image the span is of — a seat passes none.
-//! * [`span_rows`] — the same on a tower and stream the caller holds ([`span_rows_of`] is its host
-//!   half, which takes the readback as a closure); every tower writes one row of `width` a cell of
-//!   the plan's token grid.
+//! * [`span_rows_of`] — the host half of a resident's encode, which takes the readback as a
+//!   closure; every tower writes one row of `width` a cell of the plan's token grid.
 //! * [`seat_record`] — the `vision_seat` line a seat prints with its plan, before any load (also the
 //!   projector [`kept`] drops, as `seat=not-loaded`); [`record`] — the `vision` line after the
 //!   tower's load.
@@ -430,7 +429,7 @@ pub struct Opened {
     /// The most image tokens one image takes ([`Projector::cap`]).
     pub cap: usize,
     /// The tower's card figure: the plan's reserve on a stage-reserve seat, and what the tower's
-    /// load is held to ([`open_tower`]).
+    /// load in [`Resident::open`] is held to.
     pub card: CardBytes,
     /// The image-token limits the tower's activations are sized for ([`Projector::limits`]).
     pub limits: TokenLimits,
@@ -663,7 +662,7 @@ pub fn on_encoder_card<T>(
 /// ([`on_encoder_card`]), refused by name when the load's weight and activation bytes are not the
 /// card figure the plan reserved.
 #[cfg(feature = "vision")]
-pub fn open_tower(
+fn open_tower(
     model: &CudaContext,
     at: &Opened,
 ) -> Result<
@@ -771,7 +770,7 @@ pub struct SpanAt {
 /// [`SpanRows`] of `images`, encoded on `tower` in order and read back on `stream`, the stream the
 /// tower was opened with ([`span_rows_of`] holds the rules).
 #[cfg(feature = "vision")]
-pub fn span_rows<'a, T: bloomery_gpu_vision::Tower + ?Sized, K>(
+fn span_rows<'a, T: bloomery_gpu_vision::Tower + ?Sized, K>(
     tower: &mut T,
     stream: &Arc<cuda_core::CudaStream>,
     images: impl IntoIterator<Item = Image<'a>>,
@@ -794,7 +793,7 @@ pub fn span_rows<'a, T: bloomery_gpu_vision::Tower + ?Sized, K>(
 }
 
 /// A serve seat's resident image encoder under `--mmproj`: the tower on the card the plan seated
-/// it ([`open_tower`]), the stream its readbacks run on, the width of a row (the text model's
+/// it ([`Resident::open`]), the stream its readbacks run on, the width of a row (the text model's
 /// embedding, which the tower writes) and the model's image input the server renders and expands
 /// image parts by. What a seat adds is its model's splice of one image's rows.
 #[cfg(feature = "vision")]
@@ -807,8 +806,9 @@ pub struct Resident {
 
 #[cfg(feature = "vision")]
 impl Resident {
-    /// The tower of `at`'s file loaded on its seat's card ([`open_tower`]) with the model's
-    /// context (`model`) bound back; the row width is the tower's.
+    /// The tower of `at`'s file loaded on its seat's card with the model's context (`model`) bound
+    /// back, refused by name when the load's bytes are not the card figure the plan reserved; the
+    /// row width is the tower's.
     pub fn open(model: &CudaContext, at: &Opened) -> Result<Resident, GateError> {
         let (stream, tower) = open_tower(model, at)?;
         Ok(Resident {
@@ -851,7 +851,7 @@ impl Resident {
     }
 
     /// [`span_rows`] of `images` on this tower and stream, at the row width.
-    pub fn span_rows<'a, K>(
+    fn span_rows<'a, K>(
         &mut self,
         images: impl IntoIterator<Item = Image<'a>>,
         splice: impl FnMut(&[u16], &Patches) -> Result<(Vec<u16>, Vec<K>), GateError>,
@@ -934,13 +934,13 @@ impl<K> Encoded<K> {
     }
 }
 
-/// The host half of [`span_rows`]: each image encoded and read back as bf16 by `encode`, the
-/// first `n_llm_h · n_llm_w · width` values kept (the tower writes one row of `width` a cell of
-/// the plan's grid; fewer is refused by name) and handed to `splice` with the patches, which
-/// returns the span's rows and the kind of each of its positions; their count is the image's
-/// `span_len`, refused by name when it is not. The span records its image's own token grid
-/// ([`SpanAt::grid`]). What a span adds around the cells' rows (V4.1's delimiters, none for a
-/// merger's tokens) is `splice`; the rest is the same for every tower.
+/// The host half of a resident's encode ([`Resident::encode_with`]): each image encoded and read
+/// back as bf16 by `encode`, the first `n_llm_h · n_llm_w · width` values kept (the tower writes
+/// one row of `width` a cell of the plan's grid; fewer is refused by name) and handed to `splice`
+/// with the patches, which returns the span's rows and the kind of each of its positions; their
+/// count is the image's `span_len`, refused by name when it is not. The span records its image's
+/// own token grid ([`SpanAt::grid`]). What a span adds around the cells' rows (V4.1's delimiters,
+/// none for a merger's tokens) is `splice`; the rest is the same for every tower.
 pub fn span_rows_of<'a, K, E: Display>(
     images: impl IntoIterator<Item = Image<'a>>,
     width: usize,
@@ -987,8 +987,8 @@ pub fn span_rows_of<'a, K, E: Display>(
     Ok(out)
 }
 
-/// The splice of a merger tower's span ([`span_rows`]): the cells' rows as the tower wrote them,
-/// one position a cell, nothing around them — the placeholder's delimiters are ordinary ids.
+/// The splice of a merger tower's span ([`Resident::encode`]): the cells' rows as the tower wrote
+/// them, one position a cell, nothing around them — the placeholder's delimiters are ordinary ids.
 pub fn merged_cells(rows: &[u16], patches: &Patches) -> Result<(Vec<u16>, Vec<()>), GateError> {
     let cells = patches.plan.n_llm_h * patches.plan.n_llm_w;
     Ok((rows.to_vec(), vec![(); cells]))
