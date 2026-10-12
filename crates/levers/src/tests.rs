@@ -479,7 +479,8 @@ fn accessors_read_their_rows() {
             QWEN3_KV,
             LANE_PREFETCH,
             HOST_LANES,
-            GEN_SLOTS
+            GEN_SLOTS,
+            SCREEN
         ]
     );
 }

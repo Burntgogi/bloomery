@@ -519,7 +519,25 @@ fn parallel_text(slots: usize, slot_ctx: usize, from: SlotsFrom, pass: Pass) -> 
 /// context, the total, what set the count (`from`), and the shape of a round
 /// of several slots (`pass`).
 pub fn parallel_line(slots: usize, slot_ctx: usize, from: SlotsFrom, pass: Pass) {
-    eprintln!("{}", parallel_text(slots, slot_ctx, from, pass));
+    eprint_noted(&parallel_text(slots, slot_ctx, from, pass));
+}
+
+/// A seat's start line that is no [`crate::record::Record`] (the
+/// `parallel`, `cache` and Qwen3.8 `load` lines) on stderr as it is, and to
+/// the start screen (`serve::screen::note`), which keeps it only when armed.
+pub fn eprint_noted(line: &str) {
+    eprintln!("{line}");
+    serve::screen::note(line);
+}
+
+/// Arms the start screen (`serve::screen`) when `on` (the seat's
+/// `BLOOMERY_SCREEN`) and stderr is a terminal, and then hands it every
+/// record line the seat prints; a seat calls it right after its levers and
+/// records are registered, and the server draws the screen once it listens.
+pub fn arm_screen(on: bool) {
+    if serve::screen::arm(on) {
+        crate::record::tee(serve::screen::note);
+    }
 }
 
 /// `/props`' placement of `plan` on `machine`: its cards by nvidia-smi
@@ -3344,6 +3362,23 @@ mod tests {
             parallel_text(2, 4096, SlotsFrom::Flag, Pass::One),
             "parallel rule=slots slots=2 slot_ctx=4096 total=8192 from=flag pass=one"
         );
+        // The line is no record kind; the start screen (`serve::screen`)
+        // reads it by key, and its fixed starts carry it as printed.
+        for (start, line) in [
+            (
+                include_str!("../../serve/tests/fixtures/screen-start.log"),
+                parallel_text(2, 16384, SlotsFrom::Default, Pass::One),
+            ),
+            (
+                include_str!("../../serve/tests/fixtures/screen-start-qwen38.log"),
+                parallel_text(1, 8192, SlotsFrom::Ctx, Pass::One),
+            ),
+        ] {
+            assert!(
+                start.lines().any(|l| l == line),
+                "the screen's fixed start lacks `{line}`"
+            );
+        }
     }
 
     /// The slot count and its word: `--parallel` as given, one slot at the

@@ -15,7 +15,8 @@
 //! `worker` for the engine thread that steps them, `swap` for slots that take one engine in turns. [`decide`] is a decision model's server
 //! (`POST /v1/systemone`) on the same HTTP layer. [`preflight`] is what a
 //! server checks before it fetches or loads (the CPU, the driver), [`flag`]
-//! the seats' shared flag spellings.
+//! the seats' shared flag spellings, [`screen`] the start screen a person
+//! reads at a terminal.
 
 mod api;
 pub mod decide;
@@ -35,6 +36,7 @@ pub mod qwenxml;
 pub mod reasoning;
 pub mod sampling;
 mod sched;
+pub mod screen;
 mod slotfile;
 mod stop;
 mod swap;

@@ -199,8 +199,8 @@ use bloomery_gpu_deepseek41::body::{self, Body, Deepseek41Model, PAIR_ROWS, SeqS
 use bloomery_gpu_deepseek41::draft::DraftBody;
 use bloomery_gpu_deepseek41::swap;
 use bloomery_gpu_gates::bind::{
-    CacheRam, ChatSurface, Listen, Pass, Seat, SeatEngine, SlotStep, SlotsFrom, Vocab, bind_server,
-    model_props, nvidia_smi_index, parallel_line, placement_of,
+    CacheRam, ChatSurface, Listen, Pass, Seat, SeatEngine, SlotStep, SlotsFrom, Vocab, arm_screen,
+    bind_server, model_props, nvidia_smi_index, parallel_line, placement_of,
 };
 use bloomery_gpu_gates::generate::{Lane, Place, PlaceWhy, lane_at, mode_name};
 use bloomery_gpu_gates::record::{self, Record};
@@ -454,6 +454,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     model::ops::set_host_lanes(levers.host_lanes());
     record::at_main("bloomery-serve-ds41", record::BLOOMERY_SERVE_DS41);
     super::drafted::serves_widths();
+    arm_screen(levers.screen());
     let (a, placed) = parse_args(args)?;
     placed.record().eprint();
     // The lane's rate, taken before the plan reads the room (`lane_of`).

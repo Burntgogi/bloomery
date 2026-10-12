@@ -337,8 +337,8 @@ use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::model::StepMode;
 use bloomery_gpu_gates::bind::{
     CacheRam, Cached, ChatSurface, Landing, Listen, Pass, PutBack, Seat, SeatEngine, SlotPassRow,
-    SlotStep, SlotsFrom, Vocab, begin, bind_server, model_props, note_line, parallel_line,
-    placement_of, put_back, slots_of,
+    SlotStep, SlotsFrom, Vocab, arm_screen, begin, bind_server, eprint_noted, model_props,
+    note_line, parallel_line, placement_of, put_back, slots_of,
 };
 use bloomery_gpu_gates::generate::{BreakEven, Lane, Place, lane_of};
 use bloomery_gpu_gates::nodes::count_kinds;
@@ -1227,6 +1227,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     model::ops::set_host_lanes(levers.host_lanes());
     record::at_main("bloomery-serve-qwen38", record::BLOOMERY_SERVE_QWEN38);
     super::drafted::serves_widths();
+    arm_screen(levers.screen());
     // Set, the word runs as given; unset, the Qwen3.8 rule picks it once the
     // placement and the plan are known (`residency unset`).
     if let Some(word) = levers.residency() {
@@ -1643,10 +1644,10 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         mtp_inputs = None;
     }
     rule.print();
-    eprintln!(
+    eprint_noted(&format!(
         "{} message_start={MESSAGE_START} in_vocab={has_start} in_template={in_template}",
         cache.line()
-    );
+    ));
     // The rounds of several slots, decided once (the open takes it through
     // `SeatArgs`): one pass of the busy rows, a slot at a time beside an
     // expert tier card ([`Place38::tiered`]).
@@ -2113,7 +2114,7 @@ impl Q38 {
         m.set_mode(StepMode::Graph);
         record::lane(a.lane.0, &a.lane.1).eprint();
         let total = t.elapsed();
-        eprintln!(
+        eprint_noted(&format!(
             "load arch=qwen4exp resident_bytes={} ctx={} slots={} slot_ctx={} ctx_max={cap} \
              ctx_train={} verified={VERIFIED_POSITIONS} layers={} mode=graph store_bytes={} \
              prefill={} ubatch={} place={} card_layers={} in {:.1} s (runtime value)",
@@ -2129,7 +2130,7 @@ impl Q38 {
             a.place.name(),
             m.body(WHAT)?.card_layers(),
             total.as_secs_f64()
-        );
+        ));
         record::eprint_load_phases(&m, total, opened);
         // The load's NVMe expert tier, when its plan paged routed experts
         // and the arena was built: the same `nvtier` record

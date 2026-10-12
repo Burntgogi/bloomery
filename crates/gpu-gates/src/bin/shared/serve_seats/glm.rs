@@ -255,8 +255,8 @@ use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::model::{SlotRows, StepMode};
 use bloomery_gpu_gates::bind::{
     CacheRam, Cached, ChatSurface, Landing, Listen, Pass, PutBack, Seat, SeatEngine, SlotPassRow,
-    SlotStep, Vocab, begin, bind_server, default_slots_fit, model_props, note_line, parallel_line,
-    placement_of, put_back, slots_given,
+    SlotStep, Vocab, arm_screen, begin, bind_server, default_slots_fit, eprint_noted, model_props,
+    note_line, parallel_line, placement_of, put_back, slots_given,
 };
 use bloomery_gpu_gates::generate::{Lane, Place, lane_at, mode_name, with_cards};
 use bloomery_gpu_gates::record::{self, Record};
@@ -326,8 +326,9 @@ const CTX_STEP: usize = 256;
 /// slots (a `slots round` record each); a lever set outside this list is
 /// refused by name at `main`, with `BLOOMERY_PIN_MAIN` for the engine
 /// thread's cpu slot, as every serving seat reads it, and `BLOOMERY_HOST_LANES`
-/// for the lanes of the host tier's legs on that thread's CCD map;
-/// `gate_glm5next_serve` holds the same list.
+/// for the lanes of the host tier's legs on that thread's CCD map, and
+/// `BLOOMERY_SCREEN` for the start screen; `gate_glm5next_serve` holds the
+/// same list.
 pub const ACTS_ON: &[&str] = &[
     bloomery_levers::CARD_BUDGET,
     bloomery_levers::HOST_POPULATE,
@@ -340,6 +341,7 @@ pub const ACTS_ON: &[&str] = &[
     bloomery_levers::MTP_WIDTH,
     bloomery_levers::RESIDENCY,
     bloomery_levers::STEP_STATS,
+    bloomery_levers::SCREEN,
 ];
 
 /// The drafted window's verify: the target's next token and the draft's one
@@ -835,6 +837,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     model::ops::set_host_lanes(levers.host_lanes());
     let width = WidthMode::of(levers.mtp_width())?;
     record::at_main(WHAT, record::BLOOMERY_SERVE_GLM);
+    arm_screen(levers.screen());
     let a = parse_args(args)?;
     // The census the placement resolves against, read once: `--place` as
     // given, or unset the common rule's choice on the same reading.
@@ -1076,7 +1079,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         checkpoints_reserved(plan.machine),
     )?
     .holding(seq_bytes(&inputs, 1, nextn.is_some()));
-    eprintln!("{}", cache.line());
+    eprint_noted(&cache.line());
     // The round's shape the open below runs (the module doc).
     parallel_line(
         slots,
