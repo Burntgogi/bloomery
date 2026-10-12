@@ -1175,7 +1175,7 @@ mod drive {
             None => inputs.plan(&machine, ctx, place_levers),
         }
         .map_err(|e| GpuError::plan(WHAT, e))?;
-        let pick = residency::at_plan(&plan, 0, pick)?;
+        let pick = residency::at_plan::<Body>(&plan, 0, pick)?;
         Ok((Some(plan.n_l.clone()), pick))
     }
 

@@ -455,6 +455,7 @@ impl Body {
 impl ChainBody for Body {
     type Input = DecodeInput;
     type Host = Body;
+    const UNHOSTED_POOL: bloomery_levers::UnhostedPool = bloomery_levers::UnhostedPool::NotCarried;
 
     fn arch() -> Arch {
         Arch::Deepseek2

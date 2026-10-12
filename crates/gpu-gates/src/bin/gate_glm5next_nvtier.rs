@@ -248,7 +248,8 @@ mod gate {
     }
 
     /// `why` in the names the family gate's table uses ([`Unset`]): the word kept as the rule's `Serving` is `place`,
-    /// the word moved to another P is `shrunk`, the other whys keep their meaning.
+    /// the word the card slots moved to another P is `shrunk`, the host's pool `pool_shrunk`, the other whys keep
+    /// their meaning.
     fn why_name(why: GlmWhy) -> &'static str {
         match why {
             GlmWhy::Serving => "place",
@@ -260,6 +261,8 @@ mod gate {
             GlmWhy::NoRoom { .. } => "no_room",
             GlmWhy::Moved { .. } => "shrunk",
             GlmWhy::Unhosted(_) => "pool_unhosted",
+            GlmWhy::PoolShrunk { .. } => "pool_shrunk",
+            GlmWhy::PoolUnhostable(_) => "pool_unhostable",
         }
     }
 
@@ -327,6 +330,7 @@ mod gate {
             .residency;
             let room = PlanRoom::new(&plan, GLM_CARD, 0);
             let pick = glm_residency_at_plan(
+                <Body as bloomery_gpu::model::ChainBody>::UNHOSTED_POOL,
                 unset,
                 room.card_experts(),
                 |pinned| room.pool_bytes(pinned),
@@ -343,7 +347,10 @@ mod gate {
         /// On the 3090 the plan holds no routed expert on the card, so the first clause (`:1287`) answers `off`,
         /// `no_card_experts`, whatever the arena; on the A6000 the card experts, the pool and the headroom decide.
         fn expected_residency(&self, plan: &PlanFacts) -> Unset {
-            Unset::serving(&plan.room)
+            Unset::serving(
+                &plan.room,
+                <Body as bloomery_gpu::model::ChainBody>::UNHOSTED_POOL,
+            )
         }
 
         /// More than one routed layer stays on the host, so the tier has something to page: an

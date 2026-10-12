@@ -167,6 +167,7 @@ impl Planned38<'_> {
             a.host,
             a.ub,
             a.residency,
+            bloomery_levers::ChurnHosting::Hosted,
             a.slots,
         )?;
         model.set_mode(StepMode::Graph);

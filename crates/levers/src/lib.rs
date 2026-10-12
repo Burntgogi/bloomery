@@ -1091,6 +1091,13 @@ pub enum ResidencyWhy {
     /// Unset, the word keeps its P and the load does not host the churn
     /// pool there ([`PoolUnhosted`]).
     Unhosted(PoolUnhosted),
+    /// Unset, on a load that hosts its pool: the word's pinned experts
+    /// raised from `from` to `to`, the first count whose churn pool fits the
+    /// host ([`Room::MovedForPool`]).
+    PoolShrunk { from: usize, to: usize },
+    /// Unset, on a load that hosts its pool: no count the card slots hold
+    /// has a churn pool that fits the host ([`PoolUnhostable`]).
+    PoolUnhostable(PoolUnhostable),
 }
 
 impl ResidencyWhy {
@@ -1108,6 +1115,8 @@ impl ResidencyWhy {
             ResidencyWhy::NoCardExperts => "no_card_experts",
             ResidencyWhy::NoRoom { .. } => "no_room",
             ResidencyWhy::Unhosted(_) => "pool_unhosted",
+            ResidencyWhy::PoolShrunk { .. } => "pool_shrunk",
+            ResidencyWhy::PoolUnhostable(_) => "pool_unhostable",
         }
     }
 
@@ -1128,6 +1137,10 @@ impl ResidencyWhy {
                  word's P or half of them"
             )),
             ResidencyWhy::Unhosted(pool) => Some(pool.to_string()),
+            ResidencyWhy::PoolShrunk { from, to } => Some(format!(
+                "unset: p{from}→p{to} (host: the churn pool did not fit, raised)"
+            )),
+            ResidencyWhy::PoolUnhostable(pool) => Some(pool.to_string()),
             ResidencyWhy::Set
             | ResidencyWhy::Place
             | ResidencyWhy::FixedPlace
@@ -1143,6 +1156,7 @@ impl From<RoomShort> for ResidencyWhy {
         match short {
             RoomShort::NoCardExperts => ResidencyWhy::NoCardExperts,
             RoomShort::NoRoom { fewest } => ResidencyWhy::NoRoom { fewest },
+            RoomShort::PoolUnhostable(pool) => ResidencyWhy::PoolUnhostable(pool),
         }
     }
 }
@@ -1210,6 +1224,22 @@ pub enum ChurnHosting {
     Unhosted,
 }
 
+/// Whether a body's load carries a churn pool it does not host: the body
+/// declares it (`bloomery_gpu::model::ChainBody::UNHOSTED_POOL`) and an
+/// unset word's resolution reads it ([`room_for`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnhostedPool {
+    /// The load takes [`ChurnHosting::Unhosted`] to its residency spec: an
+    /// unset word whose pool fits neither host budget keeps its P with the
+    /// pool unhosted ([`Room::Unhosted`]).
+    Carried,
+    /// The load hosts every churn pool it runs: an unset word whose pool
+    /// fits neither host budget runs at the first P above it whose pool fits
+    /// ([`Room::MovedForPool`]), `off` where none up to the card ceiling
+    /// does ([`RoomShort::PoolUnhostable`]).
+    NotCarried,
+}
+
 /// The families' picks' one rule from their why: unhosted where the why is
 /// the plan's room leaving the pool out ([`PoolUnhosted`]).
 fn hosting(unhosted: bool) -> ChurnHosting {
@@ -1248,6 +1278,33 @@ impl fmt::Display for PoolUnhosted {
     }
 }
 
+/// An unset word on a load that hosts every churn pool it runs
+/// ([`UnhostedPool::NotCarried`]) whose pool fits neither budget at any P up
+/// to what the card slots hold: `needs` the pool's bytes at the last P
+/// probed, `headroom` the plan's host headroom, `mem_left` what
+/// `MemAvailable` leaves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PoolUnhostable {
+    pub needs: u64,
+    pub headroom: i128,
+    pub mem_left: i128,
+}
+
+impl fmt::Display for PoolUnhostable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let PoolUnhostable {
+            needs,
+            headroom,
+            mem_left,
+        } = *self;
+        write!(
+            f,
+            "unset: the churn pool needs {needs} B at the highest P the card slots hold, the plan \
+             leaves {headroom} B and MemAvailable {mem_left} B, and this load hosts its pool"
+        )
+    }
+}
+
 /// Why a family's residency word cannot run on a plan ([`Room::Short`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RoomShort {
@@ -1256,6 +1313,9 @@ pub enum RoomShort {
     /// The plan's fewest card experts a layer (`fewest`) leave no room for
     /// the word's P or half of them, their spares and one that moves.
     NoRoom { fewest: usize },
+    /// The load hosts its pool and no P the card slots hold has a pool that
+    /// fits ([`PoolUnhostable`]).
+    PoolUnhostable(PoolUnhostable),
 }
 
 /// What a plan's room left of a family's target residency word
@@ -1275,8 +1335,14 @@ pub enum Room {
         from: usize,
         to: usize,
     },
+    /// The word runs at `to`, the first pinned count above the P the card
+    /// slots left whose churn pool fits both host budgets, keeping its
+    /// spares; `from` the family's target. A load that hosts every pool it
+    /// runs ([`UnhostedPool::NotCarried`]) only.
+    MovedForPool { from: usize, to: usize },
     /// The word runs at `pinned`, the P the card slots left, and its host
-    /// does not take the churn pool there ([`PoolUnhosted`]).
+    /// does not take the churn pool there ([`PoolUnhosted`]). A load that
+    /// carries an unhosted pool ([`UnhostedPool::Carried`]) only.
     Unhosted { pinned: usize, pool: PoolUnhosted },
     /// The word cannot run: `off`, and why ([`RoomShort`]).
     Short(RoomShort),
@@ -1291,13 +1357,17 @@ pub enum Room {
 /// at its target while its card slots hold it, its spares and one that
 /// moves; where they do not, at
 /// half the plan's fewest card experts a layer, never under
-/// [`RESIDENCY_MIN_P`]. The host side never moves P: where the churn pool
-/// at P fits neither budget, the word keeps P and the load leaves the pool
-/// unhosted ([`Room::Unhosted`]). Through [`Room::Moved`] the word keeps its
-/// spares at the moved count; through [`Room::Short`] it does not run — a
-/// default the user did not set never refuses the load. An error of
-/// `pool_bytes` is the call's.
+/// [`RESIDENCY_MIN_P`]. Where the churn pool at P fits neither budget, the
+/// load's `carry` decides: a load that carries an unhosted pool keeps P and
+/// leaves the pool unhosted ([`Room::Unhosted`]); one that hosts every pool
+/// runs at the first count above P whose pool fits, never past what the card
+/// slots hold ([`Room::MovedForPool`]), and `off` where none does
+/// ([`RoomShort::PoolUnhostable`]). Through [`Room::Moved`] and
+/// [`Room::MovedForPool`] the word keeps its spares at the moved count;
+/// through [`Room::Short`] it does not run — a default the user did not set
+/// never refuses the load. An error of `pool_bytes` is the call's.
 pub fn room_for<E>(
+    carry: UnhostedPool,
     target: usize,
     spares: usize,
     card_experts: impl IntoIterator<Item = u64>,
@@ -1328,18 +1398,38 @@ pub fn room_for<E>(
         half
     };
     // The host side at P: the churn pool there fits the plan's host headroom
-    // and what MemAvailable leaves past the plan's own host need, else the
-    // word keeps P with the pool unhosted.
+    // and what MemAvailable leaves past the plan's own host need.
+    let fits = |needs: u64| headroom >= i128::from(needs) && mem_left >= i128::from(needs);
     let needs = pool_bytes(p)?;
-    if headroom < i128::from(needs) || mem_left < i128::from(needs) {
-        return Ok(Room::Unhosted {
-            pinned: p,
-            pool: PoolUnhosted {
-                needs,
-                headroom,
-                mem_left,
-            },
-        });
+    if !fits(needs) {
+        if carry == UnhostedPool::Carried {
+            return Ok(Room::Unhosted {
+                pinned: p,
+                pool: PoolUnhosted {
+                    needs,
+                    headroom,
+                    mem_left,
+                },
+            });
+        }
+        // The pool shrinks as the count grows, so the first count above the
+        // word's whose pool fits is the nearest the sides leave; the probes
+        // stop at the card side's ceiling.
+        let mut needs = needs;
+        for q in p + 1..=ceiling as usize {
+            needs = pool_bytes(q)?;
+            if fits(needs) {
+                return Ok(Room::MovedForPool {
+                    from: target,
+                    to: q,
+                });
+            }
+        }
+        return Ok(Room::Short(RoomShort::PoolUnhostable(PoolUnhostable {
+            needs,
+            headroom,
+            mem_left,
+        })));
     }
     Ok(if p == target {
         Room::AsIs
@@ -1361,13 +1451,16 @@ fn mid_word(p: usize, s: usize) -> &'static str {
 
 /// [`RESIDENCY`] unset on a V4.1 plan: `pick` as it is unless it runs the
 /// machine (`ResidencyWhy::Place` under a `mid-p<P>-s<S>` word); then
-/// [`room_for`] the word's P and spares against the plan — through
-/// [`ResidencyWhy::Shrunk`] the word runs at the P the card slots leave,
-/// through [`ResidencyWhy::Unhosted`] at its P with the pool unhosted, `off`
-/// with why where the card slots leave none — a default the user did not set
-/// never refuses the load. A set word and every other why pass
-/// through untouched. An error of `pool_bytes` is the call's.
+/// [`room_for`] the word's P and spares against the plan, under the load's
+/// `carry` — through [`ResidencyWhy::Shrunk`] the word runs at the P the
+/// card slots leave, through [`ResidencyWhy::Unhosted`] at its P with the
+/// pool unhosted, through [`ResidencyWhy::PoolShrunk`] at the first P whose
+/// pool the host takes, `off` with why where the card slots or the host
+/// leave none — a default the user did not set never refuses the load. A set
+/// word and every other why pass through untouched. An error of
+/// `pool_bytes` is the call's.
 pub fn residency_at_plan<E>(
+    carry: UnhostedPool,
     pick: ResidencyPick,
     card_experts: impl IntoIterator<Item = u64>,
     pool_bytes: impl Fn(usize) -> Result<u64, E>,
@@ -1381,11 +1474,23 @@ pub fn residency_at_plan<E>(
         return Ok(pick);
     };
     Ok(
-        match room_for(pinned, spares, card_experts, pool_bytes, headroom, mem_left)? {
+        match room_for(
+            carry,
+            pinned,
+            spares,
+            card_experts,
+            pool_bytes,
+            headroom,
+            mem_left,
+        )? {
             Room::AsIs => pick,
             Room::Moved { fewest, from, to } => ResidencyPick {
                 word: mid_word(to, spares),
                 why: ResidencyWhy::Shrunk { fewest, from, to },
+            },
+            Room::MovedForPool { from, to } => ResidencyPick {
+                word: mid_word(to, spares),
+                why: ResidencyWhy::PoolShrunk { from, to },
             },
             Room::Unhosted { pinned, pool } => ResidencyPick {
                 word: mid_word(pinned, spares),
@@ -1449,6 +1554,12 @@ pub enum Residency38Why {
     /// The word keeps its P and the load does not host the churn pool there
     /// ([`PoolUnhosted`]).
     Unhosted(PoolUnhosted),
+    /// On a load that hosts its pool: the word's pinned experts raised from
+    /// `from` to `to`, the first count whose churn pool fits the host.
+    PoolShrunk { from: usize, to: usize },
+    /// On a load that hosts its pool: no count the card slots hold has a
+    /// churn pool that fits the host ([`PoolUnhostable`]).
+    PoolUnhostable(PoolUnhostable),
 }
 
 impl fmt::Display for Residency38Why {
@@ -1486,6 +1597,11 @@ impl fmt::Display for Residency38Why {
                 "unset: the plan's room moves the word's pinned experts p{from}→p{to}"
             ),
             Residency38Why::Unhosted(pool) => pool.fmt(f),
+            Residency38Why::PoolShrunk { from, to } => write!(
+                f,
+                "unset: p{from}→p{to} (host: the churn pool did not fit, raised)"
+            ),
+            Residency38Why::PoolUnhostable(pool) => pool.fmt(f),
         }
     }
 }
@@ -1495,6 +1611,7 @@ impl From<RoomShort> for Residency38Why {
         match short {
             RoomShort::NoCardExperts => Residency38Why::NoCardExperts,
             RoomShort::NoRoom { fewest } => Residency38Why::NoRoom { fewest },
+            RoomShort::PoolUnhostable(pool) => Residency38Why::PoolUnhostable(pool),
         }
     }
 }
@@ -1562,12 +1679,15 @@ pub fn residency38_unset(at: Residency38At) -> Option<Residency38Pick> {
 /// Qwen3.8 room is gpu-gates' `mem_left_38`, the available bytes less the
 /// plan's host need, which already counts the checkpoints the load holds).
 /// P is 0, no seed expert pinned — where the churn pool at 0 fits neither
-/// budget, still 0 with the pool unhosted ([`Room::Unhosted`]); `off` when
-/// no layer holds a card expert, when the host holds none (the pool would
-/// serve nothing), or when the fewest leave no room for P pinned, the spares
-/// and one that moves — a default the user did not set never refuses the
-/// load. An error of `pool_bytes` is the call's.
+/// budget, the load's `carry` decides ([`room_for`]): still 0 with the pool
+/// unhosted, or the first P whose pool fits; `off` when no layer holds a
+/// card expert, when the host holds none (the pool would serve nothing),
+/// when the fewest leave no room for P pinned, the spares and one that
+/// moves, or when no P the card slots hold has a pool the host takes on a
+/// load that hosts its pool — a default the user did not set never refuses
+/// the load. An error of `pool_bytes` is the call's.
 pub fn residency38_at_plan<E>(
+    carry: UnhostedPool,
     card_experts: impl IntoIterator<Item = u64>,
     host_experts: u64,
     pool_bytes: impl Fn(usize) -> Result<u64, E>,
@@ -1585,6 +1705,7 @@ pub fn residency38_at_plan<E>(
     let fewest = usize::try_from(fewest).unwrap_or(usize::MAX);
     Ok(
         match room_for(
+            carry,
             0,
             RESIDENCY38_SPARES,
             layers,
@@ -1599,6 +1720,10 @@ pub fn residency38_at_plan<E>(
             Room::Moved { from, to, .. } => Residency38Pick {
                 pinned: Some(to),
                 why: Residency38Why::Moved { from, to },
+            },
+            Room::MovedForPool { from, to } => Residency38Pick {
+                pinned: Some(to),
+                why: Residency38Why::PoolShrunk { from, to },
             },
             Room::Unhosted { pinned, pool } => Residency38Pick {
                 pinned: Some(pinned),
@@ -1942,6 +2067,12 @@ pub enum GlmWhy {
     /// The word keeps its P and the load does not host the churn pool there
     /// ([`PoolUnhosted`]).
     Unhosted(PoolUnhosted),
+    /// On a load that hosts its pool: the word's pinned experts raised from
+    /// `from` to `to`, the first count whose churn pool fits the host.
+    PoolShrunk { from: u64, to: u64 },
+    /// On a load that hosts its pool: no count the card slots hold has a
+    /// churn pool that fits the host ([`PoolUnhostable`]).
+    PoolUnhostable(PoolUnhostable),
 }
 
 impl fmt::Display for GlmWhy {
@@ -1973,6 +2104,11 @@ impl fmt::Display for GlmWhy {
                 "unset: the plan's room moves the word's pinned experts p{from}→p{to}"
             ),
             GlmWhy::Unhosted(pool) => pool.fmt(f),
+            GlmWhy::PoolShrunk { from, to } => write!(
+                f,
+                "unset: p{from}→p{to} (host: the churn pool did not fit, raised)"
+            ),
+            GlmWhy::PoolUnhostable(pool) => pool.fmt(f),
         }
     }
 }
@@ -1984,6 +2120,7 @@ impl From<RoomShort> for GlmWhy {
             RoomShort::NoRoom { fewest } => GlmWhy::NoRoom {
                 fewest: fewest as u64,
             },
+            RoomShort::PoolUnhostable(pool) => GlmWhy::PoolUnhostable(pool),
         }
     }
 }
@@ -2066,13 +2203,17 @@ pub fn glm_unset(at: GlmAt) -> GlmUnset {
 /// machine; then [`room_for`] the word's P and spares against the plan —
 /// `off`, with why, when it holds no card expert (`card_experts` a layer, a
 /// layer holding none left out) or when its fewest leave no room for the
-/// word's pinned experts, its spares and one that moves; the word at its P
-/// with the pool unhosted ([`GlmWhy::Unhosted`]) when the churn pool there
-/// (`pool_bytes`) fits neither `headroom` (the plan's host headroom less
-/// what the load hosts beside it) nor `mem_left` (what `MemAvailable` leaves
-/// past the load's host need) — a default the user did not set never
-/// refuses the load. An error of `pool_bytes` is the call's.
+/// word's pinned experts, its spares and one that moves; when the churn pool
+/// there (`pool_bytes`) fits neither `headroom` (the plan's host headroom
+/// less what the load hosts beside it) nor `mem_left` (what `MemAvailable`
+/// leaves past the load's host need), as the load's `carry` decides
+/// ([`room_for`]): the word at its P with the pool unhosted
+/// ([`GlmWhy::Unhosted`]), at the first P whose pool fits
+/// ([`GlmWhy::PoolShrunk`]), or `off` where none does — a default the user
+/// did not set never refuses the load. An error of `pool_bytes` is the
+/// call's.
 pub fn glm_residency_at_plan<E>(
+    carry: UnhostedPool,
     pick: GlmPick,
     card_experts: impl IntoIterator<Item = u64>,
     pool_bytes: impl Fn(usize) -> Result<u64, E>,
@@ -2083,11 +2224,26 @@ pub fn glm_residency_at_plan<E>(
         return Ok(pick);
     };
     Ok(
-        match room_for(pinned, spares, card_experts, pool_bytes, headroom, mem_left)? {
+        match room_for(
+            carry,
+            pinned,
+            spares,
+            card_experts,
+            pool_bytes,
+            headroom,
+            mem_left,
+        )? {
             Room::AsIs => pick,
             Room::Moved { from, to, .. } => GlmPick {
                 word: mid_word(to, spares),
                 why: GlmWhy::Moved {
+                    from: from as u64,
+                    to: to as u64,
+                },
+            },
+            Room::MovedForPool { from, to } => GlmPick {
+                word: mid_word(to, spares),
+                why: GlmWhy::PoolShrunk {
                     from: from as u64,
                     to: to as u64,
                 },

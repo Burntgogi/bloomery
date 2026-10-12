@@ -84,6 +84,13 @@ pub trait ChainBody: Sized {
     /// runs on the card alone.
     type Host: HostServed;
 
+    /// Whether this body's residency load takes a churn pool it does not
+    /// host ([`bloomery_levers::ChurnHosting::Unhosted`] reaching its
+    /// [`ResidencySpec`]): an unset residency word's resolution reads it
+    /// ([`bloomery_levers::room_for`]), so a body that does not carry the
+    /// pool keeps the rule that raises P until the pool fits.
+    const UNHOSTED_POOL: bloomery_levers::UnhostedPool;
+
     /// The architecture this body is the chain of.
     fn arch() -> Arch;
 

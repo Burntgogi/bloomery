@@ -1068,6 +1068,7 @@ impl Body38 {
             host,
             ubatch,
             Residency::Off,
+            ChurnHosting::Hosted,
             None,
             1,
         )
@@ -1095,6 +1096,7 @@ impl Body38 {
             host,
             ubatch,
             Residency::Off,
+            ChurnHosting::Hosted,
             None,
             slots,
         )
@@ -1102,16 +1104,20 @@ impl Body38 {
 
     /// [`Body38::open_placed`] under `residency`: `mid-p<P>-s<S>` runs the
     /// residency machine over the card's routed stacks
-    /// ([`crate::host::swap`], [`swap38::Qwen38Stacks`]) — the load's host set also
-    /// holds each layer's churn pool (the card's experts past the first `P`),
-    /// refused by name when the plan's host headroom cannot take it — while
-    /// `off` is [`Body38::open_placed`] itself. The lever's word a load runs
-    /// by is the registry's, read by the caller
-    /// (`bloomery_levers::Levers::residency_at`). `slots` is
-    /// [`Body38::open_placed_slots`]'s: the plan must have counted them.
+    /// ([`crate::host::swap`], [`swap38::Qwen38Stacks`]) — under
+    /// [`ChurnHosting::Hosted`] the load's host set also holds each layer's
+    /// churn pool (the card's experts past the first `P`), refused by name
+    /// when the plan's host headroom cannot take it; under
+    /// [`ChurnHosting::Unhosted`] it only knows the pool, whose victims are
+    /// read back from the mapping — while `off` is [`Body38::open_placed`]
+    /// itself. The lever's word a load runs by and its pool's hosting are the
+    /// caller's, from the registry and the word's resolution
+    /// (`bloomery_levers::Levers::residency_at`, `residency38_at_plan`).
+    /// `slots` is [`Body38::open_placed_slots`]'s: the plan must have
+    /// counted them.
     #[allow(
         clippy::too_many_arguments,
-        reason = "open_placed's six, the residency and the planned slots (rust-quality R8)"
+        reason = "open_placed's six, the residency and its pool's hosting, and the planned slots (rust-quality R8)"
     )]
     pub fn open_placed_residency(
         file: Split,
@@ -1121,10 +1127,11 @@ impl Body38 {
         host: HostCfg,
         ubatch: usize,
         residency: Residency,
+        pool: ChurnHosting,
         slots: usize,
     ) -> Result<Qwen38Model, GpuError> {
         Body38::open_with(
-            file, plan, inputs, card, host, ubatch, residency, None, slots,
+            file, plan, inputs, card, host, ubatch, residency, pool, None, slots,
         )
     }
 
@@ -1154,6 +1161,7 @@ impl Body38 {
             host,
             ubatch,
             Residency::Off,
+            ChurnHosting::Hosted,
             Some((draft, mtp, plan)),
             1,
         )
@@ -1186,6 +1194,7 @@ impl Body38 {
             host,
             ubatch,
             Residency::Off,
+            ChurnHosting::Hosted,
             Some((draft, mtp, plan)),
             slots,
         )
@@ -1197,7 +1206,7 @@ impl Body38 {
     /// ([`Body38::open_placed_mtp_slots`]): the plan must have counted them.
     #[allow(
         clippy::too_many_arguments,
-        reason = "open_placed_mtp's eight, the residency and the planned slots (rust-quality R8)"
+        reason = "open_placed_mtp's eight, the residency and its pool's hosting, and the planned slots (rust-quality R8)"
     )]
     pub fn open_placed_mtp_residency(
         file: Split,
@@ -1209,6 +1218,7 @@ impl Body38 {
         draft: &Split,
         mtp: &model::arch::qwen35moe::place::MtpInputs,
         residency: Residency,
+        pool: ChurnHosting,
         slots: usize,
     ) -> Result<Qwen38Model, GpuError> {
         Body38::open_with(
@@ -1219,17 +1229,20 @@ impl Body38 {
             host,
             ubatch,
             residency,
+            pool,
             Some((draft, mtp, plan)),
             slots,
         )
     }
 
-    /// The load every constructor shares, under `residency`; `mtp` the
-    /// draft's file, inputs and plan, when there is one, and `slots` the
-    /// sequence slots the plan was made for ([`Slots`]).
+    /// The load every constructor shares, under `residency` with its churn
+    /// pool hosted or only known as `pool` says (the word's resolution's
+    /// decision, [`ResidencySpec::pool`]); `mtp` the draft's file, inputs and
+    /// plan, when there is one, and `slots` the sequence slots the plan was
+    /// made for ([`Slots`]).
     #[allow(
         clippy::too_many_arguments,
-        reason = "open_placed's six, the residency, the draft's file, inputs and plan, and the planned slots (rust-quality R8)"
+        reason = "open_placed's six, the residency and its pool's hosting, the draft's file, inputs and plan, and the planned slots (rust-quality R8)"
     )]
     fn open_with(
         file: Split,
@@ -1239,6 +1252,7 @@ impl Body38 {
         host: HostCfg,
         ubatch: usize,
         residency: Residency,
+        pool: ChurnHosting,
         mtp: Option<(
             &Split,
             &model::arch::qwen35moe::place::MtpInputs,
@@ -1289,7 +1303,7 @@ impl Body38 {
         let shape = plan38::read(&inputs.spec)?;
         let spec = ResidencySpec {
             lever: residency,
-            pool: ChurnHosting::Hosted,
+            pool,
             delay: LIVE_DELAY,
             deadline: DEADLINE,
             top_k: geo::N_USED,
@@ -3841,6 +3855,7 @@ impl GpuModel<Body38> {
 impl ChainBody for Body38 {
     type Input = DecodeInput38;
     type Host = Body38;
+    const UNHOSTED_POOL: bloomery_levers::UnhostedPool = bloomery_levers::UnhostedPool::Carried;
 
     fn arch() -> Arch {
         Arch::Qwen35moe

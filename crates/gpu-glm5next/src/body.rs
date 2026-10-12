@@ -2282,6 +2282,7 @@ fn store(
 impl ChainBody for Body {
     type Input = StepInput;
     type Host = Body;
+    const UNHOSTED_POOL: bloomery_levers::UnhostedPool = bloomery_levers::UnhostedPool::NotCarried;
 
     fn arch() -> Arch {
         Arch::Glm5next

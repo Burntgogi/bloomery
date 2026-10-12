@@ -700,6 +700,7 @@ fn residency_at(
                 _ => room.mem_left()?,
             };
             let pick = glm_residency_at_plan(
+                <Body as bloomery_gpu::model::ChainBody>::UNHOSTED_POOL,
                 pick,
                 room.card_experts(),
                 |pinned| room.pool_bytes(pinned),

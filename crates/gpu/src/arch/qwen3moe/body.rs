@@ -950,6 +950,7 @@ impl Body {
 impl ChainBody for Body {
     type Input = DecodeInput;
     type Host = Placed;
+    const UNHOSTED_POOL: bloomery_levers::UnhostedPool = bloomery_levers::UnhostedPool::NotCarried;
 
     fn arch() -> Arch {
         Arch::Qwen3moe

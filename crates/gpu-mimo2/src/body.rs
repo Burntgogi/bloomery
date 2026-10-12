@@ -1017,6 +1017,7 @@ pub fn set_taps(m: &mut Mimo2Model, on: bool) -> Result<(), GpuError> {
 impl ChainBody for Body {
     type Input = StepInput;
     type Host = Body;
+    const UNHOSTED_POOL: bloomery_levers::UnhostedPool = bloomery_levers::UnhostedPool::NotCarried;
 
     fn arch() -> Arch {
         Arch::Mimo2

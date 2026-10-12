@@ -14,7 +14,9 @@ use crate::GateError;
 use crate::generate::Place;
 use crate::record::{self, Record};
 use crate::residency::PlanRoom;
+use bloomery_gpu::arch::qwen3moe::Body38;
 use bloomery_gpu::host::swap::Residency;
+use bloomery_gpu::model::ChainBody;
 use bloomery_levers::{ChurnHosting, RESIDENCY38_SPARES, Residency38Pick, residency38_at_plan};
 use model::placement::churn::ChurnPool;
 use model::placement::workstation::TierBatchBytes;
@@ -204,11 +206,13 @@ pub enum Lever38<'a> {
     Unset(Option<Residency38Pick>),
 }
 
-/// The residency a load of `plan` runs under `lever`: a set word as given;
-/// unset, the rule's before the plan or on plan (a) from it
-/// (`residency38_at_plan`: P 0, or the first P the plan's card slots, host
-/// headroom and `MemAvailable` leave a churn pool for, `off` with why where
-/// they leave none) — its `residency unset` record handed to `emit`.
+/// The residency a load of `plan` runs under `lever`, and whether the load
+/// hosts its churn pool: a set word as given, hosted; unset, the rule's
+/// before the plan or on plan (a) from it under [`Body38`]'s capability
+/// (`residency38_at_plan`: P 0, its pool unhosted where it fits neither the
+/// plan's host headroom nor `MemAvailable`, `off` with why where the card
+/// slots leave no room) — its `residency unset` record handed to `emit`, the
+/// hosting the pick's ([`Residency38Pick::pool`]), which the load takes.
 /// Under `mid`, the `residency host` record of `plan` follows: the churn
 /// pool (card [`CARD38`]'s experts past the pinned ones) the load's host set
 /// holds beside the plan's host segments, which the load refuses by name for
@@ -218,7 +222,7 @@ pub fn residency38(
     plan: &Plan<'_>,
     lever: Lever38<'_>,
     emit: fn(Record),
-) -> Result<Residency, GateError> {
+) -> Result<(Residency, ChurnHosting), GateError> {
     let (residency, word, hosting) = match lever {
         Lever38::Set(r, word) => (r, word.to_owned(), ChurnHosting::Hosted),
         Lever38::Unset(pre) => {
@@ -231,6 +235,7 @@ pub fn residency38(
                     // ([`reserve_checkpoints`]), as `CacheRam`'s does.
                     let room = PlanRoom::new(plan, CARD38, 0);
                     residency38_at_plan(
+                        Body38::UNHOSTED_POOL,
                         room.card_experts(),
                         plan.host.experts,
                         |pinned| room.pool_bytes(pinned),
@@ -251,7 +256,8 @@ pub fn residency38(
             (residency, pick.word(), pick.pool())
         }
     };
-    residency_set(plan, CARD38, residency, hosting, &word, 0, emit)
+    residency_set(plan, CARD38, residency, hosting, &word, 0, emit)?;
+    Ok((residency, hosting))
 }
 
 /// A load of `plan` under `residency`, the word `word` names, whatever the

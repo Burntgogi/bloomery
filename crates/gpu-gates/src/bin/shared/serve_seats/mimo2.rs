@@ -644,7 +644,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         rule.trained
             .map_or_else(|| "none".to_owned(), |t| t.to_string())
     );
-    let pick = residency::at_plan(&plan, 0, pick)?;
+    let pick = residency::at_plan::<Body>(&plan, 0, pick)?;
     record::residency_lever(pick).eprint();
     if let Some(d) = pick.why.detail() {
         eprintln!("{d}");

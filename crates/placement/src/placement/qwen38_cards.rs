@@ -10,7 +10,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-use bloomery_levers::{Residency38Pick, Residency38Why, residency38_at_plan};
+use bloomery_levers::{Residency38Pick, Residency38Why, UnhostedPool, residency38_at_plan};
 use gguf::GgmlType;
 
 use super::churn::ChurnPool;
@@ -423,10 +423,13 @@ const UBATCH_PLANNED: u64 = 4096;
 const SCOPE_61G: u64 = 61 << 30;
 
 /// The unset residency rule on `plan` (`residency38_at_plan`) with
-/// `MemAvailable` ample, and its churn pool's bytes.
+/// `MemAvailable` ample, and its churn pool's bytes, on the Qwen3.8 body,
+/// which carries an unhosted pool (`Body38::UNHOSTED_POOL`, a crate this one
+/// does not see).
 fn residency(plan: &Plan<'_>) -> (Residency38Pick, u64) {
     let pool = |pinned| ChurnPool::of(plan, 0, pinned).map(|p| p.bytes);
     let pick = residency38_at_plan(
+        UnhostedPool::Carried,
         plan.n_l.iter().copied(),
         plan.host.experts,
         pool,

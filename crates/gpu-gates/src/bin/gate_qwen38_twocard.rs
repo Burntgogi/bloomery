@@ -353,7 +353,17 @@ mod gate {
     ) -> Result<Session<Body38>, GateError> {
         let t0 = Instant::now();
         let file = Split::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
-        let m = Body38::open_placed_residency(file, plan, inputs, 0, host, ub, residency, 1)?;
+        let m = Body38::open_placed_residency(
+            file,
+            plan,
+            inputs,
+            0,
+            host,
+            ub,
+            residency,
+            bloomery_levers::ChurnHosting::Hosted,
+            1,
+        )?;
         let tiers = m.body(NAME)?.hybrid().tiers();
         let tier = match tiers.first() {
             Some(t) => format!(
@@ -1308,6 +1318,7 @@ mod gate {
                 self.host,
                 self.ub,
                 Residency::Off,
+                bloomery_levers::ChurnHosting::Hosted,
                 slots,
             )?;
             let b = m.body_parts(NAME)?.2;

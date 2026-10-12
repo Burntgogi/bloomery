@@ -2552,6 +2552,7 @@ impl MediaBody for Body35 {
 impl ChainBody for Body35 {
     type Input = DecodeInput35;
     type Host = Placed;
+    const UNHOSTED_POOL: bloomery_levers::UnhostedPool = bloomery_levers::UnhostedPool::NotCarried;
 
     fn arch() -> Arch {
         Arch::Qwen35moe

@@ -739,7 +739,7 @@ fn print_plan(
     let plan = inputs
         .plan_with_slots(&machine, u64::try_from(ctx)?, levers, slots)
         .map_err(|e| vision_seat::refusal(vision_reserve, e))?;
-    let pick = residency::at_plan(&plan, 0, pick)?;
+    let pick = residency::at_plan::<Body>(&plan, 0, pick)?;
     record::residency_lever(pick).eprint();
     if let Some(d) = pick.why.detail() {
         eprintln!("{d}");

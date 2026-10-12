@@ -3531,9 +3531,11 @@ mod tests {
         let slot = price.budget(4_096).expect("a budget");
         assert_eq!(slot, 4 << 30);
         // A plan of one card layer of 100 experts, its host the rest: the
-        // unset rule pins none (P 0), the pool a fixed 10 GiB whatever P is.
+        // unset rule pins none (P 0), the pool a fixed 10 GiB whatever P is, on
+        // the Qwen3.8 body, which carries an unhosted pool (`Body38::UNHOSTED_POOL`).
         let pick = |mem_left: i128| {
             bloomery_levers::residency38_at_plan(
+                bloomery_levers::UnhostedPool::Carried,
                 [100u64],
                 384,
                 |_pinned: usize| Ok::<u64, std::convert::Infallible>(10u64 << 30),

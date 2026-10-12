@@ -2217,7 +2217,7 @@ mod cli {
             .into());
         }
         println!("{}", plan38_line(place, experts, &plan, &inputs.room.1)?);
-        let residency = residency38(&plan, lever, Record::print)?;
+        let (residency, pool) = residency38(&plan, lever, Record::print)?;
         let mut m = Body38::open_placed_residency(
             file,
             &plan,
@@ -2226,6 +2226,7 @@ mod cli {
             levers.host(),
             ub,
             residency,
+            pool,
             slots,
         )?;
         m.set_mode(mode);
@@ -2317,7 +2318,7 @@ mod cli {
             "{}",
             plan38_line(place, experts, &plan.plan, &inputs.room.1)?
         );
-        let residency = residency38(&plan.plan, lever, Record::print)?;
+        let (residency, pool) = residency38(&plan.plan, lever, Record::print)?;
         let mut m = Body38::open_placed_mtp_residency(
             file,
             &plan,
@@ -2328,6 +2329,7 @@ mod cli {
             &draft_split,
             &mtp,
             residency,
+            pool,
             1,
         )?;
         m.set_mode(mode);
