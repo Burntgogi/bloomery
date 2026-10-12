@@ -38,6 +38,7 @@ use cuda_host::cuda_module;
 use gguf::quant::GgmlType;
 use model::arch::deepseek41::names;
 use model::placement::Plan;
+use model::placement::accepts;
 use model::placement::churn::ChurnPool;
 
 /// Passes from the boundary that makes a flip to the one it lands at. The
@@ -615,9 +616,9 @@ fn shape(what: &'static str, detail: impl Into<String>) -> GpuError {
     }
 }
 
-/// The K-quant types of V4.1's three stacks, in stack order: the Q3_K gate
-/// and up and the Q4_K down its kernels read.
-const TYPES: [GgmlType; 3] = [GgmlType::Q3_K, GgmlType::Q3_K, GgmlType::Q4_K];
+/// The K-quant types of V4.1's three stacks, in stack order: its card leg's
+/// ([`accepts::DS41_LEG`], the arms its plan's rule reads too).
+const TYPES: [GgmlType; 3] = accepts::DS41_LEG;
 
 /// V4.1's [`FileStacks`] for the common file source: each layer's gate, up
 /// and down by name, and under the r8 sidecar the unpack of a staged gate or

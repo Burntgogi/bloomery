@@ -126,6 +126,11 @@ pub const fn qwen38_down(ty: GgmlType) -> Option<DownEntry> {
     }
 }
 
+/// The V4.1 chain's card leg, in stack order: the Q3_K gate and up and the
+/// Q4_K down its expert kernels read, the only types its card stacks load in
+/// (`gpu-deepseek41`'s `CardStacks::of` and the swap's file stacks read this).
+pub const DS41_LEG: [GgmlType; 3] = [GgmlType::Q3_K, GgmlType::Q3_K, GgmlType::Q4_K];
+
 /// A card leg's arms: the types its gate·up launches read a gate or an up
 /// stack in, and the types its down launches read a down stack in.
 #[derive(Clone, Copy, Debug)]
@@ -135,8 +140,8 @@ pub struct LegArms {
 }
 
 /// Program `p`'s card leg arms, as its load checks each layer it gives card
-/// experts; `None` for a program whose card experts run each stack alone in
-/// its own format (V4.1's chain).
+/// experts. Every program has a leg; the `Option` is for a program that
+/// runs no card expert.
 #[must_use]
 pub fn leg_arms(p: Program) -> Option<LegArms> {
     match p {
@@ -152,7 +157,10 @@ pub fn leg_arms(p: Program) -> Option<LegArms> {
             gate_up: kernels::card_gate_up_runs,
             down: kernels::card_down_runs,
         }),
-        Program::Deepseek41Chain => None,
+        Program::Deepseek41Chain => Some(LegArms {
+            gate_up: |ty| ty == DS41_LEG[0],
+            down: |ty| ty == DS41_LEG[2],
+        }),
     }
 }
 
@@ -170,7 +178,7 @@ pub fn leg_runs(p: Program, [gate, up, down]: [GgmlType; 3]) -> Option<bool> {
 /// plan gives card experts is one the load runs. The common leg's plan
 /// carries a type on the card only where both its gate·up and its down
 /// launches read it ([`kernels::card_runs`]), in every part. V4.1's chain
-/// takes each stack alone in its own format ([`CardFormat::of_routed`]).
+/// runs [`DS41_LEG`] alone.
 #[must_use]
 pub fn routed_rule(p: Program) -> RoutedRule {
     match p {
@@ -186,7 +194,10 @@ pub fn routed_rule(p: Program) -> RoutedRule {
             gate_up: common_leg_card,
             down: common_leg_card,
         },
-        Program::Deepseek41Chain => RoutedRule::PerType(CardFormat::of_routed),
+        Program::Deepseek41Chain => RoutedRule::Leg {
+            gate_up: |ty| (ty == DS41_LEG[0]).then_some(CardFormat::KQuant),
+            down: |ty| (ty == DS41_LEG[2]).then_some(CardFormat::KQuant),
+        },
     }
 }
 
@@ -257,13 +268,15 @@ mod tests {
     /// format's types: the plan's rule and the load's check read one table.
     /// Mutants, each a defect as it shipped: Qwen3-30B's or Qwen3.8's rule
     /// read per type over the union of its parts (a Q6_K, a Q8_0 gate), the
-    /// common leg's per type (a gate and an up of two types) — each names its
-    /// program and triples.
+    /// common leg's per type (a gate and an up of two types), V4.1's read per
+    /// type in its own format (a Q6_K down) — each names its program and
+    /// triples.
     #[test]
     fn a_layer_the_plan_cards_is_one_its_load_runs() {
         let (model, layers) = triples(&types());
         let mut broken = Vec::new();
         for p in PROGRAMS {
+            assert!(leg_arms(p).is_some(), "{p:?} has a card leg");
             let rule = routed_rule(p);
             for (l, &tys) in layers.iter().enumerate() {
                 let stacks = [3 * l, 3 * l + 1, 3 * l + 2];

@@ -90,6 +90,7 @@ use gguf::{GgmlType, Split};
 use model::arch::deepseek41::hparams::Hparams;
 use model::arch::deepseek41::{host, names};
 use model::moe::UNION_MAX_COLS;
+use model::placement::accepts;
 use runtime::combine::Slots;
 
 use crate::dense::{Dense, DenseKernels};
@@ -632,13 +633,10 @@ impl<'a> CardStacks<'a> {
         if found.iter().all(Option::is_none) {
             return Ok(None);
         }
-        let [gate, up, down] = [
-            (0, GgmlType::Q3_K),
-            (1, GgmlType::Q3_K),
-            (2, GgmlType::Q4_K),
-        ]
-        .map(|(i, want)| match found[i] {
-            Some(DevWeight::KQuant { ty, w: stack, .. }) if *ty == want => Ok(stack),
+        let [gate, up, down] = [0, 1, 2].map(|i| match found[i] {
+            Some(DevWeight::KQuant { ty, w: stack, .. }) if *ty == accepts::DS41_LEG[i] => {
+                Ok(stack)
+            }
             _ => Err(GpuError::Tensor {
                 what: WHAT,
                 name: names[i].clone(),
