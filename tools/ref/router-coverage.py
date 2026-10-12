@@ -7,6 +7,8 @@
     tools/ref/router-coverage.py compare <set A> <set B> [--tokens N]
     tools/ref/router-coverage.py oracle <set> <oracle set dir>
     tools/ref/router-coverage.py bursts <set> [<set>...] [--window 512] [--n-l <spec>] [--layers 2-39]
+    tools/ref/router-coverage.py predict <set> [--n 4,8,16,32] [--layers 2-39] [--positions all|gen]
+                                 [--genre G[,G...]] [--tiers CARD,POOL ...]
     tools/ref/router-coverage.py --self-test
 
 A set is a directory router_trace wrote under $BLOOMERY_DATA/router/: counts.tsv, topk-<layer>.u16
@@ -48,6 +50,29 @@ bursts    Per window of W consecutive positions inside one chunk (--window, defa
                   x W / tokens: sum over host experts of phi (1 - (1 - min(lambda / (phi W), 1))^W), solved
                   by bisection on (0, 1]; phi 1 is routing that follows the set-wide rates (tools/flow's
                   prose_phi rows are this quantity fitted from a union's time). Mean, p10, p90 and window 0
+predict   How well one token's routing at layer l names its routing at layer l + 1, the premise of reading
+          layer l + 1's misses ahead. Per predicted layer m (--layers lists them; m - 1 must be in the set)
+          and per held-out position, the m - 1 ids rank m's experts and recall@n is the share of m's
+          selections inside the first n (N = --n, 4,8,16,32 by default). Learn and held-out positions: a
+          route trace's contexts.tsv requests by their split (learn: every position; held: every position,
+          or with --positions gen only [first + prompt, end), the decode steps; --genre a,b keeps only the
+          held requests of those genres), else held_split as coverage's. Rankers, learned on the learn
+          positions:
+            freq      m's hottest experts, the same list at every position (coverage's held-out hot-n)
+            cooccur   score(e') = sum over m - 1's ids e of P(e' at m | e at m - 1), ties to m's count and
+                      then the lower id; `cooccur in-sample` fits and scores on the held-out positions
+          A ceiling row: n / n_expert_used while n < n_expert_used. The first table's rows are means over
+          the layers (every layer has the same selections); a table per layer follows. Each --tiers
+          CARD,POOL adds a table of where a selection is read from: the card (CARD: p<C>, ids 0..C-1, the
+          id range a plan places, or n<C>, m's C hottest learn experts), else the pool in host memory,
+          which holds the card (POOL: n<N>, the card and the hottest other experts up to N, or lru<N>, the
+          card and lru_hits' LRU of the other N - C, seeded with the hottest of them; each position is
+          judged on the pool as it stood before the position, then its misses are admitted), else NVMe.
+          Rows: the card misses and the RAM ones (pool, not card) with the off-card experts ranked, the
+          NVMe ones (not in the pool) with the experts out of the pool ranked (a resident is never read
+          ahead); each with its share of selections, recall@n pooled over layers and `used`, the hits over
+          the reads started (n a position and layer, fewer when fewer experts are candidates). Needs
+          numpy, imported by this command only (the self-test calls it).
 oracle    Per layer, the set's ids against the oracle set's integer twin of ffn_moe_topk-<layer>,
           integer for integer in rank order, and as sets. The twin is the one the oracle manifest's
           `tensor` row points at: the logical twin when the row marks a view (its flat file is the
@@ -172,15 +197,19 @@ def held_split(s):
     return min(bounds, key=lambda b: (abs(b - T // 2), b))
 
 
-def lru_hits(ids, n_used, capacity, reset_tokens=0):
+def lru_hits(ids, n_used, capacity, reset_tokens=0, seed=(), skip=(), before=None):
     """Replay ranked selections; hits refresh recency and misses insert then evict.
-    The second count checks membership before any selection of that token is inserted."""
-    cache = OrderedDict()
+    The second count checks membership before any selection of that token is inserted.
+    The cache starts holding `seed` (least recent first); ids in `skip` never enter it and count as neither;
+    `before`, a list, gets each token's cache members before the token."""
+    cache = OrderedDict((e, None) for e in seed)
     hits, start_hits = 0, 0
     for p in range(0, len(ids), n_used):
         if reset_tokens and (p // n_used) % reset_tokens == 0:
             cache.clear()
-        row = ids[p:p + n_used]
+        row = [e for e in ids[p:p + n_used] if e not in skip]
+        if before is not None:
+            before.append(list(cache))
         start_hits += sum(e in cache for e in row)
         for e in row:
             if e in cache:
@@ -469,6 +498,185 @@ def bursts(set_dirs, window, spec=None, keep=None):
               f"{sum(b['touched']) / b['windows']:.0f} |\n")
 
 
+def route_trace():
+    """tools/bloomery/route_trace.py, loaded by path when a command reads a route trace's sidecars."""
+    spec = importlib.util.spec_from_file_location(
+        "route_trace", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "bloomery", "route_trace.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def predict_spans(s, positions, genre):
+    """(learn spans, held-out spans, a line naming them): contexts.tsv's splits when the set has one, else
+    held_split's halves."""
+    rt = route_trace()
+    try:
+        rows, _ = rt.read_contexts(s["dir"])
+    except rt.TraceError as e:
+        raise SetError(str(e)) from None
+    T = s["tokens"]
+    if rows is None:
+        if positions != "all" or genre is not None:
+            raise SetError(f"{s['dir']}: --positions gen and --genre read a contexts.tsv, and the set has none")
+        half = held_split(s)
+        return [(0, half)], [(half, T)], f"learn [0, {half}), held-out [{half}, {T})"
+    learn = [(r["first"], r["end"]) for r in rows if r["split"] == "learn"]
+    held = [(r["first"] + (r["prompt"] if positions == "gen" else 0), r["end"]) for r in rows
+            if r["split"] == "held" and (genre is None or r["genre"] in genre.split(","))]
+    held = [(a, b) for a, b in held if b > a]
+    if not learn or not held:
+        raise SetError(f"{s['dir']}: no learn request or no held request{' of genre ' + genre if genre else ''}")
+    return learn, held, (f"learn {len(learn)} requests ({sum(b - a for a, b in learn)} positions), held-out "
+                         f"{len(held)} requests{' of genre ' + genre if genre else ''} "
+                         f"({sum(b - a for a, b in held)} {'decode ' if positions == 'gen' else ''}positions)")
+
+
+def tier_spec(text):
+    """`--tiers CARD,POOL` as ((kind, n), (kind, n)): CARD p<C> or n<C>, POOL n<N> or lru<N>."""
+    card, _, pool = text.partition(",")
+
+    def one(t, kinds):
+        for k in kinds:
+            if t.startswith(k) and t[len(k):].isdigit():
+                return k, int(t[len(k):])
+        raise SetError(f"--tiers {text!r}: CARD is p<C> or n<C>, POOL n<N> or lru<N>")
+    c, p = one(card, ("p", "n")), one(pool, ("lru", "n"))
+    if p[1] < c[1]:
+        raise SetError(f"--tiers {text!r}: the pool holds the card, so N >= C")
+    return c, p
+
+
+def predict(set_dir, n_list, keep=None, positions="all", genre=None, tiers=()):
+    try:
+        import numpy as np
+    except ImportError:
+        raise SetError("predict needs numpy: python3 -m pip install numpy") from None
+    s = read_manifest(set_dir)
+    E, K, T = s["n_expert"], s["n_used"], s["tokens"]
+    if not all(0 < n <= E for n in n_list):
+        raise SetError(f"{set_dir}: --n {','.join(map(str, n_list))} is not within 1..{E}")
+    if any(p[1] > E for _, p in tiers) or len(set(tiers)) != len(tiers):
+        raise SetError(f"{set_dir}: a --tiers pool past the expert count {E}, or a --tiers given twice")
+    targets = [m for m in s["layers"] if m - 1 in s["layers"]] if keep is None else keep
+    bad = [m for m in targets if m not in s["layers"] or m - 1 not in s["layers"]]
+    if bad or not targets:
+        raise SetError(f"{set_dir}: --layers {bad}: a predicted layer and the one before it must be in the set")
+    learn, held, said = predict_spans(s, positions, genre)
+    if not all(b > a for a, b in learn + held):
+        raise SetError(f"{set_dir}: an empty learn or held-out span ({said})")
+    ids = {}
+
+    def layer(l):
+        if l not in ids:
+            a = np.frombuffer(read_topk(s, l), dtype=np.uint16).astype(np.int64).reshape(T, K)
+            if a.size and a.max() >= E:
+                raise SetError(f"{set_dir}: layer {l}: id {a.max()} >= n_expert {E}")
+            twice = np.nonzero((np.diff(np.sort(a, axis=1), axis=1) == 0).any(axis=1))[0]
+            if len(twice):
+                raise SetError(f"{set_dir}: layer {l}: position {twice[0]} selects an expert twice")
+            ids[l] = a
+        return ids[l]
+
+    def rows(a, spans):
+        return np.concatenate([a[t0:t1] for t0, t1 in spans])
+
+    def places(score, freq, exclude=None):
+        """[P, E]: each expert's place in the ranking (0 is first) by score, then count, then the lower id;
+        excluded experts go last."""
+        P = len(score)
+        if exclude is not None:
+            score = np.where(exclude, -np.inf, score)
+        order = np.lexsort((np.broadcast_to(np.arange(E), (P, E)), np.broadcast_to(-freq, (P, E)), -score), axis=-1)
+        out = np.empty_like(order)
+        out[np.arange(P)[:, None], order] = np.arange(E)
+        return out
+
+    def cooccur(prev_learn, cur_learn, prev_eval):
+        c = np.zeros((E, E))
+        np.add.at(c, (prev_learn[:, :, None], cur_learn[:, None, :]), 1)
+        p = c / np.maximum(np.bincount(prev_learn.ravel(), minlength=E), 1)[:, None]
+        return sum(p[prev_eval[:, i]] for i in range(K))
+
+    def card_pool(freq, b_e, spec):
+        """[P, E] residency of the card and of the pool (which holds the card) before each held-out position."""
+        (ck, cn), (pk, pn) = spec
+        P = len(b_e)
+        rank = np.array(hot(freq.tolist(), E))
+        card = np.zeros(E, dtype=bool)
+        card[np.arange(cn) if ck == "p" else rank[:cn]] = True
+        rest = rank[~card[rank]]
+        room = pn - cn
+        pool = np.broadcast_to(card, (P, E)).copy()
+        if pk == "n":
+            pool[:, rest[:room]] = True
+            return np.broadcast_to(card, (P, E)), pool
+        held_lru = []
+        lru_hits(b_e.ravel().tolist(), K, room, seed=rest[:room][::-1].tolist(),
+                 skip=set(np.nonzero(card)[0].tolist()), before=held_lru)
+        for t, members in enumerate(held_lru):
+            pool[t, members] = True
+        return np.broadcast_to(card, (P, E)), pool
+
+    print(f"## {set_dir}: predict layer m from layer m - 1\n")
+    print(f"{T} positions, {E} experts, top-{K}, predicted layers {targets[0]}..{targets[-1]} ({len(targets)}). "
+          f"{said}.\n")
+    table = {"freq": [], "cooccur": [], "cooccur in-sample": []}
+    acc = {t: {} for t in tiers}
+    P = 0
+    for m in targets:
+        a, b = layer(m - 1), layer(m)
+        a_l, b_l, a_e, b_e = rows(a, learn), rows(b, learn), rows(a, held), rows(b, held)
+        P = len(b_e)
+        freq = np.bincount(b_l.ravel(), minlength=E)
+        zero = np.zeros((P, E))
+        score = cooccur(a_l, b_l, a_e)
+        got = {"freq": np.take_along_axis(places(zero, freq), b_e, axis=1),
+               "cooccur": np.take_along_axis(places(score, freq), b_e, axis=1),
+               "cooccur in-sample": np.take_along_axis(
+                   places(cooccur(a_e, b_e, a_e), np.bincount(b_e.ravel(), minlength=E)), b_e, axis=1)}
+        for k, v in got.items():
+            table[k].append([float((v < n).mean()) for n in n_list])
+        for spec in tiers:
+            card, pool = card_pool(freq, b_e, spec)
+            on_card = np.take_along_axis(card, b_e, axis=1)
+            in_pool = np.take_along_axis(pool, b_e, axis=1)
+            classes = (("card miss", ~on_card, card), ("RAM", ~on_card & in_pool, card), ("NVMe", ~in_pool, pool))
+            for name, sel, ex in classes:
+                for ranker, sc in (("freq", zero), ("cooccur", score)):
+                    pl = np.take_along_axis(places(sc, freq, ex), b_e, axis=1)[sel]
+                    cand = E - ex.sum(axis=1)
+                    row = acc[spec].setdefault((name, ranker), [0, [0] * len(n_list), [0] * len(n_list)])
+                    row[0] += int(sel.sum())
+                    for i, n in enumerate(n_list):
+                        row[1][i] += int((pl < n).sum())
+                        row[2][i] += int(np.minimum(cand, n).sum())
+    L = len(targets)
+    n_cols = " | ".join(f"n={n}" for n in n_list)
+    print(f"### recall@n of all selections (%)\n\n| ranker | {n_cols} |\n|---|" + "---:|" * len(n_list))
+    print(f"| ceiling | {' | '.join(pct(min(n, K) / K) for n in n_list)} |")
+    for k, v in table.items():
+        print(f"| {k} | {' | '.join(pct(sum(r[i] for r in v) / L) for i in range(len(n_list)))} |")
+    print("\n| layer m | " + " | ".join(f"{k} n={n}" for k in table for n in n_list) + " |")
+    print("|---:|" + "---:|" * (len(table) * len(n_list)))
+    for j, m in enumerate(targets):
+        print(f"| {m} | " + " | ".join(pct(table[k][j][i]) for k in table for i in range(len(n_list))) + " |")
+    print()
+    for spec, rows_ in acc.items():
+        (ck, cn), (pk, pn) = spec
+        sel = P * L * K
+        print(f"### card {ck}{cn}, pool {pk}{pn}: recall@n of the misses (%)\n")
+        print("Candidates are the experts off the card (card miss, RAM) or out of the pool (NVMe). `used` is the "
+              f"class's hits over the reads started, n a position and layer or every candidate when fewer. "
+              f"{P} positions x {L} layers.\n")
+        print("| class | % of selections | ranker | " + " | ".join(f"n={n} | used" for n in n_list) + " |")
+        print("|---|---:|---|" + "---:|" * (2 * len(n_list)))
+        for (name, ranker), (miss, hits, reads) in rows_.items():
+            print(f"| {name} | {pct(miss / sel)} | {ranker} | " + " | ".join(
+                f"{pct(h / miss) if miss else '-'} | {pct(h / r) if r else '-'}" for h, r in zip(hits, reads)) + " |")
+        print()
+
+
 def read_oracle(oracle_dir):
     """An oracle set's header, its `tensor` rows by (name, occurrence) and its integer twins of
     tensors by (name, occurrence, layout), read by their column lines' names."""
@@ -723,6 +931,50 @@ def self_test():
                 coverage([edge], (2,))
             held_rows = buf.getvalue().split("held-out")[1]
             assert "| 0 | 0.0 |" in held_rows and "share on [4, 10)" in buf.getvalue(), buf.getvalue()
+            # predict: layer 1 picks the pair after layer 0's, so co-occurrence names it; the counts are flat,
+            # so frequency's list is ids 0, 1 (ties to the lower id) and serves only the pair 0, 1. Card {0, 1},
+            # pool {0..3}: the held-out pairs {2, 3}, {4, 5}, {6, 7} miss the card, {2, 3} is RAM, {4..7} NVMe
+            pairs = [[2 * (t % 4), 2 * (t % 4) + 1] for t in range(16)]
+            nxt = make("next", {0: pairs, 1: [[(a + 2) % E, (b + 2) % E] for a, b in pairs]})
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                predict(nxt, (1, 2), tiers=[tier_spec("n2,n4")])
+            out = buf.getvalue()
+            for row in ("| ceiling | 50.0 | 100.0 |", "| freq | 12.5 | 25.0 |", "| cooccur | 50.0 | 100.0 |",
+                        "| card miss | 75.0 | freq | 16.7 | 25.0 | 33.3 | 25.0 |",
+                        "| card miss | 75.0 | cooccur | 50.0 | 75.0 | 100.0 | 75.0 |",
+                        "| RAM | 25.0 | cooccur | 50.0 | 25.0 | 100.0 | 25.0 |",
+                        "| NVMe | 50.0 | freq | 25.0 | 25.0 | 50.0 | 25.0 |",
+                        "| NVMe | 50.0 | cooccur | 50.0 | 50.0 | 100.0 | 50.0 |"):
+                assert row in out, (row, out)
+            # the id-prefix card p2 is {0, 1} here too; pool n7 leaves expert 7 the one NVMe candidate, so each
+            # position starts one read, not two: it serves both NVMe selections (7 in {6, 7}) of 8 reads
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                predict(nxt, (2,), tiers=[tier_spec("p2,n7")])
+            assert "| NVMe | 12.5 | cooccur | 100.0 | 25.0 |" in buf.getvalue(), buf.getvalue()
+            # pool lru4: card {0, 1} and an LRU of two seeded {2, 3}; the held pairs {2, 3} (RAM, at token 8),
+            # then {4, 5}, {6, 7}, {2, 3}, {4, 5}, {6, 7} each find the LRU holding the pair before them (NVMe)
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                predict(nxt, (1, 2), tiers=[tier_spec("n2,lru4")])
+            for row in ("| RAM | 12.5 | cooccur | 50.0 | 12.5 | 100.0 | 12.5 |",
+                        "| NVMe | 62.5 | cooccur | 50.0 | 62.5 | 100.0 | 62.5 |"):
+                assert row in buf.getvalue(), (row, buf.getvalue())
+            twice = make("twice", {0: pairs, 1: [[a, a] for a, _ in pairs]})
+            for d, kw, why in ((nxt, {"positions": "gen"}, "--positions gen without a contexts.tsv"),
+                               (nxt, {"tiers": [tier_spec("n2,n4")] * 2}, "one --tiers twice"),
+                               (twice, {}, "a position that selects an expert twice")):
+                try:
+                    predict(d, (2,), **kw)
+                    raise AssertionError(f"predict accepted {why}")
+                except SetError:
+                    pass
+            try:
+                tier_spec("n4,n2")
+                raise AssertionError("a pool smaller than the card was accepted")
+            except SetError:
+                pass
         finally:
             sys.stdout = saved
             devnull.close()
@@ -761,6 +1013,28 @@ def main(argv):
             return 0
         if len(argv) == 3 and argv[0] == "oracle":
             return oracle(argv[1], argv[2])
+        if len(argv) >= 2 and argv[0] == "predict":
+            sets, opts, tiers = [], {}, []
+            it = iter(argv[1:])
+            for a in it:
+                if a in ("--n", "--layers", "--positions", "--genre", "--tiers"):
+                    v = next(it, None)
+                    if v is None:
+                        raise SetError(f"{a} takes a value")
+                    if a == "--tiers":
+                        tiers.append(tier_spec(v))
+                    else:
+                        opts[a] = v
+                elif a.startswith("-"):
+                    raise SetError(f"predict: unknown flag {a}")
+                else:
+                    sets.append(a)
+            if len(sets) != 1 or opts.get("--positions", "all") not in ("all", "gen"):
+                raise SetError("predict: one set, and --positions all or gen")
+            predict(sets[0], tuple(int(n) for n in opts.get("--n", "4,8,16,32").split(",")),
+                    layer_list(opts["--layers"]) if "--layers" in opts else None, opts.get("--positions", "all"),
+                    opts.get("--genre"), tiers)
+            return 0
         if len(argv) >= 2 and argv[0] == "bursts":
             sets, opts = [], {}
             it = iter(argv[1:])
