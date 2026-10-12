@@ -466,6 +466,7 @@ mod gate {
     use bloomery_gpu::latent::{INDEX_HEAD, INDEX_ROW, LATENT, POOL, pools_for};
     use bloomery_gpu::linear::RING_ROWS;
     use bloomery_gpu::model::{SlotsOut, StepMode};
+    use bloomery_gpu::site::{Form, SiteTy};
     use bloomery_gpu::weights::DevWeight;
     use bloomery_gpu_gates::act_rule::Arm;
     use bloomery_gpu_gates::flip::{self, Flip, tie_allowed};
@@ -5566,11 +5567,29 @@ mod gate {
     /// reads the stream after the layer's mixer, a routed block adding 0; the
     /// head reads all 45: q·√(34·4.1875 + 3·3.64 + 11·3) = 0.1755. From
     /// `kinds` (each layer's mixer and feed-forward block).
-    fn gemm_bands(kinds: &[Layer]) -> Bands {
+    ///
+    /// PIN(2026-10-12): a block whose gate·up or down reads q8_1 blocks of
+    /// 128 values (`SiteTy::reads`, a K-quant; `wide[l]`, [`wide_q8`]) quantizes
+    /// that input on both arms, from inputs that already differ by the
+    /// stream's error `e`. Two round-to-nearest quantizations of step `d`
+    /// differ by `e` plus whole steps where `e` crosses a rounding edge: over
+    /// a uniform position in the step, `e² + d²·f(1 − f)`, `f` the fractional
+    /// part of `|e|/d`, so at most `e² + d²/4`. The `e²` is the stream's
+    /// error the layers already carry; `d²/4` is 3 times `d²/12`, the
+    /// one-sided rounding's variance, and `d²/12` at 128 values is (2q)²
+    /// (the crest at most √128 = 2·√32): 12 per quantized input, in q² as
+    /// above. Such a block's input reaches the stream through the gate and
+    /// up (2.64 · 12 = 31.68) and its SwiGLU rows through the down (12):
+    /// 43.68, for a dense block in place of its 3.64 and for a routed
+    /// layer's shared expert in place of its 0. A file of q8_0 blocks has no
+    /// such site, so its bands are the ones above; the GLM fixture's
+    /// glmffnkq variant (2 dense blocks and 4 shared experts of Q6_K gate·up
+    /// and Q5_K down) has the head at q·√(4·4.1875 + 2·3 + 6·43.68) = 0.217.
+    fn gemm_bands(kinds: &[Layer], wide: &[[bool; 2]]) -> Bands {
         let q = q8_32_rel();
         let mut c = 0.0f64;
         let (mut stores, mut stream) = (Vec::new(), Vec::new());
-        for k in kinds {
+        for (k, &[gate_up, down]) in kinds.iter().zip(wide) {
             let (store, mixer) = if k.mixer == MixerKind::Latent {
                 (1.0, 3.0)
             } else {
@@ -5578,12 +5597,58 @@ mod gate {
             };
             stores.push(q * (c + store).sqrt());
             c += mixer;
-            if k.ffn == FfnKind::Dense {
-                c += 3.64;
-            }
+            let dense = k.ffn == FfnKind::Dense;
+            c += match (gate_up, dense) {
+                (true, _) => 2.64 * WIDE_Q8,
+                (false, true) => 2.64,
+                (false, false) => 0.0,
+            };
+            c += match (down, dense) {
+                (true, _) => WIDE_Q8,
+                (false, true) => 1.0,
+                (false, false) => 0.0,
+            };
             stream.push(q * c.sqrt());
         }
         Bands { stores, stream }
+    }
+
+    /// [`gemm_bands`]' term for one input both arms quantize to q8_1 blocks
+    /// of 128 values, in q²: `d²/4` with `d²/12` = (2q)².
+    const WIDE_Q8: f64 = 12.0;
+
+    /// Per layer, whether its dense block's (a dense layer) or shared
+    /// expert's (a routed layer) gate·up and down read q8_1 blocks of 128
+    /// values on both arms ([`SiteTy::reads`]), from the file's types. A
+    /// dense tensor not in the file is refused by name; a routed layer with
+    /// no shared expert reads none.
+    fn wide_q8(file: &Split, kinds: &[Layer]) -> Result<Vec<[bool; 2]>, GateError> {
+        let reads = |name: String, need: bool| -> Result<bool, GateError> {
+            match file.find(&name) {
+                Some((_, info)) => {
+                    Ok(SiteTy::of_ggml(info.ty).is_some_and(|t| t.reads() == Form::Q8x128))
+                }
+                None if need => Err(format!("{name}: not in the file").into()),
+                None => Ok(false),
+            }
+        };
+        kinds
+            .iter()
+            .enumerate()
+            .map(|(l, k)| {
+                if k.ffn == FfnKind::Dense {
+                    Ok([
+                        reads(names::ffn_gate(l), true)?,
+                        reads(names::ffn_down(l), true)?,
+                    ])
+                } else {
+                    Ok([
+                        reads(names::ffn_gate_shexp(l), false)?,
+                        reads(names::ffn_down_shexp(l), false)?,
+                    ])
+                }
+            })
+            .collect()
     }
 
     /// PIN(2026-10-02): a flip between the GEMM batch's routing and the
@@ -6217,7 +6282,8 @@ mod gate {
         } = chunk_calls(m, &ids, &after)?;
         elapsed("(pb) chunk calls", &t);
         ok &= chunks_ok;
-        let bands = gemm_bands(&m.body("prompt batch")?.kinds());
+        let kinds = m.body("prompt batch")?.kinds();
+        let bands = gemm_bands(&kinds, &wide_q8(&glm5next_tier::open()?, &kinds)?);
         let bias = biases(m)?;
         println!(
             "prompt batch: the GEMM bands: stores at layers 0..=4 {:.3e} {:.3e} {:.3e} {:.3e} \
