@@ -475,12 +475,44 @@ fn header_stacks(file: &Split, hp: &Hparams, l: usize) -> Result<[SiteTy; 3], Gp
     Ok(tys)
 }
 
+/// Layer `l`'s routed stacks' types as a placed load's card part runs them,
+/// read from `file`'s header before any upload: `None` when the card kernel
+/// table runs no entry for them (a type no site launches, or one
+/// [`stack_entries`] refuses). Such a layer holds no card expert a placed
+/// load can run — its load refuses card experts of it by name (`placed`'s
+/// `n_card > 0` arm) and its wide arm launches nothing for a layer with none —
+/// so the plan does not refuse it. A missing tensor, or a site type of
+/// another shape, is refused by name.
+fn card_stacks(file: &Split, hp: &Hparams, l: usize) -> Result<Option<[SiteTy; 3]>, GpuError> {
+    const WHAT_H: &str = "qwen3moe::Body::load";
+    let (h, ff, e) = (hp.n_embd, hp.experts.ff, hp.experts.n_expert);
+    let site = |name: String, shape| -> Result<Option<SiteTy>, GpuError> {
+        let (_, t) = file
+            .find(&name)
+            .ok_or_else(|| GpuError::tensor(WHAT_H, &name, "in the file"))?;
+        if SiteTy::of_ggml(t.ty).is_none() {
+            return Ok(None);
+        }
+        site::file_site(file, WHAT_H, &name, shape, SiteTy::ALL).map(Some)
+    };
+    let (Some(gate), Some(up), Some(down)) = (
+        site(names::ffn_gate_exps(l), (e * ff, h))?,
+        site(names::ffn_up_exps(l), (e * ff, h))?,
+        site(names::ffn_down_exps(l), (e * h, ff))?,
+    ) else {
+        return Ok(None);
+    };
+    let tys = [gate, up, down];
+    Ok(stack_entries(tys, l).is_ok().then_some(tys))
+}
+
 /// Layer `l`'s plan read from `file`'s header alone: the four attention
-/// sites' and the three routed stacks' types as the header holds them, which
-/// are the types [`resolve`] finds resident. A placed load plans its card
-/// bytes from it before any weight is uploaded
-/// ([`GpuModel::placed_arena_bytes`]) and its wide arm reads the stacks'
-/// types from it, the resident stacks being the card's part of them.
+/// sites' types and the three routed stacks' as the card part runs them
+/// ([`card_stacks`]), which are the types [`resolve`] finds resident; a layer
+/// whose stacks the card runs none of keeps [`parts_of`]'s, which no launch
+/// reads. A placed load plans its card bytes from it before any weight is
+/// uploaded ([`GpuModel::placed_arena_bytes`]) and its wide arm reads the
+/// stacks' types from it, the resident stacks being the card's part of them.
 fn header_plan(file: &Split, hp: &Hparams, l: usize) -> Result<LayerPlan, GpuError> {
     const WHAT_H: &str = "qwen3moe::Body::load";
     let (h, q, kv) = (
@@ -494,7 +526,9 @@ fn header_plan(file: &Split, hp: &Hparams, l: usize) -> Result<LayerPlan, GpuErr
     g.k_ty = site(&g.attn_k, (kv, h))?;
     g.v_ty = site(&g.attn_v, (kv, h))?;
     g.o_ty = site(&g.attn_output, (h, q))?;
-    [f.gate_ty, f.up_ty, f.down_ty] = header_stacks(file, hp, l)?;
+    if let Some(tys) = card_stacks(file, hp, l)? {
+        [f.gate_ty, f.up_ty, f.down_ty] = tys;
+    }
     Ok(LayerPlan {
         mixer: MixerPlan::Gqa(g),
         ffn: f,
