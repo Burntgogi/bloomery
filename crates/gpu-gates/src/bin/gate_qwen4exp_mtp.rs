@@ -135,21 +135,35 @@
 //! - (x) a resume of a state whose draft side the load does not take (a
 //!   state of a load without the draft) is refused by name with the model
 //!   untouched: its stores, position and draft store unchanged.
-//! - (kp-draft) a prefix restore with the draft on cuts its side as `resume` then `rollback`
-//!   does: a drafted run's state with a point below its end, put back whole (the draft's store
-//!   holds the state's positions, the arenas' records stand), then cut to the point by
-//!   `rollback` and put back as the point's prefix (`seq_resume_prefix` asked one short of
-//!   the end): each stands at the point with the draft's store forgotten and the arenas'
-//!   records cut there, so a walk that reads either arena is refused with the same words both
-//!   ways and not the whole state's.
-//! - (sl) a drafted run's state of `n` positions saved on a save lane (`seq_save_async`), whole
-//!   and after a rollback that forgot the draft's store: the lane's copy carries the draft's
+//! - (kp-draft) a cut and a prefix restore to a point keep the draft: a drafted run's state
+//!   with a point at its prompt's end below its end, put back whole and cut to the point by
+//!   `rollback`, put back as the point's prefix (`seq_resume_prefix` asked one short of the
+//!   end), and saved there and put back whole, each stands at the point with the draft's store
+//!   holding the positions below it (its rows the run's) and the step arena's row 0 the
+//!   target's hidden row before the point bit for bit, as the point kept it; the draft's walk
+//!   at the point that reads that row runs, its logits the same bits all three ways. The store
+//!   behind the point, its own case: a point past the draft's store (ids fed without the
+//!   draft) keeps the draft off, its store forgotten. On a load of twice
+//!   `CHECKPOINT_EVERY` positions, the inner mark of a long prompt call: a cut to it and the
+//!   run's state put back as its prefix each rejoin with the row a call of its ids alone
+//!   leaves. On the two-slot load: two slots cut to points at one position each rejoin with
+//!   their own row; a continuing call's start mark after a step keeps the step's row, and one
+//!   after a select, whose position before only the load's ubatch arena held for the slot,
+//!   keeps none (a cut there leaves the draft off, never with the other slot's row); a state
+//!   put back as its prefix on the other slot rejoins with its own rows; and a slot whose cut
+//!   left the draft off rides a pass of both slots with plain rows beside the other slot's
+//!   drafted window, each slot's ids its own run's.
+//! - (sl) a drafted run's state of `n` positions saved on a save lane (`seq_save_async`), whole,
+//!   after a rollback the draft rejoins, and with the store behind the state (a prompt call
+//!   without the draft): the lane's copy carries the draft's
 //!   store rows of those positions beside the target's rows and recurrent stores, so its bytes
 //!   are the target's and the store's `n` of its `ctx` positions (the plan's store bytes times
 //!   `n / ctx`): they follow `n`, not `ctx`. With the store's rows overwritten by other ids, the
 //!   state put back whole holds the draft's count of the save and the store's rows below `n`
 //!   bit for bit. A store walked past the state's position (an anchor row) makes the save on a
-//!   lane refused by name, as the engine stream's is under (p), nothing enqueued.
+//!   lane refused by name, as the engine stream's is under (p), nothing enqueued. The lane's
+//!   state put back as its point's prefix rejoins the draft there as the engine stream's does,
+//!   the store's rows below the point and the step arena's row 0 the same bits.
 //! - (i) a pass the width chooser holds back right after the server's cut
 //!   step (the prompt call, then its last id as the seat's first step): the
 //!   chooser walks the draft's waiting rows first (`Draft::before_plain`,
@@ -246,9 +260,9 @@ mod gate {
 
     use bloomery_gpu::GpuError;
     use bloomery_gpu::arch::qwen3moe::{
-        Body38, MTP_GRAPH_ROWS, MTP_ROWS, MTP_STORE_ROWS, Mtp38, MtpDraft, MtpFeed, MtpHead,
-        MtpHidden, MtpMode, MtpNode, MtpTaps, Prompt38, Qwen38Model, Seq38, Store38Host,
-        TargetRows, checkpoint_bytes, seq_positional_bytes, seq38_bytes,
+        Body38, CHECKPOINT_EVERY, MTP_GRAPH_ROWS, MTP_ROWS, MTP_STORE_ROWS, Mtp38, MtpDraft,
+        MtpFeed, MtpHead, MtpHidden, MtpMode, MtpNode, MtpTaps, Prompt38, Qwen38Model, Seq38,
+        Store38Host, TargetRows, checkpoint_bytes, seq_positional_bytes, seq38_bytes,
     };
     use bloomery_gpu::fault::FaultSite;
     use bloomery_gpu::weights::DevWeight;
@@ -2440,95 +2454,155 @@ mod gate {
         Ok((m, ok))
     }
 
-    /// What the target's step and pass arenas hold after a restore, as a walk that reads their
-    /// row 0 as position `at` words it: the draft's store is warmed over positions `0..=at`
-    /// first (a store walk checks its own count before the arena's), then each arena is read
-    /// by a walk of one row from `at + 1`, which the arena refuses by naming the positions it
-    /// holds. A walk that runs says so: it means the arena holds the row.
-    fn arena_words(
-        m: &mut Qwen38Model,
-        prompt: &[u32],
-        at: usize,
-    ) -> Result<[String; 2], GateError> {
-        let vocab = u32::try_from(m.body("(kp-draft)")?.vocab())?;
-        let first = [(prompt[0] + 1) % vocab];
-        overwrite_store(m, prompt, at + 1, 1)?;
-        let read = |m: &mut Qwen38Model, walk: TargetRows| -> Result<String, GateError> {
-            let r = m.mtp_draft(
-                MtpFeed::Rows {
-                    tokens: &first,
-                    pos0: u32::try_from(at + 1)?,
-                    hidden: MtpHidden::Target { walk, first: 0 },
-                },
-                MtpHead::Rows,
-                MtpMode::Eager,
-            );
-            Ok(match r {
-                Ok(_) => "the walk ran".to_owned(),
-                Err(e) => {
-                    let said = e.to_string();
-                    said.rsplit_once("the arena holds ")
-                        .map_or(said.clone(), |(_, held)| held.to_owned())
-                }
-            })
-        };
-        Ok([read(m, TargetRows::Step)?, read(m, TargetRows::Pass)?])
+    /// The target's final hidden row at the last of a prompt call of `rows` ids from position
+    /// 0: what a point taken at `rows` keeps for the draft, read right after the call from the
+    /// ubatch arena, which holds the call's last ubatch ([`Body38::ubatch_cut`]).
+    fn ubatch_last(m: &Qwen38Model, rows: usize) -> Result<Vec<f32>, GateError> {
+        let last = (rows - 1) % m.body("(kp-draft)")?.ubatch_rows();
+        let all = m.target_streams(TargetRows::Ubatch, last + 1)?;
+        Ok(all[last * WIDE..].to_vec())
     }
 
-    /// (kp-draft): a prefix restore with the draft on cuts the draft's side as `resume` then
-    /// `rollback` does. A drafted run's state (the draft's store and both arenas' records in
-    /// it) with a point below its end, put back whole (the draft's store holds the state's
-    /// positions, the arenas their records: the contrast), then cut to the point by `rollback`
-    /// and put back as the point's prefix (`seq_resume_prefix` asked one short of the end):
-    /// each model stands at the point with the draft's store forgotten (`held() == 0`) and the
-    /// arenas' records cut at it, so a walk that reads either arena is refused with the same
-    /// words ([`arena_words`]) both ways and not the whole state's. Mutants: the prefix
-    /// restore that puts the draft's whole store back (`held()` is the state's, not 0); the
-    /// arenas' records left uncut (the prefix's words are the whole state's).
-    fn prefix_draft(m: Qwen38Model, prompt: &[u32]) -> Result<(Qwen38Model, bool), GateError> {
-        const N: usize = 6;
+    /// The draft's store count of a model.
+    fn held_of(m: &Qwen38Model) -> Result<usize, GateError> {
+        Ok(m.body("(kp-draft)")?.mtp().map_or(0, |d| d.held()))
+    }
+
+    /// What a model cut to a point holds for the draft's first walk there: its position, the
+    /// draft store's count and rows below the point, and the step arena's row 0.
+    struct AtPoint {
+        pos: u32,
+        held: usize,
+        store: (Vec<u16>, Vec<u16>),
+        row: Vec<f32>,
+    }
+
+    impl AtPoint {
+        fn read(m: &Qwen38Model, at: usize) -> Result<AtPoint, GateError> {
+            Ok(AtPoint {
+                pos: m.pos(),
+                held: held_of(m)?,
+                store: store_of(m, at)?,
+                row: m.target_streams(TargetRows::Step, 1)?,
+            })
+        }
+
+        /// Whether it stands at `at` with the draft rejoined: the store holds the positions
+        /// below `at`, its rows `rows`, and the step arena's row 0 is `point_row` bit for bit.
+        fn rejoined(&self, at: usize, rows: &(Vec<u16>, Vec<u16>), point_row: &[f32]) -> bool {
+            self.pos as usize == at
+                && self.held == at
+                && same_rows(&self.store, rows, at).iter().all(|&s| s)
+                && self
+                    .row
+                    .iter()
+                    .map(|x| x.to_bits())
+                    .eq(point_row.iter().map(|x| x.to_bits()))
+        }
+    }
+
+    /// The draft's walk of `id` at `at` that reads the step arena's row 0 as position `at - 1`:
+    /// its logits' bits, or the words of its refusal.
+    fn walk_at(
+        m: &mut Qwen38Model,
+        id: u32,
+        at: usize,
+    ) -> Result<Result<Vec<u32>, String>, GateError> {
+        let r = m.mtp_draft(
+            MtpFeed::Rows {
+                tokens: &[id],
+                pos0: u32::try_from(at)?,
+                hidden: MtpHidden::Target {
+                    walk: TargetRows::Step,
+                    first: 0,
+                },
+            },
+            MtpHead::Rows,
+            MtpMode::Eager,
+        );
+        Ok(match r {
+            Ok(_) => Ok(m.mtp_logits()?.0.iter().map(|x| x.to_bits()).collect()),
+            Err(e) => Err(e.to_string()),
+        })
+    }
+
+    /// A drafted run of `n` ids from a reset with checkpoints on: the model, the prompt call's
+    /// argmax (the id at the prompt's end) and the target's hidden row at the prompt's last
+    /// position, read right after the prompt call.
+    fn drafted_run(
+        m: Qwen38Model,
+        prompt: &[u32],
+        n: usize,
+    ) -> Result<(Qwen38Model, u32, Vec<f32>), GateError> {
         let ctx = m.body("(kp-draft)")?.ctx() as u32;
         let mut m = m;
         m.body_parts("(kp-draft)")?.2.set_checkpoints(true);
-        let mut m = {
-            let (mut s, mut spec) = drafted_session(m, step_cfg(Prompt38::Auto), ctx)?;
-            let first = spec.prompt(&mut s, prompt)?;
-            runtime::generate(
-                &mut s,
-                &mut spec,
-                prompt,
-                first,
-                &runtime::Stop::new(N, ctx)?,
-                &mut Kept::default(),
-            )?;
-            s.into_model()
-        };
+        let (mut s, mut spec) = drafted_session(m, step_cfg(Prompt38::Auto), ctx)?;
+        let first = spec.prompt(&mut s, prompt)?;
+        let point_row = ubatch_last(s.model(), prompt.len())?;
+        runtime::generate(
+            &mut s,
+            &mut spec,
+            prompt,
+            first,
+            &runtime::Stop::new(n, ctx)?,
+            &mut Kept::default(),
+        )?;
+        Ok((s.into_model(), first, point_row))
+    }
+
+    /// (kp-draft): a cut to a point and a prefix restore to it keep the draft. A drafted run
+    /// with a point at its prompt's end (`p`) below its end is saved; put back whole, the
+    /// draft's store holds the state's positions (the contrast). Then the state put back whole
+    /// and cut to `p` by `rollback`, the state put back as its first `p` positions
+    /// (`seq_resume_prefix` asked one short of the end), and a state saved there put back whole
+    /// each stand at `p` with the draft rejoined ([`AtPoint::rejoined`]): the draft's store
+    /// holds the `p` positions below the point, its rows the drafted run's, and the step
+    /// arena's row 0 is the target's hidden row at `p - 1` bit for bit as the prompt call left
+    /// it. The draft's walk at `p` that reads that row runs, its logits the same bits all three
+    /// ways. The prefix restore writes no row past `p`: run over another prompt first, the
+    /// store keeps that run's rows at `p..n`, which differ from the state's. Mutants: the cut
+    /// that forgets the draft's store (`held` 0, the walk refused); a row other than the
+    /// point's (the row's bits); the prefix restore that forgets the draft's store before the
+    /// rejoin (`held` 0 there, the walk refused); the prefix restore that adopts the whole
+    /// saved store (the state's rows past `p`). After a reset, a run of other ids with its own
+    /// point at `p` and cut to it leaves that run's row in the step arena, not the first run's:
+    /// a reset that keeps the points' rows (the first run's row is found first).
+    fn prefix_draft(m: Qwen38Model, prompt: &[u32]) -> Result<(Qwen38Model, bool), GateError> {
+        const N: usize = 6;
+        let (mut m, first, point_row) = drafted_run(m, prompt, N)?;
         let state = m.seq_save()?;
         let n = state.positions();
         let ask = n.saturating_sub(1);
         let at = state.keep_point(ask);
-        let held_of = |m: &Qwen38Model| -> Result<usize, GateError> {
-            Ok(m.body("(kp-draft)")?.mtp().map_or(0, |d| d.held()))
-        };
-        if at == 0 || at >= n {
+        if at == 0 || at >= n || at as usize != prompt.len() {
             m.body_parts("(kp-draft)")?.2.set_checkpoints(false);
             m.reset()?;
             println!(
-                "(kp-draft) a drafted run's state of {n} positions carries no point below its \
-                 end (asked {ask}, kept {at}): nothing to cut to FAIL"
+                "(kp-draft) a drafted run's state of {n} positions carries no point at its \
+                 prompt's end {} below its end (asked {ask}, kept {at}) FAIL",
+                prompt.len()
             );
             return Ok((m, false));
         }
-        let probe = at as usize;
+        let p = at as usize;
         m.reset()?;
         m.seq_resume(&state)?;
         let (whole_held, whole_pos) = (held_of(&m)?, m.pos());
-        let whole_words = arena_words(&mut m, prompt, probe)?;
+        let rows = store_of(&m, p)?;
+        let saved_all = store_of(&m, n as usize)?;
         m.reset()?;
         m.seq_resume(&state)?;
         m.rollback(at)?;
-        let (roll_held, roll_pos) = (held_of(&m)?, m.pos());
-        let roll_words = arena_words(&mut m, prompt, probe)?;
+        let roll = AtPoint::read(&m, p)?;
+        let roll_walk = walk_at(&mut m, first, p)?;
+        m.reset()?;
+        let vocab = u32::try_from(m.body("(kp-draft)")?.vocab())?;
+        let other: Vec<u32> = prompt.iter().map(|&t| (t + 1) % vocab).collect();
+        let (mut m, _, other_row) = drafted_run(m, &other, N)?;
+        let other_all = store_of(&m, n as usize)?;
+        m.rollback(at)?;
+        let fresh = AtPoint::read(&m, p)?;
         m.reset()?;
         let put = match m.seq_resume_prefix(&state, ask) {
             Ok(put) => put,
@@ -2539,29 +2613,123 @@ mod gate {
                 return Ok((m, false));
             }
         };
-        let (pre_held, pre_pos) = (held_of(&m)?, m.pos());
-        let pre_words = arena_words(&mut m, prompt, probe)?;
+        let pre = AtPoint::read(&m, p)?;
+        let past = store_of(&m, n as usize)?;
+        let again = m.seq_save();
+        let pre_walk = walk_at(&mut m, first, p)?;
+        m.reset()?;
+        let saved = match again.map(|s| m.seq_resume(&s).map(|()| s.positions())) {
+            Ok(Ok(k)) => Ok((k, AtPoint::read(&m, p)?, walk_at(&mut m, first, p)?)),
+            Ok(Err(e)) | Err(e) => Err(e.to_string()),
+        };
         m.body_parts("(kp-draft)")?.2.set_checkpoints(false);
         m.reset()?;
         let contrast = whole_held == n as usize && whole_pos == n;
-        let cut = roll_held == 0 && roll_pos == at && pre_held == 0 && pre_pos == at && put == at;
-        let same = pre_words == roll_words;
-        let seen = whole_words != roll_words;
-        let ok = contrast && cut && same && seen;
+        let roll_ok = roll.rejoined(p, &rows, &point_row) && roll_walk.is_ok();
+        let tail = |a, b| same_rows(a, b, n as usize)[p..].iter().all(|&s| s);
+        let (kept_tail, differs) = (tail(&past, &other_all), !tail(&other_all, &saved_all));
+        let pre_ok = put == at
+            && pre.rejoined(p, &rows, &point_row)
+            && pre_walk.is_ok()
+            && kept_tail
+            && differs;
+        let bits = |r: &[f32]| r.iter().map(|x| x.to_bits()).collect::<Vec<u32>>();
+        let fresh_ok = bits(&fresh.row) == bits(&other_row) && bits(&other_row) != bits(&point_row);
+        let (saved_ok, saved_said) = match &saved {
+            Ok((k, a, w)) => (
+                *k == at && a.rejoined(p, &rows, &point_row) && w.is_ok() && *w == roll_walk,
+                format!(
+                    "{k} positions, the draft's store {} at {}, the row {}, the walk {}",
+                    a.held,
+                    a.pos,
+                    a.row == point_row,
+                    w.as_ref().map_or_else(Clone::clone, |_| "ran".to_owned())
+                ),
+            ),
+            Err(e) => (false, format!("refused: {e}")),
+        };
+        let same = roll_walk.is_ok() && pre_walk == roll_walk;
+        let said = |a: &AtPoint, w: &Result<Vec<u32>, String>| {
+            format!(
+                "the draft's store {} at {}, its rows the run's {}, the step row the point's {}, \
+                 the walk {}",
+                a.held,
+                a.pos,
+                same_rows(&a.store, &rows, p).iter().all(|&s| s),
+                a.row == point_row,
+                w.as_ref().map_or_else(Clone::clone, |_| "ran".to_owned())
+            )
+        };
         println!(
             "(kp-draft) a drafted run's state of {n} positions, a point at {at} (asked {ask}): \
-             whole resume holds the draft's {whole_held} at {whole_pos} (arenas {whole_words:?}); \
-             resume then rollback holds {roll_held} at {roll_pos} (arenas {roll_words:?}); the \
-             prefix returned {put} and holds {pre_held} at {pre_pos} (arenas {pre_words:?}); the \
-             cut is seen {seen}, the two cut ways agree {same} {}",
+             whole resume holds the draft's {whole_held} at {whole_pos} {}",
+            verdict(contrast)
+        );
+        println!(
+            "(kp-draft) resume then rollback to {at}: {} {}",
+            said(&roll, &roll_walk),
+            verdict(roll_ok)
+        );
+        println!(
+            "(kp-draft) the prefix put back returned {put}: {}; its walk's logits the rollback's \
+             {same}; the rows past {at} another run's {kept_tail} (the state's differ there \
+             {differs}) {}",
+            said(&pre, &pre_walk),
+            verdict(pre_ok && same)
+        );
+        println!(
+            "(kp-draft) a reset, then a run of other ids with its own point at {at}, cut to it: \
+             the step row the other run's {} (differing from the first run's {}) {}",
+            bits(&fresh.row) == bits(&other_row),
+            bits(&other_row) != bits(&point_row),
+            verdict(fresh_ok)
+        );
+        println!(
+            "(kp-draft) a state saved at the prefix, put back whole: {saved_said} {}",
+            verdict(saved_ok)
+        );
+        Ok((
+            m,
+            contrast && roll_ok && pre_ok && same && saved_ok && fresh_ok,
+        ))
+    }
+
+    /// (kp-draft) the store behind the point: a cut to a point the draft's store does not reach
+    /// keeps the draft off there. A drafted run, then `K` ids by a prompt call without the
+    /// draft (a point at its end, the target's row before it in the ubatch arena, the draft's
+    /// store still at the drafted run's end), `K` more the same way, then `rollback` to the
+    /// first call's end: the draft's store is forgotten (`held` 0) and the model stands at the
+    /// point. Mutant: the rejoin without its store condition (`held` the drafted run's).
+    fn store_behind(m: Qwen38Model, prompt: &[u32]) -> Result<(Qwen38Model, bool), GateError> {
+        const N: usize = 6;
+        const K: usize = 16;
+        let (mut m, _, _) = drafted_run(m, prompt, N)?;
+        let (end, before) = (m.pos(), held_of(&m)?);
+        m.prompt38(&prompt[..K], Prompt38::Auto)?;
+        let at = m.pos();
+        m.prompt38(&prompt[K..2 * K], Prompt38::Auto)?;
+        let past = m.pos();
+        let cut = m.rollback(at);
+        let (held, pos) = (held_of(&m)?, m.pos());
+        m.body_parts("(kp-draft)")?.2.set_checkpoints(false);
+        m.reset()?;
+        let behind = before < at as usize;
+        let ok = behind && cut.is_ok() && pos == at && held == 0;
+        println!(
+            "(kp-draft) the store behind the point: a drafted run to {end}, its draft's store \
+             {before}, {K} ids without the draft to a point at {at} and {K} more to {past}, cut \
+             back to {at} ({}): the draft's store holds {held} at {pos} {}",
+            cut.map_or_else(|e| format!("refused: {e}"), |()| "ran".to_owned()),
             verdict(ok)
         );
         Ok((m, ok))
     }
 
-    /// (sl): a drafted run's state saved on a save lane (`seq_save_async`) twice, its copy
+    /// (sl): a drafted run's state saved on a save lane (`seq_save_async`) three times, its copy
     /// landed each time: whole, the draft's store holding all `n` positions, then after a
-    /// rollback to a point `at` below `n`, which forgets the store (it holds 0 of `at`). Each
+    /// rollback to a point `at` below `n`, which the draft rejoins (its store counts `at`), then
+    /// a state of `BEHIND` ids from a reset by a prompt call without the draft (the store holds 0
+    /// of `BEHIND`). Each
     /// copy's bytes (`SaveCost::bytes`) are the target's rows of the state's positions
     /// ([`seq_positional_bytes`]), its recurrent stores at the end and at each point the state
     /// carries ([`checkpoint_bytes`]), and the draft's store rows of the same positions,
@@ -2574,13 +2742,14 @@ mod gate {
     /// in the copy (the copies' bytes lack the draft's term); the K plane's spans in place of
     /// the V plane's (the V rows stay overwritten); the planes' spans strided by `n`
     /// positions, not `ctx` (the second KV head's rows stay overwritten); a put-back that
-    /// counts the state's positions (the rolled-back state's store holds `at`, not 0).
+    /// counts the state's positions (the third state's store holds `BEHIND`, not 0).
     fn lane_save(
         m: Qwen38Model,
         prompt: &[u32],
         kv_bytes: u64,
     ) -> Result<(Qwen38Model, bool), GateError> {
         const N: usize = 6;
+        const BEHIND: usize = 16;
         let ctx = m.body("(sl)")?.ctx() as u32;
         let mut m = m;
         m.body_parts("(sl)")?.2.set_checkpoints(true);
@@ -2600,8 +2769,9 @@ mod gate {
         let n = m.pos();
         let (state, held, whole_ok) = lane_round(&mut m, prompt, kv_bytes, ("whole", 1))?;
         let whole_ok = whole_ok && held == n as usize;
-        let refused_ok = whole_ok && lane_refused(&mut m, prompt, n)?;
         let at = state.keep_point(n.saturating_sub(1));
+        let prefix_ok = whole_ok && lane_prefix(&mut m, &state, n, at)?;
+        let refused_ok = whole_ok && lane_refused(&mut m, prompt, n)?;
         let cut_ok = if at == 0 || at >= n {
             println!(
                 "(sl) the state of {n} positions carries no point below its end (asked {}, \
@@ -2612,11 +2782,67 @@ mod gate {
         } else {
             m.rollback(at)?;
             let (_, held, ok) = lane_round(&mut m, prompt, kv_bytes, ("rolled back", 2))?;
+            ok && held == at as usize
+        };
+        let behind_ok = cut_ok && {
+            m.reset()?;
+            m.prompt38(&prompt[..BEHIND], Prompt38::Auto)?;
+            let (_, held, ok) = lane_round(&mut m, prompt, kv_bytes, ("store behind", 3))?;
             ok && held == 0
         };
         m.body_parts("(sl)")?.2.set_checkpoints(false);
         m.reset()?;
-        Ok((m, whole_ok && refused_ok && cut_ok))
+        Ok((
+            m,
+            whole_ok && prefix_ok && refused_ok && cut_ok && behind_ok,
+        ))
+    }
+
+    /// The lane's state of a drafted run (`lane_state`, `n` positions, its point at `at`) put
+    /// back as the point's prefix (asked one short of the end) beside the engine stream's state
+    /// of the same sequence: each stands at `at` with the draft rejoined, and the lane's store
+    /// rows below `at` and step arena row 0 are the engine stream's bit for bit. The lane's
+    /// state is put back whole after, as the model stood. Mutant: a lane state without the
+    /// points' hidden rows (its prefix put-back leaves the draft off, `held` 0).
+    fn lane_prefix(
+        m: &mut Qwen38Model,
+        lane_state: &Seq38,
+        n: u32,
+        at: u32,
+    ) -> Result<bool, GateError> {
+        if at == 0 || at >= n {
+            return Ok(false);
+        }
+        let (here, ask) = (at as usize, n - 1);
+        let engine = m.seq_save()?;
+        m.reset()?;
+        let kept_e = m.seq_resume_prefix(&engine, ask)?;
+        let want = AtPoint::read(m, here)?;
+        m.reset()?;
+        let kept_l = m.seq_resume_prefix(lane_state, ask)?;
+        let got = AtPoint::read(m, here)?;
+        m.reset()?;
+        m.seq_resume(lane_state)?;
+        let bits = |r: &[f32]| r.iter().map(|x| x.to_bits()).collect::<Vec<u32>>();
+        let same = same_rows(&got.store, &want.store, here).iter().all(|&s| s)
+            && bits(&got.row) == bits(&want.row);
+        let ok = kept_e == at
+            && kept_l == at
+            && want.held == here
+            && got.held == here
+            && got.pos == at
+            && same;
+        println!(
+            "(sl) the lane's state of {n} positions put back as the point at {at}'s prefix \
+             (kept {kept_l}, the engine stream's {kept_e}): the draft's store holds {} at {} \
+             (the engine stream's {}), its rows below {at} and the step row the engine \
+             stream's {same} {}",
+            got.held,
+            got.pos,
+            want.held,
+            verdict(ok)
+        );
+        Ok(ok)
     }
 
     /// One [`lane_save`] round on the model as it stands, `round` its name and the ids'
@@ -2729,6 +2955,90 @@ mod gate {
             )?;
         }
         Ok(())
+    }
+
+    /// The long point clause's context: a prompt call past the first inner mark
+    /// ([`CHECKPOINT_EVERY`]), its drafted run and a few positions of slack.
+    const CTX_LONG: u64 = 2 * CHECKPOINT_EVERY as u64;
+
+    /// (kp-draft) a point inside a long prompt call, on a load of [`CTX_LONG`] positions: a
+    /// drafted run whose prompt call of `CHECKPOINT_EVERY + prompt.len()` ids takes an inner
+    /// mark at [`CHECKPOINT_EVERY`] (an anchor point, which every later save carries) and one
+    /// at its end. Cut back to the inner point by `rollback`, and the run's state put back as
+    /// the inner point's prefix (asked a few positions past it), each stands at the point with
+    /// the draft rejoined ([`AtPoint::rejoined`]): the store holding the positions below it,
+    /// its rows the run's, and the step arena's row 0 the target's hidden row at
+    /// `CHECKPOINT_EVERY - 1` bit for bit as a call of the first `CHECKPOINT_EVERY` ids alone
+    /// leaves it. The draft's walk at the point runs, its logits the same bits both ways.
+    /// Mutant: the row of the mark's own position, not the one before it (no row, the draft
+    /// off).
+    fn long_point(inputs: &PlanInputs, mtp: &MtpInputs, prompt: &[u32]) -> Result<bool, GateError> {
+        const N: usize = 6;
+        let p = CHECKPOINT_EVERY as usize;
+        let ub = bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for(usize::try_from(CTX_LONG)?)?;
+        let (file, draft) = (open_target()?, open_draft()?);
+        let machine = machine(card()?, inputs.spec.layers.len(), u64::try_from(ub)?);
+        let extra = mtp.card_bytes(CTX_LONG)?;
+        let plan = inputs.plan_mtp(&machine, CTX_LONG, &plan_levers(extra)?, mtp)?;
+        let mut m = Body38::open_placed_mtp(file, &plan, inputs, 0, cfg().host, ub, &draft, mtp)?;
+        let vocab = u32::try_from(m.body("(kp-draft)")?.vocab())?;
+        let ids: Vec<u32> = (0..p + prompt.len())
+            .map(|i| Ok((prompt[i % prompt.len()] + u32::try_from(i / prompt.len())?) % vocab))
+            .collect::<Result<_, std::num::TryFromIntError>>()?;
+        m.reset()?;
+        m.prompt38(&ids[..p], Prompt38::Auto)?;
+        let point_row = ubatch_last(&m, p)?;
+        let (mut m, _, _) = drafted_run(m, &ids, N)?;
+        let state = m.seq_save()?;
+        let n = state.positions();
+        m.reset()?;
+        m.seq_resume(&state)?;
+        let rows = store_of(&m, p)?;
+        let at = u32::try_from(p)?;
+        let cut = m.rollback(at);
+        let roll = AtPoint::read(&m, p)?;
+        let roll_walk = walk_at(&mut m, ids[p], p)?;
+        m.reset()?;
+        let ask = at + 3;
+        let put = m.seq_resume_prefix(&state, ask);
+        let pre = AtPoint::read(&m, p)?;
+        let pre_walk = walk_at(&mut m, ids[p], p)?;
+        m.body_parts("(kp-draft)")?.2.set_checkpoints(false);
+        m.reset()?;
+        drop(m);
+        let said = |a: &AtPoint, w: &Result<Vec<u32>, String>| {
+            format!(
+                "the draft's store {} at {}, its rows the run's {}, the step row the call's {}, \
+                 the walk {}",
+                a.held,
+                a.pos,
+                same_rows(&a.store, &rows, p).iter().all(|&s| s),
+                a.row == point_row,
+                w.as_ref().map_or_else(Clone::clone, |_| "ran".to_owned())
+            )
+        };
+        let roll_ok = cut.is_ok() && roll.rejoined(p, &rows, &point_row) && roll_walk.is_ok();
+        let pre_ok = put.as_ref().is_ok_and(|&k| k == at)
+            && pre.rejoined(p, &rows, &point_row)
+            && pre_walk.is_ok()
+            && pre_walk == roll_walk;
+        println!(
+            "(kp-draft) a run of {n} positions from a prompt call of {} ids, cut back to its \
+             inner point at {p} ({}): {} {}",
+            ids.len(),
+            cut.map_or_else(|e| format!("refused: {e}"), |()| "ran".to_owned()),
+            said(&roll, &roll_walk),
+            verdict(roll_ok)
+        );
+        println!(
+            "(kp-draft) its state put back as a prefix asked {ask} (returned {}): {}; its walk's \
+             logits the cut's {} {}",
+            put.map_or_else(|e| format!("refused: {e}"), |k| k.to_string()),
+            said(&pre, &pre_walk),
+            pre_walk == roll_walk,
+            verdict(pre_ok)
+        );
+        Ok(roll_ok && pre_ok)
     }
 
     /// (x): a resume refused before any copy. A state of a load without the
@@ -4241,7 +4551,311 @@ mod gate {
         }
         z_ok &= z_red("waiting", waiting_select(&mut s));
         z_ok &= z_red("step after", step_after(&mut s, [a, b], &after));
-        Ok(ids_ok && passes_ok && stores_ok && z_ok)
+        tier::sc(
+            "(kp-draft) two slots cut to points at one position: each rejoins with its own row",
+        )?;
+        let mut kp_ok = slots_rejoin(&mut s, &mut spec, [a, b])?;
+        tier::sc("(kp-draft) the point at a continuing call's start, after a step and a select")?;
+        kp_ok &= slots_call_start(&mut s, [a, b])?;
+        tier::sc("(kp-draft) a state put back as its prefix on the other slot")?;
+        kp_ok &= slots_put_back(&mut s, [a, b])?;
+        tier::sc("(kp-draft) an off slot beside a drafted window in one pass")?;
+        kp_ok &= slots_off_beside(&mut s, [a, b])?;
+        Ok(ids_ok && passes_ok && stores_ok && z_ok && kp_ok)
+    }
+
+    /// (kp-draft) two slots cut to points at one position: each slot's drafted request with
+    /// checkpoints on (its prompt call of the same length, so both points stand at its end,
+    /// then its first plain step and one drafted pass), a select between them, then each slot
+    /// selected and cut back to its point by `rollback`: each stands there with its own draft's
+    /// store holding the positions below the point and the step arena's row 0 its own prompt's
+    /// hidden row before the point bit for bit, not the other slot's. Mutant: the select that
+    /// leaves the points' rows with the load (a slot rejoins with the other slot's row).
+    fn slots_rejoin(
+        s: &mut app::Session<Body38>,
+        spec: &mut Spec38,
+        windows: [&[u32]; 2],
+    ) -> Result<bool, GateError> {
+        let l = windows[0].len().min(windows[1].len());
+        let mut parked = [None, None];
+        s.model_mut()
+            .body_parts("(kp-draft)")?
+            .2
+            .set_checkpoints(true);
+        let mut rows = Vec::with_capacity(2);
+        for (slot, ids) in windows.into_iter().enumerate() {
+            switch(s, spec, &mut parked, slot)?;
+            s.reset()?;
+            spec.draft_mut().restart();
+            let first = Advance::prompt(spec, s, &ids[..l])?;
+            rows.push(ubatch_last(s.model(), l)?);
+            let mut out = vec![first, plain_step(s, spec, first)?];
+            one_pass(s, spec, &mut out)?;
+        }
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        let mut ok = bits(&rows[0]) != bits(&rows[1]);
+        for slot in 0..2 {
+            switch(s, spec, &mut parked, slot)?;
+            let cut = s.model_mut().rollback(u32::try_from(l)?);
+            let m = s.model();
+            let (held, pos) = (held_of(m)?, m.pos());
+            let row = bits(&m.target_streams(TargetRows::Step, 1)?);
+            let (own, other) = (row == bits(&rows[slot]), row == bits(&rows[1 - slot]));
+            let slot_ok = cut.is_ok() && held == l && pos as usize == l && own && !other;
+            println!(
+                "(kp-draft) slot {slot} cut back to its point at {l} ({}): the draft's store \
+                 holds {held} at {pos}, the step row its own prompt's {own}, the other slot's \
+                 {other} {}",
+                cut.map_or_else(|e| format!("refused: {e}"), |()| "ran".to_owned()),
+                verdict(slot_ok)
+            );
+            ok &= slot_ok;
+        }
+        s.model_mut()
+            .body_parts("(kp-draft)")?
+            .2
+            .set_checkpoints(false);
+        Ok(ok)
+    }
+
+    /// The ids a (kp-draft) two-slot case feeds past a slot's first call, in each call that
+    /// continues it.
+    const KP_MORE: usize = 8;
+
+    /// The selected slot's checkpoints turned on or off.
+    fn set_marks(s: &mut app::Session<Body38>, on: bool) -> Result<(), GateError> {
+        s.model_mut()
+            .body_parts("(kp-draft)")?
+            .2
+            .set_checkpoints(on);
+        Ok(())
+    }
+
+    /// (kp-draft) the point at a continuing call's start, each slot's request from its reset
+    /// and its own draft, `l` half the shorter window. After a step: slot 0's prompt call of `l`
+    /// ids and its first plain step, then a call of [`KP_MORE`] ids with checkpoints on, whose
+    /// start mark at `l + 1` reads the row the step left in the step arena; cut back to that
+    /// mark, the draft rejoins with that row bit for bit. After a select: slot 0's prompt call
+    /// of `l` ids with checkpoints off and no step, slot 1's prompt call of `l` ids (the load's
+    /// ubatch arena rewritten), slot 0 selected again and a call of [`KP_MORE`] ids with
+    /// checkpoints on: no arena of slot 0's holds `l - 1` at the start mark, so the point at
+    /// `l` keeps no row, and a cut back to it leaves the draft off, its store forgotten, never
+    /// rejoined with slot 1's row. Mutant: the select that keeps the ubatch arena's record
+    /// (slot 0 rejoins with slot 1's row).
+    fn slots_call_start(
+        s: &mut app::Session<Body38>,
+        windows: [&[u32]; 2],
+    ) -> Result<bool, GateError> {
+        let l = windows[0].len().min(windows[1].len()) / 2;
+        let more = &windows[0][l..l + KP_MORE];
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        s.select_slot(0)?;
+        let mut d = fresh_draft(s)?;
+        start(s, &mut d, &windows[0][..l])?;
+        let row = s.model().target_streams(TargetRows::Step, 1)?;
+        set_marks(s, true)?;
+        s.model_mut().prompt38(more, Prompt38::Auto)?;
+        let p = l + 1;
+        let rows = store_of(s.model(), p)?;
+        let cut = s.model_mut().rollback(u32::try_from(p)?);
+        let after_step = AtPoint::read(s.model(), p)?;
+        let step_ok = cut.is_ok() && after_step.rejoined(p, &rows, &row);
+        println!(
+            "(kp-draft) a call's start mark after a step, cut back to it at {p} ({}): the draft's \
+             store holds {} at {}, the step row the step's {} {}",
+            cut.map_or_else(|e| format!("refused: {e}"), |()| "ran".to_owned()),
+            after_step.held,
+            after_step.pos,
+            bits(&after_step.row) == bits(&row),
+            verdict(step_ok)
+        );
+        set_marks(s, false)?;
+        let mut own = Vec::with_capacity(2);
+        for (slot, ids) in windows.into_iter().enumerate() {
+            s.select_slot(slot)?;
+            s.reset()?;
+            let mut d = fresh_draft(s)?;
+            Draft::prompt(&mut d, s, &ids[..l])?;
+            own.push(ubatch_last(s.model(), l)?);
+        }
+        s.select_slot(0)?;
+        set_marks(s, true)?;
+        s.model_mut().prompt38(more, Prompt38::Auto)?;
+        let cut = s.model_mut().rollback(u32::try_from(l)?);
+        let m = s.model();
+        let (held, pos) = (held_of(m)?, m.pos());
+        let row = bits(&m.target_streams(TargetRows::Step, 1)?);
+        let (mine, other) = (row == bits(&own[0]), row == bits(&own[1]));
+        let select_ok = bits(&own[0]) != bits(&own[1])
+            && cut.is_ok()
+            && pos as usize == l
+            && held == 0
+            && !other;
+        println!(
+            "(kp-draft) a call's start mark after a select, its position before held only by \
+             the ubatch arena's record of before the select, cut back to it at {l} ({}): the \
+             draft's store holds {held} at {pos}, the step row its own prompt's {mine}, the other \
+             slot's {other} {}",
+            cut.map_or_else(|e| format!("refused: {e}"), |()| "ran".to_owned()),
+            verdict(select_ok)
+        );
+        set_marks(s, false)?;
+        Ok(step_ok && select_ok)
+    }
+
+    /// (kp-draft) a state put back as its prefix on the other slot: slot 0's drafted request
+    /// with checkpoints on (its prompt call of `l` ids, a point at its end, then its first
+    /// plain step and one drafted pass) saved, then slot 1 reset and the state put back as the
+    /// point's prefix: slot 1 stands at `l` with the draft rejoined ([`AtPoint::rejoined`]),
+    /// the store's rows slot 0's and the step arena's row 0 slot 0's prompt's hidden row at
+    /// `l - 1` bit for bit.
+    fn slots_put_back(
+        s: &mut app::Session<Body38>,
+        windows: [&[u32]; 2],
+    ) -> Result<bool, GateError> {
+        let l = windows[0].len().min(windows[1].len()) / 2;
+        s.select_slot(0)?;
+        s.reset()?;
+        set_marks(s, true)?;
+        let mut d = fresh_draft(s)?;
+        let first = Draft::prompt(&mut d, s, &windows[0][..l])?;
+        let row = ubatch_last(s.model(), l)?;
+        d.before_step(s, first)?;
+        let next = Target::step(s, first, Want::Argmax)?.argmax();
+        Draft::stepped(&mut d, s, first, next)?;
+        let mut spec = Spec38::new(d);
+        one_pass(s, &mut spec, &mut vec![first, next])?;
+        let rows = store_of(s.model(), l)?;
+        let state = s.model_mut().seq_save()?;
+        let n = state.positions();
+        set_marks(s, false)?;
+        s.select_slot(1)?;
+        s.reset()?;
+        let put = s.model_mut().seq_resume_prefix(&state, n - 1);
+        let at = AtPoint::read(s.model(), l)?;
+        let ok = put.as_ref().is_ok_and(|&k| k as usize == l) && at.rejoined(l, &rows, &row);
+        println!(
+            "(kp-draft) slot 0's state of {n} positions put back on slot 1 as a prefix (returned \
+             {}): the draft's store holds {} at {}, its rows slot 0's {}, the step row slot 0's \
+             prompt's {} {}",
+            put.map_or_else(|e| format!("refused: {e}"), |k| k.to_string()),
+            at.held,
+            at.pos,
+            same_rows(&at.store, &rows, l).iter().all(|&x| x),
+            at.row == row,
+            verdict(ok)
+        );
+        s.reset()?;
+        Ok(ok)
+    }
+
+    /// The passes of the off slot clause ([`slots_off_beside`]).
+    const KP_PASSES: usize = 6;
+
+    /// Slot 0 of the off slot clause from its reset, through `d`: the prompt call of `l` ids
+    /// of `ids` with checkpoints on and its first plain step, two calls of [`KP_MORE`] ids
+    /// without the draft, a cut back to the first's end (the draft's store behind the point
+    /// there, so the cut forgets it), then a continuing prompt call of [`KP_MORE`] ids, which
+    /// the draft skips, and its first plain step. Returns the ids from that call on and the
+    /// draft's store count after the cut.
+    fn off_slot(
+        s: &mut app::Session<Body38>,
+        d: &mut app::mtp::MtpDraft<Body38>,
+        ids: &[u32],
+        l: usize,
+    ) -> Result<(Vec<u32>, usize), GateError> {
+        s.reset()?;
+        set_marks(s, true)?;
+        start(s, d, &ids[..l])?;
+        let at = s.model().pos();
+        s.model_mut()
+            .prompt38(&ids[l..l + KP_MORE], Prompt38::Auto)?;
+        s.model_mut().prompt38(&ids[..KP_MORE], Prompt38::Auto)?;
+        s.model_mut().rollback(at + u32::try_from(KP_MORE)?)?;
+        let held = held_of(s.model())?;
+        let first = Draft::prompt(d, s, &ids[l + KP_MORE..l + 2 * KP_MORE])?;
+        d.before_step(s, first)?;
+        let next = Target::step(s, first, Want::Argmax)?.argmax();
+        Draft::stepped(d, s, first, next)?;
+        set_marks(s, false)?;
+        Ok((vec![first, next], held))
+    }
+
+    /// (kp-draft) an off slot beside a drafted window in one pass, the server's off slot at the
+    /// body: slot 0's draft off ([`off_slot`]: its store forgotten by a cut to a point it does
+    /// not reach, its next call skipped), slot 1's drafted request from its reset, then
+    /// [`KP_PASSES`] passes of both slots' rows ([`app::mtp::pass_slots`], depth
+    /// [`app::mtp::SLOT_DEPTH`]): slot 0 rides every pass with one row, a plain step, and slot
+    /// 1 proposes in at least one. Slot 0's ids are the same calls' with plain steps in place
+    /// of the passes, and slot 1's ids, kept rows and draft store its window run alone
+    /// ([`capped_run`]).
+    fn slots_off_beside(
+        s: &mut app::Session<Body38>,
+        windows: [&[u32]; 2],
+    ) -> Result<bool, GateError> {
+        let l = windows[0].len().min(windows[1].len()) / 2;
+        let depth = app::mtp::SLOT_DEPTH;
+        let mut d0 = fresh_draft(s)?;
+        let mut d1 = fresh_draft(s)?;
+        s.select_slot(0)?;
+        let (mut o0, held) = off_slot(s, &mut d0, windows[0], l)?;
+        let skips = d0.skipping();
+        s.select_slot(1)?;
+        let mut o1 = start(s, &mut d1, windows[1])?;
+        let (mut plain_rows, mut drafted_rows) = (true, 0usize);
+        let mut passes = Vec::with_capacity(KP_PASSES);
+        for _ in 0..KP_PASSES {
+            let (l0, l1) = (
+                *o0.last().ok_or("slot 0 gave no id")?,
+                *o1.last().ok_or("slot 1 gave no id")?,
+            );
+            let mut w = [
+                app::mtp::SlotWindow {
+                    slot: 0,
+                    draft: &mut d0,
+                    last: l0,
+                    depth,
+                    out: &mut o0,
+                },
+                app::mtp::SlotWindow {
+                    slot: 1,
+                    draft: &mut d1,
+                    last: l1,
+                    depth,
+                    out: &mut o1,
+                },
+            ];
+            let done = app::mtp::pass_slots(s, &mut w)?;
+            let [c0, c1] = <[Committed; 2]>::try_from(done)
+                .map_err(|d| format!("a pass of 2 slots committed {} slots", d.len()))?;
+            plain_rows &= c0.rows == 1 && c0.kept == 1;
+            drafted_rows += usize::from(c1.rows > 1);
+            passes.push(c1);
+        }
+        s.select_slot(1)?;
+        let store1 = slot_store(s)?;
+        s.select_slot(0)?;
+        let mut d = fresh_draft(s)?;
+        let (mut plain, _) = off_slot(s, &mut d, windows[0], l)?;
+        for _ in 0..KP_PASSES {
+            let last = *plain.last().ok_or("slot 0 gave no id")?;
+            plain.push(Target::step(s, last, Want::Argmax)?.argmax());
+        }
+        s.select_slot(1)?;
+        let alone = capped_run(s, windows[1], depth, KP_PASSES)?;
+        let off_same = o0 == plain;
+        let drafted_same = o1 == alone.ids && passes == alone.passes && store1 == alone.store;
+        let ok = held == 0 && skips && plain_rows && drafted_rows > 0 && off_same && drafted_same;
+        println!(
+            "(kp-draft) an off slot beside a drafted window, {KP_PASSES} passes of both slots: \
+             slot 0's store {held} after its cut, its draft skipping {skips}, one plain row a \
+             pass {plain_rows}, its ids its plain steps' {off_same}; slot 1 proposed in \
+             {drafted_rows} passes, its ids, kept rows and draft store its window alone's \
+             {drafted_same} {}",
+            verdict(ok)
+        );
+        s.reset()?;
+        Ok(ok)
     }
 
     // ------------------------------------------- (z) two slots in one pass
@@ -5163,13 +5777,18 @@ mod gate {
         tier::sc("(x) a resume of a state without the draft's side is refused")?;
         let (model, x_ok) = resume_refused(model, &inputs, ub, &prompt)?;
         ok &= x_ok;
-        tier::sc("(kp-draft) a prefix restore with the draft = resume then rollback")?;
+        tier::sc("(kp-draft) a cut and a prefix restore to a point keep the draft")?;
         let (model, kp_ok) = prefix_draft(model, &prompt)?;
         ok &= kp_ok;
+        tier::sc("(kp-draft) the store behind the point keeps the draft off")?;
+        let (model, behind_ok) = store_behind(model, &prompt)?;
+        ok &= behind_ok;
         tier::sc("(sl) a save on a lane copies the draft's store rows of the state's positions")?;
         let (model, sl_ok) = lane_save(model, &prompt, draft_kv)?;
         ok &= sl_ok;
         drop(model);
+        tier::sc("(kp-draft) a point inside a long prompt call, cut to and put back as a prefix")?;
+        ok &= long_point(&inputs, &mtp, &prompt)?;
         // Window B diverges from window A from position 0 on: the corpus's
         // deep window read past A's whole length, so no per-sequence state
         // the two share by content can pass for one the slots exchanged.

@@ -239,6 +239,24 @@ impl<A: Copy + Eq + fmt::Debug> Policy<A> {
         self.joined = None;
     }
 
+    /// The target cut back to `pos` (or a state put back as its first `pos`
+    /// positions) where the body kept the draft's store below `pos` and left
+    /// the target's hidden row at `pos - 1` in the step's arena: the state a
+    /// plain step at `pos - 1` leaves, the row at `pos` waiting with a
+    /// placeholder id that the next call's id replaces (as any refresh's last
+    /// row), no skip, and the join a new sequence's.
+    pub(super) fn rejoin(&mut self, pos: u32) {
+        self.next = Some(Refresh {
+            tokens: vec![0],
+            pos0: pos,
+            walk: self.shape.step,
+            first: 0,
+        });
+        self.last_unit = None;
+        self.joined = None;
+        self.skip = None;
+    }
+
     /// Before a plain step of `last` at the target's position `pos`: a
     /// refresh an earlier step or window left waiting reads an arena the step
     /// may overwrite (its own), so it is walked now, its last row `last`. A
@@ -712,6 +730,17 @@ mod tests {
             self.store = self.store.min(pos as usize);
         }
 
+        /// A cut to `pos` the body rejoins the draft at: the target and the
+        /// store back at `pos`, every arena's rows from `pos` on taken back,
+        /// and the step's arena holding the target's row at `pos - 1`.
+        fn rejoin_cut(&mut self, pos: u32) {
+            self.commit(pos, 0);
+            self.arenas[Ar::Step as usize] = Held {
+                first: pos - 1,
+                rows: 1,
+            };
+        }
+
         /// The walks run since the last take.
         fn take(&mut self) -> Vec<Seen> {
             std::mem::take(&mut self.seen)
@@ -1159,6 +1188,68 @@ mod tests {
         let got = rig.p.take_joined().unwrap();
         assert_eq!((got.start, got.skipped), (10, Some(STORE_BEHIND)));
         assert!(rig.p.skipping());
+    }
+
+    /// A cut the body rejoins the draft at, after drafted windows past it:
+    /// a continuing prompt walks the step's row with its first id before its
+    /// own units, joined and drafting on; a first step walks it with the
+    /// step's id; and a draft that skipped drafts again.
+    #[test]
+    fn a_rejoined_draft_walks_the_step_row_with_the_next_id() {
+        let mut rig = after_prompt(64);
+        rig.begin().unwrap();
+        rig.drafted_pass(None).unwrap();
+        rig.drafted_pass(Some(2)).unwrap();
+        rig.c.rejoin_cut(9);
+        rig.p.rejoin(9);
+        rig.c.take();
+        rig.prompt(&[30, 31], 2, Ar::Ubatch).unwrap();
+        assert_eq!(
+            rig.c.take(),
+            [
+                seen(HEAD, 9, &[30], rows_of(Ar::Step, 0)),
+                seen(STORE, 10, &[31], rows_of(Ar::Ubatch, 0)),
+            ]
+        );
+        assert_eq!(
+            rig.p.take_joined(),
+            Some(Join {
+                start: 9,
+                caught_up: 1,
+                skipped: None
+            })
+        );
+        rig.begin().unwrap();
+        rig.drafted_pass(None).unwrap();
+        assert_eq!(
+            rig.c.take(),
+            [seen(HEAD, 11, &[1011], rows_of(Ar::Ubatch, 1))]
+        );
+
+        let mut rig = after_prompt(64);
+        rig.plain_step().unwrap();
+        rig.plain_step().unwrap();
+        rig.c.rejoin_cut(9);
+        rig.p.rejoin(9);
+        rig.c.take();
+        rig.last = 40;
+        rig.plain_step().unwrap();
+        assert_eq!(rig.c.take(), [seen(HEAD, 9, &[40], rows_of(Ar::Step, 0))]);
+        assert_eq!((rig.c.store, rig.c.pos), (10, 10));
+        assert!(rig.p.take_joined().is_none());
+
+        let mut rig = after_prompt(64);
+        rig.plain_step().unwrap();
+        rig.c.store = 5;
+        rig.prompt(&IDS[..2], 2, Ar::Ubatch).unwrap();
+        assert!(rig.p.skipping());
+        rig.c.store = 9;
+        rig.c.rejoin_cut(9);
+        rig.p.rejoin(9);
+        assert!(!rig.p.skipping());
+        rig.c.take();
+        rig.prompt(&[30], 1, Ar::Ubatch).unwrap();
+        assert_eq!(rig.c.take(), [seen(HEAD, 9, &[30], rows_of(Ar::Step, 0))]);
     }
 
     /// The chain takes the refresh with its last row the token at the

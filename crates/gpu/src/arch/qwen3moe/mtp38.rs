@@ -829,12 +829,15 @@ impl Held38 {
 /// positions they hold ([`Held38`]) — the target's hidden rows a draft's
 /// waiting rows read when it rejoins the sequence. The ubatch walk's rows
 /// are not carried: after a resume that arena holds no position, and a walk
-/// that names it is refused.
+/// that names it is refused. Beside them, for each point the state carries
+/// that has one, the target's hidden row at the position before the point:
+/// a put-back as the point's prefix rejoins the draft there.
 #[derive(Clone, Debug)]
 pub struct DraftRows38 {
     pub(super) held: u32,
     pub(super) step: (Held38, Vec<f32>),
     pub(super) pass: (Held38, Vec<f32>),
+    pub(super) point_rows: Vec<(u32, Vec<f32>)>,
 }
 
 impl DraftRows38 {
@@ -842,6 +845,7 @@ impl DraftRows38 {
     #[must_use]
     pub fn bytes(&self) -> usize {
         (self.step.1.len() + self.pass.1.len()) * size_of::<f32>()
+            + self.point_rows.iter().map(|(_, r)| r.len()).sum::<usize>() * size_of::<f32>()
     }
 }
 

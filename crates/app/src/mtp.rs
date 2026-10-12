@@ -42,7 +42,8 @@
 //! When no such rows
 //! wait, or the store does not hold the positions below them, the draft
 //! skips: it proposes nothing, every pass a plain step, until a prompt call
-//! from position 0 or a restart; the call's [`Join`] names why.
+//! from position 0, a restart or a rejoin ([`MtpDraft::rejoin`]); the call's
+//! [`Join`] names why.
 //!
 //! Every decision of those calls — which rows wait, which walks a call runs
 //! and in which mode, the join checks, the refusals, what a park keeps — is
@@ -571,6 +572,20 @@ impl<B: MtpBody> MtpDraft<B> {
     /// [`Join`] naming it.
     pub fn unpark(&mut self, p: &Parked<B::Arena>) {
         self.policy.unpark(p);
+        if let Some(w) = &mut self.windows {
+            w.pending = None;
+        }
+    }
+
+    /// The target cut back to `pos`, or a state put back as its first `pos`
+    /// positions, where the body rejoined the draft to the sequence: its
+    /// store holds every position below `pos` and the step's arena
+    /// ([`MtpBody::STEP_ARENA`]) the target's hidden row at `pos - 1`. The
+    /// next call walks that row with the id it feeds at `pos` and drafts on,
+    /// as after a plain step at `pos - 1`; nothing is skipped, and the next
+    /// [`Join`] is the first since.
+    pub fn rejoin(&mut self, pos: u32) {
+        self.policy.rejoin(pos);
         if let Some(w) = &mut self.windows {
             w.pending = None;
         }
