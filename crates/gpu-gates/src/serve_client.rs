@@ -1,11 +1,11 @@
 //! The HTTP side of the binaries that drive a server (`gate_ds41_serve`,
 //! `soak_ds41_serve` on `bloomery-serve-ds41`, `gate_qwen3_serve`,
-//! `gate_glm5next_serve` and `gate_mimo2_serve` on `bloomery-serve`): the
-//! server started beside the calling binary and killed by its handle on every
-//! way out, its address read from its stderr, one request through curl, a
-//! `/metrics` value, the server's stderr read by its binary's record kinds
-//! ([`server_log`]), and the requests the seat gates share: the chat turn's
-//! ids ([`rendered`], [`tokenized`]), a greedy completion ([`greedy`]), the
+//! `gate_glm5next_serve`, `gate_mimo2_serve` and `gate_serve_start` on
+//! `bloomery-serve`): the server started beside the calling binary and killed
+//! by its handle on every way out, its address read from its stderr, one
+//! request through curl, a `/metrics` value, the server's stderr read by its
+//! binary's record kinds ([`server_log`]), and the requests the seat gates
+//! share: the chat turn's ids ([`rendered`], [`tokenized`]), a greedy completion ([`greedy`]), the
 //! chat answer held to a completion's ids ([`chat_is_those_ids`]), an image
 //! file held to its digest and sent as base64 ([`sha256`], [`base64`]) and the
 //! prefix clauses of a seat that keeps a shared prefix
