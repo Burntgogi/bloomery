@@ -2,7 +2,7 @@ place unset place=a why=one card
 residency lever residency=mid-p3-s1 why=shrunk
 parallel rule=slots slots=2 slot_ctx=16384 total=32768 from=default pass=one
 plan place=a card=A6000 ctx_max=32768 card_experts=2668 (44750684160 B) host_experts=12692 (214016901120 B) host_shadow=1342177280 B n_l=70..71 on 38 layers card_budget=none paged=0 arena=0 arena_slots=0 room=263376371712 plan_room=263376371712 card_free=50668240896 devices=[stage:A6000:cuda0:50952404992] cuda_order=unset(FASTEST_FIRST)
-residency host residency=mid-p3-s1 pinned=3 churn_experts=2554 churn_bytes=42838548480 headroom=43437910016 headroom_after=599361536
+residency host residency=mid-p3-s1 hosted=hosted pinned=3 churn_experts=2554 churn_bytes=42838548480 headroom=43437910016 headroom_after=599361536
 cache ram=8589934592 headroom=43437910016 user_start=<|User|> in_template=true
 lane card=A6000 bytes=268435456 gbs_median=24.61 gbs_min=24.02 pinned=true
 load resident_bytes=48318382080 ctx=16384 layers=43 top_k=6 shadow=host 1342177280 unified_addressing=1 prefill=batch mode=graph place=a pin_main=on pinned=true in 41.2 s (runtime value)

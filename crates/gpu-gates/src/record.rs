@@ -4831,7 +4831,7 @@ mod tests {
         layers card_budget=none paged=0 arena=0 arena_slots=0 card_free=50668240896 \
         devices=[stage:A6000:cuda1:50952404992,tier0:3090:cuda0:25350373376] \
         cuda_order=unset(FASTEST_FIRST)";
-    const RESIDENCY_HOST_GLM: &str = "residency host residency=mid-p0-s1 pinned=0 \
+    const RESIDENCY_HOST_GLM: &str = "residency host residency=mid-p0-s1 hosted=hosted pinned=0 \
         churn_experts=2552 churn_bytes=38801506304 headroom=111730458624 \
         headroom_after=68550098944";
     const LOAD_QWEN3_LINE: &str = "load arch=qwen3moe resident_bytes=24165631476 cache=f16 \

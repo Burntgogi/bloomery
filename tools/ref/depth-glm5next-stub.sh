@@ -388,7 +388,7 @@ echo "draft=${BLOOMERY_DRAFT:-none} residency=${BLOOMERY_RESIDENCY:-none} depth=
 rp() { [ -z "${BLOOMERY_RESIDENCY:-}" ] || echo "residency pass pass=$1 boundary=$2 kept=$3 landed=$4 late=0 made=$4 in_flight=0 bytes=$5 end_us=1 boundary_us=2 wait_us=0 issue_us=1 stage_us=0 prepare_us=0"; }
 [ -z "${BLOOMERY_RESIDENCY:-}" ] || [ -n "${STUB_GEN_NORESLEVER:-}" ] || echo "residency lever residency=$BLOOMERY_RESIDENCY why=set"
 echo "plan place=$place card=A6000 ctx_max=2048 card_experts=2627 (39941832704 B) host_experts=9469 (145536581632 B) host_shadow=0 B n_l=67..68 on 39 layers card_budget=none"
-[ -z "${BLOOMERY_RESIDENCY:-}" ] || echo "residency host residency=$BLOOMERY_RESIDENCY pinned=0 churn_experts=8 churn_bytes=4096 headroom=65536 headroom_after=61440"
+[ -z "${BLOOMERY_RESIDENCY:-}" ] || echo "residency host residency=$BLOOMERY_RESIDENCY hosted=hosted pinned=0 churn_experts=8 churn_bytes=4096 headroom=65536 headroom_after=61440"
 cards=''
 if [ -n "${STUB_GEN_CARDS_ON:-}" ]; then
   case $place in

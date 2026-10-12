@@ -400,7 +400,7 @@ elif [ "${STUB_RES_UNSET:-off}" = place ]; then
 else
   res=off
 fi
-[ "$res" = off ] || echo "residency host residency=$res pinned=40 churn_experts=8 churn_bytes=4096 headroom=65536 headroom_after=61440"
+[ "$res" = off ] || echo "residency host residency=$res hosted=hosted pinned=40 churn_experts=8 churn_bytes=4096 headroom=65536 headroom_after=61440"
 [ -z "${STUB_RES_WARM:-}" ] || b=1
 for k in "${!arms[@]}"; do
   a=${arms[$k]} feed=lcg
