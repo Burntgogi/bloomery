@@ -4,6 +4,7 @@
     tools/ref/window-union.py <set> [<set>...] --n-l <spec> [--k 2,3,4,6]
                               [--ranges 0-1,2-9,10-19,20-29,30-39]
                               [--policy static|strata [--rule R] [--expert-bytes B --step-ms S [--gbps 26.28]]]
+                              [--payload FILE] [--json FILE]
     tools/ref/window-union.py --self-test
 
 Each <set> is a router_trace directory (tools/ref/router-coverage.py's docstring has the format); a set
@@ -39,9 +40,18 @@ Per set and k:
     slots    mean host slots per row (Σ_l over one row) and mean union per window
 
 then, per layer range, the pooled ratio per k. The last block (`all`) pools every set's windows.
+
+--payload reads router-coverage's named bytes_by_layer profile and adds byte-weighted host payload
+totals. These count one copy per union member, compared with one per selected host slot. They do not
+model a RAM cache, native arena padding, sector alignment, speculative acceptance or measured IO.
+--json writes per-set and per-layer counts and ratios; undefined ratios are null. The existing text
+and residency replay are unchanged when --payload is absent. Its profile is separate from the scalar
+--expert-bytes that prices the strata copy link.
 """
 import importlib.util
 import io
+import json
+import math
 import os
 import sys
 import tempfile
@@ -201,7 +211,33 @@ def summary(win_k):
     }
 
 
-def report(set_dirs, spec, ks, ranges, policy=None):
+def payload_summary(per_layer, sizes, windows):
+    """Weight each layer's union and repeated slots by the declared layout, without pricing IO."""
+    missing = sorted(set(per_layer) - set(sizes))
+    if missing:
+        raise rc.SetError(f"payload profile has no bytes for layers {missing}")
+    if any(not isinstance(v, int) or isinstance(v, bool) or v <= 0 for v in sizes.values()):
+        raise rc.SetError("payload bytes must be positive integers")
+    union = sum(u * sizes[l] for l, (u, _) in per_layer.items())
+    slots = sum(sl * sizes[l] for l, (_, sl) in per_layer.items())
+    return dict(union_bytes=union, slot_bytes=slots, saved_bytes=slots - union,
+                pooled=union / slots if slots else None,
+                union_bytes_per_window=union / windows if windows else None,
+                slot_bytes_per_window=slots / windows if windows else None)
+
+
+def json_finite(value):
+    """JSON has no NaN: an undefined statistic stays undefined rather than becoming a zero."""
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if isinstance(value, dict):
+        return {k: json_finite(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_finite(v) for v in value]
+    return value
+
+
+def report(set_dirs, spec, ks, ranges, policy=None, payload=None):
     """policy None is static; strata is dict(rule=<preset>, link=None or dict(expert_bytes, step_ms, gbps))."""
     sets = [rc.read_manifest(d) for d in set_dirs]
     ranges = [parse_range(r) for r in ranges.split(",")]
@@ -215,6 +251,10 @@ def report(set_dirs, spec, ks, ranges, policy=None):
     pooled_all = {k: ([], []) for k in ks}
     layers_all = {k: {} for k in ks}
     slots_all = {}
+    data = dict(placement=spec, policy=policy or dict(rule="static"), sets=[])
+    if payload is not None:
+        sizes, source = payload
+        data["payload_source"] = source
     for s in sets:
         n_l = parse_n_l(spec, s["layers"])
         card = card_sets(s["layers"], n_l, s["n_expert"])
@@ -229,6 +269,10 @@ def report(set_dirs, spec, ks, ranges, policy=None):
             on_card = strata_on_card(s, n_l, policy["rule"], policy["link"])
         win, per_layer, row_slots = measure(s, card if on_card is None else {l: set() for l in s["layers"]}, ks,
                                             on_card)
+        result = dict(directory=s["dir"], header=s["header"], tokens=s["tokens"],
+                      chunk=int(s["header"].get("chunk", s["tokens"])) or s["tokens"],
+                      card_by_layer=n_l, host_slots_per_row=sum(row_slots.values()), rows=[])
+        data["sets"].append(result)
         print(f"host slots per row {sum(row_slots.values()):.1f} of {len(s['layers']) * s['n_used']}")
         print("k\twindows\tpredict\tmean\tp10\tp90\tpooled\tunion/window\tslots/window")
         for k in ks:
@@ -238,8 +282,21 @@ def report(set_dirs, spec, ks, ranges, policy=None):
                 pu += u
                 ps += sl
             m = summary(win[k])
-            print(f"{k}\t{m['windows']}\t{pu / ps:.3f}\t{m['mean']:.3f}\t{m['p10']:.3f}\t{m['p90']:.3f}\t"
-                  f"{m['pooled']:.3f}\t{m['union']:.1f}\t{sum(win[k][1]) / len(win[k][1]):.1f}")
+            expected = pu / ps if ps else float("nan")
+            slots = sum(win[k][1]) / len(win[k][1]) if win[k][1] else float("nan")
+            print(f"{k}\t{m['windows']}\t{expected:.3f}\t{m['mean']:.3f}\t{m['p10']:.3f}\t{m['p90']:.3f}\t"
+                  f"{m['pooled']:.3f}\t{m['union']:.1f}\t{slots:.1f}")
+            row = dict(k=k, **m, predict=expected, slots=slots,
+                       per_layer={l: dict(union=u, slots=sl) for l, (u, sl) in per_layer[k].items()})
+            if payload is not None:
+                row["payload"] = payload_summary(per_layer[k], sizes, m["windows"])
+                p = row["payload"]
+                for l, counts_l in row["per_layer"].items():
+                    counts_l.update(expert_bytes=sizes[l], union_bytes=counts_l["union"] * sizes[l],
+                                    slot_bytes=counts_l["slots"] * sizes[l])
+                print(f"payload k={k} union_bytes={p['union_bytes']} slot_bytes={p['slot_bytes']} "
+                      f"saved_bytes={p['saved_bytes']} pooled={p['pooled']}")
+            result["rows"].append(row)
             pooled_all[k][0].extend(win[k][0])
             pooled_all[k][1].extend(win[k][1])
             for l, (u, sl) in per_layer[k].items():
@@ -257,6 +314,7 @@ def report(set_dirs, spec, ks, ranges, policy=None):
             print(f"{k}\t{m['windows']}\t{m['mean']:.3f}\t{m['p10']:.3f}\t{m['p90']:.3f}\t{m['pooled']:.3f}")
         mean_slots = {l: sum(v) / len(v) for l, v in slots_all.items()}
         print_ranges({k: {l: tuple(v) for l, v in layers_all[k].items()} for k in ks}, mean_slots, ks, ranges)
+    return json_finite(data)
 
 
 def print_ranges(per_layer, row_slots, ks, ranges):
@@ -275,6 +333,7 @@ def main(argv):
     if argv == ["--self-test"]:
         return self_test()
     sets, spec, ks, ranges, policy, rule = [], None, DEFAULT_K, DEFAULT_RANGES, "static", None
+    payload_path = json_path = None
     link = {"expert_bytes": None, "step_ms": None, "gbps": 26.28}
     gbps_set = False
     it = iter(argv)
@@ -294,6 +353,10 @@ def main(argv):
             ks = tuple(int(x) for x in next(it).split(","))
         elif a == "--ranges":
             ranges = next(it)
+        elif a == "--payload":
+            payload_path = next(it)
+        elif a == "--json":
+            json_path = next(it)
         elif a.startswith("-"):
             sys.exit(f"unknown flag {a}")
         else:
@@ -318,8 +381,13 @@ def main(argv):
             sys.exit("window-union: --expert-bytes, --step-ms and --gbps price the strata policy's copies; "
                      "--policy static moves none")
     try:
-        report(sets, spec, ks, ranges, strata)
-    except rc.SetError as e:
+        payload = rc.read_expert_bytes(payload_path) if payload_path is not None else None
+        data = report(sets, spec, ks, ranges, strata, payload)
+        if json_path is not None:
+            with open(json_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, allow_nan=False)
+                f.write("\n")
+    except (rc.SetError, OSError) as e:
         sys.exit(f"window-union: {e}")
     return 0
 
@@ -436,6 +504,28 @@ def self_test():
         with redirect_stdout(buf):
             report([rows037["dir"]], "0:1", (2,), "0-0", dict(rule="mid", link=None))
         assert "host slots per row 1.6 of 2" in buf.getvalue(), buf.getvalue()
+        # Unequal layer sizes: sharing in the larger layer changes the byte ratio, not the count ratio.
+        mixed = rc.read_manifest(_fake_set(root, "mixed", {0: [(1, 2)] * 4,
+                                1: [(2 * t, 2 * t + 1) for t in range(4)]}, E, K, chunk=2))
+        counts = measure(mixed, {0: set(), 1: set()}, (1, 2))[1]
+        assert payload_summary(counts[1], {0: 10, 1: 1}, 4)["pooled"] == 1
+        p = payload_summary(counts[2], {0: 10, 1: 1}, 2)
+        assert p == dict(union_bytes=48, slot_bytes=88, saved_bytes=40, pooled=48 / 88,
+                         union_bytes_per_window=24, slot_bytes_per_window=44), p
+        try:
+            payload_summary(counts[2], {0: 10}, 2)
+            raise AssertionError("missing layer payload accepted")
+        except rc.SetError:
+            pass
+        with redirect_stdout(io.StringIO()):
+            data = report([mixed["dir"]], "0-1:0", (1, 2), "0-1", payload=({0: 10, 1: 1}, "fixture"))
+        assert data["sets"][0]["rows"][1]["payload"] == p
+        assert data["sets"][0]["rows"][1]["windows"] == 2
+        with redirect_stdout(io.StringIO()):
+            empty = report([mixed["dir"]], "0-1:16", (1, 8), "0-1", payload=({0: 10, 1: 1}, "fixture"))
+        assert empty["sets"][0]["rows"][0]["payload"]["pooled"] is None
+        assert empty["sets"][0]["rows"][1]["windows"] == 0
+        json.dumps(empty, allow_nan=False)
     print("window-union: self-test ok")
     return 0
 
