@@ -24,7 +24,7 @@
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
 
-use super::{Adapter, Arm, Outcome, probed, refused_of, view_of};
+use super::{Adapter, Arm, Outcome, Refusal, probed, refused_of, view_of};
 use bloomery_gpu_gates::bind::{SlotsFrom, default_slots_fit};
 use bloomery_gpu_gates::generate::{CTX_GRAN, trained_ctx};
 use bloomery_gpu_mimo2::swap;
@@ -160,11 +160,17 @@ fn plan_of<'a>(
 }
 
 /// A plan refusal as an outcome: the placement's own are named by
-/// [`refused_of`]; a tier card, a context of no position or an invariant
-/// break is red.
+/// [`refused_of`], a room that pages experts to the NVMe tier the body does
+/// not serve is named here; a tier card, a context of no position or an
+/// invariant break is red.
 fn place_of(p: &PlaceError) -> Outcome {
     match p {
         PlaceError::Placement(e) => refused_of(e),
+        PlaceError::NoNvmeTier { .. } => Outcome::Refused(Refusal {
+            kind: "no-nvme-tier",
+            floor: None,
+            text: p.to_string(),
+        }),
         PlaceError::Tier { .. } | PlaceError::Broken(_) | PlaceError::CtxZero => {
             Outcome::Red(p.to_string())
         }
