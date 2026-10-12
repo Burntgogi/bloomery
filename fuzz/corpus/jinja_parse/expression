@@ -1,0 +1,1 @@
+{{ [1, -2, 3.5][0:2] }}{% if value is mapping %}{{ value.items() }}{% endif %}

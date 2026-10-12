@@ -1,0 +1,1 @@
+{% macro f(x) %}{{ x | tojson(ensure_ascii=False) }}{% endmacro %}{{ f(value) }}

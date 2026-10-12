@@ -1,0 +1,5 @@
+<tool_call>
+<function=f>
+<parameter=n>not JSON</parameter>
+</function>
+</tool_call>

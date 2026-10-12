@@ -266,7 +266,7 @@ fn find_close(src: &str, from: usize, close: &str) -> Option<usize> {
             None => {
                 if c == b'\'' || c == b'"' {
                     quote = Some(c);
-                } else if src[i..].starts_with(close) {
+                } else if b[i..].starts_with(close.as_bytes()) {
                     return Some(i);
                 }
             }
@@ -2649,6 +2649,19 @@ mod tests {
         );
         assert_eq!(render("  {% if true %}x{% endif %}", json!({})), "x");
         assert_eq!(render("{{ 'a' }} {{ 'b' }}", json!({})), "a b");
+    }
+
+    #[test]
+    fn tag_closers_scan_unicode_without_slicing_inside_a_character() {
+        for close in ["}}", "%}", "#}"] {
+            let source = format!("한🙂 '{close}' \"{close}\" \\\u{00e9}{close}");
+            assert_eq!(find_close(&source, 0, close), Some(source.len() - 2));
+        }
+        for source in ["{{한", "{%🙂", "{#é", "{{\\한"] {
+            let error = ChatTemplate::parse(source).err().expect("unclosed tag");
+            assert!(error.0.contains("unclosed"), "{source}: {error}");
+        }
+        assert_eq!(render("{{ '한🙂' }}{# 한🙂 #}", json!({})), "한🙂");
     }
 
     #[test]

@@ -1,0 +1,59 @@
+[package]
+name = "bloomery-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+jinja = { package = "bloomery-jinja", path = "../crates/jinja" }
+serve = { package = "bloomery-serve", path = "../crates/serve" }
+serde_json = { version = "=1.0.151", features = ["preserve_order"] }
+
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "jinja_parse"
+path = "fuzz_targets/jinja_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "jinja_render"
+path = "fuzz_targets/jinja_render.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "glmxml"
+path = "fuzz_targets/glmxml.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "qwenxml"
+path = "fuzz_targets/qwenxml.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dsml"
+path = "fuzz_targets/dsml.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "hermes"
+path = "fuzz_targets/hermes.rs"
+test = false
+doc = false
+bench = false
