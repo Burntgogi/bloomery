@@ -5581,10 +5581,15 @@ mod gate {
     /// above. Such a block's input reaches the stream through the gate and
     /// up (2.64 · 12 = 31.68) and its SwiGLU rows through the down (12):
     /// 43.68, for a dense block in place of its 3.64 and for a routed
-    /// layer's shared expert in place of its 0. A file of q8_0 blocks has no
-    /// such site, so its bands are the ones above; the GLM fixture's
-    /// glmffnkq variant (2 dense blocks and 4 shared experts of Q6_K gate·up
-    /// and Q5_K down) has the head at q·√(4·4.1875 + 2·3 + 6·43.68) = 0.217.
+    /// layer's shared expert in place of its 0. It is a bound at the largest
+    /// crest, far above what the mechanism adds at the fixture's crests. The
+    /// routed experts' stacks (K-quants in every GLM file, the fixture's
+    /// included) read q8_1 blocks of 128 on both arms too and are not
+    /// counted: a routed block stays at its 0 above, so a file whose dense
+    /// blocks and shared experts are q8_0 keeps the bands above. The GLM
+    /// fixture's glmffnkq variant (2 dense blocks and 4 shared experts of
+    /// Q6_K gate·up and Q5_K down) has the head at
+    /// q·√(4·4.1875 + 2·3 + 6·43.68) = 0.217.
     fn gemm_bands(kinds: &[Layer], wide: &[[bool; 2]]) -> Bands {
         let q = q8_32_rel();
         let mut c = 0.0f64;
