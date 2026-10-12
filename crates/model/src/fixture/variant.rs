@@ -232,8 +232,10 @@ fn row_bytes(ty: GgmlType, dims: &[u64]) -> Option<u64> {
 ///
 /// # Errors
 /// The source is of another architecture than the row's family; a role no tensor of the scope has; a
-/// tensor already at the type the map gives it (a row that changes nothing is a mistake); a tensor the
-/// type cannot hold (its rows are not whole blocks).
+/// role whose every tensor in the scope is already at the type the map gives it (a row that changes
+/// nothing is a mistake); a tensor the type cannot hold (its rows are not whole blocks). A tensor of a
+/// role already at the map's type, beside others of the role that are not, is left out: the quantizer
+/// copies it as it is, as the source's own mix of types for that role holds it.
 pub fn expand(row: &Row, source: &Split) -> Result<Vec<Retype>, FixtureError> {
     let tag = &row.tag;
     if source.architecture() != Some(row.family.as_str()) {
@@ -259,6 +261,7 @@ pub fn expand(row: &Row, source: &Split) -> Result<Vec<Retype>, FixtureError> {
     for (role, to) in &row.map {
         let want = format!("{role}.weight");
         let mut found = 0usize;
+        let mut already = Vec::new();
         for (_, t) in source.iter_tensors() {
             let Some((layer, rest)) = layer_of(&t.name) else {
                 continue;
@@ -268,13 +271,8 @@ pub fn expand(row: &Row, source: &Split) -> Result<Vec<Retype>, FixtureError> {
             }
             found += 1;
             if t.ty == *to {
-                return Err(err(
-                    tag,
-                    format!(
-                        "tensor {}: the source is already {to}, the map changes nothing",
-                        t.name
-                    ),
-                ));
+                already.push(t.name.as_str());
+                continue;
             }
             if row_bytes(*to, &t.dims).is_none() {
                 return Err(err(
@@ -298,6 +296,16 @@ pub fn expand(row: &Row, source: &Split) -> Result<Vec<Retype>, FixtureError> {
                     "the map names {role}, and the source has no blk.<L>.{want} in scope {:?} \
                      (the NextN layers are {nextn:?})",
                     row.scope
+                ),
+            ));
+        }
+        if already.len() == found {
+            return Err(err(
+                tag,
+                format!(
+                    "the source holds every blk.<L>.{want} in scope already at {to} ({}), the map \
+                     changes nothing",
+                    already.join(", ")
                 ),
             ));
         }

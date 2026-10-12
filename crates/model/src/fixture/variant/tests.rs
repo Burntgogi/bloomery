@@ -301,7 +301,10 @@ fn a_map_that_bites_nothing_is_refused() {
     );
     red(
         expand(&with(&[("ffn_gate_exps", GgmlType::Q4_K)]), &src),
-        &[&tn(1, "ffn_gate_exps"), "already q4_K"],
+        &[
+            &format!("{}, {}", tn(1, "ffn_gate_exps"), tn(2, "ffn_gate_exps")),
+            "already at q4_K",
+        ],
     );
     red(
         expand(&with(&[("attn_q", GgmlType::IQ3_S)]), &src),
@@ -328,6 +331,36 @@ fn a_map_that_bites_nothing_is_refused() {
     red(
         expand(&the_row(), &carried),
         &[KEY_VARIANT, "the family's own fixture"],
+    );
+}
+
+/// A tensor already at the map's type, beside another of its role that is not, is left out of the
+/// expansion; the quantizer's argument keeps it at its own type.
+#[test]
+fn a_tensor_already_at_the_type_is_left_out() {
+    let d = Dir::new();
+    let mut tensors = source_tensors();
+    let two = tn(2, "ffn_down_exps");
+    let at = tensors
+        .iter()
+        .position(|t| t.name == two)
+        .expect("layer 2's down");
+    tensors[at] = t(two.clone(), &[256, 2, 3], GgmlType::IQ4_XS, 1, 8);
+    let src = open(&write(&d.0, "s", &source_kvs(), &tensors, 1));
+    let got = expand(&the_row(), &src).expect("an expansion");
+    let names: Vec<&str> = got.iter().map(|r| r.name.as_str()).collect();
+    assert!(
+        names.contains(&tn(1, "ffn_down_exps").as_str()),
+        "layer 1's down is retyped"
+    );
+    assert!(
+        !names.contains(&two.as_str()),
+        "layer 2's down is already iq4_xs: {names:?}"
+    );
+    let arg = custom_q("v1", &src, &got).expect("an argument");
+    assert!(
+        arg.contains(&format!("^{}$=iq4_xs", two.replace('.', "\\."))),
+        "layer 2's down at its own type in {arg}"
     );
 }
 
