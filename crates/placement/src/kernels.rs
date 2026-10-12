@@ -276,6 +276,7 @@ pub const fn gate_up(ty: GgmlType) -> Option<GateUpEntry> {
         | GgmlType::IQ1_M
         | GgmlType::TQ1_0
         | GgmlType::TQ2_0
+        | GgmlType::Q2_0
         | GgmlType::Unknown(_) => None,
     }
 }
@@ -313,6 +314,7 @@ pub const fn down(ty: GgmlType) -> Option<(DownEntry, DownAct)> {
         | GgmlType::IQ1_M
         | GgmlType::TQ1_0
         | GgmlType::TQ2_0
+        | GgmlType::Q2_0
         | GgmlType::Unknown(_) => None,
     }
 }
@@ -349,6 +351,7 @@ pub const fn gemm(ty: GgmlType) -> Option<GemmEntry> {
         | GgmlType::IQ1_M
         | GgmlType::TQ1_0
         | GgmlType::TQ2_0
+        | GgmlType::Q2_0
         | GgmlType::Unknown(_) => None,
     }
 }
@@ -385,6 +388,7 @@ pub const fn dense(ty: GgmlType) -> Option<SiteEntry> {
         | GgmlType::IQ1_M
         | GgmlType::TQ1_0
         | GgmlType::TQ2_0
+        | GgmlType::Q2_0
         | GgmlType::Unknown(_) => None,
     }
 }
@@ -421,6 +425,7 @@ pub const fn head(ty: GgmlType) -> Option<HeadEntry> {
         | GgmlType::IQ1_M
         | GgmlType::TQ1_0
         | GgmlType::TQ2_0
+        | GgmlType::Q2_0
         | GgmlType::Unknown(_) => None,
     }
 }
@@ -457,6 +462,7 @@ pub const fn embed(ty: GgmlType) -> Option<EmbedEntry> {
         | GgmlType::IQ1_M
         | GgmlType::TQ1_0
         | GgmlType::TQ2_0
+        | GgmlType::Q2_0
         | GgmlType::Unknown(_) => None,
     }
 }
@@ -527,7 +533,7 @@ mod tests {
 
     /// Every `GgmlType` variant in declaration order, then one id the enum
     /// does not name.
-    const ALL: [GgmlType; 29] = [
+    const ALL: [GgmlType; 30] = [
         GgmlType::F32,
         GgmlType::F16,
         GgmlType::Q5_0,
@@ -556,6 +562,7 @@ mod tests {
         GgmlType::IQ1_M,
         GgmlType::TQ1_0,
         GgmlType::TQ2_0,
+        GgmlType::Q2_0,
         GgmlType::Unknown(99),
     ];
 
@@ -591,7 +598,8 @@ mod tests {
             GgmlType::IQ1_M => 25,
             GgmlType::TQ1_0 => 26,
             GgmlType::TQ2_0 => 27,
-            GgmlType::Unknown(_) => 28,
+            GgmlType::Q2_0 => 28,
+            GgmlType::Unknown(_) => 29,
         }
     }
 

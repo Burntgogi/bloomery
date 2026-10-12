@@ -167,23 +167,30 @@ fn inventory_reports_none_for_types_outside_the_table() {
     assert_eq!(inv.tensors[0].nbytes, None);
 }
 
-/// Both paths share one parser, so a type both accept (Q5_0) yields the
-/// same name, dims, type, offset and byte count from either entry point.
+/// Both paths share one parser, so a type both accept (Q5_0, and Q2_0, mainline
+/// ggml's id 42) yields the same name, dims, type, offset and byte count from
+/// either entry point.
 #[test]
 fn inventory_agrees_with_the_strict_reader_on_supported_types() {
-    let p = tmp("q5_0.gguf");
-    // dims 64x3: two 22-byte blocks per row, three rows = 132.
-    write_gguf(&p, &[("blk.0.ffn_down.weight", &[64, 3], 6)], 132);
+    // dims 64x3: two 22-byte Q5_0 blocks per row, three rows = 132; dims
+    // 128x3: two 18-byte Q2_0 blocks per row, three rows = 108.
+    for (file, dims, ty, bytes) in [
+        ("q5_0.gguf", [64, 3], 6, 132),
+        ("q2_0.gguf", [128, 3], 42, 108),
+    ] {
+        let p = tmp(file);
+        write_gguf(&p, &[("blk.0.ffn_down.weight", &dims, ty)], bytes);
 
-    let inv = inventory_of(&p).expect("inventory");
-    let g = Gguf::open(&p).expect("strict open of a supported type");
-    assert_eq!(inv.tensors.len(), g.tensor_count());
-    let t = &inv.tensors[0];
-    let s = g.tensor(0).unwrap();
-    assert_eq!(t.name, s.name);
-    assert_eq!(t.dims, s.dims);
-    assert_eq!(t.type_id, s.ty.as_u32());
-    assert_eq!(t.offset, s.offset);
-    assert_eq!(t.nbytes, Some(s.nbytes));
-    assert_eq!(t.nbytes, Some(132));
+        let inv = inventory_of(&p).expect("inventory");
+        let g = Gguf::open(&p).unwrap_or_else(|e| panic!("strict open of a supported type: {e}"));
+        assert_eq!(inv.tensors.len(), g.tensor_count());
+        let t = &inv.tensors[0];
+        let s = g.tensor(0).unwrap();
+        assert_eq!(t.name, s.name);
+        assert_eq!(t.dims, s.dims);
+        assert_eq!(t.type_id, s.ty.as_u32());
+        assert_eq!(t.offset, s.offset);
+        assert_eq!(t.nbytes, Some(s.nbytes));
+        assert_eq!(t.nbytes, Some(bytes as u64));
+    }
 }

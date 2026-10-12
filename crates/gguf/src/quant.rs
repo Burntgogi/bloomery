@@ -24,6 +24,9 @@
 //! multiply, a power of two times an int8 of magnitude at most 12, is exact
 //! (the subnormal scales included), so no fusion question arises.
 //!
+//! Q2_0 is mainline ggml's alone (ik has no Q2_0): its decode ports
+//! llama.cpp's `dequantize_row_q2_0`, whose one product is exact.
+//!
 //! Q2_K, IQ2_XS, IQ3_XXS, IQ3_S, IQ4_NL and IQ4_XS are ports of the same-named
 //! functions in that file, whose bodies are identical in mainline ggml. None has a product
 //! that rounds, so the order of their multiplies does not decide the bits:
@@ -50,7 +53,8 @@ use crate::iq_tables::{
 ///
 /// TQ1_0=34 and TQ2_0=35 are mainline ggml's (llama.cpp `930e2fa59`,
 /// ggml.h:424-425); the ik tree leaves 34 and 35 unassigned, so no id means
-/// two things.
+/// two things. Q2_0=42 is mainline's too (llama.cpp `f2cc7282c`, ggml.h:432);
+/// ik has no Q2_0.
 ///
 /// A named type is one this build can size ([`GgmlType::blck_size`],
 /// [`GgmlType::type_size`]); whether it can decode it is a separate question
@@ -92,6 +96,7 @@ pub enum GgmlType {
     IQ1_M,
     TQ1_0,
     TQ2_0,
+    Q2_0,
     Unknown(u32),
 }
 
@@ -127,6 +132,7 @@ impl GgmlType {
             34 => GgmlType::TQ1_0,
             35 => GgmlType::TQ2_0,
             39 => GgmlType::MXFP4,
+            42 => GgmlType::Q2_0,
             other => GgmlType::Unknown(other),
         }
     }
@@ -161,6 +167,7 @@ impl GgmlType {
             GgmlType::TQ1_0 => 34,
             GgmlType::TQ2_0 => 35,
             GgmlType::MXFP4 => 39,
+            GgmlType::Q2_0 => 42,
             GgmlType::Unknown(v) => v,
         }
     }
@@ -168,7 +175,8 @@ impl GgmlType {
     /// `ggml_type_name` string (type_traits table, ggml.c:620 — entries at
     /// ggml.c:657/667/756/777/819/912/938/998/1485, mxfp4 at ggml.c:1307;
     /// i8…f64 at ggml.c:621-649, the i-quants at ggml.c:1055-1293; tq1_0 and
-    /// tq2_0 from mainline's table, llama.cpp ggml.c:912/920).
+    /// tq2_0 from mainline's table, llama.cpp ggml.c:912/920, and q2_0 from
+    /// `f2cc7282c`'s, ggml.c:685).
     /// Used to name the oracle
     /// dumps `$BLOOMERY_DATA/ref/<name>.raw`.
     pub fn name(self) -> Option<&'static str> {
@@ -201,6 +209,7 @@ impl GgmlType {
             GgmlType::IQ1_M => Some("iq1_m"),
             GgmlType::TQ1_0 => Some("tq1_0"),
             GgmlType::TQ2_0 => Some("tq2_0"),
+            GgmlType::Q2_0 => Some("q2_0"),
             GgmlType::Unknown(_) => None,
         }
     }
@@ -212,7 +221,8 @@ impl GgmlType {
     /// MXFP4 = QK_MXFP4 = 32 (ggml.c:1308, ggml-common.h:182); the integer
     /// types and F64 = 1 (ggml.c:621-649), IQ4_NL = QK4_NL = 32 (ggml.c:1276),
     /// the other i-quants and TQ1_0/TQ2_0 = QK_K = 256 (ggml.c:1055-1293,
-    /// mainline ggml.c:912/920).
+    /// mainline ggml.c:912/920), Q2_0 = QK2_0 = 64 (mainline `f2cc7282c`
+    /// ggml.c:687, ggml-common.h:187).
     ///
     /// This match is the single owner of those numbers for the Rust side.
     pub fn blck_size(self) -> Option<u64> {
@@ -245,6 +255,7 @@ impl GgmlType {
             | GgmlType::IQ1_M
             | GgmlType::TQ1_0
             | GgmlType::TQ2_0 => Some(256),
+            GgmlType::Q2_0 => Some(64),
             GgmlType::Unknown(_) => None,
         }
     }
@@ -265,7 +276,9 @@ impl GgmlType {
     /// = 98 (:492), `block_iq3_s` = 110 (:510), `block_iq1_s` = 50 (:526),
     /// `block_iq1_m` = 56 (:540), `block_iq4_nl` = 18 (:590), `block_iq4_xs` =
     /// 136 (:608), and mainline's `block_tq1_0` = 54 (:281), `block_tq2_0` =
-    /// 66 (:288); I8/I16/I32/I64/F64 are their C scalars, 1/2/4/8/8.
+    /// 66 (:288), `block_q2_0` = 18 (`f2cc7282c` ggml-common.h:188-192: one
+    /// f16 `d`, then 16 bytes of 2-bit codes); I8/I16/I32/I64/F64 are their C
+    /// scalars, 1/2/4/8/8.
     pub fn type_size(self) -> Option<u64> {
         match self {
             GgmlType::F32 => Some(4),
@@ -296,6 +309,7 @@ impl GgmlType {
             GgmlType::IQ1_M => Some(56),
             GgmlType::TQ1_0 => Some(54),
             GgmlType::TQ2_0 => Some(66),
+            GgmlType::Q2_0 => Some(18),
             GgmlType::Unknown(_) => None,
         }
     }
@@ -322,7 +336,8 @@ impl GgmlType {
             | GgmlType::IQ3_XXS
             | GgmlType::IQ3_S
             | GgmlType::IQ4_NL
-            | GgmlType::IQ4_XS => true,
+            | GgmlType::IQ4_XS
+            | GgmlType::Q2_0 => true,
             GgmlType::IQ2_XXS
             | GgmlType::IQ1_S
             | GgmlType::IQ2_S
@@ -432,6 +447,7 @@ pub fn dequant_row(ty: GgmlType, src: &[u8], dst: &mut [f32]) -> Result<(), Quan
         GgmlType::IQ3_S => dequant_iq3_s(&src[..need], dst),
         GgmlType::IQ4_NL => dequant_iq4_nl(&src[..need], dst),
         GgmlType::IQ4_XS => dequant_iq4_xs(&src[..need], dst),
+        GgmlType::Q2_0 => dequant_q2_0(&src[..need], dst),
         GgmlType::IQ2_XXS
         | GgmlType::IQ1_S
         | GgmlType::IQ2_S
@@ -849,6 +865,29 @@ fn dequant_q8_0(src: &[u8], dst: &mut [f32]) {
     }
 }
 
+/// Port of mainline's `dequantize_row_q2_0` (llama.cpp `f2cc7282c`
+/// ggml-quants.c:439; ik has no Q2_0). Block geometry (block_q2_0,
+/// ggml-common.h:187-192, 18 bytes / 64 values): d f16 @0, qs[16] @2.
+///
+/// Value j is bits `2·(j % 4)` and up of `qs[j / 4]`, the low pair first, and
+/// decodes to `(q − 1)·d`: codes 0..3 are −1, 0, +1, +2. An f16 times an
+/// integer of magnitude at most 2 is exact in f32.
+fn dequant_q2_0(src: &[u8], dst: &mut [f32]) {
+    for (blk, out) in src
+        .as_chunks::<18>()
+        .0
+        .iter()
+        .zip(dst.as_chunks_mut::<64>().0)
+    {
+        let d = half_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+        for (&byte, o4) in blk[2..].iter().zip(out.as_chunks_mut::<4>().0) {
+            for (k, o) in o4.iter_mut().enumerate() {
+                *o = (i32::from((byte >> (2 * k)) & 3) - 1) as f32 * d;
+            }
+        }
+    }
+}
+
 /// Port of `ggml_bf16_to_fp32_row` (ggml.c:445): a bf16 is the high half of
 /// an f32 (`ggml_compute_bf16_to_fp32`, ggml-impl.h:89 — the AVX2 path at
 /// ggml.c:457 is the same shift), so the conversion is exact.
@@ -1190,7 +1229,8 @@ pub fn quantize_row_q8_2_x4_roundtrip(x: &[f32], out: &mut [f32]) {
 /// f32 would be a plausible wrong answer. So is every type [`dequant_row`] does not decode. Q2_K and
 /// IQ2_XS take Q8_K in ggml (ggml.c:895, :1105 on the IQK build; `iqk_set_kernels_kquants` and
 /// `iqk_set_kernels_iquants` accept Q8_K only for them); the other i-quants take Q8_K too and have no
-/// CPU matmul here.
+/// CPU matmul here. Q2_0 takes Q8_0 in mainline (`f2cc7282c` ggml-cpu.c:237) and has none here
+/// either.
 pub fn activation_format(weight: GgmlType) -> Result<Option<ActivationFormat>, QuantError> {
     match weight {
         GgmlType::Q2_K
@@ -1220,6 +1260,7 @@ pub fn activation_format(weight: GgmlType) -> Result<Option<ActivationFormat>, Q
         | GgmlType::IQ1_M
         | GgmlType::TQ1_0
         | GgmlType::TQ2_0
+        | GgmlType::Q2_0
         | GgmlType::Unknown(_) => Err(QuantError::NoActivationFormat(weight)),
     }
 }
@@ -1280,8 +1321,8 @@ mod tests {
     /// [`GgmlType`] names, as the compiled libraries answer: ik_llama.cpp
     /// `c10fbbcc` (`build/ggml/src/libggml.so`) and, for tq1_0/tq2_0, which
     /// the ik table does not have, mainline llama.cpp `930e2fa59`
-    /// (`build/bin/libggml-base.so`). The two libraries agree on every other
-    /// row here.
+    /// (`build/bin/libggml-base.so`), and for q2_0 mainline `f2cc7282c`. ik's
+    /// and mainline's libraries agree on every other row here.
     const GGML_TABLE: &[(u32, &str, u64, u64)] = &[
         (0, "f32", 1, 4),
         (1, "f16", 1, 2),
@@ -1311,14 +1352,17 @@ mod tests {
         (34, "tq1_0", 256, 54),
         (35, "tq2_0", 256, 66),
         (39, "mxfp4", 32, 17),
+        (42, "q2_0", 64, 18),
     ];
 
     /// Ids the enum leaves `Unknown`: types it does not name yet (q4_0, q4_1,
-    /// q8_1, q8_K), slots ggml removed (4, 5, 31-33, 36-38; ik reuses
-    /// 31-33 and 36 for repacked and BitNet types mainline does not have),
-    /// and the first ids past both tables.
+    /// q8_1, q8_K; mainline's nvfp4 and q1_0 at 40 and 41, ik's q1_0_g128 at
+    /// 41 and q8_2_x4 at 99), slots ggml removed (4, 5, 31-33, 36-38; ik
+    /// reuses 31-33 and 36 for repacked and BitNet types mainline does not
+    /// have), and 43, the first id past mainline's table.
     // PIN(2026-09-24): 10 (q2_K) left this list when the enum named it for the GLM-5.3 MTP layer.
-    const UNKNOWN_IDS: &[u32] = &[2, 3, 4, 5, 9, 15, 31, 32, 33, 36, 37, 38, 40, 41, 42, 99];
+    // PIN(2026-10-12): 42 (q2_0) left this list when the enum named it.
+    const UNKNOWN_IDS: &[u32] = &[2, 3, 4, 5, 9, 15, 31, 32, 33, 36, 37, 38, 40, 41, 43, 99];
 
     /// Every named id round-trips through the enum and carries ggml's name,
     /// block size and block bytes; every other id stays `Unknown` with no
@@ -1560,6 +1604,86 @@ mod tests {
                 ty: GgmlType::IQ4_NL,
                 dst: 150,
                 blck: 32
+            })
+        );
+    }
+
+    /// `dequantize_row_q2_0` of mainline llama.cpp `f2cc7282c` over the blocks
+    /// of [`q2_0_matches_mainline`] at d = 1.0 (f16 `0x3c00`), printed through
+    /// `ggml_get_type_traits(GGML_TYPE_Q2_0)->to_float` on x86_64 Linux; one
+    /// line per 16 values, four lines per block.
+    #[rustfmt::skip]
+    const Q2_0_MAINLINE: [i8; 256] = [
+        -1, -1,  2,  2,  0, -1,  1,  2,  1, -1,  0,  2,  2, -1, -1,  2,
+        -1,  0,  2,  1,  0,  0,  1,  1,  1,  0,  0,  1,  2,  0, -1,  1,
+        -1,  1,  2,  0,  0,  1,  1,  0,  1,  1,  0,  0,  2,  1, -1,  0,
+        -1,  2,  2, -1,  0,  2,  1, -1,  1,  2,  0, -1,  2,  2, -1, -1,
+         0,  0,  1,  1, -1,  0,  2,  1,  2,  0, -1,  1,  1,  0,  0,  1,
+         0, -1,  1,  2, -1, -1,  2,  2,  2, -1, -1,  2,  1, -1,  0,  2,
+         0,  2,  1, -1, -1,  2,  2, -1,  2,  2, -1, -1,  1,  2,  0, -1,
+         0,  1,  1,  0, -1,  1,  2,  0,  2,  1, -1,  0,  1,  1,  0,  0,
+         1,  1,  0,  0,  2,  1, -1,  0, -1,  1,  2,  0,  0,  1,  1,  0,
+         1,  2,  0, -1,  2,  2, -1, -1, -1,  2,  2, -1,  0,  2,  1, -1,
+         1, -1,  0,  2,  2, -1, -1,  2, -1, -1,  2,  2,  0, -1,  1,  2,
+         1,  0,  0,  1,  2,  0, -1,  1, -1,  0,  2,  1,  0,  0,  1,  1,
+         2,  2, -1, -1,  1,  2,  0, -1,  0,  2,  1, -1, -1,  2,  2, -1,
+         2,  1, -1,  0,  1,  1,  0,  0,  0,  1,  1,  0, -1,  1,  2,  0,
+         2,  0, -1,  1,  1,  0,  0,  1,  0,  0,  1,  1, -1,  0,  2,  1,
+         2, -1, -1,  2,  1, -1,  0,  2,  0, -1,  1,  2, -1, -1,  2,  2,
+    ];
+
+    /// Q2_0 against mainline ggml's decode: four blocks whose code byte j is
+    /// `(j | (15 − j) << 4) ^ 0x55·i`, so every position holds each of the four
+    /// codes once across the blocks and no two bytes of a block are equal. At
+    /// d = 1.0 the row is [`Q2_0_MAINLINE`]. Each pass then gives the four
+    /// blocks four of the scales below (subnormal, negative, zero, negative-zero
+    /// and largest finite among them), rotated a step a pass, and every value is
+    /// that one times its block's d, computed in f64 (exact, the module doc),
+    /// down to the sign of a zero. A row one byte short, or not whole blocks, is
+    /// refused by name.
+    #[test]
+    fn q2_0_matches_mainline() {
+        let blocks = |d: [u16; 4]| -> Vec<u8> {
+            (0..4u8)
+                .flat_map(|i| {
+                    let codes = (0..16u8).map(move |j| (j | ((15 - j) << 4)) ^ (0x55 * i));
+                    d[usize::from(i)].to_le_bytes().into_iter().chain(codes)
+                })
+                .collect()
+        };
+        let scales = [
+            0x3c00u16, 0x0001, 0x03ff, 0x0400, 0xb555, 0x0000, 0x8000, 0x7bff, 0xfbff,
+        ];
+        let mut dst = [0.0f32; 256];
+        for s in 0..scales.len() {
+            let ds: [u16; 4] = std::array::from_fn(|i| scales[(s + i) % scales.len()]);
+            dequant_row(GgmlType::Q2_0, &blocks(ds), &mut dst).unwrap();
+            for (p, (&got, &l)) in dst.iter().zip(&Q2_0_MAINLINE).enumerate() {
+                let d = ds[p / 64];
+                let want = (f64::from(l) * f64::from(super::half_to_f32(d))) as f32;
+                assert_eq!(
+                    got.to_bits(),
+                    want.to_bits(),
+                    "d {d:#06x} value {p}: got {got:e}, want {want:e}"
+                );
+            }
+        }
+        let src = blocks([0x3c00; 4]);
+        assert_eq!(
+            dequant_row(GgmlType::Q2_0, &src[..71], &mut dst),
+            Err(QuantError::ShortSrc {
+                ty: GgmlType::Q2_0,
+                src: 71,
+                need: 72,
+                n: 256
+            })
+        );
+        assert_eq!(
+            dequant_row(GgmlType::Q2_0, &src, &mut dst[..96]),
+            Err(QuantError::UnalignedDst {
+                ty: GgmlType::Q2_0,
+                dst: 96,
+                blck: 64
             })
         );
     }
