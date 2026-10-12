@@ -120,7 +120,7 @@ fn token_id(split: &Split, key: &str) -> Result<Option<u64>, PlacementError> {
 pub enum DraftUsableError {
     /// No rule says whether a set of this architecture can run a draft.
     #[error(
-        "metadata general.architecture: is {arch}; no rule says whether a {arch} set can run its draft"
+        "the file's architecture is {arch}; no rule says whether a {arch} set can run its draft"
     )]
     NoRule { arch: String },
     /// The set's plan cannot be described, or the draft file's checkpoint is
