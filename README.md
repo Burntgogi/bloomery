@@ -55,7 +55,7 @@ bloomery-serve --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M --port 8080
 | Cards | One card, or one card plus one expert-tier card (`--place bp`). With `--place` unset and two cards visible, Qwen3.8 and GLM-5.3 add the second card when their plan finds it pays |
 | Host RAM under the model | Runs on Qwen3.8, GLM-5.3 and V4.1: the routed experts the RAM cannot hold are paged from the model file on NVMe through a RAM arena. Tokens equal the all-RAM load. On a small host the load can be refused at the defaults (see the known issues below). A paged Qwen3.8 load serves one request at a time with the MTP draft off (a set `--parallel 2` or draft is refused by name); adaptive residency runs on it. On WSL2 with the model on a Windows drive, set `BLOOMERY_NVTIER_READ=buffered` |
 | MiMo-V2.6-Flash | Its hot routed experts sit on the card, the rest on the host. After a 5,620-token prompt it decodes at 34.0 tok/s (0.2.10: 19.1), first token at 52.9 s (RTX A6000, `--place` unset, 0.3.0's release check) |
-| Image input | V4.1, Qwen3.6 and the Clef decide seat, with `--mmproj <file>` (llama-server's flag; on Qwen3.6 `--hf` also fetches the encoder beside the model). Images go in as base64 (`data:` URLs), not fetched URLs. A request with an image to a seat started without an encoder is refused by name |
+| Image input | V4.1, Qwen3.6 and the Clef decide seat, with `--mmproj <file>` (llama-server's flag; only the Clef decide seat also fetches the encoder under `--hf`, so Qwen3.6 and V4.1 need `--mmproj` with `--hf` too). Images go in as base64 (`data:` URLs), not fetched URLs. A request with an image to a seat started without an encoder is refused by name |
 
 ### Known issues and limits (0.3.0)
 

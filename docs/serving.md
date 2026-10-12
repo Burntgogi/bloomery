@@ -172,8 +172,8 @@ by name. `timings.cache_ms` and `/metrics`'
 
 **Image input (V4.1, Qwen3.6, Clef).** These seats read images when they have a vision encoder: `--mmproj <file>`,
 llama-server's flag, naming the model's encoder GGUF. On V4.1 the file is `mmproj-DeepSeek-V4.1-Flash-BF16.gguf`.
-On the Qwen3.6 seat and the Clef decide seat, `--hf` also fetches the repo's own projector beside the model,
-unless `--no-mmproj` says none. Qwen3-30B-A3B has no encoder, and `--mmproj` there is refused by name. A file of
+On the Clef decide seat, `--hf` also fetches the repo's own projector beside the model, unless `--no-mmproj`
+says none; the Qwen3.6 and V4.1 seats fetch none under `--hf`, so they need `--mmproj <file>` too. Qwen3-30B-A3B has no encoder, and `--mmproj` there is refused by name. A file of
 another encoder is refused by name. Images travel inside the request as PNG or JPEG bytes: an OpenAI `image_url`
 part holding a `data:` URL, or an Anthropic `image` block with a base64 source; any other URL is refused, not
 fetched. The encoder loads once at start and stays resident: on a card the load's plan leaves off it, or, when every
