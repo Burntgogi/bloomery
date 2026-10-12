@@ -312,6 +312,7 @@ mod gate {
         bloomery_levers::MTP_WIDTH,
         bloomery_levers::RESIDENCY,
         bloomery_levers::STEP_STATS,
+        bloomery_levers::SCREEN,
     ];
 
     const USAGE: &str =

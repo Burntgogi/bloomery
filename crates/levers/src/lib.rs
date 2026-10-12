@@ -35,7 +35,7 @@ pub use registry::{
     HOST_LANES, HOST_LANES_DEFAULT, HOST_LOCK, HOST_POPULATE, HOST_ROOM, HOSTSTREAM, LANE_PREFETCH,
     LANE_PREFETCH_DEFAULT, MTP_DRAFT, MTP_HEAD_ROWS, MTP_WIDTH, MTP_WINDOWS, NVTIER_BYTES,
     NVTIER_READ, PIN_MAIN, PREFILL, PREFILL_GROUP, PREFILL_GROUP_DEFAULT, PREFILL_GROUP_MAX,
-    QWEN3_KV, QWEN38_EXPERTS, R8, RESIDENCY, ROUTE_TRACE, SPIN, STEP_STATS, THREADS,
+    QWEN3_KV, QWEN38_EXPERTS, R8, RESIDENCY, ROUTE_TRACE, SCREEN, SPIN, STEP_STATS, THREADS,
 };
 pub use registry::{SPLIT_WALK, XSTREAM};
 
@@ -972,6 +972,13 @@ impl Levers {
     pub fn gen_slots(&self) -> usize {
         let n = Levers::defaulted(GEN_SLOTS, self.count(GEN_SLOTS));
         Levers::usize_of(GEN_SLOTS, n)
+    }
+
+    /// `BLOOMERY_SCREEN`: a serving seat draws its start screen on a
+    /// terminal.
+    #[must_use]
+    pub fn screen(&self) -> bool {
+        self.flag(SCREEN)
     }
 
     /// The host tier's load settings: [`HOST_POPULATE`], [`HOST_LOCK`],

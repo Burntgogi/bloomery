@@ -4,7 +4,7 @@
 
 use bloomery_levers::{
     CARD_BUDGET, CARD_DONTNEED, CED, DRAFT, ENGRAM_HELPER, HOST_LANES, HOST_LOCK, HOST_POPULATE,
-    HOSTSTREAM, MTP_WIDTH, PIN_MAIN, PREFILL, PREFILL_GROUP, R8, RESIDENCY, ROUTE_TRACE,
+    HOSTSTREAM, MTP_WIDTH, PIN_MAIN, PREFILL, PREFILL_GROUP, R8, RESIDENCY, ROUTE_TRACE, SCREEN,
     STEP_STATS,
 };
 
@@ -15,7 +15,7 @@ use bloomery_levers::{
 /// trace; adaptive expert residency and its prompt streaming; the step
 /// statistics, whose rounds of several slots the seat counts, and which on
 /// this engine also keeps the step rows' engram fill statistics; the width
-/// a drafted window verifies. The draft's
+/// a drafted window verifies; the start screen. The draft's
 /// file and card (`BLOOMERY_DSPARK_MODEL`, `BLOOMERY_DSPARK_CARD`) are read
 /// where the draft opens, not here.
 pub const ACTS_ON: &[&str] = &[
@@ -36,4 +36,5 @@ pub const ACTS_ON: &[&str] = &[
     RESIDENCY,
     HOSTSTREAM,
     STEP_STATS,
+    SCREEN,
 ];

@@ -519,7 +519,25 @@ fn parallel_text(slots: usize, slot_ctx: usize, from: SlotsFrom, pass: Pass) -> 
 /// context, the total, what set the count (`from`), and the shape of a round
 /// of several slots (`pass`).
 pub fn parallel_line(slots: usize, slot_ctx: usize, from: SlotsFrom, pass: Pass) {
-    eprintln!("{}", parallel_text(slots, slot_ctx, from, pass));
+    eprint_noted(&parallel_text(slots, slot_ctx, from, pass));
+}
+
+/// A seat's start line that is no [`crate::record::Record`] (the
+/// `parallel`, `cache` and Qwen3.8 `load` lines) on stderr as it is, and to
+/// the start screen (`serve::screen::note`), which keeps it only when armed.
+pub fn eprint_noted(line: &str) {
+    eprintln!("{line}");
+    serve::screen::note(line);
+}
+
+/// Arms the start screen (`serve::screen`) when `on` (the seat's
+/// `BLOOMERY_SCREEN`) and stderr is a terminal, and then hands it every
+/// record line the seat prints; a seat calls it right after its levers and
+/// records are registered, and the server draws the screen once it listens.
+pub fn arm_screen(on: bool) {
+    if serve::screen::arm(on) {
+        crate::record::tee(serve::screen::note);
+    }
 }
 
 /// `/props`' placement of `plan` on `machine`: its cards by nvidia-smi
