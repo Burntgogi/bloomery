@@ -15,16 +15,18 @@
 //! no other slot had run. The seat opens each slot's draft (its prompt path
 //! and step mode are the seat's), and the table drives it.
 //!
-//! The draft rejoins a sequence only where its last call left it. A seat
-//! whose saved state keeps the draft's side (its store and the arenas its
-//! waiting rows sit in) parks the slot's draft with the state
-//! ([`SlotDrafts::park`]) and puts it back with it ([`SlotDrafts::unpark`]),
-//! so a returning sequence drafts as if no other had run. A seat whose state
-//! does not keep that side turns the slot's draft off after a cut or a
-//! put-back state ([`SlotDrafts::turn_off`]): every call on that slot is the
-//! session's own until the slot's next reset, and each prompt call (or the
-//! first step when the call is empty) prints an `mtp prompt` record that
-//! names why.
+//! The draft rejoins a sequence where its last call left it, or where the
+//! body kept its side. A seat whose saved state keeps the draft's side (its
+//! store and the arenas its waiting rows sit in) parks the slot's draft with
+//! the state ([`SlotDrafts::park`]) and puts it back with it
+//! ([`SlotDrafts::unpark`]), so a returning sequence drafts as if no other
+//! had run. After a cut, or a state put back as its prefix, a seat whose
+//! body kept the draft's store below the kept position and the target's
+//! hidden row before it rejoins the slot's draft there
+//! ([`SlotDrafts::rejoin`]); otherwise it turns the slot's draft off
+//! ([`SlotDrafts::turn_off`]): every call on that slot is the session's own
+//! until the slot's next reset, and each prompt call (or the first step when
+//! the call is empty) prints an `mtp prompt` record that names why.
 
 use app::mtp::{MtpBody, MtpDraft, Parked};
 use app::{RowsLog, Session, SessionError};
@@ -168,6 +170,19 @@ where
                 print_widths(spec);
             }
             self.off[slot] = Some((why, false));
+        }
+        Ok(())
+    }
+
+    /// `slot`'s draft rejoined at `pos`, where the body kept its side after a
+    /// cut or a state put back as its first `pos` positions
+    /// ([`MtpDraft::rejoin`]), and on again: the slot's next call walks the
+    /// row before `pos` and drafts from there. Nothing without a draft;
+    /// refused as [`SlotDrafts::has`].
+    pub(crate) fn rejoin(&mut self, slot: usize, pos: u32) -> Result<(), GateError> {
+        if let Some(spec) = self.spec_mut(slot)? {
+            spec.draft_mut().draft_mut().rejoin(pos);
+            self.off[slot] = None;
         }
         Ok(())
     }

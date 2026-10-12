@@ -110,7 +110,7 @@ use crate::q6k_ids::{Q6kIdsArgs, Q6kIdsKernels};
 use crate::q8f32::{GemvOut, Q8_0GemvIdsArgs, Q8_0GemvMcolArgs, Q8_0SelArgs};
 use crate::q38::{EmbedQ8Args, OutGateArgs, SLOTS, SharedAddArgs, W_PITCH};
 use crate::rope_neox::PartialNeoxArgs;
-use crate::tensor::Q8Act;
+use crate::tensor::{Q8Act, WindowMut};
 use crate::weights::{DevWeight, Weights};
 use crate::{DeviceTensor, Gpu, GpuError};
 use cuda_core::{CudaStream, DeviceBuffer};
@@ -538,6 +538,52 @@ impl Mtp38 {
         Ok(())
     }
 
+    /// The first `at` positions of a sequence state's store rows `rows`
+    /// (`store_host`'s position-major shape, both planes, at least `at`
+    /// positions) put back, the store counted at `at`: the side of a state
+    /// put back as its first `at` positions (`Body38::put_draft_rows`). Only
+    /// the runs of positions `0..at` are written, one per KV head in each
+    /// plane, so the copy grows with `at`, not with the store's context.
+    /// Refused by name, nothing written, at 0 and when the rows do not cover
+    /// `at` positions. Blocking.
+    pub(super) fn adopt_prefix(
+        &mut self,
+        stream: &CudaStream,
+        at: usize,
+        rows: &(Vec<u16>, Vec<u16>),
+    ) -> Result<(), GpuError> {
+        let want = at * geo::N_KV * geo::HEAD;
+        if at == 0 || at > self.ctx || rows.0.len() < want || rows.1.len() < want {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "the store's rows at 0..{at} of a store of {}: {} and {} values",
+                    self.ctx,
+                    rows.0.len(),
+                    rows.1.len()
+                ),
+            ));
+        }
+        let (ctx, head) = (self.ctx, geo::HEAD);
+        let plane = |rows: &[u16], buf: &mut DeviceBuffer<u16>| -> Result<(), GpuError> {
+            let mut run = vec![0u16; at * head];
+            for kv in 0..geo::N_KV {
+                for p in 0..at {
+                    let from = (p * geo::N_KV + kv) * head;
+                    run[p * head..(p + 1) * head].copy_from_slice(&rows[from..from + head]);
+                }
+                let off = kv * ctx * head * size_of::<u16>();
+                WindowMut::<u16>::of_mut(buf, off, at * head)?.copy_from_host(stream, &run)?;
+            }
+            Ok(())
+        };
+        let (k, v) = self.store.f16_mut(WHAT)?;
+        plane(&rows.0, k)?;
+        plane(&rows.1, v)?;
+        self.held = at;
+        Ok(())
+    }
+
     /// A new sequence's side of the draft ([`Body38`]'s
     /// [`Slots`](crate::model::Slots)): a zeroed store no walk has captured
     /// over, no positions held. Load-time allocation.
@@ -846,13 +892,16 @@ impl Held38 {
 /// positions they hold ([`Held38`]) — the target's hidden rows a draft's
 /// waiting rows read when it rejoins the sequence. The ubatch walk's rows
 /// are not carried: after a resume that arena holds no position, and a walk
-/// that names it is refused.
+/// that names it is refused. Beside them, for each point the state carries
+/// that has one, the target's hidden row at the position before the point:
+/// a put-back as the point's prefix rejoins the draft there.
 #[derive(Clone, Debug)]
 pub struct DraftRows38 {
     pub(super) held: u32,
     pub(super) store: (Vec<u16>, Vec<u16>),
     pub(super) step: (Held38, Vec<f32>),
     pub(super) pass: (Held38, Vec<f32>),
+    pub(super) point_rows: Vec<(u32, Vec<f32>)>,
 }
 
 impl DraftRows38 {
@@ -861,6 +910,7 @@ impl DraftRows38 {
     pub fn bytes(&self) -> usize {
         (self.store.0.len() + self.store.1.len()) * size_of::<u16>()
             + (self.step.1.len() + self.pass.1.len()) * size_of::<f32>()
+            + self.point_rows.iter().map(|(_, r)| r.len()).sum::<usize>() * size_of::<f32>()
     }
 }
 

@@ -222,10 +222,15 @@ const BESIDE: u64 = 9 * 4 * 2560 * 4 + 4;
 /// 256 B pooled key a pool of four), two checkpoints — the 36 delta layers'
 /// committed state lane and conv ring, 3,596,288 B each, and the PLE ring,
 /// 17 · 4 · 2,560 f32 — and, under the draft, its store (2,048 B a
-/// position) and the arena rows ([`BESIDE`] less its lane word).
+/// position), the arena rows ([`BESIDE`] less its lane word) and one point's
+/// hidden row (4 · 2,560 f32).
 fn state38(ctx: u64, drafts: bool) -> u64 {
     let attention = 12 * (ctx * 2304 + ctx.div_ceil(4) * 256);
-    let draft = if drafts { ctx * 2048 + BESIDE - 4 } else { 0 };
+    let draft = if drafts {
+        ctx * 2048 + BESIDE - 4 + 4 * 2560 * 4
+    } else {
+        0
+    };
     attention + 2 * CHECKPOINT_38 + draft
 }
 

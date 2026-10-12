@@ -55,11 +55,11 @@
 //!   rows past the reply) and gives the ids of the same session run with no
 //!   switch; a resend with the reply's reasoning stripped keeps the
 //!   checkpoint at the first turn's end and gives a fresh run's ids; under
-//!   the draft a cut keeps that checkpoint only at or past the seat's
-//!   break-even for the reply (its `draft keep` line), drafting nothing and
-//!   saying why by name, and below it resets with the draft on; both sides
-//!   of the break-even at the turn's end, by reply length, each with a fresh
-//!   run's ids and its `mtp keep` record. The plain arm's main server runs
+//!   the draft each cut keeps its checkpoint with the draft rejoined there
+//!   and drafting, no draft-off line and no `mtp keep` record, on both sides
+//!   of the seat's break-even for the reply (its `draft keep` line) at the
+//!   turn's end, by reply length, each with a fresh run's ids. The plain
+//!   arm's main server runs
 //!   the clause with the draft off; its drafted half runs on the drafted
 //!   arm's main server, after that server's drafted clauses;
 //! - under the draft (`--arm drafted`, that arm's main server): a greedy
@@ -74,8 +74,8 @@
 //!   prompt call past it prints one `mtp prompt` record — the draft caught
 //!   up at the kept position, nothing skipped — and none prints a skip, and
 //!   each drafts, with the plain run's ids (the generated ones); the prompt
-//!   resent keeps its end by a cut, after which the extension drafts
-//!   nothing, by name, with the same prompt's ids fed fresh;
+//!   resent keeps its end by a cut that rejoins the draft, after which the
+//!   extension drafts from its join, with the same prompt's ids fed fresh;
 //!   and a sampled `/completion` (temperature 0.8, a fixed seed) drafts, its
 //!   passes' rows drawn by its sampler (`Engine::advance_sampled`), and the
 //!   same request at `top_k` 1 drafts and gives this server's greedy ids;
@@ -129,14 +129,14 @@
 //!   the server was started at over two (2048 of the 4096 total), the
 //!   `listening` record the same split, and `/props`' `n_ctx` is the slot
 //!   context.
-//!   On the same server, the off slot and the late request
+//!   On the same server, the cut slot and the late request
 //!   ([`slots_drafted_beside`]): the break-even clause's long turn fresh,
 //!   then `TURN_A`'s drafted request on the other slot and, once it
 //!   decodes, the turn resent with its reply stripped, cut on the turn's
-//!   slot with its draft off by name — the off slot's plain steps run in
-//!   rounds of two rows beside the drafted windows, its ids the same ids
-//!   fed fresh, and the drafted request's ids and draft counts its alone
-//!   run's (`slots_drafted_off_slot_steps_beside_a_window`). Then the late
+//!   slot with its draft rejoined there: the cut slot's windows run in
+//!   rounds of two rows beside the drafted request's, its ids the same ids
+//!   fed fresh, and the drafted request's ids its alone run's
+//!   (`slots_drafted_off_slot_steps_beside_a_window`). Then the late
 //!   request, in both orders: the first posted alone and the second once a
 //!   few of its rounds have passed, its prompt between the first's rounds,
 //!   both ids again their alone ids — `TURN_A` first
@@ -1021,17 +1021,6 @@ mod gate {
             let r = f64::from(u32::try_from(self.reply(n)).unwrap_or(u32::MAX));
             (r * self.per_token).ceil() as usize
         }
-
-        /// The `mtp keep` record a request of `n` tokens that weighed a
-        /// prefix of `prefix` positions prints, its branch `kept` or `reset`.
-        fn record(self, n: usize, prefix: u64, kept: bool) -> MtpKeep {
-            MtpKeep {
-                branch: if kept { "kept" } else { "reset" }.to_owned(),
-                prefix,
-                break_even: self.at(n) as u64,
-                reply: self.reply(n) as u64,
-            }
-        }
     }
 
     /// The seat's lines on the server's stderr so far that say the MTP draft
@@ -1132,29 +1121,25 @@ mod gate {
             }
         }
 
-        /// Under the draft, a request that kept `cache_n` by a cut: its last
-        /// draft-off line names that position, its join there names why the
-        /// draft skips, and it drafted nothing.
-        fn skipped_by_name(&self) -> bool {
-            let at = format!(" from position {} ", self.cache_n);
+        /// Under the draft, a request of `sent` ids that kept `at` by a cut or
+        /// a prefix put back with the draft rejoined there: no draft-off line,
+        /// no `mtp keep` record, and it drafted. Its join: one at `at` that
+        /// walked the rejoined row when ids are left for a prompt call past
+        /// `at`; none when one id is left, which the first step feeds, the
+        /// step walking the rejoined row with it and printing no record (as a
+        /// request that ended on its first step and is extended by one id).
+        fn rejoined_at(&self, at: u64, sent: usize) -> bool {
+            let join = if sent as u64 > at + 1 {
+                self.joined_at(at)
+            } else {
+                self.joins.is_empty()
+            };
             self.ok
-                && self.draft_n == 0
-                && self.offs.last().is_some_and(|l| l.contains(&at))
-                && self
-                    .joins
-                    .iter()
-                    .any(|j| j.start == self.cache_n && j.caught_up == 0 && j.skipped != "none")
-        }
-
-        /// Under the draft, a request that reset below the break-even: it
-        /// kept nothing, printed `record` (its `mtp keep`) and no draft-off
-        /// line, and drafted.
-        fn reset_by_rule(&self, record: &MtpKeep) -> bool {
-            self.ok
-                && self.cache_n == 0
+                && self.cache_n == at
                 && self.draft_n > 0
                 && self.offs.is_empty()
-                && self.keeps.last() == Some(record)
+                && self.keeps.is_empty()
+                && join
         }
 
         /// One join printed for this request, at `start`, that walked the
@@ -1180,13 +1165,11 @@ mod gate {
     /// its record; and after a first step again, extended by ids the model
     /// did not generate, against the same prompt fed fresh. That first step
     /// is the prompt resent, which keeps the prompt's end (one short of it)
-    /// by a cut: the draft proposes nothing from there, by name, and the
-    /// extension, with the draft off, keeps the prompt only at or past the
-    /// break-even of its reply (`mtp keep` `kept`, plain steps), else it takes
-    /// the state the first request left in the prompt cache when it ended (the
-    /// same ids, its draft on) and keeps the whole prompt, drafted from the
-    /// join at its end — with the fresh run's ids either way. Every prompt
-    /// call stays below
+    /// by a cut that rejoins the draft there (the point at the first prompt
+    /// call's end holds the target's row before it, the draft's store holds
+    /// past it): no draft-off line, no `mtp keep` record; the extension keeps
+    /// the whole prompt and drafts from the join at its end, with the fresh
+    /// run's ids. Every prompt call stays below
     /// [`GEMM_FROM`](bloomery_gpu::arch::qwen3moe::Prompt38::GEMM_FROM), so
     /// a continued and a fresh feed leave the same state.
     fn continued(
@@ -1251,49 +1234,24 @@ mod gate {
         x3.show("continued: extended by other ids");
         let fresh = greedy(url, err_log, &with(&ext), 8, false)?;
         fresh.show("continued: the same ids fed fresh");
-        // PIN(2026-10-01): the keep rule grants checkpoints under the draft (lead, round recsave),
-        // and the draft's rejoin after a cut is not built (app/src/mtp.rs): `b` keeps p − 1 by a
-        // cut, so `x3` drafts nothing and its join names why; was a join at p that drafts.
-        // PIN(2026-10-02): the seat's break-even weighs a keep that leaves the draft off (round
-        // q38rules): `b`'s reply of one token makes no pass, so it keeps p − 1 by a cut; `x3`,
-        // with the draft off, keeps the whole prompt only at or past the break-even of its 8
-        // tokens, else it resets and drafts; was the prompt kept and nothing drafted, always.
-        let k = Keep38::read(err_log)?;
-        let x3_kept = p as usize >= k.at(8);
-        let skips_at_p = x3
-            .joins
-            .iter()
-            .any(|j| j.start == p && j.caught_up == 0 && j.skipped != "none");
-        let x3_ok = if x3_kept {
-            x3.ok
-                && x3.cache_n == p
-                && x3.draft_n == 0
-                && x3.offs.is_empty()
-                && skips_at_p
-                && x3.keeps.last() == Some(&k.record(8, p, true))
-        } else {
-            // PIN(2026-10-11): below the break-even `x3` keeps the whole prompt from the state the
-            // lane saved when the first request ended (the same `p` ids, its draft on: the
-            // slot's own state, which `b` left with the draft off, was not saved, the cache
-            // already keeping all of its ids). The server picks it over the slot's reset
-            // (`Slot::reuse`: it keeps more than the rule's 0), puts it back whole, and the
-            // draft joins the rows it holds and drafts: no cut, no keep record, no draft-off
-            // line; was a reset by the rule, the cache holding no such state before the saves
-            // at the request's end.
-            x3.ok
+        // PIN(2026-10-12): the cut rejoins the draft at the point it keeps (round kp-draft): `b`
+        // keeps p − 1 by a cut with the draft on (no draft-off line, no `mtp keep` record, its
+        // first step walking the rejoined row), and `x3` keeps the whole prompt and drafts from
+        // the join at p; was the draft off from p − 1 by name, `x3` keeping the prompt with the
+        // draft off at or past the break-even of its 8 tokens, else the state the lane saved.
+        check(
+            &mut ok,
+            "continued_by_other_ids_keeps_the_prompt_and_skips_by_name",
+            b.ok && b.cache_n == p - 1
+                && b.offs.is_empty()
+                && b.keeps.is_empty()
+                && b.joins.is_empty()
+                && x3.ok
                 && x3.cache_n == p
                 && x3.draft_n > 0
                 && x3.offs.is_empty()
                 && x3.keeps.is_empty()
-                && x3.joined_at(p)
-        };
-        check(
-            &mut ok,
-            "continued_by_other_ids_keeps_the_prompt_and_skips_by_name",
-            b.cache_n == p - 1
-                && b.skipped_by_name()
-                && b.keeps.last() == Some(&k.record(1, p - 1, true))
-                && x3_ok,
+                && x3.joined_at(p),
         );
         check(
             &mut ok,
@@ -1461,8 +1419,8 @@ mod gate {
     ///   ends and an erase keeps the cache, so the switched resend finds the
     ///   state the first resend left (its ids and its reply) and keeps the
     ///   whole resend but its last id, where the first resend kept what A
-    ///   held (under the draft that prefix is weighed against the break-even
-    ///   like any other: kept with the draft off by name when it reaches it);
+    ///   held (under the draft that prefix is kept like any other, the draft
+    ///   rejoined there);
     /// - (b) A's first turn resent with the reasoning-stripped reply in place
     ///   of the reply, so the shared prefix ends at the first turn's end: it
     ///   keeps the checkpoint there (the turn's prompt call's end, one short
@@ -1472,17 +1430,15 @@ mod gate {
     ///   depend on where a call is cut);
     /// - under the draft, the cuts (the resend with no switch, the stripped
     ///   resend: the turn's end; the switched resend: all but its last id)
-    ///   weigh their prefix against the seat's
-    ///   break-even for the reply ([`Keep38`], the `draft keep` line): at or
-    ///   past it each keeps the turn's end, drafts nothing and says so by
-    ///   name (the seat's draft-off line at the kept position, an `mtp
-    ///   prompt` record there with why, a `kept` `mtp keep` record); below it
-    ///   each keeps nothing, prints a `reset` record and no draft-off line,
-    ///   and drafts. The fresh run after them drafts. Without the draft no
-    ///   such line prints. The draft's rejoin after a cut is not built: when
-    ///   it is, this clause turns over;
-    /// - (c) under the draft, both sides of the break-even at the turn's end
-    ///   ([`break_even`]).
+    ///   each keep their point with the draft rejoined there: each point is
+    ///   a prompt call's end, which holds the target's row before it, and
+    ///   the draft's store reaches it, so the seat's break-even weighs
+    ///   nothing ([`Q38::draft_keep`]); each request prints no draft-off line
+    ///   and no `mtp keep` record, joins the draft at its point and drafts.
+    ///   The fresh run after them drafts. Without the draft no such line
+    ///   prints;
+    /// - (c) under the draft, the turn's end kept on both sides of the
+    ///   break-even ([`break_even`]).
     ///
     /// Mutants: the state keeping the current position's recurrent stores
     /// alone ((b) keeps 0); a resume that leaves the PLE history behind (the
@@ -1534,37 +1490,26 @@ mod gate {
         a2.show(&format!("cache {label}: A resent verbatim after B"));
         let held = (p1.len() + a1.tokens.len()).saturating_sub(1) as u64;
         let turn_end = p1.len() as u64 - 1;
-        // PIN(2026-10-02): under the draft a cut keeps the turn's end only at or past the seat's
-        // break-even for the reply (round q38rules: `Q38::draft_keep`), else the request resets
-        // and prefills whole with the draft on; was the turn's end, the draft off, always.
+        // PIN(2026-10-12): under the draft a cut to the turn's end rejoins the draft there
+        // (round kp-draft), so the break-even weighs nothing and the cut keeps the turn's end;
+        // was the turn's end only at or past the seat's break-even for the reply, the draft off,
+        // else a reset.
         let keep38 = drafted.then(|| Keep38::read(err_log)).transpose()?;
-        let cut_kept = keep38.is_none_or(|k| turn_end >= k.at(n) as u64);
-        let cut_at = if cut_kept { turn_end } else { 0 };
-        let want = if drafted { cut_at } else { held };
+        let want = if drafted { turn_end } else { held };
         // PIN(2026-10-11): the plain switched resend keeps every id of the resend but its last,
         // not A's held positions; the lane saved the first resend's end state (its ids and its
         // reply) when that request ended, the erase kept it, and the switched resend takes the
         // prefix of it up to the nearest point it carries at or below all but the resend's last
         // id, which is the end of the first resend's prompt call. A request keeps at most all
         // but its last id, and the first resend still keeps A's held positions.
-        // Under the draft that prefix is weighed against the break-even like any kept one: at or
-        // past it the switched resend keeps it with the draft off by name (`cache load
-        // positions=121 common=105 kept=105`, `mtp keep branch=kept prefix=105 break_even=86`),
-        // below it the request resets; was the turn's end weighed, as for the first resend.
+        // PIN(2026-10-12): under the draft the switched resend keeps that prefix with the draft
+        // rejoined at its end (round kp-draft: the saved state carries the point's row); was the
+        // prefix weighed against the break-even, kept with the draft off by name at or past it
+        // (`cache load positions=121 common=105 kept=105`, `mtp keep branch=kept prefix=105
+        // break_even=86`), else a reset.
         let all_but_last = resend.len() as u64 - 1;
-        let a2_kept = keep38.is_none_or(|k| all_but_last >= k.at(n) as u64);
-        let a2_at = if a2_kept { all_but_last } else { 0 };
-        if let Some(k) = keep38 {
-            println!(
-                "cache {label}: the turn's end {turn_end} against the break-even {} of a reply of \
-                 {} tokens: {}",
-                k.at(n),
-                k.reply(n),
-                if cut_kept { "kept" } else { "reset" }
-            );
-        }
         let kept = if drafted {
-            a2.cache_n == a2_at && r2.cache_n == want
+            a2.cache_n == all_but_last && r2.cache_n == want
         } else {
             r2.cache_n == held && a2.cache_n == all_but_last && a2.cache_n >= held
         };
@@ -1605,32 +1550,25 @@ mod gate {
         check(
             &mut ok,
             &format!("cache_{label}_b_keeps_the_turns_end"),
-            c1.ok && b2.ok && a3.ok && a3.cache_n == if drafted { cut_at } else { turn_end },
+            c1.ok && b2.ok && a3.ok && a3.cache_n == turn_end,
         );
         check(
             &mut ok,
             &format!("cache_{label}_b_ids_are_a_fresh_runs"),
             f3.ok && f3.cache_n == 0 && !a3.tokens.is_empty() && a3.tokens == f3.tokens,
         );
-        // Each cut as its own prefix weighed: the first resend's and the stripped resend's at the
-        // turn's end, the switched resend's at all but its last id.
-        let named = match keep38 {
-            Some(k) => {
-                let cut = |g: &Greedy, at: u64, kept: bool| {
-                    let rec = k.record(n, at, kept);
-                    if kept {
-                        g.skipped_by_name() && g.keeps.last() == Some(&rec)
-                    } else {
-                        g.reset_by_rule(&rec)
-                    }
-                };
-                cut(&r2, turn_end, cut_kept)
-                    && cut(&a2, all_but_last, a2_kept)
-                    && cut(&a3, turn_end, cut_kept)
-                    && f3.draft_n > 0
-                    && f3.offs.is_empty()
-            }
-            None => [&r2, &a2, &a3, &f3].iter().all(|g| g.offs.is_empty()),
+        // PIN(2026-10-12): each cut keeps its point with the draft rejoined (round kp-draft): the
+        // first resend's and the stripped resend's at the turn's end, the switched resend's at
+        // all but its last id; was each weighed against the break-even, kept with the draft off
+        // by name at or past it, else a reset by the rule. The check keeps its name.
+        let named = if drafted {
+            r2.rejoined_at(turn_end, resend.len())
+                && a2.rejoined_at(all_but_last, resend.len())
+                && a3.rejoined_at(turn_end, strip.len())
+                && f3.draft_n > 0
+                && f3.offs.is_empty()
+        } else {
+            [&r2, &a2, &a3, &f3].iter().all(|g| g.offs.is_empty())
         };
         let name = format!("cache_{label}_cuts_leave_the_draft_off_by_name");
         if !drafted || tier::run_clause(&name, Tag::FileBound)? {
@@ -1644,18 +1582,19 @@ mod gate {
 
     /// The drafted seat's break-even at a turn's end, as the `cache`
     /// clause's (b) reaches it (the turn, B's turn, the turn resent with its
-    /// reply stripped: its state put back, the turn's end kept by a cut): a
-    /// reply short enough that the turn's end is at or past its break-even
-    /// keeps it — the draft off from there, by name, a `kept` record — and
-    /// one whose break-even is past it resets — nothing kept, the draft on, a
-    /// `reset` record, no draft-off line; each gives the ids of the same
-    /// request fed fresh. Each side has a session of its own
-    /// ([`BREAK_EVEN_TURNS`]), so the prompt cache holds no state that shares
-    /// more than its turn. The replies are the seat's own arithmetic on its
-    /// `draft keep` line: the longest of at most [`N_PREDICT`] tokens whose
-    /// break-even the turn's end reaches, and [`N_PREDICT`], whose
-    /// break-even it must not. Mutants: a break-even of 0 (the short reply
-    /// keeps the turn's end) and of `usize::MAX` (the long reply resets).
+    /// reply stripped: its state put back as the prefix to the turn's end):
+    /// the draft rejoins at the turn's end, so the break-even weighs nothing
+    /// on either side of it ([`Q38::draft_keep`]). A reply short enough that
+    /// the turn's end is at or past its break-even and one whose break-even
+    /// is past it each keep the turn's end with the draft rejoined
+    /// ([`Greedy::rejoined_at`]) and give the ids of the same request fed
+    /// fresh. Each side has a session of its own ([`BREAK_EVEN_TURNS`]), so
+    /// the prompt cache holds no state that shares more than its turn. The
+    /// replies are the seat's own arithmetic on its `draft keep` line: the
+    /// longest of at most [`N_PREDICT`] tokens whose break-even the turn's
+    /// end reaches, and [`N_PREDICT`], whose break-even it must not.
+    /// Mutant: the put-back that turns the draft off (the long side keeps
+    /// the turn's end with the draft off by name, the short side resets).
     fn break_even(
         url: &dyn Fn(&str) -> String,
         err_log: &Path,
@@ -1709,19 +1648,16 @@ mod gate {
                 s.show(&format!("break-even {side}: A resent stripped after B"));
                 let f = greedy(url, err_log, &strip, n, false)?;
                 f.show(&format!("break-even {side}: the same ids fresh"));
-                let rec = k.record(n, turn_end as u64, kept);
-                let branch = if kept {
-                    s.cache_n == turn_end as u64
-                        && s.skipped_by_name()
-                        && s.keeps.last() == Some(&rec)
-                } else {
-                    s.reset_by_rule(&rec)
-                };
+                // PIN(2026-10-12): both sides keep the turn's end with the draft rejoined (round
+                // kp-draft); was the long side's turn's end kept with the draft off by name (a
+                // `kept` record), the short side's a reset by the rule (a `reset` record). The
+                // checks keep their names.
+                let branch = s.rejoined_at(turn_end as u64, strip.len());
                 let fresh = a.ok && b.ok && f.ok && f.cache_n == 0 && f.offs.is_empty();
                 let same = !s.tokens.is_empty() && s.tokens == f.tokens;
                 println!(
                     "break-even {side}: the turn's end {turn_end}, a reply of {n} tokens weighed as {} \
-                 against the break-even {}: want {rec:?} {}",
+                 against the break-even {}: kept with the draft rejoined {}",
                     k.reply(n),
                     k.at(n),
                     verdict(branch && fresh && same)
@@ -2497,7 +2433,7 @@ mod gate {
     /// The drafted clauses beside the slots clause's pair, on its server
     /// (the draft on, the residency off, the fixed window, the round records
     /// on) after its alone and together runs, `alone` the alone answers of
-    /// `ids`: the off slot ([`slots_drafted_off_slot`]), then the late
+    /// `ids`: the cut slot ([`slots_drafted_off_slot`]), then the late
     /// request in both orders ([`late_pair`]): the first posted and the
     /// second once `/metrics`' `n_decode_total` has moved
     /// [`DRAFTED_LATE_ROUNDS`] rounds — its prompt between the first's
@@ -2511,7 +2447,7 @@ mod gate {
     /// (`genloop`'s prompt), so its first pass proposes beside the first
     /// request's deep one. A window rides a pass with no proposal only
     /// while its draft skips, `pass_slots`' own case; a slot a cut turned
-    /// off steps beside the pass ([`slots_drafted_off_slot`]). The mixed
+    /// off steps beside the pass. The mixed
     /// round these clauses cover is that young window beside the decoding
     /// one.
     fn slots_drafted_beside(
@@ -2606,20 +2542,18 @@ mod gate {
         Ok((polls, late))
     }
 
-    /// The off slot clause (the module header) on the slots clause's
+    /// The cut slot clause (the module header) on the slots clause's
     /// server: the break-even clause's long turn (`BREAK_EVEN_TURNS`'
-    /// first) run fresh on a free slot for a reply its break-even keeps a
-    /// cut for; then `TURN_A`'s drafted request (`a_ids`, [`SLOTS_PREDICT`]
-    /// tokens) posted — it takes the other slot, whose held ids share more
-    /// of its prompt — and once it has run [`DRAFTED_LATE_ROUNDS`] decode
-    /// calls, the turn resent with its reply stripped, which only the turn's
-    /// slot is free to take: that slot keeps the turn's end by a cut, its
-    /// draft off by name (its `mtp keep` record `kept`), and its plain steps
-    /// run in the rounds the drafted request's windows run in (a `slots
-    /// round` record of two rows inside its window). The off slot's ids are
-    /// the same ids fed fresh, and the drafted request's ids and draft
-    /// counts its alone run's (`alone_a`): an off slot steps beside a
-    /// drafted window and is never asked to propose
+    /// first) run fresh on a free slot; then `TURN_A`'s drafted request
+    /// (`a_ids`, [`SLOTS_PREDICT`] tokens) posted (it takes the other slot,
+    /// whose held ids share more of its prompt), and once it has run
+    /// [`DRAFTED_LATE_ROUNDS`] decode calls, the turn resent with its reply
+    /// stripped, which only the turn's slot is free to take: that slot keeps
+    /// the turn's end by a cut with its draft rejoined there
+    /// ([`Greedy::rejoined_at`]), and its windows run in the rounds the
+    /// drafted request's windows run in (`slots round` records of two rows).
+    /// The cut slot's ids are the same ids fed fresh, and the drafted
+    /// request's ids its alone run's (`alone_a`)
     /// (`slots_drafted_off_slot_steps_beside_a_window`).
     fn slots_drafted_off_slot(
         url: &dyn Fn(&str) -> String,
@@ -2687,20 +2621,24 @@ mod gate {
         };
         let f = greedy(url, err_log, &strip, n, false)?;
         f.show("slots-drafted off: the same ids fresh");
-        let rec = k.record(n, turn_end as u64, true);
-        let off = cut.cache_n == turn_end as u64
-            && cut.skipped_by_name()
-            && cut.keeps.last() == Some(&rec);
+        // PIN(2026-10-12): the cut rejoins the slot's draft at the turn's end (round kp-draft),
+        // so the slot drafts beside the drafted request and both slots' windows share rounds; the
+        // drafted request's draft counts are no longer its alone run's (a pass of two drafted
+        // slots caps each window, `app::mtp::SLOT_DEPTH`), its ids still are; was the slot's
+        // draft off by name (a `kept` `mtp keep` record), its plain steps beside the drafted
+        // windows, the drafted request's counts its alone run's. The check keeps its name.
+        let off = cut.rejoined_at(turn_end as u64, strip.len());
         let fresh = x.ok && f.ok && f.cache_n == 0 && f.offs.is_empty();
         let off_same = !cut.tokens.is_empty() && cut.tokens == f.tokens;
-        let drafted_same = drafted.as_ref().zip(alone_a).is_some_and(|(d, a)| {
-            !d.tokens.is_empty() && d.tokens == a.tokens && d.drafts == a.drafts
-        });
+        let drafted_same = drafted
+            .as_ref()
+            .zip(alone_a)
+            .is_some_and(|(d, a)| !d.tokens.is_empty() && d.tokens == a.tokens);
         println!(
             "slots-drafted off: posted after {polls} poll(s); the cut kept {} of the turn's end \
-             {turn_end} (want {rec:?}), {beside} round(s) of two rows beside the drafted \
-             request; off ids the fresh run's: {off_same}; drafted ids and counts its alone \
-             run's: {drafted_same}",
+             {turn_end}, the draft rejoined {off}, {beside} round(s) of two rows beside the \
+             drafted request; cut ids the fresh run's: {off_same}; drafted ids its alone run's: \
+             {drafted_same}",
             cut.cache_n
         );
         let mut ok = true;

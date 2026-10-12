@@ -479,14 +479,17 @@ impl PlanInputs {
     /// The host bytes one saved sequence state of `positions` positions
     /// holds — the prompt cache's entry: every attention layer's positional
     /// bytes, two copies of a checkpoint ([`KvLayout::state_bytes`]) and, on
-    /// a load that carries `mtp`, the draft's store below the same positions
-    /// and the step's and the pass's arena rows. The engine's own owner is
-    /// `Body38`'s `seq38_bytes`; the gate holds the two equal.
+    /// a load that carries `mtp`, the draft's store below the same positions,
+    /// the step's and the pass's arena rows and the hidden row of the one
+    /// point the checkpoint term counts. The engine's own owner is `Body38`'s
+    /// `seq38_bytes`; the gate holds the two equal.
     #[must_use]
     pub fn seq_state_bytes(&self, positions: u64, mtp: Option<&MtpInputs>) -> u64 {
         let draft = mtp.map_or(0, |m| {
+            let point_row = streams(&self.hp) * self.hp.n_embd * std::mem::size_of::<f32>();
             m.kv.layer_bytes(0, positions) + slot_resident_bytes(&self.hp)
                 - runtime::stores::U32_BYTES
+                + point_row as u64
         });
         self.kv.state_bytes(positions) + draft
     }

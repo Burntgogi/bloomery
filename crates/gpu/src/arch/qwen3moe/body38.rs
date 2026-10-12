@@ -240,6 +240,7 @@ pub struct Slot38 {
     pending: Option<Pending38>,
     ckpt: Checkpoints,
     ple_points: Vec<(u32, History)>,
+    point_rows: Vec<(u32, Vec<f32>)>,
     ple_hist: History,
     held: u32,
     wrote: Wrote38,
@@ -257,8 +258,9 @@ pub struct Slot38 {
 /// load carries it ([`Seq38::bytes`]'s terms at plan time, for a seat's park
 /// budget): the positional rows and two recurrent copies
 /// ([`seq_positional_bytes`], [`checkpoint_bytes`]), the draft's store rows
-/// below the same positions, and the step's and the pass's arena rows — the
-/// most a parked refresh reads.
+/// below the same positions, the step's and the pass's arena rows (the
+/// most a parked refresh reads), and the hidden row of the one point whose
+/// recurrent copy the shared part counts ([`POINT_ROW_BYTES`]).
 #[must_use]
 pub fn seq38_bytes(gdn: usize, qsa: usize, positions: usize, drafts: bool) -> u64 {
     let shared = seq_positional_bytes(qsa, positions) + 2 * checkpoint_bytes(gdn);
@@ -267,7 +269,20 @@ pub fn seq38_bytes(gdn: usize, qsa: usize, positions: usize, drafts: bool) -> u6
     }
     let store = 2 * (geo::N_KV * positions * geo::HEAD * size_of::<u16>()) as u64;
     let rows = ((1 + PASS_ROWS) * geo::STREAMS * geo::HIDDEN * size_of::<f32>()) as u64;
-    shared + store + rows
+    shared + store + rows + POINT_ROW_BYTES
+}
+
+/// The host bytes of the target's final hidden row a checkpoint keeps for
+/// the MTP draft ([`Body38::point_rows`], [`DraftRows38::point_rows`]): one
+/// position's four streams of [`geo::HIDDEN`] f32.
+const POINT_ROW_BYTES: u64 = (geo::STREAMS * geo::HIDDEN * size_of::<f32>()) as u64;
+
+/// The host bytes one sequence's checkpoint hidden rows hold at most on a
+/// load with the MTP draft, in a load of `ctx` positions (a slot's share) of
+/// `gdn` delta layers: one [`POINT_ROW_BYTES`] row for each point the
+/// sequence's checkpoint budget holds ([`checkpoint_budget38`]).
+pub fn point_row_budget38(gdn: usize, ctx: u64) -> Result<u64, GpuError> {
+    Ok(checkpoint_budget38(gdn, ctx)? / checkpoint_bytes(gdn) * POINT_ROW_BYTES)
 }
 
 /// The spacing of a prompt call's inner checkpoints (`runtime::seqstate`'s
@@ -1031,6 +1046,11 @@ pub struct Body38 {
     /// positions restores. A prompt call takes them only while `marks` is on.
     ckpt: Checkpoints,
     ple_points: Vec<(u32, History)>,
+    /// On a load with the draft, the target's final hidden row at the
+    /// position before each point whose row an arena still held when the
+    /// point was taken, ascending: what the draft's first walk after a cut
+    /// to the point reads ([`Body38::draft_rejoins`]).
+    point_rows: Vec<(u32, Vec<f32>)>,
     marks: bool,
     /// What a sequence state of this load belongs to.
     who: Identity,
@@ -1652,6 +1672,7 @@ impl Body38 {
             routed_gate: common_routed(&stacks),
             ckpt,
             ple_points: Vec::new(),
+            point_rows: Vec::new(),
             marks: false,
             who,
         };
@@ -2302,8 +2323,10 @@ impl Body38 {
 
     /// A checkpoint at `pos`, where the stores stand, after any waiting cut:
     /// the recurrent stores copied to a host slot with the PLE history beside
-    /// them, or nothing where one stands. Refused by name while a verify
-    /// waits or the stores hold another position. Waits for the copies.
+    /// them and, on a load with the draft, the target's final hidden row at
+    /// `pos - 1` when an arena still holds it ([`Body38::point_rows`]), or
+    /// nothing where one stands. Refused by name while a verify waits or the
+    /// stores hold another position. Waits for the copies.
     fn take_mark(&mut self, stream: &CudaStream, pos: u32) -> Result<(), GpuError> {
         self.stores_at(pos)?;
         if let Some(p) = &self.pending {
@@ -2334,26 +2357,128 @@ impl Body38 {
             Ok(Take::Copy { evicted, .. }) => {
                 if let Some(e) = evicted {
                     self.ple_points.retain(|&(p, _)| p != e);
+                    self.point_rows.retain(|&(p, _)| p != e);
                 }
                 let i = self.ple_points.partition_point(|&(p, _)| p < pos);
                 self.ple_points.insert(i, (pos, self.ple.hist.clone()));
+                let point_row = match (&self.mtp, pos.checked_sub(1)) {
+                    (Some(_), Some(before)) => self.hidden_row(stream, before)?,
+                    _ => None,
+                };
+                if let Some(row) = point_row {
+                    let i = self.point_rows.partition_point(|&(p, _)| p < pos);
+                    self.point_rows.insert(i, (pos, row));
+                }
                 Ok(())
             }
             Ok(Take::Held | Take::Empty) => Ok(()),
             Err(e) => {
                 self.ple_points.clear();
+                self.point_rows.clear();
                 Err(e)
             }
         }
     }
 
+    /// The target's final hidden row at `pos` ([`MtpHidden::Target`]'s
+    /// rows), read from the arena whose record holds it ([`Wrote38`]);
+    /// `None` when none does. Blocking.
+    fn hidden_row(&self, stream: &CudaStream, pos: u32) -> Result<Option<Vec<f32>>, GpuError> {
+        let wide = geo::STREAMS * geo::HIDDEN;
+        for walk in [TargetRows::Step, TargetRows::Pass, TargetRows::Ubatch] {
+            let (first, rows) = self.wrote.of(walk).parts();
+            let Some(row) = pos.checked_sub(first).filter(|&r| r < rows) else {
+                continue;
+            };
+            let buf = self.final_streams(walk);
+            let at = row as usize * wide;
+            if at + wide > buf.len() {
+                return Err(GpuError::shape(
+                    WHAT,
+                    format!(
+                        "the {walk:?} arena's row {row} of {} rows",
+                        buf.len() / wide
+                    ),
+                ));
+            }
+            let v = crate::tensor::Window::<f32>::of(buf, at * size_of::<f32>(), wide)?;
+            return Ok(Some(v.to_host_vec(stream)?));
+        }
+        Ok(None)
+    }
+
+    /// Whether the MTP draft rejoins the sequence at `pos` after a cut there
+    /// ([`Body38::cut`]) or a state put back as its first `pos` positions:
+    /// the point at `pos` carries the target's hidden row at `pos - 1`
+    /// ([`Body38::point_rows`]) and the draft's store holds every position
+    /// below `pos`. False on a load without the draft.
+    #[must_use]
+    pub fn draft_rejoins(&self, pos: u32) -> bool {
+        self.rejoin_row(pos).is_some()
+    }
+
+    /// The hidden row the point at `pos` carries ([`Body38::point_rows`]) where
+    /// the draft rejoins there ([`Body38::draft_rejoins`]).
+    fn rejoin_row(&self, pos: u32) -> Option<&[f32]> {
+        let d = self.mtp.as_ref()?;
+        let (_, row) = self.point_rows.iter().find(|&&(p, _)| p == pos)?;
+        (d.held() >= pos as usize).then_some(&row[..])
+    }
+
+    /// The draft's store cut to `pos` and `row`, the target's hidden row at
+    /// `pos - 1`, written to the step arena's row 0, its record holding that
+    /// one position: what a plain step at `pos - 1` leaves for the draft's
+    /// next walk, the row a window that rejoins the sequence walks first.
+    /// Refused by name, nothing moved, for a row of another width, at 0 and
+    /// on a load without the draft; a copy that fails leaves the store
+    /// forgotten. Blocking.
+    fn rejoin_draft(&mut self, stream: &CudaStream, pos: u32, row: &[f32]) -> Result<(), GpuError> {
+        let wide = geo::STREAMS * geo::HIDDEN;
+        if row.len() != wide || pos == 0 || self.final_streams(TargetRows::Step).len() < wide {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "a rejoin at {pos} with a hidden row of {} values into a step arena of {}",
+                    row.len(),
+                    self.final_streams(TargetRows::Step).len()
+                ),
+            ));
+        }
+        let Body38 {
+            plans,
+            s,
+            a,
+            wa,
+            mtp,
+            wrote,
+            ..
+        } = self;
+        let d = mtp.as_mut().ok_or(GpuError::state(
+            WHAT,
+            "an MTP draft (Body38::open_placed_mtp)",
+        ))?;
+        d.cut(pos);
+        let step = final_streams_mut(plans, [s, a, wa], TargetRows::Step);
+        let mut host = vec![0.0f32; step.len()];
+        host[..wide].copy_from_slice(row);
+        if let Err(e) = step.copy_from_host(stream, &host) {
+            d.forget();
+            return Err(e.into());
+        }
+        wrote.step = Held38::at(pos - 1, 1);
+        Ok(())
+    }
+
     /// A cut to `pos`, behind the stores' position: the point at `pos`
     /// planned for the next call ([`Body38::settle`]), the PLE history set
-    /// back to the point's, every later point dropped, the MTP draft's store
-    /// forgotten (its rows past `pos` belong to the branch the cut dropped),
-    /// and a verify waiting dropped. Refused by name, nothing moved, at 0 (a
-    /// reset) and where no point stands.
-    fn cut(&mut self, pos: u32) -> Result<(), GpuError> {
+    /// back to the point's, every later point dropped, the MTP draft
+    /// rejoining at `pos` where it can ([`Body38::draft_rejoins`]: its store
+    /// cut there, the point's hidden row in the step arena,
+    /// [`Body38::rejoin_draft`]) and its store forgotten where it cannot (its
+    /// rows past `pos` belong to the branch the cut dropped), and a verify
+    /// waiting dropped. Refused by name, nothing moved, at 0 (a reset) and
+    /// where no point stands.
+    fn cut(&mut self, stream: &CudaStream, pos: u32) -> Result<(), GpuError> {
         const WHAT_C: &str = "qwen4exp cut";
         if pos == 0 {
             return Err(GpuError::shape(
@@ -2394,16 +2519,21 @@ impl Body38 {
         self.ckpt
             .cut(pos, self.held)
             .map_err(|e| refuse(e.to_string()))?;
+        let rejoin = self.rejoin_row(pos).map(<[f32]>::to_vec);
         self.ple.hist = hist;
         self.ple_points.retain(|&(p, _)| p <= pos);
+        self.point_rows.retain(|&(p, _)| p <= pos);
         self.pending = None;
         self.staged = None;
         self.held = pos;
         self.wrote.cut(pos);
-        if let Some(d) = self.mtp.as_mut() {
+        let rejoined = rejoin.map(|row| self.rejoin_draft(stream, pos, &row));
+        if !matches!(rejoined, Some(Ok(())))
+            && let Some(d) = self.mtp.as_mut()
+        {
             d.forget();
         }
-        Ok(())
+        rejoined.unwrap_or(Ok(()))
     }
 
     /// What every save takes before its copy: the sequence state at `pos`,
@@ -2524,12 +2654,15 @@ impl Body38 {
 
     /// The draft's side of a sequence state at `pos` ([`DraftRows38`]);
     /// `None` on a load without the draft: the store's rows and the step's
-    /// and the pass's arena rows, each the positions below `pos` — the ones
-    /// a walk can read. Refused by name when the store holds positions past
-    /// `pos` or an arena's rows reach past it: a state's rows are the
-    /// positions the model stands at, and a record past them is a verify's
-    /// rejected tail or an anchor row the commit or the snapshot's caller
-    /// left standing — neither is the state's to carry. Blocking.
+    /// and the pass's arena rows, each the positions below `pos` (the ones a
+    /// walk can read), and the hidden rows of the points the state carries
+    /// ([`Checkpoints::save_points`], [`Body38::point_rows`]), which a put-back
+    /// as a point's prefix rejoins the draft with. Refused by name when the
+    /// store holds positions past `pos` or an arena's rows reach past it: a
+    /// state's rows are the positions the model stands at, and a record past
+    /// them is a verify's rejected tail or an anchor row the commit or the
+    /// snapshot's caller left standing; neither is the state's to carry.
+    /// Blocking.
     fn draft_rows(&self, stream: &CudaStream, pos: u32) -> Result<Option<DraftRows38>, GpuError> {
         const WHAT_D: &str = "qwen4exp snapshot";
         let Some(d) = self.mtp.as_ref() else {
@@ -2562,18 +2695,27 @@ impl Body38 {
         };
         let step = rows(TargetRows::Step, 1)?;
         let pass = rows(TargetRows::Pass, PASS_ROWS)?;
+        let picked = self.ckpt.save_points(pos);
+        let point_rows = self
+            .point_rows
+            .iter()
+            .filter(|(p, _)| picked.contains(p))
+            .cloned()
+            .collect();
         Ok(Some(DraftRows38 {
             held: u32::try_from(held).unwrap_or(u32::MAX),
             store: d.store_host(stream, held)?,
             step,
             pass,
+            point_rows,
         }))
     }
 
     /// Refused by name unless `d` fits this load standing at `pos`, nothing
     /// copied: the draft loaded, its store's positions and each arena's at
     /// or below `pos`, each arena's rows within its buffer (the step's one,
-    /// the pass's [`PASS_ROWS`]) and of the streams' width.
+    /// the pass's [`PASS_ROWS`]) and of the streams' width, and each point's
+    /// hidden row one row of that width at a point in `1..pos`.
     fn draft_fits(&self, d: &DraftRows38, pos: u32) -> Result<(), GpuError> {
         const WHAT_F: &str = "qwen4exp resume";
         if self.mtp.is_none() {
@@ -2604,6 +2746,19 @@ impl Body38 {
                 ));
             }
         }
+        if let Some((p, row)) = d
+            .point_rows
+            .iter()
+            .find(|(p, row)| *p == 0 || *p >= pos || row.len() != wide)
+        {
+            return Err(GpuError::shape(
+                WHAT_F,
+                format!(
+                    "the point at {p}'s hidden row of {} values put back at position {pos}",
+                    row.len()
+                ),
+            ));
+        }
         Ok(())
     }
 
@@ -2612,8 +2767,12 @@ impl Body38 {
     /// pass's arenas their rows, the ubatch's none, and the draft's store
     /// holding `d`'s positions when `at` is `n`. A cut to `at < n` is what a
     /// whole put-back and [`Body38::cut`] leave: the arenas' records cut to
-    /// `at` and the draft's store forgotten, none of its rows copied. Refused
-    /// by name, as [`Body38::draft_fits`] refuses, before any copy. Blocking.
+    /// `at`, and the draft rejoining at `at` where `d`'s store holds every
+    /// position below it and the point there carries its hidden row (the
+    /// store's rows below `at` put back, [`Mtp38::adopt_prefix`], and
+    /// [`Body38::rejoin_draft`]), else the draft's store forgotten, none of
+    /// its rows copied. Refused by name, as [`Body38::draft_fits`] refuses,
+    /// before any copy. Blocking.
     fn put_draft_rows(
         &mut self,
         stream: &CudaStream,
@@ -2623,6 +2782,11 @@ impl Body38 {
     ) -> Result<(), GpuError> {
         const WHAT_P: &str = "qwen4exp resume";
         self.draft_fits(d, n)?;
+        let rejoin = d
+            .point_rows
+            .iter()
+            .find(|&&(p, _)| p == at)
+            .filter(|_| at < n && d.held >= at);
         let Body38 {
             plans,
             s,
@@ -2631,7 +2795,7 @@ impl Body38 {
             mtp,
             wrote,
             ..
-        } = self;
+        } = &mut *self;
         for (walk, (_, v)) in [(TargetRows::Step, &d.step), (TargetRows::Pass, &d.pass)] {
             let len = final_streams(plans, [s, a, wa], walk).len();
             let mut host = vec![0.0f32; len];
@@ -2644,6 +2808,8 @@ impl Body38 {
         ))?;
         if at == n {
             draft.adopt_store(stream, d.held as usize, &d.store)?;
+        } else if rejoin.is_some() {
+            draft.adopt_prefix(stream, at as usize, &d.store)?;
         } else {
             draft.forget();
         }
@@ -2653,6 +2819,9 @@ impl Body38 {
             ubatch: Held38::NONE,
         };
         wrote.cut(at);
+        if let Some((_, row)) = rejoin {
+            self.rejoin_draft(stream, at, row)?;
+        }
         Ok(())
     }
 
@@ -2661,12 +2830,13 @@ impl Body38 {
     /// ([`SeqState::load_prefix`]): the state a whole put-back and a cut to
     /// `at` ([`Body38::cut`]) leave. The stores stand at `at`, the committed
     /// lane stamped there, the PLE history the point's, the points up to `at`
-    /// the model's own, and on a load with the draft its side cut to `at`
-    /// ([`Body38::put_draft_rows`]). Only the rows of the first `at`
-    /// positions go to the card. Returns `at`. Refused by name, nothing
-    /// copied, for another model's state, a draft side the load does not take
-    /// (a state with it onto a load without the draft, or the other way: the
-    /// store layouts differ) or onto a model that is not empty.
+    /// the model's own with their hidden rows, and on a load with the draft
+    /// its side cut to `at` ([`Body38::put_draft_rows`]). Only the rows of
+    /// the first `at` positions go to the card. Returns `at`. Refused by
+    /// name, nothing copied, for another model's state, a draft side the load
+    /// does not take (a state with it onto a load without the draft, or the
+    /// other way: the store layouts differ) or onto a model that is not
+    /// empty.
     fn load_state(&mut self, stream: &CudaStream, s: &Seq38, ask: u32) -> Result<u32, GpuError> {
         const WHAT_L: &str = "qwen4exp resume";
         if self.held != 0 || self.pending.is_some() || self.staged.is_some() {
@@ -2721,6 +2891,12 @@ impl Body38 {
         }
         if let Some(d) = &s.draft {
             self.put_draft_rows(stream, d, n, at)?;
+            self.point_rows = d
+                .point_rows
+                .iter()
+                .filter(|&&(p, _)| p <= at)
+                .cloned()
+                .collect();
         }
         self.restamp(stream, lane, at)?;
         self.ple.hist = cur;
@@ -3827,8 +4003,9 @@ impl GpuModel<Body38> {
     /// [`GpuModel::seq_resume`] of the first `n` positions of `s` the state
     /// can be cut to ([`Seq38::keep_point`]): the model stands at that many,
     /// which it returns, as a whole resume and a rollback to it leave it
-    /// (the draft's store forgotten, its arenas' records cut), with only
-    /// those positions' rows moved to the card
+    /// (the draft rejoined there where the point carries its hidden row and
+    /// the state's store reaches it, else its store forgotten; its arenas'
+    /// records cut), with only those positions' rows moved to the card
     /// ([`SeqState::load_prefix`]). Refused by name as
     /// [`GpuModel::seq_resume`] refuses, and for a prefix of no positions
     /// (reset the model instead). `s`'s copy must have landed.
@@ -3988,6 +4165,7 @@ impl ChainBody for Body38 {
         self.ple.restart()?;
         self.ckpt.clear();
         self.ple_points.clear();
+        self.point_rows.clear();
         if let Some(d) = self.mtp.as_mut() {
             d.forget();
         }
@@ -4111,6 +4289,7 @@ impl Slots for Body38 {
             pending: None,
             ckpt,
             ple_points: Vec::new(),
+            point_rows: Vec::new(),
             ple_hist,
             held: 0,
             wrote: Wrote38::default(),
@@ -4191,9 +4370,15 @@ impl Body38 {
         std::mem::swap(&mut self.pending, &mut seq.pending);
         std::mem::swap(&mut self.ckpt, &mut seq.ckpt);
         std::mem::swap(&mut self.ple_points, &mut seq.ple_points);
+        std::mem::swap(&mut self.point_rows, &mut seq.point_rows);
         std::mem::swap(&mut self.ple.hist, &mut seq.ple_hist);
         std::mem::swap(&mut self.held, &mut seq.held);
         std::mem::swap(&mut self.wrote, &mut seq.wrote);
+        // The ubatch arena is the load's, not the sequence's: another
+        // sequence's prompt call may have written it since this one's, so
+        // the sequence brought live holds no position there. A draft parked
+        // with rows waiting in that arena skips them (`Policy::park`).
+        self.wrote.ubatch = Held38::NONE;
         std::mem::swap(&mut self.last_walk, &mut seq.last_walk);
         // The arena rows a draft walk reads by position (the walk's graph
         // replays the shared arena's address, so the sequence's rows move as
@@ -4375,7 +4560,7 @@ impl Body38 {
             if pos == self.held && self.pending.is_none() {
                 return Ok(());
             }
-            return self.cut(pos);
+            return self.cut(gpu.stream(), pos);
         };
         let rows = p.tokens.len();
         if pos as usize > p.pos0 as usize + rows {

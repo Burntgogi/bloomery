@@ -204,17 +204,21 @@
 //!
 //! The MTP draft keeps the same rule past a break-even, and the server cuts
 //! its prompt calls at the same message starts (the draft's prompt call joins
-//! each run where the one before left it). The draft rejoins a sequence only
-//! where its last call left it: a state put back carries its waiting rows
-//! ([`SlotDrafts::park`]) and it drafts on as if no other sequence had run,
-//! while a cut to a checkpoint — the rows past the cut belonging to the
-//! branch the cut dropped — leaves it proposing nothing until a request
-//! starts from position 0. The seat turns the draft off there
-//! ([`SlotDrafts::turn_off`]), prints a `bloomery-serve-qwen38: the MTP draft
-//! proposes nothing …` line at the cut, and each later prompt call's `mtp
-//! prompt` record names why. A request that keeps every held position with
-//! the draft on keeps the draft. One whose kept prefix would leave the draft
-//! off (a cut, or a draft already off) keeps it only at or past the
+//! each run where the one before left it). A state put back whole carries
+//! the draft's waiting rows ([`SlotDrafts::park`]) and it drafts on as if no
+//! other sequence had run. A cut to a checkpoint, or a state put back as its
+//! first positions, rejoins the draft at the point ([`SlotDrafts::rejoin`])
+//! where the draft was on and the body kept its side there
+//! ([`Body38::draft_rejoins`]: the draft's store holds every position below
+//! the point, and the point the target's hidden row before it). Otherwise
+//! the draft proposes nothing until a request starts from position 0: the
+//! seat turns it off there ([`SlotDrafts::turn_off`]), prints a
+//! `bloomery-serve-qwen38: the MTP draft proposes nothing …` line at the
+//! cut, and each later prompt call's `mtp prompt` record names why. A
+//! request that keeps every held position, or a point the draft rejoins,
+//! with the draft on keeps the draft. One whose kept prefix would leave the
+//! draft off (a cut to a point the draft cannot rejoin, or a draft already
+//! off) keeps it only at or past the
 //! break-even (`Q38::draft_keep`): the prefix whose re-prefill costs what the
 //! draft saves over the reply — the request's tokens through passes, at most
 //! `NOMINAL_REPLY`, that when it bounds nothing — at the placement's prompt
@@ -347,7 +351,8 @@ use app::mtp::{MtpBody, MtpDraft};
 use bloomery_gpu::Gpu;
 use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for;
 use bloomery_gpu::arch::qwen3moe::{
-    Body38, Prompt38, Seq38, TargetRows, checkpoint_budget38, checkpoint_price38, seq38_bytes,
+    Body38, Prompt38, Seq38, TargetRows, checkpoint_budget38, checkpoint_price38,
+    point_row_budget38, seq38_bytes,
 };
 use bloomery_gpu::checkpoint::saved::SaveLane;
 use bloomery_gpu::host::census::TierCensus;
@@ -387,6 +392,7 @@ use model::placement::{Machine, PlacementError, Plan, PlanLevers};
 use refset::arch::qwen4exp::VERIFIED_POSITIONS;
 use refset::arch::qwen4exp::mtp::{DraftFrom, draft_file};
 use runtime::Target as _;
+use runtime::seqstate::pinned;
 use runtime::width::Mode as WidthMode;
 use serve::{
     CacheNote, DraftProps, Drafted, EngineProps, Pending, ResidencyReset, Saved, ServeError,
@@ -430,9 +436,11 @@ const CTX_STEP: usize = 256;
 const MESSAGE_START: &str = "<|im_start|>";
 
 /// Why a cut leaves the MTP draft proposing nothing
-/// ([`SlotDrafts::turn_off`]).
-const DRAFT_OFF_WHY: &str = "the draft rejoins a sequence only where its last call left it, \
-                             and it holds no rows at the kept position";
+/// ([`SlotDrafts::turn_off`]): the body did not keep its side at the kept
+/// position ([`Body38::draft_rejoins`]), or it was off already.
+const DRAFT_OFF_WHY: &str = "the draft rejoins a kept prefix only while it drafts, with its \
+                             store holding every position below the prefix's end and the \
+                             checkpoint there holding the target's hidden row before it";
 
 /// The reply the break-even weighs ([`Q38::draft_keep`]) when a request
 /// bounds nothing, and the most it weighs: the mean greedy reply of the
@@ -562,8 +570,9 @@ impl Place38 {
     /// checks; `place::machine_bp_on`), the one-card plans count them in
     /// `plan_mtp_with_slots`. The host reserves every slot's checkpoints
     /// ([`seqs38`] through [`reserve_checkpoints`], priced at `ctx` positions
-    /// a slot), which the plan's host need, the NVMe tier's floor and its
-    /// arena then count.
+    /// a slot) and, under the draft, every slot's checkpoint hidden rows
+    /// ([`POINT_ROWS_RESERVE`]), which the plan's host need, the NVMe tier's
+    /// floor and its arena then count.
     fn machine(
         self,
         inputs: &PlanInputs,
@@ -588,9 +597,21 @@ impl Place38 {
             }
         };
         reserve_checkpoints(&mut machine, seqs38(inputs, slots), ctx)?;
+        if mtp.is_some() {
+            let bytes = point_row_budget38(gdn_layers(inputs), ctx)?;
+            machine
+                .host
+                .reserves
+                .push((POINT_ROWS_RESERVE.to_owned(), pinned(slots, bytes)));
+        }
         Ok(machine)
     }
 }
+
+/// The host reserve row of a load with the MTP draft that carries its
+/// checkpoints' hidden rows: each slot's points at most, one row each
+/// ([`point_row_budget38`]), beside the checkpoints themselves.
+const POINT_ROWS_RESERVE: &str = "mtp point rows";
 
 /// What the seat's load of `slots` resident sequences of the file `inputs`
 /// describes declares ([`reserve_checkpoints`]): every slot takes checkpoints,
@@ -2387,17 +2408,19 @@ impl Q38 {
 
     /// The drafted seat's keep rule, its one owner: a prefix of `at`
     /// positions the body's rule keeps, where keeping it leaves the draft
-    /// off for the reply — a cut below the held positions, or a draft already
-    /// off — is kept only at or past the break-even for the reply's `reply`
+    /// off for the reply (a cut below the held positions to a point the
+    /// draft cannot rejoin at, [`Body38::draft_rejoins`], or a draft already
+    /// off) is kept only at or past the break-even for the reply's `reply`
     /// tokens through passes (the request's, at most [`NOMINAL_REPLY`], and
     /// that when it bounds nothing); below it the request resets, which turns
     /// the draft back on, and prefills its whole prompt. `None` where the rule
-    /// weighs nothing: no draft, nothing kept, or every held position kept
-    /// with the draft on.
+    /// weighs nothing: no draft, nothing kept, or, with the draft on, every
+    /// held position kept or a cut it rejoins.
     fn draft_keep(&self, at: usize, reply: Option<usize>) -> Option<Branch38> {
         let be = self.break_even?;
         let held = self.s.pos() as usize;
-        if at == 0 || (at >= held && !self.drafts.is_off(self.s.selected())) {
+        let on = !self.drafts.is_off(self.s.selected());
+        if at == 0 || on && (at >= held || self.draft_rejoins(at)) {
             return None;
         }
         let reply = reply.map_or(NOMINAL_REPLY, |r| r.min(NOMINAL_REPLY));
@@ -2407,6 +2430,17 @@ impl Q38 {
             prefix: at,
             break_even,
             reply,
+        })
+    }
+
+    /// Whether the body kept the MTP draft's side at `at`
+    /// ([`Body38::draft_rejoins`]), where a cut to `at` rejoins the draft.
+    fn draft_rejoins(&self, at: usize) -> bool {
+        u32::try_from(at).is_ok_and(|at| {
+            self.s
+                .model()
+                .body("bloomery-serve-qwen38")
+                .is_ok_and(|b| b.draft_rejoins(at))
         })
     }
 
@@ -2799,16 +2833,22 @@ impl Seat for Q38 {
 
     /// The body's commit or its cut to a checkpoint ([`Seat::keep`]
     /// granted it); any other position is refused by name, the body's own
-    /// message. A cut under the MTP draft prints that the draft proposes
-    /// nothing from there ([`DRAFT_OFF_WHY`]).
+    /// message. A cut under the MTP draft rejoins the slot's draft where the
+    /// body kept its side and the draft was on ([`SlotDrafts::rejoin`]);
+    /// otherwise it prints that the draft proposes nothing from there
+    /// ([`DRAFT_OFF_WHY`]).
     fn rollback(&mut self, pos: u32) -> Result<(), GateError> {
         let held = self.s.pos();
         self.s.model_mut().rollback(pos)?;
         if self.drafts.drafts() && pos < held {
             let sel = self.s.selected();
-            self.drafts.turn_off(sel, DRAFT_OFF_WHY)?;
             self.cut_line[sel] = None;
-            draft_off(pos, &format!("a cut back from {held}"));
+            if !self.drafts.is_off(sel) && self.draft_rejoins(pos as usize) {
+                self.drafts.rejoin(sel, pos)?;
+            } else {
+                self.drafts.turn_off(sel, DRAFT_OFF_WHY)?;
+                draft_off(pos, &format!("a cut back from {held}"));
+            }
         }
         Ok(())
     }
@@ -2894,8 +2934,10 @@ impl Seat for Q38 {
     /// of it ([`put_back`]): the sequence's next call runs as it would have
     /// after the whole state's resume and a rollback to the returned position
     /// ([`Seat::rollback`]): a cut short of the state's positions under the
-    /// draft leaves it proposing nothing from there ([`DRAFT_OFF_WHY`]); the
-    /// line says so at the slot's next call, unless the server resets the slot
+    /// draft rejoins the slot's draft where the body kept its side and the
+    /// state was not saved with the draft off ([`SlotDrafts::rejoin`]), else
+    /// leaves it proposing nothing from there ([`DRAFT_OFF_WHY`]); the line
+    /// says so at the slot's next call, unless the server resets the slot
     /// first (its keep is below the break-even, [`Q38::keep_for`]).
     fn resume_prefix(&mut self, state: &dyn Saved, n: usize) -> Result<usize, GateError> {
         let n = u32::try_from(n).unwrap_or(u32::MAX);
@@ -2904,12 +2946,17 @@ impl Seat for Q38 {
         })?;
         if self.drafts.drafts() && at < state.n_tokens() {
             let sel = self.s.selected();
-            self.drafts.turn_off(sel, DRAFT_OFF_WHY)?;
-            let from = state.n_tokens();
-            self.cut_line[sel] = Some((
-                u32::try_from(at).unwrap_or(u32::MAX),
-                format!("a state of {from} positions put back as its first {at}"),
-            ));
+            let pos = u32::try_from(at).unwrap_or(u32::MAX);
+            if !self.drafts.is_off(sel) && self.draft_rejoins(at) {
+                self.drafts.rejoin(sel, pos)?;
+            } else {
+                self.drafts.turn_off(sel, DRAFT_OFF_WHY)?;
+                let from = state.n_tokens();
+                self.cut_line[sel] = Some((
+                    pos,
+                    format!("a state of {from} positions put back as its first {at}"),
+                ));
+            }
         }
         Ok(at)
     }
