@@ -15,10 +15,10 @@
 #         check-<name>           every tools/check-*.sh. None is left out: each reads the tree and runs no cargo and no box
 #                                command, and `recipes.py host-nightly` runs the same set on a Linux host (all ran green on a
 #                                Mac). check-rustflags holds the two cargo files against each other, never this machine's CPU
-#   T1  x86_64 Linux with no card: T0, then every unit of `python3 tools/recipes.py host-nightly` that T0 did not already run
-#       by name (the check scripts and recipes-self-test run once), each `bash tools/gate.sh --release --locked -p <crate>`.
-#       Needs what tools/nightly/install.sh lists: the CUDA headers (cuda.h, curand.h, crt/host_config.h under
-#       CUDA_TOOLKIT_PATH), libclang for bindgen, python3-numpy and python3-pil.
+#   T1  x86_64 or aarch64 Linux with no card: T0, then every unit of `python3 tools/recipes.py host-nightly` that T0 did
+#       not already run by name (the check scripts and recipes-self-test run once), each `bash tools/gate.sh --release
+#       --locked -p <crate>`. Needs what tools/nightly/install.sh lists: the CUDA headers (cuda.h, curand.h,
+#       crt/host_config.h under CUDA_TOOLKIT_PATH), libclang for bindgen, python3-numpy and python3-pil.
 #   T2  the card and fixture tier is not built: `--tier t2` prints that and exits 64.
 #
 # RUSTFLAGS: the repo's .cargo/config.toml targets Zen 3 (znver3) on x86_64 Linux, and a binary built for it may stop with an
@@ -48,6 +48,8 @@ OS=$(uname -s)
 ARCH=$(uname -m)
 HOST_LINUX_X86=0
 if [ "$OS" = Linux ] && [ "$ARCH" = x86_64 ]; then HOST_LINUX_X86=1; fi
+HOST_TIER=0
+if [ "$OS" = Linux ] && { [ "$ARCH" = x86_64 ] || [ "$ARCH" = aarch64 ]; }; then HOST_TIER=1; fi
 
 TIER=
 ONLY=
@@ -83,8 +85,8 @@ fi
 case $TIER in
   t0) ;;
   t1)
-    if [ "$HOST_LINUX_X86" != 1 ]; then
-      say "contrib-check: tier t1 runs the host tier, which needs x86_64 Linux (this is $OS $ARCH); use --tier t0"
+    if [ "$HOST_TIER" != 1 ]; then
+      say "contrib-check: tier t1 runs the host tier, which needs x86_64 or aarch64 Linux (this is $OS $ARCH); use --tier t0"
       exit 64
     fi
     ;;
