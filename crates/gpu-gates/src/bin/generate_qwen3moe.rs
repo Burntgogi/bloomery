@@ -402,6 +402,7 @@ mod cli {
     use gguf::Split;
     use model::arch::Arch;
     use model::arch::qwen35moe::head_list::head_rows_of;
+    use model::arch::qwen35moe::hparams::Hparams;
     use model::arch::qwen35moe::place::{
         Experts, MtpInputs, PlanInputs, machine_bp_on, machine_for_experts, serve_ctx, tier_batch,
     };
@@ -477,6 +478,9 @@ mod cli {
     fn open_file() -> Result<(Split, Family), GateError> {
         let path = ref_model_path()?;
         let file = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
+        if file.architecture() == Some("qwen35") {
+            return Ok((file, Family::Qwen35));
+        }
         if file.architecture() == Some("qwen4exp") {
             return Ok((file, Family::Qwen38));
         }
@@ -2040,9 +2044,11 @@ mod cli {
         lane: Lane,
         t: Instant,
     ) -> Result<Qwen35moeModel, GateError> {
+        let arch = file.architecture().unwrap_or("<missing>").to_owned();
+        let hp = Hparams::read(&file)?;
         let o = Open35 {
             ctx,
-            mma: true,
+            mma: bloomery_gpu_gates::qwen_seat::decode_mma(hp.head_dim, hp.n_head / hp.n_head_kv)?,
             ubatch: ubatch_size()?,
             kv,
             media: false,
@@ -2068,7 +2074,7 @@ mod cli {
             record::lane(card, rate).print();
         }
         println!(
-            "load arch=qwen35moe resident_bytes={} ctx={ctx} cache={} layers={} mode={} \
+            "load arch={arch} resident_bytes={} ctx={ctx} cache={} layers={} mode={} \
              flash_mma={} store_bytes={} ubatch_attn=gqa_prefill_flash_256 ubatch={} in {:.1} s \
              (runtime value)",
             m.resident_bytes(),
