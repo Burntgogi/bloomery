@@ -13,9 +13,14 @@
   <a href="https://github.com/ggml-org/llama.cpp/blob/master/tools/server">llama-server</a>.
 </p>
 
-- **MoE models larger than the card.** Routed experts live on the GPU and in host RAM; the engine counts its own
-  routing and moves the experts it calls most onto the card while it runs. On one RTX 3090 24 GB beside a 256 GB
-  host, DeepSeek-V4.1-Flash `Q3_K_M` (347 GB) serves two requests at 34.4 tok/s in total and GLM-5.3-Flash at 26.9.
+- **MoE models larger than the card, and larger than the host's RAM.** Routed experts live on the GPU and in host
+  RAM; the engine counts its own routing and moves the experts it calls most onto the card while it runs. On one
+  RTX 3090 24 GB beside a 256 GB host, DeepSeek-V4.1-Flash `Q3_K_M` (347 GB) serves two requests at 34.4 tok/s in
+  total and GLM-5.3-Flash at 26.9. When the RAM cannot hold the host's experts either, Qwen3.8, GLM-5.3-Flash and
+  DeepSeek-V4.1-Flash page the rest from the model file on NVMe.
+- **A prompt cache that survives other requests.** The Qwen3.8 and GLM-5.3-Flash seats keep saved prompt states in
+  host RAM: a request that shares a prefix with an earlier one restores it, even after another request used the
+  slot ([recorded on tape](https://tape.midagedev.com/r/u8fnay7pn4djqmy6vvaq)).
 - **Several requests, one pass.** With `--parallel 2` two busy streams run through the model together. With the MTP
   draft off, that gave 25–37 % more tokens a second in total than one stream (0.2.1,
   [measured on the A6000](https://github.com/midagedev/rig-log/blob/main/log/2026-10-06.md#rel021-slots)). The draft
@@ -31,24 +36,46 @@ brew install midagedev/tap/bloomery        # Linux x86-64, NVIDIA sm_86+
 bloomery-serve --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M --port 8080
 ```
 
-## Status (0.2.10)
+## Status (0.3.0)
 
 | Area | State |
 |---|---|
 | Linux x86-64, NVIDIA sm_86 (RTX 3090, RTX A6000, RTX 3060) | Runs. Every number here comes from these cards |
 | NVIDIA driver | R580 or newer (CUDA 13); an older driver is refused at the start |
 | Ada and Blackwell (sm_89, sm_120) | Blackwell ran on a user's RTX 5090 under WSL2 ([#2](https://github.com/midagedev/bloomery/issues/2)): the sm_86 PTX compiles for the card at the first start. Ada not yet run. [Reports welcome](docs/evaluating.md#help-wanted-hardware-we-have-not-run) |
+| NVIDIA DGX Spark (GB10, aarch64) | Builds and runs from source (a contributor's port, [`docs/contrib/dgx-spark.md`](docs/contrib/dgx-spark.md)): the plan treats the unified memory as one pool, `BLOOMERY_ARCH` sets sm_121, and the quant types without an aarch64 kernel run through a scalar mirror. The release binaries are x86-64 only |
 | Host CPU | x86-64 with AVX2 (x86-64-v3), AMD or Intel. Every number here comes from an 8-channel host; a 2-channel desktop host is not measured here and runs the CPU experts slower |
 | macOS, Apple silicon · AMD GPUs, Windows without WSL2 | Not supported yet · Not supported |
 | OpenAI and Anthropic APIs, streaming, tool calls | Every generative model |
 | Several requests at once (`--parallel`, default 2) | One pass on V4.1, GLM-5.3, Qwen3.8 (in turn under `--place bp`) and a whole-card Qwen3-30B or Qwen3.6; in turn on the rest. `--ctx-size` alone is one request's context: the server then serves one request at that length, as llama-server does |
+| Prompt cache (Qwen3.8, GLM-5.3) | Saved states in host RAM (`--cache-ram`; by default the lesser of 8 GiB and half the RAM the plan leaves; on Qwen3.8, 0 on a plan that pages experts from NVMe). A shared prefix restores the last checkpoint inside it; a saved state keeps checkpoints at 512·2^i positions below its end. On Qwen3.8 the card's checkpoints are 4,096 positions apart, so a shared prefix shorter than that does not restore |
 | MTP draft (Qwen3.8, GLM-5.3) | On by default; its width follows measured cost |
 | Qwen3.8 prompts | Each layer seats the prompt's most-used CPU experts on the card (`--place a` and `bp`); the extra stream ring runs only under `--place a` |
-| i-quants | Qwen3.8 `UD-Q3_K_XL` (IQ3_XXS, IQ4_XS, IQ4_NL experts) runs on the card: faster than `UD-Q4_K_XL` on long prompts and decode, slower at P = 512. GLM-5.3 `UD-IQ4_XS` (IQ3_S experts) runs with every routed expert on the host. IQ2_*, IQ1_M and BF16 tensors are not loaded yet |
+| Quant types | Card experts in Q4_K–Q6_K, MXFP4, IQ2_XS, IQ3_XXS, IQ4_XS and IQ4_NL; host kernels add Q2_K, IQ2_XS and Q6_K (`UD-Q2_K_XL` files load). Qwen3.8 `UD-Q3_K_XL` runs on the card: faster than `UD-Q4_K_XL` on long prompts and decode, slower at P = 512. GLM-5.3 `UD-IQ4_XS` runs every routed expert on the host: its IQ3_S gate/up have no card kernel yet. IQ1_M and BF16 tensors are not loaded yet |
 | Cards | One card, or one card plus one expert-tier card (`--place bp`). With `--place` unset and two cards visible, Qwen3.8 and GLM-5.3 add the second card when their plan finds it pays |
-| Host RAM under the model (Qwen3.8) | Runs: the routed experts the RAM cannot hold are read from the model file on NVMe. Tokens equal the all-RAM load; an RTX 3060 12 GB with 27.5 GB of RAM free (WSL2) reads 2.3K–3.7K-token prompts at 57–86 tok/s and decodes at 5–7 tok/s after them. Such a load serves one request at a time with the MTP draft and adaptive residency off (a set `--parallel 2`, draft or residency is refused by name), and sets aside each slot's prompt checkpoints (up to 4 GiB) before it sizes its RAM buffer: the 3060 numbers were read before that, with a 4 GiB larger buffer. On WSL2 with the model on a Windows drive, set `BLOOMERY_NVTIER_READ=buffered` |
-| MiMo-V2.6-Flash | Runs with every routed expert on the host (about 161 GB of RAM for them); the card holds the dense layers, attention and the KV cache. Long prompts are slow: a 5,620-token prompt took 66.6 s to its first token, then 19.1 tok/s (RTX A6000, 0.2.10). Card experts come in 0.2.11 |
-| Vision input (V4.1) | On with `--mmproj <file>` (llama-server's flag), the encoder GGUF `mmproj-DeepSeek-V4.1-Flash-BF16.gguf`; images go in as base64 (`data:` URLs), not fetched URLs. The encoder (1.31 GB) stays resident on a card the plan leaves free, else on the stage card as a reserve the plan counts |
+| Host RAM under the model | Runs on Qwen3.8, GLM-5.3 and V4.1: the routed experts the RAM cannot hold are paged from the model file on NVMe through a RAM arena. Tokens equal the all-RAM load. On a small host the load can be refused at the defaults (see the known issues below). A paged Qwen3.8 load serves one request at a time with the MTP draft off (a set `--parallel 2` or draft is refused by name); adaptive residency runs on it. On WSL2 with the model on a Windows drive, set `BLOOMERY_NVTIER_READ=buffered` |
+| MiMo-V2.6-Flash | Its hot routed experts sit on the card, the rest on the host. After a 5,620-token prompt it decodes at 34.0 tok/s (0.2.10: 19.1), first token at 52.9 s (RTX A6000, `--place` unset, 0.3.0's release check) |
+| Image input | V4.1, Qwen3.6 and the Clef decide seat, with `--mmproj <file>` (llama-server's flag; on Qwen3.6 `--hf` also fetches the encoder beside the model). Images go in as base64 (`data:` URLs), not fetched URLs. A request with an image to a seat started without an encoder is refused by name |
+
+### Known issues and limits (0.3.0)
+
+- **A load on a small-RAM host can be refused at the defaults, on any MoE model.** Two paths lead there. In a
+  plan that pages experts from NVMe, the plan fills the RAM it read exactly. In a plan with no paging, the context
+  search grows to the edge of that reading. Any RAM the server takes after the reading then refuses the load: 132 MB
+  short on an RTX 3060 12 GB with 27.5 GB free (WSL2), and 162 MB short on an RTX 5090 with 64 GB
+  ([#46](https://github.com/midagedev/bloomery/issues/46)). Work-arounds: set `BLOOMERY_HOST_ROOM` a little under the
+  free RAM, or use a smaller `--ctx-size`. A fix is planned for 0.3.1.
+- **Qwen3-30B-A3B on a card it does not fit whole reads the prompt one row at a time.** On an RTX 3060 12 GB a
+  5,619-token prompt reads at 103 tok/s. A fix is planned for 0.3.2.
+- **Qwen3.8 with experts on the host or on a second card runs two requests in turn,** not in one pass. This covers
+  `--place bp` and a paged load.
+- **Qwen3.8's MTP draft:** a request that keeps a cached prefix runs with the draft off. The prompt-state save after a
+  request adds 100–160 ms to the next request's first token ([#46](https://github.com/midagedev/bloomery/issues/46)).
+- **Source builds:** `--version` prints `commit unknown` unless `BLOOMERY_BUILD_COMMIT` is set at build time. `/props`
+  reads `BLOOMERY_GIT_COMMIT`, else the tree's git commit.
+- **Quant types not loaded yet:** Q2_0, IQ2_S, IQ2_XXS and IQ1_M routed experts
+  ([#48](https://github.com/midagedev/bloomery/issues/48)).
+- **Not measured here:** Ada cards (sm_89), and a 2-channel desktop host's CPU experts.
 
 To try it and judge it fairly (against llama-server too): [`docs/evaluating.md`](docs/evaluating.md). Full limits:
 [`docs/serving.md`](docs/serving.md#limits).
@@ -70,12 +97,12 @@ docker run --gpus all -p 8080:8080 -v bloomery-cache:/root/.cache/bloomery \
   ghcr.io/midagedev/bloomery --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M
 
 # or the plain tarball
-tar -xzf bloomery-0.2.10-linux-x86_64-cuda-sm86.tar.gz && cd bloomery-0.2.10-linux-x86_64-cuda-sm86
+tar -xzf bloomery-0.3.0-linux-x86_64-cuda-sm86.tar.gz && cd bloomery-0.3.0-linux-x86_64-cuda-sm86
 bin/bloomery-serve --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M --port 8080
 ```
 
 The tarballs are on the [releases page](https://github.com/midagedev/bloomery/releases)
-([0.2.10](https://github.com/midagedev/bloomery/releases/tag/v0.2.10)). From source: [`docs/BUILD.md`](docs/BUILD.md).
+([0.3.0](https://github.com/midagedev/bloomery/releases/tag/v0.3.0)). From source: [`docs/BUILD.md`](docs/BUILD.md).
 
 ## Use
 
@@ -86,8 +113,8 @@ One binary, six seats; the file's architecture picks the seat, and `--place` can
 | `ds41` | [DeepSeek-V4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash) | `bloomery-serve --hf vcruz305/DeepSeek-V4.1-Flash-GGUF:Q3_K_M` |
 | `glm` | [GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) | `bloomery-serve --hf unsloth/GLM-5.3-Flash-GGUF:UD-Q4_K_XL` |
 | `qwen38` | [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) | `bloomery-serve --hf unsloth/Qwen3.8-Flash-Next-GGUF:UD-Q4_K_XL` |
-| `qwen3` | [Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B), [Qwen3-30B-A3B](https://huggingface.co/Qwen/Qwen3-30B-A3B-Instruct-2507) | `bloomery-serve --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M` |
-| `mimo2` | [MiMo-V2.6-Flash](https://huggingface.co/ggml-org/MiMo-V2.6-Flash-MOPD-GGUF) (routed experts on the host, above) | `bloomery-serve --hf ggml-org/MiMo-V2.6-Flash-MOPD-GGUF:MXFP4` |
+| `qwen3` | [Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) (images with `--mmproj`), [Qwen3-30B-A3B](https://huggingface.co/Qwen/Qwen3-30B-A3B-Instruct-2507) | `bloomery-serve --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M` |
+| `mimo2` | [MiMo-V2.6-Flash](https://huggingface.co/ggml-org/MiMo-V2.6-Flash-MOPD-GGUF) | `bloomery-serve --hf ggml-org/MiMo-V2.6-Flash-MOPD-GGUF:MXFP4` |
 | `decide` | [Clef-Flash](https://huggingface.co/Cloudflare/clef-flash) and [lev](https://huggingface.co/ggml-org/lev-GGUF) (decision models) | `bloomery-serve --hf bartowski/Cloudflare_clef-flash-GGUF:Q5_K_M` |
 
 ```sh
@@ -98,58 +125,86 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
 Claude Code: `ANTHROPIC_BASE_URL=http://localhost:8080`. The API, the flags, concurrent requests, drafts and
 adaptive residency: [`docs/serving.md`](docs/serving.md). What each model needs in GPU, RAM and disk:
 [`docs/models.md`](docs/models.md). In short, Qwen3-30B and Qwen3.6 run on a 24 GB card (or 12–16 GB, split onto
-the CPU by itself); Qwen3.8 wants 128 GB of RAM (less runs, its overflow read from NVMe), GLM-5.3 and V4.1 256 GB.
+the CPU by itself); Qwen3.8 wants 128 GB of RAM, GLM-5.3 and V4.1 256 GB, and less RAM runs with the overflow
+paged from NVMe.
 
 ## Numbers
 
-Two requests at once (`--parallel 2`, both busy) after a 512-token prompt, decode tok/s of both together, on a
-32-core AVX2 host with 8 DDR4 channels and 256 GB of RAM; the 3090 at a 250 W cap. Conditions and footnotes:
-[`docs/performance.md`](docs/performance.md#conditions-of-the-numbers); every row and the history:
+**0.3.0's release check: one request at the serving defaults** (every lever unset, no `--parallel`,
+`--ctx-size 16384`), greedy, thinking off, RTX A6000 (+ RTX 3090 for `bp`), one load per row, the release
+candidate's `bloomery-serve`. Prompt sizes are the server's prompt tokens.
+
+| Model, place | Long prompt: tokens, prefill tok/s, first token | Decode after it | Short prompt decode |
+|---|---|---|---|
+| Qwen3.8 `UD-Q4_K_XL`, `a` | 5,673, 1,693, 3.38 s | 75.1 tok/s | 86.3 tok/s |
+| Qwen3.8 `UD-Q4_K_XL`, `bp` | 5,673, 1,700, 3.36 s | 80.5 tok/s | 97.3 tok/s |
+| Qwen3.6-35B-A3B `UD-Q4_K_XL`, unset (picks `a`) | 5,673, 7,122, 0.81 s | 115 tok/s | 118 tok/s |
+| GLM-5.3-Flash `UD-IQ4_XS`, unset (picks `a`) | 5,548, 108, 51.2 s | 24.4 tok/s | 23.7 tok/s |
+| DeepSeek-V4.1-Flash `Q3_K_M`, unset (picks `a`) | 5,644, 407, 13.9 s | 42.4 tok/s | 41.1 tok/s |
+| MiMo-V2.6-Flash `MXFP4`, unset (picks `a`) | 5,620, 106, 52.9 s | 34.0 tok/s | 37.7 tok/s |
+
+**Two requests at once** (`--parallel 2`, both busy) after a 512-token prompt, decode tok/s of both together, and
+one request's decode at depth 4096. Measured on 0.3.0 (2026-10-12), on a 32-core AVX2 host with 8 DDR4 channels and
+256 GB of RAM; the 3090 at a 250 W cap; the MTP draft off. Conditions and the earlier rows:
+[`docs/performance.md`](docs/performance.md#conditions-of-the-numbers) and
 [rig-log's bench page](https://github.com/midagedev/rig-log/blob/main/docs/bloomery-bench.md).
 
 **One RTX 3090 24 GB**
 
-| Model | Where it runs | Two requests, tok/s in total | Prompt tok/s (P = 512) |
-|---|---|---|---|
-| Qwen3-30B-A3B `Q4_K_M` | the whole model on the card | 254.0 | 6,482 |
-| Qwen3.6-35B-A3B `Q4_K_M` | the whole model on the card | 193.9 ¹ | 5,834 |
-| Qwen3.8-Flash-Next `UD-Q4_K_XL` | card + CPU | 60.7 | 486 |
-| GLM-5.3-Flash `UD-Q4_K_XL` | card + CPU | 26.9 | 179 |
-| DeepSeek-V4.1-Flash `Q3_K_M` | card + CPU | 34.4 ² | 199 |
+| Model | Where it runs | Two requests, tok/s in total | Decode at depth 4096 | Prompt tok/s (P = 512 / 4096) |
+|---|---|---|---|---|
+| Qwen3-30B-A3B `Q4_K_M` | the whole model on the card | 252.5 | 164.1 | 6,496 / 6,801 |
+| Qwen3.6-35B-A3B `Q4_K_M` | the whole model on the card | 257.3 | 181.8 | 5,766 / 6,685 |
+| Qwen3.8-Flash-Next `UD-Q4_K_XL` | card + CPU | 64.3 ¹ | 51.5 ¹ | 502 / 664 ¹ |
+| GLM-5.3-Flash `UD-Q4_K_XL` | card + CPU | 25.3 ² | 19.5 | 176 / 205 |
+| DeepSeek-V4.1-Flash `Q3_K_M` | card + CPU | 33.5 | 26.9 | 195 / 376 |
 
 **RTX A6000 48 GB + RTX 3090 24 GB (`--place bp`)**
 
-| Model | Two requests, tok/s in total | Prompt tok/s (P = 512) |
-|---|---|---|
-| DeepSeek-V4.1-Flash `Q3_K_M` | 55.9 | 206 |
-| GLM-5.3-Flash `UD-Q4_K_XL` | 35.3 | 223 |
-| Qwen3.8-Flash-Next `UD-Q4_K_XL` | — ³ | — ³ |
-
-**RTX A6000 48 GB, one request, Qwen3.8-Flash-Next (0.2.8, MTP on, `--place a`)**
-
-| File | Prompt tok/s (P = 512) | Prompt tok/s (P = 4096) | Decode tok/s after the 4,096-token prompt |
+| Model | Two requests, tok/s in total | Decode at depth 4096 | Prompt tok/s (P = 512 / 4096) |
 |---|---|---|---|
-| `UD-Q4_K_XL` | 1,026 | 1,673 | 90.5 |
-| `UD-Q3_K_XL` | 1,336 | 1,875 | 96.8 |
+| DeepSeek-V4.1-Flash `Q3_K_M` | 56.1 | 39.0 | 233 / 398 |
+| GLM-5.3-Flash `UD-Q4_K_XL` | 34.0 | 22.7 | 218 / 262 |
+| Qwen3.8-Flash-Next `UD-Q4_K_XL` | — ³ | 90.5 | — / 1,777 |
 
-A prose prompt, 96 tokens after it, the mean of four rounds in one window, the serving defaults, the release
-candidate's build. 0.2.7 ran in the same window: `UD-Q4_K_XL` 957, 1,403 and 89.0; `UD-Q3_K_XL` 1,161, 1,704 and 97.5
-(at P = 4,096, `UD-Q4_K_XL` 1.19× ± 0.02, at P = 512 1.07× ± 0.03).
-Decode with the MTP draft moves ±5 % between rounds; the verify pass's time is unchanged within that
-([measured](https://github.com/midagedev/rig-log/blob/main/log/2026-10-09.md#rel028-ab)).
+¹ with `BLOOMERY_RESIDENCY=mid-p32-s1` · ² 29.1 with `BLOOMERY_RESIDENCY=mid-p0-s1` · ³ two requests run in turn on
+an expert-tier load today; the engine refuses one pass of both by name.
 
-¹ measured when Qwen3.6 ran two requests in turn (one request's rate); one pass since 0.2.3, not re-measured · ² adaptive residency off · ³ two requests in turn on two cards
-today. Qwen3.8 and GLM-5.3 ran with the MTP draft off.
+**One RTX 3060 12 GB** — one request at the serving defaults (`--ctx-size 16384`, every lever unset), 0.3.0's
+release tarball, an i7-12700F desktop with 32 GB of RAM under WSL2, greedy, thinking off.
+
+| Model | Long prompt: tokens, prefill tok/s, first token | Decode after it | Short prompt decode |
+|---|---|---|---|
+| Qwen3-30B-A3B `Q4_K_M`, card + CPU | 5,619, 103 ⁵, 54.4 s | 38.8 tok/s | 40.4 tok/s |
+
+⁵ the prompt runs one row at a time on this load (see the known issues).
+
+**Contributors' cards** — one request at the serving defaults, measured by
+[@juliankang4](https://github.com/juliankang4) on their own hardware at 0.3.0, greedy, thinking off, 256 tokens.
+Each row is their measurement on that card; the conditions, logs and tapes are in
+[#46](https://github.com/midagedev/bloomery/issues/46).
+
+| Card | Model | ~4K prompt: prefill tok/s, first token | Decode after it | Short prompt decode |
+|---|---|---|---|---|
+| RTX 5090 32 GB | Qwen3.6-35B-A3B `Q4_K_M`, whole on the card | 14,937, 276 ms | 345.2 tok/s | 356.1 tok/s |
+| RTX 5090 32 GB | Qwen3.8-Flash-Next `UD-Q4_K_XL` ⁴ | 447, 9.12 s | 54.5 tok/s | 47.7 tok/s |
+| DGX Spark (GB10) | Qwen3.6-35B-A3B `Q4_K_M`, whole | 4,576, 899 ms | 89.8 tok/s | 93.5 tok/s |
+| DGX Spark (GB10) | Qwen3.8-Flash-Next `UD-Q4_K_XL`, whole, MTP draft on | 1,038, 4.11 s | 41.6 tok/s | 41.5 tok/s |
+
+⁴ with `BLOOMERY_HOST_ROOM=56G` on 64 GB of RAM: 0.3.0 refuses this load at the defaults.
 
 ## Why it is fast
 
-Each point has a same-engine measurement in [`docs/performance.md`](docs/performance.md#why-it-is-fast):
+Each point has a same-engine measurement in [`docs/performance.md`](docs/performance.md#why-it-is-fast) or a
+release's check:
 
 - **Experts move to where they are used**: V4.1 decode 29.48 → 43.86 tok/s with adaptive residency.
 - **The card and the CPU work on a prompt at once** (V4.1): two batches in flight, 1.20× at P = 4096.
 - **A prompt's CPU experts move to the card** (Qwen3.8): each layer seats the experts the prompt uses most, and
   they stay for the answer; P = 4096 from 733 to 1,258 tok/s on the A6000.
 - **Qwen prompts as int8 tensor-core GEMMs**: P = 4096 from 357 to 2,615 tok/s, then a prefill flash kernel.
+- **MiMo's hot experts on the card**: decode after a 5,620-token prompt 19.1 → 34.0 tok/s (0.2.10 → 0.3.0 release
+  checks, A6000).
 - **CPU experts at memory speed**: AVX2 kernels on the stored quantization, grouped dispatch on a pinned pool.
 - **One CUDA graph a decode step**, with the CPU experts inside it, and speculative decoding (MTP, DSpark).
 
@@ -160,8 +215,8 @@ and every gate is shown to fail on its defect before the fix lands ([how](docs/p
 
 Issues and pull requests are welcome, in Korean or English: [`CONTRIBUTING.md`](CONTRIBUTING.md)
 ([한국어](CONTRIBUTING.ko.md)). Two tracks we hope for are a new model architecture
-([`docs/contrib/new-model.md`](docs/contrib/new-model.md)) and the NVIDIA DGX Spark port
-([`docs/contrib/dgx-spark.md`](docs/contrib/dgx-spark.md)). Starter work carries the
+([`docs/contrib/new-model.md`](docs/contrib/new-model.md)) and the NVIDIA DGX Spark, which runs since 0.3.0 and
+next scales across nodes ([`docs/contrib/dgx-spark.md`](docs/contrib/dgx-spark.md)). Starter work carries the
 [good first issue](https://github.com/midagedev/bloomery/labels/good%20first%20issue) label; questions go to
 [Discussions](https://github.com/midagedev/bloomery/discussions). Review looks first at code shape: one owner for
 shared logic, no second copy, no silent failure.
