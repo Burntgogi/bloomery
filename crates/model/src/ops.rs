@@ -4176,7 +4176,8 @@ const _: () = assert!(UNION_INLINE_COLS == DEFER_MAX_COLS);
 /// The most bytes one activation column of `k` values takes in an encoding a
 /// fused kernel reads at `k` — q8_K, or q8_2_x4 with its q8_2 tail — and 0
 /// when none does: what a union scratch holds per column before it knows its
-/// stacks' types.
+/// stacks' types. Q2_0's q8_0 column, 34 bytes per 32 values, is never the
+/// larger one: q8_2_x4 takes 36 at every `k` Q2_0 takes.
 pub(crate) fn col_bytes_max(k: usize) -> usize {
     let q8k = if k.is_multiple_of(256) {
         qdot::col_bytes(GgmlType::Q3_K, k)
@@ -5746,11 +5747,11 @@ mod tests {
     };
     use gguf::{GgmlType, Gguf};
 
-    /// A GGUF v3 file holding one `[32, 2]` tensor `w` of type `ty` over zero bytes —
+    /// A GGUF v3 file holding one `[k, 2]` tensor `w` of type `ty` over zero bytes —
     /// the least the strict reader opens.
-    fn one_tensor_file(ty: GgmlType) -> std::path::PathBuf {
-        let rows = 2u64;
-        let bytes = ty.type_size().unwrap() * (32 / ty.blck_size().unwrap()) * rows;
+    fn one_tensor_file(ty: GgmlType, k: usize) -> std::path::PathBuf {
+        let (k, rows) = (k as u64, 2u64);
+        let bytes = ty.type_size().unwrap() * (k / ty.blck_size().unwrap()) * rows;
         let mut b = Vec::new();
         b.extend_from_slice(b"GGUF");
         b.extend_from_slice(&3u32.to_le_bytes());
@@ -5759,7 +5760,7 @@ mod tests {
         b.extend_from_slice(&1u64.to_le_bytes());
         b.push(b'w');
         b.extend_from_slice(&2u32.to_le_bytes());
-        b.extend_from_slice(&32u64.to_le_bytes());
+        b.extend_from_slice(&k.to_le_bytes());
         b.extend_from_slice(&rows.to_le_bytes());
         b.extend_from_slice(&ty.as_u32().to_le_bytes());
         b.extend_from_slice(&0u64.to_le_bytes()); // offset
@@ -5779,13 +5780,15 @@ mod tests {
 
     /// No CPU matmul takes a BF16 weight: every entry that reaches the scalar arm of the
     /// fused decision refuses it with an error naming the type, instead of running it
-    /// against f32 activations. A Q8_0 weight takes the fused arm in every entry alike
-    /// (`qdot::fuses`, the Q8_0 x q8_2_x4 kernel): over zero bytes every output is 0.
+    /// against f32 activations. A Q8_0 or Q2_0 weight takes the fused arm in every entry
+    /// alike (`qdot::fuses`, the Q8_0 x q8_2_x4 and Q2_0 x q8_0 kernels): over zero bytes
+    /// every output is 0.
     // PIN(2026-09-27): Q8_0 moved from the refusals to the fused arm — qdot fuses Q8_0 (q8qdot).
+    // PIN(2026-10-12): Q2_0 joins the fused arm: qdot fuses Q2_0 against mainline's q8_0 column.
     #[test]
     fn matmul_refuses_weight_types_without_an_activation_format() {
         let ty = GgmlType::BF16;
-        let path = one_tensor_file(ty);
+        let path = one_tensor_file(ty, 32);
         let g = Gguf::open(&path).unwrap();
         let w = g.find("w").unwrap();
         let x = Tensor2::zeros(32, 1);
@@ -5804,33 +5807,38 @@ mod tests {
         }
         std::fs::remove_file(&path).unwrap();
 
-        let ty = GgmlType::Q8_0;
-        assert!(qdot::fuses(ty, 32), "{ty}: qdot fuses a 32-value row");
-        let path = one_tensor_file(ty);
-        let g = Gguf::open(&path).unwrap();
-        let w = g.find("w").unwrap();
-        let fused = |r: Result<Tensor2, crate::ModelError>, entry: &str| {
-            let y = r.unwrap_or_else(|e| panic!("{ty}: {entry} must take the fused arm, got {e}"));
-            assert_eq!(
-                (y.ne0, y.ne1, y.data.as_slice()),
-                (2, 1, &[0.0f32; 2][..]),
-                "{ty}: {entry}"
+        for (ty, k) in [(GgmlType::Q8_0, 32), (GgmlType::Q2_0, 64)] {
+            assert!(qdot::fuses(ty, k), "{ty}: qdot fuses a {k}-value row");
+            let path = one_tensor_file(ty, k);
+            let g = Gguf::open(&path).unwrap();
+            let w = g.find("w").unwrap();
+            let x = Tensor2::zeros(k, 1);
+            let fused = |r: Result<Tensor2, crate::ModelError>, entry: &str| {
+                let y =
+                    r.unwrap_or_else(|e| panic!("{ty}: {entry} must take the fused arm, got {e}"));
+                assert_eq!(
+                    (y.ne0, y.ne1, y.data.as_slice()),
+                    (2, 1, &[0.0f32; 2][..]),
+                    "{ty}: {entry}"
+                );
+            };
+            fused(matmul_q(&g, w, &x), "matmul_q");
+            fused(
+                matmul_q_group(&g, &[w], &[&x]).map(|mut v| v.remove(0)),
+                "matmul_q_group",
             );
-        };
-        fused(matmul_q(&g, w, &x), "matmul_q");
-        fused(
-            matmul_q_group(&g, &[w], &[&x]).map(|mut v| v.remove(0)),
-            "matmul_q_group",
-        );
-        fused(
-            matmul_q_group_swiglu(&g, &[w], &[GroupInput::Ready(&x)]).map(|(mut v, _)| v.remove(0)),
-            "matmul_q_group_swiglu",
-        );
-        out = [f32::NAN; 2];
-        matvec_q_local(&g, w, x.col(0), &mut out)
-            .unwrap_or_else(|e| panic!("{ty}: matvec_q_local must take the fused arm, got {e}"));
-        assert_eq!(out, [0.0f32; 2], "{ty}: matvec_q_local");
-        std::fs::remove_file(&path).unwrap();
+            fused(
+                matmul_q_group_swiglu(&g, &[w], &[GroupInput::Ready(&x)])
+                    .map(|(mut v, _)| v.remove(0)),
+                "matmul_q_group_swiglu",
+            );
+            out = [f32::NAN; 2];
+            matvec_q_local(&g, w, x.col(0), &mut out).unwrap_or_else(|e| {
+                panic!("{ty}: matvec_q_local must take the fused arm, got {e}")
+            });
+            assert_eq!(out, [0.0f32; 2], "{ty}: matvec_q_local");
+            std::fs::remove_file(&path).unwrap();
+        }
     }
 
     /// A column-mapped input's output has one column per listed column, a
@@ -5838,7 +5846,7 @@ mod tests {
     /// name before any byte is read — never clamped to the last column.
     #[test]
     fn cols_input_shapes_its_output_and_refuses_a_column_past_the_block() {
-        let path = one_tensor_file(GgmlType::F32);
+        let path = one_tensor_file(GgmlType::F32, 32);
         let g = Gguf::open(&path).unwrap();
         let w = g.find("w").unwrap();
         let x = Tensor2::zeros(32, 2);

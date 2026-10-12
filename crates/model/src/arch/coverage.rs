@@ -1667,8 +1667,8 @@ mod tests {
             !super::routed_unrun(&routed(GgmlType::Q4_K, 100), super::qwen38_card_routed),
             "q4_K at a width only the card takes"
         );
-        // The host's alone: q6_K and q3_K stacks stay host-served.
-        for ty in [GgmlType::Q6_K, GgmlType::Q3_K] {
+        // The host's alone: q6_K, q3_K and q2_0 stacks are host-served.
+        for ty in [GgmlType::Q6_K, GgmlType::Q3_K, GgmlType::Q2_0] {
             assert!(
                 !super::routed_unrun(&routed(ty, 2560), super::qwen38_card_routed),
                 "{ty}"
