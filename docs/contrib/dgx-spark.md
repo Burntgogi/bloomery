@@ -167,8 +167,16 @@ irrelevant to a whole-on-card run that never starts a host service.
   card on first start"), and the loader says it for Blackwell: "A payload built for a standard pre-Blackwell target, such as
   `sm_86`, may instead be converted to PTX and JIT-compiled by the driver on Blackwell"
   (`cuda-host/src/embedded.rs:58-62` at fork rev `4da6c13`, `Cargo.toml:30`), and the first run on a Spark did it
-  (section 1 `[#13]`). First JIT cost on the Spark's Arm cores is `[unmeasured]` (10–25 s measured on the box,
-  `README.release.md`).
+  (section 1 `[#13]`). The first JIT on the Arm cores, measured on one Spark (driver 595.84,
+  [#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6117747643)): a first start of `bloomery-serve`
+  with Qwen3.6-35B-A3B `Q4_K_M` and an empty `CUDA_CACHE_PATH` took 10.5 to 11.8 s to `listening`, and a later start
+  with the cache in place 4.1 s. The start without the cache minus the start with it, 6.4 to 7.7 s (median 6.5 s), is
+  an estimate of the JIT cost `[derived]`. The first pair's difference is 1.2 to 1.3 s larger than the other two; the
+  extra is not user CPU time (that start's system time was 2.1 to 2.2 s higher), and its cause was not measured. For
+  comparison, in the same conditions `oxart_jit` on the binary's whole `.oxart` section (311 entries) took 8.7 to 8.8 s
+  with an empty cache, counting the file read, the context creation and the attribute reads, and 0.4 s with the cache
+  in place; the difference, 8.3 to 8.4 s, is the JIT of every entry by the same subtraction `[derived]`. The first
+  start is inside the 10 to 25 s measured on the box (`README.release.md`).
 - **`sm_121` for P3.** The fork's target table has `capability: 121` (`cuda-target-spec/src/lib.rs:382,417,447`) and its
   selection tests name `sm_121a`/`sm_121f` (`cuda-oxide-codegen/src/target/tests/selection.rs:162-179`). Whether LLVM 21's
   NVPTX backend accepts `sm_121` is `[unverified]`; `cargo oxide doctor` passes on aarch64 `[#13]`. The fork's `tcgen05` path
@@ -259,11 +267,19 @@ them: the reference sets are at <https://huggingface.co/datasets/midagedev/bloom
 with each base model's licence), and how to regenerate the fixtures goes with them. The fixture files are about 49 GB in all, measured on the box (glm5next 8 GB, qwen38 11 GB, v41 16 GB, v41-r8
 7.3 GB, the `fx_` reference sets 6.4 GB; see [`local-check.md`](local-check.md)), but because the bytes are reproducible, publishing
 them is optional: publish each source model's header (a few MB per
-shard) and the seed, plus the sets. Whether `fixture generate` reads only the source's header is `[unverified]` (the
-`gate-fixture` recipe's "Reads headers only", `justfile` near line 1013, is about the gate); whether the fill is
-bit-identical on aarch64 is answered by the digest test, run once there. A licence question comes with publishing: the
-generator copies the source's `tokenizer.*` and `general.*` keys (`fixture/mod.rs:12-14`), so a fixture carries the source
-model's tokenizer (Q3).
+shard), each shard's length and the seed, plus the sets. `fixture generate` does not read the source's tensor data,
+but it opens each source file through the loader's bounds check, which refuses a tensor that ends past the end of the
+file (`crates/gguf/src/lib.rs:957` at `e659f4fe`). On qwen38
+([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6117747643)), the real shards and the same shards
+cut at the data offset and grown back to their full length as holes gave the same bytes, and a cut shard left short was
+refused (`data at 18720+0 size 675430400 exceeds the file`); no length in between was tried. So a header grown to the
+file's length as a sparse file is enough, which is what `fixture fetch` writes, at the size the repo lists for each
+file (`crates/model/src/bin/fixture.rs:24-27` at `e659f4fe`). The shortest length the check passes is the end of the
+last tensor, which the header's tensor offsets and sizes give `[derived]`. On aarch64 the fill matches the x86_64
+pins: the digest test passes with all 12 pinned cases, and `fixture fetch glm5next` run twice wrote identical bytes,
+shard 1 with the sha256 pinned as `FIXTURE_SHA256`. A licence question
+comes with publishing: the generator copies the source's `tokenizer.*` and `general.*` keys (`fixture/mod.rs:12-14`), so
+a fixture carries the source model's tokenizer (Q3).
 
 **What the fixture tier exercises on a Spark.** The fixture header "names the card budget that forces the plan to offload"
 (`ref-paths.sh:33-35`), so the fixture gates run the **host tier**: `qdot`, the CPU attention, the card/host protocol. A
@@ -369,12 +385,13 @@ Added 2026-10-11:
 ## 6. Not verified
 
 The aarch64 build of P0 and the readings of section 1 are the contributor's records on two DGX Sparks
-([#13](https://github.com/midagedev/bloomery/issues/13), [#14](https://github.com/midagedev/bloomery/pull/14)); the
-maintainers' checks ran on x86_64. Still open: LLVM 21 and `sm_121` PTX; the host-tier protocol's correctness on Arm
-(its spin sites, section 3.1); whether `fixture generate` needs only a source header; fixture fill determinism on
-aarch64; the card's read rate over pageable memory (section 7); the NVMe read rate on a Spark; of section 8, the latency of
-a direct link, small-message bandwidth in protocol mode, `cuStreamWaitValue32` on a page the NIC wrote, the hit rates, S₁,
-BW and the switch hop (8.10). Its link facts (8.1) are sourced.
+([#13](https://github.com/midagedev/bloomery/issues/13), [#14](https://github.com/midagedev/bloomery/pull/14)), and
+the readings in sections 3.2 and 3.4 are the contributor's on one Spark
+([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6117747643)); the maintainers' checks ran on
+x86_64. Still open: LLVM 21 and `sm_121` PTX; the host-tier protocol's correctness on Arm
+(its spin sites, section 3.1); the card's read rate over pageable memory (section 7); the NVMe read rate on a Spark;
+of section 8, the latency of a direct link, small-message bandwidth in protocol mode, `cuStreamWaitValue32` on a page
+the NIC wrote, the hit rates, S₁, BW and the switch hop (8.10). Its link facts (8.1) are sourced.
 
 ## 7. Above the pool: the card computes the NVMe tier
 
