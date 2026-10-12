@@ -142,6 +142,13 @@
 //!   the end): each stands at the point with the draft's store forgotten and the arenas'
 //!   records cut there, so a walk that reads either arena is refused with the same words both
 //!   ways and not the whole state's.
+//! - (sl) a drafted run's state of `n` positions saved on a save lane (`seq_save_async`), whole
+//!   and after a rollback that forgot the draft's store: the lane's copy carries the draft's
+//!   store rows of those positions beside the target's rows and recurrent stores, so its bytes
+//!   are the target's and the store's `n` of its `ctx` positions (the plan's store bytes times
+//!   `n / ctx`): they follow `n`, not `ctx`. With the store's rows overwritten by other ids, the
+//!   state put back whole holds the draft's count of the save and the store's rows below `n`
+//!   bit for bit.
 //! - (i) a pass the width chooser holds back right after the server's cut
 //!   step (the prompt call, then its last id as the seat's first step): the
 //!   chooser walks the draft's waiting rows first (`Draft::before_plain`,
@@ -239,7 +246,8 @@ mod gate {
     use bloomery_gpu::GpuError;
     use bloomery_gpu::arch::qwen3moe::{
         Body38, MTP_GRAPH_ROWS, MTP_ROWS, MTP_STORE_ROWS, Mtp38, MtpDraft, MtpFeed, MtpHead,
-        MtpHidden, MtpMode, MtpNode, MtpTaps, Prompt38, Qwen38Model, Store38Host, TargetRows,
+        MtpHidden, MtpMode, MtpNode, MtpTaps, Prompt38, Qwen38Model, Seq38, Store38Host,
+        TargetRows, checkpoint_bytes, seq_positional_bytes, seq38_bytes,
     };
     use bloomery_gpu::fault::FaultSite;
     use bloomery_gpu::weights::DevWeight;
@@ -2394,17 +2402,7 @@ mod gate {
         let ids: Vec<u32> = (0..at + 2)
             .map(|i| (prompt[i % prompt.len()] + 1) % vocab)
             .collect();
-        for (i, run) in ids[..at].chunks(MTP_STORE_ROWS).enumerate() {
-            m.mtp_walk(
-                MtpFeed::Rows {
-                    tokens: run,
-                    pos0: u32::try_from(i * MTP_STORE_ROWS)?,
-                    hidden: MtpHidden::Host(&zeros[..run.len() * WIDE]),
-                },
-                MtpHead::Rows,
-                MtpMode::Store,
-            )?;
-        }
+        overwrite_store(&mut m, prompt, at, 1)?;
         m.mtp_walk(
             MtpFeed::Rows {
                 tokens: &ids[at..at + 1],
@@ -2451,25 +2449,12 @@ mod gate {
         at: usize,
     ) -> Result<[String; 2], GateError> {
         let vocab = u32::try_from(m.body("(kp-draft)")?.vocab())?;
-        let ids: Vec<u32> = (0..=at)
-            .map(|i| (prompt[i % prompt.len()] + 1) % vocab)
-            .collect();
-        let zeros = vec![0.0f32; MTP_STORE_ROWS * WIDE];
-        for (i, run) in ids.chunks(MTP_STORE_ROWS).enumerate() {
-            m.mtp_walk(
-                MtpFeed::Rows {
-                    tokens: run,
-                    pos0: u32::try_from(i * MTP_STORE_ROWS)?,
-                    hidden: MtpHidden::Host(&zeros[..run.len() * WIDE]),
-                },
-                MtpHead::Rows,
-                MtpMode::Store,
-            )?;
-        }
+        let first = [(prompt[0] + 1) % vocab];
+        overwrite_store(m, prompt, at + 1, 1)?;
         let read = |m: &mut Qwen38Model, walk: TargetRows| -> Result<String, GateError> {
             let r = m.mtp_draft(
                 MtpFeed::Rows {
-                    tokens: &ids[..1],
+                    tokens: &first,
                     pos0: u32::try_from(at + 1)?,
                     hidden: MtpHidden::Target { walk, first: 0 },
                 },
@@ -2570,6 +2555,144 @@ mod gate {
             verdict(ok)
         );
         Ok((m, ok))
+    }
+
+    /// (sl): a drafted run's state saved on a save lane (`seq_save_async`) twice, its copy
+    /// landed each time: whole, the draft's store holding all `n` positions, then after a
+    /// rollback to a point `at` below `n`, which forgets the store (it holds 0 of `at`). Each
+    /// copy's bytes (`SaveCost::bytes`) are the target's rows of the state's positions
+    /// ([`seq_positional_bytes`]), its recurrent stores at the end and at each point the state
+    /// carries ([`checkpoint_bytes`]), and the draft's store rows of the same positions,
+    /// `kv_bytes * n / ctx` of the store's `kv_bytes` over its `ctx` positions (the plan's),
+    /// whatever the store holds: they follow `n`, not `ctx`. Then store walks of other ids,
+    /// each round its own, overwrite the store's rows below the state's positions (seen to
+    /// change), and the state put back whole leaves the store holding the positions it held at
+    /// the save, and its rows below the state's positions the saved ones bit for bit
+    /// ([`store_of`]). Mutants: the draft's store read whole on the engine stream instead of
+    /// in the copy (the copies' bytes lack the draft's term); the K plane's spans in place of
+    /// the V plane's (the V rows stay overwritten); the planes' spans strided by `n`
+    /// positions, not `ctx` (the second KV head's rows stay overwritten); a put-back that
+    /// counts the state's positions (the rolled-back state's store holds `at`, not 0).
+    fn lane_save(
+        m: Qwen38Model,
+        prompt: &[u32],
+        kv_bytes: u64,
+    ) -> Result<(Qwen38Model, bool), GateError> {
+        const N: usize = 6;
+        let ctx = m.body("(sl)")?.ctx() as u32;
+        let mut m = m;
+        m.body_parts("(sl)")?.2.set_checkpoints(true);
+        let mut m = {
+            let (mut s, mut spec) = drafted_session(m, step_cfg(Prompt38::Auto), ctx)?;
+            let first = spec.prompt(&mut s, prompt)?;
+            runtime::generate(
+                &mut s,
+                &mut spec,
+                prompt,
+                first,
+                &runtime::Stop::new(N, ctx)?,
+                &mut Kept::default(),
+            )?;
+            s.into_model()
+        };
+        let n = m.pos();
+        let (state, held, whole_ok) = lane_round(&mut m, prompt, kv_bytes, ("whole", 1))?;
+        let whole_ok = whole_ok && held == n as usize;
+        let at = state.keep_point(n.saturating_sub(1));
+        let cut_ok = if at == 0 || at >= n {
+            println!(
+                "(sl) the state of {n} positions carries no point below its end (asked {}, \
+                 kept {at}): nothing to roll back to FAIL",
+                n.saturating_sub(1)
+            );
+            false
+        } else {
+            m.rollback(at)?;
+            let (_, held, ok) = lane_round(&mut m, prompt, kv_bytes, ("rolled back", 2))?;
+            ok && held == 0
+        };
+        m.body_parts("(sl)")?.2.set_checkpoints(false);
+        m.reset()?;
+        Ok((m, whole_ok && cut_ok))
+    }
+
+    /// One [`lane_save`] round on the model as it stands, `round` its name and the ids'
+    /// shift: the state saved on a lane and its copy landed, the store overwritten
+    /// ([`overwrite_store`]), the state put back whole. The state, the positions the draft's
+    /// store held at the save, and the round's verdict.
+    fn lane_round(
+        m: &mut Qwen38Model,
+        prompt: &[u32],
+        kv_bytes: u64,
+        round: (&str, u32),
+    ) -> Result<(Seq38, usize, bool), GateError> {
+        let (what, shift) = round;
+        let n = m.pos() as usize;
+        let held_of = |m: &Qwen38Model| -> Result<usize, GateError> {
+            Ok(m.body("(sl)")?.mtp().map_or(0, Mtp38::held))
+        };
+        let held = held_of(m)?;
+        let store_ctx = m
+            .body("(sl)")?
+            .mtp()
+            .ok_or("the load opened no draft")?
+            .ctx();
+        let before = store_of(m, n)?;
+        let (gdn, qsa) = (cfg().shape.n_gdn(), cfg().shape.n_qsa());
+        let lane = m.seq_lane(2 * seq38_bytes(gdn, qsa, n, true))?;
+        let (state, pending) = m.seq_save_async(&lane)?.map_err(GateError::from)?;
+        let cost = pending.land()?;
+        let copies = 1 + pending.points().len() as u64;
+        let target = seq_positional_bytes(qsa, n) + copies * checkpoint_bytes(gdn);
+        let store = kv_bytes * n as u64 / store_ctx as u64;
+        let derived = target + store;
+        m.reset()?;
+        overwrite_store(m, prompt, n, shift)?;
+        let seen = store_of(m, n)? != before;
+        m.reset()?;
+        m.seq_resume(&state)?;
+        let put = held_of(m)?;
+        let same = store_of(m, n)? == before;
+        let bytes_ok = cost.bytes == derived;
+        let back_ok = put == held && seen && same;
+        println!(
+            "(sl) {what}, a state of {n} positions whose draft store holds {held} saved on a \
+             lane: the copy {} bytes (derived {derived}: the target's {target}, recurrent copies \
+             {copies}, the draft's store {store} = {kv_bytes} * {n} / {store_ctx}) {}; \
+             the store overwritten {seen}, put back whole it holds {put} positions, its rows \
+             below {n} the saved ones {same} {}",
+            cost.bytes,
+            verdict(bytes_ok),
+            verdict(back_ok)
+        );
+        Ok((state, held, bytes_ok && back_ok))
+    }
+
+    /// The draft's store rows at positions `0..n` written by store walks of other ids (the
+    /// prompt's, each `shift` up) beside zero hidden rows, from position 0.
+    fn overwrite_store(
+        m: &mut Qwen38Model,
+        prompt: &[u32],
+        n: usize,
+        shift: u32,
+    ) -> Result<(), GateError> {
+        let vocab = u32::try_from(m.body("store walks")?.vocab())?;
+        let ids: Vec<u32> = (0..n)
+            .map(|i| (prompt[i % prompt.len()] + shift) % vocab)
+            .collect();
+        let zeros = vec![0.0f32; MTP_STORE_ROWS * WIDE];
+        for (i, run) in ids.chunks(MTP_STORE_ROWS).enumerate() {
+            m.mtp_walk(
+                MtpFeed::Rows {
+                    tokens: run,
+                    pos0: u32::try_from(i * MTP_STORE_ROWS)?,
+                    hidden: MtpHidden::Host(&zeros[..run.len() * WIDE]),
+                },
+                MtpHead::Rows,
+                MtpMode::Store,
+            )?;
+        }
+        Ok(())
     }
 
     /// (x): a resume refused before any copy. A state of a load without the
@@ -4704,6 +4827,7 @@ mod gate {
         let extra = mtp.card_bytes(CTX)?;
         let plan = inputs.plan_mtp(&machine, CTX, &plan_levers(extra)?, &mtp)?;
         let d = &plan.draft.cards[0];
+        let draft_kv = d.kv_bytes;
         println!(
             "plan card={} ctx_max={CTX} card_budget={:?} (the draft's card bytes {extra} in it) \
              draft dense={} experts={} rounding={} kv={} map={} arena={} headroom={}",
@@ -4867,6 +4991,9 @@ mod gate {
         tier::sc("(kp-draft) a prefix restore with the draft = resume then rollback")?;
         let (model, kp_ok) = prefix_draft(model, &prompt)?;
         ok &= kp_ok;
+        tier::sc("(sl) a save on a lane copies the draft's store rows of the state's positions")?;
+        let (model, sl_ok) = lane_save(model, &prompt, draft_kv)?;
+        ok &= sl_ok;
         drop(model);
         // Window B diverges from window A from position 0 on: the corpus's
         // deep window read past A's whole length, so no per-sequence state
