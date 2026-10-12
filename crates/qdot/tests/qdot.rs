@@ -2643,6 +2643,63 @@ fn q2_0_dot_matches_mainline() {
     }
 }
 
+/// A q8_0 column as the dot reads it: per 34-byte block the f16 scale times each i8 code, in
+/// f64 (a product of an 11-bit scale and an 8-bit code is exact).
+fn restore_q8f0(acol: &[u8]) -> Vec<f64> {
+    let mut out = Vec::with_capacity(acol.len() / 34 * 32);
+    for blk in acol.as_chunks::<34>().0 {
+        let d = f64::from(half_to_f32(u16::from_le_bytes([blk[0], blk[1]])));
+        out.extend(blk[2..].iter().map(|&q| d * f64::from(q as i8)));
+    }
+    out
+}
+
+/// Q2_0 x Q8_0 against an exact f64 dot, the check that stands on neither mainline's float
+/// order nor the mirror: `dequant_row` (held to mainline's `to_float` in gguf) times
+/// [`restore_q8f0`]'s column, at the widths no constant above covers (one, three and 32 Q2_0
+/// blocks), through `dot_row` and `dot_row_scalar`. The terms are one product sum per q8_0
+/// block, exact in f64 (each product has at most 32 significant bits, and a block's sum is an
+/// integer multiple of one scale pair). The f32 dot rounds a term in its `sumi` step (twice for
+/// a block's first q8_0 half), in its Q2_0 block's `sumf` step and in each later block's: at
+/// most `nb + 2` roundings of relative 2^-24, so the bound is `gamma_(nb+2) * sum |term|` with
+/// `gamma_n = n u / (1 - n u)`. The f64 sum's own error is below 1e-14 of the same sum, far
+/// inside it. A wrong code map or bit order is off by whole terms.
+#[test]
+fn q2_0_dot_is_within_its_f64_bound() {
+    let (col, rows) = q2f0_dot_case();
+    for k in [64, 192, Q2F0_K] {
+        let nb = k / 64;
+        let acol = &col[..col_bytes(GgmlType::Q2_0, k)];
+        let y = restore_q8f0(acol);
+        let n_u = (nb + 2) as f64 * 2f64.powi(-24);
+        for (r, row) in rows.iter().enumerate() {
+            let row = &row[..18 * nb];
+            let mut w = vec![0.0f32; k];
+            dequant_row(GgmlType::Q2_0, row, &mut w).unwrap();
+            let (mut exact, mut abs) = (0.0f64, 0.0f64);
+            for (wb, yb) in w.as_chunks::<32>().0.iter().zip(y.as_chunks::<32>().0) {
+                let term: f64 = wb.iter().zip(yb).map(|(&a, &b)| f64::from(a) * b).sum();
+                exact += term;
+                abs += term.abs();
+            }
+            let bound = n_u / (1.0 - n_u) * abs;
+            for (path, got) in [
+                ("dot_row", dot_row(GgmlType::Q2_0, row, acol, k)),
+                (
+                    "dot_row_scalar",
+                    dot_row_scalar(GgmlType::Q2_0, row, acol, k),
+                ),
+            ] {
+                let got = f64::from(got.unwrap());
+                assert!(
+                    (got - exact).abs() <= bound,
+                    "{path} k = {k} row {r}: got {got:e}, exact {exact:e}, bound {bound:e}"
+                );
+            }
+        }
+    }
+}
+
 /// Q2_0 kernel vs mirror on [`generated_gate_a`]'s rows (random codes, finite scales) at 32,
 /// one and three blocks against a `quantize_col` column, bit for bit.
 #[cfg(target_arch = "x86_64")]
