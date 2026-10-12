@@ -35,23 +35,27 @@ impl HostResidency {
         keep: impl Fn(&ModelTensor) -> bool,
         cfg: HostCfg,
     ) -> Result<HostResidency, GpuError> {
-        HostResidency::at_load_with(split, plan, keep, cfg, &[])
+        HostResidency::at_load_with(split, plan, keep, cfg, &[], &[])
     }
 
-    /// [`HostResidency::at_load`] of a set that also holds `extra`, experts
-    /// of card segments the host must serve too ([`HostSet::of_with`]:
-    /// adaptive residency's churn pool).
+    /// [`HostResidency::at_load`] of a set that also holds `extra` and knows
+    /// `known`, experts of card segments the host must serve too
+    /// ([`HostSet::of_known`]: adaptive residency's churn pool): `extra`'s
+    /// are populated and locked with the plan's host segments, `known`'s
+    /// neither.
     pub fn at_load_with(
         split: &Split,
         plan: &Plan<'_>,
         keep: impl Fn(&ModelTensor) -> bool,
         cfg: HostCfg,
         extra: &[(usize, ExpertList)],
+        known: &[(usize, ExpertList)],
     ) -> Result<HostResidency, GpuError> {
         const WHAT: &str = "HostResidency::at_load";
         let r8 = HostR8::at_load(split, cfg.r8)?;
         let src = R8Source::of(split, &r8)?;
-        let set = HostSet::of_with(src, plan, keep, extra).map_err(|e| GpuError::plan(WHAT, e))?;
+        let set = HostSet::of_known(src, plan, keep, extra, known)
+            .map_err(|e| GpuError::plan(WHAT, e))?;
         let populate = cfg
             .populate
             .then(|| set.populate(src))

@@ -51,7 +51,7 @@ use bloomery_gpu::{DeviceTensor, Gpu, GpuError, GpuModel};
 use bloomery_gpu_deepseek41::block::{BlockPlan, BlockScratch, KBlockKernels};
 use bloomery_gpu_deepseek41::experts::ExpertKernels;
 use bloomery_gpu_deepseek41::router::mimo2::{N_EXPERT, N_USED, RouterKernels, RouterOut};
-use bloomery_levers::HostCfg;
+use bloomery_levers::{ChurnHosting, HostCfg};
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::Split;
 use model::arch::Arch;
@@ -573,6 +573,7 @@ impl Body {
     ) -> Result<Mimo2Model, GpuError> {
         let spec = ResidencySpec {
             lever: residency,
+            pool: ChurnHosting::Hosted,
             delay: swap::LIVE_DELAY,
             deadline: swap::DEADLINE,
             top_k: N_USED,

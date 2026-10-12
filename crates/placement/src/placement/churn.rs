@@ -1,13 +1,16 @@
 //! Adaptive residency's host share. The residency machine may send any stage
-//! card expert past a layer's first `pinned` back to the host, so the host
-//! must be able to serve each of them without a fault: that is the churn
-//! pool, each layer's card segment's experts from rank `pinned` on (the
-//! list's order, which is slot order). A load holds the pool in its host set
-//! (`HostSet::of_with`, `bloomery-model`'s `placement::host_lock`) beside the
-//! plan's host segments, and the plan's host headroom
-//! ([`super::HostTotals::headroom_bytes`], the one budget) must take the
-//! pool's bytes. A stack the plan pages to the NVMe tier adds nothing: its
-//! victims are the tier's arena's ([`super::expert_nvme_tier`]).
+//! card expert past a layer's first `pinned` back to the host: that is the
+//! churn pool, each layer's card segment's experts from rank `pinned` on (the
+//! list's order, which is slot order). Where the pool is hosted, a load reads
+//! it in and locks it in its host set (`HostSet::of_known`, `bloomery-model`'s
+//! `placement::host_lock`) beside the plan's host segments, the plan's host
+//! headroom ([`super::HostTotals::headroom_bytes`], the one budget) takes its
+//! bytes, and the host serves a victim from resident pages. Where the load's
+//! residency spec says unhosted (`bloomery_levers::ChurnHosting`), the set
+//! only knows the pool: the host serves a victim from the file's mapping,
+//! read back at a page fault's cost and counted in the machine's rereads and
+//! unresident sends. A stack the plan pages to the NVMe tier adds nothing:
+//! its victims are the tier's arena's ([`super::expert_nvme_tier`]).
 
 use super::{Device, ExpertList, PlacementError, Plan, Role, per_expert};
 
@@ -92,12 +95,32 @@ impl ChurnPool {
     /// beside the plan's own): the pool fits the plan's host headroom less
     /// them, refused by name when it does not. Returns the headroom left.
     pub fn check_beside(&self, plan: &Plan<'_>, beside: u64) -> Result<i128, PlacementError> {
-        let left = self.headroom_after(plan) - i128::from(beside);
+        self.check_taking(plan, self.experts, self.bytes, beside)
+    }
+
+    /// [`ChurnPool::check_beside`] for a load whose host set only knows the
+    /// pool, reading none of it in: `beside` alone must fit the plan's host
+    /// headroom, refused by name as the pool's check is, the pool taking 0
+    /// bytes. Returns the headroom left.
+    pub fn check_known_beside(&self, plan: &Plan<'_>, beside: u64) -> Result<i128, PlacementError> {
+        self.check_taking(plan, 0, 0, beside)
+    }
+
+    /// The plan's host headroom less `bytes` of `experts` the host set takes
+    /// of the pool and `beside`; refused by name below 0.
+    fn check_taking(
+        &self,
+        plan: &Plan<'_>,
+        experts: u64,
+        bytes: u64,
+        beside: u64,
+    ) -> Result<i128, PlacementError> {
+        let left = plan.host.headroom_bytes - i128::from(bytes) - i128::from(beside);
         if left < 0 {
             return Err(PlacementError::ResidencyOverHost(Box::new(OverHost {
                 pinned: self.pinned,
-                experts: self.experts,
-                bytes: self.bytes,
+                experts,
+                bytes,
                 headroom: plan.host.headroom_bytes,
                 beside,
             })));

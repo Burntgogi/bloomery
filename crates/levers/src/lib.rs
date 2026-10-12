@@ -1211,6 +1211,20 @@ pub fn residency_unset(at: ResidencyAt) -> ResidencyPick {
 /// `docs/cards/v41shrink3090-ab.card`.
 pub const RESIDENCY_MIN_P: usize = 1;
 
+/// Whether a load under a `mid` word holds its churn pool in the host set it
+/// reads in and locks, or only knows it: the one decision a word's
+/// resolution carries to the load, which never derives it again.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ChurnHosting {
+    /// The pool is read in and locked with the plan's host segments, and the
+    /// plan's host headroom takes its bytes.
+    #[default]
+    Hosted,
+    /// The pool is known and not read in: its victims are served from the
+    /// file's mapping, read back at a page fault's cost and counted.
+    Unhosted,
+}
+
 /// Which side of a plan moved a family's residency word off its target
 /// pinned count ([`Room::Moved`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

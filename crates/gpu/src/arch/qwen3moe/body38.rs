@@ -143,7 +143,7 @@ use crate::rope_table::{RopeSpec, RopeTable};
 use crate::tensor::WindowMut;
 use crate::weights::Weights;
 use crate::{DeviceTensor, Gpu, GpuError, launch_u32, ple};
-use bloomery_levers::HostCfg;
+use bloomery_levers::{ChurnHosting, HostCfg};
 use cuda_core::{CudaStream, DeviceBuffer};
 use engram::Hash;
 use engram::hash::{History, Window};
@@ -1289,6 +1289,7 @@ impl Body38 {
         let shape = plan38::read(&inputs.spec)?;
         let spec = ResidencySpec {
             lever: residency,
+            pool: ChurnHosting::Hosted,
             delay: LIVE_DELAY,
             deadline: DEADLINE,
             top_k: geo::N_USED,

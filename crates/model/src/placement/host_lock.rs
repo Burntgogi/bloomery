@@ -83,6 +83,10 @@ pub struct HostSet {
     /// The sidecar the set was built beside and its ranges: every walk's
     /// pair must read this open of it ([`R8Source::reads`]).
     side: Option<(Arc<Sidecar>, Vec<Range<u64>>)>,
+    /// What [`HostSet::holds`] answers from when the set also knows runs it
+    /// does not walk ([`HostSet::of_known`]): per shard, then the sidecar's,
+    /// the walked runs and the known ones merged. `None`: the walked runs.
+    held: Option<(Vec<Runs>, Runs)>,
 }
 
 /// One chunk of a walk over a [`HostSet`]: one thread's pages of one file.
@@ -201,20 +205,43 @@ impl HostSet {
         HostSet::of_with(src, plan, keep, &[])
     }
 
-    /// [`HostSet::of`] with `extra` too: per entry, the experts of the plan's
-    /// model tensor at that index which the host must serve besides its own
-    /// segments (adaptive residency's churn pool, [`super::churn`]), walked as
-    /// host segments of theirs are — each expert's run in the sidecar when it
-    /// holds the tensor, else in the shard.
+    /// [`HostSet::of_known`] with no known runs.
     pub fn of_with(
         src: R8Source<'_>,
         plan: &Plan<'_>,
         keep: impl Fn(&ModelTensor) -> bool,
         extra: &[(usize, ExpertList)],
     ) -> Result<HostSet, PlacementError> {
+        HostSet::of_known(src, plan, keep, extra, &[])
+    }
+
+    /// [`HostSet::of`] with `extra` and `known` too: per entry, the experts
+    /// of the plan's model tensor at that index which the host must serve
+    /// besides its own segments (adaptive residency's churn pool,
+    /// [`super::churn`]) — each expert's run in the sidecar when it holds the
+    /// tensor, else in the shard. `extra`'s runs are walked as host segments
+    /// of theirs are: read in and locked with them, counted in the set's
+    /// bytes. `known`'s are held and never walked: [`HostSet::serves`] answers
+    /// for them by `mincore`, [`HostSet::populate_run`] reads them in from the
+    /// mapping, and the page cache may let them go (a churn pool the host's
+    /// room did not take).
+    pub fn of_known(
+        src: R8Source<'_>,
+        plan: &Plan<'_>,
+        keep: impl Fn(&ModelTensor) -> bool,
+        extra: &[(usize, ExpertList)],
+        known: &[(usize, ExpertList)],
+    ) -> Result<HostSet, PlacementError> {
         let (split, sidecar) = (src.split(), src.sidecar());
+        let side_of = sidecar.map(Arc::as_ref);
         let page = page_bytes()?;
-        let (pages, side) = host_pages(split, sidecar.map(Arc::as_ref), plan, keep, extra, page)?;
+        let (pages, side) = host_pages(split, side_of, plan, &keep, extra, page)?;
+        let held = if known.is_empty() {
+            None
+        } else {
+            let both: Vec<(usize, ExpertList)> = extra.iter().chain(known).cloned().collect();
+            Some(host_pages(split, side_of, plan, &keep, &both, page)?)
+        };
         let shards = pages
             .into_iter()
             .enumerate()
@@ -224,6 +251,7 @@ impl HostSet {
             page,
             shards,
             side: sidecar.map(|s| (Arc::clone(s), side)),
+            held,
         })
     }
 
@@ -327,20 +355,27 @@ impl HostSet {
 }
 
 impl HostSet {
-    /// Whether every page of bytes `at` of `file`'s mapping is in the set.
+    /// Whether every page of bytes `at` of `file`'s mapping is in the set,
+    /// walked or known ([`HostSet::of_known`]).
     #[must_use]
     pub fn holds(&self, file: &HostFile, at: &Range<u64>) -> bool {
         if at.end <= at.start {
             return false;
         }
         let pages = at.start / self.page..at.end.div_ceil(self.page);
-        let runs: &[Range<u64>] = match file {
-            HostFile::Shard(s) => match self.shards.iter().find(|(x, _)| x == s) {
+        let runs: &[Range<u64>] = match (file, &self.held) {
+            (HostFile::Shard(s), None) => match self.shards.iter().find(|(x, _)| x == s) {
                 Some((_, runs)) => runs,
                 None => return false,
             },
-            HostFile::Sidecar(p) => match &self.side {
-                Some((side, runs)) if side.path() == p.as_path() => runs,
+            (HostFile::Shard(s), Some((shards, _))) => match shards.get(*s) {
+                Some(runs) => runs,
+                None => return false,
+            },
+            (HostFile::Sidecar(p), held) => match &self.side {
+                Some((side, runs)) if side.path() == p.as_path() => {
+                    held.as_ref().map_or(runs, |(_, known)| known)
+                }
                 _ => return false,
             },
         };
@@ -1231,6 +1266,31 @@ mod tests {
     /// same file checked against the same split, is refused by name
     /// (`R8Error::OtherSidecar`) before a page is walked. One Q3_K stack of
     /// two experts of 8 rows of 256, its sidecar converted beside it.
+    /// A known run is held and never walked: `holds` answers for a range
+    /// whose pages lie in the known runs, across the page a walked run
+    /// shares with them too, while the set's pages and runs, which every
+    /// populate and lock walks, are the walked ones alone.
+    #[test]
+    fn a_known_run_is_held_and_not_walked() {
+        let page = super::page_bytes().unwrap();
+        let set = HostSet {
+            page,
+            shards: vec![(0, std::iter::once(0..2).collect())],
+            side: None,
+            held: Some((vec![std::iter::once(0..5).collect()], Vec::new())),
+        };
+        let shard = super::HostFile::Shard(0);
+        assert!(set.holds(&shard, &(page..2 * page)));
+        assert!(set.holds(&shard, &(page..4 * page)));
+        assert!(set.holds(&shard, &(3 * page..5 * page)));
+        assert!(!set.holds(&shard, &(4 * page..6 * page)));
+        assert!(!set.holds(&super::HostFile::Shard(1), &(0..page)));
+        assert_eq!(set.pages(), 2);
+        assert_eq!(set.runs().len(), 1);
+        assert_eq!(set.runs()[0].1.len(), 1);
+        assert_eq!(set.runs()[0].1.first(), Some(&(0..2)));
+    }
+
     #[test]
     fn a_set_walks_only_beside_its_own_sidecar() {
         let page = super::page_bytes().unwrap();
@@ -1262,6 +1322,7 @@ mod tests {
             page,
             shards: Vec::new(),
             side: Some((Arc::clone(side), std::iter::once(0..1).collect())),
+            held: None,
         };
         for (what, src) in [
             ("a pair that reads none", R8Source::rows(&split)),
@@ -1310,6 +1371,7 @@ mod tests {
             page,
             shards: vec![(0, runs)],
             side: None,
+            held: None,
         };
         let map = split.shard(0).unwrap().mapping().as_ptr() as usize;
         let page_len = usize::try_from(page).unwrap();
