@@ -99,7 +99,7 @@ contrib-check *ARGS:
 check-recipes:
     ./tools/check-recipes.sh
 
-# BASE(기본 main)나 A..B 사이에 바뀐 파일을 입력으로 읽는 gate-* 레시피 목록 — 맥에서, 빌드 없이, 아무것도 돌리지 않는다(tools/affected-gates.sh).
+# The gate-* recipes that read a file changed since the merge-base with BASE (default main), or in A..B (from merge-base(A, B) to B, as `git diff A...B`) — on the Mac, no build, runs nothing (tools/affected-gates.sh).
 # `--narrow --scan BASE_LOG NEW_LOG …` (ptx-scan logs of the base and the change): the gates that run the changed host path.
 affected BASE='main' *ARGS:
     ./tools/affected-gates.sh {{BASE}} {{ARGS}}
@@ -1052,6 +1052,12 @@ gate-gpu-qwen3moe-experts:
 gate-gpu-qwen3moe-e2e:
     BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3moe_e2e'
 
+# qwen3moe routed types under the --place-unset defaults: for every type the host's routed kernels run, a crafted
+# two-layer header planned by the CLI's and the serve seat's defaults (plan only: no weight loaded, no model file opened,
+# so the fixture tier runs it). A refusal, or card experts of a type the card table does not run, fails by name.
+gate-gpu-qwen3moe-types:
+    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_types && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3moe_types'
+
 # ik CPU의 greedy 연속(프롬프트 0–7, 32토큰)을 $BLOOMERY_DATA/qwen3moe/greedy/에. 프롬프트마다 CPU 임대를 잡는다.
 ik-greedy-qwen3moe:
     BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'for p in 0 1 2 3 4 5 6 7; do GEN=32 PROMPT=$p bash tools/ref/ik-greedy.sh || exit $?; done'
@@ -1349,6 +1355,14 @@ gate-refset:
 # `<family> <path>...` reads the sets at the paths as sets of that family (host only, reads only).
 refset-check *ARGS:
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh refset-check && __s=$(. tools/ref/ref-paths.sh && printf %s "$DSPARK_MODEL") && export BLOOMERY_DSPARK_MODEL="$__s" && cargo build --release -p bloomery-refset --bin refset-check && bash tools/host-gate.sh refset-check {{ARGS}}'
+
+# The type census's header stubs: from tools/census/stubs.tsv (`python3 tools/type-census.py pin` writes it), the first
+# header_bytes bytes of each real file are fetched from the hub at the row's revision, checked against header_sha256,
+# written at ROOT/<org>/<repo>/<file> as a sparse file of file_bytes, and read back and checked again. ROOT is a
+# directory on the box that does not exist or is empty (e.g. /models/census-stubs-<revision tag>): a rebuild goes to a
+# new one. It reads the hub only: no card, no lock, not timed.
+census-stubs ROOT:
+    ./tools/box.sh 'python3 tools/type-census.py build "{{ROOT}}" tools/census/stubs.tsv'
 
 # V4.1 호스트 스텝 계획: 디코드 걷기 단위 시험(위치 2,101개)을 돈 뒤, V4.1 오라클 세트(배치 세트와 디코드 스텝 세트)의
 # 그래프 입력 전부를 계획과 비트 단위로 대조한다. 어떤 검사도 맡지 않은 입력은 빨강이다. 호스트 전용(카드·게이트 락 없음).
@@ -1684,7 +1698,9 @@ gate-gpu-ds41-prefill *ARGS='':
 # 걸침, 프롬프트를 닫음)에 먹이고 조항 (i)–(vi)을 본다: 미디어 자리 임베딩=행 넓힌 값·텍스트 자리=스팬 없는 호출(비트),
 # 라우터 id=카드 자체 점수의 호스트 select_n(bias_vl/bias, 커버리지 단언 포함), engram 층의 스트림 항등(−0 예외),
 # 분할 불변(한 호출=스팬 앞 텍스트에서 끊은 두 호출, 상태 해시+24 디코드), 이미지로 끝나는 프롬프트 뒤 창의 dead와
-# 스냅숏/바이트 재개, 세 거부의 이름. The 3090's plan on either card (shared/gate_card.rs), gate lock.
+# 스냅숏/바이트 재개, 세 거부의 이름. Clause (vii) holds the serve seat's media call (the set's image twice in one prompt;
+# `vision_seat::span_rows_of` + `Encoded::prompt` over `ds41_media`'s splice and builder, no tower) to the body's: same argmax,
+# bit-identical last hidden row, and the builder's spans equal the gate's own. The 3090's plan on either card (shared/gate_card.rs), gate lock.
 [group('v41-load')]
 gate-gpu-ds41-media *ARGS='':
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_ds41_media && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_ds41_media {{ARGS}}'
@@ -2003,8 +2019,9 @@ gate-gpu-p8b *ARGS:
 # PTX 스캔(계측기, 게이트 아님): 게이트 바이너리가 싣고 있는 디바이스 코드의 엔트리별
 # 디포·로컬 왕복·블록 폭 표. 디포를 가진 엔트리가 먼저 나온다. 단언은 gate_p5/gate_p4가 한다 — 머리글 참조.
 # 바이너리의 cargo 피처는 `--features`로 준다(기본 gpu). V4.1 게이트 바이너리는 `--features deepseek41`.
-# 끝의 두 열(jit_regs·jit_local)은 드라이버 JIT가 실제로 잡은 값이다. oxart_jit가 모듈을 카드에 올려 읽으므로
-# 게이트 락(tools/gpu-gate.sh) 아래서 돈다.
+# The jit_regs and jit_local columns are the values the driver JIT actually assigned; the ld.global.scalar, ld.global.v2 and
+# ld.global.v4 columns follow them. oxart_jit loads the modules onto the card to read them, so a full scan runs under the
+# gate lock (tools/gpu-gate.sh).
 # `--no-jit`: the driver JIT is not built or run, so the scan takes no card lock and waits on no landing batch's GPU hold.
 # The banner names `jit=skipped(no-jit)` and both JIT columns read `skipped(no-jit)`. The md5 block and the ptxas columns
 # are as in a full scan: that proves a move (`just affected --narrow` reads such a pair as identical or refuses it by name).
@@ -2257,7 +2274,7 @@ gate-gpu-glm5next-media:
 # The serve seat's media call of the same fixture (`bloomery-serve --mmproj` on a GLM file), gate_glm5next_e2e's `--only media-seat`
 # ((sm), `shared/glm5next_media.rs`'s `seat`, built with the `vision` feature the other recipes leave out): the encoder file of
 # the fixture's image sets, seated as the seat seats it and loaded as its resident tower; two procedural images of known grids
-# encoded on it and spliced through the seat's own steps (`Resident::span_rows`, `Session::prompt_media`), held to
+# encoded on it and spliced through the seat's own steps (`Resident::encode`, `Encoded::prompt`), held to
 # `prefill_media` called with spans put together from the images' sizes, the same argmax and a bit-identical last hidden row; a
 # control without the rows that lies away from it; and the tower's refusal by name of a grid past its cap. No oracle: the
 # numbers' quality is the tower's gate's and (im)'s. Fixture tier only: on the real tier the bin fails by name before any load
@@ -2372,6 +2389,32 @@ gate-gpu-glm5next-serve:
 [group('v41-load')]
 weekly-gpu-glm5next-media-serve:
     BLOOMERY_MODEL=glm5next BLOOMERY_CARD=both ./tools/box.sh 'bash tools/ref/real-only.sh weekly-gpu-glm5next-media-serve && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,mimo2,vision --release --bin bloomery-serve --bin gate_glm5next_serve && D=target/glm-media-gate && rm -rf $D && mkdir -p $D && bash tools/gpu-gate.sh gate_glm5next_serve --arm media --dir $D --mmproj /models/mmproj/unsloth--GLM-5.3-Flash-GGUF/mmproj-BF16.gguf'
+
+# The shipped `bloomery-serve` started once per image flag on the GLM-5.3 fixture (gate_serve_start's header has the clauses): (s1)
+# `-m <fixture>` with the serving defaults and one text chat; (s2) `--place a --mmproj <unsloth's mmproj-BF16.gguf>`, the tower's
+# `vision` record and one image chat (free-448x448.png) answered with its 16 x 16 + 2 positions; (s3) `--hf bloomery-fixture/glm5next:fixture`
+# offline from a cache of symlinks to the fixture and the projector, each beside a `.verified` marker holding the file's sha256; (s4) no
+# server stderr of the run holds "does not print this kind" or "panicked". Each start is preceded by a `--plan` run of its arguments.
+# It holds the image-flag starts at the fixture tier, which the real-tier seat gates do not. The bloomery-serve built is the release's
+# (--features glm5next,clef,vision,mimo2). Both cards in view
+# (BLOOMERY_CARD=both: both gate locks, alone in a batch): with `--place a` the other card is off the plan, so the tower sits there and no
+# fixture card budget has to hold its reserve; one card in view would drop the repo's projector or refuse the reserve. Fixture-only
+# (tools/ref/fixture-only.sh): the real tier would hash the real shards and start the real model three times, so a real-tier batch
+# defers the recipe by name. Predicted wall [derived from gate-times.tsv: glm5next-twocard at the fixture tier is 49 s median over eight
+# loads, qwen38-serve 89 s over ten-plus spawns]: three starts of about 8 s, three `--plan` runs of about 2 s, a warm build, the sha256 of the
+# 8.6 GB set and the 1.2 GB projector in threads beside the first two starts: 45 to 90 s warm; the bound is the runner's 900 s.
+[group('solo')]
+gate-gpu-serve-start-glm:
+    BLOOMERY_MODEL=glm5next BLOOMERY_CARD=both ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-gpu-serve-start-glm && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2 --release --bin bloomery-serve --bin gate_serve_start && D=target/serve-start-gate/glm && rm -rf $D && mkdir -p $D && bash tools/gpu-gate.sh gate_serve_start --family glm --dir $D'
+
+# The same gate on the V4.1 fixture (the file's architecture picks the seat, which has no `--plan`, so its plan is read from each
+# start's own log). The projector is the `# mmproj` line of the V4.1 vision set ($BLOOMERY_DATA/ref-vision/deepseek41v, `just dump-ref-vision`),
+# the file the V4.1 image gates load. The serving defaults are the seat's own (context 32768, two slots), planned under the fixture's
+# card budget. Predicted wall [derived, as above]: three starts of about 12 s over the 15 GB host set, the sha256 of the set and the
+# projector in threads beside the first two starts, a warm build: 60 to 120 s warm; the bound is the runner's 900 s.
+[group('solo')]
+gate-gpu-serve-start-ds41:
+    BLOOMERY_MODEL=deepseek41 BLOOMERY_CARD=both ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-gpu-serve-start-ds41 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2 --release --bin bloomery-serve --bin gate_serve_start && D=target/serve-start-gate/ds41 && rm -rf $D && mkdir -p $D && bash tools/gpu-gate.sh gate_serve_start --family ds41 --dir $D'
 
 # The MiMo seat of `bloomery-serve` (gate_mimo2_serve): the refusals before any load (--plan's default context, the one
 # slot, the tier card), one server at --ctx 4160 --parallel 1 holding its load and listening records, the three prompts'

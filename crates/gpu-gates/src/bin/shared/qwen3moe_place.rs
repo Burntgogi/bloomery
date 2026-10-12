@@ -5,7 +5,7 @@
 //! refused by name, the program hangs none), the machine
 //! `model::arch::qwen3moe::place::machine` lays out on it with the scratch
 //! the body's placed load holds past the m = 1 scratch, the plan by the
-//! expert rule over the stacks `card_routed` loads — the trunk on the card,
+//! expert rule over the stacks `routed_rule` loads — the trunk on the card,
 //! each layer's routed id prefix as the budget holds, the rest on the host
 //! tier — and the `plan` record of it. A plan that holds no host expert
 //! opens the whole model on the plan's card, as the unplaced load does, when
@@ -40,15 +40,16 @@ use bloomery_gpu::model::{GpuModel, Slots};
 use bloomery_gpu::rope_neox::q8_plane_lens;
 use bloomery_gpu::{Gpu, Qwen3moeModel};
 use bloomery_gpu_gates::GateError;
-use bloomery_gpu_gates::generate::{Place, PlaceWhy};
+use bloomery_gpu_gates::generate::{CTX_GRAN, Place, PlaceWhy};
 use bloomery_gpu_gates::image_plan;
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::residency38::{checkpoints_pinned, reserve_checkpoints};
 use bloomery_levers::{HostCfg, Levers};
 use gguf::Split;
-use model::arch::qwen3moe::place::{self as q3, card_routed};
+use model::arch::qwen3moe::place as q3;
 use model::arch::qwen35moe::hparams::Kind;
 use model::arch::qwen35moe::place as q35;
+use model::placement::accepts::{Program, routed_rule};
 use model::placement::ctx::{ExpertBytes, SlotCtx};
 use model::placement::workstation::{self, CardSpec, DeviceInfo, GRANULE};
 use model::placement::{
@@ -418,7 +419,9 @@ impl PlaceQ3 {
         let ctx = u64::try_from(ctx)?;
         Ok(match &self.inputs {
             Inputs::Qwen3(i) => i.plan(machine, ctx, levers)?,
-            Inputs::Qwen35(i) => i.plan_rule(machine, ctx, levers, card_routed)?,
+            Inputs::Qwen35(i) => {
+                i.plan_rule(machine, ctx, levers, routed_rule(Program::Qwen35Body))?
+            }
         })
     }
 
@@ -510,6 +513,10 @@ impl PlaceQ3 {
     /// one, and its device. `why` names what made a run with `--place`
     /// unset take this placed plan.
     pub fn record(&self, plan: &Plan<'_>, why: Option<&str>) -> Record {
+        record::require(
+            record::groups::qwen3moe_place::PLAN,
+            "qwen3moe_place::PlaceQ3::record",
+        );
         let card = &plan.cards[0];
         let r = Record::new(&record::PLAN38)
             .w("place", self.place.name())
@@ -854,6 +861,20 @@ pub struct SlotRule {
     pub margin: u64,
 }
 
+/// The qwen3 serve seat's rule: a slot's base `generate_qwen3moe`'s default
+/// context (4096), steps of [`CTX_GRAN`], a margin of
+/// [`workstation::MARGIN`] card expert bytes. The seat and
+/// `gate_qwen3moe_types` read this one.
+#[allow(
+    dead_code,
+    reason = "the serve seat and gate_qwen3moe_types read it; the CLI includes the planner without a seat"
+)]
+pub const SERVE_RULE: SlotRule = SlotRule {
+    base: 4096,
+    step: CTX_GRAN,
+    margin: workstation::MARGIN,
+};
+
 /// A default context and the load it was searched over.
 #[allow(
     dead_code,
@@ -958,6 +979,10 @@ pub fn default_ctx_qwen3(
     (slots, levers): (usize, &PlanLevers),
     kv: KvQ8,
 ) -> Result<Defaulted, GateError> {
+    record::require(
+        record::groups::qwen3moe_place::PLAN,
+        "qwen3moe_place::default_ctx_qwen3",
+    );
     let census = census()?;
     let at_base = rule.base.saturating_mul(slots);
     let on = PlaceQ3::unplaced_on(&census)?;
@@ -989,6 +1014,10 @@ pub fn default_ctx_qwen35(
     rule: SlotRule,
     (seqs, levers, encoder): (Seqs, &PlanLevers, Option<u64>),
 ) -> Result<Defaulted, GateError> {
+    record::require(
+        record::groups::qwen3moe_place::PLAN,
+        "qwen3moe_place::default_ctx_qwen35",
+    );
     let census = census()?;
     let slots = seqs.slots;
     let at_base = rule.base.saturating_mul(slots);

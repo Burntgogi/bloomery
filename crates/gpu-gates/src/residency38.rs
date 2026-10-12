@@ -223,6 +223,10 @@ pub fn residency38(
     lever: Lever38<'_>,
     emit: fn(Record),
 ) -> Result<(Residency, ChurnHosting), GateError> {
+    record::require(
+        record::groups::residency38::UNSET,
+        "residency38::residency38",
+    );
     let (residency, word, hosting) = match lever {
         Lever38::Set(r, word) => (r, word.to_owned(), ChurnHosting::Hosted),
         Lever38::Unset(pre) => {
@@ -276,6 +280,10 @@ pub fn residency_set(
     beside: u64,
     emit: fn(Record),
 ) -> Result<Residency, GateError> {
+    record::require(
+        record::groups::residency38::HOST,
+        "residency38::residency_set",
+    );
     let Residency::Mid { pinned, .. } = residency else {
         return Ok(residency);
     };

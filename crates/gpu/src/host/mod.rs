@@ -497,7 +497,8 @@ fn pass_kept(
         (true, Some(k)) => Ok(Some(k)),
         (true, None) => Err(GpuError::state(
             WHAT,
-            "the last pass's kept rows (HostTier::keep_rows)",
+            "the last pass's kept rows (HostTier::keep_rows) — or a prompt-pass boundary \
+             opened twice in one call before keep_rows",
         )),
         (false, None) => Ok(None),
         (false, Some((rows, kind))) => Err(GpuError::protocol(WHAT, kept_with_no_pass(rows, kind))),
@@ -514,6 +515,82 @@ fn kept_with_no_pass(kept: KeptRows, kind: PassKind) -> String {
         kept.count(),
         kind.word()
     )
+}
+
+/// The refusal of a boundary opened twice in one call before
+/// [`HostTier::keep_rows`], as a tier with no residency machine makes it
+/// ([`OpenCall::after_boundary`]); with a machine the same call order meets
+/// [`pass_kept`]'s open-unkept branch, which names this cause too. One
+/// wording, one owner.
+fn boundary_in_open_call() -> &'static str {
+    "a prompt-pass boundary inside an open call: the call's pass_boundary ran twice \
+     before keep_rows"
+}
+
+/// Where the last boundary's pass stands on a tier that runs no residency
+/// machine: the call order the machine's books refuse by name
+/// ([`pass_kept`], [`swap::SwapMachine::refuse_if_ahead`]), kept without the
+/// machine, so a caller that opens a boundary twice in one call is refused on
+/// a load with a machine and on one without. The tier holds one and moves it
+/// with [`OpenCall::after_boundary`] and [`OpenCall::after_keep`]; with a
+/// machine it stays [`OpenCall::Closed`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum OpenCall {
+    /// No boundary has opened a pass that waits for its kept rows.
+    #[default]
+    Closed,
+    /// A boundary opened a pass that launched, and no
+    /// [`HostTier::keep_rows`] has closed it.
+    Open,
+    /// A boundary made ahead opened the next pass, and no launch has taken it
+    /// yet ([`swap::SwapMachine::take_ahead`]).
+    Ahead,
+}
+
+impl OpenCall {
+    /// The state after a boundary at a launch, or made `ahead` of its pass.
+    /// A launch opens a pass, or takes the one a boundary made ahead opened;
+    /// a boundary made ahead opens the next. Refused by name: any boundary
+    /// while a pass is open and unkept, and one made ahead while another
+    /// waits for its launch.
+    fn after_boundary(self, ahead: bool) -> Result<OpenCall, GpuError> {
+        const WHAT: &str = "HostTier::swap_boundary";
+        match (self, ahead) {
+            (OpenCall::Closed | OpenCall::Ahead, false) => Ok(OpenCall::Open),
+            (OpenCall::Closed, true) => Ok(OpenCall::Ahead),
+            (OpenCall::Open, _) => Err(GpuError::protocol(WHAT, boundary_in_open_call())),
+            (OpenCall::Ahead, true) => Err(GpuError::protocol(
+                WHAT,
+                "a boundary made ahead of its pass while another waits for its launch: the \
+                 pass it opened has not run",
+            )),
+        }
+    }
+
+    /// Refused by name, as the machine refuses it
+    /// ([`swap::SwapMachine::refuse_if_ahead`]): kept rows while a boundary
+    /// made ahead waits for its launch, whose pass has not run. Nothing
+    /// else is refused, a keep with no call open included.
+    fn refuse_keep(self) -> Result<(), GpuError> {
+        match self {
+            OpenCall::Ahead => Err(GpuError::protocol(
+                "HostTier::keep_rows",
+                "a boundary was made ahead of its pass and no launch has taken it \
+                 (SwapMachine::take_ahead): the pass it opened has not run",
+            )),
+            OpenCall::Closed | OpenCall::Open => Ok(()),
+        }
+    }
+
+    /// The state after the pass that ran keeps its rows ([`OpenCall::refuse_keep`]
+    /// passed): an open pass is closed. A keep with no pass open changes
+    /// nothing (a step's keep on a load that opened no boundary).
+    fn after_keep(self) -> OpenCall {
+        match self {
+            OpenCall::Open => OpenCall::Closed,
+            other => other,
+        }
+    }
 }
 
 /// What a residency pass was, as its caller names it when it keeps its rows
@@ -810,6 +887,9 @@ pub struct HostTier<H> {
     /// seam for the slots harness's poison clauses, never set on a serving
     /// path.
     planted: Option<String>,
+    /// The first layer the body's step and verify run without this tier's
+    /// service, when they run one ([`HostTier::mark_unserved`]).
+    unserved: Option<usize>,
     health: Health,
     /// Which experts each layer's card stack holds; the host serves the rest.
     slots: SlotMap,
@@ -833,6 +913,10 @@ pub struct HostTier<H> {
     /// ([`HostTier::start_swap`]), and the rows the open pass keeps.
     swap: Option<swap::SwapMachine>,
     swap_kept: Option<(KeptRows, PassKind)>,
+    /// Where the last boundary's pass stands while no machine runs: the
+    /// machine keeps these books itself, so this stays closed once one
+    /// starts.
+    call_open: OpenCall,
     /// The stage card's copy of the map the machine writes: after `swap`, so
     /// it outlives the machine that holds its address.
     swap_view: Option<Arc<DeviceTensor<u32>>>,
@@ -890,6 +974,7 @@ impl<H: HostExperts> HostTier<H> {
             experts,
             fault: None,
             planted: None,
+            unserved: None,
             health: Health::default(),
             slots,
             step: StepPort::new(boundary, layers),
@@ -901,6 +986,7 @@ impl<H: HostExperts> HostTier<H> {
             tier_lists: Vec::new(),
             swap: None,
             swap_kept: None,
+            call_open: OpenCall::Closed,
             swap_view: None,
             xstream: None,
         })
@@ -913,7 +999,9 @@ impl<H: HostExperts> HostTier<H> {
     /// machine's tally and holds its staging window open while the pool waits
     /// for a go. The machine frees each layer's spare slots now, so every
     /// piece that sizes itself from the map's capacity is made first.
-    /// Load-time only; a second machine is refused by name.
+    /// Load-time only; a second machine is refused by name, and so is a
+    /// machine on a load whose step runs a layer without the service
+    /// ([`HostTier::mark_unserved`]), before any slot moves.
     pub fn start_swap(
         &mut self,
         ctx: &Arc<CudaContext>,
@@ -922,6 +1010,16 @@ impl<H: HostExperts> HostTier<H> {
         source: Arc<dyn swap::SwapSource>,
         cfg: swap::MachineCfg,
     ) -> Result<(), GpuError> {
+        if let Some(l) = self.unserved {
+            return Err(GpuError::shape(
+                "HostTier::start_swap",
+                format!(
+                    "a residency machine on a load whose step runs layer {l} without the host \
+                     service, to which the machine moves card experts: the load was made without \
+                     one (its residency glue had no source)"
+                ),
+            ));
+        }
         if self.swap.is_some() {
             return Err(GpuError::state(
                 "HostTier::start_swap",
@@ -935,6 +1033,7 @@ impl<H: HostExperts> HostTier<H> {
         self.swap = Some(machine);
         self.swap_view = Some(view);
         self.swap_kept = None;
+        self.call_open = OpenCall::Closed;
         Ok(())
     }
 
@@ -968,10 +1067,15 @@ impl<H: HostExperts> HostTier<H> {
     /// Refused by name — the write side of the refusal the
     /// next boundary makes ([`pass_kept`]) — rows kept with no pass
     /// open, and ones kept while a boundary made ahead waits for its launch
-    /// (the pass it opened has not run). Nothing without a machine.
+    /// (the pass it opened has not run). Without a machine only the second
+    /// is refused ([`OpenCall::refuse_keep`]): the keep closes the open call
+    /// ([`OpenCall::after_keep`]), and a keep with no call open is a step's
+    /// keep on a load that opened no boundary.
     pub fn keep_rows(&mut self, kept: KeptRows, kind: PassKind) -> Result<(), GpuError> {
         const WHAT: &str = "HostTier::keep_rows";
         let Some(m) = self.swap.as_ref() else {
+            self.call_open.refuse_keep()?;
+            self.call_open = self.call_open.after_keep();
             return Ok(());
         };
         m.refuse_if_ahead(WHAT)?;
@@ -987,7 +1091,8 @@ impl<H: HostExperts> HostTier<H> {
     /// rows, then the machine lands and plans; its report, with the kind of
     /// the pass it ended ([`PassKind::None`] when none was open). `None`
     /// without a machine; a pass that ran with no kept count, and a kept
-    /// count given with no pass open, are refused by name.
+    /// count given with no pass open, are refused by name, and without a
+    /// machine a boundary inside an open call is too ([`OpenCall`]).
     pub fn swap_boundary(
         &mut self,
         stream: &CudaStream,
@@ -1002,7 +1107,8 @@ impl<H: HostExperts> HostTier<H> {
     /// it was made), else [`HostTier::swap_boundary`]; ahead, after a pass's
     /// service and kept rows and before its readback, the next pass's
     /// boundary made now ([`swap::SwapMachine::boundary_ahead`]). `None`
-    /// without a machine. Refused by name: [`HostTier::swap_boundary`]'s
+    /// without a machine, which keeps the call order all the same
+    /// ([`OpenCall`]). Refused by name: [`HostTier::swap_boundary`]'s
     /// refusals, and a boundary made ahead while another waits. Every
     /// boundary an engine call lands also moves the engine watchdog's
     /// progress and names its machine there ([`crate::watchdog`]).
@@ -1012,7 +1118,7 @@ impl<H: HostExperts> HostTier<H> {
         at: swap::BoundaryAt,
     ) -> Result<Option<(PassKind, swap::PassReport)>, GpuError> {
         let ahead = match (at, self.swap.as_mut()) {
-            (_, None) => return Ok(None),
+            (_, None) => matches!(at, swap::BoundaryAt::Ahead { .. }),
             (swap::BoundaryAt::Launch { .. }, Some(m)) if m.ahead().is_some() => {
                 crate::watchdog::machine(m.shared());
                 let b = m.take_ahead()?;
@@ -1038,13 +1144,16 @@ impl<H: HostExperts> HostTier<H> {
 
     /// [`HostTier::swap_boundary`], made ahead of its pass when `ahead`.
     /// A boundary made ahead that waits for its launch is refused first, so
-    /// the open pass's kept count stays where it was.
+    /// the open pass's kept count stays where it was. Without a machine it
+    /// only moves the open-call state ([`OpenCall::after_boundary`]), and
+    /// the state stays where it was when the boundary is refused.
     fn boundary_of(
         &mut self,
         stream: &CudaStream,
         ahead: bool,
     ) -> Result<Option<(PassKind, swap::PassReport)>, GpuError> {
         let Some(m) = self.swap.as_mut() else {
+            self.call_open = self.call_open.after_boundary(ahead)?;
             return Ok(None);
         };
         m.refuse_if_ahead("HostTier::swap_boundary")?;
@@ -1548,12 +1657,14 @@ impl<H: HostExperts> HostTier<H> {
 
     /// The residency back to its seed at a quiet boundary on `stream`
     /// ([`swap::SwapMachine::reset`]), the tally cleared and no pass open;
-    /// its report. `None` without a machine.
+    /// its report. `None` without a machine, where no call is open after it
+    /// either.
     pub fn swap_reset(
         &mut self,
         stream: &CudaStream,
     ) -> Result<Option<swap::ResetReport>, GpuError> {
         let Some(m) = self.swap.as_mut() else {
+            self.call_open = OpenCall::Closed;
             return Ok(None);
         };
         let deadline = m.deadline();
@@ -1643,11 +1754,32 @@ impl<H: HostExperts> HostTier<H> {
         Ok(())
     }
 
+    /// The body's step and verify run layer `l` without this tier's service
+    /// (no go, no wait): from here on [`HostTier::attach_route_trace`]
+    /// refuses a trace, which the service writes, and
+    /// [`HostTier::start_swap`] a residency machine, which moves card experts
+    /// to the service. Load-time only.
+    pub(crate) fn mark_unserved(&mut self, l: usize) {
+        self.unserved.get_or_insert(l);
+    }
+
     /// Attach `trace`: from here on every one-row step's service records
     /// its routed ids into it ([`route_trace`]), and a prompt batch's
     /// service is refused by name. The trace must cover the slot map's
-    /// layers and experts; a second trace is refused.
+    /// layers and experts; a second trace is refused, and so is a trace on
+    /// a load whose step runs a layer without the service
+    /// ([`HostTier::mark_unserved`]).
     pub fn attach_route_trace(&mut self, trace: RouteTrace) -> Result<(), GpuError> {
+        if let Some(l) = self.unserved {
+            return Err(GpuError::shape(
+                "HostTier::attach_route_trace",
+                format!(
+                    "a route trace on a load whose step runs layer {l} without the host \
+                     service, which writes the trace: the load's HostCfg::route_trace was false \
+                     (Levers::host sets it from BLOOMERY_ROUTE_TRACE)"
+                ),
+            ));
+        }
         if self.step.trace.is_some() {
             return Err(GpuError::shape(
                 "HostTier::attach_route_trace",
@@ -2269,8 +2401,12 @@ impl<H: HostExperts> HostTier<H> {
     /// A pass its caller never kept (a failed pass, a verify the reset
     /// drops before its commit) keeps no row: its noted ids are forgotten and
     /// the next boundary ends it at 0 rows. A kept count already given
-    /// stands.
+    /// stands. Without a machine the open call closes, and the next boundary
+    /// opens one afresh.
     fn abandon_pass(&mut self) {
+        if self.swap.is_none() {
+            self.call_open = OpenCall::Closed;
+        }
         if let Some(m) = &self.swap
             && m.pass_open()
             && self.swap_kept.is_none()
@@ -2953,7 +3089,7 @@ fn count_ids(
 #[cfg(test)]
 mod tests {
     use super::{
-        Drain, PassKind, SERVED_TIERS, await_within, count_ids, drain_of, pass_kept,
+        Drain, OpenCall, PassKind, SERVED_TIERS, await_within, count_ids, drain_of, pass_kept,
         refuse_tier_count,
     };
     use crate::GpuError;
@@ -3069,10 +3205,106 @@ mod tests {
             open_unkept.to_string().contains("kept rows"),
             "{open_unkept}"
         );
+        assert!(
+            open_unkept
+                .to_string()
+                .contains("a prompt-pass boundary opened twice in one call before keep_rows"),
+            "{open_unkept}"
+        );
         let kept_closed = pass_kept(false, step).expect_err("rows kept with no pass open");
         assert!(
             kept_closed.to_string().contains("no pass open"),
             "{kept_closed}"
         );
+    }
+
+    /// A tier with no machine refuses a second boundary inside an open call
+    /// by name, whether a launch or one made ahead, and the refusal leaves
+    /// the call open.
+    #[test]
+    fn a_second_boundary_in_an_open_call_is_refused_by_name_without_a_machine() {
+        let open = OpenCall::Closed
+            .after_boundary(false)
+            .expect("the call's first boundary");
+        assert_eq!(open, OpenCall::Open);
+        for ahead in [false, true] {
+            let err = open
+                .after_boundary(ahead)
+                .expect_err("a boundary inside an open call");
+            let text = err.to_string();
+            assert!(
+                text.starts_with("HostTier::swap_boundary: ")
+                    && text.contains("a prompt-pass boundary inside an open call")
+                    && text.contains("pass_boundary ran twice before keep_rows"),
+                "{text}"
+            );
+        }
+    }
+
+    /// A boundary after the call's keep_rows is not refused, and a keep with
+    /// no call open changes nothing and refuses nothing.
+    #[test]
+    fn a_boundary_after_keep_rows_is_not_refused_without_a_machine() {
+        let kept = OpenCall::Open.after_keep();
+        assert_eq!(kept, OpenCall::Closed);
+        assert_eq!(kept.after_boundary(false).ok(), Some(OpenCall::Open));
+        assert_eq!(OpenCall::Closed.after_keep(), OpenCall::Closed);
+    }
+
+    /// A step's order without a machine: launch, keep, the next pass's
+    /// boundary made ahead, then the next launch takes it without a refusal
+    /// and its keep closes the call. A boundary made ahead while another
+    /// waits is refused by name, and the state a keep leaves the waiting one
+    /// in is for its launch ([`HostTier::keep_rows`] refuses that keep
+    /// first).
+    #[test]
+    fn a_boundary_made_ahead_is_taken_by_the_next_launch_without_a_machine() {
+        let mut call = OpenCall::Closed;
+        call = call.after_boundary(false).expect("launch");
+        call = call.after_keep();
+        call = call.after_boundary(true).expect("ahead, after the keep");
+        assert_eq!(call, OpenCall::Ahead);
+        assert_eq!(call.after_keep(), OpenCall::Ahead);
+        let twice = call
+            .after_boundary(true)
+            .expect_err("a second boundary made ahead");
+        assert!(
+            twice
+                .to_string()
+                .contains("while another waits for its launch"),
+            "{twice}"
+        );
+        for _ in 0..3 {
+            call = call.after_boundary(false).expect("the launch takes it");
+            assert_eq!(call, OpenCall::Open);
+            call = call.after_keep();
+            call = call.after_boundary(true).expect("the next ahead");
+        }
+        assert_eq!(call, OpenCall::Ahead);
+    }
+
+    /// A keep while a boundary made ahead waits for its launch is refused by
+    /// name without a machine, as the machine refuses it; a keep in any other
+    /// state is not, and the launch that takes the boundary lets the keep
+    /// through.
+    #[test]
+    fn a_keep_while_a_boundary_waits_ahead_is_refused_by_name_without_a_machine() {
+        let ahead = OpenCall::Closed
+            .after_boundary(true)
+            .expect("a boundary made ahead");
+        let err = ahead
+            .refuse_keep()
+            .expect_err("a keep while a boundary waits ahead");
+        let text = err.to_string();
+        assert!(
+            text.starts_with("HostTier::keep_rows: ")
+                && text.contains("was made ahead of its pass and no launch has taken it")
+                && text.contains("the pass it opened has not run"),
+            "{text}"
+        );
+        let open = ahead.after_boundary(false).expect("the launch takes it");
+        assert_eq!(open, OpenCall::Open);
+        assert!(open.refuse_keep().is_ok());
+        assert!(OpenCall::Closed.refuse_keep().is_ok());
     }
 }

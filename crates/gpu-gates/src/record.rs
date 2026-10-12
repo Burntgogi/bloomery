@@ -13,7 +13,11 @@
 //! `tools/bloomery/records.py` parses a log by that schema, so a reader names a
 //! kind and its fields, never a column or a pattern. The same call registers
 //! those kinds, and a line of any other kind is refused by name: the schema
-//! is every line the binary can print. [`Log`] reads a log by the same rules
+//! is every line the binary can print. A shared module's lines are a group of
+//! [`groups`], composed into the list of every binary that enters the module,
+//! and the module's entry names it ([`require`]): a binary that enters a module
+//! without having registered its group panics by name at its start, whatever
+//! flag would have reached the print. [`Log`] reads a log by the same rules
 //! in Rust, a record's values by field name ([`Fields`]), and refuses by name
 //! ([`ReadError`]) a record absent where one is due, a line that opens a
 //! kind's record and does not read whole, and a field the kind lacks, of
@@ -27,7 +31,7 @@
 //! (`load_s`, `card_expert_bytes`).
 
 use std::fmt::{Debug, Display, Write as _};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock, PoisonError};
 
 #[cfg(feature = "gpu")]
 use bloomery_gpu::host::PassKind;
@@ -237,9 +241,20 @@ impl Prints {
 /// kind renders.
 static PRINTS: OnceLock<Prints> = OnceLock::new();
 
+/// A group a shared module's entry needs registered ([`require`]) and the entry's name.
+#[derive(Clone, Copy)]
+struct Needs {
+    group: &'static [&'static Kind],
+    who: &'static str,
+}
+
+/// The groups required before [`at_main`] registered, which it checks when it does.
+static PENDING: Mutex<Vec<Needs>> = Mutex::new(Vec::new());
+
 /// With `--records-schema` among the process's arguments, print `bin`'s
 /// kinds ([`print_schema`]) and exit 0; otherwise register them, after which
-/// [`Record::line`] refuses a line of any other kind. Called right after
+/// [`Record::line`] refuses a line of any other kind, and check the groups
+/// [`require`] was given before this call. Called right after
 /// `bloomery_levers::at_main`, before any argument parse or load; a second
 /// call with another binary or list panics by name.
 pub fn at_main(bin: &'static str, kinds: &'static [&'static Kind]) {
@@ -247,15 +262,99 @@ pub fn at_main(bin: &'static str, kinds: &'static [&'static Kind]) {
         print_schema(bin, kinds);
         std::process::exit(0);
     }
-    let held = PRINTS.get_or_init(|| Prints { bin, kinds });
+    register_in(&PRINTS, &PENDING, bin, kinds);
+    #[cfg(feature = "gpu")]
+    if kinds.iter().any(|k| std::ptr::eq(*k, &RESIDENCY_LEAK)) {
+        bloomery_gpu::host::swap::set_leak_sink(eprint_leak);
+    }
+}
+
+/// A shared module's entry `who` needs `group` registered: the kinds of its
+/// path of prints (`groups`). Registered already, a kind of `group` missing
+/// from the process's list panics by name; before [`at_main`], the group
+/// waits and `at_main` checks it. A process that never calls `at_main` (a
+/// gate binary) never reads the wait.
+pub fn require(group: &'static [&'static Kind], who: &'static str) {
+    require_in(&PRINTS, &PENDING, group, who);
+}
+
+/// The names of the kinds of `group` that `list` does not hold, in the group's order.
+fn missing(list: &[&Kind], group: &[&'static Kind]) -> Vec<&'static str> {
+    group
+        .iter()
+        .filter(|g| !list.iter().any(|k| std::ptr::eq(*k, **g)))
+        .map(|g| g.name)
+        .collect()
+}
+
+/// What `held` says when the entry `who` needs `group`: `None` when it holds
+/// every kind of it.
+fn refusal(held: &Prints, group: &[&'static Kind], who: &str) -> Option<String> {
+    let lacking = missing(held.kinds, group);
+    (!lacking.is_empty()).then(|| {
+        format!(
+            "{} enters {who} without registering its records: {}",
+            held.bin,
+            lacking.join(", ")
+        )
+    })
+}
+
+/// Panics by name when `held` lacks a kind of `group`, the entry `who` needing it.
+fn enforce(held: &Prints, group: &[&'static Kind], who: &str) {
+    if let Some(why) = refusal(held, group, who) {
+        panic!("{why}");
+    }
+}
+
+/// [`require`] under the registration `slot` and the wait `pending`. Once the
+/// process registered, the check takes no lock: an entry that runs per request
+/// pays a few pointer compares.
+fn require_in(
+    slot: &OnceLock<Prints>,
+    pending: &Mutex<Vec<Needs>>,
+    group: &'static [&'static Kind],
+    who: &'static str,
+) {
+    if let Some(held) = slot.get() {
+        enforce(held, group, who);
+        return;
+    }
+    let mut wait = pending.lock().unwrap_or_else(PoisonError::into_inner);
+    // `at_main` may have registered between the look above and the lock; its drain
+    // comes after the lock, so a group pushed here is seen by it.
+    if let Some(held) = slot.get() {
+        drop(wait);
+        enforce(held, group, who);
+        return;
+    }
+    let same = |n: &Needs| {
+        n.who == who
+            && n.group.len() == group.len()
+            && n.group.iter().zip(group).all(|(a, b)| std::ptr::eq(*a, *b))
+    };
+    if !wait.iter().any(same) {
+        wait.push(Needs { group, who });
+    }
+}
+
+/// [`at_main`]'s registration of `bin`'s `kinds` in `slot`, then the check of
+/// every group that waited in `pending`.
+fn register_in(
+    slot: &OnceLock<Prints>,
+    pending: &Mutex<Vec<Needs>>,
+    bin: &'static str,
+    kinds: &'static [&'static Kind],
+) {
+    let held = slot.get_or_init(|| Prints { bin, kinds });
     assert!(
         held.bin == bin && std::ptr::eq(held.kinds, kinds),
         "record::at_main({bin}): the process registered {}'s kinds already",
         held.bin
     );
-    #[cfg(feature = "gpu")]
-    if kinds.iter().any(|k| std::ptr::eq(*k, &RESIDENCY_LEAK)) {
-        bloomery_gpu::host::swap::set_leak_sink(eprint_leak);
+    let due = std::mem::take(&mut *pending.lock().unwrap_or_else(PoisonError::into_inner));
+    for n in due {
+        enforce(held, n.group, n.who);
     }
 }
 
@@ -453,10 +552,24 @@ impl Record {
         println!("{}", self.line());
     }
 
-    /// The line on stderr.
+    /// The line on stderr, and to the [`tee`] when one is set.
     pub fn eprint(self) {
-        eprintln!("{}", self.line());
+        let line = self.line();
+        eprintln!("{line}");
+        if let Some(tee) = TEE.get() {
+            tee(&line);
+        }
     }
+}
+
+/// Where [`Record::eprint`] also hands each line, set once by [`tee`].
+static TEE: OnceLock<fn(&str)> = OnceLock::new();
+
+/// Hands every line [`Record::eprint`] prints from now on to `to` as well: a
+/// serving seat's start screen (`serve::screen`) when the seat armed it. A
+/// second call keeps the first.
+pub fn tee(to: fn(&str)) {
+    let _ = TEE.set(to);
 }
 
 // ---------------------------------------------------------------- the reader
@@ -3002,6 +3115,185 @@ pub static TAPS_DUMP: Kind = Kind {
     ],
 };
 
+/// A serve gate's server, up.
+pub static SERVER_SPAWN: Kind = Kind {
+    name: "server_spawn",
+    head: "server",
+    doc: "A serve gate's server spawn: the server binary's file name, its process id, and the wall \
+          from the gate's spawn call to the `listening on` line of the server's stderr (a runtime \
+          value) — the process start, the card's init, the load and the server's start, the poll \
+          that found the line included.",
+    parts: &[
+        key("exe", Word, ""),
+        key("pid", U64, ""),
+        key("listening_s", F64(2), "s"),
+    ],
+};
+
+// ---------------------------------------------------------------- the groups
+
+/// The kinds of `parts`, one part after another, as a constant: the length.
+const fn kinds_len(parts: &[&[&'static Kind]]) -> usize {
+    let mut n = 0;
+    let mut i = 0;
+    while i < parts.len() {
+        n += parts[i].len();
+        i += 1;
+    }
+    n
+}
+
+/// The kinds of `parts`, one part after another, as an array of `N` ([`kinds_len`]).
+const fn kinds_join<const N: usize>(parts: &[&[&'static Kind]]) -> [&'static Kind; N] {
+    let mut out = [parts[0][0]; N];
+    let mut at = 0;
+    let mut i = 0;
+    while i < parts.len() {
+        let mut j = 0;
+        while j < parts[i].len() {
+            out[at] = parts[i][j];
+            at += 1;
+            j += 1;
+        }
+        i += 1;
+    }
+    out
+}
+
+/// A list of kinds composed of parts in order: a literal `&[&KIND, …]` or a
+/// group of [`groups`]. The order of the parts is the order of the schema.
+macro_rules! kinds {
+    ($($part:expr),+ $(,)?) => {{
+        const PARTS: &[&[&'static Kind]] = &[$($part),+];
+        const N: usize = kinds_len(PARTS);
+        const JOINED: [&'static Kind; N] = kinds_join(PARTS);
+        &JOINED
+    }};
+}
+
+/// The kinds a shared module prints, a group for each entry's path of it, in
+/// the module named by the module's file stem. A seat's list holds the groups
+/// of every module it enters, and the module's entry says so at run time
+/// ([`require`]); `tools/check-records.py` holds a group equal to what its
+/// module constructs and every module that two or more binaries reach a group
+/// module. `generate.rs` is the one printer outside the rule: its kinds stay
+/// in the generate and chat lists by hand, which `tools/ref/cold-blocks.sh`
+/// and `tools/ref/depth-glm5next.sh` read as exact print sets.
+pub mod groups {
+    /// `vision_seat.rs`.
+    pub mod vision_seat {
+        use crate::record::{Kind, VISION, VISION_SEAT};
+
+        /// The records of a seat that serves images: `Flags::encoder` is every
+        /// such start's entry, and the encoder's seat and load print them.
+        pub const RECORDS: &[&Kind] = &[&VISION_SEAT, &VISION];
+    }
+
+    /// `model_file.rs`.
+    pub mod model_file {
+        use crate::record::{
+            HF_DONE, HF_DRAFT_SKIP, HF_FILE, HF_OFFLINE, HF_PROGRESS, HF_SET, Kind,
+        };
+
+        /// A fetch of exact files: the lines `resolve_exact` prints, which
+        /// `fetch_exact`, `quantized_from` and the projector's `hf_projector` run.
+        pub const FETCH: &[&Kind] = &[&HF_OFFLINE, &HF_FILE, &HF_PROGRESS, &HF_DONE];
+
+        /// A `--hf` set's resolve (`resolve`, through `model_file::name`),
+        /// which prints its own two besides the fetch's.
+        pub const SET: &[&Kind] = &[&HF_SET, &HF_DRAFT_SKIP];
+    }
+
+    /// `bin/shared/serve_seats/drafted.rs`.
+    pub mod drafted {
+        use crate::record::{Kind, MTP_PROMPT, MTP_WIDTH};
+
+        /// A slot draft's `mtp prompt` records: `SlotDrafts::open` builds the
+        /// drafts that print them.
+        pub const PROMPT: &[&Kind] = &[&MTP_PROMPT];
+
+        /// The width chooser's `mtp width` record at a request's end:
+        /// `print_widths`, which `SlotDrafts` runs and the V4.1 seat runs alone.
+        pub const WIDTH: &[&Kind] = &[&MTP_WIDTH];
+    }
+
+    /// `bin/shared/serve_seats/rounds.rs`.
+    pub mod rounds {
+        use crate::record::{Kind, SLOTS_ROUND};
+
+        /// A round of several slots a seat that counts its rounds
+        /// (`Seat::step_stats`) prints.
+        pub const ROUND: &[&Kind] = &[&SLOTS_ROUND];
+    }
+
+    /// `bind.rs`.
+    pub mod bind {
+        use crate::record::{CACHE_REUSE, Kind, SLOT_CALL, SLOTS_ROUND};
+
+        /// The prompt cache's reuse note, which every seat's `Seat::note` prints.
+        pub const CACHE: &[&Kind] = &[&CACHE_REUSE];
+
+        /// The rounds and calls of a seat that counts them
+        /// (`Seat::step_stats`) and serves two slots or more.
+        pub const SLOTS: &[&Kind] = &[&SLOTS_ROUND, &SLOT_CALL];
+    }
+
+    /// `residency38.rs`.
+    pub mod residency38 {
+        use crate::record::{Kind, RESIDENCY_HOST, RESIDENCY_UNSET};
+
+        /// The churn pool's record of a load under `mid`: `residency_set`.
+        pub const HOST: &[&Kind] = &[&RESIDENCY_HOST];
+
+        /// The residency rule's record for a qwen4exp load with the lever
+        /// unset: `residency38`, which then runs `residency_set`.
+        pub const UNSET: &[&Kind] = &[&RESIDENCY_UNSET];
+    }
+
+    /// `host_stats.rs`.
+    pub mod host_stats {
+        use crate::record::{Kind, STAT_STEP_HOST, STAT_SUMMARY_HOST};
+
+        /// The host tier's step and summary records: `print_stats`.
+        pub const STATS: &[&Kind] = &[&STAT_STEP_HOST, &STAT_SUMMARY_HOST];
+    }
+
+    /// `bin/shared/ds41_split.rs`.
+    pub mod ds41_split {
+        use crate::record::{Kind, STAT_PREFILL_SPLIT};
+
+        /// The prefill split of a V4.1 prompt: `split`.
+        pub const SPLIT: &[&Kind] = &[&STAT_PREFILL_SPLIT];
+    }
+
+    /// `bin/shared/ds41_draft.rs`.
+    pub mod ds41_draft {
+        use crate::record::{Kind, LOAD_DRAFT};
+
+        /// The DSpark draft's load record: `Draft::from_levers` is the entry
+        /// of every start that can open one.
+        pub const LOAD: &[&Kind] = &[&LOAD_DRAFT];
+    }
+
+    /// `bin/shared/qwen3moe_place.rs`.
+    pub mod qwen3moe_place {
+        use crate::record::{Kind, PLAN38};
+
+        /// The placed plan of a qwen3moe or qwen35moe load: `PlaceQ3::record`.
+        pub const PLAN: &[&Kind] = &[&PLAN38];
+    }
+
+    /// `serve_client.rs`.
+    pub mod serve_client {
+        use crate::record::{Kind, SERVER_SPAWN};
+
+        /// A gate's server spawn: the `server` record `Served::address` prints
+        /// on stdout when the server listens. The gates that start a server
+        /// register no list (`at_main`), so the record tests hold the group.
+        pub const SPAWN: &[&Kind] = &[&SERVER_SPAWN];
+    }
+}
+
 /// What `generate_ds41` prints, in the order it prints them.
 pub static GENERATE_DS41: &[&Kind] = &[
     &PLACE_UNSET,
@@ -3080,160 +3372,157 @@ pub static BLOOMERY_CHAT: &[&Kind] = &[
 
 /// What `bloomery-serve-ds41` prints, all on stderr, and the rounds of
 /// several slots and the calls of one a `BLOOMERY_STEP_STATS` run counts.
-/// The `hf` lines are the `--hf` repo's projector fetch, which runs after the
-/// seat registers ([`crate::model_file::hf_projector`]).
-pub static BLOOMERY_SERVE_DS41: &[&Kind] = &[
-    &HF_OFFLINE,
-    &HF_FILE,
-    &HF_PROGRESS,
-    &HF_DONE,
-    &PLACE_UNSET,
-    &PLAN,
-    &CACHE_CONFIG,
-    &LANE,
-    &LOAD_GENERATOR,
-    &LOAD_PHASES,
-    &HOST_POPULATE,
-    &HOST_POPULATE_OFF,
-    &HOST_LOCK,
-    &NVTIER,
-    &HELPER,
-    &LOAD_DRAFT,
-    &CAPTURE,
-    &CAPTURE_PAIR,
-    &VISION_SEAT,
-    &VISION,
-    &LISTENING,
-    &CACHE_REUSE,
-    &CACHE_SAVE,
-    &CACHE_LANDED,
-    &CACHE_LOAD,
-    &CACHE_EVICT,
-    &CACHE_SKIP,
-    &PREFILL_SPLIT,
-    &RESIDENCY_LEVER,
-    &RESIDENCY_HOST,
-    &RESIDENCY_PASS,
-    &RESIDENCY_RESET,
-    &RESIDENCY_LEAK,
-    &MTP_WIDTH,
-    &SLOTS_ROUND,
-    &SLOT_CALL,
+/// The `hf` lines are the `--hf` repo's resolve, which the server runs before
+/// the seat registers, and its projector fetch ([`crate::model_file::hf_projector`]),
+/// which runs after.
+pub static BLOOMERY_SERVE_DS41: &[&Kind] = kinds![
+    groups::model_file::FETCH,
+    groups::model_file::SET,
+    &[
+        &PLACE_UNSET,
+        &PLAN,
+        &CACHE_CONFIG,
+        &LANE,
+        &LOAD_GENERATOR,
+        &LOAD_PHASES,
+        &HOST_POPULATE,
+        &HOST_POPULATE_OFF,
+        &HOST_LOCK,
+        &NVTIER,
+        &HELPER,
+    ],
+    groups::ds41_draft::LOAD,
+    &[&CAPTURE, &CAPTURE_PAIR],
+    groups::vision_seat::RECORDS,
+    &[&LISTENING],
+    groups::bind::CACHE,
+    &[
+        &CACHE_SAVE,
+        &CACHE_LANDED,
+        &CACHE_LOAD,
+        &CACHE_EVICT,
+        &CACHE_SKIP,
+        &PREFILL_SPLIT,
+        &RESIDENCY_LEVER,
+        &RESIDENCY_HOST,
+        &RESIDENCY_PASS,
+        &RESIDENCY_RESET,
+        &RESIDENCY_LEAK,
+    ],
+    groups::drafted::WIDTH,
+    groups::bind::SLOTS,
 ];
 
-/// What `bloomery-serve-qwen38` prints, all on stderr.
-pub static BLOOMERY_SERVE_QWEN38: &[&Kind] = &[
-    &PLAN38,
-    &LISTENING38,
-    &CACHE_REUSE,
-    &MTP_PROMPT,
-    &LANE,
-    &LOAD_DRAFT_OFF38,
-    &MTP_HEAD38,
-    &MTP_KEEP38,
-    &RESIDENCY_LEVER,
-    &PLACE_UNSET,
-    &RESIDENCY_UNSET,
-    &RESIDENCY_HOST,
-    &CALL_STREAM,
-    &CALL_STREAM_END,
-    &RESIDENCY_PASS,
-    &RESIDENCY_RESET,
-    &SLOTS_ROUND,
-    &SLOT_CALL,
-    &MTP_WIDTH,
-    &DRAFT_YIELD,
-    &NVTIER,
-    &TIER_CENSUS,
+/// What `bloomery-serve-qwen38` prints, all on stderr; the `hf` lines are a
+/// `--hf` repo's resolve, which the server runs before the seat registers.
+pub static BLOOMERY_SERVE_QWEN38: &[&Kind] = kinds![
+    groups::model_file::FETCH,
+    groups::model_file::SET,
+    &[&PLAN38, &LISTENING38],
+    groups::bind::CACHE,
+    groups::drafted::PROMPT,
+    &[
+        &LANE,
+        &LOAD_PHASES,
+        &LOAD_DRAFT_OFF38,
+        &MTP_HEAD38,
+        &MTP_KEEP38,
+        &RESIDENCY_LEVER,
+        &PLACE_UNSET,
+    ],
+    groups::residency38::UNSET,
+    groups::residency38::HOST,
+    &[
+        &CALL_STREAM,
+        &CALL_STREAM_END,
+        &RESIDENCY_PASS,
+        &RESIDENCY_RESET,
+    ],
+    groups::bind::SLOTS,
+    groups::drafted::WIDTH,
+    &[&DRAFT_YIELD, &NVTIER, &TIER_CENSUS],
 ];
 
 /// What the Qwen3 seat of `bloomery-serve` prints, all on stderr: the
-/// placement and why (`place unset`), a `--hf`
-/// fetch's lines (printed by the server before the seat registers), the
-/// load, the image encoder's seat with the plan and its record after the load
-/// under `--mmproj`, the address and each request's note of the prefix it kept
-/// none of.
-pub static BLOOMERY_SERVE_QWEN3: &[&Kind] = &[
-    &PLACE_UNSET,
-    &PLAN38,
-    &HF_OFFLINE,
-    &HF_SET,
-    &HF_FILE,
-    &HF_PROGRESS,
-    &HF_DONE,
-    &LOAD_QWEN3,
-    &VISION_SEAT,
-    &VISION,
-    &LISTENING_QWEN3,
-    &CACHE_REUSE,
-    &SLOTS_ROUND,
-    &SLOT_CALL,
+/// placement and why (`place unset`), a `--hf` repo's resolve and fetch
+/// lines (the server prints the resolve before the seat registers), the
+/// load and its phases, the image encoder's seat with the plan and its record
+/// after them under `--mmproj`, the address and each request's note of the
+/// prefix it kept none of.
+pub static BLOOMERY_SERVE_QWEN3: &[&Kind] = kinds![
+    &[&PLACE_UNSET],
+    groups::qwen3moe_place::PLAN,
+    groups::model_file::FETCH,
+    groups::model_file::SET,
+    &[&LOAD_QWEN3, &LOAD_PHASES],
+    groups::vision_seat::RECORDS,
+    &[&LISTENING_QWEN3],
+    groups::bind::CACHE,
+    groups::bind::SLOTS,
 ];
 
 /// What the MiMo seat of `bloomery-serve` prints, all on stderr: the
-/// placement and why (`place unset`), a `--hf` fetch's lines (printed by the
-/// server before the seat registers), the residency lever's word and why, the
-/// plan, the churn pool's share of the host under `mid`, the load, the
-/// address and each request's note of the prefix it kept less of than it
-/// shared.
-pub static BLOOMERY_SERVE_MIMO2: &[&Kind] = &[
-    &RESIDENCY_LEVER,
-    &PLACE_UNSET,
-    &PLAN,
-    &RESIDENCY_HOST,
-    &HF_OFFLINE,
-    &HF_SET,
-    &HF_FILE,
-    &HF_PROGRESS,
-    &HF_DONE,
-    &LANE,
-    &LOAD_MIMO2,
-    &LISTENING_MIMO2,
-    &CACHE_REUSE,
+/// placement and why (`place unset`), a `--hf` repo's resolve lines (printed by
+/// the server before the seat registers), the residency lever's word and why, the
+/// plan, the churn pool's share of the host under `mid`, the load and its
+/// phases, the address and each request's note of the prefix it kept less of
+/// than it shared.
+pub static BLOOMERY_SERVE_MIMO2: &[&Kind] = kinds![
+    &[&RESIDENCY_LEVER, &PLACE_UNSET, &PLAN],
+    groups::residency38::HOST,
+    groups::model_file::FETCH,
+    groups::model_file::SET,
+    &[&LANE, &LOAD_MIMO2, &LOAD_PHASES, &LISTENING_MIMO2],
+    groups::bind::CACHE,
 ];
 
 /// What the GLM seat of `bloomery-serve` prints, all on stderr: the
-/// residency lever's word, the placement and why, the `plan`, `load` and
-/// `capture` lines `generate_glm5next` prints, the host set's records of a
+/// residency lever's word, the placement and why, the `plan`, `load`, `load
+/// phases` and `capture` lines `generate_glm5next` prints, the host set's records of a
 /// placed load, the draft's load line and its verify's capture, the
 /// listening line, the reuse records the checkpoint rule answers, the
 /// draft's joins, the residency machine's records, and the rounds of several
 /// slots and the calls of one a `BLOOMERY_STEP_STATS` run counts, and the image encoder's `vision`
-/// record under `--mmproj`. The `hf` lines are the `--hf` repo's projector fetch, which runs after
-/// the seat registers ([`crate::model_file::hf_projector`]).
-pub static BLOOMERY_SERVE_GLM: &[&Kind] = &[
-    &RESIDENCY_LEVER,
-    &DRAFT_UNSET_GLM,
-    &DRAFT_YIELD,
-    &HF_OFFLINE,
-    &HF_FILE,
-    &HF_PROGRESS,
-    &HF_DONE,
-    &PLACE_UNSET,
-    &PLAN,
-    &RESIDENCY_UNSET_GLM,
-    &RESIDENCY_HOST,
-    &LANE,
-    &LOAD_GENERATOR,
-    &HOST_POPULATE,
-    &HOST_POPULATE_OFF,
-    &HOST_LOCK,
-    &NVTIER,
-    &LOAD_DRAFT_GLM,
-    &LOAD_DRAFT_OFF_GLM,
-    &CAPTURE,
-    &CAPTURE_PAIR,
-    &VISION_SEAT,
-    &LISTENING_GLM,
-    &CACHE_REUSE,
-    &MTP_PROMPT,
-    &RESIDENCY_PASS,
-    &RESIDENCY_RESET,
-    &RESIDENCY_LEAK,
-    &SLOTS_ROUND,
-    &SLOT_CALL,
-    &MTP_WIDTH,
-    &VISION,
+/// record under `--mmproj`. The `hf` lines are the `--hf` repo's resolve, which the server runs before
+/// the seat registers, and its projector fetch ([`crate::model_file::hf_projector`]), which runs after.
+pub static BLOOMERY_SERVE_GLM: &[&Kind] = kinds![
+    &[&RESIDENCY_LEVER, &DRAFT_UNSET_GLM, &DRAFT_YIELD],
+    groups::model_file::FETCH,
+    groups::model_file::SET,
+    &[&PLACE_UNSET, &PLAN, &RESIDENCY_UNSET_GLM],
+    groups::residency38::HOST,
+    &[
+        &LANE,
+        &LOAD_GENERATOR,
+        &LOAD_PHASES,
+        &HOST_POPULATE,
+        &HOST_POPULATE_OFF,
+        &HOST_LOCK,
+        &NVTIER,
+        &LOAD_DRAFT_GLM,
+        &LOAD_DRAFT_OFF_GLM,
+        &CAPTURE,
+        &CAPTURE_PAIR,
+    ],
+    groups::vision_seat::RECORDS,
+    &[&LISTENING_GLM],
+    groups::bind::CACHE,
+    groups::drafted::PROMPT,
+    &[&RESIDENCY_PASS, &RESIDENCY_RESET, &RESIDENCY_LEAK],
+    groups::bind::SLOTS,
+    groups::drafted::WIDTH,
+];
+
+/// What the decision-model seat of `bloomery-serve` prints, all on stderr: the
+/// lines of the `--hf` repo's resolves and fetches (the model's own are the
+/// server's, printed before the seat registers; a head's and a projector's
+/// are the seat's), the `vision_seat` and `vision` records of a resident image
+/// encoder, then the `listening` record.
+pub static BLOOMERY_SERVE_DECIDE: &[&Kind] = kinds![
+    groups::model_file::FETCH,
+    groups::model_file::SET,
+    groups::vision_seat::RECORDS,
+    &[&LISTENING_DECIDE],
 ];
 
 /// What `generate_glm5next` prints, in the order it prints them.
@@ -3475,6 +3764,36 @@ pub fn load_phases(
         .f("body_s", body)
         .f("head_s", head)
         .f("other_s", other)
+}
+
+/// [`load_phases`] of `model`'s load on stderr, for the seat that just
+/// printed the `load` line whose `load_s` is `total`: `open` is the wall
+/// from the seat's start to the load the phases time (the file's headers,
+/// and the plan where the seat makes it before the loader's call), the other
+/// phases those the load timed ([`bloomery_gpu::model::GpuModel::load_times`]).
+/// A load that timed none prints nothing; phases past `total` panic by name,
+/// as [`load_phases`] does.
+#[cfg(feature = "gpu")]
+pub fn eprint_load_phases<B: bloomery_gpu::model::ChainBody>(
+    model: &bloomery_gpu::model::GpuModel<B>,
+    total: std::time::Duration,
+    open: std::time::Duration,
+) {
+    let Some(times) = model.load_times() else {
+        return;
+    };
+    load_phases(
+        total.as_secs_f64(),
+        open.as_secs_f64(),
+        times.plan.map(|d| d.as_secs_f64()),
+        times.context.as_secs_f64(),
+        times.upload.as_secs_f64(),
+        times.derive.as_secs_f64(),
+        times.host_set.as_secs_f64(),
+        times.body.as_secs_f64(),
+        times.head.as_secs_f64(),
+    )
+    .eprint();
 }
 
 /// The `lane` record of the rate a load probed on the card it stages on
@@ -3905,39 +4224,227 @@ pub fn residency_reset(r: &ResetReport) -> Record {
 mod tests {
     use super::*;
 
-    /// Every seat that takes `--mmproj` registers the `vision` record its tower's load prints:
-    /// an unregistered kind panics at the print.
+    /// `missing` names exactly the kinds of the group a list lacks, in the group's order.
+    #[test]
+    fn missing_names_the_kinds_a_list_lacks() {
+        static GROUP: &[&Kind] = &[&HF_OFFLINE, &HF_FILE, &HF_DONE];
+        assert_eq!(missing(&[&HF_FILE], GROUP), ["hf_offline", "hf_done"]);
+        assert!(missing(&[&HF_DONE, &HF_FILE, &HF_OFFLINE, &VISION], GROUP).is_empty());
+        assert!(missing(&[], &[]).is_empty());
+    }
+
+    /// Every seat that takes images calls `vision_seat::Flags::encoder` on its start (the GLM
+    /// seat at `glm.rs`, V4.1 at `ds41.rs`, Qwen3 at `qwen3.rs`, the decision seat at
+    /// `decide.rs`), which requires the vision records and the fetch lines of the `--hf`
+    /// projector: each of those seats registers them.
     #[test]
     fn the_seats_that_take_images_register_the_vision_record() {
-        for (seat, set) in [
+        for (seat, list) in [
             ("ds41", BLOOMERY_SERVE_DS41),
             ("qwen3", BLOOMERY_SERVE_QWEN3),
             ("glm", BLOOMERY_SERVE_GLM),
+            ("decide", BLOOMERY_SERVE_DECIDE),
         ] {
-            assert!(
-                set.iter().any(|k| k.name == VISION.name),
-                "the {seat} seat does not register the vision record"
+            assert_eq!(
+                missing(list, groups::vision_seat::RECORDS),
+                Vec::<&str>::new(),
+                "the {seat} seat calls Flags::encoder, so it needs vision_seat's records"
             );
         }
     }
 
-    /// Every seat whose `--hf` repo's projector is fetched after its `record::at_main`
-    /// ([`crate::model_file::hf_projector`]) registers each line that fetch prints.
+    /// Every seat whose `--hf` repo's projector is fetched after its `record::at_main` calls
+    /// `Flags::encoder`, which fetches through `model_file::hf_projector`: each registers the
+    /// lines of a fetch.
     #[test]
     fn the_seats_that_fetch_the_hf_projector_register_its_lines() {
-        for (seat, set) in [
+        for (seat, list) in [
             ("ds41", BLOOMERY_SERVE_DS41),
             ("qwen3", BLOOMERY_SERVE_QWEN3),
             ("glm", BLOOMERY_SERVE_GLM),
+            ("decide", BLOOMERY_SERVE_DECIDE),
         ] {
-            for kind in [&HF_OFFLINE, &HF_FILE, &HF_PROGRESS, &HF_DONE] {
-                assert!(
-                    set.iter().any(|k| k.name == kind.name),
-                    "the {seat} seat does not register the {} record",
-                    kind.name
+            assert_eq!(
+                missing(list, groups::model_file::FETCH),
+                Vec::<&str>::new(),
+                "the {seat} seat fetches the --hf projector, so it needs model_file's fetch lines"
+            );
+        }
+    }
+
+    /// What each binary's entries require of its list, written from the binary's side: the groups
+    /// of the shared modules it enters, and the call that enters them. The serve lists are
+    /// composed ([`kinds!`]); the generate lists are written by hand, so a kind a group gains
+    /// stays missing from them until this reds. `bloomery-serve` resolves a `--hf` repo's set
+    /// (`model_file::name`) before any seat registers, which is why every seat needs the
+    /// resolve's lines.
+    #[test]
+    fn every_binary_registers_the_groups_its_entries_require() {
+        use groups::{
+            bind, drafted, ds41_draft, ds41_split, host_stats, model_file, qwen3moe_place,
+            residency38, vision_seat,
+        };
+        type Group = &'static [&'static Kind];
+        let table: [(&str, Group, &[Group]); 11] = [
+            (
+                "ds41 seat: Flags::encoder, Draft::from_levers, print_widths, bind::spawn",
+                BLOOMERY_SERVE_DS41,
+                &[
+                    model_file::FETCH,
+                    model_file::SET,
+                    vision_seat::RECORDS,
+                    ds41_draft::LOAD,
+                    drafted::WIDTH,
+                    bind::CACHE,
+                    bind::SLOTS,
+                ],
+            ),
+            (
+                "qwen38 seat: SlotDrafts::open, residency38, bind::spawn",
+                BLOOMERY_SERVE_QWEN38,
+                &[
+                    model_file::FETCH,
+                    model_file::SET,
+                    drafted::PROMPT,
+                    drafted::WIDTH,
+                    residency38::UNSET,
+                    residency38::HOST,
+                    bind::CACHE,
+                    bind::SLOTS,
+                ],
+            ),
+            (
+                "qwen3 seat: Flags::encoder, default_ctx_qwen3, bind::spawn",
+                BLOOMERY_SERVE_QWEN3,
+                &[
+                    model_file::FETCH,
+                    model_file::SET,
+                    vision_seat::RECORDS,
+                    qwen3moe_place::PLAN,
+                    bind::CACHE,
+                    bind::SLOTS,
+                ],
+            ),
+            (
+                "mimo2 seat: residency_set, bind::spawn",
+                BLOOMERY_SERVE_MIMO2,
+                &[
+                    model_file::FETCH,
+                    model_file::SET,
+                    residency38::HOST,
+                    bind::CACHE,
+                ],
+            ),
+            (
+                "glm seat: Flags::encoder, residency_set, SlotDrafts::open, bind::spawn",
+                BLOOMERY_SERVE_GLM,
+                &[
+                    model_file::FETCH,
+                    model_file::SET,
+                    vision_seat::RECORDS,
+                    residency38::HOST,
+                    drafted::PROMPT,
+                    drafted::WIDTH,
+                    bind::CACHE,
+                    bind::SLOTS,
+                ],
+            ),
+            (
+                "decide seat: Flags::encoder",
+                BLOOMERY_SERVE_DECIDE,
+                &[model_file::FETCH, model_file::SET, vision_seat::RECORDS],
+            ),
+            (
+                "generate_ds41: Draft::from_levers, ds41_split::split",
+                GENERATE_DS41,
+                &[ds41_draft::LOAD, ds41_split::SPLIT],
+            ),
+            (
+                "generate_glm5next: residency_set, print_stats",
+                GENERATE_GLM5NEXT,
+                &[residency38::HOST, host_stats::STATS],
+            ),
+            (
+                "generate_qwen3moe: residency38, print_stats, PlaceQ3::record",
+                GENERATE_QWEN3MOE,
+                &[
+                    residency38::UNSET,
+                    residency38::HOST,
+                    host_stats::STATS,
+                    qwen3moe_place::PLAN,
+                ],
+            ),
+            (
+                "gate_nvtier: residency38",
+                GATE_NVTIER,
+                &[residency38::UNSET, residency38::HOST],
+            ),
+            (
+                "gate_deepseek41_prefill: ds41_split::split",
+                GATE_DEEPSEEK41_PREFILL,
+                &[ds41_split::SPLIT],
+            ),
+        ];
+        for (entries, list, needs) in table {
+            for group in needs {
+                assert_eq!(
+                    missing(list, group),
+                    Vec::<&str>::new(),
+                    "{entries}: a group its entries require is not in its list"
                 );
             }
         }
+        // The MiMo seat counts no round (`Seat::step_stats` is its default): no slot record in its list.
+        assert_eq!(
+            missing(BLOOMERY_SERVE_MIMO2, bind::SLOTS),
+            ["slots round", "slot call"]
+        );
+    }
+
+    /// A group required after the process registered, and missing from its list, panics by name.
+    #[test]
+    #[should_panic(expected = "bin-x enters entry-y without registering its records: hf_file")]
+    fn a_group_required_after_registration_and_missing_panics() {
+        static LIST: &[&Kind] = &[&HF_OFFLINE];
+        static GROUP: &[&Kind] = &[&HF_OFFLINE, &HF_FILE];
+        let slot = OnceLock::new();
+        let wait = Mutex::new(Vec::new());
+        register_in(&slot, &wait, "bin-x", LIST);
+        require_in(&slot, &wait, GROUP, "entry-y");
+    }
+
+    /// A group required before the process registered waits, and the registration checks it:
+    /// a missing kind panics at `at_main`, not at the entry that asked.
+    #[test]
+    #[should_panic(expected = "bin-x enters entry-y without registering its records: hf_file")]
+    fn a_group_required_before_registration_is_checked_at_registration() {
+        static LIST: &[&Kind] = &[&HF_OFFLINE];
+        static GROUP: &[&Kind] = &[&HF_OFFLINE, &HF_FILE];
+        let slot = OnceLock::new();
+        let wait = Mutex::new(Vec::new());
+        require_in(&slot, &wait, GROUP, "entry-y");
+        register_in(&slot, &wait, "bin-x", LIST);
+    }
+
+    /// Groups the registered list holds, required before or after, pass; a process that
+    /// never registers leaves the wait unread.
+    #[test]
+    fn a_group_the_list_holds_passes_and_an_unregistered_process_never_reads_the_wait() {
+        static LIST: &[&Kind] = &[&HF_OFFLINE, &HF_FILE];
+        static GROUP: &[&Kind] = &[&HF_FILE];
+        static OTHER: &[&Kind] = &[&VISION];
+        let slot = OnceLock::new();
+        let wait = Mutex::new(Vec::new());
+        require_in(&slot, &wait, GROUP, "before");
+        require_in(&slot, &wait, GROUP, "before");
+        assert_eq!(wait.lock().unwrap().len(), 1, "the same entry waits once");
+        register_in(&slot, &wait, "bin-x", LIST);
+        require_in(&slot, &wait, GROUP, "after");
+        assert!(wait.lock().unwrap().is_empty());
+        let never = OnceLock::new();
+        let wait = Mutex::new(Vec::new());
+        require_in(&never, &wait, OTHER, "entry-y");
+        assert_eq!(wait.lock().unwrap().len(), 1);
     }
 
     /// Every binary's kinds: names unique, each value part named once, a
@@ -3957,6 +4464,7 @@ mod tests {
             GATE_DEEPSEEK41_PREFILL,
             PROBE_NVREAD,
             GATE_NVTIER,
+            groups::serve_client::SPAWN,
         ] {
             let mut names: Vec<&str> = set.iter().map(|k| k.name).collect();
             names.sort_unstable();
@@ -4189,6 +4697,10 @@ mod tests {
 
     /// The checked-in schemas `records.py` reads are the binaries' own: a
     /// kind changed here fails until `just records-refresh` rewrites them.
+    /// A binary no `records.py` reader opens has no file: `bloomery-serve`'s
+    /// seats (GLM, MiMo, Qwen3, the decision seats), whose lines the gates read
+    /// through [`Log`] over the lists here, and which answer `--records-schema`
+    /// only after a model file picks the seat.
     #[test]
     fn checked_in_schemas_are_current() {
         let files = [
@@ -4244,6 +4756,29 @@ mod tests {
                 "tools/bloomery/schema/{bin}.jsonl is not {bin}'s schema: run just records-refresh"
             );
         }
+    }
+
+    /// A serve gate's `server` record names the binary, its process and the
+    /// wall to the `listening on` line, in the kind's order.
+    #[test]
+    fn server_spawn_names_the_binary_the_process_and_the_wall() {
+        let line = Record::new(&SERVER_SPAWN)
+            .w("exe", "bloomery-serve")
+            .u("pid", 4242)
+            .f("listening_s", 12.3456)
+            .line();
+        assert_eq!(line, "server exe=bloomery-serve pid=4242 listening_s=12.35");
+    }
+
+    /// A `server` record that leaves a part out panics, naming the kind and
+    /// the part.
+    #[test]
+    #[should_panic(expected = "record server_spawn: listening_s left out")]
+    fn server_spawn_refuses_a_missing_wall() {
+        let _ = Record::new(&SERVER_SPAWN)
+            .w("exe", "bloomery-serve")
+            .u("pid", 4242)
+            .line();
     }
 
     #[test]
@@ -4332,6 +4867,7 @@ mod tests {
             GATE_DEEPSEEK41_PREFILL,
             PROBE_NVREAD,
             GATE_NVTIER,
+            groups::serve_client::SPAWN,
         ] {
             for &kind in set {
                 for full in [true, false] {

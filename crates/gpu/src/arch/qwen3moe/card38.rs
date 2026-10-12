@@ -64,6 +64,7 @@ use crate::{Gpu, GpuError};
 use cuda_core::DeviceBuffer;
 use gguf::GgmlType;
 use model::arch::names::routed_stacks;
+use model::placement::accepts::{self, Program};
 use model::placement::kernels::DownAct;
 
 /// What the map check's refusals name.
@@ -281,12 +282,18 @@ struct CardRun {
     down: DeviceBuffer<f32>,
     /// The card slots' weighted sum, a row a token.
     acc: DeviceBuffer<f32>,
+    /// Zeros, a row a token, on a load with a layer that runs without a
+    /// host leg: that layer's host sum ([`Card38::zero_sum`]).
+    zero: Option<DeviceBuffer<f32>>,
 }
 
 /// Qwen3.8's card leg: each layer's card experts, and, when any layer has
 /// some, the modules and buffers the leg runs on (module doc).
 pub(super) struct Card38 {
     layers: Vec<Option<LegLayer>>,
+    /// Per layer, whether the step and the verify run it without a host leg
+    /// ([`Card38::hostless`]).
+    hostless: Vec<bool>,
     run: Option<CardRun>,
 }
 
@@ -355,21 +362,20 @@ pub(super) fn leg_layers(
 }
 
 /// Layer `l`'s gate·up and down types as `stacks` lists them, refused by
-/// name unless the card leg runs them: the gate and up Q4_K, Q5_K, IQ3_XXS
-/// or IQ4_XS, the down Q5_1, Q8_0 or IQ4_NL.
+/// name unless the card leg runs them ([`accepts::leg_runs`] of Qwen3.8's
+/// program: the table checked every layer the plan cards when it was built).
 fn leg_types(stacks: &Qwen38Stacks, l: usize) -> Result<(GgmlType, GgmlType), GpuError> {
     match stacks.pair(l) {
-        Some(
-            p @ (
-                GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::IQ3_XXS | GgmlType::IQ4_XS,
-                GgmlType::Q5_1 | GgmlType::Q8_0 | GgmlType::IQ4_NL,
-            ),
-        ) => Ok(p),
+        Some(p @ (gate_up, down))
+            if accepts::leg_runs(Program::Qwen38Body, [gate_up, gate_up, down]) == Some(true) =>
+        {
+            Ok(p)
+        }
         other => Err(GpuError::shape(
             WHAT,
             format!(
-                "layer {l}'s card experts in gate·up and down types {other:?}: the card leg runs a \
-                 Q4_K, Q5_K, IQ3_XXS or IQ4_XS gate and up and a Q5_1, Q8_0 or IQ4_NL down"
+                "layer {l}'s card experts in gate·up and down types {other:?}: the card leg \
+                 does not run them (swap38::stacks names its types)"
             ),
         )),
     }
@@ -382,15 +388,21 @@ impl Card38 {
     /// [`stack`] names them, at its count's rows and in those types, which
     /// the leg runs ([`leg_types`]); a layer it puts none on holds none.
     /// Anything else is refused by name. The modules and buffers are made
-    /// only when a layer has card experts. Load-time only.
+    /// only when a layer has card experts. `keep_host`: the load runs every
+    /// layer's host leg ([`Card38::hostless`]). Load-time only.
     pub(super) fn new(
         gpu: &Gpu,
         w: &Weights,
         stacks: &Qwen38Stacks,
         map: &SlotMap,
         layers: usize,
+        keep_host: bool,
     ) -> Result<Card38, GpuError> {
         let per = leg_layers(w, stacks, |l| map.on_card(l), layers)?;
+        let hostless: Vec<bool> = per
+            .iter()
+            .map(|c| !keep_host && c.as_ref().is_some_and(|c| c.n_card == geo::EXPERTS))
+            .collect();
         let run = if per.iter().any(Option::is_some) {
             let stream = gpu.stream();
             let slots = PASS_ROWS * SLOTS;
@@ -398,16 +410,46 @@ impl Card38 {
                 sel: SelRun::new(gpu, PASS_ROWS)?,
                 down: DeviceBuffer::zeroed(stream, slots * geo::HIDDEN)?,
                 acc: DeviceBuffer::zeroed(stream, PASS_ROWS * geo::HIDDEN)?,
+                zero: hostless
+                    .contains(&true)
+                    .then(|| DeviceBuffer::zeroed(stream, PASS_ROWS * geo::HIDDEN))
+                    .transpose()?,
             })
         } else {
             None
         };
-        Ok(Card38 { layers: per, run })
+        Ok(Card38 {
+            layers: per,
+            hostless,
+            run,
+        })
     }
 
     /// Layer `l` has card experts.
     pub(super) fn has(&self, l: usize) -> bool {
         self.layer(l).is_some()
+    }
+
+    /// The step and the verify run layer `l` without a host leg: no go, no
+    /// wait, the host not told of the row, and zeros for the host's sum
+    /// ([`Card38::zero_sum`]). The load decides it once ([`Card38::new`]):
+    /// every routed expert of the layer is on the card, and `keep_host` is
+    /// false, which the load sets when a residency machine runs or the host
+    /// service records a route trace. It holds for the load's life: with no
+    /// machine the load's slot map is every walk's (the machine is what
+    /// moves an expert to the host), and on a load with such a layer the
+    /// host tier refuses a machine started later
+    /// ([`crate::host::HostTier::start_swap`]) and a route trace, which the
+    /// host service writes ([`crate::host::HostTier::attach_route_trace`]).
+    /// The prompt pass serves every layer on the host either way. `l` must be
+    /// a layer of the load.
+    pub(super) fn hostless(&self, l: usize) -> bool {
+        assert!(
+            l < self.hostless.len(),
+            "Card38::hostless: layer {l} of a load of {} layers",
+            self.hostless.len()
+        );
+        self.hostless[l]
     }
 
     /// Layer `l`'s card experts: 0 on a layer without them.
@@ -502,10 +544,23 @@ impl Card38 {
             .ok_or(GpuError::state(WHAT, "a layer with card experts"))
     }
 
+    /// The host's routed sum of a layer run without a host leg
+    /// ([`Card38::hostless`]): zeros, a row a token, as the host writes for
+    /// an empty list. Refused by name on a load with no such layer.
+    pub(super) fn zero_sum(&self) -> Result<&DeviceBuffer<f32>, GpuError> {
+        self.run
+            .as_ref()
+            .and_then(|r| r.zero.as_ref())
+            .ok_or(GpuError::state(WHAT, "a layer run without a host leg"))
+    }
+
     /// Device bytes of the buffers.
     pub(super) fn bytes(&self) -> usize {
         self.run.as_ref().map_or(0, |r| {
-            r.sel.bytes() + r.down.num_bytes() + r.acc.num_bytes()
+            r.sel.bytes()
+                + r.down.num_bytes()
+                + r.acc.num_bytes()
+                + r.zero.as_ref().map_or(0, DeviceBuffer::num_bytes)
         })
     }
 

@@ -288,6 +288,15 @@ blk_stackwatch() {
   fi
   echo "${swt##*$'\n'}"
 }
+# ptx-scan.sh's global load widths, legacy columns, entry boundaries and scan readers on synthetic PTX, no box.
+blk_ptxscan() {
+  if ! pts=$(bash "$(dirname "$0")/ptx-scan.sh" --self-test 2>&1); then
+    echo "$pts" >&2
+    echo "check-recipes: the ptx-scan self-test failed" >&2
+    return 1
+  fi
+  echo "${pts##*$'\n'}"
+}
 # ptx-spill-check.sh's table reading (a process-substitution table read for every binary, a binary with no
 # pinned row) and its verdict lines, through a stub ptx-scan.sh on fixed scans, no build.
 blk_ptxspill() {
@@ -397,6 +406,7 @@ blk_pytools() {
     "tools/check-comment-only.py --self-test"
     "tools/check-defaults.py --self-test"
     "tools/check-ptx-names.py --self-test"
+    "tools/check-records.py --self-test"
     "tools/flow/ds41_prefill.py --self-test"
     "tools/flow/pplb.py --self-test"
     "tools/flow/q38_step.py --self-test"
@@ -428,6 +438,7 @@ blk_pytools() {
     "tools/ref/router-residency.py --self-test"
     "tools/ref/set-diff.py --self-test"
     "tools/ref/window-union.py --self-test"
+    "tools/type-census.py --self-test"
     "tools/verdict-diff.py --self-test"
   )
   root="$(cd "$(dirname "$0")/.." && pwd)"
@@ -633,7 +644,7 @@ PY
 }
 
 BLOCKS=(selftest smoke cardorder cardtests lease boxtracks loadgroups lcppfit coldblocks slotsarm lcppwarm q38srv
-  maccheck gatebatch gpugate stackwatch ptxspill scanargs narrowscan ldsscan mutantrun macstatic macremote carry pytools boxqcodes fixturevariants
+  maccheck gatebatch gpugate stackwatch ptxscan ptxspill scanargs narrowscan ldsscan mutantrun macstatic macremote carry pytools boxqcodes fixturevariants
   refsetpublish orphan archowner)
 for b in "${BLOCKS[@]}"; do
   ( set +e; blk_$b > "$B/$b.out" 2>&1; echo $? > "$B/$b.rc" ) & # set +e: a red block writes its own rc

@@ -1620,7 +1620,7 @@ pub fn routed_row_on(
 }
 
 /// [`routed_row_on`] with the card segments in `format`: the expert rule's
-/// rows, in the format the plan's [`RoutedFormat`] counted them in. `None`
+/// rows, in the format the plan's [`RoutedRule`] counted them in. `None`
 /// is refused only when a list of `on_cards` holds an expert.
 fn routed_row_on_as(
     i: usize,
@@ -1677,28 +1677,108 @@ pub fn whole_on_card(i: usize, t: &ModelTensor, card: usize) -> Result<Row, Plac
     })
 }
 
-/// Which routed stacks a program's card expert kernels run: the card format
-/// a stack of type `ty` loads in, `None` for a type none of them reads. A
-/// layer with such a stack keeps its experts on the host.
+/// The card format a routed stack of type `ty` loads in under one card
+/// expert kernel, `None` for a type it does not read.
 pub type RoutedFormat = fn(GgmlType) -> Option<CardFormat>;
 
-/// The eligible layers of `layers`: those that route, every stack of which
-/// `routed` gives a card format — a stage card's own layers, or every layer
-/// for a tier.
+/// The part of a layer's routed experts a stack holds, as its name gives it
+/// (`….ffn_{gate,up,down}_exps.weight`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExpertPart {
+    Gate,
+    Up,
+    Down,
+}
+
+impl ExpertPart {
+    /// The part `name` names; `None` for any other name, a fused gate·up
+    /// stack's among them.
+    #[must_use]
+    pub fn of_name(name: &str) -> Option<Self> {
+        match name.strip_suffix("_exps.weight")?.rsplit_once("ffn_")?.1 {
+            "gate" => Some(Self::Gate),
+            "up" => Some(Self::Up),
+            "down" => Some(Self::Down),
+            _ => None,
+        }
+    }
+}
+
+/// Which routed stacks a program's card expert kernels run, and the card
+/// format each loads in. A layer with a stack the rule gives no format keeps
+/// its experts on the host.
+#[derive(Clone, Copy, Debug)]
+pub enum RoutedRule {
+    /// Every stack by its type alone, whatever part it holds.
+    PerType(RoutedFormat),
+    /// A card leg of a fused gate·up kernel and a down kernel: a gate and an
+    /// up of one type in `gate_up`'s format, a down in `down`'s. A layer whose
+    /// gate and up differ in type has no card format; a routed stack whose
+    /// name names no part is refused by name.
+    Leg {
+        gate_up: RoutedFormat,
+        down: RoutedFormat,
+    },
+}
+
+impl RoutedRule {
+    /// The card format stack `t` loads in, `None` where the rule reads none.
+    fn format(self, t: &ModelTensor) -> Result<Option<CardFormat>, PlacementError> {
+        match self {
+            Self::PerType(f) => Ok(f(t.ty)),
+            Self::Leg { gate_up, down } => match ExpertPart::of_name(&t.name) {
+                Some(ExpertPart::Gate | ExpertPart::Up) => Ok(gate_up(t.ty)),
+                Some(ExpertPart::Down) => Ok(down(t.ty)),
+                None => Err(PlacementError::tensor(
+                    t,
+                    "a routed stack whose name names no gate, up or down part, which a card \
+                     leg's rule places by part",
+                )),
+            },
+        }
+    }
+
+    /// Whether the card runs a layer of the routed stacks `stacks`: each
+    /// loads in a card format, and on a leg its gate and up are one type.
+    pub(crate) fn layer_runs(
+        self,
+        stacks: &[usize],
+        model: &ModelTensors,
+    ) -> Result<bool, PlacementError> {
+        let mut runs = true;
+        let mut gate_up_ty = None;
+        for &i in stacks {
+            let t = &model.tensors[i];
+            runs &= self.format(t)?.is_some();
+            if let Self::Leg { .. } = self
+                && matches!(
+                    ExpertPart::of_name(&t.name),
+                    Some(ExpertPart::Gate | ExpertPart::Up)
+                )
+            {
+                runs &= *gate_up_ty.get_or_insert(t.ty) == t.ty;
+            }
+        }
+        Ok(runs)
+    }
+}
+
+/// The eligible layers of `layers`: those that route, whose stacks the card
+/// runs under `routed` ([`RoutedRule::layer_runs`]) — a stage card's own
+/// layers, or every layer for a tier.
 fn eligible(
     layers: Range<usize>,
     stacks: &[Vec<usize>],
     model: &ModelTensors,
-    routed: RoutedFormat,
-) -> Vec<usize> {
-    layers
-        .filter(|&l| {
-            !stacks[l].is_empty()
-                && stacks[l]
-                    .iter()
-                    .all(|&i| routed(model.tensors[i].ty).is_some())
-        })
-        .collect()
+    routed: RoutedRule,
+) -> Result<Vec<usize>, PlacementError> {
+    let mut out = Vec::new();
+    for l in layers {
+        if !stacks[l].is_empty() && routed.layer_runs(&stacks[l], model)? {
+            out.push(l);
+        }
+    }
+    Ok(out)
 }
 
 /// The expert rule on one card: one more expert at a time on the eligible
@@ -1753,7 +1833,7 @@ fn card_uploads<'m>(
     c: usize,
     rows: &[Option<Row>],
     eligible: &[usize],
-    routed: RoutedFormat,
+    routed: RoutedRule,
 ) -> Result<Vec<(&'m ModelTensor, CardFormat, Held)>, PlacementError> {
     let mut out = Vec::new();
     for (t, row) in model.tensors.iter().zip(rows) {
@@ -1767,7 +1847,10 @@ fn card_uploads<'m>(
             },
             None => {
                 let layer = layer_of(t, model.layers)?;
-                let Some(f) = routed(t.ty).filter(|_| eligible.contains(&layer)) else {
+                if !eligible.contains(&layer) {
+                    continue;
+                }
+                let Some(f) = routed.format(t)? else {
                     continue;
                 };
                 let (rows_per_expert, _) = per_expert(t, model.experts)?;
@@ -1889,22 +1972,21 @@ pub fn plan_with<'a>(
         ctx_max,
         kv,
         card_budget,
-        Some(CardFormat::of_routed),
+        Some(RoutedRule::PerType(CardFormat::of_routed)),
         0,
     )
 }
 
-/// [`plan`] with the expert rule run on the layers every routed stack of
-/// which `routed` gives a card format, for a program whose card expert
-/// kernels read other types than [`CardFormat::of_routed`]'s: the card
-/// budget, or none.
+/// [`plan`] with the expert rule run on the layers whose routed stacks the
+/// card runs under `routed`, for a program whose card expert kernels read
+/// other types than [`CardFormat::of_routed`]'s: the card budget, or none.
 pub fn plan_routed<'a>(
     model: &'a ModelTensors,
     machine: &'a Machine,
     ctx_max: u64,
     kv: &dyn KvBytes,
     levers: &PlanLevers,
-    routed: RoutedFormat,
+    routed: RoutedRule,
 ) -> Result<Plan<'a>, PlacementError> {
     plan_rule(
         model,
@@ -1932,7 +2014,7 @@ pub fn plan_routed_reserving<'a>(
     ctx_max: u64,
     kv: &dyn KvBytes,
     levers: &PlanLevers,
-    routed: RoutedFormat,
+    routed: RoutedRule,
     reserve: u64,
 ) -> Result<Plan<'a>, PlacementError> {
     plan_rule(
@@ -2005,7 +2087,7 @@ fn plan_rule<'a>(
     ctx_max: u64,
     kv: &dyn KvBytes,
     card_budget: Option<u64>,
-    routed: Option<RoutedFormat>,
+    routed: Option<RoutedRule>,
     reserve: u64,
 ) -> Result<Plan<'a>, PlacementError> {
     let stages = Stages::new(model.layers, &machine.cards)?;
@@ -2029,9 +2111,10 @@ fn plan_rule<'a>(
     let mut kv_bytes = Vec::with_capacity(machine.cards.len() + machine.tiers.len());
     for (c, card) in machine.cards.iter().enumerate() {
         let (kv_card, shadow) = card_kv(card, kv, ctx_max);
-        let eligible = routed.map_or_else(Vec::new, |f| {
-            eligible(card.layers.clone(), &stacks, model, f)
-        });
+        let eligible = match routed {
+            Some(r) => eligible(card.layers.clone(), &stacks, model, r)?,
+            None => Vec::new(),
+        };
         let fill = Fill {
             model,
             card,
@@ -2055,8 +2138,10 @@ fn plan_rule<'a>(
                 *h += p;
             }
         }
-        let eligible =
-            routed.map_or_else(Vec::new, |f| eligible(0..model.layers, &stacks, model, f));
+        let eligible = match routed {
+            Some(r) => eligible(0..model.layers, &stacks, model, r)?,
+            None => Vec::new(),
+        };
         let fill = Fill {
             model,
             card: tier,
@@ -2105,7 +2190,7 @@ fn plan_rule<'a>(
                 stage,
                 lists.clone(),
                 model,
-                routed.and_then(|f| f(t.ty)),
+                routed.map(|r| r.format(t)).transpose()?.flatten(),
             )?);
         }
     }
@@ -2202,7 +2287,7 @@ struct Fill<'m, 'r> {
     c: usize,
     rows: &'r [Option<Row>],
     eligible: &'r [usize],
-    routed: Option<RoutedFormat>,
+    routed: Option<RoutedRule>,
     card_budget: Option<u64>,
     kv: u64,
     /// What the caller plans beside this plan on the card
@@ -2219,7 +2304,9 @@ impl Fill<'_, '_> {
     /// free.
     fn run(&self, n_l: &mut [u64], held: &[u64]) -> Result<(), PlacementError> {
         let card = self.card;
-        let format = self.routed.unwrap_or(CardFormat::of_routed);
+        let format = self
+            .routed
+            .unwrap_or(RoutedRule::PerType(CardFormat::of_routed));
         let uploads = card_uploads(self.model, self.c, self.rows, self.eligible, format)?;
         let budget = i128::from(capped(card, self.card_budget))
             - i128::from(self.kv)
@@ -3756,6 +3843,94 @@ mod tests {
         }
     }
 
+    /// [`layered`]'s embedding and head over one layer of routed stacks a
+    /// row of `types` (gate, up, down), each named by the tail a file gives it
+    /// (the part is read from that tail, the layer from `layer`).
+    fn legged(types: &[[GgmlType; 3]]) -> ModelTensors {
+        let mut model = layered(types.len());
+        model.tensors.retain(|t| t.role != Role::RoutedExperts);
+        for (l, parts) in types.iter().enumerate() {
+            for (part, &ty) in ["gate", "up", "down"].into_iter().zip(parts) {
+                let blocks = 256 / ty.blck_size().expect("a sized type");
+                model.tensors.push(ModelTensor {
+                    name: format!("ffn_{part}_exps.weight"),
+                    shard: 0,
+                    layer: Some(l),
+                    role: Role::RoutedExperts,
+                    ty,
+                    dims: vec![256, 4, 8],
+                    file_bytes: ty.type_size().expect("a sized type") * blocks * 32,
+                    gathered_rows: None,
+                });
+            }
+        }
+        model
+    }
+
+    /// A card leg judges a layer by its parts: Qwen3-30B's leg (a Q4_K or
+    /// Q5_K gate·up, a Q4_K, Q5_K or Q6_K down) cards a Q4_K gate and up over
+    /// a Q6_K down, and keeps on the host a Q6_K gate and up (a type only its
+    /// down reads) and a gate and up of two types — the layers its load
+    /// refuses — where the per-type rule over the union of its types cards
+    /// all four. A routed stack whose name names no part is refused by name
+    /// under the leg and placed under the per-type rule.
+    #[test]
+    fn a_leg_cards_a_layer_by_its_parts() {
+        use GgmlType::{Q4_K, Q5_K, Q6_K};
+        let gate_up: RoutedFormat = |ty| matches!(ty, Q4_K | Q5_K).then_some(CardFormat::KQuant);
+        let down: RoutedFormat =
+            |ty| matches!(ty, Q4_K | Q5_K | Q6_K).then_some(CardFormat::KQuant);
+        let leg = RoutedRule::Leg { gate_up, down };
+        let union = RoutedRule::PerType(down);
+        let machine = |layers: usize| Machine {
+            cards: vec![bytes_card("stage", 1 << 30, 0..layers)],
+            tiers: Vec::new(),
+            host: host(),
+            unified: None,
+        };
+        let (m1, m4) = (machine(1), machine(4));
+        let levers = PlanLevers::default();
+        let model = legged(&[
+            [Q4_K, Q4_K, Q6_K],
+            [Q6_K, Q6_K, Q6_K],
+            [Q4_K, Q5_K, Q4_K],
+            [Q5_K, Q5_K, Q5_K],
+        ]);
+        let plan = plan_routed(&model, &m4, 4096, &NoKv, &levers, leg).expect("the leg");
+        assert_eq!(plan.n_l, vec![8, 0, 0, 8]);
+        let plan = plan_routed(&model, &m4, 4096, &NoKv, &levers, union).expect("per type");
+        assert_eq!(plan.n_l, vec![8, 8, 8, 8]);
+        let unnamed = layered(1);
+        match plan_routed(&unnamed, &m1, 4096, &NoKv, &levers, leg) {
+            Err(e) => assert_eq!(
+                e.to_string(),
+                "tensor experts 0: a routed stack whose name names no gate, up or down part, \
+                 which a card leg's rule places by part"
+            ),
+            Ok(_) => panic!("the leg placed a stack of no part"),
+        }
+        let plan = plan_routed(&unnamed, &m1, 4096, &NoKv, &levers, union)
+            .expect("the per-type rule places a stack of no part");
+        assert_eq!(plan.n_l, vec![8]);
+    }
+
+    /// The part a routed stack's name names, a draft layer's among them; a
+    /// fused gate·up stack and any other name name none.
+    #[test]
+    fn a_stack_name_names_its_part() {
+        for (name, part) in [
+            ("ffn_gate_exps.weight", Some(ExpertPart::Gate)),
+            ("ffn_up_exps.weight", Some(ExpertPart::Up)),
+            ("ffn_down_exps.weight", Some(ExpertPart::Down)),
+            ("nextn.ffn_down_exps.weight", Some(ExpertPart::Down)),
+            ("ffn_gate_up_exps.weight", None),
+            ("ffn_down_shexp.weight", None),
+            ("experts 0", None),
+        ] {
+            assert_eq!(ExpertPart::of_name(name), part, "{name}");
+        }
+    }
+
     /// A card another process holds: the census's free reading caps the
     /// expert rule — fewer experts fit than the card's usable bytes hold,
     /// the headroom and the violations against the free bytes — and a card
@@ -4048,7 +4223,7 @@ mod tests {
                 4096,
                 &NoKv,
                 &levers,
-                CardFormat::of_routed,
+                RoutedRule::PerType(CardFormat::of_routed),
                 beside,
             )
         };
@@ -4142,7 +4317,7 @@ mod tests {
                 4096,
                 &NoKv,
                 &PlanLevers::default(),
-                CardFormat::of_routed,
+                RoutedRule::PerType(CardFormat::of_routed),
                 beside,
             )
             .map(|plan| (plan.cards[0].headroom_bytes, plan.cards[0].experts))
@@ -4479,7 +4654,7 @@ mod tests {
             4096,
             &NoKv,
             &PlanLevers::default(),
-            CardFormat::of_routed,
+            RoutedRule::PerType(CardFormat::of_routed),
             5_000,
         )
         .expect("the plan");

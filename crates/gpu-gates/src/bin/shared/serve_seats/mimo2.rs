@@ -113,15 +113,15 @@
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use app::arch::mimo2::Mimo2Cfg;
 use app::{Loaded, OpenArgs, OpenLog, Session, SessionError};
 use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::model::StepMode;
 use bloomery_gpu_gates::bind::{
-    ChatSurface, Listen, Pass, Seat, SeatEngine, SlotStep, Vocab, bind_server, default_slots_fit,
-    model_props, note_line, parallel_line, placement_of, slots_given,
+    ChatSurface, Listen, Pass, Seat, SeatEngine, SlotStep, Vocab, arm_screen, bind_server,
+    default_slots_fit, model_props, note_line, parallel_line, placement_of, slots_given,
 };
 use bloomery_gpu_gates::generate::{CTX_GRAN, Lane, Place, lane_at, trained_ctx};
 use bloomery_gpu_gates::record::{self, Record};
@@ -151,8 +151,8 @@ const USAGE: &str = "usage: bloomery-serve --model mimo2 [-m PATH | --hf <repo>[
 
 /// The levers this seat acts on: the plan's card budget and the host set's
 /// load settings, which the open reads (`PlanLevers::from_levers`,
-/// `Levers::host`), the residency machine's word, the engine thread's pin and
-/// the host legs' lane rule.
+/// `Levers::host`), the residency machine's word, the engine thread's pin,
+/// the host legs' lane rule and the start screen.
 pub const ACTS_ON: &[&str] = &[
     bloomery_levers::CARD_BUDGET,
     bloomery_levers::RESIDENCY,
@@ -162,6 +162,7 @@ pub const ACTS_ON: &[&str] = &[
     bloomery_levers::R8,
     bloomery_levers::PIN_MAIN,
     bloomery_levers::HOST_LANES,
+    bloomery_levers::SCREEN,
 ];
 
 /// The floor of the searched default context.
@@ -356,6 +357,9 @@ struct OpenSeat {
 /// `load` record.
 struct Log {
     t: Instant,
+    /// The wall from `t` to the load, once the plan is made: the phases
+    /// record's `open_s`.
+    opened: Duration,
     ctx: usize,
     slots: usize,
     host_experts: u64,
@@ -379,6 +383,7 @@ impl OpenLog<Body> for Log {
     ) -> Result<bool, SessionError> {
         self.host_experts = plan.host.experts;
         self.card_experts = plan.cards[0].experts;
+        self.opened = self.t.elapsed();
         Ok(true)
     }
 
@@ -402,6 +407,7 @@ impl Log {
         if let Some((card, rate)) = &self.lane {
             record::lane(card, rate).eprint();
         }
+        let total = self.t.elapsed();
         Record::new(&record::LOAD_MIMO2)
             .w("arch", "mimo2")
             .u("resident_bytes", m.resident_bytes())
@@ -414,8 +420,9 @@ impl Log {
             .u("graph_nodes", self.graph_nodes)
             .w("pin_main", if self.pin_main { "on" } else { "off" })
             .w("pinned", self.pinned)
-            .f("load_s", self.t.elapsed().as_secs_f64())
+            .f("load_s", total.as_secs_f64())
             .eprint();
+        record::eprint_load_phases(m, total, self.opened);
         Ok(())
     }
 }
@@ -431,6 +438,7 @@ impl Mimo {
         let tier = (!a.place.tier_cards().is_empty()).then_some(NO_BATCH);
         let mut log = Log {
             t: Instant::now(),
+            opened: Duration::ZERO,
             ctx: a.ctx,
             slots: a.slots.get(),
             pin_main: a.pin_main,
@@ -556,6 +564,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let levers = bloomery_levers::at_main(ACTS_ON)?;
     model::ops::set_host_lanes(levers.host_lanes());
     record::at_main(NAME, record::BLOOMERY_SERVE_MIMO2);
+    arm_screen(levers.screen());
     let a = parse_args(args)?;
     let path = ref_model_path()?;
     let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;

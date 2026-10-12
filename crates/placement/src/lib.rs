@@ -15,6 +15,7 @@
 //! and checker (`r8file`, which re-exports this crate's [`r8`]: the refusal
 //! type the planner's error wraps).
 
+pub mod accepts;
 pub mod kernels;
 pub mod placement;
 pub mod r8;

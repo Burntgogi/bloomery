@@ -399,7 +399,7 @@
 //! `--only media-seat` is (sm), the serve seat's media call (`shared/glm5next_media.rs`'s `seat`, behind the
 //! `vision` feature, which the bin's `required-features` leave out): our tower's rows of two procedural
 //! images (the fixture's encoder file, seated as `bloomery-serve --mmproj` seats it), through the seat's own
-//! steps (`Resident::span_rows`, `Session::prompt_media`), held to `prefill_media` called with spans put
+//! steps (`Resident::encode`, `Encoded::prompt`), held to `prefill_media` called with spans put
 //! together from the images' sizes — the same argmax and a bit-identical last hidden row — with a control
 //! that lies away from the media call and the tower's refusal of a grid past its cap by name. It declares
 //! no fixture-oracle clause, and the real tier fails it by name before any load (0 clauses).
@@ -481,11 +481,11 @@ mod gate {
     };
     use bloomery_gpu_glm5next::forced::{ForcedRoute, ForcedRow};
     use bloomery_gpu_glm5next::{
-        Body, CHECKPOINT_EVERY, CHUNK, GEMM_FROM, Glm5nextModel, GlmArena, Plant, PrefillMode,
-        RouteTapRows, StoreDigest, StoreRows, checkpoint_price, feed, nextn_store,
-        plant_prompt_routes, prefill, prefill_mode, prompt_route_taps, seq_resume,
-        seq_resume_prefix, seq_save, set_prefill, set_prefill_group, set_prompt_route_taps,
-        set_taps, step_launches, store_digests, store_rows, trunk_blocks,
+        Body, CHECKPOINT_EVERY, CHUNK, FfnTapRows, GEMM_FROM, Glm5nextModel, GlmArena, Plant,
+        PrefillMode, RouteTapRows, StoreDigest, StoreRows, checkpoint_price, feed, nextn_store,
+        plant_prompt_routes, prefill, prefill_mode, prompt_ffn_taps, prompt_route_taps, seq_resume,
+        seq_resume_prefix, seq_save, set_prefill, set_prefill_group, set_prompt_ffn_taps,
+        set_prompt_route_taps, set_taps, step_launches, store_digests, store_rows, trunk_blocks,
     };
     use bloomery_levers::CARD_BUDGET;
     use cuda_core::sys;
@@ -4133,6 +4133,7 @@ mod gate {
             "a pass of several slots: a call at position",
         );
         m.rollback(pos + 2)?;
+        m.keep_rows(KeptRows::prefix(2), PassKind::Pair)?;
         let recaptured = m.capture_rows::<2>()?;
         let out = m.step_slots(&[(0, &[sa.ids[2]]), (1, &[runs[1].ids[0]])])?;
         let pass_logits: Vec<u64> = m
@@ -4649,7 +4650,9 @@ mod gate {
             ),
             (
                 "a prompt call",
-                refused_by(&prompt, GLM_BODY, waits),
+                // A prompt call opens its residency pass first, and the
+                // model's boundary refuses it while the slots wait.
+                refused_by(&prompt, "GpuModel::pass_boundary", waits),
                 outcome(&prompt),
             ),
             (
@@ -4829,6 +4832,7 @@ mod gate {
             .map(|l| Fnv1a64::default().f32s(l).value())
             .collect();
         m.rollback(pos + u32::try_from(PAIR)?)?;
+        m.keep_rows(KeptRows::prefix(PAIR), PassKind::Pair)?;
         let recaptured = m.capture_rows::<PAIR>()?;
         let rows = [[sa.ids[2], sa.ids[3]], [g[1].ids[0], sb.ids[1]]];
         let replay = match m.verify_slots(&[(0, &rows[0][..]), (1, &rows[1][..])]) {
@@ -5569,32 +5573,31 @@ mod gate {
     /// `kinds` (each layer's mixer and feed-forward block).
     ///
     /// PIN(2026-10-12): a block whose gate·up or down reads q8_1 blocks of
-    /// 128 values (`SiteTy::reads`, a K-quant; `wide[l]`, [`wide_q8`]) quantizes
-    /// that input on both arms, from inputs that already differ by the
-    /// stream's error `e`. Two round-to-nearest quantizations of step `d`
-    /// differ by `e` plus whole steps where `e` crosses a rounding edge: over
-    /// a uniform position in the step, `e² + d²·f(1 − f)`, `f` the fractional
-    /// part of `|e|/d`, so at most `e² + d²/4`. The `e²` is the stream's
-    /// error the layers already carry; `d²/4` is 3 times `d²/12`, the
-    /// one-sided rounding's variance, and `d²/12` at 128 values is (2q)²
-    /// (the crest at most √128 = 2·√32): 12 per quantized input, in q² as
-    /// above. Such a block's input reaches the stream through the gate and
-    /// up (2.64 · 12 = 31.68) and its SwiGLU rows through the down (12):
-    /// 43.68, for a dense block in place of its 3.64 and for a routed
-    /// layer's shared expert in place of its 0. It is a bound at the largest
-    /// crest, far above what the mechanism adds at the fixture's crests. The
-    /// routed experts' stacks (K-quants in every GLM file, the fixture's
-    /// included) read q8_1 blocks of 128 on both arms too and are not
-    /// counted: a routed block stays at its 0 above, so a file whose dense
-    /// blocks and shared experts are q8_0 keeps the bands above. The GLM
-    /// fixture's glmffnkq variant (2 dense blocks and 4 shared experts of
-    /// Q6_K gate·up and Q5_K down) has the head at
-    /// q·√(4·4.1875 + 2·3 + 6·43.68) = 0.217.
-    fn gemm_bands(kinds: &[Layer], wide: &[[bool; 2]]) -> Bands {
+    /// 128 values (`SiteTy::reads`, a K-quant; [`wide_q8`]) quantizes that
+    /// input on both arms, from inputs that already differ by the stream's
+    /// error `e`, each arm at its own scale. Over a uniform position in the
+    /// step `d`, the two roundings differ by `e` plus whole steps with an
+    /// excess of `d²·f(1 − f)` over `e²`, `f` the fractional part of the
+    /// shift in steps: at most `d²/4`. Over an input's blocks `b`, relative to
+    /// its values' mean square, that is `A/4` with `A = 128·Σ d_b² / Σ x²`
+    /// ([`Crest`]), `d_b` the block's q8_1 scale `amax/127`; `A` is at most
+    /// `128/127²`, which is 12 in q² (`d²/12` = (2q)² at the largest crest
+    /// √128 = 2·√32). Both inputs' `A` are read off the run's own rows
+    /// (`set_prompt_ffn_taps`, the reference's calls): the normed input the
+    /// gate·up reads and the SwiGLU rows the down reads. Such a block's input reaches the
+    /// stream through the gate and up (2.64 · x) and its SwiGLU rows through
+    /// the down (x), for a dense block in place of its 3.64 and for a routed
+    /// layer's shared expert in place of its 0. The routed experts' stacks
+    /// (K-quants in every GLM file, the fixture's included) read q8_1 blocks
+    /// of 128 on both arms too and are not counted: a routed block stays at
+    /// its 0 above, so a file whose dense blocks and shared experts are q8_0
+    /// keeps the bands above. From `terms`: per layer, the gate·up and the
+    /// down input's term in q², `None` where the input is not q8_1 of 128.
+    fn gemm_bands(kinds: &[Layer], terms: &[[Option<f64>; 2]]) -> Bands {
         let q = q8_32_rel();
         let mut c = 0.0f64;
         let (mut stores, mut stream) = (Vec::new(), Vec::new());
-        for (k, &[gate_up, down]) in kinds.iter().zip(wide) {
+        for (k, &[gate_up, down]) in kinds.iter().zip(terms) {
             let (store, mixer) = if k.mixer == MixerKind::Latent {
                 (1.0, 3.0)
             } else {
@@ -5604,14 +5607,14 @@ mod gate {
             c += mixer;
             let dense = k.ffn == FfnKind::Dense;
             c += match (gate_up, dense) {
-                (true, _) => 2.64 * WIDE_Q8,
-                (false, true) => 2.64,
-                (false, false) => 0.0,
+                (Some(x), _) => 2.64 * x,
+                (None, true) => 2.64,
+                (None, false) => 0.0,
             };
             c += match (down, dense) {
-                (true, _) => WIDE_Q8,
-                (false, true) => 1.0,
-                (false, false) => 0.0,
+                (Some(x), _) => x,
+                (None, true) => 1.0,
+                (None, false) => 0.0,
             };
             stream.push(q * c.sqrt());
         }
@@ -5619,8 +5622,126 @@ mod gate {
     }
 
     /// [`gemm_bands`]' term for one input both arms quantize to q8_1 blocks
-    /// of 128 values, in q²: `d²/4` with `d²/12` = (2q)².
+    /// of 128 values at the largest crest, in q²: `d²/4` with `d²/12` = (2q)².
     const WIDE_Q8: f64 = 12.0;
+
+    /// The least down-input term [`wide_terms`] takes, in q². A block's term
+    /// is `12·c²/128` for its crest `c` (largest magnitude over RMS): a flat
+    /// block (`c = 1`) gives 12/128 = 0.094, one nonzero value (`c² = 128`)
+    /// gives [`WIDE_Q8`]. The down's input is a SwiGLU product, whose least
+    /// layer term on the real file's every-node set (the routed experts'
+    /// product, the same SwiGLU of the same normed input) is 2.58; the floor
+    /// is a tenth of it, above a flat block's, so a tap that reads a constant
+    /// or near-constant buffer is refused by name instead of narrowing the
+    /// band toward the K-quant terms alone.
+    const DOWN_FLOOR: f64 = 0.258;
+
+    /// One layer's tapped rows for [`Crest::of`]: their width and values.
+    type TapRows<'a> = Option<(usize, &'a [f32])>;
+
+    /// The tapped feed-forward inputs' crest ([`gemm_bands`]' `A`), per
+    /// layer as running sums over positions: `Σ_b d_b²` and `Σ x²` of each
+    /// position's row, `None` for a layer not tapped.
+    struct Crest {
+        layers: Vec<Option<(Vec<f64>, Vec<f64>)>>,
+    }
+
+    impl Crest {
+        /// From [`prompt_ffn_taps`]' rows (`what` of them), each layer's of
+        /// its width: a width that is no whole q8_1 blocks of 128, or a row
+        /// whose squares sum to 0 or are not finite, is refused by name.
+        fn of(what: &str, taps: &[TapRows<'_>]) -> Result<Crest, GateError> {
+            let layers = taps
+                .iter()
+                .enumerate()
+                .map(|(l, t)| {
+                    let Some((n, t)) = *t else {
+                        return Ok(None);
+                    };
+                    if n == 0 || !n.is_multiple_of(128) {
+                        return Err(format!(
+                            "layer {l}: {what} rows of {n} values are no whole q8_1 blocks of 128"
+                        )
+                        .into());
+                    }
+                    let (mut d2, mut x2) = (vec![0.0f64], vec![0.0f64]);
+                    for (p, row) in t.chunks_exact(n).enumerate() {
+                        let mut row_d2 = 0.0f64;
+                        for b in row.as_chunks::<128>().0 {
+                            let amax = b.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+                            row_d2 += (f64::from(amax) / 127.0).powi(2);
+                        }
+                        let row_x2: f64 = row.iter().map(|&v| f64::from(v).powi(2)).sum();
+                        if !(row_x2 > 0.0 && row_x2.is_finite() && row_d2.is_finite()) {
+                            return Err(format!(
+                                "layer {l}: the {what} at position {p} squares to {row_x2}"
+                            )
+                            .into());
+                        }
+                        d2.push(d2[p] + row_d2);
+                        x2.push(x2[p] + row_x2);
+                    }
+                    Ok(Some((d2, x2)))
+                })
+                .collect::<Result<_, GateError>>()?;
+            Ok(Crest { layers })
+        }
+
+        /// Per layer, `A/4` in q² over positions `0 .. p`; `None` for a layer
+        /// not tapped. Refused by name past the tapped positions.
+        fn at(&self, p: usize) -> Result<Vec<Option<f64>>, GateError> {
+            let q = q8_32_rel();
+            self.layers
+                .iter()
+                .enumerate()
+                .map(|(l, s)| {
+                    let Some((d2, x2)) = s else {
+                        return Ok(None);
+                    };
+                    let (Some(d), Some(x)) = (d2.get(p), x2.get(p)) else {
+                        return Err(format!(
+                            "layer {l}: crest at {p} positions, {} tapped",
+                            d2.len() - 1
+                        )
+                        .into());
+                    };
+                    Ok(Some(128.0 * d / x / 4.0 / (q * q)))
+                })
+                .collect()
+        }
+    }
+
+    /// [`gemm_bands`]' terms: per layer, the gate·up and the down input's
+    /// term the run's crest gives (`gate_up[l]`, `down[l]`, [`Crest::at`])
+    /// where they read q8_1 blocks of 128 (`wide[l]`); an input of q8_1
+    /// blocks of 128 with no tap, and a down input whose term is under
+    /// [`DOWN_FLOOR`], are refused by name.
+    fn wide_terms(
+        wide: &[[bool; 2]],
+        (gate_up, down): (&[Option<f64>], &[Option<f64>]),
+    ) -> Result<Vec<[Option<f64>; 2]>, GateError> {
+        let pick = |l: usize, what: &str, wide: bool, x: Option<f64>| match (wide, x) {
+            (true, Some(x)) if what == "down" && (x.is_nan() || x < DOWN_FLOOR) => {
+                Err(GateError::from(format!(
+                    "layer {l}: the down input's crest term {x:.3} q² is under its floor \
+                     {DOWN_FLOOR} q² (a SwiGLU product's blocks are far from flat): the tap \
+                     reads no SwiGLU rows"
+                )))
+            }
+            (true, Some(x)) => Ok(Some(x)),
+            (true, None) => Err(GateError::from(format!(
+                "layer {l}: a {what} of q8_1 blocks of 128 with no feed-forward tap"
+            ))),
+            (false, _) => Ok(None),
+        };
+        wide.iter()
+            .zip(gate_up.iter().zip(down))
+            .enumerate()
+            .map(|(l, (&[g, d], (&xg, &xd)))| {
+                Ok([pick(l, "gate·up", g, xg)?, pick(l, "down", d, xd)?])
+            })
+            .collect()
+    }
 
     /// Per layer, whether its dense block's (a dense layer) or shared
     /// expert's (a routed layer) gate·up and down read q8_1 blocks of 128
@@ -5844,6 +5965,11 @@ mod gate {
         wide: usize,
         past_over: usize,
         past_worst: f64,
+        /// Of the flips first on their path, the largest pair error over the
+        /// cap and the widest gap over the margin bound: how near the held
+        /// ones sit to their rules.
+        first_worst: f64,
+        first_widest: f64,
         /// Flips whose reference margin (its eighth pick's ranked value less
         /// the best it left) lies past [`route_cap`], on any path (printed).
         margin_over: usize,
@@ -5926,6 +6052,7 @@ mod gate {
         }
         let (mut refused, mut first, mut wide, mut shown) = (0usize, 0usize, 0usize, 0usize);
         let (mut past_over, mut past_worst, mut past_shown) = (0usize, 0.0f64, 0usize);
+        let (mut first_worst, mut first_widest) = (0.0f64, 0.0f64);
         let (mut margin_over, mut margin_first) = (0usize, 0usize);
         let mut margins = Vec::with_capacity(flips.len());
         for (f, cap, bound) in &flips {
@@ -5941,12 +6068,14 @@ mod gate {
             let over = !f.allowed(*cap);
             let at_wide = !prior && (widest > *bound || widest.is_nan());
             let bad = !prior && (over || at_wide || wide_margin);
+            let err = f.pairs.iter().map(|p| p.3).fold(0.0f64, f64::max);
             if prior {
                 past_over += usize::from(over);
-                let err = f.pairs.iter().map(|p| p.3).fold(0.0f64, f64::max);
                 past_worst = past_worst.max(err / cap);
             } else {
                 first += 1;
+                first_worst = first_worst.max(err / cap);
+                first_widest = first_widest.max(widest / bound);
                 margin_first += usize::from(wide_margin);
                 refused += usize::from(over);
                 wide += usize::from(at_wide);
@@ -5987,6 +6116,8 @@ mod gate {
             wide,
             past_over,
             past_worst,
+            first_worst,
+            first_widest,
             margin_over,
             margin_first,
             margins: {
@@ -6073,7 +6204,8 @@ mod gate {
             && points == marks(p);
         println!(
             "prompt batch G=1 P={p}: against calls of {CHUNK}: {} flip(s); {} first on their path, \
-             {} of them past the pair rule's cap, {} at a wide margin; {} past an earlier flip, {} \
+             {} of them past the pair rule's cap (the worst at {:.3} of it), {} at a wide margin \
+             (the widest at {:.3} of the bound); {} past an earlier flip, {} \
              of them past the cap, the worst at {:.2} of it (printed); the reference's margins \
              over the cap at the flips: median {:.3}, 99th percentile {:.3}, largest {:.3}, {} \
              past it, {} of them first on their path (held); the stores of layers 0..={reach} (no flip's path) held to their bands, \
@@ -6086,7 +6218,9 @@ mod gate {
             tally.flips,
             tally.first,
             tally.refused,
+            tally.first_worst,
             tally.wide,
+            tally.first_widest,
             tally.flips - tally.first,
             tally.past_over,
             tally.past_worst,
@@ -6278,6 +6412,7 @@ mod gate {
         elapsed("(pb) steps", &t);
         set_prefill_group(m, 1)?;
         set_prompt_route_taps(m, CTX_PP)?;
+        set_prompt_ffn_taps(m, CTX_PP)?;
         let t = Instant::now();
         tier::sc("(pb) chunk calls: a batch of at most a chunk is the steps")?;
         let Reference {
@@ -6288,7 +6423,42 @@ mod gate {
         elapsed("(pb) chunk calls", &t);
         ok &= chunks_ok;
         let kinds = m.body("prompt batch")?.kinds();
-        let bands = gemm_bands(&kinds, &wide_q8(&glm5next_tier::open()?, &kinds)?);
+        let wide = wide_q8(&glm5next_tier::open()?, &kinds)?;
+        let taps = prompt_ffn_taps(m, CTX_PP)?;
+        set_prompt_ffn_taps(m, 0)?;
+        let rows = |f: fn(&FfnTapRows) -> TapRows<'_>| -> Vec<TapRows<'_>> {
+            taps.iter().map(|t| t.as_ref().and_then(f)).collect()
+        };
+        let crest = (
+            Crest::of(
+                "feed-forward input",
+                &rows(|t| t.input.as_deref().map(|r| (HIDDEN, r))),
+            )?,
+            Crest::of(
+                "down input",
+                &rows(|t| t.hidden.as_deref().map(|r| (t.ff, r))),
+            )?,
+        );
+        drop(taps);
+        let bands_at = |p: usize| -> Result<Bands, GateError> {
+            let terms = wide_terms(&wide, (&crest.0.at(p)?, &crest.1.at(p)?))?;
+            Ok(gemm_bands(&kinds, &terms))
+        };
+        let bands = bands_at(CTX_PP)?;
+        let cells = |c: &Crest| -> Result<String, GateError> {
+            Ok(c.at(CTX_PP)?
+                .iter()
+                .enumerate()
+                .filter_map(|(l, x)| x.map(|x| format!("{l}:{x:.2}")))
+                .collect::<Vec<_>>()
+                .join(" "))
+        };
+        println!(
+            "prompt batch: the crest term A/4 in q² over {CTX_PP} positions by layer, the gate·up \
+             inputs [{}], the down inputs [{}] (at most {WIDE_Q8})",
+            cells(&crest.0)?,
+            cells(&crest.1)?
+        );
         let bias = biases(m)?;
         println!(
             "prompt batch: the GEMM bands: stores at layers 0..=4 {:.3e} {:.3e} {:.3e} {:.3e} \
@@ -6317,7 +6487,8 @@ mod gate {
                     argmax: a.argmax,
                 }));
             } else {
-                let (pass, got) = gemm_against(m, &ids, r, &routes, (&bias, &bands))?;
+                let (pass, got) =
+                    gemm_against(m, &ids, r, &routes, (&bias, &bands_at(r.after.p)?))?;
                 ok &= pass;
                 ones.push(got);
             }
@@ -6329,7 +6500,7 @@ mod gate {
         tier::sc("(pb) forced: the reference's routes planted, every layer within its band")?;
         plant_prompt_routes(m, Some((&routes, CTX_PP)))?;
         for r in reference.iter().filter(|r| r.after.p >= GEMM_FROM) {
-            ok &= gemm_forced(m, &ids, r, &bands)?;
+            ok &= gemm_forced(m, &ids, r, &bands_at(r.after.p)?)?;
         }
         elapsed("(pb) forced", &t);
         plant_prompt_routes(m, None)?;

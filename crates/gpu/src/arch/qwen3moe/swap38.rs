@@ -13,7 +13,7 @@
 //! ([`stacks`] reads each layer's from the plan). On
 //! the card each part of slot `s` is the file's bytes of that expert at byte
 //! `s · part` of its layer's stack, which the placed load uploads as file
-//! bytes in slot order ([`place::card_routed`] keeps all three stacks in
+//! bytes in slot order ([`place::routed_rule`] keeps all three stacks in
 //! `CardFormat::KQuant`, and `super::card38` reads them exactly so). Nothing
 //! converts: a staged part is its slot's bytes as they are, so the r8
 //! sidecar, which exists for Q3_K stacks alone (`qdot::repack_q3k_r8`), is
@@ -22,29 +22,19 @@
 use super::swap::{self, CardLeg};
 use crate::GpuError;
 use crate::host::swap_source::PlanStacks;
-use gguf::quant::GgmlType;
-use model::placement::ModelTensors;
+use model::placement::accepts::Program;
+use model::placement::{ModelTensors, Plan};
 
 pub use crate::host::swap_source::{DEADLINE, LIVE_DELAY};
 
-/// Qwen3.8's card leg ([`CardLeg`]): the types it runs a routed stack in, by
-/// its place: the gate and up Q4_K, Q5_K, IQ3_XXS or IQ4_XS, the down Q5_1,
-/// Q8_0 or IQ4_NL ([`place::card_routed`]).
+/// Qwen3.8's card leg ([`CardLeg`]): the Qwen3.8 body's arms
+/// (`placement::accepts::leg_arms`: a Q4_K, Q5_K, IQ3_XXS or IQ4_XS gate and
+/// up, a Q5_1, Q8_0 or IQ4_NL down), which its place rule reads too.
 pub(super) struct Leg38;
 
 impl CardLeg for Leg38 {
     const WHAT: &'static str = "swap38::stacks";
-
-    fn gate_up(ty: GgmlType) -> bool {
-        matches!(
-            ty,
-            GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::IQ3_XXS | GgmlType::IQ4_XS
-        )
-    }
-
-    fn down(ty: GgmlType) -> bool {
-        matches!(ty, GgmlType::Q5_1 | GgmlType::Q8_0 | GgmlType::IQ4_NL)
-    }
+    const PROGRAM: Program = Program::Qwen38Body;
 }
 
 /// Qwen3.8's stack table: the common one ([`PlanStacks`]) over this family's
@@ -52,9 +42,23 @@ impl CardLeg for Leg38 {
 pub type Qwen38Stacks = PlanStacks;
 
 /// The stacks of `model`'s layers, each layer's types read from its tensors
-/// and every layer checked against [`Leg38`] ([`swap::stacks`] with every
-/// layer carded). Refused by name: a layer without all three stacks, and a
-/// layer the leg refuses. Load-time only.
-pub fn stacks(model: &ModelTensors) -> Result<Qwen38Stacks, GpuError> {
-    swap::stacks::<Leg38>(model, |_| Ok(true))
+/// and every layer `plan` gives card experts (on its stage card or a tier
+/// card) checked against [`Leg38`] ([`swap::stacks`]). Refused by name: a
+/// layer without all three stacks, and a carded layer the leg refuses.
+/// Load-time only.
+pub fn stacks(model: &ModelTensors, plan: &Plan<'_>) -> Result<Qwen38Stacks, GpuError> {
+    swap::stacks::<Leg38>(model, |l| {
+        let card = plan.n_l.get(l).copied();
+        let tiers = plan.tier_n_l.iter().map(|t| t.get(l).copied());
+        match std::iter::once(card)
+            .chain(tiers)
+            .collect::<Option<Vec<u64>>>()
+        {
+            Some(n) => Ok(n.iter().any(|&n| n > 0)),
+            None => Err(GpuError::shape(
+                "swap38::stacks",
+                format!("layer {l} is past the plan's {} layers", plan.n_l.len()),
+            )),
+        }
+    })
 }

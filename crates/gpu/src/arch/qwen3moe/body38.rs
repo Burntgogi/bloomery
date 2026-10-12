@@ -1308,7 +1308,7 @@ impl Body38 {
             deadline: DEADLINE,
             top_k: geo::N_USED,
             max_rows: PASS_ROWS,
-            stacks: Arc::new(swap38::stacks(&inputs.model)?),
+            stacks: Arc::new(swap38::stacks(&inputs.model, plan)?),
         };
         GpuModel::load_placed_with(
             file,
@@ -1470,8 +1470,11 @@ impl Body38 {
             n,
             geo::EXPERTS,
         )?);
-        let stacks = swap38::stacks(&inputs.model)?;
-        let card = Card38::new(gpu, w, &stacks, &map, n)?;
+        let stacks = swap38::stacks(&inputs.model, plan)?;
+        // A residency machine moves experts to the host after the load, and
+        // the host service writes a route trace: either keeps every host leg.
+        let keep_host = residency_glue.source().is_some() || host.route_trace;
+        let card = Card38::new(gpu, w, &stacks, &map, n, keep_host)?;
         // A tier layer's join sums the card's slots and the tier's in one
         // launch, which a layer with no card expert does not run.
         if let Some(l) = run
@@ -1569,6 +1572,11 @@ impl Body38 {
             ));
         }
         let mut hybrid = Hybrid::new(boundary, map, experts, n)?;
+        // The host service writes a route trace, so the tier refuses one on a
+        // load that runs a layer without it.
+        if let Some(l) = (0..n).find(|&l| card.hostless(l)) {
+            hybrid.mark_unserved(l);
+        }
         hybrid.watch_fault(gpu.fault_word())?;
         hybrid.keep_residency(set);
         let tiered = !tier_cards.is_empty();
@@ -1683,12 +1691,16 @@ impl Body38 {
     }
 
     /// The captured step's launches ([`super::program38`]'s count), and how
-    /// many of them are stream memory-operation batches.
+    /// many of them are stream memory-operation batches: the go and the wait
+    /// of each layer with a host leg ([`Card38::hostless`]).
     #[must_use]
     pub fn step_launches(&self) -> (usize, usize) {
+        let served = (0..self.plans.len())
+            .filter(|&l| !self.card.hostless(l))
+            .count();
         (
             step_launches(&self.plans, &self.card, self.tier.as_ref(), self.head_form),
-            STEP_MEMOPS * self.plans.len(),
+            STEP_MEMOPS * served,
         )
     }
 
@@ -3272,7 +3284,9 @@ impl GpuModel<Body38> {
     /// `run_rows`, which opens none — and 0 rows kept after it, whatever it
     /// returned: the rule counts decode rows only, and the batch service
     /// notes no id. A step-fed prompt is refused by name under a running
-    /// machine: each prompt id would end a decode pass the rule counts.
+    /// machine: each prompt id would end a decode pass the rule counts. With
+    /// no machine the steps feed opens no pass around its steps: each id is
+    /// a step with its own boundary and kept row.
     /// Under host streaming ([`Body38::set_xstream`]) a ubatch-fed call
     /// is also the machine's call: its walks move the pool
     /// ([`super::wide38`]'s module doc), its placement stays for the decode
@@ -3314,7 +3328,12 @@ impl GpuModel<Body38> {
                  path) or load with BLOOMERY_RESIDENCY=off",
             ));
         }
-        self.pass_boundary()?;
+        // The steps feed is no pass of its own: each id is a step with its
+        // boundary and its kept row, so none is opened around them.
+        let one_pass = resolved != Prompt38::Step;
+        if one_pass {
+            self.pass_boundary()?;
+        }
         // A successful call before a decode history ends with each layer
         // back at the set it started with: the decode has been routing
         // experts of its own, and the call's picks — the prompt's hottest —
@@ -3332,7 +3351,10 @@ impl GpuModel<Body38> {
         // failed call is its echo. A failed call's streaming ends with each
         // layer back at the set it started with too.
         let ended = self.stream_end(r.is_ok() && !history);
-        let kept = self.keep_rows(KeptRows::prefix(0), PassKind::Prompt);
+        let kept = match one_pass {
+            true => self.keep_rows(KeptRows::prefix(0), PassKind::Prompt),
+            false => Ok(()),
+        };
         let next = r?;
         ended?;
         kept?;

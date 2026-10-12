@@ -245,7 +245,7 @@
 use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use app::arch::glm5next::{GlmCfg, open_nextn_slots, open_resident_slots};
 use app::mtp::{MtpBody, MtpDraft};
@@ -255,8 +255,8 @@ use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::model::{SlotRows, StepMode};
 use bloomery_gpu_gates::bind::{
     CacheRam, Cached, ChatSurface, Landing, Listen, Pass, PutBack, Seat, SeatEngine, SlotPassRow,
-    SlotStep, Vocab, begin, bind_server, default_slots_fit, model_props, note_line, parallel_line,
-    placement_of, put_back, slots_given,
+    SlotStep, Vocab, arm_screen, begin, bind_server, default_slots_fit, eprint_noted, model_props,
+    note_line, parallel_line, placement_of, put_back, slots_given,
 };
 use bloomery_gpu_gates::generate::{Lane, Place, lane_at, mode_name, with_cards};
 use bloomery_gpu_gates::record::{self, Record};
@@ -285,8 +285,6 @@ use model::placement::slots::{SplitError, split_ctx};
 use model::placement::workstation::{HostNeed, MARGIN, TierBatchBytes};
 use model::placement::{Machine, Plan, PlanLevers};
 use runtime::Target;
-#[cfg(feature = "vision")]
-use runtime::Want;
 use runtime::seqstate::{Price, Why};
 use runtime::width::Mode as WidthMode;
 use serve::flag::number;
@@ -328,8 +326,9 @@ const CTX_STEP: usize = 256;
 /// slots (a `slots round` record each); a lever set outside this list is
 /// refused by name at `main`, with `BLOOMERY_PIN_MAIN` for the engine
 /// thread's cpu slot, as every serving seat reads it, and `BLOOMERY_HOST_LANES`
-/// for the lanes of the host tier's legs on that thread's CCD map;
-/// `gate_glm5next_serve` holds the same list.
+/// for the lanes of the host tier's legs on that thread's CCD map, and
+/// `BLOOMERY_SCREEN` for the start screen; `gate_glm5next_serve` holds the
+/// same list.
 pub const ACTS_ON: &[&str] = &[
     bloomery_levers::CARD_BUDGET,
     bloomery_levers::HOST_POPULATE,
@@ -342,6 +341,7 @@ pub const ACTS_ON: &[&str] = &[
     bloomery_levers::MTP_WIDTH,
     bloomery_levers::RESIDENCY,
     bloomery_levers::STEP_STATS,
+    bloomery_levers::SCREEN,
 ];
 
 /// The drafted window's verify: the target's next token and the draft's one
@@ -846,6 +846,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     model::ops::set_host_lanes(levers.host_lanes());
     let width = WidthMode::of(levers.mtp_width())?;
     record::at_main(WHAT, record::BLOOMERY_SERVE_GLM);
+    arm_screen(levers.screen());
     let a = parse_args(args)?;
     // The census the placement resolves against, read once: `--place` as
     // given, or unset the common rule's choice on the same reading.
@@ -1087,7 +1088,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         checkpoints_reserved(plan.machine),
     )?
     .holding(seq_bytes(&inputs, 1, nextn.is_some()));
-    eprintln!("{}", cache.line());
+    eprint_noted(&cache.line());
     // The round's shape the open below runs (the module doc).
     parallel_line(
         slots,
@@ -1261,6 +1262,7 @@ impl Glm {
             pin_main: a.pin_main,
             pinned,
             t,
+            opened: Duration::ZERO,
             draft_off: a.draft_off.clone(),
             draft_bytes: a.draft_bytes,
             lane: a.lane,
@@ -1451,6 +1453,9 @@ struct Log {
     pin_main: bool,
     pinned: bool,
     t: Instant,
+    /// The wall from `t` to the load, once the plan is made: the phases
+    /// record's `open_s`.
+    opened: Duration,
     /// Drafting nothing, why.
     draft_off: Option<String>,
     /// The plan's bytes for the NextN layer.
@@ -1470,11 +1475,13 @@ impl OpenLog<Body> for Log {
         _plan: &model::placement::Plan<'_>,
     ) -> Result<bool, app::SessionError> {
         self.top_k = inputs.hp.indexer.top_k;
+        self.opened = self.t.elapsed();
         Ok(true)
     }
 
     fn load(&mut self, m: &Glm5nextModel) -> Result<(), app::SessionError> {
         let b = m.body(WHAT)?;
+        let total = self.t.elapsed();
         let r = Record::new(&record::LOAD_GENERATOR)
             .u("resident_bytes", m.resident_bytes())
             .u("ctx", self.ctx)
@@ -1492,8 +1499,9 @@ impl OpenLog<Body> for Log {
             .w("place", self.place)
             .w("pin_main", if self.pin_main { "on" } else { "off" })
             .w("pinned", self.pinned)
-            .f("load_s", self.t.elapsed().as_secs_f64())
+            .f("load_s", total.as_secs_f64())
             .eprint();
+        record::eprint_load_phases(m, total, self.opened);
         if let Some(h) = b.hybrid().residency() {
             for r in record::host_residency(h) {
                 r.eprint();
@@ -1642,18 +1650,19 @@ impl Seat for Glm {
         self.vision.as_ref().map(vision_seat::Resident::media)
     }
 
-    /// The selected slot's draft turned off ([`MEDIA_DRAFT_OFF_WHY`]; a slot already off stays as
-    /// it is, its reason and its record told once), each feed's image encoded on the resident
-    /// encoder and read back as bf16, one row a cell of its grid and nothing around them
-    /// ([`vision_seat::Resident::merged_rows`]: the ids carry the delimiters), then one prompt
-    /// call with the rows in place of their positions' embeddings ([`Session::prompt_media`], the
-    /// body's `prefill_media`), the model's card bound back between the two.
+    /// Each feed's image encoded on the resident encoder and read back as bf16, one row a cell of
+    /// its grid and nothing around them ([`vision_seat::Resident::encode`]: the ids carry the
+    /// delimiters), then the selected slot's draft turned off ([`MEDIA_DRAFT_OFF_WHY`]; a slot
+    /// already off stays as it is, its reason and its record told once; an image the tower
+    /// refuses leaves the draft on), then one prompt call with the rows in place of their
+    /// positions' embeddings ([`vision_seat::Encoded::prompt`], the body's `prefill_media`); the
+    /// encode binds the model's card back before the prompt call.
     #[cfg(feature = "vision")]
     fn prefill_media(&mut self, ids: &[u32], feeds: &[MediaFeed]) -> Result<u32, GateError> {
         let Some(v) = self.vision.as_mut() else {
             return Err("no --mmproj: this seat serves no image".into());
         };
-        let rows = v.merged_rows(
+        let encoded = v.encode(
             self.s.model().gpu().context(),
             feeds
                 .iter()
@@ -1663,10 +1672,7 @@ impl Seat for Glm {
         if !self.drafted.is_off(sel) {
             self.drafted.turn_off(sel, MEDIA_DRAFT_OFF_WHY)?;
         }
-        let next = self
-            .s
-            .prompt_media(ids, &rows.media_spans(), Want::Argmax)?
-            .argmax();
+        let next = encoded.prompt(&mut self.s, ids, |rows| rows.media_spans())?;
         self.print_passes()?;
         Ok(next)
     }

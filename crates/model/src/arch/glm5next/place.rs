@@ -19,6 +19,7 @@ use super::hparams::{Hparams, Kind};
 use super::{roles, spec};
 use crate::arch::chat_of;
 use crate::arch::coverage;
+use crate::placement::accepts::{Program, routed_rule};
 use crate::placement::workstation::{self, GRANULE, HostRead, TierBatchBytes};
 use crate::placement::{
     self, Card, CardFormat, CardTotals, Device, ExpertList, Format, Host, KvBytes, Machine,
@@ -604,7 +605,7 @@ impl PlanInputs {
             ctx_max,
             &terms.slots_of(n),
             levers,
-            card_routed,
+            routed_rule(Program::Glm5nextBody),
             front.saturating_add(beside),
         )?;
         // The bytes beside the stores ride the stage card's KV term, out of
@@ -943,7 +944,7 @@ impl PlanInputs {
             ctx_max,
             &terms.slots_of(n),
             levers,
-            card_routed,
+            routed_rule(Program::Glm5nextBody),
             reserve,
         )?;
         // The bytes beside the stores ride the stage card's KV term, as

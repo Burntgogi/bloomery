@@ -112,6 +112,20 @@ impl Shape {
         2 * self.n_layer
     }
 
+    /// The stream memory-operation batches of a captured step or verify under a card plan that
+    /// puts every routed expert of `hostless` layers on the card, on a load with no residency
+    /// machine and no route trace: each other layer's go and wait (the `hostless` layers run
+    /// without the host leg).
+    #[must_use]
+    pub fn memops_card(&self, hostless: usize) -> usize {
+        assert!(
+            hostless <= self.n_layer,
+            "{hostless} hostless layers of {} layers",
+            self.n_layer
+        );
+        2 * (self.n_layer - hostless)
+    }
+
     /// The captured verify's nodes at 2, 3 and 4 rows.
     #[must_use]
     pub fn nodes_verify(&self) -> usize {
@@ -163,6 +177,7 @@ mod tests {
         assert_eq!(real.nodes_slot(), 171);
         assert_eq!(real.nodes_decode_card(48), 1391);
         assert_eq!(real.nodes_verify_card(48), 1475);
+        assert_eq!((real.memops_card(0), real.memops_card(48)), (96, 0));
         let fix = Shape::from_header(4, 2, Some(2), Some(248_056)).expect("fixture");
         assert_eq!(fix.qsa, [1, 3]);
         assert_eq!((fix.n_qsa(), fix.n_gdn()), (2, 2));

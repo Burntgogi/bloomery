@@ -188,7 +188,7 @@ use std::io::{Read, Write};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use app::arch::deepseek41::{CardDraft, Ds41Cfg};
 use app::{Loaded, OpenLog, RowsLog, Session, SessionError};
@@ -199,8 +199,8 @@ use bloomery_gpu_deepseek41::body::{self, Body, Deepseek41Model, PAIR_ROWS, SeqS
 use bloomery_gpu_deepseek41::draft::DraftBody;
 use bloomery_gpu_deepseek41::swap;
 use bloomery_gpu_gates::bind::{
-    CacheRam, ChatSurface, Listen, Pass, Seat, SeatEngine, SlotStep, SlotsFrom, Vocab, bind_server,
-    model_props, nvidia_smi_index, parallel_line, placement_of,
+    CacheRam, ChatSurface, Listen, Pass, Seat, SeatEngine, SlotStep, SlotsFrom, Vocab, arm_screen,
+    bind_server, model_props, nvidia_smi_index, parallel_line, placement_of,
 };
 use bloomery_gpu_gates::generate::{Lane, Place, PlaceWhy, lane_at, mode_name};
 use bloomery_gpu_gates::record::{self, Record};
@@ -225,6 +225,8 @@ use tokenizer::Tokenizer;
 
 #[cfg(feature = "vision")]
 use bloomery_gpu_gates::ds41_media;
+#[cfg(feature = "vision")]
+use cuda_core::CudaContext;
 #[cfg(feature = "vision")]
 use serve::media::MediaFeed;
 #[cfg(feature = "vision")]
@@ -453,6 +455,8 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let levers = bloomery_levers::at_main(crate::serve_levers::ACTS_ON)?;
     model::ops::set_host_lanes(levers.host_lanes());
     record::at_main("bloomery-serve-ds41", record::BLOOMERY_SERVE_DS41);
+    super::drafted::serves_widths();
+    arm_screen(levers.screen());
     let (a, placed) = parse_args(args)?;
     placed.record().eprint();
     // The lane's rate, taken before the plan reads the room (`lane_of`).
@@ -856,23 +860,23 @@ struct Vision {
 
 #[cfg(feature = "vision")]
 impl Vision {
-    /// Every feed's image encoded on the resident encoder, its aligner rows read back as bf16
-    /// and spliced ([`ds41_media::span_rows`]), all in one pair of buffers — the rows, the
-    /// kinds, and each span's positions, rows and kinds as ranges of them
-    /// ([`vision_seat::Resident::span_rows`]). The aligner emits the plan's token grid, one
-    /// row a cell.
-    fn span_rows(
+    /// Step (e) of the seat's media call ([`vision_seat::Resident::encode_with`]): every feed's
+    /// image encoded on the resident encoder, its aligner rows read back as bf16 and spliced
+    /// ([`ds41_media::splice`]: the delimiter rows around the aligner's, the kind of each
+    /// position), all in one pair of buffers, with `model`'s card bound back after the tower. The
+    /// aligner emits the plan's token grid, one row a cell.
+    fn encode(
         &mut self,
+        model: &CudaContext,
         feeds: &[MediaFeed],
-    ) -> Result<vision_seat::SpanRows<body::MediaKind>, GateError> {
+    ) -> Result<vision_seat::Encoded<body::MediaKind>, GateError> {
         let (n_embd, delims) = (self.resident.n_embd(), &self.delims);
-        self.resident.span_rows(
+        self.resident.encode_with(
+            model,
             feeds
                 .iter()
                 .map(|f| vision_seat::Image::of(f.at, &f.prepared)),
-            |aligner, p| {
-                ds41_media::span_rows(aligner, (p.plan.n_llm_h, p.plan.n_llm_w), n_embd, delims)
-            },
+            ds41_media::splice(n_embd, delims),
         )
     }
 }
@@ -948,9 +952,15 @@ impl V41 {
         let vision_reserve = None;
         let machine =
             vision_seat::with_reserve(a.place.machine(a.reserve, a.tier_batch)?, vision_reserve);
+        let opened = t.elapsed();
         let mut m = body::open_slots(file, machine, a.ctx, &a.cfg, a.slots)?;
         m.set_mode(StepMode::Graph);
-        let mut log = Log { a: &a, pinned, t };
+        let mut log = Log {
+            a: &a,
+            pinned,
+            t,
+            opened,
+        };
         log.load(&m)?;
         let cfg = Ds41Cfg {
             feed: a.cfg.body.prefill,
@@ -1132,8 +1142,10 @@ impl Seat for V41 {
 
     /// Each feed's image encoded on the resident encoder, its aligner rows
     /// read back as bf16 and spliced — the one assembly [`ds41_media`] gives
-    /// the media gate — into one prompt call ([`Session::prompt_media`]),
-    /// the model's card bound back between the two ([`vision_seat::on_encoder_card`]).
+    /// the media gate — ([`Vision::encode`]), then one prompt call over the
+    /// spans of those rows, each with its positions' kinds
+    /// ([`vision_seat::Encoded::prompt`], the body's `prefill_media`); the
+    /// encode binds the model's card back before the prompt call.
     /// The lookup draft rebuilds its tables
     /// from the target's history at its next pass, as after any prompt call;
     /// the DSpark draft is refused by name (its window is fed by the prompt
@@ -1158,20 +1170,9 @@ impl Seat for V41 {
             Served::Lookup(_, follows) => *follows = false,
             Served::Off => {}
         }
+        let encoded = v.encode(s.model().gpu().context(), feeds)?;
         // Each span borrows its own ranges of the call's one pair of buffers.
-        let vision_seat::SpanRows { rows, kinds, ats } =
-            vision_seat::on_encoder_card(s.model().gpu().context(), || v.span_rows(feeds))?;
-        let spans: Vec<body::Span41<'_>> = ats
-            .iter()
-            .map(|a| body::Span41 {
-                span: body::MediaSpan {
-                    at: a.positions.clone(),
-                    rows: &rows[a.rows.clone()],
-                },
-                kinds: &kinds[a.kinds.clone()],
-            })
-            .collect();
-        let next = s.prompt_media(ids, &spans, Want::Argmax)?.argmax();
+        let next = encoded.prompt(s, ids, ds41_media::spans)?;
         self.print_passes()?;
         Ok(next)
     }
@@ -1533,6 +1534,8 @@ struct Log<'a> {
     a: &'a SeatArgs,
     pinned: bool,
     t: Instant,
+    /// The wall from `t` to the loader's call: the phases record's `open_s`.
+    opened: Duration,
 }
 
 impl OpenLog<Body> for Log<'_> {
@@ -1559,6 +1562,7 @@ impl OpenLog<Body> for Log<'_> {
                 a.want_top_k
             )));
         }
+        let total = self.t.elapsed();
         let load = Record::new(&record::LOAD_GENERATOR)
             .u("resident_bytes", m.resident_bytes())
             .u("ctx", a.ctx)
@@ -1575,8 +1579,9 @@ impl OpenLog<Body> for Log<'_> {
             .w("place", a.place.name())
             .w("pin_main", if a.pin_main { "on" } else { "off" })
             .w("pinned", self.pinned)
-            .f("load_s", self.t.elapsed().as_secs_f64())
+            .f("load_s", total.as_secs_f64())
             .eprint();
+        record::eprint_load_phases(m, total, self.opened);
         if let Some(h) = b.hybrid().residency() {
             for r in record::host_residency(h) {
                 r.eprint();

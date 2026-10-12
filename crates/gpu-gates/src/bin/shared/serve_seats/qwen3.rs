@@ -174,10 +174,10 @@ use bloomery_gpu::arch::qwen3moe::{Body, Body35, KvQ8, Open35, Qwen35moeModel};
 use bloomery_gpu::model::{GpuModel, MAX_PASS_ROWS, Slots, StepMode};
 use bloomery_gpu::{Gpu, Qwen3moeModel};
 use bloomery_gpu_gates::bind::{
-    ChatSurface, Listen, Pass, Seat, SeatEngine, SlotStep, Vocab, bind_server, default_slots_fit,
-    note_line, parallel_line, slots_given,
+    ChatSurface, Listen, Pass, Seat, SeatEngine, SlotStep, Vocab, arm_screen, bind_server,
+    default_slots_fit, note_line, parallel_line, slots_given,
 };
-use bloomery_gpu_gates::generate::{CTX_GRAN, Place};
+use bloomery_gpu_gates::generate::Place;
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::vision_seat::{self, Opened, PleImage, TextFacts};
 use bloomery_gpu_gates::{GateError, gpu_census, ref_model_path};
@@ -187,18 +187,12 @@ use model::arch::Arch;
 use model::arch::qwen35moe::hparams::Hparams;
 use model::placement::PlanLevers;
 use model::placement::ctx::SlotCtx;
-use model::placement::workstation::{CardSpec, MARGIN};
+use model::placement::workstation::CardSpec;
 use runtime::Target as _;
 #[cfg(feature = "vision")]
 use serve::media::{MediaFeed, SharedMediaModel};
 use serve::{CacheNote, EngineProps, Saved, ServeError};
 use tokenizer::Tokenizer;
-#[cfg(feature = "vision")]
-use {
-    bloomery_gpu::media::{ImageSpan, MediaSpan},
-    runtime::Want,
-    std::ops::Range,
-};
 
 const NAME: &str = "bloomery-serve-qwen3";
 
@@ -209,13 +203,13 @@ const USAGE: &str = "usage: bloomery-serve --model qwen3 [-m PATH | --hf <repo>[
                      [--api-key-file FNAME]";
 
 /// The context a slot takes before the rule grows it: the base the margin
-/// counts against, `generate_qwen3moe`'s default.
-const BASE_SLOT_CTX: usize = 4096;
+/// counts against ([`q3place::SERVE_RULE`]).
+const BASE_SLOT_CTX: usize = q3place::SERVE_RULE.base;
 
 /// The context a slot takes when `--ctx` is unset: the common rule's answer
 /// (`placement::ctx::default_slot_ctx`) for `parallel` resident slots, the
-/// constants its own — [`BASE_SLOT_CTX`] a slot, steps of
-/// [`CTX_GRAN`], a margin of `MARGIN` card expert bytes — over the
+/// constants [`q3place::SERVE_RULE`]'s — [`BASE_SLOT_CTX`] a slot, steps of
+/// `CTX_GRAN`, a margin of `MARGIN` card expert bytes — over the
 /// file's trained context as the cap (the base when it states none). The
 /// probes plan the load the file takes on `a`'s card: the whole model while
 /// its whole-fit verdict takes the base a slot — weights, the cache of every
@@ -242,11 +236,7 @@ fn default_ctx(
 ) -> Result<SlotCtx, GateError> {
     let (media, encoder) = images_of(vision);
     let plan_levers = PlanLevers::from_levers(levers)?;
-    let rule = q3place::SlotRule {
-        base: BASE_SLOT_CTX,
-        step: CTX_GRAN,
-        margin: MARGIN,
-    };
+    let rule = q3place::SERVE_RULE;
     let before = q3place::reads();
     let found = match arch {
         Arch::Qwen3moe => {
@@ -498,32 +488,24 @@ trait Body3: Slots<Seq: 'static> + app::Prompt + app::Keep + Sized + 'static {
         let _ = (s, rows);
         Err("a round of several slots as one pass: this body runs its slots in turns".into())
     }
-    /// One prompt call of `ids` with `images` spliced in, the greedy token after the last id.
-    /// Refused by the default: only a qwen35moe file's body takes images.
+    /// One prompt call of `ids` with the `encoded` rows of the call's images spliced in, each
+    /// span carrying its image's token grid ([`vision_seat::SpanRows::image_spans`]); the greedy
+    /// token after the last id. Refused by the default: only a qwen35moe file's body takes
+    /// images.
     #[cfg(feature = "vision")]
     fn prompt_media(
         s: &mut app::Session<Self>,
         ids: &[u32],
-        images: &[Placed<'_>],
+        encoded: vision_seat::Encoded,
     ) -> Result<u32, GateError> {
         let _ = (s, ids);
         Err(format!(
             "a prompt with {} images: a {} file takes no image input",
-            images.len(),
+            encoded.rows().ats.len(),
             Self::ARCH
         )
         .into())
     }
-}
-
-/// One image of a media call as a body takes it: the positions its span holds in the call's ids,
-/// its rows (`n_embd` bf16 values a position) and its token grid `(nx, ny)`, `nx` tokens along a
-/// line and `ny` lines (`vision::GridPlan::span_grid` holds the order).
-#[cfg(feature = "vision")]
-struct Placed<'a> {
-    at: Range<usize>,
-    rows: &'a [u16],
-    grid: (usize, usize),
 }
 
 impl Body3 for Body {
@@ -704,27 +686,17 @@ impl Body3 for Body35 {
         super::rounds::step_rows_one_pass(s, rows)
     }
 
-    /// The session's media call ([`app::Session::prompt_media`]): each image's span of the call
+    /// The session's media call ([`vision_seat::Encoded::prompt`]): each image's span of the call
     /// takes its rows in place of its positions' embeddings and shifts the sequence's rotation
-    /// table by its grid, an `(nx, ny)` of positions in raster order. The architecture's own fact
-    /// is the grid; the rows are the tower's.
+    /// table by its grid, an `(nx, ny)` of positions in raster order. The grid is the span's own
+    /// ([`vision_seat::SpanAt::grid`]); the rows are the tower's.
     #[cfg(feature = "vision")]
     fn prompt_media(
         s: &mut app::Session<Body35>,
         ids: &[u32],
-        images: &[Placed<'_>],
+        encoded: vision_seat::Encoded,
     ) -> Result<u32, GateError> {
-        let spans: Vec<ImageSpan<'_>> = images
-            .iter()
-            .map(|p| ImageSpan {
-                span: MediaSpan {
-                    at: p.at.clone(),
-                    rows: p.rows,
-                },
-                grid: p.grid,
-            })
-            .collect();
-        Ok(s.prompt_media(ids, &spans, Want::Argmax)?.argmax())
+        encoded.prompt(s, ids, |rows| rows.image_spans())
     }
 }
 
@@ -766,6 +738,7 @@ impl<B: Body3> Q3<B> {
     ) -> Result<Q3<B>, GateError> {
         let t = Instant::now();
         let file = Split::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+        let opened = t.elapsed();
         let mut m = B::open(file, ctx, slots, load, levers, (kv, vision.as_ref()))?;
         m.set_mode(StepMode::Graph);
         let nodes = m.capture_step()?;
@@ -788,6 +761,7 @@ impl<B: Body3> Q3<B> {
         if slots > 1 {
             s.add_slots(slots)?;
         }
+        let total = t.elapsed();
         Record::new(&record::LOAD_QWEN3)
             .w("arch", B::ARCH)
             .u("resident_bytes", s.model().resident_bytes())
@@ -798,8 +772,9 @@ impl<B: Body3> Q3<B> {
             .u("layers", s.model().layers().len())
             .u("ubatch", B::ubatch(s.model())?)
             .u("graph_nodes", nodes)
-            .f("load_s", t.elapsed().as_secs_f64())
+            .f("load_s", total.as_secs_f64())
             .eprint();
+        record::eprint_load_phases(s.model(), total, opened);
         // The tower after the model's captures, as the V4.1 seat opens its encoder.
         #[cfg(feature = "vision")]
         let vision = open_encoder(&s, vision)?;
@@ -855,31 +830,21 @@ impl<B: Body3> Seat for Q3<B> {
 
     /// Each feed's image encoded on the resident encoder and read back as bf16, one row a cell of
     /// its grid and nothing around them ([`vision_seat::merged_cells`]: the tokens carry the
-    /// delimiters; [`vision_seat::Resident::merged_rows`]), then one prompt call with the images
-    /// spliced in ([`Body3::prompt_media`]), the model's card bound back between the two.
+    /// delimiters; [`vision_seat::Resident::encode`]), then one prompt call with the images
+    /// spliced in ([`Body3::prompt_media`]); the encode binds the model's card back before the
+    /// prompt call.
     #[cfg(feature = "vision")]
     fn prefill_media(&mut self, ids: &[u32], feeds: &[MediaFeed]) -> Result<u32, GateError> {
         let Some(v) = self.vision.as_mut() else {
             return Err("no --mmproj: this seat serves no image".into());
         };
-        let vision_seat::SpanRows { rows, ats, .. } = v.merged_rows(
+        let encoded = v.encode(
             self.s.model().gpu().context(),
             feeds
                 .iter()
                 .map(|f| vision_seat::Image::of(f.at, &f.prepared)),
         )?;
-        // Each span borrows its own range of the call's one buffer of rows; its grid is the
-        // image's merged-token plan (`vision::GridPlan::span_grid`).
-        let images: Vec<Placed<'_>> = ats
-            .iter()
-            .zip(feeds)
-            .map(|(a, f)| Placed {
-                at: a.positions.clone(),
-                rows: &rows[a.rows.clone()],
-                grid: f.prepared.patches.plan.span_grid(),
-            })
-            .collect();
-        B::prompt_media(&mut self.s, ids, &images)
+        B::prompt_media(&mut self.s, ids, encoded)
     }
 
     fn step(&mut self, last: u32) -> Result<u32, GateError> {
@@ -1175,12 +1140,17 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     // A placed load (`--place`) acts on the placement's levers; set beside
     // an unplaced one, they are refused by name.
     let placed = args.iter().any(|a| a == "--place");
-    let mut acts_on = vec![bloomery_levers::QWEN3_KV, bloomery_levers::STEP_STATS];
+    let mut acts_on = vec![
+        bloomery_levers::QWEN3_KV,
+        bloomery_levers::STEP_STATS,
+        bloomery_levers::SCREEN,
+    ];
     if placed {
         acts_on.extend(q3place::PLACED_LEVERS);
     }
     let levers = bloomery_levers::at_main(&acts_on)?;
     record::at_main(NAME, record::BLOOMERY_SERVE_QWEN3);
+    arm_screen(levers.screen());
     let a = parse_args(args)?;
     let kv = cache_k(&a, &levers)?;
     let path = ref_model_path()?;

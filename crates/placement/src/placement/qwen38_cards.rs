@@ -22,10 +22,11 @@ use super::workstation::{
     tier_batch_staging_bytes, unified_of,
 };
 use super::{
-    ARENA_ALIGN, ARENA_LANE_SLOTS, ArenaDial, ArenaFloor, Card, CardFormat, Device, KvBytes,
-    Machine, ModelTensor, ModelTensors, PlacementError, Plan, PlanLevers, Role, nvme_arena_of,
+    ARENA_ALIGN, ARENA_LANE_SLOTS, ArenaDial, ArenaFloor, Card, Device, KvBytes, Machine,
+    ModelTensor, ModelTensors, PlacementError, Plan, PlanLevers, Role, nvme_arena_of,
     plan_routed_reserving,
 };
+use crate::accepts::{Program, routed_rule};
 use crate::slots::{SeqTerms, Stores};
 
 /// The UD-Q4_K_XL file's tensors, in its shards' order.
@@ -186,22 +187,6 @@ fn model(q3: bool) -> ModelTensors {
         layers: LAYERS,
         experts: EXPERTS,
         experts_used: 10,
-    }
-}
-
-/// The card leg's routed stacks (`qwen35moe::place::card_routed`): a Q4_K,
-/// Q5_K, IQ3_XXS or IQ4_XS gate and up, a Q5_1, Q8_0 or IQ4_NL down, in the
-/// file's blocks.
-fn card_routed(ty: GgmlType) -> Option<CardFormat> {
-    match ty {
-        GgmlType::Q4_K
-        | GgmlType::Q5_K
-        | GgmlType::Q5_1
-        | GgmlType::Q8_0
-        | GgmlType::IQ3_XXS
-        | GgmlType::IQ4_XS
-        | GgmlType::IQ4_NL => Some(CardFormat::KQuant),
-        _ => None,
     }
 }
 
@@ -400,7 +385,15 @@ fn planned<'a>(
     let rows = terms.plan_beside(slots);
     let kv = terms.slots_of(slots);
     let levers = PlanLevers::default();
-    let mut plan = plan_routed_reserving(model, machine, ctx, &kv, &levers, card_routed, rows)?;
+    let mut plan = plan_routed_reserving(
+        model,
+        machine,
+        ctx,
+        &kv,
+        &levers,
+        routed_rule(Program::Qwen38Body),
+        rows,
+    )?;
     super::row_table_tier(&mut plan, room, 2 * state38(ctx, false), UBATCH_PLANNED)?;
     if let Some(given) = split {
         plan.host.step_slots(
@@ -528,7 +521,7 @@ fn q4_on_one_96gb_card_holds_every_routed_expert() {
 }
 
 /// The Q3 file's routed gate and up are IQ3_XXS or IQ4_XS and its downs
-/// IQ4_NL or Q8_0: all of them card types (`card_routed`), so on a large
+/// IQ4_NL or Q8_0: all of them card types in their parts (`routed_rule`), so on a large
 /// enough card every routed expert is the card's as the Q4 file's are — the
 /// host need the PLE table alone, the residency rule
 /// `off` for no host expert left. Under `--place bp` on two such cards both
@@ -1286,15 +1279,15 @@ fn the_paged_rule_reads_the_arena() {
     assert!(moved2 > 0 && deep2 > 0 && moved1 > 0 && deep1 > 0);
     assert_eq!(
         paged_columns(&at(deep2, 2, false)),
-        Ok(Paged::Reduced { slots: 1 })
+        Paged::Reduced { slots: 1 }
     );
-    assert_eq!(paged_columns(&at(deep1, 1, false)), Ok(Paged::AsAsked));
-    assert_eq!(paged_columns(&at(deep2, 2, true)), Ok(Paged::AsAsked));
+    assert_eq!(paged_columns(&at(deep1, 1, false)), Paged::AsAsked);
+    assert_eq!(paged_columns(&at(deep2, 2, true)), Paged::AsAsked);
     let (moved, shallow) = arena(2, 40 << 30);
     println!("40 GiB: two slots NVMe experts {moved} B, arena {shallow} B");
     assert!(moved > 0, "the 40 GiB room pages experts");
     assert_eq!(shallow, 0, "through the mapping, no arena");
-    assert_eq!(paged_columns(&at(shallow, 2, true)), Ok(Paged::AsAsked));
+    assert_eq!(paged_columns(&at(shallow, 2, true)), Paged::AsAsked);
 }
 
 /// The arena's floor counts a column a slot, to the step port's width: the
@@ -1816,7 +1809,7 @@ fn spark_plan<'a>(
         ctx,
         &kv,
         &PlanLevers::default(),
-        card_routed,
+        routed_rule(Program::Qwen38Body),
         rows + draft,
     )
     .expect("a Spark plan");

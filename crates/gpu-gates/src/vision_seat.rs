@@ -27,11 +27,20 @@
 //! * [`on_encoder_card`] — binds the tower's card for a tower call and the model's card back.
 //! * [`Resident`] — a serve seat's resident encoder: the tower on its card, its stream, the row
 //!   width and the model's image input; [`Resident::span_rows`] encodes a media call's images and
-//!   reads them back as the rows a prompt call splices, and [`Resident::merged_rows`] is that call
-//!   for a merger tower on the model's card. The seat gives only its model's splice of one image's
-//!   rows.
-//! * [`SpanRows::media_spans`] — the call's spans as the plain [`MediaSpan`]s of a body that takes
-//!   nothing beside a span's positions and rows.
+//!   reads them back as the rows a prompt call splices. The seat gives only its model's splice of
+//!   one image's rows.
+//! * [`Resident::encode_with`] and [`Encoded::prompt`] — the two steps of a seat's media call
+//!   (GLM, Qwen3.6 and V4.1; Clef takes the first and makes its own hidden-state call), the one
+//!   place the seats' rows pass between the readback and the prompt call: the images encoded on the model's card and read back as [`Encoded`] rows
+//!   with the seat's own splice and kinds ([`Resident::encode`] is the merger towers' splice,
+//!   [`merged_cells`]; a reference reads the rows with [`Encoded::rows`]), then the one prompt
+//!   call over the spans the seat's builder makes of them ([`app::Session::prompt_media`]). What
+//!   a seat does beside them (GLM's draft turn-off between the two, V4.1's draft refusal before
+//!   them) and how its splice and spans are made stay the seat's.
+//! * [`SpanRows::media_spans`] and [`SpanRows::image_spans`] — the call's spans as the plain
+//!   [`MediaSpan`]s of a body that takes nothing beside a span's positions and rows, and as the
+//!   [`ImageSpan`]s of a body that also takes each image's token grid, which [`span_rows_of`]
+//!   records in each span ([`SpanAt::grid`]) from the image the span is of — a seat passes none.
 //! * [`span_rows`] — the same on a tower and stream the caller holds ([`span_rows_of`] is its host
 //!   half, which takes the readback as a closure); every tower writes one row of `width` a cell of
 //!   the plan's token grid.
@@ -44,7 +53,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use bloomery_gpu::media::MediaSpan;
+use bloomery_gpu::media::{ImageSpan, MediaBody, MediaSpan};
 use cuda_core::CudaContext;
 use gguf::Gguf;
 use model::placement::workstation::{CardSpec, DeviceInfo};
@@ -138,6 +147,14 @@ impl Flags {
     /// `--hf` repo holds beside the model ([`crate::model_file::hf_projector`]) unless
     /// `--no-mmproj` says none. `None` serves no image.
     pub fn encoder(&self, takes: bool) -> Result<Option<PathBuf>, GateError> {
+        record::require(
+            record::groups::vision_seat::RECORDS,
+            "vision_seat::Flags::encoder",
+        );
+        record::require(
+            record::groups::model_file::FETCH,
+            "vision_seat::Flags::encoder",
+        );
         match self.mmproj()? {
             Some(file) => Ok(Some(file.to_owned())),
             None if takes && self.may_pick() => crate::model_file::hf_projector(),
@@ -723,15 +740,32 @@ impl<K> SpanRows<K> {
             })
             .collect()
     }
+
+    /// [`SpanRows::media_spans`] with each span's token grid, the `(nx, ny)` its own image's plan
+    /// gave it ([`SpanAt::grid`]): a body that shifts its rotation table by each image's grid. A
+    /// grid holds `nx · ny` positions only for a span that is its cells ([`merged_cells`]); a span
+    /// with rows around them (V4.1's delimiters) fails `ImageSpan::check`.
+    #[must_use]
+    pub fn image_spans(&self) -> Vec<ImageSpan<'_>> {
+        self.media_spans()
+            .into_iter()
+            .zip(&self.ats)
+            .map(|(span, a)| ImageSpan { span, grid: a.grid })
+            .collect()
+    }
 }
 
 /// One span's ranges: its positions in the call's ids, its values of [`SpanRows::rows`] and its
-/// entries of [`SpanRows::kinds`].
+/// entries of [`SpanRows::kinds`], and its image's token grid.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SpanAt {
     pub positions: Range<usize>,
     pub rows: Range<usize>,
     pub kinds: Range<usize>,
+    /// `(nx, ny)` of the image's plan: tokens along a line and lines
+    /// (`vision::GridPlan::span_grid` holds the order), recorded where the span is made, from the
+    /// image the span is of.
+    pub grid: (usize, usize),
 }
 
 /// [`SpanRows`] of `images`, encoded on `tower` in order and read back on `stream`, the stream the
@@ -825,16 +859,78 @@ impl Resident {
         span_rows(&mut *self.tower, &self.stream, images, self.n_embd, splice)
     }
 
-    /// The rows of a merger tower's media call: [`Resident::span_rows`] with [`merged_cells`] (one
-    /// row a cell of each grid, the ids carry the delimiters), the tower's card bound for the calls
-    /// and `model`, the context the seat's body runs on, bound back after them
-    /// ([`on_encoder_card`]).
-    pub fn merged_rows<'a>(
+    /// Step (e) of a seat's media call: `images` encoded and read back as the rows the prompt call
+    /// splices — [`Resident::span_rows`] with the seat's own `splice` (what its spans add around
+    /// the cells' rows, and the kind of each position), the tower's card bound for the calls and
+    /// `model`, the context the seat's body runs on, bound back after them
+    /// ([`on_encoder_card`]). The prompt call over them is [`Encoded::prompt`].
+    pub fn encode_with<'a, K>(
         &mut self,
         model: &CudaContext,
         images: impl IntoIterator<Item = Image<'a>>,
-    ) -> Result<SpanRows<()>, GateError> {
-        on_encoder_card(model, || self.span_rows(images, merged_cells))
+        splice: impl FnMut(&[u16], &Patches) -> Result<(Vec<u16>, Vec<K>), GateError>,
+    ) -> Result<Encoded<K>, GateError> {
+        let rows = on_encoder_card(model, || self.span_rows(images, splice))?;
+        Ok(Encoded { rows })
+    }
+
+    /// [`Resident::encode_with`] of a merger tower's span: [`merged_cells`] (one row a cell of
+    /// each grid, the ids carry the delimiters).
+    pub fn encode<'a>(
+        &mut self,
+        model: &CudaContext,
+        images: impl IntoIterator<Item = Image<'a>>,
+    ) -> Result<Encoded, GateError> {
+        self.encode_with(model, images, merged_cells)
+    }
+}
+
+/// The rows of one media call, read back by [`Resident::encode_with`] ([`Resident::encode`] for a
+/// merger tower: `K = ()`) and not yet spliced into a prompt call; `K` is the kind a seat's splice
+/// gives each position. [`Encoded::rows`] lends them read-only; [`Encoded::prompt`] makes the one
+/// call that splices them and consumes them, so no later read can see what it did to its own copy.
+#[derive(Debug)]
+pub struct Encoded<K = ()> {
+    rows: SpanRows<K>,
+}
+
+impl<K> Encoded<K> {
+    /// The rows of a media call read back elsewhere than [`Resident::encode_with`], wrapped to
+    /// take [`Encoded::prompt`]: a gate that holds a seat's prompt step to its body without a
+    /// tower (`gate_ds41_media`: the vision set's aligner rows, spliced by [`span_rows_of`])
+    /// builds its [`SpanRows`] and hands them here. It only wraps: the prompt call over the rows
+    /// is [`Encoded::prompt`], the one call, and a seat's rows come from its tower.
+    #[must_use]
+    pub fn from_rows(rows: SpanRows<K>) -> Encoded<K> {
+        Encoded { rows }
+    }
+
+    /// The call's rows and each span's ranges of them.
+    #[must_use]
+    pub fn rows(&self) -> &SpanRows<K> {
+        &self.rows
+    }
+
+    /// Step (p) of a media call, the only place a seat's rows pass on their way to the prompt
+    /// call: `build` makes the body's spans of the rows (the seat's own: [`SpanRows::media_spans`]
+    /// for a body that takes nothing beside positions and rows, [`SpanRows::image_spans`] for one
+    /// that takes each image's grid, the rows with their kinds for one that checks a splice
+    /// shape), then one [`app::Session::prompt_media`] of `ids` over them, the greedy token after
+    /// the last id. It is the call's one residency pass: a body's own `prefill_media` is never
+    /// called beside it.
+    pub fn prompt<B, F>(
+        self,
+        s: &mut app::Session<B>,
+        ids: &[u32],
+        build: F,
+    ) -> Result<u32, GateError>
+    where
+        B: MediaBody,
+        F: for<'r> FnOnce(&'r SpanRows<K>) -> Vec<B::Span<'r>>,
+    {
+        let rows = self.rows;
+        let spans = build(&rows);
+        Ok(s.prompt_media(ids, &spans, runtime::Want::Argmax)?.argmax())
     }
 }
 
@@ -842,8 +938,9 @@ impl Resident {
 /// first `n_llm_h · n_llm_w · width` values kept (the tower writes one row of `width` a cell of
 /// the plan's grid; fewer is refused by name) and handed to `splice` with the patches, which
 /// returns the span's rows and the kind of each of its positions; their count is the image's
-/// `span_len`, refused by name when it is not. What a span adds around the cells' rows (V4.1's
-/// delimiters, none for a merger's tokens) is `splice`; the rest is the same for every tower.
+/// `span_len`, refused by name when it is not. The span records its image's own token grid
+/// ([`SpanAt::grid`]). What a span adds around the cells' rows (V4.1's delimiters, none for a
+/// merger's tokens) is `splice`; the rest is the same for every tower.
 pub fn span_rows_of<'a, K, E: Display>(
     images: impl IntoIterator<Item = Image<'a>>,
     width: usize,
@@ -882,6 +979,7 @@ pub fn span_rows_of<'a, K, E: Display>(
             positions: at..at + kinds.len(),
             rows: out.rows.len()..out.rows.len() + rows.len(),
             kinds: out.kinds.len()..out.kinds.len() + kinds.len(),
+            grid: patches.plan.span_grid(),
         });
         out.rows.extend(rows);
         out.kinds.extend(kinds);
@@ -1793,6 +1891,70 @@ mod tests {
         assert_eq!(spans[1].rows, [200, 201, 202, 203, 204, 205]);
     }
 
+    /// The values a tower writes for a plan's grid, 0, 1, 2, ... one row a cell.
+    fn ramp(p: &Patches) -> Result<Vec<u16>, String> {
+        Ok((0..(cells(p) * W) as u16).collect())
+    }
+
+    /// The two spans of a merged call as `ImageSpan`s: the same positions over the same values as
+    /// the plain spans, each with the grid of its own image.
+    #[test]
+    fn image_spans_are_the_media_spans_with_each_spans_grid() {
+        let (a, b) = (patches(1, 2), patches(2, 1));
+        let images = [
+            Image {
+                at: 3,
+                patches: &a,
+                span_len: 2,
+            },
+            Image {
+                at: 9,
+                patches: &b,
+                span_len: 2,
+            },
+        ];
+        let got = span_rows_of(images, W, ramp, merged_cells).unwrap();
+        let spans = got.image_spans();
+        assert_eq!(spans.len(), 2);
+        assert_eq!((spans[0].span.at.clone(), spans[0].grid), (3..5, (2, 1)));
+        assert_eq!((spans[1].span.at.clone(), spans[1].grid), (9..11, (1, 2)));
+        let plain = got.media_spans();
+        assert_eq!(spans[0].span.rows, plain[0].rows);
+        assert_eq!(spans[1].span.rows, plain[1].rows);
+    }
+
+    /// Two images of equal area whose grids are each other's transpose: a span takes the grid of
+    /// its own image, `(nx, ny)` = `(n_llm_w, n_llm_h)`, in feed order. A swapped pair, or a span
+    /// given another image's grid, still holds `nx · ny` positions, so `ImageSpan::check` passes it.
+    #[test]
+    fn equal_area_images_keep_their_own_swapped_grids_in_feed_order() {
+        let (a, b) = (patches(2, 3), patches(3, 2));
+        let images = [
+            Image {
+                at: 3,
+                patches: &a,
+                span_len: 6,
+            },
+            Image {
+                at: 12,
+                patches: &b,
+                span_len: 6,
+            },
+        ];
+        let got = span_rows_of(images, W, ramp, merged_cells).unwrap();
+        let spans = got.image_spans();
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0].grid, a.plan.span_grid());
+        assert_eq!(spans[1].grid, b.plan.span_grid());
+        assert_eq!([spans[0].grid, spans[1].grid], [(3, 2), (2, 3)]);
+        assert!(spans.iter().all(|s| s.grid.0 * s.grid.1 == s.span.at.len()));
+        assert_eq!(
+            ImageSpan::rows_of(0, &spans),
+            [(3, 3, 2), (12, 2, 3)],
+            "the rotation table's (first row, nx, ny)"
+        );
+    }
+
     /// A span that adds rows around the tower's: a Start row of 9s, each grid row's cells and a
     /// NewLine row of 8s, an End row of 7s.
     fn delimited(rows: &[u16], p: &Patches) -> Result<(Vec<u16>, Vec<Kind>), GateError> {
@@ -1840,12 +2002,14 @@ mod tests {
                 SpanAt {
                     positions: 5..13,
                     rows: 0..8 * W,
-                    kinds: 0..8
+                    kinds: 0..8,
+                    grid: (2, 2)
                 },
                 SpanAt {
                     positions: 20..26,
                     rows: 8 * W..14 * W,
-                    kinds: 8..14
+                    kinds: 8..14,
+                    grid: (3, 1)
                 },
             ]
         );

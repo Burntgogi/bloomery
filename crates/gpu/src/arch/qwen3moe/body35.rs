@@ -1204,7 +1204,7 @@ impl GpuModel<Body35> {
 
     /// The Qwen3.6 model of `file` placed by `plan` (made by
     /// `model::arch::qwen35moe::place::PlanInputs::plan_rule` under
-    /// `model::arch::qwen3moe::place::card_routed` on the machine
+    /// `placement::accepts::routed_rule` of the qwen35moe body, on the machine
     /// `model::arch::qwen3moe::place::machine` lays out): the plan's card
     /// segments resident ([`GpuModel::load_placed_with`]: the trunk, the
     /// shared experts, each layer's card experts) with each router joined

@@ -67,9 +67,10 @@ use std::time::Instant;
 use bloomery_gpu::GpuError;
 use bloomery_gpu::arch::qwen3moe::ubatch::UBATCH;
 use bloomery_gpu::arch::qwen3moe::{Body35, PrefillPath, Qwen35moeModel};
-use bloomery_gpu::media::{ImageSpan, MediaBody, MediaSpan};
+use bloomery_gpu::media::{ImageSpan, MediaBody};
+use bloomery_gpu_gates::bind::arm_screen;
 use bloomery_gpu_gates::generate::Place;
-use bloomery_gpu_gates::record::{self, Kind, Record};
+use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::vision_seat::{self, EncoderSeat, PleImage, TextFacts};
 use bloomery_gpu_gates::{GateError, model_file, ref_model_path};
 use cuda_core::CudaContext;
@@ -89,19 +90,6 @@ use crate::{clef_seat, lev_seat};
 
 /// The seat's record bin name, the `listening` record's head.
 const WHAT: &str = "bloomery-serve-decide";
-
-/// What this seat prints, all on stderr (its `--records-schema`): the lines of the fetch of a head
-/// or a projector under `--hf` (the model's own are the server's, printed before the seat
-/// registers), the `vision` record of a resident image encoder, then the `listening` record.
-static KINDS: &[&Kind] = &[
-    &record::HF_OFFLINE,
-    &record::HF_FILE,
-    &record::HF_PROGRESS,
-    &record::HF_DONE,
-    &record::VISION_SEAT,
-    &record::VISION,
-    &record::LISTENING_DECIDE,
-];
 
 const USAGE: &str = "usage: bloomery-serve [--model decide] (-m PATH | --hf <repo>[:<quant>]) \
                      [--head <weights> [--head-config <file>]] [--mmproj FILE | --no-mmproj] \
@@ -270,8 +258,10 @@ impl Backbone {
     }
 
     /// [`Backbone::hidden`] of `ids` whose image spans `images` place: each image encoded on the
-    /// resident tower and read back, then one media prompt call with the rows spliced in. The
-    /// hidden states, the prompt call's wall and the tower's wall (encode and readback) in ms.
+    /// resident tower and read back ([`vision_seat::Resident::encode`]), then one media call with
+    /// the rows spliced in, each span carrying its image's grid, which reads the hidden states,
+    /// not a prompt call's argmax ([`vision_seat::Encoded::prompt`] is the argmax call). The
+    /// hidden states, the media call's wall and the tower's wall (encode and readback) in ms.
     pub fn hidden_media(
         &mut self,
         ids: &[u32],
@@ -283,26 +273,14 @@ impl Backbone {
             .ok_or("an image request on a server with no encoder (--mmproj)")?;
         self.body.reset()?;
         let t = Instant::now();
-        let vision_seat::SpanRows { rows, ats, .. } = tower.merged_rows(
+        let encoded = tower.encode(
             self.body.context(),
             images
                 .iter()
                 .map(|i| vision_seat::Image::of(i.at, i.prepared)),
         )?;
         let tower_ms = t.elapsed().as_secs_f64() * 1e3;
-        // Each span borrows its own range of the call's one buffer of rows; its grid is the
-        // image's merged-token plan (`vision::GridPlan::span_grid`).
-        let spans: Vec<ImageSpan<'_>> = ats
-            .iter()
-            .zip(images)
-            .map(|(at, image)| ImageSpan {
-                span: MediaSpan {
-                    at: at.positions.clone(),
-                    rows: &rows[at.rows.clone()],
-                },
-                grid: image.prepared.patches.plan.span_grid(),
-            })
-            .collect();
+        let spans = encoded.rows().image_spans();
         let t = Instant::now();
         let hidden = self.body.prefill_hidden_media(ids, &spans)?;
         Ok((hidden, t.elapsed().as_secs_f64() * 1e3, tower_ms))
@@ -325,7 +303,7 @@ mod image {
     use bloomery_gpu_gates::GateError;
     use std::time::Instant;
 
-    use bloomery_gpu_gates::vision_seat::{Image, Opened, ScratchHome, SpanRows};
+    use bloomery_gpu_gates::vision_seat::{Encoded, Image, Opened, ScratchHome};
     use cuda_core::CudaContext;
     use serve::media::MediaModel;
 
@@ -344,11 +322,11 @@ mod image {
             match *self {}
         }
 
-        pub fn merged_rows<'a>(
+        pub fn encode<'a>(
             &mut self,
             _: &CudaContext,
             _: impl IntoIterator<Item = Image<'a>>,
-        ) -> Result<SpanRows<()>, GateError> {
+        ) -> Result<Encoded, GateError> {
             match *self {}
         }
     }
@@ -666,8 +644,9 @@ fn head_files(from: Pick) -> Result<HeadFiles, GateError> {
 /// carries why the server ended. `hf` is the repo (`owner/name`) the model
 /// file came from under `--hf`: the model's name, else its file name.
 pub fn run(args: &[String], from: Pick, hf: Option<&str>) -> Result<ServeError, GateError> {
-    bloomery_levers::at_main(&[])?;
-    record::at_main(WHAT, KINDS);
+    let levers = bloomery_levers::at_main(&[bloomery_levers::SCREEN])?;
+    record::at_main(WHAT, record::BLOOMERY_SERVE_DECIDE);
+    arm_screen(levers.screen());
     let a = parse_args(args)?;
     let (row, head) = head_files(from)?;
     let model = ref_model_path()?;

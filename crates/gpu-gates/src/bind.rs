@@ -519,7 +519,25 @@ fn parallel_text(slots: usize, slot_ctx: usize, from: SlotsFrom, pass: Pass) -> 
 /// context, the total, what set the count (`from`), and the shape of a round
 /// of several slots (`pass`).
 pub fn parallel_line(slots: usize, slot_ctx: usize, from: SlotsFrom, pass: Pass) {
-    eprintln!("{}", parallel_text(slots, slot_ctx, from, pass));
+    eprint_noted(&parallel_text(slots, slot_ctx, from, pass));
+}
+
+/// A seat's start line that is no [`crate::record::Record`] (the
+/// `parallel`, `cache` and Qwen3.8 `load` lines) on stderr as it is, and to
+/// the start screen (`serve::screen::note`), which keeps it only when armed.
+pub fn eprint_noted(line: &str) {
+    eprintln!("{line}");
+    serve::screen::note(line);
+}
+
+/// Arms the start screen (`serve::screen`) when `on` (the seat's
+/// `BLOOMERY_SCREEN`) and stderr is a terminal, and then hands it every
+/// record line the seat prints; a seat calls it right after its levers and
+/// records are registered, and the server draws the screen once it listens.
+pub fn arm_screen(on: bool) {
+    if serve::screen::arm(on) {
+        crate::record::tee(serve::screen::note);
+    }
 }
 
 /// `/props`' placement of `plan` on `machine`: its cards by nvidia-smi
@@ -1407,6 +1425,7 @@ impl SeatEngine {
         S: Seat,
         F: FnOnce() -> Result<S, GateError> + Send + 'static,
     {
+        crate::record::require(crate::record::groups::bind::CACHE, "bind::spawn");
         let (tx, cmds) = mpsc::channel::<Cmd>();
         let (replies, rx) = mpsc::channel::<Reply>();
         let (opened, loaded) = mpsc::channel::<
@@ -1415,6 +1434,7 @@ impl SeatEngine {
                     usize,
                     usize,
                     usize,
+                    bool,
                     bool,
                     bool,
                     bool,
@@ -1443,6 +1463,7 @@ impl SeatEngine {
                         g.slot_drafts(),
                         g.drafts_sampled(),
                         g.snapshots_async(),
+                        g.step_stats() && g.slots() >= 2,
                         g.media_model(),
                         g.props(props),
                     )))
@@ -1585,13 +1606,18 @@ impl SeatEngine {
                     }
                 }
             })?;
-        let (ctx_max, rows, slots, drafts, media, props) = match loaded.recv() {
-            Ok(Ok((c, rows, n, d, ds, sa, m, props))) => {
-                (c.min(defined), rows, n, [d, ds, sa], m, props)
+        let (ctx_max, rows, slots, drafts, media, props, counts) = match loaded.recv() {
+            Ok(Ok((c, rows, n, d, ds, sa, counts, m, props))) => {
+                (c.min(defined), rows, n, [d, ds, sa], m, props, counts)
             }
             Ok(Err(e)) => return Err(e.into()),
             Err(mpsc::RecvError) => return Err("the engine thread ended during the load".into()),
         };
+        // The seat counts its rounds and serves several slots: its `slots round` and `slot call`
+        // records print from now on.
+        if counts {
+            crate::record::require(crate::record::groups::bind::SLOTS, "bind::spawn");
+        }
         Ok(SeatEngine {
             link: Link {
                 tx: Some(tx),
@@ -3336,6 +3362,23 @@ mod tests {
             parallel_text(2, 4096, SlotsFrom::Flag, Pass::One),
             "parallel rule=slots slots=2 slot_ctx=4096 total=8192 from=flag pass=one"
         );
+        // The line is no record kind; the start screen (`serve::screen`)
+        // reads it by key, and its fixed starts carry it as printed.
+        for (start, line) in [
+            (
+                include_str!("../../serve/tests/fixtures/screen-start.log"),
+                parallel_text(2, 16384, SlotsFrom::Default, Pass::One),
+            ),
+            (
+                include_str!("../../serve/tests/fixtures/screen-start-qwen38.log"),
+                parallel_text(1, 8192, SlotsFrom::Ctx, Pass::One),
+            ),
+        ] {
+            assert!(
+                start.lines().any(|l| l == line),
+                "the screen's fixed start lacks `{line}`"
+            );
+        }
     }
 
     /// The slot count and its word: `--parallel` as given, one slot at the
