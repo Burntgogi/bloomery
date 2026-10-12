@@ -5719,7 +5719,7 @@ mod gate {
         (gate_up, down): (&[Option<f64>], &[Option<f64>]),
     ) -> Result<Vec<[Option<f64>; 2]>, GateError> {
         let pick = |l: usize, what: &str, wide: bool, x: Option<f64>| match (wide, x) {
-            (true, Some(x)) if what == "down" && !(x >= DOWN_FLOOR) => {
+            (true, Some(x)) if what == "down" && (x.is_nan() || x < DOWN_FLOOR) => {
                 Err(GateError::from(format!(
                     "layer {l}: the down input's crest term {x:.3} q² is under its floor \
                      {DOWN_FLOOR} q² (a SwiGLU product's blocks are far from flat): the tap \
