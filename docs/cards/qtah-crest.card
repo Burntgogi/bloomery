@@ -1,0 +1,19 @@
+# qtah: the down input's crest term, read off GLM's every-node reference set before qtah lands.
+kind: calibration
+question: does the down's input (the dense block's and the shared expert's SwiGLU product) carry a 128-block crest
+  A_h/4 clearly above 0, so gate_glm5next_e2e's GEMM band may take the measured term in place of the largest
+  crest's 12
+term: A_h/4 = mean over 128-value blocks of (amax_b/127)^2 / sigma_row^2, over 4, of every SwiGLU tap of
+  ref_glm5next_step4_every_node (the real UD file's step-4 set), host read by crest.py, no card, no lease
+unit: q^2
+predict: 3..6 q^2
+condition: the read takes the set's dumped f32 taps as they are, every tap whose name matches the SwiGLU and FFN-input
+  patterns, its logical twin where the row has one; numpy on the host, nothing on either card, no timing
+decide-in: qtah lands; the down's band term is the measured A_h/4 and the head band's floor moves to the derivation's
+  0.095..0.12
+decide-below: under 3 but at or above 1 q^2: qtah lands with the measured term, the floor re-derived from it; under
+  1 q^2 the term is near 0 and qtah does not land (the down stays at 12)
+decide-above: 8 q^2 or more: the shexp/SwiGLU probe buys nothing over the largest crest; qtah does not land and the
+  down stays at 12
+reason: sets the down's crest term qtah measures in gate_glm5next_e2e's GEMM band; the lead's landing decision for
+  qtah, read now while the box is free between the ladder and the train batch
