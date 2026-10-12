@@ -14,10 +14,10 @@ use crate::GateError;
 use crate::generate::Place;
 use crate::record::{self, Record};
 use crate::residency::PlanRoom;
-use bloomery_gpu::arch::qwen3moe::Body38;
 use bloomery_gpu::host::swap::Residency;
-use bloomery_gpu::model::ChainBody;
-use bloomery_levers::{ChurnHosting, RESIDENCY38_SPARES, Residency38Pick, residency38_at_plan};
+use bloomery_levers::{
+    ChurnHosting, RESIDENCY38_SPARES, Residency38Pick, UnhostedPool, residency38_at_plan,
+};
 use model::placement::churn::ChurnPool;
 use model::placement::workstation::TierBatchBytes;
 use model::placement::{Machine, Plan};
@@ -208,7 +208,7 @@ pub enum Lever38<'a> {
 
 /// The residency a load of `plan` runs under `lever`, and whether the load
 /// hosts its churn pool: a set word as given, hosted; unset, the rule's
-/// before the plan or on plan (a) from it under [`Body38`]'s capability
+/// before the plan or on plan (a) from it under the loading body's capability (`carry`)
 /// (`residency38_at_plan`: P 0, its pool unhosted where it fits neither the
 /// plan's host headroom nor `MemAvailable`, `off` with why where the card
 /// slots leave no room) — its `residency unset` record handed to `emit`, the
@@ -219,6 +219,7 @@ pub enum Lever38<'a> {
 /// a set word when the plan's host headroom cannot take it. `emit` is where
 /// the binary prints its records.
 pub fn residency38(
+    carry: UnhostedPool,
     plan: &Plan<'_>,
     lever: Lever38<'_>,
     emit: fn(Record),
@@ -239,7 +240,7 @@ pub fn residency38(
                     // ([`reserve_checkpoints`]), as `CacheRam`'s does.
                     let room = PlanRoom::new(plan, CARD38, 0);
                     residency38_at_plan(
-                        Body38::UNHOSTED_POOL,
+                        carry,
                         room.card_experts(),
                         plan.host.experts,
                         |pinned| room.pool_bytes(pinned),

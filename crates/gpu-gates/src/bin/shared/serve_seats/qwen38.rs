@@ -823,7 +823,12 @@ fn residency38_at(
         Some((r, word)) => Lever38::Set(r, word),
         None => Lever38::Unset(residency38_unset(feed.residency_at(place))),
     };
-    residency38(plan, lever, Record::eprint)
+    residency38(
+        <Body38 as bloomery_gpu::model::ChainBody>::UNHOSTED_POOL,
+        plan,
+        lever,
+        Record::eprint,
+    )
 }
 
 /// The plans the seat can load, by context: the file's inputs at `place`
@@ -919,7 +924,12 @@ impl Plans<'_> {
             None => Lever38::Unset(residency38_unset(self.feed.residency_at(self.place))),
         };
         // An unhosted pool takes no host bytes: the load only knows it.
-        let pool = match residency38(&plan, lever, |_| {})? {
+        let pool = match residency38(
+            <Body38 as bloomery_gpu::model::ChainBody>::UNHOSTED_POOL,
+            &plan,
+            lever,
+            |_| {},
+        )? {
             (Residency::Mid { pinned, .. }, ChurnHosting::Hosted) => {
                 ChurnPool::of(&plan, CARD38, pinned)
                     .map_err(|e| format!("the churn pool: {e}"))?

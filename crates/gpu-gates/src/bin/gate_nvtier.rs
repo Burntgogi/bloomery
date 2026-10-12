@@ -1083,7 +1083,12 @@ fn stepunion_arm(
     // subject is the step port's union, so no lane fills the arena and only
     // the step claims can; the unset rule's `mid-p0-s1` is the `stepunion mid`
     // arm's.
-    let (residency, pool) = residency38(&plan, Lever38::Set(Residency::Off, "off"), Record::print)?;
+    let (residency, pool) = residency38(
+        <Body38 as bloomery_gpu::model::ChainBody>::UNHOSTED_POOL,
+        &plan,
+        Lever38::Set(Residency::Off, "off"),
+        Record::print,
+    )?;
     println!(
         "stepunion plan: two slots at the room {ROOM} B page {} B on the NVMe tier, arena {} B, \
          residency off (set: the clause judges the step port's union, not the default)",
@@ -1296,7 +1301,12 @@ fn slots_mid_arm(
         )
         .into());
     }
-    let (residency, pool) = residency38(&plan, Lever38::Set(MID, "mid-p0-s1"), Record::print)?;
+    let (residency, pool) = residency38(
+        <Body38 as bloomery_gpu::model::ChainBody>::UNHOSTED_POOL,
+        &plan,
+        Lever38::Set(MID, "mid-p0-s1"),
+        Record::print,
+    )?;
     println!(
         "stepunion mid plan: two slots, the {kind} plan: {} B on the NVMe tier, arena {} B, \
          residency the set mid-p0-s1",
@@ -1896,7 +1906,12 @@ fn run() -> Result<(), GateError> {
     );
     let plan = inputs.plan_with(&machine, CTX as u64, &PlanLevers::default(), Experts::Card)?;
     if let Some(role) = &role {
-        let (residency, _) = residency38(&plan, Lever38::Set(MID, "mid-p0-s1"), Record::print)?;
+        let (residency, _) = residency38(
+            <Body38 as bloomery_gpu::model::ChainBody>::UNHOSTED_POOL,
+            &plan,
+            Lever38::Set(MID, "mid-p0-s1"),
+            Record::print,
+        )?;
         return grant_child(
             role,
             path,
@@ -1911,7 +1926,12 @@ fn run() -> Result<(), GateError> {
 
     // `residency` (clause 5): the unset rule on the paged plan resolves
     // `mid-p0-s1`, the family's own word.
-    let (unset, _) = residency38(&plan, Lever38::Unset(None), Record::print)?;
+    let (unset, _) = residency38(
+        <Body38 as bloomery_gpu::model::ChainBody>::UNHOSTED_POOL,
+        &plan,
+        Lever38::Unset(None),
+        Record::print,
+    )?;
     let unset_mid = unset == MID;
     println!(
         "residency: the unset rule on the paged plan resolves {}: {}",
@@ -1925,7 +1945,12 @@ fn run() -> Result<(), GateError> {
     pass &= unset_mid;
     // The residency word both arms run: a set `mid-p0-s1`, so the paged
     // arm's flips, the seam and a lane's drops stay held.
-    let (residency, _) = residency38(&plan, Lever38::Set(MID, "mid-p0-s1"), Record::print)?;
+    let (residency, _) = residency38(
+        <Body38 as bloomery_gpu::model::ChainBody>::UNHOSTED_POOL,
+        &plan,
+        Lever38::Set(MID, "mid-p0-s1"),
+        Record::print,
+    )?;
     // `room`'s plan terms: the host need, the churn pool the residency
     // holds beside it, and the headroom the split left.
     // PIN(2026-10-09): `HostNeed::bytes` counts the plan's NVMe tier arena,

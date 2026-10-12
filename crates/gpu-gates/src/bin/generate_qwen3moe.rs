@@ -2215,7 +2215,12 @@ mod cli {
             .into());
         }
         println!("{}", plan38_line(place, experts, &plan, &inputs.room.1)?);
-        let (residency, pool) = residency38(&plan, lever, Record::print)?;
+        let (residency, pool) = residency38(
+            <Body38 as bloomery_gpu::model::ChainBody>::UNHOSTED_POOL,
+            &plan,
+            lever,
+            Record::print,
+        )?;
         let mut m = Body38::open_placed_residency(
             file,
             &plan,
@@ -2318,7 +2323,12 @@ mod cli {
             "{}",
             plan38_line(place, experts, &plan.plan, &inputs.room.1)?
         );
-        let (residency, pool) = residency38(&plan.plan, lever, Record::print)?;
+        let (residency, pool) = residency38(
+            <Body38 as bloomery_gpu::model::ChainBody>::UNHOSTED_POOL,
+            &plan.plan,
+            lever,
+            Record::print,
+        )?;
         let mut m = Body38::open_placed_mtp_residency(
             file,
             &plan,

@@ -631,7 +631,12 @@ mod gate {
             serving_place: true,
             ..ResidencyAt::FIXED
         });
-        let pick = bloomery_gpu_gates::residency::at_plan::<Body>(&plan, 0, unset)?;
+        let pick = bloomery_gpu_gates::residency::at_plan(
+            <Body as bloomery_gpu::model::ChainBody>::UNHOSTED_POOL,
+            &plan,
+            0,
+            unset,
+        )?;
         record::residency_lever(pick).print();
         if let Some(d) = pick.why.detail() {
             println!("{d}");
