@@ -148,7 +148,8 @@
 //!   are the target's and the store's `n` of its `ctx` positions (the plan's store bytes times
 //!   `n / ctx`): they follow `n`, not `ctx`. With the store's rows overwritten by other ids, the
 //!   state put back whole holds the draft's count of the save and the store's rows below `n`
-//!   bit for bit.
+//!   bit for bit. A store walked past the state's position (an anchor row) makes the save on a
+//!   lane refused by name, as the engine stream's is under (p), nothing enqueued.
 //! - (i) a pass the width chooser holds back right after the server's cut
 //!   step (the prompt call, then its last id as the seat's first step): the
 //!   chooser walks the draft's waiting rows first (`Draft::before_plain`,
@@ -2599,6 +2600,7 @@ mod gate {
         let n = m.pos();
         let (state, held, whole_ok) = lane_round(&mut m, prompt, kv_bytes, ("whole", 1))?;
         let whole_ok = whole_ok && held == n as usize;
+        let refused_ok = whole_ok && lane_refused(&mut m, prompt, n)?;
         let at = state.keep_point(n.saturating_sub(1));
         let cut_ok = if at == 0 || at >= n {
             println!(
@@ -2614,7 +2616,7 @@ mod gate {
         };
         m.body_parts("(sl)")?.2.set_checkpoints(false);
         m.reset()?;
-        Ok((m, whole_ok && cut_ok))
+        Ok((m, whole_ok && refused_ok && cut_ok))
     }
 
     /// One [`lane_save`] round on the model as it stands, `round` its name and the ids'
@@ -2667,6 +2669,39 @@ mod gate {
             verdict(back_ok)
         );
         Ok((state, held, bytes_ok && back_ok))
+    }
+
+    /// The save on a lane of a model whose draft store was walked past its position `n` (a
+    /// store walk from `n`, the anchor row): refused by name with the words of the engine
+    /// stream's save ((p)), nothing enqueued. The walk follows a whole put-back, which leaves
+    /// the store counting `n`.
+    fn lane_refused(m: &mut Qwen38Model, prompt: &[u32], n: u32) -> Result<bool, GateError> {
+        let zeros = vec![0.0f32; WIDE];
+        m.mtp_walk(
+            MtpFeed::Rows {
+                tokens: &prompt[..1],
+                pos0: n,
+                hidden: MtpHidden::Host(&zeros),
+            },
+            MtpHead::Rows,
+            MtpMode::Store,
+        )?;
+        let (gdn, qsa) = (cfg().shape.n_gdn(), cfg().shape.n_qsa());
+        let lane = m.seq_lane(seq38_bytes(gdn, qsa, n as usize, true))?;
+        let got = m
+            .seq_save_async(&lane)
+            .err()
+            .map_or_else(|| "ran".to_owned(), |e| e.to_string());
+        let want = format!(
+            "a state at {n} of a draft store that holds {} positions",
+            n + 1
+        );
+        let ok = got.contains(&want);
+        println!(
+            "(sl) a lane save of a store walked past the state's {n} positions: {got} {}",
+            verdict(ok)
+        );
+        Ok(ok)
     }
 
     /// The draft's store rows at positions `0..n` written by store walks of other ids (the
