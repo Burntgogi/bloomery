@@ -258,10 +258,9 @@ impl Backbone {
 
     /// [`Backbone::hidden`] of `ids` whose image spans `images` place: each image encoded on the
     /// resident tower and read back ([`vision_seat::Resident::encode`]), then one media call with
-    /// the rows spliced in, which reads the hidden states, not a prompt call's argmax
-    /// ([`vision_seat::Encoded::prompt`] is the argmax call). The seat's own part is each image's
-    /// grid, the image's merged-token plan. The hidden states, the media call's wall and the
-    /// tower's wall (encode and readback) in ms.
+    /// the rows spliced in, each span carrying its image's grid, which reads the hidden states,
+    /// not a prompt call's argmax ([`vision_seat::Encoded::prompt`] is the argmax call). The
+    /// hidden states, the media call's wall and the tower's wall (encode and readback) in ms.
     pub fn hidden_media(
         &mut self,
         ids: &[u32],
@@ -280,11 +279,7 @@ impl Backbone {
                 .map(|i| vision_seat::Image::of(i.at, i.prepared)),
         )?;
         let tower_ms = t.elapsed().as_secs_f64() * 1e3;
-        let grids: Vec<(usize, usize)> = images
-            .iter()
-            .map(|i| i.prepared.patches.plan.span_grid())
-            .collect();
-        let spans = encoded.rows().image_spans(&grids);
+        let spans = encoded.rows().image_spans();
         let t = Instant::now();
         let hidden = self.body.prefill_hidden_media(ids, &spans)?;
         Ok((hidden, t.elapsed().as_secs_f64() * 1e3, tower_ms))

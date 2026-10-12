@@ -492,21 +492,20 @@ trait Body3: Slots<Seq: 'static> + app::Prompt + app::Keep + Sized + 'static {
         let _ = (s, rows);
         Err("a round of several slots as one pass: this body runs its slots in turns".into())
     }
-    /// One prompt call of `ids` with the `encoded` rows of the call's images spliced in, `grids`
-    /// the token grid `(nx, ny)` of each image (`vision::GridPlan::span_grid` holds the order);
-    /// the greedy token after the last id. Refused by the default: only a qwen35moe file's body
-    /// takes images.
+    /// One prompt call of `ids` with the `encoded` rows of the call's images spliced in, each
+    /// span carrying its image's token grid ([`vision_seat::SpanRows::image_spans`]); the greedy
+    /// token after the last id. Refused by the default: only a qwen35moe file's body takes
+    /// images.
     #[cfg(feature = "vision")]
     fn prompt_media(
         s: &mut app::Session<Self>,
         ids: &[u32],
         encoded: vision_seat::Encoded,
-        grids: &[(usize, usize)],
     ) -> Result<u32, GateError> {
-        let _ = (s, ids, encoded);
+        let _ = (s, ids);
         Err(format!(
             "a prompt with {} images: a {} file takes no image input",
-            grids.len(),
+            encoded.rows().ats.len(),
             Self::ARCH
         )
         .into())
@@ -693,16 +692,15 @@ impl Body3 for Body35 {
 
     /// The session's media call ([`vision_seat::Encoded::prompt`]): each image's span of the call
     /// takes its rows in place of its positions' embeddings and shifts the sequence's rotation
-    /// table by its grid, an `(nx, ny)` of positions in raster order. The architecture's own fact
-    /// is the grid; the rows are the tower's.
+    /// table by its grid, an `(nx, ny)` of positions in raster order. The grid is the span's own
+    /// ([`vision_seat::SpanAt::grid`]); the rows are the tower's.
     #[cfg(feature = "vision")]
     fn prompt_media(
         s: &mut app::Session<Body35>,
         ids: &[u32],
         encoded: vision_seat::Encoded,
-        grids: &[(usize, usize)],
     ) -> Result<u32, GateError> {
-        encoded.prompt(s, ids, |rows| rows.image_spans(grids))
+        encoded.prompt(s, ids, |rows| rows.image_spans())
     }
 }
 
@@ -835,7 +833,7 @@ impl<B: Body3> Seat for Q3<B> {
     /// its grid and nothing around them ([`vision_seat::merged_cells`]: the tokens carry the
     /// delimiters; [`vision_seat::Resident::encode`]), then one prompt call with the images
     /// spliced in ([`Body3::prompt_media`]); the encode binds the model's card back before the
-    /// prompt call. The seat's own part is each image's grid, the image's merged-token plan.
+    /// prompt call.
     #[cfg(feature = "vision")]
     fn prefill_media(&mut self, ids: &[u32], feeds: &[MediaFeed]) -> Result<u32, GateError> {
         let Some(v) = self.vision.as_mut() else {
@@ -847,11 +845,7 @@ impl<B: Body3> Seat for Q3<B> {
                 .iter()
                 .map(|f| vision_seat::Image::of(f.at, &f.prepared)),
         )?;
-        let grids: Vec<(usize, usize)> = feeds
-            .iter()
-            .map(|f| f.prepared.patches.plan.span_grid())
-            .collect();
-        B::prompt_media(&mut self.s, ids, encoded, &grids)
+        B::prompt_media(&mut self.s, ids, encoded)
     }
 
     fn step(&mut self, last: u32) -> Result<u32, GateError> {

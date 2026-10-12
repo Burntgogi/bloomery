@@ -37,7 +37,8 @@
 //!   the two) and how its spans are made stay the seat's.
 //! * [`SpanRows::media_spans`] and [`SpanRows::image_spans`] — the call's spans as the plain
 //!   [`MediaSpan`]s of a body that takes nothing beside a span's positions and rows, and as the
-//!   [`ImageSpan`]s of a body that also takes each image's token grid.
+//!   [`ImageSpan`]s of a body that also takes each image's token grid, which [`span_rows_of`]
+//!   records in each span ([`SpanAt::grid`]) from the image the span is of — a seat passes none.
 //! * [`span_rows`] — the same on a tower and stream the caller holds ([`span_rows_of`] is its host
 //!   half, which takes the readback as a closure); every tower writes one row of `width` a cell of
 //!   the plan's token grid.
@@ -738,38 +739,31 @@ impl<K> SpanRows<K> {
             .collect()
     }
 
-    /// [`SpanRows::media_spans`] with each span's token grid, `grids[i]` the `(nx, ny)` of span
-    /// `i` (`vision::GridPlan::span_grid` holds the order): a body that shifts its rotation table
-    /// by each image's grid. The grids are the caller's; which model asks is not known here.
-    ///
-    /// # Panics
-    ///
-    /// When `grids` is not one grid a span: a span left without its grid would be spliced as a
-    /// plain one.
+    /// [`SpanRows::media_spans`] with each span's token grid, the `(nx, ny)` its own image's plan
+    /// gave it ([`SpanAt::grid`]): a body that shifts its rotation table by each image's grid. A
+    /// grid holds `nx · ny` positions only for a span that is its cells ([`merged_cells`]); a span
+    /// with rows around them (V4.1's delimiters) fails `ImageSpan::check`.
     #[must_use]
-    pub fn image_spans(&self, grids: &[(usize, usize)]) -> Vec<ImageSpan<'_>> {
-        assert_eq!(
-            grids.len(),
-            self.ats.len(),
-            "image_spans: {} grids for {} spans",
-            grids.len(),
-            self.ats.len()
-        );
+    pub fn image_spans(&self) -> Vec<ImageSpan<'_>> {
         self.media_spans()
             .into_iter()
-            .zip(grids)
-            .map(|(span, &grid)| ImageSpan { span, grid })
+            .zip(&self.ats)
+            .map(|(span, a)| ImageSpan { span, grid: a.grid })
             .collect()
     }
 }
 
 /// One span's ranges: its positions in the call's ids, its values of [`SpanRows::rows`] and its
-/// entries of [`SpanRows::kinds`].
+/// entries of [`SpanRows::kinds`], and its image's token grid.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SpanAt {
     pub positions: Range<usize>,
     pub rows: Range<usize>,
     pub kinds: Range<usize>,
+    /// `(nx, ny)` of the image's plan: tokens along a line and lines
+    /// (`vision::GridPlan::span_grid` holds the order), recorded where the span is made, from the
+    /// image the span is of.
+    pub grid: (usize, usize),
 }
 
 /// [`SpanRows`] of `images`, encoded on `tower` in order and read back on `stream`, the stream the
@@ -919,8 +913,9 @@ impl Encoded {
 /// first `n_llm_h · n_llm_w · width` values kept (the tower writes one row of `width` a cell of
 /// the plan's grid; fewer is refused by name) and handed to `splice` with the patches, which
 /// returns the span's rows and the kind of each of its positions; their count is the image's
-/// `span_len`, refused by name when it is not. What a span adds around the cells' rows (V4.1's
-/// delimiters, none for a merger's tokens) is `splice`; the rest is the same for every tower.
+/// `span_len`, refused by name when it is not. The span records its image's own token grid
+/// ([`SpanAt::grid`]). What a span adds around the cells' rows (V4.1's delimiters, none for a
+/// merger's tokens) is `splice`; the rest is the same for every tower.
 pub fn span_rows_of<'a, K, E: Display>(
     images: impl IntoIterator<Item = Image<'a>>,
     width: usize,
@@ -959,6 +954,7 @@ pub fn span_rows_of<'a, K, E: Display>(
             positions: at..at + kinds.len(),
             rows: out.rows.len()..out.rows.len() + rows.len(),
             kinds: out.kinds.len()..out.kinds.len() + kinds.len(),
+            grid: patches.plan.span_grid(),
         });
         out.rows.extend(rows);
         out.kinds.extend(kinds);
@@ -1876,7 +1872,7 @@ mod tests {
     }
 
     /// The two spans of a merged call as `ImageSpan`s: the same positions over the same values as
-    /// the plain spans, each with the grid the caller gave it.
+    /// the plain spans, each with the grid of its own image.
     #[test]
     fn image_spans_are_the_media_spans_with_each_spans_grid() {
         let (a, b) = (patches(1, 2), patches(2, 1));
@@ -1893,7 +1889,7 @@ mod tests {
             },
         ];
         let got = span_rows_of(images, W, ramp, merged_cells).unwrap();
-        let spans = got.image_spans(&[(2, 1), (1, 2)]);
+        let spans = got.image_spans();
         assert_eq!(spans.len(), 2);
         assert_eq!((spans[0].span.at.clone(), spans[0].grid), (3..5, (2, 1)));
         assert_eq!((spans[1].span.at.clone(), spans[1].grid), (9..11, (1, 2)));
@@ -1902,19 +1898,36 @@ mod tests {
         assert_eq!(spans[1].span.rows, plain[1].rows);
     }
 
-    /// A grid count that is not the span count is a named panic, never a span spliced without its
-    /// grid.
+    /// Two images of equal area whose grids are each other's transpose: a span takes the grid of
+    /// its own image, `(nx, ny)` = `(n_llm_w, n_llm_h)`, in feed order. A swapped pair, or a span
+    /// given another image's grid, still holds `nx · ny` positions, so `ImageSpan::check` passes it.
     #[test]
-    #[should_panic(expected = "image_spans: 0 grids for 1 spans")]
-    fn image_spans_refuse_a_span_without_a_grid() {
-        let a = patches(1, 2);
-        let image = Image {
-            at: 3,
-            patches: &a,
-            span_len: 2,
-        };
-        let got = span_rows_of([image], W, ramp, merged_cells).unwrap();
-        let _ = got.image_spans(&[]);
+    fn equal_area_images_keep_their_own_swapped_grids_in_feed_order() {
+        let (a, b) = (patches(2, 3), patches(3, 2));
+        let images = [
+            Image {
+                at: 3,
+                patches: &a,
+                span_len: 6,
+            },
+            Image {
+                at: 12,
+                patches: &b,
+                span_len: 6,
+            },
+        ];
+        let got = span_rows_of(images, W, ramp, merged_cells).unwrap();
+        let spans = got.image_spans();
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0].grid, a.plan.span_grid());
+        assert_eq!(spans[1].grid, b.plan.span_grid());
+        assert_eq!([spans[0].grid, spans[1].grid], [(3, 2), (2, 3)]);
+        assert!(spans.iter().all(|s| s.grid.0 * s.grid.1 == s.span.at.len()));
+        assert_eq!(
+            ImageSpan::rows_of(0, &spans),
+            [(3, 3, 2), (12, 2, 3)],
+            "the rotation table's (first row, nx, ny)"
+        );
     }
 
     /// A span that adds rows around the tower's: a Start row of 9s, each grid row's cells and a
@@ -1964,12 +1977,14 @@ mod tests {
                 SpanAt {
                     positions: 5..13,
                     rows: 0..8 * W,
-                    kinds: 0..8
+                    kinds: 0..8,
+                    grid: (2, 2)
                 },
                 SpanAt {
                     positions: 20..26,
                     rows: 8 * W..14 * W,
-                    kinds: 8..14
+                    kinds: 8..14,
+                    grid: (3, 1)
                 },
             ]
         );
