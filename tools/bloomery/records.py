@@ -470,7 +470,41 @@ def sample_line(kind):
     return "".join(out)
 
 
+# The start screen (crates/serve/src/screen.rs) is drawn from the record lines a seat printed; its goldens
+# render these fixed starts. Each record the screen shows, by the seat's kinds, must be in its start once and
+# read whole, so a kind that moves leaves the fixture (and the screen's golden) red instead of the screen
+# quietly dropping its row. `parallel` and the Qwen3.8 `load` and `cache` lines are no kind: bind.rs's
+# `the_parallel_line_names_the_shape_of_a_round` holds the first to its fixture line.
+SCREEN_STARTS = [
+    ("screen-start.log", "bloomery-serve-ds41",
+     ["place_unset", "plan", "cache_config", "load_generator", "listening"]),
+    ("screen-start-qwen38.log", "bloomery-serve-qwen38",
+     ["place_unset", "plan38", "nvtier", "listening38"]),
+]
+
+
+def screen_start_gaps(text, bin_name, kinds):
+    """What is wrong with a screen fixture `text` of `bin_name`: each of `kinds` not once, or read loose."""
+    recs = read(text.splitlines(), bin_name)
+    gaps = []
+    for k in kinds:
+        got = [r for r in recs if r.kind == k]
+        if len(got) != 1 or got[0].loose:
+            gaps.append(f"{k}: {len(got)} records{' (read loose)' if any(r.loose for r in got) else ''}")
+    return gaps
+
+
 def self_test():
+    root = SCHEMA_DIR.parent.parent.parent
+    fixtures = root / "crates" / "serve" / "tests" / "fixtures"
+    for name, bin_name, kinds in SCREEN_STARTS:
+        text = (fixtures / name).read_text()
+        assert screen_start_gaps(text, bin_name, kinds) == [], (name, screen_start_gaps(text, bin_name, kinds))
+    # a field that moved in a kind leaves the fixture's line unread by it: named, not passed
+    name, bin_name, kinds = SCREEN_STARTS[0]
+    moved = (fixtures / name).read_text().replace(" card_experts=", " card_xp=")
+    assert screen_start_gaps(moved, bin_name, kinds) == ["plan: 1 records (read loose)"], \
+        screen_start_gaps(moved, bin_name, kinds)
     schema = load(DEFAULT_BIN)
     for k in schema.kinds:
         line = sample_line(k)
@@ -502,7 +536,6 @@ def self_test():
     assert kept.getvalue().splitlines() == [reset, step, "load resident_bytes=1", "tokens extra"], kept.getvalue()
     # refresh checks every file before it writes one: a marker no record follows refuses the whole
     # stdin by name, the schema and the earlier marker's file included, and nothing is returned
-    root = SCHEMA_DIR.parent.parent.parent
     plan = ["#> tools/flow/plans/a.rec generate_ds41 --plan --depth 1", reset, "a line of no kind"]
     good = ['{"records":1,"bin":"generate_ds41","kinds":1}', '{"kind":"residency_reset"}'] + plan
     writes = refresh_writes(good, schema, root)

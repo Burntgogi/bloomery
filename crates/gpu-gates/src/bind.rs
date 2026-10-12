@@ -3354,6 +3354,23 @@ mod tests {
             parallel_text(2, 4096, SlotsFrom::Flag, Pass::One),
             "parallel rule=slots slots=2 slot_ctx=4096 total=8192 from=flag pass=one"
         );
+        // The line is no record kind; the start screen (`serve::screen`)
+        // reads it by key, and its fixed starts carry it as printed.
+        for (start, line) in [
+            (
+                include_str!("../../serve/tests/fixtures/screen-start.log"),
+                parallel_text(2, 16384, SlotsFrom::Default, Pass::One),
+            ),
+            (
+                include_str!("../../serve/tests/fixtures/screen-start-qwen38.log"),
+                parallel_text(1, 8192, SlotsFrom::Ctx, Pass::One),
+            ),
+        ] {
+            assert!(
+                start.lines().any(|l| l == line),
+                "the screen's fixed start lacks `{line}`"
+            );
+        }
     }
 
     /// The slot count and its word: `--parallel` as given, one slot at the
