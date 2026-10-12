@@ -169,16 +169,25 @@ mod gate {
                 serving_place: true,
                 ..ResidencyAt::FIXED
             });
-            let pick = bloomery_gpu_gates::residency::at_plan(&plan, 0, unset)?;
+            let pick = bloomery_gpu_gates::residency::at_plan(
+                <Body as bloomery_gpu::model::ChainBody>::UNHOSTED_POOL,
+                &plan,
+                0,
+                unset,
+            )?;
             Ok((pick.word.to_string(), pick.why.name()))
         }
 
         /// The rule is `residency_at_plan` (`crates/levers/src/lib.rs:1379`) on the serving word, through
         /// `room_for` (`:1279`). A routed stack the card holds whole puts its experts past P in the churn pool
         /// (`crates/placement/src/placement/churn.rs:46-49`) against a headroom the split's floor leaves near 0:
-        /// `host_short`. A plan whose every card-expert layer pages has an empty pool and keeps the word.
+        /// `pool_unhostable`, the V4.1 body hosting its pool (`ChainBody::UNHOSTED_POOL`). A plan whose every
+        /// card-expert layer pages has an empty pool and keeps the word.
         fn expected_residency(&self, plan: &PlanFacts) -> Unset {
-            Unset::serving(&plan.room)
+            Unset::serving(
+                &plan.room,
+                <Body as bloomery_gpu::model::ChainBody>::UNHOSTED_POOL,
+            )
         }
 
         fn refusals(&self, paged: Arm, _slots: u64) -> Vec<Refusal<'_>> {

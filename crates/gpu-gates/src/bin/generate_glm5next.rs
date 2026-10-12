@@ -346,8 +346,16 @@ mod cli {
             self.top_k = inputs.hp.indexer.top_k;
             if let Some((r, word)) = self.residency {
                 residency_room(plan, r, word).map_err(SessionError::Caller)?;
-                residency_set(plan, GLM_CARD, r, word, self.beside, Record::print)
-                    .map_err(SessionError::Caller)?;
+                residency_set(
+                    plan,
+                    GLM_CARD,
+                    r,
+                    bloomery_levers::ChurnHosting::Hosted,
+                    word,
+                    self.beside,
+                    Record::print,
+                )
+                .map_err(SessionError::Caller)?;
             }
             Ok(!self.stop_at_plan)
         }

@@ -44,12 +44,15 @@
 //! ([`PassReport::faulting`]). The
 //! load puts each layer's churn pool — its stage card experts past the
 //! pinned ones ([`ChurnPool`]) — in the set
-//! ([`crate::model::GpuModel::load_placed_with`]).
+//! ([`crate::model::GpuModel::load_placed_with`]): read in with it where
+//! [`ResidencySpec::pool`] says hosted, else known only, so that each victim
+//! of it is read back from the mapping by the prepare.
 
 use std::ops::Range;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use bloomery_levers::ChurnHosting;
 use cuda_core::{CudaContext, CudaStream, sys};
 use gguf::Split;
 use gguf::quant::GgmlType;
@@ -336,6 +339,9 @@ pub struct ResidencySpec {
     /// The lever's value ([`Residency::parse`]): `off`, or the rule's `mid`
     /// parameters with the pinned seed experts a layer.
     pub lever: Residency,
+    /// Whether the load's host set holds the churn pool or only knows it,
+    /// as the word's resolution decided ([`ChurnHosting`]).
+    pub pool: ChurnHosting,
     /// Passes from the boundary that makes a flip to the one it lands at.
     pub delay: u64,
     /// The bound on every host wait the machine makes.

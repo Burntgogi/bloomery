@@ -1060,7 +1060,12 @@ mod gate {
                 prefill_steps,
             })
         };
-        let serving = residency::at_plan(&plan, 0, at(true, false))?;
+        let serving = residency::at_plan(
+            <Body as bloomery_gpu::model::ChainBody>::UNHOSTED_POOL,
+            &plan,
+            0,
+            at(true, false),
+        )?;
         record::residency_lever(serving).print();
         if let Some(d) = serving.why.detail() {
             println!("{d}");
@@ -1071,8 +1076,18 @@ mod gate {
                 serving.why,
                 ResidencyWhy::Place | ResidencyWhy::Shrunk { .. }
             );
-        let fixed = residency::at_plan(&plan, 0, at(false, false))?;
-        let steps = residency::at_plan(&plan, 0, at(true, true))?;
+        let fixed = residency::at_plan(
+            <Body as bloomery_gpu::model::ChainBody>::UNHOSTED_POOL,
+            &plan,
+            0,
+            at(false, false),
+        )?;
+        let steps = residency::at_plan(
+            <Body as bloomery_gpu::model::ChainBody>::UNHOSTED_POOL,
+            &plan,
+            0,
+            at(true, true),
+        )?;
         let off = (fixed.word, fixed.why) == ("off", ResidencyWhy::FixedPlace)
             && (steps.word, steps.why) == ("off", ResidencyWhy::PrefillSteps);
         println!(

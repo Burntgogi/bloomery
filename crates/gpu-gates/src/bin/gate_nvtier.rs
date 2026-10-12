@@ -252,7 +252,7 @@ use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::residency38::{CARD38, Lever38, residency38};
 use bloomery_gpu_gates::{Fnv1a64, GateError, checks_failed, data_dir, exit_with, verdict};
 use bloomery_levers::{
-    CARD_DONTNEED, HOST_LOCK, HOST_POPULATE, HOST_ROOM, HostCfg, RESIDENCY38_SPARES,
+    CARD_DONTNEED, ChurnHosting, HOST_LOCK, HOST_POPULATE, HOST_ROOM, HostCfg, RESIDENCY38_SPARES,
 };
 use gguf::Split;
 use model::arch::qwen35moe::place::{Experts, PlanInputs, machine_for_experts};
@@ -677,7 +677,17 @@ fn arm(
         )
         .into());
     }
-    let model = Body38::open_placed_residency(file, &plan, &inputs, 0, host, ub, residency, 1)?;
+    let model = Body38::open_placed_residency(
+        file,
+        &plan,
+        &inputs,
+        0,
+        host,
+        ub,
+        residency,
+        ChurnHosting::Hosted,
+        1,
+    )?;
     let mut s = Session::from_model(model, CTX as u32);
     s.model_mut().body_parts(NAME)?.2.log_residency(0);
     // `split`: the load's cut, then the rule's split asked of it, the cut set
@@ -1073,14 +1083,20 @@ fn stepunion_arm(
     // subject is the step port's union, so no lane fills the arena and only
     // the step claims can; the unset rule's `mid-p0-s1` is the `stepunion mid`
     // arm's.
-    let residency = residency38(&plan, Lever38::Set(Residency::Off, "off"), Record::print)?;
+    let (residency, pool) = residency38(
+        <Body38 as bloomery_gpu::model::ChainBody>::UNHOSTED_POOL,
+        &plan,
+        Lever38::Set(Residency::Off, "off"),
+        Record::print,
+    )?;
     println!(
         "stepunion plan: two slots at the room {ROOM} B page {} B on the NVMe tier, arena {} B, \
          residency off (set: the clause judges the step port's union, not the default)",
         plan.host.nvme_expert_bytes, plan.host.nvme_arena_bytes
     );
     let ub = ubatch_for(CTX)?;
-    let model = Body38::open_placed_residency(file, &plan, &inputs, 0, host, ub, residency, 2)?;
+    let model =
+        Body38::open_placed_residency(file, &plan, &inputs, 0, host, ub, residency, pool, 2)?;
     let mut s = Session::from_model(model, CTX as u32);
     s.add_slots(2)?;
     let tier = s
@@ -1217,7 +1233,17 @@ fn floor_arm(
         return Err("the floor arm's plan pages no routed expert on the NVMe tier".into());
     }
     plan.host.nvme_arena_bytes = arena;
-    let model = Body38::open_placed_residency(file, &plan, &inputs, 0, host, ub, residency, 1)?;
+    let model = Body38::open_placed_residency(
+        file,
+        &plan,
+        &inputs,
+        0,
+        host,
+        ub,
+        residency,
+        ChurnHosting::Hosted,
+        1,
+    )?;
     let mut s = Session::from_model(model, CTX as u32);
     let tier = s
         .model()
@@ -1275,14 +1301,20 @@ fn slots_mid_arm(
         )
         .into());
     }
-    let residency = residency38(&plan, Lever38::Set(MID, "mid-p0-s1"), Record::print)?;
+    let (residency, pool) = residency38(
+        <Body38 as bloomery_gpu::model::ChainBody>::UNHOSTED_POOL,
+        &plan,
+        Lever38::Set(MID, "mid-p0-s1"),
+        Record::print,
+    )?;
     println!(
         "stepunion mid plan: two slots, the {kind} plan: {} B on the NVMe tier, arena {} B, \
          residency the set mid-p0-s1",
         plan.host.nvme_expert_bytes, plan.host.nvme_arena_bytes
     );
     let ub = ubatch_for(CTX)?;
-    let model = Body38::open_placed_residency(file, &plan, &inputs, 0, host, ub, residency, 2)?;
+    let model =
+        Body38::open_placed_residency(file, &plan, &inputs, 0, host, ub, residency, pool, 2)?;
     let mut s = Session::from_model(model, CTX as u32);
     s.add_slots(2)?;
     s.model_mut().body_parts(NAME)?.2.log_residency(0);
@@ -1874,7 +1906,12 @@ fn run() -> Result<(), GateError> {
     );
     let plan = inputs.plan_with(&machine, CTX as u64, &PlanLevers::default(), Experts::Card)?;
     if let Some(role) = &role {
-        let residency = residency38(&plan, Lever38::Set(MID, "mid-p0-s1"), Record::print)?;
+        let (residency, _) = residency38(
+            <Body38 as bloomery_gpu::model::ChainBody>::UNHOSTED_POOL,
+            &plan,
+            Lever38::Set(MID, "mid-p0-s1"),
+            Record::print,
+        )?;
         return grant_child(
             role,
             path,
@@ -1889,7 +1926,12 @@ fn run() -> Result<(), GateError> {
 
     // `residency` (clause 5): the unset rule on the paged plan resolves
     // `mid-p0-s1`, the family's own word.
-    let unset = residency38(&plan, Lever38::Unset(None), Record::print)?;
+    let (unset, _) = residency38(
+        <Body38 as bloomery_gpu::model::ChainBody>::UNHOSTED_POOL,
+        &plan,
+        Lever38::Unset(None),
+        Record::print,
+    )?;
     let unset_mid = unset == MID;
     println!(
         "residency: the unset rule on the paged plan resolves {}: {}",
@@ -1903,7 +1945,12 @@ fn run() -> Result<(), GateError> {
     pass &= unset_mid;
     // The residency word both arms run: a set `mid-p0-s1`, so the paged
     // arm's flips, the seam and a lane's drops stay held.
-    let residency = residency38(&plan, Lever38::Set(MID, "mid-p0-s1"), Record::print)?;
+    let (residency, _) = residency38(
+        <Body38 as bloomery_gpu::model::ChainBody>::UNHOSTED_POOL,
+        &plan,
+        Lever38::Set(MID, "mid-p0-s1"),
+        Record::print,
+    )?;
     // `room`'s plan terms: the host need, the churn pool the residency
     // holds beside it, and the headroom the split left.
     // PIN(2026-10-09): `HostNeed::bytes` counts the plan's NVMe tier arena,

@@ -105,7 +105,7 @@ use crate::site::{self, Order, file_site};
 use crate::tensor::window;
 use crate::weights::Weights;
 use crate::{Gpu, GpuError, launch_u32};
-use bloomery_levers::HostCfg;
+use bloomery_levers::{ChurnHosting, HostCfg};
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::Split;
 use model::arch::Arch;
@@ -1287,6 +1287,7 @@ impl GpuModel<Body35> {
         let carded = SlotMap::of_plan(plan, 0, None, 0..n_layers, n_expert)?;
         let residency = ResidencySpec {
             lever: residency,
+            pool: ChurnHosting::Hosted,
             delay: LIVE_DELAY,
             deadline: DEADLINE,
             top_k,
@@ -2551,6 +2552,7 @@ impl MediaBody for Body35 {
 impl ChainBody for Body35 {
     type Input = DecodeInput35;
     type Host = Placed;
+    const UNHOSTED_POOL: bloomery_levers::UnhostedPool = bloomery_levers::UnhostedPool::NotCarried;
 
     fn arch() -> Arch {
         Arch::Qwen35moe

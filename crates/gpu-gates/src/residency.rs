@@ -10,7 +10,7 @@
 
 use crate::GateError;
 use crate::residency38::mem_left_38;
-use bloomery_levers::{ResidencyPick, residency_at_plan};
+use bloomery_levers::{ResidencyPick, UnhostedPool, residency_at_plan};
 use model::placement::churn::ChurnPool;
 use model::placement::workstation::{HostNeed, host_available};
 use model::placement::{PlacementError, Plan};
@@ -66,15 +66,19 @@ impl<'p, 'm> PlanRoom<'p, 'm> {
 /// `BLOOMERY_RESIDENCY` against `plan` on the pair rule
 /// ([`residency_at_plan`]): `pick` as it is unless it is the serving word
 /// the plan has not yet seen, which the plan's card slots, host headroom and
-/// `MemAvailable` then keep, move or turn `off` with why. The churn pool's
-/// bytes are card `card`'s.
+/// `MemAvailable` then keep, move or turn `off` with why, as the loading
+/// body carries an unhosted pool or not (`carry`, its `ChainBody::UNHOSTED_POOL`;
+/// a value, so this module reaches no body). The churn pool's bytes are card
+/// `card`'s.
 pub fn at_plan(
+    carry: UnhostedPool,
     plan: &Plan<'_>,
     card: usize,
     pick: ResidencyPick,
 ) -> Result<ResidencyPick, GateError> {
     let room = PlanRoom::new(plan, card, 0);
     Ok(residency_at_plan(
+        carry,
         pick,
         room.card_experts(),
         |pinned| room.pool_bytes(pinned),

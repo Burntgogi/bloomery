@@ -47,7 +47,7 @@ use crate::hybrid::{Chain, HostResidency, Refusal, name_refusal};
 use crate::watchdog;
 use crate::weights::Weights;
 use crate::{Gpu, GpuError, Graph, NodeInfo};
-use bloomery_levers::HostCfg;
+use bloomery_levers::{ChurnHosting, HostCfg};
 use cuda_core::CudaStream;
 use gguf::Split;
 use model::arch::Arch;
@@ -83,6 +83,13 @@ pub trait ChainBody: Sized {
     /// the body itself when its chain can hold host work, [`NoHost`] when it
     /// runs on the card alone.
     type Host: HostServed;
+
+    /// Whether this body's residency load takes a churn pool it does not
+    /// host ([`bloomery_levers::ChurnHosting::Unhosted`] reaching its
+    /// [`ResidencySpec`]): an unset residency word's resolution reads it
+    /// ([`bloomery_levers::room_for`]), so a body that does not carry the
+    /// pool keeps the rule that raises P until the pool fits.
+    const UNHOSTED_POOL: bloomery_levers::UnhostedPool;
 
     /// The architecture this body is the chain of.
     fn arch() -> Arch;
@@ -667,7 +674,7 @@ impl<B: ChainBody> GpuModel<B> {
         derive: impl FnOnce(&CudaStream, &Split, Range<usize>, &mut Weights) -> Result<(), GpuError>,
         body: impl FnOnce(&Gpu, Split, &Weights, HostResidency) -> Result<B, GpuError>,
     ) -> Result<GpuModel<B>, GpuError> {
-        let (p, residency) = placed_pre(&file, plan, card, host, (&[], 0), derive)?;
+        let (p, residency) = placed_pre(&file, plan, card, host, (&[], 0), &[], derive)?;
         let t_body = Instant::now();
         let body = body(&p.gpu, file, &p.weights, residency)?;
         placed_done(p, body, t_body.elapsed())
@@ -737,14 +744,20 @@ impl<B: ChainBody> GpuModel<B> {
             }
         };
         // The host set holds `hosted` beside the plan's own segments, out of
-        // the same headroom the pool must fit.
+        // the same headroom a hosted pool must fit; a pool the set only
+        // knows takes none of it.
         if let Some(p) = &churn {
-            p.check_beside(plan, hosted.1)
-                .map_err(|e| GpuError::plan(WHAT, e))?;
+            match residency.pool {
+                ChurnHosting::Hosted => p.check_beside(plan, hosted.1),
+                ChurnHosting::Unhosted => p.check_known_beside(plan, hosted.1),
+            }
+            .map_err(|e| GpuError::plan(WHAT, e))?;
         }
-        let pool = churn
-            .as_ref()
-            .map_or((&[][..], 0), |p| (p.runs.as_slice(), p.bytes));
+        let runs = churn.as_ref().map_or(&[][..], |p| p.runs.as_slice());
+        let (pool, known) = match residency.pool {
+            ChurnHosting::Hosted => ((runs, churn.as_ref().map_or(0, |p| p.bytes)), &[][..]),
+            ChurnHosting::Unhosted => ((&[][..], 0), runs),
+        };
         let joined: Vec<(usize, ExpertList)>;
         let extra = if hosted.0.is_empty() {
             pool
@@ -753,7 +766,7 @@ impl<B: ChainBody> GpuModel<B> {
             (&joined[..], pool.1 + hosted.1)
         };
         let file = Arc::new(file);
-        let (p, set) = placed_pre(&file, plan, card, host, extra, derive)?;
+        let (p, set) = placed_pre(&file, plan, card, host, extra, known, derive)?;
         let t_body = Instant::now();
         let glue = match residency.lever {
             Residency::Off => ResidencyGlue::off(),
@@ -1812,7 +1825,9 @@ where
 /// card's weights with `derive`'s filings, and — after the uploads, so the
 /// card's file bytes have left the page cache first — the plan's host set
 /// read in and locked as `host` asks, with `extra`'s runs (of `extra`'s
-/// bytes) beside it. The pieces, and the host set. Every placed load passes
+/// bytes) beside it and `known`'s runs known, neither read in nor locked nor
+/// counted ([`HostResidency::at_load_with`]). The pieces, and the host set.
+/// Every placed load passes
 /// here, so the two refusals before any upload are made once: a plan's card
 /// that is not one visible device ([`Gpu::open_card`]), and a
 /// host whose `MemAvailable` is under the plan's need ([`HostNeed`]).
@@ -1822,6 +1837,7 @@ fn placed_pre(
     card: usize,
     host: HostCfg,
     extra: (&[(usize, ExpertList)], u64),
+    known: &[(usize, ExpertList)],
     derive: impl FnOnce(&CudaStream, &Split, Range<usize>, &mut Weights) -> Result<(), GpuError>,
 ) -> Result<(PlacedPre, HostResidency), GpuError> {
     let what = "GpuModel::load_placed";
@@ -1861,7 +1877,7 @@ fn placed_pre(
     let derived = t.elapsed();
     let t = Instant::now();
     let residency =
-        HostResidency::at_load_with(file, plan, |_| true, host, extra)?.with_arena(grant);
+        HostResidency::at_load_with(file, plan, |_| true, host, extra, known)?.with_arena(grant);
     let host_set = t.elapsed();
     Ok((
         PlacedPre {

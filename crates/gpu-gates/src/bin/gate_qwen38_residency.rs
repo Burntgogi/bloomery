@@ -276,7 +276,15 @@ mod gate {
         }
         let plan = plan_of(inputs, &machine)?;
         Ok(Body38::open_placed_residency(
-            file, &plan, inputs, 0, host, ub, residency, 1,
+            file,
+            &plan,
+            inputs,
+            0,
+            host,
+            ub,
+            residency,
+            bloomery_levers::ChurnHosting::Hosted,
+            1,
         )?)
     }
 
@@ -1369,7 +1377,17 @@ mod gate {
         let residency = residency_of(&plan)
             .ok_or("the two-slot plan's card experts leave the machine no room")?;
         let mut s = Session::from_model(
-            Body38::open_placed_residency(file, &plan, inputs, 0, host, ub, residency, 2)?,
+            Body38::open_placed_residency(
+                file,
+                &plan,
+                inputs,
+                0,
+                host,
+                ub,
+                residency,
+                bloomery_levers::ChurnHosting::Hosted,
+                2,
+            )?,
             CTX as u32,
         );
         let b = s.model_mut().body_parts(NAME)?.2;

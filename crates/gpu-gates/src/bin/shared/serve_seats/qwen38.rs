@@ -367,8 +367,8 @@ use bloomery_gpu_gates::residency38::{
 };
 use bloomery_gpu_gates::{GateError, gpu_census, ref_model_path};
 use bloomery_levers::{
-    Draft38At, Draft38Off, Paged, Residency38At, ResidencyPick, ResidencyWhy, draft38_unset,
-    residency38_unset,
+    ChurnHosting, Draft38At, Draft38Off, Paged, Residency38At, ResidencyPick, ResidencyWhy,
+    draft38_unset, residency38_unset,
 };
 use cuda_core::sys;
 use gguf::Split;
@@ -845,12 +845,17 @@ fn residency38_at(
     plan: &Plan<'_>,
     (place, feed): (Place38, Feed38),
     set: Option<(Residency, &str)>,
-) -> Result<Residency, GateError> {
+) -> Result<(Residency, ChurnHosting), GateError> {
     let lever = match set {
         Some((r, word)) => Lever38::Set(r, word),
         None => Lever38::Unset(residency38_unset(feed.residency_at(place))),
     };
-    residency38(plan, lever, Record::eprint)
+    residency38(
+        <Body38 as bloomery_gpu::model::ChainBody>::UNHOSTED_POOL,
+        plan,
+        lever,
+        Record::eprint,
+    )
 }
 
 /// The plans the seat can load, by context: the file's inputs at `place`
@@ -960,8 +965,14 @@ impl Plans<'_> {
             Some((r, word)) => Lever38::Set(r, word),
             None => Lever38::Unset(residency38_unset(self.feed.residency_at(self.place))),
         };
-        let pool = match residency38(&plan, lever, |_| {})? {
-            Residency::Mid { pinned, .. } => {
+        // An unhosted pool takes no host bytes: the load only knows it.
+        let pool = match residency38(
+            <Body38 as bloomery_gpu::model::ChainBody>::UNHOSTED_POOL,
+            &plan,
+            lever,
+            |_| {},
+        )? {
+            (Residency::Mid { pinned, .. }, ChurnHosting::Hosted) => {
                 ChurnPool::of(&plan, CARD38, pinned)
                     .map_err(|e| format!("the churn pool: {e}"))?
                     .bytes
@@ -1840,7 +1851,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     line.csv("devices", record::plan_devices(&machine))
         .w("cuda_order", record::cuda_order())
         .eprint();
-    let residency = residency38_at(&plan, (a.place, feed), set)?;
+    let (residency, pool) = residency38_at(&plan, (a.place, feed), set)?;
     if a.plan_only {
         // The records before the load are out; nothing was loaded and the
         // route trace's directory is not made.
@@ -1890,6 +1901,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         draft_bytes,
         draft_off,
         residency,
+        pool,
         feed: feed.prompt,
         trace,
         xstream: levers.xstream(),
@@ -2036,6 +2048,9 @@ struct SeatArgs {
     draft_off: Option<Draft38Off>,
     /// The residency the load runs ([`residency38`]).
     residency: Residency,
+    /// Whether the load hosts the residency's churn pool, as the word's
+    /// resolution decided ([`residency38`]).
+    pool: ChurnHosting,
     /// How the session feeds a prompt call: [`Prompt38::Step`] (one captured
     /// step an id) or [`Prompt38::Auto`].
     feed: Prompt38,
@@ -2168,6 +2183,7 @@ impl Q38 {
                     a.host,
                     ub,
                     a.residency,
+                    a.pool,
                     a.slots,
                 )?
             }
@@ -2202,6 +2218,7 @@ impl Q38 {
                     &draft,
                     &mtp,
                     a.residency,
+                    a.pool,
                     a.slots,
                 )?
             }

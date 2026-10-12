@@ -102,7 +102,7 @@ use bloomery_gpu_deepseek41::chain::ffn::FfnKernels;
 use bloomery_gpu_deepseek41::experts::ExpertKernels;
 use bloomery_gpu_deepseek41::hc::{HC_MIX, HC_PIECE, HC_STREAMS, HcKernels, HcPreScratch};
 use bloomery_gpu_deepseek41::router::glm5next::{N_EXPERT, N_USED, RouterKernels, RouterOut};
-use bloomery_levers::HostCfg;
+use bloomery_levers::{ChurnHosting, HostCfg};
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::Split;
 use model::arch::Arch;
@@ -1343,6 +1343,7 @@ impl Body {
         // The most rows one pass runs: the load's rows in flight.
         let spec = ResidencySpec {
             lever: residency,
+            pool: ChurnHosting::Hosted,
             delay: swap::LIVE_DELAY,
             deadline: swap::DEADLINE,
             top_k: N_USED,
@@ -1454,6 +1455,7 @@ impl Body {
         let map_layers = host_run(&inputs.spec.layers, Some(nextn.index))?.len();
         let spec = ResidencySpec {
             lever: residency,
+            pool: ChurnHosting::Hosted,
             delay: swap::LIVE_DELAY,
             deadline: swap::DEADLINE,
             top_k: N_USED,
@@ -2280,6 +2282,7 @@ fn store(
 impl ChainBody for Body {
     type Input = StepInput;
     type Host = Body;
+    const UNHOSTED_POOL: bloomery_levers::UnhostedPool = bloomery_levers::UnhostedPool::NotCarried;
 
     fn arch() -> Arch {
         Arch::Glm5next

@@ -88,7 +88,7 @@ use bloomery_gpu::hybrid::{
 use bloomery_gpu::model::{ChainBody, HostServed, Rollback, Rows};
 use bloomery_gpu::weights::Weights;
 use bloomery_gpu::{DeviceTensor, Gpu, GpuError, GpuModel, PartedBuffer, capturing, window};
-use bloomery_levers::{HostCfg, ResidencyAt};
+use bloomery_levers::{ChurnHosting, HostCfg, ResidencyAt};
 use cuda_core::{CudaStream, DeviceBuffer, DeviceCopy, IntoResult, PinnedHostBuffer, sys};
 use gguf::Split;
 use model::arch::Arch;
@@ -2378,6 +2378,7 @@ impl Body {
         let tiered = !tiers.is_empty();
         let residency = ResidencySpec {
             lever: meta.levers.residency,
+            pool: ChurnHosting::Hosted,
             delay: swap::LIVE_DELAY,
             deadline: swap::DEADLINE,
             top_k: meta.hp.experts.n_used,
@@ -2648,6 +2649,7 @@ fn open_tier(
 impl ChainBody for Body {
     type Input = StepInput;
     type Host = Body;
+    const UNHOSTED_POOL: bloomery_levers::UnhostedPool = bloomery_levers::UnhostedPool::NotCarried;
 
     fn arch() -> Arch {
         Arch::Deepseek41
