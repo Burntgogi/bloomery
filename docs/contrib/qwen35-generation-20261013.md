@@ -1,7 +1,8 @@
 # Dense Qwen generation through the native Qwen seat
 
-This is a contributor draft against `midagedev/bloomery` main at
-`1cba970783dc97f735d4320d35f4cbae2ce5e935`. It connects dense `qwen35`
+The initial contributor draft was against `midagedev/bloomery` main at
+`1cba970783dc97f735d4320d35f4cbae2ce5e935`; the follow-up rebases it onto
+`eb186d979602a3e150967541ffb86bfea157866b` (verification below). It connects dense `qwen35`
 files to the existing CUDA Body35 generation path. The contributor machine
 has an RX 7900 GRE (gfx1100), not an NVIDIA GPU. Host checks passed; a CUDA
 binary build, device loading, generated tokens and serving performance are
@@ -126,3 +127,16 @@ MTP and media out of the first text clause; verify them separately if added.
 Only after correctness passes should the repository's timing runners
 measure native serving against llama.cpp and Strata under matched model
 bits, placement, context and request concurrency.
+
+## Rebase verification
+
+The follow-up rebases this draft onto upstream main `eb186d979602a3e150967541ffb86bfea157866b`.
+The Qwen seat retains main's common `SERVE_RULE`, arm screening and load phase timing. Its load
+record still uses the file's actual architecture. The gate-path merge keeps main's added consumers
+and the draft's shape test consumers. No kernel admission guard or numerical band was relaxed.
+
+Host checks pass: 254 model tests, 106 gpu-gates library tests, five probe helper tests, 22 model-shape
+tests and 56 decision tests. The two native frontends and admission example pass static check and
+clippy with warnings denied. The real mixed-IQ 27B file still produces the expected admission
+refusal: 314 coverage items and 15 unused MTP tensors. This is host/static evidence; CUDA codegen,
+device loading, generated tokens and NVIDIA serving gates remain unverified.
