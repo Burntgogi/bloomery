@@ -408,7 +408,9 @@ impl Server {
     /// Serves until the listener fails, the engine does, or the server is
     /// asked to stop, and returns why. An orderly stop never returns: it ends
     /// the process inside [`exit_shutdown`], so every seat's
-    /// `Ok(server.run())` is the error paths' alone.
+    /// `Ok(server.run())` is the error paths' alone. Once the listener
+    /// serves, the start screen is drawn when a seat armed it
+    /// ([`crate::screen`]).
     pub fn run(self) -> ServeError {
         // The signals are installed before the listener serves: from the
         // first answer on, Ctrl+C or a kill stops the server the orderly way.
@@ -424,6 +426,7 @@ impl Server {
             Ok(s) => s,
             Err(e) => return ServeError::Io(e),
         };
+        crate::screen::draw();
         // `state` holds a sender, so the channel cannot close while we wait.
         match wait_end(&ended, state.fatal_linger) {
             Ended::Error(e) => e,

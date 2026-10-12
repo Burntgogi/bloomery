@@ -174,8 +174,8 @@ use bloomery_gpu::arch::qwen3moe::{Body, Body35, KvQ8, Open35, Qwen35moeModel};
 use bloomery_gpu::model::{GpuModel, MAX_PASS_ROWS, Slots, StepMode};
 use bloomery_gpu::{Gpu, Qwen3moeModel};
 use bloomery_gpu_gates::bind::{
-    ChatSurface, Listen, Pass, Seat, SeatEngine, SlotStep, Vocab, bind_server, default_slots_fit,
-    note_line, parallel_line, slots_given,
+    ChatSurface, Listen, Pass, Seat, SeatEngine, SlotStep, Vocab, arm_screen, bind_server,
+    default_slots_fit, note_line, parallel_line, slots_given,
 };
 use bloomery_gpu_gates::generate::{CTX_GRAN, Place};
 use bloomery_gpu_gates::record::{self, Record};
@@ -1175,12 +1175,17 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     // A placed load (`--place`) acts on the placement's levers; set beside
     // an unplaced one, they are refused by name.
     let placed = args.iter().any(|a| a == "--place");
-    let mut acts_on = vec![bloomery_levers::QWEN3_KV, bloomery_levers::STEP_STATS];
+    let mut acts_on = vec![
+        bloomery_levers::QWEN3_KV,
+        bloomery_levers::STEP_STATS,
+        bloomery_levers::SCREEN,
+    ];
     if placed {
         acts_on.extend(q3place::PLACED_LEVERS);
     }
     let levers = bloomery_levers::at_main(&acts_on)?;
     record::at_main(NAME, record::BLOOMERY_SERVE_QWEN3);
+    arm_screen(levers.screen());
     let a = parse_args(args)?;
     let kv = cache_k(&a, &levers)?;
     let path = ref_model_path()?;

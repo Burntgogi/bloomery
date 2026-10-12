@@ -452,10 +452,24 @@ impl Record {
         println!("{}", self.line());
     }
 
-    /// The line on stderr.
+    /// The line on stderr, and to the [`tee`] when one is set.
     pub fn eprint(self) {
-        eprintln!("{}", self.line());
+        let line = self.line();
+        eprintln!("{line}");
+        if let Some(tee) = TEE.get() {
+            tee(&line);
+        }
     }
+}
+
+/// Where [`Record::eprint`] also hands each line, set once by [`tee`].
+static TEE: OnceLock<fn(&str)> = OnceLock::new();
+
+/// Hands every line [`Record::eprint`] prints from now on to `to` as well: a
+/// serving seat's start screen (`serve::screen`) when the seat armed it. A
+/// second call keeps the first.
+pub fn tee(to: fn(&str)) {
+    let _ = TEE.set(to);
 }
 
 // ---------------------------------------------------------------- the reader

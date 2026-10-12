@@ -694,7 +694,8 @@ impl DecideServer {
     /// Serves until the listener fails or the decider does, and returns why: the listener's
     /// error ([`ServeError::Io`]), or after [`FATAL_LINGER`], during which `/health` answers it,
     /// the decider's failure ([`ServeError::Engine`], its crash block), as the generative server
-    /// does.
+    /// does. Once the listener serves, the start screen is drawn when the seat armed it
+    /// ([`crate::screen`]).
     pub fn run(self) -> ServeError {
         let DecideServer {
             listener,
@@ -716,6 +717,7 @@ impl DecideServer {
         accept(listener, shared.end.clone(), move |stream| {
             keep_alive(stream, &conn.answers, |req, w| answer(&conn, req, w));
         });
+        crate::screen::draw();
         // `shared` holds a sender, so the channel cannot close while we wait.
         // An orderly stop never returns: it ends the process once the answers
         // in flight are written.

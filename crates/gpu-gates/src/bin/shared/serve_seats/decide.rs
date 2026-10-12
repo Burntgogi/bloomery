@@ -68,6 +68,7 @@ use bloomery_gpu::GpuError;
 use bloomery_gpu::arch::qwen3moe::ubatch::UBATCH;
 use bloomery_gpu::arch::qwen3moe::{Body35, PrefillPath, Qwen35moeModel};
 use bloomery_gpu::media::{ImageSpan, MediaBody, MediaSpan};
+use bloomery_gpu_gates::bind::arm_screen;
 use bloomery_gpu_gates::generate::Place;
 use bloomery_gpu_gates::record::{self, Kind, Record};
 use bloomery_gpu_gates::vision_seat::{self, EncoderSeat, PleImage, TextFacts};
@@ -666,8 +667,9 @@ fn head_files(from: Pick) -> Result<HeadFiles, GateError> {
 /// carries why the server ended. `hf` is the repo (`owner/name`) the model
 /// file came from under `--hf`: the model's name, else its file name.
 pub fn run(args: &[String], from: Pick, hf: Option<&str>) -> Result<ServeError, GateError> {
-    bloomery_levers::at_main(&[])?;
+    let levers = bloomery_levers::at_main(&[bloomery_levers::SCREEN])?;
     record::at_main(WHAT, KINDS);
+    arm_screen(levers.screen());
     let a = parse_args(args)?;
     let (row, head) = head_files(from)?;
     let model = ref_model_path()?;

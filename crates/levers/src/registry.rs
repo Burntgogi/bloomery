@@ -42,6 +42,7 @@ pub const GEN_SLOTS: &str = "BLOOMERY_GEN_SLOTS";
 pub const HOST_ROOM: &str = "BLOOMERY_HOST_ROOM";
 pub const NVTIER_BYTES: &str = "BLOOMERY_NVTIER_BYTES";
 pub const NVTIER_READ: &str = "BLOOMERY_NVTIER_READ";
+pub const SCREEN: &str = "BLOOMERY_SCREEN";
 
 /// The largest `BLOOMERY_PREFILL_GROUP`: the batches a V4.1 prompt group
 /// holds at most, which the body's buffers are sized for.
@@ -853,6 +854,25 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               resident sequences, runs each slot's window as the plain run's prompt call, prints \
               each slot's records in slot order, and refuses N ≥ 2 beside `BLOOMERY_DRAFT`, \
               `BLOOMERY_CHECK_FINITE`, `BLOOMERY_STEP_STATS` and `--logits`.",
+        site: Site::Parsed {
+            left: &[],
+            phase: Phase::Load,
+        },
+    },
+    LeverSpec {
+        name: SCREEN,
+        class: Class::C,
+        kind: Kind::OnOff,
+        default: Unset::Is("on"),
+        doc: "The start screen of `bloomery-serve` (`serve::screen`): `on` draws it on stderr \
+              once the server listens, a view for a person over the record lines the start \
+              printed (where the model went, its context and slots, the address); `off` \
+              leaves the record lines alone. It is drawn only when stderr is a terminal, so \
+              piped stderr never shows it, whatever this says. `NO_COLOR` (set and not empty) \
+              or `TERM=dumb` draws it without colour; `TERM=dumb` or a locale whose first set \
+              variable of `LC_ALL`, `LC_CTYPE` and `LANG` names no UTF-8 draws it in plain \
+              ASCII. Every seat of `bloomery-serve` acts on it, and so do the per-model \
+              binaries that are its seats.",
         site: Site::Parsed {
             left: &[],
             phase: Phase::Load,
