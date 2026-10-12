@@ -146,7 +146,7 @@ margin. With no measured gain past 2, the model gives it no workload term.
    (dims in `docs/research/modelspec-design.md:455-461`) and 52,224 B in q8_0. At ~700 GB/s each decode step saves
    46,080 B × D: 0.27 ms at D 4,096, 1.08 ms at 16,384 and 2.16 ms at 32,768 `[derived]`. The f16 KV read alone takes
    0.58, 2.30 and 4.60 ms. The shallow step is not measured on the A6000: 5.2–6.3 ms (`[derived]`; the 3090's 193.9
-   tok/s scaled to 768 GB/s is ~5.6 ms, `docs/research/sparkdec.md:170`). As tok/s, t_f16 / t_q8 − 1, that gives
+   tok/s scaled to 768 GB/s is ~5.6 ms, `docs/research/sparkdec.md:177`). As tok/s, t_f16 / t_q8 − 1, that gives
    +4..+5 % at 4K, +14..+17 % at 16K and +25..+28 % at 32K `[derived]`. The one term derivation cannot fix is **whether the q8_0 flash reads at the f16 flash's byte
    rate**. If the dequant binds, the lower edge is 0. Capacity: the seat's automatic context reaches ×1.88 (the row's
    doc).
@@ -283,7 +283,7 @@ more arm).
 - **3.13 `GEMM_FROM`.** A wide unit reads each routed expert once per ubatch, and passes read it once per 8 rows, so
   the threshold already sits at the byte crossover. The bits fix it there too.
 - **3.14 K = 512 lane-idle.** A shape fact. On the A6000 at ~700 GB/s the model gives −0.06..+0.02 ms on a ~5.6 ms
-  step (`docs/research/sparkdec.md:170`); the GB10 side is that doc's own A/B.
+  step (`docs/research/sparkdec.md:177`); the GB10 side is that doc's own A/B.
 - **3.15 Sampled requests and the draft.** The per-slot chooser already sees a sampled slot's lower acceptance and
   narrows or closes. ik records the temperature and drafts anyway (`common/speculative.cpp:1953`).
 - **3.16 NVMe fill threads.** The code's own doc puts 16 at the drive's knee (`nvtier.rs:99-102`), a drive fact.

@@ -10,7 +10,7 @@ DGX Spark (GB10). Every number below is either the contributor's measurement (ci
 |---|---|---|---|
 | 1a. `qwen35moe_router_norm` regridded: 8 rows a block (one a warp), 33 blocks, the first weight chunk issued before the norm | −0.07 … −0.22 ms (−0.6 … −1.9 %), center −1.3 % `[derived]` | −0.06 … +0.02 ms (−1.0 … +0.4 %) `[derived]` | **Open** (round `sparkrouter`, §7.1): a kernel defect on 48 SMs (a second wave), not a PDL question. Its one-warp routing tail (2.5–4 µs a launch, 0.10–0.16 ms a step) stays; a bit-keeping rewrite of it is worth −0.02 … −0.04 ms, model says 0 |
 | 1b. PDL across the step's 520 nodes | −0.20 … −0.67 ms (−1.7 … −5.8 %) `[derived]`, band too wide | 0 by construction (sm_86 PTX cannot carry it) | **Not yet**: needs the `sm_121` target (`archkey`), a fork patch (ledger row 42), and one term, GB10 `c_node` (§4.4) |
-| 1c. `qwen3moe_o_resid_q4k` second wave (256 blocks on 240 slots) | −0.07 ms (−0.6 %) | 0 | **Model says 0, do not open** (under the ruler; PDL would fill it) |
+| 1c. `qwen3moe_o_resid_q4k` second wave (256 blocks on 192 slots `[derived]`, §9 term 3) | −0.07 ms (−0.6 %), if the regrid removes the whole tail (§4.3) | 0 | **Model says 0, do not open** (under the ruler; PDL would fill it) |
 | 1d. `q4k_gemv_sel` tail (half-warp at K = 512, a dependent id load) | ≤ −0.09 ms (−0.8 %) | 0 | **Model says 0, do not open** |
 | 2. More bytes in flight per SM on the layer gemvs and the head | Little's-law form (more warps, blocks or loads to cover latency): 0. The same code shape for DRAM row locality (a row's loads issued together): up to −1.4 ms, undecided | 0 | **Little's-law form: model says 0, do not open** (§5.3). **Row-locality form: undecided until the probe's arm P** (§5.4), which also tests load width (arm W); the 1.63 ms the gemvs lose is that term |
 
@@ -35,15 +35,18 @@ crates equal to `a3a44ca2`; stock clocks unless noted):
 - L2 read sectors from the SMs are 1.01–1.05 × the memory fills on the quantized layer gemvs: no duplicate L2 traffic.
 
 Code facts (registers and static blocks per SM from the 2026-10-11 `ptx-scan` of `bloomery-serve`, ptxas 13.3, sm_86;
-the cc 12.1 JIT may allocate differently `[unverified]`): `qwen3moe_gate_up_swiglu_q4k` 48 regs / 5, `qwen3moe_qkv_q4k`
+the cc 12.1 JIT on the Spark allocates differently, §9 term 3): `qwen3moe_gate_up_swiglu_q4k` 48 regs / 5, `qwen3moe_qkv_q4k`
 64 / 4, `qwen3moe_o_resid_q4k` 48 / 5, `q4k_gemv_sel` 48 / 5, `q6k_gemv_sel` 40 / 6, `q6k_gemv` 40 / 6,
 `qwen3moe_head_q6k_argmax` 40 / 6, `qwen35moe_router_norm` 47 regs, 9264 B smem / 5. Every weight load in these entries
 is `ld.global.b32` (a 2026-10-08 PTX dump of the decode bin: 67, 133, 67, 21, 72, 20 and 66 scalar loads, no vector
 load). Per-SM limits at cc 12.x equal cc 8.6's: 1536 threads, 48 warps, 64 K registers, 100 KB shared
-([CUDA programming guide, compute capabilities](https://docs.nvidia.com/cuda/cuda-programming-guide/05-appendices/compute-capabilities.html);
-the page's table groups 12.0 and 12.1 as "12.x" `[cited; the flattened table read by column order — confirm with
-cuDeviceGetAttribute on the Spark]`). So the static blocks per SM carry over, and a grid's resident slots are
-48 × blocks/SM on GB10 and 84 × blocks/SM on the A6000.
+([CUDA programming guide, compute capabilities](https://docs.nvidia.com/cuda/cuda-programming-guide/05-appendices/compute-capabilities.html)).
+`cuDeviceGetAttribute` on two Sparks reads the same: 1536 threads, 65536 registers and 102400 B of shared memory per
+SM, 48 SMs ([#17 comment 6117957831](https://github.com/midagedev/bloomery/issues/17#issuecomment-6117957831)). The
+JIT's registers differ, though. Of the plain entries, which §2 timed, two fit fewer blocks per SM on the Spark than in
+the scan: `qwen3moe_gate_up_swiglu_q4k` and `qwen3moe_o_resid_q4k` fit 4, not 5; of the `_prefetch` entries a Spark
+launches, `q4k_gemv_sel_prefetch` also fits 4 (§9 term 3). A grid's resident slots are 48 × blocks/SM on GB10, with
+§9's plain cc 12.1 values, and 84 × blocks/SM on the A6000, with the scan's.
 
 ## 2. Paper decomposition of the step
 
@@ -54,15 +57,19 @@ slope (72.99 − 25.39) / (14.176 − 4.810) = 5.082 µs/MB, i.e. **R_ss = 196.8
 
 | Kernel (grid) | MB | n/step | in flow µs | at 235.6 µs | t0 + B/R_ss µs | tail µs | tail ms/step | waves GB10 / A6000 |
 |---|---|---|---|---|---|---|---|---|
-| `gate_up_swiglu_q4k` (576) | 10.652 | 40 | 57.97 | 45.21 | 55.08 | 2.89 | 0.116 | 2.40 / 1.37 |
+| `gate_up_swiglu_q4k` (576) | 10.652 | 40 | 57.97 | 45.21 | 55.08 | 2.89 | 0.116 | 3.00 / 1.37 |
 | `head_q6k_argmax` (31040) | 417.268 | 1 | 2094.94 | 1771.1 | (R 199.2) | ~0 | 0 | 108 / 62 |
 | `qkv_q4k` (1536) | 14.176 | 16 | 72.99 | 60.17 | 72.98 | 0.01 | 0 | 8.0 / 4.6 |
 | `q6k_gemv` (1024) | 13.779 | 14 | 74.10 | 58.49 | 70.97 | 3.13 | 0.044 | 3.6 / 2.0 |
-| `o_resid_q4k` (256) | 4.747 | 40 | 26.83 | 20.15 | 25.07 | 1.76 | 0.070 | **1.07** / 0.61 |
+| `o_resid_q4k` (256) | 4.747 | 40 | 26.83 | 20.15 | 25.07 | 1.76 | 0.070 | **1.33** / 0.61 |
 | `q6k_gemv_sel` (2304) | 7.758 | 20 | 44.10 | 32.93 | 40.37 | 3.73 | 0.075 | 8.0 / 4.6 |
 | `q4k_gemv_sel` (2304) | 5.335 | 20 | 32.66 | 22.64 | 28.06 | 4.60 | 0.092 | 9.6 / 5.5 |
 | `router_norm` (257) | 2.160 | 40 | 18.48 | 9.17 | 11.93 | 6.55 | **0.262** | **1.07** / 0.61 |
 | `qkv_q4k` (520 / 1088 / 1152) | 4.8 / 10.0 / 10.6 | 14 / 6 / 4 | 25.39 / 53.47 / 56.18 | | | 0 / 1.47 / 1.18 | 0.014 | 2.7–6.0 |
+
+Waves are grid / slots `[derived]`, with the plain entries' cc 12.1 JIT blocks per SM on GB10 (§9 term 3) and the
+scan's on the A6000. `gate_up_swiglu_q4k` fills 3.00 whole waves on GB10, so in this model its 2.89 µs tail is not a
+partial-wave tail `[derived]`; its cause is `[unverified]`, and a kernel in whole waves still has a tail (§4.3).
 
 Step sum `[derived]`: steady deficit Σ B·(1/R − 1/235.6) = 1.31 ms (layer gemvs at 196.8) + 0.32 ms (head at 199.2)
 = **1.63 ms**; tails **0.67 ms** (router 0.26 of it); intercepts 237 × 0.95 = **0.23 ms**; the 0.2 ms left of the
@@ -127,7 +134,7 @@ alone computes the block's one router row with `f32_lane_partial_1col_w32` (`:10
 flight, `crates/gpu/src/q8f32.rs:263-276`, so 4 KB a round and two rounds for k = 2048); then a fence, a ticket and the
 last block's single-warp routing (`publish_route_gated`, `:741-806`). Terms `[derived]`:
 
-- **Two waves on 48 SMs.** 47 regs → 5 blocks/SM → 240 slots < 257: 17 blocks run a second wave, each paying the whole
+- **Two waves on 48 SMs.** 48 regs (§9 term 3) → 5 blocks/SM → 240 slots < 257: 17 blocks run a second wave, each paying the whole
   serial chain (norm ~1 µs, two weight rounds at low parallelism 2–3 µs, fence and ticket ~0.7 µs) ≈ 3.5–5 µs. On the
   A6000 (420 slots) it is one wave. The sibling entry's comment states the same budget for 82 SMs
   (`:2686-2688`, "a grid of 257 blocks stays one wave on 82 SMs").
@@ -179,9 +186,15 @@ show as a GB10 Δ above the band's −0.07 edge and the nsys µs above 16.7.
 ### 4.3 The other tails (levers 1c, 1d)
 
 - **`qwen3moe_o_resid_q4k`**, grid `rows / 8` (`crates/gpu/src/arch/qwen3moe/proj.rs:692`), 2048 rows of K = 4096:
-  256 blocks on 240 slots, 16 blocks in a second wave. Their 128 warps hold 128 × ≤ 576 B ≈ 74 KB in flight, under the
-  118–353 KB the pool needs (§5.1), for two rounds: ≈ 2 µs, against the 1.76 µs tail in §2. A uniform two rows a warp (128 blocks, one wave on
-  both cards) saves it: **−0.07 ms, −0.6 %**. Under the ruler: **model says 0, do not open.**
+  256 blocks on 192 slots (4 blocks/SM under the cc 12.1 JIT, §9 term 3), so 64 blocks run a second wave `[derived]`.
+  Their 512 warps hold 128 to 576 B each a round (§5.2), about 66 to 295 KB in flight, against the 118 to 353 KB the
+  pool needs (§5.1) `[derived]`; §5.2's bytes a warp assume the cc 12.1 JIT does not overlap two iterations' loads
+  `[unverified]`. The old count (74 KB, under the need at every L) no longer holds, and this count alone cannot
+  say whether the second wave is short of bytes (Little alone is ambiguous here, as in §5.3). The cause of the 1.76 µs
+  tail in §2 is `[unverified]`. A uniform two rows a warp (128 blocks, one wave on both cards) removes the partial
+  wave. The Δ is §2's whole tail, 1.76 µs × 40: **−0.07 ms, −0.6 %**; it assumes the regrid removes all of it, which
+  is `[unverified]`: `gate_up_swiglu_q4k` has a 2.89 µs tail in 3.00 whole waves (§2). Under the ruler: **model says
+  0, do not open.**
 - **`q4k_gemv_sel`** at K = 512 (`n_sb = 2`): the core's guard `sbp < n_sb` (`crates/gpu/src/cores.rs:395-404`) leaves
   lanes with `grp ≥ 2` idle, so a warp reads 288 B with half its lanes, after a dependent `sel` load
   (`crates/gpu/src/q4k_sel.rs:84`). Its 4.60 µs tail is the ceiling of any fix: **≤ −0.09 ms, −0.8 %. Model says 0, do
@@ -227,15 +240,18 @@ The Q4_K walk (`cores::q4k_row_dot_1col`, `cores.rs:341-410`) does one iteration
 in the 2026-10-08 PTX of `qwen3moe_o_resid_q4k` each iteration's header loads come first, then the scale decode's
 branches, then the `qs` loads and the dp4a, and the second unrolled iteration's loads follow the first one's dp4a — so a
 round trip carries 128 B (the four header sectors) or ~448 B (the rest), up to 576 B if ptxas hoists the `qs` loads
-over the branches `[unverified: SASS not read]`. 48 registers cannot hold two iterations' 24 weight words plus the
-activation words, so `Q4K_ITER_UNROLL = 2` (`cores.rs:324`) does not double what is in flight `[derived]`. The Q6_K walk
+over the branches `[unverified: SASS not read]`. The sm_86 scan's 48 registers (§1) cannot hold two iterations' 24
+weight words plus the activation words, so there `Q4K_ITER_UNROLL = 2` (`cores.rs:324`) does not double what is in
+flight `[derived]`. The cc 12.1 JIT gives `gate_up_swiglu_q4k` and `o_resid_q4k` 59 to 63 registers (§9 term 3);
+whether its code overlaps two iterations' loads is `[unverified: SASS not read]`. The Q4_K rows below and §4.3's count
+assume it does not; if it does, a warp holds up to twice as much `[derived]`. The Q6_K walk
 (`q6k_sel.rs:104-167`, the same body in `q6k_gemv`) issues its 15 loads together: 420 B a round.
 
 | Kernel | Per warp a round | Rounds a warp | Warps/SM | In flight per SM | Need (0.5 / 1.0 / 1.5 µs) | In flight ÷ need at 1.5 µs | Measured steady |
 |---|---|---|---|---|---|---|---|
-| `gate_up_swiglu_q4k` | 128–576 B | 4–8 (gate then up, K 2048) | 40 | 5.1–23.0 KB | 2.5 / 4.9 / 7.4 KB | 0.7–3.1 | 184 in flow |
+| `gate_up_swiglu_q4k` | 128 to 576 B | 4 to 8 (gate then up, K 2048) | 32 | 4.1 to 18.4 KB | 2.5 / 4.9 / 7.4 KB | 0.6 to 2.5 | 184 in flow |
 | `qkv_q4k` | 128–576 B | 2–4 | 32 | 4.1–18.4 KB | " | 0.6–2.5 | 196.8 (slope) |
-| `o_resid_q4k` | 128–576 B | 4–8 (K 4096) | 40 | 5.1–23.0 KB | " | 0.7–3.1 | 177 in flow, wave tail |
+| `o_resid_q4k` | 128 to 576 B | 4 to 8 (K 4096) | 32 | 4.1 to 18.4 KB | " | 0.6 to 2.5 | 177 in flow, a tail of open cause (§4.3) |
 | `q4k_gemv_sel` | 64–288 B (half the lanes) | 1–2, after a dependent `sel` load | 40 | 2.6–11.5 KB | " | 0.3–1.6 | 163 |
 | `q6k_gemv_sel` | 420 B | 1, after `sel` | 48 | 20.2 KB | " | 2.7 | 201 alone |
 | `q6k_gemv` | 420 B | 4 | 48 | 20.2 KB | " | 2.7 | 186 |
@@ -243,9 +259,12 @@ activation words, so `Q4K_ITER_UNROLL = 2` (`cores.rs:324`) does not double what
 | `router_norm` | 4 KB (warp 0 only) | 2 | 5 | 20 KB during the gemv | " | 2.7 | 117 (chain, §4.2) |
 | `hostread2` `rows_k` (#13) | ≈ 2.3 KB (two rows) | 1 | 48 | ≈ 110 KB | " | 15 | 235.6 |
 
+Warps/SM for `gate_up_swiglu_q4k` and `o_resid_q4k` is 4 × 256 / 32 = 32, the most that fit under the cc 12.1 JIT
+(§9 term 3) `[derived]`.
+
 ### 5.3 What the table says
 
-Little alone is ambiguous for the Q4_K kernels (0.6–3.1× the need, by which phase is outstanding). The measured rates
+Little alone is ambiguous for the Q4_K kernels (0.6 to 2.5× the need, by which phase is outstanding). The measured rates
 decide it: across in flight from ~4 KB (qkv, header phase) to 20 KB (the Q6_K head, one phase) the steady rate stays at
 **189–199 GB/s**, and a kernel that holds 2× more does not run 2× faster — the head with 20 KB at 99.8 % active runs at
 199.2, the qkv slope with less gives 196.8, and `q6k_gemv_sel`, one round of 20 KB, reads 201 alone. A rate that is
@@ -364,8 +383,30 @@ the candidate). **Δ ≥ +r**: reject.
 
 1. §5.4's probe on the Spark (rows_k W and P arms): decides whether 1.4 ms is reachable and by which round.
 2. GB10 `c_node` (`cnode_probe --time` on the Spark): decides `sparkpdl`.
-3. The cc 12.1 JIT's registers for the seven entries (`cuFuncGetAttribute(NUM_REGS)` on the Spark): the waves column
-   assumes the sm_86 scan's blocks/SM.
+3. The cc 12.1 JIT's registers for the eight entries (`cuFuncGetAttribute(NUM_REGS)` on the Spark): the waves column
+   assumed the sm_86 scan's blocks/SM. **Answered** by a contributor's reading with driver 595.84 (the plain entries on
+   two Sparks, the `_prefetch` entries on one;
+   [#17 comment 6117957831](https://github.com/midagedev/bloomery/issues/17#issuecomment-6117957831)):
+   each entry's registers and `cuOccupancyMaxActiveBlocksPerMultiprocessor` (the most blocks that fit on one SM) at 256
+   threads with no dynamic shared memory. Main launches the `_prefetch` entries when `row_prefetch`
+   (`crates/gpu/src/lib.rs:1936` at `e659f4fe`) finds an integrated device, so the last column is what a Spark runs.
+   §2 timed the plain entries, and its build (`04d0c0ae`) gives the plain column's values:
+
+   | entry | §1: sm_86 ptxas regs / static blocks per SM | cc 12.1 JIT, plain: regs / blocks per SM | cc 12.1 JIT, `_prefetch` |
+   |---|---|---|---|
+   | `qwen3moe_gate_up_swiglu_q4k` | 48 / 5 | **62 / 4** | 61 / 4 |
+   | `qwen3moe_qkv_q4k` | 64 / 4 | 58 / 4 | 56 / 4 |
+   | `qwen3moe_o_resid_q4k` | 48 / 5 | **59 / 4** | 63 / 4 |
+   | `q4k_gemv_sel` | 48 / 5 | 48 / 5 | **64 / 4** |
+   | `q6k_gemv_sel` | 40 / 6 | 40 / 6 | 40 / 6 |
+   | `q6k_gemv` | 40 / 6 | 40 / 6 | 39 / 6 |
+   | `qwen3moe_head_q6k_argmax` | 40 / 6 | 39 / 6 | 37 / 6 |
+   | `qwen35moe_router_norm` | 47 / 5 | 48 / 5 | 42 / 5 |
+
+   No entry has local memory. `gate_up_swiglu_q4k` and `o_resid_q4k` fit 4 blocks per SM, not 5, and
+   `q4k_gemv_sel_prefetch` also fits 4. §2's measured numbers do not move. The terms built on the scan's values are
+   corrected in place: the Verdict's 1c, §1's per-SM limits and slots, §2's waves column, §4.2's registers, §4.3's
+   `o_resid_q4k` tail, §5.2's warps per SM and register premise, and §5.3's in-flight ratio.
 
 ## 10. Measured after the design (contributor @juliankang4, #17 comment 6105096461)
 
