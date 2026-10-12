@@ -1,0 +1,1 @@
+{"messages": [{"role": "user", "content": "한글🙂 <x>"}, {"role": "assistant", "content": "ok"}], "value": {"s": "<x>", "n": 1.25, "a": [true, null]}, "add_generation_prompt": true, "bos_token": "<s>", "eos_token": "</s>"}
