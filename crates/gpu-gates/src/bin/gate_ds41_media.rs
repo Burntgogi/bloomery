@@ -9,7 +9,7 @@
 //! `deepseek41v`, the set `gate-vision` reads) and the learned delimiter
 //! rows of the mmproj file that set names.
 //!
-//! The feed: one image of the set (its `image` row's grid), its `aligner`
+//! The feed: one image of the set (`grad-448`; its `image` row's grid), its `aligner`
 //! tap's rows in reading order, and `v.token_embd.img_start`,
 //! `v.image_newline`, `v.token_embd.img_end` read from the mmproj by name —
 //! the reference's splice (`model.py:1235-1239`): a Start row, each grid
@@ -57,17 +57,20 @@
 //! - **(vi) Refusals.** By name: media under the steps feed (the engine's
 //!   `prefill_media` and `Session::prompt_media` both), a span the call
 //!   does not hold whole, and a cut inside a span.
-//! - **(vii) Seat.** One prompt with the set's image twice (two spans in one
-//!   batch), the serve seat's media call against the body's, opening no tower:
-//!   the reference arm is this gate's own spans and `body::prefill_media`, run
-//!   first; the owner arm is the seat's path over the set's aligner rows —
-//!   `vision_seat::span_rows_of` with the library splice
-//!   (`ds41_media::splice`, each image's grid from its own prepare of the
-//!   set's PNG), then `vision_seat::Encoded::prompt` over the library
-//!   builder (`ds41_media::spans`), the one prompt call. The builder's spans
-//!   equal this gate's (positions, row bits and kinds: the engine reads no
-//!   kind past its shape check, so only this equality sees one), and the two
-//!   calls leave the same greedy token and a bit-identical last hidden row.
+//! - **(vii) Seat.** One prompt with two different images of the set, `grad-448` (13 × 13 cells)
+//!   then `pad-600x451` (12 lines of 15 cells, non-square, so a swapped line and cell order
+//!   changes its span length), two spans in one batch, the serve seat's media call against the
+//!   body's, opening no tower: the reference arm is this gate's own spans and
+//!   `body::prefill_media`, run first; the owner arm is the seat's path over each image's
+//!   aligner rows — `vision_seat::span_rows_of` with the library splice (`ds41_media::splice`,
+//!   each image's grid from its own prepare of the set's PNG), then `vision_seat::Encoded::prompt`
+//!   over the library builder (`ds41_media::spans`), the one prompt call. The builder's spans
+//!   equal this gate's (positions, row bits and kinds: the engine reads no kind past its shape
+//!   check, so only this equality sees one, and an image given the other's rows is seen because
+//!   the two differ), and the two calls leave the same greedy token and a bit-identical last
+//!   hidden row. The control, run after both arms: the same ids with no spans leave a different
+//!   last hidden row, so the media rows are shown to matter. A refusal from the owner's host half
+//!   or its prompt call is a FAIL line of the clause, not an end of the gate.
 //!
 //! Every clause is self-consistency — the engine against a rule the gate computes from the
 //! model's own tensors, over the vision set's rows as inputs — so the fixture tier runs all of
@@ -82,7 +85,9 @@
 //! at the media positions, a state save that drops the spans, a refusal
 //! removed — are source edits this gate goes red on, one clause each; (vii)'s are
 //! the span order, the rows and the kinds a seat's prompt step or builder hands
-//! the call.
+//! the call, the splice's line and cell order (a span of the wrong length for the
+//! non-square image), a span given the other image's rows, and the control's call
+//! carrying the spans.
 
 #[cfg(not(feature = "deepseek41"))]
 fn main() {
@@ -143,8 +148,12 @@ mod gate {
     use vision::{MediaModel, Prepared, Rgb8};
 
     const NAME: &str = "gate_ds41_media";
-    /// The image whose aligner rows the gate feeds: the set's full-tap image.
+    /// The image clauses (i)–(vi) feed, and the seat clause's first: the set's full-tap image.
     const IMAGE: &str = "grad-448";
+    /// The seat clause's second image: a non-square grid (12 lines of 15 cells, 194 positions
+    /// against the first's 13 of 13 and 184), so the splice's line and cell order and each
+    /// image's own rows are read.
+    const SEAT_SECOND: &str = "pad-600x451";
     /// Decode steps the split-invariance clauses and the snapshot clauses run.
     const STEPS: usize = 24;
     /// The decode step the snapshot clauses take their state after.
@@ -152,8 +161,9 @@ mod gate {
     /// The dead-window clause's steps: the three that see the span, and one
     /// past them.
     const DEAD_STEPS: usize = 4;
-    /// The seat clause's prompt: this many text ids, the image's span, [`SEAT_GAP`] text ids, the
-    /// span again, [`SEAT_POST`] text ids (one batch: the sum with two spans is below `T_MAX`).
+    /// The seat clause's prompt: this many text ids, the first image's span, [`SEAT_GAP`] text ids,
+    /// the second image's span, [`SEAT_POST`] text ids (one batch: the sum with both spans is
+    /// below `T_MAX`).
     const SEAT_PRE: usize = 40;
     const SEAT_GAP: usize = 24;
     const SEAT_POST: usize = 16;
@@ -186,13 +196,19 @@ mod gate {
         }
     }
 
-    /// What the seat clause rebuilds a span from: the set image's aligner rows as the tower
-    /// would write them, the file's delimiter rows, and the image as its model's prepare made it
-    /// (the plan's grid and `span_len`, from the image's own PNG).
+    /// What the seat clause rebuilds one image's span from: the set image's aligner rows as the
+    /// tower would write them, and the image as its model's prepare made it (the plan's grid and
+    /// `span_len`, from the image's own PNG).
     struct Source {
         aligner: Vec<u16>,
-        delims: ds41_media::Delims,
         prepared: Prepared,
+    }
+
+    /// One image of the set: the feed the clauses place, and the source the seat clause rebuilds
+    /// it from.
+    struct Fed {
+        feed: Feed,
+        source: Source,
     }
 
     /// The image `img` of the set as the seat's prepare makes it, from its PNG and the resize
@@ -230,9 +246,13 @@ mod gate {
         Ok(prepared)
     }
 
-    /// The vision oracle set's image as the feed and the seat clause's source, with the model's
-    /// `n_embd`.
-    fn read_feed(hp: &Hparams) -> Result<(Feed, Source, usize), GateError> {
+    /// The vision oracle set's images `stems`, each as a feed and the seat clause's source, with
+    /// the learned delimiter rows of the mmproj the set names and the model's `n_embd`. Each
+    /// image is held to its own `image` row of the set and its own aligner rows.
+    fn read_images(
+        hp: &Hparams,
+        stems: &[&str],
+    ) -> Result<(Vec<Fed>, ds41_media::Delims, usize), GateError> {
         let dir = match std::env::var("BLOOMERY_VISION_SET") {
             Ok(set) => data_dir().join("ref-vision").join(set),
             Err(_) => VISION.path(VISION_SET),
@@ -241,67 +261,68 @@ mod gate {
         if !set.complete {
             return Err(format!("{}: the set is not complete", dir.display()).into());
         }
-        let img = set
-            .images
-            .iter()
-            .find(|i| i.stem() == IMAGE)
-            .ok_or_else(|| {
-                format!(
-                    "{}: no image {IMAGE:?} of {}",
-                    dir.display(),
-                    set.images.len()
-                )
-            })?;
         let n_embd = hp.n_embd;
-        let (w, h) = (img.n_llm_w, img.n_llm_h);
-        if img.n_tokens != 2 + h * (w + 1) {
-            return Err(format!(
-                "{}: {} tokens of a {h}x{w} grid, want {}",
-                img.name,
-                img.n_tokens,
-                2 + h * (w + 1)
-            )
-            .into());
-        }
-        let want = format!("{IMAGE}.aligner.bf16");
-        let file = set
-            .files
-            .iter()
-            .find(|f| f.name == want)
-            .ok_or_else(|| format!("{}: no aligner rows {want:?}", dir.display()))?;
-        let [rows, cols] = file.shape[..] else {
-            return Err(format!("{want}: shaped {:?}, want [rows, {n_embd}]", file.shape).into());
-        };
-        if cols != n_embd || rows != h * w {
-            return Err(format!(
-                "{want}: {rows} rows of {cols}, want the image's {h}x{w} = {} rows of the \
-                 model's n_embd {n_embd}",
-                h * w
-            )
-            .into());
-        }
-        let aligner = read_bf16(&dir.join(&file.name))?;
         // The span itself — the learned delimiter rows of the mmproj the set
         // names and the splice over the aligner rows — is the one library
         // owner `bloomery_gpu_gates::ds41_media` (this gate and the serve
         // seat's `--mmproj` path share it).
         let mmproj = gguf::Gguf::open(&set.mmproj)?;
         let d = ds41_media::delims(&mmproj, n_embd)?;
-        let (rows, kinds) = ds41_media::span_rows(&aligner, (h, w), n_embd, &d)?;
-        let prepared = prepare(&mmproj, img)?;
-        Ok((
-            Feed {
-                rows,
-                kinds,
-                token: set.image_token_id,
-            },
-            Source {
-                aligner,
-                delims: d,
-                prepared,
-            },
-            n_embd,
-        ))
+        let mut images = Vec::with_capacity(stems.len());
+        for &stem in stems {
+            let img = set
+                .images
+                .iter()
+                .find(|i| i.stem() == stem)
+                .ok_or_else(|| {
+                    format!(
+                        "{}: no image {stem:?} of {}",
+                        dir.display(),
+                        set.images.len()
+                    )
+                })?;
+            let (w, h) = (img.n_llm_w, img.n_llm_h);
+            if img.n_tokens != 2 + h * (w + 1) {
+                return Err(format!(
+                    "{}: {} tokens of a {h}x{w} grid, want {}",
+                    img.name,
+                    img.n_tokens,
+                    2 + h * (w + 1)
+                )
+                .into());
+            }
+            let want = format!("{stem}.aligner.bf16");
+            let file = set
+                .files
+                .iter()
+                .find(|f| f.name == want)
+                .ok_or_else(|| format!("{}: no aligner rows {want:?}", dir.display()))?;
+            let [rows, cols] = file.shape[..] else {
+                return Err(
+                    format!("{want}: shaped {:?}, want [rows, {n_embd}]", file.shape).into(),
+                );
+            };
+            if cols != n_embd || rows != h * w {
+                return Err(format!(
+                    "{want}: {rows} rows of {cols}, want the image's {h}x{w} = {} rows of the \
+                     model's n_embd {n_embd}",
+                    h * w
+                )
+                .into());
+            }
+            let aligner = read_bf16(&dir.join(&file.name))?;
+            let (rows, kinds) = ds41_media::span_rows(&aligner, (h, w), n_embd, &d)?;
+            let prepared = prepare(&mmproj, img)?;
+            images.push(Fed {
+                feed: Feed {
+                    rows,
+                    kinds,
+                    token: set.image_token_id,
+                },
+                source: Source { aligner, prepared },
+            });
+        }
+        Ok((images, d, n_embd))
     }
 
     /// One file of little-endian bf16 values.
@@ -771,30 +792,46 @@ mod gate {
 
     // ------------------------------------------------- the serve seat's call
 
-    /// (vii): the serve seat's media call held to the body's, on one prompt with the set's image
-    /// twice (spans at `SEAT_PRE` and after `SEAT_GAP` more text ids). Two arms over the same
-    /// ids, no tower: the reference arm is the gate's own spans ([`Feed::span`]) and
-    /// `body::prefill_media`, run first; the owner arm is the seat's path — the image seat's
-    /// `span_rows_of` over the set's aligner rows with the library splice
-    /// ([`ds41_media::splice`], each image's grid from its own prepare), then
+    /// (vii): the serve seat's media call held to the body's, on one prompt with two different
+    /// images of the set, the second a non-square grid (spans at `SEAT_PRE` and after
+    /// `SEAT_GAP` more text ids). Two arms over the same ids, no tower: the reference arm is the
+    /// gate's own spans ([`Feed::span`]) and `body::prefill_media`, run first; the owner arm is
+    /// the seat's path — the image seat's `span_rows_of` over each image's aligner rows with the
+    /// library splice ([`ds41_media::splice`], each image's grid from its own prepare), then
     /// [`vision_seat::Encoded::prompt`] over the library builder ([`ds41_media::spans`]), the
     /// one prompt call. The builder's spans equal the gate's (positions, row bits and kinds: the
     /// engine reads no kind past its shape check, so only this equality sees one), and the two
-    /// calls leave the same greedy token and a bit-identical last hidden row.
+    /// calls leave the same greedy token and a bit-identical last hidden row. The control, run
+    /// after both arms: the same ids with no spans leave a different last hidden row, so the
+    /// media rows are shown to matter. A refusal from the owner's host half (the splice, the
+    /// span lengths) or from its prompt call is a FAIL line, not an end of the gate.
     fn seat_call(
         s: &mut Session<Body>,
-        source: &Source,
-        feed: &Feed,
+        images: [(&Feed, &Source); 2],
+        delims: &ds41_media::Delims,
         n_embd: usize,
         text: &[u32],
     ) -> Result<bool, GateError> {
-        let span = feed.len();
-        let at = [SEAT_PRE, SEAT_PRE + span + SEAT_GAP];
-        let mut ids = Vec::with_capacity(at[1] + span + SEAT_POST);
+        let [(first, _), (second, source)] = images;
+        let (h, w) = (
+            source.prepared.patches.plan.n_llm_h,
+            source.prepared.patches.plan.n_llm_w,
+        );
+        let (first_len, second_len) = (first.len(), second.len());
+        if h == w || first_len == second_len {
+            return Err(format!(
+                "{NAME}: the seat clause's second image is a {h}x{w} grid of {second_len} \
+                 positions against the first's {first_len}: it must be non-square and a \
+                 different size"
+            )
+            .into());
+        }
+        let at = [SEAT_PRE, SEAT_PRE + first.len() + SEAT_GAP];
+        let mut ids = Vec::with_capacity(at[1] + second.len() + SEAT_POST);
         ids.extend_from_slice(&text[..SEAT_PRE]);
-        ids.extend(std::iter::repeat_n(feed.token, span));
+        ids.extend(std::iter::repeat_n(first.token, first.len()));
         ids.extend_from_slice(&text[SEAT_PRE..SEAT_PRE + SEAT_GAP]);
-        ids.extend(std::iter::repeat_n(feed.token, span));
+        ids.extend(std::iter::repeat_n(second.token, second.len()));
         ids.extend_from_slice(&text[SEAT_PRE + SEAT_GAP..SEAT_PRE + SEAT_GAP + SEAT_POST]);
         if ids.len() > body::T_MAX {
             return Err(format!(
@@ -805,33 +842,85 @@ mod gate {
             .into());
         }
         // The reference arm: the gate's own spans, the body's call.
-        let spans = [feed.span(at[0]), feed.span(at[1])];
+        let spans = [first.span(at[0]), second.span(at[1])];
         s.model_mut().reset()?;
         let body_next = body::prefill_media(s.model_mut(), &ids, &spans)?;
         let body_row = s.model().head_normed()?;
-        // The owner arm: the rows the seat's encode would read back, here the set's aligner rows
-        // for each image.
+        // The owner arm: the rows the seat's encode would read back, here each image's aligner
+        // rows in the call's order.
+        let mut read = 0;
         let rows = vision_seat::span_rows_of(
-            at.map(|start| vision_seat::Image::of(start, &source.prepared)),
+            images
+                .iter()
+                .zip(at)
+                .map(|(&(_, src), start)| vision_seat::Image::of(start, &src.prepared)),
             n_embd,
-            |_| Ok::<_, std::convert::Infallible>(source.aligner.clone()),
-            ds41_media::splice(n_embd, &source.delims),
-        )?;
+            |_| {
+                let aligner = images[read].1.aligner.clone();
+                read += 1;
+                Ok::<_, std::convert::Infallible>(aligner)
+            },
+            ds41_media::splice(n_embd, delims),
+        );
+        let owner = match rows {
+            Ok(rows) => owner_arm(s, rows, &spans, &ids, body_next, &body_row)?,
+            Err(e) => {
+                println!(
+                    "{NAME}: (vii) the seat's span rows over {IMAGE} and {SEAT_SECOND} \
+                     refused: {e}: {}",
+                    verdict(false)
+                );
+                false
+            }
+        };
+        // The control, after both arms: the same ids with no spans, whose media positions read
+        // the image token's own embedding, must leave a different last hidden row than the media
+        // call, or the rows were never shown to matter.
+        s.model_mut().reset()?;
+        body::prefill_media(s.model_mut(), &ids, &[])?;
+        let control_row = s.model().head_normed()?;
+        let differing = control_row
+            .iter()
+            .zip(&body_row)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        let vacuity = control_row.len() == body_row.len() && differing > 0;
+        println!(
+            "{NAME}: (vii) the same ids with no spans differ from the media call: {} ({differing} \
+             of {} last hidden row values differ)",
+            verdict(vacuity),
+            body_row.len()
+        );
+        Ok(owner && vacuity)
+    }
+
+    /// (vii)'s owner arm over the rows `rows` its host half made: the builder's spans against the
+    /// reference arm's `spans`, then the one prompt call against the body's argmax `body_next` and
+    /// last hidden row `body_row`. A refused prompt call is a FAIL line.
+    fn owner_arm(
+        s: &mut Session<Body>,
+        rows: vision_seat::SpanRows<MediaKind>,
+        spans: &[Span41<'_>],
+        ids: &[u32],
+        body_next: u32,
+        body_row: &[f32],
+    ) -> Result<bool, GateError> {
         let encoded = vision_seat::Encoded::from_rows(rows);
         let built = ds41_media::spans(encoded.rows());
         let same_spans = built.len() == spans.len()
-            && built.iter().zip(&spans).all(|(a, b)| {
+            && built.iter().zip(spans).all(|(a, b)| {
                 a.span.at == b.span.at && a.span.rows == b.span.rows && a.kinds == b.kinds
             });
         println!(
-            "{NAME}: (vii) the seat's builder over the set's image twice: {} spans of {} \
-             positions at {at:?}, positions, row bits and kinds equal the gate's own: {}",
+            "{NAME}: (vii) the seat's builder over {IMAGE} and {SEAT_SECOND}: {} spans of {:?} \
+             positions at {:?}, positions, row bits and kinds equal the gate's own: {}",
             built.len(),
-            span,
+            built.iter().map(|b| b.kinds.len()).collect::<Vec<_>>(),
+            built.iter().map(|b| b.span.at.start).collect::<Vec<_>>(),
             verdict(same_spans)
         );
         s.model_mut().reset()?;
-        let seat = match encoded.prompt(s, &ids, ds41_media::spans) {
+        let seat = match encoded.prompt(s, ids, ds41_media::spans) {
             Ok(next) => next,
             Err(e) => {
                 println!(
@@ -845,7 +934,7 @@ mod gate {
         let same_bits = seat_row.len() == body_row.len()
             && seat_row
                 .iter()
-                .zip(&body_row)
+                .zip(body_row)
                 .all(|(a, b)| a.to_bits() == b.to_bits());
         let pass = seat == body_next && same_bits;
         println!(
@@ -885,7 +974,13 @@ mod gate {
             .map(|e| e.layer_ids.clone())
             .ok_or("the model file has no engram sites")?;
         let ngram = hp.engram.as_ref().map_or(0, |e| e.max_ngram);
-        let (feed, source, n_embd) = read_feed(&hp)?;
+        let (images, delims, n_embd) = read_images(&hp, &[IMAGE, SEAT_SECOND])?;
+        let Ok([Fed { feed, source }, second]) = <[Fed; 2]>::try_from(images) else {
+            return Err(format!(
+                "{NAME}: the set's images are not the {IMAGE} and {SEAT_SECOND} read"
+            )
+            .into());
+        };
         let file = Split::open(&path).map_err(|e| format!("open {path}: {e}"))?;
         let t = std::time::Instant::now();
         let mut m = body::open(
@@ -1313,7 +1408,13 @@ mod gate {
 
         // (vii): the serve seat's call, on the session the model now stands in.
         crate::ds41_tier::sc("(vii) seat: the image seat's media call equals the body's")?;
-        ok &= seat_call(&mut s, &source, &feed, n_embd, &corpus)?;
+        ok &= seat_call(
+            &mut s,
+            [(&feed, &source), (&second.feed, &second.source)],
+            &delims,
+            n_embd,
+            &corpus,
+        )?;
 
         println!("{NAME}: {}", tier::tally_line());
         if ok {

@@ -1716,9 +1716,11 @@ gate-gpu-ds41-prefill *ARGS='':
 # 걸침, 프롬프트를 닫음)에 먹이고 조항 (i)–(vi)을 본다: 미디어 자리 임베딩=행 넓힌 값·텍스트 자리=스팬 없는 호출(비트),
 # 라우터 id=카드 자체 점수의 호스트 select_n(bias_vl/bias, 커버리지 단언 포함), engram 층의 스트림 항등(−0 예외),
 # 분할 불변(한 호출=스팬 앞 텍스트에서 끊은 두 호출, 상태 해시+24 디코드), 이미지로 끝나는 프롬프트 뒤 창의 dead와
-# 스냅숏/바이트 재개, 세 거부의 이름. Clause (vii) holds the serve seat's media call (the set's image twice in one prompt;
-# `vision_seat::span_rows_of` + `Encoded::prompt` over `ds41_media`'s splice and builder, no tower) to the body's: same argmax,
-# bit-identical last hidden row, and the builder's spans equal the gate's own. The 3090's plan on either card (shared/gate_card.rs), gate lock.
+# 스냅숏/바이트 재개, 세 거부의 이름. Clause (vii) holds the serve seat's media call (two different images of the set in
+# one prompt, `grad-448` and the non-square `pad-600x451`; `vision_seat::span_rows_of` + `Encoded::prompt` over `ds41_media`'s
+# splice and builder, no tower) to the body's: same argmax, bit-identical last hidden row, and the builder's spans equal the
+# gate's own; its control: the same ids with no spans differ from the media call. The 3090's plan on either card
+# (shared/gate_card.rs), gate lock.
 [group('v41-load')]
 gate-gpu-ds41-media *ARGS='':
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_ds41_media && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_ds41_media {{ARGS}}'
