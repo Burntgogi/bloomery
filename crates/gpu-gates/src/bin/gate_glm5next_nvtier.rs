@@ -68,8 +68,9 @@ mod gate {
     use bloomery_levers::{GlmAt, GlmWhy, HostCfg, glm_residency_at_plan, glm_unset};
     use gguf::Split;
     use model::arch::glm5next::hparams::Hparams;
-    use model::arch::glm5next::place::{NextnInputs, PlaceError, PlanInputs, card_routed};
+    use model::arch::glm5next::place::{NextnInputs, PlaceError, PlanInputs};
     use model::arch::names::routed_stacks;
+    use model::placement::accepts::{self, Program};
     use model::placement::workstation::HostRead;
     use model::placement::{Machine, PlacementError, PlanLevers};
     use runtime::{Out, Target, Want};
@@ -104,15 +105,15 @@ mod gate {
             Ok(inputs)
         }
 
-        /// The trunk's routed layers whose experts stay on the host, from the file's types: a layer with a
-        /// stack `card_routed` does not read.
+        /// The trunk's routed layers whose experts stay on the host, from the file's types: a layer
+        /// whose three stacks the card leg does not run (`accepts::leg_runs`, the arms the plan's
+        /// rule reads).
         fn host_layers(file: &Split, hp: &Hparams) -> usize {
             (hp.dense_lead..hp.n_trunk)
                 .filter(|&l| {
-                    !routed_stacks(l).iter().all(|name| {
-                        file.find(name)
-                            .is_some_and(|(_, info)| card_routed(info.ty).is_some())
-                    })
+                    let ty = routed_stacks(l).map(|name| file.find(&name).map(|(_, info)| info.ty));
+                    !matches!(ty, [Some(gate), Some(up), Some(down)]
+                        if accepts::leg_runs(Program::Glm5nextBody, [gate, up, down]) == Some(true))
                 })
                 .count()
         }

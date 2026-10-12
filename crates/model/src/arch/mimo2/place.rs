@@ -21,6 +21,7 @@ use super::hparams::Hparams;
 use super::{roles, spec};
 use crate::arch::chat_of;
 use crate::arch::coverage;
+use crate::placement::accepts::{Program, routed_rule};
 use crate::placement::{
     self, CardFormat, KvBytes, Machine, ModelTensors, PlacementError, Plan, PlanLevers,
     Unimplemented, Violation, checked, joined,
@@ -163,7 +164,14 @@ impl PlanInputs {
             });
         }
         let kv = self.seq_terms().slots_of(slots.get() as u64);
-        let plan = placement::plan_routed(&self.model, machine, ctx_max, &kv, levers, card_routed)?;
+        let plan = placement::plan_routed(
+            &self.model,
+            machine,
+            ctx_max,
+            &kv,
+            levers,
+            routed_rule(Program::Mimo2Body),
+        )?;
         checked(plan).map_err(PlaceError::Broken)
     }
 

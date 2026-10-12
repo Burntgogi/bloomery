@@ -5,7 +5,7 @@
 //! refused by name, the program hangs none), the machine
 //! `model::arch::qwen3moe::place::machine` lays out on it with the scratch
 //! the body's placed load holds past the m = 1 scratch, the plan by the
-//! expert rule over the stacks `card_routed` loads — the trunk on the card,
+//! expert rule over the stacks `routed_rule` loads — the trunk on the card,
 //! each layer's routed id prefix as the budget holds, the rest on the host
 //! tier — and the `plan` record of it. A plan that holds no host expert
 //! opens the whole model on the plan's card, as the unplaced load does, when
@@ -46,9 +46,10 @@ use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::residency38::{checkpoints_pinned, reserve_checkpoints};
 use bloomery_levers::{HostCfg, Levers};
 use gguf::Split;
-use model::arch::qwen3moe::place::{self as q3, card_routed};
+use model::arch::qwen3moe::place as q3;
 use model::arch::qwen35moe::hparams::Kind;
 use model::arch::qwen35moe::place as q35;
+use model::placement::accepts::{Program, routed_rule};
 use model::placement::ctx::{ExpertBytes, SlotCtx};
 use model::placement::workstation::{self, CardSpec, DeviceInfo, GRANULE};
 use model::placement::{
@@ -418,7 +419,9 @@ impl PlaceQ3 {
         let ctx = u64::try_from(ctx)?;
         Ok(match &self.inputs {
             Inputs::Qwen3(i) => i.plan(machine, ctx, levers)?,
-            Inputs::Qwen35(i) => i.plan_rule(machine, ctx, levers, card_routed)?,
+            Inputs::Qwen35(i) => {
+                i.plan_rule(machine, ctx, levers, routed_rule(Program::Qwen35Body))?
+            }
         })
     }
 

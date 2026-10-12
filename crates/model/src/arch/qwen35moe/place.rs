@@ -14,10 +14,10 @@
 //! ([`PlanInputs::plan`], the plan the program loads), or by the expert rule
 //! ([`PlanInputs::plan_with`] under [`Experts::Card`]): each eligible layer's
 //! id prefix `[0, n_l)`, spread evenly, on the layers whose three routed stacks the card experts read
-//! ([`card_routed`]: a Q4_K, Q5_K, IQ3_XXS or IQ4_XS gate and up, a Q5_1,
-//! Q8_0 or IQ4_NL down, each in the file's blocks), the rest on the host. A
-//! layer with a stack they do not
-//! read keeps every expert on the host, each such stack named with the reason
+//! in their parts ([`routed_rule`] of [`PROGRAM`]: a Q4_K, Q5_K, IQ3_XXS or
+//! IQ4_XS gate and up of one type, a Q5_1, Q8_0 or IQ4_NL down, each in the
+//! file's blocks), the rest on the host. A layer with a stack of a type no
+//! part reads keeps every expert on the host, each such stack named with the reason
 //! ([`PlanInputs::host_only`]).
 //!
 //! The attention layers select their positions by the mean-pool indexer at
@@ -50,6 +50,7 @@ use super::{mtp, names, roles, spec};
 use crate::arch::chat_of;
 use crate::arch::coverage;
 use crate::fileio::hex;
+use crate::placement::accepts::{Program, qwen38_down, qwen38_gate_up, routed_rule};
 use crate::placement::workstation::{
     self, A6000, CONTEXT, CardSpec, GRANULE, HostRead, MARGIN, RTX_3090, SCRATCH,
     TIER_BATCH_HOST_RESERVE, TIER_BATCH_RESERVE, TierBatchBytes, host_of, tier_batch_host_bytes,
@@ -57,7 +58,7 @@ use crate::placement::workstation::{
 };
 use crate::placement::{
     self, Card, CardFormat, Host, KvBytes, Machine, ModelTensor, ModelTensors, PlacementError,
-    Plan, PlanLevers, RoutedFormat, Unimplemented, Violation, checked, joined,
+    Plan, PlanLevers, RoutedRule, Unimplemented, Violation, checked, joined,
 };
 
 use runtime::stores::{
@@ -90,36 +91,27 @@ pub fn serve_ctx(ctx: u64, hp: &Hparams) -> Result<u64, PlaceError> {
 pub enum Experts {
     /// Every routed expert on the host: the plan [`PlanInputs::plan`] makes.
     Host,
-    /// The expert rule on the layers whose routed stacks [`card_routed`]
-    /// loads: each such layer's id prefix `[0, n_l)` on the card, as many as
+    /// The expert rule on the layers whose routed stacks [`routed_rule`] of
+    /// [`PROGRAM`] loads: each such layer's id prefix `[0, n_l)` on the card, as many as
     /// the card's budget holds, spread evenly over them; the rest on the host.
     Card,
 }
 
-/// The routed stacks the card experts read, in their card format, each as the
-/// file stores it ([`CardFormat::KQuant`]): a Q4_K, Q5_K, IQ3_XXS or IQ4_XS
-/// gate and up (`kq_gate_up_act_q4k`, `kq_gate_up_act_q5k`,
-/// `iq3_xxs_gate_up_sel`, `iq4_xs_gate_up_sel`) and a Q5_1, Q8_0 or IQ4_NL
-/// down (`q5_1_gemv_sel`, `q8_0_gemv_sel32`, `iq4_nl_gemv_sel32`: the down's
-/// `block_q5_1`s, 24 bytes a 32 values, its `block_q8_0`s, 34 bytes, or its
-/// `block_iq4_nl`s, 18 bytes, unpacked). The rule reads a stack's
-/// type alone: a stack of one of these types in a place the card leg does not
-/// run it in (a Q5_1, Q8_0 or IQ4_NL gate or up, a Q4_K, Q5_K, IQ3_XXS or
-/// IQ4_XS down) is refused by
-/// name at load (`Card38::new`, `swap38::stacks`). A stack of any other type
-/// keeps its layer's experts on the host ([`host_only_reason`]).
+/// The Qwen3.8 program, whose card experts read the routed stacks
+/// ([`routed_rule`] of it) by part, each as the file stores it
+/// ([`CardFormat::KQuant`]): a gate and an up of one type, a Q4_K, Q5_K,
+/// IQ3_XXS or IQ4_XS ([`qwen38_gate_up`]), and a Q5_1, Q8_0 or IQ4_NL down
+/// ([`qwen38_down`]). A layer with a stack of another type, or of one of
+/// these in a part the card leg does not run it in (a Q8_0 gate, a Q4_K
+/// down), keeps its experts on the host.
+pub const PROGRAM: Program = Program::Qwen38Body;
+
+/// A type [`PROGRAM`]'s card leg reads in some part: the question of a stack
+/// read alone (a type no part reads keeps its layer on the host,
+/// [`host_only_reason`]); the plan reads [`routed_rule`] by part.
 #[must_use]
 pub fn card_routed(ty: GgmlType) -> Option<CardFormat> {
-    match ty {
-        GgmlType::Q4_K
-        | GgmlType::Q5_K
-        | GgmlType::Q5_1
-        | GgmlType::Q8_0
-        | GgmlType::IQ3_XXS
-        | GgmlType::IQ4_XS
-        | GgmlType::IQ4_NL => Some(CardFormat::KQuant),
-        _ => None,
-    }
+    (qwen38_gate_up(ty).is_some() || qwen38_down(ty).is_some()).then_some(CardFormat::KQuant)
 }
 
 /// Why a routed stack of type `ty` keeps its layer's experts on the host;
@@ -500,7 +492,7 @@ impl PlanInputs {
     }
 
     /// The target's plan, unchecked: every routed expert on the host, or the
-    /// expert rule over [`card_routed`]'s layers within each card's budget
+    /// expert rule over [`routed_rule`]'s layers within each card's budget
     /// less `beside`'s reserve ([`placement::plan_routed_reserving`]) — on a machine
     /// with expert tier cards, the stage cards first and each tier the next
     /// ids after them (plan (b′), [`machine_bp`]); then the PLE table's tier
@@ -518,7 +510,7 @@ impl PlanInputs {
     ) -> Result<Plan<'a>, PlaceError> {
         let rule = match experts {
             Experts::Host => None,
-            Experts::Card => Some(card_routed as RoutedFormat),
+            Experts::Card => Some(routed_rule(PROGRAM)),
         };
         self.target_rule(machine, ctx_max, levers, rule, beside)
     }
@@ -536,7 +528,7 @@ impl PlanInputs {
     ) -> Result<Plan<'a>, PlaceError> {
         let rule = match experts {
             Experts::Host => None,
-            Experts::Card => Some(card_routed as RoutedFormat),
+            Experts::Card => Some(routed_rule(PROGRAM)),
         };
         self.target_rule_of(machine, ctx_max, levers, rule, beside, kv)
     }
@@ -559,7 +551,7 @@ impl PlanInputs {
         machine: &'a Machine,
         ctx_max: u64,
         levers: &PlanLevers,
-        rule: Option<RoutedFormat>,
+        rule: Option<RoutedRule>,
         beside: Beside<'_>,
         kv: &dyn KvBytes,
     ) -> Result<Plan<'a>, PlaceError> {
@@ -601,23 +593,22 @@ impl PlanInputs {
         machine: &'a Machine,
         ctx_max: u64,
         levers: &PlanLevers,
-        rule: Option<RoutedFormat>,
+        rule: Option<RoutedRule>,
         beside: Beside<'_>,
     ) -> Result<Plan<'a>, PlaceError> {
         self.target_rule_of(machine, ctx_max, levers, rule, beside, &self.kv)
     }
     /// `levers`, the routed experts by the expert rule over the layers whose
     /// three routed stacks `rule` loads — the card rule of the program that
-    /// runs the plan, as [`card_routed`] is Qwen3.8's and
-    /// `qwen3moe::place::card_routed` the qwen3moe program's for a qwen35moe
-    /// file — the rest on the host. Refused as [`PlanInputs::plan_with`]
+    /// runs the plan ([`routed_rule`]: [`PROGRAM`]'s, or the qwen35moe body's
+    /// for a qwen35moe file) — the rest on the host. Refused as [`PlanInputs::plan_with`]
     /// refuses; a machine with an expert tier card is refused by name.
     pub fn plan_rule<'a>(
         &'a self,
         machine: &'a Machine,
         ctx_max: u64,
         levers: &PlanLevers,
-        rule: RoutedFormat,
+        rule: RoutedRule,
     ) -> Result<Plan<'a>, PlaceError> {
         if ctx_max == 0 || ctx_max > KERNEL_POSITIONS {
             return Err(PlaceError::Positions { ctx_max });
@@ -1728,7 +1719,7 @@ impl MtpInputs {
             ctx_max,
             &kv,
             &PlanLevers::default(),
-            CardFormat::of_routed,
+            RoutedRule::PerType(CardFormat::of_routed),
         )?;
         let held: u64 = draft.n_l.iter().sum();
         if held != self.model.experts {
@@ -2113,7 +2104,7 @@ mod tests {
         assert_eq!(selecting.in_q8().layer_bytes(0, 4096), sel);
     }
 
-    /// The card rule over Qwen3.8's routed stacks ([`super::card_routed`]) on
+    /// The card rule over Qwen3.8's routed stacks ([`super::routed_rule`]) on
     /// six synthetic layers of the file's per-expert shapes (512 experts; a
     /// Q4_K gate and up of 640 rows of 2560 values, a Q5_1 down of 2560 rows
     /// of 640): layers 0, 1, 3 and 5 as most of the file's layers, layer 2 as
@@ -2124,7 +2115,7 @@ mod tests {
 
         use gguf::GgmlType;
 
-        use super::super::{card_routed, host_only_reason};
+        use super::super::{PROGRAM, card_routed, host_only_reason, routed_rule};
         use crate::placement::{
             self, Card, CardFormat, Device, Format, Host, KvBytes, Machine, ModelTensor,
             ModelTensors, Plan, PlanLevers, Role,
@@ -2256,7 +2247,7 @@ mod tests {
                 4096,
                 &NoKv,
                 levers,
-                card_routed,
+                routed_rule(PROGRAM),
                 reserve,
             )
             .expect("the card plan")
@@ -2446,7 +2437,7 @@ mod tests {
         };
         use crate::arch::synthetic::header;
         use crate::fileio::hex;
-        use crate::placement::{self, CardFormat, Device, PlanLevers, Role};
+        use crate::placement::{self, CardFormat, Device, PlanLevers, Role, RoutedRule};
 
         /// The draft program's arena formula, at the file's vocabulary:
         /// the derived value the doc states, the dense flash partials' term
@@ -2607,7 +2598,7 @@ mod tests {
                     4096,
                     &m.kv,
                     &PlanLevers::default(),
-                    CardFormat::of_routed,
+                    RoutedRule::PerType(CardFormat::of_routed),
                 )
                 .expect("the draft's plan");
                 assert!(plan.violations().is_empty(), "{:?}", plan.violations());
@@ -2743,7 +2734,7 @@ mod tests {
         use crate::placement::workstation::HostRead;
         use crate::placement::{
             self, Card, CardFormat, Host, KvBytes, Machine, ModelTensor, ModelTensors, Plan,
-            PlanLevers, Role,
+            PlanLevers, Role, RoutedRule,
         };
 
         const CTX: u64 = 4096;
@@ -2940,7 +2931,7 @@ mod tests {
                 CTX,
                 &kv,
                 &PlanLevers::default(),
-                CardFormat::of_routed,
+                RoutedRule::PerType(CardFormat::of_routed),
             )
             .expect("the draft's plan");
             let bytes = draft_card_bytes(&plan.cards[0], mtp.map_bytes) + mtp.arena_bytes();

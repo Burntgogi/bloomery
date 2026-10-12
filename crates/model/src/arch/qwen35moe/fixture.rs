@@ -14,7 +14,7 @@
 //! What it keeps: all four expert kernel pairs, on the card and on the host
 //! (q5_K and q8_0 on f0, q4_K and q5_1 on f1 and f2, q4_K and q8_0 on f3),
 //! the QSA→GDN step, and PLE on a GDN layer. Every one of the four layers is
-//! card-eligible (`place::card_routed` loads each stack type), so the planned
+//! card-eligible (the leg of `place::PROGRAM` runs each layer's three stacks), so the planned
 //! budget below leaves half of every layer's experts on the host and none of
 //! the layers host-only. What it drops: the interval 4 — the fixture writes 2
 //! ([`FIXTURE_INTERVAL`]), which re-derives the same layer kinds from the

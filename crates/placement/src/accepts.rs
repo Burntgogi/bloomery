@@ -7,7 +7,8 @@
 use gguf::GgmlType;
 use models::Arch;
 
-use crate::kernels::{self, DownEntry, GateUpEntry};
+use crate::kernels::{self, DownAct, DownEntry, GateUpEntry};
+use crate::placement::{CardFormat, RoutedRule};
 
 /// A layer program: the chain that runs a family's layers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -93,5 +94,211 @@ pub const fn qwen35_down(ty: GgmlType) -> Option<DownEntry> {
         | DownEntry::Iq4nl
         | DownEntry::Iq4xs
         | DownEntry::Mxfp4 => None,
+    }
+}
+
+/// The card gate·up entry `Body38`'s card leg (`crates/gpu/src/arch/qwen3moe/card38.rs`)
+/// runs a routed gate or up stack of `ty` with: the table's [`kernels::gate_up`]
+/// row of the K-quants and i-quants the leg launches (`kq_gate_up_act_q4k`,
+/// `kq_gate_up_act_q5k`, `iq3_xxs_gate_up_sel`, `iq4_xs_gate_up_sel`): a Q4_K,
+/// Q5_K, IQ3_XXS or IQ4_XS.
+#[must_use]
+pub const fn qwen38_gate_up(ty: GgmlType) -> Option<GateUpEntry> {
+    match kernels::gate_up(ty) {
+        Some(
+            e @ (GateUpEntry::Q4k | GateUpEntry::Q5k | GateUpEntry::Iq3xxs | GateUpEntry::Iq4xs),
+        ) => Some(e),
+        _ => None,
+    }
+}
+
+/// The card down entry `Body38`'s card leg runs a routed down stack of `ty`
+/// with: the table's [`kernels::down`] row over the 32-value activation the leg
+/// quantizes ([`DownAct::Q8Blocks32`]: `q5_1_gemv_sel`, `q8_0_gemv_sel32`,
+/// `iq4_nl_gemv_sel32`): a Q5_1, Q8_0 or IQ4_NL.
+#[must_use]
+pub const fn qwen38_down(ty: GgmlType) -> Option<DownEntry> {
+    match kernels::down(ty) {
+        Some((e @ (DownEntry::Q5_1 | DownEntry::Q8_0 | DownEntry::Iq4nl), DownAct::Q8Blocks32)) => {
+            Some(e)
+        }
+        _ => None,
+    }
+}
+
+/// A card leg's arms: the types its gate·up launches read a gate or an up
+/// stack in, and the types its down launches read a down stack in.
+#[derive(Clone, Copy, Debug)]
+pub struct LegArms {
+    pub gate_up: fn(GgmlType) -> bool,
+    pub down: fn(GgmlType) -> bool,
+}
+
+/// Program `p`'s card leg arms, as its load checks each layer it gives card
+/// experts; `None` for a program whose card experts run each stack alone in
+/// its own format (V4.1's chain).
+#[must_use]
+pub fn leg_arms(p: Program) -> Option<LegArms> {
+    match p {
+        Program::Qwen3moeBody | Program::Qwen35Body => Some(LegArms {
+            gate_up: |ty| qwen35_gate_up(ty).is_some(),
+            down: |ty| qwen35_down(ty).is_some(),
+        }),
+        Program::Qwen38Body => Some(LegArms {
+            gate_up: |ty| qwen38_gate_up(ty).is_some(),
+            down: |ty| qwen38_down(ty).is_some(),
+        }),
+        Program::Glm5nextBody | Program::Mimo2Body => Some(LegArms {
+            gate_up: kernels::card_gate_up_runs,
+            down: kernels::card_down_runs,
+        }),
+        Program::Deepseek41Chain => None,
+    }
+}
+
+/// Whether program `p`'s card leg runs a layer of routed gate, up and down
+/// stacks of these types ([`leg_arms`]): a gate and an up of one type its
+/// gate·up launches read, and a down its down launches read. `None` for a
+/// program with no card leg.
+#[must_use]
+pub fn leg_runs(p: Program, [gate, up, down]: [GgmlType; 3]) -> Option<bool> {
+    leg_arms(p).map(|a| gate == up && (a.gate_up)(gate) && (a.down)(down))
+}
+
+/// Program `p`'s plan rule for its routed stacks ([`RoutedRule`]): on a card
+/// leg, each part by the arm its load reads ([`leg_runs`]), so a layer the
+/// plan gives card experts is one the load runs. The common leg's plan
+/// carries a type on the card only where both its gate·up and its down
+/// launches read it ([`kernels::card_runs`]), in every part. V4.1's chain
+/// takes each stack alone in its own format ([`CardFormat::of_routed`]).
+#[must_use]
+pub fn routed_rule(p: Program) -> RoutedRule {
+    match p {
+        Program::Qwen3moeBody | Program::Qwen35Body => RoutedRule::Leg {
+            gate_up: |ty| qwen35_gate_up(ty).map(|_| CardFormat::KQuant),
+            down: |ty| qwen35_down(ty).map(|_| CardFormat::KQuant),
+        },
+        Program::Qwen38Body => RoutedRule::Leg {
+            gate_up: |ty| qwen38_gate_up(ty).map(|_| CardFormat::KQuant),
+            down: |ty| qwen38_down(ty).map(|_| CardFormat::KQuant),
+        },
+        Program::Glm5nextBody | Program::Mimo2Body => RoutedRule::Leg {
+            gate_up: common_leg_card,
+            down: common_leg_card,
+        },
+        Program::Deepseek41Chain => RoutedRule::PerType(CardFormat::of_routed),
+    }
+}
+
+/// The common leg's plan arm: a type both its gate·up and down launches read.
+fn common_leg_card(ty: GgmlType) -> Option<CardFormat> {
+    kernels::card_runs(ty).then_some(CardFormat::KQuant)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::placement::{ModelTensor, ModelTensors, Role};
+
+    const PROGRAMS: [Program; 6] = [
+        Program::Deepseek41Chain,
+        Program::Qwen3moeBody,
+        Program::Qwen35Body,
+        Program::Glm5nextBody,
+        Program::Qwen38Body,
+        Program::Mimo2Body,
+    ];
+
+    /// Every type the file format names.
+    fn types() -> Vec<GgmlType> {
+        (0..64)
+            .map(GgmlType::from_u32)
+            .filter(|t| !matches!(t, GgmlType::Unknown(_)))
+            .collect()
+    }
+
+    /// One layer for each (gate, up, down) triple of `types`, its three
+    /// routed stacks named by the tail a file gives them (the part is read
+    /// from that tail, the layer from `layer`).
+    fn triples(types: &[GgmlType]) -> (ModelTensors, Vec<[GgmlType; 3]>) {
+        let mut tensors = Vec::new();
+        let mut layers = Vec::new();
+        for &g in types {
+            for &u in types {
+                for &d in types {
+                    let l = layers.len();
+                    for (part, ty) in [("gate", g), ("up", u), ("down", d)] {
+                        tensors.push(ModelTensor {
+                            name: format!("ffn_{part}_exps.weight"),
+                            shard: 0,
+                            layer: Some(l),
+                            role: Role::RoutedExperts,
+                            ty,
+                            dims: vec![256, 4, 8],
+                            file_bytes: 0,
+                            gathered_rows: None,
+                        });
+                    }
+                    layers.push([g, u, d]);
+                }
+            }
+        }
+        let model = ModelTensors {
+            tensors,
+            layers: layers.len(),
+            experts: 8,
+            experts_used: 2,
+        };
+        (model, layers)
+    }
+
+    /// A layer each program's plan rule gives card experts is one its card
+    /// leg's load runs, for every (gate, up, down) triple of the file
+    /// format's types: the plan's rule and the load's check read one table.
+    /// Mutants, each a defect as it shipped: Qwen3-30B's or Qwen3.8's rule
+    /// read per type over the union of its parts (a Q6_K, a Q8_0 gate), the
+    /// common leg's per type (a gate and an up of two types) — each names its
+    /// program and triples.
+    #[test]
+    fn a_layer_the_plan_cards_is_one_its_load_runs() {
+        let (model, layers) = triples(&types());
+        let mut broken = Vec::new();
+        for p in PROGRAMS {
+            let rule = routed_rule(p);
+            for (l, &tys) in layers.iter().enumerate() {
+                let stacks = [3 * l, 3 * l + 1, 3 * l + 2];
+                let cards = rule.layer_runs(&stacks, &model).expect("named stacks");
+                if cards && leg_runs(p, tys) == Some(false) {
+                    broken.push(format!("{p:?} {tys:?}"));
+                }
+            }
+        }
+        assert!(
+            broken.is_empty(),
+            "{} layers the plan cards and the load refuses, first: {:?}",
+            broken.len(),
+            &broken[..broken.len().min(8)]
+        );
+    }
+
+    /// Qwen3.8's arms are the card leg's launches: a Q4_K, Q5_K, IQ3_XXS or
+    /// IQ4_XS gate·up and a Q5_1, Q8_0 or IQ4_NL down, no other type.
+    #[test]
+    fn qwen38_arms_are_its_legs_launches() {
+        for ty in types() {
+            assert_eq!(
+                qwen38_gate_up(ty).is_some(),
+                matches!(
+                    ty,
+                    GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::IQ3_XXS | GgmlType::IQ4_XS
+                ),
+                "{ty} gate·up"
+            );
+            assert_eq!(
+                qwen38_down(ty).is_some(),
+                matches!(ty, GgmlType::Q5_1 | GgmlType::Q8_0 | GgmlType::IQ4_NL),
+                "{ty} down"
+            );
+        }
     }
 }

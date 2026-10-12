@@ -40,7 +40,7 @@
 //!    [GDN, QSA, GDN, QSA], pools [0, 4, 0, 4], the PLE site at layer 2, and the draft as a draft
 //!    of the target;
 //! 10. the card budget: the plan of the written file under its recorded budget holds half of the
-//!     experts (256) on every layer `card_routed` admits and none on the others, its budgetless
+//!     experts (256) on every layer `routed_rule` admits and none on the others, its budgetless
 //!     plan all of them; a budget one step either side of the recorded one is refused by name, and
 //!     `verify` refuses a header whose recorded budget is not the plan's;
 //! 11. the silent traps of ik's reader: a per-layer array one short, a missing `ple.layers`, and

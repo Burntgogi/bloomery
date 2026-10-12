@@ -4,40 +4,35 @@
 //! puts every tensor but the routed stacks on the card — attention or delta
 //! rule, router, shared expert, embedding and head — and the routed experts
 //! by the expert rule over the layers whose three stacks its card experts
-//! read ([`card_routed`]), the rest on the host.
+//! read in their parts ([`routed_rule`] of [`PROGRAM`]), the rest on the host.
 //!
 //! A qwen35moe file plans through `qwen35moe::place::PlanInputs::plan_rule`
-//! with [`card_routed`] (its headers, roles and caches are that module's);
+//! with [`routed_rule`] of [`Program::Qwen35Body`] (its headers, roles and caches are that module's);
 //! a qwen3moe file through [`PlanInputs`] here. Both run on the machine
 //! [`machine`] lays out: one card with the workstation's context and margin
 //! and a scratch the caller sizes from the program's own arenas.
 
-use gguf::{GgmlType, Split};
+use gguf::Split;
 
 use super::hparams::Hparams;
 use super::roles;
-use crate::arch::coverage::{qwen35_down, qwen35_gate_up};
+use crate::placement::accepts::{Program, routed_rule};
 use crate::placement::workstation::{
     CONTEXT, CardSpec, GRANULE, MARGIN, SCRATCH, host_of, unified_of,
 };
 use crate::placement::{
-    self, Card, CardFormat, KvBytes, Machine, ModelTensors, PlacementError, Plan, PlanLevers,
-    Violation, checked, joined,
+    self, Card, KvBytes, Machine, ModelTensors, PlacementError, Plan, PlanLevers, Violation,
+    checked, joined,
 };
 use runtime::stores::{kv_q8_row_bytes, kv_row_bytes};
 
-/// The routed stacks the qwen3moe program's card experts read, each in the
-/// file's blocks ([`CardFormat::KQuant`]): a type the card kernel table
-/// gives the program's routed gate·up or down an entry on both the decode
-/// and the prompt path ([`qwen35_gate_up`], [`qwen35_down`]) — a Q4_K or
-/// Q5_K gate and up, a Q4_K, Q5_K or Q6_K down. The rule reads a stack's
-/// type alone; the load refuses by name a stack of one of these types in a
-/// part no entry runs it in (a Q6_K gate or up). A stack of any other type
-/// keeps its layer's experts on the host.
-#[must_use]
-pub fn card_routed(ty: GgmlType) -> Option<CardFormat> {
-    (qwen35_gate_up(ty).is_some() || qwen35_down(ty).is_some()).then_some(CardFormat::KQuant)
-}
+/// The qwen3moe program, whose card experts read the routed stacks
+/// ([`routed_rule`] of it): by part, a gate and an up
+/// of one type the program's routed gate·up launches read (a Q4_K or Q5_K)
+/// and a down its down launches read (a Q4_K, Q5_K or Q6_K). A layer with a
+/// stack of another type, or of one of these in a part no entry runs it in
+/// (a Q6_K gate), keeps its experts on the host.
+pub const PROGRAM: Program = Program::Qwen3moeBody;
 
 /// The machine a placed load of the program runs on: `card` runs every one
 /// of `layers`, the head and the token embedding whole, with the
@@ -168,7 +163,7 @@ impl PlanInputs {
 
     /// The placement of the file on `machine` at `ctx_max` positions under
     /// `levers`: the routed experts by the expert rule over the layers whose
-    /// stacks [`card_routed`] loads, the rest on the host. Refused when it
+    /// stacks [`routed_rule`] of [`PROGRAM`] loads, the rest on the host. Refused when it
     /// cannot be built or breaks an invariant (every violation listed), at a
     /// context of 0, and on a machine with an expert tier card.
     pub fn plan<'a>(
@@ -185,8 +180,14 @@ impl PlanInputs {
                 tier: tier.name.clone(),
             });
         }
-        let plan =
-            placement::plan_routed(&self.model, machine, ctx_max, &self.kv, levers, card_routed)?;
+        let plan = placement::plan_routed(
+            &self.model,
+            machine,
+            ctx_max,
+            &self.kv,
+            levers,
+            routed_rule(PROGRAM),
+        )?;
         checked(plan).map_err(PlaceError::Broken)
     }
 }

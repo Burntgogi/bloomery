@@ -18,7 +18,7 @@
 //! ([`checked`], [`joined`]) — one owner beside the planner it checks.
 
 pub use bloomery_placement::placement::*;
-pub use bloomery_placement::{kernels, slots};
+pub use bloomery_placement::{accepts, kernels, slots};
 pub mod host_lock;
 pub mod workstation;
 

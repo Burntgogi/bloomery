@@ -37,7 +37,7 @@ use std::ops::Range;
 use gguf::{GgmlType, Split, Value};
 use model::arch::deepseek41::{hparams::Hparams, kv::KvLayout, roles};
 use model::arch::dspark::{self, DraftCardBytes};
-use model::arch::glm5next::place::card_routed;
+use model::placement::accepts::{Program, routed_rule};
 use model::placement::{
     self, Card, CardFormat, CardTotals, Device, ExpertList, Format, KvBytes, Machine, ModelTensor,
     ModelTensors, PlacementError, Plan, PlanLevers, Role, workstation,
@@ -1166,7 +1166,7 @@ fn card_tensor_without_card_format_is_refused_by_name() {
 }
 
 /// Which routed stacks go on the card is the program's: under glm5next's
-/// card experts ([`card_routed`]) a q5_K stack keeps experts on the card, in
+/// card experts ([`routed_rule`]) a q5_K stack keeps experts on the card, in
 /// its file bytes, where V4.1's rule ([`placement::plan_with`]) keeps it on
 /// the host; a q6_K stack stays on the host under both.
 #[test]
@@ -1185,7 +1185,8 @@ fn routed_card_format_is_the_programs() {
             ty,
             &[4, 8],
         )]);
-        let plan = placement::plan_routed(&stack, &machine, 4096, &NoKv, &levers, card_routed)
+        let rule = routed_rule(Program::Glm5nextBody);
+        let plan = placement::plan_routed(&stack, &machine, 4096, &NoKv, &levers, rule)
             .unwrap_or_else(|e| panic!("a {ty} routed stack plans: {e}"));
         assert!(
             plan.violations().is_empty(),

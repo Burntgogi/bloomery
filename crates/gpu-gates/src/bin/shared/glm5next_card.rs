@@ -7,7 +7,7 @@
 //! - (i) slot map: every routed layer's row of the host tier's slot map
 //!   holds the layer's card experts — `[0, n_l)`, `n_l` the plan's — in slots `0..n_l` in ascending
 //!   id order, and the host mark on the rest; card experts sit only on
-//!   layers whose three stacks `card_routed` reads, and those layers' counts
+//!   layers whose three stacks the card leg runs (`accepts::leg_runs`), and those layers' counts
 //!   differ by at most one (the expert rule deals one at a time in turn);
 //!   without a card budget (`BLOOMERY_CARD_BUDGET`) each of them holds at
 //!   least one, so a plan that quietly keeps every expert on the host fails.
@@ -40,8 +40,9 @@ use bloomery_gpu_glm5next::Body;
 use cuda_core::DeviceBuffer;
 use gguf::{GgmlType, Split};
 use model::arch::glm5next::hparams::Hparams;
-use model::arch::glm5next::place::{PlanInputs, card_routed};
+use model::arch::glm5next::place::PlanInputs;
 use model::arch::names::routed_stacks;
+use model::placement::accepts::{self, Program};
 use model::placement::kernels::{self, DownEntry, GateUpEntry};
 
 /// The modules of the card leg's one-slot entries, by the common rule's
@@ -95,15 +96,17 @@ fn card_lists(n_l: &[u64]) -> Result<Vec<Vec<u32>>, GateError> {
         .collect()
 }
 
-/// The trunk's routed layers whose three stacks `card_routed` reads, from the file's types.
+/// The trunk's routed layers whose three stacks the card leg runs (`accepts::leg_runs`, the
+/// arms the plan's rule reads), from the file's types.
 fn readable_layers(split: &Split, hp: &Hparams) -> Vec<usize> {
     (hp.dense_lead..hp.n_trunk)
         .filter(|&l| {
-            routed_stacks(l).iter().all(|name| {
-                split
-                    .find(name)
-                    .is_some_and(|(_, info)| card_routed(info.ty).is_some())
-            })
+            match routed_stacks(l).map(|name| split.find(&name).map(|(_, info)| info.ty)) {
+                [Some(gate), Some(up), Some(down)] => {
+                    accepts::leg_runs(Program::Glm5nextBody, [gate, up, down]) == Some(true)
+                }
+                _ => false,
+            }
         })
         .collect()
 }
