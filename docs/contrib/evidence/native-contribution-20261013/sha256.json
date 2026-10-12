@@ -51,7 +51,7 @@
   },
   "hip-host-test.log": {
     "source_sha256": "4963cbfaa6afc7589906a46614c3836819751f8a4e9487e399615f119109c354",
-    "published_sha256": "bdefcddde842ca7d0106f84a10ec998b3591ae2648ab402ada82a5b3d5910165",
+    "published_sha256": "4776004fa327f4d9649e02e32dfa88bf39016cb8ab5944ff710cbe2060200fa1",
     "source_record": "evidence/step2/host-test.log"
   },
   "hip-host-clippy.log": {
