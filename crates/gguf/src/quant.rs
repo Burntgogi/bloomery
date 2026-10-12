@@ -1206,6 +1206,28 @@ pub fn quantize_row_q8_2_x4_roundtrip(x: &[f32], out: &mut [f32]) {
     }
 }
 
+/// Round-trip f32 activations through mainline ggml's x86 **Q8_0** activation quantization,
+/// the column a Q2_0 weight's dot reads: `quantize_row_q8_0` (llama.cpp `f2cc7282c`
+/// ggml-cpu/arch/x86/quants.c:302). Per 32 values `d = f16(amax / 127)`, rounded to nearest
+/// even, and each code `round_half_even(v * id)` with `id = 127 / amax`. That is not
+/// `quantize_row_q8_0_ref`'s rule, which codes with `1 / d` of the f32 `d = amax / 127`, before
+/// its f16 rounding, and `roundf`. A block whose multiplier overflows (amax below about 2^-121)
+/// restores to zero, as qdot's encoder flushes it.
+pub fn quantize_row_q8_0_roundtrip(x: &[f32], out: &mut [f32]) {
+    assert_eq!(x.len(), out.len(), "q8_0 round-trip needs matching lengths");
+    assert!(x.len().is_multiple_of(32), "q8_0 blocks are 32 values");
+    let (blocks, _) = x.as_chunks::<32>();
+    for (xb, ob) in blocks.iter().zip(out.as_chunks_mut::<32>().0) {
+        let amax = xb.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+        let d = half_to_f32(f32_to_f16_bits(amax / 127.0));
+        let id = if amax > 0.0 { 127.0 / amax } else { 0.0 };
+        let id = if id.is_finite() { id } else { 0.0 };
+        for (o, &v) in ob.iter_mut().zip(xb) {
+            *o = d * (v * id).round_ties_even();
+        }
+    }
+}
+
 /// The activation format ggml quantizes to before a dot with this weight type, as the
 /// type-traits table defines it. `Ok(None)` means the activations stay f32.
 ///
@@ -1229,8 +1251,8 @@ pub fn quantize_row_q8_2_x4_roundtrip(x: &[f32], out: &mut [f32]) {
 /// f32 would be a plausible wrong answer. So is every type [`dequant_row`] does not decode. Q2_K and
 /// IQ2_XS take Q8_K in ggml (ggml.c:895, :1105 on the IQK build; `iqk_set_kernels_kquants` and
 /// `iqk_set_kernels_iquants` accept Q8_K only for them); the other i-quants take Q8_K too and have no
-/// CPU matmul here. Q2_0 takes Q8_0 in mainline (`f2cc7282c` ggml-cpu.c:237) and has none here
-/// either.
+/// CPU matmul here. Q2_0, mainline's alone, takes Q8_0 (`f2cc7282c` ggml-cpu.c:237), the column
+/// qdot's Q2_0 kernel reads.
 pub fn activation_format(weight: GgmlType) -> Result<Option<ActivationFormat>, QuantError> {
     match weight {
         GgmlType::Q2_K
@@ -1247,6 +1269,7 @@ pub fn activation_format(weight: GgmlType) -> Result<Option<ActivationFormat>, Q
         | GgmlType::Q8_0
         | GgmlType::MXFP4
         | GgmlType::IQ4_NL => Ok(Some(ActivationFormat::Q8_2X4)),
+        GgmlType::Q2_0 => Ok(Some(ActivationFormat::Q8_0)),
         GgmlType::F32 | GgmlType::F16 => Ok(None),
         GgmlType::BF16
         | GgmlType::IQ2_XXS
@@ -1260,7 +1283,6 @@ pub fn activation_format(weight: GgmlType) -> Result<Option<ActivationFormat>, Q
         | GgmlType::IQ1_M
         | GgmlType::TQ1_0
         | GgmlType::TQ2_0
-        | GgmlType::Q2_0
         | GgmlType::Unknown(_) => Err(QuantError::NoActivationFormat(weight)),
     }
 }
@@ -1269,6 +1291,7 @@ pub fn activation_format(weight: GgmlType) -> Result<Option<ActivationFormat>, Q
 pub enum ActivationFormat {
     Q8K,
     Q8_2X4,
+    Q8_0,
 }
 
 /// Apply whichever activation quantization `weight` implies, in place of a copy; a weight
@@ -1281,6 +1304,7 @@ pub fn quantize_activations(
     match activation_format(weight)? {
         Some(ActivationFormat::Q8K) => quantize_row_q8_k_roundtrip(x, out),
         Some(ActivationFormat::Q8_2X4) => quantize_row_q8_2_x4_roundtrip(x, out),
+        Some(ActivationFormat::Q8_0) => quantize_row_q8_0_roundtrip(x, out),
         None => out.copy_from_slice(x),
     }
     Ok(())
@@ -1422,13 +1446,16 @@ mod tests {
     }
 
     /// The activation format of every type a CPU matmul takes, as ggml's `vec_dot_type` on
-    /// this AVX2 IQK build names it, and BF16 refused by name.
+    /// this AVX2 IQK build names it (Q2_0's, which ik lacks, as mainline's names it), and BF16
+    /// refused by name.
     // PIN(2026-09-27): Q8_0 takes Q8_2_X4, no longer refused — qdot fuses it (q8qdot).
     // PIN(2026-10-11): Q2_K and IQ2_XS take Q8_K, no longer refused — qdot fuses them (qw2h); ggml.c:895
     // and :1105 name Q8_K as their vec_dot_type, and ik's kernel tables accept no other column.
+    // PIN(2026-10-12): Q2_0 takes Q8_0, no longer refused: qdot fuses it, and mainline's ggml-cpu.c:237
+    // (`f2cc7282c`) names Q8_0 as its vec_dot_type.
     #[test]
     fn activation_formats_are_ggmls_vec_dot_types() {
-        use super::ActivationFormat::{Q8_2X4, Q8K};
+        use super::ActivationFormat::{Q8_0, Q8_2X4, Q8K};
         for (ty, want) in [
             (GgmlType::Q2_K, Some(Q8K)),
             (GgmlType::Q3_K, Some(Q8K)),
@@ -1442,6 +1469,7 @@ mod tests {
             (GgmlType::Q5_1, Some(Q8_2X4)),
             (GgmlType::Q8_0, Some(Q8_2X4)),
             (GgmlType::MXFP4, Some(Q8_2X4)),
+            (GgmlType::Q2_0, Some(Q8_0)),
             (GgmlType::F32, None),
             (GgmlType::F16, None),
         ] {

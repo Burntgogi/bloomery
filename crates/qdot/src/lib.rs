@@ -1,7 +1,7 @@
 //! qdot — fused quantized row dots for host CPU: Q3_K x Q8_K, Q4_K/Q5_K x Q8_2_X4,
 //! Q6_K x Q8_2_X4, Q5_0 x Q8_2_X4, Q5_1 x Q8_2_X4, Q8_0 x Q8_2_X4, Q2_K x Q8_K, IQ2_XS x Q8_K,
-//! IQ3_XXS x Q8_K, IQ3_S x Q8_K, MXFP4 x Q8_2_X4, IQ4_NL x Q8_2_X4, IQ4_XS x Q8_K, and Q8_0 x act
-//! cell kernels.
+//! IQ3_XXS x Q8_K, IQ3_S x Q8_K, MXFP4 x Q8_2_X4, IQ4_NL x Q8_2_X4, IQ4_XS x Q8_K, Q2_0 x Q8_0,
+//! and Q8_0 x act cell kernels.
 //!
 //! Dots quantized weight rows directly against quantized activation columns without
 //! materializing f32 weights, scaling once per block:
@@ -26,6 +26,9 @@
 //!   (iqk_gemm_kquants.cpp:644, :3174), the body its AVX2 (non-AVX512) build runs.
 //! - Q8_0 x Q8_2_X4: port of ik's `mul_mat_qX_0_q8_0_T<Q8_0_Unpacker, 1, block_q8_2>`
 //!   (iqk_gemm_legacy_quants.cpp:404, :753), the body its AVX2 (no AVX512-VNNI) build runs.
+//! - Q2_0 x Q8_0: port of mainline's `ggml_vec_dot_q2_0_q8_0_generic` (llama.cpp `f2cc7282c`
+//!   ggml-cpu/quants.c:177), the loop its x86 build runs (arch-fallback.h:90), with its float
+//!   steps fused as a native GCC or Clang build contracts them; ik has no Q2_0.
 //! - Q8_0 x act cells: fused cell kernel for `q_nope2_absorbed` (model::arch::deepseek2::attn).
 //! - Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q5_1, Q8_0, IQ2_XS, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL and MXFP4 tiles: one weight row against up
 //!   to [`TILE_COLS`] columns, each block unpacked once, every column bit-identical to its
@@ -53,7 +56,7 @@ use std::fmt;
 
 use gguf::GgmlType;
 use gguf::iq_tables::{IQ2XS_GRID, IQ3S_GRID, IQ3XXS_GRID, KSIGNS_IQ2XS, KVALUES_IQ4NL};
-use gguf::quant::{KVALUES_MXFP4, e8m0_to_f32_half, half_to_f32};
+use gguf::quant::{KVALUES_MXFP4, e8m0_to_f32_half, f32_to_f16_bits, half_to_f32};
 
 /// `sizeof(block_q3_K)` (ggml-common.h): 110 bytes / 256 values.
 const Q3K_BLOCK: usize = 110;
@@ -67,6 +70,9 @@ const Q5F0_BLOCK: usize = 22;
 const Q5F1_BLOCK: usize = 24;
 /// `sizeof(block_q8_0)` (ggml-common.h): f16 d @0, qs i8[32] @2 — 34 bytes / 32 values.
 const Q8F0_BLOCK: usize = 34;
+/// `sizeof(block_q2_0)` (llama.cpp `f2cc7282c` ggml-common.h:187-192): f16 d @0, qs[16] @2,
+/// 18 bytes / 64 values.
+const Q2F0_BLOCK: usize = 18;
 /// `sizeof(block_q8_2)`: 36 bytes / 32 values for tail blocks past x4 groups.
 const Q82_BLOCK: usize = 36;
 
@@ -186,6 +192,7 @@ fn has_kernel(w: GgmlType) -> bool {
             | GgmlType::MXFP4
             | GgmlType::IQ4_NL
             | GgmlType::IQ4_XS
+            | GgmlType::Q2_0
     )
 }
 
@@ -230,7 +237,7 @@ fn has_features(w: GgmlType) -> bool {
         GgmlType::MXFP4 => avx2() && fma(),
         // dot_q4k/q5k/q6k_q82x4_avx2, dot_q5f0/q5f1/q8f0_q82x4_avx2, dot_q2k_q8k_avx2,
         // dot_iq2xs_q8k_avx2, dot_iq3xxs_q8k_avx2, dot_iq3s_q8k_avx2, dot_iq4nl_q82x4_avx2,
-        // dot_iq4xs_q8k_avx2: enable = "avx2", "fma", "f16c"
+        // dot_iq4xs_q8k_avx2, dot_q2f0_q8f0_avx2: enable = "avx2", "fma", "f16c"
         GgmlType::Q2_K
         | GgmlType::IQ2_XS
         | GgmlType::Q4_K
@@ -242,7 +249,8 @@ fn has_features(w: GgmlType) -> bool {
         | GgmlType::IQ3_XXS
         | GgmlType::IQ3_S
         | GgmlType::IQ4_NL
-        | GgmlType::IQ4_XS => avx2() && fma() && f16c(),
+        | GgmlType::IQ4_XS
+        | GgmlType::Q2_0 => avx2() && fma() && f16c(),
         _ => false,
     }
 }
@@ -254,12 +262,13 @@ fn has_features(_: GgmlType) -> bool {
 }
 
 /// The `k` contract: `k` must be a multiple of the weight format's block size
-/// (256 for K-quants, IQ2_XS, IQ3_XXS, IQ3_S and IQ4_XS, 32 for Q5_0, Q5_1, Q8_0, MXFP4 and
-/// IQ4_NL). A type with no kernel here gets the K-quant contract: its callers outside this crate
+/// (256 for K-quants, IQ2_XS, IQ3_XXS, IQ3_S and IQ4_XS, 64 for Q2_0, 32 for Q5_0, Q5_1, Q8_0,
+/// MXFP4 and IQ4_NL). A type with no kernel here gets the K-quant contract: its callers outside this crate
 /// ask the size contract of weight types that never reach a kernel.
 pub fn k_granularity(w: GgmlType) -> usize {
     match w {
         GgmlType::Q5_0 | GgmlType::Q5_1 | GgmlType::Q8_0 | GgmlType::MXFP4 | GgmlType::IQ4_NL => 32,
+        GgmlType::Q2_0 => 64,
         _ => 256,
     }
 }
@@ -291,6 +300,7 @@ pub fn col_bytes(w: GgmlType, k: usize) -> usize {
             (k / 128) * Q82X4_STRIDE + ((k % 128) / 32) * Q82_BLOCK
         }
         GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K => (k / 128) * Q82X4_STRIDE,
+        GgmlType::Q2_0 => (k / 32) * Q8F0_BLOCK,
         _ => (k / 256) * Q8K_STRIDE,
     }
 }
@@ -299,7 +309,7 @@ pub fn col_bytes(w: GgmlType, k: usize) -> usize {
 ///
 /// Q2_K, Q3_K, IQ2_XS, IQ3_XXS, IQ3_S and IQ4_XS use `block_q8_K` (296 B/256 values); Q4_K, Q5_K, Q5_0, Q5_1,
 /// Q8_0, Q6_K, MXFP4 and IQ4_NL use `block_q8_2_x4` (144 B/128 values), with 36-byte
-/// `block_q8_2` tails for Q5_0/Q5_1/Q8_0/MXFP4/IQ4_NL.
+/// `block_q8_2` tails for Q5_0/Q5_1/Q8_0/MXFP4/IQ4_NL; Q2_0 uses `block_q8_0` (34 B/32 values).
 /// `out.len()` must equal `col_bytes(w, x.len())`; panics otherwise, and by
 /// name on a non-finite activation value (undefined input is refused, never
 /// encoded). Uses the AVX2 encoders when the CPU has AVX2 — byte-identical to
@@ -344,6 +354,15 @@ pub fn quantize_col(w: GgmlType, x: &[f32], out: &mut [u8]) {
                 }
             }
         }
+        GgmlType::Q2_0 => {
+            if avx2 {
+                // SAFETY: AVX2 detected just above; quantize_col_check pinned
+                // out.len() to col_bytes(w, x.len()).
+                unsafe { quantize_q8f0_col_avx2(x, out) }
+            } else {
+                quantize_q8f0_col(x, out);
+            }
+        }
         // quantize_col_check refused every type without a kernel.
         other => unreachable!("qdot has no activation format for {other:?}"),
     }
@@ -382,6 +401,7 @@ pub fn quantize_col_scalar(w: GgmlType, x: &[f32], out: &mut [u8]) {
                 quantize_q8k_block(xb, ob);
             }
         }
+        GgmlType::Q2_0 => quantize_q8f0_col(x, out),
         // quantize_col_check refused every type without a kernel.
         other => unreachable!("qdot has no activation format for {other:?}"),
     }
@@ -474,6 +494,10 @@ pub fn dot_row(w: GgmlType, wrow: &[u8], acol: &[u8], k: usize) -> Result<f32, Q
             // SAFETY: AVX2+FMA+F16C were just detected; lengths validated above.
             Ok(unsafe { dot_iq4xs_q8k_avx2(wrow, acol, nb) })
         }
+        (GgmlType::Q2_0, true) => {
+            // SAFETY: AVX2+FMA+F16C were just detected; lengths validated above.
+            Ok(unsafe { dot_q2f0_q8f0_avx2(wrow, acol, nb) })
+        }
         _ => Ok(dot_row_scalar_ty(w, wrow, acol, nb)),
     }
 }
@@ -508,6 +532,7 @@ fn dot_row_scalar_ty(w: GgmlType, wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
         GgmlType::MXFP4 => dot_mxfp4_q82x4_emul(wrow, acol, nb),
         GgmlType::IQ4_NL => dot_iq4nl_q82x4_emul(wrow, acol, nb),
         GgmlType::IQ4_XS => dot_iq4xs_q8k_emul(wrow, acol, nb),
+        GgmlType::Q2_0 => dot_q2f0_q8f0_scalar(wrow, acol, nb),
         // Every caller passed check_row, which refused a type with no kernel.
         other => unreachable!("qdot has no kernel for {other:?}"),
     }
@@ -578,6 +603,10 @@ pub fn dot_row_avx2(w: GgmlType, wrow: &[u8], acol: &[u8], k: usize) -> Result<f
         GgmlType::Q3_K => {
             // SAFETY: asserted just above; lengths validated by check_row.
             Ok(unsafe { dot_q3k_q8k_avx2(wrow, acol, nb) })
+        }
+        GgmlType::Q2_0 => {
+            // SAFETY: asserted just above; lengths validated by check_row.
+            Ok(unsafe { dot_q2f0_q8f0_avx2(wrow, acol, nb) })
         }
         // check_row refused a type with no kernel.
         other => unreachable!("qdot has no kernel for {other:?}"),
@@ -1226,6 +1255,7 @@ fn check_row(w: GgmlType, wrow_len: usize, acol_len: usize, k: usize) -> Result<
         GgmlType::MXFP4 => (k / 32, (k / 32) * MXFP4_BLOCK),
         GgmlType::IQ4_NL => (k / 32, (k / 32) * IQ4NL_BLOCK),
         GgmlType::IQ4_XS => (k / 256, (k / 256) * IQ4XS_BLOCK),
+        GgmlType::Q2_0 => (k / 64, (k / 64) * Q2F0_BLOCK),
         // The has_kernel check above refused every other type.
         other => unreachable!("qdot has no kernel for {other:?}"),
     };
@@ -3588,6 +3618,75 @@ unsafe fn quantize_q82x4_col_avx2(x: &[f32], out: &mut [u8]) {
             tb[2..4].copy_from_slice(&isum.to_le_bytes());
             tb[4..36].copy_from_slice(&codes);
         }
+    }
+}
+
+/// The q8_0 block's code multiplier from its max |value| `amax`: `127 / amax`,
+/// 0 for a zero block, as mainline's x86 `quantize_row_q8_0` (llama.cpp
+/// `f2cc7282c` ggml-cpu/arch/x86/quants.c:333) computes it, from `amax` and
+/// not from the stored f16 scale. 0 too where `127 / amax` overflows (amax
+/// below about 2^-121), where mainline's codes are the integer-indefinite
+/// -128 and ours 0. No dot tells them apart: that block's f16 `d` is exactly
+/// +0, so `fma(d, s, sumi)` adds a signed zero to `sumi`, whatever `s` is, and
+/// `sumi` is never -0 (it starts at +0, and no step rounds to -0), so it keeps
+/// its value.
+#[inline(always)]
+fn q80_inverse(amax: f32) -> f32 {
+    let id = if amax != 0.0 { 127.0 / amax } else { 0.0 };
+    if id.is_finite() { id } else { 0.0 }
+}
+
+/// Quantizes activations into `block_q8_0` blocks (34 bytes / 32 values: f16
+/// `d`, 32 i8 codes) by mainline's x86 `quantize_row_q8_0` (llama.cpp
+/// `f2cc7282c` ggml-cpu/arch/x86/quants.c:302), the column its
+/// `ggml_vec_dot_q2_0_q8_0` reads: `d = f16(amax / 127)` rounded to nearest
+/// even (mainline's F16C conversion, [`f32_to_f16_bits`] here), codes
+/// `round_half_even(v * id)` with [`q80_inverse`]'s `id`.
+/// So a block whose `d` rounds to an f16 zero keeps its codes. The reference
+/// encoder `quantize_row_q8_0_ref` differs: it codes with `1 / d` of the f32
+/// `d = amax / 127`, before its f16 rounding, and rounds half away from zero.
+fn quantize_q8f0_col(x: &[f32], out: &mut [u8]) {
+    let (blocks, _) = x.as_chunks::<32>();
+    let (oblocks, _) = out.as_chunks_mut::<Q8F0_BLOCK>();
+    for (xb, ob) in blocks.iter().zip(oblocks) {
+        let mut amax = 0.0f32;
+        for &v in xb {
+            if !v.is_finite() {
+                non_finite_activation(xb);
+            }
+            amax = amax.max(v.abs());
+        }
+        ob[0..2].copy_from_slice(&f32_to_f16_bits(amax / 127.0).to_le_bytes());
+        let id = q80_inverse(amax);
+        for (o, &v) in ob[2..].iter_mut().zip(xb) {
+            *o = nearest_int(v * id).clamp(-128, 127) as i8 as u8;
+        }
+    }
+}
+
+/// AVX2 twin of `quantize_q8f0_col`, byte-identical by construction: each
+/// block through [`quantize_q8_block_avx2`] under the f16 scale and
+/// [`q80_inverse`]'s multiplier: mainline's x86 steps, `_mm256_mul_ps`, a
+/// round to nearest even ([`v_nearest_int`], the integers mainline's
+/// `_mm256_round_ps` gives) and the saturating packs.
+///
+/// # Safety
+/// CPU must support AVX2; `x.len()` must be a multiple of 32 and `out.len()`
+/// equal `col_bytes(Q2_0, x.len())` (both enforced by [`quantize_col_check`]).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn quantize_q8f0_col_avx2(x: &[f32], out: &mut [u8]) {
+    let (blocks, _) = x.as_chunks::<32>();
+    let (oblocks, _) = out.as_chunks_mut::<Q8F0_BLOCK>();
+    for (xb, ob) in blocks.iter().zip(oblocks) {
+        // SAFETY: AVX2 present per contract; `xb` is a whole 32-value block.
+        let (codes, d, _) = unsafe {
+            quantize_q8_block_avx2(xb, |amax| {
+                (f32_to_f16_bits(amax / 127.0), q80_inverse(amax))
+            })
+        };
+        ob[0..2].copy_from_slice(&d.to_le_bytes());
+        ob[2..].copy_from_slice(&codes);
     }
 }
 
@@ -6305,6 +6404,117 @@ unsafe fn dot_q8f0_q82x4_tile_avx2<const C: usize>(
         }
         out
     }
+}
+
+// ------------------------------------------------------------- Q2_0 x Q8_0
+
+/// AVX2 row dot: Q2_0 weights against a Q8_0 column, a port of mainline's
+/// `ggml_vec_dot_q2_0_q8_0_generic` (llama.cpp `f2cc7282c`
+/// ggml-cpu/quants.c:177), the loop mainline's x86 build runs (it has no x86
+/// kernel of its own, arch-fallback.h:90). Value j of a Q2_0 block is bits
+/// `2 * (j % 4)` of `qs[j / 4]`, code q standing for `q - 1`. Each of the
+/// block's two q8_0 blocks gives the exact integer `Σ (q - 1) * y`, here
+/// `Σ q * y - Σ y` through `maddubs` (a pair at most 2 * 3 * 128 in i16), with the
+/// codes and the activations in one order of their own inside each 16-value
+/// lane, which an integer sum does not see. The float steps are the loop's,
+/// in its order, each fused as a native build with FMA contraction on fuses
+/// it (GCC 15.2 at `-O3 -march=native` compiles `ggml_vec_dot_q2_0_q8_0` to
+/// `vfmadd132ss`, `vfmadd132ss`, `vfmadd231ss`, Clang 21 to three FMAs as
+/// well): `sumi = d1 * s + sumi` over the two q8_0 blocks from `sumi = 0`,
+/// then `sumf = d0 * sumi + sumf`, block by block. A build that rounds each
+/// step apart (contraction off, or a CPU variant without FMA) gives other
+/// bits.
+///
+/// TWIN of [`dot_q2f0_q8f0_scalar`]: an edit to the float steps of one is
+/// made in both.
+///
+/// # Safety
+/// Caller must ensure AVX2+FMA+F16C are available, `wrow` holds `nb` Q2_0
+/// blocks and `acol` `2 * nb` q8_0 blocks.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma", enable = "f16c")]
+unsafe fn dot_q2f0_q8f0_avx2(wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
+    // SAFETY: AVX2+FMA+F16C present per contract; every load lies inside a
+    // block of the validated row or column.
+    unsafe {
+        let m3 = _mm256_set1_epi8(3);
+        let ones8 = _mm256_set1_epi8(1);
+        let ones16 = _mm256_set1_epi16(1);
+        // q8_0 block k's eight code bytes are code words 2k and 2k + 1: word
+        // 2k + l to every u32 slot of lane l, then slot m shifted by 2m, so
+        // byte 4m + b of lane l is the code of value 16l + 4b + m.
+        let spread = [
+            _mm256_setr_epi32(0, 0, 0, 0, 1, 1, 1, 1),
+            _mm256_setr_epi32(2, 2, 2, 2, 3, 3, 3, 3),
+        ];
+        let shifts = _mm256_setr_epi32(0, 2, 4, 6, 0, 2, 4, 6);
+        // The activations into that order: byte 4m + b of a lane from 4b + m.
+        let order = _mm256_setr_epi8(
+            0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15, 0, 4, 8, 12, 1, 5, 9, 13, 2, 6,
+            10, 14, 3, 7, 11, 15,
+        );
+        // The f16 scale at `p`, lane 0 of a whole 16-byte load: a load, where
+        // `f16c_to_f32`'s insert (`vpinsrw`) would make the conversion wait on
+        // the register it merges into (LLVM picks `sumf`'s).
+        let scale =
+            |p: *const u8| _mm_cvtss_f32(_mm_cvtph_ps(_mm_loadu_si128(p as *const __m128i)));
+        let blocks = wrow.as_chunks::<Q2F0_BLOCK>().0[..nb].iter();
+        let mut sumf = 0.0f32;
+        for (wb, ab) in blocks.zip(acol.as_chunks::<{ 2 * Q8F0_BLOCK }>().0) {
+            // SAFETY: 16 readable bytes at offset 0 of the 18-byte block.
+            let d0 = scale(wb.as_ptr());
+            // SAFETY: 16 readable bytes at offset 2 of the 18-byte block; the
+            // spreads read only its four words.
+            let qs = _mm256_castsi128_si256(_mm_loadu_si128(wb.as_ptr().add(2) as *const __m128i));
+            let mut p = [_mm256_setzero_si256(); 2];
+            for ((pk, sk), yb) in p.iter_mut().zip(spread).zip(ab.as_chunks::<Q8F0_BLOCK>().0) {
+                let spread = _mm256_permutevar8x32_epi32(qs, sk);
+                let q = _mm256_and_si256(_mm256_srlv_epi32(spread, shifts), m3);
+                // SAFETY: 32 readable bytes at offset 2 of the 34-byte block.
+                let y = _mm256_loadu_si256(yb.as_ptr().add(2) as *const __m256i);
+                let y = _mm256_shuffle_epi8(y, order);
+                let qy = _mm256_maddubs_epi16(q, y);
+                *pk =
+                    _mm256_madd_epi16(_mm256_sub_epi16(qy, _mm256_maddubs_epi16(ones8, y)), ones16);
+            }
+            // Lanes 0 and 1 of `s`: each q8_0 block's eight lanes summed.
+            let h = _mm256_add_epi32(
+                _mm256_unpacklo_epi32(p[0], p[1]),
+                _mm256_unpackhi_epi32(p[0], p[1]),
+            );
+            let s = _mm_add_epi32(_mm256_castsi256_si128(h), _mm256_extracti128_si256::<1>(h));
+            let s = _mm_add_epi32(s, _mm_unpackhi_epi64(s, s));
+            // SAFETY: 16 readable bytes at offset 0 of each 34-byte block.
+            let d1 = [scale(ab.as_ptr()), scale(ab.as_ptr().add(Q8F0_BLOCK))];
+            let sumi = d1[0].mul_add(_mm_cvtsi128_si32(s) as f32, 0.0);
+            let sumi = d1[1].mul_add(_mm_extract_epi32::<1>(s) as f32, sumi);
+            sumf = d0.mul_add(sumi, sumf);
+        }
+        sumf
+    }
+}
+
+/// Scalar twin of [`dot_q2f0_q8f0_avx2`], bit for bit: the same exact integer
+/// sums and the same fused float steps in the same order.
+fn dot_q2f0_q8f0_scalar(wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
+    let blocks = wrow.as_chunks::<Q2F0_BLOCK>().0[..nb].iter();
+    let mut sumf = 0.0f32;
+    for (wb, ab) in blocks.zip(acol.as_chunks::<{ 2 * Q8F0_BLOCK }>().0) {
+        let d0 = half_to_f32(u16::from_le_bytes([wb[0], wb[1]]));
+        let mut sumi = 0.0f32;
+        let (codes, _) = wb[2..].as_chunks::<8>();
+        for (qs, yb) in codes.iter().zip(ab.as_chunks::<Q8F0_BLOCK>().0) {
+            let d1 = half_to_f32(u16::from_le_bytes([yb[0], yb[1]]));
+            let mut s = 0i32;
+            for (j, &y) in yb[2..].iter().enumerate() {
+                let q = (qs[j / 4] >> (2 * (j % 4))) & 3;
+                s += (i32::from(q) - 1) * i32::from(y as i8);
+            }
+            sumi = d1.mul_add(s as f32, sumi);
+        }
+        sumf = d0.mul_add(sumi, sumf);
+    }
+    sumf
 }
 
 // ------------------------------------------------------------ IQ3_XXS x Q8_K

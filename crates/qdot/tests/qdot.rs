@@ -10,7 +10,9 @@
 //! The gates assert with `assert!` (not `debug_assert!`) because they run in release.
 
 use gguf::GgmlType;
-use gguf::quant::{dequant_row, quantize_row_q8_k_roundtrip};
+use gguf::quant::{
+    dequant_row, half_to_f32, quantize_row_q8_0_roundtrip, quantize_row_q8_k_roundtrip,
+};
 #[cfg(target_arch = "x86_64")]
 use qdot::dot_row_avx2;
 use qdot::{
@@ -657,6 +659,26 @@ fn rejects_unaligned_k() {
         dot_row(GgmlType::IQ2_XS, &wrow2xs, &acol2xs, 4096).unwrap(),
         0.0
     );
+    // Q2_0 pairs q8_0 (34 bytes per 32 values) with 18 weight bytes per 64 values.
+    assert_eq!(col_bytes(GgmlType::Q2_0, 2048), 34 * 64);
+    let wrow20 = vec![0u8; 18 * 32];
+    let acol20 = vec![0u8; 34 * 64];
+    assert!(matches!(
+        dot_row(GgmlType::Q2_0, &wrow20, &acol20, 2048 + 32),
+        Err(QdotError::UnalignedK { k: 2080, gran: 64 })
+    ));
+    assert!(matches!(
+        dot_row(GgmlType::Q2_0, &wrow20[..18 * 32 - 1], &acol20, 2048),
+        Err(QdotError::ShortWeightRow { .. })
+    ));
+    assert!(matches!(
+        dot_row(GgmlType::Q2_0, &wrow20, &acol20[..34 * 64 - 1], 2048),
+        Err(QdotError::ShortActivationCol { .. })
+    ));
+    assert_eq!(
+        dot_row(GgmlType::Q2_0, &wrow20, &acol20, 2048).unwrap(),
+        0.0
+    );
     // Supported type table check.
     assert!(!supports(GgmlType::F16));
     assert!(supports(GgmlType::Q5_K));
@@ -669,6 +691,7 @@ fn rejects_unaligned_k() {
     assert!(supports(GgmlType::Q8_0));
     assert!(supports(GgmlType::IQ4_NL));
     assert!(supports(GgmlType::IQ4_XS));
+    assert!(supports(GgmlType::Q2_0));
 }
 
 /// `col_bytes` panics on unaligned k.
@@ -2436,6 +2459,198 @@ fn hw_q8f0_kernel_predicts_ik() {
     );
 }
 
+// ------------------------------------------------------------- Q2_0 x Q8_0
+// Mainline ggml's Q2_0 (llama.cpp f2cc7282c; ik has no Q2_0). Each constant below is mainline's
+// own output over the inputs its clause builds, printed on x86_64 Linux by a short C program
+// linked against that build's libggml-cpu.so (GGML_NATIVE on, so its x86 paths): the Q8_0
+// traits' `from_float`, x86 `quantize_row_q8_0` (ggml-cpu/arch/x86/quants.c:302), and the Q2_0
+// traits' `vec_dot`, `ggml_vec_dot_q2_0_q8_0`. These clauses need no box: `quantize_col` and
+// `dot_row` take the AVX2 paths on a CPU with them, and the scalar mirrors are held to the same
+// bytes and bits.
+
+/// One LCG draw as a byte: [`Lcg::next_u32`] keeps the state's top 31 bits, so their top eight.
+fn q2f0_byte(rng: &mut Lcg) -> u8 {
+    (rng.next_u32() >> 23) as u8
+}
+
+/// One LCG draw as an f16 scale of either sign and magnitude in [2^-10, 2^3): the sign from bit
+/// 0, the exponent field `5 + (r >> 1) % 13`, the mantissa from bits 20..30.
+fn q2f0_scale(rng: &mut Lcg) -> u16 {
+    let r = rng.next_u32();
+    (((r & 1) << 15) | ((5 + (r >> 1) % 13) << 10) | ((r >> 20) & 0x3ff)) as u16
+}
+
+/// [`q2_0_column_matches_mainline`]'s 256 values, eight q8_0 blocks: LCG values in [-1, 1)
+/// times 1, 100, 1e-3, 1, 1e4, 0, 1e-9 and 30, block by block; then block 0 is -127 and the
+/// ties 0.5 ..= 30.5 (at amax 127 the multiplier is 1), and block 1 holds its amax, 100, at
+/// value 5.
+fn q2f0_column_values() -> Vec<f32> {
+    let mags = [1.0f32, 100.0, 1e-3, 1.0, 1e4, 0.0, 1e-9, 30.0];
+    let mut rng = Lcg(0x0800_5EED);
+    let mut x: Vec<f32> = (0..256)
+        .map(|i| (rng.next_u32() as f32 / 1073741824.0 - 1.0) * mags[i / 32])
+        .collect();
+    x[0] = -127.0;
+    for (j, v) in x[1..32].iter_mut().enumerate() {
+        *v = j as f32 + 0.5;
+    }
+    x[37] = 100.0;
+    x
+}
+
+/// Mainline's x86 `quantize_row_q8_0` over [`q2f0_column_values`]: eight 34-byte blocks, two
+/// lines a block.
+#[rustfmt::skip]
+const Q8F0_MAINLINE: [u8; 272] = [
+        0x00, 0x3c, 0x81, 0x00, 0x02, 0x02, 0x04, 0x04, 0x06, 0x06, 0x08, 0x08, 0x0a, 0x0a, 0x0c, 0x0c, 0x0e,
+        0x0e, 0x10, 0x10, 0x12, 0x12, 0x14, 0x14, 0x16, 0x16, 0x18, 0x18, 0x1a, 0x1a, 0x1c, 0x1c, 0x1e, 0x1e,
+        0x4d, 0x3a, 0x01, 0xf5, 0x7a, 0x61, 0xb7, 0x7f, 0xac, 0x49, 0xd8, 0xc8, 0xbe, 0x0c, 0xf1, 0x9b, 0x6e,
+        0x46, 0x34, 0x54, 0x14, 0x2b, 0x0b, 0xf5, 0x4c, 0xfd, 0x2b, 0x60, 0x0b, 0x59, 0x6d, 0xda, 0xf7, 0x12,
+        0x81, 0x00, 0x0d, 0x5a, 0xa3, 0x1f, 0x2c, 0xf6, 0xc1, 0xb5, 0x3c, 0x0b, 0xfb, 0x7b, 0xb1, 0x48, 0xf1,
+        0x05, 0x58, 0xa1, 0x9e, 0x6a, 0x4e, 0xeb, 0xfd, 0xc0, 0xd9, 0x6e, 0x49, 0x81, 0x13, 0x50, 0x3c, 0xe3,
+        0xe4, 0x1f, 0xe0, 0x7d, 0xd3, 0xf1, 0xba, 0xe8, 0xd8, 0xaf, 0xeb, 0xaa, 0xb9, 0x8f, 0x9b, 0x7e, 0xfa,
+        0x4f, 0xcb, 0xe8, 0x7f, 0x9e, 0x06, 0x97, 0x20, 0xee, 0x3a, 0x1a, 0x34, 0xc1, 0xa9, 0x08, 0x07, 0xd4,
+        0xdd, 0x54, 0xd6, 0xd5, 0xa5, 0x1f, 0xbb, 0x05, 0x54, 0x09, 0x0f, 0xf4, 0x14, 0xbb, 0x37, 0x76, 0xcf,
+        0x5b, 0xc7, 0x06, 0xf6, 0x8b, 0x27, 0x81, 0xe8, 0x15, 0x65, 0xd1, 0x79, 0xa6, 0xad, 0x4d, 0x52, 0x75,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x1d, 0x92, 0x83, 0x93, 0x11, 0x17, 0x97, 0x7f, 0xeb, 0x55, 0x63, 0x10, 0xaf, 0x3d, 0x2e,
+        0xc0, 0xe4, 0x19, 0xe9, 0x25, 0xec, 0xd3, 0x21, 0x1f, 0xc1, 0xb9, 0x3f, 0xf7, 0x44, 0xcc, 0x2d, 0x7a,
+        0x66, 0x33, 0xa3, 0x57, 0x09, 0x8a, 0x58, 0xfd, 0x3d, 0x7f, 0xbf, 0x47, 0x44, 0xf8, 0xfe, 0x82, 0x7a,
+        0xdf, 0x44, 0x35, 0xe6, 0x1c, 0xda, 0x81, 0x31, 0x5f, 0x87, 0x36, 0xa9, 0x8c, 0x96, 0x09, 0x59, 0xd6,
+];
+
+/// The Q2_0 activation column against mainline's x86 encoder: `quantize_col` and its scalar
+/// mirror write [`Q8F0_MAINLINE`] byte for byte. That pins the f16 scale, the multiplier
+/// `127 / amax` (block 6's scale rounds to an f16 zero beside nonzero codes; coding with
+/// `1 / d` of the stored f16 scale changes 34 bytes) and ties to even (block 0; `roundf`
+/// changes 16, and so does `quantize_row_q8_0_ref`, `1 / d` of the f32 scale with `roundf`).
+/// The codes restore to `quantize_row_q8_0_roundtrip`'s values, equal as values (a code holds
+/// no zero sign).
+#[test]
+fn q2_0_column_matches_mainline() {
+    type Encode = fn(GgmlType, &[f32], &mut [u8]);
+    let x = q2f0_column_values();
+    let mut col = vec![0u8; col_bytes(GgmlType::Q2_0, 256)];
+    for (path, encode) in [
+        ("quantize_col", quantize_col as Encode),
+        ("quantize_col_scalar", quantize_col_scalar as Encode),
+    ] {
+        encode(GgmlType::Q2_0, &x, &mut col);
+        for (i, (&got, &want)) in col.iter().zip(&Q8F0_MAINLINE).enumerate() {
+            assert!(
+                got == want,
+                "{path}: block {} byte {}: got {got:#04x}, want {want:#04x}",
+                i / 34,
+                i % 34
+            );
+        }
+    }
+    let mut rt = vec![0.0f32; 256];
+    quantize_row_q8_0_roundtrip(&x, &mut rt);
+    for (b, blk) in col.as_chunks::<34>().0.iter().enumerate() {
+        let d = half_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+        for (j, &q) in blk[2..].iter().enumerate() {
+            let v = d * f32::from(q as i8);
+            let p = 32 * b + j;
+            assert!(
+                v == rt[p],
+                "value {p}: restored {v:e}, round trip {:e}",
+                rt[p]
+            );
+        }
+    }
+}
+
+/// Width of [`q2_0_dot_matches_mainline`]'s rows: 32 Q2_0 blocks against 64 q8_0 blocks.
+const Q2F0_K: usize = 2048;
+
+/// [`q2_0_dot_matches_mainline`]'s q8_0 column and 16 Q2_0 rows, from one LCG: per q8_0 block
+/// a [`q2f0_scale`] then 32 code bytes (every i8, -128 included), per Q2_0 block a scale then
+/// 16 code bytes. Then the ends: column block 7's scale is 0 and block 21's the subnormal
+/// 0x0001; row 12's codes are all 0 (every value -1), row 13's all 3 (+2), row 14's scales
+/// alternate 0 and 0x0001, row 15's +65504 and -65504.
+fn q2f0_dot_case() -> (Vec<u8>, Vec<Vec<u8>>) {
+    let mut rng = Lcg(0x0200_5EED);
+    let mut col = Vec::with_capacity(Q2F0_K / 32 * 34);
+    for b in 0..Q2F0_K / 32 {
+        let d = match (b, q2f0_scale(&mut rng)) {
+            (7, _) => 0,
+            (21, _) => 1,
+            (_, d) => d,
+        };
+        col.extend_from_slice(&d.to_le_bytes());
+        for _ in 0..32 {
+            col.push(q2f0_byte(&mut rng));
+        }
+    }
+    let mut rows = Vec::new();
+    for r in 0..16 {
+        let mut row = Vec::with_capacity(Q2F0_K / 64 * 18);
+        for b in 0..Q2F0_K / 64 {
+            let d = match (r, q2f0_scale(&mut rng)) {
+                (14, _) => [0x0000, 0x0001][b % 2],
+                (15, _) => [0x7bff, 0xfbff][b % 2],
+                (_, d) => d,
+            };
+            row.extend_from_slice(&d.to_le_bytes());
+            for _ in 0..16 {
+                row.push(match (r, q2f0_byte(&mut rng)) {
+                    (12, _) => 0x00,
+                    (13, _) => 0xff,
+                    (_, c) => c,
+                });
+            }
+        }
+        rows.push(row);
+    }
+    (col, rows)
+}
+
+/// Mainline's `ggml_vec_dot_q2_0_q8_0` over [`q2f0_dot_case`]'s rows, as f32 bits.
+#[rustfmt::skip]
+const Q2F0_DOT_MAINLINE: [u32; 16] = [
+        0x4506affc, 0x45cc669b, 0xc6a04ab9, 0x473a069d,
+        0x4701ebbd, 0xc521ce36, 0x45b64c0c, 0x46385bb2,
+        0x4621ff41, 0xc58518d8, 0x4652919b, 0x44957542,
+        0xc43e724d, 0x464c96ee, 0x3a5af47c, 0x4cd2fdf0,
+];
+
+/// Q2_0 x Q8_0 against mainline's dot, bit for bit, through `dot_row` (the AVX2 kernel on a CPU
+/// with it) and its scalar mirror. Mainline's x86 build runs the generic loop
+/// (ggml-cpu/quants.c:177) with its three float steps fused, and these rows tell that order
+/// apart: the same loop with plain steps differs on 10 of the 16, with eight blocks summed in
+/// lanes on 14.
+#[test]
+fn q2_0_dot_matches_mainline() {
+    let (col, rows) = q2f0_dot_case();
+    for (r, (row, &want)) in rows.iter().zip(&Q2F0_DOT_MAINLINE).enumerate() {
+        for (path, got) in [
+            ("dot_row", dot_row(GgmlType::Q2_0, row, &col, Q2F0_K)),
+            (
+                "dot_row_scalar",
+                dot_row_scalar(GgmlType::Q2_0, row, &col, Q2F0_K),
+            ),
+        ] {
+            let got = got.unwrap();
+            assert!(
+                got.to_bits() == want,
+                "{path} row {r}: got {got:e} (bits {:#010x}), want {:e} (bits {want:#010x})",
+                got.to_bits(),
+                f32::from_bits(want)
+            );
+        }
+    }
+}
+
+/// Q2_0 kernel vs mirror on [`generated_gate_a`]'s rows (random codes, finite scales) at 32,
+/// one and three blocks against a `quantize_col` column, bit for bit.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn q2_0_kernel_matches_mirror() {
+    generated_gate_a(GgmlType::Q2_0, 18, 64, &[2048, 64, 192]);
+}
+
 // ------------------------------------------------- q_nope2 cell kernel
 // Q8_0 x act cell kernel gates: AVX2 kernel vs scalar mirror, bit for bit,
 // over model and boundary shapes and extreme code patterns.
@@ -2995,6 +3210,7 @@ fn quantize_col_random_bit_identical() {
         (GgmlType::Q8_0, &[128, 224, 2144]),
         (GgmlType::IQ4_NL, &[128, 640, 672]),
         (GgmlType::IQ4_XS, &[256, 512]),
+        (GgmlType::Q2_0, &[64, 256, 2048]),
     ];
     const COLS: usize = 200;
     const MAGS: [f32; 11] = [1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 0.1, 1.0, 10.0, 1e2, 1e3, 1e4];
@@ -3334,6 +3550,25 @@ fn quantize_col_subnormal_tiny_scales() {
         out4[4..].iter().all(|&b| b == 0),
         "inf/NaN products must quantize to 0 codes and 0 sums"
     );
+
+    // q8_0 (Q2_0's column): at amax 1e-38, below 127 / f32::MAX, the multiplier 127 / amax
+    // overflows, so d = 0 and the codes flush to 0; at 1e-36 it is finite, d still rounds to
+    // an f16 zero and every code is 127.
+    let mut x5 = vec![1e-38f32; 128];
+    x5[64..].fill(1e-36);
+    assert_col_bit_identical(GgmlType::Q2_0, &x5);
+    let mut out5 = vec![0u8; col_bytes(GgmlType::Q2_0, 128)];
+    quantize_col(GgmlType::Q2_0, &x5, &mut out5);
+    assert!(
+        out5[..68].iter().all(|&b| b == 0),
+        "an overflowing multiplier must flush the blocks to zero"
+    );
+    for blk in out5[68..].as_chunks::<34>().0 {
+        assert!(
+            blk[..2] == [0, 0] && blk[2..].iter().all(|&c| c == 127),
+            "a finite multiplier codes amax as 127 under an f16-zero d"
+        );
+    }
 }
 
 /// A NaN or an infinity in an activation block is undefined input, and both
@@ -3352,6 +3587,7 @@ fn quantize_col_non_finite_panics_on_both_paths() {
         (GgmlType::Q3_K, 512, 256),
         (GgmlType::Q4_K, 256, 32),
         (GgmlType::Q5_0, 160, 32),
+        (GgmlType::Q2_0, 128, 32),
     ] {
         let mut all_nan = base(k);
         all_nan[..blk].fill(f32::NAN);
@@ -3432,6 +3668,8 @@ fn f16_scales_bit_identical_kernel_vs_mirror() {
             272,
             &[0, 34, 68, 102, 136, 170, 204, 238][..],
         ),
+        // Q2_0 at k = 256 is four 18-byte blocks.
+        (GgmlType::Q2_0, 72, &[0, 18, 36, 54][..]),
     ] {
         assert!(supports(w), "{w:?}: this CPU lacks the kernel's ISA");
         let mut row: Vec<u8> = (0..block).map(|_| rng.next_u32() as u8).collect();

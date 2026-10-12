@@ -302,7 +302,10 @@ placement 0 0 0
 # PIN(2026-10-12): qdot 130 -> 131 blocks, 73 -> 74 fns, a moved body, not old code relaxed: the q8_2 block
 # encoder's steps move into quantize_q8_block_avx2 (one unsafe fn, its body's block), which the q8_2 block calls in
 # one block, each with its SAFETY line.
-qdot 131 74 0
+# PIN(2026-10-12): qdot 131 -> 136 blocks, 74 -> 76 fns, a new kernel, not old code relaxed: the Q2_0 dot
+# (dot_q2f0_q8f0_avx2) and its q8_0 column encoder (quantize_q8f0_col_avx2), two unsafe fns of one block each, and
+# the three dispatch arms that call them, each with its SAFETY line.
+qdot 136 76 0
 refset 0 0 0
 runtime 0 0 0
 sampler 4 4 1
