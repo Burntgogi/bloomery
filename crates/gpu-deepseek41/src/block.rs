@@ -96,6 +96,14 @@ impl BlockPlan {
         self == BlockPlan::Q8
     }
 
+    /// Whether a row's run leaves its clamped SwiGLU row in `h` as f32 (the q8_0 pair, a fused K-quant gate·up);
+    /// a split gate·up writes it only into the down's q8_1 blocks, from the f32 gate and up rows
+    /// ([`BlockScratch::gate_up_rows`]).
+    #[must_use]
+    pub fn writes_h(self) -> bool {
+        !matches!(self.gate_up, GateUp::Split { .. })
+    }
+
     /// The plan of a block whose gate, up and down are `tys`: the q8_0 pair or two K-quants for gate·up (the
     /// same Q4_K or Q5_K fused, else split), any of [`BLOCK_TYPES`] for the down, which a split gate·up needs a
     /// K-quant one of. Another mix is refused by name as `what`'s.
@@ -301,6 +309,13 @@ impl BlockScratch {
                 .as_ref()
                 .map_or(0, |g| g.iter().map(DeviceBuffer::num_bytes).sum())
             + self.one.num_bytes()
+    }
+
+    /// The f32 gate and up rows of the split block's last row run ([`BlockPlan::writes_h`]), each the block's
+    /// width at its start; `None` on a scratch that runs no split block. For the gates, which read them back.
+    #[must_use]
+    pub fn gate_up_rows(&self) -> Option<&[DeviceBuffer<f32>; 2]> {
+        self.gu.as_ref()
     }
 }
 

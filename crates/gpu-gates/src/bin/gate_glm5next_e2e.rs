@@ -481,8 +481,8 @@ mod gate {
     };
     use bloomery_gpu_glm5next::forced::{ForcedRoute, ForcedRow};
     use bloomery_gpu_glm5next::{
-        Body, CHECKPOINT_EVERY, CHUNK, GEMM_FROM, Glm5nextModel, GlmArena, Plant, PrefillMode,
-        RouteTapRows, StoreDigest, StoreRows, checkpoint_price, feed, nextn_store,
+        Body, CHECKPOINT_EVERY, CHUNK, FfnTapRows, GEMM_FROM, Glm5nextModel, GlmArena, Plant,
+        PrefillMode, RouteTapRows, StoreDigest, StoreRows, checkpoint_price, feed, nextn_store,
         plant_prompt_routes, prefill, prefill_mode, prompt_ffn_taps, prompt_route_taps, seq_resume,
         seq_resume_prefix, seq_save, set_prefill, set_prefill_group, set_prompt_ffn_taps,
         set_prompt_route_taps, set_taps, step_launches, store_digests, store_rows, trunk_blocks,
@@ -5578,9 +5578,9 @@ mod gate {
     /// its values' mean square, that is `A/4` with `A = 128·Σ d_b² / Σ x²`
     /// ([`Crest`]), `d_b` the block's q8_1 scale `amax/127`; `A` is at most
     /// `128/127²`, which is 12 in q² (`d²/12` = (2q)² at the largest crest
-    /// √128 = 2·√32). The gate·up input's `A` is read off the run's own rows
-    /// (`set_prompt_ffn_taps`, the reference's calls); the SwiGLU rows' is
-    /// taken at the largest crest, 12. Such a block's input reaches the
+    /// √128 = 2·√32). Both inputs' `A` are read off the run's own rows
+    /// (`set_prompt_ffn_taps`, the reference's calls): the normed input the
+    /// gate·up reads and the SwiGLU rows the down reads. Such a block's input reaches the
     /// stream through the gate and up (2.64 · x) and its SwiGLU rows through
     /// the down (x), for a dense block in place of its 3.64 and for a routed
     /// layer's shared expert in place of its 0. The routed experts' stacks
@@ -5621,6 +5621,9 @@ mod gate {
     /// of 128 values at the largest crest, in q²: `d²/4` with `d²/12` = (2q)².
     const WIDE_Q8: f64 = 12.0;
 
+    /// One layer's tapped rows for [`Crest::of`]: their width and values.
+    type TapRows<'a> = Option<(usize, &'a [f32])>;
+
     /// The tapped feed-forward inputs' crest ([`gemm_bands`]' `A`), per
     /// layer as running sums over positions: `Σ_b d_b²` and `Σ x²` of each
     /// position's row, `None` for a layer not tapped.
@@ -5629,19 +5632,23 @@ mod gate {
     }
 
     impl Crest {
-        /// From [`prompt_ffn_taps`]' rows of `n` values: a row of values
-        /// whose squares sum to 0 or are not finite is refused by name.
-        fn of(taps: &[Option<Vec<f32>>], n: usize) -> Result<Crest, GateError> {
-            if !n.is_multiple_of(128) {
-                return Err(format!("rows of {n} values are no whole q8_1 blocks of 128").into());
-            }
+        /// From [`prompt_ffn_taps`]' rows (`what` of them), each layer's of
+        /// its width: a width that is no whole q8_1 blocks of 128, or a row
+        /// whose squares sum to 0 or are not finite, is refused by name.
+        fn of(what: &str, taps: &[TapRows<'_>]) -> Result<Crest, GateError> {
             let layers = taps
                 .iter()
                 .enumerate()
                 .map(|(l, t)| {
-                    let Some(t) = t else {
+                    let Some((n, t)) = *t else {
                         return Ok(None);
                     };
+                    if n == 0 || !n.is_multiple_of(128) {
+                        return Err(format!(
+                            "layer {l}: {what} rows of {n} values are no whole q8_1 blocks of 128"
+                        )
+                        .into());
+                    }
                     let (mut d2, mut x2) = (vec![0.0f64], vec![0.0f64]);
                     for (p, row) in t.chunks_exact(n).enumerate() {
                         let mut row_d2 = 0.0f64;
@@ -5652,7 +5659,7 @@ mod gate {
                         let row_x2: f64 = row.iter().map(|&v| f64::from(v).powi(2)).sum();
                         if !(row_x2 > 0.0 && row_x2.is_finite() && row_d2.is_finite()) {
                             return Err(format!(
-                                "layer {l}: the feed-forward input at position {p} squares to {row_x2}"
+                                "layer {l}: the {what} at position {p} squares to {row_x2}"
                             )
                             .into());
                         }
@@ -5689,30 +5696,26 @@ mod gate {
         }
     }
 
-    /// [`gemm_bands`]' terms: per layer, the gate·up input's term the run's
-    /// crest gives (`gate_up[l]`, [`Crest::at`]) where it reads q8_1 blocks
-    /// of 128 (`wide[l]`), the down input's at the largest crest
-    /// ([`WIDE_Q8`]); a layer whose gate·up is q8_1 of 128 with no tap is
-    /// refused by name.
+    /// [`gemm_bands`]' terms: per layer, the gate·up and the down input's
+    /// term the run's crest gives (`gate_up[l]`, `down[l]`, [`Crest::at`])
+    /// where they read q8_1 blocks of 128 (`wide[l]`); an input of q8_1
+    /// blocks of 128 with no tap is refused by name.
     fn wide_terms(
         wide: &[[bool; 2]],
-        gate_up: &[Option<f64>],
+        (gate_up, down): (&[Option<f64>], &[Option<f64>]),
     ) -> Result<Vec<[Option<f64>; 2]>, GateError> {
+        let pick = |l: usize, what: &str, wide: bool, x: Option<f64>| match (wide, x) {
+            (true, Some(x)) => Ok(Some(x)),
+            (true, None) => Err(GateError::from(format!(
+                "layer {l}: a {what} of q8_1 blocks of 128 with no feed-forward tap"
+            ))),
+            (false, _) => Ok(None),
+        };
         wide.iter()
-            .zip(gate_up)
+            .zip(gate_up.iter().zip(down))
             .enumerate()
-            .map(|(l, (&[g, d], &x))| {
-                let g = match (g, x) {
-                    (true, Some(x)) => Some(x),
-                    (true, None) => {
-                        return Err(format!(
-                            "layer {l}: a gate·up of q8_1 blocks of 128 with no feed-forward tap"
-                        )
-                        .into());
-                    }
-                    (false, _) => None,
-                };
-                Ok([g, d.then_some(WIDE_Q8)])
+            .map(|(l, (&[g, d], (&xg, &xd)))| {
+                Ok([pick(l, "gate·up", g, xg)?, pick(l, "down", d, xd)?])
             })
             .collect()
     }
@@ -6398,22 +6401,40 @@ mod gate {
         ok &= chunks_ok;
         let kinds = m.body("prompt batch")?.kinds();
         let wide = wide_q8(&glm5next_tier::open()?, &kinds)?;
-        let crest = Crest::of(&prompt_ffn_taps(m, CTX_PP)?, HIDDEN)?;
+        let taps = prompt_ffn_taps(m, CTX_PP)?;
         set_prompt_ffn_taps(m, 0)?;
+        let rows = |f: fn(&FfnTapRows) -> TapRows<'_>| -> Vec<TapRows<'_>> {
+            taps.iter().map(|t| t.as_ref().and_then(f)).collect()
+        };
+        let crest = (
+            Crest::of(
+                "feed-forward input",
+                &rows(|t| t.input.as_deref().map(|r| (HIDDEN, r))),
+            )?,
+            Crest::of(
+                "down input",
+                &rows(|t| t.hidden.as_deref().map(|r| (t.ff, r))),
+            )?,
+        );
+        drop(taps);
         let bands_at = |p: usize| -> Result<Bands, GateError> {
-            Ok(gemm_bands(&kinds, &wide_terms(&wide, &crest.at(p)?)?))
+            let terms = wide_terms(&wide, (&crest.0.at(p)?, &crest.1.at(p)?))?;
+            Ok(gemm_bands(&kinds, &terms))
         };
         let bands = bands_at(CTX_PP)?;
-        let cells: Vec<String> = crest
-            .at(CTX_PP)?
-            .iter()
-            .enumerate()
-            .filter_map(|(l, x)| x.map(|x| format!("{l}:{x:.2}")))
-            .collect();
+        let cells = |c: &Crest| -> Result<String, GateError> {
+            Ok(c.at(CTX_PP)?
+                .iter()
+                .enumerate()
+                .filter_map(|(l, x)| x.map(|x| format!("{l}:{x:.2}")))
+                .collect::<Vec<_>>()
+                .join(" "))
+        };
         println!(
-            "prompt batch: the gate·up inputs' crest term A/4 in q² over {CTX_PP} positions by \
-             layer [{}] (at most {WIDE_Q8})",
-            cells.join(" ")
+            "prompt batch: the crest term A/4 in q² over {CTX_PP} positions by layer, the gate·up \
+             inputs [{}], the down inputs [{}] (at most {WIDE_Q8})",
+            cells(&crest.0)?,
+            cells(&crest.1)?
         );
         let bias = biases(m)?;
         println!(
