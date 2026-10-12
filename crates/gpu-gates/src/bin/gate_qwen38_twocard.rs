@@ -35,13 +35,17 @@
 //!   for the tier, not a clause. Structure [derived]: the
 //!   tier's stage step graph and each verify graph hold the reference's
 //!   nodes less one a tier layer (its card leg drops the card sum, which the
-//!   join takes after the wait); the tier's graph of the step and of each
-//!   verify width holds nine nodes a tier layer (the go wait, the two copies
-//!   in, the four launches into the tier card's rows, the rows' copy out to
-//!   the page, the signal) and the fault copy; each chain the history runs
-//!   is fed and captured once, at its first pass, and replayed by every
-//!   later one. Precondition: every tier layer was sent a routed slot by the
-//!   steps.
+//!   join takes after the wait) plus [`HOST_LEG_NODES`] a tier layer the
+//!   reference's plan hosts nothing on, read per layer from that plan (the
+//!   reference's load runs such a layer without a host leg, no go and no
+//!   wait; the tier load keeps the leg on every tier layer, its stage card
+//!   holding fewer than all the layer's experts); the tier's graph of the
+//!   step and of each verify width holds nine nodes a tier layer (the go
+//!   wait, the two copies in, the four launches into the tier card's rows,
+//!   the rows' copy out to the page, the signal) and the fault copy; each
+//!   chain the history runs is fed and captured once, at its first pass, and
+//!   replayed by every later one. Precondition: every tier layer was sent a
+//!   routed slot by the steps.
 //! - `--residency`: the tier load under `mid-p<P>-s1`, `P` half the plan's
 //!   fewest stage experts a layer (the stage's count, not the union's): the
 //!   history twice the same, flips landed (in the real tier: that flips land
@@ -187,6 +191,11 @@ mod gate {
     const TIER_LAYER_NODES: usize = TierCard::nodes_per_layer(TierAct::F32, 4);
     // PIN(2026-10-06): 8 -> 9, the rows' copy out; launches storing into the page held 385 against 433.
     const _: () = assert!(TIER_LAYER_NODES == 9);
+    /// Nodes of a stage graph a layer with a host leg, two: the go and the
+    /// wait, stream memory-operation batches ([`Shape::memops`]). A load with
+    /// no residency machine and no route trace runs a layer with every routed
+    /// expert on the card without them.
+    const HOST_LEG_NODES: usize = 2;
     /// Prompt ids the unset-rule clause's child runs.
     const UNSET_TOKENS: usize = 8;
     /// The Qwen3.8 family's unset rule as the child names it
@@ -520,20 +529,52 @@ mod gate {
             .unwrap_or_default()
     }
 
+    /// The experts the host serves on layer `l` of `plan`: the model's per
+    /// layer, less the stage card's and each tier's.
+    fn host_experts(plan: &Plan<'_>, l: usize) -> Result<u64, GateError> {
+        let past = || format!("layer {l} is past the plan's per-layer expert counts");
+        let mut held = *plan.n_l.get(l).ok_or_else(past)?;
+        for tier in &plan.tier_n_l {
+            held += *tier.get(l).ok_or_else(past)?;
+        }
+        plan.model.experts.checked_sub(held).ok_or_else(|| {
+            format!(
+                "layer {l}: the cards hold {held} experts of the model's {}",
+                plan.model.experts
+            )
+            .into()
+        })
+    }
+
     /// `--union`'s structure and precondition lines over the tier load `s`
-    /// and the two runs.
+    /// and the two runs; `reference` is the plan the reference loaded.
     fn structure(
         s: &Session<Body38>,
         want: &Run,
         got: &Run,
         layers: &[usize],
+        reference: &Plan<'_>,
     ) -> Result<bool, GateError> {
         let t = layers.len();
-        let stage: Vec<usize> = want.stage_nodes.iter().map(|n| n - t).collect();
+        // A tier layer the reference's plan hosts nothing on runs without a
+        // host leg in the reference's load; the tier load's stage card holds
+        // fewer than all its experts and keeps the leg.
+        let hosted = layers
+            .iter()
+            .map(|&l| host_experts(reference, l))
+            .collect::<Result<Vec<u64>, GateError>>()?;
+        let unhosted = hosted.iter().filter(|&&n| n == 0).count();
+        let stage: Vec<usize> = want
+            .stage_nodes
+            .iter()
+            .map(|n| n + HOST_LEG_NODES * unhosted - t)
+            .collect();
         let mut ok = got.stage_nodes == stage;
         println!(
             "structure: the stage graphs of the step and the 2, 3, 4-row verifies hold {:?} nodes, \
-             the reference's {:?} less one a tier layer ({t}): {}",
+             the reference's {:?} less one a tier layer ({t}) plus the go and the wait \
+             ({HOST_LEG_NODES}) of each tier layer its plan hosts nothing on ({unhosted}; host \
+             experts a tier layer {hosted:?}) = {stage:?}: {}",
             got.stage_nodes,
             want.stage_nodes,
             verdict(ok)
@@ -1768,7 +1809,7 @@ mod gate {
             let mut t = open(path, &plan, &inputs, (host, ub, CTX), Residency::Off)?;
             let got = history(&mut t, &ids)?;
             pass &= same("two cards", &want, &got);
-            pass &= structure(&t, &want, &got, &tl)?;
+            pass &= structure(&t, &want, &got, &tl, &uplan)?;
             let (got_prompt, served) = served_prompt(&mut t, &prompt_ids)?;
             pass &= same(
                 &format!("two cards, a {PROMPT_U}-id prompt call"),
