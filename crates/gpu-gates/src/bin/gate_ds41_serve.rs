@@ -297,7 +297,7 @@ mod gate {
     use bloomery_gpu_gates::generate::Place;
     use bloomery_gpu_gates::record;
     use bloomery_gpu_gates::serve_client::{
-        Served, curl, ids_of, json_of, metric, parse_ids, server_log,
+        self, Served, curl, ids_of, json_of, metric, parse_ids, server_log,
     };
     use bloomery_gpu_gates::{GateError, checks_failed, data_dir, ref_model_path, verdict};
     use gguf::{Gguf, Split};
@@ -1736,31 +1736,6 @@ mod gate {
         })
     }
 
-    /// The bytes of `png` as standard base64 with padding — the alphabet
-    /// `serve::media`'s strict decoder reads; no encoder exists in the tree
-    /// to borrow.
-    fn base64(png: &[u8]) -> String {
-        const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        let mut out = String::with_capacity(png.len().div_ceil(3) * 4);
-        for c in png.chunks(3) {
-            let b = [c[0], *c.get(1).unwrap_or(&0), *c.get(2).unwrap_or(&0)];
-            let n = u32::from(b[0]) << 16 | u32::from(b[1]) << 8 | u32::from(b[2]);
-            out.push(A[(n >> 18) as usize & 63] as char);
-            out.push(A[(n >> 12) as usize & 63] as char);
-            out.push(if c.len() > 1 {
-                A[(n >> 6) as usize & 63] as char
-            } else {
-                '='
-            });
-            out.push(if c.len() > 2 {
-                A[n as usize & 63] as char
-            } else {
-                '='
-            });
-        }
-        out
-    }
-
     /// The image chat of clause (b) (module header): the scene as a `data:`
     /// URL, thinking off, greedy, 64 tokens.
     fn chart_chat(s: &Scene) -> Value {
@@ -1768,7 +1743,7 @@ mod gate {
             "messages": [{"role": "user", "content": [
                 {"type": "text", "text": "List each bar's value."},
                 {"type": "image_url", "image_url": {"url":
-                    format!("data:image/png;base64,{}", base64(&s.png))}},
+                    format!("data:image/png;base64,{}", serve_client::base64(&s.png))}},
             ]}],
             "temperature": 0, "max_tokens": 64,
             "chat_template_kwargs": {"thinking": false},

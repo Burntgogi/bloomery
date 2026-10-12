@@ -108,7 +108,7 @@ mod decide_gate;
 mod gate {
     use std::path::{Path, PathBuf};
 
-    use bloomery_gpu_gates::serve_client::{Served, curl};
+    use bloomery_gpu_gates::serve_client::{self, Served, curl};
     use bloomery_gpu_gates::{GateError, checks_failed};
     use decision::encode::NO_IMAGE_INPUT;
     use decision::head::HeadConfig;
@@ -362,26 +362,6 @@ mod gate {
             .to_owned())
     }
 
-    fn base64(bytes: &[u8]) -> String {
-        const ALPHABET: &[u8; 64] =
-            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-        for chunk in bytes.chunks(3) {
-            let n = chunk
-                .iter()
-                .enumerate()
-                .fold(0u32, |n, (i, b)| n | (u32::from(*b) << (16 - 8 * i)));
-            for i in 0..4 {
-                if i <= chunk.len() {
-                    out.push(char::from(ALPHABET[((n >> (18 - 6 * i)) & 63) as usize]));
-                } else {
-                    out.push('=');
-                }
-            }
-        }
-        out
-    }
-
     /// The test images the gate posts by their stems: the three set D's requests name, and the one
     /// whose tokens alone pass the encoder's length.
     const IMAGES: [(&str, &str); 4] = [
@@ -405,7 +385,10 @@ mod gate {
             .ok_or_else(|| format!("the image {stem:?} is not one of the gate's {IMAGES:?}"))?;
         let path = repo_file(rel);
         let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-        Ok(format!("data:image/png;base64,{}", base64(&bytes)))
+        Ok(format!(
+            "data:image/png;base64,{}",
+            serve_client::base64(&bytes)
+        ))
     }
 
     /// The snapshot revision the release's runs are made at: the recipe's own `REVISION`.

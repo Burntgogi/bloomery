@@ -3330,30 +3330,6 @@ mod gate {
         agree: usize,
     }
 
-    /// The standard base64 of `bytes` with padding — the alphabet `serve::media`'s strict decoder
-    /// reads; no encoder exists in the tree to borrow.
-    fn base64(bytes: &[u8]) -> String {
-        const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-        for c in bytes.chunks(3) {
-            let b = [c[0], *c.get(1).unwrap_or(&0), *c.get(2).unwrap_or(&0)];
-            let n = u32::from(b[0]) << 16 | u32::from(b[1]) << 8 | u32::from(b[2]);
-            out.push(A[(n >> 18) as usize & 63] as char);
-            out.push(A[(n >> 12) as usize & 63] as char);
-            out.push(if c.len() > 1 {
-                A[(n >> 6) as usize & 63] as char
-            } else {
-                '='
-            });
-            out.push(if c.len() > 2 {
-                A[n as usize & 63] as char
-            } else {
-                '='
-            });
-        }
-        out
-    }
-
     /// The sha256 of the file at `path`, as `sha256sum` prints it.
     fn sha256(path: &Path) -> Result<String, GateError> {
         let out = Command::new("sha256sum").arg(path).output()?;
@@ -3494,8 +3470,10 @@ mod gate {
                         .pngs
                         .get(&name)
                         .ok_or_else(|| format!("request {id}: no image {name} among the sets'"))?;
-                    part["image_url"]["url"] =
-                        json!(format!("data:image/png;base64,{}", base64(png)));
+                    part["image_url"]["url"] = json!(format!(
+                        "data:image/png;base64,{}",
+                        serve_client::base64(png)
+                    ));
                 }
             }
             Ok(json!({
