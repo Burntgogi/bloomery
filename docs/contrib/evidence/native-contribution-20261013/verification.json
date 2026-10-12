@@ -1,0 +1,77 @@
+{
+  "measured_bases": {
+    "1": "b948a27d5e76ed8852aa4b3bfb3445ae58f6a69a",
+    "2": "3a17df85726f5cff6ee9428f1d93920478c355fc",
+    "3": "a98f4ee8e617277e21274572ef22ce134aa20a04"
+  },
+  "checked_upstream_main": "eb186d979602a3e150967541ffb86bfea157866b",
+  "native_amd_complete_model": false,
+  "native_dense_gpu_tokens_verified": false,
+  "host_checks": {
+    "number": 3,
+    "status": "native_frontend_draft_host_validated",
+    "branch": "contribution/qwen35-generation-20261013",
+    "commit": "a98f4ee8e617277e21274572ef22ce134aa20a04",
+    "report": "step3/docs/contrib/qwen35-generation-20261013.md",
+    "actual_file": "<local>/llama-stack/models/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf",
+    "actual_file_bytes": 12120016960,
+    "native_header_read": true,
+    "declared_layers": 65,
+    "trunk_layers": 64,
+    "unused_mtp_tensors": 15,
+    "coverage_entries": 314,
+    "tensor_format_role_entries": 313,
+    "optional_parser_entries": 1,
+    "file_native_admission": "expected_refusal",
+    "host_model_tests": {
+      "passed": 252,
+      "ignored": 4
+    },
+    "host_gpu_gates_tests": {
+      "passed": 99,
+      "ignored": 3
+    },
+    "decision_tests": {
+      "passed": 13
+    },
+    "static_frontend_check": "passed",
+    "static_frontend_clippy": "passed, 0 warnings",
+    "cuda_oxide_build_verified": false,
+    "native_generated_tokens_verified": false,
+    "nvidia_gates_verified": false,
+    "full_recipe_check": "passed",
+    "native_serving_throughput_measured": false,
+    "initial_recipe_check": {
+      "status": "failed",
+      "failure_logs": "evidence/step3/check-recipes-first.log",
+      "failures": [
+        "HF mirror could not parse the new serves arm; corrected with the existing literal form and updated mirror names/no-word semantics.",
+        "Batch mock chain-only case observed two calls where one was expected; no batch runner or tolerance changed."
+      ]
+    },
+    "coverage_breakdown": {
+      "iq2_s": 15,
+      "iq4_xs": 65,
+      "iq2_xs": 8,
+      "iq2_xxs": 5,
+      "bf16": 48,
+      "iq3_xxs": 60,
+      "iq3_s": 98,
+      "q2_K": 13,
+      "iq1_m": 1,
+      "optional_tool_parser": 1
+    },
+    "full_recipe_check_log": "evidence/step3/check-recipes.log",
+    "format_check": "passed",
+    "comment_check": "passed",
+    "architecture_check": "passed",
+    "load_owner_check": "passed",
+    "nvidia_affected_gate_count": 107
+  },
+  "sdk_packages": {
+    "rocm-sdk-core": "7.10.0a20251120",
+    "rocm-sdk-devel": "7.10.0a20251120",
+    "rocm-sdk-libraries-gfx110X-dgpu": "7.10.0a20251120"
+  },
+  "sdk_version_note": "Package metadata inspected at publication; these are Python distribution versions, not a claim about an official ROCm release."
+}

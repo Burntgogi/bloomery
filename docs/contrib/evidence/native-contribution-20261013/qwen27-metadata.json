@@ -1,0 +1,88 @@
+{
+  "file": "<local>/llama-stack/models/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf",
+  "bytes": 12120016960,
+  "tensor_count": 866,
+  "types": {
+    "Q4_K": 39,
+    "F32": 360,
+    "IQ2_S": 17,
+    "IQ4_XS": 96,
+    "IQ2_XS": 9,
+    "IQ2_XXS": 5,
+    "BF16": 96,
+    "IQ3_XXS": 78,
+    "IQ3_S": 144,
+    "Q2_K": 13,
+    "IQ1_M": 1,
+    "Q6_K": 8
+  },
+  "model_meta": {
+    "general.architecture": "qwen35",
+    "qwen35.block_count": 65,
+    "qwen35.context_length": 262144,
+    "qwen35.embedding_length": 5120,
+    "qwen35.feed_forward_length": 17408,
+    "qwen35.attention.head_count": 24,
+    "qwen35.attention.head_count_kv": 4,
+    "qwen35.rope.dimension_sections": [
+      11,
+      11,
+      10,
+      0
+    ],
+    "qwen35.rope.freq_base": 10000000.0,
+    "qwen35.attention.layer_norm_rms_epsilon": 9.999999974752427e-07,
+    "qwen35.attention.key_length": 256,
+    "qwen35.attention.value_length": 256,
+    "qwen35.ssm.conv_kernel": 4,
+    "qwen35.ssm.state_size": 128,
+    "qwen35.ssm.group_count": 16,
+    "qwen35.ssm.time_step_rank": 48,
+    "qwen35.ssm.inner_size": 6144,
+    "qwen35.full_attention_interval": 4,
+    "qwen35.rope.dimension_count": 64,
+    "qwen35.nextn_predict_layers": 1
+  },
+  "examples": [
+    {
+      "name": "output.weight",
+      "type": "Q4_K",
+      "shape": [
+        5120,
+        248320
+      ]
+    },
+    {
+      "name": "token_embd.weight",
+      "type": "IQ2_S",
+      "shape": [
+        5120,
+        248320
+      ]
+    },
+    {
+      "name": "blk.0.attn_qkv.weight",
+      "type": "IQ4_XS",
+      "shape": [
+        5120,
+        10240
+      ]
+    },
+    {
+      "name": "blk.0.ffn_gate.weight",
+      "type": "IQ2_XS",
+      "shape": [
+        5120,
+        17408
+      ]
+    },
+    {
+      "name": "blk.64.nextn.eh_proj.weight",
+      "type": "Q6_K",
+      "shape": [
+        10240,
+        5120
+      ]
+    }
+  ]
+}

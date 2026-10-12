@@ -1,0 +1,77 @@
+{
+  "flash-expert-payload.json": {
+    "source_sha256": "fa5d08ffc966b652230687198ced1a2d78891fbc8bd2f08517825c45a9cb3bfa",
+    "published_sha256": "81ee0ed994b2c60d8e317ed1f83ae465129bdefdab821a689fdc4af9d3ba17b1",
+    "source_record": "evidence/step1/expert-payload.json"
+  },
+  "flash-prose.json": {
+    "source_sha256": "131616a4f1db68dbd1af6e03a982429302c47492f6d1069050eecf89ab5f2222",
+    "published_sha256": "131616a4f1db68dbd1af6e03a982429302c47492f6d1069050eecf89ab5f2222",
+    "source_record": "evidence/step1/prose.json"
+  },
+  "flash-code.json": {
+    "source_sha256": "25ca4b09e1220a70ecf3fb0e1cd1ce027bd7659a29cecd39ddd51dfd0d7b7435",
+    "published_sha256": "25ca4b09e1220a70ecf3fb0e1cd1ce027bd7659a29cecd39ddd51dfd0d7b7435",
+    "source_record": "evidence/step1/code.json"
+  },
+  "flash-io-summary.json": {
+    "source_sha256": "bcde589ba7c71c86c75cea99649280a9d2a1943bd59274f10f70fe126473a535",
+    "published_sha256": "bcde589ba7c71c86c75cea99649280a9d2a1943bd59274f10f70fe126473a535",
+    "source_record": "evidence/step1/io-summary.json"
+  },
+  "flash-io-samples.json": {
+    "source_sha256": "100b832dbd956b23a83872e6a8d66e5b264edf1e3c68e1e4ea4bdff1f45db2dd",
+    "published_sha256": "100b832dbd956b23a83872e6a8d66e5b264edf1e3c68e1e4ea4bdff1f45db2dd",
+    "source_record": "evidence/step1/io-samples.json"
+  },
+  "hip-result.json": {
+    "source_sha256": "56ac9d445a2720c16f0686ef666532a5b16978006c7bb76a4dafb2d12255a438",
+    "published_sha256": "c4963b70748b897f3c6412daea4e3b5a68bc246d2a12923277c6cee8e1143c3e",
+    "source_record": "evidence/step2/result.json"
+  },
+  "qwen27-metadata.json": {
+    "source_sha256": "d12a645063c0b855410ba42aa25ceb372faa996448098152812b3fcf0b26df0c",
+    "published_sha256": "cb5cdbf3009016f2e4f5bf0a4f10b4318dfc34834e3efcc87a1ef0e355362034",
+    "source_record": "evidence/step3/real-metadata.json"
+  },
+  "qwen27-coverage-summary.json": {
+    "source_sha256": "3a7eedd2c9968e3e4df4df91996d4e6d7c76294ad93634a8e93b1675a094917b",
+    "published_sha256": "3a7eedd2c9968e3e4df4df91996d4e6d7c76294ad93634a8e93b1675a094917b",
+    "source_record": "evidence/step3/coverage-summary.json"
+  },
+  "qwen27-admission.log": {
+    "source_sha256": "c7c01dd270408dad1926d13f62417bb8ad1b6185ae72962153210d2aab3a1949",
+    "published_sha256": "6ea60d2be9b320fb2f55887e79d77ed6383464d4efa504db24ae0e0766d728b2",
+    "source_record": "evidence/step3/real-admission.log"
+  },
+  "hip-device-build.log": {
+    "source_sha256": "8688e7cd819d0f7f82a773f0b20d0c1728d295dfb1acf5d7007c5d44850f3a8d",
+    "published_sha256": "6db6c924cab04e498b8eca4d42db0f9b9b22acb4a75318c0ce802eb558e11f0c",
+    "source_record": "evidence/step2/device-build.log"
+  },
+  "hip-host-test.log": {
+    "source_sha256": "4963cbfaa6afc7589906a46614c3836819751f8a4e9487e399615f119109c354",
+    "published_sha256": "bdefcddde842ca7d0106f84a10ec998b3591ae2648ab402ada82a5b3d5910165",
+    "source_record": "evidence/step2/host-test.log"
+  },
+  "hip-host-clippy.log": {
+    "source_sha256": "56c86f693190cd7076d7c6c59bbdda9a26540a7fa212fbec7ba22034d95bd6ec",
+    "published_sha256": "e483908b15630f471c47dc5bd7f27b7859b063411f28503aa52fd1050e5ded89",
+    "source_record": "evidence/step2/clippy.log"
+  },
+  "hip-device-clippy.log": {
+    "source_sha256": "79b007ac719f88decee03d09ea3243871b2851e3ac63830f54cb00a10200525d",
+    "published_sha256": "7388249a33a32599864b78d756e7c46c5a06ee1a962d94bafd5f572790f084e2",
+    "source_record": "evidence/step2/device-clippy.log"
+  },
+  "check-recipes-final.log": {
+    "source_sha256": "901deb650fb0559f524a19b70ba6cfcd8377f6d7da325f313da769d854be69cf",
+    "published_sha256": "901deb650fb0559f524a19b70ba6cfcd8377f6d7da325f313da769d854be69cf",
+    "source_record": "evidence/step3/check-recipes.log"
+  },
+  "check-recipes-initial.log": {
+    "source_sha256": "71e544bc8edf05e6447c73d1ad838675bb2aa8759bc3ef473a4f18e138e77f5b",
+    "published_sha256": "71e544bc8edf05e6447c73d1ad838675bb2aa8759bc3ef473a4f18e138e77f5b",
+    "source_record": "evidence/step3/check-recipes-first.log"
+  }
+}

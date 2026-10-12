@@ -1,0 +1,33 @@
+check-recipes: tools/gate-paths.tsv: 110 gate rows held to the derivation, 22 rows with exceptions naming 188 gates
+self-test: ok (150 gate recipes, 0 failures)
+check-recipes: 65 timed recipes, 31 build in their box command after the card precheck
+check-recipes: 6 timed recipes build in a just dependency before their box command, where the precheck cannot come first: ab-decode (build-decode); measure-decode (build-decode); measure-engram (build-engram); measure-profile (build-decode); measure-sweep (build-decode); perf-decode (build-decode)
+card-tests: 627 tests, 0 failed
+self-test: ok (0 failures)
+box-tracks: self-test ok
+self-test: ok (0 failures)
+self-test: ok (0 failures)
+self-test: ok (0 failures)
+self-test: ok (34 checks, 0 failures)
+self-test: ok (0 failures)
+q38-3090-server.sh: self-test ok
+mac-check: self-test ok
+gate-batch self-test: 542 of 542 ok
+gpu-gate self-test: 100 of 100 ok
+stack-watch self-test: ok
+ptx-scan: self-test ok (13 cases, 0 failed)
+ptx-spill-check: self-test ok
+scan-args: self-test ok (38 cases, 0 failed)
+narrow-scan: self-test ok (71 cases, 0 failed)
+lds-scan: self-test ok (7 cases, 0 failed)
+mutant-run: self-test ok
+mac-static: self-test ok
+mac-remote: self-test ok (the flow against a fake remote needs macOS: skipped on Linux)
+carry: self-test ok (19 cases)
+check-recipes: 43 tool self-tests ok
+boxq codes 80, 81, 83-85: no other tool or recipe produces them
+check-recipes: fixture variants ok (4 row(s):  iq4xs q2kxl glmffnkq q6kdown )
+refset-publish: self-test ok
+orphan-tests: ok (2202 tests, each run by a gate-* or lab-* recipe)
+check-recipes: arch owner ok (147 recipe lines build with --arch {{arch}}, 12 fixtures)
+check-recipes: ok

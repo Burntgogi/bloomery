@@ -1,0 +1,10 @@
+{
+  "samples": 96,
+  "payload_bytes": 167372800,
+  "physical_bytes": 168501248,
+  "elapsed_ns": 167479142,
+  "physical_GB_per_second": 1.006102885337208,
+  "median_expert_ms": 1.707209,
+  "p90_expert_ms": 2.007929,
+  "scope": "Serial cold-page-cache-bypassing O_DIRECT file reads, including temporary aligned-buffer creation. SSD/controller caches are not reset. No inference or read/compute overlap is timed."
+}

@@ -1,0 +1,76 @@
+{
+  "command": [
+    "<local>/bloomery-native-contributions-20261013/step2/labs/hip-native/target/release/bloomery-hip-spike",
+    "<local>/bloomery-native-contributions-20261013/step2/labs/hip-native/target/amdgcn-amd-amdhsa/release/bloomery_hip_spike_device.elf",
+    "<local>/bloomery-qwen27-serving-20261012/matmul-fixtures/Q4_K.bin",
+    "6144",
+    "64"
+  ],
+  "real_model_case": {
+    "tensor": "blk.1.ssm_out.weight",
+    "type": 12,
+    "type_name": "Q4_K",
+    "k": 6144,
+    "rows": 64,
+    "file": "<local>/bloomery-qwen27-serving-20261012/matmul-fixtures/Q4_K.bin",
+    "sha256": "9251b422a700bf27bf47512068c93f88d029dc6eba32ed516dbc067842b570ce"
+  },
+  "device_sha256": "f1cd17d3daa99350647860eeb67112bbc86d502b5f95717dc6a1a3090fefaffd",
+  "host_sha256": "eaf7b9587a85456d1c79e5dbbe5e39fef17585478fb38bd6887d7675e84fc616",
+  "before": {
+    "gpu_busy_percent": 0,
+    "mem_info_vram_used": 6027579392,
+    "mem_info_vram_total": 17163091968
+  },
+  "scope": "Rust AMDGPU operator functionality; no libllama or ggml inference; no model serving throughput.",
+  "exit_code": 0,
+  "cases": [
+    {
+      "k": 256,
+      "rows": 7,
+      "cols": 1,
+      "nmse": 3.702660797383163e-14,
+      "copy_equal": true,
+      "steady_host_buffer_allocations": 0
+    },
+    {
+      "k": 512,
+      "rows": 64,
+      "cols": 1,
+      "nmse": 1.375607993838801e-12,
+      "copy_equal": true,
+      "steady_host_buffer_allocations": 0
+    },
+    {
+      "k": 512,
+      "rows": 64,
+      "cols": 32,
+      "nmse": 6.689703539606927e-13,
+      "copy_equal": true,
+      "steady_host_buffer_allocations": 0
+    },
+    {
+      "k": 6144,
+      "rows": 64,
+      "cols": 1,
+      "nmse": 2.331305569619408e-12,
+      "copy_equal": true,
+      "steady_host_buffer_allocations": 0
+    },
+    {
+      "k": 6144,
+      "rows": 64,
+      "cols": 32,
+      "nmse": 2.0990081683686894e-12,
+      "copy_equal": true,
+      "steady_host_buffer_allocations": 0
+    },
+    {
+      "operation": "dense_ffn",
+      "width": 256,
+      "nmse": 7.959878245021427e-14,
+      "intermediate_host_copies": 0,
+      "steady_host_buffer_allocations": 0
+    }
+  ]
+}

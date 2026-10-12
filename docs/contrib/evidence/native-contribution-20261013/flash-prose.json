@@ -1,0 +1,654 @@
+{
+  "positions": 4096,
+  "layers": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36,
+    37,
+    38,
+    39,
+    40,
+    41,
+    42,
+    43,
+    44,
+    45,
+    46,
+    47
+  ],
+  "n_expert": 512,
+  "n_used": 10,
+  "split": "learn [0, 4096), held-out [4096, 8192)",
+  "n": [
+    4,
+    8,
+    16,
+    32
+  ],
+  "recall": {
+    "freq": [
+      0.0927973321143617,
+      0.1564006399601064,
+      0.2429760222739362,
+      0.36218157829122344
+    ],
+    "cooccur": [
+      0.22006368434175533,
+      0.3636157746010638,
+      0.5330446933178191,
+      0.6977024808843085
+    ],
+    "cooccur in-sample": [
+      0.2525239985039894,
+      0.4218194190492021,
+      0.618280938331117,
+      0.7960760887632979
+    ]
+  },
+  "tiers": [
+    {
+      "card": "p64",
+      "pool": "lru128",
+      "classes": [
+        {
+          "class": "card miss",
+          "ranker": "freq",
+          "demand": 1668185,
+          "hits": [
+            172092,
+            286171,
+            439458,
+            648678
+          ],
+          "reads": [
+            770048,
+            1540096,
+            3080192,
+            6160384
+          ]
+        },
+        {
+          "class": "card miss",
+          "ranker": "cooccur",
+          "demand": 1668185,
+          "hits": [
+            408264,
+            659327,
+            945208,
+            1212276
+          ],
+          "reads": [
+            770048,
+            1540096,
+            3080192,
+            6160384
+          ]
+        },
+        {
+          "class": "RAM",
+          "ranker": "freq",
+          "demand": 1196441,
+          "hits": [
+            162794,
+            266389,
+            398024,
+            564048
+          ],
+          "reads": [
+            770048,
+            1540096,
+            3080192,
+            6160384
+          ]
+        },
+        {
+          "class": "RAM",
+          "ranker": "cooccur",
+          "demand": 1196441,
+          "hits": [
+            341653,
+            532518,
+            740438,
+            922862
+          ],
+          "reads": [
+            770048,
+            1540096,
+            3080192,
+            6160384
+          ]
+        },
+        {
+          "class": "NVMe",
+          "ranker": "freq",
+          "demand": 471744,
+          "hits": [
+            28536,
+            50560,
+            89861,
+            158525
+          ],
+          "reads": [
+            770048,
+            1540096,
+            3080192,
+            6160384
+          ]
+        },
+        {
+          "class": "NVMe",
+          "ranker": "cooccur",
+          "demand": 471744,
+          "hits": [
+            146476,
+            218930,
+            291488,
+            358573
+          ],
+          "reads": [
+            770048,
+            1540096,
+            3080192,
+            6160384
+          ]
+        }
+      ],
+      "nvme_payload_cost": [
+        {
+          "ranker": "freq",
+          "n": 4,
+          "demand_bytes": 827136460800,
+          "ahead_bytes": 1342596710400,
+          "useful_bytes": 50085683200,
+          "wasted_bytes": 1292511027200,
+          "total_bytes": 2119647488000,
+          "read_amplification": 2.562633360340437
+        },
+        {
+          "ranker": "freq",
+          "n": 8,
+          "demand_bytes": 827136460800,
+          "ahead_bytes": 2685193420800,
+          "useful_bytes": 88963328000,
+          "wasted_bytes": 2596230092800,
+          "total_bytes": 3423366553600,
+          "read_amplification": 4.138817130959197
+        },
+        {
+          "ranker": "freq",
+          "n": 16,
+          "demand_bytes": 827136460800,
+          "ahead_bytes": 5370386841600,
+          "useful_bytes": 158429619200,
+          "wasted_bytes": 5211957222400,
+          "total_bytes": 6039093683200,
+          "read_amplification": 7.301205991281094
+        },
+        {
+          "ranker": "freq",
+          "n": 32,
+          "demand_bytes": 827136460800,
+          "ahead_bytes": 10740773683200,
+          "useful_bytes": 279511936000,
+          "wasted_bytes": 10461261747200,
+          "total_bytes": 11288398208000,
+          "read_amplification": 13.64756451079662
+        },
+        {
+          "ranker": "cooccur",
+          "n": 4,
+          "demand_bytes": 827136460800,
+          "ahead_bytes": 1342596710400,
+          "useful_bytes": 256148684800,
+          "wasted_bytes": 1086448025600,
+          "total_bytes": 1913584486400,
+          "read_amplification": 2.313505179724753
+        },
+        {
+          "ranker": "cooccur",
+          "n": 8,
+          "demand_bytes": 827136460800,
+          "ahead_bytes": 2685193420800,
+          "useful_bytes": 383426099200,
+          "wasted_bytes": 2301767321600,
+          "total_bytes": 3128903782400,
+          "read_amplification": 3.7828144818737024
+        },
+        {
+          "ranker": "cooccur",
+          "n": 16,
+          "demand_bytes": 827136460800,
+          "ahead_bytes": 5370386841600,
+          "useful_bytes": 510802636800,
+          "wasted_bytes": 4859584204800,
+          "total_bytes": 5686720665600,
+          "read_amplification": 6.875190413078693
+        },
+        {
+          "ranker": "cooccur",
+          "n": 32,
+          "demand_bytes": 827136460800,
+          "ahead_bytes": 10740773683200,
+          "useful_bytes": 628396518400,
+          "wasted_bytes": 10112377164800,
+          "total_bytes": 10939513625600,
+          "read_amplification": 13.225766417090822
+        }
+      ]
+    },
+    {
+      "card": "p128",
+      "pool": "lru256",
+      "classes": [
+        {
+          "class": "card miss",
+          "ranker": "freq",
+          "demand": 1402061,
+          "hits": [
+            159269,
+            264773,
+            401868,
+            595448
+          ],
+          "reads": [
+            770048,
+            1540096,
+            3080192,
+            6160384
+          ]
+        },
+        {
+          "class": "card miss",
+          "ranker": "cooccur",
+          "demand": 1402061,
+          "hits": [
+            384935,
+            606704,
+            847321,
+            1064921
+          ],
+          "reads": [
+            770048,
+            1540096,
+            3080192,
+            6160384
+          ]
+        },
+        {
+          "class": "RAM",
+          "ranker": "freq",
+          "demand": 1261830,
+          "hits": [
+            158268,
+            262426,
+            396245,
+            581998
+          ],
+          "reads": [
+            770048,
+            1540096,
+            3080192,
+            6160384
+          ]
+        },
+        {
+          "class": "RAM",
+          "ranker": "cooccur",
+          "demand": 1261830,
+          "hits": [
+            371899,
+            579683,
+            800209,
+            993070
+          ],
+          "reads": [
+            770048,
+            1540096,
+            3080192,
+            6160384
+          ]
+        },
+        {
+          "class": "NVMe",
+          "ranker": "freq",
+          "demand": 140231,
+          "hits": [
+            11439,
+            21041,
+            37928,
+            64755
+          ],
+          "reads": [
+            770048,
+            1540096,
+            3080192,
+            6160384
+          ]
+        },
+        {
+          "class": "NVMe",
+          "ranker": "cooccur",
+          "demand": 140231,
+          "hits": [
+            57564,
+            78052,
+            97890,
+            115112
+          ],
+          "reads": [
+            770048,
+            1540096,
+            3080192,
+            6160384
+          ]
+        }
+      ],
+      "nvme_payload_cost": [
+        {
+          "ranker": "freq",
+          "n": 4,
+          "demand_bytes": 243710540800,
+          "ahead_bytes": 1342596710400,
+          "useful_bytes": 20025728000,
+          "wasted_bytes": 1322570982400,
+          "total_bytes": 1566281523200,
+          "read_amplification": 6.426810748761836
+        },
+        {
+          "ranker": "freq",
+          "n": 8,
+          "demand_bytes": 243710540800,
+          "ahead_bytes": 2685193420800,
+          "useful_bytes": 36819993600,
+          "wasted_bytes": 2648373427200,
+          "total_bytes": 2892083968000,
+          "read_amplification": 11.866880925652602
+        },
+        {
+          "ranker": "freq",
+          "n": 16,
+          "demand_bytes": 243710540800,
+          "ahead_bytes": 5370386841600,
+          "useful_bytes": 66370508800,
+          "wasted_bytes": 5304016332800,
+          "total_bytes": 5547726873600,
+          "read_amplification": 22.7635901811597
+        },
+        {
+          "ranker": "freq",
+          "n": 32,
+          "demand_bytes": 243710540800,
+          "ahead_bytes": 10740773683200,
+          "useful_bytes": 113381504000,
+          "wasted_bytes": 10627392179200,
+          "total_bytes": 10871102720000,
+          "read_amplification": 44.60661686734889
+        },
+        {
+          "ranker": "cooccur",
+          "n": 4,
+          "demand_bytes": 243710540800,
+          "ahead_bytes": 1342596710400,
+          "useful_bytes": 99658803200,
+          "wasted_bytes": 1242937907200,
+          "total_bytes": 1486648448000,
+          "read_amplification": 6.100058057070299
+        },
+        {
+          "ranker": "cooccur",
+          "n": 8,
+          "demand_bytes": 243710540800,
+          "ahead_bytes": 2685193420800,
+          "useful_bytes": 135244134400,
+          "wasted_bytes": 2549949286400,
+          "total_bytes": 2793659827200,
+          "read_amplification": 11.463024200880195
+        },
+        {
+          "ranker": "cooccur",
+          "n": 16,
+          "demand_bytes": 243710540800,
+          "ahead_bytes": 5370386841600,
+          "useful_bytes": 169817088000,
+          "wasted_bytes": 5200569753600,
+          "total_bytes": 5444280294400,
+          "read_amplification": 22.339125244762496
+        },
+        {
+          "ranker": "cooccur",
+          "n": 32,
+          "demand_bytes": 243710540800,
+          "ahead_bytes": 10740773683200,
+          "useful_bytes": 199745280000,
+          "wasted_bytes": 10541028403200,
+          "total_bytes": 10784738944000,
+          "read_amplification": 44.252246573325074
+        }
+      ]
+    },
+    {
+      "card": "n128",
+      "pool": "lru256",
+      "classes": [
+        {
+          "class": "card miss",
+          "ranker": "freq",
+          "demand": 496026,
+          "hits": [
+            18654,
+            36970,
+            74041,
+            136475
+          ],
+          "reads": [
+            770048,
+            1540096,
+            3080192,
+            6160384
+          ]
+        },
+        {
+          "class": "card miss",
+          "ranker": "cooccur",
+          "demand": 496026,
+          "hits": [
+            160154,
+            229907,
+            301920,
+            369360
+          ],
+          "reads": [
+            770048,
+            1540096,
+            3080192,
+            6160384
+          ]
+        },
+        {
+          "class": "RAM",
+          "ranker": "freq",
+          "demand": 435706,
+          "hits": [
+            17906,
+            35410,
+            70908,
+            129769
+          ],
+          "reads": [
+            770048,
+            1540096,
+            3080192,
+            6160384
+          ]
+        },
+        {
+          "class": "RAM",
+          "ranker": "cooccur",
+          "demand": 435706,
+          "hits": [
+            149061,
+            212046,
+            275851,
+            334790
+          ],
+          "reads": [
+            770048,
+            1540096,
+            3080192,
+            6160384
+          ]
+        },
+        {
+          "class": "NVMe",
+          "ranker": "freq",
+          "demand": 60320,
+          "hits": [
+            4474,
+            8394,
+            15373,
+            26352
+          ],
+          "reads": [
+            770048,
+            1540096,
+            3080192,
+            6160384
+          ]
+        },
+        {
+          "class": "NVMe",
+          "ranker": "cooccur",
+          "demand": 60320,
+          "hits": [
+            25756,
+            33528,
+            40924,
+            47758
+          ],
+          "reads": [
+            770048,
+            1540096,
+            3080192,
+            6160384
+          ]
+        }
+      ],
+      "nvme_payload_cost": [
+        {
+          "ranker": "freq",
+          "n": 4,
+          "demand_bytes": 103905894400,
+          "ahead_bytes": 1342596710400,
+          "useful_bytes": 7767398400,
+          "wasted_bytes": 1334829312000,
+          "total_bytes": 1438735206400,
+          "read_amplification": 13.846521554026486
+        },
+        {
+          "ranker": "freq",
+          "n": 8,
+          "demand_bytes": 103905894400,
+          "ahead_bytes": 2685193420800,
+          "useful_bytes": 14586060800,
+          "wasted_bytes": 2670607360000,
+          "total_bytes": 2774513254400,
+          "read_amplification": 26.70217383163202
+        },
+        {
+          "ranker": "freq",
+          "n": 16,
+          "demand_bytes": 103905894400,
+          "ahead_bytes": 5370386841600,
+          "useful_bytes": 26709478400,
+          "wasted_bytes": 5343677363200,
+          "total_bytes": 5447583257600,
+          "read_amplification": 52.42804837066106
+        },
+        {
+          "ranker": "freq",
+          "n": 32,
+          "demand_bytes": 103905894400,
+          "ahead_bytes": 10740773683200,
+          "useful_bytes": 45691955200,
+          "wasted_bytes": 10695081728000,
+          "total_bytes": 10798987622400,
+          "read_amplification": 103.93046212400439
+        },
+        {
+          "ranker": "cooccur",
+          "n": 4,
+          "demand_bytes": 103905894400,
+          "ahead_bytes": 1342596710400,
+          "useful_bytes": 44203929600,
+          "wasted_bytes": 1298392780800,
+          "total_bytes": 1402298675200,
+          "read_amplification": 13.49585298598806
+        },
+        {
+          "ranker": "cooccur",
+          "n": 8,
+          "demand_bytes": 103905894400,
+          "ahead_bytes": 2685193420800,
+          "useful_bytes": 57549516800,
+          "wasted_bytes": 2627643904000,
+          "total_bytes": 2731549798400,
+          "read_amplification": 26.28868953174614
+        },
+        {
+          "ranker": "cooccur",
+          "n": 16,
+          "demand_bytes": 103905894400,
+          "ahead_bytes": 5370386841600,
+          "useful_bytes": 70299340800,
+          "wasted_bytes": 5300087500800,
+          "total_bytes": 5403993395200,
+          "read_amplification": 52.00853547727125
+        },
+        {
+          "ranker": "cooccur",
+          "n": 32,
+          "demand_bytes": 103905894400,
+          "ahead_bytes": 10740773683200,
+          "useful_bytes": 82057984000,
+          "wasted_bytes": 10658715699200,
+          "total_bytes": 10762621593600,
+          "read_amplification": 103.58047207762642
+        }
+      ]
+    }
+  ],
+  "payload_source": "GGUF quantized gate/up/down weight payload, excluding scales, alignment, runtime repacking and cache policy"
+}

@@ -1,0 +1,770 @@
+[
+  {
+    "index": 0,
+    "layer": 28,
+    "expert": 476,
+    "payload_bytes": 2329600,
+    "physical_bytes": 2342912,
+    "read_ns": 2450963
+  },
+  {
+    "index": 1,
+    "layer": 28,
+    "expert": 194,
+    "payload_bytes": 2329600,
+    "physical_bytes": 2342912,
+    "read_ns": 1951812
+  },
+  {
+    "index": 2,
+    "layer": 11,
+    "expert": 487,
+    "payload_bytes": 1305600,
+    "physical_bytes": 1314816,
+    "read_ns": 1468632
+  },
+  {
+    "index": 3,
+    "layer": 40,
+    "expert": 190,
+    "payload_bytes": 1510400,
+    "physical_bytes": 1523712,
+    "read_ns": 1588179
+  },
+  {
+    "index": 4,
+    "layer": 6,
+    "expert": 457,
+    "payload_bytes": 1305600,
+    "physical_bytes": 1323008,
+    "read_ns": 1447281
+  },
+  {
+    "index": 5,
+    "layer": 19,
+    "expert": 145,
+    "payload_bytes": 1408000,
+    "physical_bytes": 1417216,
+    "read_ns": 1540371
+  },
+  {
+    "index": 6,
+    "layer": 5,
+    "expert": 42,
+    "payload_bytes": 1408000,
+    "physical_bytes": 1421312,
+    "read_ns": 1603635
+  },
+  {
+    "index": 7,
+    "layer": 38,
+    "expert": 405,
+    "payload_bytes": 1971200,
+    "physical_bytes": 1982464,
+    "read_ns": 1661202
+  },
+  {
+    "index": 8,
+    "layer": 28,
+    "expert": 161,
+    "payload_bytes": 2329600,
+    "physical_bytes": 2342912,
+    "read_ns": 1924833
+  },
+  {
+    "index": 9,
+    "layer": 39,
+    "expert": 15,
+    "payload_bytes": 1868800,
+    "physical_bytes": 1884160,
+    "read_ns": 1631600
+  },
+  {
+    "index": 10,
+    "layer": 33,
+    "expert": 64,
+    "payload_bytes": 1868800,
+    "physical_bytes": 1884160,
+    "read_ns": 1678073
+  },
+  {
+    "index": 11,
+    "layer": 3,
+    "expert": 36,
+    "payload_bytes": 1305600,
+    "physical_bytes": 1314816,
+    "read_ns": 1383862
+  },
+  {
+    "index": 12,
+    "layer": 12,
+    "expert": 247,
+    "payload_bytes": 1510400,
+    "physical_bytes": 1523712,
+    "read_ns": 1778291
+  },
+  {
+    "index": 13,
+    "layer": 38,
+    "expert": 30,
+    "payload_bytes": 1971200,
+    "physical_bytes": 1982464,
+    "read_ns": 1937321
+  },
+  {
+    "index": 14,
+    "layer": 29,
+    "expert": 334,
+    "payload_bytes": 1971200,
+    "physical_bytes": 1982464,
+    "read_ns": 1701213
+  },
+  {
+    "index": 15,
+    "layer": 28,
+    "expert": 200,
+    "payload_bytes": 2329600,
+    "physical_bytes": 2342912,
+    "read_ns": 2158900
+  },
+  {
+    "index": 16,
+    "layer": 33,
+    "expert": 239,
+    "payload_bytes": 1868800,
+    "physical_bytes": 1880064,
+    "read_ns": 1706427
+  },
+  {
+    "index": 17,
+    "layer": 40,
+    "expert": 301,
+    "payload_bytes": 1510400,
+    "physical_bytes": 1519616,
+    "read_ns": 1546299
+  },
+  {
+    "index": 18,
+    "layer": 31,
+    "expert": 4,
+    "payload_bytes": 1766400,
+    "physical_bytes": 1777664,
+    "read_ns": 1635764
+  },
+  {
+    "index": 19,
+    "layer": 42,
+    "expert": 87,
+    "payload_bytes": 1971200,
+    "physical_bytes": 1986560,
+    "read_ns": 1744339
+  },
+  {
+    "index": 20,
+    "layer": 29,
+    "expert": 284,
+    "payload_bytes": 1971200,
+    "physical_bytes": 1982464,
+    "read_ns": 1597482
+  },
+  {
+    "index": 21,
+    "layer": 26,
+    "expert": 85,
+    "payload_bytes": 1510400,
+    "physical_bytes": 1527808,
+    "read_ns": 1544043
+  },
+  {
+    "index": 22,
+    "layer": 45,
+    "expert": 260,
+    "payload_bytes": 1715200,
+    "physical_bytes": 1728512,
+    "read_ns": 1663505
+  },
+  {
+    "index": 23,
+    "layer": 20,
+    "expert": 235,
+    "payload_bytes": 1868800,
+    "physical_bytes": 1875968,
+    "read_ns": 1731839
+  },
+  {
+    "index": 24,
+    "layer": 32,
+    "expert": 295,
+    "payload_bytes": 2329600,
+    "physical_bytes": 2342912,
+    "read_ns": 1804811
+  },
+  {
+    "index": 25,
+    "layer": 1,
+    "expert": 71,
+    "payload_bytes": 1305600,
+    "physical_bytes": 1314816,
+    "read_ns": 1442969
+  },
+  {
+    "index": 26,
+    "layer": 36,
+    "expert": 110,
+    "payload_bytes": 1715200,
+    "physical_bytes": 1724416,
+    "read_ns": 1576249
+  },
+  {
+    "index": 27,
+    "layer": 25,
+    "expert": 110,
+    "payload_bytes": 1408000,
+    "physical_bytes": 1417216,
+    "read_ns": 1498519
+  },
+  {
+    "index": 28,
+    "layer": 18,
+    "expert": 395,
+    "payload_bytes": 1868800,
+    "physical_bytes": 1880064,
+    "read_ns": 1613304
+  },
+  {
+    "index": 29,
+    "layer": 4,
+    "expert": 17,
+    "payload_bytes": 1868800,
+    "physical_bytes": 1875968,
+    "read_ns": 1666860
+  },
+  {
+    "index": 30,
+    "layer": 43,
+    "expert": 0,
+    "payload_bytes": 2329600,
+    "physical_bytes": 2338816,
+    "read_ns": 1973451
+  },
+  {
+    "index": 31,
+    "layer": 13,
+    "expert": 214,
+    "payload_bytes": 1305600,
+    "physical_bytes": 1318912,
+    "read_ns": 1675990
+  },
+  {
+    "index": 32,
+    "layer": 3,
+    "expert": 481,
+    "payload_bytes": 1305600,
+    "physical_bytes": 1318912,
+    "read_ns": 1456048
+  },
+  {
+    "index": 33,
+    "layer": 24,
+    "expert": 406,
+    "payload_bytes": 1868800,
+    "physical_bytes": 1880064,
+    "read_ns": 1756867
+  },
+  {
+    "index": 34,
+    "layer": 26,
+    "expert": 74,
+    "payload_bytes": 1510400,
+    "physical_bytes": 1519616,
+    "read_ns": 1393472
+  },
+  {
+    "index": 35,
+    "layer": 36,
+    "expert": 203,
+    "payload_bytes": 1715200,
+    "physical_bytes": 1728512,
+    "read_ns": 1499098
+  },
+  {
+    "index": 36,
+    "layer": 43,
+    "expert": 276,
+    "payload_bytes": 2329600,
+    "physical_bytes": 2342912,
+    "read_ns": 1864407
+  },
+  {
+    "index": 37,
+    "layer": 21,
+    "expert": 89,
+    "payload_bytes": 1510400,
+    "physical_bytes": 1523712,
+    "read_ns": 1599071
+  },
+  {
+    "index": 38,
+    "layer": 19,
+    "expert": 340,
+    "payload_bytes": 1408000,
+    "physical_bytes": 1417216,
+    "read_ns": 1522520
+  },
+  {
+    "index": 39,
+    "layer": 0,
+    "expert": 419,
+    "payload_bytes": 1868800,
+    "physical_bytes": 1884160,
+    "read_ns": 1891226
+  },
+  {
+    "index": 40,
+    "layer": 7,
+    "expert": 137,
+    "payload_bytes": 1305600,
+    "physical_bytes": 1314816,
+    "read_ns": 1573686
+  },
+  {
+    "index": 41,
+    "layer": 15,
+    "expert": 103,
+    "payload_bytes": 1510400,
+    "physical_bytes": 1519616,
+    "read_ns": 1585573
+  },
+  {
+    "index": 42,
+    "layer": 0,
+    "expert": 61,
+    "payload_bytes": 1868800,
+    "physical_bytes": 1880064,
+    "read_ns": 1782431
+  },
+  {
+    "index": 43,
+    "layer": 29,
+    "expert": 498,
+    "payload_bytes": 1971200,
+    "physical_bytes": 1982464,
+    "read_ns": 1744789
+  },
+  {
+    "index": 44,
+    "layer": 11,
+    "expert": 192,
+    "payload_bytes": 1305600,
+    "physical_bytes": 1323008,
+    "read_ns": 1590416
+  },
+  {
+    "index": 45,
+    "layer": 28,
+    "expert": 195,
+    "payload_bytes": 2329600,
+    "physical_bytes": 2342912,
+    "read_ns": 1867733
+  },
+  {
+    "index": 46,
+    "layer": 46,
+    "expert": 134,
+    "payload_bytes": 1971200,
+    "physical_bytes": 1978368,
+    "read_ns": 1829059
+  },
+  {
+    "index": 47,
+    "layer": 26,
+    "expert": 392,
+    "payload_bytes": 1510400,
+    "physical_bytes": 1519616,
+    "read_ns": 1553625
+  },
+  {
+    "index": 48,
+    "layer": 7,
+    "expert": 404,
+    "payload_bytes": 1305600,
+    "physical_bytes": 1318912,
+    "read_ns": 1634608
+  },
+  {
+    "index": 49,
+    "layer": 26,
+    "expert": 217,
+    "payload_bytes": 1510400,
+    "physical_bytes": 1523712,
+    "read_ns": 1867412
+  },
+  {
+    "index": 50,
+    "layer": 0,
+    "expert": 276,
+    "payload_bytes": 1868800,
+    "physical_bytes": 1880064,
+    "read_ns": 2007929
+  },
+  {
+    "index": 51,
+    "layer": 37,
+    "expert": 311,
+    "payload_bytes": 2329600,
+    "physical_bytes": 2342912,
+    "read_ns": 2123727
+  },
+  {
+    "index": 52,
+    "layer": 1,
+    "expert": 215,
+    "payload_bytes": 1305600,
+    "physical_bytes": 1314816,
+    "read_ns": 2179521
+  },
+  {
+    "index": 53,
+    "layer": 11,
+    "expert": 403,
+    "payload_bytes": 1305600,
+    "physical_bytes": 1314816,
+    "read_ns": 1574189
+  },
+  {
+    "index": 54,
+    "layer": 38,
+    "expert": 102,
+    "payload_bytes": 1971200,
+    "physical_bytes": 1982464,
+    "read_ns": 1870366
+  },
+  {
+    "index": 55,
+    "layer": 2,
+    "expert": 149,
+    "payload_bytes": 1868800,
+    "physical_bytes": 1880064,
+    "read_ns": 1745500
+  },
+  {
+    "index": 56,
+    "layer": 13,
+    "expert": 452,
+    "payload_bytes": 1305600,
+    "physical_bytes": 1323008,
+    "read_ns": 1419364
+  },
+  {
+    "index": 57,
+    "layer": 16,
+    "expert": 9,
+    "payload_bytes": 1305600,
+    "physical_bytes": 1314816,
+    "read_ns": 1311823
+  },
+  {
+    "index": 58,
+    "layer": 39,
+    "expert": 336,
+    "payload_bytes": 1868800,
+    "physical_bytes": 1880064,
+    "read_ns": 1699001
+  },
+  {
+    "index": 59,
+    "layer": 18,
+    "expert": 395,
+    "payload_bytes": 1868800,
+    "physical_bytes": 1880064,
+    "read_ns": 1626181
+  },
+  {
+    "index": 60,
+    "layer": 4,
+    "expert": 76,
+    "payload_bytes": 1868800,
+    "physical_bytes": 1880064,
+    "read_ns": 1837921
+  },
+  {
+    "index": 61,
+    "layer": 5,
+    "expert": 213,
+    "payload_bytes": 1408000,
+    "physical_bytes": 1421312,
+    "read_ns": 1530008
+  },
+  {
+    "index": 62,
+    "layer": 37,
+    "expert": 248,
+    "payload_bytes": 2329600,
+    "physical_bytes": 2342912,
+    "read_ns": 2107268
+  },
+  {
+    "index": 63,
+    "layer": 0,
+    "expert": 377,
+    "payload_bytes": 1868800,
+    "physical_bytes": 1880064,
+    "read_ns": 1782944
+  },
+  {
+    "index": 64,
+    "layer": 23,
+    "expert": 464,
+    "payload_bytes": 1868800,
+    "physical_bytes": 1884160,
+    "read_ns": 1647644
+  },
+  {
+    "index": 65,
+    "layer": 8,
+    "expert": 495,
+    "payload_bytes": 1868800,
+    "physical_bytes": 1875968,
+    "read_ns": 1796989
+  },
+  {
+    "index": 66,
+    "layer": 36,
+    "expert": 138,
+    "payload_bytes": 1715200,
+    "physical_bytes": 1724416,
+    "read_ns": 1807575
+  },
+  {
+    "index": 67,
+    "layer": 24,
+    "expert": 187,
+    "payload_bytes": 1868800,
+    "physical_bytes": 1880064,
+    "read_ns": 1920041
+  },
+  {
+    "index": 68,
+    "layer": 40,
+    "expert": 157,
+    "payload_bytes": 1510400,
+    "physical_bytes": 1519616,
+    "read_ns": 1707991
+  },
+  {
+    "index": 69,
+    "layer": 19,
+    "expert": 233,
+    "payload_bytes": 1408000,
+    "physical_bytes": 1417216,
+    "read_ns": 1559770
+  },
+  {
+    "index": 70,
+    "layer": 39,
+    "expert": 255,
+    "payload_bytes": 1868800,
+    "physical_bytes": 1884160,
+    "read_ns": 2334437
+  },
+  {
+    "index": 71,
+    "layer": 46,
+    "expert": 194,
+    "payload_bytes": 1971200,
+    "physical_bytes": 1978368,
+    "read_ns": 2077396
+  },
+  {
+    "index": 72,
+    "layer": 10,
+    "expert": 201,
+    "payload_bytes": 1408000,
+    "physical_bytes": 1421312,
+    "read_ns": 1772116
+  },
+  {
+    "index": 73,
+    "layer": 43,
+    "expert": 397,
+    "payload_bytes": 2329600,
+    "physical_bytes": 2342912,
+    "read_ns": 2290583
+  },
+  {
+    "index": 74,
+    "layer": 30,
+    "expert": 80,
+    "payload_bytes": 2329600,
+    "physical_bytes": 2342912,
+    "read_ns": 2277557
+  },
+  {
+    "index": 75,
+    "layer": 26,
+    "expert": 48,
+    "payload_bytes": 1510400,
+    "physical_bytes": 1519616,
+    "read_ns": 1927454
+  },
+  {
+    "index": 76,
+    "layer": 6,
+    "expert": 111,
+    "payload_bytes": 1305600,
+    "physical_bytes": 1318912,
+    "read_ns": 1602545
+  },
+  {
+    "index": 77,
+    "layer": 2,
+    "expert": 261,
+    "payload_bytes": 1868800,
+    "physical_bytes": 1880064,
+    "read_ns": 1957954
+  },
+  {
+    "index": 78,
+    "layer": 15,
+    "expert": 401,
+    "payload_bytes": 1510400,
+    "physical_bytes": 1523712,
+    "read_ns": 1785872
+  },
+  {
+    "index": 79,
+    "layer": 16,
+    "expert": 430,
+    "payload_bytes": 1305600,
+    "physical_bytes": 1323008,
+    "read_ns": 1561630
+  },
+  {
+    "index": 80,
+    "layer": 38,
+    "expert": 502,
+    "payload_bytes": 1971200,
+    "physical_bytes": 1982464,
+    "read_ns": 1641744
+  },
+  {
+    "index": 81,
+    "layer": 18,
+    "expert": 179,
+    "payload_bytes": 1868800,
+    "physical_bytes": 1880064,
+    "read_ns": 1834343
+  },
+  {
+    "index": 82,
+    "layer": 46,
+    "expert": 70,
+    "payload_bytes": 1971200,
+    "physical_bytes": 1978368,
+    "read_ns": 1846816
+  },
+  {
+    "index": 83,
+    "layer": 8,
+    "expert": 233,
+    "payload_bytes": 1868800,
+    "physical_bytes": 1880064,
+    "read_ns": 1619036
+  },
+  {
+    "index": 84,
+    "layer": 30,
+    "expert": 75,
+    "payload_bytes": 2329600,
+    "physical_bytes": 2342912,
+    "read_ns": 1964929
+  },
+  {
+    "index": 85,
+    "layer": 17,
+    "expert": 217,
+    "payload_bytes": 1510400,
+    "physical_bytes": 1523712,
+    "read_ns": 1817798
+  },
+  {
+    "index": 86,
+    "layer": 13,
+    "expert": 16,
+    "payload_bytes": 1305600,
+    "physical_bytes": 1318912,
+    "read_ns": 1523317
+  },
+  {
+    "index": 87,
+    "layer": 4,
+    "expert": 275,
+    "payload_bytes": 1868800,
+    "physical_bytes": 1880064,
+    "read_ns": 2099925
+  },
+  {
+    "index": 88,
+    "layer": 26,
+    "expert": 456,
+    "payload_bytes": 1510400,
+    "physical_bytes": 1519616,
+    "read_ns": 1996328
+  },
+  {
+    "index": 89,
+    "layer": 15,
+    "expert": 61,
+    "payload_bytes": 1510400,
+    "physical_bytes": 1519616,
+    "read_ns": 1648457
+  },
+  {
+    "index": 90,
+    "layer": 2,
+    "expert": 180,
+    "payload_bytes": 1868800,
+    "physical_bytes": 1880064,
+    "read_ns": 1860942
+  },
+  {
+    "index": 91,
+    "layer": 18,
+    "expert": 377,
+    "payload_bytes": 1868800,
+    "physical_bytes": 1880064,
+    "read_ns": 1883223
+  },
+  {
+    "index": 92,
+    "layer": 33,
+    "expert": 134,
+    "payload_bytes": 1868800,
+    "physical_bytes": 1884160,
+    "read_ns": 1767776
+  },
+  {
+    "index": 93,
+    "layer": 5,
+    "expert": 370,
+    "payload_bytes": 1408000,
+    "physical_bytes": 1421312,
+    "read_ns": 1498229
+  },
+  {
+    "index": 94,
+    "layer": 8,
+    "expert": 461,
+    "payload_bytes": 1868800,
+    "physical_bytes": 1880064,
+    "read_ns": 1770583
+  },
+  {
+    "index": 95,
+    "layer": 21,
+    "expert": 143,
+    "payload_bytes": 1510400,
+    "physical_bytes": 1519616,
+    "read_ns": 1522340
+  }
+]
