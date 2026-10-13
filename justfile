@@ -525,6 +525,14 @@ box-tracks *ARGS:
 mac-disk *ARGS:
     python3 tools/mac-disk.py {{ARGS}}
 
+# A round's worktree on this Mac (tools/wt.sh): added at BASE (default HEAD), main's CLAUDE.local.md copied in, target/ seeded from the nearest warm tree.
+wt-new NAME BASE='':
+    bash tools/wt.sh new {{NAME}} {{BASE}}
+
+# Retire a round's worktree through tools/mac-disk.py retire (LANDED or PRUNABLE only), refused while a batch or static run is in flight.
+wt-retire NAME:
+    bash tools/wt.sh retire {{NAME}}
+
 # 1-4의 첫 tok/s. 같은 임대 안에서 ik를 같은 파일·같은 조건으로 한 번 더 잰다.
 # The prebuilt Linux release (tools/release/build.sh's header: the checks it runs on the binaries before it packs):
 # built on the box from a committed tree, with this commit as the binaries' --version. The tarball lands in the box
