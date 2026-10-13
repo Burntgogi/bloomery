@@ -137,7 +137,7 @@ forced_exact count pin, the reference gates).
     crates/oxide-ice-unroll/   a compiler-bug reproducer that must NOT compile; excluded from the workspace
     tools/ref/          C++ harnesses linking ggml, and the timing runners
     tools/bloomery/     the Python side's one reader per fact: records.py, manifest.py
-    tools/review/       the pull-request review bot's tools (.github/review/ holds its instructions)
+    tools/review/       Shingler's tools, the pull-request review bot (.github/review/ holds its instructions)
     docs/research/      the design docs code cites, and the v41-placement scripts
     rig-log docs/bloomery/   plan.md what is live, facts.md machine and toolchain facts, plan-triage.md open items,
                         plan-ledger.md what is closed, research/ sourced surveys

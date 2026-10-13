@@ -37,7 +37,7 @@ The `cargo-oxide` install on a clean host has not been run yet (`docs/BUILD.md:3
 
 - **CI.** `just contrib-check --tier t0` runs on every pull request (`.github/workflows/pr.yml`); `main` requires it
   green.
-- **Review.** Every ready pull request gets one advisory review from Claude (`.github/workflows/review.yml`; how it
+- **Review.** Every ready pull request gets one advisory review from Shingler, our Claude review bot (`.github/workflows/review.yml`; how it
   works: [`.github/review/README.md`](.github/review/README.md)). It comments and never blocks a merge. A draft, the
   `no-review` label or five automatic reviews stop it. A proven defect it finds outside your change becomes a
   `review-bot` issue.

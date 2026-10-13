@@ -10,7 +10,7 @@
 place into the shape `post` sends: the decision follows the body's verdict line, inline comments that do not sit on a
 line the diff adds are dropped (GitHub refuses the whole review for one), at most MAX_COMMENTS remain, the body is cut
 to MAX_BODY characters, and the footer marker that the next run reads (head sha, verdict, counts) is appended, with a
-the knowledge ledger's version and the workflow run when pr.json carries them (`ledger=`, `run=`: the weekly
+the slag ledger's version and the workflow run when pr.json carries them (`ledger=`, `run=`: the weekly
 learner reads the run's artifact back, tools/review/signals.py), and a
 second marker carrying each --usage file's accounting (tools/review/usage.py: turns, cost, context, tool calls) kept
 in DIR/usage.txt so a later check without the files keeps it. Issue candidates (issues.json: defects outside the
@@ -35,6 +35,10 @@ import urllib.error
 import urllib.request
 
 MARKER = "bloomery-review"
+# Shingler: the worker who hammers the slag out of a fresh bloom. The name is for people; MARKER stays as it is, since
+# the learner finds past reviews by it.
+SIGNATURE = ("<sub>🔨 Shingler, bloomery's review bot: advisory, never blocks a merge "
+             "([how it works](https://github.com/{repo}/blob/main/.github/review/README.md))</sub>")
 MAX_BODY = 12000
 MAX_COMMENTS = 10
 MAX_ISSUES = 2
@@ -211,8 +215,9 @@ def check(out, diff_path, pr_json, secret_env, usage_paths=(), base=None):
     issues, idropped = keep_issues(issues, base)
     if idropped:
         notes.append(f"{idropped} issue candidate(s) were dropped: malformed, evidence missing, or over the cap")
-    if len(body) > MAX_BODY:
-        body = body[:MAX_BODY].rsplit("\n", 1)[0] + "\n\n(The review was cut at the length cap.)"
+    cap = MAX_BODY - len(SIGNATURE) - 100  # the signature still fits under the cap
+    if len(body) > cap:
+        body = body[:cap].rsplit("\n", 1)[0] + "\n\n(The review was cut at the length cap.)"
     if notes:
         body += "\n\n<sub>" + " · ".join(notes) + "</sub>"
     usage_txt = os.path.join(out, "usage.txt")
@@ -222,6 +227,7 @@ def check(out, diff_path, pr_json, secret_env, usage_paths=(), base=None):
             f.write(marker + "\n")
     elif os.path.exists(usage_txt):
         marker = open(usage_txt, encoding="utf-8").read().strip()
+    body += "\n\n" + SIGNATURE.format(repo=pr.get("repo") or "midagedev/bloomery")
     body += "\n\n" + footer(pr["head_sha"], verdict, body, pr.get("mode", "full"), pr.get("ledger"), pr.get("run"))
     if marker:
         body += "\n" + marker
@@ -260,7 +266,7 @@ def issue_body(it, repo, base_sha, pr):
     links = "\n".join(f"- [{e['path']}:{e['line']}](https://github.com/{repo}/blob/{base_sha}/{e['path']}#L{e['line']})"
                       for e in it["evidence"])
     return (f"{it['body']}\n\nEvidence (at the base of #{pr}):\n{links}\n\n"
-            f"<sub>Filed by the review bot while reviewing #{pr}; the defect is outside that pull request.</sub>\n"
+            f"<sub>Filed by Shingler, the review bot, while reviewing #{pr}; the defect is outside that pull request.</sub>\n"
             f"<!-- {MARKER}-issue pr={pr} -->")
 
 

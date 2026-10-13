@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The review bot's knowledge ledger: one open issue labelled LABEL whose body lists what the bot has learned. The
+"""The review bot's slag ledger: one open issue labelled LABEL whose body lists what the bot has learned. The
 loop runs without people: a lesson goes into force when the learner proposes it, keeps itself alive only by measured
 use, and a maintainer's one move is a veto.
 
@@ -44,7 +44,7 @@ from post import TOKEN_RE, api  # noqa: E402
 
 LABEL = "review-ledger"
 MARK = "<!-- bloomery-review-ledger v1 -->"
-TITLE = "Review bot knowledge ledger"
+TITLE = "Shingler's slag ledger"
 TRUSTED_EXTRA = ("github-actions[bot]",)
 KINDS = ("escape", "noise")
 USE = {"escape": "acted", "noise": "suppressed"}
@@ -59,7 +59,7 @@ META_RE = re.compile(r"· (escape|noise) · until (\d{4}-\d\d-\d\d) · used (\d+
 RUNS_HEAD = "## Learner runs"
 
 INTRO = f"""{MARK}
-What the review bot has learned about reviewing this repository. Every review reads the ticked lines that are not
+The slag Shingler, the review bot, has learned to hammer out of this repository's pull requests. Every review reads the ticked lines that are not
 struck through (at most {MAX_ACCEPTED}). The weekly learner (`.github/workflows/review-learn.yml`) runs this list on its
 own; nobody has to approve anything.
 
@@ -233,7 +233,7 @@ def update(repo, token, cand_path, stats_path, usage_path=None, secret_env=(), d
     else:
         try:
             call("POST", f"https://api.github.com/repos/{repo}/labels", token,
-                 {"name": LABEL, "color": "5319e7", "description": "The review bot's knowledge ledger"})
+                 {"name": LABEL, "color": "5319e7", "description": "Shingler's slag ledger (the review bot's lessons)"})
         except Exception:  # the label exists
             pass
         issue = call("POST", f"https://api.github.com/repos/{repo}/issues", token,
@@ -343,7 +343,7 @@ def main(argv):
         lines = accepted(body)
         with open(opts["--out"], "w", encoding="utf-8") as f:
             if lines:
-                f.write("# Lessons in force (the knowledge ledger issue)\n\n")
+                f.write("# Lessons in force (the slag ledger issue)\n\n")
                 f.write("\n".join(f"- {x}" for x in lines) + "\n")
             else:
                 f.write("No lessons in force.\n")

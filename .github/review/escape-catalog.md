@@ -2,7 +2,7 @@
 
 Patterns that passed review here and turned out to be defects. The review bot reads this file before it decides; when
 a diff matches a pattern, the pattern's verdict applies as written. The catalog grows instead of the prompt. New lessons
-start in the knowledge ledger issue (`.github/review/README.md`); an entry here is one that has settled.
+start in the slag ledger issue (`.github/review/README.md`); an entry here is one that has settled.
 
 Rules:
 - An entry needs a confirmed defect in this project (a fix commit or a red gate), not a guess.

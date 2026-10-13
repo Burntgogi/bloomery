@@ -1,4 +1,4 @@
-# The review bot: one advisory review on every ready pull request, posted as a COMMENT review (it never approves or
+# Shingler, the review bot: one advisory review on every ready pull request, posted as a COMMENT review (it never approves or
 # blocks). Instructions: .github/review/reviewer.md and validator.md; the patterns it learns from:
 # .github/review/escape-catalog.md; design and knobs: .github/review/README.md.
 #
@@ -10,7 +10,7 @@
 # - The API key and the write token never share a job: `review` holds the key with a read-only token, `post` holds
 #   pull-requests and issues write and no key. post.py refuses to post output that carries the key or a token-shaped
 #   string, and files at most two issues a run.
-name: PR review
+name: Shingler
 
 on:
   pull_request_target:

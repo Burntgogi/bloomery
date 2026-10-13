@@ -1,11 +1,11 @@
-# The review bot's weekly learner: what happened after its reviews becomes lessons in the knowledge ledger (one open
+# Shingler's weekly learner (the review bot's): what happened after its reviews becomes lessons in the knowledge ledger (one open
 # issue labelled review-ledger; tools/review/ledger.py). Design: .github/review/README.md.
 #
 # No person is in the loop. Signals are outcomes code can see (tools/review/signals.py); the model only proposes
 # (candidates.json); ledger.py writes the issue body, puts each candidate in force with its guards, renews a lesson
 # that was used and expires one that was not. A maintainer's one move is a veto (strike a line). The key and the
 # issues-write token never share a job.
-name: Review learner
+name: Shingler learner
 
 on:
   schedule:

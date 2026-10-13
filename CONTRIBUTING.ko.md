@@ -28,7 +28,7 @@
 
 - **CI.** 모든 PR에서 `just contrib-check --tier t0`가 돕니다(`.github/workflows/pr.yml`). `main`에 들어가려면 이게
   초록이어야 합니다.
-- **리뷰.** 준비된 PR마다 Claude가 참고용 리뷰를 한 번 남깁니다(`.github/workflows/review.yml`, 동작 방식은
+- **리뷰.** 준비된 PR마다 리뷰 봇 Shingler(Claude)가 참고용 리뷰를 한 번 남깁니다(`.github/workflows/review.yml`, 동작 방식은
   [`.github/review/README.md`](.github/review/README.md)). 댓글만 달고 머지를 막지 않습니다. draft, `no-review` 라벨,
   자동 리뷰 5회에서 멈춥니다. 변경 밖에서 입증된 결함을 찾으면 `review-bot` 이슈로 올립니다.
 - **게이트.** `just affected`가 고른 `just gate-*`를 가진 카드에서 돌릴 수 있으면 돌리고(카드가 있는 Linux 머신에서

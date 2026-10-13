@@ -1,8 +1,9 @@
-# The review bot
+# Shingler, the review bot
 
-Every ready pull request gets one advisory review from Claude (`.github/workflows/review.yml`). It posts a COMMENT
+A shingler hammers the slag out of a fresh bloom so the iron can be worked. Shingler does that to pull requests:
+every ready pull request gets one advisory review from Claude (`.github/workflows/review.yml`). It posts a COMMENT
 review: it never approves and never blocks a merge. This file says why it is shaped the way it is; the instructions
-the model follows are `reviewer.md`, `validator.md` and `learner.md`; what it has learned is in the knowledge ledger
+the model follows are `reviewer.md`, `validator.md` and `learner.md`; what it has learned is in the slag ledger
 issue (below) and, once settled, in `escape-catalog.md`.
 
 ## Flow
@@ -18,7 +19,7 @@ issue (below) and, once settled, in `escape-catalog.md`.
 A synchronize event cancels the running review of the older head. A review whose head moved before posting is not
 posted. `workflow_dispatch` with a PR number runs a full review past the cap.
 
-## The knowledge ledger
+## The slag ledger
 
 The bot learns through one open issue labelled `review-ledger` (#92), not through commits, and with no person in the
 loop. Every Monday 06:00 KST `.github/workflows/review-learn.yml` collects the week's outcomes by code
