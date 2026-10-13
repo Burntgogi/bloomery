@@ -1,8 +1,14 @@
 # Shingler, the review bot
 
 A shingler hammers the slag out of a fresh bloom so the iron can be worked. Shingler does that to pull requests:
-every ready pull request gets one advisory review from Claude (`.github/workflows/review.yml`). It posts a COMMENT
-review: it never approves and never blocks a merge. This file says why it is shaped the way it is; the instructions
+every ready pull request gets one review from Claude (`.github/workflows/review.yml`), and the review says yes or
+no: a CLEAN verdict approves, a MUST_FIX verdict requests changes. With no approvals required, a change request does
+not lock the merge button; it says "fix this first", and the bot's next review of a new head replaces it.
+`tools/review/post.py` decides the event in code, not the model: APPROVE needs the CLEAN verdict, the decision file agreeing, the validator finished, and no changed file under
+`APPROVE_GUARD` (`.github/`, `tools/review/`, `AGENTS.md`, `CONTRIBUTING`, the toolchain and `.cargo/`: a change to
+the bot, CI or the toolchain needs a person's approval; such a CLEAN review is a COMMENT that says so). A push dismisses the approval (the `protect-main` ruleset),
+so an approval always covers the head it reviewed; after the fifth automatic review a person runs the workflow by
+hand for another. This file says why it is shaped the way it is; the instructions
 the model follows are `reviewer.md`, `validator.md` and `learner.md`; what it has learned is in the slag ledger
 issue (below) and, once settled, in `escape-catalog.md`.
 
@@ -45,7 +51,7 @@ Why it is safe to run without approval:
   this repository, and a repeat.
 - A `noise` lesson takes scrutiny away, so code bounds it: it can only drop ⚠ items, its evidence names two pull
   requests, and its words may not touch security, credentials, unsafe code, gates, lints, pins, tolerances, silent
-  failure or must-fix (`GUARDED` in `ledger.py`). An `escape` lesson only adds scrutiny; the review never blocks.
+  failure or must-fix (`GUARDED` in `ledger.py`). An `escape` lesson only adds scrutiny; at worst it requests a change the author can answer.
 - A lesson nobody's diff uses expires within 28 days, so a bad one costs at most a few noisy reviews.
 - The reviewer reads only a ledger opened by the bot or the owner. The script copies each line it does not age
   exactly as it is just before the write, so a veto made while the learner ran stays.
@@ -66,11 +72,13 @@ The workflow runs on `pull_request_target`, so a fork's PR gets the key. In exch
 - The key and the write token never share a job; `post.py check` refuses output that carries the key or a
   token-shaped string, in the review, the suggestions or the issue candidates.
 
-## Why advisory, and what that costs
+## Approve or request changes, and what that costs
 
-The maintainers chose advisory (2026-10-13). The measured cost of that choice in another codebase: non-blocking
-review suggestions were acted on less than 10 % of the time, because the PR merged with the review. So the review is
-built to be read: a verdict first, must-fix items with paste-ready fixes and one-click inline suggestions, at most
+The maintainers first chose a comment-only review, then (2026-10-13) a yes or no: they usually merge what Shingler
+approves. So CLEAN means "a maintainer can merge this as it is", and a missed defect now reaches `main` through an
+approval; the slag ledger's escapes are how the bot learns from that. The measured cost of a review that does not
+decide, in another codebase: non-blocking suggestions were acted on less than 10 % of the time, because the PR merged
+with the review. So the review is built to be read: a verdict first, must-fix items with paste-ready fixes and one-click inline suggestions, at most
 five non-blocking items, and a length budget (3,500 characters clean, 6,000 with must-fix items).
 
 ## Where the method comes from

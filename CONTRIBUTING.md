@@ -37,15 +37,20 @@ The `cargo-oxide` install on a clean host has not been run yet (`docs/BUILD.md:3
 
 - **CI.** `just contrib-check --tier t0` runs on every pull request (`.github/workflows/pr.yml`); `main` requires it
   green.
-- **Review.** Every ready pull request gets one advisory review from Shingler, our Claude review bot (`.github/workflows/review.yml`; how it
-  works: [`.github/review/README.md`](.github/review/README.md)). It comments and never blocks a merge. A draft, the
+- **Review.** Every ready pull request gets one review from Shingler, our Claude review bot (`.github/workflows/review.yml`; how it
+  works: [`.github/review/README.md`](.github/review/README.md)). A clean review approves, and the maintainers usually
+  merge an approved pull request; a must-fix review requests changes, which you answer with a push (the next review
+  replaces it). A change to `.github/`, the bot's tools,
+  `AGENTS.md`, CONTRIBUTING or the toolchain always waits for a person's approval. A push dismisses the approval
+  until the next review. A draft, the
   `no-review` label or five automatic reviews stop it. A proven defect it finds outside your change becomes a
   `review-bot` issue.
 - **Gates.** Run the `just gate-*` recipes `just affected` selects on your own card if you can
   (`BLOOMERY_BOX_LOCAL=1 just gate-<name>` on a Linux machine with a card; the header of `tools/box.sh` has the
   setup), and paste the commands and their output: we trust a run on your card. A maintainer runs what you could not on the workstation.
 - **Merge.** `main` takes changes only through a pull request, by rebase (linear history). A contributor with write
-  access merges their own pull request once CI is green and the evidence is in it.
+  access merges their own pull request once CI is green, the evidence is in it and Shingler approved it (or a
+  maintainer did).
 
 ## Two tracks we hope for
 

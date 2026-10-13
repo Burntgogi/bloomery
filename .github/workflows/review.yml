@@ -1,5 +1,6 @@
-# Shingler, the review bot: one advisory review on every ready pull request, posted as a COMMENT review (it never approves or
-# blocks). Instructions: .github/review/reviewer.md and validator.md; the patterns it learns from:
+# Shingler, the review bot: one review on every ready pull request, a yes or a no. CLEAN approves, MUST_FIX requests
+# changes (tools/review/post.py decides the event; a CLEAN review of a path that changes the bot, CI or the toolchain
+# is a COMMENT that asks for a person). Instructions: .github/review/reviewer.md and validator.md; the patterns it learns from:
 # .github/review/escape-catalog.md; design and knobs: .github/review/README.md.
 #
 # pull_request_target, so a fork's pull request gets the API key, and the trust rules that follow from it:
@@ -254,7 +255,7 @@ jobs:
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
-          python3 base/tools/review/post.py check --out out --diff ctx/diff.patch --pr-json ctx/pr.json \
+          python3 base/tools/review/post.py check --out out --diff ctx/diff.patch --pr-json ctx/pr.json --files ctx/files.txt \
             --base "$PWD/base" --secret-env ANTHROPIC_API_KEY \
             --usage trace/reviewer.usage.json --usage trace/validator.usage.json
       # Token and tool accounting for later optimization: the summary lines here, the full transcripts and
@@ -278,6 +279,7 @@ jobs:
           path: |
             out/review.md
             out/decision.txt
+            out/event.txt
             out/comments.json
             out/head_sha.txt
             out/usage.txt
@@ -288,6 +290,7 @@ jobs:
             out/aims.json
             ctx/diff.patch
             ctx/pr.json
+            ctx/files.txt
           retention-days: 90   # the learner reads removed.json, lessons.json and aims.json back (tools/review/signals.py)
 
   post:
@@ -324,7 +327,8 @@ jobs:
             echo "head moved from $reviewed to $now; not posting" | tee -a "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
-          python3 tools/review/post.py check --out art/out --diff art/ctx/diff.patch --pr-json art/ctx/pr.json
+          python3 tools/review/post.py check --out art/out --diff art/ctx/diff.patch --pr-json art/ctx/pr.json \
+            --files art/ctx/files.txt
           # Defects the reviewer proved outside this PR become issues labelled review-bot (deduplicated by title).
           python3 tools/review/post.py issues --out art/out --repo "$REPO" --pr "$PR" | tee -a "$GITHUB_STEP_SUMMARY"
           python3 tools/review/post.py post --out art/out --repo "$REPO" --pr "$PR" | tee -a "$GITHUB_STEP_SUMMARY"

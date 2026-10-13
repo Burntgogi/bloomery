@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Check and post the review bot's output (.github/workflows/review.yml).
 
-    tools/review/post.py check  --out DIR --diff FILE --pr-json FILE [--base DIR] [--secret-env NAME]... [--usage FILE]...
+    tools/review/post.py check  --out DIR --diff FILE --pr-json FILE [--files FILE] [--base DIR] [--secret-env NAME]...
+                                [--usage FILE]...
     tools/review/post.py issues --out DIR --repo OWNER/NAME --pr N
     tools/review/post.py post   --out DIR --repo OWNER/NAME --pr N
     tools/review/post.py --self-test
@@ -21,7 +22,13 @@ token-shaped string. A missing or unreadable output is exit 65.
 `issues` files each candidate as an issue labelled ISSUE_LABEL, unless an issue with that label and the same title
 exists (open or closed), and writes the numbers to DIR/filed.txt.
 
-`post` sends DIR as one pull request review with event COMMENT (the bot advises, it never approves or blocks), using
+`check` also decides the review's event (OUT/event.txt; a later check keeps a COMMENT): REQUEST_CHANGES for a
+MUST_FIX verdict; APPROVE for a CLEAN one when decision.txt agrees, the validator ran (its line is in review.md), and
+no file of the pull request (--files, the `pulls/<n>/files` list, else the diff's paths) is under APPROVE_GUARD, the
+paths that change the bot itself, CI or the toolchain and so need a person; else COMMENT, with a line saying why the
+CLEAN review did not approve. With no approvals required, a change request does not lock the merge button; it says
+"fix this first", and the bot's next review of a new head replaces it.
+`post` sends DIR as one pull request review with that event, using
 GH_TOKEN, with a line naming the issues `issues` filed. When GitHub refuses the inline comments (422), it posts the
 body alone and says so in the body.
 """
@@ -37,10 +44,12 @@ import urllib.request
 MARKER = "bloomery-review"
 # Shingler: the worker who hammers the slag out of a fresh bloom. The name is for people; MARKER stays as it is, since
 # the learner finds past reviews by it.
-SIGNATURE = ("<sub>🔨 Shingler, bloomery's review bot: advisory, never blocks a merge "
+SIGNATURE = ("<sub>🔨 Shingler, bloomery's review bot: approves a clean pull request and requests changes on a must-fix "
              "([how it works](https://github.com/{repo}/blob/main/.github/review/README.md))</sub>")
 MAX_BODY = 12000
 MAX_COMMENTS = 10
+APPROVE_GUARD = (".github/", "tools/review/", "AGENTS.md", "CLAUDE.md", "CONTRIBUTING.md", "CONTRIBUTING.ko.md",
+                 "rust-toolchain.toml", "deny.toml", ".cargo/")
 MAX_ISSUES = 2
 ISSUE_LABEL = "review-bot"
 VERDICTS = ("MUST_FIX", "CLEAN")
@@ -170,7 +179,30 @@ def usage_marker(paths):
     return "<!-- bloomery-usage " + "; ".join(parts) + " -->" if parts else ""
 
 
-def check(out, diff_path, pr_json, secret_env, usage_paths=(), base=None):
+def pr_paths(files_path, diff):
+    """The pull request's file paths: from the `pulls/<n>/files` list (`status\t+a\t-d\tpath` lines) when given,
+    else from the diff's headers (an incremental diff holds only the new commits)."""
+    if files_path and os.path.exists(files_path):
+        return [ln.split("\t")[-1] for ln in open(files_path, encoding="utf-8").read().splitlines() if ln.strip()]
+    return sorted(set(re.findall(r"^\+\+\+ b/(\S+)", diff, re.M) + re.findall(r"^--- a/(\S+)", diff, re.M)))
+
+
+def event_for(verdict, decision, body, paths):
+    """("APPROVE" | "REQUEST_CHANGES" | "COMMENT", why a CLEAN review does not approve or None)."""
+    if verdict == "MUST_FIX":
+        return "REQUEST_CHANGES", None
+    if decision != verdict:
+        return "COMMENT", "decision.txt disagreed with the verdict line"
+    if "<!-- validator:" not in body:
+        return "COMMENT", "the validator did not finish"
+    guarded = [p for p in paths if p.startswith(APPROVE_GUARD)]
+    if guarded:
+        return "COMMENT", (f"this pull request changes {', '.join(guarded[:3])}{' …' if len(guarded) > 3 else ''}, "
+                           "which changes the bot, CI or the toolchain and needs a person's approval")
+    return "APPROVE", None
+
+
+def check(out, diff_path, pr_json, secret_env, usage_paths=(), base=None, files_path=None):
     try:
         body = open(os.path.join(out, "review.md"), encoding="utf-8").read()
         decision = open(os.path.join(out, "decision.txt"), encoding="utf-8").read().strip()
@@ -209,6 +241,7 @@ def check(out, diff_path, pr_json, secret_env, usage_paths=(), base=None):
     if decision != verdict:
         notes.append(f"decision.txt said {decision or 'nothing'}; the body's verdict line ({verdict}) is used")
     body = re.sub(rf"(\n*<!-- (?:{MARKER}|bloomery-usage) [^>]*-->)+\s*$", "", body.rstrip())
+    body = re.sub(r"\n*<sub>🔨 Shingler[^\n]*</sub>\s*$", "", body)  # a second check (the post job)
     kept, dropped = keep_comments(comments, added_lines(diff))
     if dropped:
         notes.append(f"{dropped} inline suggestion(s) were dropped: not on lines this diff adds, or over the cap")
@@ -227,6 +260,15 @@ def check(out, diff_path, pr_json, secret_env, usage_paths=(), base=None):
             f.write(marker + "\n")
     elif os.path.exists(usage_txt):
         marker = open(usage_txt, encoding="utf-8").read().strip()
+    event, why = event_for(verdict, decision, body, pr_paths(files_path, diff))
+    # A second check never raises the event: the first one saw the reviewer's own decision.txt, which it then rewrote.
+    ev_path = os.path.join(out, "event.txt")
+    if os.path.exists(ev_path) and open(ev_path, encoding="utf-8").read().strip() == "COMMENT":
+        event = "COMMENT"
+    if "\n<sub>Not approved:" in body:
+        why = None
+    if why:
+        body += f"\n\n<sub>Not approved: {why}.</sub>"
     body += "\n\n" + SIGNATURE.format(repo=pr.get("repo") or "midagedev/bloomery")
     body += "\n\n" + footer(pr["head_sha"], verdict, body, pr.get("mode", "full"), pr.get("ledger"), pr.get("run"))
     if marker:
@@ -235,6 +277,8 @@ def check(out, diff_path, pr_json, secret_env, usage_paths=(), base=None):
         f.write(body + "\n")
     with open(os.path.join(out, "decision.txt"), "w", encoding="utf-8") as f:
         f.write(verdict + "\n")
+    with open(os.path.join(out, "event.txt"), "w", encoding="utf-8") as f:
+        f.write(event + "\n")
     with open(os.path.join(out, "comments.json"), "w", encoding="utf-8") as f:
         json.dump(kept, f, indent=1)
     with open(issues_path, "w", encoding="utf-8") as f:
@@ -307,7 +351,11 @@ def post(out, repo, pr, token):
     head = open(os.path.join(out, "head_sha.txt"), encoding="utf-8").read().strip()
     comments = json.load(open(os.path.join(out, "comments.json"), encoding="utf-8"))
     url = f"https://api.github.com/repos/{repo}/pulls/{pr}/reviews"
-    payload = {"commit_id": head, "event": "COMMENT", "body": body, "comments": comments}
+    ev_path = os.path.join(out, "event.txt")
+    event = open(ev_path, encoding="utf-8").read().strip() if os.path.exists(ev_path) else "COMMENT"
+    if event not in ("APPROVE", "REQUEST_CHANGES", "COMMENT"):
+        raise Refused(65, f"event.txt says {event!r}; only APPROVE, REQUEST_CHANGES or COMMENT is posted")
+    payload = {"commit_id": head, "event": event, "body": body, "comments": comments}
     try:
         r = api("POST", url, token, payload)
     except urllib.error.HTTPError as e:
@@ -364,7 +412,9 @@ def self_test():
         open(dp, "w").write(diff)
         json.dump({"head_sha": "abc123", "mode": "full"}, open(pj, "w"))
 
-        def write(body, decision, comments=None):
+        def write(body, decision, comments=None):  # a fresh review job's output
+            if os.path.exists(os.path.join(out, "event.txt")):
+                os.remove(os.path.join(out, "event.txt"))
             open(os.path.join(out, "review.md"), "w").write(body)
             open(os.path.join(out, "decision.txt"), "w").write(decision)
             cp = os.path.join(out, "comments.json")
@@ -383,9 +433,36 @@ def self_test():
         assert posted.rstrip().endswith(
             "<!-- bloomery-review head_sha=abc123 verdict=MUST_FIX must_fix=1 warn=2 mode=full -->"), posted
         assert open(os.path.join(out, "decision.txt")).read() == "MUST_FIX\n"
-        # A second check (the post job repeats it) keeps one footer.
+        # A second check (the post job repeats it) keeps one footer and one signature.
         check(out, dp, pj, [])
-        assert open(os.path.join(out, "review.md")).read().count("<!-- bloomery-review") == 1
+        again = open(os.path.join(out, "review.md")).read()
+        assert again.count("<!-- bloomery-review") == 1 and again.count("🔨 Shingler") == 1, again
+        assert open(os.path.join(out, "event.txt")).read() == "REQUEST_CHANGES\n"
+
+        # APPROVE only for a CLEAN verdict the decision agrees with, after the validator, off the guarded paths.
+        clean = "**Verdict: CLEAN**: fine.\n\n⚠ a\n<!-- validator: removed=0 downgraded=0 upgraded=0 -->\n"
+        fp = os.path.join(d, "files.txt")
+        for body_, decision, files, want, why in (
+                (clean, "CLEAN", "modified\t+1\t-0\ttools/n.sh\n", "APPROVE", None),
+                (clean, "MUST_FIX", "modified\t+1\t-0\ttools/n.sh\n", "COMMENT", "decision.txt disagreed"),
+                (clean.split("<!--")[0], "CLEAN", "modified\t+1\t-0\ttools/n.sh\n", "COMMENT", "validator"),
+                (clean, "CLEAN", "modified\t+1\t-0\ttools/n.sh\nmodified\t+1\t-0\t.github/workflows/ci.yml\n",
+                 "COMMENT", ".github/workflows/ci.yml"),
+                (clean, "CLEAN", None, "APPROVE", None)):
+            write(body_, decision)
+            if files is None:
+                os.remove(fp)
+            else:
+                open(fp, "w").write(files)
+            check(out, dp, pj, [], files_path=fp if files is not None else None)
+            got = open(os.path.join(out, "event.txt")).read().strip()
+            text = open(os.path.join(out, "review.md")).read()
+            assert got == want and ("Not approved:" in text) == bool(why) and (not why or why in text), (got, text)
+            check(out, dp, pj, [], files_path=fp if files is not None else None)
+            assert open(os.path.join(out, "review.md")).read() == text  # a second check changes nothing
+        assert pr_paths(None, "--- a/x.rs\n+++ b/x.rs\n--- /dev/null\n+++ b/.github/y\n") == [".github/y", "x.rs"]
+        write(body, "CLEAN")
+        check(out, dp, pj, [])
 
         up = os.path.join(d, "reviewer.usage.json")
         json.dump({"role": "reviewer", "num_turns": 7, "cost_usd": 0.51234, "context_max": 90000,
@@ -421,6 +498,24 @@ def self_test():
         assert calls[1][2]["labels"] == [ISSUE_LABEL] and "<!-- bloomery-review-issue pr=5 -->" in calls[1][2]["body"]
         open(os.path.join(out, "issues.json"), "w").write("[]")
         assert file_issues(out, "o/r", "5", "t", fake) == [] and len(calls) == 2
+
+        # post sends the event check decided, and refuses any other.
+        open(os.path.join(out, "head_sha.txt"), "w").write("abc123\n")
+        real_api, g = api, globals()
+        g["api"] = fake
+        try:
+            for ev in ("APPROVE", "REQUEST_CHANGES", "COMMENT"):
+                open(os.path.join(out, "event.txt"), "w").write(ev + "\n")
+                post(out, "o/r", "5", "t")
+                assert calls[-1][0] == "POST" and calls[-1][2]["event"] == ev, calls[-1]
+            open(os.path.join(out, "event.txt"), "w").write("DISMISS\n")
+            try:
+                post(out, "o/r", "5", "t")
+                raise AssertionError("an unknown event was posted")
+            except Refused:
+                pass
+        finally:
+            g["api"] = real_api
 
         write("**Verdict: CLEAN**: fine.\nsk-ant-api03-abcdefghijklmnopqrstuv\n", "CLEAN")
         try:
@@ -473,8 +568,9 @@ def main(argv):
     try:
         if argv[1] == "check":
             verdict, n, notes = check(opts["--out"], opts["--diff"], opts["--pr-json"], secret_env, usage,
-                                         opts.get("--base"))
-            print(f"check: verdict={verdict} inline={n}" + "".join(f"\n  note: {x}" for x in notes))
+                                      opts.get("--base"), opts.get("--files"))
+            event = open(os.path.join(opts["--out"], "event.txt"), encoding="utf-8").read().strip()
+            print(f"check: verdict={verdict} event={event} inline={n}" + "".join(f"\n  note: {x}" for x in notes))
         else:
             token = os.environ.get("GH_TOKEN", "")
             if not token:

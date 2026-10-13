@@ -28,14 +28,16 @@
 
 - **CI.** 모든 PR에서 `just contrib-check --tier t0`가 돕니다(`.github/workflows/pr.yml`). `main`에 들어가려면 이게
   초록이어야 합니다.
-- **리뷰.** 준비된 PR마다 리뷰 봇 Shingler(Claude)가 참고용 리뷰를 한 번 남깁니다(`.github/workflows/review.yml`, 동작 방식은
-  [`.github/review/README.md`](.github/review/README.md)). 댓글만 달고 머지를 막지 않습니다. draft, `no-review` 라벨,
+- **리뷰.** 준비된 PR마다 리뷰 봇 Shingler(Claude)가 리뷰를 한 번 남깁니다(`.github/workflows/review.yml`, 동작 방식은
+  [`.github/review/README.md`](.github/review/README.md)). 깨끗하면 승인(approve)하고, 메인테이너는 승인된 PR을 대개
+  머지합니다. 꼭 고칠 것이 있으면 변경 요청(request changes)을 남기고, 고쳐서 push하면 다음 리뷰가 그 요청을 대신합니다. `.github/`, 봇 도구, `AGENTS.md`, CONTRIBUTING, 툴체인을 바꾸는
+  PR은 항상 사람의 승인을 기다립니다. 새로 push하면 다음 리뷰까지 승인이 해제됩니다. draft, `no-review` 라벨,
   자동 리뷰 5회에서 멈춥니다. 변경 밖에서 입증된 결함을 찾으면 `review-bot` 이슈로 올립니다.
 - **게이트.** `just affected`가 고른 `just gate-*`를 가진 카드에서 돌릴 수 있으면 돌리고(카드가 있는 Linux 머신에서
   `BLOOMERY_BOX_LOCAL=1 just gate-<이름>`, 준비는 `tools/box.sh` 머리말에 있습니다), **실제로 돌린 명령과 출력**을
   PR에 붙여 주세요. 내 카드에서 돌린 결과는 그대로 믿습니다. 돌리지 못한 것은 메인테이너가 워크스테이션에서 돌립니다.
 - **머지.** `main`은 PR로만, rebase로만 받습니다(이력은 일직선). 쓰기 권한이 있는 기여자는 CI가 초록이고 근거가 PR에
-  있으면 자기 PR을 직접 머지합니다.
+  있고 Shingler(또는 메인테이너)가 승인했으면 자기 PR을 직접 머지합니다.
 
 ## 특히 바라는 두 가지
 
