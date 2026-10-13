@@ -233,7 +233,8 @@ def check(out, diff_path, pr_json, secret_env, usage_paths=(), base=None):
     with open(os.path.join(out, "head_sha.txt"), "w", encoding="utf-8") as f:
         f.write(pr["head_sha"] + "\n")
     with open(os.path.join(out, "base_sha.txt"), "w", encoding="utf-8") as f:
-        f.write(pr.get("base_sha", "") + "\n")
+        # Issue evidence is verified in BASE_TREE, so its links point at the commit that tree was checked out at.
+        f.write((pr.get("tree_sha") or pr.get("base_sha", "")) + "\n")
     return verdict, len(kept), notes
 
 

@@ -96,7 +96,16 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: Checkout the base (the tools)
+      # The tools come from the branch this workflow runs from (github.sha), never from the pull request's base
+      # commit: a pull request opened before a tools change has an older base.
+      - name: Checkout the tools
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          path: trusted
+          sparse-checkout: tools/review
+          persist-credentials: false
+      - name: Checkout the pull request's base (the before side of the comparison)
         uses: actions/checkout@v7
         with:
           ref: ${{ needs.gate.outputs.base_sha }}
@@ -148,7 +157,7 @@ jobs:
           gh api "repos/$REPO/pulls/$PR" -H 'Accept: application/vnd.github.diff' > diag/diff.patch
           ub="$HOME/.cache/bloomery-review/ub/venv/bin"
           s=$(date +%s)
-          python3 base/tools/review/diagnostics.py --base "$PWD/base" --pr "$PWD/pr" --changed diag/changed.txt \
+          python3 trusted/tools/review/diagnostics.py --base "$PWD/base" --pr "$PWD/pr" --changed diag/changed.txt \
             --diff diag/diff.patch --out diag/diagnostics.md --dryer "$ub/dryer" --crapper "$ub/crapper" > /dev/null || true
           echo "diagnostics: $(( $(date +%s) - s )) s" >> "$GITHUB_STEP_SUMMARY"
           test -s diag/diagnostics.md || echo "The diagnostics did not run (diagnostics.py wrote nothing)." > diag/diagnostics.md
@@ -167,10 +176,12 @@ jobs:
       contents: read
       pull-requests: read
     steps:
+      # Instructions, contracts and tools at the head of the branch this workflow runs from, not the pull request's
+      # base commit: the review holds a PR to today's contract, and an older base may predate the tools.
       - name: Checkout the base (instructions, contracts, tools)
         uses: actions/checkout@v7
         with:
-          ref: ${{ needs.gate.outputs.base_sha }}
+          ref: ${{ github.sha }}
           path: base
           persist-credentials: false
       - name: Checkout the PR head (data only)
@@ -192,6 +203,7 @@ jobs:
           PR: ${{ needs.gate.outputs.pr }}
           HEAD_SHA: ${{ needs.gate.outputs.head_sha }}
           PREV_SHA: ${{ needs.gate.outputs.prev_sha }}
+          TREE_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           mkdir -p ctx out trace
@@ -212,8 +224,9 @@ jobs:
           fi
           gh api --paginate "repos/$REPO/pulls/$PR/files" --jq '.[] | "\(.status)\t+\(.additions)\t-\(.deletions)\t\(.filename)"' > ctx/files.txt
           gh api --paginate "repos/$REPO/issues?labels=review-bot&state=open&per_page=100" --jq '.[] | "#\(.number) \(.title)"' > ctx/open-issues.txt
-          jq --arg mode "$mode" --arg repo "$REPO" '{number, title, body, author: .user.login, repo: $repo,
-              base_sha: .base.sha, head_sha: .head.sha, mode: $mode}' ctx/pr-full.json > ctx/pr.json
+          # tree_sha: the commit BASE_TREE is checked out at, which issue evidence links point into.
+          jq --arg mode "$mode" --arg repo "$REPO" --arg tree "$TREE_SHA" '{number, title, body, author: .user.login,
+              repo: $repo, base_sha: .base.sha, head_sha: .head.sha, tree_sha: $tree, mode: $mode}' ctx/pr-full.json > ctx/pr.json
           rm ctx/pr-full.json
           if [ -f ctx-diag/diagnostics.md ]; then cp ctx-diag/diagnostics.md ctx/; else
             echo "The diagnostics job did not finish; no dryer or crapper results for this review." > ctx/diagnostics.md; fi
@@ -283,7 +296,7 @@ jobs:
       - name: Checkout the base (post.py)
         uses: actions/checkout@v7
         with:
-          ref: ${{ needs.gate.outputs.base_sha }}
+          ref: ${{ github.sha }}
           sparse-checkout: tools/review
           persist-credentials: false
       - uses: actions/download-artifact@v4
