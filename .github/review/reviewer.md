@@ -237,7 +237,14 @@ Write these files to `OUT` with the Write tool, and nothing else anywhere:
    "suppressed", "what": "<one line>"}` for a ⚠ you left out because of it. The learner keeps a lesson alive only by
    these records, so write one for each use and none for a lesson you merely read.
 
-6. `aims.json`, only when a finding came from a dryer pair or a crapper function in `CTX/diagnostics.md`: a JSON array
+6. `gpu.json`, always: `{"evidence": true | false, "card": "<the nvidia-smi line, or empty>"}`. `evidence` is true
+   only when the pull request text or its files carry a gate run on a card per `CONTRIBUTING.md`'s evidence list: the
+   `nvidia-smi` line, both commit hashes, and the `just gate-*` commands with their output. A sentence such as "tested
+   on my card" without the output is false. A later step labels the pull request from this when it changes a crate a
+   card must check: `gpu-evidence` counts as verified on the author's card, `needs-gpu` waits for a run. It does not
+   change your verdict.
+
+7. `aims.json`, only when a finding came from a dryer pair or a crapper function in `CTX/diagnostics.md`: a JSON array
    of `{"tool": "dryer" | "crapper", "path": "<path>", "line": <line>}`, path and line as the finding links them. The
    learner counts how often each tool's aim led to a fix, to keep or drop the tool. A finding you would have raised
    without the tool is not an aim.

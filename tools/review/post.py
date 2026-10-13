@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Check and post the review bot's output (.github/workflows/review.yml).
 
-    tools/review/post.py check  --out DIR --diff FILE --pr-json FILE [--files FILE] [--base DIR] [--secret-env NAME]...
-                                [--usage FILE]...
+    tools/review/post.py check  --out DIR --diff FILE --pr-json FILE [--files FILE] [--device FILE] [--freeze FILE]
+                                [--base DIR] [--secret-env NAME]... [--usage FILE]...
+    tools/review/post.py device --root DIR --out FILE
+    tools/review/post.py freeze --repo OWNER/NAME --out FILE                                             (GH_TOKEN)
     tools/review/post.py issues --out DIR --repo OWNER/NAME --pr N
     tools/review/post.py post   --out DIR --repo OWNER/NAME --pr N
+    tools/review/post.py labels --out DIR --repo OWNER/NAME --pr N
     tools/review/post.py --self-test
 
 `check` reads what the reviewer wrote to DIR (review.md, decision.txt, optional comments.json) and rewrites it in
@@ -28,6 +31,13 @@ no file of the pull request (--files, the `pulls/<n>/files` list, else the diff'
 paths that change the bot itself, CI or the toolchain and so need a person; else COMMENT, with a line saying why the
 CLEAN review did not approve. With no approvals required, a change request does not lock the merge button; it says
 "fix this first", and the bot's next review of a new head replaces it.
+Card labels: `device` writes the directories of the crates that reach cuda-core (tools/recipes.py pure-crates, run
+on the trusted tree). When the pull request changes a file under one, `check` sets the bot's card label in
+OUT/labels.json: `gpu-evidence` when the reviewer's gpu.json says the pull request carries a gate run on a card
+(CONTRIBUTING's evidence list), else `needs-gpu`, and adds a line saying so. A run on the author's card counts
+as verified (CONTRIBUTING trusts it); `gpu-verified` is a maintainer's own run, and the bot never adds or removes it. While a release freeze is on (an open
+issue labelled FREEZE_LABEL opened by the owner; `freeze` writes its number to FILE), a `needs-gpu` pull request is
+not approved: a merge would change the tree under the release batch. `labels` applies OUT/labels.json.
 `post` sends DIR as one pull request review with that event, using
 GH_TOKEN, with a line naming the issues `issues` filed. When GitHub refuses the inline comments (422), it posts the
 body alone and says so in the body.
@@ -36,6 +46,7 @@ body alone and says so in the body.
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import urllib.error
@@ -48,6 +59,11 @@ SIGNATURE = ("<sub>🔨 Shingler, bloomery's review bot: approves a clean pull r
              "([how it works](https://github.com/{repo}/blob/main/.github/review/README.md))</sub>")
 MAX_BODY = 12000
 MAX_COMMENTS = 10
+CARD_LABELS = {
+    "needs-gpu": ("d93f0b", "Changes code a card must check, and carries no gate run on a card"),
+    "gpu-evidence": ("0e8a16", "Verified on the author's card: the pull request carries the gate run and its output"),
+}
+FREEZE_LABEL = "release-freeze"
 APPROVE_GUARD = (".github/", "tools/review/", "AGENTS.md", "CLAUDE.md", "CONTRIBUTING.md", "CONTRIBUTING.ko.md",
                  "rust-toolchain.toml", "deny.toml", ".cargo/")
 MAX_ISSUES = 2
@@ -187,6 +203,47 @@ def pr_paths(files_path, diff):
     return sorted(set(re.findall(r"^\+\+\+ b/(\S+)", diff, re.M) + re.findall(r"^--- a/(\S+)", diff, re.M)))
 
 
+def device_dirs(root):
+    """`crates/<dir>/` for every workspace crate whose dependency closure reaches cuda-core."""
+    r = subprocess.run([sys.executable, os.path.join(root, "tools", "recipes.py"), "pure-crates"], cwd=root,
+                       capture_output=True, text=True)
+    names = {ln.split()[1] for ln in r.stdout.splitlines()
+             if ln.startswith("rejected") and "reaches the device root" in ln}
+    dirs = []
+    for d in sorted(os.listdir(os.path.join(root, "crates"))):
+        toml = os.path.join(root, "crates", d, "Cargo.toml")
+        m = re.search(r'^name\s*=\s*"([^"]+)"', open(toml).read(), re.M) if os.path.exists(toml) else None
+        if m and m.group(1) in names:
+            dirs.append(f"crates/{d}/")
+    if r.returncode or not dirs:
+        raise Refused(70, f"device: tools/recipes.py pure-crates gave rc={r.returncode} and {len(dirs)} device "
+                          f"crate(s): {r.stderr.strip()[:300]}")
+    return dirs
+
+
+def card_label(paths, dirs, out):
+    """(label or None, the line for the review) from the changed paths and the reviewer's gpu.json."""
+    touched = [p for p in paths if p.startswith(tuple(dirs))]
+    if not dirs or not touched:
+        return None, None
+    gp = os.path.join(out, "gpu.json")
+    evidence = False
+    if os.path.exists(gp):
+        try:
+            g = json.load(open(gp, encoding="utf-8"))
+        except ValueError as e:
+            raise Refused(65, f"gpu.json is not JSON: {e}")
+        if not isinstance(g, dict) or not isinstance(g.get("evidence"), bool):
+            raise Refused(65, 'gpu.json is not {"evidence": true|false, ...}')
+        evidence = g["evidence"]
+    where = ", ".join(touched[:3]) + (" …" if len(touched) > 3 else "")
+    if evidence:
+        return "gpu-evidence", (f"Card check: `gpu-evidence`. This pull request changes {where} and carries a gate run "
+                                "on the author's card, which counts as verified.")
+    return "needs-gpu", (f"Card check: `needs-gpu`. This pull request changes {where} and carries no gate run on a "
+                         "card (CONTRIBUTING's evidence list); a maintainer adds `gpu-verified` after one.")
+
+
 def event_for(verdict, decision, body, paths):
     """("APPROVE" | "REQUEST_CHANGES" | "COMMENT", why a CLEAN review does not approve or None)."""
     if verdict == "MUST_FIX":
@@ -202,7 +259,8 @@ def event_for(verdict, decision, body, paths):
     return "APPROVE", None
 
 
-def check(out, diff_path, pr_json, secret_env, usage_paths=(), base=None, files_path=None):
+def check(out, diff_path, pr_json, secret_env, usage_paths=(), base=None, files_path=None, device_path=None,
+          freeze_path=None):
     try:
         body = open(os.path.join(out, "review.md"), encoding="utf-8").read()
         decision = open(os.path.join(out, "decision.txt"), encoding="utf-8").read().strip()
@@ -260,7 +318,18 @@ def check(out, diff_path, pr_json, secret_env, usage_paths=(), base=None, files_
             f.write(marker + "\n")
     elif os.path.exists(usage_txt):
         marker = open(usage_txt, encoding="utf-8").read().strip()
-    event, why = event_for(verdict, decision, body, pr_paths(files_path, diff))
+    paths = pr_paths(files_path, diff)
+    event, why = event_for(verdict, decision, body, paths)
+    dirs = open(device_path, encoding="utf-8").read().split() if device_path and os.path.exists(device_path) else []
+    label, card_line = card_label(paths, dirs, out)
+    with open(os.path.join(out, "labels.json"), "w", encoding="utf-8") as f:
+        json.dump({"set": label}, f)
+    freeze = open(freeze_path, encoding="utf-8").read().strip() if freeze_path and os.path.exists(freeze_path) else ""
+    if event == "APPROVE" and label == "needs-gpu" and freeze:
+        event, why = "COMMENT", (f"a release freeze is on ({freeze}), and a merge of a `needs-gpu` change now would "
+                                 "change the tree under the release batch")
+    if card_line and "\n<sub>Card check:" not in body:
+        body += f"\n\n<sub>{card_line}</sub>"
     # A second check never raises the event: the first one saw the reviewer's own decision.txt, which it then rewrote.
     ev_path = os.path.join(out, "event.txt")
     if os.path.exists(ev_path) and open(ev_path, encoding="utf-8").read().strip() == "COMMENT":
@@ -369,6 +438,41 @@ def post(out, repo, pr, token):
     return r.get("html_url", "")
 
 
+def freeze_issue(repo, token, call=None):
+    """`#<n>` of an open issue labelled FREEZE_LABEL that the repository owner opened, or ""."""
+    call = call or api
+    got = call("GET", f"https://api.github.com/repos/{repo}/issues?labels={FREEZE_LABEL}&state=open&per_page=20",
+               token)
+    owner = repo.split("/")[0]
+    hits = [i["number"] for i in got if (i.get("user") or {}).get("login") == owner]
+    return f"#{min(hits)}" if hits else ""
+
+
+def apply_labels(out, repo, pr, token, call=None):
+    """Set the bot's one card label (or none) on the pull request; never touch any other label."""
+    call = call or api
+    want = (json.load(open(os.path.join(out, "labels.json"), encoding="utf-8")) or {}).get("set")
+    if want is not None and want not in CARD_LABELS:
+        raise Refused(65, f"labels.json sets {want!r}; the bot sets only {', '.join(CARD_LABELS)}")
+    have = {x["name"] for x in call("GET", f"https://api.github.com/repos/{repo}/issues/{pr}/labels", token)}
+    done = []
+    for name in CARD_LABELS:
+        if name == want and name not in have:
+            try:
+                color, desc = CARD_LABELS[name]
+                call("POST", f"https://api.github.com/repos/{repo}/labels", token,
+                     {"name": name, "color": color, "description": desc})
+            except urllib.error.HTTPError as e:
+                if e.code != 422:  # 422: the label exists
+                    raise
+            call("POST", f"https://api.github.com/repos/{repo}/issues/{pr}/labels", token, {"labels": [name]})
+            done.append(f"+{name}")
+        elif name != want and name in have:
+            call("DELETE", f"https://api.github.com/repos/{repo}/issues/{pr}/labels/{name}", token)
+            done.append(f"-{name}")
+    return done
+
+
 def self_test():
     assert footer("h", "CLEAN", "", "full").endswith("mode=full -->")
     assert footer("h", "CLEAN", "", "full", "0a1b2c").endswith("mode=full ledger=0a1b2c -->")
@@ -461,6 +565,56 @@ def self_test():
             check(out, dp, pj, [], files_path=fp if files is not None else None)
             assert open(os.path.join(out, "review.md")).read() == text  # a second check changes nothing
         assert pr_paths(None, "--- a/x.rs\n+++ b/x.rs\n--- /dev/null\n+++ b/.github/y\n") == [".github/y", "x.rs"]
+
+        # Card labels: only for a change under a device crate; a freeze holds a needs-gpu approval.
+        dev, frz = os.path.join(d, "device.txt"), os.path.join(d, "freeze.txt")
+        open(dev, "w").write("crates/gpu/\ncrates/app/\n")
+        gpu_files = "modified\t+1\t-0\tcrates/gpu/src/a.rs\n"
+        for files, gpu, freeze, want_label, want_event in (
+                ("modified\t+1\t-0\tcrates/sampler/src/a.rs\n", None, "", None, "APPROVE"),
+                (gpu_files, None, "", "needs-gpu", "APPROVE"),
+                (gpu_files, '{"evidence": true, "card": "RTX 4090"}', "#99", "gpu-evidence", "APPROVE"),
+                (gpu_files, '{"evidence": false}', "#99", "needs-gpu", "COMMENT")):
+            write(clean, "CLEAN")
+            open(fp, "w").write(files)
+            gj = os.path.join(out, "gpu.json")
+            if gpu is None:
+                if os.path.exists(gj):
+                    os.remove(gj)
+            else:
+                open(gj, "w").write(gpu)
+            open(frz, "w").write(freeze)
+            for _ in range(2):  # the post job repeats the check
+                check(out, dp, pj, [], files_path=fp, device_path=dev, freeze_path=frz)
+            text = open(os.path.join(out, "review.md")).read()
+            assert json.load(open(os.path.join(out, "labels.json"))) == {"set": want_label}, files
+            assert open(os.path.join(out, "event.txt")).read().strip() == want_event, (want_event, text)
+            assert text.count("Card check:") == (1 if want_label else 0), text
+            assert ("release freeze is on (#99)" in text) == (want_event == "COMMENT"), text
+        open(os.path.join(out, "gpu.json"), "w").write('{"evidence": "yes"}')
+        try:
+            check(out, dp, pj, [], files_path=fp, device_path=dev)
+            raise AssertionError("a malformed gpu.json was accepted")
+        except Refused as e:
+            assert e.code == 65
+        os.remove(os.path.join(out, "gpu.json"))
+        lc = []
+
+        def lfake(method, url, token, payload=None):
+            lc.append((method, url.split("/repos/o/r/")[1], payload))
+            return [{"name": "gpu-evidence"}, {"name": "gpu-verified"}] if method == "GET" else {}
+        json.dump({"set": "needs-gpu"}, open(os.path.join(out, "labels.json"), "w"))
+        assert apply_labels(out, "o/r", "5", "t", lfake) == ["+needs-gpu", "-gpu-evidence"], lc
+        assert not any("gpu-verified" in u for _, u, _ in lc[1:]), lc
+        json.dump({"set": "gpu-verified"}, open(os.path.join(out, "labels.json"), "w"))
+        try:
+            apply_labels(out, "o/r", "5", "t", lfake)
+            raise AssertionError("the bot set a maintainer's label")
+        except Refused:
+            pass
+        assert freeze_issue("o/r", "t", lambda *a: [{"number": 4, "user": {"login": "mallory"}},
+                                                     {"number": 9, "user": {"login": "o"}}]) == "#9"
+        assert freeze_issue("o/r", "t", lambda *a: [{"number": 4, "user": {"login": "mallory"}}]) == ""
         write(body, "CLEAN")
         check(out, dp, pj, [])
 
@@ -549,7 +703,7 @@ def main(argv):
     if argv[1:] == ["--self-test"]:
         self_test()
         return 0
-    if len(argv) < 2 or argv[1] not in ("check", "issues", "post"):
+    if len(argv) < 2 or argv[1] not in ("check", "device", "freeze", "issues", "post", "labels"):
         print(__doc__, file=sys.stderr)
         return 64
     opts, secret_env, usage, rest = {}, [], [], argv[2:]
@@ -568,15 +722,28 @@ def main(argv):
     try:
         if argv[1] == "check":
             verdict, n, notes = check(opts["--out"], opts["--diff"], opts["--pr-json"], secret_env, usage,
-                                      opts.get("--base"), opts.get("--files"))
+                                      opts.get("--base"), opts.get("--files"), opts.get("--device"),
+                                      opts.get("--freeze"))
             event = open(os.path.join(opts["--out"], "event.txt"), encoding="utf-8").read().strip()
-            print(f"check: verdict={verdict} event={event} inline={n}" + "".join(f"\n  note: {x}" for x in notes))
+            label = json.load(open(os.path.join(opts["--out"], "labels.json"), encoding="utf-8")).get("set")
+            print(f"check: verdict={verdict} event={event} card={label or '-'} inline={n}"
+                  + "".join(f"\n  note: {x}" for x in notes))
+        elif argv[1] == "device":
+            dirs = device_dirs(opts["--root"])
+            open(opts["--out"], "w", encoding="utf-8").write("\n".join(dirs) + "\n")
+            print("device:", " ".join(dirs))
         else:
             token = os.environ.get("GH_TOKEN", "")
             if not token:
                 print(f"{argv[1]}: GH_TOKEN is not set", file=sys.stderr)
                 return 64
-            if argv[1] == "issues":
+            if argv[1] == "freeze":
+                f = freeze_issue(opts["--repo"], token)
+                open(opts["--out"], "w", encoding="utf-8").write(f + "\n" if f else "")
+                print("freeze:", f or "off")
+            elif argv[1] == "labels":
+                print("labels:", " ".join(apply_labels(opts["--out"], opts["--repo"], opts["--pr"], token)) or "unchanged")
+            elif argv[1] == "issues":
                 print("issues:", ", ".join(file_issues(opts["--out"], opts["--repo"], opts["--pr"], token)) or "none")
             else:
                 print("posted:", post(opts["--out"], opts["--repo"], opts["--pr"], token))

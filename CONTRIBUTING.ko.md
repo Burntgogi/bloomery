@@ -31,7 +31,10 @@
 - **리뷰.** 준비된 PR마다 리뷰 봇 Shingler(Claude)가 리뷰를 한 번 남깁니다(`.github/workflows/review.yml`, 동작 방식은
   [`.github/review/README.md`](.github/review/README.md)). 깨끗하면 승인(approve)하고, 메인테이너는 승인된 PR을 대개
   머지합니다. 꼭 고칠 것이 있으면 변경 요청(request changes)을 남기고, 고쳐서 push하면 다음 리뷰가 그 요청을 대신합니다. `.github/`, 봇 도구, `AGENTS.md`, CONTRIBUTING, 툴체인을 바꾸는
-  PR은 항상 사람의 승인을 기다립니다. 새로 push하면 다음 리뷰까지 승인이 해제됩니다. draft, `no-review` 라벨,
+  PR은 항상 사람의 승인을 기다립니다. 새로 push하면 다음 리뷰까지 승인이 해제됩니다. 카드가 필요한
+  crate(`crates/gpu*`, `crates/app`)를 바꾸면, PR에 자기 카드의 게이트 실행 명령과 출력(아래)이 있으면 `gpu-evidence`가
+  붙고 검증된 것으로 봅니다. 없으면 `needs-gpu`가 붙고, 누군가 돌려 본 뒤 메인테이너가 `gpu-verified`를 붙입니다. 릴리즈 동결 중에는 `needs-gpu` 변경을 릴리즈가
+  나갈 때까지 승인하지 않습니다. draft, `no-review` 라벨,
   자동 리뷰 5회에서 멈춥니다. 변경 밖에서 입증된 결함을 찾으면 `review-bot` 이슈로 올립니다.
 - **게이트.** `just affected`가 고른 `just gate-*`를 가진 카드에서 돌릴 수 있으면 돌리고(카드가 있는 Linux 머신에서
   `BLOOMERY_BOX_LOCAL=1 just gate-<이름>`, 준비는 `tools/box.sh` 머리말에 있습니다), **실제로 돌린 명령과 출력**을

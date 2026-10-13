@@ -8,7 +8,19 @@ not lock the merge button; it says "fix this first", and the bot's next review o
 `APPROVE_GUARD` (`.github/`, `tools/review/`, `AGENTS.md`, `CONTRIBUTING`, the toolchain and `.cargo/`: a change to
 the bot, CI or the toolchain needs a person's approval; such a CLEAN review is a COMMENT that says so). A push dismisses the approval (the `protect-main` ruleset),
 so an approval always covers the head it reviewed; after the fifth automatic review a person runs the workflow by
-hand for another. This file says why it is shaped the way it is; the instructions
+hand for another.
+
+Shingler only reads; it never builds or runs the code, and CI t0 is static. So a pull request that changes a crate
+reaching cuda-core (the list comes from `tools/recipes.py pure-crates` on the trusted tree) gets a card label:
+`gpu-evidence` when it carries a gate run on a card (CONTRIBUTING's evidence list, as the reviewer reads it in
+`gpu.json`), `needs-gpu` when it does not. A run on the author's card counts as verified, as CONTRIBUTING says; a
+sentence such as "tested on my card" without the output is not one. `gpu-verified` marks a maintainer's own run, and
+the bot never adds or removes it. The lead's release step lists every merged `needs-gpu` pull request without
+`gpu-verified` before the tag. During a release freeze (an open issue labelled `release-freeze`, opened by the
+owner), a `needs-gpu` pull request gets a COMMENT instead of an approval, since a merge then would change the tree
+under the release batch.
+
+This file says why it is shaped the way it is; the instructions
 the model follows are `reviewer.md`, `validator.md` and `learner.md`; what it has learned is in the slag ledger
 issue (below) and, once settled, in `escape-catalog.md`.
 

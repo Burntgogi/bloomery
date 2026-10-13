@@ -42,7 +42,9 @@ The `cargo-oxide` install on a clean host has not been run yet (`docs/BUILD.md:3
   merge an approved pull request; a must-fix review requests changes, which you answer with a push (the next review
   replaces it). A change to `.github/`, the bot's tools,
   `AGENTS.md`, CONTRIBUTING or the toolchain always waits for a person's approval. A push dismisses the approval
-  until the next review. A draft, the
+  until the next review. A change to a crate that reaches the card (`crates/gpu*`, `crates/app`) is labelled
+  `gpu-evidence` when your pull request carries a gate run on your card with its output (below), which counts as
+  verified, else `needs-gpu` until someone runs it (a maintainer then adds `gpu-verified`). During a release freeze a `needs-gpu` change is not approved until the release is out. A draft, the
   `no-review` label or five automatic reviews stop it. A proven defect it finds outside your change becomes a
   `review-bot` issue.
 - **Gates.** Run the `just gate-*` recipes `just affected` selects on your own card if you can

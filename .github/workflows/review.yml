@@ -225,7 +225,9 @@ jobs:
           fi
           gh api --paginate "repos/$REPO/pulls/$PR/files" --jq '.[] | "\(.status)\t+\(.additions)\t-\(.deletions)\t\(.filename)"' > ctx/files.txt
           gh api --paginate "repos/$REPO/issues?labels=review-bot&state=open&per_page=100" --jq '.[] | "#\(.number) \(.title)"' > ctx/open-issues.txt
-          # The knowledge ledger's ticked lessons (tools/review/ledger.py); its version goes into the footer marker.
+          # The crates a card must check (tools/recipes.py pure-crates on the trusted tree), for the card label.
+          python3 base/tools/review/post.py device --root base --out ctx/device-dirs.txt
+          # The slag ledger's lessons in force (tools/review/ledger.py); its version goes into the footer marker.
           ledger=$(python3 base/tools/review/ledger.py accepted --repo "$REPO" --out ctx/ledger.md)
           # tree_sha: the commit BASE_TREE is checked out at, which issue evidence links point into.
           jq --arg mode "$mode" --arg repo "$REPO" --arg tree "$TREE_SHA" --arg ledger "$ledger" --arg run "$GITHUB_RUN_ID" \
@@ -256,6 +258,7 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
           python3 base/tools/review/post.py check --out out --diff ctx/diff.patch --pr-json ctx/pr.json --files ctx/files.txt \
+            --device ctx/device-dirs.txt \
             --base "$PWD/base" --secret-env ANTHROPIC_API_KEY \
             --usage trace/reviewer.usage.json --usage trace/validator.usage.json
       # Token and tool accounting for later optimization: the summary lines here, the full transcripts and
@@ -280,6 +283,8 @@ jobs:
             out/review.md
             out/decision.txt
             out/event.txt
+            out/labels.json
+            out/gpu.json
             out/comments.json
             out/head_sha.txt
             out/usage.txt
@@ -291,6 +296,7 @@ jobs:
             ctx/diff.patch
             ctx/pr.json
             ctx/files.txt
+            ctx/device-dirs.txt
           retention-days: 90   # the learner reads removed.json, lessons.json and aims.json back (tools/review/signals.py)
 
   post:
@@ -327,8 +333,12 @@ jobs:
             echo "head moved from $reviewed to $now; not posting" | tee -a "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
+          # A release freeze (an open release-freeze issue by the owner) holds the approval of a needs-gpu change.
+          python3 tools/review/post.py freeze --repo "$REPO" --out freeze.txt | tee -a "$GITHUB_STEP_SUMMARY"
           python3 tools/review/post.py check --out art/out --diff art/ctx/diff.patch --pr-json art/ctx/pr.json \
-            --files art/ctx/files.txt
+            --files art/ctx/files.txt --device art/ctx/device-dirs.txt --freeze freeze.txt
           # Defects the reviewer proved outside this PR become issues labelled review-bot (deduplicated by title).
           python3 tools/review/post.py issues --out art/out --repo "$REPO" --pr "$PR" | tee -a "$GITHUB_STEP_SUMMARY"
           python3 tools/review/post.py post --out art/out --repo "$REPO" --pr "$PR" | tee -a "$GITHUB_STEP_SUMMARY"
+          # The card label: needs-gpu or gpu-evidence (gpu-verified is a maintainer's; the bot never touches it).
+          python3 tools/review/post.py labels --out art/out --repo "$REPO" --pr "$PR" | tee -a "$GITHUB_STEP_SUMMARY"
