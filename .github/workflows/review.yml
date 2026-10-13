@@ -224,9 +224,12 @@ jobs:
           fi
           gh api --paginate "repos/$REPO/pulls/$PR/files" --jq '.[] | "\(.status)\t+\(.additions)\t-\(.deletions)\t\(.filename)"' > ctx/files.txt
           gh api --paginate "repos/$REPO/issues?labels=review-bot&state=open&per_page=100" --jq '.[] | "#\(.number) \(.title)"' > ctx/open-issues.txt
+          # The knowledge ledger's ticked lessons (tools/review/ledger.py); its version goes into the footer marker.
+          ledger=$(python3 base/tools/review/ledger.py accepted --repo "$REPO" --out ctx/ledger.md)
           # tree_sha: the commit BASE_TREE is checked out at, which issue evidence links point into.
-          jq --arg mode "$mode" --arg repo "$REPO" --arg tree "$TREE_SHA" '{number, title, body, author: .user.login,
-              repo: $repo, base_sha: .base.sha, head_sha: .head.sha, tree_sha: $tree, mode: $mode}' ctx/pr-full.json > ctx/pr.json
+          jq --arg mode "$mode" --arg repo "$REPO" --arg tree "$TREE_SHA" --arg ledger "$ledger" '{number, title, body,
+              author: .user.login, repo: $repo, base_sha: .base.sha, head_sha: .head.sha, tree_sha: $tree, mode: $mode,
+              ledger: $ledger}' ctx/pr-full.json > ctx/pr.json
           rm ctx/pr-full.json
           if [ -f ctx-diag/diagnostics.md ]; then cp ctx-diag/diagnostics.md ctx/; else
             echo "The diagnostics job did not finish; no dryer or crapper results for this review." > ctx/diagnostics.md; fi
