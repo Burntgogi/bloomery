@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # One headless Claude Code run of the review bot (.github/workflows/review.yml).
 #
-#   tools/review/run-claude.sh reviewer|validator BASE_TREE PR_TREE CTX OUT TRACE
+#   tools/review/run-claude.sh reviewer|validator|learner BASE_TREE PR_TREE CTX OUT TRACE
+#
+# The learner (.github/workflows/review-learn.yml) has no pull request: it passes BASE_TREE as PR_TREE.
 #
 # The prompt is .github/review/<role>.md from BASE_TREE plus the four absolute paths. The run's working directory is
 # OUT, an empty directory of ours, so nothing in the PR tree is loaded as project configuration (a PR's
@@ -10,13 +12,16 @@
 # the user scope only (the runner has none). The full stream-json transcript goes to TRACE/<role>.ndjson and its token
 # and tool accounting (tools/review/usage.py) to TRACE/<role>.usage.json; TRACE is outside OUT, so the run cannot
 # touch it and nothing in it is posted. The exit code is claude's, and a result that reports an error is exit 1.
+# REVIEW_SETTING_SOURCES=project runs it on a maintainer's machine under their own login without loading their user
+# settings (OUT has no project settings); the workflow leaves it unset.
 set -euo pipefail
 
 role=${1:?role}; base=${2:?base tree}; pr=${3:?pr tree}; ctx=${4:?ctx}; out=${5:?out}; trace=${6:?trace}
 case "$role" in
   reviewer) turns=60 ;;
   validator) turns=30 ;;
-  *) echo "run-claude.sh: role is reviewer or validator, not '$role'" >&2; exit 64 ;;
+  learner) turns=40 ;;
+  *) echo "run-claude.sh: role is reviewer, validator or learner, not '$role'" >&2; exit 64 ;;
 esac
 for d in "$base" "$pr" "$ctx" "$out" "$trace"; do
   case "$d" in /*) ;; *) echo "run-claude.sh: '$d' is not an absolute path" >&2; exit 64 ;; esac
@@ -37,7 +42,7 @@ rc=0
     --effort high \
     --max-turns "$turns" \
     --output-format stream-json --verbose \
-    --setting-sources user \
+    --setting-sources "${REVIEW_SETTING_SOURCES:-user}" \
     --strict-mcp-config \
     --permission-mode dontAsk \
     --add-dir "$pr" "$base" "$ctx" \

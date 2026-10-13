@@ -1,0 +1,152 @@
+# The review bot's weekly learner: what happened after its reviews becomes lesson candidates in the knowledge ledger
+# (one open issue labelled review-ledger; tools/review/ledger.py). Design: .github/review/README.md.
+#
+# Trust: signals come from code (tools/review/signals.py), the model only proposes (candidates.json), and ledger.py
+# writes the issue body itself, adding every candidate unticked and copying the existing lines as they are. A lesson
+# reaches a review only when someone with write access ticks it. The key and the issues-write token never share a job.
+name: Review learner
+
+on:
+  schedule:
+    - cron: '0 21 * * 0'   # Sunday 21:00 UTC, Monday 06:00 KST
+  workflow_dispatch:
+    inputs:
+      days:
+        description: The window in days
+        required: false
+        default: '8'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: review-learn
+  cancel-in-progress: false
+
+env:
+  CLAUDE_CODE_VERSION: 2.1.284
+  REVIEW_MODEL: claude-sonnet-5-5
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+    outputs:
+      has_signals: ${{ steps.s.outputs.has_signals }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          path: base
+          fetch-depth: 0   # git blame over the window
+          persist-credentials: false
+      - id: s
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          DAYS: ${{ inputs.days || '8' }}
+        run: |
+          set -euo pipefail
+          s=$(date +%s)
+          python3 base/tools/review/signals.py --repo "$REPO" --git "$PWD/base" --days "$DAYS" --ref HEAD --out ctx \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+          python3 base/tools/review/ledger.py fetch --repo "$REPO" --out ctx/ledger-body.md | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "collect: $(( $(date +%s) - s )) s" >> "$GITHUB_STEP_SUMMARY"
+          echo "has_signals=$(cat ctx/has_signals.txt)" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: signals
+          path: ctx
+
+  learn:
+    needs: collect
+    if: needs.collect.outputs.has_signals == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          path: base
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: signals
+          path: ctx
+      - uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: npm-claude-code-${{ env.CLAUDE_CODE_VERSION }}
+      - name: Install Claude Code
+        run: npm install -g "@anthropic-ai/claude-code@$CLAUDE_CODE_VERSION"
+      - name: Learn
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1'
+        run: |
+          mkdir -p out trace
+          bash base/tools/review/run-claude.sh learner "$PWD/base" "$PWD/base" "$PWD/ctx" "$PWD/out" "$PWD/trace"
+          test -f out/candidates.json || echo '[]' > out/candidates.json
+      - name: Record usage
+        if: always()
+        run: |
+          python3 - >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+          import json, os
+          p = "trace/learner.usage.json"
+          if os.path.exists(p):
+              u = json.load(open(p))
+              print(f"learner: {u['subtype']} turns={u['num_turns']} cost_usd={u['cost_usd']} "
+                    f"ctx_max={u['context_max']} ctx_sum={u['context_sum']} tools={u['tools']}")
+          EOF
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: learn-trace
+          path: trace
+          retention-days: 30
+      - uses: actions/upload-artifact@v4
+        with:
+          name: candidates
+          path: |
+            out/candidates.json
+            trace/learner.usage.json
+
+  update:
+    needs: [collect, learn]
+    if: always() && needs.collect.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          sparse-checkout: tools/review
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: signals
+          path: ctx
+      - uses: actions/download-artifact@v4
+        if: needs.learn.result == 'success'
+        with:
+          name: candidates
+          path: cand
+      - name: Update the ledger
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          cost=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['cost_usd'])" cand/trace/learner.usage.json 2>/dev/null || echo 0)
+          printf '%s · learner cost $%s\n' "$(head -1 ctx/stats.md)" "$cost" > stats.md
+          python3 tools/review/ledger.py update --repo "$REPO" --candidates cand/out/candidates.json --stats stats.md \
+            | tee -a "$GITHUB_STEP_SUMMARY"
