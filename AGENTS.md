@@ -25,8 +25,8 @@ change is checked and merged is in `CONTRIBUTING.md`. A maintainer's machine may
 - **Never time by hand.** The project's numbers come from the runners in `tools/ref/` (`decode-measure.sh`,
   `ab-decode.sh`, `depth-gpu.sh`, `depth-ds41.sh`, `nsys-gpu.sh`, `ncu-gpu.sh` and their recipes), each taking the
   timing lease through `lease_take`: a machine-wide lock, a GPU-idle wait, and witness blocks around every timed
-  region. A number produced outside them is not admissible in our tables. A contributor's number from their own card
-  follows `CONTRIBUTING.md`'s evidence list instead.
+  region. A number from another machine carries `CONTRIBUTING.md`'s evidence list instead (the card and driver line,
+  both commits, the model file, the commands and their output). A number with neither is not admissible.
 - **Never relax a gate or a lint to make it pass.** Raise it with a dated comment and a reason, or file an issue. The
   lint levels in the root `Cargo.toml` carry the hit counts they were chosen from.
 - **Never write a number you did not measure.** If it is derived, say so. If it turns out wrong, strike it through and
@@ -209,11 +209,11 @@ forced_exact count pin, the reference gates).
 - **Cards.** A functional gate runs on any card unless a fact pins it. A gate bin that runs the gate plan
   (`workstation::plan_gate`, the 3090's bytes the README's 3090 rows are measured at) plans those bytes on the card it
   holds (`crates/gpu-gates/src/bin/shared/gate_card.rs`), so its pins hold on any card with the room.
-- **Public numbers name their card.** Our tables are the RTX 3090 alone and, for a model that does not fit one card,
-  a separate "A6000+3090" table in which the reference engine gets the same two cards (`-ts`) in the same lease. 3090
-  numbers from before 2026-09-22 and A6000 numbers never share a table. A contributor's number from their own card
-  decides their pull request on that card and never fills our tables; where we measure another card differently, both
-  stand, separated by a gate on the card fact, not a veto.
+- **Public numbers name their machine.** Anyone's number can be published, a maintainer's or a contributor's, when it
+  carries its conditions and evidence. Each card or card set, and each machine, has a table of its own: a table never
+  mixes cards. A row beside a reference engine gives that engine the same cards in the same session (`-ts` for two
+  cards). A contributor's number decides their pull request on their card; where two cards measure a change
+  differently, both stand, separated by a gate on the card fact, not a veto.
 - **No gate guards speed, so a change that touches the dispatch path ends with a same-lease A/B.** Build the base in a
   worktree (`just build-decode`), then `just ab-decode <that tree>`; judge by the interleaved relative numbers (the
   same commit moves ~5 % between windows). The runner rotates arm order every round (a fixed first arm reads 0.3–0.8 %
