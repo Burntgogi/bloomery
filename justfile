@@ -102,6 +102,11 @@ mac-static *ARGS:
 remote-static *ARGS:
     ./tools/mac-remote.sh {{ARGS}}
 
+# Every pool Mac's run slots and track locks (live or dead); `just mac-locks --clean` removes the dead ones
+# (no live remote run and a heartbeat older than LOCK_DEAD, 600 s). The owner is tools/mac-remote.sh.
+mac-locks *ARGS:
+    ./tools/mac-remote.sh --locks {{ARGS}}
+
 # An off-box check for a contributor: fmt, the pure crates' tests, the Python tool self-tests and every tools/check-*.sh
 # (T0, any OS with the pinned nightly), plus the host-nightly units on x86_64 or aarch64 Linux with no card (T1, the
 # default on x86_64).

@@ -1831,6 +1831,12 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
          justfile's `v41-load` group exports it.",
     ),
     runner(
+        "BLOOMERY_MAC_REMOTE",
+        Some("mac-remote.sh"),
+        "`tools/mac-remote.sh`: the alias of the pool Mac to run on, a file of \
+         `~/.config/bloomery/mac-remote.d`; unset, the runner picks a free slot across the pool.",
+    ),
+    runner(
         "BLOOMERY_V41_CLASS",
         Some("gpu-gate.sh"),
         "The V4.1 load queue's class for a loader (`tools/gpu-gate.sh`): `1` the lead's landing \

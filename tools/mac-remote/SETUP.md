@@ -84,6 +84,18 @@ measured on the lead's Mac), so the second Mac removes the load effect, not the 
 ## More Macs (the pool)
 
 Each further Mac is set up by steps 1-4 and gets its own one-line file `~/.config/bloomery/mac-remote.d/<name>`
-(`user@host`, not in this repository) on the machine that runs the tool. `BLOOMERY_MAC_REMOTE=<name> just remote-static BASE`
-runs on that Mac; unset, the tool uses `~/.config/bloomery/mac-remote` as before. Every Mac has its own two slots,
-track locks, clones and ledger, so a worker picks a Mac by name and the slot rules apply per Mac.
+(`user@host`, not in this repository) on the machine that runs the tool; the file's name is the Mac's alias in every log line.
+
+- `just remote-static BASE` with `BLOOMERY_MAC_REMOTE` unset picks the Mac itself: every Mac is surveyed at once
+  (ssh ConnectTimeout 5 s); unreachable ones and ones under 15 GB free (`POOL_MIN_GB`) are skipped; a Mac with a free
+  slot wins, first one with a warm `target/` for the track, then the most free slots, then the shortest queue. It logs
+  `mac-remote: picked <alias> (…)`, then `track <t> on <alias>` and the remote's `run slot N of 2 taken`.
+  Runners on this machine reserve their pick until they hold a slot, so two started together spread out; the claim
+  itself is still the Mac's `lockf` slot, never shared. With all slots taken it prints every Mac's slots every 5 min,
+  re-surveys every 20 s, and after 30 min (`POOL_WAIT`) queues on the least loaded Mac.
+- `BLOOMERY_MAC_REMOTE=<alias>` pins one Mac. With no `mac-remote.d`, `~/.config/bloomery/mac-remote` is used as before.
+- Locks: a track lock holds owner (host/pid), start time and a heartbeat (refreshed every 60 s by the remote run). The
+  remote run removes its own lock when it ends, however it ends; an ssh drop hangs it up, which ends the run and its job.
+  A lock with no live remote run and a heartbeat older than 10 min (`LOCK_DEAD`) is dead: the next run of that track
+  reclaims it and logs the old owner. A live lock is never taken.
+- `just mac-locks` lists every Mac's slots and locks (live/dead); `just mac-locks --clean` removes the dead ones.

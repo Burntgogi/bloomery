@@ -35,6 +35,9 @@
 # remote pid of the run once it started. A lock whose owner is a dead pid of this host is taken over, unless its
 # remote run is still going (a killed runner leaves the remote run to finish). A live lock is waited for, up to
 # TRACK_WAIT seconds (a second run of one tree, or two trees of one name, queue behind the first).
+# The lock also holds its start time and a heartbeat the remote run refreshes every 60 s; the remote run removes the
+# lock itself when it ends (an ssh drop hangs it up and ends it), and a lock with no live remote run and a heartbeat
+# older than LOCK_DEAD s is dead and reclaimed, the old owner logged. The pool and `--locks` are described below.
 #
 # The slot pool bounds the runs at once on the remote: SLOTS files ~/repo/bloomery-mr/.slot-<i>, each held by
 # `lockf` (macOS's /usr/bin/lockf takes flock(2) through O_EXLOCK, so the kernel frees a slot when its holder
@@ -72,6 +75,7 @@ SLOTS=2 # runs at once on the remote; a further run waits for a slot
 SLOT_SAY=300 # seconds between two prints of the slots' line while a run waits for a slot
 SLOT_POLL=3 # seconds between a waiting run's two looks at the queue and the slots
 TRACK_WAIT=1800 # seconds a run waits for its track's lock held by a live run
+LOCK_DEAD=${LOCK_DEAD:-600} # a lock with no live remote run and a heartbeat older than this is dead and reclaimed
 
 say() { printf '%s\n' "$*" >&2; }
 
@@ -89,6 +93,195 @@ read_host() {
     return 64
   fi
   printf '%s\n' "$line"
+}
+
+# The pool. With BLOOMERY_MAC_REMOTE unset and files in ~/.config/bloomery/mac-remote.d (one `user@host` line
+# each, the file's name the Mac's alias), a run picks its Mac itself: every Mac is surveyed at once over ssh with a
+# short ConnectTimeout (POOL_CONNECT s); one that does not answer, or has less than POOL_MIN_GB free, is left out.
+# Of the rest, a Mac with a free slot wins: first one whose clone of this track already has a target/ (warm), then
+# the one with the most free slots, then the shortest slot queue. A slot counts as taken while this
+# machine's runner that picked that Mac (a reservation in ~/.cache/bloomery/mac-pool, under one mkdir lock) has
+# not taken a slot there yet, so two runners started together spread out. The claim itself stays the remote's
+# lockf slot: a runner that loses a race queues on that Mac in its turn, never shares a slot. With no slot free
+# anywhere it prints every Mac's slots and surveys again every POOL_POLL s, up to POOL_WAIT s, then queues on the
+# least loaded Mac. Track locks whose run is gone are named (`stale?`) and never removed for another track.
+POOL_DIR=$HOME/.config/bloomery/mac-remote.d
+POOL_CONNECT=${POOL_CONNECT:-5}
+POOL_MIN_GB=${POOL_MIN_GB:-15}
+POOL_POLL=${POOL_POLL:-20}
+POOL_WAIT=${POOL_WAIT:-1800}
+RESV_DIR=$HOME/.cache/bloomery/mac-pool
+
+SURVEY='{
+exec < /dev/null
+track=$1 slots=$2
+base=$HOME/'"$RBASE"'
+mkdir -p "$base"
+echo "GB=$(df -g "$HOME" 2> /dev/null | awk "NR == 2 { print \$4 }")"
+free=0 hold=
+j=0
+while [ "$j" -lt "$slots" ]; do
+  if lockf -k -s -t 0 "$base/.slot-$j" true 2> /dev/null; then free=$((free + 1)); hold="$hold [slot $((j + 1)): free]"
+  else h=$(cat "$base/.slot-$j.holder" 2> /dev/null || true); set -- $h; hold="$hold [slot $((j + 1)): ${1:-starting}]"; fi
+  j=$((j + 1))
+done
+echo "FREE=$free"
+echo "HOLD=$hold"
+q=0
+for f in "$base"/.slot-queue/[0-9]*; do [ -e "$f" ] || continue; read -r p s < "$f" 2> /dev/null; kill -0 "$p" 2> /dev/null && q=$((q + 1)); done
+echo "QUEUE=$q"
+if [ -d "$base/$track/target" ]; then echo WARM=1; else echo WARM=0; fi
+for l in "$base"/.lock-*; do
+  [ -d "$l" ] || continue
+  rp=$(cat "$l/run-pid" 2> /dev/null || true)
+  alive=0; [ -n "$rp" ] && kill -0 "$rp" 2> /dev/null && alive=1
+  echo "LOCK=${l##*/.lock-} $(cat "$l/owner" 2> /dev/null || echo ?/0) $alive $(( $(date +%s) - $(cat "$l/heartbeat" 2> /dev/null || stat -f %m "$l" 2> /dev/null || date +%s) ))"
+done
+exit 0
+}'
+
+# pool_choose: survey records on stdin, one a Mac: `alias reachable gb free queue warm tracklocked reserved`;
+# the alias to run on and why on stdout (`alias free|queue …`), or nothing when no Mac qualifies at all.
+pool_choose() {
+  awk -v min="$POOL_MIN_GB" '
+    $2 != 1 || $3 + 0 < min { next }
+    { eff = $4 - $8; if (eff < 0) eff = 0
+      if (eff > 0 && $7 == 0) k = sprintf("1 %d %02d %04d %s", $6, eff, 9999 - $5, $1)
+      else k = sprintf("0 %d %04d %02d %s", $7 == 0, 9999 - $5 - ($4 - eff), $4, $1)
+      if (best == "" || k > best) { best = k; who = $1; why = (eff > 0 && $7 == 0) ? "free" : "queue"; w = $6; e = eff } }
+    END { if (who != "") printf "%s %s %d %d\n", who, why, e, w }'
+}
+
+# lock_note LOCKLINE: a survey LOCK line (`track owner run-alive heartbeat-age`) as words for the log when the lock is
+# dead (no live remote run, heartbeat older than LOCK_DEAD), or nothing for a live one.
+lock_note() {
+  local name owner alive age
+  read -r name owner alive age <<< "$1"
+  [ "$alive" = 0 ] && [ "${age:-0}" -ge "$LOCK_DEAD" ] || return 0
+  echo "track $name: dead lock (owner $owner, no run going, heartbeat $age s old): the next run of $name reclaims it, or just mac-locks --clean"
+}
+
+resv_lock() { local n=0; mkdir -p "$RESV_DIR"; until mkdir "$RESV_DIR/.lock" 2> /dev/null; do n=$((n + 1)); [ "$n" -lt 100 ] || rm -rf "$RESV_DIR/.lock"; sleep 0.1; done; }
+resv_unlock() { rmdir "$RESV_DIR/.lock" 2> /dev/null || true; }
+# resv_count ALIAS HOLD: this machine's live reservations of ALIAS whose track does not hold a slot there yet.
+resv_count() {
+  local f p t k=0
+  for f in "$RESV_DIR/$1".*; do
+    [ -f "$f" ] || continue
+    read -r p t < "$f" || continue
+    kill -0 "$p" 2> /dev/null || { rm -f "$f"; continue; }
+    case $2 in *": $t]"*) ;; *) k=$((k + 1)) ;; esac
+  done
+  echo "$k"
+}
+
+# pool_pick TRACK: sets CONF and MAC_NAME to the chosen Mac, or 64 / 75.
+pool_pick() {
+  local tr=$1 d f a out gb fr q w hold tl lines rec choice t0=$SECONDS last=-999 notes
+  d=$(mktemp -d "${TMPDIR:-/tmp}/mac-pool.XXXXXX")
+  local -a names=()
+  for f in "$POOL_DIR"/*; do [ -f "$f" ] && [[ ${f##*/} =~ ^[A-Za-z0-9._-]+$ ]] && names+=("${f##*/}"); done
+  [ ${#names[@]} -gt 0 ] || { rm -rf "$d"; say "mac-remote: no Mac in ~/.config/bloomery/mac-remote.d"; return 64; }
+  while :; do
+    for a in "${names[@]}"; do
+      ( CONF=$POOL_DIR/$a; h=$(read_host 2> /dev/null) || exit 64
+        ssh -o LogLevel=ERROR -o BatchMode=yes -o ConnectTimeout="$POOL_CONNECT" -o ServerAliveInterval=5 -o ServerAliveCountMax=2 \
+          "$h" "bash -s -- $(qargs "$tr" "$SLOTS")" <<< "$SURVEY" > "$d/$a" 2> /dev/null ) &
+    done
+    wait
+    resv_lock
+    lines=
+    notes=
+    for a in "${names[@]}"; do
+      out=$(cat "$d/$a" 2> /dev/null || true)
+      gb=$(sed -n 's/^GB=//p' <<< "$out"); fr=$(sed -n 's/^FREE=//p' <<< "$out"); q=$(sed -n 's/^QUEUE=//p' <<< "$out")
+      w=$(sed -n 's/^WARM=//p' <<< "$out"); hold=$(sed -n 's/^HOLD=//p' <<< "$out")
+      if [ -z "$fr" ]; then lines+="$a 0 0 0 0 0 0 0"$'\n'; notes+="  $a: not reachable in $POOL_CONNECT s, skipped"$'\n'; continue; fi
+      tl=0
+      while IFS= read -r rec; do
+        [ -n "$rec" ] || continue
+        set -- $rec
+        [ "$1" != "$tr" ] || [ "$3" = 0 ] || tl=1
+        rec=$(lock_note "$rec"); [ -z "$rec" ] || notes+="  $a: $rec"$'\n'
+      done <<< "$(sed -n 's/^LOCK=//p' <<< "$out")"
+      lines+="$a 1 ${gb:-0} $fr ${q:-0} ${w:-0} $tl $(resv_count "$a" "$hold")"$'\n'
+      [ "${gb:-0}" -ge "$POOL_MIN_GB" ] || notes+="  $a: ${gb:-?} GB free, under $POOL_MIN_GB, skipped"$'\n'
+      rec=; [ "$w" != 1 ] || rec=", warm target/ for $tr"
+      notes+="  $a:$hold, queue ${q:-0}$rec"$'\n'
+    done
+    choice=$(printf '%s' "$lines" | pool_choose)
+    set -- $choice
+    if [ -n "$choice" ] && { [ "$2" = free ] || [ $((SECONDS - t0)) -ge "$POOL_WAIT" ]; }; then
+      echo "$$ $tr" > "$RESV_DIR/$1.$$"
+      RESV_FILE=$RESV_DIR/$1.$$
+      resv_unlock
+      [ "$last" -ge 0 ] || printf 'mac-remote: pool:\n%s' "$notes" >&2
+      MAC_NAME=$1
+      CONF=$POOL_DIR/$1
+      say "mac-remote: picked $1 ($([ "$2" = free ] && echo "$3 slot(s) free" || echo "all busy after $POOL_WAIT s, queueing")$([ "$4" != 1 ] || echo ", warm target/"))"
+      rm -rf "$d"
+      return 0
+    fi
+    resv_unlock
+    if [ -z "$choice" ]; then printf 'mac-remote: pool:\n%s' "$notes" >&2; say "mac-remote: no Mac of the pool is reachable with $POOL_MIN_GB GB free"; rm -rf "$d"; return 75; fi
+    if [ $((SECONDS - last)) -ge "$SLOT_SAY" ]; then
+      printf 'mac-remote: all slots of the pool are taken (%s s):\n%s' "$((SECONDS - t0))" "$notes" >&2
+      last=$SECONDS
+    fi
+    sleep "$POOL_POLL"
+  done
+}
+
+# --locks [--clean]: every Mac's slots and track locks (the pool's, or the one Mac of ~/.config/bloomery/mac-remote),
+# each lock `live` (its run goes, or its heartbeat is younger than LOCK_DEAD) or `dead`; --clean removes the dead ones.
+LOCKS='{
+exec < /dev/null
+slots=$1 clean=$2 dead=$3
+base=$HOME/'"$RBASE"'
+mkdir -p "$base"
+now=$(date +%s)
+mtime() { stat -f %m "$1" 2> /dev/null || stat -c %Y "$1" 2> /dev/null || echo "$now"; }
+j=0
+while [ "$j" -lt "$slots" ]; do
+  if ! command -v lockf > /dev/null; then st="unknown (no lockf)"
+  elif lockf -k -s -t 0 "$base/.slot-$j" true 2> /dev/null; then st=free
+  else h=$(cat "$base/.slot-$j.holder" 2> /dev/null || true); set -- $h; if [ -n "$h" ]; then st="$1 for $((now - $2)) s"; else st=starting; fi; fi
+  echo "  slot $((j + 1)): $st"
+  j=$((j + 1))
+done
+n=0
+for l in "$base"/.lock-*; do
+  [ -d "$l" ] || continue
+  n=$((n + 1))
+  t=${l##*/.lock-}
+  rp=$(cat "$l/run-pid" 2> /dev/null || true)
+  alive=0; [ -n "$rp" ] && kill -0 "$rp" 2> /dev/null && alive=1
+  hb=$(cat "$l/heartbeat" 2> /dev/null || mtime "$l"); age=$((now - hb))
+  if [ "$alive" = 1 ] || [ "$age" -lt "$dead" ]; then v=live; else v=dead; fi
+  line="  lock $t: $v, owner $(cat "$l/owner" 2> /dev/null || echo unknown), run pid ${rp:-none}$([ "$alive" = 1 ] && echo " alive" || echo ""), heartbeat $age s old"
+  if [ "$v" = dead ] && [ "$clean" = 1 ]; then rm -rf "$l" && line="$line: removed"; fi
+  echo "$line"
+done
+[ "$n" -gt 0 ] || echo "  no track locks"
+exit 0
+}'
+
+locks_main() {
+  local clean=$1 a f rc=0 h
+  local -a names=()
+  if compgen -G "$POOL_DIR/*" > /dev/null; then
+    for f in "$POOL_DIR"/*; do [ -f "$f" ] && names+=("${f##*/}"); done
+  else
+    names=(.)
+  fi
+  for a in "${names[@]}"; do
+    if [ "$a" = . ]; then CONF=$HOME/.config/bloomery/mac-remote; a="the second Mac"; else CONF=$POOL_DIR/$a; fi
+    h=$(read_host) || { rc=64; continue; }
+    echo "$a:"
+    ssh -o LogLevel=ERROR -o BatchMode=yes -o ConnectTimeout="$POOL_CONNECT" "$h" "bash -s -- $(qargs "$SLOTS" "$clean" "$LOCK_DEAD")" <<< "$LOCKS" 2> /dev/null |
+      scrub "" "${h%@*}" "${h#*@}" || { echo "  not reachable in $POOL_CONNECT s"; rc=75; }
+  done
+  return $rc
 }
 
 # track_of DIR: the remote clone's name, DIR's directory name, or 64 when it is not one word of [A-Za-z0-9._-].
@@ -211,7 +404,7 @@ ledger_new() {
 PREP='{
 exec < /dev/null
 echo "HOME=$HOME"
-track=$1 owner=$2 channel=$3 want_just=$4 steal=$5
+track=$1 owner=$2 channel=$3 want_just=$4 steal=$5 dead=${6:-600}
 export PATH=$HOME/opt/bloomery-bin:$HOME/.cargo/bin:/usr/bin:/bin:/usr/sbin:/sbin
 miss=0
 need() { echo "missing: $*"; miss=1; }
@@ -248,6 +441,18 @@ if [ "$steal" = 1 ]; then
   if [ -n "$rp" ] && kill -0 "$rp" 2> /dev/null; then echo "RUNNING=$rp"; exit 75; fi
   rm -rf "$lock"
 fi
+mtime() { stat -f %m "$1" 2> /dev/null || stat -c %Y "$1" 2> /dev/null || date +%s; }
+if [ -d "$lock" ]; then
+  rp=$(cat "$lock/run-pid" 2> /dev/null || true)
+  if [ -z "$rp" ] || ! kill -0 "$rp" 2> /dev/null; then
+    hb=$(cat "$lock/heartbeat" 2> /dev/null || mtime "$lock")
+    age=$(( $(date +%s) - ${hb:-0} ))
+    if [ "$age" -ge "$dead" ]; then
+      echo "RECLAIMED=owner $(cat "$lock/owner" 2> /dev/null || echo unknown), started $(cat "$lock/started" 2> /dev/null || echo unknown), run pid ${rp:-none} not alive, heartbeat $age s old"
+      rm -rf "$lock"
+    fi
+  fi
+fi
 if ! mkdir "$lock" 2> /dev/null; then
   echo "HELD=$(cat "$lock/owner" 2> /dev/null)"
   rp=$(cat "$lock/run-pid" 2> /dev/null || true)
@@ -255,6 +460,8 @@ if ! mkdir "$lock" 2> /dev/null; then
   exit 75
 fi
 echo "$owner" > "$lock/owner"
+date +%s > "$lock/started"
+date +%s > "$lock/heartbeat"
 [ -d "$base/$track/.git" ] || { mkdir -p "$base/$track"; git -C "$base/$track" init -q; }
 n=0
 [ ! -f "$HOME/.cache/bloomery/mac-static-ledger.tsv" ] || n=$(wc -l < "$HOME/.cache/bloomery/mac-static-ledger.tsv" | tr -d " ")
@@ -264,6 +471,7 @@ exit 0
 
 CHECKOUT='{
 exec < /dev/null
+date +%s > "$HOME/'"$RBASE"'/.lock-$1/heartbeat" 2> /dev/null
 cd "$HOME/'"$RBASE"'/$1" || exit $?
 # The last run'"'"'s rsync (-p) chmods every file it compares, so an unchanged file'"'"'s ctime moves past the index'"'"'s whenever
 # that rsync ran a second or more after the checkout (a loaded remote); `checkout -f` compares stat data only and would
@@ -294,8 +502,16 @@ exec < /dev/null
 track=$1 basearg=$2 channel=$3 slots=$4 say=$5 poll=$6
 export PATH=$HOME/opt/bloomery-bin:$HOME/.cargo/bin:/usr/bin:/bin:/usr/sbin:/sbin
 base=$HOME/'"$RBASE"'
-echo $$ > "$base/.lock-$track/run-pid"
-trap "rm -f \"$base/.lock-$track/run-pid\"" EXIT
+# From here on the lock belongs to this run: a heartbeat every 60 s while it lives, and the whole lock removed when it ends,
+# however it ends. An ssh drop (HUP) or a signal ends the run and everything it started (its process group), then the
+# EXIT trap removes the lock, so a lost session leaves no lock behind.
+lk=$base/.lock-$track
+echo $$ > "$lk/run-pid"
+( while kill -0 $$ 2> /dev/null; do date +%s > "$lk/heartbeat" 2> /dev/null || exit 0; sleep 60; done ) > /dev/null 2>&1 &
+hb=$!
+ticket=
+trap "kill $hb 2> /dev/null; rm -f \"\$ticket\"; rm -rf \"$lk\"" EXIT
+trap "trap \"\" HUP INT TERM PIPE; kill -TERM 0 2> /dev/null; exit 129" HUP INT TERM PIPE
 cd "$base/$track" || exit 69
 case "$(uname -m)" in arm64) host=aarch64-apple-darwin ;; *) host=x86_64-apple-darwin ;; esac
 PATH=$HOME/.rustup/toolchains/$channel-$host/bin:$PATH
@@ -352,7 +568,6 @@ ticket=$qd/$(printf "%012d" "$n").$track
 printf "%s %s\n" "$$" "$(started $$)" > "$qd/.new-$$"
 mv "$qd/.new-$$" "$ticket"
 export ticket
-trap "rm -f \"$base/.lock-$track/run-pid\" \"$ticket\"" EXIT
 # The live tickets older than the ticket of this run, counted; a ticket whose run is gone is removed.
 ahead() {
   local f p s k=0
@@ -373,8 +588,9 @@ while :; do
   if [ "$k" = 0 ]; then
     i=0
     while [ "$i" -lt "$slots" ]; do
-      lockf -k -s -t 0 "$base/.slot-$i" bash -c "slot_inner \"\$@\"" _ "$i" "$((SECONDS - w0))" "$base/.slot-$i.holder" "$rcf" "${cmd[@]}"
-      lrc=$?
+      lockf -k -s -t 0 "$base/.slot-$i" bash -c "slot_inner \"\$@\"" _ "$i" "$((SECONDS - w0))" "$base/.slot-$i.holder" "$rcf" "${cmd[@]}" &
+      # in the background and waited for, so a hangup runs the trap at once, not when the job ends
+      lrc=0; wait $! || lrc=$?
       [ "$lrc" = 75 ] || break 2
       i=$((i + 1))
     done
@@ -409,13 +625,14 @@ qargs() {
 
 # release_lock: drop the track's lock on the remote (never while a run may still be going).
 release_lock() {
-  ssh "${SSH_OPTS[@]}" "$R" "rm -rf $RBASE/.lock-$track" > /dev/null 2>&1 ||
+  ssh "${SSH_OPTS[@]}" "$R" "l=$RBASE/.lock-$track; [ ! -d \$l ] || [ \"\$(cat \$l/owner 2> /dev/null)\" != $(qargs "$OWNER") ] || rm -rf \$l" > /dev/null 2>&1 ||
     say "mac-remote: could not release the lock of $track on the remote (the next run takes it over once this runner's pid is gone)"
 }
 
 cleanup() {
   { [ "${LOCKED:-0}" = 0 ] || [ "${RUN_ACTIVE:-0}" = 1 ]; } || release_lock
   [ -z "${TMP:-}" ] || rm -rf "$TMP"
+  [ -z "${RESV_FILE:-}" ] || rm -f "$RESV_FILE"
 }
 
 on_signal() {
@@ -435,14 +652,20 @@ remote_main() {
   local tree=$1 basearg=$2 r base_list n_pushed channel just_v owner ssh_rc t0=$SECONDS t_setup t_run
   local steal=0 tries=0 held running total appended tw0=$SECONDS twlast=-60
   local -a pushes=()
-  R=$(read_host) || return $?
-  RUSER=${R%@*}
-  RHOST=${R#*@}
-  RHOME=
   TREE=$(cd "$tree" 2> /dev/null && pwd -P) || { say "mac-remote: --tree '$tree' is not a directory"; return 64; }
   [ "$(git -C "$TREE" rev-parse --show-toplevel 2> /dev/null || true)" = "$TREE" ] ||
     { say "mac-remote: $TREE is not the root of a git worktree"; return 64; }
   track=$(track_of "$TREE") || return $?
+  MAC_NAME=${BLOOMERY_MAC_REMOTE:-}
+  if [ -z "$MAC_NAME" ] && compgen -G "$POOL_DIR/*" > /dev/null; then
+    pool_pick "$track" || return $?
+  elif [ -n "$MAC_NAME" ]; then
+    say "mac-remote: pinned to $MAC_NAME (BLOOMERY_MAC_REMOTE)"
+  fi
+  R=$(read_host) || return $?
+  RUSER=${R%@*}
+  RHOST=${R#*@}
+  RHOME=
   HEAD_SHA=$(commit_of "$TREE" HEAD) || return $?
   pushes=("$HEAD_SHA:refs/mr/head")
   BASE_ARG=
@@ -477,7 +700,7 @@ remote_main() {
   printf '%s\n' "$PREP" > "$TMP/prep.sh"
   while :; do
     ssh_rc=0
-    ssh "${SSH_OPTS[@]}" "$R" "bash -s -- $(qargs "$track" "$owner" "$channel" "$just_v" "$steal")" < "$TMP/prep.sh" > "$TMP/prep.out" 2>&1 || ssh_rc=$?
+    ssh "${SSH_OPTS[@]}" "$R" "bash -s -- $(qargs "$track" "$owner" "$channel" "$just_v" "$steal" "$LOCK_DEAD")" < "$TMP/prep.sh" > "$TMP/prep.out" 2>&1 || ssh_rc=$?
     RHOME=$(sed -n 's/^HOME=//p' "$TMP/prep.out" | head -1)
     case $ssh_rc in
       0) break ;;
@@ -516,9 +739,11 @@ remote_main() {
     esac
   done
   LOCKED=1
+  OWNER=$owner
+  sed -n 's/^RECLAIMED=/mac-remote: reclaimed the dead lock of track '"$track"': /p' "$TMP/prep.out" | scrub "$RHOME" "$RUSER" "$RHOST" >&2
   LEDGER_N=$(sed -n 's/^LEDGER_N=//p' "$TMP/prep.out" | head -1)
   [[ $LEDGER_N =~ ^[0-9]+$ ]] || LEDGER_N=0
-  say "mac-remote: track $track, HEAD ${HEAD_SHA:0:12}, base ${BASE_ARG:-none (full run)}"
+  say "mac-remote: track $track on ${MAC_NAME:-the second Mac}, HEAD ${HEAD_SHA:0:12}, base ${BASE_ARG:-none (full run)}"
 
   # objects, checkout, content
   git -C "$TREE" push -q --no-verify -f "$R:$RBASE/$track" "${pushes[@]}" > "$TMP/push.log" 2>&1 || {
@@ -546,7 +771,7 @@ remote_main() {
   wait "$SCPID" || true
   SSHPID= SCPID=
   if [ "$ssh_rc" = 255 ]; then
-    say "mac-remote: the ssh session of the run was lost (rc 255): the run may still be going on the remote, and the track stays locked until it ends"
+    say "mac-remote: the ssh session of the run was lost (rc 255): the remote run ends on the hangup and removes its own lock"
     return 75
   fi
   RUN_ACTIVE=0
@@ -617,6 +842,82 @@ self_test() {
   fake=$d/home
   mkdir -p "$fake/.config/bloomery"
   me=$(hostname -s | tr -c 'A-Za-z0-9.\n-' _)
+
+  # the pool: the choice, the lock notes, the reservations, the pin, an unreachable pool
+  out=$(printf '%s\n' 'a 1 40 1 0 0 0 0' 'b 1 40 2 0 0 0 0' | POOL_MIN_GB=15 pool_choose)
+  [ "${out%% *}" = b ] || fail "the Mac with more free slots was not picked: $out"
+  out=$(printf '%s\n' 'a 1 40 1 0 1 0 0' 'b 1 40 2 0 0 0 0' | POOL_MIN_GB=15 pool_choose)
+  [ "${out%% *}" = a ] || fail "the warm Mac was not preferred: $out"
+  out=$(printf '%s\n' 'a 1 10 2 0 1 0 0' 'b 0 0 0 0 0 0 0' 'c 1 40 1 0 0 0 0' | POOL_MIN_GB=15 pool_choose)
+  [ "${out%% *}" = c ] || fail "a low-disk or unreachable Mac was not skipped: $out"
+  out=$(printf '%s\n' 'a 1 40 1 0 1 0 1' 'b 1 40 1 0 0 0 0' | POOL_MIN_GB=15 pool_choose)
+  [ "${out%% *}" = b ] || fail "a slot reserved by a runner here was counted free: $out"
+  out=$(printf '%s\n' 'a 1 40 2 0 1 1 0' 'b 1 40 1 0 0 0 0' | POOL_MIN_GB=15 pool_choose)
+  [ "${out%% *}" = b ] || fail "a Mac where the track's lock is held by a live run was picked: $out"
+  out=$(printf '%s\n' 'a 1 40 0 3 1 0 0' 'b 1 40 0 1 0 0 0' | POOL_MIN_GB=15 pool_choose)
+  [ "$out" = "b queue 0 0" ] || fail "with every slot taken the shortest queue was not picked: $out"
+  out=$(printf '%s\n' 'a 0 0 0 0 0 0 0' 'b 1 5 2 0 0 0 0' | POOL_MIN_GB=15 pool_choose)
+  [ -z "$out" ] || fail "a pool of no usable Mac chose $out"
+  sleep 0 & pid=$!; wait "$pid"
+  [ -z "$(LOCK_DEAD=600 lock_note "t1 x/1 1 9999")" ] || fail "a lock whose remote run goes was called dead"
+  [ -z "$(LOCK_DEAD=600 lock_note "t1 x/1 0 30")" ] || fail "a lock with a fresh heartbeat was called dead"
+  case $(LOCK_DEAD=600 lock_note "t1 x/1 0 700") in *"dead lock"*) ;; *) fail "a lock with no run and an old heartbeat is not named dead" ;; esac
+  ( RESV_DIR=$d/resv; mkdir -p "$RESV_DIR"
+    echo "$$ tA" > "$RESV_DIR/m1.$$"; echo "$pid tB" > "$RESV_DIR/m1.$pid"
+    [ "$(resv_count m1 ' [slot 1: free]')" = 1 ] || fail "a live reservation was not counted, or a dead one was"
+    [ ! -e "$RESV_DIR/m1.$pid" ] || fail "a dead runner's reservation was not dropped"
+    [ "$(resv_count m1 ' [slot 1: tA]')" = 0 ] || fail "a reservation whose track holds a slot was still counted" )
+  rc=0; out=$(HOME=$fake BLOOMERY_MAC_REMOTE='a b' "$HERE/tools/mac-remote.sh" HEAD 2>&1) || rc=$?
+  [ "$rc" = 64 ] || fail "a BLOOMERY_MAC_REMOTE of two words ended rc $rc, not 64"
+  rm -f "$fake/.config/bloomery/mac-remote"
+  mkdir -p "$fake/.config/bloomery/mac-remote.d" "$d/sshbin"
+  printf '%s\n' 'pool-leak-sentinel@nowhere.example' > "$fake/.config/bloomery/mac-remote.d/m1"
+  printf '%s\n' 'pool-leak-sentinel@nowhere.example' > "$fake/.config/bloomery/mac-remote.d/m2"
+  printf '#!/bin/sh\nexit 255\n' > "$d/sshbin/ssh"; chmod +x "$d/sshbin/ssh"
+  rc=0; out=$(cd "$HERE" && HOME=$fake PATH=$d/sshbin:$PATH "$HERE/tools/mac-remote.sh" 2>&1) || rc=$?
+  [ "$rc" = 75 ] || fail "a pool of unreachable Macs ended rc $rc, not 75: $out"
+  case $out in *"m1: not reachable"*"m2: not reachable"*) ;; *) fail "the unreachable Macs are not named: $out" ;; esac
+  case $out in *pool-leak-sentinel*|*nowhere.example*) fail "a pool host was printed: $out" ;; esac
+  rc=0; out=$(cd "$HERE" && HOME=$fake BLOOMERY_MAC_REMOTE=m1 PATH=$d/sshbin:$PATH "$HERE/tools/mac-remote.sh" 2>&1) || rc=$?
+  case $out in *"pinned to m1"*) ;; *) fail "the pin is not named: $out" ;; esac
+  case $out in *"picked "*) fail "a pinned run surveyed the pool: $out" ;; esac
+  rm -rf "$fake/.config/bloomery/mac-remote.d"
+
+  # the lock's life, on Linux too (uname and lockf stubbed into the fake remote's PATH): a dead lock is reclaimed and
+  # named, a live one is not; a run whose ssh drops (HUP) ends and removes its own lock; --locks --clean
+  if command -v setsid > /dev/null; then
+    local lr=$d/lockrem lb
+    fake_remote "$lr" nightly-x
+    printf '#!/bin/sh\ncase $1 in -s) echo Darwin ;; *) /usr/bin/env -i PATH=/usr/bin:/bin uname "$@" ;; esac\n' > "$lr/opt/bloomery-bin/uname"
+    printf '#!/bin/bash\nwhile [ "${1:-}" != "" ] && [ "${1#-}" != "$1" ]; do [ "$1" = -t ] && shift; shift; done\nshift\nexec "$@"\n' > "$lr/opt/bloomery-bin/lockf"
+    printf '#!/bin/sh\n[ "$1" != --version ] || { echo "just 9.9.9"; exit 0; }\necho $$ > "$HOME/just.pid"\nsleep 30\n' > "$lr/opt/bloomery-bin/just"
+    chmod +x "$lr/opt/bloomery-bin/uname" "$lr/opt/bloomery-bin/lockf" "$lr/opt/bloomery-bin/just"
+    lb=$lr/$RBASE
+    mkdir -p "$lb/.lock-tdead" "$lb/.lock-tlive"
+    echo "gone/1" > "$lb/.lock-tdead/owner"; echo $(( $(date +%s) - 900 )) > "$lb/.lock-tdead/heartbeat"
+    echo "here/1" > "$lb/.lock-tlive/owner"; date +%s > "$lb/.lock-tlive/heartbeat"
+    out=$(HOME=$lr bash -s -- tdead me/1 nightly-x "just 9.9.9" 0 600 <<< "$PREP" 2>&1) || fail "the preflight did not take a dead lock: $out"
+    case $out in *"RECLAIMED=owner gone/1"*"heartbeat 9"*) ;; *) fail "the reclaim does not name the old owner and heartbeat: $out" ;; esac
+    [ "$(cat "$lb/.lock-tdead/owner")" = me/1 ] || fail "the reclaimed lock is not the new owner's"
+    rc=0; out=$(HOME=$lr bash -s -- tlive me/1 nightly-x "just 9.9.9" 0 600 <<< "$PREP" 2>&1) || rc=$?
+    [ "$rc" = 75 ] || fail "a lock with a fresh heartbeat was taken (rc $rc): $out"
+    [ "$(cat "$lb/.lock-tlive/owner")" = here/1 ] || fail "a live lock was overwritten"
+    mkdir -p "$lb/tdead"
+    HOME=$lr setsid bash -c 'bash -s -- tdead "" nightly-x 2 300 1 < "$0" > /dev/null 2>&1' <(printf '%s\n' "$RUN") &
+    for _ in $(seq 100); do [ -s "$lr/just.pid" ] && break; sleep 0.1; done
+    [ -s "$lr/just.pid" ] || fail "the stubbed run did not start"
+    [ -s "$lb/.lock-tdead/heartbeat" ] || fail "the run wrote no heartbeat"
+    kill -HUP "$(cat "$lb/.lock-tdead/run-pid")" 2> /dev/null || fail "no run pid to hang up"
+    for _ in $(seq 50); do [ -d "$lb/.lock-tdead" ] || break; sleep 0.1; done
+    [ ! -d "$lb/.lock-tdead" ] || fail "an ssh drop (HUP) left the run's lock behind"
+    sleep 0.3
+    ! kill -0 "$(cat "$lr/just.pid")" 2> /dev/null || fail "the run's job outlived the hangup"
+    echo "gone/2" > "$lb/.lock-tlive/owner"; echo $(( $(date +%s) - 900 )) > "$lb/.lock-tlive/heartbeat"
+    mkdir -p "$lb/.lock-tfresh"; date +%s > "$lb/.lock-tfresh/heartbeat"
+    out=$(HOME=$lr bash -s -- 2 1 600 <<< "$LOCKS" 2>&1)
+    case $out in *"lock tlive: dead"*"removed"*) ;; *) fail "--locks --clean did not remove the dead lock: $out" ;; esac
+    [ ! -d "$lb/.lock-tlive" ] && [ -d "$lb/.lock-tfresh" ] || fail "--locks --clean removed the wrong locks: $out"
+  fi
 
   # track names
   [ "$(track_of /a/b/bloomery-x/)" = bloomery-x ] || fail "track_of a path with a trailing slash"
@@ -931,6 +1232,7 @@ nb=0
 while [ $# -gt 0 ]; do
   case $1 in
     --self-test) [ $# = 1 ] || { say "mac-remote.sh: --self-test takes nothing"; exit 64; }; self_test; exit $? ;;
+    --locks) case ${2:-} in '') locks_main 0; exit $? ;; --clean) locks_main 1; exit $? ;; *) say "mac-remote.sh: --locks takes only --clean"; exit 64 ;; esac ;;
     --tree) [ $# -ge 2 ] || { say "mac-remote.sh: --tree needs a directory"; exit 64; }; TREE_ARG=$2; shift 2 ;;
     -*) say "usage: tools/mac-remote.sh [--tree DIR] [BASE] | --self-test ('$1' is not one)"; exit 64 ;;
     *) nb=$((nb + 1)); BASE_ARG_IN=$1; shift ;;
