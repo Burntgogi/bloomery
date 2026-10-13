@@ -80,3 +80,10 @@ The wall is one block of `check-recipes`: the gate-batch self-test (`tools/gate-
 took 474 s of the 494 s `check-recipes` wall at load 1.5 (a timed copy of check-recipes.sh); the next block took 84 s, the
 prelude 20 s, the other blocks run in parallel under those. `just mac-static` on any Mac meets the same block (derived, not
 measured on the lead's Mac), so the second Mac removes the load effect, not the 474 s.
+
+## More Macs (the pool)
+
+Each further Mac is set up by steps 1-4 and gets its own one-line file `~/.config/bloomery/mac-remote.d/<name>`
+(`user@host`, not in this repository) on the machine that runs the tool. `BLOOMERY_MAC_REMOTE=<name> just remote-static BASE`
+runs on that Mac; unset, the tool uses `~/.config/bloomery/mac-remote` as before. Every Mac has its own two slots,
+track locks, clones and ledger, so a worker picks a Mac by name and the slot rules apply per Mac.

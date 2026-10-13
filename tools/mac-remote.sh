@@ -57,7 +57,14 @@
 # lock was still held by a live run after TRACK_WAIT seconds.
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")/.." && pwd)
-CONF=$HOME/.config/bloomery/mac-remote
+# BLOOMERY_MAC_REMOTE=<name> picks another Mac of the pool: ~/.config/bloomery/mac-remote.d/<name>, same one-line form;
+# each Mac keeps its own slots, locks and clones, so the pool is just the choice of file.
+if [ -n "${BLOOMERY_MAC_REMOTE:-}" ]; then
+  [[ $BLOOMERY_MAC_REMOTE =~ ^[A-Za-z0-9._-]+$ ]] || { printf '%s\n' "mac-remote: BLOOMERY_MAC_REMOTE must be one word of [A-Za-z0-9._-]" >&2; exit 64; }
+  CONF=$HOME/.config/bloomery/mac-remote.d/$BLOOMERY_MAC_REMOTE
+else
+  CONF=$HOME/.config/bloomery/mac-remote
+fi
 LEDGER=$HOME/.cache/bloomery/mac-static-ledger.tsv
 SSH_OPTS=(-o LogLevel=ERROR -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=4)
 RBASE=repo/bloomery-mr # the clones' directory, relative to the remote home
