@@ -38,7 +38,7 @@ bloomery-serve --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M --port 8080
 
 ## Status (0.3.2)
 
-0.3.2 is main `3a21bf63` plus the #46 fix, plus the version bump at `9bd7d577`. With `BLOOMERY_RESIDENCY` unset, the default Qwen3.8 load is no longer refused on 64 GB hosts ([#46](https://github.com/midagedev/bloomery/issues/46), reported by @juliankang4). The hosts measured for this release are not a 64 GB shape, so that host was not re-checked. Release validation is the lunchtime freeze on main `f382b474` (Train A 147/147 fixture, Train B 163/163 fixture, deferred real 66/66) plus a narrowed batch for the #46 fix. There is no full real-tier re-run. `gate-gpu-qwen38-serve`'s real tier is 70/72 on that baseline and on this commit, the same two preexisting paged failures.
+0.3.2 adds MiniCPM-V 4.7 35B-A3B (text only; images in 0.3.3), tested as `Q4_K_M`. It is main `3a21bf63` plus the #46 fix, plus the version bump at `9bd7d577`. With `BLOOMERY_RESIDENCY` unset, the default Qwen3.8 load is no longer refused on 64 GB hosts ([#46](https://github.com/midagedev/bloomery/issues/46), reported by @juliankang4). The hosts measured for this release are not a 64 GB shape, so that host was not re-checked. Release validation is the lunchtime freeze on main `f382b474` (Train A 147/147 fixture, Train B 163/163 fixture, deferred real 66/66) plus a narrowed batch for the #46 fix. There is no full real-tier re-run. `gate-gpu-qwen38-serve`'s real tier is 70/72 on that baseline and on this commit, the same two preexisting paged failures.
 
 The release pass on this tarball ran four rows (18:16:42–18:21:21 KST, every row rc 0, no red line). The other rows of the wider pass were not re-run. They reuse that lunch validation.
 
@@ -104,12 +104,12 @@ docker run --gpus all -p 8080:8080 -v bloomery-cache:/root/.cache/bloomery \
   ghcr.io/midagedev/bloomery --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M
 
 # or the plain tarball
-tar -xzf bloomery-0.3.1-linux-x86_64-cuda-sm86.tar.gz && cd bloomery-0.3.1-linux-x86_64-cuda-sm86
+tar -xzf bloomery-0.3.2-linux-x86_64-cuda-sm86.tar.gz && cd bloomery-0.3.2-linux-x86_64-cuda-sm86
 bin/bloomery-serve --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M --port 8080
 ```
 
 The tarballs are on the [releases page](https://github.com/midagedev/bloomery/releases)
-([0.3.1](https://github.com/midagedev/bloomery/releases/tag/v0.3.1)). From source: [`docs/BUILD.md`](docs/BUILD.md).
+([0.3.2](https://github.com/midagedev/bloomery/releases/tag/v0.3.2)). From source: [`docs/BUILD.md`](docs/BUILD.md).
 
 ## Use
 
@@ -120,7 +120,7 @@ One binary, six seats; the file's architecture picks the seat, and `--place` can
 | `ds41` | [DeepSeek-V4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash) | `bloomery-serve --hf vcruz305/DeepSeek-V4.1-Flash-GGUF:Q3_K_M` |
 | `glm` | [GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) | `bloomery-serve --hf unsloth/GLM-5.3-Flash-GGUF:UD-Q4_K_XL` |
 | `qwen38` | [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) | `bloomery-serve --hf unsloth/Qwen3.8-Flash-Next-GGUF:UD-Q4_K_XL` |
-| `qwen3` | [Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) (images with `--mmproj`), [Qwen3-30B-A3B](https://huggingface.co/Qwen/Qwen3-30B-A3B-Instruct-2507) | `bloomery-serve --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M` |
+| `qwen3` | [Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) (images with `--mmproj`), [Qwen3-30B-A3B](https://huggingface.co/Qwen/Qwen3-30B-A3B-Instruct-2507), [MiniCPM-V 4.7 35B-A3B](https://huggingface.co/openbmb/MiniCPM-V-4.7-35B-A3B-gguf) (text; images in 0.3.3, new in 0.3.2) | `bloomery-serve --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M` |
 | `mimo2` | [MiMo-V2.6-Flash](https://huggingface.co/ggml-org/MiMo-V2.6-Flash-MOPD-GGUF) | `bloomery-serve --hf ggml-org/MiMo-V2.6-Flash-MOPD-GGUF:MXFP4` |
 | `decide` | [Clef-Flash](https://huggingface.co/Cloudflare/clef-flash) and [lev](https://huggingface.co/ggml-org/lev-GGUF) (decision models) | `bloomery-serve --hf bartowski/Cloudflare_clef-flash-GGUF:Q5_K_M` |
 
