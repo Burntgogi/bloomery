@@ -573,7 +573,10 @@ SHIM
   git -C "$main" worktree add -q -b q "$t/bloomery-q" "$c3"
   mkdir -p "$t/bloomery-p/target" "$t/bloomery-q/target"
   mkdir -p "$t/seedBUSY/target/mac-static"
-  sleep 60 & pid=$!
+  # the busy seed's "live" pid must outlive every pick below, however slow the host: a `sleep 60` died before the picks on
+  # the second Mac (the wt block took 711 s under check-recipes' parallel parts, 2026-10-13), so BUSY counted as a dead run
+  # and won every pick. It lives until this test kills it (below, or the EXIT trap's `jobs -p`).
+  sleep 3600 & pid=$!
   printf 'fmt-check %s\ncargo-lane %s\n' "$pid" "$pid" > "$t/seedBUSY/target/mac-static/pids"
   : > "$t/seedBUSY/target/mac-static/fmt-check.log"
   write_rec "$t/seedB" "$c1" 100        # B: an older line, c1 (3 behind) ...
@@ -674,7 +677,7 @@ SHIM
   }
   retire_fixture rt
   rm -f "$STUB_DISK_LOG"
-  sleep 60 & pid=$!
+  sleep 3600 & pid=$! # killed below; see the busy seed above for why not a short sleep
   d=$t/bloomery-rt/target/mac-static
   mkdir -p "$d"
   printf 'fmt-check %s\ncargo-lane %s\n' "$pid" "$pid" > "$d/pids"
