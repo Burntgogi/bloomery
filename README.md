@@ -36,7 +36,20 @@ brew install midagedev/tap/bloomery        # Linux x86-64, NVIDIA sm_86+
 bloomery-serve --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M --port 8080
 ```
 
-## Status (0.3.1)
+## Status (0.3.2)
+
+0.3.2 is main `3a21bf63` plus the #46 fix, plus the version bump at `9bd7d577`. With `BLOOMERY_RESIDENCY` unset, the default Qwen3.8 load is no longer refused on 64 GB hosts ([#46](https://github.com/midagedev/bloomery/issues/46), reported by @juliankang4). The hosts measured for this release are not a 64 GB shape, so that host was not re-checked. Release validation is the lunchtime freeze on main `f382b474` (Train A 147/147 fixture, Train B 163/163 fixture, deferred real 66/66) plus a narrowed batch for the #46 fix. There is no full real-tier re-run. `gate-gpu-qwen38-serve`'s real tier is 70/72 on that baseline and on this commit, the same two preexisting paged failures.
+
+The release pass on this tarball ran four rows (18:16:42–18:21:21 KST, every row rc 0, no red line). The other rows of the wider pass were not re-run. They reuse that lunch validation.
+
+| Model, place | Long prompt: tokens, prefill tok/s, first token | Decode after it | Short prompt decode | Off cells, red |
+|---|---|---|---|---|
+| Qwen3.6-35B-A3B UD-Q4_K_XL, DSpark off, `a` | 5,673, 7,223, 0.79 s | 143.6 tok/s | 148.0 tok/s | — |
+| Qwen3.8 UD-Q4_K_XL, `a` | 5,673, 1,703, 3.36 s | 78.4 tok/s | 91.0 tok/s | — |
+| Qwen3.8 UD-Q4_K_XL, `bp` | 5,673, 1,706, 3.35 s | 85.8 tok/s | 101.2 tok/s | — |
+| MiniCPM-V 4.7 35B-A3B Q4_K_M text, unset (picks `a`) | 5,673, 7,664, 0.75 s | 193.4 tok/s | 201.9 tok/s | — |
+
+Greedy, thinking off, `--ctx-size 16384`, serving defaults, one load. The long prompt is 5,673 tokens. MiniCPM-V 4.7 images are not in this release.
 
 | Area | State |
 |---|---|
@@ -57,8 +70,10 @@ bloomery-serve --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M --port 8080
 | MiMo-V2.6-Flash | Its hot routed experts sit on the card, the rest on the host. After a 5,620-token prompt it decodes at 34.0 tok/s (0.2.10: 19.1), first token at 52.9 s (RTX A6000, `--place` unset, 0.3.0's release check) |
 | Image input | V4.1, Qwen3.6, GLM-5.3 and the Clef decide seat, with `--mmproj <file>` (llama-server's flag). Under `--hf` with no `--mmproj`, a seat takes the projector in the model's repo when it costs the text model no card experts or context; otherwise it prints the projector's bytes and serves text (`--no-mmproj` skips it). Images go in as base64 (`data:` URLs), not fetched URLs. A request with an image to a seat started without an encoder is refused by name |
 
-### Known issues and limits (0.3.1)
+### Known issues and limits (0.3.2)
 
+- **On Qwen3.8 loads that page experts through the NVMe tier, `gate-gpu-qwen38-serve`'s real tier is 70/72.** The two failures are preexisting and the same on `f382b474`. Setting `BLOOMERY_DRAFT=mtp` is refused by name at start, as it has been since 0.3.1. A default load keeps the draft off and is unaffected. On a small card whose draft auto-yields, the paged log prints `asked_draft=off` instead of `on`. That print is cosmetic. Both are fixed in 0.3.3.
+- **`gate-gpu-qwen4exp-mtp` (pg) is a known gate-side red, and its fix does not ship in 0.3.2.** On an RTX A6000 the drafted plan's stage card holds 2,843,738,112 B less room than the plain plan at the same budget (15:52 KST, rc 1). This is the gate's clause, not a serving-default load refusal.
 - **A paged load's default context counts the NVMe arena it gives up.** The context grows while the misses a step
   (the experts it moves to NVMe, plus the arena the per-slot checkpoint reserve takes) stay within 1 % of the base's,
   and the `ctx` line prints `arena=` and `base_arena=`. On a 12 GB card the one-slot default is 12,288 positions
