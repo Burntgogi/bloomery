@@ -145,8 +145,10 @@ def crap_of(crapper, tree, files, work):
     for i, f in enumerate(x for x in files if os.path.isfile(os.path.join(tree, x))):
         w = os.path.join(work, str(i))
         os.makedirs(w, exist_ok=True)
-        rc, _, err = run([crapper, "--root", w, "-s", tree, "--no-coverage", f], w)
+        rc, so, err = run([crapper, "--root", w, "-s", tree, "--no-coverage", f], w)
         edn = os.path.join(w, ".metrics", "crap.edn")
+        if rc == 0 and "No source files to analyze" in so + err:
+            continue  # crapper leaves test files (tests/, *_test.rs) out of its analysis by design
         if rc != 0 or not os.path.isfile(edn):
             return None, f"crapper exited {rc} on {f}: {err.strip()[-300:]}"
         for (ns, name), cc in parse_crap(open(edn, encoding="utf-8").read()).items():
@@ -241,6 +243,12 @@ def self_test():
         open(ch, "w").write("crates/p/src/a.rs\n")
         out = report(d, pr, ch, dp, "/nonexistent/dryer", "/nonexistent/crapper")
         assert "dryer did not run" in out and "crapper did not run" in out, out
+        # A file crapper does not analyze (a test file) is skipped, not a failed run.
+        fake = os.path.join(d, "crapper-skips")
+        open(fake, "w").write("#!/bin/sh\necho 'No source files to analyze.'\n")
+        os.chmod(fake, 0o755)
+        out = report(d, pr, ch, dp, "/nonexistent/dryer", fake)
+        assert "crapper did not run" not in out and "No changed function" in out, out
     print("diagnostics.py self-test: ok")
 
 
