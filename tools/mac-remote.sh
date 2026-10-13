@@ -787,7 +787,17 @@ STUB
   mkdir -p "$rh/repo/bloomery-mr/.lock-tree-one"
   printf '%s\n' "$me/$$" > "$rh/repo/bloomery-mr/.lock-tree-one/owner"
   run > "$d/wait-track.out" & pid=$!
-  sleep 2
+  # the lock goes once the run has said it waits, not after a fixed sleep: a `sleep 2` lost that race on a loaded Mac under
+  # check-recipes' parallel parts (2026-10-13), and the run then never printed its wait line. Bounded at 60 s, named.
+  i=0
+  until grep -q "locked on the remote by $me/$$.*waiting" "$d/wait-track.out" 2> /dev/null; do
+    i=$((i + 1))
+    if [ "$i" -gt 600 ] || ! kill -0 "$pid" 2> /dev/null; then
+      fail "the track-lock wait was not announced within 60 s, or the run ended first: $(cat "$d/wait-track.out")"
+      break
+    fi
+    sleep 0.1
+  done
   rm -rf "$rh/repo/bloomery-mr/.lock-tree-one"
   rc=0; wait "$pid" || rc=$?
   [ "$rc" = 0 ] || fail "a run that waited for its track's lock ended rc $rc: $(cat "$d/wait-track.out")"
