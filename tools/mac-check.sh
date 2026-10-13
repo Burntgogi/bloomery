@@ -54,6 +54,12 @@
 # one target directory reuse each other's rmeta files. An inherited CARGO_TARGET_DIR is overridden,
 # with a line that names it.
 #
+# Seed record. A `lint` that exits 0 (cargo green and the warning count within the ratchet) appends one line to
+# $HOME/.cache/bloomery/seed.tsv (WT_SEED_TSV moves it): `<tree path><TAB><HEAD sha at the start of the run><TAB><unix
+# time><TAB>lint`. tools/wt.sh reads it to pick the warm tree whose target/ tools/seed-target.sh copies into a new worktree.
+# Only lint writes it (the target a seed copies is lint's), and lint has one lane, the x86_64 cross check, so the fourth
+# column is the mode. Best effort: a write that fails costs one stderr line and never changes the rc.
+#
 # Disk floor. Before its first cargo command, every mode that writes target/ (check, lint, test,
 # combos; fmt and fmt-check write nothing there and skip this) reads the free bytes of the volume
 # that holds the tree's target/ with df -Pk: below MIN_FREE_GIB the mode stops with exit 69 and one
@@ -400,9 +406,21 @@ verdict() {
   fi
 }
 
+# seed_record ROOT SHA: the header's «Seed record». Never fails its caller.
+seed_record() {
+  local f=${WT_SEED_TSV:-$HOME/.cache/bloomery/seed.tsv}
+  if [ -z "$2" ]; then
+    say "mac-check: seed record: no HEAD sha for $1 (not a git tree?), nothing written"
+    return 0
+  fi
+  { mkdir -p "$(dirname "$f")" && printf '%s\t%s\t%s\tlint\n' "$1" "$2" "$(date +%s)" >> "$f"; } 2> /dev/null ||
+    say "mac-check: seed record: could not append to $f (best effort: the lint's rc is unchanged)"
+  return 0
+}
+
 self_test() {
   # the cases are written for the default target and an unset commit word, whatever the caller exported
-  local fails=0 out t m cmd fake tc ch host a b tab why drc TARGET=$BOX_TARGET
+  local fails=0 out t m cmd fake tc ch host a b tab why drc sc r head TARGET=$BOX_TARGET
   unset BLOOMERY_CHECK_TARGET BLOOMERY_GIT_COMMIT
   fail() { say "mac-check self-test FAIL: $*"; fails=$((fails + 1)); }
 
@@ -698,6 +716,72 @@ EOF
   out=$(probe check) && fail "another RUSTC passed" || {
     case $out in *"RUSTC is /opt/other/rustc"*) ;; *) fail "another RUSTC is not named: $out" ;; esac
   }
+
+  # the seed record (header): the function on any host; on macOS also the whole lint of a scratch copy of this tree under the
+  # fake HOME, with a cargo that prints FAKE_WARN warnings and ends FAKE_CARGO_RC. A green lint writes one line, a red one
+  # (cargo red, or the warning count over the ratchet) none, a write that fails changes no rc, and no other mode writes.
+  t=$(mktemp -d)
+  out=$(WT_SEED_TSV=$t/a/seed.tsv seed_record /some/tree abc123 2>&1) || fail "seed_record failed its caller"
+  [ -z "$out" ] || fail "seed_record prints on success: $out"
+  [ "$(cut -f1,2,4 "$t/a/seed.tsv")" = "$(printf '/some/tree\tabc123\tlint')" ] || fail "the seed line is not <path>, <sha>, <time>, lint: $(cat "$t/a/seed.tsv")"
+  case $(cut -f3 "$t/a/seed.tsv") in '' | *[!0-9]*) fail "the seed line's time is not a unix time: $(cat "$t/a/seed.tsv")" ;; esac
+  out=$(WT_SEED_TSV=$t/a/seed.tsv seed_record /some/tree "" 2>&1) || fail "seed_record with no sha failed its caller"
+  case $out in *"no HEAD sha"*) ;; *) fail "seed_record with no sha does not say so: $out" ;; esac
+  [ "$(wc -l < "$t/a/seed.tsv" | tr -d ' ')" = 1 ] || fail "seed_record with no sha wrote a line"
+  out=$(WT_SEED_TSV=/dev/null/x/seed.tsv seed_record /some/tree abc123 2>&1) || fail "seed_record with an unwritable file failed its caller"
+  case $out in *"seed record: could not append to /dev/null/x/seed.tsv"*) ;; *) fail "an unwritable seed file is not named: $out" ;; esac
+  if [ "$(uname -s)" = Darwin ] && command -v just > /dev/null 2>&1; then
+    write_env
+    cat > "$tc/cargo" << 'CARGO'
+#!/bin/sh
+i=0
+while [ "$i" -lt "${FAKE_WARN:-0}" ]; do echo "warning: fake $i"; i=$((i + 1)); done
+exit "${FAKE_CARGO_RC:-0}"
+CARGO
+    chmod +x "$tc/cargo"
+    sc=$t/tree
+    mkdir -p "$sc/tools"
+    cp "$HERE/tools/mac-check.sh" "$HERE/tools/recipes.py" "$HERE/tools/lint-ratchet.txt" "$sc/tools/"
+    cp "$HERE/justfile" "$HERE/rust-toolchain.toml" "$HERE/Cargo.lock" "$sc/"
+    git -C "$sc" init -q
+    git -C "$sc" add -A
+    git -C "$sc" -c user.name=t -c user.email=t@t -c commit.gpgsign=false commit -q -m seed
+    head=$(git -C "$sc" rev-parse HEAD)
+    r=$(ratchet "$HERE/tools/lint-ratchet.txt")
+    lint_run() { # SCRIPT MODE ENV… -> rc; the run's output in $sc/out
+      local s=$1 m=$2
+      shift 2
+      (cd "$sc" && env HOME="$fake" PATH="$fake/brew/bin:$(dirname "$(command -v just)"):/usr/bin:/bin:/sbin" WT_SEED_TSV="$sc/seed.tsv" "$@" bash "$s" "$m" > "$sc/out" 2>&1)
+    }
+    seed_lines() { if [ -f "$sc/seed.tsv" ]; then wc -l < "$sc/seed.tsv" | tr -d ' '; else echo 0; fi; }
+    drc=0; lint_run "$sc/tools/mac-check.sh" lint FAKE_WARN=0 || drc=$?
+    [ "$drc" = 0 ] || fail "a green fake lint ended rc $drc: $(tail -3 "$sc/out")"
+    [ "$(seed_lines)" = 1 ] || fail "a green lint wrote $(seed_lines) seed lines, not 1"
+    [ "$(cut -f1,2,4 "$sc/seed.tsv")" = "$(printf '%s\t%s\tlint' "$sc" "$head")" ] || fail "the green lint's seed line is not <tree>, <HEAD>, lint: $(cat "$sc/seed.tsv")"
+    drc=0; lint_run "$sc/tools/mac-check.sh" lint FAKE_WARN=0 || drc=$?
+    [ "$(seed_lines)" = 2 ] || fail "a second green lint did not append (lines: $(seed_lines))"
+    drc=0; lint_run "$sc/tools/mac-check.sh" lint FAKE_WARN=0 FAKE_CARGO_RC=101 || drc=$?
+    [ "$drc" = 101 ] || fail "a red cargo ended the lint rc $drc, not 101"
+    [ "$(seed_lines)" = 2 ] || fail "a lint with a red cargo wrote a seed line"
+    drc=0; lint_run "$sc/tools/mac-check.sh" lint FAKE_WARN=$((r + 1)) || drc=$?
+    [ "$drc" = 1 ] || fail "a lint over the ratchet ended rc $drc, not 1: $(tail -3 "$sc/out")"
+    [ "$(seed_lines)" = 2 ] || fail "a lint over the ratchet wrote a seed line"
+    drc=0; lint_run "$sc/tools/mac-check.sh" check FAKE_WARN=0 || drc=$?
+    [ "$drc" = 0 ] && [ "$(seed_lines)" = 2 ] || fail "a green check (rc $drc) wrote a seed line (lines: $(seed_lines))"
+    drc=0; lint_run "$sc/tools/mac-check.sh" lint FAKE_WARN=0 WT_SEED_TSV=/dev/null/x/seed.tsv || drc=$?
+    [ "$drc" = 0 ] || fail "a green lint whose seed file cannot be written ended rc $drc, not 0"
+    case $(cat "$sc/out") in *"seed record: could not append to /dev/null/x/seed.tsv"*) ;; *) fail "the unwritable seed file of a green lint is not named: $(tail -3 "$sc/out")" ;; esac
+    drc=0; lint_run "$sc/tools/mac-check.sh" lint FAKE_WARN=0 WT_SEED_TSV= || drc=$?
+    [ -f "$fake/.cache/bloomery/seed.tsv" ] || fail "with no override the seed line did not go to \$HOME/.cache/bloomery/seed.tsv"
+    # FAIL-first: a lint that records before its verdict writes on the red one
+    sed 's|^\[ "\$vrc" != 0 \] \|\| seed_record|seed_record|' "$sc/tools/mac-check.sh" > "$sc/tools/mac-check-mut.sh"
+    cmp -s "$sc/tools/mac-check.sh" "$sc/tools/mac-check-mut.sh" && fail "the seed-record mutant did not apply"
+    drc=0; lint_run "$sc/tools/mac-check-mut.sh" lint FAKE_WARN=$((r + 1)) || drc=$?
+    [ "$(seed_lines)" = 3 ] || fail "the mutant that records before the verdict did not write on a red lint: the red-lint case proves nothing"
+  else
+    echo "mac-check: self-test: the seed-record lint cases need macOS and just (skipped on $(uname -s))"
+  fi
+  rm -rf "$t"
   rm -rf "$fake"
 
   if [ "$fails" != 0 ]; then
@@ -835,6 +919,7 @@ setup "$MODE" "$TC" "$HERE" || exit $?
 mkdir -p "$HERE/target"
 LOG=$HERE/target/mac-check-$MODE.log
 LOCK0=$(md5 -q "$HERE/Cargo.lock")
+SEED_SHA=$(git -C "$HERE" rev-parse HEAD 2> /dev/null || true) # the tree the lint reads, for the seed record
 ORIGIN="the $RECIPE recipe's box command"
 [ "$MODE" != fmt ] || ORIGIN="$ORIGIN without -- --check"
 HEAD="mac-check: ${ARGV[*]}  ($ORIGIN; $("$TC/rustc" --version 2> /dev/null || echo "$TC/rustc"), $("$TC/rustfmt" --version 2> /dev/null || echo rustfmt); CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-none})"
@@ -859,4 +944,5 @@ fi
 vrc=0
 v=$(verdict "$COUNT" "$RATCHET") || vrc=$?
 echo "$v; $(built)"
+[ "$vrc" != 0 ] || seed_record "$HERE" "$SEED_SHA"
 exit "$vrc"

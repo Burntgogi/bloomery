@@ -407,6 +407,18 @@ blk_seedtarget() {
   fi
   echo "${stt##*$'\n'}"
 }
+# wt.sh adds a worktree and seeds it from the nearest warm tree, and retires one through mac-disk: the refusals of `new` (an
+# existing path, an existing branch, an add that fails or creates nothing, each with the repo unchanged and the next step
+# not run, and a mutant of each guard that does run it), the seed choice, the read-only seed, and the in-flight rule of
+# `retire`, on scratch git repos with stub seed-target and mac-disk, no cargo, no box.
+blk_wt() {
+  if ! wts=$(bash "$(dirname "$0")/wt.sh" --self-test 2>&1); then
+    echo "$wts" >&2
+    echo "check-recipes: the wt self-test failed" >&2
+    return 1
+  fi
+  echo "${wts##*$'\n'}"
+}
 # carry.sh is the release's carry check (tools/release/carry.tsv against the commit released): its carried, lacking,
 # pending, unknown-hash and malformed-row verdicts in a temp git repo, no box. The release-build recipe runs it before
 # its box command: a recipe that stops calling it ends the check silently, so the call is held here.
@@ -688,7 +700,7 @@ PY
 
 BLOCKS=(recipescheck selftest smoke cardorder cardtests lease boxtracks loadgroups lcppfit coldblocks leverarms slotsarm lcppwarm q38srv
   maccheck gatebatch gpugate stackwatch ptxscan ptxspill scanargs narrowscan ldsscan mutantrun macstatic macremote boxsh seedtarget carry pytools boxqcodes fixturevariants
-  refsetpublish orphan archowner)
+  refsetpublish orphan archowner wt)
 for b in "${BLOCKS[@]}"; do
   ( set +e; t0=$SECONDS; blk_$b > "$B/$b.out" 2>&1; brc=$?; echo $((SECONDS - t0)) > "$B/$b.t"; echo $brc > "$B/$b.rc" ) & # set +e: a red block writes its own rc
 done
