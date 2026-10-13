@@ -94,7 +94,12 @@ change-class table in `AGENTS.md`, the three layers of a fix, and Uncle Bob's dr
   searched (its bins share a boilerplate `main` by design, and it alone costs minutes); the searched crates stay under
   300,000 lines because dryer compares every pair. Measured on the Mac: four crates for PR #89, 96 s.
 - crapper, complexity only: functions whose cyclomatic complexity rose by 5 or more, or grew above 15. Coverage would
-  need a build, which this job must not run.
+  need a build, which this job must not run. A `#[target_feature]` or `#[kernel]` body is complex by design
+  (`AGENTS.md` forbids splitting it), so the reviewer never suggests a split there.
+
+Both are adapted to this repository, not taken as they are, and both must earn their place: the reviewer records
+each finding a tool aimed it at (`aims.json`), and the weekly learner's stats line counts how many of those a later
+commit acted on and how many merged ignored. A tool whose aims keep being ignored gets a higher bar or leaves.
 mutator (mutation testing) is not used: it runs the tests, which means executing the PR. The reviewer does the
 mutation check in words for each new or changed test instead.
 

@@ -34,7 +34,7 @@ The workflow gives you these paths in the prompt's last section:
 ## Diagnostics
 
 Two of Uncle Bob's tools run on the PR tree before you start, in a job that only reads the source:
-- **dryer**: pairs of Rust functions whose normalized structure is close (score 0.82 to 1.0), where at least one side
+- **dryer**: pairs of Rust functions whose normalized structure is close (score 0.85 to 1.0), where at least one side
   is in a changed file. A pair is a duplicate candidate, not a verdict: read both sides, and if they hold the same
   knowledge, it is a "one owner per fact" finding with both file:line links. A pair that only shares a shape (two
   different loops over different data) is not.
@@ -43,7 +43,8 @@ Two of Uncle Bob's tools run on the PR tree before you start, in a job that only
   first in the adversarial procedure's "Find" step. Then say what kind of growth it is: a branch added to an existing
   function (ask whether one owner should decide instead), a new function that is complex on its
   own (sketch the split), or even growth such as another match arm (one line, harmless). Complexity is an aiming
-  signal, never a finding by itself.
+  signal, never a finding by itself. A `#[target_feature]` or `#[kernel]` body is complex by design: `AGENTS.md`
+  forbids splitting it into helpers, so never suggest a split there; read it for correctness only.
 A tool's silence is not evidence: dryer does not see a reimplementation with a different shape, so keep the Grep
 check. If `diagnostics.md` says a tool did not run, write that in "Notes" in one line.
 
@@ -233,6 +234,11 @@ Write these files to `OUT` with the Write tool, and nothing else anywhere:
    raised because of the lesson (path and line as the finding links them), and `{"id": "L<n>", "effect":
    "suppressed", "what": "<one line>"}` for a ⚠ you left out because of it. The learner keeps a lesson alive only by
    these records, so write one for each use and none for a lesson you merely read.
+
+6. `aims.json`, only when a finding came from a dryer pair or a crapper function in `CTX/diagnostics.md`: a JSON array
+   of `{"tool": "dryer" | "crapper", "path": "<path>", "line": <line>}`, path and line as the finding links them. The
+   learner counts how often each tool's aim led to a fix, to keep or drop the tool. A finding you would have raised
+   without the tool is not an aim.
 
 Do not post anything to GitHub yourself. A later step posts these files.
 

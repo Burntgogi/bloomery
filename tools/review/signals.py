@@ -17,9 +17,12 @@ machine can see; no person has to react to anything.
 - removals and lesson use: the `review` artifact of each review's run (the footer's `run=`) holds the validator's
   removed.json (findings it removed, with the reason) and the reviewer's lessons.json (ledger lessons that raised or
   suppressed a finding). A raised finding takes its outcome from the line it cites.
+- tool aims: the same artifact's aims.json names the findings dryer or crapper pointed the reviewer at; each takes
+  the outcome of the line it cites, so the stats line says whether each tool earns its place in this repository.
 
 Writes OUT/signals.md (the learner's index, with reviews/<pr>.md), OUT/lesson-stats.json ({"L3": {"raised",
-"acted", "suppressed"}} for the window), OUT/stats.md (one line for the ledger) and OUT/has_signals.txt (`true` when
+"acted", "suppressed"}} for the window), OUT/stats.md (one line for the ledger, with each tool's
+acted and ignored counts) and OUT/has_signals.txt (`true` when
 there is an escape, an ignored finding or a removal, so the workflow can skip the model run otherwise).
 `--all-merged 1` treats every merged pull request as reviewed, to try the escape search on history.
 """
@@ -42,6 +45,7 @@ MAX_FIXES = 120
 MAX_ESCAPES = 10
 MAX_LISTED = 40
 LINE_SLACK = 2
+TOOLS = ("dryer", "crapper")
 HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+\d+(?:,\d+)? @@")
 FOOT_RE = re.compile(rf"<!-- {MARKER} head_sha=(\w+) verdict=(\w+) must_fix=(\d+) warn=(\d+)")
 RUN_RE = re.compile(rf"<!-- {MARKER} head_sha=[^>]* run=(\d+)")
@@ -136,6 +140,14 @@ def line_changed(compare_files, path, line):
     return False
 
 
+def outcome_of(outcomes, pr, rec):
+    """The outcome of the finding a lessons.json or aims.json record cites by path and line, or None."""
+    for o in outcomes:
+        if o["pr"] == pr and o["path"] == rec.get("path") and o["line"] == rec.get("line"):
+            return o["outcome"]
+    return None
+
+
 def pages(call, url, token):
     got, page = [], 1
     while True:
@@ -171,7 +183,7 @@ def collect(repo, d, days, lookback, ref, token, out, call=api, download=gh_down
     prs = pages(call, f"https://api.github.com/search/issues?q={q}", token)
     for sub in ("reviews", "escapes"):
         os.makedirs(os.path.join(out, sub), exist_ok=True)
-    reviewed, origin, stats, outcomes, removals, lessons = {}, {}, [], [], [], {}
+    reviewed, origin, stats, outcomes, removals, lessons, aims = {}, {}, [], [], [], {}, {}
     for p in sorted(prs, key=lambda p: p["number"]):
         n = p["number"]
         revs = [r for r in pages(call, f"https://api.github.com/repos/{repo}/pulls/{n}/reviews", token)
@@ -242,9 +254,14 @@ def collect(repo, d, days, lookback, ref, token, out, call=api, download=gh_down
                                 s["suppressed"] += 1
                             elif x.get("effect") == "raised":
                                 s["raised"] += 1
-                                s["acted"] += any(o["pr"] == n and o["path"] == x.get("path") and
-                                                  o["line"] == x.get("line") and o["outcome"] == "acted"
-                                                  for o in outcomes)
+                                s["acted"] += outcome_of(outcomes, n, x) == "acted"
+                        for x in read_json_list(os.path.join(art, "aims.json"))[:40]:
+                            if isinstance(x, dict) and x.get("tool") in TOOLS:
+                                a = aims.setdefault(x["tool"], {"aimed": 0, "acted": 0, "ignored": 0})
+                                a["aimed"] += 1
+                                o = outcome_of(outcomes, n, x)
+                                if o:
+                                    a[o] += 1
     escapes = []
     log = git(d, "log", f"--since={since.isoformat()}", "--format=%H%x09%s", ref).splitlines()
     fixes = [line.split("\t", 1) for line in log if FIX_RE.search(line.split("\t", 1)[-1])][:MAX_FIXES]
@@ -263,18 +280,20 @@ def collect(repo, d, days, lookback, ref, token, out, call=api, download=gh_down
         text = git(d, "show", "--format=commit %H%nSubject: %s%n", sha).splitlines()
         with open(os.path.join(out, "escapes", f"{sha}.patch"), "w", encoding="utf-8") as f:
             f.write("\n".join(text[:600]) + ("\n(cut at 600 lines)\n" if len(text) > 600 else "\n"))
-    write(out, repo, since, now, days, reviewed, escapes, outcomes, removals, lessons, stats)
+    write(out, repo, since, now, days, reviewed, escapes, outcomes, removals, lessons, aims, stats)
     return len(escapes), len(outcomes), len(removals)
 
 
-def write(out, repo, since, now, days, reviewed, escapes, outcomes, removals, lessons, stats):
+def write(out, repo, since, now, days, reviewed, escapes, outcomes, removals, lessons, aims, stats):
     v = {k: sum(1 for s in stats if s[0] == k) for k in ("CLEAN", "MUST_FIX")}
     acted = [o for o in outcomes if o["outcome"] == "acted"]
     ignored = [o for o in outcomes if o["outcome"] == "ignored"]
     line = (f"{now.date()} · last {days} d · reviews {len(stats)} (CLEAN {v['CLEAN']}, MUST_FIX {v['MUST_FIX']}) · "
             f"must-fix {sum(s[1] for s in stats)}, ⚠ {sum(s[2] for s in stats)} · "
             f"review cost ${sum(s[3] for s in stats):.2f} · findings acted {len(acted)}, ignored {len(ignored)} · "
-            f"validator removed {len(removals)} · escapes {len(escapes)}")
+            f"validator removed {len(removals)} · escapes {len(escapes)}"
+            + "".join(f" · {t} aimed {a['aimed']} (acted {a['acted']}, ignored {a['ignored']})"
+                      for t, a in sorted(aims.items())))
     open(os.path.join(out, "stats.md"), "w", encoding="utf-8").write(line + "\n")
     json.dump(lessons, open(os.path.join(out, "lesson-stats.json"), "w"), indent=1, sort_keys=True)
     open(os.path.join(out, "has_signals.txt"), "w").write("true\n" if escapes or ignored or removals else "false\n")
@@ -366,6 +385,9 @@ def self_test():
             os.makedirs(os.path.join(dest, "out"))
             json.dump([{"what": "a guess", "path": "y.rs", "line": 2, "reason": "speculation", "lesson": None}],
                       open(os.path.join(dest, "out", "removed.json"), "w"))
+            json.dump([{"tool": "crapper", "path": "t.sh", "line": 5}, {"tool": "dryer", "path": "src/l.rs", "line": 9},
+                       {"tool": "dryer", "path": "q.rs", "line": 1}, {"tool": "lint", "path": "t.sh", "line": 5}],
+                      open(os.path.join(dest, "out", "aims.json"), "w"))
             json.dump([{"id": "L3", "effect": "raised", "path": "t.sh", "line": 5, "what": "rc"},
                        {"id": "L4", "effect": "suppressed", "what": "style"}, {"id": "bad"}],
                       open(os.path.join(dest, "out", "lessons.json"), "w"))
@@ -379,6 +401,7 @@ def self_test():
             "L3": {"raised": 1, "acted": 1, "suppressed": 0}, "L4": {"raised": 0, "acted": 0, "suppressed": 1}}
         stats = open(os.path.join(out, "stats.md")).read()
         assert "reviews 1 (CLEAN 0, MUST_FIX 1)" in stats and "acted 1, ignored 2" in stats and "$0.75" in stats, stats
+        assert "crapper aimed 1 (acted 1, ignored 0) · dryer aimed 2 (acted 0, ignored 1)" in stats, stats
         assert open(os.path.join(out, "has_signals.txt")).read() == "true\n"
         # A squash commit stands alone; a merge commit brings its second parent's side.
         assert pr_commits(repo, fix_sha, {"something else"}) == [fix_sha]

@@ -285,9 +285,10 @@ jobs:
             out/base_sha.txt
             out/removed.json
             out/lessons.json
+            out/aims.json
             ctx/diff.patch
             ctx/pr.json
-          retention-days: 90   # the learner reads removed.json and lessons.json back (tools/review/signals.py)
+          retention-days: 90   # the learner reads removed.json, lessons.json and aims.json back (tools/review/signals.py)
 
   post:
     needs: [gate, review]

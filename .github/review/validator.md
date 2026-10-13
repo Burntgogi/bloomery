@@ -49,5 +49,5 @@ Write `OUT/removed.json`, a JSON array with one item per finding you removed or 
 learner reads it to find what the reviewer gets wrong. When you remove a ⚠ because a `noise` lesson in `CTX/ledger.md`
 names it, set `lesson`, and add `{"id": "L<n>", "effect": "suppressed", "what": "<one line>"}` to `OUT/lessons.json`
 (create it, or add to the reviewer's). When you remove a finding the reviewer recorded in `lessons.json` as raised,
-remove that record too.
+or in `aims.json`, remove that record too.
 Write nothing else anywhere.
