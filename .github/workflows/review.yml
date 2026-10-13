@@ -119,6 +119,8 @@ jobs:
           ref: ${{ needs.gate.outputs.head_sha }}
           path: pr
           persist-credentials: false
+          # A fork head under pull_request_target: checked out as data only (nothing from it runs; see the header).
+          allow-unsafe-pr-checkout: true
       # dryer and crapper (github.com/unclebob), pinned by commit; their dependencies (tree-sitter) from PyPI. The
       # built venv is cached by the two commits: only our own steps write it, never anything from the PR.
       - name: Cache dryer and crapper
@@ -192,6 +194,8 @@ jobs:
           ref: ${{ needs.gate.outputs.head_sha }}
           path: pr
           persist-credentials: false
+          # A fork head under pull_request_target: checked out as data only (nothing from it runs; see the header).
+          allow-unsafe-pr-checkout: true
       - uses: actions/download-artifact@v4
         continue-on-error: true
         with:
