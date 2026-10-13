@@ -1,9 +1,10 @@
-# The review bot's weekly learner: what happened after its reviews becomes lesson candidates in the knowledge ledger
-# (one open issue labelled review-ledger; tools/review/ledger.py). Design: .github/review/README.md.
+# The review bot's weekly learner: what happened after its reviews becomes lessons in the knowledge ledger (one open
+# issue labelled review-ledger; tools/review/ledger.py). Design: .github/review/README.md.
 #
-# Trust: signals come from code (tools/review/signals.py), the model only proposes (candidates.json), and ledger.py
-# writes the issue body itself, adding every candidate unticked and copying the existing lines as they are. A lesson
-# reaches a review only when someone with write access ticks it. The key and the issues-write token never share a job.
+# No person is in the loop. Signals are outcomes code can see (tools/review/signals.py); the model only proposes
+# (candidates.json); ledger.py writes the issue body, puts each candidate in force with its guards, renews a lesson
+# that was used and expires one that was not. A maintainer's one move is a veto (strike a line). The key and the
+# issues-write token never share a job.
 name: Review learner
 
 on:
@@ -35,6 +36,7 @@ jobs:
       contents: read
       pull-requests: read
       issues: read
+      actions: read   # the review runs' artifacts (removed.json, lessons.json)
     outputs:
       has_signals: ${{ steps.s.outputs.has_signals }}
     steps:
@@ -146,7 +148,8 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          cost=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['cost_usd'])" cand/trace/learner.usage.json 2>/dev/null || echo 0)
-          printf '%s · learner cost $%s\n' "$(head -1 ctx/stats.md)" "$cost" > stats.md
-          python3 tools/review/ledger.py update --repo "$REPO" --candidates cand/out/candidates.json --stats stats.md \
+          # Runs every week, with or without a learner run: lessons in force age by their measured use
+          # (ctx/lesson-stats.json beside the stats line).
+          python3 tools/review/ledger.py update --repo "$REPO" --candidates cand/out/candidates.json \
+            --stats ctx/stats.md --usage cand/trace/learner.usage.json \
             | tee -a "$GITHUB_STEP_SUMMARY"

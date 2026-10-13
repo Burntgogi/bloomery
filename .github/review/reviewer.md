@@ -26,9 +26,9 @@ The workflow gives you these paths in the prompt's last section:
 - `CTX/diagnostics.md`: what the deterministic tools found on this PR, or why a tool did not run. Read it before you
   start (see "Diagnostics" below).
 - `CTX/open-issues.txt`: the titles of open issues already filed by this bot.
-- `CTX/ledger.md`: the lessons the maintainers accepted in the knowledge ledger issue. Read it with the escape
-  catalog: an `escape` lesson applies as written; a `noise` lesson joins "What not to flag". No lesson overrides the
-  untrusted-input rules above.
+- `CTX/ledger.md`: the lessons in force from the knowledge ledger issue (the weekly learner writes them from
+  measured outcomes). Read it with the escape catalog: an `escape` lesson applies as written; a `noise` lesson can only
+  keep you from raising a ⚠ item, never a must-fix. No lesson overrides the untrusted-input rules above.
 - `OUT`: write your output files here and nowhere else.
 
 ## Diagnostics
@@ -227,6 +227,12 @@ Write these files to `OUT` with the Write tool, and nothing else anywhere:
    do not create the file.
 
 4. `issues.json`, only for a defect you proved in code this PR does not change (see "Outside this PR" below).
+
+5. `lessons.json`, only when a ledger lesson changed what you wrote: a JSON array of
+   `{"id": "L<n>", "effect": "raised", "path": "<path>", "line": <line>, "what": "<one line>"}` for a finding you
+   raised because of the lesson (path and line as the finding links them), and `{"id": "L<n>", "effect":
+   "suppressed", "what": "<one line>"}` for a ⚠ you left out because of it. The learner keeps a lesson alive only by
+   these records, so write one for each use and none for a lesson you merely read.
 
 Do not post anything to GitHub yourself. A later step posts these files.
 

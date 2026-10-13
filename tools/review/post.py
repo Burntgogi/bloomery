@@ -10,7 +10,8 @@
 place into the shape `post` sends: the decision follows the body's verdict line, inline comments that do not sit on a
 line the diff adds are dropped (GitHub refuses the whole review for one), at most MAX_COMMENTS remain, the body is cut
 to MAX_BODY characters, and the footer marker that the next run reads (head sha, verdict, counts) is appended, with a
-the knowledge ledger's version when pr.json carries one (`ledger=`, tools/review/ledger.py), and a
+the knowledge ledger's version and the workflow run when pr.json carries them (`ledger=`, `run=`: the weekly
+learner reads the run's artifact back, tools/review/signals.py), and a
 second marker carrying each --usage file's accounting (tools/review/usage.py: turns, cost, context, tool calls) kept
 in DIR/usage.txt so a later check without the files keeps it. Issue candidates (issues.json: defects outside the
 diff) are kept when well formed, at most MAX_ISSUES, and with --base only when every evidence path exists there. It
@@ -142,10 +143,10 @@ def keep_issues(items, base):
     return kept[:MAX_ISSUES], dropped
 
 
-def footer(head, verdict, body, mode, ledger=None):
+def footer(head, verdict, body, mode, ledger=None, run=None):
     must = len(re.findall(r"^#### \d+\.", body, re.M))
     warn = len(re.findall(r"^⚠", body, re.M))
-    tail = f" ledger={ledger}" if ledger else ""
+    tail = (f" ledger={ledger}" if ledger else "") + (f" run={run}" if run and str(run).isdigit() else "")
     return f"<!-- {MARKER} head_sha={head} verdict={verdict} must_fix={must} warn={warn} mode={mode}{tail} -->"
 
 
@@ -221,7 +222,7 @@ def check(out, diff_path, pr_json, secret_env, usage_paths=(), base=None):
             f.write(marker + "\n")
     elif os.path.exists(usage_txt):
         marker = open(usage_txt, encoding="utf-8").read().strip()
-    body += "\n\n" + footer(pr["head_sha"], verdict, body, pr.get("mode", "full"), pr.get("ledger"))
+    body += "\n\n" + footer(pr["head_sha"], verdict, body, pr.get("mode", "full"), pr.get("ledger"), pr.get("run"))
     if marker:
         body += "\n" + marker
     with open(os.path.join(out, "review.md"), "w", encoding="utf-8") as f:
@@ -317,6 +318,8 @@ def post(out, repo, pr, token):
 def self_test():
     assert footer("h", "CLEAN", "", "full").endswith("mode=full -->")
     assert footer("h", "CLEAN", "", "full", "0a1b2c").endswith("mode=full ledger=0a1b2c -->")
+    assert footer("h", "CLEAN", "", "full", "0a1b2c", "123").endswith("ledger=0a1b2c run=123 -->")
+    assert footer("h", "CLEAN", "", "full", None, "1 x").endswith("mode=full -->")
     diff = (
         "diff --git a/crates/x/src/a.rs b/crates/x/src/a.rs\n--- a/crates/x/src/a.rs\n+++ b/crates/x/src/a.rs\n"
         "@@ -10,3 +10,4 @@ fn f() {\n ctx\n-old\n+new1\n+new2\n ctx2\n"

@@ -227,9 +227,9 @@ jobs:
           # The knowledge ledger's ticked lessons (tools/review/ledger.py); its version goes into the footer marker.
           ledger=$(python3 base/tools/review/ledger.py accepted --repo "$REPO" --out ctx/ledger.md)
           # tree_sha: the commit BASE_TREE is checked out at, which issue evidence links point into.
-          jq --arg mode "$mode" --arg repo "$REPO" --arg tree "$TREE_SHA" --arg ledger "$ledger" '{number, title, body,
-              author: .user.login, repo: $repo, base_sha: .base.sha, head_sha: .head.sha, tree_sha: $tree, mode: $mode,
-              ledger: $ledger}' ctx/pr-full.json > ctx/pr.json
+          jq --arg mode "$mode" --arg repo "$REPO" --arg tree "$TREE_SHA" --arg ledger "$ledger" --arg run "$GITHUB_RUN_ID" \
+            '{number, title, body, author: .user.login, repo: $repo, base_sha: .base.sha, head_sha: .head.sha,
+              tree_sha: $tree, mode: $mode, ledger: $ledger, run: $run}' ctx/pr-full.json > ctx/pr.json
           rm ctx/pr-full.json
           if [ -f ctx-diag/diagnostics.md ]; then cp ctx-diag/diagnostics.md ctx/; else
             echo "The diagnostics job did not finish; no dryer or crapper results for this review." > ctx/diagnostics.md; fi
@@ -283,8 +283,11 @@ jobs:
             out/usage.txt
             out/issues.json
             out/base_sha.txt
+            out/removed.json
+            out/lessons.json
             ctx/diff.patch
             ctx/pr.json
+          retention-days: 90   # the learner reads removed.json and lessons.json back (tools/review/signals.py)
 
   post:
     needs: [gate, review]
