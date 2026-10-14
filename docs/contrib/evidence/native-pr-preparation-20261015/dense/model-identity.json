@@ -1,0 +1,18 @@
+{
+  "repo": "lmstudio-community/Qwen3.8-27B-GGUF",
+  "revision": "5a7da681f60570ab5b439a587e912d2e5eddb582",
+  "filename": "Qwen3.8-27B-Q4_K_M.gguf",
+  "bytes": 16810714336,
+  "sha256": "e00082f779fa385cee8c68a3ec8833a75778cc87272240b942f74e0b8243e520",
+  "hf_lfs_sha256": "e00082f779fa385cee8c68a3ec8833a75778cc87272240b942f74e0b8243e520",
+  "full_file_hash_verified": true,
+  "architecture": "qwen35",
+  "trunk_layers": 64,
+  "declared_layers": 65,
+  "tensor_types": {
+    "F32": 360,
+    "Q4_K": 439,
+    "Q6_K": 67
+  },
+  "unused_mtp_tensors": 15
+}

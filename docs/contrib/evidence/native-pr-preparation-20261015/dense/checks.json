@@ -1,0 +1,376 @@
+{
+  "source": {
+    "base": "33a6b281d6077959c27999bc370508a33c16eccc",
+    "head": "02a650f567b8dbec88e0c1ff8ab58f2be9bc5c91",
+    "tree": "1b66364fb3e6cf1dcad9af7a55905560c2b51783",
+    "clean": true
+  },
+  "validation_scope": "host/static only; NVIDIA device validation pending",
+  "static_check": "pass",
+  "clippy_warnings_denied": "pass",
+  "host_tests": {
+    "gpu_gates_lib": {
+      "passed": 112,
+      "ignored": 3
+    },
+    "model_lib": {
+      "passed": 333,
+      "ignored": 4
+    }
+  },
+  "t0_runs": [
+    "DONE tier=t0 total=81 red=2 wall=287s red: test-bloomery-serve recipes-self-test",
+    "DONE tier=t0 total=14 red=0 wall=147s"
+  ],
+  "t0_effective_units": {
+    "fmt": {
+      "exit_code": 0,
+      "run": "t0-corrected-head.log"
+    },
+    "test-bloomery-decision": {
+      "exit_code": 0,
+      "run": "t0-initial.log"
+    },
+    "test-bloomery-hf": {
+      "exit_code": 0,
+      "run": "t0-initial.log"
+    },
+    "test-bloomery-jinja": {
+      "exit_code": 0,
+      "run": "t0-initial.log"
+    },
+    "test-bloomery-levers": {
+      "exit_code": 0,
+      "run": "t0-initial.log"
+    },
+    "test-bloomery-models": {
+      "exit_code": 0,
+      "run": "t0-initial.log"
+    },
+    "test-bloomery-placement": {
+      "exit_code": 0,
+      "run": "t0-initial.log"
+    },
+    "test-bloomery-refset": {
+      "exit_code": 0,
+      "run": "t0-initial.log"
+    },
+    "test-bloomery-runtime": {
+      "exit_code": 0,
+      "run": "t0-initial.log"
+    },
+    "test-bloomery-sampler": {
+      "exit_code": 0,
+      "run": "t0-initial.log"
+    },
+    "test-bloomery-serve": {
+      "exit_code": 0,
+      "run": "t0-corrected-head.log"
+    },
+    "test-bloomery-tokenizer": {
+      "exit_code": 0,
+      "run": "t0-initial.log"
+    },
+    "test-bloomery-vision": {
+      "exit_code": 0,
+      "run": "t0-initial.log"
+    },
+    "recipes-self-test": {
+      "exit_code": 0,
+      "run": "t0-corrected-head.log"
+    },
+    "tools/bloomery/manifest.py": {
+      "exit_code": 0,
+      "run": "t0-initial.log"
+    },
+    "tools/bloomery/records.py": {
+      "exit_code": 0,
+      "run": "t0-initial.log"
+    },
+    "tools/bloomery/rows.py": {
+      "exit_code": 0,
+      "run": "t0-initial.log"
+    },
+    "tools/bloomery/route_trace.py": {
+      "exit_code": 0,
+      "run": "t0-initial.log"
+    },
+    "tools/bloomery/selftest.py": {
+      "exit_code": 0,
+      "run": "t0-initial.log"
+    },
+    "tools/board/board.py": {
+      "exit_code": 0,
+      "run": "t0-initial.log"
+    },
+    "tools/boxq-check.py": {
+      "exit_code": 0,
+      "run": "t0-initial.log"
+    },
+    "tools/boxq.py": {
+      "exit_code": 0,
+      "run": "t0-initial.log"
+    },
+    "tools/check-comment-only.py": {
+      "exit_code": 0,
+      "run": "t0-initial.log"
+    },
+    "tools/check-defaults.py": {
+      "exit_code": 0,
+      "run": "t0-initial.log"
+    },
+    "tools/check-ptx-names.py": {
+      "exit_code": 0,
+      "run": "t0-initial.log"
+    },
+    "tools/check-records.py": {
+      "exit_code": 0,
+      "run": "t0-initial.log"
+    },
+    "tools/flow/ds41_prefill.py": {
+      "exit_code": 0,
+      "run": "t0-initial.log"
+    },
+    "tools/flow/nodes_scale.py": {
+      "exit_code": 0,
+      "run": "t0-initial.log"
+    },
+    "tools/flow/pplb.py": {
+      "exit_code": 0,
+      "run": "t0-initial.log"
+    },
+    "tools/flow/q38_step.py": {
+      "exit_code": 0,
+      "run": "t0-initial.log"
+    },
+    "tools/flow/q38width.py": {
+      "exit_code": 0,
+      "run": "t0-initial.log"
+    },
+    "tools/flow/routes.py": {
+      "exit_code": 0,
+      "run": "t0-initial.log"
+    },
+    "tools/gate-paths-merge.py": {
+      "exit_code": 0,
+      "run": "t0-initial.log"
+    },
+    "tools/hf-arch-check.py": {
+      "exit_code": 0,
+      "run": "t0-initial.log"
+    },
+    "tools/mac-disk.py": {
+      "exit_code": 0,
+      "run": "t0-initial.log"
+    },
+    "tools/pr-gate-lines.py": {
+      "exit_code": 0,
+      "run": "t0-initial.log"
+    },
+    "tools/ref/asm-census.py": {
+      "exit_code": 0,
+      "run": "t0-initial.log"
+    },
+    "tools/ref/check-int-twins.py": {
+      "exit_code": 0,
+      "run": "t0-initial.log"
+    },
+    "tools/ref/clef/e2e.py": {
+      "exit_code": 0,
+      "run": "t0-initial.log"
+    },
+    "tools/ref/clef_ref.py": {
+      "exit_code": 0,
+      "run": "t0-initial.log"
+    },
+    "tools/ref/clefvis/check_hidden.py": {
+      "exit_code": 0,
+      "run": "t0-initial.log"
+    },
+    "tools/ref/clefvis/check_preproc.py": {
+      "exit_code": 0,
+      "run": "t0-initial.log"
+    },
+    "tools/ref/dma-dram-share.py": {
+      "exit_code": 0,
+      "run": "t0-initial.log"
+    },
+    "tools/ref/draft-accept.py": {
+      "exit_code": 0,
+      "run": "t0-initial.log"
+    },
+    "tools/ref/draft-vocab.py": {
+      "exit_code": 0,
+      "run": "t0-initial.log"
+    },
+    "tools/ref/ds41copy.py": {
+      "exit_code": 0,
+      "run": "t0-initial.log"
+    },
+    "tools/ref/ds41pp.py": {
+      "exit_code": 0,
+      "run": "t0-initial.log"
+    },
+    "tools/ref/flat-imatrix.py": {
+      "exit_code": 0,
+      "run": "t0-initial.log"
+    },
+    "tools/ref/gguf-ranges.py": {
+      "exit_code": 0,
+      "run": "t0-initial.log"
+    },
+    "tools/ref/gguf-respell.py": {
+      "exit_code": 0,
+      "run": "t0-initial.log"
+    },
+    "tools/ref/hidden-diff.py": {
+      "exit_code": 0,
+      "run": "t0-initial.log"
+    },
+    "tools/ref/lev_ref.py": {
+      "exit_code": 0,
+      "run": "t0-initial.log"
+    },
+    "tools/ref/loop-floor.py": {
+      "exit_code": 0,
+      "run": "t0-initial.log"
+    },
+    "tools/ref/nsys-bridge.py": {
+      "exit_code": 0,
+      "run": "t0-initial.log"
+    },
+    "tools/ref/ptx-canon.py": {
+      "exit_code": 0,
+      "run": "t0-initial.log"
+    },
+    "tools/ref/qdot-rate-floors.py": {
+      "exit_code": 0,
+      "run": "t0-initial.log"
+    },
+    "tools/ref/route-trace-chat.py": {
+      "exit_code": 0,
+      "run": "t0-initial.log"
+    },
+    "tools/ref/router-coverage.py": {
+      "exit_code": 0,
+      "run": "t0-initial.log"
+    },
+    "tools/ref/router-residency.py": {
+      "exit_code": 0,
+      "run": "t0-initial.log"
+    },
+    "tools/ref/set-diff.py": {
+      "exit_code": 0,
+      "run": "t0-initial.log"
+    },
+    "tools/ref/window-union.py": {
+      "exit_code": 0,
+      "run": "t0-initial.log"
+    },
+    "tools/review/diagnostics.py": {
+      "exit_code": 0,
+      "run": "t0-initial.log"
+    },
+    "tools/review/labels.py": {
+      "exit_code": 0,
+      "run": "t0-initial.log"
+    },
+    "tools/review/ledger.py": {
+      "exit_code": 0,
+      "run": "t0-initial.log"
+    },
+    "tools/review/post.py": {
+      "exit_code": 0,
+      "run": "t0-initial.log"
+    },
+    "tools/review/run.py": {
+      "exit_code": 0,
+      "run": "t0-initial.log"
+    },
+    "tools/review/signals.py": {
+      "exit_code": 0,
+      "run": "t0-initial.log"
+    },
+    "tools/review/usage.py": {
+      "exit_code": 0,
+      "run": "t0-initial.log"
+    },
+    "tools/type-census.py": {
+      "exit_code": 0,
+      "run": "t0-initial.log"
+    },
+    "tools/verdict-diff.py": {
+      "exit_code": 0,
+      "run": "t0-initial.log"
+    },
+    "check-arch": {
+      "exit_code": 0,
+      "run": "t0-corrected-head.log"
+    },
+    "check-comments": {
+      "exit_code": 0,
+      "run": "t0-corrected-head.log"
+    },
+    "check-defaults": {
+      "exit_code": 0,
+      "run": "t0-corrected-head.log"
+    },
+    "check-levers": {
+      "exit_code": 0,
+      "run": "t0-corrected-head.log"
+    },
+    "check-loads": {
+      "exit_code": 0,
+      "run": "t0-corrected-head.log"
+    },
+    "check-ptx-names": {
+      "exit_code": 0,
+      "run": "t0-corrected-head.log"
+    },
+    "check-recipes": {
+      "exit_code": 0,
+      "run": "t0-corrected-head.log"
+    },
+    "check-records": {
+      "exit_code": 0,
+      "run": "t0-corrected-head.log"
+    },
+    "check-rustflags": {
+      "exit_code": 0,
+      "run": "t0-corrected-head.log"
+    },
+    "check-unsafe": {
+      "exit_code": 0,
+      "run": "t0-corrected-head.log"
+    },
+    "check-waits": {
+      "exit_code": 0,
+      "run": "t0-corrected-head.log"
+    }
+  },
+  "t0_initial_failures_and_resolution": {
+    "recipes-self-test": "added the derived gate-ds41-oracle and gate-ds41-kld consumers; source check and self-test pass",
+    "test-bloomery-serve": "unmodified mock-server test expects workspace target/debug but CARGO_TARGET_DIR points at cache; added ignored target/debug symlink to that cache, and the full crate tests pass"
+  },
+  "model_file_identity": "model-identity.json",
+  "full_coverage": {
+    "exit_code": 1,
+    "unsupported_count": 1,
+    "unsupported": [
+      "a tool-call parser for this template"
+    ],
+    "unsupported_tensor_format_role_count": 0,
+    "guard_relaxed": false
+  },
+  "unverified": [
+    "CUDA executable build/codegen",
+    "device/model loading",
+    "forced-ID logits against independent exact-file reference",
+    "eager/graph logits",
+    "HTTP vs CLI last-step at short and 4K prompts",
+    "sampling/reset/checkpoints/resident slots",
+    "performance vs llama.cpp and Strata",
+    "MTP/media/tool calling",
+    "native AMD whole-model serving"
+  ]
+}

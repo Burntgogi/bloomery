@@ -1,0 +1,7 @@
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.05s
+     Running `/home/jutai05/bloomery-native-contributions-20261013/step3/target/debug/examples/qwen35_admission /home/jutai05/llama-stack/models/qwen38-native-q4km/lmstudio-community/Qwen3.8-27B-Q4_K_M.gguf`
+tensor_types={"F32": 360, "Q4_K": 439, "Q6_K": 67}
+metadata arch=qwen35 layers=65 trunk=64 embedding=5120 heads=24 kv_heads=4 head=256 vocab=248320 experts=0 flash_mma=false
+coverage unsupported=1 unused_tensors=15
+unsupported layer=None a tool-call parser for this template
+qwen35_admission: the native coverage table refuses this file; no device was opened

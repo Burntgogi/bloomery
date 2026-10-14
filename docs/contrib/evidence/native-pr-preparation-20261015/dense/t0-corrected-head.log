@@ -1,0 +1,19 @@
+contrib-check tier=t0 commit=02a650f5
+host: Linux 7.0.0-38-generic x86_64, 12th Gen Intel(R) Core(TM) i5-12600K
+toolchain: rustc 1.100.0-nightly (e457a7b0d 2026-08-27) (nightly-2026-08-28); RUSTFLAGS: -C target-cpu=native (yours); timeout 1200s a unit
+logs: /home/jutai05/bloomery-native-contributions-20261013/dense-pr/target/contrib-check/20261015-053636
+fmt rc=0 4s
+test-bloomery-serve rc=0 3s
+recipes-self-test rc=0 30s
+check-arch rc=0 1s
+check-comments rc=0 5s
+check-defaults rc=0 1s
+check-levers rc=0 7s
+check-loads rc=0 0s
+check-ptx-names rc=0 0s
+check-recipes rc=0 91s
+check-records rc=0 5s
+check-rustflags rc=0 0s
+check-unsafe rc=0 0s
+check-waits rc=0 0s
+DONE tier=t0 total=14 red=0 wall=147s
