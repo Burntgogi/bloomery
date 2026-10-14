@@ -1,4 +1,2 @@
-   Compiling compiler_builtins v0.1.160 (/home/jutai05/bloomery-contributions/tooling/rustup/toolchains/nightly-2026-08-28-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/compiler-builtins/compiler-builtins)
-   Compiling core v0.0.0 (/home/jutai05/bloomery-contributions/tooling/rustup/toolchains/nightly-2026-08-28-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core)
     Checking bloomery-hip-spike-device v0.1.0 (/home/jutai05/bloomery-native-contributions-20261013/hip-pr/labs/hip-native/device)
-    Finished `release` profile [optimized] target(s) in 7.48s
+    Finished `release` profile [optimized] target(s) in 0.10s

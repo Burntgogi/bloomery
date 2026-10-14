@@ -1,11 +1,2 @@
-   Compiling proc-macro2 v1.0.107
-   Compiling unicode-ident v1.0.27
-   Compiling quote v1.0.47
-   Compiling libc v0.2.190
-   Compiling thiserror v2.0.21
    Compiling bloomery-hip-spike v0.1.0 (/home/jutai05/bloomery-native-contributions-20261013/hip-pr/labs/hip-native/host)
-   Compiling syn v3.0.9
-   Compiling memmap2 v0.9.11
-   Compiling thiserror-impl v2.0.21
-   Compiling bloomery-gguf v0.1.0 (/home/jutai05/bloomery-native-contributions-20261013/hip-pr/crates/gguf)
-    Finished `release` profile [optimized] target(s) in 2.55s
+    Finished `release` profile [optimized] target(s) in 0.41s

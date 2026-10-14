@@ -1,4 +1,5 @@
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.04s
+   Compiling bloomery-hip-spike v0.1.0 (/home/jutai05/bloomery-native-contributions-20261013/hip-pr/labs/hip-native/host)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.14s
      Running unittests src/main.rs (target/debug/build/bloomery-hip-spike/0c267e401c5fa09d/out/bloomery_hip_spike-0c267e401c5fa09d)
 
 running 1 test

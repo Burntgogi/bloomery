@@ -1,12 +1,12 @@
 # Native contribution source and validation handoff
 
 Two implementation heads are prepared against `midagedev/bloomery` main
-`33a6b281d6077959c27999bc370508a33c16eccc`:
+`ae09980c1754dfb01fbeff6f642b9c0c53ecf30f`:
 
 | Request | Source head | Evidence |
 |---|---|---|
-| #87 standalone HIP lab | `33f57a92e428951eb46b58a2b773d825d850c873` | [exact-head result](hip/result.json), [source patch](hip/source.patch) |
-| #88 dense Qwen frontend/admission | `02a650f567b8dbec88e0c1ff8ab58f2be9bc5c91` | [checks](dense/checks.json), [source patch](dense/source.patch), [model identity](dense/model-identity.json) |
+| #87 standalone HIP lab | `f7cb7d92951a02aae985269f8d3da9d30d86673a` | [exact-head result](hip/result.json), [source patch](hip/source.patch) |
+| #88 dense Qwen frontend/admission | `b511fb44d47ebb9823a36073c6bd93d0be916cc0` | [checks](dense/checks.json), [source patch](dense/source.patch), [model identity](dense/model-identity.json) |
 
 The HIP lab passed host/device builds and lint, its host contract test and six
 GPU cases on the RX 7900 GRE. It remains outside the CUDA workspace and does not
@@ -21,11 +21,15 @@ missing optional tool-call parser. The A6000 reference/forced-ID and HTTP-vs-CLI
 lane remains to be run by the maintainer, as agreed in #88. No native serving
 or speed result is claimed.
 
-The initial T0 run had two red units. The derived gate table was corrected;
-the other was an unmodified mock-server test looking outside the configured
-Cargo target cache. After an ignored build-artifact symlink, the relevant 14
-units passed from the source head. All 81 distinct T0 units have a green latest
-result; both summaries are kept, rather than rewriting the first run as green.
+The final-head full T0 run passed: `DONE tier=t0 total=81 red=0 wall=253s`.
+Both frontends and their shared planner gate callers pass static check and clippy
+with warnings denied. The two host libraries pass 112 and 333 tests respectively.
+The latest-main rebase preserved the frontend patch (`rebase-range-diff.txt`).
+The HIP lab was rerun after that rebase, and all six GPU cases passed again.
+Earlier T0 logs are kept as history: a missing derived gate row was corrected,
+and an unmodified mock-server test's fixed artifact path was connected to the
+configured cache through an ignored symlink. Those were resolved before the
+final full T0 run; the complete coverage tool-parser refusal remains unresolved.
 
 ## Restore the exact source
 

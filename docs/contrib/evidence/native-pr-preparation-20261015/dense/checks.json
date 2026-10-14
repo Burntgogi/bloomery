@@ -1,8 +1,8 @@
 {
   "source": {
-    "base": "33a6b281d6077959c27999bc370508a33c16eccc",
-    "head": "02a650f567b8dbec88e0c1ff8ab58f2be9bc5c91",
-    "tree": "1b66364fb3e6cf1dcad9af7a55905560c2b51783",
+    "base": "ae09980c1754dfb01fbeff6f642b9c0c53ecf30f",
+    "head": "b511fb44d47ebb9823a36073c6bd93d0be916cc0",
+    "tree": "be00c1238787497abb718729eb1a116a3c295d49",
     "clean": true
   },
   "validation_scope": "host/static only; NVIDIA device validation pending",
@@ -20,332 +20,333 @@
   },
   "t0_runs": [
     "DONE tier=t0 total=81 red=2 wall=287s red: test-bloomery-serve recipes-self-test",
-    "DONE tier=t0 total=14 red=0 wall=147s"
+    "DONE tier=t0 total=14 red=0 wall=147s",
+    "DONE tier=t0 total=81 red=0 wall=253s"
   ],
   "t0_effective_units": {
     "fmt": {
       "exit_code": 0,
-      "run": "t0-corrected-head.log"
+      "run": "t0-final-head.log"
     },
     "test-bloomery-decision": {
       "exit_code": 0,
-      "run": "t0-initial.log"
+      "run": "t0-final-head.log"
     },
     "test-bloomery-hf": {
       "exit_code": 0,
-      "run": "t0-initial.log"
+      "run": "t0-final-head.log"
     },
     "test-bloomery-jinja": {
       "exit_code": 0,
-      "run": "t0-initial.log"
+      "run": "t0-final-head.log"
     },
     "test-bloomery-levers": {
       "exit_code": 0,
-      "run": "t0-initial.log"
+      "run": "t0-final-head.log"
     },
     "test-bloomery-models": {
       "exit_code": 0,
-      "run": "t0-initial.log"
+      "run": "t0-final-head.log"
     },
     "test-bloomery-placement": {
       "exit_code": 0,
-      "run": "t0-initial.log"
+      "run": "t0-final-head.log"
     },
     "test-bloomery-refset": {
       "exit_code": 0,
-      "run": "t0-initial.log"
+      "run": "t0-final-head.log"
     },
     "test-bloomery-runtime": {
       "exit_code": 0,
-      "run": "t0-initial.log"
+      "run": "t0-final-head.log"
     },
     "test-bloomery-sampler": {
       "exit_code": 0,
-      "run": "t0-initial.log"
+      "run": "t0-final-head.log"
     },
     "test-bloomery-serve": {
       "exit_code": 0,
-      "run": "t0-corrected-head.log"
+      "run": "t0-final-head.log"
     },
     "test-bloomery-tokenizer": {
       "exit_code": 0,
-      "run": "t0-initial.log"
+      "run": "t0-final-head.log"
     },
     "test-bloomery-vision": {
       "exit_code": 0,
-      "run": "t0-initial.log"
+      "run": "t0-final-head.log"
     },
     "recipes-self-test": {
       "exit_code": 0,
-      "run": "t0-corrected-head.log"
+      "run": "t0-final-head.log"
     },
     "tools/bloomery/manifest.py": {
       "exit_code": 0,
-      "run": "t0-initial.log"
+      "run": "t0-final-head.log"
     },
     "tools/bloomery/records.py": {
       "exit_code": 0,
-      "run": "t0-initial.log"
+      "run": "t0-final-head.log"
     },
     "tools/bloomery/rows.py": {
       "exit_code": 0,
-      "run": "t0-initial.log"
+      "run": "t0-final-head.log"
     },
     "tools/bloomery/route_trace.py": {
       "exit_code": 0,
-      "run": "t0-initial.log"
+      "run": "t0-final-head.log"
     },
     "tools/bloomery/selftest.py": {
       "exit_code": 0,
-      "run": "t0-initial.log"
+      "run": "t0-final-head.log"
     },
     "tools/board/board.py": {
       "exit_code": 0,
-      "run": "t0-initial.log"
+      "run": "t0-final-head.log"
     },
     "tools/boxq-check.py": {
       "exit_code": 0,
-      "run": "t0-initial.log"
+      "run": "t0-final-head.log"
     },
     "tools/boxq.py": {
       "exit_code": 0,
-      "run": "t0-initial.log"
+      "run": "t0-final-head.log"
     },
     "tools/check-comment-only.py": {
       "exit_code": 0,
-      "run": "t0-initial.log"
+      "run": "t0-final-head.log"
     },
     "tools/check-defaults.py": {
       "exit_code": 0,
-      "run": "t0-initial.log"
+      "run": "t0-final-head.log"
     },
     "tools/check-ptx-names.py": {
       "exit_code": 0,
-      "run": "t0-initial.log"
+      "run": "t0-final-head.log"
     },
     "tools/check-records.py": {
       "exit_code": 0,
-      "run": "t0-initial.log"
+      "run": "t0-final-head.log"
     },
     "tools/flow/ds41_prefill.py": {
       "exit_code": 0,
-      "run": "t0-initial.log"
+      "run": "t0-final-head.log"
     },
     "tools/flow/nodes_scale.py": {
       "exit_code": 0,
-      "run": "t0-initial.log"
+      "run": "t0-final-head.log"
     },
     "tools/flow/pplb.py": {
       "exit_code": 0,
-      "run": "t0-initial.log"
+      "run": "t0-final-head.log"
     },
     "tools/flow/q38_step.py": {
       "exit_code": 0,
-      "run": "t0-initial.log"
+      "run": "t0-final-head.log"
     },
     "tools/flow/q38width.py": {
       "exit_code": 0,
-      "run": "t0-initial.log"
+      "run": "t0-final-head.log"
     },
     "tools/flow/routes.py": {
       "exit_code": 0,
-      "run": "t0-initial.log"
+      "run": "t0-final-head.log"
     },
     "tools/gate-paths-merge.py": {
       "exit_code": 0,
-      "run": "t0-initial.log"
+      "run": "t0-final-head.log"
     },
     "tools/hf-arch-check.py": {
       "exit_code": 0,
-      "run": "t0-initial.log"
+      "run": "t0-final-head.log"
     },
     "tools/mac-disk.py": {
       "exit_code": 0,
-      "run": "t0-initial.log"
+      "run": "t0-final-head.log"
     },
     "tools/pr-gate-lines.py": {
       "exit_code": 0,
-      "run": "t0-initial.log"
+      "run": "t0-final-head.log"
     },
     "tools/ref/asm-census.py": {
       "exit_code": 0,
-      "run": "t0-initial.log"
+      "run": "t0-final-head.log"
     },
     "tools/ref/check-int-twins.py": {
       "exit_code": 0,
-      "run": "t0-initial.log"
+      "run": "t0-final-head.log"
     },
     "tools/ref/clef/e2e.py": {
       "exit_code": 0,
-      "run": "t0-initial.log"
+      "run": "t0-final-head.log"
     },
     "tools/ref/clef_ref.py": {
       "exit_code": 0,
-      "run": "t0-initial.log"
+      "run": "t0-final-head.log"
     },
     "tools/ref/clefvis/check_hidden.py": {
       "exit_code": 0,
-      "run": "t0-initial.log"
+      "run": "t0-final-head.log"
     },
     "tools/ref/clefvis/check_preproc.py": {
       "exit_code": 0,
-      "run": "t0-initial.log"
+      "run": "t0-final-head.log"
     },
     "tools/ref/dma-dram-share.py": {
       "exit_code": 0,
-      "run": "t0-initial.log"
+      "run": "t0-final-head.log"
     },
     "tools/ref/draft-accept.py": {
       "exit_code": 0,
-      "run": "t0-initial.log"
+      "run": "t0-final-head.log"
     },
     "tools/ref/draft-vocab.py": {
       "exit_code": 0,
-      "run": "t0-initial.log"
+      "run": "t0-final-head.log"
     },
     "tools/ref/ds41copy.py": {
       "exit_code": 0,
-      "run": "t0-initial.log"
+      "run": "t0-final-head.log"
     },
     "tools/ref/ds41pp.py": {
       "exit_code": 0,
-      "run": "t0-initial.log"
+      "run": "t0-final-head.log"
     },
     "tools/ref/flat-imatrix.py": {
       "exit_code": 0,
-      "run": "t0-initial.log"
+      "run": "t0-final-head.log"
     },
     "tools/ref/gguf-ranges.py": {
       "exit_code": 0,
-      "run": "t0-initial.log"
+      "run": "t0-final-head.log"
     },
     "tools/ref/gguf-respell.py": {
       "exit_code": 0,
-      "run": "t0-initial.log"
+      "run": "t0-final-head.log"
     },
     "tools/ref/hidden-diff.py": {
       "exit_code": 0,
-      "run": "t0-initial.log"
+      "run": "t0-final-head.log"
     },
     "tools/ref/lev_ref.py": {
       "exit_code": 0,
-      "run": "t0-initial.log"
+      "run": "t0-final-head.log"
     },
     "tools/ref/loop-floor.py": {
       "exit_code": 0,
-      "run": "t0-initial.log"
+      "run": "t0-final-head.log"
     },
     "tools/ref/nsys-bridge.py": {
       "exit_code": 0,
-      "run": "t0-initial.log"
+      "run": "t0-final-head.log"
     },
     "tools/ref/ptx-canon.py": {
       "exit_code": 0,
-      "run": "t0-initial.log"
+      "run": "t0-final-head.log"
     },
     "tools/ref/qdot-rate-floors.py": {
       "exit_code": 0,
-      "run": "t0-initial.log"
+      "run": "t0-final-head.log"
     },
     "tools/ref/route-trace-chat.py": {
       "exit_code": 0,
-      "run": "t0-initial.log"
+      "run": "t0-final-head.log"
     },
     "tools/ref/router-coverage.py": {
       "exit_code": 0,
-      "run": "t0-initial.log"
+      "run": "t0-final-head.log"
     },
     "tools/ref/router-residency.py": {
       "exit_code": 0,
-      "run": "t0-initial.log"
+      "run": "t0-final-head.log"
     },
     "tools/ref/set-diff.py": {
       "exit_code": 0,
-      "run": "t0-initial.log"
+      "run": "t0-final-head.log"
     },
     "tools/ref/window-union.py": {
       "exit_code": 0,
-      "run": "t0-initial.log"
+      "run": "t0-final-head.log"
     },
     "tools/review/diagnostics.py": {
       "exit_code": 0,
-      "run": "t0-initial.log"
+      "run": "t0-final-head.log"
     },
     "tools/review/labels.py": {
       "exit_code": 0,
-      "run": "t0-initial.log"
+      "run": "t0-final-head.log"
     },
     "tools/review/ledger.py": {
       "exit_code": 0,
-      "run": "t0-initial.log"
+      "run": "t0-final-head.log"
     },
     "tools/review/post.py": {
       "exit_code": 0,
-      "run": "t0-initial.log"
+      "run": "t0-final-head.log"
     },
     "tools/review/run.py": {
       "exit_code": 0,
-      "run": "t0-initial.log"
+      "run": "t0-final-head.log"
     },
     "tools/review/signals.py": {
       "exit_code": 0,
-      "run": "t0-initial.log"
+      "run": "t0-final-head.log"
     },
     "tools/review/usage.py": {
       "exit_code": 0,
-      "run": "t0-initial.log"
+      "run": "t0-final-head.log"
     },
     "tools/type-census.py": {
       "exit_code": 0,
-      "run": "t0-initial.log"
+      "run": "t0-final-head.log"
     },
     "tools/verdict-diff.py": {
       "exit_code": 0,
-      "run": "t0-initial.log"
+      "run": "t0-final-head.log"
     },
     "check-arch": {
       "exit_code": 0,
-      "run": "t0-corrected-head.log"
+      "run": "t0-final-head.log"
     },
     "check-comments": {
       "exit_code": 0,
-      "run": "t0-corrected-head.log"
+      "run": "t0-final-head.log"
     },
     "check-defaults": {
       "exit_code": 0,
-      "run": "t0-corrected-head.log"
+      "run": "t0-final-head.log"
     },
     "check-levers": {
       "exit_code": 0,
-      "run": "t0-corrected-head.log"
+      "run": "t0-final-head.log"
     },
     "check-loads": {
       "exit_code": 0,
-      "run": "t0-corrected-head.log"
+      "run": "t0-final-head.log"
     },
     "check-ptx-names": {
       "exit_code": 0,
-      "run": "t0-corrected-head.log"
+      "run": "t0-final-head.log"
     },
     "check-recipes": {
       "exit_code": 0,
-      "run": "t0-corrected-head.log"
+      "run": "t0-final-head.log"
     },
     "check-records": {
       "exit_code": 0,
-      "run": "t0-corrected-head.log"
+      "run": "t0-final-head.log"
     },
     "check-rustflags": {
       "exit_code": 0,
-      "run": "t0-corrected-head.log"
+      "run": "t0-final-head.log"
     },
     "check-unsafe": {
       "exit_code": 0,
-      "run": "t0-corrected-head.log"
+      "run": "t0-final-head.log"
     },
     "check-waits": {
       "exit_code": 0,
-      "run": "t0-corrected-head.log"
+      "run": "t0-final-head.log"
     }
   },
   "t0_initial_failures_and_resolution": {
@@ -372,5 +373,7 @@
     "performance vs llama.cpp and Strata",
     "MTP/media/tool calling",
     "native AMD whole-model serving"
-  ]
+  ],
+  "t0_final_head_full_run": "t0-final-head.log",
+  "previous_source_head": "02a650f567b8dbec88e0c1ff8ab58f2be9bc5c91"
 }

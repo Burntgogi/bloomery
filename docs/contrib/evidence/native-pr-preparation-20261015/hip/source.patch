@@ -1,4 +1,4 @@
-From 48129bbe0d61f789a195411086eb48d77678cf53 Mon Sep 17 00:00:00 2001
+From 540a68c127f0592c1bef31538a309e4b77d58ed5 Mon Sep 17 00:00:00 2001
 From: Burntgogi <224273819+Burntgogi@users.noreply.github.com>
 Date: Tue, 13 Oct 2026 01:53:57 +0900
 Subject: [PATCH 1/3] lab: prove Rust AMDGPU kernels and a HIP-loaded dense FFN
@@ -930,12 +930,12 @@ index 00000000..e81faea0
 +    }
 +}
 
-base-commit: 33a6b281d6077959c27999bc370508a33c16eccc
+base-commit: ae09980c1754dfb01fbeff6f642b9c0c53ecf30f
 -- 
 2.43.0
 
 
-From f45f7dd0025d3895d2d202a892be1a1c573a6055 Mon Sep 17 00:00:00 2001
+From 276a79c6817baf9b1eff3a73453b4874dcec24b0 Mon Sep 17 00:00:00 2001
 From: Burntgogi <224273819+Burntgogi@users.noreply.github.com>
 Date: Thu, 15 Oct 2026 05:28:44 +0900
 Subject: [PATCH 2/3] lab: verify a clean HIP source head with device and
@@ -1301,7 +1301,7 @@ index 00000000..ce0f05f1
 2.43.0
 
 
-From 33f57a92e428951eb46b58a2b773d825d850c873 Mon Sep 17 00:00:00 2001
+From f7cb7d92951a02aae985269f8d3da9d30d86673a Mon Sep 17 00:00:00 2001
 From: Burntgogi <224273819+Burntgogi@users.noreply.github.com>
 Date: Thu, 15 Oct 2026 05:29:24 +0900
 Subject: [PATCH 3/3] lab: pass build-std through the clippy subcommand

@@ -1,4 +1,4 @@
-From 02a650f567b8dbec88e0c1ff8ab58f2be9bc5c91 Mon Sep 17 00:00:00 2001
+From b511fb44d47ebb9823a36073c6bd93d0be916cc0 Mon Sep 17 00:00:00 2001
 From: Burntgogi <224273819+Burntgogi@users.noreply.github.com>
 Date: Tue, 13 Oct 2026 02:30:19 +0900
 Subject: [PATCH] serve: connect dense qwen35 to native generation dispatch
@@ -447,7 +447,7 @@ index ce7425d9..9b275587 100644
              levers: &levers,
              kv: KvQ8::F16,
 diff --git a/crates/gpu-gates/src/bin/shared/serve_seats/qwen3.rs b/crates/gpu-gates/src/bin/shared/serve_seats/qwen3.rs
-index 662b793c..413e6d98 100644
+index e8544f0c..b27928a1 100644
 --- a/crates/gpu-gates/src/bin/shared/serve_seats/qwen3.rs
 +++ b/crates/gpu-gates/src/bin/shared/serve_seats/qwen3.rs
 @@ -1,6 +1,6 @@
@@ -868,7 +868,7 @@ index 0b07f02e..bf063238 100755
          check("a serves arm in a form this tool cannot read fails by file and line", False, "no failure")
      except SourceError as e:
 
-base-commit: 33a6b281d6077959c27999bc370508a33c16eccc
+base-commit: ae09980c1754dfb01fbeff6f642b9c0c53ecf30f
 -- 
 2.43.0
 
