@@ -13,35 +13,51 @@ The validation target is one RX 7900 GRE (`gfx1100`), Rust nightly 2026-08-28, i
 
 The fixed numerical acceptance is NMSE <= 1e-6 and finite outputs. Activation columns are F32: the original CUDA engine's Q8 activation scratch and quantized-dot order have not been ported. These checks do not establish CUDA/HIP bitwise equality or model-token equivalence. No throughput is claimed for the scalar kernels.
 
-## Build and run
+## Verify
 
-Install the repository's pinned nightly and `rust-src`. No cuda-oxide invocation is used for this AMD target; none of the existing CUDA device crates is built here.
+The lab owner is [Burntgogi](https://github.com/Burntgogi). Install the repository's pinned
+nightly with rust-src, rustfmt and clippy, Python 3.11 or later, and a HIP runtime exposing
+`libamdhip64.so`. The verified target is `gfx1100`; no other card is claimed.
+
+From a clean, committed checkout:
 
 ```sh
-cd labs/hip-native
-RUSTFLAGS='-C target-cpu=gfx1100 -C panic=abort' \
-  cargo -Zbuild-std=core build --release --target amdgcn-amd-amdhsa \
-  -p bloomery-hip-spike-device
-
 export HIP_LIB_DIR=/opt/rocm/lib
 export LD_LIBRARY_PATH="$HIP_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-RUSTFLAGS='-C target-cpu=native' cargo build --release -p bloomery-hip-spike
-RUSTFLAGS='-C target-cpu=native' cargo test -p bloomery-hip-spike
-RUSTFLAGS='-C target-cpu=native' cargo clippy --no-deps \
-  -p bloomery-hip-spike --all-targets -- -D warnings
-
-target/release/bloomery-hip-spike \
-  target/amdgcn-amd-amdhsa/release/bloomery_hip_spike_device.elf
+labs/hip-native/verify.sh /tmp/hip-evidence
 # Optional real Q4_K rows: exact packed bytes, K and row count.
-target/release/bloomery-hip-spike \
-  target/amdgcn-amd-amdhsa/release/bloomery_hip_spike_device.elf \
-  /path/to/q4_k_rows.bin 6144 64
+labs/hip-native/verify.sh /tmp/hip-real-evidence \
+  --q4-rows /path/to/q4_k_rows.bin --k 6144 --rows 64
 ```
 
-An SDK shipped outside `/opt/rocm` may need additional library directories. Each kernel uses a 64-thread workgroup, matching the host launch. Kernel signatures and argument storage must remain identical. All context/module/stream/buffer handles stay on their owning thread, and synchronization precedes destruction.
+The output directory must be new and outside the checkout. An SDK outside `/opt/rocm` may
+need additional runtime library directories. `verify.sh` checks formatting, host tests,
+host and device clippy with warnings denied, builds both release binaries, and runs the
+numerical cases under a 900-second bound per command. It compiles the standalone Rust
+AMDGPU device with `cargo -Zbuild-std=core`, never the existing CUDA device crates.
 
-## Scope for an upstream design discussion
+`result.json` records the clean HEAD commit, whole-repository and lab Git tree hashes,
+release binary SHA-256 hashes, Rust/LLVM version, target CPU, actual device name, HIP runtime
+and driver versions, fixture hash when present, command logs and each case. A failed check
+returns nonzero and writes a failed result. Attach the JSON from the PR's exact head; a new
+push requires a new run. Logs and generated artifacts stay out of the source tree.
 
-The experiment demonstrates a Rust device-code route that preserves the project's language choice. It does not yet connect AMD buffers to `Gpu`, `GpuModel`, an app session or `bloomery-serve`. A native backend needs a common contract for buffer windows, streams/events, kernel launches and capture, while retaining the existing model forward and expert placement owners. Compile-time selection should keep vendor dispatch out of the hot per-operator path.
+The default run has three synthetic matrix shapes and one dense FFN case. The optional
+fixture adds matrix-vector and 32-column cases. Use packed rows of a Q4_K tensor obtained
+through the existing GGUF reader (`gguf::Split`/`TensorInfo`), with no conversion of its
+weight bits. Record the original file SHA-256, tensor name and row range alongside the
+result; do not upload model weights in the PR. Case results establish numerical operator
+checks only, with no timing claim.
 
-Next operator work should match the original activation layouts and cover GDN/QSA, routed experts, PLE and state reset/checkpoint semantics. The CUDA path must retain its existing gates; AMD numerical and end-to-end gates must use AMD hardware. Wider hardware coverage, graph capture and performance tuning follow correctness. The whole-model libllama adapter is not part of this native backend proposal.
+Every kernel uses a 64-thread workgroup, matching its host launch. Kernel signatures and
+argument storage must remain identical. Context/module/stream/buffer handles stay on their
+owning thread, and synchronization precedes destruction.
+
+## Next native work
+
+This lab is not connected to `Gpu`, `GpuModel`, an app session or `bloomery-serve`. The next
+experiment is the existing Q4_K selected GEMV through a thin HIP shim, preserving its Q8
+activation layout, logical warp operations, launch shape and sum order. The scalar F32
+kernel here is not that port. Then gate one complete model forward against llama.cpp HIP
+on identical model bits before designing a common backend boundary with the maintainers.
+Attention/GDN, state reset/checkpoints, routed experts and media remain separate work.
