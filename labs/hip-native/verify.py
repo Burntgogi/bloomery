@@ -116,11 +116,11 @@ def main():
         run("host-test", ["cargo", "test", "--locked", "-p", "bloomery-hip-spike"], host_flags)
         run("host-clippy", ["cargo", "clippy", "--locked", "--no-deps", "-p",
                             "bloomery-hip-spike", "--all-targets", "--", "-D", "warnings"], host_flags)
-        device = ["cargo", "-Zbuild-std=core"]
+        device = ["cargo"]
         target = ["--release", "--target", "amdgcn-amd-amdhsa", "-p", "bloomery-hip-spike-device"]
-        run("device-clippy", device + ["clippy", "--locked", "--no-deps"] + target +
+        run("device-clippy", device + ["clippy", "-Zbuild-std=core", "--locked", "--no-deps"] + target +
             ["--", "-D", "warnings"], device_flags)
-        run("device-build", device + ["build", "--locked"] + target, device_flags)
+        run("device-build", device + ["build", "-Zbuild-std=core", "--locked"] + target, device_flags)
         run("host-build", ["cargo", "build", "--locked", "--release", "-p", "bloomery-hip-spike"], host_flags)
         binaries = [LAB / "target/release/bloomery-hip-spike",
                     LAB / "target/amdgcn-amd-amdhsa/release/bloomery_hip_spike_device.elf"]
