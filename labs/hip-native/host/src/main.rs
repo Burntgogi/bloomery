@@ -229,7 +229,11 @@ fn case(s: &mut Context, weights: &[u8], k: usize, rows: usize, cols: usize) -> 
     unsafe {
         s.copy(roundtrip.as_mut_ptr().cast(), copy_out, nx, 2)?;
     }
-    if roundtrip != x {
+    if !roundtrip
+        .iter()
+        .zip(&x)
+        .all(|(a, b)| a.to_bits() == b.to_bits())
+    {
         return Err("Rust GPU copy roundtrip differs".into());
     }
     let f = s.function("bloomery_hip_q4_matmul")?;
@@ -272,20 +276,20 @@ fn case(s: &mut Context, weights: &[u8], k: usize, rows: usize, cols: usize) -> 
                 .map(|(&a, &b)| f64::from(a) * f64::from(b))
                 .sum();
             let got = f64::from(y[col * rows + row]);
-            if !got.is_finite() {
-                return Err("non-finite output".into());
+            if !got.is_finite() || !reference.is_finite() {
+                return Err("non-finite output or reference".into());
             }
             error += (got - reference).powi(2);
             norm += reference.powi(2);
         }
     }
     let nmse = error / norm.max(1e-30);
-    println!(
-        "{{\"k\":{k},\"rows\":{rows},\"cols\":{cols},\"nmse\":{nmse},\"copy_equal\":true,\"steady_host_buffer_allocations\":0}}"
-    );
-    if nmse > 1e-6 {
+    if !nmse.is_finite() || nmse > 1e-6 {
         return Err(format!("NMSE {nmse} exceeds fixed 1e-6"));
     }
+    println!(
+        "{{\"operation\":\"q4_matmul\",\"k\":{k},\"rows\":{rows},\"cols\":{cols},\"nmse\":{nmse},\"copy_equal\":true,\"steady_host_buffer_allocations\":0}}"
+    );
     Ok(())
 }
 
@@ -294,6 +298,9 @@ fn run() -> Result<(), String> {
     let path = args
         .first()
         .ok_or("usage: bloomery-hip-spike DEVICE_ELF [Q4_K_FILE K ROWS]")?;
+    if args.len() != 1 && args.len() != 4 {
+        return Err("expected DEVICE_ELF [Q4_K_FILE K ROWS]".into());
+    }
     let mut s = Context::open(path)?;
     for (k, rows, cols) in [(256, 7, 1), (512, 64, 1), (512, 64, 32)] {
         case(&mut s, &fixture(k, rows), k, rows, cols)?;
@@ -305,8 +312,6 @@ fn run() -> Result<(), String> {
         for cols in [1, 32] {
             case(&mut s, &weights, k, rows, cols)?;
         }
-    } else if args.len() != 1 {
-        return Err("expected DEVICE_ELF [Q4_K_FILE K ROWS]".into());
     }
     dense_ffn(&mut s)?;
     Ok(())
@@ -432,19 +437,19 @@ fn dense_ffn(s: &mut Context) -> Result<(), String> {
     let mut energy = 0.0;
     for ((actual, reference), &residual) in got.iter().zip(reference).zip(&x) {
         let reference = reference + f64::from(residual);
-        if !actual.is_finite() {
-            return Err("FFN returned a nonfinite value".into());
+        if !actual.is_finite() || !reference.is_finite() {
+            return Err("FFN output or reference is nonfinite".into());
         }
         error += (f64::from(*actual) - reference).powi(2);
         energy += reference.powi(2);
     }
     let nmse = error / energy.max(1e-30);
+    if !nmse.is_finite() || nmse > 1e-6 {
+        return Err(format!("FFN NMSE {nmse} exceeds fixed 1e-6"));
+    }
     println!(
         "{{\"operation\":\"dense_ffn\",\"width\":256,\"nmse\":{nmse},\"intermediate_host_copies\":0,\"steady_host_buffer_allocations\":0}}"
     );
-    if nmse > 1e-6 {
-        return Err(format!("FFN NMSE {nmse} exceeds fixed 1e-6"));
-    }
     Ok(())
 }
 
