@@ -383,6 +383,7 @@ blk_pytools() {
     "tools/review/diagnostics.py --self-test"
     "tools/review/labels.py --self-test"
     "tools/review/ledger.py --self-test"
+    "tools/review/local.py --self-test"
     "tools/review/post.py --self-test"
     "tools/review/run.py --self-test"
     "tools/review/signals.py --self-test"
