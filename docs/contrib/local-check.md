@@ -176,7 +176,9 @@ runners; a fixture-only gate stays ([`dgx-spark.md`](dgx-spark.md) section 11, a
 
 `<base>` is the upstream commit your branch starts from; `upstream/main` works, because `affected` diffs from its merge
 base with `HEAD`, so it needs a git clone with that history. `--no-box` keeps `affected` from reading the box's build
-information over ssh. The dry run touches neither the box nor an output directory, and prints one `lane` line per item.
+information over ssh. Without an SSH client on `PATH`, `affected` exits 2 with a named error and the `--no-box`
+workaround; it does not silently omit dep-info. The dry run touches neither the box nor an output directory, and prints
+one `lane` line per item.
 A line `lane -  <item>` followed by `deferred to the real tier (<kind>)` is an item the fixture tier does not run:
 real-only, real-file, or of a family with no fixture. A line `lane A`, `lane B` or `lane X` is an item it runs, with its
 command. Your list is the items of the second kind. Keep `gate-ptx-spill` on it only where its tables pin your PTX
