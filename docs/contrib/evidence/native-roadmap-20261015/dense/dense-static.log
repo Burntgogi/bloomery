@@ -1,0 +1,12 @@
+    Checking bloomery-placement v0.1.0 (/home/jutai05/bloomery-native-contributions-20261013/dense-pr/crates/placement)
+    Checking bloomery-refset v0.1.0 (/home/jutai05/bloomery-native-contributions-20261013/dense-pr/crates/refset)
+    Checking bloomery-serve v0.3.2 (/home/jutai05/bloomery-native-contributions-20261013/dense-pr/crates/serve)
+    Checking bloomery-model v0.1.0 (/home/jutai05/bloomery-native-contributions-20261013/dense-pr/crates/model)
+    Checking bloomery-gpu v0.1.0 (/home/jutai05/bloomery-native-contributions-20261013/dense-pr/crates/gpu)
+    Checking bloomery-gpu-deepseek41 v0.1.0 (/home/jutai05/bloomery-native-contributions-20261013/dense-pr/crates/gpu-deepseek41)
+    Checking bloomery-gpu-vision v0.1.0 (/home/jutai05/bloomery-native-contributions-20261013/dense-pr/crates/gpu-vision)
+    Checking bloomery-gpu-glm5next v0.1.0 (/home/jutai05/bloomery-native-contributions-20261013/dense-pr/crates/gpu-glm5next)
+    Checking bloomery-gpu-mimo2 v0.1.0 (/home/jutai05/bloomery-native-contributions-20261013/dense-pr/crates/gpu-mimo2)
+    Checking bloomery-app v0.1.0 (/home/jutai05/bloomery-native-contributions-20261013/dense-pr/crates/app)
+    Checking bloomery-gpu-gates v0.3.2 (/home/jutai05/bloomery-native-contributions-20261013/dense-pr/crates/gpu-gates)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 11.85s
