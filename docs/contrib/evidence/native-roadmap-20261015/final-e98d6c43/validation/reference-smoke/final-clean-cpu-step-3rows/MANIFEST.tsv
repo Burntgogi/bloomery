@@ -1,0 +1,28 @@
+# Dense forced-logit diagnostic; no numerical accuracy gate
+# format	bloomery-forced-logits-v1
+# model	/home/jutai05/bloomery-native-model-candidates/notschmee/Qwen3.5-0.8B-GGUF/1870603ac8ab59c7ddb9d94cccf3b297e379538f/Qwen3.5-0.8B-Q4_K_M.gguf
+# model_sha256	be5b3cb8c2f3ebd791349c9c775ea38950f23a2b9e792ca2f0411597dd172988
+# model_revision	1870603ac8ab59c7ddb9d94cccf3b297e379538f
+# arch	qwen35
+# target	qwen35-0.8b-candidate
+# engine	reference
+# backend	cpu
+# build	fb4b2737a808a3fb7c2117a498f43815dc9be53e
+# source_head	9c5b3a5f484196a3c56e1081fa5211655a146fd3
+# binary_sha256	6b434be85b732c318f3a7e6857bc3884d2a6af6e92b68635f817931dfb0976b4
+# source_dirty	false
+# driver_sha256	4169017361e2fb50e115396e475d9d44c60992fb61898a978585b213dcce2907
+# prompt_sha256	01246af9a2bd1e5e01d3f6cd13aae50b84da255ffd69a7dfa7c46ac89da63dc2
+# forced_sha256	1f345bfe81c82133294b44f81f7dc8a26aa9295090df6ee715665ec028432032
+# ctx	64
+# ubatch	16
+# kv	f16
+# rows	3
+# vocab	248320
+# raw_sha256	4d11b6277972ed434df87a3f2480dfc75f7d9a94c53011e2ba5641b2137d6961
+# mode	reference
+# prefill	step
+# last_step	true
+# kind	name	occurrence	type	ne0	ne1	ne2	ne3	bytes	op
+tensor	logits	0	f32	248320	3	1	1	2979840	DIAGNOSTIC
+# complete	1	0

@@ -1,0 +1,39 @@
+{
+  "model_sha256": "e00082f779fa385cee8c68a3ec8833a75778cc87272240b942f74e0b8243e520",
+  "model": "/home/jutai05/llama-stack/models/qwen38-native-q4km/lmstudio-community/Qwen3.8-27B-Q4_K_M.gguf",
+  "corpus": "synthetic prose, no external corpus",
+  "corpus_sha256": "3ad51caab2febcae225207a69ce7f210a276bd65c4a6b71b8b5034147ae7b4cd",
+  "tokenizer_source_head": "9c5b3a5f484196a3c56e1081fa5211655a146fd3",
+  "tokenizer_binary_sha256": "428ef58d507012f74aecbf294dad6f8e7a88456666ddd528f661fffc3268c4f1",
+  "command": [
+    "/home/jutai05/bloomery-native-contributions-20261013/dense-validation/target/debug/bloomery-tokenize",
+    "-m",
+    "/home/jutai05/llama-stack/models/qwen38-native-q4km/lmstudio-community/Qwen3.8-27B-Q4_K_M.gguf",
+    "-f",
+    "/home/jutai05/bloomery-native-contributions-20261013/roadmap-20261015/dense-inputs/corpus.txt",
+    "--ids",
+    "--no-bos",
+    "--no-parse-special"
+  ],
+  "source_token_count": 15350,
+  "add_bos": false,
+  "parse_special": false,
+  "fixtures": {
+    "p64.ids": {
+      "sha256": "801d9a1908afc11f7e77d2414eb35f92abaf855e2640c22e2e0336a5bc551525",
+      "count": 64
+    },
+    "f64.ids": {
+      "sha256": "9cbe824f20cbe3b2a9fdbe6faff079c486e2b9178101f198f6a2808c60bf2eea",
+      "count": 32
+    },
+    "p4096.ids": {
+      "sha256": "f3f3e285a5adcdf009047d9afabd93815a2fdc29eaf5fc12240d5d3294edad0c",
+      "count": 4096
+    },
+    "f4096.ids": {
+      "sha256": "6fd4adc9e3df2c02ebef1f7713991827ce3f6b92bb487b5b58b70753f8665c83",
+      "count": 32
+    }
+  }
+}

@@ -1,0 +1,1945 @@
+diff --git a/crates/gpu-gates/src/bin/generate_qwen3moe.rs b/crates/gpu-gates/src/bin/generate_qwen3moe.rs
+index fc63824d..1e7744f1 100644
+--- a/crates/gpu-gates/src/bin/generate_qwen3moe.rs
++++ b/crates/gpu-gates/src/bin/generate_qwen3moe.rs
+@@ -8,7 +8,7 @@
+ //!     generate_qwen3moe (--prompt <text> | --tokens a,b,c | --seed-depth D)
+ //!                       [-n N] [--ctx C] [--mode eager|graph]
+ //!                       [--prefill auto|pass|gemm|step] [--place a|gate|bp|<cards>]
+-//!                       [--time [--warm W]] [--logits] [--last-step]
++//!                       [--time [--warm W]] [--logits] [--last-step] [--logit-rows FILE]
+ //!     generate_qwen3moe --arm a,b,c[/N] [--arm ...] [--arm-sync] [-n N] [--ctx C] ...
+ //!     generate_qwen3moe --dump-taps DIR --tokens-file F [--tokens-file F ...]
+ //!                       --seqs S --prompt-len P [-n N] [--ctx C]
+@@ -302,6 +302,14 @@
+ //! line: the head's last logits row, read back once — the argmax's lead over
+ //! the best other logit, and the row by its f32 bits (FNV-1a 64).
+ //!
++//! `--logit-rows FILE` writes every teacher-forced row as little-endian f32 and
++//! completes `FILE.meta` with the exact prompt/forced ids, dimensions and schedule.
++//! It requires `BLOOMERY_FORCE_IDS` and `--last-step`: row zero follows the full
++//! prompt, row i follows forced token i - 1. Both files must be new. This diagnostic
++//! uses one plain Qwen3/Body35 arm and slot; drafts, timing, synthetic seed depth,
++//! arm lists and qwen4exp are refused. `auto`, `pass` and `gemm` keep their existing
++//! prompt schedules; the prompt's last token always uses the step head.
++//!
+ //! `BLOOMERY_STEP_STATS=1` on a qwen4exp file reads, before the first
+ //! generated step and after each one, the host tier's counters
+ //! (`HybridStats`) with the go waits of the services since the read before,
+@@ -396,6 +404,7 @@ mod cli {
+ 
+     use bloomery_gpu_gates::generate::{Place, card_words, lane_at};
+     use bloomery_gpu_gates::host_stats::{Probe, print_stats};
++    use bloomery_gpu_gates::logit_rows::{ForcedFacts, ForcedRows};
+     use bloomery_gpu_gates::nodes::count_kinds;
+     use bloomery_gpu_gates::record::{self, Record};
+     use bloomery_gpu_gates::residency38::{CARD38, Lever38, Seqs, residency38};
+@@ -1204,6 +1213,8 @@ mod cli {
+         mode: StepMode,
+         seed_depth: Option<usize>,
+         logits: bool,
++        /// A raw forced-row dump and the explicitly resolved prefill word.
++        logit_rows: Option<(PathBuf, String)>,
+         tok: Option<Tokenizer>,
+         /// `--ctx`, as the `SMOKE` line prints it.
+         ctx: usize,
+@@ -1344,6 +1355,7 @@ mod cli {
+         let timed = std::env::args().any(|a| a == "--time");
+         let sync = std::env::args().any(|a| a == "--arm-sync");
+         let logits = std::env::args().any(|a| a == "--logits");
++        let logit_rows = flag("--logit-rows")?.map(PathBuf::from);
+         let last_step = std::env::args().any(|a| a == "--last-step");
+         let n_gen: usize = flag("-n")?.map_or(Ok(32), |s| s.parse())?;
+         let ctx: usize = flag("--ctx")?.map_or(Ok(4096), |s| s.parse())?;
+@@ -1400,6 +1412,25 @@ mod cli {
+                 .collect::<Result<_, GateError>>()?
+         };
+         let slots = levers.gen_slots();
++        if logit_rows.is_some() {
++            if !last_step || levers.force_ids().is_none() {
++                return Err("--logit-rows requires --last-step and BLOOMERY_FORCE_IDS".into());
++            }
++            if family == Family::Qwen38
++                || timed
++                || flag("--warm")?.is_some()
++                || seed_depth.is_some()
++                || !arm_specs.is_empty()
++                || slots != 1
++                || levers.draft().is_some_and(|word| word != "off")
++            {
++                return Err(
++                    "--logit-rows runs one plain Qwen3/Body35 arm and slot; it refuses \
++                     qwen4exp, --time, --warm, --seed-depth, --arm, multiple slots and drafts"
++                        .into(),
++                );
++            }
++        }
+         if slots > 1 && levers.force_ids().is_some() {
+             return Err(format!(
+                 "BLOOMERY_FORCE_IDS takes one stream's ids from a file; BLOOMERY_GEN_SLOTS={slots} \
+@@ -1641,6 +1672,7 @@ mod cli {
+             mode,
+             seed_depth,
+             logits,
++            logit_rows: logit_rows.map(|path| (path, prefill.unwrap_or("auto").to_owned())),
+             tok,
+             ctx,
+             stats: levers.step_stats(),
+@@ -1739,7 +1771,7 @@ mod cli {
+     }
+ 
+     /// The flags `--dump-taps` refuses by name: every other mode's.
+-    const NOT_WITH_DUMP: [&str; 11] = [
++    const NOT_WITH_DUMP: [&str; 12] = [
+         "--prompt",
+         "--tokens",
+         "--seed-depth",
+@@ -1748,6 +1780,7 @@ mod cli {
+         "--time",
+         "--warm",
+         "--logits",
++        "--logit-rows",
+         "--prefill",
+         "--mode",
+         "--place",
+@@ -3070,6 +3103,27 @@ mod cli {
+         arm: &Arm,
+     ) -> Result<(), GateError> {
+         let (ids, n_gen, warm) = (&arm.ids, arm.n_gen, run.warm);
++        let mut logit_rows = run
++            .logit_rows
++            .as_ref()
++            .map(|(file, prefill)| {
++                let forced = run
++                    .force
++                    .as_deref()
++                    .and_then(|ids| ids.get(..n_gen))
++                    .ok_or("--logit-rows has fewer forced ids than output rows")?;
++                ForcedRows::create(
++                    file,
++                    m.n_vocab()?,
++                    ForcedFacts {
++                        prompt_ids: ids,
++                        forced_ids: forced,
++                        mode: mode_name(run.mode),
++                        prefill,
++                    },
++                )
++            })
++            .transpose()?;
+         if let Some(d) = run.seed_depth.filter(|&d| d > 1) {
+             B::seed(m, d - 1)?;
+             println!("seed rows={} pos={}", d - 1, m.pos());
+@@ -3093,6 +3147,9 @@ mod cli {
+             (true, None) => return Err("the prompt has no ids".into()),
+         };
+         let prefill_wall = t.elapsed();
++        if let Some(rows) = &mut logit_rows {
++            rows.read(&m.logits()?)?;
++        }
+         // Under `BLOOMERY_FORCE_IDS` the file's ids replace the argmax, the
+         // prompt call's included.
+         let mut forced = run
+@@ -3125,6 +3182,9 @@ mod cli {
+             let t0 = Instant::now();
+             let argmax = m.step(&[next])?;
+             let ms = t0.elapsed().as_secs_f64() * 1e3;
++            if let Some(rows) = &mut logit_rows {
++                rows.read(&m.logits()?)?;
++            }
+             next = match &mut forced {
+                 Some(f) => f.take()?,
+                 None => argmax,
+@@ -3189,6 +3249,9 @@ mod cli {
+             );
+         }
+         print_stats(&probes, warm);
++        if let Some(rows) = logit_rows {
++            rows.finish()?;
++        }
+         Ok(())
+     }
+ 
+diff --git a/crates/gpu-gates/src/generate.rs b/crates/gpu-gates/src/generate.rs
+index 4885488c..dd2d237f 100644
+--- a/crates/gpu-gates/src/generate.rs
++++ b/crates/gpu-gates/src/generate.rs
+@@ -1397,16 +1397,15 @@ impl TopRows {
+         let (Some(path), Some(kept)) = (rows, &self.kept) else {
+             return Ok(());
+         };
+-        let bytes: Vec<u8> = kept.iter().flat_map(|v| v.to_le_bytes()).collect();
+-        std::fs::OpenOptions::new()
++        let bytes = std::fs::OpenOptions::new()
+             .append(true)
+             .open(path)
+-            .and_then(|mut f| f.write_all(&bytes))
++            .and_then(|mut f| crate::logit_rows::write_f32s(&mut f, kept))
+             .map_err(|e| format!("--rows {}: {e}", path.display()))?;
+         Record::new(&record::ROWS)
+             .u("rows", self.tops.len())
+             .u("n", kept.len() / self.tops.len().max(1))
+-            .u("bytes", bytes.len())
++            .u("bytes", bytes)
+             .w("path", path.display())
+             .print();
+         Ok(())
+diff --git a/crates/gpu-gates/src/lib.rs b/crates/gpu-gates/src/lib.rs
+index c152f0ec..8074e8a7 100644
+--- a/crates/gpu-gates/src/lib.rs
++++ b/crates/gpu-gates/src/lib.rs
+@@ -33,6 +33,7 @@ pub mod ik_norm;
+ pub mod ik_q8_2;
+ pub mod image_plan;
+ pub mod kld;
++pub mod logit_rows;
+ pub mod model_file;
+ #[cfg(feature = "gpu")]
+ pub mod nodes;
+diff --git a/crates/gpu-gates/src/logit_rows.rs b/crates/gpu-gates/src/logit_rows.rs
+new file mode 100644
+index 00000000..8682400b
+--- /dev/null
++++ b/crates/gpu-gates/src/logit_rows.rs
+@@ -0,0 +1,216 @@
++//! Raw diagnostic logits, independent of how a generator chooses its next token.
++
++use std::fs::{File, OpenOptions};
++use std::io::{self, BufWriter, Write};
++use std::path::{Path, PathBuf};
++
++use crate::GateError;
++
++/// Write f32 bits in vocabulary order, little-endian, without changing the row.
++pub(crate) fn write_f32s(writer: &mut impl Write, values: &[f32]) -> io::Result<usize> {
++    let bytes: Vec<_> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
++    writer.write_all(&bytes)?;
++    Ok(bytes.len())
++}
++
++/// The input tokens and schedule behind a teacher-forced row dump.
++pub struct ForcedFacts<'a> {
++    pub prompt_ids: &'a [u32],
++    pub forced_ids: &'a [u32],
++    pub mode: &'a str,
++    pub prefill: &'a str,
++}
++
++/// A new raw f32 file whose sidecar is completed only after every expected row.
++/// Row zero follows the full prompt; row i follows forced token i - 1.
++pub struct ForcedRows<'a> {
++    raw: BufWriter<File>,
++    meta: PathBuf,
++    vocab: usize,
++    rows: usize,
++    facts: ForcedFacts<'a>,
++}
++
++impl<'a> ForcedRows<'a> {
++    /// Create a new dump, refusing existing output, empty inputs and out-of-vocabulary ids.
++    /// The caller must feed the prompt's last token as a step before reading row zero.
++    pub fn create(path: &Path, vocab: usize, facts: ForcedFacts<'a>) -> Result<Self, GateError> {
++        if vocab == 0 || facts.prompt_ids.is_empty() || facts.forced_ids.is_empty() {
++            return Err(
++                "--logit-rows needs a vocabulary, a prompt and forced output tokens".into(),
++            );
++        }
++        if !matches!(facts.mode, "eager" | "graph")
++            || !matches!(facts.prefill, "auto" | "pass" | "gemm")
++        {
++            return Err("--logit-rows received an unsupported execution schedule".into());
++        }
++        for (kind, ids) in [("prompt", facts.prompt_ids), ("forced", facts.forced_ids)] {
++            if let Some((i, id)) = ids
++                .iter()
++                .enumerate()
++                .find(|(_, id)| **id as usize >= vocab)
++            {
++                return Err(format!(
++                    "--logit-rows: {kind} id {i} is {id}, outside vocabulary {vocab}"
++                )
++                .into());
++            }
++        }
++        let mut meta = path.as_os_str().to_os_string();
++        meta.push(".meta");
++        let meta = PathBuf::from(meta);
++        if meta.try_exists()? {
++            return Err(format!("--logit-rows: {} already exists", meta.display()).into());
++        }
++        let raw = OpenOptions::new()
++            .write(true)
++            .create_new(true)
++            .open(path)
++            .map_err(|e| format!("--logit-rows {}: {e}", path.display()))?;
++        Ok(Self {
++            raw: BufWriter::new(raw),
++            meta,
++            vocab,
++            rows: 0,
++            facts,
++        })
++    }
++
++    /// Append one finite vocabulary row; the forced token need not be its argmax.
++    pub fn read(&mut self, row: &[f32]) -> Result<(), GateError> {
++        if self.rows >= self.facts.forced_ids.len() || row.len() != self.vocab {
++            return Err(format!(
++                "--logit-rows: row {} has {} values for {} rows of vocabulary {}",
++                self.rows,
++                row.len(),
++                self.facts.forced_ids.len(),
++                self.vocab
++            )
++            .into());
++        }
++        if let Some((id, value)) = row.iter().enumerate().find(|(_, v)| !v.is_finite()) {
++            return Err(format!(
++                "--logit-rows: row {} id {id} is non-finite ({value})",
++                self.rows
++            )
++            .into());
++        }
++        write_f32s(&mut self.raw, row)?;
++        self.rows += 1;
++        Ok(())
++    }
++
++    /// Flush all rows and write the dimensions, exact ids and completion trailer to FILE.meta.
++    pub fn finish(mut self) -> Result<(), GateError> {
++        if self.rows != self.facts.forced_ids.len() {
++            return Err(format!(
++                "--logit-rows: wrote {} of {} forced rows",
++                self.rows,
++                self.facts.forced_ids.len()
++            )
++            .into());
++        }
++        self.raw.flush()?;
++        let mut meta = BufWriter::new(
++            OpenOptions::new()
++                .write(true)
++                .create_new(true)
++                .open(&self.meta)?,
++        );
++        writeln!(
++            meta,
++            "format\tbloomery-forced-logits-v1\ndtype\tfloat32-le\nrows\t{}\nvocab\t{}",
++            self.rows, self.vocab
++        )?;
++        for (kind, ids) in [
++            ("prompt_ids", self.facts.prompt_ids),
++            ("forced_ids", self.facts.forced_ids),
++        ] {
++            write!(meta, "{kind}\t")?;
++            for (i, id) in ids.iter().enumerate() {
++                if i > 0 {
++                    write!(meta, ",")?;
++                }
++                write!(meta, "{id}")?;
++            }
++            writeln!(meta)?;
++        }
++        writeln!(
++            meta,
++            "mode\t{}\nprefill\t{}\nlast_step\ttrue\ncomplete\ttrue",
++            self.facts.mode, self.facts.prefill
++        )?;
++        meta.flush()?;
++        Ok(())
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::sync::atomic::{AtomicUsize, Ordering};
++
++    static NEXT: AtomicUsize = AtomicUsize::new(0);
++
++    fn path() -> PathBuf {
++        std::env::temp_dir().join(format!(
++            "bloomery-forced-rows-{}-{}",
++            std::process::id(),
++            NEXT.fetch_add(1, Ordering::Relaxed)
++        ))
++    }
++
++    fn facts() -> ForcedFacts<'static> {
++        ForcedFacts {
++            prompt_ids: &[2, 1],
++            forced_ids: &[0, 1],
++            mode: "graph",
++            prefill: "pass",
++        }
++    }
++
++    #[test]
++    fn forced_rows_keep_bits_and_token_alignment_without_argmax_picking() {
++        let path = path();
++        let mut dump = ForcedRows::create(&path, 3, facts()).unwrap();
++        let meta = dump.meta.clone();
++        assert!(!meta.exists());
++        dump.read(&[-0.0, 4.0, 9.0]).unwrap();
++        dump.read(&[8.0, 2.0, 3.0]).unwrap();
++        assert!(dump.read(&[1.0, 2.0, 3.0]).is_err());
++        dump.finish().unwrap();
++        let expected: Vec<_> = [-0.0f32, 4.0, 9.0, 8.0, 2.0, 3.0]
++            .iter()
++            .flat_map(|v| v.to_le_bytes())
++            .collect();
++        assert_eq!(std::fs::read(&path).unwrap(), expected);
++        let text = std::fs::read_to_string(&meta).unwrap();
++        assert!(text.contains("rows\t2\nvocab\t3\nprompt_ids\t2,1\nforced_ids\t0,1\n"));
++        assert!(text.ends_with("last_step\ttrue\ncomplete\ttrue\n"));
++        assert!(ForcedRows::create(&path, 3, facts()).is_err());
++        std::fs::remove_file(path).unwrap();
++        std::fs::remove_file(meta).unwrap();
++    }
++
++    #[test]
++    fn refused_or_incomplete_rows_never_complete_a_dump() {
++        let path = path();
++        assert!(ForcedRows::create(&path, 2, facts()).is_err());
++        assert!(!path.exists());
++        let mut dump = ForcedRows::create(&path, 3, facts()).unwrap();
++        let meta = dump.meta.clone();
++        for row in [
++            &[1.0, 2.0][..],
++            &[1.0, f32::NAN, 2.0],
++            &[f32::INFINITY, 1.0, 2.0],
++        ] {
++            assert!(dump.read(row).is_err());
++        }
++        dump.read(&[1.0, 2.0, 3.0]).unwrap();
++        assert!(dump.finish().is_err());
++        assert!(!meta.exists());
++        assert!(ForcedRows::create(&path, 3, facts()).is_err());
++        std::fs::remove_file(path).unwrap();
++    }
++}
+diff --git a/docs/contrib/qwen35-dense-validation.md b/docs/contrib/qwen35-dense-validation.md
+new file mode 100644
+index 00000000..66e70fae
+--- /dev/null
++++ b/docs/contrib/qwen35-dense-validation.md
+@@ -0,0 +1,205 @@
++# Dense Qwen forced-logit validation handoff
++
++The native diagnostic extends the existing `generate_qwen3moe` loop over
++`GpuModel<Body35>`. The HTTP checks exercise the existing Qwen seat and
++`app::Session<Body35>` server path. `tools/ref/dense_logits_ref.cpp` independently reads the
++same model with mainline llama.cpp. `dense-logits.py` builds the reference,
++captures immutable input/build identities, runs either binary with bounds, and
++compares completed raw rows. These are diagnostic tools. A registered dense
++reference family, numerical acceptance band and full A6000 serving gates remain
++separate work; a successful dump or a comparison without a band is not a model
++correctness gate.
++
++## Model and row contract
++
++The default target `qwen38-27b` is exactly
++[`lmstudio-community/Qwen3.8-27B-GGUF`](https://huggingface.co/lmstudio-community/Qwen3.8-27B-GGUF/blob/5a7da681f60570ab5b439a587e912d2e5eddb582/Qwen3.8-27B-Q4_K_M.gguf),
++revision `5a7da681f60570ab5b439a587e912d2e5eddb582`, file
++`Qwen3.8-27B-Q4_K_M.gguf`, 16,810,714,336 bytes, SHA-256
++`e00082f779fa385cee8c68a3ec8833a75778cc87272240b942f74e0b8243e520`.
++It is dense `qwen35`, with 64 trunk layers and vocabulary248320; the 15 unused
++next-token tensors do not enable MTP. The host coverage result still lists a
++missing tool-call parser. The initial lane is plain-text generation with draft
++off and F16 KV.
++
++The optional `--target qwen35-0.8b-candidate` is a different, explicitly selected
++file: [`notschmee/Qwen3.5-0.8B-GGUF`](https://huggingface.co/notschmee/Qwen3.5-0.8B-GGUF/blob/1870603ac8ab59c7ddb9d94cccf3b297e379538f/Qwen3.5-0.8B-Q4_K_M.gguf),
++590,880,672 bytes, SHA-256
++`be5b3cb8c2f3ebd791349c9c775ea38950f23a2b9e792ca2f0411597dd172988`.
++It is a preparation/smoke target with Q8_0 tied embedding/head, not a replacement
++for the 27B contribution target. The runner checks complete size and SHA before
++opening either engine; another Q4_K_M file is refused.
++
++Inputs are two nonempty UTF-8 files, one decimal token id per line, no headers or
++blank lines. `prompt.ids` is the complete prompt. `forced.ids` has N continuation
++ids. Row0 is the logit row after the complete prompt, predicting `forced[0]`;
++row i>0 follows feeding `forced[i-1]`. The last forced id is recorded but is not
++fed. No greedy replacement, tokenization or chat template is applied by these
++tools. An out-of-vocabulary id is refused, not clamped.
++
++`logits.0.f32` is `[N,248320]` IEEE754 f32, little-endian, contiguous by row. The
++raw file's `.meta` sidecar is written after the last finite row and successful
++close. The runner verifies the sidecar's ids/shape, then writes the diagnostic
++`MANIFEST.tsv` with model SHA, prompt/continuation SHA, native and reference
++commits, binary SHA, context, prefill, KV and the raw-file digest. Only a successful
++run publishes its files to an exclusively created output directory, with the
++complete manifest last; existing output is refused. Failed command output and
++exit status stay in the incomplete staging directory.
++`tools/bloomery/manifest.py` is the manifest reader. Timeout cleanup is limited to
++the launched process session, including the gate wrapper's separate timeout
++process group; it never looks for or stops an existing model server.
++
++## Build on the A6000 lane
++
++Use a clean contribution checkout, pinned Rust/CUDA toolchain, and the exact model
++file above. The following `build-native` command actually runs `cargo oxide` and
++stamps both native binaries from that successful build. A hand-written stamp or
++an old binary beside a new checkout is not accepted as build evidence.
++
++```sh
++python3 tools/ref/dense-logits.py --self-test
++python3 tools/ref/dense-logits.py build-native --arch sm_86
++```
++
++The reference uses a clean official `ggml-org/llama.cpp` checkout and an existing
++configured shared-library build. The harness has been compiled against commit
++`fb4b2737a808a3fb7c2117a498f43815dc9be53e`. Pin the chosen commit and preserve its
++CUDA build flags. If configuring a new build, use that checkout's documented
++CMake invocation with `GGML_CUDA=ON` and `BUILD_SHARED_LIBS=ON`. The helper runs
++the normal incremental `llama`/`ggml` build before linking, validates the source
++directory and build-info commit, and records every shared library's SHA:
++
++```sh
++python3 tools/ref/dense-logits.py build \
++  --llama-tree /absolute/path/llama.cpp \
++  --llama-build /absolute/path/llama.cpp/build \
++  --out "$PWD/target/release/dense_logits_ref"
++```
++
++`--cached-libraries` is an explicit local smoke option. Its build record states
++that cached-library hashes do not prove source/build correspondence. Use the
++normal incremental build for the maintainer lane. Runtime prepends the recorded
++library directory, checks the loader's resolved llama/ggml paths, refuses
++`LD_PRELOAD`/`LD_AUDIT`, and rechecks library and binary hashes after the run.
++
++## Fixed short and 4K inputs
++
++Use a recorded corpus of token ids from this exact model's tokenizer. Prepare
++64-token and 4096-token prompts, each with the following 32 ids as teacher-forced
++continuation. Keep the original corpus path/hash in the handoff record. For a
++corpus with at least 4128 ids, this preparation preserves literal ids:
++
++```sh
++python3 - /absolute/path/corpus.ids /absolute/path/dense-inputs <<'PY'
++from pathlib import Path
++import hashlib, itertools, json, sys
++source, out = map(Path, sys.argv[1:])
++with source.open() as stream:
++    lines = list(itertools.islice(stream, 4128))
++ids = [int(line.strip()) for line in lines]
++assert len(ids) == 4128 and all(0 <= i < 248320 for i in ids)
++out.mkdir()  # a new input directory
++for p in (64, 4096):
++    (out / f'p{p}.ids').write_text(''.join(f'{i}\n' for i in ids[:p]))
++    (out / f'f{p}.ids').write_text(''.join(f'{i}\n' for i in ids[p:p+32]))
++with source.open('rb') as stream:
++    sha = hashlib.file_digest(stream, 'sha256').hexdigest()
++(out / 'source.json').write_text(json.dumps({'path':str(source), 'sha256':sha})+'\n')
++PY
++```
++
++## Capture and compare
++
++Set `BLOOMERY_GATE_CARD=a6000` in the maintainer box environment. CUDA runs use
++the existing `tools/gpu-gate.sh` lock and 900-second execution bound; binaries must
++be in this checkout's `target/release`. No timing lease or throughput claim is
++made by these functional captures. Keep the machine's GPU/driver line beside the
++bundles. Commands below show the 64-token case; repeat with p4096/f4096 and new
++output directories. Context 4352 holds either prompt plus 32 continuation ids.
++
++```sh
++MODEL=/absolute/path/Qwen3.8-27B-Q4_K_M.gguf
++INPUT=/absolute/path/dense-inputs
++OUT=/absolute/path/dense-validation-results
++export BLOOMERY_GATE_CARD=a6000
++
++python3 tools/ref/dense-logits.py run --kind reference \
++  --binary "$PWD/target/release/dense_logits_ref" --model "$MODEL" \
++  --prompt "$INPUT/p64.ids" --forced "$INPUT/f64.ids" \
++  --prefill step --ctx 4352 --ubatch 512 --out "$OUT/ref-step-p64"
++
++python3 tools/ref/dense-logits.py run --kind native \
++  --binary "$PWD/target/release/generate_qwen3moe" --model "$MODEL" \
++  --prompt "$INPUT/p64.ids" --forced "$INPUT/f64.ids" \
++  --mode eager --prefill pass --ctx 4352 --ubatch 512 --out "$OUT/native-eager-p64"
++
++python3 tools/ref/dense-logits.py run --kind native \
++  --binary "$PWD/target/release/generate_qwen3moe" --model "$MODEL" \
++  --prompt "$INPUT/p64.ids" --forced "$INPUT/f64.ids" \
++  --mode graph --prefill pass --ctx 4352 --ubatch 512 --out "$OUT/native-graph-p64"
++
++python3 tools/ref/dense-logits.py compare \
++  "$OUT/native-eager-p64" "$OUT/native-graph-p64" --bitwise
++python3 tools/ref/dense-logits.py compare \
++  "$OUT/native-graph-p64" "$OUT/ref-step-p64"
++```
++
++The native `pass` schedule uses the existing Body35 passes, documented as the
++one-token rule; this architecture does not accept `--prefill step`. For the
++serving prompt cut, repeat reference with `--prefill batch` and native with
++`--prefill auto`. Both feed the last prompt id separately, with the same ubatch
++limit and subsequent forced ids. Record these as separate schedules.
++
++`compare --bitwise` is a real equality check only for native eager versus graph,
++with identical file/ids/build/binary/prefill/ubatch/context/KV/backend. A mismatch
++returns 1. Ordinary `compare` checks completeness, digests, finite values and shape,
++then reports per-row max absolute error, relative L2 and argmax. It intentionally
++has no numeric pass band: derive one using the activation formats and reference
++backend spread before making it a correctness gate. Reference CPU versus CUDA
++is likewise a diagnostic floor, not equality. A zero norm is reported explicitly.
++
++## Same-seat HTTP/CLI diagnostics
++
++The serving runner uses the same stamped `generate_qwen3moe` and `bloomery-serve`
++binaries built above, with the native `qwen3` seat. It first records CLI greedy
++tokens, then starts its own loopback server on an ephemeral port under the
++existing GPU gate lock. It preserves the repository's `/completion`, `/props`
++and `/metrics` protocol. No existing server is selected or stopped.
++
++```sh
++python3 tools/ref/dense-serve.py --self-test
++python3 tools/ref/dense-serve.py --model "$MODEL" \
++  --short "$INPUT/p64.ids" --long "$INPUT/p4096.ids" \
++  --out "$OUT/serve-single"
++```
++
++Defaults are 16 predicted tokens, context 4352 per slot, ubatch 512, native graph
++mode, auto prefill with the CLI's last-prompt-token cut, f16 KV and draft off.
++The short input accepts 1–256 literal ids; the long input requires exactly 4096.
++The runner records inputs, binary/build/model identity, commands, responses,
++placement and metrics. It compares fresh and repeated short/long requests,
++reset after long prefill, and an edit at token 4064 with cached and fresh prefix
++paths. Early EOS is retained as incomplete evidence even when all returned
++tokens match the CLI prefix.
++
++Add `--two-slot` with a new output directory to run resident-slot diagnostics
++after the single-slot server has stopped. Alone and concurrent requests are
++compared, and exported occupancy is recorded. Rounded occupancy is diagnostic
++evidence; it does not become a new numerical gate or a throughput result.
++Sampling, tool calls, decision seats and a full serving acceptance gate remain
++outside this fixed-id greedy diagnostic.
++
++## Remaining acceptance work
++
++- Register a dedicated exact-file dense reference family and gate; keep the
++  existing Clef and routed Qwen sets intact. Preserve unsupported-tool-parser
++  coverage until that optional feature has its own implementation and gate.
++- Run the same-seat HTTP/CLI diagnostics at short and 4K prompts, then sampling,
++  reset, recurrent checkpoint/prefix reuse and resident-slot isolation. The CLI
++  comparison needs its existing `--last-step` cut.
++- Preserve `/props` placement and current RoPE/slot memory accounting; a dense
++  model cannot borrow the routed-expert host-offload gate's assumptions.
++- Run the contribution's affected CUDA gates, including existing routed and
++  decision seats. Host/static tests and the 0.8B CPU writer smoke cannot replace
++  A6000 execution. Native AMD whole-forward/serving and measured comparisons
++  remain later stages.
+diff --git a/tools/check-recipes.sh b/tools/check-recipes.sh
+index 1b3017a6..80bcc1bd 100755
+--- a/tools/check-recipes.sh
++++ b/tools/check-recipes.sh
+@@ -365,6 +365,8 @@ blk_pytools() {
+     "tools/ref/clefvis/check_hidden.py --self-test"
+     "tools/ref/clefvis/check_preproc.py --self-test"
+     "tools/ref/dma-dram-share.py --self-test"
++    "tools/ref/dense-logits.py --self-test"
++    "tools/ref/dense-serve.py --self-test"
+     "tools/ref/draft-accept.py --self-test"
+     "tools/ref/draft-vocab.py --self-test"
+     "tools/ref/ds41copy.py --self-test"
+diff --git a/tools/ref/dense-logits.py b/tools/ref/dense-logits.py
+new file mode 100644
+index 00000000..e6fe11ac
+--- /dev/null
++++ b/tools/ref/dense-logits.py
+@@ -0,0 +1,647 @@
++#!/usr/bin/env python3
++"""Build/run immutable dense-Qwen forced-logit diagnostics; compare without an invented accuracy band.
++
++The bundles use the existing MANIFEST.tsv reader, but are diagnostic captures, not a registered
++reference family or a passing dense GPU gate. `compare --bitwise` checks native eager/graph equality
++only. `--self-test` checks malformed/incomplete inputs and comparison contracts without a GPU.
++"""
++import argparse
++import array
++import hashlib
++import importlib.util
++import json
++import math
++import os
++from pathlib import Path
++import re
++import signal
++import shutil
++import subprocess
++import sys
++import tempfile
++import time
++
++ROOT = Path(__file__).resolve().parents[2]
++SOURCE = ROOT / "tools/ref/dense_logits_ref.cpp"
++_spec = importlib.util.spec_from_file_location("manifest", ROOT / "tools/bloomery/manifest.py")
++manifest = importlib.util.module_from_spec(_spec)
++_spec.loader.exec_module(manifest)
++
++# Each diagnostic target is an immutable, complete file. The small target is explicitly opt-in.
++TARGETS = {
++    "qwen38-27b": {
++        "vocab": 248320,
++        "size": 16810714336,
++        "sha256": "e00082f779fa385cee8c68a3ec8833a75778cc87272240b942f74e0b8243e520",
++        "repository": "lmstudio-community/Qwen3.8-27B-GGUF",
++        "revision": "5a7da681f60570ab5b439a587e912d2e5eddb582",
++        "file": "Qwen3.8-27B-Q4_K_M.gguf",
++    },
++    "qwen35-0.8b-candidate": {
++        "vocab": 248320,
++        "size": 590880672,
++        "sha256": "be5b3cb8c2f3ebd791349c9c775ea38950f23a2b9e792ca2f0411597dd172988",
++        "repository": "notschmee/Qwen3.5-0.8B-GGUF",
++        "revision": "1870603ac8ab59c7ddb9d94cccf3b297e379538f",
++        "file": "Qwen3.5-0.8B-Q4_K_M.gguf",
++    },
++}
++
++
++def digest(path):
++    with Path(path).open("rb") as src:
++        return hashlib.file_digest(src, "sha256").hexdigest()
++
++
++def file_signature(path):
++    info = Path(path).stat()
++    return [info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns]
++
++
++def immutable_model(path, target):
++    before = file_signature(path)
++    if before[2] != target["size"] or digest(path) != target["sha256"] or file_signature(path) != before:
++        raise ValueError("model differs from the selected immutable target; no engine was opened")
++    return before
++
++
++def model_unchanged(path, before):
++    if file_signature(path) != before:
++        raise ValueError("model file changed during capture")
++
++
++def command(args, **kwargs):
++    return subprocess.check_output([str(a) for a in args], text=True, **kwargs).strip()
++
++
++def git(tree, *args):
++    return command(["git", "-C", tree, *args])
++
++
++def clean_head(tree):
++    if git(tree, "status", "--porcelain", "--untracked-files=normal"):
++        raise ValueError(f"{tree}: source changes or untracked files, refusing commit attribution")
++    return git(tree, "rev-parse", "HEAD")
++
++
++def write_json(path, value):
++    Path(path).write_text(json.dumps(value, indent=2, allow_nan=False) + "\n")
++
++
++def token_ids(path, vocab=248320):
++    text = Path(path).read_text()
++    lines = text.splitlines()
++    if not lines or len(lines) > 65536:
++        raise ValueError(f"{path}: requires 1..65536 token ids")
++    if any(not re.fullmatch(r"[0-9]+", line) or int(line) >= vocab for line in lines):
++        raise ValueError(f"{path}: each line must be one decimal id in this vocabulary [0,{vocab})")
++    return [int(line) for line in lines]
++
++
++def build(args):
++    tree, folder = args.llama_tree.resolve(), args.llama_build.resolve()
++    commit = clean_head(tree)
++    remote = git(tree, "remote", "get-url", "origin")
++    if not re.fullmatch(r"(?:https://github.com/|git@github.com:)(?:ggml-org|ggerganov)/llama\.cpp(?:\.git)?", remote):
++        raise ValueError("reference source origin is not the official llama.cpp repository")
++    cache = (folder / "CMakeCache.txt").read_text()
++    if f"CMAKE_HOME_DIRECTORY:INTERNAL={tree}" not in cache:
++        raise ValueError("llama build directory belongs to a different source tree")
++    info = (folder / "common/build-info.cpp").read_text()
++    built_commit = re.search(r'LLAMA_COMMIT\s*=\s*"([0-9a-f]+)"', info)
++    if not built_commit or not commit.startswith(built_commit[1]):
++        raise ValueError("llama build-info commit differs from the clean source tree")
++    build_command = [args.cmake, "--build", str(folder), "--parallel", "2", "--target", "llama", "ggml"]
++    if not args.cached_libraries:
++        subprocess.run(build_command, check=True, timeout=args.build_bound)
++        if clean_head(tree) != commit:
++            raise ValueError("reference source changed during incremental build")
++    libs = sorted({p.resolve() for p in (folder / "bin").glob("lib*.so*") if p.is_file()})
++    if not libs:
++        raise ValueError("no shared reference libraries in build/bin")
++    output = args.out.resolve()
++    if output.exists() or Path(str(output) + ".build.json").exists():
++        raise ValueError(f"build output already exists: {output}")
++    output.parent.mkdir(parents=True, exist_ok=True)
++    tmp = Path(str(output) + ".partial")
++    if tmp.exists():
++        raise ValueError(f"incomplete build already exists: {tmp}")
++    library = folder / "bin"
++    source_sha = digest(SOURCE)
++    library_hashes = {str(p): digest(p) for p in libs}
++    argv = [args.cxx, "-std=c++17", "-O2", "-Wall", "-Wextra", "-Werror", str(SOURCE),
++            f"-I{tree / 'include'}", f"-I{tree / 'ggml/include'}", f"-L{library}",
++            "-lllama", "-lggml", "-lggml-base", f"-Wl,-rpath,{library}", "-o", str(tmp)]
++    subprocess.run(argv, check=True, timeout=300)
++    if digest(SOURCE) != source_sha or clean_head(tree) != commit:
++        raise ValueError("reference harness or llama source changed during link")
++    if any(digest(path) != expected for path, expected in library_hashes.items()):
++        raise ValueError("reference shared libraries changed during link")
++    record = {"llama_tree": str(tree), "llama_build": str(folder), "llama_commit": commit, "remote": remote,
++              "source_sha256": source_sha, "binary_sha256": digest(tmp), "command": argv,
++              "libraries": library_hashes,
++              "cuda_build": "GGML_CUDA:BOOL=ON" in cache,
++              "hip_build": "GGML_HIP:BOOL=ON" in cache,
++              "libraries_rebuilt": not args.cached_libraries,
++              "library_build_command": build_command if not args.cached_libraries else None,
++              "library_source_proof": ("successful_incremental_build" if not args.cached_libraries
++                                       else "cached_library_hashes_only_source_build_not_proven"),
++              "cmake_cache_sha256": digest(folder / "CMakeCache.txt")}
++    tmp.rename(output)
++    write_json(str(output) + ".build.json", record)
++    print(json.dumps(record, indent=2))
++
++
++def check_build(binary, backend):
++    data = json.loads(Path(str(binary) + ".build.json").read_text())
++    if digest(binary) != data["binary_sha256"] or digest(SOURCE) != data["source_sha256"]:
++        raise ValueError("reference binary or harness source differs from its build record")
++    if clean_head(data["llama_tree"]) != data["llama_commit"]:
++        raise ValueError("reference source moved after its build")
++    if git(data["llama_tree"], "remote", "get-url", "origin") != data["remote"]:
++        raise ValueError("reference source origin changed after its build")
++    for path, expected in data["libraries"].items():
++        if digest(path) != expected:
++            raise ValueError(f"reference shared library moved: {path}")
++    if backend == "cuda" and not data["cuda_build"]:
++        raise ValueError("CUDA diagnostic requested from a build without GGML_CUDA")
++    return data
++
++
++def native_build(args):
++    head = clean_head(ROOT)
++    outputs = [ROOT / "target/release" / name for name in ("generate_qwen3moe", "bloomery-serve")]
++    # A failed rebuild must not leave an old stamp claiming a new executable.
++    for output in outputs:
++        stamp = Path(str(output) + ".build.json")
++        if stamp.exists():
++            stamp.unlink()
++    env = os.environ.copy()
++    env["CARGO_TARGET_DIR"] = str(ROOT / "target")
++    argv = ["cargo", "oxide", "build", "--arch", args.arch, "--", "-p", "bloomery-gpu-gates",
++            "--features", "glm5next,clef,vision,mimo2", "--release",
++            "--bin", "generate_qwen3moe", "--bin", "bloomery-serve"]
++    subprocess.run(argv, cwd=ROOT, env=env, check=True, timeout=1800)
++    if clean_head(ROOT) != head:
++        raise ValueError("native source moved during cargo oxide build")
++    for output in outputs:
++        record = {"source_tree": str(ROOT), "source_head": head, "binary_sha256": digest(output),
++                  "command": argv, "arch": args.arch, "compiler": command(["rustc", "--version"])}
++        write_json(str(output) + ".build.json", record)
++        print(json.dumps(record, indent=2))
++
++
++def check_native_build(binary, head):
++    record = json.loads(Path(str(binary) + ".build.json").read_text())
++    if record["source_head"] != head or Path(record["source_tree"]).resolve() != ROOT:
++        raise ValueError("native binary build stamp belongs to another source checkout or commit")
++    if digest(binary) != record["binary_sha256"]:
++        raise ValueError("native binary changed after its cargo oxide build")
++    return record
++
++
++def library_environment(binary, build_info, env):
++    if env.get("LD_PRELOAD") or env.get("LD_AUDIT"):
++        raise ValueError("reference provenance requires LD_PRELOAD and LD_AUDIT to be unset")
++    lib = str(Path(build_info["llama_build"]) / "bin")
++    env["LD_LIBRARY_PATH"] = lib + (":" + env["LD_LIBRARY_PATH"] if env.get("LD_LIBRARY_PATH") else "")
++    resolved = command(["ldd", binary], env=env)
++    for line in resolved.splitlines():
++        if re.match(r"\s*lib(?:llama|ggml)", line):
++            match = re.search(r"=>\s+(\S+)", line)
++            if not match or str(Path(match[1]).resolve()) not in build_info["libraries"]:
++                raise ValueError("a loaded llama/ggml library differs from the recorded build: " + line)
++    return resolved
++
++
++def session_members(session):
++    """Snapshot Linux process identities; a timeout may create additional process groups."""
++    members = {}
++    for path in Path("/proc").iterdir():
++        if not path.name.isdecimal():
++            continue
++        try:
++            fields = (path / "stat").read_text().rsplit(")", 1)[1].split()
++            if int(fields[3]) == session and fields[0] != "Z":
++                members[int(path.name)] = fields[19]  # start time guards against PID reuse
++        except (FileNotFoundError, ProcessLookupError):
++            continue
++    return members
++
++
++def stop_owned_process(process, grace=10):
++    """Stop only this start_new_session=True launch, including timeout's other groups."""
++    if process.pid == os.getsid(0):
++        raise ValueError("refusing to stop the caller's own session")
++
++    def send(sig):
++        # Snapshot before reaping the leader so its session number cannot be reused.
++        for pid, started in session_members(process.pid).items():
++            try:
++                fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
++                if int(fields[3]) == process.pid and fields[19] == started:
++                    os.kill(pid, sig)
++            except (FileNotFoundError, ProcessLookupError):
++                pass
++
++    send(signal.SIGTERM)
++    deadline = time.monotonic() + grace
++    while session_members(process.pid) and time.monotonic() < deadline:
++        time.sleep(0.05)
++    send(signal.SIGKILL)
++    process.wait(timeout=10)
++
++
++def bounded_run(argv, env, log, seconds):
++    with subprocess.Popen(argv, cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT,
++                          start_new_session=True) as process:
++        try:
++            return process.wait(timeout=seconds)
++        except subprocess.TimeoutExpired:
++            stop_owned_process(process)
++            raise
++        except BaseException:
++            stop_owned_process(process)
++            raise
++
++
++def read_meta(path):
++    fields = {}
++    for line in Path(path).read_text().splitlines():
++        pair = line.split("\t")
++        if len(pair) != 2 or pair[0] in fields:
++            raise ValueError(f"{path}: duplicate or malformed metadata line")
++        fields[pair[0]] = pair[1]
++    if fields.get("format") != "bloomery-forced-logits-v1" or fields.get("dtype") != "float32-le":
++        raise ValueError(f"{path}: unsupported raw-logit format")
++    if fields.get("complete") != "true" or fields.get("last_step") != "true":
++        raise ValueError(f"{path}: incomplete rows or a different prompt cut")
++    return fields
++
++
++def raw_rows(path, rows, vocab):
++    if rows < 1 or vocab < 1 or Path(path).stat().st_size != rows * vocab * 4:
++        raise ValueError(f"{path}: truncated or excess raw logits, expected {rows} x {vocab} f32")
++    values = array.array("f")
++    with Path(path).open("rb") as stream:
++        values.fromfile(stream, rows * vocab)
++    if values.itemsize != 4:
++        raise ValueError("host array float is not f32")
++    if sys.byteorder != "little":
++        values.byteswap()
++    if any(not math.isfinite(v) for v in values):
++        raise ValueError(f"{path}: nonfinite logit")
++    return values
++
++
++def finish_bundle(stage, identity, meta):
++    raw = stage / "logits.0.f32"
++    n, vocab = int(meta["rows"]), int(meta["vocab"])
++    raw_rows(raw, n, vocab)
++    identity.update({"rows": str(n), "vocab": str(vocab), "raw_sha256": digest(raw),
++                     "mode": meta["mode"], "prefill": meta["prefill"], "last_step": "true"})
++    lines = ["# Dense forced-logit diagnostic; no numerical accuracy gate"]
++    for key, value in identity.items():
++        text = str(value)
++        if any(c in text for c in "\r\n\t"):
++            raise ValueError(f"metadata {key} contains a line separator")
++        lines.append(f"# {key}\t{text}")
++    lines += ["# kind\tname\toccurrence\ttype\tne0\tne1\tne2\tne3\tbytes\top",
++              f"tensor\tlogits\t0\tf32\t{vocab}\t{n}\t1\t1\t{n * vocab * 4}\tDIAGNOSTIC",
++              "# complete\t1\t0"]
++    (stage / "MANIFEST.tsv").write_text("\n".join(lines) + "\n")
++
++
++def run(args):
++    target = TARGETS[args.target]
++    model, binary, output = args.model.resolve(), args.binary.resolve(), args.out.resolve()
++    model_stat = immutable_model(model, target)
++    prompt, forced = token_ids(args.prompt), token_ids(args.forced)
++    if len(forced) > 4096 or len(prompt) + len(forced) > args.ctx:
++        raise ValueError("context does not hold prompt plus continuation, or more than 4096 rows")
++    if args.ctx < 1 or args.ubatch < 1:
++        raise ValueError("context and ubatch must be positive")
++    stage = Path(str(output) + ".staging")
++    if output.exists() or stage.exists():
++        raise ValueError("output or staging directory already exists; use a new output directory")
++    source_head = git(ROOT, "rev-parse", "HEAD")
++    source_dirty = bool(git(ROOT, "status", "--porcelain", "--untracked-files=normal"))
++    if args.kind == "native" and source_dirty:
++        raise ValueError("native source has tracked changes; commit and rebuild before attribution")
++    driver_sha = digest(__file__)
++    binary_sha = digest(binary)
++    build_info = (check_build(binary, args.backend) if args.kind == "reference"
++                  else check_native_build(binary, source_head))
++    if args.kind == "native" and args.backend != "cuda":
++        raise ValueError("the current native generator is CUDA only")
++    if args.kind == "reference" and args.prefill not in ("step", "batch"):
++        raise ValueError("reference prefill is step or batch")
++    if args.kind == "native" and args.prefill not in ("pass", "auto", "gemm"):
++        raise ValueError("native prefill is pass, auto or gemm")
++    if args.backend == "cuda" and binary.parent != (ROOT / "target/release").resolve():
++        raise ValueError("CUDA binaries must be in this checkout's target/release for gpu-gate.sh")
++    stage.mkdir(parents=True)
++    shutil.copyfile(args.prompt, stage / "prompt.ids")
++    shutil.copyfile(args.forced, stage / "forced.ids")
++    # Re-read the snapshots: the source files may have moved while the model digest was checked.
++    if token_ids(stage / "prompt.ids") != prompt or token_ids(stage / "forced.ids") != forced:
++        raise ValueError("input ids changed before their snapshot")
++    raw = stage / "logits.0.f32"
++    env = os.environ.copy()
++    env.update({"BLOOMERY_REF_MODEL": str(model), "BLOOMERY_DRAFT": "off",
++                "BLOOMERY_QWEN3_UBATCH": str(args.ubatch), "BLOOMERY_QWEN3_KV": "f16",
++                "BLOOMERY_GATE_BOUND": "900"})
++    if args.kind == "reference":
++        argv = [str(binary), "--model", str(model), "--prompt-file", str(stage / "prompt.ids"),
++                "--forced-file", str(stage / "forced.ids"), "--out", str(raw),
++                "--ctx", str(args.ctx), "--ubatch", str(args.ubatch), "--prefill", args.prefill,
++                "--gpu-layers", "99" if args.backend == "cuda" else "0"]
++        env["BLOOMERY_REF_WRITE"] = "1"
++        (stage / "resolved-libraries.log").write_text(library_environment(binary, build_info, env) + "\n")
++    else:
++        argv = [str(binary), "--tokens", ",".join(map(str, prompt)), "-n", str(len(forced)),
++                "--ctx", str(args.ctx), "--mode", args.mode, "--prefill", args.prefill,
++                "--last-step", "--logit-rows", str(raw)]
++        env["BLOOMERY_FORCE_IDS"] = str(stage / "forced.ids") + ":0"
++        env["BLOOMERY_GEN_SLOTS"] = "1"
++    if args.backend == "cuda":
++        argv = ["bash", str(ROOT / "tools/gpu-gate.sh"), binary.name, *argv[1:]]
++    else:
++        env["CUDA_VISIBLE_DEVICES"] = ""
++        env["HIP_VISIBLE_DEVICES"] = ""
++        env["ROCR_VISIBLE_DEVICES"] = ""
++    write_json(stage / "invocation.json", {"command": argv, "kind": args.kind,
++               "backend": args.backend, "target": args.target, "build": build_info,
++               "source_head": source_head, "binary_sha256": binary_sha,
++               "source_dirty": source_dirty, "driver_sha256": driver_sha,
++               "model_stat": model_stat,
++               "effective_environment": {key: value for key, value in env.items() if key.startswith("BLOOMERY_")},
++               "CUDA_VISIBLE_DEVICES_before_gate": env.get("CUDA_VISIBLE_DEVICES"),
++               "BLOOMERY_GATE_CARD": env.get("BLOOMERY_GATE_CARD")})
++    try:
++        with (stage / "run.log").open("w") as log:
++            result = bounded_run(argv, env, log, 2800 if args.backend == "cuda" else 900)
++        write_json(stage / "exit.json", {"exit_code": result})
++        if result:
++            raise ValueError(f"diagnostic exited {result}; incomplete evidence retained at {stage}")
++    except subprocess.TimeoutExpired:
++        write_json(stage / "exit.json", {"exit_code": 124, "timeout": True})
++        raise ValueError(f"diagnostic timed out; incomplete evidence retained at {stage}") from None
++    meta = read_meta(str(raw) + ".meta")
++    if meta["mode"] != (args.mode if args.kind == "native" else "reference") or meta["prefill"] != args.prefill:
++        raise ValueError("writer returned a different mode or prefill schedule")
++    if meta["prompt_ids"] != ",".join(map(str, prompt)) or meta["forced_ids"] != ",".join(map(str, forced)):
++        raise ValueError("writer returned different prompt or forced ids")
++    if int(meta["rows"]) != len(forced) or int(meta["vocab"]) != target["vocab"]:
++        raise ValueError("writer returned wrong row count or vocabulary")
++    model_unchanged(model, model_stat)
++    if git(ROOT, "rev-parse", "HEAD") != source_head or digest(binary) != binary_sha or digest(__file__) != driver_sha:
++        raise ValueError("source or binary changed during diagnostic")
++    if args.kind == "reference":
++        check_build(binary, args.backend)
++    else:
++        if clean_head(ROOT) != source_head:
++            raise ValueError("native source became dirty during diagnostic")
++        check_native_build(binary, source_head)
++    identity = {"format": "bloomery-forced-logits-v1", "model": str(model),
++                "model_sha256": target["sha256"], "model_revision": target["revision"],
++                "arch": "qwen35", "target": args.target, "engine": args.kind,
++                "backend": args.backend, "build": build_info["llama_commit"] if args.kind == "reference" else source_head,
++                "source_head": source_head, "binary_sha256": binary_sha,
++                "source_dirty": str(source_dirty).lower(), "driver_sha256": driver_sha,
++                "prompt_sha256": digest(stage / "prompt.ids"),
++                "forced_sha256": digest(stage / "forced.ids"), "ctx": str(args.ctx),
++                "ubatch": str(args.ubatch), "kv": "f16"}
++    finish_bundle(stage, identity, meta)
++    # mkdir is exclusive, unlike rename which can replace a concurrently created empty dir.
++    # The existing manifest completion marker is published after all of its files.
++    output.mkdir()
++    for path in stage.iterdir():
++        if path.name != "MANIFEST.tsv":
++            path.rename(output / path.name)
++    (stage / "MANIFEST.tsv").rename(output / "MANIFEST.tsv")
++    stage.rmdir()
++    print(f"complete diagnostic bundle: {output}; GPU correctness acceptance remains separate")
++
++
++def bundle(path):
++    path = Path(path)
++    m = manifest.read(str(path))
++    if m.complete != "1\t0" or m.header.get("format") != "bloomery-forced-logits-v1":
++        raise ValueError(f"{path}: incomplete or foreign diagnostic bundle")
++    target = TARGETS.get(m.header.get("target"))
++    if target is None or m.header.get("model_sha256") != target["sha256"]:
++        raise ValueError(f"{path}: wrong immutable model identity")
++    rows = m.rows("tensor")
++    if len(rows) != 1 or rows[0]["name"] != "logits" or rows[0]["type"] != "f32":
++        raise ValueError(f"{path}: requires one f32 logits tensor")
++    n, vocab = rows[0].int("ne1"), rows[0].int("ne0")
++    if vocab != target["vocab"] or m.header.get("arch") != "qwen35":
++        raise ValueError(f"{path}: architecture or vocabulary differs from the immutable target")
++    if rows[0].int("occurrence") != 0 or rows[0].int("ne2") != 1 or rows[0].int("ne3") != 1 or rows[0].int("bytes") != n * vocab * 4:
++        raise ValueError(f"{path}: inconsistent tensor dimensions or declared bytes")
++    if (n, vocab) != (int(m.header["rows"]), int(m.header["vocab"])):
++        raise ValueError(f"{path}: row shape differs from metadata")
++    for filename, key in (("prompt.ids", "prompt_sha256"), ("forced.ids", "forced_sha256"),
++                          ("logits.0.f32", "raw_sha256")):
++        if digest(path / filename) != m.header[key]:
++            raise ValueError(f"{path}: digest mismatch for {filename}")
++    token_ids(path / "prompt.ids", vocab)
++    if len(token_ids(path / "forced.ids", vocab)) != n:
++        raise ValueError(f"{path}: forced-id count differs from rows")
++    return m.header, raw_rows(path / "logits.0.f32", n, vocab)
++
++
++def compare(left, right, bitwise=False):
++    a, x = bundle(left)
++    b, y = bundle(right)
++    for key in ("model_sha256", "prompt_sha256", "forced_sha256", "rows", "vocab", "ctx", "kv", "last_step"):
++        if a[key] != b[key]:
++            raise ValueError(f"comparison differs at {key}: {a[key]} versus {b[key]}")
++    if bitwise:
++        if a["engine"] != "native" or b["engine"] != "native":
++            raise ValueError("bitwise acceptance is only defined for native eager/graph diagnostics")
++        for key in ("build", "binary_sha256", "prefill", "ubatch", "backend"):
++            if a[key] != b[key]:
++                raise ValueError(f"bitwise comparison differs at {key}")
++        if {a["mode"], b["mode"]} != {"eager", "graph"}:
++            raise ValueError("bitwise acceptance needs one eager and one graph run")
++    n, vocab = int(a["rows"]), int(a["vocab"])
++    output = []
++    for i in range(n):
++        p, q = x[i * vocab:(i + 1) * vocab], y[i * vocab:(i + 1) * vocab]
++        delta = math.fsum((float(u) - float(v)) ** 2 for u, v in zip(p, q))
++        denom = math.fsum(float(v) ** 2 for v in q)
++        output.append({"row": i, "max_abs": max(abs(float(u) - float(v)) for u, v in zip(p, q)),
++                       "relative_l2": math.sqrt(delta / denom) if denom else (0.0 if not delta else None),
++                       "reference_norm_zero": denom == 0,
++                       "argmax_left": max(range(vocab), key=p.__getitem__),
++                       "argmax_right": max(range(vocab), key=q.__getitem__)})
++    equal = a["raw_sha256"] == b["raw_sha256"]
++    return {"finite_shape_identity_checks": "pass", "bitwise_equal": equal,
++            "acceptance": ("pass" if equal else "fail") if bitwise else "diagnostic_only_no_numeric_band",
++            "rows": output}, 1 if bitwise and not equal else 0
++
++
++def self_test():
++    TARGETS["_selftest"] = {"sha256": "selftest-identity", "vocab": 2}
++    with tempfile.TemporaryDirectory() as temporary:
++        root = Path(temporary)
++        model = root / "model"
++        model.write_bytes(b"original")
++        target = {"size": 8, "sha256": digest(model)}
++        before = immutable_model(model, target)
++        model_unchanged(model, before)
++        model.write_bytes(b"replaced")
++        for check in (lambda: model_unchanged(model, before), lambda: immutable_model(model, target)):
++            try:
++                check()
++                raise AssertionError("accepted a model replaced during capture")
++            except ValueError:
++                pass
++        ids_file = root / "ids"
++        for bad in ("", "-1\n", "248320\n", "1 x\n", "1\n\n"):
++            ids_file.write_text(bad)
++            try:
++                token_ids(ids_file)
++                raise AssertionError(f"accepted malformed ids {bad!r}")
++            except ValueError:
++                pass
++        ids_file.write_text("1\n2\n")
++        assert token_ids(ids_file) == [1, 2]
++        for name, mode in (("a", "eager"), ("b", "graph")):
++            folder = root / name
++            folder.mkdir()
++            (folder / "prompt.ids").write_text("1\n")
++            (folder / "forced.ids").write_text("0\n")
++            values = array.array("f", [1.0, -2.0])
++            if sys.byteorder != "little":
++                values.byteswap()
++            (folder / "logits.0.f32").write_bytes(values.tobytes())
++            identity = {"target": "_selftest", "model_sha256": TARGETS["_selftest"]["sha256"], "arch": "qwen35",
++                        "format": "bloomery-forced-logits-v1", "engine": "native", "build": "same",
++                        "binary_sha256": "same", "backend": "cuda", "ctx": "8", "kv": "f16", "ubatch": "8",
++                        "prompt_sha256": digest(folder / "prompt.ids"), "forced_sha256": digest(folder / "forced.ids")}
++            finish_bundle(folder, identity, {"rows": "1", "vocab": "2", "mode": mode, "prefill": "pass"})
++        result, code = compare(root / "a", root / "b", True)
++        assert code == 0 and result["bitwise_equal"]
++        mp = root / "b/MANIFEST.tsv"
++        complete = mp.read_text()
++        raw_path = root / "b/logits.0.f32"
++        original = raw_path.read_bytes()
++        changed = array.array("f", [1.5, -2.0])
++        if sys.byteorder != "little":
++            changed.byteswap()
++        before = digest(raw_path)
++        raw_path.write_bytes(changed.tobytes())
++        mp.write_text(complete.replace(before, digest(raw_path)))
++        result, code = compare(root / "a", root / "b", True)
++        assert code == 1 and result["acceptance"] == "fail" and result["rows"][0]["max_abs"] == 0.5
++        result, code = compare(root / "a", root / "b")
++        assert code == 0 and result["acceptance"] == "diagnostic_only_no_numeric_band"
++        raw_path.write_bytes(original)
++        mp.write_text(complete)
++        for bad, want in ((complete.replace("# complete\t1\t0\n", ""), "incomplete"),
++                          (complete.replace(TARGETS["_selftest"]["sha256"], "wrong"), "identity"),
++                          (complete.replace("tensor\tlogits\t0\tf32\t2", "tensor\tlogits\t0\tf32\t3"), "vocabulary"),
++                          (complete.replace("\t1\t1\t8\tDIAGNOSTIC", "\t2\t1\t8\tDIAGNOSTIC"), "dimensions")):
++            mp.write_text(bad)
++            try:
++                bundle(root / "b")
++                raise AssertionError("accepted malformed bundle")
++            except ValueError as error:
++                assert want in str(error), error
++        mp.write_text(complete)
++        (root / "b/logits.0.f32").write_bytes(b"\0\0\0")
++        try:
++            raw_rows(root / "b/logits.0.f32", 1, 2)
++            raise AssertionError("accepted truncated rows")
++        except ValueError:
++            pass
++        # A child can create another process group while remaining in the owned session.
++        child = "import os,signal,time; os.setpgrp(); signal.signal(signal.SIGTERM,signal.SIG_IGN); print(os.getpid(),flush=True); time.sleep(60)"
++        leader = "import subprocess,sys,time; subprocess.Popen([sys.executable,'-c',sys.argv[1]]); time.sleep(60)"
++        process = subprocess.Popen([sys.executable, "-c", leader, child], stdout=subprocess.PIPE,
++                                   text=True, start_new_session=True)
++        try:
++            pid = int(process.stdout.readline())
++            assert pid in session_members(process.pid)
++            stop_owned_process(process, grace=0.1)
++            deadline = time.monotonic() + 2
++            while session_members(process.pid) and time.monotonic() < deadline:
++                time.sleep(0.01)
++            assert not session_members(process.pid)
++        finally:
++            if process.returncode is None:
++                stop_owned_process(process, grace=0.1)
++            process.stdout.close()
++        nan = array.array("f", [math.nan, 0.0])
++        if sys.byteorder != "little":
++            nan.byteswap()
++        (root / "b/logits.0.f32").write_bytes(nan.tobytes())
++        try:
++            raw_rows(root / "b/logits.0.f32", 1, 2)
++            raise AssertionError("accepted NaN")
++        except ValueError:
++            pass
++        meta = root / "raw.meta"
++        meta.write_text("format\tbloomery-forced-logits-v1\nformat\tbloomery-forced-logits-v1\n")
++        try:
++            read_meta(meta)
++            raise AssertionError("accepted duplicate metadata")
++        except ValueError:
++            pass
++    del TARGETS["_selftest"]
++    print("dense-logits self-test: malformed ids, provenance, incomplete/truncated/NaN rows, eager/graph and owned-session cleanup contracts passed")
++    return 0
++
++
++def main():
++    if sys.argv[1:] == ["--self-test"]:
++        return self_test()
++    parser = argparse.ArgumentParser(description=__doc__)
++    sub = parser.add_subparsers(dest="action", required=True)
++    b = sub.add_parser("build")
++    b.add_argument("--llama-tree", type=Path, required=True)
++    b.add_argument("--llama-build", type=Path, required=True)
++    b.add_argument("--out", type=Path, default=ROOT / "target/release/dense_logits_ref")
++    b.add_argument("--cxx", default=os.environ.get("CXX", "c++"))
++    b.add_argument("--cmake", default="cmake")
++    b.add_argument("--build-bound", type=int, default=900)
++    b.add_argument("--cached-libraries", action="store_true", help="explicit cached-library smoke only; source/build correspondence is not proven")
++    nb = sub.add_parser("build-native")
++    nb.add_argument("--arch", default="sm_86")
++    r = sub.add_parser("run")
++    r.add_argument("--kind", choices=("reference", "native"), required=True)
++    r.add_argument("--backend", choices=("cuda", "cpu"), default="cuda")
++    r.add_argument("--target", choices=TARGETS, default="qwen38-27b")
++    for key in ("model", "binary", "prompt", "forced", "out"):
++        r.add_argument("--" + key, type=Path, required=True)
++    r.add_argument("--prefill", choices=("step", "batch", "pass", "auto", "gemm"), required=True)
++    r.add_argument("--mode", choices=("eager", "graph"), default="graph")
++    r.add_argument("--ctx", type=int, default=4352)
++    r.add_argument("--ubatch", type=int, default=512)
++    c = sub.add_parser("compare")
++    c.add_argument("left", type=Path)
++    c.add_argument("right", type=Path)
++    c.add_argument("--bitwise", action="store_true")
++    args = parser.parse_args()
++    try:
++        if args.action == "build":
++            build(args)
++        elif args.action == "build-native":
++            native_build(args)
++        elif args.action == "run":
++            run(args)
++        else:
++            result, code = compare(args.left, args.right, args.bitwise)
++            print(json.dumps(result, indent=2, allow_nan=False))
++            return code
++        return 0
++    except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
++        print(f"dense-logits: {error}", file=sys.stderr)
++        return 2
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/tools/ref/dense-serve.py b/tools/ref/dense-serve.py
+new file mode 100644
+index 00000000..aa61c459
+--- /dev/null
++++ b/tools/ref/dense-serve.py
+@@ -0,0 +1,433 @@
++#!/usr/bin/env python3
++"""Capture dense-Qwen CLI/HTTP token diagnostics on the same native qwen3 seat.
++
++Requires the immutable model and both cargo-oxide binaries stamped by dense-logits.py
++build-native. This is plain-text, fixed-ID diagnostic support, not a numeric reference
++or a replacement for the serving GPU gates. No timing result is computed.
++"""
++import argparse
++from concurrent.futures import ThreadPoolExecutor
++import importlib.util
++import json
++import math
++import os
++from pathlib import Path
++import re
++import signal
++import subprocess
++import sys
++import tempfile
++import time
++
++ROOT = Path(__file__).resolve().parents[2]
++_spec = importlib.util.spec_from_file_location("dense_logits", Path(__file__).with_name("dense-logits.py"))
++common = importlib.util.module_from_spec(_spec)
++_spec.loader.exec_module(common)
++
++
++def ids(value, vocab):
++    if not isinstance(value, list) or not value or any(type(x) is not int or not 0 <= x < vocab for x in value):
++        raise ValueError("tokens must be a nonempty array of integer vocabulary IDs")
++    return value
++
++
++def cli_tokens(text, count, vocab):
++    lines = [line[7:] for line in text.splitlines() if line.startswith("tokens ")]
++    if len(lines) != 1:
++        raise ValueError(f"CLI requires exactly one tokens line, got {len(lines)}")
++    value = ids(json.loads(lines[0]), vocab)
++    if len(value) != count:
++        raise ValueError(f"CLI returned {len(value)} IDs, expected {count}")
++    return value
++
++
++def answer(value, count, vocab, prompt_len, slots, cache):
++    if not isinstance(value, dict) or "error" in value:
++        raise ValueError("completion is not a successful JSON object")
++    tokens = ids(value.get("tokens"), vocab)
++    if len(tokens) > count or type(value.get("tokens_predicted")) is not int or value["tokens_predicted"] != len(tokens):
++        raise ValueError("completion token count differs from tokens_predicted or request bound")
++    if value.get("truncated") is not False or value.get("stop") is not True:
++        raise ValueError("completion was truncated or has no final stop")
++    stop = value.get("stop_type")
++    if stop not in ("limit", "eos") or value.get("stopped_eos") is not (stop == "eos") or value.get("stopped_limit") is not (stop == "limit") or value.get("stopped_word") is not False:
++        raise ValueError("completion has an unexpected or inconsistent stop reason")
++    if stop == "limit" and len(tokens) != count:
++        raise ValueError("limit completion returned fewer IDs than requested")
++    slot = value.get("id_slot")
++    if type(slot) is not int or not 0 <= slot < slots:
++        raise ValueError("completion returned an invalid slot")
++    timing = value.get("timings")
++    if not isinstance(timing, dict):
++        raise ValueError("completion has no timings object")
++    kept = timing.get("cache_n")
++    if type(kept) is not int or not 0 <= kept <= prompt_len or (not cache and kept != 0):
++        raise ValueError("completion returned an invalid kept-prefix count")
++    return {"tokens": tokens, "stop_type": stop, "id_slot": slot, "cache_n": kept}
++
++
++def agreement(actual, expected, count):
++    if actual["tokens"] != expected[:len(actual["tokens"])]:
++        return "mismatch"
++    # HTTP stops at EOG; ignore_eos would mask that logit and change greedy selection.
++    # A matching early prefix is retained but cannot pass this fixed-count diagnostic.
++    return "pass" if len(actual["tokens"]) == count else "incomplete_early_eos"
++
++
++def endpoint(log):
++    found = re.findall(r"listening on http://([^\s]+)", log)
++    if len(found) > 1:
++        raise ValueError("server logged more than one listening address")
++    if not found:
++        return None
++    match = re.fullmatch(r"127\.0\.0\.1:([0-9]+)", found[0])
++    if not match or not 0 < int(match[1]) < 65536:
++        raise ValueError("server did not bind its own requested loopback address")
++    return "http://" + found[0]
++
++
++def request(url, route, body, folder, name, bound):
++    # The wire protocol is serve_client::completion_raw: IDs, temperature 0,
++    # return_tokens and cache_prompt. curl owns an absolute request deadline.
++    payload = None if body is None else json.dumps(body)
++    if body is not None:
++        common.write_json(folder / (name + ".request.json"), body)
++    argv = ["curl", "--noproxy", "*", "--silent", "--show-error", "--max-time", str(bound),
++            "--max-filesize", "8388608", "--write-out", "\n%{http_code}"]
++    if body is not None:
++        argv += ["--header", "Content-Type: application/json", "--data-binary", "@-"]
++    result = subprocess.run(argv + [url + route], input=payload, text=True, capture_output=True, timeout=bound + 5)
++    (folder / (name + ".response.txt")).write_text(result.stdout)
++    (folder / (name + ".curl.err")).write_text(result.stderr)
++    if result.returncode:
++        raise ValueError(f"{name}: curl failed ({result.returncode}); see retained logs")
++    raw, separator, status = result.stdout.rpartition("\n")
++    if not separator or status != "200":
++        raise ValueError(f"{name}: HTTP {status or 'missing'}; see retained response")
++    return raw
++
++
++def completion(url, prompt, count, folder, name, bound, vocab, slots, cache=False):
++    body = {"prompt": prompt, "n_predict": count, "temperature": 0, "return_tokens": True,
++            "cache_prompt": cache, "stream": False, "ignore_eos": False}
++    raw = request(url, "/completion", body, folder, name, bound)
++    return answer(json.loads(raw), count, vocab, len(prompt), slots, cache)
++
++
++def metrics(text):
++    output = {}
++    for key in ("n_decode_total", "n_busy_slots_per_decode", "swaps_total"):
++        values = re.findall(r"^llamacpp:" + key + r" ([^\n]+)$", text, re.MULTILINE)
++        if not values and key == "swaps_total":
++            output[key] = None  # Only engines whose slots take turns export this metric.
++            continue
++        if len(values) != 1:
++            raise ValueError(f"metrics requires one {key}")
++        value = float(values[0])
++        if not math.isfinite(value) or value < 0:
++            raise ValueError(f"metrics has an invalid {key}")
++        if key != "n_busy_slots_per_decode" and not value.is_integer():
++            raise ValueError(f"metrics counter {key} is not an integer")
++        if key == "n_busy_slots_per_decode" and value > 2:
++            raise ValueError("busy-slot mean exceeds the two requested slots")
++        output[key] = value
++    return output
++
++
++def overlap(before, after):
++    rounds = after["n_decode_total"] - before["n_decode_total"]
++    busy = (after["n_decode_total"] * after["n_busy_slots_per_decode"]
++            - before["n_decode_total"] * before["n_busy_slots_per_decode"])
++    if (before["swaps_total"] is None) != (after["swaps_total"] is None):
++        raise ValueError("server changed the presence of its slot-turn metrics")
++    swaps = None if before["swaps_total"] is None else after["swaps_total"] - before["swaps_total"]
++    if rounds < 0 or busy < 0 or (swaps is not None and swaps < 0):
++        raise ValueError("server counters decreased during the requests")
++    # Rounded exported means are diagnostic evidence only, not a new occupancy gate.
++    return {"decode_rounds": rounds, "busy_slots_sum_from_exported_mean": busy, "swaps": swaps,
++            "concurrent_round_observed": rounds > 0 and round(busy) > rounds and swaps in (None, 0),
++            "acceptance": "diagnostic_only_no_occupancy_band"}
++
++
++class Server:
++    def __init__(self, model, folder, env, args, slots):
++        self.folder, self.env, self.args, self.slots = folder, env.copy(), args, slots
++        self.env.pop("BLOOMERY_REF_MODEL", None)
++        self.env.pop("BLOOMERY_GEN_SLOTS", None)  # The CLI's parsed lever is refused by the serving seat.
++        self.env["BLOOMERY_GATE_BOUND"] = str(args.startup_bound + args.request_bound * 12)
++        self.argv = ["bash", str(ROOT / "tools/gpu-gate.sh"), "bloomery-serve",
++                     "--model", "qwen3", "-m", str(model), "--host", "127.0.0.1", "--port", "0",
++                     "--parallel", str(slots), "--ctx", str(args.ctx * slots), "--cache-type-k", "f16"]
++        self.process = None
++        self.log = None
++
++    def __enter__(self):
++        self.folder.mkdir()
++        common.write_json(self.folder / "launch.json", {"command": self.argv, "slots": self.slots,
++                          "effective_environment": {key: value for key, value in self.env.items() if key.startswith("BLOOMERY_")}})
++        self.log = (self.folder / "server.log").open("w")
++        self.process = subprocess.Popen(self.argv, cwd=ROOT, env=self.env, stdin=subprocess.DEVNULL,
++                                        stdout=self.log, stderr=subprocess.STDOUT, start_new_session=True)
++        try:
++            deadline = time.monotonic() + self.args.startup_bound
++            while time.monotonic() < deadline:
++                if self.process.poll() is not None:
++                    raise ValueError(f"server exited {self.process.returncode} before listening")
++                self.url = endpoint((self.folder / "server.log").read_text())
++                if self.url:
++                    return self
++                time.sleep(0.1)
++            raise ValueError("server startup deadline expired")
++        except BaseException:
++            self.__exit__(None, None, None)
++            raise
++
++    def __exit__(self, *_):
++        try:
++            if self.process is not None:
++                common.stop_owned_process(self.process)
++                self.process = None
++        finally:
++            if self.log is not None:
++                self.log.close()
++                self.log = None
++
++    def props(self, model):
++        value = json.loads(request(self.url, "/props", None, self.folder, "props", self.args.request_bound))
++        if value.get("total_slots") != self.slots or value.get("n_ctx") != self.args.ctx or value.get("model_path") != str(model):
++            raise ValueError("/props does not identify the requested model, slots and per-slot context")
++        engine = value.get("engine", {})
++        if engine.get("name") != "bloomery" or engine.get("server_pid") not in common.session_members(self.process.pid):
++            raise ValueError("/props does not identify the Bloomery process in this runner's own session")
++        return value
++
++
++def environment(args):
++    env = os.environ.copy()
++    # These diagnostics own generation policy; inherited forced rows must not replace argmax.
++    for key in ("BLOOMERY_FORCE_IDS", "BLOOMERY_ROUTE_TRACE", "BLOOMERY_REF_WRITE"):
++        env.pop(key, None)
++    env.update({"BLOOMERY_DRAFT": "off", "BLOOMERY_GEN_SLOTS": "1", "BLOOMERY_QWEN3_KV": "f16",
++                "BLOOMERY_QWEN3_UBATCH": str(args.ubatch), "BLOOMERY_GATE_BOUND": str(args.cli_bound)})
++    return env
++
++
++def run(args):
++    target = common.TARGETS[args.target]
++    model, output = args.model.resolve(), args.out.resolve()
++    head = common.clean_head(ROOT)
++    binaries = [ROOT / "target/release" / name for name in ("generate_qwen3moe", "bloomery-serve")]
++    builds = [common.check_native_build(binary, head) for binary in binaries]
++    for key in ("command", "arch", "compiler"):
++        if builds[0][key] != builds[1][key]:
++            raise ValueError(f"native binaries have different build {key}")
++    model_stat = common.immutable_model(model, target)
++    short, long = common.token_ids(args.short), common.token_ids(args.long)
++    if not 1 <= len(short) <= 256 or len(long) != 4096:
++        raise ValueError("requires a 1..256-ID short prompt and an exactly 4096-ID long prompt")
++    if not 1 <= args.predict <= 256 or args.ctx < 4096 + args.predict or args.ctx > 65536 or not 1 <= args.ubatch <= 4096:
++        raise ValueError("requires 1..256 output IDs, context holding prompt+output (at most 65536), ubatch 1..4096")
++    if any(not 1 <= n <= 3600 for n in (args.cli_bound, args.startup_bound, args.request_bound)):
++        raise ValueError("each deadline must be 1..3600 seconds")
++    edited = long.copy()
++    edit_at = len(long) - 32
++    edited[edit_at] = (edited[edit_at] + 1) % target["vocab"]
++    prompts = {"short": short, "long": long, "edited": edited}
++    output.mkdir(parents=True, exist_ok=False)
++    fixtures = output / "fixtures"
++    fixtures.mkdir()
++    for name, prompt in prompts.items():
++        (fixtures / (name + ".ids")).write_text("".join(f"{token}\n" for token in prompt))
++    env = environment(args)
++    env["BLOOMERY_REF_MODEL"] = str(model)
++    invocation = {"format": "bloomery-dense-serve-v1", "target": args.target, "model": str(model),
++                  "model_sha256": target["sha256"], "model_stat": model_stat, "source_head": head, "builds": builds,
++                  "driver_sha256": common.digest(__file__), "helper_sha256": common.digest(common.__file__),
++                  "ctx_per_slot": args.ctx, "ubatch": args.ubatch, "predict": args.predict,
++                  "prefill": "auto", "mode": "graph", "kv": "f16", "last_step": True,
++                  "prompt_sha256": {name: common.digest(fixtures / (name + ".ids")) for name in prompts},
++                  "prefix_edit_at": edit_at, "two_slot": args.two_slot,
++                  "effective_environment": {key: value for key, value in env.items() if key.startswith("BLOOMERY_")},
++                  "CUDA_VISIBLE_DEVICES_before_gate": env.get("CUDA_VISIBLE_DEVICES"),
++                  "bounds_seconds": {"cli": args.cli_bound, "startup": args.startup_bound, "request": args.request_bound}}
++    common.write_json(output / "invocation.json", invocation)
++    expected = {}
++    # CLI captures finish before any server starts, so only one model is resident.
++    for name, prompt in prompts.items():
++        argv = ["bash", str(ROOT / "tools/gpu-gate.sh"), "generate_qwen3moe", "--tokens", ",".join(map(str, prompt)),
++                "-n", str(args.predict), "--ctx", str(args.ctx), "--prefill", "auto", "--mode", "graph", "--last-step"]
++        common.write_json(output / (name + ".cli.command.json"), argv)
++        logpath = output / (name + ".cli.log")
++        with logpath.open("w") as log:
++            code = common.bounded_run(argv, env, log, args.cli_bound + 10)
++        if code:
++            raise ValueError(f"{name} CLI exited {code}; retained incomplete output at {output}")
++        expected[name] = cli_tokens(logpath.read_text(), args.predict, target["vocab"])
++    checks = []
++    with Server(model, output / "single", env, args, 1) as server:
++        server.props(model)
++        # cache_prompt=false is the existing API's full reset, including recurrent state.
++        cases = (("short_fresh", "short", False), ("short_repeat_reset", "short", False),
++                 ("long_fresh", "long", False), ("long_repeat_reset", "long", False),
++                 ("edited_cached", "edited", True), ("edited_fresh", "edited", False),
++                 ("short_after_long_reset", "short", False))
++        for name, prompt_name, cache in cases:
++            got = completion(server.url, prompts[prompt_name], args.predict, server.folder, name,
++                             args.request_bound, target["vocab"], 1, cache)
++            result = {"case": name, "status": agreement(got, expected[prompt_name], args.predict), **got}
++            if cache:
++                if got["cache_n"] > edit_at:
++                    raise ValueError("edited request reused IDs past its common prefix")
++                result["cache_reuse"] = "observed" if got["cache_n"] > 0 else "not_observed"
++                if not got["cache_n"] and result["status"] == "pass":
++                    result["status"] = "incomplete_no_prefix_reuse"
++            checks.append(result)
++    concurrent = None
++    if args.two_slot:
++        with Server(model, output / "two", env, args, 2) as server:
++            server.props(model)
++            selected = ("short", "edited")
++            alone = [completion(server.url, prompts[name], args.predict, server.folder, name + "_alone",
++                                args.request_bound, target["vocab"], 2) for name in selected]
++            before = metrics(request(server.url, "/metrics", None, server.folder, "metrics_before", args.request_bound))
++            with ThreadPoolExecutor(max_workers=2) as pool:
++                futures = [pool.submit(completion, server.url, prompts[name], args.predict, server.folder,
++                                       name + "_together", args.request_bound, target["vocab"], 2) for name in selected]
++                together = [future.result() for future in futures]
++            after = metrics(request(server.url, "/metrics", None, server.folder, "metrics_after", args.request_bound))
++            concurrent = {"before": before, "after": after, **overlap(before, after),
++                          "distinct_slots": together[0]["id_slot"] != together[1]["id_slot"]}
++            for name, baseline, got in zip(selected, alone, together):
++                checks.append({"case": name + "_two_slot_alone_cli", "status": agreement(baseline, expected[name], args.predict), **baseline})
++                checks.append({"case": name + "_together_alone", "status": agreement(got, baseline["tokens"], args.predict), **got})
++            if not concurrent["distinct_slots"] or not concurrent["concurrent_round_observed"]:
++                checks.append({"case": "resident_overlap", "status": "incomplete_overlap_not_observed"})
++    if common.clean_head(ROOT) != head or common.digest(__file__) != invocation["driver_sha256"] or common.digest(common.__file__) != invocation["helper_sha256"]:
++        raise ValueError("source or diagnostic tooling changed during capture")
++    common.model_unchanged(model, model_stat)
++    for binary, built in zip(binaries, builds):
++        if common.check_native_build(binary, head) != built:
++            raise ValueError("native binary or build stamp changed during capture")
++    result = {"complete": True, "format": "bloomery-dense-serve-v1", "checks": checks,
++              "two_slot_observation": concurrent, "acceptance": "pass" if all(c["status"] == "pass" for c in checks) else "not_passed",
++              "scope": "same-seat plain-text fixed-ID diagnostics; no numeric accuracy or performance claim"}
++    common.write_json(output / "results.json", result)
++    print(json.dumps(result, indent=2))
++    return 0 if result["acceptance"] == "pass" else 1
++
++
++def self_test():
++    valid = {"tokens": [4, 5], "tokens_predicted": 2, "truncated": False, "stop": True,
++             "stop_type": "limit", "stopped_limit": True, "stopped_eos": False, "stopped_word": False,
++             "id_slot": 0, "timings": {"cache_n": 0}}
++    parsed = answer(valid, 2, 10, 4, 1, False)
++    assert agreement(parsed, [4, 5], 2) == "pass"
++    assert agreement(parsed, [4, 6], 2) == "mismatch"
++    early = dict(valid, tokens=[4], tokens_predicted=1, stop_type="eos", stopped_eos=True, stopped_limit=False)
++    assert agreement(answer(early, 2, 10, 4, 1, False), [4, 5], 2) == "incomplete_early_eos"
++    for patch in ({"tokens": [True, 5]}, {"tokens": [4, 10]}, {"tokens": []}, {"tokens_predicted": 1},
++                  {"truncated": True}, {"stop": False}, {"stop_type": "word"}, {"stopped_eos": True},
++                  {"id_slot": 1}, {"timings": {"cache_n": 1}}, {"timings": []}, {"error": "engine fault"}):
++        try:
++            answer(dict(valid, **patch), 2, 10, 4, 1, False)
++            raise AssertionError(f"accepted invalid completion: {patch}")
++        except ValueError:
++            pass
++    assert cli_tokens("noise\ntokens [4, 5]\n", 2, 10) == [4, 5]
++    for text in ("", "tokens [4]\n", "tokens [true, 5]\n", "tokens [4, 5] slot=0\n", "tokens [4, 5]\ntokens [4, 5]\n"):
++        try:
++            cli_tokens(text, 2, 10)
++            raise AssertionError("accepted malformed CLI tokens")
++        except ValueError:
++            pass
++    assert endpoint("loading\nlistening on http://127.0.0.1:12345\n") == "http://127.0.0.1:12345"
++    for text in ("listening on http://0.0.0.0:12345", "listening on http://127.0.0.1:0",
++                 "listening on http://127.0.0.1:99999", "listening on http://127.0.0.1:4\nlistening on http://127.0.0.1:5"):
++        try:
++            endpoint(text)
++            raise AssertionError("accepted foreign/ambiguous server address")
++        except ValueError:
++            pass
++    base = metrics("llamacpp:n_decode_total 2\nllamacpp:n_busy_slots_per_decode 1\n")
++    together = metrics("llamacpp:n_decode_total 4\nllamacpp:n_busy_slots_per_decode 1.5\n")
++    assert overlap(base, together)["concurrent_round_observed"]
++    assert not overlap(base, base)["concurrent_round_observed"]
++    for bad in ("", "llamacpp:n_decode_total NaN\nllamacpp:n_busy_slots_per_decode 1\n"):
++        try:
++            metrics(bad)
++            raise AssertionError("accepted invalid metrics")
++        except ValueError:
++            pass
++    transport_self_test(valid)
++    print("dense-serve self-test: strict tokens, HTTP errors/truncation/EOG, reset counts, loopback and resident metrics contracts passed")
++    return 0
++
++
++def transport_self_test(valid):
++    """Exercise the actual curl/body/status path against a bounded host-only HTTP fixture."""
++    from http.server import BaseHTTPRequestHandler, HTTPServer
++    import threading
++
++    received = []
++
++    class Handler(BaseHTTPRequestHandler):
++        def log_message(self, *_):
++            pass
++
++        def do_POST(self):
++            received.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
++            body = json.dumps(valid if self.path == "/completion" else {"error": "fixture engine error"}).encode()
++            self.send_response(200 if self.path == "/completion" else 500)
++            self.send_header("Content-Length", str(len(body)))
++            self.end_headers()
++            self.wfile.write(body)
++
++    with tempfile.TemporaryDirectory() as temporary:
++        folder = Path(temporary)
++        with HTTPServer(("127.0.0.1", 0), Handler) as server:
++            thread = threading.Thread(target=server.serve_forever, daemon=True)
++            thread.start()
++            try:
++                url = f"http://127.0.0.1:{server.server_port}"
++                got = completion(url, [1, 2, 3, 4], 2, folder, "good", 2, 10, 1)
++                assert got["tokens"] == [4, 5]
++                assert received == [{"prompt": [1, 2, 3, 4], "n_predict": 2, "temperature": 0,
++                                     "return_tokens": True, "cache_prompt": False, "stream": False, "ignore_eos": False}]
++                try:
++                    request(url, "/error", {}, folder, "bad", 2)
++                    raise AssertionError("accepted HTTP engine error")
++                except ValueError as error:
++                    assert "HTTP 500" in str(error)
++            finally:
++                server.shutdown()
++                thread.join(timeout=3)
++                assert not thread.is_alive()
++
++
++def main():
++    if sys.argv[1:] == ["--self-test"]:
++        return self_test()
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--target", choices=common.TARGETS, default="qwen38-27b")
++    for name in ("model", "short", "long", "out"):
++        parser.add_argument("--" + name, type=Path, required=True)
++    parser.add_argument("--predict", type=int, default=16)
++    parser.add_argument("--ctx", type=int, default=4352, help="per-slot context; server receives this times its slots")
++    parser.add_argument("--ubatch", type=int, default=512)
++    parser.add_argument("--two-slot", action="store_true", help="also compare two resident requests together versus alone")
++    parser.add_argument("--cli-bound", type=int, default=900)
++    parser.add_argument("--startup-bound", type=int, default=300)
++    parser.add_argument("--request-bound", type=int, default=120)
++    args = parser.parse_args()
++    def interrupted(signum, _frame):
++        raise InterruptedError(f"received signal {signum}")
++    signal.signal(signal.SIGTERM, interrupted)
++    try:
++        return run(args)
++    except (ValueError, OSError, KeyError, TypeError, subprocess.SubprocessError, KeyboardInterrupt) as error:
++        print(f"dense-serve: {error}; incomplete evidence has no results.json completion marker", file=sys.stderr)
++        return 2
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tools/ref/dense_logits_ref.cpp b/tools/ref/dense_logits_ref.cpp
+new file mode 100644
+index 00000000..5663276c
+--- /dev/null
++++ b/tools/ref/dense_logits_ref.cpp
+@@ -0,0 +1,203 @@
++// Diagnostic forced-prefix logits from mainline llama.cpp, one f32 row per requested continuation id.
++// Row 0 follows the whole prompt; row i > 0 follows forced[i-1]. The final forced id is not fed.
++// The Python runner verifies identities and installs the complete diagnostic bundle. This writer is
++// not a registered reference family or a numerical gate. --validate-inputs opens no model or device.
++
++#include "llama.h"
++#include "gguf.h"
++
++#include <algorithm>
++#include <charconv>
++#include <cmath>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <fstream>
++#include <limits>
++#include <memory>
++#include <sstream>
++#include <stdexcept>
++#include <string>
++#include <vector>
++#include <unistd.h>
++
++static int integer(const std::string & text, const std::string & what, int minimum) {
++    int result = 0;
++    const auto parsed = std::from_chars(text.data(), text.data() + text.size(), result);
++    if (parsed.ec != std::errc() || parsed.ptr != text.data() + text.size() || result < minimum) {
++        throw std::runtime_error(what + ": invalid integer '" + text + "'");
++    }
++    return result;
++}
++
++static std::vector<llama_token> ids(const std::string & path) {
++    std::ifstream input(path);
++    if (!input) throw std::runtime_error("cannot read ids: " + path);
++    std::vector<llama_token> result;
++    std::string line;
++    while (std::getline(input, line)) {
++        result.push_back(integer(line, path + ":" + std::to_string(result.size() + 1), 0));
++        if (result.size() > 65536) throw std::runtime_error(path + ": more than 65536 ids");
++    }
++    if (input.bad() || result.empty()) throw std::runtime_error(path + ": unreadable or empty ids");
++    return result;
++}
++
++struct Options {
++    std::string model, prompt, forced, out, prefill = "batch";
++    int ctx = 4352, ubatch = 512, gpu_layers = 99, threads = 16;
++    bool validate = false;
++};
++
++static Options options(int argc, char ** argv) {
++    Options o;
++    std::vector<std::string> seen;
++    for (int i = 1; i < argc; ++i) {
++        const std::string key = argv[i];
++        if (std::find(seen.begin(), seen.end(), key) != seen.end()) {
++            throw std::runtime_error("duplicate option " + key);
++        }
++        seen.push_back(key);
++        if (key == "--validate-inputs") { o.validate = true; continue; }
++        if (i + 1 >= argc) throw std::runtime_error("missing value for " + key);
++        const std::string value = argv[++i];
++        if (key == "--model") o.model = value;
++        else if (key == "--prompt-file") o.prompt = value;
++        else if (key == "--forced-file") o.forced = value;
++        else if (key == "--out") o.out = value;
++        else if (key == "--prefill") o.prefill = value;
++        else if (key == "--ctx") o.ctx = integer(value, key, 1);
++        else if (key == "--ubatch") o.ubatch = integer(value, key, 1);
++        else if (key == "--gpu-layers") o.gpu_layers = integer(value, key, 0);
++        else if (key == "--threads") o.threads = integer(value, key, 1);
++        else throw std::runtime_error("unknown option " + key);
++    }
++    if (o.model.empty() || o.prompt.empty() || o.forced.empty() || o.out.empty()) {
++        throw std::runtime_error("requires --model, --prompt-file, --forced-file and --out");
++    }
++    if (o.prefill != "step" && o.prefill != "batch") throw std::runtime_error("--prefill is step or batch");
++    return o;
++}
++
++struct Batch {
++    llama_batch value;
++    explicit Batch(int size) : value(llama_batch_init(size, 0, 1)) {}
++    ~Batch() { llama_batch_free(value); }
++};
++
++static void decode(llama_context * ctx, Batch & batch, const llama_token * tokens, int n, int position) {
++    batch.value.n_tokens = n;
++    for (int i = 0; i < n; ++i) {
++        batch.value.token[i] = tokens[i];
++        batch.value.pos[i] = position + i;
++        batch.value.n_seq_id[i] = 1;
++        batch.value.seq_id[i][0] = 0;
++        batch.value.logits[i] = i == n - 1;
++    }
++    const int rc = llama_decode(ctx, batch.value);
++    if (rc != 0) throw std::runtime_error("llama_decode at position " + std::to_string(position) + " returned " + std::to_string(rc));
++}
++
++static void put_ids(std::ostream & output, const char * key, const std::vector<llama_token> & tokens) {
++    output << key << '\t';
++    for (size_t i = 0; i < tokens.size(); ++i) output << (i ? "," : "") << tokens[i];
++    output << '\n';
++}
++
++static int run(int argc, char ** argv) {
++    const Options o = options(argc, argv);
++    const auto prompt = ids(o.prompt), forced = ids(o.forced);
++    if (forced.size() > 4096 || prompt.size() + forced.size() > size_t(o.ctx)) {
++        throw std::runtime_error("prompt plus continuation exceeds context, or continuation exceeds 4096 rows");
++    }
++    if (o.validate) {
++        printf("inputs valid: prompt=%zu forced=%zu ctx=%d; no model or device opened\n", prompt.size(), forced.size(), o.ctx);
++        return 0;
++    }
++    const char * write = std::getenv("BLOOMERY_REF_WRITE");
++    if (!write || std::strcmp(write, "1") != 0) throw std::runtime_error("use dense-logits.py; BLOOMERY_REF_WRITE=1 is required");
++    {
++        const gguf_init_params gp = {true, nullptr};
++        std::unique_ptr<gguf_context, decltype(&gguf_free)> header(gguf_init_from_file(o.model.c_str(), gp), gguf_free);
++        if (!header) throw std::runtime_error("cannot read GGUF header");
++        const int64_t arch = gguf_find_key(header.get(), "general.architecture");
++        if (arch < 0 || gguf_get_kv_type(header.get(), arch) != GGUF_TYPE_STRING ||
++            std::strcmp(gguf_get_val_str(header.get(), arch), "qwen35") != 0) {
++            throw std::runtime_error("expected dense qwen35 before model load");
++        }
++        if (gguf_find_key(header.get(), "qwen35.decision.type") >= 0) throw std::runtime_error("decision model is not a dense generation diagnostic");
++    }
++    if (std::ifstream(o.out) || std::ifstream(o.out + ".meta")) throw std::runtime_error("output already exists");
++    llama_backend_init();
++    struct Backend { ~Backend() { llama_backend_free(); } } backend;
++    llama_model_params mp = llama_model_default_params();
++    mp.n_gpu_layers = o.gpu_layers;
++    ggml_backend_dev_t no_devices[] = {nullptr};
++    if (o.gpu_layers == 0) mp.devices = no_devices;
++    std::unique_ptr<llama_model, decltype(&llama_model_free)> model(llama_model_load_from_file(o.model.c_str(), mp), llama_model_free);
++    if (!model) throw std::runtime_error("model load failed");
++    const int vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
++    if (vocab <= 0) throw std::runtime_error("model has no vocabulary");
++    for (const auto * values : {&prompt, &forced}) {
++        for (const auto token : *values) if (token >= vocab) throw std::runtime_error("token id past vocabulary");
++    }
++    llama_context_params cp = llama_context_default_params();
++    cp.n_ctx = uint32_t(o.ctx);
++    cp.n_batch = uint32_t(prompt.size());
++    cp.n_ubatch = uint32_t(std::min(o.ubatch, int(prompt.size())));
++    cp.n_seq_max = 1;
++    cp.n_threads = cp.n_threads_batch = o.threads;
++    cp.type_k = cp.type_v = GGML_TYPE_F16;
++    cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
++    if (o.gpu_layers == 0) {
++        cp.offload_kqv = false;
++        cp.op_offload = false;
++    }
++    std::unique_ptr<llama_context, decltype(&llama_free)> ctx(llama_init_from_model(model.get(), cp), llama_free);
++    if (!ctx) throw std::runtime_error("context creation failed");
++    Batch batch(int(prompt.size()));
++    const int prefix = int(prompt.size()) - 1;
++    if (o.prefill == "step") {
++        for (int i = 0; i < prefix; ++i) decode(ctx.get(), batch, &prompt[size_t(i)], 1, i);
++    } else if (prefix) {
++        decode(ctx.get(), batch, prompt.data(), prefix, 0);
++    }
++    decode(ctx.get(), batch, &prompt.back(), 1, prefix);
++    std::unique_ptr<FILE, decltype(&std::fclose)> raw(std::fopen(o.out.c_str(), "wbx"), std::fclose);
++    if (!raw) throw std::runtime_error("cannot create raw output");
++    static_assert(sizeof(float) == 4 && std::numeric_limits<float>::is_iec559, "requires IEEE754 f32");
++    std::vector<unsigned char> bytes(size_t(vocab) * 4);
++    for (size_t i = 0; i < forced.size(); ++i) {
++        if (i) decode(ctx.get(), batch, &forced[i - 1], 1, int(prompt.size() + i - 1));
++        const float * row = llama_get_logits_ith(ctx.get(), -1);
++        if (!row) throw std::runtime_error("missing logit row " + std::to_string(i));
++        for (int j = 0; j < vocab; ++j) {
++            if (!std::isfinite(row[j])) throw std::runtime_error("nonfinite logit at row " + std::to_string(i) + " token " + std::to_string(j));
++            uint32_t bits = 0;
++            std::memcpy(&bits, row + j, sizeof(bits));
++            for (int b = 0; b < 4; ++b) bytes[size_t(j) * 4 + size_t(b)] = static_cast<unsigned char>(bits >> (8 * b));
++        }
++        if (std::fwrite(bytes.data(), 1, bytes.size(), raw.get()) != bytes.size()) throw std::runtime_error("short write of logit row");
++    }
++    if (std::fclose(raw.release()) != 0) throw std::runtime_error("raw logit close failed");
++    const auto temporary = o.out + ".meta.partial";
++    std::ostringstream meta;
++    meta << "format\tbloomery-forced-logits-v1\ndtype\tfloat32-le\nrows\t" << forced.size()
++         << "\nvocab\t" << vocab << "\nmode\treference\nprefill\t" << o.prefill << "\nlast_step\ttrue\n";
++    put_ids(meta, "prompt_ids", prompt);
++    put_ids(meta, "forced_ids", forced);
++    meta << "complete\ttrue\n";
++    const auto content = meta.str();
++    std::unique_ptr<FILE, decltype(&std::fclose)> metadata(std::fopen(temporary.c_str(), "wx"), std::fclose);
++    if (!metadata || std::fwrite(content.data(), 1, content.size(), metadata.get()) != content.size()) throw std::runtime_error("cannot write metadata");
++    if (std::fclose(metadata.release()) != 0 || ::link(temporary.c_str(), (o.out + ".meta").c_str()) != 0) throw std::runtime_error("cannot complete metadata without replacement");
++    if (::unlink(temporary.c_str()) != 0) throw std::runtime_error("cannot remove metadata staging name");
++    printf("dense_logits_ref: rows=%zu vocab=%d raw=%s; diagnostic only\n", forced.size(), vocab, o.out.c_str());
++    return 0;
++}
++
++int main(int argc, char ** argv) {
++    try { return run(argc, argv); }
++    catch (const std::exception & e) { std::fprintf(stderr, "dense_logits_ref: %s\n", e.what()); return 1; }
++}

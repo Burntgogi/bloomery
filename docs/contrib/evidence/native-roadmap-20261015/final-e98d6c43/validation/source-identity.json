@@ -1,0 +1,12 @@
+{
+  "commit": "9c5b3a5f484196a3c56e1081fa5211655a146fd3",
+  "tree": "9cd9571231b59b67b4395d8e27ad8f2c9f9ec73f",
+  "base": "e98d6c43f95bc75475cadaf1043c1735962dcc5d",
+  "dense_parent": "d63f1bab9c7f9253338d7a1e7757c804557f9589",
+  "clean": true,
+  "isolated_host_tests_passed": 118,
+  "host_tests_ignored": 3,
+  "targeted_t0_units_passed": 5,
+  "clippy": "pass",
+  "nvidia_runtime_verified": false
+}

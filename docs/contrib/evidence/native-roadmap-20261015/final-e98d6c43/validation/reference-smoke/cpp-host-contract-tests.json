@@ -1,0 +1,42 @@
+{
+  "binary": "/home/jutai05/bloomery-native-contributions-20261013/roadmap-20261015/reference-smoke/dense_logits_ref_verified",
+  "model_used_header_only": "/home/jutai05/bloomery-native-model-candidates/notschmee/Qwen3.5-0.8B-GGUF/1870603ac8ab59c7ddb9d94cccf3b297e379538f/Qwen3.5-0.8B-Q4_K_M.gguf",
+  "checks": [
+    {
+      "case": "valid_literal_ids_no_load",
+      "returncode": 0,
+      "stdout": "inputs valid: prompt=2 forced=1 ctx=8; no model or device opened\n",
+      "stderr": ""
+    },
+    {
+      "case": "negative_id_refused",
+      "returncode": 1,
+      "stdout": "",
+      "stderr": "dense_logits_ref: /tmp/tmpb0q9icsc/p.ids:1: invalid integer '-1'\n"
+    },
+    {
+      "case": "blank_id_refused",
+      "returncode": 1,
+      "stdout": "",
+      "stderr": "dense_logits_ref: /tmp/tmpb0q9icsc/p.ids:2: invalid integer ''\n"
+    },
+    {
+      "case": "duplicate_option_refused",
+      "returncode": 1,
+      "stdout": "",
+      "stderr": "dense_logits_ref: duplicate option --ctx\n"
+    },
+    {
+      "case": "context_overflow_refused",
+      "returncode": 1,
+      "stdout": "",
+      "stderr": "dense_logits_ref: prompt plus continuation exceeds context, or continuation exceeds 4096 rows\n"
+    },
+    {
+      "case": "existing_output_refused_before_load",
+      "returncode": 1,
+      "stdout": "",
+      "stderr": "dense_logits_ref: output already exists\n"
+    }
+  ]
+}

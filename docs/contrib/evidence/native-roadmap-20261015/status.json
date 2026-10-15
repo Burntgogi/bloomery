@@ -1,36 +1,39 @@
 {
-  "base": "5e837723d31cf860088c96197ba4be52d47c3c3d",
-  "publication": "implementation branch push awaits GitHub workflow scope; device authorization retried after first expiry",
+  "base": "e98d6c43f95bc75475cadaf1043c1735962dcc5d",
+  "publication": "GitHub workflow authorization resolved; implementation branches and initial PRs published",
   "stages": {
-    "1": "latest-main rebase and local checks complete; two PRs await authentication",
-    "2": "original selected Q4_K HIP port passes exact-head GPU verification",
-    "3": "forced-logit native/reference diagnostics under implementation; A6000 runtime still pending",
-    "4": "small full model acquired and SHA verified; whole forward and backend boundary not implemented",
-    "5": "planned; native AMD serving and quiet matched GPU session required"
+    "1": "initial PRs #248 and #251 submitted; reviews pending; #251 needs GPU",
+    "2": "selected Q4_K port passes18 exact-head GPU cases; draft #252 submitted, depends on #248",
+    "3": "diagnostic tools implemented; fresh host118 tests and clippy pass; A6000 execution pending",
+    "4": "exact0.8B candidate and nine-slice forward plan prepared; whole-forward/backend not implemented",
+    "5": "matched benchmarking plan prepared; native AMD service and quiet GPU window required"
   },
   "hip": {
-    "source_head": "0edd7afb0b96caaa80dee55f5c2679d8374e7cdc",
-    "tree": "5b456196819c4464cafad3e23bbd9205e6836f3a",
-    "clean": true,
+    "source_head": "dac2c4e6e3b7f20a3ccaf90c0058e66639c01116",
+    "pr": "https://github.com/midagedev/bloomery/pull/248",
     "gpu_cases_passed": 6
   },
   "dense": {
-    "source_head": "c55b99d945a81e144b5d446dd975f6d106e760dc",
-    "tree": "21baea93a5aded54e5f313358882d997bd1159c6",
-    "clean": true,
+    "source_head": "d63f1bab9c7f9253338d7a1e7757c804557f9589",
+    "pr": "https://github.com/midagedev/bloomery/pull/251",
     "t0_units_passed": 82,
-    "gpu_gates_host_tests_passed": 116,
-    "model_host_tests_passed": 350,
-    "static_check": "pass",
-    "clippy": "pass",
-    "admission_exit": 1,
-    "admission_gap": "tool-call parser",
+    "host_gpu_gates_tests_passed": 116,
+    "host_model_tests_passed": 350,
+    "admission_gap": "tool-call parser; host coverage remains exit1",
     "nvidia_runtime_verified": false
   },
   "hip-selected": {
-    "source_head": "ce87db9ac79c8e9b8658578b2b0289498c326119",
-    "tree": "6cb5112e68870bd117126a15b166771035d81eda",
-    "clean": true,
+    "source_head": "4c35e4f0625adb61ba5acffe59352e3db0762c87",
+    "pr": "https://github.com/midagedev/bloomery/pull/252",
     "gpu_cases_passed": 18
+  },
+  "validation": {
+    "source_head": "9c5b3a5f484196a3c56e1081fa5211655a146fd3",
+    "status": "draft PR preparation",
+    "isolated_host_tests_passed": 118,
+    "targeted_t0_units_passed": 5,
+    "static_clippy": "pass",
+    "reference_smoke": "CPU only on pinned0.8B; two captures of3x248320 finite rows",
+    "nvidia_runtime_verified": false
   }
 }

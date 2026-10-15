@@ -1,0 +1,10 @@
+contrib-check tier=t0 commit=9c5b3a5f
+host: Linux 7.0.0-38-generic x86_64, 12th Gen Intel(R) Core(TM) i5-12600K
+toolchain: rustc 1.100.0-nightly (e457a7b0d 2026-08-27) (nightly-2026-08-28); RUSTFLAGS: -C target-cpu=native (yours); timeout 1200s a unit
+logs: /home/jutai05/bloomery-native-contributions-20261013/dense-validation/target/contrib-check/20261015-160300
+fmt rc=0 4s
+tools/ref/dense-logits.py rc=0 1s
+tools/ref/dense-serve.py rc=0 0s
+check-comments rc=0 5s
+check-recipes rc=0 92s
+DONE tier=t0 total=5 red=0 wall=102s
