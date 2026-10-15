@@ -106,23 +106,27 @@ def main():
                             "lab_tree": git("rev-parse", "HEAD:labs/hip-native"), "clean": True}
         if os.environ.get("CARGO_ENCODED_RUSTFLAGS"):
             raise RuntimeError("unset CARGO_ENCODED_RUSTFLAGS; verification sets explicit RUSTFLAGS")
+        if os.environ.get("CARGO_BUILD_TARGET"):
+            raise RuntimeError("unset CARGO_BUILD_TARGET; verification selects the native host target")
         if not os.environ.get("HIP_LIB_DIR"):
             raise RuntimeError("HIP_LIB_DIR must name the directory containing libamdhip64.so")
         result["toolchain"] = subprocess.check_output(["rustc", "-vV"], text=True)
+        host = next(line.removeprefix("host: ") for line in result["toolchain"].splitlines() if line.startswith("host: "))
+        result["host_target"] = host
         result["target"] = {"triple": "amdgcn-amd-amdhsa", "cpu": "gfx1100"}
         host_flags = "-C target-cpu=native"
         device_flags = "-C target-cpu=gfx1100 -C panic=abort"
         run("fmt", ["cargo", "fmt", "--all", "--", "--check"])
-        run("host-test", ["cargo", "test", "--locked", "-p", "bloomery-hip-spike"], host_flags)
+        run("host-test", ["cargo", "test", "--locked", "--target", host, "-p", "bloomery-hip-spike"], host_flags)
         run("host-clippy", ["cargo", "clippy", "--locked", "--no-deps", "-p",
-                            "bloomery-hip-spike", "--all-targets", "--", "-D", "warnings"], host_flags)
+                            "bloomery-hip-spike", "--target", host, "--all-targets", "--", "-D", "warnings"], host_flags)
         device = ["cargo"]
         target = ["--release", "--target", "amdgcn-amd-amdhsa", "-p", "bloomery-hip-spike-device"]
         run("device-clippy", device + ["clippy", "-Zbuild-std=core", "--locked", "--no-deps"] + target +
             ["--", "-D", "warnings"], device_flags)
         run("device-build", device + ["build", "-Zbuild-std=core", "--locked"] + target, device_flags)
-        run("host-build", ["cargo", "build", "--locked", "--release", "-p", "bloomery-hip-spike"], host_flags)
-        binaries = [LAB / "target/release/bloomery-hip-spike",
+        run("host-build", ["cargo", "build", "--locked", "--target", host, "--release", "-p", "bloomery-hip-spike"], host_flags)
+        binaries = [LAB / f"target/{host}/release/bloomery-hip-spike",
                     LAB / "target/amdgcn-amd-amdhsa/release/bloomery_hip_spike_device.elf"]
         result["binaries"] = [{"path": str(p.relative_to(LAB)), "sha256": digest(p)} for p in binaries]
         result["card"] = card()
