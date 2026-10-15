@@ -61,3 +61,8 @@ activation layout, logical warp operations, launch shape and sum order. The scal
 kernel here is not that port. Then gate one complete model forward against llama.cpp HIP
 on identical model bits before designing a common backend boundary with the maintainers.
 Attention/GDN, state reset/checkpoints, routed experts and media remain separate work.
+
+The verifier rejects an inherited `CARGO_BUILD_TARGET` and explicitly selects the
+`rustc -vV` host triple for host tests, lint and build. Its executable comes from
+that triple's output directory, so a Cargo config target cannot select an older
+`target/release` binary.

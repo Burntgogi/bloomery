@@ -1,6 +1,4 @@
 use std::ffi::{CStr, CString, c_char, c_void};
-use std::marker::PhantomData;
-use std::rc::Rc;
 
 unsafe extern "C" {
     fn hipInit(flags: u32) -> i32;
@@ -53,8 +51,6 @@ struct Context {
     module: *mut c_void,
     stream: *mut c_void,
     buffers: Vec<*mut c_void>,
-    // Module, stream and buffers stay on their creating thread.
-    _owner: PhantomData<Rc<()>>,
 }
 
 impl Context {
@@ -64,7 +60,6 @@ impl Context {
             module: std::ptr::null_mut(),
             stream: std::ptr::null_mut(),
             buffers: Vec::new(),
-            _owner: PhantomData,
         };
         // SAFETY: output pointer storage and the C string remain live; Drop frees partial initialization.
         unsafe {
@@ -467,7 +462,7 @@ mod tests {
     fn refuses_invalid_shapes_and_truncated_weights() {
         for (k, r, c, w) in [
             (0, 1, 1, 0),
-            (255, 1, 1, 144),
+            (257, 1, 1, 144),
             (256, 0, 1, 0),
             (256, 1, 0, 144),
             (256, 1, 1, 143),
