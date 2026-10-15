@@ -270,5 +270,34 @@ fn an_integer_file_of_another_length_is_malformed() {
         set.i32s(pos, Layout::Flat),
         Err(RefError::Malformed { .. })
     ));
+    for extra in 1..=3 {
+        let mut bytes = ids(&[1, 2, 3]);
+        bytes.extend(std::iter::repeat_n(0, extra));
+        std::fs::write(&file, bytes).unwrap();
+        assert!(matches!(
+            set.i32s(pos, Layout::Flat),
+            Err(RefError::Malformed { .. })
+        ));
+    }
     std::fs::remove_dir_all(&dir).unwrap_or_else(|e| panic!("{e}"));
+}
+
+#[test]
+fn a_float_file_with_a_partial_value_is_malformed() {
+    let dir = set_dir("f32-partial");
+    write_set(&dir, RUNS, "/models/D/draft.gguf", &[KV]);
+    let set = Dsref::read(&dir).unwrap();
+    let row = set.find(0, Graph::Kv, "dflash_kv_fused_target", 0).unwrap();
+    let file = dir.join(Dsref::file_name(row, Layout::Flat, FileElem::F32));
+    let values = [0.0f32, 1.0, -1.0, 0.5, 0.25, 0.0, 0.0, -0.25];
+    let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+    std::fs::write(&file, &bytes).unwrap();
+    assert_eq!(set.f32s(row).unwrap(), values);
+    for extra in 1..=3 {
+        let mut partial = bytes.clone();
+        partial.extend(std::iter::repeat_n(0, extra));
+        std::fs::write(&file, partial).unwrap();
+        assert!(matches!(set.f32s(row), Err(RefError::Malformed { .. })));
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
 }
