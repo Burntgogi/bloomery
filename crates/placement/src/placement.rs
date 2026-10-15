@@ -4531,6 +4531,26 @@ mod tests {
                 (3, "ffn_down_exps.weight"),
             ]
         );
+        // The reason names the failing kernel contract: an unsupported part
+        // is one cause, a gate/up type mismatch another, and neither is empty
+        // or collapsed into the other. The wording itself is not pinned.
+        let why = |program: Program, layer: usize, tensor: &str| {
+            routed_rule(program)
+                .host_only(&model)
+                .unwrap()
+                .into_iter()
+                .find(|h| h.layer == layer && h.tensor.name == tensor)
+                .map(|h| h.why)
+                .expect("the cause is named")
+        };
+        let unsupported = why(Program::Qwen35Body, 1, "ffn_down_exps.weight");
+        let mismatch = why(Program::Qwen35Body, 3, "ffn_up_exps.weight");
+        assert!(!unsupported.is_empty(), "{unsupported}");
+        assert!(!mismatch.is_empty(), "{mismatch}");
+        assert_ne!(
+            unsupported, mismatch,
+            "an unsupported part and a gate/up mismatch are distinct causes"
+        );
         let empty = ModelTensors {
             tensors: Vec::new(),
             ..model

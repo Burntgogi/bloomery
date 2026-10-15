@@ -4469,18 +4469,23 @@ mod tests {
 
     #[test]
     fn host_only_records_name_causes_and_skip_an_all_host_choice() {
-        use gguf::GgmlType::{Q4_K, Q6_K, Q8_0};
+        use gguf::GgmlType::{Q4_K, Q5_K, Q6_K, Q8_0};
         use model::placement::accepts::{Program, routed_rule};
         use model::placement::{ModelTensor, ModelTensors, Role};
         let mut model = ModelTensors {
             tensors: Vec::new(),
-            layers: 3,
+            layers: 4,
             experts: 8,
             experts_used: 2,
         };
-        for (layer, types) in [[Q4_K, Q4_K, Q6_K], [Q4_K, Q4_K, Q8_0], [Q6_K, Q6_K, Q6_K]]
-            .into_iter()
-            .enumerate()
+        for (layer, types) in [
+            [Q4_K, Q4_K, Q6_K],
+            [Q4_K, Q4_K, Q8_0],
+            [Q6_K, Q6_K, Q6_K],
+            [Q4_K, Q5_K, Q4_K],
+        ]
+        .into_iter()
+        .enumerate()
         {
             for (part, ty) in ["gate", "up", "down"].into_iter().zip(types) {
                 model.tensors.push(ModelTensor {
@@ -4512,8 +4517,25 @@ mod tests {
                 (1, "ffn_down_exps.weight"),
                 (2, "ffn_gate_exps.weight"),
                 (2, "ffn_up_exps.weight"),
+                (3, "ffn_up_exps.weight"),
             ]
         );
+        // The rendered reason carries the offending type and keeps distinct
+        // causes apart: the Q8_0 down is an unsupported part, the Q4_K/Q5_K
+        // gate/up a mismatch. The wording itself is not pinned.
+        let why = |layer: u64, tensor: &str| {
+            causes
+                .iter()
+                .find(|r| r.u64("layer").unwrap() == layer && r.word("tensor").unwrap() == tensor)
+                .unwrap()
+                .text("why")
+                .unwrap()
+        };
+        let unsupported = why(1, "ffn_down_exps.weight");
+        let mismatch = why(3, "ffn_up_exps.weight");
+        assert!(unsupported.starts_with(&Q8_0.to_string()), "{unsupported}");
+        assert!(mismatch.starts_with(&Q5_K.to_string()), "{mismatch}");
+        assert_ne!(unsupported, mismatch, "distinct causes must not collapse");
         assert!(host_only(&model, None).unwrap().next().is_none());
     }
 
