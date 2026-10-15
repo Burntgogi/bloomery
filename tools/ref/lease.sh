@@ -876,6 +876,7 @@ decode_bin() { echo "$HOME/repo/$1/$DECODE_BIN"; }
 # to seconds (LEASE_GPU_POLL/REPORT/WAIT of 1/1/2), and the four lease_gpu_idle cases sleep 4 s
 # between them; the trace cases (a temp lease and trace, no /root) follow. just check-recipes runs this
 # on the Mac.
+# Trace-write checks name the failed path and preserve continuation, not the OS's localized wording.
 if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = --self-test ]; then
   fails=0
   check() {
@@ -1087,7 +1088,11 @@ EOF
     RC=0
     (exec 9>"$t/tlock3" && flock -n 9 && lease_trace_take 2> "$t/err" && echo "id=[$LEASE_TRACE_ID]" > "$t/out") || RC=$?
     check trace-write-fail-rc "$RC" 0
-    matches trace-write-fail-line '^\[lease\] trace not written: .*No such file or directory \(.*/no-such-dir/trace.log\); the lease goes on$' "$(cat "$t/err")"
+    check trace-write-fail-lines "$(wc -l < "$t/err" | tr -d '[:space:]')" 1
+    case $(cat "$t/err") in
+      "[lease] trace not written: "*"$BLOOMERY_LEASE_TRACE"*) check trace-write-fail-named yes yes ;;
+      *) check trace-write-fail-named no yes ;;
+    esac
     check trace-write-fail-no-id "$(cat "$t/out")" 'id=[]'
     # No trace file and a lock that is not the machine's: nothing written, nothing named.
     unset BLOOMERY_LEASE_TRACE
