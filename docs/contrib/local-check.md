@@ -94,6 +94,10 @@ Exceptions:
   has the same two, `/usr/local/cuda-13.3/include` and `/usr/include`; without CUDA there, the headers are in the three
   `.deb` files `tools/nightly/install.sh` names.
 
+The CPU guard's synthetic process IDs are derived from each case's shell PID,
+so a low PID in a container cannot replace a fixture process. Its live pair
+still reads the real `/proc`; no product guard threshold or host PID is changed.
+
 ## 3. Gates on your own card: local mode
 
 `BLOOMERY_BOX_LOCAL=1` makes `tools/box.sh` run, in your tree and with `bash`, the same command line it would send to the

@@ -60,41 +60,44 @@ expect() {
 
 # The stub tree's writers, for the scripts `expect` runs: `up <seconds>` sets the uptime, `ps1 <pid>
 # <comm> <ppid> <start> <ticks>` a process's stat line (utime = ticks, stime 0), `gone <pid>` ends it.
-# The runner is the script's own shell ($$): its child `timeout` (pid 101) runs generate_ds41 (102); cargo
-# (201) and rustc (202) hang off pid 1. Every process exists at the interval's start, so the seed reading
-# (named processes: none) is taken at once. Each script starts from an empty tree.
+# The runner is the script's own shell ($$). Synthetic pids are offsets from it, so none can
+# replace its row: timeout runs generate_ds41 under the runner; cargo and rustc hang off pid 1.
+# Every initial process exists before the seed reading (named processes: none). Each case starts empty.
 STUB='P=$BLOOMERY_LEASE_PROC; rm -rf "${P:?}"; mkdir -p "$P"
 up() { echo "$1 0.00" > "$P/uptime"; }
 ps1() { mkdir -p "$P/$1"; echo "$1 ($2) S $3 0 0 0 -1 0 0 0 0 0 $5 0 0 0 20 0 1 0 $4 0 0" > "$P/$1/stat"; }
 gone() { rm -rf "${P:?}/$1"; }
-up 100.00; ps1 1 systemd 0 1 50; ps1 $$ bash 1 900 10; ps1 101 timeout $$ 1000 1; ps1 102 generate_ds41 101 1001 1000
-ps1 201 cargo 1 1100 500; ps1 202 rustc 201 1101 20
+p_timeout=$(($$ + 1)); p_own=$(($$ + 2)); p_cargo=$(($$ + 3))
+p_rustc=$(($$ + 4)); p_new=$(($$ + 5))
+up 100.00; ps1 1 systemd 0 1 50; ps1 $$ bash 1 900 10
+ps1 "$p_timeout" timeout $$ 1000 1; ps1 "$p_own" generate_ds41 "$p_timeout" 1001 1000
+ps1 "$p_cargo" cargo 1 1100 500; ps1 "$p_rustc" rustc "$p_cargo" 1101 20
 seed() { CPU_BUSY_COMMS=none; cpu_busy_sample || exit 3; CPU_BUSY_COMMS="cargo rustc generate_ds41"; }'
 export BLOOMERY_LEASE_PROC=$tmp/proc
 export CPU_TEST_STUB=$STUB
 
 expect 'the runner'\''s own busy arm is left out' 0 '^tag=\[\] reading=\[0\.0 cargo 0\.0%;rustc 0\.0%;\] own=\[generate_ds41 300\.0%;\] span=\[10\.0\]$' \
-  'eval "$CPU_TEST_STUB"; seed; up 110.00; ps1 102 generate_ds41 101 1001 4000; guard_cpu post
+  'eval "$CPU_TEST_STUB"; seed; up 110.00; ps1 "$p_own" generate_ds41 "$p_timeout" 1001 4000; guard_cpu post
    echo "tag=[$CPU_BUSY_TAG] reading=[$CPU_BUSY_READING] own=[$CPU_BUSY_OWN] span=[$CPU_BUSY_SPAN]"'
 expect 'a foreign cargo over the threshold tags the row' 0 '^\[cpu-busy\] .* post: 80\.0% > 50% of one cpu over 10\.0 s \[cargo 80\.0%;rustc 0\.0%;\] \(not counted, under the runner: generate_ds41 300\.0%;\)$' \
-  'eval "$CPU_TEST_STUB"; seed; up 110.00; ps1 102 generate_ds41 101 1001 4000; ps1 201 cargo 1 1100 1300; guard_cpu post
+  'eval "$CPU_TEST_STUB"; seed; up 110.00; ps1 "$p_own" generate_ds41 "$p_timeout" 1001 4000; ps1 "$p_cargo" cargo 1 1100 1300; guard_cpu post
    [ "$CPU_BUSY_TAG" = " [cpu-busy]" ]'
 expect 'a foreign rustc started inside the interval counts whole' 0 'post: 70\.0% > 50% .* \[cargo 0\.0%;rustc 0\.0%;rustc 70\.0%;\]' \
-  'eval "$CPU_TEST_STUB"; seed; up 110.00; ps1 203 rustc 201 10500 700; guard_cpu post'
+  'eval "$CPU_TEST_STUB"; seed; up 110.00; ps1 "$p_new" rustc "$p_cargo" 10500 700; guard_cpu post'
 expect 'a reused pid counts from its own start' 0 '^tag=\[\] reading=\[10\.0 cargo 10\.0%;rustc 0\.0%;\]' \
-  'eval "$CPU_TEST_STUB"; seed; up 110.00; gone 201; ps1 201 cargo 1 10400 100; guard_cpu post
+  'eval "$CPU_TEST_STUB"; seed; up 110.00; gone "$p_cargo"; ps1 "$p_cargo" cargo 1 10400 100; guard_cpu post
    echo "tag=[$CPU_BUSY_TAG] reading=[$CPU_BUSY_READING]"'
 expect 'a foreign process of the same busy share under the threshold does not tag' 0 '^tag=\[\]$' \
-  'eval "$CPU_TEST_STUB"; seed; up 110.00; ps1 201 cargo 1 1100 900; guard_cpu post; echo "tag=[$CPU_BUSY_TAG]"'
+  'eval "$CPU_TEST_STUB"; seed; up 110.00; ps1 "$p_cargo" cargo 1 1100 900; guard_cpu post; echo "tag=[$CPU_BUSY_TAG]"'
 expect 'a call under a second after the last reading starts the next interval' 0 '^tag=\[\] span=\[\] then tag=\[ \[cpu-busy\]\] span=\[10\.0\]$' \
-  'eval "$CPU_TEST_STUB"; seed; up 100.50; ps1 201 cargo 1 1100 1300; guard_cpu pre; a="tag=[$CPU_BUSY_TAG] span=[$CPU_BUSY_SPAN]"
-   up 110.50; ps1 201 cargo 1 1100 2100; guard_cpu post; echo "$a then tag=[$CPU_BUSY_TAG] span=[$CPU_BUSY_SPAN]"'
+  'eval "$CPU_TEST_STUB"; seed; up 100.50; ps1 "$p_cargo" cargo 1 1100 1300; guard_cpu pre; a="tag=[$CPU_BUSY_TAG] span=[$CPU_BUSY_SPAN]"
+   up 110.50; ps1 "$p_cargo" cargo 1 1100 2100; guard_cpu post; echo "$a then tag=[$CPU_BUSY_TAG] span=[$CPU_BUSY_SPAN]"'
 expect 'cpu_busy_reading keeps its form' 0 '^0\.0 $' \
   'eval "$CPU_TEST_STUB"; CPU_BUSY_COMMS=none; cpu_busy_reading'
 expect 'a process tree that cannot be read is a named exit' 70 '^guard_cpu: pre: no cpu reading: .*/no-proc cannot be read' \
   "BLOOMERY_LEASE_PROC='$tmp/no-proc' guard_cpu pre"
 expect 'strict mode aborts on a foreign cargo' 75 'witness abort-cpu' \
-  'eval "$CPU_TEST_STUB"; seed; up 110.00; ps1 201 cargo 1 1100 1300; witness() { echo "witness $1"; }; BLOOMERY_OTHER_STRICT=1 guard_cpu post'
+  'eval "$CPU_TEST_STUB"; seed; up 110.00; ps1 "$p_cargo" cargo 1 1100 1300; witness() { echo "witness $1"; }; BLOOMERY_OTHER_STRICT=1 guard_cpu post'
 
 if [ ! -r /proc/self/stat ]; then
   echo "skip live: no /proc/self/stat here (the box runs it)"
