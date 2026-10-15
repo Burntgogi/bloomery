@@ -4439,7 +4439,7 @@ mod tests {
         {
             for (part, ty) in ["gate", "up", "down"].into_iter().zip(types) {
                 model.tensors.push(ModelTensor {
-                    name: format!("blk.{layer}.ffn_{part}_exps.weight"),
+                    name: format!("ffn_{part}_exps.weight"),
                     shard: 0,
                     layer: Some(layer),
                     role: Role::RoutedExperts,
@@ -4464,9 +4464,9 @@ mod tests {
         assert_eq!(
             actual,
             [
-                (1, "blk.1.ffn_down_exps.weight"),
-                (2, "blk.2.ffn_gate_exps.weight"),
-                (2, "blk.2.ffn_up_exps.weight"),
+                (1, "ffn_down_exps.weight"),
+                (2, "ffn_gate_exps.weight"),
+                (2, "ffn_up_exps.weight"),
             ]
         );
         assert!(host_only(&model, None).unwrap().next().is_none());
