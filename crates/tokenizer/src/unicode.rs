@@ -12,8 +12,8 @@ pub(crate) const REPLACEMENT: u32 = 0xFFFD;
 /// overlong forms and surrogates pass through, and a byte that starts no valid
 /// sequence becomes U+FFFD and advances one byte.
 ///
-/// A four-byte form above U+10FFFF also becomes U+FFFD here; the reference
-/// throws on it when it re-encodes the word.
+/// A four-byte form above U+10FFFF is refused; the reference throws on it
+/// when it re-encodes the word.
 pub(crate) fn decode_lenient(bytes: &[u8], out: &mut Vec<u32>) {
     out.clear();
     out.reserve(bytes.len());
@@ -48,7 +48,8 @@ fn decode_one(b: &[u8], i: usize) -> (u32, usize) {
     } else if lead & 0x08 == 0 {
         if cont(1) && cont(2) && cont(3) {
             let cpt = (u32::from(lead & 0x07) << 18) | (bits(1) << 12) | (bits(2) << 6) | bits(3);
-            (if cpt > 0x10FFFF { REPLACEMENT } else { cpt }, 4)
+            assert!(cpt <= 0x10FFFF, "UTF-8 codepoint U+{cpt:X} above U+10FFFF");
+            (cpt, 4)
         } else {
             (REPLACEMENT, 1)
         }
@@ -112,4 +113,26 @@ pub(crate) fn byte_to_cpt_table() -> [u32; 256] {
         }
     }
     table
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decode_lenient, encode_cpt};
+
+    #[test]
+    fn upper_unicode_boundary_round_trips() {
+        let bytes = b"\xF4\x8F\xBF\xBF";
+        let mut cpts = Vec::new();
+        decode_lenient(bytes, &mut cpts);
+        assert_eq!(cpts, [0x10FFFF]);
+        let mut encoded = Vec::new();
+        encode_cpt(cpts[0], &mut encoded);
+        assert_eq!(encoded, bytes);
+    }
+
+    #[test]
+    #[should_panic(expected = "above U+10FFFF")]
+    fn refuses_codepoint_above_unicode_limit() {
+        decode_lenient(b"\xF4\x90\x80\x80", &mut Vec::new());
+    }
 }
