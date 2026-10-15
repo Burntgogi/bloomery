@@ -156,6 +156,7 @@ These are complete allocated files. No model forward or weight upload was run.
 
 | File | Bytes | Architecture and tensors | Fit for first AMD Qwen forward |
 | --- | ---: | --- | --- |
+| Newly acquired `bloomery-native-model-candidates/notschmee/Qwen3.5-0.8B-GGUF/1870603ac8ab59c7ddb9d94cccf3b297e379538f/Qwen3.5-0.8B-Q4_K_M.gguf` | 590,880,672 | `qwen35`, 24 layers, width1024, heads8/2; Q4_K162/Q6_K24/Q8_0 1/F32 133 | Full SHA verified; host coverage has only missing tool parser. Q8_0 embedding/tied head is an explicit additional port dependency. See `small-model/README.md`. |
 | `llama-stack/models/clef-flash/Cloudflare_clef-flash-Q4_K_L.gguf` | 6,202,025,280 | `qwen35`, 32 layers, width4096, heads16/4; Q4_K98/Q6_K46/Q8_0 53/Q5_K5/F32 225 | Same native Body35 family, physically smaller; requires Q5_K and Q8_0 too, plus complete coverage check and exact digest. Not the three-type initial target. |
 | `clef-tactical/models/Clef-Flash-Q4_K_M.gguf` | 6,486,448,192 | `clef`, decision type `clef`, 32 layers; Q8_0 211/Q4_K97/Q6_K1/F32 277/BF16 1 | Decision backbone layout; unsuitable as a plain-generation shortcut. |
 | `d1-tactical/models/d1-3B-Q4_K_M.gguf` | 1,674,456,672 | `lfm2`, decision type `lfm2-d1`, 30 layers, width2048; Q4_K148/Q6_K19/F32 99 | No native Bloomery lfm2 architecture in the inspected dispatch; not a smaller Qwen. |
@@ -166,7 +167,10 @@ and partial downloads in the earlier evidence directory are not model candidates
 If reducing the first port to Q4_K/Q6_K/F32 is necessary, acquire a genuinely
 smaller plain `qwen35` generation file only after inspecting every tensor type and
 the model metadata. Pin its upstream revision/size/full SHA before claiming it is
-the new target. No such small, three-type, plain target is established by this audit.
+the new target. The follow-up screened three0.8B files and found no exact
+three-type target; it acquired the notschmee candidate above after explicitly
+accepting its one Q8_0 embedding/tied-head dependency. This does not replace the
+initial dense27B contribution target or complete the AMD whole-forward stage.
 
 ### Current resource blockers
 

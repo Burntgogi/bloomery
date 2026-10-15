@@ -1,29 +1,36 @@
 {
-  "base": "9fc2cc0d67f9a5b1d71e10663ba43873431c25e5",
+  "base": "5e837723d31cf860088c96197ba4be52d47c3c3d",
+  "publication": "implementation branch push awaits GitHub workflow scope; device authorization retried after first expiry",
+  "stages": {
+    "1": "latest-main rebase and local checks complete; two PRs await authentication",
+    "2": "original selected Q4_K HIP port passes exact-head GPU verification",
+    "3": "forced-logit native/reference diagnostics under implementation; A6000 runtime still pending",
+    "4": "small full model acquired and SHA verified; whole forward and backend boundary not implemented",
+    "5": "planned; native AMD serving and quiet matched GPU session required"
+  },
   "hip": {
-    "source_head": "e203eb9ce3f45ff3222a301efa1a304ddf69341b",
-    "tree": "2111c4d87600ff1b4a690964cce9650de865adeb",
+    "source_head": "0edd7afb0b96caaa80dee55f5c2679d8374e7cdc",
+    "tree": "5b456196819c4464cafad3e23bbd9205e6836f3a",
     "clean": true,
-    "gpu_cases": 6,
-    "status": "pass"
+    "gpu_cases_passed": 6
   },
   "dense": {
-    "source_head": "00a54d4b60ff6831d283d81c6bb5e6c95c71ab70",
-    "tree": "6b6def820bfcb6b6245e8974b19bdea8ef2234f9",
+    "source_head": "c55b99d945a81e144b5d446dd975f6d106e760dc",
+    "tree": "21baea93a5aded54e5f313358882d997bd1159c6",
     "clean": true,
     "t0_units_passed": 82,
     "gpu_gates_host_tests_passed": 116,
-    "model_host_tests_passed": 342,
+    "model_host_tests_passed": 350,
     "static_check": "pass",
     "clippy": "pass",
-    "nvidia_runtime": "pending maintainer A6000 after 0.3.3"
+    "admission_exit": 1,
+    "admission_gap": "tool-call parser",
+    "nvidia_runtime_verified": false
   },
-  "publication": "waiting for GitHub device auth refresh",
-  "stages": {
-    "1": "rebase and local verification complete; publication pending",
-    "2": "implementation in hip-selected",
-    "3": "detailed handoff design; A6000 unavailable locally",
-    "4": "plan with dependency and resource evidence; not implemented",
-    "5": "plan; requires native AMD service and idle matching GPU session"
+  "hip-selected": {
+    "source_head": "ce87db9ac79c8e9b8658578b2b0289498c326119",
+    "tree": "6cb5112e68870bd117126a15b166771035d81eda",
+    "clean": true,
+    "gpu_cases_passed": 18
   }
 }

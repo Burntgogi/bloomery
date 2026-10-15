@@ -1,0 +1,239 @@
+{
+  "schema": 1,
+  "status": "pass",
+  "checks": [
+    {
+      "name": "fmt",
+      "command": [
+        "cargo",
+        "fmt",
+        "--all",
+        "--",
+        "--check"
+      ],
+      "rustflags": "-C target-cpu=native",
+      "log": "fmt.log",
+      "status": "pass",
+      "exit_code": 0,
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "name": "host-test",
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "bloomery-hip-spike"
+      ],
+      "rustflags": "-C target-cpu=native",
+      "log": "host-test.log",
+      "status": "pass",
+      "exit_code": 0,
+      "log_sha256": "d6e5d5680ba684801a2c24f096289b8668069035846a31ced97c94b41fa7b282"
+    },
+    {
+      "name": "host-clippy",
+      "command": [
+        "cargo",
+        "clippy",
+        "--locked",
+        "--no-deps",
+        "-p",
+        "bloomery-hip-spike",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "rustflags": "-C target-cpu=native",
+      "log": "host-clippy.log",
+      "status": "pass",
+      "exit_code": 0,
+      "log_sha256": "c7e3e435667f7fde917433b41a7ef6a424c90a4daca65bd4acf2badccf51ae55"
+    },
+    {
+      "name": "device-clippy",
+      "command": [
+        "cargo",
+        "clippy",
+        "-Zbuild-std=core",
+        "--locked",
+        "--no-deps",
+        "--release",
+        "--target",
+        "amdgcn-amd-amdhsa",
+        "-p",
+        "bloomery-hip-spike-device",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "rustflags": "-C target-cpu=gfx1100 -C panic=abort",
+      "log": "device-clippy.log",
+      "status": "pass",
+      "exit_code": 0,
+      "log_sha256": "c6750bb8a4dc3dbe8ab175e9e47ca3c04cd747d4aeab8bd2a8504de3724ca95a"
+    },
+    {
+      "name": "device-build",
+      "command": [
+        "cargo",
+        "build",
+        "-Zbuild-std=core",
+        "--locked",
+        "--release",
+        "--target",
+        "amdgcn-amd-amdhsa",
+        "-p",
+        "bloomery-hip-spike-device"
+      ],
+      "rustflags": "-C target-cpu=gfx1100 -C panic=abort",
+      "log": "device-build.log",
+      "status": "pass",
+      "exit_code": 0,
+      "log_sha256": "fe5e8c29a2ea37bc43a48ffa2e14bf52f24b5ce734fe47b0946a0cff2e2528f8"
+    },
+    {
+      "name": "host-build",
+      "command": [
+        "cargo",
+        "build",
+        "--locked",
+        "--release",
+        "-p",
+        "bloomery-hip-spike"
+      ],
+      "rustflags": "-C target-cpu=native",
+      "log": "host-build.log",
+      "status": "pass",
+      "exit_code": 0,
+      "log_sha256": "97718d26dbe5a53e5c2b39151e56e65cd618ecb43e94e579d26828afe7fde8ce"
+    },
+    {
+      "name": "gpu",
+      "command": [
+        "/home/jutai05/bloomery-native-contributions-20261013/hip-pr/labs/hip-native/target/release/bloomery-hip-spike",
+        "/home/jutai05/bloomery-native-contributions-20261013/hip-pr/labs/hip-native/target/amdgcn-amd-amdhsa/release/bloomery_hip_spike_device.elf",
+        "/home/jutai05/bloomery-qwen27-serving-20261012/matmul-fixtures/Q4_K.bin",
+        "6144",
+        "64"
+      ],
+      "rustflags": "-C target-cpu=native",
+      "log": "gpu.log",
+      "status": "pass",
+      "exit_code": 0,
+      "log_sha256": "9f73908bebf9c9a0eed96fa053a1229e14e411c4996d46f789702a006e204eb1"
+    }
+  ],
+  "cases": [
+    {
+      "operation": "q4_matmul",
+      "k": 256,
+      "rows": 7,
+      "cols": 1,
+      "nmse": 3.702660797383163e-14,
+      "copy_equal": true,
+      "steady_host_buffer_allocations": 0,
+      "status": "pass"
+    },
+    {
+      "operation": "q4_matmul",
+      "k": 512,
+      "rows": 64,
+      "cols": 1,
+      "nmse": 1.375607993838801e-12,
+      "copy_equal": true,
+      "steady_host_buffer_allocations": 0,
+      "status": "pass"
+    },
+    {
+      "operation": "q4_matmul",
+      "k": 512,
+      "rows": 64,
+      "cols": 32,
+      "nmse": 6.689703539606927e-13,
+      "copy_equal": true,
+      "steady_host_buffer_allocations": 0,
+      "status": "pass"
+    },
+    {
+      "operation": "q4_matmul",
+      "k": 6144,
+      "rows": 64,
+      "cols": 1,
+      "nmse": 2.331305569619408e-12,
+      "copy_equal": true,
+      "steady_host_buffer_allocations": 0,
+      "status": "pass"
+    },
+    {
+      "operation": "q4_matmul",
+      "k": 6144,
+      "rows": 64,
+      "cols": 32,
+      "nmse": 2.0990081683686894e-12,
+      "copy_equal": true,
+      "steady_host_buffer_allocations": 0,
+      "status": "pass"
+    },
+    {
+      "operation": "dense_ffn",
+      "width": 256,
+      "nmse": 7.959878245021427e-14,
+      "intermediate_host_copies": 0,
+      "steady_host_buffer_allocations": 0,
+      "status": "pass"
+    }
+  ],
+  "started_utc": "2026-10-15T05:52:16.192016+00:00",
+  "host": {
+    "platform": "Linux-7.0.0-38-generic-x86_64-with-glibc2.39",
+    "cpu": "x86_64"
+  },
+  "source": {
+    "commit": "0edd7afb0b96caaa80dee55f5c2679d8374e7cdc",
+    "tree": "5b456196819c4464cafad3e23bbd9205e6836f3a",
+    "lab_tree": "65647ae542326497039333a65091a3ce53ad9bf5",
+    "clean": true
+  },
+  "toolchain": "rustc 1.100.0-nightly (e457a7b0d 2026-08-27)\nbinary: rustc\ncommit-hash: e457a7b0d326d67b4322ef0d11bd715cfaeda48f\ncommit-date: 2026-08-27\nhost: x86_64-unknown-linux-gnu\nrelease: 1.100.0-nightly\nLLVM version: 23.1.0\n",
+  "target": {
+    "triple": "amdgcn-amd-amdhsa",
+    "cpu": "gfx1100"
+  },
+  "binaries": [
+    {
+      "path": "target/release/bloomery-hip-spike",
+      "sha256": "2ad635a3abf5f1566fab0401ace8d8207bc3a6f41248b64694583ce24408becf"
+    },
+    {
+      "path": "target/amdgcn-amd-amdhsa/release/bloomery_hip_spike_device.elf",
+      "sha256": "f1cd17d3daa99350647860eeb67112bbc86d502b5f95717dc6a1a3090fefaffd"
+    }
+  ],
+  "card": {
+    "name": "AMD Radeon RX 7900 GRE",
+    "device_ordinal": 0,
+    "runtime_version": 70253210,
+    "driver_version": 70253210,
+    "visibility": {
+      "HIP_VISIBLE_DEVICES": null,
+      "ROCR_VISIBLE_DEVICES": null,
+      "GPU_DEVICE_ORDINAL": null
+    },
+    "runtime_library": "/home/jutai05/Strata/.venv/lib/python3.12/site-packages/_rocm_sdk_core/lib/libamdhip64.so.7"
+  },
+  "fixture": {
+    "name": "Q4_K.bin",
+    "sha256": "9251b422a700bf27bf47512068c93f88d029dc6eba32ed516dbc067842b570ce",
+    "k": 6144,
+    "rows": 64,
+    "bytes": 221184
+  },
+  "acceptance": {
+    "nmse_max": 1e-06,
+    "finite_outputs": true
+  },
+  "finished_utc": "2026-10-15T05:52:21.515489+00:00"
+}

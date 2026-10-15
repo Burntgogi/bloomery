@@ -1,0 +1,5 @@
+tensor_types={"F32": 133, "Q4_K": 162, "Q6_K": 24, "Q8_0": 1}
+metadata arch=qwen35 layers=24 trunk=24 embedding=1024 heads=8 kv_heads=2 head=256 vocab=248320 experts=0 flash_mma=true
+coverage unsupported=1 unused_tensors=0
+unsupported layer=None a tool-call parser for this template
+qwen35_admission: the native coverage table refuses this file; no device was opened

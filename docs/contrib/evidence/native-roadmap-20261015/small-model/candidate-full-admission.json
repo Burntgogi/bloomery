@@ -1,0 +1,15 @@
+{
+  "command": [
+    "/home/jutai05/bloomery-native-contributions-20261013/step3/target/debug/examples/qwen35_admission",
+    "/home/jutai05/bloomery-native-model-candidates/notschmee/Qwen3.5-0.8B-GGUF/1870603ac8ab59c7ddb9d94cccf3b297e379538f/Qwen3.5-0.8B-Q4_K_M.gguf"
+  ],
+  "exit_code": 1,
+  "binary_sha256_before": "af4b515c2a5eb31a91a78133980bf14f1fb261bc0faf906419f2380c9f7cb186",
+  "binary_sha256_after": "af4b515c2a5eb31a91a78133980bf14f1fb261bc0faf906419f2380c9f7cb186",
+  "binary_unchanged": true,
+  "source_head": "00a54d4b60ff6831d283d81c6bb5e6c95c71ab70",
+  "source_base": "9fc2cc0d67f9a5b1d71e10663ba43873431c25e5",
+  "completed_utc": "2026-10-15T05:53:18.300682+00:00",
+  "full_file_sha256": "be5b3cb8c2f3ebd791349c9c775ea38950f23a2b9e792ca2f0411597dd172988",
+  "gpu_opened": false
+}

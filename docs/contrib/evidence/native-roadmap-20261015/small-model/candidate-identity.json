@@ -1,0 +1,25 @@
+{
+  "repository": "notschmee/Qwen3.5-0.8B-GGUF",
+  "revision": "1870603ac8ab59c7ddb9d94cccf3b297e379538f",
+  "filename": "Qwen3.5-0.8B-Q4_K_M.gguf",
+  "source_url": "https://huggingface.co/notschmee/Qwen3.5-0.8B-GGUF/blob/1870603ac8ab59c7ddb9d94cccf3b297e379538f/Qwen3.5-0.8B-Q4_K_M.gguf",
+  "resolve_url": "https://huggingface.co/notschmee/Qwen3.5-0.8B-GGUF/resolve/1870603ac8ab59c7ddb9d94cccf3b297e379538f/Qwen3.5-0.8B-Q4_K_M.gguf",
+  "size": 590880672,
+  "expected_sha256": "be5b3cb8c2f3ebd791349c9c775ea38950f23a2b9e792ca2f0411597dd172988",
+  "tensor_types": {
+    "F32": 133,
+    "Q8_0": 1,
+    "Q4_K": 162,
+    "Q6_K": 24
+  },
+  "local_file": "/home/jutai05/bloomery-native-model-candidates/notschmee/Qwen3.5-0.8B-GGUF/1870603ac8ab59c7ddb9d94cccf3b297e379538f/Qwen3.5-0.8B-Q4_K_M.gguf",
+  "bytes_read": 590880672,
+  "sha256": "be5b3cb8c2f3ebd791349c9c775ea38950f23a2b9e792ca2f0411597dd172988",
+  "lfs_sha256_match": true,
+  "full_file_verified": true,
+  "completed_utc": "2026-10-15T05:53:00.829369+00:00",
+  "download_wall_seconds": 67.6938808860723,
+  "gpu_loaded": false,
+  "stage4_whole_forward": "not run",
+  "extra_port_dependency": "Q8_0 token_embd.weight, also the tied output head"
+}

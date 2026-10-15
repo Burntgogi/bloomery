@@ -1,0 +1,10 @@
+   Compiling bloomery-hip-spike v0.1.0 (/home/jutai05/bloomery-native-contributions-20261013/hip-selected/labs/hip-native/host)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.09s
+     Running unittests src/main.rs (target/debug/build/bloomery-hip-spike/77c8987991b265dc/out/bloomery_hip_spike-77c8987991b265dc)
+
+running 2 tests
+test selected::tests::selected_shape_refusals_precede_the_driver ... ok
+test tests::refuses_invalid_shapes_and_truncated_weights ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

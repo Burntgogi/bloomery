@@ -1,0 +1,8 @@
+{
+  "binary": "/home/jutai05/bloomery-native-contributions-20261013/step3/target/debug/examples/qwen35_admission",
+  "sha256": "af4b515c2a5eb31a91a78133980bf14f1fb261bc0faf906419f2380c9f7cb186",
+  "source_head": "00a54d4b60ff6831d283d81c6bb5e6c95c71ab70",
+  "source_base": "9fc2cc0d67f9a5b1d71e10663ba43873431c25e5",
+  "kind": "host-only native admission example",
+  "nvidia_or_amd_device_opened": false
+}
