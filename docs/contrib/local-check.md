@@ -101,6 +101,10 @@ box: the guard, the model profile, the tier and the exports, with no ssh and no 
 unchanged on a Linux machine with a card of its own. The header of `tools/box.sh` is the full contract; this section is
 what a contributor sets up and what to expect.
 
+`tools/gpu-gate.sh --self-test` may run with `BLOOMERY_BOX_LOCAL=1` still set.
+Its remote-only queue fixture clears local mode before invoking its SSH stub;
+the local-mode cases continue to exercise the local runner.
+
 **Set up once:**
 
 1. **The environment file.** `BLOOMERY_ENV_FILE`, default `~/bloomery-env.sh`, is sourced before the command; a
