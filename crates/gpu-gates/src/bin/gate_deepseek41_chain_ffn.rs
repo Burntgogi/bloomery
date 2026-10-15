@@ -2,6 +2,8 @@
 //! (`bloomery_gpu_deepseek41::chain::ffn::FfnPiece`, B5 G1) against ik's CPU
 //! dumps: the decode-step sets at positions 4 and 301 (`STEP4`, `D1N`), T = 1,
 //! every layer.
+//! The f32 unit roundoff and gamma bound come from
+//! `bloomery_gpu_gates::rounding`, shared with the other chain gates.
 //!
 //! Per layer the gate makes the layer's dense tensors resident with
 //! `Weights::load_where` and uploads the card's routed stacks compacted in slot
@@ -122,6 +124,7 @@ mod gate {
     use bloomery_gpu_gates::act_rule::{Act, Rule};
     use bloomery_gpu_gates::oracle;
     use bloomery_gpu_gates::oracle::deepseek41::{D1N, STEP4};
+    use bloomery_gpu_gates::rounding::{U, gamma};
     use bloomery_gpu_gates::{
         GateError, RefManifest, RefRow, activations, bits_equal, bytes_to_words, checks_failed,
         no_local_depot, q8_1_dequant, ref_model_path, ref_tensor_of_in, row_bytes,
@@ -144,15 +147,6 @@ mod gate {
     /// The ik tree the sets must come from: the dump before its sink fix is
     /// kept read-only elsewhere and must not be read.
     const PRE_FIX_BUILD: &str = "49ef19d0";
-
-    /// f32's unit roundoff, 2^-24.
-    const U: f64 = f32::EPSILON as f64 / 2.0;
-
-    /// `n·u / (1 - n·u)`: the relative bound of `n` roundings.
-    fn gamma(n: usize) -> f64 {
-        let nu = n as f64 * U;
-        nu / (1.0 - nu)
-    }
 
     /// Roundings on one term's path through one of our dots over `k` values
     /// (the MoE gate's count): one per value a lane reads, `k/32` a lane, and
