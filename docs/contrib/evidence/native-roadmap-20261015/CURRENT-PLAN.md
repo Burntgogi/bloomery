@@ -43,3 +43,7 @@ The0.8B pilot is not the original27B target. Before attempting27B on a16GiB AMD
 card, use the real native planner's weights/state/KV/scratch budget; file size
 alone does not establish fit. Additional format or dense placement work, if the
 budget refuses it, remains separate from the initial three-type frontend attach.
+
+The corrected initial PRs #248 and #251 have now both received CLEAN/APPROVED
+code reviews. Their new full CI runs are still in progress. The dense PR retains
+its needs-gpu status; a code approval is not an NVIDIA/runtime result.

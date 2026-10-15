@@ -2,7 +2,7 @@
   "base": "e98d6c43f95bc75475cadaf1043c1735962dcc5d",
   "publication": "GitHub workflow authorization resolved; implementation branches and initial PRs published",
   "stages": {
-    "1": "initial PRs #248/#251 submitted; all four first-review must-fix items corrected and retested; new CI/review pending",
+    "1": "PRs #248/#251 submitted, all four first-review findings fixed, both corrected heads CLEAN/APPROVED; full CI in progress",
     "2": "selected Q4_K port passes18 exact-head GPU cases; draft #252 submitted, depends on #248",
     "3": "draft #254 provides executable diagnostics; isolated119 host tests and clippy pass; actual A6000/reference/gate acceptance pending",
     "4": "exact0.8B candidate and nine-slice forward plan prepared; whole-forward/backend not implemented",
@@ -58,6 +58,6 @@
     "hip_response": "https://github.com/midagedev/bloomery/pull/248#issuecomment-6186897349",
     "dense_response": "https://github.com/midagedev/bloomery/pull/251#issuecomment-6186897780",
     "evidence": "https://github.com/Burntgogi/bloomery/tree/57b689d8/docs/contrib/evidence/native-roadmap-20261015/review-fixes",
-    "remote_status": "new CI/review runs pending; not claimed approved"
+    "remote_status": "Both initial PRs now have CLEAN/APPROVED reviews on corrected heads; full CI reruns in progress; dense runtime remains needs-gpu"
   }
 }
