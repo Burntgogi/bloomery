@@ -2069,7 +2069,9 @@ mod cli {
             Some((p, levers)) => {
                 let q = PlaceQ3::qwen3(&file, p, ctx, kv)?;
                 let plan = q.plan(ctx, &PlanLevers::from_levers(levers)?)?;
-                q.record(&plan, None).print();
+                for line in q.records(&plan, None)? {
+                    line.print();
+                }
                 match q.whole_card_qwen3(&file, &plan, (ctx, 1))? {
                     Some(card) => {
                         Qwen3moeModel::open(Gpu::open_card(card.name, card.device)?, file, opts)?
@@ -2173,7 +2175,9 @@ mod cli {
             Some((p, levers)) => {
                 let q = PlaceQ3::qwen35(&file, p, o)?;
                 let plan = q.plan(ctx, &PlanLevers::from_levers(levers)?)?;
-                q.record(&plan, None).print();
+                for line in q.records(&plan, None)? {
+                    line.print();
+                }
                 match q.whole_card_qwen35(&file, &plan, (ctx, 1), o)? {
                     Some(card) => {
                         if dspark {
@@ -2350,6 +2354,14 @@ mod cli {
             .into());
         }
         println!("{}", plan38_line(place, experts, &plan, &inputs.room.1)?);
+        for line in record::host_only(
+            plan.model,
+            matches!(experts, Experts::Card).then(|| {
+                model::placement::accepts::routed_rule(model::arch::qwen35moe::place::PROGRAM)
+            }),
+        )? {
+            line.print();
+        }
         let (residency, pool) = residency38(
             <Body38 as bloomery_gpu::model::ChainBody>::UNHOSTED_POOL,
             &plan,
@@ -2458,6 +2470,14 @@ mod cli {
             "{}",
             plan38_line(place, experts, &plan.plan, &inputs.room.1)?
         );
+        for line in record::host_only(
+            plan.plan.model,
+            matches!(experts, Experts::Card).then(|| {
+                model::placement::accepts::routed_rule(model::arch::qwen35moe::place::PROGRAM)
+            }),
+        )? {
+            line.print();
+        }
         let (residency, pool) = residency38(
             <Body38 as bloomery_gpu::model::ChainBody>::UNHOSTED_POOL,
             &plan.plan,

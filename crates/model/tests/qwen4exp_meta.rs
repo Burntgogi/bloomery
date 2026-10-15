@@ -875,25 +875,25 @@ fn hw_qwen4exp_card_plan() {
     let draft = Split::open(SHARED).unwrap_or_else(|e| panic!("open {SHARED}: {e}"));
     let mtp = MtpInputs::read(&draft, &split, &inputs, HeadSet::Full)
         .unwrap_or_else(|e| panic!("MtpInputs::read {SHARED}: {e}"));
-    let mut host_only = inputs.host_only();
-    host_only.sort_by(|x, y| (x.layer, &x.tensor).cmp(&(y.layer, &y.tensor)));
+    let mut host_only = model::placement::accepts::routed_rule(place::PROGRAM)
+        .host_only(&inputs.model)
+        .unwrap();
+    host_only.sort_by(|x, y| (x.layer, &x.tensor.name).cmp(&(y.layer, &y.tensor.name)));
     let named: Vec<(usize, &str)> = host_only
         .iter()
-        .map(|h| (h.layer, h.tensor.as_str()))
+        .map(|h| (h.layer, h.tensor.name.as_str()))
         .collect();
-    let reasons = host_only
-        .iter()
-        .all(|h| h.why.contains("no card expert kernel"));
     for h in &host_only {
-        let _ = writeln!(o, "host only: layer {} {}: {}", h.layer, h.tensor, h.why);
+        let _ = writeln!(
+            o,
+            "host only: layer {} {}: {}",
+            h.layer, h.tensor.name, h.why
+        );
     }
     check(
         &mut o,
-        format!(
-            "the stacks the card experts do not read, by name with their reason ({reasons}): \
-             {named:?}"
-        ),
-        named == HOST_ONLY && reasons,
+        format!("the stacks the card experts do not read: {named:?}"),
+        named == HOST_ONLY,
     );
     let off: Vec<usize> = HOST_ONLY.iter().map(|&(l, _)| l).collect();
     let per_expert = |t: &model::placement::ModelTensor| t.file_bytes / inputs.model.experts;
@@ -1316,7 +1316,9 @@ fn hw_qwen4exp_q3_card_plan() {
         ),
         mtp.borrowed_head == BorrowedHead::Q6K,
     );
-    let host_only = inputs.host_only();
+    let host_only = model::placement::accepts::routed_rule(place::PROGRAM)
+        .host_only(&inputs.model)
+        .unwrap();
     check(
         &mut o,
         format!("the stacks the card experts do not read: {host_only:?}"),

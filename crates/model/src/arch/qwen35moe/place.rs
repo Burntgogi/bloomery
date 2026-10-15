@@ -16,9 +16,9 @@
 //! id prefix `[0, n_l)`, spread evenly, on the layers whose three routed stacks the card experts read
 //! in their parts ([`routed_rule`] of [`PROGRAM`]: a Q4_K, Q5_K, IQ3_XXS or
 //! IQ4_XS gate and up of one type, a Q5_1, Q8_0 or IQ4_NL down, each in the
-//! file's blocks), the rest on the host. A layer with a stack of a type no
-//! part reads keeps every expert on the host, each such stack named with the reason
-//! ([`PlanInputs::host_only`]).
+//! file's blocks), the rest on the host. The same routed rule names every
+//! stack whose kernel contract keeps its layer on the host
+//! ([`placement::RoutedRule::host_only`]).
 //!
 //! The attention layers select their positions by the mean-pool indexer at
 //! every position the program runs, so no count of positions is refused for
@@ -112,25 +112,11 @@ pub enum Experts {
 /// down), keeps its experts on the host.
 pub const PROGRAM: Program = Program::Qwen38Body;
 
-/// A type [`PROGRAM`]'s card leg reads in some part: the question of a stack
-/// read alone (a type no part reads keeps its layer on the host,
-/// [`host_only_reason`]); the plan reads [`routed_rule`] by part.
+/// A type [`PROGRAM`]'s card leg reads in some part. Coverage reads this
+/// type union; the plan and its host-only diagnosis use [`routed_rule`] by part.
 #[must_use]
 pub fn card_routed(ty: GgmlType) -> Option<CardFormat> {
     (qwen38_gate_up(ty).is_some() || qwen38_down(ty).is_some()).then_some(CardFormat::KQuant)
-}
-
-/// Why a routed stack of type `ty` keeps its layer's experts on the host;
-/// `None` for a stack [`card_routed`] loads.
-#[must_use]
-pub fn host_only_reason(ty: GgmlType) -> Option<String> {
-    if card_routed(ty).is_some() {
-        return None;
-    }
-    Some(format!(
-        "{ty}: no card expert kernel of this program reads it (the gate and up Q4_K, Q5_K, \
-         IQ3_XXS or IQ4_XS, the down Q5_1, Q8_0 or IQ4_NL)"
-    ))
 }
 
 /// What a target plan sets aside beside its own terms: `reserve` bytes the
@@ -176,15 +162,6 @@ impl<'a> Beside<'a> {
     const fn slots(self, slots: usize) -> Self {
         Beside { slots, ..self }
     }
-}
-
-/// A routed stack whose layer keeps every expert on the host under
-/// [`Experts::Card`], and why ([`host_only_reason`]).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct HostOnly {
-    pub layer: usize,
-    pub tensor: String,
-    pub why: String,
 }
 
 /// What a plan of a qwen4exp file is made from, read from its headers.
@@ -695,26 +672,6 @@ impl PlanInputs {
         check_draft_reserve(machine, None)?;
         let plan = self.target_rule(machine, ctx_max, levers, Some(rule), Beside::none())?;
         checked(plan).map_err(PlaceError::Broken)
-    }
-
-    /// Every routed stack whose layer keeps all its experts on the host
-    /// under [`Experts::Card`] — a stack of a type [`card_routed`] does not
-    /// load — with the reason, in the file's tensor order.
-    #[must_use]
-    pub fn host_only(&self) -> Vec<HostOnly> {
-        self.model
-            .tensors
-            .iter()
-            .filter(|t| t.role == Role::RoutedExperts)
-            .filter_map(|t| {
-                let why = host_only_reason(t.ty)?;
-                Some(HostOnly {
-                    layer: t.layer?,
-                    tensor: t.name.clone(),
-                    why,
-                })
-            })
-            .collect()
     }
 
     /// [`PlanInputs::plan`] with the MTP draft `mtp` on the machine's one
@@ -2348,7 +2305,7 @@ mod tests {
 
         use gguf::GgmlType;
 
-        use super::super::{PROGRAM, card_routed, host_only_reason, routed_rule};
+        use super::super::{PROGRAM, card_routed, routed_rule};
         use crate::placement::{
             self, Card, CardFormat, Device, Format, Host, KvBytes, Machine, ModelTensor,
             ModelTensors, Node, Plan, PlanLevers, Role,
@@ -2488,12 +2445,11 @@ mod tests {
             .expect("the card plan")
         }
 
-        /// The card format of each routed type, and the named reason of each
-        /// type it leaves on the host; the Q5_1, Q8_0 and IQ4_NL downs' card
-        /// bytes are their file bytes, a whole Q5_1 tensor keeps its packed
+        /// The card format of each routed type; the Q5_1, Q8_0 and IQ4_NL downs'
+        /// card bytes are their file bytes, a whole Q5_1 tensor keeps its packed
         /// format and a whole Q8_0 tensor its planes.
         #[test]
-        fn routed_types_and_their_reasons() {
+        fn routed_types_and_formats() {
             for ty in [
                 GgmlType::Q4_K,
                 GgmlType::Q5_K,
@@ -2504,7 +2460,6 @@ mod tests {
                 GgmlType::IQ4_NL,
             ] {
                 assert_eq!(card_routed(ty), Some(CardFormat::KQuant), "{ty}");
-                assert_eq!(host_only_reason(ty), None, "{ty}");
             }
             for ty in [
                 GgmlType::Q6_K,
@@ -2513,8 +2468,6 @@ mod tests {
                 GgmlType::IQ2_S,
             ] {
                 assert_eq!(card_routed(ty), None, "{ty}");
-                let why = host_only_reason(ty).expect("a stack the card does not read is named");
-                assert!(why.starts_with(&ty.to_string()), "{why}");
             }
             for n in [1, 3, 323] {
                 assert_eq!(

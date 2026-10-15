@@ -1168,6 +1168,18 @@ pub static PLAN38: Kind = Kind {
     ],
 };
 
+/// A routed tensor whose kernel contract keeps its layer on the host.
+pub static HOST_ONLY: Kind = Kind {
+    name: "host_only",
+    head: "host only",
+    doc: "A routed stack that keeps its layer on the host under the printed plan's card expert rule; not a byte-budget limit or an all-host choice. One record per cause, in file order.",
+    parts: &[
+        key("layer", U64, ""),
+        key("tensor", Word, ""),
+        key("why", Text, ""),
+    ],
+};
+
 /// The loaded model.
 pub static LOAD: Kind = Kind {
     name: "load",
@@ -3322,10 +3334,10 @@ pub mod groups {
 
     /// `bin/shared/qwen3moe_place.rs`.
     pub mod qwen3moe_place {
-        use crate::record::{Kind, PLAN38};
+        use crate::record::{HOST_ONLY, Kind, PLAN38};
 
-        /// The placed plan of a qwen3moe or qwen35moe load: `PlaceQ3::record`.
-        pub const PLAN: &[&Kind] = &[&PLAN38];
+        /// The placed plan and its host-only causes: `PlaceQ3::records`.
+        pub const PLAN: &[&Kind] = &[&PLAN38, &HOST_ONLY];
     }
 
     /// `serve_client.rs`.
@@ -3463,7 +3475,7 @@ pub static BLOOMERY_SERVE_DS41: &[&Kind] = kinds![
 pub static BLOOMERY_SERVE_QWEN38: &[&Kind] = kinds![
     groups::model_file::FETCH,
     groups::model_file::SET,
-    &[&PLAN38, &LISTENING38],
+    &[&PLAN38, &HOST_ONLY, &LISTENING38],
     groups::bind::CACHE,
     groups::drafted::PROMPT,
     &[
@@ -3627,6 +3639,7 @@ pub static GENERATE_GLM5NEXT: &[&Kind] = &[
 /// lines; the binary's other lines are its own.
 pub static GENERATE_QWEN3MOE: &[&Kind] = &[
     &PLAN38,
+    &HOST_ONLY,
     &LANE,
     &LOAD_DRAFT_OFF38,
     &MTP_HEAD38,
@@ -3712,6 +3725,24 @@ pub fn mtp_stats(
 /// `gate_nvtier`'s rows: the tier's counters, the residency rule's two
 /// records of the paged plan and the tier census of each phase.
 pub static GATE_NVTIER: &[&Kind] = &[&NVTIER, &RESIDENCY_UNSET, &RESIDENCY_HOST, &TIER_CENSUS];
+
+/// The printed plan's host-only causes under its actual expert rule.
+/// `None` is the user's all-host choice and emits no kernel diagnosis.
+pub fn host_only<'a>(
+    model: &'a model::placement::ModelTensors,
+    rule: Option<model::placement::RoutedRule>,
+) -> Result<impl Iterator<Item = Record> + 'a, GateError> {
+    let causes = match rule {
+        Some(rule) => rule.host_only(model)?,
+        None => Vec::new(),
+    };
+    Ok(causes.into_iter().map(|cause| {
+        Record::new(&HOST_ONLY)
+            .u("layer", cause.layer)
+            .w("tensor", &cause.tensor.name)
+            .w("why", format!("{}: {}", cause.tensor.ty, cause.why))
+    }))
+}
 
 /// `r` with the host room's reading and the plan room when the plan was made at
 /// one (`HostTotals::room`), the two parts `plan` and `plan38` share; the
@@ -4391,6 +4422,56 @@ pub fn residency_reset(r: &ResetReport) -> Record {
 mod tests {
     use super::*;
 
+    #[test]
+    fn host_only_records_name_causes_and_skip_an_all_host_choice() {
+        use gguf::GgmlType::{Q4_K, Q6_K, Q8_0};
+        use model::placement::accepts::{Program, routed_rule};
+        use model::placement::{ModelTensor, ModelTensors, Role};
+        let mut model = ModelTensors {
+            tensors: Vec::new(),
+            layers: 3,
+            experts: 8,
+            experts_used: 2,
+        };
+        for (layer, types) in [[Q4_K, Q4_K, Q6_K], [Q4_K, Q4_K, Q8_0], [Q6_K, Q6_K, Q6_K]]
+            .into_iter()
+            .enumerate()
+        {
+            for (part, ty) in ["gate", "up", "down"].into_iter().zip(types) {
+                model.tensors.push(ModelTensor {
+                    name: format!("blk.{layer}.ffn_{part}_exps.weight"),
+                    shard: 0,
+                    layer: Some(layer),
+                    role: Role::RoutedExperts,
+                    ty,
+                    dims: vec![256, 4, 8],
+                    file_bytes: 0,
+                    gathered_rows: None,
+                });
+            }
+        }
+        let lines = host_only(&model, Some(routed_rule(Program::Qwen35Body)))
+            .unwrap()
+            .map(|r| r.line())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let log = Log::of(&lines, GENERATE_QWEN3MOE);
+        let causes = log.all(&HOST_ONLY).unwrap();
+        let actual = causes
+            .iter()
+            .map(|r| (r.u64("layer").unwrap(), r.word("tensor").unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual,
+            [
+                (1, "blk.1.ffn_down_exps.weight"),
+                (2, "blk.2.ffn_gate_exps.weight"),
+                (2, "blk.2.ffn_up_exps.weight"),
+            ]
+        );
+        assert!(host_only(&model, None).unwrap().next().is_none());
+    }
+
     /// `missing` names exactly the kinds of the group a list lacks, in the group's order.
     #[test]
     fn missing_names_the_kinds_a_list_lacks() {
@@ -4532,7 +4613,7 @@ mod tests {
                 &[residency38::HOST, host_stats::STATS],
             ),
             (
-                "generate_qwen3moe: residency38, print_stats, PlaceQ3::record",
+                "generate_qwen3moe: residency38, print_stats, PlaceQ3::records",
                 GENERATE_QWEN3MOE,
                 &[
                     residency38::UNSET,

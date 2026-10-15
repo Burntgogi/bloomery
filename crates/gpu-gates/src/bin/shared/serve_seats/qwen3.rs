@@ -507,7 +507,9 @@ impl Body3 for Body {
                 whole,
             } => {
                 let plan = q.plan(total, &PlanLevers::from_levers(levers)?)?;
-                q.record(&plan, why).eprint();
+                for line in q.records(&plan, why)? {
+                    line.eprint();
+                }
                 match whole {
                     Some(card) => Ok(Qwen3moeModel::open(
                         Gpu::open_card(card.name, card.device)?,
@@ -586,7 +588,9 @@ impl Body3 for Body35 {
                 whole,
             } => {
                 let plan = q.plan(total, &PlanLevers::from_levers(levers)?)?;
-                q.record(&plan, why).eprint();
+                for line in q.records(&plan, why)? {
+                    line.eprint();
+                }
                 print_seat(vision);
                 match whole {
                     Some(card) => {
@@ -996,7 +1000,9 @@ impl Q3Load {
     fn print_plan(&self, levers: &Levers, vision: Option<&Opened>) -> Result<(), GateError> {
         if let Q3Load::Placed { q, total, why, .. } = self {
             let plan = q.plan(*total, &PlanLevers::from_levers(levers)?)?;
-            q.record(&plan, *why).eprint();
+            for line in q.records(&plan, *why)? {
+                line.eprint();
+            }
         }
         print_seat(vision);
         Ok(())

@@ -432,10 +432,14 @@ impl PlaceQ3 {
     /// census read them, the host room the plan was made at when it had
     /// one, and its device. `why` names what made a run with `--place`
     /// unset take this placed plan.
-    pub fn record(&self, plan: &Plan<'_>, why: Option<&str>) -> Record {
+    pub fn records<'a>(
+        &self,
+        plan: &Plan<'a>,
+        why: Option<&str>,
+    ) -> Result<impl Iterator<Item = Record> + 'a, GateError> {
         record::require(
             record::groups::qwen3moe_place::PLAN,
-            "qwen3moe_place::PlaceQ3::record",
+            "qwen3moe_place::PlaceQ3::records",
         );
         let card = &plan.cards[0];
         let r = Record::new(&record::PLAN38)
@@ -474,8 +478,14 @@ impl PlaceQ3 {
             (Inputs::Qwen35(_), Err(_)) => r.w("rows", "refused"),
             (Inputs::Qwen35(_), Ok(None)) | (Inputs::Qwen3(_), _) => r,
         };
-        r.csv("devices", record::plan_devices(plan.machine))
-            .w("cuda_order", record::cuda_order())
+        let r = r
+            .csv("devices", record::plan_devices(plan.machine))
+            .w("cuda_order", record::cuda_order());
+        let program = match self.inputs {
+            Inputs::Qwen3(_) => Program::Qwen3moeBody,
+            Inputs::Qwen35(_) => Program::Qwen35Body,
+        };
+        Ok(std::iter::once(r).chain(record::host_only(plan.model, Some(routed_rule(program)))?))
     }
 }
 
@@ -1010,7 +1020,9 @@ pub fn open_unplaced_qwen3(
         )?),
         Unplaced::Placed(q) => {
             let plan = q.plan(ctx, &PlanLevers::from_levers(levers)?)?;
-            emit(q.record(&plan, Some(WHY_NOT_WHOLE)));
+            for line in q.records(&plan, Some(WHY_NOT_WHOLE))? {
+                emit(line);
+            }
             open_qwen3(file, &plan, opts, levers.host())
         }
     }
@@ -1036,7 +1048,9 @@ pub fn open_unplaced_qwen35(
         )?),
         Unplaced::Placed(q) => {
             let plan = q.plan(o.ctx, &PlanLevers::from_levers(levers)?)?;
-            emit(q.record(&plan, Some(WHY_NOT_WHOLE)));
+            for line in q.records(&plan, Some(WHY_NOT_WHOLE))? {
+                emit(line);
+            }
             open_qwen35(file, &plan, o, levers.host())
         }
     }
