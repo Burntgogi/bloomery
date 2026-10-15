@@ -1816,6 +1816,8 @@ def fetch_depinfo(host: str, remote: str) -> list[tuple[str, float, str]]:
     )
     try:
         proc = subprocess.run(["ssh", "-o", "BatchMode=yes", host, script], capture_output=True, text=True, timeout=120)
+    except FileNotFoundError as err:
+        raise RecipeError(f"reading dep-info over ssh {host} failed: ssh client not found on PATH; --no-box skips it") from err
     except subprocess.TimeoutExpired as err:
         raise RecipeError(f"reading dep-info over ssh {host} timed out; --no-box skips it") from err
     if proc.returncode != 0:
@@ -10946,6 +10948,24 @@ def _st_selection(fails: list[str], side: Side) -> None:
     # dep-info parsing
     t, deps, root = parse_depinfo("/r/b/target/release/g: /r/b/crates/a\\ b.rs /r/b/crates/c.rs\n")
     expect(t.endswith("/g") and root == "/r/b" and "/r/b/crates/a b.rs" in deps, "dep-info parse")
+    with tempfile.TemporaryDirectory(prefix="recipes-no-ssh-") as tmp:
+        saved_path = os.environ.get("PATH")
+        try:
+            os.environ["PATH"] = tmp
+            try:
+                fetch_depinfo("no-ssh-test", "/unused")
+            except RecipeError as err:
+                expect("ssh" in str(err) and "--no-box" in str(err),
+                       f"dep-info: missing ssh refusal omits its cause or workaround: {err}")
+            except OSError as err:
+                fails.append(f"dep-info: missing ssh escapes as an OS error: {err}")
+            else:
+                fails.append("dep-info: missing ssh accepted")
+        finally:
+            if saved_path is None:
+                os.environ.pop("PATH", None)
+            else:
+                os.environ["PATH"] = saved_path
 
 
 def self_test(serial: bool = False) -> int:
