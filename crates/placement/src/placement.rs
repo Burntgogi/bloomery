@@ -1821,6 +1821,14 @@ impl ExpertPart {
     }
 }
 
+/// A routed tensor that keeps its layer on the host under a card rule.
+#[derive(Clone, Copy, Debug)]
+pub struct HostOnly<'a> {
+    pub layer: usize,
+    pub tensor: &'a ModelTensor,
+    pub why: &'static str,
+}
+
 /// Which routed stacks a program's card expert kernels run, and the card
 /// format each loads in. A layer with a stack the rule gives no format keeps
 /// its experts on the host.
@@ -1855,6 +1863,46 @@ impl RoutedRule {
         }
     }
 
+    fn refusal(
+        self,
+        tensor: &ModelTensor,
+        gate_up_ty: &mut Option<GgmlType>,
+    ) -> Result<Option<&'static str>, PlacementError> {
+        let unsupported = self.format(tensor)?.is_none();
+        let mismatched = matches!(self, Self::Leg { .. })
+            && matches!(
+                ExpertPart::of_name(&tensor.name),
+                Some(ExpertPart::Gate | ExpertPart::Up)
+            )
+            && *gate_up_ty.get_or_insert(tensor.ty) != tensor.ty;
+        Ok(if unsupported {
+            Some("no card expert kernel for this routed part")
+        } else if mismatched {
+            Some("the routed gate and up have different types")
+        } else {
+            None
+        })
+    }
+
+    /// The tensors that disqualify their layers under this rule, in file
+    /// order, independent of the card's byte budget. Uses the same refusal
+    /// as the planner's layer eligibility.
+    pub fn host_only(self, model: &ModelTensors) -> Result<Vec<HostOnly<'_>>, PlacementError> {
+        let mut gate_up_types = vec![None; model.layers];
+        let mut out = Vec::new();
+        for tensor in model
+            .tensors
+            .iter()
+            .filter(|t| t.role == Role::RoutedExperts)
+        {
+            let layer = layer_of(tensor, model.layers)?;
+            if let Some(why) = self.refusal(tensor, &mut gate_up_types[layer])? {
+                out.push(HostOnly { layer, tensor, why });
+            }
+        }
+        Ok(out)
+    }
+
     /// Whether the card runs a layer of the routed stacks `stacks`: each
     /// loads in a card format, and on a leg its gate and up are one type.
     pub(crate) fn layer_runs(
@@ -1865,16 +1913,7 @@ impl RoutedRule {
         let mut runs = true;
         let mut gate_up_ty = None;
         for &i in stacks {
-            let t = &model.tensors[i];
-            runs &= self.format(t)?.is_some();
-            if let Self::Leg { .. } = self
-                && matches!(
-                    ExpertPart::of_name(&t.name),
-                    Some(ExpertPart::Gate | ExpertPart::Up)
-                )
-            {
-                runs &= *gate_up_ty.get_or_insert(t.ty) == t.ty;
-            }
+            runs &= self.refusal(&model.tensors[i], &mut gate_up_ty)?.is_none();
         }
         Ok(runs)
     }
@@ -4452,6 +4491,56 @@ mod tests {
         let plan = plan_routed(&unnamed, &m1, 4096, &NoKv, &levers, union)
             .expect("the per-type rule places a stack of no part");
         assert_eq!(plan.n_l, vec![8]);
+    }
+
+    #[test]
+    fn host_only_reasons_follow_the_program_and_part_in_file_order() {
+        use crate::accepts::{Program, routed_rule};
+        use GgmlType::{Q4_K, Q5_K, Q6_K, Q8_0};
+        let model = legged(&[
+            [Q4_K, Q4_K, Q6_K],
+            [Q4_K, Q4_K, Q8_0],
+            [Q6_K, Q6_K, Q6_K],
+            [Q4_K, Q5_K, Q4_K],
+        ]);
+        let rows = |program| {
+            routed_rule(program)
+                .host_only(&model)
+                .unwrap()
+                .into_iter()
+                .map(|h| (h.layer, h.tensor.name.as_str()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            rows(Program::Qwen35Body),
+            [
+                (1, "ffn_down_exps.weight"),
+                (2, "ffn_gate_exps.weight"),
+                (2, "ffn_up_exps.weight"),
+                (3, "ffn_up_exps.weight"),
+            ]
+        );
+        assert_eq!(
+            rows(Program::Qwen38Body),
+            [
+                (0, "ffn_down_exps.weight"),
+                (2, "ffn_gate_exps.weight"),
+                (2, "ffn_up_exps.weight"),
+                (2, "ffn_down_exps.weight"),
+                (3, "ffn_up_exps.weight"),
+                (3, "ffn_down_exps.weight"),
+            ]
+        );
+        let empty = ModelTensors {
+            tensors: Vec::new(),
+            ..model
+        };
+        assert!(
+            routed_rule(Program::Qwen35Body)
+                .host_only(&empty)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// The part a routed stack's name names, a draft layer's among them; a

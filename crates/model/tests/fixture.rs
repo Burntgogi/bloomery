@@ -2653,7 +2653,13 @@ fn hw_fixture_q38_budget() {
     assert_eq!((layers, experts), (4, 512));
     // A layer whose stacks no card kernel loads keeps all its experts on the
     // host; the engine lists them, and the plan is held to that list.
-    let host_only: Vec<usize> = inputs.host_only().iter().map(|h| h.layer).collect();
+    let host_only: Vec<usize> =
+        model::placement::accepts::routed_rule(model::arch::qwen35moe::place::PROGRAM)
+            .host_only(&inputs.model)
+            .unwrap()
+            .iter()
+            .map(|h| h.layer)
+            .collect();
     let machine = machine_for_experts(
         RTX_3090,
         layers,

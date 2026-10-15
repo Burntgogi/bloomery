@@ -122,6 +122,15 @@ every term (dense, KV, context, scratch, margin, and what the load holds beside 
 the card — before minutes of loading, not after. Inside a container the host's RAM is the smaller of `MemAvailable`
 and the cgroup's own memory limit (`docker run --memory`, a systemd scope's `MemoryMax`), read the same way.
 
+**Why a Qwen layer stays on the host.** Under the card expert rule, each
+printed placement plan is followed by `host only layer=… tensor=… why=…`
+records for routed tensors whose kernel contract excludes their layer from
+the card. The rule is the actual body's, including the tensor's gate/up/down
+role and matching gate/up types. Causes keep file order and are not deduplicated
+by layer. A byte-budget limit alone, a dense model with no routed tensors, or an
+explicit all-host expert choice emits no such diagnosis. These records use the
+plan's stream: stderr in the server and stdout in the generation CLI.
+
 **When the host cannot hold its experts either.** A Qwen3.8, GLM-5.3 or V4.1 plan whose host need passes the
 host's available RAM pages the overflow on the NVMe tier and serves it from a RAM arena filled from the file. The
 tokens equal the all-RAM load's. The load prints an `nvtier` record (the arena's budget, the paged bytes and its

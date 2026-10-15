@@ -3820,7 +3820,9 @@ mod gate {
             card_budget_bytes: Some(placed_budget()),
         };
         let plan = q.plan(CTX, &levers)?;
-        q.record(&plan, None).print();
+        for line in q.records(&plan, None)? {
+            line.print();
+        }
         let split = plan.host.experts > 0 && plan.cards[0].experts > 0;
         println!(
             "placed plan: card_experts={} host_experts={} (both above 0) {}",
@@ -3955,7 +3957,9 @@ mod gate {
         };
         let q = PlaceQ3::qwen35(&file, Place::parse("cuda0")?, o)?;
         let plan = q.plan(CTX, &PlanLevers::default())?;
-        q.record(&plan, None).print();
+        for line in q.records(&plan, None)? {
+            line.print();
+        }
         let on_card = plan.host.experts == 0 && plan.cards[0].experts > 0;
         println!(
             "placed plan with no budget: card_experts={} host_experts={} (every expert on the \
@@ -4179,7 +4183,9 @@ mod gate {
             card_budget_bytes: Some(budget),
         };
         let plan = q.plan(CTX, &levers)?;
-        q.record(&plan, None).print();
+        for line in q.records(&plan, None)? {
+            line.print();
+        }
         let card_experts = plan.cards.first().ok_or("a plan of no card")?.experts;
         let split = plan.host.experts > 0 && card_experts >= want;
         println!(

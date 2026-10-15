@@ -1146,7 +1146,11 @@ mod gate {
                 card_budget_bytes: Some(PLACED_BUDGET),
             },
         )?;
-        let line = q.record(&plan, Some(q3place::WHY_NOT_WHOLE)).line();
+        let line = q
+            .records(&plan, Some(q3place::WHY_NOT_WHOLE))?
+            .next()
+            .ok_or("a placed plan must print its plan record")?
+            .line();
         let record_ok = line.contains("why=whole_does_not_fit") && line.contains("card_free=");
         println!("memguard record: {record_ok} {line}");
         ok &= record_ok;
@@ -1240,7 +1244,9 @@ mod gate {
             card_budget_bytes: Some(PLACED_BUDGET),
         };
         let plan = q.plan(ctx, &levers)?;
-        q.record(&plan, None).print();
+        for line in q.records(&plan, None)? {
+            line.print();
+        }
         let split = plan.host.experts > 0 && plan.cards[0].experts > 0;
         println!(
             "placed plan: card_experts={} host_experts={} (both above 0) {}",
@@ -1331,7 +1337,9 @@ mod gate {
         let file = open_split(Arch::Qwen3moe, "gate-gpu-qwen3moe-e2e")?;
         let q = PlaceQ3::qwen3(&file, Place::parse("cuda0")?, CTX, KvQ8::F16)?;
         let plan = q.plan(CTX, &PlanLevers::default())?;
-        q.record(&plan, None).print();
+        for line in q.records(&plan, None)? {
+            line.print();
+        }
         let on_card = plan.host.experts == 0 && plan.cards[0].experts > 0;
         println!(
             "placed plan with no budget: card_experts={} host_experts={} (every expert on the \

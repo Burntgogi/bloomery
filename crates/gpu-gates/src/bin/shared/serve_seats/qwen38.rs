@@ -1501,6 +1501,14 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     line.csv("devices", record::plan_devices(&machine))
         .w("cuda_order", record::cuda_order())
         .eprint();
+    for line in record::host_only(
+        plan.model,
+        matches!(experts, Experts::Card).then(|| {
+            model::placement::accepts::routed_rule(model::arch::qwen35moe::place::PROGRAM)
+        }),
+    )? {
+        line.eprint();
+    }
     let (residency, pool) = residency38_at(&plan, (a.place, feed), set)?;
     if a.plan_only {
         // The records before the load are out; nothing was loaded and the
