@@ -53,6 +53,23 @@ def digest(path):
         return hashlib.file_digest(src, "sha256").hexdigest()
 
 
+def file_signature(path):
+    info = Path(path).stat()
+    return [info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns]
+
+
+def immutable_model(path, target):
+    before = file_signature(path)
+    if before[2] != target["size"] or digest(path) != target["sha256"] or file_signature(path) != before:
+        raise ValueError("model differs from the selected immutable target; no engine was opened")
+    return before
+
+
+def model_unchanged(path, before):
+    if file_signature(path) != before:
+        raise ValueError("model file changed during capture")
+
+
 def command(args, **kwargs):
     return subprocess.check_output([str(a) for a in args], text=True, **kwargs).strip()
 
@@ -298,8 +315,7 @@ def finish_bundle(stage, identity, meta):
 def run(args):
     target = TARGETS[args.target]
     model, binary, output = args.model.resolve(), args.binary.resolve(), args.out.resolve()
-    if model.stat().st_size != target["size"] or digest(model) != target["sha256"]:
-        raise ValueError("model differs from the selected immutable target; no engine was opened")
+    model_stat = immutable_model(model, target)
     prompt, forced = token_ids(args.prompt), token_ids(args.forced)
     if len(forced) > 4096 or len(prompt) + len(forced) > args.ctx:
         raise ValueError("context does not hold prompt plus continuation, or more than 4096 rows")
@@ -358,6 +374,7 @@ def run(args):
                "backend": args.backend, "target": args.target, "build": build_info,
                "source_head": source_head, "binary_sha256": binary_sha,
                "source_dirty": source_dirty, "driver_sha256": driver_sha,
+               "model_stat": model_stat,
                "effective_environment": {key: value for key, value in env.items() if key.startswith("BLOOMERY_")},
                "CUDA_VISIBLE_DEVICES_before_gate": env.get("CUDA_VISIBLE_DEVICES"),
                "BLOOMERY_GATE_CARD": env.get("BLOOMERY_GATE_CARD")})
@@ -377,6 +394,7 @@ def run(args):
         raise ValueError("writer returned different prompt or forced ids")
     if int(meta["rows"]) != len(forced) or int(meta["vocab"]) != target["vocab"]:
         raise ValueError("writer returned wrong row count or vocabulary")
+    model_unchanged(model, model_stat)
     if git(ROOT, "rev-parse", "HEAD") != source_head or digest(binary) != binary_sha or digest(__file__) != driver_sha:
         raise ValueError("source or binary changed during diagnostic")
     if args.kind == "reference":
@@ -469,6 +487,18 @@ def self_test():
     TARGETS["_selftest"] = {"sha256": "selftest-identity", "vocab": 2}
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
+        model = root / "model"
+        model.write_bytes(b"original")
+        target = {"size": 8, "sha256": digest(model)}
+        before = immutable_model(model, target)
+        model_unchanged(model, before)
+        model.write_bytes(b"replaced")
+        for check in (lambda: model_unchanged(model, before), lambda: immutable_model(model, target)):
+            try:
+                check()
+                raise AssertionError("accepted a model replaced during capture")
+            except ValueError:
+                pass
         ids_file = root / "ids"
         for bad in ("", "-1\n", "248320\n", "1 x\n", "1\n\n"):
             ids_file.write_text(bad)

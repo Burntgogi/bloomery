@@ -212,11 +212,6 @@ def environment(args):
     return env
 
 
-def model_signature(path):
-    info = path.stat()
-    return [info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns]
-
-
 def run(args):
     target = common.TARGETS[args.target]
     model, output = args.model.resolve(), args.out.resolve()
@@ -226,9 +221,7 @@ def run(args):
     for key in ("command", "arch", "compiler"):
         if builds[0][key] != builds[1][key]:
             raise ValueError(f"native binaries have different build {key}")
-    model_stat = model_signature(model)
-    if model_stat[2] != target["size"] or common.digest(model) != target["sha256"] or model_signature(model) != model_stat:
-        raise ValueError("model differs from the selected immutable target; no engine was opened")
+    model_stat = common.immutable_model(model, target)
     short, long = common.token_ids(args.short), common.token_ids(args.long)
     if not 1 <= len(short) <= 256 or len(long) != 4096:
         raise ValueError("requires a 1..256-ID short prompt and an exactly 4096-ID long prompt")
@@ -311,8 +304,7 @@ def run(args):
                 checks.append({"case": "resident_overlap", "status": "incomplete_overlap_not_observed"})
     if common.clean_head(ROOT) != head or common.digest(__file__) != invocation["driver_sha256"] or common.digest(common.__file__) != invocation["helper_sha256"]:
         raise ValueError("source or diagnostic tooling changed during capture")
-    if model_signature(model) != model_stat:
-        raise ValueError("model file changed during capture")
+    common.model_unchanged(model, model_stat)
     for binary, built in zip(binaries, builds):
         if common.check_native_build(binary, head) != built:
             raise ValueError("native binary or build stamp changed during capture")
