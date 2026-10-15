@@ -1,7 +1,8 @@
 # Dense Qwen forced-logit validation handoff
 
-The native diagnostic extends `generate_qwen3moe` on its existing
-`Session<Body35>` path. `tools/ref/dense_logits_ref.cpp` independently reads the
+The native diagnostic extends the existing `generate_qwen3moe` loop over
+`GpuModel<Body35>`. The HTTP checks exercise the existing Qwen seat and
+`app::Session<Body35>` server path. `tools/ref/dense_logits_ref.cpp` independently reads the
 same model with mainline llama.cpp. `dense-logits.py` builds the reference,
 captures immutable input/build identities, runs either binary with bounds, and
 compares completed raw rows. These are diagnostic tools. A registered dense
