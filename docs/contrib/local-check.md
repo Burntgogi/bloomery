@@ -85,9 +85,6 @@ Exceptions:
 - **aarch64 Linux.** `tools/nightly/install.sh` installs the x86_64 packages only. One DGX Spark ran T1 with the CUDA 13.3
   headers of the `nvidia/cuda:13.3.1-devel-ubuntu24.04` image, LLVM 21.1.8's libclang, the distribution's numpy and
   PIL, and `just` built from source (same link).
-- **A locale other than English.** `check-recipes` runs `tools/ref/lease.sh --self-test`, and one of its cases matches
-  the English `strerror` text. On a host whose libc messages are translated (`LANG=ko_KR.utf8`, say) that case fails, on
-  main as well. Run under `LC_ALL=C` ([#38](https://github.com/midagedev/bloomery/pull/38), "What I ran into").
 - **The Mac's environment file.** `just mac-static` checks the Linux build, so bindgen needs the CUDA 13.3 headers and
   an x86_64 Linux `/usr/include` on the Mac, beside libclang from the Xcode command line tools. The header of
   `tools/mac-check.sh` copies the two directories from the maintainers' workstation. Any x86_64 Linux host with CUDA 13.3
