@@ -118,6 +118,11 @@ impl Tokenizer {
     /// asks for them ([`Tokenizer::add_bos`], [`Tokenizer::add_eos`]);
     /// `parse_special` lets CONTROL tokens written in the text become their
     /// ids (USER_DEFINED tokens always do, as in the reference).
+    ///
+    /// # Panics
+    ///
+    /// Panics if a four-byte UTF-8 sequence decodes above U+10FFFF. Other
+    /// malformed bytes follow the reference's lenient decoding.
     pub fn encode(
         &self,
         text: impl AsRef<[u8]>,
