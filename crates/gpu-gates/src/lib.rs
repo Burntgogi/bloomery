@@ -33,6 +33,7 @@ pub mod ik_norm;
 pub mod ik_q8_2;
 pub mod image_plan;
 pub mod kld;
+pub mod logit_rows;
 pub mod model_file;
 #[cfg(feature = "gpu")]
 pub mod nodes;
