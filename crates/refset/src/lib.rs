@@ -36,6 +36,10 @@
 //!
 //! Every manifest row is read by the column names its header line gives
 //! that kind of row, never by position.
+//!
+//! DSpark and MTP raw f32/i32 files must contain complete 32-bit values.
+//! A partial trailing value is malformed even when the complete prefix has
+//! the manifest's expected element count.
 
 use std::path::PathBuf;
 

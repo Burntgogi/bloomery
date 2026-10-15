@@ -121,3 +121,19 @@ pub(crate) fn file_name(name: &str, at: &dyn Display) -> Result<(), RefError> {
     }
     Ok(())
 }
+
+/// A raw f32/i32 file, refusing a partial last value before decoding.
+pub(crate) fn bytes32(path: &std::path::Path) -> Result<Vec<u8>, RefError> {
+    let bytes = std::fs::read(path)
+        .map_err(|e| RefError::missing(path, format!("{}: {e}", path.display())))?;
+    if !bytes.len().is_multiple_of(4) {
+        return Err(RefError::malformed(
+            path.display(),
+            format!(
+                "{} bytes is not a whole number of 32-bit values",
+                bytes.len()
+            ),
+        ));
+    }
+    Ok(bytes)
+}

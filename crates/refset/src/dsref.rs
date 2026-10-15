@@ -481,8 +481,7 @@ impl Dsref {
 
     fn f32_file(&self, r: &DsRow, layout: Layout) -> Result<Vec<f32>, RefError> {
         let p = self.dir.join(Dsref::file_name(r, layout, FileElem::F32));
-        let v: Vec<f32> = self
-            .bytes(&p)?
+        let v: Vec<f32> = crate::columns::bytes32(&p)?
             .as_chunks::<4>()
             .0
             .iter()
@@ -496,7 +495,7 @@ impl Dsref {
     /// has elements.
     pub fn i32s(&self, r: &DsRow, layout: Layout) -> Result<Vec<i32>, RefError> {
         let p = self.dir.join(Dsref::file_name(r, layout, FileElem::I32));
-        let v = i32s_of(&self.bytes(&p)?);
+        let v = i32s_of(&crate::columns::bytes32(&p)?);
         self.count(&p, v.len() as u64, r.count(), r.ne)?;
         Ok(v)
     }
@@ -504,7 +503,7 @@ impl Dsref {
     /// The values of int row `r`'s file: as many as its `count`.
     pub fn int_values(&self, r: &DsInt) -> Result<Vec<i32>, RefError> {
         let p = self.dir.join(&r.file);
-        let v = i32s_of(&self.bytes(&p)?);
+        let v = i32s_of(&crate::columns::bytes32(&p)?);
         if v.len() as u64 != r.count {
             return Err(RefError::malformed(
                 p.display(),
@@ -536,10 +535,6 @@ impl Dsref {
             .filter(|d| d.block == b)
             .map(|d| d.token)
             .collect()
-    }
-
-    fn bytes(&self, p: &Path) -> Result<Vec<u8>, RefError> {
-        std::fs::read(p).map_err(|e| RefError::missing(p, format!("{}: {e}", p.display())))
     }
 
     fn count(&self, p: &Path, got: u64, want: u64, ne: [u64; 4]) -> Result<(), RefError> {

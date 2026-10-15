@@ -357,6 +357,33 @@ fn a_node_file_of_another_length_is_malformed() {
     assert_eq!(set.f32s(out).unwrap_or_else(|e| panic!("{e}")), logits);
     std::fs::write(&file, f32s(&logits[..7])).unwrap_or_else(|e| panic!("{e}"));
     assert!(matches!(set.f32s(out), Err(RefError::Malformed { .. })));
+    for extra in 1..=3 {
+        let mut bytes = f32s(&logits);
+        bytes.extend(std::iter::repeat_n(0, extra));
+        std::fs::write(&file, bytes).unwrap();
+        assert!(matches!(set.f32s(out), Err(RefError::Malformed { .. })));
+    }
+    remove(&dir);
+}
+
+#[test]
+fn an_integer_file_with_a_partial_value_is_malformed() {
+    let dir = set_dir("i32-partial");
+    let set = open_own(&dir, &own_rows()).unwrap();
+    let row = set.find(0, Graph::Update, "inp_tokens", 0).unwrap();
+    let file = dir.join(MtpSet::file_name(row, Layout::Flat, FileElem::I32));
+    let bytes: Vec<u8> = [14i32, 16].iter().flat_map(|v| v.to_le_bytes()).collect();
+    std::fs::write(&file, &bytes).unwrap();
+    assert_eq!(set.i32s(row, Layout::Flat).unwrap(), [14, 16]);
+    for extra in 1..=3 {
+        let mut partial = bytes.clone();
+        partial.extend(std::iter::repeat_n(0, extra));
+        std::fs::write(&file, partial).unwrap();
+        assert!(matches!(
+            set.i32s(row, Layout::Flat),
+            Err(RefError::Malformed { .. })
+        ));
+    }
     remove(&dir);
 }
 
