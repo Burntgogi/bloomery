@@ -1,0 +1,174 @@
+{
+  "schema": 1,
+  "status": "fail",
+  "checks": [
+    {
+      "name": "fmt",
+      "command": [
+        "cargo",
+        "fmt",
+        "--all",
+        "--",
+        "--check"
+      ],
+      "rustflags": "-C target-cpu=native",
+      "log": "fmt.log",
+      "status": "pass",
+      "exit_code": 0,
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "name": "host-test",
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "--target",
+        "x86_64-unknown-linux-gnu",
+        "-p",
+        "bloomery-hip-spike"
+      ],
+      "rustflags": "-C target-cpu=native",
+      "log": "host-test.log",
+      "status": "pass",
+      "exit_code": 0,
+      "log_sha256": "231ac40c778a340d07ad1f8da1543d00533812ed55091d11c6e5f2ac860f91c3"
+    },
+    {
+      "name": "host-clippy",
+      "command": [
+        "cargo",
+        "clippy",
+        "--locked",
+        "--no-deps",
+        "-p",
+        "bloomery-hip-spike",
+        "--target",
+        "x86_64-unknown-linux-gnu",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "rustflags": "-C target-cpu=native",
+      "log": "host-clippy.log",
+      "status": "pass",
+      "exit_code": 0,
+      "log_sha256": "41b955648d7c63a4e0f93363a2e4caa5a2c50649d6c3fc4bed3389bc8f797559"
+    },
+    {
+      "name": "device-clippy",
+      "command": [
+        "cargo",
+        "clippy",
+        "-Zbuild-std=core",
+        "--locked",
+        "--no-deps",
+        "--release",
+        "--target",
+        "amdgcn-amd-amdhsa",
+        "-p",
+        "bloomery-hip-spike-device",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "rustflags": "-C target-cpu=gfx1100 -C panic=abort",
+      "log": "device-clippy.log",
+      "status": "pass",
+      "exit_code": 0,
+      "log_sha256": "602c47eaf4c6fd0271b2f5c74075ed262ecf2e056e67d80b7e8fe51a2ee0983d"
+    },
+    {
+      "name": "device-build",
+      "command": [
+        "cargo",
+        "build",
+        "-Zbuild-std=core",
+        "--locked",
+        "--release",
+        "--target",
+        "amdgcn-amd-amdhsa",
+        "-p",
+        "bloomery-hip-spike-device"
+      ],
+      "rustflags": "-C target-cpu=gfx1100 -C panic=abort",
+      "log": "device-build.log",
+      "status": "pass",
+      "exit_code": 0,
+      "log_sha256": "d1b62725e7cab291040aaf8f6b955c329eaa9d290dd9777247c4d4d98adad4ec"
+    },
+    {
+      "name": "host-build",
+      "command": [
+        "cargo",
+        "build",
+        "--locked",
+        "--target",
+        "x86_64-unknown-linux-gnu",
+        "--release",
+        "-p",
+        "bloomery-hip-spike"
+      ],
+      "rustflags": "-C target-cpu=native",
+      "log": "host-build.log",
+      "status": "pass",
+      "exit_code": 0,
+      "log_sha256": "62b6474c1c103ea8a27a08da8b916080b16bf8ecca1366dfde9a27a03ce07b4f"
+    },
+    {
+      "name": "gpu",
+      "command": [
+        "/home/jutai05/bloomery-native-contributions-20261013/hip-nmse-mutant/labs/hip-native/target/x86_64-unknown-linux-gnu/release/bloomery-hip-spike",
+        "/home/jutai05/bloomery-native-contributions-20261013/hip-nmse-mutant/labs/hip-native/target/amdgcn-amd-amdhsa/release/bloomery_hip_spike_device.elf"
+      ],
+      "rustflags": "-C target-cpu=native",
+      "log": "gpu.log",
+      "status": "fail",
+      "exit_code": 1,
+      "log_sha256": "f6ae413b1c9159184ec0bc30f4efc93f0b31d60d1544abc903ed391cd2c14950"
+    }
+  ],
+  "cases": [],
+  "started_utc": "2026-10-15T07:21:20.846677+00:00",
+  "host": {
+    "platform": "Linux-7.0.0-38-generic-x86_64-with-glibc2.39",
+    "cpu": "x86_64"
+  },
+  "source": {
+    "commit": "1c040edcbadab1b9354cc50c00bc1d1e8052c57f",
+    "tree": "88708a4ab1a8184d49a5583b5880b0f915f2a86d",
+    "lab_tree": "8b901816505bbfc47632c9c4ee7daedc1fd126b4",
+    "clean": true
+  },
+  "toolchain": "rustc 1.100.0-nightly (e457a7b0d 2026-08-27)\nbinary: rustc\ncommit-hash: e457a7b0d326d67b4322ef0d11bd715cfaeda48f\ncommit-date: 2026-08-27\nhost: x86_64-unknown-linux-gnu\nrelease: 1.100.0-nightly\nLLVM version: 23.1.0\n",
+  "host_target": "x86_64-unknown-linux-gnu",
+  "target": {
+    "triple": "amdgcn-amd-amdhsa",
+    "cpu": "gfx1100"
+  },
+  "binaries": [
+    {
+      "path": "target/x86_64-unknown-linux-gnu/release/bloomery-hip-spike",
+      "sha256": "a21656fb54cb16b4e9b0800b5da2de823778ec2e8263a3bfbec1774b21de119d"
+    },
+    {
+      "path": "target/amdgcn-amd-amdhsa/release/bloomery_hip_spike_device.elf",
+      "sha256": "954b5398036e91e8e7860ba4a3a3d8d2b52086f081bde381f9fc178edfb43971"
+    }
+  ],
+  "card": {
+    "name": "AMD Radeon RX 7900 GRE",
+    "device_ordinal": 0,
+    "runtime_version": 70253210,
+    "driver_version": 70253210,
+    "visibility": {
+      "HIP_VISIBLE_DEVICES": null,
+      "ROCR_VISIBLE_DEVICES": null,
+      "GPU_DEVICE_ORDINAL": null
+    },
+    "runtime_library": "/home/jutai05/Strata/.venv/lib/python3.12/site-packages/_rocm_sdk_core/lib/libamdhip64.so.7"
+  },
+  "error": "gpu failed (1): /home/jutai05/bloomery-native-contributions-20261013/roadmap-20261015/hip-review-fix/numeric-mutant/gpu.log",
+  "finished_utc": "2026-10-15T07:21:41.075548+00:00"
+}

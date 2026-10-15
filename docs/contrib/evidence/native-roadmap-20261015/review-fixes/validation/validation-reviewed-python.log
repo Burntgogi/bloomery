@@ -1,0 +1,2 @@
+dense-logits self-test: malformed ids, provenance, incomplete/truncated/NaN rows, eager/graph and owned-session cleanup contracts passed
+dense-serve self-test: strict tokens, HTTP errors/truncation/EOG, reset counts, loopback and resident metrics contracts passed

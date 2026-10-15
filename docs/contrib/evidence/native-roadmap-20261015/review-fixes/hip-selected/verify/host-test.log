@@ -1,0 +1,22 @@
+   Compiling proc-macro2 v1.0.107
+   Compiling unicode-ident v1.0.27
+   Compiling quote v1.0.47
+   Compiling libc v0.2.190
+   Compiling thiserror v2.0.21
+   Compiling bloomery-levers v0.1.0 (/home/jutai05/bloomery-native-contributions-20261013/hip-selected/crates/levers)
+   Compiling bloomery-hip-spike v0.1.0 (/home/jutai05/bloomery-native-contributions-20261013/hip-selected/labs/hip-native/host)
+   Compiling syn v3.0.9
+   Compiling memmap2 v0.9.11
+   Compiling bloomery-threads v0.1.0 (/home/jutai05/bloomery-native-contributions-20261013/hip-selected/crates/threads)
+   Compiling thiserror-impl v2.0.21
+   Compiling bloomery-gguf v0.1.0 (/home/jutai05/bloomery-native-contributions-20261013/hip-selected/crates/gguf)
+   Compiling bloomery-qdot v0.1.0 (/home/jutai05/bloomery-native-contributions-20261013/hip-selected/crates/qdot)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.26s
+     Running unittests src/main.rs (target/x86_64-unknown-linux-gnu/debug/build/bloomery-hip-spike/448ebd6d4d0f7f44/out/bloomery_hip_spike-448ebd6d4d0f7f44)
+
+running 2 tests
+test selected::tests::selected_shape_refusals_precede_the_driver ... ok
+test tests::refuses_invalid_shapes_and_truncated_weights ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

@@ -1,0 +1,65 @@
+
+running 1 test
+test model_file::tests::decision_header_distinguishes_absent_string_and_malformed_markers ... FAILED
+
+failures:
+
+---- model_file::tests::decision_header_distinguishes_absent_string_and_malformed_markers stdout ----
+
+thread 'model_file::tests::decision_header_distinguishes_absent_string_and_malformed_markers' (1587006) panicked at crates/gpu-gates/src/model_file.rs:312:64:
+called `Result::unwrap_err()` on an `Ok` value: None
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    model_file::tests::decision_header_distinguishes_absent_string_and_malformed_markers
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 119 filtered out; finished in 0.00s
+
+   Compiling proc-macro2 v1.0.107
+   Compiling unicode-ident v1.0.26
+   Compiling quote v1.0.47
+   Compiling libc v0.2.190
+   Compiling version_check v0.9.5
+   Compiling thiserror v2.0.21
+   Compiling generic-array v0.14.7
+   Compiling typenum v1.20.1
+   Compiling cfg-if v1.0.5
+   Compiling cpufeatures v0.2.17
+   Compiling memchr v2.8.3
+   Compiling syn v3.0.6
+   Compiling serde_core v1.0.229
+   Compiling memmap2 v0.9.11
+   Compiling zmij v1.0.23
+   Compiling bloomery-levers v0.1.0 (/home/jutai05/bloomery-native-contributions-20261013/dense-pr/crates/levers)
+   Compiling serde_json v1.0.151
+   Compiling crc32fast v1.5.2
+   Compiling block-buffer v0.10.4
+   Compiling crypto-common v0.1.7
+   Compiling digest v0.10.7
+   Compiling bloomery-threads v0.1.0 (/home/jutai05/bloomery-native-contributions-20261013/dense-pr/crates/threads)
+   Compiling sha2 v0.10.9
+   Compiling hashbrown v0.17.1
+   Compiling foldhash v0.1.5
+   Compiling object v0.36.7
+   Compiling itoa v1.0.18
+   Compiling thiserror-impl v2.0.21
+   Compiling equivalent v1.0.2
+   Compiling hashbrown v0.15.5
+   Compiling indexmap v2.14.2
+   Compiling sha1 v0.10.7
+   Compiling bloomery-gguf v0.1.0 (/home/jutai05/bloomery-native-contributions-20261013/dense-pr/crates/gguf)
+   Compiling bloomery-models v0.1.0 (/home/jutai05/bloomery-native-contributions-20261013/dense-pr/crates/models)
+   Compiling bloomery-tokenizer v0.1.0 (/home/jutai05/bloomery-native-contributions-20261013/dense-pr/crates/tokenizer)
+   Compiling bloomery-runtime v0.1.0 (/home/jutai05/bloomery-native-contributions-20261013/dense-pr/crates/runtime)
+   Compiling bloomery-placement v0.1.0 (/home/jutai05/bloomery-native-contributions-20261013/dense-pr/crates/placement)
+   Compiling bloomery-qdot v0.1.0 (/home/jutai05/bloomery-native-contributions-20261013/dense-pr/crates/qdot)
+   Compiling bloomery-hf v0.1.0 (/home/jutai05/bloomery-native-contributions-20261013/dense-pr/crates/hf)
+   Compiling oxide-artifacts v0.2.1
+   Compiling bloomery-model v0.1.0 (/home/jutai05/bloomery-native-contributions-20261013/dense-pr/crates/model)
+   Compiling bloomery-engram v0.1.0 (/home/jutai05/bloomery-native-contributions-20261013/dense-pr/crates/engram)
+   Compiling bloomery-refset v0.1.0 (/home/jutai05/bloomery-native-contributions-20261013/dense-pr/crates/refset)
+   Compiling bloomery-gpu-gates v0.3.2 (/home/jutai05/bloomery-native-contributions-20261013/dense-pr/crates/gpu-gates)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 13.00s
+     Running unittests src/lib.rs (target/debug/build/bloomery-gpu-gates/a8f4fc91aef442f4/out/bloomery_gpu_gates-a8f4fc91aef442f4)
+error: test failed, to rerun pass `-p bloomery-gpu-gates --lib`

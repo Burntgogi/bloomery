@@ -1,0 +1,14 @@
+{
+  "command": [
+    "cargo",
+    "test",
+    "--locked",
+    "-p",
+    "bloomery-gpu-gates",
+    "--lib",
+    "decision_header_distinguishes_absent_string_and_malformed_markers"
+  ],
+  "mutant": "restore permissive arch_get_str decision lookup",
+  "mutant_exit": 101,
+  "fixed_exit": 0
+}

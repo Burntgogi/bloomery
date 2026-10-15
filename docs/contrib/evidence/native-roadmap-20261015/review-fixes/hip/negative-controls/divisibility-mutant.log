@@ -1,0 +1,31 @@
+
+running 1 test
+test tests::refuses_invalid_shapes_and_truncated_weights ... FAILED
+
+failures:
+
+---- tests::refuses_invalid_shapes_and_truncated_weights stdout ----
+
+thread 'tests::refuses_invalid_shapes_and_truncated_weights' (1584073) panicked at host/src/main.rs:470:13:
+assertion failed: shape(k, r, c, w).is_err()
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    tests::refuses_invalid_shapes_and_truncated_weights
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Compiling proc-macro2 v1.0.107
+   Compiling quote v1.0.47
+   Compiling unicode-ident v1.0.27
+   Compiling libc v0.2.190
+   Compiling thiserror v2.0.21
+   Compiling bloomery-hip-spike v0.1.0 (/home/jutai05/bloomery-native-contributions-20261013/hip-pr/labs/hip-native/host)
+   Compiling syn v3.0.9
+   Compiling memmap2 v0.9.11
+   Compiling thiserror-impl v2.0.21
+   Compiling bloomery-gguf v0.1.0 (/home/jutai05/bloomery-native-contributions-20261013/hip-pr/crates/gguf)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.45s
+     Running unittests src/main.rs (target/x86_64-unknown-linux-gnu/debug/build/bloomery-hip-spike/b9a1ce0c0da162a4/out/bloomery_hip_spike-b9a1ce0c0da162a4)
+error: test failed, to rerun pass `-p bloomery-hip-spike --bin bloomery-hip-spike`

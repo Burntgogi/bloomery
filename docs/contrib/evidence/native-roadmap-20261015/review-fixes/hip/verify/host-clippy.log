@@ -1,0 +1,6 @@
+   Compiling bloomery-hip-spike v0.1.0 (/home/jutai05/bloomery-native-contributions-20261013/hip-pr/labs/hip-native/host)
+    Checking libc v0.2.190
+    Checking thiserror v2.0.21
+    Checking memmap2 v0.9.11
+    Checking bloomery-gguf v0.1.0 (/home/jutai05/bloomery-native-contributions-20261013/hip-pr/crates/gguf)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.83s

@@ -1,0 +1,3 @@
+   Compiling bloomery-serve v0.3.2 (/home/jutai05/bloomery-native-contributions-20261013/dense-validation/crates/serve)
+    Checking bloomery-gpu-gates v0.3.2 (/home/jutai05/bloomery-native-contributions-20261013/dense-validation/crates/gpu-gates)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.21s

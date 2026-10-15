@@ -1,0 +1,8 @@
+fmt: pass
+host-test: pass
+host-clippy: pass
+device-clippy: pass
+device-build: pass
+host-build: pass
+verify: gpu failed (1): /home/jutai05/bloomery-native-contributions-20261013/roadmap-20261015/hip-review-fix/numeric-mutant/gpu.log
+/home/jutai05/bloomery-native-contributions-20261013/roadmap-20261015/hip-review-fix/numeric-mutant/result.json

@@ -1,0 +1,15 @@
+{
+  "command": [
+    "cargo",
+    "test",
+    "--locked",
+    "--target",
+    "x86_64-unknown-linux-gnu",
+    "-p",
+    "bloomery-hip-spike",
+    "refuses_invalid_shapes_and_truncated_weights"
+  ],
+  "mutation": "remove K-multiple-of256 guard only",
+  "mutant_exit": 101,
+  "restored_exit": 0
+}

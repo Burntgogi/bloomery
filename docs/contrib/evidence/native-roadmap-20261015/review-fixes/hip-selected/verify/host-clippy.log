@@ -1,0 +1,9 @@
+    Checking libc v0.2.190
+    Checking bloomery-levers v0.1.0 (/home/jutai05/bloomery-native-contributions-20261013/hip-selected/crates/levers)
+   Compiling bloomery-hip-spike v0.1.0 (/home/jutai05/bloomery-native-contributions-20261013/hip-selected/labs/hip-native/host)
+    Checking thiserror v2.0.21
+    Checking memmap2 v0.9.11
+    Checking bloomery-threads v0.1.0 (/home/jutai05/bloomery-native-contributions-20261013/hip-selected/crates/threads)
+    Checking bloomery-gguf v0.1.0 (/home/jutai05/bloomery-native-contributions-20261013/hip-selected/crates/gguf)
+    Checking bloomery-qdot v0.1.0 (/home/jutai05/bloomery-native-contributions-20261013/hip-selected/crates/qdot)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.23s
