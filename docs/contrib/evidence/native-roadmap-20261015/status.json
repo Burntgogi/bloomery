@@ -2,38 +2,62 @@
   "base": "e98d6c43f95bc75475cadaf1043c1735962dcc5d",
   "publication": "GitHub workflow authorization resolved; implementation branches and initial PRs published",
   "stages": {
-    "1": "initial PRs #248 and #251 submitted; reviews pending; #251 needs GPU",
+    "1": "initial PRs #248/#251 submitted; all four first-review must-fix items corrected and retested; new CI/review pending",
     "2": "selected Q4_K port passes18 exact-head GPU cases; draft #252 submitted, depends on #248",
-    "3": "diagnostic tools implemented; fresh host118 tests and clippy pass; A6000 execution pending",
+    "3": "draft #254 provides executable diagnostics; isolated119 host tests and clippy pass; actual A6000/reference/gate acceptance pending",
     "4": "exact0.8B candidate and nine-slice forward plan prepared; whole-forward/backend not implemented",
     "5": "matched benchmarking plan prepared; native AMD service and quiet GPU window required"
   },
   "hip": {
-    "source_head": "dac2c4e6e3b7f20a3ccaf90c0058e66639c01116",
+    "source_head": "a0d81f0667f197625f6a7ff0736e50b8a1d2fe88",
     "pr": "https://github.com/midagedev/bloomery/pull/248",
-    "gpu_cases_passed": 6
+    "gpu_cases_passed": 6,
+    "tree": "f5c390b1d61b07fc8d6089cc0ae94962f3c7d2ae"
   },
   "dense": {
-    "source_head": "d63f1bab9c7f9253338d7a1e7757c804557f9589",
+    "source_head": "49cd2b21baebb8f938d47c9c95838818b9e368c5",
     "pr": "https://github.com/midagedev/bloomery/pull/251",
     "t0_units_passed": 82,
-    "host_gpu_gates_tests_passed": 116,
+    "host_gpu_gates_tests_passed": 117,
     "host_model_tests_passed": 350,
     "admission_gap": "tool-call parser; host coverage remains exit1",
-    "nvidia_runtime_verified": false
+    "nvidia_runtime_verified": false,
+    "tree": "63b0eff9fbf62ef443f4b6c7c47f064e97c16407",
+    "full_t0_at_parent": "d63f1bab9c7f9253338d7a1e7757c804557f9589"
   },
   "hip-selected": {
-    "source_head": "4c35e4f0625adb61ba5acffe59352e3db0762c87",
+    "source_head": "0d534cd52c0fa5a6688a1d4ccee779ad5f89c072",
     "pr": "https://github.com/midagedev/bloomery/pull/252",
-    "gpu_cases_passed": 18
+    "gpu_cases_passed": 18,
+    "tree": "4e1123f6b9fd6285b22b16acc4c8cfd0eb79d0d9"
   },
   "validation": {
-    "source_head": "9c5b3a5f484196a3c56e1081fa5211655a146fd3",
-    "status": "draft PR preparation",
-    "isolated_host_tests_passed": 118,
+    "source_head": "4bd0784f4899b91b47445b5fa7b86b2a70451db3",
+    "status": "draft submitted, inherits reviewed parent corrections",
+    "isolated_host_tests_passed": 119,
     "targeted_t0_units_passed": 5,
     "static_clippy": "pass",
     "reference_smoke": "CPU only on pinned0.8B; two captures of3x248320 finite rows",
-    "nvidia_runtime_verified": false
+    "nvidia_runtime_verified": false,
+    "pr": "https://github.com/midagedev/bloomery/pull/254",
+    "tree": "a64d5a6306be3909e1152fd1595df124331a742e"
+  },
+  "reports": {
+    "87": "https://github.com/midagedev/bloomery/issues/87#issuecomment-6186612941",
+    "88": "https://github.com/midagedev/bloomery/issues/88#issuecomment-6186613315"
+  },
+  "next_actions": [
+    "Handle reviews of initial PRs #248 and #251; keep dependent drafts #252/#254 separate until their parents land.",
+    "After maintainer release0.3.3 GPU availability, execute exact27B CUDA reference/native forced rows and eager/graph plus short/4K HTTP/CLI diagnostics using supplied fixtures.",
+    "Use the real captures to register the dense reference family and pin justified numerical/serving gates, retaining existing routed/decision checks.",
+    "Proceed through the nine AMD forward port slices in amd-forward-closure.md; whole-model execution needs a free GPU window and concrete resource/runtime implementation.",
+    "Connect the proven forward path to common native Session/SeatEngine, preserve CUDA evidence, then measure matched llama.cpp HIP/Strata serving under the repository lease/evidence contract."
+  ],
+  "review_corrections": {
+    "must_fix_addressed": 4,
+    "hip_response": "https://github.com/midagedev/bloomery/pull/248#issuecomment-6186897349",
+    "dense_response": "https://github.com/midagedev/bloomery/pull/251#issuecomment-6186897780",
+    "evidence": "https://github.com/Burntgogi/bloomery/tree/57b689d8/docs/contrib/evidence/native-roadmap-20261015/review-fixes",
+    "remote_status": "new CI/review runs pending; not claimed approved"
   }
 }
