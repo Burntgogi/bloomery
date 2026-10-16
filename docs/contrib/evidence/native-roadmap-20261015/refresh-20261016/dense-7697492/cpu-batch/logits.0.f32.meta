@@ -1,0 +1,10 @@
+format	bloomery-forced-logits-v1
+dtype	float32-le
+rows	3
+vocab	248320
+mode	reference
+prefill	batch
+last_step	true
+prompt_ids	100000,1001,1002,1003,1004,1005,1006,1007,1008
+forced_ids	1009,1010,1011
+complete	true

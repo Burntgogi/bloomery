@@ -1,0 +1,17 @@
+{
+  "before": {
+    "source_head": "efdc55d36f7f65d426e2dab8f992a4f41e21fbb3",
+    "mutation": "Remove only duplicate-key rejection in memory; execute the actual complete self_test with the original ROOT",
+    "exit": 0,
+    "stdout": "dense-logits self-test: malformed ids, provenance, incomplete/truncated/NaN rows, eager/graph and owned-session cleanup contracts passed\n",
+    "stderr": ""
+  },
+  "after": {
+    "source_head": "769749240a3da5a600944be4eee286ded9ff960e",
+    "scope": "Actual complete self-test with only duplicate-key rejection removed in memory",
+    "exit": 1,
+    "stdout": "",
+    "stderr": "Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\n  File \"/tmp/bloomery-dense-254/tools/ref/dense-logits.py\", line 591, in self_test\n    raise AssertionError(\"accepted duplicate metadata\")\nAssertionError: accepted duplicate metadata\n"
+  },
+  "restored": "Both actual unmutated diagnostic self-tests pass; repaired fixture otherwise satisfies format/dtype/completeness contract."
+}

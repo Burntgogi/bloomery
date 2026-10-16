@@ -4,10 +4,10 @@
     "fix/timing-source-inspection": "e67e6e8e67c5a02b89b9312063f785004ef18763",
     "fix/gemm-reference-panic": "f11aaeea0fdd634d0e735f9cc9f684e70304e0f8",
     "contribution/hip-q4-selected-20261015": "3395e11d3c8e5f8a90dde16b1459883f54b953d5",
-    "contribution/qwen35-dense-validation-20261015": "efdc55d36f7f65d426e2dab8f992a4f41e21fbb3",
+    "contribution/qwen35-dense-validation-20261015": "769749240a3da5a600944be4eee286ded9ff960e",
     "fix/card-tests-outcomes": "a946fa667757e804e6802c0e1ee88149f222fe43",
     "fix/flash-split-first-key": "5c84771d79fdf5219618fb42e32cc00347f4ff72",
-    "integration/source-correctness-current": "09bd728f56a21a4fc708f3c638e2d3d8afc3ab1f",
+    "integration/source-correctness-current": "c5e2e1e98cc2f7dcbe4c0fc6507a28c3cfdf173f",
     "fix/card-dense-caller-followup": "626be5fb686053de9e4bbcc262679c7d7351481f"
   },
   "skill": {
@@ -71,7 +71,7 @@
       "restored_control": "eaa04a5: all seven checks and eighteen GPU cases pass"
     },
     "dense": {
-      "head": "efdc55d36f7f65d426e2dab8f992a4f41e21fbb3",
+      "head": "769749240a3da5a600944be4eee286ded9ff960e",
       "default_library_tests_passed": 124,
       "ignored": 3,
       "diagnostic_self_tests": "both passed",
@@ -79,7 +79,9 @@
       "full_feature_test_metadata_on_this_head": "blocked by independent main missing seventh judge_prefill argument; fixed by PR370 and passed in integration below",
       "real_official_llama_reference": "rebuild and CPU step/batch complete 3-row captures",
       "comparison": "finite/shape/identity pass; bitwise false; diagnostic_only_no_numeric_band",
-      "native_cuda": "not_run"
+      "native_cuda": "not_run",
+      "metadata_and_library_proof_head": "c5e2e1e98cc2f7dcbe4c0fc6507a28c3cfdf173f (combined integration including PR370/372)",
+      "duplicate_metadata_mutation": "Before fixture repair, removing duplicate rejection wrongly exits0; repaired otherwise-valid fixture exits1 with accepted duplicate metadata; unmutated self-tests pass."
     },
     "integration": {
       "head": "3498be4b562669e507c904111dd45d1ee9900e84",
@@ -121,6 +123,17 @@
       "exit": 101,
       "diagnostic": "error: no such command: `oxide`",
       "scope": "Native CUDA test/build tool unavailable in this environment; not replaced with plain cargo or a fake driver."
+    },
+    "final_fixture_integration": {
+      "head": "c5e2e1e98cc2f7dcbe4c0fc6507a28c3cfdf173f",
+      "format": "pass",
+      "workspace_all_targets_metadata": "pass",
+      "all_features_gpu_test_metadata": "pass with existing unused-item warnings, no CUDA device codegen",
+      "default_host_library_passed": 124,
+      "ignored": 3,
+      "diagnostic_self_tests": "both pass",
+      "recipe_derivation": "133 rows, 29 named exceptions, pass",
+      "full_recipe_suite_provenance": "Earlier 3498be4 run remains the 784 card / 61 tool / 2717 ownership evidence; not re-attributed."
     }
   },
   "additional_findings": [
@@ -145,6 +158,12 @@
       "problem": "Concurrent #339/#359 merges leave two dense Card reserve callers unmigrated",
       "source_fix_metadata_and_actual_host_error_boundary": "pass",
       "nvidia_execution": "not_run"
+    },
+    {
+      "issue": 373,
+      "problem": "Reported pre-existing forced_probe comparison false PASS for empty/truncated activation tensors",
+      "source": "review bot filed issue outside PR254; inspected issue report, not independently reproduced here",
+      "fixed_here": false
     }
   ],
   "external_prerequisites": [
@@ -215,6 +234,37 @@
       "mergedAt": null,
       "mergeCommit": null,
       "headRefOid": "5c84771d79fdf5219618fb42e32cc00347f4ff72"
+    }
+  },
+  "latest_submission_snapshot": {
+    "p254": {
+      "state": "OPEN",
+      "isDraft": false,
+      "headRefOid": "769749240a3da5a600944be4eee286ded9ff960e",
+      "mergedAt": null,
+      "reviews": {
+        "nodes": [
+          {
+            "state": "CHANGES_REQUESTED",
+            "commit": {
+              "oid": "efdc55d36f7f65d426e2dab8f992a4f41e21fbb3"
+            },
+            "body": "**Verdict: MUST_FIX**: The duplicate-metadata self-test stays green when duplicate detection is removed.\n\n### Must fix\n#### 1. Make the duplicate-metadata fixture otherwise valid\n[tools/ref/dense-logits.py:588](https://github.com/midagedev/bloomery/blob/efdc55d36f7f65d426e2dab8f992a4f41e21fbb3/tools/ref/dense-logits.py#L588) Removing `or pair[0] in fields` from `read_meta()` leaves this test green: missing `dtype` triggers a different `ValueError`. An in-memory mutation check confirmed this.\nRepair the fixture now so a later duplicate-key regression turns the test red. Replace its write with:\n\n```python\n        meta.write_text(\"format\\tbloomery-forced-logits-v1\\nformat\\tbloomery-forced-logits-v1\\ndtype\\tfloat32-le\\nlast_step\\ttrue\\ncomplete\\ttrue\\n\")\n```\n\n### Checked\nDuplicates: no duplicate finding remains.\nComplexity: diagnostics report `run` 164→176 and `run_arm` 35→46; these are aiming signals, not findings.\nSilent failure: `read_meta()` rejects malformed or duplicate keys, unsupported formats and incomplete rows; the fixture masks which rejection fired.\nTests: isolated mutation confirms the original fixture masks missing duplicate detection. The replacement exposes that mutant, parses as Python and sits on an added line.\nGates: no CUDA gates run by the validator; the PR disclaims NVIDIA acceptance.\nEscape catalog: no C1–C4 pattern applies to these findings.\n\n### Notes\ndryer did not run; its stated reason conflicts with the changed Rust paths.\nFull self-tests, builds and CUDA gates were not run in this review. The PR explicitly lacks NVIDIA acceptance evidence.\n\n<!-- validator: removed=1 downgraded=0 upgraded=0 -->\n\n<sub>Card check: `needs-gpu`. This pull request changes crates/gpu-gates/src/bin/generate_qwen3moe.rs, crates/gpu-gates/src/generate.rs, crates/gpu-gates/src/lib.rs … and carries no gate run on a card (CONTRIBUTING's evidence list); a maintainer adds `gpu-verified` after one.</sub>\n\n<sub>🔨 Shingler, bloomery's review bot: approves a clean pull request and requests changes on a must-fix ([how it works](https://github.com/midagedev/bloomery/blob/main/.github/review/README.md))</sub>\n\nFiled outside this PR: #373\n\n<!-- bloomery-review head_sha=efdc55d36f7f65d426e2dab8f992a4f41e21fbb3 verdict=MUST_FIX must_fix=1 warn=0 mode=full ledger=none run=38963481777 -->\n<!-- bloomery-usage reviewer: turns=None cost_usd=None ctx_max=None ctx_sum=1273370 out=18041 tools=command_execution:33,file_change:1 denied=0 engine=codex; validator: turns=None cost_usd=None ctx_max=None ctx_sum=361964 out=7817 tools=command_execution:20,file_change:2 denied=0 engine=codex -->\n"
+          }
+        ]
+      }
+    },
+    "p370": {
+      "state": "OPEN",
+      "isDraft": false,
+      "headRefOid": "5c84771d79fdf5219618fb42e32cc00347f4ff72",
+      "mergedAt": null
+    },
+    "p372": {
+      "state": "OPEN",
+      "isDraft": false,
+      "headRefOid": "626be5fb686053de9e4bbcc262679c7d7351481f",
+      "mergedAt": null
     }
   }
 }

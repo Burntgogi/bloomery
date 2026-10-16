@@ -1,0 +1,31 @@
+{
+  "p254": {
+    "state": "OPEN",
+    "isDraft": false,
+    "headRefOid": "769749240a3da5a600944be4eee286ded9ff960e",
+    "mergedAt": null,
+    "reviews": {
+      "nodes": [
+        {
+          "state": "CHANGES_REQUESTED",
+          "commit": {
+            "oid": "efdc55d36f7f65d426e2dab8f992a4f41e21fbb3"
+          },
+          "body": "**Verdict: MUST_FIX**: The duplicate-metadata self-test stays green when duplicate detection is removed.\n\n### Must fix\n#### 1. Make the duplicate-metadata fixture otherwise valid\n[tools/ref/dense-logits.py:588](https://github.com/midagedev/bloomery/blob/efdc55d36f7f65d426e2dab8f992a4f41e21fbb3/tools/ref/dense-logits.py#L588) Removing `or pair[0] in fields` from `read_meta()` leaves this test green: missing `dtype` triggers a different `ValueError`. An in-memory mutation check confirmed this.\nRepair the fixture now so a later duplicate-key regression turns the test red. Replace its write with:\n\n```python\n        meta.write_text(\"format\\tbloomery-forced-logits-v1\\nformat\\tbloomery-forced-logits-v1\\ndtype\\tfloat32-le\\nlast_step\\ttrue\\ncomplete\\ttrue\\n\")\n```\n\n### Checked\nDuplicates: no duplicate finding remains.\nComplexity: diagnostics report `run` 164→176 and `run_arm` 35→46; these are aiming signals, not findings.\nSilent failure: `read_meta()` rejects malformed or duplicate keys, unsupported formats and incomplete rows; the fixture masks which rejection fired.\nTests: isolated mutation confirms the original fixture masks missing duplicate detection. The replacement exposes that mutant, parses as Python and sits on an added line.\nGates: no CUDA gates run by the validator; the PR disclaims NVIDIA acceptance.\nEscape catalog: no C1–C4 pattern applies to these findings.\n\n### Notes\ndryer did not run; its stated reason conflicts with the changed Rust paths.\nFull self-tests, builds and CUDA gates were not run in this review. The PR explicitly lacks NVIDIA acceptance evidence.\n\n<!-- validator: removed=1 downgraded=0 upgraded=0 -->\n\n<sub>Card check: `needs-gpu`. This pull request changes crates/gpu-gates/src/bin/generate_qwen3moe.rs, crates/gpu-gates/src/generate.rs, crates/gpu-gates/src/lib.rs … and carries no gate run on a card (CONTRIBUTING's evidence list); a maintainer adds `gpu-verified` after one.</sub>\n\n<sub>🔨 Shingler, bloomery's review bot: approves a clean pull request and requests changes on a must-fix ([how it works](https://github.com/midagedev/bloomery/blob/main/.github/review/README.md))</sub>\n\nFiled outside this PR: #373\n\n<!-- bloomery-review head_sha=efdc55d36f7f65d426e2dab8f992a4f41e21fbb3 verdict=MUST_FIX must_fix=1 warn=0 mode=full ledger=none run=38963481777 -->\n<!-- bloomery-usage reviewer: turns=None cost_usd=None ctx_max=None ctx_sum=1273370 out=18041 tools=command_execution:33,file_change:1 denied=0 engine=codex; validator: turns=None cost_usd=None ctx_max=None ctx_sum=361964 out=7817 tools=command_execution:20,file_change:2 denied=0 engine=codex -->\n"
+        }
+      ]
+    }
+  },
+  "p370": {
+    "state": "OPEN",
+    "isDraft": false,
+    "headRefOid": "5c84771d79fdf5219618fb42e32cc00347f4ff72",
+    "mergedAt": null
+  },
+  "p372": {
+    "state": "OPEN",
+    "isDraft": false,
+    "headRefOid": "626be5fb686053de9e4bbcc262679c7d7351481f",
+    "mergedAt": null
+  }
+}

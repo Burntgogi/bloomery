@@ -1,0 +1,31 @@
+{
+  "finite_shape_identity_checks": "pass",
+  "bitwise_equal": false,
+  "acceptance": "diagnostic_only_no_numeric_band",
+  "rows": [
+    {
+      "row": 0,
+      "max_abs": 0.537169337272644,
+      "relative_l2": 0.056043770968185115,
+      "reference_norm_zero": false,
+      "argmax_left": 828,
+      "argmax_right": 828
+    },
+    {
+      "row": 1,
+      "max_abs": 0.543848991394043,
+      "relative_l2": 0.04487118939872389,
+      "reference_norm_zero": false,
+      "argmax_left": 738,
+      "argmax_right": 738
+    },
+    {
+      "row": 2,
+      "max_abs": 0.5100833177566528,
+      "relative_l2": 0.0427393615643544,
+      "reference_norm_zero": false,
+      "argmax_left": 828,
+      "argmax_right": 828
+    }
+  ]
+}
