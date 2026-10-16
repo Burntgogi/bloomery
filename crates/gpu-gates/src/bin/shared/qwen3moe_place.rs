@@ -643,6 +643,7 @@ impl Whole {
 
     /// The refusal of a whole load this verdict does not take, of a model
     /// with no routed expert to move to the host tier.
+    /// Keep an unrepresentable reserve a named overflow, not a retryable shortage.
     fn dense_refusal(&self, ctx: usize) -> GateError {
         if let Whole::Short(n) = self {
             let Some(reserves) = n.card.reserve_bytes() else {
