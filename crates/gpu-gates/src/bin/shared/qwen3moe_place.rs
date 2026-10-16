@@ -638,6 +638,12 @@ impl Whole {
     /// with no routed expert to move to the host tier.
     fn dense_refusal(&self, ctx: usize) -> GateError {
         if let Whole::Short(n) = self {
+            let Some(reserves) = n.card.reserve_bytes() else {
+                return PlacementError::CardBytesPastU64 {
+                    card: n.card.name.clone(),
+                }
+                .into();
+            };
             let (margin, beside) = match n.load {
                 WholeLoad::Checked { arena, reserve } => (reserve, arena),
                 WholeLoad::Unchecked => (n.card.margin_bytes, 0),
@@ -650,7 +656,7 @@ impl Whole {
                 kv: n.kv,
                 context: n.card.context_bytes,
                 scratch: n.card.scratch_bytes,
-                reserves: n.card.reserve_bytes(),
+                reserves,
                 margin,
                 beside,
             }
@@ -1345,23 +1351,21 @@ mod tests {
                 (u64::MAX, DEFAULT_TARGET),
             ] {
                 let mut probes = Vec::new();
-                let chosen = choose_ctx_of(
-                    DEFAULT_TARGET,
-                    (None, 1),
-                    (None, None),
-                    |ctx| {
-                        probes.push(ctx);
-                        match verdict(ctx, Some(budget))? {
-                            Whole::Fits(_) => Ok(Probe::Holds(ServeLoad::Whole(spec))),
-                            other => short_or(other.dense_refusal(usize::try_from(ctx)?)),
-                        }
-                    },
-                )?;
+                let chosen = choose_ctx_of(DEFAULT_TARGET, (None, 1), (None, None), |ctx| {
+                    probes.push(ctx);
+                    match verdict(ctx, Some(budget))? {
+                        Whole::Fits(_) => Ok(Probe::Holds(ServeLoad::Whole(spec))),
+                        other => short_or(other.dense_refusal(usize::try_from(ctx)?)),
+                    }
+                })?;
                 assert_eq!((chosen.slot_ctx, chosen.total), (expected, expected));
                 assert!(matches!(chosen.plan, ServeLoad::Whole(_)));
                 assert_eq!(probes[0], DEFAULT_TARGET);
                 assert_eq!(probes.last(), Some(&expected));
-                assert_eq!(matches!(chosen.rule, Rule::Target), expected == DEFAULT_TARGET);
+                assert_eq!(
+                    matches!(chosen.rule, Rule::Target),
+                    expected == DEFAULT_TARGET
+                );
             }
         }
         let refused = Whole::Refused("unsupported tensor format".into());
