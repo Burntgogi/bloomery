@@ -13,9 +13,7 @@ pub fn assert_close(got: &[f32], want: &[f32], tol: f32, what: &str) {
     let mut worst = 0.0f32;
     let mut at = 0usize;
     for (i, (&g, &w)) in got.iter().zip(want).enumerate() {
-        // A non-finite cell never compares: NaN > worst is false, so a mutant
-        // that writes one NaN output would keep `worst` at zero and read as a
-        // pass. Reject the operand before the maximum can absorb it.
+        // Reject non-finite operands before comparing errors.
         assert!(
             g.is_finite(),
             "{what}: non-finite got at index {i} (reference {w}); gate is {tol:e}"

@@ -63,6 +63,10 @@ fn assert_close_rel(got: &[f32], want: &[f32], what: &str) {
     let mut at = 0usize;
     let mut pair = (0.0f32, 0.0f32);
     for (i, (&g, &w)) in got.iter().zip(want).enumerate() {
+        assert!(
+            g.is_finite() && w.is_finite(),
+            "non-finite comparison operand at index {i}: got {g}, reference {w}"
+        );
         let d = (g - w).abs();
         worst_abs = worst_abs.max(d);
         max_abs_ref = max_abs_ref.max(w.abs());
