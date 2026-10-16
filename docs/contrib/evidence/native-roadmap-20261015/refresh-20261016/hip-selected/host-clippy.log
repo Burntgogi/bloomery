@@ -1,0 +1,9 @@
+    Checking libc v0.2.190
+   Compiling bloomery-hip-spike v0.1.0 (/tmp/bloomery-hip-252/labs/hip-native/host)
+    Checking bloomery-levers v0.1.0 (/tmp/bloomery-hip-252/crates/levers)
+    Checking thiserror v2.0.21
+    Checking memmap2 v0.9.11
+    Checking bloomery-threads v0.1.0 (/tmp/bloomery-hip-252/crates/threads)
+    Checking bloomery-gguf v0.1.0 (/tmp/bloomery-hip-252/crates/gguf)
+    Checking bloomery-qdot v0.1.0 (/tmp/bloomery-hip-252/crates/qdot)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.28s
