@@ -141,12 +141,6 @@ majflt_require() {
   echo "$1: /proc/vmstat gives no pgmajfault: every row's majflt column and cold tag would read 0" >&2
   exit 2
 }
-# majflt_require <runner>: exit 2 before the lease when /proc/vmstat has no pgmajfault.
-majflt_require() {
-  [ -n "$(majflt_now 2> /dev/null)" ] && return 0
-  echo "$1: /proc/vmstat gives no pgmajfault: every row's majflt column and cold tag would read 0" >&2
-  exit 2
-}
 # majflt_mark <file> <ERE>: its stdin to stdout line by line, and /proc/vmstat's pgmajfault into
 # <file> at the first line matching <ERE> (at none when <ERE> is empty): the line an engine prints as
 # its measured window starts. The read is one line at a time through the shell: awk buffers its
@@ -447,9 +441,9 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = --self-test ]; then
   # output), and awk buffers that input, so a marker the match itself sampled waited for a
   # buffer's fill and the window's faults landed under its start. One line at a time through the
   # shell lands it while the pipe is still open; the sleep below is the check's wait, not a fix.
+  d=$(mktemp -d)
+  mkfifo "$d/pipe"
   if [ -e /proc/vmstat ]; then
-    d=$(mktemp -d)
-    mkfifo "$d/pipe"
     majflt_mark "$d/mark" 'window-start' < "$d/pipe" > "$d/out" &
     mp=$!
     exec 9> "$d/pipe"
@@ -469,6 +463,20 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = --self-test ]; then
     majflt_mark "$d/mark-none" '' <<< $'window-start\ntrailing' > /dev/null
     check marker-empty-re "$([ -e "$d/mark-none" ] && echo yes || echo no)" 'no'
   fi
+  # A failed forward must finish without waiting for upstream EOF.
+  (
+    majflt_mark /dev/null '' < "$d/pipe" 1< /dev/null 2> /dev/null && r=0 || r=$?
+    printf '%s\n' "$r" > "$d/forward.rc"
+  ) &
+  mp=$!
+  exec 9> "$d/pipe"
+  printf 'forwarded\n' >&9
+  for ((i = 0; i < 40; i++)); do [ -s "$d/forward.rc" ] && break; sleep 0.01; done
+  r=$(cat "$d/forward.rc" 2> /dev/null)
+  check marker-forward-failure "$([ -n "$r" ] && [ "$r" -ne 0 ] && echo failed || echo waiting-or-success)" failed
+  exec 9>&-
+  wait "$mp"
+  rm -rf "$d"
   check ncmoe-long "$(with_ncmoe '-ngl 99 --n-cpu-moe 33 -fa on' 2)" "-ngl 99 -fa on --n-cpu-moe 2"
   check ncmoe-short "$(with_ncmoe '-ngl 99 -fa on -lzm off -ncmoe 26' 30)" "-ngl 99 -fa on -lzm off --n-cpu-moe 30"
   check ncmoe-none "$(with_ncmoe '-ngl 99' 4)" "-ngl 99 --n-cpu-moe 4"
