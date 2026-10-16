@@ -4637,6 +4637,17 @@ mod tests {
         assert!(unsupported.starts_with(&Q8_0.to_string()), "{unsupported}");
         assert!(mismatch.starts_with(&Q5_K.to_string()), "{mismatch}");
         assert_ne!(unsupported, mismatch, "distinct causes must not collapse");
+        // The renderer hands the policy's own reason through, so losing or
+        // overwriting `cause.why` (keeping only the type prefix) cannot stay
+        // green. The reading ties the two representations, not a wording.
+        for cause in routed_rule(Program::Qwen35Body).host_only(&model).unwrap() {
+            let layer = u64::try_from(cause.layer).unwrap();
+            assert!(
+                why(layer, &cause.tensor.name).ends_with(cause.why),
+                "{}",
+                why(layer, &cause.tensor.name)
+            );
+        }
         assert!(host_only(&model, None).unwrap().next().is_none());
     }
 
