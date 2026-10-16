@@ -1,0 +1,272 @@
+    Checking bloomery-levers v0.1.0 (/tmp/bloomery-integration-currentmain/crates/levers)
+   Compiling bloomery-serve v0.3.3 (/tmp/bloomery-integration-currentmain/crates/serve)
+    Checking bloomery-threads v0.1.0 (/tmp/bloomery-integration-currentmain/crates/threads)
+    Checking bloomery-placement v0.1.0 (/tmp/bloomery-integration-currentmain/crates/placement)
+    Checking bloomery-qdot v0.1.0 (/tmp/bloomery-integration-currentmain/crates/qdot)
+    Checking bloomery-engram v0.1.0 (/tmp/bloomery-integration-currentmain/crates/engram)
+    Checking bloomery-engram-lab v0.1.0 (/tmp/bloomery-integration-currentmain/crates/engram-lab)
+    Checking bloomery-model v0.1.0 (/tmp/bloomery-integration-currentmain/crates/model)
+    Checking bloomery-gpu-gates v0.3.3 (/tmp/bloomery-integration-currentmain/crates/gpu-gates)
+    Checking bloomery-gpu v0.1.0 (/tmp/bloomery-integration-currentmain/crates/gpu)
+    Checking bloomery-gpu-deepseek41 v0.1.0 (/tmp/bloomery-integration-currentmain/crates/gpu-deepseek41)
+    Checking bloomery-gpu-vision v0.1.0 (/tmp/bloomery-integration-currentmain/crates/gpu-vision)
+    Checking bloomery-app v0.1.0 (/tmp/bloomery-integration-currentmain/crates/app)
+    Checking bloomery-gpu-gemma-embedding2 v0.1.0 (/tmp/bloomery-integration-currentmain/crates/gpu-gemma-embedding2)
+    Checking bloomery-gpu-glm5next v0.1.0 (/tmp/bloomery-integration-currentmain/crates/gpu-glm5next)
+    Checking bloomery-gpu-mimo2 v0.1.0 (/tmp/bloomery-integration-currentmain/crates/gpu-mimo2)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 19.98s
+    Checking bloomery-app v0.1.0 (/tmp/bloomery-integration-currentmain/crates/app)
+    Checking bloomery-gpu-gates v0.3.3 (/tmp/bloomery-integration-currentmain/crates/gpu-gates)
+warning: unused import: `NodeInfo`
+  --> crates/gpu-gates/src/bin/gate_nemotron_e2e.rs:88:55
+   |
+88 |     use bloomery_gpu::{Gpu, GpuError, NemotronHModel, NodeInfo};
+   |                                                       ^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `dense_shortage_halves_the_default_context` is never used
+    --> crates/gpu-gates/src/bin/shared/serve_seats/../qwen3moe_place.rs:1306:19
+     |
+1306 |     pub(crate) fn dense_shortage_halves_the_default_context() {
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `bloomery-gpu-gates` (bin "gate_nemotron_e2e" test) generated 1 warning (run `cargo fix --bin "gate_nemotron_e2e" -p bloomery-gpu-gates --tests` to apply 1 suggestion)
+warning: `bloomery-gpu-gates` (bin "bloomery-serve" test) generated 1 warning
+warning: unused import: `Run`
+  --> crates/gpu-gates/src/bin/gate_nemotron_h_moe_e2e.rs:81:22
+   |
+81 |     use crate::e2e::{Run, argmax, feed, finite, fresh, histogram, or_fault, same, top_ids, walk};
+   |                      ^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `GpuError`
+  --> crates/gpu-gates/src/bin/gate_nemotron_h_moe_e2e.rs:84:29
+   |
+84 |     use bloomery_gpu::{Gpu, GpuError, NemotronHMoeModel};
+   |                             ^^^^^^^^
+
+warning: `bloomery-gpu-gates` (bin "gate_nemotron_h_moe_e2e" test) generated 2 warnings (run `cargo fix --bin "gate_nemotron_h_moe_e2e" -p bloomery-gpu-gates --tests` to apply 2 suggestions)
+warning: struct `Run` is never constructed
+   --> crates/gpu-gates/src/bin/shared/e2e.rs:370:12
+    |
+370 | pub struct Run {
+    |            ^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `feed` is never used
+   --> crates/gpu-gates/src/bin/shared/e2e.rs:376:8
+    |
+376 | pub fn feed<B: bloomery_gpu::model::ChainBody>(
+    |        ^^^^
+
+warning: function `or_fault` is never used
+   --> crates/gpu-gates/src/bin/shared/e2e.rs:394:8
+    |
+394 | pub fn or_fault<T>(c: &str, w: &str, r: Result<T, GpuError>) -> Result<Option<T>, GateError> {
+    |        ^^^^^^^^
+
+warning: function `fresh` is never used
+   --> crates/gpu-gates/src/bin/shared/e2e.rs:406:8
+    |
+406 | pub fn fresh<B: bloomery_gpu::model::ChainBody>(
+    |        ^^^^^
+
+warning: function `finite` is never used
+   --> crates/gpu-gates/src/bin/shared/e2e.rs:416:8
+    |
+416 | pub fn finite(r: &Run) -> bool {
+    |        ^^^^^^
+
+warning: function `same` is never used
+   --> crates/gpu-gates/src/bin/shared/e2e.rs:420:8
+    |
+420 | pub fn same(a: &Run, b: &Run) -> bool {
+    |        ^^^^
+
+warning: function `histogram` is never used
+   --> crates/gpu-gates/src/bin/shared/e2e.rs:430:8
+    |
+430 | pub fn histogram(nodes: &[bloomery_gpu::NodeInfo]) -> std::collections::BTreeMap<String, usize> {
+    |        ^^^^^^^^^
+
+warning: function `top_ids` is never used
+   --> crates/gpu-gates/src/bin/shared/e2e.rs:439:8
+    |
+439 | pub fn top_ids(v: &[f32], k: usize) -> Vec<usize> {
+    |        ^^^^^^^
+
+warning: function `walk` is never used
+   --> crates/gpu-gates/src/bin/shared/e2e.rs:447:8
+    |
+447 | pub fn walk(n: usize, vocab: usize) -> Vec<u32> {
+    |        ^^^^
+
+warning: `bloomery-gpu-gates` (bin "gate_glm5next_e2e" test) generated 9 warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 7.83s
+   Compiling memchr v2.8.3
+   Compiling bloomery-levers v0.1.0 (/tmp/bloomery-integration-currentmain/crates/levers)
+   Compiling serde_core v1.0.229
+   Compiling serde_json v1.0.151
+   Compiling crc32fast v1.5.2
+   Compiling hashbrown v0.17.1
+   Compiling foldhash v0.1.5
+   Compiling itoa v1.0.18
+   Compiling equivalent v1.0.2
+   Compiling zmij v1.0.23
+   Compiling sha1 v0.10.7
+   Compiling bloomery-refset v0.1.0 (/tmp/bloomery-integration-currentmain/crates/refset)
+   Compiling bloomery-runtime v0.1.0 (/tmp/bloomery-integration-currentmain/crates/runtime)
+   Compiling hashbrown v0.15.5
+   Compiling bloomery-tokenizer v0.1.0 (/tmp/bloomery-integration-currentmain/crates/tokenizer)
+   Compiling bloomery-threads v0.1.0 (/tmp/bloomery-integration-currentmain/crates/threads)
+   Compiling bloomery-placement v0.1.0 (/tmp/bloomery-integration-currentmain/crates/placement)
+   Compiling indexmap v2.14.2
+   Compiling bloomery-qdot v0.1.0 (/tmp/bloomery-integration-currentmain/crates/qdot)
+   Compiling bloomery-engram v0.1.0 (/tmp/bloomery-integration-currentmain/crates/engram)
+   Compiling object v0.36.7
+   Compiling bloomery-hf v0.1.0 (/tmp/bloomery-integration-currentmain/crates/hf)
+   Compiling bloomery-model v0.1.0 (/tmp/bloomery-integration-currentmain/crates/model)
+   Compiling oxide-artifacts v0.2.1
+   Compiling bloomery-gpu-gates v0.3.3 (/tmp/bloomery-integration-currentmain/crates/gpu-gates)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 9.23s
+     Running unittests src/lib.rs (/tmp/bloomery-target-integration-currentmain/debug/build/bloomery-gpu-gates/cc71489d8fe54f8f/out/bloomery_gpu_gates-cc71489d8fe54f8f)
+
+running 127 tests
+test act_rule::site_tests::site_rel_agrees_with_the_k_quant_rule_where_both_speak ... ok
+test act_rule::site_tests::q8_rel_is_the_32_value_model_scaled_by_the_root_of_the_block ... ok
+test act_rule::site_tests::site_rel_is_the_table ... ok
+test act_rule::ffnmoe_tests::q8_2_sums_are_the_codes ... ok
+test act_rule::tests::dot_q3k_is_the_dequantized_dot ... ok
+test beside::tests::the_probe_and_the_placed_plan_see_the_same_reserve ... ok
+test act_rule::ffnmoe_tests::dots_are_the_dequantized_dots ... ok
+test beside::tests::the_embedding_model_is_a_second_reserve ... ok
+test ctx_ladder::tests::a_dropped_rung_names_the_reserve ... ok
+test ctx_ladder::tests::the_ladder_ends_on_the_floor ... ok
+test ctx_ladder::tests::a_line_holds_its_word ... ok
+test flip::tests::a_flip_is_allowed_only_under_the_cap ... ok
+test act_rule::tests::q3k_scales_match_dequant ... ok
+test flip::tests::a_head_tie_needs_a_finite_row_and_band ... ok
+test flip::tests::a_tie_is_bounded_by_the_head_input ... ok
+test act_rule::site_tests::site_rel_reads_the_forms_the_launches_name ... ok
+test gpu_census::tests::the_listing_reads_its_rows ... ok
+test gpu_census::tests::the_uuid_is_nvidia_smis ... ok
+test gpu_census::tests::a_listed_compute_app_names_its_card_holder ... ok
+test kld::tests::hw_ds41_kld_base_matches_its_run ... ignored, hw: needs the ik base files in $BLOOMERY_DATA/ikppl and the V4.1 model file on the box
+test flash_band::tests::prefill_bound_counts_tiles_from_first_key ... ok
+test act_rule::tests::q8_codes_refuse_a_non_finite_value ... ok
+test image_plan::tests::the_table_term_is_a_row_of_f32_a_position ... ok
+test logit_rows::tests::refused_or_incomplete_rows_never_complete_a_dump ... ok
+test logit_rows::tests::forced_rows_keep_bits_and_token_alignment_without_argmax_picking ... ok
+test kld::tests::a_base_file_reads_back_and_a_bad_one_is_refused ... ok
+test ik_q8_2::tests::partial_blocks_stop_by_name ... ok
+test oracle::deepseek41::tests::hw_ds41_oracle_reads_every_row ... ignored, hw: needs the V4.1 oracle set in $BLOOMERY_DATA on the box
+test oracle::deepseek41::tests::hw_ds41_oracle_step_sets_share_the_batch_build ... ignored, hw: needs the V4.1 oracle sets in $BLOOMERY_DATA on the box
+test flip::tests::head_margin_matches_fixtures_and_names_invalid_rows ... ok
+test oracle::tests::a_rows_sets_are_its_familys ... ok
+test prompts::tests::compare_forced_counts_every_position_not_only_the_first ... ok
+test kld::tests::two_files_compare_to_a_known_kld ... ok
+test prompts::tests::compare_forced_exact_judges_against_the_truth_not_the_reference ... ok
+test prompts::tests::compare_forced_spans_the_shorter_of_the_two_lengths ... ok
+test prompts::tests::compare_greedy_judges_a_short_eos_row_over_its_own_length ... ok
+test prompts::tests::compare_greedy_classifies_the_first_difference_only ... ok
+test prompts::tests::std_normal_cdf_matches_the_table ... ok
+test prompts::tests::sigma_forced_signs_toward_the_truth_and_counts_only_clear_positions ... ok
+test flip::tests::a_head_tie_is_held_within_the_band_and_fails_past_it ... ok
+test ptx::tests::a_bundle_whose_ptx_a_cubin_shadows_is_refused ... ok
+test prompts::tests::read_exact_takes_contiguous_steps_and_checks_coverage ... ok
+test model_file::tests::decision_header_distinguishes_absent_string_and_malformed_markers ... ok
+test ptx::tests::a_rejected_container_is_an_error_not_an_empty_scan ... ok
+test prompts::tests::read_greedy_takes_only_the_gen_format ... ok
+test ptx::tests::body_stops_at_a_device_function ... ok
+test ptx::tests::last_body_ends_where_its_payload_ends ... ok
+test ptx::tests::body_stops_at_the_next_entry ... ok
+test ptx::tests::lists_every_entry_in_declaration_order ... ok
+test ptx::tests::each_bundle_is_its_own_module ... ok
+test ptx::tests::counts_the_calls_an_entry_makes ... ok
+test ptx::tests::normalize_rewrites_whole_tokens_only ... ok
+test ptx::tests::a_hashed_generated_name_normalizes_like_the_plain_one ... ok
+test ptx::tests::an_undeclared_or_unreadable_generated_symbol_is_a_named_error ... ok
+test ptx::tests::a_symbol_that_is_not_generated_is_kept_by_name ... ok
+test ptx::tests::normalize_ignores_renumbering ... ok
+test ptx::tests::a_reference_moved_onto_a_declaration_of_another_size_moves_the_digest ... ok
+test ptx::tests::find_and_count_survive_degenerate_needles ... ok
+test ptx::tests::counts_the_shapes_of_one_entry ... ok
+test q36_fixture::tests::a_layer_no_rule_covers_and_a_slot_count_on_an_apart_layer_are_refused_by_name ... ok
+test q38_fixture::tests::a_header_without_layers_or_interval_is_refused_and_no_site_adds_no_launches ... ok
+test q38_fixture::tests::the_header_gives_the_real_files_literals_and_the_fixtures_counts ... ok
+test qwen_seat::tests::head_shape_selects_the_existing_flash ... ok
+test q36_fixture::tests::the_headers_give_the_real_files_literals_and_the_fixtures_counts ... ok
+test ptx::tests::scan_puts_the_spilling_entries_first ... ok
+test ptx::tests::reads_the_block_width_and_its_absence ... ok
+test qwen_seat::tests::dense_generation_keeps_decision_layouts_out ... ok
+test ptx::tests::normalize_sees_every_other_change ... ok
+test ptx::tests::two_modules_that_differ_only_by_renumbering_give_equal_entry_digests ... ok
+test q36_fixture::tests::a_header_read_gives_the_layers_and_an_apart_rule_over_all_three_parts ... ok
+test ptx::tests::two_references_merged_into_one_symbol_move_the_digest ... ok
+test record::tests::a_group_required_after_registration_and_missing_panics - should panic ... ok
+test record::tests::a_group_required_before_registration_is_checked_at_registration - should panic ... ok
+test ptx::tests::a_changed_declaration_size_moves_the_digest ... ok
+test record::tests::a_group_the_list_holds_passes_and_an_unregistered_process_never_reads_the_wait ... ok
+test record::tests::every_binary_registers_the_groups_its_entries_require ... ok
+test record::tests::an_off_path_save_reads_by_field ... ok
+test oracle::tests::a_set_of_another_architecture_is_refused ... ok
+test record::tests::a_line_that_opens_a_record_and_does_not_read_whole_is_refused ... ok
+test record::tests::nvtier_ends_with_the_union_counters ... ok
+test record::tests::a_plan38_names_the_host_room_it_was_made_at ... ok
+test record::tests::field_reads_refuse_by_name ... ok
+test record::tests::refuses_a_kind_its_binary_does_not_print - should panic ... ok
+test record::tests::refuses_a_line_with_a_part_missing - should panic ... ok
+test record::tests::card_free_is_held_to_the_stage_devices_usable_bytes ... ok
+test record::tests::server_spawn_names_the_binary_the_process_and_the_wall ... ok
+test record::tests::renders_the_known_text ... ok
+test record::tests::refuses_a_value_out_of_order - should panic ... ok
+test record::tests::missing_names_the_kinds_a_list_lacks ... ok
+test record::tests::one_names_an_absent_kind_and_the_log ... ok
+test flip::tests::the_lifted_caps_are_the_copies ... ok
+test record::tests::host_only_records_name_causes_and_skip_an_all_host_choice ... ok
+test record::tests::server_spawn_refuses_a_missing_wall - should panic ... ok
+test record::tests::the_seats_that_fetch_the_hf_projector_register_its_lines ... ok
+test record::tests::the_seats_that_take_images_register_the_vision_record ... ok
+test rounding::tests::the_q8_32_error_model ... ok
+test record::tests::tier_cost_parser_fixture_is_current ... ok
+test tests::kquant_d_at_is_the_scale_every_value_reads ... ok
+test record::tests::kinds_are_well_formed ... ok
+test record::tests::shared_heads_read_by_the_whole_line ... ok
+test tests::max_rel_err_rejects_nan_output ... ok
+test tests::the_corpus_reader_takes_n_ids_and_refuses_the_rest ... ok
+test tier::tests::a_clause_call_prints_counts_and_answers ... ok
+test tier::tests::a_clauses_fate_in_each_tier ... ok
+test tier::tests::each_decision_prints_its_line ... ok
+test record::tests::optional_parts_left_out_read_as_absent ... ok
+test tier::tests::the_budget_is_the_levers_in_the_real_tier_and_the_headers_plus_the_draft_in_the_fixture ... ok
+test tier::tests::each_tier_runs_its_tags ... ok
+test tier::tests::eight_tags_in_the_docs_order ... ok
+test tier::tests::an_untagged_clause_in_the_fixture_tier_is_a_named_error ... ok
+test tier::tests::the_card_clause_is_left_only_on_a_variant_with_no_card_layer ... ok
+test tier::tests::the_fixture_tier_opens_only_a_whole_fixture ... ok
+test tier::tests::the_host_clause_is_left_only_on_a_fixture_with_too_few_host_layers ... ok
+test tier::tests::the_real_tier_holds_its_fixture_only_clauses_to_the_declared_count ... ok
+test tier::tests::the_fixture_tier_holds_its_fixture_oracle_runs_to_the_declared_count ... ok
+test tier::tests::the_deferred_line_is_what_the_batch_counts ... ok
+test tier::tests::the_tally_counts_and_prints_three_kinds ... ok
+test tier::tests::a_clause_names_the_family_and_the_fixture_it_needs ... ok
+test tier::tests::the_variable_names_a_tier_or_is_refused ... ok
+test tier::tests::the_layout_clause_is_left_only_on_a_fixture_with_no_layer_of_its_layout ... ok
+test tier::tests::the_fixture_tier_acts_on_the_card_budget ... ok
+test tier::tests::a_fixture_set_opens_or_fails_by_name ... ok
+test record::tests::checked_in_schemas_are_current ... ok
+test tier::tests::the_generator_writes_the_keys_this_module_reads ... ok
+test hc_host::tests::hc_pre_f32_digest ... ok
+test record::tests::reads_every_kind_whole ... ok
+test hc_host::tests::hc_chain_q8_0_digest ... ok
+
+test result: ok. 124 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+
+Wall time: 41.74 seconds

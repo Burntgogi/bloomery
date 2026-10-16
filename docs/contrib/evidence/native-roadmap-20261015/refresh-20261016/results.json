@@ -1,5 +1,4 @@
 {
-  "main_base": "cca9beaef0180caf5fed247ac53a74617a868007",
   "source_refs": {
     "fix/card-reserve-overflow": "62ea287641c702b2ffd2147b79e8f6bf53254b0f",
     "fix/timing-source-inspection": "e67e6e8e67c5a02b89b9312063f785004ef18763",
@@ -8,7 +7,8 @@
     "contribution/qwen35-dense-validation-20261015": "efdc55d36f7f65d426e2dab8f992a4f41e21fbb3",
     "fix/card-tests-outcomes": "a946fa667757e804e6802c0e1ee88149f222fe43",
     "fix/flash-split-first-key": "5c84771d79fdf5219618fb42e32cc00347f4ff72",
-    "integration/source-correctness-current": "3498be4b562669e507c904111dd45d1ee9900e84"
+    "integration/source-correctness-current": "09bd728f56a21a4fc708f3c638e2d3d8afc3ab1f",
+    "fix/card-dense-caller-followup": "626be5fb686053de9e4bbcc262679c7d7351481f"
   },
   "skill": {
     "installed": "/home/jutai05/.omp/agent/skills/be-ambitious",
@@ -22,7 +22,8 @@
     "252": "https://github.com/midagedev/bloomery/pull/252",
     "254": "https://github.com/midagedev/bloomery/pull/254",
     "incidental_wording_cleanup": "https://github.com/midagedev/bloomery/pull/367",
-    "upstream_compile_prerequisite": "https://github.com/midagedev/bloomery/pull/370"
+    "upstream_compile_prerequisite": "https://github.com/midagedev/bloomery/pull/370",
+    "merged_card_caller_compatibility": "https://github.com/midagedev/bloomery/pull/372"
   },
   "parent_dependency": {
     "pull_request": 339,
@@ -94,7 +95,33 @@
       "tool_self_tests_passed": 61,
       "owned_tests": 2717
     },
-    "strict_dependency_inclusive_clippy": "FAILED on four existing chunks_exact_to_as_chunks diagnostics in unchanged crates/gguf/src/quant.rs:1296,1351; no lint level relaxed"
+    "strict_dependency_inclusive_clippy": "FAILED on four existing chunks_exact_to_as_chunks diagnostics in unchanged crates/gguf/src/quant.rs:1296,1351; no lint level relaxed",
+    "post_merge_integration": {
+      "head": "09bd728f56a21a4fc708f3c638e2d3d8afc3ab1f",
+      "upstream_base": "e195c9e6af40372d56543c779f52222e3cf5955e",
+      "prerequisites": [
+        370,
+        372
+      ],
+      "format": "pass",
+      "workspace_all_targets_metadata": "pass",
+      "all_features_gpu_test_metadata": "pass, existing unused-item warnings; no device codegen",
+      "default_host_library_passed": 124,
+      "ignored": 3,
+      "recipe_suite_scope": "Full recipe run belongs to prior 3498be4, not re-attributed to this head."
+    },
+    "merged_card_caller": {
+      "head": "626be5fb686053de9e4bbcc262679c7d7351481f",
+      "fail_first_main": "actual CLI and shared-server metadata both exit101/E0308 on e195c9e",
+      "after": "format, all-feature production-target metadata, workspace/all-targets metadata and 138 placement tests pass",
+      "runtime_smoke": "actual private refusal/line/note owners preserve bounded shortage fields; overflowing reserves retain CardBytesPastU64 and card context; no GPU"
+    },
+    "native_cuda_toolchain_probe": {
+      "command": "cargo oxide doctor",
+      "exit": 101,
+      "diagnostic": "error: no such command: `oxide`",
+      "scope": "Native CUDA test/build tool unavailable in this environment; not replaced with plain cargo or a fake driver."
+    }
   },
   "additional_findings": [
     {
@@ -112,11 +139,17 @@
       "problem": "main split-prefill referee missing first-key argument",
       "source_fix_and_integrated_metadata": "pass",
       "nvidia_device_run": "not_run"
+    },
+    {
+      "pull_request": 372,
+      "problem": "Concurrent #339/#359 merges leave two dense Card reserve callers unmigrated",
+      "source_fix_metadata_and_actual_host_error_boundary": "pass",
+      "nvidia_execution": "not_run"
     }
   ],
   "external_prerequisites": [
-    "NVIDIA gate and actual CUDA regression FAIL-first/restored runs, device-consumer panic mutants, 27B native eager/graph/reference and serving acceptance: no local NVIDIA or configured GPU SSH host; default ws resolution failed",
-    "Upstream must merge the submitted PR370 prerequisite to clear its independent full-feature test compile error"
+    "NVIDIA native gate/actual CUDA regression FAIL-first/restored and device-consumer panic mutants, 27B native eager/graph/reference and serving acceptance remain unrun. Local native CUDA cargo-oxide is unavailable, no NVIDIA or configured GPU SSH host is present, and default ws resolution failed.",
+    "Upstream integration still needs the isolated compile prerequisites PR370 and PR372; combined source is verified and publicly retained."
   ],
   "historical_artifacts": "Older directories and host proofs retain their recorded source heads; only explicitly final-head artifacts above are attributed to current branches.",
   "no_claims": [
@@ -125,5 +158,63 @@
     "No 27B/NVIDIA accuracy acceptance",
     "No relaxed numeric band, count pin or lint level",
     "No upstream merge of these submitted fixes claimed"
-  ]
+  ],
+  "initial_integration_base": "cca9beaef0180caf5fed247ac53a74617a868007",
+  "upstream_main_observed": "e195c9e6af40372d56543c779f52222e3cf5955e",
+  "source_ref_scope": "These are retained working/verification branch heads, not substitutes for the merged PR heads recorded separately.",
+  "observed_submission_states": {
+    "p359": {
+      "state": "MERGED",
+      "mergedAt": "2026-10-16T20:22:19Z",
+      "mergeCommit": {
+        "oid": "3781737c6df9b721045c11a493ca6505cc2f1ec8"
+      },
+      "headRefOid": "5e3f139fdb7cfe2c18cd4453f85475a1c9034347"
+    },
+    "p252": {
+      "state": "MERGED",
+      "mergedAt": "2026-10-16T20:22:53Z",
+      "mergeCommit": {
+        "oid": "e195c9e6af40372d56543c779f52222e3cf5955e"
+      },
+      "headRefOid": "eaa04a5e1ce69347f3a78569c9c2052eb5d2e337"
+    },
+    "p361": {
+      "state": "MERGED",
+      "mergedAt": "2026-10-16T20:22:02Z",
+      "mergeCommit": {
+        "oid": "279c8261d5737ec9f5d2daacbd529fc4de74b7ce"
+      },
+      "headRefOid": "e67e6e8e67c5a02b89b9312063f785004ef18763"
+    },
+    "p364": {
+      "state": "MERGED",
+      "mergedAt": "2026-10-16T20:21:45Z",
+      "mergeCommit": {
+        "oid": "4a7c056a7d7d6acce9435931aa1d9c0b028ec5e7"
+      },
+      "headRefOid": "f11aaeea0fdd634d0e735f9cc9f684e70304e0f8"
+    },
+    "p367": {
+      "state": "MERGED",
+      "mergedAt": "2026-10-16T20:21:19Z",
+      "mergeCommit": {
+        "oid": "dd7ef9653e899c41235ed6fae4ff2d9e6fe62dfa"
+      },
+      "headRefOid": "a946fa667757e804e6802c0e1ee88149f222fe43"
+    },
+    "p254": {
+      "state": "OPEN",
+      "mergedAt": null,
+      "mergeCommit": null,
+      "headRefOid": "efdc55d36f7f65d426e2dab8f992a4f41e21fbb3",
+      "isDraft": false
+    },
+    "p370": {
+      "state": "OPEN",
+      "mergedAt": null,
+      "mergeCommit": null,
+      "headRefOid": "5c84771d79fdf5219618fb42e32cc00347f4ff72"
+    }
+  }
 }

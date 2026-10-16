@@ -1,0 +1,7 @@
+{
+  "source_head": "e195c9e6af40372d56543c779f52222e3cf5955e",
+  "command": "cargo check -p bloomery-gpu-gates --all-features --bin generate_qwen3moe --bin bloomery-serve",
+  "exit": 101,
+  "scope": "Observed compiler diagnostic excerpt from the fresh isolated actual production-target check",
+  "diagnostic": "error[E0308]: mismatched types\n  --> crates/gpu-gates/src/bin/shared/qwen3moe_place.rs:660:27\nreserves: n.card.reserve_bytes(),\nexpected u64, found Option<u64>\nThe same E0308 occurs through shared/serve_seats/../qwen3moe_place.rs:660:27."
+}
