@@ -12,46 +12,25 @@ correctness gate.
 
 ## Dependency and review boundary
 
-This diagnostics draft is not an independent dense-generation attach. Its parent
-is [PR #339](https://github.com/midagedev/bloomery/pull/339), the successor of
-#251, from `juliankang4/bloomery:contribution/dense-qwen-pr-20261015`. The reviewed
-source is `ab68f0088c12996ec53fcf34349a872d926473d6`; that parent is not in upstream
-main at `6d4113c1f96942227cd77e22b83c4b35b5be237b`.
-
-The local `support/qwen35-339-review-fix` branch adds focused commit
-`f9102a2` and single-owner gate registration `492218d` to the exact reviewed
-parent for its author's cherry-pick. It preserves
-the typed dense whole-load shortage requested by
-[review 5550636450](https://github.com/midagedev/bloomery/pull/339#pullrequestreview-5550636450):
-the existing default-context chooser can halve to a fitting rung rather than
-exiting on a string refusal. The regression exercises that context consumer,
-checked/unchecked arena accounting, exact-fit and one-byte-short budgets, and
-fatal non-memory refusals; it does not open a card.
-
-`support/qwen35-339-current` (`3845e27`)
-rebases the parent and that fix onto the main pin above, preserving original
-authors, Nemotron dispatch, embedding side-seat reserves and current gate
-selectors. `contribution/dense-validation-current` then carries only the original
-diagnostics commits `cef6606`, `be1393a`, `a67b74a` plus their current compatibility
-and dependency-documentation updates. The diagnostics-only review range is:
+The dense-generation parent [PR #339](https://github.com/midagedev/bloomery/pull/339)
+is merged at `71713898d3f94527b87af2e96aff0afe4ed1f43e`. This follow-up is based on
+upstream main `cca9beaef0180caf5fed247ac53a74617a868007`; it contains only the
+original diagnostics commits and their compatibility/documentation updates.
+It does not carry a duplicate frontend or a local replacement for the parent.
 
 ```sh
-git diff support/qwen35-339-current...contribution/dense-validation-current
-git log support/qwen35-339-current..contribution/dense-validation-current
+git diff cca9beaef0180caf5fed247ac53a74617a868007...HEAD
+git log cca9beaef0180caf5fed247ac53a74617a868007..HEAD
 ```
 
-These are local support refs, not published replacements for another author's
-branch. GitHub cannot set an upstream pull request's base to a branch in another
-fork. Keep #254 draft until the corrected #339 lands and rebase only its
-diagnostics onto that merged main, or have a maintainer establish an upstream
-integration branch as the explicit dependency base. Comparing #254 to main
-before that cutover includes the unmerged parent; do not describe that range as
-a diagnostics-only feature or submit a duplicate of #339.
+The merged parent's typed dense shortage remains its context chooser's owner.
+Host and CPU-reference diagnostics do not establish NVIDIA/27B acceptance; the
+native eager/graph, reference and serving runs below remain the device lane.
 
 ## Host, static and reference smoke handoff
 
-The refresh itself runs no checks. Run these on the final integrated source and
-record its exact head; earlier heads' results do not establish this rebase:
+Run these on the exact source head being reviewed and record that identity;
+earlier heads' results do not establish a later rebase:
 
 ```sh
 RUSTFLAGS='-C target-cpu=native' cargo test --locked -p bloomery-gpu-gates --lib
@@ -70,7 +49,7 @@ cargo check --locked -p bloomery-gpu-gates \
   --features glm5next,clef,vision,mimo2,gemma-embedding2 \
   --bin generate_qwen3moe --bin bloomery-serve
 cargo oxide test --arch sm_86 -- -p bloomery-gpu-gates --features gpu \
-  --bin generate_qwen3moe dense_default_context_halves_only_for_a_short_whole_load
+  --bin generate_qwen3moe dense_shortage_halves_the_default_context
 ```
 
 After building the reference below, this writer/input smoke uses existing
