@@ -12,6 +12,8 @@
 //! `None` past u64 bytes, as the complete floor does. Planning refuses those
 //! sums with a named [`placement::PlacementError::CardBytesPastU64`]; a
 //! whole-load floor cannot turn overflow into a fitting `u64::MAX` sentinel.
+//! Shared-pool card totals are checked before host accounting; separate
+//! device memories do not accumulate an irrelevant combined card total.
 //!
 //! What does not live here, because the Mac cannot run it: the host tier's
 //! page locks and residency walks (`bloomery-model`'s
