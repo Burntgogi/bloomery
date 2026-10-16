@@ -59,7 +59,7 @@ owning thread, and synchronization precedes destruction.
 ## Original selected Q4_K port
 
 The arithmetic baseline is Bloomery `9fc2cc0d67f9a5b1d71e10663ba43873431c25e5`;
-the whole-file drift pin is reviewed against main `6d4113c1`.
+the whole-file drift pin is reviewed against main `cca9bea`.
 `crates/gpu/src/q4k_sel.rs::q4k_gemv_sel` owns selection and launch geometry;
 `crates/gpu/src/cores.rs::q4k_row_dot_1col` owns the arithmetic. `device/build.rs`
 extracts nine original core function bodies verbatim, retaining the two-iteration
