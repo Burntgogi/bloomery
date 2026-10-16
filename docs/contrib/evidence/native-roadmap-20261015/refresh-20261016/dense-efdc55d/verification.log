@@ -1,0 +1,294 @@
+   Compiling proc-macro2 v1.0.107
+   Compiling unicode-ident v1.0.26
+   Compiling quote v1.0.47
+    Checking cfg-if v1.0.5
+   Compiling thiserror v2.0.21
+   Compiling libc v0.2.190
+   Compiling version_check v0.9.5
+    Checking typenum v1.20.1
+    Checking cpufeatures v0.2.17
+   Compiling serde_core v1.0.229
+   Compiling crc32fast v1.5.2
+    Checking memchr v2.8.3
+    Checking hashbrown v0.17.1
+    Checking equivalent v1.0.2
+   Compiling glob v0.3.4
+   Compiling rustix v0.38.44
+   Compiling prettyplease v0.2.37
+   Compiling zmij v1.0.23
+    Checking simd-adler32 v0.3.10
+   Compiling regex-syntax v0.8.11
+   Compiling generic-array v0.14.7
+   Compiling bitflags v2.13.2
+   Compiling either v1.19.0
+   Compiling linux-raw-sys v0.4.15
+   Compiling minimal-lexical v0.2.1
+   Compiling clang-sys v1.9.1
+   Compiling libloading v0.8.9
+   Compiling bindgen v0.69.5
+    Checking adler2 v2.0.1
+   Compiling home v0.5.12
+   Compiling serde_json v1.0.151
+   Compiling itertools v0.12.1
+   Compiling nom v7.1.3
+   Compiling log v0.4.34
+    Checking itoa v1.0.18
+   Compiling lazy_static v1.5.1
+   Compiling shlex v1.3.0
+    Checking indexmap v2.14.2
+   Compiling rustc-hash v1.1.0
+   Compiling lazycell v1.3.0
+    Checking miniz_oxide v0.9.1
+    Checking foldhash v0.1.5
+    Checking bloomery-levers v0.1.0 (/tmp/bloomery-dense-254/crates/levers)
+   Compiling object v0.36.7
+   Compiling zerocopy v0.8.61
+    Checking miniz_oxide v0.8.9
+    Checking hashbrown v0.15.5
+   Compiling syn v3.0.6
+   Compiling syn v2.0.119
+    Checking fdeflate v0.3.7
+    Checking flate2 v1.1.10
+   Compiling anyhow v1.0.104
+    Checking zune-core v0.5.1
+    Checking memmap2 v0.9.11
+   Compiling serde v1.0.229
+    Checking bloomery-threads v0.1.0 (/tmp/bloomery-dense-254/crates/threads)
+    Checking cuda-target-spec v0.1.0 (https://github.com/midagedev/cuda-oxide.git?rev=87bc951864b79f723b4da9c11fa229f5600aefcb#87bc9518)
+    Checking block-buffer v0.10.4
+    Checking crypto-common v0.1.7
+    Checking zune-jpeg v0.5.15
+   Compiling reserved-oxide-symbols v0.2.1 (https://github.com/midagedev/cuda-oxide.git?rev=87bc951864b79f723b4da9c11fa229f5600aefcb#87bc9518)
+   Compiling cuda-core v0.4.0 (https://github.com/midagedev/cuda-oxide.git?rev=87bc951864b79f723b4da9c11fa229f5600aefcb#87bc9518)
+    Checking digest v0.10.7
+    Checking png v0.18.1
+    Checking ptx-parse v0.1.0 (https://github.com/midagedev/cuda-oxide.git?rev=87bc951864b79f723b4da9c11fa229f5600aefcb#87bc9518)
+    Checking bloomery-verbs v0.1.0 (/tmp/bloomery-dense-254/crates/verbs)
+   Compiling regex-automata v0.4.18
+    Checking sha2 v0.10.9
+    Checking sha1 v0.10.7
+   Compiling autocfg v1.5.1
+    Checking rawpointer v0.2.1
+   Compiling bloomery-serve v0.3.3 (/tmp/bloomery-dense-254/crates/serve)
+    Checking bloomery-sampler v0.1.0 (/tmp/bloomery-dense-254/crates/sampler)
+   Compiling matrixmultiply v0.3.11
+   Compiling which v4.4.2
+   Compiling cexpr v0.6.0
+   Compiling thiserror-impl v2.0.21
+   Compiling serde_derive v1.0.229
+   Compiling regex v1.13.1
+    Checking bloomery-gguf v0.1.0 (/tmp/bloomery-dense-254/crates/gguf)
+    Checking libnvvm-sys v0.2.1 (https://github.com/midagedev/cuda-oxide.git?rev=87bc951864b79f723b4da9c11fa229f5600aefcb#87bc9518)
+    Checking nvjitlink-sys v0.2.1 (https://github.com/midagedev/cuda-oxide.git?rev=87bc951864b79f723b4da9c11fa229f5600aefcb#87bc9518)
+    Checking bloomery-jinja v0.1.0 (/tmp/bloomery-dense-254/crates/jinja)
+    Checking bloomery-models v0.1.0 (/tmp/bloomery-dense-254/crates/models)
+    Checking bloomery-tokenizer v0.1.0 (/tmp/bloomery-dense-254/crates/tokenizer)
+    Checking bloomery-vision v0.1.0 (/tmp/bloomery-dense-254/crates/vision)
+    Checking bloomery-qdot v0.1.0 (/tmp/bloomery-dense-254/crates/qdot)
+    Checking bloomery-engram v0.1.0 (/tmp/bloomery-dense-254/crates/engram)
+    Checking bloomery-refset v0.1.0 (/tmp/bloomery-dense-254/crates/refset)
+    Checking bloomery-runtime v0.1.0 (/tmp/bloomery-dense-254/crates/runtime)
+    Checking bloomery-placement v0.1.0 (/tmp/bloomery-dense-254/crates/placement)
+    Checking oxide-artifacts v0.2.1
+    Checking cuda-artifact-finalizer v0.2.1 (https://github.com/midagedev/cuda-oxide.git?rev=87bc951864b79f723b4da9c11fa229f5600aefcb#87bc9518)
+    Checking bloomery-hf v0.1.0 (/tmp/bloomery-dense-254/crates/hf)
+    Checking bloomery-model v0.1.0 (/tmp/bloomery-dense-254/crates/model)
+    Checking bloomery-decision v0.1.0 (/tmp/bloomery-dense-254/crates/decision)
+   Compiling zerocopy-derive v0.8.61
+   Compiling cuda-core-derive v0.4.0 (https://github.com/midagedev/cuda-oxide.git?rev=87bc951864b79f723b4da9c11fa229f5600aefcb#87bc9518)
+   Compiling cuda-macros v0.2.1 (https://github.com/midagedev/cuda-oxide.git?rev=87bc951864b79f723b4da9c11fa229f5600aefcb#87bc9518)
+    Checking cuda-device v0.2.1 (https://github.com/midagedev/cuda-oxide.git?rev=87bc951864b79f723b4da9c11fa229f5600aefcb#87bc9518)
+   Compiling cuda-bindings v0.4.0 (https://github.com/midagedev/cuda-oxide.git?rev=87bc951864b79f723b4da9c11fa229f5600aefcb#87bc9518)
+    Checking half v2.7.1
+    Checking cuda-host v0.2.1 (https://github.com/midagedev/cuda-oxide.git?rev=87bc951864b79f723b4da9c11fa229f5600aefcb#87bc9518)
+    Checking bloomery-gpu v0.1.0 (/tmp/bloomery-dense-254/crates/gpu)
+    Checking bloomery-gpu-deepseek41 v0.1.0 (/tmp/bloomery-dense-254/crates/gpu-deepseek41)
+    Checking bloomery-gpu-vision v0.1.0 (/tmp/bloomery-dense-254/crates/gpu-vision)
+    Checking bloomery-gpu-gemma-embedding2 v0.1.0 (/tmp/bloomery-dense-254/crates/gpu-gemma-embedding2)
+    Checking bloomery-gpu-mimo2 v0.1.0 (/tmp/bloomery-dense-254/crates/gpu-mimo2)
+    Checking bloomery-gpu-glm5next v0.1.0 (/tmp/bloomery-dense-254/crates/gpu-glm5next)
+    Checking bloomery-app v0.1.0 (/tmp/bloomery-dense-254/crates/app)
+    Checking bloomery-gpu-gates v0.3.3 (/tmp/bloomery-dense-254/crates/gpu-gates)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 37.15s
+   Compiling proc-macro2 v1.0.107
+   Compiling typenum v1.20.1
+   Compiling cfg-if v1.0.5
+   Compiling cpufeatures v0.2.17
+   Compiling memchr v2.8.3
+   Compiling serde_core v1.0.229
+   Compiling bloomery-levers v0.1.0 (/tmp/bloomery-dense-254/crates/levers)
+   Compiling serde_json v1.0.151
+   Compiling crc32fast v1.5.2
+   Compiling hashbrown v0.17.1
+   Compiling foldhash v0.1.5
+   Compiling libc v0.2.190
+   Compiling zmij v1.0.23
+   Compiling itoa v1.0.18
+   Compiling equivalent v1.0.2
+   Compiling hashbrown v0.15.5
+   Compiling indexmap v2.14.2
+   Compiling quote v1.0.47
+   Compiling memmap2 v0.9.11
+   Compiling bloomery-threads v0.1.0 (/tmp/bloomery-dense-254/crates/threads)
+   Compiling syn v3.0.6
+   Compiling generic-array v0.14.7
+   Compiling object v0.36.7
+   Compiling block-buffer v0.10.4
+   Compiling crypto-common v0.1.7
+   Compiling digest v0.10.7
+   Compiling sha2 v0.10.9
+   Compiling sha1 v0.10.7
+   Compiling thiserror-impl v2.0.21
+   Compiling thiserror v2.0.21
+   Compiling bloomery-gguf v0.1.0 (/tmp/bloomery-dense-254/crates/gguf)
+   Compiling bloomery-models v0.1.0 (/tmp/bloomery-dense-254/crates/models)
+   Compiling bloomery-qdot v0.1.0 (/tmp/bloomery-dense-254/crates/qdot)
+   Compiling bloomery-tokenizer v0.1.0 (/tmp/bloomery-dense-254/crates/tokenizer)
+   Compiling bloomery-engram v0.1.0 (/tmp/bloomery-dense-254/crates/engram)
+   Compiling bloomery-refset v0.1.0 (/tmp/bloomery-dense-254/crates/refset)
+   Compiling bloomery-runtime v0.1.0 (/tmp/bloomery-dense-254/crates/runtime)
+   Compiling bloomery-placement v0.1.0 (/tmp/bloomery-dense-254/crates/placement)
+   Compiling bloomery-hf v0.1.0 (/tmp/bloomery-dense-254/crates/hf)
+   Compiling oxide-artifacts v0.2.1
+   Compiling bloomery-model v0.1.0 (/tmp/bloomery-dense-254/crates/model)
+   Compiling bloomery-gpu-gates v0.3.3 (/tmp/bloomery-dense-254/crates/gpu-gates)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 21.40s
+     Running unittests src/lib.rs (/tmp/bloomery-target-dense-efdc55d/debug/build/bloomery-gpu-gates/cc71489d8fe54f8f/out/bloomery_gpu_gates-cc71489d8fe54f8f)
+
+running 127 tests
+test act_rule::site_tests::q8_rel_is_the_32_value_model_scaled_by_the_root_of_the_block ... ok
+test act_rule::ffnmoe_tests::q8_2_sums_are_the_codes ... ok
+test act_rule::site_tests::site_rel_agrees_with_the_k_quant_rule_where_both_speak ... ok
+test act_rule::site_tests::site_rel_is_the_table ... ok
+test act_rule::ffnmoe_tests::dots_are_the_dequantized_dots ... ok
+test act_rule::tests::dot_q3k_is_the_dequantized_dot ... ok
+test beside::tests::the_embedding_model_is_a_second_reserve ... ok
+test ctx_ladder::tests::a_dropped_rung_names_the_reserve ... ok
+test ctx_ladder::tests::the_ladder_ends_on_the_floor ... ok
+test ctx_ladder::tests::a_line_holds_its_word ... ok
+test act_rule::site_tests::site_rel_reads_the_forms_the_launches_name ... ok
+test flash_band::tests::prefill_bound_counts_tiles_from_first_key ... ok
+test beside::tests::the_probe_and_the_placed_plan_see_the_same_reserve ... ok
+test flip::tests::a_flip_is_allowed_only_under_the_cap ... ok
+test flip::tests::a_head_tie_needs_a_finite_row_and_band ... ok
+test flip::tests::a_tie_is_bounded_by_the_head_input ... ok
+test gpu_census::tests::the_listing_reads_its_rows ... ok
+test gpu_census::tests::the_uuid_is_nvidia_smis ... ok
+test gpu_census::tests::a_listed_compute_app_names_its_card_holder ... ok
+test act_rule::tests::q3k_scales_match_dequant ... ok
+test image_plan::tests::the_table_term_is_a_row_of_f32_a_position ... ok
+test kld::tests::hw_ds41_kld_base_matches_its_run ... ignored, hw: needs the ik base files in $BLOOMERY_DATA/ikppl and the V4.1 model file on the box
+test oracle::deepseek41::tests::hw_ds41_oracle_reads_every_row ... ignored, hw: needs the V4.1 oracle set in $BLOOMERY_DATA on the box
+test oracle::deepseek41::tests::hw_ds41_oracle_step_sets_share_the_batch_build ... ignored, hw: needs the V4.1 oracle sets in $BLOOMERY_DATA on the box
+test oracle::tests::a_rows_sets_are_its_familys ... ok
+test act_rule::tests::q8_codes_refuse_a_non_finite_value ... ok
+test prompts::tests::compare_forced_counts_every_position_not_only_the_first ... ok
+test prompts::tests::compare_forced_spans_the_shorter_of_the_two_lengths ... ok
+test prompts::tests::compare_greedy_classifies_the_first_difference_only ... ok
+test ik_q8_2::tests::partial_blocks_stop_by_name ... ok
+test prompts::tests::sigma_forced_signs_toward_the_truth_and_counts_only_clear_positions ... ok
+test prompts::tests::compare_forced_exact_judges_against_the_truth_not_the_reference ... ok
+test prompts::tests::std_normal_cdf_matches_the_table ... ok
+test ptx::tests::a_bundle_whose_ptx_a_cubin_shadows_is_refused ... ok
+test logit_rows::tests::forced_rows_keep_bits_and_token_alignment_without_argmax_picking ... ok
+test flip::tests::a_head_tie_is_held_within_the_band_and_fails_past_it ... ok
+test ptx::tests::a_rejected_container_is_an_error_not_an_empty_scan ... ok
+test ptx::tests::a_reference_moved_onto_a_declaration_of_another_size_moves_the_digest ... ok
+test ptx::tests::a_changed_declaration_size_moves_the_digest ... ok
+test flip::tests::head_margin_matches_fixtures_and_names_invalid_rows ... ok
+test prompts::tests::compare_greedy_judges_a_short_eos_row_over_its_own_length ... ok
+test ptx::tests::a_symbol_that_is_not_generated_is_kept_by_name ... ok
+test kld::tests::a_base_file_reads_back_and_a_bad_one_is_refused ... ok
+test ptx::tests::counts_the_shapes_of_one_entry ... ok
+test ptx::tests::a_hashed_generated_name_normalizes_like_the_plain_one ... ok
+test prompts::tests::read_greedy_takes_only_the_gen_format ... ok
+test ptx::tests::body_stops_at_a_device_function ... ok
+test ptx::tests::an_undeclared_or_unreadable_generated_symbol_is_a_named_error ... ok
+test logit_rows::tests::refused_or_incomplete_rows_never_complete_a_dump ... ok
+test ptx::tests::counts_the_calls_an_entry_makes ... ok
+test ptx::tests::last_body_ends_where_its_payload_ends ... ok
+test ptx::tests::normalize_rewrites_whole_tokens_only ... ok
+test ptx::tests::find_and_count_survive_degenerate_needles ... ok
+test ptx::tests::each_bundle_is_its_own_module ... ok
+test ptx::tests::lists_every_entry_in_declaration_order ... ok
+test ptx::tests::reads_the_block_width_and_its_absence ... ok
+test ptx::tests::body_stops_at_the_next_entry ... ok
+test q36_fixture::tests::a_layer_no_rule_covers_and_a_slot_count_on_an_apart_layer_are_refused_by_name ... ok
+test q36_fixture::tests::a_header_read_gives_the_layers_and_an_apart_rule_over_all_three_parts ... ok
+test ptx::tests::scan_puts_the_spilling_entries_first ... ok
+test q38_fixture::tests::a_header_without_layers_or_interval_is_refused_and_no_site_adds_no_launches ... ok
+test kld::tests::two_files_compare_to_a_known_kld ... ok
+test q36_fixture::tests::the_headers_give_the_real_files_literals_and_the_fixtures_counts ... ok
+test ptx::tests::two_modules_that_differ_only_by_renumbering_give_equal_entry_digests ... ok
+test q38_fixture::tests::the_header_gives_the_real_files_literals_and_the_fixtures_counts ... ok
+test qwen_seat::tests::dense_generation_keeps_decision_layouts_out ... ok
+test ptx::tests::two_references_merged_into_one_symbol_move_the_digest ... ok
+test qwen_seat::tests::head_shape_selects_the_existing_flash ... ok
+test ptx::tests::normalize_sees_every_other_change ... ok
+test record::tests::a_group_required_after_registration_and_missing_panics - should panic ... ok
+test record::tests::a_group_required_before_registration_is_checked_at_registration - should panic ... ok
+test oracle::tests::a_set_of_another_architecture_is_refused ... ok
+test flip::tests::the_lifted_caps_are_the_copies ... ok
+test record::tests::a_group_the_list_holds_passes_and_an_unregistered_process_never_reads_the_wait ... ok
+test record::tests::a_line_that_opens_a_record_and_does_not_read_whole_is_refused ... ok
+test record::tests::an_off_path_save_reads_by_field ... ok
+test record::tests::card_free_is_held_to_the_stage_devices_usable_bytes ... ok
+test record::tests::every_binary_registers_the_groups_its_entries_require ... ok
+test ptx::tests::normalize_ignores_renumbering ... ok
+test record::tests::missing_names_the_kinds_a_list_lacks ... ok
+test record::tests::nvtier_ends_with_the_union_counters ... ok
+test prompts::tests::read_exact_takes_contiguous_steps_and_checks_coverage ... ok
+test record::tests::one_names_an_absent_kind_and_the_log ... ok
+test record::tests::a_plan38_names_the_host_room_it_was_made_at ... ok
+test record::tests::refuses_a_line_with_a_part_missing - should panic ... ok
+test record::tests::refuses_a_value_out_of_order - should panic ... ok
+test record::tests::optional_parts_left_out_read_as_absent ... ok
+test record::tests::renders_the_known_text ... ok
+test record::tests::field_reads_refuse_by_name ... ok
+test record::tests::host_only_records_name_causes_and_skip_an_all_host_choice ... ok
+test record::tests::refuses_a_kind_its_binary_does_not_print - should panic ... ok
+test record::tests::the_seats_that_take_images_register_the_vision_record ... ok
+test record::tests::kinds_are_well_formed ... ok
+test model_file::tests::decision_header_distinguishes_absent_string_and_malformed_markers ... ok
+test record::tests::server_spawn_refuses_a_missing_wall - should panic ... ok
+test record::tests::server_spawn_names_the_binary_the_process_and_the_wall ... ok
+test record::tests::tier_cost_parser_fixture_is_current ... ok
+test rounding::tests::the_q8_32_error_model ... ok
+test tests::kquant_d_at_is_the_scale_every_value_reads ... ok
+test tests::max_rel_err_rejects_nan_output ... ok
+test tests::the_corpus_reader_takes_n_ids_and_refuses_the_rest ... ok
+test tier::tests::a_clause_call_prints_counts_and_answers ... ok
+test tier::tests::a_clauses_fate_in_each_tier ... ok
+test tier::tests::an_untagged_clause_in_the_fixture_tier_is_a_named_error ... ok
+test tier::tests::each_tier_runs_its_tags ... ok
+test tier::tests::eight_tags_in_the_docs_order ... ok
+test tier::tests::the_deferred_line_is_what_the_batch_counts ... ok
+test tier::tests::the_fixture_tier_acts_on_the_card_budget ... ok
+test tier::tests::a_clause_names_the_family_and_the_fixture_it_needs ... ok
+test tier::tests::the_host_clause_is_left_only_on_a_fixture_with_too_few_host_layers ... ok
+test tier::tests::the_layout_clause_is_left_only_on_a_fixture_with_no_layer_of_its_layout ... ok
+test tier::tests::the_budget_is_the_levers_in_the_real_tier_and_the_headers_plus_the_draft_in_the_fixture ... ok
+test tier::tests::the_real_tier_holds_its_fixture_only_clauses_to_the_declared_count ... ok
+test tier::tests::a_fixture_set_opens_or_fails_by_name ... ok
+test tier::tests::the_fixture_tier_holds_its_fixture_oracle_runs_to_the_declared_count ... ok
+test tier::tests::the_variable_names_a_tier_or_is_refused ... ok
+test record::tests::shared_heads_read_by_the_whole_line ... ok
+test record::tests::the_seats_that_fetch_the_hf_projector_register_its_lines ... ok
+test tier::tests::the_card_clause_is_left_only_on_a_variant_with_no_card_layer ... ok
+test tier::tests::each_decision_prints_its_line ... ok
+test tier::tests::the_tally_counts_and_prints_three_kinds ... ok
+test tier::tests::the_fixture_tier_opens_only_a_whole_fixture ... ok
+test record::tests::checked_in_schemas_are_current ... ok
+test tier::tests::the_generator_writes_the_keys_this_module_reads ... ok
+test hc_host::tests::hc_pre_f32_digest ... ok
+test hc_host::tests::hc_chain_q8_0_digest ... ok
+test record::tests::reads_every_kind_whole ... ok
+
+test result: ok. 124 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+dense-logits self-test: malformed ids, provenance, incomplete/truncated/NaN rows, eager/graph and owned-session cleanup contracts passed
+dense-serve self-test: strict tokens, HTTP errors/truncation/EOG, reset counts, loopback and resident metrics contracts passed
+check-recipes: tools/gate-paths.tsv: 133 gate rows held to the derivation, 29 rows with exceptions naming 627 gates
+
+
+Wall time: 102.68 seconds

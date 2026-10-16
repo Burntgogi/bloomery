@@ -1,0 +1,17 @@
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+   Compiling bloomery-levers v0.1.0 (/tmp/bloomery-hip-252/crates/levers)
+   Compiling bloomery-threads v0.1.0 (/tmp/bloomery-hip-252/crates/threads)
+   Compiling bloomery-qdot v0.1.0 (/tmp/bloomery-hip-252/crates/qdot)
+   Compiling bloomery-hip-spike v0.1.0 (/tmp/bloomery-hip-252/labs/hip-native/host)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 7.62s
+     Running unittests src/main.rs (target/x86_64-unknown-linux-gnu/debug/build/bloomery-hip-spike/dd441e1ea0ef359a/out/bloomery_hip_spike-dd441e1ea0ef359a)
+
+running 2 tests
+test tests::refuses_invalid_shapes_and_truncated_weights ... ok
+test selected::tests::selected_shape_refusals_precede_the_driver ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

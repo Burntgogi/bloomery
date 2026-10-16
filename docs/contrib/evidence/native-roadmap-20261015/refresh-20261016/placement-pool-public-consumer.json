@@ -1,0 +1,7 @@
+{
+  "head": "5e3f139",
+  "scope": "Separate actual public-API release executable, no GPU/model",
+  "exit_code": 0,
+  "stdout": "separate card memories: accepted without summing their independent reserves\nshared pool: named refusal: card card1: required card or shared-pool bytes pass u64 bytes\n",
+  "stderr": "     Locking 21 packages to highest Rust 1.100.0-nightly compatible versions\n   Compiling version_check v0.9.5\n   Compiling proc-macro2 v1.0.107\n   Compiling unicode-ident v1.0.27\n   Compiling quote v1.0.47\n   Compiling typenum v1.20.1\n   Compiling libc v0.2.190\n   Compiling thiserror v2.0.21\n   Compiling cpufeatures v0.2.17\n   Compiling cfg-if v1.0.5\n   Compiling bloomery-levers v0.1.0 (/tmp/bloomery-card-reserve-349/crates/levers)\n   Compiling generic-array v0.14.7\n   Compiling syn v3.0.9\n   Compiling memmap2 v0.9.11\n   Compiling crypto-common v0.1.7\n   Compiling block-buffer v0.10.4\n   Compiling digest v0.10.7\n   Compiling sha2 v0.10.9\n   Compiling thiserror-impl v2.0.21\n   Compiling bloomery-gguf v0.1.0 (/tmp/bloomery-card-reserve-349/crates/gguf)\n   Compiling bloomery-models v0.1.0 (/tmp/bloomery-card-reserve-349/crates/models)\n   Compiling bloomery-placement v0.1.0 (/tmp/bloomery-card-reserve-349/crates/placement)\n   Compiling pool-budget-smoke v0.0.0 (/tmp/bloomery-pool-smoke)\n    Finished `release` profile [optimized] target(s) in 6.81s\n     Running `bloomery-pool-smoke/target/release/pool-budget-smoke`\n"
+}

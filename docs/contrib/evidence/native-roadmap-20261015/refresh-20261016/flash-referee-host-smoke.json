@@ -1,0 +1,8 @@
+{
+  "source_head": "5c84771d79fdf5219618fb42e32cc00347f4ff72",
+  "scope": "actual source referee and HostCache, default host-library callees, no GPU or device implementation",
+  "command": "source /home/jutai05/bloomery-contributions/tooling/env.sh && export RUSTFLAGS=\"-C target-cpu=native\" CARGO_TARGET_DIR=/tmp/bloomery-target-flash-host-smoke && cargo run --release --manifest-path /tmp/bloomery-flash-host-smoke/Cargo.toml",
+  "exit": 0,
+  "stdout": "full-cache first=0, counts=[64, 65, 66]: within-band rows accepted (measured/bound=0.00000000045849671126133535); NaN rejected with infinite measured/bound\n",
+  "stderr": "   Compiling flash-origin-smoke v0.0.0 (/tmp/bloomery-flash-host-smoke)\n    Finished `release` profile [optimized] target(s) in 0.35s\n     Running `/tmp/bloomery-target-flash-host-smoke/release/flash-origin-smoke`\n"
+}

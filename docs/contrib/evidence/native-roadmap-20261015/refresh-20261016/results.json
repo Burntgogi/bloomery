@@ -1,14 +1,14 @@
 {
+  "main_base": "cca9beaef0180caf5fed247ac53a74617a868007",
   "source_refs": {
-    "fix/card-reserve-overflow": "43fd95032e083841a06d1a354c10bd97e5bf5c65",
+    "fix/card-reserve-overflow": "62ea287641c702b2ffd2147b79e8f6bf53254b0f",
     "fix/timing-source-inspection": "e67e6e8e67c5a02b89b9312063f785004ef18763",
     "fix/gemm-reference-panic": "f11aaeea0fdd634d0e735f9cc9f684e70304e0f8",
-    "contribution/hip-selected-current": "b3774b837893e70a2e4b9b7c32b8b9a14fe880e6",
-    "contribution/dense-validation-current": "affc216e2bb4f4610dbafb35194ada7cd466f76e",
-    "support/qwen35-339-review-fix": "492218d54b0b1cb06b049078d9c3accc6aaf4089",
-    "support/qwen35-339-current": "3845e272d9b3bc816bbdccc67b8989dfb6380c91",
-    "support/gemm346-on344": "7eaf697035aa23ec8b8ed9740de63c5a2ff342f9",
-    "integration/source-correctness-20261016": "db5cdccb3ea06d6488e9a32a772c7f26d838add9"
+    "contribution/hip-q4-selected-20261015": "3395e11d3c8e5f8a90dde16b1459883f54b953d5",
+    "contribution/qwen35-dense-validation-20261015": "efdc55d36f7f65d426e2dab8f992a4f41e21fbb3",
+    "fix/card-tests-outcomes": "a946fa667757e804e6802c0e1ee88149f222fe43",
+    "fix/flash-split-first-key": "5c84771d79fdf5219618fb42e32cc00347f4ff72",
+    "integration/source-correctness-current": "3498be4b562669e507c904111dd45d1ee9900e84"
   },
   "skill": {
     "installed": "/home/jutai05/.omp/agent/skills/be-ambitious",
@@ -21,65 +21,109 @@
     "346": "https://github.com/midagedev/bloomery/pull/364",
     "252": "https://github.com/midagedev/bloomery/pull/252",
     "254": "https://github.com/midagedev/bloomery/pull/254",
-    "parent_support": "https://github.com/juliankang4/bloomery/pull/1",
-    "incidental_wording_cleanup": "https://github.com/midagedev/bloomery/pull/367"
+    "incidental_wording_cleanup": "https://github.com/midagedev/bloomery/pull/367",
+    "upstream_compile_prerequisite": "https://github.com/midagedev/bloomery/pull/370"
+  },
+  "parent_dependency": {
+    "pull_request": 339,
+    "state": "MERGED",
+    "merge_commit": "71713898d3f94527b87af2e96aff0afe4ed1f43e",
+    "followup": "Original diagnostic commits replayed onto merged main, without copied parent correction or duplicate regression",
+    "obsolete_fork_support_pr": "https://github.com/juliankang4/bloomery/pull/1 (closed as obsolete)"
   },
   "verification": {
-    "placement_debug": {
-      "passed": 137
-    },
-    "placement_release_regressions": {
-      "passed": 2
+    "placement": {
+      "head": "62ea287641c702b2ffd2147b79e8f6bf53254b0f",
+      "debug_passed": 138,
+      "release_card_sums_passed": 3,
+      "strict_owner_clippy": "--all-targets --no-deps -- -D warnings passed",
+      "real_public_consumer": "separate card memories accepted; overflowing shared pool named refusal",
+      "fail_first": "debug overflow panic / release named-refusal assertion failure, both exit101; retained committed regression is pooled_card_sums_are_checked_only_for_shared_memory"
     },
     "source_inspection": {
-      "passed": 45,
-      "baseline_negative_control": "corrupt index returned 0 and dirty_files=0 instead of required exit 2"
+      "head": "e67e6e8e67c5a02b89b9312063f785004ef18763",
+      "actual_dry_runner_cases_passed": 45,
+      "baseline_negative_control": "corrupt index returned 0 and dirty_files=0 instead of required exit2"
+    },
+    "gemm_reference": {
+      "head": "f11aaeea0fdd634d0e735f9cc9f684e70304e0f8",
+      "host_executable_clean_partial_all_exits": [
+        0,
+        1,
+        1
+      ],
+      "generic_nvfp4_host_clean_partial_all_exits": [
+        0,
+        1,
+        1
+      ],
+      "generic_nvfp4_integration_head": "7eaf697035aa23ec8b8ed9740de63c5a2ff342f9",
+      "device_and_actual_committed_cuda_test_mutants": "not_run; applicable consumer patches and ignored-worker test patch retained"
     },
     "hip": {
-      "head": "b3774b837893e70a2e4b9b7c32b8b9a14fe880e6",
+      "head": "3395e11d3c8e5f8a90dde16b1459883f54b953d5",
+      "tree": "6df2410d1a35442f17fd0c3207e7187dc520cf72",
       "checks_passed": 7,
       "gpu_cases_passed": 18,
-      "device": "AMD Radeon RX 7900 GRE/gfx1100"
+      "device": "AMD Radeon RX7900GRE/gfx1100",
+      "host_negative_control": "7c2905b: six preceding checks pass; GPU exits1 because HOST raises an unexpected expert-id fault",
+      "restored_control": "eaa04a5: all seven checks and eighteen GPU cases pass"
     },
-    "dense_final_head": {
-      "head": "affc216e2bb4f4610dbafb35194ada7cd466f76e",
-      "library_tests_passed": 123,
-      "library_tests_ignored": 3,
-      "cpu_reference_schedules": [
-        "step",
-        "batch"
-      ],
-      "rows_each": 3,
-      "numerical_acceptance": "diagnostic_only_no_numeric_band",
+    "dense": {
+      "head": "efdc55d36f7f65d426e2dab8f992a4f41e21fbb3",
+      "default_library_tests_passed": 124,
+      "ignored": 3,
+      "diagnostic_self_tests": "both passed",
+      "production_cli_server_all_feature_metadata": "passed",
+      "full_feature_test_metadata_on_this_head": "blocked by independent main missing seventh judge_prefill argument; fixed by PR370 and passed in integration below",
+      "real_official_llama_reference": "rebuild and CPU step/batch complete 3-row captures",
+      "comparison": "finite/shape/identity pass; bitwise false; diagnostic_only_no_numeric_band",
       "native_cuda": "not_run"
     },
-    "recipe_check": {
-      "status": "pass",
-      "card_tests_passed": 781,
+    "integration": {
+      "head": "3498be4b562669e507c904111dd45d1ee9900e84",
+      "includes_prerequisite": 370,
+      "format": "pass",
+      "workspace_all_targets_metadata": "pass",
+      "gpu_gates_all_features_tests_metadata": "pass, with existing unused-item warnings; no CUDA device codegen",
+      "placement_debug_passed": 138,
+      "placement_release_card_sums_passed": 3,
+      "source_inspection_passed": 45,
+      "recipe_check": "pass",
+      "card_tests_passed": 784,
       "tool_self_tests_passed": 61,
-      "owned_tests": 2709
+      "owned_tests": 2717
     },
-    "static": "workspace/all-targets and isolated GPU CLI/server/GEMM/test metadata checks passed; not device codegen",
-    "strict_clippy_changed_owner": "placement --all-targets --no-deps -- -D warnings passed",
-    "strict_clippy_dependencies": "FAILED on 4 existing chunks_exact_to_as_chunks diagnostics in unchanged crates/gguf/src/quant.rs:1296,1351"
+    "strict_dependency_inclusive_clippy": "FAILED on four existing chunks_exact_to_as_chunks diagnostics in unchanged crates/gguf/src/quant.rs:1296,1351; no lint level relaxed"
   },
-  "separate_finding": {
-    "issue": "https://github.com/midagedev/bloomery/issues/362",
-    "problem": "mawk cold marker samples after EOF; extended DS41/Qwen warm-row suites not claimed green",
-    "fixed_here": false
-  },
-  "external_prerequisites": [
-    "Corrected #339 must land or maintainer must provide upstream integration base before #254 draft can be cleared",
-    "NVIDIA gate and real device-consumer panic mutants / 27B native and serving acceptance remain unrun; no local NVIDIA, no configured GPU SSH hosts, default ws hostname resolution failed"
+  "additional_findings": [
+    {
+      "issue": 362,
+      "problem": "production mawk cold-marker waits for EOF; extended DS41/Qwen warm suites not claimed green",
+      "fixed_here": false
+    },
+    {
+      "issue": 363,
+      "problem": "unchecked host-reserve sum, separate from selected Card overflow scope",
+      "fixed_here": false
+    },
+    {
+      "pull_request": 370,
+      "problem": "main split-prefill referee missing first-key argument",
+      "source_fix_and_integrated_metadata": "pass",
+      "nvidia_device_run": "not_run"
+    }
   ],
-  "submission_states": {
-    "252": "ready_for_review",
-    "254": "draft_dependency_and_gpu_validation_blocked"
-  },
+  "external_prerequisites": [
+    "NVIDIA gate and actual CUDA regression FAIL-first/restored runs, device-consumer panic mutants, 27B native eager/graph/reference and serving acceptance: no local NVIDIA or configured GPU SSH host; default ws resolution failed",
+    "Upstream must merge the submitted PR370 prerequisite to clear its independent full-feature test compile error"
+  ],
+  "historical_artifacts": "Older directories and host proofs retain their recorded source heads; only explicitly final-head artifacts above are attributed to current branches.",
   "no_claims": [
     "No whole-model AMD support",
     "No performance/timing claim",
     "No 27B/NVIDIA accuracy acceptance",
-    "No relaxed numeric band or lint level"
+    "No relaxed numeric band, count pin or lint level",
+    "No upstream merge of these submitted fixes claimed"
   ]
 }

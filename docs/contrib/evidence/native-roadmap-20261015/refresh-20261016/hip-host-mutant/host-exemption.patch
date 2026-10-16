@@ -1,0 +1,11 @@
+--- a/labs/hip-native/device/src/selected.rs
++++ b/labs/hip-native/device/src/selected.rs
+@@ -110,7 +110,7 @@
+     // SAFETY: the row guard bounds slot; every lane in this wave reads the same id.
+     let id = unsafe { *sel.add(slot) };
+     if id >= n_experts {
+-        if id != u32::MAX && lane == 0 {
++        if lane == 0 {
+             // SAFETY: the host checked the full fault buffer and layer range.
+             unsafe { expert_fault(fault, layer) };
+         }

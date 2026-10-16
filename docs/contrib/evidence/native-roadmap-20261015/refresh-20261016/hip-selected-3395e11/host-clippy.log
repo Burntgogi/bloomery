@@ -1,0 +1,5 @@
+    Checking bloomery-levers v0.1.0 (/tmp/bloomery-hip-252/crates/levers)
+    Checking bloomery-threads v0.1.0 (/tmp/bloomery-hip-252/crates/threads)
+    Checking bloomery-qdot v0.1.0 (/tmp/bloomery-hip-252/crates/qdot)
+    Checking bloomery-hip-spike v0.1.0 (/tmp/bloomery-hip-252/labs/hip-native/host)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.99s

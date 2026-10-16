@@ -1,0 +1,521 @@
+   Compiling proc-macro2 v1.0.107
+   Compiling quote v1.0.47
+   Compiling unicode-ident v1.0.26
+   Compiling libc v0.2.190
+   Compiling thiserror v2.0.21
+    Checking cfg-if v1.0.5
+   Compiling version_check v0.9.5
+    Checking typenum v1.20.1
+    Checking cpufeatures v0.2.17
+    Checking memchr v2.8.3
+    Checking hashbrown v0.17.1
+    Checking equivalent v1.0.2
+   Compiling serde_core v1.0.229
+   Compiling zmij v1.0.23
+   Compiling serde_json v1.0.151
+    Checking itoa v1.0.18
+    Checking bloomery-levers v0.1.0 (/tmp/bloomery-integration-currentmain/crates/levers)
+   Compiling crc32fast v1.5.2
+    Checking simd-adler32 v0.3.10
+    Checking adler2 v2.0.1
+    Checking zune-core v0.5.1
+    Checking fdeflate v0.3.7
+    Checking miniz_oxide v0.9.1
+    Checking miniz_oxide v0.8.9
+    Checking bitflags v2.13.2
+   Compiling generic-array v0.14.7
+    Checking zune-jpeg v0.5.15
+   Compiling object v0.36.7
+    Checking foldhash v0.1.5
+   Compiling glob v0.3.4
+   Compiling prettyplease v0.2.37
+   Compiling rustix v0.38.44
+    Checking hashbrown v0.15.5
+    Checking indexmap v2.14.2
+   Compiling linux-raw-sys v0.4.15
+   Compiling either v1.19.0
+    Checking flate2 v1.1.10
+   Compiling minimal-lexical v0.2.1
+   Compiling regex-syntax v0.8.11
+   Compiling clang-sys v1.9.1
+   Compiling libloading v0.8.9
+   Compiling bindgen v0.69.5
+    Checking png v0.18.1
+   Compiling nom v7.1.3
+   Compiling syn v3.0.6
+   Compiling syn v2.0.119
+   Compiling home v0.5.12
+   Compiling itertools v0.12.1
+   Compiling lazycell v1.3.0
+   Compiling log v0.4.34
+   Compiling rustc-hash v1.1.0
+   Compiling shlex v1.3.0
+   Compiling lazy_static v1.5.1
+   Compiling zerocopy v0.8.61
+   Compiling serde v1.0.229
+   Compiling anyhow v1.0.104
+   Compiling reserved-oxide-symbols v0.2.1 (https://github.com/midagedev/cuda-oxide.git?rev=87bc951864b79f723b4da9c11fa229f5600aefcb#87bc9518)
+    Checking memmap2 v0.9.11
+    Checking bloomery-threads v0.1.0 (/tmp/bloomery-integration-currentmain/crates/threads)
+    Checking cuda-target-spec v0.1.0 (https://github.com/midagedev/cuda-oxide.git?rev=87bc951864b79f723b4da9c11fa229f5600aefcb#87bc9518)
+   Compiling cuda-core v0.4.0 (https://github.com/midagedev/cuda-oxide.git?rev=87bc951864b79f723b4da9c11fa229f5600aefcb#87bc9518)
+    Checking ptx-parse v0.1.0 (https://github.com/midagedev/cuda-oxide.git?rev=87bc951864b79f723b4da9c11fa229f5600aefcb#87bc9518)
+    Checking bloomery-verbs v0.1.0 (/tmp/bloomery-integration-currentmain/crates/verbs)
+   Compiling bloomery-serve v0.3.3 (/tmp/bloomery-integration-currentmain/crates/serve)
+    Checking block-buffer v0.10.4
+    Checking crypto-common v0.1.7
+   Compiling autocfg v1.5.1
+    Checking digest v0.10.7
+    Checking rawpointer v0.2.1
+    Checking bloomery-sampler v0.1.0 (/tmp/bloomery-integration-currentmain/crates/sampler)
+    Checking sha2 v0.10.9
+    Checking sha1 v0.10.7
+   Compiling regex-automata v0.4.18
+   Compiling matrixmultiply v0.3.11
+   Compiling cexpr v0.6.0
+   Compiling which v4.4.2
+   Compiling thiserror-impl v2.0.21
+   Compiling serde_derive v1.0.229
+    Checking bloomery-gguf v0.1.0 (/tmp/bloomery-integration-currentmain/crates/gguf)
+    Checking bloomery-jinja v0.1.0 (/tmp/bloomery-integration-currentmain/crates/jinja)
+    Checking libnvvm-sys v0.2.1 (https://github.com/midagedev/cuda-oxide.git?rev=87bc951864b79f723b4da9c11fa229f5600aefcb#87bc9518)
+    Checking nvjitlink-sys v0.2.1 (https://github.com/midagedev/cuda-oxide.git?rev=87bc951864b79f723b4da9c11fa229f5600aefcb#87bc9518)
+   Compiling regex v1.13.1
+    Checking bloomery-models v0.1.0 (/tmp/bloomery-integration-currentmain/crates/models)
+    Checking bloomery-tokenizer v0.1.0 (/tmp/bloomery-integration-currentmain/crates/tokenizer)
+    Checking bloomery-qdot v0.1.0 (/tmp/bloomery-integration-currentmain/crates/qdot)
+    Checking bloomery-refset v0.1.0 (/tmp/bloomery-integration-currentmain/crates/refset)
+    Checking bloomery-engram v0.1.0 (/tmp/bloomery-integration-currentmain/crates/engram)
+    Checking bloomery-vision v0.1.0 (/tmp/bloomery-integration-currentmain/crates/vision)
+    Checking bloomery-runtime v0.1.0 (/tmp/bloomery-integration-currentmain/crates/runtime)
+    Checking bloomery-placement v0.1.0 (/tmp/bloomery-integration-currentmain/crates/placement)
+    Checking bloomery-engram-lab v0.1.0 (/tmp/bloomery-integration-currentmain/crates/engram-lab)
+    Checking oxide-artifacts v0.2.1
+    Checking bloomery-hf v0.1.0 (/tmp/bloomery-integration-currentmain/crates/hf)
+   Compiling zerocopy-derive v0.8.61
+   Compiling cuda-macros v0.2.1 (https://github.com/midagedev/cuda-oxide.git?rev=87bc951864b79f723b4da9c11fa229f5600aefcb#87bc9518)
+   Compiling cuda-core-derive v0.4.0 (https://github.com/midagedev/cuda-oxide.git?rev=87bc951864b79f723b4da9c11fa229f5600aefcb#87bc9518)
+    Checking bloomery-model v0.1.0 (/tmp/bloomery-integration-currentmain/crates/model)
+    Checking cuda-artifact-finalizer v0.2.1 (https://github.com/midagedev/cuda-oxide.git?rev=87bc951864b79f723b4da9c11fa229f5600aefcb#87bc9518)
+    Checking bloomery-decision v0.1.0 (/tmp/bloomery-integration-currentmain/crates/decision)
+    Checking cuda-device v0.2.1 (https://github.com/midagedev/cuda-oxide.git?rev=87bc951864b79f723b4da9c11fa229f5600aefcb#87bc9518)
+   Compiling cuda-bindings v0.4.0 (https://github.com/midagedev/cuda-oxide.git?rev=87bc951864b79f723b4da9c11fa229f5600aefcb#87bc9518)
+    Checking bloomery-gpu-gates v0.3.3 (/tmp/bloomery-integration-currentmain/crates/gpu-gates)
+    Checking half v2.7.1
+    Checking cuda-host v0.2.1 (https://github.com/midagedev/cuda-oxide.git?rev=87bc951864b79f723b4da9c11fa229f5600aefcb#87bc9518)
+    Checking bloomery-gpu v0.1.0 (/tmp/bloomery-integration-currentmain/crates/gpu)
+    Checking bloomery-gpu-deepseek41 v0.1.0 (/tmp/bloomery-integration-currentmain/crates/gpu-deepseek41)
+    Checking bloomery-app v0.1.0 (/tmp/bloomery-integration-currentmain/crates/app)
+    Checking bloomery-gpu-vision v0.1.0 (/tmp/bloomery-integration-currentmain/crates/gpu-vision)
+    Checking bloomery-gpu-gemma-embedding2 v0.1.0 (/tmp/bloomery-integration-currentmain/crates/gpu-gemma-embedding2)
+    Checking bloomery-gpu-glm5next v0.1.0 (/tmp/bloomery-integration-currentmain/crates/gpu-glm5next)
+    Checking bloomery-gpu-mimo2 v0.1.0 (/tmp/bloomery-integration-currentmain/crates/gpu-mimo2)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 32.00s
+    Checking bloomery-app v0.1.0 (/tmp/bloomery-integration-currentmain/crates/app)
+    Checking bloomery-gpu-gates v0.3.3 (/tmp/bloomery-integration-currentmain/crates/gpu-gates)
+warning: unused import: `Run`
+  --> crates/gpu-gates/src/bin/gate_nemotron_h_moe_e2e.rs:81:22
+   |
+81 |     use crate::e2e::{Run, argmax, feed, finite, fresh, histogram, or_fault, same, top_ids, walk};
+   |                      ^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `GpuError`
+  --> crates/gpu-gates/src/bin/gate_nemotron_h_moe_e2e.rs:84:29
+   |
+84 |     use bloomery_gpu::{Gpu, GpuError, NemotronHMoeModel};
+   |                             ^^^^^^^^
+
+warning: `bloomery-gpu-gates` (bin "gate_nemotron_h_moe_e2e" test) generated 2 warnings (run `cargo fix --bin "gate_nemotron_h_moe_e2e" -p bloomery-gpu-gates --tests` to apply 2 suggestions)
+warning: function `dense_shortage_halves_the_default_context` is never used
+    --> crates/gpu-gates/src/bin/shared/serve_seats/../qwen3moe_place.rs:1305:19
+     |
+1305 |     pub(crate) fn dense_shortage_halves_the_default_context() {
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `bloomery-gpu-gates` (bin "bloomery-serve" test) generated 1 warning
+warning: unused import: `NodeInfo`
+  --> crates/gpu-gates/src/bin/gate_nemotron_e2e.rs:88:55
+   |
+88 |     use bloomery_gpu::{Gpu, GpuError, NemotronHModel, NodeInfo};
+   |                                                       ^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `bloomery-gpu-gates` (bin "gate_nemotron_e2e" test) generated 1 warning (run `cargo fix --bin "gate_nemotron_e2e" -p bloomery-gpu-gates --tests` to apply 1 suggestion)
+warning: struct `Run` is never constructed
+   --> crates/gpu-gates/src/bin/shared/e2e.rs:370:12
+    |
+370 | pub struct Run {
+    |            ^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `feed` is never used
+   --> crates/gpu-gates/src/bin/shared/e2e.rs:376:8
+    |
+376 | pub fn feed<B: bloomery_gpu::model::ChainBody>(
+    |        ^^^^
+
+warning: function `or_fault` is never used
+   --> crates/gpu-gates/src/bin/shared/e2e.rs:394:8
+    |
+394 | pub fn or_fault<T>(c: &str, w: &str, r: Result<T, GpuError>) -> Result<Option<T>, GateError> {
+    |        ^^^^^^^^
+
+warning: function `fresh` is never used
+   --> crates/gpu-gates/src/bin/shared/e2e.rs:406:8
+    |
+406 | pub fn fresh<B: bloomery_gpu::model::ChainBody>(
+    |        ^^^^^
+
+warning: function `finite` is never used
+   --> crates/gpu-gates/src/bin/shared/e2e.rs:416:8
+    |
+416 | pub fn finite(r: &Run) -> bool {
+    |        ^^^^^^
+
+warning: function `same` is never used
+   --> crates/gpu-gates/src/bin/shared/e2e.rs:420:8
+    |
+420 | pub fn same(a: &Run, b: &Run) -> bool {
+    |        ^^^^
+
+warning: function `histogram` is never used
+   --> crates/gpu-gates/src/bin/shared/e2e.rs:430:8
+    |
+430 | pub fn histogram(nodes: &[bloomery_gpu::NodeInfo]) -> std::collections::BTreeMap<String, usize> {
+    |        ^^^^^^^^^
+
+warning: function `top_ids` is never used
+   --> crates/gpu-gates/src/bin/shared/e2e.rs:439:8
+    |
+439 | pub fn top_ids(v: &[f32], k: usize) -> Vec<usize> {
+    |        ^^^^^^^
+
+warning: function `walk` is never used
+   --> crates/gpu-gates/src/bin/shared/e2e.rs:447:8
+    |
+447 | pub fn walk(n: usize, vocab: usize) -> Vec<u32> {
+    |        ^^^^
+
+warning: `bloomery-gpu-gates` (bin "gate_glm5next_e2e" test) generated 9 warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 9.90s
+   Compiling proc-macro2 v1.0.107
+   Compiling typenum v1.20.1
+   Compiling cpufeatures v0.2.17
+   Compiling cfg-if v1.0.5
+   Compiling bloomery-levers v0.1.0 (/tmp/bloomery-integration-currentmain/crates/levers)
+   Compiling libc v0.2.190
+   Compiling quote v1.0.47
+   Compiling syn v3.0.6
+   Compiling generic-array v0.14.7
+   Compiling memmap2 v0.9.11
+   Compiling block-buffer v0.10.4
+   Compiling crypto-common v0.1.7
+   Compiling digest v0.10.7
+   Compiling sha2 v0.10.9
+   Compiling thiserror-impl v2.0.21
+   Compiling thiserror v2.0.21
+   Compiling bloomery-gguf v0.1.0 (/tmp/bloomery-integration-currentmain/crates/gguf)
+   Compiling bloomery-models v0.1.0 (/tmp/bloomery-integration-currentmain/crates/models)
+   Compiling bloomery-placement v0.1.0 (/tmp/bloomery-integration-currentmain/crates/placement)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 8.97s
+     Running unittests src/lib.rs (/tmp/bloomery-target-integration-currentmain/debug/build/bloomery-placement/886d1152e1951c61/out/bloomery_placement-886d1152e1951c61)
+
+running 138 tests
+test accepts::tests::the_qwen3moe_body_dense_owner_refuses_q5_0 ... ok
+test accepts::tests::qwen38_arms_are_its_legs_launches ... ok
+test kernels::tests::an_unnamed_type_has_no_row ... ok
+test kernels::tests::dense_admits_exactly_the_pinned_pairs ... ok
+test kernels::tests::card_runs_admits_exactly_the_pinned_types ... ok
+test kernels::tests::down_admits_exactly_the_pinned_pairs ... ok
+test kernels::tests::down_reads_the_activation_form_of_its_entry ... ok
+test kernels::tests::embed_admits_exactly_the_pinned_pairs ... ok
+test kernels::tests::every_row_type_has_a_card_layout ... ok
+test kernels::tests::gate_up_admits_exactly_the_pinned_pairs ... ok
+test kernels::tests::gemm_admits_exactly_the_pinned_pairs ... ok
+test kernels::tests::head_admits_exactly_the_pinned_pairs ... ok
+test kernels::tests::the_leg_admits_each_role_by_its_own_rule ... ok
+test kernels::tests::the_type_list_is_every_variant ... ok
+test placement::churn::tests::the_pool_fits_the_headroom_less_the_bytes_beside ... ok
+test placement::churn::tests::a_stated_room_binds_an_unsplit_plans_headroom ... ok
+test placement::ctx::tests::a_slot_past_the_least_bound_is_refused_by_its_name ... ok
+test placement::ctx::tests::largest_rows ... ok
+test placement::ctx::tests::slots_of_rows ... ok
+test placement::ctx_ask::tests::a_default_short_at_the_floor_is_refused ... ok
+test placement::ctx_ask::tests::a_seat_error_is_never_retried ... ok
+test placement::ctx_ask::tests::a_set_context_that_does_not_fit_names_the_largest_that_does ... ok
+test placement::ctx_ask::tests::a_set_total_is_split_and_planned_once ... ok
+test placement::ctx_ask::tests::a_short_card_halves_only_the_default ... ok
+test placement::ctx_ask::tests::only_a_card_over_its_bytes_reads_as_short ... ok
+test placement::ctx_ask::tests::no_slot_and_no_position_plan_nothing ... ok
+test placement::ctx_ask::tests::the_default_is_the_target_when_it_holds ... ok
+test placement::ctx_ask::tests::the_line_says_why ... ok
+test placement::devices::tests::an_ambiguous_name_and_an_unlisted_bus_are_refused ... ok
+test placement::devices::tests::device_on_host_finds_the_plan_card ... ok
+test placement::devices::tests::aliases_without_a_census_are_this_workstation ... ok
+test placement::devices::tests::the_reserve_rule_reproduces_both_cards ... ok
+test placement::devices::tests::the_listed_index_follows_the_device_bus ... ok
+test placement::devices::tests::gate_plans_the_3090s_bytes_on_its_card ... ok
+test placement::devices::tests::equal_large_cards_rank_by_ordinal ... ok
+test placement::devices::tests::the_words_on_every_fake_host ... ok
+test placement::devices::tests::word_picks_reads_the_list_word ... ok
+test placement::devices::tests::two_3090s_plan_as_stage_and_tier ... ok
+test placement::paged_drop::tests::a_held_page_inside_a_run_is_found ... ok
+test placement::paged_drop::tests::a_part_smaller_than_a_page_names_no_page ... ok
+test placement::devices::tests::the_free_reading_rides_the_spec ... ok
+test placement::paged_drop::tests::a_run_between_two_held_ids_keeps_both_edge_pages ... ok
+test placement::paged_drop::tests::adjacent_non_held_ids_merge_into_one_run ... ok
+test placement::paged_drop::tests::books_that_do_not_fit_the_parts_are_refused_by_name ... ok
+test placement::paged_drop::tests::a_held_ids_every_byte_stays_outside_every_dropped_range ... ok
+test accepts::tests::a_layer_the_plan_cards_is_one_its_load_runs ... ok
+test placement::qwen38_cards::a_given_arena_under_the_floor_is_refused_by_name ... ok
+test placement::nodes_scale::census_budgets_keep_each_node_and_stage_terms ... ok
+test placement::nodes_scale::named_refusals ... ok
+test placement::nodes_scale::fills_balance ... ok
+test placement::nodes_scale::link_share ... ok
+test placement::qwen38_cards::a_given_room_plans_as_given ... ok
+test placement::qwen38_cards::a_plan_names_the_room_it_was_made_at ... ok
+test placement::nodes_scale::read_balance ... ok
+test placement::qwen38_cards::a_paged_plans_load_check_counts_the_arena ... ok
+test placement::nodes_scale::never_slower ... ok
+test placement::nodes_scale::messages_o_n ... ok
+test placement::qwen38_cards::both_files_lend_the_draft_their_output_matrices ... ok
+test placement::nodes_scale::nic_not_max ... ok
+test placement::nodes_scale::expected_sets ... ok
+test placement::qwen38_cards::a_read_rooms_plan_holds_at_a_lowered_reading ... ok
+test placement::nodes_scale::n1_is_today ... ok
+test placement::qwen38_cards::a_27_gib_room_puts_the_overflow_on_the_nvme_tier ... ok
+test placement::qwen38_cards::the_host_room_lever_reads_bytes_or_is_refused_by_name ... ok
+test placement::nodes_scale::pool_per_node ... ok
+test placement::qwen38_cards::a_paged_stack_adds_nothing_to_the_churn_pool ... ok
+test placement::qwen38_cards::the_split_dial_picks_its_arena_or_refuses_a_too_large_one ... ok
+test placement::qwen38_cards::an_unpaged_plan_at_the_plan_room_ends_a_margin_under_the_reading ... ok
+test placement::qwen38_cards::the_seats_cache_budget_counts_the_arena_once ... ok
+test placement::qwen38_cards::the_dials_one_step_is_at_half_the_host_leg ... ok
+test placement::tests::a_census_reading_counts_the_context_once ... ok
+test placement::tests::a_formats_word_names_it ... ok
+test placement::tests::a_held_card_plans_within_its_free_bytes ... ok
+test placement::tests::a_lane_holds_its_open_reads_and_its_victim_claim ... ok
+test placement::tests::a_layers_host_experts_are_the_models_less_the_cards ... ok
+test placement::tests::a_leg_cards_a_layer_by_its_parts ... ok
+test placement::tests::a_stack_name_names_its_part ... ok
+test placement::tests::a_tier_with_nothing_left_is_refused ... ok
+test placement::tests::a_total_past_the_whole_fit_fits_at_half ... ok
+test placement::tests::a_trunk_past_the_free_bytes_is_refused_by_name ... ok
+test placement::tests::a_unified_pool_holds_card_and_host_together ... ok
+test placement::tests::a_unified_pool_lowers_the_card_budget_to_the_tiers_floor ... ok
+test placement::tests::card_sums_preserve_the_u64_boundary ... ok
+test placement::tests::expert_list_shapes ... ok
+test placement::tests::grown_kv_leaves_the_headroom_usable_less_every_term ... ok
+test placement::tests::host_only_reasons_follow_the_program_and_part_in_file_order ... ok
+test placement::tests::one_device_counted_twice_is_refused ... ok
+test placement::tests::overflowing_card_sums_are_named_placement_refusals ... ok
+test placement::tests::pooled_card_sums_are_checked_only_for_shared_memory ... ok
+test placement::tests::the_budget_floor_counts_what_the_caller_holds_beside_the_plan ... ok
+test placement::tests::the_floor_carries_the_batched_unions_pins ... ok
+test placement::tests::the_free_floor_counts_what_the_caller_holds_beside_the_plan ... ok
+test placement::tests::the_host_bound_is_the_needs_check_at_the_machine_room ... ok
+test placement::tests::the_whole_fit_counts_the_arena_and_the_granules ... ok
+test placement::tests::token_embedding_is_the_layer_0_card_alone ... ok
+test placement::tests::two_devices_of_one_name_plan ... ok
+test placement::workstation::tests::a_placed_load_holds_the_whole_model_at_its_scratch ... ok
+test placement::workstation::tests::a_plan_room_covers_a_load_that_drifted_by_the_margin ... ok
+test placement::workstation::tests::an_integrated_card_plans_against_one_pool ... ok
+test placement::workstation::tests::an_integrated_card_with_no_reading_has_no_pool - should panic ... ok
+test placement::workstation::tests::an_unpaged_load_short_of_its_need_is_refused ... ok
+test placement::workstation::tests::an_unset_climb_that_fills_its_room_passes_the_load_after_drift ... ok
+test placement::workstation::tests::cgroup_room_reads_the_limit_and_gives_file_pages_back ... ok
+test placement::workstation::tests::cgroup_v2_path_reads_the_unified_line ... ok
+test placement::workstation::tests::grant_keeps_a_covered_arena_whole ... ok
+test placement::workstation::tests::grant_refuses_a_shortfall_past_the_floor ... ok
+test placement::workstation::tests::grant_shrinks_the_arena_by_the_shortfall ... ok
+test placement::workstation::tests::host_need_is_refused_past_mem_available ... ok
+test placement::workstation::tests::host_room_takes_the_smaller_reading ... ok
+test placement::workstation::tests::mem_available_reads_the_line_in_kb ... ok
+test placement::workstation::tests::place_a_names_the_draft_or_refuses ... ok
+test placement::workstation::tests::plan_node_tiers_keeps_each_census_and_service_on_its_node ... ok
+test placement::workstation::tests::plan_node_tiers_refuses_service_off_plan ... ok
+test placement::workstation::tests::plan_tiers_is_plan_bp_a_and_gate ... ok
+test placement::workstation::tests::plan_tiers_refuses_by_name ... ok
+test placement::workstation::tests::plan_tiers_sums_the_host_rows_per_tier ... ok
+test placement::workstation::tests::the_plan_room_is_one_const ... ok
+test placement::workstation::tests::tier_card_refuses_an_overflowing_batch - should panic ... ok
+test placement::workstation::tests::v41_tier_batch_bytes ... ok
+test slots::tests::bytes_count_every_term_per_slot ... ok
+test placement::qwen38_cards::a_room_that_leaves_under_the_floors_slots_is_refused_by_name ... ok
+test slots::tests::slots_of_multiplies_every_layer ... ok
+test slots::tests::split_ctx_floors_and_refuses ... ok
+test slots::tests::plan_kv_is_one_beside_less ... ok
+test placement::qwen38_cards::a_split_plans_pool_fits_the_room_past_the_arena ... ok
+test placement::qwen38_cards::a_58_gib_room_puts_the_overflow_on_the_nvme_tier ... ok
+test placement::qwen38_cards::a_split_leaves_the_run_ahead_window ... ok
+test placement::qwen38_cards::the_paged_rule_reads_the_arena ... ok
+test placement::qwen38_cards::the_dial_moves_a_byte_a_byte_but_at_its_step ... ok
+test placement::qwen38_cards::the_split_reads_no_environment ... ok
+test placement::qwen38_cards::the_arena_floor_counts_the_plans_slots ... ok
+test placement::qwen38_cards::a_room_that_holds_the_need_keeps_the_plan_unchanged ... ok
+test placement::qwen38_cards::two_slots_at_4096_hold_every_routed_expert ... ok
+test placement::qwen38_cards::q4_on_one_96gb_card_holds_every_routed_expert ... ok
+test placement::qwen38_cards::a_room_under_the_floor_is_refused_by_name ... ok
+test placement::qwen38_cards::two_slots_at_252416_stay_within_the_margin ... ok
+test placement::qwen38_cards::a_spark_defaults_to_the_ladders_target ... ok
+test placement::qwen38_cards::q3_routes_onto_cards_like_the_q4_file ... ok
+
+test result: ok. 138 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 54.12s
+
+   Doc-tests bloomery_placement
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Compiling proc-macro2 v1.0.107
+   Compiling version_check v0.9.5
+   Compiling unicode-ident v1.0.26
+   Compiling quote v1.0.47
+   Compiling typenum v1.20.1
+   Compiling libc v0.2.190
+   Compiling thiserror v2.0.21
+   Compiling cpufeatures v0.2.17
+   Compiling cfg-if v1.0.5
+   Compiling bloomery-levers v0.1.0 (/tmp/bloomery-integration-currentmain/crates/levers)
+   Compiling generic-array v0.14.7
+   Compiling syn v3.0.6
+   Compiling memmap2 v0.9.11
+   Compiling crypto-common v0.1.7
+   Compiling block-buffer v0.10.4
+   Compiling digest v0.10.7
+   Compiling sha2 v0.10.9
+   Compiling thiserror-impl v2.0.21
+   Compiling bloomery-gguf v0.1.0 (/tmp/bloomery-integration-currentmain/crates/gguf)
+   Compiling bloomery-models v0.1.0 (/tmp/bloomery-integration-currentmain/crates/models)
+   Compiling bloomery-placement v0.1.0 (/tmp/bloomery-integration-currentmain/crates/placement)
+    Finished `release` profile [optimized] target(s) in 6.24s
+     Running unittests src/lib.rs (/tmp/bloomery-target-integration-currentmain/release/build/bloomery-placement/95e974872c1fe6d0/out/bloomery_placement-95e974872c1fe6d0)
+
+running 3 tests
+test placement::tests::card_sums_preserve_the_u64_boundary ... ok
+test placement::tests::overflowing_card_sums_are_named_placement_refusals ... ok
+test placement::tests::pooled_card_sums_are_checked_only_for_shared_memory ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 135 filtered out; finished in 0.00s
+
+ok draft-ik-clean
+ok draft-lcpp-clean
+ok qwen-ik-clean
+ok qwen-lcpp-clean
+ok qwen-mrs-clean
+ok qwen-bin-clean
+ok qwen-server-clean
+ok ds41-ik-clean
+ok ds41-lcpp-clean
+ok ds41-bin-clean
+ok ds41-server-clean
+ok glm-27752-clean
+ok glm-27754-clean
+ok glm-exl3-clean
+ok draft-ik-dirty
+ok draft-lcpp-dirty
+ok qwen-ik-dirty
+ok qwen-lcpp-dirty
+ok qwen-mrs-dirty
+ok qwen-bin-dirty
+ok qwen-server-dirty
+ok ds41-ik-dirty
+ok ds41-lcpp-dirty
+ok ds41-bin-dirty
+ok ds41-server-dirty
+ok glm-27752-dirty
+ok glm-27754-dirty
+ok glm-exl3-dirty
+ok draft-ik-corrupt-index
+ok draft-lcpp-corrupt-index
+ok qwen-ik-corrupt-index
+ok qwen-lcpp-corrupt-index
+ok qwen-mrs-corrupt-index
+ok qwen-bin-corrupt-index
+ok qwen-server-corrupt-index
+ok ds41-ik-corrupt-index
+ok ds41-lcpp-corrupt-index
+ok ds41-bin-corrupt-index
+ok ds41-server-corrupt-index
+ok glm-27752-corrupt-index
+ok glm-27754-corrupt-index
+ok glm-exl3-corrupt-index
+ok ds41-no-git-abc123-dirty
+ok ds41-no-git-unknown
+ok ds41-no-git-other-tree
+source-inspection-test: 45 checks, 0 failed (dry runners, no timing)
+ok the runner's own busy arm is left out
+ok a foreign cargo over the threshold tags the row
+ok a foreign rustc started inside the interval counts whole
+ok a reused pid counts from its own start
+ok a foreign process of the same busy share under the threshold does not tag
+ok a call under a second after the last reading starts the next interval
+ok cpu_busy_reading keeps its form
+ok a process tree that cannot be read is a named exit
+ok strict mode aborts on a foreign cargo
+ok live: the runner's own busy arm does not tag its row
+ok live: a foreign busy process tags the row
+cpu-guard: 11 tests, 0 failed
+proc-leg: wall 7 s
+check-recipes: tools/gate-paths.tsv: 133 gate rows held to the derivation, 29 rows with exceptions naming 627 gates
+self-test: slowest sections: narrow table 65 s, key 59 s, narrow 53 s
+self-test: ok (179 gate recipes, 0 failures)
+check-recipes: 67 timed recipes, 32 build in their box command after the card precheck
+check-recipes: 6 timed recipes build in a just dependency before their box command, where the precheck cannot come first: ab-decode (build-decode); measure-decode (build-decode); measure-engram (build-engram); measure-profile (build-decode); measure-sweep (build-decode); perf-decode (build-decode)
+card-tests: 784 tests, 0 failed
+self-test: ok (0 failures)
+box-tracks: self-test ok
+check-unsafe: self-test ok
+check-arch: self-test ok
+check-loads: self-test ok
+check-comments: self-test ok
+check-levers: self-test ok
+self-test: ok (0 failures)
+self-test: ok (0 failures)
+self-test: ok (0 failures)
+self-test: ok (6 checks, 0 failures)
+self-test: ok (34 checks, 0 failures)
+self-test: ok (10 checks, 0 failures)
+self-test: ok (0 failures)
+q38-3090-server.sh: self-test ok
+mac-check: self-test ok
+gate-batch self-test: slowest cases: real-file: the tree's own recipes.py reaches the fence for a gate that opens the model, and not for one that opens none 31 s, chain mutant: every card reading 3090 lets a lane take a member it may not 26 s, chain: a gap between two members ends green 25 s
+gate-batch self-test: 653 of 653 ok
+gpu-gate self-test: 112 of 112 ok
+stack-watch self-test: ok
+ptx-scan: self-test ok (21 cases, 0 failed)
+ptx-spill-check: self-test ok
+scan-args: self-test ok (41 cases, 0 failed)
+narrow-scan: self-test ok (124 cases, 0 failed)
+canon-check: self-test ok (37 cases, 0 failed)
+ptx-compare: self-test ok (33 cases, 0 failed)
+lds-scan: self-test ok (7 cases, 0 failed)
+mutant-run: self-test ok
+mac-static: self-test ok
+mac-remote: self-test ok (the flow against a fake remote needs macOS: skipped on Linux)
+box.sh: self-test ok
+seed-target: self-test ok
+carry: self-test ok (19 cases)
+release: self-test ok (12 cases)
+check-recipes: 61 tool self-tests ok
+boxq codes 80, 81, 83-85: no other tool or recipe produces them
+check-recipes: deepseek41 fixture draft: source stays up, dspark_model refuses
+check-recipes: fixture variants ok (6 row(s):  iq4xs q2kxl glmffnkq q6kdown unjoined unjoinedq6 )
+check-recipes: draft reads go through dspark_model (167 shell files, the printf fixture is red)
+refset-publish: self-test ok
+orphan-tests: ok (2717 tests, each run by a gate-* or lab-* recipe)
+check-recipes: arch owner ok (169 recipe lines build with --arch {{arch}}, 12 fixtures)
+wt: self-test ok
+proc-leg: gpu-gate holder named
+check-recipes: slowest: lease 96 s, gatebatch 93 s, recipescheck 73 s, selftest 67 s, cardtests 58 s
+check-recipes: ok
+
+
+Wall time: 224.62 seconds

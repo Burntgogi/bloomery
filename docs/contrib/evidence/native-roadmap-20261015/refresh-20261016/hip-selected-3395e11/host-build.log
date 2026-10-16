@@ -1,0 +1,5 @@
+   Compiling bloomery-levers v0.1.0 (/tmp/bloomery-hip-252/crates/levers)
+   Compiling bloomery-threads v0.1.0 (/tmp/bloomery-hip-252/crates/threads)
+   Compiling bloomery-qdot v0.1.0 (/tmp/bloomery-hip-252/crates/qdot)
+   Compiling bloomery-hip-spike v0.1.0 (/tmp/bloomery-hip-252/labs/hip-native/host)
+    Finished `release` profile [optimized] target(s) in 11.80s
