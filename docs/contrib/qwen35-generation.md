@@ -6,6 +6,12 @@ The serving path remains `SeatEngine` -> `app::Session<Body35>` -> Bloomery's
 native GPU model, with the common context/load choice, placement, resident slots,
 prompt scheduling and checkpoint-based prefix reuse.
 
+With `--ctx` unset, a dense whole-load memory shortage retains the typed card
+budget refusal, so the common context chooser halves to a fitting rung. It
+cannot fall back to expert offload. A tensor-format or load-options refusal
+remains fatal rather than triggering a smaller context. An explicitly set
+context retains the common refusal and largest-fitting-share contract.
+
 Use an explicit `bloomery-serve --model qwen3` for generation. With no model word,
 the existing decision selection stays in force: a decision model's card or
 in-file decision type selects its decision seat, and a bare backbone without a
