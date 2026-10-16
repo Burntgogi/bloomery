@@ -2959,7 +2959,7 @@ mod gate {
         ) -> Result<Vec<T>, GateError> {
             let next = AtomicUsize::new(0);
             let threads = std::thread::available_parallelism().map_or(8, |n| n.get().min(32));
-            let parts = std::thread::scope(|sc| {
+            std::thread::scope(|sc| {
                 let hs: Vec<_> = (0..threads)
                     .map(|_| {
                         sc.spawn(|| {
@@ -2975,12 +2975,20 @@ mod gate {
                         })
                     })
                     .collect();
-                hs.into_iter().map(|h| h.join()).collect::<Vec<_>>()
-            });
-            parts
-                .into_iter()
-                .map(|p| p.map_err(|_| "reference thread panicked".into()))
-                .collect()
+                let mut parts = Vec::with_capacity(threads);
+                let mut panicked = false;
+                for h in hs {
+                    match h.join() {
+                        Ok(part) => parts.push(part),
+                        Err(_) => panicked = true,
+                    }
+                }
+                if panicked {
+                    Err("reference thread panicked".into())
+                } else {
+                    Ok(parts)
+                }
+            })
         }
 
         /// K per dense case: 96 and 352 end in a one-block step (K/32 odd),
@@ -5212,12 +5220,7 @@ mod gate {
                     slots,
                 ));
                 assert_eq!(calls.load(Ordering::Relaxed), 2);
-                assert_gate_failure(run(
-                    &|_| Some(0),
-                    &|_| panic!("reference panic"),
-                    &y,
-                    slots,
-                ));
+                assert_gate_failure(run(&|_| Some(0), &|_| panic!("reference panic"), &y, slots));
                 assert_gate_failure(par_slots::<()>(
                     slots,
                     || panic!("reference initializer panic"),
