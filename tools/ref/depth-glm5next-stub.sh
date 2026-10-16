@@ -248,7 +248,6 @@ echo 'lease_take() { echo "[stub] no lease: the stub test'"'"'s copy of lease.sh
 # shellcheck disable=SC2016 # the copies expand them when they run
 {
   echo 'majflt_now() { cat "$STUB_MAJFLT"; }'
-  echo 'majflt_sample() { local v='"'"''"'"'; if [ -r "$STUB_MAJFLT" ]; then read -r v < "$STUB_MAJFLT" || v='"'"''"'"'; fi; printf '"'"'%s\n'"'"' "$v" > "$1"; }'
 } >> "$T/tools/ref/cold-blocks.sh"
 echo 'lcpp_srv_majflt() { cat "$STUB_MAJFLT"; }' >> "$T/tools/ref/lcpp-warm.sh"
 touch "$T/Cargo.toml"

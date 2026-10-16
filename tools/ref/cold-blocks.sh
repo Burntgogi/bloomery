@@ -141,34 +141,28 @@ majflt_require() {
   echo "$1: /proc/vmstat gives no pgmajfault: every row's majflt column and cold tag would read 0" >&2
   exit 2
 }
-# majflt_sample <file>: /proc/vmstat's pgmajfault into <file>. The depth runners' stub suites
-# override this one with their own counter file; majflt_mark keeps the reading and the line loop.
-majflt_sample() {
-  local l
-  while read -r l; do
-    case $l in pgmajfault\ *) printf '%s\n' "${l#pgmajfault }" > "$1"; return 0 ;; esac
-  done < /proc/vmstat
-  printf '%s\n' '' > "$1"
+# majflt_require <runner>: exit 2 before the lease when /proc/vmstat has no pgmajfault.
+majflt_require() {
+  [ -n "$(majflt_now 2> /dev/null)" ] && return 0
+  echo "$1: /proc/vmstat gives no pgmajfault: every row's majflt column and cold tag would read 0" >&2
+  exit 2
 }
 # majflt_mark <file> <ERE>: its stdin to stdout line by line, and /proc/vmstat's pgmajfault into
 # <file> at the first line matching <ERE> (at none when <ERE> is empty): the line an engine prints as
 # its measured window starts. The read is one line at a time through the shell: awk buffers its
-# stdin (mawk 1.3.4, gawk and the Mac's awk alike), so a sample the match took waited for the
+# stdin (mawk 1.3.4, gawk and the Mac's awk alike), so the sample a match took waited for the
 # buffer's fill or the stream's end, and the faults a lazy sample leaves out of the window are the
-# ones the window's start line means to measure away.
+# ones the window's start line means to measure away. The sampler is `majflt_now`, the counter's
+# owner; a failed forward is the run's failure, not the marker's.
 majflt_mark() {
   local f=$1 re=$2 line s=''
-  while IFS= read -r line; do
+  while IFS= read -r line || [ -n "$line" ]; do
     if [ -z "$s" ] && [ -n "$re" ] && [[ $line =~ $re ]]; then
-      majflt_sample "$f"
+      majflt_now > "$f" || return
       s=1
     fi
-    printf '%s\n' "$line"
+    printf '%s\n' "$line" || return
   done
-  if [ -n "$line" ]; then
-    if [ -z "$s" ] && [ -n "$re" ] && [[ $line =~ $re ]]; then majflt_sample "$f"; fi
-    printf '%s\n' "$line"
-  fi
 }
 # cold_check <faults> <window s>: MAJ_BOUND, faults × COLD_US as a percent of the window, and COLD_TAG
 # (` [cold]` at COLD_PCT or more).
@@ -459,7 +453,10 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = --self-test ]; then
     majflt_mark "$d/mark" 'window-start' < "$d/pipe" > "$d/out" &
     mp=$!
     exec 9> "$d/pipe"
-    printf 'ahead\nwindow-start\n' >&9
+    printf 'ahead\n' >&9
+    for ((i = 0; i < 40; i++)); do [ -s "$d/out" ] && break; sleep 0.01; done
+    check marker-before-match "$(cat "$d/out")|$([ -e "$d/mark" ] && echo yes || echo no)" 'ahead|no'
+    printf 'window-start\n' >&9
     sleep 0.4
     v=$(cat "$d/mark" 2> /dev/null)
     case $v in '' | *[!0-9]*) at='no' ;; *) at='yes' ;; esac
