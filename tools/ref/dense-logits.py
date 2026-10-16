@@ -585,7 +585,7 @@ def self_test():
         except ValueError:
             pass
         meta = root / "raw.meta"
-        meta.write_text("format\tbloomery-forced-logits-v1\nformat\tbloomery-forced-logits-v1\n")
+        meta.write_text("format\tbloomery-forced-logits-v1\nformat\tbloomery-forced-logits-v1\ndtype\tfloat32-le\nlast_step\ttrue\ncomplete\ttrue\n")
         try:
             read_meta(meta)
             raise AssertionError("accepted duplicate metadata")
