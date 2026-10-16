@@ -10,6 +10,93 @@ reference family, numerical acceptance band and full A6000 serving gates remain
 separate work; a successful dump or a comparison without a band is not a model
 correctness gate.
 
+## Dependency and review boundary
+
+This diagnostics draft is not an independent dense-generation attach. Its parent
+is [PR #339](https://github.com/midagedev/bloomery/pull/339), the successor of
+#251, from `juliankang4/bloomery:contribution/dense-qwen-pr-20261015`. The reviewed
+source is `ab68f0088c12996ec53fcf34349a872d926473d6`; that parent is not in upstream
+main at `6d4113c1f96942227cd77e22b83c4b35b5be237b`.
+
+The local `support/qwen35-339-review-fix` branch adds focused commit
+`8cf09c2` to the exact reviewed parent for its author's cherry-pick. It preserves
+the typed dense whole-load shortage requested by
+[review 5550636450](https://github.com/midagedev/bloomery/pull/339#pullrequestreview-5550636450):
+the existing default-context chooser can halve to a fitting rung rather than
+exiting on a string refusal. The regression exercises that context consumer,
+checked/unchecked arena accounting, exact-fit and one-byte-short budgets, and
+fatal non-memory refusals; it does not open a card.
+
+`support/qwen35-339-current` (`4232c80b5bd408dad2cf90285930b5a6f5ee69f1`)
+rebases the parent and that fix onto the main pin above, preserving original
+authors, Nemotron dispatch, embedding side-seat reserves and current gate
+selectors. `contribution/dense-validation-current` then carries only the original
+diagnostics commits `cef6606`, `be1393a`, `a67b74a` plus their current compatibility
+and dependency-documentation updates. The diagnostics-only review range is:
+
+```sh
+git diff support/qwen35-339-current...contribution/dense-validation-current
+git log support/qwen35-339-current..contribution/dense-validation-current
+```
+
+These are local support refs, not published replacements for another author's
+branch. GitHub cannot set an upstream pull request's base to a branch in another
+fork. Keep #254 draft until the corrected #339 lands and rebase only its
+diagnostics onto that merged main, or have a maintainer establish an upstream
+integration branch as the explicit dependency base. Comparing #254 to main
+before that cutover includes the unmerged parent; do not describe that range as
+a diagnostics-only feature or submit a duplicate of #339.
+
+## Host, static and reference smoke handoff
+
+The refresh itself runs no checks. Run these on the final integrated source and
+record its exact head; earlier heads' results do not establish this rebase:
+
+```sh
+RUSTFLAGS='-C target-cpu=native' cargo test --locked -p bloomery-gpu-gates --lib
+python3 tools/ref/dense-logits.py --self-test
+python3 tools/ref/dense-serve.py --self-test
+python3 tools/recipes.py check
+just contrib-check --tier t0
+```
+
+With the pinned CUDA headers and libclang available, frontend metadata checks
+open no device. Use `cargo oxide`, not plain cargo, for linked device executables
+and the context regression:
+
+```sh
+cargo check --locked -p bloomery-gpu-gates \
+  --features glm5next,clef,vision,mimo2,gemma-embedding2 \
+  --bin generate_qwen3moe --bin bloomery-serve
+cargo oxide test --arch sm_86 -- -p bloomery-gpu-gates --features gpu \
+  --bin generate_qwen3moe dense_default_context_halves_only_for_a_short_whole_load
+```
+
+After building the reference below, this writer/input smoke uses existing
+`prompt.ids` and `forced.ids`, opens no model or device and creates no raw output:
+
+```sh
+target/release/dense_logits_ref --validate-inputs --model /unused/model.gguf \
+  --prompt-file /absolute/path/prompt.ids --forced-file /absolute/path/forced.ids \
+  --out /unused/logits.f32 --ctx 4352 --prefill step
+```
+
+For an optional CPU writer smoke with the exact 0.8B file below, use a newly
+built reference and a new output directory; this is not native CUDA evidence:
+
+```sh
+python3 tools/ref/dense-logits.py run --kind reference --backend cpu \
+  --target qwen35-0.8b-candidate \
+  --binary "$PWD/target/release/dense_logits_ref" \
+  --model /absolute/path/Qwen3.5-0.8B-Q4_K_M.gguf \
+  --prompt /absolute/path/prompt.ids --forced /absolute/path/forced.ids \
+  --ctx 4352 --ubatch 512 --prefill step --out /absolute/path/new-cpu-smoke
+```
+
+Retain malformed-input/nonfinite/provenance failure output alongside successful
+smokes. Neither these commands nor a reference CPU dump establish dense A6000
+logits, eager/graph equality, HTTP/native parity or full-model correctness.
+
 ## Model and row contract
 
 The default target `qwen38-27b` is exactly
@@ -39,8 +126,8 @@ tools. An out-of-vocabulary id is refused, not clamped.
 
 `logits.0.f32` is `[N,248320]` IEEE754 f32, little-endian, contiguous by row. The
 raw file's `.meta` sidecar is written after the last finite row and successful
-close. The runner verifies the sidecar's ids/shape, then writes the diagnostic
-`MANIFEST.tsv` with model SHA, prompt/continuation SHA, native and reference
+flush (native) or close (reference). The runner verifies the sidecar's ids/shape,
+then writes the diagnostic `MANIFEST.tsv` with model SHA, prompt/continuation SHA, native and reference
 commits, binary SHA, context, prefill, KV and the raw-file digest. Only a successful
 run publishes its files to an exclusively created output directory, with the
 complete manifest last; existing output is refused. Failed command output and
