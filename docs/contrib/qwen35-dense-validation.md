@@ -112,6 +112,8 @@ commits, binary SHA, context, prefill, KV and the raw-file digest. Only a succes
 run publishes its files to an exclusively created output directory, with the
 complete manifest last; existing output is refused. Failed command output and
 exit status stay in the incomplete staging directory.
+Every sidecar key must be unique: duplicate keys are refused even when its format,
+dtype and completion markers are otherwise valid.
 `tools/bloomery/manifest.py` is the manifest reader. Timeout cleanup is limited to
 the launched process session, including the gate wrapper's separate timeout
 process group; it never looks for or stops an existing model server.
