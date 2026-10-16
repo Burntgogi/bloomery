@@ -1339,8 +1339,8 @@ pub enum PlacementError {
     /// ([`churn::ChurnPool`]), take more than the plan's host headroom.
     #[error("{0}")]
     ResidencyOverHost(Box<churn::OverHost>),
-    /// A card's reserves, set-aside or load floor summed past u64 bytes.
-    #[error("card {card}: its reserves, set-aside or load floor pass u64 bytes")]
+    /// A card's reserves, set-aside, load floor or shared-pool total summed past u64 bytes.
+    #[error("card {card}: required card or shared-pool bytes pass u64 bytes")]
     CardBytesPastU64 { card: String },
     /// A card budget below what the card needs with no expert on it: the
     /// floor counts what the caller holds beside the plan
@@ -3740,7 +3740,12 @@ fn totals<'a>(
             let used = card
                 .floor_bytes(heap.taken, kv, stage_rows)
                 .ok_or_else(|| card.bytes_past_u64())?;
-            pool_cards += used + card.margin_bytes - card.context_in_free();
+            if machine.unified().is_some() {
+                pool_cards = pool_cards
+                    .checked_add(used - card.context_in_free())
+                    .and_then(|bytes| bytes.checked_add(card.margin_bytes))
+                    .ok_or_else(|| card.bytes_past_u64())?;
+            }
             Ok(CardTotals {
                 dense_bytes: card_dense[c],
                 expert_bytes: card_experts[c],
@@ -4585,6 +4590,38 @@ mod tests {
             whole_need(&model, &machine.cards[0], 0, WholeLoad::Unchecked),
             Err(PlacementError::CardBytesPastU64 { card }) if card == "load-overflow"
         ));
+    }
+
+    #[test]
+    fn pooled_card_sums_are_checked_only_for_shared_memory() {
+        let model = layered(2);
+        for unified in [None, Some(UnifiedPool { bytes: u64::MAX })] {
+            let machine = Machine {
+                cards: (0..2)
+                    .map(|i| Card {
+                        head: i == 1,
+                        reserves: vec![("resident".into(), 1 << 63)],
+                        ..bytes_card(&format!("stage{i}"), u64::MAX, i..i + 1)
+                    })
+                    .collect(),
+                tiers: Vec::new(),
+                nodes: vec![Node {
+                    host: host(),
+                    unified,
+                }],
+            };
+            let result = plan_with(&model, &machine, 4096, &NoKv, None);
+            if unified.is_some() {
+                assert!(matches!(
+                    result,
+                    Err(PlacementError::CardBytesPastU64 { card }) if card == "stage1"
+                ));
+            } else {
+                let plan = result.expect("separate card memories need no combined card total");
+                assert_eq!(plan.n_l, vec![8, 8]);
+                assert!(plan.violations().is_empty());
+            }
+        }
     }
 
     /// A tier after a stage card that holds every expert is refused by name;
