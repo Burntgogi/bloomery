@@ -1,7 +1,7 @@
 //! Import the pinned upstream arithmetic; this build script never edits the CUDA source.
 use std::{env, fs, path::PathBuf};
 
-const CORE_FNV1A: u64 = 0xafb05c1974a0928b;
+const CORE_FNV1A: u64 = 0x886002db3d49d572;
 const FUNCTIONS: &[&str] = &[
     "half_to_f32",
     "q4k_nibble",
