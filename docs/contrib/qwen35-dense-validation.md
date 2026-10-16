@@ -19,7 +19,8 @@ source is `ab68f0088c12996ec53fcf34349a872d926473d6`; that parent is not in upst
 main at `6d4113c1f96942227cd77e22b83c4b35b5be237b`.
 
 The local `support/qwen35-339-review-fix` branch adds focused commit
-`8cf09c2` to the exact reviewed parent for its author's cherry-pick. It preserves
+`f9102a2` and single-owner gate registration `492218d` to the exact reviewed
+parent for its author's cherry-pick. It preserves
 the typed dense whole-load shortage requested by
 [review 5550636450](https://github.com/midagedev/bloomery/pull/339#pullrequestreview-5550636450):
 the existing default-context chooser can halve to a fitting rung rather than
@@ -27,7 +28,7 @@ exiting on a string refusal. The regression exercises that context consumer,
 checked/unchecked arena accounting, exact-fit and one-byte-short budgets, and
 fatal non-memory refusals; it does not open a card.
 
-`support/qwen35-339-current` (`4232c80b5bd408dad2cf90285930b5a6f5ee69f1`)
+`support/qwen35-339-current` (`3845e27`)
 rebases the parent and that fix onto the main pin above, preserving original
 authors, Nemotron dispatch, embedding side-seat reserves and current gate
 selectors. `contribution/dense-validation-current` then carries only the original
