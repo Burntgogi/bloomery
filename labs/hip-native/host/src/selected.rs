@@ -83,12 +83,8 @@ fn planes(values: &[f32], k: usize) -> Planes {
 }
 
 fn upload<T: Copy>(context: &mut Context, values: &[T]) -> Result<*mut c_void, String> {
-    let bytes = std::mem::size_of_val(values);
-    let ptr = context.alloc(bytes)?;
-    // SAFETY: both allocations cover bytes; the transfer synchronizes before values are dropped.
-    unsafe {
-        context.copy(ptr, values.as_ptr().cast(), bytes, 1)?;
-    }
+    let ptr = context.alloc(std::mem::size_of_val(values))?;
+    overwrite(context, ptr, values)?;
     Ok(ptr)
 }
 
