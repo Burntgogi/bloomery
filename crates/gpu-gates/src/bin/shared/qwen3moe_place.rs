@@ -645,6 +645,12 @@ impl Whole {
     /// with no routed expert to move to the host tier.
     fn dense_refusal(&self, ctx: usize) -> GateError {
         if let Whole::Short(n) = self {
+            let Some(reserves) = n.card.reserve_bytes() else {
+                return PlacementError::CardBytesPastU64 {
+                    card: n.card.name.clone(),
+                }
+                .into();
+            };
             let (margin, beside) = match n.load {
                 WholeLoad::Checked { arena, reserve } => (reserve, arena),
                 WholeLoad::Unchecked => (n.card.margin_bytes, 0),
@@ -657,7 +663,7 @@ impl Whole {
                 kv: n.kv,
                 context: n.card.context_bytes,
                 scratch: n.card.scratch_bytes,
-                reserves: n.card.reserve_bytes(),
+                reserves,
                 margin,
                 beside,
             }
@@ -1368,7 +1374,7 @@ pub(super) mod tests {
                         need.kv,
                         card.context_bytes,
                         card.scratch_bytes,
-                        card.reserve_bytes(),
+                        card.reserve_bytes().expect("bounded reserves"),
                         past.0,
                         past.1
                     )
