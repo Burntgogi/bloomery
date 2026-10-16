@@ -1,0 +1,9 @@
+{
+  "cwd": "/tmp/bloomery-pr369-review-fix",
+  "argv": [
+    "bash",
+    "tools/ref/cold-blocks.sh",
+    "--self-test"
+  ],
+  "exit": 0
+}

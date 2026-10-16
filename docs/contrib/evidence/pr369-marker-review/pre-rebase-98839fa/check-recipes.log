@@ -1,0 +1,855 @@
+ok the runner's own busy arm is left out
+ok a foreign cargo over the threshold tags the row
+ok a foreign rustc started inside the interval counts whole
+ok a reused pid counts from its own start
+ok a foreign process of the same busy share under the threshold does not tag
+ok a call under a second after the last reading starts the next interval
+ok cpu_busy_reading keeps its form
+ok a process tree that cannot be read is a named exit
+ok strict mode aborts on a foreign cargo
+ok live: the runner's own busy arm does not tag its row
+ok live: a foreign busy process tags the row
+cpu-guard: 11 tests, 0 failed
+proc-leg: wall 7 s
+check-recipes: tools/gate-paths.tsv: 133 gate rows held to the derivation, 29 rows with exceptions naming 627 gates
+self-test: slowest sections: narrow table 51 s, key 45 s, narrow 42 s
+self-test: ok (178 gate recipes, 0 failures)
+check-recipes: 67 timed recipes, 32 build in their box command after the card precheck
+check-recipes: 6 timed recipes build in a just dependency before their box command, where the precheck cannot come first: ab-decode (build-decode); measure-decode (build-decode); measure-engram (build-engram); measure-profile (build-decode); measure-sweep (build-decode); perf-decode (build-decode)
+ok check valid-ab
+ok check hcpre-ab
+ok check under-ruler
+ok check under-ruler
+ok check under-ruler --round-minutes 2.5
+ok check under-ruler
+ok check under-ruler --rounds 5
+ok check valid-ab --rounds 2
+ok new ab-written
+ok new ab-checked
+ok new ab-round-trip
+ok new ab-order
+ok new exists
+ok new under-ruler
+ok new under-ruler-unwritten
+ok new malformed
+ok new bad-flag
+ok new twice
+ok new wrap
+ok new wrap-110
+ok new hash-word
+ok check straddle
+ok check sd-override
+ok check sd-no-source
+ok check same-decisions
+ok check no-condition
+ok check baseline-no-reason
+ok check profile
+ok check profile --rounds 3
+ok check profile-rounds
+ok check exclusive
+ok check exclusive-long
+ok check exclusive-no-minutes
+ok check exclusive-predict
+ok check unknown-key
+ok check unknown-kind
+ok check bad-band
+ok check reversed-band
+ok check non-finite band 1e999..1e999
+ok non-finite band diagnostic 1e999..1e999
+ok lease non-finite band 1e999..1e999
+ok check non-finite band -1e999..1
+ok non-finite band diagnostic -1e999..1
+ok lease non-finite band -1e999..1
+ok check non-finite band 1..1e999
+ok non-finite band diagnostic 1..1e999
+ok lease non-finite band 1..1e999
+ok check non-finite band -1e999..-1e999
+ok non-finite band diagnostic -1e999..-1e999
+ok lease non-finite band -1e999..-1e999
+ok check finite band 1e308..1e308
+ok check finite band -1e308..-1e308
+ok check non-finite minutes 1e999
+ok lease non-finite minutes 1e999
+ok check non-finite minutes 1..1e999
+ok lease non-finite minutes 1..1e999
+ok check non-finite minutes 1e999..1e999
+ok lease non-finite minutes 1e999..1e999
+ok check non-finite margin
+ok verdict non-finite margin
+ok check dup-key
+ok check ab-unit
+ok check continuation
+ok check orphan-indent
+ok check missing
+ok check noninf-valid
+ok check noninf-default
+ok check noninf-default
+ok check noninf-rounds
+ok check noninf-rounds
+ok check noninf-rounds --round-minutes 3
+ok check noninf-rounds --rounds 14
+ok check noninf-margin-no-reason
+ok verdict pass
+ok verdict pass: the ratio line
+ok verdict fail
+ok verdict fail: the band region
+ok verdict on an ab card
+ok verdict on a label with no ratio
+ok verdict on one ratio
+ok verdict on a refused card
+ok check usage
+ok check bad --rounds
+ok docs/cards/b1-pp.card
+ok docs/cards/bolt-b1-serve-tg-a6000.card
+ok docs/cards/bolt-iq2opt.card
+ok docs/cards/bolt-lcpp-base-3090.card
+ok docs/cards/bolt-lcpp-base-a6000.card
+ok docs/cards/bolt-lcpp-nsys-a6000.card
+ok docs/cards/boxlease-proof.card
+ok docs/cards/brand-probe.card
+ok docs/cards/callstream-pp-a.card
+ok docs/cards/callstream-pp-bp.card
+ok docs/cards/candref-build.card
+ok docs/cards/candref-dump-d1c.card
+ok docs/cards/candref-dump-d1sep.card
+ok docs/cards/churn-unhosted.card
+ok docs/cards/clip021-tape.card
+ok docs/cards/contributor-router-locality.card
+ok docs/cards/contributor-sampler-threshold.card
+ok docs/cards/dma-dram-share-q38.card
+ok docs/cards/dma-dram-share-v41.card
+ok docs/cards/dma-dram-share.card
+ok docs/cards/draftgate-noninf.card
+ok docs/cards/dsclamp-accept.card
+ok docs/cards/dsclamp-build.card
+ok docs/cards/e21-ref.card
+ok docs/cards/e21-warm.card
+ok docs/cards/eqa1-host-rate.card
+ok docs/cards/exact-ref.card
+ok docs/cards/example-ab.card
+ok docs/cards/example-baseline.card
+ok docs/cards/example-calibration.card
+ok docs/cards/example-exclusive.card
+ok docs/cards/example-profile.card
+ok docs/cards/excl-decode.card
+ok docs/cards/f32dec-ud.card
+ok docs/cards/fa2-ncu.card
+ok docs/cards/fixture-gen.card
+ok docs/cards/fxoracle-dump.card
+ok docs/cards/g3-nsys35.card
+ok docs/cards/glm-public.card
+ok docs/cards/glmbp-ab.card
+ok docs/cards/glmbp-pp.card
+ok docs/cards/glmclip-tape.card
+ok docs/cards/glmclip3090-tape.card
+ok docs/cards/glmdsaref-dump.card
+ok docs/cards/glmffnkq-dump.card
+ok docs/cards/glmgemm2-pp.card
+ok docs/cards/glmlane2-pp.card
+ok docs/cards/glmmtpref-dump.card
+ok docs/cards/glmnext-cardtile.card
+ok docs/cards/glmpair-probe.card
+ok docs/cards/glmpick-pp.card
+ok docs/cards/glmpick-split.card
+ok docs/cards/glmpp-depth.card
+ok docs/cards/glmpp3-pp.card
+ok docs/cards/glmppa-pp.card
+ok docs/cards/glmprefetch-ab.card
+ok docs/cards/glmref-dump.card
+ok docs/cards/glmres-ab.card
+ok docs/cards/glmresmtp-stage.card
+ok docs/cards/glmslots-ab.card
+ok docs/cards/glmslots-deep.card
+ok docs/cards/glmslots-res.card
+ok docs/cards/glmswap-pp.card
+ok docs/cards/glmtiles-pp.card
+ok docs/cards/glmtime-smoke.card
+ok docs/cards/glmtrace-oracle.card
+ok docs/cards/glmtrace.card
+ok docs/cards/glmunion-pp.card
+ok docs/cards/glmwire-mtp.card
+ok docs/cards/h1grid-seat.card
+ok docs/cards/ikmimo2-build.card
+ok docs/cards/iq3s-rate.card
+ok docs/cards/iq3sfix-decode.card
+ok docs/cards/iq3sfix-rate.card
+ok docs/cards/iqhost-rate.card
+ok docs/cards/iqtile-ab.card
+ok docs/cards/m2-group2-pp.card
+ok docs/cards/m2-mxfp4-rate.card
+ok docs/cards/m2-mxfp4-tile.card
+ok docs/cards/mimo2-r5.card
+ok docs/cards/mimoref-dump.card
+ok docs/cards/mimotrace.card
+ok docs/cards/mrs-flash-qwen3.card
+ok docs/cards/mrsq3-nsys.card
+ok docs/cards/mtp-qwen4exp-dump.card
+ok docs/cards/mtpcost-pp.card
+ok docs/cards/mtppf-pp.card
+ok docs/cards/n2c-glm.card
+ok docs/cards/n2c-q38.card
+ok docs/cards/n2c-q38one.card
+ok docs/cards/n2c-v41.card
+ok docs/cards/n3090-glm.card
+ok docs/cards/n3090-q3.card
+ok docs/cards/n3090-q36.card
+ok docs/cards/n3090-q36two.card
+ok docs/cards/n3090-q38.card
+ok docs/cards/n3090-q38r.card
+ok docs/cards/n3090-v41.card
+ok docs/cards/n3090-v41r.card
+ok docs/cards/nemotron-base-3090.card
+ok docs/cards/nemotron-base-a6000.card
+ok docs/cards/nemotron-ncu-q4k-scan.card
+ok docs/cards/nemotron-ncu-q5.card
+ok docs/cards/nemotron-ncu-stalls.card
+ok docs/cards/nemotron-nsys-a6000.card
+ok docs/cards/node-decode.card
+ok docs/cards/node-link-bytes.card
+ok docs/cards/node-small-link.card
+ok docs/cards/nvtier-read.card
+ok docs/cards/oneload-aa.card
+ok docs/cards/padprobe-flash.card
+ok docs/cards/paged028.card
+ok docs/cards/pageddraft-decode.card
+ok docs/cards/pcie-a6000.card
+ok docs/cards/pf1-tile-m5.card
+ok docs/cards/pfcopy-ab.card
+ok docs/cards/pfxprose.card
+ok docs/cards/pickrate-c1-ab.card
+ok docs/cards/pickrate-c1.card
+ok docs/cards/pickrule-ab.card
+ok docs/cards/prefill1-ab.card
+ok docs/cards/prefillgroup-pp.card
+ok docs/cards/q2k-iq2xs-rate.card
+ok docs/cards/q35fx-dump.card
+ok docs/cards/q35oracle-dump.card
+ok docs/cards/q35pfa.card
+ok docs/cards/q36-public.card
+ok docs/cards/q36rows-pass.card
+ok docs/cards/q38-3090-cfg.card
+ok docs/cards/q38-3090-k1.card
+ok docs/cards/q38-3090-nsys.card
+ok docs/cards/q38-public.card
+ok docs/cards/q38-tile.card
+ok docs/cards/q38-union.card
+ok docs/cards/q38-warm.card
+ok docs/cards/q38bpbug-ab.card
+ok docs/cards/q38cjk-ab.card
+ok docs/cards/q38gap-split.card
+ok docs/cards/q38head-ab.card
+ok docs/cards/q38head2-ab.card
+ok docs/cards/q38hol-ab.card
+ok docs/cards/q38legs-tg.card
+ok docs/cards/q38mhist-read.card
+ok docs/cards/q38mtp-tg.card
+ok docs/cards/q38prose-pp.card
+ok docs/cards/q38ref-dump.card
+ok docs/cards/q38res-ab.card
+ok docs/cards/q38route-mstar.card
+ok docs/cards/q38route-pp.card
+ok docs/cards/q38seed-ab.card
+ok docs/cards/q38seed-mtp.card
+ok docs/cards/q38step-stats.card
+ok docs/cards/q38tier-ab.card
+ok docs/cards/q38wide-pp.card
+ok docs/cards/q3fa-pp.card
+ok docs/cards/q3flash-srcpage.card
+ok docs/cards/q3gemmb-ncu.card
+ok docs/cards/q3gemmb-pp.card
+ok docs/cards/q3gemmc-ncu.card
+ok docs/cards/q3gemmd-ncu-t512.card
+ok docs/cards/q3gemmd-ncu.card
+ok docs/cards/q3ncu-flash.card
+ok docs/cards/q3swz-ncu.card
+ok docs/cards/q3swz-pp.card
+ok docs/cards/q3ub-pp.card
+ok docs/cards/qdot-rate-redpairs.card
+ok docs/cards/qdsweep.card
+ok docs/cards/qtah-crest.card
+ok docs/cards/qwen3-xeng.card
+ok docs/cards/r4b-decode.card
+ok docs/cards/r4d-decode.card
+ok docs/cards/r4dc-default.card
+ok docs/cards/r8-sidecar.card
+ok docs/cards/readmesit-glmbp.card
+ok docs/cards/readmesit-glmg.card
+ok docs/cards/readmesit-q3.card
+ok docs/cards/readmesit-q36.card
+ok docs/cards/readmesit-q38bp.card
+ok docs/cards/readmesit-q38g.card
+ok docs/cards/readmesit-v41bp.card
+ok docs/cards/readmesit-v41g.card
+ok docs/cards/refill-decode.card
+ok docs/cards/rel027-ab.card
+ok docs/cards/rel028-ab.card
+ok docs/cards/resclock-ab.card
+ok docs/cards/resclock-pin.card
+ok docs/cards/resit-glm-3090.card
+ok docs/cards/resit-glm-a.card
+ok docs/cards/resit-glm-screen.card
+ok docs/cards/resit-q36-3090.card
+ok docs/cards/resit-q36-a.card
+ok docs/cards/resit-q38-3090.card
+ok docs/cards/resit-q38-a.card
+ok docs/cards/resit-q38-screen.card
+ok docs/cards/resit-v41-3090.card
+ok docs/cards/resit-v41-a.card
+ok docs/cards/resit-v41-bp.card
+ok docs/cards/resit-v41-screen.card
+ok docs/cards/resv41.card
+ok docs/cards/resvideo-tape.card
+ok docs/cards/resvideo-v41.card
+ok docs/cards/router-attr.card
+ok docs/cards/selftest-lease-hold.card
+ok docs/cards/sit10-dsref.card
+ok docs/cards/sit10-greedy.card
+ok docs/cards/sit10-kldbase.card
+ok docs/cards/slots-qwen3-ab.card
+ok docs/cards/slots-qwen35-ab.card
+ok docs/cards/slots-qwen38-ab.card
+ok docs/cards/stgv41-ab-off.card
+ok docs/cards/stgv41-ab.card
+ok docs/cards/stream028.card
+ok docs/cards/swapprio-ab.card
+ok docs/cards/swapprio-nsys.card
+ok docs/cards/t1-split-pp.card
+ok docs/cards/t3-warm-probe.card
+ok docs/cards/tape026.card
+ok docs/cards/tape027.card
+ok docs/cards/tape028.card
+ok docs/cards/tileunits-ab.card
+ok docs/cards/twocard-v41-ab.card
+ok docs/cards/uniondispatch-pp.card
+ok docs/cards/unpacksimt-launch.card
+ok docs/cards/v41-public.card
+ok docs/cards/v41-residency-pp.card
+ok docs/cards/v41-victim-populate.card
+ok docs/cards/v41-warm.card
+ok docs/cards/v41-xeng.card
+ok docs/cards/v41-xeng2.card
+ok docs/cards/v41bp-ab.card
+ok docs/cards/vid026-3arm.card
+ok docs/cards/xstream-common.card
+ok docs/cards/xstream-pp.card
+ok lease mode refuses an example card
+ok lease mode takes the self-test card
+ok gpu-ab without a card
+ok gpu-ab checks the card at its rounds
+ok gpu-ab refuses an example card
+ok gpu-ab passes the card and plans
+ok gpu-ab names the tree that checks nothing
+ok gpu-ab merges BLOOMERY_BOX_ENV
+ok gpu-ab puts the arm levers after the caller
+ok gpu-ab refuses an arm tree without the card
+ok gpu-ab refuses an arm that sets the rounds
+ok gpu-ab refuses rounds that disagree
+ok lease-hold without --card
+ok lease-hold without a command
+ok lease-hold with two cards
+ok lease_take refuses a GPU runner with no TIMING_GPU
+ok the refused GPU runner opens no lease file
+ok lease_take without a card
+ok lease_take without a card says how to pass one
+ok lease_take without a card opens no lease file
+ok lease_take names box.sh BLOOMERY_CARD
+ok lease_take refuses a card outside docs/cards
+ok lease_take refuses an example card
+ok lease_take refuses a missing card
+ok lease_take checks an ab card at the runner ROUNDS
+ok lease_take falls back to BLOOMERY_AB_ROUNDS
+ok lease_take prices a refusal with ROUND_MINUTES
+ok lease_take refuses inside lease-hold
+ok refused runs open no lease file
+ok lease_take prints the card, then holds
+ok lease_take ok prints /^\[lease\] card: docs/cards/hcpre-ab\.card sha256=[0-9a-f]{64}$/
+ok lease_take ok prints /^\[lease\] card: ok kind=ab h = 0\.875 % at 5 rounds \(the runner/
+ok lease_take ok prints /is not the machine lease/
+ok lease_take ok prints /^\[lease\] held by pid/
+ok lease_take ok prints /^\[test\] lease_take returned$/
+ok lease_take prints the whole body (15 lines)
+ok the lease ends with the shell that took it
+ok lease_take records a CPU runner as timing no GPU
+ok lease_take records a GPU runner's timing card
+ok lease_take records both cards of a two-card run
+ok lease_take under BLOOMERY_LOCK_DIR takes the machine lease
+ok lease_take under BLOOMERY_LOCK_DIR is admissible
+ok lease-hold returns the failing command rc
+ok lease-hold prints /^\[lease\] card \| kind: exclusive$/
+ok lease-hold prints /^\[lease\] card: ok kind=exclusive minutes=5\.\.15/
+ok lease-hold prints /^--- witness pre .* epoch [0-9]+ ---$/
+ok lease-hold prints /^--- witness post .* epoch [0-9]+ ---$/
+ok lease-hold prints /^\[lease-hold\] command: false$/
+ok lease-hold prints /^\[lease\] released at /
+ok lease-hold released the lease after the command failed
+ok lease-hold holds the lease while the command runs
+ok lease-hold marks its command
+ok lease-hold command leaves a process behind
+ok lease-hold says the lease outlives it
+ok the process left behind keeps the lease
+ok a waiter names the holder at once
+ok the waiter prints /^\[lease\]   pid 4242 holds it: comm=sleep exe=/bin/sleep cwd=/tmp elapsed=0h10m00s card=docs/cards/selftest-lease-hold\.card args=\[sleep 60\]$/
+ok the waiter prints //locks: FLOCK WRITE taken by pid 4241 \(not running — a lock outlives the process that took it .*; the holders are the processes above\)$/
+ok the waiter prints /^\[lease\] held by pid/
+ok the waiter prints /^\[test\] lease_take returned$/
+ok the waiter lists only the descriptor on the lock
+ok the lease is free once the process left behind exits
+ok lease_holders on a lock nobody holds says so
+ok lease_holders without a /proc tree says so
+ok lease_take meeting a shared probe waits for it
+ok lease_take takes the lease once the probe lets go
+ok lease-hold refuses a card outside docs/cards
+ok lease-hold refused: no lease file opened
+ok this tree: lease-hold with the self-test card
+ok this tree: the self-test lease is released
+ok lease_free: a free lock reads free (0)
+ok lease_free: a shared holder (another probe) does not read as held (0)
+ok the old exclusive probe reads that shared holder as held (1, the false read)
+ok lease_free: an exclusive holder (the lease) reads held (1)
+ok lease_free: a lock it cannot open is untestable (2), named
+ok if lease_free reads an untestable lock as not free
+ok no hold up: lease_holds_up is 0
+ok no hold up: lease_holds_up prints nothing
+ok a hold up: lease_holds_up names it, its owner, age and start
+ok the owner's own hold is passed
+ok the owner's own hold is passed: nothing printed
+ok another owner's hold is not passed
+ok the owner's own hold is not listed to it
+ok lease_guard 0 with a hold up: 75 at once
+ok lease_guard names the hold, its owner and how the owner passes
+ok lease_guard 0 with only the caller's own hold up: 0
+ok lease_guard 0 with only the caller's own hold up: silent
+ok lease_guard 0 with another owner's hold up: 75
+ok lease_guard 0 on a quiet box: 0 at once
+ok lease_guard 0 on a quiet box: silent
+ok lease_guard 0 with the lease held: 75, naming the lease
+ok lease_guard asks lease_holders for the holder
+ok lease_guard waits for the lease, then starts on two quiet polls
+ok lease_guard says it waits, with its bound and poll
+ok lease_guard gives up at its bound: 75, naming what is up
+ok two holds up: the later owner gives way at once (75)
+ok two holds up: the earlier owner waits as for any hold
+ok the earlier owner does not give way
+ok two holds up in the same second: the owner that sorts later gives way
+ok two holds up under a lock directory with a space: the later owner gives way at once (75)
+ok lease_guard on an untestable lease: 70 at once
+ok lease_guard refuses a bound that is not seconds
+ok lease_guard refuses an owner that is not a word
+ok lease_guard refuses a hold pattern without one * for the owner
+ok the lease and the holds are under /root by default
+ok BLOOMERY_LOCK_DIR moves the lease and the holds
+ok box.sh: a command reaches the stub ssh
+ok box.sh: the guard comes first, before the environment
+ok box.sh: the command comes last
+ok box.sh: a cargo oxide command reaches the stub ssh
+ok box.sh: a cargo oxide command checks the installed cargo-oxide against the pin
+ok box.sh: a cargo oxide command with BLOOMERY_BOX_ENV runs
+ok box.sh: the cargo-oxide check runs after BLOOMERY_BOX_ENV
+ok box.sh: 'bash tools/gate.sh --oxide -p x --release --lib' reaches the stub ssh
+ok box.sh: 'bash tools/gate.sh --oxide -p x --release --lib' checks the installed cargo-oxide too
+ok box.sh: 'bash tools/release/build.sh 0.1.0 abcdef0' reaches the stub ssh
+ok box.sh: 'bash tools/release/build.sh 0.1.0 abcdef0' checks the installed cargo-oxide too
+ok box.sh: 'bash tools/release/build.sh --check /tmp/out && bash tools/release/build.sh 0.1.0 abcdef0' reaches the stub ssh
+ok box.sh: 'bash tools/release/build.sh --check /tmp/out && bash tools/release/build.sh 0.1.0 abcdef0' checks the installed cargo-oxide too
+ok box.sh: 'cargo check' reaches the stub ssh
+ok box.sh: 'cargo check' does not check cargo-oxide
+ok box.sh: 'bash tools/release/build.sh --check /tmp/out' reaches the stub ssh
+ok box.sh: 'bash tools/release/build.sh --check /tmp/out' does not check cargo-oxide
+ok box.sh: the pinned cargo-oxide passes the check
+ok box.sh: a cargo-oxide from 4da6c138 is refused by name
+ok box.sh: a cargo-oxide from path is refused by name
+ok box.sh: BLOOMERY_BOX_WAIT and BLOOMERY_HOLD_OWNER reach the guard
+ok box.sh: lease_guard 0 03
+ok box.sh: a read-only command runs
+ok box.sh: the read-only command has no guard
+ok box.sh: the read-only command is the command
+ok box.sh: BLOOMERY_BOX_READONLY=1 refuses 'cargo --version' by name
+ok box.sh: the refusal of 'cargo --version' reached no ssh
+ok box.sh: BLOOMERY_BOX_READONLY=1 refuses 'just check' by name
+ok box.sh: the refusal of 'just check' reached no ssh
+ok box.sh: BLOOMERY_BOX_READONLY=1 refuses 'make -j' by name
+ok box.sh: the refusal of 'make -j' reached no ssh
+ok box.sh: BLOOMERY_BOX_READONLY=1 refuses 'cmake ..' by name
+ok box.sh: the refusal of 'cmake ..' reached no ssh
+ok box.sh: BLOOMERY_BOX_READONLY=1 refuses 'ninja -C build' by name
+ok box.sh: the refusal of 'ninja -C build' reached no ssh
+ok box.sh: BLOOMERY_BOX_READONLY=1 refuses './target/release/generate_ds41 --time' by name
+ok box.sh: the refusal of './target/release/generate_ds41 --time' reached no ssh
+ok box.sh: BLOOMERY_BOX_READONLY takes 1 or 0
+ok box.sh: BLOOMERY_BOX_WAIT is seconds
+ok box.sh: BLOOMERY_HOLD_OWNER is a word
+ok box.sh: BLOOMERY_BOX_ENV entries reach the command
+ok box.sh: each BLOOMERY_BOX_ENV entry is one export
+ok box.sh: a BLOOMERY_BOX_ENV entry with a quote is refused
+ok box.sh: the second half of a spaced value is refused
+ok box.sh: a lower-case name after an entry is refused
+ok box.sh: BLOOMERY_BOX_ENV entries on separate lines reach the command
+ok box.sh: an entry on a later line is exported too
+ok box.sh: a BLOOMERY_TIER entry on a later line is read
+ok box.sh: a lower-case name on a later line is refused
+ok box.sh: a BLOOMERY_BOX_ENV refusal runs no command
+ok box.sh: a command with the default card runs
+ok box.sh: the default card reaches the box as BLOOMERY_BOX_CARD=3090
+ok box.sh: a command with BLOOMERY_CARD=both runs
+ok box.sh: BLOOMERY_CARD=both reaches the box as BLOOMERY_BOX_CARD=both
+ok box.sh: BLOOMERY_ARCH unset runs without tools/arch.sh
+ok box.sh: BLOOMERY_ARCH unset adds nothing to the remote command
+ok box.sh: BLOOMERY_ARCH=sm_121 runs
+ok box.sh: BLOOMERY_ARCH reaches the command as one export
+ok box.sh: the same BLOOMERY_ARCH in BLOOMERY_BOX_ENV runs
+ok box.sh: BLOOMERY_ARCH='sm121' is refused
+ok box.sh: the refused BLOOMERY_ARCH='sm121' reached no ssh or rsync
+ok box.sh: BLOOMERY_ARCH='' is refused
+ok box.sh: the refused BLOOMERY_ARCH='' reached no ssh or rsync
+ok box.sh: BLOOMERY_ARCH='SM_86' is refused
+ok box.sh: the refused BLOOMERY_ARCH='SM_86' reached no ssh or rsync
+ok box.sh: BLOOMERY_ARCH='sm_8' is refused
+ok box.sh: the refused BLOOMERY_ARCH='sm_8' reached no ssh or rsync
+ok box.sh: BLOOMERY_ARCH and a different BLOOMERY_BOX_ENV entry are refused
+ok box.sh: the contradicting BLOOMERY_ARCH reached no ssh or rsync
+ok box.sh: a BLOOMERY_BOX_ENV arch entry that is not the default, with BLOOMERY_ARCH unset, is refused
+ok box.sh: the unset-environment BLOOMERY_ARCH entry reached no ssh or rsync
+ok box.sh: a BLOOMERY_BOX_ENV arch entry equal to the default runs
+ok box.sh: the entry is the only export of BLOOMERY_ARCH
+ok box.sh: the entry alone exports BLOOMERY_ARCH once
+ok box.sh: a direct call
+ok box.sh: a direct call runs no queue client
+ok box.sh: a direct call has no dir lock in its rsync
+ok box.sh: BLOOMERY_BOX_QUEUE=0 is the direct call
+ok box.sh: BLOOMERY_BOX_QUEUE=0 sends the same ssh and rsync arguments as unset
+ok box.sh: BLOOMERY_BOX_LOCAL=0 sends the same ssh and rsync arguments as unset
+ok box.sh: BLOOMERY_BOX_QUEUE takes 1 or 0
+ok box.sh: a queue refusal syncs nothing
+ok box.sh: a queued call submits one job
+ok box.sh: the sync runs behind the remote directory's lock, the old id removed first, the new one put in place after rsync ends 0
+ok box.sh: the id goes with the tree as .sync-id.new, after the tree
+ok box.sh: the id is 16 hex digits
+ok box.sh: the id's temp dir is gone after the call
+ok box.sh: the sync id is not a file of the Mac tree
+ok box.sh: the Mac tree has no .sync-id
+ok box.sh: the job words are run --card 3090 --class round --name x-echo-<tag6> --expected-s 90 --
+ok box.sh: the id is the tree's (box.sh --tree-id)
+ok box.sh: the job holds the dir lock shared, 85 when it cannot
+ok box.sh: the job checks the tree's .sync-id against this call's id first
+ok box.sh: the job exits 80 on a stale tree
+ok box.sh: the job is the command as it runs directly
+ok box.sh: the job has no guard
+ok box.sh: the ssh of a queued call has no guard and no command
+ok box.sh: the remote directory is made, and its id read, before the sync
+ok box.sh --tree-id: one tree read twice is one id
+ok box.sh --tree-id: what rsync does not send (target/ and .git/ anywhere, top-level .ptx, .ll, .oxide-artifacts/) leaves it
+ok box.sh --tree-id: a nested .ptx (rsync sends it) moves it
+ok box.sh --tree-id: the tree back as it was is the same id
+ok box.sh --tree-id: a file's new mtime moves it
+ok box.sh --tree-id: a file's new mode moves it
+ok box.sh --tree-id: same-length bytes with the mtime put back move it
+ok box.sh --tree-id: the bytes restored, the mtime kept, is the same id
+ok box.sh: a queued call on a tree the box holds is not synced, named
+ok box.sh: a tree the box holds runs no rsync
+ok box.sh: a tree the box holds is still checked by the job
+ok box.sh: a queued call on a tree the box holds another id for syncs
+ok box.sh: the other id syncs
+ok box.sh: a queued call exits with the client's 3
+ok box.sh: a queued call exits with the client's 80
+ok box.sh: a queued call exits with the client's 81
+ok box.sh: a queued call exits with the client's 83
+ok box.sh: a queued call exits with the client's 84
+ok box.sh: a queued call exits with the client's 85
+ok box.sh: a queued call exits with the client's 130
+ok box.sh: a queued call exits with the client's 143
+ok box.sh: no prediction prints predicted unknown
+ok box.sh: no prediction submits without --expected-s
+ok box.sh: BLOOMERY_Q_PRED_S=0 is refused
+ok box.sh: the refused prediction 0 synced nothing
+ok box.sh: BLOOMERY_Q_PRED_S=abc is refused
+ok box.sh: the refused prediction abc synced nothing
+ok box.sh: BLOOMERY_Q_PRED_S=1.5 is refused
+ok box.sh: the refused prediction 1.5 synced nothing
+ok box.sh: BLOOMERY_Q_PRED_S=-3 is refused
+ok box.sh: the refused prediction -3 synced nothing
+ok box.sh: BLOOMERY_Q_PRED_S=090 is refused
+ok box.sh: the refused prediction 090 synced nothing
+ok box.sh: BLOOMERY_Q_CLASS reaches the job and the queue line
+ok box.sh: --class lead
+ok box.sh: BLOOMERY_Q_CLASS is a class
+ok box.sh: a command whose first word is a path
+ok box.sh: the name takes the last part of the first word
+ok box.sh: a command whose first word is an assignment
+ok box.sh: the name holds only [A-Za-z0-9._-]
+ok box.sh: a failed sync with the dir lock held by another tree ends 83, named
+ok box.sh: the 83 submitted no job
+ok box.sh: the 83 probed the dir lock and the remote id in one call
+ok box.sh: the 83 left no temp dir
+ok box.sh: a failed sync with the dir lock free is rsync's own code
+ok box.sh: a failed sync whose probe cannot reach the box is rsync's own code
+ok box.sh: a direct call whose rsync fails keeps rsync's code
+ok box.sh: a direct call probes no lock
+ok box.sh: BLOOMERY_CARD=a6000 is the queue lane
+ok box.sh: --card a6000
+ok box.sh: BLOOMERY_CARD=both is the queue lane
+ok box.sh: --card both
+ok box.sh: BLOOMERY_Q_CARD=a6000 alone is the lane
+ok box.sh: the lane from BLOOMERY_Q_CARD
+ok box.sh: BLOOMERY_CARD and BLOOMERY_Q_CARD that agree are one lane
+ok box.sh: BLOOMERY_CARD and BLOOMERY_Q_CARD that differ are refused
+ok box.sh: the differing lanes synced nothing
+ok box.sh: BLOOMERY_CARD=any is not a lane (only BLOOMERY_Q_CARD takes it)
+ok box.sh: a queued call with a file on stdin is refused
+ok box.sh: … before any sync or submit
+ok box.sh: a queued call with a pipe of input on stdin is refused
+ok box.sh: a queued call with a NUL on stdin is refused
+ok box.sh: a direct call still takes a file on stdin
+ok box.sh: a queued call with an empty stdin runs
+ok box.sh: a queued call on an open, empty pipe runs within its 1 s bound (no hang)
+ok box.sh: BLOOMERY_Q_CARD is a lane
+ok box.sh: BLOOMERY_Q_CARD=any
+ok box.sh: --card any
+ok box.sh: any picks the card from $SIGNALBOX_CARD when the job starts
+ok box.sh: any exports the daemon's card as BLOOMERY_BOX_CARD
+ok box.sh: any fixes no card on the Mac
+ok box.sh: no lane named, any-form gates only: 'cargo oxide build -- --bin a && BLOOMERY…'
+ok box.sh: … is lane any
+ok box.sh: … its gate card is the daemon's
+ok box.sh: no lane named, any-form gates only: 'bash tools/ref/real-only.sh g && cargo o…'
+ok box.sh: … is lane any
+ok box.sh: … its gate card is the daemon's
+ok box.sh: no lane named, any-form gates only: 'bash tools/host-gate.sh h && bash tools/…'
+ok box.sh: … is lane any
+ok box.sh: … its gate card is the daemon's
+ok box.sh: no lane named, any-form gates only: 'bash tools/scan-args.sh s && bash tools/…'
+ok box.sh: … is lane any
+ok box.sh: … its gate card is the daemon's
+ok box.sh: no lane named, any-form gates only: 'cargo test -p x -- --ignored && bash too…'
+ok box.sh: … is lane any
+ok box.sh: … its gate card is the daemon's
+ok box.sh: no lane named, not only any-form gates: 'true…'
+ok box.sh: … stays on lane 3090
+ok box.sh: no lane named, not only any-form gates: 'cargo oxide build -- --bin g && bash too…'
+ok box.sh: … stays on lane 3090
+ok box.sh: no lane named, not only any-form gates: 'BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:…'
+ok box.sh: … stays on lane 3090
+ok box.sh: no lane named, not only any-form gates: 'BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:…'
+ok box.sh: … stays on lane 3090
+ok box.sh: no lane named, not only any-form gates: 'BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:…'
+ok box.sh: … stays on lane 3090
+ok box.sh: no lane named, not only any-form gates: 'BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:…'
+ok box.sh: … stays on lane 3090
+ok box.sh: no lane named, not only any-form gates: 'BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:…'
+ok box.sh: … stays on lane 3090
+ok box.sh: no lane named, not only any-form gates: 'BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:…'
+ok box.sh: … stays on lane 3090
+ok box.sh: no lane named, not only any-form gates: 'BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:…'
+ok box.sh: … stays on lane 3090
+ok box.sh: no lane named, not only any-form gates: 'BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:…'
+ok box.sh: … stays on lane 3090
+ok box.sh: no lane named, not only any-form gates: 'export BLOOMERY_GATE_CARD=3090 && BLOOME…'
+ok box.sh: … stays on lane 3090
+ok box.sh: no lane named, not only any-form gates: 'BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:…'
+ok box.sh: … stays on lane 3090
+ok box.sh: no lane named, not only any-form gates: 'BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:…'
+ok box.sh: … stays on lane 3090
+ok box.sh: no lane named, not only any-form gates: 'BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:…'
+ok box.sh: … stays on lane 3090
+ok box.sh: no lane named, not only any-form gates: 'BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:…'
+ok box.sh: … stays on lane 3090
+ok box.sh: no lane named, not only any-form gates: 'BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:…'
+ok box.sh: … stays on lane 3090
+ok box.sh: a BLOOMERY_GATE_CARD card in BLOOMERY_BOX_ENV is the lane of any-form gates
+ok box.sh: … lane a6000 from BLOOMERY_BOX_ENV
+ok box.sh: the last BLOOMERY_GATE_CARD entry of BLOOMERY_BOX_ENV is the lane
+ok box.sh: … lane 3090, the last entry
+ok box.sh: BLOOMERY_GATE_CARD=any in BLOOMERY_BOX_ENV keeps lane 3090
+ok box.sh: … lane 3090 under an any entry
+ok box.sh: BLOOMERY_CARD=a6000 is its lane whatever the command
+ok box.sh: … lane a6000
+ok box.sh: BLOOMERY_Q_CARD=none
+ok box.sh: --card none
+ok box.sh: none keeps the default card pin and BLOOMERY_BOX_CARD=3090
+ok box.sh: none picks no card
+ok box.sh: a read under BLOOMERY_BOX_QUEUE=1 runs
+ok box.sh: a read under the queue submits no job
+ok box.sh: a read under the queue syncs nothing
+ok box.sh: a read under the queue is the direct read
+ok box.sh: a read under the queue has no dir lock
+ok box.sh: a read under the queue still refuses a build
+ok box.sh job: the command runs and its code is the job's; lane 3090 is the gate card
+ok box.sh job: lane a6000 pins the A6000 and is the gate card
+ok box.sh job: lane both pins the 3090 then the A6000 and is the gate card
+ok box.sh job: a BLOOMERY_BOX_ENV gate card wins over the lane's
+ok box.sh job: any on the daemon's a6000 pins the A6000 and is its gate card
+ok box.sh job: any on the daemon's 3090 keeps the default pin and is its gate card
+ok box.sh job: any with no SIGNALBOX_CARD is a named 70, the command not run
+ok box.sh job: any on a lane that is neither card is a named 70
+ok box.sh job: none keeps the default pin and names no gate card
+ok box.sh job: a tree synced again since the submit ends 80, named
+ok box.sh job: the stale tree ran nothing
+ok box.sh job: a tree with no .sync-id ends 80
+ok box.sh job: the tree with no .sync-id ran nothing
+ok box.sh job: the same id runs the command
+ok box.sh job: the command ran
+ok box.sh job: the dir lock held exclusive ends 85
+ok box.sh job: the 85 ran nothing
+ok box.sh job: the dir lock held shared by another job lets this one run
+ok box.sh job: quotes, dollars and newlines in the command cross whole
+ok box.sh job: the quoted command ends the output the same way
+ok box.sh: local mode runs the command here, after the environment file
+ok box.sh: local mode runs it in the tree, the card local, the locks and data passed, no oxide backend and no build jobs set
+ok box.sh: local mode reaches no ssh and no rsync
+ok box.sh: local mode made its lock directory
+ok box.sh: local mode unsets the environment file's CUDA_OXIDE_BACKEND and adds no backend check to cargo oxide
+ok box.sh: local mode refuses an environment file that moves the lock directory after the guard
+ok box.sh: that refusal ran no command
+ok box.sh: local mode runs BLOOMERY_CARD=a6000 on the local card
+ok box.sh: local mode refuses BLOOMERY_CARD=both
+ok box.sh: the refusal of both ran no command
+ok box.sh: the local guard reads the holds in the lock directory, a path with a space and a ; whole
+ok box.sh: the local guard ran no command while the hold was up
+ok box.sh: local mode with no environment file: 69, named
+ok box.sh: local mode keeps its locks under ~/.cache/bloomery/locks by default
+ok box.sh: local mode refuses the lock directory /root, the box's
+ok box.sh: local mode refuses a relative lock directory, which two trees would read apart
+ok box.sh: local mode refuses an environment file's BLOOMERY_ARCH that the recipe did not expand
+ok box.sh: the command gets none of what box.sh read on this side, its own outputs only as it exports them, as on the box
+ok box.sh: just box-gc's script refuses local mode by name
+ok box.sh: local mode refuses the box queue
+ok box.sh: the refusal of the queue ran no command
+ok box.sh: the refusal of the queue runs no queue client
+ok box.sh: local mode refuses a host that is not Linux
+ok box.sh: BLOOMERY_BOX_LOCAL takes 1 or 0
+ok gpu-gate.sh: both cards in view refuse the 3090 lock alone
+ok gpu-gate.sh: both cards in view refuse any
+ok gpu-gate.sh: the A6000 in view refuses the 3090 lock
+ok gpu-gate.sh: both needs both cards in view
+ok gpu-gate.sh: BLOOMERY_BOX_CARD is a card box.sh picks
+ok gpu-gate.sh: local is box.sh's choice, never a gate card
+ok gpu-gate.sh: box.sh's local mode refuses both
+ok gpu-gate.sh: box.sh's local mode refuses the lock directory /root
+ok gpu-gate.sh: BLOOMERY_LOCK_DIR holds the gate locks
+ok gpu-gate.sh: box.sh's local mode opens its one lock there, the path whole
+ok gpu-gate.sh: BLOOMERY_GATE_CARD is a card
+ok gpu-gate.sh: a lock file it cannot open ends at once, by name
+ok gate.sh: --oxide builds for sm_86 when BLOOMERY_ARCH is unset
+ok gate.sh: --oxide builds for BLOOMERY_ARCH
+ok gate.sh: --oxide refuses a BLOOMERY_ARCH that is no arch, by name
+ok gate.sh: a plain cargo test never reads BLOOMERY_ARCH
+ok gate.sh: a filter's call passes cargo's output through
+ok   … and ends 78 when no test passed, by name
+FAIL gate.sh: a FIFO it cannot make ends 70: no line matches /mkfifo.*File exists/
+    | mkfifo: '/tmp/card-tests.ckSN6n/gateshtree/log.out'의 FIFO 버퍼를 만들 수 없습니다: 파일이 있습니다
+ok   … before cargo runs, and the linked file stays as it was
+ok gate.sh: a log reader that fails after a passing summary ends with its code
+ok gate.sh: cargo's failure wins over the reader's
+ok gate.sh: TERM just after tee starts (before-pid)
+ok   cargo never starts after the signal
+ok   tee ended without a FIFO writer
+ok gate.sh: HUP just after tee starts (before-pid)
+ok   cargo never starts after the signal
+ok   tee ended without a FIFO writer
+ok gate.sh: TERM just after tee starts (after-pid)
+ok   cargo never starts after the signal
+ok   tee ended without a FIFO writer
+ok gate.sh: HUP just after tee starts (after-pid)
+ok   cargo never starts after the signal
+ok   tee ended without a FIFO writer
+ok precheck without a card refuses before any build
+ok precheck passes the environment card
+ok precheck checks an ab card at BLOOMERY_AB_ROUNDS
+ok precheck takes the recipe card
+ok precheck refuses two cards
+ok precheck passes a dry run by name
+ok this tree: precheck with the exact-ref card
+ok witness (head indent gpus) with a failing nvidia-smi goes on
+ok witness (head indent gpus) names the failure
+ok witness (head indent stage0-gpus) with a failing nvidia-smi goes on
+ok witness (head indent stage0-gpus) names the failure
+ok witness (head indent stage0-apps) with a failing nvidia-smi goes on
+ok witness (head indent stage0-apps) names the failure
+ok witness (head-load indent gpu-apps) with a failing nvidia-smi goes on
+ok witness (head-load indent gpu-apps) names the failure
+ok cards: both names resolve
+ok cards: the 3090 missing leaves its variable empty, named
+ok cards: a name twice leaves that card empty, named
+ok cards: a failing nvidia-smi leaves both empty, named
+ok cards: no nvidia-smi on PATH leaves both empty, named
+ok timing-card.sh local: the one card listed is the timing card
+ok timing-card.sh local: a warning beside the list is no card
+ok timing-card.sh local: a runner that does not opt in is refused
+ok timing-card.sh local: the refusal line is tagged [timing-card]
+ok timing-card.sh local: a failing nvidia-smi is refused
+ok timing-card.sh local: no card listed is refused
+ok timing-card.sh local: two cards and no BLOOMERY_TIMING_GPU are refused
+ok timing-card.sh local: BLOOMERY_TIMING_GPU picks a listed card
+ok timing-card.sh local: a BLOOMERY_TIMING_GPU nvidia-smi does not list is refused
+ok timing-card.sh local: BLOOMERY_TIMING_CARDS is refused
+ok timing-card.sh local: the lock directory /root is refused
+ok timing-card.sh local: the precheck reads the kernel journal
+ok timing-card.sh local: the precheck refuses a journal that fails (69)
+ok timing-card.sh local: the precheck refuses a journal that shows no line (69)
+ok timing-card.sh local: the precheck refuses a journal that only warns on stderr (69)
+ok timing-card.sh local: a lost card fails the arm
+ok timing-card.sh local: the card answering passes the arm
+ok timing-card.sh local: arm-place.sh refuses bp (64)
+ok t dump: gpu-ab, card.py and both depth runners print tdist.py for df 1..40
+ok walker: --classes on the stub tree
+ok walker: a two-hop any call is balanced with both cards, and names its line
+ok walker: a two-hop call with no card (bare name via BASH_SOURCE) is the 3090
+ok walker: a cycle ends, each file read once
+ok walker: a chain past WALK_DEPTH is a named refusal
+ok walker: a lease take two hops down is timed
+ok walker: a script named in a message is not followed
+ok walker: a card form the runner does not read is refused
+ok walker: a stub-test harness is named, not read
+ok the cpu guard tests (cpu-guard.sh)
+ok the depth-serve runner's stub tests (depth-serve.sh --self-test)
+card-tests: 784 tests, 1 failed
+check-recipes: the card tests failed
+self-test: ok (0 failures)
+box-tracks: self-test ok
+check-unsafe: self-test ok
+check-arch: self-test ok
+check-loads: self-test ok
+check-comments: self-test ok
+check-levers: self-test ok
+self-test: ok (0 failures)
+self-test: ok (0 failures)
+self-test: ok (0 failures)
+self-test: ok (6 checks, 0 failures)
+self-test: ok (34 checks, 0 failures)
+self-test: ok (10 checks, 0 failures)
+self-test: ok (0 failures)
+q38-3090-server.sh: self-test ok
+mac-check: self-test ok
+gate-batch self-test: slowest cases: chain mutant: every card reading 3090 lets a lane take a member it may not 26 s, chain: a gap between two members ends green 24 s, chain: a 3090-only and an A6000-pick member end green 23 s
+gate-batch self-test: 653 of 653 ok
+gpu-gate self-test: 112 of 112 ok
+stack-watch self-test: ok
+ptx-scan: self-test ok (21 cases, 0 failed)
+ptx-spill-check: self-test ok
+scan-args: self-test ok (41 cases, 0 failed)
+narrow-scan: self-test ok (124 cases, 0 failed)
+canon-check: self-test ok (37 cases, 0 failed)
+ptx-compare: self-test ok (33 cases, 0 failed)
+lds-scan: self-test ok (7 cases, 0 failed)
+mutant-run: self-test ok
+mac-static: self-test ok
+mac-remote: self-test ok (the flow against a fake remote needs macOS: skipped on Linux)
+box.sh: self-test ok
+seed-target: self-test ok
+carry: self-test ok (19 cases)
+release: self-test ok (12 cases)
+check-recipes: 58 tool self-tests ok
+boxq codes 80, 81, 83-85: no other tool or recipe produces them
+check-recipes: deepseek41 fixture draft: source stays up, dspark_model refuses
+check-recipes: fixture variants ok (6 row(s):  iq4xs q2kxl glmffnkq q6kdown unjoined unjoinedq6 )
+check-recipes: draft reads go through dspark_model (166 shell files, the printf fixture is red)
+refset-publish: self-test ok
+orphan-tests: ok (2705 tests, each run by a gate-* or lab-* recipe)
+check-recipes: arch owner ok (169 recipe lines build with --arch {{arch}}, 12 fixtures)
+wt: self-test ok
+proc-leg: gpu-gate holder named
+check-recipes: slowest: lease 98 s, gatebatch 86 s, recipescheck 59 s, gpugate 54 s, selftest 53 s
+
+
+Wall time: 105.41 seconds
+
+Command exited with code 1

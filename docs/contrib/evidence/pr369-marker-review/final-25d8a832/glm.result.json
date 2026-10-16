@@ -1,0 +1,8 @@
+{
+  "cwd": "/tmp/bloomery-pr369-review-fix",
+  "argv": [
+    "bash",
+    "tools/ref/depth-glm5next-stub.sh"
+  ],
+  "exit": 0
+}

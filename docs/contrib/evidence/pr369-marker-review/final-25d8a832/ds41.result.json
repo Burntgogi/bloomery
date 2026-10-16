@@ -1,0 +1,8 @@
+{
+  "cwd": "/tmp/bloomery-pr369-review-fix",
+  "argv": [
+    "bash",
+    "tools/ref/depth-ds41-stub.sh"
+  ],
+  "exit": 0
+}

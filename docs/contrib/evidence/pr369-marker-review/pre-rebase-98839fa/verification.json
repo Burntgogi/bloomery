@@ -1,0 +1,46 @@
+{
+  "source_head": "98839fa3b3780925204918c6c153a7b147962e05",
+  "syntax": {
+    "command": "bash -n tools/ref/cold-blocks.sh && bash -n tools/ref/depth-ds41-stub.sh && bash -n tools/ref/depth-qwen3moe-stub.sh && bash -n tools/ref/depth-glm5next-stub.sh",
+    "exit": 0
+  },
+  "self_test": {
+    "command": "bash tools/ref/cold-blocks.sh --self-test",
+    "exit": 0,
+    "observed_stdout_summary": "self-test: ok (0 failures)"
+  },
+  "glm_stub": {
+    "command": "bash tools/ref/depth-glm5next-stub.sh",
+    "exit": 0,
+    "observed_stdout_summary": "depth-glm5next-stub: 49 checks, 0 failed",
+    "skips": [
+      "Corpus-dependent cases: no pinned prose ids at /root/bloomery-data/glm5next/corpus-prose.ids",
+      "dry-same: DEPTH_GLM5NEXT_BASE unset"
+    ]
+  },
+  "qwen_stub": {
+    "command": "bash tools/ref/depth-qwen3moe-stub.sh",
+    "exit": 0,
+    "observed_stdout_summary": "depth-qwen3moe-stub: 86 checks, 0 failed",
+    "warm_case": "ok warm"
+  },
+  "ds41_stub": {
+    "command": "bash tools/ref/depth-ds41-stub.sh",
+    "exit": 0,
+    "observed_stdout_summary": "depth-ds41-stub: 84 checks, 0 failed",
+    "warm_cases": [
+      "ok warm",
+      "ok warm-fail",
+      "ok warm-bad"
+    ]
+  },
+  "full_recipe_integration": {
+    "command": "bash tools/check-recipes.sh",
+    "exit": 1,
+    "observed_failure": "gate.sh FIFO refusal test pins English mkfifo.*File exists; Korean diagnostic does not match",
+    "observed_card_tests": "784 tests, 1 failed",
+    "observed_tool_self_tests": 58,
+    "observed_owned_tests": 2705,
+    "plan": "Rebase onto already-corrected main, do not re-pin wording or change locale."
+  }
+}

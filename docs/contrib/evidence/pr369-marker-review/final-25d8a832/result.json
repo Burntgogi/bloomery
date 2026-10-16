@@ -1,0 +1,90 @@
+{
+  "source_head": "25d8a832ae55e4da35baf5e288dc2aba30564aa0",
+  "main_base": "c14c46115ae487b3472e6c8ce80d2d109fd599bb",
+  "previous_pr_head": "e8e13f25e2533d7dd6bf9c109fa14d7fcc2af679",
+  "pre_rebase_local_head": "98839fa3b3780925204918c6c153a7b147962e05",
+  "issue": 362,
+  "pull_request": 369,
+  "changes_this_session": [
+    "Remove the duplicate majflt_require definition; retain the existing single counter owner.",
+    "Add a real FIFO/read-only-stdout regression requiring failure before upstream EOF; clean up its owned fixture.",
+    "Document shared counter ownership and failure propagation.",
+    "Rebase onto already-corrected main instead of re-pinning the stale English strerror assertion or changing locale."
+  ],
+  "retained_existing_pr_fixes": [
+    "Forwarding and sampling errors propagate.",
+    "Unmatched prefix creates no marker; first matching line is sampled before EOF.",
+    "All three runner stubs override majflt_now, with no majflt_sample copies."
+  ],
+  "verification": {
+    "syntax": "All four PR shell files pass bash -n",
+    "commands": {
+      "cold-blocks": {
+        "command": "bash tools/ref/cold-blocks.sh --self-test",
+        "exit": 0,
+        "last_line": "self-test: ok (0 failures)"
+      },
+      "ds41": {
+        "command": "bash tools/ref/depth-ds41-stub.sh",
+        "exit": 0,
+        "last_line": "depth-ds41-stub: 84 checks, 0 failed"
+      },
+      "qwen": {
+        "command": "bash tools/ref/depth-qwen3moe-stub.sh",
+        "exit": 0,
+        "last_line": "depth-qwen3moe-stub: 86 checks, 0 failed"
+      },
+      "glm": {
+        "command": "bash tools/ref/depth-glm5next-stub.sh",
+        "exit": 0,
+        "last_line": "depth-glm5next-stub: 49 checks, 0 failed"
+      },
+      "check-recipes": {
+        "command": "bash tools/check-recipes.sh",
+        "exit": 0,
+        "last_line": "check-recipes: ok"
+      }
+    },
+    "live_stream_smoke": {
+      "passed": 7,
+      "detail": "stream-smoke.json"
+    },
+    "negative_controls": {
+      "forwarding_guard_removed": {
+        "exit": 1,
+        "failed_checks": [
+          "marker-forward-failure"
+        ]
+      },
+      "match_predicate_removed": {
+        "exit": 1,
+        "failed_checks": [
+          "marker-before-match"
+        ]
+      },
+      "buffered_awk_restored": {
+        "exit": 1,
+        "failed_checks": [
+          "marker-at-line",
+          "marker-before-match",
+          "marker-forward-failure"
+        ]
+      }
+    },
+    "mutant_patch_applicability": "All three git apply --check calls pass on this head.",
+    "full_recipe_integration": {
+      "card_tests_passed": 785,
+      "tool_self_tests_passed": 59,
+      "owned_tests": 2725
+    }
+  },
+  "test_design": "The original EOF-only write-failure check survived guard deletion because the final printf status propagated accidentally. The retained live-pipe regression catches loss of immediate failure propagation.",
+  "limits": [
+    "GLM corpus-dependent cases skipped: pinned corpus-prose.ids is not present at the configured path; local candidate corpus search found none and /root/bloomery-data access is denied. No substitute ids or SHA changes.",
+    "GLM dry-same skipped because no base-runner argument was supplied.",
+    "Native Mac paths were not executed; Linux host verification only.",
+    "No GPU, model accuracy, timing or throughput claim."
+  ],
+  "isolation": "Only cold-blocks.sh and docs/performance.md newly edited in this session; the original /tmp/bloomery-362 worktree and other session tools/box.sh scope were not modified.",
+  "pre_rebase_failure": "See pre-rebase/verification.json and check-recipes.log: old base fails its English mkfifo wording assertion under ko_KR; the rebased final head passes without a locale override."
+}

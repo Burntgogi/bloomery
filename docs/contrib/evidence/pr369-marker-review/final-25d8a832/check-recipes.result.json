@@ -1,0 +1,8 @@
+{
+  "cwd": "/tmp/bloomery-pr369-review-fix",
+  "argv": [
+    "bash",
+    "tools/check-recipes.sh"
+  ],
+  "exit": 0
+}

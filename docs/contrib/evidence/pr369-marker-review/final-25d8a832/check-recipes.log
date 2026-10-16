@@ -1,0 +1,65 @@
+ok the runner's own busy arm is left out
+ok a foreign cargo over the threshold tags the row
+ok a foreign rustc started inside the interval counts whole
+ok a reused pid counts from its own start
+ok a foreign process of the same busy share under the threshold does not tag
+ok a call under a second after the last reading starts the next interval
+ok cpu_busy_reading keeps its form
+ok a process tree that cannot be read is a named exit
+ok strict mode aborts on a foreign cargo
+ok live: the runner's own busy arm does not tag its row
+ok live: a foreign busy process tags the row
+cpu-guard: 11 tests, 0 failed
+proc-leg: wall 7 s
+check-recipes: tools/gate-paths.tsv: 133 gate rows held to the derivation, 29 rows with exceptions naming 627 gates
+self-test: slowest sections: narrow table 55 s, narrow 45 s, key 43 s
+self-test: ok (179 gate recipes, 0 failures)
+check-recipes: 67 timed recipes, 32 build in their box command after the card precheck
+check-recipes: 6 timed recipes build in a just dependency before their box command, where the precheck cannot come first: ab-decode (build-decode); measure-decode (build-decode); measure-engram (build-engram); measure-profile (build-decode); measure-sweep (build-decode); perf-decode (build-decode)
+card-tests: 785 tests, 0 failed
+self-test: ok (0 failures)
+box-tracks: self-test ok
+check-unsafe: self-test ok
+check-arch: self-test ok
+check-loads: self-test ok
+check-comments: self-test ok
+check-levers: self-test ok
+self-test: ok (0 failures)
+self-test: ok (0 failures)
+self-test: ok (0 failures)
+self-test: ok (6 checks, 0 failures)
+self-test: ok (34 checks, 0 failures)
+self-test: ok (10 checks, 0 failures)
+self-test: ok (0 failures)
+q38-3090-server.sh: self-test ok
+mac-check: self-test ok
+gate-batch self-test: slowest cases: chain mutant: every card reading 3090 lets a lane take a member it may not 26 s, chain: a gap between two members ends green 25 s, chain: a 3090-only and an A6000-pick member end green 23 s
+gate-batch self-test: 653 of 653 ok
+gpu-gate self-test: 112 of 112 ok
+stack-watch self-test: ok
+ptx-scan: self-test ok (21 cases, 0 failed)
+ptx-spill-check: self-test ok
+scan-args: self-test ok (41 cases, 0 failed)
+narrow-scan: self-test ok (124 cases, 0 failed)
+canon-check: self-test ok (37 cases, 0 failed)
+ptx-compare: self-test ok (33 cases, 0 failed)
+lds-scan: self-test ok (7 cases, 0 failed)
+mutant-run: self-test ok
+mac-static: self-test ok
+mac-remote: self-test ok (the flow against a fake remote needs macOS: skipped on Linux)
+box.sh: self-test ok
+seed-target: self-test ok
+carry: self-test ok (19 cases)
+release: self-test ok (12 cases)
+check-recipes: 59 tool self-tests ok
+boxq codes 80, 81, 83-85: no other tool or recipe produces them
+check-recipes: deepseek41 fixture draft: source stays up, dspark_model refuses
+check-recipes: fixture variants ok (6 row(s):  iq4xs q2kxl glmffnkq q6kdown unjoined unjoinedq6 )
+check-recipes: draft reads go through dspark_model (167 shell files, the printf fixture is red)
+refset-publish: self-test ok
+orphan-tests: ok (2725 tests, each run by a gate-* or lab-* recipe)
+check-recipes: arch owner ok (169 recipe lines build with --arch {{arch}}, 12 fixtures)
+wt: self-test ok
+proc-leg: gpu-gate holder named
+check-recipes: slowest: lease 96 s, gatebatch 87 s, recipescheck 58 s, selftest 56 s, pytools 53 s
+check-recipes: ok

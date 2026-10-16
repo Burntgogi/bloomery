@@ -1,0 +1,11 @@
+--- a/tools/ref/cold-blocks.sh
++++ b/tools/ref/cold-blocks.sh
+@@ -155,7 +155,7 @@
+       majflt_now > "$f" || return
+       s=1
+     fi
+-    printf '%s\n' "$line" || return
++    printf '%s\n' "$line"
+   done
+ }
+ # cold_check <faults> <window s>: MAJ_BOUND, faults × COLD_US as a percent of the window, and COLD_TAG

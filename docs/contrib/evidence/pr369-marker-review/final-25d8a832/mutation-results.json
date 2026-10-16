@@ -1,0 +1,34 @@
+{
+  "forwarding_guard_removed": {
+    "base_source_head": "25d8a832ae55e4da35baf5e288dc2aba30564aa0",
+    "exit": 1,
+    "failed_checks": [
+      "marker-forward-failure"
+    ],
+    "source_sha256": "86d703e810c0fd87603354348cdbb4add1e22234226101e6a40efa5072a1777a",
+    "stdout": "ok cold-at\nok cold-under\nok cold-zero\nok cold-nowindow\nok marker-before-match\nok marker-at-line\nok marker-rc\nok marker-pass\nok marker-empty-re\nFAIL marker-forward-failure: got [waiting-or-success], want [failed]\nok ncmoe-long\nok ncmoe-short\nok ncmoe-none\nok order-bad\nok order-blocks\nok order-default\nok counted\nok fail-row\nok fail-file\nok fail-discard\nok fail-list\nok fail-drop\nok refusal-rc\nok refusal-stop\nok refusal-list\nok refusal-round\nok refusal-near\nok refusal-no-output\nok refusal-match\nok blk-keys\nok blk-arms\nok blk-line-ours\nok blk-line-x\nok blk-line-y\nok warm-bad\nok warm-default\nok verdict-off\nok verdict-first\nok verdict-fail\nok verdict-fail-list\nok verdict-clean\nok verdict-discard\nok warm-summary\nok prime\nok prime-off\nok res-sums\nok res-sums-load\nok res-sums-nolever\nok res-sums-table\nok res-sums-slots\nok res-sums-slots-only\nok res-sums-slotsdrafted\nok res-kinds\nok res-kinds-none\nok res-kinds-bad\nself-test: FAIL (1 failures)\n",
+    "stderr": ""
+  },
+  "match_predicate_removed": {
+    "base_source_head": "25d8a832ae55e4da35baf5e288dc2aba30564aa0",
+    "exit": 1,
+    "failed_checks": [
+      "marker-before-match"
+    ],
+    "source_sha256": "68c171d1a2f291c13d822e50f9f0fa50c0b48206a34ad927bf4c3120f599b6c4",
+    "stdout": "ok cold-at\nok cold-under\nok cold-zero\nok cold-nowindow\nFAIL marker-before-match: got [ahead|yes], want [ahead|no]\nok marker-at-line\nok marker-rc\nok marker-pass\nok marker-empty-re\nok marker-forward-failure\nok ncmoe-long\nok ncmoe-short\nok ncmoe-none\nok order-bad\nok order-blocks\nok order-default\nok counted\nok fail-row\nok fail-file\nok fail-discard\nok fail-list\nok fail-drop\nok refusal-rc\nok refusal-stop\nok refusal-list\nok refusal-round\nok refusal-near\nok refusal-no-output\nok refusal-match\nok blk-keys\nok blk-arms\nok blk-line-ours\nok blk-line-x\nok blk-line-y\nok warm-bad\nok warm-default\nok verdict-off\nok verdict-first\nok verdict-fail\nok verdict-fail-list\nok verdict-clean\nok verdict-discard\nok warm-summary\nok prime\nok prime-off\nok res-sums\nok res-sums-load\nok res-sums-nolever\nok res-sums-table\nok res-sums-slots\nok res-sums-slots-only\nok res-sums-slotsdrafted\nok res-kinds\nok res-kinds-none\nok res-kinds-bad\nself-test: FAIL (1 failures)\n",
+    "stderr": ""
+  },
+  "buffered_awk_restored": {
+    "base_source_head": "25d8a832ae55e4da35baf5e288dc2aba30564aa0",
+    "exit": 1,
+    "failed_checks": [
+      "marker-at-line",
+      "marker-before-match",
+      "marker-forward-failure"
+    ],
+    "source_sha256": "fd06a430354d64b608607df7d04549b133553bf3bb1b7e45c98a98dc14881703",
+    "stdout": "ok cold-at\nok cold-under\nok cold-zero\nok cold-nowindow\nFAIL marker-before-match: got [|no], want [ahead|no]\nFAIL marker-at-line: got [no], want [yes]\nok marker-rc\nok marker-pass\nok marker-empty-re\nFAIL marker-forward-failure: got [waiting-or-success], want [failed]\nok ncmoe-long\nok ncmoe-short\nok ncmoe-none\nok order-bad\nok order-blocks\nok order-default\nok counted\nok fail-row\nok fail-file\nok fail-discard\nok fail-list\nok fail-drop\nok refusal-rc\nok refusal-stop\nok refusal-list\nok refusal-round\nok refusal-near\nok refusal-no-output\nok refusal-match\nok blk-keys\nok blk-arms\nok blk-line-ours\nok blk-line-x\nok blk-line-y\nok warm-bad\nok warm-default\nok verdict-off\nok verdict-first\nok verdict-fail\nok verdict-fail-list\nok verdict-clean\nok verdict-discard\nok warm-summary\nok prime\nok prime-off\nok res-sums\nok res-sums-load\nok res-sums-nolever\nok res-sums-table\nok res-sums-slots\nok res-sums-slots-only\nok res-sums-slotsdrafted\nok res-kinds\nok res-kinds-none\nok res-kinds-bad\nself-test: FAIL (3 failures)\n",
+    "stderr": ""
+  }
+}

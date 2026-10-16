@@ -1,0 +1,51 @@
+{
+  "source_head": "25d8a832ae55e4da35baf5e288dc2aba30564aa0",
+  "source_file_sha256": "f03849741e601fb18699b205461972e4aebc5ad8685f0f8331e3512d1dd9a260",
+  "scope": "Actual sourced module; real pipe and /proc counter, existing majflt_now fixture overrides for controlled failure/once checks; no GPU or performance claim",
+  "cases": {
+    "live_real_counter_stream": {
+      "exit": 0,
+      "prefix_preserved": true,
+      "marker_before_match": false,
+      "marker_before_eof": true,
+      "sample": "13176546",
+      "final_fragment": "final-fragment\n",
+      "later_counter": null,
+      "first_mark_retained": null
+    },
+    "first_match_only": {
+      "exit": 0,
+      "prefix_preserved": true,
+      "marker_before_match": false,
+      "marker_before_eof": true,
+      "sample": "7",
+      "final_fragment": "final-fragment\n",
+      "later_counter": 19,
+      "first_mark_retained": true
+    },
+    "empty_regex": {
+      "exit": 0,
+      "stdout": "window-start\n",
+      "stderr": ""
+    },
+    "counter_failure": {
+      "exit": 9,
+      "stdout": "",
+      "stderr": ""
+    },
+    "marker_file_failure": {
+      "exit": 1,
+      "stdout": "",
+      "stderr": "/tmp/bloomery-pr369-review-fix/tools/ref/cold-blocks.sh: 줄 155: /tmp/pr369-rebased-stream-icrh7icm: 디렉터리입니다\n"
+    },
+    "missing_counter_preflight": {
+      "exit": 2,
+      "stdout": "",
+      "stderr": "marker-preflight: /proc/vmstat gives no pgmajfault: every row's majflt column and cold tag would read 0\n"
+    },
+    "readonly_stdout": {
+      "exit": 1,
+      "stderr": "/tmp/bloomery-pr369-review-fix/tools/ref/cold-blocks.sh: 행 158번: printf: 쓰기 오류: 파일 디스크립터가 잘못됨\n"
+    }
+  }
+}

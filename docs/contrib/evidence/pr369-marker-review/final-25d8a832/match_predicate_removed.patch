@@ -1,0 +1,11 @@
+--- a/tools/ref/cold-blocks.sh
++++ b/tools/ref/cold-blocks.sh
+@@ -151,7 +151,7 @@
+ majflt_mark() {
+   local f=$1 re=$2 line s=''
+   while IFS= read -r line || [ -n "$line" ]; do
+-    if [ -z "$s" ] && [ -n "$re" ] && [[ $line =~ $re ]]; then
++    if [ -z "$s" ] && [ -n "$re" ]; then
+       majflt_now > "$f" || return
+       s=1
+     fi

@@ -1,0 +1,52 @@
+ok fit
+ok fit-fail
+ok fit-exit
+ok fit-nobench
+ok fit-flags
+ok fit-dry
+ok preheat
+ok preheat-dry
+ok preheat-refused
+ok preheat-fail
+ok srv-past
+ok pair
+ok srv-flags-refused
+ok mtp-past
+ok mtp-env
+ok mtp-dry
+ok ctx-derived
+ok ctx-derived-slots
+ok ctx-srv-edge
+ok ctx-bad
+ok lever-refuse empty-list
+ok lever-refuse space
+ok lever-refuse empty-item
+ok lever-refuse not-kv
+ok lever-refuse empty-name
+ok lever-refuse empty-value
+ok lever-refuse bad-name
+ok lever-refuse at-value
+ok lever-refuse pipe-value
+ok lever-refuse twice
+ok lever-refuse ref-lcpp
+ok lever-refuse ref-exl3
+ok lever-refuse mtp-draft
+ok lever-refuse ours-draft
+ok lever-refuse no-row
+ok lever-refuse ab-load
+ok lever-refuse runner-env
+ok lever-dry
+ok bp-onecard
+ok bp-onecard-arm
+ok place-ref
+ok place-word
+ok place-twice
+ok place-empty-trail
+ok place-empty-lead
+ok place-card
+ok twocard-gate
+ok slots-env
+ok slots-bad
+skip ours-timed, cold-retry, ctx-derived-run, ctx-derived-srv, srv, srv-xcheck, srv-ctx, srv-flags, srv-dry, srv-probe, srv-fail, mtp, mtp-rec, mtp-lever, lever-pair, mtp-lever-arm, lever-res-nolever, lever-res-none, lever-levers, twocard-place, twocard-place-mtp, twocard-place-order, twocard-place-3090, twocard-nocards, twocard-place-dry, slots, slots-res-off, slots-pos, slots-leak, slots-none, slots-res-step, slots-past and slots-dry: no prose ids at /root/bloomery-data/glm5next/corpus-prose.ids (the profile pins their sha256)
+skip dry-same: DEPTH_GLM5NEXT_BASE is unset (a copy of the base runner to compare the dry run with)
+depth-glm5next-stub: 49 checks, 0 failed
