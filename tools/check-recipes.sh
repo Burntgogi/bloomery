@@ -372,6 +372,8 @@ blk_pytools() {
     "tools/ref/clefvis/check_hidden.py --self-test"
     "tools/ref/clefvis/check_preproc.py --self-test"
     "tools/ref/dma-dram-share.py --self-test"
+    "tools/ref/dense-logits.py --self-test"
+    "tools/ref/dense-serve.py --self-test"
     "tools/ref/draft-accept.py --self-test"
     "tools/ref/draft-vocab.py --self-test"
     "tools/ref/ds41copy.py --self-test"
