@@ -54,6 +54,16 @@ fn hw_rms_norm_matches_ggml() {
     asserts::assert_close(&got.data, &want, 0.0, "rms_norm -> attn_norm-0");
 }
 
+// The gates above compare against the oracle with gate 0.0, and a mutant that
+// writes one NaN output there used to keep `worst` at zero and read as a pass,
+// because NaN > worst is false. The rejection in the helper is what the gates
+// cannot test themselves without a box, so this one needs no fixture.
+#[test]
+#[should_panic(expected = "non-finite")]
+fn the_nan_output_cell_cannot_pass_the_gate() {
+    asserts::assert_close(&[f32::NAN], &[1.0], 0.0, "rms_norm mutant -> attn_norm-0");
+}
+
 #[test]
 #[ignore = "hw: needs the box, the model file and $BLOOMERY_DATA/ref"]
 fn hw_matmul_q_matches_ggml() {
