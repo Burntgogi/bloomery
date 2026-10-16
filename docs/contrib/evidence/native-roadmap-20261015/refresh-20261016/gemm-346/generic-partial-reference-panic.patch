@@ -1,0 +1,11 @@
+--- a/crates/gpu-gates/src/bin/gate_gemm.rs
++++ b/crates/gpu-gates/src/bin/gate_gemm.rs
+@@ -3192,6 +3192,8 @@
+                         return;
+                     };
+                     for r in (0..rows).filter(|&r| row_checked(slots, s, r)) {
++                        static CALLS: AtomicUsize = AtomicUsize::new(0);
++                        assert!(CALLS.fetch_add(1, Ordering::Relaxed) != 1, "injected generic reference worker panic");
+                         let (want, y64, mag) = dot(e * rows + r, col(s));
+                         let got = out[r];
+                         let band = gamma(roundings) * mag;

@@ -1,0 +1,85 @@
+{
+  "source_refs": {
+    "fix/card-reserve-overflow": "43fd95032e083841a06d1a354c10bd97e5bf5c65",
+    "fix/timing-source-inspection": "e67e6e8e67c5a02b89b9312063f785004ef18763",
+    "fix/gemm-reference-panic": "f11aaeea0fdd634d0e735f9cc9f684e70304e0f8",
+    "contribution/hip-selected-current": "b3774b837893e70a2e4b9b7c32b8b9a14fe880e6",
+    "contribution/dense-validation-current": "affc216e2bb4f4610dbafb35194ada7cd466f76e",
+    "support/qwen35-339-review-fix": "492218d54b0b1cb06b049078d9c3accc6aaf4089",
+    "support/qwen35-339-current": "3845e272d9b3bc816bbdccc67b8989dfb6380c91",
+    "support/gemm346-on344": "7eaf697035aa23ec8b8ed9740de63c5a2ff342f9",
+    "integration/source-correctness-20261016": "db5cdccb3ea06d6488e9a32a772c7f26d838add9"
+  },
+  "skill": {
+    "installed": "/home/jutai05/.omp/agent/skills/be-ambitious",
+    "upstream_commit": "7dc63b7a748b8bd14bf213c15ecddd4536409407",
+    "discovery": "omp read skill://be-ambitious passed"
+  },
+  "pull_requests": {
+    "349": "https://github.com/midagedev/bloomery/pull/359",
+    "350": "https://github.com/midagedev/bloomery/pull/361",
+    "346": "https://github.com/midagedev/bloomery/pull/364",
+    "252": "https://github.com/midagedev/bloomery/pull/252",
+    "254": "https://github.com/midagedev/bloomery/pull/254",
+    "parent_support": "https://github.com/juliankang4/bloomery/pull/1",
+    "incidental_wording_cleanup": "https://github.com/midagedev/bloomery/pull/367"
+  },
+  "verification": {
+    "placement_debug": {
+      "passed": 137
+    },
+    "placement_release_regressions": {
+      "passed": 2
+    },
+    "source_inspection": {
+      "passed": 45,
+      "baseline_negative_control": "corrupt index returned 0 and dirty_files=0 instead of required exit 2"
+    },
+    "hip": {
+      "head": "b3774b837893e70a2e4b9b7c32b8b9a14fe880e6",
+      "checks_passed": 7,
+      "gpu_cases_passed": 18,
+      "device": "AMD Radeon RX 7900 GRE/gfx1100"
+    },
+    "dense_final_head": {
+      "head": "affc216e2bb4f4610dbafb35194ada7cd466f76e",
+      "library_tests_passed": 123,
+      "library_tests_ignored": 3,
+      "cpu_reference_schedules": [
+        "step",
+        "batch"
+      ],
+      "rows_each": 3,
+      "numerical_acceptance": "diagnostic_only_no_numeric_band",
+      "native_cuda": "not_run"
+    },
+    "recipe_check": {
+      "status": "pass",
+      "card_tests_passed": 781,
+      "tool_self_tests_passed": 61,
+      "owned_tests": 2709
+    },
+    "static": "workspace/all-targets and isolated GPU CLI/server/GEMM/test metadata checks passed; not device codegen",
+    "strict_clippy_changed_owner": "placement --all-targets --no-deps -- -D warnings passed",
+    "strict_clippy_dependencies": "FAILED on 4 existing chunks_exact_to_as_chunks diagnostics in unchanged crates/gguf/src/quant.rs:1296,1351"
+  },
+  "separate_finding": {
+    "issue": "https://github.com/midagedev/bloomery/issues/362",
+    "problem": "mawk cold marker samples after EOF; extended DS41/Qwen warm-row suites not claimed green",
+    "fixed_here": false
+  },
+  "external_prerequisites": [
+    "Corrected #339 must land or maintainer must provide upstream integration base before #254 draft can be cleared",
+    "NVIDIA gate and real device-consumer panic mutants / 27B native and serving acceptance remain unrun; no local NVIDIA, no configured GPU SSH hosts, default ws hostname resolution failed"
+  ],
+  "submission_states": {
+    "252": "ready_for_review",
+    "254": "draft_dependency_and_gpu_validation_blocked"
+  },
+  "no_claims": [
+    "No whole-model AMD support",
+    "No performance/timing claim",
+    "No 27B/NVIDIA accuracy acceptance",
+    "No relaxed numeric band or lint level"
+  ]
+}

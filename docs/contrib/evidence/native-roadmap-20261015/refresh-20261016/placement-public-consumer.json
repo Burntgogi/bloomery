@@ -1,0 +1,6 @@
+{
+  "scope": "Public-API consumer built during #349 implementation, not a stamped native engine binary",
+  "exit_code": 0,
+  "stdout": "exact u64::MAX boundary fits: the whole load on consumer-card: fits: need 18446744073709551615 B = weights 0 B (the allocator's granules; 0 B of buffers) + cache 0 B + context 2 B + scratch 3 B + reserves 18446744073709551610 B + margin 0 B (the program's arena under it), of 18446744073709551615 B the card had (no free reading, its usable 18446744073709551615 B)\nnamed refusal: card consumer-card: its reserves, set-aside or load floor pass u64 bytes\nnamed refusal: card consumer-card: its reserves, set-aside or load floor pass u64 bytes\nnamed refusal: card consumer-card: its reserves, set-aside or load floor pass u64 bytes\nnamed refusal: card consumer-card: its reserves, set-aside or load floor pass u64 bytes\nnamed refusal: card consumer-card: its reserves, set-aside or load floor pass u64 bytes\nnamed refusal: card consumer-card: its reserves, set-aside or load floor pass u64 bytes\n",
+  "stderr": ""
+}

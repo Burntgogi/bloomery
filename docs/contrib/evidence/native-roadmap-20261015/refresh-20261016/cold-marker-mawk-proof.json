@@ -1,0 +1,14 @@
+[
+  {
+    "implementation": "system-mawk",
+    "marker_before_eof": false,
+    "marker_after_eof": true,
+    "exit_code": 0
+  },
+  {
+    "implementation": "mawk-interactive-control",
+    "marker_before_eof": true,
+    "marker_after_eof": true,
+    "exit_code": 0
+  }
+]

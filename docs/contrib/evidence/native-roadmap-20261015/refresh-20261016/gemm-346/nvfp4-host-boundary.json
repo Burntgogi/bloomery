@@ -1,0 +1,24 @@
+{
+  "scope": "Actual generic check, parallel worker owner and dot32_nv host transcription; NOT NVIDIA arithmetic/device evidence",
+  "source_head": "7eaf697",
+  "cases": [
+    {
+      "case": "clean",
+      "exit_code": 0,
+      "stdout": "NVFP4 host contract: 6 outputs\n",
+      "stderr": ""
+    },
+    {
+      "case": "partial",
+      "exit_code": 1,
+      "stdout": "",
+      "stderr": "\nthread '<unnamed>' (2524658) panicked at src/main.rs:133:75:\ninjected partial generic-reference panic\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\ngate_gemm-generic-host-reference: reference thread panicked\n"
+    },
+    {
+      "case": "all",
+      "exit_code": 1,
+      "stdout": "",
+      "stderr": "\nthread '<unnamed>' (2524677) panicked at src/main.rs:132:33:\ninjected generic-reference panic\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\nthread '<unnamed>' (2524678) panicked at src/main.rs:132:33:\ninjected generic-reference panic\n\nthread '<unnamed>' (2524679) panicked at src/main.rs:132:33:\ninjected generic-reference panic\ngate_gemm-generic-host-reference: reference thread panicked\n"
+    }
+  ]
+}

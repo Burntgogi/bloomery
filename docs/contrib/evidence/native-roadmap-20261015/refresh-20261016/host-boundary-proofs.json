@@ -1,0 +1,41 @@
+{
+  "scope": "Host executables over exact private source owners, not native CUDA gate execution",
+  "integration_head": "8876542542e09e867bccf3e81c6b7961fe384084",
+  "dense_source_sha256": "e502c1ff4340aa5ed4f27ebf91e1387c85acf6b8f89861c0576de780fbcb8cfd",
+  "dense_context": [
+    {
+      "case": "dense-context-smoke",
+      "exit_code": 0,
+      "stdout": "budget=134230028 selected=131072 probes=[262144, 131072]\nbudget=134230027 selected=65536 probes=[262144, 131072, 65536]\nbudget=18446744073709551615 selected=262144 probes=[262144]\nbudget=134279173 selected=131072 probes=[262144, 131072]\nbudget=134279172 selected=65536 probes=[262144, 131072, 65536]\nbudget=18446744073709551615 selected=262144 probes=[262144]\n",
+      "stderr": ""
+    },
+    {
+      "case": "string-refusal",
+      "exit_code": 1,
+      "stdout": "",
+      "stderr": "Error: \"whole fit at ctx 262144: the whole load on dense-host-consumer: does not fit: need 268447756 B = weights 0 B (the allocator's granules; 0 B of buffers) + cache 268435456 B + context 2 B + scratch 3 B + reserves 12288 B + margin 7 B (the program's arena under it), of 134230028 B the card had (134230028 B free of its usable 18446744073709551615 B at plan time): a dense backbone has no routed experts to move to the host tier\"\n"
+    }
+  ],
+  "gemm_source_sha256": "210b19fda97074202a422679b4b92e36c366e9683fb31fa61a840aef33d11800",
+  "gemm_reference": [
+    {
+      "case": "clean",
+      "exit_code": 0,
+      "stdout": "complete numeric reference: 6 outputs\n",
+      "stderr": ""
+    },
+    {
+      "case": "partial",
+      "exit_code": 1,
+      "stdout": "",
+      "stderr": "\nthread '<unnamed>' (2442562) panicked at src/main.rs:161:79:\ninjected partial-reference panic\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\ngate_gemm-host-reference: reference thread panicked\n"
+    },
+    {
+      "case": "all",
+      "exit_code": 1,
+      "stdout": "",
+      "stderr": "\nthread '<unnamed>' (2442579) panicked at src/main.rs:160:25:\ninjected all-worker panic\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\nthread '<unnamed>' (2442580) panicked at src/main.rs:160:25:\ninjected all-worker panic\n\nthread '<unnamed>' (2442581) panicked at src/main.rs:160:25:\ninjected all-worker panic\ngate_gemm-host-reference: reference thread panicked\n"
+    }
+  ],
+  "nvidia_gate": "not_run: no local NVIDIA device, default ws SSH hostname resolution failed"
+}
