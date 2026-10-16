@@ -3668,3 +3668,93 @@ mod cli {
         Probe::read(m.body("generate_qwen3moe")?.hybrid(), m.gpu(), prev)
     }
 }
+
+#[cfg(all(test, feature = "gpu"))]
+mod tests {
+    use super::q3place::{ServeLoad, Whole, short_or, whole_on};
+    use bloomery_gpu_gates::GateError;
+    use bloomery_gpu_gates::beside::Beside;
+    use bloomery_gpu_gates::generate::choose_ctx_of;
+    use bloomery_gpu_gates::residency38::Seqs;
+    use model::placement::{self, ModelTensors, Role, WholeLoad};
+    use placement::ctx_ask::{DEFAULT_TARGET, Probe, Rule};
+    use placement::workstation::CardSpec;
+
+    #[test]
+    fn dense_default_context_halves_only_for_a_short_whole_load() -> Result<(), GateError> {
+        let model = ModelTensors {
+            tensors: vec![placement::ModelTensor {
+                name: "blk.0.ffn_up.weight".into(),
+                shard: 0,
+                layer: Some(0),
+                role: Role::DenseFfn,
+                ty: gguf::GgmlType::F32,
+                dims: vec![256, 1],
+                file_bytes: 1024,
+                gathered_rows: None,
+            }],
+            layers: 1,
+            experts: 0,
+            experts_used: 0,
+        };
+        let spec = CardSpec {
+            name: "context-test",
+            total_bytes: u64::MAX,
+            driver_reserve_bytes: 0,
+            device: None,
+            free_bytes: None,
+            held_by: None,
+            integrated: false,
+        };
+        let beside = Beside {
+            image: Some(4096),
+            embedding: Some(8192),
+        };
+        for load in [
+            WholeLoad::Checked {
+                arena: 16384,
+                reserve: 32768,
+            },
+            WholeLoad::Unchecked,
+        ] {
+            let verdict = |ctx, free_bytes| {
+                whole_on(
+                    CardSpec { free_bytes, ..spec },
+                    &model,
+                    1,
+                    ctx * 1024,
+                    (Seqs::ONE, ctx, beside),
+                    Ok(load),
+                )
+            };
+            let Whole::Fits(lower) = verdict(DEFAULT_TARGET / 2, None)? else {
+                panic!("an uncapped card holds the lower rung");
+            };
+            for (budget, expected) in [
+                (lower.need, DEFAULT_TARGET / 2),
+                (lower.need - 1, DEFAULT_TARGET / 4),
+                (u64::MAX, DEFAULT_TARGET),
+            ] {
+                let mut probes = Vec::new();
+                let chosen = choose_ctx_of(DEFAULT_TARGET, (None, 1), (None, None), |ctx| {
+                    probes.push(ctx);
+                    match verdict(ctx, Some(budget))? {
+                        Whole::Fits(_) => Ok(Probe::Holds(ServeLoad::Whole(spec))),
+                        other => short_or(other.dense_refusal(usize::try_from(ctx)?)),
+                    }
+                })?;
+                assert_eq!((chosen.slot_ctx, chosen.total), (expected, expected));
+                assert!(matches!(chosen.plan, ServeLoad::Whole(_)));
+                assert_eq!(probes[0], DEFAULT_TARGET);
+                assert_eq!(probes.last(), Some(&expected));
+                assert_eq!(
+                    matches!(chosen.rule, Rule::Target),
+                    expected == DEFAULT_TARGET
+                );
+            }
+        }
+        let refused = Whole::Refused("unsupported tensor format".into());
+        assert!(short_or(refused.dense_refusal(4096)).is_err());
+        Ok(())
+    }
+}

@@ -607,7 +607,7 @@ fn qwen35_whole(file: &Split, o: Open35) -> Result<WholeLoad, String> {
 }
 
 /// The whole-fit verdict ([`whole_on`]).
-enum Whole {
+pub(super) enum Whole {
     /// The whole load fits what the card had.
     Fits(WholeNeed),
     /// It does not.
@@ -636,7 +636,7 @@ impl Whole {
 
     /// The refusal of a whole load this verdict does not take, of a model
     /// with no routed expert to move to the host tier.
-    fn dense_refusal(&self, ctx: usize) -> GateError {
+    pub(super) fn dense_refusal(&self, ctx: usize) -> GateError {
         if let Whole::Short(n) = self {
             let (margin, beside) = match n.load {
                 WholeLoad::Checked { arena, reserve } => (reserve, arena),
@@ -675,7 +675,7 @@ impl Whole {
 /// the program's refusal), sized by `placement::whole_need`, the verdict's
 /// one owner. A tensor no card format loads is a refusal; any other planner
 /// error is the error.
-fn whole_on(
+pub(super) fn whole_on(
     spec: CardSpec,
     model: &ModelTensors,
     layers: usize,
@@ -1024,7 +1024,7 @@ pub fn serve_choice(
     dead_code,
     reason = "the serve seat, the routed legs and the types gate read it; the CLI and the e2e gates include the planner without it"
 )]
-fn short_or(e: GateError) -> Result<Probe<ServeLoad>, GateError> {
+pub(super) fn short_or(e: GateError) -> Result<Probe<ServeLoad>, GateError> {
     let short = short_in::<q3::PlaceError>(&e).or_else(|| short_in::<q35::PlaceError>(&e));
     short.map(Probe::Short).ok_or(e)
 }
@@ -1281,89 +1281,4 @@ pub fn open_qwen35(
     host: HostCfg,
 ) -> Result<Qwen35moeModel, GateError> {
     Ok(GpuModel::<Body35>::open_placed(file, plan, o, host)?)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use bloomery_gpu_gates::generate::choose_ctx_of;
-    use placement::ctx_ask::{DEFAULT_TARGET, Rule};
-
-    #[test]
-    fn dense_default_context_halves_only_for_a_short_whole_load() -> Result<(), GateError> {
-        let model = ModelTensors {
-            tensors: vec![placement::ModelTensor {
-                name: "blk.0.ffn_up.weight".into(),
-                shard: 0,
-                layer: Some(0),
-                role: Role::DenseFfn,
-                ty: gguf::GgmlType::F32,
-                dims: vec![256, 1],
-                file_bytes: 1024,
-                gathered_rows: None,
-            }],
-            layers: 1,
-            experts: 0,
-            experts_used: 0,
-        };
-        let spec = CardSpec {
-            name: "context-test",
-            total_bytes: u64::MAX,
-            driver_reserve_bytes: 0,
-            device: None,
-            free_bytes: None,
-            held_by: None,
-            integrated: false,
-        };
-        let beside = Beside {
-            image: Some(4096),
-            embedding: Some(8192),
-        };
-        for load in [
-            WholeLoad::Checked {
-                arena: 16384,
-                reserve: 32768,
-            },
-            WholeLoad::Unchecked,
-        ] {
-            let verdict = |ctx, free_bytes| {
-                whole_on(
-                    CardSpec { free_bytes, ..spec },
-                    &model,
-                    1,
-                    ctx * 1024,
-                    (Seqs::ONE, ctx, beside),
-                    Ok(load),
-                )
-            };
-            let Whole::Fits(lower) = verdict(DEFAULT_TARGET / 2, None)? else {
-                panic!("an uncapped card holds the lower rung");
-            };
-            for (budget, expected) in [
-                (lower.need, DEFAULT_TARGET / 2),
-                (lower.need - 1, DEFAULT_TARGET / 4),
-                (u64::MAX, DEFAULT_TARGET),
-            ] {
-                let mut probes = Vec::new();
-                let chosen = choose_ctx_of(DEFAULT_TARGET, (None, 1), (None, None), |ctx| {
-                    probes.push(ctx);
-                    match verdict(ctx, Some(budget))? {
-                        Whole::Fits(_) => Ok(Probe::Holds(ServeLoad::Whole(spec))),
-                        other => short_or(other.dense_refusal(usize::try_from(ctx)?)),
-                    }
-                })?;
-                assert_eq!((chosen.slot_ctx, chosen.total), (expected, expected));
-                assert!(matches!(chosen.plan, ServeLoad::Whole(_)));
-                assert_eq!(probes[0], DEFAULT_TARGET);
-                assert_eq!(probes.last(), Some(&expected));
-                assert_eq!(
-                    matches!(chosen.rule, Rule::Target),
-                    expected == DEFAULT_TARGET
-                );
-            }
-        }
-        let refused = Whole::Refused("unsupported tensor format".into());
-        assert!(short_or(refused.dense_refusal(4096)).is_err());
-        Ok(())
-    }
 }
