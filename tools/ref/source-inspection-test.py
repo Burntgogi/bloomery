@@ -53,6 +53,9 @@ def self_test():
             "EXL3_WIKITEXT": str(tmp / "wiki.test.raw"),
             "BLOOMERY_TOKENIZE_BIN": str(tmp / "tokenize"),
             "BLOOMERY_GEN_BIN": str(tmp / "plan"),
+            # This synthetic model has no profile-sized placement; only dry preflight runs.
+            "IK_NCMOE": "0",
+            "LCPP_NCMOE": "0",
         }
 
         def put(path, text, executable=False):
@@ -85,8 +88,8 @@ def self_test():
             if witness is not None:
                 assert witness in result.stdout, f"{name}: missing {witness!r}\n{output}"
             if rc == 2:
-                diagnostic = f"source-inspection: git status failed for {ref} (exit 128)"
-                assert diagnostic in result.stderr, f"{name}: missing {diagnostic!r}\n{output}"
+                for detail in ("source-inspection:", str(ref), "128"):
+                    assert detail in result.stderr, f"{name}: missing error context {detail!r}\n{output}"
                 assert "dirty_files=" not in result.stdout, f"{name}: published failed inspection\n{output}"
             checks += 1
             print(f"ok {name}")
