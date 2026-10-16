@@ -34,7 +34,14 @@ fn max_abs_diff(got: &[f32], want: &[f32]) -> f32 {
     );
     got.iter()
         .zip(want)
-        .map(|(&g, &w)| (g - w).abs())
+        .enumerate()
+        .map(|(i, (&g, &w))| {
+            assert!(
+                g.is_finite() && w.is_finite(),
+                "non-finite comparison operand at index {i}: got {g}, reference {w}"
+            );
+            (g - w).abs()
+        })
         .fold(0.0f32, f32::max)
 }
 
@@ -43,8 +50,8 @@ fn max_abs_diff(got: &[f32], want: &[f32]) -> f32 {
 /// only its batch, so any difference here means the shim is not the identity it says
 /// it is. The same run is `Derived`'s end-to-end claim (`tests/derived.rs`, layer 3):
 /// `forward` builds its own `Derived`, `step` is handed one, and block `b`'s absorption
-/// must get block `b`'s blocks either way. Bits, not differences: `NaN - NaN` folds to
-/// a clean zero through `f32::max`.
+/// must get block `b`'s blocks either way. Bits, not differences; a non-finite
+/// side in either vector is refused before the fold.
 #[test]
 #[ignore = "hw: needs the box and the model file"]
 fn hw_kv_one_shot_equals_uncached() {

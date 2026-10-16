@@ -54,14 +54,21 @@ fn hw_rms_norm_matches_ggml() {
     asserts::assert_close(&got.data, &want, 0.0, "rms_norm -> attn_norm-0");
 }
 
-// The gates above compare against the oracle with gate 0.0, and a mutant that
-// writes one NaN output there used to keep `worst` at zero and read as a pass,
-// because NaN > worst is false. The rejection in the helper is what the gates
-// cannot test themselves without a box, so this one needs no fixture.
+// The shared numeric gate rejects a non-finite output without fixtures.
 #[test]
-#[should_panic(expected = "non-finite")]
 fn the_nan_output_cell_cannot_pass_the_gate() {
-    asserts::assert_close(&[f32::NAN], &[1.0], 0.0, "rms_norm mutant -> attn_norm-0");
+    let got = std::panic::catch_unwind(|| {
+        asserts::assert_close(&[f32::NAN], &[1.0], 0.0, "rms_norm mutant -> attn_norm-0")
+    })
+    .is_err();
+    let reference = std::panic::catch_unwind(|| {
+        asserts::assert_close(&[1.0], &[f32::NAN], 0.0, "rms_norm mutant -> attn_norm-0")
+    })
+    .is_err();
+    assert!(
+        got && reference,
+        "a NaN must fail the gate in each operand position"
+    );
 }
 
 #[test]

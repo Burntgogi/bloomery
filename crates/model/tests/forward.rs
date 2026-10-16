@@ -28,6 +28,10 @@ fn max_abs_diff(got: &[f32], want: &[f32]) -> (f32, usize) {
     let mut worst = 0.0f32;
     let mut at = 0usize;
     for (i, (&g, &w)) in got.iter().zip(want).enumerate() {
+        assert!(
+            g.is_finite() && w.is_finite(),
+            "non-finite comparison operand at index {i}: got {g}, reference {w}"
+        );
         let d = (g - w).abs();
         if d > worst {
             worst = d;
