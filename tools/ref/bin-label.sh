@@ -141,6 +141,11 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = --self-test ]; then
   ds41+=.sh
   check ds41-stem-calls "$(grep -c 'bin_label_stem' "$ds41")" 3
   check ds41-one-format "$(grep -c 'bin:${' "$ds41" || true)" 0
+  # Both runners that source this file call bin_arms_distinct once (the bin: arms' guard).
+  q3m=${BASH_SOURCE[0]%/*}/depth-qwen3moe
+  q3m+=.sh
+  check ds41-distinct-calls "$(grep -c 'bin_arms_distinct' "$ds41")" 1
+  check qwen3moe-distinct-calls "$(grep -c 'bin_arms_distinct' "$q3m")" 1
   echo "self-test: $([ "$fails" = 0 ] && echo ok || echo FAIL) ($checks checks, $fails failures)"
   [ "$fails" = 0 ]
   exit
