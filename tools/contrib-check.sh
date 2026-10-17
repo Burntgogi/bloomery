@@ -206,7 +206,14 @@ fi
 cpu=$(sed -n 's/^model name[^:]*: *//p' /proc/cpuinfo 2> /dev/null | head -1)
 [ -n "$cpu" ] || cpu=$(sysctl -n machdep.cpu.brand_string 2> /dev/null || echo unknown)
 commit=$(git rev-parse --short=8 HEAD 2> /dev/null || echo "?")
-if [ -n "$(git status --porcelain --untracked-files=normal 2> /dev/null)" ]; then commit=$commit+local; fi
+# The status is a checked assignment, as in tools/box.sh: a tree whose HEAD reads but whose status does not
+# (a corrupt index) would print that commit without +local and attribute every run's evidence to it, so the
+# run stops 70 naming the tree and Git's exit code before the evidence header. No readable HEAD keeps the "?" path.
+if [ "$commit" != "?" ]; then
+  st=$(git status --porcelain --untracked-files=normal 2> /dev/null) && st_rc=0 || st_rc=$?
+  [ "$st_rc" = 0 ] || { say "contrib-check: git status on $(git rev-parse --show-toplevel 2> /dev/null || pwd) failed (git exit $st_rc): the evidence header would print $commit without its +local; repair the tree first"; exit 70; }
+  [ -z "$st" ] || commit=$commit+local
+fi
 echo "contrib-check tier=$TIER commit=$commit"
 echo "host: $(uname -srm), $cpu"
 echo "toolchain: $(rustc --version) ($CHANNEL); RUSTFLAGS: $RUSTFLAGS_NOTE; $TIMEOUT_NOTE"
