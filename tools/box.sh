@@ -720,9 +720,11 @@ STUB
     while read -r name query_rc apps gate_rc lease_rc expected; do
       [ "$apps" != - ] || apps=
       rm -f "$d/launched"
+      # Keep the marker relative: read-only command inspection must not interpret
+      # TMPDIR's directory names as build commands.
       call BLOOMERY_BOX_READONLY=1 BLOOMERY_REMOTE="$d/tree" BLOOMERY_CARD="$card" STUB_EXEC_REMOTE=1 \
         STUB_APPS="$apps" STUB_APPS_RC="$query_rc" STUB_GATE_RC="$gate_rc" STUB_LEASE_RC="$lease_rc" \
-        -- 'printf "%s\n" "$CUDA_VISIBLE_DEVICES" > '"$(printf %q "$d/launched")"
+        -- 'printf "%s\n" "$CUDA_VISIBLE_DEVICES" > ../launched'
       want "$expected" "$card $name"
       if [ "$expected" = 0 ]; then
         [ -f "$d/launched" ] && [ "$(cat "$d/launched")" = "$visible" ] || fail "$card $name: command did not run with the selected devices"
