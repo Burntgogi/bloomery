@@ -432,8 +432,10 @@ impl Body {
     /// pass order), derived from the layer table: a pass of one row is the
     /// step's ([`facts::step_launches`]); a pass of `m` rows runs each layer's
     /// row-wise launches once (the attention's four, the dense block's
-    /// four, the routed block's six with the router's second launch and a
-    /// handoff a column, and the card experts' six) and the
+    /// four, the routed block's six with the router's two launches past
+    /// the step's one (the rows' score GEMM, then its sigmoid, before the
+    /// pick) and a handoff a column past the first, and the card experts'
+    /// six) and the
     /// [`SEQ_LAUNCHES`] once a busy slot, then the head's.
     #[must_use]
     pub fn slots_launches(&self, key: &[(usize, usize)]) -> usize {
@@ -453,7 +455,7 @@ impl Body {
                         facts::DENSE_LAUNCHES - 2 + c.block.map_or(2, |p| p.column_launches(m))
                     }
                     FfnKind::Moe => {
-                        facts::MOE_LAUNCHES + m + if card { facts::CARD_LAUNCHES } else { 0 }
+                        facts::MOE_LAUNCHES + m + 1 + if card { facts::CARD_LAUNCHES } else { 0 }
                     }
                 }
             })

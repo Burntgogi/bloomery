@@ -1136,9 +1136,10 @@ mod gate {
     /// one row is the decode step's [`NODES_DECODE`] whichever slot runs it; a
     /// pass of `m` rows over `s` busy slots is the step's nodes, plus
     /// [`SEQ_BOUND`] a layer for each busy slot past the first, plus on each
-    /// routed layer the router's second launch and a handoff a column past
-    /// the first (`m` in all: the router over the rows is two launches, a
-    /// handoff a column one), and the dense block's columns past the step's
+    /// routed layer the router's two launches past the step's one and a
+    /// handoff a column past the first (`m + 1` in all: the router over the
+    /// rows is the score GEMM, its sigmoid and the pick, a handoff a column
+    /// one), and the dense block's columns past the step's
     /// own launches: none on a q8_0 block, whose columns share its launches,
     /// a whole block a column on a K-quant one.
     fn pass_nodes(m: &mut Mimo2Model) -> Result<bool, GateError> {
@@ -1159,7 +1160,7 @@ mod gate {
                     .iter()
                     .map(|p| p.column_launches(rows) - 2 - p.extra_launches())
                     .sum();
-                step + N_LAYER * SEQ_BOUND * (key.len() - 1) + rows * routed + dense
+                step + N_LAYER * SEQ_BOUND * (key.len() - 1) + (rows + 1) * routed + dense
             }
         };
         let mut ok = step == step_nodes;
