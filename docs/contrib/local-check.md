@@ -114,9 +114,16 @@ the local-mode cases continue to exercise the local runner.
 In box mode, `BLOOMERY_GATE_CARD=any` considers the A6000 idle only after a
 successful compute-process query that does not name its UUID. A failed query,
 including one with partial output, skips the A6000 and tries the 3090 under the
-existing lease rules. An explicit `a6000` selection keeps its forced-card policy.
+existing lease rules. An explicit `BLOOMERY_GATE_CARD=a6000` keeps the gate
+runner's forced-card policy.
 The host-only self-test exercises these selection paths with isolated locks,
 leases and query responses; it does not measure physical GPU occupancy.
+
+The outer `box.sh` selector requires a successful process query for
+`BLOOMERY_CARD=a6000` and `both`. Failure, even with partial output or a held
+Bloomery lock, stops with rc 75 before the command runs. Its self-test executes
+the complete remote command through a fake SSH endpoint with query, service and
+lock stubs, checking both the exit status and whether the command ran.
 
 **Set up once:**
 

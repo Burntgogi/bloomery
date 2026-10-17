@@ -430,6 +430,10 @@ STUB
 exit "$(pop "$D/rsync.script" 0)"
 STUB
   cat >> "$d/stub/ssh" << 'STUB'
+if [ "${STUB_EXEC_REMOTE:-0}" = 1 ]; then
+  for command do :; done
+  exec bash -c "$command"
+fi
 case "$*" in
   *flock*)
     set -- $(pop "$D/probe.script" '0 0')
@@ -683,6 +687,59 @@ STUB
   wait "$bpid" 2> /dev/null || true
   [ ! -e "$pd/$bpid" ] || fail "a call ended by TERM left its pid file $pd/$bpid"
   spid=$(cat "$d/ssh.pid" 2> /dev/null) && kill "$spid" 2> /dev/null || true
+  # Execute the actual remote command under a fake environment: query failures must stop
+  # both A6000 selections before the command's side effect, even when a Bloomery lock is held.
+  mkdir -p "$d/tree/tools/ref/models"
+  printf ':\n' > "$d/home/bloomery-env.sh"
+  printf 'BLOOMERY_MODEL=stub\nMODEL=/unused\nBLOOMERY_DATA=/unused\n' > "$d/tree/tools/ref/ref-paths.sh"
+  printf 'V41_MODEL=/unused\n' > "$d/tree/tools/ref/models/deepseek41.sh"
+  cat > "$d/stub/nvidia-smi" << 'STUB'
+#!/bin/sh
+case "$*" in
+  *--query-gpu=*) printf 'GPU-A6000, NVIDIA RTX A6000\nGPU-3090, NVIDIA GeForce RTX 3090\n' ;;
+  *--query-compute-apps=pid*)
+    [ -z "$STUB_APPS" ] || printf '%s\n' "$STUB_APPS"
+    exit "$STUB_APPS_RC" ;;
+  *) exit 64 ;;
+esac
+STUB
+  printf '#!/bin/sh\nprintf "inactive\\n"\nexit 3\n' > "$d/stub/systemctl"
+  cat > "$d/stub/flock" << 'STUB'
+#!/bin/sh
+case "$*" in
+  *bloomery-gate-a6000.lock*) exit "$STUB_GATE_RC" ;;
+  *bloomery-cpu.lock*) exit "$STUB_LEASE_RC" ;;
+  *) exit 64 ;;
+esac
+STUB
+  chmod +x "$d/stub/nvidia-smi" "$d/stub/systemctl" "$d/stub/flock"
+  local card name query_rc apps gate_rc lease_rc expected visible
+  for card in a6000 both; do
+    visible=GPU-A6000
+    [ "$card" != both ] || visible=GPU-3090,GPU-A6000
+    while read -r name query_rc apps gate_rc lease_rc expected; do
+      [ "$apps" != - ] || apps=
+      rm -f "$d/launched"
+      call BLOOMERY_BOX_READONLY=1 BLOOMERY_REMOTE="$d/tree" BLOOMERY_CARD="$card" STUB_EXEC_REMOTE=1 \
+        STUB_APPS="$apps" STUB_APPS_RC="$query_rc" STUB_GATE_RC="$gate_rc" STUB_LEASE_RC="$lease_rc" \
+        -- 'printf "%s\n" "$CUDA_VISIBLE_DEVICES" > '"$(printf %q "$d/launched")"
+      want "$expected" "$card $name"
+      if [ "$expected" = 0 ]; then
+        [ -f "$d/launched" ] && [ "$(cat "$d/launched")" = "$visible" ] || fail "$card $name: command did not run with the selected devices"
+      else
+        [ ! -e "$d/launched" ] || fail "$card $name: refused command still ran"
+      fi
+    done << 'CASES'
+empty 0 - 0 0 0
+busy 0 1234 0 0 75
+failed-empty 42 - 0 0 75
+failed-partial 42 1234 0 0 75
+busy-gate-held 0 1234 1 0 0
+busy-lease-held 0 1234 0 1 0
+failed-gate-held 42 1234 1 0 75
+failed-lease-held 42 - 0 1 75
+CASES
+  done
   # A tree whose HEAD reads but whose status does not (a corrupt index): the call stops 70 naming the tree and Git's exit
   # code, and the command never reaches ssh — a commit whose dirt is unreadable is not one BLOOMERY_GIT_COMMIT gets to export.
   printf 'x' > "$d/tree/.git/index"
@@ -994,7 +1051,8 @@ card_pick() {
     # A compute process on the A6000 while its gate lock or the timing lease is held is one of our runs: the
     # command goes on, and tools/gpu-gate.sh waits for the card lock inside its bound. One with both free is
     # a surprise (serving or training) and ends the command with 75. Shared probes: they never hold a lock.
-    if [ -n "$(nvidia-smi -i "$A" --query-compute-apps=pid --format=csv,noheader)" ] &&
+    APPS=$(nvidia-smi -i "$A" --query-compute-apps=pid --format=csv,noheader) || { echo "box.sh: A6000 process query failed" >&2; exit 75; }
+    if [ -n "$APPS" ] &&
        flock -s -n /root/bloomery-gate-a6000.lock true && flock -s -n /root/bloomery-cpu.lock true; then
       echo "box.sh: the A6000 has compute processes and neither its gate lock nor the timing lease is held (serving or training?) — not taking it" >&2; exit 75; fi
     '"$( [ "$1" = both ] && echo 'export CUDA_VISIBLE_DEVICES="$T,$A"' || echo 'export CUDA_VISIBLE_DEVICES="$A"' )" ;;
