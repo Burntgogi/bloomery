@@ -36,9 +36,9 @@ brew install midagedev/tap/bloomery        # Linux x86-64, NVIDIA sm_86+
 bloomery-serve --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M --port 8080
 ```
 
-## Status (0.3.3)
+## Status (0.3.4)
 
-0.3.3 adds Nemotron 3 Nano 4B on its own seat (`--model nemotron`, [#259](https://github.com/midagedev/bloomery/pull/259)) and MiniCPM-V 4.7 35B-A3B image input ([#147](https://github.com/midagedev/bloomery/pull/147)), with `--mmproj` on the `qwen3` seat; a tile is capped at 70 tokens. The Qwen3.8 limits 0.3.2 listed are fixed: the paged log names the asked draft before the yield ([#121](https://github.com/midagedev/bloomery/pull/121)), and `gate-gpu-qwen4exp-mtp` (pg) plans its card experts with their route scratch ([#255](https://github.com/midagedev/bloomery/pull/255)). The release pass for this tarball is in the [0.3.3 release notes](https://github.com/midagedev/bloomery/releases/tag/v0.3.3).
+0.3.4 adds Nemotron 3.5 Bolt 74B-A9B on the `nemotron` seat ([#320](https://github.com/midagedev/bloomery/pull/320)), whose prompt runs in batched passes of up to 4,096 rows ([#328](https://github.com/midagedev/bloomery/pull/328), [#400](https://github.com/midagedev/bloomery/pull/400)), and Nemotron 3 Nano 4B now reads a prompt in passes instead of one step a token ([#305](https://github.com/midagedev/bloomery/pull/305)). EmbeddingGemma v1 joins EmbeddingGemma 2 beside a chat model ([#390](https://github.com/midagedev/bloomery/pull/390)), and EmbeddingGemma 2 embeds sampled video frames and audio ([#397](https://github.com/midagedev/bloomery/pull/397), [#405](https://github.com/midagedev/bloomery/pull/405)). The release pass for this tarball is in the [0.3.4 release notes](https://github.com/midagedev/bloomery/releases/tag/v0.3.4).
 
 | Area | State |
 |---|---|
@@ -60,13 +60,13 @@ bloomery-serve --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M --port 8080
 | Text embeddings | EmbeddingGemma v1 (300M) and EmbeddingGemma 2, Q8_0, beside a chat model: `--embd-model FILE` or `--embd-hf ggml-org/embeddinggemma-2-GGUF:Q8_0`. `/v1/embeddings` and `/embedding` return mean-pooled vectors; `dimensions` selects 128, 256, 512 or the full output width (768), normalized after the cut. V1 takes up to 2048 tokens per input; v2 takes up to 8192. The side seat reserves its bytes before the chat plan places experts. See [serving](docs/serving.md) |
 | Image input | V4.1, Qwen3.6, MiniCPM-V 4.7, GLM-5.3 and the Clef decide seat, with `--mmproj <file>` (llama-server's flag). Under `--hf` with no `--mmproj`, a seat takes the projector in the model's repo when it costs the text model no card experts or context; otherwise it prints the projector's bytes and serves text (`--no-mmproj` skips it). Images go in as base64 (`data:` URLs), not fetched URLs. A request with an image to a seat started without an encoder is refused by name |
 
-### Known issues and limits (0.3.3)
+### Known issues and limits (0.3.4)
 
 - **The Qwen3.6 real-tier e2e gate's `split` residency clause can fail on one run and pass on the next at the same commit** (on an RTX 3090, logits distance from the off run up to 4.879e-1 against its 0.26 band, then 1.6–1.8e-1 on a rerun). The experts it streams follow the lane rate measured at runtime, so the clause's distance moves from run to run. This is a developer gate, not a change in what a load serves.
 - **On Qwen3.8 loads that page experts through the NVMe tier, `gate-gpu-qwen38-serve`'s real tier was 70/72 on 0.3.2's
-  baseline (`f382b474`), with two preexisting paged failures.** It was not re-run for this note; the 0.3.3 release pass
-  re-checks it. A default load keeps the draft off.
-- **Nemotron 3 Nano 4B reads a prompt at its decode rate and serves one slot on one card** ([the nemotron seat](docs/serving.md#the-seats) names what it refuses and when it keeps a prefix).
+  baseline (`f382b474`), with two preexisting paged failures.** It was not re-run for this note, and the 0.3.4
+  release pass has no paged row. A default load keeps the draft off.
+- **The nemotron seat (Nemotron 3 Nano 4B and Nemotron 3.5 Bolt) serves one slot on one card** ([the nemotron seat](docs/serving.md#the-seats) names what it refuses and when it keeps a prefix); `--place bp` on Bolt is refused by name.
 - **Unset context is the seats' ladder (PIN(2026-10-14)).** With `--ctx-size` unset, one slot asks the lesser of
   262,144 and the file's limit and halves while the plan is short of the card, and of the host where the body keeps
   no tier past it. A set `--ctx-size` that does not fit is refused
@@ -97,12 +97,12 @@ docker run --gpus all -p 8080:8080 -v bloomery-cache:/root/.cache/bloomery \
   ghcr.io/midagedev/bloomery --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M
 
 # or the plain tarball
-tar -xzf bloomery-0.3.3-linux-x86_64-cuda-sm86.tar.gz && cd bloomery-0.3.3-linux-x86_64-cuda-sm86
+tar -xzf bloomery-0.3.4-linux-x86_64-cuda-sm86.tar.gz && cd bloomery-0.3.4-linux-x86_64-cuda-sm86
 bin/bloomery-serve --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M --port 8080
 ```
 
 The tarballs are on the [releases page](https://github.com/midagedev/bloomery/releases)
-([0.3.3](https://github.com/midagedev/bloomery/releases/tag/v0.3.3)). From source: [`docs/BUILD.md`](docs/BUILD.md).
+([0.3.4](https://github.com/midagedev/bloomery/releases/tag/v0.3.4)). From source: [`docs/BUILD.md`](docs/BUILD.md).
 
 ## Use
 
@@ -117,8 +117,9 @@ One binary, seven seats; the file's architecture picks the seat, and `--place` c
 | `mimo2` | [MiMo-V2.6-Flash](https://huggingface.co/ggml-org/MiMo-V2.6-Flash-MOPD-GGUF) | `bloomery-serve --hf ggml-org/MiMo-V2.6-Flash-MOPD-GGUF:MXFP4` |
 | `decide` | [Clef-Flash](https://huggingface.co/Cloudflare/clef-flash) and [lev](https://huggingface.co/ggml-org/lev-GGUF) (decision models) | `bloomery-serve --hf bartowski/Cloudflare_clef-flash-GGUF:Q5_K_M` |
 
-The seventh seat, `nemotron`, serves Nemotron 3 Nano 4B (new in 0.3.3) from a file on disk, tested as
-`NVIDIA-Nemotron3-Nano-4B-Q4_K_M.gguf`: `bloomery-serve --model nemotron -m PATH/NVIDIA-Nemotron3-Nano-4B-Q4_K_M.gguf`.
+The seventh seat, `nemotron`, serves Nemotron 3 Nano 4B (new in 0.3.3) and Nemotron 3.5 Bolt 74B-A9B (new in 0.3.4)
+from a file on disk, tested as `NVIDIA-Nemotron3-Nano-4B-Q4_K_M.gguf` and `NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB.gguf`:
+`bloomery-serve -m PATH/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB.gguf`.
 The table above lists the seats with a checked `--hf` row.
 
 ```sh
