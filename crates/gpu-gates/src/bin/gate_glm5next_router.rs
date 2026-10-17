@@ -114,7 +114,6 @@ mod gate {
             fault: FaultSink,
         ) -> Result<(), GpuError>;
         #[allow(clippy::too_many_arguments, reason = "the module's launcher, flat")]
-        #[allow(clippy::too_many_arguments, reason = "the module's launcher, flat")]
         fn enqueue_rows(
             k: &Self::Kernels,
             s: &CudaStream,

@@ -616,6 +616,10 @@ mod mamba2_kernels {
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]
+    #[allow(
+        clippy::needless_range_loop,
+        reason = "a range `for` is the loop the unroller recognizes; an iterator loop keeps its array in a local depot"
+    )]
     #[kernel]
     // Seven blocks an SM: 72 registers a thread. A grid of 512 blocks (a
     // 128-head, 4-chunk layer) on 84 SMs is one wave at seven; six leave a
@@ -804,11 +808,9 @@ mod mamba2_kernels {
                 for i in 0usize..CH_PER_WARP {
                     let k = wid * CH_PER_WARP + i;
                     if channel_live(chunk, k, head_dim) {
-                        let at = c_x + k;
-                        // SAFETY: at0 + 2·STATE + k and at0 + STAGED_Z + k <
-                        // STAGE_T2, written before the barrier.
-                        let (x, zv) =
-                            unsafe { (*cs.add(at0 + 2 * STATE + k), *cs.add(at0 + STAGED_Z + k)) };
+                        // SAFETY: at0 + 2·STATE + k < STAGE_T2, written before
+                        // the barrier.
+                        let x = unsafe { *cs.add(at0 + 2 * STATE + k) };
                         xs[i] = x;
                         let x_dt = mul_rn_f32(x, sigma);
                         #[unroll]
