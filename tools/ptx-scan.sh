@@ -56,6 +56,10 @@
 #   (tools/ptx-spill-check.sh) read the JIT columns and need the full scan. Every reader of a scan
 #   (tools/ref/ptx-canon.py, tools/recipes.py `affected --narrow`, tools/ptx-spill-check.sh) reads the
 #   banner's `jit=` and the cell, and never takes the marker for a value.
+#   A driver JIT that tools/gpu-gate.sh ends with 75 (a card lock, the batch hold, the V4.1 load lock or the timing lease was
+#   not free: contention, not a red gate) ends the scan 75, not 1: the banner names `jit=contention scan=failed` (no rows, so a
+#   reader refuses it as any failed scan) and the last stderr line says the scan hit lock contention and holds gpu-gate.sh's
+#   own last line. Every other nonzero JIT code stays `jit=failed`, rc 1.
 #   PTX_SCAN_KEEP=<dir> keeps the extractor's modules: every mod<N>.ptx it wrote (the raw module text, which is what
 #   tools/ref/ptx-canon.py reads, not the extractor's --norm bodies) is copied into <dir>, made if missing, after the older
 #   mod<N>.ptx files there are removed (other files stay). Nothing else changes: the same stdout and stderr, the same
@@ -193,6 +197,13 @@ case $module in
 esac >&2
 ''')
     executable(tree / "tools/gpu-gate.sh", '''
+if [ -n "${PTX_FIX_JIT_RC:-}" ]; then
+    case $PTX_FIX_JIT_RC in
+        75) echo "gpu-gate.sh: oxart_jit: the timing lease /root/lease is held by a sitting: not starting on it - contention, not a red gate (rc 75)" >&2 ;;
+        *) echo "oxart_jit: fixture JIT failure" >&2 ;;
+    esac
+    exit "$PTX_FIX_JIT_RC"
+fi
 printf '# card=fixture cc=86 cuda_driver=13030\n'
 printf 'q4k_gemv\t32\t0\t256\t128\nzero_loads\t12\t0\t0\t1024\nnext_module\t16\t0\t128\t32\n'
 ''')
@@ -297,6 +308,22 @@ printf 'q4k_gemv\t32\t0\t256\t128\nzero_loads\t12\t0\t0\t1024\nnext_module\t16\t
     check("full scan layout and JIT columns", assembled.returncode == 0 and ah == header and not an
           and ar["q4k_gemv"] == rows["q4k_gemv"][:10] + ["32", "0"] + ["7", "4", "3"]
           and ad == digests)
+    # The driver JIT's exit code: tools/gpu-gate.sh's 75 is lock contention, not a red gate, so the scan ends 75 with a banner no
+    # reader takes for a table and the line that names it; any other nonzero JIT code stays the failed scan, rc 1.
+    contended = scan(["gate_x"], {"PTX_FIX_JIT_RC": "75"})
+    check("a JIT that ends 75 ends the scan 75: a contention banner with no rows, not the failed-JIT banner",
+          contended.returncode == 75 and "modules=2 jit=contention scan=failed" in contended.stdout
+          and "entry " not in contended.stdout and "jit=failed" not in contended.stdout)
+    check("a JIT that ends 75: the last stderr line names the contention and keeps gpu-gate.sh's own last line",
+          contended.stderr.splitlines()[-1] == "ptx-scan: the driver JIT (oxart_jit) hit lock contention, not a failure (rc 75): "
+          "gpu-gate.sh: oxart_jit: the timing lease /root/lease is held by a sitting: not starting on it "
+          "- contention, not a red gate (rc 75)")
+    for code in ("1", "124", "137"):
+        broken = scan(["gate_x"], {"PTX_FIX_JIT_RC": code})
+        check(f"a JIT that ends {code} stays the failed scan, rc 1, with the failed-JIT banner and line",
+              broken.returncode == 1 and "modules=2 jit=failed scan=failed" in broken.stdout and "entry " not in broken.stdout
+              and "contention" not in broken.stdout + broken.stderr
+              and broken.stderr.splitlines()[-1] == "ptx-scan: the driver JIT (oxart_jit) failed: oxart_jit: fixture JIT failure")
     # blk/SM is column 10. next_module (one warp, 128 B) is held by the block cap alone at 16 registers, 16 on 8.6
     # and 24 on 12.x, where the warp limit would allow 48; at 90 registers a warp takes 3072 of them in units of 256,
     # and 65536 / 3072 holds it at 21; at 25000 B a block takes 25088 + 1024 of the 102400, and shared memory holds
@@ -411,9 +438,11 @@ case $ARCH in
 esac
 BIN=target/release/$NAME
 # A failed scan prints its banner and no rows: two failed scans must never diff as two equal tables.
+# FAIL_RC is the exit code: 1, except the JIT's lock contention (75, below), which sets it on the line before its call.
+FAIL_RC=1
 fail() { # fail <banner fields...>
   echo "ptx-scan bin=$BIN $* scan=failed"
-  exit 1
+  exit "$FAIL_RC"
 }
 if [ ! -x "$BIN" ]; then
   echo "ptx-scan: no $BIN — run the matching just gate-gpu-* recipe first" >&2
@@ -512,6 +541,12 @@ else
   jit_rc=0
   BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh "$JIT" "$PTX" >"$JITTBL" 2>"$MODS/jit.err" || jit_rc=$?
   grep '^gpu-gate\.sh: waited ' "$MODS/jit.err" >&2 || true
+  if [ "$jit_rc" = 75 ]; then
+    # gpu-gate.sh's 75 is lock contention, not a red gate: the scan ends 75 so a retrying caller (tools/gate-batch.sh) retries it.
+    echo "ptx-scan: the driver JIT ($JIT) hit lock contention, not a failure (rc 75): $(tail -1 "$MODS/jit.err")" >&2
+    FAIL_RC=75
+    fail "$SEC $TOOLS modules=$NMOD jit=contention"
+  fi
   if [ "$jit_rc" != 0 ]; then
     echo "ptx-scan: the driver JIT ($JIT) failed: $(tail -1 "$MODS/jit.err")" >&2
     fail "$SEC $TOOLS modules=$NMOD jit=failed"

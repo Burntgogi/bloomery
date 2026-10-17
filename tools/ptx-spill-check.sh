@@ -42,9 +42,13 @@
 #   <bin> <entry> stale                                    (in the table, not in the scan)
 #   ptx-spill bin=<bin> scan is no-jit (jit_local not read) FAIL   (a scan that skipped the JIT)
 #   ptx-spill bin=<bin> no table for <arch> on cc <M.m> FAIL       (no table of the scan's arch and capability)
+#   ptx-spill bin=<bin> scan rc=75 CONTENTION                      (the scan's JIT could not take a lock: no reading, no verdict)
 # Before its verdict each binary names the table it read: `ptx-spill bin=<bin> table=<path> arch=<arch> jit-cc=<M.m>`.
 # Exit status: 0 when every binary's scan read and matched its pins; 1 on a violation or a scan
-# that failed (ptx-scan's own nonzero exit, or a table it printed without rows); 2 on a usage error
+# that failed (ptx-scan's own nonzero exit but 75, or a table it printed without rows); 75 when at least one scan
+# ended 75 (lock contention: ptx-scan's JIT step found a card lock, a batch hold or the timing lease taken) and no binary
+# had a violation or a failed scan: a contended binary is no verdict and the rest read as usual, so a batch retries the
+# gate instead of booking it red; 2 on a usage error
 # (a table whose arch or capability lines are refused above included); 64 a BLOOMERY_ARCH that is no arch or that no
 # table pins.
 set -uo pipefail
@@ -55,11 +59,14 @@ self_test() {
   cp "${BASH_SOURCE[0]}" "$t/ptx-spill-check.sh"
   cp "${BASH_SOURCE[0]%/*}/arch.sh" "$t/arch.sh"
   unset BLOOMERY_ARCH
-  # The stub scan prints the fixture scan of its binary, or fails as ptx-scan does on a missing binary.
+  # The stub scan prints the fixture scan of its binary, or fails as ptx-scan does on a missing binary. A fixture with a `.err` file
+  # also writes that to stderr, and one with a `.rc` file ends with that code (the scan of a JIT that met a lock, 75).
   printf '%s\n' '#!/usr/bin/env bash' \
     'f="${BASH_SOURCE[0]%/*}/$1${2:+.$2}.scan"' \
     '[ -f "$f" ] || { echo "ptx-scan bin=target/release/$1 missing scan=failed"; exit 1; }' \
-    'cat "$f"' > "$t/ptx-scan.sh"
+    '[ ! -f "${f%.scan}.err" ] || cat "${f%.scan}.err" >&2' \
+    'cat "$f"' \
+    'exit "$(cat "${f%.scan}.rc" 2> /dev/null || echo 0)"' > "$t/ptx-scan.sh"
   # A scan's banner names the arch and capability it was read on: SA and SC, sm_86 and 8.6 unset.
   scan() { # scan <bin> <entry spill jit_local>...
     local b=$1 r
@@ -83,6 +90,13 @@ self_test() {
   marked g " jit=skipped(no-jit)" 0 "k1 0"
   marked h "" "skipped(no-jit)" "k1 0"
   scan v.vis_ "vis_a 0 0"
+  # p75: a scan whose JIT met a held lock, as ptx-scan ends it: a banner with no rows, six module lines on stderr and the line that
+  # names the contention (gpu-gate.sh's own last line in it) last, rc 75.
+  hold='the batch hold /root/bloomery-batch.gpuhold (owner leadbatch) was still up after 4 s (CARD_BOUND 4 s) - contention, not a red gate (rc 75)'
+  want75="ptx-scan: the driver JIT (oxart_jit) hit lock contention, not a failure (rc 75): gpu-gate.sh: oxart_jit: $hold"
+  echo "ptx-scan bin=target/release/p75 section=.oxart bytes=1 modules=6 jit=contention scan=failed" > "$t/p75.scan"
+  { for r in 1 2 3 4 5 6; do echo "ptx-scan: mod$r bundle=fixture bytes=1"; done; echo "$want75"; } > "$t/p75.err"
+  echo 75 > "$t/p75.rc"
   # Scans on a cc 12.1 card: w at sm_86, x at sm_86 with only a cc 8.6 row, y on a capability no table pins, z at sm_121.
   SC=12.1 scan w "k1 0 0" "k2 8 24"
   SC=12.1 scan x "k1 0 0"
@@ -112,6 +126,20 @@ self_test() {
   check "a spill above its pin" 1 "d k1 spill=16 pinned=0 ABOVE" "$t/table" d
   check "a pinned row the scan lacks" 1 "d k9 stale" "$t/table" d
   check "a failed scan" 1 "ptx-spill bin=e scan rc=1 FAIL" "$t/table" e
+  # A scan that ends 75 met lock contention: no reading and no verdict, so no FAIL and rc 75; any real failure beside it is still 1.
+  check "a scan that ends 75 is contention, rc 75" 75 "ptx-spill bin=p75 scan rc=75 CONTENTION" "$t/table" p75
+  if grep -q 'FAIL' <<< "$out"; then
+    echo "ptx-spill-check self-test: a scan that ends 75 printed a FAIL line:" >&2
+    sed 's/^/  /' <<< "$out" >&2
+    fails=$((fails + 1))
+  fi
+  check "a contended scan's own stderr line, behind its six module lines, reaches the output" 75 "  ptx-scan stderr: $want75" "$t/table" p75
+  check "a contended binary then a green one: the green one reads, rc 75" 75 "ptx-spill bin=a entries=2 pinned=2 nonzero=k2(spill=8,jit_local=0) violations=0 PASS" "$t/table" p75 a
+  check "a green binary then a contended one: rc 75" 75 "ptx-spill bin=p75 scan rc=75 CONTENTION" "$t/table" a p75
+  check "two contended scans: rc 75" 75 "ptx-spill bin=p75 scan rc=75 CONTENTION" "$t/table" p75 p75
+  check "a contended scan then a failed one: rc 1, the failure named" 1 "ptx-spill bin=e scan rc=1 FAIL" "$t/table" p75 e
+  check "a failed scan then a contended one: rc 1, the contention named" 1 "ptx-spill bin=p75 scan rc=75 CONTENTION" "$t/table" e p75
+  check "a contended scan then a spill above its pin: rc 1" 1 "d k1 spill=16 pinned=0 ABOVE" "$t/table" p75 d
   check "a scan that skipped the JIT (banner and cells)" 1 "ptx-spill bin=f scan is no-jit (jit_local not read) FAIL" "$t/table" f
   check "a no-jit banner over a numeric jit_local" 1 "ptx-spill bin=g scan is no-jit (jit_local not read) FAIL" "$t/table" g
   check "a skipped jit_local under a banner that ran the JIT" 1 "ptx-spill bin=h scan is no-jit (jit_local not read) FAIL" "$t/table" h
@@ -222,6 +250,7 @@ if ! printf '%s\n' "${KEYS[@]}" | grep -q "^$ARCH "; then
   exit 64
 fi
 rc=0
+contention=0
 for ARG in "$@"; do
   BIN=${ARG%%:*}
   FILTER=
@@ -230,6 +259,13 @@ for ARG in "$@"; do
   src=$?
   banner=$(grep -m1 '^ptx-scan bin=' "$TMP/$BIN.scan")
   echo "${banner:-ptx-scan bin=target/release/$BIN (no banner)}"
+  if [ "$src" -eq 75 ]; then
+    # ptx-scan's last stderr line on a 75 names the contention and holds gpu-gate.sh's own last line (the batch reads the hold's owner from it).
+    echo "ptx-spill bin=$BIN scan rc=75 CONTENTION"
+    sed 's/^/  ptx-scan stderr: /' "$TMP/$BIN.err" | tail -1
+    contention=1
+    continue
+  fi
   if [ "$src" -ne 0 ]; then
     echo "ptx-spill bin=$BIN scan rc=$src FAIL"
     sed 's/^/  ptx-scan stderr: /' "$TMP/$BIN.err" | head -5
@@ -289,4 +325,6 @@ for ARG in "$@"; do
     echo "ptx-spill bin=$BIN entries=$n pinned=$p nonzero=${nz:-none} violations=0 PASS"
   fi
 done
+# A real failure anywhere is 1; contention alone is 75 (the header).
+[ "$rc" != 0 ] || [ "$contention" = 0 ] || rc=75
 exit "$rc"
