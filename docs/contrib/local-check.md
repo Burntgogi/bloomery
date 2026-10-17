@@ -111,6 +111,13 @@ what a contributor sets up and what to expect.
 Its remote-only queue fixture clears local mode before invoking its SSH stub;
 the local-mode cases continue to exercise the local runner.
 
+In box mode, `BLOOMERY_GATE_CARD=any` considers the A6000 idle only after a
+successful compute-process query that does not name its UUID. A failed query,
+including one with partial output, skips the A6000 and tries the 3090 under the
+existing lease rules. An explicit `a6000` selection keeps its forced-card policy.
+The host-only self-test exercises these selection paths with isolated locks,
+leases and query responses; it does not measure physical GPU occupancy.
+
 **Set up once:**
 
 1. **The environment file.** `BLOOMERY_ENV_FILE`, default `~/bloomery-env.sh`, is sourced before the command; a

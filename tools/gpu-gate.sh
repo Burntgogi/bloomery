@@ -370,6 +370,7 @@ self_test() {
   printf '%s\n' '#!/bin/sh' 'case "$*" in' \
     '  *query-gpu=name,uuid*) printf "NVIDIA GeForce RTX 3090, GPU-11111111-1111-1111-1111-111111111111\nNVIDIA RTX A6000, GPU-00000000-0000-0000-0000-000000000000\n" ;;' \
     '  *query-gpu=*) printf "GPU-11111111-1111-1111-1111-111111111111, NVIDIA GeForce RTX 3090\nGPU-00000000-0000-0000-0000-000000000000, NVIDIA RTX A6000\n" ;;' \
+    '  *query-compute-apps=*) [ -z "${STUB_COMPUTE_UUID:-}" ] || printf "%s\n" "$STUB_COMPUTE_UUID"; exit "${STUB_COMPUTE_RC:-0}" ;;' \
     'esac' > "$t/bin/nvidia-smi"
   printf '%s\n' '#!/bin/sh' '[ -z "${STUB_PID:-}" ] || echo "$$ $PPID" > "$STUB_PID"' \
     '[ -z "${STUB_TERM:-}" ] || trap "sleep 1; exit $STUB_TERM" TERM' \
@@ -422,7 +423,7 @@ PY
   }
   local gate_env=(env -u BLOOMERY_BOX_CARD -u BLOOMERY_GATE_BOUND -u BLOOMERY_GATE_V41_LOAD -u BLOOMERY_GATE_STACKS -u BLOOMERY_GATE_GDB -u CUDA_VISIBLE_DEVICES
     -u BLOOMERY_TIER -u BLOOMERY_FIXTURE_MODEL -u BLOOMERY_REF_MODEL -u BLOOMERY_BATCH_OWNER -u BLOOMERY_V41_CLASS -u BLOOMERY_V41_PRED_S
-    -u GATE_TEST_PACE -u STUB_ORDER -u STUB_ID PATH="$t/bin:$PATH")
+    -u GATE_TEST_PACE -u STUB_ORDER -u STUB_ID -u STUB_COMPUTE_UUID -u STUB_COMPUTE_RC PATH="$t/bin:$PATH")
   # gate <out file> <BLOOMERY_GATE_CARD> <lease file> [K=V…]: one run of the runner, its rc (TL=<dir>: the dir its locks and its
   # batch hold live in, default the test's own; GB=<s>: its own bound, default 60)
   gate() {
@@ -543,6 +544,13 @@ PY
   rm -rf "$t/lease.card" "$t/proc"
   mkdir -p "$t/proc"
   case_ 'a6000 forced, lease free: the A6000' 0 "ran on $GPU_A6000" a6000 "$t/lease"
+  case_ 'any, successful empty process query: takes the A6000' 0 'ok on the a6000 \(asked any\)' any "$t/lease"
+  case_ 'any, successful process query names the A6000: takes the 3090' 0 'ok on the 3090 \(asked any\)' any "$t/lease" STUB_COMPUTE_UUID="$GPU_A6000"
+  case_ 'any, successful process query names another card: takes the A6000' 0 'ok on the a6000 \(asked any\)' any "$t/lease" STUB_COMPUTE_UUID="$GPU_3090"
+  case_ 'any, failed empty process query: takes the 3090' 0 'ok on the 3090 \(asked any\)' any "$t/lease" STUB_COMPUTE_RC=42
+  case_ 'any, failed partial process query names another card: takes the 3090' 0 'ok on the 3090 \(asked any\)' any "$t/lease" STUB_COMPUTE_RC=42 STUB_COMPUTE_UUID="$GPU_3090"
+  case_ 'any, failed partial process query names the A6000: takes the 3090' 0 'ok on the 3090 \(asked any\)' any "$t/lease" STUB_COMPUTE_RC=42 STUB_COMPUTE_UUID="$GPU_A6000"
+  case_ 'a6000 forced, process query fails: still runs on the A6000' 0 "ran on $GPU_A6000" a6000 "$t/lease" STUB_COMPUTE_RC=42
   case_ 'a6000 forced, lease cannot be tested: 70, named' 70 'cannot be tested' a6000 "$t/no-dir/lease"
   case_ 'a V4.1 load alone takes the V4.1 load lock and does not wait' 0 'ok on the 3090 \(asked 3090\), V4\.1 load lock' 3090 "$t/lease" BLOOMERY_GATE_V41_LOAD=1
   case_ 'BLOOMERY_GATE_V41_LOAD other than 0 or 1: 64, named' 64 'BLOOMERY_GATE_V41_LOAD is 1' 3090 "$t/lease" BLOOMERY_GATE_V41_LOAD=yes
@@ -1737,8 +1745,9 @@ for row in "${PIN_3090[@]}"; do
 done
 uuid_of() { nvidia-smi --query-gpu=uuid,name --format=csv,noheader | grep "$1" | cut -d, -f1 | head -1; }
 a6000_idle() {
-  local u; u=$(uuid_of A6000); [ -n "$u" ] || return 1
-  ! nvidia-smi --query-compute-apps=gpu_uuid --format=csv,noheader | grep -q "$u"
+  local u processes; u=$(uuid_of A6000); [ -n "$u" ] || return 1
+  processes=$(nvidia-smi --query-compute-apps=gpu_uuid --format=csv,noheader) || return 1
+  ! grep -Fq -- "$u" <<< "$processes"
 }
 # 락 파일을 못 여는 셸(박스의 root가 아니거나 박스가 아님)은 경쟁이 아니다 — 여기서 이름을 대고 끝난다.
 LOCK_FILES=("9:$GATE_LOCK" "8:$A6000_LOCK")
