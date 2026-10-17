@@ -137,6 +137,11 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = --self-test ]; then
   A_BIN=("$pt/third/target/release/generate_qwen3moe")
   out=$(bin_arms_distinct "$pt/ours/target/release/generate_qwen3moe" "$pt/ours" 2>&1) && r=0 || r=$?
   check distinct "$r|$out" '0|'
+  # The declaration is what the A/A call rides on: the preceding arm (a third tree's build) passes the
+  # distinct check without it, so asserting on it would keep a deleted `return` green. The same-tree
+  # arm the `same-tree` case above refused is what needs the declaration — set it back and call.
+  ARMS=(bin:$pt/ours/target/release/generate_qwen3moe:6)
+  A_BIN=("$pt/ours/target/release/generate_qwen3moe")
   A_KIND=(bin)
   out=$(BLOOMERY_AB_AA=1 bin_arms_distinct "$pt/ours/target/release/generate_qwen3moe" "$pt/ours" 2>&1) && r=0 || r=$?
   check aa-declared "$r" 0
