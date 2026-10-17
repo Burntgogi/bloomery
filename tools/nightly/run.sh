@@ -125,7 +125,12 @@ else
   TREE_LABEL=origin/main
 fi
 COMMIT=$(git -C "$CLONE" rev-parse --short=8 HEAD)
-if [ -n "$(git -C "$CLONE" status --porcelain --untracked-files=normal)" ]; then COMMIT=$COMMIT+local; fi
+# The status is a checked assignment, as in tools/box.sh: the clone's HEAD reads but its status may not
+# (a corrupt index), and the commit would then be published — the file above all — without its +local
+# honesty. Stop RED naming the clone and Git's exit code before anything carries the commit.
+st=$(git -C "$CLONE" status --porcelain --untracked-files=normal) && st_rc=0 || st_rc=$?
+[ "$st_rc" = 0 ] || { put "$RUN/failed" "run: git status of $CLONE failed (git exit $st_rc)"; finish 2 RED "git status of $CLONE failed (git exit $st_rc)"; }
+[ -z "$st" ] || COMMIT=$COMMIT+local
 put "$RUN/commit" "$COMMIT"
 put "$RUN/summary" "$DATE $COMMIT $TREE_LABEL RUNNING (started $(TZ=Asia/Seoul date +%H:%M:%S) KST)"
 echo "== tree $TREE_LABEL $COMMIT"
