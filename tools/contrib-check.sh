@@ -54,7 +54,7 @@ say() { printf '%s\n' "$*" >&2; }
 self_test() {
   local run_only=${1:-'^fmt$'} d out rc scratch fails=0
   command -v git > /dev/null || { say "contrib-check: --self-test: no git on PATH: nothing was run"; return 70; }
-  d=$(mktemp -d "${TMPDIR:-/tmp}/contrib-selftest.XXXXXX")
+  d=$(mktemp -d "${TMPDIR:-/tmp}/contrib-selftest.XXXXXX") || { say "contrib-check: --self-test: cannot create scratch directory"; return 1; }
   cp -a "$ROOT" "$d/repo" || { say "contrib-check: --self-test: the copy of $ROOT failed"; return 1; }
   scratch=$d/repo
   rm -rf "$scratch/.git" "$scratch/target"
@@ -66,8 +66,7 @@ self_test() {
   fi
   # the clean case: the boundary publishes the commit and the run goes on. contrib-check reads the status of
   # the directory it runs in, so the copy runs from its own root.
-  out=$(cd "$scratch" && bash "$scratch/tools/contrib-check.sh" --only "$run_only" 2>&1) || rc=$?
-  rc=${rc:-0}
+  out=$(cd "$scratch" && bash "$scratch/tools/contrib-check.sh" --only "$run_only" 2>&1) && rc=0 || rc=$?
   case $out in
     *"+local"*) say "contrib-check: self-test: the clean run's header marked the commit +local: $out"; fails=$((fails + 1)) ;;
     *"contrib-check tier="*) ;;
@@ -78,6 +77,7 @@ self_test() {
   printf 'x' > "$scratch/.git/index"
   out=$(cd "$scratch" && bash "$scratch/tools/contrib-check.sh" --only "$run_only" 2>&1) || rc=$?
   rc=${rc:-0}
+  out=$(cd "$scratch" && bash "$scratch/tools/contrib-check.sh" --only "$run_only" 2>&1) && rc=0 || rc=$?
   [ "$rc" = 70 ] || { say "contrib-check: self-test: the corrupt-index run ended rc $rc, want 70: $out"; fails=$((fails + 1)); }
   case $out in
     *"failed (git exit 128)"*) ;;
@@ -86,6 +86,15 @@ self_test() {
   case $out in
     *"contrib-check tier="*) say "contrib-check: self-test: the corrupt-index run printed the evidence header: $out"; fails=$((fails + 1)) ;;
   esac
+  # the no-HEAD case (a source archive: no .git, so commit=?): the run keeps going — the ? path the checked
+  # assignment cannot treat, and its unit runs
+  rm -rf "$scratch/.git"
+  out=$(cd "$scratch" && bash "$scratch/tools/contrib-check.sh" --only "$run_only" 2>&1) && rc=0 || rc=$?
+  case $out in
+    *"commit=?"*) ;;
+    *) say "contrib-check: self-test: the archive run's header does not keep the ? path rc $rc: $out"; fails=$((fails + 1)) ;;
+  esac
+  [ "$rc" = 0 ] || { say "contrib-check: self-test: the archive run ended rc $rc: $out"; fails=$((fails + 1)); }
   rm -rf "$d"
   if [ "$fails" != 0 ]; then
     say "contrib-check: self-test $fails failed"
@@ -264,10 +273,13 @@ cpu=$(sed -n 's/^model name[^:]*: *//p' /proc/cpuinfo 2> /dev/null | head -1)
 commit=$(git rev-parse --short=8 HEAD 2> /dev/null || echo "?")
 # The status is a checked assignment, as in tools/box.sh: a status that fails (a corrupt index) leaves the
 # commit's dirt unreadable, and the header would attribute the runs to $commit without its +local — the run
-# stops 70 naming the tree and Git's exit code before the header.
-st=$(git status --porcelain --untracked-files=normal 2> /dev/null) && st_rc=0 || st_rc=$?
-[ "$st_rc" = 0 ] || { say "contrib-check: git status of $ROOT failed (git exit $st_rc)"; exit 70; }
-[ -z "$st" ] || commit=$commit+local
+# stops 70 naming the tree and Git's exit code before the header. No readable HEAD keeps the "?" path (a
+# source archive has none; its header prints commit=? and its unit runs).
+if [ "$commit" != "?" ]; then
+  st=$(git status --porcelain --untracked-files=normal 2> /dev/null) && st_rc=0 || st_rc=$?
+  [ "$st_rc" = 0 ] || { say "contrib-check: git status of $ROOT failed (git exit $st_rc)"; exit 70; }
+  [ -z "$st" ] || commit=$commit+local
+fi
 echo "contrib-check tier=$TIER commit=$commit"
 echo "host: $(uname -srm), $cpu"
 echo "toolchain: $(rustc --version) ($CHANNEL); RUSTFLAGS: $RUSTFLAGS_NOTE; $TIMEOUT_NOTE"
