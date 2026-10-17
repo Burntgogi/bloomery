@@ -237,14 +237,6 @@ fn hw_attn_exact_input_stages() {
             v,
         )
     };
-    let maxdiff = |a: &Tensor2, b: &Tensor2| {
-        a.data
-            .iter()
-            .zip(&b.data)
-            .map(|(x, y)| (x - y).abs())
-            .fold(0.0f32, f32::max)
-    };
-
     for blk in [0usize, 1usize] {
         let g = gguf::Gguf::open(model_path::model_path()).unwrap();
         let p = attn::MlaParams::read(&g, blk).unwrap();
@@ -262,9 +254,11 @@ fn hw_attn_exact_input_stages() {
             attn::q_nope2_absorbed(derived.wk_b_all_heads(blk).unwrap(), &q_exact, &p).unwrap();
         let want = load2(&format!("q_nope2-{blk}"), 0);
         assert_eq!([out.ne0, out.ne1], [want.ne0, want.ne1], "stage A shape");
-        assert!(
-            maxdiff(&out, &want) <= 1e-5,
-            "stage A: absorption arithmetic"
+        asserts::assert_close(
+            &out.data,
+            &want.data,
+            1e-5,
+            "stage A: absorption arithmetic",
         );
 
         // B: the attention proper — two legs.
@@ -366,9 +360,11 @@ fn hw_attn_exact_input_stages() {
         let out = model::ops::matmul_q(&g, wo, &kqv_2d).unwrap();
         let want = load2(&format!("kqv_out-{blk}"), 0);
         assert_eq!([out.ne0, out.ne1], [want.ne0, want.ne1], "stage C shape");
-        assert!(
-            maxdiff(&out, &want) <= 1e-4,
-            "stage C: wv_b + output projection"
+        asserts::assert_close(
+            &out.data,
+            &want.data,
+            1e-4,
+            "stage C: wv_b + output projection",
         );
     }
 }

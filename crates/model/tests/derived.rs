@@ -24,6 +24,8 @@
 //! `hw_` prefix: needs the box and the model file. Like `tests/kv.rs`, this
 //! compares our paths against each other — `tests/attn.rs` and
 //! `tests/forward.rs` are what tie them to ik.
+#[path = "common/asserts.rs"]
+mod asserts;
 #[path = "common/manifest.rs"]
 mod manifest;
 #[path = "common/model_path.rs"]
@@ -119,15 +121,11 @@ fn hw_derived_wblocks_bit_identical() {
         let from_reference = q_nope2_absorbed(&reference_flat, &q, &p).unwrap();
         let from_derived = q_nope2_absorbed(d.wk_b_all_heads(blk).unwrap(), &q, &p).unwrap();
         assert_eq!(from_derived.data.len(), from_reference.data.len(), "shape");
-        let worst = from_derived
-            .data
-            .iter()
-            .zip(&from_reference.data)
-            .map(|(&a, &b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
-        assert_eq!(
-            worst, 0.0,
-            "q_nope2-{blk}: cached-wblocks vs in-place-wblocks max|diff| {worst:e}"
+        asserts::assert_close(
+            &from_derived.data,
+            &from_reference.data,
+            0.0,
+            &format!("q_nope2-{blk}: cached-wblocks vs in-place-wblocks"),
         );
         eprintln!("q_nope2-{blk:<4} cached == in-place   max|diff| = 0   exact");
     }

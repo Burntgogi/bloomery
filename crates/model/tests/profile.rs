@@ -24,6 +24,8 @@
 //! hold anything specific — the oracle is used only as the shared prompt, the same
 //! one every other gate runs, so the bit-identity claim is about the prompt that
 //! matters.
+#[path = "common/asserts.rs"]
+mod asserts;
 #[path = "common/manifest.rs"]
 mod manifest;
 #[path = "common/model_path.rs"]
@@ -117,17 +119,7 @@ fn hw_profile_gate() {
         off.len(),
         on.len()
     );
-    let worst = off
-        .iter()
-        .zip(&on)
-        .map(|(&a, &b)| (a - b).abs())
-        .fold(0.0f32, f32::max);
-    assert_eq!(
-        worst,
-        0.0,
-        "profiling changed the logits: max|diff| {worst:e} over {} values",
-        off.len()
-    );
+    asserts::assert_close(&on, &off, 0.0, "profiling changed the logits");
     eprintln!("logits, off vs profiled level 2      max|diff| = 0   exact");
 
     // Assertions 2 and 3 need the in-process accumulators. The children were separate
