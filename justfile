@@ -279,8 +279,9 @@ gate-gpu-nvfp4:
 # token's logits differ from the token alone), the fault word clean. A step that raises the fault word fails the clause naming it. Against
 # mainline's last-position logits (ref-nemotron-logits, `just dump-ref-nemotron`): the body's argmax is the set's on every prompt, and
 # each prompt's cosine keeps the floor with the same top-5 ids; the max |delta| and cosine print per prompt. A set the box lacks fails by name.
+# Real tier only: the set is the real file's and the Nano has no fixture twin of it, so the fixture tier defers the gate by name.
 gate-gpu-nemotron-e2e:
-    BLOOMERY_MODEL=nemotron_h ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_nemotron_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_nemotron_e2e'
+    BLOOMERY_MODEL=nemotron_h ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-nemotron-e2e && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_nemotron_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_nemotron_e2e'
 
 # nemotron_h_moe (Nemotron 3.5 Bolt) end-to-end gate, one card, on the fixture tier's four layers (or the real file's eighty-eight
 # under the real tier): the captured step's entries against the layer kinds the header derives (the group-16 attention, the MoE
