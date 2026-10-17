@@ -1,0 +1,13 @@
+# The release decode row on the RTX 3090 (250 W): ours v0.3.4 (44495f0ba) vs llama.cpp mainline at depths 512 and
+# 4096, n=96. Ours read 88.36/87.14 (d=512) and 87.42/86.69 (d=4096) in the release sittings; llama.cpp's
+# last same-lease Bolt decode was 81.22 (A6000) / 78.19 (3090) at depth 6 (s1999/s2000).
+kind: baseline
+question: where does the release head's decode sit beside llama.cpp's at depth 512 and 4096?
+term: decode tok/s @ n=96, depth 4096, ours 44495f0ba vs lcpp, RTX 3090 (250 W)
+unit: tok/s
+predict: 85..90
+condition: one lease, the 3090 (BLOOMERY_TIMING_GPU), BLOOMERY_AB_ROUNDS=4; arms 512 lcpp:512 4096 lcpp:4096
+reason: the release sittings' ours rows on the same bits; decode kernels unchanged since.
+decide-in: the release table's decode rows take ours and lcpp from this sitting
+decide-below: under 85: the decode moved since the release sitting; diff the step's launches first
+decide-above: beyond 90: read the witness blocks before taking the row

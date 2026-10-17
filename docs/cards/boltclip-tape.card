@@ -1,0 +1,10 @@
+kind: baseline
+question: what do Bolt's served tapes show for bloomery 0.3.4 beside llama.cpp, each on one card alone?
+term: prompt tok/s of the P4 tape (~5.6K tokens), ours 0.3.4 vs llama.cpp llama-server -ub 4096, RTX A6000
+unit: tok/s
+predict: 2400..2900
+condition: one lease; arms ours:a6000 lcpp:a6000 ours:3090 lcpp:3090, each a fresh load, two discarded warm-ups, P4 then P1 tapes, greedy, thinking off
+reason: the 0.3.4 pass's Bolt row read 2,716 tok/s prompt and 87.5 decode on the same tarball; llama-bench -ub 4096 read 2,217 pp4096 on the A6000.
+decide-in: publish the four P4 tapes to the tape site with titles naming engine and card
+decide-below: under 2400: the serve path lost prompt speed against the pass row; read the serve's plan lines before publishing
+decide-above: beyond 2900: read the witness block before publishing

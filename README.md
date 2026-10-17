@@ -38,14 +38,14 @@ bloomery-serve --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M --port 8080
 
 ## Status (0.3.4)
 
-0.3.4 adds Nemotron 3.5 Bolt 74B-A9B on the `nemotron` seat ([#320](https://github.com/midagedev/bloomery/pull/320)), whose prompt runs in batched passes of up to 4,096 rows ([#328](https://github.com/midagedev/bloomery/pull/328), [#400](https://github.com/midagedev/bloomery/pull/400)), and Nemotron 3 Nano 4B now reads a prompt in passes instead of one step a token ([#305](https://github.com/midagedev/bloomery/pull/305)). EmbeddingGemma v1 joins EmbeddingGemma 2 beside a chat model ([#390](https://github.com/midagedev/bloomery/pull/390)), and EmbeddingGemma 2 embeds sampled video frames and audio ([#397](https://github.com/midagedev/bloomery/pull/397), [#405](https://github.com/midagedev/bloomery/pull/405)). The release pass for this tarball is in the [0.3.4 release notes](https://github.com/midagedev/bloomery/releases/tag/v0.3.4).
+0.3.4 adds Nemotron 3.5 Bolt 74B-A9B on the `nemotron` seat ([#320](https://github.com/midagedev/bloomery/pull/320)), whose prompt runs in batched passes of up to 4,096 rows ([#328](https://github.com/midagedev/bloomery/pull/328), [#400](https://github.com/midagedev/bloomery/pull/400)), and Nemotron 3 Nano 4B now reads a prompt in passes instead of one step a token ([#305](https://github.com/midagedev/bloomery/pull/305)). EmbeddingGemma v1 joins EmbeddingGemma 2 beside a chat model ([#390](https://github.com/midagedev/bloomery/pull/390)), and EmbeddingGemma 2 embeds sampled video frames and audio ([#397](https://github.com/midagedev/bloomery/pull/397), [#405](https://github.com/midagedev/bloomery/pull/405)). Several DGX Sparks serve one model: a tier node on another Spark owns routed experts by id range and pages them from its own NVMe, for Qwen3.8, with the same output as on one Spark ([#358](https://github.com/midagedev/bloomery/pull/358), [#411](https://github.com/midagedev/bloomery/pull/411)), and for GLM-5.3-Flash and DeepSeek-V4.1-Flash ([#420](https://github.com/midagedev/bloomery/pull/420)), whose greedy output can part from one Spark's when experts move between card and host: the two quantize activations differently ([`docs/serving.md`](docs/serving.md)), as with any change of placement. The release pass for this tarball is in the [0.3.4 release notes](https://github.com/midagedev/bloomery/releases/tag/v0.3.4).
 
 | Area | State |
 |---|---|
 | Linux x86-64, NVIDIA sm_86 (RTX 3090, RTX A6000, RTX 3060) | Runs. Every number here comes from these cards |
 | NVIDIA driver | R580 or newer (CUDA 13); an older driver is refused at the start |
 | Ada and Blackwell (sm_89, sm_120) | Blackwell ran on a user's RTX 5090 under WSL2 ([#2](https://github.com/midagedev/bloomery/issues/2)): the sm_86 PTX compiles for the card at the first start. Ada not yet run. [Reports welcome](docs/evaluating.md#help-wanted-hardware-we-have-not-run) |
-| NVIDIA DGX Spark (GB10, aarch64) | Builds and runs from source (a contributor's port, [`docs/contrib/dgx-spark.md`](docs/contrib/dgx-spark.md)): the plan treats the unified memory as one pool, `BLOOMERY_ARCH` sets sm_121, and the quant types without an aarch64 kernel run through a scalar mirror. The release binaries are x86-64 only |
+| NVIDIA DGX Spark (GB10, aarch64) | Builds and runs from source (a contributor's port, [`docs/contrib/dgx-spark.md`](docs/contrib/dgx-spark.md)): the plan treats the unified memory as one pool, `BLOOMERY_ARCH` sets sm_121, and the quant types without an aarch64 kernel run through a scalar mirror. Two Sparks over RDMA serve one model, a node owning routed experts ([#358](https://github.com/midagedev/bloomery/pull/358), [#420](https://github.com/midagedev/bloomery/pull/420)). The release binaries are x86-64 only |
 | Host CPU | x86-64 with AVX2 (x86-64-v3), AMD or Intel. Every number here comes from an 8-channel host; a 2-channel desktop host is not measured here and runs the CPU experts slower |
 | macOS, Apple silicon · AMD GPUs, Windows without WSL2 | Not supported yet · Not supported |
 | OpenAI and Anthropic APIs, streaming, tool calls | Every generative model |
@@ -137,7 +137,8 @@ paged from NVMe.
 
 **0.3.1's release check: one request at the serving defaults** (every lever unset, no `--parallel`,
 `--ctx-size 16384`), greedy, thinking off, RTX A6000 (+ RTX 3090 for `bp`), one load per row, the release
-candidate's `bloomery-serve`. Prompt sizes are the server's prompt tokens. The `a` row of Qwen3.8 is 0.3.0's check.
+candidate's `bloomery-serve`. Prompt sizes are the server's prompt tokens. The `a` row of Qwen3.8 is 0.3.0's check;
+the Bolt row is 0.3.4's.
 
 | Model, place | Long prompt: tokens, prefill tok/s, first token | Decode after it | Short prompt decode |
 |---|---|---|---|
@@ -147,6 +148,7 @@ candidate's `bloomery-serve`. Prompt sizes are the server's prompt tokens. The `
 | GLM-5.3-Flash `UD-IQ4_XS`, unset (picks `bp`) | 5,548, 172, 32.3 s | 35.1 tok/s | 35.0 tok/s |
 | DeepSeek-V4.1-Flash `Q3_K_M`, unset (picks `a`) | 5,642, 403, 14.0 s | 41.9 tok/s | 42.7 tok/s |
 | MiMo-V2.6-Flash `MXFP4`, unset (picks `a`) | 5,620, 104, 53.9 s | 34.8 tok/s | 36.1 tok/s |
+| Nemotron 3.5 Bolt 74B-A9B `24GB`, unset (picks `a`) (0.3.4) | 5,680, 2,716, 2.10 s | 87.5 tok/s | 88.7 tok/s |
 
 **Two requests at once** (`--parallel 2`, both busy) after a 512-token prompt, decode tok/s of both together, and
 one request's decode at depth 4096. Measured on 0.3.0 (2026-10-12), on a 32-core AVX2 host with 8 DDR4 channels and
@@ -163,6 +165,7 @@ one request's decode at depth 4096. Measured on 0.3.0 (2026-10-12), on a 32-core
 | Qwen3.8-Flash-Next `UD-Q4_K_XL` | card + CPU | 64.3 ¹ | 51.5 ¹ | 502 / 664 ¹ |
 | GLM-5.3-Flash `UD-Q4_K_XL` | card + CPU | 25.3 ² | 19.5 | 176 / 205 |
 | DeepSeek-V4.1-Flash `Q3_K_M` | card + CPU | 33.5 | 26.9 | 195 / 376 |
+| Nemotron 3.5 Bolt 74B-A9B `24GB` (0.3.4) | the whole model on the card | — ⁷ | 86.9 | 1,773 / 2,047 |
 
 **RTX A6000 48 GB + RTX 3090 24 GB (`--place bp`)**
 
@@ -174,6 +177,8 @@ one request's decode at depth 4096. Measured on 0.3.0 (2026-10-12), on a 32-core
 
 ¹ with `BLOOMERY_RESIDENCY=mid-p32-s1` · ² 29.1 with `BLOOMERY_RESIDENCY=mid-p0-s1` · ³ 0.3.0's measurement: two requests ran in
 turn on an expert-tier load. 0.3.1 runs them in one pass; not re-measured here.
+⁷ the nemotron seat serves one slot. Bolt's rows are 0.3.4's sittings (n=4, prompt at e92fa8bde, decode at 44495f0ba);
+on one RTX A6000 the same sittings read 87.4 tok/s at depth 4096 and 2,143 / 2,772 prompt tok/s.
 
 **One RTX 3060 12 GB** — one request at the serving defaults (`--ctx-size 16384`, every lever unset), 0.3.0's
 release tarball, an i7-12700F desktop with 32 GB of RAM under WSL2, greedy, thinking off.
@@ -226,7 +231,7 @@ and every gate is shown to fail on its defect before the fix lands ([how](docs/p
 Issues and pull requests are welcome, in Korean or English: [`CONTRIBUTING.md`](CONTRIBUTING.md)
 ([한국어](CONTRIBUTING.ko.md)). Two tracks we hope for are a new model architecture
 ([`docs/contrib/new-model.md`](docs/contrib/new-model.md)) and the NVIDIA DGX Spark, which runs since 0.3.0 and
-next scales across nodes ([`docs/contrib/dgx-spark.md`](docs/contrib/dgx-spark.md)). Starter work carries the
+serves one model across several Sparks since 0.3.4 ([`docs/contrib/dgx-spark.md`](docs/contrib/dgx-spark.md)). Starter work carries the
 [good first issue](https://github.com/midagedev/bloomery/labels/good%20first%20issue) label; questions go to
 [Discussions](https://github.com/midagedev/bloomery/discussions). Review looks first at code shape: one owner for
 shared logic, no second copy, no silent failure.
