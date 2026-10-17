@@ -51,7 +51,7 @@ set -uo pipefail
 # run green — its assertions keep the boundary.
 self_test() {
   local d fails=0 branch=0 commit sum out=
-  d=$(mktemp -d "${TMPDIR:-/tmp}/nightly-selftest.XXXXXX")
+  d=$(mktemp -d "${TMPDIR:-/tmp}/nightly-selftest.XXXXXX") || { echo "nightly: self-test: cannot create scratch directory" >&2; return 1; }
   mkdir -p "$d/home" "$d/state"
   git init -q "$d/home/repo"
   git -C "$d/home/repo" -c user.name=nightly -c user.email=nightly@local commit -q --no-gpg-sign --allow-empty -m tree
