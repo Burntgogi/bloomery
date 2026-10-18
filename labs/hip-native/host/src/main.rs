@@ -1,3 +1,6 @@
+mod forward;
+mod forward_core_probe;
+mod forward_mixer_probe;
 mod selected;
 
 use std::ffi::{CStr, CString, c_char, c_void};
@@ -18,6 +21,8 @@ unsafe extern "C" {
     fn hipStreamDestroy(stream: *mut c_void) -> i32;
     fn hipMalloc(buffer: *mut *mut c_void, bytes: usize) -> i32;
     fn hipFree(buffer: *mut c_void) -> i32;
+    fn hipMemGetInfo(free: *mut usize, total: *mut usize) -> i32;
+    fn hipMemsetAsync(dst: *mut c_void, value: i32, bytes: usize, stream: *mut c_void) -> i32;
     fn hipMemcpyAsync(
         dst: *mut c_void,
         src: *const c_void,
@@ -49,10 +54,32 @@ fn checked(code: i32, op: &str) -> Result<(), String> {
     Err(format!("{op}: {code}: {text}"))
 }
 
+/// HIP copies each argument's declared width from aligned, live host storage.
+#[repr(align(8))]
+struct Arg([u8; 8]);
+
+impl Arg {
+    fn ptr(value: *const c_void) -> Self {
+        Self((value as usize).to_ne_bytes())
+    }
+
+    fn u32(value: u32) -> Self {
+        let mut bytes = [0; 8];
+        bytes[..4].copy_from_slice(&value.to_ne_bytes());
+        Self(bytes)
+    }
+
+    fn f32(value: f32) -> Self {
+        Self::u32(value.to_bits())
+    }
+}
+
 struct Context {
     module: *mut c_void,
     stream: *mut c_void,
     buffers: Vec<*mut c_void>,
+    allocated_bytes: usize,
+    allocation_limit: usize,
 }
 
 impl Context {
@@ -62,6 +89,8 @@ impl Context {
             module: std::ptr::null_mut(),
             stream: std::ptr::null_mut(),
             buffers: Vec::new(),
+            allocated_bytes: 0,
+            allocation_limit: usize::MAX,
         };
         // SAFETY: output pointer storage and the C string remain live; Drop frees partial initialization.
         unsafe {
@@ -76,12 +105,23 @@ impl Context {
         if bytes == 0 {
             return Err("zero allocation refused".into());
         }
+        let allocated = self
+            .allocated_bytes
+            .checked_add(bytes)
+            .ok_or("allocation byte count overflow")?;
+        if allocated > self.allocation_limit {
+            return Err(format!(
+                "managed allocation budget exceeded: {allocated} > {}",
+                self.allocation_limit
+            ));
+        }
         let mut p = std::ptr::null_mut();
         // SAFETY: p receives the allocation and this owner frees it exactly once.
         unsafe {
             checked(hipMalloc(&mut p, bytes), "hipMalloc")?;
         }
         self.buffers.push(p);
+        self.allocated_bytes = allocated;
         Ok(p)
     }
     fn function(&self, name: &str) -> Result<*mut c_void, String> {
@@ -147,6 +187,58 @@ impl Context {
             )?;
         }
         self.sync()
+    }
+
+    fn call<const N: usize>(
+        &self,
+        function: *mut c_void,
+        workitems: usize,
+        mut args: [Arg; N],
+    ) -> Result<(), String> {
+        let mut pointers = [std::ptr::null_mut(); N];
+        for (pointer, arg) in pointers.iter_mut().zip(&mut args) {
+            *pointer = arg.0.as_mut_ptr().cast();
+        }
+        self.launch(function, workitems, &mut pointers)
+    }
+
+    fn upload<T: Copy>(&mut self, values: &[T]) -> Result<*mut c_void, String> {
+        let bytes = std::mem::size_of_val(values);
+        let pointer = self.alloc(bytes)?;
+        // SAFETY: the allocation and slice cover bytes; copy synchronizes before the slice is released.
+        unsafe { self.copy(pointer, values.as_ptr().cast(), bytes, 1)? };
+        Ok(pointer)
+    }
+
+    fn download<T: Copy>(&self, pointer: *const c_void, out: &mut [T]) -> Result<(), String> {
+        // SAFETY: callers own the device allocation covering out's exact byte length.
+        unsafe {
+            self.copy(
+                out.as_mut_ptr().cast(),
+                pointer,
+                std::mem::size_of_val(out),
+                2,
+            )
+        }
+    }
+
+    fn fill(&self, pointer: *mut c_void, byte: i32, bytes: usize) -> Result<(), String> {
+        // SAFETY: callers own the allocation covering bytes; this stream is live and synchronized.
+        unsafe {
+            checked(
+                hipMemsetAsync(pointer, byte, bytes, self.stream),
+                "hipMemsetAsync",
+            )?
+        };
+        self.sync()
+    }
+
+    fn memory(&self) -> Result<(usize, usize), String> {
+        let mut free = 0;
+        let mut total = 0;
+        // SAFETY: HIP has been initialized and the output storage is live.
+        unsafe { checked(hipMemGetInfo(&mut free, &mut total), "hipMemGetInfo")? };
+        Ok((free, total))
     }
 }
 
@@ -301,6 +393,9 @@ fn case(s: &mut Context, weights: &[u8], k: usize, rows: usize, cols: usize) -> 
 
 fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|mode| mode.starts_with("--")) {
+        return forward::run(&args);
+    }
     let path = args
         .first()
         .ok_or("usage: bloomery-hip-spike DEVICE_ELF [Q4_K_FILE K ROWS]")?;

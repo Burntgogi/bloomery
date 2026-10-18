@@ -8,3 +8,5 @@ license = "MIT"
 [dependencies]
 bloomery-gguf = { path = "../../../crates/gguf" }
 bloomery-qdot = { path = "../../../crates/qdot" }
+bloomery-model = { path = "../../../crates/model" }
+serde_json = "1"

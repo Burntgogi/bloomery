@@ -1,6 +1,6 @@
 # Native Rust HIP feasibility lab
 
-This isolated lab compiles Rust kernels for `amdgcn-amd-amdhsa`, loads their ELF through HIP, and checks the scalar probes against Bloomery's GGUF dequantizer with FP64 accumulation and the selected Q4_K port against the existing card-rule scalar oracle. It calls no libllama, ggml model forward, or llama-server process. Both host and device code are Rust. The nested workspace is excluded from the default CUDA workspace.
+This isolated lab compiles Rust kernels for `amdgcn-amd-amdhsa`, loads their ELF through HIP, and runs operator probes and an eager raw-token dense Qwen3.5 hybrid forward. It calls no libllama, ggml model forward, or llama-server process. Both host and device code are Rust. The nested workspace is excluded from the default CUDA workspace.
 
 The validation target is one RX 7900 GRE (`gfx1100`), Rust nightly 2026-08-28, its LLVM backend and the local HIP runtime. Rust's AMDGPU target is tier 3: this is a feasibility result, not a supported release backend. The original CUDA model chains, seats, kernels, scheduling and MTP remain unchanged.
 
@@ -10,7 +10,8 @@ The validation target is one RX 7900 GRE (`gfx1100`), Rust nightly 2026-08-28, i
 - A scalar Q4_K × F32 matrix kernel on synthetic shapes and real `blk.1.ssm_out.weight` rows from Qwen3.8-27B IQ3_S. Matrix rows use GGUF Q4_K's 144 bytes per 256 weights. Scales and fused dequantization follow `crates/gguf/src/quant.rs`.
 - A 256-wide synthetic dense FFN unit: RMSNorm, separate gate/up projections, SwiGLU, down projection and residual. Its intermediate values stay on the GPU. It does not include attention, GDN state, routed experts or a complete transformer block.
 - The original selected Q4_K down row walk with Q8 activation planes, 256-thread blocks and logical warp32 reduction. Host-side `qdot::card_q8_1_scalar` prepares the inputs; device quantization is a later step.
-- Three repeated launches use already allocated buffers. The reported zero count covers allocations explicitly issued by this host, not internal allocations by the driver.
+- A single-lane dense Qwen3.5 chain: on-device packed embedding/projections/head, GDN conv and recurrence, gated GQA with partial Neox RoPE and F16 KV, dense SwiGLU FFNs, residuals and finite argmax. The common `model::arch::spec` reader supplies layer kinds, dimensions and tensor roles. This numerical harness is not a second serving engine.
+- Operator repeats use already allocated buffers. The reported zero count covers allocations explicitly issued by the selected-probe host, not internal driver allocations or diagnostic file output.
 
 The scalar probes retain fixed NMSE <= 1e-6 and finite outputs. The selected Q4_K port requires bitwise equality with the existing `qdot::card_q4k_dot_row_scalar` oracle for finite activations, NaN propagation for refused activation scales, and exact fault words, masks and skipped-slot sentinels. This is host-oracle/HIP equality, not a measured CUDA/HIP or model-token comparison. No throughput is claimed.
 
@@ -37,10 +38,10 @@ host and device clippy with warnings denied, builds both release binaries, and r
 numerical cases under a 900-second bound per command. It compiles the standalone Rust
 AMDGPU device with `cargo -Zbuild-std=core`, never the existing CUDA device crates.
 
-`result.json` records the clean HEAD commit, whole-repository and lab Git tree hashes,
+`result.json` schema 3 records the clean HEAD commit, whole-repository and lab Git tree hashes,
 release binary SHA-256 hashes, Rust/LLVM version, target CPU, actual device name, HIP runtime
-and driver versions, fixture hash when present, command logs and each case. A failed check
-returns nonzero and writes a failed result. Attach the JSON from the PR's exact head; a new
+and driver versions, fixture hash when present, command logs, operator cases and bounded hybrid evidence.
+A failed check returns nonzero and writes a failed result. Attach the JSON from the PR's exact head; a new
 push requires a new run. Logs and generated artifacts stay out of the source tree.
 
 The default run has three synthetic matrix shapes, one dense FFN case and eleven selected
@@ -50,11 +51,87 @@ through the existing GGUF reader (`gguf::Split`/`TensorInfo`), with no conversio
 weight bits. Record the original file SHA-256, tensor name and row range alongside the
 result; do not upload model weights in the PR. Case results establish numerical operator
 checks only, with no timing claim.
+The verifier then runs `--forward-probe` in a separate process. Its `forward` result independently
+checks both repeats' complete logit files, their digests, finiteness and argmax, rather than trusting
+the writer's success flags. `same_file_real_model_llama_HIP` remains false: passing the bounded
+synthetic hybrid does not close the pinned real-model milestone.
 
 Scalar kernels use 64-thread workgroups. The selected port uses 256 threads (eight logical
 32-lane rows), and a one-thread probe checks the compiled wave size before any selected launch.
 Kernel signatures and argument storage must remain identical. Context/module/stream/buffer handles stay on their
 owning thread, and synchronization precedes destruction.
+
+## Eager dense Qwen3.5 forward
+
+`--inspect` opens GGUF metadata through the common reader without initializing HIP or loading
+weights on a GPU. Admission checks exact tensor axes and formats; unsupported mixers, routed FFNs,
+extra sites, non-plain residuals, scaled/windowed attention and contexts outside 1–64 are refused.
+Supported matrix storage is F32, Q4_K, Q6_K and Q8_0; gains, conv weights and GDN parameters are F32.
+An absent `output.weight` aliases the embedding allocation, not a second copy.
+
+All token-dependent numerical work runs on the device. RoPE constants, weight names, function
+handles, dimensions and arena addresses are resolved at load. GDN uses head128, conv4, the original
+11-row input ring, tiled key heads and value-major recurrent state. GQA reads interleaved per-head
+Q/gates, applies Q/K norms and partial Neox rotation, appends round-to-nearest-even F16 KV, and attends
+only live causal rows. Compiled wave32 is checked before the eight-lane delta reduction.
+
+The eager GEMV lane dequantizes original GGUF bytes on the GPU and reads **F32 activations**. It is
+not the selected kernel's Q8 activation arithmetic, and its scalar softmax is not CUDA flash's
+segmented reduction. Preserve this distinction when interpreting logit differences. No throughput,
+CUDA/HIP bit parity, production-backend support, or serving admission is claimed.
+
+The model preallocates weights and one compact lab arena; `step` resolves no names and allocates no
+buffers. Fit admission retains the production owner's `FIT_RESERVE`, extracted by `host/build.rs`
+without linking CUDA. The reported managed-byte estimate excludes driver and kernel scratch.
+The bounded probe additionally caps explicit managed allocations at 16 MiB. Neither estimate is a
+measurement of peak VRAM residency or permission to interrupt another GPU service.
+
+A failed launch or device fault poisons the model before accepting its token. Further steps and
+logit reads are refused until `reset`, which clears recurrent state, conv rings, KV and the sticky
+fault. Invalid token IDs and exhausted context are refused before mutation. The probe exercises
+these transitions by inducing a real nonfinite gain, restoring it, and checking bitwise recovery.
+Independent operator oracles retain NMSE <= 1e-6; GDN crosses ring wrap and GQA covers all 64 positions.
+
+For development builds from this directory, with the same runtime setup as above:
+
+```sh
+unset CARGO_ENCODED_RUSTFLAGS CARGO_BUILD_TARGET
+HOST=x86_64-unknown-linux-gnu
+RUSTFLAGS='-C target-cpu=native' \
+  cargo build --release --target "$HOST" -p bloomery-hip-spike
+RUSTFLAGS='-C target-cpu=gfx1100 -C panic=abort' \
+  cargo build -Zbuild-std=core --release --target amdgcn-amd-amdhsa \
+  -p bloomery-hip-spike-device
+BIN="target/$HOST/release/bloomery-hip-spike"
+DEVICE=target/amdgcn-amd-amdhsa/release/bloomery_hip_spike_device.elf
+"$BIN" --inspect /path/to/Qwen3.5-0.8B-Q4_K_M.gguf 64
+"$BIN" --forward-probe "$DEVICE" /tmp/hip-bounded-forward
+# Only in an authorized GPU-memory window; output directories must be new.
+"$BIN" --forward "$DEVICE" /path/to/Qwen3.5-0.8B-Q4_K_M.gguf \
+  /path/to/prompt.ids /tmp/hip-real-forward 8 64
+```
+
+`prompt.ids` holds one unsigned token ID per line: no tokenizer, BOS insertion or chat template
+runs here. Zero greedy steps feeds only the supplied IDs. For positive steps the first generated
+ID is the last prompt row's argmax, and the final generated ID is not fed back; consumed positions
+are `prompt.len() + max(steps - 1, 0)`.
+
+`forward.json` records model file hashes, the resolved allocation estimate, input/predicted/greedy
+IDs and both repeats' logit digests. `run-{0,1}/logits-NNNN.f32` is a full little-endian F32 vocabulary
+row after each consumed token, including prompt rows. A reference whose row zero follows the whole
+prompt aligns with native row `prompt.len() - 1`. Diagnostic host transfers and file/hash work are
+outside `Model::step`; they are not a performance path.
+
+The fixed acceptance file remains `notschmee/Qwen3.5-0.8B-GGUF` revision
+`1870603ac8ab59c7ddb9d94cccf3b297e379538f`, `Qwen3.5-0.8B-Q4_K_M.gguf`,
+590,880,672 bytes, SHA-256
+`be5b3cb8c2f3ebd791349c9c775ea38950f23a2b9e792ca2f0411597dd172988`.
+Header admission is not a real-model GPU execution. Completion still requires an authorized memory
+window, refreshed llama.cpp HIP source/build attribution and observed HIP placement, identical raw
+English/Korean IDs, context64/ubatch1/F16 KV, eight equal greedy tokens and two identical reset runs.
+Report full-logit error diagnostically; do not invent a whole-model accuracy band or substitute CPU
+reference/synthetic-model success. Keep chat/tool admission separate. Only then discuss the common
+backend boundary with the maintainers.
 
 ## Original selected Q4_K port
 
@@ -95,12 +172,11 @@ columns, exact fault masks and NaN propagation. It does not exercise graph captu
 The real fixture's rows are viewed as four experts solely to test the selected operator;
 this does not make the source tensor or model routed.
 
-The host quantizer owns the non-finite refusal in this experiment. The down kernel
-propagates its NaN scale without claiming a GPU quantizer's QuantColumn fault. GPU
-quantization, gate/up, attention/GDN, graph replay and a full model forward are later work.
-The lab is not connected to `Gpu`, `GpuModel`, an app session or `bloomery-serve`. Gate one
-complete model forward against llama.cpp HIP on identical model bits before designing a
-common backend boundary with the maintainers.
+The selected experiment's host quantizer owns its non-finite refusal. The down kernel propagates
+its NaN scale without claiming a GPU quantizer's QuantColumn fault. On-device Q8 activation
+quantization and graph replay remain unimplemented; the eager forward above deliberately uses
+F32 activations instead. Neither lane is connected to `Gpu`, `GpuModel`, an app session or
+`bloomery-serve`; identical-file real-model llama.cpp HIP acceptance remains outstanding.
 
 The verifier rejects an inherited `CARGO_BUILD_TARGET` and explicitly selects the
 `rustc -vV` host triple for host tests, lint and build. Its executable comes from

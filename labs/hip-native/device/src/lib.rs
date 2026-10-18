@@ -5,6 +5,9 @@
 
 use core::panic::PanicInfo;
 
+mod forward_core;
+mod forward_math;
+mod forward_mixer;
 mod selected;
 
 #[panic_handler]
