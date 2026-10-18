@@ -1368,15 +1368,16 @@ def case_flush_cap(fx):
 
 
 class SigTrap(RecTrap):
-    """A RecTrap that delivers one signal during its first wait, as a signal during the sleep between two polls."""
+    """A RecTrap that delivers one signal during its `at`-th wait: the first is the sleep between two polls, and the second
+    of a running job that is then seen done is the flush that reads what the job wrote last."""
 
-    def __init__(self, sig):
+    def __init__(self, sig, at=1):
         super().__init__()
-        self.sig = sig
+        self.sig, self.at = sig, at
 
     def wait(self, secs):
         super().wait(secs)
-        if len(self.waits) == 1:
+        if len(self.waits) == self.at:
             self.sigs.append(self.sig)
 
     rc = Trap.rc
@@ -1391,6 +1392,21 @@ def case_signal_then_done(fx):
             check(rc == want and fake.cancels() == [] and fx.rc_file() is None,
                   f"{sig.name} after a {before['status']} poll wins over a done reply: {want}, no cancel, no mirror: "
                   f"{rc} {fake.cancels()} {fx.rc_file()!r}")
+            fx.gone(fx.tail_pids)
+            fx.fake.polls = 0
+
+
+def case_signal_in_flush(fx):
+    """A signal during the flush after a terminal status is the signal's exit, and no rc file is written: the job's own rc
+    (0 here) is no verdict of an attachment interrupted before it read the job's last output."""
+    for leave in (False, True):
+        for sig, want in ((signal.SIGINT, 130), (signal.SIGTERM, 143)):
+            fake = fx.serve([{"status": "running"}, {"status": "done", "rc": 0}])
+            trap = SigTrap(sig, at=2)
+            rc = attach_job(Queue(fx.env()), "j1", fx.rc_dir, trap, leave)
+            check(trap.sigs == [sig] and rc == want and fake.cancels() == [] and fx.rc_file() is None,
+                  f"{sig.name} during the flush of a done job (leave={leave}) is {want}, no cancel, no mirror: "
+                  f"delivered={trap.sigs} waits={trap.waits} rc={rc} {fake.cancels()} {fx.rc_file()!r}")
             fx.gone(fx.tail_pids)
             fx.fake.polls = 0
 
@@ -1936,7 +1952,7 @@ def case_attach_leave(fx):
 CASES = [case_list, case_attach_leave, case_submit_body, case_submit_no_prediction, case_run_done, case_lost, case_health_down, case_reconnect,
          case_refusal,
          case_passthrough, case_queued_line, case_int_cancel, case_attach_env, case_mirror, case_config, case_cancel_cmd,
-         case_tails_stop, case_flush_cap, case_signal_then_done, case_drain_closed_reader, case_drain_full_pipe,
+         case_tails_stop, case_flush_cap, case_signal_then_done, case_signal_in_flush, case_drain_closed_reader, case_drain_full_pipe,
          case_pending_replay, case_stalled_tail, case_replay_ssh, case_replay_signal, case_reconnect_wall, case_reconnect_step,
          case_cancel_deadline, case_queued_age, case_cancelled_elsewhere, case_load_ready]
 
