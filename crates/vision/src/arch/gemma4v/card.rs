@@ -52,9 +52,9 @@ impl ScratchLens {
     #[must_use]
     pub fn bytes(&self) -> u64 {
         // F32 patches, patch output, residuals and post norms; BF16 linears, attention,
-        // pooling gather, gate/up/activation, output rows; f32 position angles.
+        // gate/up/activation, pooled rows, output rows; f32 position angles.
         4 * (self.raw as u64 + 4 * self.hidden as u64)
-            + 2 * (4 * self.hidden as u64
+            + 2 * (3 * self.hidden as u64
                 + self.qkv as u64
                 + 5 * self.ff as u64
                 + 3 * self.pooled as u64

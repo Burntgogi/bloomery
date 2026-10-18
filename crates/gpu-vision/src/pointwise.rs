@@ -138,15 +138,20 @@ mod kernels {
         }
     }
 
-    /// Gather three-by-three raster cells and narrow each value for the shared group mean.
+    /// Mean each three-by-three raster group of F32 rows into one BF16 row, the groups in the order
+    /// the merged tokens lie: `out[g·width + d] = bf16((((c0 + c1) + c2) + .. + c8) · scale)` over the
+    /// group's cells `c0 .. c8` in raster order. Each cell narrows to BF16 first and widens exactly,
+    /// every add rounds on its own and the one multiply by the f32 `1/9` rounds once, as
+    /// `vis_mean_groups` does. This order is the gate. One thread per output value.
     #[kernel]
     #[launch_bounds(256)]
-    #[launch_contract(domain = 1, block = (256, 1, 1), requires = (x.len() >= n, out.len() >= n))]
+    #[launch_contract(domain = 1, block = (256, 1, 1), requires = (x.len() >= 9 * n, out.len() >= n))]
     pub(crate) fn vis_pool_order_f32(
         x: &[f32],
         n: u32,
         width: u32,
         grid_w: u32,
+        scale: f32,
         mut out: DisjointSlice<u16>,
     ) {
         let i = thread::index_1d().get();
@@ -154,19 +159,26 @@ mod kernels {
             return;
         }
         let w = width as usize;
-        let row = i / w;
-        let group = row / 9;
-        let cell = row % 9;
+        let group = i / w;
         let cols = grid_w as usize / 3;
-        let src = ((group / cols * 3 + cell / 3) * grid_w as usize + group % cols * 3 + cell % 3)
-            * w
-            + i % w;
-        // SAFETY: complete three-by-three groups permute n lanes, so src < n <= x.len().
-        let value = unsafe { *x.get_unchecked(src) };
-        let value = f32_to_bf16_rne(value);
+        let top = group / cols * 3;
+        let left = group % cols * 3;
+        let mut acc = 0.0f32;
+        let mut cell = 0usize;
+        while cell < 9 {
+            let src = ((top + cell / 3) * grid_w as usize + left + cell % 3) * w + i % w;
+            // SAFETY: complete three-by-three groups permute the 9 n lanes, so src < 9 n <= x.len().
+            let value = bf16_to_f32(f32_to_bf16_rne(unsafe { *x.get_unchecked(src) }));
+            acc = if cell == 0 {
+                value
+            } else {
+                add_rn_f32(acc, value)
+            };
+            cell += 1;
+        }
         // SAFETY: i < n <= out.len(); thread i owns this output.
         unsafe {
-            *out.get_unchecked_mut(i) = value;
+            *out.get_unchecked_mut(i) = f32_to_bf16_rne(mul_rn_f32(acc, scale));
         }
     }
 
@@ -233,6 +245,10 @@ pub(crate) struct PositionArgs<'a> {
     pub out: &'a mut DeviceBuffer<f32>,
 }
 
+/// The cells of a pooling group: three raster rows of three.
+const POOL_CELLS: usize = 9;
+
+/// The F32 rows to pool and the BF16 rows of the group means.
 pub(crate) struct FloatPoolArgs<'a> {
     pub x: &'a DeviceBuffer<f32>,
     pub rows: usize,
@@ -307,6 +323,8 @@ impl Kernels {
         Ok(())
     }
 
+    /// Enqueue the means of the three-by-three raster groups of `x`'s `rows` rows into the first
+    /// `rows / 9` rows of `out`, narrowed to BF16.
     pub(crate) fn pool_f32(
         &self,
         stream: &CudaStream,
@@ -319,26 +337,29 @@ impl Kernels {
             grid_w,
             out,
         } = a;
-        let what = "vision F32 pooling gather";
+        let what = "vision F32 pooling mean";
         let group_rows = grid_w
             .checked_mul(3)
             .ok_or_else(|| GpuError::shape(what, "pool grid overflows"))?;
-        let n = rows
+        let values = rows
             .checked_mul(width)
             .ok_or_else(|| GpuError::shape(what, "element count overflows"))?;
-        if n == 0
+        if values == 0
             || grid_w == 0
             || !grid_w.is_multiple_of(3)
             || !rows.is_multiple_of(group_rows)
-            || x.len() < n
-            || out.len() < n
+            || x.len() < values
+            || out.len() < values / POOL_CELLS
         {
             return Err(GpuError::shape(
                 what,
                 "pooling buffers must hold complete three-by-three groups",
             ));
         }
+        let n = values / POOL_CELLS;
         let u = |name, value| launch_u32(what, name, value);
+        // The launch contract multiplies in u32: the input's value count bounds every product.
+        u("input values", values)?;
         let prep = self.module.prepare_vis_pool_order_f32(LaunchConfig1D::new(
             u("grid", n.div_ceil(256))?,
             256,
@@ -351,6 +372,7 @@ impl Kernels {
             u("n", n)?,
             u("width", width)?,
             u("grid width", grid_w)?,
+            1.0f32 / POOL_CELLS as f32,
             out,
         )?;
         Ok(())
@@ -478,5 +500,93 @@ impl Kernels {
             a.out,
         )?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{f32_bf16, mean_groups::mean_groups_ref};
+    use bloomery_gpu::Gpu;
+
+    /// A xorshift stream of f32 with a wide exponent spread, signs, zeros and subnormals.
+    fn values(n: usize, mut s: u64) -> Vec<f32> {
+        (0..n)
+            .map(|i| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                let m = ((s >> 11) as f64 / (1u64 << 53) as f64) as f32 * 2.0 - 1.0;
+                match i % 97 {
+                    0 => 0.0,
+                    1 => -0.0,
+                    2 => 1.0e-40,
+                    3 => -1.0e30,
+                    4 => 1.0e30,
+                    _ => m * 2f32.powi((s % 41) as i32 - 20),
+                }
+            })
+            .collect()
+    }
+
+    fn run(
+        gpu: &Gpu,
+        rows: usize,
+        width: usize,
+        grid_w: usize,
+        seed: u64,
+    ) -> Result<bool, GpuError> {
+        let stream = gpu.stream();
+        let x = values(rows * width, seed);
+        let groups = rows / 9;
+        let cols = grid_w / 3;
+        let mut gathered = Vec::with_capacity(rows * width);
+        for g in 0..groups {
+            for cell in 0..9 {
+                let row = ((g / cols * 3 + cell / 3) * grid_w) + g % cols * 3 + cell % 3;
+                gathered.extend(
+                    x[row * width..(row + 1) * width]
+                        .iter()
+                        .map(|&v| f32_bf16(v)),
+                );
+            }
+        }
+        let expected = mean_groups_ref(&gathered, width, 9);
+        let dx = DeviceBuffer::from_host(stream, &x)?;
+        let mut out = DeviceBuffer::<u16>::zeroed(stream, groups * width + 5)?;
+        let ctx = gpu.context();
+        let k = Kernels::load(ctx)?;
+        k.pool_f32(
+            stream,
+            FloatPoolArgs {
+                x: &dx,
+                rows,
+                width,
+                grid_w,
+                out: &mut out,
+            },
+        )?;
+        let got = out.to_host_vec(stream)?;
+        let same = got[..groups * width] == expected[..];
+        let tail = got[groups * width..].iter().all(|&v| v == 0);
+        Ok(same && tail)
+    }
+
+    /// The fused pooling mean writes, bit for bit, what the gather narrowed to BF16 and then
+    /// `vis_mean_groups` (its host rule `mean_groups_ref`) wrote, and nothing past the groups.
+    #[test]
+    #[ignore = "needs a CUDA card"]
+    fn hw_pool_f32_mean_equals_the_gather_then_group_mean() {
+        let gpu = Gpu::new().unwrap();
+        for (rows, width, grid_w, seed) in [
+            (72, 96, 12, 0x9e37_79b9_7f4a_7c15),
+            (2520, 768, 60, 0x1234_5678_9abc_def1),
+            (9, 33, 3, 0xdead_beef_cafe_f00d),
+        ] {
+            assert!(
+                run(&gpu, rows, width, grid_w, seed).unwrap(),
+                "rows {rows} width {width} grid_w {grid_w}"
+            );
+        }
     }
 }

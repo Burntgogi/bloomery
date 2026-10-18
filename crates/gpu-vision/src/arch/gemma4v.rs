@@ -12,7 +12,6 @@ use crate::{
     attn::{AttnArgs, AttnKernels, QkvLayout},
     chain::{Encoded, NoTaps, TapSink, read_bf16, read_f32, tap, tap_f32},
     gemm_bf16::{Epilogue, FloatGemmArgs, GemmArgs, GemmKernels},
-    mean_groups::MeanGroupsKernels,
     norm::{FloatNormArgs, HeadNormArgs, NormKernels},
     pointwise::{self, Op},
     rope2d::{RopeArgs, RopeKernels, RopeTable},
@@ -59,7 +58,6 @@ pub struct Encoder {
     ops: pointwise::Kernels,
     rope: RopeKernels,
     attn: AttnKernels,
-    mean: MeanGroupsKernels,
     s: Scratch,
     weight_bytes: u64,
     scratch_bytes: u64,
@@ -76,7 +74,6 @@ struct Scratch {
     h32: DeviceBuffer<f32>,
     work: DeviceBuffer<u16>,
     att: DeviceBuffer<u16>,
-    gathered: DeviceBuffer<u16>,
     qkv: DeviceBuffer<u16>,
     gate: DeviceBuffer<u16>,
     up: DeviceBuffer<u16>,
@@ -103,7 +100,6 @@ impl Scratch {
             h32: DeviceBuffer::zeroed(stream, l.hidden)?,
             work: b(l.hidden)?,
             att: b(l.hidden)?,
-            gathered: b(l.hidden)?,
             qkv: b(l.qkv)?,
             gate: b(l.ff)?,
             up: b(l.ff)?,
@@ -129,7 +125,6 @@ impl Scratch {
                 &self.h,
                 &self.work,
                 &self.att,
-                &self.gathered,
                 &self.qkv,
                 &self.gate,
                 &self.up,
@@ -301,7 +296,7 @@ impl Encoder {
                     }
             })
             .sum::<usize>();
-        let launches = 7 + 22 * hp.n_layer + usize::from(standardize) + clamps;
+        let launches = 6 + 22 * hp.n_layer + usize::from(standardize) + clamps;
         Ok(Self {
             hp,
             limits,
@@ -318,7 +313,6 @@ impl Encoder {
             ops: pointwise::Kernels::load(ctx)?,
             rope: RopeKernels::load(ctx)?,
             attn: AttnKernels::load(ctx)?,
-            mean: MeanGroupsKernels::load(ctx)?,
         })
     }
 
@@ -389,7 +383,6 @@ impl Encoder {
             norm: &self.norm,
             rope: &self.rope,
             attn: &self.attn,
-            mean: &self.mean,
             standardize: self.standardize,
             gemm: &self.gemm,
             ops: &self.ops,
@@ -423,7 +416,6 @@ struct Chain<'a> {
     norm: &'a NormKernels,
     rope: &'a RopeKernels,
     attn: &'a AttnKernels,
-    mean: &'a MeanGroupsKernels,
     standardize: bool,
     gemm: &'a GemmKernels,
     ops: &'a pointwise::Kernels,
@@ -621,11 +613,9 @@ impl Chain<'_> {
                 rows: n,
                 width: d,
                 grid_w,
-                out: &mut s.gathered,
+                out: &mut s.pooled,
             },
         )?;
-        self.mean
-            .enqueue(stream, n, 9, d, &s.gathered, &mut s.pooled)?;
 
         self.ops.enqueue(
             stream,
@@ -866,5 +856,36 @@ impl crate::Tower for Encoder {
     }
     fn scratch_bytes(&self) -> u64 {
         self.scratch_bytes
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bloomery_gpu::Gpu;
+
+    /// The buffers a tower holds are the bytes its card figure reserves: the load refuses any other
+    /// pair, so a buffer added to or dropped from `Scratch` must move `ScratchLens::bytes` with it.
+    #[test]
+    #[ignore = "needs a CUDA card"]
+    fn hw_held_scratch_equals_the_reserve() -> Result<(), GpuError> {
+        let gpu = Gpu::new()?;
+        let hp = Hparams {
+            n_layer: 1,
+            dim: 64,
+            ff: 128,
+            n_head: 2,
+            patch: 4,
+            out_dim: 32,
+            eps: 1.0e-6,
+            pos_rows: 16,
+            gelu_tanh: true,
+        };
+        let lens = ScratchLens::new(&hp, 4).map_err(|e| GpuError::plan(WHAT, e.to_string()))?;
+        let s = Scratch::new(gpu.stream(), lens)?;
+        let gemm = GemmKernels::load(gpu.context(), gpu.stream())?;
+        // The card figure adds the shared GEMM's two stand-ins, six bytes, to `lens.bytes()`.
+        assert_eq!(s.bytes() + gemm.scratch_bytes(), lens.bytes() + 6);
+        Ok(())
     }
 }

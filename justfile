@@ -2603,6 +2603,12 @@ gate-gpu-minicpmv-tower:
 gate-gpu-vision-lib:
     ./tools/box.sh 'bash tools/gate.sh --oxide -p bloomery-gpu-vision --release --lib'
 
+# The image-tower crate's `hw_` tests, which open a card (the lib recipe above runs the rest): the Gemma4 tower's fused 3x3 pooling
+# mean against the gather followed by the group mean, bit for bit, and the tower's held scratch bytes against its card figure. The
+# card is the box's 3090 pin, with no gate lock, as the other device-linked libs' `hw_` tests.
+gate-gpu-vision-hw:
+    ./tools/box.sh 'bash tools/gate.sh --oxide -p bloomery-gpu-vision --release --lib -- --ignored'
+
 # The glm5v image tower on the card (the mmproj of GLM-5.3-Flash: llama.cpp's `glm4v` graph with a per-head q/k norm, a clamped
 # SwiGLU and an erf GELU; 24 blocks of heads of 64, a 2x2 convolution merger) against the glm5next vision seat's tap set B
 # (fx_ref_glm5next_vis_taps, with its CPU twin: mainline mtmd's `vit_out`, `after_fc_proj`, `after_ffn_proj` and `embd` of nine
