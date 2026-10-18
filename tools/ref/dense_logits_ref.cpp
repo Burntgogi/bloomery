@@ -259,8 +259,9 @@ static int run(int argc, char ** argv) {
         // ROCm is the registry name in the pinned public ggml-cuda.h HIP branch.
         for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
             const auto dev = ggml_backend_dev_get(i);
-            if (std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "ROCm") == 0 &&
-                ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            if (std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "ROCm") != 0) continue;
+            const auto type = ggml_backend_dev_type(dev);
+            if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
                 placement.device = dev;
                 break;
             }
