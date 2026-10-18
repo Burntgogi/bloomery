@@ -87,10 +87,6 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = --self-test ]; then
     echo "runner.sh: arm '$1': $2" >&2
     exit 64
   }
-  arm_refuse() {
-    echo "runner.sh: arm '$1': $2" >&2
-    exit 64
-  }
   check stem-target "$(bin_label_stem /root/r/t/target/release/generate_qwen3moe)" bin:t
   check stem-nodir "$(bin_label_stem /root/r/b1ab/b1)" bin:b1ab
   check tree-target "$(bin_tree /root/r/t/target/release/generate_qwen3moe)" /root/r/t

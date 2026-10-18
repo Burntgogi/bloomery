@@ -823,6 +823,93 @@ print(f"check-recipes: arch owner ok ({uses} recipe lines build with --arch {{{{
 PY
 }
 
+# units.sh's tree_commit is the one commit label of contrib-check.sh, nightly/run.sh, gate-batch.sh, ptx-compare.sh and
+# narrow-scan.sh: a `git status` that fails (a corrupt index) is a refusal naming the tree and git's exit code, never a commit
+# published without `+local`. Its labels on temp repositories, and the first two scripts stopping on a corrupt index
+# (contrib-check the real script in this tree, run.sh a clone under a temp NIGHTLY_HOME), no box and no cargo; the other three
+# test their use in their own self-tests (blk_gatebatch, blk_ptxcompare, blk_narrowscan).
+blk_treecommit() { tool_selftest nightly/selftest.sh; }
+
+# A shell function has one owner in its file: a second definition at the same indent with the same body is dead weight
+# that reads as a second owner. The same name with another body is a stub or an override and stays. The fixtures are the
+# FAIL-first: the pair the rule forbids is red on its own copy, the shapes it must leave are green.
+blk_fnowner() {
+  python3 - "$(cd "$(dirname "$0")" && pwd)" << 'PY'
+import pathlib
+import re
+import sys
+
+HEAD = re.compile(r"^([ \t]*)([A-Za-z_][A-Za-z0-9_:.-]*)[ \t]*\(\)[ \t]*\{(.*)$")
+HEREDOC = re.compile(r"(?<!<)<<(?!<)-?[ \t]*['\"]?([A-Za-z_][A-Za-z0-9_]*)['\"]?")
+
+
+def problems(text, where):
+    lines = text.split("\n")
+    seen, out, end = {}, [], None
+    for i, line in enumerate(lines):
+        # A here-document is another file's text (a stub script, a python body), not this file's functions.
+        if end is not None:
+            if line.strip() == end:
+                end = None
+            continue
+        h = HEREDOC.search(line)
+        if h is not None:
+            end = h.group(1)
+        m = HEAD.match(line)
+        if m is None:
+            continue
+        indent, name, rest = m.groups()
+        if rest.strip().endswith("}") and rest.strip() != "":
+            body = rest.strip()[:-1].strip()
+        elif rest.strip() == "":
+            j = i + 1
+            while j < len(lines) and lines[j] != indent + "}":
+                j += 1
+            body = "\n".join(lines[i + 1 : j])
+        else:
+            continue
+        key = (name, indent, body)
+        if key in seen:
+            out.append(f"{where}:{i + 1}: {name} is defined again with the body of line {seen[key]}")
+        else:
+            seen[key] = i + 1
+    return out
+
+
+multi = "f() {\n  echo a\n}\n"
+fixtures = [
+    ("one definition", multi, 0),
+    ("the same body twice at one indent", multi + multi, 1),
+    ("the same body three times", multi * 3, 2),
+    ("one line, the same body twice", "f() { echo a; }\nf() { echo a; }\n", 1),
+    ("the same name with another body", multi + "f() {\n  echo b\n}\n", 0),
+    ("the same body at another indent", multi + "  f() {\n    echo a\n  }\n", 0),
+    ("two names with one body", multi + multi.replace("f()", "g()"), 0),
+    ("the same one-line body in a here-document", "cat << 'EOF'\nf() { echo a; }\nEOF\nf() { echo a; }\n", 0),
+    ("the same body twice inside one here-document", "cat << 'EOF'\n" + multi + multi + "EOF\n", 0),
+]
+bad = 0
+for name, text, want in fixtures:
+    got = problems(text, "fixture")
+    if len(got) != want:
+        bad += 1
+        print(f"check-recipes: shell function owner fixture '{name}': {len(got)} problems, want {want}: {got}", file=sys.stderr)
+if bad:
+    sys.exit(1)
+root = pathlib.Path(sys.argv[1])
+found, scripts = [], 0
+for path in sorted(root.rglob("*.sh")):
+    scripts += 1
+    found += problems(path.read_text(encoding="utf-8", errors="replace"), f"tools/{path.relative_to(root)}")
+if found:
+    print("check-recipes: a shell function is defined twice with the same body in one file (delete the second):", file=sys.stderr)
+    for f in found:
+        print(f"  {f}", file=sys.stderr)
+    sys.exit(1)
+print(f"check-recipes: shell function owner ok ({scripts} scripts, {len(fixtures)} fixtures)")
+PY
+}
+
 # The cpu-guard live pair reads a real /proc. It runs here, before the blocks, so it does not share the
 # runner with them (on CI's two cores a foreign busy loop inside the 36-wide block can miss its window).
 # No /proc is a printed skip. The product cpu threshold stays 50 %; only the pair sets CPU_BUSY_PCT=1.
@@ -882,7 +969,7 @@ unset CPU_GUARD_PROC_LEG
 
 BLOCKS=(recipescheck selftest smoke cardorder cardtests lease boxtracks unsafecount archscan loadscan commentscan leverscan loadgroups lcppfit coldblocks leverarms slotsarm binlabel lcppwarm q38srv
   maccheck gatebatch gpugate stackwatch ptxscan ptxspill scanargs narrowscan canoncheck ptxcompare ldsscan mutantrun macstatic macremote boxsh seedtarget carry releasebuild pytools boxqcodes fixturevariants dsparkread
-  refsetpublish orphan archowner wt)
+  refsetpublish orphan archowner treecommit fnowner wt)
 for b in "${BLOCKS[@]}"; do
   ( set +e; t0=$SECONDS; blk_$b > "$B/$b.out" 2>&1; brc=$?; echo $((SECONDS - t0)) > "$B/$b.t"; echo $brc > "$B/$b.rc" ) & # set +e: a red block writes its own rc
 done
