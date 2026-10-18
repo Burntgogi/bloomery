@@ -33,7 +33,41 @@ fn hw_clipped_linear() -> Result<(), GpuError> {
     linear.clamp[3] = 8.0;
     pass.mm(stream, &linear, &x, 1, &mut tmp, &mut y)?;
     assert_eq!(y.to_host_vec(stream)?, vec![6.0], "output minimum");
+    linear.clamp[2] = -f32::MAX;
+    linear.clamp[3] = f32::MAX;
+    pass.mm(stream, &linear, &x, 1, &mut tmp, &mut y)?;
+    assert_eq!(
+        y.to_host_vec(stream)?,
+        vec![5.34375],
+        "output bounds at the extremes"
+    );
     stream.synchronize()?;
+    Ok(())
+}
+
+#[test]
+#[ignore = "opens the card for the clamp launch the extreme bounds skip"]
+fn hw_extreme_bounds_clamp_changes_no_bit() -> Result<(), GpuError> {
+    let gpu = Gpu::new()?;
+    let stream = gpu.stream();
+    let pass = Pass::load(&gpu)?;
+    let values = [
+        0.0,
+        -0.0,
+        1.0,
+        -1.0,
+        f32::MAX,
+        -f32::MAX,
+        f32::MIN_POSITIVE,
+        1.0e-45,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        f32::from_bits(0x7fc0_1234),
+    ];
+    let mut x = DeviceBuffer::from_host(stream, &values)?;
+    pass.unary(stream, values.len(), [-f32::MAX, f32::MAX], 0, &mut x)?;
+    let bits = |v: &[f32]| v.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+    assert_eq!(bits(&x.to_host_vec(stream)?), bits(&values));
     Ok(())
 }
 #[test]

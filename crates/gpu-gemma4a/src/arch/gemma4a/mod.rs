@@ -322,7 +322,9 @@ impl Encoder {
             p.elem
                 .enqueue_rms_norm(stream, &s.x, &b.last, EPS, WIDTH, n, &mut s.b)?;
             std::mem::swap(&mut s.x, &mut s.b);
-            take(stream, &format!("blk{index}"), n, WIDTH, &s.x, &mut tap)?;
+            if tap.is_some() {
+                take(stream, &format!("blk{index}"), n, WIDTH, &s.x, &mut tap)?;
+            }
         }
         p.mm(stream, &w.out, &s.x, n, &mut s.a, &mut s.c)?;
         p.add(stream, &w.out_bias, n * OUT, OUT, 1.0, &mut s.c)?;
@@ -397,7 +399,13 @@ impl Pass {
             tmp,
         )?;
         self.gemm.enqueue_f32_tile(stream, &w.w, tmp, n, y)?;
-        self.unary(stream, n * w.w.rows(), [w.clamp[2], w.clamp[3]], 0, y)
+        let bounds = [w.clamp[2], w.clamp[3]];
+        // `unary` clamps a finite value and passes any other: bounds at the f32 extremes change
+        // no value, so there is nothing to launch.
+        if bounds == [-f32::MAX, f32::MAX] {
+            return Ok(());
+        }
+        self.unary(stream, n * w.w.rows(), bounds, 0, y)
     }
 
     fn unary(
