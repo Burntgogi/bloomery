@@ -91,6 +91,13 @@ check contrib-check-stops "$rc" 70
 check contrib-check-no-header "$out" ""
 has contrib-check-names-the-tree "$(cat "$T/cc.err")" "git status failed in $ROOT (git exit 128)"
 
+# A tree with no readable HEAD (an unpacked archive) is the `?` label, not the stop: the header names commit=? and the units run.
+out=$(cd "$ROOT" && GIT_DIR=$T/no-git CONTRIB_INJECT_FAIL=1 bash tools/contrib-check.sh --tier t0 --only '^inject-fail$' 2> "$T/cc-archive.err")
+rc=$?
+check contrib-check-archive-runs "$rc" 1
+has contrib-check-archive-header "$out" "contrib-check tier=t0 commit=?"
+has contrib-check-archive-unit-ran "$out" "inject-fail rc=101"
+
 # ---- tools/nightly/run.sh: a clone under a temp NIGHTLY_HOME, no fetch ----
 # nightly_run NAME CLONE: the files of the one run it leaves in $T/NAME/state/<date>/. flock is a stub on the nightly's PATH
 # ($HOME/bin comes first there), so a host without it (macOS) runs the same code. The clone has no rust-toolchain.toml, so a run
