@@ -15,7 +15,7 @@
 # Files of <run> = $STATE/<YYYY-MM-DD in Asia/Seoul>, or <date>-<n> for a second run the same day:
 #   summary             one line: date, commit, tree, GREEN|RED, wall, then each unit's counts; RUNNING until the run ends
 #   status              GREEN | RED | RUNNING
-#   rc                  0 green; 1 a unit failed; 2 the run could not start its units (fetch, toolchain, owner)
+#   rc                  0 green; 1 a unit failed; 2 the run could not start its units (fetch, toolchain, owner, the clone's git state)
 #   commit              the short sha tested, `+local` when the working tree holds uncommitted files
 #   units.tsv           unit, kind (cargo|script), rc, passed, failed, ignored, seconds
 #   failed              one line per failing test, and one per unit that failed with no failing test (build, timeout, script)
@@ -124,8 +124,13 @@ else
     git -C "$CLONE" reset --quiet --hard origin/main || { put "$RUN/failed" "run: fetch or reset of $CLONE failed"; finish 2 RED "fetch failed"; }
   TREE_LABEL=origin/main
 fi
-COMMIT=$(git -C "$CLONE" rev-parse --short=8 HEAD)
-if [ -n "$(git -C "$CLONE" status --porcelain --untracked-files=normal)" ]; then COMMIT=$COMMIT+local; fi
+tree_commit "$CLONE"
+case $? in
+  0) ;;
+  1) put "$RUN/failed" "run: HEAD of $CLONE cannot be read"; finish 2 RED "no HEAD" ;;
+  *) put "$RUN/failed" "run: git status of $CLONE failed (git exit $TREE_GIT_RC): whether the tree is clean is unknown"; finish 2 RED "git status failed" ;;
+esac
+COMMIT=$TREE_COMMIT
 put "$RUN/commit" "$COMMIT"
 put "$RUN/summary" "$DATE $COMMIT $TREE_LABEL RUNNING (started $(TZ=Asia/Seoul date +%H:%M:%S) KST)"
 echo "== tree $TREE_LABEL $COMMIT"

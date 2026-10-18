@@ -364,7 +364,9 @@
 # as green. Item lines gain `ledger=<state>`: recorded, changed (an input moved during the batch), red, yield (a --round-ledger
 # item that yielded to another batch's GPU hold — nothing ran, nothing recorded),
 # never, unkeyed (no key before the batch, or a recheck that failed — named on stderr), append-failed. The DONE line gains `skipped=<n>`; the exit code counts only the items
-# that ran. --rerun runs every item and still records. --dry-run --ledger prints each item's status and
+# that ran. A record names the tree's commit (`<sha12>`, `-dirty` appended for uncommitted files, `unknown` outside a repository,
+# tools/nightly/units.sh's tree_commit); a tree whose `git status` fails ends the batch rc 70 by name before any item runs.
+# --rerun runs every item and still records. --dry-run --ledger prints each item's status and
 # why: `skip` with the green run's commit, date and tree; `run` with what moved since the item's last
 # green (the parts of each green key are kept in <ledger>.parts/<key>.parts).
 #   Never skipped: a recipe that runs a reference tree's files (ik, llama.cpp, mistral.rs — today
@@ -939,6 +941,8 @@ RT
   # The GPU hold's box-side writer is the real tools/gpu-gate.sh (with the real lease-probe.sh it sources): the fake box below runs
   # its --gpuhold calls on the fixture, so the batch's hold is the real one end to end.
   cp "$(dirname "$self")/gpu-gate.sh" "$t/tools/gpu-gate.sh"
+  mkdir -p "$t/tools/nightly"
+  cp "$(dirname "$self")/nightly/units.sh" "$t/tools/nightly/units.sh"
   cp "$(dirname "$self")/ref/lease-probe.sh" "$t/tools/ref/lease-probe.sh"
   cp "$(dirname "$self")/ref/real-only.sh" "$t/tools/ref/real-only.sh"
   cp "$(dirname "$self")/ref/fixture-only.sh" "$t/tools/ref/fixture-only.sh"
@@ -3259,6 +3263,31 @@ EOS
   rc_ok 'hold: a batch whose every item skips ends green' hold-skip 1
   if [ ! -e "$t/fake-state/hold.log" ]; then pass '  … and puts no hold up'
   else fail '  … and puts no hold up' "$(cat "$t/fake-state/hold.log")"; fi
+  # The ledger's commit label is tree_commit's (tools/nightly/units.sh). GIT_DIR and GIT_WORK_TREE point the run's git at a repository
+  # of the case's own, since the fixture tree is no repository: a corrupt index (HEAD reads, `git status` fails 128 with no output) ends
+  # the batch rc 70 by name before any item runs and before the ledger is touched; a dirty work tree is `<sha12>-dirty`, a clean one
+  # the bare commit. Mutant: the failed status read as a clean tree, the row written with the bare commit.
+  for lbl in bad dirty clean; do
+    git init -q --template= "$t/lbl-$lbl" && echo a > "$t/lbl-$lbl/f" && git -C "$t/lbl-$lbl" add f \
+      && git -C "$t/lbl-$lbl" -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q -m one \
+      || { echo "gate-batch: self-test: the label repository $lbl could not be made" >&2; return 70; }
+  done
+  printf garbage > "$t/lbl-bad/.git/index"
+  lbl_sha=$(git -C "$t/lbl-dirty" rev-parse --short=12 HEAD)
+  rc=$(GIT_DIR="$t/lbl-bad/.git" GIT_WORK_TREE="$t/lbl-bad" steal_case lbl-bad "plain-any	B	a6000	10	$d" -- plain-any)
+  printf '%s' "$rc" > "$t/rc-lbl-bad"
+  if [ "$(cat "$t/rc-lbl-bad")" = 70 ] && grep -Eq '^gate-batch: git status failed in .* \(git exit 128\): whether the tree is clean is unknown' "$t/out-lbl-bad.log" \
+    && [ ! -e "$t/rounds-lbl-bad.tsv" ] && [ ! -e "$t/fake-state/box.log" ]; then
+    pass 'label: a git status that fails ends the batch rc 70 by name, with no item run and no ledger row'
+  else fail 'label: a git status that fails ends the batch rc 70 by name, with no item run and no ledger row' "rc=$(cat "$t/rc-lbl-bad") $(tail -2 "$t/out-lbl-bad.log" 2>/dev/null)"; fi
+  rc=$(GIT_DIR="$t/lbl-dirty/.git" GIT_WORK_TREE="$t" steal_case lbl-dirty "plain-any	B	a6000	10	$d" -- plain-any)
+  printf '%s' "$rc" > "$t/rc-lbl-dirty"
+  rc_ok 'label: a dirty work tree runs the batch' lbl-dirty 1
+  want 'label: … and the ledger row names the commit with -dirty' "$t/rounds-lbl-dirty.tsv" "$(printf '\t%s-dirty\t' "$lbl_sha")"
+  rc=$(GIT_DIR="$t/lbl-clean/.git" GIT_WORK_TREE="$t/lbl-clean" steal_case lbl-clean "plain-any	B	a6000	10	$d" -- plain-any)
+  printf '%s' "$rc" > "$t/rc-lbl-clean"
+  rc_ok 'label: a clean work tree runs the batch' lbl-clean 1
+  want 'label: … and the ledger row names the bare commit' "$t/rounds-lbl-clean.tsv" "$(printf '\t%s\t' "$(git -C "$t/lbl-clean" rev-parse --short=12 HEAD)")"
   fi
   if gb_part 15; then
   # The dry run names the hold it would take and touches nothing; the options' refusals.
@@ -5652,8 +5681,20 @@ if [ "$LEDGER" = 1 ]; then
   else
     LWORK=$OUT/ledger
     mkdir -p "$LWORK" || RC=73 die "cannot create $LWORK"
-    COMMIT=$(git -C "$ROOT" rev-parse --short=12 HEAD 2> /dev/null || echo unknown)
-    [ -z "$(git -C "$ROOT" status --porcelain 2> /dev/null | head -1)" ] || COMMIT="$COMMIT-dirty"
+    # The commit label is tools/nightly/units.sh's tree_commit, read only here: a plan and a dry run never name a commit.
+    [ -f "$ROOT/tools/nightly/units.sh" ] || RC=70 die "cannot read $ROOT/tools/nightly/units.sh, the owner of the ledger's commit label"
+    # shellcheck source=tools/nightly/units.sh
+    source "$ROOT/tools/nightly/units.sh"
+    LABEL_RC=0
+    tree_commit "$ROOT" 12 || LABEL_RC=$?
+    case $LABEL_RC in
+      0)
+        COMMIT=$TREE_SHA
+        [ "$TREE_DIRTY" = 0 ] || COMMIT="$COMMIT-dirty"
+        ;;
+      1) COMMIT=unknown ;;
+      *) RC=70 die "git status failed in $ROOT (git exit $TREE_GIT_RC): whether the tree is clean is unknown, so the ledger cannot record a commit; no item ran" ;;
+    esac
   fi
   [ "$NC" = 0 ] || ledger_plan "$LWORK" # a batch whose items are all deferred has nothing to key
 fi

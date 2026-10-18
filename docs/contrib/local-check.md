@@ -74,8 +74,9 @@ Output: a header (commit, host, toolchain, `RUSTFLAGS`, bound, log directory), o
 both tiers, runs under a bound of `CONTRIB_UNIT_BOUND` seconds (default 1200) through GNU `timeout`, or `gtimeout` when
 only that is installed; a host with neither (macOS as shipped) runs units unbounded, and the header says so. Exit: 0
 every unit green, 1 a unit red, 64 usage, 69 a prerequisite is missing (named, with how it is made), 70 a list the
-script reads is empty or `--only` matches no unit. `CONTRIB_INJECT_FAIL=1` adds one deliberately failing unit, so the
-red path can be shown to fail first.
+script reads is empty, `--only` matches no unit, or `git status` fails in the tree (whether it is clean is unknown, so
+no commit is named). `CONTRIB_INJECT_FAIL=1` adds one deliberately failing unit, so the red path can be shown to fail
+first.
 
 The gate-batch self-test waits for stopped fixture lanes and their registered
 items to finish before a case can remove its tree. A delayed TERM-handler case

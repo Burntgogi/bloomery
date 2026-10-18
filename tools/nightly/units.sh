@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# The one unit runner: a library, sourced by tools/nightly/run.sh (the nightly host run) and tools/contrib-check.sh (a
-# contributor's off-box check). A unit is a `name<TAB>command` line of `python3 tools/recipes.py host-nightly`, or any
-# command a caller names; this file runs one and reads its outcome, and a caller decides what to do with it.
+# The one unit runner and the one commit label: a library, sourced by tools/nightly/run.sh (the nightly host run) and
+# tools/contrib-check.sh (a contributor's off-box check), and, for the label alone, by tools/gate-batch.sh,
+# tools/ptx-compare.sh and tools/narrow-scan.sh. A unit is a `name<TAB>command` line of `python3 tools/recipes.py
+# host-nightly`, or any command a caller names; this file runs one and reads its outcome, and a caller decides what to do
+# with it.
 #
 #   run_unit CMD LOG BOUND [quiet]
 #     runs `bash -c CMD` with stdin from /dev/null under `timeout --kill-after=10 BOUND+30` (the 30 s leave room for the
@@ -17,10 +19,21 @@
 #     prints what a red unit's `failed` file holds: one `NAME: <test>` line per libtest `... FAILED` line, or else one
 #     `NAME: <why>` line (timeout, a filter that matched no test, a build failure, the rc) and the first few red lines (a rustfmt
 #     `Diff in` line included).
+#   tree_commit DIR [WIDTH]
+#     the label a run's evidence is attributed to: the short commit (WIDTH hex digits, default 8) of the tree at DIR, with
+#     `+local` appended when its working tree holds uncommitted files. Sets TREE_SHA (the short commit), TREE_DIRTY (1 when
+#     the working tree holds uncommitted files, else 0), TREE_COMMIT (the label: TREE_SHA, `+local` when dirty) and
+#     TREE_GIT_RC (the exit code of the git call that failed, else 0), and returns 0 when the label is exact. A caller with
+#     another spelling of the dirty mark composes it from TREE_SHA and TREE_DIRTY. It never states a commit it could not
+#     qualify: on any failure TREE_SHA, TREE_DIRTY and TREE_COMMIT are all `?`.
+#       1  HEAD cannot be read (no commit, or not a repository); `git status` is not asked
+#       2  HEAD reads and `git status` fails (a corrupt index, an unreadable tree): whether the tree is clean is unknown, and a
+#          caller must stop and name the tree and TREE_GIT_RC
 #
-# The two callers stay in step by sharing this code: a change to how a unit's counts or failures are read lands here once.
+# The callers stay in step by sharing this code: a change to how a unit's counts or failures are read, or to how a tree is
+# labelled, lands here once.
 
-# shellcheck disable=SC2034  # the UNIT_* variables are this library's result interface, read by the sourcing script
+# shellcheck disable=SC2034  # the UNIT_* and TREE_* variables are this library's result interface, read by the sourcing script
 UNIT_TIMEOUT=${UNIT_TIMEOUT-timeout}
 
 run_unit() {
@@ -55,4 +68,26 @@ unit_failure() {
     # a script's red lines sit anywhere in its output, not in its last 80: name the first few
     grep -E 'FAIL|[Ff]ailed|[Ee]rror|^Diff in' "$log" | grep -v '^ok ' | head -n 8 | cut -c1-220 | sed 's/^/    | /'
   fi
+}
+
+tree_commit() {
+  local dir=$1 width=${2:-8} dirty
+  TREE_GIT_RC=0
+  if ! TREE_SHA=$(git -C "$dir" rev-parse --short="$width" HEAD 2> /dev/null); then
+    TREE_SHA="?" TREE_DIRTY="?" TREE_COMMIT="?"
+    return 1
+  fi
+  # A status that fails prints nothing, which reads as a clean tree: the assignment's own exit code decides.
+  dirty=$(git -C "$dir" status --porcelain --untracked-files=normal) || {
+    TREE_GIT_RC=$?
+    TREE_SHA="?" TREE_DIRTY="?" TREE_COMMIT="?"
+    return 2
+  }
+  TREE_DIRTY=0
+  TREE_COMMIT=$TREE_SHA
+  if [ -n "$dirty" ]; then
+    TREE_DIRTY=1
+    TREE_COMMIT=$TREE_COMMIT+local
+  fi
+  return 0
 }

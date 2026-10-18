@@ -35,7 +35,7 @@
 #
 # Exit: 0 every unit green; 1 a unit red; 64 usage (a tier this host cannot run included; `--tier t2`); 69 a prerequisite is
 # missing (named, with how it is made); 70 a list this script reads (the self-tests, the pure crates, the nightly's units) is
-# empty, or `--only` matches no unit.
+# empty, `--only` matches no unit, or `git status` fails in the tree (whether it is clean is unknown, so no commit is named).
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -100,6 +100,19 @@ case $TIER in
     exit 64
     ;;
 esac
+
+# ---- the tree: the commit the evidence is attributed to ----
+# `?` is the label of a tree with no readable HEAD (an unpacked archive), and the header says so. A tree whose HEAD reads but whose
+# `git status` fails is not that: its state is unknown, and the run stops before it names a commit it cannot qualify.
+tree_commit "$ROOT"
+case $? in
+  0 | 1) ;;
+  *)
+    say "contrib-check: git status failed in $ROOT (git exit $TREE_GIT_RC): whether the tree is clean is unknown, so no commit can be named; repair the repository and rerun"
+    exit 70
+    ;;
+esac
+commit=$TREE_COMMIT
 
 # ---- prerequisites: the toolchain rust-toolchain.toml pins, python3 ----
 command -v python3 > /dev/null || { say "contrib-check: no python3 on PATH (the unit lists come from tools/recipes.py)"; exit 69; }
@@ -205,8 +218,6 @@ fi
 # ---- the header: the block a pull request pastes ----
 cpu=$(sed -n 's/^model name[^:]*: *//p' /proc/cpuinfo 2> /dev/null | head -1)
 [ -n "$cpu" ] || cpu=$(sysctl -n machdep.cpu.brand_string 2> /dev/null || echo unknown)
-commit=$(git rev-parse --short=8 HEAD 2> /dev/null || echo "?")
-if [ -n "$(git status --porcelain --untracked-files=normal 2> /dev/null)" ]; then commit=$commit+local; fi
 echo "contrib-check tier=$TIER commit=$commit"
 echo "host: $(uname -srm), $cpu"
 echo "toolchain: $(rustc --version) ($CHANNEL); RUSTFLAGS: $RUSTFLAGS_NOTE; $TIMEOUT_NOTE"

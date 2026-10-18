@@ -32,7 +32,7 @@
 # Exit codes: 0 nothing existing moved (the head holds every base entry with each column and digest equal, and maybe more: `added`
 # says which); 3 an existing entry's row or digest moved, or the bundle set did; 4 an entry was removed; 5 both; 2 a log or a pair
 # refused by name (a failed scan, a --no-jit scan, two bins, two digest methods, two toolchains: tools/recipes.py's message); 64 usage; 1 a side's box command
-# or the base archive failed (named, with its log); 75 the box is held by a sitting or a lease (contention, nothing built: run again);
+# or the base archive failed (named, with its log), or `git status` failed in this tree (its head side cannot be labelled); 75 the box is held by a sitting or a lease (contention, nothing built: run again);
 # 70 the box's toolchain (box.sh's exit 70). Those are the codes a gate-batch item reads: red unless 0.
 set -uo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -89,7 +89,7 @@ valid_scan() {
 
 # run_compare <base rev> <bin> <features> <base only 0|1> <no cache 0|1>
 run_compare() {
-  local rev=$1 bin=$2 feats=$3 baseonly=$4 nocache=$5 sha key dir track bremote src rc scanner hl tmp
+  local rev=$1 bin=$2 feats=$3 baseonly=$4 nocache=$5 sha key dir track bremote src rc scanner hl lrc tmp
   local arc=()
   sha=$(git -C "$ROOT" rev-parse --verify --quiet "$rev^{commit}") || die 64 "'$rev' names no commit of this repository"
   case $bin in '' | *[!A-Za-z0-9_-]* | -*) die 64 "'$bin' is no binary name" ;; esac
@@ -136,8 +136,18 @@ run_compare() {
     return 0
   fi
   # --- the head side: this tree as box.sh syncs it
-  hl=$(git -C "$ROOT" rev-parse --short=8 HEAD 2> /dev/null || echo unknown)
-  [ -z "$(git -C "$ROOT" status --porcelain 2> /dev/null)" ] || hl=$hl+uncommitted
+  # shellcheck source=tools/nightly/units.sh
+  source "$ROOT/tools/nightly/units.sh"
+  lrc=0
+  tree_commit "$ROOT" || lrc=$?
+  case $lrc in
+    0)
+      hl=$TREE_SHA
+      [ "$TREE_DIRTY" = 0 ] || hl=$hl+uncommitted
+      ;;
+    1) hl=unknown ;;
+    *) die 1 "git status failed in $ROOT (git exit $TREE_GIT_RC): whether this tree is clean is unknown, so its head side cannot be labelled; nothing ran on the box for it" ;;
+  esac
   tmp=$(mktemp "$dir/head.scan.XXXXXX") || die 70 "cannot create head scan"
   side_run "head $hl" "$ROOT" "" "$(scan_command "$feats" "$bin")" "$tmp" "$dir/head.build.log"
   rc=$?
@@ -179,6 +189,8 @@ self_test() {
   mkdir -p "$t/repo/tools/ref" "$t/stub" "$t/home"
   cp "$0" "$t/repo/tools/ptx-compare.sh"
   cp "$ROOT/tools/recipes.py" "$t/repo/tools/recipes.py"
+  mkdir -p "$t/repo/tools/nightly"
+  cp "$ROOT/tools/nightly/units.sh" "$t/repo/tools/nightly/units.sh"
   cp "$ROOT/tools/ref/ptx-canon.py" "$t/repo/tools/ref/ptx-canon.py"
   [ ! -d "$ROOT/tools/bloomery" ] || cp -R "$ROOT/tools/bloomery" "$t/repo/tools/bloomery"
   printf '%s\n' '#!/usr/bin/env bash' 'echo "scanner v1"' > "$t/repo/tools/ptx-scan.sh"
@@ -261,6 +273,14 @@ STUB
   { mklog gx alpha:1 beta:2 | sed -e 's/jit-card=[^ ]* jit-cc=[^ ]* jit-cuda=[^ ]*/jit=skipped(no-jit)/' -e 's/ 12 0$/ skipped(no-jit) skipped(no-jit)/'; } > "$t/stub/head.scan"
   run -- "$base_sha" gx --features gpu
   [ "$rc" = 2 ] && has 'holds no JIT columns'; ok "a --no-jit head: refused, rc 2" $?
+  # 5b. the head label is the tree's: an uncommitted edit is named; a `git status` that fails (a corrupt index, HEAD readable) is no clean
+  # tree, so the head side is refused rc 1 by name before its box call. Mutant: the failed status read as a clean tree, the bare commit the label.
+  mklog gx alpha:1 beta:2 > "$t/stub/head.scan"
+  run -- "$base_sha" gx --features gpu
+  [ "$rc" = 0 ] && has "head=${base_sha:0:8}+uncommitted"; ok "the head label names the uncommitted edit" $?
+  printf garbage > "$t/badindex"
+  run GIT_INDEX_FILE="$t/badindex" -- "$base_sha" gx --features gpu
+  [ "$rc" = 1 ] && has "git status failed in" && has "(git exit 128)" && [ "$(calls head)" = 0 ]; ok "a git status that fails: refused rc 1 by name, no head box call" $?
   # 6. --base-only: the base side alone, cached for the round's end
   mklog gx alpha:1 beta:2 gamma:3 > "$t/stub/head.scan"
   rm -rf "$t/repo/target"

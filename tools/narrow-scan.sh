@@ -511,6 +511,9 @@ run_side() {
 self_test() {
   local t n=0 bad=0 want rc got
   unset BLOOMERY_ARCH
+  # macOS tar stores extended attributes as `._*` members, which the ptx decoder refuses as no mod<N>.ptx; the box's
+  # GNU tar writes none, so the cases tar as the box does.
+  export COPYFILE_DISABLE=1
   # The base side's cache is off for every run below but its own cases (they set NARROW_NO_CACHE=0): a hit would skip the side the
   # older cases assert on.
   export NARROW_NO_CACHE=1
@@ -882,6 +885,8 @@ fi
 rm -f "$rf"
 NARROW_STUB_EOF
   chmod +x "$w/tools/"*.sh
+  mkdir -p "$w/tools/nightly"
+  cp "$ROOT/tools/nightly/units.sh" "$w/tools/nightly/units.sh"
   git -C "$w" init -q && git -C "$w" config user.email test@test && git -C "$w" config user.name test && git -C "$w" config commit.gpgsign false
   echo base > "$w/marker.txt"
   git -C "$w" add -A && git -C "$w" commit -q -m base
@@ -906,6 +911,14 @@ NARROW_STUB_EOF
   wt_run "$t/cm.log" "$wb" "$wb" --out "$t/cm-out"
   [ "$rc" = 0 ] && grep -qx "head rh marker=base new=no" "$t/cm.log" && grep -qx "recipes scan-set $wb" "$t/cm.log" && grep -qx "affected $wb..$wb --narrow --scan $t/cm-out/base/gate_x.log $t/cm-out/head/gate_x.log" "$t/cm.log"
   ok "worktree: a commit head side still reads the commit, not the edit (the contrast)" $?
+  grep -qF "narrow-scan: note: this tree has uncommitted changes; the scans read the commits" <<< "$got"; ok "note: a dirty tree is named when the head side is a commit" $?
+  # A `git status` that fails (a corrupt index, HEAD readable) prints nothing, which reads as a clean tree. The note names it unknown and
+  # does not claim a dirty or a clean tree; the run goes on, since its scans read commits. Mutant: the failed status read as a clean tree,
+  # no note at all.
+  printf garbage > "$t/narrow-badindex"
+  GIT_INDEX_FILE="$t/narrow-badindex" wt_run "$t/cmb.log" "$wb" "$wb" --out "$t/cmb-out"
+  [ "$rc" = 0 ] && grep -Eq "narrow-scan: note: git status failed in .* \(git exit 128\): whether this tree has uncommitted changes is unknown" <<< "$got" \
+    && ! grep -qF "has uncommitted changes;" <<< "$got"; ok "note: a git status that fails is named unknown, never read as a clean tree" $?
   STUB_EDIT=1 wt_run "$t/edit.log" "$wb" --worktree --out "$t/edit-out"
   [ "$rc" = 1 ] && grep -qF "the working tree changed during the run" <<< "$got"; ok "worktree: a tree edited during the run is refused by name" $?
   wt_run "$t/arg.log" "$wb" "$wb" --worktree --out "$t/arg-out"
@@ -1199,7 +1212,16 @@ if [ "$WORKTREE" = 1 ]; then
   AFFECTED_RANGE=$BASE_SHA
   HEAD_SRC=worktree
 else
-  [ -z "$(git -C "$ROOT" status --porcelain 2> /dev/null | head -n 1)" ] || echo "narrow-scan: note: this tree has uncommitted changes; the scans read the commits ${BASE_SHA:0:8} and ${HEAD_SHA:0:8} only (--worktree reads the tree)" >&2
+  # The scans read the commits, so a work tree whose state is unknown changes no number: the note says it is unknown, and the run goes on.
+  # shellcheck source=tools/nightly/units.sh
+  source "$ROOT/tools/nightly/units.sh"
+  lrc=0
+  tree_commit "$ROOT" || lrc=$?
+  case $lrc in
+    0) [ "$TREE_DIRTY" = 0 ] || echo "narrow-scan: note: this tree has uncommitted changes; the scans read the commits ${BASE_SHA:0:8} and ${HEAD_SHA:0:8} only (--worktree reads the tree)" >&2 ;;
+    1) echo "narrow-scan: note: HEAD of $ROOT cannot be read, so whether this tree has uncommitted changes is unknown; the scans read the commits ${BASE_SHA:0:8} and ${HEAD_SHA:0:8} only" >&2 ;;
+    *) echo "narrow-scan: note: git status failed in $ROOT (git exit $TREE_GIT_RC): whether this tree has uncommitted changes is unknown; the scans read the commits ${BASE_SHA:0:8} and ${HEAD_SHA:0:8} only" >&2 ;;
+  esac
   HEAD_LABEL=${HEAD_SHA:0:8}
   SCAN_SET_REV=("$HEAD_SHA")
   AFFECTED_RANGE=$BASE_SHA..$HEAD_SHA
