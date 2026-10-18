@@ -6,6 +6,7 @@
 //! ```text
 //! # tokenizer    <path>  <md5>   the llama-tokenize executable
 //! # libllama     <path>  <md5>   the libllama.so it loads (the tokenizer lives there)
+//! # build        <commit>        the mainline commit both were built at (a set dumped from a pinned mainline tree)
 //! # vocabulary   <path>          the GGUF file whose vocabulary it read, first shard
 //! # text tree    <path>          where the corpus texts were gathered from
 //! # cases        <path>  <md5>   the hand-picked cases file the case texts came from
@@ -17,9 +18,9 @@
 //! Row `<name>` has its text in `<name>.txt`, its ids in `<name>.ids` (special
 //! tokens parsed, `llama-tokenize`'s default) and `<name>.nps.ids`
 //! (`--no-parse-special`), one id a line. [`TokenizerSet::open`] refuses by
-//! name a set dumped with another executable or library, from another
-//! vocabulary file, with a text that is not the one dumped, or that never
-//! finished.
+//! name a set dumped with another executable or library (or, when the family
+//! pins a mainline commit, another commit), from another vocabulary file,
+//! with a text that is not the one dumped, or that never finished.
 
 use crate::RefError;
 use crate::columns::{Columns, Row, parse_field};
@@ -108,6 +109,9 @@ pub struct TokenizerSet {
     pub binary: Option<(String, String)>,
     /// `# libllama`: the library it loads and its md5.
     pub library: Option<(String, String)>,
+    /// `# build`: the mainline commit the executable and the library were built at, which `oracle.sh` states only after the
+    /// tree's HEAD and the executable's own report name it.
+    pub commit: Option<String>,
     /// `# vocabulary`: the GGUF file the set was dumped from.
     pub vocabulary: Option<String>,
     /// `# text tree`: where the corpus texts were gathered from.
@@ -158,6 +162,7 @@ impl TokenizerSet {
             dir: dir.to_path_buf(),
             binary: None,
             library: None,
+            commit: None,
             vocabulary: None,
             text_tree: None,
             cases: None,
@@ -181,6 +186,11 @@ impl TokenizerSet {
             match f[0] {
                 "# tokenizer" => set.binary = Some(path_and_md5(&f, &at)?),
                 "# libllama" => set.library = Some(path_and_md5(&f, &at)?),
+                "# build" => {
+                    if set.commit.replace(one_value(&f, &at)?).is_some() {
+                        return Err(RefError::malformed(&at, "# build is stated twice"));
+                    }
+                }
                 "# cases" => set.cases = Some(path_and_md5(&f, &at)?),
                 "# extra cases" => set.extra_cases = Some(path_and_md5(&f, &at)?),
                 "# vocabulary" => set.vocabulary = Some(one_value(&f, &at)?),
@@ -217,10 +227,15 @@ impl TokenizerSet {
         Ok(set)
     }
 
-    /// The executable and the library the set names, as a family's `build`
-    /// pin spells them ([`build_id`]); `None` unless both lines are there.
+    /// The build the set names, as a family's `build` pin spells it: the
+    /// `# build` commit when the set states one, else the executable and the
+    /// library's md5s ([`build_id`]), `None` unless both lines are there. A
+    /// family pins one spelling, so a set of the other is refused by name.
     #[must_use]
     pub fn build(&self) -> Option<String> {
+        if let Some(commit) = &self.commit {
+            return Some(commit.clone());
+        }
         let (_, binary) = self.binary.as_ref()?;
         let (_, library) = self.library.as_ref()?;
         Some(build_id(binary, library))

@@ -1,6 +1,6 @@
 //! EmbeddingGemma v1 text rows, pooled vectors and llama-server vectors.
 use crate::RefError;
-use crate::emb2::{Kind, Profile, family};
+use crate::emb2::{Kind, LCPP_BUILD, Profile, family};
 use crate::family::{Build, Family, Identity};
 
 /// The Q8_0 file from ggml-org/embeddinggemma-300M-GGUF, revision 0f741b5a.
@@ -18,12 +18,10 @@ pub static PROFILE: Profile = Profile {
 fn model() -> Result<String, RefError> {
     Ok(MODEL.to_string())
 }
-/// The vocabulary oracle's executable and library, built at mainline 6868a52cb.
-// PIN(2026-10-16): the mainline tokenizer used to dump the text-only model's ids.
-pub const TOKENIZER_BUILD: &str = "llama-tokenize be4957f2c2f96704054e0557c48b9b09 \
-                                 libllama.so 10eff38604798775e975958c13b3b385";
-
-/// The SentencePiece ids, including BOS and EOS in both parse modes.
+/// The SentencePiece ids, including BOS and EOS in both parse modes, from the oracle commit's `llama-tokenize`. The set
+/// names that commit in its `# build` line, so any machine's build of it is the same oracle: the executable's and the library's
+/// md5s change with every rebuild and are not the identity.
+// PIN(2026-10-18): the oracle commit, not one machine's llama-tokenize and libllama.so md5s, which no other build of it matched.
 pub static TOKENIZER: Family = Family {
     name: "tokenizer-llama",
     sets: &["ref-tokenizer-llama"],
@@ -31,7 +29,7 @@ pub static TOKENIZER: Family = Family {
     recipe: "just dump-ref-tokenizer llama",
     identity: Identity::Vocabulary,
     arch: None,
-    build: Some(Build::Is(TOKENIZER_BUILD)),
+    build: Some(Build::Is(LCPP_BUILD)),
     runs: Some(model),
     draft_runs: None,
     consumers: &["gate-tokenizer"],

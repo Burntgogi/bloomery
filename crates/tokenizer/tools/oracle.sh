@@ -24,9 +24,11 @@
 #   <name>.ids           one id per line, special tokens parsed
 #   <name>.nps.ids       one id per line, --no-parse-special
 #   cases/<nn>.{txt,ids,nps.ids}
-#   MANIFEST.tsv         the executable and the libllama.so it loads (path, md5), the vocabulary
-#                        file, the cases file (path, md5), one row per text (the corpus names, then
-#                        cases/<nn>: bytes, text md5, id counts), and the `# complete` trailer
+#   MANIFEST.tsv         the executable and the libllama.so it loads (path, md5), the mainline commit
+#                        they were built at (`# build`, the pinned mainline vocabularies only), the
+#                        vocabulary file, the cases file (path, md5), one row per text (the corpus
+#                        names, then cases/<nn>: bytes, text md5, id counts), and the `# complete`
+#                        trailer
 #
 # The vocabularies, each with its reference tree and its set (`profile` below owns the table;
 # crates/refset/src/arch/tokenizer.rs pins the same executables and libraries by md5):
@@ -40,6 +42,16 @@
 #                                                 LCPP and MODEL, tools/ref/models/gemma-embedding2.sh)
 #   llama     EmbeddingGemma v1's Q8_0 file      the same mainline pin, gemma-embedding profile       ref-tokenizer-llama
 #
+# The two mainline vocabularies (gemma4, llama) are the commit's build, not an md5: before anything is read the tree's HEAD, its
+# tracked files and llama-tokenize's own `--version` must name the profile's LCPP_PIN (tools/ref/emb2/oracle-tree.sh), and the
+# manifest then states `# build <commit>`, which the refset family pins. The executable's and the library's md5s stay in the
+# manifest (tools/ref/emb2/emb2.sh holds the ids to this machine's binary) but change with every rebuild, so no family pins them.
+#
+# llama's corpora are cut into rows of at most CHUNK bytes, named <corpus>.<nnn> (a cut at a line end: `split -C`). That vocabulary's
+# SPM tokenizer partitions a text at its user-defined special tokens, the newline runs among them, and walks the fragment list once
+# per match, so the time of one text grows with the square of its size; the corpora whole outran the recipe's bound. The other
+# vocabularies keep one row per corpus, which the tokenizer gate's corpus test names.
+#
 # A vocabulary can have cases of its own after the shared ones (EXTRA, `# extra cases` in the manifest, rows numbered on
 # from the shared cases): gemma4's crates/tokenizer/tests/cases-gemma4.txt, the boundaries of its own vocabulary and the
 # texts the EmbeddingGemma 2 oracle sets are dumped from (tools/ref/emb2/emb2.sh reads their ids here).
@@ -47,6 +59,8 @@
 # The sets' directories are `ref-tokenizer-*`, not the `tokenizer*` of the format this script wrote
 # before it wrote a trailer: a checkout that still runs that format's gate rewrites those and cannot
 # touch these.
+#
+# Every text's wall time is printed (`oracle: <name> ... s`), the quickest read of where a long run spends it.
 #
 # Every vocabulary reads the same texts: the default profile's ik tree and this tree's docs/. `all`
 # takes one snapshot of docs/ per vocabulary, in turn, all but gemma4 and llama, which run by name on a machine with their
@@ -82,6 +96,8 @@ VOCAB_NAME=$1
 # profile's: another profile's IK tree would give this vocabulary other texts than its siblings.
 # shellcheck source=tools/ref/ref-paths.sh
 source "$ROOT/tools/ref/ref-paths.sh"
+# shellcheck source=tools/ref/emb2/oracle-tree.sh
+source "$ROOT/tools/ref/emb2/oracle-tree.sh"
 [ "$BLOOMERY_MODEL" = deepseek2 ] || {
   echo "oracle: the texts are the default profile's (deepseek2); BLOOMERY_MODEL=$BLOOMERY_MODEL would take another IK tree" >&2
   exit 64
@@ -93,6 +109,7 @@ source "$ROOT/tools/ref/ref-paths.sh"
 # ik's does: `--no-bos` where the file would prepend a BOS (the gate compares the text's own ids),
 # `--no-escape` where it would turn a `\n` in the text into a newline.
 EXTRA=
+ORACLE_TREE= BUILD_PIN= CHUNK=0
 profile() {
   REF_FLAGS=()
   case $1 in
@@ -140,13 +157,18 @@ profile() {
       local emb2 model_profile=gemma-embedding2
       [ "$1" != llama ] || model_profile=gemma-embedding
       # shellcheck disable=SC2016 # the child shell expands them
-      emb2=$(env -u BLOOMERY_REF_MODEL bash -c 'source "$1" && printf "%s\t%s\t%s" "$LCPP" "$MODEL" "${EMBED_CASES:?the profile names EMBED_CASES}"' _ \
+      emb2=$(env -u BLOOMERY_REF_MODEL bash -c 'source "$1" && printf "%s\t%s\t%s\t%s" "$LCPP" "$MODEL" "${EMBED_CASES:?the profile names EMBED_CASES}" "${LCPP_PIN:?the profile names LCPP_PIN}"' _ \
         "$ROOT/tools/ref/models/$model_profile.sh")
-      TOKENIZE=${emb2%%$'\t'*}/build/bin/llama-tokenize
+      ORACLE_TREE=${emb2%%$'\t'*}
+      TOKENIZE=$ORACLE_TREE/build/bin/llama-tokenize
       emb2=${emb2#*$'\t'}
       SHARD=${emb2%%$'\t'*}
+      emb2=${emb2#*$'\t'}
       SET=ref-tokenizer-$1
-      EXTRA=$ROOT/crates/tokenizer/tests/${emb2#*$'\t'}
+      EXTRA=$ROOT/crates/tokenizer/tests/${emb2%%$'\t'*}
+      BUILD_PIN=${emb2#*$'\t'}
+      # The SPM partition walk is quadratic in a text's size (header): llama's corpora go in rows of at most 1 MB.
+      [ "$1" != llama ] || CHUNK=1000000
       # No --no-bos: the EmbeddingGemma sets run these ids as the model's
       # input, BOS and EOS included, as llama-server's /tokenize with
       # add_special gives them (tools/ref/emb2/server_vectors.py).
@@ -161,6 +183,7 @@ profile "$VOCAB_NAME"
 # ik's binaries export libllama.so; the mainline build nemotron uses exports libllama.so.0.
 LIBLLAMA=$(ldd "$TOKENIZE" | awk '$1 == "libllama.so" || $1 == "libllama.so.0" { print $3; exit }')
 [ -f "$LIBLLAMA" ] || { echo "oracle: $TOKENIZE loads no libllama.so (ldd names '$LIBLLAMA')" >&2; exit 66; }
+[ -z "$ORACLE_TREE" ] || oracle_tree oracle "$ORACLE_TREE" "$BUILD_PIN" llama-tokenize
 if [ "$VOCAB_NAME" = v41 ]; then
   # The reference's `~` is a symbol, so `~/` is one word and one id; a tree whose `~` is in neither
   # P nor S returns [96, 17].
@@ -197,10 +220,16 @@ for path in sys.stdin.read().splitlines():
   esac
 }
 
-# ids <text file> <out prefix> — both parse modes, one id per line.
+# ids <text file> <out prefix> — both parse modes, one id per line, and the wall of each on stderr.
 ids() {
+  local t0 t1 t2
+  t0=$(date +%s.%N)
   one "$1" "$2.ids"
+  t1=$(date +%s.%N)
   one "$1" "$2.nps.ids" --no-parse-special
+  t2=$(date +%s.%N)
+  awk -v n="${2##*/}" -v b="$(wc -c < "$1")" -v a="$t0" -v c="$t1" -v d="$t2" \
+    'BEGIN { printf "oracle: %s %d bytes: parse %.1f s, no-parse %.1f s\n", n, b, c - a, d - c }' >&2
 }
 
 # one <text file> <out file> [flag] — llama-tokenize --ids, reshaped to one id per line.
@@ -223,6 +252,7 @@ extra_md5=
 {
   printf '# tokenizer\t%s\t%s\n' "$TOKENIZE" "$(md5sum < "$TOKENIZE" | cut -d' ' -f1)"
   printf '# libllama\t%s\t%s\n' "$LIBLLAMA" "$(md5sum < "$LIBLLAMA" | cut -d' ' -f1)"
+  [ -z "$BUILD_PIN" ] || printf '# build\t%s\n' "${BUILD_PIN:0:9}"
   printf '# vocabulary\t%s\n' "$SHARD"
   printf '# text tree\t%s\n' "$IK"
   printf '# cases\t%s\t%s\n' "$CASES" "$(md5sum < "$CASES" | cut -d' ' -f1)"
@@ -232,9 +262,21 @@ extra_md5=
 
 if [ "${2:-}" != --cases-only ]; then
   for name in code prose prose-all threads korean; do
-    gather "$name" > "$OUT.new/$name.txt"
-    ids "$OUT.new/$name.txt" "$OUT.new/$name"
-    row "$name" >> "$OUT.new/MANIFEST.tsv"
+    if [ "$CHUNK" -gt 0 ]; then
+      gather "$name" | split -C "$CHUNK" -d -a 3 --additional-suffix=.txt - "$OUT.new/$name."
+      pieces=("$OUT.new/$name".[0-9][0-9][0-9].txt)
+      [ -e "${pieces[0]}" ] || { echo "oracle: the corpus $name is empty" >&2; exit 65; }
+      for piece in "${pieces[@]}"; do
+        piece=${piece##*/}
+        piece=${piece%.txt}
+        ids "$OUT.new/$piece.txt" "$OUT.new/$piece"
+        row "$piece" >> "$OUT.new/MANIFEST.tsv"
+      done
+    else
+      gather "$name" > "$OUT.new/$name.txt"
+      ids "$OUT.new/$name.txt" "$OUT.new/$name"
+      row "$name" >> "$OUT.new/MANIFEST.tsv"
+    fi
   done
 fi
 

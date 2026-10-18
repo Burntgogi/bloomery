@@ -33,6 +33,8 @@ pub(crate) static FAMILY: Family = Family {
 pub(crate) struct Stated<'a> {
     pub binary: &'a str,
     pub library: &'a str,
+    /// The `# build` commit, for a set dumped from a pinned mainline tree.
+    pub commit: Option<&'a str>,
     pub vocabulary: &'a str,
     pub cases: &'a str,
     pub complete: bool,
@@ -41,6 +43,7 @@ pub(crate) struct Stated<'a> {
 pub(crate) const RIGHT: Stated<'static> = Stated {
     binary: BINARY_MD5,
     library: LIBRARY_MD5,
+    commit: None,
     vocabulary: VOCABULARY,
     cases: "",
     complete: true,
@@ -77,6 +80,9 @@ pub(crate) fn write_set(dir: &Path, s: &Stated<'_>, cases_file_md5: &str) {
     let mut lines = vec![
         format!("# tokenizer\t/ik/build/bin/llama-tokenize\t{}", s.binary),
         format!("# libllama\t/ik/build/src/libllama.so\t{}", s.library),
+    ];
+    lines.extend(s.commit.map(|commit| format!("# build\t{commit}")));
+    lines.extend([
         format!("# vocabulary\t{}", s.vocabulary),
         "# text tree\t/ik".to_string(),
         format!(
@@ -88,7 +94,7 @@ pub(crate) fn write_set(dir: &Path, s: &Stated<'_>, cases_file_md5: &str) {
             }
         ),
         "set\tbytes\ttext_md5\tids\tnps_ids".to_string(),
-    ];
+    ]);
     for (name, text, ids, nps) in TEXTS {
         w(&format!("{name}.txt"), text);
         w(&format!("{name}.ids"), ids);
@@ -139,6 +145,41 @@ fn a_set_of_the_familys_file_and_build_opens_and_reads() {
     assert_eq!(
         (p.dumped_from.as_str(), p.build.as_deref()),
         (VOCABULARY, Some(PIN))
+    );
+    remove(&dir);
+}
+
+/// A set that states a `# build` commit names that commit as its build, whatever its executable's and library's md5s are,
+/// and a family that pins the md5 spelling refuses it by name; a set that states none still names the md5 spelling.
+#[test]
+fn a_build_line_is_the_sets_build() {
+    let dir = set_dir("commit");
+    let commit = "6868a52cb";
+    write_set(
+        &dir,
+        &Stated {
+            commit: Some(commit),
+            ..RIGHT
+        },
+        CASES_MD5,
+    );
+    let set = TokenizerSet::read(&dir, &FAMILY).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(set.commit.as_deref(), Some(commit));
+    assert_eq!(set.build().as_deref(), Some(commit));
+    match TokenizerSet::open(&dir, &FAMILY) {
+        Err(RefError::Foreign {
+            field: "build",
+            got,
+            want,
+            ..
+        }) => assert_eq!((got.as_str(), want.as_str()), (commit, PIN)),
+        r => panic!("an md5-pinned family given a set that names a commit: {r:?}"),
+    }
+    write_set(&dir, &RIGHT, CASES_MD5);
+    let set = TokenizerSet::read(&dir, &FAMILY).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(
+        (set.commit.as_deref(), set.build().as_deref()),
+        (None, Some(PIN))
     );
     remove(&dir);
 }
@@ -355,7 +396,8 @@ fn an_ids_file_that_disagrees_with_its_row_is_malformed() {
 
 /// A manifest line the reader cannot take is malformed at its line: an md5
 /// that is not one, a text row before its column line, a text named twice, a
-/// name that leaves the set's directory.
+/// name that leaves the set's directory, a `# build` without its commit or
+/// stated twice.
 #[test]
 fn a_manifest_line_that_does_not_parse_is_malformed() {
     let dir = set_dir("lines");
@@ -376,6 +418,17 @@ fn a_manifest_line_that_does_not_parse_is_malformed() {
             good.replace("set\tbytes\ttext_md5\tids\tnps_ids\n", ""),
         ),
         ("named twice", good.replace(&row, &format!("{row}\n{row}"))),
+        (
+            "# build is stated twice",
+            good.replace(
+                "# vocabulary",
+                "# build\t6868a52cb\n# build\t6868a52cb\n# vocabulary",
+            ),
+        ),
+        (
+            "want <key>",
+            good.replace("# vocabulary", "# build\n# vocabulary"),
+        ),
         (
             "does not name a file under the set",
             good.replace(&row, &row.replacen("code", "../code", 1)),

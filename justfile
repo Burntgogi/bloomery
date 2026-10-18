@@ -1516,6 +1516,8 @@ gate-tokenizer:
 # gemma4 and llama). No lease, no GPU. gemma4 (EmbeddingGemma 2) and llama (v1) use mainline 6868a52cb
 # (`just build-emb2-lcpp`), with their profile's EMBED_CASES after cases.txt. The EmbeddingGemma oracle sets read those ids.
 # A re-dump on a moved reference tree changes the md5 pins in crates/refset/src/arch/tokenizer.rs: the gate names which.
+# gemma4 and llama are held to the mainline commit instead (their manifest's `# build` line, checked against the tree before the
+# dump), which any rebuild of that commit keeps; llama's corpora go in rows of at most 1 MB, its tokenizer being quadratic in a text.
 # V4.1's reference is a side tree (/home/user/ik-tilde: ik main plus the one line that puts `~` in the S class,
 # ik#2528) and Qwen3-MoE, GLM-5.3-Flash and Qwen3.8 use /home/user/ik-tokref (the ik-idxkey commit plus the
 # unicode_tolower fix, ik#2520). Nemotron uses /home/user/llama.cpp-mainline: ik-tokref has no nemotron_h

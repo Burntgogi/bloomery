@@ -15,7 +15,9 @@
 //! `/home/user/llama.cpp-mainline`, whose `pixtral` pre is the LLAMA3 regex
 //! with `ignore_merges`. A family pins the executable and the library it
 //! loads by md5 ([`crate::tokenizer::build_id`]): the tokenizer is the
-//! library's code, the executable only calls it.
+//! library's code, the executable only calls it. EmbeddingGemma v1's pins the
+//! mainline commit its set's `# build` line names instead: its oracle is a
+//! commit's build, and every machine's rebuild of that commit has other md5s.
 
 use crate::RefError;
 use crate::family::{Build, Family, Identity};
@@ -162,6 +164,7 @@ mod tests {
         TOKREF_BUILD, V41,
     };
     use crate::RefError;
+    use crate::emb2::LCPP_BUILD;
     use crate::family::Family;
     use crate::md5::check_hex;
     use crate::tokenizer::tests::{CASES_MD5, RIGHT, Stated, set_dir, write_set};
@@ -173,20 +176,31 @@ mod tests {
         (words.nth(1).unwrap_or(""), words.nth(1).unwrap_or(""))
     }
 
+    /// Whether a pin is a mainline commit, which a set states in its `# build` line, and not the
+    /// executable's and the library's md5s.
+    fn is_commit(pin: &str) -> bool {
+        !pin.contains(' ')
+    }
+
     /// Write a set into `dir` as `f`'s dumper would for the vocabulary `file`,
     /// stating the pin `build`.
     fn write(dir: &Path, file: &str, build: &str) {
-        let (binary, library) = md5s(build);
-        write_set(
-            dir,
-            &Stated {
+        let stated = if is_commit(build) {
+            Stated {
+                commit: Some(build),
+                vocabulary: file,
+                ..RIGHT
+            }
+        } else {
+            let (binary, library) = md5s(build);
+            Stated {
                 binary,
                 library,
                 vocabulary: file,
                 ..RIGHT
-            },
-            CASES_MD5,
-        );
+            }
+        };
+        write_set(dir, &stated, CASES_MD5);
     }
 
     fn check(f: &Family, what: &str, file: &str, build: &str) -> Result<(), RefError> {
@@ -199,7 +213,8 @@ mod tests {
 
     /// The table holds the vocabularies under one key, each its own row with
     /// its own set directory and the recipe that writes it; a pin is two md5s
-    /// the reader's `build_id` spells.
+    /// the reader's `build_id` spells, or the mainline commit of the one
+    /// vocabulary whose oracle is a pinned mainline tree.
     #[test]
     fn the_vocabularies_are_rows_of_the_table() {
         assert_eq!(crate::arch::families(ARCH).len(), 6);
@@ -215,6 +230,10 @@ mod tests {
             let Some(crate::family::Build::Is(pin)) = f.build else {
                 panic!("{} pins no build", f.name);
             };
+            if is_commit(pin) {
+                assert_eq!(pin, LCPP_BUILD, "{}", f.name);
+                continue;
+            }
             let (binary, library) = md5s(pin);
             assert_eq!(pin, crate::tokenizer::build_id(binary, library));
             for md5 in [binary, library] {
@@ -227,10 +246,7 @@ mod tests {
             (&GLM5NEXT, TOKREF_BUILD),
             (&QWEN38, TOKREF_BUILD),
             (&NEMOTRON, NEMOTRON_BUILD),
-            (
-                &super::super::gemma_embedding::TOKENIZER,
-                super::super::gemma_embedding::TOKENIZER_BUILD,
-            ),
+            (&super::super::gemma_embedding::TOKENIZER, LCPP_BUILD),
         ] {
             assert!(
                 matches!(f.build, Some(crate::family::Build::Is(p)) if p == pin),
@@ -253,9 +269,10 @@ mod tests {
     }
 
     /// Each family takes a set dumped from its own vocabulary file with the
-    /// executable and library it pins, and no other family's pin: V4.1's set
-    /// read by the tolower-fixed tree is as foreign as a Qwen set read by the
-    /// tilde tree.
+    /// executable and library (or the mainline commit) it pins, and no other
+    /// pin: V4.1's set read by the tolower-fixed tree is as foreign as a Qwen
+    /// set read by the tilde tree, a set of another commit is foreign to the
+    /// commit's family, and a set in the other spelling is foreign to both kinds.
     #[test]
     fn each_family_takes_its_own_build_and_vocabulary_only() -> Result<(), RefError> {
         for f in FAMILIES {
@@ -263,15 +280,19 @@ mod tests {
             let Some(crate::family::Build::Is(own)) = f.build else {
                 panic!("{} pins no build", f.name);
             };
-            let other = if own == TILDE_BUILD {
-                TOKREF_BUILD
+            let others = if is_commit(own) {
+                ["0000000ff", TILDE_BUILD]
+            } else if own == TILDE_BUILD {
+                [TOKREF_BUILD, LCPP_BUILD]
             } else {
-                TILDE_BUILD
+                [TILDE_BUILD, LCPP_BUILD]
             };
             check(f, &format!("{}-own", f.name), &runs, own)?;
-            match check(f, &format!("{}-other", f.name), &runs, other) {
-                Err(RefError::Foreign { field: "build", .. }) => {}
-                r => panic!("{}: a set of the other tree: {r:?}", f.name),
+            for other in others {
+                match check(f, &format!("{}-other", f.name), &runs, other) {
+                    Err(RefError::Foreign { field: "build", .. }) => {}
+                    r => panic!("{}: a set of the other build {other}: {r:?}", f.name),
+                }
             }
         }
         Ok(())
