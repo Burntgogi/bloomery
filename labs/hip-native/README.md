@@ -133,6 +133,86 @@ Report full-logit error diagnostically; do not invent a whole-model accuracy ban
 reference/synthetic-model success. Keep chat/tool admission separate. Only then discuss the common
 backend boundary with the maintainers.
 
+## Same-small-GGUF HIP comparison
+
+`compare-hip.py` is a separate, fail-closed comparison controller. It requires a clean,
+committed, unchanged source HEAD and a **new canonical `verify.py` result from that exact
+HEAD**, not historical evidence. Both native executable and device ELF must still reside
+under this lab's `target` directory and match the canonical SHA-256 records. It does not
+build binaries or silently refresh stale evidence.
+
+The only model accepted here is canonical `forward/smoke.gguf`: the deterministic two-layer
+GDN+GQA fixture, 685,984 bytes, vocabulary258, SHA-256
+`420f680e27e9ec75c7c29d39298574f7fd2aff8808e9b2566f3915664016ed06`.
+The root reference target `hip-lab-hybrid` attributes this fixture to
+`midagedev/bloomery`, revision `03372d339f99996ec5103484f6e917412191d661`, file
+`smoke.gguf`. No real0.8B model is loaded by this workflow.
+
+From the repository root, with the HIP runtime environment configured as in **Verify**:
+
+```sh
+# LLAMA_TREE is a clean pinned llama.cpp checkout; LLAMA_HIP_BUILD is its
+# matching CMake build directory configured with GGML_HIP=ON.
+python3 tools/ref/dense-logits.py build \
+  --llama-tree "$LLAMA_TREE" --llama-build "$LLAMA_HIP_BUILD" \
+  --out labs/hip-native/target/dense_logits_ref
+labs/hip-native/verify.sh /tmp/hip-current-canonical
+python3 labs/hip-native/compare-hip.py /tmp/hip-small-comparison \
+  --reference labs/hip-native/target/dense_logits_ref \
+  --native-evidence /tmp/hip-current-canonical/result.json
+
+# Consumer-side contracts only; no GPU initialization or model execution:
+python3 labs/hip-native/compare-hip.py --self-test
+```
+
+All evidence directories must be new and outside the checkout. The reference build record
+must bind the current C++ harness, clean llama.cpp source, HIP-enabled build, binary and
+resolved shared libraries. Cached-library smoke attribution is not accepted. Inherited
+HIP/ROCR visibility is preserved; the reference explicitly selects the first visible ROCm
+device and requires observed computation for both trunk layers and the output head on
+that device. CPU math-node counts are retained honestly: the standard reference input
+embedding leg may remain on CPU. This is not a CPU-reference substitution or a claim that
+every reference node runs on HIP.
+
+Inputs stay fixed: raw prompt `[3,17,41,9,23]`, eight greedy IDs, context64, ubatch1,
+F16 KV and step prefill. The controller derives the reference continuation independently
+with eight HIP prefix captures; sentinel forced ID0 is not consumed. It then captures all
+eight reference rows in one final forced run and checks its argmax against those independently
+derived IDs. Native HIP runs both its own greedy8 and a zero-greedy-step forward consuming
+the original prompt followed by the first seven reference IDs, using the exact same GGUF.
+Reference row0 aligns with native row4, not native row0 or5.
+
+Every reference capture and both native runs perform two real in-process reset passes.
+The controller reads the complete raw F32 files, checks dimensions, finiteness, independent
+argmax, file/model/source/binary identities and reset bit equality, and retains each
+reference capture's placement, memory and build attribution. Native processes and the
+reference's actual GPU child use the root driver's bounded cleanup, with a 900-second
+bound per launch. No service is stopped or reconfigured.
+
+`comparison.json` schema1 has `status=pass|mismatch|error`; only `pass` exits zero.
+Successful and token-mismatch comparisons contain all eight aligned-row diagnostics:
+max absolute error, reference-normalized relativeL2 (null for a zero reference norm with
+nonzero error), actual argmax IDs and diagnostic bit equality. There is **no invented
+numeric tolerance or full-logit parity gate**. Passing requires finite complete rows,
+reset equality, unchanged identities and agreement of the independently derived reference,
+final reference, native greedy and native reference-forced token IDs.
+`first-divergence.json` preserves the first differing token's prefixes, complete rows and
+artifact offsets/paths. Errors preserve incomplete bundles under `.staging`, native row
+files and command logs where available; they never publish a fake complete comparison.
+The report distinguishes equivalent driver CLI arguments from actual child argv recorded
+by the imported reference runner.
+
+The reference's default16MiB tensor-payload bound is not a total VRAM cap. Both lanes retain
+the current production `FIT_RESERVE`; the reference additionally checks selected-device free
+memory before model/context/decode stages using its recorded conservative context allowance.
+Driver allocations, fragmentation and unmodeled backend workspace remain outside that
+estimate. These are stage preflight checks, not an OS-enforced cap or measured peak.
+Insufficient headroom is a nonzero refusal, never permission to evict another service.
+`real_model_HIP_acceptance` is **always false**, including on a passing small-fixture run.
+This section defines the runnable workflow, not a claim that its self-test or GPU comparison
+has already been executed; it grants no real-model, serving, performance or CUDA/HIP parity
+acceptance.
+
 ## Original selected Q4_K port
 
 The arithmetic baseline is Bloomery `9fc2cc0d67f9a5b1d71e10663ba43873431c25e5`;
