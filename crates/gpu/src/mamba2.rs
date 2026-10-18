@@ -239,6 +239,7 @@ mod mamba2_kernels {
         static mut STAGE: SharedArray<f32, STAGED> = SharedArray::UNINIT;
         static mut YS: SharedArray<f32, CH_PER_BLOCK> = SharedArray::UNINIT;
         static mut LAST: SharedArray<u32, 1> = SharedArray::UNINIT;
+        static mut SCALE: SharedArray<f32, 1> = SharedArray::UNINIT;
 
         let (n_head, per, n_group, hd, chunks) = (
             n_head as usize,
@@ -263,11 +264,12 @@ mod mamba2_kernels {
         let conv_dim = inner + 2 * n_group * STATE;
         // SAFETY: block-shared arrays of this block, reached without a
         // reference to a `static mut`; the barriers below order their users.
-        let (cs, ys, last) = unsafe {
+        let (cs, ys, last, sc) = unsafe {
             (
                 SharedArray::as_raw_mut_ptr(&raw mut STAGE),
                 SharedArray::as_raw_mut_ptr(&raw mut YS),
                 SharedArray::as_raw_mut_ptr(&raw mut LAST),
+                SharedArray::as_raw_mut_ptr(&raw mut SCALE),
             )
         };
         let (yp, ringp, statep) = (y.as_mut_ptr(), ring.as_mut_ptr(), state.as_mut_ptr());
@@ -447,37 +449,48 @@ mod mamba2_kernels {
             // The ticket's release orders this block's writes before it; the
             // last block's acquire sees every block's.
             let is_last = count.fetch_add(1, AtomicOrdering::AcqRel) + 1 == bpg as u32;
+            let mut scale = 0.0f32;
             if is_last {
                 // Every block of the group has drawn its ticket.
                 count.store(0, AtomicOrdering::Relaxed);
+                // Every partial and every `y` of the group is published
+                // (volatile loads: this block's L1 never held another
+                // block's values, and a volatile load does not ask it). The
+                // block's one sum of the partials in block order, and its
+                // scale, are thread 0's: the other threads read the scale
+                // below.
+                let pp = part.as_mut_ptr();
+                let mut total = 0.0f64;
+                let mut i = 0usize;
+                while i < bpg {
+                    // SAFETY: pbase + i < (g + 1)·bpg <= n_head·chunks <=
+                    // part.len().
+                    total += unsafe { core::ptr::read_volatile(pp.add(pbase + i)) };
+                    i += 1;
+                }
+                let mean = (total / width as f64) as f32;
+                // A non-finite mean gives a NaN scale: each `o` below is NaN
+                // and raises.
+                scale = if mean.is_finite() {
+                    1.0 / (mean + eps).sqrt()
+                } else {
+                    f32::NAN
+                };
             }
-            // SAFETY: block-shared, one element, read after the barrier below.
-            unsafe { *last = u32::from(is_last) };
+            // SAFETY: block-shared, one element each, read after the barrier
+            // below.
+            unsafe {
+                *last = u32::from(is_last);
+                *sc = scale;
+            }
         }
         thread::sync_threads();
         // SAFETY: written by thread 0 before the barrier above.
-        if unsafe { *last } == 0 {
+        let (is_last, scale) = unsafe { (*last, *sc) };
+        if is_last == 0 {
             return;
         }
 
-        // The group's last block: every partial and every `y` of the group
-        // is published (volatile loads: this block's L1 never held another
-        // block's values, and a volatile load does not ask it).
-        let pp = part.as_mut_ptr();
-        let mut total = 0.0f64;
-        let mut i = 0usize;
-        while i < bpg {
-            // SAFETY: pbase + i < (g + 1)·bpg <= n_head·chunks <= part.len().
-            total += unsafe { core::ptr::read_volatile(pp.add(pbase + i)) };
-            i += 1;
-        }
-        let mean = (total / width as f64) as f32;
-        // A non-finite mean gives a NaN scale: each `o` below is NaN and raises.
-        let scale = if mean.is_finite() {
-            1.0 / (mean + eps).sqrt()
-        } else {
-            f32::NAN
-        };
         let ybase = g * width;
         let mut i = tid;
         while i < width {
