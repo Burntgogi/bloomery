@@ -47,6 +47,12 @@ Its default profile's `IK` tree must contain `src/`, `docs/`, `README.md` and
 `github-data/`, as for the v2 tokenizer set. `LCPP` selects the tokenizer executable;
 `IK` selects those corpus texts.
 
+The v1 set is the commit's build, not an md5: `oracle.sh` checks the tree's HEAD, its tracked files and `llama-tokenize
+--version` against the profile's pin before it reads anything, and writes `# build <commit>`, which the `tokenizer-llama`
+family pins. The executable's and the library's md5s stay in the manifest and change with every rebuild. The v1 corpora are
+cut into rows of at most 1 MB, `<corpus>.<nnn>`, because that vocabulary's SPM tokenizer takes time quadratic in one text's
+size; `oracle.sh` prints each row's wall time.
+
 ## Decoded audio (EmbeddingGemma 2)
 
 The embeddings endpoints accept `input_audio` parts containing decoded mono PCM
@@ -84,6 +90,16 @@ path, SHA256 and prompt count. Collect the CPU twin with `--cpu`,
 `CUDA_VISIBLE_DEVICES=''`, `-ngl 0` and `--no-mmproj-offload`.
 Store the sets as `ref_gemma_embedding2_audio_server` and
 `ref_gemma_embedding2_audio_server.cpu` under `BLOOMERY_DATA`.
+
+The stored set's inputs are two synthetic PCM files of the E9 mel set (`just dump-ref-emb2-mel`),
+`ref_gemma_embedding2_mel/sine_pcm.0.f32` and `ref_gemma_embedding2_mel/silence_pcm.0.f32` under `BLOOMERY_DATA`, passed as
+`--audio sine=PATH` and `--audio silence=PATH`. As `dump_mel.cpp` generates them, `sine` is 16,000 samples (1 s) of
+`0.4 * sin(2 pi 440 i / 16000)` plus uniform noise in [-0.25, 0.25) from a 32-bit LCG (`rng = 1664525 * rng + 1013904223`,
+seed 12345), and `silence` is 32,000 zero samples (2 s). The server runs with `-m MODEL --embeddings --pooling mean -c 8192
+-b 8192 -ub 8192 -np 1 -ngl 99 --host 127.0.0.1 --port P --no-webui --mmproj MMPROJ` (the CPU twin adds `-ngl 0
+--no-mmproj-offload`, empties `CUDA_VISIBLE_DEVICES` and passes `--cpu` to `server_vectors.py`), with
+`--ids-dir $BLOOMERY_DATA/ref-tokenizer-gemma4`, `--build-record` the dumper's `.build` file, and `BLOOMERY_REF_BUILD` the
+pin's first nine digits.
 
 With both sets and their PCM files present:
 
