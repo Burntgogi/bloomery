@@ -112,7 +112,7 @@ fn read<T: Copy>(context: &Context, ptr: *mut c_void, values: &mut [T]) -> Resul
     }
 }
 
-fn wave_size(context: &mut Context) -> Result<(), String> {
+pub(super) fn wave_size(context: &mut Context) -> Result<(), String> {
     let mut word = [0u32];
     let mut ptr = upload(context, &word)?;
     let f = context.function("bloomery_hip_wave_size")?;

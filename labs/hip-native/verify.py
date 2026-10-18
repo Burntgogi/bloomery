@@ -9,6 +9,7 @@ import math
 import os
 from pathlib import Path
 import platform
+import struct
 import subprocess
 import sys
 
@@ -57,6 +58,38 @@ def card():
     return result
 
 
+def forward_evidence(directory):
+    """Check the actual full-logit files, independently of the writer's success flags."""
+    data = json.loads((directory / "forward.json").read_text())
+    prompt, greedy = data["prompt_ids"], data["greedy_ids"]
+    consumed, predictions = data["consumed_ids"], data["predictions"]
+    expected = prompt + greedy[:-1] if greedy else prompt
+    rows, vocab = len(consumed), data["model"]["vocab"]
+    if not prompt or consumed != expected or len(predictions) != rows or len(data["logit_sha256"]) != rows:
+        raise RuntimeError("forward prompt/continuation row contract differs")
+    if greedy and predictions[len(prompt) - 1:] != greedy:
+        raise RuntimeError("forward greedy ids differ from their GPU predictions")
+    if data["model"]["gdn_layers"] < 1 or data["model"]["gqa_layers"] < 1:
+        raise RuntimeError("bounded hybrid proof did not exercise both mixer kinds")
+    model = directory / "smoke.gguf"
+    if digest(model) != data["model"]["files"][0]["sha256"]:
+        raise RuntimeError("bounded hybrid model changed after execution")
+    for repeat in range(2):
+        for row in range(rows):
+            path = directory / f"run-{repeat}" / f"logits-{row:04}.f32"
+            raw = path.read_bytes()
+            if len(raw) != vocab * 4 or hashlib.sha256(raw).hexdigest() != data["logit_sha256"][row]:
+                raise RuntimeError("forward logit length, digest, or reset/repeat bits differ")
+            values = [value for (value,) in struct.iter_unpack("<f", raw)]
+            if not all(math.isfinite(value) for value in values):
+                raise RuntimeError("forward observed a nonfinite logit")
+            if max(range(vocab), key=values.__getitem__) != predictions[row]:
+                raise RuntimeError("forward GPU argmax differs from the complete finite logit row")
+    return {"model": data["model"], "rows_per_repeat": rows, "greedy_ids": greedy,
+            "all_logit_files_finite": True, "reset_repeat_bitwise_equal": True,
+            "independent_argmax_equal": True, "same_file_real_model_llama_HIP": False}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("output", type=Path, help="new evidence directory outside the Git checkout")
@@ -72,7 +105,7 @@ def main():
     if output.is_relative_to(ROOT):
         parser.error("evidence must be outside the source checkout")
     output.mkdir(parents=True, exist_ok=False)
-    result = {"schema": 2, "status": "fail", "checks": [], "cases": [],
+    result = {"schema": 3, "status": "fail", "checks": [], "cases": [],
               "started_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
               "host": {"platform": platform.platform(), "cpu": platform.processor()}}
 
@@ -174,6 +207,11 @@ def main():
             case["status"] = "pass"
         result["acceptance"] = {"nmse_max": 1e-6, "finite_outputs": True,
                                 "selected_q4": "bitwise finite, NaN propagation, exact sticky fault and sentinel"}
+        run("forward-gpu", [str(binaries[0]), "--forward-probe", str(binaries[1]),
+                            str(output / "forward")])
+        result["forward"] = forward_evidence(output / "forward")
+        result["acceptance"]["bounded_hybrid_forward"] = "full-logit finite/argmax/reset checked"
+        result["acceptance"]["same_file_real_model_llama_HIP"] = False
         clean()
         if git("rev-parse", "HEAD") != head:
             raise RuntimeError("source HEAD moved during verification")
