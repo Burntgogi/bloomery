@@ -60,7 +60,7 @@ After building the reference below, this writer/input smoke uses existing
 ```sh
 target/release/dense_logits_ref --validate-inputs --model /unused/model.gguf \
   --prompt-file /absolute/path/prompt.ids --forced-file /absolute/path/forced.ids \
-  --out /unused/logits.f32 --ctx 4352 --prefill step
+  --out /unused/logits.f32 --ctx 4352 --prefill step --backend cpu --gpu-layers 0
 ```
 
 For an optional CPU writer smoke with the exact 0.8B file below, use a newly
@@ -78,6 +78,31 @@ python3 tools/ref/dense-logits.py run --kind reference --backend cpu \
 Retain malformed-input/nonfinite/provenance failure output alongside successful
 smokes. Neither these commands nor a reference CPU dump establish dense A6000
 logits, eager/graph equality, HTTP/native parity or full-model correctness.
+
+## Observed HIP lab comparison
+
+The reference writer also accepts `--backend hip` from a recorded `GGML_HIP=ON`
+shared-library build. It selects a visible `ROCm` registry device and observes actual
+graph-compute buffers through ggml's evaluation callback. Every trunk FFN and the output
+head must execute on that device; unexpected CPU or other-device math is refused.
+The normal CPU token-embedding gather is counted separately and is not advertised as
+device computation.
+
+HIP captures retain the production `FIT_RESERVE` and check selected-device free memory
+before and after model/context/decode stages. The default HIP tensor-payload limit is
+16 MiB. These admission checks are not an OS-enforced allocation cap or a measured peak;
+driver allocations, fragmentation and unmodeled workspace remain explicit exclusions.
+
+`--reset-repeats 2` clears llama.cpp's context memory in process, writes a second raw
+artifact, and requires finite, bit-identical repeat rows before publishing a complete
+bundle. Existing CPU/CUDA captures keep their explicit backend and single-repeat default.
+
+The frozen `hip-lab-hybrid` target is the small synthetic GDN/GQA GGUF, not the real 0.8B
+candidate. The [excluded HIP lab workflow](../../labs/hip-native/README.md#same-small-gguf-hip-comparison)
+derives its reference greedy continuation independently, compares native greedy and
+reference-forced rows, and retains full-logit diagnostics without inventing an accuracy
+band. It does not grant real-model HIP acceptance, NVIDIA serving evidence, or a backend
+integration claim.
 
 ## Model and row contract
 

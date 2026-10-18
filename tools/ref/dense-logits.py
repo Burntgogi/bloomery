@@ -2,12 +2,13 @@
 """Build/run immutable dense-Qwen forced-logit sets; compare them without an invented accuracy band.
 
 A set is a node-dump `MANIFEST.tsv` (tools/bloomery/manifest.py here, crates/refset there) with the
-rows in `logits.0.f32` and the ids it was fed. A `--kind reference` run is the one writer of the
+rows in `logits.0.f32` and the ids it was fed. A CUDA `--kind reference` run is the one writer of the
 refset family `logits-qwen38d` (crates/refset/src/arch/qwen35/dense.rs; `just dump-logits-qwen38d`
 drives it through tools/ref/dense-logits.sh): its `# model`, `# build` and `# arch` lines are what the
-family checks. A `--kind native` run is a comparison capture and is no family's set. `compare --bitwise`
-checks native eager/graph equality only; `floor` prints the oracle's own spread (mainline CUDA against
-its CPU twin) and the top-2 margins the gates' bands are derived from. `--self-test` checks the
+family checks. HIP reference runs are lab diagnostics with full build hashes, not that family's sets.
+A `--kind native` run is a comparison capture and is no family's set. `compare --bitwise` checks native
+eager/graph equality only; `floor` prints the oracle's own spread (mainline CUDA against its CPU twin)
+and the top-2 margins the gates' bands are derived from. `--self-test` checks the
 malformed/incomplete inputs and the comparison contracts without a GPU.
 """
 import argparse
@@ -51,6 +52,14 @@ TARGETS = {
         "repository": "notschmee/Qwen3.5-0.8B-GGUF",
         "revision": "1870603ac8ab59c7ddb9d94cccf3b297e379538f",
         "file": "Qwen3.5-0.8B-Q4_K_M.gguf",
+    },
+    "hip-lab-hybrid": {
+        "vocab": 258,
+        "size": 685984,
+        "sha256": "420f680e27e9ec75c7c29d39298574f7fd2aff8808e9b2566f3915664016ed06",
+        "repository": "midagedev/bloomery",
+        "revision": "03372d339f99996ec5103484f6e917412191d661",
+        "file": "smoke.gguf",
     },
 }
 
@@ -209,6 +218,8 @@ def check_build(binary, backend):
             raise ValueError(f"reference shared library moved: {path}")
     if backend == "cuda" and not data["cuda_build"]:
         raise ValueError("CUDA diagnostic requested from a build without GGML_CUDA")
+    if backend == "hip" and not data.get("hip_build"):
+        raise ValueError("HIP diagnostic requested from a build without GGML_HIP")
     return data
 
 
@@ -375,12 +386,74 @@ def corpus_slice(path, sha256, count, vocab):
     raise ValueError(f"{path}: holds {len(ids)} ids, {count} wanted")
 
 
+def fit_reserve(source=None):
+    """Read the production owner; unsupported expressions are a refusal, not a new default."""
+    text = (ROOT / "crates/gpu/src/model/fit.rs").read_text() if source is None else source
+    declarations = re.findall(r"^pub const FIT_RESERVE:\s*usize\s*=\s*(.+);$", text, re.MULTILINE)
+    if len(declarations) != 1:
+        raise ValueError("requires exactly one production FIT_RESERVE declaration")
+    match = re.fullmatch(r"([1-9][0-9]*)\s*<<\s*([0-9]+)", declarations[0])
+    if not match or int(match[2]) > 30:
+        raise ValueError("unsupported production FIT_RESERVE expression")
+    value = int(match[1]) << int(match[2])
+    if value > 2147483647:
+        raise ValueError("production FIT_RESERVE exceeds reference byte argument range")
+    return value
+
+
+def verify_repeat(folder, meta, rows, vocab):
+    repeats = meta.get("reset_repeats", "1")
+    if repeats not in ("1", "2"):
+        raise ValueError("unsupported reset repeat count")
+    if repeats == "1":
+        return {}
+    name = meta.get("repeat_file", "")
+    if name != "logits.0.f32.repeat-1.f32" or meta.get("reset_repeat_bitwise_equal") != "true":
+        raise ValueError("missing or unsafe reset-repeat artifact metadata")
+    repeat = Path(folder) / name
+    raw_rows(repeat, rows, vocab)
+    sha = digest(repeat)
+    if sha != digest(Path(folder) / "logits.0.f32"):
+        raise ValueError("reset-repeat raw artifact differs bitwise")
+    return {"repeat_file": name, "reset_repeat_bitwise_equal": "true", "repeat_sha256": sha}
+
+
+def hip_metadata(meta, reserve, maximum):
+    required = ("hip_device", "hip_description", "hip_trunk_layers", "hip_model_layers",
+                "hip_output", "hip_math_nodes", "hip_cpu_math_nodes", "hip_reserve_bytes",
+                "hip_cpu_input_nodes",
+                "hip_max_model_bytes", "model_tensor_bytes", "hip_free_before_model",
+                "hip_free_after_load", "hip_free_after_context", "hip_free_after_run",
+                "hip_context_allowance_bytes", "hip_registry", "hip_memory_guard",
+                "hip_estimate_exclusions")
+    if any(not meta.get(key) for key in required) or meta.get("backend") != "hip":
+        raise ValueError("missing HIP execution evidence")
+    if (meta["hip_registry"] != "ROCm" or meta["hip_output"] != "true" or
+            int(meta["hip_trunk_layers"]) != int(meta["hip_model_layers"]) or
+            int(meta["hip_model_layers"]) <= 0 or int(meta["hip_math_nodes"]) <= 0 or
+            int(meta["hip_cpu_math_nodes"]) < 0 or int(meta["hip_reserve_bytes"]) != reserve or
+            int(meta["hip_cpu_input_nodes"]) != int(meta["hip_cpu_math_nodes"]) or
+            int(meta["hip_max_model_bytes"]) != maximum or
+            not 0 < int(meta["model_tensor_bytes"]) <= maximum):
+        raise ValueError("HIP placement or admission evidence disagrees with request")
+    allowance = int(meta["hip_context_allowance_bytes"])
+    if allowance <= 0 or any(int(meta[key]) < minimum for key, minimum in (
+            ("hip_free_before_model", reserve + allowance + int(meta["model_tensor_bytes"])),
+            ("hip_free_after_load", reserve + allowance),
+            ("hip_free_after_context", reserve), ("hip_free_after_run", reserve))):
+        raise ValueError("HIP memory evidence does not retain production reserve")
+    return {key: meta[key] for key in required}
+
+
 def finish_bundle(stage, identity, meta):
     """Write the set's MANIFEST.tsv last: the node dumps' header (`# model`, `# build`, `# arch` are what a family
     checks), the one tensor row, and the `# complete` trailer."""
     raw = stage / "logits.0.f32"
     n, vocab = int(meta["rows"]), int(meta["vocab"])
     values = raw_rows(raw, n, vocab)
+    identity.update(verify_repeat(stage, meta, n, vocab))
+    if "reset_repeats" in meta:
+        identity["reset_repeats"] = meta["reset_repeats"]
     identity.update({"rows": str(n), "vocab": str(vocab), "raw_sha256": digest(raw),
                      "mode": meta["mode"], "schedule": meta["prefill"], "last_step": "true"})
     title = {"reference": "# dense_logits_ref - llama.cpp mainline logits after the prompt and after each forced id",
@@ -419,7 +492,15 @@ def run(args):
         raise ValueError("context does not hold prompt plus continuation, or more than 4096 rows")
     if args.ctx < 1 or args.ubatch < 1:
         raise ValueError("context and ubatch must be positive")
+    if not 0 < args.hip_max_model_bytes <= 2147483647:
+        raise ValueError("hip-max-model-bytes must be positive and fit the reference byte argument range")
+    if args.reset_repeats not in (1, 2):
+        raise ValueError("reset-repeats is 1 or 2")
+    if native and args.reset_repeats != 1:
+        raise ValueError("reset-repeats is supported by the reference writer only")
     model_stat = immutable_model(model, target)
+    reserve = fit_reserve() if args.backend == "hip" else None
+    reserve_source_sha = digest(ROOT / "crates/gpu/src/model/fit.rs") if reserve is not None else None
     stage = Path(str(output) + ".staging")
     if output.exists() or stage.exists():
         raise ValueError("output or staging directory already exists; use a new output directory")
@@ -459,7 +540,11 @@ def run(args):
         argv = [str(binary), "--model", str(model), "--prompt-file", str(stage / "prompt.ids"),
                 "--forced-file", str(stage / "forced.ids"), "--out", str(raw),
                 "--ctx", str(args.ctx), "--ubatch", str(args.ubatch), "--prefill", args.prefill,
-                "--gpu-layers", "99" if args.backend == "cuda" else "0"]
+                "--backend", args.backend, "--reset-repeats", str(args.reset_repeats),
+                "--gpu-layers", "0" if args.backend == "cpu" else "99"]
+        if args.backend == "hip":
+            argv += ["--hip-max-model-bytes", str(args.hip_max_model_bytes),
+                     "--hip-reserve-bytes", str(reserve)]
         env["BLOOMERY_REF_WRITE"] = "1"
         (stage / "resolved-libraries.log").write_text(library_environment(binary, build_info, env) + "\n")
     else:
@@ -470,7 +555,7 @@ def run(args):
         env["BLOOMERY_GEN_SLOTS"] = "1"
     if args.backend == "cuda":
         argv = ["bash", str(ROOT / "tools/gpu-gate.sh"), binary.name, *argv[1:]]
-    else:
+    elif args.backend == "cpu":
         env["CUDA_VISIBLE_DEVICES"] = ""
         env["HIP_VISIBLE_DEVICES"] = ""
         env["ROCR_VISIBLE_DEVICES"] = ""
@@ -481,6 +566,8 @@ def run(args):
                "model_stat": model_stat,
                "effective_environment": {key: value for key, value in env.items() if key.startswith("BLOOMERY_")},
                "CUDA_VISIBLE_DEVICES_before_gate": env.get("CUDA_VISIBLE_DEVICES"),
+               "HIP_VISIBLE_DEVICES": env.get("HIP_VISIBLE_DEVICES"),
+               "ROCR_VISIBLE_DEVICES": env.get("ROCR_VISIBLE_DEVICES"),
                "BLOOMERY_GATE_CARD": env.get("BLOOMERY_GATE_CARD")})
     bound = args.bound or (2800 if args.backend == "cuda" else 900)
     try:
@@ -499,6 +586,9 @@ def run(args):
         raise ValueError("writer returned different prompt or forced ids")
     if int(meta["rows"]) != len(forced) or int(meta["vocab"]) != target["vocab"]:
         raise ValueError("writer returned wrong row count or vocabulary")
+    if args.kind == "reference" and (meta.get("backend") != args.backend or
+                                    meta.get("reset_repeats") != str(args.reset_repeats)):
+        raise ValueError("writer returned a different backend or reset schedule")
     model_unchanged(model, model_stat)
     if (native and git(ROOT, "rev-parse", "HEAD") != source_head) or digest(binary) != binary_sha or digest(__file__) != driver_sha:
         raise ValueError("source or binary changed during diagnostic")
@@ -509,8 +599,10 @@ def run(args):
     else:
         check_build(binary, args.backend)
     identity = {"format": MANIFEST_FORMAT, "model": str(model),
-                # The family pins mainline's commit as the nine digits the qwen35 sets all name.
-                "build": source_head if native else build_info["llama_commit"][:9],
+                # Canonical CPU/CUDA sets retain the family's nine-digit build identity.
+                # HIP lab diagnostics keep the full hash and cannot impersonate that family.
+                "build": (source_head if native else build_info["llama_commit"] if args.backend == "hip"
+                          else build_info["llama_commit"][:9]),
                 "arch": "qwen35", "model_sha256": target["sha256"], "model_revision": target["revision"],
                 "target": args.target, "engine": args.kind, "backend": args.backend,
                 "binary_sha256": binary_sha, "driver_sha256": driver_sha,
@@ -518,6 +610,11 @@ def run(args):
                 "ctx": str(args.ctx), "ubatch": str(args.ubatch), "kv": "f16", **corpus}
     if native:
         identity.update({"source_head": source_head, "source_dirty": str(source_dirty).lower()})
+    if args.backend == "hip":
+        identity.update(hip_metadata(meta, reserve, args.hip_max_model_bytes))
+        if fit_reserve() != reserve or digest(ROOT / "crates/gpu/src/model/fit.rs") != reserve_source_sha:
+            raise ValueError("production FIT_RESERVE source changed during capture")
+        identity["hip_fit_reserve_source_sha256"] = reserve_source_sha
     finish_bundle(stage, identity, meta)
     # mkdir is exclusive, unlike rename which can replace a concurrently created empty dir.
     # The existing manifest completion marker is published after all of its files.
@@ -560,6 +657,9 @@ def bundle(path):
     values = raw_rows(path / "logits.0.f32", n, vocab)
     if repr(math.fsum(values)) != rows[0]["sum"]:
         raise ValueError(f"{path}: the tensor row's sum differs from the rows")
+    repeat = verify_repeat(path, m.header, n, vocab)
+    if repeat and repeat["repeat_sha256"] != m.header.get("repeat_sha256"):
+        raise ValueError("repeat artifact differs from manifest identity")
     return m.header, values
 
 
@@ -721,6 +821,71 @@ def self_test():
                 pass
         ids_file.write_text("1\n2\n")
         assert token_ids(ids_file) == [1, 2]
+        ids_file.write_text("258\n")
+        try:
+            token_ids(ids_file, TARGETS["hip-lab-hybrid"]["vocab"])
+            raise AssertionError("accepted out-of-vocabulary small-model input")
+        except ValueError:
+            pass
+        repeat_folder = root / "repeat"
+        repeat_folder.mkdir()
+        raw = repeat_folder / "logits.0.f32"
+        repeat = repeat_folder / "logits.0.f32.repeat-1.f32"
+        finite = array.array("f", [1.0, -2.0])
+        if sys.byteorder != "little":
+            finite.byteswap()
+        raw.write_bytes(finite.tobytes())
+        repeat.write_bytes(finite.tobytes())
+        repeat_meta = {"reset_repeats": "2", "reset_repeat_bitwise_equal": "true",
+                       "repeat_file": repeat.name}
+        evidence = verify_repeat(repeat_folder, repeat_meta, 1, 2)
+        assert evidence["repeat_sha256"] == digest(raw)
+        for bad in ({**repeat_meta, "repeat_file": "../logits.0.f32"},
+                    {**repeat_meta, "reset_repeat_bitwise_equal": "false"},
+                    {**repeat_meta, "reset_repeats": "3"}):
+            try:
+                verify_repeat(repeat_folder, bad, 1, 2)
+                raise AssertionError("accepted unsafe/incomplete repeat evidence")
+            except ValueError:
+                pass
+        for bad_bytes in (finite.tobytes()[:-1], b"\0" * 8,
+                          bytes.fromhex("0000c07f00000000")):
+            repeat.write_bytes(bad_bytes)
+            try:
+                verify_repeat(repeat_folder, repeat_meta, 1, 2)
+                raise AssertionError("accepted truncated, unequal, or nonfinite reset repeat")
+            except ValueError:
+                pass
+        assert fit_reserve("pub const FIT_RESERVE: usize = 256 << 20;") == 268435456
+        for bad in ("", "pub const FIT_RESERVE: usize = 1 + 2;",
+                    "pub const FIT_RESERVE: usize = 1 << 63;",
+                    "pub const FIT_RESERVE: usize = 1 << 20;\n" * 2):
+            try:
+                fit_reserve(bad)
+                raise AssertionError("accepted unsupported/ambiguous reserve source")
+            except ValueError:
+                pass
+        hip = {"backend": "hip", "hip_device": "ROCm0", "hip_description": "selected GPU",
+               "hip_registry": "ROCm", "hip_output": "true", "hip_trunk_layers": "2",
+               "hip_model_layers": "2", "hip_math_nodes": "3", "hip_cpu_math_nodes": "1",
+               "hip_cpu_input_nodes": "1",
+               "hip_reserve_bytes": "256", "hip_max_model_bytes": "16", "model_tensor_bytes": "8",
+               "hip_context_allowance_bytes": "32", "hip_memory_guard": "stage_preflight_not_allocation_cap",
+               "hip_estimate_exclusions": "driver", "hip_free_before_model": "296",
+               "hip_free_after_load": "288", "hip_free_after_context": "256", "hip_free_after_run": "256"}
+        assert hip_metadata(hip, 256, 16)["hip_cpu_math_nodes"] == "1"
+        for key, value in (("backend", "cpu"), ("hip_registry", "CUDA"), ("hip_output", "false"),
+                           ("hip_trunk_layers", "1"), ("hip_math_nodes", "0"),
+                           ("hip_cpu_math_nodes", "-1"), ("model_tensor_bytes", "17"),
+                           ("hip_cpu_input_nodes", "0"),
+                           ("hip_reserve_bytes", "255"), ("hip_free_before_model", "295"),
+                           ("hip_free_after_load", "287"), ("hip_free_after_context", "255"),
+                           ("hip_free_after_run", "255")):
+            try:
+                hip_metadata({**hip, key: value}, 256, 16)
+                raise AssertionError("accepted incomplete placement or unsafe HIP memory evidence")
+            except ValueError:
+                pass
         for name, mode in (("a", "eager"), ("b", "graph")):
             folder = root / name
             folder.mkdir()
@@ -836,7 +1001,8 @@ def self_test():
         def asked(**changes):
             call = dict(target="_selftest", kind="reference", model=root / "model", binary=root / "none", out=root / "out",
                         corpus=None, prompt=None, forced=None, prompt_count=None, forced_count=None, corpus_sha256=None,
-                        ctx=8, ubatch=8, backend="cpu", prefill="batch", mode="graph", bound=None)
+                        ctx=8, ubatch=8, backend="cpu", prefill="batch", mode="graph", bound=None,
+                        hip_max_model_bytes=16 * 1024 * 1024, reset_repeats=1)
             call.update(changes)
             run(argparse.Namespace(**call))
 
@@ -916,7 +1082,7 @@ def self_test():
             assert "floor takes a reference CUDA set" in str(error), error
     del TARGETS["_selftest"]
     print("dense-logits self-test: malformed ids, provenance, the set's family-shaped manifest, corpus slices, run and build refusals, "
-          "incomplete/truncated/NaN rows, eager/graph, the oracle floor and owned-session cleanup contracts passed")
+          "incomplete/truncated/NaN rows, HIP placement and reserve, reset repeats, eager/graph, the oracle floor and owned-session cleanup contracts passed")
     return 0
 
 
@@ -938,7 +1104,7 @@ def main():
     nb.add_argument("--arch", default="sm_86")
     r = sub.add_parser("run")
     r.add_argument("--kind", choices=("reference", "native"), required=True)
-    r.add_argument("--backend", choices=("cuda", "cpu"), default="cuda")
+    r.add_argument("--backend", choices=("cuda", "cpu", "hip"), default="cuda")
     r.add_argument("--target", choices=TARGETS, default="qwen38-27b")
     for key in ("model", "binary", "out"):
         r.add_argument("--" + key, type=Path, required=True)
@@ -952,6 +1118,8 @@ def main():
     r.add_argument("--mode", choices=("eager", "graph"), default="graph")
     r.add_argument("--ctx", type=int, default=4352)
     r.add_argument("--ubatch", type=int, default=512)
+    r.add_argument("--hip-max-model-bytes", type=int, default=16 * 1024 * 1024)
+    r.add_argument("--reset-repeats", type=int, choices=(1, 2), default=1)
     c = sub.add_parser("compare")
     c.add_argument("left", type=Path)
     c.add_argument("right", type=Path)
