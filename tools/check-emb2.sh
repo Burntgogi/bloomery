@@ -45,7 +45,7 @@ class Writer(unittest.TestCase):
                 self.skipTest(f"{name} is required for the Linux writer fixtures")
         self.root = Path(tempfile.mkdtemp(prefix="bloomery-emb2-")).resolve()
         self.addCleanup(shutil.rmtree, self.root)
-        for name in ("tools/ref/emb2/emb2.sh", "tools/gate-bound.sh",
+        for name in ("tools/ref/emb2/emb2.sh", "tools/ref/emb2/oracle-tree.sh", "tools/gate-bound.sh",
                      "tools/ref/emb2/dump_emb2.cpp", "tools/ref/clefvis/set_writer.h"):
             dest = self.root / name
             dest.parent.mkdir(parents=True, exist_ok=True)
@@ -229,74 +229,114 @@ printf '%s:end\\n' "$FIXTURE_TAG" >> "$FIXTURE_EVENTS"
 
 
 class Builders(unittest.TestCase):
-    def test_audio_builds_clean_libraries_and_checks_the_mel_family(self):
-        if sys.platform != "linux" or not shutil.which("sha256sum"):
-            self.skipTest("audio builder fixture requires Linux and sha256sum")
-        for failure in ("", "mel", "configure", "build", "compile", "gpu", "cpu", "check-gpu", "check-cpu", "shape", "size"):
+    PIN = "a" * 40
+    STAGES = ["build", "mel", "compile", "gpu", "cpu", "check-gpu", "check-cpu"]
+
+    def audio_root(self, tmp, failure, server_commit):
+        """A tree holding audio.sh, its oracle tree (stub binaries and libraries) and every stub the script calls."""
+        root = Path(tmp).resolve()
+        for name in ("tools/ref/emb2/audio.sh", "tools/ref/emb2/oracle-tree.sh", "tools/host-gate.sh", "tools/gate-bound.sh"):
+            write(root / name, (ROOT / name).read_text())
+        shutil.copytree(ROOT / "tools/bloomery", root / "tools/bloomery")
+        from bloomery.manifest import dump_file_name
+        mel_dir = root / "data/ref_gemma_embedding2_mel"
+        rows = []
+        for case in ("minimum/0", "sine/0", "silence/0", "before-30s/0", "after-30s/0", "after-30s/1"):
+            name = case + "/mel"
+            write(mel_dir / dump_file_name(name, 0, "output", "contig", "f32"), "\0" * (511 if failure == "size" else 512))
+            rows.append(f"tensor\t{name}\t0\tf32\t1\t{127 if failure == 'shape' else 128}\t1\t1\t512\t0\tNONE\t1\t0\t-\t-")
+        write(mel_dir / "MANIFEST.tsv", "# kind\tname\toccurrence\ttype\tne0\tne1\tne2\tne3\tbytes\tsum\top\tcontig\tlogical\tsrc0\tsrc1\n" + "\n".join(rows) + "\n# complete\t6\t0\n")
+        projector = root / "projector.gguf"
+        projector.write_bytes(b"audio fixture")
+        write(root / "tools/ref/models/gemma-embedding2.sh",
+              f'LCPP={shlex.quote(str(root / "oracle"))}\nLCPP_PIN={self.PIN}\n'
+              f'MMPROJ={shlex.quote(str(projector))}\n'
+              f'MMPROJ_SHA256={hashlib.sha256(projector.read_bytes()).hexdigest()}\n')
+        bin_dir = root / "oracle/build/bin"
+        write(bin_dir / "llama-server", f"#!/bin/bash\necho 'version: 0.6.0-dev (build 1, commit {server_commit})'\n", True)
+        for lib in ("libmtmd.so", "libllama.so", "libggml.so", "libggml-base.so"):
+            write(bin_dir / lib, "")
+        write(root / "bin/git", '#!/bin/bash\ncase " $* " in\n'
+              '  *" rev-parse HEAD "*) echo "${FIXTURE_HEAD:-' + self.PIN + '}" ;;\n'
+              '  *" status "*) exit 0 ;;\n  *) exit 91 ;;\nesac\n', True)
+        # The script builds refset-check with cargo, then runs it through tools/host-gate.sh; the stub binary is what that build leaves.
+        write(root / "bin/cargo", '#!/bin/bash\n'
+              '[ "$*" = "build --release -p bloomery-refset --bin refset-check" ] || exit 91\n'
+              'printf "build\\n" >> "$FIXTURE_EVENTS"\n'
+              '[ "$FIXTURE_FAIL" != build ] || exit 42\n'
+              'mkdir -p target/release && cp "$FIXTURE_ROOT/bin/refset-check" target/release/refset-check\n', True)
+        write(root / "bin/refset-check", '#!/bin/bash\n'
+              'case "$1" in\n'
+              '  mel-gemma4a) stage=mel ;;\n'
+              '  tower-gemma4a) stage=check-gpu ;;\n'
+              '  tower-gemma4a-cpu) stage=check-cpu ;;\n'
+              '  *) exit 91 ;;\nesac\n'
+              'printf "%s\\n" "$stage" >> "$FIXTURE_EVENTS"\n'
+              '[ "$FIXTURE_FAIL" != "$stage" ] || exit 42\n', True)
+        # No build step may touch the oracle tree: a call of cmake, make or ninja is an event the expected list lacks.
+        for tool in ("cmake", "make", "ninja"):
+            write(root / "bin" / tool, f'#!/bin/bash\nprintf "{tool}\\n" >> "$FIXTURE_EVENTS"\nexit 91\n', True)
+        write(root / "bin/dump-audio", '#!/bin/bash\n'
+              'printf "%s\\n" "$3" >> "$FIXTURE_EVENTS"\n'
+              '[ "$FIXTURE_FAIL" != "$3" ] || exit 42\n'
+              '[ ! -e "$2" ] || exit 91\nmkdir "$2"\nprintf "complete\\n" > "$2/MANIFEST.tsv"\n', True)
+        write(root / "bin/c++", '#!/bin/bash\n'
+              'printf "compile\\n" >> "$FIXTURE_EVENTS"\n'
+              '[ "$FIXTURE_FAIL" != compile ] || exit 42\n'
+              'cp "$FIXTURE_ROOT/bin/dump-audio" target/dump_audio\n', True)
+        return root
+
+    def run_audio(self, root, failure, **extra):
+        env = dict(os.environ, PATH=str(root / "bin") + os.pathsep + os.environ["PATH"],
+                   BLOOMERY_DATA=str(root / "data"), CXX="c++", FIXTURE_ROOT=str(root),
+                   FIXTURE_EVENTS=str(root / "events"), FIXTURE_FAIL=failure, **extra)
+        result = subprocess.run(["bash", str(root / "tools/ref/emb2/audio.sh")], env=env, capture_output=True,
+                                text=True, timeout=10)
+        events = (root / "events").read_text().splitlines() if (root / "events").exists() else []
+        return result.returncode, result.stdout + result.stderr, events
+
+    def test_audio_reuses_the_oracle_tree_and_checks_the_mel_family(self):
+        if sys.platform != "linux" or not shutil.which("sha256sum") or not shutil.which("timeout"):
+            self.skipTest("audio builder fixture requires Linux, sha256sum and timeout")
+        for failure in ("", "mel", "build", "compile", "gpu", "cpu", "check-gpu", "check-cpu", "shape", "size"):
             with self.subTest(failure=failure), tempfile.TemporaryDirectory(prefix="audio-build-") as tmp:
-                root = Path(tmp).resolve()
-                script = root / "tools/ref/emb2/audio.sh"
-                script.parent.mkdir(parents=True)
-                shutil.copyfile(ROOT / "tools/ref/emb2/audio.sh", script)
-                shutil.copytree(ROOT / "tools/bloomery", root / "tools/bloomery")
-                from bloomery.manifest import dump_file_name
-                mel_dir = root / "data/ref_gemma_embedding2_mel"
-                rows = []
-                for case in ("minimum/0", "sine/0", "silence/0", "before-30s/0", "after-30s/0", "after-30s/1"):
-                    name = case + "/mel"
-                    write(mel_dir / dump_file_name(name, 0, "output", "contig", "f32"), "\0" * (511 if failure == "size" else 512))
-                    rows.append(f"tensor\t{name}\t0\tf32\t1\t{127 if failure == 'shape' else 128}\t1\t1\t512\t0\tNONE\t1\t0\t-\t-")
-                write(mel_dir / "MANIFEST.tsv", "# kind\tname\toccurrence\ttype\tne0\tne1\tne2\tne3\tbytes\tsum\top\tcontig\tlogical\tsrc0\tsrc1\n" + "\n".join(rows) + "\n# complete\t6\t0\n")
-                projector = root / "projector.gguf"
-                projector.write_bytes(b"audio fixture")
-                pin = "a" * 40
-                write(root / "tools/ref/models/gemma-embedding2.sh",
-                      f'LCPP={shlex.quote(str(root / "oracle"))}\nLCPP_PIN={pin}\n'
-                      f'MMPROJ={shlex.quote(str(projector))}\n'
-                      f'MMPROJ_SHA256={hashlib.sha256(projector.read_bytes()).hexdigest()}\n')
-                write(root / "bin/git", '#!/bin/bash\ncase " $* " in\n'
-                      f'  *" rev-parse HEAD "*) echo {pin} ;;\n'
-                      '  *" status "*) exit 0 ;;\n  *) exit 91 ;;\nesac\n', True)
-                write(root / "bin/cargo", '#!/bin/bash\n'
-                      'case " $* " in\n'
-                      '  *" -- mel-gemma4a "*) stage=mel ;;\n'
-                      '  *" -- tower-gemma4a "*) stage=check-gpu ;;\n'
-                      '  *" -- tower-gemma4a-cpu "*) stage=check-cpu ;;\n'
-                      '  *) exit 91 ;;\nesac\n'
-                      'printf "%s\\n" "$stage" >> "$FIXTURE_EVENTS"\n'
-                      '[ "$FIXTURE_FAIL" != "$stage" ] || exit 42\n', True)
-                write(root / "bin/cmake", '#!/bin/bash\n'
-                      'case "$1" in\n'
-                      '  -S) stage=configure; [ "$*" = "-S $FIXTURE_ROOT/oracle -B $FIXTURE_ROOT/oracle/build" ] || exit 91 ;;\n'
-                      '  --build) stage=build; [ "$*" = "--build $FIXTURE_ROOT/oracle/build --clean-first --parallel 16" ] || exit 91 ;;\n'
-                      '  *) exit 91 ;;\nesac\n'
-                      'printf "%s\\n" "$stage" >> "$FIXTURE_EVENTS"\n'
-                      '[ "$FIXTURE_FAIL" != "$stage" ] || exit 42\n', True)
-                write(root / "bin/dump-audio", '#!/bin/bash\n'
-                      'printf "%s\\n" "$3" >> "$FIXTURE_EVENTS"\n'
-                      '[ "$FIXTURE_FAIL" != "$3" ] || exit 42\n'
-                      '[ ! -e "$2" ] || exit 91\nmkdir "$2"\nprintf "complete\\n" > "$2/MANIFEST.tsv"\n', True)
-                write(root / "bin/c++", '#!/bin/bash\n'
-                      'printf "compile\\n" >> "$FIXTURE_EVENTS"\n'
-                      '[ "$FIXTURE_FAIL" != compile ] || exit 42\n'
-                      'cp "$FIXTURE_ROOT/bin/dump-audio" target/dump_audio\n', True)
-                env = dict(os.environ, PATH=str(root / "bin") + os.pathsep + os.environ["PATH"],
-                           BLOOMERY_DATA=str(root / "data"), CXX="c++", FIXTURE_ROOT=str(root),
-                           FIXTURE_EVENTS=str(root / "events"), FIXTURE_FAIL=failure)
-                result = subprocess.run(["bash", str(script)], env=env, capture_output=True,
-                                        text=True, timeout=10)
-                events = (root / "events").read_text().splitlines()
-                output = result.stdout + result.stderr
-                self.assertEqual(result.returncode, (1 if failure in ("shape", "size") else 42) if failure else 0, output)
-                expected = ["mel", "configure", "build", "compile", "gpu", "cpu", "check-gpu", "check-cpu"]
+                root = self.audio_root(tmp, failure, self.PIN[:9])
+                rc, output, events = self.run_audio(root, failure)
+                self.assertEqual(rc, (1 if failure in ("shape", "size") else 42) if failure else 0, output)
+                expected = self.STAGES
                 if failure in ("shape", "size"):
-                    expected = expected[:4]
+                    expected = expected[:3]
                     self.assertIn("malformed mel row or file", output)
                 elif failure:
                     expected = expected[:expected.index(failure) + 1]
                 self.assertEqual(events, expected, output)
                 for suffix in ("", ".cpu"):
                     self.assertEqual((root / ("data/ref_gemma_embedding2_audio" + suffix)).exists(), not bool(failure))
+
+    def test_audio_refuses_an_oracle_that_is_missing_or_another_build_before_anything_runs(self):
+        if sys.platform != "linux" or not shutil.which("sha256sum") or not shutil.which("timeout"):
+            self.skipTest("audio builder fixture requires Linux, sha256sum and timeout")
+        refusals = {
+            "no-server": lambda root: f"audio: no {root}/oracle/build/bin/llama-server",
+            "rebuilt-without-git": lambda root: f"audio: {root}/oracle/build/bin/llama-server is not built at aaaaaaa: version: 0.6.0-dev (build 1, commit unknown)",
+            "no-library": lambda root: f"audio: no {root}/oracle/build/bin/libggml-base.so",
+            "other-commit": lambda root: f"audio: {root}/oracle is at {'b' * 40}, the profile pins {self.PIN}",
+        }
+        for name, message in refusals.items():
+            with self.subTest(refusal=name), tempfile.TemporaryDirectory(prefix="audio-oracle-") as tmp:
+                root = self.audio_root(tmp, "", "unknown" if name == "rebuilt-without-git" else self.PIN[:9])
+                extra = {}
+                if name == "no-server":
+                    (root / "oracle/build/bin/llama-server").unlink()
+                if name == "no-library":
+                    (root / "oracle/build/bin/libggml-base.so").unlink()
+                if name == "other-commit":
+                    extra["FIXTURE_HEAD"] = "b" * 40
+                rc, output, events = self.run_audio(root, "", **extra)
+                self.assertEqual(rc, 2, output)
+                self.assertIn(message(root), output)
+                self.assertEqual(events, [], output)
+                self.assertFalse((root / "data/ref_gemma_embedding2_audio").exists())
 
     def test_unreadable_index_stops_before_compilation(self):
         scripts = (

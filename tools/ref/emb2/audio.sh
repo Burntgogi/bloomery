@@ -1,21 +1,24 @@
 #!/usr/bin/env bash
-# Dump the pinned audio tower from the existing BF16 projector and E9 mel set.
+# Dump the pinned audio tower from the existing BF16 projector and E9 mel set, linked against the oracle tree that
+# `just build-emb2-lcpp` built. The tree belongs to `user`: this script reads it and never builds in it (a root rebuild there
+# left root-owned files and a llama-server that reports `build 0`, which tools/ref/emb2/server_vectors.py refuses).
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/../../.."
 source tools/ref/models/gemma-embedding2.sh
+source tools/ref/emb2/oracle-tree.sh
 DATA=${BLOOMERY_DATA:-/root/bloomery-data}
-head=$(git -c safe.directory="$LCPP" -C "$LCPP" rev-parse HEAD)
-[ "$head" = "$LCPP_PIN" ] || { echo "audio: llama.cpp is $head, want $LCPP_PIN" >&2; exit 2; }
-status=$(git -c safe.directory="$LCPP" -C "$LCPP" status --porcelain --untracked-files=no)
-[ -z "$status" ] || { echo "audio: llama.cpp has tracked changes" >&2; exit 2; }
+oracle_tree audio "$LCPP" "$LCPP_PIN"
+for lib in libmtmd.so libllama.so libggml.so libggml-base.so; do
+    [ -e "$LCPP/build/bin/$lib" ] || { echo "audio: no $LCPP/build/bin/$lib (just build-emb2-lcpp)" >&2; exit 2; }
+done
 printf '%s  %s\n' "$MMPROJ_SHA256" "$MMPROJ" | sha256sum -c -
 OUT=$DATA/ref_gemma_embedding2_audio
 for path in "$OUT" "$OUT.cpu"; do
     [ ! -e "$path" ] && [ ! -L "$path" ] || { echo "audio: $path exists; move it aside before dumping" >&2; exit 2; }
 done
-cargo run --release -p bloomery-refset --bin refset-check -- mel-gemma4a "$DATA/ref_gemma_embedding2_mel"
-cmake -S "$LCPP" -B "$LCPP/build"
-cmake --build "$LCPP/build" --clean-first --parallel 16
+cargo build --release -p bloomery-refset --bin refset-check
+refset_check() { bash tools/host-gate.sh refset-check "$@"; }
+refset_check mel-gemma4a "$DATA/ref_gemma_embedding2_mel"
 mkdir -p target "$DATA"
 CXX=${CXX:-c++}
 "$CXX" -std=c++17 -O2 -pthread -I"$LCPP/include" -I"$LCPP/ggml/include" -I"$LCPP/tools/mtmd" \
@@ -47,12 +50,12 @@ for device in gpu cpu; do
     LD_LIBRARY_PATH="$LCPP/build/bin${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
         BLOOMERY_REF_BUILD=${LCPP_PIN:0:9} target/dump_audio "$MMPROJ" "$scratch/$device" "$device" "${args[@]}"
 done
-cargo run --release -p bloomery-refset --bin refset-check -- tower-gemma4a "$scratch/gpu"
-cargo run --release -p bloomery-refset --bin refset-check -- tower-gemma4a-cpu "$scratch/cpu"
+refset_check tower-gemma4a "$scratch/gpu"
+refset_check tower-gemma4a-cpu "$scratch/cpu"
 for device in gpu cpu; do
     target=$OUT
     if [ "$device" = cpu ]; then target=$OUT.cpu; fi
     mv -Tn -- "$scratch/$device" "$target"
     [ ! -e "$scratch/$device" ] || { echo "audio: $target appeared while dumping; set not published" >&2; exit 2; }
 done
-echo "audio: published $OUT and CPU twin from $head"
+echo "audio: published $OUT and CPU twin from $LCPP_PIN"

@@ -58,6 +58,8 @@ selected() {
 }
 # shellcheck source=tools/gate-bound.sh
 source tools/gate-bound.sh
+# shellcheck source=tools/ref/emb2/oracle-tree.sh
+source tools/ref/emb2/oracle-tree.sh
 BLOOMERY_GATE_BOUND=${EMB2_BOUND-1500} gate_bound "emb2 (EMB2_BOUND)" || exit $?
 
 # Outside the runner, a call with a card step: the card steps in one call through the runner, then the twins, each a call of
@@ -106,20 +108,11 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 sha() { sha256sum "$1" | cut -d' ' -f1; }
-git_lcpp() { git -c safe.directory="$ORACLE" -C "$ORACLE" "$@"; }
 
 # The tree, its build and the files, before every step.
 verify() {
-  local have want
-  have=$(git_lcpp rev-parse HEAD) || die "$ORACLE is not a git tree"
-  [ "$have" = "$LCPP_PIN" ] || die "$ORACLE is at $have, the profile pins $LCPP_PIN"
-  have=$(git_lcpp status --porcelain --untracked-files=no) || die "cannot inspect tracked changes in $ORACLE"
-  [ -z "$have" ] || die "$ORACLE has tracked changes; the oracle is the commit's build"
-  have=$("$SERVER_BIN" --version 2>&1) || die "$SERVER_BIN --version failed: $have"
-  # The whole commit token, 7 hex digits or more, a prefix of the pin.
-  local re='commit ([0-9a-f]{7,40})([^0-9a-f]|$)'
-  [[ $have =~ $re ]] && [ "${LCPP_PIN:0:${#BASH_REMATCH[1]}}" = "${BASH_REMATCH[1]}" ] ||
-    die "$SERVER_BIN is not built at ${LCPP_PIN:0:7}: $have"
+  local want
+  oracle_tree emb2 "$ORACLE" "$LCPP_PIN" llama-server
   for want in "source_sha256 $(sha "$DUMPER")" "set_writer_sha256 $(sha tools/ref/clefvis/set_writer.h)" "lcpp_commit $BLOOMERY_REF_BUILD" "lcpp $(readlink -f "$ORACLE")"; do
     grep -Fqx "$want" "$BIN.build" 2> /dev/null || die "$BIN is not this tree's dump_emb2 at $BLOOMERY_REF_BUILD (no '$want' in $BIN.build; just build-emb2-ref)"
   done
