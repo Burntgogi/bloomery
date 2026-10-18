@@ -495,10 +495,35 @@ pub fn rms_warp_tree(w: [f32; RMS_WARPS]) -> f32 {
 /// own width, `eps` added inside the sqrt — the reference's form. The
 /// reference sums the squares in f64 serially; the device's fixed f32
 /// lane/butterfly tree moves last ulps only, which the gate's band owns.
+///
+/// A scale that is not finite and positive has no norm behind it — a sum of
+/// squares that overflowed (finite values whose squares sum past f32's
+/// range) or was never finite gives 0 or NaN — and comes back NaN: every
+/// value it scales is NaN, never the finite zero `1/∞` would write.
 #[inline(always)]
 pub fn rms_scale(sum_sq: f32, k: u32, eps: f32) -> f32 {
     let mean = sum_sq / k as f32;
-    1.0 / (mean + eps).sqrt()
+    let scale = 1.0 / (mean + eps).sqrt();
+    if (scale > 0.0) & (scale < f32::INFINITY) {
+        scale
+    } else {
+        f32::NAN
+    }
+}
+
+/// [`rms_scale`] for a kernel with a fault sink: a refused scale (NaN) raises
+/// [`FaultSite::F32Product`] from the lane `lead` names — one lane of the
+/// block, so one atomic rather than one a thread — and is returned, so the
+/// values it scales are NaN. `rms_norm` and `kv_norm_rope_append`'s latent
+/// norm both take their scale here, so a row raises the same site on either
+/// path.
+#[inline(always)]
+pub fn rms_scale_checked(sum_sq: f32, k: u32, eps: f32, fault: FaultSink, lead: bool) -> f32 {
+    let scale = rms_scale(sum_sq, k, eps);
+    if lead & scale.is_nan() {
+        fault.raise(FaultSite::F32Product);
+    }
+    scale
 }
 
 /// Adjacent-pair rotation of one rope pair, the reference's op order (the
@@ -1020,15 +1045,7 @@ mod elem_kernels {
                 *ws.add(7),
             ]
         };
-        let sum_sq = rms_warp_tree(sums);
-        let scale = if sum_sq.is_finite() {
-            rms_scale(sum_sq, k as u32, eps)
-        } else {
-            if tid == 0 {
-                fault.raise(FaultSite::F32Product);
-            }
-            f32::NAN
-        };
+        let scale = rms_scale_checked(rms_warp_tree(sums), k as u32, eps, fault, tid == 0);
         apply.map(move |g, v| (scale * g) * v);
     }
 

@@ -7,8 +7,8 @@
 use crate::GpuError;
 use crate::cores::q3k_row_dot;
 use crate::elem::{
-    RMS_THREADS, RMS_THREADS_U32, RMS_WARPS, rms_partial_sq, rms_scale, rms_warp_tree,
-    rope_pair_core, silu_mul,
+    RMS_THREADS, RMS_THREADS_U32, RMS_WARPS, rms_partial_sq, rms_scale, rms_scale_checked,
+    rms_warp_tree, rope_pair_core, silu_mul,
 };
 use crate::fault::{FaultSink, FaultSite};
 use crate::flash::f32_to_f16_bits;
@@ -270,7 +270,9 @@ mod fused_kernels {
     /// `flash::kv_append_pos_buf`'s `f32_to_f16_bits` at `pos_buf[0]`. A
     /// position at or past the cache's height has no row: it raises
     /// [`FaultSite::CachePos`] on `fault` and appends nothing, as
-    /// `kv_append_pos_buf` does.
+    /// `kv_append_pos_buf` does. A latent whose sum of squares is not finite
+    /// raises [`FaultSite::F32Product`] as `elem::rms_norm` does, and the
+    /// latent half of `kv_s`, `kvr` and the cache row is NaN.
     #[allow(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
@@ -349,7 +351,11 @@ mod fused_kernels {
                 *ws.add(7),
             ]
         };
-        let scale = rms_scale(rms_warp_tree(sums), latent, eps);
+        // A latent whose sum of squares is not finite (non-finite values, or
+        // finite ones whose squares overflow the sum) raises, as
+        // `elem::rms_norm` does, and leaves NaN in `kv_s`, `kvr` and the
+        // cache row, not the zeros an infinite sum would scale them to.
+        let scale = rms_scale_checked(rms_warp_tree(sums), latent, eps, fault, tid == 0);
 
         // SAFETY: pos_buf.len() >= 1 by the launch contract.
         let pos = unsafe { *pos_buf.get_unchecked(0) } as usize;

@@ -15,7 +15,10 @@
 //! `kvr` and the appended f16 cache row bit for bit, rerun, eager vs
 //! captured-graph replay, and the SAME captured graph at a second position;
 //! then a position at the cache's height, which both appends refuse (the
-//! named `CachePos` fault, the cache untouched). Printed, never asserted: `ik_rel` of
+//! named `CachePos` fault, the cache untouched); and a latent of finite
+//! values whose squares overflow the norm's f32 sum, which both paths refuse
+//! with the named `F32Product` fault and NaN in the latent half of every
+//! output, never zeros. Printed, never asserted: `ik_rel` of
 //! y against dump `l_out-0`'s last column and of h against `ffn_up_gate-0`'s
 //! (the block-layer bands are pinned by the lead from these numbers, not
 //! here).
@@ -735,6 +738,88 @@ fn run() -> Result<(), GateError> {
         if !(op_pass && fu_pass) {
             ok = false;
         }
+
+        // A latent of finite values whose squares overflow the f32 sum: the
+        // norm has no scale. Both paths raise the one named `F32Product`
+        // fault and leave NaN in the latent half of `kv_s`, `kvr` and the
+        // cache row — never the zeros an infinite sum scales it to — while
+        // the rope tail stays finite, and the fused outputs are the op
+        // path's bits.
+        const OVERFLOW_VALUE: f32 = 1e20;
+        let mut kv_big = kv_a.clone();
+        kv_big[..latent].fill(OVERFLOW_VALUE);
+        let kv_big_dev = DeviceBuffer::from_host(stream, &kv_big)?;
+        pos_dev.copy_from_host(stream, &[0u32])?;
+        gpu.clear_fault()?;
+        let want_overflow = Some(Fault::at(LAYER_NONE, FaultSite::F32Product));
+        key_op(
+            &gpu,
+            &step,
+            stream,
+            &kv_big_dev,
+            &kv_gain_dev,
+            &cs_dev,
+            &pos_dev,
+            &g_src_dev,
+            &g_dst_dev,
+            mla.eps,
+            latent,
+            rope,
+            &mut kv_s_op,
+            &mut kvr_op,
+            &mut cache_op,
+        )?;
+        stream.synchronize()?;
+        let op_fault = gpu.take_fault()?;
+        fused.enqueue_kv_norm_rope_append(
+            stream,
+            &kv_big_dev,
+            &kv_gain_dev,
+            &cs_dev,
+            &pos_dev,
+            mla.eps,
+            latent,
+            rope,
+            &mut kv_s_fu,
+            &mut kvr_fu,
+            &mut cache_fu,
+            gpu.unlabelled_sink(),
+        )?;
+        stream.synchronize()?;
+        let fu_fault = gpu.take_fault()?;
+        let (kv_s_op_big, kvr_op_big) = (kv_s_op.to_host_vec(stream)?, kvr_op.to_host_vec(stream)?);
+        let (kv_s_fu_big, kvr_fu_big) = (kv_s_fu.to_host_vec(stream)?, kvr_fu.to_host_vec(stream)?);
+        let (cache_op_big, cache_fu_big) = (
+            cache_op.buf().to_host_vec(stream)?,
+            cache_fu.buf().to_host_vec(stream)?,
+        );
+        let f16_nan = |h: u16| (h & 0x7c00) == 0x7c00 && (h & 0x03ff) != 0;
+        let nan_latent = kv_s_fu_big[..latent].iter().all(|v| v.is_nan())
+            && kvr_fu_big[rope..].iter().all(|v| v.is_nan())
+            && cache_fu_big[rope..width].iter().all(|&h| f16_nan(h));
+        let finite_tail = kv_s_fu_big[latent..].iter().all(|v| v.is_finite())
+            && kvr_fu_big[..rope].iter().all(|v| v.is_finite())
+            && cache_fu_big[..rope].iter().all(|&h| (h & 0x7c00) != 0x7c00);
+        let as_op = bits_equal(&kv_s_op_big, &kv_s_fu_big)
+            && bits_equal(&kvr_op_big, &kvr_fu_big)
+            && cache_op_big == cache_fu_big;
+        let overflow_pass = op_fault == want_overflow
+            && fu_fault == want_overflow
+            && nan_latent
+            && finite_tail
+            && as_op;
+        println!(
+            "key overflow latent={OVERFLOW_VALUE:e} op_fault=\"{}\" fused_fault=\"{}\" want=\"{}\" \
+             latent_all_nan={nan_latent} rope_tail_finite={finite_tail} \
+             bit_identical_to_op={as_op} {}",
+            shown(op_fault),
+            shown(fu_fault),
+            shown(want_overflow),
+            verdict(overflow_pass)
+        );
+        if !overflow_pass {
+            ok = false;
+        }
     }
 
     // ---- printed, never asserted: distance to the CUDA oracle's own
@@ -764,7 +849,7 @@ fn run() -> Result<(), GateError> {
         "PASSED: gate_p0b fused 4-launch block-0 FFN bit-identical to the 8-launch op path \
          (Q8Act, f32 normed, h, y, reruns, graph replays); node counts 8 and 4. The MLA key \
          path fused to 1 launch bit-identical to its 4 (kv_s, kvr, cache row, rerun, replay, \
-         second position)"
+         second position), and an overflowing latent refused as the op path refuses it"
     );
     Ok(())
 }
