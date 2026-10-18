@@ -37,9 +37,10 @@ impl Cache {
         })
     }
 
-    /// A hit becomes the most recently used entry.
+    /// A hit becomes the most recently used entry. The search starts at that end, where a repeated
+    /// request's entry sits.
     pub fn get(&mut self, key: &[u8; 32]) -> Option<Value> {
-        let at = self.entries.iter().position(|(k, _)| k == key)?;
+        let at = self.entries.iter().rposition(|(k, _)| k == key)?;
         let entry = self.entries.remove(at).expect("the entry was found");
         let value = entry.1.clone();
         self.entries.push_back(entry);
@@ -178,5 +179,41 @@ mod tests {
         assert!(cache.bytes <= cache.limit);
         assert_ne!(vector_key(&[1, 2], &[]), vector_key(&[2, 1], &[]));
         assert_ne!(vector_key(&[1], &[]), vector_key(&[1, 0], &[]));
+    }
+
+    #[test]
+    fn a_key_holds_one_entry_and_a_hit_is_found_wherever_it_sits() {
+        let v = |x: f32| Value::Vector(vec![x]);
+        let shared = Cache::shared(8 * Cache::charge(&v(0.0))).unwrap();
+        let mut cache = shared.lock().unwrap();
+        for k in 1..=4u8 {
+            cache.insert([k; 32], v(f32::from(k)));
+        }
+        cache.insert([2; 32], v(20.0));
+        assert_eq!(cache.entries.len(), 4);
+        for (k, want) in [
+            (1u8, 1.0f32),
+            (4, 4.0),
+            (2, 20.0),
+            (3, 3.0),
+            (2, 20.0),
+            (1, 1.0),
+        ] {
+            let Some(Value::Vector(hit)) = cache.get(&[k; 32]) else {
+                panic!("key {k} missing");
+            };
+            assert_eq!(hit, vec![want], "key {k}");
+            assert_eq!(cache.entries.back().map(|(key, _)| key[0]), Some(k));
+            assert_eq!(cache.entries.len(), 4);
+        }
+        assert!(cache.get(&[9; 32]).is_none());
+        assert_eq!(
+            cache
+                .entries
+                .iter()
+                .map(|(key, _)| key[0])
+                .collect::<Vec<_>>(),
+            [4, 3, 2, 1]
+        );
     }
 }
