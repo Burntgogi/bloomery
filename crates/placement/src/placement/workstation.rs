@@ -764,19 +764,33 @@ impl HostNeed {
         host.usable_bytes.saturating_sub(os_reserve(host))
     }
 
+    /// The terms [`HostNeed::bytes`] sums, less the OS reserve, exact: no
+    /// sum of u64 terms wraps in u128. `arena` says whether the NVMe tier's
+    /// arena is among them ([`HostNeed::plan_bytes`] leaves it out).
+    fn exact(&self, arena: bool) -> u128 {
+        [
+            self.experts,
+            self.tables,
+            self.shadows,
+            self.reserves,
+            self.extra,
+            if arena { self.arena } else { 0 },
+            self.cards,
+        ]
+        .into_iter()
+        .map(u128::from)
+        .sum::<u128>()
+        .saturating_sub(u128::from(self.os))
+    }
+
     /// The bytes `MemAvailable` must cover: the plan's host terms, `extra`,
     /// the arena and the cards' share of a unified pool — what a placed load
-    /// of this plan holds.
+    /// of this plan holds. A need past u64 bytes reads `u64::MAX`, which no
+    /// reading but `u64::MAX` covers ([`HostNeed::check`] holds the exact
+    /// sum).
     #[must_use]
     pub fn bytes(&self) -> u64 {
-        (self.experts
-            + self.tables
-            + self.shadows
-            + self.reserves
-            + self.extra
-            + self.arena
-            + self.cards)
-            .saturating_sub(self.os)
+        u64::try_from(self.exact(true)).unwrap_or(u64::MAX)
     }
 
     /// [`HostNeed::bytes`] with the arena out: the plan's own host terms,
@@ -786,8 +800,7 @@ impl HostNeed {
     /// already lost the arena).
     #[must_use]
     pub fn plan_bytes(&self) -> u64 {
-        (self.experts + self.tables + self.shadows + self.reserves + self.extra + self.cards)
-            .saturating_sub(self.os)
+        u64::try_from(self.exact(false)).unwrap_or(u64::MAX)
     }
 
     /// What `room` leaves past [`HostNeed::plan_bytes`]: the plan's host
@@ -815,7 +828,7 @@ impl HostNeed {
     /// need, or the refusal that names both, each term and what lowers the
     /// need.
     pub fn check(self, available: u64) -> Result<(), HostShort> {
-        if self.bytes() <= available {
+        if self.exact(true) <= u128::from(available) {
             Ok(())
         } else {
             Err(HostShort {
@@ -836,10 +849,17 @@ impl HostNeed {
     /// recomputes it.
     pub fn grant(self, available: u64, least: u64) -> Result<ArenaGrant, HostShort> {
         let planned = self.arena;
-        let Some(short) = self.bytes().checked_sub(available).filter(|&s| s > 0) else {
+        let Some(short) = self
+            .exact(true)
+            .checked_sub(u128::from(available))
+            .filter(|&s| s > 0)
+        else {
             return Ok(ArenaGrant::whole(planned));
         };
-        match planned.checked_sub(short) {
+        match u64::try_from(short)
+            .ok()
+            .and_then(|short| planned.checked_sub(short))
+        {
             Some(granted) if planned > 0 && granted >= least => Ok(ArenaGrant { planned, granted }),
             _ => Err(HostShort {
                 need: self,

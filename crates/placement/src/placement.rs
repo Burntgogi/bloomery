@@ -263,6 +263,18 @@ pub struct Host {
     pub reserves: Vec<(String, u64)>,
 }
 
+impl Host {
+    /// The reserves' bytes; `None` past u64 bytes. The one owner of that
+    /// sum: a plan's host totals and [`Plan::violations`] both take it from
+    /// here.
+    #[must_use]
+    pub fn reserve_bytes(&self) -> Option<u64> {
+        self.reserves
+            .iter()
+            .try_fold(0u64, |sum, (_, bytes)| sum.checked_add(*bytes))
+    }
+}
+
 /// One memory behind the cards and the host (GB10): each side's figure
 /// reads the same bytes, so a plan holds their sum to it as well
 /// ([`Violation::PoolOver`]).
@@ -1342,6 +1354,10 @@ pub enum PlacementError {
     /// A card's reserves, set-aside, load floor or shared-pool total summed past u64 bytes.
     #[error("card {card}: required card or shared-pool bytes pass u64 bytes")]
     CardBytesPastU64 { card: String },
+    /// The host's reserves, with the row-gathered tables' page-cache reserve,
+    /// summed past u64 bytes: no host figure holds them.
+    #[error("the host's reserves pass u64 bytes")]
+    HostBytesPastU64,
     /// A card budget below what the card needs with no expert on it: the
     /// floor counts what the caller holds beside the plan
     /// ([`plan_routed_reserving`]) as the expert rule's budget does.
@@ -3787,8 +3803,11 @@ fn totals<'a>(
         })
         .collect::<Result<_, PlacementError>>()?;
     let row_reserve = row_cache_reserve(model, &rows);
-    let reserve_bytes: u64 =
-        machine.host().reserves.iter().map(|(_, b)| b).sum::<u64>() + row_reserve;
+    let reserve_bytes = machine
+        .host()
+        .reserve_bytes()
+        .and_then(|bytes| bytes.checked_add(row_reserve))
+        .ok_or(PlacementError::HostBytesPastU64)?;
     let shadow_bytes: u64 = kv_bytes.iter().map(|&(_, shadow, _)| shadow).sum();
     let mut host = HostTotals {
         expert_bytes: host_experts,
@@ -4012,15 +4031,17 @@ impl Plan<'_> {
         let need = workstation::HostNeed {
             experts: self.host_resident(),
             tables: 0,
-            reserves: host.reserves.iter().map(|(_, b)| b).sum::<u64>()
-                + self.host.row_reserve_bytes,
+            reserves: host
+                .reserve_bytes()
+                .and_then(|bytes| bytes.checked_add(self.host.row_reserve_bytes))
+                .expect("the plan's host reserves fit u64"),
             arena: 0,
             cards: 0,
             ..workstation::HostNeed::of(self, 0)
         };
         if let Err(short) = need.check(workstation::HostNeed::machine_room(host)) {
             out.push(Violation::HostOver {
-                total: short.need.bytes() + short.need.os,
+                total: short.need.bytes().saturating_add(short.need.os),
                 usable: host.usable_bytes,
             });
         }
@@ -4561,6 +4582,85 @@ mod tests {
             assert_eq!(card.set_aside_bytes(), None);
             assert_eq!(card.floor_bytes(0, 0, 0), None);
         }
+    }
+
+    #[test]
+    fn host_reserve_sum_preserves_the_u64_boundary() {
+        let host = |reserves: &[u64]| Host {
+            usable_bytes: u64::MAX,
+            reserves: reserves.iter().map(|&b| ("beside".into(), b)).collect(),
+        };
+        assert_eq!(host(&[]).reserve_bytes(), Some(0));
+        assert_eq!(host(&[u64::MAX]).reserve_bytes(), Some(u64::MAX));
+        assert_eq!(host(&[u64::MAX - 5, 5]).reserve_bytes(), Some(u64::MAX));
+        assert_eq!(host(&[u64::MAX, 1]).reserve_bytes(), None);
+        assert_eq!(host(&[1 << 63, 1 << 63]).reserve_bytes(), None);
+    }
+
+    /// A host whose reserves sum past u64 bytes wraps to a small number
+    /// under unchecked addition (release) or panics (debug): the plan then
+    /// passes the host bound or never returns. It is a named refusal.
+    #[test]
+    fn overflowing_host_reserves_are_a_named_placement_refusal() {
+        let model = layered(3);
+        for reserves in [
+            vec![u64::MAX, 1],
+            vec![1 << 63, 1 << 63],
+            vec![u64::MAX - 5, 3, 3],
+        ] {
+            let machine = Machine {
+                cards: vec![bytes_card("stage", HEAD + 12 * EXPERT, 0..3)],
+                tiers: Vec::new(),
+                nodes: vec![Node {
+                    host: Host {
+                        usable_bytes: 1 << 40,
+                        reserves: reserves.iter().map(|&b| ("beside".into(), b)).collect(),
+                    },
+                    unified: None,
+                }],
+            };
+            assert!(
+                matches!(
+                    plan_with(&model, &machine, 4096, &NoKv, None),
+                    Err(PlacementError::HostBytesPastU64)
+                ),
+                "{reserves:?}"
+            );
+        }
+    }
+
+    /// Reserves that fit u64 alone but not beside the plan's host experts:
+    /// the host's need passes every room, so the plan is a `HostOver`, not a
+    /// wrapped small need that fits.
+    #[test]
+    fn a_host_need_past_u64_is_a_host_over() {
+        let model = layered(3);
+        let machine = Machine {
+            cards: vec![bytes_card("stage", HEAD + 12 * EXPERT, 0..3)],
+            tiers: Vec::new(),
+            nodes: vec![Node {
+                host: Host {
+                    usable_bytes: 1 << 40,
+                    reserves: vec![("beside".into(), u64::MAX - 100)],
+                },
+                unified: None,
+            }],
+        };
+        let plan = plan_with(&model, &machine, 4096, &NoKv, None).expect("the plan");
+        assert!(plan.host.expert_bytes > 100, "the host holds experts");
+        let over: Vec<_> = plan
+            .violations()
+            .into_iter()
+            .filter(|v| matches!(v, Violation::HostOver { .. }))
+            .collect();
+        assert_eq!(
+            over,
+            vec![Violation::HostOver {
+                total: u64::MAX,
+                usable: 1 << 40
+            }]
+        );
+        assert!(workstation::HostNeed::of(&plan, 0).check(u64::MAX).is_err());
     }
 
     #[test]
