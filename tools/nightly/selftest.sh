@@ -19,7 +19,11 @@ ROOT=$(cd "$HERE/../.." && pwd)
 # shellcheck source=tools/nightly/units.sh
 source "$HERE/units.sh"
 
-T=$(mktemp -d "${TMPDIR:-/tmp}/tree-commit.XXXXXX")
+# An empty T would put every repository, fixture and nightly state below at the filesystem root.
+T=$(mktemp -d "${TMPDIR:-/tmp}/tree-commit.XXXXXX") || {
+  echo "tree-commit self-test: cannot create a scratch directory under ${TMPDIR:-/tmp}: nothing was checked" >&2
+  exit 70
+}
 trap 'rm -rf "$T"' EXIT
 fails=0 checks=0
 check() {
