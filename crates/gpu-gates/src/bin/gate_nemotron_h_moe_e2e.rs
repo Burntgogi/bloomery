@@ -13,8 +13,8 @@
 //!
 //! - `structure` (self-consistency): the captured step holds the entries the
 //!   layer kinds derive — one Mamba-2 scan and two NVFP4 gemvs a Mamba-2
-//!   layer; a group-16 attention layer's `2 · n_kv` group-8 segment passes,
-//!   one merge and `2 · n_kv` appends; a MoE layer's router at its own count,
+//!   layer; a group-16 attention layer's one group-8 segment pass (two packs a
+//!   key head), one merge and `2 · n_kv` appends; a MoE layer's router at its own count,
 //!   four `iq2_xxs_gemv_sel` (the routed up and down, the shared expert's
 //!   up and down), two squared ReLUs and one weighted sum; one Q8_0
 //!   embedding row — and no group-5 entry, no host node.
@@ -272,8 +272,9 @@ mod gate {
         for (name, n) in &want {
             pass &= got(name) == *n;
         }
-        // The group-16 pass is group-8 segment entries over each key head's
-        // planes, two a key head; no group-5 entry runs.
+        // The group-16 pass is one group-8 segment entry a layer over the key
+        // heads' planes (`packs` 2); no group-5 entry runs.
+        // PIN(2026-10-18): one segment node a layer (was `2 * n_kv`, one a key head and pack).
         let seg = |g5: bool| -> usize {
             hist.iter()
                 .filter(|(k, _)| k.starts_with("gqa_flash_seg") && k.ends_with("_g5") == g5)
@@ -281,7 +282,7 @@ mod gate {
                 .sum()
         };
         let (group8, group5) = (seg(false), seg(true));
-        pass &= group8 == 2 * n_kv * attn && group5 == 0;
+        pass &= group8 == attn && group5 == 0;
         let listed: Vec<String> = want
             .iter()
             .map(|(name, n)| format!("{name}={}/{n}", got(name)))
@@ -290,7 +291,7 @@ mod gate {
             "structure: layers mamba={mamba} attn={attn} moe={moe}, graph_nodes={nodes} host={host}, \
              entries (got/want) {} group8_segments={group8}/{} group5_entries={group5} (want 0) {}",
             listed.join(" "),
-            2 * n_kv * attn,
+            attn,
             verdict(pass)
         );
         println!(

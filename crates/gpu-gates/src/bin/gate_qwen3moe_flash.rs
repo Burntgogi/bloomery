@@ -137,14 +137,14 @@
 //! threshold each row bit for bit its one-row launch.
 //!
 //! Group 16 (`enqueue_pass` at [`GROUP_16`], two group-of-eight packs a key
-//! head through windows), at Nemotron 3.5 Bolt's 32 query heads over 2 key
+//! head in one segment launch), at Nemotron 3.5 Bolt's 32 query heads over 2 key
 //! heads of 128, on a seeded cache NaN past the count, both passes, at 6,
 //! 512 and 4,096 keys: every head within the band above of the exact
 //! attention over its key head `h / 16`; bit for bit the group-of-eight
 //! launch over planes holding each key head twice (the eight-head entry's
-//! own arithmetic, which the windows must not move); a rerun bit-identical.
+//! own arithmetic, which the pack grid must not move); a rerun bit-identical.
 //! At 512 keys the prefill shape and the `key_count` fault clause above at
-//! group 16; at 4,096 the captured launch, `2 · n_kv` segment nodes of
+//! group 16; at 4,096 the captured launch, one segment node of `2 · n_kv ·`
 //! [`SEGMENTS`] blocks and one merge of `n_head` blocks, replaying the eager
 //! bits.
 //!
@@ -2005,16 +2005,16 @@ mod gate {
     const G16_CTX: usize = 4_096 + KEY_TILE;
 
     /// Head 128, [`GROUP_16`] query heads a key head (module doc of
-    /// `flash_gqa`: two group-of-eight packs a key head), both passes, on a
+    /// `flash_gqa`: two group-of-eight packs a key head in one launch), both passes, on a
     /// seeded query and cache whose rows at or past the count are NaN. At
     /// each count of [`G16_KEYS`]: every head within its band of the exact
     /// attention over key head `h / 16`; bit for bit the group-of-eight
     /// launch over planes holding each key head twice (`2 · n_kv` key heads,
     /// so head `h` reads key head `h / 8` of them, the real `h / 16`); a
     /// rerun bit-identical. At 512 keys the prefill shape and the fault
-    /// clause at group 16; at 4,096 the captured launch: `2 · n_kv` segment
-    /// nodes of [`SEGMENTS`] blocks and one merge of `n_head`, replaying the
-    /// eager bits.
+    /// clause at group 16; at 4,096 the captured launch: one segment node of
+    /// `2 · n_kv ·` [`SEGMENTS`] blocks and one merge of `n_head`, replaying
+    /// the eager bits.
     fn group16(k: &FlashGqaKernels, gpu: &Gpu, scale: f32) -> Result<bool, GateError> {
         let (n_kv, ctx) = (G16_KV, G16_CTX);
         let n_head = n_kv * GROUP_16;
@@ -2157,7 +2157,8 @@ mod gate {
                 .collect()
         };
         let (seg, merge) = (grids("gqa_flash_seg"), grids("gqa_flash_merge"));
-        let want_seg = vec![[u32::try_from(SEGMENTS)?, 1, 1]; g.n_kv * GROUP_16 / GROUP];
+        // PIN(2026-10-18): one segment node of every pack's blocks (was `2 * n_kv` nodes of `SEGMENTS`).
+        let want_seg = vec![[u32::try_from(g.n_kv * GROUP_16 / GROUP * SEGMENTS)?, 1, 1]];
         let want_merge = vec![[u32::try_from(n_head)?, 1, 1]];
         let shape = nodes.len() == want_seg.len() + 1
             && nodes.iter().all(|n| n.kernel.is_some())
