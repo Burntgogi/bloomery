@@ -29,6 +29,8 @@ use bloomery_gpu::model::StepMode;
 #[cfg(feature = "gpu")]
 use bloomery_gpu_gates::prompts::{read_greedy, read_prompts};
 #[cfg(feature = "gpu")]
+use bloomery_gpu_gates::tap_dump::{distance, read_f32};
+#[cfg(feature = "gpu")]
 use bloomery_gpu_gates::{GateError, data_dir, ref_model_path};
 #[cfg(feature = "gpu")]
 use gguf::Split;
@@ -86,16 +88,6 @@ fn write_f32(path: &Path, v: &[f32]) -> Res<()> {
     std::fs::write(path, bytes).map_err(|e| format!("write {}: {e}", path.display()).into())
 }
 
-#[cfg(feature = "gpu")]
-fn read_f32(path: &Path) -> Res<Vec<f32>> {
-    let b = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-    Ok(b.as_chunks::<4>()
-        .0
-        .iter()
-        .map(|c| f32::from_le_bytes(*c))
-        .collect())
-}
-
 /// Token ids by logit descending, ties by id ascending — the reference
 /// writer's order.
 #[cfg(feature = "gpu")]
@@ -107,19 +99,6 @@ fn ranked(logits: &[f32]) -> Vec<u32> {
             .then(a.cmp(&b))
     });
     ids
-}
-
-/// `‖a − b‖ / ‖b‖` and `max |a − b|`; `(0, 0)` for two empty spans.
-#[cfg(feature = "gpu")]
-fn distance(a: &[f32], b: &[f32]) -> (f64, f64) {
-    let (mut num, mut den, mut mx) = (0f64, 0f64, 0f64);
-    for (x, y) in a.iter().zip(b) {
-        let d = f64::from(*x) - f64::from(*y);
-        num += d * d;
-        den += f64::from(*y) * f64::from(*y);
-        mx = mx.max(d.abs());
-    }
-    (if den > 0.0 { (num / den).sqrt() } else { 0.0 }, mx)
 }
 
 #[cfg(feature = "gpu")]
@@ -303,7 +282,11 @@ fn compare(logits: &[f32], taps: &[LayerTaps], other: &Path, top: usize) -> Res<
             .collect::<Vec<_>>()
             .join(" ")
     );
-    let (lrel, lmax) = distance(logits, &other_logits);
+    let (lrel, lmax) = distance(
+        &format!("{} logits.f32", other.display()),
+        logits,
+        &other_logits,
+    )?;
     println!("logits rel={lrel:.3e} max_abs={lmax:.4}");
     print!("{:>3}", "L");
     for name in TAPS {
@@ -313,8 +296,9 @@ fn compare(logits: &[f32], taps: &[LayerTaps], other: &Path, top: usize) -> Res<
     for t in taps {
         print!("{:>3}", t.layer);
         for name in TAPS {
-            let b = read_f32(&other.join(format!("L{:02}.{name}.f32", t.layer)))?;
-            let (rel, _) = distance(tap(t, name), &b);
+            let file = format!("L{:02}.{name}.f32", t.layer);
+            let b = read_f32(&other.join(&file))?;
+            let (rel, _) = distance(&format!("{} {file}", other.display()), tap(t, name), &b)?;
             print!(" {rel:>15.3e}");
         }
         let ids: Vec<String> = t.moe_ids.iter().map(u32::to_string).collect();

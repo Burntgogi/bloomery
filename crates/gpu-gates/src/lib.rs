@@ -64,6 +64,7 @@ pub mod serve_client;
 pub mod side_seat;
 #[cfg(feature = "gpu")]
 pub mod slots_gate;
+pub mod tap_dump;
 pub mod tier;
 // The image encoder's pieces the serve seats share; the tower itself is `bloomery-gpu-vision`'s, behind `vision`.
 #[cfg(any(feature = "vision", feature = "deepseek41"))]
