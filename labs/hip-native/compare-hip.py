@@ -133,7 +133,7 @@ def reference_rows(directory, prompt, forced, source, binary_sha, model, target,
     expected = {"backend": "hip", "engine": "reference", "target": target_name,
                 "source_head": source["commit"], "source_dirty": "false", "binary_sha256": binary_sha,
                 "model_sha256": target["sha256"], "model": str(model),
-                "ctx": "64", "ubatch": "1", "kv": "f16", "prefill": "step", "mode": "reference",
+                "ctx": "64", "ubatch": "1", "kv": "f16", "schedule": "step", "mode": "reference",
                 "rows": str(len(forced)), "vocab": str(target["vocab"]),
                 "reset_repeats": "2", "reset_repeat_bitwise_equal": "true", "hip_output": "true"}
     for key, value in expected.items():
@@ -293,7 +293,8 @@ def main():
             ref.run(argparse.Namespace(kind="reference", backend="hip", target=args.target, model=model,
                     binary=reference, prompt=prompt_path, forced=forced_path, out=directory,
                     prefill="step", mode="graph", ctx=64, ubatch=1, reset_repeats=2,
-                    hip_max_model_bytes=max_model_bytes))
+                    hip_max_model_bytes=max_model_bytes, bound=None, corpus=None,
+                    corpus_sha256=None, prompt_count=None, forced_count=None))
             rows, attribution = reference_rows(directory, prompt, forced, source, identities[reference],
                                                model, target, reserve, args.target, max_model_bytes)
             result["reference_captures"].append(attribution)

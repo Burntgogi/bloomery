@@ -473,6 +473,7 @@ def finish_bundle(stage, identity, meta):
 def run(args):
     target = TARGETS[args.target]
     native = args.kind == "native"
+    source_bound = native or args.backend == "hip"
     model, binary, output = args.model.resolve(), args.binary.resolve(), args.out.resolve()
     corpus = {}
     if args.corpus:
@@ -504,10 +505,10 @@ def run(args):
     stage = Path(str(output) + ".staging")
     if output.exists() or stage.exists():
         raise ValueError("output or staging directory already exists; use a new output directory")
-    # A native run is attributed to this checkout's commit; a reference run to mainline's, which its build record names
-    # (the box's copy of this tree carries no .git).
-    source_head = git(ROOT, "rev-parse", "HEAD") if native else None
-    source_dirty = bool(git(ROOT, "status", "--porcelain", "--untracked-files=normal")) if native else None
+    # Native and lab HIP captures bind this checkout. Standalone CPU/CUDA references
+    # bind mainline's build record and may run from a deployment without .git.
+    source_head = git(ROOT, "rev-parse", "HEAD") if source_bound else None
+    source_dirty = bool(git(ROOT, "status", "--porcelain", "--untracked-files=normal")) if source_bound else None
     if native and source_dirty:
         raise ValueError("native source has tracked changes; commit and rebuild before attribution")
     driver_sha = digest(__file__)
@@ -590,7 +591,7 @@ def run(args):
                                     meta.get("reset_repeats") != str(args.reset_repeats)):
         raise ValueError("writer returned a different backend or reset schedule")
     model_unchanged(model, model_stat)
-    if (native and git(ROOT, "rev-parse", "HEAD") != source_head) or digest(binary) != binary_sha or digest(__file__) != driver_sha:
+    if (source_bound and git(ROOT, "rev-parse", "HEAD") != source_head) or digest(binary) != binary_sha or digest(__file__) != driver_sha:
         raise ValueError("source or binary changed during diagnostic")
     if native:
         if clean_head(ROOT) != source_head:
@@ -608,7 +609,7 @@ def run(args):
                 "binary_sha256": binary_sha, "driver_sha256": driver_sha,
                 "prompt_sha256": digest(stage / "prompt.ids"), "forced_sha256": digest(stage / "forced.ids"),
                 "ctx": str(args.ctx), "ubatch": str(args.ubatch), "kv": "f16", **corpus}
-    if native:
+    if source_bound:
         identity.update({"source_head": source_head, "source_dirty": str(source_dirty).lower()})
     if args.backend == "hip":
         identity.update(hip_metadata(meta, reserve, args.hip_max_model_bytes))
