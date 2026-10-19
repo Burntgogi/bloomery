@@ -141,7 +141,7 @@ HEAD**, not historical evidence. Both native executable and device ELF must stil
 under this lab's `target` directory and match the canonical SHA-256 records. It does not
 build binaries or silently refresh stale evidence.
 
-The only model accepted here is canonical `forward/smoke.gguf`: the deterministic two-layer
+The default target accepts only canonical `forward/smoke.gguf`: the deterministic two-layer
 GDN+GQA fixture, 685,984 bytes, vocabulary258, SHA-256
 `420f680e27e9ec75c7c29d39298574f7fd2aff8808e9b2566f3915664016ed06`.
 The root reference target `hip-lab-hybrid` attributes this fixture to
@@ -208,10 +208,50 @@ memory before model/context/decode stages using its recorded conservative contex
 Driver allocations, fragmentation and unmodeled backend workspace remain outside that
 estimate. These are stage preflight checks, not an OS-enforced cap or measured peak.
 Insufficient headroom is a nonzero refusal, never permission to evict another service.
-`real_model_HIP_acceptance` is **always false**, including on a passing small-fixture run.
-This section defines the runnable workflow, not a claim that its self-test or GPU comparison
-has already been executed; it grants no real-model, serving, performance or CUDA/HIP parity
-acceptance.
+`real_model_HIP_acceptance` is always false for the small target. The opt-in pinned
+real-model workflow below uses the same controller and checks, not a synthetic substitute.
+Neither workflow grants serving, performance or CUDA/HIP bit-parity acceptance.
+
+## Same-real-model HIP comparison
+
+After obtaining an authorized memory window, use the pinned 0.8B GGUF from **Eager dense
+Qwen3.5 forward** with `--target qwen35-0.8b-candidate --model ... --prompt ...`.
+The model must match its complete file size and SHA-256. Native metadata must describe
+24 layers (18 GDN, 6 GQA); reference callbacks must observe all24 layers and the output
+head on HIP. The small canonical probe is still required from the current clean HEAD
+to bind the native executables and their operator checks.
+
+Prepare separate English and Korean raw-ID files with this exact model's tokenizer.
+Record the original UTF-8 bytes, tokenizer source/binary identities, BOS and special-token
+settings alongside the IDs. Do not apply a chat template or alter inputs after seeing a
+token mismatch. Each prompt plus eight continuation IDs must fit context64.
+
+```sh
+python3 labs/hip-native/compare-hip.py /tmp/hip-real-english \
+  --reference labs/hip-native/target/dense_logits_ref \
+  --native-evidence /tmp/hip-current-canonical/result.json \
+  --target qwen35-0.8b-candidate --model /absolute/path/Qwen3.5-0.8B-Q4_K_M.gguf \
+  --prompt /absolute/path/english.ids
+python3 labs/hip-native/compare-hip.py /tmp/hip-real-korean \
+  --reference labs/hip-native/target/dense_logits_ref \
+  --native-evidence /tmp/hip-current-canonical/result.json \
+  --target qwen35-0.8b-candidate --model /absolute/path/Qwen3.5-0.8B-Q4_K_M.gguf \
+  --prompt /absolute/path/korean.ids
+```
+
+The reference tensor-payload limit is the pinned real file's size rather than the small
+target's16MiB default. This permits that file only; it does not reduce `FIT_RESERVE` or
+skip selected-device memory preflight. Context64, ubatch1, F16 KV, independent greedy8,
+complete finite vocabulary rows, actual context reset2 and same-prefix forced diagnostics
+are unchanged. Reference row0 aligns with native row `prompt.len()-1`, including prompts
+whose lengths differ from the small fixture.
+
+For the real target, a passing report sets `real_model_HIP_acceptance=true` **for that
+single raw prompt only**. The English/Korean milestone requires both reports to pass at
+the same clean source and binary identities. A mismatch remains nonzero, preserves the
+first differing full vocabulary row and never changes inputs or invents a logit-error
+tolerance. These are correctness diagnostics, not chat/tool admission, release-backend
+support or measured performance.
 
 ## Original selected Q4_K port
 
