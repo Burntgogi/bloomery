@@ -1,0 +1,13 @@
+   Compiling bloomery-hip-spike v0.1.0 ($SOURCE_ROOT/labs/hip-native/host)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.29s
+     Running unittests src/main.rs (target/x86_64-unknown-linux-gnu/debug/build/bloomery-hip-spike/51faf187488ee6e8/out/bloomery_hip_spike-51faf187488ee6e8)
+
+running 5 tests
+test forward::plan::tests::load_fit_preserves_reserve_and_refuses_overflow ... ok
+test forward::tests::raw_ids_refuse_empty_negative_fractional_and_overflow ... ok
+test selected::tests::selected_shape_refusals_precede_the_driver ... ok
+test tests::refuses_invalid_shapes_and_truncated_weights ... ok
+test forward::tests::admission_and_generation_bounds_precede_device_load ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+

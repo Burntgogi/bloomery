@@ -1,0 +1,49 @@
+{
+  "llama_tree": "$LLAMA_SOURCE",
+  "llama_build": "$LLAMA_BUILD",
+  "llama_commit": "fb4b2737a808a3fb7c2117a498f43815dc9be53e",
+  "remote": "https://github.com/ggml-org/llama.cpp.git",
+  "source_sha256": "d438f3c83f9f84860b3862ae0d9c56012319280cf5a9455806d124564dc08911",
+  "binary_sha256": "1f813f3ed1b8cdf63a8351e6f777984094ccf9f9686f4e018c59b7c22ae344ea",
+  "command": [
+    "$TOOLING_ROOT/bin/c++",
+    "-std=c++17",
+    "-O2",
+    "-Wall",
+    "-Wextra",
+    "-Werror",
+    "$SOURCE_ROOT/tools/ref/dense_logits_ref.cpp",
+    "-I$LLAMA_SOURCE/include",
+    "-I$LLAMA_SOURCE/ggml/include",
+    "-L$LLAMA_BUILD/bin",
+    "-lllama",
+    "-lggml",
+    "-lggml-base",
+    "-Wl,-rpath,$LLAMA_BUILD/bin",
+    "-o",
+    "$EVIDENCE_ROOT/reference/dense_logits_ref.partial"
+  ],
+  "libraries": {
+    "$LLAMA_BUILD/bin/libggml-base.so.0.25.3": "dc7e962c9153e965ba7fe843934f6d3dc299ac2777009a18b720b577af2910a0",
+    "$LLAMA_BUILD/bin/libggml-cpu.so.0.25.3": "80e4180191de4ef0849b4694887a0d528a01121a9ab6dc4541b8b31de2914b11",
+    "$LLAMA_BUILD/bin/libggml-hip.so.0.25.3": "50354a1d7e4b309c28c0b97d3dbef70fe3e059d28025e2aa8ecff630c4aac12c",
+    "$LLAMA_BUILD/bin/libggml.so.0.25.3": "d87d75a1d487e1973f29603ba44a202047e0497d347757d7377b6fd4eb5228d9",
+    "$LLAMA_BUILD/bin/libllama.so.0.5.0": "c7afe29deb233a74d3c63ce0e1b007bbf8f73f591ceffd15f97a3d396ac74db2"
+  },
+  "cuda_build": false,
+  "hip_build": true,
+  "pin": null,
+  "libraries_rebuilt": true,
+  "library_build_command": [
+    "$TOOL_VENV/lib/python3.12/site-packages/cmake/data/bin/cmake",
+    "--build",
+    "$LLAMA_BUILD",
+    "--parallel",
+    "2",
+    "--target",
+    "llama",
+    "ggml"
+  ],
+  "library_source_proof": "successful_incremental_build",
+  "cmake_cache_sha256": "344ef56b7305b45fb0479da7f9781756bd9737f36963a2c19c815654281cff70"
+}

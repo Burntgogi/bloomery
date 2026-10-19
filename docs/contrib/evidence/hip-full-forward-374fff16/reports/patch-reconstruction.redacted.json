@@ -1,0 +1,11 @@
+{
+  "status": "pass",
+  "base": "11d8a7d37a7648f3d5fc058f293947638313b2c4",
+  "verified_source": {
+    "commit": "374fff1608900e284b3e48f69abd4195738a6e3e",
+    "tree": "f438008d70015ddb81ad4aed4558a458846f953c",
+    "lab_tree": "2823c530a4261b377b1913029604dc8a52afbd60",
+    "clean": true
+  },
+  "reconstructed_tree": "f438008d70015ddb81ad4aed4558a458846f953c"
+}

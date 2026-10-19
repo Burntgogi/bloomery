@@ -1,0 +1,701 @@
+{
+  "schema": 1,
+  "purpose": "Original retained files and explicitly named path-redacted public derivatives; not an unmodified verifier bundle.",
+  "digest_semantics": "Nested digests and byte counts retain original artifact identities. Per-artifact public_sha256 and public_bytes identify disclosed copies.",
+  "replacement_semantics": "Known prefixes substituted longest-first inside serialized JSON string tokens or text; unchanged copies declared.",
+  "original_path_base": "retained local evidence root",
+  "artifacts": [
+    {
+      "original_relative_path": "canonical/result.json",
+      "public_relative_path": "reports/canonical.redacted.json",
+      "original_sha256": "1bf0b273c4a23e820bf3a7567e4bd9e72968c72ee8f429c4722d133b9b0f81e7",
+      "original_bytes": 15069,
+      "public_sha256": "41527832cc38957959990710954868fa8d0147f4662d6f74fb2e71081abec492",
+      "public_bytes": 14741,
+      "transformation": "json-string-path-prefix-substitution",
+      "replacement_count": 8,
+      "replacement_counts_by_alias": {
+        "$SOURCE_ROOT": 4,
+        "$FIXTURE_ROOT": 1,
+        "$EVIDENCE_ROOT": 2,
+        "$ROCM_SDK": 1
+      },
+      "aliases": [
+        "$EVIDENCE_ROOT",
+        "$FIXTURE_ROOT",
+        "$ROCM_SDK",
+        "$SOURCE_ROOT"
+      ]
+    },
+    {
+      "original_relative_path": "english-hip-comparison/comparison.json",
+      "public_relative_path": "reports/english.redacted.json",
+      "original_sha256": "7421887d508f567469fda60ae7ab915badebd5e114c9571bf5b01791b650335d",
+      "original_bytes": 135055,
+      "public_sha256": "43b1f84ae382a056c5e943f371c87b2d4de3edd1a3cbc8fe95ffe1af4f201a4e",
+      "public_bytes": 119734,
+      "transformation": "json-string-path-prefix-substitution",
+      "replacement_count": 394,
+      "replacement_counts_by_alias": {
+        "$EVIDENCE_ROOT": 185,
+        "$MODEL_ROOT": 41,
+        "$LLAMA_SOURCE": 30,
+        "$LLAMA_BUILD": 90,
+        "$TOOLING_ROOT": 10,
+        "$SOURCE_ROOT": 27,
+        "$TOOL_VENV": 10,
+        "$ROCM_SDK": 1
+      },
+      "aliases": [
+        "$EVIDENCE_ROOT",
+        "$LLAMA_BUILD",
+        "$LLAMA_SOURCE",
+        "$MODEL_ROOT",
+        "$ROCM_SDK",
+        "$SOURCE_ROOT",
+        "$TOOLING_ROOT",
+        "$TOOL_VENV"
+      ]
+    },
+    {
+      "original_relative_path": "korean-hip-comparison/comparison.json",
+      "public_relative_path": "reports/korean.redacted.json",
+      "original_sha256": "924f426b40917ab7e0d18b519386c33f8c076c08c0eb929c1cd0bb27428c9bc7",
+      "original_bytes": 135363,
+      "public_sha256": "1e7b3d17ac1eaed93c400b3837db2d1fe50979ebbc3a14353c9a9c91462fe3b1",
+      "public_bytes": 120042,
+      "transformation": "json-string-path-prefix-substitution",
+      "replacement_count": 394,
+      "replacement_counts_by_alias": {
+        "$EVIDENCE_ROOT": 185,
+        "$MODEL_ROOT": 41,
+        "$LLAMA_SOURCE": 30,
+        "$LLAMA_BUILD": 90,
+        "$TOOLING_ROOT": 10,
+        "$SOURCE_ROOT": 27,
+        "$TOOL_VENV": 10,
+        "$ROCM_SDK": 1
+      },
+      "aliases": [
+        "$EVIDENCE_ROOT",
+        "$LLAMA_BUILD",
+        "$LLAMA_SOURCE",
+        "$MODEL_ROOT",
+        "$ROCM_SDK",
+        "$SOURCE_ROOT",
+        "$TOOLING_ROOT",
+        "$TOOL_VENV"
+      ]
+    },
+    {
+      "original_relative_path": "small-hip-comparison/comparison.json",
+      "public_relative_path": "reports/small.redacted.json",
+      "original_sha256": "feaf414bc68393d6d8118336f28a248c83e1884082df81ae75f42e4d1f83e7b6",
+      "original_bytes": 131861,
+      "public_sha256": "5a70d9383b29cc7ae056ae35476abfd0b906148d999517053f66396d1f108c4d",
+      "public_bytes": 116015,
+      "transformation": "json-string-path-prefix-substitution",
+      "replacement_count": 393,
+      "replacement_counts_by_alias": {
+        "$EVIDENCE_ROOT": 225,
+        "$LLAMA_SOURCE": 30,
+        "$LLAMA_BUILD": 90,
+        "$TOOLING_ROOT": 10,
+        "$SOURCE_ROOT": 27,
+        "$TOOL_VENV": 10,
+        "$ROCM_SDK": 1
+      },
+      "aliases": [
+        "$EVIDENCE_ROOT",
+        "$LLAMA_BUILD",
+        "$LLAMA_SOURCE",
+        "$ROCM_SDK",
+        "$SOURCE_ROOT",
+        "$TOOLING_ROOT",
+        "$TOOL_VENV"
+      ]
+    },
+    {
+      "original_relative_path": "inputs.json",
+      "public_relative_path": "inputs/inputs.redacted.json",
+      "original_sha256": "c806ecf3f4fefce4b5c9562a5dea7221cb1f4eb27ee8b7b54f5b5cfc31125155",
+      "original_bytes": 2690,
+      "public_sha256": "4a3496c8fa8cababdcd4735ea75d4eabdbd70c2c7bd520da57ea78c060e39bab",
+      "public_bytes": 2172,
+      "transformation": "json-string-path-prefix-substitution",
+      "replacement_count": 12,
+      "replacement_counts_by_alias": {
+        "$EVIDENCE_ROOT": 4,
+        "$PREVIOUS_EVIDENCE": 6,
+        "$MODEL_ROOT": 2
+      },
+      "aliases": [
+        "$EVIDENCE_ROOT",
+        "$MODEL_ROOT",
+        "$PREVIOUS_EVIDENCE"
+      ]
+    },
+    {
+      "original_relative_path": "reference/dense_logits_ref.build.json",
+      "public_relative_path": "reports/reference-build.redacted.json",
+      "original_sha256": "11edb58899eac83b193262c8e4eebcf572a3f1672694e1c8915a888d999b4c78",
+      "original_bytes": 2276,
+      "public_sha256": "8e8d27f398f52d40ce0e76e9a065d78e86e0c562213e97ffa2925443c270674f",
+      "public_bytes": 1802,
+      "transformation": "json-string-path-prefix-substitution",
+      "replacement_count": 16,
+      "replacement_counts_by_alias": {
+        "$LLAMA_SOURCE": 3,
+        "$LLAMA_BUILD": 9,
+        "$TOOLING_ROOT": 1,
+        "$SOURCE_ROOT": 1,
+        "$EVIDENCE_ROOT": 1,
+        "$TOOL_VENV": 1
+      },
+      "aliases": [
+        "$EVIDENCE_ROOT",
+        "$LLAMA_BUILD",
+        "$LLAMA_SOURCE",
+        "$SOURCE_ROOT",
+        "$TOOLING_ROOT",
+        "$TOOL_VENV"
+      ]
+    },
+    {
+      "original_relative_path": "scope.json",
+      "public_relative_path": "reports/scope.redacted.json",
+      "original_sha256": "fa3446247620b3027af4ea59ab198af9522fa42d547f0b3d2c2474bef31fc86d",
+      "original_bytes": 3207,
+      "public_sha256": "fa3446247620b3027af4ea59ab198af9522fa42d547f0b3d2c2474bef31fc86d",
+      "public_bytes": 3207,
+      "transformation": "json-string-path-prefix-substitution",
+      "replacement_count": 0,
+      "replacement_counts_by_alias": {},
+      "aliases": []
+    },
+    {
+      "original_relative_path": "comparison-vs-original.json",
+      "public_relative_path": "reports/comparison-vs-original.redacted.json",
+      "original_sha256": "e8bc4d6e32b13d7e0bd8cf37200e510bbbe9e9fa62b6881e184b8332f01b6072",
+      "original_bytes": 1570,
+      "public_sha256": "e8bc4d6e32b13d7e0bd8cf37200e510bbbe9e9fa62b6881e184b8332f01b6072",
+      "public_bytes": 1570,
+      "transformation": "json-string-path-prefix-substitution",
+      "replacement_count": 0,
+      "replacement_counts_by_alias": {},
+      "aliases": []
+    },
+    {
+      "original_relative_path": "patch-reconstruction.json",
+      "public_relative_path": "reports/patch-reconstruction.redacted.json",
+      "original_sha256": "007202a8b78d9e58350c1365ba4f91a215c6568f38e3161ad5a4abb189327350",
+      "original_bytes": 365,
+      "public_sha256": "007202a8b78d9e58350c1365ba4f91a215c6568f38e3161ad5a4abb189327350",
+      "public_bytes": 365,
+      "transformation": "json-string-path-prefix-substitution",
+      "replacement_count": 0,
+      "replacement_counts_by_alias": {},
+      "aliases": []
+    },
+    {
+      "original_relative_path": "commands.json",
+      "public_relative_path": "reports/commands.redacted.json",
+      "original_sha256": "c4ae97ff4bcc617d8ca607bedcc6aa8e304a10c56eb9e429aca807d7f56a4c2d",
+      "original_bytes": 8898,
+      "public_sha256": "45ee6052577808f706c3a076dcf5b9029e870eef39abb8d7e0ab989f42a9524c",
+      "public_bytes": 6212,
+      "transformation": "json-string-path-prefix-substitution",
+      "replacement_count": 67,
+      "replacement_counts_by_alias": {
+        "$EVIDENCE_ROOT": 35,
+        "$SOURCE_ROOT": 26,
+        "$LLAMA_SOURCE": 1,
+        "$LLAMA_BUILD": 1,
+        "$TOOL_VENV": 1,
+        "$FIXTURE_ROOT": 1,
+        "$MODEL_ROOT": 2
+      },
+      "aliases": [
+        "$EVIDENCE_ROOT",
+        "$FIXTURE_ROOT",
+        "$LLAMA_BUILD",
+        "$LLAMA_SOURCE",
+        "$MODEL_ROOT",
+        "$SOURCE_ROOT",
+        "$TOOL_VENV"
+      ]
+    },
+    {
+      "original_relative_path": "inputs/english.txt",
+      "public_relative_path": "inputs/english.txt",
+      "original_sha256": "bbaff4d2ecd5892d4a442b0f53131641bf6e6f284761dd20fc0664bc97145762",
+      "original_bytes": 24,
+      "public_sha256": "bbaff4d2ecd5892d4a442b0f53131641bf6e6f284761dd20fc0664bc97145762",
+      "public_bytes": 24,
+      "transformation": "byte-identical-copy",
+      "replacement_count": 0,
+      "replacement_counts_by_alias": {},
+      "aliases": []
+    },
+    {
+      "original_relative_path": "inputs/english.ids",
+      "public_relative_path": "inputs/english.ids",
+      "original_sha256": "ac224bf7edf2cf8c82f50255805fd06ad2fbf90fa9f147f2358566c2255d77ba",
+      "original_bytes": 22,
+      "public_sha256": "ac224bf7edf2cf8c82f50255805fd06ad2fbf90fa9f147f2358566c2255d77ba",
+      "public_bytes": 22,
+      "transformation": "byte-identical-copy",
+      "replacement_count": 0,
+      "replacement_counts_by_alias": {},
+      "aliases": []
+    },
+    {
+      "original_relative_path": "inputs/korean.txt",
+      "public_relative_path": "inputs/korean.txt",
+      "original_sha256": "8136b9f248ff5da30946ca049f8a32435feb4c184a2f8b6665dc5b29f46ca84d",
+      "original_bytes": 25,
+      "public_sha256": "8136b9f248ff5da30946ca049f8a32435feb4c184a2f8b6665dc5b29f46ca84d",
+      "public_bytes": 25,
+      "transformation": "byte-identical-copy",
+      "replacement_count": 0,
+      "replacement_counts_by_alias": {},
+      "aliases": []
+    },
+    {
+      "original_relative_path": "inputs/korean.ids",
+      "public_relative_path": "inputs/korean.ids",
+      "original_sha256": "8dd5dad7f2baa37ef9220e63e98e4eb83cc8b5fa301d00fc67cd4c1f98fee8c0",
+      "original_bytes": 34,
+      "public_sha256": "8dd5dad7f2baa37ef9220e63e98e4eb83cc8b5fa301d00fc67cd4c1f98fee8c0",
+      "public_bytes": 34,
+      "transformation": "byte-identical-copy",
+      "replacement_count": 0,
+      "replacement_counts_by_alias": {},
+      "aliases": []
+    },
+    {
+      "original_relative_path": "canonical/fmt.log",
+      "public_relative_path": "logs/canonical/fmt.redacted.log",
+      "original_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "original_bytes": 0,
+      "public_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "public_bytes": 0,
+      "transformation": "text-path-prefix-substitution",
+      "replacement_count": 0,
+      "replacement_counts_by_alias": {},
+      "aliases": []
+    },
+    {
+      "original_relative_path": "canonical/host-test.log",
+      "public_relative_path": "logs/canonical/host-test.redacted.log",
+      "original_sha256": "a87ce7374fbd75b346128d8e2d7bb778fc0b1155883562b04efd8949bb4a016f",
+      "original_bytes": 828,
+      "public_sha256": "5eaaf4f1ea3350a1a3fad06cea20af82d0f27893e42328c74168390d2a50279d",
+      "public_bytes": 798,
+      "transformation": "text-path-prefix-substitution",
+      "replacement_count": 1,
+      "replacement_counts_by_alias": {
+        "$SOURCE_ROOT": 1
+      },
+      "aliases": [
+        "$SOURCE_ROOT"
+      ]
+    },
+    {
+      "original_relative_path": "canonical/host-clippy.log",
+      "public_relative_path": "logs/canonical/host-clippy.redacted.log",
+      "original_sha256": "e3744c7f52ca3f70d8b86f54b42efa7cb699a8bd42f95f0d2bedafe3fde4dbb3",
+      "original_bytes": 177,
+      "public_sha256": "a82ff90b290ecf6953e18eef935c1dbc819c9d93a6815be1c3f6c63f3e8d17bf",
+      "public_bytes": 147,
+      "transformation": "text-path-prefix-substitution",
+      "replacement_count": 1,
+      "replacement_counts_by_alias": {
+        "$SOURCE_ROOT": 1
+      },
+      "aliases": [
+        "$SOURCE_ROOT"
+      ]
+    },
+    {
+      "original_relative_path": "canonical/device-clippy.log",
+      "public_relative_path": "logs/canonical/device-clippy.redacted.log",
+      "original_sha256": "e8056ee5216ba6e20caceaf7380ae427efae61910fe397b8ab785d06f27369ad",
+      "original_bytes": 176,
+      "public_sha256": "b45785418da7a7978a072ad79228b112027baa30d42efe531e52a579c7375c44",
+      "public_bytes": 146,
+      "transformation": "text-path-prefix-substitution",
+      "replacement_count": 1,
+      "replacement_counts_by_alias": {
+        "$SOURCE_ROOT": 1
+      },
+      "aliases": [
+        "$SOURCE_ROOT"
+      ]
+    },
+    {
+      "original_relative_path": "canonical/device-build.log",
+      "public_relative_path": "logs/canonical/device-build.redacted.log",
+      "original_sha256": "9d6636d55727f7c154db48c7a9a164e300355e5dbba987a3e1bbfbb764838871",
+      "original_bytes": 6331,
+      "public_sha256": "4b3b1e64835f50f77f98447f28ff95130e01eda9582ea147ad55a2d1ba894134",
+      "public_bytes": 5511,
+      "transformation": "text-path-prefix-substitution",
+      "replacement_count": 27,
+      "replacement_counts_by_alias": {
+        "$TOOLING_ROOT": 10,
+        "$SOURCE_ROOT": 17
+      },
+      "aliases": [
+        "$SOURCE_ROOT",
+        "$TOOLING_ROOT"
+      ]
+    },
+    {
+      "original_relative_path": "canonical/host-build.log",
+      "public_relative_path": "logs/canonical/host-build.redacted.log",
+      "original_sha256": "d0474c913a50c3eb326f3daea7412c28bcd760653855e0bb0119867988fdf74c",
+      "original_bytes": 167,
+      "public_sha256": "9fd52051d74ce37f5450055f85f657c1f026e4473c9f22886a45727d4649a1df",
+      "public_bytes": 137,
+      "transformation": "text-path-prefix-substitution",
+      "replacement_count": 1,
+      "replacement_counts_by_alias": {
+        "$SOURCE_ROOT": 1
+      },
+      "aliases": [
+        "$SOURCE_ROOT"
+      ]
+    },
+    {
+      "original_relative_path": "canonical/gpu.log",
+      "public_relative_path": "logs/canonical/gpu.redacted.log",
+      "original_sha256": "92af53a65cad72c1430e0c706c86d03ffa69b32467cfc897e7886ed426b96a9f",
+      "original_bytes": 4629,
+      "public_sha256": "92af53a65cad72c1430e0c706c86d03ffa69b32467cfc897e7886ed426b96a9f",
+      "public_bytes": 4629,
+      "transformation": "text-path-prefix-substitution",
+      "replacement_count": 0,
+      "replacement_counts_by_alias": {},
+      "aliases": []
+    },
+    {
+      "original_relative_path": "canonical/forward-gpu.log",
+      "public_relative_path": "logs/canonical/forward-gpu.redacted.log",
+      "original_sha256": "66b3b50a5c5369c79960238c4feb4a95a14fb9522892920348af7499f1ff6203",
+      "original_bytes": 2616,
+      "public_sha256": "66b3b50a5c5369c79960238c4feb4a95a14fb9522892920348af7499f1ff6203",
+      "public_bytes": 2616,
+      "transformation": "text-path-prefix-substitution",
+      "replacement_count": 0,
+      "replacement_counts_by_alias": {},
+      "aliases": []
+    },
+    {
+      "original_relative_path": "canonical-current-main.log",
+      "public_relative_path": "logs/canonical-current-main.redacted.log",
+      "original_sha256": "12246f4fa1fd7ea7469f1d4092c1d94fab5665975bbea0d0676272e0f9f5b86a",
+      "original_bytes": 214,
+      "public_sha256": "b8062cad2f78566f5f11003b56b65f4393d776fef7e785a3e78ac8a4e6d678ce",
+      "public_bytes": 165,
+      "transformation": "text-path-prefix-substitution",
+      "replacement_count": 1,
+      "replacement_counts_by_alias": {
+        "$EVIDENCE_ROOT": 1
+      },
+      "aliases": [
+        "$EVIDENCE_ROOT"
+      ]
+    },
+    {
+      "original_relative_path": "root-fmt.log",
+      "public_relative_path": "logs/root-fmt.redacted.log",
+      "original_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "original_bytes": 0,
+      "public_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "public_bytes": 0,
+      "transformation": "text-path-prefix-substitution",
+      "replacement_count": 0,
+      "replacement_counts_by_alias": {},
+      "aliases": []
+    },
+    {
+      "original_relative_path": "reference-self-test.log",
+      "public_relative_path": "logs/reference-self-test.redacted.log",
+      "original_sha256": "6417bd60e82dddaf433ccc35a802672d3fbe754ea7f18fe14de9906f564ec339",
+      "original_bytes": 270,
+      "public_sha256": "6417bd60e82dddaf433ccc35a802672d3fbe754ea7f18fe14de9906f564ec339",
+      "public_bytes": 270,
+      "transformation": "text-path-prefix-substitution",
+      "replacement_count": 0,
+      "replacement_counts_by_alias": {},
+      "aliases": []
+    },
+    {
+      "original_relative_path": "comparer-self-test.log",
+      "public_relative_path": "logs/comparer-self-test.redacted.log",
+      "original_sha256": "4858f0648274a37f5c1afbb0cacd5468099351a0994cdbd787526c8130f44e78",
+      "original_bytes": 57,
+      "public_sha256": "4858f0648274a37f5c1afbb0cacd5468099351a0994cdbd787526c8130f44e78",
+      "public_bytes": 57,
+      "transformation": "text-path-prefix-substitution",
+      "replacement_count": 0,
+      "replacement_counts_by_alias": {},
+      "aliases": []
+    },
+    {
+      "original_relative_path": "recipes-contract.log",
+      "public_relative_path": "logs/recipes-contract.redacted.log",
+      "original_sha256": "515c6b5f45e965e8697264313e81859cc00561751d886420682577772eb1fac8",
+      "original_bytes": 116,
+      "public_sha256": "515c6b5f45e965e8697264313e81859cc00561751d886420682577772eb1fac8",
+      "public_bytes": 116,
+      "transformation": "text-path-prefix-substitution",
+      "replacement_count": 0,
+      "replacement_counts_by_alias": {},
+      "aliases": []
+    },
+    {
+      "original_relative_path": "comment-contract.log",
+      "public_relative_path": "logs/comment-contract.redacted.log",
+      "original_sha256": "0fd5e57e377ebf6ec6c9380cb968aa876dd6ca75a92a35985c06f3854ec855e0",
+      "original_bytes": 165,
+      "public_sha256": "0fd5e57e377ebf6ec6c9380cb968aa876dd6ca75a92a35985c06f3854ec855e0",
+      "public_bytes": 165,
+      "transformation": "text-path-prefix-substitution",
+      "replacement_count": 0,
+      "replacement_counts_by_alias": {},
+      "aliases": []
+    },
+    {
+      "original_relative_path": "reference-build.log",
+      "public_relative_path": "logs/reference-build.redacted.log",
+      "original_sha256": "76cbb84cc717c74bae719fd7a3bde6e9f6b057a25e6a63888ec13d61678d1c0d",
+      "original_bytes": 2298,
+      "public_sha256": "0c804612ba9e57ef05ca2c185a9e4740b2ac81765c98dcbf335252a38fe6b476",
+      "public_bytes": 1824,
+      "transformation": "text-path-prefix-substitution",
+      "replacement_count": 16,
+      "replacement_counts_by_alias": {
+        "$EVIDENCE_ROOT": 1,
+        "$TOOLING_ROOT": 1,
+        "$SOURCE_ROOT": 1,
+        "$LLAMA_BUILD": 9,
+        "$LLAMA_SOURCE": 3,
+        "$TOOL_VENV": 1
+      },
+      "aliases": [
+        "$EVIDENCE_ROOT",
+        "$LLAMA_BUILD",
+        "$LLAMA_SOURCE",
+        "$SOURCE_ROOT",
+        "$TOOLING_ROOT",
+        "$TOOL_VENV"
+      ]
+    },
+    {
+      "original_relative_path": "refset-consumer-tests.log",
+      "public_relative_path": "logs/refset-consumer-tests.redacted.log",
+      "original_sha256": "7223dde565f9124bcce69e11b7326d1fdc06f4e52561da01df196a1ec0f898ac",
+      "original_bytes": 20220,
+      "public_sha256": "cf1d578123cbd2d43e3b20e5759d3f7687b42ea9c4b84be2ad12db3bd6339d08",
+      "public_bytes": 20190,
+      "transformation": "text-path-prefix-substitution",
+      "replacement_count": 1,
+      "replacement_counts_by_alias": {
+        "$SOURCE_ROOT": 1
+      },
+      "aliases": [
+        "$SOURCE_ROOT"
+      ]
+    },
+    {
+      "original_relative_path": "cpu-reset-compatibility.log",
+      "public_relative_path": "logs/cpu-reset-compatibility.redacted.log",
+      "original_sha256": "53d5bc973e17ff0078efda2cb0dd3890668f97e00a229c3cdb94262661058e27",
+      "original_bytes": 147,
+      "public_sha256": "3f4420e61f8b927cf1508b16b14557d813e61a5a8f186c3c5113ce1d79178a6f",
+      "public_bytes": 98,
+      "transformation": "text-path-prefix-substitution",
+      "replacement_count": 1,
+      "replacement_counts_by_alias": {
+        "$EVIDENCE_ROOT": 1
+      },
+      "aliases": [
+        "$EVIDENCE_ROOT"
+      ]
+    },
+    {
+      "original_relative_path": "english-hip-comparison.log",
+      "public_relative_path": "logs/english-hip-comparison.redacted.log",
+      "original_sha256": "ed3f8cf5ca25a9ed2377a4232b9e7b5282d87ca4c7efc543e6ecf803126d7c00",
+      "original_bytes": 1569,
+      "public_sha256": "1ddfc0a7fe1bb712101f3576732e405d5da8c0e64ac86269a10d59d912d263bb",
+      "public_bytes": 1079,
+      "transformation": "text-path-prefix-substitution",
+      "replacement_count": 10,
+      "replacement_counts_by_alias": {
+        "$EVIDENCE_ROOT": 10
+      },
+      "aliases": [
+        "$EVIDENCE_ROOT"
+      ]
+    },
+    {
+      "original_relative_path": "korean-hip-comparison.log",
+      "public_relative_path": "logs/korean-hip-comparison.redacted.log",
+      "original_sha256": "7b765568c1ae82309a0f6a0d09499c3f60666bc2e36d76a8afd1ca4806880b0e",
+      "original_bytes": 1559,
+      "public_sha256": "ca879a2a5beab79720f662fb687ca26208a5f7ec36e9e9a4dc3c2f5f22c34e84",
+      "public_bytes": 1069,
+      "transformation": "text-path-prefix-substitution",
+      "replacement_count": 10,
+      "replacement_counts_by_alias": {
+        "$EVIDENCE_ROOT": 10
+      },
+      "aliases": [
+        "$EVIDENCE_ROOT"
+      ]
+    },
+    {
+      "original_relative_path": "small-hip-comparison.log",
+      "public_relative_path": "logs/small-hip-comparison.redacted.log",
+      "original_sha256": "668a9a0de02907f38cc65651243bf7ac6cb16575700129e04f3d409c08899262",
+      "original_bytes": 1549,
+      "public_sha256": "e0a4b32133221ee4da1df83c7166e2878a7c00f41f1f98729e7543b2eb675eb2",
+      "public_bytes": 1059,
+      "transformation": "text-path-prefix-substitution",
+      "replacement_count": 10,
+      "replacement_counts_by_alias": {
+        "$EVIDENCE_ROOT": 10
+      },
+      "aliases": [
+        "$EVIDENCE_ROOT"
+      ]
+    },
+    {
+      "original_relative_path": "english-hip-comparison/reference-final/run.log",
+      "public_relative_path": "logs/english/reference-final.redacted.log",
+      "original_sha256": "aa562d9a397cb3e11ba2207317d567ee042fa2b772352d96cad88583ad66469f",
+      "original_bytes": 181455,
+      "public_sha256": "97fd3a2eded444533f76929e2f77b68b97d7e3a750ee1995560c103f6b940d28",
+      "public_bytes": 181371,
+      "transformation": "text-path-prefix-substitution",
+      "replacement_count": 2,
+      "replacement_counts_by_alias": {
+        "$EVIDENCE_ROOT": 1,
+        "$MODEL_ROOT": 1
+      },
+      "aliases": [
+        "$EVIDENCE_ROOT",
+        "$MODEL_ROOT"
+      ]
+    },
+    {
+      "original_relative_path": "english-hip-comparison/native-greedy.log",
+      "public_relative_path": "logs/english/native-greedy.redacted.log",
+      "original_sha256": "ab1a7e429e101f665540547eab940b87281c11eb983fecb8be4aee5076cad204",
+      "original_bytes": 148,
+      "public_sha256": "ab1a7e429e101f665540547eab940b87281c11eb983fecb8be4aee5076cad204",
+      "public_bytes": 148,
+      "transformation": "text-path-prefix-substitution",
+      "replacement_count": 0,
+      "replacement_counts_by_alias": {},
+      "aliases": []
+    },
+    {
+      "original_relative_path": "english-hip-comparison/native-forced.log",
+      "public_relative_path": "logs/english/native-forced.redacted.log",
+      "original_sha256": "b6589da66859f7f9d594d862b5cb606b82f3354a18a164b88996d31b6a212e14",
+      "original_bytes": 114,
+      "public_sha256": "b6589da66859f7f9d594d862b5cb606b82f3354a18a164b88996d31b6a212e14",
+      "public_bytes": 114,
+      "transformation": "text-path-prefix-substitution",
+      "replacement_count": 0,
+      "replacement_counts_by_alias": {},
+      "aliases": []
+    },
+    {
+      "original_relative_path": "korean-hip-comparison/reference-final/run.log",
+      "public_relative_path": "logs/korean/reference-final.redacted.log",
+      "original_sha256": "25f270b54d0c1933acb8e88f9e558877aab7d7426d0132ad7aa5ce3941b3b9d3",
+      "original_bytes": 181454,
+      "public_sha256": "4e9407840d045edf6085948daf2236e5bb95442d4628645b9d2535b69c6cdc61",
+      "public_bytes": 181370,
+      "transformation": "text-path-prefix-substitution",
+      "replacement_count": 2,
+      "replacement_counts_by_alias": {
+        "$EVIDENCE_ROOT": 1,
+        "$MODEL_ROOT": 1
+      },
+      "aliases": [
+        "$EVIDENCE_ROOT",
+        "$MODEL_ROOT"
+      ]
+    },
+    {
+      "original_relative_path": "korean-hip-comparison/native-greedy.log",
+      "public_relative_path": "logs/korean/native-greedy.redacted.log",
+      "original_sha256": "dd79441abbf4ed7133d45fbc745cc4a0485b2f4411b8fa897bb2a39443fb5d16",
+      "original_bytes": 161,
+      "public_sha256": "dd79441abbf4ed7133d45fbc745cc4a0485b2f4411b8fa897bb2a39443fb5d16",
+      "public_bytes": 161,
+      "transformation": "text-path-prefix-substitution",
+      "replacement_count": 0,
+      "replacement_counts_by_alias": {},
+      "aliases": []
+    },
+    {
+      "original_relative_path": "korean-hip-comparison/native-forced.log",
+      "public_relative_path": "logs/korean/native-forced.redacted.log",
+      "original_sha256": "b6589da66859f7f9d594d862b5cb606b82f3354a18a164b88996d31b6a212e14",
+      "original_bytes": 114,
+      "public_sha256": "b6589da66859f7f9d594d862b5cb606b82f3354a18a164b88996d31b6a212e14",
+      "public_bytes": 114,
+      "transformation": "text-path-prefix-substitution",
+      "replacement_count": 0,
+      "replacement_counts_by_alias": {},
+      "aliases": []
+    },
+    {
+      "original_relative_path": "cpu-reset-compatibility/run.log",
+      "public_relative_path": "logs/cpu-reset-compatibility-run.redacted.log",
+      "original_sha256": "10ac8bc7e34a5cc58d2209b8c3e9f6f78e080d3a4536d95cde42f74b246e143e",
+      "original_bytes": 22348,
+      "public_sha256": "6711f026685f53883bd30141c644d0fe1fc3333b9ea603b5c4fcd6bf9f5afdb8",
+      "public_bytes": 22250,
+      "transformation": "text-path-prefix-substitution",
+      "replacement_count": 2,
+      "replacement_counts_by_alias": {
+        "$EVIDENCE_ROOT": 2
+      },
+      "aliases": [
+        "$EVIDENCE_ROOT"
+      ]
+    },
+    {
+      "original_relative_path": "hip-full-forward-current.patch",
+      "public_relative_path": "hip-full-forward-current.patch",
+      "original_sha256": "a28558923f51e80ff9279443b6fbfb5e1b0edbc0e1d052172f8d7dde0ba7ae0d",
+      "original_bytes": 244333,
+      "public_sha256": "a28558923f51e80ff9279443b6fbfb5e1b0edbc0e1d052172f8d7dde0ba7ae0d",
+      "public_bytes": 244333,
+      "transformation": "byte-identical-copy",
+      "replacement_count": 0,
+      "replacement_counts_by_alias": {},
+      "aliases": []
+    },
+    {
+      "original_relative_path": "review.json",
+      "public_relative_path": "reports/review.redacted.json",
+      "original_sha256": "d84cf1967fc65ca7a3127cff522b11b0a88c207e102ac3ac0c0f2cb99eb2f790",
+      "original_bytes": 827,
+      "public_sha256": "d84cf1967fc65ca7a3127cff522b11b0a88c207e102ac3ac0c0f2cb99eb2f790",
+      "public_bytes": 827,
+      "transformation": "json-string-path-prefix-substitution",
+      "replacement_count": 0,
+      "replacement_counts_by_alias": {},
+      "aliases": []
+    }
+  ]
+}

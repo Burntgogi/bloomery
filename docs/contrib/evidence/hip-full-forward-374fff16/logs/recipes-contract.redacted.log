@@ -1,0 +1,1 @@
+check-recipes: tools/gate-paths.tsv: 139 gate rows held to the derivation, 31 rows with exceptions naming 689 gates

@@ -1,0 +1,27 @@
+{"operation":"core_gemv_kind_0","values":3,"nmse":0,"max_abs":0}
+{"operation":"core_embed_kind_0_token_0","values":67,"nmse":0,"max_abs":0}
+{"operation":"core_embed_kind_0_token_1","values":67,"nmse":0,"max_abs":0}
+{"operation":"core_embed_kind_0_token_2","values":67,"nmse":0,"max_abs":0}
+{"operation":"core_gemv_kind_12","values":3,"nmse":0.000000000000007216267605747946,"max_abs":0.0000019073486328125}
+{"operation":"core_embed_kind_12_token_0","values":512,"nmse":0,"max_abs":0}
+{"operation":"core_embed_kind_12_token_1","values":512,"nmse":0,"max_abs":0}
+{"operation":"core_embed_kind_12_token_2","values":512,"nmse":0,"max_abs":0}
+{"operation":"core_gemv_kind_14","values":3,"nmse":0,"max_abs":0}
+{"operation":"core_embed_kind_14_token_0","values":512,"nmse":0,"max_abs":0}
+{"operation":"core_embed_kind_14_token_1","values":512,"nmse":0,"max_abs":0}
+{"operation":"core_embed_kind_14_token_2","values":512,"nmse":0,"max_abs":0}
+{"operation":"core_gemv_kind_8","values":3,"nmse":0.000000000000004108988484777532,"max_abs":0.00000005960464477539063}
+{"operation":"core_embed_kind_8_token_0","values":96,"nmse":0,"max_abs":0}
+{"operation":"core_embed_kind_8_token_1","values":96,"nmse":0,"max_abs":0}
+{"operation":"core_embed_kind_8_token_2","values":96,"nmse":0,"max_abs":0}
+{"operation":"core_grouped_norm","values":201,"nmse":0,"max_abs":0}
+{"operation":"core_glu","values":201,"nmse":0,"max_abs":0}
+{"operation":"core_residual","values":201,"nmse":0,"max_abs":0}
+{"operation":"core_norm_in_place","values":201,"nmse":0,"max_abs":0}
+{"operation":"core_fault_and_argmax","atomic_min":true,"tie_smallest":true,"nonfinite_refused":true,"invalid_formats_refused":true}
+forward-mixer GDN positions=15 passes=2 ring_rows=11 nk=2 nv=4 worst_nmse=[3.437104091382377e-15, 3.779428491961927e-14, 2.1857066830962386e-14, 3.903734200169316e-14, 8.775202357736438e-15] reset_repeat=bitwise
+forward-mixer GQA qh=4 kvh=2 width=256 rope=64 positions=64 passes=2 q_nmse=0.000000000e0 attention_nmse=1.792500666e-13 f16_cache=bitwise reset_repeat=bitwise poisoned_future=unread
+forward-mixer refusals=conv-eps,decay-beta,delta-state,gate-square,gqa-square,attention-key,attention-gate band_nmse<=1e-6
+{"operation":"forward_model_state","token_bounds":true,"context_bounds":true,"poison_refusal":true,"reset_bitwise_recovery":true}
+{"consumed_tokens":12,"greedy_ids":[141,129,231,30,177,245,10,134],"layers":2,"operation":"forward_hybrid","reset_repeat_bitwise_equal":true}
+{"actual_managed_allocation_bytes":1387160,"managed_allocation_budget_bytes":16777216,"operation":"forward_probe_complete","real_model_acceptance":false}

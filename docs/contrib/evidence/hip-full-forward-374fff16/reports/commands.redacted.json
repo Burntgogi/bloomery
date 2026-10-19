@@ -1,0 +1,251 @@
+[
+  {
+    "name": "preserve-prepublication-head",
+    "argv": [
+      "git",
+      "bundle",
+      "create",
+      "$EVIDENCE_ROOT/prepared-faa9b469.bundle",
+      "ba39a135ba73cbafe63917e3f9ea899cc70eea5d..contribution/hip-full-forward-current-20261019"
+    ],
+    "cwd": "$SOURCE_ROOT",
+    "exit_code": 0,
+    "log": "$EVIDENCE_ROOT/preserve-prepublication-head.log"
+  },
+  {
+    "name": "refresh-publishing-base",
+    "argv": [
+      "git",
+      "rebase",
+      "--onto",
+      "11d8a7d37a7648f3d5fc058f293947638313b2c4",
+      "ba39a135ba73cbafe63917e3f9ea899cc70eea5d",
+      "contribution/hip-full-forward-current-20261019"
+    ],
+    "cwd": "$SOURCE_ROOT",
+    "exit_code": 0,
+    "log": "$EVIDENCE_ROOT/refresh-publishing-base.log"
+  },
+  {
+    "name": "publishing-source-id",
+    "argv": [
+      "git",
+      "rev-parse",
+      "HEAD"
+    ],
+    "cwd": "$SOURCE_ROOT",
+    "exit_code": 0,
+    "log": "$EVIDENCE_ROOT/publishing-source-id.log"
+  },
+  {
+    "name": "comparer-self-test",
+    "argv": [
+      "/usr/bin/python3",
+      "$SOURCE_ROOT/labs/hip-native/compare-hip.py",
+      "--self-test"
+    ],
+    "cwd": "$SOURCE_ROOT",
+    "exit_code": 0,
+    "log": "$EVIDENCE_ROOT/comparer-self-test.log"
+  },
+  {
+    "name": "reference-self-test",
+    "argv": [
+      "/usr/bin/python3",
+      "$SOURCE_ROOT/tools/ref/dense-logits.py",
+      "--self-test"
+    ],
+    "cwd": "$SOURCE_ROOT",
+    "exit_code": 0,
+    "log": "$EVIDENCE_ROOT/reference-self-test.log"
+  },
+  {
+    "name": "root-fmt",
+    "argv": [
+      "cargo",
+      "fmt",
+      "--all",
+      "--",
+      "--check"
+    ],
+    "cwd": "$SOURCE_ROOT",
+    "exit_code": 0,
+    "log": "$EVIDENCE_ROOT/root-fmt.log"
+  },
+  {
+    "name": "reference-build",
+    "argv": [
+      "/usr/bin/python3",
+      "$SOURCE_ROOT/tools/ref/dense-logits.py",
+      "build",
+      "--llama-tree",
+      "$LLAMA_SOURCE",
+      "--llama-build",
+      "$LLAMA_BUILD",
+      "--cmake",
+      "$TOOL_VENV/lib/python3.12/site-packages/cmake/data/bin/cmake",
+      "--out",
+      "$EVIDENCE_ROOT/reference/dense_logits_ref"
+    ],
+    "cwd": "$SOURCE_ROOT",
+    "exit_code": 0,
+    "log": "$EVIDENCE_ROOT/reference-build.log"
+  },
+  {
+    "name": "comment-contract",
+    "argv": [
+      "bash",
+      "$SOURCE_ROOT/tools/check-comments.sh"
+    ],
+    "cwd": "$SOURCE_ROOT",
+    "exit_code": 0,
+    "log": "$EVIDENCE_ROOT/comment-contract.log"
+  },
+  {
+    "name": "canonical-current-main",
+    "argv": [
+      "bash",
+      "$SOURCE_ROOT/labs/hip-native/verify.sh",
+      "$EVIDENCE_ROOT/canonical",
+      "--q4-rows",
+      "$FIXTURE_ROOT/Q4_K.bin",
+      "--k",
+      "6144",
+      "--rows",
+      "64"
+    ],
+    "cwd": "$SOURCE_ROOT/labs/hip-native",
+    "exit_code": 0,
+    "log": "$EVIDENCE_ROOT/canonical-current-main.log"
+  },
+  {
+    "name": "recipes-contract",
+    "argv": [
+      "/usr/bin/python3",
+      "$SOURCE_ROOT/tools/recipes.py",
+      "check"
+    ],
+    "cwd": "$SOURCE_ROOT",
+    "exit_code": 0,
+    "log": "$EVIDENCE_ROOT/recipes-contract.log"
+  },
+  {
+    "name": "cpu-reset-compatibility",
+    "argv": [
+      "/usr/bin/python3",
+      "$SOURCE_ROOT/tools/ref/dense-logits.py",
+      "run",
+      "--kind",
+      "reference",
+      "--backend",
+      "cpu",
+      "--target",
+      "hip-lab-hybrid",
+      "--binary",
+      "$EVIDENCE_ROOT/reference/dense_logits_ref",
+      "--model",
+      "$EVIDENCE_ROOT/canonical/forward/smoke.gguf",
+      "--prompt",
+      "$EVIDENCE_ROOT/canonical/forward/prompt.ids",
+      "--forced",
+      "$EVIDENCE_ROOT/canonical/forward/forced.ids",
+      "--ctx",
+      "64",
+      "--ubatch",
+      "1",
+      "--prefill",
+      "step",
+      "--reset-repeats",
+      "2",
+      "--out",
+      "$EVIDENCE_ROOT/cpu-reset-compatibility"
+    ],
+    "cwd": "$SOURCE_ROOT",
+    "exit_code": 0,
+    "log": "$EVIDENCE_ROOT/cpu-reset-compatibility.log"
+  },
+  {
+    "name": "refset-consumer-tests",
+    "argv": [
+      "cargo",
+      "test",
+      "--locked",
+      "-p",
+      "bloomery-refset",
+      "--lib"
+    ],
+    "cwd": "$SOURCE_ROOT",
+    "exit_code": 0,
+    "log": "$EVIDENCE_ROOT/refset-consumer-tests.log"
+  },
+  {
+    "name": "small-hip-comparison",
+    "argv": [
+      "/usr/bin/python3",
+      "$SOURCE_ROOT/labs/hip-native/compare-hip.py",
+      "$EVIDENCE_ROOT/small-hip-comparison",
+      "--reference",
+      "$EVIDENCE_ROOT/reference/dense_logits_ref",
+      "--native-evidence",
+      "$EVIDENCE_ROOT/canonical/result.json"
+    ],
+    "cwd": "$SOURCE_ROOT",
+    "exit_code": 0,
+    "log": "$EVIDENCE_ROOT/small-hip-comparison.log"
+  },
+  {
+    "name": "english-hip-comparison",
+    "argv": [
+      "/usr/bin/python3",
+      "$SOURCE_ROOT/labs/hip-native/compare-hip.py",
+      "$EVIDENCE_ROOT/english-hip-comparison",
+      "--reference",
+      "$EVIDENCE_ROOT/reference/dense_logits_ref",
+      "--native-evidence",
+      "$EVIDENCE_ROOT/canonical/result.json",
+      "--target",
+      "qwen35-0.8b-candidate",
+      "--model",
+      "$MODEL_ROOT/notschmee/Qwen3.5-0.8B-GGUF/1870603ac8ab59c7ddb9d94cccf3b297e379538f/Qwen3.5-0.8B-Q4_K_M.gguf",
+      "--prompt",
+      "$EVIDENCE_ROOT/inputs/english.ids"
+    ],
+    "cwd": "$SOURCE_ROOT",
+    "exit_code": 0,
+    "log": "$EVIDENCE_ROOT/english-hip-comparison.log"
+  },
+  {
+    "name": "korean-hip-comparison",
+    "argv": [
+      "/usr/bin/python3",
+      "$SOURCE_ROOT/labs/hip-native/compare-hip.py",
+      "$EVIDENCE_ROOT/korean-hip-comparison",
+      "--reference",
+      "$EVIDENCE_ROOT/reference/dense_logits_ref",
+      "--native-evidence",
+      "$EVIDENCE_ROOT/canonical/result.json",
+      "--target",
+      "qwen35-0.8b-candidate",
+      "--model",
+      "$MODEL_ROOT/notschmee/Qwen3.5-0.8B-GGUF/1870603ac8ab59c7ddb9d94cccf3b297e379538f/Qwen3.5-0.8B-Q4_K_M.gguf",
+      "--prompt",
+      "$EVIDENCE_ROOT/inputs/korean.ids"
+    ],
+    "cwd": "$SOURCE_ROOT",
+    "exit_code": 0,
+    "log": "$EVIDENCE_ROOT/korean-hip-comparison.log"
+  },
+  {
+    "name": "source-scope",
+    "argv": [
+      "git",
+      "diff",
+      "--name-only",
+      "11d8a7d37a7648f3d5fc058f293947638313b2c4",
+      "374fff1608900e284b3e48f69abd4195738a6e3e"
+    ],
+    "cwd": "$SOURCE_ROOT",
+    "exit_code": 0,
+    "log": "$EVIDENCE_ROOT/source-scope.log"
+  }
+]

@@ -1,0 +1,10 @@
+complete set: $EVIDENCE_ROOT/english-hip-comparison/reference-step-0; GPU correctness acceptance remains separate
+complete set: $EVIDENCE_ROOT/english-hip-comparison/reference-step-1; GPU correctness acceptance remains separate
+complete set: $EVIDENCE_ROOT/english-hip-comparison/reference-step-2; GPU correctness acceptance remains separate
+complete set: $EVIDENCE_ROOT/english-hip-comparison/reference-step-3; GPU correctness acceptance remains separate
+complete set: $EVIDENCE_ROOT/english-hip-comparison/reference-step-4; GPU correctness acceptance remains separate
+complete set: $EVIDENCE_ROOT/english-hip-comparison/reference-step-5; GPU correctness acceptance remains separate
+complete set: $EVIDENCE_ROOT/english-hip-comparison/reference-step-6; GPU correctness acceptance remains separate
+complete set: $EVIDENCE_ROOT/english-hip-comparison/reference-step-7; GPU correctness acceptance remains separate
+complete set: $EVIDENCE_ROOT/english-hip-comparison/reference-final; GPU correctness acceptance remains separate
+$EVIDENCE_ROOT/english-hip-comparison/comparison.json

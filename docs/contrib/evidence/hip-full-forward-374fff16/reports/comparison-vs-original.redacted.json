@@ -1,0 +1,44 @@
+{
+  "english": {
+    "original_source": {
+      "commit": "faa9b469394caf2d15568a815f2fdcfe29ecfb36",
+      "tree": "c4ab14aca397a960c41832be83110a6a6fe631a1",
+      "lab_tree": "2823c530a4261b377b1913029604dc8a52afbd60",
+      "clean": true
+    },
+    "current_source": {
+      "commit": "374fff1608900e284b3e48f69abd4195738a6e3e",
+      "tree": "f438008d70015ddb81ad4aed4558a458846f953c",
+      "lab_tree": "2823c530a4261b377b1913029604dc8a52afbd60",
+      "clean": true
+    },
+    "prompt_ids_unchanged": true,
+    "reference_greedy_unchanged": true,
+    "native_greedy_unchanged": true,
+    "native_greedy_row_SHA256_unchanged": true,
+    "native_forced_row_SHA256_unchanged": true,
+    "reference_final_raw_SHA256_unchanged": true,
+    "numerical_diagnostics_unchanged": true
+  },
+  "korean": {
+    "original_source": {
+      "commit": "faa9b469394caf2d15568a815f2fdcfe29ecfb36",
+      "tree": "c4ab14aca397a960c41832be83110a6a6fe631a1",
+      "lab_tree": "2823c530a4261b377b1913029604dc8a52afbd60",
+      "clean": true
+    },
+    "current_source": {
+      "commit": "374fff1608900e284b3e48f69abd4195738a6e3e",
+      "tree": "f438008d70015ddb81ad4aed4558a458846f953c",
+      "lab_tree": "2823c530a4261b377b1913029604dc8a52afbd60",
+      "clean": true
+    },
+    "prompt_ids_unchanged": true,
+    "reference_greedy_unchanged": true,
+    "native_greedy_unchanged": true,
+    "native_greedy_row_SHA256_unchanged": true,
+    "native_forced_row_SHA256_unchanged": true,
+    "reference_final_raw_SHA256_unchanged": true,
+    "numerical_diagnostics_unchanged": true
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "source": {
+    "commit": "374fff1608900e284b3e48f69abd4195738a6e3e",
+    "tree": "f438008d70015ddb81ad4aed4558a458846f953c",
+    "lab_tree": "2823c530a4261b377b1913029604dc8a52afbd60",
+    "clean": true
+  },
+  "source_review": {
+    "reviewer": "PublishingSourceReview",
+    "result": "no findings",
+    "confidence": 0.96,
+    "scope": "unchanged feature-file contents against newer main consumers, reference-family compatibility and scope boundary"
+  },
+  "evidence_review": {
+    "reviewer": "PublishingEvidenceReview",
+    "result": "no findings",
+    "confidence": 0.98,
+    "scope": "actual source/tree/binary/library/command hashes; fixed input/model; raw shapes/sums/finiteness/reset pairs and independent greedy/forced argmax"
+  },
+  "method": "read-only existing-artifact audit; no duplicate engine execution"
+}
