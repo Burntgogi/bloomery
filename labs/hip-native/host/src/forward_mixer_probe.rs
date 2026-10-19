@@ -35,16 +35,8 @@ pub(super) fn compare(name: &str, got: &[f32], want: &[f32]) -> Result<f64, Stri
         energy += f64::from(b) * f64::from(b);
         max_abs = max_abs.max(delta.abs());
     }
-    let nmse = if energy == 0.0 {
-        if error == 0.0 { 0.0 } else { f64::INFINITY }
-    } else {
-        error / energy
-    };
-    if !nmse.is_finite() || nmse > 1.0e-6 {
-        return Err(format!(
-            "{name}: NMSE={nmse:.9e} max_abs={max_abs:.9e}, limit=1e-6"
-        ));
-    }
+    let nmse = crate::checked_nmse(name, error, energy)
+        .map_err(|e| format!("{e}, max_abs={max_abs:.9e}"))?;
     println!(
         "{{\"operation\":\"{name}\",\"values\":{},\"nmse\":{nmse},\"max_abs\":{max_abs}}}",
         got.len()

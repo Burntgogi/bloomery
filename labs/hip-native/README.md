@@ -14,6 +14,9 @@ The validation target is one RX 7900 GRE (`gfx1100`), Rust nightly 2026-08-28, i
 - Operator repeats use already allocated buffers. The reported zero count covers allocations explicitly issued by the selected-probe host, not internal driver allocations or diagnostic file output.
 
 The scalar probes retain fixed NMSE <= 1e-6 and finite outputs. The selected Q4_K port requires bitwise equality with the existing `qdot::card_q4k_dot_row_scalar` oracle for finite activations, NaN propagation for refused activation scales, and exact fault words, masks and skipped-slot sentinels. This is host-oracle/HIP equality, not a measured CUDA/HIP or model-token comparison. No throughput is claimed.
+Scalar Q4_K, dense FFN and core/mixer probes use one F64 NMSE normalization and acceptance
+owner. A zero-energy oracle requires exact zero error; nonzero energy is divided without a
+floor. The Q4 oracle retains its F64 dot products and checks both one and 32 activation columns.
 
 ## Verify
 
