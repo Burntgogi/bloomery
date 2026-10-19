@@ -174,6 +174,11 @@ that device. CPU math-node counts are retained honestly: the standard reference 
 embedding leg may remain on CPU. This is not a CPU-reference substitution or a claim that
 every reference node runs on HIP.
 
+Captures use the current forced-logits v2 manifest, including its `schedule` header
+and checked tensor sum. HIP diagnostics additionally bind the clean lab source HEAD
+and retain the full llama.cpp commit hash. They are not registered `logits-qwen38d`
+reference sets; that family's CPU/CUDA build identity and acceptance remain unchanged.
+
 Inputs stay fixed: raw prompt `[3,17,41,9,23]`, eight greedy IDs, context64, ubatch1,
 F16 KV and step prefill. The controller derives the reference continuation independently
 with eight HIP prefix captures; sentinel forced ID0 is not consumed. It then captures all

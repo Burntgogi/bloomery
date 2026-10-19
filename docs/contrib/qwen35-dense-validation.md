@@ -97,6 +97,10 @@ driver allocations, fragmentation and unmodeled workspace remain explicit exclus
 artifact, and requires finite, bit-identical repeat rows before publishing a complete
 bundle. Existing CPU/CUDA captures keep their explicit backend and single-repeat default.
 
+HIP diagnostics use the same v2 tensor manifest and `schedule` header, while retaining
+the lab source HEAD and full llama.cpp commit hash. They do not establish acceptance
+as the registered `logits-qwen38d` reference family.
+
 The frozen `hip-lab-hybrid` target is the small synthetic GDN/GQA GGUF, not the real 0.8B
 candidate. The [excluded HIP lab workflow](../../labs/hip-native/README.md#same-small-gguf-hip-comparison)
 derives its reference greedy continuation independently, compares native greedy and
