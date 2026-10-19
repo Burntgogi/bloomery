@@ -348,6 +348,7 @@ pub const fn gate_up(ty: GgmlType) -> Option<GateUpEntry> {
         | GgmlType::Q8_1
         | GgmlType::Q8_K
         | GgmlType::F8E4M3_ROWS
+        | GgmlType::NVFP4_ROWS
         | GgmlType::MXFP8
         | GgmlType::Unknown(_) => None,
     }
@@ -394,6 +395,7 @@ pub const fn down(ty: GgmlType) -> Option<(DownEntry, DownAct)> {
         | GgmlType::Q8_1
         | GgmlType::Q8_K
         | GgmlType::F8E4M3_ROWS
+        | GgmlType::NVFP4_ROWS
         | GgmlType::MXFP8
         | GgmlType::Unknown(_) => None,
     }
@@ -453,6 +455,7 @@ pub const fn gemm(ty: GgmlType) -> Option<GemmEntry> {
         | GgmlType::Q8_1
         | GgmlType::Q8_K
         | GgmlType::F8E4M3_ROWS
+        | GgmlType::NVFP4_ROWS
         | GgmlType::MXFP8
         | GgmlType::Unknown(_) => None,
     }
@@ -499,6 +502,7 @@ pub const fn dense(ty: GgmlType) -> Option<SiteEntry> {
         | GgmlType::Q8_1
         | GgmlType::Q8_K
         | GgmlType::F8E4M3_ROWS
+        | GgmlType::NVFP4_ROWS
         | GgmlType::Unknown(_) => None,
     }
 }
@@ -543,6 +547,7 @@ pub const fn head(ty: GgmlType) -> Option<HeadEntry> {
         | GgmlType::Q8_K
         | GgmlType::NVFP4
         | GgmlType::F8E4M3_ROWS
+        | GgmlType::NVFP4_ROWS
         | GgmlType::MXFP8
         | GgmlType::Unknown(_) => None,
     }
@@ -588,6 +593,7 @@ pub const fn embed(ty: GgmlType) -> Option<EmbedEntry> {
         | GgmlType::Q8_K
         | GgmlType::NVFP4
         | GgmlType::F8E4M3_ROWS
+        | GgmlType::NVFP4_ROWS
         | GgmlType::MXFP8
         | GgmlType::Unknown(_) => None,
     }
@@ -684,7 +690,7 @@ mod tests {
 
     /// Every `GgmlType` variant in declaration order, then one id the enum
     /// does not name.
-    const ALL: [GgmlType; 38] = [
+    const ALL: [GgmlType; 39] = [
         GgmlType::F32,
         GgmlType::F16,
         GgmlType::Q5_0,
@@ -722,6 +728,7 @@ mod tests {
         GgmlType::Q8_K,
         GgmlType::F8E4M3_ROWS,
         GgmlType::MXFP8,
+        GgmlType::NVFP4_ROWS,
         GgmlType::Unknown(99),
     ];
 
@@ -766,7 +773,8 @@ mod tests {
             GgmlType::Q8_K => 34,
             GgmlType::F8E4M3_ROWS => 35,
             GgmlType::MXFP8 => 36,
-            GgmlType::Unknown(_) => 37,
+            GgmlType::NVFP4_ROWS => 37,
+            GgmlType::Unknown(_) => 38,
         }
     }
 
