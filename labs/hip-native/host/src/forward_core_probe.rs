@@ -1,5 +1,6 @@
 //! Bounded GPU operator evidence; CPU arithmetic here is an oracle, never a forward fallback.
 
+use crate::forward_mixer_probe::{compare, fault_is};
 use crate::{Arg, Context};
 use std::ffi::c_void;
 
@@ -10,47 +11,6 @@ struct Kernels {
     glu: *mut c_void,
     add: *mut c_void,
     argmax: *mut c_void,
-}
-
-fn compare(name: &str, got: &[f32], want: &[f32]) -> Result<(), String> {
-    if got.len() != want.len() || got.is_empty() {
-        return Err(format!("{name}: oracle/output shape mismatch"));
-    }
-    let mut error = 0.0_f64;
-    let mut energy = 0.0_f64;
-    let mut maximum = 0.0_f64;
-    for (i, (&a, &b)) in got.iter().zip(want).enumerate() {
-        if !a.is_finite() || !b.is_finite() {
-            return Err(format!("{name}: nonfinite output/oracle at {i}: {a}/{b}"));
-        }
-        let delta = f64::from(a) - f64::from(b);
-        error += delta * delta;
-        energy += f64::from(b) * f64::from(b);
-        maximum = maximum.max(delta.abs());
-    }
-    let nmse = error / energy.max(1e-30);
-    if !nmse.is_finite() || nmse > 1e-6 {
-        return Err(format!(
-            "{name}: NMSE {nmse} exceeds fixed 1e-6, max_abs={maximum}"
-        ));
-    }
-    println!(
-        "{{\"operation\":\"{name}\",\"values\":{},\"nmse\":{nmse},\"max_abs\":{maximum}}}",
-        got.len()
-    );
-    Ok(())
-}
-
-fn fault_is(ctx: &Context, fault: *mut c_void, expected: u32, name: &str) -> Result<(), String> {
-    let mut got = [0_u32];
-    ctx.download(fault, &mut got)?;
-    if got[0] != expected {
-        return Err(format!(
-            "{name}: fault={:#x}, expected={expected:#x}",
-            got[0]
-        ));
-    }
-    Ok(())
 }
 
 fn fixture(kind: u32, width: usize, rows: usize) -> Vec<u8> {

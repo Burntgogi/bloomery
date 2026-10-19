@@ -162,15 +162,7 @@ impl<'c, 'p> Model<'c, 'p> {
             .collect();
         if plan.rope_dim != 0 {
             let rows = rope_rows(plan.rope_base, plan.rope_dim, plan.context);
-            // SAFETY: the planned RoPE region covers the complete load-time table; copy synchronizes.
-            unsafe {
-                context.copy(
-                    buffers.rope,
-                    rows.as_ptr().cast(),
-                    std::mem::size_of_val(rows.as_slice()),
-                    1,
-                )?
-            };
+            context.overwrite(buffers.rope, &rows)?;
         }
         let mut model = Self {
             context,
@@ -502,8 +494,7 @@ pub(super) fn probe_contract(model: &mut Model<'_, '_>) -> Result<(), String> {
     }
     let gain = model.weights[model.plan.output_gain];
     let nan = [f32::NAN];
-    // SAFETY: the smoke's F32 output gain owns at least one value; the copy synchronizes.
-    unsafe { model.context.copy(gain, nan.as_ptr().cast(), 4, 1)? };
+    model.context.overwrite(gain, &nan)?;
     if model.step(11).is_ok() || model.state != State::Poisoned {
         return Err("nonfinite model arithmetic did not poison the model".into());
     }
@@ -525,8 +516,7 @@ pub(super) fn probe_contract(model: &mut Model<'_, '_>) -> Result<(), String> {
         .expect("smoke gain shard")
         .data(&original.info)
         .map_err(|e| e.to_string())?;
-    // SAFETY: this restores the exact first four bytes of the smoke's private gain allocation.
-    unsafe { model.context.copy(gain, bytes.as_ptr().cast(), 4, 1)? };
+    model.context.overwrite(gain, &bytes[..4])?;
     model.reset()?;
     if model.step(7)? != first {
         return Err("reset did not recover the original first token".into());

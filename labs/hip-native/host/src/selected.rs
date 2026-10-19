@@ -82,42 +82,12 @@ fn planes(values: &[f32], k: usize) -> Planes {
     }
 }
 
-fn upload<T: Copy>(context: &mut Context, values: &[T]) -> Result<*mut c_void, String> {
-    let ptr = context.alloc(std::mem::size_of_val(values))?;
-    overwrite(context, ptr, values)?;
-    Ok(ptr)
-}
-
-fn overwrite<T: Copy>(context: &Context, ptr: *mut c_void, values: &[T]) -> Result<(), String> {
-    // SAFETY: each caller passes the allocation made for this exact-length typed vector; copy synchronizes.
-    unsafe {
-        context.copy(
-            ptr,
-            values.as_ptr().cast(),
-            std::mem::size_of_val(values),
-            1,
-        )
-    }
-}
-
-fn read<T: Copy>(context: &Context, ptr: *mut c_void, values: &mut [T]) -> Result<(), String> {
-    // SAFETY: each caller passes the allocation made for this exact-length typed vector; copy synchronizes.
-    unsafe {
-        context.copy(
-            values.as_mut_ptr().cast(),
-            ptr,
-            std::mem::size_of_val(values),
-            2,
-        )
-    }
-}
-
 pub(super) fn wave_size(context: &mut Context) -> Result<(), String> {
     let mut word = [0u32];
-    let mut ptr = upload(context, &word)?;
+    let mut ptr = context.upload(&word)?;
     let f = context.function("bloomery_hip_wave_size")?;
     context.launch_shape(f, 1, 1, &mut [(&mut ptr as *mut *mut c_void).cast()])?;
-    read(context, ptr, &mut word)?;
+    context.download(ptr, &mut word)?;
     if word != [32] {
         return Err(format!(
             "q4_selected: requires compiled wave32, got {}",
@@ -258,40 +228,40 @@ fn case(
     let mut fault = vec![0u32; FAULT_WORDS];
     fault[0] = u32::MAX;
     let mut device = Device {
-        w: upload(context, weights)?,
-        q: upload(context, &ordinary.q)?,
-        sums: upload(context, &ordinary.sums)?,
-        scales: upload(context, &ordinary.scales)?,
-        ids: upload(context, &ids_a)?,
-        fault: upload(context, &fault)?,
-        out: upload(context, &out)?,
+        w: context.upload(weights)?,
+        q: context.upload(&ordinary.q)?,
+        sums: context.upload(&ordinary.sums)?,
+        scales: context.upload(&ordinary.scales)?,
+        ids: context.upload(&ids_a)?,
+        fault: context.upload(&fault)?,
+        out: context.upload(&out)?,
         function: context.function("bloomery_hip_q4_sel")?,
     };
     let allocated = context.buffers.len();
     let mut runs = 0;
     for ids in [&ids_a, &ids_a, &ids_a, &ids_b] {
         out.fill(SENTINEL);
-        overwrite(context, device.ids, ids)?;
-        overwrite(context, device.out, &out)?;
+        context.overwrite(device.ids, ids)?;
+        context.overwrite(device.out, &out)?;
         device.launch(context, &plan, 9)?;
-        read(context, device.out, &mut out)?;
+        context.download(device.out, &mut out)?;
         check_output(&plan, weights, &ordinary, ids, &out)?;
         runs += 1;
     }
-    read(context, device.fault, &mut fault)?;
+    context.download(device.fault, &mut fault)?;
     if fault[0] != u32::MAX || fault[1..].iter().any(|&v| v != 0) {
         return Err("q4_selected: valid selection raised a fault".into());
     }
     out.fill(SENTINEL);
-    overwrite(context, device.out, &out)?;
-    overwrite(context, device.ids, &ids_bad)?;
+    context.overwrite(device.out, &out)?;
+    context.overwrite(device.ids, &ids_bad)?;
     for layer in [9, 3, 9] {
         device.launch(context, &plan, layer)?;
         runs += 1;
     }
-    read(context, device.out, &mut out)?;
+    context.download(device.out, &mut out)?;
     check_output(&plan, weights, &ordinary, &ids_bad, &out)?;
-    read(context, device.fault, &mut fault)?;
+    context.download(device.fault, &mut fault)?;
     if fault[0] != (3 << 8) | 7
         || fault[4] != 1 << 7
         || fault[10] != 1 << 7
@@ -308,13 +278,13 @@ fn case(
     let ids_host = [2, HOST, 3, 0, 1, 3];
     fault.fill(0);
     fault[0] = u32::MAX;
-    overwrite(context, device.fault, &fault)?;
-    overwrite(context, device.ids, &ids_host)?;
+    context.overwrite(device.fault, &fault)?;
+    context.overwrite(device.ids, &ids_host)?;
     out.fill(SENTINEL);
-    overwrite(context, device.out, &out)?;
+    context.overwrite(device.out, &out)?;
     device.launch(context, &plan, 9)?;
     runs += 1;
-    read(context, device.out, &mut out)?;
+    context.download(device.out, &mut out)?;
     check_output(&plan, weights, &ordinary, &ids_host, &out)?;
     // A NaN input is refused by the HOST oracle/quantizer here. This entry propagates the
     // NaN scale; it does not pretend to have run the GPU quantizer or to raise its fault.
@@ -325,17 +295,17 @@ fn case(
             f32::from_bits(100_000 + (i % 17) as u32 * 37) * if i % 2 == 0 { 1.0 } else { -1.0 };
     }
     let refused = planes(&values, k);
-    overwrite(context, device.q, &refused.q)?;
-    overwrite(context, device.sums, &refused.sums)?;
-    overwrite(context, device.scales, &refused.scales)?;
-    overwrite(context, device.ids, &ids_a)?;
+    context.overwrite(device.q, &refused.q)?;
+    context.overwrite(device.sums, &refused.sums)?;
+    context.overwrite(device.scales, &refused.scales)?;
+    context.overwrite(device.ids, &ids_a)?;
     out.fill(SENTINEL);
-    overwrite(context, device.out, &out)?;
+    context.overwrite(device.out, &out)?;
     device.launch(context, &plan, 9)?;
     runs += 1;
-    read(context, device.out, &mut out)?;
+    context.download(device.out, &mut out)?;
     check_output(&plan, weights, &refused, &ids_a, &out)?;
-    read(context, device.fault, &mut fault)?;
+    context.download(device.fault, &mut fault)?;
     if fault[0] != u32::MAX || fault[1..].iter().any(|&v| v != 0) {
         return Err("q4_selected: HOST or NaN scale raised an unexpected expert-id fault".into());
     }
