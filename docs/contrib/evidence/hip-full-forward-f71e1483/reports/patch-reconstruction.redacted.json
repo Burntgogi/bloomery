@@ -1,0 +1,13 @@
+{
+  "base": "11d8a7d37a7648f3d5fc058f293947638313b2c4",
+  "source": "f71e148395ab810aa40c577861ff7a3fd277873c",
+  "expected_tree": "ea2a9bb28ae919deb5ef6af1840d55401169b301",
+  "reconstructed_tree": "ea2a9bb28ae919deb5ef6af1840d55401169b301",
+  "status": "pass",
+  "patch": {
+    "path": "$EVIDENCE_ROOT/hip-full-forward-current.patch",
+    "bytes": 257528,
+    "sha256": "9f0185ff60bcc6134dec554c25f68b4cd2f392eb473157d1c8a4709dc9fa8221"
+  },
+  "method": "alternate-index read-tree, apply --cached, write-tree; source index untouched"
+}

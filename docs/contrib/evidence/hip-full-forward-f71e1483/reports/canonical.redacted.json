@@ -1,0 +1,544 @@
+{
+  "schema": 3,
+  "status": "pass",
+  "checks": [
+    {
+      "name": "fmt",
+      "command": [
+        "cargo",
+        "fmt",
+        "--all",
+        "--",
+        "--check"
+      ],
+      "rustflags": "-C target-cpu=native",
+      "log": "fmt.log",
+      "status": "pass",
+      "exit_code": 0,
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "name": "host-test",
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "--target",
+        "x86_64-unknown-linux-gnu",
+        "-p",
+        "bloomery-hip-spike"
+      ],
+      "rustflags": "-C target-cpu=native",
+      "log": "host-test.log",
+      "status": "pass",
+      "exit_code": 0,
+      "log_sha256": "16f7cc2a85638da6df7de20839c40bbe029d576f1a7903121effebda3cf604fa"
+    },
+    {
+      "name": "host-clippy",
+      "command": [
+        "cargo",
+        "clippy",
+        "--locked",
+        "--no-deps",
+        "-p",
+        "bloomery-hip-spike",
+        "--target",
+        "x86_64-unknown-linux-gnu",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "rustflags": "-C target-cpu=native",
+      "log": "host-clippy.log",
+      "status": "pass",
+      "exit_code": 0,
+      "log_sha256": "83cda6758edf030d721fbedbe1ad3c845299c3cd9385ed5191ed09b4a5a21e6d"
+    },
+    {
+      "name": "device-clippy",
+      "command": [
+        "cargo",
+        "clippy",
+        "-Zbuild-std=core",
+        "--locked",
+        "--no-deps",
+        "--release",
+        "--target",
+        "amdgcn-amd-amdhsa",
+        "-p",
+        "bloomery-hip-spike-device",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "rustflags": "-C target-cpu=gfx1100 -C panic=abort",
+      "log": "device-clippy.log",
+      "status": "pass",
+      "exit_code": 0,
+      "log_sha256": "042d1950ae27c63d769c6a83eae7c384c3ff40ac1250f03ba95235b1d9447537"
+    },
+    {
+      "name": "device-build",
+      "command": [
+        "cargo",
+        "build",
+        "-Zbuild-std=core",
+        "--locked",
+        "--message-format=json",
+        "--release",
+        "--target",
+        "amdgcn-amd-amdhsa",
+        "-p",
+        "bloomery-hip-spike-device"
+      ],
+      "rustflags": "-C target-cpu=gfx1100 -C panic=abort",
+      "log": "device-build.log",
+      "status": "pass",
+      "exit_code": 0,
+      "log_sha256": "c2511bccc2c21d830a148bb38eae3cbb8b9d4d2d23b71b1969e641eecbba994b"
+    },
+    {
+      "name": "host-build",
+      "command": [
+        "cargo",
+        "build",
+        "--locked",
+        "--target",
+        "x86_64-unknown-linux-gnu",
+        "--release",
+        "-p",
+        "bloomery-hip-spike"
+      ],
+      "rustflags": "-C target-cpu=native",
+      "log": "host-build.log",
+      "status": "pass",
+      "exit_code": 0,
+      "log_sha256": "664d78755eb5b1a61bbeaa6c177c488819d1056d93c91544cfe225a01c909e5e"
+    },
+    {
+      "name": "gpu",
+      "command": [
+        "$SOURCE_ROOT/labs/hip-native/target/x86_64-unknown-linux-gnu/release/bloomery-hip-spike",
+        "$SOURCE_ROOT/labs/hip-native/target/amdgcn-amd-amdhsa/release/bloomery_hip_spike_device.elf",
+        "$FIXTURE_ROOT/Q4_K.bin",
+        "6144",
+        "64"
+      ],
+      "rustflags": "-C target-cpu=native",
+      "log": "gpu.log",
+      "status": "pass",
+      "exit_code": 0,
+      "log_sha256": "92af53a65cad72c1430e0c706c86d03ffa69b32467cfc897e7886ed426b96a9f"
+    },
+    {
+      "name": "forward-gpu",
+      "command": [
+        "$SOURCE_ROOT/labs/hip-native/target/x86_64-unknown-linux-gnu/release/bloomery-hip-spike",
+        "--forward-probe",
+        "$SOURCE_ROOT/labs/hip-native/target/amdgcn-amd-amdhsa/release/bloomery_hip_spike_device.elf",
+        "$EVIDENCE_ROOT/canonical/forward"
+      ],
+      "rustflags": "-C target-cpu=native",
+      "log": "forward-gpu.log",
+      "status": "pass",
+      "exit_code": 0,
+      "log_sha256": "0c546255a7e5101c568598d2ffa215768cbaed65e419f22900e40e3c6fe10317"
+    }
+  ],
+  "cases": [
+    {
+      "operation": "q4_matmul",
+      "k": 256,
+      "rows": 7,
+      "cols": 1,
+      "nmse": 3.702660797383163e-14,
+      "copy_equal": true,
+      "steady_host_buffer_allocations": 0,
+      "status": "pass"
+    },
+    {
+      "operation": "q4_matmul",
+      "k": 512,
+      "rows": 64,
+      "cols": 1,
+      "nmse": 1.375607993838801e-12,
+      "copy_equal": true,
+      "steady_host_buffer_allocations": 0,
+      "status": "pass"
+    },
+    {
+      "operation": "q4_matmul",
+      "k": 512,
+      "rows": 64,
+      "cols": 32,
+      "nmse": 6.689703539606927e-13,
+      "copy_equal": true,
+      "steady_host_buffer_allocations": 0,
+      "status": "pass"
+    },
+    {
+      "operation": "q4_matmul",
+      "k": 6144,
+      "rows": 64,
+      "cols": 1,
+      "nmse": 2.331305569619408e-12,
+      "copy_equal": true,
+      "steady_host_buffer_allocations": 0,
+      "status": "pass"
+    },
+    {
+      "operation": "q4_matmul",
+      "k": 6144,
+      "rows": 64,
+      "cols": 32,
+      "nmse": 2.0990081683686894e-12,
+      "copy_equal": true,
+      "steady_host_buffer_allocations": 0,
+      "status": "pass"
+    },
+    {
+      "operation": "q4_selected",
+      "contract": "selected_bitwise",
+      "k": 6144,
+      "rows_per_expert": 16,
+      "experts": 4,
+      "slots": 6,
+      "activation_cols": 8,
+      "launches": 9,
+      "real_weights": true,
+      "wave_size": 32,
+      "bitwise_equal": true,
+      "finite_expected_outputs": true,
+      "nan_propagation": true,
+      "fault_and_sentinel": true,
+      "steady_host_buffer_allocations": 0,
+      "status": "pass"
+    },
+    {
+      "operation": "dense_ffn",
+      "width": 256,
+      "nmse": 7.959878245021427e-14,
+      "intermediate_host_copies": 0,
+      "steady_host_buffer_allocations": 0,
+      "status": "pass"
+    },
+    {
+      "operation": "q4_selected",
+      "contract": "selected_bitwise",
+      "k": 256,
+      "rows_per_expert": 7,
+      "experts": 4,
+      "slots": 6,
+      "activation_cols": 8,
+      "launches": 9,
+      "real_weights": false,
+      "wave_size": 32,
+      "bitwise_equal": true,
+      "finite_expected_outputs": true,
+      "nan_propagation": true,
+      "fault_and_sentinel": true,
+      "steady_host_buffer_allocations": 0,
+      "status": "pass"
+    },
+    {
+      "operation": "q4_selected",
+      "contract": "selected_bitwise",
+      "k": 512,
+      "rows_per_expert": 8,
+      "experts": 4,
+      "slots": 6,
+      "activation_cols": 8,
+      "launches": 9,
+      "real_weights": false,
+      "wave_size": 32,
+      "bitwise_equal": true,
+      "finite_expected_outputs": true,
+      "nan_propagation": true,
+      "fault_and_sentinel": true,
+      "steady_host_buffer_allocations": 0,
+      "status": "pass"
+    },
+    {
+      "operation": "q4_selected",
+      "contract": "selected_bitwise",
+      "k": 768,
+      "rows_per_expert": 9,
+      "experts": 4,
+      "slots": 6,
+      "activation_cols": 8,
+      "launches": 9,
+      "real_weights": false,
+      "wave_size": 32,
+      "bitwise_equal": true,
+      "finite_expected_outputs": true,
+      "nan_propagation": true,
+      "fault_and_sentinel": true,
+      "steady_host_buffer_allocations": 0,
+      "status": "pass"
+    },
+    {
+      "operation": "q4_selected",
+      "contract": "selected_bitwise",
+      "k": 1024,
+      "rows_per_expert": 7,
+      "experts": 4,
+      "slots": 6,
+      "activation_cols": 8,
+      "launches": 9,
+      "real_weights": false,
+      "wave_size": 32,
+      "bitwise_equal": true,
+      "finite_expected_outputs": true,
+      "nan_propagation": true,
+      "fault_and_sentinel": true,
+      "steady_host_buffer_allocations": 0,
+      "status": "pass"
+    },
+    {
+      "operation": "q4_selected",
+      "contract": "selected_bitwise",
+      "k": 1280,
+      "rows_per_expert": 8,
+      "experts": 4,
+      "slots": 6,
+      "activation_cols": 8,
+      "launches": 9,
+      "real_weights": false,
+      "wave_size": 32,
+      "bitwise_equal": true,
+      "finite_expected_outputs": true,
+      "nan_propagation": true,
+      "fault_and_sentinel": true,
+      "steady_host_buffer_allocations": 0,
+      "status": "pass"
+    },
+    {
+      "operation": "q4_selected",
+      "contract": "selected_bitwise",
+      "k": 1792,
+      "rows_per_expert": 9,
+      "experts": 4,
+      "slots": 6,
+      "activation_cols": 8,
+      "launches": 9,
+      "real_weights": false,
+      "wave_size": 32,
+      "bitwise_equal": true,
+      "finite_expected_outputs": true,
+      "nan_propagation": true,
+      "fault_and_sentinel": true,
+      "steady_host_buffer_allocations": 0,
+      "status": "pass"
+    },
+    {
+      "operation": "q4_selected",
+      "contract": "selected_bitwise",
+      "k": 2048,
+      "rows_per_expert": 7,
+      "experts": 4,
+      "slots": 6,
+      "activation_cols": 8,
+      "launches": 9,
+      "real_weights": false,
+      "wave_size": 32,
+      "bitwise_equal": true,
+      "finite_expected_outputs": true,
+      "nan_propagation": true,
+      "fault_and_sentinel": true,
+      "steady_host_buffer_allocations": 0,
+      "status": "pass"
+    },
+    {
+      "operation": "q4_selected",
+      "contract": "selected_bitwise",
+      "k": 2304,
+      "rows_per_expert": 8,
+      "experts": 4,
+      "slots": 6,
+      "activation_cols": 8,
+      "launches": 9,
+      "real_weights": false,
+      "wave_size": 32,
+      "bitwise_equal": true,
+      "finite_expected_outputs": true,
+      "nan_propagation": true,
+      "fault_and_sentinel": true,
+      "steady_host_buffer_allocations": 0,
+      "status": "pass"
+    },
+    {
+      "operation": "q4_selected",
+      "contract": "selected_bitwise",
+      "k": 2816,
+      "rows_per_expert": 9,
+      "experts": 4,
+      "slots": 6,
+      "activation_cols": 8,
+      "launches": 9,
+      "real_weights": false,
+      "wave_size": 32,
+      "bitwise_equal": true,
+      "finite_expected_outputs": true,
+      "nan_propagation": true,
+      "fault_and_sentinel": true,
+      "steady_host_buffer_allocations": 0,
+      "status": "pass"
+    },
+    {
+      "operation": "q4_selected",
+      "contract": "selected_bitwise",
+      "k": 6144,
+      "rows_per_expert": 7,
+      "experts": 4,
+      "slots": 6,
+      "activation_cols": 8,
+      "launches": 9,
+      "real_weights": false,
+      "wave_size": 32,
+      "bitwise_equal": true,
+      "finite_expected_outputs": true,
+      "nan_propagation": true,
+      "fault_and_sentinel": true,
+      "steady_host_buffer_allocations": 0,
+      "status": "pass"
+    },
+    {
+      "operation": "q4_selected",
+      "contract": "selected_bitwise",
+      "k": 20480,
+      "rows_per_expert": 8,
+      "experts": 4,
+      "slots": 6,
+      "activation_cols": 8,
+      "launches": 9,
+      "real_weights": false,
+      "wave_size": 32,
+      "bitwise_equal": true,
+      "finite_expected_outputs": true,
+      "nan_propagation": true,
+      "fault_and_sentinel": true,
+      "steady_host_buffer_allocations": 0,
+      "status": "pass"
+    }
+  ],
+  "started_utc": "2026-10-19T08:42:32.380808+00:00",
+  "host": {
+    "platform": "Linux-7.0.0-38-generic-x86_64-with-glibc2.39",
+    "cpu": "x86_64"
+  },
+  "source": {
+    "commit": "f71e148395ab810aa40c577861ff7a3fd277873c",
+    "tree": "ea2a9bb28ae919deb5ef6af1840d55401169b301",
+    "lab_tree": "4d22acaf7d6dad0dc393edb21686ff8e146953b1",
+    "clean": true
+  },
+  "toolchain": "rustc 1.100.0-nightly (e457a7b0d 2026-08-27)\nbinary: rustc\ncommit-hash: e457a7b0d326d67b4322ef0d11bd715cfaeda48f\ncommit-date: 2026-08-27\nhost: x86_64-unknown-linux-gnu\nrelease: 1.100.0-nightly\nLLVM version: 23.1.0\n",
+  "host_target": "x86_64-unknown-linux-gnu",
+  "target": {
+    "triple": "amdgcn-amd-amdhsa",
+    "cpu": "gfx1100",
+    "wave_size": 32
+  },
+  "upstream_sources": [
+    {
+      "path": "crates/gpu/src/cores.rs",
+      "sha256": "2604a4fd96658c402c6c669bcd6c4c1f27c31d3c9be9ad377fcca559e3ee9c47"
+    },
+    {
+      "path": "crates/gpu/src/q4k_sel.rs",
+      "sha256": "105f7e1d302038b9c6345732f03c0cec2c50147dd60e1a8f87b6b1fa0bfec7eb"
+    },
+    {
+      "path": "crates/qdot/src/lib.rs",
+      "sha256": "263068d62671e1b917428f73e4a6a16a1a87c728122fe28615edc76b6aefd0b9"
+    }
+  ],
+  "binaries": [
+    {
+      "path": "target/x86_64-unknown-linux-gnu/release/bloomery-hip-spike",
+      "sha256": "7d0da0958ad651b9feb0114e2746c5a4b20312ed41d5877375abfa97b3e0b4ba"
+    },
+    {
+      "path": "target/amdgcn-amd-amdhsa/release/bloomery_hip_spike_device.elf",
+      "sha256": "09bd5111bf959ac8784163bfd6b60f8a995097cdc305c4f774b2a621840ba929"
+    }
+  ],
+  "generated_core": {
+    "path": "target/amdgcn-amd-amdhsa/release/build/bloomery-hip-spike-device/6f79ff5b9dcb56c6/out/q4k_core.rs",
+    "sha256": "7c00b212e13eaef61e6b1c828bc24ff968a9ed693d7918545b4252bbda43e3de"
+  },
+  "card": {
+    "name": "AMD Radeon RX 7900 GRE",
+    "device_ordinal": 0,
+    "runtime_version": 70253210,
+    "driver_version": 70253210,
+    "visibility": {
+      "HIP_VISIBLE_DEVICES": null,
+      "ROCR_VISIBLE_DEVICES": null,
+      "GPU_DEVICE_ORDINAL": null
+    },
+    "runtime_library": "$ROCM_SDK/lib/libamdhip64.so.7"
+  },
+  "fixture": {
+    "name": "Q4_K.bin",
+    "sha256": "9251b422a700bf27bf47512068c93f88d029dc6eba32ed516dbc067842b570ce",
+    "k": 6144,
+    "rows": 64,
+    "bytes": 221184
+  },
+  "acceptance": {
+    "nmse_max": 1e-06,
+    "finite_outputs": true,
+    "selected_q4": "bitwise finite, NaN propagation, exact sticky fault and sentinel",
+    "bounded_hybrid_forward": "full-logit finite/argmax/reset checked",
+    "same_file_real_model_llama_HIP": false
+  },
+  "forward": {
+    "model": {
+      "activation_arithmetic": "F32 scalar; on-device GGUF dequantization; not CUDA Q8-activation bit parity",
+      "allocation_estimate_excludes_driver_and_kernel_scratch": true,
+      "architecture": "qwen35",
+      "arena_bytes": 178216,
+      "context": 16,
+      "files": [
+        {
+          "bytes": 685984,
+          "file": "$EVIDENCE_ROOT/canonical/forward/smoke.gguf",
+          "sha256": "420f680e27e9ec75c7c29d39298574f7fd2aff8808e9b2566f3915664016ed06"
+        }
+      ],
+      "fit_reserve_bytes": 268435456,
+      "gdn_layers": 1,
+      "gqa_layers": 1,
+      "hidden": 256,
+      "kv": "F16",
+      "layers": 2,
+      "loaded_tensors": 27,
+      "mtp": false,
+      "serving_admission": false,
+      "state_bytes": 161792,
+      "tied_head": true,
+      "ubatch": 1,
+      "vocab": 258,
+      "weight_payload_bytes": 679504
+    },
+    "rows_per_repeat": 12,
+    "greedy_ids": [
+      141,
+      129,
+      231,
+      30,
+      177,
+      245,
+      10,
+      134
+    ],
+    "all_logit_files_finite": true,
+    "reset_repeat_bitwise_equal": true,
+    "independent_argmax_equal": true,
+    "same_file_real_model_llama_HIP": false
+  },
+  "finished_utc": "2026-10-19T08:42:55.771595+00:00"
+}

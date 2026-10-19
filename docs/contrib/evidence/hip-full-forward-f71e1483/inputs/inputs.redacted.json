@@ -1,0 +1,64 @@
+{
+  "english": {
+    "text": "The capital of France is",
+    "text_file": "$REVIEWED_EVIDENCE/inputs/english.txt",
+    "ids_file": "$REVIEWED_EVIDENCE/inputs/english.ids",
+    "ids": [
+      760,
+      6511,
+      314,
+      9338,
+      369
+    ],
+    "tokenizer_argv": [
+      "$PREVIOUS_EVIDENCE/llama-tokenize",
+      "-m",
+      "$MODEL_ROOT/notschmee/Qwen3.5-0.8B-GGUF/1870603ac8ab59c7ddb9d94cccf3b297e379538f/Qwen3.5-0.8B-Q4_K_M.gguf",
+      "-f",
+      "$PREVIOUS_EVIDENCE/english.txt",
+      "--ids",
+      "--no-bos",
+      "--no-parse-special",
+      "--no-escape"
+    ],
+    "tokenizer_sha256": "bdfcdfc931441e3fcfcd05d5b9c5a5d5a009fc496af25f231c73df65a69919f7",
+    "model_sha256": "be5b3cb8c2f3ebd791349c9c775ea38950f23a2b9e792ca2f0411597dd172988",
+    "bos_inserted": false,
+    "chat_template_applied": false,
+    "parse_special": false,
+    "reused_from_record": "$PREVIOUS_EVIDENCE/inputs.json",
+    "ids_sha256": "ac224bf7edf2cf8c82f50255805fd06ad2fbf90fa9f147f2358566c2255d77ba",
+    "text_sha256": "bbaff4d2ecd5892d4a442b0f53131641bf6e6f284761dd20fc0664bc97145762"
+  },
+  "korean": {
+    "text": "대한민국의 수도는",
+    "text_file": "$REVIEWED_EVIDENCE/inputs/korean.txt",
+    "ids_file": "$REVIEWED_EVIDENCE/inputs/korean.ids",
+    "ids": [
+      178031,
+      148928,
+      154735,
+      159951,
+      16072
+    ],
+    "tokenizer_argv": [
+      "$PREVIOUS_EVIDENCE/llama-tokenize",
+      "-m",
+      "$MODEL_ROOT/notschmee/Qwen3.5-0.8B-GGUF/1870603ac8ab59c7ddb9d94cccf3b297e379538f/Qwen3.5-0.8B-Q4_K_M.gguf",
+      "-f",
+      "$PREVIOUS_EVIDENCE/korean.txt",
+      "--ids",
+      "--no-bos",
+      "--no-parse-special",
+      "--no-escape"
+    ],
+    "tokenizer_sha256": "bdfcdfc931441e3fcfcd05d5b9c5a5d5a009fc496af25f231c73df65a69919f7",
+    "model_sha256": "be5b3cb8c2f3ebd791349c9c775ea38950f23a2b9e792ca2f0411597dd172988",
+    "bos_inserted": false,
+    "chat_template_applied": false,
+    "parse_special": false,
+    "reused_from_record": "$PREVIOUS_EVIDENCE/inputs.json",
+    "ids_sha256": "8dd5dad7f2baa37ef9220e63e98e4eb83cc8b5fa301d00fc67cd4c1f98fee8c0",
+    "text_sha256": "8136b9f248ff5da30946ca049f8a32435feb4c184a2f8b6665dc5b29f46ca84d"
+  }
+}

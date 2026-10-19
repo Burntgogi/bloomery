@@ -1,0 +1,313 @@
+{
+  "source": {
+    "commit": "f71e148395ab810aa40c577861ff7a3fd277873c",
+    "tree": "ea2a9bb28ae919deb5ef6af1840d55401169b301",
+    "lab_tree": "4d22acaf7d6dad0dc393edb21686ff8e146953b1",
+    "clean": true
+  },
+  "commands": [
+    {
+      "name": "legacy-zero-oracle-compile",
+      "argv": [
+        "rustc",
+        "--edition=2024",
+        "$EVIDENCE_ROOT/legacy-zero-oracle.rs",
+        "-o",
+        "$EVIDENCE_ROOT/legacy-zero-oracle"
+      ],
+      "cwd": "$SOURCE_ROOT",
+      "exit_code": 0,
+      "log": "$EVIDENCE_ROOT/legacy-zero-oracle-compile.log"
+    },
+    {
+      "name": "legacy-zero-oracle-expected-failure",
+      "argv": [
+        "$EVIDENCE_ROOT/legacy-zero-oracle"
+      ],
+      "cwd": "$SOURCE_ROOT",
+      "exit_code": 101,
+      "log": "$EVIDENCE_ROOT/legacy-zero-oracle-expected-failure.log",
+      "expected_exit_code": 101,
+      "expected_failure": true
+    },
+    {
+      "name": "review-fix-format",
+      "argv": [
+        "cargo",
+        "fmt",
+        "--all"
+      ],
+      "cwd": "$SOURCE_ROOT/labs/hip-native",
+      "exit_code": 0,
+      "log": "$EVIDENCE_ROOT/review-fix-format.log"
+    },
+    {
+      "name": "comparison-regression",
+      "argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "--manifest-path",
+        "$SOURCE_ROOT/labs/hip-native/host/Cargo.toml",
+        "comparison_enforces_oracle_span_finiteness_and_nmse_contract",
+        "--",
+        "--nocapture"
+      ],
+      "cwd": "$SOURCE_ROOT/labs/hip-native",
+      "exit_code": 0,
+      "log": "$EVIDENCE_ROOT/comparison-regression.log"
+    },
+    {
+      "name": "stage-review-fixes",
+      "argv": [
+        "git",
+        "add",
+        "--",
+        "labs/hip-native/host/src/main.rs",
+        "labs/hip-native/host/src/selected.rs",
+        "labs/hip-native/host/src/forward_core_probe.rs",
+        "labs/hip-native/host/src/forward_mixer_probe.rs",
+        "labs/hip-native/host/src/forward/runner.rs",
+        "labs/hip-native/device/src/forward_mixer.rs",
+        "labs/hip-native/device/src/forward_math.rs",
+        "labs/hip-native/README.md"
+      ],
+      "cwd": "$SOURCE_ROOT",
+      "exit_code": 0,
+      "log": "$EVIDENCE_ROOT/stage-review-fixes.log"
+    },
+    {
+      "name": "commit-review-fixes",
+      "argv": [
+        "git",
+        "commit",
+        "-m",
+        "hip-native: consolidate probe and transfer owners, document device safety"
+      ],
+      "cwd": "$SOURCE_ROOT",
+      "exit_code": 0,
+      "log": "$EVIDENCE_ROOT/commit-review-fixes.log"
+    },
+    {
+      "name": "patch-load-base",
+      "argv": [
+        "git",
+        "read-tree",
+        "11d8a7d37a7648f3d5fc058f293947638313b2c4"
+      ],
+      "cwd": "$SOURCE_ROOT",
+      "exit_code": 0,
+      "log": "$EVIDENCE_ROOT/patch-load-base.log"
+    },
+    {
+      "name": "patch-apply",
+      "argv": [
+        "git",
+        "apply",
+        "--cached",
+        "$EVIDENCE_ROOT/hip-full-forward-current.patch"
+      ],
+      "cwd": "$SOURCE_ROOT",
+      "exit_code": 0,
+      "log": "$EVIDENCE_ROOT/patch-apply.log"
+    },
+    {
+      "name": "comparer-self-test",
+      "argv": [
+        "/usr/bin/python3",
+        "$SOURCE_ROOT/labs/hip-native/compare-hip.py",
+        "--self-test"
+      ],
+      "exit_code": 0,
+      "log": "$EVIDENCE_ROOT/comparer-self-test.log",
+      "cwd": "$SOURCE_ROOT"
+    },
+    {
+      "name": "reference-self-test",
+      "argv": [
+        "/usr/bin/python3",
+        "$SOURCE_ROOT/tools/ref/dense-logits.py",
+        "--self-test"
+      ],
+      "exit_code": 0,
+      "log": "$EVIDENCE_ROOT/reference-self-test.log",
+      "cwd": "$SOURCE_ROOT"
+    },
+    {
+      "name": "root-fmt",
+      "argv": [
+        "cargo",
+        "fmt",
+        "--all",
+        "--",
+        "--check"
+      ],
+      "exit_code": 0,
+      "log": "$EVIDENCE_ROOT/root-fmt.log",
+      "cwd": "$SOURCE_ROOT"
+    },
+    {
+      "name": "reference-build",
+      "argv": [
+        "/usr/bin/python3",
+        "$SOURCE_ROOT/tools/ref/dense-logits.py",
+        "build",
+        "--llama-tree",
+        "$LLAMA_SOURCE",
+        "--llama-build",
+        "$LLAMA_BUILD",
+        "--cmake",
+        "$TOOL_VENV/lib/python3.12/site-packages/cmake/data/bin/cmake",
+        "--out",
+        "$EVIDENCE_ROOT/reference/dense_logits_ref"
+      ],
+      "exit_code": 0,
+      "log": "$EVIDENCE_ROOT/reference-build.log",
+      "cwd": "$SOURCE_ROOT"
+    },
+    {
+      "name": "comment-contract",
+      "argv": [
+        "bash",
+        "$SOURCE_ROOT/tools/check-comments.sh"
+      ],
+      "exit_code": 0,
+      "log": "$EVIDENCE_ROOT/comment-contract.log",
+      "cwd": "$SOURCE_ROOT"
+    },
+    {
+      "name": "canonical-current-main",
+      "argv": [
+        "bash",
+        "$SOURCE_ROOT/labs/hip-native/verify.sh",
+        "$EVIDENCE_ROOT/canonical",
+        "--q4-rows",
+        "$FIXTURE_ROOT/Q4_K.bin",
+        "--k",
+        "6144",
+        "--rows",
+        "64"
+      ],
+      "exit_code": 0,
+      "log": "$EVIDENCE_ROOT/canonical-current-main.log",
+      "cwd": "$SOURCE_ROOT"
+    },
+    {
+      "name": "recipes-contract",
+      "argv": [
+        "/usr/bin/python3",
+        "$SOURCE_ROOT/tools/recipes.py",
+        "check"
+      ],
+      "exit_code": 0,
+      "log": "$EVIDENCE_ROOT/recipes-contract.log",
+      "cwd": "$SOURCE_ROOT"
+    },
+    {
+      "name": "cpu-reset-compatibility",
+      "argv": [
+        "/usr/bin/python3",
+        "$SOURCE_ROOT/tools/ref/dense-logits.py",
+        "run",
+        "--kind",
+        "reference",
+        "--backend",
+        "cpu",
+        "--target",
+        "hip-lab-hybrid",
+        "--binary",
+        "$EVIDENCE_ROOT/reference/dense_logits_ref",
+        "--model",
+        "$EVIDENCE_ROOT/canonical/forward/smoke.gguf",
+        "--prompt",
+        "$EVIDENCE_ROOT/canonical/forward/prompt.ids",
+        "--forced",
+        "$EVIDENCE_ROOT/canonical/forward/forced.ids",
+        "--ctx",
+        "64",
+        "--ubatch",
+        "1",
+        "--prefill",
+        "step",
+        "--reset-repeats",
+        "2",
+        "--out",
+        "$EVIDENCE_ROOT/cpu-reset-compatibility"
+      ],
+      "exit_code": 0,
+      "log": "$EVIDENCE_ROOT/cpu-reset-compatibility.log",
+      "cwd": "$SOURCE_ROOT"
+    },
+    {
+      "name": "refset-consumer-tests",
+      "argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "bloomery-refset",
+        "--lib"
+      ],
+      "exit_code": 0,
+      "log": "$EVIDENCE_ROOT/refset-consumer-tests.log",
+      "cwd": "$SOURCE_ROOT"
+    },
+    {
+      "name": "small-hip-comparison",
+      "argv": [
+        "/usr/bin/python3",
+        "$SOURCE_ROOT/labs/hip-native/compare-hip.py",
+        "$EVIDENCE_ROOT/small-hip-comparison",
+        "--reference",
+        "$EVIDENCE_ROOT/reference/dense_logits_ref",
+        "--native-evidence",
+        "$EVIDENCE_ROOT/canonical/result.json"
+      ],
+      "exit_code": 0,
+      "log": "$EVIDENCE_ROOT/small-hip-comparison.log",
+      "cwd": "$SOURCE_ROOT"
+    },
+    {
+      "name": "english-hip-comparison",
+      "argv": [
+        "/usr/bin/python3",
+        "$SOURCE_ROOT/labs/hip-native/compare-hip.py",
+        "$EVIDENCE_ROOT/english-hip-comparison",
+        "--reference",
+        "$EVIDENCE_ROOT/reference/dense_logits_ref",
+        "--native-evidence",
+        "$EVIDENCE_ROOT/canonical/result.json",
+        "--target",
+        "qwen35-0.8b-candidate",
+        "--model",
+        "$MODEL_ROOT/notschmee/Qwen3.5-0.8B-GGUF/1870603ac8ab59c7ddb9d94cccf3b297e379538f/Qwen3.5-0.8B-Q4_K_M.gguf",
+        "--prompt",
+        "$EVIDENCE_ROOT/inputs/english.ids"
+      ],
+      "exit_code": 0,
+      "log": "$EVIDENCE_ROOT/english-hip-comparison.log",
+      "cwd": "$SOURCE_ROOT"
+    },
+    {
+      "name": "korean-hip-comparison",
+      "argv": [
+        "/usr/bin/python3",
+        "$SOURCE_ROOT/labs/hip-native/compare-hip.py",
+        "$EVIDENCE_ROOT/korean-hip-comparison",
+        "--reference",
+        "$EVIDENCE_ROOT/reference/dense_logits_ref",
+        "--native-evidence",
+        "$EVIDENCE_ROOT/canonical/result.json",
+        "--target",
+        "qwen35-0.8b-candidate",
+        "--model",
+        "$MODEL_ROOT/notschmee/Qwen3.5-0.8B-GGUF/1870603ac8ab59c7ddb9d94cccf3b297e379538f/Qwen3.5-0.8B-Q4_K_M.gguf",
+        "--prompt",
+        "$EVIDENCE_ROOT/inputs/korean.ids"
+      ],
+      "exit_code": 0,
+      "log": "$EVIDENCE_ROOT/korean-hip-comparison.log",
+      "cwd": "$SOURCE_ROOT"
+    }
+  ]
+}

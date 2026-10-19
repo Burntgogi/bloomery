@@ -1,0 +1,60 @@
+{
+  "source": {
+    "commit": "f71e148395ab810aa40c577861ff7a3fd277873c",
+    "tree": "ea2a9bb28ae919deb5ef6af1840d55401169b301",
+    "lab_tree": "4d22acaf7d6dad0dc393edb21686ff8e146953b1"
+  },
+  "base": "11d8a7d37a7648f3d5fc058f293947638313b2c4",
+  "paths": [
+    "docs/contrib/qwen35-dense-validation.md",
+    "labs/hip-native/Cargo.lock",
+    "labs/hip-native/README.md",
+    "labs/hip-native/compare-hip.py",
+    "labs/hip-native/device/src/forward_core.rs",
+    "labs/hip-native/device/src/forward_math.rs",
+    "labs/hip-native/device/src/forward_mixer.rs",
+    "labs/hip-native/device/src/lib.rs",
+    "labs/hip-native/host/Cargo.toml",
+    "labs/hip-native/host/build.rs",
+    "labs/hip-native/host/src/forward/fixture.rs",
+    "labs/hip-native/host/src/forward/mod.rs",
+    "labs/hip-native/host/src/forward/plan.rs",
+    "labs/hip-native/host/src/forward/runner.rs",
+    "labs/hip-native/host/src/forward_core_probe.rs",
+    "labs/hip-native/host/src/forward_mixer_probe.rs",
+    "labs/hip-native/host/src/main.rs",
+    "labs/hip-native/host/src/selected.rs",
+    "labs/hip-native/verify.py",
+    "tools/ref/dense-logits.py",
+    "tools/ref/dense_logits_ref.cpp"
+  ],
+  "changed_file_count": 21,
+  "production_paths_changed": false,
+  "review_fix_files": [
+    "labs/hip-native/host/src/main.rs",
+    "labs/hip-native/host/src/selected.rs",
+    "labs/hip-native/host/src/forward_core_probe.rs",
+    "labs/hip-native/host/src/forward_mixer_probe.rs",
+    "labs/hip-native/host/src/forward/runner.rs",
+    "labs/hip-native/device/src/forward_mixer.rs",
+    "labs/hip-native/device/src/forward_math.rs",
+    "labs/hip-native/README.md"
+  ],
+  "device_executable_source_comparison": {
+    "labs/hip-native/device/src/forward_mixer.rs": "all nonblank, non-line-comment source lines unchanged",
+    "labs/hip-native/device/src/forward_math.rs": "all nonblank, non-line-comment source lines unchanged"
+  },
+  "patch_reconstruction": {
+    "base": "11d8a7d37a7648f3d5fc058f293947638313b2c4",
+    "source": "f71e148395ab810aa40c577861ff7a3fd277873c",
+    "expected_tree": "ea2a9bb28ae919deb5ef6af1840d55401169b301",
+    "reconstructed_tree": "ea2a9bb28ae919deb5ef6af1840d55401169b301",
+    "status": "pass",
+    "patch": {
+      "path": "$EVIDENCE_ROOT/hip-full-forward-current.patch",
+      "bytes": 257528,
+      "sha256": "9f0185ff60bcc6134dec554c25f68b4cd2f392eb473157d1c8a4709dc9fa8221"
+    },
+    "method": "alternate-index read-tree, apply --cached, write-tree; source index untouched"
+  }
+}

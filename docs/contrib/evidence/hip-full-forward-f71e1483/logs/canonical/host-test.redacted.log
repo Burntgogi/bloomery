@@ -1,0 +1,24 @@
+   Compiling bloomery-gguf v0.1.0 ($SOURCE_ROOT/crates/gguf)
+   Compiling bloomery-levers v0.1.0 ($SOURCE_ROOT/crates/levers)
+   Compiling bloomery-models v0.1.0 ($SOURCE_ROOT/crates/models)
+   Compiling bloomery-threads v0.1.0 ($SOURCE_ROOT/crates/threads)
+   Compiling bloomery-runtime v0.1.0 ($SOURCE_ROOT/crates/runtime)
+   Compiling bloomery-qdot v0.1.0 ($SOURCE_ROOT/crates/qdot)
+   Compiling bloomery-hf v0.1.0 ($SOURCE_ROOT/crates/hf)
+   Compiling bloomery-placement v0.1.0 ($SOURCE_ROOT/crates/placement)
+   Compiling bloomery-tokenizer v0.1.0 ($SOURCE_ROOT/crates/tokenizer)
+   Compiling bloomery-hip-spike v0.1.0 ($SOURCE_ROOT/labs/hip-native/host)
+   Compiling bloomery-model v0.1.0 ($SOURCE_ROOT/crates/model)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 9.02s
+     Running unittests src/main.rs (target/x86_64-unknown-linux-gnu/debug/build/bloomery-hip-spike/703b2769e9787d29/out/bloomery_hip_spike-703b2769e9787d29)
+
+running 6 tests
+test forward::plan::tests::load_fit_preserves_reserve_and_refuses_overflow ... ok
+test forward::tests::raw_ids_refuse_empty_negative_fractional_and_overflow ... ok
+test forward_mixer_probe::tests::comparison_enforces_oracle_span_finiteness_and_nmse_contract ... ok
+test selected::tests::selected_shape_refusals_precede_the_driver ... ok
+test tests::refuses_invalid_shapes_and_truncated_weights ... ok
+test forward::tests::admission_and_generation_bounds_precede_device_load ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+

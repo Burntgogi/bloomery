@@ -1,0 +1,50 @@
+{
+  "schema": 1,
+  "kind": "required-review-corrections",
+  "source": {
+    "commit": "f71e148395ab810aa40c577861ff7a3fd277873c",
+    "tree": "ea2a9bb28ae919deb5ef6af1840d55401169b301",
+    "lab_tree": "4d22acaf7d6dad0dc393edb21686ff8e146953b1"
+  },
+  "reviewed_source": "374fff1608900e284b3e48f69abd4195738a6e3e",
+  "PR": 476,
+  "mandatory_fixes": {
+    "shared_probe_checks": {
+      "comparison_owner": "forward_mixer_probe::compare",
+      "fault_owner": "forward_mixer_probe::fault_is",
+      "core_imports_both": true,
+      "f64_accumulators": [
+        "error",
+        "energy",
+        "max_abs"
+      ],
+      "zero_energy": "zero error -> 0; nonzero error -> infinity/refusal",
+      "nonzero_energy": "exact denominator, no floor",
+      "NMSE_limit": 1e-06,
+      "refuse_nonfinite_NMSE": true,
+      "regression": "comparison_enforces_oracle_span_finiteness_and_nmse_contract",
+      "legacy_zero_oracle_expected_failure_exit": 101,
+      "new_regression_exit": 0
+    },
+    "typed_transfers": {
+      "owner": "Context::{upload,download,overwrite}",
+      "upload_delegates_to": "overwrite",
+      "duplicate_selected_and_mixer_transfer_helpers_removed": true,
+      "synchronous_boundaries_preserved": true
+    },
+    "device_safety": {
+      "adjacent_invariants_added": 26,
+      "executable_source_comparison": {
+        "labs/hip-native/device/src/forward_mixer.rs": "all nonblank, non-line-comment source lines unchanged",
+        "labs/hip-native/device/src/forward_math.rs": "all nonblank, non-line-comment source lines unchanged"
+      }
+    }
+  },
+  "optional_sync_optimization_implemented": false,
+  "scope": {
+    "production_paths_changed": false,
+    "changed_file_count": 21
+  },
+  "verification_status": "pass: targeted regression, canonical, CPU compatibility, refset and small/English/Korean HIP comparisons at exact clean HEAD",
+  "limits": "not a GitHub reviewer approval; not a performance result"
+}

@@ -1,0 +1,46 @@
+   Compiling proc-macro2 v1.0.107
+   Compiling version_check v0.9.5
+   Compiling unicode-ident v1.0.27
+   Compiling quote v1.0.47
+   Compiling generic-array v0.14.7
+   Compiling libc v0.2.190
+   Compiling typenum v1.20.1
+   Compiling syn v3.0.9
+   Compiling thiserror v2.0.21
+   Compiling thiserror-impl v2.0.21
+   Compiling memmap2 v0.9.11
+   Compiling block-buffer v0.10.4
+   Compiling crypto-common v0.1.7
+   Compiling digest v0.10.7
+   Compiling cpufeatures v0.2.17
+   Compiling cfg-if v1.0.5
+   Compiling sha2 v0.10.9
+   Compiling zmij v1.0.23
+   Compiling serde_core v1.0.229
+   Compiling bloomery-gguf v0.1.0 ($SOURCE_ROOT/crates/gguf)
+   Compiling serde_json v1.0.151
+   Compiling bloomery-levers v0.1.0 ($SOURCE_ROOT/crates/levers)
+   Compiling bloomery-models v0.1.0 ($SOURCE_ROOT/crates/models)
+   Compiling memchr v2.8.3
+   Compiling itoa v1.0.18
+   Compiling bloomery-runtime v0.1.0 ($SOURCE_ROOT/crates/runtime)
+   Compiling bloomery-threads v0.1.0 ($SOURCE_ROOT/crates/threads)
+   Compiling sha1 v0.10.7
+   Compiling bloomery-hf v0.1.0 ($SOURCE_ROOT/crates/hf)
+   Compiling bloomery-qdot v0.1.0 ($SOURCE_ROOT/crates/qdot)
+   Compiling bloomery-placement v0.1.0 ($SOURCE_ROOT/crates/placement)
+   Compiling bloomery-tokenizer v0.1.0 ($SOURCE_ROOT/crates/tokenizer)
+   Compiling bloomery-hip-spike v0.1.0 ($SOURCE_ROOT/labs/hip-native/host)
+   Compiling bloomery-model v0.1.0 ($SOURCE_ROOT/crates/model)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 16.40s
+     Running unittests src/main.rs (target/debug/build/bloomery-hip-spike/8eedb6c9aedb2cc6/out/bloomery_hip_spike-8eedb6c9aedb2cc6)
+
+running 1 test
+{"operation":"zero","values":2,"nmse":0,"max_abs":0}
+{"operation":"exact","values":1,"nmse":0,"max_abs":0}
+{"operation":"at-limit","values":1,"nmse":0.000001,"max_abs":1}
+{"operation":"below-limit","values":1,"nmse":0.00000025,"max_abs":0.5}
+test forward_mixer_probe::tests::comparison_enforces_oracle_span_finiteness_and_nmse_contract ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s
+

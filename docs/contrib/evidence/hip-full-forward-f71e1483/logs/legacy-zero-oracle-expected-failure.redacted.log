@@ -1,0 +1,6 @@
+{"operation":"zero-oracle","values":1,"nmse":0.0000000000999999936531046,"max_abs":0.000000000000000000009999999682655225}
+zero-oracle refusal required; old core returned Ok(())
+
+thread 'main' (4066250) panicked at $EVIDENCE_ROOT/legacy-zero-oracle.rs:32:5:
+nonzero error against zero oracle must be refused
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace

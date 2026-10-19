@@ -1,0 +1,12 @@
+    Checking bloomery-gguf v0.1.0 ($SOURCE_ROOT/crates/gguf)
+    Checking bloomery-models v0.1.0 ($SOURCE_ROOT/crates/models)
+    Checking bloomery-levers v0.1.0 ($SOURCE_ROOT/crates/levers)
+    Checking bloomery-threads v0.1.0 ($SOURCE_ROOT/crates/threads)
+    Checking bloomery-runtime v0.1.0 ($SOURCE_ROOT/crates/runtime)
+   Compiling bloomery-hip-spike v0.1.0 ($SOURCE_ROOT/labs/hip-native/host)
+    Checking bloomery-hf v0.1.0 ($SOURCE_ROOT/crates/hf)
+    Checking bloomery-qdot v0.1.0 ($SOURCE_ROOT/crates/qdot)
+    Checking bloomery-placement v0.1.0 ($SOURCE_ROOT/crates/placement)
+    Checking bloomery-tokenizer v0.1.0 ($SOURCE_ROOT/crates/tokenizer)
+    Checking bloomery-model v0.1.0 ($SOURCE_ROOT/crates/model)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 5.25s
