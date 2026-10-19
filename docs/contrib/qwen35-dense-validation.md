@@ -104,6 +104,10 @@ reference-forced rows, and retains full-logit diagnostics without inventing an a
 band. It does not grant real-model HIP acceptance, NVIDIA serving evidence, or a backend
 integration claim.
 
+The same controller's [pinned real-model workflow](../../labs/hip-native/README.md#same-real-model-hip-comparison)
+requires the exact 0.8B file and separate English/Korean raw-ID comparisons. Each passing
+report covers one prompt only; both are required for the language-pair milestone.
+
 ## Model and row contract
 
 The default target `qwen38-27b` is exactly

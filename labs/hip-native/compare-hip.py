@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Compare the frozen small hybrid GGUF on native HIP and observed llama.cpp HIP.
+"""Compare a frozen hybrid GGUF on native HIP and observed llama.cpp HIP.
 
-This diagnostic has no floating-point accuracy band and never grants real-model acceptance.
+Acceptance covers one raw prompt, with diagnostic-only floating-point differences.
 """
 import argparse
 import datetime
@@ -27,6 +27,11 @@ VOCAB = 258
 MODEL_BYTES = 685984
 MODEL_SHA = "420f680e27e9ec75c7c29d39298574f7fd2aff8808e9b2566f3915664016ed06"
 TARGET = "hip-lab-hybrid"
+REAL_TARGET = "qwen35-0.8b-candidate"
+MODEL_GEOMETRIES = {
+    MODEL_SHA: (2, 1, 1),
+    "be5b3cb8c2f3ebd791349c9c775ea38950f23a2b9e792ca2f0411597dd172988": (24, 18, 6),
+}
 
 
 def require(condition, message):
@@ -74,8 +79,8 @@ def model_identity(data, model, target, context):
     require(len(files) == 1 and Path(files[0]["file"]).resolve() == model and
             files[0].get("bytes") == target["size"] and files[0].get("sha256") == target["sha256"],
             "native metadata is not the same frozen model file")
-    require(data.get("vocab") == target["vocab"] and data.get("layers") == 2 and
-            data.get("gdn_layers") == 1 and data.get("gqa_layers") == 1,
+    geometry = tuple(data.get(key) for key in ("layers", "gdn_layers", "gqa_layers"))
+    require(geometry == MODEL_GEOMETRIES[target["sha256"]],
             "native metadata differs from the frozen hybrid geometry")
     require(data.get("context") == context and data.get("ubatch") == 1 and data.get("kv") == "F16",
             "native context/ubatch/KV contract differs")
@@ -121,10 +126,11 @@ def native_rows(directory, prompt, steps, model, target, context):
     return data, rows, artifacts
 
 
-def reference_rows(directory, prompt, forced, source, binary_sha, model, target, reserve):
+def reference_rows(directory, prompt, forced, source, binary_sha, model, target, reserve,
+                   target_name, max_model_bytes):
     header, flat = ref.bundle(directory)
     meta = ref.read_meta(directory / "logits.0.f32.meta")
-    expected = {"backend": "hip", "engine": "reference", "target": TARGET,
+    expected = {"backend": "hip", "engine": "reference", "target": target_name,
                 "source_head": source["commit"], "source_dirty": "false", "binary_sha256": binary_sha,
                 "model_sha256": target["sha256"], "model": str(model),
                 "ctx": "64", "ubatch": "1", "kv": "f16", "prefill": "step", "mode": "reference",
@@ -137,13 +143,13 @@ def reference_rows(directory, prompt, forced, source, binary_sha, model, target,
             "reference prompt/forced snapshots differ")
     require(meta["prompt_ids"] == ",".join(map(str, prompt)) and
             meta["forced_ids"] == ",".join(map(str, forced)), "reference raw metadata IDs differ")
-    placement = ref.hip_metadata(meta, reserve, 16 << 20)
+    placement = ref.hip_metadata(meta, reserve, max_model_bytes)
     for key, value in placement.items():
         require(header.get(key) == value, f"reference placement/header attribution differs at {key}")
     for key in ("backend", "reset_repeats", "reset_repeat_bitwise_equal", "repeat_file"):
         require(header.get(key) == meta.get(key), f"reference raw/header attribution differs at {key}")
-    require(int(header["hip_model_layers"]) == 2,
-            "reference has not observed both frozen-model HIP trunk layers")
+    require(int(header["hip_model_layers"]) == MODEL_GEOMETRIES[target["sha256"]][0],
+            "reference has not observed all frozen-model HIP trunk layers")
     require(int(header["hip_cpu_math_nodes"]) == int(header["hip_cpu_input_nodes"]),
             "reference CPU math exceeds the observed standard input-embedding leg")
     repeat_evidence = ref.verify_repeat(directory, meta, len(forced), target["vocab"])
@@ -158,12 +164,12 @@ def reference_rows(directory, prompt, forced, source, binary_sha, model, target,
                   "exit": json_file(directory / "exit.json"), "reset_raw_sha256": ref.digest(directory / repeat)}
 
 
-def row_diagnostic(index, reference, native):
+def row_diagnostic(index, reference, native, prompt_length):
     require(len(reference) == len(native), "comparison row vocabulary differs")
     reference_id, native_id = argmax(reference), argmax(native)
     delta = math.fsum((float(a) - float(b)) ** 2 for a, b in zip(native, reference))
     norm = math.fsum(float(v) ** 2 for v in reference)
-    return {"row": index, "native_row": len(PROMPT) - 1 + index,
+    return {"row": index, "native_row": prompt_length - 1 + index,
             "reference_argmax": reference_id, "native_forced_argmax": native_id,
             "argmax_equal": reference_id == native_id,
             "max_abs": max(abs(float(a) - float(b)) for a, b in zip(native, reference)),
@@ -183,29 +189,34 @@ def main():
     parser.add_argument("output", type=Path, help="new evidence directory outside the source checkout")
     parser.add_argument("--reference", type=Path, required=True, help="HIP reference binary with .build.json")
     parser.add_argument("--native-evidence", type=Path, required=True, help="current canonical verify.py result.json")
+    parser.add_argument("--target", choices=(TARGET, REAL_TARGET), default=TARGET)
+    parser.add_argument("--model", type=Path, help="required for the pinned real-model target")
+    parser.add_argument("--prompt", type=Path, help="raw token IDs; required for the real-model target")
     args = parser.parse_args()
     output = args.output.resolve()
     require(not output.is_relative_to(ROOT), "comparison evidence must be outside the checkout")
     output.mkdir(parents=True, exist_ok=False)
     result = {"schema": 1, "status": "error", "real_model_HIP_acceptance": False,
               "started_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-              "original_prompt_ids": PROMPT, "reference_greedy_ids": [], "rows": [],
+              "original_prompt_ids": [], "reference_greedy_ids": [], "rows": [],
               "reference_captures": [], "commands": [],
               "numeric_acceptance": "diagnostic_only_no_numeric_band",
               "memory_guard": "stage preflight only; not an OS VRAM cap or measured peak"}
+    result["acceptance_scope"] = "one raw prompt; not language-pair, serving, performance or CUDA parity"
     try:
         head = ref.clean_head(ROOT)
         source = {"commit": head, "tree": ref.git(ROOT, "rev-parse", "HEAD^{tree}"),
                   "lab_tree": ref.git(ROOT, "rev-parse", "HEAD:labs/hip-native"), "clean": True}
         result["source"] = source
-        target = ref.TARGETS[TARGET]
-        require((target["sha256"], target["size"], target["vocab"]) == (MODEL_SHA, MODEL_BYTES, VOCAB),
+        small_target = ref.TARGETS[TARGET]
+        require((small_target["sha256"], small_target["size"], small_target["vocab"]) ==
+                (MODEL_SHA, MODEL_BYTES, VOCAB),
                 "reference target differs from the approved frozen small GGUF")
         evidence_path = args.native_evidence.resolve()
         canonical = json_file(evidence_path)
         canonical_identity(canonical, source)
-        model = (evidence_path.parent / "forward/smoke.gguf").resolve()
-        model_stat = ref.immutable_model(model, target)
+        canonical_model = (evidence_path.parent / "forward/smoke.gguf").resolve()
+        ref.immutable_model(canonical_model, small_target)
         binaries = canonical["binaries"]
         require(len(binaries) == 2, "canonical evidence must bind both native host and device binaries")
         host = (LAB / "target" / canonical["host_target"] / "release/bloomery-hip-spike").resolve()
@@ -215,22 +226,42 @@ def main():
         for record, path in zip(binaries, (host, device)):
             require((LAB / record["path"]).resolve() == path and ref.digest(path) == record["sha256"],
                     f"native binary path or SHA differs from canonical evidence: {path}")
-        _, _, canonical_rows = native_rows(evidence_path.parent / "forward", PROMPT, STEPS, model, target, 16)
+        _, _, canonical_rows = native_rows(evidence_path.parent / "forward", PROMPT, STEPS,
+                                            canonical_model, small_target, 16)
         require(canonical["forward"]["model"] == json_file(evidence_path.parent / "forward/forward.json")["model"],
                 "canonical forward summary differs from its actual model identity")
+        target = ref.TARGETS[args.target]
+        if args.target == TARGET:
+            require(args.model is None and args.prompt is None,
+                    "the small target uses only its canonical model and frozen prompt")
+            model, prompt = canonical_model, PROMPT
+            max_model_bytes = 16 << 20
+        else:
+            require(args.model is not None and args.prompt is not None,
+                    "the real-model target requires --model and --prompt")
+            model = args.model.resolve()
+            prompt = ref.token_ids(args.prompt.resolve(), target["vocab"])
+            require(len(prompt) + STEPS <= 64, "raw prompt plus eight tokens exceeds context64")
+            max_model_bytes = target["size"]
+        model_stat = ref.immutable_model(model, target)
+        result["original_prompt_ids"] = prompt
         reference = args.reference.resolve()
         build = ref.check_build(reference, "hip")
         require(build.get("hip_build") is True, "reference was not built with HIP")
         require(build.get("libraries_rebuilt") is True and
                 build.get("library_source_proof") == "successful_incremental_build",
                 "cached-library smoke attribution cannot establish this HIP comparison")
-        result["model"] = {"path": str(model), "target": TARGET, **target}
+        result["model"] = {"path": str(model), "target": args.target, **target}
         result["canonical_native"] = {"path": str(evidence_path), "sha256": ref.digest(evidence_path),
                                       "source": canonical["source"], "binaries": binaries,
                                       "card": canonical["card"], "reset_rows": canonical_rows}
         result["reference_build"] = build
         identities = {path: ref.digest(path) for path in (host, device, reference, DRIVER, Path(__file__).resolve(),
                                                          evidence_path, Path(str(reference) + ".build.json"))}
+        if args.prompt is not None:
+            identities[args.prompt.resolve()] = ref.digest(args.prompt.resolve())
+            require(ref.token_ids(args.prompt.resolve(), target["vocab"]) == prompt,
+                    "raw prompt changed before its identity snapshot")
         result["file_identities"] = [{"path": str(path), "sha256": sha} for path, sha in identities.items()]
         reserve = canonical["forward"]["model"]["fit_reserve_bytes"]
         require(reserve == ref.fit_reserve(),
@@ -249,22 +280,22 @@ def main():
             ids_file(forced_path, forced)
             directory = output / label
             command = [sys.executable, str(DRIVER), "run", "--kind", "reference", "--backend", "hip",
-                       "--target", TARGET, "--model", str(model), "--binary", str(reference),
+                       "--target", args.target, "--model", str(model), "--binary", str(reference),
                        "--prompt", str(prompt_path), "--forced", str(forced_path), "--out", str(directory),
                        "--prefill", "step", "--ctx", "64", "--ubatch", "1", "--reset-repeats", "2",
-                       "--hip-max-model-bytes", str(16 << 20)]
+                       "--hip-max-model-bytes", str(max_model_bytes)]
             entry = {"name": label, "equivalent_driver_argv": command,
                      "execution": "dense-logits.run API; actual child argv/exit/log in bundle or .staging",
                      "directory": str(directory), "status": "error"}
             result["commands"].append(entry)
             # In-process use preserves bounded_run's ownership of the actual GPU child;
             # wrapping the driver in a second process would create nested owned sessions.
-            ref.run(argparse.Namespace(kind="reference", backend="hip", target=TARGET, model=model,
+            ref.run(argparse.Namespace(kind="reference", backend="hip", target=args.target, model=model,
                     binary=reference, prompt=prompt_path, forced=forced_path, out=directory,
                     prefill="step", mode="graph", ctx=64, ubatch=1, reset_repeats=2,
-                    hip_max_model_bytes=16 << 20))
+                    hip_max_model_bytes=max_model_bytes))
             rows, attribution = reference_rows(directory, prompt, forced, source, identities[reference],
-                                               model, target, reserve)
+                                               model, target, reserve, args.target, max_model_bytes)
             result["reference_captures"].append(attribution)
             entry["status"] = "pass"
             return rows
@@ -272,15 +303,15 @@ def main():
         greedy = result["reference_greedy_ids"]
         iterative = []
         for index in range(STEPS):
-            row = capture(f"reference-step-{index}", PROMPT + greedy, [0])[0]
+            row = capture(f"reference-step-{index}", prompt + greedy, [0])[0]
             iterative.append(row)
             greedy.append(argmax(row))
-        reference_values = capture("reference-final", PROMPT, greedy)
+        reference_values = capture("reference-final", prompt, greedy)
         final_ids = [argmax(row) for row in reference_values]
         result["reference_final_argmax_ids"] = final_ids
         result["reference_iterative_final_agreement"] = final_ids == greedy
-        result["reference_iterative_final_rows"] = [row_diagnostic(i, iterative[i], reference_values[i])
-                                                    for i in range(STEPS)]
+        result["reference_iterative_final_rows"] = [
+            row_diagnostic(i, iterative[i], reference_values[i], len(prompt)) for i in range(STEPS)]
 
         def native(label, prompt, steps):
             unchanged()
@@ -308,14 +339,14 @@ def main():
                                                   "directory": str(directory)}
             return data, values
 
-        native_data, native_greedy_rows = native("native-greedy", PROMPT, STEPS)
-        forced_data, native_forced_rows = native("native-forced", PROMPT + greedy[:-1], 0)
-        native_greedy_rows = aligned_rows(native_greedy_rows, len(PROMPT), STEPS)
-        native_forced_rows = aligned_rows(native_forced_rows, len(PROMPT), STEPS)
+        native_data, native_greedy_rows = native("native-greedy", prompt, STEPS)
+        forced_data, native_forced_rows = native("native-forced", prompt + greedy[:-1], 0)
+        native_greedy_rows = aligned_rows(native_greedy_rows, len(prompt), STEPS)
+        native_forced_rows = aligned_rows(native_forced_rows, len(prompt), STEPS)
         result["native_greedy_ids"] = native_data["greedy_ids"]
         result["native_forced_argmax_ids"] = [argmax(row) for row in native_forced_rows]
         for index in range(STEPS):
-            diagnostic = row_diagnostic(index, reference_values[index], native_forced_rows[index])
+            diagnostic = row_diagnostic(index, reference_values[index], native_forced_rows[index], len(prompt))
             diagnostic["reference_greedy_id"] = greedy[index]
             diagnostic["native_greedy_id"] = native_data["greedy_ids"][index]
             diagnostic["native_greedy_argmax"] = argmax(native_greedy_rows[index])
@@ -325,19 +356,20 @@ def main():
         first = first_token_divergence(result["rows"])
         if first is not None:
             index = first["row"]
-            divergence = {"diagnostic": first, "reference_prefix_ids": PROMPT + greedy[:index],
-                          "native_greedy_prefix_ids": PROMPT + native_data["greedy_ids"][:index],
+            divergence = {"diagnostic": first, "reference_prefix_ids": prompt + greedy[:index],
+                          "native_greedy_prefix_ids": prompt + native_data["greedy_ids"][:index],
                           "reference_logits": reference_values[index],
                           "native_reference_forced_logits": native_forced_rows[index],
                           "native_greedy_logits": native_greedy_rows[index],
                           "reference_raw": str(output / "reference-final/logits.0.f32"),
-                          "reference_byte_offset": index * VOCAB * 4,
-                          "native_row_file": str(output / f"native-forced/run-0/logits-{len(PROMPT)-1+index:04}.f32")}
+                          "reference_byte_offset": index * target["vocab"] * 4,
+                          "native_row_file": str(output / f"native-forced/run-0/logits-{len(prompt)-1+index:04}.f32")}
             ref.write_json(output / "first-divergence.json", divergence)
             result["first_divergence"] = {"row": index, "artifact": "first-divergence.json"}
         unchanged()
         ref.check_build(reference, "hip")
         result["status"] = "mismatch" if first is not None else "pass"
+        result["real_model_HIP_acceptance"] = args.target == REAL_TARGET and result["status"] == "pass"
     except (OSError, ValueError, KeyError, TypeError, IndexError, RuntimeError, subprocess.SubprocessError) as error:
         result["error"] = f"{type(error).__name__}: {error}"
         print(result["error"], file=sys.stderr)
@@ -368,9 +400,10 @@ def self_test():
     assert argmax([-3., -1., -2.]) == 1
     for value in (math.nan, math.inf, -math.inf):
         rejects(lambda value=value: argmax([1., value]))
-    rejects(lambda: row_diagnostic(0, [1., 2.], [1.]))
-    assert row_diagnostic(0, [0., 0.], [1., 0.])["relative_l2"] is None
-    assert not row_diagnostic(0, [1., 2.], [3., 2.])["argmax_equal"]
+    rejects(lambda: row_diagnostic(0, [1., 2.], [1.], 3))
+    assert row_diagnostic(0, [0., 0.], [1., 0.], 3)["relative_l2"] is None
+    assert not row_diagnostic(0, [1., 2.], [3., 2.], 3)["argmax_equal"]
+    assert row_diagnostic(2, [0., 1.], [0., 1.], 7)["native_row"] == 8
     good = {"argmax_equal": True, "greedy_token_equal": True, "reference_iterative_final_equal": True}
     assert first_token_divergence([good]) is None
     for key in good:
