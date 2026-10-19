@@ -19,49 +19,48 @@ fn silu(x: f32) -> f32 {
     x / (1.0 + (-x).exp())
 }
 
-fn compare(name: &str, got: &[f32], want: &[f32]) -> Result<f64, String> {
+pub(super) fn compare(name: &str, got: &[f32], want: &[f32]) -> Result<f64, String> {
     if got.len() != want.len() || got.is_empty() {
         return Err(format!("{name}: invalid oracle span"));
     }
     let mut error = 0.0f64;
     let mut energy = 0.0f64;
-    let mut max_abs = 0.0f32;
+    let mut max_abs = 0.0f64;
     for (i, (&a, &b)) in got.iter().zip(want).enumerate() {
         if !a.is_finite() || !b.is_finite() {
             return Err(format!("{name}: nonfinite value {i}: gpu={a} oracle={b}"));
         }
-        error += (a as f64 - b as f64).powi(2);
-        energy += (b as f64).powi(2);
-        max_abs = max_abs.max((a - b).abs());
+        let delta = f64::from(a) - f64::from(b);
+        error += delta * delta;
+        energy += f64::from(b) * f64::from(b);
+        max_abs = max_abs.max(delta.abs());
     }
     let nmse = if energy == 0.0 {
         if error == 0.0 { 0.0 } else { f64::INFINITY }
     } else {
         error / energy
     };
-    if nmse > 1.0e-6 {
+    if !nmse.is_finite() || nmse > 1.0e-6 {
         return Err(format!(
             "{name}: NMSE={nmse:.9e} max_abs={max_abs:.9e}, limit=1e-6"
         ));
     }
+    println!(
+        "{{\"operation\":\"{name}\",\"values\":{},\"nmse\":{nmse},\"max_abs\":{max_abs}}}",
+        got.len()
+    );
     Ok(nmse)
 }
 
-fn overwrite<T: Copy>(ctx: &Context, ptr: *mut c_void, values: &[T]) -> Result<(), String> {
-    // SAFETY: callers retain the exact allocation made for this typed span; copy synchronizes.
-    unsafe {
-        ctx.copy(
-            ptr,
-            values.as_ptr().cast(),
-            std::mem::size_of_val(values),
-            1,
-        )
-    }
-}
 fn clear_fault(ctx: &Context, fault: *mut c_void) -> Result<(), String> {
     ctx.fill(fault, 255, 4)
 }
-fn fault_is(ctx: &Context, fault: *mut c_void, want: u32, name: &str) -> Result<(), String> {
+pub(super) fn fault_is(
+    ctx: &Context,
+    fault: *mut c_void,
+    want: u32,
+    name: &str,
+) -> Result<(), String> {
     let mut word = [0u32];
     ctx.download(fault, &mut word)?;
     if word[0] != want {
@@ -232,10 +231,10 @@ fn gdn(ctx: &mut Context) -> Result<(), String> {
             let zv = signal(nv * HEAD, 31 + pos, 0.019);
             let bv = signal(nv, 17 + pos, 0.021);
             let av = signal(nv, 23 + pos, 0.017);
-            overwrite(ctx, x, &xv)?;
-            overwrite(ctx, z, &zv)?;
-            overwrite(ctx, b, &bv)?;
-            overwrite(ctx, a, &av)?;
+            ctx.overwrite(x, &xv)?;
+            ctx.overwrite(z, &zv)?;
+            ctx.overwrite(b, &bv)?;
+            ctx.overwrite(a, &av)?;
             ctx.call(
                 conv_fn,
                 2 * nk + nv,
@@ -398,7 +397,7 @@ fn gdn(ctx: &mut Context) -> Result<(), String> {
     )?;
     refused(ctx, fault, qkv, "conv-invalid-epsilon")?;
     clear_fault(ctx, fault)?;
-    overwrite(ctx, b, &[f32::INFINITY, 0.2, 0.3, 0.4])?;
+    ctx.overwrite(b, &[f32::INFINITY, 0.2, 0.3, 0.4])?;
     ctx.call(
         decay_fn,
         nv,
@@ -416,12 +415,12 @@ fn gdn(ctx: &mut Context) -> Result<(), String> {
     )?;
     refused(ctx, fault, beta, "decay-infinite-beta-input")?;
     clear_fault(ctx, fault)?;
-    overwrite(ctx, qkv, &signal(channels, 2, 0.003))?;
-    overwrite(ctx, beta, &[0.5f32; 4])?;
-    overwrite(ctx, decay, &[0.8f32; 4])?;
+    ctx.overwrite(qkv, &signal(channels, 2, 0.003))?;
+    ctx.overwrite(beta, &[0.5f32; 4])?;
+    ctx.overwrite(decay, &[0.8f32; 4])?;
     let mut bad_state = vec![0.0; nv * HEAD * HEAD];
     bad_state[0] = f32::NAN;
-    overwrite(ctx, state, &bad_state)?;
+    ctx.overwrite(state, &bad_state)?;
     ctx.call(
         delta_fn,
         nv * HEAD * 8,
@@ -439,7 +438,7 @@ fn gdn(ctx: &mut Context) -> Result<(), String> {
     )?;
     refused(ctx, fault, delta, "delta-nonfinite-state")?;
     clear_fault(ctx, fault)?;
-    overwrite(ctx, delta, &vec![f32::MAX; nv * HEAD])?;
+    ctx.overwrite(delta, &vec![f32::MAX; nv * HEAD])?;
     ctx.call(
         gate_fn,
         nv,
@@ -557,8 +556,8 @@ fn gqa(ctx: &mut Context) -> Result<(), String> {
         let mut host_k = poison.clone();
         let mut host_v = poison.clone();
         if pass != 0 {
-            overwrite(ctx, kc, &poison)?;
-            overwrite(ctx, vc, &poison)?;
+            ctx.overwrite(kc, &poison)?;
+            ctx.overwrite(vc, &poison)?;
         }
         for pos in 0..context {
             let qgate = signal(qh * 2 * width, 51 + pos, 0.023);
@@ -578,9 +577,9 @@ fn gqa(ctx: &mut Context) -> Result<(), String> {
             {
                 v[i] = value;
             }
-            overwrite(ctx, qg, &qgate)?;
-            overwrite(ctx, kp, &k)?;
-            overwrite(ctx, vp, &v)?;
+            ctx.overwrite(qg, &qgate)?;
+            ctx.overwrite(kp, &k)?;
+            ctx.overwrite(vp, &v)?;
             ctx.call(
                 prep_fn,
                 qh + kh,
@@ -699,7 +698,7 @@ fn gqa(ctx: &mut Context) -> Result<(), String> {
         "forward-mixer GQA qh=4 kvh=2 width=256 rope=64 positions={context} passes=2 q_nmse={worst_q:.9e} attention_nmse={worst_attention:.9e} f16_cache=bitwise reset_repeat=bitwise poisoned_future=unread"
     );
     clear_fault(ctx, fault)?;
-    overwrite(ctx, qg, &vec![f32::MAX; qh * 2 * width])?;
+    ctx.overwrite(qg, &vec![f32::MAX; qh * 2 * width])?;
     ctx.call(
         prep_fn,
         qh + kh,
@@ -726,9 +725,9 @@ fn gqa(ctx: &mut Context) -> Result<(), String> {
     )?;
     refused(ctx, fault, qo, "gqa-norm-overflowed-square")?;
     clear_fault(ctx, fault)?;
-    overwrite(ctx, qg, &signal(qh * 2 * width, 2, 0.01))?;
-    overwrite(ctx, qo, &signal(qh * width, 3, 0.01))?;
-    overwrite(ctx, kc, &poison)?;
+    ctx.overwrite(qg, &signal(qh * 2 * width, 2, 0.01))?;
+    ctx.overwrite(qo, &signal(qh * width, 3, 0.01))?;
+    ctx.overwrite(kc, &poison)?;
     ctx.call(
         attn_fn,
         qh,
@@ -749,10 +748,10 @@ fn gqa(ctx: &mut Context) -> Result<(), String> {
     )?;
     refused(ctx, fault, out, "attention-live-nonfinite-key")?;
     clear_fault(ctx, fault)?;
-    overwrite(ctx, kc, &vec![0u16; kh * context * width])?;
+    ctx.overwrite(kc, &vec![0u16; kh * context * width])?;
     let mut bad_gate = signal(qh * 2 * width, 2, 0.01);
     bad_gate[width] = f32::INFINITY;
-    overwrite(ctx, qg, &bad_gate)?;
+    ctx.overwrite(qg, &bad_gate)?;
     ctx.call(
         attn_fn,
         qh,
@@ -783,4 +782,30 @@ pub(super) fn run(ctx: &mut Context) -> Result<(), String> {
         "forward-mixer refusals=conv-eps,decay-beta,delta-state,gate-square,gqa-square,attention-key,attention-gate band_nmse<=1e-6"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compare;
+
+    #[test]
+    fn comparison_enforces_oracle_span_finiteness_and_nmse_contract() {
+        assert_eq!(compare("zero", &[0.0, -0.0], &[0.0, 0.0]).unwrap(), 0.0);
+        // A zero-energy oracle requires exact agreement; a denominator floor
+        // can conceal a nonzero F64 error.
+        assert!(compare("zero-oracle", &[1.0e-20], &[0.0]).is_err());
+        assert!(compare("tiny-oracle", &[2.0e-20], &[1.0e-20]).is_err());
+        assert_eq!(compare("exact", &[f32::MAX], &[f32::MAX]).unwrap(), 0.0);
+        assert_eq!(compare("at-limit", &[1001.0], &[1000.0]).unwrap(), 1.0e-6);
+        assert!(compare("below-limit", &[1000.5], &[1000.0]).is_ok());
+        assert!(compare("above-limit", &[1001.0001], &[1000.0]).is_err());
+        assert!(compare("large-error", &[-f32::MAX], &[f32::MAX]).is_err());
+        assert!(compare("empty", &[], &[]).is_err());
+        assert!(compare("short-output", &[], &[0.0]).is_err());
+        assert!(compare("long-output", &[0.0], &[]).is_err());
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert!(compare("nonfinite-output", &[value], &[1.0]).is_err());
+            assert!(compare("nonfinite-oracle", &[1.0], &[value]).is_err());
+        }
+    }
 }

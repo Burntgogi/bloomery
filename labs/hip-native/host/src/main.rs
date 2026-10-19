@@ -205,9 +205,21 @@ impl Context {
     fn upload<T: Copy>(&mut self, values: &[T]) -> Result<*mut c_void, String> {
         let bytes = std::mem::size_of_val(values);
         let pointer = self.alloc(bytes)?;
-        // SAFETY: the allocation and slice cover bytes; copy synchronizes before the slice is released.
-        unsafe { self.copy(pointer, values.as_ptr().cast(), bytes, 1)? };
+        self.overwrite(pointer, values)?;
         Ok(pointer)
+    }
+
+    fn overwrite<T: Copy>(&self, pointer: *mut c_void, values: &[T]) -> Result<(), String> {
+        // SAFETY: callers retain a device allocation covering this typed span; the source slice
+        // covers size_of_val(values) bytes and copy synchronizes before its borrow ends.
+        unsafe {
+            self.copy(
+                pointer,
+                values.as_ptr().cast(),
+                std::mem::size_of_val(values),
+                1,
+            )
+        }
     }
 
     fn download<T: Copy>(&self, pointer: *const c_void, out: &mut [T]) -> Result<(), String> {
@@ -310,11 +322,8 @@ fn case(s: &mut Context, weights: &[u8], k: usize, rows: usize, cols: usize) -> 
     let mut dx = s.alloc(nx)?;
     let mut dy = s.alloc(ny)?;
     let mut copy_out = s.alloc(nx)?;
-    // SAFETY: buffers match validated byte lengths, host vectors remain live and every transfer synchronizes.
-    unsafe {
-        s.copy(w, weights.as_ptr().cast(), weights.len(), 1)?;
-        s.copy(dx, x.as_ptr().cast(), nx, 1)?;
-    }
+    s.overwrite(w, weights)?;
+    s.overwrite(dx, &x)?;
     let cp = s.function("bloomery_hip_copy")?;
     let mut n = u32::try_from(x.len()).map_err(|e| e.to_string())?;
     let mut cp_args = [
@@ -323,10 +332,7 @@ fn case(s: &mut Context, weights: &[u8], k: usize, rows: usize, cols: usize) -> 
         (&mut n as *mut u32).cast(),
     ];
     s.launch(cp, x.len(), &mut cp_args)?;
-    // SAFETY: both copy buffers hold nx bytes and remain live through synchronization.
-    unsafe {
-        s.copy(roundtrip.as_mut_ptr().cast(), copy_out, nx, 2)?;
-    }
+    s.download(copy_out, &mut roundtrip)?;
     if !roundtrip
         .iter()
         .zip(&x)
@@ -352,10 +358,7 @@ fn case(s: &mut Context, weights: &[u8], k: usize, rows: usize, cols: usize) -> 
     if s.buffers.len() != before {
         return Err("steady launch allocated a GPU buffer".into());
     }
-    // SAFETY: y and dy hold ny bytes and remain live through synchronization.
-    unsafe {
-        s.copy(y.as_mut_ptr().cast(), dy, ny, 2)?;
-    }
+    s.download(dy, &mut y)?;
     let mut decoded = vec![0.0_f32; k];
     let mut error = 0.0_f64;
     let mut norm = 0.0_f64;
@@ -446,13 +449,10 @@ fn dense_ffn(s: &mut Context) -> Result<(), String> {
     let mut hidden = s.alloc(N * 4)?;
     let mut out = s.alloc(N * 4)?;
     let mut w = [s.alloc(wg.len())?, s.alloc(wu.len())?, s.alloc(wd.len())?];
-    // SAFETY: all host/device buffers have the exact lengths passed, and each copy synchronizes.
-    unsafe {
-        s.copy(dx, x.as_ptr().cast(), N * 4, 1)?;
-        s.copy(dgamma, gamma.as_ptr().cast(), N * 4, 1)?;
-        for (dst, source) in w.iter().zip([&wg, &wu, &wd]) {
-            s.copy(*dst, source.as_ptr().cast(), source.len(), 1)?;
-        }
+    s.overwrite(dx, &x)?;
+    s.overwrite(dgamma, &gamma)?;
+    for (dst, source) in w.iter().zip([&wg, &wu, &wd]) {
+        s.overwrite(*dst, source)?;
     }
     let rms = s.function("bloomery_hip_rms_norm")?;
     let mm = s.function("bloomery_hip_q4_matmul")?;
@@ -508,10 +508,7 @@ fn dense_ffn(s: &mut Context) -> Result<(), String> {
         return Err("FFN steady launch issued a buffer allocation".into());
     }
     let mut got = vec![0.0_f32; N];
-    // SAFETY: got and out cover N*4 bytes; the copy synchronizes before got is read.
-    unsafe {
-        s.copy(got.as_mut_ptr().cast(), out, N * 4, 2)?;
-    }
+    s.download(out, &mut got)?;
     let inverse = 1.0
         / (x.iter().map(|&v| f64::from(v).powi(2)).sum::<f64>() / N as f64 + f64::from(eps)).sqrt();
     let normalized: Vec<f64> = x

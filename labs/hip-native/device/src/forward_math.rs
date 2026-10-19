@@ -12,6 +12,8 @@ pub(super) unsafe fn mark(fault: *mut u32, tag: u32) {
 #[inline(always)]
 pub(super) unsafe fn checked(value: f32, fault: *mut u32, tag: u32) -> f32 {
     if !value.is_finite() {
+        // SAFETY: fault is the launch's live, u32-aligned atomic word;
+        // reporting a nonfinite value only performs an atomic minimum.
         unsafe {
             mark(fault, tag);
         }

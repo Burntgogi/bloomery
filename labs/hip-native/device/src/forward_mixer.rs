@@ -32,10 +32,13 @@ fn sum128(values: &[f32; 128]) -> f64 {
 
 #[inline(always)]
 unsafe fn input(p: *const f32, i: usize, fault: *mut u32, tag: u32) -> f32 {
+    // SAFETY: p is live and f32-aligned; i is within the initialized input
+    // span established by the kernel's bounded head/channel/cache indexing.
     let x = unsafe { *p.add(i) };
     if x.is_finite() {
         x
     } else {
+        // SAFETY: fault remains a live, u32-aligned atomic word for this launch.
         unsafe {
             mark(fault, tag);
         }
@@ -65,10 +68,13 @@ pub unsafe extern "gpu-kernel" fn bloomery_hip_gdn_conv(
         return;
     }
     if n_k == 0 || n_v == 0 || !n_v.is_multiple_of(n_k) || !eps.is_finite() || eps <= 0.0 {
+        // SAFETY: even on shape refusal, fault is a live, aligned atomic word.
         unsafe {
             mark(fault, tag);
         }
         for i in 0..128 {
+            // SAFETY: h < heads and i < 128 bound the validated out span;
+            // this workitem alone owns the head's 128 output elements.
             unsafe {
                 *out.add(h * 128 + i) = f32::NAN;
             }
@@ -83,10 +89,15 @@ pub unsafe extern "gpu-kernel" fn bloomery_hip_gdn_conv(
         for j in 0..4 {
             let distance = 3 - j;
             let v = if distance == 0 {
+                // SAFETY: c = h*128+i < channels bounds the live, aligned x
+                // span; fault is the launch's live, aligned atomic word.
                 unsafe { input(x, c, fault, tag) }
             } else if (pos as usize) < distance {
                 0.0
             } else {
+                // SAFETY: pos >= distance prevents subtraction underflow;
+                // modulo 11 and c < channels bound the initialized ring span.
+                // Other workitems own different channels; fault is live/aligned.
                 unsafe {
                     input(
                         ring,
@@ -96,11 +107,17 @@ pub unsafe extern "gpu-kernel" fn bloomery_hip_gdn_conv(
                     )
                 }
             };
+            // SAFETY: c < channels and j < 4 bound the validated, aligned
+            // four-weights-per-channel conv span; fault is live/aligned.
             let w = unsafe { input(conv, c * 4 + j, fault, tag) };
             acc = if j == 0 { v * w } else { fma(v, w, acc) };
         }
+        // SAFETY: checked only atomically updates the live, aligned fault word.
         *value = unsafe { checked(silu(checked(acc, fault, tag)), fault, tag) };
         // Predecessors of this channel have all been read before its ring write.
+        // SAFETY: modulo 11 and c < channels bound the live ring allocation;
+        // this head alone writes c, after reading its predecessors. x[c] is
+        // within the distinct aligned input span; fault is live/aligned.
         unsafe {
             *ring.add((pos as usize % 11) * channels + c) = input(x, c, fault, tag);
         }
@@ -110,6 +127,7 @@ pub unsafe extern "gpu-kernel" fn bloomery_hip_gdn_conv(
         let scale = if sum.is_finite() {
             1.0 / sqrt(sum).max(eps)
         } else {
+            // SAFETY: fault is the launch's live, aligned atomic word.
             unsafe {
                 mark(fault, tag);
             }
@@ -123,6 +141,8 @@ pub unsafe extern "gpu-kernel" fn bloomery_hip_gdn_conv(
         }
     }
     for (i, &value) in values.iter().enumerate() {
+        // SAFETY: h < heads and i < 128 bound the distinct, aligned out span;
+        // each head has one writer, and checked uses the live/aligned fault word.
         unsafe {
             *out.add(h * 128 + i) = checked(value, fault, tag);
         }
@@ -147,6 +167,9 @@ pub unsafe extern "gpu-kernel" fn bloomery_hip_gdn_decay(
     if h >= n_v as usize {
         return;
     }
+    // SAFETY: h < n_v bounds all four initialized, aligned input arrays and
+    // both distinct output arrays; one workitem owns each output h. fault is
+    // live and aligned for atomic updates throughout the launch.
     unsafe {
         let b = input(b_raw, h, fault, tag);
         let a = input(a_raw, h, fault, tag);
@@ -181,6 +204,9 @@ fn lane_dot(a: &[f32; 16], b: &[f32; 16]) -> f32 {
 fn column_sum(mut value: f32, lane: usize) -> f32 {
     for d in [4, 2, 1] {
         // Each group of eight is wholly active, inside a logical wave32.
+        // SAFETY: the wave32 launch and eight-lane-aligned column groups keep
+        // lane ^ d in the same active group for d=4,2,1; byte indices select
+        // lanes 0..31 of the current wave, all executing this shuffle.
         let other = unsafe { bpermute(((lane ^ d) * 4) as u32, value.to_bits()) };
         value += f32::from_bits(other);
     }
@@ -207,6 +233,8 @@ pub unsafe extern "gpu-kernel" fn bloomery_hip_gdn_delta(
         return;
     }
     if n_k == 0 || !n_v.is_multiple_of(n_k) {
+        // SAFETY: fault is live/aligned; t < n_v*128*8 bounds t/8 within
+        // the validated out span, and only lane t%8 == 0 writes that element.
         unsafe {
             mark(fault, tag);
             if t.is_multiple_of(8) {
@@ -222,6 +250,12 @@ pub unsafe extern "gpu-kernel" fn bloomery_hip_gdn_delta(
     let mut s = [0.0f32; 16];
     let mut k = [0.0f32; 16];
     let mut q = [0.0f32; 16];
+    // SAFETY: h < n_v and kh < n_k bound beta/decay and Q/K heads;
+    // col < n_v*128 bounds V/out, and key=32*(i/4)+4*j+i%4 < 128.
+    // The eight lanes partition each column's 128 state keys without overlap;
+    // only j=0 writes out[col]. Validated aligned spans are disjoint except
+    // for each lane's owned state cells. Full eight-lane groups execute both
+    // wave32 shuffles, and fault is a live, aligned atomic word.
     unsafe {
         let dc = input(decay, h, fault, tag);
         for i in 0..16 {
@@ -264,6 +298,8 @@ pub unsafe extern "gpu-kernel" fn bloomery_hip_gdn_gate(
     }
     let mut values = [0.0f32; 128];
     for (i, value) in values.iter_mut().enumerate() {
+        // SAFETY: h < n_v and i < 128 bound the initialized, aligned x span;
+        // fault remains live and aligned for atomic reporting.
         *value = unsafe { input(x, h * 128 + i, fault, tag) };
     }
     let mean = (sum128(&values) / 128.0) as f32;
@@ -276,12 +312,16 @@ pub unsafe extern "gpu-kernel" fn bloomery_hip_gdn_gate(
     {
         raw_scale
     } else {
+        // SAFETY: fault is the launch's live, aligned atomic word.
         unsafe {
             mark(fault, tag);
         }
         f32::NAN
     };
     for (i, &value) in values.iter().enumerate() {
+        // SAFETY: i < 128 bounds gain; h < n_v bounds z/out at h*128+i.
+        // Inputs are live/aligned and distinct from out; this head alone
+        // writes its output slice. fault is live and aligned for atomics.
         unsafe {
             let w = input(gain, i, fault, tag);
             let gate = silu(input(z, h * 128 + i, fault, tag));
@@ -300,7 +340,11 @@ unsafe fn head_scale(x: *const f32, width: usize, eps: f32, fault: *mut u32, tag
         let mut lanes = [0.0f64; 32];
         for (l, value) in lanes.iter_mut().enumerate() {
             if base + l < half {
+                // SAFETY: base+l < width/2 bounds this read in the live,
+                // aligned width-element head; fault is live/aligned.
                 let a = unsafe { input(x, base + l, fault, tag) };
+                // SAFETY: base+l < half and 2*half == width (even GQA width)
+                // bound the second-half read; x and fault are live/aligned.
                 let b = unsafe { input(x, base + l + half, fault, tag) };
                 *value = (a * a) as f64 + (b * b) as f64;
             }
@@ -311,6 +355,7 @@ unsafe fn head_scale(x: *const f32, width: usize, eps: f32, fault: *mut u32, tag
     let mean = (total / width as f64) as f32;
     let scale = 1.0 / sqrt(mean + eps);
     if !mean.is_finite() || !eps.is_finite() || eps <= 0.0 || !scale.is_finite() || scale <= 0.0 {
+        // SAFETY: fault is the launch's live, aligned atomic word.
         unsafe {
             mark(fault, tag);
         }
@@ -366,6 +411,7 @@ pub unsafe extern "gpu-kernel" fn bloomery_hip_gqa_prep(
         || !rope_dim.is_multiple_of(2)
         || rope_dim > head_dim
     {
+        // SAFETY: shape refusal does not invalidate the live/aligned fault word.
         unsafe {
             mark(fault, tag);
         }
@@ -374,6 +420,12 @@ pub unsafe extern "gpu-kernel" fn bloomery_hip_gqa_prep(
     let query = unit < qheads as usize;
     let h = if query { unit } else { unit - qheads as usize };
     let width = head_dim as usize;
+    // SAFETY: unit selects one query or KV head; validated aligned spans cover
+    // qheads*2*width Q/gate, kvheads*width K/V, and width gains. Even width
+    // makes head_scale's paired reads complete; partner < rope_dim <= width.
+    // pos < context bounds the context*rope_dim table and head-major caches.
+    // Each unit exclusively writes its Q head or KV head's current cache row,
+    // disjoint from inputs and other units; fault is live/aligned for atomics.
     unsafe {
         let source = if query {
             qgate.add(h * 2 * width)
@@ -448,6 +500,7 @@ pub unsafe extern "gpu-kernel" fn bloomery_hip_attention(
         return;
     }
     if !gqa_shape(qheads, kvheads, head_dim, pos, context) {
+        // SAFETY: shape refusal does not invalidate the live/aligned fault word.
         unsafe {
             mark(fault, tag);
         }
@@ -459,6 +512,12 @@ pub unsafe extern "gpu-kernel" fn bloomery_hip_attention(
     let scale = 1.0 / sqrt(width as f32);
     let mut maximum = f32::NEG_INFINITY;
     let mut valid = true;
+    // SAFETY: h < qheads and the divisible grouping give kh < kvheads.
+    // Even width <= 256 bounds paired Q/key reads; pos < context <= 64
+    // bounds weights and all cache rows t <= pos, initialized by prep.
+    // Validated aligned allocations cover Q, doubled Q/gate, and both
+    // kvheads*context*width caches. This head alone writes its distinct
+    // width-element out slice; fault is a live, aligned atomic word.
     unsafe {
         for (t, weight) in weights.iter_mut().enumerate().take(pos as usize + 1) {
             // flash_gqa's four rotating pair partials and fixed final tree.

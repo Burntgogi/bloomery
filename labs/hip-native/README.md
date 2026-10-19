@@ -91,6 +91,10 @@ logit reads are refused until `reset`, which clears recurrent state, conv rings,
 fault. Invalid token IDs and exhausted context are refused before mutation. The probe exercises
 these transitions by inducing a real nonfinite gain, restoring it, and checking bitwise recovery.
 Independent operator oracles retain NMSE <= 1e-6; GDN crosses ring wrap and GQA covers all 64 positions.
+Core and mixer probes share one finite-value, F64 NMSE and fault-checking implementation.
+Zero-energy oracles require exact agreement; nonzero energy is never floored before normalization.
+Typed host/device transfers share `Context::upload`, `download` and `overwrite`, retaining the
+existing synchronous copy and launch boundaries.
 
 For development builds from this directory, with the same runtime setup as above:
 
