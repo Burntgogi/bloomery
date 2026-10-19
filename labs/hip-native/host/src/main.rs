@@ -311,6 +311,54 @@ fn fixture(k: usize, rows: usize) -> Vec<u8> {
     out
 }
 
+fn checked_nmse(name: &str, error: f64, energy: f64) -> Result<f64, String> {
+    let nmse = if energy == 0.0 {
+        if error == 0.0 { 0.0 } else { f64::INFINITY }
+    } else {
+        error / energy
+    };
+    if !nmse.is_finite() || nmse > 1e-6 {
+        return Err(format!("{name}: NMSE {nmse} exceeds fixed 1e-6"));
+    }
+    Ok(nmse)
+}
+
+fn q4_nmse(
+    weights: &[u8],
+    x: &[f32],
+    y: &[f32],
+    k: usize,
+    rows: usize,
+    cols: usize,
+) -> Result<f64, String> {
+    let mut decoded = vec![0.0_f32; k];
+    let mut error = 0.0_f64;
+    let mut norm = 0.0_f64;
+    let row_bytes = k / 256 * 144;
+    for row in 0..rows {
+        gguf::dequant_row(
+            gguf::GgmlType::Q4_K,
+            &weights[row * row_bytes..(row + 1) * row_bytes],
+            &mut decoded,
+        )
+        .map_err(|e| e.to_string())?;
+        for col in 0..cols {
+            let reference: f64 = decoded
+                .iter()
+                .zip(&x[col * k..(col + 1) * k])
+                .map(|(&a, &b)| f64::from(a) * f64::from(b))
+                .sum();
+            let got = f64::from(y[col * rows + row]);
+            if !got.is_finite() || !reference.is_finite() {
+                return Err("non-finite output or reference".into());
+            }
+            error += (got - reference).powi(2);
+            norm += reference.powi(2);
+        }
+    }
+    checked_nmse("q4_matmul", error, norm)
+}
+
 fn case(s: &mut Context, weights: &[u8], k: usize, rows: usize, cols: usize) -> Result<(), String> {
     let (nx, ny) = shape(k, rows, cols, weights.len())?;
     let x: Vec<f32> = (0..k * cols)
@@ -359,35 +407,7 @@ fn case(s: &mut Context, weights: &[u8], k: usize, rows: usize, cols: usize) -> 
         return Err("steady launch allocated a GPU buffer".into());
     }
     s.download(dy, &mut y)?;
-    let mut decoded = vec![0.0_f32; k];
-    let mut error = 0.0_f64;
-    let mut norm = 0.0_f64;
-    let row_bytes = k / 256 * 144;
-    for row in 0..rows {
-        gguf::dequant_row(
-            gguf::GgmlType::Q4_K,
-            &weights[row * row_bytes..(row + 1) * row_bytes],
-            &mut decoded,
-        )
-        .map_err(|e| e.to_string())?;
-        for col in 0..cols {
-            let reference: f64 = decoded
-                .iter()
-                .zip(&x[col * k..(col + 1) * k])
-                .map(|(&a, &b)| f64::from(a) * f64::from(b))
-                .sum();
-            let got = f64::from(y[col * rows + row]);
-            if !got.is_finite() || !reference.is_finite() {
-                return Err("non-finite output or reference".into());
-            }
-            error += (got - reference).powi(2);
-            norm += reference.powi(2);
-        }
-    }
-    let nmse = error / norm.max(1e-30);
-    if !nmse.is_finite() || nmse > 1e-6 {
-        return Err(format!("NMSE {nmse} exceeds fixed 1e-6"));
-    }
+    let nmse = q4_nmse(weights, &x, &y, k, rows, cols)?;
     println!(
         "{{\"operation\":\"q4_matmul\",\"k\":{k},\"rows\":{rows},\"cols\":{cols},\"nmse\":{nmse},\"copy_equal\":true,\"steady_host_buffer_allocations\":0}}"
     );
@@ -543,10 +563,7 @@ fn dense_ffn(s: &mut Context) -> Result<(), String> {
         error += (f64::from(*actual) - reference).powi(2);
         energy += reference.powi(2);
     }
-    let nmse = error / energy.max(1e-30);
-    if !nmse.is_finite() || nmse > 1e-6 {
-        return Err(format!("FFN NMSE {nmse} exceeds fixed 1e-6"));
-    }
+    let nmse = checked_nmse("FFN", error, energy)?;
     println!(
         "{{\"operation\":\"dense_ffn\",\"width\":256,\"nmse\":{nmse},\"intermediate_host_copies\":0,\"steady_host_buffer_allocations\":0}}"
     );
@@ -562,7 +579,26 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::shape;
+    use super::{fixture, q4_nmse, shape};
+
+    #[test]
+    fn q4_gate_rejects_zero_and_tiny_oracle_corruption() {
+        let zero_weights = vec![0; 4 * 144];
+        let nonzero_weights = fixture(256, 4);
+        for cols in [1, 32] {
+            let x = vec![1.0; cols * 256];
+            let zero = vec![0.0; cols * 4];
+            assert_eq!(
+                q4_nmse(&zero_weights, &x, &zero, 256, 4, cols).unwrap(),
+                0.0
+            );
+            let corrupted = vec![1.0e-20; cols * 4];
+            assert!(q4_nmse(&zero_weights, &x, &corrupted, 256, 4, cols).is_err());
+            let tiny_x = vec![1.0e-24; cols * 256];
+            assert!(q4_nmse(&nonzero_weights, &tiny_x, &zero, 256, 4, cols).is_err());
+        }
+    }
+
     #[test]
     fn refuses_invalid_shapes_and_truncated_weights() {
         for (k, r, c, w) in [
