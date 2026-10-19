@@ -1,0 +1,52 @@
+   Compiling proc-macro2 v1.0.107
+   Compiling unicode-ident v1.0.27
+   Compiling quote v1.0.47
+   Compiling version_check v0.9.5
+   Compiling generic-array v0.14.7
+   Compiling libc v0.2.190
+   Compiling typenum v1.20.1
+   Compiling syn v3.0.9
+   Compiling thiserror v2.0.21
+   Compiling block-buffer v0.10.4
+   Compiling crypto-common v0.1.7
+   Compiling memmap2 v0.9.11
+   Compiling digest v0.10.7
+   Compiling cpufeatures v0.2.17
+   Compiling cfg-if v1.0.5
+   Compiling sha2 v0.10.9
+   Compiling serde_core v1.0.229
+   Compiling zmij v1.0.23
+   Compiling bloomery-levers v0.1.0 ($SOURCE_ROOT/crates/levers)
+   Compiling thiserror-impl v2.0.21
+   Compiling memchr v2.8.3
+   Compiling serde_json v1.0.151
+   Compiling bloomery-gguf v0.1.0 ($SOURCE_ROOT/crates/gguf)
+   Compiling bloomery-models v0.1.0 ($SOURCE_ROOT/crates/models)
+   Compiling itoa v1.0.18
+   Compiling bloomery-runtime v0.1.0 ($SOURCE_ROOT/crates/runtime)
+   Compiling bloomery-threads v0.1.0 ($SOURCE_ROOT/crates/threads)
+   Compiling sha1 v0.10.7
+   Compiling bloomery-hf v0.1.0 ($SOURCE_ROOT/crates/hf)
+   Compiling bloomery-qdot v0.1.0 ($SOURCE_ROOT/crates/qdot)
+   Compiling bloomery-placement v0.1.0 ($SOURCE_ROOT/crates/placement)
+   Compiling bloomery-tokenizer v0.1.0 ($SOURCE_ROOT/crates/tokenizer)
+   Compiling bloomery-hip-spike v0.1.0 ($SOURCE_ROOT/labs/hip-native/host)
+   Compiling bloomery-model v0.1.0 ($SOURCE_ROOT/crates/model)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 17.41s
+     Running unittests src/main.rs (target/x86_64-unknown-linux-gnu/debug/build/bloomery-hip-spike/d9195002c417954e/out/bloomery_hip_spike-d9195002c417954e)
+
+running 1 test
+
+thread 'tests::q4_gate_rejects_zero_and_tiny_oracle_corruption' (4077002) panicked at host/src/main.rs:591:13:
+assertion failed: q4_nmse(&zero_weights, &x, &corrupted, 256, 4, cols).is_err()
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test tests::q4_gate_rejects_zero_and_tiny_oracle_corruption ... FAILED
+
+failures:
+
+failures:
+    tests::q4_gate_rejects_zero_and_tiny_oracle_corruption
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--bin bloomery-hip-spike`

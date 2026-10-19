@@ -1,0 +1,35 @@
+{
+  "schema": 1,
+  "status": "pass",
+  "previous_source": "f71e148395ab810aa40c577861ff7a3fd277873c",
+  "current_source": "1a3d1a6f2f34cc808f4e1ab9fba83d8d23e5e004",
+  "cases": {
+    "small": {
+      "all_token_ids_and_row_metrics_unchanged": true,
+      "all_native_full_row_hashes_unchanged": true,
+      "reference_final_raw_sha256": "8ec66e34d106ed464ba801aeb3be5fb6a6f8f01961d6bf325f957f7580af28ac",
+      "per_engine_reset_bitwise_equal": true,
+      "rows": 8,
+      "vocab": 258,
+      "max_relative_l2": 0.02468421425166595
+    },
+    "english": {
+      "all_token_ids_and_row_metrics_unchanged": true,
+      "all_native_full_row_hashes_unchanged": true,
+      "reference_final_raw_sha256": "194b41b6a13b6ef5ead171a4368a078393a673f90e57aad8dbc5492bbf1d7a73",
+      "per_engine_reset_bitwise_equal": true,
+      "rows": 8,
+      "vocab": 248320,
+      "max_relative_l2": 0.027311885469503642
+    },
+    "korean": {
+      "all_token_ids_and_row_metrics_unchanged": true,
+      "all_native_full_row_hashes_unchanged": true,
+      "reference_final_raw_sha256": "1c4bc503267ea7ae934d54af55b5027099210d8ff012058c1dab1e8041f465f3",
+      "per_engine_reset_bitwise_equal": true,
+      "rows": 8,
+      "vocab": 248320,
+      "max_relative_l2": 0.0226808442104578
+    }
+  }
+}

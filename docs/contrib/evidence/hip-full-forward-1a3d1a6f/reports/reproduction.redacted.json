@@ -1,0 +1,44 @@
+{
+  "issue": 479,
+  "source": "f71e148395ab810aa40c577861ff7a3fd277873c",
+  "host": {
+    "path": "$PARENT_SOURCE_ROOT/labs/hip-native/target/x86_64-unknown-linux-gnu/release/bloomery-hip-spike",
+    "bytes": 1860424,
+    "sha256": "7d0da0958ad651b9feb0114e2746c5a4b20312ed41d5877375abfa97b3e0b4ba"
+  },
+  "device_mutant": {
+    "path": "$MUTANT_SOURCE_ROOT/labs/hip-native/target/amdgcn-amd-amdhsa/release/bloomery_hip_spike_device.elf",
+    "bytes": 129664,
+    "sha256": "2cf9cf321c430cfe454aa3fe199c7534c168d0f864c0010e6067829cd577a9e2"
+  },
+  "device_mutation": "bloomery_hip_q4_matmul: store sum + 1.0e-20_f32",
+  "zero_fixture": {
+    "path": "$EVIDENCE_ROOT/zero-q4-k256-rows4.bin",
+    "bytes": 576,
+    "sha256": "1a0295f4bf5986c5f74eca9153a6a4cb10b073a01a76ba4a457fd862c78966a4"
+  },
+  "K": 256,
+  "rows": 4,
+  "before_exit": 0,
+  "incorrect_outputs_accepted": [
+    {
+      "operation": "q4_matmul",
+      "k": 256,
+      "rows": 4,
+      "cols": 1,
+      "nmse": 3.999999746124184e-10,
+      "copy_equal": true,
+      "steady_host_buffer_allocations": 0
+    },
+    {
+      "operation": "q4_matmul",
+      "k": 256,
+      "rows": 4,
+      "cols": 32,
+      "nmse": 1.2799999187597388e-08,
+      "copy_equal": true,
+      "steady_host_buffer_allocations": 0
+    }
+  ],
+  "status": "reproduced on actual HIP GPU"
+}

@@ -1,0 +1,35 @@
+   Compiling proc-macro2 v1.0.107
+   Compiling version_check v0.9.5
+   Compiling unicode-ident v1.0.27
+   Compiling quote v1.0.47
+   Compiling generic-array v0.14.7
+   Compiling libc v0.2.190
+   Compiling typenum v1.20.1
+   Compiling syn v3.0.9
+   Compiling thiserror v2.0.21
+   Compiling thiserror-impl v2.0.21
+   Compiling memmap2 v0.9.11
+   Compiling crypto-common v0.1.7
+   Compiling block-buffer v0.10.4
+   Compiling digest v0.10.7
+   Compiling cpufeatures v0.2.17
+   Compiling cfg-if v1.0.5
+   Compiling sha2 v0.10.9
+   Compiling bloomery-gguf v0.1.0 ($SOURCE_ROOT/crates/gguf)
+   Compiling zmij v1.0.23
+   Compiling serde_core v1.0.229
+   Compiling bloomery-levers v0.1.0 ($SOURCE_ROOT/crates/levers)
+   Compiling bloomery-models v0.1.0 ($SOURCE_ROOT/crates/models)
+   Compiling memchr v2.8.3
+   Compiling serde_json v1.0.151
+   Compiling itoa v1.0.18
+   Compiling bloomery-runtime v0.1.0 ($SOURCE_ROOT/crates/runtime)
+   Compiling bloomery-threads v0.1.0 ($SOURCE_ROOT/crates/threads)
+   Compiling sha1 v0.10.7
+   Compiling bloomery-hf v0.1.0 ($SOURCE_ROOT/crates/hf)
+   Compiling bloomery-qdot v0.1.0 ($SOURCE_ROOT/crates/qdot)
+   Compiling bloomery-tokenizer v0.1.0 ($SOURCE_ROOT/crates/tokenizer)
+   Compiling bloomery-placement v0.1.0 ($SOURCE_ROOT/crates/placement)
+   Compiling bloomery-hip-spike v0.1.0 ($SOURCE_ROOT/labs/hip-native/host)
+   Compiling bloomery-model v0.1.0 ($SOURCE_ROOT/crates/model)
+    Finished `release` profile [optimized] target(s) in 28.53s

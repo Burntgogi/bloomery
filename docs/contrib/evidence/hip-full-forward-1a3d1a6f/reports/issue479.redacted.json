@@ -1,0 +1,191 @@
+{
+  "schema": 1,
+  "issue": 479,
+  "status": "pass",
+  "source": {
+    "commit": "1a3d1a6f2f34cc808f4e1ab9fba83d8d23e5e004",
+    "tree": "84fbace83f79e05ffcc0c31d9ce5830c494f601e",
+    "lab_tree": "660113afa5a1564dc44d27aebac6e3ccb1b4d40e",
+    "clean": true
+  },
+  "parent": "f71e148395ab810aa40c577861ff7a3fd277873c",
+  "before": {
+    "issue": 479,
+    "source": "f71e148395ab810aa40c577861ff7a3fd277873c",
+    "host": {
+      "path": "$PARENT_SOURCE_ROOT/labs/hip-native/target/x86_64-unknown-linux-gnu/release/bloomery-hip-spike",
+      "bytes": 1860424,
+      "sha256": "7d0da0958ad651b9feb0114e2746c5a4b20312ed41d5877375abfa97b3e0b4ba"
+    },
+    "device_mutant": {
+      "path": "$MUTANT_SOURCE_ROOT/labs/hip-native/target/amdgcn-amd-amdhsa/release/bloomery_hip_spike_device.elf",
+      "bytes": 129664,
+      "sha256": "2cf9cf321c430cfe454aa3fe199c7534c168d0f864c0010e6067829cd577a9e2"
+    },
+    "device_mutation": "bloomery_hip_q4_matmul: store sum + 1.0e-20_f32",
+    "zero_fixture": {
+      "path": "$EVIDENCE_ROOT/zero-q4-k256-rows4.bin",
+      "bytes": 576,
+      "sha256": "1a0295f4bf5986c5f74eca9153a6a4cb10b073a01a76ba4a457fd862c78966a4"
+    },
+    "K": 256,
+    "rows": 4,
+    "before_exit": 0,
+    "incorrect_outputs_accepted": [
+      {
+        "operation": "q4_matmul",
+        "k": 256,
+        "rows": 4,
+        "cols": 1,
+        "nmse": 3.999999746124184e-10,
+        "copy_equal": true,
+        "steady_host_buffer_allocations": 0
+      },
+      {
+        "operation": "q4_matmul",
+        "k": 256,
+        "rows": 4,
+        "cols": 32,
+        "nmse": 1.2799999187597388e-08,
+        "copy_equal": true,
+        "steady_host_buffer_allocations": 0
+      }
+    ],
+    "status": "reproduced on actual HIP GPU"
+  },
+  "after": {
+    "normal_zero_fixture_exit": 0,
+    "normal_zero_cases": [
+      {
+        "operation": "q4_matmul",
+        "k": 256,
+        "rows": 4,
+        "cols": 1,
+        "nmse": 0,
+        "copy_equal": true,
+        "steady_host_buffer_allocations": 0
+      },
+      {
+        "operation": "q4_matmul",
+        "k": 256,
+        "rows": 4,
+        "cols": 32,
+        "nmse": 0,
+        "copy_equal": true,
+        "steady_host_buffer_allocations": 0
+      }
+    ],
+    "all_cols_mutant_exit": 1,
+    "cols32_only_mutant_exit": 1,
+    "rejection": "q4_matmul: NMSE inf exceeds fixed 1e-6",
+    "cols32_refusal_reached_after_exact_zero_cols1": true,
+    "host": {
+      "path": "$SOURCE_ROOT/labs/hip-native/target/x86_64-unknown-linux-gnu/release/bloomery-hip-spike",
+      "bytes": 1860112,
+      "sha256": "54c361dde518ca05fc4df1657616f5d584e80b77b985f2ce69fbca37577d61aa"
+    },
+    "device": {
+      "path": "$SOURCE_ROOT/labs/hip-native/target/amdgcn-amd-amdhsa/release/bloomery_hip_spike_device.elf",
+      "bytes": 129664,
+      "sha256": "09bd5111bf959ac8784163bfd6b60f8a995097cdc305c4f774b2a621840ba929"
+    },
+    "device_binary_unchanged": true
+  },
+  "permanent_regression": {
+    "name": "q4_gate_rejects_zero_and_tiny_oracle_corruption",
+    "before_expected_failure_exit": 101,
+    "after_exit": 0,
+    "cases": "zero/tiny oracle energy, zero exact output and nonzero corrupt output, cols1/32"
+  },
+  "NMSE_limit": 1e-06,
+  "policy_owner": "checked_nmse",
+  "oracle_precision": "F64 Q4 dot products retained; no F32 narrowing",
+  "canonical": {
+    "status": "pass",
+    "command_groups": 8,
+    "GPU_cases": 18
+  },
+  "model_output_comparison": {
+    "schema": 1,
+    "status": "pass",
+    "previous_source": "f71e148395ab810aa40c577861ff7a3fd277873c",
+    "current_source": "1a3d1a6f2f34cc808f4e1ab9fba83d8d23e5e004",
+    "cases": {
+      "small": {
+        "all_token_ids_and_row_metrics_unchanged": true,
+        "all_native_full_row_hashes_unchanged": true,
+        "reference_final_raw_sha256": "8ec66e34d106ed464ba801aeb3be5fb6a6f8f01961d6bf325f957f7580af28ac",
+        "per_engine_reset_bitwise_equal": true,
+        "rows": 8,
+        "vocab": 258,
+        "max_relative_l2": 0.02468421425166595
+      },
+      "english": {
+        "all_token_ids_and_row_metrics_unchanged": true,
+        "all_native_full_row_hashes_unchanged": true,
+        "reference_final_raw_sha256": "194b41b6a13b6ef5ead171a4368a078393a673f90e57aad8dbc5492bbf1d7a73",
+        "per_engine_reset_bitwise_equal": true,
+        "rows": 8,
+        "vocab": 248320,
+        "max_relative_l2": 0.027311885469503642
+      },
+      "korean": {
+        "all_token_ids_and_row_metrics_unchanged": true,
+        "all_native_full_row_hashes_unchanged": true,
+        "reference_final_raw_sha256": "1c4bc503267ea7ae934d54af55b5027099210d8ff012058c1dab1e8041f465f3",
+        "per_engine_reset_bitwise_equal": true,
+        "rows": 8,
+        "vocab": 248320,
+        "max_relative_l2": 0.0226808442104578
+      }
+    }
+  },
+  "scope": {
+    "source": {
+      "commit": "1a3d1a6f2f34cc808f4e1ab9fba83d8d23e5e004",
+      "tree": "84fbace83f79e05ffcc0c31d9ce5830c494f601e",
+      "lab_tree": "660113afa5a1564dc44d27aebac6e3ccb1b4d40e"
+    },
+    "base": "11d8a7d37a7648f3d5fc058f293947638313b2c4",
+    "paths": [
+      "docs/contrib/qwen35-dense-validation.md",
+      "labs/hip-native/Cargo.lock",
+      "labs/hip-native/README.md",
+      "labs/hip-native/compare-hip.py",
+      "labs/hip-native/device/src/forward_core.rs",
+      "labs/hip-native/device/src/forward_math.rs",
+      "labs/hip-native/device/src/forward_mixer.rs",
+      "labs/hip-native/device/src/lib.rs",
+      "labs/hip-native/host/Cargo.toml",
+      "labs/hip-native/host/build.rs",
+      "labs/hip-native/host/src/forward/fixture.rs",
+      "labs/hip-native/host/src/forward/mod.rs",
+      "labs/hip-native/host/src/forward/plan.rs",
+      "labs/hip-native/host/src/forward/runner.rs",
+      "labs/hip-native/host/src/forward_core_probe.rs",
+      "labs/hip-native/host/src/forward_mixer_probe.rs",
+      "labs/hip-native/host/src/main.rs",
+      "labs/hip-native/host/src/selected.rs",
+      "labs/hip-native/verify.py",
+      "tools/ref/dense-logits.py",
+      "tools/ref/dense_logits_ref.cpp"
+    ],
+    "changed_file_count": 21,
+    "production_paths_changed": false,
+    "incremental_parent": "f71e148395ab810aa40c577861ff7a3fd277873c",
+    "incremental_paths": [
+      "labs/hip-native/README.md",
+      "labs/hip-native/host/src/forward_mixer_probe.rs",
+      "labs/hip-native/host/src/main.rs"
+    ],
+    "incremental_file_count": 3,
+    "device_sources_unchanged": true,
+    "F64_Q4_dot_accumulation_retained": true,
+    "kernel_launches_copies_and_sync_unchanged": true,
+    "NMSE_policy_owner": "checked_nmse",
+    "NMSE_limit": 1e-06
+  },
+  "no_performance_claim": true,
+  "no_resident_service_changes": true,
+  "mutant_warning": "isolated throwaway device builds only; never admission evidence or source PR contents"
+}

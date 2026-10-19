@@ -1,0 +1,13 @@
+diff --git a/labs/hip-native/device/src/lib.rs b/labs/hip-native/device/src/lib.rs
+index 3bb1c9f3..387ab4db 100644
+--- a/labs/hip-native/device/src/lib.rs
++++ b/labs/hip-native/device/src/lib.rs
+@@ -120,7 +120,7 @@ pub unsafe extern "gpu-kernel" fn bloomery_hip_q4_matmul(
+             sum += w * *x.add(col * k as usize + j);
+             j += 1;
+         }
+-        *y.add(i) = sum;
++        *y.add(i) = sum + 1.0e-20_f32;
+     }
+ }
+ 

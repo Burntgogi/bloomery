@@ -1,0 +1,438 @@
+{
+  "source": {
+    "commit": "1a3d1a6f2f34cc808f4e1ab9fba83d8d23e5e004",
+    "tree": "84fbace83f79e05ffcc0c31d9ce5830c494f601e",
+    "lab_tree": "660113afa5a1564dc44d27aebac6e3ccb1b4d40e",
+    "clean": true
+  },
+  "commands": [
+    {
+      "name": "create-fix-worktree",
+      "argv": [
+        "git",
+        "worktree",
+        "add",
+        "-b",
+        "fix/hip-q4-zero-oracle-479-20261019",
+        "$SOURCE_ROOT",
+        "f71e148395ab810aa40c577861ff7a3fd277873c"
+      ],
+      "cwd": "$PARENT_SOURCE_ROOT",
+      "exit_code": 0,
+      "log": "$EVIDENCE_ROOT/create-fix-worktree.log"
+    },
+    {
+      "name": "create-isolated-mutant",
+      "argv": [
+        "git",
+        "worktree",
+        "add",
+        "--detach",
+        "$MUTANT_SOURCE_ROOT",
+        "f71e148395ab810aa40c577861ff7a3fd277873c"
+      ],
+      "cwd": "$PARENT_SOURCE_ROOT",
+      "exit_code": 0,
+      "log": "$EVIDENCE_ROOT/create-isolated-mutant.log"
+    },
+    {
+      "name": "build-mutant-device",
+      "argv": [
+        "cargo",
+        "build",
+        "-Zbuild-std=core",
+        "--locked",
+        "--release",
+        "--target",
+        "amdgcn-amd-amdhsa",
+        "-p",
+        "bloomery-hip-spike-device"
+      ],
+      "cwd": "$MUTANT_SOURCE_ROOT/labs/hip-native",
+      "exit_code": 0,
+      "log": "$EVIDENCE_ROOT/build-mutant-device.log"
+    },
+    {
+      "name": "before-zero-weight-mutant",
+      "argv": [
+        "$PARENT_SOURCE_ROOT/labs/hip-native/target/x86_64-unknown-linux-gnu/release/bloomery-hip-spike",
+        "$MUTANT_SOURCE_ROOT/labs/hip-native/target/amdgcn-amd-amdhsa/release/bloomery_hip_spike_device.elf",
+        "$EVIDENCE_ROOT/zero-q4-k256-rows4.bin",
+        "256",
+        "4"
+      ],
+      "cwd": "$SOURCE_ROOT",
+      "exit_code": 0,
+      "log": "$EVIDENCE_ROOT/before-zero-weight-mutant.log"
+    },
+    {
+      "name": "regression-before-expected-failure",
+      "argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "--manifest-path",
+        "$SOURCE_ROOT/labs/hip-native/host/Cargo.toml",
+        "--target",
+        "x86_64-unknown-linux-gnu",
+        "q4_gate_rejects_zero_and_tiny_oracle_corruption",
+        "--",
+        "--nocapture"
+      ],
+      "cwd": "$SOURCE_ROOT/labs/hip-native",
+      "exit_code": 101,
+      "log": "$EVIDENCE_ROOT/regression-before-expected-failure.log",
+      "expected_exit_code": 101,
+      "expected_failure": true
+    },
+    {
+      "name": "build-cols32-mutant-device",
+      "argv": [
+        "cargo",
+        "build",
+        "-Zbuild-std=core",
+        "--locked",
+        "--release",
+        "--target",
+        "amdgcn-amd-amdhsa",
+        "-p",
+        "bloomery-hip-spike-device"
+      ],
+      "cwd": "$MUTANT_SOURCE_ROOT/labs/hip-native",
+      "exit_code": 0,
+      "log": "$EVIDENCE_ROOT/build-cols32-mutant-device.log"
+    },
+    {
+      "name": "before-cols32-only-mutant",
+      "argv": [
+        "$PARENT_SOURCE_ROOT/labs/hip-native/target/x86_64-unknown-linux-gnu/release/bloomery-hip-spike",
+        "$EVIDENCE_ROOT/q4-mutant-cols32.elf",
+        "$EVIDENCE_ROOT/zero-q4-k256-rows4.bin",
+        "256",
+        "4"
+      ],
+      "cwd": "$SOURCE_ROOT",
+      "exit_code": 0,
+      "log": "$EVIDENCE_ROOT/before-cols32-only-mutant.log"
+    },
+    {
+      "name": "format",
+      "argv": [
+        "cargo",
+        "fmt",
+        "--all"
+      ],
+      "cwd": "$SOURCE_ROOT/labs/hip-native",
+      "exit_code": 0,
+      "log": "$EVIDENCE_ROOT/format.log"
+    },
+    {
+      "name": "regression-after",
+      "argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "--manifest-path",
+        "$SOURCE_ROOT/labs/hip-native/host/Cargo.toml",
+        "--target",
+        "x86_64-unknown-linux-gnu",
+        "q4_gate_rejects_zero_and_tiny_oracle_corruption",
+        "--",
+        "--nocapture"
+      ],
+      "cwd": "$SOURCE_ROOT/labs/hip-native",
+      "exit_code": 0,
+      "log": "$EVIDENCE_ROOT/regression-after.log"
+    },
+    {
+      "name": "stage-fix",
+      "argv": [
+        "git",
+        "add",
+        "--",
+        "labs/hip-native/host/src/main.rs",
+        "labs/hip-native/host/src/forward_mixer_probe.rs",
+        "labs/hip-native/README.md"
+      ],
+      "cwd": "$SOURCE_ROOT",
+      "exit_code": 0,
+      "log": "$EVIDENCE_ROOT/stage-fix.log"
+    },
+    {
+      "name": "commit-fix",
+      "argv": [
+        "git",
+        "commit",
+        "-m",
+        "hip-native: reject zero-energy Q4 corruption with shared NMSE gate"
+      ],
+      "cwd": "$SOURCE_ROOT",
+      "exit_code": 0,
+      "log": "$EVIDENCE_ROOT/commit-fix.log"
+    },
+    {
+      "name": "patch-load-base",
+      "argv": [
+        "git",
+        "read-tree",
+        "11d8a7d37a7648f3d5fc058f293947638313b2c4"
+      ],
+      "cwd": "$SOURCE_ROOT",
+      "exit_code": 0,
+      "log": "$EVIDENCE_ROOT/patch-load-base.log"
+    },
+    {
+      "name": "patch-apply",
+      "argv": [
+        "git",
+        "apply",
+        "--cached",
+        "$EVIDENCE_ROOT/hip-full-forward-current.patch"
+      ],
+      "cwd": "$SOURCE_ROOT",
+      "exit_code": 0,
+      "log": "$EVIDENCE_ROOT/patch-apply.log"
+    },
+    {
+      "name": "after-zero-weight-normal",
+      "argv": [
+        "$SOURCE_ROOT/labs/hip-native/target/x86_64-unknown-linux-gnu/release/bloomery-hip-spike",
+        "$SOURCE_ROOT/labs/hip-native/target/amdgcn-amd-amdhsa/release/bloomery_hip_spike_device.elf",
+        "$EVIDENCE_ROOT/zero-q4-k256-rows4.bin",
+        "256",
+        "4"
+      ],
+      "cwd": "$SOURCE_ROOT",
+      "exit_code": 0,
+      "log": "$EVIDENCE_ROOT/after-zero-weight-normal.log"
+    },
+    {
+      "name": "after-zero-weight-mutant",
+      "argv": [
+        "$SOURCE_ROOT/labs/hip-native/target/x86_64-unknown-linux-gnu/release/bloomery-hip-spike",
+        "$EVIDENCE_ROOT/q4-mutant-all-cols.elf",
+        "$EVIDENCE_ROOT/zero-q4-k256-rows4.bin",
+        "256",
+        "4"
+      ],
+      "cwd": "$SOURCE_ROOT",
+      "exit_code": 1,
+      "log": "$EVIDENCE_ROOT/after-zero-weight-mutant.log",
+      "expected_exit_code": 1,
+      "expected_refusal": true
+    },
+    {
+      "name": "after-cols32-only-mutant",
+      "argv": [
+        "$SOURCE_ROOT/labs/hip-native/target/x86_64-unknown-linux-gnu/release/bloomery-hip-spike",
+        "$EVIDENCE_ROOT/q4-mutant-cols32.elf",
+        "$EVIDENCE_ROOT/zero-q4-k256-rows4.bin",
+        "256",
+        "4"
+      ],
+      "cwd": "$SOURCE_ROOT",
+      "exit_code": 1,
+      "log": "$EVIDENCE_ROOT/after-cols32-only-mutant.log",
+      "expected_exit_code": 1,
+      "expected_refusal": true
+    },
+    {
+      "name": "comparer-self-test",
+      "argv": [
+        "/usr/bin/python3",
+        "$SOURCE_ROOT/labs/hip-native/compare-hip.py",
+        "--self-test"
+      ],
+      "exit_code": 0,
+      "log": "$EVIDENCE_ROOT/comparer-self-test.log",
+      "cwd": "$SOURCE_ROOT"
+    },
+    {
+      "name": "reference-self-test",
+      "argv": [
+        "/usr/bin/python3",
+        "$SOURCE_ROOT/tools/ref/dense-logits.py",
+        "--self-test"
+      ],
+      "exit_code": 0,
+      "log": "$EVIDENCE_ROOT/reference-self-test.log",
+      "cwd": "$SOURCE_ROOT"
+    },
+    {
+      "name": "root-fmt",
+      "argv": [
+        "cargo",
+        "fmt",
+        "--all",
+        "--",
+        "--check"
+      ],
+      "exit_code": 0,
+      "log": "$EVIDENCE_ROOT/root-fmt.log",
+      "cwd": "$SOURCE_ROOT"
+    },
+    {
+      "name": "reference-build",
+      "argv": [
+        "/usr/bin/python3",
+        "$SOURCE_ROOT/tools/ref/dense-logits.py",
+        "build",
+        "--llama-tree",
+        "$LLAMA_SOURCE",
+        "--llama-build",
+        "$LLAMA_BUILD",
+        "--cmake",
+        "$TOOL_VENV/lib/python3.12/site-packages/cmake/data/bin/cmake",
+        "--out",
+        "$EVIDENCE_ROOT/reference/dense_logits_ref"
+      ],
+      "exit_code": 0,
+      "log": "$EVIDENCE_ROOT/reference-build.log",
+      "cwd": "$SOURCE_ROOT"
+    },
+    {
+      "name": "comment-contract",
+      "argv": [
+        "bash",
+        "$SOURCE_ROOT/tools/check-comments.sh"
+      ],
+      "exit_code": 0,
+      "log": "$EVIDENCE_ROOT/comment-contract.log",
+      "cwd": "$SOURCE_ROOT"
+    },
+    {
+      "name": "canonical-current-main",
+      "argv": [
+        "bash",
+        "$SOURCE_ROOT/labs/hip-native/verify.sh",
+        "$EVIDENCE_ROOT/canonical",
+        "--q4-rows",
+        "$FIXTURE_ROOT/Q4_K.bin",
+        "--k",
+        "6144",
+        "--rows",
+        "64"
+      ],
+      "exit_code": 0,
+      "log": "$EVIDENCE_ROOT/canonical-current-main.log",
+      "cwd": "$SOURCE_ROOT"
+    },
+    {
+      "name": "recipes-contract",
+      "argv": [
+        "/usr/bin/python3",
+        "$SOURCE_ROOT/tools/recipes.py",
+        "check"
+      ],
+      "exit_code": 0,
+      "log": "$EVIDENCE_ROOT/recipes-contract.log",
+      "cwd": "$SOURCE_ROOT"
+    },
+    {
+      "name": "cpu-reset-compatibility",
+      "argv": [
+        "/usr/bin/python3",
+        "$SOURCE_ROOT/tools/ref/dense-logits.py",
+        "run",
+        "--kind",
+        "reference",
+        "--backend",
+        "cpu",
+        "--target",
+        "hip-lab-hybrid",
+        "--binary",
+        "$EVIDENCE_ROOT/reference/dense_logits_ref",
+        "--model",
+        "$EVIDENCE_ROOT/canonical/forward/smoke.gguf",
+        "--prompt",
+        "$EVIDENCE_ROOT/canonical/forward/prompt.ids",
+        "--forced",
+        "$EVIDENCE_ROOT/canonical/forward/forced.ids",
+        "--ctx",
+        "64",
+        "--ubatch",
+        "1",
+        "--prefill",
+        "step",
+        "--reset-repeats",
+        "2",
+        "--out",
+        "$EVIDENCE_ROOT/cpu-reset-compatibility"
+      ],
+      "exit_code": 0,
+      "log": "$EVIDENCE_ROOT/cpu-reset-compatibility.log",
+      "cwd": "$SOURCE_ROOT"
+    },
+    {
+      "name": "refset-consumer-tests",
+      "argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "bloomery-refset",
+        "--lib"
+      ],
+      "exit_code": 0,
+      "log": "$EVIDENCE_ROOT/refset-consumer-tests.log",
+      "cwd": "$SOURCE_ROOT"
+    },
+    {
+      "name": "small-hip-comparison",
+      "argv": [
+        "/usr/bin/python3",
+        "$SOURCE_ROOT/labs/hip-native/compare-hip.py",
+        "$EVIDENCE_ROOT/small-hip-comparison",
+        "--reference",
+        "$EVIDENCE_ROOT/reference/dense_logits_ref",
+        "--native-evidence",
+        "$EVIDENCE_ROOT/canonical/result.json"
+      ],
+      "exit_code": 0,
+      "log": "$EVIDENCE_ROOT/small-hip-comparison.log",
+      "cwd": "$SOURCE_ROOT"
+    },
+    {
+      "name": "english-hip-comparison",
+      "argv": [
+        "/usr/bin/python3",
+        "$SOURCE_ROOT/labs/hip-native/compare-hip.py",
+        "$EVIDENCE_ROOT/english-hip-comparison",
+        "--reference",
+        "$EVIDENCE_ROOT/reference/dense_logits_ref",
+        "--native-evidence",
+        "$EVIDENCE_ROOT/canonical/result.json",
+        "--target",
+        "qwen35-0.8b-candidate",
+        "--model",
+        "$MODEL_ROOT/notschmee/Qwen3.5-0.8B-GGUF/1870603ac8ab59c7ddb9d94cccf3b297e379538f/Qwen3.5-0.8B-Q4_K_M.gguf",
+        "--prompt",
+        "$EVIDENCE_ROOT/inputs/english.ids"
+      ],
+      "exit_code": 0,
+      "log": "$EVIDENCE_ROOT/english-hip-comparison.log",
+      "cwd": "$SOURCE_ROOT"
+    },
+    {
+      "name": "korean-hip-comparison",
+      "argv": [
+        "/usr/bin/python3",
+        "$SOURCE_ROOT/labs/hip-native/compare-hip.py",
+        "$EVIDENCE_ROOT/korean-hip-comparison",
+        "--reference",
+        "$EVIDENCE_ROOT/reference/dense_logits_ref",
+        "--native-evidence",
+        "$EVIDENCE_ROOT/canonical/result.json",
+        "--target",
+        "qwen35-0.8b-candidate",
+        "--model",
+        "$MODEL_ROOT/notschmee/Qwen3.5-0.8B-GGUF/1870603ac8ab59c7ddb9d94cccf3b297e379538f/Qwen3.5-0.8B-Q4_K_M.gguf",
+        "--prompt",
+        "$EVIDENCE_ROOT/inputs/korean.ids"
+      ],
+      "exit_code": 0,
+      "log": "$EVIDENCE_ROOT/korean-hip-comparison.log",
+      "cwd": "$SOURCE_ROOT"
+    }
+  ]
+}

@@ -1,0 +1,45 @@
+{
+  "source": {
+    "commit": "1a3d1a6f2f34cc808f4e1ab9fba83d8d23e5e004",
+    "tree": "84fbace83f79e05ffcc0c31d9ce5830c494f601e",
+    "lab_tree": "660113afa5a1564dc44d27aebac6e3ccb1b4d40e"
+  },
+  "base": "11d8a7d37a7648f3d5fc058f293947638313b2c4",
+  "paths": [
+    "docs/contrib/qwen35-dense-validation.md",
+    "labs/hip-native/Cargo.lock",
+    "labs/hip-native/README.md",
+    "labs/hip-native/compare-hip.py",
+    "labs/hip-native/device/src/forward_core.rs",
+    "labs/hip-native/device/src/forward_math.rs",
+    "labs/hip-native/device/src/forward_mixer.rs",
+    "labs/hip-native/device/src/lib.rs",
+    "labs/hip-native/host/Cargo.toml",
+    "labs/hip-native/host/build.rs",
+    "labs/hip-native/host/src/forward/fixture.rs",
+    "labs/hip-native/host/src/forward/mod.rs",
+    "labs/hip-native/host/src/forward/plan.rs",
+    "labs/hip-native/host/src/forward/runner.rs",
+    "labs/hip-native/host/src/forward_core_probe.rs",
+    "labs/hip-native/host/src/forward_mixer_probe.rs",
+    "labs/hip-native/host/src/main.rs",
+    "labs/hip-native/host/src/selected.rs",
+    "labs/hip-native/verify.py",
+    "tools/ref/dense-logits.py",
+    "tools/ref/dense_logits_ref.cpp"
+  ],
+  "changed_file_count": 21,
+  "production_paths_changed": false,
+  "incremental_parent": "f71e148395ab810aa40c577861ff7a3fd277873c",
+  "incremental_paths": [
+    "labs/hip-native/README.md",
+    "labs/hip-native/host/src/forward_mixer_probe.rs",
+    "labs/hip-native/host/src/main.rs"
+  ],
+  "incremental_file_count": 3,
+  "device_sources_unchanged": true,
+  "F64_Q4_dot_accumulation_retained": true,
+  "kernel_launches_copies_and_sync_unchanged": true,
+  "NMSE_policy_owner": "checked_nmse",
+  "NMSE_limit": 1e-06
+}

@@ -1,0 +1,4 @@
+{"operation":"q4_matmul","k":256,"rows":7,"cols":1,"nmse":0.00000000000003702660797383163,"copy_equal":true,"steady_host_buffer_allocations":0}
+{"operation":"q4_matmul","k":512,"rows":64,"cols":1,"nmse":0.000000000001375607993838801,"copy_equal":true,"steady_host_buffer_allocations":0}
+{"operation":"q4_matmul","k":512,"rows":64,"cols":32,"nmse":0.0000000000006689703539606927,"copy_equal":true,"steady_host_buffer_allocations":0}
+bloomery-hip-spike: q4_matmul: NMSE inf exceeds fixed 1e-6

@@ -1,0 +1,216 @@
+{
+  "schema": 1,
+  "document_kind": "curated_public_attestation_not_a_verifier_bundle",
+  "publication_status": "snapshot_prepared_before_evidence_upload",
+  "run_status": "pass",
+  "source": {
+    "commit": "1a3d1a6f2f34cc808f4e1ab9fba83d8d23e5e004",
+    "tree": "84fbace83f79e05ffcc0c31d9ce5830c494f601e",
+    "lab_tree": "660113afa5a1564dc44d27aebac6e3ccb1b4d40e",
+    "clean": true
+  },
+  "base": "11d8a7d37a7648f3d5fc058f293947638313b2c4",
+  "branch": "contribution/hip-full-forward-current-20261019",
+  "changed_file_count": 21,
+  "production_paths_changed": false,
+  "model": {
+    "target": "qwen35-0.8b-candidate",
+    "vocab": 248320,
+    "size": 590880672,
+    "sha256": "be5b3cb8c2f3ebd791349c9c775ea38950f23a2b9e792ca2f0411597dd172988",
+    "repository": "notschmee/Qwen3.5-0.8B-GGUF",
+    "revision": "1870603ac8ab59c7ddb9d94cccf3b297e379538f",
+    "file": "Qwen3.5-0.8B-Q4_K_M.gguf"
+  },
+  "hardware": {
+    "GPU": "AMD Radeon RX 7900 GRE",
+    "target": "gfx1100",
+    "wave_size": 32,
+    "HIP_runtime_version": 70253210,
+    "HIP_driver_version": 70253210,
+    "host_platform": "Linux-7.0.0-38-generic-x86_64-with-glibc2.39",
+    "cpu": "12th Gen Intel(R) Core(TM) i5-12600K",
+    "linux_MemTotal_KiB": 65573888,
+    "linux_MemTotal_bytes": 67147661312,
+    "linux_MemTotal_GiB_derived": 62.5361328125,
+    "source": "Linux /proc/cpuinfo and /proc/meminfo read during publication preparation; not performance evidence"
+  },
+  "toolchain": "rustc 1.100.0-nightly (e457a7b0d 2026-08-27)\nbinary: rustc\ncommit-hash: e457a7b0d326d67b4322ef0d11bd715cfaeda48f\ncommit-date: 2026-08-27\nhost: x86_64-unknown-linux-gnu\nrelease: 1.100.0-nightly\nLLVM version: 23.1.0\n",
+  "native_binaries_identity_only": [
+    {
+      "path": "target/x86_64-unknown-linux-gnu/release/bloomery-hip-spike",
+      "sha256": "54c361dde518ca05fc4df1657616f5d584e80b77b985f2ce69fbca37577d61aa"
+    },
+    {
+      "path": "target/amdgcn-amd-amdhsa/release/bloomery_hip_spike_device.elf",
+      "sha256": "09bd5111bf959ac8784163bfd6b60f8a995097cdc305c4f774b2a621840ba929"
+    }
+  ],
+  "reference": {
+    "backend": "HIP",
+    "llama_commit": "fb4b2737a808a3fb7c2117a498f43815dc9be53e",
+    "source_sha256": "d438f3c83f9f84860b3862ae0d9c56012319280cf5a9455806d124564dc08911",
+    "binary_sha256": "1f813f3ed1b8cdf63a8351e6f777984094ccf9f9686f4e018c59b7c22ae344ea",
+    "library_source_proof": "successful_incremental_build",
+    "library_SHA256_by_basename": {
+      "libggml-base.so.0.25.3": "dc7e962c9153e965ba7fe843934f6d3dc299ac2777009a18b720b577af2910a0",
+      "libggml-cpu.so.0.25.3": "80e4180191de4ef0849b4694887a0d528a01121a9ab6dc4541b8b31de2914b11",
+      "libggml-hip.so.0.25.3": "50354a1d7e4b309c28c0b97d3dbef70fe3e059d28025e2aa8ecff630c4aac12c",
+      "libggml.so.0.25.3": "d87d75a1d487e1973f29603ba44a202047e0497d347757d7377b6fd4eb5228d9",
+      "libllama.so.0.5.0": "c7afe29deb233a74d3c63ce0e1b007bbf8f73f591ceffd15f97a3d396ac74db2"
+    }
+  },
+  "cases": {
+    "english": {
+      "prompt_ids": [
+        760,
+        6511,
+        314,
+        9338,
+        369
+      ],
+      "greedy_ids": [
+        279,
+        6511,
+        314,
+        279,
+        3516,
+        14634,
+        13,
+        198
+      ],
+      "greedy_matches": 8,
+      "forced_matches": 8,
+      "rows": 8,
+      "vocab": 248320,
+      "reset_repeats": 2,
+      "reset_bitwise_equal": true,
+      "max_relative_l2": 0.027311885469503642,
+      "cross_engine_bitwise_equal": false,
+      "observed_reference_layers": 24,
+      "reference_cpu_only_input_embedding": true,
+      "original_output_digests_unchanged": true
+    },
+    "korean": {
+      "prompt_ids": [
+        178031,
+        148928,
+        154735,
+        159951,
+        16072
+      ],
+      "greedy_ids": [
+        159301,
+        151396,
+        13,
+        198,
+        176490,
+        32587,
+        159301,
+        238420
+      ],
+      "greedy_matches": 8,
+      "forced_matches": 8,
+      "rows": 8,
+      "vocab": 248320,
+      "reset_repeats": 2,
+      "reset_bitwise_equal": true,
+      "max_relative_l2": 0.0226808442104578,
+      "cross_engine_bitwise_equal": false,
+      "observed_reference_layers": 24,
+      "reference_cpu_only_input_embedding": true,
+      "original_output_digests_unchanged": true
+    }
+  },
+  "checks": {
+    "canonical_command_groups": 8,
+    "canonical_GPU_cases": 18,
+    "static_results": {
+      "comparer-self-test": 0,
+      "reference-self-test": 0,
+      "root-fmt": 0,
+      "reference-build": 0,
+      "comment-contract": 0,
+      "canonical-current-main": 0,
+      "recipes-contract": 0
+    },
+    "refset_library_tests": {
+      "passed": 246,
+      "failed": 0,
+      "ignored": 3
+    },
+    "CPU_reset_compatibility_exit": 0,
+    "Q4_regression_before_expected_failure_exit": 101,
+    "Q4_regression_after_exit": 0,
+    "zero_weight_normal_exit": 0,
+    "Q4_mutants_after_expected_refusal_exits": [
+      1,
+      1
+    ]
+  },
+  "reports": {
+    "canonical": "reports/canonical.redacted.json",
+    "english": "reports/english.redacted.json",
+    "korean": "reports/korean.redacted.json",
+    "small": "reports/small.redacted.json"
+  },
+  "original_report_SHA256": {
+    "canonical": "100f502dd086fdb753aa42d4f9dd695a79fa96674df99163143e71d4f4c887fc",
+    "english": "dca8680447597c52ac93859cf9125c14f05af9e0b723e72518cb7ac1a585522e",
+    "korean": "f61bad5efdc607e31aec69cc8cf3c013b1fa64173cdae4491fb1a823569c8fa1",
+    "small": "28b8a994303f20707e80f2ee4c99bfbdeafb065106e8bac04b921c058e152088"
+  },
+  "original_to_public_ledger": "artifact-ledger.json",
+  "redaction_notice": "Published reports and logs are explicitly path-redacted derivatives. Nested original artifact digests still identify retained original files, not the disclosed derivatives. The ledger records both original and public-copy digests. No raw logits, model weights or runtime binaries are included.",
+  "limits": {
+    "fixed_real_prompts": 2,
+    "general_language_quality_verified": false,
+    "serving_or_release_backend_acceptance": false,
+    "CUDA_hardware_gates_run": false,
+    "CUDA_bit_parity": false,
+    "performance_measured": false,
+    "IGPU_execution_verified": false,
+    "full_contrib_check_or_CI_run": false,
+    "memory_guard": "stage preflight; not allocation cap or measured peak",
+    "resident_services_stopped_or_reconfigured": false
+  },
+  "environment_at_execution": {
+    "CARGO_HOME": "$TOOLING_ROOT/cargo",
+    "RUSTUP_HOME": "$TOOLING_ROOT/rustup",
+    "RUSTUP_TOOLCHAIN": "nightly-2026-08-28",
+    "RUSTFLAGS": "-C target-cpu=native",
+    "CC": "$TOOLING_ROOT/bin/cc",
+    "CXX": "$TOOLING_ROOT/bin/c++",
+    "AR": "$ROCM_SDK/lib/llvm/bin/llvm-ar",
+    "HIP_LIB_DIR": "$EVIDENCE_ROOT/hip-lib",
+    "LD_LIBRARY_PATH": "$ROCM_SDK/lib:$LLAMA_BUILD/bin:$ROCM_SDK/lib:$LLAMA_BUILD/bin:/usr/lib/mesa-diverted/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu/mesa:/usr/lib/x86_64-linux-gnu/dri:/usr/lib/x86_64-linux-gnu/gallium-pipe",
+    "CARGO_TARGET_DIR": "$SOURCE_ROOT/labs/hip-native/target",
+    "PYTHONDONTWRITEBYTECODE": "1",
+    "CARGO_BUILD_JOBS": "2"
+  },
+  "environment_disclosure_note": "Allowlisted original build/run environment only; paths are disclosure aliases. Root refset tests used a separate target directory recorded in the command transcript. These are not credentials or executable environment assignments.",
+  "publication_notice": "Run/preparation-time flags in the preserved reports are historical snapshots, not live publication state. See the source PR for published locations.",
+  "review_corrections": {
+    "required_fix_count": 3,
+    "all_implemented": true,
+    "device_executable_lines_unchanged": true,
+    "comparison_vs_reviewed": "reports/comparison-vs-parent.redacted.json",
+    "unsafe_invariant_comments_added": 26,
+    "optional_synchronization_optimization_implemented": false
+  },
+  "issue479": {
+    "implemented": true,
+    "policy_owner": "checked_nmse",
+    "regression_fails_before_passes_after": true,
+    "actual_HIP_mutants_refused_for_cols": [
+      1,
+      32
+    ],
+    "normal_zero_fixture_passes": true,
+    "F64_Q4_oracle_retained": true,
+    "threshold": 1e-06,
+    "device_sources_and_binary_unchanged": true,
+    "report": "reports/issue479.redacted.json",
+    "compared_parent_source": "f71e148395ab810aa40c577861ff7a3fd277873c"
+  }
+}

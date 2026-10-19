@@ -1,0 +1,9 @@
+fmt: pass
+host-test: pass
+host-clippy: pass
+device-clippy: pass
+device-build: pass
+host-build: pass
+gpu: pass
+forward-gpu: pass
+$EVIDENCE_ROOT/canonical/result.json
