@@ -384,6 +384,7 @@ blk_pytools() {
     "tools/hf-arch-check.py --self-test"
     "tools/mac-disk.py --self-test"
     "tools/model_tax.py --self-test"
+    "tools/owners_check.py --self-test"
     "tools/pr-gate-lines.py --self-test"
     "tools/ref/asm-census.py --self-test"
     "tools/ref/check-int-twins.py --self-test"
