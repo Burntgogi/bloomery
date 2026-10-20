@@ -178,12 +178,13 @@ mod tests {
     /// Q5_1 and IQ4_NL arms are refused, the Q4_K one passes.
     #[test]
     fn qwen38s_leg_keeps_its_table() {
-        use GgmlType::{IQ3_XXS, IQ4_NL, IQ4_XS, Q4_K, Q5_1, Q5_K, Q6_K, Q8_0};
+        use GgmlType::{IQ3_XXS, IQ4_NL, IQ4_XS, NVFP4, Q4_K, Q5_1, Q5_K, Q6_K, Q8_0};
         for ok in [
             [Q4_K, Q4_K, Q5_1],
             [Q5_K, Q5_K, Q8_0],
             [IQ3_XXS, IQ3_XXS, IQ4_NL],
             [IQ4_XS, IQ4_XS, Q8_0],
+            [NVFP4, NVFP4, NVFP4],
         ] {
             assert_eq!(layer::<Leg38>(ok), Ok(()), "{ok:?}");
         }
@@ -198,8 +199,8 @@ mod tests {
                 text,
                 format!(
                     "layer 0's gate {}, up {} and down {}: the card leg runs a gate and an up \
-                     of one type, [Q4_K, Q5_K, IQ3_XXS, IQ4_XS], and a down of [Q5_1, Q8_0, \
-                     IQ4_NL]",
+                     of one type, [Q4_K, Q5_K, IQ3_XXS, IQ4_XS, NVFP4], and a down of [Q5_1, \
+                     Q8_0, IQ4_NL, NVFP4]",
                     bad[0], bad[1], bad[2]
                 )
             );
