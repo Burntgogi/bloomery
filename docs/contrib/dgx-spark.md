@@ -186,6 +186,15 @@ depth 512, prefill 0.9971 ± 0.0024 at P = 512
 ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6107847345)). A reference engine's arm in the same
 lease is a build the contributor makes for aarch64; no recipe makes it.
 
+**Deciding a speed change.** A speed pull request on a Spark is judged like one on the box (`AGENTS.md`, "Know the
+ruler"). It opens with an `ab` prediction card (`docs/cards/<slug>.card`, `tools/ref/card.py`): the effect band derived
+before the run, the round count, and an `sd:` line that names the Spark's A/A above as its source. It reports the
+effect and its 95 % interval, not a count of rounds won. Three rounds that all favour one arm come up one time in eight
+when there is no effect, and at the box's 0.6 % the interval at three rounds is about ±1.4 % [derived]. Before a
+sitting, `python3 tools/ref/card.py check <card>` prints the interval at the card's `rounds` and refuses a predicted
+effect that sits inside it. A change whose effect is smaller than that ruler is decided by more rounds, or kept for
+what it saves in bytes, launches, memory or CPU time at an equal rate.
+
 **Evidence.** A Spark number carries CONTRIBUTING.md's evidence list and `tok/s @ n=N, depth D, card` (`AGENTS.md`). It
 decides a pull request on the Spark, and it can be published in the Spark's own table with the machine named; a table
 never mixes cards (`AGENTS.md`, "Public numbers name their machine"). A direct run of `cnode_probe` is enough when it
