@@ -1,0 +1,12 @@
+# mutant: serve_http_api: stop word hold; expected killer: gate-serve
+--- a/crates/serve/src/stop.rs
++++ b/crates/serve/src/stop.rs
+@@ -55,7 +55,7 @@
+                 stopped: Some(word),
+             };
+         }
+-        let hold = self.partial_suffix();
++        let hold = self.partial_suffix().saturating_sub(1);
+         let upto = self.text.len() - hold;
+         let send = self.text[self.sent.min(upto)..upto].to_owned();
+         self.sent = self.sent.max(upto);

@@ -1,0 +1,14 @@
+# mutant: whole() accepts a number with a leading zero; expected killer: gate-levers
+diff --git a/crates/levers/src/lib.rs b/crates/levers/src/lib.rs
+index 470912342..5acfaba47 100644
+--- a/crates/levers/src/lib.rs
++++ b/crates/levers/src/lib.rs
+@@ -128,7 +128,7 @@ enum NotWhole {
+ /// `s` as a whole number: base-10 digits with no sign and no leading zero.
+ fn whole(s: &str) -> Result<u64, NotWhole> {
+     let digits = !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+-    if !digits || (s.len() > 1 && s.starts_with('0')) {
++    if !digits {
+         return Err(NotWhole::Syntax);
+     }
+     s.parse::<u64>().map_err(|_| NotWhole::Overflow)

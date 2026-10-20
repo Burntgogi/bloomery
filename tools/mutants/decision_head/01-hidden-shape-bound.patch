@@ -1,0 +1,12 @@
+# mutant: decision_head: hidden shape bound; expected killer: gate-decision-clef
+--- a/crates/decision/src/head.rs
++++ b/crates/decision/src/head.rs
+@@ -467,7 +467,7 @@
+     ) -> Result<Vec<Vec<f32>>, Error> {
+         let hs = self.cfg.hidden_size;
+         let n = enc.ids.len();
+-        if hidden.len() != n * hs {
++        if hidden.len() != n * hs + 1 {
+             return Err(Error::HiddenShape {
+                 values: hidden.len(),
+                 ids: n,

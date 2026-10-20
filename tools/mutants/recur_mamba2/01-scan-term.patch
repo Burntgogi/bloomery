@@ -1,0 +1,23 @@
+# mutant: the selective scan subtracts B*(x*sigma) from the decayed state instead of adding it; expected killer: gate-gpu-mamba2
+diff --git a/crates/gpu/src/mamba2.rs b/crates/gpu/src/mamba2.rs
+index ac9419437..eae7383cf 100644
+--- a/crates/gpu/src/mamba2.rs
++++ b/crates/gpu/src/mamba2.rs
+@@ -386,7 +386,7 @@ mod mamba2_kernels {
+                 let mut acc = 0.0f32;
+                 #[unroll]
+                 for j in 0usize..4 {
+-                    let u = mul_rn_f32(s[4 * i + j], decay) + mul_rn_f32(bq[j], x_dt);
++                    let u = mul_rn_f32(s[4 * i + j], decay) - mul_rn_f32(bq[j], x_dt);
+                     s[4 * i + j] = u;
+                     acc += mul_rn_f32(u, cq[j]);
+                 }
+@@ -828,7 +828,7 @@ mod mamba2_kernels {
+                         let x_dt = mul_rn_f32(x, sigma);
+                         #[unroll]
+                         for j in 0usize..4 {
+-                            let v = mul_rn_f32(s[4 * i + j], decay) + mul_rn_f32(bq[j], x_dt);
++                            let v = mul_rn_f32(s[4 * i + j], decay) - mul_rn_f32(bq[j], x_dt);
+                             s[4 * i + j] = v;
+                             acc[i] += mul_rn_f32(v, cq[j]);
+                         }

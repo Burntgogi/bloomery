@@ -1,0 +1,14 @@
+# mutant: silu_mul exponentiates +g instead of -g; expected killer: gate-gpu-p4
+diff --git a/crates/gpu/src/elem.rs b/crates/gpu/src/elem.rs
+index 7ed9fca10..8f5f6837c 100644
+--- a/crates/gpu/src/elem.rs
++++ b/crates/gpu/src/elem.rs
+@@ -557,7 +557,7 @@ pub(crate) fn rope_pair_core(x0: f32, x1: f32, c: f32, s: f32) -> (f32, f32) {
+ /// ulps; the gate bands that distance and prints the measured max.
+ #[inline(always)]
+ pub(crate) fn silu_mul(g: f32, u: f32) -> f32 {
+-    g / (1.0 + (-g).exp()) * u
++    g / (1.0 + g.exp()) * u
+ }
+ 
+ /// Token `t`'s output value `d` of the routed-expert combine:

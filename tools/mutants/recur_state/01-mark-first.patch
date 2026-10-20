@@ -1,0 +1,14 @@
+# mutant: marks() starts at the multiple at or below `from` instead of the one after it; expected killer: gate-runtime
+diff --git a/crates/runtime/src/seqstate.rs b/crates/runtime/src/seqstate.rs
+index 9000129fb..8fbd3ffc7 100644
+--- a/crates/runtime/src/seqstate.rs
++++ b/crates/runtime/src/seqstate.rs
+@@ -56,7 +56,7 @@ pub fn marks(from: u32, to: u32, every: u32) -> Vec<u32> {
+         v.push(from);
+     }
+     if let Some(q) = from.checked_div(every) {
+-        let mut p = (q + 1).saturating_mul(every);
++        let mut p = q.saturating_mul(every);
+         while p < to {
+             v.push(p);
+             p = p.saturating_add(every);

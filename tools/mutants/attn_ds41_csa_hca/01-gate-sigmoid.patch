@@ -1,0 +1,14 @@
+# mutant: the hyper-connection combine weights a stream by its raw gate, not sigmoid(gate); expected killer: gate-gpu-hc-gated
+diff --git a/crates/gpu/src/hc_gated.rs b/crates/gpu/src/hc_gated.rs
+index df7e8bb26..ff640c0ac 100644
+--- a/crates/gpu/src/hc_gated.rs
++++ b/crates/gpu/src/hc_gated.rs
+@@ -301,7 +301,7 @@ unsafe fn up_mix_value<const M: usize>(
+             thread::__unroll_config::<0>();
+             // SAFETY: (c·STREAMS + s)·hidden + h < M·STREAMS·hidden <= xn.len().
+             let x = unsafe { *xn.get_unchecked((c * STREAMS + s) * hidden + h) };
+-            let sg = sigmoid(g[s][c]);
++            let sg = g[s][c];
+             acc = if s == 0 {
+                 x * sg
+             } else {

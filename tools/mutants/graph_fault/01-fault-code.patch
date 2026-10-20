@@ -1,0 +1,14 @@
+# mutant: Fault::of_sites reports the largest site code instead of the smallest; expected killer: gate-gpu-lib
+diff --git a/crates/gpu/src/fault.rs b/crates/gpu/src/fault.rs
+index 3d0af1858..f2c260578 100644
+--- a/crates/gpu/src/fault.rs
++++ b/crates/gpu/src/fault.rs
+@@ -655,7 +655,7 @@ impl Fault {
+     pub fn of_sites(layer: u32, sites: &[FaultSite]) -> Fault {
+         Fault {
+             layer,
+-            code: sites.iter().map(|s| *s as u32).min().unwrap_or(0),
++            code: sites.iter().map(|s| *s as u32).max().unwrap_or(0),
+             sites: sites.iter().fold(0, |m, s| m | (1 << *s as u32)),
+             arch: None,
+         }

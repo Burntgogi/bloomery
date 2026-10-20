@@ -1,0 +1,14 @@
+# mutant: rms_norm divides the sum of squares by one element more than the row holds; expected killer: gate-ops
+diff --git a/crates/model/src/ops.rs b/crates/model/src/ops.rs
+index 4935256e5..d161b9fd7 100644
+--- a/crates/model/src/ops.rs
++++ b/crates/model/src/ops.rs
+@@ -357,7 +357,7 @@ pub fn rms_norm(x: &Tensor2, gain: &[f32], eps: f32) -> Tensor2 {
+         // The reference's fused norm: f32 squares summed in f64, the mean
+         // narrowed to f32, then `(scale · gain) · x` in that order.
+         let sum = qdot::sum_sq_f64(src);
+-        let mean = (sum / x.ne0 as f64) as f32;
++        let mean = (sum / (x.ne0 as f64 + 1.0)) as f32;
+         let scale = 1.0f32 / (mean + eps).sqrt();
+         let dst = out.col_mut(t);
+         for i in 0..x.ne0 {

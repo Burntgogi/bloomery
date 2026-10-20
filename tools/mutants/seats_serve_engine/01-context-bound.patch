@@ -1,0 +1,13 @@
+# mutant: seats_serve_engine: context bound; expected killer: gate-serve-draft-rules
+# (its only cover gate builds the serve binaries and runs no test, so this mutant is expected to survive)
+--- a/crates/serve/src/genloop.rs
++++ b/crates/serve/src/genloop.rs
+@@ -2233,7 +2233,7 @@
+             }
+             let (n, len) = (self.n, self.generated.len());
+             // Feeding `tok` takes position n + len - 1; the cache holds ctx_max.
+-            if n + len > self.ctx_max {
++            if n + len >= self.ctx_max {
+                 self.truncated = true;
+                 break;
+             }

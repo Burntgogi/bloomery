@@ -1,0 +1,12 @@
+# mutant: drafts_mtp: join sum order; expected killer: gate-runtime
+--- a/crates/runtime/src/combine.rs
++++ b/crates/runtime/src/combine.rs
+@@ -73,7 +73,7 @@
+ /// expert's, `(acc + hsum) + shexp`.
+ #[must_use]
+ pub fn join(acc: f32, hsum: f32, shexp: f32) -> f32 {
+-    (acc + hsum) + shexp
++    acc + (hsum + shexp)
+ }
+ 
+ /// One output value's combine: [`card_sum`] of the card's slots, then

@@ -1,0 +1,12 @@
+# mutant: placement_nodes: msgs per layer; expected killer: none (no common gate names the owner in the fixture tier)
+--- a/crates/placement/src/placement/nodes.rs
++++ b/crates/placement/src/placement/nodes.rs
+@@ -1602,7 +1602,7 @@
+                 nic_permille,
+                 msgs_per_layer: match (remotes, j) {
+                     (0, _) => 0,
+-                    (_, 0) => 2 * remotes.min(t.experts_used),
++                    (_, 0) => remotes.min(t.experts_used),
+                     _ => 2,
+                 },
+                 fills_milli: fills

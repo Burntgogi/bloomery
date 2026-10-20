@@ -1,0 +1,12 @@
+# mutant: placement_sizing: arena floor coefficient; expected killer: gate-gpu-routed-legs
+--- a/crates/placement/src/placement.rs
++++ b/crates/placement/src/placement.rs
+@@ -3466,7 +3466,7 @@
+     /// The tier's room floor, `base + 3 W` ([`expert_nvme_tier`]'s terms).
+     /// Refused by name past u64.
+     pub fn floor(&self) -> Result<u64, PlacementError> {
+-        3u64.checked_mul(self.heavy)
++        2u64.checked_mul(self.heavy)
+             .and_then(|w| w.checked_add(self.base))
+             .ok_or_else(|| PlacementError::Metadata {
+                 key: "the NVMe expert tier's floor".to_string(),

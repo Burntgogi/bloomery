@@ -1,0 +1,14 @@
+# mutant: the gated quantizer adds the sigmoid gate instead of multiplying it; expected killer: gate-gpu-qwen35moe-attn (family gate; no common gate names quant_gated)
+diff --git a/crates/gpu/src/gated_quant.rs b/crates/gpu/src/gated_quant.rs
+index 6c27e6058..6cc5d7444 100644
+--- a/crates/gpu/src/gated_quant.rs
++++ b/crates/gpu/src/gated_quant.rs
+@@ -134,7 +134,7 @@ mod gated_quant_kernels {
+         #[unroll]
+         while i < 4 {
+             v[i] = if gv[i].is_finite() {
+-                a[i] * sigmoid(gv[i])
++                a[i] + sigmoid(gv[i])
+             } else {
+                 f32::NAN
+             };

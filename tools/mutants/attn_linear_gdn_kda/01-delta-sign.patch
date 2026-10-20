@@ -1,0 +1,23 @@
+# mutant: the delta step adds S^T k to v instead of subtracting it; expected killer: gate-gpu-linear
+diff --git a/crates/gpu/src/linear/delta.rs b/crates/gpu/src/linear/delta.rs
+index 490dbae69..1512c6299 100644
+--- a/crates/gpu/src/linear/delta.rs
++++ b/crates/gpu/src/linear/delta.rs
+@@ -302,7 +302,7 @@ unsafe fn delta_body<const DECAY: u32>(
+             s[i] = mul_rn_f32(s[i], if DECAY == DECAY_HEAD { dh } else { dk[i] });
+         }
+         let kv = column_sum(lane_dot(s, k));
+-        let u = mul_rn_f32(vt - kv, bt);
++        let u = mul_rn_f32(vt + kv, bt);
+         for i in 0..KEYS_PER_LANE {
+             cuda_device::thread::__unroll_config::<0>();
+             s[i] = fma_rn_f32(k[i], u, s[i]);
+@@ -1018,7 +1018,7 @@ unsafe fn delta_lanes_body<const DECAY: u32>(
+             s[i] = mul_rn_f32(s[i], if DECAY == DECAY_HEAD { dh } else { dk[i] });
+         }
+         let kv = column_sum(lane_dot(s, k));
+-        let u = mul_rn_f32(vt - kv, bt);
++        let u = mul_rn_f32(vt + kv, bt);
+         for i in 0..KEYS_PER_LANE {
+             cuda_device::thread::__unroll_config::<0>();
+             s[i] = fma_rn_f32(k[i], u, s[i]);

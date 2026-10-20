@@ -1,0 +1,12 @@
+# mutant: serve_toolcall: call keys; expected killer: gate-serve
+--- a/crates/serve/src/hermes.rs
++++ b/crates/serve/src/hermes.rs
+@@ -205,7 +205,7 @@
+     }
+     if let Some(key) = fields
+         .keys()
+-        .find(|k| !matches!(k.as_str(), "name" | "arguments"))
++        .find(|k| !matches!(k.as_str(), "name"))
+     {
+         return Err(HermesError::UnknownKey {
+             index,

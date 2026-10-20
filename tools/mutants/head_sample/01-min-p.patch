@@ -1,0 +1,14 @@
+# mutant: the min-p floor doubles the log-probability offset; expected killer: gate-sampler
+diff --git a/crates/sampler/src/lib.rs b/crates/sampler/src/lib.rs
+index 8ad5ca444..e37ed2226 100644
+--- a/crates/sampler/src/lib.rs
++++ b/crates/sampler/src/lib.rs
+@@ -298,7 +298,7 @@ impl Sampler {
+             0.0
+         };
+         if p.min_p > 0.0 {
+-            let floor = max + p.min_p.ln();
++            let floor = max + 2.0 * p.min_p.ln();
+             self.cand.retain(|c| c.logit >= floor);
+         }
+         self.cand.sort_unstable_by(best_first);

@@ -1,0 +1,14 @@
+# mutant: the Q4_K/Q5_K epilogue scales the block sum by d + dmin instead of d; expected killer: gate-gpu-gemm
+diff --git a/crates/gpu/src/gemm/grouped.rs b/crates/gpu/src/gemm/grouped.rs
+index e59ea4acd..88a8af753 100644
+--- a/crates/gpu/src/gemm/grouped.rs
++++ b/crates/gpu/src/gemm/grouped.rs
+@@ -427,7 +427,7 @@ macro_rules! qk_min_epi {
+         while i < 4 {
+             ::cuda_device::thread::__unroll_config::<{ 0 }>();
+             let r = i / 2;
+-            let tv = mul_rn_f32(dr[r], $isum[i] as f32);
++            let tv = mul_rn_f32(dr[r] + ndr[r], $isum[i] as f32);
+             let tv = fma_rn_f32(ndr[r], imin[i] as f32, tv);
+             $acc[4 * $nt + i] = fma_rn_f32($dcol[i & 1], tv, $acc[4 * $nt + i]);
+             i += 1;

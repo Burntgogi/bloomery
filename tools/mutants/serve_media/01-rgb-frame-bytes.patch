@@ -1,0 +1,12 @@
+# mutant: serve_media: rgb frame bytes; expected killer: gate-vision
+--- a/crates/vision/src/image.rs
++++ b/crates/vision/src/image.rs
+@@ -79,7 +79,7 @@
+ impl Rgb8 {
+     /// The data bytes of a `width`×`height` frame, `None` when the count overflows `usize`.
+     pub(crate) fn frame_len(width: usize, height: usize) -> Option<usize> {
+-        width.checked_mul(height)?.checked_mul(3)
++        width.checked_mul(height)?.checked_mul(4)
+     }
+ 
+     /// [`Rgb8::frame_len`] of a decoder's header size, its overflow refused by the frame's size.

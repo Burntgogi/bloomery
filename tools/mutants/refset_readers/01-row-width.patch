@@ -1,0 +1,14 @@
+# mutant: a manifest row wider than its column line is accepted; expected killer: gate-refset
+diff --git a/crates/refset/src/columns.rs b/crates/refset/src/columns.rs
+index a23799fa2..8032c0b0b 100644
+--- a/crates/refset/src/columns.rs
++++ b/crates/refset/src/columns.rs
+@@ -42,7 +42,7 @@ impl Columns {
+         at: &'a dyn Display,
+     ) -> Result<Row<'a>, RefError> {
+         let f: Vec<&str> = line.split('\t').collect();
+-        if f.len() != self.len() {
++        if f.len() < self.len() {
+             return Err(RefError::malformed(
+                 at,
+                 format!(

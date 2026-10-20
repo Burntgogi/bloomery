@@ -1,0 +1,14 @@
+# mutant: the index key subtracts the layer-norm bias instead of adding it; expected killer: gate-gpu-glm-mla
+diff --git a/crates/gpu/src/latent.rs b/crates/gpu/src/latent.rs
+index 92c679635..ef2d023ab 100644
+--- a/crates/gpu/src/latent.rs
++++ b/crates/gpu/src/latent.rs
+@@ -314,7 +314,7 @@ mod latent_kernels {
+                     *x.get_unchecked(gbase + at),
+                 )
+             };
+-            let hk = f32_to_f16_bits(add_rn_f32(mul_rn_f32(mul_rn_f32(k[j], scale), wv), bv));
++            let hk = f32_to_f16_bits(add_rn_f32(mul_rn_f32(mul_rn_f32(k[j], scale), wv), -bv));
+             let hg = f32_to_f16_bits(g);
+             ok &= f16_finite(hk) & f16_finite(hg);
+             // SAFETY: p < rows, so row + INDEX_HEAD + at < (p + 1)·INDEX_ROW

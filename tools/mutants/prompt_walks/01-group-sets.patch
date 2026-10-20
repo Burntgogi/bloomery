@@ -1,0 +1,12 @@
+# mutant: prompt_walks: group sets; expected killer: gate-runtime
+--- a/crates/runtime/src/prompt.rs
++++ b/crates/runtime/src/prompt.rs
+@@ -145,7 +145,7 @@
+ /// ([`groups`]). The prompt batch's per-unit buffers are made for this many.
+ #[must_use]
+ pub const fn group_sets(g: usize) -> usize {
+-    if g >= 2 { g + 1 } else { 1 }
++    if g >= 2 { g + 2 } else { 1 }
+ }
+ 
+ /// The groups of a call of `k` batches under a lever of `g`: runs of `g`

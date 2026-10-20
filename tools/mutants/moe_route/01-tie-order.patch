@@ -1,0 +1,14 @@
+# mutant: a value tie in the LARGER_ID router order goes to the smaller expert id; expected killer: gate-gpu-glm-router
+diff --git a/crates/gpu/src/route_core.rs b/crates/gpu/src/route_core.rs
+index 24cc45551..34b3288b0 100644
+--- a/crates/gpu/src/route_core.rs
++++ b/crates/gpu/src/route_core.rs
+@@ -99,7 +99,7 @@ impl Score for Sigmoid {
+ #[inline(always)]
+ pub fn take<const LARGER_ID: bool>(v: f32, i: u32, best_v: f32, best_i: u32) -> bool {
+     if LARGER_ID {
+-        v > best_v || (v == best_v && i > best_i)
++        v > best_v || (v == best_v && i < best_i)
+     } else {
+         argmax_take(v, i, best_v, best_i)
+     }

@@ -1,0 +1,12 @@
+# mutant: quant_q5k: q5k minus offset; expected killer: gate-gpu-kquant
+--- a/crates/gpu/src/kquant/q5k.rs
++++ b/crates/gpu/src/kquant/q5k.rs
+@@ -52,7 +52,7 @@
+         let dmin = half_to_f32((w0 >> 16) as u16);
+         let (sc, mi) = q4k_scale_min(s, w1, w2, w3);
+         let cda = d * sc as f32;
+-        let cdb = -(dmin * mi as f32);
++        let cdb = dmin * mi as f32;
+         let qh = wk + QH_WORD;
+         let qs = wk + QS_WORD + 8 * (s >> 1);
+         let nib = (s as u32 & 1) * 4;

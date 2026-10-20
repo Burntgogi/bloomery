@@ -1,0 +1,14 @@
+# mutant: the qwen3moe registry row names an architecture no file can be looked up by; expected killer: gate-arch-registry
+diff --git a/crates/model/src/arch/registry.rs b/crates/model/src/arch/registry.rs
+index e37b67064..c3dd26264 100644
+--- a/crates/model/src/arch/registry.rs
++++ b/crates/model/src/arch/registry.rs
+@@ -97,7 +97,7 @@ pub static ROWS: &[ArchRow] = &[
+     },
+     ArchRow {
+         arch: Some(Arch::Qwen3moe),
+-        names: &["qwen3moe"],
++        names: &["qwen3moex"],
+         read: Some(qwen3moe::spec::read),
+         draft: None,
+         fixture: None,

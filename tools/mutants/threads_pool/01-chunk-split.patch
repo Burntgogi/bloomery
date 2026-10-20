@@ -1,0 +1,14 @@
+# mutant: chunk_bounds gives the thread at the remainder boundary an extra element; expected killer: gate-threads
+diff --git a/crates/threads/src/lib.rs b/crates/threads/src/lib.rs
+index 6f527eeb5..e09f40656 100644
+--- a/crates/threads/src/lib.rs
++++ b/crates/threads/src/lib.rs
+@@ -738,7 +738,7 @@ pub fn chunk_bounds(n: usize, threads: usize, t: usize) -> (usize, usize) {
+     } else {
+         rem * (base + 1) + (t - rem) * base
+     };
+-    let len = base + usize::from(t < rem);
++    let len = base + usize::from(t <= rem);
+     (start, start + len)
+ }
+ 

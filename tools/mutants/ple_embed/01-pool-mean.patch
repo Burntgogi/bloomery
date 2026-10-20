@@ -1,0 +1,14 @@
+# mutant: mean pooling divides every column by one row more than it summed; expected killer: gate-embed
+diff --git a/crates/embed/src/lib.rs b/crates/embed/src/lib.rs
+index 096b1318d..cf70b74f0 100644
+--- a/crates/embed/src/lib.rs
++++ b/crates/embed/src/lib.rs
+@@ -81,7 +81,7 @@ pub fn mean(rows: &[f32], width: usize) -> Vec<f32> {
+             *s += f64::from(x);
+         }
+     }
+-    sum.iter().map(|&s| (s / n as f64) as f32).collect()
++    sum.iter().map(|&s| (s / (n as f64 + 1.0)) as f32).collect()
+ }
+ 
+ /// RFC 4648 base64, with padding.

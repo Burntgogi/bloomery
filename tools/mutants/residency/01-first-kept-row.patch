@@ -1,0 +1,12 @@
+# mutant: residency: first kept row; expected killer: gate-gpu-swap
+--- a/crates/runtime/src/swaprule.rs
++++ b/crates/runtime/src/swaprule.rs
+@@ -142,7 +142,7 @@
+             return None;
+         }
+         let over = self.mask >> rows;
+-        (over != 0).then(|| rows + over.trailing_zeros() as usize)
++        (over != 0).then(|| rows + over.leading_zeros() as usize)
+     }
+ 
+     /// The mask itself, bit `r` = row `r` kept: a report field.

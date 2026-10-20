@@ -1,0 +1,12 @@
+# mutant: tier_legs: cnt word offset; expected killer: gate-gpu-lib
+--- a/crates/gpu/src/host/tier.rs
++++ b/crates/gpu/src/host/tier.rs
+@@ -309,7 +309,7 @@
+     const fn offset(self) -> usize {
+         match self {
+             TWord::Go(r) => 128 * r,
+-            TWord::Cnt(r) => 64 + 128 * r,
++            TWord::Cnt(r) => 128 + 128 * r,
+             TWord::Prog => 128 * MAX_ROWS,
+             TWord::Fault => 128 * MAX_ROWS + 64,
+         }

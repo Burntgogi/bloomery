@@ -1,0 +1,12 @@
+# mutant: quant_q6k: q6k row bytes; expected killer: gate-gpu-q6k-ids
+--- a/crates/gpu/src/q6k_ids.rs
++++ b/crates/gpu/src/q6k_ids.rs
+@@ -93,7 +93,7 @@
+         }
+         let row_abs = id as usize;
+         let n_sb = n_sb as usize;
+-        let row_bytes = 210 * n_sb;
++        let row_bytes = 209 * n_sb;
+ 
+         let w16 = lane & 15;
+         let half = lane >> 4;

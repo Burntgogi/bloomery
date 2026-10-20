@@ -1,0 +1,14 @@
+# mutant: ring_rows pads the window by a whole prompt batch, one row more than the pass can append; expected killer: gate-runtime
+diff --git a/crates/runtime/src/stores.rs b/crates/runtime/src/stores.rs
+index 765f116f6..76b408dc3 100644
+--- a/crates/runtime/src/stores.rs
++++ b/crates/runtime/src/stores.rs
+@@ -69,7 +69,7 @@ pub fn window_rows<T: Ord>(window: T, positions: T) -> T {
+ /// reads, so the window's oldest row survives it.
+ #[must_use]
+ pub fn ring_rows(window: u64, ctx_max: u64) -> u64 {
+-    let span = window.saturating_add(PROMPT_BATCH - 1);
++    let span = window.saturating_add(PROMPT_BATCH);
+     window_rows(span.div_ceil(RING_ALIGN) * RING_ALIGN, ctx_max)
+ }
+ 

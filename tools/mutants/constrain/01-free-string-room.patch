@@ -1,0 +1,12 @@
+# mutant: constrain: free string room; expected killer: gate-serve
+--- a/crates/serve/src/constrain/program.rs
++++ b/crates/serve/src/constrain/program.rs
+@@ -678,7 +678,7 @@
+         let Step::Free(f) = &prog.steps[step] else {
+             return Err(self.stuck("a string context stands on another step"));
+         };
+-        let room = f.max.map_or(usize::MAX, |m| m.saturating_sub(chars));
++        let room = f.max.map_or(usize::MAX, |m| m.saturating_sub(chars).saturating_add(1));
+         let in_class = if room > 0 {
+             let n = row.len().min(f.class.n_vocab());
+             sampling::argmax_in(

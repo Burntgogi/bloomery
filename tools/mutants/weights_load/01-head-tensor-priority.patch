@@ -1,0 +1,12 @@
+# mutant: weights_load: head tensor priority; expected killer: gate-gpu-lib
+--- a/crates/gpu/src/weights.rs
++++ b/crates/gpu/src/weights.rs
+@@ -41,7 +41,7 @@
+ /// neither is answered `output.weight`, which every reader then refuses by name as absent.
+ #[must_use]
+ pub fn head_tensor(split: &Split) -> &'static str {
+-    if split.find(HEAD_TENSOR).is_none() && split.find(EMBED_TENSOR).is_some() {
++    if split.find(HEAD_TENSOR).is_none() {
+         EMBED_TENSOR
+     } else {
+         HEAD_TENSOR

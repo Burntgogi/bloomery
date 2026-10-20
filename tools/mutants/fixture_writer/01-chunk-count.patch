@@ -1,0 +1,14 @@
+# mutant: a tensor plan samples one chunk short of its tail; expected killer: none (cover gap: no common gate; gate-fixture is tooling and its byte checks stay green)
+diff --git a/crates/model/src/fixture/plan.rs b/crates/model/src/fixture/plan.rs
+index 0c92e9d94..7c91a3d11 100644
+--- a/crates/model/src/fixture/plan.rs
++++ b/crates/model/src/fixture/plan.rs
+@@ -46,7 +46,7 @@ pub struct PlannedTensor {
+ impl PlannedTensor {
+     /// Chunks its stream is cut into.
+     pub fn chunks(&self) -> usize {
+-        (self.nbytes as usize).div_ceil(chunk_len(self.ty))
++        (self.nbytes as usize) / chunk_len(self.ty)
+     }
+ 
+     /// The byte range of chunk `c`.

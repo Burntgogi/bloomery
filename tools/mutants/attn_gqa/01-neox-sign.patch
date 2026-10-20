@@ -1,0 +1,14 @@
+# mutant: the NEOX pair turns x0 with +x1*s instead of -x1*s; expected killer: gate-gpu-qwen35moe-attn (also gate-gpu-gemma-embedding-head256, -head512)
+diff --git a/crates/gpu/src/rope_neox.rs b/crates/gpu/src/rope_neox.rs
+index 161f27959..83a6c7ee9 100644
+--- a/crates/gpu/src/rope_neox.rs
++++ b/crates/gpu/src/rope_neox.rs
+@@ -119,7 +119,7 @@ const _: () = assert!(THREADS_U32 as usize == THREADS && THREADS == 64);
+ #[inline(always)]
+ pub fn neox_pair(x0: f32, x1: f32, c: f32, s: f32) -> (f32, f32) {
+     (
+-        fma_rn_f32(x0, c, -mul_rn_f32(x1, s)),
++        fma_rn_f32(x0, c, mul_rn_f32(x1, s)),
+         fma_rn_f32(x0, s, mul_rn_f32(x1, c)),
+     )
+ }

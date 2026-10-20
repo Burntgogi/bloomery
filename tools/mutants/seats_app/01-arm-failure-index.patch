@@ -1,0 +1,12 @@
+# mutant: seats_app: arm failure index; expected killer: gate-app
+--- a/crates/app/src/lib.rs
++++ b/crates/app/src/lib.rs
+@@ -142,7 +142,7 @@
+     };
+     for (i, arm) in arms.iter().enumerate() {
+         if i > 0 {
+-            clear(s).map_err(|e| failed(i, E::from(e)))?;
++            clear(s).map_err(|e| failed(i + 1, E::from(e)))?;
+         }
+         run(s, i, arm).map_err(|e| failed(i, e))?;
+     }

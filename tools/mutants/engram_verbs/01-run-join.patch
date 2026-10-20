@@ -1,0 +1,14 @@
+# mutant: adjacent_runs joins ids two apart into one run; expected killer: gate-engram
+diff --git a/crates/engram/src/lib.rs b/crates/engram/src/lib.rs
+index d03175741..4bd5b4225 100644
+--- a/crates/engram/src/lib.rs
++++ b/crates/engram/src/lib.rs
+@@ -573,7 +573,7 @@ fn adjacent_runs(ids: &[u32]) -> Vec<(u32, u32)> {
+     let mut runs: Vec<(u32, u32)> = Vec::new();
+     for id in sorted {
+         match runs.last_mut() {
+-            Some((_, last)) if id - *last == 1 => *last = id,
++            Some((_, last)) if id - *last <= 2 => *last = id,
+             _ => runs.push((id, id)),
+         }
+     }

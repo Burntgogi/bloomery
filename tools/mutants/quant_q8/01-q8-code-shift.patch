@@ -1,0 +1,12 @@
+# mutant: quant_q8: q8 code shift; expected killer: gate-gpu-kquant
+--- a/crates/gpu/src/kquant/q8_0.rs
++++ b/crates/gpu/src/kquant/q8_0.rs
+@@ -50,7 +50,7 @@
+             ]
+         };
+         let d = half_to_f32((v[0] >> (16 * odd)) as u16);
+-        let sh = 16 + 16 * odd;
++        let sh = 32 - 16 * odd;
+         let vi = [
+             q8_0_code(v[0], v[1], sh),
+             q8_0_code(v[1], v[2], sh),

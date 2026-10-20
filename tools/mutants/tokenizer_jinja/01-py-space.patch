@@ -1,0 +1,14 @@
+# mutant: py_space drops U+001F from the four separators Python counts; expected killer: gate-jinja
+diff --git a/crates/jinja/src/lib.rs b/crates/jinja/src/lib.rs
+index 2e5fdd3e6..9e96503ec 100644
+--- a/crates/jinja/src/lib.rs
++++ b/crates/jinja/src/lib.rs
+@@ -253,7 +253,7 @@ fn segment(src: &str) -> Result<(Vec<Seg>, Vec<usize>), TemplateError> {
+ /// Python's `str.isspace`: Rust's `White_Space` and the four separators
+ /// U+001C–U+001F, which Python counts and Rust does not.
+ fn py_space(c: char) -> bool {
+-    c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c)
++    c.is_whitespace() || ('\u{1c}'..='\u{1e}').contains(&c)
+ }
+ 
+ /// The byte at which the tag whose body starts at `from` closes. A comment ends at the first `#}`; the

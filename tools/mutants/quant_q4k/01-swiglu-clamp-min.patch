@@ -1,0 +1,12 @@
+# mutant: quant_q4k: swiglu clamp min; expected killer: gate-gpu-kquant
+--- a/crates/gpu/src/kquant/act.rs
++++ b/crates/gpu/src/kquant/act.rs
+@@ -74,7 +74,7 @@
+     let mut s = silu_ik(g);
+     let mut uc = u;
+     if limit > 1e-6 {
+-        s = if limit < s { limit } else { s };
++        s = if s < limit { limit } else { s };
+         uc = if u < limit { u } else { limit };
+         uc = if -limit < uc { uc } else { -limit };
+     }

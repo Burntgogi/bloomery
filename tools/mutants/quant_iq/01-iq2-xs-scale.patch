@@ -1,0 +1,12 @@
+# mutant: quant_iq: iq2 xs scale; expected killer: gate-gpu-iq
+--- a/crates/gpu/src/iq.rs
++++ b/crates/gpu/src/iq.rs
+@@ -668,7 +668,7 @@
+                 *dh.get_unchecked(h >> 1),
+             )
+         };
+-        let d = half_bits_to_f32((dw >> (16 * (h & 1))) as u16) * 0.125;
++        let d = half_bits_to_f32((dw >> (16 * (h & 1))) as u16) * 0.25;
+         let s = (sw >> (8 * (g & 3))) & 0xff;
+         let (a0, a1) = ((2 * (s & 15) + 1) as i32, (2 * (s >> 4) + 1) as i32);
+         let [c0, c1] = v.0;
