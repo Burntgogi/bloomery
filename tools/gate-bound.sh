@@ -12,6 +12,12 @@
 # gate handed one hangs as long as it likes; a value timeout itself refuses (a sign, a word) would end
 # the runner with timeout's 125, reported as a red gate.
 #
+# The codes these functions return of their own (a started command's status passes through unchanged):
+#   64   a refused value (the bound, a handle, LEASE_FIFO_TRIES), nothing started
+#   70   a cleanup that failed or had no budget (lease_stop, group_clear, a stop that could not be read)
+#   74   bounded: the FIFO named by LEASE_BOUNDED_OUT or LEASE_BOUNDED_ERR got no write end in LEASE_FIFO_TRIES
+#        tries, the command not started
+#
 #   gate_bound <runner>   BOUND=<the value>, or the refusal on stderr and 64
 gate_bound() {
   local v=${BLOOMERY_GATE_BOUND-900}
@@ -200,6 +206,15 @@ lease_bound() {
   esac
 }
 
+# __bounded_run <run_bounded arguments>: run_bounded, marking in BOUNDED_RAN that it was called. A shell that fails a
+# redirection on a function call never calls the function, so the mark is how bounded tells a command that ran from one
+# whose output could not be opened.
+__bounded_run() {
+  # shellcheck disable=SC2034 # bounded reads it
+  BOUNDED_RAN=1
+  run_bounded "$@"
+}
+
 # bounded <seconds> <command…>: (with LEASE_BOUNDED_OUT=<file> set for the call, the command's stdout and stderr go
 # to that file, stderr to LEASE_BOUNDED_ERR when that is set too) the command under `timeout --kill-after=G
 # <seconds>`, its exit code returned: the foreground form every runner outside the gate runners uses, so none writes
@@ -213,20 +228,46 @@ lease_bound() {
 # descriptors it inherited (the lease, a gate lock). So a runner calls it in its own shell and takes the output from
 # a file (lease_capture, tools/ref/lease.sh, or LEASE_BOUNDED_OUT). The command is an executable, not a shell function
 # or an assignment. LEASE_BOUNDED_PIDFILE, when set, records timeout's PID from its child before the executable starts.
+# When LEASE_BOUNDED_OUT or LEASE_BOUNDED_ERR is a FIFO, the shell opens its write end here and the open blocks until
+# the reader has the other end. A signal the shell handles while it waits (bash 3.2 takes any trapped one, and a child's
+# exit) ends the open with EINTR, the command is never started, and the reader waits for a writer that is not coming. So an
+# open that failed on a FIFO is tried again, LEASE_FIFO_TRIES times in all (5 when unset), each retry named on stderr; at
+# the last the command is not started, the give-up is named, and the status is 74. Any other output that cannot be
+# opened stays the redirection's own error.
 bounded() {
-  local bound=${1:-} rc=0 grace=${LEASE_STOP_GRACE:-9}
+  local bound=${1:-} rc=0 grace=${LEASE_STOP_GRACE:-9} tries=${LEASE_FIFO_TRIES:-5} try=0 fifo
   lease_bound "$bound" || return $?
+  case $tries in
+    '' | *[!0-9]* | 0*)
+      echo "[bound] bounded: LEASE_FIFO_TRIES is a positive number of tries, got '$tries'" >&2
+      return 64
+      ;;
+  esac
   shift
   if [ -n "${LEASE_BOUNDED_PIDFILE:-}" ]; then
     set -- bash -c 'printf "%s\n" "$PPID" > "$1" || exit $?; shift; exec "$@"' _ "$LEASE_BOUNDED_PIDFILE" "$@"
   fi
-  if [ -n "${LEASE_BOUNDED_OUT:-}" ] && [ -n "${LEASE_BOUNDED_ERR:-}" ]; then
-    run_bounded timeout --kill-after="$grace" "$bound" "$@" > "$LEASE_BOUNDED_OUT" 2> "$LEASE_BOUNDED_ERR" || rc=$?
-  elif [ -n "${LEASE_BOUNDED_OUT:-}" ]; then
-    run_bounded timeout --kill-after="$grace" "$bound" "$@" > "$LEASE_BOUNDED_OUT" 2>&1 || rc=$?
-  else
-    run_bounded timeout --kill-after="$grace" "$bound" "$@" || rc=$?
-  fi
+  while :; do
+    rc=0 BOUNDED_RAN='' BIN_SIGNAL=''
+    if [ -n "${LEASE_BOUNDED_OUT:-}" ] && [ -n "${LEASE_BOUNDED_ERR:-}" ]; then
+      __bounded_run timeout --kill-after="$grace" "$bound" "$@" > "$LEASE_BOUNDED_OUT" 2> "$LEASE_BOUNDED_ERR" || rc=$?
+    elif [ -n "${LEASE_BOUNDED_OUT:-}" ]; then
+      __bounded_run timeout --kill-after="$grace" "$bound" "$@" > "$LEASE_BOUNDED_OUT" 2>&1 || rc=$?
+    else
+      __bounded_run timeout --kill-after="$grace" "$bound" "$@" || rc=$?
+    fi
+    [ -z "$BOUNDED_RAN" ] || break
+    fifo=''
+    if [ -p "${LEASE_BOUNDED_OUT:-}" ]; then fifo=$LEASE_BOUNDED_OUT; elif [ -p "${LEASE_BOUNDED_ERR:-}" ]; then fifo=$LEASE_BOUNDED_ERR; fi
+    [ -n "$fifo" ] || break
+    try=$((try + 1))
+    if [ "$try" -ge "$tries" ]; then
+      echo "[bound] bounded: no write end of $fifo after $tries tries, the command not started (rc 74)" >&2
+      rc=74
+      break
+    fi
+    echo "[bound] bounded: the open of $fifo for writing failed (try $try of $tries), trying again" >&2
+  done
   case $rc in
     124) echo "[bound] $1 cut off at its ${bound} s bound (rc 124)" >&2 ;;
     137) echo "[bound] $1 killed (rc 137: the bound's KILL ${bound} s + $grace s in, or another SIGKILL)" >&2 ;;
@@ -477,6 +518,9 @@ bounded_bg_get() {
 #   output-setup       fifo-fail: a stdin or output file that cannot be opened ends the command, not the runner, and
 #                      starts nothing that outlives the call
 #   output-filter      lease.sh --self-test, bounded-filter-open-term-*: the filter's guard stands before it starts
+#   fifo-eintr         a signal the runner handles ends the blocking open of a FIFO's write end (EINTR): bounded tries
+#                      again and the command runs once the reader is there; after LEASE_FIFO_TRIES tries it gives up by
+#                      name (74) with the command not started; a count that is no positive number is refused (64)
 #   no-group           a child that leads no process group of its own is stopped, and no other group is signalled
 #   nested-grace       two supervisors, one inside the other, finish inside the outer's budget (the inner's is half)
 #   natural-end        --clear: a command that ends by itself and leaves a process in its group: gone when
@@ -881,6 +925,81 @@ EOF
     'source "$1"; LEASE_BOUNDED_OUT=$NOPE/out bounded 5 "$HELD" "$PIDF"' _ "$self" > "$t/fifo3.out" 2>&1 || RC=$?
   check fifo-fg-rc "$([ "$RC" != 0 ] && echo nonzero || echo 0)" nonzero
   check fifo-fg-nothing-started "$([ -e "$t/fifo3.pid" ] && echo started || echo none)" none
+  # fifo-eintr: the runner handles USR1, so a USR1 while its write-end open waits for a reader ends the open with EINTR (the
+  # injection; bash takes a trapped signal there, as it takes a child's exit). The reader comes only after the signals, so
+  # the open is what waits. A hang is the case's own bound (10 s), never the self-test's.
+  cat > "$t/eintr-runner" << 'EOF'
+source "$GB"
+trap : USR1
+: > "$READY"
+rc=0
+LEASE_BOUNDED_OUT=$FIFO bounded 20 sh -c 'echo fifo-ok; : > "$1"' _ "$STARTED" || rc=$?
+echo "bounded=$rc"
+exit "$rc"
+EOF
+  # ended <pid> <seconds>: 0 when the child of this shell is gone within the seconds, else it is stopped and the status is 1.
+  ended() {
+    local i=0
+    while kill -0 "$1" 2> /dev/null; do
+      if [ "$i" -ge "$(($2 * 10))" ]; then
+        kill -TERM "$1" 2> /dev/null
+        return 1
+      fi
+      sleep 0.1
+      i=$((i + 1))
+    done
+  }
+  # eintr_case <name> <tries> <line that ends the signals> <reader: yes|no>: one runner on a fresh FIFO; a USR1 goes to it
+  # while it sleeps, until its stderr has the line (at most 40, one every 0.2 s); then the reader, when asked for. Its
+  # status is EINTR_RC; the case's check says whether the runner and the reader ended within their bounds.
+  eintr_case() {
+    local name=$1 tries=$2 stop=$3 reader=$4 rp rd='' sent=0 st w=0 run=yes rdr=yes
+    EINTR_RC=0
+    mkfifo "$t/$name.fifo" || return 70
+    rm -f "$t/$name.ready" "$t/$name.started"
+    env GB="$self" FIFO="$t/$name.fifo" READY="$t/$name.ready" STARTED="$t/$name.started" PATH="$t/bin:$PATH" \
+      LEASE_FIFO_TRIES="$tries" bash "$t/eintr-runner" > "$t/$name.out" 2> "$t/$name.err" &
+    rp=$!
+    until [ -e "$t/$name.ready" ] || [ "$w" = 100 ]; do
+      sleep 0.1
+      w=$((w + 1))
+    done
+    while [ "$sent" -lt 40 ] && kill -0 "$rp" 2> /dev/null && ! grep -q -- "$stop" "$t/$name.err"; do
+      st=$(ps -o stat= -p "$rp" 2> /dev/null) || break
+      case $st in
+        *S*)
+          kill -USR1 "$rp" 2> /dev/null
+          sent=$((sent + 1))
+          sleep 0.2
+          ;;
+        *) sleep 0.05 ;;
+      esac
+    done
+    if [ "$reader" = yes ]; then
+      cat "$t/$name.fifo" > "$t/$name.got" &
+      rd=$!
+    fi
+    ended "$rp" 10 || run=hang
+    wait "$rp" 2> /dev/null || EINTR_RC=$?
+    if [ -n "$rd" ]; then
+      ended "$rd" 3 || rdr=never-paired
+      wait "$rd" 2> /dev/null || :
+    fi
+    check "$name-no-hang" "$run/$rdr" yes/yes
+  }
+  eintr_case fifo-eintr 5 'trying again' yes
+  check fifo-eintr-rc "$EINTR_RC" 0
+  check fifo-eintr-retried "$(grep -c 'the open of .* for writing failed (try 1 of 5), trying again' "$t/fifo-eintr.err")" 1
+  check fifo-eintr-reader-got-output "$(cat "$t/fifo-eintr.got" 2> /dev/null)" fifo-ok
+  check fifo-eintr-command-ran "$([ -e "$t/fifo-eintr.started" ] && echo ran || echo none)" ran
+  eintr_case fifo-giveup 2 'rc 74' no
+  check fifo-giveup-rc "$EINTR_RC" 74
+  check fifo-giveup-named "$(grep -c 'no write end of .*fifo-giveup.fifo after 2 tries, the command not started (rc 74)' "$t/fifo-giveup.err")" 1
+  check fifo-giveup-nothing-started "$([ -e "$t/fifo-giveup.started" ] && echo started || echo none)" none
+  RC=0
+  env LEASE_FIFO_TRIES=0 PATH="$t/bin:$PATH" bash -c 'source "$1"; bounded 5 true' _ "$self" > "$t/fifo-tries.out" 2>&1 || RC=$?
+  check fifo-tries-refused-rc "$RC" 64
+  check fifo-tries-refused-named "$(grep -c 'LEASE_FIFO_TRIES is a positive number of tries' "$t/fifo-tries.out")" 1
   # no-group: a child that leads no group of its own is stopped, and a process in the runner's own group lives on.
   cat > "$t/nogroup-runner" << 'EOF'
 source "$GB"
