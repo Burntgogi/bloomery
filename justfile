@@ -1982,6 +1982,11 @@ gate-ds41-oracle:
 gate-hf:
     ./tools/box.sh 'bash tools/gate.sh -p bloomery-hf --lib -- --nocapture'
 
+# The shared mapped checkpoint reader's dtype, span, shard and conversion contracts. No model or card.
+[group('canary')]
+gate-safetensors:
+    ./tools/box.sh 'bash tools/gate.sh -p bloomery-safetensors --lib -- --nocapture'
+
 # The shared checkpoint preparer's shard and tokenizer checks, without model files.
 gate-prepare:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model-hf --bin prepare -- --nocapture'

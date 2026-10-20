@@ -30,7 +30,7 @@ use gguf::quant::{
 
 use crate::csf;
 use crate::quant_config::{Format, Placed};
-use crate::safetensors::{self, Dtype, Raw};
+use safetensors::{Dtype, Raw};
 
 /// Why a ModelOpt tensor was refused.
 #[derive(Debug, thiserror::Error)]
@@ -847,7 +847,7 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::*;
-    use crate::safetensors::{Safetensors, write};
+    use safetensors::{Safetensors, write};
 
     const STEMS: [&str; 2] = [
         "model.language_model.layers.0.mlp.experts.0.gate_proj",

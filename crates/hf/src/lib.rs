@@ -25,8 +25,9 @@
 //! from, when the caller's predicate says the set can run it
 //! ([`fetch::Draft`]); a repo holding no file of the name is fetched as it is.
 //!
-//! The other files of a repo are read by [`safetensors`] (a draft's weights, Clef's head, a model
-//! folder), [`quant_config`] (a checkpoint's quantization config, one format a tensor),
+//! Checkpoint bytes are read by the standalone [`safetensors`] crate (a draft's weights, Clef's
+//! head, a model folder). This crate reads [`quant_config`] (a checkpoint's quantization config,
+//! one format a tensor),
 //! [`modelopt`] (a ModelOpt checkpoint's tensors in GGUF's types, one table from a tensor's format),
 //! [`csf`] (its compressed block scales read back as stored bytes), [`vocab`] (a byte-level BPE
 //! tokenizer as GGUF's tokenizer keys) and [`dspark`] (a DSpark draft's `config.json` read into the
@@ -38,7 +39,6 @@ pub mod dspark;
 pub mod fetch;
 pub mod modelopt;
 pub mod quant_config;
-pub mod safetensors;
 pub mod schema;
 pub mod sentence_transformers;
 pub mod source;

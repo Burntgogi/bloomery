@@ -16,8 +16,8 @@ use std::ops::Range;
 use gguf::Value;
 use hf::modelopt::{self, Normal, Plain, Use};
 use hf::quant_config::{Placed, Plan};
-use hf::safetensors::{self, Raw};
 use hf::schema::{self, Fields, Rule::*, Type};
+use safetensors::Raw;
 use serde_json::Value as Json;
 
 use model::arch::qwen35moe::hparams::{MAX_PLE_HEADS, MAX_PLE_NGRAM};
@@ -1288,7 +1288,7 @@ mod tests {
     use std::io::Read;
 
     use hf::quant_config::{Config, plan};
-    use hf::safetensors::Dtype;
+    use safetensors::Dtype;
 
     use super::*;
 
@@ -2089,7 +2089,7 @@ mod tests {
                 ("e.shard_1.weight", "F8_E4M3", &[2, 160], &[0x40u8; 320]),
                 ("e.shard_1.weight_scale", "F32", &[1], second),
             ];
-            hf::safetensors::Safetensors::parse(hf::safetensors::write(&list)).unwrap()
+            safetensors::Safetensors::parse(safetensors::write(&list)).unwrap()
         };
         let hq = serde_json::json!({"quantization": {"quant_algo": "MIXED_PRECISION",
             "quantized_layers": {"e": {"quant_algo": "FP8"}}}});

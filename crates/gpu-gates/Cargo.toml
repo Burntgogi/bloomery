@@ -17,9 +17,10 @@ bloomery-gguf = { path = "../gguf" }
 # the vision set.
 bloomery-refset = { path = "../refset" }
 # Host only, through the `hf` feature: a server's `--hf <repo>[:<quant>]`, the repo's GGUF set fetched into a
-# local cache, and the checkpoint folders the hf crate reads (a DSpark draft's, Clef's head). The gates that
-# read no such thing do not link it.
+# local cache, and a DSpark draft's configuration. The gates that read no such thing do not link it.
 bloomery-hf = { path = "../hf", optional = true }
+# Host-only checkpoint weights, through `hf` for DSpark and `clef` for the decision head.
+bloomery-safetensors = { path = "../safetensors", optional = true }
 # Host only, through the `glm5next-hf` feature: GLM-5.3-Flash's checkpoint map (`generate_glm5next`'s tensor-parallel read).
 bloomery-model-hf = { path = "../model-hf", optional = true }
 # Host only: the lever registry, which the binaries parse once at `main`.
@@ -99,8 +100,8 @@ bloomery-gpu-vision = { path = "../gpu-vision", optional = true }
 bloomery-vision = { path = "../vision", optional = true }
 
 [features]
-# The hub: `--hf` fetches, and the checkpoint folders the hf crate reads. A bin that uses either requires it.
-hf = ["dep:bloomery-hf"]
+# The hub: `--hf` fetches, plus DSpark configuration and checkpoint weights.
+hf = ["dep:bloomery-hf", "dep:bloomery-safetensors"]
 # GLM-5.3-Flash read from its Hugging Face checkpoint folder: `generate_glm5next --place tp`.
 glm5next-hf = ["glm5next", "hf", "dep:bloomery-model-hf"]
 gpu = [
@@ -136,7 +137,7 @@ deepseek41 = [
     "dep:bloomery-vision",
 ]
 vision = ["gpu", "dep:bloomery-gpu-vision", "dep:bloomery-vision"]
-clef = ["gpu", "dep:bloomery-decision", "bloomery-decision/safetensors", "dep:bloomery-serve", "dep:serde_json"]
+clef = ["gpu", "dep:bloomery-decision", "bloomery-decision/safetensors", "dep:bloomery-safetensors", "dep:bloomery-serve", "dep:serde_json"]
 glm5next = ["deepseek41", "dep:bloomery-gpu-glm5next", "bloomery-app/glm5next"]
 mimo2 = ["gpu", "dep:bloomery-gpu-mimo2", "bloomery-app/mimo2"]
 solar2 = ["gpu", "dep:bloomery-gpu-solar2", "bloomery-app/solar2"]

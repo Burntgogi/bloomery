@@ -487,7 +487,8 @@ gpu-vision 148 0 0
 # PIN(2026-10-13): hf 0 -> 2 blocks, new code, not old code relaxed: the DSpark draft's 1.9 GB safetensors file is read
 # through a read-only mapping (Safetensors::open) instead of into memory, and a bf16 tensor's bytes are viewed as u16
 # (Safetensors::bf16, a misaligned file refused), each block with its SAFETY line.
-hf 2 0 0
+# PIN(2026-10-21): hf 2 -> 0 blocks, the mapped reader moved intact to safetensors.
+hf 0 0 0
 jinja 0 0 0
 levers 0 0 0
 # PIN(2026-10-02): model 112 -> 114 blocks, 29 -> 30 fns, new code, not old code relaxed: the union's row lanes
@@ -566,6 +567,8 @@ placement 0 0 0
 qdot 217 95 0
 refset 0 0 0
 runtime 0 0 0
+# PIN(2026-10-21): two existing blocks moved from hf, not new unsafe: the read-only mapping and checked bf16 view.
+safetensors 2 0 0
 sampler 4 4 1
 # PIN(2026-10-08): serve 0 -> 6 blocks, new code, not old code relaxed: the orderly stop's signal
 # handling (api.rs, libc already the workspace's) — the handlers' pipe pair, the reader thread's read,

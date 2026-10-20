@@ -53,6 +53,12 @@ matches, for example a red unit again. The script reads every list from its owne
 `python3 tools/recipes.py pure-crates`, the Python self-tests from the `selftests=(` array of `tools/check-recipes.sh`,
 and the host units from `python3 tools/recipes.py host-nightly`.
 
+The mapped checkpoint reader is `bloomery-safetensors`; `gate-safetensors` owns its dtype, span and shard tests.
+Decision's optional `safetensors` feature loads a head through that reader without linking the hub crate.
+Check both feature configurations with `cargo tree --locked -p bloomery-decision -e normal`, adding
+`--features safetensors` for the loading path. Neither tree should contain `bloomery-hf`; the feature-on tree
+must contain `bloomery-safetensors`. A zero `recipes.py gaps` result alone does not establish this boundary.
+
 | Tier | Where | Runs |
 |---|---|---|
 | T0 | any OS with the pinned nightly (rustup, rustfmt) and `python3` 3.11 or later (`tools/recipes.py` reads `Cargo.lock` with `tomllib`) with numpy and PIL | `cargo fmt --all -- --check`; `cargo test -p <crate>` for each crate of `recipes.py pure-crates`; `python3 tools/recipes.py --self-test`; each Python tool self-test `check-recipes.sh` lists (some import numpy and PIL, which CI installs before T0); every `tools/check-*.sh`. Each check script reads the tree and runs no cargo and no box command, so none is left out |

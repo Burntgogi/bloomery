@@ -176,6 +176,7 @@ gate-gpu-vision-lib	common		lib	serve_media
 gate-gpu-xstream	common		tier	tier_legs
 gate-head	family	deepseek2	host	model_host_ops
 gate-hf	common		host	refset_readers
+gate-safetensors	common		host	refset_readers
 gate-jinja	common		host	tokenizer_jinja
 gate-kv	family	deepseek2	host	kv_pool_checkpoint
 gate-levers	common		lever	levers

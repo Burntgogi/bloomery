@@ -1,6 +1,6 @@
 # Checkpoint shard headers
 
-Real safetensors headers, gzipped, for `crates/hf/src/safetensors.rs`'s folder tests. Each `.header.json.gz` is the JSON header of one shard exactly as the file stores it (the bytes after its 8-byte length), read by an HTTP range request. The tests write each one as a shard whose data section is a hole, so the files have the real layout and no tensor bytes.
+Real safetensors headers, gzipped, shared by `crates/safetensors/src/lib.rs`'s folder tests and the checkpoint configuration tests in this crate. Each `.header.json.gz` is the JSON header of one shard exactly as the file stores it (the bytes after its 8-byte length), read by an HTTP range request. The tests write each one as a shard whose data section is a hole, so the files have the real layout and no tensor bytes.
 
 | file | source |
 |---|---|
