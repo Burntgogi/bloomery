@@ -7,7 +7,10 @@ two the group gets a KILL if COMMAND is still there (K 0 or none: no KILL). The 
 KILL ends the group, else COMMAND's status (128 + the signal). The monitor leads the group and ignores its own TERM
 while forwarding it. A SIGALRM is the bound running out, as coreutils' timeout takes it from its own timer, so a case
 can end the bound at the moment its command is ready instead of at a time after the spawn. COMMAND inherits the
-monitor's open descriptors, including a lease held on descriptor 9."""
+monitor's open descriptors, including a lease held on descriptor 9.
+STUB_TIMEOUT_BOUND_NOTE=TEXT (unset: nothing) prints TEXT and a newline on stdout when S runs out, so a self-test can
+tell a COMMAND that S ended from one a TERM sent here ended (the KILL that follows a TERM, after K seconds, prints
+nothing)."""
 import os
 import signal
 import subprocess
@@ -15,6 +18,7 @@ import sys
 import time
 
 kill_after = 0.0
+note = os.environ.get('STUB_TIMEOUT_BOUND_NOTE')
 args = []
 for a in sys.argv[1:]:
     if a.startswith('--kill-after='):
@@ -66,6 +70,8 @@ while True:
         break
     except subprocess.TimeoutExpired:
         if time.monotonic() >= deadline:
+            if note and term_signal == signal.SIGTERM:  # S ran out: after a TERM sent here the deadline is the KILL's
+                print(note, flush=True)
             timed_out, deadline = True, float('inf')
             cleanup(term_signal)
 if timed_out and rc == -signal.SIGKILL:

@@ -789,6 +789,10 @@ CARGO
   sc=$t/overlap
   mkdir -p "$sc/tools" "$sc/sync"
   cp "$HERE/tools/mac-check.sh" "$HERE/tools/mac-static.sh" "$HERE/tools/lint-ratchet.txt" "$sc/tools/"
+  # the scheduler mac-static.sh runs its jobs under, and what it imports (recipes.py, which reads the table reader)
+  mkdir -p "$sc/tools/bloomery"
+  cp "$HERE/tools/static-sched.py" "$HERE/tools/recipes.py" "$sc/tools/"
+  cp "$HERE/tools/bloomery/fixture_dirs.py" "$sc/tools/bloomery/"
   printf '#!/bin/sh\nexit 0\n' > "$sc/tools/check-overlap.sh"
   cp "$HERE/rust-toolchain.toml" "$HERE/Cargo.lock" "$sc/"
   git -C "$sc" init -q
@@ -797,8 +801,10 @@ CARGO
   case $host in aarch64-*) a=arm64 ;; *) a=x86_64 ;; esac
   printf '#!/bin/sh\ncase $1 in -s) echo Darwin ;; -m) echo %s ;; esac\n' "$a" > "$fake/brew/bin/uname"
   printf '#!/bin/sh\ncksum "$2"\n' > "$fake/brew/bin/md5"
+  realpy=$(command -v python3) || exit 70
   cat > "$fake/brew/bin/python3" << 'RECIPES'
 #!/bin/sh
+[ "$1" != tools/static-sched.py ] || exec "$REAL_PYTHON3" "$@"
 case $2 in
   box-command)
     case $3 in lint) echo cargo clippy --all-targets ;; fmt-check) echo cargo fmt --all -- --check ;; esac ;;
@@ -821,13 +827,13 @@ CARGO
   chmod +x "$tc/cargo" "$fake/brew/bin/uname" "$fake/brew/bin/md5" "$fake/brew/bin/python3"
   echo 0 > "$sc/tools/lint-ratchet.txt"
   local p1 rc1=0 rc2=0 k=0
-  (HOME=$fake PATH=$fake/brew/bin:$PATH WT_SEED_TSV=$sc/seed.tsv CHECK_ROLE=slow CHECK_SYNC=$sc/sync \
+  (HOME=$fake PATH=$fake/brew/bin:$PATH REAL_PYTHON3=$realpy WT_SEED_TSV=$sc/seed.tsv CHECK_ROLE=slow CHECK_SYNC=$sc/sync \
     bash "$sc/tools/mac-static.sh" --full > "$sc/slow.out" 2>&1) & p1=$!
   until [ -e "$sc/sync/warned" ]; do
     k=$((k + 1)); [ "$k" -le 600 ] || { fail "the overlapping lint did not emit its warning within 60 s: $(cat "$sc/slow.out")"; break; }
     sleep 0.1
   done
-  HOME=$fake PATH=$fake/brew/bin:$PATH WT_SEED_TSV=$sc/seed.tsv CHECK_ROLE=green CHECK_SYNC=$sc/sync \
+  HOME=$fake PATH=$fake/brew/bin:$PATH REAL_PYTHON3=$realpy WT_SEED_TSV=$sc/seed.tsv CHECK_ROLE=green CHECK_SYNC=$sc/sync \
     bash "$sc/tools/mac-static.sh" --full > "$sc/green.out" 2>&1 || rc2=$?
   touch "$sc/sync/release"
   wait "$p1" || rc1=$?

@@ -184,6 +184,9 @@ check archive-tree-bad-rev-names-git "$r|$(ls -A "$T/arc-tmp")" "1|128|-|"
 # out; the monitor's timer (60 s) is only the hang guard, and the KILL after the bound is 0.5 s. A unit never ends by
 # itself in the term and bound paths (its 60 s dwell is also a hang guard): what ends it is the path under test. A slow
 # unit (bound path only) is ready a second after its spawn, as on a loaded machine: the bound still comes from readiness.
+# PIN(2026-10-19): the bound path's bound was 0.5 s of wall clock against a unit that ended itself after 2 s, so a loaded host
+# that ran the bound out late read as a surviving unit. The assertions are unchanged (the runner's code, nothing left, no
+# unit-survived); the bound now runs out on the event, once the unit is ready.
 # shellcheck source=tools/ref/cancel-stubs.sh
 source "$ROOT/tools/ref/cancel-stubs.sh"
 mkdir "$T/ru-bin"
@@ -226,11 +229,12 @@ for ru_mon in $ru_monitors; do
           MODE="$([ "$ru_mode" = quiet ] && echo quiet)" bash "$T/ru-cell" > "$T/$tag.out" 2>&1 &
         rp=$! i=0
         if [ "$ru_path" = term ]; then
-          until grep -qs unit-ready "$T/$tag.log" || [ "$i" = 100 ]; do sleep 0.1; i=$((i + 1)); done
+          # ready: the unit's line in its log, or the runner gone (its output tells why); 1200 passes is the failsafe
+          until grep -qs unit-ready "$T/$tag.log" || ! cancel_alive "$rp" || [ "$i" = 1200 ]; do sleep 0.1; i=$((i + 1)); done
           kill -TERM "$rp"
         fi
         i=0
-        while cancel_alive "$rp" && [ "$i" -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
+        while cancel_alive "$rp" && [ "$i" -lt 1200 ]; do sleep 0.1; i=$((i + 1)); done
         ! cancel_alive "$rp" || kill -KILL "$rp"
         wait "$rp"
         rc=$?
@@ -274,8 +278,9 @@ for ru_mon in $ru_monitors; do
       kill() { if [ "$1" = -KILL ]; then echo "kill: ($3) - Operation not permitted" >&2; return 1; fi; builtin kill "$@"; }
       for c in "exit 0" "exit 3"; do run_unit "sleep 1000 & echo \$! >> \"\$PIDF\"; echo x; $c" "$LOG" 60 $MODE; echo "rc=$UNIT_RC"; done' \
       > "$T/$tag.out" 2>&1 &
+    # run_unit returns at once: one that waited on the leftover child would take its 1000 s; 600 passes is the failsafe
     rp=$! i=0
-    while cancel_alive "$rp" && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+    while cancel_alive "$rp" && [ "$i" -lt 600 ]; do sleep 0.1; i=$((i + 1)); done
     r=returned
     ! cancel_alive "$rp" || { r=hung; kill -KILL "$rp"; }
     wait "$rp" 2> /dev/null

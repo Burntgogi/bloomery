@@ -1,11 +1,16 @@
 #!/usr/bin/env bash
-# bloomery — the Mac static tier in one command, the round loop's form. The loop a round runs before
-# it reports was a sequence (mac-check check, mac-check combos, mac-check lint, fmt-check, the eight
-# tools/check-*.sh one after another) whose walls measured 2026-10-07 (load ~5, this Mac): the cargo
-# steps 0.6-40 s each but the eight scripts ~240 s serial, `check-recipes` alone 172 s. Two lanes cut
-# it to the longer lane: the scripts lane (fmt-check and every tools/check-*.sh, one job each) and the cargo
-# lane (lint, then the scoped combos, serial — they share the tree's target directory, and two cargos
-# on one directory serialize on its lock anyway).
+# bloomery — the Mac static tier in one command, the round loop's form: fmt-check, lint, the scoped combos and every
+# tools/check-*.sh, check-recipes as its blocks (tools/check-recipes.sh --jobs), all of them jobs of one scheduler,
+# tools/static-sched.py: at most a cpu count at once (lint and combos count the cores they compile on), the longest
+# recorded first (~/.cache/bloomery/static-times.tsv), combos after lint (one target directory, one cargo lock). Every
+# job at once oversubscribed the Mac and turned timing self-tests red under the load alone.
+#
+# A run with a BASE keys every job but lint and combos (tools/recipes.py static-key: the content of the tree the job
+# reads, the commit of a revision its keyspec names, the command and the environment, the rustflags among it) and skips
+# a job whose key is green in the ledger; a skipped step or block is a summary line of its own. Lint and combos source
+# $HOME/opt/bloomery-mac-env.sh (tools/mac-check.sh), which no key reads and which may export rustflags: a key green
+# under one setup would skip the lint under another. --fresh keys and records but skips nothing (a proof run); a full
+# run (no BASE) keys nothing.
 #
 # The cargo lane runs `lint`, not `check`: clippy is rustc plus lints, so every error `cargo check`
 # reports is a clippy error too (proved FAIL-first at birth: a type-error mutant is red under this
@@ -20,13 +25,15 @@
 # tools/mac-check.sh moves every key (they are in every shape's inputs), so a tooling round re-checks
 # every shape.
 #
-#   tools/mac-static.sh [BASE|--full]   one line a step (rc, wall, the step's own summary), exits
+#   tools/mac-static.sh [--fresh] [BASE|--full]   one line a step (rc, wall, the step's own summary), exits
 #                                       non-zero naming every red step; BASE scopes the combos step
-#                                       (a rev, or A..B); --full or no argument runs it unscoped
-#   tools/mac-static.sh --self-test     the lanes' orchestration, the rc/wall capture, the red-step
-#                                       naming, the check-script derivation, the parallel check runner and the
-#                                       argument plumbing, against /bin/true, /bin/false and sleep stubs and fixture
-#                                       check scripts; runs no cargo and no check script (check-recipes runs it)
+#                                       (a rev, or A..B) and keys the jobs; --full or no argument runs
+#                                       it unscoped and unkeyed
+#   tools/mac-static.sh --self-test     the job list, the scheduling (through tools/static-sched.py on stub jobs), the
+#                                       rc/wall capture, the skip lines, the red-step naming, the check-script
+#                                       derivation, the parallel check runner and the argument plumbing, against stub
+#                                       jobs and fixture check scripts; runs no cargo and no check script
+#                                       (check-recipes runs it)
 #   tools/mac-static.sh --checks [--list] [--no-base] [--skip NAME]…
 #                                       the check scripts alone, in parallel, at most one a cpu (what `just gate` runs:
 #                                       the justfile's check-scripts): one line a check in byte order of the name
@@ -45,21 +52,25 @@
 #
 # Exit: the first red step's rc, or 0. 64: an argument this script does not take. 69: no cpu count (getconf, sysctl and
 # nproc all fail), or results that cannot be cleared, created or removed (named; a run that already ended red keeps its rc). A step
-# whose rc file is missing or empty (killed before its wrapper ran, or a result that could not be written) is red, named `no rc`,
-# never 0. Steps' full output and their rc/wall land in target/mac-static/run.XXXXXX/<step>.{log,rc,wall} (--checks: a run directory under
-# target/mac-static/checks/, whose red logs come back whole on stderr); the cargo lane's steps also write the mac-check logs
+# whose rc file is missing or empty (killed before it ended, or a result that could not be written) is red, named `no rc`,
+# never 0. Jobs' full output and their rc/wall land in target/mac-static/run.XXXXXX/<job>.{log,rc,wall} (a skipped one also
+# <job>.skip; sched.tsv is the run's timeline; --checks: a run directory under target/mac-static/checks/, whose red logs come
+# back whole on stderr); check-recipes' step files are its blocks' report; the cargo steps also write the mac-check logs
 # (target/mac-check-*.log) as they always did.
 #
 # The environment is mac-check's (the pinned toolchain, $HOME/opt/bloomery-mac-env.sh for the cross
 # check): every cargo step calls tools/mac-check.sh, which owns that setup. The ledger is
 # ~/.cache/bloomery/mac-static-ledger.tsv, shared between trees on purpose: a green key is a fact
-# about the inputs, not the tree. Another round's tree has its own target directory; nothing here
-# reads another tree's.
+# about the inputs, not the tree; the shapes' keys and the jobs' keys hash different headers, so they never meet.
+# Another round's tree has its own target directory; nothing here reads another tree's.
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 LEDGER=$HOME/.cache/bloomery/mac-static-ledger.tsv
 # The check scripts the round loop leaves out, by name (tools/check-NAME.sh), the reason on the line above each. None today.
 SKIP=()
+TIMES=$HOME/.cache/bloomery/static-times.tsv
+# The cores a cargo step holds in the schedule: cargo compiles on every core while a crate graph allows.
+CARGO_CPUS=4
 
 say() { printf '%s\n' "$*" >&2; }
 
@@ -149,29 +160,61 @@ remove_run_dir() {
   rm -rf "$1" || { say "mac-static.sh: cannot remove the results in $1"; [ "$2" != 0 ] || exit 69; }
 }
 
-# run_steps D CARGO_CMDV…: both lanes. The scripts lane: one background job a script (fmt-check and
-# every tools/check-*.sh). The cargo lane: one background job running lint then the combos step
-# serially (one target directory, one lock). Every job's pid is captured at start, written to
-# D/pids, and waited on; no polling.
-run_steps() {
-  local d=$1 base=$2
-  shift 2
-  local -a cargo=("$@") pids=() names=()
-  : > "$d/pids"
-  ( step_inner fmt-check "$d" "$HERE/tools/mac-check.sh" fmt-check ) & pids+=($!) && names+=(fmt-check)
-  local s
+# step_keyspec NAME BASE: what a check script's input key reads (tools/recipes.py static-key). Each scans the tree;
+# check-model-tax also holds its rows to the base revision.
+step_keyspec() {
+  case $1 in
+    model-tax) printf 'tree,rev:%s\n' "$(base_rev "$2")" ;;
+    *) echo tree ;;
+  esac
+}
+
+# job_lines BASE CARGO_CMDV…: every job of the run as tools/static-sched.py's JOBS lines, run from this tree's root:
+# fmt-check, lint, combos after lint, each check script, check-recipes as its blocks. A command carries its arguments
+# quoted (%q) for the scheduler's `bash -c`: a ledger path or a revision with spaces stays one argument.
+job_lines() {
+  local base=$1 s w cmdv
+  shift
   local -a args
-  local w
+  printf 'fmt-check\t-\ttree\ttools/mac-check.sh fmt-check\n'
+  printf 'lint\tcpus=%s\t-\ttools/mac-check.sh lint\n' "$CARGO_CPUS"
+  printf -v cmdv '%q ' "$@"
+  printf 'combos\tafter=lint,cpus=%s\t-\ttools/mac-check.sh %s\n' "$CARGO_CPUS" "${cmdv% }"
   for s in "${SCRIPTS[@]}"; do
+    if [ "$s" = recipes ]; then
+      bash "$HERE/tools/check-recipes.sh" --jobs
+      continue
+    fi
     args=()
     while IFS= read -r w; do args+=("$w"); done < <(check_argv "$s" "$base")
-    ( step_inner "check-$s" "$d" bash "$HERE/tools/check-$s.sh" ${args[@]+"${args[@]}"} ) & pids+=($!) && names+=(check-$s)
+    printf -v cmdv '%q ' ${args[@]+"${args[@]}"}
+    printf 'check-%s\t-\t%s\tbash tools/check-%s.sh%s\n' "$s" "$(step_keyspec "$s" "$base")" "$s" "${args[*]+ ${cmdv% }}"
   done
-  ( step_inner lint "$d" "$HERE/tools/mac-check.sh" lint
-    step_inner combos "$d" "$HERE/tools/mac-check.sh" "${cargo[@]}" ) & pids+=($!) && names+=(cargo-lane)
-  local i
-  for i in "${!pids[@]}"; do echo "${names[$i]} ${pids[$i]}" >> "$d/pids"; done
-  wait "${pids[@]}" || true # a killed wrapper is the summary's `no rc` case, not this script's end
+}
+
+# run_jobs D JOBS MODE: the scheduler over JOBS from this tree's root, its files to D. MODE: full (no keys), keyed (a
+# job whose key is green is skipped), fresh (keyed and recorded, nothing skipped). Then check-recipes' step files from
+# its blocks' report, the step's wall being the span from its first block's start to its last block's end.
+run_jobs() {
+  local d=$1 jobs=$2 mode=$3 rc=0
+  local -a keyed=()
+  if [ "$mode" != full ]; then
+    (cd "$HERE" && python3 tools/recipes.py static-key "$jobs") > "$d/keys.tsv" || {
+      say "mac-static: tools/recipes.py static-key failed; every job runs"
+      mode=full
+    }
+  fi
+  [ "$mode" = full ] || keyed=(--keys "$d/keys.tsv" --ledger "$LEDGER" --tree "${HERE##*/}")
+  [ "$mode" != fresh ] || keyed+=(--no-skip)
+  (cd "$HERE" && python3 tools/static-sched.py run --out "$d" --times "$TIMES" ${keyed[@]+"${keyed[@]}"} "$jobs") || rc=$?
+  [ "$rc" = 0 ] || { say "mac-static: tools/static-sched.py ended rc $rc"; return "$rc"; }
+  if grep -q '^check-recipes\.' "$jobs"; then
+    rc=0
+    bash "$HERE/tools/check-recipes.sh" --report "$d" > "$d/check-recipes.log" 2>&1 || rc=$?
+    echo "$rc" > "$d/check-recipes.rc"
+    awk -F'\t' '$1 ~ /^check-recipes\./ && $5 == "run" { if (s == "" || $2 < s) s = $2; if ($3 > e) e = $3 }
+      END { printf "%d\n", (s == "" ? 0 : e - s) }' "$d/sched.tsv" > "$d/check-recipes.wall"
+  fi
 }
 
 # run_check_jobs DIR BASE NOBASE JOBS D NAME…: DIR's check-NAME.sh for each NAME, in the order given, at most JOBS at a time under
@@ -218,7 +261,8 @@ run_checks() {
 }
 
 # step_line D NAME: the step's summary line on stdout, `mac-static: <step> rc <n> in <s> s [— the step's own closing line]`: the
-# cargo steps' closing line comes from their log, a check's is its log's last non-empty line (cut at 160 characters). A step that
+# cargo steps' closing line comes from their log, check-recipes' is its count of blocks run and skipped, a check's is its log's
+# last non-empty line (cut at 160 characters), and a skipped step's names its green row. A step that
 # is red, or whose rc file is missing, empty or not a number, joins REDS; FIRSTRC is the rc of the first red one (1 for no rc), 0
 # while none is.
 REDS=()
@@ -239,8 +283,10 @@ step_line() {
     lint) extra=$(grep -E '^mac-check: (lint \^warning|lint rc)' "$d/$name.log" | tail -1 || true) ;;
     combos) extra=$(grep -E '^mac-check: combos rc' "$d/$name.log" | tail -1 || true) ;;
     fmt-check) extra="rustfmt diff blocks: $(grep -cE '^diff' "$d/$name.log" || true)" ;;
+    check-recipes) extra=$(grep -E '^check-recipes: [0-9]+ blocks ran' "$d/$name.log" | tail -1 || true) ;;
     check-*) extra=$(grep -v '^[[:space:]]*$' "$d/$name.log" | tail -1 | cut -c1-160 || true) ;;
   esac
+  [ ! -f "$d/$name.skip" ] || extra="skipped, its input key is $(cat "$d/$name.skip")"
   echo "mac-static: $name rc $rc in $wall s${extra:+ — $extra}"
   if [ "$rc" != 0 ]; then
     REDS+=("$name (rc $rc)")
@@ -271,16 +317,23 @@ summarize_checks() {
 
 # summarize D BASE: one line a step in a fixed order (fmt-check, lint, combos, every check),
 # then the verdict. Prints `mac-static: <step> rc <n> in <s> s [— the step's own closing line]`; the
-# cargo steps' closing line comes from their log. Ends 0, or prints one line naming every red step
-# and ends with the first red rc.
+# cargo steps' closing line comes from their log, check-recipes' is its count of blocks run and skipped, a
+# skipped step's names its green row. Then one line naming every skipped job (steps and check-recipes' blocks)
+# when any was. Ends 0, or prints one line naming every red step and ends with the first red rc.
 summarize() {
-  local d=$1 base=$2 s
+  local d=$1 base=$2 s f skipped=''
   REDS=()
   FIRSTRC=0
   step_line "$d" fmt-check
   step_line "$d" lint
   step_line "$d" combos
   for s in "${SCRIPTS[@]}"; do step_line "$d" "check-$s"; done
+  for f in "$d"/*.skip; do
+    [ -e "$f" ] || continue
+    f=${f##*/}
+    skipped="$skipped ${f%.skip}"
+  done
+  [ -z "$skipped" ] || echo "mac-static: skipped by a green input key:$skipped"
   echo "mac-static: total $((SECONDS - T0)) s, base ${base:-none (full run)}, ledger ${base:+$LEDGER}"
   if [ "${#REDS[@]}" != 0 ]; then
     say "mac-static: red steps: ${REDS[*]}"
@@ -290,7 +343,7 @@ summarize() {
 }
 
 self_test() {
-  local fails=0 d out rc k in_scripts in_skip
+  local fails=0 d out rc k in_scripts in_skip sp cmd got
   local -a pids=()
   fail() { say "mac-static self-test FAIL: $*"; fails=$((fails + 1)); }
   T0=$SECONDS
@@ -423,21 +476,25 @@ self_test() {
   for mode in --checks --full; do
     fx=$(mktemp -d)
     mkdir "$fx/tools" "$fx/sync"
-    cp "$HERE/tools/mac-static.sh" "$fx/tools/mac-static.sh"
+    # the scheduler and what it imports (recipes.py reads the job file, and the table reader)
+    cp "$HERE/tools/mac-static.sh" "$HERE/tools/static-sched.py" "$HERE/tools/recipes.py" "$fx/tools/"
+    mkdir "$fx/tools/bloomery"
+    cp "$HERE/tools/bloomery/fixture_dirs.py" "$fx/tools/bloomery/"
     printf '#!/usr/bin/env bash\n[ "${CHECK_ROLE:-}" != slow ] || exit 7\n' > "$fx/tools/check-model-tax.sh"
     printf '#!/usr/bin/env bash\nexit 0\n' > "$fx/tools/mac-check.sh"
     chmod +x "$fx/tools/mac-check.sh"
     # shellcheck disable=SC2016 # the check's own shell expands them
     printf '#!/usr/bin/env bash\n[ "$CHECK_ROLE" != slow ] || { n=0; until [ -e "$CHECK_SYNC/release" ]; do n=$((n + 1)); [ "$n" -le 600 ] || exit 9; sleep 0.1; done; }\n' > "$fx/tools/check-zlate.sh"
     rc1=0; rc2=0
-    CHECK_SYNC=$fx/sync CHECK_ROLE=slow bash "$fx/tools/mac-static.sh" "$mode" > "$fx/out1" 2>&1 & p1=$!
+    # HOME is the fixture's, so the scheduler's times and the ledger are the fixture's, not the real files
+    HOME=$fx CHECK_SYNC=$fx/sync CHECK_ROLE=slow bash "$fx/tools/mac-static.sh" "$mode" > "$fx/out1" 2>&1 & p1=$!
     k=0
     until [ "$(cat "$fx"/target/mac-static/check-model-tax.rc "$fx"/target/mac-static/run.*/check-model-tax.rc "$fx"/target/mac-static/checks/check-model-tax.rc "$fx"/target/mac-static/checks/run.*/check-model-tax.rc 2> /dev/null)" = 7 ]; do
       k=$((k + 1))
       [ "$k" -le 600 ] || { fail "the first run's model-tax result did not land within 60 s"; break; }
       sleep 0.1
     done
-    out=$(CHECK_SYNC=$fx/sync CHECK_ROLE=green bash "$fx/tools/mac-static.sh" "$mode" 2>&1) || rc2=$?
+    out=$(HOME=$fx CHECK_SYNC=$fx/sync CHECK_ROLE=green bash "$fx/tools/mac-static.sh" "$mode" 2>&1) || rc2=$?
     touch "$fx/sync/release"
     wait "$p1" || rc1=$?
     [ "$rc2" = 0 ] || fail "$mode: the overlapping green run ends rc $rc2: $out"
@@ -507,34 +564,65 @@ self_test() {
   [ "$rc" = 64 ] || fail "--checks --skip with no name ends rc $rc, not 64"
   rc=0; out=$(bash "$HERE/tools/mac-static.sh" --checks --bogus 2>&1) || rc=$?
   [ "$rc" = 64 ] || fail "--checks --bogus ends rc $rc, not 64"
+  rc=0; out=$(bash "$HERE/tools/mac-static.sh" --fresh --checks --list 2>&1) || rc=$?
+  [ "$rc" = 64 ] || fail "--fresh --checks ends rc $rc, not 64: a --checks run has no keys to skip by, so --fresh would be dropped unsaid"
   out=$(ncpu) || fail "ncpu ends rc $?"
   case $out in '' | *[!0-9]* | 0) fail "ncpu prints '$out', not a positive whole number" ;; esac
 
-  # the lanes: two steps that each mark their start and wait for the other's mark (they ran at once;
-  # on serial lanes the first waits out its bound, 120 s, and ends rc 9), whatever the load delays
-  # either start by; rcs and walls land, a failing step is red and named, a step with no rc file is
-  # red as `no rc`
+  # job_lines: fmt-check, lint, combos after lint (the cargo steps holding CARGO_CPUS), one job a check script, the
+  # model-tax key holding the base revision, check-recipes as its blocks and not as one step
+  out=$(job_lines '' combos --base main)
+  [ "$(printf '%s\n' "$out" | head -3 | cut -f1,2 | tr '\t\n' ' ')" = "fmt-check - lint cpus=$CARGO_CPUS combos after=lint,cpus=$CARGO_CPUS " ] \
+    || fail "the cargo jobs' lines: $(printf '%s\n' "$out" | head -3)"
+  grep -qx "combos	after=lint,cpus=$CARGO_CPUS	-	tools/mac-check.sh combos --base main" <<< "$out" || fail "the combos job is not the combos argv, unkeyed"
+  grep -qx "lint	cpus=$CARGO_CPUS	-	tools/mac-check.sh lint" <<< "$out" || fail "the lint job is not mac-check lint, unkeyed (it sources a setup script no key reads): $(printf '%s\n' "$out" | grep '^lint	')"
+  for s in "${SCRIPTS[@]}"; do
+    [ "$s" = recipes ] || grep -q "^check-$s	" <<< "$out" || fail "check-$s is not a job"
+  done
+  ! grep -q '^check-recipes	' <<< "$out" || fail "check-recipes is a job of its own, not its blocks"
+  grep -q '^check-recipes\.cardtests	' <<< "$out" || fail "check-recipes' blocks are not jobs"
+  grep -q '^check-recipes\.gatebatch\.1	' <<< "$out" || fail "gate-batch's self-test parts are not jobs"
+  grep -qx 'check-model-tax	-	tree,rev:origin/main	bash tools/check-model-tax.sh check --base origin/main' <<< "$out" \
+    || fail "the model-tax job does not key the base revision: $(printf '%s\n' "$out" | grep '^check-model-tax')"
+  # a job's command keeps its argument boundaries as the scheduler's `bash -c` reads it: a ledger path with a space reaches
+  # mac-check as one argument, and so does a revision with spaces reach check-model-tax
+  sp='/tmp/x y/ledger.tsv'
+  out=$(job_lines '' combos --ledger "$sp")
+  cmd=$(printf '%s\n' "$out" | awk -F'\t' '$1 == "combos" { print $4 }')
+  got=$(bash -c "set -- $cmd; printf '%s|' \"\$@\"")
+  [ "$got" = "tools/mac-check.sh|combos|--ledger|$sp|" ] || fail "a ledger path with a space does not reach mac-check as one argument: $got"
+  out=$(job_lines 'main@{1 day ago}' combos)
+  cmd=$(printf '%s\n' "$out" | awk -F'\t' '$1 == "check-model-tax" { print $4 }')
+  got=$(bash -c "set -- $cmd; printf '%s|' \"\$@\"")
+  [ "$got" = "bash|tools/check-model-tax.sh|check|--base|main@{1 day ago}|" ] || fail "a revision with spaces does not reach check-model-tax as one argument: $got"
+
+  # the scheduling, through tools/static-sched.py on stub jobs: two jobs that each mark their start and wait for the
+  # other's mark ran at once (one after the other, the first waits out its bound, 120 s, and ends rc 9), whatever the
+  # load delays either start by; rcs and walls land; a job after a slow one starts after it and reads its own wall
   d=$(mktemp -d)
   T0=$SECONDS
-  np=0
-  # shellcheck disable=SC2016 # the step's own shell expands them
+  # shellcheck disable=SC2016 # the job's own shell expands them
   meet='touch "$1/$2.on"; n=0; until [ -e "$1/$3.on" ]; do n=$((n + 1)); [ "$n" -le 600 ] || exit 9; sleep 0.2; done'
-  ( step_inner meet-a "$d" bash -c "$meet" _ "$d" a b ) & pids[$np]=$!; np=$((np + 1))
-  ( step_inner meet-b "$d" bash -c "$meet" _ "$d" b a ) & pids[$np]=$!; np=$((np + 1))
-  ( step_inner false-step "$d" bash -c 'exit 3' ) & pids[$np]=$!; np=$((np + 1))
-  ( step_inner true-step "$d" bash -c 'echo ok' ) & pids[$np]=$!; np=$((np + 1))
-  # a step's wall is its own seconds, not the lane's: a function step moves this subshell's clock by 60 s (no sleep), and the
-  # next step in the same lane reads under 30 s, whatever the load; a wall taken from the lane's start would read 60 or more
-  clock_step() { SECONDS=$((SECONDS + 60)); }
-  ( step_inner clock-step "$d" clock_step; step_inner after-clock "$d" true ) & pids[$np]=$!; np=$((np + 1))
-  wait "${pids[@]}" || true
+  {
+    printf 'meet-a\t-\t-\tbash -c %q _ %q a b\n' "$meet" "$d"
+    printf 'meet-b\t-\t-\tbash -c %q _ %q b a\n' "$meet" "$d"
+    printf 'false-step\t-\t-\texit 3\n'
+    printf 'true-step\t-\t-\techo ok\n'
+    printf 'slow-step\t-\t-\tsleep 3\n'
+    printf 'after-slow\tafter=slow-step\t-\ttrue\n'
+  } > "$d/jobs.tsv"
+  rc=0; TIMES=$d/times.tsv run_jobs "$d" "$d/jobs.tsv" full || rc=$? # stub rows stay out of the real times file
+  [ "$rc" = 0 ] || fail "the scheduler over stub jobs ended rc $rc"
   [ "$(cat "$d/meet-a.rc")" = 0 ] && [ "$(cat "$d/meet-b.rc")" = 0 ] \
-    || fail "two steps that wait for each other did not meet within 120 s: the lanes ran one after another"
+    || fail "two jobs that wait for each other did not meet within 120 s: the jobs ran one after another"
   [ "$(cat "$d/true-step.rc")" = 0 ] || fail "a true step's rc is not 0"
   [ "$(cat "$d/false-step.rc")" = 3 ] || fail "an exit-3 step's rc is not 3"
-  [ "$(cat "$d/clock-step.wall")" -ge 60 ] || fail "a step that moved the clock by 60 s reads a wall of $(cat "$d/clock-step.wall") s"
-  [ "$(cat "$d/after-clock.wall")" -lt 30 ] || fail "a step after a slow one in its lane reads a wall of $(cat "$d/after-clock.wall") s, not its own"
+  [ "$(cat "$d/slow-step.wall")" -ge 3 ] || fail "a 3 s step reads a wall of $(cat "$d/slow-step.wall") s"
+  [ "$(cat "$d/after-slow.wall")" -lt 3 ] || fail "a step after a slow one reads a wall of $(cat "$d/after-slow.wall") s, not its own"
+  awk -F'\t' '$1 == "slow-step" { e = $3 } $1 == "after-slow" { s = $2 } END { exit !(s >= e) }' "$d/sched.tsv" \
+    || fail "a step after another started before it ended: $(cat "$d/sched.tsv")"
   [ "$(cat "$d/true-step.log")" = ok ] || fail "a step's output did not land in its log"
+  [ ! -e "$d/check-recipes.rc" ] || fail "a run with no check-recipes job wrote its step files"
   echo 0 > "$d/fmt-check.rc"; echo 1 > "$d/fmt-check.wall"; : > "$d/fmt-check.log"
   echo 3 > "$d/lint.rc"; echo 1 > "$d/lint.wall"; printf '%s\n' 'mac-check: lint rc 3' > "$d/lint.log"
   echo 0 > "$d/combos.rc"; echo 2 > "$d/combos.wall"; printf '%s\n' 'mac-check: combos rc 0; 3 shapes run' > "$d/combos.log"
@@ -556,6 +644,16 @@ self_test() {
   rc=0; out=$(summarize "$d" main 2>&1) || rc=$?
   [ "$rc" = 0 ] || fail "a green loop ends rc $rc"
   case $out in *"mac-static: ok"*) ;; *) fail "a green loop does not end ok: $out" ;; esac
+  case $out in *"skipped by a green input key"*) fail "a run with no skip names one: $out" ;; esac
+  # a skipped step's line names its green row, and the run names every skipped job, a check-recipes block among them
+  echo 'green at 2026-10-19 10:00 in t1, key 0123456789ab' > "$d/check-arch.skip"
+  : > "$d/check-recipes.gatebatch.skip"
+  printf '%s\n' 'check-recipes: 40 blocks ran, 15 skipped by a green input key' > "$d/check-recipes.log"
+  rc=0; out=$(summarize "$d" main 2>&1) || rc=$?
+  [ "$rc" = 0 ] || fail "a run with skipped jobs ends rc $rc"
+  case $out in *"check-arch rc 0 in 1 s — skipped, its input key is green at 2026-10-19 10:00 in t1"*) ;; *) fail "a skipped step's line: $out" ;; esac
+  case $out in *"check-recipes rc 0 in 1 s — check-recipes: 40 blocks ran, 15 skipped"*) ;; *) fail "check-recipes' line does not count its blocks: $out" ;; esac
+  case $out in *"skipped by a green input key: check-arch check-recipes.gatebatch"*) ;; *) fail "the skipped jobs are not named: $out" ;; esac
   rm -rf "$d"
 
   if [ "$fails" != 0 ]; then
@@ -567,9 +665,15 @@ self_test() {
 
 T0=$SECONDS
 BASE=
+MODE=keyed
+if [ "${1:-}" = --fresh ]; then
+  MODE=fresh
+  shift
+fi
 case ${1:-} in
-  --self-test) [ $# = 1 ] || { say "mac-static.sh: --self-test takes nothing"; exit 64; }; self_test; exit $? ;;
+  --self-test) [ $# = 1 ] && [ "$MODE" = keyed ] || { say "mac-static.sh: --self-test takes nothing"; exit 64; }; self_test; exit $? ;;
   --checks)
+    [ "$MODE" = keyed ] || { say "mac-static.sh: --fresh is a run's, --checks takes only its own arguments"; exit 64; }
     shift
     list=
     nobase=
@@ -596,9 +700,10 @@ case ${1:-} in
     ;;
   --full) [ $# = 1 ] || { say "mac-static.sh: --full takes nothing"; exit 64; } ;;
   "") : ;;
-  -*) say "usage: tools/mac-static.sh [BASE|--full] | --checks [--list] [--no-base] [--skip NAME]… | --self-test ('$1' is not one)"; exit 64 ;;
+  -*) say "usage: tools/mac-static.sh [--fresh] [BASE|--full] | --checks [--list] [--no-base] [--skip NAME]… | --self-test ('$1' is not one)"; exit 64 ;;
   *) BASE=$1; [ $# = 1 ] || { say "mac-static.sh: one optional BASE, got $#: $*"; exit 64; } ;;
 esac
+[ -n "$BASE" ] || MODE=full
 
 D=$HERE/target/mac-static
 mkdir -p "$D" || { say "mac-static.sh: cannot create $D"; exit 69; }
@@ -606,5 +711,6 @@ D=$(mktemp -d "$D/run.XXXXXX") || { say "mac-static.sh: cannot create a run dire
 echo "mac-static: results ${D#"$HERE/"}"
 CARGO=()
 while IFS= read -r w; do CARGO+=("$w"); done < <(combos_argv "$BASE" "$LEDGER")
-run_steps "$D" "$BASE" "${CARGO[@]}"
+job_lines "$BASE" "${CARGO[@]}" > "$D/jobs.tsv"
+run_jobs "$D" "$D/jobs.tsv" "$MODE" || true # a scheduler that ended early leaves its steps without rc files: the summary names them
 summarize "$D" "$BASE"
