@@ -71,6 +71,9 @@ trap 'rm -rf "$B"' EXIT
 blk_recipescheck() {
   python3 "$(dirname "$0")/recipes.py" check
 }
+blk_gateclass() {
+  python3 "$(dirname "$0")/gate_class.py" check
+}
 blk_selftest() {
   if ! python3 "$(dirname "$0")/recipes.py" --self-test; then
     echo "check-recipes: the recipes.py self-test failed" >&2
@@ -376,6 +379,7 @@ blk_pytools() {
     "tools/flow/q38_step.py --self-test"
     "tools/flow/q38width.py --self-test"
     "tools/flow/routes.py --self-test"
+    "tools/gate_class.py --self-test"
     "tools/gate-paths-merge.py --self-test"
     "tools/hf-arch-check.py --self-test"
     "tools/mac-disk.py --self-test"
@@ -1059,7 +1063,7 @@ proc_leg_gpu() {
 proc_leg
 unset CPU_GUARD_PROC_LEG
 
-BLOCKS=(recipescheck selftest smoke cardorder cardtests lease boxtracks unsafecount archscan loadscan commentscan leverscan loadgroups lcppfit coldblocks leverarms slotsarm binlabel lcppwarm q38srv
+BLOCKS=(recipescheck gateclass selftest smoke cardorder cardtests lease boxtracks unsafecount archscan loadscan commentscan leverscan loadgroups lcppfit coldblocks leverarms slotsarm binlabel lcppwarm q38srv
   maccheck gatebatch gpugate stackwatch ptxscan ptxspill scanargs narrowscan canoncheck ptxcompare ldsscan mutantrun macstatic macremote boxsh seedtarget carry releasebuild pytools boxqcodes fixturevariants fixturedirs dsparkread
   refsetpublish orphan archowner treecommit archivepipe fnowner wt boundedscan gatebound dumpdequant tokoracle ikpintree qdotrefargs)
 for b in "${BLOCKS[@]}"; do

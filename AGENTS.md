@@ -177,6 +177,10 @@ forced_exact count pin, the reference gates).
   print-only tests, no second test pinning what another pins. Removing a gate needs the same dated reason as relaxing
   one. Gate tests are `hw_`-prefixed and `#[ignore]`d (`.config/nextest.toml` fences them); the `just gate-*` recipes
   run them.
+- **Every `gate-*` recipe has a class row** in `tools/gate-class.tsv` (common, family or tooling; its family; the
+  common owners it covers, named in `tools/owners.tsv`), and every family a row in `tools/families.tsv` (rep R or F,
+  its own-file globs). `tools/gate_class.py check` (in `just check-recipes`) holds them to the justfile and the arch
+  registry. A new model's gates are `family` rows of an F family.
 - **Record lines have one owner:** a `Kind` in `crates/gpu-gates/src/record.rs`, rendered by `Record`, which panics by
   name on a value out of order, missing or of another type (`<bin> --records-schema` prints the kinds). Readers go
   through `tools/bloomery/records.py` by kind and field. `generate_ds41 --plan` prints the prompt call's records and
