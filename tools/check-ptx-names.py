@@ -5,7 +5,7 @@
     tools/check-ptx-names.py --self-test
 
 tools/ptx-spill-check.sh holds every entry a pinned binary carries to the row of tools/ref/ptx-shapes.tsv, but
-only on the box, after the three binaries are built and scanned: a kernel deleted without its row, or added
+only on the box, after the pinned binaries are built and scanned: a kernel deleted without its row, or added
 without one, passed every Mac check and went red inside a landing batch (train0211i, 2026-10-11, carried R5u's
 first commit without its pin commit: ds41_ffn_card_acc_10 unpinned, ds41_ffn_places_10_cols, q38_card_acc and
 qwen3moe_places stale). This check reads the same two sets from source:
@@ -40,14 +40,33 @@ not know are each a named refusal, never a skipped entry.
 Which tables, binaries and crates. The tables and binaries come from the `gate-ptx-spill` recipe's `ptx-spill-check.sh
 tools/ref/ptx-shapes.tsv [<table>...] <bin>[:<substring>]...` call (the one owner of what is pinned); BIN_CRATES
 names the device crates each links under the features the recipe builds it with (`generate_ds41`: gpu + deepseek41,
-`gate_e2e`: gpu, `gate_qwen3vl_tower`: vision = gpu + gpu-vision). A substring after `:` is ptx-scan's own entry
+`gate_qwen3vl_tower`: vision = gpu + gpu-vision). A substring after `:` is ptx-scan's own entry
 filter: the binary's expected entries are the crates' kernels that hold it. A binary in the recipe or the
 table that BIN_CRATES lacks is a refusal that says what to add.
 
+The covered binary. A binary the recipe does not scan, whose kernels the scanned ones carry, is pinned by the premise that
+it carries the same device code (COVERED: `gate_e2e`, whose entries are `generate_ds41`'s bloomery-gpu bundle again). The
+premise is derived, not listed: from the manifests, by a small resolver
+of cargo's feature rules over the workspace's path crates (`dep:`, `crate/feature`, optional dependencies, default
+features; a weak `crate?/feature` is a refusal), for the covered binary under its `[[bin]]` `required-features` and for every
+scanned binary under the `--features` of its `cargo oxide build` in the recipe. A device crate is a workspace crate whose
+source has a `#[kernel]` or `#[cuda_module]` line, or invokes a `macro_rules!` whose body has one. It fails:
+
+  <bin> <crate> not scanned (...)            the covered binary links a device crate no unfiltered scanned binary links (a
+                                             binary scanned for the entries holding a substring pins only those entries)
+  <bin> <crate> features differ (...)        every scanned binary that links it gives the crate other features
+  <bin> <file>:<line> declares a kernel ...  a `#[kernel]` or `#[cuda_module]` in the covered binary's own sources (its
+                                             bin file and the modules it names with `mod x;` / `#[path]`), which no
+                                             scanned binary compiles
+
 What it cannot see (the box scan still does):
-  - which crates a feature set links: BIN_CRATES is a map written beside the recipe, not derived from
-    crates/gpu-gates/Cargo.toml; a feature change that links one more kernel crate into a pinned binary shows
-    on the box as `unpinned`;
+  - which crates a recipe's feature set links, for the scanned binaries' own pins: BIN_CRATES is a map written beside the
+    recipe; a feature change that links one more kernel crate into a pinned binary shows on the box as `unpinned` (the
+    covered binary's guard above does read the manifests);
+  - the covered binary's guard compares the workspace crates' features, not those of an external crate (cuda-*, serde_json),
+    code behind `#[cfg(..)]` outside a kernel's own attributes, an `include!` (refused where it names a source of the
+    covered binary), or a build of the covered binary with more features than its `required-features` (the recipe never
+    scanned one);
   - a macro other than the one bound by a `KEY:` line, a `#[macro_export]` macro invoked from another crate, a
     kernel written by a proc macro (all named refusals where the text shows them, otherwise invisible);
   - the spill and jit_local values (the ratchet's own job) and whether the compiler emits an entry.
@@ -71,9 +90,13 @@ RECIPE = "gate-ptx-spill"
 # the gate-ptx-spill recipe builds it with.
 BIN_CRATES = {
     "generate_ds41": ("gpu", "gpu-deepseek41"),
-    "gate_e2e": ("gpu",),
     "gate_qwen3vl_tower": ("gpu", "gpu-vision"),
 }
+
+# The package that owns every pinned binary, and the binaries of it the recipe does not scan because the scanned ones carry
+# their device code (header: the covered binary).
+GATES_PKG = "bloomery-gpu-gates"
+COVERED = ("gate_e2e",)
 
 KERNEL_RE = re.compile(r"^#\[kernel(?:\(.*\))?\]")
 FN_RE = re.compile(
@@ -307,6 +330,300 @@ def recipe_call(justfile):
     return args[:n], [tuple(a.split(":", 1)) if ":" in a else (a, "") for a in args[n:]]
 
 
+def recipe_builds(justfile):
+    """bin -> the features of the `cargo oxide build` (or `cargo build`) that builds it in the gate-ptx-spill recipe: the
+    comma-separated words after `--features`, every `--bin` of the segment taking them. A bin built twice with other
+    features is a refusal (the second build would replace the first's file)."""
+    with open(justfile, encoding="utf-8") as fh:
+        lines = fh.read().split("\n")
+    at = [i for i, ln in enumerate(lines) if re.match(rf"^{re.escape(RECIPE)}\s*:", ln)]
+    if len(at) != 1:
+        raise Refuse(f"{justfile}: want one `{RECIPE}:` recipe, found {len(at)}")
+    body = []
+    for ln in lines[at[0] + 1:]:
+        if ln and not ln[0].isspace():
+            break
+        body.append(ln)
+    out = {}
+    for seg in re.findall(r"cargo (?:oxide )?build\b([^&']*)", "\n".join(body)):
+        words = seg.split()
+        feats = []
+        for i, w in enumerate(words):
+            if w == "--features" and i + 1 < len(words):
+                feats = [f for f in words[i + 1].split(",") if f]
+        for i, w in enumerate(words):
+            if w == "--bin" and i + 1 < len(words):
+                b = words[i + 1]
+                if b in out and out[b] != feats:
+                    raise Refuse(f"{justfile}: recipe {RECIPE} builds {b} with features {out[b]} and again with {feats}")
+                out[b] = feats
+    return out
+
+
+def read_toml(path):
+    import tomllib
+
+    with open(path, "rb") as fh:
+        try:
+            return tomllib.load(fh)
+        except tomllib.TOMLDecodeError as e:
+            raise Refuse(f"{path}: does not parse as TOML ({e})")
+
+
+def load_workspace(root):
+    """package name -> {dir, features, deps, bins} for every crates/*/Cargo.toml. A dependency is `pkg` (the workspace
+    crate it names by `path`, directly or through [workspace.dependencies]; None for an external one), `optional`,
+    `features` and `default`, keyed by the name the manifest and its [features] use. Dev and build dependencies are not
+    linked into a binary and are left out; a `[target.*.dependencies]` table counts whole."""
+    top = read_toml(os.path.join(root, "Cargo.toml"))
+    wdeps = top.get("workspace", {}).get("dependencies", {})
+    docs = {}
+    for path in sorted(glob.glob(os.path.join(root, "crates", "*", "Cargo.toml"))):
+        docs[os.path.dirname(path)] = read_toml(path)
+    by_dir = {}
+    for d, doc in docs.items():
+        if "name" not in doc.get("package", {}):
+            raise Refuse(f"{os.path.relpath(d, root)}/Cargo.toml has no [package] name")
+        by_dir[d] = doc["package"]["name"]
+    ws = {}
+    for d, doc in docs.items():
+        deps = {}
+        tables = [doc.get("dependencies", {})] + [v.get("dependencies", {}) for v in doc.get("target", {}).values()]
+        for table in tables:
+            for key, spec in table.items():
+                spec = {"version": spec} if isinstance(spec, str) else spec
+                base = wdeps.get(key, {}) if spec.get("workspace") else {}
+                base = {"version": base} if isinstance(base, str) else base
+                path = spec.get("path") or base.get("path")
+                anchor = d if spec.get("path") else root
+                deps[key] = {
+                    "pkg": by_dir.get(os.path.normpath(os.path.join(anchor, path))) if path else None,
+                    "optional": bool(spec.get("optional")),
+                    "features": [*base.get("features", []), *spec.get("features", [])],
+                    "default": spec.get("default-features", base.get("default-features", True)),
+                }
+        ws[by_dir[d]] = {
+            "dir": d,
+            "features": doc.get("features", {}),
+            "deps": deps,
+            "bins": {b["name"]: b for b in doc.get("bin", []) if "name" in b},
+        }
+    return ws
+
+
+def link_closure(ws, root_pkg, requested):
+    """{workspace crate: sorted features} for every crate a build of root_pkg with the `requested` features links, by cargo's
+    rules for a feature list: `feat` (a feature, or an optional dependency's implicit one), `dep:x`, `x/feat` (turns x on),
+    and an edge's own `features` and default features. `x?/feat` is a refusal."""
+    feats, linked = {}, set()
+
+    def link(name):
+        if name in linked:
+            return
+        linked.add(name)
+        feats.setdefault(name, set())
+        for dep in ws[name]["deps"].values():
+            if dep["pkg"] and not dep["optional"]:
+                use(dep)
+
+    def use(dep):
+        link(dep["pkg"])
+        for f in dep["features"]:
+            enable(dep["pkg"], f)
+        if dep["default"] and "default" in ws[dep["pkg"]]["features"]:
+            enable(dep["pkg"], "default")
+
+    def enable(name, f):
+        link(name)
+        p = ws[name]
+        if f in feats[name]:
+            return
+        if f in p["features"]:
+            feats[name].add(f)
+            for item in p["features"][f]:
+                if item.startswith("dep:"):
+                    activate(name, item[4:])
+                elif "/" in item:
+                    dk, sub = item.split("/", 1)
+                    if dk.endswith("?"):
+                        raise Refuse(f"{name}: feature `{f}` names `{item}`, a weak dependency feature this check does not resolve")
+                    activate(name, dk)
+                    if p["deps"][dk]["pkg"]:
+                        enable(p["deps"][dk]["pkg"], sub)
+                else:
+                    enable(name, item)
+        elif f in p["deps"] and p["deps"][f]["optional"] and not any(f"dep:{f}" in v for v in p["features"].values()):
+            feats[name].add(f)
+            activate(name, f)
+        else:
+            raise Refuse(f"{name}: feature `{f}` is declared by no [features] entry and no optional dependency")
+
+    def activate(name, key):
+        dep = ws[name]["deps"].get(key)
+        if dep is None:
+            raise Refuse(f"{name}: a feature names the dependency `{key}`, which its manifest does not declare")
+        if dep["pkg"]:
+            use(dep)
+
+    link(root_pkg)
+    if "default" in ws[root_pkg]["features"]:
+        enable(root_pkg, "default")
+    for f in requested:
+        enable(root_pkg, f)
+    return {n: sorted(feats[n]) for n in sorted(linked)}
+
+
+DEVICE_RE = re.compile(r"^#\[(?:kernel|cuda_module)\b")
+INCLUDE_RE = re.compile(r"\binclude!\s*\(")
+MOD_RE = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+(\w+)\s*;")
+PATH_RE = re.compile(r'^\s*#\[path\s*=\s*"([^"]+)"\s*\]')
+
+
+def device_lines(text):
+    """The 1-based lines that open a device item: a #[kernel] or #[cuda_module] line of its own, not in a comment."""
+    return [i for i, ln in enumerate(text.split("\n"), 1) if not ln.strip().startswith("//") and DEVICE_RE.match(ln.strip())]
+
+
+def crate_sources(root, ws, name):
+    """{relative path: text} of crates/<dir>/src/**/*.rs of workspace crate `name`."""
+    base = os.path.join(ws[name]["dir"], "src")
+    out = {}
+
+    def unlisted(e):  # a directory the walk cannot list is an unreadable input (main_check's exit 2), never skipped
+        raise e
+    for d, _, fs in os.walk(base, onerror=unlisted):
+        for f in sorted(fs):
+            if f.endswith(".rs"):
+                p = os.path.join(d, f)
+                with open(p, encoding="utf-8") as fh:
+                    out[os.path.relpath(p, root)] = fh.read()
+    return out
+
+
+def device_crates(root, ws, names):
+    """The crates among `names` that carry device code: a source with a #[kernel] or #[cuda_module] line, or one that
+    invokes a macro_rules! (of any crate in `names`) whose body has one (a family instantiated from another crate)."""
+    srcs = {n: crate_sources(root, ws, n) for n in names}
+    kernel_macros = set()
+    for files in srcs.values():
+        for text in files.values():
+            cur, body = None, []
+            for ln in text.split("\n"):
+                m = MACRO_RE.match(ln)
+                if m:
+                    cur, body = m.group(1), []
+                elif cur is not None:
+                    if ln.rstrip() == "}":
+                        if device_lines("\n".join(body)):
+                            kernel_macros.add(cur)
+                        cur = None
+                    else:
+                        body.append(ln)
+    out = set()
+    for n, files in srcs.items():
+        for text in files.values():
+            if device_lines(text) or any(re.search(rf"\b{re.escape(m)}!\s*\{{", text) for m in kernel_macros):
+                out.add(n)
+                break
+    return out
+
+
+def bin_sources(root, ws, pkg, bin_name):
+    """The files of one bin target: its root (the [[bin]] `path`, else src/bin/<name>.rs or src/bin/<name>/main.rs) and
+    every file it declares with `mod x;` (x.rs or x/mod.rs beside it) or `#[path = ".."] mod x;` (relative to the
+    declaring file). A `mod x;` that names no file, and an include!, are refusals."""
+    p = ws[pkg]
+    entry = p["bins"].get(bin_name, {})
+    base = p["dir"]
+    cands = [os.path.join(base, entry["path"])] if "path" in entry else [
+        os.path.join(base, "src", "bin", bin_name + ".rs"), os.path.join(base, "src", "bin", bin_name, "main.rs")]
+    top = next((c for c in cands if os.path.exists(c)), None)
+    if top is None:
+        raise Refuse(f"{pkg}: no source file for the bin `{bin_name}` (looked at {', '.join(os.path.relpath(c, root) for c in cands)})")
+    seen, order = set(), []
+
+    def walk(path, mod_dir):
+        if path in seen:
+            return
+        seen.add(path)
+        order.append(path)
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+        rel = os.path.relpath(path, root)
+        attr = None
+        for no, ln in enumerate(text.split("\n"), 1):
+            if ln.strip().startswith("//"):
+                continue
+            if INCLUDE_RE.search(ln):
+                raise Refuse(f"{rel}:{no}: an include! in a source of the covered binary `{bin_name}`: what it pulls in is not text this check reads")
+            m = PATH_RE.match(ln)
+            if m:
+                attr = m.group(1)
+                continue
+            m = MOD_RE.match(ln)
+            if m:
+                if attr:
+                    child = os.path.normpath(os.path.join(os.path.dirname(path), attr))
+                    nested = os.path.dirname(child)
+                else:
+                    near = [os.path.join(mod_dir, m.group(1) + ".rs"), os.path.join(mod_dir, m.group(1), "mod.rs")]
+                    child = next((c for c in near if os.path.exists(c)), None)
+                    if child is None:
+                        raise Refuse(f"{rel}:{no}: `mod {m.group(1)};` names no file ({', '.join(os.path.relpath(c, root) for c in near)})")
+                    nested = os.path.dirname(child) if os.path.basename(child) == "mod.rs" else os.path.splitext(child)[0]
+                if not os.path.exists(child):
+                    raise Refuse(f"{rel}:{no}: `mod {m.group(1)};` names the file {os.path.relpath(child, root)}, which is not there")
+                walk(child, nested)
+            if ln.strip():
+                attr = None
+
+    walk(top, os.path.dirname(top))
+    return [os.path.relpath(f, root) for f in order]
+
+
+def covered_problems(root, bins, builds):
+    """(violation lines, summary) of the covered binaries' premise (header: the covered binary)."""
+    root = os.path.abspath(root)
+    ws = load_workspace(root)
+    if GATES_PKG not in ws:
+        raise Refuse(f"{GATES_PKG}: no crates/*/Cargo.toml names this package")
+    scanned = {}
+    for b, flt in bins:
+        if flt:
+            continue  # scanned for the entries holding a substring: it pins those, not the crates' other kernels
+        if b not in builds:
+            raise Refuse(f"{b}: the {RECIPE} recipe scans this binary and has no `cargo oxide build ... --features .. --bin {b}` for it")
+        scanned[b] = link_closure(ws, GATES_PKG, builds[b])
+    covered = {}
+    for b in COVERED:
+        entry = ws[GATES_PKG]["bins"].get(b)
+        if entry is None:
+            raise Refuse(f"{GATES_PKG}: COVERED names the bin `{b}`, which crates/*/Cargo.toml does not declare")
+        covered[b] = link_closure(ws, GATES_PKG, entry.get("required-features", []))
+    names = {n for m in [*scanned.values(), *covered.values()] for n in m} - {GATES_PKG}
+    carriers = device_crates(root, ws, sorted(names))
+    problems, shown = [], []
+    for b, linked in covered.items():
+        for crate in sorted(c for c in linked if c in carriers):
+            mine = linked[crate]
+            same = [s for s, m in scanned.items() if m.get(crate) == mine]
+            if same:
+                shown.append(f"{crate} by {same[0]}")
+                continue
+            others = {s: m[crate] for s, m in scanned.items() if crate in m}
+            if others:
+                theirs = "; ".join(f"{s}: [{','.join(f)}]" for s, f in sorted(others.items()))
+                problems.append(f"{b} {crate} features differ ({b}: [{','.join(mine)}]; {theirs})")
+            else:
+                problems.append(f"{b} {crate} not scanned ({b} links it with features [{','.join(mine)}]; "
+                                f"no unfiltered binary of the recipe links it)")
+        for rel in bin_sources(root, ws, GATES_PKG, b):
+            with open(os.path.join(root, rel), encoding="utf-8") as fh:
+                for no in device_lines(fh.read()):
+                    problems.append(f"{b} {rel}:{no} declares a kernel (a source only {b} compiles: no scanned binary carries it)")
+    return problems, f"{', '.join(COVERED)} covered ({', '.join(shown) or 'no device crate'})"
+
+
 def check(root):
     """(violation lines, summary) for the tree under root. Raises Refuse for a thing it cannot read."""
     others, bins = recipe_call(os.path.join(root, JUSTFILE))
@@ -352,7 +669,9 @@ def check(root):
             for e in sorted(set(brows.get(b, {})) - set(decl[b])):
                 problems.append(f"{b} {e} stale ({rel})")
     tail = f"; {len(tables)} tables beside it read for stale rows" if tables else ""
-    return problems, f"{len(bins)} binaries, {nrows} rows = {ndecl} declared entries{tail}"
+    more, covered = covered_problems(root, bins, recipe_builds(os.path.join(root, JUSTFILE)))
+    problems += more
+    return problems, f"{len(bins)} binaries, {nrows} rows = {ndecl} declared entries{tail}; {covered}"
 
 
 def main_check(root):
@@ -368,7 +687,8 @@ def main_check(root):
         print(p)
     if problems:
         print(f"check-ptx-names: {len(problems)} violation(s) against {TABLE} — a deleted kernel's row goes with it, "
-              f"an added kernel's row is pinned in the same change (tools/ptx-spill-check.sh header)")
+              f"an added kernel's row is pinned in the same change (tools/ptx-spill-check.sh header); a line that names a covered "
+              f"binary is the premise of this file's header, «The covered binary»")
         return 1
     print(f"check-ptx-names: ok ({summary})")
     return 0
@@ -512,18 +832,91 @@ gate-other:
     echo other
 
 gate-ptx-spill:
-    ./tools/box.sh 'cargo oxide build && bash tools/ptx-spill-check.sh tools/ref/ptx-shapes.tsv generate_ds41 gate_e2e gate_qwen3vl_tower:vis_'
+    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu,deepseek41 --release --bin generate_ds41 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features vision --release --bin gate_qwen3vl_tower --bin oxart_jit && bash tools/ptx-spill-check.sh tools/ref/ptx-shapes.tsv generate_ds41 gate_qwen3vl_tower:vis_'
 
 gate-after:
     echo after
 """
+
+ROOT_TOML = """\
+[workspace]
+members = ["crates/gpu", "crates/gpu-deepseek41", "crates/gpu-vision", "crates/app", "crates/gpu-gates"]
+
+[workspace.dependencies]
+cuda-device = "0.2"
+"""
+
+GPU_TOML = """\
+[package]
+name = "bloomery-gpu"
+
+[dependencies]
+cuda-device.workspace = true
+"""
+
+DS_TOML = """\
+[package]
+name = "bloomery-gpu-deepseek41"
+
+[dependencies]
+cuda-device.workspace = true
+bloomery-gpu = { path = "../gpu" }
+"""
+
+VIS_TOML = DS_TOML.replace("deepseek41", "vision")
+
+APP_TOML = """\
+[package]
+name = "bloomery-app"
+
+[dependencies]
+bloomery-gpu = { path = "../gpu" }
+bloomery-gpu-deepseek41 = { path = "../gpu-deepseek41", optional = true }
+
+[features]
+dspark = []
+deepseek41 = ["dep:bloomery-gpu-deepseek41", "dspark"]
+"""
+
+GATES_TOML = """\
+[package]
+name = "bloomery-gpu-gates"
+
+[dependencies]
+bloomery-gpu = { path = "../gpu", optional = true }
+bloomery-gpu-deepseek41 = { path = "../gpu-deepseek41", optional = true }
+bloomery-gpu-vision = { path = "../gpu-vision", optional = true }
+bloomery-app = { path = "../app", optional = true }
+
+[features]
+gpu = ["dep:bloomery-gpu", "dep:bloomery-app", "bloomery-app/dspark"]
+deepseek41 = ["gpu", "dep:bloomery-gpu-deepseek41", "bloomery-app/deepseek41"]
+vision = ["gpu", "dep:bloomery-gpu-vision"]
+
+[[bin]]
+name = "generate_ds41"
+required-features = ["deepseek41"]
+
+[[bin]]
+name = "gate_e2e"
+required-features = ["gpu"]
+
+[[bin]]
+name = "gate_qwen3vl_tower"
+required-features = ["vision"]
+"""
+
+E2E_RS = "fn main() {}\n"
+
+# A crate that carries kernels only through the macro `x_router_instance!` that GPU_RS defines (the glm5next and mimo2 shape).
+MIMO_TOML = DS_TOML.replace("deepseek41", "mimo2")
+MIMO_RS = "bloomery_gpu::x_router_instance! {\n    pub mod xi {\n        entries: m_router, m_scores,\n    }\n}\n"
 
 BESIDE_FIXTURE = "tools/ref/ptx-shapes/sm_121-cc12.1.tsv"
 BESIDE_DIR = "tools/ref/ptx-shapes/"
 
 TABLE_ROWS = {
     "generate_ds41": ["k_one", "k_two_8", "alpha_router", "alpha_scores", "beta_router", "beta_scores", "ds_plain"],
-    "gate_e2e": ["k_one", "k_two_8"],
     "gate_qwen3vl_tower": ["vis_one", "vis_two"],
 }
 
@@ -540,15 +933,26 @@ def table_text(rows):
     return "\n".join(out) + "\n"
 
 
-def write_fixture(root, gpu=GPU_RS, ds=DS_RS, vis=VIS_RS, justfile=JUSTFILE_TXT, rows=TABLE_ROWS, table=None, beside=None):
+def write_fixture(root, gpu=GPU_RS, ds=DS_RS, vis=VIS_RS, justfile=JUSTFILE_TXT, rows=TABLE_ROWS, table=None, beside=None,
+                  gates=GATES_TOML, gpu_toml=GPU_TOML, app=APP_TOML, e2e=E2E_RS, extra=()):
     if beside is not None:
         justfile = justfile.replace(f"{TABLE} ", f"{TABLE} {BESIDE_DIR} ")
     for rel, text in (*(((BESIDE_FIXTURE, beside),) if beside is not None else ()),
         ("crates/gpu/src/lib.rs", gpu),
         ("crates/gpu-deepseek41/src/router.rs", ds),
         ("crates/gpu-vision/src/vis.rs", vis),
+        ("Cargo.toml", ROOT_TOML),
+        ("crates/gpu/Cargo.toml", gpu_toml),
+        ("crates/gpu-deepseek41/Cargo.toml", DS_TOML),
+        ("crates/gpu-vision/Cargo.toml", VIS_TOML),
+        ("crates/app/Cargo.toml", app),
+        ("crates/app/src/lib.rs", "pub fn app() {}\n"),
+        ("crates/gpu-gates/Cargo.toml", gates),
+        ("crates/gpu-gates/src/lib.rs", "pub fn gates() {}\n"),
+        ("crates/gpu-gates/src/bin/gate_e2e.rs", e2e),
         (JUSTFILE, justfile),
         (TABLE, table if table is not None else table_text(rows)),
+        *extra,
     ):
         p = os.path.join(root, rel)
         os.makedirs(os.path.dirname(p), exist_ok=True)
@@ -579,15 +983,15 @@ def self_test():
 
     try:
         out = run("green: every row declared, every declared entry pinned (macro names and the filter included)", 0, [])
-        if "3 binaries, 11 rows = 11 declared entries" not in out:
+        if "2 binaries, 9 rows = 9 declared entries" not in out or "gate_e2e covered (bloomery-gpu by generate_ds41)" not in out:
             fails.append(f"green summary: {out!r}")
         # stale: a kernel deleted from source, its row left.
-        run("stale: a deleted kernel's row", 1, ["generate_ds41 k_two_8 stale", "gate_e2e k_two_8 stale"],
+        run("stale: a deleted kernel's row", 1, ["generate_ds41 k_two_8 stale"],
             gpu=GPU_RS.replace("    #[kernel]\n    pub fn k_two_8(a: &[u32]) {}\n", ""))
         # unpinned: a kernel added without its row (in each of the binary's crates).
         gpu2 = GPU_RS.replace("pub fn k_two_8(a: &[u32]) {}\n", "pub fn k_two_8(a: &[u32]) {}\n\n    #[kernel]\n    pub fn k_new() {}\n")
         at = f"crates/gpu/src/lib.rs:{line_of(gpu2, 'pub fn k_new') - 1}"
-        run("unpinned: an added kernel with no row", 1, [f"generate_ds41 k_new unpinned ({at})", f"gate_e2e k_new unpinned ({at})"], gpu=gpu2)
+        run("unpinned: an added kernel with no row", 1, [f"generate_ds41 k_new unpinned ({at})"], gpu=gpu2)
         ds2 = DS_RS + "\n#[kernel]\npub fn ds_new() {}\n"
         run("unpinned: a kernel of the V4.1 crate lands on generate_ds41 only", 1,
             [f"generate_ds41 ds_new unpinned (crates/gpu-deepseek41/src/router.rs:{line_of(ds2, 'pub fn ds_new') - 1})"], ds=ds2)
@@ -637,7 +1041,7 @@ def self_test():
         if "is followed by `struct S;`, not a fn" not in out:
             fails.append(f"kernel then struct: {out!r}")
         out = run("refusal: a pinned binary BIN_CRATES lacks", 1, [],
-                  justfile=JUSTFILE_TXT.replace("gate_e2e", "gate_new"))
+                  justfile=JUSTFILE_TXT.replace(" gate_qwen3vl_tower:vis_'", " gate_new'"))
         if "gate_new: the gate-ptx-spill recipe pins this binary and BIN_CRATES" not in out:
             fails.append(f"unknown binary: {out!r}")
         out = run("table: a binary the recipe does not run", 1, ["gate_old: the table pins this binary, the gate-ptx-spill recipe does not run it"],
@@ -660,6 +1064,63 @@ def self_test():
         out = run("refusal: a malformed table row", 1, [], table="generate_ds41 k_one 0\n")
         if "want `<binary> <entry> <spill> <jit_local>`, got 3 fields" not in out:
             fails.append(f"malformed row: {out!r}")
+        # the covered binary (header): its device crates, their features and its own sources against the scanned binaries'.
+        # A feature on bloomery-gpu that only gate_e2e's feature set turns on: its build compiles a kernel set no scanned binary does.
+        wide_gpu = GPU_TOML + "\n[features]\nwide = []\n"
+        wide_e2e = GATES_TOML.replace('name = "gate_e2e"\nrequired-features = ["gpu"]', 'name = "gate_e2e"\nrequired-features = ["e2e-wide"]'
+                                      ).replace('vision = ["gpu", "dep:bloomery-gpu-vision"]',
+                                                'vision = ["gpu", "dep:bloomery-gpu-vision"]\ne2e-wide = ["gpu", "bloomery-gpu/wide"]')
+        run("covered: a feature only gate_e2e's set turns on", 1,
+            ["gate_e2e bloomery-gpu features differ (gate_e2e: [wide]; generate_ds41: [])"], gates=wide_e2e, gpu_toml=wide_gpu)
+        # ...and the other way: a scanned binary's set turns it on and gate_e2e's does not, so gate_e2e's kernels are not the pinned ones.
+        wide_ds = GATES_TOML.replace('deepseek41 = ["gpu",', 'deepseek41 = ["gpu", "bloomery-gpu/wide",')
+        run("covered: a feature only the scanned binary's set turns on", 1,
+            ["gate_e2e bloomery-gpu features differ (gate_e2e: []; generate_ds41: [wide])"], gates=wide_ds, gpu_toml=wide_gpu)
+        # A device crate gate_e2e links that the one scanned binary pinning only a substring of its entries links: not covered.
+        vis_e2e = GATES_TOML.replace('name = "gate_e2e"\nrequired-features = ["gpu"]', 'name = "gate_e2e"\nrequired-features = ["vision"]')
+        run("covered: a device crate only a filtered scan links", 1,
+            ["gate_e2e bloomery-gpu-vision not scanned (gate_e2e links it with features []; no unfiltered binary of the recipe links it)"],
+            gates=vis_e2e)
+        # A crate with no #[kernel] line of its own that instantiates a kernel macro of another crate is a device crate too.
+        mimo_gates = GATES_TOML.replace('bloomery-app = { path = "../app", optional = true }\n',
+                                        'bloomery-app = { path = "../app", optional = true }\nbloomery-gpu-mimo2 = { path = "../gpu-mimo", optional = true }\n'
+                                        ).replace('name = "gate_e2e"\nrequired-features = ["gpu"]', 'name = "gate_e2e"\nrequired-features = ["mimo2"]'
+                                                  ).replace('vision = ["gpu", "dep:bloomery-gpu-vision"]',
+                                                            'vision = ["gpu", "dep:bloomery-gpu-vision"]\nmimo2 = ["gpu", "dep:bloomery-gpu-mimo2"]')
+        mimo = (("crates/gpu-mimo/Cargo.toml", MIMO_TOML), ("crates/gpu-mimo/src/lib.rs", MIMO_RS))
+        run("covered: a crate whose kernels come from a macro of another crate", 1,
+            ["gate_e2e bloomery-gpu-mimo2 not scanned (gate_e2e links it with features []; no unfiltered binary of the recipe links it)"],
+            gates=mimo_gates, extra=mimo)
+        # A kernel in a source only gate_e2e compiles: the bin file itself, and a file it names with #[path].
+        run("covered: a #[kernel] in gate_e2e's own file", 1,
+            ["gate_e2e crates/gpu-gates/src/bin/gate_e2e.rs:2 declares a kernel (a source only gate_e2e compiles: no scanned binary carries it)"],
+            e2e="fn main() {}\n#[kernel]\npub fn e2e_only() {}\n")
+        run("covered: a #[cuda_module] in a module gate_e2e names with #[path]", 1,
+            ["gate_e2e crates/gpu-gates/src/bin/shared/e2e_k.rs:2 declares a kernel (a source only gate_e2e compiles: no scanned binary carries it)"],
+            e2e='#[path = "shared/e2e_k.rs"]\nmod e2e_k;\nfn main() {}\n',
+            extra=(("crates/gpu-gates/src/bin/shared/e2e_k.rs", "// shared\n#[cuda_module]\nmod m {}\n"),))
+        run("covered: a #[kernel] in a comment of gate_e2e's file is no kernel", 0, [], e2e="// #[kernel]\nfn main() {}\n")
+        out = run("refusal: a `mod x;` of gate_e2e that names no file", 1, [], e2e="mod gone;\nfn main() {}\n")
+        if "`mod gone;` names no file" not in out:
+            fails.append(f"missing module: {out!r}")
+        out = run("refusal: an include! in gate_e2e", 1, [], e2e='include!("x.rs");\nfn main() {}\n')
+        if "an include! in a source of the covered binary `gate_e2e`" not in out:
+            fails.append(f"include!: {out!r}")
+        out = run("refusal: a weak dependency feature", 1, [], gates=GATES_TOML.replace('"bloomery-app/dspark"', '"bloomery-app?/dspark"'))
+        if "a weak dependency feature this check does not resolve" not in out:
+            fails.append(f"weak feature: {out!r}")
+        out = run("refusal: a scanned binary the recipe has no build for", 1, [],
+                  justfile=JUSTFILE_TXT.replace("--bin generate_ds41", "--bin generate_other"))
+        if "generate_ds41: the gate-ptx-spill recipe scans this binary and has no `cargo oxide build" not in out:
+            fails.append(f"no build: {out!r}")
+        out = run("refusal: a binary built twice with other features", 1, [],
+                  justfile=JUSTFILE_TXT.replace("--bin oxart_jit", "--bin oxart_jit && cargo build --features gpu --bin gate_qwen3vl_tower"))
+        if "builds gate_qwen3vl_tower with features ['vision'] and again with ['gpu']" not in out:
+            fails.append(f"built twice: {out!r}")
+        out = run("refusal: a covered binary the manifest does not declare", 1, [],
+                  gates=GATES_TOML.replace('name = "gate_e2e"', 'name = "gate_e2f"'))
+        if "COVERED names the bin `gate_e2e`" not in out:
+            fails.append(f"undeclared covered bin: {out!r}")
         # an unreadable tree is rc 2, not a pass.
         empty = tempfile.mkdtemp(dir=top)
         import io
