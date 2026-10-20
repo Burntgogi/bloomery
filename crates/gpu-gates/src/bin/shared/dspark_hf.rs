@@ -1,7 +1,7 @@
 //! The loader of a DSpark draft kept as a Hugging Face directory (`config.json` and `model.safetensors`),
 //! for the binaries that run one beside a target: Qwen3.6's RedHat speculator today.
 //!
-//! [`open`] reads the geometry through `hf::dspark`, the weights through `hf::safetensors` (a mapping:
+//! [`open`] reads the geometry through `hf::dspark`, the weights through `safetensors` (a mapping:
 //! the 1.9 GB file is never read into memory at once), and builds what the card-side owner takes:
 //! [`DenseLayers`] (its matrices Q8_0, quantized from the file's bf16 on the host), [`FcWeights`], the
 //! head ([`HeadWeights`] with its own Q8_0 `lm_head`) and the host embedding table. The Markov tables
@@ -20,8 +20,8 @@ use bloomery_gpu::{DeviceTensor, Gpu, GpuError};
 use bloomery_gpu_gates::GateError;
 use cuda_core::DeviceBuffer;
 use hf::dspark as config;
-use hf::safetensors::Safetensors;
 use runtime::dspark::{DraftVocab, DsparkShape};
+use safetensors::Safetensors;
 
 /// The name the draft's card bytes carry as a reserve of the target's plan.
 pub const RESERVE: &str = "dspark draft";

@@ -8,7 +8,7 @@
 //!
 //! [`json`] reads a request as Python does, [`render`] writes JSON as Python does, [`request`]
 //! validates (under the model's [`request::Rules`]), [`encode`] builds Clef's ids, [`head`] runs Clef's head
-//! (and, under the `safetensors` feature, loads the release's file through `hf::safetensors`), [`gguf_head`]
+//! (and, under the `safetensors` feature, loads the release's file through `safetensors`), [`gguf_head`]
 //! reads it from a model file that carries it (llama.cpp's Clef layout), [`rows`] gives either model its
 //! output embedding rows from a GGUF file, [`answer`] builds the shared parts of a body, [`label`] the
 //! label models', [`generative`] asks a generative model the request and reads its decisions as answers;
@@ -126,9 +126,9 @@ pub enum Error {
 }
 
 #[cfg(feature = "safetensors")]
-impl From<hf::safetensors::Error> for Error {
-    fn from(e: hf::safetensors::Error) -> Error {
-        use hf::safetensors::Error as E;
+impl From<safetensors::Error> for Error {
+    fn from(e: safetensors::Error) -> Error {
+        use safetensors::Error as E;
         match e {
             E::Io(path, e) => Error::Io(path, e),
             E::Format(what) => Error::Safetensors(what),

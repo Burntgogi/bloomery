@@ -29,8 +29,8 @@ use gguf::write::{Layout, TensorDecl, Writer};
 use gguf::{GgmlType, Value};
 use hf::modelopt::{self, Normal, Plain, Use};
 use hf::quant_config::{self, Config, Format};
-use hf::safetensors::{Dtype, Folder};
 use model_hf::arch::qwen35moe::{Checkpoint, Mapped};
+use safetensors::{Dtype, Folder};
 
 const USAGE: &str = "usage: prepare <folder> <out prefix> [--shard-gib <n>] [--keep-bf16]";
 

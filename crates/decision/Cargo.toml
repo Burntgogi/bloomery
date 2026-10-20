@@ -27,7 +27,7 @@ workspace = true
 
 [dependencies]
 bloomery-gguf = { path = "../gguf" }
-bloomery-hf = { path = "../hf", optional = true }
+bloomery-safetensors = { path = "../safetensors", optional = true }
 bloomery-jinja = { path = "../jinja" }
 bloomery-tokenizer = { path = "../tokenizer" }
 bloomery-vision = { path = "../vision" }
@@ -40,7 +40,7 @@ matrixmultiply.workspace = true
 
 [features]
 # The release's head file (`joint_head.safetensors`): `ClefHead::open`, `from_safetensors` and the
-# `Weights` impl over `hf::safetensors`. The request, answer, encode, generative, label, render and rows
+# `Weights` impl over `safetensors`. The request, answer, encode, generative, label, render and rows
 # code reads no checkpoint, so a crate that only serves a request (`bloomery-serve`) leaves it off and
-# its builds do not key `bloomery-hf`.
-safetensors = ["dep:bloomery-hf"]
+# its builds do not key `bloomery-safetensors`.
+safetensors = ["dep:bloomery-safetensors"]

@@ -312,7 +312,7 @@ impl Safetensors {
 
 /// The values of the tensor `name` stored as `raw`, converted to f32. BF16, F16 and F32 convert
 /// exactly; any other dtype is refused by name.
-pub(crate) fn f32_values(name: &str, raw: &Raw<'_>) -> Result<Vec<f32>, Error> {
+pub fn f32_values(name: &str, raw: &Raw<'_>) -> Result<Vec<f32>, Error> {
     Ok(match raw.dtype {
         Dtype::Bf16 => raw
             .bytes
@@ -668,7 +668,7 @@ mod tests {
     #[test]
     fn a_modelopt_shard_slice_opens_with_u8_and_f8_e4m3_held_raw() {
         let st = Safetensors::parse(
-            include_bytes!("../tests/fixtures/modelopt-nvfp4.safetensors").to_vec(),
+            include_bytes!("../../hf/tests/fixtures/modelopt-nvfp4.safetensors").to_vec(),
         )
         .unwrap();
         let stem = "model.language_model.layers.0.mlp.experts.0.gate_proj";
@@ -938,7 +938,7 @@ mod tests {
         let d = Dir::new("real");
         let fixture = |name: &str| {
             std::fs::read(format!(
-                "{}/tests/fixtures/checkpoint-headers/{name}",
+                "{}/../hf/tests/fixtures/checkpoint-headers/{name}",
                 env!("CARGO_MANIFEST_DIR")
             ))
             .unwrap()

@@ -2462,8 +2462,8 @@ def cmd_why(args: argparse.Namespace) -> int:
 # dependency a feature turns on only for the binaries that need it, a crate the common code does not name) is the
 # gap; a commit that touches the crate then re-runs every gate that merely links it.
 KEY_REACH_PINS = {
-    "bloomery-hf": "a Hugging Face fetch or checkpoint reader: its commits move only the gates whose targets run its code (model-hf, "
-    "gpu-gates under the `hf` feature, decision under its `safetensors` feature)",
+    "bloomery-hf": "a Hugging Face fetch or checkpoint configuration reader: its commits move only the gates whose targets run its code "
+    "(model-hf and gpu-gates under the `hf` feature)",
     "bloomery-model-hf": "the fixture fetch and GLM's checkpoint map: gpu-gates links it under the `glm5next-hf` feature, for generate_glm5next alone",
 }
 
@@ -10724,6 +10724,12 @@ def key_reach_self_test(expect, side: Side) -> None:
     chain = why_chains(side, "gate-gpu-glm5next-twocard", "crates/hf/src/lib.rs")
     expect(any(c.endswith("generate_glm5next: bloomery-gpu-gates -> bloomery-hf") for c in chain), f"why: gate-gpu-glm5next-twocard's chain to hf is {chain}")
     expect(why_chains(side, "gate-hf", "crates/hf/src/lib.rs") == ["bloomery-hf libtest: its own package"], f"why: gate-hf's chain to hf is {why_chains(side, 'gate-hf', 'crates/hf/src/lib.rs')}")
+    for name in ("gate-decision-clef", "gate-decision-lev"):
+        expect(side.graph.inputs(name).match("crates/hf/src/lib.rs") is None, f"{name} keys unrelated hub code")
+    expect(
+        side.graph.inputs("gate-decision-clef").match("crates/safetensors/src/lib.rs") is not None,
+        "the feature-on decision gate must key its mapped head reader",
+    )
 
 
 def reach_self_test(expect, side: Side, row, stats: dict[str, int]) -> None:
@@ -12256,7 +12262,7 @@ def _st_host_crates(fails: list[str], side: Side) -> None:
     real = dict(pure_crates(tree, load_lock(tree.root)))
     pure_now = sorted(n for n, w in real.items() if not w)
     expect(
-        pure_now == ["bloomery-decision", "bloomery-embed", "bloomery-hf", "bloomery-jinja", "bloomery-levers", "bloomery-models", "bloomery-placement", "bloomery-refset", "bloomery-runtime", "bloomery-sampler", "bloomery-serve", "bloomery-tokenizer", "bloomery-verbs", "bloomery-vision"],
+        pure_now == ["bloomery-decision", "bloomery-embed", "bloomery-hf", "bloomery-jinja", "bloomery-levers", "bloomery-models", "bloomery-placement", "bloomery-refset", "bloomery-runtime", "bloomery-safetensors", "bloomery-sampler", "bloomery-serve", "bloomery-tokenizer", "bloomery-verbs", "bloomery-vision"],
         f"pure: the real tree's pure crates are {pure_now} — a new member of the set is proven by `just mac-test` before this list takes it",
     )
     expect(any("crates/gguf/src/lib.rs:" in w and "RUSAGE_THREAD" in w for w in real.get("bloomery-gguf", [])), f"pure: gguf's reason {real.get('bloomery-gguf')}")
@@ -12268,12 +12274,13 @@ def _st_host_crates(fails: list[str], side: Side) -> None:
     host_now = [n for n, _ in host_crates(tree, lock_now)]
     # PIN(2026-10-20): bloomery-model-hf joined with the tests it took out of bloomery-model (the fixture fetch's, the GLM checkpoint
     # map's), which the nightly ran as part of that crate.
+    # PIN(2026-10-21): safetensors keeps the mapped reader's fixture tests previously run by bloomery-hf.
     expect(
         host_now
         == [
             "bloomery-app", "bloomery-decision", "bloomery-embed", "bloomery-engram", "bloomery-engram-lab", "bloomery-gguf", "bloomery-hf", "bloomery-jinja",
             "bloomery-levers", "bloomery-model", "bloomery-model-hf", "bloomery-models", "bloomery-placement", "bloomery-qdot", "bloomery-refset", "bloomery-runtime",
-            "bloomery-sampler", "bloomery-serve", "bloomery-threads", "bloomery-tokenizer", "bloomery-verbs",
+            "bloomery-safetensors", "bloomery-sampler", "bloomery-serve", "bloomery-threads", "bloomery-tokenizer", "bloomery-verbs",
             "bloomery-vision",
         ],
         f"host nightly: the real tree's set is {host_now} — a new member of the set is proven by a nightly run before this list takes it",

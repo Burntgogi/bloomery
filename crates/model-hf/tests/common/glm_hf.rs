@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::io::Read;
 
 use hf::quant_config::{Config, plan};
-use hf::safetensors::Dtype;
+use safetensors::Dtype;
 use serde_json::Value;
 
 use super::{Geometry, Layout};

@@ -88,8 +88,8 @@ name = "bloomery-decision"
 version = "0.1.0"
 dependencies = [
  "bloomery-gguf",
- "bloomery-hf",
  "bloomery-jinja",
+ "bloomery-safetensors",
  "bloomery-tokenizer",
  "bloomery-vision",
  "matrixmultiply",
@@ -195,6 +195,7 @@ dependencies = [
  "bloomery-qdot",
  "bloomery-refset",
  "bloomery-runtime",
+ "bloomery-safetensors",
  "bloomery-sampler",
  "bloomery-serve",
  "bloomery-threads",
@@ -295,8 +296,8 @@ version = "0.1.0"
 dependencies = [
  "bloomery-gguf",
  "bloomery-runtime",
+ "bloomery-safetensors",
  "flate2",
- "memmap2",
  "regex",
  "serde_json",
  "sha1",
@@ -342,6 +343,7 @@ dependencies = [
  "bloomery-hf",
  "bloomery-model",
  "bloomery-refset",
+ "bloomery-safetensors",
  "bloomery-tokenizer",
  "flate2",
  "libc",
@@ -392,6 +394,17 @@ name = "bloomery-runtime"
 version = "0.1.0"
 dependencies = [
  "bloomery-models",
+]
+
+[[package]]
+name = "bloomery-safetensors"
+version = "0.1.0"
+dependencies = [
+ "bloomery-gguf",
+ "flate2",
+ "memmap2",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]

@@ -19,10 +19,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use hf::quant_config::{self, Config, Format};
-use hf::safetensors::{Dtype, Folder};
 use model::arch::glm5next::names::{self, Sub};
 use model::arch::glm5next::{roles, tp};
 use model::placement::tp::{TpTensor, card_blocks};
+use safetensors::{Dtype, Folder};
 use serde_json::Value;
 
 /// Why the checkpoint was refused.
@@ -33,7 +33,7 @@ pub enum Error {
     #[error("glm5next hf: {name}: {what}")]
     Tensor { name: String, what: String },
     #[error("glm5next hf: {0}")]
-    Folder(#[from] hf::safetensors::Error),
+    Folder(#[from] safetensors::Error),
     #[error("glm5next hf: {0}")]
     Quant(#[from] quant_config::Error),
 }
@@ -173,7 +173,7 @@ pub fn map<'a>(
         }
     }
     for ((l, proj), by_id) in experts {
-        let (sources, dims) = ::hf::safetensors::expert_stack(&by_id, g.experts)?;
+        let (sources, dims) = safetensors::expert_stack(&by_id, g.experts)?;
         let glm = match proj {
             "gate_proj" => names::ffn_gate_exps(l),
             "up_proj" => names::ffn_up_exps(l),
@@ -932,11 +932,7 @@ mod tests {
                 .zip(&data)
                 .map(|((n, s), d)| (n.as_str(), "F32", s.as_slice(), d.as_slice()))
                 .collect();
-            std::fs::write(
-                dir.join("model.safetensors"),
-                hf::safetensors::write(&entries),
-            )
-            .unwrap();
+            std::fs::write(dir.join("model.safetensors"), safetensors::write(&entries)).unwrap();
             let weights: BTreeMap<_, _> = kept
                 .iter()
                 .map(|(n, _)| (n.as_str(), "model.safetensors"))

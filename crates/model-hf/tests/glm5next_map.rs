@@ -5,8 +5,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use hf::quant_config::Config;
-use hf::safetensors::Dtype;
 use model_hf::arch::glm5next::{Geometry, Layout, map};
+use safetensors::Dtype;
 
 #[path = "common/glm_hf.rs"]
 mod hf_support;
@@ -91,8 +91,8 @@ fn hw_glm_map_matches_the_unsloth_gguf() {
     );
     println!("names and dims equal: {} tensors", dims.len());
 
-    let small = hf::safetensors::Safetensors::open(&set.dir.join(HF)).unwrap();
-    let gguf = hf::safetensors::Safetensors::open(&set.dir.join(GGUF)).unwrap();
+    let small = safetensors::Safetensors::open(&set.dir.join(HF)).unwrap();
+    let gguf = safetensors::Safetensors::open(&set.dir.join(GGUF)).unwrap();
     let held: BTreeSet<&str> = gguf.names().collect();
     let required: BTreeSet<&str> = got
         .keys()

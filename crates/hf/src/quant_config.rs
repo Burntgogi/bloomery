@@ -23,8 +23,8 @@ use gguf::GgmlType;
 use regex::Regex;
 use serde_json::Value;
 
-use crate::safetensors::Dtype;
 use crate::schema::{self, Fields, Rule::Read};
+use safetensors::Dtype;
 
 /// Why a config or a tensor was refused.
 #[derive(Debug, thiserror::Error)]
@@ -1497,10 +1497,10 @@ mod tests {
     #[test]
     fn real_fp8_rows_decode_to_their_producers_rule() {
         use gguf::quant::dequant_row;
+        use safetensors::Safetensors;
         use sha2::{Digest, Sha256};
 
         use crate::modelopt::{Plain, Use, normalize};
-        use crate::safetensors::Safetensors;
 
         let st =
             Safetensors::parse(include_bytes!("../tests/fixtures/fp8-scales.safetensors").to_vec())
