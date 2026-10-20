@@ -1,0 +1,512 @@
+#!/usr/bin/env python3
+"""The class tables of the gate-* recipes: their loader and the checks that keep them honest (Mac).
+
+    tools/gate_class.py check          # rc 1 with one line per finding
+    tools/gate_class.py summary         # the counts per class, per family and per owner
+    tools/gate_class.py --self-test
+
+Three tables, one row a thing:
+
+  tools/gate-class.tsv  recipe<TAB>class<TAB>family<TAB>topic<TAB>owners
+  tools/families.tsv    family<TAB>rep<TAB>globs<TAB>rotation_days<TAB>fixture
+  tools/owners.tsv      owner<TAB>kind<TAB>globs
+
+`class` is `common` (family-agnostic: a synthetic input or a shape-generic owner), `family` (one family's own weights
+or code) or `tooling` (harness, static, fixture writer, PTX). `family` is the registry's canonical name
+(tools/arch-registry.tsv column 1, the first name of a comma list) or a declared non-arch group; a `common` or a
+`tooling` row names none. `owners` is the `+` list of the owners the gate tests, names from tools/owners.tsv, or `-`.
+`rep` is `R` (a representative family, run whole on a landing) or `F` (a fixture family, run on its own change and
+in the rotation). `globs` are the family's own files and the owner's files; a glob matches a file or the round is red.
+
+`check` runs the checks of the design (§4.4): every `gate-*` recipe has a row and every row names a recipe that
+exists; the families of both tables are the registry's canonical names plus the declared non-arch groups; every
+glob of both tables matches a file in the tree. One line per finding, rc 1 when there is one. A table that does not
+load is a named error, rc 2.
+
+Nothing reads the tables yet: the class stage of `just affected` comes later, and until it does this tool only
+reports. The justfile's recipe names are read through tools/recipes.py, the one parser.
+"""
+
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import os
+import sys
+from pathlib import Path
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # `python3 -I` drops the script's directory
+import recipes  # noqa: E402
+
+ROOT = recipes.ROOT
+CLASSES = ("common", "family", "tooling")
+REPS = ("R", "F")
+GATE_PREFIX = recipes.GATE_PREFIX
+DEFAULT_ROTATION_DAYS = 7
+# The families that are not architectures: a group of gates with no registry row of its own. A family that is not in
+# the registry and not here has no owner, and the check is red.
+DECLARED_GROUPS = ("gemma4a", "gemma4v", "minicpmv47", "qwen38d")
+
+
+class GateClassError(Exception):
+    """A named input failure; main() prints it and exits 2."""
+
+    def __init__(self, msg: str, rc: int = 2):
+        super().__init__(msg)
+        self.rc = rc
+
+
+@dataclasses.dataclass(frozen=True)
+class GateRow:
+    recipe: str
+    cls: str
+    family: str
+    topic: str
+    owners: tuple[str, ...]
+
+
+@dataclasses.dataclass(frozen=True)
+class FamilyRow:
+    family: str
+    rep: str
+    globs: tuple[str, ...]
+    rotation_days: int
+    fixture: bool
+
+
+@dataclasses.dataclass(frozen=True)
+class OwnerRow:
+    owner: str
+    kind: str
+    globs: tuple[str, ...]
+
+
+@dataclasses.dataclass(frozen=True)
+class Tables:
+    gates: dict[str, GateRow]
+    families: dict[str, FamilyRow]
+    owners: dict[str, OwnerRow]
+
+
+# ---------------------------------------------------------------------------------------------- the tables
+
+
+def _rows(path: Path) -> list[tuple[int, list[str]]]:
+    """(line number, tab-separated fields) of every data row of a table; '#' comments and blank lines skipped."""
+    out: list[tuple[int, list[str]]] = []
+    with path.open(encoding="utf-8") as fh:
+        for n, line in enumerate(fh, 1):
+            line = line.rstrip("\n")
+            if not line.strip() or line.startswith("#"):
+                continue
+            out.append((n, line.split("\t")))
+    return out
+
+
+def _where(path: Path, line: int) -> str:
+    return f"{path.name}:{line}"
+
+
+def load_owners(root: Path) -> dict[str, OwnerRow]:
+    """tools/owners.tsv: the owner, its kind and the files it owns."""
+    path = root / "tools" / "owners.tsv"
+    if not path.exists():
+        raise GateClassError(f"tools/owners.tsv does not exist under {root}")
+    owners: dict[str, OwnerRow] = {}
+    for n, f in _rows(path):
+        if len(f) != 3:
+            raise GateClassError(f"{_where(path, n)}: a row is not `owner, kind, globs` (tab-separated): {'\\t'.join(f)[:100]!r}")
+        name, kind, globs = f[0].strip(), f[1].strip(), f[2].split()
+        if not name or not kind:
+            raise GateClassError(f"{_where(path, n)}: a row has no owner name or no kind")
+        if name in owners:
+            raise GateClassError(f"{_where(path, n)}: the owner {name} is listed twice")
+        owners[name] = OwnerRow(owner=name, kind=kind, globs=tuple(globs))
+    if not owners:
+        raise GateClassError("tools/owners.tsv names no owner")
+    return owners
+
+
+def load_families(root: Path) -> dict[str, FamilyRow]:
+    """tools/families.tsv: the family, its rep, its own files, its rotation period and whether it has a fixture."""
+    path = root / "tools" / "families.tsv"
+    if not path.exists():
+        raise GateClassError(f"tools/families.tsv does not exist under {root}")
+    families: dict[str, FamilyRow] = {}
+    for n, f in _rows(path):
+        if len(f) != 5:
+            raise GateClassError(f"{_where(path, n)}: a row is not `family, rep, globs, rotation_days, fixture` (tab-separated): {'\\t'.join(f)[:100]!r}")
+        name, rep, globs, days, fixture = f[0].strip(), f[1].strip(), f[2].split(), f[3].strip(), f[4].strip()
+        if not name:
+            raise GateClassError(f"{_where(path, n)}: a row has no family name")
+        if rep not in REPS:
+            raise GateClassError(f"{_where(path, n)}: unknown rep {rep!r} (one of {', '.join(REPS)})")
+        if days == "":
+            days_s = DEFAULT_ROTATION_DAYS
+        elif days.isdigit() and int(days) > 0:
+            days_s = int(days)
+        else:
+            raise GateClassError(f"{_where(path, n)}: `rotation_days` is not a number of days: {days!r}")
+        if fixture not in ("yes", "no"):
+            raise GateClassError(f"{_where(path, n)}: `fixture` is {fixture!r} (yes or no)")
+        if name in families:
+            raise GateClassError(f"{_where(path, n)}: the family {name} is listed twice")
+        families[name] = FamilyRow(family=name, rep=rep, globs=tuple(globs), rotation_days=days_s, fixture=fixture == "yes")
+    if not families:
+        raise GateClassError("tools/families.tsv names no family")
+    return families
+
+
+def load_gates(root: Path, owners: dict[str, OwnerRow], families: dict[str, FamilyRow]) -> dict[str, GateRow]:
+    """tools/gate-class.tsv: the recipe, its class, its family, its topic and the owners it tests."""
+    path = root / "tools" / "gate-class.tsv"
+    if not path.exists():
+        raise GateClassError(f"tools/gate-class.tsv does not exist under {root}")
+    gates: dict[str, GateRow] = {}
+    for n, f in _rows(path):
+        if len(f) != 5:
+            raise GateClassError(f"{_where(path, n)}: a row is not `recipe, class, family, topic, owners` (tab-separated): {'\\t'.join(f)[:100]!r}")
+        recipe, cls, family, topic, owners_s = (x.strip() for x in f)
+        if not recipe:
+            raise GateClassError(f"{_where(path, n)}: a row has no recipe name")
+        if cls not in CLASSES:
+            raise GateClassError(f"{_where(path, n)}: unknown class {cls!r} (one of {', '.join(CLASSES)})")
+        if cls == "family" and not family:
+            raise GateClassError(f"{_where(path, n)}: a `family` row names no family")
+        if cls != "family" and family:
+            raise GateClassError(f"{_where(path, n)}: a `{cls}` row names a family ({family}); only a `family` row does")
+        if family and family not in families:
+            raise GateClassError(f"{_where(path, n)}: the family {family} is not in families.tsv")
+        if owners_s in ("", "-"):
+            owner_names: tuple[str, ...] = ()
+        else:
+            owner_names = tuple(owners_s.split("+"))
+            for o in owner_names:
+                if not o:
+                    raise GateClassError(f"{_where(path, n)}: the owner list has an empty name")
+                if o not in owners:
+                    raise GateClassError(f"{_where(path, n)}: the owner {o} is not in owners.tsv")
+            if len(set(owner_names)) != len(owner_names):
+                raise GateClassError(f"{_where(path, n)}: the owner list names an owner twice")
+        if recipe in gates:
+            raise GateClassError(f"{_where(path, n)}: the recipe {recipe} is listed twice")
+        gates[recipe] = GateRow(recipe=recipe, cls=cls, family=family, topic=topic, owners=owner_names)
+    if not gates:
+        raise GateClassError("tools/gate-class.tsv names no recipe")
+    return gates
+
+
+def load(root: str | os.PathLike = ROOT) -> Tables:
+    """The three tables of the tree at ROOT, loaded and cross-checked. A named error names the file and the line."""
+    root = Path(root)
+    owners = load_owners(root)
+    families = load_families(root)
+    gates = load_gates(root, owners, families)
+    return Tables(gates=gates, families=families, owners=owners)
+
+
+# ---------------------------------------------------------------------------------------------- the tree
+
+
+def matching_files(root: Path, pattern: str) -> list[Path]:
+    """The files of the tree at ROOT the glob matches; `*` stays in a path segment, `**` crosses one."""
+    try:
+        if pattern.endswith("/**"):
+            d = root / pattern[:-3]
+            if not d.is_dir():
+                return []
+            return [p for p in d.rglob("*") if p.is_file()]
+        return [p for p in root.glob(pattern) if p.is_file()]
+    except (ValueError, OSError):
+        return []
+
+
+def registry_families(root: Path) -> set[str]:
+    """The registry's canonical names: the first name of every row of tools/arch-registry.tsv."""
+    path = root / "tools" / "arch-registry.tsv"
+    if not path.exists():
+        raise GateClassError(f"tools/arch-registry.tsv does not exist under {root}")
+    out: set[str] = set()
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip() or line.startswith("#"):
+            continue
+        names = line.split("\t")[0].strip()
+        if not names or names == "names":
+            continue
+        out.add(names.split(",")[0].strip())
+    if not out:
+        raise GateClassError("tools/arch-registry.tsv names no architecture")
+    return out
+
+
+# ---------------------------------------------------------------------------------------------- the checks
+
+
+def check(root: Path, tables: Tables) -> list[str]:
+    """The findings of the design's checks: one line each, empty when the tables are honest."""
+    findings: list[str] = []
+    justfile = root / "justfile"
+    if not justfile.exists():
+        raise GateClassError(f"there is no justfile under {root}")
+    try:
+        recs = recipes.load_justfile(str(justfile))
+    except recipes.RecipeError as e:
+        raise GateClassError(f"the justfile does not load: {e}") from e
+    gate_names = {n for n in recs if n.startswith(GATE_PREFIX)}
+
+    # Every gate has a row, and every row names a gate.
+    for name in sorted(gate_names - set(tables.gates)):
+        findings.append(f"no gate-class.tsv row for the recipe {name}")
+    for name in sorted(set(tables.gates) - gate_names):
+        if name in recs:
+            findings.append(f"gate-class.tsv names {name}, which is not a {GATE_PREFIX} recipe of the justfile")
+        else:
+            findings.append(f"gate-class.tsv names {name}, which is not a recipe of the justfile")
+
+    # The families of both tables are the registry's canonical names plus the declared groups.
+    want = registry_families(root) | set(DECLARED_GROUPS)
+    for fam in sorted(want - set(tables.families)):
+        findings.append(f"families.tsv has no row for the family {fam}")
+    for fam in sorted(set(tables.families) - want):
+        findings.append(f"families.tsv names the family {fam}, which the registry does not name and no group is declared")
+    # A family with no gate row of its own is not a finding (a registry row may have no gate yet); the summary names
+    # it, and the loader refuses a gate row that names a family families.tsv does not hold.
+
+    # Every glob matches a file.
+    for owner in sorted(tables.owners):
+        for g in tables.owners[owner].globs:
+            if not matching_files(root, g):
+                findings.append(f"owners.tsv: the owner {owner}'s glob {g} matches no file")
+    for fam in sorted(tables.families):
+        for g in tables.families[fam].globs:
+            if not matching_files(root, g):
+                findings.append(f"families.tsv: the family {fam}'s glob {g} matches no file")
+    return findings
+
+
+# ---------------------------------------------------------------------------------------------- the summary
+
+
+def summary(tables: Tables) -> str:
+    """The counts per class, per family and rep, and per owner."""
+    per_class: dict[str, int] = {c: 0 for c in CLASSES}
+    per_family: dict[str, int] = {f: 0 for f in tables.families}
+    per_owner: dict[str, int] = {o: 0 for o in tables.owners}
+    for row in tables.gates.values():
+        per_class[row.cls] += 1
+        if row.family:
+            per_family[row.family] += 1
+        for o in row.owners:
+            per_owner[o] += 1
+    out = ["per class:"]
+    for c in CLASSES:
+        out.append(f"  {c:<8} {per_class[c]:>4}")
+    out.append("per family (rep, gates):")
+    for f in sorted(tables.families):
+        out.append(f"  {f:<16} {tables.families[f].rep}  {per_family[f]:>4}")
+    out.append("per owner (gates):")
+    for o in sorted(per_owner):
+        out.append(f"  {o:<20} {per_owner[o]:>4}")
+    without = [f for f in sorted(tables.families) if not per_family[f]]
+    if without:
+        out.append("families with no gate of their own: " + " ".join(without))
+    return "\n".join(out)
+
+
+# ---------------------------------------------------------------------------------------------- the self-test
+
+
+def _write(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+
+def _tree(tmp: Path) -> Path:
+    """A small tree with two gate recipes, two families, one owner and the files the globs name."""
+    root = tmp / "tree"
+    _write(root / "justfile", "gate-a:\n    echo a\n\ngate-b:\n    echo b\n\nother:\n    echo o\n")
+    _write(root / "tools" / "arch-registry.tsv", "# the registry's rows\nnames\tvariant\tread\tdraft\tfixture\nfam-a\tFamA\tno\tno\t-\nfam-b,FamB\tFamB\tyes\tno\t-\n")
+    _write(root / "crates" / "fam-a" / "a.rs", "// a\n")
+    _write(root / "crates" / "fam-b" / "b.rs", "// b\n")
+    _write(root / "tools" / "owners.tsv", "# owner\tkind\tglobs\nown-a\tkernel\tcrates/fam-a/a.rs\n")
+    groups = "".join(f"{g}\tF\tcrates/fam-b/b.rs\t7\tno\n" for g in DECLARED_GROUPS)
+    _write(root / "tools" / "families.tsv",
+           "# family\trep\tglobs\trotation_days\tfixture\n"
+           f"fam-a\tR\tcrates/fam-a/**\t7\tno\n"
+           f"fam-b\tF\tcrates/fam-b/**\t7\tyes\n" + groups)
+    _write(root / "tools" / "gate-class.tsv",
+           "# recipe\tclass\tfamily\ttopic\towners\n"
+           "gate-a\tfamily\tfam-a\tkernel\town-a\n"
+           "gate-b\tcommon\t\thost\t-\n")
+    return root
+
+
+def self_test() -> int:
+    fails: list[str] = []
+
+    def expect(cond: bool, msg: str) -> None:
+        if not cond:
+            fails.append(msg)
+
+    def raises(fn, text: str) -> bool:
+        try:
+            fn()
+        except (GateClassError, recipes.RecipeError) as e:
+            return text in str(e)
+        return False
+
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="gate-class-selftest-") as tmpdir:
+        tmp = Path(tmpdir)
+        root = _tree(tmp)
+        tables = load(root)
+        expect(sorted(tables.gates) == ["gate-a", "gate-b"], f"load: the tree's two gate rows: {sorted(tables.gates)}")
+        expect(tables.gates["gate-a"].owners == ("own-a",), f"load: the owner of gate-a: {tables.gates['gate-a'].owners}")
+        expect(tables.families["fam-b"].rotation_days == 7 and tables.families["fam-b"].fixture, "load: the family's rep days and fixture flag")
+        expect(check(root, tables) == [], f"check: the tree's tables are green: {check(root, tables)}")
+
+        # A malformed row, an unknown class, an unknown rep, an unknown owner, an unknown family, a duplicate row.
+        gate_rows = (root / "tools" / "gate-class.tsv").read_text(encoding="utf-8").splitlines()
+        fam_rows = (root / "tools" / "families.tsv").read_text(encoding="utf-8").splitlines()
+        owner_rows = (root / "tools" / "owners.tsv").read_text(encoding="utf-8").splitlines()
+
+        def with_gate(text: str):
+            _write(root / "tools" / "gate-class.tsv", text)
+            return lambda: load(root)
+
+        def with_fam(text: str):
+            _write(root / "tools" / "families.tsv", text)
+            return lambda: load(root)
+
+        def with_owner(text: str):
+            _write(root / "tools" / "owners.tsv", text)
+            return lambda: load(root)
+
+        def fam_text(*rows: str) -> str:
+            """The tree's families.tsv with these rows and the declared groups, which every tree must hold."""
+            return "\n".join(["# h", *rows, *(f"{g}\tF\tcrates/fam-b/b.rs\t7\tno" for g in DECLARED_GROUPS)]) + "\n"
+
+        bad = "\n".join(["# h", "gate-a\tfamily\tfam-a\tkernel\town-a", "gate-b\tcommon\thost"]) + "\n"
+        expect(raises(with_gate(bad), "gate-class.tsv:3: a row is not"), "load: a short row is a named error with the file and the line")
+        bad = "\n".join(["# h", "gate-a\tfamily\tfam-a\tkernel\town-a", "gate-b\tsideways\t\thost\t-"]) + "\n"
+        expect(raises(with_gate(bad), "unknown class 'sideways'"), "load: an unknown class is a named error")
+        bad = "\n".join(["# h", "gate-a\tfamily\tfam-a\tkernel\town-a", "gate-b\tfamily\tfam-b\tkernel\town-z"]) + "\n"
+        expect(raises(with_gate(bad), "the owner own-z is not in owners.tsv"), "load: an owner that is not in owners.tsv is a named error")
+        bad = "\n".join(["# h", "gate-a\tfamily\tfam-z\tkernel\town-a"]) + "\n"
+        expect(raises(with_gate(bad), "the family fam-z is not in families.tsv"), "load: a family that is not in families.tsv is a named error")
+        bad = "\n".join(["# h", "gate-a\tfamily\tfam-a\tkernel\town-a", "gate-a\tcommon\t\thost\t-"]) + "\n"
+        expect(raises(with_gate(bad), "the recipe gate-a is listed twice"), "load: a recipe twice is a named error")
+        bad = "\n".join(["# h", "gate-a\tfamily\tfam-a\tkernel\town-a", "gate-b\tcommon\tfam-b\thost\t-"]) + "\n"
+        expect(raises(with_gate(bad), "a `common` row names a family"), "load: a common row with a family is a named error")
+        bad = "\n".join(["# h", "gate-a\tfamily\t\tkernel\town-a"]) + "\n"
+        expect(raises(with_gate(bad), "a `family` row names no family"), "load: a family row with no family is a named error")
+        bad = fam_text("fam-a\tR\tcrates/fam-a/**\t7\tno", "fam-b\tX\tcrates/fam-b/**\t7\tyes")
+        expect(raises(with_fam(bad), "unknown rep 'X'"), "load: an unknown rep is a named error")
+        bad = fam_text("fam-a\tR\tcrates/fam-a/**\t7\tno", "fam-b\tF\tcrates/fam-b/**\t0\tyes")
+        expect(raises(with_fam(bad), "`rotation_days` is not a number of days"), "load: a bad rotation period is a named error")
+        bad = fam_text("fam-a\tR\tcrates/fam-a/**\t7\tno", "fam-b\tF\tcrates/fam-b/**\t7\tmaybe")
+        expect(raises(with_fam(bad), "`fixture` is 'maybe'"), "load: a bad fixture flag is a named error")
+        bad = "\n".join(["# h", "own-a\tkernel\tcrates/fam-a/a.rs", "own-a\tkernel\tcrates/fam-a/a.rs"]) + "\n"
+        expect(raises(with_owner(bad), "the owner own-a is listed twice"), "load: an owner twice is a named error")
+        bad = "\n".join(["# h", "own-a\tkernel"]) + "\n"
+        expect(raises(with_owner(bad), "a row is not `owner, kind, globs`"), "load: a short owner row is a named error")
+
+        # The checks: a gate with no row, a row that names no gate, a family the tables disagree on, a glob that
+        # matches no file.
+        _write(root / "tools" / "owners.tsv", "\n".join(owner_rows) + "\n")
+        _write(root / "tools" / "families.tsv", "\n".join(fam_rows) + "\n")
+        _write(root / "tools" / "gate-class.tsv", "\n".join(gate_rows) + "\n")
+        good = check(root, load(root))
+        expect(good == [], f"check: the restored tables are green: {good}")
+
+        one = "\n".join(["# h", "gate-a\tfamily\tfam-a\tkernel\town-a"]) + "\n"
+        _write(root / "tools" / "gate-class.tsv", one)
+        found = check(root, load(root))
+        expect(any("gate-b" in f for f in found), f"check: a gate with no row is red, naming it: {found}")
+        two = "\n".join(["# h", "gate-a\tfamily\tfam-a\tkernel\town-a", "gate-b\tcommon\t\thost\t-", "gate-z\tcommon\t\thost\t-"]) + "\n"
+        _write(root / "tools" / "gate-class.tsv", two)
+        found = check(root, load(root))
+        expect(any("gate-z" in f for f in found), f"check: a row that names no gate is red: {found}")
+        three = "\n".join(["# h", "gate-a\tfamily\tfam-a\tkernel\town-a", "gate-b\tcommon\t\thost\t-",
+                           "gate-c\tfamily\tfam-b\tkernel\t-"]) + "\n"
+        _write(root / "tools" / "gate-class.tsv", three)
+        found = check(root, load(root))
+        expect(any("gate-c" in f for f in found), f"check: a row that names no gate is red: {found}")
+        _write(root / "tools" / "gate-class.tsv", "\n".join(gate_rows) + "\n")
+
+        # A family the two tables do not agree on, and a family the registry does not name.
+        _write(root / "tools" / "families.tsv", "\n".join(fam_rows) + "\n")
+        only_gate = "\n".join(["# h", "gate-a\tfamily\tfam-a\tkernel\town-a", "gate-b\tfamily\tfam-z\tkernel\t-"]) + "\n"
+        _write(root / "tools" / "gate-class.tsv", only_gate)
+        expect(raises(lambda: load(root), "the family fam-z is not in families.tsv"),
+               "load: a family the gate table names and families.tsv does not is a named error")
+        _write(root / "tools" / "gate-class.tsv", "\n".join(gate_rows) + "\n")
+        no_fam = fam_text("fam-a\tR\tcrates/fam-a/**\t7\tno")
+        _write(root / "tools" / "families.tsv", no_fam)
+        found = check(root, load(root))
+        expect(any("fam-b" in f for f in found), f"check: a family of the registry with no row is red: {found}")
+        extra = fam_text("fam-a\tR\tcrates/fam-a/**\t7\tno", "fam-b\tF\tcrates/fam-b/**\t7\tyes", "fam-z\tF\tcrates/fam-z/**\t7\tno")
+        _write(root / "tools" / "families.tsv", extra)
+        found = check(root, load(root))
+        expect(any("fam-z" in f for f in found), f"check: a family the registry does not name is red: {found}")
+        _write(root / "tools" / "families.tsv", "\n".join(fam_rows) + "\n")
+
+        # A glob that matches no file.
+        nofile = "\n".join(["# h", "own-a\tkernel\tcrates/fam-a/nothing.rs"]) + "\n"
+        _write(root / "tools" / "owners.tsv", nofile)
+        found = check(root, load(root))
+        expect(any("nothing.rs" in f for f in found), f"check: an owner glob that matches no file is red: {found}")
+        _write(root / "tools" / "owners.tsv", "\n".join(owner_rows) + "\n")
+        nofile = fam_text("fam-a\tR\tcrates/fam-a/**\t7\tno", "fam-b\tF\tcrates/fam-b/nothing/**\t7\tyes")
+        _write(root / "tools" / "families.tsv", nofile)
+        found = check(root, load(root))
+        expect(any("nothing" in f for f in found), f"check: a family glob that matches no file is red: {found}")
+        _write(root / "tools" / "families.tsv", "\n".join(fam_rows) + "\n")
+        expect(check(root, load(root)) == [], "check: the restored tree is green again")
+
+        # The tree's own tables: they load and they are green.
+        try:
+            real = load(ROOT)
+            findings = check(Path(ROOT), real)
+            expect(findings == [], f"check: the tree's own tables are green: {findings[:6]}")
+            expect(len(real.gates) > 0 and len(real.families) > 0 and len(real.owners) > 0, "load: the tree's own tables hold rows")
+            text = summary(real)
+            expect("per class:" in text and "per family" in text and "per owner" in text, "summary: the three counts are printed")
+        except (GateClassError, recipes.RecipeError) as e:
+            expect(False, f"the tree's own tables: {e}")
+
+    if fails:
+        for f in fails:
+            print(f"gate_class self-test FAIL: {f}", file=sys.stderr)
+        print(f"gate_class self-test: {len(fails)} failed", file=sys.stderr)
+        return 1
+    print("gate_class self-test: ok")
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    if argv == ["--self-test"]:
+        return self_test()
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("check", help="the findings of the design's checks; rc 1 when there is one")
+    sub.add_parser("summary", help="the counts per class, per family and per owner")
+    args = ap.parse_args(argv)
+    try:
+        tables = load(ROOT)
+        if args.cmd == "summary":
+            print(summary(tables))
+            return 0
+        findings = check(Path(ROOT), tables)
+    except (GateClassError, recipes.RecipeError) as e:
+        print(f"gate_class.py: {e}", file=sys.stderr)
+        return 2
+    for f in findings:
+        print(f"RED  {f}")
+    print(f"gate_class check: {len(findings)} finding(s)")
+    return 1 if findings else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
