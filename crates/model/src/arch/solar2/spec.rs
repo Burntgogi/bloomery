@@ -202,18 +202,22 @@ mod tests {
         );
     }
 
-    /// Every layer kind of the file runs, so nothing is listed: the softplus-decay, β-scaled KDA
-    /// layer (`kda_conv_prep_sp2`) and the GQA layer's sigmoid output gate (`attn_out_gate_sigmoid`)
-    /// each have a program.
-    // PIN(2026-10-20): the two items this test listed are gone; their programs landed with the family.
+    /// Only what no program runs is listed: the test description's shapes (d 16, group 2, 8 experts) have
+    /// no kernel, so its softplus-decay, β-scaled KDA layer is listed by its own item, while the GQA
+    /// layer's sigmoid output gate, which a program runs at any shape, is not.
+    // PIN(2026-10-20): the out gate left the list when its program (`attn_out_gate_sigmoid`) landed.
     #[test]
-    fn every_layer_kind_runs() {
+    fn what_no_program_runs_is_listed() {
         let read = read("coverage", &tensors()).expect("the header reads");
         let items: Vec<String> = coverage::check(&read.spec, &read.tensors)
             .into_iter()
             .map(|u| u.feature)
             .collect();
-        assert!(items.is_empty(), "listed: {items:#?}");
+        let listed = |needle: &str| items.iter().any(|f| f.contains(needle));
+        let needle = "delta rule KDA: d 16, 4 heads, conv 4, softplus gate, beta scaled by 2";
+        assert!(listed(needle), "{needle:?} not listed: {items:#?}");
+        let gate = "attention output gate";
+        assert!(!listed(gate), "{gate:?} listed: {items:#?}");
     }
 
     /// A tensor the table does not hold — a fused projection, a next-token block, a block past the
