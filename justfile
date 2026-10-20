@@ -1859,11 +1859,20 @@ check-scripts:
 smoke *ARGS:
     ./tools/gate-batch.sh --smoke {{ARGS}}
 
-# The weekly tier: every `weekly-*` recipe (a gate taken out of the landing batch; `just affected` selects only
-# `gate-*`, and names a weekly recipe when a file one of its trigger rows in tools/gate-paths.tsv matches changes) in
-# one sitting through tools/gate-batch.sh, on the lead's ledger. ARGS go to it (--dry-run, --out DIR, --rerun).
+# The weekly tier and the rotation: every `weekly-*` recipe (a gate taken out of the landing batch; `just affected`
+# selects only `gate-*`, and names a weekly recipe when a file one of its trigger rows in tools/gate-paths.tsv matches
+# changes), then every gate the fixture tier defers (real-only, real-file, no-fixture, needs-env) that has no green row
+# at its current key and none newer than 7 days (tools/rotation.py due), in one sitting through tools/gate-batch.sh, on
+# the lead's ledger. `just affected` never selects the rotation.
+# ARGS go to the batch (--dry-run, --out DIR, --rerun).
 weekly *ARGS:
-    ./tools/gate-batch.sh --ledger --weekly {{ARGS}}
+    mkdir -p target && python3 tools/rotation.py due --with-weekly --out target/weekly.list && ./tools/gate-batch.sh --ledger --list target/weekly.list {{ARGS}}
+
+# The rotation's due list alone, as a `--list` file for tools/gate-batch.sh: the gates no landing runs, stalest family
+# first, each with its predicted wall. It reads the box once, for the keys.
+# ARGS go to tools/rotation.py due (--days N, --classes FILE).
+rotation-due *ARGS:
+    python3 tools/rotation.py due {{ARGS}}
 
 # B0b V4.1 인벤토리: 분할 GGUF의 헤더만 읽어 텐서 표를 뽑는다(임대 불필요, 텐서 바이트 미접촉).
 # 표는 박스의 /tmp에 쓰고 scp로 회수한다 — 박스 작업 트리에 쓰면 다음 box.sh의 rsync --delete가 지운다.
