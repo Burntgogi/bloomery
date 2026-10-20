@@ -7,7 +7,8 @@ network, never rewrites Cargo.lock), and the sources as text. It builds nothing 
 
     python3 tools/recipes.py check            # the target checks of `just check-recipes`, one feature set a bin, and the plan files records-refresh writes (presence)
     python3 tools/recipes.py targets [RECIPE]  # recipe -> cargo targets, scripts, input count
-    python3 tools/recipes.py affected [BASE | A..B] [--no-box] [--all-recipes] [--narrow [--scan BASE_LOG NEW_LOG]...]
+    python3 tools/recipes.py affected [BASE | A..B] [--no-box] [--all-recipes] [--narrow [--scan BASE_LOG NEW_LOG]...] [--class]
+    python3 tools/recipes.py release-list [TAG | TAG..HEAD] [--wall]  # the release batch's list: the S0 gates, the R families' gates, the class-staged affected and the rotation's due gates
     python3 tools/recipes.py scan-set [REV]    # the bins whose ptx-scans cover every kernel carrier: bin<TAB>features<TAB>carriers (just narrow scans them)
     python3 tools/recipes.py ships [--rev REV] [--base REV] FILE...  # the FILEs inside the shipped closure (tools/release/build.sh's bins at its features), with why; exit 1 when any is (tools/release/late-commit.sh)
     python3 tools/recipes.py ship-scan [--rev REV] BASE_LOG HEAD_LOG...  # the shipped bins' ptx-scan pairs: a verdict line each; exit 0 only when every shipped bin has a pair and all are identical
@@ -37,6 +38,14 @@ used; both sides are read from `git archive` copies, so the graph is the one tho
 A recipe that a row of tools/fixture-variants.tsv lists also prints its variant item, `NAME@BLOOMERY_FIXTURE_VARIANT=<tag>`, as a line of
 its own and in the `recipes:` line (a batch `--list` takes the first word of the line). A row that was added or edited prints the items of its
 recipes whether or not the diff selected them: the variant's file lives outside the repository, so the row is what a change to it is.
+
+The class stage (`--class`, off by default) is the third stage, after select() and narrow(): the class tables (tools/gate-class.tsv,
+tools/families.tsv, tools/owners.tsv, read through tools/gate_class.py's loader) say what a gate-* recipe is, and a family gate is kept only
+when the change can have moved it — the family's own file changed, the recipe's own text or one of its own target files changed, the family is
+a representative one and the pick reaches a changed file, or the family was added since the last release tag. The gate it leaves out is printed
+with its reason, in the same `left out` block the ptx-scan stage uses. Without the flag the output is the list of today, byte for byte.
+`release-list` is the release batch's list: every S0 gate (a common or a tooling gate the fixture tier runs), every gate of a representative
+family, the class-staged affected(TAG) and the rotation's due gates.
 
 A recipe's inputs are:
   - the files of every cargo target it builds or tests: the target's own module tree (`mod`,
@@ -212,6 +221,7 @@ import re
 import shlex
 import shutil
 import stat
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -2198,12 +2208,22 @@ def cmd_affected(args: argparse.Namespace) -> int:
         rng = f"{a_label}..{b_rev[:9]}" if b_rev else f"{a_label}..(working tree)"
         nar = narrow(changed, a, b, scans, expanded_table(notes=notes), tables) if args.narrow else None
         narrowed = nar is not None and not nar.full
-        vitems = variant_items(list(nar.picks) if narrowed else [s.recipe for s in sels], a, b, changed, prefix) if prefix == GATE_PREFIX else []
+        picks = dict(nar.picks) if narrowed else {s.recipe: s.why for s in sels}
+        stage: ClassStage | None = None
+        ctables = None
+        if args.class_stage:
+            ctables = class_tables(b.tree.root)
+            stage = class_narrow(picks, changed, ctables, lambda n: class_reach(n, changed, a, b),
+                                 families_new_since(ROOT, ctables))
+            picks = {n: why for n, why in picks.items() if n in stage.kept}
+        vitems = variant_items(list(picks), a, b, changed, prefix) if prefix == GATE_PREFIX else []
+        class_note = f"class-staged: {len(stage.kept)} kept, {len(stage.left_out)} left out" if stage else ""
         if narrowed:
-            print(f"affected: {rng} — {len(changed)} changed files, {len(nar.picks)} of {total} {prefix or ''}recipes selected "
-                  f"(narrowed from {len(sels)} by ptx-scan){weekly}")
+            print(f"affected: {rng} — {len(changed)} changed files, {len(picks)} of {total} {prefix or ''}recipes selected "
+                  f"(narrowed from {len(sels)} by ptx-scan; {class_note}){weekly}")
         else:
-            print(f"affected: {rng} — {len(changed)} changed files, {len(sels)} of {total} {prefix or ''}recipes selected{weekly}")
+            print(f"affected: {rng} — {len(changed)} changed files, {len(picks)} of {total} {prefix or ''}recipes selected"
+                  + (f" ({class_note})" if stage else "") + weekly)
         if nar is not None:
             for r in nar.full:
                 print(f"narrow: full list — {r}")
@@ -2211,28 +2231,51 @@ def cmd_affected(args: argparse.Namespace) -> int:
                 print(f"narrow: ptx-scan {v.line()}")
             for line in nar.files:
                 print(f"narrow: file {line}")
+
+        def class_rule(n: str) -> str:
+            """The class rule that kept a family pick (the common and the tooling ones have nothing to say)."""
+            if stage is None or ctables is None:
+                return ""
+            row = ctables.gates.get(n)
+            if row is None or row.cls != "family":
+                return ""
+            return f"  ({stage.kept[n]})"
+
         if narrowed:
-            width = max([len(n) for n in nar.picks] + [len(i) for i, _ in vitems] + [len(t.recipe) for t in trig] + [10])
-            for n, why in nar.picks.items():
-                print(f"  {n:<{width}}  {why}")
+            width = max([len(n) for n in picks] + [len(i) for i, _ in vitems] + [len(t.recipe) for t in trig] + [10])
+            for n, why in picks.items():
+                print(f"  {n:<{width}}  {why}{class_rule(n)}")
             print_variants(vitems, width)
             print_triggers(trig, width)
-            print("recipes: " + " ".join([*nar.picks, *(i for i, _ in vitems), *(t.recipe for t in trig)]))
+            print("recipes: " + " ".join([*picks, *(i for i, _ in vitems), *(t.recipe for t in trig)]))
             print("always: " + " ".join(ALWAYS))
             let_out = "; ".join(v.line() for v in nar.verdicts)
             out = [s.recipe for s in sels if s.recipe not in nar.picks]
-            print(f"left out ({len(out)}), each by ptx-scan {let_out}:")
-            for n in out:
-                print(f"  - {n}  (ptx-scan {let_out})")
+            if stage is None:
+                print(f"left out ({len(out)}), each by ptx-scan {let_out}:")
+                for n in out:
+                    print(f"  - {n}  (ptx-scan {let_out})")
+            else:
+                reasons = [(n, f"ptx-scan {let_out}") for n in out]
+                reasons += [(n, why) for n, why in stage.left_out.items()]
+                print(f"left out ({len(reasons)}), each by its reason:")
+                for n, why in reasons:
+                    print(f"  - {n}  ({why})")
         else:
-            width = max([len(s.recipe) for s in sels] + [len(i) for i, _ in vitems] + [len(t.recipe) for t in trig] + [10])
+            width = max([len(n) for n in picks] + [len(i) for i, _ in vitems] + [len(t.recipe) for t in trig] + [10])
             for s in sels:
+                if s.recipe not in picks:
+                    continue
                 more_n = f" (+{len(s.files) - 1})" if len(s.files) > 1 else ""
-                print(f"  {s.recipe:<{width}}  {s.files[0]}{more_n}  [{s.why}]")
+                print(f"  {s.recipe:<{width}}  {s.files[0]}{more_n}  [{s.why}]{class_rule(s.recipe)}")
             print_variants(vitems, width)
             print_triggers(trig, width)
-            print("recipes: " + " ".join([*(s.recipe for s in sels), *(i for i, _ in vitems), *(t.recipe for t in trig)]))
+            print("recipes: " + " ".join([*picks, *(i for i, _ in vitems), *(t.recipe for t in trig)]))
             print("always: " + " ".join(ALWAYS))
+            if stage is not None and stage.left_out:
+                print(f"left out ({len(stage.left_out)}), each by its reason:")
+                for n, why in stage.left_out.items():
+                    print(f"  - {n}  ({why})")
         print(f"unmapped ({len(unmapped)}):")
         for u in unmapped:
             print(f"  {u}")
@@ -2975,6 +3018,20 @@ def _own_origin(why: str) -> bool:
     if "<-" in inner or inner.startswith(("cargo", "tools/box.sh", "profile ", "dep-info")):
         return False
     return True
+
+
+# The origins that are not a target's own read: a script the recipe names, a cargo global, a box call's file, a
+# directory. A gate they belong to is not the gate's own target, so a change of one is not the gate's own change.
+_NOT_TARGET_FILE = ("cargo", "tools/box.sh", "profile ", "dep-info", "script ", "named directory", "find in ")
+
+
+def _own_target_file(why: str) -> bool:
+    """Whether a hit is a file of the recipe's own cargo target: the target's own read, not a script the recipe
+    names, a cargo global, a box call's file or a directory a script walks."""
+    if not _own_origin(why):
+        return False
+    inner = re.sub(r" \(via [^)]*\)$", "", why)
+    return not inner.startswith(_NOT_TARGET_FILE)
 
 
 # ---- which module paths a target's own files name ----
@@ -12312,6 +12369,452 @@ def _st_selection(fails: list[str], side: Side) -> None:
                 os.environ["PATH"] = saved_path
 
 
+# ----------------------------------------------------------------------------------------------
+# the class stage of `affected`: the gate classes of the class tables
+# ----------------------------------------------------------------------------------------------
+#
+# The three tables (tools/gate-class.tsv, tools/families.tsv, tools/owners.tsv; read through
+# tools/gate_class.py's loader, the one reader) say what a gate-* recipe is: a common gate (family-agnostic), a
+# tooling gate (harness, static, fixture writer) or a family gate (one family's own weights or code). The class
+# stage is the third stage of `affected`, after select() and narrow(): it keeps every common and every tooling
+# pick, and keeps a family pick only when the change can have moved it. It is off by default (`--class`).
+#
+# A family:X pick is kept when
+#   (a) X is a representative family (families.tsv's rep R) and the pick reaches a changed file through the
+#       dependency graph — the reach `affected` computes for it;
+#   (b) a changed file matches one of X's own globs in families.tsv;
+#   (c) the recipe's own text changed, or one of its own cargo target's files changed (a script it names is not
+#       one: tools/gate-bound.sh is every gate's, and a change of it would keep every gate);
+#   (d) X was added since the last release tag: no v* tag's families.tsv names it, and its own files were not in
+#       the tree at the last release tag.
+# Otherwise the pick is left out with the reason `class: family gate of X, no file of X changed (rep F)`.
+#
+# The stage never adds a pick and never drops a common or a tooling one (the design's check 6): both are named
+# errors, not a quiet pass.
+
+def class_tables(root: str = ROOT):
+    """The three class tables of the tree at ROOT, through tools/gate_class.py's loader. A table the loader
+    refuses is a named error."""
+    if "recipes" not in sys.modules and "__main__" in sys.modules:
+        sys.modules["recipes"] = sys.modules["__main__"]  # the loader imports this module by name
+    try:
+        import gate_class  # tools/gate_class.py
+    except ImportError as err:
+        raise RecipeError(f"the class tables' loader is not readable: {err}") from err
+    try:
+        return gate_class.load(root)
+    except gate_class.GateClassError as err:
+        raise RecipeError(f"the class tables of {root}: {err}") from err
+
+
+_CLASS_GLOBS: dict[str, re.Pattern] = {}
+
+
+def class_glob(glob: str) -> re.Pattern:
+    """A glob of the class tables as a pattern: `**` crosses a directory, `*` stays in a segment."""
+    p = _CLASS_GLOBS.get(glob)
+    if p is None:
+        p = glob_regex(glob)
+        _CLASS_GLOBS[glob] = p
+    return p
+
+
+def glob_prefix(glob: str) -> str:
+    """The fixed path prefix of a glob: the part before its first wildcard."""
+    cut = len(glob)
+    for i, ch in enumerate(glob):
+        if ch in "*?{":
+            cut = i
+            break
+    return glob[:cut]
+
+
+def class_reach(n: str, changed: list[str], a: Side | None, b: Side) -> tuple[list[str], list[str], bool]:
+    """(the changed files the recipe reaches through the dependency graph, the changed files that are its own
+    cargo target's, whether its own text changed). The reach is the one `affected` computes: the recipe's own
+    inputs (its targets' files and the workspace libs they link)."""
+    reached: list[str] = []
+    own: list[str] = []
+    text = False
+    for f in changed:
+        if f == "justfile":
+            old = a.recipes.get(n) if a is not None else None
+            if n in b.recipes and (old is None or old.text != b.recipes[n].text):
+                text = True
+            continue
+        side = b if b.tree.exists(f) or a is None else a
+        if n not in side.recipes:
+            continue
+        why = side.graph.inputs(n).match(f)
+        if why is None:
+            continue
+        reached.append(f)
+        if _own_target_file(why):
+            own.append(f)
+    return reached, own, text
+
+
+# ---- the release tags: the families a release added ----
+
+
+def release_tags(root: str = ROOT) -> list[str]:
+    """The v* tags of the repository, the newest first."""
+    out = git("for-each-ref", "--sort=-creatordate", "--format=%(refname:short)", "refs/tags", cwd=root).split()
+    return [t for t in out if t.startswith("v")]
+
+
+def tag_text(rev: str, path: str, root: str = ROOT) -> str | None:
+    """The text of a file at a revision, or None when that revision has no such file."""
+    proc = subprocess.run(["git", "show", f"{rev}:{path}"], cwd=root, capture_output=True, text=True)
+    if proc.returncode != 0:
+        return None
+    return proc.stdout
+
+
+def tag_families(rev: str, root: str = ROOT) -> set[str]:
+    """The families the revision's tools/families.tsv names; a revision without the file names none."""
+    text = tag_text(rev, "tools/families.tsv", root)
+    if text is None:
+        return set()
+    out = set()
+    for line in text.splitlines():
+        if not line.strip() or line.startswith("#"):
+            continue
+        out.add(line.split("\t")[0].strip())
+    return out
+
+
+def tag_files(rev: str, root: str = ROOT) -> list[str]:
+    """The files of the tree at a revision."""
+    return git("ls-tree", "-r", "--name-only", rev, cwd=root).split()
+
+
+def family_has_file(fam, files: list[str]) -> bool:
+    """Whether the family had a file of its own among the tree's files."""
+    for g in fam.globs:
+        pre = glob_prefix(g)
+        pat = class_glob(g)
+        for f in files:
+            if f.startswith(pre) and pat.match(f):
+                return True
+    return False
+
+
+def families_new_since(root: str, tables) -> set[str]:
+    """The families added since the last release tag: no v* tag's families.tsv names them, and their own files
+    were not in the tree at the last release tag. A repository with no release tag names no new family."""
+    tags = release_tags(root)
+    if not tags:
+        return set()
+    named: set[str] = set()
+    for t in tags:
+        named |= tag_families(t, root)
+    files = tag_files(tags[0], root)
+    return {name for name, fam in tables.families.items()
+            if name not in named and not family_has_file(fam, files)}
+
+
+# ---- the stage itself ----
+
+
+@dataclass
+class ClassStage:
+    kept: dict[str, str]      # recipe -> the rule that kept it
+    left_out: dict[str, str]  # recipe -> the reason it was left out
+
+
+def class_check6(picks: dict[str, str], kept: dict[str, str], left_out: dict[str, str], tables) -> None:
+    """The stage's own check: it never adds a pick and never drops a common or a tooling one."""
+    added = set(kept) - set(picks)
+    if added:
+        raise RecipeError(f"the class stage added {len(added)} pick(s): {' '.join(sorted(added)[:6])}")
+    for n in left_out:
+        row = tables.gates.get(n)
+        if row is None or row.cls in ("common", "tooling"):
+            cls = row.cls if row is not None else "unclassed"
+            raise RecipeError(f"the class stage dropped the {cls} pick {n}")
+
+
+def class_narrow(picks: dict[str, str], changed: list[str], tables, reach, new_families: set[str]) -> ClassStage:
+    """The class stage of `affected`: the picks it keeps and the ones it leaves out.
+
+    `picks` is the recipe -> why map of the stage before (select()'s picks or narrow()'s); `changed` the changed
+    files; `tables` the three class tables; `reach` the recipe -> (the changed files it reaches through the
+    dependency graph, the changed files that are its own target's, whether its own text changed) reader;
+    `new_families` the families added since the last release tag.
+    """
+    kept: dict[str, str] = {}
+    left_out: dict[str, str] = {}
+    for n in picks:
+        row = tables.gates.get(n)
+        if row is None:
+            kept[n] = "class: no class row, so a common gate"
+            continue
+        if row.cls in ("common", "tooling"):
+            kept[n] = f"class: {row.cls}"
+            continue
+        fam = tables.families.get(row.family)
+        if fam is None:
+            raise RecipeError(f"the class row of {n} names the family {row.family}, which families.tsv does not hold")
+        reached, own, text = reach(n)
+        hit = next((f for f in changed if any(class_glob(g).match(f) for g in fam.globs)), None)
+        if text:
+            kept[n] = "class: the recipe's own text changed"
+        elif own:
+            kept[n] = f"class: the recipe's own target file {own[0]} changed"
+        elif hit is not None:
+            kept[n] = f"class: the family {row.family}'s own file {hit} changed"
+        elif fam.rep == "R" and reached:
+            kept[n] = f"class: {row.family} is a representative family and the recipe reaches {reached[0]}"
+        elif row.family in new_families:
+            kept[n] = f"class: the family {row.family} was added since the last release tag"
+        else:
+            left_out[n] = f"class: family gate of {row.family}, no file of {row.family} changed (rep {fam.rep})"
+    class_check6(picks, kept, left_out, tables)
+    return ClassStage({n: kept[n] for n in picks if n in kept}, left_out)
+
+
+def class_stage(picks: dict[str, str], changed: list[str], tables, reach, new_families: set[str],
+                enabled: bool) -> ClassStage:
+    """The class stage, off by default: without the flag the picks stand as they are."""
+    if not enabled:
+        return ClassStage(dict(picks), {})
+    return class_narrow(picks, changed, tables, reach, new_families)
+
+
+def class_picks(changed: list[str], a: Side | None, b: Side, tables, root: str = ROOT) -> ClassStage:
+    """The class stage over select()'s picks of a diff: the picks it keeps and the ones it leaves out."""
+    sels, _, _ = select(changed, a, b, GATE_PREFIX)
+    picks = {s.recipe: s.why for s in sels}
+    new_families = families_new_since(root, tables)
+    return class_narrow(picks, changed, tables, lambda n: class_reach(n, changed, a, b), new_families)
+
+
+# ---- the release list ----
+
+
+def fixture_classes(root: str = ROOT) -> dict[str, str]:
+    """The fixture tier's class of every recipe: `tools/gate-batch.sh --tier fixture --classes` (the batch's own
+    classifier, never re-implemented). A recipe the classifier does not name is not in the fixture tier."""
+    proc = subprocess.run([os.path.join(root, "tools", "gate-batch.sh"), "--tier", "fixture", "--classes"],
+                          capture_output=True, text=True, cwd=root)
+    if proc.returncode != 0:
+        raise RecipeError(f"`tools/gate-batch.sh --tier fixture --classes` failed (exit {proc.returncode}): "
+                          f"{proc.stderr.strip()[-300:]}")
+    out: dict[str, str] = {}
+    for n, line in enumerate(proc.stdout.splitlines(), 1):
+        if not line.strip():
+            continue
+        f = line.split("\t")
+        if len(f) < 2:
+            raise RecipeError(f"the classifier's line {n} is not `recipe, class, …`: {line[:80]!r}")
+        out[f[0]] = f[1]
+    return out
+
+
+def rotation_due(root: str = ROOT) -> list[str]:
+    """The rotation's due gates: `tools/rotation.py due`, the names of its list (the comment lines are its own)."""
+    proc = subprocess.run([sys.executable, os.path.join(root, "tools", "rotation.py"), "due"],
+                          capture_output=True, text=True, cwd=root)
+    if proc.returncode != 0:
+        raise RecipeError(f"`tools/rotation.py due` failed (exit {proc.returncode}): {proc.stderr.strip()[-300:]}")
+    return [ln.strip() for ln in proc.stdout.splitlines() if ln.strip() and not ln.startswith("#")]
+
+
+def release_union(parts: dict[str, list[str]]) -> tuple[list[str], dict[str, int]]:
+    """(the release list: the union of the parts, sorted, no duplicate; the count of each part)."""
+    names: set[str] = set()
+    counts: dict[str, int] = {}
+    for part, items in parts.items():
+        counts[part] = len(items)
+        names.update(items)
+    return sorted(names), counts
+
+
+def times_rows(path: str) -> tuple[dict[str, list[tuple[str, int]]], dict[str, list[tuple[str, int]]]]:
+    """(the times file's fixture-tier rows by recipe name, its plain rows by item): (lane, seconds) each, in file
+    order. A row that does not parse is counted, not read."""
+    fixture: dict[str, list[tuple[str, int]]] = {}
+    plain: dict[str, list[tuple[str, int]]] = {}
+    bad = 0
+    if not os.path.exists(path):
+        return fixture, plain
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        for ln in fh:
+            f = ln.rstrip("\n").split("\t")
+            if len(f) != 5 or not f[3].isdigit():
+                bad += 1
+                continue
+            row = (f[1], int(f[3]))
+            if "@BLOOMERY_TIER=fixture" in f[0]:
+                fixture.setdefault(f[0].split("@", 1)[0], []).append(row)
+            else:
+                plain.setdefault(f[0], []).append(row)
+    if bad:
+        print(f"release-list: {path}: {bad} malformed row(s) ignored", file=sys.stderr)
+    return fixture, plain
+
+
+def predicted_wall(names: list[str], fixture: dict[str, list[tuple[str, int]]],
+                   plain: dict[str, list[tuple[str, int]]], default: int = 45) -> dict[str, int]:
+    """The predicted wall of a list: the medians of the fixture tier's rows (the plain rows where a gate has no
+    fixture row), the lanes they ran in, and the wall the lanes make: (A+B)/2 + X (the design's model: the two
+    lanes run side by side, the solo lane after them)."""
+    lanes = {"A": 0, "B": 0, "X": 0}
+    total = 0
+    for n in names:
+        rows = fixture.get(n) or plain.get(n) or []
+        if rows:
+            last = rows[-5:]
+            secs = int(statistics.median([s for _, s in last]) + 0.5)
+            lane = last[-1][0]
+        else:
+            secs, lane = default, "A"
+        lanes[lane if lane in lanes else "X"] += secs
+        total += secs
+    return {"A": lanes["A"], "B": lanes["B"], "X": lanes["X"], "sum": total,
+            "wall": int((lanes["A"] + lanes["B"]) / 2 + lanes["X"])}
+
+
+def cmd_release_list(args: argparse.Namespace) -> int:
+    """The release batch's list: every S0 gate (a common or a tooling gate the fixture tier runs), every gate of
+    a representative family, the class-staged affected(BASE) and the rotation's due gates. One recipe per line,
+    sorted, no duplicate; the counts per part on stderr."""
+    changed, a_rev, b_rev, _ = changed_files(args.base)
+    tmp = tempfile.mkdtemp(prefix="recipes-release-")
+    try:
+        b = make_side(archive(b_rev, os.path.join(tmp, "b")) if b_rev else ROOT)
+        a = make_side(archive(a_rev, os.path.join(tmp, "a"))) if a_rev else None
+        tables = class_tables(b.tree.root)
+        classes = fixture_classes(b.tree.root)
+        s0 = [n for n, row in tables.gates.items()
+              if row.cls in ("common", "tooling") and classes.get(n) in ("A", "B", "F", "X")]
+        reps = [n for n, row in tables.gates.items()
+                if row.family and tables.families[row.family].rep == "R"]
+        affected = list(class_picks(changed, a, b, tables).kept)
+        due = rotation_due(b.tree.root)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    names, counts = release_union({"S0": s0, "R families": reps, "affected": affected, "rotation due": due})
+    for n in names:
+        print(n)
+    print("release-list: " + ", ".join(f"{k} {v}" for k, v in counts.items()) + f", {len(names)} recipe(s) in all", file=sys.stderr)
+    if args.wall:
+        fixture, plain = times_rows(args.times)
+        w = predicted_wall(names, fixture, plain)
+        print(f"release-list: the predicted wall {w['wall']} s of the medians (lanes A {w['A']} B {w['B']} X {w['X']}, "
+              f"the medians sum {w['sum']} s), × {args.lock_wait:g} = {int(w['wall'] * args.lock_wait)} s", file=sys.stderr)
+    return 0
+
+
+def class_stage_self_test(fails: list[str]) -> None:
+    """The class stage on a synthetic tree and tables: the four rules that keep a family gate, the reason a family
+    gate is left out, the check that the stage never adds a pick and never drops a common or a tooling one, the
+    default-off identity and the release list's union."""
+    expect = _expecting(fails)
+    t0 = time.monotonic()
+
+    def refused(fn, why: str) -> bool:
+        try:
+            fn()
+        except RecipeError as err:
+            return why in str(err)
+        return False
+
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="recipes-class-") as tmp:
+        root = os.path.join(tmp, "tree")
+
+        def write(rel: str, text: str) -> None:
+            p = os.path.join(root, rel)
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "w", encoding="utf-8") as fh:
+                fh.write(text)
+
+        write("tools/families.tsv", "# family\trep\tglobs\trotation_days\tfixture\n"
+              "fam-rep\tR\tcrates/fam-rep/**\t7\tno\n"
+              "fam-fix\tF\tcrates/fam-fix/**\t7\tno\n"
+              "fam-new\tF\tcrates/fam-new/**\t7\tno\n")
+        write("tools/owners.tsv", "# owner\tkind\tglobs\nown-a\tkernel\tcrates/fam-rep/a.rs\n")
+        write("tools/gate-class.tsv", "# recipe\tclass\tfamily\ttopic\towners\n"
+              "gate-rep\tfamily\tfam-rep\tkernel\town-a\n"
+              "gate-fix\tfamily\tfam-fix\tkernel\t-\n"
+              "gate-new\tfamily\tfam-new\tkernel\t-\n"
+              "gate-com\tcommon\t\thost\t-\n"
+              "gate-tool\ttooling\t\thost\t-\n")
+        write("crates/fam-rep/a.rs", "// a\n")
+        write("crates/fam-fix/b.rs", "// b\n")
+        write("crates/fam-new/c.rs", "// c\n")
+        tables = class_tables(root)
+        expect(sorted(tables.gates) == ["gate-com", "gate-fix", "gate-new", "gate-rep", "gate-tool"],
+               f"class: the synthetic table loads: {sorted(tables.gates)}")
+
+        # the synthetic reach: the changed files a recipe reaches, the changed files that are its own target's,
+        # whether its own text changed
+        reach: dict[str, tuple[list[str], list[str], bool]] = {
+            "gate-rep": (["crates/other/c.rs"], [], False),
+            "gate-fix": (["crates/other/c.rs"], [], False),
+            "gate-new": (["crates/other/c.rs"], [], False),
+            "gate-com": (["crates/other/c.rs"], [], False),
+            "gate-tool": (["crates/other/c.rs"], [], False),
+        }
+        picks = {n: "why" for n in reach}
+        changed = ["crates/other/c.rs"]
+
+        def stage(new: set[str] | None = None, ch: list[str] | None = None) -> ClassStage:
+            return class_narrow(picks, ch if ch is not None else changed, tables, lambda n: reach[n],
+                                 new if new is not None else set())
+
+        # (a) a representative family whose pick reaches a changed file
+        st = stage()
+        expect("gate-rep" in st.kept and "gate-rep" not in st.left_out,
+               f"class: a representative family is kept: {st.kept.get('gate-rep')}")
+        # (b) a changed file of the family
+        st = stage(ch=["crates/fam-fix/b.rs"])
+        expect("gate-fix" in st.kept, f"class: the family's own file keeps its gate: {st.kept.get('gate-fix')}")
+        # (c) the recipe's own text, and one of its own target files
+        reach["gate-fix"] = (["crates/other/c.rs"], [], True)
+        expect("gate-fix" in stage().kept, "class: the recipe's own text keeps its gate")
+        reach["gate-fix"] = (["crates/other/c.rs"], ["crates/fam-fix/b.rs"], False)
+        expect("gate-fix" in stage().kept, "class: the recipe's own target file keeps its gate")
+        reach["gate-fix"] = (["crates/other/c.rs"], [], False)
+        # (d) a family added since the last release tag
+        expect("gate-fix" in stage({"fam-fix"}).kept, "class: a family added since the last release tag keeps its gate")
+        # otherwise the family gate is left out, with the reason
+        st = stage()
+        want = "class: family gate of fam-fix, no file of fam-fix changed (rep F)"
+        expect(st.left_out.get("gate-fix") == want, f"class: the reason a family gate is left out: {st.left_out.get('gate-fix')!r}")
+        expect("gate-com" in st.kept and "gate-tool" in st.kept, "class: a common and a tooling pick are kept")
+        # a pick with no class row is a common gate
+        st = class_narrow({"gate-none": "why"}, changed, tables, lambda n: ([], [], False), set())
+        expect("gate-none" in st.kept and not st.left_out, f"class: a pick with no row is kept: {st.kept}")
+        # check 6: the stage never adds a pick and never drops a common or a tooling one
+        expect(refused(lambda: class_check6(picks, {**picks, "gate-extra": "why"}, {}, tables), "added 1 pick"),
+               "class: check 6 refuses a pick the stage added")
+        expect(refused(lambda: class_check6(picks, {}, {"gate-com": "why"}, tables), "dropped the common pick"),
+               "class: check 6 refuses a common pick the stage dropped")
+        # the stage is off by default
+        st = class_stage(picks, changed, tables, lambda n: reach[n], set(), False)
+        expect(st.kept == picks and not st.left_out, f"class: the stage off by default keeps every pick: {st.kept}")
+        expect("gate-fix" in class_stage(picks, changed, tables, lambda n: reach[n], set(), True).left_out,
+               "class: the stage on leaves the family gate out")
+        # the tree's own tables: every common gate is kept, and a family gate of an F family is left out
+        real = class_tables(ROOT)
+        st = class_narrow({n: "why" for n in real.gates}, ["crates/gpu/src/lib.rs"], real,
+                          lambda n: (["crates/gpu/src/lib.rs"], [], False), set())
+        expect(all(n in st.kept for n, r in real.gates.items() if r.cls in ("common", "tooling")),
+               "class: every common and tooling gate of the tree's own table is kept")
+        expect(len(st.left_out) > 0, "class: the tree's own table leaves a family gate out")
+
+        # the release list: the union of the parts, sorted, without a duplicate
+        names, counts = release_union({"S0": ["b", "a"], "R families": ["a", "c"], "rotation due": ["c"]})
+        expect(names == ["a", "b", "c"], f"release: the union is sorted and holds no duplicate: {names}")
+        expect(counts == {"S0": 2, "R families": 2, "rotation due": 1}, f"release: the count of each part: {counts}")
+
+    print(f"class stage self-test: {'ok' if not fails else f'{len(fails)} failure(s)'} ({time.monotonic() - t0:.1f} s)")
+
+
 def self_test(serial: bool = False) -> int:
     side = make_side(ROOT)
     gates = [n for n in side.recipes if n.startswith(GATE_PREFIX)]
@@ -12354,6 +12857,7 @@ def self_test(serial: bool = False) -> int:
         ("narrow", narrow),
         ("narrow table", lambda f: narrow_table_self_test(_expecting(f), side)),
         ("dispatch", lambda f: dispatch_self_test(_expecting(f), side)),
+        ("class stage", lambda f: class_stage_self_test(f)),
         ("small tools", small),
         ("key detectors", lambda f: key_detectors_self_test(_expecting(f), side)),
         ("key", lambda f: key_self_test(_expecting(f), side)),
@@ -12386,6 +12890,7 @@ def main(argv: list[str]) -> int:
     a.add_argument("--depinfo-remote", default=os.environ.get("BLOOMERY_DEPINFO_REMOTE", "~/repo/bloomery"))
     a.add_argument("--narrow", action="store_true", help=f"the gates that run the changed host path, when every --scan pair is identical or added (the rule and {GATE_PATHS}: the section above narrow())")
     a.add_argument("--scan", nargs=2, action="append", metavar=("BASE_LOG", "NEW_LOG"), help="a pair of `just ptx-scan <bin>` logs, the base tree's and the change's (repeatable)")
+    a.add_argument("--class", dest="class_stage", action="store_true", help="the class stage: keep a family gate only when the change can have moved it (the class tables; off by default)")
     ss = sub.add_parser("scan-set", help="the bins whose ptx-scans cover every kernel carrier, one line each: bin<TAB>features<TAB>the carriers it covers (tools/narrow-scan.sh scans them)")
     ss.add_argument("rev", nargs="?", help="the commit to read (a git archive of it); default the working tree")
     ss.add_argument("--ship", action="store_true", help=f"the shipped bins at the release features (tools/release/build.sh) are the first picks; {SCAN_SHIP_ENV}=1 does the same")
@@ -12451,6 +12956,11 @@ def main(argv: list[str]) -> int:
     op = sub.add_parser("opens", help="per RECIPE, whether a cargo target it builds or runs reaches the fixture fence (Tier::check_file): opens<TAB>recipe<TAB>pkg:kind:target<TAB>path:line<TAB>called, or none<TAB>recipe (tools/gate-batch.sh's real-file deferral)")
     op.add_argument("items", nargs="*", metavar="RECIPE")
     op.add_argument("--explain", action="store_true", help="the fence, the openers and each recipe's targets, on stderr")
+    rl = sub.add_parser("release-list", help="the release batch's list: every S0 gate, every gate of a representative family, the class-staged affected(BASE) and the rotation's due gates")
+    rl.add_argument("base", nargs="?", default="main", help="the release tag (or TAG..HEAD): the diff the list covers")
+    rl.add_argument("--wall", action="store_true", help="the predicted wall of the list on stderr (the fixture tier's medians)")
+    rl.add_argument("--lock-wait", type=float, default=1.57, help="the factor the predicted wall carries over the medians (the lock waits)")
+    rl.add_argument("--times", default=os.environ.get("BLOOMERY_GATE_TIMES", os.path.expanduser("~/.cache/bloomery/gate-times.tsv")), help="the times file the medians come from")
     args = ap.parse_args(argv)
     try:
         if args.self_test:
@@ -12499,6 +13009,8 @@ def main(argv: list[str]) -> int:
             return cmd_expand(args)
         if args.cmd == "rows":
             return cmd_rows(args)
+        if args.cmd == "release-list":
+            return cmd_release_list(args)
         ap.print_help()
         return 64
     except RecipeError as err:
