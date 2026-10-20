@@ -329,9 +329,7 @@ dependencies = [
  "bloomery-runtime",
  "bloomery-threads",
  "bloomery-tokenizer",
- "flate2",
  "libc",
- "serde_json",
  "sha2",
  "thiserror",
 ]
