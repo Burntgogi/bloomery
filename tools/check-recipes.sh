@@ -412,6 +412,7 @@ blk_pytools() {
     "tools/review/run.py --self-test"
     "tools/review/signals.py --self-test"
     "tools/review/usage.py --self-test"
+    "tools/rotation.py --self-test"
     "tools/type-census.py --self-test"
     "tools/verdict-diff.py --self-test"
   )

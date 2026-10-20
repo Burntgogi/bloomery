@@ -78,6 +78,8 @@ reference; what follows is the contract.
   rows in `tools/gate-paths.tsv` or its own text changes. `just stage-gpu-load-v41 [--plan a]` (plan (b) staged on
   both cards, checked byte for byte; solo) is never selected: a change to `crates/model/src/placement.rs`,
   `placement/{workstation,host_lock}.rs`, `crates/gpu/src/{hybrid,weights}.rs` or `gate_load_v41.rs` runs it by name.
+  `just weekly` also runs the rotation (`tools/rotation.py due`): every gate a fixture-tier landing defers (real-only,
+  real-file, no-fixture, needs-env) that has no green row at its current key and none in 7 days; `just rotation-due` prints it.
 - `just gate` excludes the measure targets (they need a quiet machine and a lock) and `just deny`. Build artifacts land
   in the workspace root `target/`; the measure runners read only from there.
 
