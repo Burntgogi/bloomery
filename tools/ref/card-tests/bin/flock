@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""A stand-in for util-linux flock(1) where there is none (the Mac), for tools/ref/card-tests/run.sh.
+"""A stand-in for util-linux flock(1) where there is none (the Mac), used by the timing-card self-tests.
 
 It takes the forms lease.sh and the tests use, `flock [-s] [-n | -w SECS] [-E CODE] FD` and
 `flock [-s] [-n | -w SECS] [-E CODE] FILE COMMAND...`, and locks with flock(2) through fcntl.flock, as
