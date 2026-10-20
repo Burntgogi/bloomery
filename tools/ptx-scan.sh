@@ -46,6 +46,10 @@
 #   PTX_SCAN_EXTRACT (default target/release/oxart_ptx) and
 #   PTX_SCAN_JIT (default oxart_jit, a target/release binary run through tools/gpu-gate.sh)
 #   override the tools.
+#   An entry substring limits what is read, not only what is printed: ptxas and the byte scan read the modules that hold an entry
+#   whose name contains it, stderr names how many of the section's modules that is, and a module with no match is not assembled (a
+#   module only ptxas would reject does not fail such a scan). The extractor and the driver JIT still take the whole section; a
+#   substring no module's entry holds ends the scan `rows=0` before the JIT.
 #   --no-jit (anywhere among the words; the only flag) skips the driver JIT: no card, no gate lock, no
 #   wait on a landing batch's GPU hold. The banner then names `jit=skipped(no-jit)` in place of
 #   jit-card/jit-cc/jit-cuda, and every jit_regs and jit_local cell reads `skipped(no-jit)` — never
@@ -188,8 +192,10 @@ printf 'mod1 bundle=fixture bytes=1\nmod2 bundle=fixture bytes=1\n'
 ''')
     executable(binaries / "ptxas", '''
 case $1 in --version) echo 'Cuda compilation tools, release 13.3, V13.3.73'; exit 0 ;; esac
-[ "${PTX_FIX_FAIL:-0}" = 0 ] || { echo 'fixture assembly failure' >&2; exit 1; }
 for arg; do case $arg in *.ptx) module=${arg##*/} ;; esac; done
+[ -z "${PTX_FIX_LOG:-}" ] || echo "$module" >> "$PTX_FIX_LOG"
+# PTX_FIX_FAIL=1 rejects every module, PTX_FIX_FAIL=<modN.ptx> that one.
+case ${PTX_FIX_FAIL:-0} in 0) ;; 1 | "$module") echo 'fixture assembly failure' >&2; exit 1 ;; esac
 case $module in
     mod1.ptx)
         printf "ptxas info : Compiling entry function 'q4k_gemv' for 'sm_86'\nptxas info : 4 bytes spill stores, 4 bytes spill loads\nptxas info : Used 32 registers, 256 bytes smem\n"
@@ -346,6 +352,40 @@ printf 'q4k_gemv\t32\t0\t256\t128\nzero_loads\t12\t0\t0\t1024\nnext_module\t16\t
     missing = scan(["--no-jit", "gate_x", "absent"])
     check("empty filter remains a failed scan", missing.returncode == 1
           and "rows=0 scan=failed" in missing.stdout and "entry " not in missing.stdout)
+    # An entry substring reads only the modules that hold a matching entry: ptxas runs on those alone, a module with no match that
+    # it would reject does not fail the scan, and the kept entries' rows and digest lines are the unfiltered scan's, byte for byte.
+    log = root / "ptxas.log"
+
+    def assembled(args, extra=None):
+        log.write_text("", encoding="utf-8")
+        r = scan(args, dict(extra or {}, PTX_FIX_LOG=str(log)))
+        return r, log.read_text(encoding="utf-8").split()
+
+    full_lines = result.stdout.splitlines()
+    only2, seen2 = assembled(["--no-jit", "gate_x", "next_mod"])
+    kept = [ln for ln in full_lines if ln.startswith(("next_module ", "ptx-scan-md5:"))]
+    check("entry filter: ptxas and the byte scan read the one module that holds a match", only2.returncode == 0
+          and seen2 == ["mod2.ptx"] and "read 1 of 2 modules" in only2.stderr)
+    check("entry filter: the kept entry's row and digest line are the unfiltered scan's, byte for byte",
+          all(ln in only2.stdout.splitlines() for ln in kept) and len(only2.stdout.splitlines()) == 5)
+    _, _, only2_rows, only2_digests, _ = parsed(only2)
+    check("entry filter: the parsed row and digest are the unfiltered scan's", only2_rows == {"next_module": rows["next_module"]}
+          and only2_digests == {"next_module": digests["next_module"]})
+    only1, seen1 = assembled(["--no-jit", "gate_x", "q4k"])
+    check("entry filter: the other module is the one skipped", only1.returncode == 0 and seen1 == ["mod1.ptx"])
+    both, seen_both = assembled(["--no-jit", "gate_x", "_"])
+    check("entry filter: a match in every module skips none and says nothing", both.returncode == 0
+          and seen_both == ["mod1.ptx", "mod2.ptx"] and "modules:" not in both.stderr)
+    rejected_skipped = scan(["--no-jit", "gate_x", "next_mod"], {"PTX_FIX_FAIL": "mod1.ptx"})
+    check("entry filter: a module with no match that ptxas rejects does not fail the scan", rejected_skipped.returncode == 0
+          and parsed(rejected_skipped)[2] == {"next_module": rows["next_module"]})
+    rejected_read = scan(["--no-jit", "gate_x"], {"PTX_FIX_FAIL": "mod1.ptx"})
+    check("the same module fails the scan with no entry filter", rejected_read.returncode == 1
+          and "ptxas-failed=mod1 scan=failed" in rejected_read.stdout)
+    no_match, seen_none = assembled(["gate_x", "absent"], {"PTX_FIX_JIT_RC": "75"})
+    check("entry filter: no module holds a match: nothing is assembled and the driver JIT is not reached", no_match.returncode == 1
+          and seen_none == [] and "modules=2 filter=absent rows=0 scan=failed" in no_match.stdout
+          and "entry " not in no_match.stdout)
     # md5sum and wc stand-ins first on PATH (tools/ref/read-stubs.sh): a read that fails, of a normalized body's digest or
     # line count or of the section's size, fails the scan by name with no rows and no digest block.
     stubs = root / "read-stubs"
@@ -515,8 +555,27 @@ if [ -n "${PTX_SCAN_KEEP:-}" ]; then
 fi
 MODFILES=()
 for ((i = 1; i <= NMOD; i++)); do MODFILES+=("$MODS/mod$i.ptx"); done
+# An entry substring (header) drops every other entry from the table, so a module with no matching entry is neither assembled nor
+# byte-scanned: the pre-pass reads the entry names with the byte scan's own rule (the text between `.visible .entry ` and `(`, a
+# literal substring test), and the kept modules keep their order. The driver JIT below still loads the whole section.
+SCANFILES=("${MODFILES[@]}")
+if [ -n "$FILTER" ]; then
+  SCANFILES=()
+  while IFS= read -r MOD; do SCANFILES+=("$MOD"); done < <(LC_ALL=C awk -v filter="$FILTER" '
+    /\.visible \.entry / {
+      name = $0; sub(/.*\.visible \.entry /, "", name); sub(/\(.*/, "", name)
+      if (index(name, filter) > 0 && !(FILENAME in hit)) { hit[FILENAME] = 1; print FILENAME }
+    }' "${MODFILES[@]}")
+  if [ "${#SCANFILES[@]}" = 0 ]; then
+    echo "ptx-scan: no entry name contains $FILTER" >&2
+    fail "$SEC $TOOLS modules=$NMOD filter=$FILTER rows=0"
+  fi
+  if [ "${#SCANFILES[@]}" != "$NMOD" ]; then
+    echo "ptx-scan: ptxas and the byte scan read ${#SCANFILES[@]} of $NMOD modules: the others hold no entry name containing $FILTER" >&2
+  fi
+fi
 FAILED=
-for MOD in "${MODFILES[@]}"; do
+for MOD in "${SCANFILES[@]}"; do
   # A module ptxas rejects (a .version it does not know, a wrong -arch) has no ptxas columns.
   if ! "$PTXAS" -arch="$ARCH" -v "$MOD" -o /dev/null 2>"$MOD.err"; then
     echo "ptx-scan: ptxas failed on $(basename "$MOD"): $(head -1 "$MOD.err")" >&2
@@ -699,7 +758,7 @@ name != "" {
   tally_global(global_line)
 }
 END { flush() }
-' "${MODFILES[@]}" | LC_ALL=C sort -k1,1n -k2,2 | cut -f2- >"$ROWS"; then
+' "${SCANFILES[@]}" | LC_ALL=C sort -k1,1n -k2,2 | cut -f2- >"$ROWS"; then
   fail "$SEC $TOOLS modules=$NMOD bytescan=failed"
 fi
 if [ -s "$UNREAD" ]; then
