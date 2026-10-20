@@ -16,7 +16,7 @@ network, never rewrites Cargo.lock), and the sources as text. It builds nothing 
     python3 tools/recipes.py why FILE... [--recipe R]...  # every recipe a file selects, with the chain; --recipe R: whether R's key holds it and R's shortest dependency chain to the file's crate
     python3 tools/recipes.py gaps [CRATE...] [--rev REV] [--list]  # per crate: recipes whose key holds a file of it, recipes whose targets reach code of it, the gap; exit 1 on a gap of a pinned crate (KEY_REACH_PINS)
     python3 tools/recipes.py rows              # tools/gate-paths.tsv as narrow() reads it: each `derive` row's gates written out, line for line (cached by tree)
-    python3 tools/recipes.py reach FILE... [--brief] [--row]  # the gates whose targets can run the file's code, each with a chain
+    python3 tools/recipes.py reach FILE... [--brief] [--row]  # the gates whose targets can run the file's code, each with a chain (--brief: the reason it is kept: a static chain, or the registry row its model files name)
     python3 tools/recipes.py key --manifest F [--ledger L [--round-ledger R]] ITEM...  # the green ledger's key per item
     python3 tools/recipes.py box-manifest      # on the box, through tools/box.sh: the key's box part
     python3 tools/recipes.py box-command RECIPE  # the recipe's box.sh command, verbatim (tools/mac-check.sh derives from it)
@@ -225,8 +225,9 @@ from bloomery.fixture_dirs import FAMILY_NAME, FIXTURE_DIRS, REF_PATHS, RecipeEr
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 GATE_PREFIX = "gate-"
-# A gate taken out of the landing batch: `just weekly` runs every one, and `just affected` names one only when a
-# changed file matches one of its trigger rows in tools/gate-paths.tsv, or its own recipe text changed.
+# A gate taken out of the landing batch: `just weekly` runs every one (and the rotation's due list, tools/rotation.py),
+# and `just affected` names one only when a changed file matches one of its trigger rows in tools/gate-paths.tsv, or its
+# own recipe text changed.
 WEEKLY_PREFIX = "weekly-"
 # The checks the lead's batches always run; the diff does not pick them.
 ALWAYS = ["check-recipes", "check-rustflags", "check-comments", "check-levers", "check-arch", "check-model-tax", "check", "fmt-check", "lint"]
@@ -2527,7 +2528,7 @@ def cmd_reach(args: argparse.Namespace) -> int:
               f"{len(own)} read it as their own target's (narrow() picks those without a row)")
         for n in held:
             union[n] = None
-            print(f"  {n}" + ("" if args.brief else f"  {reach_chain(tree, graph, n, got[n])}"))
+            print(f"  {n}" + (f"  [{reach_of(tree).reason(graph, n, got[n])}]" if args.brief else f"  {reach_chain(tree, graph, n, got[n])}"))
         left = [n for n in dep if n not in got and n not in NARROW_ALWAYS]
         if left:
             print(f"  not reached ({len(left)}): {' '.join(left)}")
@@ -3467,6 +3468,61 @@ def rust_facts(text: str, test: bool) -> RustFacts:
 RootKey = tuple[str, str, bool]  # (package, target root file, cfg(test))
 Hit = tuple[RootKey, str, int]  # (the root a file is compiled in, the file, the unit's index; -1: a data file)
 
+# ---- run-time dispatch by the opened file's architecture: the arch registry ----
+#
+# The registry's table holds one row per group of `general.architecture` strings, and a row holds function pointers: the
+# family's reader (`read: Some(qwen35moe::spec::read)`) and its draft rule. `registry::row_of(arch)` picks a row by the
+# architecture of the file a program opened, so the item graph below reaches every family's reader from every unit that
+# names the table (rule 6 of Reach). The edges from the table to a row's entries are therefore dispatch edges: a gate's
+# reach keeps the ones of a row only when the gate can open a file of that row (Reach.gate_archs: its profile, the names
+# of its own targets, the /models paths they name), or walks the table itself (a fn of the registry that takes no key and
+# names the table, and its tests). A unit a closed row's entries lead to stays reached when it lies outside the architecture
+# tree, the registry's directory (ops, placement, the kernel crates: what a reader calls, a gate's other code calls too);
+# a file of the tree only a closed row leads to is left out of the gate's reach.
+# A gate that selects its model file some other way (a command line flag, an environment variable, a recipe the Mac runs)
+# keeps every row.
+ARCH_REGISTRY = ("crates/model/src/arch/registry.rs", "ROWS")  # (file, the table's static)
+# What picks a model file other than the profile: `-m PATH`, `--hf`, `--model`, a reference-model variable.
+MODEL_SELECTORS = re.compile(r"BLOOMERY_REF_MODEL|BLOOMERY_V41_MODEL|(?:^|\s)(?:-m|--model|--hf)(?:\s|=)")
+_ROW_START = re.compile(r"\bArchRow\s*\{")
+_ROW_NAMES = re.compile(r"\bnames\s*:\s*(&\s*\[[^\]]*\]|[A-Za-z_][A-Za-z0-9_]*)")
+_ROW_PICK = re.compile(r"\b(?:read|draft)\s*:\s*Some\s*\(\s*([A-Za-z_][A-Za-z0-9_]*(?:\s*::\s*[A-Za-z_][A-Za-z0-9_]*)*)\s*\)")
+_STR_LIT = re.compile(r'"([^"\\]*)"')
+_IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+ANY_ARCH = "*"  # a row whose strings the reach cannot read: every gate keeps it
+DEFAULT_SIGNAL = "the default profile"  # a box command that sets no BLOOMERY_MODEL: no evidence of its own
+
+
+def arch_norm(name: str) -> str:
+    """An architecture string, a profile or a target name in one spelling: `glm5-next` and `glm5_next` are one."""
+    return name.replace("-", "_").lower()
+
+
+@dataclass
+class Dispatch:
+    """The registry's table in one root: its node, each row's architecture strings (arch_norm), the node of each row's
+    entries (reader, draft rule) with the rows that name it, and the units that walk every row."""
+
+    node: int
+    rows: list[frozenset[str]]
+    entries: dict[int, frozenset[int]]
+    enumerators: frozenset[int]
+
+
+def _matching(shape: str, at: int) -> int:
+    """The index just past the bracket that closes the one at `at` (shape has its strings and comments blanked)."""
+    pairs = {"[": "]", "{": "}", "(": ")"}
+    stack = [pairs[shape[at]]]
+    for i in range(at + 1, len(shape)):
+        c = shape[i]
+        if c in pairs:
+            stack.append(pairs[c])
+        elif stack and c == stack[-1]:
+            stack.pop()
+            if not stack:
+                return i + 1
+    raise RecipeError(f"{ARCH_REGISTRY[0]}: a bracket at offset {at} is never closed")
+
 
 class RuleSet:
     """Rule 1's associated items and their indexes: by a unit their header names, by the name a reached unit must
@@ -3499,8 +3555,9 @@ class Reach:
       M is a namespace on the way. A path's first segment resolves as rustc's: `crate`, `self`, `super`, a child
       module, a name a `use` leaf of the file binds, a workspace crate's name (crate_idents); any other (std, an
       external crate, a local variable, a generic) names nothing of the workspace. A name M neither defines nor
-      imports by name (an item a macro writes) reaches every unit of M. A path that ends at a module is a
-      namespace, and a `mod` declaration no edge: declaring a module runs none of its code.
+      imports by name (an item a macro writes) reaches every unit of M; a name M imports is accounted for, and a
+      path through it that ends at a module or an external item reaches M's `use` unit only. A path that ends at a
+      module is a namespace, and a `mod` declaration no edge: declaring a module runs none of its code.
     - a method. Method syntax names no path but always the method's name: a trait in scope in a unit's file (a
       private `use` of it, its own definition, a glob-imported module's) is reached by a unit that names one of the
       trait's fns, and an associated item by the rule for impls below.
@@ -3525,9 +3582,11 @@ class Reach:
     5. Macros. A `name!` call reaches the `macro_rules! name` units of the same root (textual scope, `#[macro_use]`
        modules included); a `#[macro_export]` macro is an item of its crate's root, so a path to it or a `use` of
        it reaches it; the macro's body is that unit's code, and its `$crate::` paths resolve in its crate.
-    6. Run-time dispatch by value (an `Arch` match). Every arm's path is named, so every arm is reached: the static
-       reach over-selects there, and a row that leaves such a gate out says so as a named exception
-       (gate_paths_problems).
+    6. Run-time dispatch by value. An `Arch` match names every arm's path, so every arm is reached: the static reach
+       over-selects there, and a row that leaves such a gate out says so as a named exception (gate_paths_problems). The
+       registry's table of readers is read as what it is (Dispatch): its edges to a row's entries are kept for a gate that
+       can open a file of that row, or walks the table, and cut for the others (gate, Reach.gate_archs); a dispatch
+       elsewhere (a serve seat table, coverage::check's pin table) is still this rule's exception.
 
     The seeds: a test harness (a lib's own tests, a test file) runs its `#[test]` fns, and its own impls follow rule 1
     in its own root; any other target (a bin, `cargo test --bin` too) and a test file with no `#[test]` fn is
@@ -3570,6 +3629,13 @@ class Reach:
         self._traits: dict[tuple, list[tuple[Hit, frozenset[str], str]]] = {}
         self._rules: RuleSet | None = None
         self._own_rules: dict[RootKey, RuleSet] = {}
+        self._dispatch: dict[RootKey, Dispatch] | None = None
+        self._rows_nodes: dict[int, Dispatch] = {}
+        self._enum_nodes: frozenset[int] = frozenset()
+        self._family_dirs: tuple[str, ...] = ()
+        self._archs: dict[tuple[str, str], tuple[frozenset[str] | None, dict[str, str]]] = {}
+        self._dropped: dict[tuple[str, str], frozenset[int]] = {}
+        self._dir_archs: dict[str, set[str]] | None = None
 
     def text(self, f: str) -> str:
         if f not in self._text:
@@ -3755,12 +3821,16 @@ class Reach:
         own = facts.named.get((ctx, name))
         if own:
             return [(rk, fm, i) for i in own]
-        if not mod and rk in self.lib_roots and name in self.exported(rk[0]):
-            return [(rk, g, i) for g, i in self.exported(rk[0])[name]]
+        lrk = (rk[0], rk[1], False)  # a lib's own test build names the same exported macros, units of the lib's non-test view
+        if not mod and lrk in self.lib_roots and name in self.exported(rk[0]):
+            return [(lrk, g, i) for g, i in self.exported(rk[0])[name]]
         out: list[Hit] = []
-        for bp in facts.scoped.get((ctx, name), []):
+        leaves = facts.scoped.get((ctx, name), [])
+        for bp in leaves:
             out += self.resolve(rk, mod, bp + rest, strict, name if bp[0] == name else "")
-        if out:
+        # a name the module imports is accounted for even when its path ends at a namespace (a module, an external
+        # crate's item): the import is the unit it reaches, never every unit of the module
+        if out or leaves:
             return out + [(rk, fm, facts.uses)]
         for c, bp in facts.globs:
             if c == ctx:
@@ -3962,14 +4032,216 @@ class Reach:
             self._own_rules[rk] = RuleSet(self.root_rules(rk, sorted(set(self.mods(rk).values()))))
         return self._own_rules[rk]
 
+    # -- the registry's dispatch --
+
+    def dispatches(self) -> dict[RootKey, Dispatch]:
+        """The registry's table in each root that compiles its file (the lib's, and the lib's own test build), read once;
+        none for a tree without the registry's file."""
+        if self._dispatch is None:
+            self._dispatch = {}
+            path, static = ARCH_REGISTRY
+            dirs: set[str] = set()
+            enum: set[int] = set()
+            if self.tree.exists(path):
+                for pname, p in sorted(self.tree.packages.items()):
+                    lib = p.lib()
+                    for test in (False, True) if lib is not None else ():
+                        rk = (pname, lib.src, test)
+                        if path not in self.mods(rk).values():
+                            continue
+                        d = self._read_table(rk, path, static)
+                        if d is None:
+                            continue
+                        self._dispatch[rk] = d
+                        self._rows_nodes[d.node] = d
+                        enum |= d.enumerators
+                        dirs.add(os.path.dirname(path))
+            self._enum_nodes = frozenset(enum)
+            self._family_dirs = tuple(sorted(dirs))
+        return self._dispatch
+
+    def _read_table(self, rk: RootKey, path: str, static: str) -> Dispatch | None:
+        facts = self.facts(rk, path)
+        idx = [i for i in facts.named.get(((), static), []) if facts.units[i].kind == "static"]
+        if not idx:
+            return None
+        u = facts.units[idx[0]]
+        code, shape = build_view(self.text(path), rk[2])
+        head = re.search(rf"\bstatic\s+{re.escape(static)}\b", shape)
+        if head is None:
+            return None
+        lb = shape.index("[", shape.index("=", head.end()))
+        end = _matching(shape, lb)
+        bases = self.bases(rk, path) or [()]
+        rows: list[frozenset[str]] = []
+        entries: dict[int, frozenset[int]] = {}
+        for m in _ROW_START.finditer(shape, lb, end):
+            block = code[m.start() : _matching(shape, m.end() - 1)]
+            r = len(rows)
+            rows.append(self._row_names(rk, path, u, block, bases))
+            for text in _ROW_PICK.findall(block):
+                for b in bases:
+                    for h in self.resolve(rk, b + u.ctx, tuple(re.split(r"\s*::\s*", text))):
+                        if h[2] >= 0:
+                            x = self.node(h)
+                            entries[x] = entries.get(x, frozenset()) | {r}
+        # a fn of the registry that takes no key and names the table walks every row (its tests too); `row_of(arch)` does not
+        lines = shape.split("\n")
+        enum = set()
+        for k, e in enumerate(facts.units):
+            if e.kind == "fn" and e.name and static in e.idents:
+                window = "\n".join(lines[e.line - 1 : e.line + 5])
+                if re.search(rf"\bfn\s+{re.escape(e.name)}\s*(?:<[^>{{]*>)?\s*\(\s*\)", window):
+                    enum.add(self.node((rk, path, k)))
+        return Dispatch(self.node((rk, path, idx[0])), rows, entries, frozenset(enum))
+
+    def _row_names(self, rk: RootKey, path: str, u: Unit, block: str, bases: list[tuple[str, ...]]) -> frozenset[str]:
+        """A row's architecture strings: the literals of its `names`, and the strings of each const it names."""
+        m = _ROW_NAMES.search(block)
+        if m is None:
+            return frozenset({ANY_ARCH})
+        out = {arch_norm(x) for x in _STR_LIT.findall(m.group(1))}
+        for ident in _IDENT.findall(_STR_LIT.sub("", m.group(1))):
+            got = None
+            for b in bases:
+                local = [(rk, path, i) for i in self.facts(rk, path).named.get((u.ctx, ident), ())]
+                for h in local or self.resolve(rk, b + u.ctx, (ident,)):
+                    if h[2] >= 0 and self.facts(h[0], h[1]).units[h[2]].kind == "const":
+                        cm = re.search(rf"\bconst\s+{ident}\b[^;]*;", rust_lex(self.text(h[1]))[0])
+                        if cm:
+                            got = {arch_norm(x) for x in _STR_LIT.findall(cm.group(0))}
+            if got is None:
+                return frozenset({ANY_ARCH})
+            out |= got
+        return frozenset(out) or frozenset({ANY_ARCH})
+
+    def _family_file(self, f: str) -> bool:
+        """Whether `f` lies in the architecture tree (the registry's directory), whose code a family's reader reaches."""
+        return any(f.startswith(d + "/") for d in self._family_dirs)
+
+    def rows_open(self, graph: Graph, n: str) -> frozenset[int] | None:
+        """The rows of the registry's table gate `n` can open a file of, as row numbers; None for every row (the gate's
+        files are not known, or the tree has no registry)."""
+        d = next(iter(self.dispatches().values()), None)
+        if d is None:
+            return None
+        archs, _ = self.gate_archs(graph, n)
+        if archs is None:
+            return None
+        return frozenset(i for i, names in enumerate(d.rows) if ANY_ARCH in names or names & archs)
+
+    def gate_archs(self, graph: Graph, n: str) -> tuple[frozenset[str] | None, dict[str, str]]:
+        """(the architecture strings (arch_norm) of the model files gate `n` can open, each with the signal that named it;
+        None when they cannot be told, with the reason under the key ``). The signals: the BLOOMERY_MODEL of each box
+        command of the recipe and its dependencies (no BLOOMERY_MODEL is the default profile); the names of the gate's own
+        cargo targets, which name a row's string (`qwen35moe_meta`); the /models paths its own targets' sources name, by the
+        profile that defines that directory or the fixture directory of a family. A recipe the Mac runs, a model file
+        picked by a flag or a reference-model variable, a profile no row names, and a /models path nothing explains with
+        no other signal, are not told: every row stays open."""
+        key = (n, graph.recipes[n].text)
+        if key in self._archs:
+            return self._archs[key]
+        out, why = self._gate_archs(graph, n)
+        self._archs[key] = (out, why)
+        return out, why
+
+    def _gate_archs(self, graph: Graph, n: str) -> tuple[frozenset[str] | None, dict[str, str]]:
+        recipes = graph.recipes
+        d = next(iter(self.dispatches().values()))
+        known = frozenset().union(*d.rows)
+        found: dict[str, str] = {}
+        for r in recipe_closure(recipes, n):
+            mac, unmodeled = command_shape(recipes[r])
+            if mac or unmodeled:
+                return None, {"": f"{r} runs `{(mac or unmodeled)[0]}` outside tools/box.sh's modeled shapes"}
+            body = "\n".join(ln for ln in recipes[r].lines if not ln.lstrip("@- ").startswith("#"))
+            sel = MODEL_SELECTORS.search(body)
+            if sel:
+                return None, {"": f"{r} picks its model file by `{sel.group(0).strip()}`"}
+            for m in graph.inputs(r).commands.models:
+                prof = DEFAULT_PROFILE if m is None else m
+                if not FAMILY_NAME.fullmatch(prof):
+                    return None, {"": f"{r} runs under the profile {prof!r}, which is not a plain name"}
+                a = arch_norm(prof)
+                if ANY_ARCH not in known and a not in known:
+                    return None, {"": f"{r} runs under the profile {prof}, which no row of the registry names"}
+                found.setdefault(a, f"profile {prof}" if m is not None else DEFAULT_SIGNAL)
+        lits: set[str] = set()
+        for pname, kind, tname, _ in graph.inputs(n).targets:
+            if kind in ("lib", "doctest"):
+                continue
+            pkg = self.tree.packages[pname]
+            t = pkg.lib() if kind == "libtest" else pkg.find(kind, tname or "")
+            if t is None:
+                continue
+            label = tname or pname
+            for a in sorted(known - {ANY_ARCH}):
+                if a in arch_norm(label):
+                    found.setdefault(a, f"target {label}")
+            own = self.tree.tree_of(t.src, True)[0]
+            if kind == "libtest":
+                own = own - self.tree.tree_of(t.src)[0]
+            for f in sorted(own):
+                if f.endswith(".rs"):
+                    lits |= {x for x in MODEL_LITERAL.findall(rust_lex(self.tree.read(f))[0])}
+        stray = []
+        for lit in sorted(lits):
+            arch = self.literal_archs(lit)
+            for a in arch:
+                found.setdefault(a, f"names {lit}")
+            if not arch and not lit.startswith((FIXTURE_ROOT, VARIANT_ROOT)):
+                stray.append(lit)
+        if stray and all(w == DEFAULT_SIGNAL for w in found.values()):
+            return None, {"": f"its targets name {stray[0]}, which no profile defines, and nothing else tells its family"}
+        return frozenset(found), found
+
+    def literal_archs(self, lit: str) -> set[str]:
+        """The architecture strings a /models path stands for: the profile whose directory it is (or which it extends by a
+        `-` suffix: a quant of the same checkpoint), the family of a fixture directory under the fixture root."""
+        if self._dir_archs is None:
+            self._dir_archs = {}
+            root = self.tree.root
+            env = {k: v for k, v in os.environ.items() if k not in ("BLOOMERY_REF_MODEL", "BLOOMERY_TIER")}
+            for prof in sorted(glob.glob(os.path.join(root, "tools/ref/models/*.sh"))):
+                for dd in profile_dirs(root, os.path.relpath(prof, root), env):
+                    self._dir_archs.setdefault(dd, set()).add(arch_norm(os.path.basename(prof)[:-3]))
+            if self.tree.exists(FIXTURE_DIRS) and self.tree.exists(REF_PATHS):
+                rows, _ = fixture_table(self.tree.read(FIXTURE_DIRS), self.tree.read(REF_PATHS))
+                for fam, fdir in rows.items():
+                    if fdir not in ("self", "none"):
+                        self._dir_archs.setdefault(f"{FIXTURE_ROOT}/{fdir}", set()).add(arch_norm(fam))
+        out: set[str] = set()
+        for dd, a in self._dir_archs.items():
+            if lit == dd or lit.startswith(dd + "/") or lit.startswith(dd + "-"):
+                out |= a
+        return out
+
     # -- gates --
 
     def gate(self, graph: Graph, n: str) -> dict[int, tuple[int, str]]:
         """Every unit gate `n`'s targets reach: node -> (the node it was reached from, the step); a target's own
-        unit -> (-1, the target)."""
+        unit -> (-1, the target). The registry's dispatch edges of the rows the gate cannot open are cut (the section
+        above Dispatch); what only they reached inside the architecture tree is in the map for its chains and in
+        `dropped`, which gate_files leaves out."""
         key = (n, graph.recipes[n].text)
         if key in self._gates:
             return self._gates[key]
+        rows = self.rows_open(graph, n)
+        full = self._close(graph, n, None)
+        if rows is None:
+            self._gates[key], self._dropped[key] = full, frozenset()
+            return full
+        cut = self._close(graph, n, rows)
+        self._dropped[key] = frozenset(m for m in full if m not in cut and self._family_file(self.nodes[m][1]))
+        self._gates[key] = {**full, **cut}
+        return self._gates[key]
+
+    def _close(self, graph: Graph, n: str, open_rows: frozenset[int] | None) -> dict[int, tuple[int, str]]:
+        """The closure of gate `n`'s targets; `open_rows`, when given, are the only rows of the registry's table whose
+        entries its dispatch edges lead to, until a unit that walks every row is reached."""
+        self.dispatches()
+        cut = open_rows is not None and bool(self._rows_nodes)
+        held: list[tuple[int, int, str]] = []
         ri = graph.inputs(n)
         linked = set(ri.files)
         sets = [self.rules()]
@@ -4025,6 +4297,16 @@ class Reach:
         while True:
             while work:
                 m = work.pop()
+                dis = None
+                if cut:
+                    if m in self._enum_nodes:
+                        cut = False
+                        for src, x, how in held:
+                            if x not in par:
+                                par[x] = (src, how)
+                                work.append(x)
+                        held.clear()
+                    dis = self._rows_nodes.get(m)
                 for rs in sets:
                     for i in rs.by_node.get(m, ()):
                         fire(rs, i)
@@ -4038,6 +4320,9 @@ class Reach:
                                     fire(rs, i)
                 for x, how in self.edges(m):
                     if x not in par and nodes[x][1] in linked:
+                        if cut and dis is not None and x in dis.entries and not dis.entries[x] & open_rows:
+                            held.append((m, x, how))
+                            continue
                         par[x] = (m, how)
                         work.append(x)
             # a build script's output (its env, cfgs and OUT_DIR files) reaches only its own crate's code
@@ -4050,7 +4335,6 @@ class Reach:
                         seed(h, f"build script of {bpkg}, its crate reached")
             if not work:
                 break
-        self._gates[key] = par
         return par
 
     def gate_files(self, graph: Graph, n: str) -> dict[str, int]:
@@ -4059,9 +4343,33 @@ class Reach:
         if key not in self._gate_files:
             out: dict[str, int] = {}
             for m in self.gate(graph, n):
-                out.setdefault(self.nodes[m][1], m)
+                if m not in self._dropped[key]:
+                    out.setdefault(self.nodes[m][1], m)
             self._gate_files[key] = out
         return self._gate_files[key]
+
+    def reason(self, graph: Graph, n: str, m: int) -> str:
+        """Why gate `n` keeps unit `m`: a static chain, a registry row its model files name (with the signal that named it),
+        or a gate that cannot tell its files / walks the whole table, which keeps every row."""
+        par = self.gate(graph, n)
+        self.dispatches()
+        at, via = m, None
+        while par[at][0] >= 0:
+            src, _ = par[at]
+            d = self._rows_nodes.get(src)
+            if d is not None and at in d.entries:
+                via = sorted({x for r in d.entries[at] for x in d.rows[r]})
+            at = src
+        if via is None:
+            return "static chain"
+        archs, why = self.gate_archs(graph, n)
+        walks = next((self.label(x) for x in sorted(self._enum_nodes) if x in par), None)
+        if walks is not None:
+            return f"registry row {'/'.join(via)}: the gate walks every row ({walks})"
+        if archs is None:
+            return f"registry row {'/'.join(via)}: every row open ({why[''] if '' in why else 'files not told'})"
+        signal = next((why[a] for a in sorted(archs) if a in via), "opens a file of the row")
+        return f"registry row {'/'.join(via)}: {signal}"
 
     def label(self, m: int) -> str:
         rk, f, k = self.nodes[m]
@@ -10633,6 +10941,176 @@ def narrow_self_test(expect, side: Side) -> None:
         expect([r.glob for r in got[0]] == ["crates/x/**"] and got[1] is None, f"weekly: the rows of the tree read, not the working tree's: {got}")
 
 
+def dispatch_self_test(expect, side: Side) -> None:
+    """The registry's dispatch edges (Dispatch): a synthetic workspace with a registry of two families, one clause per rule it
+    decides, and the same rules on the real tree (a gate that cannot open a family is not selected for that family's files
+    by the registry's pointer; every gate that opens it is; a file a family shares is selected as before)."""
+    dispatch_synthetic_self_test(expect)
+    dispatch_real_self_test(expect, side)
+
+
+def dispatch_synthetic_self_test(expect) -> None:
+    reg_path, static = ARCH_REGISTRY
+    rows_src = (
+        "use super::{fam_alpha, fam_beta};\n"
+        "pub struct ArchRow {\n    pub names: &'static [&'static str],\n    pub read: Option<fn() -> u32>,\n}\n"
+        "pub const ALIAS: &str = \"beta-alias\";\n"
+        f"pub static {static}: &[ArchRow] = &[\n"
+        "    ArchRow {\n        names: &[\"deepseek2\"],\n        read: None,\n    },\n"
+        "    ArchRow {\n        names: &[\"alpha\"],\n        read: Some(fam_alpha::read),\n    },\n"
+        "    ArchRow {\n        names: &[\"beta\", ALIAS],\n        read: Some(fam_beta::read),\n    },\n];\n"
+        f"pub fn row_of(arch: &str) -> Option<&'static ArchRow> {{\n    {static}.iter().find(|r| r.names.contains(&arch))\n}}\n"
+        f"pub fn count() -> usize {{\n    {static}.len()\n}}\n"
+        f"#[cfg(test)]\nmod tests {{\n    #[test]\n    fn rows() {{\n        assert!(!super::{static}.is_empty());\n    }}\n}}\n"
+    )
+    files = {
+        "crates/model/Cargo.toml": "",
+        "crates/model/src/lib.rs": "pub mod arch;\npub mod ops;\n",
+        "crates/model/src/ops.rs": "pub fn run() -> u32 {\n    5\n}\n",
+        "crates/model/src/arch/mod.rs": (
+            "pub mod fam_alpha;\npub mod fam_beta;\npub mod registry;\npub mod shared;\npub mod shared2;\npub use util;\n"
+            "pub fn spec(arch: &str) -> u32 {\n    match registry::row_of(arch).and_then(|r| r.read) {\n        Some(f) => f(),\n        None => shared::helper(),\n    }\n}\n"
+            "pub fn variant() -> u32 {\n    fam_alpha::hp::HP\n}\n"
+        ),
+        reg_path: rows_src,
+        "crates/model/src/arch/shared.rs": "pub fn helper() -> u32 {\n    1\n}\n",
+        "crates/model/src/arch/shared2.rs": "pub fn only_by_a_family() -> u32 {\n    2\n}\n",
+        "crates/model/src/arch/fam_alpha/mod.rs": "pub mod hp;\npub fn read() -> u32 {\n    hp::HP + crate::arch::shared2::only_by_a_family() + crate::ops::run()\n}\n",
+        "crates/model/src/arch/fam_alpha/hp.rs": "pub const HP: u32 = 3;\n",
+        "crates/model/src/arch/fam_beta/mod.rs": "pub mod hp;\npub fn read() -> u32 {\n    hp::HP\n}\n",
+        "crates/model/src/arch/fam_beta/hp.rs": "pub const HP: u32 = 4;\n",
+        "crates/util/Cargo.toml": "",
+        "crates/util/src/lib.rs": "pub mod shape;\n",
+        "crates/util/src/shape.rs": "pub fn f() {}\n",
+        "crates/app/Cargo.toml": "",
+        "crates/app/src/lib.rs": "",
+        "tools/ref/models/beta.sh": "MODEL=/models/Beta-7B/m.gguf\n",
+    }
+    spec_call = "#[test]\nfn t() {\n    model::arch::spec(\"x\");\n}\n"
+    tests = {
+        "open": spec_call,
+        "walk": "#[test]\nfn t() {\n    model::arch::spec(\"x\");\n    model::arch::registry::count();\n}\n",
+        "alpha_meta": spec_call,
+        "lit": "const M: &str = \"/models/Beta-7B-Q4/m.gguf\";\n" + spec_call,
+        "stray": "const M: &str = \"/models/Nobody/m.gguf\";\n" + spec_call,
+        "ns": "use model::arch::util::shape;\n#[test]\nfn t() {\n    shape::f();\n}\n",
+    }
+    for name, text in tests.items():
+        files[f"crates/app/tests/{name}.rs"] = text
+    with tempfile.TemporaryDirectory(prefix="recipes-dispatch-") as tmp:
+        for rel, text in files.items():
+            os.makedirs(os.path.join(tmp, os.path.dirname(rel)), exist_ok=True)
+            with open(os.path.join(tmp, rel), "w", encoding="utf-8") as fh:
+                fh.write(text)
+
+        def pkg(name: str, targets: list[tuple[str, str, str]], deps: list[str]) -> dict:
+            return {
+                "id": name, "name": name, "manifest_path": os.path.join(tmp, "crates", name, "Cargo.toml"), "features": {},
+                "dependencies": [{"name": d, "kind": None, "optional": False, "features": [], "uses_default_features": True} for d in deps],
+                "targets": [{"kind": [k], "name": n, "src_path": os.path.join(tmp, "crates", name, s)} for k, n, s in targets],
+            }
+
+        meta = {
+            "workspace_root": tmp, "workspace_members": ["model", "util", "app"],
+            "packages": [
+                pkg("model", [("lib", "model", "src/lib.rs")], ["util"]),
+                pkg("util", [("lib", "util", "src/lib.rs")], []),
+                pkg("app", [("lib", "app", "src/lib.rs"), *(("test", n, f"tests/{n}.rs") for n in tests)], ["model", "util"]),
+            ],
+        }
+        st = Tree(tmp, meta)
+
+        def gate(name: str, test: str, profile: str | None = None, flags: str = "") -> Recipe:
+            env = f"BLOOMERY_MODEL={profile} " if profile else ""
+            return Recipe(name, [f"{env}./tools/box.sh 'bash tools/gate.sh -p app --test {test}{flags}'"], [], "")
+
+        rs = {
+            "gate-a": gate("gate-a", "open", "alpha"), "gate-b": gate("gate-b", "open", "beta"), "gate-d": gate("gate-d", "open"),
+            "gate-walk": gate("gate-walk", "walk", "beta"), "gate-name": gate("gate-name", "alpha_meta"),
+            "gate-lit": gate("gate-lit", "lit"), "gate-stray": gate("gate-stray", "stray"), "gate-flag": gate("gate-flag", "open", "beta", " -- -m x"),
+            "gate-ns": gate("gate-ns", "ns"),
+            "gate-lib": Recipe("gate-lib", ["BLOOMERY_MODEL=beta ./tools/box.sh 'bash tools/gate.sh -p model --lib'"], [], ""),
+        }
+        sg = Graph(st, rs)
+        fa, fb = "crates/model/src/arch/fam_alpha/hp.rs", "crates/model/src/arch/fam_beta/hp.rs"
+        shared2, sh = "crates/model/src/arch/shared2.rs", "crates/model/src/arch/shared.rs"
+        every = list(rs)
+
+        r = reach_of(st)
+
+        def reached(f: str) -> set[str]:
+            return {n for n in every if f in r.gate_files(sg, n)}
+
+
+        expect(len(r.dispatches()) == 2 and all(len(d.rows) == 3 for d in r.dispatches().values()),
+               f"dispatch: the table is read in the lib's root and its test build, three rows each: {[len(d.rows) for d in r.dispatches().values()]}")
+        d0 = next(iter(r.dispatches().values()))
+        expect(d0.rows[2] == frozenset({"beta", "beta_alias"}), f"dispatch: a row's const name is read: {sorted(d0.rows[2])}")
+        # a family's own files: the gates that open the family (profile, a target's name, a /models path a profile defines), and the
+        # gates that cannot tell their files or walk the table; never the gate of another family or of the default profile
+        want_a = {"gate-a", "gate-name", "gate-walk", "gate-stray", "gate-flag", "gate-lib"}
+        want_b = {"gate-b", "gate-walk", "gate-lit", "gate-stray", "gate-flag", "gate-lib"}
+        expect(reached(fa) == want_a, f"dispatch: {fa} is reached by {sorted(reached(fa))}, not {sorted(want_a)}")
+        expect(reached(fb) == want_b, f"dispatch: {fb} is reached by {sorted(reached(fb))}, not {sorted(want_b)}")
+        # a file of the architecture tree only alpha's reader uses follows alpha; what it calls outside the tree (ops.rs) is reached by
+        # every gate that reaches the table, as before
+        expect(reached(shared2) == want_a, f"dispatch: {shared2}, a helper of the architecture tree only alpha's reader calls, is reached by {sorted(reached(shared2))}")
+        ops = "crates/model/src/ops.rs"
+        expect(reached(ops) == set(every) - {"gate-ns"}, f"dispatch: {ops}, a file outside the architecture tree that alpha's reader calls, is reached by {sorted(reached(ops))}")
+        expect(reached(sh) == set(every) - {"gate-ns", "gate-lib"}, f"dispatch: {sh}, the unregistered arm, is reached by {sorted(reached(sh))}")
+        # a name a module imports whose path ends at a namespace reaches the import, not every unit of the module
+        expect("gate-ns" not in reached(fa) and "gate-ns" not in reached(fb) and "gate-ns" in reached("crates/model/src/arch/mod.rs"),
+               f"dispatch: a path through `pub use util;` to a module reaches every unit of the importing module: {sorted(reached(fa))}")
+        # the reason `reach --brief` prints
+        why = {n: r.reason(sg, n, r.gate_files(sg, n)[fa]) for n in want_a if fa in r.gate_files(sg, n)}
+        expect(why.get("gate-a") == "registry row alpha: profile alpha" and why.get("gate-name") == "registry row alpha: target alpha_meta"
+               and why.get("gate-walk", "").startswith("registry row alpha: the gate walks every row (")
+               and why.get("gate-flag", "").startswith("registry row alpha: every row open (gate-flag picks its model file by `-m`)")
+               and why.get("gate-stray", "").startswith("registry row alpha: every row open (its targets name /models/Nobody"),
+               f"dispatch: the reasons of a kept gate: {why}")
+        expect(r.gate_archs(sg, "gate-lit")[0] == frozenset({"deepseek2", "beta"}), f"dispatch: a /models path that extends a profile's directory by a `-` names that profile: {r.gate_archs(sg, 'gate-lit')}")
+        expect(r.gate_archs(sg, "gate-d")[0] == frozenset({"deepseek2"}), f"dispatch: no profile is the default profile: {r.gate_archs(sg, 'gate-d')}")
+
+
+
+def dispatch_real_self_test(expect, side: Side) -> None:
+    tree, recipes, graph = side.tree, side.recipes, side.graph
+    rr = reach_of(tree)
+    gates = gate_order(recipes)
+    ds = rr.dispatches()
+    expect(bool(ds) and bool(rr._enum_nodes), "dispatch: the real registry's table is not read")
+    d = next(iter(ds.values()))
+    by_dir: dict[str, set[int]] = {}
+    for x, rows in d.entries.items():
+        by_dir.setdefault(os.path.dirname(rr.nodes[x][1]), set()).update(rows)
+    families = {dd: rows for dd, rows in by_dir.items() if dd != os.path.dirname(ARCH_REGISTRY[0])}
+    expect(len(families) >= 8, f"dispatch: {len(families)} family directories behind the registry's rows")
+    for dd, rows in sorted(families.items()):
+        names = frozenset().union(*(d.rows[i] for i in rows))
+        fam = os.path.basename(dd)
+        f = f"{dd}/spec.rs"
+        if not tree.exists(f):
+            continue
+        got = dep_reach(tree, graph, gates, f)
+        for n in gates:
+            archs, _ = rr.gate_archs(graph, n)
+            par = rr.gate(graph, n)
+            dispatches = any(x in par for x in rr._rows_nodes)
+            if archs is not None and archs & names and dispatches and graph.inputs(n).match(f) is not None:
+                expect(f in rr.gate_files(graph, n), f"dispatch: {n} opens {fam} (its {sorted(archs & names)}) and reaches the registry's table, but {f} is not in its reach")
+        for n, node in got.items():
+            archs, _ = rr.gate_archs(graph, n)
+            if archs is not None and not archs & names and not any(x in rr.gate(graph, n) for x in rr._enum_nodes):
+                chain = reach_chain(tree, graph, n, node)
+                expect("(static ROWS) -[" not in chain, f"dispatch: {n} cannot open {fam} (it opens {sorted(archs)}) and reaches {f} through the registry's pointer: {chain[-300:]}")
+    # a file outside the families is reached by the same gates with every row open: the rule narrows family files only
+    common = ["crates/gpu/src/weights.rs", "crates/model/src/arch/mod.rs", "crates/placement/src/placement.rs"]
+    for f in common:
+        cut = {n for n in gates if f in rr.gate_files(graph, n)}
+        full = {n for n in gates if any(rr.nodes[m][1] == f for m in rr._close(graph, n, None))}
+        expect(cut == full, f"dispatch: {f} is a common file, and the dispatch edges move its gates: {sorted(cut ^ full)}")
+
+
 def narrow_table_self_test(expect, side: Side) -> None:
     """The gate-paths table's checks and the host group's guard on the real tree."""
 
@@ -11650,6 +12128,7 @@ def self_test(serial: bool = False) -> int:
         ("orphan-tests", lambda f: orphan_self_test(_expecting(f), side)),
         ("narrow", narrow),
         ("narrow table", lambda f: narrow_table_self_test(_expecting(f), side)),
+        ("dispatch", lambda f: dispatch_self_test(_expecting(f), side)),
         ("small tools", small),
         ("key detectors", lambda f: key_detectors_self_test(_expecting(f), side)),
         ("key", lambda f: key_self_test(_expecting(f), side)),
