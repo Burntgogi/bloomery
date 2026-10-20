@@ -20,7 +20,8 @@
 #   tools/box.sh's guard (lease_guard) and naming the lease's holder to a waiter (lease_holders);
 #   which process on a card is the runner's own (lease_pid_is_ours): the one rule the card guards
 #   share, so a load group's engine between its arms is not read as a co-tenant;
-#   the bound on every process a runner starts under the lease (lease_bounded);
+#   the bound on every process a runner starts under the lease (lease_bounded) and on the wait for a reader of a
+#   FIFO the runner made (lease_reader_wait);
 #   the card every lease needs (tools/ref/card.py, at lease_take below): no card, no lease;
 #   the lease's trace (lease_trace_take, lease_trace_let_go): who took the lease and when it was free;
 #   the witness block: its four header forms and every field a runner can list, each spelled once;
@@ -28,6 +29,16 @@
 #   the two arm helpers the depth and A/B runners share: the LCG prompt of a depth and the
 #   bloomery-decode binary of a tree.
 # Which card is timed, and the card's own witness lines, stay in timing-card.sh (the `card` field).
+#
+# The codes it ends a runner with or returns of its own (a started command's status passes through unchanged):
+#   64   a refused value or use (a bound, a handle, a lease taken inside lease-hold.sh, a lease file override on the box)
+#   66   the tree of this file, and so its card, is not found
+#   69   nvidia-smi cannot be read, so the timing card's emptiness is unknown
+#   70   a failure of the runner's own: a capture directory, a cleanup that failed or had no budget
+#   74   a FIFO that never paired: lease_reader_wait stopped a reader whose writer never opened it (lease_filter returns
+#        it unless the command failed first); gate-bound.sh's bounded returns it when it gave up opening the write end
+#   75   contention: the lease or a card did not come free within its wait
+#   a card refusal ends the runner with tools/ref/card.py's code (it lists them; never 75)
 #
 # Witness fields. `witness <tag>` prints the runner's WITNESS list in order; the first entry is a
 # header form, and `indent` makes every field after it start with four spaces. A field that reads a
@@ -519,9 +530,31 @@ lease_capture() {
   return "$rc"
 }
 
+# lease_reader_wait <pid> <what>: wait for the reader <pid> of a FIFO the runner made, which ends at EOF once every write
+# end of the FIFO is closed, for up to LEASE_FILTER_DRAIN s (30 when unset); its status is returned. A reader whose writer
+# never opened the FIFO waits in its own open for ever, and so does a plain `wait` on it: the bound is what turns that
+# into a failed run. At the bound the reader is stopped (lease_stop), the line names <what>, and the status is 74 (70
+# when the stop failed).
+LEASE_FILTER_DRAIN=${LEASE_FILTER_DRAIN:-30}
+lease_reader_wait() {
+  local pid=$1 what=${2:-reader} deadline rc=0
+  deadline=$((SECONDS + LEASE_FILTER_DRAIN))
+  while kill -0 "$pid" 2> /dev/null; do
+    if [ "$SECONDS" -ge "$deadline" ]; then
+      echo "[lease] $what (pid $pid) still running $LEASE_FILTER_DRAIN s after its writer ended: its FIFO got no write end, stopping it (rc 74)" >&2
+      lease_stop "$pid" || return $?
+      return 74
+    fi
+    sleep 0.1 9>&-
+  done
+  wait "$pid" || rc=$?
+  return "$rc"
+}
+
 # lease_filter <seconds> <stdout|stderr> <file> <filter command...> -- <command...>:
 # a live filter in the output file, with the bounded command owned by the runner's shell.
-# stdout filters the combined output; stderr leaves stdout in LEASE_OUT_FILE.
+# stdout filters the combined output; stderr leaves stdout in LEASE_OUT_FILE. The filter ends at EOF of its FIFO;
+# lease_reader_wait bounds that wait, so a writer that never opened the FIFO ends the call (74), never hangs it.
 lease_filter() {
   local bound=$1 stream=$2 output=$3 rc=0 reader='' filter_rc=0
   local -a filter=()
@@ -557,7 +590,7 @@ lease_filter() {
     stderr) LEASE_BOUNDED_OUT=$LEASE_OUT_FILE LEASE_BOUNDED_ERR=$LEASE_OUT_FIFO lease_bounded "$bound" "$@" || rc=$? ;;
   esac
   if [ -n "$reader" ]; then
-    wait "$reader" || filter_rc=$?
+    lease_reader_wait "$reader" "lease_filter's filter" || filter_rc=$?
     reader=''
   fi
   trap - TERM INT HUP
@@ -991,6 +1024,13 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = --self-test ]; then
   matches() { # <name> <ERE> <text>: the text has a line matching the ERE
     if printf '%s\n' "$3" | grep -E -- "$2" > /dev/null; then echo "ok $1"; else echo "FAIL $1: no line matches /$2/ in [$3]"; fails=$((fails + 1)); fi
   }
+  # reap_reader <pid>: a test's capture reader, waited for within the drain bound: a reader that never got its writer ends
+  # the self-test by name (74), any other failure of the wait is 70.
+  reap_reader() {
+    local rc=0
+    lease_reader_wait "$1" 'the self-test reader' || rc=$?
+    [ "$rc" = 0 ] || exit $((rc == 74 ? 74 : 70))
+  }
   t=$(mktemp -d "${TMPDIR:-/tmp}/lease-self-test.XXXXXX") || exit 70
   trap 'rm -rf "$t"' EXIT
   # perf_own_timeout <stub pid> <recorded parent>: 0 only when the parent is the stub's live timeout. A timeout (GNU's
@@ -1390,7 +1430,7 @@ EOF
     check bounded-restore-eof "$([ -s "$t/restore-eof" ] && echo yes || echo no)" yes
     check bounded-restore-handler "$(grep -E '^(server-stopped|next-arm)$' "$t/restore-out")" server-stopped
     [ "$lk" = free ] || lease_stop "$ip" || exit 70
-    wait "$reader" || exit 70
+    reap_reader "$reader"
     # An enclosing timeout must not KILL the shell before its inner group releases the lease and output.
     for enclosing in external owned; do
       mkdir "$t/nested-$enclosing" || exit 70
@@ -1450,7 +1490,7 @@ EOF
         read -r ip < "$t/nested-$enclosing/monitor" || exit 70
         [ "$lk" = free ] || lease_stop "$ip" || exit 70
       fi
-      wait "$reader" || exit 70
+      reap_reader "$reader"
     done
     # Keep the Clefvis command lines in a shell beneath the gate's outer timeout.
     for arm in chat tower hidden; do
@@ -1553,7 +1593,7 @@ EOF
           if kill -0 "$ip" 2> /dev/null; then lease_stop "$ip" || :; fi
           if kill -0 "$sp" 2> /dev/null; then lease_stop "$sp" || :; fi
         fi
-        wait "$reader" || exit 70
+        reap_reader "$reader"
       done
     done
     # The real memory scope must wait through a second TERM and return its late child's code.
@@ -1848,6 +1888,28 @@ EOF
     RC=0
     lease_filter 10 stdout "$t/filter-failed" sh -c 'cat; exit 4' -- echo out || RC=$?
     check bounded-filter-reader-rc "$RC" 4
+    # lease_reader_wait: a reader whose writer never opened its FIFO is stopped at the drain bound, by name, status 74 (a
+    # plain `wait` on it hangs); a reader that ended by itself gives its own status. Only a hang reaches the case's 40 s bound.
+    RC=0
+    lease_bounded 40 bash -c '
+      source "$1"
+      mkfifo "$2/orphan.fifo" || exit 70
+      cat "$2/orphan.fifo" > "$2/orphan.out" &
+      reader=$!
+      s0=$SECONDS rc=0
+      LEASE_FILTER_DRAIN=2 lease_reader_wait "$reader" "the orphan reader" || rc=$?
+      echo "rc=$rc waited=$((SECONDS - s0))"
+      if kill -0 "$reader" 2> /dev/null; then echo reader=alive; else echo reader=gone; fi
+      sh -c "exit 3" &
+      rc=0
+      LEASE_FILTER_DRAIN=2 lease_reader_wait "$!" "an ended reader" || rc=$?
+      echo "ended=$rc"
+    ' _ "$LEASE_TREE/tools/ref/lease.sh" "$t" > "$t/orphan.log" 2>&1 || RC=$?
+    check lease-reader-wait-script-rc "$RC" 0
+    matches lease-reader-wait-orphan-rc '^rc=74 waited=[0-9]+$' "$(cat "$t/orphan.log")"
+    matches lease-reader-wait-orphan-named '^\[lease\] the orphan reader \(pid [0-9]+\) still running 2 s after its writer ended: its FIFO got no write end, stopping it \(rc 74\)$' "$(cat "$t/orphan.log")"
+    matches lease-reader-wait-orphan-gone '^reader=gone$' "$(cat "$t/orphan.log")"
+    matches lease-reader-wait-ended-status '^ended=3$' "$(cat "$t/orphan.log")"
     RC=0
     lease_bounded 5 bash -c 'source "$1"; lease_filter 0600 stdout "$2" cat -- true' \
       _ "$LEASE_TREE/tools/ref/lease.sh" "$t/refused-filter" > "$t/refused-filter-log" 2>&1 || RC=$?
