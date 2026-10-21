@@ -183,8 +183,15 @@ pub(super) fn model(q3: bool) -> ModelTensors {
         layers: LAYERS,
         experts: EXPERTS,
         experts_used: 10,
-        bf16_words: |_| false,
+        bf16_words: indexer_projection,
     }
+}
+
+/// The file's BF16 matrices, the 24 indexer projections of the 12 selecting
+/// layers, which the card keeps in their words (`qwen35moe::roles`'s
+/// `bf16_words` names these among the stems `Body38` reads as BF16).
+fn indexer_projection(t: &ModelTensor) -> bool {
+    t.name.ends_with(".indexer.q_proj.weight") || t.name.ends_with(".indexer.k_proj.weight")
 }
 
 /// The file's cache bytes a layer (`qwen35moe::place::KvLayout`) [derived
@@ -453,7 +460,7 @@ const ROW_ROOM: u64 = 536_870_912;
 /// host expert is left to move to the card. The restated terms first give
 /// the box gate's A6000
 /// row at the same context and ubatch (`CARD_PLANS`: 262 experts on the
-/// first 40 layers, 261 on the rest, 39,385,907,200 B).
+/// first 46 layers, 261 on the rest, 39,404,339,200 B).
 #[test]
 fn q4_on_one_96gb_card_holds_every_routed_expert() {
     let q4 = model(false);
@@ -466,12 +473,16 @@ fn q4_on_one_96gb_card_holds_every_routed_expert() {
     assert_eq!(routed, Q4_ROUTED);
     let m = machine_a(A6000);
     let a6000 = plan_at(&q4, &m, 4096, 1, PLAN_ROOM).expect("the A6000 plan");
+    // PIN(2026-10-21): 262 on the first 46 layers and 39,404,339,200 B; was 262 on the first 40 and
+    // 39,385,907,200 B. The card keeps the 24 indexer projections in their 2-byte words
+    // (`indexer_projection`), 18 granules (37,748,736 B) fewer, which the spread fills with 6
+    // experts of 3,072,000 B and their granules [derived: the box gate's CARD_PLANS row].
     let want: Vec<u64> = (0..LAYERS)
-        .map(|l| if l < 40 { 262 } else { 261 })
+        .map(|l| if l < 46 { 262 } else { 261 })
         .collect();
     assert_eq!(
         (&a6000.n_l, a6000.cards[0].expert_bytes),
-        (&want, 39_385_907_200)
+        (&want, 39_404_339_200)
     );
 
     let one = picked("a", &census_96(1))[0];
@@ -598,14 +609,16 @@ fn q3_routes_onto_cards_like_the_q4_file() {
         ),
         (Some(Device::Nvme), PLE_TABLE, 0, ROW_ROOM)
     );
-    // The host experts are the routed share less the 13,899,033,600 B the
-    // 3090 holds (the iqplan's 64 GiB plan holds 10,967,959,552 B beside the
-    // draft's 2,919,229,612 B reserve, within 12 MB of the same budget); the
-    // host arm adds the table to them, the NVMe arm the row room (the OS
-    // reserve is MemAvailable's own and leaves the need).
+    // The host experts are the routed share less the 13,912,089,600 B the
+    // 3090 holds; the host arm adds the table to them, the NVMe arm the row
+    // room (the OS reserve is MemAvailable's own and leaves the need).
+    // PIN(2026-10-21): 6 experts of this file's 2,176,000 B more on the card, 13,056,000 B off the
+    // host and both needs; was 41,924,531,200, 70,724,669,440 and 42,461,402,112 B. The card keeps
+    // the 24 indexer projections in their words (`indexer_projection`), 18 granules fewer
+    // [derived: the same spread, 13,056,000 = 6 · 2,176,000].
     assert_eq!(
         (host.host.expert_bytes, host_need, nvme_need),
-        (41_924_531_200, 70_724_669_440, 42_461_402_112)
+        (41_911_475_200, 70_711_613_440, 42_448_346_112)
     );
     assert_eq!(nvme_need + PLE_TABLE, host_need + ROW_ROOM);
     assert!(nvme_need <= SCOPE_61G && SCOPE_61G < host_need);
@@ -695,17 +708,22 @@ fn two_slots_at_4096_hold_every_routed_expert() {
     assert_eq!((bytes, n_l, host), (Q4_ROUTED, vec![EXPERTS; LAYERS], 0));
 }
 
-/// 252,416 positions a slot on one such card, two sequences and no draft,
+/// 252,928 positions a slot on one such card, two sequences and no draft,
 /// is the last step of 256 whose plan holds at most the plan's margin fewer
 /// card expert bytes than the plan at 4,096
 /// ([`two_slots_at_4096_hold_every_routed_expert`]: every routed byte); the
-/// next step passes it. There 504 or 505 experts a layer stay on the card
-/// and 337 go to the host.
+/// next step passes it. There 505 or 506 experts a layer stay on the card
+/// and 335 go to the host.
+// PIN(2026-10-21): 252,928 positions (was 252,416), 505 or 506 experts a layer with one at 506 and
+// 335 on the host (was 504 or 505 with 47 at 505 and 337). The card keeps the 24 indexer
+// projections in their words (`indexer_projection`): 37,748,736 B of room, 664 positions of the two
+// slots' cache (2 · 28,416 B a position), and the boundary moved two steps of 256 within the
+// granules [derived: the plan's own boundary, 252,928 − 252,416 = 512].
 #[test]
-fn two_slots_at_252416_stay_within_the_margin() {
-    let (at, n_l, host) = two_slots(252_416);
+fn two_slots_at_252928_stay_within_the_margin() {
+    let (at, n_l, host) = two_slots(252_928);
     assert!(Q4_ROUTED - at <= MARGIN);
-    let (next, _, _) = two_slots(252_416 + 256);
+    let (next, _, _) = two_slots(252_928 + 256);
     assert!(Q4_ROUTED - next > MARGIN);
     let (lo, hi) = (
         *n_l.iter().min().expect("layers"),
@@ -713,7 +731,7 @@ fn two_slots_at_252416_stay_within_the_margin() {
     );
     assert_eq!(
         (lo, hi, n_l.iter().filter(|&&n| n == hi).count(), host),
-        (504, 505, 47, 337)
+        (505, 506, 1, 335)
     );
 }
 
