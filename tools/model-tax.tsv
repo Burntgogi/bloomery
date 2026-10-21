@@ -70,7 +70,7 @@ crates/gpu-gates/src/bin/gate_routed_legs.rs	glm	2	baseline P 2: MK2 program by 
 crates/gpu-gates/src/bin/gate_routed_legs.rs	mimo	2	baseline P 2: MK2 program by body
 crates/gpu-gates/src/bin/gate_serve_start.rs	clef	1	baseline P 1: MK2 program by body
 crates/gpu-gates/src/bin/gate_serve_start.rs	deepseek	10	baseline P 10: MK2 program by body
-crates/gpu-gates/src/bin/gate_serve_start.rs	glm	14	baseline P 14: MK2 program by body
+crates/gpu-gates/src/bin/gate_serve_start.rs	glm	15	PIN(2026-10-21) glm: baseline P 14: MK2 program by body; +1 is (s5)'s default-template clause, the one seat (GLM) that serves the file's template where V4.1 serves its official encoding (#595)
 crates/gpu-gates/src/bin/gate_vision_encoder.rs	deepseek	2	baseline T 2: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
 crates/gpu-gates/src/bin/generate.rs	deepseek	4	baseline T 4: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
 crates/gpu-gates/src/bin/generate.rs	qwen	1	baseline T 1: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
@@ -176,6 +176,7 @@ crates/serve/src/dsml.rs	glm	2	PIN(2026-10-19) glm: MK7 tool format and reasonin
 crates/serve/src/dsml.rs	qwen	18	PIN(2026-10-19) qwen: MK7 tool format and reasoning from the template; +1 is ToolFormat::call_parts, the forced-call inverse of each format's scan (structured output)
 crates/serve/src/lib.rs	glm	1	baseline S 1: MK9/MK7 seat and tool-format data
 crates/serve/src/lib.rs	qwen	1	baseline S 1: MK9/MK7 seat and tool-format data
+crates/serve/src/lib.rs	deepseek	1	PIN(2026-10-21) deepseek: MK9/MK7 seat and tool-format data: `pub mod v41`, V4.1's official prompt encoding, beside glmxml and qwenxml (#595)
 crates/vision/src/media.rs	minicpm	1	baseline D 1: media design: VideoRule data per tower (vidcore)
 crates/gpu-gates/src/bin/gate_radio_tower.rs	clef	4	PIN(2026-10-20) clef: the image sets' reader every tower gate shares is still named after Clef (refset::clefvis)
 crates/gpu-gates/src/bin/gate_radio_tower.rs	nemotron	5	PIN(2026-10-20) nemotron: the RADIO tower is Bolt's mmproj; the gate bin names its model until the tower gates take the model from a profile row
