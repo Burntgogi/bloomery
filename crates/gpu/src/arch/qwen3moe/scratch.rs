@@ -510,7 +510,12 @@ impl KvPlanes {
 
     /// The head-256 norm, partial turn and append of `s`'s rows over these
     /// planes ([`KvPlanes::append_128`]'s head-256 form).
-    pub(super) fn append_256(
+    ///
+    /// # Safety
+    ///
+    /// Among the first `s.m` positions in `s.pos`, those below `s.ctx`
+    /// are pairwise distinct.
+    pub(super) unsafe fn append_256(
         &mut self,
         neox: &RopeNeoxKernels,
         stream: &CudaStream,
@@ -533,50 +538,58 @@ impl KvPlanes {
             fault,
         } = s;
         match self {
-            KvPlanes::F16 { k: kc, v: vc } => neox.enqueue_head_norm_neox_append_256(
-                stream,
-                PartialNeoxArgs {
-                    qg,
-                    q,
-                    k,
-                    v,
-                    gq,
-                    gk,
-                    table,
-                    pos,
-                    eps,
-                    n_head,
-                    n_kv,
-                    ctx,
-                    m,
-                    fault,
-                    cache_k: kc,
-                    cache_v: vc,
-                },
-            ),
-            KvPlanes::Q8 { kq, kd, vq, vd } => neox.enqueue_head_norm_neox_append_256_q8(
-                stream,
-                PartialNeoxQ8Args {
-                    qg,
-                    q,
-                    k,
-                    v,
-                    gq,
-                    gk,
-                    table,
-                    pos,
-                    eps,
-                    n_head,
-                    n_kv,
-                    ctx,
-                    m,
-                    fault,
-                    kq,
-                    kd,
-                    vq,
-                    vd,
-                },
-            ),
+            KvPlanes::F16 { k: kc, v: vc } =>
+            // SAFETY: the enclosing helper requires distinct cache-valid positions.
+            unsafe {
+                neox.enqueue_head_norm_neox_append_256(
+                    stream,
+                    PartialNeoxArgs {
+                        qg,
+                        q,
+                        k,
+                        v,
+                        gq,
+                        gk,
+                        table,
+                        pos,
+                        eps,
+                        n_head,
+                        n_kv,
+                        ctx,
+                        m,
+                        fault,
+                        cache_k: kc,
+                        cache_v: vc,
+                    },
+                )
+            },
+            KvPlanes::Q8 { kq, kd, vq, vd } =>
+            // SAFETY: append_256 requires distinct cache-valid positions.
+            unsafe {
+                neox.enqueue_head_norm_neox_append_256_q8(
+                    stream,
+                    PartialNeoxQ8Args {
+                        qg,
+                        q,
+                        k,
+                        v,
+                        gq,
+                        gk,
+                        table,
+                        pos,
+                        eps,
+                        n_head,
+                        n_kv,
+                        ctx,
+                        m,
+                        fault,
+                        kq,
+                        kd,
+                        vq,
+                        vd,
+                    },
+                )
+            },
         }
     }
 

@@ -893,26 +893,31 @@ fn gated_256(
         .q_out
         .as_mut()
         .ok_or(GpuError::state(WHAT, "the arena's buffer of gated queries"))?;
-    kv.append_256(
-        &k.neox,
-        stream,
-        Append256 {
-            qg: &s.q,
-            q: q_out,
-            k: &mut s.k,
-            v: &s.v,
-            gq: f32_gain(w, &n.attn_q_norm)?,
-            gk: f32_gain(w, &n.attn_k_norm)?,
-            table: c.table,
-            pos: &s.pos,
-            eps: c.eps,
-            n_head: d.n_head,
-            n_kv: d.n_kv,
-            ctx: d.ctx,
-            m,
-            fault: c.sink,
-        },
-    )?;
+    // SAFETY: the layer program embeds consecutive positions before attention;
+    // saturation is outside the cache. Each call uses one sequence's row window
+    // and its own cache planes, not the combined positions of different slots.
+    unsafe {
+        kv.append_256(
+            &k.neox,
+            stream,
+            Append256 {
+                qg: &s.q,
+                q: q_out,
+                k: &mut s.k,
+                v: &s.v,
+                gq: f32_gain(w, &n.attn_q_norm)?,
+                gk: f32_gain(w, &n.attn_k_norm)?,
+                table: c.table,
+                pos: &s.pos,
+                eps: c.eps,
+                n_head: d.n_head,
+                n_kv: d.n_kv,
+                ctx: d.ctx,
+                m,
+                fault: c.sink,
+            },
+        )
+    }?;
     kv.flash_256(
         &k.flash,
         stream,

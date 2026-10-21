@@ -2259,27 +2259,30 @@ fn qsa(
     // The selecting store is f16 (the qwen38 family's stores carry no q8_0
     // form), so the family's shared append runs its f16 arm.
     let (kcache, vcache) = kv.f16_mut("qwen38::wide")?;
-    c.k.neox.enqueue_head_norm_neox_append_256(
-        stream,
-        PartialNeoxArgs {
-            qg: &q.qg,
-            q: &mut q.q,
-            k: &mut q.k,
-            v: &q.v,
-            gq: f32_gain(w, &qp.q_norm)?,
-            gk: f32_gain(w, &qp.k_norm)?,
-            table: c.table,
-            pos: &u.pos,
-            eps: c.eps,
-            n_head: geo::N_HEAD,
-            n_kv: geo::N_KV,
-            ctx,
-            m,
-            fault: sink,
-            cache_k: kcache,
-            cache_v: vcache,
-        },
-    )?;
+    // SAFETY: the per-sequence embedding supplies distinct cache-valid positions.
+    unsafe {
+        c.k.neox.enqueue_head_norm_neox_append_256(
+            stream,
+            PartialNeoxArgs {
+                qg: &q.qg,
+                q: &mut q.q,
+                k: &mut q.k,
+                v: &q.v,
+                gq: f32_gain(w, &qp.q_norm)?,
+                gk: f32_gain(w, &qp.k_norm)?,
+                table: c.table,
+                pos: &u.pos,
+                eps: c.eps,
+                n_head: geo::N_HEAD,
+                n_kv: geo::N_KV,
+                ctx,
+                m,
+                fault: sink,
+                cache_k: kcache,
+                cache_v: vcache,
+            },
+        )
+    }?;
     let (kcache, vcache) = kv.f16("qwen38::wide")?;
     if dense > 0 {
         // SAFETY: rows 0 .. dense <= m of the queries and the flash's output
