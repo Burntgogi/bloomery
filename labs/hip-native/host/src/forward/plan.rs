@@ -3,7 +3,7 @@ use std::path::Path;
 
 use gguf::{GgmlType, Split, TensorInfo};
 use model::arch::models::{
-    Act, Arch, DeltaKind, Ffn, GdnGate, Gqa, Mixer, ModelSpec, Residual, Role, RopeMode,
+    Act, Arch, DeltaKind, Ffn, GdnGate, Gqa, Mixer, ModelSpec, OutGate, Residual, Role, RopeMode,
 };
 use model::arch::{names, qwen35moe::names as qnames};
 
@@ -336,7 +336,7 @@ impl Plan {
                         || !g.head_dim.is_multiple_of(2)
                         || g.value_dim != g.head_dim
                         || !g.qk_norm
-                        || !g.out_gate
+                        || g.out_gate != OutGate::Packed
                         || g.select.is_some()
                         || g.window.is_some()
                         || g.sinks
@@ -453,7 +453,7 @@ impl Plan {
             .map(|i| {
                 let shard = self.file.shard(i).expect("plan's live shard");
                 serde_json::json!({"file":self.file.shard_path(i).expect("plan's shard path"),
-                "bytes":shard.mapping().len(), "sha256":model::fileio::sha256_hex(shard.mapping())})
+                "bytes":shard.mapping().len(), "sha256":gguf::digest::sha256_hex(shard.mapping())})
             })
             .collect();
         serde_json::json!({"files":files,"architecture":self.spec.arch.name(),

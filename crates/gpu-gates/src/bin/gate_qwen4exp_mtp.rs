@@ -268,6 +268,7 @@ mod gate {
     use bloomery_gpu_gates::tier::{self, Tag, Tier};
     use bloomery_gpu_gates::{GateError, RefManifest, checks_failed, ref_model_path, verdict};
     use bloomery_levers::{CARD_BUDGET, HostCfg, Levers};
+    use gguf::digest::hex;
     use gguf::quant::{GgmlType, half_to_f32};
     use gguf::{Gguf, Split};
     use model::arch::models::headpick::{HeadSet, vocab_sha256};
@@ -276,7 +277,6 @@ mod gate {
     use model::arch::qwen35moe::place::{
         Experts, MtpInputs, MtpPlan, PlaceError, PlanInputs, machine, machine_for_experts,
     };
-    use model::fileio::hex;
     use model::placement::workstation::HostRead;
     use model::placement::{PlacementError, PlanLevers};
     use refset::arch::qwen4exp::IK;

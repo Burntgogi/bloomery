@@ -159,6 +159,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
 
+use gguf::digest::{hex, sha256_hex};
 use gguf::write::{Layout, TensorDecl, Writer};
 use gguf::{GgmlType, Split, Value};
 use model::arch::deepseek41::fixture::{self as v41, LAYER_MAP};
@@ -179,7 +180,6 @@ use model::arch::qwen35moe::place::{Experts, PlanInputs, UBATCH_PLANNED, machine
 use model::arch::solar2::fixture as solar;
 use model::arch::solar2::hparams::{Hparams as SolarHparams, Kind as SolarKind};
 use model::arch::solar2::place::PlanInputs as SolarInputs;
-use model::fileio;
 use model::fixture::{
     self, CHUNK_TARGET, CardBudget, DEFAULT_SHARD_BYTES, Family, FilePlan, FixtureError,
     FixtureSpec, KEY_CARD_BUDGET, KEY_SEED, KEY_SOURCE_LAYERS, KEY_SOURCE_SHA256, KEY_VERSION,
@@ -632,7 +632,7 @@ fn sample(t: &PlannedTensor, seed: u64) -> Vec<u8> {
 }
 
 fn sha(bytes: &[u8]) -> String {
-    fileio::hex(&Sha256::digest(bytes)[..8])
+    hex(&Sha256::digest(bytes)[..8])
 }
 
 /// One `e2e: sha256` line per `.gguf` file under `dir`, by path below it.
@@ -651,7 +651,7 @@ fn print_file_shas(dir: &Path) {
     }
     files.sort();
     for f in files {
-        let hex = fileio::sha256_hex(&std::fs::read(&f).unwrap());
+        let hex = sha256_hex(&std::fs::read(&f).unwrap());
         println!(
             "e2e: sha256 {hex}  {}",
             f.strip_prefix(dir).unwrap().display()

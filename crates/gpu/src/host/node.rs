@@ -39,7 +39,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gguf::Split;
-use model::fileio::sha256_hex_of;
+use gguf::digest::sha256_hex_of;
 use model::ops::DEFER_MAX_COLS;
 use model::placement::devices::{DeviceId, DeviceInfo, spec_of_device};
 use model::placement::workstation::{self, ArenaGrant, CardSpec};
