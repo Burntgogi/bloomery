@@ -382,8 +382,10 @@
 # files or recipe text, its profile among them, or a /models value in the box env).
 # Structural reach is cached privately in ~/.cache/bloomery/reach/<checkout-id>/graph.json. The cache
 # contains no green verdicts: source/code/metadata/read/probe content must still match, and malformed or
-# stale snapshots rebuild. Runtime reach is not profile-pruned for keys. The v2 key format deliberately
-# invalidates pre-reach ledger entries once; an old green cannot authorize a narrower new key.
+# stale snapshots rebuild. Code-identity compilation is memoized by exact source bytes, filename and
+# optimization level; cached recipe inputs still recheck current content, and key output is validated again.
+# Runtime reach is not profile-pruned for keys. The v2 key format deliberately invalidates pre-reach ledger
+# entries once; an old green cannot authorize a narrower new key.
 #   Keys are computed before the lease check. An item whose key is in the ledger does not run: run.log
 # gets `<stem> rc=skip green-at=<commit> <date> lane=<L>`. Every other item runs as without --ledger;
 # one whose final rc is 0 is recorded after its key is computed again (against the same pre-batch box

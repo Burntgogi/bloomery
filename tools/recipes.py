@@ -1845,11 +1845,11 @@ class Graph:
                 self._key_inputs.clear()
                 self._script_cache.clear()
                 reach = self.tree._reach = Reach(self.tree)
+            elif name in self._key_inputs:
+                return self._key_inputs[name]
         reach.prepare()
         broad = self.inputs(name)
         reach.validate()
-        if name in self._key_inputs:
-            return self._key_inputs[name]
         keep = reach.key_files(self, name)
         files = {f: why for f, why in broad.files.items() if f in keep or not _linked_origin(why)}
         prefixes = {f: why for f, why in broad.prefixes.items() if f in keep or not _linked_origin(why)}

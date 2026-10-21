@@ -586,6 +586,9 @@ class RecipeKeyCLI(unittest.TestCase):
                 ws = Workspace(self, runtime_files())
                 ws.green("gate-called")
                 driver = r'''
+import contextlib
+import io
+import os
 import importlib.util
 from pathlib import Path
 import sys
@@ -597,11 +600,19 @@ spec.loader.exec_module(module)
 from bloomery import reach_cache
 path = Path(sys.argv[1])
 before = path.read_bytes()
+state = path.stat()
+with contextlib.redirect_stdout(io.StringIO()) as baseline:
+    result = module.main(["key", "--manifest", sys.argv[2], "--ledger", sys.argv[3], "gate-called"])
+assert result == 0 and baseline.getvalue().strip().split("\t")[2] == "skip", baseline.getvalue()
 try:
-    path.write_bytes(before + b"\nREACH_CODE_MUTATION = 1\n")
+    changed = before.replace(b"_REACH_LOADED_CODE", b"_REACH_EDITED_CODE", 1)
+    assert changed != before and len(changed) == len(before)
+    path.write_bytes(changed)
+    os.utime(path, ns=(state.st_atime_ns, state.st_mtime_ns))
     result = module.main(["key", "--manifest", sys.argv[2], "--ledger", sys.argv[3], "gate-called"])
 finally:
     path.write_bytes(before)
+    os.utime(path, ns=(state.st_atime_ns, state.st_mtime_ns))
 raise SystemExit(result)
 '''
                 observed = ws.run(sys.executable, "-c", driver, relative, str(ws.manifest), str(ws.ledger))
