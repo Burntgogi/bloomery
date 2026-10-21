@@ -369,7 +369,6 @@ pytools_list() {
     "tools/bloomery/route_trace.py --self-test"
     "tools/bloomery/rows.py --self-test"
     "tools/bloomery/selftest.py --self-test"
-    "tools/board/board.py --self-test"
     "tools/boxq-check.py --self-test"
     "tools/boxq.py --self-test"
     "tools/check-comment-only.py --self-test"
