@@ -1362,8 +1362,11 @@ mod tests {
         )
         .unwrap();
         let raws: Vec<_> = st.names().map(|n| (n, st.raw(n).unwrap())).collect();
-        let plan =
-            crate::quant_config::plan(&config, raws.iter().map(|(n, r)| (*n, r.dtype, r.shape)));
+        let plan = crate::quant_config::plan(
+            &config,
+            raws.iter().map(|(n, r)| (*n, r.dtype, r.shape)),
+            |_| None,
+        );
         let experts = ["e.0.weight", "e.1.weight"].map(|n| (n, &plan.placed[n]));
         let got = normalize(|n| st.raw(n), &experts, Use::Matrix(Plain::Q8_0)).unwrap();
         assert_eq!(got.scale, [2.0, 3.0]);

@@ -19,3 +19,11 @@
 Bolt's two files list 27,921 modules (15 MB); they are cut to the first module of each algorithm (`quantized_layers`) and the first group (`config_groups`), the rest unchanged.
 
 `../checkpoint-headers/glm-5.3-flash-nvfp4-layers-0-3.tensors.json.gz` is the dtype and shape of every tensor of `nvidia/GLM-5.3-Flash-NVFP4` layers 0 and 3 and every unlayered `model.language_model.` tensor and `lm_head.weight`, gathered from all 33 shard headers.
+
+**Class-name targets.** `quant_config::plan` takes an explicit module-class resolver; the checkpoint-module
+classifier in `model_hf::arch::module_class` supplies the projection and embedding roles read by the GLM and
+Qwen3.8 maps. `Linear` and `Embedding` select only their own classes, in both `targets` and `ignore`.
+Norms, convolutions and unknown roles do not match a class merely because their stored weights look like matrices.
+Module-name and `re:` targets still match their names; an unsupported bare capitalized class name is refused by
+name while reading the config. BF16 and F32 tensors remain placed as stored, independently of quantization targets.
+

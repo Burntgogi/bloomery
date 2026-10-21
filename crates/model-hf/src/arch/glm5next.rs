@@ -29,6 +29,7 @@ use model::placement::tp::TpTensor;
 use safetensors::{Dtype, Folder};
 use serde_json::Value;
 
+use super::module_class;
 use crate::part::{self, Checkpoint, Made};
 
 /// Why the checkpoint was refused.
@@ -442,6 +443,7 @@ fn placed_map(
     let placed = quant_config::plan(
         config,
         table.iter().map(|(n, d, s)| (n.as_str(), *d, s.as_slice())),
+        module_class,
     );
     if let Some((name, why)) = placed.refused.iter().next() {
         return Err(refuse(name, why.clone()));

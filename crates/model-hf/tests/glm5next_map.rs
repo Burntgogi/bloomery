@@ -8,6 +8,7 @@ use gguf::GgmlType;
 use hf::modelopt::Normal;
 use hf::quant_config::Config;
 use model_hf::arch::glm5next::{Geometry, Layout, map};
+use model_hf::arch::module_class;
 use safetensors::{Dtype, Raw};
 
 #[path = "common/glm_hf.rs"]

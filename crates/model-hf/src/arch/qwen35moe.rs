@@ -1347,6 +1347,7 @@ mod tests {
             entries
                 .iter()
                 .map(|(n, d, s)| (n.as_str(), *d, s.as_slice())),
+            crate::arch::module_class,
         );
         let logical: Vec<(&str, Vec<usize>)> = entries
             .iter()
@@ -2120,6 +2121,7 @@ mod tests {
                 entries
                     .iter()
                     .map(|(n, d, s)| (n.as_str(), *d, s.as_slice())),
+                crate::arch::module_class,
             );
             let got: Vec<_> = m.parts(&p, |n| st.raw(n)).collect();
             if let Some(want) = want {
