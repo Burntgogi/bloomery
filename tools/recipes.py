@@ -3268,6 +3268,7 @@ _FN_NAME = re.compile(r"\bfn\s+(?:r#)?([A-Za-z_][A-Za-z0-9_]*)")
 _MACRO_EXPORT = re.compile(r"#\s*\[\s*macro_export\b[^\]]*\]\s*macro_rules\s*!\s*(?:r#)?([A-Za-z_][A-Za-z0-9_]*)")
 _MACRO_CALL = re.compile(r"(?<![A-Za-z0-9_:])([A-Za-z_][A-Za-z0-9_]*)\s*!\s*[(\[{]")
 _MACRO_PATH_CALL = re.compile(r"((?:(?:r#)?[A-Za-z_]\w*\s*::\s*)*(?:r#)?[A-Za-z_]\w*)\s*!\s*[(\[{]")
+_MACRO_IMPORT = re.compile(r"\b(?:use|extern\s+crate)\b")
 _WORD = re.compile(r"(?<![A-Za-z0-9_])[A-Za-z_][A-Za-z0-9_]*")
 _PUB_BEFORE = re.compile(r"\bpub\b(?:\s*\([^)]*\))?\s*$")
 _TYPE_PATH = re.compile(r"(?<![A-Za-z0-9_'])((?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*[A-Za-z_][A-Za-z0-9_]*)")
@@ -4705,6 +4706,12 @@ class Reach:
                         for k, unit in enumerate(facts.units):
                             if any(name in known for name in unit.macro_calls):
                                 source_seeds.add((rk, f, k))
+                            # Definition-site bindings are not copied into the invocation context.
+                            for name in unit.macro_calls:
+                                for g, i in self.macros(rk).get(name, ()):
+                                    body = _source_macro_bodies(self.text(g), rk[2]).get(i)
+                                    if body is None or _MACRO_IMPORT.search(body):
+                                        opaque = True
                             for path in set(unit.sites) & qualified_paths:
                                 hits = [h for base in self.bases(rk, f) or [()]
                                         for h in self.resolve(rk, base + unit.ctx, path) if h[2] >= 0]
@@ -4716,7 +4723,7 @@ class Reach:
                                         body = _source_macro_bodies(self.text(h[1]), h[0][2]).get(h[2])
                                         # Imports and nested expansions may emit names absent from source edges.
                                         # Bound the invoker, not an unrelated item elsewhere in the macro crate.
-                                        if body is None or re.search(r"\b(?:use|extern\s+crate)\b", body) or any(_key_attributes(body)) or any(
+                                        if body is None or _MACRO_IMPORT.search(body) or any(_key_attributes(body)) or any(
                                                 match.group(1).removeprefix("r#") not in syntax_words
                                                 for match in _MACRO_PATH_CALL.finditer(body)):
                                             opaque = True

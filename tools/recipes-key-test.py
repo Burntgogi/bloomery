@@ -255,6 +255,11 @@ pub fn boot(_: proc_macro::TokenStream) -> proc_macro::TokenStream {
        };"#.parse().unwrap()
 }
 '''
+    elif kind == "local-relative-import":
+        files["crates/dep/src/lib.rs"] = ('macro_rules! boot { () => {{ use super::hidden::run; run(); }}; }\n'
+                                         + files["crates/dep/src/lib.rs"])
+        files["crates/dep/src/startup.rs"] = "pub fn run() { boot!(); }\n"
+        files["crates/dep/src/used.rs"] = "pub fn run() { crate::startup::run(); }\n"
     else:
         source = ('macro_rules! boot { () => { impl Drop for crate::Token {\n'
                   '    fn drop(&mut self) { crate::hidden::run(); }\n'
@@ -322,7 +327,8 @@ class RecipeKeyCLI(unittest.TestCase):
                 ws.assert_status(ws.keys(*items, ledger=True), {"gate-called": "run", "gate-linked": "skip"})
 
     def test_known_source_macro_startup_and_implicit_impl_inputs(self):
-        for kind in ("exported-startup", "exported-expression", "exported-import", "exported-proc-startup", "local-drop", "shadowed-builtin"):
+        for kind in ("exported-startup", "exported-expression", "exported-import", "exported-proc-startup",
+                     "local-relative-import", "local-drop", "shadowed-builtin"):
             with self.subTest(expansion=kind):
                 files = source_macro_files(kind)
                 ws = Workspace(self, files)
