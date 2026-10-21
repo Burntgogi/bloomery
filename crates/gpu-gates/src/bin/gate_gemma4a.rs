@@ -5,7 +5,7 @@
 mod e2e;
 
 use bloomery_gpu::Gpu;
-use bloomery_gpu_gates::{GateError, sha256};
+use bloomery_gpu_gates::GateError;
 use bloomery_gpu_gemma4a::{Encoder, arch::gemma4a::attention};
 use gguf::Gguf;
 use refset::arch::gemma_embedding2::{
@@ -58,7 +58,7 @@ fn compare(
 fn main() -> Result<(), GateError> {
     let _levers = bloomery_levers::at_main(&[])?;
     assert_eq!(
-        sha256(std::path::Path::new(MMPROJ_BF16))?,
+        gguf::digest::sha256_file(std::path::Path::new(MMPROJ_BF16))?,
         MMPROJ_BF16_SHA256,
         "audio projector identity"
     );

@@ -231,7 +231,7 @@ fn read_image() -> Result<Vec<u8>, GateError> {
         .join("../..")
         .join(IMAGE);
     let png = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let got = bloomery_gpu_gates::sha256(&path)?;
+    let got = gguf::digest::sha256_file(&path)?;
     if got != IMAGE_SHA256 {
         return Err(format!(
             "{}: sha256 {got}, the gate's image is {IMAGE_SHA256}",
@@ -416,19 +416,19 @@ type Hashed = JoinHandle<Result<Vec<String>, String>>;
 fn hash_in_background(files: Vec<PathBuf>) -> Hashed {
     std::thread::spawn(move || {
         std::thread::scope(|s| {
-            let jobs: Vec<_> = files.iter().map(|f| s.spawn(move || sha256(f))).collect();
+            let jobs: Vec<_> = files
+                .iter()
+                .map(|f| s.spawn(move || gguf::digest::sha256_file(f)))
+                .collect();
             jobs.into_iter()
                 .map(|j| {
                     j.join()
                         .map_err(|_| "a hashing thread panicked".to_owned())?
+                        .map_err(|e| e.to_string())
                 })
                 .collect::<Result<Vec<String>, String>>()
         })
     })
-}
-
-fn sha256(p: &Path) -> Result<String, String> {
-    bloomery_gpu_gates::sha256(p).map_err(|e| e.to_string())
 }
 
 /// `messages` of the text chat.

@@ -83,8 +83,7 @@ mod gate {
     use bloomery_gpu::weights::DevWeight;
     use bloomery_gpu::{Gpu, GpuError, capture_template};
     use bloomery_gpu_gates::{
-        GateError, checks_failed, equal, first_diff, oracle_row, quantile, ref_model_path, sha256,
-        verdict,
+        GateError, checks_failed, equal, first_diff, oracle_row, quantile, ref_model_path, verdict,
     };
     use bloomery_gpu_vision::f32_bf16;
     use gguf::Split;
@@ -310,7 +309,7 @@ mod gate {
                 .tokens_file_sha256
                 .as_deref()
                 .ok_or_else(|| format!("{name}: no `# tokens_file_sha256` line"))?;
-            let got = sha256(Path::new(file))?;
+            let got = gguf::digest::sha256_file(Path::new(file))?;
             let count = hidden.n_ids()?;
             if got != want || h.tokens_count != Some(u64::try_from(count)?) {
                 return Err(format!(

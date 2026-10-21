@@ -32,7 +32,7 @@ mod gate {
     };
     use bloomery_gpu_gates::{
         GateError, RefManifest, checks_failed, data_dir, gpu_census, ref_model_path,
-        ref_tensor_logical_in, sha256,
+        ref_tensor_logical_in,
     };
     use gguf::Split;
     use model::placement::{Plan, PlanLevers, UnifiedPool};
@@ -351,7 +351,7 @@ mod gate {
                 let path = image.as_str().ok_or("frame path must be a string")?;
                 let identity = format!(
                     "# image\tframe_{index}\t{path}\t{}",
-                    sha256(Path::new(path))?
+                    gguf::digest::sha256_file(Path::new(path))?
                 );
                 if !card.header.other.contains(&identity) || !cpu.header.other.contains(&identity) {
                     return Err(format!("{name}: frame {index} differs from the oracle").into());
@@ -652,7 +652,7 @@ mod gate {
             let [name, path, digest, tokens, prefix] = fields[..] else {
                 return Err("malformed audio identity".into());
             };
-            if sha256(Path::new(path))? != digest {
+            if gguf::digest::sha256_file(Path::new(path))? != digest {
                 return Err(format!("{name}: PCM sha256 differs").into());
             }
             let bytes = std::fs::read(path)?;
@@ -832,11 +832,11 @@ mod gate {
                     .into(),
             );
         }
-        if sha256(Path::new(embedding))? != digest {
+        if gguf::digest::sha256_file(Path::new(embedding))? != digest {
             return Err("embedding model sha256 differs from the server set".into());
         }
         if images {
-            if sha256(Path::new(MMPROJ_BF16))? != MMPROJ_BF16_SHA256 {
+            if gguf::digest::sha256_file(Path::new(MMPROJ_BF16))? != MMPROJ_BF16_SHA256 {
                 return Err("embedding projector sha256 differs from the oracle".into());
             }
             return if cache_images(embedding)? {
@@ -850,7 +850,9 @@ mod gate {
         if Split::open(model)?.architecture() != Some("qwen3moe") {
             return Err("serve gate needs Qwen3-30B-A3B-Instruct-2507 Q4_K_M".into());
         }
-        if (audio || clips.is_some()) && sha256(Path::new(MMPROJ_BF16))? != MMPROJ_BF16_SHA256 {
+        if (audio || clips.is_some())
+            && gguf::digest::sha256_file(Path::new(MMPROJ_BF16))? != MMPROJ_BF16_SHA256
+        {
             return Err("embedding projector sha256 differs from the oracle".into());
         }
         if let Some(manifest) = clips {

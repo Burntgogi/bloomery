@@ -19,6 +19,9 @@
 //! decode, activation), which `quant`, [`ggml_type_info`] and the other
 //! crates read.
 //!
+//! The [`digest`] module owns shared SHA-256 file, bounded-reader and structured feeds used by
+//! checkpoint, reference, fixture and vocabulary consumers. Each consumer keeps its format framing.
+//!
 //! Format facts mirrored from the vendored ik_llama.cpp reader
 //! (`gguf_init_from_file`, ggml.c:31219-31475):
 //!   * header: magic `GGUF`, u32 version (3), u64 tensor count, u64 KV count;
@@ -34,6 +37,7 @@
 //! truncated or hostile file yields [`LoadError`].
 
 pub mod card;
+pub mod digest;
 pub mod iq_tables;
 pub mod qtype;
 pub mod quant;

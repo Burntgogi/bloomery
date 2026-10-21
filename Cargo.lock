@@ -133,6 +133,7 @@ dependencies = [
  "bloomery-refset",
  "libc",
  "memmap2",
+ "sha2",
  "thiserror",
 ]
 
@@ -209,7 +210,6 @@ dependencies = [
  "memmap2",
  "oxide-artifacts",
  "serde_json",
- "sha2",
 ]
 
 [[package]]

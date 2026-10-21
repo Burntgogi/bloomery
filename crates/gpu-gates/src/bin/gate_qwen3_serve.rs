@@ -523,7 +523,7 @@ mod gate {
         server_log, tokenized,
     };
     use bloomery_gpu_gates::vision_seat::{self, EncoderSeat};
-    use bloomery_gpu_gates::{GateError, checks_failed, sha256};
+    use bloomery_gpu_gates::{GateError, checks_failed};
     use gguf::{Gguf, Split};
     use model::arch::qwen35moe::hparams::{Hparams, Kind};
     use model::placement::WholeLoad;
@@ -3575,7 +3575,7 @@ mod gate {
     impl Images {
         fn read() -> Result<Images, GateError> {
             let mmproj = PathBuf::from(vis::MMPROJ_BF16);
-            let got = sha256(&mmproj)?;
+            let got = gguf::digest::sha256_file(&mmproj)?;
             if got != vis::MMPROJ_BF16_SHA256 {
                 return Err(format!(
                     "{} is {got}; the Qwen3.6 sets were dumped with {}",
@@ -3629,7 +3629,7 @@ mod gate {
             for set in e.iter().chain(&c) {
                 for image in &set.images {
                     let path = root.join(IMAGE_DIR).join(format!("{}.png", image.name));
-                    if sha256(&path)? != image.png_sha256 {
+                    if gguf::digest::sha256_file(&path)? != image.png_sha256 {
                         return Err(format!(
                             "{} is not the image the sets were dumped from ({})",
                             path.display(),
