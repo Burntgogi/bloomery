@@ -1,0 +1,29 @@
+# Raon-1-mini-preview after the mHC route split (commit e8bd14c08, release build of bloomery-serve), the
+# same sitting as tape037 (commit 93c017bd0): RTX 3090 at the serving defaults (no --place, no --ctx: the
+# slot's context is the trained 262,144), three arms, each a fresh load, two discarded warm-ups, one tape
+# each for K1, K2 (Korean) and E1 (Rust), n-predict 512, greedy.
+# Derivation [derived]: tape037 measured the chooser's plain step at 11.12 ms and the server's K1 decode at
+# 10.5 ms a token. The per-token route kernel ran one block a token over a 17 x 10240 f32 selector at 50
+# sites, latency-bound at about 98 us a site (4.6 ms a step); the split over m x 40 blocks plus its finish
+# leaves about 10 us a site, so the step is 11.12 - 4.6 + 0.5 = 6.5..7.0 ms and the server's token
+# 5.9..6.9 ms: 145..170 tok/s. Verify windows drop by the same 4.6 ms (the route's blocks run in parallel
+# over the rows) and by the m-column FFN rows: about 16.9 ms at width 1, so a window still needs E_w above
+# about 2.6, and K1's tape037 acceptance (0.53..0.64 a position) keeps the chooser closed.
+# Timeline per plain token: card DRAM 3.9 ms (2.76 GB at 700 GB/s), host CPU 0.03..0.05 ms, PCIe under
+# 0.1 ms; the step stays latency-bound (925 graph nodes), so the term is the route's removed latency.
+kind: baseline
+question: does the mHC route split move Raon-1-mini-preview's plain decode on one RTX 3090 to the derived
+  step, and does the DFlash2 draft behind its chooser then pay on any of the three prompts?
+term: decode tok/s of the K1 tape (Korean, 23 prompt tokens, n-predict 512), arm (b): thinking on,
+  BLOOMERY_DRAFT=off, RTX 3090, ctx 262144
+unit: tok/s
+predict: 145..170
+condition: one lease with the box quiet; the 3090 alone; each arm a fresh server, two discarded warm-ups so
+  the chooser's costs are read, io pressure some avg10 under 5 before each tape; greedy; the /metrics
+  spec_decode counters before and after each tape and the mtp width records say how many passes drafted
+reason: the user wants Raon's speed fixed before 0.3.7 ships; this sitting is the fix's one measurement and
+  the release post's Raon tapes, and it decides the draft default (the faster path is the default)
+decide-in: the route term is closed; publish one Raon tape and set the draft default by arms (a) against (b)
+decide-below: under 145: another latency term is left in the step; read the chooser's cost list and the
+  mtp width records before publishing, and open a perf-step reading round
+decide-above: beyond 170: a term the model counted is smaller than derived; read the chooser's cost list
