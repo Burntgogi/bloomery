@@ -747,27 +747,12 @@ impl Names<'_> {
         if self.file.find(&layer_name(l, SSM_CONV_BIAS)).is_some() {
             return self.vector(l, SSM_CONV_BIAS, len);
         }
-        let got = self.w.f32_buf(self.what, ZERO_CONV_BIAS)?.len();
-        if got != len {
-            return Err(GpuError::shape(
-                self.what,
-                format!("{ZERO_CONV_BIAS} holds {got} values, the layer reads {len}"),
-            ));
-        }
-        Ok(ZERO_CONV_BIAS.to_owned())
+        site::vector(self.w, self.what, ZERO_CONV_BIAS.to_owned(), len)
     }
 
     /// The f32 vector `stem` of layer `l`, `len` values: its name.
     pub(crate) fn vector(&self, l: usize, stem: &str, len: usize) -> Result<String, GpuError> {
-        let name = layer_name(l, stem);
-        let got = self.w.f32_buf(self.what, &name)?.len();
-        if got != len {
-            return Err(GpuError::shape(
-                self.what,
-                format!("{name} holds {got} values, the layer reads {len}"),
-            ));
-        }
-        Ok(name)
+        site::vector(self.w, self.what, layer_name(l, stem), len)
     }
 
     /// Mamba-2 layer `l` of the widths `s` on a `hidden`-value row, its
@@ -1181,6 +1166,23 @@ pub struct WideCx<'a> {
     pub w: &'a Weights,
     pub wk: WideKernels<'a>,
     pub m: usize,
+}
+
+/// The wide forms [`project_wide`] quantizes into for the `sites` of the
+/// model that read `k` values: `cols` columns of `k` values, one of each form
+/// the types of those sites read ([`WideActs::wants_of`]); a site of another
+/// width is not counted. Load-time only.
+pub fn wide_acts_at<'s>(
+    stream: &CudaStream,
+    sites: impl IntoIterator<Item = &'s Site>,
+    (cols, k): (usize, usize),
+) -> Result<WideActs, GpuError> {
+    let tys: Vec<SiteTy> = sites
+        .into_iter()
+        .filter(|s| s.k == k)
+        .map(|s| s.ty)
+        .collect();
+    WideActs::new(stream, WideActs::wants_of(&tys), cols, k)
 }
 
 /// `y = W · x` for each of `sites` over the batch's `m` rows of `x`, `rows`

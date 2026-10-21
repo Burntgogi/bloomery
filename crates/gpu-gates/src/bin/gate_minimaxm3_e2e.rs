@@ -261,13 +261,14 @@ mod gate {
     /// The vocabulary's pieces, `tokenizer.ggml.tokens` of the file.
     fn pieces_of(split: &gguf::Split) -> Result<Vec<String>, GateError> {
         match split.value("tokenizer.ggml.tokens") {
-            Some(gguf::Value::Array(items)) => Ok(items
+            Some(gguf::Value::Array(items)) => items
                 .iter()
-                .map(|v| match v {
-                    gguf::Value::String(s) => s.clone(),
-                    _ => String::new(),
+                .enumerate()
+                .map(|(i, v)| match v {
+                    gguf::Value::String(s) => Ok(s.clone()),
+                    _ => Err(format!("tokenizer.ggml.tokens[{i}] is not a string").into()),
                 })
-                .collect()),
+                .collect(),
             _ => Err("the file holds no tokenizer.ggml.tokens array".into()),
         }
     }

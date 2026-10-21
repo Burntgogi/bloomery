@@ -337,6 +337,7 @@ impl BatchBufs {
             Some(&self.weights),
             Some(&self.sh),
             Some(&self.x1s),
+            Some(&self.h),
             self.dense_xn.as_ref(),
             self.dense_out.as_ref(),
         ]

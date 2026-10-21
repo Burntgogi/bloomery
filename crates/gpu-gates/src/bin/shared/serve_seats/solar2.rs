@@ -130,7 +130,6 @@ pub struct Solar;
 
 impl Family for Solar {
     type Body = bloomery_gpu_solar2::Body;
-    type Flags = ();
     type H = model::arch::solar2::hparams::Hparams;
 
     const NAME: &'static str = self::NAME;
@@ -146,14 +145,6 @@ impl Family for Solar {
 
     fn read(split: &Split) -> Result<PlanInputs<Self::H>, PlacementError> {
         model::arch::solar2::place::PlanInputs::read(split)
-    }
-
-    fn flags(
-        _flag: &str,
-        _value: &str,
-        _out: &mut (),
-    ) -> Result<bool, bloomery_gpu_gates::GateError> {
-        Ok(false)
     }
 
     fn register() {

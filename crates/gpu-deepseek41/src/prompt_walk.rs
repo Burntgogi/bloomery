@@ -4,7 +4,7 @@
 //! routed block over the unit's slots, the logits of the last row and the fault word.
 //!
 //! A call is cut by [`runtime::prompt::call_batches`] into units of at most `t_max` positions, and its
-//! units run in groups of [`BatchBufs::group`] units ([`runtime::prompt::groups`]); a group is one walk
+//! units run in groups of `group` units ([`runtime::prompt::groups`]); a group is one walk
 //! of the runtime's layer schedule at the point `(g, T, Batch)` ([`runtime::sched::walk`]) through the
 //! host tier's batch port ([`BatchLeg`]). Per layer and unit:
 //! - the front: the layer's attention (the family's), then its feed-forward: the routed block's norm
@@ -188,18 +188,6 @@ impl BatchBufs {
         }
         self.group = group;
         Ok(sets > have)
-    }
-
-    /// The units a group holds.
-    #[must_use]
-    pub fn group(&self) -> usize {
-        self.group
-    }
-
-    /// The most positions a unit holds.
-    #[must_use]
-    pub fn t_max(&self) -> usize {
-        self.t_max
     }
 
     /// The device bytes of the buffers.

@@ -305,16 +305,7 @@ impl<R: RouterEntry> RouteBlock<R> {
         gpu: &Gpu,
     ) -> Result<RouteIn<'a>, GpuError> {
         let layer = self.layer(l)?;
-        let bias = match (&layer.bias, &self.no_bias) {
-            (Some(name), _) => w.f32_buf(self.what, name)?,
-            (None, Some(zero)) => zero,
-            (None, None) => {
-                return Err(GpuError::State {
-                    what: self.what,
-                    missing: "the zero selection bias of a layer with no bias",
-                });
-            }
-        };
+        let bias = self.bias_of(w, l)?;
         Ok(RouteIn {
             w: w.f32_tensor(self.what, &layer.router)?,
             bias,

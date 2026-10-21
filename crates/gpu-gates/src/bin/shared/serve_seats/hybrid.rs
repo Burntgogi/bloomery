@@ -4,8 +4,8 @@
 //! [`minimaxm3`](super::minimaxm3)).
 //!
 //! A seat gives its family the facts the run needs — the architectures it
-//! accepts, its plan inputs, its own flags, the words its refusals name and
-//! the records it prints — and this module holds what two families already do
+//! accepts, its plan inputs, the words its refusals name and the records it
+//! prints — and this module holds what two families already do
 //! the same way: the load on the engine thread, the `load` record, the
 //! prompt call, the step, the keep rule and the tags the model's own
 //! description names.
@@ -36,22 +36,18 @@ use serve::{CacheNote, Saved, ServeError};
 use super::tiered::{self, Open, Tiered};
 
 /// What a hybrid seat's family gives the common owner: its body, its plan
-/// inputs, the words its refusals and its records name, and the flags it
-/// takes beside the common ones.
+/// inputs, and the words its refusals and its records name.
 pub trait Family: Sized + 'static {
     /// The body the seat serves: one chain on one card, fed in prompt
     /// batches.
     type Body: ChainBody + app::Open<Inputs = PlanInputs<Self::H>, Cfg = HybridCfg> + Prompt + Keep;
-
-    /// The flags this seat takes beside the common ones.
-    type Flags: Default + Send;
 
     /// The family's hyperparameters: what its plan inputs are read for.
     type H;
 
     /// The binary's name, its records' owner and the `note` line's.
     const NAME: &'static str;
-    /// The usage line the seat's own flags are named in.
+    /// The usage line the seat's flag refusals print.
     const USAGE: &'static str;
     /// The levers this seat acts on, parsed once at `main`.
     const ACTS_ON: &'static [&'static str];
@@ -67,10 +63,6 @@ pub trait Family: Sized + 'static {
 
     /// The file's plan inputs, its own reading.
     fn read(split: &Split) -> Result<PlanInputs<Self::H>, PlacementError>;
-
-    /// One of the seat's own flags (`SeatFlags::parse`'s `own`): `Ok(true)`
-    /// took it.
-    fn flags(flag: &str, value: &str, out: &mut Self::Flags) -> Result<bool, GateError>;
 
     /// The records the seat prints, registered once at `main`.
     fn register();
@@ -180,7 +172,7 @@ impl<F: Family> Log<F> {
 /// The session of the file at `a.path` on `a.place`, the step captured, the
 /// `load` record on stderr, on the calling thread, pinned to the dispatcher's
 /// cpu slot when asked.
-fn open_session<F: Family>(a: Open<F::Flags>) -> Result<Hybrid<F>, GateError> {
+fn open_session<F: Family>(a: Open<()>) -> Result<Hybrid<F>, GateError> {
     record::require(record::groups::hybrid::GROUP, "hybrid seat");
     let pinned = a.pin_main && threads::pool().pin_caller();
     let file = Split::open(&a.path).map_err(|e| format!("open {}: {e}", a.path.display()))?;
@@ -290,7 +282,7 @@ fn no_cache<F: Family>() -> String {
 
 impl<F: Family> Tiered for Hybrid<F> {
     type H = F::H;
-    type Flags = F::Flags;
+    type Flags = ();
 
     const NAME: &'static str = F::NAME;
     const USAGE: &'static str = F::USAGE;
@@ -308,8 +300,8 @@ impl<F: Family> Tiered for Hybrid<F> {
         F::read(split)
     }
 
-    fn flags(flag: &str, value: &str, out: &mut Self::Flags) -> Result<bool, GateError> {
-        F::flags(flag, value, out)
+    fn flags(_flag: &str, _value: &str, _out: &mut ()) -> Result<bool, GateError> {
+        Ok(false)
     }
 
     fn think(inputs: &PlanInputs<Self::H>) -> Result<Option<ThinkTags>, GateError> {

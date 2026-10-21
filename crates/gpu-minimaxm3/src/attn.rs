@@ -562,12 +562,6 @@ impl MsaScratch {
         })
     }
 
-    /// The most rows a launch may serve.
-    #[must_use]
-    pub fn rows(&self) -> usize {
-        self.rows
-    }
-
     /// Device bytes of the three buffers.
     #[must_use]
     pub fn bytes(&self) -> usize {

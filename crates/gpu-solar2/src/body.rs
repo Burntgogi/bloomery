@@ -34,7 +34,7 @@ use std::num::NonZeroUsize;
 use std::ops::Range;
 use std::sync::Arc;
 
-use bloomery_gpu::arch::hybrid::{Acts, GqaGate, GqaLayer, Site};
+use bloomery_gpu::arch::hybrid::{Acts, GqaGate, GqaLayer, Site, wide_acts_at};
 use bloomery_gpu::checkpoint::{self, Checkpoints};
 use bloomery_gpu::flash_gqa::{GROUP, partials_ms_len, partials_v_len};
 use bloomery_gpu::head::Head;
@@ -1228,10 +1228,9 @@ fn store(
 fn new_batch(gpu: &Gpu, d: &Dims, stores: &[Store]) -> Result<Batch, GpuError> {
     let sites = || stores.iter().flat_map(Store::sites);
     let rows = MixerBufs::new(gpu.stream(), d, T_MAX, sites())?;
-    let tys: Vec<SiteTy> = sites().filter(|s| s.k() == d.embd).map(Site::ty).collect();
     Ok(Batch {
         rows,
-        wide: WideActs::new(gpu.stream(), WideActs::wants_of(&tys), T_MAX, d.embd)?,
+        wide: wide_acts_at(gpu.stream(), sites(), (T_MAX, d.embd))?,
     })
 }
 

@@ -17,7 +17,7 @@
 //! one, as the step's is). The dense layers attend every position; the sparse
 //! ones the blocks their indexer picks.
 
-use bloomery_gpu::arch::hybrid::WideCx;
+use bloomery_gpu::arch::hybrid::{Site, WideCx, wide_acts_at};
 use bloomery_gpu::flash_gqa::{GROUP_16, HEAD};
 use bloomery_gpu::gemm::{GemmKernels, GemmRoute};
 use bloomery_gpu::head::Head;
@@ -165,15 +165,21 @@ pub struct Batch {
 }
 
 impl Batch {
-    /// The buffers of a batch of `rows` rows a unit holds. Load-time only.
-    pub fn new(gpu: &Gpu, (d, shape): (&Dims, &MsaShape), rows: usize) -> Result<Batch, GpuError> {
+    /// The buffers of a batch of `rows` rows a unit holds, the wide forms cut for the types of the `sites` the
+    /// model's projections read at each width. Load-time only.
+    pub fn new(
+        gpu: &Gpu,
+        (d, shape): (&Dims, &MsaShape),
+        rows: usize,
+        sites: &[&Site],
+    ) -> Result<Batch, GpuError> {
         let stream = gpu.stream();
         let q_width = d.heads * HEAD;
         Ok(Batch {
             rows: BatchRows::new(stream, (d, shape), rows)?,
             msa: MsaScratch::new(stream, shape, rows, d.ctx)?,
-            wide: WideActs::new(stream, (false, true), rows, d.embd)?,
-            arm: WideActs::new(stream, (false, true), rows, q_width)?,
+            wide: wide_acts_at(stream, sites.iter().copied(), (rows, d.embd))?,
+            arm: wide_acts_at(stream, sites.iter().copied(), (rows, q_width))?,
             route: GemmRoute::new(stream, rows, 1)?,
             gemm: GemmKernels::load(gpu.context())?,
         })

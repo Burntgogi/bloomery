@@ -129,7 +129,6 @@ pub struct MiniMax3;
 
 impl Family for MiniMax3 {
     type Body = bloomery_gpu_minimaxm3::Body;
-    type Flags = ();
     type H = model::arch::minimaxm3::hparams::Hparams;
 
     const NAME: &'static str = self::NAME;
@@ -148,14 +147,6 @@ impl Family for MiniMax3 {
     /// template's tool-call parser.
     fn read(split: &Split) -> Result<PlanInputs<Self::H>, PlacementError> {
         model::arch::minimaxm3::place::PlanInputs::describe(split)
-    }
-
-    fn flags(
-        _flag: &str,
-        _value: &str,
-        _out: &mut (),
-    ) -> Result<bool, bloomery_gpu_gates::GateError> {
-        Ok(false)
     }
 
     fn register() {

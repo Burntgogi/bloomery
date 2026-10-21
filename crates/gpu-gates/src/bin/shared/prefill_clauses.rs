@@ -108,7 +108,9 @@ fn logprobs_near(s: &[f32], b: &[f32], bound: Option<f64>) -> (bool, String) {
         let z = (lb[id] - ls[id]).abs() / sigma_lp(ls[id].exp(), sq).max(f64::MIN_POSITIVE);
         if z.is_nan() || z > w.0 { (z, id) } else { w }
     });
-    let pass = (bound.is_none() || z <= k) && top.len() == TOP;
+    // A deferred comparison still refuses a row that holds a NaN or an infinity.
+    let finite = s.iter().chain(b).all(|v| v.is_finite());
+    let pass = finite && (bound.is_none() || z <= k) && top.len() == TOP;
     let bound_line = match bound {
         Some(_) => format!("bound {k:.2}"),
         None => {
@@ -116,10 +118,11 @@ fn logprobs_near(s: &[f32], b: &[f32], bound: Option<f64>) -> (bool, String) {
         }
     };
     let line = format!(
-        "logits worst z {z:.2} at id {at} (|dlogprob| {:.4}, sigma {:.4}) over the steps' top {}, {bound_line} {}",
+        "logits worst z {z:.2} at id {at} (|dlogprob| {:.4}, sigma {:.4}) over the steps' top {}, {bound_line}{} {}",
         (lb[at] - ls[at]).abs(),
         sigma_lp(ls[at].exp(), sq),
         top.len(),
+        if finite { "" } else { ", a non-finite value" },
         verdict(pass)
     );
     (pass, line)
@@ -138,11 +141,11 @@ fn layers_near(s: &[f32], b: &[f32], case: &Case) -> (bool, String) {
             (0.0f64, 0usize),
             |w, (l, &d)| if d > w.0 { (d, l) } else { w },
         );
-    // `rel` is infinite on a NaN, so a NaN layer is past its ceiling.
+    // `rel` is infinite on a NaN, and a family that holds a layer to no ceiling (infinite) must still refuse it.
     let first = table
         .iter()
         .enumerate()
-        .position(|(l, &d)| d > (case.tap_ceil)(case.tier, l));
+        .position(|(l, &d)| !d.is_finite() || d > (case.tap_ceil)(case.tier, l));
     let pass = first.is_none() && s.len() == b.len() && !table.is_empty();
     let probe: Vec<String> = [0, 1, 2, 3, 4, table.len().saturating_sub(1)]
         .into_iter()

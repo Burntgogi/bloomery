@@ -16,7 +16,10 @@
 //! the engine's two paths to each other and need no reference.
 //!
 //! The clauses (all self-consistency) are the common ones ([`prefill_clauses`]): `prefill_near_steps`,
-//! `prefill_then_step_near_steps`, `prefill_group_is_group_one` and `fault_word_clean`.
+//! `prefill_then_step_near_steps`, `prefill_group_is_group_one` and `fault_word_clean`, and the family's own,
+//! `prefill_batch_forms`, which runs first and on no file: the batch's wide pools quantize the input of every projection
+//! type the loader accepts (each type alone at both widths, then a mix), so a file whose projections are K-quants
+//! prefills as the released file's Q8_0 ones do.
 //!
 //! The family has no fixture file, so the fixture tier is refused by name before anything loads; the real tier's file is
 //! the one the end-to-end gate reads.
@@ -67,9 +70,17 @@ mod gate {
     use crate::lcpp_e2e::{arm_arg, model_path};
     use crate::prefill_clauses::Case;
     use crate::seat;
-    use bloomery_gpu_gates::GateError;
-    use bloomery_gpu_gates::tier::Tier;
-    use bloomery_gpu_minimaxm3::prefill::T_MAX;
+    use bloomery_gpu::Gpu;
+    use bloomery_gpu::arch::hybrid::Site;
+    use bloomery_gpu::flash_gqa::HEAD;
+    use bloomery_gpu::gemm::Gemm32Kernels;
+    use bloomery_gpu::site::{SiteTy, WideActs, WideKernels};
+    use bloomery_gpu_gates::tier::{self, Tag, Tier};
+    use bloomery_gpu_gates::{GateError, checks_failed, verdict};
+    use bloomery_gpu_minimaxm3::attn::MsaShape;
+    use bloomery_gpu_minimaxm3::body::{Dims, INDEX, PROJ};
+    use bloomery_gpu_minimaxm3::prefill::{Batch, T_MAX};
+    use cuda_core::DeviceBuffer;
     use refset::arch::minimaxm3::ARCH;
 
     const NAME: &str = "gate_minimaxm3_prefill";
@@ -83,6 +94,82 @@ mod gate {
     /// Positions of the cache beyond the longest prompt and the step after it.
     const CTX_SPARE: usize = 8;
 
+    /// The synthetic batch's widths: the model width, and the output projection's (the query heads of [`HEAD`] values).
+    /// Both are whole blocks of the q8_1 form's 128 values and of the q8 form's 64-value step.
+    const EMBD: usize = 3072;
+    const QUERY_HEADS: usize = 64;
+
+    /// The clause `prefill_batch_forms`: whether a batch cut for the sites it is told of quantizes the input of each of
+    /// them. Each type the loader accepts is run alone at both widths (the projections' input at the model width, the
+    /// output projection's at the query width), then a mix of the Q8_0 and K-quant types at both. A pool that holds no
+    /// form a site's type reads refuses the quantize by name; each refusal is a line and fails the clause.
+    fn batch_forms() -> Result<bool, GateError> {
+        let gpu = Gpu::new()?;
+        let stream = gpu.stream();
+        let d = Dims {
+            embd: EMBD,
+            vocab: 1,
+            heads: QUERY_HEADS,
+            kv_heads: 4,
+            rms_eps: 1.0e-6,
+            rope_base: 5.0e6,
+            ctx: 256,
+        };
+        let q_width = QUERY_HEADS * HEAD;
+        let shape = MsaShape::new(16, 1)?;
+        let g32 = Gemm32Kernels::load(gpu.context())?;
+        let x = DeviceBuffer::<f32>::zeroed(stream, T_MAX * q_width)?;
+        let accepted = INDEX
+            .iter()
+            .chain(PROJ.iter().filter(|t| !INDEX.contains(t)))
+            .map(|&t| (format!("{t:?}"), vec![t], vec![t]));
+        let mixed = (
+            "mixed".to_string(),
+            vec![SiteTy::Q8_0, SiteTy::Q4K, SiteTy::F32],
+            vec![SiteTy::Q6K, SiteTy::Q8_0, SiteTy::Q5K],
+        );
+        let mut ok = true;
+        for (label, at_embd, at_query) in accepted.chain([mixed]) {
+            let sites: Vec<Site> = at_embd
+                .iter()
+                .map(|&t| Site::new(format!("{label}.embd"), t, EMBD))
+                .chain(
+                    at_query
+                        .iter()
+                        .map(|&t| Site::new(format!("{label}.query"), t, q_width)),
+                )
+                .collect();
+            let refs: Vec<&Site> = sites.iter().collect();
+            let mut batch = Batch::new(&gpu, (&d, &shape), T_MAX, &refs)?;
+            let wk = WideKernels {
+                gemm: &batch.gemm,
+                g32: Some(&g32),
+            };
+            let mut quantize = |pool: &mut WideActs, tys: &[SiteTy]| -> Result<String, GateError> {
+                Ok(
+                    match pool.quantize(&gpu, &wk, gpu.layer_sink(0)?, &x, T_MAX, tys) {
+                        Ok(()) => "ok".to_string(),
+                        Err(e) => {
+                            ok = false;
+                            e.to_string()
+                        }
+                    },
+                )
+            };
+            let model = quantize(&mut batch.wide, &at_embd)?;
+            let output = quantize(&mut batch.arm, &at_query)?;
+            println!(
+                "prefill_batch_forms: {label}: the model width's pool {model}; the output width's pool {output}"
+            );
+        }
+        stream.synchronize()?;
+        println!(
+            "prefill_batch_forms: every type the loader accepts, alone and mixed {}",
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
     pub fn run() -> Result<(), GateError> {
         let tier_now = Tier::from_env()?;
         if tier_now == Tier::Fixture {
@@ -90,6 +177,12 @@ mod gate {
                 "{NAME}: the family has no fixture file: the gate runs in the real tier (`just {RECIPE}`)"
             )
             .into());
+        }
+        // Before the file loads: a pool the batch was cut wrong for fails in seconds, not after the load.
+        if tier::run_clause("prefill_batch_forms", Tag::SelfConsistency)? && !batch_forms()? {
+            println!("clause prefill_batch_forms FAIL");
+            println!("{}", tier::tally_line());
+            return Err(checks_failed());
         }
         let path = model_path(tier_now, RECIPE, ARCH)?;
         let ctx = T_MAX + 1 + CTX_SPARE;

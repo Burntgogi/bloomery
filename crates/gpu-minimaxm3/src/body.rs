@@ -83,9 +83,6 @@ pub struct Dims {
     pub rms_eps: f32,
     /// The rope's base; its table is [`ROT`] values a position.
     pub rope_base: f32,
-    /// Routed experts' and the shared expert's widths.
-    pub expert_ff: usize,
-    pub shared_ff: usize,
     pub ctx: usize,
 }
 
@@ -269,7 +266,7 @@ pub(crate) fn shape(detail: impl Into<String>) -> GpuError {
 }
 
 /// Site types a projection of the file may be: Q8_0 (the released file's), and the K-quants.
-const PROJ: &[SiteTy] = &[
+pub const PROJ: &[SiteTy] = &[
     SiteTy::Q8_0,
     SiteTy::Q3K,
     SiteTy::Q4K,
@@ -278,7 +275,7 @@ const PROJ: &[SiteTy] = &[
 ];
 
 /// Site types of the indexer's projections: the released file's f32, or any projection type.
-const INDEX: &[SiteTy] = &[
+pub const INDEX: &[SiteTy] = &[
     SiteTy::F32,
     SiteTy::Q8_0,
     SiteTy::Q3K,
@@ -363,8 +360,6 @@ fn dims_of(inputs: &PlanInputs, ctx: usize) -> Result<(Dims, MsaShape), GpuError
             kv_heads,
             rms_eps: hp.rms_eps,
             rope_base: hp.rope.base,
-            expert_ff: hp.experts.ff,
-            shared_ff: hp.experts.shared_ff(),
             ctx,
         },
         msa,
@@ -546,7 +541,8 @@ impl Body {
             &mut hybrid,
             crate::prefill::T_MAX,
         )?;
-        let batch = crate::prefill::Batch::new(gpu, (&dims, &msa), crate::prefill::T_MAX)?;
+        let sites: Vec<&Site> = stores.iter().flat_map(Store::sites).collect();
+        let batch = crate::prefill::Batch::new(gpu, (&dims, &msa), crate::prefill::T_MAX, &sites)?;
         let units = BatchBufs::new(gpu, dims.embd, crate::prefill::T_MAX, 1)?;
         let mut body = Body {
             shell: TierShell::new(hybrid, glue, dims.embd, WHAT),
@@ -598,12 +594,6 @@ impl Body {
     #[must_use]
     pub fn kinds(&self) -> Vec<Layer> {
         self.cfg.clone()
-    }
-
-    /// The positions the stores hold.
-    #[must_use]
-    pub fn held(&self) -> u32 {
-        self.at
     }
 
     /// The bytes of the stores over the written positions: each layer's K and V planes and a sparse
@@ -673,13 +663,6 @@ impl Body {
                 .taps
                 .as_ref()
                 .map_or(0, |t| t.iter().map(DeviceBuffer::num_bytes).sum())
-    }
-
-    /// The token embedding's row of `token`, dequantized into `row` (one row of `n_embd` values); a token past the
-    /// vocabulary is refused by name.
-    pub fn embed(&self, token: u32, row: &mut [f32]) -> Result<(), GpuError> {
-        self.embd.table.row_into(token, row)?;
-        Ok(())
     }
 
     /// Arm (or disarm) the per-layer taps: after each layer the chain copies its output into the layer's tap. The
