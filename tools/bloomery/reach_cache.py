@@ -234,13 +234,18 @@ def _record_types(cls):
     return typing.get_type_hints(cls)
 
 
+@functools.cache
+def _schema_shape(annotation):
+    return typing.get_origin(annotation), typing.get_args(annotation), dataclasses.is_dataclass(annotation)
+
+
 def _typed(value, annotation):
     """Strict container/record checks for the fixed structural schema; bool is not a node index."""
-    origin, args = typing.get_origin(annotation), typing.get_args(annotation)
+    if annotation is str or annotation is int or annotation is bool or annotation is type(None):
+        return type(value) is annotation
+    origin, args, record = _schema_shape(annotation)
     if origin in (typing.Union, types.UnionType):
         return any(_typed(value, a) for a in args)
-    if annotation is type(None):
-        return value is None
     if origin in (list, set, frozenset):
         return type(value) is origin and all(_typed(v, args[0]) for v in value)
     if origin is dict:
@@ -253,7 +258,7 @@ def _typed(value, annotation):
         return len(value) == len(args) and all(_typed(v, a) for v, a in zip(value, args))
     if type(value) is not annotation:
         return False
-    if dataclasses.is_dataclass(value):
+    if record:
         return all(_typed(getattr(value, k), a) for k, a in _record_types(annotation).items())
     return True
 

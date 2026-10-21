@@ -3410,6 +3410,35 @@ def _key_attributes(shape: str) -> tuple[bool, bool]:
     return opaque, linkage
 
 
+@dataclass(frozen=True)
+class KeySyntax:
+    extern_crates: frozenset[str]
+    opaque: bool
+    foreign: bool
+    macro_calls: frozenset[str]
+    qualified: frozenset[tuple[str, ...]]
+    conditional: bool
+
+
+@functools.cache
+def _key_syntax(text: str) -> KeySyntax:
+    """File-local syntax only; bindings, macro resolution and active owners remain graph-specific."""
+    code, shape = rust_lex(text)
+    opaque, linkage = _key_attributes(shape)
+    calls = frozenset(match.group(1) for match in _MACRO_PATH_CALL.finditer(shape))
+    return KeySyntax(
+        frozenset(re.findall(r"\bextern\s+crate\s+([A-Za-z_]\w*)", shape)),
+        opaque,
+        linkage or bool(re.search(r'\bextern\s*(?:"[^"]*"\s*)?\{', code))
+        or bool(re.search(r'\binclude!\s*\(\s*(?!")\S', code)
+                or re.search(r'\binclude!\s*\(\s*"[^"]*(?<!\.rs)"', code)),
+        calls,
+        frozenset(tuple(part.removeprefix("r#") for part in re.split(r"\s*::\s*", call))
+                  for call in calls if "::" in call),
+        bool(re.search(r"#\s*!?\s*\[\s*cfg(?:_attr)?\b", shape)),
+    )
+
+
 def _type_names(text: str, params: frozenset[str]) -> tuple[tuple[str, ...] | None, tuple[tuple[str, ...], ...]]:
     """(head path, the other paths) of a type or trait as an impl header writes it; a generic parameter, a lifetime
     or a keyword is no path, and a head that is one leaves the head None."""
@@ -4675,9 +4704,9 @@ class Reach:
                 pname = work.pop()
                 pkg = tree.packages[pname]
                 for f in compiled[pname]:
-                    code, shape = rust_lex(self.text(f))
+                    syntax = _key_syntax(self.text(f))
                     facts_by_root = [(rk, self.facts(rk, f)) for rk in views[pname, f]]
-                    links = set(re.findall(r"\bextern\s+crate\s+([A-Za-z_]\w*)", shape))
+                    links = set(syntax.extern_crates)
                     # Even an unused import can make rustc link a crate and run its constructors.
                     links.update(path[0].removeprefix("r#")
                                  for _, facts in facts_by_root for _, path, _, _ in facts.binds
@@ -4689,14 +4718,9 @@ class Reach:
                         if dep.key.replace("-", "_") in links or (lib is not None and lib.name.replace("-", "_") in links):
                             active_owners.add(dep.pkg)
                             work.append(dep.pkg)
-                    opaque, linkage = _key_attributes(shape)
-                    # An ABI on a Rust callback definition or function-pointer type is not an extern block.
-                    outside_ownership |= linkage or bool(re.search(r'\bextern\s*(?:"[^"]*"\s*)?\{', code))
-                    outside_ownership |= bool(re.search(r'\binclude!\s*\(\s*(?!")\S', code)
-                                              or re.search(r'\binclude!\s*\(\s*"[^"]*(?<!\.rs)"', code))
-                    calls = {match.group(1) for match in _MACRO_PATH_CALL.finditer(shape)}
-                    qualified_paths = {tuple(part.removeprefix("r#") for part in re.split(r"\s*::\s*", call))
-                                       for call in calls if "::" in call}
+                    opaque = syntax.opaque
+                    outside_ownership |= syntax.foreign
+                    calls, qualified_paths = syntax.macro_calls, syntax.qualified
                     qualified_known: set[tuple[RootKey, tuple[str, ...]]] = set()
                     # Source macros use the existing unhygienic expansion edges, even from otherwise
                     # unreached items: an expansion may emit a constructor or an implicit trait impl.
@@ -4733,7 +4757,7 @@ class Reach:
                     # Only unconditionally named local enums are proven to import variants, never macros.
                     # Imported/conditional paths remain opaque: a different binding may export a macro.
                     glob_shadow = False
-                    conditional_bindings = bool(re.search(r"#\s*!?\s*\[\s*cfg(?:_attr)?\b", shape))
+                    conditional_bindings = syntax.conditional
                     for rk, facts in facts_by_root:
                         for ctx, path in facts.globs:
                             hits = [h for base in self.bases(rk, f) or [()]
@@ -4770,15 +4794,13 @@ class Reach:
             work.extend(added)
         keep |= {self.nodes[m][1] for m in par}
         # Module declarations/re-exports on the path to reached code are behavior, not merely linkage.
-        for m in par:
-            rk, f, _ = self.nodes[m]
+        for rk, f in {(self.nodes[m][0], self.nodes[m][1]) for m in par}:
             mods = self.mods(rk)
-            for path, owner in mods.items():
-                if owner == f:
-                    for depth in range(len(path) + 1):
-                        ancestor = mods.get(path[:depth])
-                        if ancestor in ri.files:
-                            keep.add(ancestor)
+            for path in self.bases(rk, f):
+                for depth in range(len(path) + 1):
+                    ancestor = mods.get(path[:depth])
+                    if ancestor in ri.files:
+                        keep.add(ancestor)
         for m in par:
             rk, f, k = self.nodes[m]
             if k < 0:

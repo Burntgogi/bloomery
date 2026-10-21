@@ -384,6 +384,9 @@
 # contains no green verdicts: source/code/metadata/read/probe content must still match, and malformed or
 # stale snapshots rebuild. Code-identity compilation is memoized by exact source bytes, filename and
 # optimization level; cached recipe inputs still recheck current content, and key output is validated again.
+# Immutable file-local syntax facts are memoized by exact text; bindings and macro resolution stay
+# graph-specific. Schema descriptors are reused, never value-validation verdicts. Module ancestors are
+# collected once per root/file through the existing base index, not once per reached item.
 # Runtime reach is not profile-pruned for keys. The v2 key format deliberately invalidates pre-reach ledger
 # entries once; an old green cannot authorize a narrower new key.
 #   Keys are computed before the lease check. An item whose key is in the ledger does not run: run.log
