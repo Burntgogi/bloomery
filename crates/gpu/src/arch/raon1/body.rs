@@ -20,7 +20,7 @@
 //! runs the step's own launches.
 
 use super::ffn::{self, Ffn, FfnKernels, FfnRows, FfnScratch, Glu, Routed};
-use super::mhc::{HC_OUT, MhcKernels, STREAMS, SiteVecs};
+use super::mhc::{self, HC_OUT, MhcKernels, STREAMS, SiteVecs};
 use super::mla::{self, MlaBufs, MlaDims, MlaKernels, MlaSites};
 use super::rda::{self, RdaSites, RowKernels, RowsKit};
 use super::rows::{RowState, RowViews};
@@ -182,8 +182,10 @@ struct Scratch {
     /// row.
     x: DeviceBuffer<f32>,
     x2: DeviceBuffer<f32>,
-    /// The sub-layer's route ([`HC_OUT`] values a row).
+    /// The sub-layer's route ([`HC_OUT`] values a row) and its partial sums
+    /// ([`mhc::parts_len`] a row).
     hc: DeviceBuffer<f32>,
+    part: DeviceBuffer<f32>,
     /// The fold, its norm and the sub-layer's output, `n` a row each.
     u: DeviceBuffer<f32>,
     un: DeviceBuffer<f32>,
@@ -197,23 +199,47 @@ struct Scratch {
 }
 
 /// The f32 lengths of a [`Scratch`]'s buffers, in its fields' order: the
-/// streams and the sub-layer's rows, the RDA mixer's twelve, the latent
-/// layer's eleven. Each buffer holds at least one value.
-type ScratchLens = ([usize; 6], [usize; 12], [usize; 11]);
+/// streams, the route and the sub-layer's rows, the RDA mixer's twelve, the
+/// latent layer's eleven. Each buffer holds at least one value.
+type ScratchLens = ([usize; 7], [usize; 12], [usize; 11]);
 
 impl Scratch {
     /// The lengths of a walk's buffers of `rows` rows over a latent cache of
     /// `ctx` rows: the one formula [`Scratch::new`] allocates and
-    /// [`Body::pass_reserve`] counts.
-    fn lens(hp: &Hparams, (d, m): (&KdaDims, &MlaDims), ctx: usize, rows: usize) -> ScratchLens {
+    /// [`Body::pass_reserve`] counts. Refused by name when the streams are
+    /// not whole route pieces ([`mhc::parts_len`]).
+    fn lens(
+        hp: &Hparams,
+        (d, m): (&KdaDims, &MlaDims),
+        ctx: usize,
+        rows: usize,
+    ) -> Result<ScratchLens, GpuError> {
         let z = |n: usize| (rows * n).max(1);
         let n = hp.n_embd;
+        let parts = mhc::parts_len(n).ok_or_else(|| {
+            GpuError::shape(
+                WHAT,
+                format!(
+                    "n_embd {n}: the route takes the streams' {} values in {}-value pieces",
+                    STREAMS * n,
+                    mhc::HC_PIECE
+                ),
+            )
+        })?;
         let lin = d.shape;
         let (channels, v, n_v) = (lin.channels(), lin.n_v * HEAD, lin.n_v);
         let (part_v, part_ms) = mla::partials_lens_rows(m, ctx, rows);
         let (heads, row) = (m.heads, m.row());
-        (
-            [z(STREAMS * n), z(STREAMS * n), z(HC_OUT), z(n), z(n), z(n)],
+        Ok((
+            [
+                z(STREAMS * n),
+                z(STREAMS * n),
+                z(HC_OUT),
+                z(parts),
+                z(n),
+                z(n),
+                z(n),
+            ],
             [
                 z(channels),
                 z(hp.decay_rank),
@@ -241,7 +267,7 @@ impl Scratch {
                 part_v.max(1),
                 part_ms.max(1),
             ],
-        )
+        ))
     }
 
     /// Card bytes of the buffers [`Scratch::lens`] names, before any load.
@@ -270,12 +296,13 @@ impl Scratch {
                 .try_into()
                 .unwrap_or_else(|_| unreachable!("{N} buffers made of {N} lengths")))
         }
-        let (streams, kda, mla) = Scratch::lens(hp, dims, ctx, rows);
-        let [x, x2, hc, u, un, br] = zeroed(stream, streams)?;
+        let (streams, kda, mla) = Scratch::lens(hp, dims, ctx, rows)?;
+        let [x, x2, hc, part, u, un, br] = zeroed(stream, streams)?;
         Ok(Scratch {
             x,
             x2,
             hc,
+            part,
             u,
             un,
             br,
@@ -285,12 +312,14 @@ impl Scratch {
     }
 
     fn bytes(&self) -> usize {
-        [&self.x, &self.x2, &self.hc, &self.u, &self.un, &self.br]
-            .into_iter()
-            .chain(self.kda.iter())
-            .chain(self.mla.iter())
-            .map(DeviceBuffer::num_bytes)
-            .sum()
+        [
+            &self.x, &self.x2, &self.hc, &self.part, &self.u, &self.un, &self.br,
+        ]
+        .into_iter()
+        .chain(self.kda.iter())
+        .chain(self.mla.iter())
+        .map(DeviceBuffer::num_bytes)
+        .sum()
     }
 }
 
@@ -470,7 +499,7 @@ impl Body {
     /// context takes. Refused as the load refuses `hp`.
     pub fn pass_reserve(hp: &Hparams) -> Result<u64, GpuError> {
         let (kda, mla) = dims(hp)?;
-        let lens = Scratch::lens(hp, (&kda, &mla), usize::MAX, PASS_ROWS);
+        let lens = Scratch::lens(hp, (&kda, &mla), usize::MAX, PASS_ROWS)?;
         Ok(Scratch::bytes_of(&lens) as u64)
     }
 
@@ -592,7 +621,9 @@ impl Body {
             layers.iter().flat_map(Layer::mixer_sites),
         )?;
         let ff = (hp.dense_ff.max(e.shared_ff()), e.ff);
-        let stage = rda::stage_len(&kda).max(mla::stage_len(&mla));
+        let stage = rda::stage_len(&kda)
+            .max(mla::stage_len(&mla))
+            .max(ffn::stage_len(ff.0.max(ff.1)));
         Ok(Body {
             k: Kernels::load(gpu, &mla)?,
             s: Scratch::new(stream, &hp, (&kda, &mla), ctx, 1)?,
@@ -748,6 +779,7 @@ impl Body {
             x,
             x2,
             hc,
+            part,
             u,
             un,
             br,
@@ -767,7 +799,14 @@ impl Body {
                     base: w.f32_buf(STEP, base)?,
                 })
             };
-            mhc.enqueue_route(stream, &vecs(attn_hc)?, x, (n, m), hcf, hc)?;
+            mhc.enqueue_route(
+                stream,
+                &vecs(attn_hc)?,
+                x,
+                (n, m),
+                hcf,
+                (&mut *part, &mut *hc),
+            )?;
             mhc.enqueue_fold(stream, x, hc, (n, m), u)?;
             match &mut layer.mixer {
                 Mixer::Rda { sites, store } => {
@@ -852,7 +891,14 @@ impl Body {
                 }
             }
             mhc.enqueue_post(stream, (x, br, hc), (n, m), x2)?;
-            mhc.enqueue_route(stream, &vecs(ffn_hc)?, x2, (n, m), hcf, hc)?;
+            mhc.enqueue_route(
+                stream,
+                &vecs(ffn_hc)?,
+                x2,
+                (n, m),
+                hcf,
+                (&mut *part, &mut *hc),
+            )?;
             mhc.enqueue_fold(stream, x2, hc, (n, m), u)?;
             let gain = w.f32_buf(STEP, &names::ffn_norm(l))?;
             gpu.elem()
@@ -861,7 +907,14 @@ impl Body {
             let at_l = (l, &layer.ffn);
             match &mut ffn_b {
                 FfnBufs::Step(f) => ffn::ffn(&cx, &k.ffn, acts, rule, at_l, un, f, br)?,
-                FfnBufs::Rows(f) => ffn::ffn_rows(&cx, &k.ffn, acts, rule, at_l, m, un, f, br)?,
+                FfnBufs::Rows(f) => {
+                    let kit = RowsKit {
+                        linear: &k.linear,
+                        rows: &k.rows,
+                        stage: &mut *stage,
+                    };
+                    ffn::ffn_rows(&cx, &k.ffn, acts, rule, at_l, m, un, f, br, kit)?
+                }
             }
             mhc.enqueue_post(stream, (x2, br, hc), (n, m), x)?;
         }

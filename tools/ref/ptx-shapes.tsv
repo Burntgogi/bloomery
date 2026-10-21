@@ -374,6 +374,7 @@ generate_ds41   qwen3moe_router_norm_prefetch            0           0
 generate_ds41   qwen3moe_router_route                    0           0
 generate_ds41   qwen3moe_token_major                     0           0
 generate_ds41   raon_hc_fold                             0           0
+generate_ds41   raon_hc_mix                              0           0
 generate_ds41   raon_hc_mean                             0           0
 generate_ds41   raon_hc_post                             0           0
 generate_ds41   raon_hc_route                            0           112

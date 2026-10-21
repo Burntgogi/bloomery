@@ -20,12 +20,16 @@
 //! `enqueue_router_rows` (what that many one-token routers write), the card
 //! leg's slots are slot-local whatever its token count, the SiTU and the
 //! add are element-wise, and each site runs over the rows as
-//! [`project_rows`] says.
+//! [`project_rows`] says: one launch over the rows where the site has one
+//! (the K-quants' m-column gemv through the pass's stage, the f32 rows'
+//! gemv), else the one-row launch a row.
 
+use super::rda::{self, RowsKit};
+use super::state::PASS_ROWS;
 use crate::arch::hybrid::{Acts, GqaCx, Site};
 use crate::card_leg::{CardLeg, LegBufs, LegRun, LegShape, LegStacks, LegSum};
 use crate::kquant::Act;
-use crate::site::{self, Form};
+use crate::site::{Form, SiteTy};
 use crate::tensor::{Window, WindowMut};
 use crate::weights::Weights;
 use crate::{Gpu, GpuError};
@@ -281,14 +285,42 @@ pub(crate) fn ffn(
     }
 }
 
+/// f32s of the stage ([`RowsKit`]) a pass of up to [`PASS_ROWS`] rows of
+/// blocks at most `ff` wide writes: a row-major gate or up site's columns.
+#[must_use]
+pub(crate) fn stage_len(ff: usize) -> usize {
+    PASS_ROWS * ff
+}
+
+/// Whether site `s` runs over several rows in one launch: the f32 rows'
+/// gemv, or a K-quant's m-column gemv. Not a Q6_K row of an odd
+/// super-block count, which `site::kgemv` runs one column at a launch, nor
+/// the Q5_0 form.
+fn has_columns(s: &Site) -> bool {
+    match s.ty().reads() {
+        Form::F32 | Form::Q8x32 => true,
+        Form::Q8x128 => {
+            let odd_q6k = matches!(s.ty(), SiteTy::Q6K) && (s.k() / 256) % 2 == 1;
+            s.ty().kgemv_order().is_some() && !odd_q6k
+        }
+        Form::Q8Blocks32 => false,
+    }
+}
+
 /// `y = W · x` for site `s` over `m` rows of `x` (token-major, `s.k()`
 /// values a row) into `y` (`rows` values a row), each row the one-row
-/// [`Site::project`]'s bits: a site of the f32 rows' forms (Q8_0, F32) in
-/// one launch over the rows (`site::gemv`'s columns, each its one-column
-/// gemv bit for bit), any other form the one-row launch on each row's
-/// window. At one row it is [`Site::project`].
+/// [`Site::project`]'s bits: a site [`has_columns`] in one launch over the
+/// rows ([`rda::project_rows`]: each column its one-column launch bit for
+/// bit), any other the one-row launch on each row's window. At one row it
+/// is [`Site::project`].
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a site's launch inputs: the context, the row kit, the forms, the layer, the site, \
+              the rows and the buffers"
+)]
 fn project_rows(
     cx: &GqaCx<'_>,
+    kit: &mut RowsKit<'_>,
     acts: &mut Acts,
     l: usize,
     s: &Site,
@@ -299,26 +331,29 @@ fn project_rows(
     if m == 1 {
         return s.project(cx, acts, l, x, y);
     }
-    match s.ty().reads() {
-        Form::F32 | Form::Q8x32 => site::gemv(cx.gpu, cx.g32, (s.ty(), cx.w, s.name()), x, m, y),
-        _ => {
-            let (k, f) = (s.k(), size_of::<f32>());
-            for r in 0..m {
-                let xr = Window::<f32>::of(x, r * k * f, k)?;
-                let mut yr = WindowMut::<f32>::of_mut(y, r * rows * f, rows)?;
-                s.project(cx, acts, l, &xr, &mut yr)?;
-            }
-            Ok(())
-        }
+    if has_columns(s) {
+        return rda::project_rows(cx, kit, acts, (l, m), (s, rows), x, y);
     }
+    let (k, f) = (s.k(), size_of::<f32>());
+    for r in 0..m {
+        let xr = Window::<f32>::of(x, r * k * f, k)?;
+        let mut yr = WindowMut::<f32>::of_mut(y, r * rows * f, rows)?;
+        s.project(cx, acts, l, &xr, &mut yr)?;
+    }
+    Ok(())
 }
 
 /// [`glu`] over `m` rows of `xn`: each site over the rows
 /// ([`project_rows`]; a site's rows run before the next site's, so a
 /// per-row form reads its weight from the cache after the first row), the
 /// SiTU over every row in one launch.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "glu's inputs, the row count and the row kit"
+)]
 fn glu_rows(
     cx: &GqaCx<'_>,
+    kit: &mut RowsKit<'_>,
     (acts, rule): (&mut Acts, Act),
     (l, m): (usize, usize),
     g: &Glu,
@@ -331,17 +366,21 @@ fn glu_rows(
     y: &mut DeviceBuffer<f32>,
 ) -> Result<(), GpuError> {
     let (gate, up, act) = s;
-    project_rows(cx, acts, l, &g.gate, (m, g.ff), xn, gate)?;
-    project_rows(cx, acts, l, &g.up, (m, g.ff), xn, up)?;
+    project_rows(cx, kit, acts, l, &g.gate, (m, g.ff), xn, gate)?;
+    project_rows(cx, kit, acts, l, &g.up, (m, g.ff), xn, up)?;
     cx.gpu
         .elem()
         .enqueue_situ(cx.gpu.stream(), rule, (gate, up), m * g.ff, act)?;
-    project_rows(cx, acts, l, &g.down, (m, cx.hidden), act, y)
+    project_rows(cx, kit, acts, l, &g.down, (m, cx.hidden), act, y)
 }
 
 /// [`ffn`] over `m` rows of `xn` (token-major) into `y`, each row the
-/// one-row block's bits (module doc): `m` is 1 to the rows `s` was made for.
-#[allow(clippy::too_many_arguments, reason = "ffn's inputs and the row count")]
+/// one-row block's bits (module doc): `m` is 1 to the rows `s` was made for;
+/// `kit`'s stage holds at least the [`stage_len`] of the widest block.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "ffn's inputs, the row count and the row kit"
+)]
 pub(crate) fn ffn_rows(
     cx: &GqaCx<'_>,
     k: &FfnKernels,
@@ -352,6 +391,7 @@ pub(crate) fn ffn_rows(
     xn: &DeviceBuffer<f32>,
     s: &mut FfnRows,
     y: &mut DeviceBuffer<f32>,
+    mut kit: RowsKit<'_>,
 ) -> Result<(), GpuError> {
     if m == 0 || m > s.rows {
         return Err(GpuError::shape(
@@ -375,7 +415,16 @@ pub(crate) fn ffn_rows(
         ..
     } = s;
     match f {
-        Ffn::Dense(g) => glu_rows(cx, (acts, rule), (l, m), g, xn, (gate, up, act), y),
+        Ffn::Dense(g) => glu_rows(
+            cx,
+            &mut kit,
+            (acts, rule),
+            (l, m),
+            g,
+            xn,
+            (gate, up, act),
+            y,
+        ),
         Ffn::Routed(r) => {
             let (gpu, w) = (cx.gpu, cx.w);
             let stream = gpu.stream();
@@ -397,6 +446,7 @@ pub(crate) fn ffn_rows(
             routed_sum(gpu, w, &k.leg, (l, r, rule), (xn, m), picks, leg, routed)?;
             glu_rows(
                 cx,
+                &mut kit,
                 (acts, rule),
                 (l, m),
                 &r.shared,

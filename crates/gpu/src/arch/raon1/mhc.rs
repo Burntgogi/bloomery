@@ -8,9 +8,16 @@
 //! with `comb[j · 4 + i]` the weight of source stream `j` in stream `i`
 //! (V4.1's HC_PRE layout, so the apply stages are the same rule).
 //!
-//! - [`raon_hc_kernels::raon_hc_route`], one block a token: the selector's
-//!   [`HC_MIX`] dots of the widened f16 rows `hc_*_fn` with the token's
-//!   streams and the streams' sum of squares, then on thread 0
+//! - [`raon_hc_kernels::raon_hc_mix`], one block a (token, piece of
+//!   [`HC_PIECE`] values): the selector's [`HC_MIX`] dots of the widened f16
+//!   rows `hc_*_fn` with the token's streams over the piece, then the
+//!   piece's sum of squares, a warp a row: lane `l` sums its values
+//!   `l + 32s` by `mul_add` from 0, `s` ascending, then
+//!   `warp::reduce_sum_f32`. The pieces spread the selector over the card's
+//!   SMs: one block walking every row is load-latency bound.
+//! - [`raon_hc_kernels::raon_hc_route`], one block a token: each row's piece
+//!   sums (lane `l` adds pieces `l + 32j` from 0, `j` ascending, then
+//!   `warp::reduce_sum_f32`), then on thread 0
 //!   `mix = dot / √(ss/K + eps)`, `pre = σ(α_pre·mix + b)`,
 //!   `post = mag·σ(α_post·mix + b)`, the chart `e = H z Hᵀ` of the
 //!   `(n−1)²` coordinates `z`, `ρ = 1 + max(0, max(−e/B))`, `φ = e/ρ + B`
@@ -51,8 +58,64 @@ pub const MAX_TOKENS: usize = 512;
 /// Threads of a route block: eight warps.
 const ROUTE_THREADS: u32 = 256;
 const ROUTE_WARPS: usize = 8;
+/// Values of `K` one `raon_hc_mix` block owns: eight a lane, 32 apart.
+pub(crate) const HC_PIECE: usize = 256;
+/// Partial sums a (token, piece): the [`HC_MIX`] selector dots, then the
+/// squares.
+const HC_PARTS: usize = HC_MIX + 1;
+const _: () = assert!(HC_PIECE == 8 * 32 && HC_PARTS == 18 && HC_PARTS <= 3 * ROUTE_WARPS);
 /// Threads of the element-wise entries.
 const ELEM_THREADS: u32 = 256;
+
+/// The route's partial sums a token of `n`-wide streams takes: [`HC_PARTS`]
+/// a piece of [`HC_PIECE`] values. `None` when `4n` is not whole pieces.
+pub(crate) fn parts_len(n: usize) -> Option<usize> {
+    let k = STREAMS * n;
+    (k > 0 && k.is_multiple_of(HC_PIECE)).then_some(k / HC_PIECE * HC_PARTS)
+}
+
+/// One lane's share of a piece's dot of `a` from `ia` with `b` from `ib`:
+/// `a[ia + 32s] · b[ib + 32s]`, `s` = 0..8 ascending, by `mul_add` from 0,
+/// every load issued before the first product.
+///
+/// SAFETY: `ia + 224 < a.len()` and `ib + 224 < b.len()`.
+#[inline(always)]
+unsafe fn lane_piece_dot(a: &[f32], ia: usize, b: &[f32], ib: usize) -> f32 {
+    // SAFETY: every offset is at most `ia + 224` or `ib + 224`, in bounds by
+    // this fn's contract.
+    let (va, vb) = unsafe {
+        (
+            [
+                *a.get_unchecked(ia),
+                *a.get_unchecked(ia + 32),
+                *a.get_unchecked(ia + 64),
+                *a.get_unchecked(ia + 96),
+                *a.get_unchecked(ia + 128),
+                *a.get_unchecked(ia + 160),
+                *a.get_unchecked(ia + 192),
+                *a.get_unchecked(ia + 224),
+            ],
+            [
+                *b.get_unchecked(ib),
+                *b.get_unchecked(ib + 32),
+                *b.get_unchecked(ib + 64),
+                *b.get_unchecked(ib + 96),
+                *b.get_unchecked(ib + 128),
+                *b.get_unchecked(ib + 160),
+                *b.get_unchecked(ib + 192),
+                *b.get_unchecked(ib + 224),
+            ],
+        )
+    };
+    let mut acc = va[0].mul_add(vb[0], 0.0);
+    acc = va[1].mul_add(vb[1], acc);
+    acc = va[2].mul_add(vb[2], acc);
+    acc = va[3].mul_add(vb[3], acc);
+    acc = va[4].mul_add(vb[4], acc);
+    acc = va[5].mul_add(vb[5], acc);
+    acc = va[6].mul_add(vb[6], acc);
+    va[7].mul_add(vb[7], acc)
+}
 
 /// Helmert basis entry `(i, j)` of `n` streams: `1` for `i ≤ j`, `−(j+1)`
 /// for `i = j + 1`, else 0, over `√((j+1)(j+2))` — the reference's f32
@@ -83,10 +146,68 @@ fn sigmoid(x: f32) -> f32 {
 mod raon_hc_kernels {
     use super::*;
 
-    /// One token's route (module doc), block `t` token `t`: `w` the
-    /// [`HC_MIX`] selector rows of `4n` f32, `scale` the four scales
-    /// (`α_pre`, `α_post`, `α_z`, `η`), `base` the [`HC_MIX`] biases, `x` the
-    /// tokens' streams; writes [`HC_OUT`] values a token into `hc`.
+    /// The route's partial sums (module doc), block `t·pieces + p` token
+    /// `t`'s piece `p` of [`HC_PIECE`] values: `w` the [`HC_MIX`] selector
+    /// rows of `4n` f32, `x` the tokens' streams. Warp `w` owns rows `w`,
+    /// `w + 8`, `w + 16` of the [`HC_PARTS`]: the selector rows' dots, then
+    /// the squares; writes [`HC_PARTS`] values a (token, piece) into `part`.
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            pieces * 256 == 4 * n,
+            w.len() >= 68 * n,
+            x.len() >= m * 4 * n,
+            part.len() >= m * pieces * 18
+        )
+    )]
+    pub fn raon_hc_mix(
+        w: &[f32],
+        x: &[f32],
+        n: u32,
+        m: u32,
+        pieces: u32,
+        mut part: DisjointSlice<f32>,
+    ) {
+        let b = thread::blockIdx_x() as usize;
+        let pieces = pieces as usize;
+        let (t, p) = (b / pieces, b % pieces);
+        if t >= m as usize {
+            return;
+        }
+        let wi = thread::threadIdx_x() as usize / 32;
+        let lane = warp::lane_id() as usize;
+        let k = STREAMS * n as usize;
+        let at = p * HC_PIECE + lane;
+        let xt = t * k + at;
+        let mut r = wi;
+        while r < HC_PARTS {
+            // SAFETY: at + 224 < (p + 1)·HC_PIECE <= k, so for r < HC_MIX
+            // r·k + at + 224 < 17·k <= w.len(), and xt + 224 < (t + 1)·k <=
+            // x.len(), by the contract.
+            let acc = unsafe {
+                if r < HC_MIX {
+                    lane_piece_dot(w, r * k + at, x, xt)
+                } else {
+                    lane_piece_dot(x, xt, x, xt)
+                }
+            };
+            let acc = warp::reduce_sum_f32(acc);
+            if lane == 0 {
+                // SAFETY: (t·pieces + p)·HC_PARTS + r < m·pieces·18 <=
+                // part.len() by the contract; this warp alone owns row r.
+                unsafe { *part.get_unchecked_mut((t * pieces + p) * HC_PARTS + r) = acc };
+            }
+            r += ROUTE_WARPS;
+        }
+    }
+
+    /// One token's route (module doc), block `t` token `t`: `part` the
+    /// tokens' [`raon_hc_mix`] sums over `pieces` pieces, `scale` the four
+    /// scales (`α_pre`, `α_post`, `α_z`, `η`), `base` the [`HC_MIX`] biases;
+    /// writes [`HC_OUT`] values a token into `hc`.
     #[allow(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
@@ -97,26 +218,25 @@ mod raon_hc_kernels {
         domain = 1,
         block = (256, 1, 1),
         requires = (
-            w.len() >= 68 * n,
+            pieces * 256 == 4 * n,
+            part.len() >= m * pieces * 18,
             scale.len() >= 4,
             base.len() >= 17,
-            x.len() >= m * 4 * n,
             hc.len() >= m * 24
         )
     )]
     pub fn raon_hc_route(
-        w: &[f32],
+        part: &[f32],
         scale: &[f32],
         base: &[f32],
-        x: &[f32],
         n: u32,
         m: u32,
+        pieces: u32,
         eps: f32,
         magnitude: f32,
         mut hc: DisjointSlice<f32>,
     ) {
-        static mut MIX: SharedArray<f32, HC_MIX> = SharedArray::UNINIT;
-        static mut SS: SharedArray<f32, ROUTE_WARPS> = SharedArray::UNINIT;
+        static mut MIX: SharedArray<f32, HC_PARTS> = SharedArray::UNINIT;
 
         let t = thread::blockIdx_x() as usize;
         if t >= m as usize {
@@ -126,43 +246,24 @@ mod raon_hc_kernels {
         let wi = tid / 32;
         let lane = warp::lane_id() as usize;
         let k = STREAMS * n as usize;
-        let xt = t * k;
-        // SAFETY: MIX and SS are this block's own shared allocations; the
-        // raw form reaches each `static mut` without a reference.
-        let (mix, ss) = unsafe {
-            (
-                SharedArray::as_raw_mut_ptr(&raw mut MIX),
-                SharedArray::as_raw_mut_ptr(&raw mut SS),
-            )
-        };
-        let mut sq = 0.0f32;
-        let mut i = tid;
-        while i < k {
-            // SAFETY: xt + i < (t + 1)·k <= m·k <= x.len() by the contract.
-            let v = unsafe { *x.get_unchecked(xt + i) };
-            sq = v.mul_add(v, sq);
-            i += ROUTE_THREADS as usize;
-        }
-        let sq = warp::reduce_sum_f32(sq);
-        if lane == 0 {
-            // SAFETY: wi < ROUTE_WARPS; lane 0 of each warp writes its slot.
-            unsafe { *ss.add(wi) = sq };
-        }
+        let pieces = pieces as usize;
+        let row0 = t * pieces * HC_PARTS;
+        // SAFETY: MIX is this block's own shared allocation; the raw form
+        // reaches the `static mut` without a reference.
+        let mix = unsafe { SharedArray::as_raw_mut_ptr(&raw mut MIX) };
         let mut r = wi;
-        while r < HC_MIX {
-            let row = r * k;
+        while r < HC_PARTS {
             let mut acc = 0.0f32;
-            let mut i = lane;
-            while i < k {
-                // SAFETY: row + i < 17·k <= w.len() and xt + i < x.len() by
-                // the contract.
-                let (a, b) = unsafe { (*w.get_unchecked(row + i), *x.get_unchecked(xt + i)) };
-                acc = a.mul_add(b, acc);
-                i += 32;
+            let mut j = lane;
+            while j < pieces {
+                // SAFETY: row0 + j·HC_PARTS + r < (t + 1)·pieces·18 <=
+                // part.len() by the contract.
+                acc = add_rn_f32(acc, unsafe { *part.get_unchecked(row0 + j * HC_PARTS + r) });
+                j += 32;
             }
             let acc = warp::reduce_sum_f32(acc);
             if lane == 0 {
-                // SAFETY: r < HC_MIX; this warp alone owns row r.
+                // SAFETY: r < HC_PARTS; this warp alone owns row r.
                 unsafe { *mix.add(r) = acc };
             }
             r += ROUTE_WARPS;
@@ -171,13 +272,8 @@ mod raon_hc_kernels {
         if tid != 0 {
             return;
         }
-        let mut sum = 0.0f32;
-        let mut s = 0usize;
-        while s < ROUTE_WARPS {
-            // SAFETY: s < ROUTE_WARPS, written above, past the barrier.
-            sum = add_rn_f32(sum, unsafe { *ss.add(s) });
-            s += 1;
-        }
+        // SAFETY: HC_MIX < HC_PARTS, written above, past the barrier.
+        let sum = unsafe { *mix.add(HC_MIX) };
         let rms = sqrt_rn_f32(add_rn_f32(div_rn_f32(sum, k as f32), eps));
         // SAFETY: scale.len() >= 4 and base.len() >= HC_MIX by the contract.
         let (a_pre, a_post, a_z, eta) = unsafe {
@@ -436,7 +532,10 @@ impl MhcKernels {
     }
 
     /// The route of `m` tokens' streams `x` (`4n` a token) at site `v` into
-    /// `hc` ([`HC_OUT`] a token). Asynchronous, allocation-free, capturable.
+    /// `hc` ([`HC_OUT`] a token), through the partial sums `part`
+    /// ([`parts_len`] a token): two launches. A `4n` that is not whole
+    /// [`HC_PIECE`] pieces is refused by name. Asynchronous, allocation-free,
+    /// capturable.
     #[allow(
         clippy::too_many_arguments,
         reason = "the site's three vectors, the streams, the widths and the file's two constants"
@@ -448,50 +547,57 @@ impl MhcKernels {
         x: &DeviceBuffer<f32>,
         (n, m): (usize, usize),
         (eps, magnitude): (f32, f32),
-        hc: &mut DeviceBuffer<f32>,
+        (part, hc): (&mut DeviceBuffer<f32>, &mut DeviceBuffer<f32>),
     ) -> Result<(), GpuError> {
         let what = "raon1 mhc::enqueue_route";
         let k = STREAMS * n;
+        let Some(per) = parts_len(n) else {
+            return Err(GpuError::shape(
+                what,
+                format!("n={n}: the streams' {k} values are not whole {HC_PIECE}-value pieces"),
+            ));
+        };
         if m == 0
             || m > MAX_TOKENS
             || v.w.len() < HC_MIX * k
             || v.scale.len() < 4
             || v.base.len() < HC_MIX
             || x.len() < m * k
+            || part.len() < m * per
             || hc.len() < m * HC_OUT
         {
             return Err(GpuError::shape(
                 what,
                 format!(
                     "m={m} (1..={MAX_TOKENS}), n={n}: w {} (want {}), scale {}, base {}, x {} \
-                     (want {}), hc {} (want {})",
+                     (want {}), part {} (want {}), hc {} (want {})",
                     v.w.len(),
                     HC_MIX * k,
                     v.scale.len(),
                     v.base.len(),
                     x.len(),
                     m * k,
+                    part.len(),
+                    m * per,
                     hc.len(),
                     m * HC_OUT
                 ),
             ));
         }
         let mu = launch_u32(what, "m", m)?;
+        let pieces = launch_u32(what, "pieces", k / HC_PIECE)?;
+        let nu = launch_u32(what, "n", n)?;
+        let blocks = launch_u32(what, "m·pieces", m * (k / HC_PIECE))?;
+        let prep =
+            self.module
+                .prepare_raon_hc_mix(LaunchConfig1D::new(blocks, ROUTE_THREADS, 0))?;
+        self.module
+            .raon_hc_mix(stream, &prep, v.w, x, nu, mu, pieces, &mut *part)?;
         let prep = self
             .module
             .prepare_raon_hc_route(LaunchConfig1D::new(mu, ROUTE_THREADS, 0))?;
         self.module.raon_hc_route(
-            stream,
-            &prep,
-            v.w,
-            v.scale,
-            v.base,
-            x,
-            launch_u32(what, "n", n)?,
-            mu,
-            eps,
-            magnitude,
-            hc,
+            stream, &prep, &*part, v.scale, v.base, nu, mu, pieces, eps, magnitude, hc,
         )?;
         Ok(())
     }
