@@ -27,10 +27,10 @@ bloomery-runtime = { path = "../runtime" }
 # The coverage check asks the tokenizer which pre-tokenizers it runs.
 bloomery-tokenizer = { path = "../tokenizer" }
 libc = { workspace = true }
-sha2 = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+sha2 = { workspace = true }
 # The gates read the oracle sets through the reference-set reader, which checks each set's
 # provenance. It depends on the GGUF reader only, so the edge makes no cycle.
 bloomery-refset = { path = "../refset" }

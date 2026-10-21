@@ -5,9 +5,9 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::path::PathBuf;
 
+use gguf::digest::sha256_hex_of;
 use gguf::write::{Layout, TensorDecl, file_alignment};
 use gguf::{GgmlType, Split, Value};
-use sha2::{Digest, Sha256};
 
 use super::fill::{
     FloatTy, NVFP4_TENSOR_SCALE, Rule, Window, chunk_len, chunk_rng, fill_units, rule_for,
@@ -17,7 +17,6 @@ use super::{
     FIXTURE_VERSION, FixtureError, KEY_CARD_BUDGET, KEY_SEED, KEY_SOURCE_LAYERS, KEY_SOURCE_SHA256,
     KEY_SUBSET, KEY_VERSION, meta,
 };
-use crate::fileio;
 
 /// Every tensor of a layer is named `blk.<layer>.<leaf>`, in every family.
 const BLK: &str = "blk.";
@@ -229,14 +228,12 @@ pub(crate) fn split_layer(name: &str) -> Option<(usize, &str)> {
 /// lowercase hex sha256 of every shard's bytes before its data base, in
 /// split order.
 pub fn header_sha256(split: &Split) -> String {
-    let mut h = Sha256::new();
-    for i in 0..split.shard_count() {
-        let g = split
+    sha256_hex_of((0..split.shard_count()).map(|i| {
+        split
             .shard(i)
-            .expect("a split has a reader for every shard index");
-        h.update(g.header_bytes());
-    }
-    fileio::hex(&h.finalize())
+            .expect("a split has a reader for every shard index")
+            .header_bytes()
+    }))
 }
 
 /// The fixture's own keys.

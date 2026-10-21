@@ -48,7 +48,6 @@ use models::{DraftSpec, Ffn, HcKind, Mixer, ModelSpec, MtpDraft, MtpSource, OutG
 use super::hparams::{Hparams, Kind};
 use super::{mtp, names, roles, spec};
 use crate::arch::coverage;
-use crate::fileio::hex;
 use crate::placement::accepts::{
     Program, leg_card_format, qwen38_down, qwen38_gate_up, routed_rule,
 };
@@ -62,6 +61,7 @@ use crate::placement::{
     self, Card, CardFormat, Host, KvBytes, Machine, ModelTensor, ModelTensors, Node,
     PlacementError, Plan, PlanLevers, RoutedRule, Unimplemented, Violation, checked, joined,
 };
+use gguf::digest::hex;
 
 use runtime::stores::{
     DELTA_LANES, F32_BYTES, delta_lane_bytes, dense_kv_bytes, kv_plane_bytes, ple_ring_bytes,
@@ -2671,8 +2671,8 @@ mod tests {
             FileTensor, MtpInputs, MtpLoad, mtp_arena_bytes, mtp_tensors, mtp_widened,
         };
         use crate::arch::synthetic::header;
-        use crate::fileio::hex;
         use crate::placement::{self, CardFormat, Device, PlanLevers, Role, RoutedRule};
+        use gguf::digest::hex;
 
         /// The draft program's arena formula, at the file's vocabulary:
         /// the derived value the doc states, the dense flash partials' term

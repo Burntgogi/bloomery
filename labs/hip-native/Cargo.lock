@@ -16,6 +16,7 @@ name = "bloomery-gguf"
 version = "0.1.0"
 dependencies = [
  "memmap2",
+ "sha2",
  "thiserror",
 ]
 
@@ -50,7 +51,6 @@ dependencies = [
  "bloomery-threads",
  "bloomery-tokenizer",
  "libc",
- "sha2",
  "thiserror",
 ]
 
@@ -59,7 +59,6 @@ name = "bloomery-models"
 version = "0.1.0"
 dependencies = [
  "bloomery-gguf",
- "sha2",
  "thiserror",
 ]
 

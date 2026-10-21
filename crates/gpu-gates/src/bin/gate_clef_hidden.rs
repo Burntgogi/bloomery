@@ -61,7 +61,7 @@ mod gate {
     use bloomery_gpu::arch::qwen3moe::{KvQ8, Open35, PrefillPath, Qwen35moeModel};
     use bloomery_gpu_gates::{
         GateError, RefManifest, checks_failed, data_dir, load_ref_in, quantile, ref_model_path,
-        sha256, verdict,
+        verdict,
     };
     use gguf::Split;
     use refset::arch::qwen35::{
@@ -243,7 +243,7 @@ mod gate {
             .tokens_file_sha256
             .as_deref()
             .ok_or_else(|| format!("{name}: no `# tokens_file_sha256` line"))?;
-        let got = sha256(Path::new(file))?;
+        let got = gguf::digest::sha256_file(Path::new(file))?;
         if got != want || h.tokens_count != Some(u64::try_from(n)?) {
             return Err(format!(
                 "{name}: the set was dumped from {want} ({:?} ids); {file} is {got}, {n} wanted",

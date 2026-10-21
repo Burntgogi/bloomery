@@ -1,13 +1,10 @@
-//! File-system calls std does not wrap, and the digest text the file writers
-//! record. Each returns the bare `io::Error`; the caller names the path and
-//! the operation.
+//! File-system calls std does not wrap. Each returns the bare `io::Error`;
+//! the caller names the path and the operation.
 
 use std::ffi::CString;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
-
-use sha2::{Digest, Sha256};
 
 /// `p` as a C string; a path holding a NUL is `InvalidInput`.
 fn c_path(p: &Path) -> io::Result<CString> {
@@ -47,23 +44,4 @@ pub fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
     } else {
         Err(io::Error::last_os_error())
     }
-}
-
-/// `bytes` as lowercase hex, two digits a byte.
-pub fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-/// Lowercase hex sha256 of `bytes`.
-pub fn sha256_hex(bytes: &[u8]) -> String {
-    sha256_hex_of([bytes])
-}
-
-/// Lowercase hex sha256 of `parts`, one after another.
-pub fn sha256_hex_of<'a>(parts: impl IntoIterator<Item = &'a [u8]>) -> String {
-    let mut sha = Sha256::new();
-    for p in parts {
-        sha.update(p);
-    }
-    hex(&sha.finalize())
 }

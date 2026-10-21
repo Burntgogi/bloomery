@@ -25,7 +25,7 @@
 
 use crate::RefError;
 use crate::columns::Columns;
-use sha2::{Digest, Sha256};
+use gguf::digest::sha256_reader;
 use std::collections::HashMap;
 use std::fmt::{self, Display};
 use std::io::Read;
@@ -222,7 +222,7 @@ impl StubSet {
         let mut first = None;
         for (i, shard) in self.shards.iter().enumerate() {
             let path = self.stub_path(root, shard);
-            let mut f = std::fs::File::open(&path)
+            let f = std::fs::File::open(&path)
                 .map_err(|e| RefError::missing(&path, format!("{}: {e}", path.display())))?;
             let len = f
                 .metadata()
@@ -236,7 +236,8 @@ impl StubSet {
                     got: len.to_string(),
                 });
             }
-            let got = header_digest(&mut f, shard.header_bytes, &path)?;
+            let got = sha256_reader(&path, &mut f.take(shard.header_bytes))
+                .map_err(|e| RefError::missing(&path, e.to_string()))?;
             if got != shard.header_sha256 {
                 return Err(RefError::StubDiffers {
                     stub: path,
@@ -522,32 +523,6 @@ fn stem_and_shard(base: &str) -> (&str, Option<(u32, u32)>) {
         return (&base[..l - 15], Some((n(l - 14..l - 9), n(l - 4..l))));
     }
     (base, None)
-}
-
-/// The sha256 of the file's first `header_bytes` bytes, read into a fixed
-/// buffer: the check never reads past them.
-fn header_digest(
-    f: &mut std::fs::File,
-    header_bytes: u64,
-    path: &Path,
-) -> Result<String, RefError> {
-    let mut sha = Sha256::new();
-    let mut r = f.take(header_bytes);
-    let mut buf = [0u8; 64 * 1024];
-    loop {
-        let n = r
-            .read(&mut buf)
-            .map_err(|e| RefError::missing(path, format!("{}: {e}", path.display())))?;
-        if n == 0 {
-            return Ok(lower_hex(&sha.finalize()));
-        }
-        sha.update(&buf[..n]);
-    }
-}
-
-/// `bytes` as lowercase hex.
-fn lower_hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 #[cfg(test)]

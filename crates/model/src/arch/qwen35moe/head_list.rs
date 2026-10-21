@@ -21,7 +21,7 @@ use models::headpick::{
 };
 
 use super::place::PlaceError;
-use crate::fileio::sha256_hex;
+use gguf::digest::sha256_hex;
 
 /// The shipped list: Qwen3.8's Korean, Chinese and Japanese list at 76,000 rows.
 pub const SHIPPED: ListDef = ListDef {

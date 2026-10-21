@@ -26,7 +26,7 @@ use super::{ARCH, LCPP_BUILD};
 use crate::RefError;
 use crate::family::{Build, Family, Identity};
 use crate::ik::{RefManifest, ref_tensor_of_in};
-use sha2::{Digest, Sha256};
+use gguf::digest::sha256_file;
 use std::path::Path;
 
 /// The file every `logits-qwen38d` set is dumped from: lmstudio-community's Qwen3.8-27B Q4_K_M
@@ -168,19 +168,9 @@ fn stated<T: std::str::FromStr>(man: &RefManifest, key: &str) -> Result<T, RefEr
     })
 }
 
-/// The sha256 of `bytes`, as lowercase hex.
-fn sha(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
-}
-
 /// The sha256 of the file at `path`, as lowercase hex.
 fn digest(path: &Path) -> Result<String, RefError> {
-    let bytes = std::fs::read(path)
-        .map_err(|e| RefError::missing(path, format!("{}: {e}", path.display())))?;
-    Ok(sha(&bytes))
+    sha256_file(path).map_err(|e| RefError::missing(path, e.to_string()))
 }
 
 /// `name`, one decimal id a line, against the digest the manifest states; every id inside `vocab`.
@@ -218,9 +208,10 @@ fn ids(dir: &Path, name: &str, sha256: &str, vocab: usize) -> Result<Vec<u32>, R
 
 #[cfg(test)]
 mod tests {
-    use super::{ForcedLogits, LOGITS, MODEL, OP, sha};
+    use super::{ForcedLogits, LOGITS, MODEL, OP};
     use crate::RefError;
     use crate::arch::qwen35::{ARCH, HIDDEN, LCPP_BUILD};
+    use gguf::digest::sha256_hex;
     use std::path::{Path, PathBuf};
 
     const VOCAB: usize = 4;
@@ -259,11 +250,11 @@ mod tests {
             "# engine\treference".to_string(),
             "# backend\tcuda".to_string(),
             "# schedule\tbatch".to_string(),
-            format!("# prompt_sha256\t{}", sha(ids_text(&PROMPT).as_bytes())),
-            format!("# forced_sha256\t{}", sha(ids_text(&FORCED).as_bytes())),
+            format!("# prompt_sha256\t{}", sha256_hex(ids_text(&PROMPT).as_bytes())),
+            format!("# forced_sha256\t{}", sha256_hex(ids_text(&FORCED).as_bytes())),
             "# rows\t2".to_string(),
             format!("# vocab\t{VOCAB}"),
-            format!("# raw_sha256\t{}", sha(&raw)),
+            format!("# raw_sha256\t{}", sha256_hex(&raw)),
             "# kind\tname\toccurrence\ttype\tne0\tne1\tne2\tne3\tbytes\tsum\top\tcontig\tlogical\tsrc0\tsrc1"
                 .to_string(),
             format!("tensor\tlogits\t0\tf32\t{VOCAB}\t2\t1\t1\t{}\t{sum:?}\t{OP}\t1\t0\t-\t-", raw.len()),
@@ -346,10 +337,10 @@ mod tests {
         let long = ids_text(&[0, 1, 2]);
         std::fs::write(dir.join("forced.ids"), &long).expect("forced");
         let text = std::fs::read_to_string(dir.join("MANIFEST.tsv")).expect("manifest");
-        let was = sha(ids_text(&FORCED).as_bytes());
+        let was = sha256_hex(ids_text(&FORCED).as_bytes());
         std::fs::write(
             dir.join("MANIFEST.tsv"),
-            text.replace(&was, &sha(long.as_bytes())),
+            text.replace(&was, &sha256_hex(long.as_bytes())),
         )
         .expect("manifest");
         assert!(
@@ -362,12 +353,50 @@ mod tests {
         let text = std::fs::read_to_string(dir.join("MANIFEST.tsv")).expect("manifest");
         std::fs::write(
             dir.join("MANIFEST.tsv"),
-            text.replace(&sha(long.as_bytes()), &sha(bad.as_bytes())),
+            text.replace(&sha256_hex(long.as_bytes()), &sha256_hex(bad.as_bytes())),
         )
         .expect("manifest");
         assert!(refused(&dir).contains("inside the vocabulary of 4"), "id");
         let _ = std::fs::remove_dir_all(&dir);
         Ok(())
+    }
+
+    #[test]
+    fn missing_raw_and_id_files_are_missing_naming_the_file() {
+        for file in ["logits.0.f32", "prompt.ids", "forced.ids"] {
+            let dir = write_set(file, MODEL, LCPP_BUILD, ARCH, true);
+            let path = dir.join(file);
+            std::fs::remove_file(&path).expect("remove fixture file");
+            match ForcedLogits::open(&dir) {
+                Err(RefError::Missing {
+                    path: missing,
+                    what,
+                }) => {
+                    assert_eq!(missing, path);
+                    assert!(what.contains(&path.display().to_string()), "{what}");
+                }
+                result => panic!("expected Missing for {}, got {result:?}", path.display()),
+            }
+            std::fs::remove_dir_all(dir).expect("remove fixture");
+        }
+    }
+
+    #[test]
+    fn altered_raw_and_id_files_are_malformed_naming_the_file() {
+        for file in ["logits.0.f32", "prompt.ids", "forced.ids"] {
+            let dir = write_set(&format!("altered-{file}"), MODEL, LCPP_BUILD, ARCH, true);
+            let path = dir.join(file);
+            let mut bytes = std::fs::read(&path).expect("fixture file");
+            bytes[0] ^= 1;
+            std::fs::write(&path, bytes).expect("alter fixture file");
+            match ForcedLogits::open(&dir) {
+                Err(RefError::Malformed { at, .. }) => {
+                    assert_eq!(at, path.display().to_string());
+                }
+                result => panic!("expected Malformed for {}, got {result:?}", path.display()),
+            }
+            std::fs::remove_dir_all(dir).expect("remove fixture");
+        }
     }
 
     fn refused_cpu(dir: &Path) -> String {
