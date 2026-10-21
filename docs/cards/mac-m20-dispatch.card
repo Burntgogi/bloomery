@@ -51,3 +51,20 @@ reason: sets c_d and f_bw, the two terms M2.3's ICB design decision multiplies; 
   now: both are hardware and OS facts no cost model in rig-log has measured on Apple
   silicon, and the published fixed cost is two engines' aggregate, not the
   per-dispatch term
+#
+# Outcome, M4 Pro sitting 2026-10-21 (development evidence; the Mac has no timing
+# runner, so these are not public numbers). Log: probe-Apple-M4-Pro-20261021T190838.tsv,
+# thermal nominal at start and end, AC power, kernels compiled at run time.
+# - c_d(plain) 0.84 us (fit over N = 1..580, r2 0.988): below the band, so decide-below.
+#   concurrent 1.01, icb 0.90 (+26 us intercept), cbper:50 0.79, cbper:1 1.80 us: one
+#   command-buffer boundary costs ~1 us here, not the ~20 us MLX reported, and the ICB
+#   is not lower than the plain encoder by 1 us, so M2.3 keeps the plain encoder.
+# - f_bw alone 262.2 / 273 = 0.96 (tg 1024; median 256.3): above the band.
+# - chain, 580 dispatches over 1.8 GB: 8.31 ms plain, 8.31 ms icb, against 7.10 ms at
+#   the in-chain best bandwidth (ratio 1.17) and 6.59 ms at 273 GB/s [derived]; 1.8 GB /
+#   8.31 ms = 217 GB/s = 0.79 of 273, inside the chain band. The chain pays 2.08 us a
+#   dispatch where an empty dispatch pays 0.84 us: ~1.2 us is the drain and refill of a
+#   bandwidth-bound kernel across each barrier [derived], not encoding.
+# - Next: the 2.1-2.5 ms the published engines lose is not per-dispatch encoding on this
+#   chip. M2.3's levers are fewer dependent steps (fused kernels) and independent work
+#   placed beside a barrier (concurrent dispatch), priced by this chain arm.
