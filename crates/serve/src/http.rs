@@ -332,6 +332,54 @@ impl<'a> EventStream<'a> {
     }
 }
 
+/// Reads one test response without consuming the next response on a persistent connection.
+/// Heads and bodies stay below 64 KiB; `100 Continue` has no body, while final responses
+/// must declare their exact body length. Truncated headers or bodies fail the test.
+#[cfg(test)]
+pub(crate) fn read_test_response(r: &mut impl BufRead) -> (u16, String, Vec<u8>) {
+    const MAX_RESPONSE: usize = 64 * 1024;
+    let mut head = String::new();
+    loop {
+        let mut line = String::new();
+        let n = r
+            .by_ref()
+            .take((MAX_RESPONSE - head.len()) as u64)
+            .read_line(&mut line)
+            .expect("response head");
+        assert!(
+            n > 0 && line.ends_with("\r\n"),
+            "incomplete response head: {head}{line}"
+        );
+        head.push_str(&line);
+        assert!(head.len() < MAX_RESPONSE, "a bounded test response head");
+        if line == "\r\n" {
+            break;
+        }
+    }
+    let status = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .expect("a status line");
+    let len = if status == 100 {
+        0
+    } else {
+        head.lines()
+            .filter_map(|line| line.split_once(':'))
+            .find_map(|(name, value)| {
+                name.eq_ignore_ascii_case("Content-Length")
+                    .then_some(value.trim())
+            })
+            .expect("a fixed-length response")
+            .parse::<usize>()
+            .expect("the response length")
+    };
+    assert!(len < MAX_RESPONSE, "a bounded test response body: {len}");
+    let mut body = vec![0; len];
+    r.read_exact(&mut body).expect("the complete response body");
+    (status, head, body)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{MAX_BODY, parse_query, read_body, read_chunked, read_head};

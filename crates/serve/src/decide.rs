@@ -1509,32 +1509,9 @@ mod tests {
 
     /// Reads one closing response's status and body, with no interim response before it.
     fn written(client: &std::net::TcpStream) -> (u16, String) {
-        use std::io::{BufRead, BufReader, Read};
-        let mut r = BufReader::new(client);
-        let mut head = String::new();
-        loop {
-            let mut line = String::new();
-            assert_ne!(r.read_line(&mut line).expect("response head"), 0, "{head}");
-            head.push_str(&line);
-            if line == "\r\n" {
-                break;
-            }
-        }
+        let (status, head, body) =
+            crate::http::read_test_response(&mut std::io::BufReader::new(client));
         assert!(head.contains("Connection: close"), "{head}");
-        let status = head
-            .split_whitespace()
-            .nth(1)
-            .and_then(|c| c.parse().ok())
-            .expect("a status line");
-        let len = head
-            .lines()
-            .find_map(|line| line.strip_prefix("Content-Length: "))
-            .expect("a fixed-length response")
-            .parse::<usize>()
-            .expect("the response length");
-        assert!(len < 64 * 1024, "a bounded test response: {len}");
-        let mut body = vec![0; len];
-        r.read_exact(&mut body).expect("the complete response body");
         (status, String::from_utf8(body).expect("a UTF-8 response"))
     }
 
@@ -1549,11 +1526,16 @@ mod tests {
             use std::io::Write;
             let (mut client, server) = pair();
             let conn = Arc::clone(&s);
-            let handled = std::thread::spawn(move || {
-                keep_alive(server, &conn.answers, &conn.api_keys, |req, w| {
-                    answer(&conn, req, w)
-                });
-            });
+            let (handled, _) = threads::helper::spawn_helper(
+                "decide-auth-fixture",
+                threads::helper::Placement::Float,
+                move || {
+                    keep_alive(server, &conn.answers, &conn.api_keys, |req, w| {
+                        answer(&conn, req, w)
+                    });
+                },
+            )
+            .expect("the connection helper is placed");
             let extra: String = headers
                 .iter()
                 .map(|(k, v)| format!("{k}: {v}\r\n"))

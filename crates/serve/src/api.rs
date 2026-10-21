@@ -5815,7 +5815,8 @@ mod tests {
     /// authorized requests retain both body framings, the handshake and the next keyed request.
     #[test]
     fn authorization_precedes_bodies_and_preserves_authorized_keep_alive() {
-        use std::io::{BufRead, BufReader, Write};
+        use crate::http::read_test_response as response;
+        use std::io::{BufReader, Write};
         use std::net::TcpStream;
 
         fn connect(addr: SocketAddr) -> BufReader<TcpStream> {
@@ -5827,27 +5828,6 @@ mod tests {
                 .set_write_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
             BufReader::new(stream)
-        }
-
-        fn response(r: &mut BufReader<TcpStream>) -> (u16, String, Vec<u8>) {
-            let mut head = String::new();
-            loop {
-                let mut line = String::new();
-                assert_ne!(r.read_line(&mut line).expect("response head"), 0, "{head}");
-                head.push_str(&line);
-                if line == "\r\n" {
-                    break;
-                }
-            }
-            let status = head.split_whitespace().nth(1).unwrap().parse().unwrap();
-            let len = head
-                .lines()
-                .find_map(|line| line.strip_prefix("Content-Length: "))
-                .map_or(0, |v| v.parse::<usize>().unwrap());
-            assert!(len < 64 * 1024, "a bounded test response: {len}");
-            let mut body = vec![0; len];
-            r.read_exact(&mut body).expect("response body");
-            (status, head, body)
         }
 
         let mut keys = ApiKeys::default();
