@@ -5170,7 +5170,7 @@ mod tests {
             qwen3moe_place, residency38, serve_client, side_seat, vision_seat,
         };
         type Group = &'static [&'static Kind];
-        let table: [(&str, Group, &[Group]); 15] = [
+        let table: [(&str, Group, &[Group]); 16] = [
             (
                 "ds41 seat: Flags::encoder, Draft::from_levers, print_widths, bind::spawn",
                 BLOOMERY_SERVE_DS41,

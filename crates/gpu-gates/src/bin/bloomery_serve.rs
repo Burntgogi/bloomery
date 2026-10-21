@@ -231,7 +231,7 @@ models (the --model word is optional with a model file: the file's architecture 
 
     impl Model {
         /// Every generative seat.
-        const ALL: [Model; 8] = [
+        const ALL: [Model; 9] = [
             Model::Ds41,
             Model::Qwen38,
             Model::Glm,
