@@ -457,7 +457,7 @@ class RecipeKeyCLI(unittest.TestCase):
             ws.assert_status(ws.keys(*items, ledger=True), {item: "skip" for item in items})
 
     def test_unused_import_keeps_linked_crate_startup_inputs(self):
-        for imported in ("use sibling as _;", "use sibling::Marker as _;",
+        for imported in ("extern crate sibling as _;", "use sibling as _;", "use sibling::Marker as _;",
                          "use sibling::Marker;", "use sibling::{Marker as _};", "use sibling::*;"):
             with self.subTest(imported=imported):
                 files = macro_files()

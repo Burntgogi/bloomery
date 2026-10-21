@@ -11283,6 +11283,8 @@ def reach_self_test(expect, side: Side, row, stats: dict[str, int]) -> None:
                 expect(inputs.match(rel) is None, f"opaque owner restored an unrelated reverse/sibling input {rel}: {source!r}")
         with open(os.path.join(tmp, "base/src/a.rs"), "w", encoding="utf-8") as fh:
             fh.write("extern crate side as _;\n")
+        # An extern-crate link must be declared by its importer, not only by the final application's sibling edge.
+        opaque_meta["packages"][0] = pkg("base", [("lib", "base", "src/lib.rs")], ["leaf", "side"])
         inputs = Graph(Tree(tmp, opaque_meta), rs).key_inputs("gate-app")
         expect(inputs.match("side/src/lib.rs") is not None, "explicit side-effect extern-crate link lost its opaque owner")
 
