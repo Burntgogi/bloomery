@@ -13,9 +13,9 @@
 # The `# build` line every set of the family carries is HEAD's short hash (dump.sh reads it), which
 # the family pins (crates/refset/src/arch/deepseek41/mod.rs, CAND_BUILD).
 #
-# The cmake flags are the ones the V4.1 oracle tree (REF_TREE, the profile's IK) was configured with:
-# after the configure every GGML_* and LLAMA_* cache entry is compared with REF_TREE's, and a
-# difference stops the build, so the two trees differ by their sources alone.
+# The cmake flags are compared with the V4.1 oracle tree (REF_TREE, the profile's IK) after configure:
+# common GGML_* and LLAMA_* options must agree; one-sided options are reported. An unreadable cache
+# or a failed comparison stops before the lease and build, rather than treating it as an empty cache.
 #
 # The ik build uses every core for minutes, so it runs under the machine-wide CPU lease with an
 # exclusive card (BLOOMERY_LEASE_CARD); dump_ref is then linked by build-dump.sh into DUMP_OUT, the
@@ -58,16 +58,10 @@ echo "build-ik-cand: $IK = $PIN + $PICK as $BUILD"
 
 as_user cmake -S "$IK" -B "$IK/build" -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON \
   -DCMAKE_CUDA_ARCHITECTURES=86 -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc > /dev/null
-cache_flags() { grep -E '^(GGML|LLAMA)_[A-Z0-9_]*:[A-Z]+=' "$1/build/CMakeCache.txt" | grep -v '_FOUND:' | LC_ALL=C sort; }
-# PIN is newer than REF_TREE, so an option one of them lacks is printed; an option both have must agree.
-differ=$(LC_ALL=C join -t= <(cache_flags "$REF_TREE") <(cache_flags "$IK") | awk -F= '$2 != $3')
-only=$(LC_ALL=C join -t= -v1 -v2 <(cache_flags "$REF_TREE") <(cache_flags "$IK") || true)
-[ -z "$only" ] || { echo "build-ik-cand: cache options only one of $REF_TREE and $IK has:"; echo "$only"; }
-if [ -n "$differ" ]; then
-  echo "build-ik-cand: $IK/build is configured differently from $REF_TREE/build (option=$REF_TREE=$IK):" >&2
-  echo "$differ" >&2
-  exit 1
-fi
+# PIN is newer than REF_TREE: report one-sided options, but require common options to agree.
+# shellcheck source=tools/ref/cache-options.sh
+source "$(dirname "${BASH_SOURCE[0]}")/cache-options.sh"
+ref_cache_check build-ik-cand "$REF_TREE" "$IK"
 
 lease_take
 t0=$(date +%s)
