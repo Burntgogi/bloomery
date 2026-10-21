@@ -3267,6 +3267,7 @@ _ITEM_DEF = re.compile(r"\b(?:fn|struct|enum|union|trait|type|const|static)\s+(?
 _FN_NAME = re.compile(r"\bfn\s+(?:r#)?([A-Za-z_][A-Za-z0-9_]*)")
 _MACRO_EXPORT = re.compile(r"#\s*\[\s*macro_export\b[^\]]*\]\s*macro_rules\s*!\s*(?:r#)?([A-Za-z_][A-Za-z0-9_]*)")
 _MACRO_CALL = re.compile(r"(?<![A-Za-z0-9_:])([A-Za-z_][A-Za-z0-9_]*)\s*!\s*[(\[{]")
+_MACRO_PATH_CALL = re.compile(r"((?:(?:r#)?[A-Za-z_]\w*\s*::\s*)*(?:r#)?[A-Za-z_]\w*)\s*!\s*[(\[{]")
 _WORD = re.compile(r"(?<![A-Za-z0-9_])[A-Za-z_][A-Za-z0-9_]*")
 _PUB_BEFORE = re.compile(r"\bpub\b(?:\s*\([^)]*\))?\s*$")
 _TYPE_PATH = re.compile(r"(?<![A-Za-z0-9_'])((?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*[A-Za-z_][A-Za-z0-9_]*)")
@@ -3600,6 +3601,15 @@ def _assoc_units(shape: str, a: int, b: int, ctx: tuple[str, ...], hdr: tuple[in
         end = max(_unit_end(shape, i, b, semi), i + 1)
         out.append(("assoc", ctx, m.group(2) if m is not None and m.group(2) != "_" else None, i, end, hdr, False))
         i = end
+
+
+@functools.cache
+def _source_macro_bodies(text: str, test: bool) -> dict[int, str]:
+    """Lexed definition bodies, indexed exactly like rust_facts, for expansion safety checks."""
+    _, shape = build_view(text, test)
+    raw: list = []
+    _module_units(shape, 0, len(shape), (), raw, [])
+    return {k: shape[a:b] for k, (kind, _, _, a, b, _, _) in enumerate(raw) if kind == "macro_rules!"}
 
 
 @functools.cache
@@ -4683,13 +4693,36 @@ class Reach:
                     outside_ownership |= linkage or bool(re.search(r'\bextern\s*(?:"[^"]*"\s*)?\{', code))
                     outside_ownership |= bool(re.search(r'\binclude!\s*\(\s*(?!")\S', code)
                                               or re.search(r'\binclude!\s*\(\s*"[^"]*(?<!\.rs)"', code))
+                    calls = {match.group(1) for match in _MACRO_PATH_CALL.finditer(shape)}
+                    qualified_paths = {tuple(part.removeprefix("r#") for part in re.split(r"\s*::\s*", call))
+                                       for call in calls if "::" in call}
+                    qualified_known: set[tuple[RootKey, tuple[str, ...]]] = set()
                     # Source macros use the existing unhygienic expansion edges, even from otherwise
                     # unreached items: an expansion may emit a constructor or an implicit trait impl.
                     for rk, facts in facts_by_root:
                         known = set(self.macros(rk)) | exported_names
+                        unresolved: set[tuple[str, ...]] = set()
                         for k, unit in enumerate(facts.units):
                             if any(name in known for name in unit.macro_calls):
                                 source_seeds.add((rk, f, k))
+                            for path in set(unit.sites) & qualified_paths:
+                                hits = [h for base in self.bases(rk, f) or [()]
+                                        for h in self.resolve(rk, base + unit.ctx, path) if h[2] >= 0]
+                                if hits and all(h[0][0] in linked_packages and
+                                                self.facts(h[0], h[1]).units[h[2]].kind == "macro_rules!" for h in hits):
+                                    source_seeds.add((rk, f, k))
+                                    qualified_known.add((rk, path))
+                                    for h in hits:
+                                        body = _source_macro_bodies(self.text(h[1]), h[0][2]).get(h[2])
+                                        # Nested expansions/attributes may emit names absent from source edges.
+                                        # Bound the invoker, not an unrelated item elsewhere in the macro crate.
+                                        if body is None or any(_key_attributes(body)) or any(
+                                                match.group(1).removeprefix("r#") not in syntax_words
+                                                for match in _MACRO_PATH_CALL.finditer(body)):
+                                            opaque = True
+                                else:
+                                    unresolved.add(path)
+                        qualified_known.difference_update((rk, path) for path in unresolved)
                     # Only unconditionally named local enums are proven to import variants, never macros.
                     # Imported/conditional paths remain opaque: a different binding may export a macro.
                     glob_shadow = False
@@ -4701,7 +4734,6 @@ class Reach:
                                     if h[2] >= 0] if len(path) == 2 and path[0] not in facts.bound and not conditional_bindings else []
                             if not hits or any(self.facts(h[0], h[1]).units[h[2]].kind != "enum" for h in hits):
                                 glob_shadow = True
-                    calls = set(re.findall(r"((?:(?:r#)?[A-Za-z_]\w*\s*::\s*)*(?:r#)?[A-Za-z_]\w*)\s*!\s*[(\[{]", shape))
                     for call in calls:
                         spelling = re.split(r"\s*::\s*", call)[-1]
                         if spelling in syntax_words:
@@ -4709,6 +4741,9 @@ class Reach:
                         macro = spelling.removeprefix("r#")
                         shadowed = glob_shadow or any(macro in facts.bound for _, facts in facts_by_root)
                         local_source = all(macro in self.macros(rk) for rk, _ in facts_by_root)
+                        path = tuple(part.removeprefix("r#") for part in re.split(r"\s*::\s*", call))
+                        if "::" in call and all((rk, path) in qualified_known for rk, _ in facts_by_root):
+                            continue
                         if "::" not in call and not shadowed and (macro in safe_macros or local_source):
                             continue
                         opaque = True

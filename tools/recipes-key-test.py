@@ -217,7 +217,7 @@ def source_macro_files(kind: str) -> dict[str, str]:
     files = runtime_files()
     files["crates/dep/src/lib.rs"] += "mod hidden;\nmod startup;\n"
     files["crates/dep/src/hidden.rs"] = 'pub fn run() { println!("source-macro1"); }\n'
-    if kind == "exported-startup":
+    if kind in ("exported-startup", "exported-expression", "exported-proc-startup"):
         files["Cargo.toml"] = files["Cargo.toml"].replace('"crates/dep"]', '"crates/dep", "crates/macros"]')
         files["crates/dep/Cargo.toml"] += '[dependencies]\nmacros = { path = "../macros" }\n'
         files["crates/macros/Cargo.toml"] = package("macros")
@@ -234,6 +234,25 @@ macro_rules! boot {
 }
 '''
         files["crates/dep/src/startup.rs"] = "macros::boot!();\n"
+        if kind == "exported-expression":
+            files["crates/macros/src/lib.rs"] = '#[macro_export]\nmacro_rules! boot { () => { crate::hidden::run() }; }\n'
+            files["crates/dep/src/startup.rs"] = "pub fn run() { macros::boot!(); }\n"
+            files["crates/dep/src/used.rs"] = "pub fn run() { crate::startup::run(); }\n"
+        elif kind == "exported-proc-startup":
+            files["Cargo.toml"] = files["Cargo.toml"].replace('"crates/macros"]', '"crates/macros", "crates/procgen"]')
+            files["crates/dep/Cargo.toml"] += 'procgen = { path = "../procgen" }\n'
+            files["crates/macros/src/lib.rs"] = '#[macro_export]\nmacro_rules! boot { () => { procgen::boot!(); }; }\n'
+            files["crates/procgen/Cargo.toml"] = package("procgen") + "[lib]\nproc-macro = true\n"
+            files["crates/procgen/src/lib.rs"] = r'''extern crate proc_macro;
+#[proc_macro]
+pub fn boot(_: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    r#"#[used] #[link_section = ".init_array"]
+       static START: extern "C" fn() = {
+           extern "C" fn launch() { crate::hidden::run(); }
+           launch
+       };"#.parse().unwrap()
+}
+'''
     else:
         source = ('macro_rules! boot { () => { impl Drop for crate::Token {\n'
                   '    fn drop(&mut self) { crate::hidden::run(); }\n'
@@ -301,7 +320,7 @@ class RecipeKeyCLI(unittest.TestCase):
                 ws.assert_status(ws.keys(*items, ledger=True), {"gate-called": "run", "gate-linked": "skip"})
 
     def test_known_source_macro_startup_and_implicit_impl_inputs(self):
-        for kind in ("exported-startup", "local-drop", "shadowed-builtin"):
+        for kind in ("exported-startup", "exported-expression", "exported-proc-startup", "local-drop", "shadowed-builtin"):
             with self.subTest(expansion=kind):
                 files = source_macro_files(kind)
                 ws = Workspace(self, files)
@@ -309,9 +328,9 @@ class RecipeKeyCLI(unittest.TestCase):
                 rel = "crates/dep/src/hidden.rs"
                 self.assert_file(baseline["gate-called"], rel)
                 self.assert_file(baseline["gate-called"], "crates/dep/src/startup.rs")
-                if kind == "exported-startup":
+                if kind.startswith("exported-"):
                     self.assert_file(baseline["gate-called"], "crates/macros/src/lib.rs")
-                if kind == "local-drop":
+                if kind in ("local-drop", "exported-expression"):
                     self.assert_file(baseline["gate-called"], "crates/dep/src/unused.rs", False)
                 with ws.changed(rel, files[rel].replace("source-macro1", "source-macro2"), restore_mtime=True):
                     ws.assert_status(ws.keys("gate-called", "gate-linked", ledger=True),
