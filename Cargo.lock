@@ -430,7 +430,6 @@ dependencies = [
  "bloomery-embed",
  "bloomery-gguf",
  "bloomery-jinja",
- "bloomery-threads",
  "bloomery-tokenizer",
  "bloomery-vision",
  "libc",

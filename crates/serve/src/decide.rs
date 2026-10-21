@@ -1521,21 +1521,10 @@ mod tests {
     fn the_decide_server_checks_keys_before_its_dispatch_too() {
         let mut keys = ApiKeys::default();
         keys.add("--api-key", "sk-decide-key").unwrap();
-        let s = Arc::new(shared_with(keys));
+        let s = shared_with(keys);
         let send = |method: &str, path: &str, headers: &[(&str, &str)], denied: bool| {
             use std::io::Write;
             let (mut client, server) = pair();
-            let conn = Arc::clone(&s);
-            let (handled, _) = threads::helper::spawn_helper(
-                "decide-auth-fixture",
-                threads::helper::Placement::Float,
-                move || {
-                    keep_alive(server, &conn.answers, &conn.api_keys, |req, w| {
-                        answer(&conn, req, w)
-                    });
-                },
-            )
-            .expect("the connection helper is placed");
             let extra: String = headers
                 .iter()
                 .map(|(k, v)| format!("{k}: {v}\r\n"))
@@ -1551,9 +1540,11 @@ mod tests {
                  Content-Length: 5\r\n{extra}{expect}\r\n{body}"
             )
             .unwrap();
-            let response = written(&client);
-            handled.join().unwrap();
-            response
+            // These bounded requests and responses fit the socket buffers. Run on this thread:
+            // denied requests deliberately leave the advertised body unsent, so the handler
+            // must return from the headers alone, without an interim `100 Continue`.
+            keep_alive(server, &s.answers, &s.api_keys, |req, w| answer(&s, req, w));
+            written(&client)
         };
 
         let (status, body) = send("POST", "/v1/rerank", &[], true);
