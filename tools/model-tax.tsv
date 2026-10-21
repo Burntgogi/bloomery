@@ -201,5 +201,4 @@ crates/model/src/arch/mod.rs	raon	1	PIN(2026-10-21) raon: the family's module de
 crates/models/src/lib.rs	raon	2	PIN(2026-10-21) raon: ModelSpec.arch names the family by an enum variant and its name arm; the variant stays until ModelSpec carries the registry's name instead
 crates/placement/src/accepts.rs	raon	5	PIN(2026-10-21) raon: program_of, Program::name, leg_arms and routed_rule match every Program or models::Arch exhaustively, so the body's variant needs an arm in each; the program would own its arms and rule instead of the matches naming programs
 crates/gpu-gates/src/bin/shared/routed_legs.rs	raon	2	PIN(2026-10-21) raon: family_of and skip_of match every models::Arch exhaustively; the family has no routed-legs adapter until its body exists
-# raon-serve
 crates/model/src/arch/coverage.rs	raon	27	PIN(2026-10-21) raon: the coverage rows, the type pins and the expert-stack match are keyed by Program, so each row the raon1 body runs lists its variant; the program would own its rows instead of the list naming programs
