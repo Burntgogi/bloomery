@@ -1,0 +1,17 @@
+# raon037-fix (commit e8bd14c08, this binary) measured arm (a) 122..126 tok/s on 387..512-token answers
+# [measured]; a 2048-token answer reads deeper KV in the 7 latent layers, so the band opens 10 below
+# [derived].
+kind: baseline
+question: what does one long Raon-1-mini-preview tape (Korean, n-predict 2048) show on one RTX 3090 at the
+  serving defaults with the DFlash2 draft beside it?
+term: decode tok/s of the K3 tape (Korean, about 50 prompt tokens, n-predict 2048), thinking as the template
+  gives it, draft unset, RTX 3090, ctx 262144
+unit: tok/s
+predict: 112..130
+condition: one lease, the box quiet, the 3090 alone, a fresh server, two discarded warm-ups, io pressure some
+  avg10 under 5 before the tape, greedy
+reason: the release post's Raon tape was too short; this is its long replacement
+decide-in: publish it as the post's Raon tape
+decide-below: under 112: the longer context costs more than raon037-fix's arm (a) shows; read the mtp width
+  record before publishing
+decide-above: beyond 130: the chooser opened on this prompt; read the mtp width record and the text

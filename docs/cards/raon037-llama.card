@@ -1,0 +1,16 @@
+# No prior number for this fork on a card. Floor from bytes: 2.76 GB a token at about 700 GB/s is 3.9 ms (256
+# tok/s); a new architecture's unfused ops (the delta-rule mixer, the four-stream mix) add launches, so the
+# band is wide [derived].
+kind: baseline
+question: how fast is the model's own llama.cpp fork on Raon-1-mini-preview Q4_K_M on one RTX 3090, beside the
+  bloomery long tape?
+term: decode tok/s of llama-server's K3 tape (Korean, n-predict 2048), -ngl 99 -fa on -c 262144, RTX 3090
+unit: tok/s
+predict: 60..180
+condition: one lease, the box quiet, the 3090 alone, a fresh server, two discarded warm-ups, io pressure some
+  avg10 under 5 before the tape, greedy; then llama-bench pp512 tg128 three repetitions
+reason: the user asked how the model's own llama.cpp compares; the release post's comparison line needs it
+  measured in the same session conditions
+decide-in: write both engines' rows side by side in the report, no ratio claimed in the README
+decide-below: under 60: read the offload and flash-attention lines of the server log before quoting it
+decide-above: beyond 180: read the server log and the tape's text before quoting it
