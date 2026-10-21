@@ -25,6 +25,8 @@ use model::placement::tp::{TpTensor, card_blocks};
 use safetensors::{Dtype, Folder};
 use serde_json::Value;
 
+use super::module_class;
+
 /// Why the checkpoint was refused.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -357,6 +359,7 @@ pub fn tp_tensors(
     let placed = quant_config::plan(
         config,
         table.iter().map(|(n, d, s)| (n.as_str(), *d, s.as_slice())),
+        module_class,
     );
     if let Some((name, why)) = placed.refused.iter().next() {
         return Err(refuse(name, why.clone()));

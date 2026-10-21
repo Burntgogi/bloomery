@@ -15,6 +15,7 @@
 //! `quant_method`, algorithm or scheme is refused when the config is read. `input_scale` (an
 //! activation scale) is reported, not used.
 
+use std::cell::LazyCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::Path;
@@ -241,10 +242,17 @@ enum Other {
     },
 }
 
-/// A compressed-tensors target: every linear, a module by name, or `re:` a regex from the start.
+/// The module classes a model's checkpoint map can identify for class-name targets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModuleClass {
+    Linear,
+    Embedding,
+}
+
+/// A compressed-tensors target: a module class, a module by name, or `re:` a regex from the start.
 #[derive(Debug)]
 enum Target {
-    Linear,
+    Class(ModuleClass),
     Name(String),
     Re(Regex),
 }
@@ -256,14 +264,22 @@ impl Target {
                 Regex::new(&format!("^(?:{re})"))
                     .map_err(|e| bad(format!("compressed-tensors pattern {t}: {e}")))?,
             ),
-            None if t == "Linear" => Target::Linear,
+            None if t == "Linear" => Target::Class(ModuleClass::Linear),
+            None if t == "Embedding" => Target::Class(ModuleClass::Embedding),
+            None if !t.contains('.')
+                && t.as_bytes().first().is_some_and(u8::is_ascii_uppercase) =>
+            {
+                return Err(bad(format!(
+                    "compressed-tensors class {t} is not one this reader knows"
+                )));
+            }
             None => Target::Name(t.to_string()),
         })
     }
 
-    fn matches(&self, module: &str) -> bool {
+    fn matches(&self, module: &str, class: impl FnOnce() -> Option<ModuleClass>) -> bool {
         match self {
-            Target::Linear => true,
+            Target::Class(want) => class() == Some(*want),
             Target::Name(n) => n == module,
             Target::Re(re) => re.is_match(module),
         }
@@ -313,7 +329,11 @@ impl Config {
 
     /// The formats `module` is declared, and the module whose scale a tensor-scale format shares;
     /// empty when the config leaves it unquantized.
-    fn declared(&self, module: &str) -> (Vec<Format>, Option<&str>) {
+    fn declared(
+        &self,
+        module: &str,
+        class_of: impl FnOnce() -> Option<ModuleClass>,
+    ) -> (Vec<Format>, Option<&str>) {
         if let Some(m) = &self.modelopt {
             let layer = m
                 .layers
@@ -350,12 +370,14 @@ impl Config {
                 }
             }
             Some(Other::CompressedTensors { groups, ignore }) => {
-                if ignore.iter().any(|t| t.matches(module)) {
+                let class = LazyCell::new(class_of);
+                let matches = |t: &Target| t.matches(module, || *class);
+                if ignore.iter().any(matches) {
                     vec![]
                 } else {
                     groups
                         .iter()
-                        .filter(|(ts, _)| ts.iter().any(|t| t.matches(module)))
+                        .filter(|(ts, _)| ts.iter().any(matches))
                         .map(|(_, f)| *f)
                         .collect()
                 }
@@ -627,10 +649,12 @@ const COMPANIONS: [&str; 7] = [
     "weight_zero_point",
 ];
 
-/// Every tensor of `tensors` (name, dtype, shape) placed by `config`.
+/// Every tensor of `tensors` (name, dtype, shape) placed by `config`. `class_of` supplies a module's
+/// class from the model's map, or `None` for another or unknown role; only class targets ask for it.
 pub fn plan<'a>(
     config: &Config,
     tensors: impl IntoIterator<Item = (&'a str, Dtype, &'a [usize])>,
+    class_of: impl Fn(&str) -> Option<ModuleClass>,
 ) -> Plan {
     let table: BTreeMap<&str, (Dtype, &[usize])> =
         tensors.into_iter().map(|(n, d, s)| (n, (d, s))).collect();
@@ -646,7 +670,7 @@ pub fn plan<'a>(
         if plain(dtype).is_some() {
             continue;
         }
-        let (formats, owner) = config.declared(module);
+        let (formats, owner) = config.declared(module, || class_of(module));
         let found = formats
             .iter()
             .find_map(|&f| layout(f, name, module, owner, dtype, shape, &table).map(|c| (f, c)));
@@ -1096,7 +1120,11 @@ mod tests {
         for (tag, probes) in cases {
             let c = config(tag).unwrap_or_else(|e| panic!("{tag}: {e}"));
             for (module, want) in *probes {
-                assert_eq!(c.declared(module).0, *want, "{tag}: {module}");
+                assert_eq!(
+                    c.declared(module, || Some(ModuleClass::Linear)).0,
+                    *want,
+                    "{tag}: {module}"
+                );
             }
         }
         let e = config("nvidia__NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB").unwrap_err();
@@ -1137,6 +1165,17 @@ mod tests {
                     "weights": { "num_bits": 4, "type": "int", "strategy": "group",
                         "group_size": group, "symmetric": true } } } } })
         };
+        for (field, class) in [("targets", "LayerNorm"), ("ignore", "Conv2d")] {
+            let mut config = int4(128.into());
+            if field == "targets" {
+                config["quantization_config"]["config_groups"]["g"]["targets"] =
+                    serde_json::json!([class]);
+            } else {
+                config["quantization_config"]["ignore"] = serde_json::json!([class]);
+            }
+            let e = Config::parse(&config, None).unwrap_err();
+            assert!(e.to_string().contains(class), "{e}");
+        }
         let fp8 = |key: &str, v: Value| {
             let mut q =
                 serde_json::json!({ "quant_method": "fp8", "weight_block_size": [128, 128] });
@@ -1231,7 +1270,7 @@ mod tests {
             ("ple.ids", I64, &[3]),
             ("e.2.weight", U8, &[0, 9_223_372_036_854_775_840]),
         ];
-        let p = plan(&c, t.iter().copied());
+        let p = plan(&c, t.iter().copied(), |_| None);
         let got = |n: &str| p.placed.get(n).map(|pl| (pl.format, pl.companions.clone()));
         assert_eq!(
             got("e.0.weight").unwrap(),
@@ -1277,7 +1316,7 @@ mod tests {
             ("l.mlp.gate.weight_packed", I32, &[8, 64]),
             ("y.weight_packed", I32, &[0, usize::MAX / 4]),
         ];
-        let p = plan(&ct, t.iter().copied());
+        let p = plan(&ct, t.iter().copied(), |_| Some(ModuleClass::Linear));
         assert_eq!(
             p.placed["x.weight_packed"].format,
             Format::Int4Pack { group: 128 }
@@ -1292,6 +1331,69 @@ mod tests {
             assert_eq!(
                 layout(format, "m.weight", "m", None, U8, shape, &BTreeMap::new()),
                 None
+            );
+        }
+    }
+
+    #[test]
+    fn compressed_tensor_classes_do_not_quantize_each_others_weights() {
+        use Dtype::*;
+        let tensors: &[(&str, Dtype, &[usize])] = &[
+            ("model.embed_tokens.weight_packed", I32, &[8, 16]),
+            ("model.embed_tokens.weight_scale", Bf16, &[8, 1]),
+            ("model.embed_tokens.weight_shape", I64, &[2]),
+            (
+                "model.layers.0.self_attn.q_proj.weight_packed",
+                I32,
+                &[8, 16],
+            ),
+            (
+                "model.layers.0.self_attn.q_proj.weight_scale",
+                Bf16,
+                &[8, 1],
+            ),
+            ("model.layers.0.self_attn.q_proj.weight_shape", I64, &[2]),
+        ];
+        for (target, kept, refused) in [
+            (
+                "Embedding",
+                "model.embed_tokens",
+                "model.layers.0.self_attn.q_proj",
+            ),
+            (
+                "Linear",
+                "model.layers.0.self_attn.q_proj",
+                "model.embed_tokens",
+            ),
+        ] {
+            let config = Config::parse(
+                &serde_json::json!({"quantization_config": {
+                    "quant_method": "compressed-tensors",
+                    "config_groups": {"g": {
+                        "format": "pack-quantized", "targets": [target],
+                        "weights": {"num_bits": 4, "type": "int", "strategy": "group",
+                            "group_size": 128, "symmetric": true}
+                    }}
+                }}),
+                None,
+            )
+            .unwrap();
+            let placed = plan(&config, tensors.iter().copied(), |module| match module {
+                "model.embed_tokens" => Some(ModuleClass::Embedding),
+                "model.layers.0.self_attn.q_proj" => Some(ModuleClass::Linear),
+                _ => None,
+            });
+            assert_eq!(
+                placed
+                    .placed
+                    .get(&format!("{kept}.weight_packed"))
+                    .map(|p| p.format),
+                Some(Format::Int4Pack { group: 128 }),
+                "{target}: {placed:?}"
+            );
+            assert!(
+                placed.refused[&format!("{refused}.weight_packed")].contains("unquantized"),
+                "{target}: {placed:?}"
             );
         }
     }
@@ -1339,6 +1441,7 @@ mod tests {
                 entries
                     .iter()
                     .map(|(n, d, s)| (n.as_str(), *d, s.as_slice())),
+                |_| None,
             );
             let mut count = BTreeMap::new();
             for pl in p.placed.values() {
@@ -1518,6 +1621,14 @@ mod tests {
             plan(
                 &config(tag).unwrap(),
                 entries.iter().map(|(n, d, s)| (*n, *d, s.as_slice())),
+                |module| {
+                    matches!(
+                        module,
+                        "model.language_model.layers.20.mlp.experts.148.down_proj"
+                            | "model.language_model.layers.20.mlp.experts.149.down_proj"
+                    )
+                    .then_some(ModuleClass::Linear)
+                },
             )
         };
         let m = Use::Matrix(Plain::Q8_0);

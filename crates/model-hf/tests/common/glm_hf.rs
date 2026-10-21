@@ -5,7 +5,7 @@ use hf::quant_config::{Config, plan};
 use safetensors::Dtype;
 use serde_json::Value;
 
-use super::{Geometry, Layout};
+use super::{Geometry, Layout, module_class};
 
 pub(super) const GLM: Geometry = Geometry {
     layers: 45,
@@ -33,6 +33,7 @@ pub(super) fn logical(
     let p = plan(
         config,
         table.iter().map(|(n, d, s)| (n.as_str(), *d, s.as_slice())),
+        module_class,
     );
     assert!(p.refused.is_empty(), "{:?}", p.refused);
     table

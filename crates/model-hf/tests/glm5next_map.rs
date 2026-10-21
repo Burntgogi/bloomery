@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use hf::quant_config::Config;
 use model_hf::arch::glm5next::{Geometry, Layout, map};
+use model_hf::arch::module_class;
 use safetensors::Dtype;
 
 #[path = "common/glm_hf.rs"]
