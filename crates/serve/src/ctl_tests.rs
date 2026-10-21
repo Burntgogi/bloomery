@@ -16,7 +16,7 @@ use jinja::ChatTemplate;
 use serde_json::{Map, Value, json};
 
 use super::fixture_templates::FIXTURE_TEMPLATES;
-use super::{State, chat_input, render_chat, testserve};
+use super::{State, apply_template, chat_input, render_chat, testserve};
 use crate::engine::{Decoder, EngineError, Tokenizer};
 use crate::media::SharedMediaModel;
 use crate::{Engine, MockEngine};
@@ -482,6 +482,35 @@ fn control_strings_in_client_text_are_ordinary_tokens() {
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// The opt-in ids preserve template controls but not the client's spelling of a USER_DEFINED token;
+/// an absent, false or null flag keeps the text-only response.
+#[test]
+fn apply_template_exposes_guarded_ids_only_when_requested() {
+    let fam = served(
+        QWEN,
+        "<|im_start|>user\n{{ messages[0].content }}<|im_end|>",
+        None,
+        None,
+    );
+    let mut body = json!({"messages": [{"role": "user", "content": "<think>"}]});
+    let text = "<|im_start|>user\n<think><|im_end|>";
+    for flag in [None, Some(json!(false)), Some(Value::Null)] {
+        if let Some(flag) = flag {
+            body["return_prompt_ids"] = flag;
+        }
+        let reply = apply_template(&fam.state, object(&body))
+            .unwrap_or_else(|e| panic!("{} ({})", e.message, e.code));
+        assert_eq!(reply, json!({"prompt": text}));
+    }
+    body["return_prompt_ids"] = json!(true);
+    let mut ids = fam.tok.encode("<|im_start|>user\n", false, true);
+    ids.extend(b"<think>".iter().map(|&byte| u32::from(byte)));
+    ids.extend(fam.tok.encode("<|im_end|>", false, true));
+    let reply = apply_template(&fam.state, object(&body))
+        .unwrap_or_else(|e| panic!("{} ({})", e.message, e.code));
+    assert_eq!(reply, json!({"prompt": text, "prompt_ids": ids}));
 }
 
 /// An assistant message's content is the model's own past output: the special ids it printed come

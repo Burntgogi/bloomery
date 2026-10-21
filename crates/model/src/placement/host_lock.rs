@@ -32,6 +32,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use gguf::{Gguf, Split};
+use os::Populated;
 
 use super::{Device, ExpertList, Format, ModelTensor, PlacementError, Plan, Segment};
 use crate::r8file::{R8Error, R8Source, Sidecar};
@@ -861,83 +862,55 @@ pub(crate) fn drop_pages(
         libc::off_t::try_from(v)
             .map_err(|_| PlacementError::Host(format!("{name} offset {v} passes off_t")))
     };
-    // SAFETY: the descriptor is this file's own and lives across the call;
-    // fadvise reads no memory of ours.
-    let rc = unsafe {
-        libc::posix_fadvise(
-            file.as_raw_fd(),
-            off(first)?,
-            off(end - first)?,
-            libc::POSIX_FADV_DONTNEED,
-        )
-    };
-    if rc != 0 {
-        return Err(PlacementError::Host(format!(
-            "posix_fadvise(DONTNEED) of {name} bytes {first}..{end}: {}",
-            io::Error::from_raw_os_error(rc)
-        )));
-    }
+    os::fadvise_dontneed(file.as_raw_fd(), off(first)?, off(end - first)?).map_err(|e| {
+        PlacementError::Host(format!(
+            "posix_fadvise(DONTNEED) of {name} bytes {first}..{end}: {e}"
+        ))
+    })?;
     Ok(end - first)
-}
-
-/// How [`populate_span`] faulted a span's pages in.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Populated {
-    /// `MADV_POPULATE_READ`.
-    Advised,
-    /// A read of one byte a page: the kernel has no `MADV_POPULATE_READ`.
-    Touched,
 }
 
 /// The line a populate prints once when the kernel has no
 /// `MADV_POPULATE_READ`.
+#[cfg(target_os = "linux")]
 const NO_POPULATE_READ: &str = "host populate: madvise(MADV_POPULATE_READ) is not in this kernel \
                                 (EINVAL; it came in Linux 5.14), so the load reads one byte a page \
                                 instead";
 
+/// The line a populate prints once when the platform has no
+/// `MADV_POPULATE_READ`.
+#[cfg(target_os = "macos")]
+const NO_POPULATE_READ: &str = "host populate: this platform has no madvise(MADV_POPULATE_READ), \
+                                so the load reads one byte a page instead";
+
 /// `madvise(MADV_POPULATE_READ)` over `span`, a live sub-slice of a set's
 /// mappings: a shard's read-only file mapping, or the sidecar's, which is its
 /// file's mapping or a resident anonymous copy.
-fn advise_populate(span: &[u8]) -> io::Result<()> {
-    // SAFETY: `span` is a live slice (the caller's contract above);
-    // MADV_POPULATE_READ faults its pages in on either kind of mapping and
-    // never writes them.
-    let rc = unsafe {
-        libc::madvise(
-            span.as_ptr().cast_mut().cast(),
-            span.len(),
-            libc::MADV_POPULATE_READ,
-        )
-    };
-    if rc == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
+fn advise_populate(span: &[u8]) -> Result<(), os::OsError> {
+    // SAFETY: `span` is a live slice (the caller's contract above), so its
+    // pages are inside one live mapping.
+    unsafe { os::advise_populate(span.as_ptr().cast_mut().cast(), span.len()) }
 }
 
 /// Fault the pages of `span` in through `advise` (the madvise call,
 /// [`advise_populate`]); a kernel that does not know the advice (EINVAL,
-/// before Linux 5.14) gets the same pages faulted by a read of one byte each
-/// `page` bytes instead. Any other refusal is the walk's, by name.
+/// before Linux 5.14) or a platform without it ([`os::OsError::Unsupported`])
+/// gets the same pages faulted by a read of one byte each `page` bytes
+/// instead. Any other refusal is the walk's, by name. The error stays typed
+/// through this seam: the fallback reads the variant and the errno.
 fn populate_span(
     span: &[u8],
     page: u64,
-    advise: impl Fn(&[u8]) -> io::Result<()>,
+    advise: impl Fn(&[u8]) -> Result<(), os::OsError>,
 ) -> Result<Populated, String> {
-    match advise(span) {
-        Ok(()) => Ok(Populated::Advised),
-        Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
-            let step = usize::try_from(page).map_err(|_| format!("a page of {page} bytes"))?;
-            for at in (0..span.len()).step_by(step) {
-                // SAFETY: `at` is below `span.len()`, so the byte is inside
-                // the live slice; the read is volatile so that it is made.
-                let _ = unsafe { std::ptr::read_volatile(span.as_ptr().add(at)) };
-            }
-            Ok(Populated::Touched)
-        }
-        Err(e) => Err(format!("madvise(MADV_POPULATE_READ): {e}")),
+    // SAFETY: `span` is a live slice (the caller's contract above), so its
+    // pages are inside one live mapping.
+    unsafe {
+        os::populate_span(span.as_ptr().cast_mut().cast(), span.len(), page, || {
+            advise(span)
+        })
     }
+    .map_err(|e| format!("madvise(MADV_POPULATE_READ): {e}"))
 }
 
 /// What one chunk's thread hands back: every span its call succeeded on —
@@ -1207,20 +1180,12 @@ fn host_pages(
 fn resident_pages(span: &[u8], page: u64) -> io::Result<(u64, u64)> {
     let n = (span.len() as u64).div_ceil(page);
     let mut vec = vec![0u8; usize::try_from(n).map_err(io::Error::other)?];
-    // SAFETY: `span` starts on a page boundary inside one live mapping (a set
-    // run starts at a page multiple of the mapping's page-aligned start), and
-    // `vec` has one byte for each of its pages. mincore only reads the page
-    // tables; nothing is written through `addr`.
-    let rc = unsafe {
-        libc::mincore(
-            span.as_ptr().cast_mut().cast(),
-            span.len(),
-            vec.as_mut_ptr(),
-        )
-    };
-    if rc != 0 {
-        return Err(io::Error::last_os_error());
-    }
+    // `span` starts on a page boundary inside one live mapping (a set run
+    // starts at a page multiple of the mapping's page-aligned start), and
+    // `vec` has one byte for each of its pages.
+    // SAFETY: the caller's contract above.
+    unsafe { os::mincore(span.as_ptr().cast_mut().cast(), span.len(), &mut vec) }
+        .map_err(io::Error::from)?;
     Ok((vec.iter().filter(|&&b| b & 1 != 0).count() as u64, n))
 }
 
@@ -1237,21 +1202,36 @@ mod tests {
     use gguf::write::{Layout, TensorDecl, Writer};
     use gguf::{Split, Weights};
 
-    /// A kernel without `MADV_POPULATE_READ` (EINVAL) gets the span's pages
-    /// read one byte each instead; an advice the kernel takes reads nothing
-    /// more, and any other refusal is named. The madvise call is the seam: the errno comes from
-    /// the test, not from the running kernel.
+    /// A kernel without `MADV_POPULATE_READ` (EINVAL) or a platform without
+    /// it (`Unsupported`) gets the span's pages read one byte each instead; an
+    /// advice the kernel takes reads nothing more, and any other refusal is
+    /// named. The madvise call is the seam: the error comes from the test, not
+    /// from the running kernel.
     #[test]
     fn a_kernel_without_populate_read_reads_a_byte_a_page() {
         let page = 4096u64;
         let span: Vec<u8> = (0..3 * 4096 + 7).map(|i| (i % 251) as u8).collect();
-        let einval = |_: &[u8]| Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+        let einval = |_: &[u8]| {
+            Err(os::OsError::Io(std::io::Error::from_raw_os_error(
+                libc::EINVAL,
+            )))
+        };
         assert_eq!(populate_span(&span, page, einval), Ok(Populated::Touched));
+        let absent = |_: &[u8]| {
+            Err(os::OsError::Unsupported {
+                call: "madvise(MADV_POPULATE_READ)",
+            })
+        };
+        assert_eq!(populate_span(&span, page, absent), Ok(Populated::Touched));
         assert_eq!(
             populate_span(&span, page, |_: &[u8]| Ok(())),
             Ok(Populated::Advised)
         );
-        let enomem = |_: &[u8]| Err(std::io::Error::from_raw_os_error(libc::ENOMEM));
+        let enomem = |_: &[u8]| {
+            Err(os::OsError::Io(std::io::Error::from_raw_os_error(
+                libc::ENOMEM,
+            )))
+        };
         let e = populate_span(&span, page, enomem).unwrap_err();
         assert!(e.starts_with("madvise(MADV_POPULATE_READ): "), "{e}");
         assert_eq!(
