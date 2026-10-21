@@ -72,16 +72,11 @@ fn media_error(i: usize, e: &MediaError) -> DecideError {
     }
 }
 
-/// Each image URL loaded (a data URL of a PNG or a JPEG) and prepared for `media`, in the
+/// Each image URL decoded under one request budget before any are prepared for `media`, in the
 /// request's order.
 fn prepare_images(urls: &[String], media: &dyn MediaModel) -> Result<Vec<Prepared>, DecideError> {
-    urls.iter()
-        .enumerate()
-        .map(|(i, url)| {
-            let file = media::load(url).map_err(|e| media_error(i, &e))?;
-            media::prepare(&file, media).map_err(|e| media_error(i, &e))
-        })
-        .collect()
+    media::prepare_images(urls.iter().map(String::as_str), media)
+        .map_err(|(i, error)| media_error(i, &error))
 }
 
 struct Clef {

@@ -162,6 +162,10 @@ Your OpenAI client works unchanged. bloomery speaks llama-server's HTTP API and 
   (`Invalid API Key`) without a valid one, and a flag that names no key refuses to start rather than serve
   unlocked. The server binds `127.0.0.1` by default; `--host 0.0.0.0` without a key serves anyone who can
   reach the port.
+  The key check runs on the headers, before `100 Continue` or body ingestion.
+  A denied request gets 401 and the connection closes without draining its body.
+  Public health and `OPTIONS` requests are answered from their headers; a declared
+  unread body closes that connection rather than becoming another request.
 - **Stopping the server**: `SIGINT`/`SIGTERM` stop it as llama-server's do — no new request is admitted, the
   engine thread ends between its calls, and the process exits 0 after one stderr line naming the cause; a second
   signal terminates at once. `POST /shutdown` does the same over HTTP, accepted only from a loopback peer (a
@@ -301,6 +305,18 @@ answers `vision: false`. A generative seat answers a request with an image with 
 this server reads text only`). The Clef decide seat answers it with a 501 and llama.cpp's hint (`image input is not
 supported - hint: if this is unexpected, you may need to provide the mmproj`). Lev takes no image: `--mmproj` beside
 it is refused, and a request with an image is a 501.
+
+Inline PNG/JPEG input shares a fixed 64 MiB decoded-RGB budget across a request's
+images, including batched embedding inputs. Image headers are checked before
+allocating decoder output, and all inline images are decoded within the budget
+before model preparation starts. PNG temporary output must fit the remaining
+budget too. An oversized image is a named 400, not a large allocation followed
+by a context refusal. Trusted offline image constructors are not subject to this
+serving policy.
+
+The budget bounds retained RGB, not total process memory: compressed request
+data, decoder internals, temporary conversion buffers and model preparation are
+additional. Encoded-video planning and decoding keep their own limits.
 
 **Video input.** A model with a video rule reads a clip when `ffmpeg` and `ffprobe` (5.1 or newer) are on `PATH`; the
 server looks once at start, prints one `video:` line, and answers `/props` with `modalities.video` true. A clip is an
