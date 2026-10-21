@@ -73,41 +73,28 @@ fn image_parts_preserve_delimiters_and_place_spans_in_one_input() {
         media::expand_prompt(&[side.tok.bos()], &[], &**model),
         Err(media::MediaError::NoChatImageToken)
     ));
-    side.ctx = got.ids.len();
-    assert_eq!(
-        inputs(&side, "input", &json!([body.clone()])).unwrap_or_else(|e| panic!("{}", e.message))
-            [0]
-        .ids,
-        got.ids
-    );
-    side.ctx = got.images[1].at;
-    let mut over = body.clone();
-    let parts = over["content"].as_array_mut().unwrap();
-    parts.extend(std::iter::repeat_n(parts[1].clone(), 64));
-    let error = inputs(&side, "input", &json!([over]))
-        .err()
-        .expect("context refusal");
-    assert_eq!(error.code, 400);
+    // Only context changes: the same valid input fits exactly, but not one position below.
+    for ctx in [got.ids.len() - 1, got.ids.len(), got.ids.len() + 1] {
+        side.ctx = ctx;
+        let result = inputs(&side, "input", &json!([body.clone()]));
+        if ctx < got.ids.len() {
+            let error = result.err().expect("context refusal");
+            assert_eq!(error.code, 400);
+        } else {
+            let parsed = result.unwrap_or_else(|e| panic!("{}", e.message));
+            assert_eq!(parsed.len(), 1);
+            assert_eq!(parsed[0].ids, got.ids);
+            assert_eq!(parsed[0].images.len(), got.images.len());
+            for (feed, want) in parsed[0].images.iter().zip(&got.images) {
+                assert_eq!(feed.at, want.at);
+                assert_eq!(feed.key, want.key);
+                assert_eq!(feed.prepared, want.prepared);
+            }
+        }
+    }
     side.ctx = 8192;
     let second = json!({"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAIAAAB7QOjdAAAAD0lEQVR4nGPgEpHTMLIBAAI3ANNbVlHYAAAAAElFTkSuQmCC"}});
     let video = json!({"content":[{"type":"text","text":"Video:"},image.clone(),second.clone()]});
-    for capacity in [4, 70, 71, 72, 73, 140] {
-        let rule = vision::size::SizeRule::new(
-            16,
-            3,
-            vision::arch::TokenLimits::new(1, capacity).unwrap(),
-        )
-        .unwrap();
-        side.media = Some(Arc::new(vision::arch::gemma4v::Media::new(rule)));
-        let result = inputs(&side, "input", &video);
-        if capacity < 72 {
-            let error = result.err().expect("video exceeds loaded tower capacity");
-            assert_eq!(error.code, 400);
-        } else {
-            assert!(result.is_ok(), "video fits {capacity} tokens");
-        }
-    }
-    let parsed = inputs(&side, "input", &video).unwrap_or_else(|e| panic!("{}", e.message));
     let files = [&image, &second]
         .map(|part| media::load(part["image_url"]["url"].as_str().unwrap()).unwrap());
     assert_ne!(files[0].key, files[1].key);
@@ -117,28 +104,80 @@ fn image_parts_preserve_delimiters_and_place_spans_in_one_input() {
         .collect::<Vec<_>>();
     let (_, prepared) = vision::arch::gemma4v::prepare_clip(&frames, (1, 1), 16).unwrap();
     assert_ne!(prepared[0].input, prepared[1].input);
-    let got = &parsed[0];
-    assert_eq!(got.images.len(), prepared.len());
+    assert_eq!(
+        prepared
+            .iter()
+            .map(|frame| frame.span_len)
+            .collect::<Vec<_>>(),
+        [72, 72]
+    );
     let mut want = vec![side.tok.bos()];
     want.extend(side.tok.encode("Video:"));
-    for ((feed, frame), file) in got.images.iter().zip(&prepared).zip(&files) {
+    let mut positions = Vec::new();
+    for frame in &prepared {
         want.extend(side.tok.encode("<|image>"));
-        assert_eq!(feed.at, want.len());
-        assert_eq!(&*feed.prepared, frame);
-        assert_eq!(feed.key, file.key);
+        positions.push(want.len());
         want.extend(std::iter::repeat_n(side.tok.bos(), frame.span_len));
         want.extend(side.tok.encode("<image|>"));
     }
     if side.tok.add_eos() {
         want.push(side.tok.eos());
     }
-    assert_eq!(got.ids, want);
-    side.ctx = got.ids.len();
-    assert!(inputs(&side, "input", &video).is_ok());
-    side.ctx -= 1;
-    assert!(inputs(&side, "input", &video).is_err());
+    let assert_video = |parsed: &[Input]| {
+        assert_eq!(parsed.len(), 1);
+        let got = &parsed[0];
+        assert_eq!(got.ids, want);
+        assert_eq!(got.images.len(), prepared.len());
+        for (((feed, frame), file), at) in
+            got.images.iter().zip(&prepared).zip(&files).zip(&positions)
+        {
+            assert_eq!(feed.at, *at);
+            assert_eq!(&*feed.prepared, frame);
+            assert_eq!(feed.key, file.key);
+        }
+    };
+    // Both files decode independently above; only the loaded projector capacity varies.
+    for capacity in [71, 72, 73] {
+        let rule = vision::size::SizeRule::new(
+            16,
+            3,
+            vision::arch::TokenLimits::new(1, capacity).unwrap(),
+        )
+        .unwrap();
+        let model = vision::arch::gemma4v::Media::new(rule);
+        let model_result = vision::MediaModel::prepare_video(&model, &frames);
+        side.media = Some(Arc::new(model));
+        let result = inputs(&side, "input", &video);
+        if capacity < 72 {
+            assert!(matches!(
+                model_result,
+                Err(vision::VisionError::Limits { .. })
+            ));
+            let error = result
+                .err()
+                .expect("video exceeds loaded projector capacity");
+            assert_eq!(error.code, 400);
+        } else {
+            assert_eq!(model_result.unwrap(), prepared);
+            assert_video(&result.unwrap_or_else(|e| panic!("{}", e.message)));
+        }
+    }
+    for ctx in [want.len() - 1, want.len(), want.len() + 1] {
+        side.ctx = ctx;
+        let result = inputs(&side, "input", &video);
+        if ctx < want.len() {
+            let error = result.err().expect("video exceeds context");
+            assert_eq!(error.code, 400);
+        } else {
+            assert_video(&result.unwrap_or_else(|e| panic!("{}", e.message)));
+        }
+    }
     side.ctx = 8192;
     let square = vision::Rgb8::filled(576, 576, [10, 20, 30]);
+    let square_frames = std::slice::from_ref(&square);
+    let prepared = vision::arch::gemma4v::prepare_video(square_frames, 16).unwrap();
+    assert_eq!(prepared.len(), 1);
+    assert_eq!(prepared[0].span_len, 121);
     for capacity in [120, 121, 122] {
         let rule = vision::size::SizeRule::new(
             16,
@@ -147,10 +186,11 @@ fn image_parts_preserve_delimiters_and_place_spans_in_one_input() {
         )
         .unwrap();
         let model = vision::arch::gemma4v::Media::new(rule);
-        let result = vision::MediaModel::prepare_video(&model, std::slice::from_ref(&square));
-        assert_eq!(result.is_ok(), capacity >= 121);
-        if let Ok(prepared) = result {
-            assert_eq!(prepared[0].span_len, 121);
+        let result = vision::MediaModel::prepare_video(&model, square_frames);
+        if capacity < 121 {
+            assert!(matches!(result, Err(vision::VisionError::Limits { .. })));
+        } else {
+            assert_eq!(result.unwrap(), prepared);
         }
     }
     // A clip of either spelling reaches the server's decoder, which a bare side has none of: the
@@ -182,8 +222,6 @@ fn image_parts_preserve_delimiters_and_place_spans_in_one_input() {
     ] {
         assert!(inputs(&side, "input", &json!({"content":content})).is_err());
     }
-    side.ctx = 1;
-    assert!(inputs(&side, "input", &video).is_err());
     side.media = None;
     assert!(inputs(&side, "input", &json!([body])).is_err());
     assert!(
