@@ -552,6 +552,7 @@ mod tests {
             rows(CardFormat::of),
             [
                 (GgmlType::F32, CardFormat::F32),
+                (GgmlType::F16, CardFormat::Bf16AsF32),
                 (GgmlType::Q5_0, CardFormat::Q5_0),
                 (GgmlType::Q5_1, CardFormat::Q5_1),
                 (GgmlType::Q8_0, CardFormat::Q8_0Planes),
@@ -602,6 +603,7 @@ mod tests {
         assert_eq!(
             held(CardFormat::Bf16AsF32),
             [
+                GgmlType::F16,
                 GgmlType::Q3_K,
                 GgmlType::Q4_K,
                 GgmlType::Q5_K,

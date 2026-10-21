@@ -6225,16 +6225,17 @@ mod tests {
             weights + KV + context + scratch + MARGIN,
             "the margin in the arena's place"
         );
+        // A routed stack of a type with no device format (iq1_s has none) is refused by name.
         let mut odd = layered(3);
-        odd.tensors[1].ty = GgmlType::F16;
+        odd.tensors[1].ty = GgmlType::IQ1_S;
         match whole_need(&odd, &at(need), KV, load) {
             Err(e @ PlacementError::NoCardFormat { .. }) => assert_eq!(
                 e.to_string(),
-                "tensor experts 0: type f16 has no device format, but its role (routed) puts it \
+                "tensor experts 0: type iq1_s has no device format, but its role (routed) puts it \
                  on a card"
             ),
             Err(e) => panic!("{e}, not NoCardFormat"),
-            Ok(n) => panic!("an f16 stack was sized as {n:?}"),
+            Ok(n) => panic!("an iq1_s stack was sized as {n:?}"),
         }
     }
 
