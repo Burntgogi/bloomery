@@ -362,8 +362,10 @@
 # saving is in the items the rebase left alone.
 # Each item's input key is `tools/recipes.py key` (its section header lists the parts): its own target
 # sources, uncut reached dependency sources, build/procedural-macro compilation inputs, named script
-# reads and manifests. Opaque expansion/linkage keeps conservative bounds; a Mac command, unmodelled
-# cargo subcommand or tree-walking script still keys the whole tree. `just affected` keeps its broader
+# reads and manifests. Compiled regular-source macro invocations add structural roots even in otherwise
+# unreached modules; implicit impls include non-.rs #[path] modules. Opaque expansion/linkage keeps
+# conservative bounds; a Mac command, unmodelled cargo subcommand or tree-walking script still keys
+# the whole tree. `just affected` keeps its broader
 # compile closure: an affected recipe need not have a changed ledger key. Keys also include the text
 # of the recipe and every dependency recipe, the scripts those name, cargo globals and cuda-oxide pin, its
 # ARGS, its full BLOOMERY_BOX_ENV (the caller's, the item's, its lane's card), the Mac-side variables

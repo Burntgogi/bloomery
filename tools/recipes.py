@@ -3374,7 +3374,7 @@ def _key_attributes(shape: str) -> tuple[bool, bool]:
     execute code without an ordinary item edge. Builtin derives are the only derives resolved here.
     """
     standard = {"cfg", "allow", "warn", "deny", "forbid", "expect", "doc", "test", "ignore", "inline",
-                "cold", "repr", "path", "macro_use", "macro_export", "must_use", "non_exhaustive",
+                "cold", "repr", "path", "macro_export", "must_use", "non_exhaustive",
                 "track_caller", "automatically_derived", "deprecated", "should_panic", "used"}
     builtin_derives = {"Clone", "Copy", "Debug", "Default", "Eq", "PartialEq", "Ord", "PartialOrd", "Hash"}
     foreign = {"no_mangle", "export_name", "link", "link_name", "link_section"}
@@ -4200,8 +4200,6 @@ class Reach:
         name some reached unit must say, None for an item std calls unnamed; rule 1)."""
         out = []
         for f in files:
-            if not f.endswith(".rs"):
-                continue
             facts = self.facts(rk, f)
             bases = self.bases(rk, f) or [()]
             sides: dict[ImplHead, tuple[list[list[int]], bool]] = {}
@@ -4448,7 +4446,8 @@ class Reach:
         self._gates[key] = {**full, **cut}
         return self._gates[key]
 
-    def _close(self, graph: Graph, n: str, open_rows: frozenset[int] | None) -> dict[int, tuple[int, str]]:
+    def _close(self, graph: Graph, n: str, open_rows: frozenset[int] | None,
+               extra: set[Hit] | None = None) -> dict[int, tuple[int, str]]:
         """The closure of gate `n`'s targets; `open_rows`, when given, are the only rows of the registry's table whose
         entries its dispatch edges lead to, until a unit that walks every row is reached."""
         self.dispatches()
@@ -4501,6 +4500,9 @@ class Reach:
             entries = [h for h in own if kind in ("libtest", "test") and h[2] >= 0 and self.facts(h[0], h[1]).units[h[2]].test]
             for h in entries or own:
                 seed(h, label)
+        for h in extra or ():
+            if h[1] in linked:
+                seed(h, "source macro compilation effect")
         builds = {self.tree.packages[bpkg].name: src for src, bpkg in self.builds.items() if src in linked}
         names = frozenset().union(*(rs.names for rs in sets))
         for rs in sets:
@@ -4589,33 +4591,21 @@ class Reach:
         """
         ri, tree = graph.inputs(n), self.tree
         par = self._close(graph, n, None)
-        keep = {self.nodes[m][1] for m in par}
-        # Module declarations/re-exports on the path to reached code are behavior, not merely linkage.
-        for m in par:
-            rk, f, _ = self.nodes[m]
-            mods = self.mods(rk)
-            for path, owner in mods.items():
-                if owner == f:
-                    for depth in range(len(path) + 1):
-                        ancestor = mods.get(path[:depth])
-                        if ancestor in ri.files:
-                            keep.add(ancestor)
+        keep: set[str] = set()
         keep |= {f for f in ri.files if f in tree.manifest_paths or f in CARGO_GLOBALS or f in OXIDE_GLOBALS
                  or ri.files[f].startswith("dep-info")}
         linked_packages = {p.name for p in tree.packages.values() if p.manifest in ri.files}
         boundary = set(ri.files) | set(ri.prefixes)
         compiled: dict[str, set[str]] = {p: set() for p in linked_packages}
         reads: dict[str, set[str]] = {p: set() for p in linked_packages}
-        roots: dict[str, set[RootKey]] = {p: set() for p in linked_packages}
-        views: dict[tuple[str, str], set[bool]] = {}
+        views: dict[tuple[str, str], set[RootKey]] = {}
 
         def compile_root(pname: str, src: str, test: bool = False) -> set[str]:
-            roots[pname].add((pname, src, test))
             files, lits = tree.tree_of(src, test)
             files = files & boundary
             for f in files:
                 compiled[pname].add(f)
-                views.setdefault((pname, f), set()).add(test)
+                views.setdefault((pname, f), set()).add((pname, src, test))
             found = files | set(tree._resolve_literals(tree.packages[pname], [(f, lit) for f, lit in lits if f in files]))
             reads[pname].update(found)
             return found
@@ -4666,48 +4656,87 @@ class Reach:
         # Within each runtime-active owner scan *all* compilation files: an unreachable ctor can run.
         active_owners = {self.nodes[m][0][0] for m in par if self.nodes[m][2] >= 0}
         work = list(active_owners)
-        while work:
-            pname = work.pop()
-            pkg = tree.packages[pname]
-            for f in compiled[pname]:
-                code, shape = rust_lex(self.text(f))
-                links = set(re.findall(r"\bextern\s+crate\s+([A-Za-z_]\w*)", shape))
-                links.update(re.findall(r"\buse\s+([A-Za-z_]\w*)\s+as\s+_\s*;", shape))
-                # Even an unused import can make rustc link a crate and run its constructors.
-                links.update(path[0].removeprefix("r#")
-                             for test in views[pname, f]
-                             for _, path, _, _ in rust_facts(self.text(f), test).binds
-                             if path and path[0] not in ("crate", "self", "super"))
-                for dep in pkg.deps:
-                    if dep.pkg not in linked_packages or dep.pkg in active_owners:
-                        continue
-                    lib = tree.packages[dep.pkg].lib()
-                    if dep.key.replace("-", "_") in links or (lib is not None and lib.name.replace("-", "_") in links):
-                        active_owners.add(dep.pkg)
-                        work.append(dep.pkg)
-                opaque, linkage = _key_attributes(shape)
-                # An ABI on a Rust callback definition or function-pointer type is not an extern block.
-                outside_ownership |= linkage or bool(re.search(r'\bextern\s*(?:"[^"]*"\s*)?\{', code))
-                outside_ownership |= bool(re.search(r'\binclude!\s*\(\s*(?!")\S', code)
-                                          or re.search(r'\binclude!\s*\(\s*"[^"]*(?<!\.rs)"', code))
-                # An unmodeled item-level macro may itself produce startup code, even in a file with no
-                # ordinary reached item. Known source macros reuse Reach's existing definition resolver.
-                calls = set(re.findall(r"((?:(?:r#)?[A-Za-z_]\w*\s*::\s*)*(?:r#)?[A-Za-z_]\w*)\s*!\s*[(\[{]", shape))
-                for call in calls:
-                    spelling = re.split(r"\s*::\s*", call)[-1]
-                    if spelling in syntax_words:
-                        continue
-                    macro = spelling.removeprefix("r#")
-                    if macro not in safe_macros and (not any(macro in self.macros(rk) for rk in roots[pname])
-                                                     and not any(self.exported(p).get(macro) for p in linked_packages)):
+        source_seeds: set[Hit] = set()
+        closed_seeds: set[Hit] = set()
+        exported_names = {name for p in linked_packages for name, hits in self.exported(p).items() if hits}
+        while True:
+            while work:
+                pname = work.pop()
+                pkg = tree.packages[pname]
+                for f in compiled[pname]:
+                    code, shape = rust_lex(self.text(f))
+                    facts_by_root = [(rk, self.facts(rk, f)) for rk in views[pname, f]]
+                    links = set(re.findall(r"\bextern\s+crate\s+([A-Za-z_]\w*)", shape))
+                    # Even an unused import can make rustc link a crate and run its constructors.
+                    links.update(path[0].removeprefix("r#")
+                                 for _, facts in facts_by_root for _, path, _, _ in facts.binds
+                                 if path and path[0] not in ("crate", "self", "super"))
+                    for dep in pkg.deps:
+                        if dep.pkg not in linked_packages or dep.pkg in active_owners:
+                            continue
+                        lib = tree.packages[dep.pkg].lib()
+                        if dep.key.replace("-", "_") in links or (lib is not None and lib.name.replace("-", "_") in links):
+                            active_owners.add(dep.pkg)
+                            work.append(dep.pkg)
+                    opaque, linkage = _key_attributes(shape)
+                    # An ABI on a Rust callback definition or function-pointer type is not an extern block.
+                    outside_ownership |= linkage or bool(re.search(r'\bextern\s*(?:"[^"]*"\s*)?\{', code))
+                    outside_ownership |= bool(re.search(r'\binclude!\s*\(\s*(?!")\S', code)
+                                              or re.search(r'\binclude!\s*\(\s*"[^"]*(?<!\.rs)"', code))
+                    # Source macros use the existing unhygienic expansion edges, even from otherwise
+                    # unreached items: an expansion may emit a constructor or an implicit trait impl.
+                    for rk, facts in facts_by_root:
+                        known = set(self.macros(rk)) | exported_names
+                        for k, unit in enumerate(facts.units):
+                            if any(name in known for name in unit.macro_calls):
+                                source_seeds.add((rk, f, k))
+                    # Only unconditionally named local enums are proven to import variants, never macros.
+                    # Imported/conditional paths remain opaque: a different binding may export a macro.
+                    glob_shadow = False
+                    conditional_bindings = bool(re.search(r"#\s*!?\s*\[\s*cfg(?:_attr)?\b", shape))
+                    for rk, facts in facts_by_root:
+                        for ctx, path in facts.globs:
+                            hits = [h for base in self.bases(rk, f) or [()]
+                                    for h in self.walk(rk, base + ctx, path[:-1], True)
+                                    if h[2] >= 0] if len(path) == 2 and path[0] not in facts.bound and not conditional_bindings else []
+                            if not hits or any(self.facts(h[0], h[1]).units[h[2]].kind != "enum" for h in hits):
+                                glob_shadow = True
+                    calls = set(re.findall(r"((?:(?:r#)?[A-Za-z_]\w*\s*::\s*)*(?:r#)?[A-Za-z_]\w*)\s*!\s*[(\[{]", shape))
+                    for call in calls:
+                        spelling = re.split(r"\s*::\s*", call)[-1]
+                        if spelling in syntax_words:
+                            continue
+                        macro = spelling.removeprefix("r#")
+                        shadowed = glob_shadow or any(macro in facts.bound for _, facts in facts_by_root)
+                        local_source = all(macro in self.macros(rk) for rk, _ in facts_by_root)
+                        if "::" not in call and not shadowed and (macro in safe_macros or local_source):
+                            continue
                         opaque = True
-                if opaque:
-                    opaque_owners.add(pname)
-                    # Expansion can name its package's forward dependencies, not unrelated reverse/sibling
-                    # packages. Inspect the activated owners for startup and foreign-link obligations too.
-                    added = dependency_closure({pname}) - active_owners
-                    active_owners.update(added)
-                    work.extend(added)
+                    if opaque:
+                        opaque_owners.add(pname)
+                        # Opaque expansion can name its package's forward dependencies, not unrelated
+                        # reverse/sibling packages. Inspect activated owners for linkage obligations too.
+                        added = dependency_closure({pname}) - active_owners
+                        active_owners.update(added)
+                        work.extend(added)
+            if source_seeds == closed_seeds:
+                break
+            par = self._close(graph, n, None, source_seeds)
+            closed_seeds = set(source_seeds)
+            added = {self.nodes[m][0][0] for m in par if self.nodes[m][2] >= 0} - active_owners
+            active_owners.update(added)
+            work.extend(added)
+        keep |= {self.nodes[m][1] for m in par}
+        # Module declarations/re-exports on the path to reached code are behavior, not merely linkage.
+        for m in par:
+            rk, f, _ = self.nodes[m]
+            mods = self.mods(rk)
+            for path, owner in mods.items():
+                if owner == f:
+                    for depth in range(len(path) + 1):
+                        ancestor = mods.get(path[:depth])
+                        if ancestor in ri.files:
+                            keep.add(ancestor)
         for m in par:
             rk, f, k = self.nodes[m]
             if k < 0:

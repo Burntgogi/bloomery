@@ -213,6 +213,35 @@ pub fn inject(_: TokenStream, _: TokenStream) -> TokenStream {
     return files
 
 
+def source_macro_files(kind: str) -> dict[str, str]:
+    files = runtime_files()
+    files["crates/dep/src/lib.rs"] += "mod hidden;\nmod startup;\n"
+    files["crates/dep/src/hidden.rs"] = 'pub fn run() { println!("source-macro1"); }\n'
+    if kind == "exported-startup":
+        files["Cargo.toml"] = files["Cargo.toml"].replace('"crates/dep"]', '"crates/dep", "crates/macros"]')
+        files["crates/dep/Cargo.toml"] += '[dependencies]\nmacros = { path = "../macros" }\n'
+        files["crates/macros/Cargo.toml"] = package("macros")
+        files["crates/macros/src/lib.rs"] = r'''#[macro_export]
+macro_rules! boot {
+    () => {
+        #[used]
+        #[link_section = ".init_array"]
+        static START: extern "C" fn() = {
+            extern "C" fn launch() { crate::hidden::run(); }
+            launch
+        };
+    };
+}
+'''
+        files["crates/dep/src/startup.rs"] = "macros::boot!();\n"
+    else:
+        source = ('macro_rules! boot { () => { impl Drop for crate::Token {\n'
+                  '    fn drop(&mut self) { crate::hidden::run(); }\n'
+                  '} }; }\nboot!();\n')
+        files["crates/dep/src/startup.rs"] = source.replace("boot", "println") if kind == "shadowed-builtin" else source
+    return files
+
+
 class RecipeKeyCLI(unittest.TestCase):
     def assert_file(self, row, rel: str, present: bool = True) -> None:
         paths = {p.split("\t")[1] for p in row[3] if p.startswith(("file\t", "link\t", "manifest\t"))}
@@ -255,6 +284,38 @@ class RecipeKeyCLI(unittest.TestCase):
             rows = ws.keys("gate-called", ledger=True)
             ws.assert_status(rows, {"gate-called": "run"})
             self.assert_file(rows["gate-called"], rel)
+
+    def test_nonstandard_drop_impl_keeps_its_transitive_helper(self):
+        files = runtime_files()
+        files["crates/dep/src/lib.rs"] += '#[path = "drop.rust"] mod destructor;\nmod hidden;\n'
+        files["crates/dep/src/drop.rust"] = 'impl Drop for crate::Token { fn drop(&mut self) { crate::hidden::run(); } }\n'
+        files["crates/dep/src/hidden.rs"] = 'pub fn run() { println!("drop1"); }\npub fn alt() { println!("alt1"); }\n'
+        ws = Workspace(self, files)
+        items = ("gate-called", "gate-linked")
+        baseline = ws.green(*items)
+        for rel in ("crates/dep/src/drop.rust", "crates/dep/src/hidden.rs"):
+            self.assert_file(baseline["gate-called"], rel)
+            self.assert_file(baseline["gate-linked"], rel, False)
+            changed = files[rel].replace("hidden::run()", "hidden::alt()") if rel.endswith(".rust") else files[rel].replace("drop1", "drop2")
+            with self.subTest(rel=rel), ws.changed(rel, changed, restore_mtime=True):
+                ws.assert_status(ws.keys(*items, ledger=True), {"gate-called": "run", "gate-linked": "skip"})
+
+    def test_known_source_macro_startup_and_implicit_impl_inputs(self):
+        for kind in ("exported-startup", "local-drop", "shadowed-builtin"):
+            with self.subTest(expansion=kind):
+                files = source_macro_files(kind)
+                ws = Workspace(self, files)
+                baseline = ws.green("gate-called", "gate-linked")
+                rel = "crates/dep/src/hidden.rs"
+                self.assert_file(baseline["gate-called"], rel)
+                self.assert_file(baseline["gate-called"], "crates/dep/src/startup.rs")
+                if kind == "exported-startup":
+                    self.assert_file(baseline["gate-called"], "crates/macros/src/lib.rs")
+                if kind == "local-drop":
+                    self.assert_file(baseline["gate-called"], "crates/dep/src/unused.rs", False)
+                with ws.changed(rel, files[rel].replace("source-macro1", "source-macro2"), restore_mtime=True):
+                    ws.assert_status(ws.keys("gate-called", "gate-linked", ledger=True),
+                                     {"gate-called": "run", "gate-linked": "skip"})
 
     def test_features_and_test_roots(self):
         ws = Workspace(self, runtime_files())
@@ -374,6 +435,9 @@ class RecipeKeyCLI(unittest.TestCase):
             '#[macros::keep]\n#[derive(macros::Generated)]\nstruct Probe;\n'
             'fn main() { let _ = Probe; mid::run(); }\n')
         ws = Workspace(self, files)
+        ws.green("gate-linked")
+        with ws.changed("crates/macros/src/helper.rs", "pub fn observe() { panic!(); }\n"):
+            ws.assert_status(ws.keys("gate-linked", ledger=True), {"gate-linked": "run"})
         baseline = ws.green("gate-called")
         for rel in ("crates/macros/src/lib.rs", "crates/macros/src/helper.rs", "crates/macros/macro-input.txt"):
             self.assert_file(baseline["gate-called"], rel)
@@ -418,10 +482,10 @@ class RecipeKeyCLI(unittest.TestCase):
                 with ws.changed("crates/dep/src/hidden.rs", 'pub fn run() { println!("hidden2"); }\n', restore_mtime=True):
                     ws.assert_status(ws.keys("gate-called", ledger=True), {"gate-called": "run"})
 
-    def test_negated_conditions_and_c_abi_callbacks_do_not_activate_unreached_code(self):
+    def test_negated_conditions_enum_globs_and_c_abi_callbacks_do_not_activate_unreached_code(self):
         files = runtime_files()
         files["crates/dep/src/used.rs"] = (
-            'pub fn run() {\n    if !(false) { println!("used1"); }\n'
+            'enum Choice { A }\npub fn run() {\n    use Choice::*;\n    let _ = A;\n    if !(false) { println!("used1"); }\n'
             '    while !(true) {}\n    let _callback: extern "C" fn() = callback;\n}\n'
             'extern "C" fn callback() {}\n')
         ws = Workspace(self, files)
