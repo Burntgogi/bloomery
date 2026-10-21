@@ -58,7 +58,14 @@ source = "/home/user/ik_llama.cpp"
 pin = {"cand": "ed27bf7e", "mimo2": "043ced9a", "draft": "db517b69"}[kind]
 patched = ("src/llama-hparams.h", "src/llama-hparams.cpp", "src/llama-load-tensors.cpp",
            "src/graphs/build_deepseek4.cpp")
-scratch = Path(os.environ["FIXTURE_HOME"]).parent / "scratch"
+# The one form of the scratch path every check compares against: the fixture
+# hands it over resolved, so a path under a symlinked temp root (/var ->
+# /private/var) still reads as inside the scratch directory.
+scratch = Path(os.environ["FIXTURE_SCRATCH"])
+
+def under_scratch(path):
+    # The one path check: inside the scratch directory, symlinks resolved.
+    return Path(path).resolve().is_relative_to(scratch)
 
 def reject():
     print("unexpected fixture invocation: " + repr([name, *args]), file=sys.stderr)
@@ -123,7 +130,7 @@ elif name == "find":
     if kind != "mimo2" or args != [source + "/.git", "!", "-user", "user", "-print", "-quit"]:
         reject()
 elif name == "tee":
-    draft_path = len(args) == 1 and Path(args[0]).resolve().is_relative_to(scratch)
+    draft_path = len(args) == 1 and under_scratch(args[0])
     if not ((kind == "draft" and draft_path) or (kind == "mimo2" and args == [candidate + "/PROVENANCE"])):
         reject()
     value = sys.stdin.buffer.read()
@@ -158,7 +165,7 @@ elif name == "mktemp":
     scratch.mkdir()
     print(scratch)
 elif name == "mkdir":
-    if kind != "draft" or len(args) != 2 or args[0] != "-p" or not Path(args[1]).resolve().is_relative_to(scratch):
+    if kind != "draft" or len(args) != 2 or args[0] != "-p" or not under_scratch(args[1]):
         reject()
     Path(args[1]).mkdir(parents=True, exist_ok=True)
 elif name == "sed":
@@ -183,8 +190,15 @@ class Fixture:
         self.bin = self.root / "bin"
         for path in (self.reference / "build", self.candidate / "build", self.bin, self.root / "home"):
             path.mkdir(parents=True)
+        # The wrappers size the build with `nproc`, which the Mac has not. The
+        # fixture answers it, so the recorded `-j` is the same on every host.
+        put(self.bin / "nproc", "#!/bin/sh\nprintf '4\\n'\n", True)
         self.events = self.root / "events"
         self.audit = self.root / "audit"
+        # The scratch directory the draft wrapper's mktemp hands out, resolved:
+        # the temp root sits under a symlink on the Mac (/var -> /private/var),
+        # so the printed path and the compared paths must be the same form.
+        self.scratch = (self.root / "scratch").resolve()
         self.env = {
             "PATH": str(self.bin) + os.pathsep + "/usr/bin:/bin",
             "HOME": str(self.root / "home"),
@@ -192,6 +206,7 @@ class Fixture:
             "FIXTURE_HOME": str(self.root / "home"),
             "FIXTURE_REFERENCE": str(self.reference),
             "FIXTURE_CANDIDATE": str(self.candidate),
+            "FIXTURE_SCRATCH": str(self.scratch),
             "FIXTURE_EVENTS": str(self.events),
             "FIXTURE_AUDIT": str(self.audit),
             "BLOOMERY_BUILD_BOUND": "60",
@@ -208,6 +223,18 @@ class Fixture:
 
     def fail_utility(self, name):
         put(self.bin / name, "#!/bin/bash\nprintf 'fixture " + name + " failure\\n' >&2\nexit 73\n", True)
+
+    def install_boundaries(self, kind):
+        names = ["sudo", "git", "find", "tee", "cmake"]
+        if kind == "draft":
+            names += ["sha256sum", "mktemp", "mkdir", "sed", "python3"]
+        for name in names:
+            put(self.bin / name, "#!" + sys.executable + "\n" + BOUNDARY, True)
+
+    def boundary(self, name, *args):
+        return subprocess.run([str(self.bin / name), *map(str, args)], cwd=self.root,
+                              env=self.env, capture_output=True, text=True, timeout=30,
+                              input="")
 
     def helper(self, function, *args):
         return subprocess.run(
@@ -227,9 +254,7 @@ class Fixture:
                 shutil.copyfile(source, target)
         kind = {"build-ik-cand.sh": "cand", "build-ik-mimo2.sh": "mimo2", "build-dump-draft.sh": "draft"}[script]
         self.env["FIXTURE_KIND"] = kind
-        boundaries = ["sudo", "git", "find", "tee", "cmake"]
         if kind == "draft":
-            boundaries += ["sha256sum", "mktemp", "mkdir", "sed", "python3"]
             self.env["FIXTURE_PATCH"] = str(self.root / "draft-patch.py")
             patched = ("src/llama-hparams.h", "src/llama-hparams.cpp", "src/llama-load-tensors.cpp",
                        "src/graphs/build_deepseek4.cpp")
@@ -242,8 +267,7 @@ class Fixture:
             put(self.root / "tools/ref/ref-build-common.sh",
                 "REF_BIN=" + shlex.quote(str(self.root / "out")) + "\nHERE=" + shlex.quote(str(self.root)) + "\n")
             self.env["DRAFT_IK"] = str(self.candidate)
-        for name in boundaries:
-            put(self.bin / name, "#!" + sys.executable + "\n" + BOUNDARY, True)
+        self.install_boundaries(kind)
         profile = (
             "IK=" + shlex.quote(str(self.reference if kind == "cand" else self.candidate)) + "\n"
             "CAND_IK=" + shlex.quote(str(self.candidate)) + "\n"
@@ -473,6 +497,22 @@ class CacheOptions(unittest.TestCase):
         fixture.fail_utility("diff")
         result = fixture.wrapper("build-dump-draft.sh")
         self.wrapper_events(fixture, result, 2, "draft-failed-comparison")
+
+    def test_draft_boundary_paths_outside_the_scratch_are_refused(self):
+        fixture = self.fixture()
+        fixture.env["FIXTURE_KIND"] = "draft"
+        fixture.install_boundaries("draft")
+        fixture.boundary("mktemp", "-d", "/tmp/dsv41-draft.XXXXXX")
+        inside = fixture.scratch / "inside.txt"
+        result = fixture.boundary("tee", inside)
+        self.assertEqual(result.returncode, 0,
+                         f"inside the scratch: rc={result.returncode}\n{result.stderr}")
+        self.assertTrue(inside.exists())
+        outside = fixture.root / "outside.txt"
+        result = fixture.boundary("tee", outside)
+        self.assertEqual(result.returncode, 97,
+                         f"outside the scratch: rc={result.returncode}\n{result.stderr}")
+        self.assertFalse(outside.exists())
 
 
 def self_test():
