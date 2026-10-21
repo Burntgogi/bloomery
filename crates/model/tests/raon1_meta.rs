@@ -76,31 +76,10 @@ const TENSORS: &[&str] = &[
     "token_embd q4_K 1",
 ];
 
-// PIN(2026-10-21): the coverage check's list with no program for the family: the program itself and
-// each part of the description or of the file no program's table runs [derived] from the layer
-// lines above: the delta layers' rule (erase and write gates apart, the full-width output gate), the
-// dense block's and the experts' `situ`, the 128-expert sigmoid router with its bias, the latent
-// layers' absorbed 192/128 attention with its 64 unrotated key values and its output gate, the
-// four-stream chart mix, and the tensor types no program pins: f16 mixers and mixes (every layer
-// holds one), and the routed down stacks in q8_0 (12 layers) and q5_0 (12). The recurrent state and
-// the mixed trunk are covered by the Qwen3.5 body's rows; the pre-tokenizer `raon` and the
-// tool-call parser by the tokenizer's table and the spec's declared markup.
-const COVERAGE: &[&str] = &[
-    "delta rule RDA: d 128, 40 heads, conv 4, erase and write gates apart, full-width output gate, sigmoid gate bounded below by -5: 0-2,4-6,8-10,12-14,16-18,20-22",
-    "dense situ layer: ff 12032: 0",
-    "chart-constrained hyper-connections of 4 streams, collapse Mean: 0-24",
-    "router: sigmoid, 128 experts, top 6, with a selection bias: 1-24",
-    "routed experts of situ: 1-24",
-    "shared expert of situ: 1-24",
-    "latent attention 512 x rope 0, absorbed qk 192 / v 128: 3,7,11,15,19,23-24",
-    "latent attention with 64 unrotated key values beside the latent, shared by every head: 3,7,11,15,19,23-24",
-    "latent attention output gate: sigmoid of its own projection: 3,7,11,15,19,23-24",
-    "f16 weights: 0-24",
-    "f16 mixer matrices (attention, Mamba-2 or delta rule): 0-2,4-6,8-10,12-14,16-18,20-22",
-    "q8_0 routed experts: 1-2,5,8,11,14,17,20-24",
-    "q5_0 routed experts: 3-4,6-7,9-10,12-13,15-16,18-19",
-    "a layer program for raon1",
-];
+// PIN(2026-10-21): the coverage check lists nothing for the Q4_K_M file: the Raon body's program
+// runs every kind it names (the delta rule's gates, `situ`, the router, the latent attention with its
+// unrotated values and output gate, the four-stream chart mix, the f16 and q8_0/q5_0 tensors).
+const COVERAGE: &[&str] = &[];
 
 #[test]
 #[ignore = "needs the Raon-1-mini-preview Q4_K_M file on the box"]

@@ -122,24 +122,16 @@ mod tests {
         assert_eq!(kv.bytes(0..6, 64), 4 * 41_248 + 2 * 5_120);
     }
 
-    /// The file is described whatever the coverage holds, and refused by the program's absence
-    /// until a body runs it: the plan names the missing layer program, and a context of no
-    /// position or a tier card is refused first by its own name.
+    /// The file is described whatever the coverage holds, and the body's program plans it; a
+    /// context of no position is refused by its own name, and the read still refuses the small
+    /// header through the coverage check (its widths are not Raon's).
     #[test]
-    fn the_plan_waits_for_a_program() {
+    fn the_described_file_plans_on_the_body() {
         let inputs = described("raon1-place-program");
         let machine = workstation::plan_gate(6);
         let levers = PlanLevers::default();
-        match inputs.plan(&machine, 64, &levers) {
-            Err(PlaceError::Placement(PlacementError::Unimplemented(items))) => {
-                assert!(
-                    items
-                        .iter()
-                        .any(|u| u.feature.contains("a layer program for raon1")),
-                    "{items:?}"
-                );
-            }
-            other => panic!("{other:?}, not the missing program"),
+        if let Err(e) = inputs.plan(&machine, 64, &levers) {
+            panic!("{e:?}, not a plan on the body");
         }
         assert!(matches!(
             inputs.plan(&machine, 0, &levers),

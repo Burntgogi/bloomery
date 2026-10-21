@@ -218,23 +218,31 @@ mod tests {
         assert_eq!(spec.chat.reasoning, Some(models::ReasoningFormat::THINK));
     }
 
-    /// Only what no program runs is listed: the delta rule's erase and write gates, the
-    /// unrotated latent values and the latent output gate, `situ`, the hyper-connection chart and
-    /// the program itself. Each is a coverage item, so a load refuses the file by name rather than
-    /// running it wrong. The pre-tokenizer `raon` and the tool-call parser are not among them.
+    /// The body runs every kind the file names, so only the small header's widths are listed:
+    /// each kind's coverage row holds Raon's own widths, and a file of other widths is refused by
+    /// name rather than run wrong. The kinds themselves (the unrotated latent values, the latent
+    /// output gate, the layer program), the pre-tokenizer `raon` and the tool-call parser are not
+    /// among them. Mutant: `Program::Raon1Body` left out of a kind's row lists that kind.
     #[test]
-    fn what_no_program_runs_is_listed() {
+    fn only_the_small_widths_are_listed() {
         let (_, items) = read("raon1-coverage");
         let listed = |needle: &str| items.iter().any(|f| f.contains(needle));
         for needle in [
-            "delta rule RDA",
-            "unrotated key values",
-            "latent attention output gate",
-            "situ",
+            "delta rule RDA: d 16",
+            "dense situ layer: ff 48",
             "chart-constrained hyper-connections of 3 streams",
-            "a layer program for raon1",
+            "latent attention 32 x rope 0",
+            "router: sigmoid, 8 experts",
+            "shared expert, ff 24",
         ] {
             assert!(listed(needle), "{needle:?} not listed: {items:#?}");
+        }
+        for needle in [
+            "unrotated key values",
+            "latent attention output gate",
+            "a layer program for raon1",
+        ] {
+            assert!(!listed(needle), "{needle:?} listed: {items:#?}");
         }
         assert!(!listed("pre-tokenizer"), "{items:#?}");
         assert!(!listed("tool-call parser"), "{items:#?}");
