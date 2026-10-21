@@ -422,7 +422,7 @@ class CacheOptions(unittest.TestCase):
             self.assertIn("tee:", audit)
 
     def test_wrapper_missing_and_directory_caches(self):
-        for script in WRAPPERS:
+        for script in (*WRAPPERS, "build-dump-draft.sh"):
             for side in ("reference", "candidate"):
                 for state in (None, "directory"):
                     with self.subTest(wrapper=script, side=side, state=state):
@@ -431,7 +431,7 @@ class CacheOptions(unittest.TestCase):
                         fixture.cache(fixture.candidate, state if side == "candidate" else SELECTED)
                         result = fixture.wrapper(script)
                         self.wrapper_events(fixture, result, 2, f"{script}-{side}-{state}")
-                        reference = Path("/home/user/ik-idxkey") if script == "build-ik-mimo2.sh" else fixture.reference
+                        reference = fixture.reference if script == "build-ik-cand.sh" else Path("/home/user/ik-idxkey")
                         tree = reference if side == "reference" else fixture.candidate
                         self.context(result, script.removesuffix(".sh"), tree / "build/CMakeCache.txt")
 
@@ -455,18 +455,6 @@ class CacheOptions(unittest.TestCase):
         result = fixture.wrapper("build-dump-draft.sh")
         self.wrapper_events(fixture, result, 2, "draft-failed-cache-sorts")
         self.context(result, "build-dump-draft", Path("/home/user/ik-idxkey/build/CMakeCache.txt"))
-
-    def test_draft_missing_and_directory_caches(self):
-        for side in ("reference", "candidate"):
-            for state in (None, "directory"):
-                with self.subTest(side=side, state=state):
-                    fixture = self.fixture()
-                    fixture.cache(fixture.reference, state if side == "reference" else SELECTED)
-                    fixture.cache(fixture.candidate, state if side == "candidate" else SELECTED)
-                    result = fixture.wrapper("build-dump-draft.sh")
-                    self.wrapper_events(fixture, result, 2, f"draft-{side}-{state}")
-                    tree = Path("/home/user/ik-idxkey") if side == "reference" else fixture.candidate
-                    self.context(result, "build-dump-draft", tree / "build/CMakeCache.txt")
 
     def test_draft_strict_comparison(self):
         for name, reference, candidate, expected, _ in self.comparison_cases():
