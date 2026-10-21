@@ -20,9 +20,9 @@ import typing
 
 _REACH_LOADED_CODE = sys._getframe().f_code
 
-VERSION = 1
+VERSION = 2
 STATE = ("idents", "lib_root", "lib_roots", "_mods", "_bases", "_macros", "_exported", "_text",
-         "_resolved", "_traits", "ids", "nodes", "adj", "file_root", "builds", "_rules", "_own_rules",
+         "_traits", "ids", "nodes", "adj", "file_root", "builds", "_rules", "_own_rules",
          "_dispatch", "_rows_nodes", "_enum_nodes", "_family_dirs", "_facts")
 
 
@@ -283,7 +283,6 @@ def _validate(state, tree, module):
         "_dispatch": dict[root, module.Dispatch], "_rows_nodes": dict[int, module.Dispatch],
         "_enum_nodes": frozenset[int], "_family_dirs": tuple[str, ...],
         "_facts": dict[tuple[str, bool], module.RustFacts],
-        "_resolved": dict[tuple, list],
     }
     for key, annotation in schemas.items():
         if not _typed(state[key], annotation):
@@ -293,14 +292,6 @@ def _validate(state, tree, module):
             raise ValueError("invalid Reach fact provenance")
         if not _typed(facts.binds, tuple[tuple[mod, mod, str, bool], ...]) or not _typed(facts.exported, frozenset[str]):
             raise ValueError("invalid Reach import facts")
-    for key, values in state["_resolved"].items():
-        if not key or key[0] not in ("path", "item", "module") or key[1] not in roots:
-            raise ValueError("invalid Reach resolver identity")
-        if key[0] == "module":
-            if not _typed(values, list[tuple[root, mod]]) or any(r not in roots for r, _ in values):
-                raise ValueError("invalid Reach module resolution")
-        elif not _typed(values, list[hit]):
-            raise ValueError("invalid Reach item resolution")
     for f, text in state["_text"].items():
         if not f.endswith("/<doctests>.rs"):
             with open(os.path.join(tree.root, f), encoding="utf-8", errors="replace") as fh:
@@ -386,10 +377,6 @@ def _validate(state, tree, module):
             for name, hits in state["_macros"][rk].items()}
         if names != expected:
             raise ValueError("invalid Reach exported macro index")
-    for values in state["_resolved"].values():
-        for value in values:
-            if len(value) == 3 and value not in ids:
-                raise ValueError("invalid Reach resolved unit index")
     for values in state["_traits"].values():
         if any(h not in ids for h, _, _ in values):
             raise ValueError("invalid Reach trait unit index")
@@ -424,6 +411,9 @@ def prepare(reach):
         if _identity(tree) != identity or _corpus(tree) != corpus or not _holds(tree, payload["observed"]):
             raise module.RecipeError("source tree changed during reach cache validation")
         reach.__dict__.update(state)
+        # Resolver results are a recomputable per-analysis memo, not structural graph state.
+        # Discard any eager results made before this validated snapshot was installed.
+        reach._resolved.clear()
         reach._key_identity, reach._key_snapshot, reach._key_observed = identity, corpus, payload["observed"]
         return
     except (OSError, ValueError, TypeError, KeyError, IndexError, AttributeError, RecursionError):
