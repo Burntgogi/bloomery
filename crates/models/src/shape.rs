@@ -301,6 +301,16 @@ pub const ROUTERS: &[RouterInst] = &[
         top_k_max: 4,
         at: "gpu-deepseek41/src/router.rs sigmoid_128_4_router*",
     },
+    // Raon-1's router: the second pick count at 128 experts.
+    RouterInst {
+        body: RouterBody::BiasedSigmoid,
+        rule: BIASED_SIGMOID,
+        norm_arg: false,
+        experts: 128,
+        top_k_min: 6,
+        top_k_max: 6,
+        at: "gpu/src/arch/raon1/ffn.rs sigmoid_128_6_router*",
+    },
 ];
 
 /// Why a shape has no instance.
@@ -434,19 +444,25 @@ pub fn select_router(s: MoeShape) -> Result<RouterInst, ShapeRefused> {
     if rule.is_empty() {
         return Err(refuse(Refusal::NoRouterRule));
     }
-    let Some(row) = rule.iter().find(|r| r.experts() == s.experts) else {
-        return Err(refuse(Refusal::RouterWidth {
-            served: rule.iter().map(|r| r.experts()).collect(),
-        }));
+    let width: Vec<&&RouterInst> = rule.iter().filter(|r| r.experts() == s.experts).collect();
+    let Some(first) = width.first() else {
+        let mut served: Vec<u32> = Vec::new();
+        for e in rule.iter().map(|r| r.experts()) {
+            if !served.contains(&e) {
+                served.push(e);
+            }
+        }
+        return Err(refuse(Refusal::RouterWidth { served }));
     };
-    let max = row.top_k_max.min(row.experts());
-    if !(row.top_k_min..=max).contains(&s.top_k) {
-        return Err(refuse(Refusal::TopK {
-            min: row.top_k_min,
-            max,
-        }));
+    // A width may hold one row a pick count its instances compile.
+    let holds = |r: &RouterInst| (r.top_k_min..=r.top_k_max.min(r.experts())).contains(&s.top_k);
+    match width.iter().find(|r| holds(r)) {
+        Some(row) => Ok(***row),
+        None => Err(refuse(Refusal::TopK {
+            min: first.top_k_min,
+            max: first.top_k_max.min(first.experts()),
+        })),
     }
-    Ok(**row)
 }
 
 /// Body `body`'s row at `experts`: the const form a device crate holds
@@ -463,6 +479,27 @@ pub const fn router_row(body: RouterBody, experts: u32) -> RouterInst {
         i += 1;
     }
     panic!("no router row for this body at this width")
+}
+
+/// Body `body`'s row at `experts` whose pick range holds `top_k`: the const
+/// form a device crate holds each (width, pick count) it compiles to, for a
+/// body whose instances fix the pick count. Fails the build when the table
+/// has no such row.
+#[must_use]
+pub const fn router_row_k(body: RouterBody, experts: u32, top_k: u32) -> RouterInst {
+    let mut i = 0;
+    while i < ROUTERS.len() {
+        let r = ROUTERS[i];
+        if body_eq(r.body, body)
+            && r.experts == experts
+            && r.top_k_min <= top_k
+            && top_k <= r.top_k_max
+        {
+            return r;
+        }
+        i += 1;
+    }
+    panic!("no router row for this body at this width and pick count")
 }
 
 /// Whether row `r` is body `body` at `per_lane`, with rule `rule` and the
@@ -751,7 +788,7 @@ pub fn gqa_row(head: u32, group: u32) -> Option<GqaInst> {
 mod tests {
     use super::{
         AttnShape, GQA, GroupRule, LANE_PICKS, MoeShape, ROUTERS, Refusal, RouterInst, RouterRule,
-        Shape, router_row, router_row_is, rules, select_gqa, select_router,
+        Shape, router_row, router_row_is, router_row_k, rules, select_gqa, select_router,
     };
     use crate::{Act, Moe, Router, Score, Shared};
 
@@ -787,6 +824,9 @@ mod tests {
             ("Bolt 368", moe(rules::BIASED_SIGMOID, 368, 9)),
             ("Bolt 432", moe(rules::BIASED_SIGMOID, 432, 9)),
             ("Bolt 496", moe(rules::BIASED_SIGMOID, 496, 9)),
+            // Raon-1's header: expert_count 128, expert_used_count 6, gating
+            // sigmoid, exp_probs_b, weights_norm true.
+            ("Raon-1", moe(rules::BIASED_SIGMOID, 128, 6)),
         ]
     }
 
@@ -855,19 +895,20 @@ mod tests {
                     || r.at.contains("glm5next_router")
                     || r.at.contains("sigmoid_320_8_router")
                     || r.at.contains("sigmoid_128_4_router")
+                    || r.at.contains("sigmoid_128_6_router")
                     || r.at.contains("nemotron_moe_router"),
                 "{}",
                 r.at
             );
         }
         // The rows that carry the body: GLM's and MiMo's, then Bolt's five, then
-        // the 320-expert instance's, then the 128-expert one's.
+        // the 320-expert instance's, then the two 128-expert ones (top 4, top 6).
         let widths: Vec<u32> = ROUTERS
             .iter()
             .filter(|r| super::body_eq(r.body, super::RouterBody::BiasedSigmoid))
             .map(RouterInst::experts)
             .collect();
-        assert_eq!(widths, [288, 256, 240, 304, 368, 432, 496, 320, 128]);
+        assert_eq!(widths, [288, 256, 240, 304, 368, 432, 496, 320, 128, 128]);
         // Coverage's `routes(n, &[BiasedSigmoid])`: the rule's shapes pass at
         // both widths, and a width between them is refused.
         let routes = |s| select_router(s).is_ok_and(|r| r.body == super::RouterBody::BiasedSigmoid);
@@ -918,6 +959,23 @@ mod tests {
         }
         let dflash = select_router(moe(rules::BIASED_SQRT_SOFTPLUS, 128, 3)).expect("dflash");
         assert_eq!(dflash.body, super::RouterBody::Dflash);
+    }
+
+    /// Raon-1's router (128 experts, top 6) is the second `BiasedSigmoid` row
+    /// at 128 beside MiniMax-M3's top 4: the pick count picks the row, the
+    /// const form takes it, and a count neither row holds is refused.
+    #[test]
+    fn sigmoid_128_6_router_is_its_row_beside_128_4() {
+        let rule = rules::BIASED_SIGMOID;
+        let raon = select_router(moe(rule, 128, 6)).expect("no router row at 128/6");
+        assert!(raon.at.contains("sigmoid_128_6_router"), "{}", raon.at);
+        assert!(router_row_is(raon, rule, false, (6, 6)));
+        let mm = select_router(moe(rule, 128, 4)).expect("no router row at 128/4");
+        assert!(mm.at.contains("sigmoid_128_4_router"), "{}", mm.at);
+        assert_eq!(router_row_k(super::RouterBody::BiasedSigmoid, 128, 6), raon);
+        assert_eq!(router_row_k(super::RouterBody::BiasedSigmoid, 128, 4), mm);
+        let x = select_router(moe(rule, 128, 5)).expect_err("128 at top 5");
+        assert!(matches!(x.why, Refusal::TopK { .. }), "{x}");
     }
 
     /// Bolt's routers (top 9) select only Bolt's rows: GLM's and MiMo's
@@ -1022,15 +1080,18 @@ mod tests {
         assert_eq!(MoeShape::of(&m).rule, rules::SOFTMAX_NORM);
     }
 
-    /// Rows are distinct instances: no two rows run one rule at one width.
+    /// Rows are distinct instances: no two rows run one rule at one width
+    /// and one pick count, and one body holds two rows at a width only by
+    /// disjoint pick ranges.
     #[test]
     fn no_two_router_rows_overlap() {
         for (i, a) in ROUTERS.iter().enumerate() {
             for b in &ROUTERS[i + 1..] {
-                let overlap = a.experts == b.experts && (a.runs(b.rule) || b.runs(a.rule));
+                let picks = a.top_k_min <= b.top_k_max && b.top_k_min <= a.top_k_max;
+                let overlap = a.experts == b.experts && (a.runs(b.rule) || b.runs(a.rule)) && picks;
                 assert!(!overlap, "{} and {}", a.at, b.at);
                 assert!(
-                    (a.body, a.experts) != (b.body, b.experts),
+                    !((a.body, a.experts) == (b.body, b.experts) && picks),
                     "{} and {}",
                     a.at,
                     b.at

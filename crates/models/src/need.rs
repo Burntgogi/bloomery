@@ -68,6 +68,12 @@ pub enum Need {
         rope: u32,
         up: LatentUp,
     },
+    /// A latent layer whose cached row carries `width` key values beside the latent that no rope
+    /// turns, shared by every head.
+    LatentPe { width: u32 },
+    /// A latent layer's heads' outputs multiplied by a sigmoid gate a projection of the layer input
+    /// of its own writes.
+    LatentOutGate,
     /// A per-head RMS norm on the latent query.
     QueryHeadNorm,
     /// A compressor writing `width`-value rows.
@@ -139,6 +145,8 @@ pub enum Need {
     /// A dense layer of `ff` values of an activation with a clamped gate and
     /// an offset up path (`swigluoai`).
     SwigluOai { ff: u32 },
+    /// A dense layer of `ff` values of the bounded gate and up activation `situ`.
+    Situ { ff: u32 },
     /// An encoder's value rows RMS-normed per head of `head` values, with no
     /// gain.
     ValueNorm { head: u32 },
@@ -165,6 +173,9 @@ pub enum Need {
     },
     /// Hyper-connections of `streams` streams.
     Hc { streams: u32 },
+    /// Chart-constrained hyper-connections of `streams` streams, every sublayer its own mix, the
+    /// streams collapsed by `collapse`.
+    HcChart { streams: u32, collapse: Collapse },
     /// Gated-residual hyper-connections of `streams` streams through a
     /// `rank`-value bottleneck.
     HcGated { streams: u32, rank: u32 },
@@ -262,6 +273,13 @@ impl fmt::Display for Need {
                     "latent attention {latent} x rope {rope}, absorbed qk {qk} / v {v}"
                 ),
             },
+            Need::LatentPe { width } => write!(
+                f,
+                "latent attention with {width} unrotated key values beside the latent, shared by every head"
+            ),
+            Need::LatentOutGate => {
+                f.write_str("latent attention output gate: sigmoid of its own projection")
+            }
             Need::QueryHeadNorm => f.write_str("the per-head query RMS norm"),
             Need::Compress { width } => write!(f, "a compressor of {width}-value rows"),
             Need::CompressorApe => {
@@ -325,6 +343,18 @@ impl fmt::Display for Need {
                     }
                     Ok(())
                 }
+                DeltaKind::Rda { gate } => {
+                    write!(
+                        f,
+                        "delta rule RDA: d {d}, {v_heads} heads, conv {conv}, erase and write gates apart, full-width output gate"
+                    )?;
+                    match gate {
+                        KdaGate::Sigmoid { lower_bound } => {
+                            write!(f, ", sigmoid gate bounded below by {lower_bound}")
+                        }
+                        KdaGate::Softplus => f.write_str(", softplus gate"),
+                    }
+                }
             },
             Need::Router(MoeShape {
                 rule,
@@ -380,6 +410,7 @@ impl fmt::Display for Need {
             Need::ReluSqr { ff } => write!(f, "squared-ReLU dense layer: ff {ff}"),
             Need::GeGlu { ff } => write!(f, "dense GELU GLU layer: ff {ff}"),
             Need::SwigluOai { ff } => write!(f, "dense swigluoai layer: ff {ff}"),
+            Need::Situ { ff } => write!(f, "dense situ layer: ff {ff}"),
             Need::ValueNorm { head } => {
                 write!(f, "a gainless per-head RMS norm on the values: head {head}")
             }
@@ -406,6 +437,10 @@ impl fmt::Display for Need {
                 "Mamba-2 mixer: inner {d_inner}, state {d_state}, {n_heads} heads, {n_groups} groups, conv {d_conv}"
             ),
             Need::Hc { streams } => write!(f, "hyper-connections of {streams} streams"),
+            Need::HcChart { streams, collapse } => write!(
+                f,
+                "chart-constrained hyper-connections of {streams} streams, collapse {collapse:?}"
+            ),
             Need::HcGated { streams, rank } => write!(
                 f,
                 "gated-residual hyper-connections of {streams} streams, rank {rank}"
@@ -514,6 +549,12 @@ pub fn needs(spec: &ModelSpec) -> Vec<(Need, Option<LayerIdx>)> {
                     rope: a.rope.map_or(0, |r| r.dims),
                     up: a.up,
                 });
+                if a.pe > 0 {
+                    at(Need::LatentPe { width: a.pe });
+                }
+                if a.out_gate == OutGate::Proj {
+                    at(Need::LatentOutGate);
+                }
                 if let Some(c) = &a.compress {
                     at(Need::Compress { width: a.latent });
                     if let Source::Own(own) = c.rows {
@@ -584,6 +625,7 @@ pub fn needs(spec: &ModelSpec) -> Vec<(Need, Option<LayerIdx>)> {
                 Act::ReluSqr => {}
                 Act::GeGlu => at(Need::GeGlu { ff: *ff }),
                 Act::SwigluOai { .. } => at(Need::SwigluOai { ff: *ff }),
+                Act::Situ { .. } => at(Need::Situ { ff: *ff }),
             },
         }
         if layer.residual == Residual::Hc
@@ -592,6 +634,10 @@ pub fn needs(spec: &ModelSpec) -> Vec<(Need, Option<LayerIdx>)> {
             at(match hc.kind {
                 HcKind::Mhc { .. } => Need::Hc {
                     streams: hc.streams,
+                },
+                HcKind::Chart { collapse, .. } => Need::HcChart {
+                    streams: hc.streams,
+                    collapse,
                 },
                 HcKind::Gated { rank } => Need::HcGated {
                     streams: hc.streams,
@@ -651,6 +697,7 @@ pub fn needs(spec: &ModelSpec) -> Vec<(Need, Option<LayerIdx>)> {
             (HcMix::Lagged, Collapse::LastMix) => {}
             (mix, collapse) => model(Need::HcWiring { mix, collapse }),
         },
+        Some(HcKind::Chart { .. }) => {}
         Some(HcKind::Gated { rank }) => model(Need::HcGatedHead { rank }),
         None => {}
     }

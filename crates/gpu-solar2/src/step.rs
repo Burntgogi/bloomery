@@ -301,6 +301,7 @@ impl StepProgram<'_> {
             fa,
             ga,
             beta_raw,
+            write_raw: None,
             f,
             z,
             conv,

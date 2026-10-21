@@ -56,6 +56,12 @@ pub enum Program {
     /// The EmbeddingGemma encoders (`crates/gpu-gemma-embedding2`): one
     /// pass of a dense trunk on a card, no routed experts.
     GemmaEmbedding2Body,
+    /// The raon1 body (`crates/gpu/src/arch/raon1` `Body`): whole-card, its
+    /// RDA layers over the common KDA mixer, its gated latent layers, Raon_mHC's
+    /// streams and SiTU blocks, and routed experts whose gate·up the common card
+    /// leg's K-quant entries read and whose down it reads in the file's blocks
+    /// or, for a Q5_0 stack, in the packed layout ([`resident_down_runs`]).
+    Raon1Body,
 }
 
 /// The program that runs `arch`'s layers; `None` when none does.
@@ -69,6 +75,7 @@ pub fn program_of(arch: Arch) -> Option<Program> {
         Arch::Qwen4Exp => Some(Program::Qwen38Body),
         Arch::MiMo2 => Some(Program::Mimo2Body),
         Arch::MiniMaxM3 => Some(Program::MiniMaxM3Body),
+        Arch::Raon1 => Some(Program::Raon1Body),
         Arch::SolarOpen2 => Some(Program::Solar2Body),
         Arch::NemotronH => Some(Program::NemotronHBody),
         Arch::NemotronHMoe => Some(Program::NemotronHMoeBody),
@@ -94,6 +101,7 @@ impl Program {
             Self::NemotronHBody => "nemotron_h",
             Self::NemotronHMoeBody => "nemotron_h_moe",
             Self::GemmaEmbedding2Body => "gemma-embedding2",
+            Self::Raon1Body => "raon1",
         }
     }
 }
@@ -231,6 +239,20 @@ pub const fn qwen38_down(ty: GgmlType) -> Option<DownEntry> {
     }
 }
 
+/// Whether a whole-file body's card leg runs a routed down of type `ty`: the
+/// common leg's entries ([`kernels::card_down_runs`]) and the Q5_0 one, whose
+/// stack such a body holds in the `pack_q5_0` layout (`CardFormat::Q5_0`) its
+/// `q5_0_gemv_sel` reads. The one owner of the plan's rule and of the load's
+/// admission (`LegStacks::of_resident`).
+#[must_use]
+pub const fn resident_down_runs(ty: GgmlType) -> bool {
+    kernels::card_down_runs(ty)
+        || matches!(
+            kernels::down(ty),
+            Some((DownEntry::Q5_0, DownAct::Q8Blocks32))
+        )
+}
+
 /// The card format every card leg reads a routed stack of `ty` in: NVFP4 in
 /// its planes ([`kernels::card_planes_runs`]: codes, block scales and a tensor
 /// scale an expert), every other type in the file's blocks. A leg's arms say
@@ -289,6 +311,10 @@ pub fn leg_arms(p: Program) -> Option<LegArms> {
             gate_up: |ty| ty == BOLT_LEG,
             down: |ty| ty == BOLT_LEG,
         }),
+        Program::Raon1Body => Some(LegArms {
+            gate_up: kernels::card_gate_up_runs,
+            down: resident_down_runs,
+        }),
         Program::NemotronHBody | Program::GemmaEmbedding2Body => None,
     }
 }
@@ -335,6 +361,10 @@ pub fn routed_rule(p: Program) -> RoutedRule {
             gate_up: bolt_leg_card,
             down: bolt_leg_card,
         },
+        Program::Raon1Body => RoutedRule::Leg {
+            gate_up: |ty| kernels::card_gate_up_runs(ty).then(|| leg_card_format(ty)),
+            down: resident_down_card,
+        },
         // No routed stack: every one is refused by name.
         Program::NemotronHBody | Program::GemmaEmbedding2Body => RoutedRule::PerType(|_| None),
     }
@@ -343,6 +373,16 @@ pub fn routed_rule(p: Program) -> RoutedRule {
 /// The latent MoE body's plan arm: [`BOLT_LEG`], in its card format.
 fn bolt_leg_card(ty: GgmlType) -> Option<CardFormat> {
     (ty == BOLT_LEG).then(|| leg_card_format(ty))
+}
+
+/// The raon1 body's down arm ([`resident_down_runs`]): a Q5_0 stack in the packed
+/// layout its `q5_0_gemv_sel` reads, every other type in the leg's card format.
+fn resident_down_card(ty: GgmlType) -> Option<CardFormat> {
+    if kernels::card_down_runs(ty) {
+        Some(leg_card_format(ty))
+    } else {
+        resident_down_runs(ty).then_some(CardFormat::Q5_0)
+    }
 }
 
 /// The common leg's plan arm: a type both its gate·up and down launches read.
@@ -366,6 +406,7 @@ mod tests {
         Program::MiniMaxM3Body,
         Program::NemotronHBody,
         Program::NemotronHMoeBody,
+        Program::Raon1Body,
     ];
 
     /// Every type the file format names.
@@ -475,6 +516,31 @@ mod tests {
         }
     }
 
+    /// The raon1 body's arms are the common leg's launches and the Q5_0 down: a gate·up of
+    /// [`kernels::card_gate_up_runs`]' types, a down of [`kernels::card_down_runs`]' types or
+    /// Q5_0, the Q5_0 one in the packed layout. Mutant: the Q5_0 arm dropped from the down.
+    #[test]
+    fn raon1_arms_are_the_legs_launches_and_the_packed_q5_0_down() {
+        let arms = leg_arms(Program::Raon1Body).expect("a card leg");
+        let RoutedRule::Leg { gate_up, down } = routed_rule(Program::Raon1Body) else {
+            panic!("a leg rule");
+        };
+        for ty in types() {
+            assert_eq!((arms.gate_up)(ty), kernels::card_gate_up_runs(ty), "{ty} gate·up");
+            assert_eq!(gate_up(ty).is_some(), (arms.gate_up)(ty), "{ty} gate·up rule");
+            assert_eq!(
+                (arms.down)(ty),
+                kernels::card_down_runs(ty) || ty == GgmlType::Q5_0,
+                "{ty} down"
+            );
+            assert_eq!(down(ty).is_some(), (arms.down)(ty), "{ty} down rule");
+        }
+        assert_eq!(down(GgmlType::Q5_0), Some(CardFormat::Q5_0));
+        assert_eq!(down(GgmlType::Q8_0), Some(CardFormat::KQuant));
+        assert_eq!(gate_up(GgmlType::Q4_K), Some(CardFormat::KQuant));
+        assert_eq!(gate_up(GgmlType::Q5_0), None);
+    }
+
     /// Every program's card leg loads a stack it runs by the one format rule
     /// ([`leg_card_format`]): NVFP4 in its planes, every other type in the
     /// file's blocks. Mutant, the defect Qwen3.8's rule had: a leg that loads
@@ -493,6 +559,12 @@ mod tests {
                     continue;
                 };
                 for f in [gate_up(ty), down(ty)].into_iter().flatten() {
+                    // A whole-file body holds its Q5_0 down in the packed layout.
+                    let want = if p == Program::Raon1Body && ty == GgmlType::Q5_0 {
+                        CardFormat::Q5_0
+                    } else {
+                        want
+                    };
                     assert_eq!(f, want, "{p:?} {ty}");
                 }
             }

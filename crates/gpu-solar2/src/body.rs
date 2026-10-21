@@ -447,7 +447,12 @@ fn kda_rule(gate: KdaGate, beta_scale: f32) -> Result<KdaRule, GpuError> {
         KdaGate::Sigmoid { lower_bound } => KdaDecay::Sigmoid { lower_bound },
         KdaGate::Softplus => KdaDecay::Softplus,
     };
-    KdaRule { decay, beta_scale }.check(WHAT)
+    KdaRule {
+        decay,
+        beta_scale,
+        write_gate: false,
+    }
+    .check(WHAT)
 }
 
 /// A GQA layer's description held to what the kernels run: NoPE, no qk

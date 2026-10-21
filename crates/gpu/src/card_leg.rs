@@ -78,6 +78,7 @@ use crate::weights::{DevWeight, Weights};
 use crate::{DeviceTensor, Gpu, GpuError, Q8Act};
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::GgmlType;
+use model::placement::accepts;
 use model::placement::kernels::{self, DownAct, DownEntry, GateUpEntry, GemmEntry, q8_act_bytes};
 
 /// What the leg's errors name.
@@ -223,19 +224,21 @@ const fn q8_blocks32_bytes(cols: usize, k: usize) -> usize {
 }
 
 /// A resident routed stack's device form: the file's blocks as words
-/// (`DevWeight::KQuant`), or NVFP4's planes and its experts' scales
-/// (`DevWeight::Nvfp4Stack`).
+/// (`DevWeight::KQuant`), NVFP4's planes and its experts' scales
+/// (`DevWeight::Nvfp4Stack`), or a Q5_0 down in the `pack_q5_0` layout
+/// (`DevWeight::Q5_0`), which `q5_0_gemv_sel` reads.
 #[derive(Clone, Copy)]
 pub(crate) enum StackW<'a> {
     Words(&'a DeviceTensor<u32>),
     Nvfp4(Nvfp4Stack<'a>),
+    Q5_0(&'a DeviceTensor<u32>),
 }
 
 impl<'a> StackW<'a> {
     /// Rows the stack holds, every expert's.
     pub(crate) fn rows(&self) -> usize {
         match self {
-            StackW::Words(w) => w.rows(),
+            StackW::Words(w) | StackW::Q5_0(w) => w.rows(),
             StackW::Nvfp4(s) => s.qs.rows(),
         }
     }
@@ -252,7 +255,7 @@ impl<'a> StackW<'a> {
             (GemmEntry::Iq4nl, StackW::Words(w)) => RouteW::Blocks32(Gemm32Weight::Iq4NlFile(w)),
             (GemmEntry::Nvfp4, StackW::Nvfp4(s)) => RouteW::Blocks32(Gemm32Weight::Nvfp4Planes(s)),
             (entry, StackW::Words(w)) => RouteW::Grouped(GemmWeight::of_entry(entry)?, w),
-            (_, StackW::Nvfp4(_)) => return None,
+            (_, StackW::Nvfp4(_) | StackW::Q5_0(_)) => return None,
         })
     }
 }
@@ -295,6 +298,12 @@ impl<'a> LegStack<'a> {
                 w: StackW::Words(w),
                 k: *k,
             }),
+            Some(DevWeight::Q5_0 { w, k }) if runs(GgmlType::Q5_0) => Ok(LegStack {
+                name,
+                ty: GgmlType::Q5_0,
+                w: StackW::Q5_0(w),
+                k: *k,
+            }),
             Some(DevWeight::Nvfp4Stack { k, .. }) if planes(GgmlType::NVFP4) => Ok(LegStack {
                 name,
                 ty: GgmlType::NVFP4,
@@ -318,7 +327,15 @@ impl<'a> LegStack<'a> {
     fn words(&self) -> Result<&'a DeviceTensor<u32>, GpuError> {
         match self.w {
             StackW::Words(w) => Ok(w),
-            StackW::Nvfp4(_) => Err(self.unrun()),
+            StackW::Nvfp4(_) | StackW::Q5_0(_) => Err(self.unrun()),
+        }
+    }
+
+    /// The stack's `pack_q5_0` words, for the Q5_0 down entry.
+    fn q5_0(&self) -> Result<&'a DeviceTensor<u32>, GpuError> {
+        match self.w {
+            StackW::Q5_0(w) => Ok(w),
+            StackW::Words(_) | StackW::Nvfp4(_) => Err(self.unrun()),
         }
     }
 
@@ -326,7 +343,7 @@ impl<'a> LegStack<'a> {
     fn planes(&self) -> Result<Nvfp4Stack<'a>, GpuError> {
         match self.w {
             StackW::Nvfp4(s) => Ok(s),
-            StackW::Words(_) => Err(self.unrun()),
+            StackW::Words(_) | StackW::Q5_0(_) => Err(self.unrun()),
         }
     }
 
@@ -367,6 +384,16 @@ impl<'a> LegStacks<'a> {
         const DOWN: &str = "a resident routed down stack of a type a rank's card leg runs \
                             (`kernels::rank_down_runs`)";
         LegStacks::with_downs(w, names, (kernels::rank_down_runs, DOWN))
+    }
+
+    /// [`LegStacks::of`] for a body that loads every tensor in the format
+    /// [`gguf::card::CardFormat::of`] names (`Weights::load`), whose downs may
+    /// also be Q5_0 in the `pack_q5_0` layout ([`accepts::resident_down_runs`]).
+    /// Allocation-free on success.
+    pub fn of_resident(w: &'a Weights, names: [&'a str; 3]) -> Result<LegStacks<'a>, GpuError> {
+        const DOWN: &str = "a resident routed down stack of a type a whole-file body's card leg \
+                            runs (`kernels::card_down_runs` or Q5_0)";
+        LegStacks::with_downs(w, names, (accepts::resident_down_runs, DOWN))
     }
 
     /// The stacks with the down admitted by `downs.0`, refused as `downs.1`.
@@ -721,6 +748,17 @@ impl CardLeg {
                     rows_per_expert,
                 };
                 self.nvfp4.enqueue_down(stream, &d, fault, down)?;
+            }
+            (Some((DownEntry::Q5_0, DownAct::Q8Blocks32)), ActH::Blocks32(act)) => {
+                gpu.q5().enqueue_gemv_q5_0_sel(
+                    stream,
+                    st.down.q5_0()?,
+                    act,
+                    sel,
+                    slots,
+                    rows_per_expert,
+                    down,
+                )?;
             }
             (Some((entry, DownAct::Q8Blocks32)), ActH::Blocks32(act)) => {
                 let run = Sel32Run {

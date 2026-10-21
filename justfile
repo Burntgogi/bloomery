@@ -3421,3 +3421,61 @@ route-trace-chat-q38 OUT PROMPTS='tools/ref/data/d2-prompts-ko.tsv,tools/ref/dat
 [group('v41-load')]
 soak-ds41 MINUTES='30':
     BLOOMERY_MODEL=deepseek41 BLOOMERY_CARD=a6000 ./tools/box.sh 'bash tools/ref/real-only.sh soak-ds41 && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41,vision,gemma-embedding2,hf --release --bin bloomery-serve-ds41 --bin soak_ds41_serve && D=target/soak && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_BOUND=$(( {{MINUTES}} * 60 + 900 )) bash tools/gpu-gate.sh soak_ds41_serve --minutes {{MINUTES}} --dir $D'
+
+# --- raon-ref (Raon-1-mini-preview oracle) -------------------------------------------------------------------------------------------
+
+# Raon-1-mini-preview oracle: raon1_dump (the shared tools/ref/cb_dump.cpp) linked against KRAFTON's llama.cpp branch raon-1-mini-preview
+# at fb895662d (CPU, no patch, /home/user/llama.cpp-raon, whose tracked files must be clean), which this does not rebuild: the tree is
+# built once by tools/ref/raon1-tree.sh (a background job; its header has the command). tools/ref/raon1-dump-build.sh is the call; the
+# binary and its build record land in $BLOOMERY_DATA/bin.
+build-ref-raon1:
+    BLOOMERY_Q_CARD=none BLOOMERY_Q_PRED_S=60 BLOOMERY_MODEL=raon1 ./tools/box.sh 'bash tools/ref/raon1-dump-build.sh'
+
+# The Raon-1-mini-preview oracle sets (refset family lcpp-raon1; tools/ref/raon1-dump.sh has the layout and the taps): the vendor branch
+# on the CPU over the four prompts of tools/ref/data/raon1 from one load of the Q4_K_M file, into $BLOOMERY_DATA/ref_raon1_{a,b,c,d}: each
+# layer's taps for a, each layer output and the router's expert ids for b and c, the last logits row for d, the top-40 logprobs and 32
+# greedy tokens for a, b and c. Predicted wall 1-5 min, under the CPU lease and its card
+# (BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/raon1-dump.card'); DUMP_DRY=1 in that variable prints the dump and stops before the
+# lease. The file has no fixture yet: BLOOMERY_TIER=fixture is refused by name.
+dump-ref-raon1:
+    BLOOMERY_Q_CARD=none BLOOMERY_Q_PRED_S=240 BLOOMERY_MODEL=raon1 ./tools/box.sh 'bash tools/ref/raon1-dump.sh'
+
+# --- end raon-ref ---
+
+# --- raon-body (Raon-1-mini chain) ---------------------------------------------------------------------------------------------------
+
+# Raon-1-mini end-to-end gate (gate_raon1_e2e's doc): the whole step on one card (RDA and gated latent layers, Raon_mHC's four streams,
+# the dense and routed SiTU blocks), one prompt id a step, against the vendor branch's sets (refset family lcpp-raon1, `just
+# dump-ref-raon1`): on each of the English, Korean and Rust sets the argmax after the prompt and the 32-token greedy continuation id for
+# id. The file has no fixture yet, so the gate runs in the real tier only.
+gate-gpu-raon1-e2e:
+    BLOOMERY_MODEL=raon1 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-raon1-e2e && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_raon1_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_raon1_e2e'
+
+# --- end raon-body ---
+
+# --- raon-attn (Raon-1-mini attention layers) ------------------------------------------------------------------------------------------
+
+# Raon-1's RDA step (conv prep, write gate, KDA delta) and gated latent attention (`raon1::mla::attend`) on the card at the model's
+# shapes against the HF model in f64 (gate_raon1_attn's doc), seeded inputs, no model file; each with an in-gate separation.
+gate-gpu-raon1-attn:
+    ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_raon1_attn && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_raon1_attn'
+
+# --- end raon-attn ---
+
+# --- raon-model ---
+# raon1 (Raon-1-mini-preview) header gate: the reader's refusals on synthetic headers (a latent layer read as delta, a head
+# count of 2, a missing or off-width latent row, the hyper-connection mix of another width, a tensor of the other kind), the
+# common KDA, noaux and hybrid-plan owners it reads through, then the description of the Q4_K_M file: the delta and latent
+# layer lines, the keys left unread, the tensors by role and type, the coverage list and the stores of the layers. The lib
+# half is what runs the synthetic refusals; the test half is the file under /models. Headers only, seconds.
+gate-raon1-meta:
+    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::raon1 arch::kda arch::noaux arch::classify arch::place_hybrid arch::solar2 arch::glm5next --nocapture && bash tools/gate.sh --release -p bloomery-model --test raon1_meta -- --ignored --nocapture'
+
+# The raon vocabulary: our ids equal the reference tree's `llama-tokenize` on every case of crates/tokenizer/tests/cases.txt and
+# cases-raon.txt, in both parse modes (the pins are tests/raon-ids.tsv, written by crates/tokenizer/tools/raon-oracle.sh from the
+# krafton-ai llama.cpp tree whose pre-tokenizer `raon` and NFC normalizer exist there only), and the header's two end tokens end
+# generation. The vocabulary only: seconds.
+gate-raon1-tokenizer:
+    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-tokenizer --lib --test raon -- --include-ignored --nocapture'
+
+# --- end raon-model ---

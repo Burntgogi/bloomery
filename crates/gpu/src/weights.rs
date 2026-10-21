@@ -868,6 +868,51 @@ impl Weights {
         self.by_name.remove(name)
     }
 
+    /// Re-upload the resident file tensor `name` of `split` in `format`, a
+    /// layout its type has ([`CardFormat::holds`]): for a body loaded by
+    /// [`Weights::load`] whose routed card entry reads a stack in another
+    /// layout than [`CardFormat::of`] names (a Q8_0 down's file blocks as
+    /// words). The resident form is freed before the upload. A name not
+    /// resident or not in the file, a format the type has not and a type whose
+    /// values a tensor scale multiplies are refused by name. Load-time only.
+    pub fn relayout(
+        &mut self,
+        stream: &CudaStream,
+        split: &Split,
+        name: &str,
+        format: CardFormat,
+    ) -> Result<(), GpuError> {
+        const WHAT: &str = "Weights::relayout";
+        let (shard, t) = split
+            .find(name)
+            .ok_or_else(|| GpuError::tensor(WHAT, name, "a tensor of the file"))?;
+        if !format.holds(t.ty) || t.ty.reads_scale() {
+            let detail = format!("tensor {name} of {} has no {format:?} layout here", t.ty);
+            return Err(GpuError::shape(WHAT, detail));
+        }
+        let gguf = split
+            .shard(shard)
+            .ok_or_else(|| GpuError::tensor(WHAT, name, "a shard the split holds"))?;
+        let src = gguf.data(t)?;
+        if self.by_name.remove(name).is_none() {
+            return Err(GpuError::tensor(WHAT, name, "a resident weight"));
+        }
+        let mut ring = UploadRing::new(stream, upload_budget(t))?;
+        let dw = upload_rows(
+            stream,
+            &mut ring,
+            WHAT,
+            format,
+            t,
+            tensor_rows(t),
+            &[src],
+            None,
+        )?;
+        ring.finish(stream)?;
+        self.by_name.insert(name.to_owned(), dw);
+        Ok(())
+    }
+
     /// The resident weight `name`, refused by name as `what`'s when absent.
     pub fn resident(&self, what: &'static str, name: &str) -> Result<&DevWeight, GpuError> {
         self.get(name)

@@ -474,6 +474,9 @@ fn delta_shape(d: &DeltaRule) -> Result<LinearShape, String> {
         DeltaKind::Kda { .. } => {
             return Err("a Kimi delta rule, which no kernel here runs".into());
         }
+        DeltaKind::Rda { .. } => {
+            return Err("a Raon delta rule, which no kernel here runs".into());
+        }
     };
     let shape = LinearShape {
         n_k: d.k_heads as usize,

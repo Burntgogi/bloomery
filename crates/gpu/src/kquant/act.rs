@@ -1,11 +1,12 @@
 //! The activation rules a gate·up kernel of this family applies to a row's
 //! two sums: `silu_mul` (`elem::silu_mul`, the reference's scalar SwiGLU
-//! with the device `expf`), ik's clamped SwiGLU [`swiglu_clamp`] and the
+//! with the device `expf`), ik's clamped SwiGLU [`swiglu_clamp`], the
 //! gpt-oss / MiniMax SwiGLU [`swiglu_oai`], whose exponentials are
 //! transcriptions of ik's AVX2 `v_expf` and so round the same on the device
-//! and the host. `silu_mul` differs from the other two in its exponential,
-//! and the clamp from the OAI form in where the limit bites, so they are
-//! three rules, picked per launch by [`Act`].
+//! and the host, and SiTU-GLU [`situ`] (Raon-1, Kimi-K3: both branches
+//! bounded by a scaled tanh). `silu_mul` differs from the clamp and the OAI
+//! form in its exponential, and the clamp from the OAI form in where the
+//! limit bites, so they are four rules, picked per launch by [`Act`].
 //!
 //! V4.1 kernels share these rules and the non-finite sum check. Gate-up
 //! entries use [`apply_checked`] before writing their rows.
@@ -28,6 +29,11 @@ pub enum Act {
     /// rule's `alpha` is [`SWIGLU_OAI_ALPHA`], the one value the references
     /// run; any other is refused by [`Act::code`].
     SwigluOai { alpha: f32, limit: f32 },
+    /// SiTU-GLU at `beta` on the gate and `linear_beta` on the up sum
+    /// ([`situ`]). The device rule's `linear_beta` is [`SITU_LINEAR_BETA`],
+    /// the one value the references run; any other is refused by
+    /// [`Act::code`].
+    Situ { beta: f32, linear_beta: f32 },
 }
 
 /// The device code of [`Act::SiluMul`].
@@ -36,12 +42,18 @@ pub const ACT_SILU_MUL: u32 = 0;
 pub const ACT_SWIGLU_CLAMP: u32 = 1;
 /// The device code of [`Act::SwigluOai`].
 pub const ACT_SWIGLU_OAI: u32 = 2;
+/// The device code of [`Act::Situ`].
+pub const ACT_SITU: u32 = 3;
 /// The largest rule code a kernel's launch contract admits.
-pub const ACT_MAX: u32 = ACT_SWIGLU_OAI;
+pub const ACT_MAX: u32 = ACT_SITU;
 
 /// `alpha` of [`swiglu_oai`]: the reference graph's `constexpr float alpha =
 /// 1.702f` (llama.cpp `build_moe_ffn`, ik's `k_swiglu_oai_alpha`).
 pub const SWIGLU_OAI_ALPHA: f32 = 1.702;
+
+/// `linear_beta` of [`situ`]: the file's `activation.situ_linear_beta`
+/// (Raon-1's), the one value the device rule takes.
+pub const SITU_LINEAR_BETA: f32 = 25.0;
 
 impl Act {
     /// The kernel's `(act, limit)` arguments, for the launcher `what`: a rule
@@ -76,13 +88,28 @@ impl Act {
                      0, got alpha {alpha}, limit {limit}"
                 ),
             )),
+            Act::Situ { beta, linear_beta }
+                if linear_beta.to_bits() == SITU_LINEAR_BETA.to_bits()
+                    && beta.is_finite()
+                    && beta > 0.0 =>
+            {
+                Ok((ACT_SITU, beta))
+            }
+            Act::Situ { beta, linear_beta } => Err(GpuError::shape(
+                what,
+                format!(
+                    "situ runs at linear beta {SITU_LINEAR_BETA} and a finite positive beta, got \
+                     beta {beta}, linear beta {linear_beta}"
+                ),
+            )),
         }
     }
 }
 
 /// The rule of code `act` on a row's gate sum `g` and up sum `u`: the
 /// launcher passes one of the codes of [`Act::code`], and `limit` only with
-/// [`ACT_SWIGLU_CLAMP`] and [`ACT_SWIGLU_OAI`].
+/// [`ACT_SWIGLU_CLAMP`] and [`ACT_SWIGLU_OAI`] (the limit) and [`ACT_SITU`]
+/// (the gate's beta).
 #[inline(always)]
 #[must_use]
 pub fn apply(act: u32, limit: f32, g: f32, u: f32) -> f32 {
@@ -90,9 +117,24 @@ pub fn apply(act: u32, limit: f32, g: f32, u: f32) -> f32 {
         swiglu_clamp(g, u, limit)
     } else if act == ACT_SWIGLU_OAI {
         swiglu_oai(g, u, limit)
+    } else if act == ACT_SITU {
+        situ(g, u, limit, SITU_LINEAR_BETA)
     } else {
         silu_mul(g, u)
     }
+}
+
+/// SiTU-GLU for one row: `beta·tanh(g/beta)·σ(g) · lb·tanh(u/lb)`, in the
+/// reference's op order (llama.cpp `build_situ`: each scale by the f32
+/// reciprocal, the tanh, the scale back, then the products), σ ik's form
+/// with [`expf_ik`] and the tanh libdevice's (the host's differs by ulps).
+#[inline(always)]
+#[must_use]
+pub fn situ(g: f32, u: f32, beta: f32, linear_beta: f32) -> f32 {
+    let a = (g * (1.0 / beta)).tanh() * beta;
+    let s = 1.0 / (1.0 + expf_ik(0.0 - g));
+    let v = (u * (1.0 / linear_beta)).tanh() * linear_beta;
+    (a * s) * v
 }
 
 /// Apply the rule only to finite gate and up sums. Otherwise raise

@@ -197,3 +197,7 @@ crates/gpu-gates/src/record.rs	solar	4	PIN(2026-10-20) solar: a seat's load and 
 crates/gpu/src/fault.rs	solar	2	PIN(2026-10-20) solar: the fault table is per architecture by design: the `SOLAR2` step order and its `step_order::of` arm
 crates/gpu-gates/src/bin/tier_server.rs	solar	2	PIN(2026-10-21) solar: the tier server's family list is one `#[cfg(feature)]` arm a family, as deepseek's and glm's rows above; a registry of node families built from the features would own the list instead
 crates/gpu/src/fault.rs	minimax	2	PIN(2026-10-21) minimax: the fault table is per architecture by design: the `MINIMAXM3` step order and its `step_order::of` arm
+crates/model/src/arch/mod.rs	raon	1	PIN(2026-10-21) raon: the family's module declaration (`pub mod raon1;`); the module list is not a registry, so each family declares its directory here until the registry owns the modules
+crates/models/src/lib.rs	raon	2	PIN(2026-10-21) raon: ModelSpec.arch names the family by an enum variant and its name arm; the variant stays until ModelSpec carries the registry's name instead
+crates/placement/src/accepts.rs	raon	1	PIN(2026-10-21) raon: program_of matches every models::Arch exhaustively, so the variant needs an arm; None until the family's body adds its Program
+crates/gpu-gates/src/bin/shared/routed_legs.rs	raon	2	PIN(2026-10-21) raon: family_of and skip_of match every models::Arch exhaustively; the family has no routed-legs adapter until its body exists

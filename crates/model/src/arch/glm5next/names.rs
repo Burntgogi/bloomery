@@ -7,8 +7,10 @@
 use crate::arch::names::blk;
 
 pub use crate::arch::names::{
-    ffn_down_shexp, ffn_gate_shexp, ffn_up_shexp, indexer_k_norm, output, output_norm, ssm_a,
-    ssm_beta, ssm_conv1d, ssm_dt_bias, ssm_f_a, ssm_f_b, ssm_g_a, ssm_g_b, ssm_norm, token_embd,
+    Sub, attn_k_b, attn_kv_a_mqa, attn_kv_a_norm, attn_q_a, attn_q_a_norm, attn_q_b, attn_v_b,
+    ffn_down_shexp, ffn_gate_shexp, ffn_up_shexp, hc_base, hc_fn, hc_scale, indexer_k_norm, output,
+    output_norm, ssm_a, ssm_beta, ssm_conv1d, ssm_dt_bias, ssm_f_a, ssm_f_b, ssm_g_a, ssm_g_b,
+    ssm_norm, token_embd,
 };
 
 /// The mixer's RMS gain, both kinds.
@@ -47,34 +49,6 @@ pub fn ssm_conv1d_qkv(l: usize) -> String {
 }
 
 // ------------------------------------------------------------- latent
-
-pub fn attn_q_a(l: usize) -> String {
-    blk(l, "attn_q_a.weight")
-}
-
-pub fn attn_q_a_norm(l: usize) -> String {
-    blk(l, "attn_q_a_norm.weight")
-}
-
-pub fn attn_q_b(l: usize) -> String {
-    blk(l, "attn_q_b.weight")
-}
-
-pub fn attn_kv_a_mqa(l: usize) -> String {
-    blk(l, "attn_kv_a_mqa.weight")
-}
-
-pub fn attn_kv_a_norm(l: usize) -> String {
-    blk(l, "attn_kv_a_norm.weight")
-}
-
-pub fn attn_k_b(l: usize) -> String {
-    blk(l, "attn_k_b.weight")
-}
-
-pub fn attn_v_b(l: usize) -> String {
-    blk(l, "attn_v_b.weight")
-}
 
 pub fn indexer_attn_k(l: usize) -> String {
     blk(l, "indexer.attn_k.weight")
@@ -145,35 +119,6 @@ pub fn ffn_down_exps(l: usize) -> String {
 }
 
 // ---------------------------------------------------- hyper-connections
-
-/// The sub-layer a hyper-connection mix feeds: the mixer or the
-/// feed-forward block.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Sub {
-    Attn,
-    Ffn,
-}
-
-impl Sub {
-    fn stem(self) -> &'static str {
-        match self {
-            Sub::Attn => "attn",
-            Sub::Ffn => "ffn",
-        }
-    }
-}
-
-pub fn hc_fn(l: usize, sub: Sub) -> String {
-    blk(l, &format!("hc_{}_fn.weight", sub.stem()))
-}
-
-pub fn hc_scale(l: usize, sub: Sub) -> String {
-    blk(l, &format!("hc_{}_scale.weight", sub.stem()))
-}
-
-pub fn hc_base(l: usize, sub: Sub) -> String {
-    blk(l, &format!("hc_{}_base.weight", sub.stem()))
-}
 
 // ------------------------------------------------------- the next-token layer
 

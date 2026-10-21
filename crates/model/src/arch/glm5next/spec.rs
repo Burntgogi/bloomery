@@ -13,8 +13,8 @@
 use gguf::Split;
 use models::{
     Act, Arch, Collapse, DeltaKind, DeltaRule, Ffn, HcKind, HcMix, HcSpec, KdaGate, Latent,
-    LatentOut, LatentUp, LayerSpec, Mixer, ModelSpec, Moe, PoolRule, ReasoningFormat, Residual,
-    Router, Score, Selector, Shared, ToolFormat,
+    LatentOut, LatentUp, LayerSpec, Mixer, ModelSpec, Moe, OutGate, PoolRule, ReasoningFormat,
+    Residual, Router, Score, Selector, Shared, ToolFormat,
 };
 
 use super::hparams::{Hparams, Kind};
@@ -73,6 +73,8 @@ pub fn spec_of(
                 },
                 rope: None,
                 q_head_norm: false,
+                pe: 0,
+                out_gate: OutGate::None,
                 out: LatentOut::Plain,
                 window: None,
                 sinks: false,

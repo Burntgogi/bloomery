@@ -2,7 +2,8 @@
 //! runs them: [`Pre::DeepseekV3`] (`deepseek-v3`, `hunyuan-dense`,
 //! `joyai-llm`), [`Pre::Qwen2`] (`qwen2`, `solar-open`), [`Pre::Glm4`] (`glm4`),
 //! [`Pre::Qwen35`] (`qwen35`), [`Pre::Pixtral`] (`pixtral`),
-//! [`Pre::MiniMaxM2`] (`minimax-m2`) and [`Pre::Gemma4`] (`gemma4`).
+//! [`Pre::MiniMaxM2`] (`minimax-m2`), [`Pre::Gemma4`] (`gemma4`) and
+//! [`Pre::Raon`] (`raon`).
 //!
 //! ## deepseek-v3
 //!
@@ -118,6 +119,18 @@
 //! here ([`match_minimax_m2`]). Past the words the alternatives are qwen2's, but
 //! the symbol run's tail is `[\r\n/]*`, a slash as well as the newlines. The
 //! reference sets `clean_spaces` false for this name; this crate cleans no spaces.
+//!
+//! ## raon
+//!
+//! One regex, which the reference runs as the hand-written
+//! `unicode_regex_split_custom_raon` (and which its `std::regex` form would split alike but for
+//! the one-codepoint piece a position no alternative matches becomes): a run of Han, hiragana and
+//! katakana (`U+4E00..U+9FA5`, `U+3040..U+30FF`) behind an optional space; a run of letters that
+//! are none of those, each with its marks, whose words a single space may join; digits cut into
+//! words of three from the run's end, the first one the shorter; a run of punctuation behind an
+//! optional space with the newlines and slashes after it; a run of whitespace ending in a
+//! newline; a whitespace run but its last space when a word follows. The reference applies NFC
+//! before this ([`Pre::nfc`]). [`split_raon`] is that function line for line.
 //!
 //! ## gemma4
 //!
@@ -462,11 +475,14 @@ pub(crate) enum Pre {
     MiniMaxM2,
     /// `gemma4`: runs of newlines and runs of the rest, over metaspace text.
     Gemma4,
+    /// `raon`: the reference's hand-written splitter with the CJK run, the letter run joined by
+    /// single spaces and the digits in threes from the end; the text is NFC-normalized first.
+    Raon,
 }
 
 impl Pre {
     /// The names this crate runs, as `tokenizer.ggml.pre` spells them.
-    pub(crate) const NAMES: [(&'static str, Pre); 10] = [
+    pub(crate) const NAMES: [(&'static str, Pre); 11] = [
         ("deepseek-v3", Pre::DeepseekV3),
         ("hunyuan-dense", Pre::DeepseekV3),
         ("joyai-llm", Pre::DeepseekV3),
@@ -477,12 +493,26 @@ impl Pre {
         ("pixtral", Pre::Pixtral),
         ("minimax-m2", Pre::MiniMaxM2),
         ("gemma4", Pre::Gemma4),
+        ("raon", Pre::Raon),
     ];
 
     /// Whether a word that is itself a vocabulary token is taken whole,
     /// before merges. Any pre can carry it; `pixtral` does.
     pub(crate) fn ignore_merges(self) -> bool {
         matches!(self, Pre::Pixtral)
+    }
+
+    /// Whether the reference NFC-normalizes the text before this pre-tokenizer whatever the
+    /// header's normalizer says: the Hugging Face tokenizer of `raon` applies it.
+    pub(crate) fn nfc(self) -> bool {
+        matches!(self, Pre::Raon)
+    }
+
+    /// Whether the text is decoded by the newer reference's strict UTF-8 reader before its NFC step
+    /// (`unicode::decode_strict`): an overlong form is not a codepoint there. The older readers' tree
+    /// accepts it.
+    pub(crate) fn strict_utf8(self) -> bool {
+        matches!(self, Pre::Raon)
     }
 
     /// Whether BPE runs as Hugging Face's does ([`crate::bpe::Bpe::new`]).
@@ -500,7 +530,8 @@ impl Pre {
             | Pre::Qwen35
             | Pre::Qwen35Hf
             | Pre::Pixtral
-            | Pre::MiniMaxM2 => Spelling::ByteLevel,
+            | Pre::MiniMaxM2
+            | Pre::Raon => Spelling::ByteLevel,
         }
     }
 }
@@ -531,6 +562,89 @@ pub(crate) fn split<'s>(pre: Pre, cpts: &[u32], s: &'s mut Scratch) -> &'s [usiz
             split_newlines(cpts, &mut s.b);
             &s.b
         }
+        Pre::Raon => {
+            split_raon(cpts, &s.collapsed, &mut s.b);
+            &s.b
+        }
+    }
+}
+
+/// `unicode_regex_split_custom_raon` over one fragment: `cpts` its codepoints, `c` their
+/// collapsed bytes; the words' lengths go to `out`. Each branch is the reference's, in its order.
+fn split_raon(cpts: &[u32], c: &[u8], out: &mut Vec<usize>) {
+    out.clear();
+    let end = cpts.len();
+    let cjk = |p: usize| p < end && is_cjk(cpts[p]);
+    // The reference's flags read as empty past the fragment.
+    let flag_letter = |p: usize| p < end && is_letter(c[p]);
+    let letter = |p: usize| flag_letter(p) && !cjk(p);
+    let mark = |p: usize| p < end && c[p] == MARK;
+    let number = |p: usize| p < end && is_number(c[p]);
+    let space = |p: usize| p < end && is_space(c[p]);
+    let punct = |p: usize| p < end && !space(p) && !flag_letter(p) && !number(p);
+    let mut pos = 0;
+    while pos < end {
+        let start = pos;
+        let mut p = pos + usize::from(cpts[pos] == u32::from(b' '));
+        if cjk(p) {
+            // ` ?[CJK]+`
+            while cjk(p) {
+                p += 1;
+            }
+            pos = p;
+        } else if letter(p) {
+            // ` ?(letter mark*)+( (letter mark*)+)*`
+            loop {
+                p += 1;
+                while mark(p) {
+                    p += 1;
+                }
+                if letter(p) {
+                    continue;
+                }
+                if p < end && cpts[p] == u32::from(b' ') && letter(p + 1) {
+                    p += 1;
+                    continue;
+                }
+                break;
+            }
+            pos = p;
+        } else if number(pos) {
+            // `\p{N}{1,3}(?=(?:\p{N}{3})*(?!\p{N}))`: the run cut in threes from its end.
+            p = pos;
+            while number(p) {
+                p += 1;
+            }
+            let first = (p - pos) % 3;
+            pos += if first > 0 { first } else { 3 };
+        } else if punct(p) {
+            // ` ?[^\s\p{L}\p{N}]+[\r\n/]*`
+            while punct(p) {
+                p += 1;
+            }
+            while p < end && (is_newline(c[p]) || cpts[p] == u32::from(b'/')) {
+                p += 1;
+            }
+            pos = p;
+        } else {
+            // `\s*[\r\n]+`, `\s+(?!\S)`, `\s+`
+            p = pos;
+            let mut last_newline = pos;
+            while space(p) {
+                if is_newline(c[p]) {
+                    last_newline = p + 1;
+                }
+                p += 1;
+            }
+            pos = if last_newline > pos {
+                last_newline
+            } else if p > pos {
+                if p < end && p - pos > 1 { p - 1 } else { p }
+            } else {
+                pos + 1
+            };
+        }
+        out.push(pos - start);
     }
 }
 
@@ -767,6 +881,44 @@ mod tests {
         ];
         for &(text, want) in cases {
             assert_eq!(words(Pre::Qwen2, text), want, "{text:?}");
+        }
+    }
+
+    /// The raon splitter's alternatives, one case each, as its reference function splits them: a
+    /// space may join two letter runs but not a letter run and a number, a mark stays with its
+    /// letter, Han and kana split from the Latin and Hangul letters that touch them, digits are cut
+    /// in threes from the run's end, a slash or newline after punctuation joins it, and a whitespace
+    /// run gives its last space to the word after it.
+    ///
+    /// FAIL-first: with the digits cut from the run's start ("1234567" as 123|456|7) or the
+    /// letter run not joining across one space ("hello world" as two words) the rows below fail.
+    #[test]
+    fn raon_cases() {
+        let cases: &[(&str, &[&str])] = &[
+            ("hello world", &["hello world"]),
+            ("hello  world", &["hello", " ", " world"]),
+            ("it's", &["it", "'", "s"]),
+            ("a\u{301}b c", &["a\u{301}b c"]),
+            ("12", &["12"]),
+            ("123", &["123"]),
+            ("1234", &["1", "234"]),
+            ("1234567", &["1", "234", "567"]),
+            (" 12", &[" ", "12"]),
+            ("abc1234def", &["abc", "1", "234", "def"]),
+            ("한국어 텍스트", &["한국어 텍스트"]),
+            ("日本語テスト", &["日本語テスト"]),
+            (" 日本 語", &[" 日本", " 語"]),
+            ("Hello,世界!", &["Hello", ",", "世界", "!"]),
+            ("x = y;", &["x", " =", " y", ";"]),
+            ("a/\nb", &["a", "/\n", "b"]),
+            ("a  b", &["a", " ", " b"]),
+            ("hello\n\nworld", &["hello", "\n\n", "world"]),
+            ("end ", &["end", " "]),
+            ("  ", &["  "]),
+            ("(foo)", &["(", "foo", ")"]),
+        ];
+        for &(text, want) in cases {
+            assert_eq!(words(Pre::Raon, text), want, "{text:?}");
         }
     }
 

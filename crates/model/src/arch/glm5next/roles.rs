@@ -77,14 +77,7 @@ pub const SHARED: &[Stem] = &[
 ];
 
 /// The hyper-connection tensors: every trunk layer's, no next-token layer's.
-pub const HC: &[Stem] = &[
-    req("hc_attn_fn.weight", Role::HyperConnection),
-    req("hc_attn_base.weight", Role::HyperConnection),
-    req("hc_attn_scale.weight", Role::HyperConnection),
-    req("hc_ffn_fn.weight", Role::HyperConnection),
-    req("hc_ffn_base.weight", Role::HyperConnection),
-    req("hc_ffn_scale.weight", Role::HyperConnection),
-];
+pub use crate::arch::stems::HC;
 
 /// A next-token layer's own stems, beside the trunk's; `shared_head_norm` is
 /// optional (the block shares the trunk's embedding and head).

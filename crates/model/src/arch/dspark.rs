@@ -115,6 +115,12 @@ impl DraftHparams {
                 detail: format!("is {:?}, not {:?}", split.architecture(), super::DFLASH),
             });
         }
+        if super::dflash2::is_dflash2(split) {
+            return Err(PlacementError::Metadata {
+                key: "architecture".to_string(),
+                detail: "is a DFlash2 draft (selector head), read by arch::dflash2".to_string(),
+            });
+        }
         let n_layer = meta_usize(split, "block_count")?;
         let head_dim = meta_usize(split, "attention.key_length")?;
         let value_length = meta_usize(split, "attention.value_length")?;
@@ -981,7 +987,7 @@ fn per_layer_f32(split: &Split, suffix: &str, n_layer: usize) -> Result<Vec<f32>
 }
 
 /// `target_layers`: non-empty and strictly increasing.
-fn target_layers(split: &Split) -> Result<Vec<usize>, PlacementError> {
+pub(super) fn target_layers(split: &Split) -> Result<Vec<usize>, PlacementError> {
     let key = "target_layers";
     let mut layers: Vec<usize> = Vec::new();
     for (i, v) in meta_arr(split, key)?.iter().enumerate() {
@@ -1002,7 +1008,7 @@ fn target_layers(split: &Split) -> Result<Vec<usize>, PlacementError> {
 }
 
 /// `tokenizer.ggml.mask_token_id`.
-fn mask_token(split: &Split) -> Result<u32, PlacementError> {
+pub(super) fn mask_token(split: &Split) -> Result<u32, PlacementError> {
     split
         .value(MASK_TOKEN)
         .and_then(Value::as_unsigned)

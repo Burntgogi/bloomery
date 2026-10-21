@@ -1177,6 +1177,30 @@ mod elem_kernels {
         e.map(|g, u| mul_rn_f32(gelu_tanh_dev(g), u));
     }
 
+    /// `y[i] = situ(gate[i], up[i])`, elementwise over `n` values: the
+    /// gate·up rule [`crate::kquant::act::situ`] at `beta` and
+    /// [`crate::kquant::act::SITU_LINEAR_BETA`], the rows the `_sel`
+    /// gate·up writes under it for the same sums.
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (gate.len() >= n, up.len() >= n, y.len() >= n)
+    )]
+    pub fn situ_rows(gate: &[f32], up: &[f32], n: u32, beta: f32, mut y: DisjointSlice<f32>) {
+        let i = thread::index_1d().get();
+        if i >= n as usize {
+            return;
+        }
+        // SAFETY: the `requires` above were launcher-checked, `n` is this
+        // kernel's parameter and `i` this thread's `index_1d` past the `i < n`
+        // guard, and the launch is `domain = 1` with the contract's exact 1-D
+        // block.
+        let e = unsafe { Elem2::new(gate, up, &mut y, i) };
+        e.map(|g, u| crate::kquant::act::situ(g, u, beta, crate::kquant::act::SITU_LINEAR_BETA));
+    }
+
     /// `y[i] = max(x[i], 0)^2` over `n` values. A non-finite input is copied
     /// as it is: `max` of a non-finite is not this rule, and the square of
     /// `−inf` is not 0.
@@ -2326,6 +2350,45 @@ impl ElemKernels {
             .module
             .prepare_geglu_tanh(LaunchConfig1D::new(n.div_ceil(256), 256, 0))?;
         self.module.geglu_tanh(stream, &prep, gate, up, n, y)?;
+        Ok(())
+    }
+
+    /// Enqueue `y = situ(gate, up)` at `rule` over `n` values (flat;
+    /// token-major spans of any width): [`crate::kquant::Act::Situ`] alone,
+    /// any other rule or one [`crate::kquant::Act::code`] refuses is refused
+    /// by name. Asynchronous, allocation-free, capturable.
+    pub fn enqueue_situ(
+        &self,
+        stream: &CudaStream,
+        rule: crate::kquant::Act,
+        (gate, up): (&DeviceBuffer<f32>, &DeviceBuffer<f32>),
+        n: usize,
+        y: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let what = "enqueue_situ";
+        let crate::kquant::Act::Situ { .. } = rule else {
+            return Err(GpuError::shape(
+                what,
+                format!("{rule:?} is not a situ rule"),
+            ));
+        };
+        let (_, beta) = rule.code(what)?;
+        if n == 0 || gate.len() < n || up.len() < n || y.len() < n {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "n={n}, gate.len() {}, up.len() {}, y.len() {}",
+                    gate.len(),
+                    up.len(),
+                    y.len()
+                ),
+            ));
+        }
+        let n = launch_u32(what, "n", n)?;
+        let prep = self
+            .module
+            .prepare_situ_rows(LaunchConfig1D::new(n.div_ceil(256), 256, 0))?;
+        self.module.situ_rows(stream, &prep, gate, up, n, beta, y)?;
         Ok(())
     }
 

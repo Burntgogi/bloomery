@@ -221,3 +221,10 @@ gate-threads	common		host	threads_pool
 gate-tokenizer	common		host	tokenizer_jinja
 gate-union	common		host	moe_route
 gate-vision	common		media	serve_media
+# raon-body
+gate-gpu-raon1-e2e	family	raon1	e2e	graph_fault+attn_linear_gdn_kda+attn_latent_mla+moe_route
+# raon-attn
+gate-gpu-raon1-attn	family	raon1	kernel	attn_linear_gdn_kda+attn_latent_mla
+# raon-model
+gate-raon1-meta	family	raon1	meta	arch_registry
+gate-raon1-tokenizer	family	raon1	tokenizer	tokenizer_jinja

@@ -821,6 +821,68 @@ mod tests {
         }
     }
 
+    /// Raon's pre-tokenizer NFC-normalizes the text whatever the header's normalizer says, and the
+    /// converter's boolean `tokenizer.ggml.normalizer.nfc` selects the same for another BPE; a
+    /// SentencePiece vocabulary refuses it by name. `<|im_end|>` and `<|endoftext|>`, the two
+    /// ends the model's generation config lists, end generation.
+    ///
+    /// FAIL-first: without the pre-tokenizer's own NFC the `raon` row keeps the combining mark's
+    /// two bytes; without the boolean key's read the `qwen35` row does.
+    #[test]
+    fn raon_normalizes_to_nfc_and_ends_on_its_two_end_tokens() {
+        let bytes: Vec<Value> = crate::unicode::byte_to_cpt_table()
+            .into_iter()
+            .map(|cp| Value::String(char::from_u32(cp).unwrap().to_string()))
+            .collect();
+        let header = |pre: &str, flag: Option<bool>| {
+            let mut h = vec![
+                ("tokenizer.ggml.model".into(), Value::String("gpt2".into())),
+                ("tokenizer.ggml.pre".into(), Value::String(pre.into())),
+                (
+                    "tokenizer.ggml.tokens".into(),
+                    Value::Array(
+                        bytes
+                            .iter()
+                            .cloned()
+                            .chain(
+                                ["ab", "<|im_end|>", "<|endoftext|>"]
+                                    .map(|t| Value::String(t.into())),
+                            )
+                            .collect(),
+                    ),
+                ),
+                (
+                    "tokenizer.ggml.merges".into(),
+                    Value::Array(vec![Value::String("a b".into())]),
+                ),
+            ];
+            h.push(("tokenizer.ggml.eos_token_id".into(), Value::U32(257)));
+            if let Some(flag) = flag {
+                h.push(("tokenizer.ggml.normalizer.nfc".into(), Value::Bool(flag)));
+            }
+            h
+        };
+        let composed = [195, 169];
+        let raw: Vec<u32> = "e\u{301}".bytes().map(u32::from).collect();
+        for (pre, flag, want) in [
+            ("raon", None, &composed[..]),
+            ("raon", Some(true), &composed[..]),
+            ("qwen35", Some(true), &composed[..]),
+            ("qwen35", Some(false), &raw[..]),
+            ("qwen35", None, &raw[..]),
+        ] {
+            let tok = from_header(&header(pre, flag)).unwrap();
+            assert_eq!(tok.encode("e\u{301}", false, false), want, "{pre} {flag:?}");
+        }
+        let tok = from_header(&header("raon", None)).unwrap();
+        assert_eq!(tok.eog(), &[257, 258]);
+        let mut spm = header("raon", Some(true));
+        spm[0].1 = Value::String("llama".into());
+        assert!(
+            matches!(from_header(&spm), Err(Error::UnsupportedNormalizer(name)) if name == "nfc")
+        );
+    }
+
     /// The explicit stop list selects Hugging Face's encoding, and only for a qwen35 BPE: its
     /// regex folds `ſ` to `s` in a contraction ("'ſx" is `'ſ` and `x`, ids 257 and 120 under
     /// the merges below, where qwen35 merges the one word to 258), and its BPE skips a byte its

@@ -45,6 +45,7 @@ pub(crate) fn dims(d: &Dims) -> KdaDims {
         rule: KdaRule {
             decay: KdaDecay::Sigmoid { lower_bound: d.lb },
             beta_scale: 1.0,
+            write_gate: false,
         },
     }
 }
@@ -171,6 +172,7 @@ pub(crate) fn kda(gpu: &Gpu, w: &Weights, p: &mut Parts<'_>, l: usize) -> Result
             fa: &mut s.fa,
             ga: &mut s.ga,
             beta_raw: &mut s.beta_raw,
+            write_raw: None,
             f: &mut s.f,
             z: &mut s.z,
             conv: &mut s.conv,

@@ -17,8 +17,8 @@ use gguf::Split;
 use models::{
     Act, Arch, BlockDraft, Candidates, Collapse, Compress, Compressor, DraftSpec, Extra, Ffn,
     HcKind, HcMix, HcSpec, IndexKeys, Latent, LatentOut, LatentUp, LayerSpec, Mixer, ModelSpec,
-    Moe, NgramRule, ReasoningFormat, Residual, Rope, RopeMode, Router, Score, Selector, Shared,
-    Source, ToolFormat, Yarn,
+    Moe, NgramRule, OutGate, ReasoningFormat, Residual, Rope, RopeMode, Router, Score, Selector,
+    Shared, Source, ToolFormat, Yarn,
 };
 
 use super::hparams::{CandidateMask, Collapse as HpCollapse, Hparams, LayerKind, Model};
@@ -190,6 +190,8 @@ fn layer_of(
             }),
         }),
         q_head_norm: hp.q_head_norm,
+        pe: 0,
+        out_gate: OutGate::None,
         out: LatentOut::Grouped {
             groups: spec_u32("attention.output_group_count", hp.o_groups)?,
             rank: spec_u32("attention.output_lora_rank", hp.o_lora_rank)?,
@@ -308,6 +310,8 @@ pub fn draft_of(hp: &DraftHparams) -> Result<DraftSpec, PlacementError> {
                         yarn: None,
                     }),
                     q_head_norm: false,
+                    pe: 0,
+                    out_gate: OutGate::None,
                     out: LatentOut::Grouped {
                         groups: spec_u32("attention.output_group_count", hp.o_groups)?,
                         rank: spec_u32("attention.output_lora_rank", hp.o_lora_rank)?,

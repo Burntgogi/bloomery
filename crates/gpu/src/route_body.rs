@@ -384,7 +384,7 @@ macro_rules! sigmoid_router_instance {
         /// The instance's row in `models::shape::ROUTERS`: a shape read from
         /// a file selects it through `select_router`.
         pub const ROW: RouterInst =
-            shape::router_row(RouterBody::BiasedSigmoid, N_EXPERT as u32);
+            shape::router_row_k(RouterBody::BiasedSigmoid, N_EXPERT as u32, N_USED as u32);
         const _: () = assert!(shape::router_row_is(
             ROW,
             rules::BIASED_SIGMOID,

@@ -380,6 +380,7 @@ pub(crate) fn card_terms(t: &CardTotals) -> u64 {
 enum Hold {
     /// A GQA layer: K and V of `row` bytes a position, over its `window` positions when it has one,
     /// and `index` bytes of index key a position over every position (0: the layer selects nothing).
+    /// A latent layer: its cached row of `row` bytes a position, no index, no window.
     Attention {
         row: u64,
         index: u64,
@@ -416,8 +417,9 @@ pub struct KvLayout {
 
 impl KvLayout {
     /// The layout of the trunk layers `mixers` name, window layers on the ring; a mixer whose store
-    /// this owner does not size (a latent or Mamba-2 layer, a GQA layer with a selector other than
-    /// the block selector or with a window beside it) is refused by name with its layer.
+    /// this owner does not size (a Mamba-2 layer, a latent layer that compresses, selects or windows,
+    /// a GQA layer with a selector other than the block selector or with a window beside it) is refused
+    /// by name with its layer.
     pub fn of<'a>(mixers: impl IntoIterator<Item = &'a Mixer>) -> Result<KvLayout, PlacementError> {
         let mut holds = Vec::new();
         let mut ropes: Vec<(u32, u32)> = Vec::new();
@@ -448,6 +450,17 @@ impl KvLayout {
                             * stores::F16_BYTES,
                         index,
                         window: g.window.map(u64::from),
+                    }
+                }
+                // A latent layer that compresses, selects or windows nothing holds a plane of one
+                // row a position, the latent and the key values beside it, in f16.
+                Mixer::Latent(a)
+                    if a.compress.is_none() && a.select.is_none() && a.window.is_none() =>
+                {
+                    Hold::Attention {
+                        row: (u64::from(a.latent) + u64::from(a.pe)) * stores::F16_BYTES,
+                        index: 0,
+                        window: None,
                     }
                 }
                 Mixer::DeltaRule(d) => Hold::State(state_bytes(d)),
@@ -525,8 +538,8 @@ fn unsized_store(layer: usize, what: &str) -> PlacementError {
     PlacementError::Unimplemented(vec![Unimplemented {
         layer: Some(layer),
         feature: format!(
-            "{what}: this plan sizes the stores of a GQA layer (plain, or selecting blocks) and a \
-             delta-rule layer"
+            "{what}: this plan sizes the stores of a GQA layer (plain, or selecting blocks), a plain \
+             latent layer and a delta-rule layer"
         ),
     }])
 }

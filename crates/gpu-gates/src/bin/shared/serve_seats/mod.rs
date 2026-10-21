@@ -69,6 +69,10 @@ pub mod hybrid;
 // body it serves is in the gpu crate, so it needs no feature of its own.
 #[cfg(feature = "deepseek41")]
 pub mod nemotron;
+// The raon1 seat sits behind `deepseek41` for the nemotron seat's reason; its body is
+// in the gpu crate.
+#[cfg(feature = "deepseek41")]
+pub mod raon1;
 // The seats' one owner of a round run as passes (`step_rows_one_pass`).
 #[cfg(feature = "deepseek41")]
 pub mod rounds;

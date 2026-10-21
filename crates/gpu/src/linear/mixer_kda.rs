@@ -12,7 +12,9 @@
 //!    order (a GEMM front may run `g_b` beside the first four);
 //! 3. the conv and prep with one decay per key channel (`kda_conv_prep` at
 //!    the layer's [`KdaRule`]: the conv over the ring by each row's position,
-//!    SiLU, the q and k L2 norms, `beta_scale · σ(β)`, the decay);
+//!    SiLU, the q and k L2 norms, `beta_scale · σ(β)`, the decay), and on a
+//!    rule with a write gate the values scaled by `σ(b + w) / σ(b)`
+//!    ([`crate::linear::write_gate`], Raon Delta Attention);
 //! 4. the delta step (`kda_delta_lanes`) over the state's lane, its stamp
 //!    checked against the position;
 //! 5. the gated per-head RMS norm with the sigmoid gate;
@@ -22,7 +24,8 @@
 //! its quantizations (one q8_1 of `xn` for four K-quant sites, a GEMM front
 //! past a batch width) are not the mixer's. Launches 1 and 3-5 are this
 //! module's and the same for every family; the launch count is
-//! [`CORE_LAUNCHES`] plus what the family's projections launch.
+//! [`CORE_LAUNCHES`] (one more with a write gate, [`KdaRule::launches`]) plus
+//! what the family's projections launch.
 //!
 //! The mixer never clamps the state; the delta step raises its fault site
 //! when the state stops being finite.
@@ -32,6 +35,7 @@ use cuda_core::{CudaStream, DeviceBuffer};
 use crate::linear::conv::{KdaBetaScale, KdaConvArgs, KdaGateRule};
 use crate::linear::delta::{DeltaArgs, DeltaLanesArgs, KdaLanesArgs};
 use crate::linear::norm_gate::NormGateArgs;
+use crate::linear::write_gate::WriteGateArgs;
 use crate::linear::{LinearKernels, LinearShape};
 use crate::{Gpu, GpuError};
 
@@ -51,13 +55,17 @@ pub enum KdaDecay {
     Softplus,
 }
 
-/// A KDA layer's rule: the decay and the scale on `σ(b_proj x)` (1 for GLM,
-/// 2 for Solar's `allow_neg_eigval`). Only the pairs so3's conv-prep entries
-/// instantiate are accepted ([`KdaRule::check`]).
+/// A KDA layer's rule: the decay, the scale on `σ(b_proj x)` (1 for GLM,
+/// 2 for Solar's `allow_neg_eigval`) and whether a write gate apart from that
+/// erase gate scales the values (Raon Delta Attention: `σ(b + w) / σ(b)`, `w`
+/// the family's write projection, [`KdaIn::write_raw`]). Only the pairs so3's
+/// conv-prep entries instantiate are accepted, and a write gate only over the
+/// erase gate `σ(b)` ([`KdaRule::check`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct KdaRule {
     pub decay: KdaDecay,
     pub beta_scale: f32,
+    pub write_gate: bool,
 }
 
 impl KdaRule {
@@ -68,9 +76,26 @@ impl KdaRule {
         self.entry(what).map(|_| self)
     }
 
+    /// The launches the mixer makes itself at this rule: [`CORE_LAUNCHES`],
+    /// and the write gate's.
+    #[must_use]
+    pub fn launches(self) -> usize {
+        CORE_LAUNCHES + usize::from(self.write_gate)
+    }
+
     /// The conv-prep launch's gate rule and β scale: the one table of the
     /// pairs.
     fn entry(self, what: &'static str) -> Result<(KdaGateRule, KdaBetaScale), GpuError> {
+        if self.write_gate && self.beta_scale != 1.0 {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "a write gate scales the values by sigmoid(b + w) / sigmoid(b), over the \
+                     erase gate sigmoid(b); beta_scale {} is not 1",
+                    self.beta_scale
+                ),
+            ));
+        }
         match (self.decay, self.beta_scale) {
             (KdaDecay::Sigmoid { lower_bound }, scale) if scale == 1.0 && lower_bound < 0.0 => {
                 Ok((KdaGateRule::Sigmoid { lower_bound }, KdaBetaScale::X1))
@@ -131,6 +156,9 @@ pub struct KdaBufs<'a> {
     pub fa: &'a mut DeviceBuffer<f32>,
     pub ga: &'a mut DeviceBuffer<f32>,
     pub beta_raw: &'a mut DeviceBuffer<f32>,
+    /// The write projection's raw rows (`[m][n_v]`), lent exactly when the
+    /// rule has a write gate.
+    pub write_raw: Option<&'a mut DeviceBuffer<f32>>,
     pub f: &'a mut DeviceBuffer<f32>,
     pub z: &'a mut DeviceBuffer<f32>,
     pub conv: &'a mut DeviceBuffer<f32>,
@@ -142,12 +170,14 @@ pub struct KdaBufs<'a> {
 }
 
 /// The rows [`KdaProj::input`] writes: the four projections of `xn`, the
-/// low-rank halves' intermediates `fa` and `ga`, and `f`, `z` from them.
+/// low-rank halves' intermediates `fa` and `ga`, `f`, `z` from them, and on a
+/// rule with a write gate the write projection's raw rows `write_raw`.
 pub struct KdaIn<'a> {
     pub qkv: &'a mut DeviceBuffer<f32>,
     pub fa: &'a mut DeviceBuffer<f32>,
     pub ga: &'a mut DeviceBuffer<f32>,
     pub beta_raw: &'a mut DeviceBuffer<f32>,
+    pub write_raw: Option<&'a mut DeviceBuffer<f32>>,
     pub f: &'a mut DeviceBuffer<f32>,
     pub z: &'a mut DeviceBuffer<f32>,
 }
@@ -209,6 +239,7 @@ pub fn enqueue(
         fa,
         ga,
         beta_raw,
+        mut write_raw,
         f,
         z,
         conv,
@@ -218,6 +249,12 @@ pub fn enqueue(
         gated,
         out,
     } = b;
+    if d.rule.write_gate != write_raw.is_some() {
+        return Err(GpuError::state(
+            WHAT,
+            "the write projection's rows exactly when the rule has a write gate",
+        ));
+    }
     gpu.elem()
         .enqueue_rms_norm(stream, x, v.norm, d.rms_eps, d.embd, m, xn)?;
     proj.input(
@@ -230,6 +267,7 @@ pub fn enqueue(
             fa,
             ga,
             beta_raw: &mut *beta_raw,
+            write_raw: write_raw.as_deref_mut(),
             f: &mut *f,
             z: &mut *z,
         },
@@ -257,6 +295,19 @@ pub fn enqueue(
             ring: &mut *st.ring,
         },
     )?;
+    if let Some(w) = write_raw {
+        k.write_gate.enqueue_write_gate(
+            stream,
+            WriteGateArgs {
+                b: beta_raw,
+                w,
+                shape: d.shape,
+                m,
+                fault,
+                y: &mut *conv,
+            },
+        )?;
+    }
     k.delta.enqueue_kda_delta_lanes(
         stream,
         KdaLanesArgs {
@@ -305,11 +356,28 @@ mod tests {
     /// pair, and a sigmoid bound that is not below 0, is refused by name.
     #[test]
     fn check_accepts_only_the_pairs_an_entry_runs() {
-        let rule = |decay, beta_scale| KdaRule { decay, beta_scale };
+        let rule = |decay, beta_scale| KdaRule {
+            decay,
+            beta_scale,
+            write_gate: false,
+        };
         let sigmoid = |lower_bound| KdaDecay::Sigmoid { lower_bound };
-        for ok in [rule(sigmoid(-5.0), 1.0), rule(KdaDecay::Softplus, 2.0)] {
+        let write = |r: KdaRule| KdaRule {
+            write_gate: true,
+            ..r
+        };
+        for ok in [
+            rule(sigmoid(-5.0), 1.0),
+            rule(KdaDecay::Softplus, 2.0),
+            write(rule(sigmoid(-5.0), 1.0)),
+        ] {
             assert_eq!(ok.check("test").unwrap(), ok, "{ok:?}");
         }
+        let e = write(rule(KdaDecay::Softplus, 2.0))
+            .check("test")
+            .unwrap_err()
+            .to_string();
+        assert!(e.starts_with("test: a write gate scales"), "{e}");
         for bad in [
             rule(sigmoid(-5.0), 2.0),
             rule(KdaDecay::Softplus, 1.0),

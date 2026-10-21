@@ -10,14 +10,13 @@
 
 use gguf::Split;
 
-use crate::arch::stems::{Stem, req};
+use crate::arch::stems::{Stem, join, req};
 use crate::arch::{meta_usize, metadata, optional_usize, positive};
 use crate::placement::{PlacementError, Role};
 
-/// A KDA delta-rule layer's mixer; `ssm_f_b` and `ssm_g_b` are required
-/// because without them ik takes another decay rule (`src/llama-kda.cpp`,
-/// `build_kda_beta_gate`).
-pub const STEMS: &[Stem] = &[
+/// A delta-rule layer's mixer up to the decay's low-rank halves, which a KDA layer
+/// and a Raon delta layer carry alike.
+pub const HEAD: &[Stem] = &[
     req("attn_norm.weight", Role::Attention),
     req("attn_q.weight", Role::Attention),
     req("attn_k.weight", Role::Attention),
@@ -27,14 +26,26 @@ pub const STEMS: &[Stem] = &[
     req("ssm_conv1d_v.weight", Role::Attention),
     req("ssm_f_a.weight", Role::Attention),
     req("ssm_f_b.weight", Role::Attention),
+];
+
+/// A KDA layer's output gate: a low-rank pair. `ssm_g_b` is required because without it ik takes
+/// another decay rule (`src/llama-kda.cpp`, `build_kda_beta_gate`).
+pub const LOW_RANK_GATE: &[Stem] = &[
     req("ssm_g_a.weight", Role::Attention),
     req("ssm_g_b.weight", Role::Attention),
+];
+
+/// The rest of a delta-rule layer's mixer, after the gate.
+pub const TAIL: &[Stem] = &[
     req("ssm_beta.weight", Role::Attention),
     req("ssm_a", Role::Attention),
     req("ssm_dt.bias", Role::Attention),
     req("ssm_norm.weight", Role::Attention),
     req("attn_output.weight", Role::Attention),
 ];
+
+/// A KDA delta-rule layer's mixer.
+pub const STEMS: &[Stem] = &join::<16>(&[HEAD, LOW_RANK_GATE, TAIL]);
 
 /// The KDA numbers a file's keys give: the conv's taps and the head width.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -80,15 +91,16 @@ pub(in crate::arch) fn read(
     Ok(Keys { conv, head_dim })
 }
 
-/// A KDA layer's tensors by stem and the dims they hold, ggml order:
-/// `d_state` is the head dim, `d_inner` that times the heads.
-pub(in crate::arch) fn dims(
+/// The dims of [`HEAD`]'s tensors by stem, ggml order: `d_state` is the head dim, `d_inner` that
+/// times the heads, `rank` the decay's low-rank width.
+pub(in crate::arch) fn head_dims(
     n_embd: usize,
     n_head: usize,
     head_dim: usize,
+    rank: usize,
     conv: usize,
-) -> [(&'static str, Vec<u64>); 16] {
-    let (e, h, st) = (n_embd as u64, n_head as u64, head_dim as u64);
+) -> [(&'static str, Vec<u64>); 9] {
+    let (e, h, st, r) = (n_embd as u64, n_head as u64, head_dim as u64, rank as u64);
     let inner = st * h;
     let conv = conv as u64;
     [
@@ -99,15 +111,57 @@ pub(in crate::arch) fn dims(
         ("ssm_conv1d_q.weight", vec![conv, 1, inner]),
         ("ssm_conv1d_k.weight", vec![conv, 1, inner]),
         ("ssm_conv1d_v.weight", vec![conv, 1, inner]),
-        ("ssm_f_a.weight", vec![e, st]),
-        ("ssm_f_b.weight", vec![st, inner]),
-        ("ssm_g_a.weight", vec![e, st]),
-        ("ssm_g_b.weight", vec![st, inner]),
+        ("ssm_f_a.weight", vec![e, r]),
+        ("ssm_f_b.weight", vec![r, inner]),
+    ]
+}
+
+/// The dims of [`TAIL`]'s tensors by stem, ggml order.
+pub(in crate::arch) fn tail_dims(
+    n_embd: usize,
+    n_head: usize,
+    head_dim: usize,
+) -> [(&'static str, Vec<u64>); 5] {
+    let (e, h, st) = (n_embd as u64, n_head as u64, head_dim as u64);
+    let inner = st * h;
+    [
         ("ssm_beta.weight", vec![e, h]),
         ("ssm_a", vec![h]),
         ("ssm_dt.bias", vec![inner]),
         ("ssm_norm.weight", vec![st]),
         ("attn_output.weight", vec![inner, e]),
+    ]
+}
+
+/// A KDA layer's tensors by stem and the dims they hold, ggml order: the decay's low-rank width
+/// and the gate's are the head dim.
+pub(in crate::arch) fn dims(
+    n_embd: usize,
+    n_head: usize,
+    head_dim: usize,
+    conv: usize,
+) -> [(&'static str, Vec<u64>); 16] {
+    let (e, st) = (n_embd as u64, head_dim as u64);
+    let inner = st * n_head as u64;
+    let [norm, q, k, v, cq, ck, cv, fa, fb] = head_dims(n_embd, n_head, head_dim, head_dim, conv);
+    let [beta, a, dt, sn, out] = tail_dims(n_embd, n_head, head_dim);
+    [
+        norm,
+        q,
+        k,
+        v,
+        cq,
+        ck,
+        cv,
+        fa,
+        fb,
+        ("ssm_g_a.weight", vec![e, st]),
+        ("ssm_g_b.weight", vec![st, inner]),
+        beta,
+        a,
+        dt,
+        sn,
+        out,
     ]
 }
 

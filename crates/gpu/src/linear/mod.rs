@@ -2,8 +2,9 @@
 //! conv with SiLU, the q/k L2 norm and the β/decay prep ([`conv`]), the
 //! recurrent delta step over a run of tokens ([`delta`]), and the gated
 //! per-head RMS norm of its output ([`norm_gate`]), with the sigmoid output
-//! gate of a gated softmax-attention layer beside it ([`out_gate`]). The
-//! projections around them (`W_qkv`, `w_β`, `w_α`, `W_gate`, `W_out`) are the tree's dense
+//! gate of a gated softmax-attention layer beside it ([`out_gate`]), and the
+//! write gate of a layer whose write and erase gates differ ([`write_gate`]).
+//! The projections around them (`W_qkv`, `w_β`, `w_α`, `W_gate`, `W_out`) are the tree's dense
 //! gemv/GEMM and are not here.
 //!
 //! The rule, per token t and value head h (`n_v` value heads, `n_k` query/key
@@ -23,7 +24,10 @@
 //! sigmoid gate. Solar-Open2 takes the same steps with
 //! `decay_hk = exp(ssm_a_h · softplus(f_hk + dt_hk))` and `β = 2·sigmoid(b)`
 //! (`kda_conv_prep_sp2`), and gates its attention output by
-//! `attn · sigmoid(g)` ([`out_gate`]).
+//! `attn · sigmoid(g)` ([`out_gate`]). Raon Delta Attention takes
+//! GLM-5.3-Flash's steps with a write gate apart from the erase gate β: the
+//! values the prep leaves are scaled by `sigmoid(b + w) / sigmoid(b)`, `w`
+//! the write projection's rows, before the delta step ([`write_gate`]).
 //!
 //! Layouts, all f32 and token-major:
 //! - channels `[m][C]`: q heads, then k heads, then v heads, [`HEAD`] each —
@@ -54,6 +58,7 @@ pub mod delta;
 pub mod mixer_kda;
 pub mod norm_gate;
 pub mod out_gate;
+pub mod write_gate;
 
 use crate::GpuError;
 use cuda_core::CudaContext;
@@ -221,22 +226,24 @@ impl LinearShape {
     }
 }
 
-/// The four modules, loaded once.
+/// The five modules, loaded once.
 pub struct LinearKernels {
     pub conv: conv::ConvKernels,
     pub delta: delta::DeltaKernels,
     pub norm_gate: norm_gate::NormGateKernels,
     pub out_gate: out_gate::OutGateKernels,
+    pub write_gate: write_gate::WriteGateKernels,
 }
 
 impl LinearKernels {
-    /// Load the four device bundles into `ctx`. Load-time only.
+    /// Load the five device bundles into `ctx`. Load-time only.
     pub fn load(ctx: &Arc<CudaContext>) -> Result<LinearKernels, GpuError> {
         Ok(LinearKernels {
             conv: conv::ConvKernels::load(ctx)?,
             delta: delta::DeltaKernels::load(ctx)?,
             norm_gate: norm_gate::NormGateKernels::load(ctx)?,
             out_gate: out_gate::OutGateKernels::load(ctx)?,
+            write_gate: write_gate::WriteGateKernels::load(ctx)?,
         })
     }
 }

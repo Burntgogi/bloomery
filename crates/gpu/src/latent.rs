@@ -11,7 +11,15 @@
 //!   the raw [`INDEX_HEAD`]-value pool gate beside it, `[key; gate]` rounded
 //!   to f16 — the row the pool selector reads.
 //!
-//! A third entry reads the index cache back: [`LatentKernels::enqueue_index_pool`]
+//! A third append serves an absorbed MLA layer whose keys carry a rope-free
+//! extra part beside the latent (Raon-1's NoPE MLA):
+//! [`LatentKernels::enqueue_latent_extra_append`] writes one f16 row of
+//! `extra + LATENT` values, the token's raw `extra` values first, then its
+//! latent normed as [`LatentKernels::enqueue_latent_append`] norms it — the
+//! `[rope | latent]` row order `crate::flash`'s latent attention reads, with
+//! no rotation.
+//!
+//! A fourth entry reads the index cache back: [`LatentKernels::enqueue_index_pool`]
 //! writes the key of every pool of [`POOL`] positions a token completes,
 //! once, into the layer's pool plane (`[pools][INDEX_HEAD]` f16, pool `j` the
 //! positions `4j .. 4j + 3`): per channel `d`, `Σ_i softmax_i(gate_i[d] +
@@ -210,6 +218,125 @@ mod latent_kernels {
             // cache.len() by the launch contract; one thread per value, and
             // one block per position.
             unsafe { *cache.get_unchecked_mut(row + at) = h };
+            i += 1;
+        }
+        if !ok {
+            fault.raise(FaultSite::CacheValue);
+        }
+    }
+
+    /// The `[extra | latent]` rows of `m` tokens (module doc), one block per
+    /// token: token `t`'s latent is `x[t·stride + off ..][..LATENT]`, its
+    /// extra part `x[t·stride + e_off ..][..extra]`; the f16 row goes to row
+    /// `pos[t]` of `cache` (`rows` rows of `extra + LATENT`), the extra part
+    /// first, raw, then the latent normed as `latent_rms_append` norms it.
+    /// `off + LATENT <= stride`, `e_off + extra <= stride` and `extra <= 128`
+    /// (host-checked).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(128)]
+    #[launch_contract(
+        domain = 1,
+        block = (128, 1, 1),
+        requires = (
+            x.len() >= m * stride,
+            gain.len() >= 512,
+            pos.len() >= m,
+            cache.len() >= rows * (512 + extra)
+        )
+    )]
+    pub fn latent_extra_rms_append(
+        x: &[f32],
+        gain: &[f32],
+        pos: &[u32],
+        eps: f32,
+        stride: u32,
+        off: u32,
+        e_off: u32,
+        extra: u32,
+        rows: u32,
+        m: u32,
+        fault: FaultSink,
+        mut cache: DisjointSlice<u16>,
+    ) {
+        static mut XSUM: SharedArray<f64, 4> = SharedArray::UNINIT;
+
+        let t = thread::blockIdx_x() as usize;
+        if t >= m as usize {
+            return; // block-uniform
+        }
+        let tid = thread::threadIdx_x() as usize;
+        let base = t * stride as usize + off as usize;
+        // SAFETY: t < m <= pos.len() by the launch contract.
+        let p = unsafe { *pos.get_unchecked(t) } as usize;
+        let mut v = [0.0f32; PER_THREAD];
+        let mut acc = 0.0f64;
+        let mut i = 0usize;
+        #[unroll]
+        while i < PER_THREAD {
+            // SAFETY: tid + 128·i < LATENT and off + LATENT <= stride
+            // (host-checked), so base + tid + 128·i < (t + 1)·stride <=
+            // m·stride <= x.len() by the launch contract.
+            v[i] = unsafe { *x.get_unchecked(base + tid + 128 * i) };
+            acc += f64::from(mul_rn_f32(v[i], v[i]));
+            i += 1;
+        }
+        let acc = warp_sum_f64(acc);
+        // SAFETY: XSUM is this block's own shared allocation; the raw form is
+        // the only way to reach it without a reference to a `static mut`.
+        // Four slots, one per warp, written before the barrier that
+        // publishes them.
+        let ws = unsafe { SharedArray::as_raw_mut_ptr(&raw mut XSUM) };
+        if warp::lane_id() == 0 {
+            // SAFETY: tid / 32 < 4; one lane per warp writes its slot.
+            unsafe { *ws.add(tid / 32) = acc };
+        }
+        thread::sync_threads();
+        // SAFETY: all four slots were written before the barrier above.
+        let sum = unsafe { ((*ws.add(0) + *ws.add(1)) + *ws.add(2)) + *ws.add(3) };
+        let mean = (sum / LATENT as f64) as f32;
+        let scale = if mean.is_finite() {
+            1.0 / (mean + eps).sqrt()
+        } else {
+            f32::NAN
+        };
+
+        if p >= rows as usize {
+            if tid == 0 {
+                fault.raise(FaultSite::CachePos);
+            }
+            return; // block-uniform: p is the token's
+        }
+        let width = extra as usize + LATENT;
+        let row = p * width;
+        let mut ok = true;
+        if tid < extra as usize {
+            // SAFETY: tid < extra and e_off + extra <= stride (host-checked),
+            // so the read lies in token t's row of x; row + tid < (p + 1)·width
+            // <= rows·width <= cache.len() by the launch contract, one thread
+            // per value and one block per position.
+            unsafe {
+                let e = *x.get_unchecked(t * stride as usize + e_off as usize + tid);
+                let h = f32_to_f16_bits(e);
+                ok &= f16_finite(h);
+                *cache.get_unchecked_mut(row + tid) = h;
+            }
+        }
+        let mut i = 0usize;
+        #[unroll]
+        while i < PER_THREAD {
+            let at = tid + 128 * i;
+            // SAFETY: at < LATENT <= gain.len() by the launch contract.
+            let g = unsafe { *gain.get_unchecked(at) };
+            let h = f32_to_f16_bits(mul_rn_f32(mul_rn_f32(scale, g), v[i]));
+            ok &= f16_finite(h);
+            // SAFETY: p < rows, so row + extra + at < (p + 1)·width <=
+            // rows·width <= cache.len() by the launch contract; one thread per
+            // value, and one block per position.
+            unsafe { *cache.get_unchecked_mut(row + extra as usize + at) = h };
             i += 1;
         }
         if !ok {
@@ -465,6 +592,22 @@ pub struct LatentAppendArgs<'a> {
     pub cache: &'a mut DeviceTensor<u16>,
 }
 
+/// [`LatentKernels::enqueue_latent_extra_append`]'s arguments: the latent at
+/// column `off` and the `extra` raw values at column `e_off` of each row of
+/// `rows`, the norm's [`LATENT`] gains, the `m` positions on the device, and
+/// the dense cache (`[positions][extra + LATENT]` f16).
+pub struct LatentExtraAppendArgs<'a> {
+    pub rows: Rows<'a>,
+    pub off: usize,
+    pub e_off: usize,
+    pub extra: usize,
+    pub gain: &'a DeviceBuffer<f32>,
+    pub pos: &'a DeviceBuffer<u32>,
+    pub eps: f32,
+    pub fault: FaultSink,
+    pub cache: &'a mut DeviceTensor<u16>,
+}
+
 /// [`LatentKernels::enqueue_index_key_append`]'s arguments: the key at
 /// column `k_off` and the gate at column `g_off` of each row of `rows`, the
 /// LayerNorm's [`INDEX_HEAD`] weights and biases, the `m` positions on the
@@ -605,6 +748,76 @@ impl LatentKernels {
             eps,
             stride,
             off,
+            n_rows,
+            m,
+            fault,
+            cache.buf_mut(),
+        )?;
+        Ok(())
+    }
+
+    /// Enqueue the `[extra | latent]` rows of `m` tokens: one block per
+    /// token. Refused before the launch: no token, no extra part or one wider
+    /// than the block, a cache of no rows or not `extra + LATENT` wide, a
+    /// part past the row stride, short rows, positions or gains.
+    /// Asynchronous, allocation-free, capturable.
+    pub fn enqueue_latent_extra_append(
+        &self,
+        stream: &CudaStream,
+        a: LatentExtraAppendArgs<'_>,
+    ) -> Result<(), GpuError> {
+        let what = "enqueue_latent_extra_append";
+        let LatentExtraAppendArgs {
+            rows,
+            off,
+            e_off,
+            extra,
+            gain,
+            pos,
+            eps,
+            fault,
+            cache,
+        } = a;
+        if extra == 0 || extra > BLOCK as usize {
+            return Err(GpuError::shape(
+                what,
+                format!("the extra part is one value a thread, 1..={BLOCK}, got {extra}"),
+            ));
+        }
+        check_shape(
+            what,
+            rows,
+            &[("latent", off, LATENT), ("extra part", e_off, extra)],
+            pos,
+            cache,
+            extra + LATENT,
+        )?;
+        if gain.len() < LATENT {
+            return Err(GpuError::shape(
+                what,
+                format!("gain.len() {} < {LATENT}", gain.len()),
+            ));
+        }
+        let m = launch_u32(what, "m", rows.m)?;
+        let stride = launch_u32(what, "stride", rows.stride)?;
+        let off = launch_u32(what, "off", off)?;
+        let e_off = launch_u32(what, "e_off", e_off)?;
+        let extra = launch_u32(what, "extra", extra)?;
+        let n_rows = launch_u32(what, "rows", cache.rows())?;
+        let prep = self
+            .module
+            .prepare_latent_extra_rms_append(LaunchConfig1D::new(m, BLOCK, 0))?;
+        self.module.latent_extra_rms_append(
+            stream,
+            &prep,
+            rows.x,
+            gain,
+            pos,
+            eps,
+            stride,
+            off,
+            e_off,
+            extra,
             n_rows,
             m,
             fault,
@@ -811,6 +1024,54 @@ pub fn latent_append_host(
             }
             cache[p * LATENT + d] = h;
         }
+    }
+    sites
+}
+
+/// The host rule of [`LatentKernels::enqueue_latent_extra_append`]: the
+/// latent normed as [`latent_append_host`] norms it, after the token's
+/// `extra` raw values at column `e_off`, each rounded to f16, into `cache`
+/// (`[rows][extra + LATENT]` f16 bits). Returns the mask of the sites the
+/// launch raises.
+///
+/// # Panics
+///
+/// When `x` holds fewer than `pos.len()` rows or a part passes a row, or
+/// `gain` is shorter than [`LATENT`].
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the launch's own arguments, as the host rule of one kernel entry"
+)]
+#[must_use]
+pub fn latent_extra_append_host(
+    x: &[f32],
+    stride: usize,
+    off: usize,
+    e_off: usize,
+    extra: usize,
+    gain: &[f32],
+    pos: &[u32],
+    eps: f32,
+    cache: &mut [u16],
+) -> u32 {
+    let width = extra + LATENT;
+    let rows = cache.len() / width;
+    let mut latent = vec![0u16; rows * LATENT];
+    let mut sites = latent_append_host(x, stride, off, gain, pos, eps, &mut latent);
+    for (t, &p) in pos.iter().enumerate() {
+        let p = p as usize;
+        if p >= rows {
+            continue;
+        }
+        for j in 0..extra {
+            let h = f32_to_f16_bits(x[t * stride + e_off + j]);
+            if !f16_finite(h) {
+                sites |= bit(FaultSite::CacheValue);
+            }
+            cache[p * width + j] = h;
+        }
+        cache[p * width + extra..(p + 1) * width]
+            .copy_from_slice(&latent[p * LATENT..(p + 1) * LATENT]);
     }
     sites
 }

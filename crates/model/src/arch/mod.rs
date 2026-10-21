@@ -14,6 +14,7 @@ mod classify;
 pub mod coverage;
 pub mod deepseek2;
 pub mod deepseek41;
+pub mod dflash2;
 pub mod draft;
 pub mod dspark;
 pub mod gemma_embedding;
@@ -31,6 +32,7 @@ pub mod noaux;
 pub mod place_hybrid;
 pub mod qwen35moe;
 pub mod qwen3moe;
+pub mod raon1;
 pub mod registry;
 pub mod solar2;
 mod stems;
@@ -160,6 +162,7 @@ pub enum Arch {
     Mimo2,
     SolarOpen2,
     MiniMaxM3,
+    Raon1,
     NemotronH,
     NemotronHMoe,
     GemmaEmbedding,
@@ -192,6 +195,7 @@ impl Arch {
             "mimo2" => Ok(Arch::Mimo2),
             "solar-open2" => Ok(Arch::SolarOpen2),
             "minimax-m3" => Ok(Arch::MiniMaxM3),
+            "raon1" => Ok(Arch::Raon1),
             "nemotron_h" => Ok(Arch::NemotronH),
             "nemotron_h_moe" => Ok(Arch::NemotronHMoe),
             GEMMA_EMBEDDING => Ok(Arch::GemmaEmbedding),
@@ -217,6 +221,7 @@ impl Arch {
             Arch::Mimo2 => "mimo2",
             Arch::SolarOpen2 => "solar-open2",
             Arch::MiniMaxM3 => "minimax-m3",
+            Arch::Raon1 => "raon1",
             Arch::NemotronH => "nemotron_h",
             Arch::NemotronHMoe => "nemotron_h_moe",
             Arch::GemmaEmbedding => GEMMA_EMBEDDING,
@@ -276,6 +281,15 @@ fn meta_f32(split: &Split, suffix: &str) -> Result<f32, PlacementError> {
     split
         .arch_get_f32(suffix)
         .ok_or_else(|| metadata(split, suffix, "is absent or not a float"))
+}
+
+/// `<architecture>.<suffix>` as a float, `None` when the file does not carry the key; a key of
+/// another type is an error naming it.
+pub(crate) fn optional_f32(split: &Split, suffix: &str) -> Result<Option<f32>, PlacementError> {
+    match split.value(&split.arch_key(suffix)) {
+        None => Ok(None),
+        Some(_) => meta_f32(split, suffix).map(Some),
+    }
 }
 
 /// `<architecture>.<suffix>` as a finite positive float.
@@ -1092,6 +1106,7 @@ mod tests {
             Arch::Mimo2,
             Arch::SolarOpen2,
             Arch::MiniMaxM3,
+            Arch::Raon1,
             Arch::NemotronH,
             Arch::NemotronHMoe,
             Arch::GemmaEmbedding,

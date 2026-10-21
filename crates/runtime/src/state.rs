@@ -255,6 +255,8 @@ mod tests {
                 up: LatentUp::KeqV,
                 rope: Some(rope(RopeMode::NormTail, 64)),
                 q_head_norm: false,
+                pe: 0,
+                out_gate: OutGate::None,
                 out: LatentOut::Grouped {
                     groups: 8,
                     rank: 1024,

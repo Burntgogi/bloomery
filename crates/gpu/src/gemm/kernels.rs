@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 // `gemm_swiglu_quant`'s contract spells the largest gate·up rule code as a
 // literal.
-const _: () = assert!(crate::kquant::act::ACT_MAX == 2);
+const _: () = assert!(crate::kquant::act::ACT_MAX == 3);
 
 #[cuda_module]
 mod gemm_kernels {
@@ -723,8 +723,9 @@ mod gemm_kernels {
     /// of block `(col, b)` takes values `128·b + 4·l .. +3` of column `col` of
     /// `g` and `u`, forms the gate·up rule `kquant::act::apply(act, limit, ..)`
     /// of each pair — `elem::silu_mul` (`ACT_SILU_MUL`), ik's clamped SwiGLU
-    /// at `limit` (`ACT_SWIGLU_CLAMP`) or the OAI SwiGLU at `limit`
-    /// (`ACT_SWIGLU_OAI`), the contract admits those three codes alone —
+    /// at `limit` (`ACT_SWIGLU_CLAMP`), the OAI SwiGLU at `limit`
+    /// (`ACT_SWIGLU_OAI`) or SiTU at beta `limit` (`ACT_SITU`), the contract
+    /// admits those four codes alone —
     /// and hands the four to `q8_1_quant_vals`: the values
     /// `elem::swiglu` stores under the first rule and the bytes
     /// `q3k_quantize_q8_1` writes from them, since both run the same bodies
@@ -742,7 +743,7 @@ mod gemm_kernels {
         domain = 1,
         block = (32, 1, 1),
         requires = (
-            act <= 2,
+            act <= 3,
             g.len() >= n_cols * 256 * n_sb,
             u.len() >= n_cols * 256 * n_sb,
             q3.len() >= n_cols * 64 * half_it,

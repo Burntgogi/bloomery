@@ -65,7 +65,33 @@ pub fn combine(rule: Act, g: &[f32], u: &[f32]) -> Option<(Vec<f32>, usize)> {
             );
             Some((out, bit(&|g| g > limit, limit)))
         }
+        Act::Situ { beta, linear_beta } => {
+            for ((o, &g), &u) in out.iter_mut().zip(g).zip(u) {
+                assert!(
+                    g.is_finite() && u.is_finite(),
+                    "situ: a sum that is not finite"
+                );
+                *o = situ_host(g, u, beta, linear_beta);
+            }
+            Some((out, 0))
+        }
     }
+}
+
+/// SiTU-GLU of one pair on the host, in the device rule's op order
+/// (`kquant::act::situ`) with the host's `tanh`, which differs from
+/// libdevice's by ulps.
+#[must_use]
+pub fn situ_host(g: f32, u: f32, beta: f32, linear_beta: f32) -> f32 {
+    let a = (g * (1.0 / beta)).tanh() * beta;
+    let s = 1.0 / (1.0 + silu_exp(0.0 - g));
+    let v = (u * (1.0 / linear_beta)).tanh() * linear_beta;
+    (a * s) * v
+}
+
+/// The exponential the device rule's sigmoid takes: ik's `expf` form.
+fn silu_exp(x: f32) -> f32 {
+    bloomery_gpu::linear::expf_ik(x)
 }
 
 /// The OAI SwiGLU of one pair in f64: `x / (1 + e^z) · (y + 1)` with `x =

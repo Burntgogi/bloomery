@@ -67,7 +67,10 @@ pub const QROWS: &[QRow] = &[
     QRow { ty: T::F32, name: "f32", blck: 1, bytes: 4, dequant: true, host_act: H::F32,
            card: card!(F32           F32           -       -                   -      F32     -    -) },
     // f16: ggml.c:667
-    QRow { ty: T::F16, name: "f16", blck: 1, bytes: 2, dequant: true, host_act: H::F32, card: Card::NONE },
+    // An f16 tensor loads widened to f32 (exact), the layout a BF16 one loads in; no dense entry names
+    // it, so a site over it is the f32 site of its widened rows.
+    QRow { ty: T::F16, name: "f16", blck: 1, bytes: 2, dequant: true, host_act: H::F32,
+           card: card!(Bf16AsF32     Bf16AsF32     -       -                   -      -       -    -) },
     // q4_0 and q4_1: ggml-common.h:167-171 and :174-178 (two f16 halves for q4_1). Sized and named so
     // a file holding them opens; no decoder and no CPU matmul here, so every use is refused by name.
     QRow { ty: T::Q4_0, name: "q4_0", blck: 32, bytes: 18, dequant: false, host_act: H::None, card: Card::NONE },

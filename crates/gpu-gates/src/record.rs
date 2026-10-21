@@ -3055,6 +3055,38 @@ pub static LISTENING_NEMOTRON: Kind = Kind {
     ],
 };
 
+/// The raon1 seat's load.
+pub static LOAD_RAON1: Kind = Kind {
+    name: "load_raon1",
+    head: "load",
+    doc: "The raon1 seat's model on its card: its architecture, resident bytes (the weights, the latent caches of `ctx` rows, the RDA stores and the step's scratch), the cache rows the model was loaded with (`ctx`), the resident sequences it holds (`slots`: one, the body has no more), layers, the step graph's nodes, and the load's wall.",
+    parts: &[
+        key("arch", Word, ""),
+        key("resident_bytes", U64, "B"),
+        key("ctx", U64, "positions"),
+        key("slots", U64, ""),
+        key("layers", U64, ""),
+        key("graph_nodes", U64, ""),
+        lit(" in "),
+        pos("load_s", F64(1), "s"),
+        lit(" s"),
+    ],
+};
+
+/// The raon1 seat's address.
+pub static LISTENING_RAON1: Kind = Kind {
+    name: "listening_raon1",
+    head: "bloomery-serve-raon1:",
+    doc: "The raon1 seat's placement, the context its one slot serves, the slots it serves and the address it listens on.",
+    parts: &[
+        key("place", Word, ""),
+        key("ctx", U64, "positions"),
+        key("slots", U64, ""),
+        lit(" listening on http://"),
+        pos("addr", Word, ""),
+    ],
+};
+
 /// The GGUF set a `--hf` quant picked.
 pub static HF_SET: Kind = Kind {
     name: "hf_set",
@@ -3927,6 +3959,19 @@ pub static BLOOMERY_SERVE_NEMOTRON: &[&Kind] = kinds![
     groups::fetch::FETCH,
     groups::fetch::SET,
     &[&LOAD_NEMOTRON, &LOAD_PHASES, &LISTENING_NEMOTRON],
+    groups::bind::CACHE,
+];
+
+/// What the raon1 seat of `bloomery-serve` prints, all on stderr: the
+/// placement and why (`place unset`), a `--hf` repo's resolve lines, the
+/// plan, the load and its phases, the address and each request's note of the
+/// prefix it kept less of than it shared (the RDA state keeps a prefix only
+/// at the position it stands).
+pub static BLOOMERY_SERVE_RAON1: &[&Kind] = kinds![
+    &[&PLACE_UNSET, &PLAN, &NEED],
+    groups::fetch::FETCH,
+    groups::fetch::SET,
+    &[&LOAD_RAON1, &LOAD_PHASES, &LISTENING_RAON1],
     groups::bind::CACHE,
 ];
 
@@ -5181,6 +5226,11 @@ mod tests {
                 &[fetch::FETCH, fetch::SET, bind::CACHE],
             ),
             (
+                "raon1 seat: bind::spawn",
+                BLOOMERY_SERVE_RAON1,
+                &[fetch::FETCH, fetch::SET, bind::CACHE],
+            ),
+            (
                 "glm seat: Flags::encoder, residency_set, SlotDrafts::open, bind::spawn",
                 BLOOMERY_SERVE_GLM,
                 &[
@@ -5264,6 +5314,11 @@ mod tests {
         // The nemotron_h seat counts no round (`Seat::step_stats` is its default) and has one slot.
         assert_eq!(
             missing(BLOOMERY_SERVE_NEMOTRON, bind::SLOTS),
+            ["slots round", "slot call"]
+        );
+        // The raon1 seat counts no round (`Seat::step_stats` is its default) and has one slot.
+        assert_eq!(
+            missing(BLOOMERY_SERVE_RAON1, bind::SLOTS),
             ["slots round", "slot call"]
         );
         // The MiMo seat counts no round (`Seat::step_stats` is its default): no slot record in its list.

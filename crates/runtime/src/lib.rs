@@ -35,6 +35,7 @@ pub mod prompt;
 pub mod qsa;
 pub mod savemap;
 pub mod sched;
+pub mod selector;
 pub mod seqstate;
 mod speculative;
 pub mod splitwalk;

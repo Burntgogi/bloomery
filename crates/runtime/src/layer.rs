@@ -129,8 +129,8 @@ mod tests {
     use crate::sched::{self, At, Item, LayerProgram, Overlap, Port, PortKind, Refused};
     use crate::state::{Store, StoreRule, every_position, stores};
     use models::{
-        Act, DeltaKind, DeltaRule, KdaGate, Latent, LatentOut, LatentUp, Moe, PoolRule, Router,
-        Score, Selector, Shared,
+        Act, DeltaKind, DeltaRule, KdaGate, Latent, LatentOut, LatentUp, Moe, OutGate, PoolRule,
+        Router, Score, Selector, Shared,
     };
 
     /// GLM-5.3-Flash's 45 trunk layers as `glm5next_meta.rs`'s `VIEW` pins
@@ -149,6 +149,8 @@ mod tests {
                         up: LatentUp::Absorbed { qk: 256, v: 256 },
                         rope: None,
                         q_head_norm: false,
+                        pe: 0,
+                        out_gate: OutGate::None,
                         out: LatentOut::Plain,
                         window: None,
                         sinks: false,

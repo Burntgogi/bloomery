@@ -307,6 +307,13 @@ impl Vocab {
             Some("NFC") if !matches!(model, Model::Spm) => true,
             Some(name) => return Err(Error::UnsupportedNormalizer(name.to_string())),
         };
+        // The converter's boolean spelling of the same normalizer.
+        let nfc = match m.flag("tokenizer.ggml.normalizer.nfc")? {
+            Some(true) if matches!(model, Model::Spm) => {
+                return Err(Error::UnsupportedNormalizer("nfc".to_string()));
+            }
+            flag => nfc || flag == Some(true),
+        };
         let mut texts = m
             .strings("tokenizer.ggml.tokens")?
             .ok_or(Error::Missing("tokenizer.ggml.tokens"))?;
@@ -381,6 +388,9 @@ impl Vocab {
                 let merges = m
                     .strings("tokenizer.ggml.merges")?
                     .ok_or(Error::Missing("tokenizer.ggml.merges"))?;
+                // The reference NFC-normalizes the text of a pre-tokenizer that names it
+                // ([`Pre::nfc`]) whatever the header says.
+                let nfc = nfc || pre.nfc();
                 (name.to_string(), Encoding::Bpe { pre, merges, nfc })
             }
             Model::Spm if explicit_stops.is_some() => {

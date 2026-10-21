@@ -748,3 +748,13 @@ required-features = ["hf"]
 [[bin]]
 name = "gate_qwen38_media"
 required-features = ["vision", "deepseek41"]
+
+# raon-body: the Raon-1 end-to-end gate.
+[[bin]]
+name = "gate_raon1_e2e"
+required-features = ["gpu"]
+
+# raon-attn: Raon-1's RDA and gated latent attention against the HF model in f64.
+[[bin]]
+name = "gate_raon1_attn"
+required-features = ["gpu"]

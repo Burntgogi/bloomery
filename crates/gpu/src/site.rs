@@ -126,11 +126,18 @@ impl SiteTy {
     ];
 
     /// The family of a file tensor of type `ty`, the one that launches the
-    /// kernel table's dense entry for it (`kernels::dense`); `None` for a type
-    /// no launch here reads.
+    /// kernel table's dense entry for it (`kernels::dense`); a type with no
+    /// dense entry that loads widened to f32 (F16) is the f32 site of its
+    /// widened rows; `None` for a type no launch here reads.
     #[must_use]
     pub fn of_ggml(ty: GgmlType) -> Option<SiteTy> {
-        kernels::dense(ty).and_then(SiteTy::of_entry)
+        match kernels::dense(ty) {
+            Some(entry) => SiteTy::of_entry(entry),
+            None if gguf::card::CardFormat::of(ty) == Some(gguf::card::CardFormat::Bf16AsF32) => {
+                Some(SiteTy::F32)
+            }
+            None => None,
+        }
     }
 
     /// The family that launches the kernel table's dense entry `entry`;
@@ -1195,13 +1202,16 @@ enum SwigluLaunch {
 /// `rule`; a rule the form's launch lacks is refused by name.
 fn swiglu_launch((ty, name): (SiteTy, &str), rule: Act) -> Result<SwigluLaunch, GpuError> {
     match (ty.reads(), rule) {
-        (Form::Q8x128, Act::SiluMul | Act::SwigluClamp { .. } | Act::SwigluOai { .. }) => {
-            Ok(SwigluLaunch::Q128)
-        }
+        (
+            Form::Q8x128,
+            Act::SiluMul | Act::SwigluClamp { .. } | Act::SwigluOai { .. } | Act::Situ { .. },
+        ) => Ok(SwigluLaunch::Q128),
         // `SiluMul` keeps the plain entry, which carries no rule switch; the
         // rule's entry writes the same bytes under it.
         (Form::Q8x32, Act::SiluMul) => Ok(SwigluLaunch::Q32Plain),
-        (Form::Q8x32, Act::SwigluClamp { .. } | Act::SwigluOai { .. }) => Ok(SwigluLaunch::Q32Rule),
+        (Form::Q8x32, Act::SwigluClamp { .. } | Act::SwigluOai { .. } | Act::Situ { .. }) => {
+            Ok(SwigluLaunch::Q32Rule)
+        }
         (Form::F32, Act::SiluMul) => Ok(SwigluLaunch::F32),
         (Form::F32, Act::SwigluClamp { limit }) => Err(GpuError::shape(
             "site::swiglu",
@@ -1215,6 +1225,13 @@ fn swiglu_launch((ty, name): (SiteTy, &str), rule: Act) -> Result<SwigluLaunch, 
             format!(
                 "{name} is {ty}: its SwiGLU rows are f32 and only silu(gate) · up writes them, \
                  not swigluoai at {limit}"
+            ),
+        )),
+        (Form::F32, Act::Situ { beta, .. }) => Err(GpuError::shape(
+            "site::swiglu",
+            format!(
+                "{name} is {ty}: its SwiGLU rows are f32 and only silu(gate) · up writes them, \
+                 not situ at {beta}"
             ),
         )),
         (Form::Q8Blocks32, _) => Err(GpuError::shape(

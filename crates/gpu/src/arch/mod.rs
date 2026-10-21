@@ -16,3 +16,4 @@ pub mod hybrid;
 pub mod nemotron_h;
 pub mod nemotron_h_moe;
 pub mod qwen3moe;
+pub mod raon1;

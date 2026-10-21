@@ -1,0 +1,16 @@
+# Cases of the raon vocabulary beyond cases.txt: its pre-tokenizer's alternatives and its NFC normalizer; tools/raon-oracle.sh decodes each line with printf %b.
+안녕하세요, 라온 모델입니다. 한국어 문장을 토큰화합니다.
+The quick brown fox jumps over the lazy dog. It's 5 o'clock.
+hello world foo  bar   baz
+a b c d e f g
+한국어 텍스트 mixed with English words 그리고 다시
+日本語のテキスト、中文测试。 日本 語 한자
+Hello,世界!こんにちは world
+1 12 123 1234 12345 123456 1234567 12345678 123456789 1,234,567.89
+x1y22z333w4444
+Hello 👋 world 🌍🚀 ok 👨\xe2\x80\x8d👩\xe2\x80\x8d👧
+a/b\n\nc //comment\n/* x */ a/\nb ?/\r\n
+e\xcc\x81 \xe1\x84\x92\xe1\x85\xa1\xe1\x86\xab A\xcc\x8a\xcc\x81 \xe0\xa4\xa8\xe0\xa4\xae
+ \tx \n \n y   \n
+fn main() {\n    println!("Hello, {}!", 42);\n}\n
+<|im_start|>user\n안녕<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nOK<|im_end|><|endoftext|>

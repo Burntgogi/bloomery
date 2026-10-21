@@ -2249,6 +2249,7 @@ impl KdaProj for KdaBatch<'_> {
             beta_raw,
             f,
             z,
+            ..
         } = y;
         let gemm = t >= GEMM_FROM;
         if gemm {
@@ -2462,6 +2463,7 @@ impl PromptProgram<'_> {
                 fa: &mut b.fa,
                 ga: &mut b.ga,
                 beta_raw: &mut b.beta_raw,
+                write_raw: None,
                 f: &mut b.f,
                 z: &mut b.z,
                 conv: &mut b.conv,

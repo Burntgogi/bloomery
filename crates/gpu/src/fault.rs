@@ -614,6 +614,14 @@ pub mod step_order {
         Mamba2Scan,
     ];
 
+    /// Raon-1 (`arch::raon1`): the order is [`SOLAR2`]'s — the token id (the
+    /// card's embedding), a layer's norm and quantizers, an RDA layer's conv,
+    /// delta step, lane word, stamp and gated norm, then the sites only the
+    /// attention layer meets (a latent layer's cache append and visible
+    /// count where Solar's GQA layer's stand), the router, the expert ids
+    /// and the head's logits — so a fault word decodes by it.
+    pub const RAON1: &[FaultSite] = SOLAR2;
+
     /// The order of `arch`'s step.
     #[must_use]
     pub fn of(arch: model::arch::Arch) -> &'static [FaultSite] {
@@ -626,6 +634,7 @@ pub mod step_order {
             model::arch::Arch::Mimo2 => MIMO2,
             model::arch::Arch::SolarOpen2 => SOLAR2,
             model::arch::Arch::MiniMaxM3 => MINIMAXM3,
+            model::arch::Arch::Raon1 => RAON1,
             // No program runs nemotron_h. The listing is MiMo's so a fault
             // word still decodes; it is not a step this architecture runs.
             model::arch::Arch::NemotronH => NEMOTRON_H,
@@ -976,6 +985,7 @@ mod tests {
             Arch::Mimo2,
             Arch::SolarOpen2,
             Arch::MiniMaxM3,
+            Arch::Raon1,
             Arch::NemotronH,
             Arch::NemotronHMoe,
             Arch::GemmaEmbedding,
@@ -991,6 +1001,7 @@ mod tests {
                 | Arch::Mimo2
                 | Arch::SolarOpen2
                 | Arch::MiniMaxM3
+                | Arch::Raon1
                 | Arch::NemotronH
                 | Arch::NemotronHMoe
                 | Arch::GemmaEmbedding

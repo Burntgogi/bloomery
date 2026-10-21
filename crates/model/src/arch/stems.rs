@@ -38,3 +38,31 @@ pub(crate) const fn opt(name: &'static str, role: Role) -> Stem {
 pub fn required(stems: &[Stem]) -> impl Iterator<Item = &'static str> + '_ {
     stems.iter().filter(|s| s.required).map(|s| s.name)
 }
+
+/// The stems of `parts` in order as one table of `N`; `N` is their count, held by assertion.
+pub(crate) const fn join<const N: usize>(parts: &[&[Stem]]) -> [Stem; N] {
+    let mut out = [parts[0][0]; N];
+    let (mut n, mut p) = (0, 0);
+    while p < parts.len() {
+        let mut i = 0;
+        while i < parts[p].len() {
+            out[n] = parts[p][i];
+            n += 1;
+            i += 1;
+        }
+        p += 1;
+    }
+    assert!(n == N, "join: the parts' stems are not N");
+    out
+}
+
+/// The hyper-connection tensors a trunk layer carries: the mix of each sublayer's input and
+/// output from the streams, which every family of hyper-connections names alike.
+pub const HC: &[Stem] = &[
+    req("hc_attn_fn.weight", Role::HyperConnection),
+    req("hc_attn_base.weight", Role::HyperConnection),
+    req("hc_attn_scale.weight", Role::HyperConnection),
+    req("hc_ffn_fn.weight", Role::HyperConnection),
+    req("hc_ffn_base.weight", Role::HyperConnection),
+    req("hc_ffn_scale.weight", Role::HyperConnection),
+];
