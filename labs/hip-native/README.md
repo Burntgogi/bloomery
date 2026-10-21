@@ -75,7 +75,7 @@ An absent `output.weight` aliases the embedding allocation, not a second copy.
 All token-dependent numerical work runs on the device. RoPE constants, weight names, function
 handles, dimensions and arena addresses are resolved at load. GDN uses head128, conv4, the original
 11-row input ring, tiled key heads and value-major recurrent state. GQA reads interleaved per-head
-Q/gates, applies Q/K norms and partial Neox rotation, appends round-to-nearest-even F16 KV, and attends
+Q/gates (`OutGate::Packed` only), applies Q/K norms and partial Neox rotation, appends round-to-nearest-even F16 KV, and attends
 only live causal rows. Compiled wave32 is checked before the eight-lane delta reduction.
 
 The eager GEMV lane dequantizes original GGUF bytes on the GPU and reads **F32 activations**. It is
@@ -128,6 +128,9 @@ IDs and both repeats' logit digests. `run-{0,1}/logits-NNNN.f32` is a full littl
 row after each consumed token, including prompt rows. A reference whose row zero follows the whole
 prompt aligns with native row `prompt.len() - 1`. Diagnostic host transfers and file/hash work are
 outside `Model::step`; they are not a performance path.
+
+Model-file identities and emitted logit rows use the shared `gguf::digest` SHA-256 owner. A host
+metadata check alone does not establish that this standalone binary compiles or emits valid digests.
 
 The fixed acceptance file remains `notschmee/Qwen3.5-0.8B-GGUF` revision
 `1870603ac8ab59c7ddb9d94cccf3b297e379538f`, `Qwen3.5-0.8B-Q4_K_M.gguf`,

@@ -106,7 +106,7 @@ fn row(
     file.write_all(bytes).map_err(|e| e.to_string())?;
     run.inputs.push(input);
     run.predictions.push(next);
-    run.logit_sha256.push(model::fileio::sha256_hex(bytes));
+    run.logit_sha256.push(gguf::digest::sha256_hex(bytes));
     Ok(next)
 }
 
