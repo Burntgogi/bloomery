@@ -8,7 +8,7 @@ today. Install and the one-command start are in the [README](../README.md).
 Your OpenAI client works unchanged. bloomery speaks llama-server's HTTP API and reads the same files:
 
 - **The API**: `/v1/chat/completions`, `/completion`, streaming, tool calls, `reasoning_content`,
-  `cache_prompt`, `/tokenize`, `/detokenize`, `/slots`, `/metrics`, `/v1/models`, `/props`. OpenAI SDKs, curl,
+  `cache_prompt`, `/apply-template`, `/tokenize`, `/detokenize`, `/slots`, `/metrics`, `/v1/models`, `/props`. OpenAI SDKs, curl,
   and llama-server tutorials apply as they are.
 - **The Anthropic Messages API**: `POST /v1/messages` and `/v1/messages/count_tokens`, as llama-server serves
   them. Point Claude Code or the Anthropic SDK at `ANTHROPIC_BASE_URL=http://localhost:8080`.
@@ -32,6 +32,13 @@ Your OpenAI client works unchanged. bloomery speaks llama-server's HTTP API and 
   covered: a template that builds a spelling from its own pieces around a client string (`'<' ~ key ~ '>'`, as
   Nemotron's does for the extra keys of a tool parameter's schema). A `/completion` prompt is the client's own
   tokenization and still parses special tokens.
+- **Inspecting chat prompt ids**: `POST /apply-template` accepts the chat request's `messages`, tools and template
+  options and normally answers `{"prompt": "..."}`. Set `"return_prompt_ids": true` to add `"prompt_ids": [...]`,
+  using the same guarded tokenization as chat: a user's `<think>` is ordinary text, while template-written turn
+  markers stay special tokens. Tokenizing the returned `prompt` with `/tokenize` is not equivalent, because that
+  route parses special-token spellings in the text. An absent, false or null flag keeps the text-only response;
+  another type is a named 400. Media placeholders are unexpanded in both fields: these ids precede image/video span
+  expansion, not the full multimodal engine prompt.
 - **Embeddings**: `POST /v1/embeddings` (OpenAI's shape: `encoding_format` `float` or `base64`, `dimensions`
   for a width the model cuts its vectors to) and `/embedding` or `/embeddings` (llama-server's own array) read
   `input`, or `content`, as llama-server does: a string, a list of ids, a list of strings and ids, or a list of

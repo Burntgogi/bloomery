@@ -2430,13 +2430,17 @@ fn token_ids(tok: &dyn Tokenizer, v: &Value) -> Result<Vec<u32>, ApiError> {
     ::embed::input::token_ids(tok.n_vocab(), v).map_err(ApiError::from)
 }
 
-/// `/apply-template`: the render's text, as llama-server answers it. A client string's spelling of
-/// a special token is text in the ids a chat request runs ([`crate::guard`]), and `/tokenize` of
-/// this text reads it as the token: this route shows the text, not those ids.
+/// `/apply-template`: the rendered text, with its guarded token ids when requested.
+/// Media placeholders stay unexpanded, as they do in the text.
 fn apply_template(state: &State, b: &Map<String, Value>) -> Result<Value, ApiError> {
-    // The unexpanded placeholder: an image is one placeholder token in the
-    // render, and only the request that runs it expands it to its span.
-    Ok(json!({ "prompt": render_chat(state, b)?.text }))
+    let return_ids = get_b(b, "return_prompt_ids")?.unwrap_or(false);
+    let rendered = render_chat(state, b)?;
+    let ids = return_ids.then(|| rendered.ids(&*state.tok));
+    let mut reply = json!({ "prompt": rendered.text });
+    if let Some(ids) = ids {
+        reply["prompt_ids"] = json!(ids);
+    }
+    Ok(reply)
 }
 
 /// A chat template's render: its text, each image as the model's
@@ -2448,6 +2452,15 @@ struct Rendered {
     text: String,
     guarded: Option<Guarded>,
     media: Vec<Medium>,
+}
+
+impl Rendered {
+    fn ids(&self, tok: &dyn Tokenizer) -> Vec<u32> {
+        match &self.guarded {
+            Some(guarded) => guarded.encode(tok),
+            None => tok.encode(&self.text),
+        }
+    }
 }
 
 /// Renders the chat template for an OpenAI `messages` body. An array content
@@ -3044,10 +3057,7 @@ fn media_error(e: &MediaError) -> ApiError {
 /// each image expanded to its span with its feed ([`media::expand_prompt`]),
 /// which also refuses a placeholder no image part made.
 fn chat_prompt(state: &State, rendered: &Rendered) -> Result<Prompt, ApiError> {
-    let ids = match &rendered.guarded {
-        Some(guarded) => guarded.encode(&*state.tok),
-        None => state.tok.encode(&rendered.text),
-    };
+    let ids = rendered.ids(&*state.tok);
     let Some(model) = &state.media else {
         return Ok(Prompt::from(ids));
     };
@@ -5004,6 +5014,14 @@ mod tests {
                 json!(0),
                 "a boolean",
                 "a number",
+            ),
+            (
+                "/apply-template",
+                &chat,
+                "return_prompt_ids",
+                json!("true"),
+                "a boolean",
+                "a string",
             ),
             (
                 "/tokenize",
