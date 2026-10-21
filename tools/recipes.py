@@ -4714,9 +4714,9 @@ class Reach:
                                     qualified_known.add((rk, path))
                                     for h in hits:
                                         body = _source_macro_bodies(self.text(h[1]), h[0][2]).get(h[2])
-                                        # Nested expansions/attributes may emit names absent from source edges.
+                                        # Imports and nested expansions may emit names absent from source edges.
                                         # Bound the invoker, not an unrelated item elsewhere in the macro crate.
-                                        if body is None or any(_key_attributes(body)) or any(
+                                        if body is None or re.search(r"\b(?:use|extern\s+crate)\b", body) or any(_key_attributes(body)) or any(
                                                 match.group(1).removeprefix("r#") not in syntax_words
                                                 for match in _MACRO_PATH_CALL.finditer(body)):
                                             opaque = True

@@ -217,7 +217,7 @@ def source_macro_files(kind: str) -> dict[str, str]:
     files = runtime_files()
     files["crates/dep/src/lib.rs"] += "mod hidden;\nmod startup;\n"
     files["crates/dep/src/hidden.rs"] = 'pub fn run() { println!("source-macro1"); }\n'
-    if kind in ("exported-startup", "exported-expression", "exported-proc-startup"):
+    if kind in ("exported-startup", "exported-expression", "exported-import", "exported-proc-startup"):
         files["Cargo.toml"] = files["Cargo.toml"].replace('"crates/dep"]', '"crates/dep", "crates/macros"]')
         files["crates/dep/Cargo.toml"] += '[dependencies]\nmacros = { path = "../macros" }\n'
         files["crates/macros/Cargo.toml"] = package("macros")
@@ -234,8 +234,10 @@ macro_rules! boot {
 }
 '''
         files["crates/dep/src/startup.rs"] = "macros::boot!();\n"
-        if kind == "exported-expression":
+        if kind in ("exported-expression", "exported-import"):
             files["crates/macros/src/lib.rs"] = '#[macro_export]\nmacro_rules! boot { () => { crate::hidden::run() }; }\n'
+            if kind == "exported-import":
+                files["crates/macros/src/lib.rs"] = '#[macro_export]\nmacro_rules! boot { () => {{ use crate::hidden::run; run(); }}; }\n'
             files["crates/dep/src/startup.rs"] = "pub fn run() { macros::boot!(); }\n"
             files["crates/dep/src/used.rs"] = "pub fn run() { crate::startup::run(); }\n"
         elif kind == "exported-proc-startup":
@@ -320,7 +322,7 @@ class RecipeKeyCLI(unittest.TestCase):
                 ws.assert_status(ws.keys(*items, ledger=True), {"gate-called": "run", "gate-linked": "skip"})
 
     def test_known_source_macro_startup_and_implicit_impl_inputs(self):
-        for kind in ("exported-startup", "exported-expression", "exported-proc-startup", "local-drop", "shadowed-builtin"):
+        for kind in ("exported-startup", "exported-expression", "exported-import", "exported-proc-startup", "local-drop", "shadowed-builtin"):
             with self.subTest(expansion=kind):
                 files = source_macro_files(kind)
                 ws = Workspace(self, files)
