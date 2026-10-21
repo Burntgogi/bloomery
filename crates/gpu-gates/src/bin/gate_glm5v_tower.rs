@@ -51,6 +51,10 @@ mod vision_rules;
 
 #[cfg(feature = "vision")]
 #[path = "shared/vision_taps.rs"]
+#[allow(
+    dead_code,
+    reason = "shared by the tower gates; each runs a part of it"
+)]
 mod vision_taps;
 
 #[cfg(feature = "vision")]

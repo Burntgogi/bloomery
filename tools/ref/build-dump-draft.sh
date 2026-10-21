@@ -11,9 +11,10 @@
 # nothing else in the tree may differ from BASE_SHA. A tree that is neither pristine nor exactly
 # patched is refused — a hand edit there would reach the oracle under this build's name.
 #
-# The cmake flags are the ones BASE's build was configured with (its CMakeCache's non-default
-# entries). After the configure, every GGML_* and LLAMA_* cache entry is compared with BASE's
-# cache, and a difference stops the build: the two trees must differ by the patch alone.
+# After configure, all selected GGML_* and LLAMA_* cache rows must match BASE's,
+# including options present in only one tree. Readable empty snapshots may agree;
+# failed snapshots or comparisons stop before the lease and build. The trees
+# must differ by the patch alone.
 #
 # The ik build uses every core for minutes, so it runs under the machine-wide CPU lease (a timed
 # sitting would otherwise measure it). The oracle's `# build` line is DRAFT_BUILD below; the
@@ -89,8 +90,18 @@ ugit "$IK" diff --stat "$BASE_SHA"
 # BASE's configure, spelled out: the non-default entries of its CMakeCache.
 as_user cmake -S "$IK" -B "$IK/build" -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON \
   -DCMAKE_CUDA_ARCHITECTURES=86 -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc > /dev/null
-cache_flags() { grep -E '^(GGML|LLAMA)_[A-Z0-9_]*:[A-Z]+=' "$1/build/CMakeCache.txt" | grep -v '_FOUND:' | sort; }
-if ! diff <(cache_flags "$BASE") <(cache_flags "$IK"); then
+# shellcheck source=tools/ref/cache-options.sh
+source "$(dirname "${BASH_SOURCE[0]}")/cache-options.sh"
+base_flags=$(ref_cache_flags build-dump-draft "$BASE") || exit 2
+draft_flags=$(ref_cache_flags build-dump-draft "$IK") || exit 2
+if diff <(printf '%s' "$base_flags") <(printf '%s' "$draft_flags"); then
+  :
+else
+  rc=$?
+  if [ "$rc" != 1 ]; then
+    echo "build-dump-draft: cache comparison failed (diff exit $rc), no verdict" >&2
+    exit 2
+  fi
   echo "build-dump-draft: $IK/build is configured differently from $BASE/build (diff above)" >&2
   exit 1
 fi

@@ -140,6 +140,7 @@ gate-gpu-qwen35moe-media	family	qwen35moe	media	serve_media
 gate-gpu-qwen35moe-moe	family	qwen35moe	kernel	moe_route
 gate-gpu-qwen35moe-mtp	family	qwen35moe	draft	drafts_mtp
 gate-gpu-qwen35moe-verify	family	qwen35moe	draft	drafts_mtp
+gate-gpu-qwen38-media	family	qwen4exp	media	serve_media
 gate-gpu-qwen38-nodes	family	qwen4exp	tier	node_link+placement_nodes
 gate-gpu-qwen38-nodes-remote	family	qwen4exp	tier	node_link+placement_nodes
 gate-gpu-qwen38-residency	family	qwen4exp	residency	residency

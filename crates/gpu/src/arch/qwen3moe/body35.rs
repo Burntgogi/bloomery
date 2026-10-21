@@ -78,7 +78,9 @@ use super::body::{Kernels, KvQ8, TapRows, f32_site};
 use super::dispatch::{self, PassCtx};
 use super::draft_taps::DraftTaps;
 use super::head_argmax::HeadArgmaxState;
-use super::image::{ImageWrite, MediaRows, PromptImage};
+use super::image::{
+    ImageWrite, MediaCarrier, MediaRows, PromptImage, imrope_sections, media_call, section_order,
+};
 use super::mtp35::Mtp35;
 use super::placed::{
     BatchWalk, PLACED_ROWS, Placed, PlacedOpen, StepWalk, WalkParts, apart_plans, counted_arena,
@@ -110,7 +112,7 @@ use crate::host::xstream::{Costs, XLayer, XMode, XReport, XStreamBody};
 use crate::host::{BatchLeg, StepLeg};
 use crate::hybrid::{Chain, SlotMap};
 use crate::linear::{self, LinearShape};
-use crate::media::{ImageSpan, MediaBody, MediaSpan, SeqRope};
+use crate::media::{ImageSpan, MediaBody, MediaSpan, RopeBase, SeqRope, kept_rule, rope_table};
 use crate::model::fit::{FIT_RESERVE, largest_fit};
 use crate::model::{
     ChainBody, GpuModel, HostServed, Instrumented, MAX_PASS_ROWS, Rollback, Rows, SlotRange, Slots,
@@ -127,9 +129,9 @@ use gguf::Split;
 use gguf::quant::GgmlType;
 use model::arch::Arch;
 use model::arch::models::shape::MoeShape;
-use model::arch::models::{Ffn, LayerSpec, Mixer, ModelSpec, MtpDraft, RopeMode};
+use model::arch::models::{Ffn, LayerSpec, Mixer, ModelSpec, MtpDraft};
 use model::placement::{Plan, WholeLoad, accepts};
-use runtime::seqstate::{Kept, Price, Why};
+use runtime::seqstate::{Kept, Price};
 use std::num::NonZeroUsize;
 use std::ops::Range;
 use std::sync::Arc;
@@ -422,25 +424,6 @@ pub struct Slot35 {
     ckpt: Checkpoints,
     /// The sequence's rotation table on a media load ([`Body35::seq_rope`]).
     pub(super) rope: Option<SeqRope>,
-}
-
-/// What a media load makes each sequence's rotation table from
-/// ([`SeqRope::new`]): the plain table's host rows, shared by every table,
-/// the file's IMROPE sections and the order they read an image row's
-/// position slots in (`rope.section_order`).
-struct RopeBase {
-    base: Arc<[f32]>,
-    sections: [u32; 4],
-    order: vision::mrope::SectionOrder,
-}
-
-/// The table the rope launches of a sequence read: its own on a media load,
-/// else the load's.
-pub(super) fn rope_table<'a>(
-    rope: &'a RopeRows,
-    own: Option<&'a SeqRope>,
-) -> &'a DeviceBuffer<f32> {
-    own.map_or(&rope.table, SeqRope::table)
 }
 
 /// `name` of layer `l`.
@@ -1059,35 +1042,15 @@ impl Pre35 {
             ))?;
         let sections = media
             .then(|| {
-                spec.layers.iter().find_map(|s| match &s.mixer {
-                    Mixer::Gqa(g) => match g.rope.mode {
-                        RopeMode::Imrope { sections } => Some(sections),
-                        _ => None,
-                    },
-                    _ => None,
-                })
-            })
-            .map(|found| {
-                found.ok_or(GpuError::shape(
+                let sections = imrope_sections(&spec).ok_or(GpuError::shape(
                     WHAT,
                     "a media load of a file with no IMROPE attention layer: an image's positions \
                      have no sections to follow",
-                ))
-            })
-            .transpose()?
-            .map(|sections| {
-                let order = match model::arch::qwen35moe::hparams::Hparams::read(file)
+                ))?;
+                let order = model::arch::qwen35moe::hparams::Hparams::read(file)
                     .map_err(|e| GpuError::plan(WHAT, e))?
-                    .rope_order
-                {
-                    model::arch::qwen35moe::hparams::SectionOrder::Tyxz => {
-                        vision::mrope::SectionOrder::Tyxz
-                    }
-                    model::arch::qwen35moe::hparams::SectionOrder::Zyxt => {
-                        vision::mrope::SectionOrder::Zyxt
-                    }
-                };
-                Ok::<_, GpuError>((sections, order))
+                    .rope_order;
+                Ok::<_, GpuError>((sections, section_order(order)))
             })
             .transpose()?;
         if mma && kinds.contains(&Kind35::Gqa(Flash::Pairs)) {
@@ -1623,15 +1586,8 @@ impl Body35 {
             Some((sections, order)) => {
                 let base: Arc<[f32]> =
                     RopeRows::host_rows(&table, q35::ROPE_DIMS as usize, ctx)?.into();
-                let own = SeqRope::new(stream, base.clone(), sections, order, ctx)?;
-                (
-                    Some(own),
-                    Some(RopeBase {
-                        base,
-                        sections,
-                        order,
-                    }),
-                )
+                let base = RopeBase::new(base, sections, order);
+                (Some(base.seq(stream, ctx)?), Some(base))
             }
             None => (None, None),
         };
@@ -1802,32 +1758,21 @@ impl Body35 {
     /// else every position, the empty model at 0, or the nearest checkpoint
     /// at or below `n`, nothing (`Missed`) when none lies there — a delta
     /// layer keeps no earlier state but a copy. After a call failed past its
-    /// launch the stores hold more than `pos`, which is no longer kept.
-    /// Never past `pos`. The rule [`Body35::commit`] takes on a load that
-    /// verifies drafted rows, [`Body35::cut`] otherwise.
+    /// launch the stores hold more than `pos`, which is no longer kept. On a
+    /// media load a point inside an image grants nothing: the cut is asked
+    /// again at the image's start. Never past `pos`. The rule
+    /// [`Body35::commit`] takes on a load that verifies drafted rows,
+    /// [`Body35::cut`] otherwise.
     #[must_use]
     pub fn kept(&self, n: u32, pos: u32) -> Kept {
-        if let Some(p) = &self.pending
-            && n > p.pos0
-        {
-            let at = n.min(self.held);
-            let why = if at == self.held {
-                Why::Current
+        let verify = self.pending.map(|p| p.pos0);
+        kept_rule(self.seq_rope.as_ref(), verify, self.held, n, |n| {
+            if self.held == pos {
+                self.ckpt.kept(n, pos)
             } else {
-                Why::Rule
-            };
-            return Kept {
-                asked: n,
-                held: self.held,
-                at,
-                why,
-            };
-        }
-        if self.held == pos {
-            self.ckpt.kept(n, pos)
-        } else {
-            self.ckpt.kept(n.min(pos), self.held)
-        }
+                self.ckpt.kept(n.min(pos), self.held)
+            }
+        })
     }
 
     /// The checkpoints: their positions, their slots, what they have done.
@@ -2727,186 +2672,15 @@ impl Body35 {
     pub fn takes_media(&self) -> bool {
         self.seq_rope.is_some()
     }
-
-    /// Refuse a call whose first position `pos` lies strictly inside an image
-    /// the live sequence's table holds: the table's rows there are the
-    /// image's, which the call's own ids (text, or a span after the image's
-    /// end) would read. A sequence stands there when a call failed inside an
-    /// image (the table keeps the image whole) or a record was restored
-    /// ahead of the state it belongs to. A cut back to the image's start
-    /// ([`Rollback::rollback_on`]) or a reset takes the image away. Nothing
-    /// moves; a text load holds no image.
-    pub(super) fn refuse_inside_image(&self, what: &'static str, pos: u32) -> Result<(), GpuError> {
-        let Some(rope) = &self.seq_rope else {
-            return Ok(());
-        };
-        let row = pos as usize;
-        match rope
-            .rows()
-            .seq()
-            .spans()
-            .find(|&(at, nx, ny)| at < row && row < at + nx * ny)
-        {
-            None => Ok(()),
-            Some((at, nx, ny)) => Err(GpuError::shape(
-                what,
-                format!(
-                    "a call at position {pos} inside the image at rows {at}..{}: the rotation \
-                     table holds the image's rows there; cut back to {at} or reset first",
-                    at + nx * ny
-                ),
-            )),
-        }
-    }
 }
 
 impl GpuModel<Body35> {
-    /// The images the live sequence's rotation table holds, to keep beside a
-    /// save of the sequence's state; the empty record on a text load.
-    pub fn rope_saved(&self) -> Result<MropeSeq, GpuError> {
-        let body = self.body("qwen35moe::rope_saved")?;
-        Ok(body
-            .seq_rope
-            .as_ref()
-            .map_or_else(MropeSeq::new, SeqRope::saved))
-    }
-
     /// The rotation table the live sequence's rope launches read, `ctx` rows
     /// of 64 values read back: a media load's own, else the load's. An
     /// instrument; synchronizes.
     pub fn rope_rows(&self) -> Result<Vec<f32>, GpuError> {
         let body = self.body("qwen35moe::rope_rows")?;
         Ok(rope_table(&body.rope, body.seq_rope.as_ref()).to_host_vec(self.gpu().stream())?)
-    }
-
-    /// Keep (`on`) or stop keeping and drop what was kept of every unit's
-    /// rows as its first layer reads them: the embedding rows of the unit's
-    /// positions after a media call's rows replaced theirs, `(first
-    /// position, rows)` read back eagerly after each unit's copies, so the
-    /// unit's launches wait for the read. An instrument for gates; refused by
-    /// name on a load opened without media.
-    pub fn set_media_tap(&mut self, on: bool) -> Result<(), GpuError> {
-        const WHAT_T: &str = "qwen35moe::set_media_tap";
-        let (_, _, body) = self.body_parts(WHAT_T)?;
-        let rows = body.u.media.as_mut().ok_or(GpuError::state(
-            WHAT_T,
-            "a load opened with media (Open35::media)",
-        ))?;
-        rows.set_tap(on);
-        Ok(())
-    }
-
-    /// The rows the tap kept since the last call ([`GpuModel::set_media_tap`]),
-    /// in unit order, and the tap emptied.
-    pub fn take_media_tap(&mut self) -> Result<Vec<(usize, Vec<f32>)>, GpuError> {
-        const WHAT_T: &str = "qwen35moe::take_media_tap";
-        let (_, _, body) = self.body_parts(WHAT_T)?;
-        body.u
-            .media
-            .as_mut()
-            .and_then(MediaRows::take_tap)
-            .ok_or(GpuError::state(WHAT_T, "the tap armed on a media load"))
-    }
-
-    /// Take `seq` (from [`GpuModel::rope_saved`]) as the images of the live
-    /// sequence: the table's rows from the first image that differs are
-    /// rewritten. The record belongs to the state the sequence stands at, so
-    /// the caller restores it with that state. A record that holds an image
-    /// is refused by name on a text load, and one that reaches past the
-    /// cache by the table.
-    pub fn rope_restore(&mut self, seq: MropeSeq) -> Result<(), GpuError> {
-        const WHAT_S: &str = "qwen35moe::rope_restore";
-        let (gpu, _, body) = self.body_parts(WHAT_S)?;
-        match body.seq_rope.as_mut() {
-            Some(rope) => rope.restore(gpu.stream(), seq),
-            None if seq.is_empty() => Ok(()),
-            None => Err(GpuError::shape(
-                WHAT_S,
-                "a record of images for a load opened without media (Open35::media): a text \
-                 load's sequence holds none",
-            )),
-        }
-    }
-}
-
-/// A media call of `spans` over `ids` on `m`, as `run` feeds `ids` (the call
-/// is eager, every unit on [`PrefillPath::Wide`]): the spans checked, the
-/// images' rows entered in the sequence's rotation table and their rows
-/// staged for the units, then `run`. No span is the plain call. A call that
-/// fails returns its own error, and takes back the images of the positions it
-/// did not feed: the model stands where its last unit left it, and the table
-/// holds the images that start before that position, so the next call reads
-/// the rows the cache holds. An image the fed positions cut cannot be taken
-/// back (a cut inside an image is refused) and stays whole in the table; a
-/// later call that starts inside it, a prompt or a step, is refused by name
-/// ([`Body35::refuse_inside_image`]), and a cut back
-/// ([`Rollback::rollback_on`]) or a reset takes it away. A take-back that
-/// fails on the card is named beside the call's error.
-fn media_call<T>(
-    m: &mut GpuModel<Body35>,
-    what: &'static str,
-    ids: &[u32],
-    spans: &[ImageSpan<'_>],
-    run: impl FnOnce(&mut GpuModel<Body35>) -> Result<T, GpuError>,
-) -> Result<T, GpuError> {
-    let pos = m.pos();
-    let first = pos as usize;
-    let hidden = m.body(what)?.hidden();
-    m.body(what)?.refuse_inside_image(what, pos)?;
-    ImageSpan::check(what, spans, ids.len(), hidden)?;
-    if spans.is_empty() {
-        return run(m);
-    }
-    {
-        let (gpu, _, body) = m.body_parts(what)?;
-        if !body.takes_media() {
-            return Err(GpuError::shape(
-                what,
-                format!(
-                    "{} image spans on a load opened without media (Open35::media): a text \
-                     load's sequences hold one rotation table",
-                    spans.len()
-                ),
-            ));
-        }
-        if crate::capturing(gpu.stream())? {
-            return Err(GpuError::state(
-                what,
-                "an eager call: a captured unit would bake the staged rows' address",
-            ));
-        }
-    }
-    m.prefill_plan(ids.len(), PrefillPath::Wide)?;
-    {
-        let (gpu, _, body) = m.body_parts(what)?;
-        let stream = gpu.stream();
-        let Body35 { seq_rope, u, .. } = body;
-        let (Some(rope), Some(rows)) = (seq_rope.as_mut(), u.media.as_mut()) else {
-            return Err(GpuError::state(what, "the media load's table and staging"));
-        };
-        rows.begin(stream, first, spans)?;
-        if let Err(e) = rope.push_images(stream, first, spans) {
-            rows.end();
-            return Err(e);
-        }
-    }
-    let ran = run(m);
-    let stood = m.pos() as usize;
-    let (gpu, _, body) = m.body_parts(what)?;
-    if let Some(rows) = body.u.media.as_mut() {
-        rows.end();
-    }
-    match (ran, body.seq_rope.as_mut()) {
-        (Err(e), Some(rope)) => match rope.cut(gpu.stream(), stood) {
-            // A cut inside an image is refused by the table and changes
-            // nothing: the call's own error stands.
-            Ok(()) | Err(GpuError::Shape { .. }) => Err(e),
-            Err(undo) => Err(GpuError::shape(
-                what,
-                format!("{e}; and the images past the fed positions were not taken back: {undo}"),
-            )),
-        },
-        (ran, _) => ran,
     }
 }
 
@@ -2919,6 +2693,28 @@ impl XStreamBody for Body35 {
     /// [`Body35::xstream_word`].
     fn xstream_word(&self) -> String {
         Body35::xstream_word(self)
+    }
+}
+
+/// The check of a media call's plan: `tokens` ids run as wide units
+/// ([`GpuModel::prefill_plan`]).
+fn plan_wide(tokens: usize) -> impl FnOnce(&GpuModel<Body35>) -> Result<(), GpuError> {
+    move |m| m.prefill_plan(tokens, PrefillPath::Wide).map(drop)
+}
+
+impl MediaCarrier for Body35 {
+    const VIA: &'static str = "Open35::media";
+
+    fn width(&self) -> usize {
+        self.hidden()
+    }
+
+    fn seq_rope(&self) -> Option<&SeqRope> {
+        self.seq_rope.as_ref()
+    }
+
+    fn media_parts(&mut self) -> Option<(&mut SeqRope, &mut MediaRows)> {
+        self.seq_rope.as_mut().zip(self.u.media.as_mut())
     }
 }
 
@@ -2948,9 +2744,13 @@ impl MediaBody for Body35 {
         ids: &[u32],
         spans: &[ImageSpan<'_>],
     ) -> Result<u32, GpuError> {
-        media_call(m, "qwen35moe::prefill_media", ids, spans, |m| {
-            m.prefill_with(ids, PrefillPath::Wide)
-        })
+        media_call(
+            m,
+            "qwen35moe::prefill_media",
+            (ids, spans),
+            plan_wide(ids.len()),
+            |m| m.prefill_with(ids, PrefillPath::Wide),
+        )
     }
 
     /// [`GpuModel::prefill_hidden`] on [`PrefillPath::Wide`], as
@@ -2961,9 +2761,13 @@ impl MediaBody for Body35 {
         ids: &[u32],
         spans: &[ImageSpan<'_>],
     ) -> Result<Vec<f32>, GpuError> {
-        media_call(m, "qwen35moe::prefill_hidden_media", ids, spans, |m| {
-            m.prefill_hidden(ids, PrefillPath::Wide)
-        })
+        media_call(
+            m,
+            "qwen35moe::prefill_hidden_media",
+            (ids, spans),
+            plan_wide(ids.len()),
+            |m| m.prefill_hidden(ids, PrefillPath::Wide),
+        )
     }
 }
 
@@ -3152,7 +2956,7 @@ impl Slots for Body35 {
         let rope = self
             .rope_base
             .as_ref()
-            .map(|b| SeqRope::new(stream, b.base.clone(), b.sections, b.order, d.ctx))
+            .map(|b| b.seq(stream, d.ctx))
             .transpose()?;
         Ok(Slot35 {
             stores,

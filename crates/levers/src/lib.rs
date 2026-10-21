@@ -37,7 +37,7 @@ pub use registry::{
     LANE_PREFETCH, LANE_PREFETCH_DEFAULT, MTP_DRAFT, MTP_HEAD_ROWS, MTP_WIDTH, MTP_WINDOWS,
     NEED_HOOK, NVTIER_BYTES, NVTIER_MEM, NVTIER_READ, PIN_MAIN, PREFILL, PREFILL_GROUP,
     PREFILL_GROUP_DEFAULT, PREFILL_GROUP_MAX, QWEN3_KV, QWEN38_EXPERTS, R8, RESIDENCY, ROUTE_TRACE,
-    SCREEN, SPIN, STEP_STATS, THREADS, TIER_LINK, TIER_NODES, TP_NODES,
+    SCREEN, SPIN, STEP_STATS, THREADS, TIER_LINK, TIER_NODES, TP_NODES, WARM_PROFILE,
 };
 pub use registry::{SCHEMAJUMP, SPLIT_WALK, XSTREAM};
 
@@ -888,6 +888,14 @@ impl Levers {
         }
     }
 
+    fn path(&self, name: &str) -> Option<&Path> {
+        match &self.entry(name).value {
+            None => None,
+            Some(Value::Path(p)) => Some(p),
+            v => panic!("{name} holds {v:?}, not a path"),
+        }
+    }
+
     fn count(&self, name: &str) -> Option<u64> {
         match self.entry(name).value {
             None => None,
@@ -991,11 +999,7 @@ impl Levers {
     /// the family's path — `refset::arch::qwen4exp::mtp::draft_file`).
     #[must_use]
     pub fn mtp_draft(&self) -> Option<&Path> {
-        match &self.entry(MTP_DRAFT).value {
-            None => None,
-            Some(Value::Path(p)) => Some(p),
-            v => panic!("{MTP_DRAFT} holds {v:?}, not a path"),
-        }
+        self.path(MTP_DRAFT)
     }
 
     /// `BLOOMERY_MTP_WINDOWS`: every drafted window's proposal, probabilities
@@ -1016,11 +1020,13 @@ impl Levers {
     /// (no trace).
     #[must_use]
     pub fn route_trace(&self) -> Option<&Path> {
-        match &self.entry(ROUTE_TRACE).value {
-            None => None,
-            Some(Value::Path(p)) => Some(p),
-            v => panic!("{ROUTE_TRACE} holds {v:?}, not a path"),
-        }
+        self.path(ROUTE_TRACE)
+    }
+
+    /// `BLOOMERY_WARM_PROFILE`: the residency's usage profile; `None` unset.
+    #[must_use]
+    pub fn warm_profile(&self) -> Option<&Path> {
+        self.path(WARM_PROFILE)
     }
 
     /// `BLOOMERY_QWEN38_EXPERTS`: where a Qwen3.8 plan puts the routed
@@ -2030,6 +2036,10 @@ pub enum Draft38Off {
     /// machine's drive scaling with the queue depth a verify's fills run
     /// at); a set [`DRAFT`] runs.
     Paged { arena: u64 },
+    /// Unset on the Qwen3.8 seat beside `--mmproj`: an image load gives every
+    /// sequence a rotation table the draft's walks do not read, so it carries
+    /// no draft; a set [`DRAFT`]`=mtp` is refused.
+    Media,
 }
 
 impl fmt::Display for Draft38Off {
@@ -2069,6 +2079,10 @@ impl fmt::Display for Draft38Off {
                 f,
                 "unset: the plan pages host experts through the NVMe tier's {arena} B RAM arena, \
                  and the draft is off by default there; set {DRAFT}=mtp to draft on a paged plan"
+            ),
+            Draft38Off::Media => f.write_str(
+                "unset: --mmproj makes an image load, whose sequences hold rotation tables the \
+                 MTP draft's walks do not read",
             ),
         }
     }
@@ -2661,11 +2675,7 @@ pub struct NeedLevers {
 pub fn need_levers() -> Result<NeedLevers, LeverError> {
     let env: Vec<(OsString, OsString)> = std::env::vars_os().collect();
     let levers = read(&env, Scope::Need)?;
-    let hook = match &levers.entry(NEED_HOOK).value {
-        None => None,
-        Some(Value::Path(p)) => Some(p.clone()),
-        v => panic!("{NEED_HOOK} holds {v:?}, not a path"),
-    };
+    let hook = levers.path(NEED_HOOK).map(Path::to_path_buf);
     Ok(NeedLevers {
         hook,
         host_lock: levers.flag(HOST_LOCK),

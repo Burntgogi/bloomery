@@ -78,6 +78,11 @@ script reads is empty, `--only` matches no unit, or `git status` fails in the tr
 no commit is named). `CONTRIB_INJECT_FAIL=1` adds one deliberately failing unit, so the red path can be shown to fail
 first.
 
+The flowcounts weekly reads its record parser and schema, routing data and statistical tools, not the hub reader.
+Use `python3 tools/recipes.py why tools/bloomery/hf.py --recipe weekly-gpu-ds41-flowcounts` to inspect that boundary.
+The script walk is conservative: a helper's prose must not turn the self-tests that use it into dependencies of
+the helper itself. The regression holds both the absent hub input and the retained executable inputs.
+
 The gate-batch self-test waits for stopped fixture lanes and their registered
 items to finish before a case can remove its tree. A delayed TERM-handler case
 checks that the lane's last write has completed; a teardown failure still fails

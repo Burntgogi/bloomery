@@ -11981,12 +11981,13 @@ def _st_real_tree(fails: list[str], side: Side) -> None:
     # PIN(2026-10-16): gate-gpu-nemotron-h-moe-serve joins them; the same seat gate on the moe body
     # PIN(2026-10-16): the embedding serve gate also builds bloomery-serve, including its V4.1 seat.
     # PIN(2026-10-17): the v1 embedding serve gate builds the same server and its V4.1 seat.
+    # PIN(2026-10-19): the Qwen3.8 media gate builds bloomery-serve beside its own bin for its serve clauses.
     # PIN(2026-10-20): gate-serve-draft-rules tests both serve bins, including their V4.1 draft.
     # PIN(2026-10-20): gate-gpu-solar2-serve joins them; its recipe builds bloomery-serve beside its own bin.
     expect(dspark == {"gate-gpu-clef-serve", "gate-gpu-ds41-chat", "gate-gpu-ds41-draft", "gate-gpu-ds41-dspark-loop",
                       "gate-gpu-ds41-prefill", "gate-gpu-ds41-tier", "gate-gpu-ds41-twocard", "gate-gpu-gemma-embedding-serve", "gate-gpu-gemma-embedding2-serve", "gate-gpu-glm5next-serve",
                       "gate-gpu-lev-serve", "gate-gpu-nemotron-h-moe-serve", "gate-gpu-nemotron-serve",
-                      "gate-gpu-qwen3-serve", "gate-gpu-serve-start-ds41", "gate-gpu-serve-start-glm", "gate-gpu-solar2-serve", "gate-ptx-spill", "gate-serve-draft-rules"},
+                      "gate-gpu-qwen3-serve", "gate-gpu-qwen38-media", "gate-gpu-serve-start-ds41", "gate-gpu-serve-start-glm", "gate-gpu-solar2-serve", "gate-ptx-spill", "gate-serve-draft-rules"},
            f"shared/ds41_dspark.rs (a #[path] module of the bins that name it) selects {sorted(dspark)}")
     hybrid = sel("crates/gpu/src/hybrid.rs")
     expect("gate-gpu-e2e" in hybrid and "gate-ops" not in hybrid and len(hybrid) < len(gates) - 20,
@@ -12014,6 +12015,10 @@ def _st_real_tree(fails: list[str], side: Side) -> None:
     schema = sel("tools/bloomery/schema/generate_ds41.jsonl") | {n for n in weeklies if graph.inputs(n).match("tools/bloomery/schema/generate_ds41.jsonl")}
     # PIN(2026-10-20): gate-q38-serve-rules also runs the lib's serve_client tests and record schema includes.
     expect(schema == {"gate-gpu-gates-lib", "gate-ds41-oracle", "gate-ds41-kld", "gate-ds41-bind", "gate-ds41-place", "gate-q38-serve-rules", "weekly-gpu-ds41-flowcounts"}, f"a record schema selects {sorted(schema)}")
+    flow = graph.inputs("weekly-gpu-ds41-flowcounts")
+    expect(flow.match("tools/bloomery/hf.py") is None, "flowcounts must not key the unrelated hub reader through self-test prose")
+    for path in ("tools/bloomery/records.py", "tools/flow/routes.py", "tools/gpu-ab.py", "tools/ref/tdist.py"):
+        expect(flow.match(path) is not None, f"flowcounts lost its executable input {path}")
     for n in ("check", "lint"):
         expect(graph.inputs(n).match("tools/levers-direct.txt") is not None, f"{n} (--all-targets) does not read tools/levers-direct.txt")
 

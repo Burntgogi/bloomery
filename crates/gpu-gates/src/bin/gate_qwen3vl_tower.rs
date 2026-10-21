@@ -57,8 +57,8 @@ mod gate {
 
     use super::vision_rules::{Count, exact_check, gemm_check, near_check, norm_rows, par_rows};
     use super::vision_taps::{
-        Collect, HostFile, band_check, dist, dist_f32, eager_twice, floor, ggml_table, nudge,
-        nudged, read_image, reuse_after_largest, sens as sensitivity, to_bf16, to_f32,
+        Collect, HostFile, K_TAP, band_check, dist, dist_f32, eager_twice, floor, ggml_table,
+        nudge, nudged, read_image, reuse_after_largest, sens as sensitivity, to_bf16, to_f32,
     };
     use bloomery_gpu_gates::{GateError, checks_failed, verdict};
     use bloomery_gpu_vision::attn::{QkvLayout, attn_72_ref, attn_bound};
@@ -86,12 +86,6 @@ mod gate {
     const CLEF_SCRATCH_BYTES: u64 = 570_949_632;
     /// The blocks whose nodes the set holds.
     const TAP_BLOCKS: [usize; 4] = [0, 1, 13, 26];
-    /// A tap passes when `rms(ours − ref) / rms(ref)` is at most this multiple of the larger of its
-    /// controls.
-    /// PIN(2026-10-10): fixed before the first run of this engine against the set; the design's
-    /// prediction is a block output at about 1.6× the rounding floor, so 4 leaves room for a
-    /// free-running network's amplification without admitting an order-one defect.
-    const K_TAP: f64 = 4.0;
     /// Values of the tanh GELU sweep of [−8, 8] that may differ from the host rule, each by one
     /// bf16 step at most: the device's `tanhf` against the host's.
     /// PIN(2026-10-10): the first measurement of this build; see the sweep line.

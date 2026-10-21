@@ -2268,6 +2268,35 @@ pub static RESIDENCY_RESET: Kind = Kind {
     ],
 };
 
+/// The residency's usage profile read at the load's end
+/// (`app::warm::WarmFile::load`).
+pub static WARM_LOAD: Kind = Kind {
+    name: "warm_load",
+    head: "warm load",
+    doc: "The residency's usage profile read at the load's end: `reseeded` (the card set moved \
+          to the profile's rankings: the experts copied onto the card, the live map's entries \
+          that differ from the new seed after it, 0 when it worked), `missing` (no file) or \
+          `refused` (the file is not this load's profile, `why` naming it); the last two keep \
+          the placement's seed.",
+    parts: &[
+        key("outcome", Word, ""),
+        opt("copies", U64, ""),
+        opt("diff", U64, ""),
+        opt("why", Text, ""),
+    ],
+};
+
+/// The residency's usage profile written at the run's end
+/// (`app::warm::WarmFile::save`).
+pub static WARM_SAVE: Kind = Kind {
+    name: "warm_save",
+    head: "warm save",
+    doc: "The residency's usage profile written at the run's end, the run's usage folded in: its \
+          bytes, and `replaced` naming why a file at the path was not folded into (another key, \
+          corrupt).",
+    parts: &[key("bytes", U64, "B"), opt("replaced", Text, "")],
+};
+
 /// A prompt call's pick at one (group, layer)
 /// ([`bloomery_gpu::host::swap::CallPick`]).
 pub static CALL_STREAM: Kind = Kind {
@@ -3619,6 +3648,8 @@ pub static GATE_GEMMA_EMBEDDING2_SERVE: &[&Kind] = kinds![
 /// What `generate_ds41` prints, in the order it prints them.
 pub static GENERATE_DS41: &[&Kind] = &[
     &PLACE_UNSET,
+    &WARM_LOAD,
+    &WARM_SAVE,
     &PLAN,
     &NEED,
     &CALL_PLAN,
@@ -3757,6 +3788,7 @@ pub static BLOOMERY_SERVE_QWEN38: &[&Kind] = kinds![
         &RESIDENCY_LEVER,
         &PLACE_UNSET,
     ],
+    groups::vision_seat::RECORDS,
     groups::residency38::UNSET,
     groups::residency38::HOST,
     &[
@@ -4961,14 +4993,15 @@ mod tests {
     }
 
     /// Every seat that takes images calls `vision_seat::Flags::encoder` on its start (the GLM
-    /// seat at `glm.rs`, V4.1 at `ds41.rs`, Qwen3 at `qwen3.rs`, the decision seat at
-    /// `decide.rs`), which requires the vision records and the fetch lines of the `--hf`
-    /// projector: each of those seats registers them.
+    /// seat at `glm.rs`, V4.1 at `ds41.rs`, Qwen3 at `qwen3.rs`, Qwen3.8 at `qwen38.rs`, the
+    /// decision seat at `decide.rs`), which requires the vision records and the fetch lines of
+    /// the `--hf` projector: each of those seats registers them.
     #[test]
     fn the_seats_that_take_images_register_the_vision_record() {
         for (seat, list) in [
             ("ds41", BLOOMERY_SERVE_DS41),
             ("qwen3", BLOOMERY_SERVE_QWEN3),
+            ("qwen38", BLOOMERY_SERVE_QWEN38),
             ("glm", BLOOMERY_SERVE_GLM),
             ("decide", BLOOMERY_SERVE_DECIDE),
         ] {
@@ -4988,6 +5021,7 @@ mod tests {
         for (seat, list) in [
             ("ds41", BLOOMERY_SERVE_DS41),
             ("qwen3", BLOOMERY_SERVE_QWEN3),
+            ("qwen38", BLOOMERY_SERVE_QWEN38),
             ("glm", BLOOMERY_SERVE_GLM),
             ("decide", BLOOMERY_SERVE_DECIDE),
         ] {
@@ -5028,12 +5062,13 @@ mod tests {
                 ],
             ),
             (
-                "qwen38 seat: SlotDrafts::open, residency38, bind::spawn",
+                "qwen38 seat: Flags::encoder, SlotDrafts::open, residency38, bind::spawn",
                 BLOOMERY_SERVE_QWEN38,
                 &[
                     side_seat::SEAT,
                     fetch::FETCH,
                     fetch::SET,
+                    vision_seat::RECORDS,
                     drafted::PROMPT,
                     drafted::WIDTH,
                     residency38::UNSET,
