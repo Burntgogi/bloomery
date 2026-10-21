@@ -101,7 +101,7 @@ mod gate {
     };
     use bloomery_gpu_gates::vision_seat::{self, Image, Opened, PleImage, TextFacts};
     use bloomery_gpu_gates::{
-        GateError, checks_failed, equal, first_diff, oracle_row, ref_model_path, sha256, verdict,
+        GateError, checks_failed, equal, first_diff, oracle_row, ref_model_path, verdict,
     };
     use bloomery_gpu_vision::f32_bf16;
     use bloomery_levers::HostCfg;
@@ -192,7 +192,7 @@ mod gate {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join(IMAGE_DIR)
             .join(format!("{name}.png"));
-        if sha256(&path)? != image.png_sha256 {
+        if gguf::digest::sha256_file(&path)? != image.png_sha256 {
             return Err(format!(
                 "{} is not the image the sets were dumped from ({})",
                 path.display(),
@@ -232,7 +232,7 @@ mod gate {
                 .tokens_file_sha256
                 .as_deref()
                 .ok_or_else(|| format!("{name}: no `# tokens_file_sha256` line"))?;
-            let got = sha256(Path::new(file))?;
+            let got = gguf::digest::sha256_file(Path::new(file))?;
             let count = hidden.n_ids()?;
             if got != want || h.tokens_count != Some(u64::try_from(count)?) {
                 return Err(format!(
@@ -524,7 +524,7 @@ mod gate {
                 false
             }
         };
-        let got = sha256(Path::new(MMPROJ_BF16))?;
+        let got = gguf::digest::sha256_file(Path::new(MMPROJ_BF16))?;
         if got != MMPROJ_BF16_SHA256 {
             return Err(format!(
                 "{MMPROJ_BF16} is {got}; the Qwen3.8 sets were dumped with {MMPROJ_BF16_SHA256}"
