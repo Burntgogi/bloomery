@@ -435,7 +435,10 @@ mod gate {
                 eps: EPS,
             },
             fault,
-            |s, args| kern.enqueue_head_norm_neox_append_256(s, args),
+            |s, args| {
+                // SAFETY: rope_gate::run checks the host positions are distinct before enqueue.
+                unsafe { kern.enqueue_head_norm_neox_append_256(s, args) }
+            },
         )
     }
 
@@ -519,6 +522,12 @@ mod gate {
         fault: FaultSink,
     ) -> Result<RopeQ8Out, GateError> {
         use bloomery_gpu::rope_neox::PartialNeoxQ8Args;
+        assert!(
+            pos.iter()
+                .enumerate()
+                .all(|(i, &p)| p as usize >= ROPE_CTX || !pos[..i].contains(&p)),
+            "rope gate: cache-valid positions must be distinct"
+        );
         let m = pos.len();
         let qg = DeviceBuffer::from_host(stream, &inp.qg)?;
         let mut q = DeviceBuffer::from_host(stream, &vec![0.0f32; m * N_HEAD * HEAD])?;
@@ -535,29 +544,32 @@ mod gate {
         let mut kd = DeviceBuffer::from_host(stream, &sc)?;
         let mut vq = DeviceBuffer::from_host(stream, &codes)?;
         let mut vd = DeviceBuffer::from_host(stream, &sc)?;
-        kern.enqueue_head_norm_neox_append_256_q8(
-            stream,
-            PartialNeoxQ8Args {
-                qg: &qg,
-                q: &mut q,
-                k: &mut k,
-                v: &v,
-                gq: &gq,
-                gk: &gk,
-                table: &table,
-                pos: &posd,
-                eps: EPS,
-                n_head: N_HEAD,
-                n_kv: N_KV,
-                ctx: ROPE_CTX,
-                m,
-                fault,
-                kq: &mut kq,
-                kd: &mut kd,
-                vq: &mut vq,
-                vd: &mut vd,
-            },
-        )?;
+        // SAFETY: the host assertion above checks distinct cache-valid positions before upload.
+        unsafe {
+            kern.enqueue_head_norm_neox_append_256_q8(
+                stream,
+                PartialNeoxQ8Args {
+                    qg: &qg,
+                    q: &mut q,
+                    k: &mut k,
+                    v: &v,
+                    gq: &gq,
+                    gk: &gk,
+                    table: &table,
+                    pos: &posd,
+                    eps: EPS,
+                    n_head: N_HEAD,
+                    n_kv: N_KV,
+                    ctx: ROPE_CTX,
+                    m,
+                    fault,
+                    kq: &mut kq,
+                    kd: &mut kd,
+                    vq: &mut vq,
+                    vd: &mut vd,
+                },
+            )
+        }?;
         stream.synchronize()?;
         Ok(RopeQ8Out {
             q: q.to_host_vec(stream)?,

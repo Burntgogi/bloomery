@@ -452,26 +452,31 @@ fn gated_256(
     gemm(c, (n.q_ty, &n.attn_q), d.q_rows, &hid, table, m, q)?;
     gemm(c, (n.k_ty, &n.attn_k), d.kv_len(), &hid, table, m, kr)?;
     gemm(c, (n.v_ty, &n.attn_v), d.kv_len(), &hid, table, m, v)?;
-    kv.append_256(
-        &k.neox,
-        stream,
-        Append256 {
-            qg: q,
-            q: q_out,
-            k: kr,
-            v,
-            gq: f32_gain(w, &n.attn_q_norm)?,
-            gk: f32_gain(w, &n.attn_k_norm)?,
-            table: c.table,
-            pos,
-            eps: c.eps,
-            n_head: d.n_head,
-            n_kv: d.n_kv,
-            ctx: d.ctx,
-            m,
-            fault: c.sink,
-        },
-    )?;
+    // SAFETY: the layer program embeds consecutive positions before attention;
+    // saturation is outside the cache. Each call uses one sequence's row window
+    // and its own cache planes, not the combined positions of different slots.
+    unsafe {
+        kv.append_256(
+            &k.neox,
+            stream,
+            Append256 {
+                qg: q,
+                q: q_out,
+                k: kr,
+                v,
+                gq: f32_gain(w, &n.attn_q_norm)?,
+                gk: f32_gain(w, &n.attn_k_norm)?,
+                table: c.table,
+                pos,
+                eps: c.eps,
+                n_head: d.n_head,
+                n_kv: d.n_kv,
+                ctx: d.ctx,
+                m,
+                fault: c.sink,
+            },
+        )
+    }?;
     kv.prefill_256(
         &k.prefill,
         stream,

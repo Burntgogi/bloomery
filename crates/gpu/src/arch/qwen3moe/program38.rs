@@ -1249,7 +1249,9 @@ fn qsa(
                 y: flash,
             };
             let scratch = (&mut qa.sel, &mut qa.part_v, &mut qa.part_ms);
-            qsa_attend(c, qp, (kv, pooled), io, scratch, m, sink)?;
+            // SAFETY: the front embedding generates consecutive positions within this
+            // sequence's window; this call selects only that sequence's cache planes.
+            unsafe { qsa_attend(c, qp, (kv, pooled), io, scratch, m, sink) }?;
         }
         Seqs38::Slots(seqs) => {
             qsa_query(c, qp, s, m)?;
@@ -1291,7 +1293,9 @@ fn qsa(
                     y: &mut *rows_mut(flash, r, geo::ATTN)?,
                 };
                 let scratch = (&mut qa.sel, &mut qa.part_v, &mut qa.part_ms);
-                qsa_attend(c, qp, (kv, pooled), io, scratch, r.len(), sink)?;
+                // SAFETY: the front embedding generates consecutive positions within this
+                // sequence's window; this call selects only that sequence's cache planes.
+                unsafe { qsa_attend(c, qp, (kv, pooled), io, scratch, r.len(), sink) }?;
             }
         }
     }
@@ -1372,7 +1376,12 @@ fn qsa_query(c: &Ctx38<'_>, qp: &QsaPlan, s: &mut Arena38, m: usize) -> Result<(
 /// first row), the q/k norm and turn with the K/V append at the rows'
 /// positions, then the selected flash over the selection's lists (its
 /// partials from their first row) into `io.y`.
-fn qsa_attend(
+///
+/// # Safety
+///
+/// Among the first `m` positions in `io.pos`, those below `c.ctx` are
+/// pairwise distinct.
+unsafe fn qsa_attend(
     c: &Ctx38<'_>,
     qp: &QsaPlan,
     (kv, pooled): (&mut super::scratch::KvPlanes, &mut DeviceBuffer<u16>),
@@ -1415,27 +1424,30 @@ fn qsa_attend(
     // The selecting store is f16 (the qwen38 family's stores carry no q8_0
     // form), so the family's shared append runs its f16 arm.
     let (kc, vc) = kv.f16_mut("qwen38::attention")?;
-    c.k.neox.enqueue_head_norm_neox_append_256(
-        stream,
-        PartialNeoxArgs {
-            qg,
-            q: &mut *q,
-            k,
-            v,
-            gq: f32_gain(w, &qp.q_norm)?,
-            gk: f32_gain(w, &qp.k_norm)?,
-            table: c.table,
-            pos,
-            eps: c.eps,
-            n_head: geo::N_HEAD,
-            n_kv: geo::N_KV,
-            ctx,
-            m,
-            fault: sink,
-            cache_k: kc,
-            cache_v: vc,
-        },
-    )?;
+    // SAFETY: the enclosing helper requires distinct cache-valid positions.
+    unsafe {
+        c.k.neox.enqueue_head_norm_neox_append_256(
+            stream,
+            PartialNeoxArgs {
+                qg,
+                q: &mut *q,
+                k,
+                v,
+                gq: f32_gain(w, &qp.q_norm)?,
+                gk: f32_gain(w, &qp.k_norm)?,
+                table: c.table,
+                pos,
+                eps: c.eps,
+                n_head: geo::N_HEAD,
+                n_kv: geo::N_KV,
+                ctx,
+                m,
+                fault: sink,
+                cache_k: kc,
+                cache_v: vc,
+            },
+        )
+    }?;
     let (kc, vc) = kv.f16("qwen38::attention")?;
     let width = sel.width();
     c.k.flash.enqueue_pass_256_p12_sel(

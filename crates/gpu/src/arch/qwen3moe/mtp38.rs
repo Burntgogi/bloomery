@@ -1888,27 +1888,30 @@ impl Mtp38 {
         // The draft's store is f16: the family's shared append runs its f16
         // arm.
         let (kc, vc) = store.f16_mut("qwen38::mtp")?;
-        k.neox.enqueue_head_norm_neox_append_256(
-            stream,
-            PartialNeoxArgs {
-                qg: &a.qg,
-                q: &mut a.q,
-                k: &mut a.k,
-                v: &a.v,
-                gq: f32_gain(w, &n.q_norm)?,
-                gk: f32_gain(w, &n.k_norm)?,
-                table: c.table,
-                pos: &a.pos,
-                eps: c.eps,
-                n_head: geo::N_HEAD,
-                n_kv: geo::N_KV,
-                ctx: *ctx,
-                m,
-                fault: sink,
-                cache_k: kc,
-                cache_v: vc,
-            },
-        )?;
+        // SAFETY: the per-sequence embedding supplies distinct cache-valid positions.
+        unsafe {
+            k.neox.enqueue_head_norm_neox_append_256(
+                stream,
+                PartialNeoxArgs {
+                    qg: &a.qg,
+                    q: &mut a.q,
+                    k: &mut a.k,
+                    v: &a.v,
+                    gq: f32_gain(w, &n.q_norm)?,
+                    gk: f32_gain(w, &n.k_norm)?,
+                    table: c.table,
+                    pos: &a.pos,
+                    eps: c.eps,
+                    n_head: geo::N_HEAD,
+                    n_kv: geo::N_KV,
+                    ctx: *ctx,
+                    m,
+                    fault: sink,
+                    cache_k: kc,
+                    cache_v: vc,
+                },
+            )
+        }?;
         let (kc, vc) = store.f16("qwen38::mtp")?;
         k.flash.enqueue_pass_256_p4(
             stream,
@@ -2310,27 +2313,30 @@ impl Mtp38 {
         // The draft's store is f16: the family's shared append runs its f16
         // arm.
         let (kc, vc) = store.f16_mut("qwen38::mtp")?;
-        k.neox.enqueue_head_norm_neox_append_256(
-            stream,
-            PartialNeoxArgs {
-                qg: &s.qg,
-                q: &mut s.q,
-                k: &mut s.k,
-                v: &s.v,
-                gq: f32_gain(w, &n.q_norm)?,
-                gk: f32_gain(w, &n.k_norm)?,
-                table: c.table,
-                pos: &s.pos,
-                eps: c.eps,
-                n_head: geo::N_HEAD,
-                n_kv: geo::N_KV,
-                ctx: *ctx,
-                m,
-                fault: sink,
-                cache_k: kc,
-                cache_v: vc,
-            },
-        )
+        // SAFETY: the per-sequence embedding supplies distinct cache-valid positions.
+        unsafe {
+            k.neox.enqueue_head_norm_neox_append_256(
+                stream,
+                PartialNeoxArgs {
+                    qg: &s.qg,
+                    q: &mut s.q,
+                    k: &mut s.k,
+                    v: &s.v,
+                    gq: f32_gain(w, &n.q_norm)?,
+                    gk: f32_gain(w, &n.k_norm)?,
+                    table: c.table,
+                    pos: &s.pos,
+                    eps: c.eps,
+                    n_head: geo::N_HEAD,
+                    n_kv: geo::N_KV,
+                    ctx: *ctx,
+                    m,
+                    fault: sink,
+                    cache_k: kc,
+                    cache_v: vc,
+                },
+            )
+        }
     }
 
     /// The streams of the last walk's rows: the layer's output, `l_out`.

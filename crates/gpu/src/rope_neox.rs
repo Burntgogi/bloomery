@@ -2135,12 +2135,17 @@ impl RopeNeoxKernels {
     /// head `h` of token `t` at `(t·n_head + h)·512`, its gate the next 256)
     /// and go to `args.q` (`m·n_head·256`, token-major); `args.table` holds
     /// [`ROT_256`] f32 for each of at least `ctx` positions (`RopeTable::push`
-    /// over a [`ROT_256`]-wide spec). Positions as in
-    /// [`RopeNeoxKernels::enqueue_head_norm_neox_append`]: distinct, below
-    /// `ctx`; one at or past it raises [`FaultSite::CachePos`] on
-    /// `args.fault`, leaves the token's heads NaN and is not appended.
+    /// over a [`ROT_256`]-wide spec). A position at or past `ctx` raises
+    /// [`FaultSite::CachePos`] on `args.fault`, leaves the token's heads NaN
+    /// and is not appended.
     /// Asynchronous, allocation-free, capturable.
-    pub fn enqueue_head_norm_neox_append_256(
+    ///
+    /// # Safety
+    ///
+    /// Among the first `args.m` positions in `args.pos`, those below
+    /// `args.ctx` are pairwise distinct. Out-of-range positions never
+    /// append, so repeated invalid sentinels do not create cache writers.
+    pub unsafe fn enqueue_head_norm_neox_append_256(
         &self,
         stream: &CudaStream,
         args: PartialNeoxArgs<'_>,
@@ -2489,7 +2494,11 @@ impl RopeNeoxKernels {
     /// and the scales ([`q8_plane_lens`] at [`HEAD_256`]), the quantization
     /// rule and refusal [`q8_block_warp`]'s. Asynchronous, allocation-free,
     /// capturable.
-    pub fn enqueue_head_norm_neox_append_256_q8(
+    ///
+    /// # Safety
+    /// Among the first `args.m` positions in `args.pos`, cache-valid values
+    /// (`pos < args.ctx`) are pairwise distinct, as for the f16 append.
+    pub unsafe fn enqueue_head_norm_neox_append_256_q8(
         &self,
         stream: &CudaStream,
         args: PartialNeoxQ8Args<'_>,
