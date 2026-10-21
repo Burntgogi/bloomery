@@ -49,6 +49,7 @@ mod nodes_scale;
 #[cfg(test)]
 mod qwen38_cards;
 
+pub use gguf::card::CardFormat;
 pub use models::{Role, Unimplemented};
 
 /// `features` grouped by feature in first-seen order, each with its layers:
@@ -107,6 +108,14 @@ pub struct ModelTensors {
     /// one token uses.
     pub experts: u64,
     pub experts_used: u64,
+    /// Whether its program reads bf16 matrix `t` of a dense role in its words
+    /// ([`CardFormat::Bf16Raw`], [`ModelTensors::card_format`]): the
+    /// architecture's classifier names each tensor a bf16 site, head or
+    /// embedding lookup reads (qwen4exp's projections); a tensor of the same
+    /// role its program reads as f32 values (a conv, an inject, the parts of
+    /// a joined stack) is not one. `|_| false` loads every bf16 tensor as f32
+    /// values ([`CardFormat::Bf16AsF32`]).
+    pub bf16_words: fn(&ModelTensor) -> bool,
 }
 
 /// The experts of routed stack `t` of a model of `experts`: its last dim
@@ -122,6 +131,38 @@ pub fn stack_experts(t: &ModelTensor, experts: u64) -> u64 {
 }
 
 impl ModelTensors {
+    /// The format file tensor `t` of this model loads in on a card:
+    /// [`CardFormat::of`] of its type, except
+    /// - an engram gain, which the card reads as f32 values whatever its
+    ///   type: a K-quant one is decoded at load;
+    /// - a bf16 matrix (two or more dims) [`ModelTensors::bf16_words`] names,
+    ///   of a role whose matrices the bf16 dense site, head and embedding
+    ///   lookup read (attention, a hyper-connection, a shared expert, a dense
+    ///   FFN, an engram's dense projections, the head, the token embedding):
+    ///   [`CardFormat::Bf16Raw`], which those kernels widen as they read it
+    ///   (`crate::kernels`' `SiteEntry::Bf16`, `HeadEntry::Bf16`,
+    ///   `EmbedEntry::Bf16`). Every other bf16 tensor (a vector, a router, a
+    ///   norm, a matrix it does not name) stays [`CardFormat::Bf16AsF32`]:
+    ///   the kernels that read those read f32 values.
+    #[must_use]
+    pub fn card_format(&self, t: &ModelTensor) -> Option<CardFormat> {
+        match (t.role, card_format_of_role(t.ty, t.role)) {
+            (
+                Role::Attention
+                | Role::HyperConnection
+                | Role::SharedExpert
+                | Role::DenseFfn
+                | Role::EngramDense
+                | Role::Head
+                | Role::TokenEmbedding,
+                Some(CardFormat::Bf16AsF32),
+            ) if (self.bf16_words)(t) && t.ty == GgmlType::BF16 && t.dims.len() >= 2 => {
+                Some(CardFormat::Bf16Raw)
+            }
+            (_, f) => f,
+        }
+    }
+
     /// The experts of routed stack `t` ([`stack_experts`]).
     #[must_use]
     pub fn experts_of(&self, t: &ModelTensor) -> u64 {
@@ -462,269 +503,14 @@ pub enum Device {
     Unused,
 }
 
-/// A card's layout for a file tensor: the GPU loader's `DevWeight` formats
-/// (`crates/gpu/src/weights.rs`). [`CardFormat::buffer_bytes`] is the one
-/// owner of their file → device arithmetic: the plan sums it and counts its
-/// buffers through the allocator, and the loader refuses and checks every
-/// upload by it.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum CardFormat {
-    /// The file's rows as they are stored, their byte stream as u32 words,
-    /// zero-padded at its end to `rows · ceil(words / rows)` words: every
-    /// q3_K/q4_K/q5_K/q6_K tensor, and a routed q5_1, q8_0, iq3_xxs, iq3_s,
-    /// iq4_xs, iq4_nl or mxfp4 stack a
-    /// program's card experts read in the file's `block_q5_1`, `block_q8_0`,
-    /// `block_iq3_xxs`, `block_iq3_s`, `block_iq4_xs`, `block_iq4_nl` or
-    /// `block_mxfp4`
-    /// bytes (a program's [`RoutedFormat`] names it; [`CardFormat::of`] keeps
-    /// q5_1 in [`CardFormat::Q5_1`] and q8_0 in [`CardFormat::Q8_0Planes`]).
-    /// The kernels address a row by its byte offset in the stream, so a row
-    /// need not start on a word (q6_K at k = 768 is 630 bytes); the padding
-    /// only makes the buffer a whole number of words per row.
-    KQuant,
-    /// q5_0 in the gemv's layout: per row the file's 22 bytes a 32-value
-    /// block regrouped into planes — four `qs` words and one `qh` word a
-    /// block, then the f16 scales two to a word.
-    Q5_0,
-    /// q5_1 in the gemv's layout: per row one byte per 5-bit code in
-    /// 1024-value windows, then one f32 scale and one f32 min per block.
-    Q5_1,
-    /// q8_0 in two planes: per 32-value block 8 code words and the block's
-    /// f16 scale bits as the file stores them.
-    Q8_0Planes,
-    /// nvfp4 in two planes (`crates/gpu/src/mxfp4.rs`, `repack`): a row's
-    /// code bytes as `k / 8` words, then its UE4M3 scale bytes four to a
-    /// word, `k / 64` words — the file's 36 bytes a 64-value block, moved.
-    /// A tensor's f32 `.scale` is its own F32 row; a routed stack (three
-    /// dims) adds a third buffer, one f32 scale an expert it holds
-    /// ([`card_buffers`]).
-    Nvfp4Planes,
-    /// bloomery's mxfp8 (`GgmlType::MXFP8`) in two planes
-    /// (`crates/gpu/src/q8f32.rs`, `e4m3_planes`): a row's value bytes as
-    /// `k / 4` words, then its E8M0 scale bytes four to a word, `k / 128`
-    /// words — the file's 33 bytes a 32-value block, moved.
-    Mxfp8Planes,
-    /// bloomery's fp8_b128 (`GgmlType::FP8_B128`) in the same two planes
-    /// (`e4m3_planes`): a row's value bytes as `k / 4` words, then its
-    /// blocks' f32 scales, one word a 128 values — the file's 132 bytes a
-    /// block, moved.
-    Fp8B128Planes,
-    /// f32: the file's values.
-    F32,
-    /// Decoded to f32 at load (`dequant_row`): bf16 by its type, and a
-    /// K-quant that [`CardFormat::of_role`] gives it by its role.
-    Bf16AsF32,
-    /// bf16 as the file stores it, two values to a little-endian u32 word
-    /// (value `2j` in the low half of word `j`), for a kernel that widens on
-    /// the card. No file type loads in it by [`CardFormat::of`]: a reader
-    /// picks it for its own tensors (the DSpark draft's Markov weights and
-    /// the target embedding rows it reads), and uploads it itself; the GPU
-    /// loader's `Weights` refuses it.
-    Bf16Raw,
-}
-
-impl CardFormat {
-    /// The format a file tensor of type `ty` loads in on a card; `None` when
-    /// the loader has none. `None` is not a refusal by itself: a routed stack
-    /// of such a type stays on the host, and a tensor its role puts on a card
-    /// is refused by the plan with [`PlacementError::NoCardFormat`]. Every
-    /// type is listed by name, so a new [`GgmlType`] must be decided here.
-    /// IQ2_XXS loads in the file's blocks ([`CardFormat::KQuant`]), which
-    /// `iq2_xxs_gemv_sel` reads for a routed stack and for a dense matrix as
-    /// a stack of one expert (the latent MoE body's shared expert).
-    #[must_use]
-    pub fn of(ty: GgmlType) -> Option<CardFormat> {
-        match ty {
-            GgmlType::Q3_K
-            | GgmlType::Q4_K
-            | GgmlType::Q5_K
-            | GgmlType::Q6_K
-            | GgmlType::IQ2_XXS => Some(CardFormat::KQuant),
-            GgmlType::Q5_0 => Some(CardFormat::Q5_0),
-            GgmlType::Q5_1 => Some(CardFormat::Q5_1),
-            GgmlType::Q8_0 => Some(CardFormat::Q8_0Planes),
-            GgmlType::NVFP4 => Some(CardFormat::Nvfp4Planes),
-            GgmlType::F32 => Some(CardFormat::F32),
-            GgmlType::BF16 => Some(CardFormat::Bf16AsF32),
-            GgmlType::MXFP8 => Some(CardFormat::Mxfp8Planes),
-            GgmlType::FP8_B128 => Some(CardFormat::Fp8B128Planes),
-            GgmlType::F16
-            | GgmlType::Q4_0
-            | GgmlType::Q4_1
-            | GgmlType::MXFP4
-            | GgmlType::Q2_K
-            | GgmlType::IQ2_XS
-            | GgmlType::IQ3_XXS
-            | GgmlType::IQ1_S
-            | GgmlType::IQ4_NL
-            | GgmlType::IQ3_S
-            | GgmlType::IQ2_S
-            | GgmlType::IQ4_XS
-            | GgmlType::I8
-            | GgmlType::I16
-            | GgmlType::I32
-            | GgmlType::I64
-            | GgmlType::F64
-            | GgmlType::IQ1_M
-            | GgmlType::TQ1_0
-            | GgmlType::TQ2_0
-            | GgmlType::Q2_0
-            | GgmlType::Q1_0
-            | GgmlType::Q8_1
-            | GgmlType::Q8_K
-            | GgmlType::F8E4M3_ROWS
-            | GgmlType::NVFP4_ROWS
-            | GgmlType::Unknown(_) => None,
-        }
-    }
-
-    /// The device buffers of `rows` rows of `k` values of file type `ty` in
-    /// this format, in bytes, in the order the upload allocates them: q8_0's
-    /// code plane, then its scale plane; one buffer in every other format —
-    /// the upload's own arithmetic. `None` exactly where the upload refuses: a
-    /// zero dimension, `k` off the type's block, or a `ty` this format is not
-    /// the loader's format for.
-    #[must_use]
-    pub fn buffer_bytes(self, ty: GgmlType, k: u64, rows: u64) -> Option<Vec<u64>> {
-        let blck = ty.blck_size()?;
-        if !self.holds(ty) || k == 0 || rows == 0 || !k.is_multiple_of(blck) {
-            return None;
-        }
-        let blocks = k / blck;
-        // The Q5_1 code section: one byte per code, in whole 1024-value windows.
-        let window = || k.div_ceil(1024).checked_mul(1024);
-        Some(match self {
-            CardFormat::KQuant => {
-                let words = ty
-                    .type_size()?
-                    .checked_mul(blocks)?
-                    .checked_mul(rows)?
-                    .div_ceil(4);
-                vec![words.div_ceil(rows).checked_mul(rows)?.checked_mul(4)?]
-            }
-            CardFormat::Q5_0 => {
-                // Per block four `qs` words and one `qh` word, then the f16
-                // scales two to a word (`q5::q5_0_row_words`).
-                let words = blocks.checked_mul(5)?.checked_add(blocks.div_ceil(2))?;
-                vec![rows.checked_mul(words.checked_mul(4)?)?]
-            }
-            CardFormat::Q5_1 => {
-                vec![rows.checked_mul(window()?.checked_add(blocks.checked_mul(8)?)?)?]
-            }
-            CardFormat::Q8_0Planes => {
-                vec![
-                    rows.checked_mul(k)?,
-                    rows.checked_mul(blocks.checked_mul(2)?)?,
-                ]
-            }
-            CardFormat::Nvfp4Planes => {
-                vec![
-                    rows.checked_mul(blocks.checked_mul(32)?)?,
-                    rows.checked_mul(blocks.checked_mul(4)?)?,
-                ]
-            }
-            CardFormat::Mxfp8Planes => {
-                // Whole scale words a row: a row's four blocks a word.
-                if !blocks.is_multiple_of(4) {
-                    return None;
-                }
-                vec![rows.checked_mul(k)?, rows.checked_mul(blocks)?]
-            }
-            CardFormat::Fp8B128Planes => {
-                vec![
-                    rows.checked_mul(k)?,
-                    rows.checked_mul(blocks.checked_mul(4)?)?,
-                ]
-            }
-            CardFormat::F32 | CardFormat::Bf16AsF32 => vec![rows.checked_mul(k.checked_mul(4)?)?],
-            CardFormat::Bf16Raw => {
-                // Whole words per row: a row never shares a word with the next.
-                if !k.is_multiple_of(2) {
-                    return None;
-                }
-                vec![rows.checked_mul(k.checked_mul(2)?)?]
-            }
-        })
-    }
-
-    /// The format a file tensor of type `ty` in role `role` loads in on a
-    /// card: [`CardFormat::of`], except an engram gain, which the card reads
-    /// as f32 values whatever its type — a K-quant one is decoded at load.
-    #[must_use]
-    pub fn of_role(ty: GgmlType, role: Role) -> Option<CardFormat> {
-        match (role, CardFormat::of(ty)) {
-            (Role::EngramGain, Some(CardFormat::KQuant)) => Some(CardFormat::Bf16AsF32),
-            (_, f) => f,
-        }
-    }
-
-    /// The format an expert stack of type `ty` loads in on a card under the
-    /// default expert rule ([`plan_with`]): [`CardFormat::of`] less q5_K,
-    /// which this rule does not admit, and less mxfp8, whose planes have no
-    /// card expert entry. A q8_0 or fp8_b128 stack loads in its planes, which
-    /// the f32 expert-select gemv reads (`site::resident_sel_f32`, the MTP
-    /// draft's experts). A card expert kernel does read q5_K
-    /// (`kq_gate_up_act_q5k`, `q5k_gemv_sel`), and the program that runs
-    /// them names q5_K in its own [`RoutedFormat`] (glm5next's
-    /// `card_routed`). An nvfp4 stack loads in its planes, which the card
-    /// leg's nvfp4 pair reads (`crate::kernels::card_planes_runs`). A stack
-    /// of a type with none stays on the host.
-    #[must_use]
-    pub fn of_routed(ty: GgmlType) -> Option<CardFormat> {
-        CardFormat::of(ty).filter(|_| !matches!(ty, GgmlType::Q5_K | GgmlType::MXFP8))
-    }
-
-    /// A file tensor of type `ty` can be laid out in this format: the
-    /// format [`CardFormat::of`] names for `ty`, [`CardFormat::Bf16AsF32`] for
-    /// a K-quant ([`CardFormat::of_role`]'s engram gain),
-    /// [`CardFormat::Bf16Raw`] for bf16, which only a reader that picks it
-    /// uses, or [`CardFormat::KQuant`] for q5_1, q8_0, iq2_xs, iq3_xxs,
-    /// iq3_s, iq4_xs, iq4_nl and mxfp4, the file's blocks,
-    /// which only a program's [`RoutedFormat`] picks.
-    #[must_use]
-    pub fn holds(self, ty: GgmlType) -> bool {
-        CardFormat::of(ty) == Some(self)
-            || (self == CardFormat::Bf16AsF32 && CardFormat::of(ty) == Some(CardFormat::KQuant))
-            || (self == CardFormat::Bf16Raw && ty == GgmlType::BF16)
-            || (self == CardFormat::KQuant
-                && matches!(
-                    ty,
-                    GgmlType::Q5_1
-                        | GgmlType::Q8_0
-                        | GgmlType::IQ2_XS
-                        | GgmlType::IQ3_XXS
-                        | GgmlType::IQ3_S
-                        | GgmlType::IQ4_XS
-                        | GgmlType::IQ4_NL
-                        | GgmlType::MXFP4
-                ))
-    }
-
-    /// The format's name in a plan's rows and a loader's table.
-    #[must_use]
-    pub const fn label(self) -> &'static str {
-        match self {
-            CardFormat::KQuant => "kquant",
-            CardFormat::Q5_0 => "q5_0",
-            CardFormat::Q5_1 => "q5_1",
-            CardFormat::Q8_0Planes => "q8_0_planes",
-            CardFormat::Nvfp4Planes => "nvfp4_planes",
-            CardFormat::Mxfp8Planes => "mxfp8_planes",
-            CardFormat::Fp8B128Planes => "fp8_b128_planes",
-            CardFormat::F32 => "f32",
-            CardFormat::Bf16AsF32 => "bf16_as_f32",
-            CardFormat::Bf16Raw => "bf16_raw",
-        }
-    }
-
-    /// Device bytes of `rows` rows of `k` values of file type `ty` in this
-    /// format: the sum of its [`CardFormat::buffer_bytes`], `None` where they
-    /// are.
-    #[must_use]
-    pub fn resident_bytes(self, ty: GgmlType, k: u64, rows: u64) -> Option<u64> {
-        self.buffer_bytes(ty, k, rows)?
-            .into_iter()
-            .try_fold(0u64, u64::checked_add)
+/// The format a file tensor of type `ty` in role `role` loads in on a
+/// card: [`CardFormat::of`], except an engram gain, which the card reads
+/// as f32 values whatever its type — a K-quant one is decoded at load.
+#[must_use]
+pub fn card_format_of_role(ty: GgmlType, role: Role) -> Option<CardFormat> {
+    match (role, CardFormat::of(ty)) {
+        (Role::EngramGain, Some(CardFormat::KQuant)) => Some(CardFormat::Bf16AsF32),
+        (_, f) => f,
     }
 }
 
@@ -1838,14 +1624,15 @@ fn card_heaps(
 }
 
 /// A card segment of `rows` rows of `t` — all of it, or an expert slice —
-/// in the format its role gives its type ([`CardFormat::of_role`]).
+/// in the format `model` gives it ([`ModelTensors::card_format`]).
 fn card_segment(
+    model: &ModelTensors,
     t: &ModelTensor,
     card: usize,
     rows: u64,
     experts: Option<ExpertList>,
 ) -> Result<Segment, PlacementError> {
-    card_segment_as(t, card, rows, experts, CardFormat::of_role(t.ty, t.role))
+    card_segment_as(t, card, rows, experts, model.card_format(t))
 }
 
 /// [`card_segment`] in `format`; `None` is the refusal of a tensor no card
@@ -1887,8 +1674,9 @@ fn place_whole(
     i: usize,
     t: &ModelTensor,
     stages: &Stages,
-    layers: usize,
+    model: &ModelTensors,
 ) -> Result<Row, PlacementError> {
+    let layers = model.layers;
     let stage = stages.stage_of(t, layers)?;
     let (segment, read_bytes) = match t.role {
         Role::Attention
@@ -1900,11 +1688,20 @@ fn place_whole(
         | Role::EngramDense
         | Role::EngramGain => {
             layer_of(t, layers)?;
-            (card_segment(t, stage, rows_of(t), None)?, t.file_bytes)
+            (
+                card_segment(model, t, stage, rows_of(t), None)?,
+                t.file_bytes,
+            )
         }
-        Role::Head => (card_segment(t, stage, rows_of(t), None)?, t.file_bytes),
+        Role::Head => (
+            card_segment(model, t, stage, rows_of(t), None)?,
+            t.file_bytes,
+        ),
         Role::TokenEmbedding => match stages.embedding {
-            Some(card) => (card_segment(t, card, rows_of(t), None)?, gathered(t)?),
+            Some(card) => (
+                card_segment(model, t, card, rows_of(t), None)?,
+                gathered(t)?,
+            ),
             None => (
                 in_place(Device::Host, Format::HostFile, None, t.file_bytes),
                 gathered(t)?,
@@ -1998,14 +1795,7 @@ pub fn routed_row_on(
     on_cards: Vec<(usize, ExpertList)>,
     model: &ModelTensors,
 ) -> Result<Row, PlacementError> {
-    routed_row_on_as(
-        i,
-        t,
-        stage,
-        on_cards,
-        model,
-        CardFormat::of_role(t.ty, t.role),
-    )
+    routed_row_on_as(i, t, stage, on_cards, model, model.card_format(t))
 }
 
 /// [`routed_row_on`] with the card segments in `format`: the expert rule's
@@ -2064,13 +1854,18 @@ fn routed_row_on_as(
     })
 }
 
-/// Row `i`, the tensor `t` whole on card `card` in its card format, whatever
-/// its role — for a load that fixes its own split ([`routed_row`] places the
-/// routed stacks).
-pub fn whole_on_card(i: usize, t: &ModelTensor, card: usize) -> Result<Row, PlacementError> {
+/// Row `i`, the tensor `t` of `model` whole on card `card` in its card
+/// format, whatever its role — for a load that fixes its own split
+/// ([`routed_row`] places the routed stacks).
+pub fn whole_on_card(
+    i: usize,
+    t: &ModelTensor,
+    card: usize,
+    model: &ModelTensors,
+) -> Result<Row, PlacementError> {
     Ok(Row {
         tensor: i,
-        segments: vec![card_segment(t, card, rows_of(t), None)?],
+        segments: vec![card_segment(model, t, card, rows_of(t), None)?],
         read_bytes: t.file_bytes,
         stage: card,
     })
@@ -2542,13 +2337,13 @@ fn plan_rule<'a>(
     let mut stacks: Vec<Vec<usize>> = vec![Vec::new(); model.layers];
     for (i, t) in model.tensors.iter().enumerate() {
         // A never-loaded tensor's shape is nothing a card must take.
-        if let Some(format) = CardFormat::of_role(t.ty, t.role).filter(|_| t.role != Role::Unused) {
+        if let Some(format) = model.card_format(t).filter(|_| t.role != Role::Unused) {
             card_bytes(t, format, rows_of(t))?;
         }
         if t.role == Role::RoutedExperts {
             stacks[layer_of(t, model.layers)?].push(i);
         } else {
-            rows[i] = Some(place_whole(i, t, &stages, model.layers)?);
+            rows[i] = Some(place_whole(i, t, &stages, model)?);
         }
     }
     check_tiers(&machine.tiers)?;
@@ -2974,7 +2769,7 @@ impl fmt::Display for WholeNeed {
 /// whole-fit verdict. The load uploads every tensor its loader takes — each
 /// of the model's layers and every model-level tensor, whatever its role —
 /// in the model's order, each in the card format its role gives its type
-/// ([`CardFormat::of_role`]) and each one's buffers through the card's
+/// ([`ModelTensors::card_format`]) and each one's buffers through the card's
 /// allocator ([`Heap`]), so the granules are counted; then the cache, the
 /// card's set-aside and what the program holds past them (`load`), summed
 /// by the card's floor ([`Card::floor_bytes`]). The budget is the card's
@@ -2999,8 +2794,9 @@ pub fn whole_need(
         .iter()
         .filter(|t| t.layer.is_none_or(|l| l < model.layers));
     for t in loaded {
-        let format =
-            CardFormat::of_role(t.ty, t.role).ok_or_else(|| PlacementError::NoCardFormat {
+        let format = model
+            .card_format(t)
+            .ok_or_else(|| PlacementError::NoCardFormat {
                 name: t.name.clone(),
                 ty: t.ty,
                 role: t.role,
@@ -4442,6 +4238,7 @@ mod tests {
             layers: 1,
             experts: 1,
             experts_used: 1,
+            bf16_words: |_| false,
         };
         let pool = |unified: bool| {
             let mut c = card("GB10", 0..1, true, true);
@@ -4668,11 +4465,125 @@ mod tests {
             layers,
             experts: 8,
             experts_used: 2,
+            bf16_words: |_| false,
         }
     }
 
     const HEAD: u64 = 4_352;
     const EXPERT: u64 = 576;
+
+    /// A model of 4 layers with every role's bf16 tensor (an attention
+    /// matrix, a hyper-connection, a shared expert, a router, an FFN norm,
+    /// the head and the token embedding, 256-value rows) beside a routed
+    /// q4_K stack, its readers' choice `bf16_words`, planned on `n` cards of
+    /// `4 / n` layers each: every bf16 tensor's card segment is on the card
+    /// that runs it, in the format `ModelTensors::card_format` names, at its
+    /// format's bytes. With `bf16_words` the matrices of the dense roles keep
+    /// their words (the file's bytes); the router and the norm, and every
+    /// tensor without it, are f32 values (twice the file's bytes): the plan
+    /// of a model that does not set it is the one it was.
+    #[test]
+    fn a_bf16_matrix_keeps_its_words_where_its_readers_read_them() {
+        let bf16 = |name: String, layer, role, rows: &[u64]| {
+            let mut dims = vec![256];
+            dims.extend_from_slice(rows);
+            ModelTensor {
+                name,
+                shard: 0,
+                layer,
+                role,
+                ty: GgmlType::BF16,
+                file_bytes: 2 * dims.iter().product::<u64>(),
+                dims,
+                gathered_rows: (role == Role::TokenEmbedding).then_some(1),
+            }
+        };
+        let raw = [
+            Role::Attention,
+            Role::HyperConnection,
+            Role::SharedExpert,
+            Role::Head,
+            Role::TokenEmbedding,
+        ];
+        for bf16_words in [false, true] {
+            for n in [1usize, 2, 4] {
+                let mut model = layered(4);
+                model.bf16_words = if bf16_words { |_| true } else { |_| false };
+                for l in 0..4 {
+                    for (what, role, rows) in [
+                        ("attn", Role::Attention, &[16][..]),
+                        ("hc", Role::HyperConnection, &[4]),
+                        ("shexp", Role::SharedExpert, &[8]),
+                        ("router", Role::Router, &[9]),
+                        ("norm", Role::FfnNorm, &[]),
+                    ] {
+                        model
+                            .tensors
+                            .push(bf16(format!("{what} {l}"), Some(l), role, rows));
+                    }
+                }
+                for (name, role) in [
+                    ("bf16 head", Role::Head),
+                    ("bf16 embd", Role::TokenEmbedding),
+                ] {
+                    model.tensors.push(bf16(name.into(), None, role, &[16]));
+                }
+                let per = 4 / n;
+                let cards = (0..n)
+                    .map(|c| Card {
+                        usable_bytes: 1 << 30,
+                        ..card(
+                            &format!("card{c}"),
+                            c * per..(c + 1) * per,
+                            c == n - 1,
+                            c == 0,
+                        )
+                    })
+                    .collect();
+                let machine = Machine {
+                    cards,
+                    tiers: Vec::new(),
+                    nodes: vec![Node {
+                        host: host(),
+                        unified: None,
+                    }],
+                };
+                let plan = plan_with(&model, &machine, 4096, &NoKv, None)
+                    .unwrap_or_else(|e| panic!("n={n} words={bf16_words}: {e}"));
+                let mut seen = 0;
+                for r in &plan.rows {
+                    let t = &model.tensors[r.tensor];
+                    if t.ty != GgmlType::BF16 {
+                        continue;
+                    }
+                    seen += 1;
+                    let (format, bytes) = if bf16_words && raw.contains(&t.role) {
+                        (CardFormat::Bf16Raw, t.file_bytes)
+                    } else {
+                        (CardFormat::Bf16AsF32, 2 * t.file_bytes)
+                    };
+                    let card = match (t.layer, t.role) {
+                        (Some(l), _) => l / per,
+                        (None, Role::Head) => n - 1,
+                        (None, _) => 0,
+                    };
+                    assert_eq!(model.card_format(t), Some(format), "{}", t.name);
+                    let got: Vec<_> = r
+                        .segments
+                        .iter()
+                        .map(|s| (s.device, s.format, s.experts.is_none(), s.resident_bytes))
+                        .collect();
+                    assert_eq!(
+                        got,
+                        [(Device::Card(card), Format::Card(format), true, bytes)],
+                        "n={n} words={bf16_words} {}",
+                        t.name
+                    );
+                }
+                assert_eq!(seen, 4 * 5 + 2, "n={n}");
+            }
+        }
+    }
 
     /// A card of `usable` bytes and nothing else set aside.
     fn bytes_card(name: &str, usable: u64, layers: Range<usize>) -> Card {

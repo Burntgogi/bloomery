@@ -56,7 +56,7 @@ mod gate {
     use crate::image::open;
     use bloomery_gpu::Gpu;
     use bloomery_gpu_gates::{
-        GateError, RefManifest, checks_failed, data_dir, ref_model_path, sha256, verdict,
+        GateError, RefManifest, checks_failed, data_dir, ref_model_path, verdict,
     };
     use bloomery_gpu_gemma_embedding2::{Encoder, Pass, card_bytes};
     use gguf::Split;
@@ -106,7 +106,7 @@ mod gate {
                 .parse::<usize>()
                 .map_err(|e| format!("{}: case {id}: token count {n:?}: {e}", TEXT.name))?;
             let ids = read_ids(&path, want)?;
-            let digest = sha256(&path)?;
+            let digest = gguf::digest::sha256_file(&path)?;
             if digest != sha {
                 return Err(format!(
                     "{}: {} ids of digest {digest}; the set's case line says {n} of {sha}",
@@ -558,7 +558,7 @@ mod gate {
             let total = bytes.checked_mul(count).ok_or("clip byte count overflow")?;
             if total > 512 * 1024 * 1024
                 || std::fs::metadata(f[6])?.len() != total as u64
-                || sha256(Path::new(f[6]))? != f[7]
+                || gguf::digest::sha256_file(Path::new(f[6]))? != f[7]
             {
                 return Err(format!("{name}: clip size or sha256 mismatch").into());
             }
@@ -675,7 +675,7 @@ mod gate {
             (&TEXT, &TEXT_CPU, IDS_SET, MODEL_SHA256)
         };
         let model = ref_model_path()?;
-        let digest = sha256(&model)?;
+        let digest = gguf::digest::sha256_file(&model)?;
         if digest != model_sha {
             return Err(format!(
                 "{}: sha256 {digest}, the sets are dumped from {model_sha}",

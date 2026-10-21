@@ -62,7 +62,7 @@ mod gate {
     };
     use cuda_core::DeviceBuffer;
     use gguf::Split;
-    use gguf::quant::{GgmlType, f32_to_f16_bits, half_to_f32};
+    use gguf::quant::{GgmlType, half_to_f32};
     use model::arch::dspark::{DraftHparams, names};
     use refset::arch::deepseek41::{DSREF, DSREF_SET};
     use refset::dsref::{DsRow, Dsref, Graph};
@@ -254,8 +254,7 @@ mod gate {
 
     /// `x` rounded to the nearest bf16, ties to even (finite `x`).
     fn bf16_round(x: f32) -> f32 {
-        let b = x.to_bits();
-        f32::from_bits((b + 0x7fff + ((b >> 16) & 1)) & 0xffff_0000)
+        gguf::quant::bf16_bits_to_f32(gguf::quant::fp32_to_bf16_bits(x))
     }
 
     /// The first maximum (lowest index on a tie), `ggml_argmax`'s rule.
@@ -764,24 +763,31 @@ mod gate {
     /// The own head's norm epsilon.
     const EPS: f32 = 1e-6;
 
-    /// `vals` as Q8_0 rows in `bloomery_gpu::q8f32`'s device layout: per 32
-    /// values the scale `d = f16(amax / 127)` and the codes `round_half_even(v
-    /// / d)`, four codes to a word (the first in the low byte).
+    /// The shared Q8_0 rule in the two-plane device layout.
     fn q8_0_rows(vals: &[f32]) -> (Vec<u32>, Vec<u16>) {
-        let (mut qs, mut ds) = (Vec::new(), Vec::new());
-        for block in vals.as_chunks::<32>().0 {
-            let amax = block.iter().fold(0.0f32, |a, v| a.max(v.abs()));
-            let d16 = f32_to_f16_bits(amax / 127.0);
-            let d = half_to_f32(d16);
-            let id = if d > 0.0 { 1.0 / d } else { 0.0 };
-            ds.push(d16);
-            qs.extend(
-                block.as_chunks::<4>().0.iter().map(|q| {
-                    u32::from_le_bytes(q.map(|v| ((v * id).round_ties_even() as i8) as u8))
-                }),
-            );
+        assert!(vals.len().is_multiple_of(32), "Q8_0 row needs whole blocks");
+        let blocks: Vec<_> = vals.chunks(32).map(gguf::quant::quantize_q8_0).collect();
+        bloomery_gpu::weights::q8_0_planes(&blocks)
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn q8_0_fixture_refuses_non_finite_blocks() {
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut x = [1.0; 32];
+            x[17] = bad;
+            for x in [x, [bad; 32]] {
+                assert!(std::panic::catch_unwind(|| q8_0_rows(&x)).is_err());
+            }
         }
-        (qs, ds)
+        assert!(std::panic::catch_unwind(|| q8_0_rows(&[1.0; 31])).is_err());
+        let (q, d) = q8_0_rows(&[127.0; 32]);
+        assert_eq!(q, [0x7f7f7f7f; 8]);
+        assert_eq!(d, [0x3c00]);
+        let x: [f32; 32] = std::array::from_fn(|i| [100.0, -100.0, 0.0, 50.0][i % 4]);
+        let (q, d) = q8_0_rows(&x);
+        assert_eq!(q, [0x4000_817f; 8]);
+        assert_eq!(d, [0x3a4d]);
     }
 
     /// The largest probability of a row of logits by `argmax_p_rows_fault`'s

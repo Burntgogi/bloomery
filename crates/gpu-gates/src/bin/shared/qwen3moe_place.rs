@@ -181,7 +181,7 @@ pub const SLOTS_RESERVE: &str = "resident slots";
 /// The card reserve of a media load's rotation tables, one for every resident sequence ([`laid`]):
 /// a placed plan's KV term counts a text load's bytes a position, not the table each sequence's
 /// image positions rewrite (`gpu::media::SeqRope`).
-pub const TABLES_RESERVE: &str = "sequence rotation tables";
+pub use bloomery_gpu_gates::image_plan::TABLES_RESERVE;
 
 /// The layers the model loads: a qwen35moe file's trunk (its next-token
 /// layers are never loaded).
@@ -1336,6 +1336,7 @@ pub(super) mod tests {
             layers: 1,
             experts: 0,
             experts_used: 0,
+            bf16_words: |_| false,
         };
         let machine = workstation::placed_with_arena(workstation::A6000, 1, 0);
         let mut card = machine.whole_card().expect("one card");

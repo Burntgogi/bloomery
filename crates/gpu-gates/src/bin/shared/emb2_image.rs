@@ -1,7 +1,7 @@
 //! The EmbeddingGemma image gates' pinned inputs and CPU-twin comparisons.
 
 use crate::e2e::rel;
-use bloomery_gpu_gates::{GateError, RefManifest, sha256, verdict};
+use bloomery_gpu_gates::{GateError, RefManifest, verdict};
 use refset::arch::gemma_embedding2::{MMPROJ_BF16, MMPROJ_BF16_SHA256, TWIN};
 use refset::emb2::Emb2Set;
 use refset::family::Family;
@@ -43,7 +43,7 @@ pub fn projector(model: &Path) -> Result<PathBuf, GateError> {
             .file_name()
             .ok_or("no projector filename")?,
     );
-    let digest = sha256(&path)?;
+    let digest = gguf::digest::sha256_file(&path)?;
     if digest != MMPROJ_BF16_SHA256 {
         return Err(format!(
             "{}: projector sha256 {digest}, expected {MMPROJ_BF16_SHA256}",
@@ -80,7 +80,7 @@ pub fn image(
         Ok((PathBuf::from(f[0]), f[1].to_string()))
     };
     let (path, digest) = header(card)?;
-    if header(cpu)?.1 != digest || sha256(&path)? != digest {
+    if header(cpu)?.1 != digest || gguf::digest::sha256_file(&path)? != digest {
         return Err(format!("{name}: CPU/card image sha256 mismatch").into());
     }
     Ok((Rgb8::from_png(&std::fs::read(path)?)?, digest))

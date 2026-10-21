@@ -39,7 +39,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gguf::Split;
-use model::fileio::sha256_hex_of;
+use gguf::digest::sha256_hex_of;
 use model::ops::DEFER_MAX_COLS;
 use model::placement::devices::{DeviceId, DeviceInfo, spec_of_device};
 use model::placement::workstation::{self, ArenaGrant, CardSpec};
@@ -1825,6 +1825,7 @@ pub(super) mod tests {
             layers: 1,
             experts: 2,
             experts_used: 1,
+            bf16_words: |_| false,
         };
         let segment = Segment {
             device: Device::Card(1),
@@ -1914,6 +1915,7 @@ pub(super) mod tests {
                     layers: 1,
                     experts: 2,
                     experts_used: 1,
+                    bf16_words: |_| false,
                 })
             },
             experts: |_, _, _, _, _| panic!("metadata must be checked before loading experts"),
@@ -2349,6 +2351,7 @@ pub(super) mod tests {
             layers: 3,
             experts: 8,
             experts_used: 2,
+            bf16_words: |_| false,
         };
         assert!(open.rows_on(&model(r.dims.clone())).is_ok());
         let mut absent = open.clone();

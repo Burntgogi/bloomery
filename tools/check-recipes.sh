@@ -388,6 +388,7 @@ pytools_list() {
     "tools/pr-gate-lines.py --self-test"
     "tools/recipes-key-test.py --self-test"
     "tools/ref/asm-census.py --self-test"
+    "tools/ref/cache-options-test.py --self-test"
     "tools/ref/check-int-twins.py --self-test"
     "tools/ref/clef/e2e.py --self-test"
     "tools/ref/clef/sjcmp.py --self-test"

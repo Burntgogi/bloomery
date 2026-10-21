@@ -53,6 +53,14 @@ matches, for example a red unit again. The script reads every list from its owne
 `python3 tools/recipes.py pure-crates`, the Python self-tests from the `selftests=(` array of `tools/check-recipes.sh`,
 and the host units from `python3 tools/recipes.py host-nightly`.
 
+The mapped checkpoint reader is `bloomery-safetensors`; `gate-safetensors` owns its dtype, span and shard tests.
+`f32_values` also checks directly constructed `Raw` values: shape and dtype must account for the complete
+byte span without overflow. A partial value or a mismatched span is `Error::Format`, not a truncated conversion.
+Decision's optional `safetensors` feature loads a head through that reader without linking the hub crate.
+Check both feature configurations with `cargo tree --locked -p bloomery-decision -e normal`, adding
+`--features safetensors` for the loading path. Neither tree should contain `bloomery-hf`; the feature-on tree
+must contain `bloomery-safetensors`. A zero `recipes.py gaps` result alone does not establish this boundary.
+
 | Tier | Where | Runs |
 |---|---|---|
 | T0 | any OS with the pinned nightly (rustup, rustfmt) and `python3` 3.11 or later (`tools/recipes.py` reads `Cargo.lock` with `tomllib`) with numpy and PIL | `cargo fmt --all -- --check`; `cargo test -p <crate>` for each crate of `recipes.py pure-crates`; `python3 tools/recipes.py --self-test`; each Python tool self-test `check-recipes.sh` lists (some import numpy and PIL, which CI installs before T0); every `tools/check-*.sh`. Each check script reads the tree and runs no cargo and no box command, so none is left out |
@@ -77,6 +85,11 @@ every unit green, 1 a unit red, 64 usage, 69 a prerequisite is missing (named, w
 script reads is empty, `--only` matches no unit, or `git status` fails in the tree (whether it is clean is unknown, so
 no commit is named). `CONTRIB_INJECT_FAIL=1` adds one deliberately failing unit, so the red path can be shown to fail
 first.
+
+The flowcounts weekly reads its record parser and schema, routing data and statistical tools, not the hub reader.
+Use `python3 tools/recipes.py why tools/bloomery/hf.py --recipe weekly-gpu-ds41-flowcounts` to inspect that boundary.
+The script walk is conservative: a helper's prose must not turn the self-tests that use it into dependencies of
+the helper itself. The regression holds both the absent hub input and the retained executable inputs.
 
 The gate-batch self-test waits for stopped fixture lanes and their registered
 items to finish before a case can remove its tree. A delayed TERM-handler case

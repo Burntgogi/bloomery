@@ -23,7 +23,7 @@
 //! prefix that falls or runs past the records, a record outside its block or out of order, an
 //! exception position out of range, repeated or unsorted, and records or codes left over.
 
-use crate::safetensors::{self, Dtype, Raw};
+use safetensors::{Dtype, Raw};
 
 /// The largest base: `base + 15` must stay a byte.
 const MAX_BASE: u8 = 240;
@@ -347,7 +347,7 @@ fn csf32(
 #[cfg(test)]
 mod tests {
     use super::{Encoding, Error, weight_scale};
-    use crate::safetensors::{Safetensors, write};
+    use safetensors::{Safetensors, write};
     use sha2::{Digest, Sha256};
 
     /// The fixture `tests/fixtures/csf_scales.py fixture` writes.
@@ -396,7 +396,7 @@ mod tests {
             (Encoding::Csf32, usize::MAX / 32 * 32, 2),
         ] {
             let get = |n: &str| {
-                use crate::safetensors::Dtype;
+                use safetensors::Dtype;
                 let dtype = if n.ends_with("offsets") || n.ends_with("csf32_exceptions") {
                     Dtype::U16
                 } else if n.ends_with("exceptions") || n.ends_with("page_bases") {
@@ -404,7 +404,7 @@ mod tests {
                 } else {
                     Dtype::U8
                 };
-                Ok(crate::safetensors::Raw {
+                Ok(safetensors::Raw {
                     dtype,
                     shape: &[],
                     bytes: &[],

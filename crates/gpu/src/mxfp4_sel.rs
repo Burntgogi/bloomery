@@ -1116,7 +1116,7 @@ impl Mxfp4SelKernels {
         let prep = self
             .module
             .prepare_mxfp4_gate_up_sel(LaunchConfig1D::new(grid, BLOCK, 0))?;
-        let (act, limit) = a.rule.code();
+        let (act, limit) = a.rule.code(what)?;
         self.module.mxfp4_gate_up_sel(
             stream,
             &prep,
@@ -1906,5 +1906,34 @@ mod tests {
             )),
             "gate, up and down refusals: {refusals:?}"
         );
+    }
+
+    /// The K units a tensor-parallel plan keeps a rank's part whole in
+    /// (`kernels::card_k_unit`) are the card layouts' own: an MXFP4 stack
+    /// and MXFP8 planes load at that K and refuse half of it.
+    #[test]
+    #[ignore = "needs a CUDA card"]
+    fn hw_card_k_units_are_the_layouts_own() {
+        use gguf::GgmlType;
+        use model::placement::Role;
+        use model::placement::kernels::card_k_unit;
+        let gpu = Gpu::new().expect("card");
+        let mx = card_k_unit(GgmlType::MXFP4, Role::RoutedExperts) as usize;
+        let blocks = |k: usize| {
+            let block = [vec![127u8], vec![0u8; 16]].concat();
+            block.repeat(k / 32)
+        };
+        assert!(MxStack::upload(gpu.stream(), &blocks(mx), 1, 1, mx).is_ok());
+        assert!(MxStack::upload(gpu.stream(), &blocks(mx / 2), 1, 1, mx / 2).is_err());
+        let m8 = card_k_unit(GgmlType::MXFP8, Role::DenseFfn) as usize;
+        let planes = |k: usize| {
+            crate::q8f32::e4m3_planes(
+                crate::q8f32::E4m3Scales::Mxfp8,
+                &vec![0u8; k / 32 * 33],
+                1,
+                k,
+            )
+        };
+        assert!(planes(m8).is_ok() && planes(m8 / 2).is_err());
     }
 }

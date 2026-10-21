@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""A stand-in timeout for the self-tests of tools/gpu-gate.sh, tools/ref/stack-watch.sh, tools/ref/load-groups.sh,
-tools/ref/lease.sh and tools/ref/card-tests/run.sh where the host has none (the Mac), copied in as `timeout`. It takes
+"""A stand-in timeout for the GPU gate, stack watcher, load-group, lease and timing-card self-tests
+where the host has none (the Mac), copied in as `timeout`. It takes
 coreutils' `timeout [--kill-after=K] S COMMAND...` and keeps its timing and exit codes: S 0 is no bound; otherwise at
 S seconds COMMAND's process group gets a TERM, as it does when a TERM is sent here. K seconds after the first of the
 two the group gets a KILL if COMMAND is still there (K 0 or none: no KILL). The exit is 124 when S ran out, 137 when

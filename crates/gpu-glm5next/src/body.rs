@@ -130,7 +130,7 @@ mod media;
 pub mod prefill;
 
 #[path = "pair.rs"]
-mod pair;
+pub(crate) mod pair;
 
 #[path = "nextn.rs"]
 pub mod nextn;
@@ -216,7 +216,7 @@ pub(crate) struct Kernels {
 }
 
 impl Kernels {
-    fn load(gpu: &Gpu, k_blocks: bool) -> Result<Kernels, GpuError> {
+    pub(crate) fn load(gpu: &Gpu, k_blocks: bool) -> Result<Kernels, GpuError> {
         let ctx = gpu.context();
         Ok(Kernels {
             step: StepKernels::load(ctx)?,
@@ -470,7 +470,7 @@ pub(crate) struct Scratch {
 impl Scratch {
     /// Each row's buffers ([`RowScratch::new`]) and the lane word at lane 0.
     /// Load-time only.
-    fn new(
+    pub(crate) fn new(
         stream: &CudaStream,
         d: &Dims,
         (ff, ctx): (usize, usize),
@@ -699,21 +699,29 @@ impl RowScratch {
 /// The token embedding as the host reads it: the shared table's rows of a
 /// type [`EmbedTable`] reads, one dequantized per step and written four
 /// times, one copy a stream.
-struct Embedding {
+pub(crate) struct Embedding {
     file: Arc<Split>,
-    n_vocab: usize,
     row: Vec<f32>,
-    streams: Vec<f32>,
+    pub(crate) streams: Vec<f32>,
     table: EmbedTable,
 }
 
 impl Embedding {
-    fn new(file: Arc<Split>, n_embd: usize) -> Result<Embedding, GpuError> {
+    pub(crate) fn new(
+        file: Arc<Split>,
+        n_embd: usize,
+        n_vocab: usize,
+    ) -> Result<Embedding, GpuError> {
         let name = names::token_embd();
-        let table = EmbedTable::new(file.clone(), &name, n_embd)?;
+        let table = EmbedTable::new(Arc::clone(&file), &name, n_embd)?;
+        if table.n_vocab() != n_vocab {
+            return Err(shape(format!(
+                "the embedding has {} rows, the file's vocabulary {n_vocab}",
+                table.n_vocab()
+            )));
+        }
         Ok(Embedding {
             file,
-            n_vocab: table.n_vocab(),
             row: vec![0.0; n_embd],
             streams: vec![0.0; HC_STREAMS * n_embd],
             table,
@@ -722,7 +730,7 @@ impl Embedding {
 
     /// Row `token`, dequantized and repeated into the four streams; a token
     /// past the vocabulary is refused by name.
-    fn fill(&mut self, token: u32) -> Result<(), GpuError> {
+    pub(crate) fn fill(&mut self, token: u32) -> Result<(), GpuError> {
         self.table.row_into(token, &mut self.row)?;
         for s in self.streams.chunks_exact_mut(self.row.len()) {
             s.copy_from_slice(&self.row);
@@ -1107,9 +1115,32 @@ fn shape(detail: String) -> GpuError {
     GpuError::Shape { what: WHAT, detail }
 }
 
+/// A load's positions, the one-card body's and a tensor-parallel rank's: at least one, and at
+/// most the positions a reference set checks the latent selector at.
+pub(crate) fn check_ctx(ctx: usize) -> Result<(), GpuError> {
+    if ctx == 0 || ctx as u64 > place::ORACLE_POSITIONS {
+        return Err(shape(format!(
+            "ctx {ctx}: at least 1 and at most the {} positions a reference set checks the \
+             selector at",
+            place::ORACLE_POSITIONS
+        )));
+    }
+    Ok(())
+}
+
+/// A step at `pos` inside stores of `ctx` positions, refused by name past them.
+pub(crate) fn check_pos(pos: u32, ctx: usize) -> Result<(), GpuError> {
+    if pos as usize >= ctx {
+        return Err(shape(format!(
+            "a step at position {pos} in stores of {ctx}"
+        )));
+    }
+    Ok(())
+}
+
 /// The layer's SwiGLU limit, 0 (the plain combine) when it has none. Any
 /// other activation has no clamp and is refused by name.
-fn limit_of(act: Act) -> Result<f32, GpuError> {
+pub(crate) fn limit_of(act: Act) -> Result<f32, GpuError> {
     match act {
         Act::SwiGlu { limit } => Ok(limit.unwrap_or(0.0)),
         other => Err(shape(format!("{} has no SwiGLU clamp", other.what()))),
@@ -1210,7 +1241,10 @@ pub const TIER_BEFORE_UPLOAD: &str = "glm5next Body::open_placed_lanes (before u
 /// NextN load the next-token layer `nextn` after them — the slot map's
 /// layers. Refused by name: a trunk with no routed run, and a next-token
 /// layer that does not follow it.
-fn host_run(layers: &[LayerSpec], nextn: Option<usize>) -> Result<Range<usize>, GpuError> {
+pub(crate) fn host_run(
+    layers: &[LayerSpec],
+    nextn: Option<usize>,
+) -> Result<Range<usize>, GpuError> {
     let trunk = hosted(layers).map_err(|e| shape(e.to_string()))?;
     match nextn {
         None => Ok(trunk),
@@ -1469,7 +1503,7 @@ impl Body {
     /// and its three conv tap sets into one, in the conv's channel order; a
     /// latent layer's four projections of the normed input. Each row keeps
     /// its file bits.
-    fn derive(
+    pub(crate) fn derive(
         stream: &CudaStream,
         kinds: &[Layer],
         layers: Range<usize>,
@@ -1563,16 +1597,8 @@ impl Body {
             )));
         }
         let ctx = usize::try_from(plan.ctx_max)
-            .ok()
-            .filter(|&c| c > 0 && c as u64 <= place::ORACLE_POSITIONS)
-            .ok_or_else(|| {
-                shape(format!(
-                    "ctx_max {}: at least 1 and at most the {} positions a reference set \
-                     checks the selector at",
-                    plan.ctx_max,
-                    place::ORACLE_POSITIONS
-                ))
-            })?;
+            .map_err(|_| shape(format!("ctx_max {} passes usize", plan.ctx_max)))?;
+        check_ctx(ctx)?;
         let dense = usize::try_from(place::dense_positions(hp))
             .map_err(|_| shape(format!("dense positions {}", place::dense_positions(hp))))?;
         let run = host_run(&spec.layers, nextn.map(|(_, n)| n.index))?;
@@ -1706,13 +1732,7 @@ impl Body {
         // The residency machine frees arena slots between passes, which a
         // card hold keeps: a load that starts one keeps the host leg.
         hybrid.attach_arena_leg(gpu, glue.source().is_some())?;
-        let embd = Embedding::new(file, dims.embd)?;
-        if embd.n_vocab != hp.n_vocab {
-            return Err(shape(format!(
-                "the embedding has {} rows, the file's vocabulary {}",
-                embd.n_vocab, hp.n_vocab
-            )));
-        }
+        let embd = Embedding::new(file, dims.embd, hp.n_vocab)?;
         let ckpt = Checkpoints::sequence(
             gpu.context(),
             checkpoint_lens(inputs)?,
@@ -2081,7 +2101,7 @@ pub fn trunk_blocks(file: &Split) -> Result<Vec<BlockPlan>, GpuError> {
 
 /// Each trunk layer's block plan from `inputs`' layer descriptions and `file`'s
 /// tensor types.
-fn trunk_plans(file: &Split, inputs: &PlanInputs) -> Result<Vec<BlockPlan>, GpuError> {
+pub(crate) fn trunk_plans(file: &Split, inputs: &PlanInputs) -> Result<Vec<BlockPlan>, GpuError> {
     let embd = dims_of(inputs)?.embd;
     inputs
         .spec
@@ -2109,7 +2129,7 @@ fn trunk_plans(file: &Split, inputs: &PlanInputs) -> Result<Vec<BlockPlan>, GpuE
 
 /// The file's widths and constants, each checked against the kernel that
 /// fixes it.
-fn dims_of(inputs: &PlanInputs) -> Result<Dims, GpuError> {
+pub(crate) fn dims_of(inputs: &PlanInputs) -> Result<Dims, GpuError> {
     let hp = &inputs.hp;
     let heads = hp.n_head;
     let checks = [
@@ -2180,7 +2200,7 @@ fn dims_of(inputs: &PlanInputs) -> Result<Dims, GpuError> {
 /// Layer `l`'s programs from its description and the values its launches
 /// take, its block read as `block`; a routed layer's row in the card copy is
 /// `map`'s ([`SlotMap::row_offset`]).
-fn layer_cfg(
+pub(crate) fn layer_cfg(
     l: usize,
     s: &LayerSpec,
     map: &SlotMap,
@@ -2236,7 +2256,7 @@ fn layer_cfg(
 /// Layer `kind`'s store at `ctx` positions: a KDA layer's state of `lanes`
 /// lanes, lane 0 stamped at position 0, and its conv ring, a latent layer's
 /// latent and index rows and its pool plane.
-fn store(
+pub(crate) fn store(
     stream: &CudaStream,
     kind: Layer,
     d: &Dims,
@@ -2279,12 +2299,7 @@ impl ChainBody for Body {
     /// past the stores, or one the stores do not stand at, is refused by
     /// name ([`Body::stores_at`]).
     fn decode_input(&mut self, token: u32, pos: u32) -> Result<StepInput, GpuError> {
-        if pos as usize >= self.ctx {
-            return Err(shape(format!(
-                "a step at position {pos} in stores of {}",
-                self.ctx
-            )));
-        }
+        check_pos(pos, self.ctx)?;
         self.stores_at(pos)?;
         self.embd.fill(token)?;
         Ok(StepInput { pos })
@@ -2577,4 +2592,49 @@ pub(crate) fn refuse_steps_under_residency(m: &Glm5nextModel) -> Result<(), GpuE
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gguf::write::{Layout, TensorDecl, Writer};
+
+    #[test]
+    fn the_embedding_rows_must_match_the_declared_vocabulary() {
+        let dir = std::env::temp_dir().join(format!("glm5next-embedding-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut refused = Vec::new();
+        for rows in [3, 4, 5] {
+            let name = names::token_embd();
+            let path = dir.join(format!("{rows}.gguf"));
+            let layout = Layout::new(
+                &[],
+                vec![TensorDecl {
+                    name: name.clone(),
+                    dims: vec![32, rows],
+                    type_id: 0,
+                    nbytes: 4 * 32 * rows,
+                }],
+            )
+            .unwrap();
+            let mut writer = Writer::new(std::fs::File::create(&path).unwrap(), layout).unwrap();
+            writer
+                .tensor(&name, &vec![0; 4 * 32 * rows as usize])
+                .unwrap();
+            writer.finish().unwrap();
+            let file = Arc::new(Split::open(&path).unwrap());
+            let embedding = Embedding::new(file, 32, 4);
+            if rows == 4 {
+                let mut embedding = embedding.unwrap();
+                embedding.fill(3).unwrap();
+                assert!(embedding.fill(4).is_err());
+            } else {
+                refused.push(matches!(embedding, Err(GpuError::Shape { detail, .. })
+                    if detail.contains(&format!("the embedding has {rows} rows"))
+                        && detail.contains("vocabulary 4")));
+            }
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(refused, [true, true], "V-1 and V+1 rows must be refused");
+    }
 }

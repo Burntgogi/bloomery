@@ -311,8 +311,20 @@ impl Safetensors {
 }
 
 /// The values of the tensor `name` stored as `raw`, converted to f32. BF16, F16 and F32 convert
-/// exactly; any other dtype is refused by name.
-pub(crate) fn f32_values(name: &str, raw: &Raw<'_>) -> Result<Vec<f32>, Error> {
+/// exactly; any other dtype is refused by name. The shape must describe the complete byte span.
+pub fn f32_values(name: &str, raw: &Raw<'_>) -> Result<Vec<f32>, Error> {
+    let expected = raw
+        .shape
+        .iter()
+        .try_fold(raw.dtype.size(), |bytes, &dim| bytes.checked_mul(dim));
+    if expected != Some(raw.bytes.len()) {
+        return Err(bad(format!(
+            "{name}: shape {:?} does not match {} {} bytes",
+            raw.shape,
+            raw.bytes.len(),
+            raw.dtype.name()
+        )));
+    }
     Ok(match raw.dtype {
         Dtype::Bf16 => raw
             .bytes
@@ -576,6 +588,39 @@ mod tests {
     }
 
     #[test]
+    fn f32_conversion_validates_constructed_raw_spans() {
+        let malformed: &[(Dtype, &[usize], &[u8])] = &[
+            (Dtype::F32, &[1], &[0, 0, 0]),
+            (Dtype::Bf16, &[1], &[0]),
+            (Dtype::F16, &[1], &[0]),
+            (Dtype::F32, &[2], &[0; 4]),
+            (Dtype::F32, &[1], &[0; 8]),
+            (Dtype::F32, &[usize::MAX], &[]),
+        ];
+        for &(dtype, shape, bytes) in malformed {
+            let raw = Raw {
+                dtype,
+                shape,
+                bytes,
+            };
+            assert!(matches!(f32_values("raw", &raw), Err(Error::Format(_))));
+        }
+        let scalar = 1.25f32.to_le_bytes();
+        let raw = Raw {
+            dtype: Dtype::F32,
+            shape: &[],
+            bytes: &scalar,
+        };
+        assert_eq!(f32_values("scalar", &raw).unwrap(), [1.25]);
+        let empty = Raw {
+            dtype: Dtype::F32,
+            shape: &[0],
+            bytes: &[],
+        };
+        assert!(f32_values("empty", &empty).unwrap().is_empty());
+    }
+
+    #[test]
     fn reads_bf16_f16_f32_and_scalars() {
         let f32s: Vec<u8> = [1.5f32, -2.25]
             .iter()
@@ -668,7 +713,7 @@ mod tests {
     #[test]
     fn a_modelopt_shard_slice_opens_with_u8_and_f8_e4m3_held_raw() {
         let st = Safetensors::parse(
-            include_bytes!("../tests/fixtures/modelopt-nvfp4.safetensors").to_vec(),
+            include_bytes!("../../hf/tests/fixtures/modelopt-nvfp4.safetensors").to_vec(),
         )
         .unwrap();
         let stem = "model.language_model.layers.0.mlp.experts.0.gate_proj";
@@ -938,7 +983,7 @@ mod tests {
         let d = Dir::new("real");
         let fixture = |name: &str| {
             std::fs::read(format!(
-                "{}/tests/fixtures/checkpoint-headers/{name}",
+                "{}/../hf/tests/fixtures/checkpoint-headers/{name}",
                 env!("CARGO_MANIFEST_DIR")
             ))
             .unwrap()

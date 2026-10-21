@@ -67,7 +67,10 @@ use gguf::GgmlType;
 use gguf::iq_tables::{
     IQ2XS_GRID, IQ2XXS_GRID, IQ3S_GRID, IQ3XXS_GRID, KSIGNS_IQ2XS, KVALUES_IQ4NL,
 };
-use gguf::quant::{KVALUES_MXFP4, e8m0_to_f32_half, f32_to_f16_bits, half_to_f32};
+use gguf::quant::{
+    KVALUES_MXFP4, bf16_bits_to_f32, e8m0_to_f32_half, f32_to_f16_bits, fp32_to_bf16_bits,
+    half_to_f32, non_finite_activation, q80_inverse, q82_inverse,
+};
 
 pub mod generic;
 
@@ -1432,57 +1435,16 @@ fn check_row(w: GgmlType, wrow_len: usize, acol_len: usize, k: usize) -> Result<
 
 // ----------------------------------------------------------- q8_K encode
 
-/// ggml's `nearest_int` (ggml-quants.c:1726): round-to-nearest via the
-/// 2^23 + 2^22 f32 mantissa trick. Identical to `round_ties_even` on the
-/// |v| <= 127 domain `iscale * x` lives in, which is what lets gate 1
-/// compare restored values bit for bit against
-/// `quantize_row_q8_k_roundtrip` (which rounds with `round_ties_even`).
-/// Every activation encoder rounds through this: without SSE4.1 in the
-/// baseline target `round_ties_even` is a libm `rintf` call per element.
-#[inline]
-pub fn nearest_int(fval: f32) -> i32 {
-    let val = fval + 12582912.0;
-    let i = f32::to_bits(val);
-    ((i & 0x007f_ffff) as i32) - 0x0040_0000
-}
-
-/// A NaN or an infinity in an activation block is undefined input: every
-/// encoder path refuses it here, by name, instead of quantizing the block to a
-/// defined value (a lane-wise max would skip the NaN; an infinity would give a
-/// zero scale). `x` is the block; the message names the first offending value.
-#[cold]
-#[inline(never)]
-fn non_finite_activation(x: &[f32]) -> ! {
-    let (i, v) = x
-        .iter()
-        .enumerate()
-        .find(|(_, v)| !v.is_finite())
-        .map_or((usize::MAX, f32::NAN), |(i, &v)| (i, v));
-    panic!(
-        "qdot: non-finite activation value {v} at offset {i} of a {}-value block",
-        x.len()
-    );
-}
+pub use gguf::quant::nearest_int;
 
 /// Quantizes one 256-value block into 296-byte `block_q8_K` layout. Refuses a
 /// block with a non-finite value ([`non_finite_activation`]).
 fn quantize_q8k_block(x: &[f32], out: &mut [u8]) {
     debug_assert_eq!(x.len(), 256);
     debug_assert_eq!(out.len(), Q8K_STRIDE);
-    let mut max = 0.0f32;
-    let mut amax = 0.0f32;
-    for &v in x {
-        if !v.is_finite() {
-            non_finite_activation(x);
-        }
-        let ax = v.abs();
-        if ax > amax {
-            amax = ax;
-            max = v;
-        }
-    }
+    let max = gguf::quant::activation_max(x, "qdot");
     out[4..8].fill(0);
-    if amax == 0.0 {
+    if max == 0.0 {
         out.fill(0);
         return;
     }
@@ -1594,7 +1556,7 @@ unsafe fn quantize_q8k_block_avx2(x: &[f32; 256], out: &mut [u8; 296]) {
         }
         let amax = hmax_ps(m);
         if _mm256_movemask_ps(unord) != 0 || !amax.is_finite() {
-            non_finite_activation(x);
+            non_finite_activation(x, "qdot");
         }
         if amax == 0.0 {
             *out = [0u8; Q8K_STRIDE];
@@ -3570,38 +3532,6 @@ fn make_q4_scales(scales12: &[u8]) -> [u32; 4] {
     ]
 }
 
-/// Converts fp32 to bf16 bits with round to nearest even.
-#[inline]
-fn fp32_to_bf16_bits(s: f32) -> u16 {
-    let u = s.to_bits();
-    if (u & 0x7fff_ffff) > 0x7f80_0000 {
-        ((u >> 16) | 64) as u16
-    } else {
-        (u.wrapping_add(0x7fff + ((u >> 16) & 1)) >> 16) as u16
-    }
-}
-
-/// Converts bf16 bits to f32.
-#[inline]
-fn bf16_bits_to_f32(h: u16) -> f32 {
-    f32::from_bits((h as u32) << 16)
-}
-
-/// The q8_2 block's code multiplier from its bf16 scale bits: `1/d`, and 0
-/// where `d` is 0 or `1/d` overflows (a block whose scale is at or below
-/// about 2^-128 flushes to zero codes and a zero sum). Codes are `nearest_int(v
-/// * id)` saturated to i8, the sum over the unsaturated ints, which is ik's
-/// x86 rule (`_mm256_cvtps_epi32` then the saturating packs): with a normal
-/// `d` the bf16 round-down is at most 2^-8 relative and every code stays in
-/// ±127, but a subnormal `d` keeps fewer bits and `v * id` reaches 128 —
-/// saturated to 127, not wrapped to -128 (`hw_q82_codes_at_bf16_round_down`).
-#[inline(always)]
-fn q82_inverse(t: u16) -> f32 {
-    let d = bf16_bits_to_f32(t);
-    let id = if d > 0.0 { 1.0 / d } else { 0.0 };
-    if id.is_finite() { id } else { 0.0 }
-}
-
 /// Quantizes activations into Q8_2_X4 column layout.
 ///
 /// Leftover blocks past 128-multiples are stored as standard 36-byte block_q8_2.
@@ -3613,13 +3543,7 @@ fn quantize_q82x4_col(x: &[f32], out: &mut [u8]) {
         group.fill(0);
         for ir in 0..4 {
             let xb = &blocks[4 * gi + ir];
-            let mut amax = 0.0f32;
-            for &v in xb {
-                if !v.is_finite() {
-                    non_finite_activation(xb);
-                }
-                amax = amax.max(v.abs());
-            }
+            let amax = gguf::quant::activation_max(xb, "qdot").abs();
             let t = fp32_to_bf16_bits(amax / 127.0);
             group[2 * ir..2 * ir + 2].copy_from_slice(&t.to_le_bytes());
             let id = q82_inverse(t);
@@ -3635,13 +3559,7 @@ fn quantize_q82x4_col(x: &[f32], out: &mut [u8]) {
     }
     for (t, xb) in blocks[nb4..].iter().enumerate() {
         let tb = &mut out[nb4 / 4 * Q82X4_STRIDE + t * Q82_BLOCK..][..Q82_BLOCK];
-        let mut amax = 0.0f32;
-        for &v in xb {
-            if !v.is_finite() {
-                non_finite_activation(xb);
-            }
-            amax = amax.max(v.abs());
-        }
+        let amax = gguf::quant::activation_max(xb, "qdot").abs();
         let b = fp32_to_bf16_bits(amax / 127.0);
         tb[0..2].copy_from_slice(&b.to_le_bytes());
         let id = q82_inverse(b);
@@ -3707,7 +3625,7 @@ unsafe fn quantize_q8_block_avx2(
         }
         let amax = hmax_ps(m);
         if _mm256_movemask_ps(unord) != 0 || !amax.is_finite() {
-            non_finite_activation(x);
+            non_finite_activation(x, "qdot");
         }
         // The scale rule stays scalar: one conversion per block.
         let (t, id) = rule(amax);
@@ -3774,21 +3692,6 @@ unsafe fn quantize_q82x4_col_avx2(x: &[f32], out: &mut [u8]) {
     }
 }
 
-/// The q8_0 block's code multiplier from its max |value| `amax`: `127 / amax`,
-/// 0 for a zero block, as mainline's x86 `quantize_row_q8_0` (llama.cpp
-/// `f2cc7282c` ggml-cpu/arch/x86/quants.c:333) computes it, from `amax` and
-/// not from the stored f16 scale. 0 too where `127 / amax` overflows (amax
-/// below about 2^-121), where mainline's codes are the integer-indefinite
-/// -128 and ours 0. No dot tells them apart: that block's f16 `d` is exactly
-/// +0, so `fma(d, s, sumi)` adds a signed zero to `sumi`, whatever `s` is, and
-/// `sumi` is never -0 (it starts at +0, and no step rounds to -0), so it keeps
-/// its value.
-#[inline(always)]
-fn q80_inverse(amax: f32) -> f32 {
-    let id = if amax != 0.0 { 127.0 / amax } else { 0.0 };
-    if id.is_finite() { id } else { 0.0 }
-}
-
 /// Quantizes activations into `block_q8_0` blocks (34 bytes / 32 values: f16
 /// `d`, 32 i8 codes) by mainline's x86 `quantize_row_q8_0` (llama.cpp
 /// `f2cc7282c` ggml-cpu/arch/x86/quants.c:302), the column its
@@ -3802,18 +3705,7 @@ fn quantize_q8f0_col(x: &[f32], out: &mut [u8]) {
     let (blocks, _) = x.as_chunks::<32>();
     let (oblocks, _) = out.as_chunks_mut::<Q8F0_BLOCK>();
     for (xb, ob) in blocks.iter().zip(oblocks) {
-        let mut amax = 0.0f32;
-        for &v in xb {
-            if !v.is_finite() {
-                non_finite_activation(xb);
-            }
-            amax = amax.max(v.abs());
-        }
-        ob[0..2].copy_from_slice(&f32_to_f16_bits(amax / 127.0).to_le_bytes());
-        let id = q80_inverse(amax);
-        for (o, &v) in ob[2..].iter_mut().zip(xb) {
-            *o = nearest_int(v * id).clamp(-128, 127) as i8 as u8;
-        }
+        ob.copy_from_slice(&gguf::quant::quantize_q8_0(xb).to_bytes());
     }
 }
 
@@ -9625,6 +9517,129 @@ unsafe fn swiglu_clamp_avx2(gate: &[f32], up: &[f32], limit: f32, out: &mut [f32
         let c = _mm256_max_ps(_mm256_min_ps(u, hi), lo);
         // SAFETY: op holds eight f32 values.
         unsafe { _mm256_storeu_ps(op.as_mut_ptr(), _mm256_mul_ps(c, s)) };
+        out[full..].copy_from_slice(&op[..n - full]);
+    }
+    let finite = _mm256_cmpgt_epi32(_mm256_castps_si256(_mm256_set1_ps(f32::INFINITY)), acc);
+    _mm256_movemask_epi8(finite) == -1
+}
+
+/// The gpt-oss / MiniMax SwiGLU for one value, the rule the card runs
+/// (`bloomery_gpu::kquant::act::swiglu_oai`): `x = min(gate, limit)`, `y =
+/// clamp(up, -limit, limit)`, `x / (1 + e^(−alpha·x)) · (y + 1)` — llama.cpp's
+/// `ggml_compute_forward_swiglu_oai` (and ik's `MulMat::swiglu_oai`) term for
+/// term, with the exponential [`expf_ik_scalar`] where they call libm's. The
+/// `min` and the clamp are the `std::min` and `std::clamp` comparisons.
+#[inline]
+#[must_use]
+pub fn swiglu_oai_1(gate: f32, up: f32, alpha: f32, limit: f32) -> f32 {
+    let x = if limit < gate { limit } else { gate };
+    let y = if up < -limit {
+        -limit
+    } else if limit < up {
+        limit
+    } else {
+        up
+    };
+    x / (1.0 + expf_ik_scalar(alpha * (0.0 - x))) * (y + 1.0)
+}
+
+/// `out[i] = swiglu_oai_1(gate[i], up[i], alpha, limit)`, AVX2 where available:
+/// [`swiglu`]'s `v_expf` lanes (a tail shorter than eight goes through the
+/// same lanes on a zero-padded copy, so a value never depends on where in the
+/// block it sits) with the OAI rule's clamps, the same bits as the scalar
+/// [`swiglu_oai_1`]. `limit` must not be negative (the clamp of `up` would have
+/// its bounds reversed).
+///
+/// Returns `false` when `gate` or `up` holds a value that is not finite: the
+/// clamps would write some of those as finite values, so the caller refuses the
+/// block by name instead of using `out`.
+pub fn swiglu_oai(gate: &[f32], up: &[f32], alpha: f32, limit: f32, out: &mut [f32]) -> bool {
+    assert!(gate.len() == up.len() && gate.len() == out.len());
+    assert!(
+        limit >= 0.0 && limit.is_finite(),
+        "swiglu_oai: the limit must be finite and not negative, got {limit}"
+    );
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma") {
+        // SAFETY: the features were just detected; the slices are equal length.
+        return unsafe { swiglu_oai_avx2(gate, up, alpha, limit, out) };
+    }
+    // Absolute f32 encodings put every finite value below infinity and NaN.
+    let mut max_bits = 0u32;
+    for (o, (&g, &u)) in out.iter_mut().zip(gate.iter().zip(up)) {
+        max_bits = max_bits
+            .max(g.to_bits() & 0x7fff_ffff)
+            .max(u.to_bits() & 0x7fff_ffff);
+        *o = swiglu_oai_1(g, u, alpha, limit);
+    }
+    max_bits < f32::INFINITY.to_bits()
+}
+
+/// [`swiglu_oai_1`] over eight lanes; `(alpha, limit, -limit)` broadcast. The
+/// `min` and `max` operand orders are the scalar rule's comparisons.
+///
+/// # Safety
+/// The CPU must support AVX2 and FMA. Register-only: no memory is touched.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+#[inline]
+unsafe fn v_swiglu_oai(g: __m256, u: __m256, (a, hi, lo): (__m256, __m256, __m256)) -> __m256 {
+    let x = _mm256_min_ps(hi, g);
+    let y = _mm256_max_ps(_mm256_min_ps(u, hi), lo);
+    // SAFETY: same target features as the caller.
+    let e = unsafe { v_expf(_mm256_mul_ps(a, _mm256_sub_ps(_mm256_setzero_ps(), x))) };
+    let s = _mm256_div_ps(x, _mm256_add_ps(_mm256_set1_ps(1.0), e));
+    _mm256_mul_ps(s, _mm256_add_ps(y, _mm256_set1_ps(1.0)))
+}
+
+/// [`swiglu_oai`]'s vector body, with its flag.
+///
+/// # Safety
+/// The CPU must support AVX2 and FMA, and `gate`, `up` and `out` must all be
+/// the same length — the loads and the store share one index.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn swiglu_oai_avx2(
+    gate: &[f32],
+    up: &[f32],
+    alpha: f32,
+    limit: f32,
+    out: &mut [f32],
+) -> bool {
+    let n = gate.len();
+    let full = n / 8 * 8;
+    let (hi, lo, a) = (
+        _mm256_set1_ps(limit),
+        _mm256_set1_ps(-limit),
+        _mm256_set1_ps(alpha),
+    );
+    let mut acc = _mm256_setzero_si256();
+    let mut i = 0;
+    while i < full {
+        // SAFETY: i + 8 <= full <= gate.len().
+        let g = unsafe { _mm256_loadu_ps(gate.as_ptr().add(i)) };
+        // SAFETY: i + 8 <= full <= up.len().
+        let u = unsafe { _mm256_loadu_ps(up.as_ptr().add(i)) };
+        acc = max_abs_bits(acc, g, u);
+        // SAFETY: this function requires AVX2 and FMA.
+        let v = unsafe { v_swiglu_oai(g, u, (a, hi, lo)) };
+        // SAFETY: i + 8 <= full <= out.len().
+        unsafe { _mm256_storeu_ps(out.as_mut_ptr().add(i), v) };
+        i += 8;
+    }
+    if full < n {
+        let (mut gp, mut upad, mut op) = ([0.0f32; 8], [0.0f32; 8], [0.0f32; 8]);
+        gp[..n - full].copy_from_slice(&gate[full..]);
+        upad[..n - full].copy_from_slice(&up[full..]);
+        // SAFETY: gp holds eight f32 values.
+        let g = unsafe { _mm256_loadu_ps(gp.as_ptr()) };
+        // SAFETY: upad holds eight f32 values.
+        let u = unsafe { _mm256_loadu_ps(upad.as_ptr()) };
+        acc = max_abs_bits(acc, g, u);
+        // SAFETY: this function requires AVX2 and FMA.
+        let v = unsafe { v_swiglu_oai(g, u, (a, hi, lo)) };
+        // SAFETY: op holds eight writable f32 values.
+        unsafe { _mm256_storeu_ps(op.as_mut_ptr(), v) };
         out[full..].copy_from_slice(&op[..n - full]);
     }
     let finite = _mm256_cmpgt_epi32(_mm256_castps_si256(_mm256_set1_ps(f32::INFINITY)), acc);

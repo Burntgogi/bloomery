@@ -63,7 +63,7 @@ use vision::{EncoderInput, MediaModel, Patches, Prepared, VisionError};
 
 use crate::GateError;
 use crate::generate::Place;
-pub use crate::image_plan::table_bytes_per_position;
+pub use crate::image_plan::{TABLES_RESERVE, table_bytes_per_position};
 use crate::record::{self, Record};
 
 /// A [`MediaModel`] the server holds across its threads (`serve::media::SharedMediaModel`).
@@ -78,6 +78,11 @@ pub const MINICPM_TILE_TOKENS: usize = 70;
 /// Patches in one merged MiniCPM-V token. Both mergers fold 2×2, the same figure
 /// `bloomery_gpu_vision::minicpmv::PATCHES_PER_TOKEN` is, so 70 tokens are 1120 patches.
 pub const MINICPM_PATCHES_PER_TOKEN: usize = 16;
+
+/// What a build without the `vision` feature says of `--mmproj`: the tower's device code is not
+/// compiled, so the flag is refused by name.
+pub const NO_TOWER: &str =
+    "--mmproj: this build takes no images (built without the vision feature)";
 
 /// The image-input flags of a serve seat, llama-server's spelling.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -306,6 +311,18 @@ pub enum PleImage {
     /// It has one and the file carries no `ple.image_token_id`.
     NoKey,
     Id(u32),
+}
+
+impl PleImage {
+    /// The text model's PLE site as the check reads it: `site` is `None` with no site, else the
+    /// site's `ple.image_token_id` (`None` when the file carries none).
+    #[must_use]
+    pub fn of(site: Option<Option<u32>>) -> PleImage {
+        match site {
+            None => PleImage::Absent,
+            Some(image) => image.map_or(PleImage::NoKey, PleImage::Id),
+        }
+    }
 }
 
 /// An encoder file opened on the host, held against its seat by [`Projector::check_text`]. Nothing
@@ -934,6 +951,25 @@ impl Resident {
     }
 }
 
+/// The resident encoder of `--mmproj` for a serve seat: the tower of `at` loaded on the card the
+/// plan seated it ([`Resident::open`], `model` the context the seat's body runs on) and the
+/// `vision` record that names the card, which of the two seats it is and the tower's bytes
+/// ([`Resident::announce`], the tower's activations its own). `None` without an encoder. A seat
+/// opens it after its model's captures.
+#[cfg(feature = "vision")]
+pub fn open_resident(
+    model: &CudaContext,
+    at: Option<Opened>,
+) -> Result<Option<Resident>, GateError> {
+    let Some(at) = at else {
+        return Ok(None);
+    };
+    let started = std::time::Instant::now();
+    let resident = Resident::open(model, &at)?;
+    resident.announce(&at, ScratchHome::Own, started);
+    Ok(Some(resident))
+}
+
 /// The rows of one media call, read back by [`Resident::encode_with`] ([`Resident::encode`] for a
 /// merger tower: `K = ()`) and not yet spliced into a prompt call; `K` is the kind a seat's splice
 /// gives each position. [`Encoded::rows`] lends them read-only; [`Encoded::prompt`] makes the one
@@ -1230,6 +1266,22 @@ pub fn seat_record(at: &Opened) -> Record {
     seat_line(at, at.seat.word(), None)
 }
 
+/// The `vision_seat` record of the encoder a seat seated, nothing without one, so a load without
+/// `--mmproj` prints its lines as it did.
+pub fn print_seat(at: Option<&Opened>) {
+    if let Some(at) = at {
+        seat_record(at).eprint();
+    }
+}
+
+/// What a seat's plans and its open take of `--mmproj`: whether the load is a media load (every
+/// sequence holds the rotation table an image's positions rewrite) and the bytes the encoder
+/// reserves on the stage card, when its tower sits there.
+#[must_use]
+pub fn images_of(at: Option<&Opened>) -> (bool, Option<u64>) {
+    (at.is_some(), at.and_then(|v| v.seat.reserve))
+}
+
 /// The `vision_seat` record of a projector [`kept`] drops: the seat it would have taken, the
 /// reserve it would have reserved and what that costs the plan.
 fn not_loaded(at: &Opened, costs: &Costs) -> Record {
@@ -1514,6 +1566,15 @@ mod tests {
             imrope,
             ple,
         }
+    }
+
+    /// The text model's PLE site is the check's third kind: none, a site with no image key, and a
+    /// site that names the id the projector's image token must equal.
+    #[test]
+    fn a_ple_site_is_read_by_its_image_key() {
+        assert_eq!(PleImage::of(None), PleImage::Absent);
+        assert_eq!(PleImage::of(Some(None)), PleImage::NoKey);
+        assert_eq!(PleImage::of(Some(Some(248_056))), PleImage::Id(248_056));
     }
 
     /// `open_seat` before any file or card: no `--mmproj` is no encoder, a limit without it is

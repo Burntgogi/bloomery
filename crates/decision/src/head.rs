@@ -18,7 +18,7 @@ use crate::encode::Encoded;
 use crate::json::{self, Json};
 use crate::ops::{self, Mha, dot, gelu, layer_norm, layer_normed, linear, normalized};
 #[cfg(feature = "safetensors")]
-use hf::safetensors::Safetensors;
+use safetensors::Safetensors;
 
 pub use crate::ops::LAYER_NORM_EPS;
 
@@ -832,7 +832,7 @@ pub(crate) mod release_file {
     use super::*;
     use crate::encode::encode_with;
     use crate::request::Request;
-    use hf::safetensors::write;
+    use safetensors::write;
 
     pub(crate) fn bf16(n: usize, seed: u32) -> Vec<u8> {
         let mut s = seed;

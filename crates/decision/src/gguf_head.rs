@@ -331,7 +331,7 @@ mod tests {
     use crate::head::release_file::file_of;
     use crate::head::tests::CFG;
     use crate::head::{ClefHead, scales_of};
-    use hf::safetensors::Safetensors;
+    use safetensors::Safetensors;
 
     /// llama.cpp's name map of the head, as `gguf-py/gguf/tensor_mapping.py` lists it for `clef`
     /// (`{bid}` is the block id); the test's own copy, which [`sources`] must invert.

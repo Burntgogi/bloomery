@@ -37,8 +37,9 @@ use gguf::{GENERAL_ARCHITECTURE, GgmlType, Gguf, PrivateType, Split, TensorInfo,
 use qdot::{Q3K_R8_LAYOUT, Q3K_R8_ROWS};
 
 use crate::ModelError;
-use crate::fileio::{self, sha256_hex};
+use crate::fileio;
 use crate::placement::host_lock::{FileMapping, HostFile, drop_pages};
+use gguf::digest::sha256_hex;
 
 /// The r8 format's refusal type and its two identity constants live in
 /// `bloomery-placement` (the planner's error wraps them); this module is

@@ -53,7 +53,9 @@
 //! first launch.
 //! A stack of any other type is refused by name when the stacks are read
 //! ([`LegStacks::of`]), and an entry the table names but the run has no arm
-//! for is refused by name at the launch.
+//! for is refused by name at the launch. A tensor-parallel rank's stacks may
+//! also hold a Q6_K down ([`LegStacks::of_rank`], [`kernels::rank_down_runs`]),
+//! which the Q6_K `_sel` runs over the 128-value columns.
 //!
 //! A prompt walk that runs a unit's card slots through a route table reads
 //! each resident stack by the GEMM entry [`kernels::gemm`] names for its type
@@ -69,6 +71,7 @@ use crate::mxfp4_sel::{Mxfp4SelKernels, Nvfp4Down, Nvfp4GateUp, Nvfp4SelKernels,
 use crate::q4k_sel::QuantSel;
 use crate::q5::Q8Blocks32;
 use crate::q5_1_sel::{Q51SelDown, Q51SelKernels};
+use crate::q6k_sel::Q6kSelKernels;
 use crate::q8_0_sel32::{Q80SelDown, Q80SelKernels};
 use crate::quant_sel::QuantSelKernels;
 use crate::weights::{DevWeight, Weights};
@@ -248,12 +251,7 @@ impl<'a> StackW<'a> {
             (GemmEntry::Q5_1, StackW::Words(w)) => RouteW::Blocks32(Gemm32Weight::Q5_1File(w)),
             (GemmEntry::Iq4nl, StackW::Words(w)) => RouteW::Blocks32(Gemm32Weight::Iq4NlFile(w)),
             (GemmEntry::Nvfp4, StackW::Nvfp4(s)) => RouteW::Blocks32(Gemm32Weight::Nvfp4Planes(s)),
-            (_, StackW::Words(w)) => {
-                let Ok(t) = GemmWeight::from_ggml(ty) else {
-                    return None;
-                };
-                RouteW::Grouped(t, w)
-            }
+            (entry, StackW::Words(w)) => RouteW::Grouped(GemmWeight::of_entry(entry)?, w),
             (_, StackW::Nvfp4(_)) => return None,
         })
     }
@@ -358,9 +356,26 @@ impl<'a> LegStacks<'a> {
     /// [`kernels::card_planes_runs`] admits (not necessarily the same one).
     /// Allocation-free on success.
     pub fn of(w: &'a Weights, names: [&'a str; 3]) -> Result<LegStacks<'a>, GpuError> {
-        const GATE_UP: &str = "a resident routed gate or up stack of a type the card leg runs (`kernels::card_gate_up_runs`)";
         const DOWN: &str =
             "a resident routed down stack of a type the card leg runs (`kernels::card_down_runs`)";
+        LegStacks::with_downs(w, names, (kernels::card_down_runs, DOWN))
+    }
+
+    /// [`LegStacks::of`] for a tensor-parallel rank, whose downs may also be
+    /// Q6_K ([`kernels::rank_down_runs`]). Allocation-free on success.
+    pub fn of_rank(w: &'a Weights, names: [&'a str; 3]) -> Result<LegStacks<'a>, GpuError> {
+        const DOWN: &str = "a resident routed down stack of a type a rank's card leg runs \
+                            (`kernels::rank_down_runs`)";
+        LegStacks::with_downs(w, names, (kernels::rank_down_runs, DOWN))
+    }
+
+    /// The stacks with the down admitted by `downs.0`, refused as `downs.1`.
+    fn with_downs(
+        w: &'a Weights,
+        names: [&'a str; 3],
+        downs: (fn(GgmlType) -> bool, &'static str),
+    ) -> Result<LegStacks<'a>, GpuError> {
+        const GATE_UP: &str = "a resident routed gate or up stack of a type the card leg runs (`kernels::card_gate_up_runs`)";
         let [gate, up, down] = names;
         let (gate, up, down) = (
             LegStack::of(
@@ -377,13 +392,7 @@ impl<'a> LegStacks<'a> {
                 kernels::card_planes_runs,
                 GATE_UP,
             )?,
-            LegStack::of(
-                w,
-                down,
-                kernels::card_down_runs,
-                kernels::card_planes_runs,
-                DOWN,
-            )?,
+            LegStack::of(w, down, downs.0, kernels::card_planes_runs, downs.1)?,
         );
         if up.ty != gate.ty {
             return Err(GpuError::Tensor {
@@ -439,6 +448,7 @@ pub struct LegSum<'a> {
 /// The modules the leg's launches run on.
 pub struct CardLeg {
     quant: QuantSelKernels,
+    q6k: Q6kSelKernels,
     mxfp4: Mxfp4SelKernels,
     nvfp4: Nvfp4SelKernels,
     q51: Q51SelKernels,
@@ -460,6 +470,7 @@ impl CardLeg {
         let (ctx, word) = (gpu.context(), gpu.fault_word());
         Ok(CardLeg {
             quant: QuantSelKernels::load(ctx, word)?,
+            q6k: Q6kSelKernels::load(ctx, word)?,
             mxfp4: Mxfp4SelKernels::load(ctx, word)?,
             nvfp4: Nvfp4SelKernels::load(ctx, word)?,
             q51: Q51SelKernels::load(ctx, word)?,
@@ -679,6 +690,17 @@ impl CardLeg {
                     rows_per_expert,
                 };
                 self.quant.enqueue_gemv_q5k_sel(stream, &d, fault, down)?;
+            }
+            (Some((DownEntry::Q6k, DownAct::Q8Act)), ActH::Q8Act(act)) => {
+                self.q6k.enqueue_gemv_q6k_sel(
+                    stream,
+                    st.down.words()?,
+                    act,
+                    sel,
+                    slots,
+                    rows_per_expert,
+                    down,
+                )?;
             }
             (Some((DownEntry::Mxfp4, DownAct::Q8Act)), ActH::Q8Act(act)) => {
                 let d = SelDown {
@@ -1462,14 +1484,20 @@ pub(crate) mod tests {
                 GgmlType::Q5_K => &["sel", "arena", "tiles"],
                 _ => &["sel"],
             };
-            for &mode in modes {
+            let rules = [
+                Act::SwigluClamp { limit: 7.0 },
+                Act::SwigluOai {
+                    alpha: crate::kquant::act::SWIGLU_OAI_ALPHA,
+                    limit: 7.0,
+                },
+            ];
+            for (&mode, rule) in modes.iter().flat_map(|m| rules.map(|r| (m, r))) {
                 let (gate, up) = if mode == "sel_gate" {
                     (&wu, &wg)
                 } else {
                     (&wg, &wu)
                 };
                 let mut h = DeviceBuffer::zeroed(stream, ROWS).expect("h");
-                let rule = Act::SwigluClamp { limit: 7.0 };
                 let a = GateUpAct {
                     wg: gate,
                     wu: up,
@@ -1540,11 +1568,11 @@ pub(crate) mod tests {
                 let ok = fault == Some(Fault::at(LAYER_NONE, FaultSite::F32Product))
                     && rows.iter().all(|v| v.is_nan());
                 println!(
-                    "{ty:?} {mode}: fault={fault:?} nan={} {ok}",
+                    "{ty:?} {mode} {rule:?}: fault={fault:?} nan={} {ok}",
                     rows.iter().filter(|v| v.is_nan()).count()
                 );
                 if !ok {
-                    failures.push(format!("{ty:?} {mode}: {fault:?} {rows:?}"));
+                    failures.push(format!("{ty:?} {mode} {rule:?}: {fault:?} {rows:?}"));
                 }
             }
         }
@@ -2008,11 +2036,14 @@ pub(crate) mod tests {
             scales: &scales,
         });
         let words = StackW::Words(&qs);
+        // PIN(2026-10-21): IQ2_XXS's words join the grouped routes with the
+        // table's GEMM row for the type (`gemm_iq2xxs`).
         for ty in [
             GgmlType::Q3_K,
             GgmlType::Q4_K,
             GgmlType::Q5_K,
             GgmlType::Q6_K,
+            GgmlType::IQ2_XXS,
             GgmlType::IQ3_XXS,
             GgmlType::IQ4_XS,
         ] {
@@ -2049,12 +2080,7 @@ pub(crate) mod tests {
             assert!(planes.route(ty).is_none(), "{ty} in planes");
         }
         assert!(words.route(GgmlType::NVFP4).is_none(), "NVFP4 as words");
-        for ty in [
-            GgmlType::IQ2_XXS,
-            GgmlType::MXFP4,
-            GgmlType::Q5_0,
-            GgmlType::F32,
-        ] {
+        for ty in [GgmlType::MXFP4, GgmlType::Q5_0, GgmlType::F32] {
             assert!(kernels::gemm(ty).is_none(), "{ty} has a GEMM row");
             assert!(words.route(ty).is_none(), "{ty}");
         }

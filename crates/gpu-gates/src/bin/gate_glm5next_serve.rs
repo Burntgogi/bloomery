@@ -309,7 +309,7 @@ mod gate {
         metric, parse_ids, plan_run, prefix_restore, rendered, server_log, tokenized,
     };
     use bloomery_gpu_gates::tier::{self, Tag};
-    use bloomery_gpu_gates::{GateError, checks_failed, ref_model_path, sha256};
+    use bloomery_gpu_gates::{GateError, checks_failed, ref_model_path};
     use bloomery_gpu_glm5next::{CHECKPOINT_EVERY, checkpoint_price};
     use gguf::Split;
     use model::arch::glm5next::place::{
@@ -2834,7 +2834,7 @@ mod gate {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join(IMAGE_DIR)
             .join(MEDIA_PNG);
-        let got = sha256(&path)?;
+        let got = gguf::digest::sha256_file(&path)?;
         if got != MEDIA_PNG_SHA256 {
             return Err(format!(
                 "{} is {got}, not the image the media arm was written against ({MEDIA_PNG_SHA256})",

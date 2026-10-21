@@ -6,11 +6,15 @@
 //! run along, dim 1 the rows, the dims past them whole matrices) into N equal parts. A part must
 //! hold whole units of the tensor's role along that dim (a head's rows, say) and whole blocks of
 //! its format (a 64-value NVFP4 block along dim 0, a 128-row FP8 block along dim 1): a cut off
-//! either is refused by name. What the dims, units and blocks are comes from the caller: the
-//! family says which dim and unit ([`TpTensor::cut`]), the tensor's format its bytes and blocks.
+//! either is refused by name. The family says which dim and unit ([`TpTensor::cut`]), the
+//! format its bytes and blocks, and [`card_blocks`] includes the role's kernel K unit.
+
+use gguf::GgmlType;
+use models::Role;
 
 use super::devices::DeviceId;
 use super::workstation::{CardSpec, unified_of};
+use crate::kernels;
 
 /// A tensor as the plan takes it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -22,7 +26,8 @@ pub struct TpTensor {
     pub bytes: u64,
     /// The bytes every rank holds whole beside its part (a tensor scale a matrix).
     pub whole_bytes: u64,
-    /// The values a format block spans along dims 0 and 1.
+    /// The values a part keeps whole along dims 0 and 1: the format's block, along dim 0 at
+    /// least the role's kernel K unit ([`card_blocks`]).
     pub block: [u64; 2],
     /// `None` keeps the tensor whole on every rank.
     pub cut: Option<Cut>,
@@ -33,6 +38,75 @@ pub struct TpTensor {
 pub struct Cut {
     pub dim: usize,
     pub unit: u64,
+}
+
+impl Cut {
+    /// One rank's extent along the cut of tensor `name` of `dims` into `n` ranks, its format and
+    /// kernel blocks `blocks` values along dims 0 and 1 (1 past them). No rank, a dim the tensor
+    /// lacks, a part of no units or of other than whole units, and a part off a block are refused by
+    /// name.
+    ///
+    /// # Errors
+    ///
+    /// [`TpError::NoRank`], [`TpError::NoDim`], [`TpError::Unit`] or [`TpError::Block`].
+    pub fn part(
+        self,
+        name: &str,
+        dims: &[u64],
+        blocks: [u64; 2],
+        n: usize,
+    ) -> Result<u64, TpError> {
+        if n == 0 {
+            return Err(TpError::NoRank);
+        }
+        let dim = self.dim;
+        let extent = *dims.get(dim).ok_or_else(|| TpError::NoDim {
+            name: name.into(),
+            dim,
+            dims: dims.to_vec(),
+        })?;
+        let part = extent / n as u64;
+        if part == 0 || !extent.is_multiple_of(n as u64) || !part.is_multiple_of(self.unit) {
+            return Err(TpError::Unit {
+                name: name.into(),
+                dim,
+                extent,
+                ranks: n,
+                unit: self.unit,
+            });
+        }
+        let block = blocks.get(dim).copied().unwrap_or(1);
+        if !part.is_multiple_of(block) {
+            return Err(TpError::Block {
+                name: name.into(),
+                dim,
+                extent,
+                ranks: n,
+                block,
+            });
+        }
+        Ok(part)
+    }
+}
+
+/// The values a part of a tensor of card type `ty`, whose format block spans `block` values along
+/// dims 0 and 1, keeps whole: along dim 0 the least multiple of the block and the K unit of the
+/// role's kernel ([`kernels::card_k_unit`]), so a cut never leaves a rank a part it cannot run. A
+/// block past u64 is refused.
+///
+/// # Errors
+///
+/// [`TpError::Overflow`].
+pub fn card_blocks(ty: GgmlType, block: [u64; 2], role: Role) -> Result<[u64; 2], TpError> {
+    let unit = kernels::card_k_unit(ty, role);
+    let (mut gcd, mut b) = (block[0], unit);
+    while b != 0 {
+        (gcd, b) = (b, gcd % b);
+    }
+    let k = (block[0] / gcd)
+        .checked_mul(unit)
+        .ok_or(TpError::Overflow)?;
+    Ok([k, block[1]])
 }
 
 /// One rank's node, by the name its lines print, and the bytes its pool holds for the rank.
@@ -144,8 +218,8 @@ pub enum TpError {
 ///
 /// # Errors
 ///
-/// A cut along a dim the tensor lacks, into parts that are not whole units or whole format blocks,
-/// a rank past its pool and two ranks on one device, each by name; no rank or a byte sum past u64.
+/// A cut [`Cut::part`] refuses, a rank past its pool and two ranks on one device, each by name; no
+/// rank or a byte sum past u64.
 pub fn plan_tp(pools: &[RankPool], tensors: &[TpTensor]) -> Result<Vec<Rank>, TpError> {
     let n = pools.len();
     if n == 0 {
@@ -174,34 +248,8 @@ pub fn plan_tp(pools: &[RankPool], tensors: &[TpTensor]) -> Result<Vec<Rank>, Tp
             whole_n += 1;
             continue;
         };
-        let Some(&extent) = t.dims.get(cut.dim) else {
-            return Err(TpError::NoDim {
-                name: t.name.clone(),
-                dim: cut.dim,
-                dims: t.dims.clone(),
-            });
-        };
+        cut.part(&t.name, &t.dims, t.block, n)?;
         let ranks = n as u64;
-        let part = extent / ranks;
-        if !extent.is_multiple_of(ranks) || !part.is_multiple_of(cut.unit) {
-            return Err(TpError::Unit {
-                name: t.name.clone(),
-                dim: cut.dim,
-                extent,
-                ranks: n,
-                unit: cut.unit,
-            });
-        }
-        let block = t.block.get(cut.dim).copied().unwrap_or(1);
-        if !part.is_multiple_of(block) {
-            return Err(TpError::Block {
-                name: t.name.clone(),
-                dim: cut.dim,
-                extent,
-                ranks: n,
-                block,
-            });
-        }
         // Whole blocks a part: the bytes split evenly with the values.
         split = split
             .checked_add(t.bytes / ranks)
@@ -238,7 +286,7 @@ pub fn plan_tp(pools: &[RankPool], tensors: &[TpTensor]) -> Result<Vec<Rank>, Tp
 
 #[cfg(test)]
 mod tests {
-    use super::{Cut, RankPool, TpError, TpTensor, plan_tp};
+    use super::{Cut, GgmlType, RankPool, Role, TpError, TpTensor, card_blocks, plan_tp};
 
     fn pools(n: usize, bytes: u64) -> Vec<RankPool> {
         (0..n)
@@ -378,7 +426,7 @@ mod tests {
     }
 
     /// A part that is not whole units of the role, or that cuts a format block, is refused by name;
-    /// so are a dim the tensor lacks and no rank.
+    /// so are a part of no units, a dim the tensor lacks and no rank.
     #[test]
     fn cuts_off_a_unit_or_a_block_are_refused_by_name() {
         let heads = Some(Cut { dim: 1, unit: 128 });
@@ -417,6 +465,69 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(e, TpError::NoDim { dim: 2, .. }), "{e}");
+        // An extent of no values leaves every rank no unit.
+        let empty = t("empty", 0, 64, [1, 1], Some(Cut { dim: 0, unit: 1 }));
+        assert!(matches!(
+            plan_tp(&pools(2, u64::MAX), &[empty]).unwrap_err(),
+            TpError::Unit { extent: 0, .. }
+        ));
         assert_eq!(plan_tp(&[], &[]).unwrap_err(), TpError::NoRank);
+    }
+
+    /// A cut along K keeps the card layout's unit whole past the format's 32-value block: MXFP8
+    /// planes 128 values (K 4096 at N = 32 is 128 a rank, at N = 64 64), an MXFP4 stack 256 (K
+    /// 1024 at N = 4 is 256, at N = 8 128); a type whose block is its layout keeps its block.
+    #[test]
+    fn a_cut_keeps_the_card_layouts_k_unit_whole() {
+        for (ty, k, fits, cuts) in [
+            (GgmlType::MXFP8, 4096, 32, 64),
+            (GgmlType::MXFP4, 1024, 4, 8),
+        ] {
+            let block = card_blocks(ty, [32, 1], Role::DenseFfn).unwrap();
+            let down = || t("down", k, 64, block, Some(Cut { dim: 0, unit: 1 }));
+            assert!(plan_tp(&pools(fits, u64::MAX), &[down()]).is_ok(), "{ty}");
+            assert!(
+                matches!(
+                    plan_tp(&pools(cuts, u64::MAX), &[down()]).unwrap_err(),
+                    TpError::Block { .. }
+                ),
+                "{ty}"
+            );
+        }
+        // Dense NVFP4 reads Q8Act; routed down reads Q8Blocks32.
+        let dense = card_blocks(GgmlType::NVFP4, [64, 1], Role::DenseFfn).unwrap();
+        let routed = card_blocks(GgmlType::NVFP4, [32, 1], Role::RoutedExperts).unwrap();
+        for role in [Role::Attention, Role::SharedExpert] {
+            assert_eq!(card_blocks(GgmlType::NVFP4, [64, 1], role), Ok(dense));
+        }
+        for n in [1, 2, 4] {
+            let cut = Cut { dim: 0, unit: 1 };
+            assert_eq!(
+                cut.part("routed down", &[32 * n as u64, 64, 2], routed, n),
+                Ok(32)
+            );
+            assert_eq!(
+                cut.part("dense down", &[256 * n as u64, 64], dense, n),
+                Ok(256)
+            );
+            for k in [64, 128, 192] {
+                assert!(matches!(
+                    cut.part("dense down", &[k * n as u64, 64], dense, n),
+                    Err(TpError::Block { block: 256, .. })
+                ));
+            }
+        }
+        assert_eq!(
+            card_blocks(GgmlType::Q4_K, [256, 1], Role::DenseFfn),
+            Ok([256, 1])
+        );
+        assert_eq!(
+            card_blocks(GgmlType::MXFP8, [48, 128], Role::DenseFfn),
+            Ok([384, 128])
+        );
+        assert_eq!(
+            card_blocks(GgmlType::MXFP4, [u64::MAX, 1], Role::RoutedExperts),
+            Err(TpError::Overflow)
+        );
     }
 }

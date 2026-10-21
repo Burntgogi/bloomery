@@ -2567,8 +2567,8 @@ def cmd_why(args: argparse.Namespace) -> int:
 # compilation inputs and are not counted as runtime code by key_holders. Build scripts/proc macros and opaque
 # generated code can legitimately remain wider than runtime reach; gaps reports that distinction honestly.
 KEY_REACH_PINS = {
-    "bloomery-hf": "a Hugging Face fetch or checkpoint reader: its commits move only the gates whose targets run its code (model-hf, "
-    "gpu-gates under the `hf` feature, decision under its `safetensors` feature)",
+    "bloomery-hf": "a Hugging Face fetch or checkpoint configuration reader: its commits move only the gates whose targets run its code "
+    "(model-hf and gpu-gates under the `hf` feature)",
     "bloomery-model-hf": "the fixture fetch and GLM's checkpoint map: gpu-gates links it under the `glm5next-hf` feature, for generate_glm5next alone",
 }
 
@@ -11124,6 +11124,12 @@ def key_reach_self_test(expect, side: Side) -> None:
     chain = why_chains(side, "gate-gpu-glm5next-twocard", "crates/hf/src/lib.rs")
     expect(any(c.endswith("generate_glm5next: bloomery-gpu-gates -> bloomery-hf") for c in chain), f"why: gate-gpu-glm5next-twocard's chain to hf is {chain}")
     expect(why_chains(side, "gate-hf", "crates/hf/src/lib.rs") == ["bloomery-hf libtest: its own package"], f"why: gate-hf's chain to hf is {why_chains(side, 'gate-hf', 'crates/hf/src/lib.rs')}")
+    for name in ("gate-decision-clef", "gate-decision-lev"):
+        expect(side.graph.inputs(name).match("crates/hf/src/lib.rs") is None, f"{name} keys unrelated hub code")
+    expect(
+        side.graph.inputs("gate-decision-clef").match("crates/safetensors/src/lib.rs") is not None,
+        "the feature-on decision gate must key its mapped head reader",
+    )
 
 
 def reach_self_test(expect, side: Side, row, stats: dict[str, int]) -> None:
@@ -12462,12 +12468,13 @@ def _st_real_tree(fails: list[str], side: Side) -> None:
     # PIN(2026-10-16): gate-gpu-nemotron-h-moe-serve joins them; the same seat gate on the moe body
     # PIN(2026-10-16): the embedding serve gate also builds bloomery-serve, including its V4.1 seat.
     # PIN(2026-10-17): the v1 embedding serve gate builds the same server and its V4.1 seat.
+    # PIN(2026-10-19): the Qwen3.8 media gate builds bloomery-serve beside its own bin for its serve clauses.
     # PIN(2026-10-20): gate-serve-draft-rules tests both serve bins, including their V4.1 draft.
     # PIN(2026-10-20): gate-gpu-solar2-serve joins them; its recipe builds bloomery-serve beside its own bin.
     expect(dspark == {"gate-gpu-clef-serve", "gate-gpu-ds41-chat", "gate-gpu-ds41-draft", "gate-gpu-ds41-dspark-loop",
                       "gate-gpu-ds41-prefill", "gate-gpu-ds41-tier", "gate-gpu-ds41-twocard", "gate-gpu-gemma-embedding-serve", "gate-gpu-gemma-embedding2-serve", "gate-gpu-glm5next-serve",
                       "gate-gpu-lev-serve", "gate-gpu-nemotron-h-moe-serve", "gate-gpu-nemotron-serve",
-                      "gate-gpu-qwen3-serve", "gate-gpu-serve-start-ds41", "gate-gpu-serve-start-glm", "gate-gpu-solar2-serve", "gate-ptx-spill", "gate-serve-draft-rules"},
+                      "gate-gpu-qwen3-serve", "gate-gpu-qwen38-media", "gate-gpu-serve-start-ds41", "gate-gpu-serve-start-glm", "gate-gpu-solar2-serve", "gate-ptx-spill", "gate-serve-draft-rules"},
            f"shared/ds41_dspark.rs (a #[path] module of the bins that name it) selects {sorted(dspark)}")
     hybrid = sel("crates/gpu/src/hybrid.rs")
     expect("gate-gpu-e2e" in hybrid and "gate-ops" not in hybrid and len(hybrid) < len(gates) - 20,
@@ -12495,6 +12502,10 @@ def _st_real_tree(fails: list[str], side: Side) -> None:
     schema = sel("tools/bloomery/schema/generate_ds41.jsonl") | {n for n in weeklies if graph.inputs(n).match("tools/bloomery/schema/generate_ds41.jsonl")}
     # PIN(2026-10-20): gate-q38-serve-rules also runs the lib's serve_client tests and record schema includes.
     expect(schema == {"gate-gpu-gates-lib", "gate-ds41-oracle", "gate-ds41-kld", "gate-ds41-bind", "gate-ds41-place", "gate-q38-serve-rules", "weekly-gpu-ds41-flowcounts"}, f"a record schema selects {sorted(schema)}")
+    flow = graph.inputs("weekly-gpu-ds41-flowcounts")
+    expect(flow.match("tools/bloomery/hf.py") is None, "flowcounts must not key the unrelated hub reader through self-test prose")
+    for path in ("tools/bloomery/records.py", "tools/flow/routes.py", "tools/gpu-ab.py", "tools/ref/tdist.py"):
+        expect(flow.match(path) is not None, f"flowcounts lost its executable input {path}")
     for n in ("check", "lint"):
         expect(graph.inputs(n).match("tools/levers-direct.txt") is not None, f"{n} (--all-targets) does not read tools/levers-direct.txt")
 
@@ -12732,7 +12743,7 @@ def _st_host_crates(fails: list[str], side: Side) -> None:
     real = dict(pure_crates(tree, load_lock(tree.root)))
     pure_now = sorted(n for n, w in real.items() if not w)
     expect(
-        pure_now == ["bloomery-decision", "bloomery-embed", "bloomery-hf", "bloomery-jinja", "bloomery-levers", "bloomery-models", "bloomery-placement", "bloomery-refset", "bloomery-runtime", "bloomery-sampler", "bloomery-serve", "bloomery-tokenizer", "bloomery-verbs", "bloomery-vision"],
+        pure_now == ["bloomery-decision", "bloomery-embed", "bloomery-hf", "bloomery-jinja", "bloomery-levers", "bloomery-models", "bloomery-placement", "bloomery-refset", "bloomery-runtime", "bloomery-safetensors", "bloomery-sampler", "bloomery-serve", "bloomery-tokenizer", "bloomery-verbs", "bloomery-vision"],
         f"pure: the real tree's pure crates are {pure_now} — a new member of the set is proven by `just mac-test` before this list takes it",
     )
     expect(any("crates/gguf/src/lib.rs:" in w and "RUSAGE_THREAD" in w for w in real.get("bloomery-gguf", [])), f"pure: gguf's reason {real.get('bloomery-gguf')}")
@@ -12744,12 +12755,13 @@ def _st_host_crates(fails: list[str], side: Side) -> None:
     host_now = [n for n, _ in host_crates(tree, lock_now)]
     # PIN(2026-10-20): bloomery-model-hf joined with the tests it took out of bloomery-model (the fixture fetch's, the GLM checkpoint
     # map's), which the nightly ran as part of that crate.
+    # PIN(2026-10-21): safetensors keeps the mapped reader's fixture tests previously run by bloomery-hf.
     expect(
         host_now
         == [
             "bloomery-app", "bloomery-decision", "bloomery-embed", "bloomery-engram", "bloomery-engram-lab", "bloomery-gguf", "bloomery-hf", "bloomery-jinja",
             "bloomery-levers", "bloomery-model", "bloomery-model-hf", "bloomery-models", "bloomery-placement", "bloomery-qdot", "bloomery-refset", "bloomery-runtime",
-            "bloomery-sampler", "bloomery-serve", "bloomery-threads", "bloomery-tokenizer", "bloomery-verbs",
+            "bloomery-safetensors", "bloomery-sampler", "bloomery-serve", "bloomery-threads", "bloomery-tokenizer", "bloomery-verbs",
             "bloomery-vision",
         ],
         f"host nightly: the real tree's set is {host_now} — a new member of the set is proven by a nightly run before this list takes it",

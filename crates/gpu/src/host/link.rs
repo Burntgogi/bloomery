@@ -58,7 +58,7 @@ use threads::helper::{HelperError, Placement, spawn_helper};
 
 use crate::GpuError;
 use crate::graph::{MappedHost, SHARED_PAGE, cu};
-pub use gather::{GatherSet, GatherShape, Gathers};
+pub use gather::{GatherLoop, GatherSet, GatherShape, Gathers};
 pub use pump::{Crossing, PostCols, Reader, Span};
 use pump::{Half, Move, Page, TAIL_LINE, Wire};
 pub use rdma::RdmaEnd;
@@ -121,6 +121,10 @@ impl Drop for Remote {
 }
 
 impl pump::Page for MappedHost {
+    fn bytes(&self) -> usize {
+        self.bytes()
+    }
+
     fn word(&self, off: usize) -> &AtomicU32 {
         self.atomic_u32(off)
             .expect("the tier page's layout keeps every word the link touches 4-aligned inside it")

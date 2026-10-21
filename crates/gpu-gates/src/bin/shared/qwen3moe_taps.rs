@@ -71,8 +71,6 @@ pub fn read_ids(path: &Path) -> Result<Vec<u32>, GateError> {
         .collect()
 }
 
-pub use bloomery_gpu_gates::sha256;
-
 /// `count` prompts of `len` ids from the ids file `path`, window `k` starting
 /// at `k · ⌊n / count⌋` of its `n` ids: spread over the whole file and never
 /// overlapping. A file too short for that is refused by name.
@@ -216,7 +214,7 @@ impl Dump {
             "{k}\t{}\t{}\t{}",
             seq.source.display(),
             seq.offset,
-            sha256(&seq.source)?
+            gguf::digest::sha256_file(&seq.source)?
         ));
         self.rows.push(row);
         self.write_tables()?;

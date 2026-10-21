@@ -10,8 +10,8 @@
 //!   expert's gate are joined as the target's are (`plan38::router`).
 //! - `token_embd` and `output` are the target's: nothing is uploaded for
 //!   them. The body holds their names and the device addresses they had at
-//!   open — the embedding's two Q8_0 planes, the head's two Q8_0 planes or
-//!   its one Q6_K word plane; the target's `Weights`, which `GpuModel` drops
+//!   open — the embedding's two Q8_0 planes or BF16 words, the head's two
+//!   Q8_0 planes, BF16 words or one Q6_K word plane; the target's `Weights`, which `GpuModel` drops
 //!   after the body, own the buffers, and a walk reads them through the
 //!   `&Weights` it is handed ([`Mtp38::borrowed`]), which refuses by name an
 //!   address that moved.
@@ -30,13 +30,15 @@
 //! its hidden the draft's own streams). Every launch is an entry the
 //! target's chain has, but two of its own (`crate::mtp`), the routed
 //! experts' expert-select gemv and a listed head's `q8_0_gemv_ids` (one
-//! row) or `q8_0_gemv_ids_mcol`, and over a Q6_K `output` its quantize and
-//! `q6k_gemv_ids` pair (`crate::q6k_ids`):
-//! - the target's embedding rows (`embed_rows_q8_0`, the borrowed
-//!   `token_embd`), the input pack (`mtp_input`: `rms(e)·enorm` beside
+//! row) or `q8_0_gemv_ids_mcol`, over a BF16 `output` `bf16_gemv_ids`, and
+//! over a Q6_K `output` its quantize and `q6k_gemv_ids` pair
+//! (`crate::q6k_ids`):
+//! - the target's embedding rows (`embed_rows_q8_0` or `embed_rows_bf16`,
+//!   the borrowed `token_embd`), the input pack (`mtp_input`: `rms(e)·enorm` beside
 //!   `rms(h)·hnorm` over all four streams, a row's four `[e | h_s]`), and
 //!   `nextn.eh_proj` over the `4·m` packed columns into the streams, in runs
-//!   of eight columns (`q8_0_gemv_mcol`, token-major);
+//!   of eight columns (the common dense site, `site::resident_gemv_cols`:
+//!   `q8_0_gemv_mcol` for Q8_0, the BF16 gemv or tile for BF16, token-major);
 //! - the attention site's mix, then dense gated GQA over the store: q (with
 //!   each head's gate), k and v, the q/k norm, turn and append
 //!   (`head_norm_neox_append_256`), the flash over every stored position
@@ -71,7 +73,7 @@
 //! sequence wrote). A new sequence ([`Mtp38::forget`], the body's reset)
 //! holds no position and no own row.
 //!
-//! A store walk ([`MtpMode::Store`], the prompt's warmup) stops after the
+//! A store walk ([`WalkMode::Store`], the prompt's warmup) stops after the
 //! append: a later row reads a row's keys and values and nothing else of
 //! it. It runs over up to [`MTP_STORE_ROWS`] rows at once through the
 //! launches the ubatch walk (`wide38`) runs, in its own buffers:
@@ -85,7 +87,7 @@
 //!
 //! Each op computes a row's values from that row's inputs alone, so a
 //! row's keys and values do not depend on the walk it lands in or on its
-//! neighbours. Against an [`MtpMode::Eager`] walk, which reads the f32
+//! neighbours. Against an [`WalkMode::Eager`] walk, which reads the f32
 //! rows, the three projections read q8 activations: the two stores agree to
 //! the error of that quantization and are not bit-equal.
 //!
@@ -95,24 +97,27 @@
 
 use super::body::ATTN_SCALE_256;
 use super::plan38::{HcSite, geo, router};
-use super::program38::{Ctx38, Kernels38, MMA, q8};
+use super::program38::{Ctx38, Kernels38, MMA};
 use super::router::{RouterDims, RouterOut};
 use super::scratch::{IN_IDS, IN_POS0, Inbox, KvPlanes, f32_view, param_view, put_input};
 use super::scratch38::{PASS_ROWS, VERIFY_ROWS};
 use crate::card_slots::CardAcc;
 use crate::checkpoint::saved::Spans;
+use crate::draft::{Feed, Hidden, WalkMode};
 use crate::fault::Fault;
 use crate::flash_gqa::{GqaArgs, partials_ms_len, partials_v_len_256};
-use crate::gemm::{Gemm32Args, Gemm32Weight, GemmAct32, GemmInput, GemmRoute};
+use crate::gemm::{GemmAct32, GemmRoute};
 use crate::graph::Graph;
-use crate::hc_gated::{Before, HcScratch, HcWideScratch, SiteWeights, WideMixArgs};
+use crate::hc_gated::{Before, HcMatrix, HcScratch, HcWideScratch, SiteWeights, WideMixArgs};
 use crate::host::handoff::Places;
+use crate::media::CallRows;
 use crate::model::lookup::{f32_gain, f32_tensor};
 use crate::mtp::{ArgmaxPArgs, MtpInputArgs};
 use crate::q6k_ids::{Q6kIdsArgs, Q6kIdsKernels};
-use crate::q8f32::{GemvOut, Q8_0GemvIdsArgs, Q8_0GemvMcolArgs, SelArgs};
-use crate::q38::{EmbedQ8Args, OutGateArgs, SLOTS, SharedAddArgs, W_PITCH};
+use crate::q8f32::{Bf16GemvIdsArgs, Q8_0GemvIdsArgs, SelArgs};
+use crate::q38::{EmbedArgs, EmbedRows, OutGateArgs, SLOTS, SharedAddArgs, W_PITCH};
 use crate::rope_neox::PartialNeoxArgs;
+use crate::site::{self, WideIn, WideKernels};
 use crate::tensor::{Q8Act, WindowMut};
 use crate::weights::{DevWeight, Weights};
 use crate::{DeviceTensor, Gpu, GpuError};
@@ -127,7 +132,8 @@ use runtime::hc_gated::Geometry;
 const WHAT: &str = "qwen4exp Mtp38";
 
 /// A matrix of the target's the draft reads in place: its name and its two
-/// Q8_0 planes' device addresses at open.
+/// Q8_0 planes' device addresses at open, or its BF16 words' and a zero
+/// ([`planes`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BorrowedPlanes {
     pub name: String,
@@ -135,12 +141,13 @@ pub struct BorrowedPlanes {
     pub planes: [u64; 2],
 }
 
-/// The target's `output` the draft reads in place: its Q8_0 planes' device
-/// addresses at open, or its Q6_K word plane's with the row width and rows
-/// the gemv reads.
+/// The target's `output` the draft reads in place: its Q8_0 planes' or
+/// BF16 words' device addresses at open, or its Q6_K word plane's with the
+/// row width and rows the gemv reads.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum BorrowedHead {
     Q8_0(BorrowedPlanes),
+    Bf16(BorrowedPlanes),
     Q6K {
         name: String,
         plane: u64,
@@ -158,6 +165,9 @@ pub enum HeadOut<'w> {
         d: &'w DeviceTensor<u16>,
     },
     Q6K {
+        w: &'w DeviceTensor<u32>,
+    },
+    Bf16 {
         w: &'w DeviceTensor<u32>,
     },
 }
@@ -225,9 +235,9 @@ impl Mtp38 {
     /// the plan's store term counts them all, this load's one sequence among
     /// them. Refused by name: a draft that is not the target's shape, a
     /// draft file that carries its own matrices, a borrowed matrix absent or
-    /// not of its read form (`token_embd` Q8_0, `output` Q8_0 or Q6_K, each
-    /// `[hidden, vocab]`), a listed id at or past the vocabulary, an
-    /// upload whose bytes are not the plan's.
+    /// not of its read form (`token_embd` Q8_0 or BF16, `output` Q8_0, Q6_K
+    /// or BF16, each `[hidden, vocab]`), a listed id at or past the
+    /// vocabulary, an upload whose bytes are not the plan's.
     #[allow(
         clippy::too_many_arguments,
         reason = "the card, the target's weights, the draft's file, inputs and plan, the page-cache release and the planned slots (rust-quality R8)"
@@ -393,7 +403,7 @@ impl Mtp38 {
     #[must_use]
     pub fn borrowed_planes(&self) -> [BorrowedPlanes; 2] {
         let head = match &self.head_w {
-            BorrowedHead::Q8_0(b) => b.clone(),
+            BorrowedHead::Q8_0(b) | BorrowedHead::Bf16(b) => b.clone(),
             BorrowedHead::Q6K { name, plane, .. } => BorrowedPlanes {
                 name: name.clone(),
                 planes: [*plane, 0],
@@ -416,6 +426,12 @@ impl Mtp38 {
                     return Err(GpuError::tensor(WHAT, b.name.clone(), "Q8_0 planes"));
                 };
                 HeadOut::Q8_0 { qs, d }
+            }
+            BorrowedHead::Bf16(b) => {
+                let DevWeight::Bf16 { w, .. } = at_open(target, b, WHAT)? else {
+                    return Err(GpuError::tensor(WHAT, b.name.clone(), "BF16 words"));
+                };
+                HeadOut::Bf16 { w }
             }
             BorrowedHead::Q6K {
                 name,
@@ -557,10 +573,12 @@ impl Mtp38 {
     }
 }
 
-/// A Q8_0 weight's two planes' device addresses; `None` for another format.
+/// A Q8_0 weight's two planes' device addresses, or a BF16 weight's words'
+/// and a zero; `None` for another format.
 pub(super) fn planes(dw: &DevWeight) -> Option<[u64; 2]> {
     match dw {
         DevWeight::Q8_0 { qs, d, .. } => Some([qs.buf().cu_deviceptr(), d.buf().cu_deviceptr()]),
+        DevWeight::Bf16 { w, .. } => Some([w.buf().cu_deviceptr(), 0]),
         _ => None,
     }
 }
@@ -587,8 +605,8 @@ pub(super) fn at_open<'w>(
     }
 }
 
-/// `name` of the target's weights `w`, resident as a Q8_0 `[hidden, vocab]`
-/// matrix: its planes' addresses.
+/// `name` of the target's weights `w`, resident as a Q8_0 or BF16 `[hidden,
+/// vocab]` matrix: its planes' addresses ([`planes`]).
 fn borrowed_planes(
     w: &Weights,
     name: String,
@@ -604,8 +622,8 @@ fn borrowed_planes(
         _ => Err(GpuError::shape(
             WHAT,
             format!(
-                "the target's {name} is {} rows of {} values in another format than Q8_0; the \
-                 draft reads a Q8_0 [{hidden}, {vocab}] matrix",
+                "the target's {name} is {} rows of {} values in another format than Q8_0 or \
+                 BF16; the draft reads a Q8_0 or BF16 [{hidden}, {vocab}] matrix",
                 shape.1, shape.0
             ),
         )),
@@ -613,8 +631,8 @@ fn borrowed_planes(
 }
 
 /// `name` of the target's weights `w`, resident as the head's read form over
-/// a `[hidden, vocab]` matrix: its Q8_0 planes, or its Q6_K word plane with
-/// the row width and rows the gemv reads.
+/// a `[hidden, vocab]` matrix: its Q8_0 planes or BF16 words, or its Q6_K
+/// word plane with the row width and rows the gemv reads.
 fn borrowed_head(
     w: &Weights,
     name: String,
@@ -627,6 +645,9 @@ fn borrowed_head(
     match dw {
         DevWeight::Q8_0 { .. } if (dw.k(), dw.rows()) == (hidden, vocab) => {
             Ok(BorrowedHead::Q8_0(borrowed_planes(w, name, hidden, vocab)?))
+        }
+        DevWeight::Bf16 { .. } if (dw.k(), dw.rows()) == (hidden, vocab) => {
+            Ok(BorrowedHead::Bf16(borrowed_planes(w, name, hidden, vocab)?))
         }
         DevWeight::KQuant {
             ty: GgmlType::Q6_K,
@@ -644,7 +665,8 @@ fn borrowed_head(
                 WHAT,
                 format!(
                     "the target's {name} is {rows} rows of {k} values in another format than \
-                     Q8_0 or Q6_K; the draft reads a [{hidden}, {vocab}] matrix of one of them"
+                     Q8_0, Q6_K or BF16; the draft reads a [{hidden}, {vocab}] matrix of one of \
+                     them"
                 ),
             ))
         }
@@ -718,8 +740,13 @@ pub const MTP_ROWS: usize = PASS_ROWS;
 /// refresh runs.
 pub const MTP_GRAPH_ROWS: usize = VERIFY_ROWS;
 
-/// The most rows one store walk ([`MtpMode::Store`]) takes: the columns of
-/// its GEMMs, and the rows of the store arena it runs in.
+/// The most rows one store walk ([`WalkMode::Store`]) takes: the columns of
+/// its GEMMs, and the rows of the store arena it runs in. A store walk
+/// enqueues launch by launch through the store's append and no further, up to
+/// these rows through the wide launches (module doc): the rows' keys and
+/// values, which are all a later row reads of them. A row's stored bits are
+/// a function of that row's inputs alone, within the q8 activations' error
+/// of an [`WalkMode::Eager`] walk's.
 pub const MTP_STORE_ROWS: usize = 64;
 
 /// Values of a row's streams, the target's hidden row.
@@ -757,19 +784,10 @@ pub enum MtpHead {
     Rows,
 }
 
-/// Where a walk's hidden rows come from.
-#[derive(Clone, Copy, Debug)]
-pub enum MtpHidden<'a> {
-    /// `m · 4 · 2560` values written from the host.
-    Host(&'a [f32]),
-    /// The target's streams after its last walk of `walk`'s arena, from row
-    /// `first` on; that walk must have run its head, whose mix applies the
-    /// last layer's combine (a step, a verify, a prompt's last pass or
-    /// ubatch).
-    Target { walk: TargetRows, first: usize },
-}
-
-/// The target arena a [`MtpHidden::Target`] feed reads.
+/// The target arena a [`Hidden::Target`] feed reads: the target's streams
+/// after its last walk of that arena, from the row the feed names on; that
+/// walk must have run its head, whose mix applies the last layer's combine (a
+/// step, a verify, a prompt's last pass or ubatch).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TargetRows {
     /// The step's one row.
@@ -784,7 +802,7 @@ pub enum TargetRows {
 /// what the call that last wrote the arena left there, less the positions a
 /// cut took back since. No rows: the arena holds no position of the
 /// sequence. A walk that reads an arena names the positions its rows must
-/// hold ([`MtpHidden::Target`]); without this record it would read a stale
+/// hold ([`Hidden::Target`]); without this record it would read a stale
 /// arena silently.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Held38 {
@@ -857,41 +875,21 @@ impl DraftRows38 {
 /// A walk's rows.
 #[derive(Clone, Copy, Debug)]
 pub enum MtpFeed<'a> {
-    /// `tokens` at positions `pos0 ..`, each beside its hidden row.
-    Rows {
-        tokens: &'a [u32],
-        pos0: u32,
-        hidden: MtpHidden<'a>,
-    },
+    /// `tokens` at positions `pos0 ..`, each beside its hidden row. The
+    /// feed's media rows are refused by name: this draft has no media prompt
+    /// call.
+    Rows(Feed<'a, TargetRows>),
     /// One row at `pos0`: the last walk's last row's token and streams.
     Own { pos0: u32 },
 }
 
-/// The target's streams a [`MtpHidden::Target`] feed copies from, and the
+/// The target's streams a [`Hidden::Target`] feed copies from, and the
 /// positions its rows hold ([`Held38`]): the buffer and the record together,
 /// the body's `mtp_target` resolving both over its arenas.
 #[derive(Clone, Copy)]
 pub(super) struct Target38<'a> {
     pub(super) buf: &'a DeviceBuffer<f32>,
     pub(super) held: Held38,
-}
-
-/// How a walk runs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MtpMode {
-    /// Enqueued launch by launch.
-    Eager,
-    /// Replayed from its capture, captured on first use.
-    Graph,
-    /// Enqueued launch by launch through the store's append and no
-    /// further, up to [`MTP_STORE_ROWS`] rows through the wide launches
-    /// (module doc): the rows' keys and values, which are all a later row
-    /// reads of them (a row's input is its token and the target's hidden
-    /// row, never the draft's output). No flash, feed-forward block or head,
-    /// no readback and no own row: the prompt's warmup. A row's stored bits
-    /// are a function of that row's inputs alone, within the q8
-    /// activations' error of an [`MtpMode::Eager`] walk's.
-    Store,
 }
 
 /// A captured walk's key: its rows, whether it reads its own last row, its
@@ -1478,27 +1476,28 @@ impl Mtp38 {
 
     /// Run one walk of the program (module doc) over `feed`'s rows into
     /// `head`, eager or replayed, and read its tokens back. `target` is the
-    /// target's streams a [`MtpHidden::Target`] feed copies from. Refused by
+    /// target's streams a [`Hidden::Target`] feed copies from. Refused by
     /// name before anything moves: rows outside 1..=[`MTP_ROWS`] (a captured
     /// walk 1..=[`MTP_GRAPH_ROWS`]), a hidden slice of other than the rows'
     /// values, a token past the vocabulary, positions past the store, an
     /// own row before any walk of this sequence, a walk starting past the
     /// positions the store holds for the sequence, a row-list head on a
     /// full-head load, a captured walk with the taps armed, a store walk
-    /// ([`MtpMode::Store`] reads nothing back). A fault a launch raised is
-    /// [`GpuError::Fault`], not a token.
+    /// ([`WalkMode::Store`] reads nothing back), a walk whose rows carry
+    /// media rows. A fault a launch raised is [`GpuError::Fault`], not a
+    /// token.
     pub(super) fn run(
         &mut self,
         c: &MtpCtx<'_>,
         target: Option<Target38<'_>>,
         feed: MtpFeed<'_>,
         head: MtpHead,
-        mode: MtpMode,
+        mode: WalkMode,
     ) -> Result<MtpDraft, GpuError> {
         let stream = c.gpu.stream();
         refuse_store(
             mode,
-            "a walk with a head to read back (MtpMode::Store writes the store alone)",
+            "a walk with a head to read back (WalkMode::Store writes the store alone)",
         )?;
         let m = self.run_walk(c, target, feed, head, mode)?;
         let a = self.arena_ref()?;
@@ -1507,7 +1506,7 @@ impl Mtp38 {
 
     /// One walk of the program over `feed`'s rows into `head`, eager,
     /// replayed from its capture or through the store's append alone
-    /// ([`MtpMode::Store`]), with no readback: [`Mtp38::run`]'s checks and
+    /// ([`WalkMode::Store`]), with no readback: [`Mtp38::run`]'s checks and
     /// launches, the arena's last-walk bookkeeping moved and the walk's rows
     /// returned. A store walk leaves no last walk: an own row after it, and
     /// the readbacks of its rows, are refused by name. A fault the walk
@@ -1519,7 +1518,7 @@ impl Mtp38 {
         target: Option<Target38<'_>>,
         feed: MtpFeed<'_>,
         head: MtpHead,
-        mode: MtpMode,
+        mode: WalkMode,
     ) -> Result<usize, GpuError> {
         let stream = c.gpu.stream();
         if head == MtpHead::Rows && self.head.rows.is_none() {
@@ -1530,17 +1529,20 @@ impl Mtp38 {
         }
         let ctx = self.ctx;
         let taps_on = self.arena_ref()?.taps.is_some();
-        if mode == MtpMode::Graph && taps_on {
+        if mode == WalkMode::Graph && taps_on {
             return Err(GpuError::state(WHAT, "the taps off for a captured walk"));
         }
         let (m, own, pos0) = match feed {
-            MtpFeed::Rows { tokens, pos0, .. } => (tokens.len(), false, pos0),
+            MtpFeed::Rows(f) => {
+                refuse_media(f.media)?;
+                (f.tokens.len(), false, f.pos0)
+            }
             MtpFeed::Own { pos0 } => (1, true, pos0),
         };
         let most = match mode {
-            MtpMode::Eager => MTP_ROWS,
-            MtpMode::Graph => MTP_GRAPH_ROWS,
-            MtpMode::Store => MTP_STORE_ROWS,
+            WalkMode::Eager => MTP_ROWS,
+            WalkMode::Graph => MTP_GRAPH_ROWS,
+            WalkMode::Store => MTP_STORE_ROWS,
         };
         if !(1..=most).contains(&m) {
             return Err(GpuError::shape(
@@ -1571,17 +1573,18 @@ impl Mtp38 {
             ));
         }
         let mut src = None;
-        if let MtpFeed::Rows { tokens, hidden, .. } = feed {
+        if let MtpFeed::Rows(f) = feed {
+            let (tokens, hidden) = (f.tokens, f.hidden);
             super::refuse_past_vocab(WHAT, tokens, vocab)?;
             match hidden {
-                MtpHidden::Host(v) if v.len() != m * WIDE => {
+                Hidden::Host(v) if v.len() != m * WIDE => {
                     return Err(GpuError::shape(
                         WHAT,
                         format!("{} hidden values for {m} rows of {WIDE}", v.len()),
                     ));
                 }
-                MtpHidden::Host(_) => {}
-                MtpHidden::Target { walk, first } => {
+                Hidden::Host(_) => {}
+                Hidden::Target { walk, first } => {
                     let t = target.ok_or(GpuError::state(WHAT, "the target's streams to copy"))?;
                     if (first + m) * WIDE > t.buf.len() {
                         return Err(GpuError::shape(
@@ -1620,7 +1623,8 @@ impl Mtp38 {
         }
         let a = self.arena()?;
         match feed {
-            MtpFeed::Rows { tokens, hidden, .. } => {
+            MtpFeed::Rows(f) => {
+                let (tokens, hidden) = (f.tokens, f.hidden);
                 put_input(a.inbox.host_mut()?, tokens, pos0)?;
                 a.inbox.upload(stream, IN_IDS + m)?;
                 // SAFETY: `h_in` holds MTP_ROWS · WIDE values and the store
@@ -1628,19 +1632,19 @@ impl Mtp38 {
                 // mode's rows (checked above); the window lives for this copy.
                 let mut h = unsafe {
                     match mode {
-                        MtpMode::Store => f32_view(&a.st.h, 0, m * WIDE),
-                        MtpMode::Eager | MtpMode::Graph => f32_view(&a.h_in, 0, m * WIDE),
+                        WalkMode::Store => f32_view(&a.st.h, 0, m * WIDE),
+                        WalkMode::Eager | WalkMode::Graph => f32_view(&a.h_in, 0, m * WIDE),
                     }
                 };
                 match (hidden, src) {
-                    (MtpHidden::Host(v), _) => h.copy_from_host(stream, v)?,
-                    (MtpHidden::Target { .. }, Some((t, first))) => {
+                    (Hidden::Host(v), _) => h.copy_from_host(stream, v)?,
+                    (Hidden::Target { .. }, Some((t, first))) => {
                         // SAFETY: rows first .. first + m lie inside `t` (checked
                         // above); the window lives for this copy.
                         let src = unsafe { f32_view(t, first * WIDE, m * WIDE) };
                         h.copy_from_device_async(&src, stream)?;
                     }
-                    (MtpHidden::Target { .. }, None) => {
+                    (Hidden::Target { .. }, None) => {
                         return Err(GpuError::state(WHAT, "the target's streams to copy"));
                     }
                 }
@@ -1652,9 +1656,9 @@ impl Mtp38 {
         }
         let key = MtpKey { m, own, head };
         match mode {
-            MtpMode::Eager => self.walk(c, key)?,
-            MtpMode::Store => self.store_walk(c, m, own)?,
-            MtpMode::Graph => {
+            WalkMode::Eager => self.walk(c, key)?,
+            WalkMode::Store => self.store_walk(c, m, own)?,
+            WalkMode::Graph => {
                 let mut graphs = std::mem::take(&mut self.graphs);
                 let found = graphs.iter().position(|(k, _)| *k == key);
                 let r = match found {
@@ -1671,7 +1675,7 @@ impl Mtp38 {
         }
         // A store walk wrote no own row, no streams past its attention's
         // input and no head: nothing of it is there to read.
-        self.last = (mode != MtpMode::Store).then_some((m, head));
+        self.last = (mode != WalkMode::Store).then_some((m, head));
         self.held = pos0 as usize + m;
         Ok(m)
     }
@@ -1693,19 +1697,21 @@ impl Mtp38 {
         refresh: MtpFeed<'_>,
         own: usize,
         head: MtpHead,
-        mode: MtpMode,
+        mode: WalkMode,
     ) -> Result<MtpDraft, GpuError> {
         let stream = c.gpu.stream();
         refuse_store(
             mode,
-            "a chain's walks with a head (MtpMode::Store writes the store alone)",
+            "a chain's walks with a head (WalkMode::Store writes the store alone)",
         )?;
-        let MtpFeed::Rows { tokens, pos0, .. } = refresh else {
+        let MtpFeed::Rows(f) = refresh else {
             return Err(GpuError::shape(
                 WHAT,
                 format!("a chain's refresh {refresh:?}: the rows the target kept"),
             ));
         };
+        refuse_media(f.media)?;
+        let (tokens, pos0) = (f.tokens, f.pos0);
         if own >= MTP_GRAPH_ROWS {
             return Err(GpuError::shape(
                 WHAT,
@@ -1840,18 +1846,17 @@ impl Mtp38 {
         let (h, ff, used) = (geo::HIDDEN, geo::FF, geo::N_USED);
 
         // The embedding rows and the input pack.
-        let DevWeight::Q8_0 { qs: eqs, d: ed, .. } = embd else {
-            return Err(GpuError::tensor(WHAT, "token_embd.weight", "Q8_0 planes"));
-        };
+        let table = EmbedRows::of_weight(embd).ok_or_else(|| {
+            GpuError::tensor(WHAT, "token_embd.weight", "Q8_0 planes or BF16 words")
+        })?;
         // SAFETY: words IN_IDS .. IN_IDS + m of the inbox's IN_IDS +
         // MTP_STORE_ROWS words (m <= MTP_ROWS <= MTP_STORE_ROWS); the window
         // lives for the embedding's enqueue.
         let ids = unsafe { param_view::<u32>(a.inbox.dev(), IN_IDS, m) };
         k.q38.enqueue_embed_rows(
             stream,
-            EmbedQ8Args {
-                qs: eqs,
-                d: ed,
+            EmbedArgs {
+                table,
                 ids: if own { &a.own_id } else { &ids },
                 pos0: &a.pos0,
                 first: 0,
@@ -1876,7 +1881,6 @@ impl Mtp38 {
                 out: &mut a.pack,
             },
         )?;
-        let (eqs, ed) = q8(w, &n.eh)?;
         let cols = geo::STREAMS * m;
         let mut at = 0;
         while at < cols {
@@ -1891,17 +1895,7 @@ impl Mtp38 {
                     f32_view(&a.res, at * h, run * h),
                 )
             };
-            gpu.q8f32().enqueue_q8_0_gemv_mcol(
-                stream,
-                Q8_0GemvMcolArgs {
-                    qs: eqs,
-                    d: ed,
-                    x: &x,
-                    m: run,
-                    out: GemvOut::TokenMajor,
-                    y: &mut y,
-                },
-            )?;
+            cx.dense_gemv(&n.eh, &x, run, &mut y)?;
             at += run;
         }
         if let (Some(t), false) = (a.taps.as_mut(), capturing) {
@@ -1925,9 +1919,9 @@ impl Mtp38 {
         if let (Some(t), false) = (a.taps.as_mut(), capturing) {
             t.node(stream, MtpNode::AttnIn, &a.mixed, m)?;
         }
-        cx.q8_gemv(&n.q, &a.mixed, m, &mut a.qg)?;
-        cx.q8_gemv(&n.k, &a.mixed, m, &mut a.k)?;
-        cx.q8_gemv(&n.v, &a.mixed, m, &mut a.v)?;
+        cx.dense_gemv(&n.q, &a.mixed, m, &mut a.qg)?;
+        cx.dense_gemv(&n.k, &a.mixed, m, &mut a.k)?;
+        cx.dense_gemv(&n.v, &a.mixed, m, &mut a.v)?;
         // The draft's store is f16: the family's shared append runs its f16
         // arm.
         let (kc, vc) = store.f16_mut("qwen38::mtp")?;
@@ -1983,7 +1977,7 @@ impl Mtp38 {
                 y: &mut a.attn,
             },
         )?;
-        cx.q8_gemv(&n.out, &a.attn, m, &mut a.y)?;
+        cx.dense_gemv(&n.out, &a.attn, m, &mut a.y)?;
         if let (Some(t), false) = (a.taps.as_mut(), capturing) {
             t.node(stream, MtpNode::AttnGated, &a.attn, m)?;
             t.node(stream, MtpNode::AttnOut, &a.y, m)?;
@@ -2076,11 +2070,11 @@ impl Mtp38 {
             fault: sink,
         };
         k.slots.enqueue_card_acc(stream, &sum, &mut a.acc)?;
-        cx.q8_gemv(&n.gate_sh, &a.ffn_x, m, &mut a.sh_g)?;
-        cx.q8_gemv(&n.up_sh, &a.ffn_x, m, &mut a.sh_u)?;
+        cx.dense_gemv(&n.gate_sh, &a.ffn_x, m, &mut a.sh_g)?;
+        cx.dense_gemv(&n.up_sh, &a.ffn_x, m, &mut a.sh_u)?;
         gpu.elem()
             .enqueue_swiglu(stream, &a.sh_g, &a.sh_u, ff * m, &mut a.sh_h)?;
-        cx.q8_gemv(&n.down_sh, &a.sh_h, m, &mut a.sh_y)?;
+        cx.dense_gemv(&n.down_sh, &a.sh_h, m, &mut a.sh_y)?;
         k.q38.enqueue_shared_add(
             stream,
             SharedAddArgs {
@@ -2119,7 +2113,7 @@ impl Mtp38 {
         }
         let full_rows = match &head_out {
             HeadOut::Q8_0 { d, .. } => d.rows(),
-            HeadOut::Q6K { w } => w.rows(),
+            HeadOut::Q6K { w } | HeadOut::Bf16 { w } => w.rows(),
         };
         let (rows, map) = match head {
             MtpHead::Full => (full_rows, None),
@@ -2144,6 +2138,23 @@ impl Mtp38 {
                     Q8_0GemvIdsArgs {
                         qs,
                         d,
+                        ids,
+                        rows,
+                        x: &a.head_x,
+                        m,
+                        y: &mut lg,
+                    },
+                    sink,
+                )?,
+            },
+            HeadOut::Bf16 { w } => match map {
+                None => gpu
+                    .q8f32()
+                    .enqueue_bf16_gemv(stream, w, &a.head_x, m, &mut lg)?,
+                Some(ids) => gpu.q8f32().enqueue_bf16_gemv_ids(
+                    stream,
+                    Bf16GemvIdsArgs {
+                        w,
                         ids,
                         rows,
                         x: &a.head_x,
@@ -2229,18 +2240,17 @@ impl Mtp38 {
         let s = &mut a.st;
 
         // The embedding rows and the input pack.
-        let DevWeight::Q8_0 { qs: eqs, d: ed, .. } = embd else {
-            return Err(GpuError::tensor(WHAT, "token_embd.weight", "Q8_0 planes"));
-        };
+        let table = EmbedRows::of_weight(embd).ok_or_else(|| {
+            GpuError::tensor(WHAT, "token_embd.weight", "Q8_0 planes or BF16 words")
+        })?;
         // SAFETY: words IN_IDS .. IN_IDS + m of the inbox's IN_IDS +
         // MTP_STORE_ROWS words (m <= MTP_STORE_ROWS); the window lives for
         // the embedding's enqueue.
         let ids = unsafe { param_view::<u32>(a.inbox.dev(), IN_IDS, m) };
         k.q38.enqueue_embed_rows(
             stream,
-            EmbedQ8Args {
-                qs: eqs,
-                d: ed,
+            EmbedArgs {
+                table,
                 ids: if own { &a.own_id } else { &ids },
                 pos0: &a.pos0,
                 first: 0,
@@ -2267,29 +2277,32 @@ impl Mtp38 {
         )?;
 
         // `eh_proj` over the packed columns into the streams.
-        k.g32
-            .enqueue_quantize_gemm32(stream, &s.pack, cols, &mut s.pack_q, sink)?;
+        let tw: &Weights = w;
+        let dense = WideKernels {
+            gemm: &k.gemm,
+            g32: Some(&k.g32),
+        };
+        site::resident_quantize(
+            gpu,
+            &dense,
+            (tw, &[&n.eh]),
+            (&s.pack, cols),
+            &mut s.pack_q,
+            sink,
+        )?;
         k.gemm
             .enqueue_route_dense(stream, cols, &mut s.packed, gpu.unlabelled_sink())?;
-        let (qs, d) = q8(w, &n.eh)?;
-        k.g32.enqueue_gemm32(
-            stream,
-            Gemm32Args {
-                w: Gemm32Weight::Q8_0Plane { qs, d },
-                rows_per_expert: qs.rows(),
-                act: &s.pack_q,
-                route: &s.packed,
-                input: GemmInput::PerSlot,
-                y: &mut s.res,
-            },
-        )?;
+        let x = WideIn {
+            q128: None,
+            q32: Some(&s.pack_q),
+            f32: Some(&s.pack),
+        };
+        site::resident_gemm(gpu, &dense, (tw, &n.eh), &x, &s.packed, cols, &mut s.res)?;
 
         // The attention site's mix, then q, k and v over the rows.
         k.gemm
             .enqueue_route_dense(stream, m, &mut s.rows, gpu.unlabelled_sink())?;
         let site = &n.attn_site;
-        let (down_qs, down_d) = q8(w, &site.down)?;
-        let (up_qs, up_d) = q8(w, &site.up)?;
         let inject = match &site.inject {
             Some(t) => Some(f32_tensor(w, t)?),
             None => None,
@@ -2301,10 +2314,8 @@ impl Mtp38 {
                 before: Before::Plain,
                 w: SiteWeights {
                     gamma: f32_gain(w, &site.norm)?,
-                    down_qs,
-                    down_d,
-                    up_qs,
-                    up_d,
+                    down: HcMatrix::of(w, WHAT, &site.down)?,
+                    up: HcMatrix::of(w, WHAT, &site.up)?,
                     inject,
                 },
                 eps: c.eps,
@@ -2312,25 +2323,26 @@ impl Mtp38 {
                 fault: sink,
                 scratch: &mut s.hc,
                 gemm: &k.g32,
+                q8f32: gpu.q8f32(),
                 dense: &s.rows,
                 mixed: &mut s.mixed,
             },
         )?;
-        k.g32
-            .enqueue_quantize_gemm32(stream, &s.mixed, m, &mut s.mixed_q, sink)?;
+        site::resident_quantize(
+            gpu,
+            &dense,
+            (tw, &[&n.q, &n.k, &n.v]),
+            (&s.mixed, m),
+            &mut s.mixed_q,
+            sink,
+        )?;
+        let x = WideIn {
+            q128: None,
+            q32: Some(&s.mixed_q),
+            f32: Some(&s.mixed),
+        };
         for (name, y) in [(&n.q, &mut s.qg), (&n.k, &mut s.k), (&n.v, &mut s.v)] {
-            let (qs, d) = q8(w, name)?;
-            k.g32.enqueue_gemm32(
-                stream,
-                Gemm32Args {
-                    w: Gemm32Weight::Q8_0Plane { qs, d },
-                    rows_per_expert: qs.rows(),
-                    act: &s.mixed_q,
-                    route: &s.rows,
-                    input: GemmInput::PerSlot,
-                    y,
-                },
-            )?;
+            site::resident_gemm(gpu, &dense, (tw, name), &x, &s.rows, m, y)?;
         }
         // The draft's store is f16: the family's shared append runs its f16
         // arm.
@@ -2421,11 +2433,24 @@ impl Mtp38 {
     }
 }
 
-/// Refuse by name a store walk ([`MtpMode::Store`]) where the head's rows
+/// Refuse by name a store walk ([`WalkMode::Store`]) where the head's rows
 /// are read back, `why` naming the call.
-fn refuse_store(mode: MtpMode, why: &'static str) -> Result<(), GpuError> {
-    if mode == MtpMode::Store {
+fn refuse_store(mode: WalkMode, why: &'static str) -> Result<(), GpuError> {
+    if mode == WalkMode::Store {
         return Err(GpuError::state(WHAT, why));
+    }
+    Ok(())
+}
+
+/// Refuse by name a walk whose rows carry media rows: this draft has no media
+/// prompt call, and a draft that dropped them would walk another feed than
+/// the target's. Refused before the walk enqueues anything.
+fn refuse_media(media: Option<&CallRows<'_>>) -> Result<(), GpuError> {
+    if media.is_some() {
+        return Err(GpuError::shape(
+            WHAT,
+            "a walk with media rows: this body's draft has no media prompt call",
+        ));
     }
     Ok(())
 }
@@ -2452,3 +2477,24 @@ fn read_draft(a: &MtpArena, stream: &CudaStream, m: usize) -> Result<MtpDraft, G
 const _: () = assert!(
     MTP_ROWS <= 8 && MTP_GRAPH_ROWS <= MTP_ROWS && EH_COLS == 8 && MTP_ROWS <= MTP_STORE_ROWS
 );
+
+#[cfg(test)]
+mod tests {
+    use super::refuse_media;
+    use crate::media::CallRows;
+
+    /// A feed that holds media rows is refused by name, not walked without
+    /// them: this draft has no media prompt call.
+    #[test]
+    fn media_rows_are_refused_by_name() {
+        let (at, rows) = (0..1, [0u16; 2]);
+        let media = CallRows::new(5, 2, [(&at, &rows[..])]).expect("one whole row");
+        let e = refuse_media(Some(&media)).expect_err("media rows");
+        assert!(
+            e.to_string()
+                .contains("this body's draft has no media prompt call"),
+            "{e}"
+        );
+        assert!(refuse_media(None).is_ok(), "a feed with no media");
+    }
+}

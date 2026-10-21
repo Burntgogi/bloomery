@@ -65,6 +65,8 @@ pub mod serve_client;
 pub mod side_seat;
 #[cfg(feature = "gpu")]
 pub mod slots_gate;
+#[cfg(feature = "gpu")]
+pub mod swiglu_host;
 pub mod tap_dump;
 pub mod tier;
 // The image encoder's pieces the serve seats share; the tower itself is `bloomery-gpu-vision`'s, behind `vision`.
@@ -187,25 +189,6 @@ pub fn bench_arm(
         return Err(format!("--bench-arm {arm:?} names no arm").into());
     }
     Ok(Some(arm))
-}
-
-/// The SHA-256 of the file at `path`, lowercase hex; an error names the file.
-pub fn sha256(path: &Path) -> Result<String, GateError> {
-    use sha2::{Digest, Sha256};
-    use std::io::Read;
-
-    let named = |e: std::io::Error| format!("{}: {e}", path.display());
-    let mut file = std::fs::File::open(path).map_err(named)?;
-    let mut sha = Sha256::new();
-    let mut buf = vec![0u8; 8 << 20];
-    loop {
-        let n = file.read(&mut buf).map_err(named)?;
-        if n == 0 {
-            break;
-        }
-        sha.update(&buf[..n]);
-    }
-    Ok(sha.finalize().iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// The model file every gate and server opens: the one a server named on
@@ -746,6 +729,32 @@ pub fn same_bits(a: &[f32], b: &[f32]) -> usize {
         .count()
 }
 
+/// The first index at which `a` and `b` differ in bits, or `None` when
+/// equal (a length that differs is index 0).
+pub fn first_diff(a: &[f32], b: &[f32]) -> Option<usize> {
+    if a.len() != b.len() {
+        return Some(0);
+    }
+    a.iter()
+        .zip(b)
+        .position(|(x, y)| x.to_bits() != y.to_bits())
+}
+
+/// One clause line for `a` against `b`: how many values and whether they are
+/// equal bit for bit ([`first_diff`]); whether they are.
+pub fn equal(what: &str, a: &[f32], b: &[f32]) -> bool {
+    let d = first_diff(a, b);
+    println!(
+        "    {what}: {} values {}",
+        a.len(),
+        d.map_or_else(
+            || "equal bit for bit".to_string(),
+            |i| format!("differ from value {i}")
+        )
+    );
+    d.is_none()
+}
+
 /// Ulps between two finite f32, through integers ordered like the floats
 /// they encode (`-0.0` and `+0.0` the same point).
 fn ulps(a: f32, b: f32) -> u32 {
@@ -863,6 +872,29 @@ pub fn view_flat(view: &[f32], base: &[f32], off: usize, what: &str) -> Result<(
         .into());
     }
     Ok(())
+}
+
+/// The rotation row of the position triple `(t, h, w)` from the plain table
+/// `plain` (`ROT` values a position, a cos and a sin per pair), by ggml's
+/// interleaved M-RoPE written out: pair `s` of sector `s mod 32` takes the h
+/// position at sectors 1 mod 3 below 33, the w position at 2 mod 3 below 30
+/// and the t position at 0 mod 3 below 33.
+pub fn oracle_row<const ROT: usize>(plain: &[f32], (t, h, w): (usize, usize, usize)) -> [f32; ROT] {
+    let mut row = [0.0; ROT];
+    for s in 0..ROT / 2 {
+        let sector = s % 32;
+        let q = if sector % 3 == 1 && sector < 33 {
+            h
+        } else if sector % 3 == 2 && sector < 30 {
+            w
+        } else if sector % 3 == 0 && sector < 33 {
+            t
+        } else {
+            0
+        };
+        row[2 * s..2 * s + 2].copy_from_slice(&plain[q * ROT + 2 * s..q * ROT + 2 * s + 2]);
+    }
+    row
 }
 
 /// A router reference's outputs: the probabilities `[n_expert, m]`, then the

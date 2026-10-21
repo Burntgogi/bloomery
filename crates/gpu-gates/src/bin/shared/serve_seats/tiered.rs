@@ -255,7 +255,7 @@ pub fn run<S: Tiered>(args: &[String], side: &side_seat::Flags) -> Result<ServeE
     };
     let engine = SeatEngine::spawn(move || S::open(open), slot_ctx, vocab, card, props, 0)?;
     let side = side_seat::Side::start(side.zip(side_seat))?;
-    let server = a.bind(engine, chat, &path, slots, levers.schema_jump(), side)?;
+    let server = a.bind(engine, chat, &path, slots, &levers, side)?;
     let server = match think {
         Some(tags) => server.with_think_tags(tags),
         None => server,

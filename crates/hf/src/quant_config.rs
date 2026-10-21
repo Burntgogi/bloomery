@@ -23,8 +23,8 @@ use gguf::GgmlType;
 use regex::Regex;
 use serde_json::Value;
 
-use crate::safetensors::Dtype;
 use crate::schema::{self, Fields, Rule::Read};
+use safetensors::Dtype;
 
 /// Why a config or a tensor was refused.
 #[derive(Debug, thiserror::Error)]
@@ -110,7 +110,8 @@ impl Format {
     /// bloomery's FP8_B128 (an f32 a 128 values) when a scale covers whole 128-value blocks of a
     /// row, as one a tensor, a row or a block 128 values wide does; MXFP8 (an E8M0 byte a 32
     /// values) when it covers whole 32-value ones. Another FP8 block has no card type.
-    pub(crate) fn card_type(self) -> Option<GgmlType> {
+    #[must_use]
+    pub fn card_type(self) -> Option<GgmlType> {
         match self {
             Format::Nvfp4 | Format::Nvfp4Csf | Format::Nvfp4Csf32 => Some(GgmlType::NVFP4),
             Format::Fp8Channel | Format::Fp8Tensor => Some(GgmlType::FP8_B128),
@@ -1496,10 +1497,10 @@ mod tests {
     #[test]
     fn real_fp8_rows_decode_to_their_producers_rule() {
         use gguf::quant::dequant_row;
+        use safetensors::Safetensors;
         use sha2::{Digest, Sha256};
 
         use crate::modelopt::{Plain, Use, normalize};
-        use crate::safetensors::Safetensors;
 
         let st =
             Safetensors::parse(include_bytes!("../tests/fixtures/fp8-scales.safetensors").to_vec())

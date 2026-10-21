@@ -9,8 +9,8 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use gguf::digest::{Sha256, hex};
 use gguf::{Split, Value};
-use sha2::{Digest, Sha256};
 
 /// The output rows an MTP head scores.
 #[derive(Clone, Debug, PartialEq)]
@@ -276,15 +276,10 @@ pub fn vocab_sha256(split: &Split) -> Result<[u8; 32], HeadRowsError> {
                  its file bytes cannot be digested"
             )));
         }
-        h.update((s.len() as u64).to_le_bytes());
+        h.update(&(s.len() as u64).to_le_bytes());
         h.update(s.as_bytes());
     }
-    Ok(h.finalize().into())
-}
-
-/// `bytes` as lowercase hex, two digits a byte.
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    Ok(h.finish())
 }
 
 /// A window walks the head three times, each walk reading every row of the list once.
@@ -340,6 +335,109 @@ mod tests {
     use super::{Arc, HEAD_ROWS_FORMAT, HeadRowsError, HeadSet, hex, parse_head_rows};
 
     const DIGEST: [u8; 32] = [0xab; 32];
+
+    /// Exercise the digest through the GGUF reader used by model placement.
+    fn vocabulary(value: Option<gguf::Value>) -> Result<[u8; 32], HeadRowsError> {
+        use gguf::write::{Layout, Writer};
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "models-vocab-{}-{}.gguf",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        if matches!(value.as_ref(), Some(gguf::Value::Array(values)) if values.is_empty()) {
+            // Value drops an empty array's element type; encode STRING[] explicitly.
+            let mut bytes = b"GGUF".to_vec();
+            bytes.extend_from_slice(&3u32.to_le_bytes());
+            bytes.extend_from_slice(&0u64.to_le_bytes()); // No tensors.
+            bytes.extend_from_slice(&1u64.to_le_bytes()); // One metadata pair.
+            bytes.extend_from_slice(&(super::TOKENS.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(super::TOKENS.as_bytes());
+            bytes.extend_from_slice(&9u32.to_le_bytes()); // Array.
+            bytes.extend_from_slice(&8u32.to_le_bytes()); // String elements.
+            bytes.extend_from_slice(&0u64.to_le_bytes());
+            bytes.resize(bytes.len().next_multiple_of(32), 0);
+            std::fs::write(&path, bytes).expect("write empty vocabulary GGUF");
+        } else {
+            let kvs = value
+                .map(|value| vec![(super::TOKENS.to_string(), value)])
+                .unwrap_or_default();
+            let layout = Layout::new(&kvs, Vec::new()).expect("tiny vocabulary layout");
+            let file = std::fs::File::create(&path).expect("create tiny GGUF");
+            Writer::new(file, layout)
+                .expect("write header")
+                .finish()
+                .expect("finish tiny GGUF");
+        }
+        let split = gguf::Split::open(&path).expect("open tiny GGUF");
+        let result = super::vocab_sha256(&split);
+        drop(split);
+        std::fs::remove_file(path).expect("remove tiny GGUF");
+        result
+    }
+
+    fn tokens(words: &[&str]) -> gguf::Value {
+        gguf::Value::Array(
+            words
+                .iter()
+                .map(|s| gguf::Value::String((*s).to_string()))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn vocabulary_digest_preserves_lengths_utf8_and_id_order() {
+        use sha2::{Digest, Sha256};
+
+        let cases: &[&[&str]] = &[
+            &[],
+            &[""],
+            &["", ""],
+            &["a", ""],
+            &["", "a"],
+            &["é", "猫", "🦀"],
+            &["猫", "é", "🦀"],
+            &["ab", "c"],
+            &["a", "bc"],
+        ];
+        let mut digests = Vec::new();
+        for words in cases {
+            let mut oracle = Sha256::new();
+            for word in *words {
+                oracle.update((word.len() as u64).to_le_bytes());
+                oracle.update(word.as_bytes());
+            }
+            let expected: [u8; 32] = oracle.finalize().into();
+            let got = vocabulary(Some(tokens(words))).expect("valid vocabulary");
+            assert_eq!(got, expected, "{words:?}");
+            assert!(
+                !digests.contains(&got),
+                "distinct framed vocabulary: {words:?}"
+            );
+            digests.push(got);
+        }
+    }
+
+    #[test]
+    fn vocabulary_digest_refuses_invalid_metadata_and_tokens() {
+        use gguf::Value;
+
+        for value in [
+            None,
+            Some(Value::U32(1)),
+            Some(Value::String("not an array".to_string())),
+            Some(Value::Array(vec![Value::U32(1)])),
+            Some(tokens(&["ok", "\u{fffd}"])),
+            Some(tokens(&["x\u{fffd}y"])),
+        ] {
+            assert!(matches!(
+                vocabulary(value),
+                Err(HeadRowsError::Tokens { .. })
+            ));
+        }
+    }
 
     fn rows_file(vocab: u32, ids: &[u32], said: usize) -> String {
         let mut s = format!(

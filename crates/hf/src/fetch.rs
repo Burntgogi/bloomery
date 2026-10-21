@@ -819,30 +819,34 @@ fn write_marker(path: &Path, digest: &str) -> Result<(), HfError> {
     fs::write(path, format!("{digest}\n")).map_err(|e| HfError::io(path, e))
 }
 
-/// The digest of the `size`-byte file at `path` by `check`, lowercase hex.
+/// The digest of the whole file at `path` by `check`, lowercase hex.
+/// For a Git blob, `size` supplies the header's size, not a read limit.
 pub fn digest(path: &Path, check: Check, size: u64) -> Result<String, HfError> {
-    let mut f = fs::File::open(path).map_err(|e| HfError::io(path, e))?;
-    let mut buf = vec![0u8; 8 << 20];
-    let mut sha256 = sha2::Sha256::new();
-    let mut sha1 = sha1::Sha1::new();
-    if check == Check::GitSha1 {
-        sha1.update(format!("blob {size}\0").as_bytes());
-    }
-    loop {
-        let n = f.read(&mut buf).map_err(|e| HfError::io(path, e))?;
-        if n == 0 {
-            break;
+    match check {
+        Check::Sha256 => gguf::digest::sha256_file(path).map_err(|e| HfError::Io {
+            path: e.path.display().to_string(),
+            err: e.source,
+        }),
+        Check::GitSha1 => {
+            let mut f = fs::File::open(path).map_err(|e| HfError::io(path, e))?;
+            let mut sha1 = sha1::Sha1::new();
+            // "blob ", at most 20 decimal digits for a u64, and NUL.
+            let mut header = [0u8; 26];
+            let mut remaining = &mut header[..];
+            write!(remaining, "blob {size}\0").expect("a u64 Git blob header fits");
+            let used = 26 - remaining.len();
+            sha1.update(&header[..used]);
+            let mut buf = [0u8; 64 * 1024];
+            loop {
+                let n = f.read(&mut buf).map_err(|e| HfError::io(path, e))?;
+                if n == 0 {
+                    break;
+                }
+                sha1.update(&buf[..n]);
+            }
+            Ok(gguf::digest::hex(&sha1.finalize()))
         }
-        match check {
-            Check::Sha256 => sha256.update(&buf[..n]),
-            Check::GitSha1 => sha1.update(&buf[..n]),
-        }
     }
-    let bytes: Vec<u8> = match check {
-        Check::Sha256 => sha256.finalize().to_vec(),
-        Check::GitSha1 => sha1.finalize().to_vec(),
-    };
-    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 #[cfg(test)]
@@ -1033,7 +1037,7 @@ mod tests {
     }
 
     #[test]
-    fn a_cached_file_the_repo_moved_on_is_fetched_again() {
+    fn an_unmarked_same_size_corrupt_cache_is_revalidated_and_fetched_again() {
         let d = scratch("stale");
         let body = content();
         let (c, e) = served(&d, "a/b", "m.gguf", &body);
@@ -1042,10 +1046,19 @@ mod tests {
         other[5] ^= 1;
         fs::write(&p, &other).expect("overwrite");
         fs::remove_file(with_suffix(&p, ".verified")).expect("marker");
+        assert_eq!(fs::metadata(&p).expect("cache metadata").len(), e.size);
         let (r, seen) = run(&c, "a/b", &e);
         r.expect("refetch");
         assert_eq!(states(&seen), ["file stale 0"]);
         assert_eq!(fs::read(&p).expect("file"), body);
+        assert_eq!(
+            fs::read_to_string(with_suffix(&p, ".verified")).expect("new marker"),
+            format!("{}\n", e.digest)
+        );
+        assert!(!with_suffix(&p, ".part").exists());
+        let (r, seen) = run(&c, "a/b", &e);
+        r.expect("verified cache");
+        assert_eq!(states(&seen), [format!("file cached {}", body.len())]);
     }
 
     /// A cached file longer than the repo's, or a `.part` longer than it, is
@@ -1178,6 +1191,68 @@ mod tests {
             digest(&p, Check::GitSha1, 6).expect("digest"),
             "ce013625030ba8dba906f756967f9e9ca394464a"
         );
+    }
+
+    #[test]
+    fn an_empty_git_blob_has_the_published_object_id() {
+        let d = scratch("git-empty");
+        let p = d.join("empty");
+        fs::write(&p, b"").expect("file");
+        assert_eq!(
+            digest(&p, Check::GitSha1, 0).expect("digest"),
+            "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"
+        );
+    }
+
+    #[test]
+    fn a_git_blob_uses_the_supplied_size_and_reads_the_entire_file() {
+        let d = scratch("git-supplied-size");
+        let p = d.join("body");
+        let body = content();
+        fs::write(&p, &body).expect("file");
+        for size in [0, 1, body.len() as u64 - 1, body.len() as u64 + 1, u64::MAX] {
+            let mut expected = sha1::Sha1::new();
+            expected.update(format!("blob {size}\0").as_bytes());
+            expected.update(&body);
+            assert_eq!(
+                digest(&p, Check::GitSha1, size).expect("digest"),
+                hex(&expected.finalize()),
+                "supplied size {size}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_sha256_file_digest_ignores_the_supplied_size() {
+        let d = scratch("sha256-size");
+        let p = d.join("body");
+        let body = content();
+        fs::write(&p, &body).expect("file");
+        let expected = hex(&sha2::Sha256::digest(&body));
+        for size in [0, body.len() as u64, u64::MAX] {
+            assert_eq!(digest(&p, Check::Sha256, size).expect("digest"), expected);
+        }
+    }
+
+    #[test]
+    fn a_missing_digest_file_preserves_its_typed_path_and_io_error() {
+        let d = scratch("digest-missing");
+        let p = d.join("absent");
+        for check in [Check::Sha256, Check::GitSha1] {
+            let error = digest(&p, check, 0).expect_err("missing file");
+            let HfError::Io { path, err } = &error else {
+                panic!("{error:?}");
+            };
+            assert_eq!(path, &p.display().to_string());
+            assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+            let source = std::error::Error::source(&error)
+                .expect("I/O source")
+                .downcast_ref::<std::io::Error>()
+                .expect("original I/O error");
+            assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
+            assert_eq!(error.to_string(), format!("{}: {source}", p.display()));
+            assert!(!source.to_string().contains(path.as_str()));
+        }
     }
 
     /// A client whose hub refuses the connection: curl's exit 7.
