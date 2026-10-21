@@ -1435,6 +1435,7 @@ mod tests {
             (SiteTy::Nvfp4, GgmlType::NVFP4, "NVFP4", None),
             (SiteTy::Mxfp8, GgmlType::MXFP8, "MXFP8", None),
             (SiteTy::Fp8B128, GgmlType::FP8_B128, "FP8_B128", None),
+            (SiteTy::Bf16, GgmlType::BF16, "BF16", None),
         ];
         assert_eq!(SiteTy::ALL.len(), expected.len());
         for (&s, (want, ty, label, grouped)) in SiteTy::ALL.iter().zip(expected) {
