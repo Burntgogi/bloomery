@@ -76,7 +76,7 @@ set, because a binary built for the repo's `znver3` may stop with an illegal ins
 nightly sets `x86-64-v3` for its own machine (`tools/nightly/run.sh:55`), and both callers share one unit runner,
 `tools/nightly/units.sh`.
 
-Output: a header (commit, host, toolchain, `RUSTFLAGS`, bound, log directory), one line per unit,
+Output: a header (commit, host, CPU features, toolchain, `RUSTFLAGS`, bound, log directory), one line per unit,
 `<name> rc=<n> <seconds>s`, under a red one its failing tests or first red lines and its log path, then
 `DONE tier=… total=… red=… wall=…s`. Each unit's log is in `target/contrib-check/<time>/<name>.log`. Every unit, in
 both tiers, runs under a bound of `CONTRIB_UNIT_BOUND` seconds (default 1200) through GNU `timeout`, or `gtimeout` when
@@ -85,6 +85,11 @@ every unit green, 1 a unit red, 64 usage, 69 a prerequisite is missing (named, w
 script reads is empty, `--only` matches no unit, or `git status` fails in the tree (whether it is clean is unknown, so
 no commit is named). `CONTRIB_INJECT_FAIL=1` adds one deliberately failing unit, so the red path can be shown to fail
 first.
+
+The CPU-feature line names its source: the first reported `flags`/`Features` set in Linux's `/proc/cpuinfo`,
+or the enabled `hw.optional` keys on macOS. Missing information is `unavailable`, not an empty feature set.
+This is host diagnostic evidence, not an ISA selector or a guarantee about every CPU in a heterogeneous host;
+it changes neither the build flags nor the CI cache policy.
 
 The flowcounts weekly reads its record parser and schema, routing data and statistical tools, not the hub reader.
 Use `python3 tools/recipes.py why tools/bloomery/hf.py --recipe weekly-gpu-ds41-flowcounts` to inspect that boundary.

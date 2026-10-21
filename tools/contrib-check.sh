@@ -32,7 +32,7 @@
 # cargo unit unless RUSTFLAGS is already set, in which case yours stands and the header line says so. The nightly's own
 # machine sets x86-64-v3 (tools/nightly/run.sh); the unit runner is the same code (tools/nightly/units.sh).
 #
-# Output: a header (commit, host, toolchain, RUSTFLAGS), one line per unit `<name> rc=<N> <secs>s` (a red unit then names its
+# Output: a header (commit, host, CPU features, toolchain, RUSTFLAGS), one line per unit `<name> rc=<N> <secs>s` (a red unit then names its
 # failing tests and its first red lines, then prints that unit's log whole — the CI step keeps this stdout, and the file
 # under target/ is not uploaded), a `DONE tier=… total=… red=… wall=…s` line; each unit's full log is also in
 # target/contrib-check/<time>/<name>.log. A host without GNU `timeout` (macOS) runs units unbounded, and the header says so;
@@ -236,8 +236,23 @@ fi
 # ---- the header: the block a pull request pastes ----
 cpu=$(sed -n 's/^model name[^:]*: *//p' /proc/cpuinfo 2> /dev/null | head -1)
 [ -n "$cpu" ] || cpu=$(sysctl -n machdep.cpu.brand_string 2> /dev/null || echo unknown)
+cpu_features=
+feature_source=unavailable
+case "$OS" in
+  Linux)
+    feature_source='/proc/cpuinfo, first reported set'
+    cpu_features=$(awk '/^(flags|Features)[[:space:]]*:/ { sub(/^[^:]*:[[:space:]]*/, ""); print; exit }' /proc/cpuinfo 2> /dev/null)
+    ;;
+  Darwin)
+    feature_source='sysctl hw.optional=1'
+    cpu_features=$(sysctl -a 2> /dev/null | LC_ALL=C sort | sed -n 's/^hw\.optional\.\([^:]*\): 1$/\1/p' | tr '\n' ' ')
+    cpu_features=${cpu_features% }
+    ;;
+esac
+[ -n "$cpu_features" ] || cpu_features=unavailable
 echo "contrib-check tier=$TIER commit=$commit"
 echo "host: $(uname -srm), $cpu"
+echo "cpu features ($feature_source): $cpu_features"
 echo "toolchain: $(rustc --version) ($CHANNEL); RUSTFLAGS: $RUSTFLAGS_NOTE; $TIMEOUT_NOTE"
 echo "logs: $LOGDIR"
 
