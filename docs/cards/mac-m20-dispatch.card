@@ -1,0 +1,53 @@
+# Prediction card (kind calibration) for the M2.0 Metal probe (tools/metal-probe),
+# written before the M4 Pro sitting; the probe is validated on an M1 Pro in the same
+# round. Two terms, two bands: the format carries one numeric band (`predict`), so
+# the checked band is c_d(plain) and the f_bw and c_d(icb) bands are named in `term`
+# and `condition`.
+#
+# c_d derivation: llama.cpp's Llama-2-7B Q4_0 decode reads 3.8 GB of weights. At an
+# M5 Ultra's datasheet 1.2 TB/s the byte floor is 3.09 ms, and the measured 5.58 ms
+# leaves 2.49 ms of non-byte time; on an M5 Max 8.34 - 6.22 leaves 2.12 ms. Dividing
+# by ~300-320 dependent dispatches a token (32 layers x 9-10 CUDA graph nodes + 2;
+# [unverified], this tree holds no measured llama.cpp node count) gives 6.6-8.3 us
+# per dispatch on those machines. An M4 Pro's GPU is slower per dispatch, so the band
+# is 6.0..8.5 us. The M1 Pro probe (development evidence, this round) read
+# c_d(plain) 3.3 us at N=1..7 and 1.9-2.1 us per dispatch at N=580 across two
+# sittings, below the band: if
+# the M4 Pro repeats that, the 2.1-2.5 ms was never a per-dispatch term and
+# decide-below applies.
+#
+# f_bw derivation: MLX's dense rows reach 80-85 % of their roofline, so a streaming
+# read is predicted at 0.80..0.85 of 273 GB/s alone, and at 0.75..0.85 inside a
+# 580-dispatch chain that also pays c_d per dispatch.
+kind: calibration
+question: on an M4 Pro, does one dependent dispatch cost what the published fixed
+  cost implies (~6-8 us), or a fraction of it, and does a streaming read reach the
+  dense-MLX roofline fraction alone and inside a 580-dispatch 1.8 GB chain?
+term: c_d, us per dependent empty dispatch (plain serial encoder, buffer barrier per
+  dispatch) on an M4 Pro; c_d(icb) predicted 0.5..2.0 us; f_bw predicted 0.80..0.85
+  of 273 GB/s alone and 0.75..0.85 inside the chain
+unit: us
+predict: 6.0..8.5 us
+condition: bash tools/metal-probe/run.sh on the M4 Pro -- dispatch --n
+  1,16,64,256,580 --reps 30 in plain and icb (the fit slope is c_d), bw --bytes
+  2147483648 --tg 256,512,1024, then chain --bytes 1800000000 --n 580 in both modes,
+  one log; c_d(plain) is the fit slope, f_bw is bw_best / 273 GB/s; the info block
+  opens and closes every subcommand and the run refuses to start on a thermal state
+  of serious or critical
+decide-in: c_d(plain) lands in the band, so the published fixed cost is per
+  dependent dispatch; compare c_d(icb) with c_d(plain) in the same log -- if icb is
+  lower by more than 1 us, M2.3 replays one ICB a token, otherwise M2.3 keeps the
+  plain encoder and spends the effort on command-buffer boundaries and f_bw
+decide-below: c_d(plain) is under 6.0 us (the M1 Pro reading), so the 2.1-2.5 ms is
+  not per dispatch but command-buffer boundaries and host encoding (the cbper:1 arm
+  prices the boundary); M2.3 budgets one command buffer a token and measures the
+  commit path; if f_bw is under 0.80 the byte floor B / 273 GB/s moves too, so
+  re-derive the token ceiling from the measured chain
+decide-above: c_d(plain) is over 8.5 us, so 580 dispatches alone cost more than the
+  M5's whole fixed cost and an ICB or a fused chain is mandatory before any byte
+  work; re-derive the per-token ceiling with this c_d, and if c_d(icb) is not lower,
+  drop the ICB bet and fuse dispatch groups instead
+reason: sets c_d and f_bw, the two terms M2.3's ICB design decision multiplies; why
+  now: both are hardware and OS facts no cost model in rig-log has measured on Apple
+  silicon, and the published fixed cost is two engines' aggregate, not the
+  per-dispatch term
