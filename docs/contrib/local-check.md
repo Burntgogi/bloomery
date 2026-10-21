@@ -54,6 +54,8 @@ matches, for example a red unit again. The script reads every list from its owne
 and the host units from `python3 tools/recipes.py host-nightly`.
 
 The mapped checkpoint reader is `bloomery-safetensors`; `gate-safetensors` owns its dtype, span and shard tests.
+`f32_values` also checks directly constructed `Raw` values: shape and dtype must account for the complete
+byte span without overflow. A partial value or a mismatched span is `Error::Format`, not a truncated conversion.
 Decision's optional `safetensors` feature loads a head through that reader without linking the hub crate.
 Check both feature configurations with `cargo tree --locked -p bloomery-decision -e normal`, adding
 `--features safetensors` for the loading path. Neither tree should contain `bloomery-hf`; the feature-on tree
