@@ -1,0 +1,49 @@
+# Prediction card (kind calibration) for the M2.2a Metal mat-vec probe (tools/metal-probe --kernels),
+# written while the M4 Pro sitting ran and before its log was read; the probe was validated on an M1 Pro
+# in the same round. One numeric band (`predict`) for the headline term; the others are named in `term`.
+#
+# Derivation. The design's per-token time for the qwen35moe chain (9.6 / 10.7 / 12.2 ms on an M4 Pro) is
+# the byte floor over f_q = 0.9 / 0.8 / 0.7, so f_q is the term that decides which row holds. On the M1
+# Pro (16-core GPU, 2 GiB stream 178.9 GB/s), all reps in one command buffer:
+#   Q4_K own (4 rows a SIMD group)  0.84-0.88 of the same-shape stream at 2048^2..8192x4096
+#   Q4_K ggml (llama.cpp's loop)    0.66-0.81
+#   Q6_K ggml                       0.87-0.89
+#   512x2048 (one expert's down)    under 0.47 of the 2 GiB stream for every variant
+# The M4 Pro streams 262 GB/s (f_bw 0.96, the M2.0 sitting) with 20 GPU cores: more bytes per core in
+# flight are needed to hold the same fraction, so the band is set a little under the M1 Pro reading.
+kind: calibration
+question: on an M4 Pro, how close does the probe's Q4_K mat-vec (own variant) come to the same-shape
+  stream at the large decode shapes, and does the ggml loop stay well below it?
+term: f_q, Q4_K own variant GB/s over the same-shape stream GB/s at 4096x4096 on an M4 Pro; Q4_K ggml
+  predicted 0.60..0.80 at the same shape; Q6_K ggml 0.80..0.90; the 580-mat-vec chain (q4k 2048^2,
+  brk) ratio over its byte floor 1.2..1.4 at K=1
+unit: ratio
+predict: 0.78..0.90 ratio
+condition: bash tools/metal-probe/run.sh --kernels on the M4 Pro, one log; every arm all reps in one
+  command buffer with a buffer barrier between dispatches, each rep on another weight copy (working set
+  at least 1 GiB); the info block opens and closes every subcommand; thermal nominal, AC power
+decide-in: the own variant is the Q4_K kernel M2.2b ports into crates/metal, Q6_K keeps the ggml loop,
+  and the design's middle row (f_q 0.8, 10.7 ms) is the token-time line M2.3a is judged against
+decide-below: under 0.78 the per-core in-flight bytes are short on the bigger GPU; M2.2b opens with a
+  rows-per-SIMD-group sweep (4, 8) and a threadgroup-size sweep before any port, and the token-time
+  line moves to the 12.2 ms row
+decide-above: over 0.90 the kernel is at the stream; the remaining token time is barriers and small
+  shapes, so M2.3a spends its effort on concurrent dispatch (K=2 already saves ~3 us a barrier on the
+  M1 Pro) and on the 512-row expert shapes
+reason: sets f_q, the term the design's token-time rows divide by; why now: M2.2b ports the kernels
+  and must know which variant to port, and the M4 Pro is the only machine with the target's GPU
+  generation shape until an M5 arrives
+#
+# Outcome, M4 Pro sitting 2026-10-21 (development evidence; the Mac has no timing runner, so these are
+# not public numbers). Log: probe-Apple-M4-Pro-20261021T234945.tsv, thermal nominal at start and end,
+# AC power, kernels compiled at run time; 2 GiB stream 262.4 GB/s; every gemv rel_err <= 1e-7.
+# - f_q(Q4_K own, 4096^2) 0.91 (222 GB/s): just above the band, so decide-above.
+# - The ggml loop is not below it here: Q4_K ggml 0.90-0.94 at 1536x4096..8192x4096 (243 GB/s at
+#   8192x4096), against 0.66-0.81 on the M1 Pro, where its pipeline held 768 threads; here it holds
+#   1024. The band for Q4_K ggml (0.60..0.80) was wrong: it carried the M1 Pro's occupancy over.
+# - Q6_K ggml 0.89-0.95; 512x2048 reaches 136 (Q4_K) and 144 (Q6_K) GB/s, about half the 2 GiB stream.
+# - Chain, q4k 2048^2 brk, 580 dependent mat-vecs: 7.21 ms against a 5.18 ms byte floor, ratio 1.39
+#   (band 1.2..1.4); with two independent mat-vecs between barriers (concurrent encoder) 6.39 ms, 1.23.
+# Decision: M2.2b ports llama.cpp's loop for Q4_K and Q6_K (the own variant is dropped: it wins only
+# on the M1 Pro's occupancy). The design's top row (f_q 0.9, 9.6 ms a token on the M4 Pro) is the
+# line M2.3a is judged against, and the remaining token time is barriers and the small expert shapes.
