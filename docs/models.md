@@ -10,6 +10,7 @@
 | MiMo-V2.6-Flash | [`MXFP4`](https://huggingface.co/ggml-org/MiMo-V2.6-Flash-MOPD-GGUF) (ggml-org) | GPU + CPU experts; the hot routed experts sit on the card |
 | Qwen3.6-35B-A3B | [`Q4_K_M`](https://huggingface.co/lmstudio-community/Qwen3.6-35B-A3B-GGUF) (lmstudio-community) | whole on one 24 GB card, or split onto the CPU on 12-16 GB (automatic); image input with `--mmproj` |
 | Ornith-1.5-35B-A3B | [`Q4_K_M`](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF) (ornith-ai) | on the `qwen3` seat (a `qwen35moe` file with Qwen3.6-35B-A3B's shapes; the next-token layer it carries is not read); whole on one 24 GB card, or split onto the CPU on 12-16 GB (automatic); text only, its `mmproj` has not been run |
+| Sage-A1.5 | [`Q4_K_M`](https://huggingface.co/InternScience/Sage-A1.5-Q4_K_M-GGUF) (InternScience) | on the `qwen3` seat (a `qwen35moe` fine-tune of Qwen3.6-35B-A3B with its shapes; the next-token layer it carries is not read); whole on one 24 GB card, or split onto the CPU on 12-16 GB (automatic); image input with its `mmproj` |
 | Qwen3-30B-A3B-Instruct-2507 | [`Q4_K_M`](https://huggingface.co/unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF) (unsloth) | whole on one 24 GB card, or split onto the CPU on 12-16 GB (automatic) |
 | MiniCPM-V 4.7 35B-A3B | [`Q4_K_M`](https://huggingface.co/openbmb/MiniCPM-V-4.7-35B-A3B-gguf) (openbmb) | on the `qwen3` seat (a `qwen35moe` file); image input with `--mmproj` since 0.3.3, a tile capped at 70 tokens |
 | Clef-Flash | [`Q8_0` to `Q3_K_S`](https://huggingface.co/bartowski/Cloudflare_clef-flash-GGUF) (bartowski's upload of 2026-10-05; llama.cpp's `clef` layout carries the head, and the Q3_K files' Q3_K token embedding runs on the card; an older `qwen35`-layout file takes the release's [head file](BUILD.md#clef-flash)) | whole on one GPU, its head on the CPU; image input with an encoder |
@@ -37,6 +38,7 @@ recommended — a load streams the file to the card, and V4.1 reads its engram t
 | lev `Q4_K_M` | 6.12 GB at its default 16,384 context (the server's fit line) | any | 3.0 GB |
 | Qwen3.6-35B `Q4_K_M` | 24 GB whole, or 12–16 GB split (automatic) | 32 GB whole; about 10 GB free beside a small card | 21.2 GB |
 | Ornith-1.5-35B `Q4_K_M` | 24 GB whole, or 12–16 GB split (automatic) | 32 GB whole; about 10 GB free beside a small card | 21.7 GB |
+| Sage-A1.5 `Q4_K_M` | 24 GB whole, or 12–16 GB split (automatic) | 32 GB whole; about 10 GB free beside a small card | 21.7 GB, plus the 0.90 GB `mmproj` |
 | Qwen3-30B `Q4_K_M` | 24 GB whole, or 12–16 GB split (automatic) | 32 GB whole; about 8 GB free beside a small card | 18.6 GB |
 | Qwen3.8-Flash-Next | 24 GB recommended (the expert share sizes to the card's free bytes); a 96 GB card holds every routed expert at a 4k context, and a second card adds none | 128 GB beside a 24 or 48 GB card, 64 GB beside a 96 GB card (about 101, 75 and 34 GB free, plus adaptive residency's pool where the host has it) | 111.3 GB, plus the 2.8 GB MTP draft |
 | GLM-5.3-Flash | 24 GB recommended | 256 GB to hold every routed expert; less pages the rest from NVMe | 199.7 GB |
@@ -44,6 +46,7 @@ recommended — a load streams the file to the card, and V4.1 reads its engram t
 | DeepSeek-V4.1-Flash | 24 GB recommended | 256 GB to hold every routed expert; less pages the rest from NVMe | 347.3 GB (a source build can add a 155.7 GB r8 sidecar; the release does not use one) |
 
 Ornith-1.5-35B's `Q4_K_M` plans the same weight bytes as Qwen3.6-35B's (21,311,258,624 B at the allocator's granules, `--plan` on both files), so its GPU and host RAM cells are Qwen3.6's; the 0.55 GB its file holds beyond is the next-token layer, which the load does not read.
+Sage-A1.5's `Q4_K_M` plans the same weight bytes as Qwen3.6-35B's too (21,311,258,624 B, `--plan` on both files). It passes the `qwen3` serve gate, and it answers with thinking on and off, calls tools on `/v1/chat/completions` and reads an image through its `mmproj`. The seat has no draft for its next-token layer: `BLOOMERY_DRAFT=mtp` is refused by name.
 
 **The NVMe expert tier** (Qwen3.8, GLM-5.3, V4.1): when the host RAM cannot hold the experts the plan leaves on the
 host, the plan pages the overflow through a RAM arena filled from the model file on NVMe. The tokens equal the
