@@ -10,7 +10,7 @@
 //! chat answer held to a completion's ids ([`chat_is_those_ids`]), a greedy chat with its
 //! runner-up logprobs read against an oracle's ids ([`greedy_chat`], [`answered`],
 //! [`ChatReply::follows`]), an image
-//! file held to its digest and sent as base64 ([`crate::sha256`], [`base64`]) and the
+//! file held to its digest and sent as base64 ([`gguf::digest::sha256_file`], [`base64`]) and the
 //! prefix clauses of a seat that keeps a shared prefix
 //! ([`edit_and_extension`]) and of one whose prompt cache holds a saved
 //! state's checkpoints ([`prefix_restore`]).
