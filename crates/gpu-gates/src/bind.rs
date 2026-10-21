@@ -3257,6 +3257,8 @@ mod tests {
 
     const N_VOCAB: usize = 8;
 
+    // PIN(2026-10-21): Removed seat-source/copy wiring assertions; the shared binder reads parsed levers.
+
     /// The factory's sampler is the sampler crate's chain over the request's
     /// parameters, and a parameter the chain refuses (a non-finite
     /// temperature) is the request's refusal in the chain's own words: no
