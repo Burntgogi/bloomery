@@ -12,7 +12,7 @@ use super::{ARCH, MODEL};
 use crate::RefError;
 use crate::arch::BesideDraft;
 pub use crate::arch::DraftFrom;
-use crate::arch::draft::DraftFile;
+use crate::arch::draft::{DraftFile, MTP_LEVER};
 use crate::family::{Build, Family, Identity};
 
 /// The shared MTP draft file every set of the family is dumped with and
@@ -24,6 +24,7 @@ pub const DRAFT: &str = "/models/Qwen3.8-Flash-Next/mtp-Qwen3.8-Flash-Next-share
 pub static BESIDE: BesideDraft = BesideDraft {
     arch: ARCH,
     file: DraftFile::Fixed(DRAFT),
+    lever: MTP_LEVER,
 };
 
 /// The MTP draft file a run of `target` opens: [`BESIDE`]'s pick
@@ -79,7 +80,7 @@ pub static MTP: Family = Family {
 
 #[cfg(test)]
 mod tests {
-    use super::{DRAFT, DraftFrom, draft_file};
+    use super::{DRAFT, DraftFrom, MTP_LEVER, draft_file};
     use std::path::{Path, PathBuf};
 
     /// The lever wins; unset, the file of the shared draft's name beside the
@@ -94,7 +95,7 @@ mod tests {
 
         assert_eq!(
             draft_file(None, &target),
-            (PathBuf::from(DRAFT), DraftFrom::Family)
+            (PathBuf::from(DRAFT), DraftFrom::Family(MTP_LEVER))
         );
         std::fs::write(&beside, b"").unwrap_or_else(|e| panic!("{}: {e}", beside.display()));
         assert_eq!(
@@ -104,7 +105,7 @@ mod tests {
         let other = dir.join("elsewhere.gguf");
         assert_eq!(
             draft_file(Some(&other), &target),
-            (other.clone(), DraftFrom::Lever)
+            (other.clone(), DraftFrom::Lever(MTP_LEVER))
         );
         std::fs::remove_dir_all(&dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
     }

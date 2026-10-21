@@ -14,13 +14,13 @@
 use std::path::{Path, PathBuf};
 
 use bloomery_gpu::dspark::dense::{Bf16Source, DenseDims, DenseLayers, DenseSpec};
-use bloomery_gpu::dspark::head::HeadWeights;
+use bloomery_gpu::dspark::head::{HeadTail, HeadWeights, MarkovTail};
 use bloomery_gpu::dspark::{EmbedSource, FcWeights, HeadSource, HostEmbed, Q8Rows};
 use bloomery_gpu::{DeviceTensor, Gpu, GpuError};
 use bloomery_gpu_gates::GateError;
 use cuda_core::DeviceBuffer;
 use hf::dspark as config;
-use runtime::dspark::{DraftVocab, DsparkShape};
+use runtime::dspark::{DraftVocab, DsparkShape, HeadKind};
 use safetensors::Safetensors;
 
 /// The name the draft's card bytes carry as a reserve of the target's plan.
@@ -183,7 +183,13 @@ pub fn open(gpu: &Gpu, dir: &Path, ctx: usize) -> Result<Parts, GateError> {
     let (lm_bits, _) = file.bf16("lm_head.weight")?;
     let own = Q8Rows::from_bf16(gpu, lm_bits, rows, hidden, &|r| r)?;
     let (head_norm, _) = file.f32s("norm.weight")?;
-    let rank = shape.markov_rank;
+    let HeadKind::Markov { rank, confidence } = shape.head else {
+        return Err(format!(
+            "{WHAT}: a {:?} head: this loader reads Markov drafts",
+            shape.head
+        )
+        .into());
+    };
     let w1 = pair_words(&file, "markov_head.markov_w1.weight", n_target, rank)?;
     let w2 = pair_words(&file, "markov_head.markov_w2.weight", rows, rank)?;
     let stream = gpu.stream();
@@ -191,7 +197,7 @@ pub fn open(gpu: &Gpu, dir: &Path, ctx: usize) -> Result<Parts, GateError> {
         DraftVocab::Reduced { to_target, .. } => Some(DeviceBuffer::from_host(stream, to_target)?),
         DraftVocab::Full { .. } => None,
     };
-    let conf = if shape.confidence {
+    let conf = if confidence {
         expect_shape(&file, "confidence_head.proj.weight", &[1, hidden + rank])?;
         expect_shape(&file, "confidence_head.proj.bias", &[1])?;
         let (w, _) = file.f32s("confidence_head.proj.weight")?;
@@ -204,10 +210,12 @@ pub fn open(gpu: &Gpu, dir: &Path, ctx: usize) -> Result<Parts, GateError> {
         norm: row_f32(gpu, &head_norm)?,
         eps: spec.eps,
         source: HeadSource::Own(own),
-        markov_w1: DeviceTensor::upload(stream, &w1, n_target, rank / 2)?,
-        markov_w2: DeviceTensor::upload(stream, &w2, rows, rank / 2)?,
-        to_target,
-        conf,
+        tail: HeadTail::Markov(MarkovTail {
+            markov_w1: DeviceTensor::upload(stream, &w1, n_target, rank / 2)?,
+            markov_w2: DeviceTensor::upload(stream, &w2, rows, rank / 2)?,
+            to_target,
+            conf,
+        }),
     };
 
     // The draft's own embedding table stays on the host: the owner gathers the rows a pass needs.
@@ -237,12 +245,19 @@ pub fn card_bytes(dir: &Path, ctx: usize) -> Result<u64, GateError> {
     let q8 = |rows: usize, k: usize| (rows * (k + k / 16)) as u64;
     let rows = shape.vocab.rows();
     let n_target = shape.vocab.n_target();
-    let (h, rank) = (dims.hidden, shape.markov_rank);
+    let HeadKind::Markov { rank, confidence } = shape.head else {
+        return Err(format!(
+            "{WHAT}: a {:?} head: this loader reads Markov drafts",
+            shape.head
+        )
+        .into());
+    };
+    let h = dims.hidden;
     let fc = q8(h, shape.taps.len() * shape.hidden);
     let head = q8(rows, h);
     let markov = 4 * ((n_target + rows) * (rank / 2)) as u64;
     let map = 4 * rows as u64;
-    let conf = if shape.confidence {
+    let conf = if confidence {
         4 * (h + rank + 1) as u64
     } else {
         0

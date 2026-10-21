@@ -24,7 +24,7 @@
 use std::num::NonZeroU64;
 
 use gguf::{GgmlType, Split, Value};
-use runtime::dspark::{DraftVocab, DsparkShape};
+use runtime::dspark::{DraftVocab, DsparkShape, HeadKind};
 
 use super::deepseek41::hparams::HyperConnections;
 use super::{meta_arr, meta_f32, meta_u64, meta_usize, metadata, n_vocab};
@@ -198,8 +198,10 @@ pub fn shape(hp: &DraftHparams) -> DsparkShape {
         vocab: DraftVocab::Full { n: hp.n_vocab },
         mask_id: hp.mask_token,
         window: Some(hp.window),
-        markov_rank: hp.markov_rank,
-        confidence: true,
+        head: HeadKind::Markov {
+            rank: hp.markov_rank,
+            confidence: true,
+        },
     }
 }
 
@@ -207,7 +209,7 @@ pub fn shape(hp: &DraftHparams) -> DsparkShape {
 mod tests {
     use super::{DraftExperts, DraftHparams, shape};
     use crate::arch::deepseek41::hparams::HyperConnections;
-    use runtime::dspark::DraftVocab;
+    use runtime::dspark::{DraftVocab, HeadKind};
 
     /// A draft file's hyperparameters with the geometry the shape reads.
     fn hparams() -> DraftHparams {
@@ -263,8 +265,13 @@ mod tests {
         assert_eq!(s.vocab, DraftVocab::Full { n: 129_280 });
         assert_eq!(s.mask_id, 128_799);
         assert_eq!(s.window, Some(128));
-        assert_eq!(s.markov_rank, 256);
-        assert!(s.confidence);
+        assert_eq!(
+            s.head,
+            HeadKind::Markov {
+                rank: 256,
+                confidence: true
+            }
+        );
         assert_eq!(s.check(), Ok(()));
         assert_eq!(s.width(2), 1);
     }

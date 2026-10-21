@@ -975,7 +975,7 @@ mod tests {
 
     /// Every architecture; a new one is a compile error here until it is
     /// listed (and [`step_order::of`] gives it a table).
-    fn every_arch() -> [Arch; 12] {
+    fn every_arch() -> [Arch; 13] {
         let all = [
             Arch::Deepseek2,
             Arch::Deepseek41,

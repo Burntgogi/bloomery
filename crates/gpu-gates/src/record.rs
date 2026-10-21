@@ -3055,6 +3055,19 @@ pub static LISTENING_NEMOTRON: Kind = Kind {
     ],
 };
 
+/// What the raon1 seat's `BLOOMERY_DRAFT` resolved to before the plan.
+pub static DRAFT_RULE_RAON1: Kind = Kind {
+    name: "draft_rule_raon1",
+    head: "draft rule",
+    doc: "What the raon1 seat's BLOOMERY_DRAFT resolved to before the plan: the requests its \
+          DFlash2 draft runs (every: each greedy request, under dspark; thinking: each request whose \
+          prompt call leaves the model inside its think span, unset with the draft's file there; \
+          off: none) and why (the lever's word and the draft's file and where it was found, or \
+          what left the plain path: off, no draft file in the directories named, think tags the \
+          vocabulary does not hold as special tokens).",
+    parts: &[key("drafts", Word, ""), key("why", Text, "")],
+};
+
 /// The raon1 seat's load.
 pub static LOAD_RAON1: Kind = Kind {
     name: "load_raon1",
@@ -3963,16 +3976,18 @@ pub static BLOOMERY_SERVE_NEMOTRON: &[&Kind] = kinds![
 ];
 
 /// What the raon1 seat of `bloomery-serve` prints, all on stderr: the
-/// placement and why (`place unset`), a `--hf` repo's resolve lines, the
-/// plan, the load and its phases, the address and each request's note of the
-/// prefix it kept less of than it shared (the RDA state keeps a prefix only
-/// at the position it stands).
+/// placement and why (`place unset`), the draft rule, a `--hf` repo's resolve
+/// lines, the plan, the load and its phases, the DFlash2 draft's load, the
+/// address, each request's note of the prefix it kept less of than it shared
+/// (the RDA state keeps a prefix only at the position it stands) and the width
+/// chooser's record at a drafted request's end.
 pub static BLOOMERY_SERVE_RAON1: &[&Kind] = kinds![
-    &[&PLACE_UNSET, &PLAN, &NEED],
+    &[&PLACE_UNSET, &DRAFT_RULE_RAON1, &PLAN, &NEED],
     groups::fetch::FETCH,
     groups::fetch::SET,
-    &[&LOAD_RAON1, &LOAD_PHASES, &LISTENING_RAON1],
+    &[&LOAD_RAON1, &LOAD_PHASES, &LOAD_DRAFT, &LISTENING_RAON1],
     groups::bind::CACHE,
+    groups::drafted::WIDTH,
 ];
 
 /// What the GLM seat of `bloomery-serve` prints, all on stderr: the
@@ -5226,9 +5241,9 @@ mod tests {
                 &[fetch::FETCH, fetch::SET, bind::CACHE],
             ),
             (
-                "raon1 seat: bind::spawn",
+                "raon1 seat: print_widths, bind::spawn",
                 BLOOMERY_SERVE_RAON1,
-                &[fetch::FETCH, fetch::SET, bind::CACHE],
+                &[fetch::FETCH, fetch::SET, drafted::WIDTH, bind::CACHE],
             ),
             (
                 "glm seat: Flags::encoder, residency_set, SlotDrafts::open, bind::spawn",

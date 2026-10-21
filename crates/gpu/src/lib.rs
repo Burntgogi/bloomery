@@ -37,6 +37,7 @@ pub mod card_slots;
 pub mod checkpoint;
 pub mod cores;
 pub mod draft;
+pub mod draft_taps;
 pub mod dspark;
 pub mod elem;
 pub mod fault;

@@ -229,6 +229,16 @@ impl<H> PlanInputs<H> {
         }
     }
 
+    /// `self` with each delta-rule layer's state `lanes` lanes ([`KvLayout::with_lanes`]): the
+    /// stores of a load that verifies `lanes` rows a pass.
+    #[must_use]
+    pub fn with_lanes(self, lanes: NonZeroUsize) -> PlanInputs<H> {
+        PlanInputs {
+            kv: self.kv.with_lanes(lanes),
+            ..self
+        }
+    }
+
     /// The card bytes the load of `machine` makes beside the plan's terms: the prompt batch's, and
     /// a tiered load's more. A machine that names an expert tier card where the body serves none
     /// is refused by name ([`PlaceError::Tier`]).
@@ -386,8 +396,14 @@ enum Hold {
         index: u64,
         window: Option<u64>,
     },
-    /// A delta-rule layer: its state, stamp and conv ring, whatever the context.
-    State(u64),
+    /// A delta-rule layer: its first state lane and conv ring (`fixed` bytes), and the lanes'
+    /// stamps and the lanes past the first over `v_heads` heads of `d × d` f32, whatever the
+    /// context.
+    State {
+        fixed: u64,
+        v_heads: usize,
+        d: usize,
+    },
     /// A layer with no token mixer.
     Nothing,
 }
@@ -398,8 +414,8 @@ enum Hold {
 /// and value rows in f16. A GQA layer that selects blocks ([`Selector::BlockMax`]) attends every
 /// position it holds (it has no window) and keeps, beside its planes, one f16 index key of the
 /// selector's `d` values for every position. A delta-rule layer holds a state of `v_heads` heads of
-/// `d × d` f32, one stamped lane, and the conv ring (`runtime::stores::recurrent_bytes`,
-/// `delta_lane_bytes`).
+/// `d × d` f32 in each of its stamped lanes, and the conv ring (`runtime::stores::recurrent_bytes`,
+/// `delta_lane_bytes`): one lane, or the lanes of a load that verifies ([`KvLayout::with_lanes`]).
 #[derive(Clone, Debug)]
 pub struct KvLayout {
     /// Per trunk layer.
@@ -413,6 +429,8 @@ pub struct KvLayout {
     /// row beside each index key, to a plane of the widest selector's key nothing reads and every
     /// selecting layer shares; 0 for a trunk that selects nothing.
     sink_row: u64,
+    /// The lanes of a delta-rule layer's state.
+    lanes: NonZeroUsize,
 }
 
 impl KvLayout {
@@ -463,7 +481,11 @@ impl KvLayout {
                         window: None,
                     }
                 }
-                Mixer::DeltaRule(d) => Hold::State(state_bytes(d)),
+                Mixer::DeltaRule(d) => Hold::State {
+                    fixed: state_bytes(d),
+                    v_heads: d.v_heads as usize,
+                    d: d.d as usize,
+                },
                 Mixer::None => Hold::Nothing,
                 other => return Err(unsized_store(layer, other.what())),
             });
@@ -476,6 +498,7 @@ impl KvLayout {
                 .map(|&(_, dims)| u64::from(dims) * stores::F32_BYTES)
                 .sum(),
             sink_row,
+            lanes: NonZeroUsize::MIN,
         })
     }
 
@@ -483,6 +506,13 @@ impl KvLayout {
     #[must_use]
     pub fn with_rows(self, rows: Rows) -> KvLayout {
         KvLayout { rows, ..self }
+    }
+
+    /// The same layout with each delta-rule layer's state `lanes` lanes: a load that verifies
+    /// `lanes` rows a pass keeps one a row.
+    #[must_use]
+    pub fn with_lanes(self, lanes: NonZeroUsize) -> KvLayout {
+        KvLayout { lanes, ..self }
     }
 
     /// The bytes of layers `layers` at `ctx_max` positions: what a card that runs them holds beside
@@ -544,12 +574,11 @@ fn unsized_store(layer: usize, what: &str) -> PlacementError {
     }])
 }
 
-/// A delta-rule layer's state, one stamped lane and conv ring in bytes.
+/// A delta-rule layer's first state lane and conv ring in bytes, its stamps apart.
 fn state_bytes(d: &DeltaRule) -> u64 {
     let (v_heads, k_heads) = (d.v_heads as usize, d.k_heads as usize);
     let (state, conv) = (d.d as usize, d.conv as usize);
     stores::recurrent_bytes(v_heads, k_heads, state, conv)
-        + stores::delta_lane_bytes(v_heads, state, 1)
 }
 
 impl KvBytes for KvLayout {
@@ -559,7 +588,9 @@ impl KvBytes for KvLayout {
                 .rows_at(layer, ctx_max)
                 .saturating_mul(*row)
                 .saturating_add(ctx_max.saturating_mul(*index)),
-            Some(Hold::State(bytes)) => *bytes,
+            Some(Hold::State { fixed, v_heads, d }) => {
+                fixed + stores::delta_lane_bytes(*v_heads, *d, self.lanes.get())
+            }
             Some(Hold::Nothing) | None => 0,
         }
     }

@@ -482,9 +482,18 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               under 3), never a refusal. Drafting, the load carries the NextN layer as \
               `generate_glm5next`'s does, prints a `load draft=mtp` record after the `load` line, \
               and `/props`' `engine.draft` names it; the plain path prints `load draft=off \
-              (<why>)`; `mtp` set is refused by name with stores too short for one window. Every \
-              other binary and \
-              family refuses each word by name, `off` included (the qwen3 seat's apart).",
+              (<why>)`; `mtp` set is refused by name with stores too short for one window. The \
+              raon1 seat of `bloomery-serve` takes `dspark` and `off`: `dspark` serves the DFlash2 \
+              draft (`$BLOOMERY_DSPARK_MODEL`, else the Q8_0 file of the draft's fixed name \
+              beside the target) and drafts every greedy request, the draft's file missing refused by name before the \
+              plan; `off` is the plain path; unset opens the draft when its file is there and \
+              drafts a request whose prompt call leaves the model inside its think span (the \
+              template's thinking-on prompt) while the draft has followed the slot since its \
+              reset, each other request running plain steps with no draft work, and runs the \
+              plain path when no file is there or the vocabulary holds no think tags; the \
+              `draft rule` record before the plan names which and why; `lookup` and `mtp` are \
+              refused by name. Every other binary and \
+              family refuses each word by name, `off` included (the qwen3 and raon1 seats' apart).",
         site: Site::Parsed {
             left: &[],
             phase: Phase::Load,
@@ -563,7 +572,8 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         default: Unset::Means("`cost` on a run that drafts"),
         doc: "A run that drafts (the MTP draft of `generate_qwen3moe`, `generate_glm5next` and \
               their serve seats; the lookup and DSpark drafts of `generate_ds41` and \
-              `bloomery-serve-ds41`): how many of a proposal's ids a pass verifies. `cost` \
+              `bloomery-serve-ds41`; the DFlash2 draft of `bloomery-serve`'s raon1 seat): how \
+              many of a proposal's ids a pass verifies. `cost` \
               (unset) puts the draft behind the width chooser (`runtime::width`): each window \
               verifies the width whose expected kept positions over its measured pass wall is \
               highest, and none while no width beats the plain step by its margin; the draft \
@@ -1564,7 +1574,9 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
          (`tools/ref/models/deepseek41.sh`), which the DSpark recipes and \
          `tools/ref/timing-card.sh` export; `generate_ds41` and `bloomery-serve-ds41` \
          under `BLOOMERY_DRAFT=dspark` read it, and a binary that needs it and finds it \
-         unset says so.",
+         unset says so. `bloomery-serve`'s raon1 seat reads it as its DFlash2 draft's file \
+         before the one beside the target, and refuses a file that is not a DFlash2 draft \
+         by name.",
     ),
     path(
         "BLOOMERY_ENGRAM_BIN",

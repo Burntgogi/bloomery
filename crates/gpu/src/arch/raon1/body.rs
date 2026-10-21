@@ -11,21 +11,32 @@
 //! ([`super::rda`]) or a latent one ([`super::mla`]), each applying its own
 //! `attn_norm`; the feed-forward one is `ffn_norm` then the dense or routed
 //! SiTU block ([`super::ffn`]). The head reads the streams' mean.
+//!
+//! A pass of `m` rows ([`Run::Rows`]: a verify's or a prompt chunk's,
+//! [`super::rows`]) is the same walk over the rows the staging holds: the
+//! embedding of their ids, the mHC kernels, norms and SiTU over every row,
+//! the RDA and latent layers' row forms and the feed-forward block's
+//! ([`ffn::ffn_rows`]), each row the one-row step's bits. A walk of one row
+//! runs the step's own launches.
 
-use super::ffn::{self, Ffn, FfnKernels, FfnScratch, Glu, Routed};
+use super::ffn::{self, Ffn, FfnKernels, FfnRows, FfnScratch, Glu, Routed};
 use super::mhc::{HC_OUT, MhcKernels, STREAMS, SiteVecs};
 use super::mla::{self, MlaBufs, MlaDims, MlaKernels, MlaSites};
-use super::rda::{self, RdaSites};
+use super::rda::{self, RdaSites, RowKernels, RowsKit};
+use super::rows::{RowState, RowViews};
+use super::state::{self, PASS_ROWS, Pass};
 use crate::arch::hybrid::{Acts, DecodeInput, GqaCx, Site};
 use crate::elem::EmbedRowsArgs;
 use crate::flash_gqa::FlashGqaKernels;
 use crate::gemm::Gemm32Kernels;
 use crate::head::Head;
 use crate::kquant::Act;
-use crate::linear::mixer_kda::{KdaBufs, KdaDims, KdaState};
+use crate::linear::mixer_kda::{KdaBufs, KdaDims};
 use crate::linear::{HEAD, LinearKernels};
 use crate::model::{ChainBody, GpuModel, NoHost, block_count};
+use crate::recur::RecStore;
 use crate::site::{self, KGemvKernels, SiteTy};
+use crate::tensor::Window;
 use crate::weights::{DevWeight, Weights};
 use crate::{DeviceTensor, Gpu, GpuError};
 use cuda_core::{CudaStream, DeviceBuffer};
@@ -52,12 +63,11 @@ const FFN_TYPES: &[SiteTy] = &[
 
 /// A layer's attention sub-layer and its store.
 enum Mixer {
-    /// The recurrent state, its stamp and the conv ring of one lane.
+    /// The recurrent state's lanes, their stamps and the conv ring
+    /// ([`state::rda_store`]).
     Rda {
         sites: Box<RdaSites>,
-        state: DeviceBuffer<f32>,
-        stamp: DeviceBuffer<u32>,
-        ring: DeviceBuffer<f32>,
+        store: RecStore,
     },
     /// The latent cache, `[ctx][row]` f16.
     Mla {
@@ -75,11 +85,16 @@ struct Layer {
 }
 
 impl Layer {
-    fn sites(&self) -> Vec<&Site> {
-        let mut out: Vec<&Site> = match &self.mixer {
+    /// The attention sub-layer's sites.
+    fn mixer_sites(&self) -> Vec<&Site> {
+        match &self.mixer {
             Mixer::Rda { sites, .. } => sites.sites().to_vec(),
             Mixer::Mla { sites, .. } => sites.sites().to_vec(),
-        };
+        }
+    }
+
+    fn sites(&self) -> Vec<&Site> {
+        let mut out = self.mixer_sites();
         match &self.ffn {
             Ffn::Dense(g) => out.extend(g.sites()),
             Ffn::Routed(r) => out.extend(r.shared.sites()),
@@ -89,9 +104,7 @@ impl Layer {
 
     fn store_bytes(&self) -> usize {
         match &self.mixer {
-            Mixer::Rda {
-                state, stamp, ring, ..
-            } => state.num_bytes() + stamp.num_bytes() + ring.num_bytes(),
+            Mixer::Rda { store, .. } => store.bytes(),
             Mixer::Mla { cache, .. } => cache.buf().num_bytes(),
         }
     }
@@ -103,6 +116,7 @@ struct Kernels {
     g32: Gemm32Kernels,
     flash: FlashGqaKernels,
     linear: LinearKernels,
+    rows: RowKernels,
     hc: MhcKernels,
     ffn: FfnKernels,
     mla: MlaKernels,
@@ -116,6 +130,7 @@ impl Kernels {
             g32: Gemm32Kernels::load(ctx)?,
             flash: FlashGqaKernels::load(ctx)?,
             linear: LinearKernels::load(ctx)?,
+            rows: RowKernels::load(ctx)?,
             hc: MhcKernels::load(ctx)?,
             ffn: FfnKernels::load(gpu)?,
             mla: MlaKernels::load(gpu, mla)?,
@@ -123,108 +138,216 @@ impl Kernels {
     }
 }
 
-/// The step's one-token buffers.
+/// The RDA and latent layers' widths `hp` names, or a named refusal of a
+/// shape the card does not run: the softplus decay, a latent row of another
+/// width.
+fn dims(hp: &Hparams) -> Result<(KdaDims, MlaDims), GpuError> {
+    let KdaGate::Sigmoid { lower_bound } = hp.gate else {
+        return Err(GpuError::shape(
+            WHAT,
+            "the RDA layers' decay is the softplus form; the card runs the bounded sigmoid \
+             (kda.gate_lower_bound)",
+        ));
+    };
+    let n = hp.n_embd;
+    let kda = rda::dims(n, hp.n_head, hp.rms_eps, lower_bound);
+    kda.rule.check(WHAT)?;
+    let mla = MlaDims {
+        embd: n,
+        heads: hp.n_head,
+        q_lora: hp.mla.q_lora,
+        nope: hp.mla.nope(),
+        extra: hp.mla.pe,
+        v_head: hp.mla.head_v,
+        rms_eps: hp.rms_eps,
+        latent_eps: hp.latent_eps,
+    };
+    if mla.row() != hp.mla.row() {
+        return Err(GpuError::shape(
+            WHAT,
+            format!(
+                "the latent row is {} values in the file; the card's latent layer caches {}",
+                hp.mla.row(),
+                mla.row()
+            ),
+        ));
+    }
+    Ok((kda, mla))
+}
+
+/// A walk's buffers, `rows` rows of each width, token-major: the step's
+/// one row, or a pass's [`PASS_ROWS`].
 struct Scratch {
-    /// The streams the layer reads and the ones it writes, `STREAMS · n`.
+    /// The streams the layer reads and the ones it writes, `STREAMS · n` a
+    /// row.
     x: DeviceBuffer<f32>,
     x2: DeviceBuffer<f32>,
-    /// The sub-layer's route ([`HC_OUT`] values).
+    /// The sub-layer's route ([`HC_OUT`] values a row).
     hc: DeviceBuffer<f32>,
-    /// The fold, its norm and the sub-layer's output, `n` each.
+    /// The fold, its norm and the sub-layer's output, `n` a row each.
     u: DeviceBuffer<f32>,
     un: DeviceBuffer<f32>,
     br: DeviceBuffer<f32>,
-    /// The token once a stream: the embedding writes the streams in one
-    /// launch.
-    ids: DeviceBuffer<u32>,
-    pos0: DeviceBuffer<u32>,
-    /// The embedding's per-row position and live key count; row 0's are the
-    /// step's.
-    pos: DeviceBuffer<u32>,
-    n_keys: DeviceBuffer<u32>,
-    /// The recurrent stores' one lane word (lane 0).
-    lane: DeviceBuffer<u32>,
     /// The RDA mixer's: qkv, fa, ga, beta_raw, write_raw, f, z, conv, beta,
     /// decay, o, gated.
     kda: [DeviceBuffer<f32>; 12],
     /// The latent layer's: qa, qr, kv, gate, q, qabs, att, av, gated,
     /// part_v, part_ms.
     mla: [DeviceBuffer<f32>; 11],
-    ffn: FfnScratch,
 }
 
+/// The f32 lengths of a [`Scratch`]'s buffers, in its fields' order: the
+/// streams and the sub-layer's rows, the RDA mixer's twelve, the latent
+/// layer's eleven. Each buffer holds at least one value.
+type ScratchLens = ([usize; 6], [usize; 12], [usize; 11]);
+
 impl Scratch {
-    fn new(
-        stream: &CudaStream,
-        hp: &Hparams,
-        (d, m): (&KdaDims, &MlaDims),
-        ctx: usize,
-    ) -> Result<Scratch, GpuError> {
-        let z = |n: usize| DeviceBuffer::<f32>::zeroed(stream, n.max(1));
-        let u = |n: usize| DeviceBuffer::<u32>::zeroed(stream, n);
+    /// The lengths of a walk's buffers of `rows` rows over a latent cache of
+    /// `ctx` rows: the one formula [`Scratch::new`] allocates and
+    /// [`Body::pass_reserve`] counts.
+    fn lens(hp: &Hparams, (d, m): (&KdaDims, &MlaDims), ctx: usize, rows: usize) -> ScratchLens {
+        let z = |n: usize| (rows * n).max(1);
         let n = hp.n_embd;
         let lin = d.shape;
         let (channels, v, n_v) = (lin.channels(), lin.n_v * HEAD, lin.n_v);
-        let routed_ff = hp.experts.ff;
-        let shared_ff = hp.experts.shared_ff();
-        let (part_v, part_ms) = mla::partials_lens(m, ctx);
+        let (part_v, part_ms) = mla::partials_lens_rows(m, ctx, rows);
         let (heads, row) = (m.heads, m.row());
+        (
+            [z(STREAMS * n), z(STREAMS * n), z(HC_OUT), z(n), z(n), z(n)],
+            [
+                z(channels),
+                z(hp.decay_rank),
+                z(hp.decay_rank),
+                z(n_v),
+                z(n_v),
+                z(v),
+                z(v),
+                z(channels),
+                z(n_v),
+                z(v),
+                z(v),
+                z(v),
+            ],
+            [
+                z(m.q_lora),
+                z(m.q_lora),
+                z(row),
+                z(heads * m.v_head),
+                z(heads * m.head_k()),
+                z(heads * row),
+                z(heads * hp.mla.kv_lora),
+                z(heads * m.v_head),
+                z(heads * m.v_head),
+                part_v.max(1),
+                part_ms.max(1),
+            ],
+        )
+    }
+
+    /// Card bytes of the buffers [`Scratch::lens`] names, before any load.
+    fn bytes_of(lens: &ScratchLens) -> usize {
+        let (a, b, c) = lens;
+        let values: usize = a.iter().chain(b).chain(c).sum();
+        values * std::mem::size_of::<f32>()
+    }
+
+    fn new(
+        stream: &CudaStream,
+        hp: &Hparams,
+        dims: (&KdaDims, &MlaDims),
+        ctx: usize,
+        rows: usize,
+    ) -> Result<Scratch, GpuError> {
+        fn zeroed<const N: usize>(
+            stream: &CudaStream,
+            lens: [usize; N],
+        ) -> Result<[DeviceBuffer<f32>; N], GpuError> {
+            let mut out = Vec::with_capacity(N);
+            for n in lens {
+                out.push(DeviceBuffer::<f32>::zeroed(stream, n)?);
+            }
+            Ok(out
+                .try_into()
+                .unwrap_or_else(|_| unreachable!("{N} buffers made of {N} lengths")))
+        }
+        let (streams, kda, mla) = Scratch::lens(hp, dims, ctx, rows);
+        let [x, x2, hc, u, un, br] = zeroed(stream, streams)?;
         Ok(Scratch {
-            x: z(STREAMS * n)?,
-            x2: z(STREAMS * n)?,
-            hc: z(HC_OUT)?,
-            u: z(n)?,
-            un: z(n)?,
-            br: z(n)?,
-            ids: u(STREAMS)?,
-            pos0: u(1)?,
-            pos: u(STREAMS)?,
-            n_keys: u(STREAMS)?,
-            lane: u(1)?,
-            kda: [
-                z(channels)?,
-                z(hp.decay_rank)?,
-                z(hp.decay_rank)?,
-                z(n_v)?,
-                z(n_v)?,
-                z(v)?,
-                z(v)?,
-                z(channels)?,
-                z(n_v)?,
-                z(v)?,
-                z(v)?,
-                z(v)?,
-            ],
-            mla: [
-                z(m.q_lora)?,
-                z(m.q_lora)?,
-                z(row)?,
-                z(heads * m.v_head)?,
-                z(heads * m.head_k())?,
-                z(heads * row)?,
-                z(heads * hp.mla.kv_lora)?,
-                z(heads * m.v_head)?,
-                z(heads * m.v_head)?,
-                z(part_v)?,
-                z(part_ms)?,
-            ],
-            ffn: FfnScratch::new(stream, n, hp.dense_ff.max(shared_ff), routed_ff)?,
+            x,
+            x2,
+            hc,
+            u,
+            un,
+            br,
+            kda: zeroed(stream, kda)?,
+            mla: zeroed(stream, mla)?,
         })
     }
 
     fn bytes(&self) -> usize {
-        let f = [&self.x, &self.x2, &self.hc, &self.u, &self.un, &self.br]
+        [&self.x, &self.x2, &self.hc, &self.u, &self.un, &self.br]
             .into_iter()
             .chain(self.kda.iter())
             .chain(self.mla.iter())
             .map(DeviceBuffer::num_bytes)
-            .sum::<usize>();
-        let w = [&self.ids, &self.pos0, &self.pos, &self.n_keys, &self.lane]
+            .sum()
+    }
+}
+
+/// The step's input, rewritten by every refresh: the token once a stream
+/// (the embedding writes the streams in one launch), the position, and the
+/// embedding's per-row position and live key count, row 0's the step's.
+struct StepIn {
+    ids: DeviceBuffer<u32>,
+    pos0: DeviceBuffer<u32>,
+    pos: DeviceBuffer<u32>,
+    n_keys: DeviceBuffer<u32>,
+}
+
+impl StepIn {
+    fn new(stream: &CudaStream) -> Result<StepIn, GpuError> {
+        let u = |n: usize| DeviceBuffer::<u32>::zeroed(stream, n);
+        Ok(StepIn {
+            ids: u(STREAMS)?,
+            pos0: u(1)?,
+            pos: u(STREAMS)?,
+            n_keys: u(STREAMS)?,
+        })
+    }
+
+    fn bytes(&self) -> usize {
+        [&self.ids, &self.pos0, &self.pos, &self.n_keys]
             .into_iter()
             .map(DeviceBuffer::num_bytes)
-            .sum::<usize>();
-        f + w + self.ffn.bytes()
+            .sum()
     }
+}
+
+/// What a walk runs: the step's one row from its refreshed input, or `m`
+/// rows of the staged pass from staging row `at`
+/// ([`RowState`](super::rows::RowState)), their RDA states as `pass` says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Run {
+    Step,
+    Rows { at: usize, m: usize, pass: Pass },
+}
+
+/// Where a walk's rows go past the last layer.
+pub(super) enum Tail<'h> {
+    /// Every row's mean of the streams into `head`, a head of the walk's
+    /// rows, then the head.
+    Head(&'h mut Head),
+    /// The last row's mean into `head`, a head of one row, then the head: a
+    /// prompt call's last chunk.
+    Last(&'h mut Head),
+    /// No head: a prompt chunk before the call's last.
+    Open,
+}
+
+/// A walk's feed-forward buffers: the step's, or a pass's rows'.
+enum FfnBufs<'a> {
+    Step(&'a mut FfnScratch),
+    Rows(&'a mut FfnRows),
 }
 
 /// The Raon-1 chain over one sequence on one card.
@@ -236,7 +359,18 @@ pub struct Body {
     layers: Vec<Layer>,
     k: Kernels,
     acts: Acts,
+    /// The step's one row.
     s: Scratch,
+    step_in: StepIn,
+    ffn_s: FfnScratch,
+    /// A pass's rows, and the stage a row-major site's columns land in
+    /// before their copy into token-major rows ([`RowsKit`]).
+    pass: Scratch,
+    ffn_rows: FfnRows,
+    stage: DeviceBuffer<f32>,
+    /// The passes' staging, the lane word, the taps and the position the
+    /// stores stand at.
+    pub(super) rows: RowState,
     /// The token once a stream, rewritten by every refresh.
     ids: [u32; STREAMS],
     ctx: usize,
@@ -246,9 +380,27 @@ impl GpuModel<Body> {
     /// The whole model of `file` resident on `gpu`, plus the output head:
     /// every tensor in its kernels' device format (the F16 ones widened to
     /// f32), the latent layers' caches of `ctx` rows, the RDA layers' stores
-    /// and the step's buffers. The model takes the file and closes it once
-    /// the weights are resident.
+    /// of one lane and the walks' buffers. The model takes the file and
+    /// closes it once the weights are resident. A verify of drafted rows
+    /// takes [`GpuModel::open_verifying`]'s load.
     pub fn open(gpu: Gpu, file: Split, ctx: usize) -> Result<GpuModel<Body>, GpuError> {
+        GpuModel::open_lanes(gpu, file, ctx, 1)
+    }
+
+    /// [`GpuModel::open`] with [`PASS_ROWS`] lanes an RDA store, so a
+    /// verify of up to that many rows keeps any `1..=m` of them
+    /// ([`super::state`]); the steps and prompt calls are the plain load's,
+    /// bit for bit.
+    pub fn open_verifying(gpu: Gpu, file: Split, ctx: usize) -> Result<GpuModel<Body>, GpuError> {
+        GpuModel::open_lanes(gpu, file, ctx, PASS_ROWS)
+    }
+
+    fn open_lanes(
+        gpu: Gpu,
+        file: Split,
+        ctx: usize,
+        lanes: usize,
+    ) -> Result<GpuModel<Body>, GpuError> {
         let n_layers = block_count(&file, "raon1 GpuModel::open")?;
         GpuModel::load_blocks(gpu, &file, ctx, 0..n_layers, true, |gpu, w| {
             let hp = Hparams::read(&file).map_err(|e| GpuError::plan(WHAT, e))?;
@@ -258,7 +410,7 @@ impl GpuModel<Body> {
             for l in (0..hp.n_layer).filter(|&l| !hp.dense(l)) {
                 down_words(gpu.stream(), &file, w, &names::ffn_down_exps(l))?;
             }
-            Body::load(gpu, &file, w, hp, ctx)
+            Body::load(gpu, &file, w, (hp, ctx), lanes)
         })
     }
 }
@@ -310,6 +462,18 @@ fn exact(w: &Weights, name: String, len: usize) -> Result<String, GpuError> {
 }
 
 impl Body {
+    /// Card bytes of the rows pass's walk buffers ([`PASS_ROWS`] rows, the
+    /// latent layers' attention partials among them), which every load of
+    /// the file `hp` describes makes beside a plan's terms: what its plan
+    /// keeps out of the expert budget (`PlanInputs::with_prompt_reserve`).
+    /// Counted at a cache taller than one attention segment, the most any
+    /// context takes. Refused as the load refuses `hp`.
+    pub fn pass_reserve(hp: &Hparams) -> Result<u64, GpuError> {
+        let (kda, mla) = dims(hp)?;
+        let lens = Scratch::lens(hp, (&kda, &mla), usize::MAX, PASS_ROWS);
+        Ok(Scratch::bytes_of(&lens) as u64)
+    }
+
     /// The last hyper-connection site's route as the step left it: the last
     /// layer's feed-forward site, `pre[4]`, `post[4]`, then `comb[16]` at
     /// `src · 4 + dst` ([`HC_OUT`] values). Synchronizes the stream.
@@ -321,8 +485,8 @@ impl Body {
         gpu: &Gpu,
         file: &Split,
         w: &Weights,
-        hp: Hparams,
-        ctx: usize,
+        (hp, ctx): (Hparams, usize),
+        lanes: usize,
     ) -> Result<Body, GpuError> {
         let stream = gpu.stream();
         let n = hp.n_embd;
@@ -335,13 +499,6 @@ impl Body {
                 ),
             ));
         }
-        let KdaGate::Sigmoid { lower_bound } = hp.gate else {
-            return Err(GpuError::shape(
-                WHAT,
-                "the RDA layers' decay is the softplus form; the card runs the bounded sigmoid \
-                 (kda.gate_lower_bound)",
-            ));
-        };
         let e = hp.experts;
         if e.n_expert != ffn::sigmoid_128_6::N_EXPERT
             || e.n_used != ffn::sigmoid_128_6::N_USED
@@ -360,28 +517,7 @@ impl Body {
                 ),
             ));
         }
-        let kda = rda::dims(n, hp.n_head, hp.rms_eps, lower_bound);
-        kda.rule.check(WHAT)?;
-        let mla = MlaDims {
-            embd: n,
-            heads: hp.n_head,
-            q_lora: hp.mla.q_lora,
-            nope: hp.mla.nope(),
-            extra: hp.mla.pe,
-            v_head: hp.mla.head_v,
-            rms_eps: hp.rms_eps,
-            latent_eps: hp.latent_eps,
-        };
-        if mla.row() != hp.mla.row() {
-            return Err(GpuError::shape(
-                WHAT,
-                format!(
-                    "the latent row is {} values in the file; the card's latent layer caches {}",
-                    hp.mla.row(),
-                    mla.row()
-                ),
-            ));
-        }
+        let (kda, mla) = dims(&hp)?;
         let act = Act::Situ {
             beta: hp.situ.gate_beta,
             linear_beta: hp.situ.value_beta,
@@ -399,15 +535,10 @@ impl Body {
         let mut layers = Vec::with_capacity(hp.n_layer);
         for l in 0..hp.n_layer {
             let mixer = match hp.kind(l) {
-                Kind::Rda => {
-                    let lin = kda.shape;
-                    Mixer::Rda {
-                        sites: Box::new(RdaSites::load(file, w, &kda, l)?),
-                        state: DeviceBuffer::zeroed(stream, lin.state_len())?,
-                        stamp: DeviceBuffer::from_host(stream, &[0u32])?,
-                        ring: DeviceBuffer::zeroed(stream, lin.ring_len())?,
-                    }
-                }
+                Kind::Rda => Mixer::Rda {
+                    sites: Box::new(RdaSites::load(file, w, &kda, l)?),
+                    store: state::rda_store(stream, kda.shape, lanes)?,
+                },
                 Kind::Mla => Mixer::Mla {
                     sites: Box::new(MlaSites::load(file, w, &mla, l)?),
                     cache: DeviceTensor::zeroed(stream, ctx, mla.row())?,
@@ -454,16 +585,28 @@ impl Body {
             exact(w, names::ffn_norm(l), n)?;
             layers.push(Layer { mixer, ffn, hc });
         }
-        let acts = Acts::new(stream, layers.iter().flat_map(Layer::sites))?;
-        let s = Scratch::new(stream, &hp, (&kda, &mla), ctx)?;
+        let mut acts = Acts::new(stream, layers.iter().flat_map(Layer::sites))?;
+        rda::add_row_forms(
+            stream,
+            &mut acts,
+            layers.iter().flat_map(Layer::mixer_sites),
+        )?;
+        let ff = (hp.dense_ff.max(e.shared_ff()), e.ff);
+        let stage = rda::stage_len(&kda).max(mla::stage_len(&mla));
         Ok(Body {
             k: Kernels::load(gpu, &mla)?,
+            s: Scratch::new(stream, &hp, (&kda, &mla), ctx, 1)?,
+            step_in: StepIn::new(stream)?,
+            ffn_s: FfnScratch::new(stream, n, ff.0, ff.1)?,
+            pass: Scratch::new(stream, &hp, (&kda, &mla), ctx, PASS_ROWS)?,
+            ffn_rows: FfnRows::new(stream, n, ff, PASS_ROWS)?,
+            stage: DeviceBuffer::zeroed(stream, stage)?,
+            rows: RowState::new(stream, lanes)?,
             kda,
             mla,
             act,
             layers,
             acts,
-            s,
             ids: [0; STREAMS],
             ctx,
             hp,
@@ -472,27 +615,134 @@ impl Body {
 
     /// Device bytes the body holds past the weights and the stores.
     fn scratch_bytes(&self) -> usize {
-        self.s.bytes() + self.acts.bytes() + self.k.kgemv.device_bytes()
+        self.s.bytes()
+            + self.step_in.bytes()
+            + self.ffn_s.bytes()
+            + self.pass.bytes()
+            + self.ffn_rows.bytes()
+            + self.stage.num_bytes()
+            + self.rows.bytes()
+            + self.acts.bytes()
+            + self.k.kgemv.device_bytes()
     }
 
-    /// The whole chain: the embedding into the streams, every layer, the
-    /// streams' mean into the head's input, then `head`.
-    fn enqueue(&mut self, gpu: &Gpu, w: &Weights, head: &mut Head) -> Result<(), GpuError> {
+    /// Device bytes of the sequence's stores: the RDA layers' lanes and
+    /// rings, the latent layers' caches.
+    pub(super) fn store_bytes(&self) -> usize {
+        self.layers.iter().map(Layer::store_bytes).sum()
+    }
+
+    /// The layers a tap may name and the floats of one tapped row of a
+    /// layer: the streams, `STREAMS · n`.
+    pub(super) fn tap_shape(&self) -> (usize, usize) {
+        (self.layers.len(), STREAMS * self.hp.n_embd)
+    }
+
+    /// One walk (module doc): the embedding of `run`'s ids into the
+    /// streams, every layer — the rows entering a tapped layer laid into the
+    /// taps first — then `tail`.
+    pub(super) fn walk(
+        &mut self,
+        gpu: &Gpu,
+        w: &Weights,
+        run: Run,
+        tail: Tail<'_>,
+    ) -> Result<(), GpuError> {
         let stream = gpu.stream();
-        let (n, hcf) = (self.hp.n_embd, (self.hp.hc.eps, self.hp.hc.magnitude));
+        let Body {
+            hp,
+            kda: kd,
+            mla: md,
+            act,
+            layers,
+            k,
+            acts,
+            s,
+            step_in,
+            ffn_s,
+            pass: ps,
+            ffn_rows,
+            stage,
+            rows,
+            ctx,
+            ..
+        } = self;
+        let (n, hcf) = (hp.n_embd, (hp.hc.eps, hp.hc.magnitude));
         let cx = GqaCx {
             what: STEP,
             gpu,
             w,
-            kgemv: &self.k.kgemv,
-            g32: &self.k.g32,
-            flash: &self.k.flash,
+            kgemv: &k.kgemv,
+            g32: &k.g32,
+            flash: &k.flash,
             mma: false,
             out_gate: None,
             hidden: n,
-            eps: self.hp.rms_eps,
+            eps: hp.rms_eps,
             n_kv: 1,
-            ctx: self.ctx,
+            ctx: *ctx,
+        };
+        let embd = names::token_embd();
+        let Some(DevWeight::KQuant { ty, w: table, .. }) = w.get(&embd) else {
+            return Err(GpuError::tensor(STEP, &embd, "K-quant rows"));
+        };
+        let RowState {
+            rin, lanes, taps, ..
+        } = rows;
+        let pos_w: Window<'_, u32>;
+        let keys_w: Window<'_, u32>;
+        let (sc, mut ffn_b, pos, keys, (at, m, pass)) = match run {
+            Run::Step => {
+                gpu.elem().enqueue_embed_rows_kquant(
+                    stream,
+                    *ty,
+                    EmbedRowsArgs {
+                        w: table,
+                        ids: &step_in.ids,
+                        pos0: &step_in.pos0,
+                        first: 0,
+                        y: &mut s.x,
+                        pos: &mut step_in.pos,
+                        n_keys: &mut step_in.n_keys,
+                    },
+                )?;
+                let (pos, keys) = (&step_in.pos, &step_in.n_keys);
+                (s, FfnBufs::Step(ffn_s), pos, keys, (0, 1, Pass::InPlace))
+            }
+            Run::Rows { at, m, pass } => {
+                let RowViews {
+                    ids,
+                    pos,
+                    keys,
+                    epos,
+                    ekeys,
+                } = rin.views(at, m)?;
+                // The embedding's own positions are its rows', a stream each:
+                // they land in buffers no layer reads; the layers read the
+                // staged ones.
+                gpu.elem().enqueue_embed_rows_kquant(
+                    stream,
+                    *ty,
+                    EmbedRowsArgs {
+                        w: table,
+                        ids: &ids,
+                        pos0: &pos,
+                        first: 0,
+                        y: &mut ps.x,
+                        pos: epos,
+                        n_keys: ekeys,
+                    },
+                )?;
+                pos_w = pos;
+                keys_w = keys;
+                (
+                    ps,
+                    FfnBufs::Rows(ffn_rows),
+                    &*pos_w,
+                    &*keys_w,
+                    (at, m, pass),
+                )
+            }
         };
         let Scratch {
             x,
@@ -501,34 +751,14 @@ impl Body {
             u,
             un,
             br,
-            ids,
-            pos0,
-            pos,
-            n_keys,
-            lane,
             kda,
             mla: mla_b,
-            ffn: ffn_s,
-        } = &mut self.s;
-        let embd = names::token_embd();
-        let Some(DevWeight::KQuant { ty, w: table, .. }) = w.get(&embd) else {
-            return Err(GpuError::tensor(STEP, &embd, "K-quant rows"));
-        };
-        gpu.elem().enqueue_embed_rows_kquant(
-            stream,
-            *ty,
-            EmbedRowsArgs {
-                w: table,
-                ids,
-                pos0,
-                first: 0,
-                y: x,
-                pos,
-                n_keys,
-            },
-        )?;
-        let mhc = &self.k.hc;
-        for (l, layer) in self.layers.iter_mut().enumerate() {
+        } = sc;
+        let mhc = &k.hc;
+        for (l, layer) in layers.iter_mut().enumerate() {
+            if let Some((t, slot)) = taps.as_mut().and_then(|t| t.slot(l).map(|i| (t, i))) {
+                t.enter_at(stream, slot, x, (at, m))?;
+            }
             let [attn_hc, ffn_hc] = &layer.hc;
             let vecs = |[f, scale, base]: &[String; 3]| -> Result<SiteVecs<'_>, GpuError> {
                 Ok(SiteVecs {
@@ -537,15 +767,10 @@ impl Body {
                     base: w.f32_buf(STEP, base)?,
                 })
             };
-            mhc.enqueue_route(stream, &vecs(attn_hc)?, x, (n, 1), hcf, hc)?;
-            mhc.enqueue_fold(stream, x, hc, (n, 1), u)?;
+            mhc.enqueue_route(stream, &vecs(attn_hc)?, x, (n, m), hcf, hc)?;
+            mhc.enqueue_fold(stream, x, hc, (n, m), u)?;
             match &mut layer.mixer {
-                Mixer::Rda {
-                    sites,
-                    state,
-                    stamp,
-                    ring,
-                } => {
+                Mixer::Rda { sites, store } => {
                     let [
                         qkv,
                         fa,
@@ -560,15 +785,10 @@ impl Body {
                         o,
                         gated,
                     ] = &mut *kda;
-                    let st = KdaState {
-                        state,
-                        stamp,
-                        ring,
-                        lane,
-                        lanes: 1,
-                        each: false,
-                        row: 0,
-                    };
+                    // The pass's own kind, not the lane book's: a verify's
+                    // capture records it before its plan opens it.
+                    let mut st = lanes.state(store)?;
+                    st.each = pass == Pass::Verify;
                     let bufs = KdaBufs {
                         x: u,
                         pos,
@@ -587,22 +807,23 @@ impl Body {
                         gated,
                         out: br,
                     };
-                    rda::step(
-                        &cx,
-                        &self.k.linear,
-                        &mut self.acts,
-                        sites,
-                        (l, &self.kda),
-                        st,
-                        bufs,
-                    )?;
+                    if m == 1 {
+                        rda::step(&cx, &k.linear, acts, sites, (l, &*kd), st, bufs)?;
+                    } else {
+                        let kit = RowsKit {
+                            linear: &k.linear,
+                            rows: &k.rows,
+                            stage: &mut *stage,
+                        };
+                        rda::rows(&cx, kit, acts, sites, (l, &*kd, m), st, bufs)?;
+                    }
                 }
                 Mixer::Mla { sites, cache } => {
                     let [qa, qr, kv, gate, q, qabs, att, av, gated, part_v, part_ms] = &mut *mla_b;
                     let bufs = MlaBufs {
                         x: u,
                         pos,
-                        n_keys,
+                        n_keys: keys,
                         xn: un,
                         qa,
                         qr,
@@ -618,36 +839,51 @@ impl Body {
                         out: br,
                         cache,
                     };
-                    mla::step(
-                        &cx,
-                        &self.k.mla,
-                        &mut self.acts,
-                        (&**sites, &self.mla),
-                        l,
-                        bufs,
-                    )?;
+                    if m == 1 {
+                        mla::step(&cx, &k.mla, acts, (&**sites, &*md), l, bufs)?;
+                    } else {
+                        let kit = RowsKit {
+                            linear: &k.linear,
+                            rows: &k.rows,
+                            stage: &mut *stage,
+                        };
+                        mla::rows(&cx, &k.mla, acts, (&**sites, &*md), (l, m), bufs, kit)?;
+                    }
                 }
             }
-            mhc.enqueue_post(stream, (x, br, hc), (n, 1), x2)?;
-            mhc.enqueue_route(stream, &vecs(ffn_hc)?, x2, (n, 1), hcf, hc)?;
-            mhc.enqueue_fold(stream, x2, hc, (n, 1), u)?;
+            mhc.enqueue_post(stream, (x, br, hc), (n, m), x2)?;
+            mhc.enqueue_route(stream, &vecs(ffn_hc)?, x2, (n, m), hcf, hc)?;
+            mhc.enqueue_fold(stream, x2, hc, (n, m), u)?;
             let gain = w.f32_buf(STEP, &names::ffn_norm(l))?;
             gpu.elem()
-                .enqueue_rms_norm(stream, u, gain, self.hp.rms_eps, n, 1, un)?;
-            ffn::ffn(
-                &cx,
-                &self.k.ffn,
-                &mut self.acts,
-                (self.act, self.hp.experts.weights_scale),
-                (l, &layer.ffn),
-                un,
-                ffn_s,
-                br,
-            )?;
-            mhc.enqueue_post(stream, (x2, br, hc), (n, 1), x)?;
+                .enqueue_rms_norm(stream, u, gain, hp.rms_eps, n, m, un)?;
+            let rule = (*act, hp.experts.weights_scale);
+            let at_l = (l, &layer.ffn);
+            match &mut ffn_b {
+                FfnBufs::Step(f) => ffn::ffn(&cx, &k.ffn, acts, rule, at_l, un, f, br)?,
+                FfnBufs::Rows(f) => ffn::ffn_rows(&cx, &k.ffn, acts, rule, at_l, m, un, f, br)?,
+            }
+            mhc.enqueue_post(stream, (x2, br, hc), (n, m), x)?;
         }
-        mhc.enqueue_mean(stream, x, (n, 1), head.input_mut())?;
-        head.enqueue(gpu, w)
+        match tail {
+            Tail::Head(head) => {
+                if head.m() != m {
+                    return Err(GpuError::shape(
+                        STEP,
+                        format!("a walk of {m} rows into a head of {}", head.m()),
+                    ));
+                }
+                mhc.enqueue_mean(stream, x, (n, m), head.input_mut())?;
+                head.enqueue(gpu, w)
+            }
+            Tail::Last(head) => {
+                let row = STREAMS * n;
+                let last = Window::<f32>::of(&*x, (m - 1) * row * size_of::<f32>(), row)?;
+                mhc.enqueue_mean(stream, &last, (n, 1), head.input_mut())?;
+                head.enqueue(gpu, w)
+            }
+            Tail::Open => Ok(()),
+        }
     }
 }
 
@@ -671,34 +907,35 @@ impl ChainBody for Body {
         Ok(DecodeInput { token, pos })
     }
 
-    /// The token once a stream and the position: two copies.
+    /// The token once a stream and the position: two copies. Refused by
+    /// name, before either, while a verify waits for its commit or off the
+    /// position the stores stand at ([`RowState::step_at`]).
     fn refresh(&mut self, stream: &CudaStream, input: &DecodeInput) -> Result<(), GpuError> {
+        self.rows.step_at(input.pos)?;
         self.ids = [input.token; STREAMS];
-        self.s.ids.copy_from_host(stream, &self.ids)?;
-        Ok(self.s.pos0.copy_from_host(stream, &[input.pos])?)
+        self.step_in.ids.copy_from_host(stream, &self.ids)?;
+        self.step_in.pos0.copy_from_host(stream, &[input.pos])?;
+        self.rows.held = input.pos + 1;
+        Ok(())
     }
 
     fn enqueue_chain(&mut self, gpu: &Gpu, w: &Weights, head: &mut Head) -> Result<(), GpuError> {
-        self.enqueue(gpu, w, head)
+        self.walk(gpu, w, Run::Step, Tail::Head(head))
     }
 
-    /// Every RDA state and conv ring back to zero in place (a captured chain
-    /// keeps their addresses) with its lane at position 0. The latent caches
-    /// need nothing: no row at or past the live count is read, and every row
-    /// below it is written by its own step first.
+    /// Every RDA store back to a fresh one in place (a captured chain keeps
+    /// their addresses, [`state::clear_store`]), the lane word at lane 0 and
+    /// any verify waiting dropped. The latent caches need nothing: no row at
+    /// or past the live count is read, and every row below it is written by
+    /// its own walk first.
     fn reset(&mut self, gpu: &Gpu) -> Result<(), GpuError> {
         let stream = gpu.stream();
         for layer in &mut self.layers {
-            if let Mixer::Rda {
-                state, stamp, ring, ..
-            } = &mut layer.mixer
-            {
-                state.zero_async(stream)?;
-                ring.zero_async(stream)?;
-                stamp.copy_from_host(stream, &[0u32])?;
+            if let Mixer::Rda { store, .. } = &mut layer.mixer {
+                state::clear_store(stream, store)?;
             }
         }
-        Ok(())
+        self.rows.reset(stream)
     }
 
     /// `attention.layer_norm_rms_epsilon`: every block norm's, the head's
@@ -708,8 +945,7 @@ impl ChainBody for Body {
     }
 
     fn resident_bytes(&self) -> usize {
-        let stores: usize = self.layers.iter().map(Layer::store_bytes).sum();
-        stores + self.scratch_bytes()
+        self.store_bytes() + self.scratch_bytes()
     }
 
     fn layers(&self) -> Range<usize> {

@@ -10,6 +10,8 @@
 mod tests;
 
 use crate::RefError;
+use crate::arch::BesideDraft;
+use crate::arch::draft::{DSPARK_LEVER, DraftFile};
 use crate::family::{Build, Family, Identity};
 
 /// The architecture every raon1 manifest names in its `# arch` line: the GGUF `general.architecture`.
@@ -18,6 +20,18 @@ pub const ARCH: &str = "raon1";
 /// The Q4_K_M file every raon1 set is dumped from and the engine runs: the identity each set's `# model` line states. A set of the file
 /// moved elsewhere is stale by this line, not by its name.
 pub const MODEL: &str = "/models/Raon-1-mini-preview/raon-1-mini-preview-Q4_K_M.gguf";
+
+/// Raon-1-mini's DFlash2 draft (Q8_0), whose file name is its identity beside a target.
+pub const DFLASH: &str = "/models/Raon-1-mini-preview/dflash-raon-1-mini-preview-Q8_0.gguf";
+
+/// Raon-1's beside-file draft: [`DFLASH`] beside the target, or the file `BLOOMERY_DSPARK_MODEL`
+/// names. Not a row of [`beside_drafts`](super::beside_drafts) while no `--hf` fetch rule
+/// (`model::arch::draft::draft_usable`) reads it, as MiMo's is not.
+pub static DFLASH_BESIDE: BesideDraft = BesideDraft {
+    arch: ARCH,
+    file: DraftFile::Fixed(DFLASH),
+    lever: DSPARK_LEVER,
+};
 
 /// The build every raon1 set names: llama.cpp `fb895662d` (krafton-ai/llama.cpp, branch `raon-1-mini-preview`) and the first 12 hex
 /// digits of the md5 of the `libllama.so` built from it (`/home/user/llama.cpp-raon`, the tree the profile's `LCPP` names;

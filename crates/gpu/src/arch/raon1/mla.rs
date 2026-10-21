@@ -1,4 +1,4 @@
-//! A Raon gated MLA layer on the card at one row: absorbed latent attention
+//! A Raon gated MLA layer on the card: absorbed latent attention
 //! with no positional encoding, its `rope.dimension_count` channels an
 //! unrotated extra key part shared by the heads, and a sigmoid output gate
 //! (llama.cpp `src/models/raon1.cpp` `build_mla_layer`, the HF
@@ -28,9 +28,26 @@
 //!
 //! and last, 11. `attn_output` into `out`.
 //!
+//! [`step`] runs one row. [`rows`] runs a pass of 1 to [`PASS_ROWS`] rows in
+//! position order — a verify's rows or a prompt chunk — through the same
+//! launches, each once over the pass's rows: the projections' m-column
+//! launches ([`super::rda::project_rows`]), the cache rows of every row
+//! appended before any attends, the absorb and a Q8_0 value projection over
+//! the rows' windows (`q8_0_gemv_heads_mcol`; a Q6_K one is `q6k_heads` a row
+//! at a time), the gather over tables built for [`PASS_ROWS`] rows, and the
+//! latent attention over the `m` query tokens, token `t` over keys
+//! `0 ..= pos + t`. Row `t` of each launch is the step's launch on row `t`
+//! bit for bit, and so is the attention's while the pass's live count stays
+//! at or under `SEGMENTS · seg_keys` (`crate::flash`): the split cuts every
+//! group at the fixed `seg_keys`-key span there. Past it a token whose group
+//! reaches a wider cut than its own step's sums its keys in another order: a
+//! float-order band, not a bit pin.
+//!
 //! What the file forces here: the NoPE extra part and the output gate; the
 //! widths are the header's ([`MlaDims::of`]).
 
+use super::rda::{RowsKit, kgemv_rows, project_rows};
+use super::state::PASS_ROWS;
 use crate::arch::hybrid::{Acts, GqaCx, Site};
 use crate::fault::FaultSink;
 use crate::flash::{FlashGeom, FlashInputs, FlashSplitArgs, partials_ms_len, partials_v_len};
@@ -38,8 +55,9 @@ use crate::latent::{LATENT, LatentExtraAppendArgs, LatentKernels, Rows};
 use crate::linear::out_gate::{OutGateArgs, OutGateKernels};
 use crate::model::{Q8_0GemvHeadsArgs, StepKernels};
 use crate::q6k_heads::{Q6kHeadsArgs, Q6kHeadsKernels};
+use crate::q8f32::Q8_0GemvHeadsMcolArgs;
 use crate::site::{self, Form, SiteTy};
-use crate::tensor::DeviceTensor;
+use crate::tensor::{DeviceTensor, Window, WindowMut};
 use crate::weights::{DevWeight, Weights};
 use crate::{Gpu, GpuError};
 use cuda_core::DeviceBuffer;
@@ -211,7 +229,9 @@ impl MlaSites {
 }
 
 /// The kernels every MLA layer launches beyond the `Gpu`'s own, and the
-/// extra part's gather tables (`[h·head_k + nope + j] → [h·row + j]`).
+/// extra part's gather tables for up to [`PASS_ROWS`] rows
+/// (`[(t·heads + h)·head_k + nope + j] → [(t·heads + h)·row + j]`; a pass of
+/// `m` rows reads the first `m·heads·extra` pairs).
 pub struct MlaKernels {
     step: StepKernels,
     latent: LatentKernels,
@@ -228,12 +248,12 @@ impl MlaKernels {
         let at = |v: usize| {
             u32::try_from(v).map_err(|_| GpuError::shape(WHAT, "a gather index past u32"))
         };
-        let mut src = Vec::with_capacity(d.heads * d.extra);
-        let mut dst = Vec::with_capacity(d.heads * d.extra);
-        for h in 0..d.heads {
+        let pairs = PASS_ROWS * d.heads * d.extra;
+        let (mut src, mut dst) = (Vec::with_capacity(pairs), Vec::with_capacity(pairs));
+        for head in 0..PASS_ROWS * d.heads {
             for j in 0..d.extra {
-                src.push(at(h * d.head_k() + d.nope + j)?);
-                dst.push(at(h * d.row() + j)?);
+                src.push(at(head * d.head_k() + d.nope + j)?);
+                dst.push(at(head * d.row() + j)?);
             }
         }
         let (ctx, stream) = (gpu.context(), gpu.stream());
@@ -252,14 +272,36 @@ impl MlaKernels {
 /// of `d.heads` heads over a cache of `ctx` rows.
 #[must_use]
 pub fn partials_lens(d: &MlaDims, ctx: usize) -> (usize, usize) {
-    (partials_v_len(d.heads, ctx), partials_ms_len(d.heads, ctx))
+    partials_lens_rows(d, ctx, 1)
 }
 
-/// The buffers one row of an MLA layer reads and writes: `x` the layer's
-/// input, `pos` the row's position and `n_keys` its live key count (`pos +
-/// 1`), the intermediates (each at least its width), the attention's
-/// partials ([`partials_lens`]), `out` the update, and the layer's cache
-/// (`[ctx][row]` f16).
+/// [`partials_lens`] for a pass of `m` rows.
+#[must_use]
+pub fn partials_lens_rows(d: &MlaDims, ctx: usize, m: usize) -> (usize, usize) {
+    let q_rows = m * d.heads;
+    (partials_v_len(q_rows, ctx), partials_ms_len(q_rows, ctx))
+}
+
+/// f32s of the stage an MLA layer's pass of up to [`PASS_ROWS`] rows writes
+/// (`rda::RowsKit`): the widest projection's outputs of every row.
+#[must_use]
+pub(crate) fn stage_len(d: &MlaDims) -> usize {
+    let widest = [
+        d.q_lora,
+        d.row(),
+        d.heads * d.v_head,
+        d.heads * d.head_k(),
+        d.embd,
+    ];
+    PASS_ROWS * widest.into_iter().max().unwrap_or(0)
+}
+
+/// The buffers a pass of `m` rows of an MLA layer reads and writes (one row
+/// at a step), each at least `m` rows of its width, token-major: `x` the
+/// layer's inputs, `pos` the rows' positions and `n_keys` their live key
+/// counts (`pos + 1` a row; the attention reads row `m − 1`'s), the
+/// intermediates, the attention's partials ([`partials_lens_rows`]), `out`
+/// the updates, and the layer's cache (`[ctx][row]` f16).
 pub(crate) struct MlaBufs<'a> {
     pub x: &'a DeviceBuffer<f32>,
     pub pos: &'a DeviceBuffer<u32>,
@@ -456,6 +498,159 @@ pub fn attend(
     )
 }
 
+/// [`attend`] over a pass of `m` rows, 1 to [`PASS_ROWS`] (module doc): `a`'s
+/// rows and `s`'s buffers each at least `m` rows of their widths, `a.pos`
+/// the rows' positions and `a.n_keys` their live counts; the cache rows at
+/// the positions written into `cache`, the gated heads of every row into `y`
+/// (`[m][heads·v_head]`). One row is [`attend`]; a count past [`PASS_ROWS`],
+/// or rows the gather's tables would read or write past, is refused by name.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "attend's six and the pass's row count, each named as attend names it (rust-quality R8)"
+)]
+pub fn attend_rows(
+    gpu: &Gpu,
+    k: &MlaKernels,
+    d: &MlaDims,
+    m: usize,
+    a: AttendIn<'_>,
+    s: AttnBufs<'_>,
+    cache: &mut DeviceTensor<u16>,
+    y: &mut DeviceBuffer<f32>,
+) -> Result<(), GpuError> {
+    if m == 1 {
+        return attend(gpu, k, d, a, s, cache, y);
+    }
+    let (hk, row, hl, hv) = (
+        d.heads * d.head_k(),
+        d.heads * d.row(),
+        d.heads * LATENT,
+        d.heads * d.v_head,
+    );
+    if !(2..=PASS_ROWS).contains(&m) || a.q.len() < m * hk || s.qabs.len() < m * row {
+        return Err(GpuError::shape(
+            WHAT,
+            format!(
+                "a pass of {m} rows (1 to {PASS_ROWS}) over q of {} and qabs of {}: the gather \
+                 reads {} and writes {}",
+                a.q.len(),
+                s.qabs.len(),
+                m * hk,
+                m * row
+            ),
+        ));
+    }
+    let stream = gpu.stream();
+    k.latent.enqueue_latent_extra_append(
+        stream,
+        LatentExtraAppendArgs {
+            rows: Rows {
+                x: a.kv,
+                stride: d.row(),
+                m,
+            },
+            off: 0,
+            e_off: LATENT,
+            extra: d.extra,
+            gain: a.kv_norm,
+            pos: a.pos,
+            eps: d.latent_eps,
+            fault: a.fault,
+            cache: &mut *cache,
+        },
+    )?;
+    let q8 = gpu.q8f32();
+    let (qs, dd) = a.k_b;
+    q8.enqueue_q8_0_gemv_heads_mcol(
+        stream,
+        Q8_0GemvHeadsMcolArgs {
+            qs,
+            d: dd,
+            x: a.q,
+            rows_per_head: LATENT,
+            x_head_stride: d.head_k(),
+            y_head_stride: d.row(),
+            y_off: d.extra,
+            m,
+            x_col_stride: hk,
+            y_col_stride: row,
+            y: &mut *s.qabs,
+        },
+    )?;
+    let pairs = m * d.heads * d.extra;
+    k.step
+        .enqueue_gather(stream, a.q, &k.src, &k.dst, pairs, s.qabs)?;
+    let n_keys = Window::<u32>::of(a.n_keys, 4 * (m - 1), 1)?;
+    gpu.flash().enqueue_flash_latent_split(
+        stream,
+        FlashSplitArgs {
+            inputs: FlashInputs {
+                q: s.qabs,
+                kv: cache,
+                n_keys_buf: &n_keys,
+                kq_scale: 1.0 / (d.head_k() as f32).sqrt(),
+                geom: FlashGeom {
+                    tokens: m,
+                    heads: d.heads,
+                    rope_dims: d.extra,
+                    latent_dims: LATENT,
+                },
+            },
+            part_v: s.part_v,
+            part_ms: s.part_ms,
+            y: &mut *s.att,
+        },
+    )?;
+    match a.v_b {
+        ValueW::Q6K(wv) => {
+            for t in 0..m {
+                let x = Window::<f32>::of(&*s.att, 4 * t * hl, hl)?;
+                let mut yv = WindowMut::<f32>::of_mut(&mut *s.av, 4 * t * hv, hv)?;
+                k.q6k.enqueue_q6k_heads(
+                    stream,
+                    Q6kHeadsArgs {
+                        w: wv,
+                        x: &x,
+                        k: LATENT,
+                        rows_per_head: d.v_head,
+                        x_head_stride: LATENT,
+                        y_head_stride: d.v_head,
+                        y_off: 0,
+                        y: &mut yv,
+                    },
+                )?;
+            }
+        }
+        ValueW::Q8_0(qs, dd) => q8.enqueue_q8_0_gemv_heads_mcol(
+            stream,
+            Q8_0GemvHeadsMcolArgs {
+                qs,
+                d: dd,
+                x: s.att,
+                rows_per_head: d.v_head,
+                x_head_stride: LATENT,
+                y_head_stride: d.v_head,
+                y_off: 0,
+                m,
+                x_col_stride: hl,
+                y_col_stride: hv,
+                y: &mut *s.av,
+            },
+        )?,
+    }
+    k.out_gate.enqueue_out_gate(
+        stream,
+        OutGateArgs {
+            attn: s.av,
+            gate: a.gate,
+            n_head: d.heads,
+            m,
+            fault: a.fault,
+            y,
+        },
+    )
+}
+
 /// Enqueue MLA layer `l` at one row on `b`'s buffers (module doc).
 pub(crate) fn step(
     cx: &GqaCx<'_>,
@@ -537,4 +732,387 @@ pub(crate) fn step(
         b.gated,
     )?;
     sites.out.project(cx, acts, l, b.gated, b.out)
+}
+
+/// Enqueue MLA layer `l` over a pass of `m` rows, 1 to [`PASS_ROWS`], in
+/// position order (module doc) on `b`'s buffers, each at least `m` rows of
+/// its width ([`MlaBufs`]), the projections' row-major outputs staged in
+/// `kit`. One row is [`step`]; a count past [`PASS_ROWS`] is refused by name.
+pub(crate) fn rows(
+    cx: &GqaCx<'_>,
+    k: &MlaKernels,
+    acts: &mut Acts,
+    (sites, d): (&MlaSites, &MlaDims),
+    (l, m): (usize, usize),
+    b: MlaBufs<'_>,
+    mut kit: RowsKit<'_>,
+) -> Result<(), GpuError> {
+    if m == 1 {
+        return step(cx, k, acts, (sites, d), l, b);
+    }
+    if !(2..=PASS_ROWS).contains(&m) {
+        return Err(GpuError::shape(
+            WHAT,
+            format!("layer {l}: a pass of {m} rows; a pass runs 1 to {PASS_ROWS}"),
+        ));
+    }
+    let (gpu, w) = (cx.gpu, cx.w);
+    let stream = gpu.stream();
+    let fault = gpu.layer_sink(l)?;
+    let [norm, q_a_norm, kv_a_norm] = &sites.vecs;
+    gpu.elem().enqueue_rms_norm(
+        stream,
+        b.x,
+        w.f32_buf(WHAT, norm)?,
+        d.rms_eps,
+        d.embd,
+        m,
+        b.xn,
+    )?;
+    let q8 = |t: &Site| t.ty().reads() == Form::Q8x128;
+    let input: [(&Site, usize, &mut DeviceBuffer<f32>); 3] = [
+        (&sites.q_a, d.q_lora, &mut *b.qa),
+        (&sites.kv_a, d.row(), &mut *b.kv),
+        (&sites.gate, d.heads * d.v_head, &mut *b.gate),
+    ];
+    let mut rest = Vec::with_capacity(3);
+    if input.iter().any(|(t, ..)| q8(t)) {
+        let act = acts.q8_1_at(WHAT, d.embd, m)?;
+        gpu.enqueue_quantize_q8_1_layer(b.xn, act, l)?;
+        for (t, n, y) in input {
+            if q8(t) {
+                kgemv_rows(cx, &mut kit, (t, n), act, l, y)?;
+            } else {
+                rest.push((t, n, y));
+            }
+        }
+    } else {
+        rest.extend(input);
+    }
+    for (t, n, y) in rest {
+        project_rows(cx, &mut kit, acts, (l, m), (t, n), b.xn, y)?;
+    }
+    gpu.elem().enqueue_rms_norm(
+        stream,
+        b.qa,
+        w.f32_buf(WHAT, q_a_norm)?,
+        d.latent_eps,
+        d.q_lora,
+        m,
+        b.qr,
+    )?;
+    let q_b = (&sites.q_b, d.heads * d.head_k());
+    project_rows(cx, &mut kit, acts, (l, m), q_b, b.qr, b.q)?;
+    attend_rows(
+        gpu,
+        k,
+        d,
+        m,
+        AttendIn {
+            kv: b.kv,
+            q: b.q,
+            gate: b.gate,
+            kv_norm: w.f32_buf(WHAT, kv_a_norm)?,
+            k_b: q8_planes(w, &sites.k_b)?,
+            v_b: value_w(w, &sites.v_b)?,
+            pos: b.pos,
+            n_keys: b.n_keys,
+            fault,
+        },
+        AttnBufs {
+            qabs: b.qabs,
+            att: b.att,
+            av: b.av,
+            part_v: b.part_v,
+            part_ms: b.part_ms,
+        },
+        b.cache,
+        b.gated,
+    )?;
+    let out = (&sites.out, d.embd);
+    project_rows(cx, &mut kit, acts, (l, m), out, b.gated, b.out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MlaBufs, MlaDims, MlaKernels, MlaSites, ValueHeads, partials_lens_rows, rows};
+    use crate::Gpu;
+    use crate::arch::hybrid::{Acts, GqaCx, Site};
+    use crate::arch::raon1::rda::tests::{Lcg, f32s, q6k, q8_0, resident, same};
+    use crate::arch::raon1::rda::{RowKernels, RowsKit, add_row_forms};
+    use crate::arch::raon1::state::PASS_ROWS;
+    use crate::flash_gqa::FlashGqaKernels;
+    use crate::gemm::Gemm32Kernels;
+    use crate::latent::LATENT;
+    use crate::linear::LinearKernels;
+    use crate::site::{KGemvKernels, SiteTy};
+    use crate::tensor::DeviceTensor;
+    use crate::weights::Weights;
+    use cuda_core::DeviceBuffer;
+    use gguf::quant::f32_to_f16_bits;
+    use model::arch::raon1::names;
+
+    /// The layer the names carry.
+    const L: usize = 3;
+    /// Raon's per-head widths at four heads, the model width two Q6_K
+    /// super-blocks.
+    const D: MlaDims = MlaDims {
+        embd: 512,
+        heads: 4,
+        q_lora: 576,
+        nope: 128,
+        extra: 64,
+        v_head: 128,
+        rms_eps: 1e-5,
+        latent_eps: 1e-6,
+    };
+    /// The pass's rows.
+    const M: usize = 7;
+    /// (cache rows, the pass's first position): the single-launch attention
+    /// and the split one.
+    const RUNS: [(usize, usize); 2] = [(64, 40), (1024, 300)];
+
+    /// One MLA layer's file tensors at [`D`]'s widths, resident, and its
+    /// sites: Raon's types (Q6_K `q_a`, `kv_a` and `v_b`, Q8_0 the rest).
+    fn layer(gpu: &Gpu) -> (Weights, MlaSites) {
+        let mut r = Lcg(0x006d_6c61);
+        let (e, h, hv) = (D.embd, D.heads, D.heads * D.v_head);
+        let gains = (0.5, 1.5);
+        let parts = [
+            f32s(&mut r, names::attn_norm(L), vec![e], gains),
+            q6k(&mut r, names::attn_q_a(L), vec![e, D.q_lora]),
+            f32s(&mut r, names::attn_q_a_norm(L), vec![D.q_lora], gains),
+            q6k(&mut r, names::attn_kv_a_mqa(L), vec![e, D.row()]),
+            f32s(&mut r, names::attn_kv_a_norm(L), vec![LATENT], gains),
+            q8_0(&mut r, names::attn_gate(L), vec![e, hv]),
+            q8_0(&mut r, names::attn_q_b(L), vec![D.q_lora, h * D.head_k()]),
+            q8_0(&mut r, names::attn_k_b(L), vec![D.nope, LATENT, h]),
+            q6k(&mut r, names::attn_v_b(L), vec![LATENT, D.v_head, h]),
+            q8_0(&mut r, names::attn_output(L), vec![hv, e]),
+        ];
+        let w = resident(gpu, &parts);
+        let site = |name: String, ty: SiteTy, k: usize| Site::new(name, ty, k);
+        let sites = MlaSites {
+            q_a: site(names::attn_q_a(L), SiteTy::Q6K, e),
+            kv_a: site(names::attn_kv_a_mqa(L), SiteTy::Q6K, e),
+            gate: site(names::attn_gate(L), SiteTy::Q8_0, e),
+            q_b: site(names::attn_q_b(L), SiteTy::Q8_0, D.q_lora),
+            out: site(names::attn_output(L), SiteTy::Q8_0, hv),
+            k_b: names::attn_k_b(L),
+            v_b: ValueHeads::Q6K(names::attn_v_b(L)),
+            vecs: [
+                names::attn_norm(L),
+                names::attn_q_a_norm(L),
+                names::attn_kv_a_norm(L),
+            ],
+        };
+        (w, sites)
+    }
+
+    /// The buffers of a pass of up to [`PASS_ROWS`] rows over a cache of
+    /// `ctx` rows, each its width times [`PASS_ROWS`]: the input, the
+    /// positions and live counts, [`MlaBufs`]' f32 buffers in its order from
+    /// `xn` to `out`, and the stage.
+    struct Bufs {
+        x: DeviceBuffer<f32>,
+        pos: DeviceBuffer<u32>,
+        n_keys: DeviceBuffer<u32>,
+        f: [DeviceBuffer<f32>; 13],
+        stage: DeviceBuffer<f32>,
+    }
+
+    impl Bufs {
+        fn new(gpu: &Gpu, ctx: usize) -> Bufs {
+            let s = gpu.stream();
+            let z = |n: usize| DeviceBuffer::<f32>::zeroed(s, n).expect("a buffer");
+            let u = || DeviceBuffer::<u32>::zeroed(s, PASS_ROWS).expect("a word row");
+            let (h, hv) = (D.heads, D.heads * D.v_head);
+            let (pv, pm) = partials_lens_rows(&D, ctx, PASS_ROWS);
+            let rows = [
+                D.embd,
+                D.q_lora,
+                D.q_lora,
+                D.row(),
+                hv,
+                h * D.head_k(),
+                h * D.row(),
+                h * LATENT,
+                hv,
+                hv,
+            ];
+            let [xn, qa, qr, kv, gate, q, qabs, att, av, gated] = rows.map(|n| z(PASS_ROWS * n));
+            Bufs {
+                x: z(PASS_ROWS * D.embd),
+                pos: u(),
+                n_keys: u(),
+                f: [
+                    xn,
+                    qa,
+                    qr,
+                    kv,
+                    gate,
+                    q,
+                    qabs,
+                    att,
+                    av,
+                    gated,
+                    z(pv),
+                    z(pm),
+                    z(PASS_ROWS * D.embd),
+                ],
+                stage: z(super::stage_len(&D)),
+            }
+        }
+    }
+
+    /// One MLA layer and everything a pass of it reads.
+    struct Rig<'g> {
+        gpu: &'g Gpu,
+        w: Weights,
+        sites: MlaSites,
+        mk: MlaKernels,
+        lin: LinearKernels,
+        rk: RowKernels,
+        kgemv: KGemvKernels,
+        g32: Gemm32Kernels,
+        flash: FlashGqaKernels,
+        acts: Acts,
+    }
+
+    impl Rig<'_> {
+        /// The first `n` rows of `xs` from position `p` as one pass on
+        /// `cache`: the rows' updates.
+        fn pass(
+            &mut self,
+            (b, cache): (&mut Bufs, &mut DeviceTensor<u16>),
+            (p, n): (usize, usize),
+            xs: &[f32],
+        ) -> Vec<f32> {
+            let s = self.gpu.stream();
+            let at = u32::try_from(p).expect("a u32 position");
+            let mut x = vec![0.0f32; PASS_ROWS * D.embd];
+            x[..n * D.embd].copy_from_slice(&xs[..n * D.embd]);
+            let pos: Vec<u32> = (at..).take(PASS_ROWS).collect();
+            let live: Vec<u32> = (at + 1..).take(PASS_ROWS).collect();
+            b.x.copy_from_host(s, &x).expect("the rows up");
+            b.pos.copy_from_host(s, &pos).expect("the positions up");
+            b.n_keys
+                .copy_from_host(s, &live)
+                .expect("the live counts up");
+            let cx = GqaCx {
+                what: "raon1 mla test",
+                gpu: self.gpu,
+                w: &self.w,
+                kgemv: &self.kgemv,
+                g32: &self.g32,
+                flash: &self.flash,
+                mma: false,
+                out_gate: None,
+                hidden: D.embd,
+                eps: D.rms_eps,
+                n_kv: 1,
+                ctx: cache.rows(),
+            };
+            let [
+                xn,
+                qa,
+                qr,
+                kv,
+                gate,
+                q,
+                qabs,
+                att,
+                av,
+                gated,
+                part_v,
+                part_ms,
+                out,
+            ] = &mut b.f;
+            let bufs = MlaBufs {
+                x: &b.x,
+                pos: &b.pos,
+                n_keys: &b.n_keys,
+                xn,
+                qa,
+                qr,
+                kv,
+                gate,
+                q,
+                qabs,
+                att,
+                av,
+                gated,
+                part_v,
+                part_ms,
+                out: &mut *out,
+                cache,
+            };
+            let kit = RowsKit {
+                linear: &self.lin,
+                rows: &self.rk,
+                stage: &mut b.stage,
+            };
+            let sd = (&self.sites, &D);
+            rows(&cx, &self.mk, &mut self.acts, sd, (L, n), bufs, kit).expect("the pass");
+            assert!(
+                self.gpu.fault().expect("the fault word").is_none(),
+                "a clean pass raises no fault"
+            );
+            out.to_host_vec(s).expect("the updates back")[..n * D.embd].to_vec()
+        }
+    }
+
+    /// A pass of rows is its rows run as steps, bit for bit — the updates
+    /// and every cache row — from a position past a filled cache prefix, on
+    /// a cache short enough for the single-launch attention and on one the
+    /// split attention cuts.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_mla_rows_are_steps() {
+        let gpu = Gpu::with_device(0).expect("a Gpu on device 0");
+        let (w, sites) = layer(&gpu);
+        let (s, ctx) = (gpu.stream(), gpu.context());
+        let mut acts = Acts::new(s, sites.sites().into_iter()).expect("the one-row forms");
+        add_row_forms(s, &mut acts, sites.sites().into_iter()).expect("the row forms");
+        let mut rig = Rig {
+            gpu: &gpu,
+            mk: MlaKernels::load(&gpu, &D).expect("the MLA kernels"),
+            lin: LinearKernels::load(ctx).expect("the linear kernels"),
+            rk: RowKernels::load(ctx).expect("the row kernels"),
+            kgemv: KGemvKernels::load(&gpu).expect("the K-quant gemvs"),
+            g32: Gemm32Kernels::load(ctx).expect("the F32 tile"),
+            flash: FlashGqaKernels::load(ctx).expect("the flash kernels"),
+            acts,
+            w,
+            sites,
+        };
+        let e = D.embd;
+        for (height, p0) in RUNS {
+            let mut r = Lcg(0x0070_6173 + p0 as u64);
+            let xs = r.fill(M * e, -1.0, 1.0);
+            let mut prefix: Vec<u16> = r
+                .fill(p0 * D.row(), -1.0, 1.0)
+                .into_iter()
+                .map(f32_to_f16_bits)
+                .collect();
+            prefix.resize(height * D.row(), 0);
+            let cache = || DeviceTensor::upload(s, &prefix, height, D.row()).expect("the cache");
+            let (mut c_steps, mut c_pass) = (cache(), cache());
+            let mut b = Bufs::new(&gpu, height);
+            let mut steps = Vec::with_capacity(M * e);
+            for t in 0..M {
+                steps.extend(rig.pass((&mut b, &mut c_steps), (p0 + t, 1), &xs[t * e..]));
+            }
+            let pass = rig.pass((&mut b, &mut c_pass), (p0, M), &xs);
+            assert!(
+                same(&pass, &steps, f32::to_bits),
+                "cache of {height} rows from {p0}: a pass of {M} rows is its rows as steps"
+            );
+            let held = |c: &DeviceTensor<u16>| c.buf().to_host_vec(s).expect("the cache back");
+            assert!(
+                same(&held(&c_pass), &held(&c_steps), u32::from),
+                "cache of {height} rows from {p0}: the pass writes the steps' cache rows"
+            );
+        }
+    }
 }

@@ -2,7 +2,10 @@
 //! this family's reading. What each layer holds is read off the description (an RDA layer's
 //! state and conv ring, a latent layer's plane of cached rows), and a machine that hangs an
 //! expert tier card is refused by name ([`PlaceError::Tier`]) until a body serves one. The
-//! family's own is the reading.
+//! family's own is the reading, and the lanes a verifying load's delta layers hold
+//! ([`VERIFY_LANES`]).
+
+use std::num::NonZeroUsize;
 
 use gguf::Split;
 
@@ -19,6 +22,10 @@ pub type PlanInputs = place_hybrid::PlanInputs<Hparams>;
 
 /// The engine the plan's refusals name.
 const ENGINE: &str = "Raon-1";
+
+/// The lanes each delta layer's state holds on a load that verifies a draft's rows: one a row of
+/// the widest verify ([`PlanInputs::with_lanes`]). The card body binds its own constant to it.
+pub const VERIFY_LANES: NonZeroUsize = NonZeroUsize::new(8).expect("eight lanes");
 
 impl PlanInputs {
     /// [`PlanInputs::describe`], then the file refused with every feature the engine does not run
@@ -47,7 +54,7 @@ mod tests {
     use runtime::stores::{delta_lane_bytes, recurrent_bytes};
 
     use super::super::hparams::tests::{keys, tensors};
-    use super::{KvLayout, PlaceError, PlanInputs};
+    use super::{KvLayout, PlaceError, PlanInputs, VERIFY_LANES};
     use crate::arch::synthetic::{V, header_shaped};
     use crate::placement::{KvBytes, PlacementError, PlanLevers, workstation};
 
@@ -97,6 +104,22 @@ mod tests {
             recurrent_bytes(4, 4, 16, d.conv as usize) + delta_lane_bytes(4, 16, 1),
             12_548
         );
+    }
+
+    /// A verifying load's delta layer holds [`VERIFY_LANES`] stamped lanes [derived from the
+    /// header's widths]: 12,548 B + 7 more lanes of 4 heads of 16 x 16 f32 (28,672 B) and their
+    /// stamps (28 B) = 41,248 B whatever the context; a latent layer's plane does not move. Mutant:
+    /// the layer's bytes not reading the lanes.
+    #[test]
+    fn a_verifying_load_holds_a_lane_a_row() {
+        let inputs = described("raon1-place-lanes").with_lanes(VERIFY_LANES);
+        let kv: &KvLayout = &inputs.kv;
+        for l in [0, 1, 3, 4] {
+            assert_eq!(kv.layer_bytes(l, 1), 41_248, "layer {l}");
+            assert_eq!(kv.layer_bytes(l, 1 << 20), 41_248, "layer {l}");
+        }
+        assert_eq!(kv.layer_bytes(2, 64), 5_120);
+        assert_eq!(kv.bytes(0..6, 64), 4 * 41_248 + 2 * 5_120);
     }
 
     /// The file is described whatever the coverage holds, and refused by the program's absence

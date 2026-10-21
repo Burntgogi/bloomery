@@ -1450,7 +1450,8 @@ mod tests {
     }
 
     /// Every family is the kernel table's dense row of one file type: a type
-    /// has a family exactly where the table names a dense entry for it, the
+    /// has a family exactly where the table names a dense entry for it (F16,
+    /// which loads widened to f32, is the f32 site of its widened rows), the
     /// family maps back to that type and is named by it in upper case, its
     /// K-quant GEMM is the one the table names for the type, and it is a
     /// `kgemv` exactly where it reads the q8_1 rows of 128 values.
@@ -1465,6 +1466,15 @@ mod tests {
         ];
         for ty in gguf::QROWS.iter().map(|r| r.ty).chain(own) {
             let family = SiteTy::of_ggml(ty);
+            if ty == GgmlType::F16 {
+                assert_eq!(
+                    family,
+                    Some(SiteTy::F32),
+                    "{ty}: the f32 site of its widened rows"
+                );
+                assert_eq!(kernels::dense(ty), None, "{ty}");
+                continue;
+            }
             assert_eq!(family.is_some(), kernels::dense(ty).is_some(), "{ty}");
             if let Some(s) = family {
                 assert_eq!(s.ggml(), ty, "{s}");

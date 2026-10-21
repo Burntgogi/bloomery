@@ -33,6 +33,9 @@ pub mod minimaxm3;
 /// The qwen3moe family's Qwen3.8 session pieces: the body lives in the gpu
 /// crate's own qwen3moe arch, so they need no feature of their own.
 pub mod qwen3moe;
+/// Raon-1-mini's session pieces: the body lives in the gpu crate's own raon1
+/// arch, so they need no feature of their own.
+pub mod raon1;
 #[cfg(feature = "solar2")]
 pub mod solar2;
 

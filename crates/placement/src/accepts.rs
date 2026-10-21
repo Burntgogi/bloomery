@@ -395,7 +395,7 @@ mod tests {
     use super::*;
     use crate::placement::{ModelTensor, ModelTensors, Role};
 
-    const PROGRAMS: [Program; 10] = [
+    const PROGRAMS: [Program; 11] = [
         Program::Deepseek41Chain,
         Program::Qwen3moeBody,
         Program::Qwen35Body,
@@ -526,8 +526,16 @@ mod tests {
             panic!("a leg rule");
         };
         for ty in types() {
-            assert_eq!((arms.gate_up)(ty), kernels::card_gate_up_runs(ty), "{ty} gate·up");
-            assert_eq!(gate_up(ty).is_some(), (arms.gate_up)(ty), "{ty} gate·up rule");
+            assert_eq!(
+                (arms.gate_up)(ty),
+                kernels::card_gate_up_runs(ty),
+                "{ty} gate·up"
+            );
+            assert_eq!(
+                gate_up(ty).is_some(),
+                (arms.gate_up)(ty),
+                "{ty} gate·up rule"
+            );
             assert_eq!(
                 (arms.down)(ty),
                 kernels::card_down_runs(ty) || ty == GgmlType::Q5_0,

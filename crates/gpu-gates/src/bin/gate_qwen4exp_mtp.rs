@@ -345,7 +345,7 @@ mod gate {
         let (path, from) = draft_file(levers.mtp_draft(), target);
         let tier = Tier::from_env()?;
         if tier == Tier::Fixture {
-            if from == DraftFrom::Family {
+            if matches!(from, DraftFrom::Family(_)) {
                 return Err(format!(
                     "the fixture tier found no shared draft beside {} and would open the real one at \
                      {}",

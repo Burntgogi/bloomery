@@ -1,6 +1,7 @@
 //! A DSpark draft's geometry ([`DsparkShape`]): what the draft file says about
 //! its block, the target layers it reads, its vocabulary against the target's,
-//! its mask token and its attention window. Every field is the file's data,
+//! its mask token, its attention window and its head ([`HeadKind`]). Every
+//! field is the file's data,
 //! read once at load by the file's reader; no family's value is a constant in
 //! code. The card-side owner that runs a draft of this shape is
 //! `bloomery_gpu::dspark`.
@@ -32,10 +33,25 @@ pub struct DsparkShape {
     /// How far back the draft's attention reads its context ring: `None` is
     /// the whole context.
     pub window: Option<usize>,
-    /// The Markov head's rank.
-    pub markov_rank: usize,
-    /// Whether the file carries a confidence head.
-    pub confidence: bool,
+    /// How the block's rows become ids.
+    pub head: HeadKind,
+}
+
+/// What follows the head's projection: how a block's rows become ids.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeadKind {
+    /// V4.1's Markov head: each row's logits take a bigram correction of
+    /// the id the row before took, `markov_w2[v] · markov_w1[prev]` over
+    /// `rank` values, and the row's argmax is its id (serial over the rows).
+    /// `confidence` says the file carries a confidence head.
+    Markov { rank: usize, confidence: bool },
+    /// DFlash2's selector: every row after the anchor keeps the `top_k` ids
+    /// its logits rank highest and scores each against each id the row
+    /// before kept through factors of `rank` values
+    /// ([`crate::selector`]); a greedy walk takes one id a row. Row 0 is the
+    /// anchor and drafts nothing, and the draft's attention is non-causal
+    /// over the block, so a block always runs whole.
+    Selector { rank: usize, top_k: usize },
 }
 
 /// The ids a draft's head scores.
@@ -59,8 +75,12 @@ pub enum DsparkError {
     Block(usize),
     /// No tap, or taps not strictly rising.
     Taps(Vec<usize>),
-    /// A width of 0 (hidden or rank).
+    /// A width of 0 (hidden, rank or top-k).
     Zero(&'static str),
+    /// A selector head over a shape that cannot host it.
+    Selector(&'static str),
+    /// A selector keeping more ids than the head scores.
+    TopK { top_k: usize, rows: usize },
     /// A reduced map whose id `index` is `id`, past the target's `n_target`
     /// ids, or a repeat of an earlier one.
     Map {
@@ -85,6 +105,11 @@ impl fmt::Display for DsparkError {
             ),
             DsparkError::Taps(t) => write!(f, "dspark: taps {t:?}: at least one, strictly rising"),
             DsparkError::Zero(what) => write!(f, "dspark: a {what} of 0"),
+            DsparkError::Selector(why) => write!(f, "dspark: a selector head {why}"),
+            DsparkError::TopK { top_k, rows } => write!(
+                f,
+                "dspark: a selector keeping {top_k} ids of a head that scores {rows}"
+            ),
             DsparkError::Map { index, id, why } => {
                 write!(
                     f,
@@ -153,9 +178,19 @@ impl DsparkShape {
         self.ids_per_block().min(verify_rows.saturating_sub(1))
     }
 
-    /// The block rows a proposal of `width` ids runs.
+    /// The block rows a proposal of `width` ids runs: a selector's is the
+    /// whole block, its rows attend to one another.
     pub fn rows(&self, width: usize) -> usize {
-        if self.row0_drafts { width } else { width + 1 }
+        match self.head {
+            HeadKind::Selector { .. } => self.block,
+            HeadKind::Markov { .. } if self.row0_drafts => width,
+            HeadKind::Markov { .. } => width + 1,
+        }
+    }
+
+    /// The block row of a proposal's first id.
+    pub fn first_row(&self) -> usize {
+        usize::from(!self.row0_drafts)
     }
 
     /// Every field's own check, a named error per field.
@@ -169,13 +204,38 @@ impl DsparkShape {
         if self.hidden == 0 {
             return Err(DsparkError::Zero("hidden width"));
         }
-        if self.markov_rank == 0 {
-            return Err(DsparkError::Zero("Markov rank"));
+        let n_target = self.vocab.n_target();
+        match self.head {
+            HeadKind::Markov { rank: 0, .. } => return Err(DsparkError::Zero("Markov rank")),
+            HeadKind::Markov { .. } => {}
+            HeadKind::Selector { rank: 0, .. } => {
+                return Err(DsparkError::Zero("selector rank"));
+            }
+            HeadKind::Selector { top_k: 0, .. } => {
+                return Err(DsparkError::Zero("selector top-k"));
+            }
+            HeadKind::Selector { top_k, .. } => {
+                if self.row0_drafts {
+                    return Err(DsparkError::Selector(
+                        "drafts from row 1: row 0 is the anchor",
+                    ));
+                }
+                if matches!(self.vocab, DraftVocab::Reduced { .. }) {
+                    return Err(DsparkError::Selector(
+                        "scores target ids: its vocabulary is the target's",
+                    ));
+                }
+                if top_k > self.vocab.rows() {
+                    return Err(DsparkError::TopK {
+                        top_k,
+                        rows: self.vocab.rows(),
+                    });
+                }
+            }
         }
         if self.window == Some(0) {
             return Err(DsparkError::Window);
         }
-        let n_target = self.vocab.n_target();
         if usize::try_from(self.mask_id).map_or(true, |m| m >= n_target) {
             return Err(DsparkError::Mask {
                 id: self.mask_id,
@@ -208,7 +268,7 @@ impl DsparkShape {
 
 #[cfg(test)]
 mod tests {
-    use super::{DraftVocab, DsparkError, DsparkShape};
+    use super::{DraftVocab, DsparkError, DsparkShape, HeadKind};
 
     fn shape(block: usize, vocab: DraftVocab) -> DsparkShape {
         DsparkShape {
@@ -219,8 +279,20 @@ mod tests {
             vocab,
             mask_id: 5,
             window: Some(2048),
-            markov_rank: 256,
-            confidence: true,
+            head: HeadKind::Markov {
+                rank: 256,
+                confidence: true,
+            },
+        }
+    }
+
+    /// DFlash2's geometry: a block of 8 over the target's ids, the selector
+    /// head, row 0 the anchor.
+    fn selector_shape(top_k: usize, vocab: DraftVocab) -> DsparkShape {
+        DsparkShape {
+            row0_drafts: false,
+            head: HeadKind::Selector { rank: 256, top_k },
+            ..shape(8, vocab)
         }
     }
 
@@ -313,5 +385,64 @@ mod tests {
         let mut window = ok;
         window.window = Some(0);
         assert_eq!(window.check(), Err(DsparkError::Window));
+    }
+
+    /// A selector runs the whole block whatever the proposal's width and
+    /// drafts from row 1; a Markov block runs one row per id (plus the
+    /// anchor when row 0 drafts nothing).
+    #[test]
+    fn a_selector_block_runs_whole_and_drafts_from_row_one() {
+        let sel = selector_shape(16, DraftVocab::Full { n: 64 });
+        assert_eq!(sel.check(), Ok(()));
+        assert_eq!(sel.ids_per_block(), 7);
+        assert_eq!(sel.width(8), 7);
+        assert_eq!(sel.width(4), 3);
+        for width in 1..=7 {
+            assert_eq!(sel.rows(width), 8, "width {width}");
+        }
+        assert_eq!(sel.first_row(), 1);
+        let mut markov = shape(8, DraftVocab::Full { n: 64 });
+        markov.row0_drafts = false;
+        assert_eq!((markov.rows(3), markov.first_row()), (4, 1));
+        markov.row0_drafts = true;
+        assert_eq!((markov.rows(3), markov.first_row()), (3, 0));
+    }
+
+    /// Each selector field is refused by name: a width of 0, a row 0 that
+    /// drafts, a reduced vocabulary, a top-k past the head's ids.
+    #[test]
+    fn a_selector_shape_is_checked_by_name() {
+        let full = DraftVocab::Full { n: 64 };
+        let mut rank = selector_shape(16, full.clone());
+        rank.head = HeadKind::Selector { rank: 0, top_k: 16 };
+        assert_eq!(rank.check(), Err(DsparkError::Zero("selector rank")));
+        assert_eq!(
+            selector_shape(0, full.clone()).check(),
+            Err(DsparkError::Zero("selector top-k"))
+        );
+        let mut row0 = selector_shape(16, full.clone());
+        row0.row0_drafts = true;
+        assert!(matches!(row0.check(), Err(DsparkError::Selector(_))));
+        let reduced = selector_shape(
+            2,
+            DraftVocab::Reduced {
+                to_target: vec![0, 7, 3],
+                n_target: 64,
+            },
+        );
+        assert!(matches!(reduced.check(), Err(DsparkError::Selector(_))));
+        assert_eq!(
+            selector_shape(65, full).check(),
+            Err(DsparkError::TopK {
+                top_k: 65,
+                rows: 64
+            })
+        );
+        let mut markov = shape(8, DraftVocab::Full { n: 64 });
+        markov.head = HeadKind::Markov {
+            rank: 0,
+            confidence: false,
+        };
+        assert_eq!(markov.check(), Err(DsparkError::Zero("Markov rank")));
     }
 }

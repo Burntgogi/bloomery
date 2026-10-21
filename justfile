@@ -2135,8 +2135,9 @@ gate-ds41-bind:
 gate-q38-serve-rules:
     ./tools/box.sh 'bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features deepseek41,gemma-embedding2,hf --lib -- serve_client:: && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features deepseek41,gemma-embedding2,hf --bin bloomery-serve-qwen38'
 
-# The shared draft's prompt boundaries and per-slot costs in the other serve targets that include it.
-# Host only, no card or gate lock.
+# The shared draft's prompt boundaries and per-slot costs in the other serve targets that include it, and the Raon seat's
+# unset draft rule: a request drafts while its think span is open, up to the tag that closes it. Host only, no card or
+# gate lock.
 [group('host')]
 gate-serve-draft-rules:
     ./tools/box.sh 'bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features glm5next,clef,mimo2,solar2,minimaxm3,gemma-embedding2,hf --bin bloomery-serve --bin bloomery-serve-ds41'
@@ -3447,11 +3448,24 @@ dump-ref-raon1:
 # Raon-1-mini end-to-end gate (gate_raon1_e2e's doc): the whole step on one card (RDA and gated latent layers, Raon_mHC's four streams,
 # the dense and routed SiTU blocks), one prompt id a step, against the vendor branch's sets (refset family lcpp-raon1, `just
 # dump-ref-raon1`): on each of the English, Korean and Rust sets the argmax after the prompt and the 32-token greedy continuation id for
-# id. The file has no fixture yet, so the gate runs in the real tier only.
+# id; then, in the verifying load, the rows pass, verifies, commits and taps against the steps bit for bit, and with the DFlash2 draft
+# beside the file the drafted greedy run is the plain one id for id. The file has no fixture yet, so the gate runs in the real tier
+# only.
 gate-gpu-raon1-e2e:
     BLOOMERY_MODEL=raon1 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-raon1-e2e && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_raon1_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_raon1_e2e'
 
 # --- end raon-body ---
+
+# --- dfl-wire (Raon-1's DFlash2 draft) -----------------------------------------------------------------------------------------------
+
+# Raon-1's DFlash2 draft on one card (gate_raon1_dflash's doc): the draft file beside the Q4_K_M target loads; V4.1's DSpark draft (the
+# deepseek41 profile's DSPARK_MODEL, read in a shell of its own so the raon1 profile stays the command's) is refused by name; and on set
+# a the first block after the prompt, fed the vendor's own taps, proposes the host oracle's 7 ids. The target model is not loaded: the
+# draft borrows its file's output and embedding rows. The file has no fixture yet, so the gate runs in the real tier only.
+gate-gpu-raon1-dflash:
+    BLOOMERY_MODEL=raon1 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-raon1-dflash && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_raon1_dflash && __v=$(env -u BLOOMERY_REF_MODEL_PROFILE -u BLOOMERY_REF_MODEL -u BLOOMERY_DSPARK_MODEL BLOOMERY_MODEL=deepseek41 bash -c ". tools/ref/ref-paths.sh && dspark_model") && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_raon1_dflash --v41-draft "$__v"'
+
+# --- end dfl-wire ---
 
 # --- raon-attn (Raon-1-mini attention layers) ------------------------------------------------------------------------------------------
 

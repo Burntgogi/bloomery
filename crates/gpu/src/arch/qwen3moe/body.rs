@@ -1281,14 +1281,15 @@ mod tests {
     /// A dense entry the qwen3moe body runs is the launch family of its file
     /// type: [`qwen3moe_dense`] maps the type to the entry,
     /// `SiteTy::of_entry` to the family `site.rs` names, and `SiteTy::ggml`
-    /// back. A type the owner does not return has no site launch, unless the
-    /// table row reads an activation the arena does not carry (Q5_0).
+    /// back. A type the owner does not return has no site launch (Q4_0 has no
+    /// table row), unless the table row reads an activation the arena does not
+    /// carry (Q5_0).
     #[test]
     fn a_dense_entry_is_the_launch_family_of_its_file_type() {
         let mut named = 0;
         for ty in [
             GgmlType::F32,
-            GgmlType::F16,
+            GgmlType::Q4_0,
             GgmlType::BF16,
             GgmlType::Q2_K,
             GgmlType::Q3_K,

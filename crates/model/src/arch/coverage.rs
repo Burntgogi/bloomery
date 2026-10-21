@@ -16,7 +16,9 @@
 //! against the whole tree: a need any program's row covers, and a tensor type
 //! any program's pin reads, is not an item; the program itself is one.
 
-use bloomery_placement::accepts::{BOLT_LEG, embed_of_widened, head_of_widened, qwen3moe_dense};
+use bloomery_placement::accepts::{
+    BOLT_LEG, embed_of_widened, head_of_widened, qwen3moe_dense, resident_down_runs,
+};
 pub use bloomery_placement::accepts::{Program, program_of, qwen35_down, qwen35_gate_up};
 pub use bloomery_placement::kernels::{DownEntry, GateUpEntry, SiteEntry};
 use gguf::GgmlType;
@@ -402,8 +404,9 @@ pub const AVAILABLE: &[Available] = &[
             Program::Glm5nextBody,
             Program::Mimo2Body,
             Program::Solar2Body,
+            Program::Raon1Body,
         ],
-        at: "models/src/shape.rs ROUTERS, the BiasedSigmoid body (gpu-deepseek41 router: glm5next at 288 experts, mimo2 at 256, solar2 at 320)",
+        at: "models/src/shape.rs ROUTERS, the BiasedSigmoid body (gpu-deepseek41 router: glm5next at 288 experts, mimo2 at 256, solar2 at 320; gpu/src/arch/raon1/ffn.rs sigmoid_128_6: raon1 at 128)",
         runs: |n| routes(n, &[RouterBody::BiasedSigmoid]),
     },
     Available {
@@ -709,7 +712,137 @@ pub const AVAILABLE: &[Available] = &[
         at: "gpu/src/site.rs gemm (output); gpu-gemma-embedding2/src/pass.rs mean",
         runs: |n| matches!(n, Need::Pooled { proj } if matches!(proj.as_slice(), [768] | [3072, 768])),
     },
+    Available {
+        programs: &[Program::Raon1Body],
+        at: "gpu/src/arch/raon1/rda.rs (the common KDA mixer, linear/mixer_kda.rs, with the write gate \
+             linear/write_gate.rs: HEAD, CONV_TAPS, a bounded sigmoid decay)",
+        runs: |n| {
+            matches!(
+                n,
+                Need::DeltaRule {
+                    kind: DeltaKind::Rda {
+                        gate: KdaGate::Sigmoid { lower_bound },
+                    },
+                    k_heads,
+                    v_heads,
+                    d: 128,
+                    conv: 4,
+                } if k_heads == v_heads && *k_heads > 0 && *lower_bound < 0.0
+            )
+        },
+    },
+    Available {
+        programs: &[Program::Raon1Body],
+        at: "gpu/src/arch/raon1/mla.rs (the absorbed heads over gpu/src/latent.rs LATENT, \
+             latent_extra_rms_append)",
+        runs: |n| {
+            matches!(
+                n,
+                Need::Latent {
+                    latent: 512,
+                    rope: 0,
+                    up: LatentUp::Absorbed { qk: 192, v: 128 }
+                }
+            )
+        },
+    },
+    Available {
+        programs: &[Program::Raon1Body],
+        at: "gpu/src/latent.rs latent_extra_rms_append (the extra values first, raw, at most 128)",
+        runs: |n| matches!(n, Need::LatentPe { width } if (1..=128).contains(width)),
+    },
+    Available {
+        programs: &[Program::Raon1Body],
+        at: "gpu/src/arch/raon1/mla.rs (attn_gate, then gpu/src/linear/out_gate.rs)",
+        runs: |n| matches!(n, Need::LatentOutGate),
+    },
+    Available {
+        programs: &[Program::Raon1Body],
+        at: "gpu/src/arch/raon1/ffn.rs Glu (the gate and up sites, gpu/src/elem.rs enqueue_situ, the \
+             down site)",
+        runs: |n| matches!(n, Need::Situ { ff } if ff.is_multiple_of(32)),
+    },
+    Available {
+        programs: &[Program::Raon1Body],
+        at: "gpu/src/arch/raon1/ffn.rs (the card leg's gate·up `_sel` under kquant::Act::Situ, \
+             SITU_LINEAR_BETA)",
+        runs: |n| {
+            matches!(
+                n,
+                Need::ExpertAct {
+                    shared: false,
+                    act
+                } if situ_runs(act)
+            )
+        },
+    },
+    Available {
+        programs: &[Program::Raon1Body],
+        at: "gpu/src/arch/raon1/ffn.rs Routed.shared (the shared expert's Glu block, added after \
+             the routed sum)",
+        runs: |n| {
+            matches!(
+                n,
+                Need::Shared {
+                    ff,
+                    sigmoid_gate: false,
+                } if ff.is_multiple_of(32)
+            )
+        },
+    },
+    Available {
+        programs: &[Program::Raon1Body],
+        at: "gpu/src/arch/raon1/ffn.rs Routed.shared (gpu/src/elem.rs enqueue_situ between the \
+             shared expert's gate·up and down sites, SITU_LINEAR_BETA)",
+        runs: |n| {
+            matches!(
+                n,
+                Need::ExpertAct {
+                    shared: true,
+                    act
+                } if situ_runs(act)
+            )
+        },
+    },
+    Available {
+        programs: &[Program::Raon1Body],
+        at: "gpu/src/arch/raon1/mhc.rs STREAMS (raon_hc_route, raon_hc_fold, raon_hc_post, raon_hc_mean)",
+        runs: |n| {
+            matches!(
+                n,
+                Need::HcChart {
+                    streams: 4,
+                    collapse: Collapse::Mean
+                }
+            )
+        },
+    },
+    Available {
+        programs: &[Program::Raon1Body],
+        at: "gpu/src/arch/raon1/body.rs Mixer::Rda (the state, the stamp and the conv ring, one lane)",
+        runs: |n| matches!(n, Need::RecurrentState),
+    },
+    Available {
+        programs: &[Program::Raon1Body],
+        at: "gpu/src/arch/raon1/body.rs Mixer (a delta or a latent mixer per layer's kind)",
+        runs: |n| matches!(n, Need::MixedTrunk),
+    },
 ];
+
+/// The `value_beta` of the SiTU rule the device runs (`gpu/src/kquant/act.rs`
+/// `SITU_LINEAR_BETA`): the one value the references' files carry.
+const SITU_VALUE_BETA: f32 = 25.0;
+
+/// Whether the device runs `act`: SiTU at a finite positive gate beta and the
+/// one value beta ([`SITU_VALUE_BETA`]), the pair `Act::code` of the card's
+/// gate·up kernels takes.
+fn situ_runs(act: &models::Act) -> bool {
+    matches!(
+        act,
+        models::Act::Situ { gate_beta, value_beta }
+            if gate_beta.is_finite() && *gate_beta > 0.0 && value_beta.to_bits() == SITU_VALUE_BETA.to_bits()
+    )
+}
 
 /// Whether the K192 flash row ([`gqa_row_v`] at head 192, value 128) takes
 /// `group` query heads a key head, with the window, sinks and value scale
@@ -1170,6 +1303,61 @@ const TYPE_PINS: &[TypePin] = &[
         what: "output projection (the encoder reads q8_0)",
         reads: &[GgmlType::Q8_0],
     },
+    TypePin {
+        programs: &[Program::Raon1Body],
+        role: Role::Attention,
+        matrices: true,
+        names: None,
+        what: "attention and delta-rule matrices (the body reads q3_K, q4_K, q5_K, q6_K and q8_0 \
+               sites and the f16 rows it widens)",
+        reads: RAON1_PROJ,
+    },
+    TypePin {
+        programs: &[Program::Raon1Body],
+        role: Role::DenseFfn,
+        matrices: true,
+        names: None,
+        what: "dense FFN (the body reads q4_K, q5_K, q6_K, q8_0 and q5_0)",
+        reads: RAON1_FFN,
+    },
+    TypePin {
+        programs: &[Program::Raon1Body],
+        role: Role::SharedExpert,
+        matrices: true,
+        names: None,
+        what: "shared expert (the body reads q4_K, q5_K, q6_K, q8_0 and q5_0)",
+        reads: RAON1_FFN,
+    },
+    TypePin {
+        programs: &[Program::Raon1Body],
+        role: Role::HyperConnection,
+        matrices: true,
+        names: None,
+        what: "hyper-connection fn (the body reads the f16 rows it widens to f32)",
+        reads: &[GgmlType::F16],
+    },
+];
+
+/// The types a raon1 attention or delta-rule matrix reads: the sites'
+/// (`gpu/src/arch/raon1/{rda,mla}.rs` `DENSE`) and the f16 rows `Weights::load`
+/// widens (the delta layers' `ssm_beta`, `ssm_rda`, `ssm_f_a` and `ssm_f_b`).
+const RAON1_PROJ: &[GgmlType] = &[
+    GgmlType::Q3_K,
+    GgmlType::Q4_K,
+    GgmlType::Q5_K,
+    GgmlType::Q6_K,
+    GgmlType::Q8_0,
+    GgmlType::F16,
+];
+
+/// The types a raon1 feed-forward site reads (`gpu/src/arch/raon1/body.rs`
+/// `FFN_TYPES`, each a launch of `gpu/src/site.rs`).
+const RAON1_FFN: &[GgmlType] = &[
+    GgmlType::Q4_K,
+    GgmlType::Q5_K,
+    GgmlType::Q6_K,
+    GgmlType::Q8_0,
+    GgmlType::Q5_0,
 ];
 
 /// A tensor family whose type a program pins by the card kernel table's
@@ -1301,6 +1489,38 @@ const ROW_PINS: &[RowPin] = &[
         names: Some(routed_down),
         what: "routed experts down (the body reads q4_K, q5_K and q6_K)",
         row: |ty| qwen35_down(ty).is_some(),
+    },
+    RowPin {
+        program: Program::Raon1Body,
+        role: Role::Head,
+        matrices: true,
+        names: None,
+        what: "output head (the types head_of_widened names)",
+        row: |ty| head_of_widened(ty).is_some(),
+    },
+    RowPin {
+        program: Program::Raon1Body,
+        role: Role::TokenEmbedding,
+        matrices: true,
+        names: None,
+        what: "token embedding (the card's rows: the types embed_of_widened names)",
+        row: |ty| embed_of_widened(ty).is_some(),
+    },
+    RowPin {
+        program: Program::Raon1Body,
+        role: Role::RoutedExperts,
+        matrices: true,
+        names: Some(routed_gate_up),
+        what: "routed experts gate and up (the card leg's types: kernels::card_gate_up_runs)",
+        row: crate::placement::kernels::card_gate_up_runs,
+    },
+    RowPin {
+        program: Program::Raon1Body,
+        role: Role::RoutedExperts,
+        matrices: true,
+        names: Some(routed_down),
+        what: "routed experts down (the card leg's types and q5_0: accepts::resident_down_runs)",
+        row: resident_down_runs,
     },
 ];
 
@@ -1528,7 +1748,7 @@ pub fn check_with(
                 // pins' types: a part of another type is one of their items,
                 // by name and part (the default expert rule's card formats
                 // would pass q3_K and q6_K gate·up to the load's refusal).
-                Some(Program::Qwen3moeBody | Program::Qwen35Body) => {}
+                Some(Program::Qwen3moeBody | Program::Qwen35Body | Program::Raon1Body) => {}
                 // These bodies are dense: a routed stack is an item.
                 Some(Program::NemotronHBody | Program::GemmaEmbedding2Body) => {
                     at(t.layer, Need::RoutedFormat(t.ty));
@@ -1970,6 +2190,61 @@ mod tests {
                         );
                     }
                 }
+            }
+        }
+    }
+
+    /// The raon1 body reads routed stacks by part: a gate and an up of the common leg's gate·up
+    /// types (q4_K, q5_K), a down of its down types or q5_0 (the packed layout); a q8_0 or q6_K gate
+    /// and up and a q6_K down are items by name and part. Mutant: `resident_down_runs` without its
+    /// q5_0 arm.
+    #[test]
+    fn the_raon1_body_reads_routed_stacks_by_part() {
+        let item = |name: &str, ty: GgmlType| {
+            items(Program::Raon1Body, &matrix(name, Role::RoutedExperts, ty))
+        };
+        for name in ["ffn_gate_exps.weight", "ffn_up_exps.weight"] {
+            for ty in [GgmlType::Q4_K, GgmlType::Q5_K] {
+                assert_eq!(item(name, ty), Vec::<String>::new(), "{name} {ty}");
+            }
+            for ty in [GgmlType::Q8_0, GgmlType::Q6_K, GgmlType::Q5_0] {
+                assert_eq!(item(name, ty).len(), 1, "{name} {ty}: {:?}", item(name, ty));
+            }
+        }
+        for ty in [
+            GgmlType::Q4_K,
+            GgmlType::Q5_K,
+            GgmlType::Q8_0,
+            GgmlType::Q5_0,
+        ] {
+            assert_eq!(
+                item("ffn_down_exps.weight", ty),
+                Vec::<String>::new(),
+                "down {ty}"
+            );
+        }
+        assert_eq!(item("ffn_down_exps.weight", GgmlType::Q6_K).len(), 1);
+    }
+
+    /// The device runs SiTU at one value beta and a finite positive gate beta: the raon1 rows
+    /// cover the file's pair and no other. Mutant: the value beta of the row at another value.
+    #[test]
+    fn the_raon1_situ_rows_run_the_one_value_beta() {
+        use super::AVAILABLE;
+        let covered = |need: &Need| {
+            AVAILABLE
+                .iter()
+                .any(|a| a.programs.contains(&Program::Raon1Body) && (a.runs)(need))
+        };
+        let situ = |gate_beta: f32, value_beta: f32| models::Act::Situ {
+            gate_beta,
+            value_beta,
+        };
+        for shared in [false, true] {
+            let need = |act| Need::ExpertAct { shared, act };
+            assert!(covered(&need(situ(4.0, 25.0))), "shared {shared}");
+            for (g, v) in [(4.0, 20.0), (0.0, 25.0), (-1.0, 25.0), (f32::NAN, 25.0)] {
+                assert!(!covered(&need(situ(g, v))), "shared {shared} {g} {v}");
             }
         }
     }

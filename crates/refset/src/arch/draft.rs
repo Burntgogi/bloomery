@@ -1,6 +1,7 @@
-//! The MTP draft file a family keeps beside its target: the one table of
-//! such files ([`beside_drafts`]) and the rules that pick the file a run
-//! opens ([`BesideDraft::pick`], [`BesideDraft::pick_for`]).
+//! The draft file a family keeps beside its target (an MTP head, or a block
+//! draft): the one table of such files ([`beside_drafts`]) and the rules that
+//! pick the file a run opens ([`BesideDraft::pick`], [`BesideDraft::pick_for`]),
+//! the row's lever first.
 //!
 //! A family whose draft is a file of its own, not a part of the target (GLM's
 //! NextN block is inside the target's file, so it has no row), is one
@@ -30,41 +31,48 @@ use std::path::{Path, PathBuf};
 use super::mimo2;
 use super::qwen4exp;
 
-/// Where the MTP draft file a run opens came from ([`BesideDraft::pick`]).
+/// The lever the MTP rows name their draft file by.
+pub const MTP_LEVER: &str = "BLOOMERY_MTP_DRAFT";
+
+/// Where the draft file a run opens came from ([`BesideDraft::pick`]); the
+/// lever named is the row's ([`BesideDraft::lever`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DraftFrom {
-    /// `BLOOMERY_MTP_DRAFT`.
-    Lever,
+    /// The row's lever.
+    Lever(&'static str),
     /// The file of the row's draft name in the target's directory, or in the
     /// directory the target's symlinks resolve to.
     Beside,
-    /// The row's path itself: the lever unset and no file of its name beside
-    /// the target.
-    Family,
+    /// The row's path itself: the row's lever unset and no file of its name
+    /// beside the target.
+    Family(&'static str),
 }
 
 impl DraftFrom {
     /// Where the file came from, as an error about opening it says.
     #[must_use]
-    pub fn describe(self) -> &'static str {
+    pub fn describe(self) -> String {
         match self {
-            DraftFrom::Lever => "BLOOMERY_MTP_DRAFT",
-            DraftFrom::Beside => "the shared draft's name beside the target",
-            DraftFrom::Family => {
-                "the family's path: BLOOMERY_MTP_DRAFT is unset and no file of the shared draft's \
-                 name is beside the target"
-            }
+            DraftFrom::Lever(lever) => lever.to_owned(),
+            DraftFrom::Beside => "the shared draft's name beside the target".to_owned(),
+            DraftFrom::Family(lever) => format!(
+                "the family's path: {lever} is unset and no file of the shared draft's name is \
+                 beside the target"
+            ),
         }
     }
 }
 
-/// One family's beside-file MTP draft.
+/// One family's beside-file draft.
 #[derive(Debug)]
 pub struct BesideDraft {
     /// The `general.architecture` its target files declare.
     pub arch: &'static str,
     /// How the draft's file is found for a target.
     pub file: DraftFile,
+    /// The lever that names the draft's file instead ([`MTP_LEVER`] for the
+    /// MTP rows), as [`DraftFrom`] names it.
+    pub lever: &'static str,
 }
 
 /// How a family's draft file is found for a target.
@@ -168,7 +176,7 @@ impl BesideDraft {
     #[must_use]
     pub fn pick(&self, set: Option<&Path>, target: &Path) -> (PathBuf, DraftFrom) {
         match self.file {
-            DraftFile::Fixed(path) => pick_path(path, set, target),
+            DraftFile::Fixed(path) => pick_path(path, self.lever, set, target),
             DraftFile::ByCheckpoint(_) => panic!(
                 "the {} draft file follows the target's checkpoint: pick_for names it",
                 self.arch
@@ -188,11 +196,11 @@ impl BesideDraft {
         target: &Path,
     ) -> Result<(PathBuf, DraftFrom), UnknownCheckpoint> {
         match self.file {
-            DraftFile::Fixed(path) => Ok(pick_path(path, set, target)),
+            DraftFile::Fixed(path) => Ok(pick_path(path, self.lever, set, target)),
             DraftFile::ByCheckpoint(files) => files
                 .iter()
                 .find(|f| f.checkpoint == checkpoint)
-                .map(|f| pick_path(f.path, set, target))
+                .map(|f| pick_path(f.path, self.lever, set, target))
                 .ok_or_else(|| UnknownCheckpoint {
                     arch: self.arch,
                     checkpoint: checkpoint.to_string(),
@@ -249,16 +257,33 @@ fn beside_paths<'a>(path: &'static str, target: &'a Path) -> impl Iterator<Item 
     first.into_iter().chain(resolved)
 }
 
-/// [`BesideDraft::pick`]'s rule over one path.
-fn pick_path(path: &'static str, set: Option<&Path>, target: &Path) -> (PathBuf, DraftFrom) {
+/// [`BesideDraft::pick`]'s rule over one path, `lever` the row's.
+fn pick_path(
+    path: &'static str,
+    lever: &'static str,
+    set: Option<&Path>,
+    target: &Path,
+) -> (PathBuf, DraftFrom) {
     if let Some(p) = set {
-        return (p.to_path_buf(), DraftFrom::Lever);
+        return (p.to_path_buf(), DraftFrom::Lever(lever));
     }
     match beside_paths(path, target).find(|p| p.is_file()) {
         Some(p) => (p, DraftFrom::Beside),
-        None => (PathBuf::from(path), DraftFrom::Family),
+        None => (PathBuf::from(path), DraftFrom::Family(lever)),
     }
 }
+
+/// `BLOOMERY_DSPARK_MODEL`, the lever of the DSpark-kind draft files (V4.1's
+/// sets, [`super::deepseek41::dspark_model`], and Raon-1's row,
+/// [`super::raon1::DFLASH_BESIDE`]), as the environment holds it: `None` when
+/// it is unset or empty. The crate's one reading of it.
+#[must_use]
+pub fn dspark_lever() -> Option<String> {
+    std::env::var(DSPARK_LEVER).ok().filter(|p| !p.is_empty())
+}
+
+/// The lever the DSpark-kind draft rows name their file by.
+pub const DSPARK_LEVER: &str = "BLOOMERY_DSPARK_MODEL";
 
 /// The MiMo-V2.6-Flash MTP sidecar (`mtp-<checkpoint>-Q8_0.gguf`; the repos'
 /// Q4_0 and BF16 files are not rows, since a resolve fetches every file of
@@ -268,6 +293,7 @@ fn pick_path(path: &'static str, set: Option<&Path>, target: &Path) -> (PathBuf,
 /// would fetch the 2.38 GB file and nothing would read it.
 pub static MIMO2_BESIDE: BesideDraft = BesideDraft {
     arch: mimo2::ARCH,
+    lever: MTP_LEVER,
     file: DraftFile::ByCheckpoint(&[
         CheckpointFile {
             checkpoint: "MiMo-V2.6-Flash-MOPD",
@@ -300,7 +326,7 @@ pub fn beside_draft(arch: &str) -> Option<&'static BesideDraft> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BesideDraft, Candidate, DraftFile, DraftFrom, MIMO2_BESIDE, UnknownCheckpoint,
+        BesideDraft, Candidate, DraftFile, DraftFrom, MIMO2_BESIDE, MTP_LEVER, UnknownCheckpoint,
         beside_draft, beside_drafts,
     };
     use crate::arch::all;
@@ -316,7 +342,7 @@ mod tests {
         // The replaced `draft_file`, body for body.
         fn old(set: Option<&Path>, target: &Path) -> (PathBuf, DraftFrom) {
             if let Some(p) = set {
-                return (p.to_path_buf(), DraftFrom::Lever);
+                return (p.to_path_buf(), DraftFrom::Lever(MTP_LEVER));
             }
             let beside = Path::new(PATH)
                 .file_name()
@@ -325,7 +351,7 @@ mod tests {
                 .filter(|p| p.is_file());
             match beside {
                 Some(p) => (p, DraftFrom::Beside),
-                None => (PathBuf::from(PATH), DraftFrom::Family),
+                None => (PathBuf::from(PATH), DraftFrom::Family(MTP_LEVER)),
             }
         }
 
@@ -349,7 +375,7 @@ mod tests {
         }
         assert_eq!(
             row.pick(None, &target),
-            (PathBuf::from(PATH), DraftFrom::Family)
+            (PathBuf::from(PATH), DraftFrom::Family(MTP_LEVER))
         );
         let beside = dir.join(NAME);
         std::fs::write(&beside, b"").unwrap_or_else(|e| panic!("{}: {e}", beside.display()));
@@ -357,7 +383,10 @@ mod tests {
             assert_eq!(row.pick(set, &target), old(set, &target), "a file beside");
         }
         assert_eq!(row.pick(None, &target), (beside, DraftFrom::Beside));
-        assert_eq!(row.pick(Some(&other), &target), (other, DraftFrom::Lever));
+        assert_eq!(
+            row.pick(Some(&other), &target),
+            (other, DraftFrom::Lever(MTP_LEVER))
+        );
         std::fs::remove_dir_all(&dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
     }
 
@@ -431,6 +460,7 @@ mod tests {
     const ROW_NAME: &str = "mtp-linked-shard.gguf";
     const ROW: BesideDraft = BesideDraft {
         arch: "test",
+        lever: MTP_LEVER,
         file: DraftFile::Fixed(ROW_PATH),
     };
 
@@ -519,7 +549,7 @@ mod tests {
         let target = s.link(&shard);
         assert_eq!(
             ROW.pick(None, &target),
-            (PathBuf::from(ROW_PATH), DraftFrom::Family)
+            (PathBuf::from(ROW_PATH), DraftFrom::Family(MTP_LEVER))
         );
     }
 
@@ -531,7 +561,7 @@ mod tests {
         let target = s.file("only", "shard-00001.gguf");
         assert_eq!(
             ROW.pick(None, &target),
-            (PathBuf::from(ROW_PATH), DraftFrom::Family)
+            (PathBuf::from(ROW_PATH), DraftFrom::Family(MTP_LEVER))
         );
         let beside = target.with_file_name(ROW_NAME);
         assert_eq!(ROW.places(&target), vec![beside, PathBuf::from(ROW_PATH)]);
@@ -648,7 +678,7 @@ mod tests {
             row.pick_for(MOPD, None, &target),
             Ok((
                 PathBuf::from("/models/MiMo-V2.6-Flash-MOPD/mtp-MiMo-V2.6-Flash-MOPD-Q8_0.gguf"),
-                DraftFrom::Family
+                DraftFrom::Family(MTP_LEVER)
             ))
         );
         assert_eq!(row.pick_for(RL, None, &target), Ok((rl, DraftFrom::Beside)));
@@ -660,7 +690,7 @@ mod tests {
         let lever = dir.join("elsewhere.gguf");
         assert_eq!(
             row.pick_for(MOPD, Some(&lever), &target),
-            Ok((lever, DraftFrom::Lever))
+            Ok((lever, DraftFrom::Lever(MTP_LEVER)))
         );
         assert_eq!(
             row.pick_for("MiMo-V2.6-Flash-Other", None, &target),

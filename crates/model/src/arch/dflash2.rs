@@ -22,9 +22,10 @@
 //! This module reads the file and does not run it: [`Hparams::read`] takes
 //! every key it needs, [`names`] owns the tensor names and [`tensors`] states
 //! the shape and type of every tensor; [`check`] holds the file to that
-//! statement.
+//! statement; [`shape`] is the geometry the common DSpark owner runs it by.
 
 use gguf::{GgmlType, Split, Value};
+use runtime::dspark::{DraftVocab, DsparkShape, HeadKind};
 
 use super::{DFLASH, meta_arr, meta_bool, meta_f32, meta_usize, metadata, n_vocab, positive};
 use crate::placement::PlacementError;
@@ -194,6 +195,30 @@ impl Hparams {
     #[must_use]
     pub fn fc_in(&self) -> usize {
         self.target_layers.len() * self.target_hidden
+    }
+}
+
+/// The draft file's geometry as the common DSpark owner reads it. The taps
+/// are the file's `target_layers` as they stand, each tap the whole stream set
+/// entering that layer (`target_hidden` values). The block is
+/// `[id_last, mask × (b − 1)]` and row 0 is only the anchor, so a block of `b`
+/// rows drafts `b − 1` ids; the selector runs over the whole block every time.
+/// The selector's tables cover the target's own ids. Pass the result to
+/// `DsparkShape::check` before use.
+#[must_use]
+pub fn shape(hp: &Hparams) -> DsparkShape {
+    DsparkShape {
+        block: hp.block_size,
+        row0_drafts: false,
+        taps: hp.target_layers.clone(),
+        hidden: hp.target_hidden,
+        vocab: DraftVocab::Full { n: hp.n_vocab },
+        mask_id: hp.mask_token,
+        window: Some(hp.window),
+        head: HeadKind::Selector {
+            rank: hp.selector.rank,
+            top_k: hp.selector.top_k,
+        },
     }
 }
 

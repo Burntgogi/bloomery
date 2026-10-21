@@ -758,3 +758,8 @@ required-features = ["gpu"]
 [[bin]]
 name = "gate_raon1_attn"
 required-features = ["gpu"]
+
+# dfl-wire: Raon-1's DFlash2 draft: its load, the V4.1 DSpark file refused, and its first block against the host oracle's.
+[[bin]]
+name = "gate_raon1_dflash"
+required-features = ["gpu"]

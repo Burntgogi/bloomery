@@ -47,7 +47,9 @@ fn main() -> std::process::ExitCode {
 mod gate {
     use std::path::{Path, PathBuf};
 
-    use bloomery_gpu::dspark::head::{Head, HeadWeights, ReducedMarkovWeights};
+    use bloomery_gpu::dspark::head::{
+        Head, HeadTail, HeadWeights, MarkovTail, ReducedMarkovWeights,
+    };
     use bloomery_gpu::dspark::{HeadSource, Q8Rows};
     use bloomery_gpu::{DeviceTensor, FAULT_NONE, Fault, FaultSite, Gpu, LAYER_NONE};
     use bloomery_gpu_deepseek41::hc::HC_MIX;
@@ -889,10 +891,12 @@ mod gate {
                 qs: DeviceTensor::upload(s, &qs, RED_HEAD, HEAD_HIDDEN / 4)?,
                 d: DeviceTensor::upload(s, &d, RED_HEAD, HEAD_HIDDEN / 32)?,
             }),
-            markov_w1: DeviceTensor::upload(s, &rd.w1, RED_PREV, MARKOV_ROW_WORDS)?,
-            markov_w2: DeviceTensor::upload(s, &rd.w2, RED_HEAD, MARKOV_ROW_WORDS)?,
-            to_target: Some(DeviceBuffer::from_host(s, &rd.to_target)?),
-            conf: None,
+            tail: HeadTail::Markov(MarkovTail {
+                markov_w1: DeviceTensor::upload(s, &rd.w1, RED_PREV, MARKOV_ROW_WORDS)?,
+                markov_w2: DeviceTensor::upload(s, &rd.w2, RED_HEAD, MARKOV_ROW_WORDS)?,
+                to_target: Some(DeviceBuffer::from_host(s, &rd.to_target)?),
+                conf: None,
+            }),
         };
         let mut head = Head::new(cx.gpu, w, HEAD_HIDDEN, m)?;
         // One count, the same one `DsparkBody::own_held` adds: each weight
