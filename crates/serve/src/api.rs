@@ -495,9 +495,12 @@ impl Server {
             })?;
         let conn_state = Arc::clone(&state);
         accept(listener, state.shared.end.clone(), move |stream| {
-            keep_alive(stream, &conn_state.shared.answers, |req, w| {
-                route(&conn_state, req, w)
-            });
+            keep_alive(
+                stream,
+                &conn_state.shared.answers,
+                &conn_state.api_keys,
+                |req, w| route(&conn_state, req, w),
+            );
         });
         Ok((state, ended))
     }
@@ -1177,11 +1180,12 @@ impl Drop for Answering<'_> {
 /// Answers `stream`'s requests in order through `route` while the client keeps
 /// the connection alive ([`next_request_arrives`]); `route` answers one
 /// request, `Ok(true)` when the connection may carry another, counted in
-/// `answers` until it returns. A request that cannot be read is a 400 and the
-/// connection closes.
+/// `answers` until it returns. Headers are authorized against `keys` before
+/// continuing or reading the body; a denied or unreadable request closes the connection.
 pub(crate) fn keep_alive(
     stream: TcpStream,
     answers: &Answers,
+    keys: &ApiKeys,
     mut route: impl FnMut(&Request, &mut TcpStream) -> io::Result<bool>,
 ) {
     let _ = stream.set_nodelay(true);
@@ -1193,7 +1197,24 @@ pub(crate) fn keep_alive(
         if !next_request_arrives(&mut r) {
             return;
         }
-        let req = match http::read_request(&mut r, &mut w) {
+        let req = match (|| -> io::Result<Option<Request>> {
+            let Some(mut req) = http::read_head(&mut r)? else {
+                return Ok(None);
+            };
+            if key_denied(keys, &mut req, &mut w)? {
+                return Ok(None);
+            }
+            if req.method == "OPTIONS" || matches!(req.path.as_str(), "/health" | "/v1/health") {
+                // These public handlers ignore bodies; unread framing cannot carry a next request.
+                req.keep_alive &= req.header("transfer-encoding").is_none()
+                    && req
+                        .header("content-length")
+                        .is_none_or(|len| len.parse::<usize>() == Ok(0));
+            } else {
+                http::read_body(&mut r, &mut w, &mut req)?;
+            }
+            Ok(Some(req))
+        })() {
             Ok(Some(req)) => req,
             Ok(None) => return,
             Err(e) if e.kind() == io::ErrorKind::InvalidData => {
@@ -1291,13 +1312,9 @@ fn deny_line(method: &str, path: &str, peer: &str) -> String {
     format!("{method} {path} from {peer}: refused, no valid API key")
 }
 
-/// The key check before either server's dispatch — this server's
-/// [`route`] and the decision server's own connection handler, the one call
-/// both make. A request that passes ([`ApiKeys::allows`]) is `Ok(false)`;
-/// one that does not is answered with llama-server's 401 (`Invalid API Key`,
-/// `authentication_error`) after the one [`deny_line`], and is `Ok(true)`:
-/// answered, and the connection may carry another request.
-pub(crate) fn key_denied(keys: &ApiKeys, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
+/// Answers a denied request's headers with llama-server's 401 and marks the connection closed.
+/// The unread body is never drained or interpreted as another request.
+fn key_denied(keys: &ApiKeys, req: &mut Request, w: &mut TcpStream) -> io::Result<bool> {
     if keys.allows(
         &req.method,
         &req.path,
@@ -1311,6 +1328,7 @@ pub(crate) fn key_denied(keys: &ApiKeys, req: &Request, w: &mut TcpStream) -> io
         .map(|a| a.to_string())
         .unwrap_or_else(|e| format!("a peer that cannot be read: {e}"));
     eprintln!("{}", deny_line(&req.method, &req.path, &peer));
+    req.keep_alive = false;
     send_error(
         w,
         req,
@@ -1326,9 +1344,6 @@ pub(crate) fn key_denied(keys: &ApiKeys, req: &Request, w: &mut TcpStream) -> io
 
 /// Dispatches one request; `Ok(true)` when the connection may carry another.
 fn route(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
-    if key_denied(&state.api_keys, req, w)? {
-        return Ok(true);
-    }
     let r = match (req.method.as_str(), req.path.as_str()) {
         ("GET", "/health" | "/v1/health") => return health(state, req, w),
         ("GET", "/v1/models" | "/models") => Ok(models(state)),
@@ -5794,6 +5809,139 @@ mod tests {
             super::testserve::roundtrip(addr, "POST", "/completion", &xkey(KEY), ask);
         assert_eq!(status, 200, "X-Api-Key: {body}");
         assert!(body.contains("content"), "the generation answered: {body}");
+    }
+
+    /// Refusals and public bodyless handlers answer headers without `100 Continue` or a body;
+    /// authorized requests retain both body framings, the handshake and the next keyed request.
+    #[test]
+    fn authorization_precedes_bodies_and_preserves_authorized_keep_alive() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpStream;
+
+        fn connect(addr: SocketAddr) -> BufReader<TcpStream> {
+            let stream = TcpStream::connect(addr).expect("connect");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            BufReader::new(stream)
+        }
+
+        fn response(r: &mut BufReader<TcpStream>) -> (u16, String, Vec<u8>) {
+            let mut head = String::new();
+            loop {
+                let mut line = String::new();
+                assert_ne!(r.read_line(&mut line).expect("response head"), 0, "{head}");
+                head.push_str(&line);
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            let status = head.split_whitespace().nth(1).unwrap().parse().unwrap();
+            let len = head
+                .lines()
+                .find_map(|line| line.strip_prefix("Content-Length: "))
+                .map_or(0, |v| v.parse::<usize>().unwrap());
+            assert!(len < 64 * 1024, "a bounded test response: {len}");
+            let mut body = vec![0; len];
+            r.read_exact(&mut body).expect("response body");
+            (status, head, body)
+        }
+
+        let mut keys = ApiKeys::default();
+        keys.add("--api-key", KEY).unwrap();
+        let (addr, _state, _ended) = super::testserve::spawn_keyed(keys);
+        for key in [
+            "",
+            "Authorization: Bearer sk-wrong\r\n",
+            "X-Api-Key: sk-wrong\r\n",
+        ] {
+            for framing in ["Content-Length: 1024\r\n", "Transfer-Encoding: chunked\r\n"] {
+                for expect in ["", "Expect: 100-continue\r\n"] {
+                    let mut r = connect(addr);
+                    write!(
+                        r.get_mut(),
+                        "POST /completion HTTP/1.1\r\nConnection: keep-alive\r\n\
+                         {key}{framing}{expect}\r\n"
+                    )
+                    .expect("headers without a body");
+                    let (status, head, body) = response(&mut r);
+                    assert_eq!(status, 401, "{head}");
+                    assert!(head.contains("Connection: close"), "{head}");
+                    let v: Value = serde_json::from_slice(&body).expect("the 401's JSON");
+                    assert_eq!(v["error"]["type"], "authentication_error");
+                    let mut byte = [0];
+                    assert_eq!(r.read(&mut byte).expect("the denied connection closes"), 0);
+                }
+            }
+        }
+
+        for (method, path, framing, status) in [
+            ("GET", "/health", "Content-Length: 1024\r\n", 200),
+            ("GET", "/v1/health", "Transfer-Encoding: chunked\r\n", 200),
+            (
+                "OPTIONS",
+                "/completion",
+                "Transfer-Encoding: chunked\r\n",
+                204,
+            ),
+        ] {
+            let mut r = connect(addr);
+            write!(
+                r.get_mut(),
+                "{method} {path} HTTP/1.1\r\nConnection: keep-alive\r\n\
+                 {framing}Expect: 100-continue\r\n\r\n"
+            )
+            .expect("public headers without the ignored body");
+            let (got, head, _) = response(&mut r);
+            assert_eq!(got, status, "{head}");
+            assert!(head.contains("Connection: close"), "{head}");
+            let mut byte = [0];
+            assert_eq!(r.read(&mut byte).expect("the unread public body closes"), 0);
+        }
+
+        let ask = r#"{"prompt":"hello","max_tokens":1}"#;
+        for chunked in [false, true] {
+            let mut r = connect(addr);
+            let framing = if chunked {
+                "Transfer-Encoding: chunked\r\n".to_owned()
+            } else {
+                format!("Content-Length: {}\r\n", ask.len())
+            };
+            write!(
+                r.get_mut(),
+                "POST /completion HTTP/1.1\r\nAuthorization: {BEARER}\r\n\
+                 {framing}Expect: 100-continue\r\n\r\n"
+            )
+            .expect("authorized headers");
+            let (status, _, body) = response(&mut r);
+            assert_eq!(status, 100, "continue before sending the body");
+            assert!(body.is_empty());
+            if chunked {
+                write!(r.get_mut(), "{:x}\r\n{ask}\r\n0\r\n\r\n", ask.len()).unwrap();
+            } else {
+                r.get_mut().write_all(ask.as_bytes()).unwrap();
+            }
+            let (status, head, body) = response(&mut r);
+            assert_eq!(status, 200, "{head}");
+            assert!(head.contains("Connection: keep-alive"), "{head}");
+            let v: Value = serde_json::from_slice(&body).expect("completion JSON");
+            assert!(v.get("content").is_some(), "{v}");
+
+            write!(
+                r.get_mut(),
+                "GET /props HTTP/1.1\r\nAuthorization: {BEARER}\r\nConnection: close\r\n\r\n"
+            )
+            .expect("the next keyed request");
+            let (status, head, body) = response(&mut r);
+            assert_eq!(status, 200, "{head}");
+            let v: Value = serde_json::from_slice(&body).expect("props JSON");
+            assert!(v.is_object(), "{v}");
+            let mut byte = [0];
+            assert_eq!(r.read(&mut byte).expect("the final connection closes"), 0);
+        }
     }
 
     /// `POST /shutdown` needs the key even from a loopback peer: without one

@@ -30,6 +30,40 @@ pub use vision::{FileKind, MediaModel, Prepared, Rgb8, VisionError};
 
 use crate::video::{Clip, PlannedClip, VideoError, VideoSupport, plan_clip};
 
+const DECODED_IMAGE_BYTES: usize = 64 * 1024 * 1024;
+
+/// An inline image decoded under the request's shared RGB budget, before model preparation.
+pub(crate) struct DecodedImage {
+    pub key: ImageKey,
+    pub image: Rgb8,
+}
+
+/// Decode all inline images before preparing any, charging retained RGB once per image.
+pub(crate) fn decode_images<'a>(
+    urls: impl IntoIterator<Item = &'a str>,
+) -> Result<Vec<DecodedImage>, MediaError> {
+    decode_images_with_limit(urls, DECODED_IMAGE_BYTES).map_err(|(_, error)| error)
+}
+
+fn decode_images_with_limit<'a>(
+    urls: impl IntoIterator<Item = &'a str>,
+    mut left_bytes: usize,
+) -> Result<Vec<DecodedImage>, (usize, MediaError)> {
+    urls.into_iter()
+        .enumerate()
+        .map(|(index, url)| {
+            let file = load(url).map_err(|error| (index, error))?;
+            let image = Rgb8::from_bytes_with_limit(&file.bytes, left_bytes)
+                .map_err(|error| (index, MediaError::Decode(error)))?;
+            left_bytes -= image.data.len();
+            Ok(DecodedImage {
+                key: file.key,
+                image,
+            })
+        })
+        .collect()
+}
+
 /// A [`MediaModel`] the server holds across its threads: the request threads prepare images on
 /// it while the engine runs elsewhere.
 pub type SharedMediaModel = Arc<dyn MediaModel + Send + Sync>;
@@ -817,17 +851,40 @@ pub fn load(url: &str) -> Result<ImageFile, MediaError> {
     })
 }
 
-/// Decode a file and prepare it for `model`.
+/// Decode a single image within the serving RGB budget and prepare it for `model`.
 pub fn prepare(file: &ImageFile, model: &dyn MediaModel) -> Result<Prepared, MediaError> {
-    prepare_with(file, |image| model.prepare(image))
+    let image = Rgb8::from_bytes_with_limit(&file.bytes, DECODED_IMAGE_BYTES)
+        .map_err(MediaError::Decode)?;
+    model.prepare(&image).map_err(MediaError::Prepare)
 }
 
-fn prepare_with(
-    file: &ImageFile,
-    prepare: impl FnOnce(&Rgb8) -> Result<Prepared, VisionError>,
-) -> Result<Prepared, MediaError> {
-    let image = Rgb8::from_bytes(&file.bytes).map_err(MediaError::Decode)?;
-    prepare(&image).map_err(MediaError::Prepare)
+/// Decode all image URLs under one serving RGB budget before preparing any, returning the
+/// failing image's zero-based index and error.
+pub fn prepare_images<'a>(
+    urls: impl IntoIterator<Item = &'a str>,
+    model: &dyn MediaModel,
+) -> Result<Vec<Prepared>, (usize, MediaError)> {
+    prepare_images_with_limit(urls, model, DECODED_IMAGE_BYTES)
+}
+
+fn prepare_images_with_limit<'a>(
+    urls: impl IntoIterator<Item = &'a str>,
+    model: &dyn MediaModel,
+    max_bytes: usize,
+) -> Result<Vec<Prepared>, (usize, MediaError)> {
+    decode_images_with_limit(urls, max_bytes)?
+        .into_iter()
+        .enumerate()
+        .map(|(index, image)| {
+            let prepared = model
+                .prepare(&image.image)
+                .map_err(|error| (index, MediaError::Prepare(error)))?;
+            if prepared.span_len == 0 {
+                return Err((index, MediaError::Expand(ExpandError::EmptySpan(index))));
+            }
+            Ok(prepared)
+        })
+        .collect()
 }
 
 /// Prepare a decoded video's image parts through the model's video rule: the frames were sampled
@@ -836,6 +893,7 @@ fn prepare_with(
 pub(crate) fn prepare_video(
     parts: &[Value],
     model: &dyn MediaModel,
+    images: &mut impl Iterator<Item = DecodedImage>,
 ) -> Result<Vec<MediaFeed>, MediaError> {
     let rule =
         model
@@ -854,23 +912,26 @@ pub(crate) fn prepare_video(
     parts
         .iter()
         .map(|part| {
-            let Part::Image(url) = parse_part(part)? else {
+            let Part::Image(_) = parse_part(part)? else {
                 return Err(MediaError::PartField {
                     ty: "decoded video",
                     need: "only image_url frames after its prefix",
                 });
             };
-            let file = load(url)?;
-            let prepared = prepare_with(&file, |frame| {
-                let (size, _) =
-                    model
-                        .video_sizer()
-                        .group_size(frame.width, frame.height, rule.group_tokens)?;
-                model.prepare_group(std::slice::from_ref(frame), size)
+            let frame = images.next().ok_or(MediaError::PartField {
+                ty: "decoded video",
+                need: "one decoded image per frame",
             })?;
+            let (size, _) = model
+                .video_sizer()
+                .group_size(frame.image.width, frame.image.height, rule.group_tokens)
+                .map_err(MediaError::Prepare)?;
+            let prepared = model
+                .prepare_group(std::slice::from_ref(&frame.image), size)
+                .map_err(MediaError::Prepare)?;
             Ok(MediaFeed {
                 at: 0,
-                key: file.key,
+                key: frame.key,
                 prepared: Arc::new(prepared),
             })
         })
@@ -935,20 +996,18 @@ pub fn expand_prompt(
         return Err(MediaError::ImageLast);
     }
     check_placeholders(ids, &want, image_token, model)?;
-    let files = media
-        .iter()
-        .filter_map(|m| match m {
-            Medium::Image(url) => Some(load(url)),
-            Medium::Video(_) => None,
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut files = files.iter();
+    let images = decode_images(media.iter().filter_map(|m| match m {
+        Medium::Image(url) => Some(url.as_str()),
+        Medium::Video(_) => None,
+    }))?;
+    let mut images = images.into_iter();
     let mut ready: Vec<(ImageKey, Arc<Prepared>)> = Vec::with_capacity(want.len());
     for m in media {
         match m {
             Medium::Image(_) => {
-                let file = files.next().expect("one file per image, loaded above");
-                ready.push((file.key, Arc::new(prepare(file, model)?)));
+                let image = images.next().expect("one decoded image per image medium");
+                let prepared = model.prepare(&image.image).map_err(MediaError::Prepare)?;
+                ready.push((image.key, Arc::new(prepared)));
             }
             Medium::Video(clip) => {
                 ready.extend(
@@ -1654,6 +1713,71 @@ mod tests {
         assert!(matches!(
             err(prepare(&broken, &PLAIN)),
             MediaError::Decode(VisionError::Decode(_))
+        ));
+    }
+
+    #[test]
+    fn bulk_images_share_one_rgb_budget_and_preserve_error_indices() {
+        let url = data("image/png", PNG_B64);
+        let urls = [url.as_str(), url.as_str()];
+        let images = super::prepare_images_with_limit(urls, &PLAIN, 12).unwrap();
+        assert_eq!(
+            images
+                .iter()
+                .map(|image| image.span_len)
+                .collect::<Vec<_>>(),
+            [2, 2]
+        );
+        assert!(matches!(
+            super::prepare_images_with_limit(urls, &NumberedMedia, 11),
+            Err((1, MediaError::Decode(VisionError::Limits { .. })))
+        ));
+        assert!(matches!(
+            super::prepare_images_with_limit(urls, &NumberedMedia, 12),
+            Err((0, MediaError::Prepare(VisionError::Limits { .. })))
+        ));
+        assert!(matches!(
+            super::prepare_images([url.as_str(), "https://example.com/image.png"], &PLAIN),
+            Err((1, MediaError::Scheme(_)))
+        ));
+        struct Empty;
+        impl MediaModel for Empty {
+            fn image_placeholder(&self, _index: usize) -> Cow<'_, str> {
+                Cow::Borrowed("<img>")
+            }
+
+            fn image_marker(&self) -> &str {
+                "<img>"
+            }
+
+            fn image_token(&self) -> Option<u32> {
+                Some(7)
+            }
+
+            fn prepare(&self, image: &Rgb8) -> Result<Prepared, VisionError> {
+                let mut prepared = PLAIN.prepare(image)?;
+                prepared.span_len = 0;
+                Ok(prepared)
+            }
+        }
+        assert!(matches!(
+            super::prepare_images([url.as_str()], &Empty),
+            Err((0, MediaError::Expand(ExpandError::EmptySpan(0))))
+        ));
+    }
+
+    #[test]
+    fn all_inline_images_decode_before_any_model_prepare() {
+        let url = data("image/png", PNG_B64);
+        let broken = data("image/png", &encode_base64(b"\x89PNG\r\n\x1a\n"));
+        // NumberedMedia refuses any prepare; the later decode must fail first instead.
+        assert!(matches!(
+            expand_prompt(
+                &[100, 200, 300, 7, 100, 201, 300, 7, 1],
+                &Medium::images(&[&url, &broken]),
+                &NumberedMedia,
+            ),
+            Err(MediaError::Decode(VisionError::Decode(_)))
         ));
     }
 
