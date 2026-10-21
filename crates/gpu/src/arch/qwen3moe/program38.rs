@@ -1046,8 +1046,8 @@ fn gdn_in(c: &Ctx38<'_>, gp: &GdnPlan, s: &mut Arena38, m: usize) -> Result<(), 
     c.f32_gemv(&gp.beta_alpha, mixed, m, &mut g.ba)?;
     if m > 1 {
         let (wb, wa) = beta_alpha_rows(&g.ba, m)?;
-        c.k.proj.enqueue_token_major(stream, &wb, nv, m, &mut g.b)?;
-        c.k.proj.enqueue_token_major(stream, &wa, nv, m, &mut g.a)?;
+        c.k.proj.token_major.enqueue(stream, &wb, nv, m, &mut g.b)?;
+        c.k.proj.token_major.enqueue(stream, &wa, nv, m, &mut g.a)?;
     }
     Ok(())
 }
@@ -1356,7 +1356,7 @@ fn qsa_query(c: &Ctx38<'_>, qp: &QsaPlan, s: &mut Arena38, m: usize) -> Result<(
     c.f32_gemv(&qp.idx_q, mixed, m, &mut qa.qr)?;
     if m > 1 {
         let stream = c.gpu.stream();
-        c.k.proj.enqueue_token_major(
+        c.k.proj.token_major.enqueue(
             stream,
             &qa.qr,
             geo::IDX_HEADS * geo::IDX_DIM,

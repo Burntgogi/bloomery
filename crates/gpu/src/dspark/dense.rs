@@ -2165,6 +2165,9 @@ mod tests {
     /// One layer's caches as the card holds them, K then V.
     type Cache = (Vec<u16>, Vec<u16>);
 
+    /// One layer's block keys and values in f64: K rows then V rows.
+    type BlockKv = (Vec<f64>, Vec<f64>);
+
     /// The block pass on the host in f64 over the card's own cached K and V: a block of `m` rows after
     /// `count` context rows from position `base`, every row reading the positions the reference's
     /// mask lets it.
@@ -2206,7 +2209,7 @@ mod tests {
         }
 
         /// The block's output rows from its embedded rows `x0`, and each layer's block K and V.
-        fn run(&self, x0: &[f64], m: usize) -> (Vec<f64>, Vec<(Vec<f64>, Vec<f64>)>) {
+        fn run(&self, x0: &[f64], m: usize) -> (Vec<f64>, Vec<BlockKv>) {
             let (group, coeffs, count) = (N_Q / N_KV, CONV.coeffs(H), self.count);
             let scale = 1.0 / (HEAD as f64).sqrt();
             let mut x = x0.to_vec();

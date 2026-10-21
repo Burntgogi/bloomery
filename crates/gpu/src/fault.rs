@@ -585,7 +585,9 @@ pub mod step_order {
     /// router and the handoff's id check, and the head's logits last. The
     /// order of the sites the step raises is the order a KDA layer's launches
     /// meet them, then the sites only a GQA layer meets; the sites the step
-    /// never raises follow.
+    /// never raises follow. Raon-1 (`arch::raon1`) runs the same order: an RDA
+    /// layer launches a KDA layer's sites, and a latent layer's cache append
+    /// and visible count stand where a GQA layer's do.
     pub const SOLAR2: &[FaultSite] = &[
         TokenId,
         F32Product,
@@ -614,14 +616,6 @@ pub mod step_order {
         Mamba2Scan,
     ];
 
-    /// Raon-1 (`arch::raon1`): the order is [`SOLAR2`]'s — the token id (the
-    /// card's embedding), a layer's norm and quantizers, an RDA layer's conv,
-    /// delta step, lane word, stamp and gated norm, then the sites only the
-    /// attention layer meets (a latent layer's cache append and visible
-    /// count where Solar's GQA layer's stand), the router, the expert ids
-    /// and the head's logits — so a fault word decodes by it.
-    pub const RAON1: &[FaultSite] = SOLAR2;
-
     /// The order of `arch`'s step.
     #[must_use]
     pub fn of(arch: model::arch::Arch) -> &'static [FaultSite] {
@@ -632,9 +626,8 @@ pub mod step_order {
             model::arch::Arch::Qwen35moe => QWEN35MOE,
             model::arch::Arch::Glm5next => GLM5NEXT,
             model::arch::Arch::Mimo2 => MIMO2,
-            model::arch::Arch::SolarOpen2 => SOLAR2,
+            model::arch::Arch::SolarOpen2 | model::arch::Arch::Raon1 => SOLAR2,
             model::arch::Arch::MiniMaxM3 => MINIMAXM3,
-            model::arch::Arch::Raon1 => RAON1,
             // No program runs nemotron_h. The listing is MiMo's so a fault
             // word still decodes; it is not a step this architecture runs.
             model::arch::Arch::NemotronH => NEMOTRON_H,

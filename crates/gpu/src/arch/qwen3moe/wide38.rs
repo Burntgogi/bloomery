@@ -2227,7 +2227,8 @@ fn qsa(
     // The append reads the keys row-major (`[IDX_DIM][m]`, the gemv's
     // layout): the tile's `[m][IDX_DIM]` turned.
     c.k.proj
-        .enqueue_token_major(stream, &x.kr, m, geo::IDX_DIM, &mut q.kr)?;
+        .token_major
+        .enqueue(stream, &x.kr, m, geo::IDX_DIM, &mut q.kr)?;
     c.k.q38.enqueue_key_append(
         stream,
         KeyAppendArgs {

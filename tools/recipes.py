@@ -11152,8 +11152,10 @@ def narrow_self_test(expect, side: Side) -> None:
         # a bin carrier is covered by the scan of that bin alone. Every bin of gpu-gates carries its own kernels in a
         # bundle named for the package, so a scan of another gpu-gates bin (same bundle name) or of that bin without
         # the package's bundle reads nothing of them. A change under crates/gpu reaches the closure of both bin
-        # carriers (gate_swap, gate_kquant) and of the four device libs.
-        libs = ("bloomery-gpu", "bloomery-gpu-deepseek41", "bloomery-gpu-gemma4a", "bloomery-gpu-vision")
+        # carriers (gate_swap, gate_kquant) and of the five device libs.
+        # PIN(2026-10-21): bloomery-gpu-minimaxm3 joins the device libs: it carries kernels of its own, which a change
+        # under crates/gpu reaches through the bins that link it (the narrow message named it "not scanned").
+        libs = ("bloomery-gpu", "bloomery-gpu-deepseek41", "bloomery-gpu-gemma4a", "bloomery-gpu-minimaxm3", "bloomery-gpu-vision")
         own = ("bloomery-gpu", "bloomery-gpu-gates")
         gpu_rows = [row("crates/gpu/src/**", ["gate-gpu-lib"])]
 
@@ -12013,9 +12015,10 @@ def _st_real_tree(fails: list[str], side: Side) -> None:
     # PIN(2026-10-19): the Qwen3.8 media gate builds bloomery-serve beside its own bin for its serve clauses.
     # PIN(2026-10-20): gate-serve-draft-rules tests both serve bins, including their V4.1 draft.
     # PIN(2026-10-20): gate-gpu-solar2-serve joins them; its recipe builds bloomery-serve beside its own bin.
+    # PIN(2026-10-21): gate-gpu-minimaxm3-serve joins them; its recipe (justfile) builds bloomery-serve beside its own bin.
     expect(dspark == {"gate-gpu-clef-serve", "gate-gpu-ds41-chat", "gate-gpu-ds41-draft", "gate-gpu-ds41-dspark-loop",
                       "gate-gpu-ds41-prefill", "gate-gpu-ds41-tier", "gate-gpu-ds41-twocard", "gate-gpu-gemma-embedding-serve", "gate-gpu-gemma-embedding2-serve", "gate-gpu-glm5next-serve",
-                      "gate-gpu-lev-serve", "gate-gpu-nemotron-h-moe-serve", "gate-gpu-nemotron-serve",
+                      "gate-gpu-lev-serve", "gate-gpu-minimaxm3-serve", "gate-gpu-nemotron-h-moe-serve", "gate-gpu-nemotron-serve",
                       "gate-gpu-qwen3-serve", "gate-gpu-qwen38-media", "gate-gpu-serve-start-ds41", "gate-gpu-serve-start-glm", "gate-gpu-solar2-serve", "gate-ptx-spill", "gate-serve-draft-rules"},
            f"shared/ds41_dspark.rs (a #[path] module of the bins that name it) selects {sorted(dspark)}")
     hybrid = sel("crates/gpu/src/hybrid.rs")

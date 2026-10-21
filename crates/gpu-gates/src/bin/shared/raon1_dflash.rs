@@ -31,7 +31,7 @@ use gguf::{GgmlType, Split};
 use model::arch::dflash2::{self, Hparams, names};
 use model::arch::names as arch_names;
 use model::embed::EmbedTable;
-use refset::arch::DraftFrom;
+use refset::arch::draft::DraftFrom;
 use refset::arch::raon1::DFLASH_BESIDE;
 use runtime::dspark::DsparkShape;
 

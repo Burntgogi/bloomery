@@ -92,6 +92,7 @@ pub mod routed_block;
 pub mod router;
 pub mod site;
 pub(crate) mod tensor;
+pub mod token_major;
 pub(crate) mod upload;
 pub(crate) mod view;
 pub(crate) mod watchdog;

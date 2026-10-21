@@ -54,7 +54,7 @@ mod gate {
     };
     use model::arch::Arch;
     use model::arch::dflash2::{Hparams, names};
-    use refset::arch::DraftFrom;
+    use refset::arch::draft::DraftFrom;
     use refset::arch::prompt_tables;
     use refset::arch::raon1::{A, DFLASH_BESIDE, LCPP, MODEL};
     use runtime::dspark::{DraftVocab, DsparkShape, HeadKind};

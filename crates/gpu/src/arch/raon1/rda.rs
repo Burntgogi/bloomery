@@ -30,13 +30,13 @@ use super::state::PASS_ROWS;
 use crate::Gpu;
 use crate::GpuError;
 use crate::arch::hybrid::{Acts, GqaCx, Site};
-use crate::arch::qwen3moe::proj::ProjKernels;
 use crate::linear::mixer_kda::{
     self, KdaBufs, KdaDecay, KdaDims, KdaIn, KdaProj, KdaRule, KdaState, KdaVecs,
 };
 use crate::linear::{CONV_TAPS, HEAD, KHeadMap, LinearKernels, LinearShape};
 use crate::site::{self, Form, Order, SiteTy};
 use crate::tensor::{Q8Act, WindowMut};
+use crate::token_major::TokenMajor;
 use crate::weights::Weights;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 use gguf::Split;
@@ -201,16 +201,16 @@ impl RdaSites {
 
 /// The kernels a pass of more than one row launches beyond the step's: the
 /// copy of a row-major K-quant output into token-major rows
-/// (`qwen3moe_token_major`, the one owner of that copy).
+/// ([`TokenMajor`], the one owner of that copy).
 pub(crate) struct RowKernels {
-    tm: ProjKernels,
+    tm: TokenMajor,
 }
 
 impl RowKernels {
     /// Load the copy's module into `ctx`. Load-time only.
     pub(crate) fn load(ctx: &Arc<CudaContext>) -> Result<RowKernels, GpuError> {
         Ok(RowKernels {
-            tm: ProjKernels::load(ctx)?,
+            tm: TokenMajor::load(ctx)?,
         })
     }
 }
@@ -291,9 +291,7 @@ pub(super) fn kgemv_rows(
                 let mut stage = WindowMut::<f32>::of_mut(&mut *kit.stage, 0, rows * m)?;
                 t.kgemv(cx, act, l, &mut stage)?;
             }
-            kit.rows
-                .tm
-                .enqueue_token_major(cx.gpu.stream(), kit.stage, rows, m, y)
+            kit.rows.tm.enqueue(cx.gpu.stream(), kit.stage, rows, m, y)
         }
         None => Err(no_rows(cx.what, t, m)),
     }
@@ -469,13 +467,10 @@ impl KdaProj for Rows<'_, '_> {
                 t.kgemv(cx, act, l, &mut win)?;
                 at += rows * m;
             }
-            self.kit.rows.tm.enqueue_token_major(
-                gpu.stream(),
-                self.kit.stage,
-                shape.channels(),
-                m,
-                y.qkv,
-            )?;
+            self.kit
+                .rows
+                .tm
+                .enqueue(gpu.stream(), self.kit.stage, shape.channels(), m, y.qkv)?;
             for (i, t) in rest.iter().enumerate().filter(|(_, t)| q8(t)) {
                 let mut win = window(&mut y, 3 + i, shape)?;
                 kgemv_rows(cx, self.kit, (t, rows_of[i]), act, l, &mut win)?;

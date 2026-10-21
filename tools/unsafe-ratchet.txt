@@ -393,7 +393,16 @@ gguf 7 2 0
 # PIN(2026-10-21): gpu 2027 -> 2030 blocks, new code, not old code relaxed: two new kernel entries for the four-slot
 # routed counts (MiniMax-M3's), ds41_ffn_handoff_4's call into handoff_at and ds41_ffn_card_acc_4's call into
 # card_acc_at and its write, each block with its SAFETY line.
-gpu 2030 239 10
+# PIN(2026-10-21): gpu 2030 -> 2100 blocks, 239 -> 242 fns, new kernel entries of Raon and DFlash2, not old code
+# relaxed: raon_hc_route, raon_hc_fold, raon_hc_post and raon_hc_mean (arch/raon1/mhc.rs, 18 blocks); dflash_conv
+# (dspark/conv.rs, 3) and InPlace::new, an unsafe fn over the target's resident matrix (dspark/mod.rs, 2 blocks and
+# 1 fn); sel_score, sel_topk_part and sel_topk_merge with warp_top16, an unsafe fn (dspark/selector.rs, 21 blocks and
+# 1 fn); latent_extra_rms_append (latent.rs, 8); kda_write_gate (linear/write_gate.rs, 3); q6k_heads_f32
+# (q6k_heads.rs, 4); situ_rows (elem.rs, 1); gqa_flash_seg_p4_ring with seg_scalar_ring_p, an unsafe fn that states
+# its launch contract (flash_gqa.rs, 9 blocks and 1 fn beyond BlockListed's, pinned above). Each block has its SAFETY
+# line. The token-major copy lifted out of qwen3moe/proj.rs into token_major.rs carries its kernel's one block along
+# and adds the shared-slot load every module family makes, 1 block.
+gpu 2100 242 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.
@@ -463,7 +472,10 @@ gpu-deepseek41 385 44 0
 # unsafe head-128 partial-turn launcher, whose positions rope_gate::run checks distinct, with its SAFETY line.
 # PIN(2026-10-21): gpu-gates 84 -> 85 blocks, new code, not old code relaxed: gate_minimaxm3_msa's launch of the index heads
 # (attn::enqueue_index, an unsafe fn: the positions are distinct, which rope_gate::run checks), with its SAFETY line.
-gpu-gates 85 5 1
+# PIN(2026-10-21): gpu-gates 85 -> 86 blocks, new code, not old code relaxed: the DFlash2 draft's Q6KInPlace head
+# (shared/raon1_dflash.rs) borrows the target model's resident matrix, whose lifetime the seat's session holds, with
+# its SAFETY line.
+gpu-gates 86 5 1
 # PIN(2026-10-15): gpu-gemma-embedding2 0 -> 1 blocks, new code, not old code relaxed: the head-512
 # launcher call requires distinct Consts::pos positions, with its SAFETY line.
 # PIN(2026-10-15): gpu-gemma-embedding2 1 -> 2 blocks, new code, not old code relaxed: Encoder::pass's call of

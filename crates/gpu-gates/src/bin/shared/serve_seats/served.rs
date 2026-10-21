@@ -238,7 +238,7 @@ impl<B: ChainBody + 'static> ServedSpark<B> {
     /// Whether the draft holds every position the target ran before `pos`.
     #[allow(
         dead_code,
-        reason = "the raon1 seat's; a binary that includes this file and serves no such seat reads it nowhere"
+        reason = "the seat that checks its draft's position before it proposes reads it; a binary that includes this file and serves no such seat reads it nowhere"
     )]
     pub fn follows(&self, pos: u32) -> bool {
         self.window.follows(pos)

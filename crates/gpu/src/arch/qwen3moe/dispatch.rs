@@ -597,7 +597,7 @@ pub(super) fn site_gemv(
         "the arena's row-major scratch (a K-quant site launched alone past one row)",
     ))?;
     gemv(cols)?;
-    c.k.proj.enqueue_token_major(gpu.stream(), cols, rows, m, y)
+    c.k.proj.token_major.enqueue(gpu.stream(), cols, rows, m, y)
 }
 
 /// The buffers a shared expert run as its own dense FFN ([`shared_dense`])
@@ -763,7 +763,8 @@ pub(super) fn attn_in(c: &Ctx<'_>, n: &GqaPlan, s: &mut Arena, m: usize) -> Resu
                 Some(cols) => {
                     gpu.enqueue_gemv_q6k(wv, &s.act_x[i], cols)?;
                     k.proj
-                        .enqueue_token_major(stream, cols, d.kv_len(), m, &mut s.v)?;
+                        .token_major
+                        .enqueue(stream, cols, d.kv_len(), m, &mut s.v)?;
                 }
                 None => gpu.enqueue_gemv_q6k(wv, &s.act_x[i], &mut s.v)?,
             }
