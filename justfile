@@ -2718,7 +2718,7 @@ depth-gpu-glm5next *ARMS:
 # BLOOMERY_BOX_ENV=BLOOMERY_DRY=1 nothing is built and no lease is taken: the plan and each binary's state.
 depth-serve *ARMS:
     @[ -n "${BLOOMERY_MODEL:-}" ] || { echo "depth-serve: BLOOMERY_MODEL is unset: name the model profile (tools/ref/models/<name>.sh), e.g. BLOOMERY_MODEL=mimo2 just depth-serve <tree>:<D>" >&2; exit 64; }
-    ./tools/box.sh "${BLOOMERY_AB_ROUNDS:+export BLOOMERY_AB_ROUNDS=$BLOOMERY_AB_ROUNDS && }"'{{precheck}} && { here=$(basename "$PWD"); ours=; for a in {{ARMS}}; do t=${a#env=*:}; [ "${t%%:*}" != "$here" ] || ours=1; done; if [ -n "$ours" ] && [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,mimo2,solar2,vision,gemma-embedding2,hf --release --bin bloomery-serve; fi; } && bash tools/ref/depth-serve.sh {{ARMS}}'
+    ./tools/box.sh "${BLOOMERY_AB_ROUNDS:+export BLOOMERY_AB_ROUNDS=$BLOOMERY_AB_ROUNDS && }"'{{precheck}} && { here=$(basename "$PWD"); ours=; for a in {{ARMS}}; do t=${a#env=*:}; [ "${t%%:*}" != "$here" ] || ours=1; done; if [ -n "$ours" ] && [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,mimo2,solar2,minimaxm3,vision,gemma-embedding2,hf --release --bin bloomery-serve; fi; } && bash tools/ref/depth-serve.sh {{ARMS}}'
 
 # The schemajump against Clef-Flash sitting: the Clef decide seat and a Qwen3.6 seat, both bloomery-serve, one lease on
 # the A6000, the arms alternating request by request (the design's §4; the cards are docs/cards/sj-*.card). Two windows
@@ -2739,7 +2739,7 @@ depth-serve *ARMS:
 # bloomery-serve-ds41 picks, with SJ_DS41_MODEL; this recipe builds that binary when the windows name it) and SJ_SUITES
 # other suite files (`tools/ref/clef/suite-hard.jsonl`, scored against its `.gold.jsonl`); the header of the runner has both.
 sj-vs-clef:
-    ./tools/box.sh "${BLOOMERY_AB_ROUNDS:+export BLOOMERY_AB_ROUNDS=$BLOOMERY_AB_ROUNDS && }"'{{precheck}} && if [ -z "${BLOOMERY_DRY:-}" ]; then case " $(printf %s "${SJ_WINDOWS:-qwen:on qwen:off}" | tr , " ") " in *" qwen:"*) cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,mimo2,solar2,vision,gemma-embedding2,hf --release --bin bloomery-serve;; esac && case " $(printf %s "${SJ_WINDOWS:-}" | tr , " ") " in *" ds41:"*) cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41,vision,gemma-embedding2,hf --release --bin bloomery-serve-ds41;; esac; fi && bash tools/ref/sj-vs-clef.sh'
+    ./tools/box.sh "${BLOOMERY_AB_ROUNDS:+export BLOOMERY_AB_ROUNDS=$BLOOMERY_AB_ROUNDS && }"'{{precheck}} && if [ -z "${BLOOMERY_DRY:-}" ]; then case " $(printf %s "${SJ_WINDOWS:-qwen:on qwen:off}" | tr , " ") " in *" qwen:"*) cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,mimo2,solar2,minimaxm3,vision,gemma-embedding2,hf --release --bin bloomery-serve;; esac && case " $(printf %s "${SJ_WINDOWS:-}" | tr , " ") " in *" ds41:"*) cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41,vision,gemma-embedding2,hf --release --bin bloomery-serve-ds41;; esac; fi && bash tools/ref/sj-vs-clef.sh'
 
 # Qwen3-30B-A3B decode-step kernel timeline (nsys, A6000, under the lease, lead-only): generate_qwen3moe's seed form at each
 # depth (default 6 4096), one prefill pass + BLOOMERY_NSYS_N - 1 replays, the cache height depth-qwen3moe.sh uses. The
