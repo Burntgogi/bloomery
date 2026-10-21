@@ -4,7 +4,8 @@
 //! last-bit nudge of its input), the line a compared tap prints, the tap collector, ggml's vision
 //! RoPE cache, the image files, the encoder file's host copies, and the two structure lines of an
 //! encode (eager twice, reuse after the largest image). Shared by `gate_qwen3vl_tower` and
-//! `gate_glm5v_tower`; each gate owns its band multiple, its tap names and its host rules.
+//! `gate_glm5v_tower`; the 4.0 band multiple ([`K_TAP`]) is the Qwen3-VL tower's and the Qwen3.8
+//! media gate's, each gate owns its tap names and its host rules.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -81,6 +82,13 @@ pub fn nudged(x: &[u16]) -> Vec<u16> {
 pub fn sens(nudged_run: &[u16], run: &[u16]) -> f64 {
     dist(nudged_run, &to_f32(run)).rms_rel
 }
+
+/// A tap passes when `rms(ours − ref) / rms(ref)` is at most this multiple of the larger of its
+/// controls: the band the Qwen3-VL tower's tap and the Qwen3.8 media gate's tower rows pass.
+/// PIN(2026-10-10): fixed before the first run of the Qwen3-VL tower against the set; the design's
+/// prediction is a block output at about 1.6× the rounding floor, so 4 leaves room for a
+/// free-running network's amplification without admitting an order-one defect.
+pub const K_TAP: f64 = 4.0;
 
 /// One compared tap's line: `rms(ours − ref) / rms(ref)` against `k ×` the larger of its controls.
 #[allow(

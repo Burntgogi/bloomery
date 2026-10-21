@@ -710,3 +710,7 @@ required-features = ["vision"]
 [[test]]
 name = "sentence_prompts"
 required-features = ["hf"]
+
+[[bin]]
+name = "gate_qwen38_media"
+required-features = ["vision", "deepseek41"]
