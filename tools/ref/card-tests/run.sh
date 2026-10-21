@@ -97,6 +97,46 @@ has() {
   if grep -Eq -- "$2" "$tmp/out"; then pass "$1"; else fail "$1" "no line matches /$2/" "$tmp/out"; fi
 }
 
+# The drive reader against a bind-root source, a whole-disk alias and absent counters. Only the
+# mount/block-device commands and /sys readability stand in; no disk or Linux /sys is needed.
+drive_case() (
+  mode=$1
+  source "$ROOT/tools/ref/drive-read.sh"
+  findmnt() {
+    [ "$mode" != unmounted ] || return 1
+    case "$mode" in
+      alias) echo /dev/disk/by-id/test-alias ;;
+      fallback) echo /dev/testdisk ;;
+      *)
+        case " $* " in
+          *" --nofsroot "*) echo /dev/testp1 ;;
+          *) echo '/dev/testp1[/models]' ;;
+        esac
+        ;;
+    esac
+  }
+  lsblk() {
+    case "$3:$4" in
+      PKNAME:/dev/testp1) echo testdisk ;;
+      KNAME:/dev/disk/by-id/test-alias) echo testdisk ;;
+      *) return 1 ;;
+    esac
+  }
+  function [ {
+    if builtin [ "${1:-}" = -r ] && [[ "${2:-}" = /sys/block/*/stat ]]; then
+      builtin [ "$mode" != nocounters ] && builtin [ "$2" = /sys/block/testdisk/stat ]
+    else
+      builtin [ "$@"
+    fi
+  }
+  drive_dev '/models with space/model.gguf'
+)
+run 'drive: a bind root resolves to the whole disk' 0 '^testdisk$' drive_case bind
+run 'drive: a whole-disk alias resolves through KNAME' 0 '^testdisk$' drive_case alias
+run 'drive: a canonical disk with no lsblk row retains its counters' 0 '^testdisk$' drive_case fallback
+run 'drive: absent counters are a named refusal' 2 'no counters at /sys/block/testdisk/stat' drive_case nocounters
+run 'drive: an unreadable mount is a named refusal' 2 'findmnt cannot name the mount of /models with space' drive_case unmounted
+
 # card <fixture> <rc> <pattern> [args…]: card.py check on a fixture of this directory.
 card() {
   local f=$1 want=$2 pat=$3

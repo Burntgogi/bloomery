@@ -218,7 +218,7 @@ echo "[binary] $BIN sha256=$BIN_SHA mtime=$BIN_MTIME (newer than every file in i
 DIR=$(dirname "$MODEL")
 DEV=$(drive_dev "$MODEL") || exit 2
 # The witness's table and blockstat fields read the mount source and the device's counters.
-SRC=$(findmnt -n -o SOURCE --target "$DIR")
+SRC=$(drive_source "$MODEL") || exit 2
 STAT=/sys/block/$DEV/stat
 
 WITNESS=(head loadavg pressure-cpu pressure-io table blockstat meminfo pgmajfault cpu cpu-mhz-range lock-holder binary model)

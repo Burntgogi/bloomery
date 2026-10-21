@@ -140,6 +140,10 @@ BLOOMERY_BOX_LOCAL=1 BLOOMERY_BOX_ENV='BLOOMERY_TIER=fixture BLOOMERY_GATE_BOUND
   reference set's identity is the first shard's full path (`AGENTS.md`; a set's `# model` line,
   `crates/refset/src/fixture.rs:19-20`). `/models/fixtures` stays the one legal root, so on a Spark it is a symlink
   (answer 2).
+- **Container drive counters.** The depth, nvtier-read and engram-rate runners resolve a model's mount through
+  `tools/ref/drive-read.sh`: `findmnt --nofsroot` removes a bind mount's bracketed root, then `lsblk` resolves the
+  whole-disk parent or kernel name. The container must expose readable `/sys/block/<disk>/stat` counters.
+  A mount or counter that cannot be read is a named exit 2 before timing, not a guessed device or a weaker witness.
 - **Card names.** A Spark's card is named neither 3090 nor A6000, and local mode takes the one local card without a name
   match. `--place gate` plans the 3090's bytes on the smallest visible card with the room for them, the GB10 here, and local mode refuses the
   two-card recipes (rc 64) ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6124298082)). Which
