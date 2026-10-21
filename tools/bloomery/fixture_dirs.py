@@ -11,6 +11,9 @@ a guess: a row of another shape would be read as a family and fall to `none`.
 """
 
 import re
+import sys
+
+_REACH_LOADED_CODE = sys._getframe().f_code
 
 FIXTURE_DIRS = "tools/fixture-dirs.tsv"
 REF_PATHS = "tools/ref/ref-paths.sh"
