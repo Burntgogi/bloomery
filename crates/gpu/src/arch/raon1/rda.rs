@@ -124,16 +124,7 @@ impl RdaSites {
             site::site(w, WHAT, &name, (rows, k), ty)?;
             Ok(Site::new(name, ty, k))
         };
-        let vector = |name: String, len: usize| -> Result<String, GpuError> {
-            let got = w.f32_buf(WHAT, &name)?.len();
-            if got != len {
-                return Err(GpuError::shape(
-                    WHAT,
-                    format!("{name} holds {got} values; the layer reads {len}"),
-                ));
-            }
-            Ok(name)
-        };
+        let vector = |name: String, len: usize| site::vector(w, WHAT, name, len);
         let f_a = names::ssm_f_a(l);
         let low_rank = w.get(&f_a).map_or(0, |_| {
             file.find(&f_a)

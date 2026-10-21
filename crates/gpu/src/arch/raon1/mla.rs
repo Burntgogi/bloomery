@@ -176,16 +176,7 @@ impl MlaSites {
             site::site(w, WHAT, &name, (rows, k), ty)?;
             Ok(Site::new(name, ty, k))
         };
-        let vector = |name: String, len: usize| -> Result<String, GpuError> {
-            let got = w.f32_buf(WHAT, &name)?.len();
-            if got != len {
-                return Err(GpuError::shape(
-                    WHAT,
-                    format!("{name} holds {got} values; the layer reads {len}"),
-                ));
-            }
-            Ok(name)
-        };
+        let vector = |name: String, len: usize| site::vector(w, WHAT, name, len);
         let ty_of = |name: &str| file.find(name).map(|(_, t)| t.ty);
         let k_b = names::attn_k_b(l);
         if ty_of(&k_b) != Some(GgmlType::Q8_0) {
