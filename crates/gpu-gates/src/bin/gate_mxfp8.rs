@@ -731,8 +731,10 @@ mod gate {
         let planes = w.e4m3("gate_mxfp8", name)?;
         let expected_codes: Vec<u8> = (0..rows * k).map(|i| codes[(i + i / k) % 8]).collect();
         let expected_words: Vec<u32> = expected_codes
-            .chunks_exact(4)
-            .map(|b| u32::from_le_bytes(b.try_into().expect("four code bytes")))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| u32::from_le_bytes(*b))
             .collect();
         let mut ok = planes.scales == E4m3Scales::Mxfp8
             && planes.qs.buf().to_host_vec(gpu.stream())? == expected_words

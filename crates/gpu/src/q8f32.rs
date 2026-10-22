@@ -1388,6 +1388,7 @@ unsafe fn blocks_gemv_ids<F: ByteBlocks>(
         let f = unsafe { blocks_lane_partial_1col::<F>(qs, d, x, k, id as usize, 0, lane) };
         [f, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
     } else {
+        // SAFETY: the validated row and planes cover the m_cols input columns.
         let Some(f) = (unsafe {
             blocks_lane_partials_m::<F>(qs, d, x, k, id as usize, 0, k as usize, m_cols, lane)
         }) else {
@@ -1940,6 +1941,10 @@ mod q8f32_kernels {
             y.len() >= n_rows * m_cols
         )
     )]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the flat arguments (rust-quality R8)"
+    )]
     pub fn mxfp8_gemv_mcol(
         qs: &[u32],
         e: &[u32],
@@ -2036,6 +2041,10 @@ mod q8f32_kernels {
             x.len() >= m_cols * k,
             y.len() >= n_rows * m_cols
         )
+    )]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the flat arguments (rust-quality R8)"
     )]
     pub fn fp8_b128_gemv_mcol(
         qs: &[u32],
@@ -3519,7 +3528,7 @@ pub(crate) fn bf16_mxfp8_planes(
     }
     let mut qs = vec![0u32; count / 4];
     let mut scales = vec![0u32; count / 128];
-    for (block, bytes) in src.chunks_exact(64).enumerate() {
+    for (block, bytes) in src.as_chunks::<64>().0.iter().enumerate() {
         let values: [f32; 32] = std::array::from_fn(|i| {
             f32::from_bits(u32::from(u16::from_le_bytes([bytes[2 * i], bytes[2 * i + 1]])) << 16)
         });
