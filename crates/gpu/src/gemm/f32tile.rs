@@ -409,6 +409,14 @@ const _: () = assert!((MMA_ROWS + MMA_COLS) * MMA_LINE == STAGE_FLOATS && STAGES
 /// rows*n outputs, and w holds rows*K values. The grid covers 64 by 64
 /// output tiles. sh holds STAGES*STAGE_FLOATS aligned shared values.
 #[inline(always)]
+#[allow(
+    clippy::needless_range_loop,
+    reason = "a range `for` is the loop the unroller recognizes; an iterator loop keeps its array in a local depot"
+)]
+#[allow(
+    clippy::manual_range_contains,
+    reason = "the kernel's two compares on the bits; a RangeInclusive would move its PTX"
+)]
 pub(crate) unsafe fn bf16_mma_body<W: TileRows>(
     w: W,
     x: &[f32],

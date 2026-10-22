@@ -346,8 +346,9 @@ fn attention(
     match &mut planes {
         // SAFETY: the sequence uploads consecutive positions for its rows; different sequences use disjoint planes.
         Planes::Slot(kv) => unsafe { kv.append_128(&c.k.neox, stream, append) }?,
-        // SAFETY: the sequence uploads consecutive positions for its rows; different sequences use disjoint planes.
         Planes::Rows(table) => {
+            // SAFETY: the sequence uploads consecutive positions for its rows; different sequences use disjoint
+            // planes.
             unsafe { KvPlanes::append_128_rows(&c.k.neox, stream, table, append) }?
         }
     }
