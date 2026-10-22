@@ -112,7 +112,7 @@ impl HermesScan {
             } else if self.after_call {
                 let ws = self.buf.len() - self.buf.trim_start().len();
                 let rest = &self.buf[ws..];
-                if rest.is_empty() || CALL_OPEN.starts_with(rest) {
+                if rest.len() < CALL_OPEN.len() && CALL_OPEN.starts_with(rest) {
                     return Ok(out);
                 }
                 if rest.starts_with(CALL_OPEN) {

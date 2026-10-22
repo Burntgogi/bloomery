@@ -95,6 +95,9 @@ Your OpenAI client works unchanged. bloomery speaks llama-server's HTTP API and 
   generation that ends inside the call) ends the stream with an error event naming the call: the non-streamed answer
   keeps DSML's raw text as content, and a stream cannot take its fragments back. `/v1/messages` and `/v1/responses`
   streams send a call when it closes.
+  Hermes treats a complete `<tool_call>` opener at EOF as an unterminated call, including immediately after a
+  previous call closed. Only a proper prefix of that opener remains text at EOF; neither decision depends on
+  stream chunk boundaries.
 - **Refused by name** (a 400 naming the field): `samplers` in an order other than llama-server's default list for the
   stages that are on, or naming a sampler this server lacks; typical_p, mirostat, `dry_*`, `xtc_*`, `top_n_sigma` and
   `dynatemp_*` when a request turns them on; `n_predict` or `max_tokens` outside -1..=i32::MAX (-2 does not mean "no
