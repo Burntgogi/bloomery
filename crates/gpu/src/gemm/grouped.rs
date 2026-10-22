@@ -1375,6 +1375,10 @@ macro_rules! gemm_block {
 /// # Safety
 ///
 /// Words `byte / 4` and `byte / 4 + 1` are inside `w`.
+#[allow(
+    clippy::manual_div_ceil,
+    reason = "the kernel keeps the add-and-shift form; div_ceil's remainder test would move its PTX"
+)]
 #[inline(always)]
 pub(super) unsafe fn win(w: &[u32], byte: usize) -> u32 {
     let a = byte / 4;

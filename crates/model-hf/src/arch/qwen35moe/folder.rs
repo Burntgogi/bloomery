@@ -251,7 +251,7 @@ fn ple_rows(
             row_bytes: width / divisor,
             runs,
         },
-        block_scales: (ty == GgmlType::NVFP4_ROWS).then(|| StoredPlane {
+        block_scales: (ty == GgmlType::NVFP4_ROWS).then_some(StoredPlane {
             row_bytes: width / 16,
             runs: scale_runs,
         }),
