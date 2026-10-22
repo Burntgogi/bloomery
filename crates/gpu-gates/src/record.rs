@@ -4457,8 +4457,8 @@ mod tests {
             .f("priced", 3600.0)
             .u("picks", 7)
             .u("pick_digest", u64::MAX)
-            .csv("tokens", &[1u32, 2])
-            .csv("digests", &[0u64, u64::MAX])
+            .csv("tokens", [1u32, 2])
+            .csv("digests", [0u64, u64::MAX])
             .line();
         let f = Log::of(&line, GATE_NVTIER).one(&NVTIER_SITTING).unwrap();
         assert_eq!(f.csv("tokens").unwrap(), ["1", "2"]);

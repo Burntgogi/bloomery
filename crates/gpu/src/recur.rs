@@ -93,6 +93,27 @@ impl RecStore {
     }
 }
 
+/// A fresh store's stamps over `lanes` lanes: lane 0 holds position 0, every
+/// other lane was never written ([`NEVER`]).
+pub(crate) fn fresh_stamps(lanes: usize) -> Vec<u32> {
+    let mut st = vec![NEVER; lanes];
+    if let Some(first) = st.first_mut() {
+        *first = 0;
+    }
+    st
+}
+
+/// The stamps of a store over `lanes` lanes whose lane `lane` stands at
+/// position `at` and whose every other lane was never written. A lane at or
+/// past `lanes` is refused by name.
+pub(crate) fn stamps_at(lanes: usize, lane: u32, at: u32) -> Result<Vec<u32>, GpuError> {
+    let mut st = vec![NEVER; lanes];
+    *st.get_mut(lane as usize).ok_or_else(|| {
+        GpuError::shape("recur::stamps_at", format!("lane {lane} of {lanes} lanes"))
+    })? = at;
+    Ok(st)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,25 +154,4 @@ mod tests {
         }
         Ok(())
     }
-}
-
-/// A fresh store's stamps over `lanes` lanes: lane 0 holds position 0, every
-/// other lane was never written ([`NEVER`]).
-pub(crate) fn fresh_stamps(lanes: usize) -> Vec<u32> {
-    let mut st = vec![NEVER; lanes];
-    if let Some(first) = st.first_mut() {
-        *first = 0;
-    }
-    st
-}
-
-/// The stamps of a store over `lanes` lanes whose lane `lane` stands at
-/// position `at` and whose every other lane was never written. A lane at or
-/// past `lanes` is refused by name.
-pub(crate) fn stamps_at(lanes: usize, lane: u32, at: u32) -> Result<Vec<u32>, GpuError> {
-    let mut st = vec![NEVER; lanes];
-    *st.get_mut(lane as usize).ok_or_else(|| {
-        GpuError::shape("recur::stamps_at", format!("lane {lane} of {lanes} lanes"))
-    })? = at;
-    Ok(st)
 }
