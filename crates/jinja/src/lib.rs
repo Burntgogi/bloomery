@@ -2372,21 +2372,7 @@ fn call_method(o: &V, method: &str, args: &[V], kwargs: &[(&str, V)]) -> Result<
             ))
         }
         (V::J(Value::String(s)), "split") => {
-            if args.len() > 2 {
-                return err("split() takes at most 2 arguments");
-            }
-            let mut given = [args.first(), args.get(1)];
-            for (k, a) in kwargs {
-                let i = match *k {
-                    "sep" => 0,
-                    "maxsplit" => 1,
-                    other => return err(format!("split() takes no argument {other}")),
-                };
-                if given[i].is_some() {
-                    return err(format!("split(): {k} given twice"));
-                }
-                given[i] = Some(a);
-            }
+            let given = bind_args("split()", ["sep", "maxsplit"], args, kwargs)?;
             V::J(Value::Array(
                 split(s, given[0], given[1])?
                     .into_iter()
@@ -2550,24 +2536,32 @@ fn filter(
     })
 }
 
+/// Bind positional and keyword arguments once, retaining references to the values.
+fn bind_args<'a, const N: usize>(
+    callee: &str,
+    names: [&str; N],
+    args: &'a [V],
+    kwargs: &'a [(&str, V)],
+) -> Result<[Option<&'a V>; N], TemplateError> {
+    if args.len() > N {
+        return err(format!("{callee} takes at most {N} arguments"));
+    }
+    let mut slots = std::array::from_fn(|i| args.get(i));
+    for (k, v) in kwargs {
+        let Some(i) = names.iter().position(|n| n == k) else {
+            return err(format!("{callee} takes no argument {k}"));
+        };
+        if slots[i].replace(v).is_some() {
+            return err(format!("{callee}: {k} given twice"));
+        }
+    }
+    Ok(slots)
+}
+
 /// `replace(old, new, count=None)` without autoescape: Python's `str()` on
 /// the input and both strings, then non-overlapping, character-safe replacement.
 fn replace_filter(v: V, args: &[V], kwargs: &[(&str, V)]) -> Result<V, TemplateError> {
-    if args.len() > 3 {
-        return err("|replace takes at most three arguments");
-    }
-    let mut slots = [args.first(), args.get(1), args.get(2)];
-    for (k, x) in kwargs {
-        let at = match *k {
-            "old" => 0,
-            "new" => 1,
-            "count" => 2,
-            other => return err(format!("|replace takes no argument {other}")),
-        };
-        if slots[at].replace(x).is_some() {
-            return err(format!("|replace: {k} given twice"));
-        }
-    }
+    let slots = bind_args("|replace", ["old", "new", "count"], args, kwargs)?;
     let old = slots[0].ok_or_else(|| TemplateError("|replace requires old".into()))?;
     let new = slots[1].ok_or_else(|| TemplateError("|replace requires new".into()))?;
     let count = match slots[2] {
@@ -2617,20 +2611,7 @@ fn replace_filter(v: V, args: &[V], kwargs: &[(&str, V)]) -> Result<V, TemplateE
 /// jinja2's `default(default_value='', boolean=False)`: the value, or the
 /// default when the value is undefined (or, under `boolean`, false).
 fn default_filter(v: V, args: &[V], kwargs: &[(&str, V)]) -> Result<V, TemplateError> {
-    let mut slots: [Option<&V>; 2] = [args.first(), args.get(1)];
-    if args.len() > 2 {
-        return err("|default takes at most two arguments");
-    }
-    for (k, x) in kwargs {
-        let at = match *k {
-            "default_value" => 0,
-            "boolean" => 1,
-            other => return err(format!("|default takes no argument {other}")),
-        };
-        if slots[at].replace(x).is_some() {
-            return err(format!("|default: {k} given twice"));
-        }
-    }
+    let slots = bind_args("|default", ["default_value", "boolean"], args, kwargs)?;
     let boolean = match slots[1] {
         None => false,
         Some(V::J(Value::Bool(b))) => *b,
@@ -3086,7 +3067,6 @@ mod tests {
             ("{{ 'a'|replace }}", "requires old"),
             ("{{ 'a'|replace('a') }}", "requires new"),
             ("{{ 'a'|replace(new='b') }}", "requires old"),
-            ("{{ 'a'|replace('a','b',1,2) }}", "at most three"),
             ("{{ 'a'|replace('a','b',other=1) }}", "no argument other"),
             ("{{ 'a'|replace('a','b',old='c') }}", "old given twice"),
             ("{{ 'a'|replace('a','b',new='c') }}", "new given twice"),
@@ -3105,6 +3085,20 @@ mod tests {
                 .and_then(|t| t.render(&Map::new()))
                 .expect_err("must refuse");
             assert!(e.0.contains(want), "{src}: {e}");
+        }
+    }
+
+    #[test]
+    fn keyword_callees_refuse_excess_positional_arguments() {
+        for (src, callee) in [
+            ("{{ 'a'|replace('a','b',1,2) }}", "|replace"),
+            ("{{ u|default(1, true, 2) }}", "|default"),
+            ("{{ 'a'.split(',', 1, 2) }}", "split()"),
+        ] {
+            let e = ChatTemplate::parse(src)
+                .and_then(|t| t.render(&Map::new()))
+                .expect_err("excess arguments must not produce output");
+            assert!(e.0.contains(callee), "{src}: {e}");
         }
     }
 
@@ -3137,7 +3131,6 @@ mod tests {
                    {{ e|default('d', true) }}|{{ u|default }}|{{ e|default(boolean=true, default_value='k') }}";
         assert_eq!(render(src, json!({"x": "v", "e": ""})), "d|v||d||k");
         for (src, want) in [
-            ("{{ u|default(1, true, 2) }}", "at most two"),
             ("{{ u|default(other=1) }}", "no argument other"),
             (
                 "{{ u|default(1, boolean=true, default_value=2) }}",
