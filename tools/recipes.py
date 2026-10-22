@@ -9629,6 +9629,11 @@ def module_gate_self_test(expect) -> None:
             'mod plain;\n#[cfg(feature = "fy")]\nmod gated;\n#[cfg(not(feature = "fy"))]\nmod off;\n'
             '#[cfg(all(feature = "fy", feature = "fz"))]\n#[allow(dead_code)]\nmod inl {\n    mod deep;\n'
             '    const D: &str = include_str!("../data/d.txt");\n}\n#[cfg(any(test, feature = "fy"))]\nmod either;\n'
+            '#[cfg(test)]\nmod attr_test {\n'
+            '    #[doc = concat!(stringify!({\n}\n    ),\n'
+            '        include_str!("../../../attribute-test.txt"),\n'
+            '        "tools/attribute-test-data.txt"\n    )]\n'
+            '    pub struct Item;\n    const AFTER: &str = include_str!("../../../after-attribute.txt");\n}\n'
         ),
         "crates/g/src/plain.rs": '#[doc = concat!(\n    include_str!("../../../attribute.txt"),\n    "tools/attribute-data.txt"\n)]\npub struct Plain;\n',
         "crates/g/src/gated.rs": "",
@@ -9638,6 +9643,9 @@ def module_gate_self_test(expect) -> None:
         "crates/g/data/d.txt": "",
         "attribute.txt": "attribute1\n",
         "tools/attribute-data.txt": "literal1\n",
+        "attribute-test.txt": "test attribute\n",
+        "tools/attribute-test-data.txt": "test literal\n",
+        "after-attribute.txt": "after attribute\n",
         "crates/g/src/bin/x.rs": '#[cfg(feature = "fy")]\nmod xg;\nfn main() {}\n',
         "crates/g/src/bin/xg.rs": "",
         "crates/g/src/bin/y.rs": "fn main() {}\n",
@@ -9677,6 +9685,11 @@ def module_gate_self_test(expect) -> None:
             sels, _, _ = select([os.path.normpath(os.path.join("crates/g/src", rel))], side, side, GATE_PREFIX)
             got = {x.recipe for x in sels}
             expect(got == want, f"module gate: {what} selects {sorted(got)}, not {sorted(want)}")
+        for rel in ("attribute-test.txt", "tools/attribute-test-data.txt", "after-attribute.txt"):
+            sels, _, _ = select([rel], side, side, GATE_PREFIX)
+            got = {x.recipe for x in sels} - whole
+            expect(got == {"gate-lib", "gate-liby", "gate-all"},
+                   f"module gate: an attribute brace must leave {rel} test-only, selected {sorted(got)}")
         expect(not side.tree.unresolved, f"module gate: unresolved {side.tree.unresolved[:2]}")
 
 
