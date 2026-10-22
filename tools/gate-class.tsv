@@ -30,6 +30,7 @@ gate-emb2-mel	family	gemma4a	media	serve_media
 gate-embed	common		host	ple_embed
 gate-engram	common		host	engram_verbs
 gate-ffn	family	deepseek2	host	model_host_ops
+gate-flint-meta	family	flint	meta	arch_registry
 gate-fixture	tooling		fixture-writer	-
 gate-fixture-budget	tooling		fixture-writer	-
 gate-forward	family	deepseek2	host	model_host_ops

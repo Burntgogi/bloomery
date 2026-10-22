@@ -1,9 +1,32 @@
 # Flint: reader and common-owner attachment design (#632)
 
-Snapshot: **`e53cabebbb9b16249c81b7c26a026da1670f7d9d`**. This completes the
-**design round** requested by [#632](https://github.com/midagedev/bloomery/issues/632), not the reader,
-body or serve-seat implementation. Flint remains unsupported until the acceptance gates below pass.
-No GPU, model-inference, performance or weight-content validation is claimed here.
+Design snapshot: **`e53cabebbb9b16249c81b7c26a026da1670f7d9d`**, requested by
+[#632](https://github.com/midagedev/bloomery/issues/632). The source-gap observations below describe
+that snapshot. The current tree additionally has a **header-only reader**; it still has no Flint
+body, app session or serve seat. No GPU, inference, performance or weight-content validation is claimed.
+
+## Host reader status
+
+`arch/flint` reads independent bool SWA/RoPE masks, explicit head widths, the dense lead,
+sigmoid router facts, optional selection bias and one explicitly sized ungated shared MLP.
+It reuses the common metadata validators, tensor stems, classification and dimension checks.
+The common needs walk emits q/k normalization even on NoPE layers. `program_of(Flint)` remains
+`None`; missing program, head128 sinks/SWA, NoPE normalization and 256/top6 bindings remain coverage
+refusals. The generic router's `norm` flag describes requested normalization, **not** an implementation
+of Flint's denominator floor or activated-value scaling.
+
+Run `BLOOMERY_MODEL=<pinned GGUF or header prefix> BLOOMERY_BOX_LOCAL=1 just gate-flint-meta`.
+The gate hashes the first 5,470,528 bytes before using `gguf::inventory_of`, `write::Layout`
+and `Split::header_only`; it reads no tensor payload and never treats a sparse file as real weights.
+The pinned header yielded 779 tensors, 49 layers, 2 dense/47 routed blocks, 49 head-normalization
+needs, 35 rotary needs and 49 sink-attention needs. An external reader smoke also exercised
+short/malformed masks, zero window, nonfinite scale, missing sink/norm/shared tensors, a malformed
+optional bias and an unknown tensor: each was refused with the offending key/name.
+
+The independent common Jinja and tokenizer changes are tracked by #632; a reader does not imply
+those changes are present in an older checkout. Fixture/refset registration is intentionally absent:
+the artifact license/provenance conflict below is unresolved, and runtime support still requires the
+remaining acceptance rows. This header gate is not an end-to-end model gate.
 
 ## 1. Sources and observed artifact
 

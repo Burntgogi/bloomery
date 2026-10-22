@@ -3181,6 +3181,11 @@ gate-gemma-embedding2-meta:
 gate-gemma-embedding-meta:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::gemma_embedding:: --nocapture && bash tools/gate.sh --release -p bloomery-model --test gemma_embedding_meta -- --ignored --nocapture'
 
+# Flint header-only reader and coverage refusals. BLOOMERY_MODEL names the pinned
+# UD-Q4_K_XL GGUF or a prefix through its padded header; no payload or GPU is read.
+gate-flint-meta:
+    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::flint --nocapture && bash tools/gate.sh --release -p bloomery-model --test flint_meta -- --ignored --nocapture'
+
 # mimo2 (MiMo-V2.6-Flash) end-to-end: the program loaded once by the gate placement, the 3090's bytes on either card
 # (every routed expert on the host tier, the host set derived at about 161.5 GB), against ik's sets (refset `ik-mimo2`,
 # dumped from the MOPD file): (s) the step's node count and its memory operations, the layer kinds, each layer's
