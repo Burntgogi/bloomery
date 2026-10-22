@@ -676,6 +676,7 @@ sj_main() {
 # `bash tools/ref/sj-vs-clef.sh --self-test`: the stub servers (a tiny Python HTTP server that answers
 # /v1/systemone, /v1/chat/completions and /tokenize with canned bodies), the windows, the servers stopped, the
 # refusals and the ruler's math. No card, no lease, no model.
+# Each case reserves its three port choices together, then releases them before starting the servers.
 sj_selftest() {
   local n=0 fails=0 RC=0 C='' stub='' CP='' QP='' DP='' SELF=$HERE/sj-vs-clef.sh k p rows kv
   # T and RUNPID are read by the EXIT trap, after this function has returned: not local.
@@ -890,9 +891,9 @@ SMI
   : > "$T/hang.gguf"
   : > "$T/plan.gguf"
   : > "$T/other.gguf"
-  st_port() { python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])'; }
-  # st_prep: a fresh case directory and the two ports; the previous case's servers reaped first.
+  # st_prep: a fresh case directory and three distinct ports; the previous case's servers reaped first.
   st_prep() {
+    local ports
     st_reap "$T/case"
     C=$T/case
     rm -rf "$C"
@@ -906,9 +907,17 @@ SMI
     echo 'fn main() {}' > "$C/tree/crates/x/src/lib.rs"
     touch -t 200001010000 "$C/tree/Cargo.toml" "$C/tree/Cargo.lock" "$C/tree/crates/x/src/lib.rs"
     [ -z "${ST_STALE:-}" ] || touch -t 203001010000 "$C/tree/crates/x/src/lib.rs"
-    CP=$(st_port)
-    QP=$(st_port)
-    DP=$(st_port)
+    # Keep every socket bound until all choices are made; a released port can be handed straight back.
+    ports=$(python3 - << 'PORTS'
+import socket
+
+sockets = [socket.socket() for _ in range(3)]
+for sock in sockets:
+    sock.bind(("127.0.0.1", 0))
+print(*(sock.getsockname()[1] for sock in sockets))
+PORTS
+    ) || exit 2
+    read -r CP QP DP <<< "$ports"
   }
   # st_launch <function and arguments>: the runner's function in a bash of its own, as the justfile runs the script, so
   # its $$ and its traps are the runner's; its output in $C/out. The lease, the witness and the guards are stand-ins.
