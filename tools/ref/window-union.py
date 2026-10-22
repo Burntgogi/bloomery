@@ -39,9 +39,14 @@ Per set and k:
     slots    mean host slots per row (Σ_l over one row) and mean union per window
 
 then, per layer range, the pooled ratio per k. The last block (`all`) pools every set's windows.
+
+Zero-host windows count toward `windows` but not the mean or percentiles of the ratio. A zero
+predicted or pooled denominator prints `nan` (range tables use `-`), not a measured ratio of zero.
+When no window fits within a chunk, measured means also print `nan`; actual zero work prints 0.
 """
 import importlib.util
 import io
+import math
 import os
 import sys
 import tempfile
@@ -238,8 +243,10 @@ def report(set_dirs, spec, ks, ranges, policy=None):
                 pu += u
                 ps += sl
             m = summary(win[k])
-            print(f"{k}\t{m['windows']}\t{pu / ps:.3f}\t{m['mean']:.3f}\t{m['p10']:.3f}\t{m['p90']:.3f}\t"
-                  f"{m['pooled']:.3f}\t{m['union']:.1f}\t{sum(win[k][1]) / len(win[k][1]):.1f}")
+            predicted = pu / ps if ps else float("nan")
+            slots_per_window = sum(win[k][1]) / m["windows"] if m["windows"] else float("nan")
+            print(f"{k}\t{m['windows']}\t{predicted:.3f}\t{m['mean']:.3f}\t{m['p10']:.3f}\t{m['p90']:.3f}\t"
+                  f"{m['pooled']:.3f}\t{m['union']:.1f}\t{slots_per_window:.1f}")
             pooled_all[k][0].extend(win[k][0])
             pooled_all[k][1].extend(win[k][1])
             for l, (u, sl) in per_layer[k].items():
@@ -381,6 +388,21 @@ def self_test():
         chunked = rc.read_manifest(_fake_set(root, "chunked", {0: [(3, 7)] * 8}, E, K, chunk=4))
         win, _, _ = measure(chunked, {0: set()}, (2, 4))
         assert summary(win[2])["windows"] == 6 and summary(win[4])["windows"] == 2
+        # Zero-host windows have no ratio but still count; an empty window set has no measured means.
+        host = _fake_set(root, "host", {0: [(9, 10)] * 8}, E, K, chunk=4)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            report([chunked["dir"], host], "0:8", (2, 8), "0-0")
+        table = [[float(c) for c in line.split("\t")] for line in buf.getvalue().splitlines()
+                 if line.startswith(("2\t", "8\t"))]
+        zero, active, pooled = [row for row in table if row[0] == 2]
+        assert zero[:2] == [2, 6] and all(math.isnan(v) for v in zero[2:7]) and zero[7:] == [0, 0], zero
+        assert active == [2, 6, 0.5, 0.5, 0.5, 0.5, 0.5, 2, 4], active
+        assert pooled == [2, 12, 0.5, 0.5, 0.5, 0.5], pooled
+        zero, active, pooled = [row for row in table if row[0] == 8]
+        assert zero[:2] == [8, 0] and all(math.isnan(v) for v in zero[2:]), zero
+        assert active[:3] == [8, 0, 0.125] and all(math.isnan(v) for v in active[3:]), active
+        assert pooled[:2] == [8, 0] and all(math.isnan(v) for v in pooled[2:]), pooled
         # the prediction: 16 experts each picked once in 8 rows, p = 1/8: 16 (1 - (7/8)^2) over 2 x 2
         u, sl = predict([1] * E, 8, set(), 2)
         assert abs(u / sl - 16 * (1 - (7 / 8) ** 2) / 4) < 1e-12 and abs(sl - 4.0) < 1e-12
