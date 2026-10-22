@@ -326,6 +326,33 @@ class RecipeKeyCLI(unittest.TestCase):
             with self.subTest(rel=rel), ws.changed(rel, changed, restore_mtime=True):
                 ws.assert_status(ws.keys(*items, ledger=True), {"gate-called": "run", "gate-linked": "skip"})
 
+    def test_absolute_and_raw_paths_invalidate_called_inputs(self):
+        for call, module in (("::dep::used::run()", "used"), ("dep::r#type::run()", "type")):
+            with self.subTest(call=call):
+                files = runtime_files()
+                files["crates/mid/src/lib.rs"] = f"pub fn run() {{ {call}; }}\n"
+                if module == "type":
+                    files["crates/dep/src/lib.rs"] += "pub mod r#type;\n"
+                    files["crates/dep/src/type.rs"] = 'pub fn run() { println!("raw1"); }\n'
+                ws = Workspace(self, files)
+                ws.green("gate-called", "gate-linked")
+                rel = f"crates/dep/src/{module}.rs"
+                with ws.changed(rel, files[rel].replace("1", "2"), restore_mtime=True):
+                    ws.assert_status(ws.keys("gate-called", "gate-linked", ledger=True),
+                                     {"gate-called": "run", "gate-linked": "skip"})
+
+    def test_nonstandard_target_root_keeps_called_inputs(self):
+        files = runtime_files()
+        del files["crates/app/src/bin/called.rs"]
+        files["crates/app/Cargo.toml"] += '\n[[bin]]\nname = "called"\npath = "src/main.rust"\n'
+        files["crates/app/src/main.rust"] = "fn main() { dep::used::run(); }\n"
+        ws = Workspace(self, files)
+        ws.green("gate-called", "gate-linked")
+        rel = "crates/dep/src/used.rs"
+        with ws.changed(rel, files[rel].replace("used1", "used2"), restore_mtime=True):
+            ws.assert_status(ws.keys("gate-called", "gate-linked", ledger=True),
+                             {"gate-called": "run", "gate-linked": "skip"})
+
     def test_known_source_macro_startup_and_implicit_impl_inputs(self):
         for kind in ("exported-startup", "exported-expression", "exported-import", "exported-proc-startup",
                      "local-relative-import", "local-drop", "shadowed-builtin"):

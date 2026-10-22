@@ -53,6 +53,12 @@ matches, for example a red unit again. The script reads every list from its owne
 `python3 tools/recipes.py pure-crates`, the Python self-tests from the `selftests=(` array of `tools/check-recipes.sh`,
 and the host units from `python3 tools/recipes.py host-nightly`.
 
+`python3 tools/recipes-key-test.py --self-test` checks the public key/ledger CLI in isolated, offline Cargo
+workspaces. Called-source edits must invalidate a recorded green result even when size and mtime stay unchanged.
+Absolute paths and raw identifiers retain conservative owner/dependency bounds when structural resolution is
+uncertain; Cargo-selected roots and declared Rust modules are source regardless of their filename suffix.
+The persistent structural cache must preserve these inputs across fresh processes.
+
 The mapped checkpoint reader is `bloomery-safetensors`; `gate-safetensors` owns its dtype, span and shard tests.
 `f32_values` also checks directly constructed `Raw` values: shape and dtype must account for the complete
 byte span without overflow. A partial value or a mismatched span is `Error::Format`, not a truncated conversion.

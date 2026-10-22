@@ -3432,7 +3432,7 @@ def _key_syntax(text: str) -> KeySyntax:
     calls = frozenset(match.group(1) for match in _MACRO_PATH_CALL.finditer(shape))
     return KeySyntax(
         frozenset(re.findall(r"\bextern\s+crate\s+([A-Za-z_]\w*)", shape)),
-        opaque,
+        opaque or bool(re.search(r"(?<![\w:>\]])::|r#[A-Za-z_]", shape)),
         linkage or bool(re.search(r'\bextern\s*(?:"[^"]*"\s*)?\{', code))
         or bool(re.search(r'\binclude!\s*\(\s*(?!")\S', code)
                 or re.search(r'\binclude!\s*\(\s*"[^"]*(?<!\.rs)"', code)),
@@ -3957,8 +3957,8 @@ class Reach:
         return path
 
     def units(self, rk: RootKey, f: str) -> list[Hit]:
-        """Every unit of file `f` in root `rk`; a file with no Rust items (a data file, an empty module) as -1."""
-        if not f.endswith(".rs"):
+        """Every unit of a Rust module; a non-source data file uses index -1."""
+        if not f.endswith(".rs") and f not in self.mods(rk).values():
             return [(rk, f, -1)]
         n = len(self.facts(rk, f).units)
         return [(rk, f, i) for i in range(n)] or [(rk, f, -1)]
@@ -11163,6 +11163,7 @@ def oxide_rev_self_test(expect) -> None:
 
 def key_reach_self_test(expect, side: Side) -> None:
     """The runtime key/reach pins and genuine Cargo-linkage explanation chains on the real tree."""
+    # PIN(2026-10-22): Drop the plain-link hf mutation: v2 keys exclude uncalled runtime code.
     for crate, reason in KEY_REACH_PINS.items():
         gap = key_reach_gap(side, crate)
         expect(not gap, f"{crate} ({reason}): {len(gap)} recipes key it without reaching it: {' '.join(gap[:8])}")
