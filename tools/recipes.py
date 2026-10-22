@@ -1245,11 +1245,8 @@ class Tree:
             s = line.strip()
             if not s or s.startswith("//"):
                 continue
-            if attr_depth > 0:
-                attr_depth += s.count("[") - s.count("]")
-                continue
             indent = len(line) - len(line.lstrip())
-            if s == "}" and inline and inline[-1][0] == indent:
+            if attr_depth == 0 and s == "}" and inline and inline[-1][0] == indent:
                 inline.pop()
                 continue
             here = inline[-1][2] if inline else test
@@ -1267,6 +1264,9 @@ class Tree:
                     (acc.test_files if here else acc.files).add(p)
                 else:
                     self.unresolved.append(f"{rel}: include of {inc} ({p} not found)")
+            if attr_depth > 0:
+                attr_depth += s.count("[") - s.count("]")
+                continue
             # `#[cfg(test)] mod x;`, `#[path = "x.rs"] mod x;`, `#[cfg(test)] #[path = "x.rs"]`: each
             # one-line attribute counts as if on a line of its own, then the item after them is read
             attrs, rest = self.lead_attrs(s)
@@ -9630,12 +9630,14 @@ def module_gate_self_test(expect) -> None:
             '#[cfg(all(feature = "fy", feature = "fz"))]\n#[allow(dead_code)]\nmod inl {\n    mod deep;\n'
             '    const D: &str = include_str!("../data/d.txt");\n}\n#[cfg(any(test, feature = "fy"))]\nmod either;\n'
         ),
-        "crates/g/src/plain.rs": "",
+        "crates/g/src/plain.rs": '#[doc = concat!(\n    include_str!("../../../attribute.txt"),\n    "tools/attribute-data.txt"\n)]\npub struct Plain;\n',
         "crates/g/src/gated.rs": "",
         "crates/g/src/off.rs": "",
         "crates/g/src/inl/deep.rs": "",
         "crates/g/src/either.rs": "",
         "crates/g/data/d.txt": "",
+        "attribute.txt": "attribute1\n",
+        "tools/attribute-data.txt": "literal1\n",
         "crates/g/src/bin/x.rs": '#[cfg(feature = "fy")]\nmod xg;\nfn main() {}\n',
         "crates/g/src/bin/xg.rs": "",
         "crates/g/src/bin/y.rs": "fn main() {}\n",
@@ -9661,6 +9663,8 @@ def module_gate_self_test(expect) -> None:
         fy = {"gate-xy", "gate-yz", "gate-liby", "gate-all"} | whole
         cases = [
             ("an ungated module", "plain.rs", every),
+            ("an include on an inner attribute line", "../../../attribute.txt", every),
+            ("a path literal on an inner attribute line", "../../../tools/attribute-data.txt", every),
             ("a module under feature = fy", "gated.rs", fy),
             ("a module under not(feature = fy)", "off.rs", {"gate-x", "gate-lib"} | whole),
             ("a module under any(test, feature = fy), which a test build compiles whatever the features", "either.rs", every),

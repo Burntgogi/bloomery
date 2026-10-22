@@ -95,6 +95,9 @@ The flowcounts weekly reads its record parser and schema, routing data and stati
 Use `python3 tools/recipes.py why tools/bloomery/hf.py --recipe weekly-gpu-ds41-flowcounts` to inspect that boundary.
 The script walk is conservative: a helper's prose must not turn the self-tests that use it into dependencies of
 the helper itself. The regression holds both the absent hub input and the retained executable inputs.
+Includes and repository-path literals on inner lines of a multiline Rust attribute are inputs too.
+The recipe self-test checks that changing either selects the compiling recipes; attribute contents
+must not bypass input discovery while the module/`cfg` scanner skips their syntax.
 
 The gate-batch self-test waits for stopped fixture lanes and their registered
 items to finish before a case can remove its tree. A delayed TERM-handler case
