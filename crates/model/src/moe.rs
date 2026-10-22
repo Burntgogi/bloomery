@@ -1051,7 +1051,7 @@ fn serve_resolved(
     // and two reads of `x` an expert; a relu² leg's holds the ups alone, and
     // moves them to the up slots once the down has read them.
     let (first, up_site) = match run.form {
-        ExpertForm::Gated { .. } => (2 * n, "host_gate_up"),
+        ExpertForm::Gated { .. } | ExpertForm::GatedOai { .. } => (2 * n, "host_gate_up"),
         ExpertForm::Relu2 => (n, "host_up"),
     };
     let mut xl: Vec<&Tensor2> = relist(std::mem::take(xs));
@@ -1064,6 +1064,11 @@ fn serve_resolved(
         ExpertForm::Gated { limit } => {
             for [gate, up] in gate_up[..2 * n].as_chunks::<2>().0 {
                 sl.push(GroupInput::SwigluClamp(gate, up, limit));
+            }
+        }
+        ExpertForm::GatedOai { alpha, limit } => {
+            for [gate, up] in gate_up[..2 * n].as_chunks::<2>().0 {
+                sl.push(GroupInput::SwigluOai(gate, up, alpha, limit));
             }
         }
         ExpertForm::Relu2 => {
@@ -1782,7 +1787,7 @@ fn serve_tiered<'w>(
     let slots = tier.slots.slots(tier.layer);
     if slots >= 2 * batch && s.tier_ids.len() <= slots - 2 * batch {
         tier.slots
-            .note_union(tier.layer, &s.plan.ids, &s.plan.off, false);
+            .note_union(tier.layer, &s.plan.ids, &s.plan.off, lists.len(), false);
         let pin = tier
             .slots
             .ensure_pinned(tier.layer, &s.tier_ids, Claim::Keep)?;
@@ -1801,7 +1806,7 @@ fn serve_tiered<'w>(
         .into());
     }
     tier.slots
-        .note_union(tier.layer, &s.plan.ids, &s.plan.off, true);
+        .note_union(tier.layer, &s.plan.ids, &s.plan.off, lists.len(), true);
     let batching = Batching {
         tier,
         keep: slots - 2 * batch,
@@ -1862,6 +1867,8 @@ fn serve_batched<'w>(
         tier.layer,
         &ids[span(cut.host)],
         claim_of(cut.host),
+        1,
+        None,
     )?);
     let mut base = 0;
     for g in 0..ends.len() {
@@ -1874,6 +1881,8 @@ fn serve_batched<'w>(
                     tier.layer,
                     &ids[span(g + 1)],
                     claim_of(g + 1),
+                    1,
+                    None,
                 )?);
             }
             tier.check_lent(&stacks, &ids[span(g)])?;
@@ -2066,8 +2075,10 @@ pub fn experts_union_into<'x>(
 /// What a host tier needs to serve one layer's routed experts, in the
 /// file's own terms: the three stacks' tensor names, the expert count, the
 /// widths and the routed experts' SwiGLU limit — the gated reading of a
-/// layer ([`ExpertForm::Gated`], which [`HostLayer::build`] serves it by);
-/// the relu² reading has its own spec ([`Relu2Spec`], [`HostLayer::build_relu2`]).
+/// layer ([`ExpertForm::Gated`], which [`HostLayer::build`] serves it by, or
+/// [`ExpertForm::GatedOai`], which [`HostLayer::build_oai`] serves it by, the
+/// spec's limit the OAI rule's); the relu² reading has its own spec
+/// ([`Relu2Spec`], [`HostLayer::build_relu2`]).
 /// The architecture fills it; this module reads no model's names or keys.
 pub struct HostLayerSpec<'a> {
     pub gate: &'a str,
@@ -2459,12 +2470,16 @@ pub trait TierSlots: Send + Sync {
     /// ticket's pin (the claim found it so), and an id whose slot lends
     /// nothing is in flight until the wait: a step computes the first early
     /// and the second after its wait. The default fills on the caller, the
-    /// ticket ready.
+    /// ticket ready. `columns` is the call's column count. With `column_off`,
+    /// `ids` is the full union plan, including host ids, and `ids[d]` routes
+    /// `column_off[d + 1] - column_off[d]` columns; without, each id routes once.
     fn prefetch_pinned<'a>(
         &'a self,
         layer: usize,
         ids: &[u32],
         claim: Claim,
+        _columns: u64,
+        _column_off: Option<&[usize]>,
     ) -> Result<Ticket<'a>, TierError> {
         self.ensure_pinned(layer, ids, claim).map(Ticket::ready)
     }
@@ -2474,15 +2489,24 @@ pub trait TierSlots: Send + Sync {
     /// [`TierSlots::ensure_pinned`], a [`Ticket`]'s pin): no claim takes a
     /// pinned slot, and an unpinned one is the LRU's to refill.
     fn slot(&self, layer: usize, id: u32, part: usize) -> Option<&[u8]>;
-    /// A prompt union call on `layer`, told once per tiered union call,
-    /// before its first batch's claim, as it takes its path: `batched` when
-    /// its arena ids are more than the layer's slots less two batches. `ids`
-    /// are the call's distinct ids, ascending, those of the plan's host
-    /// segment included, and the columns that list `ids[d]` number
-    /// `off[d + 1] - off[d]`. A call refused before its path is told is not
-    /// told. It must not lock or allocate unless its tier was asked to keep
-    /// the call; a tier that keeps no books takes the default.
-    fn note_union(&self, _layer: usize, _ids: &[u32], _off: &[usize], _batched: bool) {}
+    /// A prompt union call of `cols` columns on `layer`, told once per tiered
+    /// union call, before its first batch's claim, as it takes its path:
+    /// `batched` when its arena ids are more than the layer's slots less two
+    /// batches. `ids` are the call's distinct ids, ascending, those of the
+    /// plan's host segment included, and the columns that list `ids[d]`
+    /// number `off[d + 1] - off[d]`. A call refused before its path is told
+    /// is not told. It must not lock or allocate unless its tier keeps books
+    /// of the call (a gate's record of it, or the routing counts its
+    /// victims are ranked by); a tier that keeps none takes the default.
+    fn note_union(
+        &self,
+        _layer: usize,
+        _ids: &[u32],
+        _off: &[usize],
+        _cols: usize,
+        _batched: bool,
+    ) {
+    }
     /// Host compute of a step's hit group while its miss ticket was still
     /// in flight, in ns. A tier that does not count it takes the default.
     /// A ready ticket never reaches the hit group, so it adds nothing.
@@ -2599,6 +2623,46 @@ impl HostLayer {
         )
     }
 
+    /// [`HostLayer::build`] for a SwiGLU-OAI layer ([`ExpertForm::GatedOai`]):
+    /// the same three stacks and the same checks, the spec's `swiglu_limit`
+    /// the OAI rule's `limit` and `alpha` beside it, like the relu² form, an
+    /// activation fact the load resolves. A non-finite or negative limit and
+    /// a non-finite or non-positive alpha are refused by name.
+    pub fn build_oai(
+        src: R8Source<'_>,
+        spec: &HostLayerSpec<'_>,
+        alpha: f32,
+    ) -> Result<HostLayer, ModelError> {
+        if !(spec.swiglu_limit.is_finite() && spec.swiglu_limit >= 0.0) {
+            return Err(ModelError::Metadata {
+                key: "swiglu_oai limit".to_string(),
+                detail: format!(
+                    "the limit must be finite and not negative, got {}",
+                    spec.swiglu_limit
+                ),
+            });
+        }
+        if !(alpha.is_finite() && alpha > 0.0) {
+            return Err(ModelError::Metadata {
+                key: "swiglu_oai alpha".to_string(),
+                detail: format!("the alpha must be finite and positive, got {alpha}"),
+            });
+        }
+        Self::build_form(
+            src,
+            StackNames {
+                gate: Some(spec.gate),
+                up: spec.up,
+                down: spec.down,
+            },
+            (spec.n_expert, spec.embd, spec.ff),
+            ExpertForm::GatedOai {
+                alpha,
+                limit: spec.swiglu_limit,
+            },
+        )
+    }
+
     /// [`HostLayer::build`] for a relu² layer ([`Relu2Spec`]): the up and the
     /// down checked as the gated build checks them, no gate stack looked for.
     /// The form rides beside the spec like the r8 sidecar does: an activation
@@ -2616,7 +2680,8 @@ impl HostLayer {
         )
     }
 
-    /// [`HostLayer::build`] and [`HostLayer::build_relu2`]'s one body over
+    /// [`HostLayer::build`], [`HostLayer::build_oai`] and
+    /// [`HostLayer::build_relu2`]'s one body over
     /// the named stacks: a gate name (`Some`) is a stack the layer holds, found,
     /// checked and served; `None`, one it does not.
     fn build_form(
@@ -2803,10 +2868,15 @@ impl HostLayer {
     }
 
     /// The routed experts' SwiGLU limit, a gated layer's; `0.0` for a relu²
-    /// layer, which clamps nothing.
+    /// layer, which clamps nothing. A SwiGLU-OAI layer has no SwiGLU clamp (its
+    /// limit is the OAI rule's, [`HostLayer::form`]), so it panics by name
+    /// instead of handing that number to a clamp.
     pub fn swiglu_limit(&self) -> f32 {
         match self.form {
             ExpertForm::Gated { limit } => limit,
+            ExpertForm::GatedOai { .. } => {
+                panic!("swigluoai has no SwiGLU clamp: read the OAI rule's limit from the form")
+            }
             ExpertForm::Relu2 => 0.0,
         }
     }
@@ -3024,9 +3094,9 @@ impl HostLayer {
         if union.tier_ids.is_empty() {
             return self.serve_column(lanes, split, x, experts, out, scratch);
         }
-        let ticket = tier
-            .slots
-            .prefetch_pinned(tier.layer, &union.tier_ids, Claim::Step)?;
+        let ticket =
+            tier.slots
+                .prefetch_pinned(tier.layer, &union.tier_ids, Claim::Step, 1, None)?;
         if ticket.is_ready() || !union.plan.fits(union.max_slots) {
             let _pin = ticket.wait()?;
             return self.serve_column(lanes, split, x, experts, out, scratch);
@@ -3167,9 +3237,13 @@ impl HostLayer {
         // The claim is made now and the misses fill on the tier's threads;
         // the pin lasts until the union's reads end, as `experts_into_on`'s
         // ids are.
-        let ticket = tier
-            .slots
-            .prefetch_pinned(tier.layer, &scratch.tier_ids, Claim::Step)?;
+        let ticket = tier.slots.prefetch_pinned(
+            tier.layer,
+            &scratch.plan.ids,
+            Claim::Step,
+            lists.len() as u64,
+            Some(&scratch.plan.off),
+        )?;
         tier.lend(&mut stacks);
         if ticket.is_ready() || !scratch.plan.fits(scratch.max_slots) {
             let pin = ticket.wait()?;
@@ -3221,7 +3295,7 @@ impl HostLayer {
         // A relu² layer warms its up and its down; the stacks' gate slot is
         // the up again.
         let warmed = match self.form {
-            ExpertForm::Gated { .. } => &stacks[..],
+            ExpertForm::Gated { .. } | ExpertForm::GatedOai { .. } => &stacks[..],
             ExpertForm::Relu2 => &stacks[1..],
         };
         'ids: for &id in ids {
@@ -3614,6 +3688,230 @@ mod tests {
         println!("refusal: {e}");
     }
 
+    /// The OAI form's layer over `split`: the spec of [`build_layer`] with
+    /// `limit` and `alpha`.
+    fn build_oai_layer(
+        split: &gguf::Split,
+        (embd, ff, n_expert): (usize, usize, usize),
+        (alpha, limit): (f32, f32),
+    ) -> Result<HostLayer, crate::ModelError> {
+        HostLayer::build_oai(
+            R8Source::rows(split),
+            &HostLayerSpec {
+                gate: "gate_exps",
+                up: "up_exps",
+                down: "down_exps",
+                n_expert,
+                embd,
+                ff,
+                swiglu_limit: limit,
+            },
+            alpha,
+        )
+    }
+
+    /// A SwiGLU-OAI layer's list call is the OAI rule on the same weights:
+    /// per expert the gate and up dots, [`qdot::swiglu_oai`] over them, the
+    /// down over that, summed in list order — bit for bit the composition of
+    /// the allocating group entry — and it differs from the clamped form's
+    /// result over the same stacks.
+    #[test]
+    fn host_layer_oai_matches_the_rule_and_differs_from_the_clamp() {
+        let (embd, ff, n_expert) = (256, 256, 3);
+        let (alpha, limit) = (1.702f32, 7.0f32);
+        let path = layer_file("oai", [GgmlType::Q4_K; 3], embd, ff, n_expert);
+        let split = gguf::Split::open(&path).unwrap();
+        let src = R8Source::rows(&split);
+        let oai = build_oai_layer(&split, (embd, ff, n_expert), (alpha, limit)).unwrap();
+        assert_eq!(
+            oai.form(),
+            ExpertForm::GatedOai { alpha, limit },
+            "the layer carries its form"
+        );
+        let clamp = HostLayer::build(
+            src,
+            &HostLayerSpec {
+                gate: "gate_exps",
+                up: "up_exps",
+                down: "down_exps",
+                n_expert,
+                embd,
+                ff,
+                swiglu_limit: limit,
+            },
+        )
+        .unwrap();
+        let x = Tensor2::from_vec(
+            embd,
+            1,
+            (0..embd)
+                .map(|i| ((i * 7919) % 1013) as f32 / 1013.0 - 0.5)
+                .collect(),
+        );
+        let list = [(2u32, 0.5f32), (0, 0.25)];
+        let run = |layer: &HostLayer| {
+            let mut host = HostScratch::new(embd, ff, list.len()).unwrap();
+            let mut out = vec![f32::NAN; embd];
+            layer
+                .experts_into(src, &x, &list, &mut out, &mut host)
+                .unwrap();
+            out
+        };
+
+        let g = gguf::Gguf::open(&path).unwrap();
+        let view = |name: &str, e: u32| {
+            super::expert_view(g.find(name).unwrap(), e as usize, n_expert).unwrap()
+        };
+        let mut want = vec![0.0f32; embd];
+        for &(e, w) in &list {
+            let [gate, up, down] = ["gate_exps", "up_exps", "down_exps"].map(|n| view(n, e));
+            let gu = ops::matmul_q_group(&g, &[&gate, &up], &[&x, &x]).unwrap();
+            let mut act = vec![0.0f32; ff];
+            assert!(qdot::swiglu_oai(
+                &gu[0].data,
+                &gu[1].data,
+                alpha,
+                limit,
+                &mut act
+            ));
+            let act = Tensor2::from_vec(ff, 1, act);
+            let d = ops::matmul_q_group(&g, &[&down], &[&act]).unwrap();
+            for (o, &dv) in want.iter_mut().zip(d[0].col(0)) {
+                *o += w * dv;
+            }
+        }
+        let got = run(&oai);
+        let diff = got
+            .iter()
+            .zip(&want)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        println!("oai layer vs the rule: diff_cells={diff}");
+        assert_eq!(diff, 0, "the layer's result must be the OAI composition");
+
+        let clamped = run(&clamp);
+        let apart = got
+            .iter()
+            .zip(&clamped)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        assert!(
+            apart > 0,
+            "the OAI form must not give the clamped form's result"
+        );
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// A SwiGLU-OAI layer has no SwiGLU clamp: `swiglu_limit` panics by name
+    /// instead of returning the OAI rule's limit, while a clamped layer still
+    /// returns its own.
+    #[test]
+    fn host_layer_oai_has_no_swiglu_clamp_limit() {
+        let (embd, ff, n_expert) = (256, 256, 2);
+        let path = layer_file("oailimit", [GgmlType::Q4_K; 3], embd, ff, n_expert);
+        let split = gguf::Split::open(&path).unwrap();
+        let oai = build_oai_layer(&split, (embd, ff, n_expert), (1.702, 7.0)).unwrap();
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| oai.swiglu_limit()));
+        std::fs::remove_file(&path).unwrap();
+        let payload = caught.expect_err("an OAI layer has no SwiGLU clamp to return");
+        let text = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap_or_default();
+        assert!(
+            text.contains("swigluoai has no SwiGLU clamp"),
+            "the panic must name the rule, got {text:?}"
+        );
+    }
+
+    /// [`HostLayer::build_oai`] refuses by name a NaN alpha, a zero or
+    /// negative alpha, a negative limit and a non-finite limit, before it looks
+    /// for a stack.
+    #[test]
+    fn host_layer_build_oai_refuses_by_name() {
+        let (embd, ff, n_expert) = (256, 256, 2);
+        let path = layer_file("oairefuse", [GgmlType::Q4_K; 3], embd, ff, n_expert);
+        let split = gguf::Split::open(&path).unwrap();
+        for (alpha, limit, want) in [
+            (f32::NAN, 7.0, "swiglu_oai alpha"),
+            (0.0, 7.0, "swiglu_oai alpha"),
+            (-1.0, 7.0, "swiglu_oai alpha"),
+            (1.702, -7.0, "swiglu_oai limit"),
+            (1.702, f32::NAN, "swiglu_oai limit"),
+            (1.702, f32::INFINITY, "swiglu_oai limit"),
+        ] {
+            let e = build_oai_layer(&split, (embd, ff, n_expert), (alpha, limit))
+                .err()
+                .unwrap_or_else(|| panic!("alpha {alpha}, limit {limit} must be refused"))
+                .to_string();
+            assert!(
+                e.contains(want),
+                "alpha {alpha}, limit {limit}: the refusal must name {want:?}, got {e:?}"
+            );
+        }
+        build_oai_layer(&split, (embd, ff, n_expert), (1.702, 0.0))
+            .expect("a zero limit is the rule's, not a refusal");
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// A union call over a SwiGLU-OAI layer writes, column for column and bit
+    /// for bit, what the one-column call writes: narrow (3 columns) and wide
+    /// (12).
+    #[test]
+    fn union_call_on_an_oai_layer_matches_its_columns() {
+        let (embd, ff, n_expert) = (256, 256, 6);
+        let path = layer_file("oaiunion", [GgmlType::Q4_K; 3], embd, ff, n_expert);
+        let split = gguf::Split::open(&path).unwrap();
+        let layer = build_oai_layer(&split, (embd, ff, n_expert), (1.702, 7.0)).unwrap();
+        let mut us = UnionScratch::new_routed(embd, ff, 16, 3).unwrap();
+        let mut host = HostScratch::new(embd, ff, 3).unwrap();
+        for cols in [3, 12] {
+            let x = Tensor2::from_vec(
+                embd,
+                cols,
+                (0..embd * cols)
+                    .map(|i| ((i * 7919) % 1013) as f32 / 1013.0 - 0.5)
+                    .collect(),
+            );
+            let lists: Vec<Vec<(u32, f32)>> = (0..cols)
+                .map(|j| {
+                    [0, 1, 3]
+                        .map(|s| (((j + s) % n_expert) as u32, 0.25 + 0.125 * s as f32))
+                        .to_vec()
+                })
+                .collect();
+            let slices: Vec<&[(u32, f32)]> = lists.iter().map(Vec::as_slice).collect();
+            let mut want = vec![f32::NAN; embd * cols];
+            for (j, list) in lists.iter().enumerate() {
+                let xj = Tensor2::from_vec(embd, 1, x.col(j).to_vec());
+                layer
+                    .experts_into(
+                        R8Source::rows(&split),
+                        &xj,
+                        list,
+                        &mut want[j * embd..][..embd],
+                        &mut host,
+                    )
+                    .unwrap();
+            }
+            let mut got = vec![f32::NAN; embd * cols];
+            layer
+                .experts_union_into(R8Source::rows(&split), &x, &slices, &mut got, &mut us)
+                .unwrap();
+            let diff = got
+                .iter()
+                .zip(&want)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            assert_eq!(
+                diff, 0,
+                "{cols} columns: the union differs from its columns"
+            );
+        }
+        std::fs::remove_file(&path).unwrap();
+    }
+
     /// A union call whose up reads other bytes than its gate — a Q3_K gate
     /// (q8_K columns) and a Q4_K up (q8_2_x4) — writes, column for column and
     /// bit for bit, what the one-column call writes, in both of its forms: a
@@ -3887,8 +4185,7 @@ mod tests {
         ensured: std::sync::Mutex<Vec<(usize, Vec<u32>)>>,
         asked: std::sync::Mutex<Vec<(usize, u32, usize)>>,
         pins: std::sync::Mutex<PinLog>,
-        /// What `note_union` was told: the layer, the call's ids and column
-        /// offsets, and whether it took the batched path.
+        /// The prompt note or step prefetch's column plan and batch path.
         told: std::sync::Mutex<Vec<Told>>,
         /// A step's claim: `None` holds every id of a ticket unwaited (the
         /// prompt batches' mode); `Some(late)` holds the claim's hits waited
@@ -3910,12 +4207,13 @@ mod tests {
         Wait,
     }
 
-    /// One `note_union` call as the mock was told it.
+    /// One union's column plan and batch path as the mock was told it.
     #[derive(Debug, PartialEq)]
     struct Told {
         layer: usize,
         ids: Vec<u32>,
         off: Vec<usize>,
+        cols: usize,
         batched: bool,
     }
 
@@ -4059,7 +4357,12 @@ mod tests {
             layer: usize,
             ids: &[u32],
             claim: super::Claim,
+            columns: u64,
+            column_off: Option<&[usize]>,
         ) -> Result<super::Ticket<'a>, super::TierError> {
+            if let Some(off) = column_off {
+                self.note_union(layer, ids, off, usize::try_from(columns).unwrap(), false);
+            }
             self.ensured.lock().unwrap().push((layer, ids.to_vec()));
             let pin = self.pin_batch(ids, claim, false);
             if let Some(late) = &self.late {
@@ -4110,11 +4413,12 @@ mod tests {
             self.filled.then(|| &self.parts[3 * id as usize + part][..])
         }
 
-        fn note_union(&self, layer: usize, ids: &[u32], off: &[usize], batched: bool) {
+        fn note_union(&self, layer: usize, ids: &[u32], off: &[usize], cols: usize, batched: bool) {
             self.told.lock().unwrap().push(Told {
                 layer,
                 ids: ids.to_vec(),
                 off: off.to_vec(),
+                cols,
                 batched,
             });
         }
@@ -4522,7 +4826,7 @@ mod tests {
 
     /// A tiered union call tells its tier its path once, before its first
     /// batch's claim: the call's distinct ids ascending (the host segment's
-    /// included) with their column offsets, `batched` when its arena ids are
+    /// included) with their column offsets, its columns, `batched` when its arena ids are
     /// more than the slots less two batches and not when they fit. A call
     /// refused before its path (a layer under the floor, an expert past the
     /// stacks') tells nothing.
@@ -4568,6 +4872,7 @@ mod tests {
                 layer: 4,
                 ids: vec![2, 3, 4, 5, 6, 7],
                 off: vec![0, 1, 2, 4, 5, 6, 7],
+                cols: 2,
                 batched: true
             }],
             "one note, batched, with the call's ids and offsets"
@@ -4584,6 +4889,7 @@ mod tests {
                 layer: 4,
                 ids: vec![0, 2, 7],
                 off: vec![0, 1, 3, 4],
+                cols: 2,
                 batched: false
             }],
             "one note, not batched, the host segment's id in the ids"
@@ -4773,6 +5079,7 @@ mod tests {
             &[(5, 0.6), (3, 0.4)],
         ];
         let tier_ids = [0u32, 2, 3, 5];
+        let claim_ids = [0u32, 1, 2, 3, 5];
         let src = R8Source::rows(&split);
         let mut us = UnionScratch::new_routed(embd, ff, 8, 3).unwrap();
 
@@ -4791,16 +5098,16 @@ mod tests {
         }
         assert_eq!(
             empty.ensured(),
-            vec![(4, tier_ids.to_vec())],
-            "ensure saw the call's distinct tier ids once, ascending, at the tier's layer"
+            vec![(4, claim_ids.to_vec())],
+            "ensure saw the full plan's distinct ids once, ascending, at the tier's layer"
         );
         assert_eq!(
             empty.events(),
             vec![
-                PinEvent::Pinned(super::Claim::Step, tier_ids.to_vec()),
-                PinEvent::Unpinned(tier_ids.to_vec()),
+                PinEvent::Pinned(super::Claim::Step, claim_ids.to_vec()),
+                PinEvent::Unpinned(claim_ids.to_vec()),
             ],
-            "the step union's tier ids are pinned as the step's, and let go when it refuses"
+            "the mock holds the full step plan and lets go when it refuses"
         );
 
         let mut full = MockTier::of(&split, &layer, true);
@@ -4815,14 +5122,25 @@ mod tests {
         assert_eq!(
             full.events(),
             vec![
-                PinEvent::Pinned(super::Claim::Step, tier_ids.to_vec()),
-                PinEvent::Unpinned(tier_ids.to_vec()),
+                PinEvent::Pinned(super::Claim::Step, claim_ids.to_vec()),
+                PinEvent::Unpinned(claim_ids.to_vec()),
             ],
-            "the step union's tier ids stay pinned for the call and are let go after it"
+            "the mock holds the full step plan for the call and lets go after it"
         );
         assert!(
             full.pins.lock().unwrap().loose.is_empty(),
             "every slot the step union read was pinned"
+        );
+        assert_eq!(
+            full.told(),
+            vec![Told {
+                layer: 4,
+                ids: claim_ids.to_vec(),
+                off: vec![0, 1, 3, 4, 5, 7],
+                cols,
+                batched: false,
+            }],
+            "the step claim carries each id's routed columns, including host ids"
         );
         let asked = full.asked();
         assert!(
@@ -4891,7 +5209,7 @@ mod tests {
             &[(2, 0.5), (6, 3e-4), (1, 0.25), (5, 7.0)],
             &[(7, 0.6), (3, 2.0), (5, 1e-2), (0, 0.125)],
         ];
-        let tier_ids = [0u32, 2, 3, 5, 6, 7];
+        let claim_ids = [0u32, 1, 2, 3, 5, 6, 7];
         let (late, hits) = ([0u32, 6], [2u32, 3, 5, 7]);
         let src = R8Source::rows(&split);
         let mut us = UnionScratch::new_routed(embd, ff, 8, 4).unwrap();
@@ -4962,10 +5280,10 @@ mod tests {
         assert_eq!(
             tier.events(),
             vec![
-                PinEvent::Pinned(super::Claim::Step, tier_ids.to_vec()),
-                PinEvent::Unpinned(tier_ids.to_vec()),
+                PinEvent::Pinned(super::Claim::Step, claim_ids.to_vec()),
+                PinEvent::Unpinned(claim_ids.to_vec()),
             ],
-            "one claim for the call's tier ids, let go after it"
+            "one claim for the full plan, let go after it"
         );
         std::fs::remove_file(&path).unwrap();
     }
@@ -5009,8 +5327,8 @@ mod tests {
         assert_eq!(
             tier.events(),
             vec![
-                PinEvent::Pinned(super::Claim::Step, vec![0, 2, 5]),
-                PinEvent::Unpinned(vec![0, 2, 5]),
+                PinEvent::Pinned(super::Claim::Step, vec![0, 1, 2, 5]),
+                PinEvent::Unpinned(vec![0, 1, 2, 5]),
             ],
             "the claim is let go whole"
         );

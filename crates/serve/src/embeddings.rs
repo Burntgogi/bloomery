@@ -170,10 +170,35 @@ pub fn assemble<'a>(
 
 #[cfg(test)]
 fn input(side: &Side, key: &str, v: &Value) -> Result<Input, ApiError> {
-    input_with(side, &VideoSupport::default(), key, v)
+    let mut images = inline_images(side, std::iter::once(v))?;
+    input_with(side, &VideoSupport::default(), key, v, &mut images)
 }
 
-fn input_with(side: &Side, video: &VideoSupport, key: &str, v: &Value) -> Result<Input, ApiError> {
+fn inline_images<'a>(
+    side: &Side,
+    inputs: impl IntoIterator<Item = &'a Value>,
+) -> Result<std::vec::IntoIter<media::DecodedImage>, ApiError> {
+    let urls = inputs
+        .into_iter()
+        .filter(|_| side.media.is_some())
+        .filter_map(|v| v.get("content").and_then(Value::as_array))
+        .flatten()
+        .filter_map(|part| match media::parse_part(part) {
+            Ok(media::Part::Image(url)) => Some(url),
+            _ => None,
+        });
+    media::decode_images(urls)
+        .map(Vec::into_iter)
+        .map_err(|e| invalid(e.to_string()))
+}
+
+fn input_with(
+    side: &Side,
+    video: &VideoSupport,
+    key: &str,
+    v: &Value,
+    decoded_images: &mut std::vec::IntoIter<media::DecodedImage>,
+) -> Result<Input, ApiError> {
     if let Some(parts) = v
         .as_object()
         .and_then(|o| o.get("content"))
@@ -185,7 +210,7 @@ fn input_with(side: &Side, video: &VideoSupport, key: &str, v: &Value) -> Result
                     if model.embedding_video().is_some_and(|(text, _)| text == prefix)) =>
             {
                 Some(
-                    media::prepare_video(&parts[1..], &**model)
+                    media::prepare_video(&parts[1..], &**model, decoded_images)
                         .map_err(|e| invalid(e.to_string()))?
                         .into_iter(),
                 )
@@ -205,7 +230,9 @@ fn input_with(side: &Side, video: &VideoSupport, key: &str, v: &Value) -> Result
             .any(|p| matches!(media::parse_part(p), Ok(media::Part::Video(_))))
         {
             for (at, part) in parts.iter().enumerate() {
-                let Some(f) = prepare_fixed(side, part, &mut decoded).map_err(invalid)? else {
+                let Some(f) =
+                    prepare_fixed(side, part, &mut decoded, decoded_images).map_err(invalid)?
+                else {
                     continue;
                 };
                 spent += video::group_positions(f.positions, f.around(&*side.tok));
@@ -251,7 +278,7 @@ fn input_with(side: &Side, video: &VideoSupport, key: &str, v: &Value) -> Result
             }
             let f = match fixed.remove(&at) {
                 Some(f) => Ok(Some(f)),
-                None => prepare_fixed(side, part, &mut decoded),
+                None => prepare_fixed(side, part, &mut decoded, decoded_images),
             };
             vec![match f {
                 Ok(Some(f)) => {
@@ -333,6 +360,7 @@ fn prepare_fixed<'a>(
     side: &'a Side,
     part: &Value,
     decoded: &mut Option<std::vec::IntoIter<media::MediaFeed>>,
+    decoded_images: &mut std::vec::IntoIter<media::DecodedImage>,
 ) -> Result<Option<Fixed<'a>>, String> {
     if part.get("type").and_then(Value::as_str) == Some("input_audio") {
         let a = part
@@ -381,7 +409,7 @@ fn prepare_fixed<'a>(
             }),
         }));
     }
-    let Ok(media::Part::Image(url)) = media::parse_part(part) else {
+    let Ok(media::Part::Image(_)) = media::parse_part(part) else {
         return Ok(None);
     };
     let model = side
@@ -396,11 +424,13 @@ fn prepare_fixed<'a>(
             .next()
             .ok_or("video frame count differs from input")?
     } else {
-        let file = media::load(url).map_err(|e| e.to_string())?;
+        let image = decoded_images
+            .next()
+            .ok_or("image count differs from input")?;
         media::MediaFeed {
             at: 0,
-            key: file.key,
-            prepared: Arc::new(media::prepare(&file, &**model).map_err(|e| e.to_string())?),
+            key: image.key,
+            prepared: Arc::new(model.prepare(&image.image).map_err(|e| e.to_string())?),
         }
     };
     Ok(Some(Fixed {
@@ -498,6 +528,7 @@ fn prepare(
             })
         })
         .transpose()?;
+    let mut images = inline_images(side, request.inputs.iter().copied())?;
     let inputs = request
         .inputs
         .iter()
@@ -511,9 +542,10 @@ fn prepare(
                     video,
                     request.key,
                     &Value::String(format!("{prefix}{text}")),
+                    &mut images,
                 )
             } else {
-                input_with(side, video, request.key, v)
+                input_with(side, video, request.key, v, &mut images)
             }
         })
         .collect::<Result<Vec<_>, _>>()?;

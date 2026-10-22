@@ -1177,6 +1177,30 @@ mod elem_kernels {
         e.map(|g, u| mul_rn_f32(gelu_tanh_dev(g), u));
     }
 
+    /// `y[i] = situ(gate[i], up[i])`, elementwise over `n` values: the
+    /// gate·up rule [`crate::kquant::act::situ`] at `beta` and
+    /// [`crate::kquant::act::SITU_LINEAR_BETA`], the rows the `_sel`
+    /// gate·up writes under it for the same sums.
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (gate.len() >= n, up.len() >= n, y.len() >= n)
+    )]
+    pub fn situ_rows(gate: &[f32], up: &[f32], n: u32, beta: f32, mut y: DisjointSlice<f32>) {
+        let i = thread::index_1d().get();
+        if i >= n as usize {
+            return;
+        }
+        // SAFETY: the `requires` above were launcher-checked, `n` is this
+        // kernel's parameter and `i` this thread's `index_1d` past the `i < n`
+        // guard, and the launch is `domain = 1` with the contract's exact 1-D
+        // block.
+        let e = unsafe { Elem2::new(gate, up, &mut y, i) };
+        e.map(|g, u| crate::kquant::act::situ(g, u, beta, crate::kquant::act::SITU_LINEAR_BETA));
+    }
+
     /// `y[i] = max(x[i], 0)^2` over `n` values. A non-finite input is copied
     /// as it is: `max` of a non-finite is not this rule, and the square of
     /// `−inf` is not 0.
@@ -1208,8 +1232,10 @@ mod elem_kernels {
         }
     }
 
-    /// `y[i] = sigmoid(y[i])` over `n` values, in place — the router score's
-    /// scalar ([`crate::route_core::sigmoid`]) over a tile GEMM's logits.
+    /// `y[i] = sigmoid(y[i])` over `n` values, in place — the router score
+    /// ([`crate::route_core::router_score`] of
+    /// [`Sigmoid`](crate::route_core::Sigmoid)) over a tile GEMM's logits: a
+    /// logit that is not finite becomes NaN.
     #[kernel]
     #[launch_bounds(256)]
     #[launch_contract(
@@ -1226,13 +1252,15 @@ mod elem_kernels {
         // entry i.
         unsafe {
             let v = *y.get_unchecked_mut(i);
-            *y.get_unchecked_mut(i) = crate::route_core::sigmoid(v);
+            *y.get_unchecked_mut(i) =
+                crate::route_core::router_score::<crate::route_core::Sigmoid>(v);
         }
     }
 
     /// `y[i] = sqrt_softplus(y[i])` over `n` values, in place — the router
-    /// score's scalar ([`crate::route_core::sqrt_softplus`]) over a tile
-    /// GEMM's logits.
+    /// score ([`crate::route_core::router_score`] of
+    /// [`SqrtSoftplus`](crate::route_core::SqrtSoftplus)) over a tile GEMM's
+    /// logits: a logit that is not finite becomes NaN.
     #[kernel]
     #[launch_bounds(256)]
     #[launch_contract(
@@ -1249,7 +1277,8 @@ mod elem_kernels {
         // entry i.
         unsafe {
             let v = *y.get_unchecked_mut(i);
-            *y.get_unchecked_mut(i) = crate::route_core::sqrt_softplus(v);
+            *y.get_unchecked_mut(i) =
+                crate::route_core::router_score::<crate::route_core::SqrtSoftplus>(v);
         }
     }
 
@@ -2133,6 +2162,10 @@ impl ElemKernels {
     /// Enqueue `y = rms_norm(x, gain, eps)` over `m` tokens of `k` values
     /// (token-major). `k` a positive multiple of 32; `x`, `y` hold `k * m`
     /// f32, `gain` holds `k`. Asynchronous, allocation-free, capturable.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "host launcher: one argument per kernel argument it binds (rust-quality R8)"
+    )]
     pub fn enqueue_rms_norm(
         &self,
         stream: &CudaStream,
@@ -2180,6 +2213,10 @@ impl ElemKernels {
     /// `t*nd` — the host YaRN cache, uploaded per step). `nd` even and at
     /// least 2. `dst` holds `m * n_vec * nd` f32 in `src`'s layout.
     /// Asynchronous, allocation-free, capturable.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "host launcher: one argument per kernel argument it binds (rust-quality R8)"
+    )]
     pub fn enqueue_rope(
         &self,
         stream: &CudaStream,
@@ -2329,6 +2366,45 @@ impl ElemKernels {
         Ok(())
     }
 
+    /// Enqueue `y = situ(gate, up)` at `rule` over `n` values (flat;
+    /// token-major spans of any width): [`crate::kquant::Act::Situ`] alone,
+    /// any other rule or one [`crate::kquant::Act::code`] refuses is refused
+    /// by name. Asynchronous, allocation-free, capturable.
+    pub fn enqueue_situ(
+        &self,
+        stream: &CudaStream,
+        rule: crate::kquant::Act,
+        (gate, up): (&DeviceBuffer<f32>, &DeviceBuffer<f32>),
+        n: usize,
+        y: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let what = "enqueue_situ";
+        let crate::kquant::Act::Situ { .. } = rule else {
+            return Err(GpuError::shape(
+                what,
+                format!("{rule:?} is not a situ rule"),
+            ));
+        };
+        let (_, beta) = rule.code(what)?;
+        if n == 0 || gate.len() < n || up.len() < n || y.len() < n {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "n={n}, gate.len() {}, up.len() {}, y.len() {}",
+                    gate.len(),
+                    up.len(),
+                    y.len()
+                ),
+            ));
+        }
+        let n = launch_u32(what, "n", n)?;
+        let prep = self
+            .module
+            .prepare_situ_rows(LaunchConfig1D::new(n.div_ceil(256), 256, 0))?;
+        self.module.situ_rows(stream, &prep, gate, up, n, beta, y)?;
+        Ok(())
+    }
+
     /// Enqueue `y = max(x, 0)^2` over `n` values (flat). A non-finite input
     /// stays that value. Asynchronous, allocation-free, capturable.
     pub fn enqueue_relu_sqr(
@@ -2430,6 +2506,10 @@ impl ElemKernels {
     /// m]`), `w` the router weights (`n_exp * m` f32, `[n_exp, m]`); `y`
     /// holds `rows * m` f32, token-major. Asynchronous, allocation-free,
     /// capturable.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "host launcher: one argument per kernel argument it binds (rust-quality R8)"
+    )]
     pub fn enqueue_weighted_sum(
         &self,
         stream: &CudaStream,

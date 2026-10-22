@@ -111,7 +111,10 @@ pub enum FaultSite {
     /// met an indexer key that is not finite after its f16 rounding
     /// (`q38::qsa_key_append`, the raw key), a pooled key or a head's score
     /// that is not finite, its top-k a refused live count, or its selected
-    /// flash a list entry at or past the cache.
+    /// flash a list entry at or past the cache. A block selector (MiniMax's
+    /// `msa`) raises it for a head's score that is not finite, a selection
+    /// that lost the query's own block, and its selected flash for a block
+    /// at or past the cache.
     PoolSelect = 18,
     /// A PLE site's gate or conv (`ple`) met a key, stream, gated value or
     /// conv input whose sum of squares, dot or value is not finite, or a
@@ -541,6 +544,38 @@ pub mod step_order {
         Mamba2Scan,
     ];
 
+    /// MiniMax-M3 (`gpu-minimaxm3`): the token id checked on the host before the step; a layer's cache append
+    /// (position), the sparse layers' block pick (the selector's counts and the ids it keeps) and the flash's
+    /// visible key count; the router and the handoff's id check; the q8_0 head's logits last. The projections and
+    /// the norms read f32 rows with nothing to raise; the sites the step never raises follow in [`MIMO2`]'s order.
+    pub const MINIMAXM3: &[FaultSite] = &[
+        TokenId,
+        CachePos,
+        PoolSelect,
+        KeyCount,
+        Router,
+        ExpertId,
+        Logit,
+        QuantColumn,
+        NormQuant,
+        Q5Quant,
+        HcQuant,
+        AttnSel,
+        AttnCount,
+        LinearConv,
+        LinearDelta,
+        LinearGate,
+        DeltaLane,
+        CacheValue,
+        Ple,
+        HcMix,
+        F32Product,
+        DeltaStamp,
+        CandMask,
+        KvQuant,
+        Mamba2Scan,
+    ];
+
     /// Solar-Open2 (`gpu-solar2`): the token id checked on the host before
     /// the step; a layer's norm and the q8_1 quantizer of its normed row, the
     /// Q5_0 halves' 32-value quantizer, a KDA layer's conv, delta step (its
@@ -550,7 +585,9 @@ pub mod step_order {
     /// router and the handoff's id check, and the head's logits last. The
     /// order of the sites the step raises is the order a KDA layer's launches
     /// meet them, then the sites only a GQA layer meets; the sites the step
-    /// never raises follow.
+    /// never raises follow. Raon-1 (`arch::raon1`) runs the same order: an RDA
+    /// layer launches a KDA layer's sites, and a latent layer's cache append
+    /// and visible count stand where a GQA layer's do.
     pub const SOLAR2: &[FaultSite] = &[
         TokenId,
         F32Product,
@@ -589,7 +626,8 @@ pub mod step_order {
             model::arch::Arch::Qwen35moe => QWEN35MOE,
             model::arch::Arch::Glm5next => GLM5NEXT,
             model::arch::Arch::Mimo2 => MIMO2,
-            model::arch::Arch::SolarOpen2 => SOLAR2,
+            model::arch::Arch::SolarOpen2 | model::arch::Arch::Raon1 => SOLAR2,
+            model::arch::Arch::MiniMaxM3 => MINIMAXM3,
             // No program runs nemotron_h. The listing is MiMo's so a fault
             // word still decodes; it is not a step this architecture runs.
             model::arch::Arch::NemotronH => NEMOTRON_H,
@@ -930,7 +968,7 @@ mod tests {
 
     /// Every architecture; a new one is a compile error here until it is
     /// listed (and [`step_order::of`] gives it a table).
-    fn every_arch() -> [Arch; 11] {
+    fn every_arch() -> [Arch; 13] {
         let all = [
             Arch::Deepseek2,
             Arch::Deepseek41,
@@ -939,6 +977,8 @@ mod tests {
             Arch::Glm5next,
             Arch::Mimo2,
             Arch::SolarOpen2,
+            Arch::MiniMaxM3,
+            Arch::Raon1,
             Arch::NemotronH,
             Arch::NemotronHMoe,
             Arch::GemmaEmbedding,
@@ -953,6 +993,8 @@ mod tests {
                 | Arch::Glm5next
                 | Arch::Mimo2
                 | Arch::SolarOpen2
+                | Arch::MiniMaxM3
+                | Arch::Raon1
                 | Arch::NemotronH
                 | Arch::NemotronHMoe
                 | Arch::GemmaEmbedding

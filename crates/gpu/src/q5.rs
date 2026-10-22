@@ -765,6 +765,8 @@ mod q5_kernels {
         mut d8: DisjointSlice<f32>,
         fault: FaultSink,
     ) {
+        // x_rows only bounds the activation in the launch contract.
+        let _ = x_rows;
         let grp = thread::index_1d().get() / 32;
         if grp >= m_cols as usize * n_groups as usize {
             return;
@@ -1846,7 +1848,7 @@ impl Q5Kernels {
     /// experts are reached by `row0` without a gather copy.
     #[allow(
         clippy::too_many_arguments,
-        reason = "host launcher; folding these into a *Args struct is the R8 round"
+        reason = "host launcher: one argument per kernel argument it binds (rust-quality R8)"
     )]
     pub fn enqueue_gemv_q5_0(
         &self,
@@ -1945,6 +1947,10 @@ impl Q5Kernels {
     /// one that is not [`HOST`] raises [`FaultSite::ExpertId`] on the owning
     /// `Gpu`'s fault word as an unlabelled launch ([`LAYER_NONE`]).
     /// Asynchronous, allocation-free, capturable.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "host launcher: one argument per kernel argument it binds (rust-quality R8)"
+    )]
     pub fn enqueue_gemv_q5_0_sel(
         &self,
         stream: &CudaStream,
@@ -2032,7 +2038,7 @@ impl Q5Kernels {
     /// `pack_q5_1` with `cols = q_stride + 2*k/32`.
     #[allow(
         clippy::too_many_arguments,
-        reason = "host launcher; folding these into a *Args struct is the R8 round"
+        reason = "host launcher: one argument per kernel argument it binds (rust-quality R8)"
     )]
     pub fn enqueue_gemv_q5_1(
         &self,

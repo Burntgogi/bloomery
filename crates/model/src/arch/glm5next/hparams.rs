@@ -9,7 +9,8 @@ use gguf::{Split, Value};
 use super::roles::{DENSE, HC, KDA, LATENT, MOE, NEXTN, SHARED, required};
 use crate::arch::{
     expert_counts, kda, meta_arr, meta_bool, meta_f32, meta_usize, metadata, n_vocab, nextn_layers,
-    one_expert_group, optional_usize, positive, refuse_tensor_set, sigmoid_gating, unread_keys_of,
+    one_expert_group, optional_f32, optional_usize, positive, refuse_tensor_set, sigmoid_gating,
+    unread_keys_of,
 };
 use crate::placement::PlacementError;
 
@@ -541,14 +542,6 @@ fn per_layer_f32(split: &Split, suffix: &str, n_layer: usize) -> Result<Vec<f32>
             )),
         })
         .collect()
-}
-
-/// `<architecture>.<suffix>` as a float, `None` when absent.
-fn optional_f32(split: &Split, suffix: &str) -> Result<Option<f32>, PlacementError> {
-    match split.value(&split.arch_key(suffix)) {
-        None => Ok(None),
-        Some(_) => meta_f32(split, suffix).map(Some),
-    }
 }
 
 /// `<architecture>.<suffix>` as a bool, `None` when absent.

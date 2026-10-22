@@ -1,6 +1,8 @@
 //! The reference's Unicode handling, byte for byte: its lenient UTF-8 decoder,
-//! the GPT-2 byte <-> codepoint table, and the "collapsed" byte its regex
-//! fallback matches on.
+//! the strict one of the newer tree that normalizes to NFC, the GPT-2 byte <->
+//! codepoint table, and the "collapsed" byte its regex fallback matches on.
+
+use unicode_normalization_alignments::UnicodeNormalization;
 
 use crate::collapse_table::RUNS;
 
@@ -20,11 +22,14 @@ pub(crate) fn decode_lenient(bytes: &[u8], out: &mut Vec<u32>) {
     let mut i = 0;
     while i < bytes.len() {
         let (cpt, n) = decode_one(bytes, i);
+        assert!(cpt <= 0x10FFFF, "UTF-8 codepoint U+{cpt:X} above U+10FFFF");
         out.push(cpt);
         i += n;
     }
 }
 
+/// The codepoint at `b[i]` and its length, the lead byte trusted for the length: the sequence's
+/// bits as written, overlong or above U+10FFFF or not.
 fn decode_one(b: &[u8], i: usize) -> (u32, usize) {
     let cont = |k: usize| b.get(i + k).is_some_and(|&c| c & 0xC0 == 0x80);
     let lead = b[i];
@@ -48,7 +53,6 @@ fn decode_one(b: &[u8], i: usize) -> (u32, usize) {
     } else if lead & 0x08 == 0 {
         if cont(1) && cont(2) && cont(3) {
             let cpt = (u32::from(lead & 0x07) << 18) | (bits(1) << 12) | (bits(2) << 6) | bits(3);
-            assert!(cpt <= 0x10FFFF, "UTF-8 codepoint U+{cpt:X} above U+10FFFF");
             (cpt, 4)
         } else {
             (REPLACEMENT, 1)
@@ -56,6 +60,48 @@ fn decode_one(b: &[u8], i: usize) -> (u32, usize) {
     } else {
         (REPLACEMENT, 1)
     }
+}
+
+/// Decode `bytes` the way the newer reference tree's `unicode_cpts_from_utf8` does, the one that
+/// precedes its NFC step: [`decode_lenient`]'s rules with overlong forms and codepoints above
+/// U+10FFFF refused too. A byte that starts no valid sequence is one U+FFFD and advances one byte;
+/// surrogates pass through.
+pub(crate) fn decode_strict(bytes: &[u8], out: &mut Vec<u32>) {
+    out.clear();
+    out.reserve(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let (cpt, n) = match decode_one(bytes, i) {
+            (cpt, n) if n > 1 && cpt < [0, 0, 0x80, 0x800, 0x1_0000][n] => (REPLACEMENT, 1),
+            (cpt, _) if cpt > 0x10FFFF => (REPLACEMENT, 1),
+            ok => ok,
+        };
+        out.push(cpt);
+        i += n;
+    }
+}
+
+/// NFC of `cpts`, as the reference's `unicode_cpts_normalize_nfc` makes it: each run of
+/// codepoints that are characters normalizes on its own, and a surrogate (no character, a starter
+/// that composes with nothing) stands where it was.
+pub(crate) fn normalize_nfc(cpts: &mut Vec<u32>) {
+    let mut out = Vec::with_capacity(cpts.len());
+    let mut run = String::new();
+    let flush = |run: &mut String, out: &mut Vec<u32>| {
+        out.extend(run.nfc().map(|(c, _)| u32::from(c)));
+        run.clear();
+    };
+    for &cpt in cpts.iter() {
+        match char::from_u32(cpt) {
+            Some(c) => run.push(c),
+            None => {
+                flush(&mut run, &mut out);
+                out.push(cpt);
+            }
+        }
+    }
+    flush(&mut run, &mut out);
+    *cpts = out;
 }
 
 /// Append the UTF-8 form of `cpt` (<= U+10FFFF; surrogates are encoded as
@@ -154,7 +200,7 @@ pub fn byte_to_cpt_table() -> [u32; 256] {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_lenient, encode_cpt};
+    use super::{decode_lenient, decode_strict, encode_cpt, normalize_nfc};
 
     #[test]
     fn upper_unicode_boundary_round_trips() {
@@ -165,6 +211,31 @@ mod tests {
         let mut encoded = Vec::new();
         encode_cpt(cpts[0], &mut encoded);
         assert_eq!(encoded, bytes);
+    }
+
+    /// The newer tree's reader: an overlong form, a four-byte form above U+10FFFF and a truncated
+    /// one are U+FFFD a byte, a surrogate passes, and the NFC step composes what is a character
+    /// run and leaves a surrogate where it stood.
+    #[test]
+    fn strict_decoding_replaces_a_byte_at_a_time() {
+        let mut cpts = Vec::new();
+        for (bytes, want) in [
+            (&b"\xC0\x80"[..], vec![0xFFFD, 0xFFFD]),
+            (b"\xC1\xBF", vec![0xFFFD, 0xFFFD]),
+            (b"\xE0\x80\x80", vec![0xFFFD; 3]),
+            (b"\xF0\x80\x80\x80", vec![0xFFFD; 4]),
+            (b"\xF4\x90\x80\x80", vec![0xFFFD; 4]),
+            (b"\xF0\x9F\x98", vec![0xFFFD; 3]),
+            (b"\xED\xA0\x80", vec![0xD800]),
+            (b"\xF4\x8F\xBF\xBF", vec![0x10FFFF]),
+            (b"a\x80b", vec![0x61, 0xFFFD, 0x62]),
+        ] {
+            decode_strict(bytes, &mut cpts);
+            assert_eq!(cpts, want, "{bytes:?}");
+        }
+        let mut cpts = vec![0x65, 0x301, 0xD800, 0x65, 0x301, 0x1112, 0x1161, 0x11AB];
+        normalize_nfc(&mut cpts);
+        assert_eq!(cpts, [0xE9, 0xD800, 0xE9, 0xD55C]);
     }
 
     #[test]

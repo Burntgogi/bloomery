@@ -90,7 +90,10 @@ impl Encoder {
                 bpe: encoder,
                 nfc,
             } => {
-                if *nfc && let Ok(text) = std::str::from_utf8(text) {
+                if *nfc && kind.strict_utf8() {
+                    unicode::decode_strict(text, cpts);
+                    unicode::normalize_nfc(cpts);
+                } else if *nfc && let Ok(text) = std::str::from_utf8(text) {
                     cpts.clear();
                     cpts.extend(text.nfc().map(|(c, _)| u32::from(c)));
                 } else {

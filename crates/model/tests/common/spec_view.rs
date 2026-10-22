@@ -6,7 +6,8 @@
 use std::fmt::Write as _;
 
 use model::arch::models::{
-    Act, Compress, Ffn, IndexKeys, LayerSpec, Mixer, ModelSpec, Residual, Rope, Selector, Source,
+    Act, Compress, Ffn, IndexKeys, LayerSpec, Mixer, ModelSpec, OutGate, Residual, Rope, Selector,
+    Source,
 };
 use model::placement::Unimplemented;
 
@@ -33,6 +34,10 @@ fn act(a: &Act) -> String {
         Act::ReluSqr => "relusqr".to_string(),
         Act::GeGlu => "geglu".to_string(),
         Act::SwigluOai { alpha, limit } => format!("swigluoai {alpha}/{limit}"),
+        Act::Situ {
+            gate_beta,
+            value_beta,
+        } => format!("situ {gate_beta}/{value_beta}"),
     }
 }
 
@@ -113,6 +118,9 @@ pub fn layer_line(layer: &LayerSpec) -> String {
                 a.window,
                 a.sinks
             );
+            if a.pe > 0 || a.out_gate != OutGate::None {
+                let _ = write!(o, " pe {} gate {:?}", a.pe, a.out_gate);
+            }
             if let Some(Compress { ratio, rows }) = &a.compress {
                 let _ = write!(
                     o,

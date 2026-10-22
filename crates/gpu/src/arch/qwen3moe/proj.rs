@@ -2,8 +2,8 @@
 //! flash: the query, key and value rows in one (`qwen3moe_qkv_q4k`; a Q6_K
 //! value projection keeps its own `q6k_gemv` launch), and the output
 //! projection with the residual add in its store (`qwen3moe_o_resid_q4k`).
-//! `q6k_gemv` writes `m > 1` columns row-major; `qwen3moe_token_major`
-//! copies them into the token-major layout the rest of the chain reads.
+//! `q6k_gemv` writes `m > 1` columns row-major; [`TokenMajor`] copies them
+//! into the token-major layout the rest of the chain reads.
 //!
 //! Every projection has two entries, split by column count the way
 //! `q4k_gemv` and `q4k_gemv_mcol` are, and its one-column entry a
@@ -31,6 +31,7 @@ use crate::GpuError;
 use crate::cores::{l2_prefetch, q4k_row_dot, q4k_row_dot_1col};
 use crate::launch_u32;
 use crate::tensor::{DeviceTensor, Q8Act};
+use crate::token_major::TokenMajor;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread, warp};
 use cuda_host::cuda_module;
@@ -603,28 +604,6 @@ mod qwen3moe_proj_kernels {
             }
         }
     }
-
-    /// A row-major `m`-column output to token-major: `y[c · rows + r] =
-    /// x[r · m + c]`, one thread per value — a copy, so exact.
-    #[kernel]
-    #[launch_bounds(256)]
-    #[launch_contract(
-        domain = 1,
-        block = (256, 1, 1),
-        requires = (x.len() >= rows * m, y.len() >= rows * m)
-    )]
-    pub fn qwen3moe_token_major(x: &[f32], rows: u32, m: u32, mut y: DisjointSlice<f32>) {
-        let i = thread::index_1d().get();
-        let (rows, m) = (rows as usize, m as usize);
-        if i >= rows * m {
-            return;
-        }
-        let c = i / rows;
-        // SAFETY: i < rows·m, so c < m and i − c·rows < rows: both indices are
-        // below rows·m, inside x and y by the launch contract; thread i is
-        // y[i]'s only writer.
-        unsafe { *y.get_unchecked_mut(i) = *x.get_unchecked((i - c * rows) * m + c) };
-    }
 }
 
 /// [`ProjKernels::enqueue_qkv`]'s arguments: the Q4_K query and key
@@ -655,6 +634,8 @@ pub struct OResidArgs<'a> {
 /// The loaded module. Owns no stream: each enqueue takes the engine stream.
 pub struct ProjKernels {
     module: qwen3moe_proj_kernels::LoadedModule,
+    /// The row-major to token-major copy of a Q6_K site's columns.
+    pub(super) token_major: TokenMajor,
     /// [`crate::row_prefetch`] of the context's device.
     row_prefetch: bool,
 }
@@ -702,6 +683,7 @@ impl ProjKernels {
         let module = unsafe { crate::shared_module!(qwen3moe_proj_kernels, ctx)? };
         Ok(ProjKernels {
             module,
+            token_major: TokenMajor::load(ctx)?,
             row_prefetch: crate::row_prefetch(ctx)?,
         })
     }
@@ -824,39 +806,6 @@ impl ProjKernels {
                 y,
             )?;
         }
-        Ok(())
-    }
-
-    /// Enqueue the copy of `x`'s `m` row-major columns of `rows` values into
-    /// `y` token-major (module doc). Asynchronous, allocation-free,
-    /// capturable.
-    pub fn enqueue_token_major(
-        &self,
-        stream: &CudaStream,
-        x: &DeviceBuffer<f32>,
-        rows: usize,
-        m: usize,
-        y: &mut DeviceBuffer<f32>,
-    ) -> Result<(), GpuError> {
-        let what = "qwen3moe::enqueue_token_major";
-        if rows == 0 || m == 0 || x.len() < rows * m || y.len() < rows * m {
-            return Err(GpuError::shape(
-                what,
-                format!(
-                    "{m} columns of {rows}: x.len() {}, y.len() {}",
-                    x.len(),
-                    y.len()
-                ),
-            ));
-        }
-        let grid = launch_u32(what, "grid", (rows * m).div_ceil(256))?;
-        let rows = launch_u32(what, "rows", rows)?;
-        let m = launch_u32(what, "m", m)?;
-        let prep = self
-            .module
-            .prepare_qwen3moe_token_major(LaunchConfig1D::new(grid, 256, 0))?;
-        self.module
-            .qwen3moe_token_major(stream, &prep, x, rows, m, y)?;
         Ok(())
     }
 

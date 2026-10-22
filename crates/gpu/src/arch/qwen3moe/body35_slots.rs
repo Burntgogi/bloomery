@@ -471,26 +471,31 @@ fn gqa_layer(
             let kv = kv_of(&mut *qs.stores, c.layer)?;
             let pos = rows(pos, r, 1)?;
             let mut qo = rows_mut(q_out, r, d.attn_len())?;
-            kv.append_256(
-                &k.neox,
-                stream,
-                Append256 {
-                    qg: &*rows(q, r, d.q_rows)?,
-                    q: &mut qo,
-                    k: &mut *rows_mut(kr, r, d.kv_len())?,
-                    v: &*rows(v, r, d.kv_len())?,
-                    gq,
-                    gk,
-                    table: qs.table,
-                    pos: &pos,
-                    eps: c.eps,
-                    n_head: d.n_head,
-                    n_kv: d.n_kv,
-                    ctx: d.ctx,
-                    m: r.len(),
-                    fault: c.sink,
-                },
-            )?;
+            // SAFETY: the layer program embeds consecutive positions before attention;
+            // saturation is outside the cache. Each call uses one sequence's row window
+            // and its own cache planes, not the combined positions of different slots.
+            unsafe {
+                kv.append_256(
+                    &k.neox,
+                    stream,
+                    Append256 {
+                        qg: &*rows(q, r, d.q_rows)?,
+                        q: &mut qo,
+                        k: &mut *rows_mut(kr, r, d.kv_len())?,
+                        v: &*rows(v, r, d.kv_len())?,
+                        gq,
+                        gk,
+                        table: qs.table,
+                        pos: &pos,
+                        eps: c.eps,
+                        n_head: d.n_head,
+                        n_kv: d.n_kv,
+                        ctx: d.ctx,
+                        m: r.len(),
+                        fault: c.sink,
+                    },
+                )
+            }?;
             kv.flash_256(
                 &k.flash,
                 stream,

@@ -597,7 +597,7 @@ pub(super) fn site_gemv(
         "the arena's row-major scratch (a K-quant site launched alone past one row)",
     ))?;
     gemv(cols)?;
-    c.k.proj.enqueue_token_major(gpu.stream(), cols, rows, m, y)
+    c.k.proj.token_major.enqueue(gpu.stream(), cols, rows, m, y)
 }
 
 /// The buffers a shared expert run as its own dense FFN ([`shared_dense`])
@@ -763,7 +763,8 @@ pub(super) fn attn_in(c: &Ctx<'_>, n: &GqaPlan, s: &mut Arena, m: usize) -> Resu
                 Some(cols) => {
                     gpu.enqueue_gemv_q6k(wv, &s.act_x[i], cols)?;
                     k.proj
-                        .enqueue_token_major(stream, cols, d.kv_len(), m, &mut s.v)?;
+                        .token_major
+                        .enqueue(stream, cols, d.kv_len(), m, &mut s.v)?;
                 }
                 None => gpu.enqueue_gemv_q6k(wv, &s.act_x[i], &mut s.v)?,
             }
@@ -892,26 +893,31 @@ fn gated_256(
         .q_out
         .as_mut()
         .ok_or(GpuError::state(WHAT, "the arena's buffer of gated queries"))?;
-    kv.append_256(
-        &k.neox,
-        stream,
-        Append256 {
-            qg: &s.q,
-            q: q_out,
-            k: &mut s.k,
-            v: &s.v,
-            gq: f32_gain(w, &n.attn_q_norm)?,
-            gk: f32_gain(w, &n.attn_k_norm)?,
-            table: c.table,
-            pos: &s.pos,
-            eps: c.eps,
-            n_head: d.n_head,
-            n_kv: d.n_kv,
-            ctx: d.ctx,
-            m,
-            fault: c.sink,
-        },
-    )?;
+    // SAFETY: the layer program embeds consecutive positions before attention;
+    // saturation is outside the cache. Each call uses one sequence's row window
+    // and its own cache planes, not the combined positions of different slots.
+    unsafe {
+        kv.append_256(
+            &k.neox,
+            stream,
+            Append256 {
+                qg: &s.q,
+                q: q_out,
+                k: &mut s.k,
+                v: &s.v,
+                gq: f32_gain(w, &n.attn_q_norm)?,
+                gk: f32_gain(w, &n.attn_k_norm)?,
+                table: c.table,
+                pos: &s.pos,
+                eps: c.eps,
+                n_head: d.n_head,
+                n_kv: d.n_kv,
+                ctx: d.ctx,
+                m,
+                fault: c.sink,
+            },
+        )
+    }?;
     kv.flash_256(
         &k.flash,
         stream,
@@ -1145,6 +1151,7 @@ fn slots_down(
                 &mut s.h,
             )?,
             GateUpEntry::Q8_0
+            | GateUpEntry::Q6k
             | GateUpEntry::Iq2xs
             | GateUpEntry::Iq3xxs
             | GateUpEntry::Iq3s
@@ -1370,6 +1377,7 @@ fn apart_down(
         GateUpEntry::Q4k => kk.kq.enqueue_gate_up_q4k(stream, &gate_up, c.sink, h)?,
         GateUpEntry::Q5k => kk.kq.enqueue_gate_up_q5k(stream, &gate_up, c.sink, h)?,
         GateUpEntry::Q8_0
+        | GateUpEntry::Q6k
         | GateUpEntry::Iq2xs
         | GateUpEntry::Iq3xxs
         | GateUpEntry::Iq3s

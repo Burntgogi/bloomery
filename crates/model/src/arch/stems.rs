@@ -1,8 +1,9 @@
 //! The role tables' row, shared by the families whose tables name their
-//! tensors by stem (`glm5next`, `mimo2`): what a layer of some kind carries,
-//! and which of it the file must carry. The tables themselves stay in each
-//! family's `roles` — the GGUF names are its architecture's strings — as
-//! `classify_with`'s contract says.
+//! tensors by stem, and the blocks of rows every such family spells alike
+//! ([`DENSE`], [`MOE`], [`HC`]). A family's own table holds the rows its
+//! architecture alone carries, in its `roles` — the GGUF names are its
+//! architecture's strings — and the walk over them is
+//! [`classify`](crate::arch::classify)'s.
 
 use crate::placement::Role;
 
@@ -38,3 +39,88 @@ pub(crate) const fn opt(name: &'static str, role: Role) -> Stem {
 pub fn required(stems: &[Stem]) -> impl Iterator<Item = &'static str> + '_ {
     stems.iter().filter(|s| s.required).map(|s| s.name)
 }
+
+/// The stems of `parts` in order as one table of `N`; `N` is their count, held by assertion.
+pub(crate) const fn join<const N: usize>(parts: &[&[Stem]]) -> [Stem; N] {
+    let mut out = [parts[0][0]; N];
+    let (mut n, mut p) = (0, 0);
+    while p < parts.len() {
+        let mut i = 0;
+        while i < parts[p].len() {
+            out[n] = parts[p][i];
+            n += 1;
+            i += 1;
+        }
+        p += 1;
+    }
+    assert!(n == N, "join: the parts' stems are not N");
+    out
+}
+
+/// An attention block with per-head query and key norms: the pre-attention norm, the split q, k
+/// and v projections, the two norms and the output projection.
+pub(crate) const ATTENTION: &[Stem] = &[
+    req("attn_norm.weight", Role::Attention),
+    req("attn_q.weight", Role::Attention),
+    req("attn_k.weight", Role::Attention),
+    req("attn_v.weight", Role::Attention),
+    req("attn_q_norm.weight", Role::Attention),
+    req("attn_k_norm.weight", Role::Attention),
+    req("attn_output.weight", Role::Attention),
+];
+
+/// The hyper-connection tensors a trunk layer carries: the mix of each sublayer's input and
+/// output from the streams, which every family of hyper-connections names alike.
+pub const HC: &[Stem] = &[
+    req("hc_attn_fn.weight", Role::HyperConnection),
+    req("hc_attn_base.weight", Role::HyperConnection),
+    req("hc_attn_scale.weight", Role::HyperConnection),
+    req("hc_ffn_fn.weight", Role::HyperConnection),
+    req("hc_ffn_base.weight", Role::HyperConnection),
+    req("hc_ffn_scale.weight", Role::HyperConnection),
+];
+
+/// A dense layer's gate and down stems, which a placement reads to size the forms of the
+/// feed-forward block ([`DENSE`]).
+pub const DENSE_GATE: &str = "ffn_gate.weight";
+pub const DENSE_DOWN: &str = "ffn_down.weight";
+
+/// A dense layer's feed-forward block: the pre-FFN norm, the gate and up projections of the GLU
+/// and the down projection.
+pub const DENSE: &[Stem] = &[
+    req("ffn_norm.weight", Role::FfnNorm),
+    req(DENSE_GATE, Role::DenseFfn),
+    req("ffn_up.weight", Role::DenseFfn),
+    req(DENSE_DOWN, Role::DenseFfn),
+];
+
+/// The router's selection bias, which the graph adds for the selection only and the loader reads
+/// when the file carries it.
+pub const SELECTION_BIAS: &str = "exp_probs_b.bias";
+
+/// A routed layer's router: the pre-FFN norm and the router itself.
+pub(crate) const MOE_ROUTER: &[Stem] = &[
+    req("ffn_norm.weight", Role::FfnNorm),
+    req("ffn_gate_inp.weight", Role::Router),
+];
+
+/// A routed layer's routed stacks.
+pub(crate) const MOE_STACKS: &[Stem] = &[
+    req("ffn_gate_exps.weight", Role::RoutedExperts),
+    req("ffn_up_exps.weight", Role::RoutedExperts),
+    req("ffn_down_exps.weight", Role::RoutedExperts),
+];
+
+/// The router's selection bias, which the file may carry.
+const BIAS_OPTIONAL: &[Stem] = &[opt(SELECTION_BIAS, Role::Router)];
+
+/// A routed layer's feed-forward block: the pre-FFN norm, the router with its optional selection
+/// bias, and the routed stacks.
+pub const MOE: &[Stem] = &join::<6>(&[MOE_ROUTER, BIAS_OPTIONAL, MOE_STACKS]);
+
+/// A routed layer's shared expert, when the file has one.
+pub const SHARED: &[Stem] = &[
+    req("ffn_gate_shexp.weight", Role::SharedExpert),
+    req("ffn_up_shexp.weight", Role::SharedExpert),
+    req("ffn_down_shexp.weight", Role::SharedExpert),
+];

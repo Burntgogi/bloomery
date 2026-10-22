@@ -4,12 +4,18 @@
 //! the keep rule and `/props`' draft row. The seat's own plain path stays the
 //! seat's: every method that has none to run says so by its `None`.
 //!
-//! The DSpark arm reaches its draft through [`Spark`] alone: the calls a seat
-//! makes of the draft besides `runtime::Draft`, which the width chooser
-//! (`BLOOMERY_MTP_WIDTH`) and the session's verify pass drive. The owner
-//! stores the window behind a trait object (`Driven`), so a seat is generic
-//! over its body and nothing else: a body that cannot verify rows (a
-//! qwen3moe file's) holds an owner that is only ever off.
+//! The DSpark arm is [`ServedSpark`], which reaches its draft through [`Spark`]
+//! alone: the calls a seat makes of the draft besides `runtime::Draft`, which
+//! the width chooser (`BLOOMERY_MTP_WIDTH`) and the session's verify pass
+//! drive. It stores the window behind a trait object (`Driven`), so a seat is
+//! generic over its body and nothing else: a body that cannot verify rows (a
+//! qwen3moe file's) holds an owner that is only ever off. It needs no slots
+//! (the DSpark draft serves one, [`draft_slots`]), so a body of one sequence
+//! serves it alone, without the lookup arm.
+//!
+//! The card draft's own adapter is one impl here too ([`Spark`] over
+//! [`CardDspark`], every seat's): a seat names its draft's layers, never a
+//! copy of these calls.
 //!
 //! The lookup arm holds the serve seats' one owner of the lookup draft,
 //! [`Lookups`]: a context and a width chooser a resident slot, the context
@@ -21,8 +27,10 @@
 
 use std::path::{Path, PathBuf};
 
+use app::dspark::CardDspark;
 use app::{Keep, Prompt, RowsLog, Session, SessionError};
 use bloomery_gpu::GpuError;
+use bloomery_gpu::dspark::DraftLayers;
 use bloomery_gpu::model::{ChainBody, Rollback, Rows, Slots};
 use bloomery_gpu_gates::GateError;
 use bloomery_gpu_gates::bind::{SlotsFrom, nvidia_smi_index};
@@ -76,6 +84,54 @@ where
 
     /// The card the draft runs on.
     fn card(&self) -> &'static str;
+}
+
+/// The DSpark draft of any body that taps its rows: the card draft the session drives, as
+/// the owner calls it. One impl for every seat ([`CardDspark`] is the one owner of the card
+/// draft), so a new body takes the draft by naming its layers, never by copying this.
+///
+/// A draft with no window keeps every position, so [`Spark::window`] answers `usize::MAX`: a
+/// cut then leaves a prompt call that starts the draft over at 0 and feeds every id. The two
+/// families whose draft file always carries one (V4.1's `DraftHparams::read` and DFlash2's
+/// `Hparams::read` refuse a missing `attention.sliding_window` by name) read the same way
+/// here: the file's own reader has already refused the case that has no window.
+impl<B, L> Spark<B> for CardDspark<L>
+where
+    B: Prompt + Keep + Rows + Rollback + 'static,
+    Session<B>: runtime::TappedPrompt<Error = SessionError>,
+    L: DraftLayers + 'static,
+{
+    fn feed_call(&mut self, s: &mut Session<B>, ids: &[u32]) -> Result<u32, SessionError> {
+        CardDspark::<L>::feed_call(self, s, ids)
+    }
+
+    fn forget(&mut self) {
+        CardDspark::<L>::forget(self);
+    }
+
+    fn restart(&mut self) -> Result<(), GpuError> {
+        CardDspark::<L>::restart(self)
+    }
+
+    fn window(&self) -> usize {
+        CardDspark::<L>::window(self).unwrap_or(usize::MAX)
+    }
+
+    fn follows(&self, pos: u32) -> bool {
+        CardDspark::<L>::follows(self, pos)
+    }
+
+    fn resident_bytes(&self) -> usize {
+        CardDspark::<L>::resident_bytes(self)
+    }
+
+    fn device(&self) -> Result<DeviceId, GpuError> {
+        CardDspark::<L>::device(self)
+    }
+
+    fn card(&self) -> &'static str {
+        CardDspark::<L>::card(self)
+    }
 }
 
 /// A draft's window behind the width chooser, as the owner drives it. One
@@ -160,15 +216,143 @@ where
 
 /// The DSpark draft a seat serves: its window behind the width chooser and the
 /// draft's file for `/props`.
-struct Dspark<B: ChainBody + 'static> {
+pub struct ServedSpark<B: ChainBody + 'static> {
     window: Box<dyn Driven<B>>,
     file: Option<PathBuf>,
+}
+
+impl<B: ChainBody + 'static> ServedSpark<B> {
+    /// `draft` on `s`, behind the width chooser of `mode`, its verify pass of
+    /// every width up to `M` = the draft's width + 1 captured now (`log` told
+    /// of each); `file` is the draft's file for `/props`.
+    pub fn open<D, const M: usize>(
+        s: &mut Session<B>,
+        draft: D,
+        mode: WidthMode,
+        log: &mut impl RowsLog,
+        file: Option<PathBuf>,
+    ) -> Result<Self, SessionError>
+    where
+        B: Prompt + Keep + Rows + Rollback,
+        D: Spark<B>,
+        Window<M>: Widths,
+    {
+        let spec = s.with_draft::<Choosing<D>, M>(behind::<B, D>(draft, mode)?, log)?;
+        Ok(ServedSpark {
+            window: Box::new(spec),
+            file,
+        })
+    }
+
+    /// The draft's own prompt call of `ids`, fed as the call hands its
+    /// features over. The argmax after the last id.
+    pub fn prefill(&mut self, s: &mut Session<B>, ids: &[u32]) -> Result<u32, GateError> {
+        Ok(self.window.prompt_call(s, ids)?)
+    }
+
+    /// The seat's plain step of `last` took `next`: the draft takes in the
+    /// position.
+    pub fn stepped(&mut self, s: &mut Session<B>, last: u32, next: u32) -> Result<(), GateError> {
+        Ok(self.window.stepped(s, last, next)?)
+    }
+
+    /// One drafted pass from `last`: the kept ids into `out` and what the
+    /// draft proposed and kept.
+    pub fn pass(
+        &mut self,
+        s: &mut Session<B>,
+        last: u32,
+        out: &mut Vec<u32>,
+    ) -> Result<Drafted, GateError> {
+        Ok(drafted(self.window.pass(s, last, out)?))
+    }
+
+    /// The most rows [`Seat::pass`](bloomery_gpu_gates::bind::Seat::pass) runs.
+    pub fn rows(&self) -> usize {
+        self.window.rows()
+    }
+
+    /// The target stands elsewhere than the draft was fed: the draft starts
+    /// over at its next call.
+    pub fn moved(&mut self) {
+        self.window.forget();
+    }
+
+    /// The target was reset: the draft starts over with it.
+    pub fn reset(&mut self) -> Result<(), GateError> {
+        Ok(self.window.restart()?)
+    }
+
+    /// The positions a request that starts the draft over feeds it before its
+    /// first proposal.
+    pub fn window(&self) -> usize {
+        self.window.window()
+    }
+
+    /// Whether the draft holds every position the target ran before `pos`.
+    #[allow(
+        dead_code,
+        reason = "the seat that checks its draft's position before it proposes reads it; a binary that includes this file and serves no such seat reads it nowhere"
+    )]
+    pub fn follows(&self, pos: u32) -> bool {
+        self.window.follows(pos)
+    }
+
+    /// The longest prefix of at most `n` positions a cut keeps, `body` being
+    /// the body's rule at the target's position `pos`: a cut anywhere but
+    /// where the draft stands also leaves the request's prompt call a window.
+    pub fn keep(
+        &self,
+        n: usize,
+        pos: u32,
+        body: impl FnOnce(usize) -> (usize, Option<String>),
+    ) -> (usize, Option<String>) {
+        if u32::try_from(n).is_ok_and(|n| n == pos && self.window.follows(n)) {
+            return body(n);
+        }
+        let window = self.window.window();
+        let (k, why) = body(n.saturating_sub(window));
+        let why = format!(
+            "the DSpark draft starts over, so the prompt call carries its window of \
+             {window} positions: cut to at most {}{}",
+            n.saturating_sub(window),
+            why.map(|w| format!(", then {w}")).unwrap_or_default()
+        );
+        (k, Some(why))
+    }
+
+    /// `engine.draft`, and the draft's resident bytes in its card's placement
+    /// row, the class `draft` (a row of its own when the target has no layer
+    /// there). The card's index missing leaves the device out.
+    pub fn props(&self, mut p: EngineProps) -> EngineProps {
+        let ServedSpark { window, file } = self;
+        let device = window
+            .device()
+            .ok()
+            .and_then(|dev| nvidia_smi_index(window.card(), Some(dev)).ok())
+            .map(|i| format!("GPU{i}"));
+        let name = file
+            .as_deref()
+            .and_then(Path::file_name)
+            .map(|f| f.to_string_lossy().into_owned());
+        if let (Some(dev), Some(pl)) = (&device, p.placement.as_mut()) {
+            add_draft_bytes(pl, dev, window.resident_bytes() as u64);
+        }
+        p.draft = Some(DraftProps {
+            model: name.unwrap_or_else(|| Draft::Dspark.name().to_owned()),
+            n_max: Some(window.rows() as u64 - 1),
+            kind: Some(Draft::Dspark.name().to_owned()),
+            path: file.as_deref().map(|p| p.display().to_string()),
+            device,
+        });
+        p
+    }
 }
 
 /// The draft a seat serves: none, the DSpark draft or the lookup, each
 /// verified by the session's pass behind the width chooser.
 pub struct ServedDraft<B: ChainBody + 'static> {
-    dspark: Option<Dspark<B>>,
+    dspark: Option<ServedSpark<B>>,
     lookup: Option<Lookups<Session<B>>>,
 }
 
@@ -220,12 +404,8 @@ where
         D: Spark<B>,
         Window<M>: Widths,
     {
-        let spec = s.with_draft::<Choosing<D>, M>(behind::<B, D>(draft, mode)?, log)?;
         Ok(ServedDraft {
-            dspark: Some(Dspark {
-                window: Box::new(spec),
-                file,
-            }),
+            dspark: Some(ServedSpark::open::<D, M>(s, draft, mode, log, file)?),
             lookup: None,
         })
     }
@@ -233,7 +413,7 @@ where
     /// The most rows [`Seat::pass`](bloomery_gpu_gates::bind::Seat::pass) runs.
     pub fn rows(&self) -> usize {
         match (&self.dspark, &self.lookup) {
-            (Some(d), _) => d.window.rows(),
+            (Some(d), _) => d.rows(),
             (None, Some(_)) => LOOKUP_ROWS,
             (None, None) => 1,
         }
@@ -256,7 +436,7 @@ where
         plain: impl FnOnce(&mut Session<B>) -> Result<u32, GateError>,
     ) -> Result<u32, GateError> {
         match (&mut self.dspark, &mut self.lookup) {
-            (Some(d), _) => Ok(d.window.prompt_call(s, ids)?),
+            (Some(d), _) => d.prefill(s, ids),
             (None, Some(l)) => {
                 let slot = s.selected();
                 l.prompt_call(s, slot, ids, plain)
@@ -285,7 +465,7 @@ where
     /// position.
     pub fn stepped(&mut self, s: &mut Session<B>, last: u32, next: u32) -> Result<(), GateError> {
         match (&mut self.dspark, &mut self.lookup) {
-            (Some(d), _) => Ok(d.window.stepped(s, last, next)?),
+            (Some(d), _) => d.stepped(s, last, next),
             (None, Some(l)) => l.stepped(s, s.selected(), last, next),
             (None, None) => Ok(()),
         }
@@ -301,7 +481,7 @@ where
         out: &mut Vec<u32>,
     ) -> Result<Option<Drafted>, GateError> {
         match (&mut self.dspark, &mut self.lookup) {
-            (Some(d), _) => Ok(Some(drafted(d.window.pass(s, last, out)?))),
+            (Some(d), _) => Ok(Some(d.pass(s, last, out)?)),
             (None, Some(l)) => {
                 let slot = s.selected();
                 Ok(Some(l.pass(s, slot, last, Taking::Argmax, out)?))
@@ -316,7 +496,7 @@ where
     /// nothing.
     pub fn moved(&mut self) {
         if let Some(d) = &mut self.dspark {
-            d.window.forget();
+            d.moved();
         }
     }
 
@@ -334,7 +514,7 @@ where
     /// The target's `slot` was reset: the draft starts over with it.
     pub fn reset(&mut self, slot: usize) -> Result<(), GateError> {
         if let Some(d) = &mut self.dspark {
-            d.window.restart()?;
+            d.reset()?;
         }
         if let Some(l) = &mut self.lookup {
             l.forget(slot)?;
@@ -345,7 +525,7 @@ where
     /// The draft's window: the positions a request that starts the draft over
     /// feeds it before its first proposal; 0 without one.
     pub fn window(&self) -> usize {
-        self.dspark.as_ref().map_or(0, |d| d.window.window())
+        self.dspark.as_ref().map_or(0, ServedSpark::window)
     }
 
     /// The longest prefix of at most `n` positions a cut keeps, `body` being
@@ -358,53 +538,23 @@ where
         pos: u32,
         body: impl FnOnce(usize) -> (usize, Option<String>),
     ) -> (usize, Option<String>) {
-        let Some(d) = &self.dspark else {
-            return body(n);
-        };
-        if u32::try_from(n).is_ok_and(|n| n == pos && d.window.follows(n)) {
-            return body(n);
+        match &self.dspark {
+            Some(d) => d.keep(n, pos, body),
+            None => body(n),
         }
-        let window = d.window.window();
-        let (k, why) = body(n.saturating_sub(window));
-        let why = format!(
-            "the DSpark draft starts over, so the prompt call carries its window of \
-             {window} positions: cut to at most {}{}",
-            n.saturating_sub(window),
-            why.map(|w| format!(", then {w}")).unwrap_or_default()
-        );
-        (k, Some(why))
     }
 
     /// `engine.draft`, and the draft's resident bytes in its card's placement
     /// row, the class `draft` (a row of its own when the target has no layer
     /// there). The card's index missing leaves the device out.
-    pub fn props(&self, mut p: EngineProps) -> EngineProps {
+    pub fn props(&self, p: EngineProps) -> EngineProps {
         if self.lookup.is_some() {
             return lookup_props(p);
         }
-        let Some(Dspark { window, file }) = &self.dspark else {
-            return p;
-        };
-        let device = window
-            .device()
-            .ok()
-            .and_then(|dev| nvidia_smi_index(window.card(), Some(dev)).ok())
-            .map(|i| format!("GPU{i}"));
-        let name = file
-            .as_deref()
-            .and_then(Path::file_name)
-            .map(|f| f.to_string_lossy().into_owned());
-        if let (Some(dev), Some(pl)) = (&device, p.placement.as_mut()) {
-            add_draft_bytes(pl, dev, window.resident_bytes() as u64);
+        match &self.dspark {
+            Some(d) => d.props(p),
+            None => p,
         }
-        p.draft = Some(DraftProps {
-            model: name.unwrap_or_else(|| Draft::Dspark.name().to_owned()),
-            n_max: Some(window.rows() as u64 - 1),
-            kind: Some(Draft::Dspark.name().to_owned()),
-            path: file.as_deref().map(|p| p.display().to_string()),
-            device,
-        });
-        p
     }
 }
 

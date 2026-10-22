@@ -1566,15 +1566,6 @@ impl<H: HostExperts> HostTier<H> {
         m.return_pump(&self.slots, |_| port.routed_landed(key))
     }
 
-    /// The open call's return copies queued and not issued yet
-    /// ([`swap::SwapMachine::returns_owed`]); 0 without a machine.
-    #[must_use]
-    pub fn call_returns_owed(&self) -> usize {
-        self.swap
-            .as_ref()
-            .map_or(0, swap::SwapMachine::returns_owed)
-    }
-
     /// Whether the residency machine's rule holds any decode history
     /// ([`swap::SwapMachine::has_history`]): what a prompt call's end reads
     /// to keep its placement only when the decode has none of its own.
@@ -1885,7 +1876,7 @@ impl<H: HostExperts> HostTier<H> {
     /// refuses a trace, which the service writes, and
     /// [`HostTier::start_swap`] a residency machine, which moves card experts
     /// to the service. Load-time only.
-    pub(crate) fn mark_unserved(&mut self, l: usize) {
+    pub fn mark_unserved(&mut self, l: usize) {
         self.unserved.get_or_insert(l);
     }
 
@@ -2672,6 +2663,14 @@ impl<H: HostExperts> HostTier<H> {
         self.step.open(stream, units, cols)?;
         self.note_capture();
         Ok(())
+    }
+
+    /// Each hybrid layer's routed ids of the last step, in rank order: the
+    /// engine's own routing, empty for a layer the host leg did not serve.
+    /// A gate reads them against a reference engine's picks.
+    #[must_use]
+    pub fn step_ids(&self) -> &[Vec<u32>] {
+        self.step.ids()
     }
 
     /// Layer `layer`'s hybrid work is enqueued: a capture notes it, an eager

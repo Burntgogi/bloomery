@@ -10,6 +10,10 @@ app 0 0 0
 # (bounds asserted before it) and pool.rs's lifetime erasure of a task the caller joins before returning, each with
 # its SAFETY line.
 decision 2 0 0
+# PIN(2026-10-22): device 3 blocks, 6 fns, 5 impls, a new crate, not old code relaxed: the contract's `Elem` impls for
+# the five plain types, the two `from_raw` constructors and the two `Shared` accessors that state their invariant in
+# `# Safety`, and the mock's zeroed element, each with its SAFETY line.
+device 3 6 5
 embed 0 0 0
 # PIN(2026-10-07): engram 6 -> 7 blocks, new code, not old code relaxed: the row reads over a table's bytes in a
 # mapping the reader does not own (TableBytes, which a split's table, Qwen3.8's PLE, and a site share) advise its
@@ -22,9 +26,11 @@ embed 0 0 0
 # libc's pread into a buffer that may hold bytes never written (read_span_uninit, which the NVMe tier's pinned arena
 # reads into), one block, and read_span views its initialized bytes as that buffer, one block; each with its SAFETY
 # line.
-engram 10 0 0
+# PIN(2026-10-22): engram 10 -> 11 blocks, new code, not old code relaxed: RunTable maps each file that holds a
+# table's runs (a checkpoint folder's shards) read-only with memmap2's map, one block with its SAFETY line.
+engram 11 0 0
 engram-lab 0 0 0
-gguf 9 2 0
+gguf 7 2 0
 # PIN(2026-10-01): gpu 1354 -> 1356, a new kernel entry, not old code relaxed: kda_delta_lanes (GLM's two-row
 # verify, one state lane per row) adds its launcher's and its kernel's decay-row blocks, each with its SAFETY line.
 # PIN(2026-10-01): gpu 1356 -> 1363 blocks, 143 -> 144 fns, a new kernel entry, not old code relaxed:
@@ -386,7 +392,37 @@ gguf 9 2 0
 # PIN(2026-10-21): gpu 2023 -> 2024 blocks, 236 -> 237 fns, a new kernel entry, not old code relaxed:
 # head_norm_neox_append_128_partial (rope_neox.rs): its launcher is an unsafe fn (the positions are distinct, as the
 # 512 and whole-turn launchers state) and its kernel makes the one call into norm_partial_append, with its SAFETY line.
-gpu 2024 237 10
+# PIN(2026-10-21): gpu 2024 -> 2027 blocks, 237 -> 239 fns, a new kernel entry, not old code relaxed: the block walk
+# BlockListed (flash_gqa.rs) is the second KeyWalk next to Listed: its trait method is an unsafe fn (declaration and impl, the
+# Listed impl keeping the one it had), the impl reads the block id and the cache row in two blocks, and the
+# gqa_flash_seg_mma_p16_blocks entry makes the one call into seg_mma_ps. Each with its SAFETY line.
+# PIN(2026-10-21): gpu 2027 -> 2030 blocks, new code, not old code relaxed: two new kernel entries for the four-slot
+# routed counts (MiniMax-M3's), ds41_ffn_handoff_4's call into handoff_at and ds41_ffn_card_acc_4's call into
+# card_acc_at and its write, each block with its SAFETY line.
+# PIN(2026-10-21): gpu 2030 -> 2100 blocks, 239 -> 242 fns, new kernel entries of Raon and DFlash2, not old code
+# relaxed: raon_hc_route, raon_hc_fold, raon_hc_post and raon_hc_mean (arch/raon1/mhc.rs, 18 blocks); dflash_conv
+# (dspark/conv.rs, 3) and InPlace::new, an unsafe fn over the target's resident matrix (dspark/mod.rs, 2 blocks and
+# 1 fn); sel_score, sel_topk_part and sel_topk_merge with warp_top16, an unsafe fn (dspark/selector.rs, 21 blocks and
+# 1 fn); latent_extra_rms_append (latent.rs, 8); kda_write_gate (linear/write_gate.rs, 3); q6k_heads_f32
+# (q6k_heads.rs, 4); situ_rows (elem.rs, 1); gqa_flash_seg_p4_ring with seg_scalar_ring_p, an unsafe fn that states
+# its launch contract (flash_gqa.rs, 9 blocks and 1 fn beyond BlockListed's, pinned above). Each block has its SAFETY
+# line. The token-major copy lifted out of qwen3moe/proj.rs into token_major.rs carries its kernel's one block along
+# and adds the shared-slot load every module family makes, 1 block.
+# PIN(2026-10-21): gpu 2100 -> 2101 blocks, 242 -> 243 fns, a new kernel entry, not old code relaxed: raon_hc_mix
+# (arch/raon1/mhc.rs) splits Raon's mHC route over m x 40 blocks; its unsafe fn is the lane's 8-load piece dot.
+# PIN(2026-10-21): gpu 2101 -> 2112 blocks, 243 -> 247 fns: both head-256
+# appends carry their distinct cache-writer contract through the KV and selecting-attention wrappers.
+# Eleven audited caller blocks discharge that obligation; no device code or launch changes.
+# PIN(2026-10-22): gpu 2112 -> 2115 blocks, a new kernel entry, not old code relaxed: q6k_gate_up_sel (q6k_sel.rs), the
+# Q6_K gate·up the common card leg launches for Body35's placed layers. Each block has its SAFETY line.
+# PIN(2026-10-22): gpu 2115 -> 2118 blocks, a new kernel entry, not old code relaxed: raon_join_qkv (arch/raon1/wide.rs)
+# joins the wide unit's q, k and v rows into one token-major buffer, its source read and its one-writer store (2), and
+# the shared-slot load every module family makes (1). Each block has its SAFETY line.
+# PIN(2026-10-22): gpu 2118 -> 2119 blocks, a new kernel entry, not old code relaxed: raon_row_window
+# (arch/raon1/wide.rs) copies a column window of each of a wide unit's rows; its one-writer store has its SAFETY line.
+# PIN(2026-10-22): gpu 2119 -> 2121 blocks, a new kernel entry, not old code relaxed: gemm_iq3s (gemm/grouped.rs)
+# reads the file's IQ3_S blocks: its block load (iq3s_dec) and its lane decode (iq3s_lane). Each block has its SAFETY line.
+gpu 2121 247 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.
@@ -406,7 +442,7 @@ gpu 2024 237 10
 # PIN(2026-10-17): gpu-deepseek41 388 -> 385 blocks, fns unchanged, not old code relaxed: the wide
 # router scores' move to the common f32_tile_gemm (bolt-r6) takes the family's three remaining
 # wide-dot call blocks out of the crate. Measured 385 on the merged tree.
-gpu-deepseek41 385 44 0
+gpu-deepseek41 382 44 0
 # PIN(2026-10-01): gpu-gates 60 -> 61 blocks, new code, not old code relaxed: gate_glm5next_serve starts
 # bloomery-serve with PR_SET_PDEATHSIG set between fork and exec (one pre_exec block, its SAFETY line), as the
 # Qwen3.8 serve gate does, so a bound that ends the gate does not leave the server holding the card.
@@ -454,7 +490,17 @@ gpu-deepseek41 385 44 0
 # overflowing E4M3 shapes before launch. Each constructor has its own SAFETY line.
 # PIN(2026-10-21): gpu-gates 83 -> 84 blocks, new code, not old code relaxed: gate_minimaxm3_rope's launch of the
 # unsafe head-128 partial-turn launcher, whose positions rope_gate::run checks distinct, with its SAFETY line.
-gpu-gates 84 5 1
+# PIN(2026-10-21): gpu-gates 84 -> 85 blocks, new code, not old code relaxed: gate_minimaxm3_msa's launch of the index heads
+# (attn::enqueue_index, an unsafe fn: the positions are distinct, which rope_gate::run checks), with its SAFETY line.
+# PIN(2026-10-21): gpu-gates 85 -> 86 blocks, new code, not old code relaxed: the DFlash2 draft's Q6KInPlace head
+# (shared/raon1_dflash.rs) borrows the target model's resident matrix, whose lifetime the seat's session holds, with
+# its SAFETY line.
+# PIN(2026-10-21): gpu-gates 86 -> 88 blocks: the f16 and Q8 head-256 rope gates
+# invoke their contracted launchers only after checking distinct host cache writers.
+# PIN(2026-10-22): gpu-gates 88 -> 89 blocks, new code, not old code relaxed: MiniCPM-V 4.7's full-vocabulary DSpark
+# draft (shared/dspark_hf.rs) borrows the target's resident Q6_K head in place, as the DFlash2 draft does, with its
+# SAFETY line; the seat checks the draft's CUDA context against the target's first.
+gpu-gates 89 5 1
 # PIN(2026-10-15): gpu-gemma-embedding2 0 -> 1 blocks, new code, not old code relaxed: the head-512
 # launcher call requires distinct Consts::pos positions, with its SAFETY line.
 # PIN(2026-10-15): gpu-gemma-embedding2 1 -> 2 blocks, new code, not old code relaxed: Encoder::pass's call of
@@ -471,6 +517,15 @@ gpu-gemma4a 11 0 0
 # SAFETY line; the rank holds the page past every launch it enqueues.
 gpu-glm5next 7 0 0
 gpu-mimo2 0 0 0
+# PIN(2026-10-21): gpu-minimaxm3 0 -> 19 blocks, 0 -> 1 fns, a new crate, not old code relaxed: the score and select kernels
+# (attn.rs) read and write their buffers through raw places and shared words, each block with its SAFETY line, and
+# enqueue_index is an unsafe fn, as the head kernel it calls (the positions are distinct).
+# PIN(2026-10-21): gpu-minimaxm3 19 -> 21 blocks, new code, not old code relaxed: the step's two launches of those head
+# kernels (the index heads and the attention heads, one token, so the positions are distinct), each with its SAFETY line.
+# PIN(2026-10-21): gpu-minimaxm3 21 -> 23 blocks, new code, not old code relaxed: the prompt batch's two launches of those
+# head kernels (the index heads and the attention heads, a unit's rows, so the positions are distinct), each with its SAFETY
+# line.
+gpu-minimaxm3 23 1 0
 gpu-solar2 0 0 0
 # PIN(2026-10-10): gpu-vision 48 -> 86 blocks, new code, not old code relaxed: the Qwen3-VL tower's five kernel entries read and
 # write their buffers through the same raw places as V4.1's, each block with its SAFETY line — vis_attn_h72 17, vis_rope2d_h72 4,
@@ -496,6 +551,11 @@ gpu-vision 148 0 0
 hf 0 0 0
 jinja 0 0 0
 levers 0 0 0
+# PIN(2026-10-22): metal 21 blocks, 6 fns, 13 impls, a new crate, not old code relaxed: the Objective-C bindings declare
+# no Metal protocol thread-safe, so the thread-safe handles and the window's raw carry `unsafe impl Send/Sync` with Apple's
+# list as their invariant; the shared pages' one owner (`HostPages`) holds every access through the contents pointer; the
+# window raw's buffer dereference and the encoder's two argument calls each carry their SAFETY line.
+metal 21 6 13
 # PIN(2026-10-02): model 112 -> 114 blocks, 29 -> 30 fns, new code, not old code relaxed: the union's row lanes
 # (ops.rs PairWork::compute_lanes, the one unsafe fn) read the pass's quantized columns and write their output
 # cells, two blocks, each with its SAFETY line.
@@ -506,11 +566,22 @@ levers 0 0 0
 # compute call (ops.rs dispatch_ccd, over each run of a block) and the warm walk's prefetch (ops.rs warm_touch), each
 # with its SAFETY line, and the cut test's RowSet double (ccd_tests::Pairs, whose `unsafe fn compute` the trait
 # makes unsafe).
-model 115 31 13
+# PIN(2026-10-22): model 108 -> 109 blocks, 31 -> 32 fns, new code, not old code relaxed: host_lock's
+# release_file_pages, an unsafe fn whose caller states that the slice is a file's own read-only mapping, and the one
+# block that hands that slice to FileMapping::new, with its SAFETY line.
+model 109 32 13
 # model-hf: the four blocks that left model (119 -> 115) with the fixture bin and its test, the page-fault reads (`getrusage`),
 # each with its SAFETY line; no new unsafe.
-model-hf 4 0 0
+# PIN(2026-10-22): model-hf 0 -> 1 block, new code, not old code relaxed: Checkpoint::release calls
+# release_file_pages on the shard mapping safetensors::Folder::mapped gives, with its SAFETY line.
+model-hf 1 0 0
 models 0 0 0
+# PIN(2026-10-21): os 24 blocks, 5 fns, not old code relaxed: the host chain's OS calls moved here from threads,
+# gguf, engram and model (their pins come down), each beside its macOS body, each block with its SAFETY line.
+# PIN(2026-10-21): os 24 -> 30 blocks, new code, not old code relaxed: the base page (moved from model's host_lock),
+# the peak resident set (moved from model-hf's four), and macOS's host memory (mach_host_self, host_statistics64)
+# and sysctl reads; model and model-hf come down by the five that moved.
+os 30 5 0
 placement 0 0 0
 # PIN(2026-10-02): qdot 69 -> 77 blocks, 36 -> 41 fns, new kernels, not old code relaxed: the Q4_K/Q5_K row
 # lanes (pack_lanes_avx2, dot_lanes_avx2 and their helpers transpose8_epi32, transpose8_ps, lane_codes: five
@@ -573,6 +644,7 @@ placement 0 0 0
 # dispatch in swiglu_oai (1 block), v_swiglu_oai and its v_expf call (1 block), swiglu_oai_avx2's full-vector and
 # padded-tail bodies (two loads, the v_swiglu_oai call and the store each: 8), each with its own SAFETY line.
 qdot 227 97 0
+record 0 0 0
 refset 0 0 0
 runtime 0 0 0
 # PIN(2026-10-21): two existing blocks moved from hf, not new unsafe: the read-only mapping and checked bf16 view.
@@ -583,7 +655,7 @@ sampler 4 4 1
 # the zeroed sigaction and its registration, the handler's stderr write with _exit on a second
 # interrupt and its one-byte write on the first, each with its SAFETY line.
 serve 6 0 0
-threads 9 0 1
+threads 3 0 1
 tokenizer 0 0 0
 # PIN(2026-10-14): verbs 0 -> 57 blocks, 22 fns, 2 impls, new crate, moved from gpu-gates/src/bin/shared/verbs.rs (45
 # blocks there) with the tier link's RDMA end as its second user: the calls into libibverbs loaded at run time

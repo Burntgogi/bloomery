@@ -311,7 +311,8 @@ pub(super) fn project(c: &Ctx<'_>, d: &DeltaPlan, s: &mut Arena, m: usize) -> Re
         Some(cols) => {
             gpu.enqueue_gemv_q6k(wqkv, act, cols)?;
             k.proj
-                .enqueue_token_major(stream, cols, d.shape.channels(), m, &mut g.x)?;
+                .token_major
+                .enqueue(stream, cols, d.shape.channels(), m, &mut g.x)?;
         }
         None => gpu.enqueue_gemv_q6k(wqkv, act, &mut g.x)?,
     }

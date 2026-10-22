@@ -14,6 +14,7 @@ mod classify;
 pub mod coverage;
 pub mod deepseek2;
 pub mod deepseek41;
+pub mod dflash2;
 pub mod draft;
 pub mod dspark;
 pub mod gemma_embedding;
@@ -31,6 +32,7 @@ pub mod noaux;
 pub mod place_hybrid;
 pub mod qwen35moe;
 pub mod qwen3moe;
+pub mod raon1;
 pub mod registry;
 pub mod solar2;
 mod stems;
@@ -159,6 +161,8 @@ pub enum Arch {
     Glm5next,
     Mimo2,
     SolarOpen2,
+    MiniMaxM3,
+    Raon1,
     NemotronH,
     NemotronHMoe,
     GemmaEmbedding,
@@ -190,6 +194,8 @@ impl Arch {
             "glm5next" | GLM5_NEXT_LLAMA_CPP => Ok(Arch::Glm5next),
             "mimo2" => Ok(Arch::Mimo2),
             "solar-open2" => Ok(Arch::SolarOpen2),
+            "minimax-m3" => Ok(Arch::MiniMaxM3),
+            "raon1" => Ok(Arch::Raon1),
             "nemotron_h" => Ok(Arch::NemotronH),
             "nemotron_h_moe" => Ok(Arch::NemotronHMoe),
             GEMMA_EMBEDDING => Ok(Arch::GemmaEmbedding),
@@ -214,6 +220,8 @@ impl Arch {
             Arch::Glm5next => "glm5next",
             Arch::Mimo2 => "mimo2",
             Arch::SolarOpen2 => "solar-open2",
+            Arch::MiniMaxM3 => "minimax-m3",
+            Arch::Raon1 => "raon1",
             Arch::NemotronH => "nemotron_h",
             Arch::NemotronHMoe => "nemotron_h_moe",
             Arch::GemmaEmbedding => GEMMA_EMBEDDING,
@@ -273,6 +281,15 @@ fn meta_f32(split: &Split, suffix: &str) -> Result<f32, PlacementError> {
     split
         .arch_get_f32(suffix)
         .ok_or_else(|| metadata(split, suffix, "is absent or not a float"))
+}
+
+/// `<architecture>.<suffix>` as a float, `None` when the file does not carry the key; a key of
+/// another type is an error naming it.
+pub(crate) fn optional_f32(split: &Split, suffix: &str) -> Result<Option<f32>, PlacementError> {
+    match split.value(&split.arch_key(suffix)) {
+        None => Ok(None),
+        Some(_) => meta_f32(split, suffix).map(Some),
+    }
 }
 
 /// `<architecture>.<suffix>` as a finite positive float.
@@ -344,6 +361,40 @@ fn per_layer_items<'a>(
         ));
     }
     Ok(items)
+}
+
+/// `<architecture>.<suffix>` as one shared count expanded to every trunk
+/// layer or an array of the trunk's counts: an array of `n_trunk` counts, or
+/// of the file's `n_layer` counts (a next-token layer's entries close it),
+/// the trunk's taken. Other array lengths are refused by name. Zero is a
+/// count; a family that refuses it checks that itself.
+pub(crate) fn per_layer_count_trunk(
+    split: &Split,
+    suffix: &str,
+    n_trunk: usize,
+    n_layer: usize,
+) -> Result<Vec<usize>, PlacementError> {
+    if !matches!(split.value(&split.arch_key(suffix)), Some(Value::Array(_))) {
+        return per_layer_count(split, suffix, n_trunk);
+    }
+    let items = meta_arr(split, suffix)?;
+    if items.len() != n_trunk && items.len() != n_layer {
+        return Err(metadata(
+            split,
+            suffix,
+            format!("has {} values for {n_trunk} trunk layers", items.len()),
+        ));
+    }
+    items
+        .iter()
+        .take(n_trunk)
+        .enumerate()
+        .map(|(l, v)| {
+            v.as_unsigned()
+                .and_then(|x| usize::try_from(x).ok())
+                .ok_or_else(|| metadata(split, suffix, format!("has no count at layer {l}")))
+        })
+        .collect()
 }
 
 /// `<architecture>.<suffix>` as one shared count expanded to every layer
@@ -650,9 +701,11 @@ fn block_tensors(split: &Split, first: usize, end: usize) -> Vec<BlockTensors> {
 /// The blocks past the trunk and the next-token layers a file carries, from
 /// `nextn_predict_layers` (n) and the tensors of the blocks `n_layer - n ..
 /// n_layer`. Every default taken or shape read is recorded in `defaults`: an
-/// absent key (`absent_note`, the line that defaults it). Where the first of
-/// the blocks carries `nextn.eh_proj`, the count is believed. Where it does
-/// not, the blocks are read by their tensors:
+/// absent key (`absent_note`, the line that defaults it; empty when the
+/// family's dialect reads no next-token layer, where the absence is no
+/// default taken). Where the first of the blocks carries `nextn.eh_proj`, the
+/// count is believed. Where it does not, the blocks are read by their
+/// tensors:
 /// - none carries any tensor: a stripped next-token layer, the trunk is
 ///   `n_layer - n` and none is carried;
 /// - each carries trunk tensors and none a `nextn.*` one: they are trunk
@@ -671,7 +724,9 @@ fn nextn_layers(
     let key = "nextn_predict_layers";
     let n = match split.value(&split.arch_key(key)) {
         None => {
-            defaults.push(format!("{key} = 0 ({absent_note})"));
+            if !absent_note.is_empty() {
+                defaults.push(format!("{key} = 0 ({absent_note})"));
+            }
             return Ok(NextnLayers::NONE);
         }
         Some(_) => meta_usize(split, key)?,
@@ -1088,6 +1143,8 @@ mod tests {
             Arch::Glm5next,
             Arch::Mimo2,
             Arch::SolarOpen2,
+            Arch::MiniMaxM3,
+            Arch::Raon1,
             Arch::NemotronH,
             Arch::NemotronHMoe,
             Arch::GemmaEmbedding,

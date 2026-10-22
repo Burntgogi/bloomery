@@ -42,7 +42,7 @@
 //! draft_to_target[draft_idx]"; vLLM `vllm/model_executor/models/qwen3_dspark.py`:
 //! `return draft_ids + self.draft_id_to_target_id[draft_ids]`).
 
-use runtime::dspark::{DraftVocab, DsparkError, DsparkShape};
+use runtime::dspark::{DraftVocab, DsparkError, DsparkShape, HeadKind};
 use serde_json::Value;
 
 /// Why a draft's config or id map was refused.
@@ -340,8 +340,10 @@ pub fn shape(config_json: &str, d2t: Option<&[i64]>) -> Result<DsparkShape, Erro
         vocab,
         mask_id,
         window: window_of(&cfg)?,
-        markov_rank,
-        confidence,
+        head: HeadKind::Markov {
+            rank: markov_rank,
+            confidence,
+        },
     };
     shape.check()?;
     Ok(shape)
@@ -478,8 +480,13 @@ mod tests {
         assert_eq!(s.hidden, 2048);
         assert_eq!(s.mask_id, 248077);
         assert_eq!(s.window, Some(2048));
-        assert_eq!(s.markov_rank, 256);
-        assert!(s.confidence);
+        assert_eq!(
+            s.head,
+            HeadKind::Markov {
+                rank: 256,
+                confidence: true
+            }
+        );
         let DraftVocab::Reduced {
             to_target,
             n_target,
@@ -511,8 +518,13 @@ mod tests {
         // Full attention, no window; the head scores the target's own ids.
         assert_eq!(s.window, None);
         assert_eq!(s.vocab, DraftVocab::Full { n: 248144 });
-        assert_eq!(s.markov_rank, 256);
-        assert!(s.confidence);
+        assert_eq!(
+            s.head,
+            HeadKind::Markov {
+                rank: 256,
+                confidence: true
+            }
+        );
         assert_eq!(s.width(8), 7);
     }
 

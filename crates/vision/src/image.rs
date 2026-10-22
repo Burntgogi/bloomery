@@ -135,9 +135,15 @@ impl Rgb8 {
     /// Decode a PNG or JPEG file's bytes to RGB, the decoder chosen by the file's signature; any
     /// other file is refused by its name.
     pub fn from_bytes(bytes: &[u8]) -> Result<Rgb8, VisionError> {
+        Rgb8::from_bytes_with_limit(bytes, usize::MAX)
+    }
+
+    /// Decode PNG or JPEG bytes only when both the RGB frame and the decoder's output buffer
+    /// fit `max_bytes`, checked from the headers before allocating either output.
+    pub fn from_bytes_with_limit(bytes: &[u8], max_bytes: usize) -> Result<Rgb8, VisionError> {
         match FileKind::sniff(bytes) {
-            FileKind::Png => Rgb8::from_png(bytes),
-            FileKind::Jpeg => Rgb8::from_jpeg(bytes),
+            FileKind::Png => Rgb8::decode_png(bytes, max_bytes),
+            FileKind::Jpeg => Rgb8::decode_jpeg(bytes, max_bytes),
             other => Err(VisionError::Format(format!(
                 "a {} file; only PNG and JPEG decode here",
                 other.name()
@@ -148,6 +154,10 @@ impl Rgb8 {
     /// Decode a JPEG file's bytes to RGB, as the reference's `Image.open(...).convert("RGB")` up to
     /// the decoder's rounding (module doc).
     pub fn from_jpeg(bytes: &[u8]) -> Result<Rgb8, VisionError> {
+        Rgb8::decode_jpeg(bytes, usize::MAX)
+    }
+
+    fn decode_jpeg(bytes: &[u8], max_bytes: usize) -> Result<Rgb8, VisionError> {
         // The decoder finishes a baseline file whose EOI marker, or the scan bytes before it, are
         // missing; Pillow calls that file truncated.
         if !reaches_eoi(bytes) {
@@ -183,6 +193,8 @@ impl Rgb8 {
         let (width, height) = decoder
             .dimensions()
             .ok_or_else(|| VisionError::Decode("the JPEG's headers name no frame size".into()))?;
+        let frame_bytes = Rgb8::decoded_frame_len(width, height)?;
+        check_decode_limit(frame_bytes, max_bytes)?;
         let pixels = decoder.decode().map_err(decode)?;
         let data = if grey {
             pixels.iter().flat_map(|&g| [g, g, g]).collect()
@@ -194,6 +206,10 @@ impl Rgb8 {
 
     /// Decode a PNG file's bytes to RGB, as the reference's `Image.open(...).convert("RGB")`.
     pub fn from_png(bytes: &[u8]) -> Result<Rgb8, VisionError> {
+        Rgb8::decode_png(bytes, usize::MAX)
+    }
+
+    fn decode_png(bytes: &[u8], max_bytes: usize) -> Result<Rgb8, VisionError> {
         let mut decoder = png::Decoder::new(Cursor::new(bytes));
         // Palette indices become their colours and 1/2/4-bit greys become 8-bit greys; 16-bit
         // samples stay 16-bit and are refused below.
@@ -204,6 +220,9 @@ impl Rgb8 {
         let size = reader
             .output_buffer_size()
             .ok_or_else(|| VisionError::Decode("the PNG's frame size overflows".into()))?;
+        let header = reader.info();
+        let frame_bytes = Rgb8::decoded_frame_len(header.width as usize, header.height as usize)?;
+        check_decode_limit(frame_bytes.max(size), max_bytes)?;
         let mut buf = vec![0u8; size];
         let info = reader
             .next_frame(&mut buf)
@@ -214,6 +233,9 @@ impl Rgb8 {
                 "a {:?}-bit PNG; only 8-bit samples convert to RGB here",
                 info.bit_depth
             )));
+        }
+        if info.color_type == png::ColorType::Rgb && buf.len() == info.buffer_size() {
+            return Rgb8::from_decoded(width, height, buf);
         }
         let rows = buf.chunks_exact(info.line_size).take(height);
         let mut data = Vec::with_capacity(Rgb8::decoded_frame_len(width, height)?);
@@ -265,6 +287,17 @@ impl Rgb8 {
     }
 }
 
+fn check_decode_limit(bytes: usize, max_bytes: usize) -> Result<(), VisionError> {
+    if bytes > max_bytes {
+        return Err(VisionError::Limits {
+            detail: format!(
+                "image decode needs {bytes} bytes, over the {max_bytes} decoded-image bytes remaining"
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// Whether a JPEG's marker sequence reaches an EOI. Segments are walked by their lengths; any other
 /// byte that is not `0xFF` is skipped (a scan's entropy-coded bytes, or stray bytes libjpeg skips
 /// too), as are a stuffed `FF 00`, fill `FF`s and the markers that carry no length. Whatever follows
@@ -295,6 +328,67 @@ fn reaches_eoi(bytes: &[u8]) -> bool {
 mod tests {
     use super::{FileKind, Rgb8};
     use crate::VisionError;
+
+    fn png(width: u32, height: u32, color: png::ColorType, pixels: Option<&[u8]>) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut bytes, width, height);
+            encoder.set_color(color);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().unwrap();
+            if let Some(pixels) = pixels {
+                writer.write_image_data(pixels).unwrap();
+            }
+        }
+        if pixels.is_none() {
+            bytes.truncate(33);
+            bytes.extend_from_slice(b"\0\0\0\0IDAT\x35\xaf\x06\x1e");
+        }
+        bytes
+    }
+
+    #[test]
+    fn bounded_decode_checks_headers_before_allocating_output() {
+        let huge = png(1, 40_000_000, png::ColorType::Rgb, None);
+        assert!(huge.len() < 64);
+        assert!(matches!(
+            Rgb8::from_bytes_with_limit(&huge, 64 * 1024 * 1024),
+            Err(VisionError::Limits { .. })
+        ));
+        // RGB fits, but the transformed RGBA buffer does not.
+        let rgba = png(2, 1, png::ColorType::Rgba, None);
+        assert!(matches!(
+            Rgb8::from_bytes_with_limit(&rgba, 6),
+            Err(VisionError::Limits { .. })
+        ));
+    }
+
+    #[test]
+    fn bounded_decode_keeps_small_png_and_jpeg_pixels() {
+        for (color, pixels) in [
+            (png::ColorType::Rgb, &[12, 34, 56, 78, 90, 12][..]),
+            (png::ColorType::Rgba, &[12, 34, 56, 0, 78, 90, 12, 255][..]),
+            (png::ColorType::Grayscale, &[12, 34][..]),
+            (png::ColorType::GrayscaleAlpha, &[12, 0, 34, 255][..]),
+        ] {
+            let bytes = png(2, 1, color, Some(pixels));
+            let expected = Rgb8::from_png(&bytes).unwrap();
+            assert_eq!(Rgb8::from_bytes_with_limit(&bytes, 8).unwrap(), expected);
+            assert!(matches!(
+                Rgb8::from_bytes_with_limit(&bytes, 5),
+                Err(VisionError::Limits { .. })
+            ));
+        }
+        let jpeg = include_bytes!("../tests/fixtures/jpeg/tiny-1x1-420.jpg");
+        assert_eq!(
+            Rgb8::from_bytes_with_limit(jpeg, 3).unwrap(),
+            Rgb8::from_jpeg(jpeg).unwrap()
+        );
+        assert!(matches!(
+            Rgb8::from_bytes_with_limit(jpeg, 2),
+            Err(VisionError::Limits { .. })
+        ));
+    }
 
     #[test]
     fn file_kinds_by_signature() {

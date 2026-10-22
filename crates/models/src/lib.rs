@@ -77,6 +77,9 @@ pub enum Arch {
     /// Solar-Open2: Kimi delta attention layers with a NoPE GQA layer every fourth, routed
     /// experts with a shared one in every layer.
     SolarOpen2,
+    /// Raon-1: Raon delta attention layers (decoupled erase and write gates) with a gated NoPE
+    /// latent-attention layer every few, `situ` experts with a shared one, Raon_mHC streams.
+    Raon1,
     GemmaEmbedding,
     GemmaEmbedding2,
 }
@@ -100,6 +103,7 @@ impl Arch {
             Arch::NemotronH => "nemotron_h",
             Arch::NemotronHMoe => "nemotron_h_moe",
             Arch::SolarOpen2 => "solar-open2",
+            Arch::Raon1 => "raon1",
             Arch::GemmaEmbedding => "gemma-embedding",
             Arch::GemmaEmbedding2 => "gemma-embedding2",
         }
@@ -279,6 +283,13 @@ pub struct Latent {
     pub rope: Option<Rope>,
     /// A per-head RMS norm on the query, without a gain.
     pub q_head_norm: bool,
+    /// Key values beside the latent in the cached row, which no rope turns: shared by every head
+    /// (`qk_rope_head_dim` of a model that rotates none). 0: the row is the latent alone.
+    pub pe: u32,
+    /// The gate on the heads' outputs before the output projection; [`OutGate::Proj`] is a
+    /// projection of the layer input of its own (`attn_gate`). [`OutGate::Packed`] is not a
+    /// latent layer's.
+    pub out_gate: OutGate,
     pub out: LatentOut,
     /// The raw positions attended; `None`: every position.
     pub window: Option<u32>,
@@ -450,6 +461,11 @@ pub enum DeltaKind {
     /// A per-channel decay, a conv per q, k and v, the output gated. `gate` is
     /// how the decay is made, `beta_scale` the scale on `sigmoid(b_proj x)`.
     Kda { gate: KdaGate, beta_scale: f32 },
+    /// A Kda decay and conv with an erase gate `sigmoid(b)` apart from the write gate
+    /// `sigmoid(b + w)` (a value scale `exp(logsigmoid(b + w) - logsigmoid(b))`, `w` the
+    /// per-head `ssm_rda` projection), the output gated by a full-width projection of its own
+    /// (`ssm_g`) after a per-head RMS norm. `gate` is how the decay is made.
+    Rda { gate: KdaGate },
 }
 
 /// How a KDA layer's decay gate is made.
@@ -589,6 +605,9 @@ pub enum Act {
     /// `x·sigmoid(alpha·x)·(y + 1)`. The gate is clamped from above only,
     /// before the sigmoid, and the up path carries a unit offset.
     SwigluOai { alpha: f32, limit: f32 },
+    /// `situ`: `gate_beta·tanh(g/gate_beta)·sigmoid(g) · value_beta·tanh(u/value_beta)`; both
+    /// betas are above 0 and finite.
+    Situ { gate_beta: f32, value_beta: f32 },
 }
 
 impl Act {
@@ -600,6 +619,7 @@ impl Act {
             Act::ReluSqr => "squared ReLU",
             Act::GeGlu => "GELU GLU",
             Act::SwigluOai { .. } => "swigluoai",
+            Act::Situ { .. } => "situ",
         }
     }
 
@@ -642,6 +662,17 @@ pub enum HcKind {
         /// `hyper_connection.epsilon`: the floor on the mixes.
         eps: f32,
         mix: HcMix,
+        collapse: Collapse,
+    },
+    /// Chart-constrained (Raon_mHC): pre, post and a Helmert-chart residual mix from one
+    /// projection of the streams scaled by their RMS, every sublayer its own mix. The residual
+    /// mix is `(1 - g) I + g Phi` with `g = sigmoid(eta)` and `Phi` the doubly stochastic point
+    /// of the chart; the post mix is `magnitude · sigmoid(..)`.
+    Chart {
+        /// `hyper_connection.epsilon`: added to the streams' mean square.
+        eps: f32,
+        /// `hyper_connection.magnitude`: the post mix's factor.
+        magnitude: f32,
         collapse: Collapse,
     },
     /// Gated-residual: the sublayer's input the mean of the normed streams,

@@ -198,12 +198,16 @@ pub enum LoadError {
     /// A [`PrivateType`] entry that cannot size a tensor, or one listed twice.
     #[error("private type id {id}: {detail}")]
     BadPrivateType { id: u32, detail: &'static str },
+    /// The tensor scales beside a tensor of a type that reads them ([`tensor_scales`]).
+    #[error("tensor {name}: {detail}")]
+    Scale { name: String, detail: String },
 }
 
 /// A parsed, mmap-backed GGUF file.
 pub struct Gguf {
-    // Kept alive for the mapping's lifetime; the mapping borrows the fd.
-    _file: File,
+    // Kept alive for the mapping's lifetime; the mapping borrows the fd. A
+    // header alone ([`Split::header_only`]) has no file.
+    _file: Option<File>,
     map: Backing,
     meta: Vec<(String, Value)>,
     tensors: Vec<TensorInfo>,
@@ -226,6 +230,8 @@ pub enum Weights {
 enum Backing {
     File(Mmap),
     Anon(MmapMut),
+    /// The header's bytes and no tensor's ([`Split::header_only`]).
+    Header(Vec<u8>),
 }
 
 impl std::ops::Deref for Backing {
@@ -234,6 +240,7 @@ impl std::ops::Deref for Backing {
         match self {
             Backing::File(m) => m,
             Backing::Anon(m) => m,
+            Backing::Header(h) => h,
         }
     }
 }
@@ -319,7 +326,7 @@ impl Gguf {
             }
         };
         Ok(Gguf {
-            _file: file,
+            _file: Some(file),
             map,
             meta: h.meta,
             tensors,
@@ -341,6 +348,11 @@ impl Gguf {
     /// Iterate all metadata pairs.
     pub fn iter_kv(&self) -> impl Iterator<Item = (&str, &Value)> {
         self.meta.iter().map(|(k, v)| (k.as_str(), v))
+    }
+
+    /// Every metadata pair, in file order.
+    pub fn keys(&self) -> &[(String, Value)] {
+        &self.meta
     }
 
     /// Raw metadata lookup by exact key.
@@ -577,6 +589,27 @@ impl Split {
         Split::assemble(shards, paths)
     }
 
+    /// The header `layout` lays out, as one shard named `path`, holding no tensor's bytes: the
+    /// model of a checkpoint folder whose tensors a load reads through its part source
+    /// (`model::part::Source`) while its plan, tokenizer and chat surface read this header as
+    /// they read a split's. Every tensor is checked as a shard's is (its type, block alignment
+    /// and size, against the file `layout` would write), and every read of a tensor's bytes is
+    /// refused by name ([`Gguf::data`]: past the data the shard holds).
+    pub fn header_only(path: PathBuf, layout: &write::Layout) -> Result<Split, LoadError> {
+        let bytes = layout.header_bytes().to_vec();
+        let h = parse_header(&bytes, layout.file_len())?;
+        let tensors = strict_tensors(h.tensors, h.data_base, layout.file_len(), &[], true)?;
+        let shard = Gguf {
+            _file: None,
+            map: Backing::Header(bytes),
+            meta: h.meta,
+            tensors,
+            data_base: h.data_base,
+            alignment: h.alignment,
+        };
+        Split::assemble(vec![shard], vec![path])
+    }
+
     /// Index every tensor by name, refusing a name that appears twice.
     fn assemble(shards: Vec<Gguf>, paths: Vec<PathBuf>) -> Result<Split, LoadError> {
         let mut by_name: HashMap<String, (usize, usize)> = HashMap::new();
@@ -641,6 +674,11 @@ impl Split {
     /// The first shard's metadata pairs, in file order.
     pub fn iter_kv(&self) -> impl Iterator<Item = (&str, &Value)> {
         self.shards[0].iter_kv()
+    }
+
+    /// [`Gguf::keys`] of the first shard.
+    pub fn keys(&self) -> &[(String, Value)] {
+        self.shards[0].keys()
     }
 
     /// [`Gguf::architecture`] of the first shard.
@@ -789,6 +827,115 @@ pub fn ggml_type_info(id: u32) -> Option<(&'static str, u64, u64)> {
 pub fn tensor_bytes(blck: u64, tsz: u64, dims: &[u64]) -> Option<u64> {
     let row = tsz.checked_mul(dims[0] / blck)?;
     dims[1..].iter().try_fold(row, |acc, &d| acc.checked_mul(d))
+}
+
+/// The byte runs, in order, that hold the values `at` along dim `dim` of a tensor of `dims` held as
+/// `tsz`-byte blocks of `blck` values along dim 0 ([`tensor_bytes`]' layout): along dim 0 one run a
+/// row, whole blocks; along a dim past it one run of whole rows for each index of the dims past
+/// `dim`. `None` for no dim `dim`, an empty `at` or one past the dim, a dim 0 or an `at` along it
+/// off the blocks, and a byte count past u64.
+#[must_use]
+pub fn tensor_runs(
+    blck: u64,
+    tsz: u64,
+    dims: &[u64],
+    dim: usize,
+    at: std::ops::Range<u64>,
+) -> Option<Vec<std::ops::Range<u64>>> {
+    let extent = *dims.get(dim)?;
+    if blck == 0
+        || tsz == 0
+        || dims.contains(&0)
+        || at.start >= at.end
+        || at.end > extent
+        || !dims[0].is_multiple_of(blck)
+    {
+        return None;
+    }
+    // Every run lies inside the tensor's bytes, so a count that fits u64 bounds every offset.
+    tensor_bytes(blck, tsz, dims)?;
+    let row = tsz * (dims[0] / blck);
+    if dim == 0 {
+        if !at.start.is_multiple_of(blck) || !at.end.is_multiple_of(blck) {
+            return None;
+        }
+        let (lo, hi) = (at.start / blck * tsz, at.end / blck * tsz);
+        let rows: u64 = dims[1..].iter().product();
+        return Some((0..rows).map(|i| i * row + lo..i * row + hi).collect());
+    }
+    let inner = row * dims[1..dim].iter().product::<u64>();
+    let outer: u64 = dims[dim + 1..].iter().product();
+    let stride = inner * extent;
+    Some(
+        (0..outer)
+            .map(|o| o * stride + at.start * inner..o * stride + at.end * inner)
+            .collect(),
+    )
+}
+
+/// The tensor scales `t`'s values are multiplied by: the f32 values of `<stem>.scale` beside
+/// `<stem>.weight`, found through `find` (the file's tensors by name: its shard and entry), one
+/// for a tensor and one an expert, in expert order, for a routed stack (three dims, mainline's
+/// `.scale` `[n_expert]`). A type that reads them ([`GgmlType::reads_scale`]: NVFP4 and
+/// bloomery's F8 and NVFP4 rows) carries them; `None` for any other type.
+///
+/// # Errors
+///
+/// A name without the `.weight` suffix, a missing scale, one of another type or count, and a
+/// value that is not finite, as [`LoadError::Scale`]; a scale's bytes [`Gguf::data`] refuses.
+pub fn tensor_scales<'g>(
+    t: &TensorInfo,
+    find: impl Fn(&str) -> Option<(&'g Gguf, &'g TensorInfo)>,
+) -> Result<Option<Vec<f32>>, LoadError> {
+    if !t.ty.reads_scale() {
+        return Ok(None);
+    }
+    let refuse = |detail: String| LoadError::Scale {
+        name: t.name.clone(),
+        detail,
+    };
+    let stem = t.name.strip_suffix(".weight").ok_or_else(|| {
+        refuse("a scaled tensor's name ends in .weight, its scale's in .scale".into())
+    })?;
+    let name = format!("{stem}.scale");
+    let (g, s) =
+        find(&name).ok_or_else(|| refuse(format!("its scale {name} is not in the file")))?;
+    let (want, of) = match t.dims.as_slice() {
+        [_, _, n] => (*n, "one f32 value an expert is a stack's scales"),
+        _ => (1, "one f32 value is the tensor's scale"),
+    };
+    if s.ty != GgmlType::F32 || s.dims.iter().try_fold(1u64, |a, &d| a.checked_mul(d)) != Some(want)
+    {
+        return Err(refuse(format!(
+            "its scale {name} is {} {:?}; {of}",
+            s.ty, s.dims
+        )));
+    }
+    let scales: Vec<f32> = g
+        .data(s)?
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| f32::from_le_bytes(*b))
+        .collect();
+    if u64::try_from(scales.len()).ok() != Some(want) {
+        return Err(refuse(format!("its scale {name} is not {want} f32 values")));
+    }
+    if let Some((i, v)) = scales.iter().enumerate().find(|(_, v)| !v.is_finite()) {
+        return Err(refuse(format!(
+            "its scale {name} [{i}] is {v}, not a finite value"
+        )));
+    }
+    Ok(Some(scales))
+}
+
+/// The tensor `name` is the tensor scale of ([`tensor_scales`]): `<stem>.weight` of `split`
+/// beside `<stem>.scale`, of a type that reads one. `None` for any other name.
+#[must_use]
+pub fn scaled_weight(split: &Split, name: &str) -> Option<String> {
+    let weight = format!("{}.weight", name.strip_suffix(".scale")?);
+    let (_, t) = split.find(&weight)?;
+    t.ty.reads_scale().then_some(weight)
 }
 
 /// [`tensor_bytes`], or [`LoadError::TooLarge`] naming the tensor.
@@ -1251,6 +1398,40 @@ mod split_tests {
         std::fs::remove_dir_all(&d).unwrap();
     }
 
+    /// A layout's header alone reads as the file the layout writes reads, and holds no tensor
+    /// bytes: every read of one is refused by name.
+    #[test]
+    fn a_header_alone_reads_as_its_file_and_refuses_every_byte() {
+        let d = set_dir("header");
+        let p = d.join("whole.gguf");
+        let kvs = [kv(GENERAL_ARCHITECTURE, Value::String("test".into()))];
+        write_gguf(&p, &kvs, &["a", "b"]);
+        let decl = |name: &str| TensorDecl {
+            name: name.into(),
+            dims: vec![4],
+            type_id: 0,
+            nbytes: 16,
+        };
+        let layout = crate::write::Layout::new(&kvs, vec![decl("a"), decl("b")]).unwrap();
+        let file = Split::open(&p).unwrap();
+        let head = Split::header_only(d.clone(), &layout).unwrap();
+        assert_eq!(head.keys(), file.keys());
+        let infos = |s: &Split| {
+            s.iter_tensors()
+                .map(|(i, t)| (i, t.name.clone(), t.dims.clone(), t.ty, t.offset, t.nbytes))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(infos(&head), infos(&file));
+        assert_eq!(head.shard_path(0), Some(d.as_path()));
+        let shard = head.shard(0).unwrap();
+        assert!(!shard.file_backed());
+        for (_, t) in head.iter_tensors() {
+            let e = shard.data(t).unwrap_err().to_string();
+            assert!(e.contains(&format!("{:?}", t.name)), "{e}");
+        }
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
     #[test]
     fn a_missing_shard_is_named() {
         let d = good_set("missing");
@@ -1321,16 +1502,15 @@ mod split_tests {
 
     /// Page faults the calling thread has taken, minor and major.
     fn thread_faults() -> u64 {
-        // SAFETY: `rusage` is a C struct of integers; all-zero bytes are a value of it.
-        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
-        // SAFETY: `usage` is a live, writable `rusage` for the duration of the call.
-        let rc = unsafe { libc::getrusage(libc::RUSAGE_THREAD, &mut usage) };
-        assert_eq!(rc, 0, "getrusage(RUSAGE_THREAD)");
-        u64::try_from(usage.ru_minflt + usage.ru_majflt).unwrap()
+        os::thread_faults().expect("getrusage(RUSAGE_THREAD)")
     }
 
     /// A file refused by the strict pass costs a populating open its header's
     /// pages, not its data's: the populate waits for the validation.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "the Linux fact it reads: a per-thread page-fault count"
+    )]
     #[test]
     fn a_refused_file_is_not_populated() {
         const DATA: usize = 64 << 20;

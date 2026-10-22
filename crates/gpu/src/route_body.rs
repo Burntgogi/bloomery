@@ -27,7 +27,7 @@
 //! ones.
 
 use crate::q8f32::f32_lane_partial_1col_w32;
-use crate::route_core::{Score, renorm_divisor, take};
+use crate::route_core::{Score, renorm_divisor, router_score, take};
 use crate::{FaultSink, FaultSite};
 use cuda_device::atomic::{AtomicOrdering, DeviceAtomicU32};
 use cuda_device::{DisjointSlice, thread, threadfence, warp};
@@ -188,10 +188,10 @@ pub unsafe fn select_n<const E: usize, const U: usize>(
 }
 
 /// `ds41_router`'s body (`gpu-deepseek41`) over `E` experts, `U` slots and the score `S`: the
-/// row walk (`f32_gemv`'s m = 1 row, the logit into `logits`, `S::score` of
-/// it into `probs`), the fence and the block's ticket, and in the block that
-/// draws the last ticket [`publish_n`] and [`select_n`] into `ids` and
-/// `weights` from 0, then the ticket count back to zero.
+/// row walk (`f32_gemv`'s m = 1 row, the logit into `logits`, its
+/// [`router_score`] into `probs`), the fence and the block's ticket, and in
+/// the block that draws the last ticket [`publish_n`] and [`select_n`] into
+/// `ids` and `weights` from 0, then the ticket count back to zero.
 ///
 /// # Safety
 ///
@@ -240,7 +240,7 @@ pub unsafe fn router_body<S: Score, const E: usize, const U: usize>(
             unsafe { *logits.get_unchecked_mut(row) = logit };
             // SAFETY: row < n_expert <= probs.len() by this fn's contract;
             // lane 0 of the row's warp is the slot's only writer.
-            unsafe { *probs.get_unchecked_mut(row) = S::score(logit) };
+            unsafe { *probs.get_unchecked_mut(row) = router_score::<S>(logit) };
         }
     }
     threadfence();
@@ -344,7 +344,7 @@ pub unsafe fn pick_body<const E: usize, const U: usize>(
 /// holding `N_EXPERT` and `N_USED`, the three `#[cuda_module]` entries
 /// (`$router`, `$scores`, `$pick`), `RouterOut` and `RouterKernels` at those
 /// counts, compiled into the crate that invokes it (`gpu-deepseek41`'s
-/// `glm5next` and `mimo2`; Bolt's five, `arch/nemotron_h_moe/router.rs`). The expert and slot counts are tokens, not constants, so the
+/// `glm5next` and `mimo2`; Bolt's five, `arch/nemotron_h_moe/router.rs`; the 128/6 one below). The expert and slot counts are tokens, not constants, so the
 /// entries' `launch_contract` literals and the module's constants are one
 /// source. The entry names are the PTX entry names, and `$p_router`,
 /// `$p_scores` and `$p_pick` the `prepare_*` launchers `#[cuda_module]`
@@ -384,7 +384,7 @@ macro_rules! sigmoid_router_instance {
         /// The instance's row in `models::shape::ROUTERS`: a shape read from
         /// a file selects it through `select_router`.
         pub const ROW: RouterInst =
-            shape::router_row(RouterBody::BiasedSigmoid, N_EXPERT as u32);
+            shape::router_row_k(RouterBody::BiasedSigmoid, N_EXPERT as u32, N_USED as u32);
         const _: () = assert!(shape::router_row_is(
             ROW,
             rules::BIASED_SIGMOID,
@@ -803,4 +803,18 @@ macro_rules! sigmoid_router_instance {
         }
         }
     };
+}
+
+crate::sigmoid_router_instance! {
+    /// The sigmoid router at 128 experts and the top 6 (Raon-1's and
+    /// Nemotron-3.5-Lightning's): the rule of `sigmoid_128_4` (MiniMax-M3)
+    /// at another pick count, from the generic bodies. Named by its shape:
+    /// any family at 128/6 imports it.
+    pub mod sigmoid_128_6 {
+        experts: 128,
+        used: 6,
+        kernels: sigmoid_128_6_router_kernels,
+        entries: sigmoid_128_6_router, sigmoid_128_6_router_pick,
+        prepare: prepare_sigmoid_128_6_router, prepare_sigmoid_128_6_router_pick,
+    }
 }

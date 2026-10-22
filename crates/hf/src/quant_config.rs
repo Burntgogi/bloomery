@@ -15,6 +15,7 @@
 //! `quant_method`, algorithm or scheme is refused when the config is read. `input_scale` (an
 //! activation scale) is reported, not used.
 
+use std::cell::LazyCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::Path;
@@ -94,8 +95,6 @@ impl fmt::Display for Format {
 /// A tensor of one format as a card holds it, its block scales decoded to plain ones.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Held {
-    /// The values and their block scales: the bytes a cut splits.
-    pub bytes: u64,
     /// One tensor scale a matrix, which every rank holds whole.
     pub whole_bytes: u64,
     /// The values a cut keeps whole along dims 0 and 1 (ggml's order).
@@ -163,8 +162,8 @@ impl Format {
     }
 
     /// The held form of a tensor of the format and logical `dims` (ggml's order: dim 0 the values
-    /// a row holds, dim 1 the rows, the dims past them whole matrices) in its card type, whose
-    /// row gives its bytes; `None` for a format no card holds, a zero dimension, a byte count past
+    /// a row holds, dim 1 the rows, the dims past them whole matrices) in its card type;
+    /// `None` for a format no card holds, a zero dimension, a byte count past
     /// `u64`, or a row that is not whole blocks of its card type. NVFP4 adds its one F32 tensor
     /// scale a matrix.
     #[must_use]
@@ -179,16 +178,12 @@ impl Format {
         if k % block[0] != 0 {
             return None;
         }
-        let bytes = gguf::tensor_bytes(row.blck, row.bytes, dims)?;
+        gguf::tensor_bytes(row.blck, row.bytes, dims)?;
         let whole_bytes = match self {
             Format::Nvfp4 | Format::Nvfp4Csf | Format::Nvfp4Csf32 => matrices.checked_mul(4)?,
             _ => 0,
         };
-        Some(Held {
-            bytes,
-            whole_bytes,
-            block,
-        })
+        Some(Held { whole_bytes, block })
     }
 
     /// The logical shape of a tensor of the format with `stored` shape (row-major): two E2M1
@@ -241,10 +236,17 @@ enum Other {
     },
 }
 
-/// A compressed-tensors target: every linear, a module by name, or `re:` a regex from the start.
+/// The module classes a model's checkpoint map can identify for class-name targets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModuleClass {
+    Linear,
+    Embedding,
+}
+
+/// A compressed-tensors target: a module class, a module by name, or `re:` a regex from the start.
 #[derive(Debug)]
 enum Target {
-    Linear,
+    Class(ModuleClass),
     Name(String),
     Re(Regex),
 }
@@ -256,14 +258,22 @@ impl Target {
                 Regex::new(&format!("^(?:{re})"))
                     .map_err(|e| bad(format!("compressed-tensors pattern {t}: {e}")))?,
             ),
-            None if t == "Linear" => Target::Linear,
+            None if t == "Linear" => Target::Class(ModuleClass::Linear),
+            None if t == "Embedding" => Target::Class(ModuleClass::Embedding),
+            None if !t.contains('.')
+                && t.as_bytes().first().is_some_and(u8::is_ascii_uppercase) =>
+            {
+                return Err(bad(format!(
+                    "compressed-tensors class {t} is not one this reader knows"
+                )));
+            }
             None => Target::Name(t.to_string()),
         })
     }
 
-    fn matches(&self, module: &str) -> bool {
+    fn matches(&self, module: &str, class: impl FnOnce() -> Option<ModuleClass>) -> bool {
         match self {
-            Target::Linear => true,
+            Target::Class(want) => class() == Some(*want),
             Target::Name(n) => n == module,
             Target::Re(re) => re.is_match(module),
         }
@@ -313,7 +323,11 @@ impl Config {
 
     /// The formats `module` is declared, and the module whose scale a tensor-scale format shares;
     /// empty when the config leaves it unquantized.
-    fn declared(&self, module: &str) -> (Vec<Format>, Option<&str>) {
+    fn declared(
+        &self,
+        module: &str,
+        class_of: impl FnOnce() -> Option<ModuleClass>,
+    ) -> (Vec<Format>, Option<&str>) {
         if let Some(m) = &self.modelopt {
             let layer = m
                 .layers
@@ -350,12 +364,14 @@ impl Config {
                 }
             }
             Some(Other::CompressedTensors { groups, ignore }) => {
-                if ignore.iter().any(|t| t.matches(module)) {
+                let class = LazyCell::new(class_of);
+                let matches = |t: &Target| t.matches(module, || *class);
+                if ignore.iter().any(matches) {
                     vec![]
                 } else {
                     groups
                         .iter()
-                        .filter(|(ts, _)| ts.iter().any(|t| t.matches(module)))
+                        .filter(|(ts, _)| ts.iter().any(matches))
                         .map(|(_, f)| *f)
                         .collect()
                 }
@@ -627,10 +643,12 @@ const COMPANIONS: [&str; 7] = [
     "weight_zero_point",
 ];
 
-/// Every tensor of `tensors` (name, dtype, shape) placed by `config`.
+/// Every tensor of `tensors` (name, dtype, shape) placed by `config`. `class_of` supplies a module's
+/// class from the model's map, or `None` for another or unknown role; only class targets ask for it.
 pub fn plan<'a>(
     config: &Config,
     tensors: impl IntoIterator<Item = (&'a str, Dtype, &'a [usize])>,
+    class_of: impl Fn(&str) -> Option<ModuleClass>,
 ) -> Plan {
     let table: BTreeMap<&str, (Dtype, &[usize])> =
         tensors.into_iter().map(|(n, d, s)| (n, (d, s))).collect();
@@ -646,7 +664,7 @@ pub fn plan<'a>(
         if plain(dtype).is_some() {
             continue;
         }
-        let (formats, owner) = config.declared(module);
+        let (formats, owner) = config.declared(module, || class_of(module));
         let found = formats
             .iter()
             .find_map(|&f| layout(f, name, module, owner, dtype, shape, &table).map(|c| (f, c)));
@@ -1096,7 +1114,11 @@ mod tests {
         for (tag, probes) in cases {
             let c = config(tag).unwrap_or_else(|e| panic!("{tag}: {e}"));
             for (module, want) in *probes {
-                assert_eq!(c.declared(module).0, *want, "{tag}: {module}");
+                assert_eq!(
+                    c.declared(module, || Some(ModuleClass::Linear)).0,
+                    *want,
+                    "{tag}: {module}"
+                );
             }
         }
         let e = config("nvidia__NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB").unwrap_err();
@@ -1137,6 +1159,17 @@ mod tests {
                     "weights": { "num_bits": 4, "type": "int", "strategy": "group",
                         "group_size": group, "symmetric": true } } } } })
         };
+        for (field, class) in [("targets", "LayerNorm"), ("ignore", "Conv2d")] {
+            let mut config = int4(128.into());
+            if field == "targets" {
+                config["quantization_config"]["config_groups"]["g"]["targets"] =
+                    serde_json::json!([class]);
+            } else {
+                config["quantization_config"]["ignore"] = serde_json::json!([class]);
+            }
+            let e = Config::parse(&config, None).unwrap_err();
+            assert!(e.to_string().contains(class), "{e}");
+        }
         let fp8 = |key: &str, v: Value| {
             let mut q =
                 serde_json::json!({ "quant_method": "fp8", "weight_block_size": [128, 128] });
@@ -1231,7 +1264,7 @@ mod tests {
             ("ple.ids", I64, &[3]),
             ("e.2.weight", U8, &[0, 9_223_372_036_854_775_840]),
         ];
-        let p = plan(&c, t.iter().copied());
+        let p = plan(&c, t.iter().copied(), |_| None);
         let got = |n: &str| p.placed.get(n).map(|pl| (pl.format, pl.companions.clone()));
         assert_eq!(
             got("e.0.weight").unwrap(),
@@ -1277,7 +1310,7 @@ mod tests {
             ("l.mlp.gate.weight_packed", I32, &[8, 64]),
             ("y.weight_packed", I32, &[0, usize::MAX / 4]),
         ];
-        let p = plan(&ct, t.iter().copied());
+        let p = plan(&ct, t.iter().copied(), |_| Some(ModuleClass::Linear));
         assert_eq!(
             p.placed["x.weight_packed"].format,
             Format::Int4Pack { group: 128 }
@@ -1292,6 +1325,69 @@ mod tests {
             assert_eq!(
                 layout(format, "m.weight", "m", None, U8, shape, &BTreeMap::new()),
                 None
+            );
+        }
+    }
+
+    #[test]
+    fn compressed_tensor_classes_do_not_quantize_each_others_weights() {
+        use Dtype::*;
+        let tensors: &[(&str, Dtype, &[usize])] = &[
+            ("model.embed_tokens.weight_packed", I32, &[8, 16]),
+            ("model.embed_tokens.weight_scale", Bf16, &[8, 1]),
+            ("model.embed_tokens.weight_shape", I64, &[2]),
+            (
+                "model.layers.0.self_attn.q_proj.weight_packed",
+                I32,
+                &[8, 16],
+            ),
+            (
+                "model.layers.0.self_attn.q_proj.weight_scale",
+                Bf16,
+                &[8, 1],
+            ),
+            ("model.layers.0.self_attn.q_proj.weight_shape", I64, &[2]),
+        ];
+        for (target, kept, refused) in [
+            (
+                "Embedding",
+                "model.embed_tokens",
+                "model.layers.0.self_attn.q_proj",
+            ),
+            (
+                "Linear",
+                "model.layers.0.self_attn.q_proj",
+                "model.embed_tokens",
+            ),
+        ] {
+            let config = Config::parse(
+                &serde_json::json!({"quantization_config": {
+                    "quant_method": "compressed-tensors",
+                    "config_groups": {"g": {
+                        "format": "pack-quantized", "targets": [target],
+                        "weights": {"num_bits": 4, "type": "int", "strategy": "group",
+                            "group_size": 128, "symmetric": true}
+                    }}
+                }}),
+                None,
+            )
+            .unwrap();
+            let placed = plan(&config, tensors.iter().copied(), |module| match module {
+                "model.embed_tokens" => Some(ModuleClass::Embedding),
+                "model.layers.0.self_attn.q_proj" => Some(ModuleClass::Linear),
+                _ => None,
+            });
+            assert_eq!(
+                placed
+                    .placed
+                    .get(&format!("{kept}.weight_packed"))
+                    .map(|p| p.format),
+                Some(Format::Int4Pack { group: 128 }),
+                "{target}: {placed:?}"
+            );
+            assert!(
+                placed.refused[&format!("{refused}.weight_packed")].contains("unquantized"),
+                "{target}: {placed:?}"
             );
         }
     }
@@ -1339,6 +1435,7 @@ mod tests {
                 entries
                     .iter()
                     .map(|(n, d, s)| (n.as_str(), *d, s.as_slice())),
+                |_| None,
             );
             let mut count = BTreeMap::new();
             for pl in p.placed.values() {
@@ -1402,8 +1499,7 @@ mod tests {
         assert!(p.refused.is_empty(), "{:?}", p.refused);
     }
 
-    /// Each format's held bytes and blocks, the stored values plus plain scales: NVFP4 in every
-    /// encoding is GGUF's 36 bytes a 64 values and one tensor scale a matrix.
+    /// Each format's held blocks and tensor scales, including shape and byte-count refusals.
     #[test]
     fn each_format_holds_its_values_and_plain_scales() {
         let expert = [2048, 4096, 288];
@@ -1411,7 +1507,6 @@ mod tests {
             assert_eq!(
                 f.held(&expert),
                 Some(Held {
-                    bytes: 2048 * 4096 * 288 / 2 + 2048 * 4096 * 288 / 16,
                     whole_bytes: 4 * 288,
                     block: [64, 1],
                 })
@@ -1421,7 +1516,6 @@ mod tests {
         assert_eq!(
             Format::Mxfp8.held(&[4096, 8192]),
             Some(Held {
-                bytes: 4096 * 8192 + 4096 * 8192 / 32,
                 whole_bytes: 0,
                 block: [32, 1],
             })
@@ -1429,7 +1523,6 @@ mod tests {
         assert_eq!(
             B128.held(&[16384, 4096]),
             Some(Held {
-                bytes: 16384 * 4096 + 4 * 4096 * 128,
                 whole_bytes: 0,
                 block: [128, 1],
             })
@@ -1446,7 +1539,7 @@ mod tests {
             assert_eq!(B128.held(dims), None, "{dims:?}");
         }
         for ranks in [1, 2, 4] {
-            assert_eq!(B128.held(&[128, 1, ranks]).unwrap().bytes, 132 * ranks);
+            assert!(B128.held(&[128, 1, ranks]).is_some());
         }
         for (rows, cols) in [(0, 128), (128, 0), (0, 0)] {
             assert_eq!(Format::Fp8Block { rows, cols }.held(&[128, 1]), None);
@@ -1457,7 +1550,6 @@ mod tests {
         assert_eq!(
             fp8.held(&[16384, 4096]),
             Some(Held {
-                bytes: 16384 * 4096 + 512 * 4096,
                 whole_bytes: 0,
                 block: [32, 1],
             })
@@ -1466,18 +1558,22 @@ mod tests {
             assert_eq!(
                 f.held(&[16384, 4096]),
                 Some(Held {
-                    bytes: 16384 * 4096 + 4 * 128 * 4096,
                     whole_bytes: 0,
                     block: [128, 1],
                 })
             );
         }
         assert_eq!(Format::Fp8Block { rows: 32, cols: 48 }.held(&[96, 4]), None);
-        assert_eq!(
-            Format::Bf16.held(&[512, 256, 64]).unwrap().bytes,
-            2 * 512 * 256 * 64
-        );
-        assert_eq!(Format::F32.held(&[64]).unwrap().bytes, 256);
+        // PIN(2026-10-21): resident byte counts belong to CardFormat; Held keeps cut units and scales.
+        for (f, dims) in [(Format::Bf16, &[512, 256, 64][..]), (Format::F32, &[64])] {
+            assert_eq!(
+                f.held(dims),
+                Some(Held {
+                    whole_bytes: 0,
+                    block: [1, 1],
+                })
+            );
+        }
         assert_eq!(Format::Fp8Tensor.held(&[64, 64]), None);
         assert_eq!(Format::Bf16.held(&[0, 8192]), None);
         assert_eq!(Format::Bf16.held(&[64, 0]), None);
@@ -1518,6 +1614,14 @@ mod tests {
             plan(
                 &config(tag).unwrap(),
                 entries.iter().map(|(n, d, s)| (*n, *d, s.as_slice())),
+                |module| {
+                    matches!(
+                        module,
+                        "model.language_model.layers.20.mlp.experts.148.down_proj"
+                            | "model.language_model.layers.20.mlp.experts.149.down_proj"
+                    )
+                    .then_some(ModuleClass::Linear)
+                },
             )
         };
         let m = Use::Matrix(Plain::Q8_0);

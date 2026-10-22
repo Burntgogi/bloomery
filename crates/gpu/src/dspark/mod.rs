@@ -1,24 +1,30 @@
 //! The DSpark draft on the card, common to every family that drafts with
 //! one: [`DsparkBody`] runs fc over the target's tapped rows, keeps the
 //! context ring's slots, stages a block, and runs the head chain (norm,
-//! projection, the Markov loop, the draft-to-target id map) with one graph
-//! per width. The layers between the embedded block and the head are a
-//! family's ([`DraftLayers`]): V4.1's live in `bloomery-gpu-deepseek41`, the
-//! dense Qwen3-shaped layer in [`dense`]. The draft's geometry is
-//! [`bloomery_runtime::dspark::DsparkShape`].
+//! projection, then the Markov loop and the draft-to-target id map or the
+//! selector, [`head::HeadTail`]) with one graph per width. The layers
+//! between the embedded block and the head are a family's
+//! ([`DraftLayers`]): V4.1's live in `bloomery-gpu-deepseek41`, the dense
+//! Qwen3-shaped layer in [`dense`] (DFlash2's too, with [`conv`]). The
+//! draft's geometry is [`bloomery_runtime::dspark::DsparkShape`].
 
-use cuda_core::{CudaStream, DeviceBuffer};
-use runtime::dspark::{DraftVocab, DsparkShape};
+use std::mem::ManuallyDrop;
+use std::sync::Arc;
+
+use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
+use runtime::dspark::DsparkShape;
 
 use crate::q8f32::{GemvOut, Q8_0GemvMcolArgs};
 use crate::{DeviceTensor, Gpu, GpuError, Graph, WindowMut};
 
+pub mod conv;
 pub mod dense;
 pub mod head;
 pub mod ring;
+pub mod selector;
 pub mod stage;
 
-use head::{Head, HeadWeights, MARKOV_RANK};
+use head::{Head, HeadWeights};
 use ring::Positions;
 use stage::{Inbox, put_f32};
 
@@ -141,14 +147,64 @@ pub struct HostEmbed {
 
 /// The target's output matrix as the draft's head borrows it: a copy on the
 /// draft's card in the target file's type, each arm holding exactly its
-/// planes. The owner runs the types it has a row kernel for and refuses any
+/// planes, or the target's own resident matrix read in place on the target's
+/// card. The owner runs the types it has a row kernel for and refuses any
 /// other by name.
 pub enum TargetHead {
     /// Q6_K superblocks: the matrix's words.
     Q6K(DeviceTensor<u32>),
+    /// The target's resident Q6_K matrix, read in place ([`InPlace`]): no
+    /// copy, and none of its bytes the draft's.
+    Q6KInPlace(InPlace),
     /// Q8_0 rows in the form the row kernel takes. Refused by name until a
     /// family's borrowed head needs it.
     Q8_0(Q8Rows),
+}
+
+impl TargetHead {
+    /// The Q6_K words the head's row kernel reads: the copy's, or the
+    /// target's in place; `None` for a type with no row kernel.
+    pub(crate) fn q6k(&self) -> Option<&DeviceTensor<u32>> {
+        match self {
+            TargetHead::Q6K(w) => Some(w),
+            TargetHead::Q6KInPlace(p) => Some(&p.w),
+            TargetHead::Q8_0(_) => None,
+        }
+    }
+}
+
+/// A window on a matrix the target holds on the draft's card: the launches
+/// read it as a buffer of the draft's own, and dropping it frees nothing.
+pub struct InPlace {
+    w: ManuallyDrop<DeviceTensor<u32>>,
+}
+
+impl InPlace {
+    /// A window on `w`, a matrix the target holds, in `ctx`, the draft's
+    /// context on the target's card.
+    ///
+    /// # Safety
+    ///
+    /// `w`'s buffer must be a buffer of the card `ctx` runs on and stay
+    /// allocated and in place while the draft launches: a captured graph
+    /// bakes the address in.
+    #[must_use]
+    pub unsafe fn new(w: &DeviceTensor<u32>, ctx: &Arc<CudaContext>) -> InPlace {
+        // SAFETY: the span is `w`'s own `rows × cols` words, and the caller
+        // holds them allocated and in place.
+        let w = unsafe { DeviceTensor::window(w.buf().cu_deviceptr(), w.rows(), w.cols(), ctx) };
+        InPlace { w }
+    }
+}
+
+impl Drop for InPlace {
+    fn drop(&mut self) {
+        // SAFETY: `self.w` is not read again; giving a window back frees no
+        // memory.
+        DeviceTensor::release(ManuallyDrop::new(unsafe {
+            ManuallyDrop::take(&mut self.w)
+        }));
+    }
 }
 
 /// Where the head's projection comes from.
@@ -174,8 +230,8 @@ pub enum Submit {
 
 /// The graphs [`DsparkBody::new`] captures.
 struct Graphs {
-    /// The block pass of `m` rows at `m - 1`: the layers, the head and the
-    /// Markov loop.
+    /// The block pass of `m` rows at `m - 1`: the layers, the head and its
+    /// tail.
     block: Vec<Graph>,
     /// The append of `n` rows at `n - 1`: fc, the hidden norm and the layers'
     /// context append.
@@ -276,47 +332,7 @@ impl<L: DraftLayers> DsparkBody<L> {
         let () = Self::COUNTS;
         let refuse = |detail: String| GpuError::shape(WHAT, detail);
         shape.check().map_err(|e| refuse(e.to_string()))?;
-        if shape.markov_rank != MARKOV_RANK {
-            return Err(refuse(format!(
-                "a Markov rank of {}; the head's kernel takes {MARKOV_RANK}",
-                shape.markov_rank
-            )));
-        }
-        // The owner maps the head's ids through the shape's map and the head's
-        // Markov step through its device map: the two must be one map.
-        match (&shape.vocab, &head.to_target) {
-            (DraftVocab::Full { .. }, None) => {}
-            (
-                DraftVocab::Reduced {
-                    to_target,
-                    n_target,
-                },
-                Some(map),
-            ) => {
-                if head.markov_w1.rows() != *n_target {
-                    return Err(refuse(format!(
-                        "markov_w1 of {} rows for a reduced vocabulary over the target's {n_target} \
-                         ids",
-                        head.markov_w1.rows()
-                    )));
-                }
-                if map.to_host_vec(gpu.stream())? != *to_target {
-                    return Err(refuse(
-                        "the head's draft-to-target map differs from the shape's".into(),
-                    ));
-                }
-            }
-            (DraftVocab::Full { .. }, Some(_)) => {
-                return Err(refuse(
-                    "a draft-to-target map on the head of a full vocabulary".into(),
-                ));
-            }
-            (DraftVocab::Reduced { .. }, None) => {
-                return Err(refuse(
-                    "a reduced vocabulary whose head carries no draft-to-target map".into(),
-                ));
-            }
-        }
+        head.check_against(gpu, &shape.head, &shape.vocab)?;
         if shape.rows(1) > L::MAX_ROWS {
             return Err(refuse(format!(
                 "a block of {} rows for the shortest proposal; the layers hold {}",
@@ -376,17 +392,14 @@ impl<L: DraftLayers> DsparkBody<L> {
                 shape.vocab.rows()
             )));
         }
-        let group = L::APPEND_GROUP;
-        let capacity = shape.window.map_or(group, |w| w.div_ceil(group) * group);
-        let block_words = 1 + match embed {
-            Embed::Layers => 0,
-            Embed::Host(_) => L::MAX_ROWS * hidden,
-        };
+        let capacity = Self::capacity(shape);
+        let [x, fc_out, feats, block_in] =
+            Self::working_lens(shape, hidden, matches!(embed, Embed::Host(_)));
         let s = gpu.stream();
-        let x = DeviceBuffer::zeroed(s, capacity.max(L::MAX_ROWS) * hidden)?;
-        let fc_out = DeviceBuffer::zeroed(s, group * hidden)?;
-        let feats = Inbox::new(gpu, capacity * feat)?;
-        let block_in = Inbox::new(gpu, block_words)?;
+        let x = DeviceBuffer::zeroed(s, x)?;
+        let fc_out = DeviceBuffer::zeroed(s, fc_out)?;
+        let feats = Inbox::new(gpu, feats)?;
+        let block_in = Inbox::new(gpu, block_in)?;
         let mut body = DsparkBody {
             graphs: Graphs {
                 block: Vec::new(),
@@ -408,10 +421,10 @@ impl<L: DraftLayers> DsparkBody<L> {
         };
         for m in 1..=L::MAX_ROWS {
             let g = gpu.capture(|_| body.enqueue_block(gpu, m))?;
-            body.counted(&g, Head::launches(m))?;
+            body.counted(&g, body.head.launches_of(m))?;
             body.graphs.block.push(g);
         }
-        for n in 1..=group {
+        for n in 1..=L::APPEND_GROUP {
             let g = gpu.capture(|_| body.enqueue_append(gpu, n))?;
             body.counted(&g, body.fc_launches(n))?;
             body.graphs.append.push(g);
@@ -434,13 +447,13 @@ impl<L: DraftLayers> DsparkBody<L> {
         ))
     }
 
-    /// Enqueue a block of `m` rows: the layers, then the head's norm,
-    /// projection and Markov loop. Capturable.
+    /// Enqueue a block of `m` rows: the layers, then the head's norm and
+    /// projection, and its tail (the Markov loop or the selector). Capturable.
     fn enqueue_block(&mut self, gpu: &Gpu, m: usize) -> Result<(), GpuError> {
         self.layers.enqueue_block(gpu, &mut self.x, m)?;
         self.head.enqueue_logits(gpu, &self.x, m)?;
         let first = self.block_in.u32s(0, 1)?;
-        self.head.enqueue_markov(gpu, m, &first)
+        self.head.enqueue_tail(gpu, m, &first)
     }
 
     /// Enqueue an append of `n` rows over the staged tapped rows: fc and the
@@ -544,7 +557,7 @@ impl<L: DraftLayers> DsparkBody<L> {
     /// One block after `last`, the token at position `pos` (the committed
     /// position): it writes `width` ids in the target's vocabulary to the
     /// front of `out`, and when `p` is not empty each id's probability under
-    /// the draft, after the Markov term, to the front of `p`. `width` is in
+    /// the draft, after the head's tail, to the front of `p`. `width` is in
     /// `1..=shape.ids_per_block()`, and its block rows within
     /// [`DraftLayers::MAX_ROWS`]. An empty `p` asks for no probabilities and
     /// launches nothing for them. Blocks until the ids are on the host.
@@ -642,10 +655,10 @@ impl<L: DraftLayers> DsparkBody<L> {
         } else {
             (self.head.tokens(s, m)?, None)
         };
-        // A row 0 that is only the anchor drafts no id: the ids are the last
-        // `width` rows'.
-        let skip = m - width;
-        for (i, &d) in ids[skip..].iter().enumerate() {
+        // A row 0 that is only the anchor drafts no id: the ids start at the
+        // shape's first drafting row.
+        let first = self.shape.first_row();
+        for (i, &d) in ids[first..first + width].iter().enumerate() {
             out[i] = self
                 .shape
                 .vocab
@@ -653,7 +666,7 @@ impl<L: DraftLayers> DsparkBody<L> {
                 .map_err(|e| refuse(e.to_string()))?;
         }
         if let Some(probs) = probs {
-            p[..width].copy_from_slice(&probs[skip..]);
+            p[..width].copy_from_slice(&probs[first..first + width]);
         }
         Ok(width)
     }
@@ -691,6 +704,38 @@ impl<L: DraftLayers> DsparkBody<L> {
     #[must_use]
     pub fn committed(&self) -> u32 {
         self.positions.committed()
+    }
+
+    /// The most rows one append takes: the window in whole groups, or one
+    /// group for a draft with no window.
+    fn capacity(shape: &DsparkShape) -> usize {
+        let group = L::APPEND_GROUP;
+        shape.window.map_or(group, |w| w.div_ceil(group) * group)
+    }
+
+    /// The lengths of the owner's working buffers for a draft of `shape`
+    /// over rows of `hidden` values, `host` when it embeds the block's rows
+    /// on the host, as [`DsparkBody::new`] allocates them: `x`, `fc_out`, the
+    /// tapped rows' inbox and the block's, each of 4-byte elements.
+    fn working_lens(shape: &DsparkShape, hidden: usize, host: bool) -> [usize; 4] {
+        let capacity = Self::capacity(shape);
+        let feat = shape.taps.len() * shape.hidden;
+        let block_words = 1 + if host { L::MAX_ROWS * hidden } else { 0 };
+        [
+            capacity.max(L::MAX_ROWS) * hidden,
+            L::APPEND_GROUP * hidden,
+            capacity * feat,
+            block_words,
+        ]
+    }
+
+    /// Card bytes of the owner's working buffers for a draft of `shape` over
+    /// rows of `hidden` values, `host` when it embeds the block's rows on the
+    /// host, before any load: [`OwnHeld::working`] less the head's scratch.
+    #[must_use]
+    pub fn working_bytes(shape: &DsparkShape, hidden: usize, host: bool) -> u64 {
+        let words: usize = Self::working_lens(shape, hidden, host).iter().sum();
+        words as u64 * 4
     }
 
     /// Card bytes the draft holds at `ctx` positions: the layers', and the
@@ -770,10 +815,10 @@ impl<L: DraftLayers> DsparkBody<L> {
     }
 
     /// Launches of the head over a block of `m` rows: the norm, the
-    /// quantizer, the projection and the Markov loop's two a row.
+    /// quantizer and the projection, then its tail's ([`Head::launches_of`]).
     #[must_use]
     pub fn head_launches(&self, m: usize) -> usize {
-        Head::launches(m)
+        self.head.launches_of(m)
     }
 
     /// Launches of the owner's part of an append of `n` rows: fc and the

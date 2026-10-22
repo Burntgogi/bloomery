@@ -94,6 +94,8 @@
 //!   reads 128 KiB, 32 pages at 4 KiB, so a band of 64 pages and 240 a flip.
 //!   The line also prints each read's band pages, and the prompt's drops and
 //!   their wall against the prompt's.
+//! - Under `heat`, `stepunion` also holds a four-column Step claim to each
+//!   id's routed column count and the unrouted id's four-column decay.
 //! - `stepunion` (clause 8, a load of its own): the step port's union of
 //!   two columns on a paged plan — the plan made for two slots at the same
 //!   room and context (the two arms' plan counts one sequence, and a second
@@ -194,6 +196,30 @@
 //!   budget's, fewer than the planned budget's — and decodes the arm's steps
 //!   bit for bit the paged arm's; a reading short by the room above the
 //!   floor and one byte is refused naming the floor.
+//! - `sittings` (clause 14, two child processes of this binary): the paged
+//!   plan under the set `mid-p0-s1` and the expert stream's `split` (the
+//!   load's default under `--place a` with a residency), loaded twice, the
+//!   second beside a host memory copy load the gate runs while that child
+//!   lives, so the two loads' lane probes read different rates (printed, not
+//!   judged). Each child runs a [`PROMPT`]-id prompt call, [`STEPS`] greedy
+//!   steps, a second [`PROMPT`]-id call (a decode history before it, so it
+//!   returns to its start in its walk) and [`SITTING_STEPS`] steps. The
+//!   rule prices the lane by where its sources sit, never by the probe: the
+//!   two loads' priced rates, the calls' picks (each layer's admits, floor
+//!   and counts), every greedy token and every logits row are the same bit
+//!   for bit. Pricing the rule at the probed rate parts the second
+//!   sitting's picks and then its bits.
+//! - `evict` (clause 15, `BLOOMERY_NVTIER_EVICT`): two tiers of the
+//!   floor's own arena over the paged plan, one each rule, through the same
+//!   claims on the first paged layer: its first served id stepped three
+//!   times, the next ids once each until every slot is full, then a
+//!   transient's miss and two steps' misses. Under `heat` the transient's
+//!   miss takes the hot slot whose expert has the least routing count
+//!   ([`NvTier::route_count`], read just before), the first id staying; the
+//!   next step's miss takes that transient, and the one after it the
+//!   coldest count again. Under `tick` the transient's miss takes the first
+//!   id, the least recently used, and the tier counts nothing. A tier that
+//!   evicts by tick alone under `heat` takes the first id: red.
 //!
 //! PIN(2026-10-11): clause 7 judges 0 interior pages after the prompt, where it judged at most `layers x cpus x 2R`. Derived, not measured: the prompt's union reads every tier id from its arena slot (`prefetch_pinned`), so it faults no page of a drop run, and no drop follows it (`release_union` is gone), so a page of a run read after the prompt would stay. The interiors leave out the edge bands where the host segment's own reads reach. The pre-change run (R4b-1, the same union) read 0 against the old bound of 196608. FAIL-first: a layer left unattached to the tier reads the mapping and its interior pages stay, turning the clause red.
 //!
@@ -233,10 +259,13 @@
 
 #[path = "shared/gate_card.rs"]
 mod gate_card;
+#[path = "shared/xstream_rule.rs"]
+mod xstream_rule;
 
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use app::Session;
@@ -251,17 +280,21 @@ use bloomery_gpu::host::swap::{LateLog, PassReport, Residency, SwapSource};
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::residency38::{CARD38, Lever38, residency38};
 use bloomery_gpu_gates::{Fnv1a64, GateError, checks_failed, data_dir, exit_with, verdict};
+use bloomery_levers::NvTierEvict;
 use bloomery_levers::{
     CARD_DONTNEED, ChurnHosting, HOST_LOCK, HOST_POPULATE, HOST_ROOM, HostCfg, RESIDENCY38_SPARES,
 };
 use gguf::Split;
 use model::arch::qwen35moe::place::{Experts, PlanInputs, machine_for_experts};
 use model::moe::UNION_BATCH_IDS;
+use model::moe::{Claim, TierSlots};
 use model::placement::churn::ChurnPool;
 use model::placement::host_lock::page_bytes;
 use model::placement::workstation::{ArenaGrant, HostNeed, HostRead};
 use model::placement::{ArenaFloor, Machine, PlanLevers};
 use runtime::{Out, Target, Want};
+use threads::helper::{Placement, spawn_helper};
+use xstream_rule::{Stage, xstream_rule};
 
 const NAME: &str = "gate_nvtier";
 
@@ -314,14 +347,25 @@ const STEP_MISSES_PREDICTED: u64 = 4_000;
 /// whose arena has less room above its floor takes half of that room
 /// instead.
 const GRANT_SHORT: u64 = 132_071_424;
-/// The argument that makes this binary one of the `grant` clause's children,
-/// followed by the child's role: [`GRANT_LOAD`] or [`GRANT_REFUSE`].
-const GRANT_CHILD: &str = "--grant-child";
+/// The argument that makes this binary one of a clause's children, followed
+/// by the child's role: `grant`'s [`GRANT_LOAD`] or [`GRANT_REFUSE`], or
+/// `sittings`' [`SITTING`].
+const CHILD: &str = "--child";
 /// The child that loads the paged plan with the short reading and runs the
 /// paged arm's steps.
 const GRANT_LOAD: &str = "load";
 /// The child whose load is refused: a reading short past the arena's floor.
 const GRANT_REFUSE: &str = "refuse";
+/// The `sittings` clause's child: the paged plan under `split`, two prompt
+/// calls and their steps.
+const SITTING: &str = "sitting";
+/// The `sittings` clause's greedy steps after its second prompt call.
+const SITTING_STEPS: usize = 8;
+/// The host memory copy load beside the `sittings` clause's second child:
+/// its threads, and the bytes each copies a turn — far past the host's
+/// caches, so every turn holds the host's DRAM.
+const HOG_THREADS: usize = 4;
+const HOG_BYTES: usize = 256 << 20;
 
 fn main() -> std::process::ExitCode {
     exit_with(NAME, run())
@@ -639,6 +683,47 @@ fn inputs_of(file: &Split, room: Option<u64>) -> Result<PlanInputs, GateError> {
     Ok(inputs)
 }
 
+/// The model of `plan` (made of `inputs` over `file`) loaded under
+/// `residency` with `host`, its residency boundaries logged: every arm's and
+/// every child's load. Refused by name: a plan that pages experts on the NVMe
+/// tier without `room` given, or pages none with it.
+fn open_arm(
+    file: Split,
+    inputs: &PlanInputs,
+    plan: &model::placement::Plan<'_>,
+    room: Option<u64>,
+    residency: Residency,
+    host: HostCfg,
+) -> Result<Session<Body38>, GateError> {
+    if (plan.host.nvme_expert_bytes > 0) != room.is_some() {
+        return Err(format!(
+            "the {} arm's plan pages {} B on the NVMe tier: {}",
+            if room.is_some() { "paged" } else { "all-RAM" },
+            plan.host.nvme_expert_bytes,
+            if room.is_some() {
+                "the dial gave the room no tier — check the floor and the room"
+            } else {
+                "the host's own room does not hold the host leg (BLOOMERY_HOST_ROOM set?)"
+            }
+        )
+        .into());
+    }
+    let model = Body38::open_placed_residency(
+        file,
+        plan,
+        inputs,
+        0,
+        host,
+        ubatch_for(CTX)?,
+        residency,
+        ChurnHosting::Hosted,
+        1,
+    )?;
+    let mut s = Session::from_model(model, CTX as u32);
+    s.model_mut().body_parts(NAME)?.2.log_residency(0);
+    Ok(s)
+}
+
 /// One arm: the model loaded under `residency` with `room` given (or the
 /// machine's reading), its [`PROMPT`] ids as one prompt call and [`STEPS`]
 /// greedy steps, the residency boundaries' reports summed; on a load with a
@@ -661,35 +746,9 @@ fn arm(
 ) -> Result<ArmRun, GateError> {
     let file = Split::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
     let inputs = inputs_of(&file, room)?;
-    let ub = ubatch_for(CTX)?;
     let plan = inputs.plan_with(machine, CTX as u64, &PlanLevers::default(), Experts::Card)?;
     let card = plan.n_l.clone();
-    if (plan.host.nvme_expert_bytes > 0) != room.is_some() {
-        return Err(format!(
-            "the {} arm's plan pages {} B on the NVMe tier: {}",
-            if room.is_some() { "paged" } else { "all-RAM" },
-            plan.host.nvme_expert_bytes,
-            if room.is_some() {
-                "the dial gave the room no tier — check the floor and the room"
-            } else {
-                "the host's own room does not hold the host leg (BLOOMERY_HOST_ROOM set?)"
-            }
-        )
-        .into());
-    }
-    let model = Body38::open_placed_residency(
-        file,
-        &plan,
-        &inputs,
-        0,
-        host,
-        ub,
-        residency,
-        ChurnHosting::Hosted,
-        1,
-    )?;
-    let mut s = Session::from_model(model, CTX as u32);
-    s.model_mut().body_parts(NAME)?.2.log_residency(0);
+    let mut s = open_arm(file, &inputs, &plan, room, residency, host)?;
     // `split`: the load's cut, then the rule's split asked of it, the cut set
     // back after it either way.
     let split_walk = {
@@ -1018,6 +1077,8 @@ struct StepRun {
     solo_prompts: [u32; 2],
     solo_tokens: Vec<u32>,
     solo_digests: Vec<u64>,
+    /// A four-column Step claim's routing counts and decay.
+    counts: bool,
     flips: usize,
     misses: u64,
     fills: u64,
@@ -1060,6 +1121,7 @@ fn stepunion_arm(
     ids: &[u32],
     probe: &Split,
     band: Option<u64>,
+    evict: NvTierEvict,
 ) -> Result<StepRun, GateError> {
     let file = Split::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
     let inputs = inputs_of(&file, Some(ROOM))?;
@@ -1163,6 +1225,41 @@ fn stepunion_arm(
             solo_tokens.push(argmax);
         }
     }
+    let layer = regions[0].0;
+    let counts = if evict == NvTierEvict::Heat {
+        let ids: Vec<_> = (0..plan.model.experts as u32)
+            .filter(|&id| tier.slot_filled(layer, id))
+            .take(3)
+            .collect();
+        if ids.len() != 3 {
+            return Err("the stepunion heat check needs three filled ids".into());
+        }
+        let before: Vec<_> = ids.iter().map(|&id| tier.route_count(layer, id)).collect();
+        let pin = tier
+            .prefetch_pinned(layer, &ids[..2], Claim::Step, 4, Some(&[0, 4, 5]))?
+            .wait()?;
+        let decay = (-4.0f64 / 32.0).exp2();
+        let counts = ids
+            .iter()
+            .zip(before)
+            .zip([4.0, 1.0, 0.0])
+            .all(|((&id, before), added)| {
+                let (Some(before), Some(after)) = (before, tier.route_count(layer, id)) else {
+                    return false;
+                };
+                let want = before * decay + added;
+                before > 0.0 && after.is_finite() && (after - want).abs() <= 1e-12 * want
+            });
+        drop(pin);
+        counts
+    } else {
+        tier.route_count(layer, 0).is_none()
+    };
+    println!(
+        "stepunion counts {evict:?}: four columns route one id four times and another once, \
+        the third decays four columns: {}",
+        verdict(counts)
+    );
     Ok(StepRun {
         prompts,
         tokens,
@@ -1170,6 +1267,7 @@ fn stepunion_arm(
         solo_prompts,
         solo_tokens,
         solo_digests,
+        counts,
         flips,
         misses: t1.misses - t0.misses,
         fills: t1.fills - t0.fills,
@@ -1669,12 +1767,12 @@ fn plans_of(passes: &[PassReport]) -> Vec<Plan> {
         .collect()
 }
 
-/// The role this process runs as in the `grant` clause: `Some` of
-/// [`GRANT_LOAD`] or [`GRANT_REFUSE`] for a child of the gate, `None` for the
+/// The role this process runs as: `Some` of [`GRANT_LOAD`],
+/// [`GRANT_REFUSE`] or [`SITTING`] for a child of the gate, `None` for the
 /// gate itself.
-fn grant_role() -> Option<String> {
+fn child_role() -> Option<String> {
     let mut args = std::env::args().skip(1);
-    args.find(|a| a == GRANT_CHILD)?;
+    args.find(|a| a == CHILD)?;
     args.next()
 }
 
@@ -1763,31 +1861,35 @@ where
         .collect::<Result<Vec<_>, _>>()?)
 }
 
-/// Runs this binary as a `grant` child of `role` with the load's reading of
-/// the host set to `reading` bytes, forwards its output and returns its
-/// stdout. A child that ends nonzero is an error by name.
-fn grant_spawn(role: &str, reading: u64) -> Result<String, GateError> {
+/// Runs this binary as `clause`'s child of `role`, with the load's reading
+/// of the host set to `reading` bytes when given (a `grant` child), forwards
+/// its output and returns its stdout. A child that ends nonzero is an error
+/// by name.
+fn child_spawn(clause: &str, role: &str, reading: Option<u64>) -> Result<String, GateError> {
     let t = Instant::now();
-    let out = Command::new(std::env::current_exe()?)
-        .arg(GRANT_CHILD)
-        .arg(role)
-        .env(HOST_ROOM, reading.to_string())
+    let mut child = Command::new(std::env::current_exe()?);
+    child.arg(CHILD).arg(role);
+    if let Some(reading) = reading {
+        child.env(HOST_ROOM, reading.to_string());
+    }
+    let out = child
         .output()
-        .map_err(|e| format!("grant: run the {role} child: {e}"))?;
+        .map_err(|e| format!("{clause}: run the {role} child: {e}"))?;
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     for line in stdout.lines() {
-        println!("[grant {role}] {line}");
+        println!("[{clause} {role}] {line}");
     }
     for line in String::from_utf8_lossy(&out.stderr).lines() {
-        eprintln!("[grant {role}] {line}");
+        eprintln!("[{clause} {role}] {line}");
     }
+    let at = reading.map_or(String::new(), |r| format!(" at BLOOMERY_HOST_ROOM {r} B"));
     println!(
-        "grant {role}: the child at BLOOMERY_HOST_ROOM {reading} B ended {} in {:.1} s",
+        "{clause} {role}: the child{at} ended {} in {:.1} s",
         out.status,
         t.elapsed().as_secs_f64()
     );
     if !out.status.success() {
-        return Err(format!("grant: the {role} child ended {}", out.status).into());
+        return Err(format!("{clause}: the {role} child ended {}", out.status).into());
     }
     Ok(stdout)
 }
@@ -1795,12 +1897,16 @@ fn grant_spawn(role: &str, reading: u64) -> Result<String, GateError> {
 /// The `grant` clause's two children: the load short of its need by
 /// `terms.short`, and the load short past the arena's floor.
 fn grant_run(terms: &GrantTerms) -> Result<GrantRun, GateError> {
-    let loaded = grant_spawn(GRANT_LOAD, terms.reading(terms.short)?)?;
+    let loaded = child_spawn("grant", GRANT_LOAD, Some(terms.reading(terms.short)?))?;
     let line = loaded
         .lines()
         .find_map(|l| l.strip_prefix("grant-load "))
         .ok_or("the grant load child printed no grant-load line")?;
-    let refused = grant_spawn(GRANT_REFUSE, terms.reading(terms.room() + 1)?)?;
+    let refused = child_spawn(
+        "grant",
+        GRANT_REFUSE,
+        Some(terms.reading(terms.room() + 1)?),
+    )?;
     let refusal = refused
         .lines()
         .find_map(|l| l.strip_prefix("grant-refuse "))
@@ -1875,16 +1981,164 @@ fn grant_child(
             println!("grant-refuse {refusal}");
             Ok(())
         }
-        other => {
-            Err(format!("{GRANT_CHILD} takes {GRANT_LOAD} or {GRANT_REFUSE}, not {other}").into())
+        other => Err(format!("{CHILD} takes {GRANT_LOAD} or {GRANT_REFUSE}, not {other}").into()),
+    }
+}
+
+/// What a `sittings` child answered: the stream's mode, the lane's rate its
+/// load's probe measured and the rate the rule priced (0 under `admit`), its
+/// prompt calls' picks and their digest, and its tokens and logits rows'
+/// digests.
+struct Sitting {
+    mode: String,
+    probed: f64,
+    priced: f64,
+    picks: usize,
+    pick_digest: u64,
+    tokens: Vec<u32>,
+    digests: Vec<u64>,
+}
+
+/// A `sittings` child: the paged plan loaded under `residency` with `host`
+/// and the expert stream's unset rule under `--place a` ([`xstream_rule`]:
+/// `split`, `admit` on a card with no room for the ring), the first
+/// [`PROMPT`] ids of `ids` as one prompt call and [`STEPS`] greedy steps,
+/// then the next [`PROMPT`] ids as a second call and [`SITTING_STEPS`]
+/// steps; prints the rule's `xstream=` line, then on one line for the gate
+/// the mode, the lane's probed and priced rates, the calls' picks (each
+/// one's unit, layer, admits, floor and counts) and the tokens and logits
+/// rows' digests.
+fn sitting_child(
+    path: &Path,
+    machine: &Machine,
+    residency: Residency,
+    host: HostCfg,
+    ids: &[u32],
+) -> Result<(), GateError> {
+    let file = Split::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    let inputs = inputs_of(&file, Some(ROOM))?;
+    let plan = inputs.plan_with(machine, CTX as u64, &PlanLevers::default(), Experts::Card)?;
+    let mut s = open_arm(file, &inputs, &plan, Some(ROOM), residency, host)?;
+    let (gpu, _, body) = s.model_mut().body_parts(NAME)?;
+    let line = xstream_rule(gpu, body, None, Stage::A, residency)?;
+    println!("{line}");
+    let mode = line
+        .strip_prefix("xstream=")
+        .and_then(|l| l.split_whitespace().next())
+        .ok_or_else(|| format!("the stream rule's line names no mode: {line}"))?
+        .to_string();
+    let (probed, priced) = body
+        .hybrid()
+        .xstream()
+        .map_or((0.0, 0.0), |x| (x.probed_b_per_us(), x.lane_b_per_us()));
+    let (mut tokens, mut digests) = (Vec::new(), Vec::new());
+    let (mut picks, mut pick_digest) = (0, Fnv1a64::default());
+    for (call, steps) in [(&ids[..PROMPT], STEPS), (&ids[PROMPT..], SITTING_STEPS)] {
+        let Out::Logits { argmax, row } = s.prompt(call, Want::Logits)? else {
+            return Err("a prompt asked for its logits answered an argmax".into());
+        };
+        digests.push(Fnv1a64::default().f32s(row).value());
+        let mut next = argmax;
+        tokens.push(next);
+        let (calls, _) = s.model_mut().body_parts(NAME)?.2.take_stream_records();
+        for (unit, p) in &calls {
+            for v in [
+                *unit as u64,
+                p.layer as u64,
+                p.admitted as u64,
+                p.floor,
+                p.counts,
+            ] {
+                pick_digest = pick_digest.bytes(&v.to_le_bytes());
+            }
+        }
+        picks += calls.len();
+        for _ in 0..steps {
+            let out = s.step(next, Want::Logits)?;
+            if let Out::Logits { row, .. } = out {
+                digests.push(Fnv1a64::default().f32s(row).value());
+            }
+            next = out.argmax();
+            tokens.push(next);
         }
     }
+    Record::new(&record::NVTIER_SITTING)
+        .w("mode", mode)
+        .f("probed", probed)
+        .f("priced", priced)
+        .u("picks", picks)
+        .u("pick_digest", pick_digest.value())
+        .csv("tokens", &tokens)
+        .csv("digests", &digests)
+        .print();
+    Ok(())
+}
+
+/// `f` run beside a host memory copy load: [`HOG_THREADS`] helper threads,
+/// each copying [`HOG_BYTES`] from one buffer to another until `f` returns,
+/// errs or unwinds, joined when it returns.
+fn beside_hog<T>(f: impl FnOnce() -> Result<T, GateError>) -> Result<T, GateError> {
+    /// Ends the copies when `f` is done, on every way out alike.
+    struct Stop(Arc<AtomicBool>);
+    impl Drop for Stop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+    let stop = Stop(Arc::new(AtomicBool::new(false)));
+    let mut hogs = Vec::with_capacity(HOG_THREADS);
+    for i in 0..HOG_THREADS {
+        let stop = Arc::clone(&stop.0);
+        let (hog, _) = spawn_helper(&format!("nvtier-hog-{i}"), Placement::Float, move || {
+            let (from, mut to) = (vec![1u8; HOG_BYTES], vec![0u8; HOG_BYTES]);
+            while !stop.load(Ordering::Relaxed) {
+                to.copy_from_slice(&from);
+                std::hint::black_box(&mut to);
+            }
+        })?;
+        hogs.push(hog);
+    }
+    let out = f();
+    drop(stop);
+    for hog in hogs {
+        hog.join()
+            .map_err(|_| "sittings: a host copy thread panicked")?;
+    }
+    out
+}
+
+/// The `sittings` clause's two children: one alone, one beside a host memory
+/// copy load ([`beside_hog`]).
+fn sittings_run() -> Result<[Sitting; 2], GateError> {
+    let of = |stdout: String| -> Result<Sitting, GateError> {
+        let f = record::Log::of(&stdout, record::GATE_NVTIER).one(&record::NVTIER_SITTING)?;
+        Ok(Sitting {
+            mode: f.word("mode")?.to_owned(),
+            probed: f.f64("probed")?,
+            priced: f.f64("priced")?,
+            picks: usize::try_from(f.u64("picks")?)?,
+            pick_digest: f.u64("pick_digest")?,
+            tokens: f
+                .csv("tokens")?
+                .into_iter()
+                .map(str::parse)
+                .collect::<Result<_, _>>()?,
+            digests: f
+                .csv("digests")?
+                .into_iter()
+                .map(str::parse)
+                .collect::<Result<_, _>>()?,
+        })
+    };
+    let alone = of(child_spawn("sittings", SITTING, None)?)?;
+    let beside = of(beside_hog(|| child_spawn("sittings", SITTING, None))?)?;
+    Ok([alone, beside])
 }
 
 fn run() -> Result<(), GateError> {
     // A `grant` child reads `BLOOMERY_HOST_ROOM`, the reading the gate sets
     // for it; the gate itself leaves it unset.
-    let role = grant_role();
+    let role = child_role();
     let acts_on: &[&str] = if role.is_some() {
         &[HOST_POPULATE, HOST_LOCK, CARD_DONTNEED, HOST_ROOM]
     } else {
@@ -1912,6 +2166,9 @@ fn run() -> Result<(), GateError> {
             Lever38::Set(MID, "mid-p0-s1"),
             Record::print,
         )?;
+        if role == SITTING {
+            return sitting_child(path, &machine, residency, host, &prose38(2 * PROMPT)?);
+        }
         return grant_child(
             role,
             path,
@@ -1974,6 +2231,7 @@ fn run() -> Result<(), GateError> {
         plan.host.nvme_expert_bytes, plan.host.nvme_arena_bytes
     );
     pass &= refuse_clauses(path, &machine, &plan)?;
+    pass &= evict_clause(path, &plan)?;
     let least = ArenaFloor::of(&plan)?;
     let grant_terms = GrantTerms::of(
         plan.host.nvme_arena_bytes,
@@ -1996,6 +2254,54 @@ fn run() -> Result<(), GateError> {
     // `grant` (clause 13)'s children run before the paged arm holds its
     // arena; their answer is read after the `bits` line.
     let grant = grant_run(&grant_terms);
+    // `sittings` (clause 14): the paged plan under `split` loaded twice, the
+    // second beside a host copy load: one rate priced, the same picks and the
+    // same bits. Its children run and its line prints before the paged arm
+    // holds its arena, so a box short of the all-RAM arm's memory still
+    // judges it.
+    let sittings_ok = match sittings_run() {
+        Ok([a, b]) => {
+            let mode_eq = a.mode == b.mode;
+            let priced_eq = a.priced.to_bits() == b.priced.to_bits();
+            let picks_eq = a.picks > 0 && a.picks == b.picks && a.pick_digest == b.pick_digest;
+            let tokens_eq = !a.tokens.is_empty() && a.tokens == b.tokens;
+            let digests_eq = a.digests == b.digests;
+            let ok = mode_eq && priced_eq && picks_eq && tokens_eq && digests_eq;
+            println!(
+                "sittings: the paged plan under mid-p0-s1 and the unset stream rule ({} / {}, \
+                 the same {mode_eq}), loaded alone and beside a host copy load: the lane probed \
+                 {:.2} / {:.2} GB/s (printed, not judged) and priced {:.2} / {:.2} GB/s, the \
+                 same {priced_eq}; {} / {} picks the same {picks_eq}; {} greedy tokens equal \
+                 {tokens_eq}, {} logits rows bit for bit {digests_eq}: {}",
+                a.mode,
+                b.mode,
+                a.probed / 1000.0,
+                b.probed / 1000.0,
+                a.priced / 1000.0,
+                b.priced / 1000.0,
+                a.picks,
+                b.picks,
+                a.tokens.len(),
+                a.digests.len(),
+                verdict(ok)
+            );
+            ok
+        }
+        Err(e) => {
+            println!(
+                "sittings: the children did not answer: {e}: {}",
+                verdict(false)
+            );
+            false
+        }
+    };
+    pass &= sittings_ok;
+    // The all-RAM arm loads first: the paged arm's tier, which the clauses
+    // below read, holds its arena until the stepunion arms, and the host's
+    // reading at the all-RAM arm's load would lose those bytes.
+    let ram = arm(
+        path, &machine, None, residency, host, &ids, false, &probe, None,
+    )?;
     let mut paged = arm(
         path,
         &machine,
@@ -2006,9 +2312,6 @@ fn run() -> Result<(), GateError> {
         audit,
         &probe,
         band,
-    )?;
-    let ram = arm(
-        path, &machine, None, residency, host, &ids, false, &probe, None,
     )?;
 
     let tokens_eq = paged.tokens == ram.tokens;
@@ -2593,7 +2896,15 @@ fn run() -> Result<(), GateError> {
     let mut census = std::mem::take(&mut paged.census);
     let prompt_fill = paged.prompt_fill.take();
     drop((paged, ram));
-    let step = stepunion_arm(path, &machine, host, &ids, &probe, band)?;
+    let step = stepunion_arm(
+        path,
+        &machine,
+        host,
+        &ids,
+        &probe,
+        band,
+        levers.nvtier_evict(),
+    )?;
     let solo_bits = !step.tokens.is_empty()
         && step.prompts == step.solo_prompts
         && step.tokens == step.solo_tokens
@@ -2605,7 +2916,7 @@ fn run() -> Result<(), GateError> {
     // Under a set `off` no lane fills the arena and no prompt union runs: the
     // passes' fills are the step claims', and the union's counters stand.
     let counted = step.step_fills > 0 && step.union_fills == 0 && step.union_hits == 0;
-    let stepunion = solo_bits && step_pages_ok && served && counted;
+    let stepunion = solo_bits && step_pages_ok && served && counted && step.counts;
     println!(
         "stepunion: {STEP_COLS} two-column passes on a two-slot load, {} tokens and logits rows \
          and both prompts' argmax bit for bit the same sequences stepped alone: {}; {}; misses \
@@ -2806,6 +3117,90 @@ fn run() -> Result<(), GateError> {
     }
 }
 
+/// `evict` (clause 15): the victim rule each `BLOOMERY_NVTIER_EVICT` word
+/// names, on a tier of the floor's own arena over `plan` (the module doc).
+fn evict_clause(path: &Path, plan: &model::placement::Plan<'_>) -> Result<bool, GateError> {
+    let split = Arc::new(Split::open(path)?);
+    let least = ArenaFloor::of(plan)?;
+    let mut floor = plan.clone();
+    floor.host.nvme_arena_bytes = least.bytes;
+    let mut pass = true;
+    for evict in [NvTierEvict::Tick, NvTierEvict::Heat] {
+        let tier = NvTier::of_paged(
+            &floor,
+            &split,
+            true,
+            ArenaGrant::whole(least.bytes),
+            ArenaKind::Anon,
+            evict,
+        )?
+        .ok_or("the floor's arena built no tier")?;
+        let layer = (0..plan.model.layers)
+            .find(|&l| tier.covers(l))
+            .ok_or("the paged plan covers no layer")?;
+        let slots = tier.layer_slots(layer);
+        let ids: Vec<u32> = (0..plan.model.experts as u32)
+            .filter(|&id| tier.serves(layer, id))
+            .take(slots + 3)
+            .collect();
+        if ids.len() < slots + 3 {
+            return Err(format!(
+                "layer {layer} serves {} ids, under {} slots and 3",
+                ids.len(),
+                slots
+            )
+            .into());
+        }
+        let (first, transient) = (ids[0], ids[slots]);
+        for &id in [first, first].iter().chain(&ids[..slots]) {
+            tier.ensure(layer, &[id])?;
+        }
+        let filled = |id: u32| tier.slot_filled(layer, id);
+        // The hot id of the least count the tier holds, which `heat` takes.
+        let coldest = || -> Result<Option<u32>, GateError> {
+            let mut least: Option<(u32, f64)> = None;
+            for &id in ids[..slots].iter().filter(|&&id| filled(id)) {
+                let count = tier
+                    .route_count(layer, id)
+                    .ok_or_else(|| format!("layer {layer} id {id}: a heat tier holds no count"))?;
+                if least.is_none_or(|(_, c)| count < c) {
+                    least = Some((id, count));
+                }
+            }
+            Ok(least.map(|(id, _)| id))
+        };
+        let heat = evict == NvTierEvict::Heat;
+        let first_victim = if heat { coldest()? } else { Some(first) };
+        tier.ensure_as(layer, &[transient], Claim::Transient)?;
+        let took = first_victim.is_some_and(|v| !filled(v)) && filled(transient);
+        let kept = !heat || (filled(first) && first_victim != Some(first));
+        tier.ensure(layer, &[ids[slots + 1]])?;
+        let transient_first = !filled(transient) && filled(ids[slots + 1]);
+        let next_victim = if heat { coldest()? } else { Some(ids[1]) };
+        tier.ensure(layer, &[ids[slots + 2]])?;
+        let next = next_victim.is_some_and(|v| !filled(v)) && filled(first) == heat;
+        let counted = tier.route_count(layer, first).is_some() == heat;
+        let ok = took && kept && transient_first && next && counted;
+        println!(
+            "evict {evict:?}: layer {layer} of {slots} slots, id {first} stepped three times then \
+             {} ids once: the transient's miss took {first_victim:?} ({}), the first id {} \
+             ({}); the next step's miss took the transient ({}); the one after took \
+             {next_victim:?} ({}); counts {} ({}): {}",
+            slots - 1,
+            verdict(took),
+            if filled(first) { "kept" } else { "gone" },
+            verdict(kept),
+            verdict(transient_first),
+            verdict(next),
+            if heat { "kept" } else { "none" },
+            verdict(counted),
+            verdict(ok)
+        );
+        pass &= ok;
+    }
+    Ok(pass)
+}
+
 /// `refuse` (clause 4): each refusal by name before any load. The room
 /// under the tier's floor is the plan's; the arena budgets under the
 /// arena's floor — one byte, the routed width less one slot sets, the
@@ -2834,7 +3229,14 @@ fn refuse_clauses(
     let with_arena = |bytes: u64| {
         let mut p = plan.clone();
         p.host.nvme_arena_bytes = bytes;
-        NvTier::of_paged(&p, &split, true, ArenaGrant::whole(bytes), ArenaKind::Anon)
+        NvTier::of_paged(
+            &p,
+            &split,
+            true,
+            ArenaGrant::whole(bytes),
+            ArenaKind::Anon,
+            NvTierEvict::Tick,
+        )
     };
     let slot = match with_arena(1) {
         Err(e) => e.to_string().contains("carves 0 slots"),

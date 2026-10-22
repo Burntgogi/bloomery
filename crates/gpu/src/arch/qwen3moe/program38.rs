@@ -59,7 +59,6 @@
 use super::body::ATTN_SCALE_256;
 use super::card38::{CARD_LAUNCHES, Card38, TIER_CARD_LAUNCHES};
 use super::plan38::{GDN, GdnPlan, HcSite, Layer38, Mixer38, PlePlan, QsaPlan, geo, head_site};
-use super::proj::ProjKernels;
 use super::router::gated;
 use super::scratch::{Io, f32_view};
 use super::scratch38::{Arena38, Store38, Taps38};
@@ -90,7 +89,7 @@ use crate::qsa::{PoolArgs, QsaKernels, QsaScratch, SelectArgs};
 use crate::rope_neox::{PartialNeoxArgs, RopeNeoxKernels};
 use crate::site;
 use crate::tensor::{DeviceTensor, Window, WindowMut};
-use crate::weights::{DevWeight, Weights};
+use crate::weights::Weights;
 use crate::{Gpu, GpuError};
 use cuda_core::DeviceBuffer;
 use runtime::sched::{self, At, LayerProgram, Overlap, PortKind};
@@ -140,12 +139,9 @@ fn head_launches(head: model::arch::qwen35moe::mtp::BorrowedHead) -> usize {
         ))
 }
 
-/// A delta layer's launches past [`GDN_LAUNCHES`] at more than one row: β
-/// and α copied token-major out of the joined projection.
-pub(super) const GDN_ROWS_LAUNCHES: usize = 2;
-/// A selecting layer's launches past [`QSA_LAUNCHES`] at more than one row:
-/// the indexer queries copied token-major.
-pub(super) const QSA_ROWS_LAUNCHES: usize = 1;
+/// A delta layer's launches past [`GDN_LAUNCHES`] at more than one row: the
+/// joined β·α projection runs as β's rows and α's rows, one launch each.
+pub(super) const GDN_ROWS_LAUNCHES: usize = 1;
 
 /// The captured decode step's launches for `plans` with `card`'s card
 /// experts and `tier`'s tier layers (module doc).
@@ -159,10 +155,9 @@ pub(super) fn step_launches(
 }
 
 /// The captured verify's launches for `plans` with `card`'s card experts and
-/// `tier`'s tier layers at `m >= 2` rows: the step's, plus each mixer's
-/// token-major copies ([`GDN_ROWS_LAUNCHES`], [`QSA_ROWS_LAUNCHES`]); the
-/// handoff, the go, the wait, the card leg and the head are one each
-/// whatever `m`.
+/// `tier`'s tier layers at `m >= 2` rows: the step's, plus each delta
+/// layer's [`GDN_ROWS_LAUNCHES`]; the handoff, the go, the wait, the card
+/// leg and the head are one each whatever `m`.
 pub(super) fn verify_launches(
     plans: &[Layer38],
     card: &Card38,
@@ -187,7 +182,7 @@ fn walk_launches(
         .map(|(l, p)| {
             let mixer = match p.mixer {
                 Mixer38::Gdn(_) => GDN_LAUNCHES + usize::from(rows) * GDN_ROWS_LAUNCHES,
-                Mixer38::Qsa(_) => QSA_LAUNCHES + usize::from(rows) * QSA_ROWS_LAUNCHES,
+                Mixer38::Qsa(_) => QSA_LAUNCHES,
             };
             let ffn = if card.hostless(l) {
                 FFN_LAUNCHES - STEP_MEMOPS
@@ -221,8 +216,6 @@ pub(super) struct Kernels38 {
     pub(super) linear: LinearKernels,
     pub(super) router: gated::RouterKernels,
     pub(super) handoff: HandoffKernels,
-    /// The token-major copy of a row-major gemv output.
-    pub(super) proj: ProjKernels,
     /// The ubatch walk's: the one-expert table's fill, the 32-value GEMM
     /// family, the prefill flash and the wide mixes.
     pub(super) gemm: GemmKernels,
@@ -248,7 +241,6 @@ impl Kernels38 {
             linear: LinearKernels::load(ctx)?,
             router: gated::RouterKernels::load(ctx)?,
             handoff: HandoffKernels::load(ctx)?,
-            proj: ProjKernels::load(ctx)?,
             gemm: GemmKernels::load(ctx)?,
             g32: Gemm32Kernels::load(ctx)?,
             prefill: FlashGqaPrefill::load(ctx)?,
@@ -271,9 +263,9 @@ pub(super) struct Ctx38<'a> {
 }
 
 impl Ctx38<'_> {
-    /// `y = W · x` for the Q8_0 or BF16 weight `name` (its resident form,
-    /// `plan38::plans` checks which) over `m` columns, token-major: the
-    /// common dense site (`site::resident_gemv_cols`).
+    /// `y = W · x` for the dense weight `name` over `m` columns, token-major:
+    /// the common dense site at the type of its resident form
+    /// (`site::resident_gemv_cols`; `plan38::plans` checks it is one).
     pub(super) fn dense_gemv(
         &self,
         name: &str,
@@ -281,24 +273,7 @@ impl Ctx38<'_> {
         m: usize,
         y: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
-        site::resident_gemv_cols(self.gpu, &self.k.g32, (self.w, name), x, m, y)
-    }
-
-    /// `y = W · x` for the F32 or BF16 weight `name` over `m` columns,
-    /// row-major (`[rows][m]`): `f32_gemv`, or `bf16_gemv` bit for bit it
-    /// over the widened values.
-    fn f32_gemv(
-        &self,
-        name: &str,
-        x: &DeviceBuffer<f32>,
-        m: usize,
-        y: &mut DeviceBuffer<f32>,
-    ) -> Result<(), GpuError> {
-        let (q, stream) = (self.gpu.q8f32(), self.gpu.stream());
-        match self.w.get(name) {
-            Some(DevWeight::Bf16 { w, .. }) => q.enqueue_bf16_gemv(stream, w, x, m, y),
-            _ => q.enqueue_f32_gemv(stream, f32_tensor(self.w, name)?, x, m, y),
-        }
+        site::resident_gemv_cols(self.gpu, Some(&self.k.g32), (self.w, name), x, m, y)
     }
 
     /// The mix of `site` over `m` columns of `res`, after `before`, into
@@ -980,8 +955,7 @@ fn gdn(
     {
         let Arena38 { gdn: g, pos, .. } = &mut *s;
         let (wb, wa) = beta_alpha_rows(&g.ba, m)?;
-        let (b, a): (&DeviceBuffer<f32>, &DeviceBuffer<f32>) =
-            if m == 1 { (&*wb, &*wa) } else { (&g.b, &g.a) };
+        let (b, a): (&DeviceBuffer<f32>, &DeviceBuffer<f32>) = (&wb, &wa);
         match seqs {
             Seqs38::One { stores, io, .. } => {
                 let lane = lane_of(io)?;
@@ -1034,27 +1008,29 @@ fn gdn(
     gdn_out(c, gp, s, m, sink)
 }
 
-/// A delta layer's projections over every row of `s.mixed`: q·k·v, `z`
-/// and the joined β·α (row-major `[2·n_v][m]`), β and α then copied
-/// token-major at more than one row.
+/// A delta layer's projections over every row of `s.mixed`: q·k·v, `z` and
+/// the joined β·α into `ba` ([`beta_alpha_rows`]): one launch at one row,
+/// past it β's rows and α's rows of the joined weight, one launch each.
 fn gdn_in(c: &Ctx38<'_>, gp: &GdnPlan, s: &mut Arena38, m: usize) -> Result<(), GpuError> {
-    let stream = c.gpu.stream();
     let nv = GDN.n_v;
     let Arena38 { mixed, gdn: g, .. } = s;
     c.dense_gemv(&gp.qkv, mixed, m, &mut g.x)?;
     c.dense_gemv(&gp.z, mixed, m, &mut g.z)?;
-    c.f32_gemv(&gp.beta_alpha, mixed, m, &mut g.ba)?;
-    if m > 1 {
-        let (wb, wa) = beta_alpha_rows(&g.ba, m)?;
-        c.k.proj.enqueue_token_major(stream, &wb, nv, m, &mut g.b)?;
-        c.k.proj.enqueue_token_major(stream, &wa, nv, m, &mut g.a)?;
+    if m == 1 {
+        return c.dense_gemv(&gp.beta_alpha, mixed, 1, &mut g.ba);
+    }
+    let g32 = Some(&c.k.g32);
+    for (i, part) in [(0, nv), (nv, nv)].into_iter().enumerate() {
+        let mut y = beta_alpha_mut(&mut g.ba, m, i)?;
+        site::resident_gemv_rows(c.gpu, g32, (c.w, &gp.beta_alpha, part), mixed, m, &mut y)?;
     }
     Ok(())
 }
 
-/// β's and α's rows of the joined projection `ba` over `m` columns
-/// (row-major `[2·n_v][m]`): its first `n_v·m` values, then the next.
-fn beta_alpha_rows(
+/// β's rows and α's rows of the joined projection `ba` over `m` rows, each
+/// token-major: its first `n_v·m` values, then the next. At one row they
+/// are the whole joined gemv's output, β's values then α's.
+pub(super) fn beta_alpha_rows(
     ba: &DeviceBuffer<f32>,
     m: usize,
 ) -> Result<(Window<'_, f32>, Window<'_, f32>), GpuError> {
@@ -1063,6 +1039,17 @@ fn beta_alpha_rows(
         Window::of(ba, 0, n)?,
         Window::of(ba, n * size_of::<f32>(), n)?,
     ))
+}
+
+/// β's rows (`i` 0) or α's rows (`i` 1) of [`beta_alpha_rows`], to write
+/// through.
+pub(super) fn beta_alpha_mut(
+    ba: &mut DeviceBuffer<f32>,
+    m: usize,
+    i: usize,
+) -> Result<WindowMut<'_, f32>, GpuError> {
+    let n = GDN.n_v * m;
+    WindowMut::of_mut(ba, i * n * size_of::<f32>(), n)
 }
 
 /// A delta layer's launches bound to one sequence, over `io`'s `m` rows:
@@ -1237,9 +1224,8 @@ fn qsa(
                 flash,
                 ..
             } = &mut *s;
-            let qsel: &DeviceBuffer<f32> = if m == 1 { &qa.qr } else { &qa.qi };
             let io = AttendIo {
-                qsel,
+                qsel: &qa.qi,
                 n_keys,
                 qg: &qa.qg,
                 q: &mut qa.q,
@@ -1249,7 +1235,9 @@ fn qsa(
                 y: flash,
             };
             let scratch = (&mut qa.sel, &mut qa.part_v, &mut qa.part_ms);
-            qsa_attend(c, qp, (kv, pooled), io, scratch, m, sink)?;
+            // SAFETY: the front embedding generates consecutive positions within this
+            // sequence's window; this call selects only that sequence's cache planes.
+            unsafe { qsa_attend(c, qp, (kv, pooled), io, scratch, m, sink) }?;
         }
         Seqs38::Slots(seqs) => {
             qsa_query(c, qp, s, m)?;
@@ -1279,9 +1267,8 @@ fn qsa(
                     n_keys: &n_keys,
                 };
                 qsa_keys(c, qp, (raw, pooled), keys, r.len(), sink)?;
-                let qsel: &DeviceBuffer<f32> = if m == 1 { &qa.qr } else { &qa.qi };
                 let io = AttendIo {
-                    qsel: &*rows_of(qsel, r, geo::IDX_HEADS * d)?,
+                    qsel: &*rows_of(&qa.qi, r, geo::IDX_HEADS * d)?,
                     n_keys: &n_keys,
                     qg: &*rows_of(&qa.qg, r, geo::Q_ROWS)?,
                     q: &mut *rows_mut(&mut qa.q, r, geo::ATTN)?,
@@ -1291,7 +1278,9 @@ fn qsa(
                     y: &mut *rows_mut(flash, r, geo::ATTN)?,
                 };
                 let scratch = (&mut qa.sel, &mut qa.part_v, &mut qa.part_ms);
-                qsa_attend(c, qp, (kv, pooled), io, scratch, r.len(), sink)?;
+                // SAFETY: the front embedding generates consecutive positions within this
+                // sequence's window; this call selects only that sequence's cache planes.
+                unsafe { qsa_attend(c, qp, (kv, pooled), io, scratch, r.len(), sink) }?;
             }
         }
     }
@@ -1308,9 +1297,8 @@ fn qsa_qkv(c: &Ctx38<'_>, qp: &QsaPlan, s: &mut Arena38, m: usize) -> Result<(),
 }
 
 /// A selecting layer's indexer keys of one sequence's `m` rows: their
-/// projection (row-major `[IDX_DIM][m]`, so a sequence's own launch), the
-/// raw keys appended to the store at the rows' positions, then the pools
-/// those rows complete.
+/// projection (token-major, a sequence's own launch), the raw keys appended
+/// to the store at the rows' positions, then the pools those rows complete.
 fn qsa_keys(
     c: &Ctx38<'_>,
     qp: &QsaPlan,
@@ -1321,7 +1309,7 @@ fn qsa_keys(
 ) -> Result<(), GpuError> {
     let (w, stream, ctx) = (c.w, c.gpu.stream(), c.ctx);
     let KeysIo { x, kr, pos, n_keys } = io;
-    c.f32_gemv(&qp.idx_k, x, m, kr)?;
+    c.dense_gemv(&qp.idx_k, x, m, kr)?;
     c.k.q38.enqueue_key_append(
         stream,
         KeyAppendArgs {
@@ -1349,22 +1337,11 @@ fn qsa_keys(
     )
 }
 
-/// A selecting layer's indexer queries over every row of `s.mixed`
-/// (row-major), copied token-major at more than one row.
+/// A selecting layer's indexer queries over every row of `s.mixed` into
+/// `qi`, token-major.
 fn qsa_query(c: &Ctx38<'_>, qp: &QsaPlan, s: &mut Arena38, m: usize) -> Result<(), GpuError> {
     let Arena38 { mixed, qsa: qa, .. } = s;
-    c.f32_gemv(&qp.idx_q, mixed, m, &mut qa.qr)?;
-    if m > 1 {
-        let stream = c.gpu.stream();
-        c.k.proj.enqueue_token_major(
-            stream,
-            &qa.qr,
-            geo::IDX_HEADS * geo::IDX_DIM,
-            m,
-            &mut qa.qi,
-        )?;
-    }
-    Ok(())
+    c.dense_gemv(&qp.idx_q, mixed, m, &mut qa.qi)
 }
 
 /// A selecting layer's attention over one sequence's `m` rows and its
@@ -1372,7 +1349,12 @@ fn qsa_query(c: &Ctx38<'_>, qp: &QsaPlan, s: &mut Arena38, m: usize) -> Result<(
 /// first row), the q/k norm and turn with the K/V append at the rows'
 /// positions, then the selected flash over the selection's lists (its
 /// partials from their first row) into `io.y`.
-fn qsa_attend(
+///
+/// # Safety
+///
+/// Among the first `m` positions in `io.pos`, those below `c.ctx` are
+/// pairwise distinct.
+unsafe fn qsa_attend(
     c: &Ctx38<'_>,
     qp: &QsaPlan,
     (kv, pooled): (&mut super::scratch::KvPlanes, &mut DeviceBuffer<u16>),
@@ -1415,27 +1397,30 @@ fn qsa_attend(
     // The selecting store is f16 (the qwen38 family's stores carry no q8_0
     // form), so the family's shared append runs its f16 arm.
     let (kc, vc) = kv.f16_mut("qwen38::attention")?;
-    c.k.neox.enqueue_head_norm_neox_append_256(
-        stream,
-        PartialNeoxArgs {
-            qg,
-            q: &mut *q,
-            k,
-            v,
-            gq: f32_gain(w, &qp.q_norm)?,
-            gk: f32_gain(w, &qp.k_norm)?,
-            table: c.table,
-            pos,
-            eps: c.eps,
-            n_head: geo::N_HEAD,
-            n_kv: geo::N_KV,
-            ctx,
-            m,
-            fault: sink,
-            cache_k: kc,
-            cache_v: vc,
-        },
-    )?;
+    // SAFETY: the enclosing helper requires distinct cache-valid positions.
+    unsafe {
+        c.k.neox.enqueue_head_norm_neox_append_256(
+            stream,
+            PartialNeoxArgs {
+                qg,
+                q: &mut *q,
+                k,
+                v,
+                gq: f32_gain(w, &qp.q_norm)?,
+                gk: f32_gain(w, &qp.k_norm)?,
+                table: c.table,
+                pos,
+                eps: c.eps,
+                n_head: geo::N_HEAD,
+                n_kv: geo::N_KV,
+                ctx,
+                m,
+                fault: sink,
+                cache_k: kc,
+                cache_v: vc,
+            },
+        )
+    }?;
     let (kc, vc) = kv.f16("qwen38::attention")?;
     let width = sel.width();
     c.k.flash.enqueue_pass_256_p12_sel(

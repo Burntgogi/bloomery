@@ -1,6 +1,8 @@
 //! The draft's head chain: the final norm, the projection
-//! ([`super::HeadSource`]), the Markov loop over the block's positions and
-//! the draft-to-target id map.
+//! ([`super::HeadSource`]) and what follows it, by kind ([`HeadTail`]): V4.1's
+//! Markov loop over the block's positions with the draft-to-target id map, or
+//! DFlash2's selector ([`super::selector`]), which scores each row's best
+//! ids against the row before's and hands the host the lattice to walk.
 //!
 //! [`Head`] launches the chain over a block's `m` folded rows: `rms_norm`
 //! (the head's own gain and epsilon), then the projection, one launch each
@@ -33,6 +35,19 @@
 //! maps them to target ids. [`Head::n_vocab`] counts the logits' rows,
 //! `n_head`. The target's Q8_0 matrix, and any map over the target's matrix
 //! (no file needs one), are refused by name.
+//!
+//! # The selector
+//!
+//! A selector head launches [`HeadTail::Selector`]'s chain after the
+//! projection ([`Head::enqueue_tail`]): four launches, whatever the row
+//! count. [`Head::tokens`] and [`Head::tokens_p`] read the lattice back,
+//! walk it on the host ([`runtime::selector::walk_p`], no probability
+//! floor: the caller cuts by the probability it gets) and return `m`
+//! entries: row 0, the anchor, has no id (`u32::MAX`, a probability of NaN),
+//! and rows `1..m` the walk's ids and their softmax. The head runs no
+//! launch for the probabilities ([`Head::enqueue_p`] is a no-op), and none at
+//! all for a block of the anchor alone. Ids are the target's own: a selector
+//! head scores the whole vocabulary.
 //!
 //! # The Markov loop
 //!
@@ -87,9 +102,15 @@ use cuda_device::{DisjointSlice, SharedArray, kernel, launch_bounds, launch_cont
 use cuda_host::cuda_module;
 use std::sync::Arc;
 
+use runtime::dspark::{DraftVocab, HeadKind};
+use runtime::selector::{Lattice, SelectorError, walk_p};
+
+use super::selector::{self, SelectArgs, Selector, SelectorTail};
 use super::{HeadSource, TargetHead};
 
 const WHAT: &str = "dspark::head";
+/// What the owner's checks name.
+const OWNER: &str = "dspark";
 
 /// The head's weights on the card.
 pub struct HeadWeights {
@@ -99,6 +120,20 @@ pub struct HeadWeights {
     pub eps: f32,
     /// The projection: the target's matrix or the draft's own Q8_0 rows.
     pub source: HeadSource,
+    /// What follows the projection.
+    pub tail: HeadTail,
+}
+
+/// The weights of what follows the head's projection, by kind.
+pub enum HeadTail {
+    /// V4.1's Markov head.
+    Markov(MarkovTail),
+    /// DFlash2's selector head.
+    Selector(SelectorTail),
+}
+
+/// The Markov head's tables on the card.
+pub struct MarkovTail {
     /// The Markov term's input table, one row per target id (the previous
     /// token): bf16 values two to a word.
     pub markov_w1: DeviceTensor<u32>,
@@ -111,6 +146,157 @@ pub struct HeadWeights {
     /// The confidence head's projection (hidden plus rank) and bias. Carried
     /// with the weights; no launch reads it.
     pub conf: Option<(DeviceTensor<f32>, f32)>,
+}
+
+impl HeadTail {
+    /// The draft-to-target map, a Markov head's alone.
+    fn map(&self) -> Option<&DeviceBuffer<u32>> {
+        match self {
+            HeadTail::Markov(t) => t.to_target.as_ref(),
+            HeadTail::Selector(_) => None,
+        }
+    }
+}
+
+impl MarkovTail {
+    /// Refuse by name tables the Markov loop has no launch for, over a head
+    /// of `n_head` ids: the rows and width of both tables and the map.
+    fn check(&self, stream: &CudaStream, n_head: usize) -> Result<(), GpuError> {
+        let refuse = |detail: String| GpuError::shape(WHAT, detail);
+        let n_prev = if self.to_target.is_some() {
+            self.markov_w1.rows()
+        } else {
+            n_head
+        };
+        for (name, t, need, ids) in [
+            ("markov_w1", &self.markov_w1, n_prev, "previous-token"),
+            ("markov_w2", &self.markov_w2, n_head, "head"),
+        ] {
+            if t.rows() != need || t.cols() != MARKOV_ROW_WORDS || need == 0 {
+                return Err(refuse(format!(
+                    "{name} is {} x {} words; the {need} {ids} ids need {need} x \
+                     {MARKOV_ROW_WORDS}",
+                    t.rows(),
+                    t.cols()
+                )));
+            }
+        }
+        if let Some(map) = &self.to_target {
+            if map.len() != n_head {
+                return Err(refuse(format!(
+                    "a draft-to-target map of {} words for a head of {n_head} ids",
+                    map.len()
+                )));
+            }
+            let host = map.to_host_vec(stream)?;
+            if let Some((d, &t)) = host
+                .iter()
+                .enumerate()
+                .find(|&(_, &t)| t as usize >= n_prev)
+            {
+                return Err(refuse(format!(
+                    "head id {d} maps to target id {t}, past the {n_prev} ids of markov_w1"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl HeadWeights {
+    /// The kind these weights are, in a shape's terms.
+    #[must_use]
+    pub fn kind(&self) -> HeadKind {
+        match &self.tail {
+            HeadTail::Markov(t) => HeadKind::Markov {
+                rank: 2 * t.markov_w1.cols(),
+                confidence: t.conf.is_some(),
+            },
+            HeadTail::Selector(t) => HeadKind::Selector {
+                rank: 4 * t.pred.qs.cols(),
+                top_k: t.top_k,
+            },
+        }
+    }
+
+    /// Refuse by name weights that are not the head `kind` and `vocab` of
+    /// a shape ask for: the kind itself, the Markov rank the kernel is built
+    /// for, the selector's rank and top-k, and a vocabulary and a
+    /// draft-to-target map that are one map (the owner maps the head's ids
+    /// through the shape's and the Markov step through the device's). Load-time
+    /// only.
+    pub fn check_against(
+        &self,
+        gpu: &Gpu,
+        kind: &HeadKind,
+        vocab: &DraftVocab,
+    ) -> Result<(), GpuError> {
+        let refuse = |detail: String| GpuError::shape(OWNER, detail);
+        match (&self.tail, kind) {
+            (HeadTail::Markov(t), HeadKind::Markov { rank, .. }) => {
+                if *rank != MARKOV_RANK {
+                    return Err(refuse(format!(
+                        "a Markov rank of {rank}; the head's kernel takes {MARKOV_RANK}"
+                    )));
+                }
+                match (vocab, &t.to_target) {
+                    (DraftVocab::Full { .. }, None) => Ok(()),
+                    (
+                        DraftVocab::Reduced {
+                            to_target,
+                            n_target,
+                        },
+                        Some(map),
+                    ) => {
+                        if t.markov_w1.rows() != *n_target {
+                            return Err(refuse(format!(
+                                "markov_w1 of {} rows for a reduced vocabulary over the target's \
+                                 {n_target} ids",
+                                t.markov_w1.rows()
+                            )));
+                        }
+                        if map.to_host_vec(gpu.stream())? != *to_target {
+                            return Err(refuse(
+                                "the head's draft-to-target map differs from the shape's".into(),
+                            ));
+                        }
+                        Ok(())
+                    }
+                    (DraftVocab::Full { .. }, Some(_)) => Err(refuse(
+                        "a draft-to-target map on the head of a full vocabulary".into(),
+                    )),
+                    (DraftVocab::Reduced { .. }, None) => Err(refuse(
+                        "a reduced vocabulary whose head carries no draft-to-target map".into(),
+                    )),
+                }
+            }
+            (HeadTail::Selector(t), HeadKind::Selector { rank, top_k }) => {
+                if *rank != selector::RANK || *top_k != t.top_k {
+                    return Err(refuse(format!(
+                        "a selector of rank {rank} and top-k {top_k} over tables of rank {} and \
+                         top-k {}; the kernels take {} and {}",
+                        4 * t.pred.qs.cols(),
+                        t.top_k,
+                        selector::RANK,
+                        selector::TOP_K
+                    )));
+                }
+                match vocab {
+                    DraftVocab::Full { .. } => Ok(()),
+                    DraftVocab::Reduced { .. } => Err(refuse(
+                        "a selector head over a reduced vocabulary: its tables are the target's"
+                            .into(),
+                    )),
+                }
+            }
+            (HeadTail::Markov(_), kind) => Err(refuse(format!(
+                "a shape with a {kind:?} head over Markov weights"
+            ))),
+            (HeadTail::Selector(_), kind) => Err(refuse(format!(
+                "a shape with a {kind:?} head over selector weights"
+            ))),
+        }
+    }
 }
 
 /// The Markov rank this kernel is built for (`markov_w1`'s row length).
@@ -528,6 +714,8 @@ impl MarkovKernels {
     }
 }
 
+const _: () = assert!(Head::MAX_ROWS == selector::MAX_ROWS);
+
 /// The head chain's buffers and weights, for blocks of up to
 /// [`Head::MAX_ROWS`] rows.
 pub struct Head {
@@ -555,6 +743,8 @@ pub struct Head {
     rows: usize,
     /// Ids the head scores: the logits' rows and `markov_w2`'s.
     n_head: usize,
+    /// The selector's launches and buffers: the selector kind's alone.
+    sel: Option<Selector>,
 }
 
 impl Head {
@@ -580,14 +770,14 @@ impl Head {
         }
         let n_head = match &w.source {
             HeadSource::Target(target) => {
-                if w.to_target.is_some() {
+                if w.tail.map().is_some() {
                     return Err(refuse(
                         "a draft-to-target map over the target's matrix: no draft needs one; \
                          a reduced head scores its own rows"
                             .into(),
                     ));
                 }
-                let TargetHead::Q6K(proj) = target else {
+                let Some(proj) = target.q6k() else {
                     return Err(refuse(
                         "a Q8_0 target matrix: the head chain has a row kernel for Q6_K".into(),
                     ));
@@ -621,43 +811,16 @@ impl Head {
                 w.norm.buf().len()
             )));
         }
-        let n_prev = if w.to_target.is_some() {
-            w.markov_w1.rows()
-        } else {
-            n_head
-        };
-        for (name, t, need, ids) in [
-            ("markov_w1", &w.markov_w1, n_prev, "previous-token"),
-            ("markov_w2", &w.markov_w2, n_head, "head"),
-        ] {
-            if t.rows() != need || t.cols() != MARKOV_ROW_WORDS || need == 0 {
-                return Err(refuse(format!(
-                    "{name} is {} x {} words; the {need} {ids} ids need {need} x \
-                     {MARKOV_ROW_WORDS}",
-                    t.rows(),
-                    t.cols()
-                )));
-            }
-        }
         let s = gpu.stream();
-        if let Some(map) = &w.to_target {
-            if map.len() != n_head {
-                return Err(refuse(format!(
-                    "a draft-to-target map of {} words for a head of {n_head} ids",
-                    map.len()
-                )));
+        let sel = match &w.tail {
+            HeadTail::Markov(t) => {
+                t.check(s, n_head)?;
+                None
             }
-            let host = map.to_host_vec(s)?;
-            if let Some((d, &t)) = host
-                .iter()
-                .enumerate()
-                .find(|&(_, &t)| t as usize >= n_prev)
-            {
-                return Err(refuse(format!(
-                    "head id {d} maps to target id {t}, past the {n_prev} ids of markov_w1"
-                )));
+            HeadTail::Selector(t) => {
+                Some(Selector::new(gpu.context(), s, t, n_head, hidden, rows)?)
             }
-        }
+        };
         let acts = match &w.source {
             HeadSource::Target(_) => (1..=rows)
                 .map(|m| Q8Act::with_k(s, m, hidden))
@@ -677,6 +840,7 @@ impl Head {
             hidden,
             rows,
             n_head,
+            sel,
             w,
         })
     }
@@ -694,33 +858,66 @@ impl Head {
         self.rows
     }
 
-    /// Launches of a block of `m` rows: the norm, the quantizer and the
-    /// projection, then the Markov loop's two a row. A head on the draft's
-    /// own Q8_0 rows runs one fewer (no quantizer).
+    /// Launches of a Markov block of `m` rows: the norm, the quantizer and
+    /// the projection, then the Markov loop's two a row. A head on the
+    /// draft's own Q8_0 rows runs one fewer (no quantizer).
     #[must_use]
     pub fn launches(m: usize) -> usize {
         Head::LOGIT_LAUNCHES + 2 * m
     }
 
+    /// Launches of a block of `m` rows of this head's kind: [`Head::launches`]
+    /// for the Markov kind, the selector's four after the projection
+    /// otherwise.
+    #[must_use]
+    pub fn launches_of(&self, m: usize) -> usize {
+        match &self.w.tail {
+            HeadTail::Markov(_) => Head::launches(m),
+            HeadTail::Selector(_) if m == 1 => Head::LOGIT_LAUNCHES,
+            HeadTail::Selector(_) => Head::LOGIT_LAUNCHES + selector::LAUNCHES,
+        }
+    }
+
+    /// The kind this head is.
+    #[must_use]
+    pub fn kind(&self) -> HeadKind {
+        self.w.kind()
+    }
+
+    /// The selector's buffers, for the gates' readouts: `None` for another
+    /// kind.
+    #[must_use]
+    pub fn selector(&self) -> Option<&Selector> {
+        self.sel.as_ref()
+    }
+
     /// Device bytes of each weight buffer, as allocated: the norm's gain, the
-    /// projection (its planes, for a Q8_0 matrix), the two Markov tables,
-    /// then the draft-to-target map and the confidence projection when
-    /// present.
+    /// projection (its planes, for a Q8_0 matrix; none for the target's
+    /// matrix read in place), then the Markov kind's two
+    /// tables, its draft-to-target map and confidence projection when
+    /// present, or the selector kind's three tables' planes.
     #[must_use]
     pub fn weight_buffers(&self) -> Vec<u64> {
         let tensor = |t: &DeviceTensor<u32>| t.buf().num_bytes() as u64;
         let mut out = vec![self.w.norm.buf().num_bytes() as u64];
         match &self.w.source {
             HeadSource::Target(TargetHead::Q6K(w)) => out.push(tensor(w)),
+            // The target's buffer, not the draft's.
+            HeadSource::Target(TargetHead::Q6KInPlace(_)) => {}
             HeadSource::Target(TargetHead::Q8_0(q)) | HeadSource::Own(q) => {
                 out.push(q.qs.buf().num_bytes() as u64);
                 out.push(q.d.buf().num_bytes() as u64);
             }
         }
-        out.push(tensor(&self.w.markov_w1));
-        out.push(tensor(&self.w.markov_w2));
-        out.extend(self.w.to_target.iter().map(|m| m.num_bytes() as u64));
-        out.extend(self.w.conf.iter().map(|(c, _)| c.buf().num_bytes() as u64));
+        match &self.w.tail {
+            HeadTail::Markov(t) => {
+                out.push(tensor(&t.markov_w1));
+                out.push(tensor(&t.markov_w2));
+                out.extend(t.to_target.iter().map(|m| m.num_bytes() as u64));
+                out.extend(t.conf.iter().map(|(c, _)| c.buf().num_bytes() as u64));
+            }
+            HeadTail::Selector(t) => out.extend(Selector::weight_buffers(t)),
+        }
         out
     }
 
@@ -736,6 +933,7 @@ impl Head {
             + self.probs.num_bytes()
             + self.done.num_bytes()
             + self.no_map.num_bytes()) as u64
+            + self.sel.as_ref().map_or(0, Selector::scratch_bytes)
     }
 
     /// Refuse a row count the head holds no scratch for.
@@ -772,7 +970,11 @@ impl Head {
             &mut self.normed,
         )?;
         match &self.w.source {
-            HeadSource::Target(TargetHead::Q6K(proj)) => {
+            HeadSource::Target(target) => {
+                let proj = target.q6k().ok_or(GpuError::State {
+                    what: WHAT,
+                    missing: "a projection with a row kernel",
+                })?;
                 let act = &mut self.acts[m - 1];
                 gpu.enqueue_quantize_q8_1(&self.normed, act)?;
                 gpu.enqueue_gemv_q6k(proj, act, &mut self.logits)
@@ -788,9 +990,38 @@ impl Head {
                     y: &mut self.logits,
                 },
             ),
-            HeadSource::Target(TargetHead::Q8_0(_)) => Err(GpuError::State {
+        }
+    }
+
+    /// Enqueue what follows the projection, by kind: the Markov loop
+    /// ([`Head::enqueue_markov`]) or the selector's four launches (module doc),
+    /// the anchor `first[0]` (a target id) the first row's predecessor in
+    /// both. Asynchronous, allocation-free, capturable.
+    pub fn enqueue_tail(
+        &mut self,
+        gpu: &Gpu,
+        m: usize,
+        first: &DeviceBuffer<u32>,
+    ) -> Result<(), GpuError> {
+        match (&self.w.tail, self.sel.as_mut()) {
+            (HeadTail::Markov(_), _) => self.enqueue_markov(gpu, m, first),
+            // A block of the anchor alone has no row to select from.
+            (HeadTail::Selector(_), Some(_)) if m == 1 => Ok(()),
+            (HeadTail::Selector(t), Some(sel)) => sel.enqueue(
+                gpu,
+                t,
+                SelectArgs {
+                    normed: &self.normed,
+                    logits: &self.logits,
+                    first,
+                    done: &mut self.done,
+                    m,
+                    fault: gpu.unlabelled_sink(),
+                },
+            ),
+            (HeadTail::Selector(_), None) => Err(GpuError::State {
                 what: WHAT,
-                missing: "a projection with a row kernel",
+                missing: "the selector's buffers",
             }),
         }
     }
@@ -799,6 +1030,7 @@ impl Head {
     /// token `first[0]` (a target id): `m` steps of two launches. A reduced
     /// head's steps carry the map ([`MarkovKernels::enqueue_step_reduced`]);
     /// the others are V4.1's ([`MarkovKernels::enqueue_step`]), unchanged.
+    /// A selector head has no Markov tables and is refused by name.
     /// Asynchronous, allocation-free, capturable.
     pub fn enqueue_markov(
         &mut self,
@@ -807,11 +1039,17 @@ impl Head {
         first: &DeviceBuffer<u32>,
     ) -> Result<(), GpuError> {
         self.check(m)?;
-        match &self.w.to_target {
+        let HeadTail::Markov(t) = &self.w.tail else {
+            return Err(GpuError::shape(
+                WHAT,
+                "the Markov loop on a selector head: it has no Markov tables",
+            ));
+        };
+        match &t.to_target {
             None => {
                 let mw = MarkovWeights {
-                    w1: &self.w.markov_w1,
-                    w2: &self.w.markov_w2,
+                    w1: &t.markov_w1,
+                    w2: &t.markov_w2,
                 };
                 for row in 0..m {
                     self.markov.enqueue_step(
@@ -829,8 +1067,8 @@ impl Head {
             }
             Some(to_target) => {
                 let mw = ReducedMarkovWeights {
-                    w1: &self.w.markov_w1,
-                    w2: &self.w.markov_w2,
+                    w1: &t.markov_w1,
+                    w2: &t.markov_w2,
                     to_target,
                 };
                 for row in 0..m {
@@ -857,9 +1095,14 @@ impl Head {
     /// a logit that is not finite raises [`FaultSite::Logit`]. The ids are
     /// head ids, as [`Head::tokens`]'. Asynchronous, allocation-free,
     /// capturable; the engine enqueues it only for a caller that asks, so a
-    /// block's graph does not hold it.
+    /// block's graph does not hold it. A selector head launches nothing
+    /// ([`Head::tokens_p`] reads the walk's probabilities).
     pub fn enqueue_p(&mut self, gpu: &Gpu, m: usize) -> Result<(), GpuError> {
         self.check(m)?;
+        if self.sel.is_some() {
+            // The walk's probabilities come with the lattice: no launch.
+            return Ok(());
+        }
         self.mtp.enqueue_argmax_p_rows_fault(
             gpu.stream(),
             ArgmaxPArgs {
@@ -894,11 +1137,15 @@ impl Head {
     }
 
     /// The `m` rows' proposal, head ids: a reduced head's are its own, not
-    /// the target's. Blocking. A fault the last step copied is
+    /// the target's. A selector head's are the walk's (module doc), row 0's
+    /// `u32::MAX`. Blocking. A fault the last step copied is
     /// [`GpuError::Fault`], not a proposal; it stays raised on the card until
     /// the `Gpu`'s owner clears it.
     pub fn tokens(&self, stream: &CudaStream, m: usize) -> Result<Vec<u32>, GpuError> {
         self.check(m)?;
+        if let Some(sel) = &self.sel {
+            return Ok(Head::walked(sel, stream, m)?.0);
+        }
         let out = self.tok.to_host_vec(stream)?;
         if let Some(fault) = Fault::from_words(out[m], out[m + 1]) {
             return Err(GpuError::fault("dspark::head::tokens", fault));
@@ -915,11 +1162,51 @@ impl Head {
         m: usize,
     ) -> Result<(Vec<u32>, Vec<f32>), GpuError> {
         self.check(m)?;
+        if let Some(sel) = &self.sel {
+            return Head::walked(sel, stream, m);
+        }
         let out = self.probs.to_host_vec(stream)?;
         if let Some(fault) = Fault::from_words(out[2 * m], out[2 * m + 1]) {
             return Err(GpuError::fault("dspark::head::tokens_p", fault));
         }
         let p = out[m..2 * m].iter().map(|&b| f32::from_bits(b)).collect();
         Ok((out[..m].to_vec(), p))
+    }
+
+    /// The selector's walk over the lattice the last block of `m` rows left
+    /// (a block of one row, the anchor alone, has none): `m` entries, row 0's (the anchor's) an id of `u32::MAX` and a
+    /// probability of NaN, then each row's id and softmax. A row the walk
+    /// cannot take (every score −∞), a NaN score or a fault any launch
+    /// raised is an error, not a short proposal. Blocking.
+    fn walked(
+        sel: &Selector,
+        stream: &CudaStream,
+        m: usize,
+    ) -> Result<(Vec<u32>, Vec<f32>), GpuError> {
+        if m == 1 {
+            return Ok((vec![u32::MAX], vec![f32::NAN]));
+        }
+        let refuse = |e: SelectorError| GpuError::shape("dspark::head::walk", e.to_string());
+        let words = sel.lattice(stream, m)?;
+        let lattice = Lattice::from_words(&words, m - 1, selector::TOP_K).map_err(refuse)?;
+        let taken = walk_p(&lattice, 0.0).map_err(refuse)?;
+        if taken.len() != m - 1 {
+            return Err(GpuError::shape(
+                "dspark::head::walk",
+                format!(
+                    "the walk took {} of {} ids: row {} has no finite score",
+                    taken.len(),
+                    m - 1,
+                    taken.len() + 1
+                ),
+            ));
+        }
+        let ids = std::iter::once(u32::MAX)
+            .chain(taken.iter().map(|t| t.id))
+            .collect();
+        let p = std::iter::once(f32::NAN)
+            .chain(taken.iter().map(|t| t.p))
+            .collect();
+        Ok((ids, p))
     }
 }

@@ -8,12 +8,11 @@
 #   tools/gate-batch.sh --self-test [--part K|all]   the placement rules on a fixture justfile and the disk floor
 #                                      against a fake df (check-recipes runs it: every part at once, see self_test)
 #
-# The status board (tools/board/README.md): a real run appends its events to the board directory beside the times file.
 # Start hook. BLOOMERY_BATCH_START_HOOK, a command line (split on blanks, no shell syntax), runs once in the background at the start of a
 # real run: it never delays the batch and changes no rc or stdout line. Its output goes to OUT/start-hook.log and its exit code to
 # OUT/start-hook.rc when it ends; one that ended with a code other than 0 adds one stderr line at the end of the run,
 # `gate-batch: start hook (rc=N): <its first output line>`. Unset or empty: nothing runs. A machine uses it for a check that should start with
-# a batch and never wait on one (the status board's agent check, for one); the batch knows nothing of what it runs.
+# a batch and never wait on one; the batch knows nothing of what it runs.
 #
 # Items. `NAME[@K=V[,K=V…]][:ARGS]` — NAME a recipe in `just --dump`; `@K=V,…` added to
 # BLOOMERY_BOX_ENV for that item (values without spaces, commas or colons); `:ARGS` passed to the
@@ -490,7 +489,6 @@ DEFAULT_S=45 # the expected seconds of an item with no row in the times file (th
 MIN_FREE_GIB=3 # the disk floor (the header's «Disk floor»): 2× the larger of one cold check's and one cold combos' growth of a tree's target/ (tools/mac-check.sh), rounded up to a whole GiB
 TIMES_FILE=${BLOOMERY_GATE_TIMES:-$HOME/.cache/bloomery/gate-times.tsv}
 COLD_FILE=${TIMES_FILE%.tsv}-cold.tsv # a cold build's rows, outside the median (the header)
-BOARD_DIR=$(dirname "$TIMES_FILE")/board # the status board's state (tools/board/README.md); beside the times file, so a test that moves that file moves this too
 # The solo-real recipes that join the chain (class C, the header). Each one's own reason was read
 # (loadchain's D5 N3, 2026-10-09): the stated reason is the host set under the big-load lock — not
 # two cards, not a host-memory pin — and no clause or plan of its gate reads a host-memory value a
@@ -539,50 +537,6 @@ times_record() { # $1 = plan index, $2 = lane, $3 = the final try's seconds, $4 
   local f=$TIMES_FILE
   [ "${4:-0}" = 0 ] || f=$COLD_FILE
   python3 -c "$PYAPPEND" "$f" "$(printf '%s\t%s\t%s\t%s\t%s' "${P_TKEY[$1]}" "$2" "${P_TCARD[$1]}" "$3" "$(date '+%Y-%m-%dT%H:%M:%S%z')")"
-}
-
-# The status board's event line: one JSON object per start, item, done and stop of a real run, appended under the same flock and
-# single write as PYAPPEND, so the lanes' subshells interleave whole lines. The fields come as key=value words; a whole number
-# is an integer; a `done` event's `line=` is the DONE line, split into its key=value words (`wall=412s` is wall: 412).
-IFS= read -r -d '' PYBOARD << 'PY' || true
-import datetime, fcntl, json, os, re, sys
-
-path, kind = sys.argv[1:3]
-ev = {"ev": kind, "ts": datetime.datetime.now().astimezone().isoformat(timespec="seconds")}
-
-
-def put(word):
-    key, _, val = word.partition("=")
-    whole = key not in ("name", "branch", "tree") and re.fullmatch(r"[0-9]+s?", val)
-    ev[key] = int(val.rstrip("s")) if whole else val
-
-
-for word in sys.argv[3:]:
-    if word.startswith("line="):
-        for w in word[5:].split()[1:]:
-            put(w)
-    else:
-        put(word)
-os.makedirs(os.path.dirname(path), exist_ok=True)
-data = (json.dumps(ev) + "\n").encode()
-fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
-try:
-    fcntl.flock(fd, fcntl.LOCK_EX)
-    if os.write(fd, data) != len(data):
-        sys.exit("a short write")
-finally:
-    os.close(fd)
-PY
-
-# board_event <kind> [key=value…]: best effort — a write that fails costs this process one stderr line and no more events,
-# never the batch's output or exit code.
-board_event() {
-  [ -n "${BOARD_FILE:-}" ] || return 0
-  python3 -c "$PYBOARD" "$BOARD_FILE" "$@" 2> /dev/null || {
-    echo "gate-batch: board: an event did not reach $BOARD_FILE (the batch goes on)" >&2
-    BOARD_FILE=''
-  }
-  return 0
 }
 
 # start_hook: BLOOMERY_BATCH_START_HOOK (the header), once, in the background. A value that holds no command is one stderr line and no run.
@@ -1472,7 +1426,7 @@ FP
   steal_case() { # <tag> <times rows…> -- <items…>: one real batch run on the fixture, rc printed;
     # LEASE_UP=1 puts the fake lease up before the batch starts; GBFAST=1 runs the fast-retry copy above, GBFAST=2 that copy with a longer dir-lock bound
     local tag=$1 rc=0 runner=("${gb[@]}")
-    local times=${STEAL_TIMES:-$t/times-$tag.tsv} # STEAL_TIMES: the times file's place, which also places the board directory beside it
+    local times=$t/times-$tag.tsv
     shift
     local rows=()
     while [ "$1" != -- ]; do rows+=("$1"); shift; done
@@ -2000,31 +1954,7 @@ SH
     n=$((n + 1)); note_case "$1"
     if [ -e "$2" ]; then bad=$((bad + 1)); echo "FAIL $1: $2 exists"; else echo "ok $1"; fi
   }
-  # The status board's events (tools/board/README.md). The ch-skip batch above is the fixture: its lanes ran two items and the ledger
-  # skipped the third. Its events went to the board directory beside its times file, $t/board, one JSON line each.
-  local bj=$t/board/batch/c-ch-skip.jsonl
   if gb_part 6; then
-  want 'board: the start event carries the item count, tier, lanes, mode, predicted wall, tree and branch' "$bj" \
-    '^\{"ev": "start", "ts": "[^"]+", "total": 3, "tier": "real", "lanes": 2, "mode": "round", "predicted_wall": [0-9]+, "tree": "[^"]+", "branch": "[^"]+"\}$'
-  want_count 'board: one item event per item' "$bj" '"ev": "item"' 3
-  want 'board: a run item event names the item, rc, seconds and lane' "$bj" '"ev": "item", "ts": "[^"]+", "name": "steal-fix", "rc": 0, "secs": [0-9]+, "lane": "A"'
-  want 'board: the ledger skip is an item event with rc skip' "$bj" '"name": "v41-any", "rc": "skip", "secs": 0, "lane": "C"'
-  want 'board: the done event holds the DONE line'"'"'s fields' "$bj" '"ev": "done", "ts": "[^"]+", "total": 3, "red": 0, "tier": "real", "skipped": 1, "wall": [0-9]+, "laneA": [0-9]+, "laneB": [0-9]+'
-  want_count 'board: the file holds the start, the three items and the done, nothing else' "$bj" '.' 5
-  # Best effort: a regular file where the board directory would go. The batch's rc and lines are what they always were and the failure
-  # costs one stderr line, not one per event.
-  mkdir -p "$t/bf"
-  : > "$t/bf/board"
-  rc=$(STEAL_TIMES=$t/bf/times.tsv steal_case board-bf "plain-any	B	a6000	5	$d" -- plain-any)
-  printf '%s' "$rc" > "$t/rc-board-bf"
-  rc_ok 'board: an unwritable board directory leaves the batch green' board-bf 1
-  want 'board: and its item line is the one it always printed' "$t/out-board-bf.log" '^plain-any rc=0 [0-9]+s try=1 lane=[AB]( |$)'
-  want_count 'board: the failure costs one stderr line' "$t/out-board-bf.log" '^gate-batch: board: an event did not reach ' 1
-  # FAIL-first: without run_item's event a run item leaves none, and the three-item case above is red on it.
-  mutant_of board-noitem 's|^  board_event item name=.*rc="\$rcl".*$|  true # MUTANT board-noitem|' '# MUTANT board-noitem$'
-  rc=$(MTAG=board-noitem steal_case board-m "plain-any	B	a6000	5	$d" -- plain-any)
-  printf '%s' "$rc" > "$t/rc-board-m"
-  want_count 'board mutant: without run_item'"'"'s event the run item leaves none' "$t/board/batch/c-board-m.jsonl" '"ev": "item"' 0
   # The start hook (start_hook) runs once, in the background. The stub holds until the case has seen the batch end: a batch that waited
   # for it ends only after the stub gave up (10 s), and the stub then writes `timeout`, not `released`.
   mkdir -p "$t/hk"
@@ -6330,7 +6260,6 @@ reap_boxes() {
 stop() {
   local f
   trap '' INT TERM # a second canary item ending red meanwhile signals this shell again
-  board_event stop
   # The lanes first, so none starts its next item, then the items they were running, then the box.sh calls under them.
   for f in "$OUT"/lane-*.pid "$OUT"/lane-*.child; do
     if [ -f "$f" ]; then kill -TERM "$(cat "$f")" 2> /dev/null || true; fi
@@ -6510,9 +6439,6 @@ rm -rf "$OUT"/lane-*.box # ... nor an earlier run's registered pids (a KILLed ca
 mkdir -p "$OUT/claims" # one claim per item: the owner's start and the thief's steal agree on it
 T0=$(date +%s)
 echo "plan $PREDICTED defaults=$SUM_NDEF (predicted, derived from $TIMES_FILE)" >> "$RUNLOG"
-BOARD_FILE=$BOARD_DIR/batch/$(basename "$OUT").jsonl
-board_event start total="$NT" tier="$TIER" lanes="$LANES" mode="${LMODE:-none}" predicted_wall="$SUM_W" \
-  tree="$(basename "$ROOT")" branch="$(git -C "$ROOT" rev-parse --abbrev-ref HEAD 2> /dev/null || echo unknown)"
 start_hook
 echo "gate-batch: $N items$DEFER_NOTE, lanes $LANES, logs in $OUT"
 canary_say
@@ -6523,7 +6449,6 @@ for ((i = 0; i < ND; i++)); do # a deferred item is recorded at once: the batch 
   line="${DP_STEM[$i]} rc=deferred ${DP_KIND[$i]} lane=- tier=$TIER deferred=1"
   [ -z "${DP_ITEM[$i]}" ] || line="$line item=${DP_ITEM[$i]}"
   echo "$line" >> "$RUNLOG"
-  board_event item name="${DP_STEM[$i]}" rc=deferred secs=0 lane=-
   echo "$line"
 done
 DEFER_LIST=$OUT/deferred.list
@@ -6709,7 +6634,6 @@ run_item() { # $1 = plan index, $2 = lane label; the lane's current child pid go
   fi
   [ -z "${P_ITEM[$i]}" ] || line="$line item=${P_ITEM[$i]}"
   echo "$line" >> "$RUNLOG"
-  board_event item name="${P_STEM[$i]}" rc="$rcl" secs="$s" lane="$lane"
   echo "$line"
   # A red canary item stops the batch (the header's «Canary»): the main shell's TERM trap (stop) signals the lanes and ends the run.
   if [ "$CANARY" = 1 ] && [ -z "$yowner" ] && [ "$rc" != 0 ] && canary_of "$i"; then canary_red "$i" "$rc"; fi
@@ -6726,7 +6650,6 @@ skip_item() { # $1 = plan index, $2 = lane label: the ledger holds a green run o
   line="${P_STEM[$i]} rc=skip ${P_LDET[$i]% tree=*} lane=$2 tier=$TIER"
   [ -z "${P_ITEM[$i]}" ] || line="$line item=${P_ITEM[$i]}"
   echo "$line" >> "$RUNLOG"
-  board_event item name="${P_STEM[$i]}" rc=skip secs=0 lane="$2"
   echo "$line"
 }
 
@@ -7223,7 +7146,6 @@ for ((i = 0; i < N; i++)); do
   [ "${P_LANE[$i]}" != X ] || continue
   awk -v s="${P_STEM[$i]}" '$1 == s && $2 ~ /^rc=/ { f = 1 } END { exit !f }' "$RUNLOG" && continue
   echo "${P_STEM[$i]} rc=unclaimed lane=${P_LANE[$i]} tier=$TIER" >> "$RUNLOG"
-  board_event item name="${P_STEM[$i]}" rc=unclaimed secs=0 lane="${P_LANE[$i]}"
   echo "gate-batch: ${P_STEM[$i]} (lane ${P_LANE[$i]}) was taken by no lane, and every lane has ended" >&2
 done
 if has_lane X; then run_pack; fi
@@ -7268,7 +7190,6 @@ elif [ "$ND" != 0 ]; then
   done_line="$done_line deferred_list=$DEFER_LIST"
 fi
 echo "$done_line" >> "$RUNLOG"
-board_event done line="$done_line"
 echo "$done_line"
 if [ "$red" -ne 0 ]; then
   grep -v ' rc=0 ' "$RUNLOG" | grep ' rc=' | grep -v ' rc=skip ' | grep -v ' rc=deferred ' | grep -v ' rc=yield ' |

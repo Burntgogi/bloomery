@@ -185,6 +185,16 @@ pub enum EngramError {
         product: u64,
         nbytes: u64,
     },
+    /// A table held as runs ([`rows::RunTable`]) of no rows, of empty rows, or of more rows
+    /// than a `u32` row id names.
+    #[error(
+        "{name}: {rows} rows of {row_bytes} B: a run table holds 1 to 2^32 rows of at least one byte"
+    )]
+    RunRows {
+        name: String,
+        rows: u64,
+        row_bytes: u64,
+    },
     #[error("{name}: data at {base}+{off} + {nbytes} B runs past the {len} B file {path}")]
     PastEndOfFile {
         name: String,
@@ -540,21 +550,8 @@ impl Site {
 /// `posix_fadvise(DONTNEED)` over `at .. at + len` of `file`: the page-cache
 /// half of an eviction, after the mapping's own entries are dropped.
 fn fadvise_dontneed(file: &File, at: usize, len: usize) -> Result<(), std::io::Error> {
-    // SAFETY: the descriptor is `file`'s own, borrowed for the call, and the
-    // range is plain numbers: fadvise reads and writes no memory of ours.
-    let rc = unsafe {
-        libc::posix_fadvise(
-            file.as_raw_fd(),
-            fadvise_off(at),
-            fadvise_off(len),
-            libc::POSIX_FADV_DONTNEED,
-        )
-    };
-    if rc == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::from_raw_os_error(rc))
-    }
+    os::fadvise_dontneed(file.as_raw_fd(), fadvise_off(at), fadvise_off(len))
+        .map_err(std::io::Error::from)
 }
 
 /// `ids` as runs of adjacent rows, each `(first, last)` inclusive, sorted and
@@ -683,7 +680,8 @@ impl TableBytes<'_> {
         // mapping this type covers is a read-only file mapping (a site's own,
         // and a split's, whose shards `gguf::Split::open` maps from their
         // files and nothing else), where it drops the page-table entries and
-        // the next touch reads the file's bytes again.
+        // the next touch reads the file's bytes again. A run table's
+        // (`rows::RunTable`) maps its files read-only too.
         let rc = unsafe { libc::madvise(first as *mut libc::c_void, len, advice) };
         if rc == 0 {
             Ok(())
@@ -699,7 +697,16 @@ impl TableBytes<'_> {
 
     /// [`Site::populate`]'s read: `POPULATE_READ` over each row's pages.
     fn populate(&self, ids: &[u32]) -> Result<(), EngramError> {
-        self.advise(ids, libc::MADV_POPULATE_READ, "madvise(POPULATE_READ)")
+        let page = u64::try_from(self.page).expect("a page size fits a u64");
+        for &id in ids {
+            let (first, len) = self.pages(id)?;
+            let addr = first as *mut libc::c_void;
+            // SAFETY: the range is whole pages inside the mapping (`pages`
+            // rounds a row out to the mapping's own pages).
+            unsafe { os::populate_span(addr, len, page, || os::advise_populate(addr, len)) }
+                .map_err(|e| self.io("madvise(POPULATE_READ)", e.into()))?;
+        }
+        Ok(())
     }
 
     /// [`Site::resident_rows`]' count: the rows of `ids` whose pages `mincore`
@@ -748,14 +755,12 @@ impl TableBytes<'_> {
     /// when the page is in the page cache.
     fn mincore_chunk(&self, at: usize, len: usize) -> Result<[u8; MINCORE_PAGES], EngramError> {
         let mut vec = [0u8; MINCORE_PAGES];
-        // SAFETY: `at .. at + len` is page-aligned and inside the mapping
-        // (`pages` rounds a row out to the mapping's own pages), and `vec`
-        // holds one byte for each of the at most `MINCORE_PAGES` pages of
-        // that range.
-        let rc = unsafe { libc::mincore(at as *mut libc::c_void, len, vec.as_mut_ptr()) };
-        if rc != 0 {
-            return Err(self.io("mincore", std::io::Error::last_os_error()));
-        }
+        // `at .. at +len` is page-aligned and inside the mapping (`pages`
+        // rounds a row out to the mapping's own pages), and `vec` holds one
+        // byte for each of the at most `MINCORE_PAGES` pages of that range.
+        // SAFETY: the caller's contract above.
+        unsafe { os::mincore(at as *mut libc::c_void, len, &mut vec) }
+            .map_err(|e| self.io("mincore", e.into()))?;
         Ok(vec)
     }
 
@@ -938,7 +943,8 @@ pub fn faults() -> Faults {
 /// This is the counter a helper-thread design needs: the process total cannot
 /// say which thread paid for a fault, and the whole claim of moving the read
 /// off the step thread is that the step thread stops taking them. Sample it on
-/// the thread it describes — a thread cannot ask for another's.
+/// the thread it describes — a thread cannot ask for another's. Linux only: a
+/// kernel without `RUSAGE_THREAD` (macOS) refuses it, and that panics by name.
 pub fn faults_thread() -> Faults {
     faults_of(RUSAGE_THREAD)
 }
@@ -946,11 +952,17 @@ pub fn faults_thread() -> Faults {
 fn faults_of(who: libc::c_int) -> Faults {
     // SAFETY: `usage` is a live, writable `rusage` for the duration of the call
     // and `getrusage` fills it or leaves it untouched.
-    let usage = unsafe {
+    let (rc, usage) = unsafe {
         let mut usage: libc::rusage = std::mem::zeroed();
-        libc::getrusage(who, &mut usage);
-        usage
+        let rc = libc::getrusage(who, &mut usage);
+        (rc, usage)
     };
+    assert_eq!(
+        rc,
+        0,
+        "getrusage({who}) refused: {}",
+        std::io::Error::last_os_error()
+    );
     Faults {
         major: usage.ru_majflt.max(0) as u64,
         minor: usage.ru_minflt.max(0) as u64,

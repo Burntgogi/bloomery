@@ -30,8 +30,9 @@
 //!
 //! Weights. The routed `_sel`, gate·up and file-layout gemm entries read a
 //! stack as the file's blocks in the [`CardFormat::KQuant`] word stream;
-//! `q5_0_gemv_sel` and the Q5_0 dense site ([`SiteEntry::Q5_0`]) read the
-//! packed [`CardFormat::Q5_0`] layout, the Q8_0 dense, head and embedding
+//! `q5_0_gemv_sel`, the Q5_0 gemm entry and the Q5_0 dense site
+//! ([`SiteEntry::Q5_0`]) read the packed [`CardFormat::Q5_0`] layout, the
+//! Q8_0 dense, head and embedding
 //! entries read [`CardFormat::Q8_0Planes`], and the NVFP4 entries read
 //! [`CardFormat::Nvfp4Planes`] (a routed stack's with one tensor scale an
 //! expert). A routed entry's layout is its `layout`, which
@@ -87,6 +88,10 @@ pub enum GateUpEntry {
     /// `KquantKernels::enqueue_gate_up_q8_0` (`kq_gate_up_act_q8_0`, the
     /// file's `block_q8_0` stream) in `crates/gpu/src/kquant/sel.rs`.
     Q8_0,
+    /// `Q6kSelKernels::enqueue_gate_up` (`q6k_gate_up_sel`, the file's 210-byte
+    /// `block_q6_K` stream over the `Q8Act`'s q6 plane) in
+    /// `crates/gpu/src/q6k_sel.rs`.
+    Q6k,
     /// `QuantSelKernels::enqueue_gate_up` (`iq2_xs_gate_up_sel`, the file's
     /// 74-byte `block_iq2_xs` stream) in `crates/gpu/src/iq_sel.rs`.
     Iq2xs,
@@ -185,6 +190,8 @@ pub enum GemmEntry {
     Iq2xxs,
     /// `GemmWeight::Iq3Xxs` (`gemm_iq3xxs`).
     Iq3xxs,
+    /// `GemmWeight::Iq3S` (`gemm_iq3s`).
+    Iq3s,
     /// `GemmWeight::Iq4Xs` (`gemm_iq4xs`).
     Iq4xs,
     /// `Gemm32Weight::Q8_0File` (`gemm_q8_0f`, the file's `block_q8_0` stream)
@@ -192,6 +199,9 @@ pub enum GemmEntry {
     /// the q8f32 planes) for a dense projection (`SiteEntry::Q8_0`); both in
     /// `crates/gpu/src/gemm/kernels32.rs`.
     Q8_0,
+    /// `Gemm32Weight::Q5_0Packed` (`gemm_q5_0p`, the `pack_q5_0` layout a
+    /// stack's `q5_0_gemv_sel` reads) in `crates/gpu/src/gemm/kernels32.rs`.
+    Q5_0,
     /// `Gemm32Weight::Q5_1File` (`gemm_q5_1`) in
     /// `crates/gpu/src/gemm/kernels32.rs`.
     Q5_1,
@@ -619,7 +629,7 @@ impl CardFormat {
     /// draft's experts). A card expert kernel does read q5_K
     /// (`kq_gate_up_act_q5k`, `q5k_gemv_sel`), which that column leaves out,
     /// and the program that runs them names q5_K in its own `RoutedFormat`
-    /// (glm5next's `card_routed`). An nvfp4 stack loads in its planes, which
+    /// (`placement::accepts::routed_rule`). An nvfp4 stack loads in its planes, which
     /// the card leg's nvfp4 pair reads (`placement::kernels::card_planes_runs`).
     /// A stack of a type with none stays on the host.
     #[must_use]

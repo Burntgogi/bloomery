@@ -343,7 +343,8 @@ pub fn f32x2_to_f16x2_bits(lo: f32, hi: f32) -> u32 {
 /// `cores::half_to_f32`'s value for every finite and infinite input — one
 /// instruction instead of a decode whose subnormal branch is a loop.
 #[inline(always)]
-pub(crate) fn half_bits_to_f32(bits: u16) -> f32 {
+#[must_use]
+pub fn half_bits_to_f32(bits: u16) -> f32 {
     cvt_f32_f16x2_lo(bits as u32)
 }
 
@@ -832,7 +833,7 @@ mod flash_kernels {
     }
 
     /// Latent flash attention over the absorbed KV cache, `m` query tokens
-    /// (1..=8) with every head in one launch. `q` holds `m * n_heads` rows
+    /// (at least 1) with every head in one launch. `q` holds `m * n_heads` rows
     /// of `width = rope_dims + latent` f32, row `t * n_heads + h` (the
     /// `kqv_compressed` column order); `kv` is the `[dst_rows x width]` u16
     /// cache; the live key count is `n_keys_buf[0]`. Query `t` attends to
@@ -851,6 +852,7 @@ mod flash_kernels {
             y.len() >= q_rows * latent
         )
     )]
+    #[allow(clippy::too_many_arguments)]
     pub fn flash_latent(
         q: &[f32],
         kv: &[u16],
@@ -1777,8 +1779,11 @@ pub struct FlashKernels {
 }
 
 /// The query geometry every flash launch over the cache shares: `tokens`
-/// query tokens (1..=8) of `heads` heads each, so `tokens * heads` query
-/// rows of `rope_dims + latent_dims` f32, row `t * heads + h`.
+/// query tokens (at least 1) of `heads` heads each, so `tokens * heads` query
+/// rows of `rope_dims + latent_dims` f32, row `t * heads + h`. The kernels
+/// bound nothing on `tokens`: the split launch's partials do
+/// ([`partials_v_len`], [`partials_ms_len`] at `tokens * heads` rows), and a
+/// caller sizes them for the most tokens it launches at once.
 #[derive(Clone, Copy, Debug)]
 pub struct FlashGeom {
     pub tokens: usize,
@@ -2506,8 +2511,8 @@ fn check_flash(
         rope_dims,
         latent_dims: latent,
     } = geom;
-    if !(1..=8).contains(&m) {
-        return Err(GpuError::shape(what, format!("1 <= m <= 8, got {m}")));
+    if m == 0 {
+        return Err(GpuError::shape(what, "m >= 1 query token"));
     }
     if n_heads == 0 {
         return Err(GpuError::shape(what, "n_heads >= 1"));

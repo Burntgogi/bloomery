@@ -46,11 +46,13 @@ pub const HOST_ROOM: &str = "BLOOMERY_HOST_ROOM";
 pub const NVTIER_BYTES: &str = "BLOOMERY_NVTIER_BYTES";
 pub const NVTIER_READ: &str = "BLOOMERY_NVTIER_READ";
 pub const NVTIER_MEM: &str = "BLOOMERY_NVTIER_MEM";
+pub const NVTIER_EVICT: &str = "BLOOMERY_NVTIER_EVICT";
 pub const TIER_LINK: &str = "BLOOMERY_TIER_LINK";
 pub const TIER_NODES: &str = "BLOOMERY_TIER_NODES";
 pub const TP_NODES: &str = "BLOOMERY_TP_NODES";
 pub const SCREEN: &str = "BLOOMERY_SCREEN";
 pub const SCHEMAJUMP: &str = "BLOOMERY_SCHEMAJUMP";
+pub const PREPARE_Q8: &str = "BLOOMERY_PREPARE_Q8";
 
 /// The largest `BLOOMERY_PREFILL_GROUP`: the batches a V4.1 prompt group
 /// holds at most, which the body's buffers are sized for.
@@ -351,6 +353,25 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         },
     },
     LeverSpec {
+        name: NVTIER_EVICT,
+        class: Class::A,
+        kind: Kind::Words(&["tick", "heat"]),
+        default: Unset::Is("tick"),
+        doc: "Which filled slot of the NVMe expert tier's RAM arena a miss takes once no slot is \
+              free. Both words take a prompt's transients first, oldest first. `tick` then takes \
+              the least recently used hot slot. `heat` takes the hot slot whose expert has the \
+              least decayed routing count, the least recently used among equal counts: the \
+              tier counts per layer and expert the columns that route it, the prompt's at its \
+              union call and a step's at its claim, halved every 32 columns the layer serves. \
+              The two words read and compute the same bytes, so a token is the same under \
+              either; only the fills differ. `tick` and `heat` are the same-binary arms. Read \
+              where the tier is built.",
+        site: Site::Parsed {
+            left: &[],
+            phase: Phase::Load,
+        },
+    },
+    LeverSpec {
         name: TIER_LINK,
         class: Class::M,
         kind: Kind::Words(&["shared", "loopback", "rdma"]),
@@ -442,7 +463,14 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         ),
         doc: "`generate_ds41` and `bloomery-serve-ds41`: `lookup` serves an n-gram lookup \
               draft, `dspark` the DSpark draft (`$BLOOMERY_DSPARK_MODEL`), through the skewed \
-              two-row pass; the qwen3 seat of `bloomery-serve` and `generate_qwen3moe` on a \
+              two-row pass; the qwen3 seat of `bloomery-serve` on a \
+              qwen35moe or qwen35 file: `dspark` serves the HF DSpark draft \
+              (`$BLOOMERY_DSPARK_MODEL`) on a whole-card load of one slot, and `lookup` serves \
+              the n-gram lookup draft on the same whole-card verifying load, one context a \
+              slot, while `dspark` on a qwen3moe file and on a placed load, `lookup` on a \
+              qwen3moe file and on a placed load, and several slots under `dspark` are refused \
+              by name, and the seat (not the CLI) takes `off` as the plain path; \
+              `generate_qwen3moe` on a \
               qwen35moe file: `dspark` serves the HF DSpark draft (`$BLOOMERY_DSPARK_MODEL`) \
               on a whole-card load of one slot, while `lookup`, `dspark` on a qwen3moe file and \
               on a placed load, and several slots under it, are refused by name, and the seat \
@@ -481,9 +509,18 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               under 3), never a refusal. Drafting, the load carries the NextN layer as \
               `generate_glm5next`'s does, prints a `load draft=mtp` record after the `load` line, \
               and `/props`' `engine.draft` names it; the plain path prints `load draft=off \
-              (<why>)`; `mtp` set is refused by name with stores too short for one window. Every \
-              other binary and \
-              family refuses each word by name, `off` included (the qwen3 seat's apart).",
+              (<why>)`; `mtp` set is refused by name with stores too short for one window. The \
+              raon1 seat of `bloomery-serve` takes `dspark` and `off`: `dspark` serves the DFlash2 \
+              draft (`$BLOOMERY_DSPARK_MODEL`, else the Q8_0 file of the draft's fixed name \
+              beside the target) and drafts every greedy request, the draft's file missing refused by name before the \
+              plan; `off` is the plain path; unset opens the draft when its file is there and \
+              drafts a request whose prompt call leaves the model inside its think span (the \
+              template's thinking-on prompt) while the draft has followed the slot since its \
+              reset, each other request running plain steps with no draft work, and runs the \
+              plain path when no file is there or the vocabulary holds no think tags; the \
+              `draft rule` record before the plan names which and why; `lookup` and `mtp` are \
+              refused by name. Every other binary and \
+              family refuses each word by name, `off` included (the qwen3 and raon1 seats' apart).",
         site: Site::Parsed {
             left: &[],
             phase: Phase::Load,
@@ -562,7 +599,9 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         default: Unset::Means("`cost` on a run that drafts"),
         doc: "A run that drafts (the MTP draft of `generate_qwen3moe`, `generate_glm5next` and \
               their serve seats; the lookup and DSpark drafts of `generate_ds41` and \
-              `bloomery-serve-ds41`): how many of a proposal's ids a pass verifies. `cost` \
+              `bloomery-serve-ds41`; the lookup and DSpark drafts of `bloomery-serve`'s qwen3 \
+              seat; the DFlash2 draft of `bloomery-serve`'s raon1 seat): how \
+              many of a proposal's ids a pass verifies. `cost` \
               (unset) puts the draft behind the width chooser (`runtime::width`): each window \
               verifies the width whose expected kept positions over its measured pass wall is \
               highest, and none while no width beats the plain step by its margin; the draft \
@@ -875,8 +914,9 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               stay for the decode after it. `split` admits, then streams the host experts the \
               rule (`runtime::xsplit`) sends to the card through a ring of card slots for the \
               ubatch alone (`host::xstream`): an expert streams when its columns cost the host \
-              union more than its copy and the card's columns, at the lane's rate the load's \
-              probe measured, cut at the ring's half and where the layer's copies would pass the \
+              union more than its copy and the card's columns, at the lane's rate its sources \
+              price (host memory, or the drive under the NVMe tier; the load's probe is printed, \
+              never priced), cut at the ring's half and where the layer's copies would pass the \
               union it keeps; a ubatch narrower than the rule's least width streams nothing, so \
               decode and short prompts run as under `admit`. The host union leaves the streamed \
               experts out. The prompt's bits are then the band's, not the decode steps'. `off` \
@@ -1044,10 +1084,11 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               printed (where the model went, its context and slots, the address); `off` \
               leaves the record lines alone. It is drawn only when stderr is a terminal, so \
               piped stderr never shows it, whatever this says. `NO_COLOR` (set and not empty) \
-              or `TERM=dumb` draws it without colour; `TERM=dumb` or a locale whose first set \
-              variable of `LC_ALL`, `LC_CTYPE` and `LANG` names no UTF-8 draws it in plain \
-              ASCII. Every seat of `bloomery-serve` acts on it, and so do the per-model \
-              binaries that are its seats.",
+              or `TERM=dumb` draws it without colour; `COLORTERM=truecolor` (or `24bit`) draws \
+              its colours in 24 bits, any other terminal in the 256-colour cube; `TERM=dumb` \
+              or a locale whose first set variable of `LC_ALL`, `LC_CTYPE` and `LANG` names \
+              no UTF-8 draws it in plain ASCII. Every seat of `bloomery-serve` acts on it, \
+              and so do the per-model binaries that are its seats.",
         site: Site::Parsed {
             left: &[],
             phase: Phase::Load,
@@ -1068,6 +1109,30 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               takes the step arm whatever this says. A request's `timings.constrained` counts \
               the calls of the arm it took. A server takes it as \
               `serve::SlotConfig::schema_jump`.",
+        site: Site::Parsed {
+            left: &[],
+            phase: Phase::Load,
+        },
+    },
+    LeverSpec {
+        name: PREPARE_Q8,
+        class: Class::M,
+        kind: Kind::Flag,
+        default: Unset::Is("0"),
+        doc: "`prepare`: `1` writes each BF16 or F32 matrix its checkpoint map reads as Q8_0 (the \
+              attention and linear-attention projections, the shared expert, the PLE key and \
+              value, the hyper-connections' down and up, the head and the token embedding) as \
+              ggml's reference Q8_0; `0` keeps each single BF16 matrix as stored and refuses \
+              F32 matrices read as Q8_0. BF16 and F32 expert stacks are refused, and the \
+              quantized tensors (NVFP4, MXFP8, FP8) keep their stored blocks, under both \
+              values. The rewrite is lossy: on \
+              `nvidia/Qwen3.8-Flash-Next-NVFP4` at fc694b54, the checkpoint's own f32 forward \
+              with its BF16 projections rounded to Q8_0 is at a KL divergence of 4.288e-02 from \
+              the forward with them as stored, at the last of the five positions of the \
+              batch set, and 4.181e-02 at position 3,000 of the D3K set (refset \
+              `hf-qwen4exp-nvfp4`, the `_bf16` sets against the others), so it is asked for, \
+              never a default. `--keep-bf16`, which asks for the stored form, is refused \
+              beside it.",
         site: Site::Parsed {
             left: &[],
             phase: Phase::Load,
@@ -1539,7 +1604,9 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
          (`tools/ref/models/deepseek41.sh`), which the DSpark recipes and \
          `tools/ref/timing-card.sh` export; `generate_ds41` and `bloomery-serve-ds41` \
          under `BLOOMERY_DRAFT=dspark` read it, and a binary that needs it and finds it \
-         unset says so.",
+         unset says so. `bloomery-serve`'s raon1 seat reads it as its DFlash2 draft's file \
+         before the one beside the target, and refuses a file that is not a DFlash2 draft \
+         by name.",
     ),
     path(
         "BLOOMERY_ENGRAM_BIN",

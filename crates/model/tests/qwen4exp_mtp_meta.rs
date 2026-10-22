@@ -174,7 +174,10 @@ const LIST_ROWS: u32 = 40_960;
 // PIN(2026-10-15): the arena stays one fixed addend (mtp_arena_bytes at vocab 248,320). Room
 // 37,251,097,876 (A6000) and 11,649,066,260 (3090) over 30,720 is 1,212,600 and 379,201; the pin
 // is one fewer.
-const CARD_MAX_CTX_MTP: [(&str, u64); 2] = [("A6000", 1_212_599), ("3090", 379_200)];
+// PIN(2026-10-21): the dense and rounding bytes fall 37,748,736 B (qwen4exp_meta's CARD_DENSE), so the
+// room is 37,288,846,612 (A6000) and 11,686,814,996 (3090) over 30,720: 1,213,829 and 380,430; the
+// pin is one fewer.
+const CARD_MAX_CTX_MTP: [(&str, u64); 2] = [("A6000", 1_213_828), ("3090", 380_429)];
 
 /// The plan with the shared draft (`place::PlanInputs::plan_mtp`): on each
 /// card at 4,096 and 32,768 positions the target's plan is `plan`'s field
@@ -450,8 +453,17 @@ fn hw_qwen4exp_mtp_plan() {
 // A6000 (3,170,304 B against 3,072,000 B an expert and the granules' slack) and the tier's terms
 // unchanged; the box's planner on this tree: as predicted, the old pins red on exactly the A6000's
 // split and the tier's].
+// PIN(2026-10-21): the A6000 243 on the first 3 layers and 242 on the rest, 11,619 experts (was 242
+// on the first 41, 11,609), both cards 393 on the first 39 layers (was 29), the tier's 22,675,456,000
+// B of experts (was 22,676,889,600) and 147,849,216 B of rounding (was 146,415,616); the host 5,721
+// experts (was 5,731). The indexer projections' words (qwen4exp_meta's CARD_DENSE) take 18 dense
+// granules (37,748,736 B) off the A6000 under an unmoved budget: plan (a)'s drafted row gains 10
+// experts, and both cards' totals gain the same 10: the tier keeps its 7,236 experts, on other
+// layers [derived: the planner on the file's tensor table over the A6000 and tier machines of this
+// row with the draft's reserve of 2,847,926,444 B, the old row exactly under the old rule; the box's
+// planner on this tree printed this one].
 const BP_DRAFTED: (u64, usize, u64, u64, usize, u64, u64, u64) =
-    (242, 41, 241, 393, 29, 7_236, 22_676_889_600, 146_415_616);
+    (243, 3, 242, 393, 39, 7_236, 22_675_456_000, 147_849_216);
 
 /// Plan (b′) of the Qwen3.8 file with the shared draft (`place::machine_bp`
 /// with `MtpInputs::card_bytes` as the A6000's reserve, `plan_mtp_with`

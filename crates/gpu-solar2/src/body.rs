@@ -9,8 +9,8 @@
 //! All 48 layers are one card's chain, each a mixer by its description (a
 //! NoPE GQA layer with its out gate at every fourth layer from 0, a KDA layer
 //! elsewhere) and a routed block with one shared expert, whose experts run on
-//! the card where the plan puts them ([`crate::ffn::Routed`]) and on the host
-//! tier otherwise. A KDA layer's store is its recurrent state, its stamp and
+//! the card where the plan puts them ([`crate::ffn::Routed`]), on the plan's
+//! expert tier card ([`crate::tier`]) and on the host tier otherwise. A KDA layer's store is its recurrent state, its stamp and
 //! its conv ring, one lane (the file has no next-token head), whatever the
 //! context; a GQA layer's the K and V planes of every position. The
 //! embedding is a host row, dequantized per step and copied into `x` before
@@ -20,8 +20,8 @@
 //! checkpoint taken there ([`Body::checkpoint`]), or the empty model at 0,
 //! and is carried out at the next device call ([`Body::apply_cut`]).
 //!
-//! What the load refuses, by name: a plan of other than one card with no
-//! expert tier, a layer other than the two mixers over a routed block on a
+//! What the load refuses, by name: a plan of other than one stage card, more
+//! expert tier cards than the host tier serves, a layer other than the two mixers over a routed block on a
 //! plain residual, GQA or KDA widths the kernels have no geometry for, KDA
 //! layers that disagree on their rule, a tensor whose type no site launches
 //! or that is not resident in the rows its launch reads, stores whose bytes
@@ -34,23 +34,27 @@ use std::num::NonZeroUsize;
 use std::ops::Range;
 use std::sync::Arc;
 
-use bloomery_gpu::arch::hybrid::{Acts, GqaGate, GqaLayer, Site};
+use bloomery_gpu::arch::hybrid::{Acts, GqaGate, GqaLayer, Site, wide_acts_at};
 use bloomery_gpu::checkpoint::{self, Checkpoints};
 use bloomery_gpu::flash_gqa::{GROUP, partials_ms_len, partials_v_len};
 use bloomery_gpu::head::Head;
 use bloomery_gpu::host::PassKind;
+use bloomery_gpu::host::leg_tier::{Hang, LegOpen};
+use bloomery_gpu::host::refuse_tier_count;
 use bloomery_gpu::host::run::{HostRun, HostWidths};
 use bloomery_gpu::host::served::{ResidencyParts, TierBody};
 use bloomery_gpu::host::shell::TierShell;
 use bloomery_gpu::host::swap::{PassReport, Residency};
 use bloomery_gpu::host::swap_source::{
-    DEADLINE, FileSwap, LIVE_DELAY, PlanStacks, ResidencyGlue, ResidencySpec, StackFacts,
+    DEADLINE, FileSwap, LIVE_DELAY, PlanStacks, ResidencyGlue, ResidencySpec, hosted_stacks,
 };
-use bloomery_gpu::hybrid::{Boundary, BoundaryShape, Chain, HostResidency, Hybrid, SlotMap};
+use bloomery_gpu::host::tier::TierOpen;
+use bloomery_gpu::hybrid::{Chain, HostResidency, Hybrid, SlotMap};
 use bloomery_gpu::linear::mixer_kda::{KdaDecay, KdaDims, KdaRule};
 use bloomery_gpu::linear::{CONV_TAPS, HEAD, KHeadMap, LinearShape};
 use bloomery_gpu::model::{
-    ChainBody, HostServed, MAX_PASS_ROWS, Rollback, StepMode, host_run, refuse_scratch_past,
+    ChainBody, HostServed, MAX_PASS_ROWS, Rollback, StepMode, agreed, hosted_hybrid_tiered,
+    refuse_scratch_past, stage_run,
 };
 use bloomery_gpu::site::{self, SiteTy, WideActs};
 use bloomery_gpu::weights::Weights;
@@ -64,13 +68,16 @@ use model::arch::solar2::host as solar_host;
 use model::arch::solar2::place::{self, PlanInputs};
 use model::embed::EmbedTable;
 use model::placement::Plan;
-use models::{Act, DeltaKind, Ffn, Gqa, KdaGate, LayerSpec, Mixer, ModelSpec, OutGate, RopeMode};
+use models::{DeltaKind, Gqa, KdaGate, LayerSpec, Mixer, ModelSpec, OutGate, RopeMode};
 use runtime::layer::{FfnKind, Layer, MixerKind, ResidualKind, hosted};
 use runtime::seqstate::{Kept, Take};
 
-use crate::ffn::{Routed, RoutedDims};
-use crate::prefill::{self, Extra};
+use bloomery_gpu_deepseek41::prompt_walk::{self, BatchBufs};
+
+use crate::ffn::{CARD, Routed, RoutedDims};
+use crate::prefill::Extra;
 use crate::step::Kernels;
+use crate::tier;
 
 /// What the body's refusals name.
 pub(crate) const WHAT: &str = "solar2 Body";
@@ -209,16 +216,11 @@ pub struct LayerCfg {
 pub struct Scratch {
     pub x: DeviceBuffer<f32>,
     pub x1: DeviceBuffer<f32>,
-    pub xn: DeviceBuffer<f32>,
     pub pos: DeviceBuffer<u32>,
     pub words: DeviceBuffer<u32>,
     pub n_keys: DeviceBuffer<u32>,
-    /// KDA: qkv, fa, ga, beta_raw, f, z, conv, beta, decay, o, gated.
-    pub kda: [DeviceBuffer<f32>; 11],
-    /// GQA: q, k, v, g, attn, part_v, part_ms.
-    pub gqa: [DeviceBuffer<f32>; 7],
-    pub delta: DeviceBuffer<f32>,
-    pub acts: Acts,
+    /// The mixers' intermediates and the activation forms.
+    pub mixers: MixerBufs,
 }
 
 impl Scratch {
@@ -232,18 +234,61 @@ impl Scratch {
     ) -> Result<Scratch, GpuError> {
         let z = |n: usize| DeviceBuffer::<f32>::zeroed(stream, rows * n);
         let u = |n: usize| DeviceBuffer::<u32>::zeroed(stream, n);
+        Ok(Scratch {
+            x: z(d.embd)?,
+            x1: z(d.embd)?,
+            pos: u(rows)?,
+            words: u(WORD_ROWS + d.kv_heads)?,
+            n_keys: u(rows)?,
+            mixers: MixerBufs::new(stream, d, rows, sites)?,
+        })
+    }
+
+    /// Device bytes of every buffer and activation form.
+    #[must_use]
+    pub fn bytes(&self) -> usize {
+        let f32s = [&self.x, &self.x1]
+            .into_iter()
+            .map(DeviceBuffer::num_bytes)
+            .sum::<usize>();
+        let words = [&self.pos, &self.words, &self.n_keys]
+            .into_iter()
+            .map(DeviceBuffer::num_bytes)
+            .sum::<usize>();
+        f32s + words + self.mixers.bytes()
+    }
+}
+
+/// The mixers' buffers: the normed rows, every mixer's intermediates and the
+/// activation forms, at `rows` rows. The step holds them in its [`Scratch`],
+/// the prompt batch in its [`Batch`].
+pub struct MixerBufs {
+    pub xn: DeviceBuffer<f32>,
+    /// KDA: qkv, fa, ga, beta_raw, f, z, conv, beta, decay, o, gated.
+    pub kda: [DeviceBuffer<f32>; 11],
+    /// GQA: q, k, v, g, attn, part_v, part_ms.
+    pub gqa: [DeviceBuffer<f32>; 7],
+    pub delta: DeviceBuffer<f32>,
+    pub acts: Acts,
+}
+
+impl MixerBufs {
+    /// `rows` rows of every width the mixers and `sites` read. Load-time
+    /// only.
+    fn new<'s>(
+        stream: &CudaStream,
+        d: &Dims,
+        rows: usize,
+        sites: impl Iterator<Item = &'s Site>,
+    ) -> Result<MixerBufs, GpuError> {
+        let z = |n: usize| DeviceBuffer::<f32>::zeroed(stream, rows * n);
         let shape = d.kda.shape;
         let (channels, v, n_v) = (shape.channels(), shape.n_v * HEAD, shape.n_v);
         let (q_width, kv_width) = (d.heads * HEAD, d.kv_heads * HEAD);
         // The decode flash splits a row's keys; a batch's flash needs no partials.
         let attn_rows = rows.min(MAX_PASS_ROWS);
-        Ok(Scratch {
-            x: z(d.embd)?,
-            x1: z(d.embd)?,
+        Ok(MixerBufs {
             xn: z(d.embd)?,
-            pos: u(rows)?,
-            words: u(WORD_ROWS + d.kv_heads)?,
-            n_keys: u(rows)?,
             kda: [
                 z(channels)?,
                 z(HEAD)?,
@@ -274,24 +319,20 @@ impl Scratch {
     /// Device bytes of every buffer and activation form.
     #[must_use]
     pub fn bytes(&self) -> usize {
-        let f32s = [&self.x, &self.x1, &self.xn, &self.delta]
+        let f32s = [&self.xn, &self.delta]
             .into_iter()
             .chain(&self.kda)
             .chain(&self.gqa)
             .map(DeviceBuffer::num_bytes)
             .sum::<usize>();
-        let words = [&self.pos, &self.words, &self.n_keys]
-            .into_iter()
-            .map(DeviceBuffer::num_bytes)
-            .sum::<usize>();
-        f32s + words + self.acts.bytes()
+        f32s + self.acts.bytes()
     }
 }
 
-/// The prompt batch's buffers: [`Scratch`]'s at [`T_MAX`] rows, and the
+/// The prompt batch's buffers: the mixers' rows at [`T_MAX`] rows, and the
 /// wide activation forms the GEMMs read.
 pub struct Batch {
-    pub rows: Scratch,
+    pub rows: MixerBufs,
     pub wide: WideActs,
 }
 
@@ -322,6 +363,8 @@ pub struct Body {
     pub(crate) stores: Vec<Store>,
     pub(crate) s: Scratch,
     pub(crate) batch: Batch,
+    /// The prompt batch's units: the walker's own buffers.
+    pub(crate) units: BatchBufs,
     pub(crate) slots: Arc<DeviceTensor<u32>>,
     /// The positions the stores hold: a step at `pos` needs `at == pos`, and
     /// it leaves `pos + 1`.
@@ -370,31 +413,6 @@ const KQUANT: &[SiteTy] = &[SiteTy::Q3K, SiteTy::Q4K, SiteTy::Q5K, SiteTy::Q6K];
 /// K-quant).
 const LOW_RANK: &[SiteTy] = &[SiteTy::Q5_0, SiteTy::Q8_0, SiteTy::F32];
 
-/// Site `name` of `rows` rows of `k` values, its type from the file's header
-/// (one of `allowed`) checked against the resident weight.
-fn typed_site(
-    file: &Split,
-    w: &Weights,
-    name: String,
-    (rows, k): (usize, usize),
-    allowed: &[SiteTy],
-) -> Result<Site, GpuError> {
-    let ty = site::file_site(file, WHAT, &name, (rows, k), allowed)?;
-    site::site(w, WHAT, &name, (rows, k), ty)?;
-    Ok(Site::new(name, ty, k))
-}
-
-/// The resident f32 vector `name`, `len` values: its name.
-fn vector(w: &Weights, name: String, len: usize) -> Result<String, GpuError> {
-    let got = w.f32_buf(WHAT, &name)?.len();
-    if got != len {
-        return Err(shape(format!(
-            "{name} holds {got} values; the layer reads {len}"
-        )));
-    }
-    Ok(name)
-}
-
 /// The joined conv taps of KDA layer `l`'s q, k and v, in the conv's channel
 /// order: the one weight the mixer's conv reads, made at load.
 fn conv_joined(l: usize) -> String {
@@ -429,26 +447,12 @@ fn kda_rule(gate: KdaGate, beta_scale: f32) -> Result<KdaRule, GpuError> {
         KdaGate::Sigmoid { lower_bound } => KdaDecay::Sigmoid { lower_bound },
         KdaGate::Softplus => KdaDecay::Softplus,
     };
-    KdaRule { decay, beta_scale }.check(WHAT)
-}
-
-/// What every layer of a kind agrees on: the first's `value`, every other
-/// layer's equal to it.
-fn agreed<T: PartialEq + std::fmt::Debug>(
-    what: &str,
-    l: usize,
-    first: &mut Option<T>,
-    value: T,
-) -> Result<(), GpuError> {
-    match first {
-        Some(f) if *f != value => Err(shape(format!(
-            "layer {l}: {what} is {value:?}, an earlier layer's {f:?}"
-        ))),
-        _ => {
-            first.get_or_insert(value);
-            Ok(())
-        }
+    KdaRule {
+        decay,
+        beta_scale,
+        write_gate: false,
     }
+    .check(WHAT)
 }
 
 /// A GQA layer's description held to what the kernels run: NoPE, no qk
@@ -516,7 +520,7 @@ fn dims_of(inputs: &PlanInputs, ctx: usize) -> Result<Dims, GpuError> {
                         g.heads, hp.n_head
                     )));
                 }
-                agreed("the key head count", l, &mut kv, g.kv_heads as usize)?;
+                agreed(WHAT, "the key head count", l, &mut kv, g.kv_heads as usize)?;
             }
             Mixer::DeltaRule(d) => {
                 let DeltaKind::Kda { gate, beta_scale } = d.kind else {
@@ -533,8 +537,20 @@ fn dims_of(inputs: &PlanInputs, ctx: usize) -> Result<Dims, GpuError> {
                         d.k_heads, d.v_heads, d.d, d.conv
                     )));
                 }
-                agreed("the KDA head count", l, &mut kda_heads, d.v_heads as usize)?;
-                agreed("the KDA rule", l, &mut rule, kda_rule(gate, beta_scale)?)?;
+                agreed(
+                    WHAT,
+                    "the KDA head count",
+                    l,
+                    &mut kda_heads,
+                    d.v_heads as usize,
+                )?;
+                agreed(
+                    WHAT,
+                    "the KDA rule",
+                    l,
+                    &mut rule,
+                    kda_rule(gate, beta_scale)?,
+                )?;
             }
             other => {
                 return Err(shape(format!(
@@ -568,37 +584,13 @@ fn dims_of(inputs: &PlanInputs, ctx: usize) -> Result<Dims, GpuError> {
     })
 }
 
-/// The SwiGLU limit of layer `l`'s routed experts; any other activation is
-/// refused by name.
-fn routed_limit(spec: &ModelSpec, l: usize) -> Result<f32, GpuError> {
-    match spec.layers.get(l).map(|s| &s.ffn) {
-        Some(Ffn::Moe(m)) => match m.act {
-            Act::SwiGlu { limit } => Ok(limit.unwrap_or(0.0)),
-            other => Err(shape(format!(
-                "layer {l}: the routed activation is {other:?}; this program runs SwiGLU"
-            ))),
-        },
-        _ => Err(shape(format!("layer {l}: not a routed block"))),
-    }
-}
-
 /// The stacks of the layers `inputs` describes for the residency machine's
 /// file source: each routed layer's gate, up and down, their types read from
 /// its tensors. Refused by name: a layer that holds some of its three stacks
 /// but not all, and a description whose routed layers are not one run.
 fn stacks(inputs: &PlanInputs) -> Result<PlanStacks, GpuError> {
     let run = hosted(&inputs.spec.layers).map_err(|e| shape(format!("the routed layers: {e}")))?;
-    PlanStacks::of(
-        &inputs.model,
-        StackFacts {
-            what: "solar2 stacks",
-            names: names::routed_stacks,
-            check: None,
-            empty: false,
-            map_layers: Some(run.len()),
-            unrouted: Vec::new(),
-        },
-    )
+    hosted_stacks(&inputs.model, "solar2 stacks", (run.len(), false))
 }
 
 /// The f32s of each store one checkpoint copies, in the layers' order: every
@@ -674,6 +666,8 @@ impl Body {
                  slots to add"
             )));
         }
+        let tiers = TierOpen::of_machine(plan.machine)?;
+        refuse_tier_count(WHAT, tiers.len())?;
         let kinds: Vec<Layer> = inputs.spec.layers.iter().map(Layer::of).collect();
         let spec = ResidencySpec {
             lever: residency,
@@ -696,7 +690,7 @@ impl Body {
                     gpu,
                     file,
                     w,
-                    (plan, inputs, card),
+                    (plan, inputs, card, &tiers),
                     host,
                     (set, glue, residency),
                 )
@@ -706,52 +700,27 @@ impl Body {
 
     /// The body of card `card`: its layers' programs and values from the
     /// plan's description, the stores at the plan's `ctx_max`, the step's
-    /// buffers, the slot map the plan's routed segments make, the routed
-    /// blocks and the host tier over the routed run. `glue` is the load's
-    /// residency side, whose machine the body starts once its pieces are
-    /// sized.
+    /// buffers, the slot map the plan's routed segments make (the stage
+    /// card's and the expert tier cards' `tiers`), the routed blocks and the
+    /// host tier over the routed run with the tier cards hung under it.
+    /// `glue` is the load's residency side, whose machine the body starts once
+    /// its pieces are sized.
     fn load(
         gpu: &Gpu,
         file: &Arc<Split>,
         w: &Weights,
-        (plan, inputs, card): (&Plan<'_>, &PlanInputs, usize),
+        (plan, inputs, card, tiers): (&Plan<'_>, &PlanInputs, usize, &[TierOpen]),
         host: HostCfg,
         (set, glue, residency): (HostResidency, ResidencyGlue, Residency),
     ) -> Result<Body, GpuError> {
         let (hp, spec) = (&inputs.hp, &inputs.spec);
         gpu.context().bind_to_thread()?;
-        if plan.machine.cards.len() != 1 || !plan.machine.tiers.is_empty() {
-            return Err(shape(format!(
-                "a plan of {} cards and {} expert tiers; the program runs every layer on one \
-                 card with no expert tier",
-                plan.machine.cards.len(),
-                plan.machine.tiers.len()
-            )));
-        }
-        let layers = plan
-            .machine
-            .cards
-            .get(card)
-            .map(|c| c.layers.clone())
-            .ok_or_else(|| shape(format!("the plan has no card {card}")))?;
-        if layers != (0..spec.layers.len()) {
-            return Err(shape(format!(
-                "card {card} runs layers {layers:?}; the program runs every layer (0..{})",
-                spec.layers.len()
-            )));
-        }
-        let ctx = usize::try_from(plan.ctx_max)
-            .ok()
-            .filter(|&c| c > 0 && u32::try_from(c).is_ok())
-            .ok_or_else(|| {
-                shape(format!(
-                    "ctx_max {}: at least 1 and at most the positions a u32 counts",
-                    plan.ctx_max
-                ))
-            })?;
+        let (layers, ctx) = stage_run(WHAT, plan, card, spec.layers.len())?;
         let dims = dims_of(inputs, ctx)?;
         let run = hosted(&spec.layers).map_err(|e| shape(e.to_string()))?;
-        let map = SlotMap::of_plan(plan, card, None, run.clone(), hp.experts.n_expert)?;
+        let tier_cards: Vec<usize> = tiers.iter().map(|t| t.card).collect();
+        let map =
+            SlotMap::of_plan_tiers(plan, card, &tier_cards, run.clone(), hp.experts.n_expert)?;
         let mut lcfg = Vec::with_capacity(spec.layers.len());
         for (l, s) in spec.layers.iter().enumerate() {
             lcfg.push(layer_cfg(l, s, &map)?);
@@ -794,46 +763,36 @@ impl Body {
                 rms_eps: dims.rms_eps,
                 batch_rows: T_MAX,
             },
+            CARD,
         )?;
-        let boundary = Boundary::with_rows(
-            gpu.context(),
-            stream,
-            BoundaryShape {
+        let hang = Hang {
+            tiers,
+            family: &tier::NODE_FAMILY,
+            open: LegOpen {
+                n_expert: hp.experts.n_expert,
+                layers: spec.layers.len(),
                 hidden: dims.embd,
                 n_used: hp.experts.n_used,
+                rows: LOAD_ROWS,
             },
-            LOAD_ROWS,
+            cols: T_MAX,
+            card_dontneed: host.card_dontneed,
+        };
+        let mut hybrid = hosted_hybrid_tiered(
+            (gpu, file, plan),
+            (run.clone(), map),
+            (host, set, &glue),
+            (
+                HostWidths {
+                    embd: hp.n_embd,
+                    ff: hp.experts.ff,
+                    n_used: hp.experts.n_used,
+                },
+                LOAD_ROWS,
+            ),
+            Some(&hang),
+            |src| solar_host::routed_layers(src, hp, spec, run.clone()),
         )?;
-        let limits = (0..spec.layers.len())
-            .map(|l| routed_limit(spec, l))
-            .collect::<Result<Vec<_>, _>>()?;
-        // The common host-run build: a paged plan's NVMe expert tier is
-        // attached before the run's first call.
-        let experts = host_run(
-            gpu.context(),
-            plan,
-            file,
-            run.clone(),
-            host.r8,
-            set.arena(),
-            HostWidths {
-                embd: hp.n_embd,
-                ff: hp.experts.ff,
-                n_used: hp.experts.n_used,
-            },
-            |src| {
-                run.clone()
-                    .map(|l| solar_host::layer(src, hp, l, limits[l]))
-                    .collect()
-            },
-        )?;
-        glue.attach_tier(experts.tier())?;
-        let mut hybrid = Hybrid::new(boundary, map, experts, run.len())?;
-        hybrid.watch_fault(gpu.fault_word())?;
-        hybrid.keep_residency(set);
-        // The residency machine frees arena slots between passes, which a
-        // card hold keeps: a load that starts one keeps the host leg.
-        hybrid.attach_arena_leg(gpu, glue.source().is_some())?;
         let table = EmbedTable::new(Arc::clone(file), &names::token_embd(), dims.embd)?;
         if table.n_vocab() != hp.n_vocab {
             return Err(shape(format!(
@@ -842,9 +801,10 @@ impl Body {
                 hp.n_vocab
             )));
         }
-        prefill::prepare_host(gpu, &mut hybrid)?;
+        prompt_walk::prepare_host(gpu, &mut hybrid, T_MAX)?;
         let batch = new_batch(gpu, &dims, &stores)?;
         let extra = Extra::new(gpu, &dims, &stores, 1)?;
+        let units = BatchBufs::new(gpu, dims.embd, T_MAX, 1)?;
         let ckpt = Checkpoints::sequence(
             gpu.context(),
             checkpoint_lens(spec, &dims),
@@ -863,6 +823,7 @@ impl Body {
             stores,
             s,
             batch,
+            units,
             slots,
             at: 0,
             k: Kernels::load(gpu)?,
@@ -886,7 +847,10 @@ impl Body {
             "the step's buffers, the routed blocks' buffers and card experts, the mixers' \
              kernels, the host boundary, the slot map's copy",
         )?;
-        refuse_prompt_past(inputs.prompt_reserve, body.prompt_bytes())?;
+        let reserve = inputs
+            .reserve_on(plan.machine)
+            .map_err(|e| GpuError::plan(WHAT, e))?;
+        refuse_prompt_past(reserve, body.prompt_bytes())?;
         // Last: the machine frees each layer's spare slots, and every piece
         // above sized itself from the load's map, capacity = live.
         body.start_residency(gpu)?;
@@ -1006,7 +970,7 @@ impl Body {
     /// out of the expert budget; a load past it is refused by name.
     #[must_use]
     pub fn prompt_bytes(&self) -> usize {
-        self.batch.bytes() + self.prefill.bytes() + self.ffn.batch_bytes()
+        self.batch.bytes() + self.prefill.bytes() + self.units.bytes() + self.ffn.batch_bytes()
     }
 
     /// Every store's and buffer's bytes on the card, the armed taps
@@ -1216,10 +1180,10 @@ fn store(
 ) -> Result<Store, GpuError> {
     let stream = gpu.stream();
     let site = |name: String, rows_k: (usize, usize), allowed: &[SiteTy]| {
-        typed_site(file, w, name, rows_k, allowed)
+        Site::of_file((file, w), WHAT, name, rows_k, allowed)
     };
     let embd = d.embd;
-    let norm = vector(w, names::attn_norm(l), embd)?;
+    let norm = site::vector(w, WHAT, names::attn_norm(l), embd)?;
     if matches!(inputs.spec.layers[l].mixer, Mixer::Gqa(_)) {
         let (q_rows, kv_rows) = (d.heads * HEAD, d.kv_heads * HEAD);
         return Ok(Store::Gqa(GqaLayer {
@@ -1253,10 +1217,10 @@ fn store(
         out: site(names::attn_output(l), (embd, v), KQUANT)?,
         vecs: [
             norm,
-            vector(w, conv_joined(l), lin.channels() * CONV_TAPS)?,
-            vector(w, names::ssm_dt_bias(l), v)?,
-            vector(w, names::ssm_a(l), lin.n_v)?,
-            vector(w, names::ssm_norm(l), HEAD)?,
+            site::vector(w, WHAT, conv_joined(l), lin.channels() * CONV_TAPS)?,
+            site::vector(w, WHAT, names::ssm_dt_bias(l), v)?,
+            site::vector(w, WHAT, names::ssm_a(l), lin.n_v)?,
+            site::vector(w, WHAT, names::ssm_norm(l), HEAD)?,
         ],
     };
     // Lane 0 stands at position 0.
@@ -1273,11 +1237,10 @@ fn store(
 /// only.
 fn new_batch(gpu: &Gpu, d: &Dims, stores: &[Store]) -> Result<Batch, GpuError> {
     let sites = || stores.iter().flat_map(Store::sites);
-    let rows = Scratch::new(gpu.stream(), d, T_MAX, sites())?;
-    let tys: Vec<SiteTy> = sites().filter(|s| s.k() == d.embd).map(Site::ty).collect();
+    let rows = MixerBufs::new(gpu.stream(), d, T_MAX, sites())?;
     Ok(Batch {
         rows,
-        wide: WideActs::new(gpu.stream(), WideActs::wants_of(&tys), T_MAX, d.embd)?,
+        wide: wide_acts_at(gpu.stream(), sites(), (T_MAX, d.embd))?,
     })
 }
 

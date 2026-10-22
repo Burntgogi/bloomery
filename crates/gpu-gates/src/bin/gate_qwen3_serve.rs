@@ -50,9 +50,14 @@
 //!   tokens, of those ids and of [`PROSE`] (`/tokenize`, a raw continuation,
 //!   which a model's next ids follow more loosely than a chat answer, so a
 //!   prompt call fed other ids moves them sooner), gives for each the ids
-//!   `generate_qwen3moe --arm <ids>/N … --last-step` prints for the same
-//!   file (the server's cut: the prompt less its last id, then a step) — all
-//!   of them, or a prefix ending at an end-of-generation id;
+//!   `generate_qwen3moe --arm <ids>/N --ctx <the server's loaded context>
+//!   … --last-step` prints for the same file (the server's cut: the prompt
+//!   less its last id, then a step). The CLI's own default context plans a
+//!   different split of the routed experts, and the card leg and the host
+//!   leg sum in different orders, so the ids are the server's context's —
+//!   all of them, or a prefix ending at an end-of-generation id, and the
+//!   two loads' plans agree (both absent, or the same host experts, card
+//!   experts and context);
 //! - `chat_is_those_ids`: `/v1/chat/completions` of the same turn at
 //!   temperature 0 and `max_tokens` N is a 200 whose `usage` counts the
 //!   prompt's ids and the completion's tokens, and whose message text (the
@@ -193,20 +198,23 @@
 //!   the load does not fit is a named error: the arm is not a whole arm.
 //!   FAIL-first: a seat that decides a set total's load at a slot's share
 //!   puts its line at half the total.
-//! - `slots_rounds_run_one_pass`, on both arms (both bodies run one pass of
-//!   their slots, `SlotRows`: a qwen3moe file's `Body`, a qwen35moe file's
-//!   `Body35`), and the seat's `parallel` line names the shape the open
-//!   decided (`slots_parallel_line_names_one_pass` on the whole-card arm,
-//!   `placed_slots_parallel_line_names_turns` on the placed one, whose host
-//!   experts keep the fallback loop: `qwen3::pass_of`; FAIL-first: the word
-//!   printed flipped, red on both and on the one-slot arm's
-//!   `one_slot_parallel_line_names_one_pass`): a whole-card server
+//! - `slots_rounds_run_one_pass`, on both arms (a qwen3moe file's `Body`, a
+//!   qwen35moe file's `Body35`), and the seat's `parallel` line names the
+//!   shape the open decided. The no-flag arm is one pass when it prints no
+//!   plan (`slots_parallel_line_names_one_pass`: the whole model) and turns
+//!   when it prints one (`slots_parallel_line_names_turns`: the whole load
+//!   does not fit, so `qwen3::pass_of` names the fallback loop). The placed
+//!   arm (`placed_slots_parallel_line_names_turns`) is that loop. FAIL-first:
+//!   the word printed flipped, red on the arm and on the one-slot arm's
+//!   `one_slot_parallel_line_names_one_pass`. A server
 //!   of `--parallel 2` under `BLOOMERY_STEP_STATS=1` prints a `slots round`
 //!   record a round of several slots — two greedy streamed requests of the
 //!   slots clause's prompts, each first run alone on that server and then
-//!   both together — and over the together run every record holds
-//!   `passes=1` over `rows` of 2..=`MAX_TOKENS` on `slots=2`
-//!   (`slots_rounds_run_one_pass`); the window holds a round of both
+//!   both together — and over the together run every record holds the
+//!   shape the line named: `passes=1` over `rows` of 2..=`MAX_TOKENS` on
+//!   `slots=2` when the arm printed no plan (`slots_rounds_run_one_pass`),
+//!   and `passes=rows` when it printed one (`slots_rounds_run_in_turn`);
+//!   the window holds a round of both
 //!   (`slots_rounds_hold_a_round_of_both`: at least one record of `rows=2`)
 //!   — the one thing the records can see of both advancing in the same
 //!   rounds, for a round of one stepping slot prints no record (the
@@ -236,11 +244,12 @@
 //!   `passes=rows`, the default loop (`placed_slots_rounds_run_in_turn`),
 //!   and its window holds a round of both
 //!   (`placed_slots_rounds_hold_a_round_of_both`).
-//!   FAIL-first: a seat left on the default loop prints `passes=rows` on
-//!   the whole arm, and only this clause is red; a seat that serves one
-//!   slot at a time prints no record of both and the hold clause is red on
-//!   both arms, while a server that only stretches one-slot runs between
-//!   two-row rounds is the (v2) busy ratio's red, not the records'.
+//!   FAIL-first: a load that prints no plan and `passes=rows` is red on
+//!   `slots_rounds_run_one_pass`; a load that prints a plan and `passes=1`
+//!   is red on `slots_rounds_run_in_turn`. A seat that serves one slot at a
+//!   time prints no record of both and the hold clause is red on both arms,
+//!   while a server that only stretches one-slot runs between two-row rounds
+//!   is the (v2) busy ratio's red, not the records'.
 //! - `slots_late_request_together_alone`, on both arms: a
 //!   whole-card server of `--parallel 2`, the first request decoding alone
 //!   and the second posted once `/metrics`' `n_decode_total` has moved a
@@ -1098,9 +1107,11 @@ mod gate {
     /// the halving ladder the load holds,
     /// `ctx_default_is_the_highest_rung_held`): a load under `--place` takes
     /// the rung its plan holds, its two slots resident on either file
-    /// (`placed_slots_are_resident`), and the q8_0 cache's load holds the
-    /// planes' derived delta against the main server's at the same context
-    /// (a file whose head shape has no q8_0 flash is refused instead,
+    /// (`placed_slots_are_resident`), and the q8_0 cache's load at the main
+    /// server's context holds the planes' bytes — the whole-fit verdict's
+    /// cache term — down by their saving, the freed bytes spent on more card
+    /// experts where both loads are placed (a file whose head shape has no
+    /// q8_0 flash is refused instead,
     /// [`q8_cache_is_refused_on_the_scalar_pair_flash`]).
     /// The choice itself — the target, the halving, the floor and the set
     /// share — is held by `bloomery_placement::placement::ctx_ask`'s tests.
@@ -1231,17 +1242,11 @@ mod gate {
             .arch_get_u64("attention.key_length")
             .ok_or("no attention.key_length")?;
         let layers = split.arch_get_u64("block_count").ok_or("no block_count")?;
-        // A qwen3moe file's every layer carries the planes, so
-        // the delta is exact; a qwen35moe file's delta layers
-        // carry none, so the same product is only the upper
-        // bound (their exact 17/32 term is the model crate's
-        // own unit pin).
-        // The delta holds at one context: the default ladder can take
+        // The two loads compare at one context: the default ladder can take
         // a higher rung under q8_0 than under f16 where the card is
-        // short at f16's, so the residents compare against a q8_0 server
-        // held to the main server's context by `--ctx`, started
-        // once the placed arm's server has stopped (two loads do
-        // not fit one card).
+        // short at f16's, so the q8_0 server is held to the main server's
+        // context by `--ctx`, started once the placed arm's server has
+        // stopped (two loads do not fit one card).
         let same_n = default_n;
         let same_dir = dir.join("ctx-q8-same");
         std::fs::create_dir_all(&same_dir)?;
@@ -1274,15 +1279,51 @@ mod gate {
         let f16_log = std::fs::read_to_string(dir.join("server.err"))?;
         let (f16_resident, q8_resident) = (resident(&f16_log)?, resident(&same_log)?);
         let d = f16_resident.saturating_sub(q8_resident);
-        let dropped = match split.architecture() {
-            Some("qwen3moe") => d == ceiling,
-            _ => d > 0 && d <= ceiling,
+        // PIN(2026-10-22): a placed plan spends the bytes the q8 planes free
+        // on more card experts, so the resident no longer falls by the planes'
+        // saving. The clause holds the whole-fit verdict's cache term (the
+        // planes' bytes) and, where both loads print a plan, that the q8 plan
+        // keeps more experts on the card at the same context. A card the whole
+        // load fits prints no plan, and there the resident falls by that term.
+        // A qwen3moe file's every layer carries the planes, so the cache term's
+        // drop is the ceiling; a qwen35moe file's delta layers carry none, so
+        // the same product is only the upper bound (their exact 17/32 term is
+        // the model crate's own unit pin).
+        // FAIL-first: a q8 load that keeps the f16 planes — the cache term does
+        // not drop, and a placed plan does not take more card experts.
+        let f16_cache = cache_term(&f16_log, same_n)?;
+        let q8_cache = cache_term(&same_log, same_n)?;
+        let plane_drop = f16_cache.saturating_sub(q8_cache);
+        let planes_held = match split.architecture() {
+            Some("qwen3moe") => plane_drop == ceiling,
+            _ => plane_drop > 0 && plane_drop <= ceiling,
+        };
+        let f16_split = routed_split(&record::Log::of(&f16_log, record::BLOOMERY_SERVE_QWEN3))?;
+        let q8_split = routed_split(&record::Log::of(&same_log, record::BLOOMERY_SERVE_QWEN3))?;
+        let spent = match (f16_split, q8_split) {
+            (Some((_, fc, fx)), Some((_, qc, qx))) => {
+                println!(
+                    "ctx arm q8: placed, card_experts f16 {fc} q8_0 {qc}, ctx_max {fx} and {qx}"
+                );
+                qc > fc && fx == same_n && qx == same_n
+            }
+            (None, None) => {
+                println!(
+                    "ctx arm q8: both loads whole, the resident's drop {d} against the planes' \
+                     {plane_drop}"
+                );
+                d == plane_drop
+            }
+            _ => {
+                println!("ctx arm q8: one load placed and the other whole");
+                false
+            }
         };
         println!(
-            "ctx arm q8: residents f16 {f16_resident} q8_0 {q8_resident} at the f16 context \
-                 {same_n}, the planes' delta at most {ceiling} B",
+            "ctx arm q8: cache f16 {f16_cache} q8_0 {q8_cache}, drop {plane_drop} against ceiling \
+             {ceiling}; residents f16 {f16_resident} q8_0 {q8_resident} at context {same_n}",
         );
-        check(ok, "q8_resident_drops_by_the_planes", dropped);
+        check(ok, "q8_resident_drops_by_the_planes", planes_held && spent);
         // The load names the format it holds. FAIL-first: a flag the seat
         // ignores loads the f16 planes and says so.
         let caches = seat_log(&same_err)?
@@ -1308,7 +1349,7 @@ mod gate {
     /// 27B: 24 query heads over 4 key-value heads): the server of
     /// `--cache-type-k q8_0` at the default arm's context exits before it
     /// listens, and its stderr names the cache's flash as the reason. The
-    /// q8_0 delta and cache-word clauses (`q8_resident_drops_by_the_planes`,
+    /// q8_0 plane and cache-word clauses (`q8_resident_drops_by_the_planes`,
     /// `q8_load_names_its_cache`) print `n/a` for it. FAIL-first: a server
     /// that listens on this file (a pair pass for the q8_0 cache) leaves the
     /// clause red; its owner then replaces the clause with those two.
@@ -1360,12 +1401,14 @@ mod gate {
     }
 
     /// The terms of one whole-fit line (`whole fit at ctx …: the whole load
-    /// on …`): its `need`, that need less its cache term (the terms no
-    /// context moves at or past the floor), what the card had, the census
-    /// reading inside its parentheses, and whether it says the load fits. A
-    /// line without its terms is a named error.
+    /// on …`): its `need`, its `cache` term (the planes' bytes), that need
+    /// less the cache (the terms no context moves at or past the floor),
+    /// what the card had, the census reading inside its parentheses, and
+    /// whether it says the load fits. A line without its terms is a named
+    /// error.
     struct WholeTerms<'a> {
         need: u64,
+        cache: u64,
         rest: u64,
         budget: u64,
         census: &'a str,
@@ -1395,6 +1438,7 @@ mod gate {
             .ok_or_else(|| format!("the whole-fit line's cache passes its need: {line}"))?;
         Ok(WholeTerms {
             need,
+            cache,
             rest,
             budget,
             census: census.trim_end_matches(')'),
@@ -1437,6 +1481,7 @@ mod gate {
             budget,
             census,
             fits: whole,
+            ..
         } = whole_terms(line)?;
         // The whole load's need at `ctx` positions, the line's other terms kept.
         let need_at = |ctx: u64| -> Result<u64, GateError> {
@@ -2348,9 +2393,11 @@ mod gate {
     /// started with `BLOOMERY_STEP_STATS=1` and the arm's flags and
     /// environment into its own directory: two greedy streamed requests of
     /// the slots clause's prompts, each first run alone on that server and
-    /// then both together, the `slots round` records between read back. On
-    /// the whole-card arm every together-run record holds `passes=1`
-    /// (`slots_rounds_run_one_pass`); on both arms the window holds a round
+    /// then both together, the `slots round` records between read back. The
+    /// no-flag arm follows the load it printed: no plan, and every
+    /// together-run record holds `passes=1` (`slots_rounds_run_one_pass`);
+    /// a plan, and every record holds `passes=rows`
+    /// (`slots_rounds_run_in_turn`). On both arms the window holds a round
     /// of both ([`rounds_hold_a_round_of_both`]: at least one record of
     /// `rows=2` — the records carry no round of one stepping slot, so the
     /// records cannot see one-slot stretches, and the window's solo count
@@ -2426,6 +2473,23 @@ mod gate {
             // of the busy rows on the whole-card load, a select and a step a slot beside the host
             // tier (`qwen3::pass_of`); the rounds below hold the records to the same shape.
             let log = std::fs::read_to_string(&err_log)?;
+            // PIN(2026-10-22): the no-flag arm is one pass only while it
+            // prints no plan (the whole model). A plan is the placed load —
+            // the whole load does not fit at this total, the same fact
+            // `unplaced_default_names_itself` holds — and `pass_of` names
+            // turns. The word and the records follow that line.
+            // FAIL-first: a load with no plan whose records hold `passes=rows`,
+            // or a load with a plan whose records hold `passes=1`.
+            let one_pass = if one_pass {
+                let plan = routed_split(&seat_records(&log, &err_log))?;
+                println!(
+                    "{dir_name}: plan (host, card, ctx) {plan:?}; a round is {}",
+                    if plan.is_none() { "one pass" } else { "turns" }
+                );
+                plan.is_none()
+            } else {
+                one_pass
+            };
             let parallel = log.lines().find(|l| l.starts_with("parallel rule="));
             println!("{dir_name}: {parallel:?}");
             check(
@@ -2508,10 +2572,10 @@ mod gate {
                 window,
                 solo,
             );
-            if one_pass {
+            if prefix.is_empty() {
                 // The tokens decoded beyond the two prompts' first: each
                 // request's `n_predict` less one, its first token being the
-                // prompt's own last step.
+                // prompt's own last step. The no-flag arm, whole or placed.
                 let sum: u64 = rows.iter().sum();
                 let want = 2 * (SLOTS_PREDICT - 1) as u64;
                 println!(
@@ -3371,9 +3435,42 @@ mod gate {
         Ok(())
     }
 
-    /// `generate_qwen3moe --arm <prompt>/N … --last-step` on `model`, an arm
-    /// a prompt; its `tokens` lines in order.
-    fn cli(model: &Path, prompts: &[&[u32]], dir: &Path) -> Result<Vec<Vec<u32>>, GateError> {
+    /// The whole-fit verdict's cache term at `ctx`: the planes' bytes.
+    fn cache_term(log: &str, ctx: u64) -> Result<u64, GateError> {
+        let head = format!("whole fit at ctx {ctx}: ");
+        let line = log
+            .lines()
+            .find(|l| l.starts_with(&head))
+            .ok_or_else(|| format!("no whole-fit line at context {ctx}"))?;
+        Ok(whole_terms(line)?.cache)
+    }
+
+    /// One `plan` record's routed split `(host_experts, card_experts, ctx_max)`,
+    /// or none when the load printed no plan (the whole model on the card).
+    /// More than one is a named error.
+    fn routed_split(log: &record::Log) -> Result<Option<(u64, u64, u64)>, GateError> {
+        let plans = log.all(&record::PLAN38)?;
+        match plans.as_slice() {
+            [] => Ok(None),
+            [p] => Ok(Some((
+                p.u64("host_experts")?,
+                p.u64("card_experts")?,
+                p.u64("ctx_max")?,
+            ))),
+            _ => Err(format!("{} plan records, the clause wants one split", plans.len()).into()),
+        }
+    }
+
+    /// `generate_qwen3moe --arm <prompt>/N --ctx <ctx> … --last-step` on
+    /// `model`, an arm a prompt; its `tokens` lines in order. `ctx` is the
+    /// server's loaded context: the CLI's own default plans a different
+    /// split of the routed experts, and the two legs do not sum in one order.
+    fn cli(
+        model: &Path,
+        prompts: &[&[u32]],
+        ctx: u64,
+        dir: &Path,
+    ) -> Result<Vec<Vec<u32>>, GateError> {
         let exe = beside("generate_qwen3moe")?;
         let mut args = Vec::new();
         for p in prompts {
@@ -3381,6 +3478,9 @@ mod gate {
             args.push("--arm".to_owned());
             args.push(format!("{}/{N}", ids.join(",")));
         }
+        // The server's context, so the CLI's plan is the server's split.
+        args.push("--ctx".to_owned());
+        args.push(ctx.to_string());
         args.push("--last-step".to_owned());
         let out = Command::new(&exe)
             .args(&args)
@@ -4381,13 +4481,38 @@ mod gate {
                 continue;
             };
             let prompts: Vec<&[u32]> = answers.iter().map(|a| a.prompt.as_slice()).collect();
-            let references = cli(model, &prompts, &dir)?;
+            let references = cli(model, &prompts, default_n, &dir)?;
             let mut agree_all = true;
             for (ans, reference) in answers.iter().zip(&references) {
                 println!("cli tokens {reference:?}");
                 agree_all &= agree(&ans.tokens, &ans.stop, reference);
             }
-            check(&mut ok, "completion_ids_are_the_cli_ids", agree_all);
+            // Both absent is the whole model on the card. Both present must
+            // name the same host experts, card experts and context, and that
+            // context is the server's loaded one. One of each is a different
+            // split, which the ids are not held across.
+            let server_split = routed_split(&seat_log(&dir.join("server.err"))?)?;
+            let cli_text = std::fs::read_to_string(dir.join("gen.log"))?;
+            let cli_split = routed_split(
+                &record::Log::of(&cli_text, &[&record::PLAN38])
+                    .named(dir.join("gen.log").display().to_string()),
+            )?;
+            println!(
+                "cli split (host, card, ctx) {cli_split:?} against the server's {server_split:?} \
+                 at context {default_n}"
+            );
+            let same_split = match (server_split, cli_split) {
+                (None, None) => true,
+                (Some((sh, sc, sx)), Some((ch, cc, cx))) => {
+                    sh == ch && sc == cc && sx == cx && sx == default_n
+                }
+                _ => false,
+            };
+            check(
+                &mut ok,
+                "completion_ids_are_the_cli_ids",
+                agree_all && same_split,
+            );
             ctx_default(model, seat, &dir, default_n, &mut ok)?;
             plan_flag_stops_before_the_load(model, seat, &dir, &mut ok)?;
             ctx_past_the_trained_is_refused_by_name(model, &dir, &mut ok)?;

@@ -16,7 +16,7 @@
 //! The file is checked against [`dspark::inventory`] before anything is
 //! uploaded: an absent, misshapen or unread tensor is refused by name.
 
-use bloomery_gpu::dspark::head::HeadWeights;
+use bloomery_gpu::dspark::head::{HeadTail, HeadWeights, MarkovTail};
 use bloomery_gpu::dspark::{EmbedSource, FcWeights, HeadSource, Q8Rows, TargetHead};
 use bloomery_gpu::mxfp4_sel::MxStack;
 use bloomery_gpu::weights::{DevWeight, Weights};
@@ -724,10 +724,12 @@ pub fn owner_inputs(
         norm: w.take_f32(names::output_norm(), n_embd)?,
         eps,
         source: HeadSource::Target(TargetHead::Q6K(w.take_projection()?)),
-        markov_w1,
-        markov_w2,
-        to_target: None,
-        conf: None,
+        tail: HeadTail::Markov(MarkovTail {
+            markov_w1,
+            markov_w2,
+            to_target: None,
+            conf: None,
+        }),
     };
     Ok((fc, head, EmbedSource::Target))
 }

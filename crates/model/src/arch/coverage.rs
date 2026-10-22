@@ -16,8 +16,12 @@
 //! against the whole tree: a need any program's row covers, and a tensor type
 //! any program's pin reads, is not an item; the program itself is one.
 
-use bloomery_placement::accepts::{BOLT_LEG, embed_of_widened, head_of_widened, qwen3moe_dense};
+use bloomery_placement::accepts::{
+    BOLT_LEG, dense_by_name, embed_of_widened, head_of_widened, leg_arms, qwen3moe_dense,
+    resident_down_runs,
+};
 pub use bloomery_placement::accepts::{Program, program_of, qwen35_down, qwen35_gate_up};
+use bloomery_placement::accepts::{prompt_leg_down, prompt_leg_gate_up};
 pub use bloomery_placement::kernels::{DownEntry, GateUpEntry, SiteEntry};
 use gguf::GgmlType;
 use models::shape::{RouterBody, gqa_row, gqa_row_v, select_router};
@@ -173,9 +177,10 @@ pub const AVAILABLE: &[Available] = &[
     Available {
         programs: &[Program::NemotronHMoeBody],
         at: "models/src/shape.rs ROUTERS, the BiasedSigmoid body at 240, 304, 368, 432 and 496 \
-             (gpu/src/arch/nemotron_h_moe/router.rs)",
+             with the top 9 and at 128 with the top 6 (gpu/src/arch/nemotron_h_moe/router.rs)",
         runs: |n| {
-            matches!(n, Need::Router(s) if s.top_k == 9) && routes(n, &[RouterBody::BiasedSigmoid])
+            matches!(n, Need::Router(s) if NEMOTRON_ROUTERS.contains(&(s.experts, s.top_k)))
+                && routes(n, &[RouterBody::BiasedSigmoid])
         },
     },
     Available {
@@ -201,14 +206,14 @@ pub const AVAILABLE: &[Available] = &[
     Available {
         programs: &[Program::NemotronHMoeBody],
         at: "gpu/src/arch/nemotron_h_moe/moe.rs (the shared expert, one-expert iq2_xxs_gemv_sel \
-             stacks)",
+             stacks or a q8_0 site)",
         runs: |n| {
             matches!(
                 n,
                 Need::Shared {
                     ff,
                     sigmoid_gate: false,
-                } if ff.is_multiple_of(256)
+                } if ff.is_multiple_of(32)
             )
         },
     },
@@ -402,8 +407,9 @@ pub const AVAILABLE: &[Available] = &[
             Program::Glm5nextBody,
             Program::Mimo2Body,
             Program::Solar2Body,
+            Program::Raon1Body,
         ],
-        at: "models/src/shape.rs ROUTERS, the BiasedSigmoid body (gpu-deepseek41 router: glm5next at 288 experts, mimo2 at 256, solar2 at 320)",
+        at: "models/src/shape.rs ROUTERS, the BiasedSigmoid body (gpu-deepseek41 router: glm5next at 288 experts, mimo2 at 256, solar2 at 320; gpu/src/route_body.rs sigmoid_128_6: raon1 and nemotron_h_moe at 128)",
         runs: |n| routes(n, &[RouterBody::BiasedSigmoid]),
     },
     Available {
@@ -709,7 +715,137 @@ pub const AVAILABLE: &[Available] = &[
         at: "gpu/src/site.rs gemm (output); gpu-gemma-embedding2/src/pass.rs mean",
         runs: |n| matches!(n, Need::Pooled { proj } if matches!(proj.as_slice(), [768] | [3072, 768])),
     },
+    Available {
+        programs: &[Program::Raon1Body],
+        at: "gpu/src/arch/raon1/rda.rs (the common KDA mixer, linear/mixer_kda.rs, with the write gate \
+             linear/write_gate.rs: HEAD, CONV_TAPS, a bounded sigmoid decay)",
+        runs: |n| {
+            matches!(
+                n,
+                Need::DeltaRule {
+                    kind: DeltaKind::Rda {
+                        gate: KdaGate::Sigmoid { lower_bound },
+                    },
+                    k_heads,
+                    v_heads,
+                    d: 128,
+                    conv: 4,
+                } if k_heads == v_heads && *k_heads > 0 && *lower_bound < 0.0
+            )
+        },
+    },
+    Available {
+        programs: &[Program::Raon1Body],
+        at: "gpu/src/arch/raon1/mla.rs (the absorbed heads over gpu/src/latent.rs LATENT, \
+             latent_extra_rms_append)",
+        runs: |n| {
+            matches!(
+                n,
+                Need::Latent {
+                    latent: 512,
+                    rope: 0,
+                    up: LatentUp::Absorbed { qk: 192, v: 128 }
+                }
+            )
+        },
+    },
+    Available {
+        programs: &[Program::Raon1Body],
+        at: "gpu/src/latent.rs latent_extra_rms_append (the extra values first, raw, at most 128)",
+        runs: |n| matches!(n, Need::LatentPe { width } if (1..=128).contains(width)),
+    },
+    Available {
+        programs: &[Program::Raon1Body],
+        at: "gpu/src/arch/raon1/mla.rs (attn_gate, then gpu/src/linear/out_gate.rs)",
+        runs: |n| matches!(n, Need::LatentOutGate),
+    },
+    Available {
+        programs: &[Program::Raon1Body],
+        at: "gpu/src/arch/raon1/ffn.rs Glu (the gate and up sites, gpu/src/elem.rs enqueue_situ, the \
+             down site)",
+        runs: |n| matches!(n, Need::Situ { ff } if ff.is_multiple_of(32)),
+    },
+    Available {
+        programs: &[Program::Raon1Body],
+        at: "gpu/src/arch/raon1/ffn.rs (the card leg's gate·up `_sel` under kquant::Act::Situ, \
+             SITU_LINEAR_BETA)",
+        runs: |n| {
+            matches!(
+                n,
+                Need::ExpertAct {
+                    shared: false,
+                    act
+                } if situ_runs(act)
+            )
+        },
+    },
+    Available {
+        programs: &[Program::Raon1Body],
+        at: "gpu/src/arch/raon1/ffn.rs Routed.shared (the shared expert's Glu block, added after \
+             the routed sum)",
+        runs: |n| {
+            matches!(
+                n,
+                Need::Shared {
+                    ff,
+                    sigmoid_gate: false,
+                } if ff.is_multiple_of(32)
+            )
+        },
+    },
+    Available {
+        programs: &[Program::Raon1Body],
+        at: "gpu/src/arch/raon1/ffn.rs Routed.shared (gpu/src/elem.rs enqueue_situ between the \
+             shared expert's gate·up and down sites, SITU_LINEAR_BETA)",
+        runs: |n| {
+            matches!(
+                n,
+                Need::ExpertAct {
+                    shared: true,
+                    act
+                } if situ_runs(act)
+            )
+        },
+    },
+    Available {
+        programs: &[Program::Raon1Body],
+        at: "gpu/src/arch/raon1/mhc.rs STREAMS (raon_hc_route, raon_hc_fold, raon_hc_post, raon_hc_mean)",
+        runs: |n| {
+            matches!(
+                n,
+                Need::HcChart {
+                    streams: 4,
+                    collapse: Collapse::Mean
+                }
+            )
+        },
+    },
+    Available {
+        programs: &[Program::Raon1Body],
+        at: "gpu/src/arch/raon1/body.rs Mixer::Rda (the state, the stamp and the conv ring, one lane)",
+        runs: |n| matches!(n, Need::RecurrentState),
+    },
+    Available {
+        programs: &[Program::Raon1Body],
+        at: "gpu/src/arch/raon1/body.rs Mixer (a delta or a latent mixer per layer's kind)",
+        runs: |n| matches!(n, Need::MixedTrunk),
+    },
 ];
+
+/// The `value_beta` of the SiTU rule the device runs (`gpu/src/kquant/act.rs`
+/// `SITU_LINEAR_BETA`): the one value the references' files carry.
+const SITU_VALUE_BETA: f32 = 25.0;
+
+/// Whether the device runs `act`: SiTU at a finite positive gate beta and the
+/// one value beta ([`SITU_VALUE_BETA`]), the pair `Act::code` of the card's
+/// gate·up kernels takes.
+fn situ_runs(act: &models::Act) -> bool {
+    matches!(
+        act,
+        models::Act::Situ { gate_beta, value_beta }
+            if gate_beta.is_finite() && *gate_beta > 0.0 && value_beta.to_bits() == SITU_VALUE_BETA.to_bits()
+    )
+}
 
 /// Whether the K192 flash row ([`gqa_row_v`] at head 192, value 128) takes
 /// `group` query heads a key head, with the window, sinks and value scale
@@ -910,34 +1046,10 @@ const TYPE_PINS: &[TypePin] = &[
     },
     TypePin {
         programs: &[Program::Qwen38Body],
-        role: Role::Attention,
-        matrices: true,
-        names: Some(|n| !indexer_projection(n)),
-        what: "attention matrices (the body reads q8_0 and bf16)",
-        reads: &[GgmlType::Q8_0, GgmlType::BF16],
-    },
-    TypePin {
-        programs: &[Program::Qwen38Body],
-        role: Role::Attention,
-        matrices: true,
-        names: Some(indexer_projection),
-        what: "indexer projections (the body reads bf16)",
-        reads: &[GgmlType::BF16],
-    },
-    TypePin {
-        programs: &[Program::Qwen38Body],
         role: Role::HyperConnection,
         matrices: true,
         names: None,
         what: "hyper-connection down and up (the body reads q8_0 and bf16)",
-        reads: &[GgmlType::Q8_0, GgmlType::BF16],
-    },
-    TypePin {
-        programs: &[Program::Qwen38Body],
-        role: Role::SharedExpert,
-        matrices: true,
-        names: None,
-        what: "shared expert (the body reads q8_0 and bf16)",
         reads: &[GgmlType::Q8_0, GgmlType::BF16],
     },
     // The qwen4exp load keeps a bf16 head and embedding in their words
@@ -1123,22 +1235,6 @@ const TYPE_PINS: &[TypePin] = &[
         reads: &[GgmlType::Q8_0],
     },
     TypePin {
-        programs: &[Program::NemotronHMoeBody],
-        role: Role::RoutedExperts,
-        matrices: false,
-        names: None,
-        what: "routed experts (the body's iq2_xxs_gemv_sel reads iq2_xxs)",
-        reads: &[BOLT_LEG],
-    },
-    TypePin {
-        programs: &[Program::NemotronHMoeBody],
-        role: Role::SharedExpert,
-        matrices: false,
-        names: None,
-        what: "shared expert (the body's iq2_xxs_gemv_sel reads iq2_xxs)",
-        reads: &[BOLT_LEG],
-    },
-    TypePin {
         programs: &[Program::GemmaEmbedding2Body],
         role: Role::Attention,
         matrices: true,
@@ -1170,6 +1266,61 @@ const TYPE_PINS: &[TypePin] = &[
         what: "output projection (the encoder reads q8_0)",
         reads: &[GgmlType::Q8_0],
     },
+    TypePin {
+        programs: &[Program::Raon1Body],
+        role: Role::Attention,
+        matrices: true,
+        names: None,
+        what: "attention and delta-rule matrices (the body reads q3_K, q4_K, q5_K, q6_K and q8_0 \
+               sites and the f16 rows it widens)",
+        reads: RAON1_PROJ,
+    },
+    TypePin {
+        programs: &[Program::Raon1Body],
+        role: Role::DenseFfn,
+        matrices: true,
+        names: None,
+        what: "dense FFN (the body reads q4_K, q5_K, q6_K, q8_0 and q5_0)",
+        reads: RAON1_FFN,
+    },
+    TypePin {
+        programs: &[Program::Raon1Body],
+        role: Role::SharedExpert,
+        matrices: true,
+        names: None,
+        what: "shared expert (the body reads q4_K, q5_K, q6_K, q8_0 and q5_0)",
+        reads: RAON1_FFN,
+    },
+    TypePin {
+        programs: &[Program::Raon1Body],
+        role: Role::HyperConnection,
+        matrices: true,
+        names: None,
+        what: "hyper-connection fn (the body reads the f16 rows it widens to f32)",
+        reads: &[GgmlType::F16],
+    },
+];
+
+/// The types a raon1 attention or delta-rule matrix reads: the sites'
+/// (`gpu/src/arch/raon1/{rda,mla}.rs` `DENSE`) and the f16 rows `Weights::load`
+/// widens (the delta layers' `ssm_beta`, `ssm_rda`, `ssm_f_a` and `ssm_f_b`).
+const RAON1_PROJ: &[GgmlType] = &[
+    GgmlType::Q3_K,
+    GgmlType::Q4_K,
+    GgmlType::Q5_K,
+    GgmlType::Q6_K,
+    GgmlType::Q8_0,
+    GgmlType::F16,
+];
+
+/// The types a raon1 feed-forward site reads (`gpu/src/arch/raon1/body.rs`
+/// `FFN_TYPES`, each a launch of `gpu/src/site.rs`).
+const RAON1_FFN: &[GgmlType] = &[
+    GgmlType::Q4_K,
+    GgmlType::Q5_K,
+    GgmlType::Q6_K,
+    GgmlType::Q8_0,
+    GgmlType::Q5_0,
 ];
 
 /// A tensor family whose type a program pins by the card kernel table's
@@ -1190,14 +1341,32 @@ struct RowPin {
 /// body's attention sites ([`qwen3moe_dense`]: the table's dense row kept to
 /// the forms that body's arena carries, the fused Q4_K ones among them), head
 /// ([`head_of_widened`]: `head.rs`) and token embedding ([`embed_of_widened`]:
-/// `elem.rs`), each the table's row but BF16, and routed stacks ([`qwen35_gate_up`], [`qwen35_down`]: the FFN
-/// dispatch both bodies share), and `Body35`'s FFN ([`qwen35_gate_up`],
-/// [`qwen35_down`], [`qwen35_shared`]),
+/// `elem.rs`), each the table's row but BF16, and routed stacks (the qwen3moe
+/// body's and `Body35`'s [`prompt_leg_gate_up`], [`prompt_leg_down`]: the
+/// FFN dispatch and the common card leg), and `Body35`'s shared expert
+/// ([`qwen35_shared`]),
 /// and the glm5next and mimo2 bodies' token embedding (the host's rows,
 /// `GgmlType::has_dequant`), and the gemma-embedding2 encoder's token table
 /// and per-layer input projection (the host's rows), each `what` naming the
 /// types its row takes or the table row it follows.
 const ROW_PINS: &[RowPin] = &[
+    // PIN(2026-10-22): Qwen38 dense pins admit MXFP8/FP8_B128 and Q8_0 indexers via BY_NAME; the old MXFP8 refusal fails the new coverage test (PR FAIL-first).
+    RowPin {
+        program: Program::Qwen38Body,
+        role: Role::Attention,
+        matrices: true,
+        names: None,
+        what: "attention matrices (the types dense_by_name names)",
+        row: |ty| dense_by_name(ty).is_some(),
+    },
+    RowPin {
+        program: Program::Qwen38Body,
+        role: Role::SharedExpert,
+        matrices: true,
+        names: None,
+        what: "shared expert (the types dense_by_name names)",
+        row: |ty| dense_by_name(ty).is_some(),
+    },
     RowPin {
         program: Program::Qwen3moeBody,
         role: Role::Attention,
@@ -1267,16 +1436,16 @@ const ROW_PINS: &[RowPin] = &[
         role: Role::RoutedExperts,
         matrices: true,
         names: Some(routed_gate_up),
-        what: "routed experts gate and up (the body reads q4_K and q5_K)",
-        row: |ty| qwen35_gate_up(ty).is_some(),
+        what: "routed experts gate and up (the body reads q4_K, q5_K, q6_K, iq3_xxs, iq3_s, iq4_xs and q8_0)",
+        row: prompt_leg_gate_up,
     },
     RowPin {
         program: Program::Qwen3moeBody,
         role: Role::RoutedExperts,
         matrices: true,
         names: Some(routed_down),
-        what: "routed experts down (the body reads q4_K, q5_K and q6_K)",
-        row: |ty| qwen35_down(ty).is_some(),
+        what: "routed experts down (the body reads q4_K, q5_K, q6_K, iq3_xxs, iq3_s, iq4_xs, q5_1, q8_0 and iq4_nl)",
+        row: prompt_leg_down,
     },
     RowPin {
         program: Program::Qwen35Body,
@@ -1291,16 +1460,57 @@ const ROW_PINS: &[RowPin] = &[
         role: Role::RoutedExperts,
         matrices: true,
         names: Some(routed_gate_up),
-        what: "routed experts gate and up (the body reads q4_K and q5_K)",
-        row: |ty| qwen35_gate_up(ty).is_some(),
+        what: "routed experts gate and up (the body reads q4_K, q5_K, q6_K, iq3_xxs, iq3_s, iq4_xs and q8_0)",
+        row: prompt_leg_gate_up,
     },
     RowPin {
         program: Program::Qwen35Body,
         role: Role::RoutedExperts,
         matrices: true,
         names: Some(routed_down),
-        what: "routed experts down (the body reads q4_K, q5_K and q6_K)",
-        row: |ty| qwen35_down(ty).is_some(),
+        what: "routed experts down (the body reads q4_K, q5_K, q6_K, iq3_xxs, iq3_s, iq4_xs, q5_1, q8_0 and iq4_nl)",
+        row: prompt_leg_down,
+    },
+    RowPin {
+        program: Program::Raon1Body,
+        role: Role::Head,
+        matrices: true,
+        names: None,
+        what: "output head (the types head_of_widened names)",
+        row: |ty| head_of_widened(ty).is_some(),
+    },
+    RowPin {
+        program: Program::Raon1Body,
+        role: Role::TokenEmbedding,
+        matrices: true,
+        names: None,
+        what: "token embedding (the card's rows: the types embed_of_widened names)",
+        row: |ty| embed_of_widened(ty).is_some(),
+    },
+    RowPin {
+        program: Program::Raon1Body,
+        role: Role::RoutedExperts,
+        matrices: true,
+        names: Some(routed_gate_up),
+        what: "routed experts gate and up (the card leg's types: kernels::card_gate_up_runs)",
+        row: crate::placement::kernels::card_gate_up_runs,
+    },
+    RowPin {
+        program: Program::Raon1Body,
+        role: Role::RoutedExperts,
+        matrices: true,
+        names: Some(routed_down),
+        what: "routed experts down (the card leg's types and q5_0: accepts::resident_down_runs)",
+        row: resident_down_runs,
+    },
+    RowPin {
+        program: Program::NemotronHMoeBody,
+        role: Role::SharedExpert,
+        matrices: false,
+        names: None,
+        what: "shared expert (the card's iq2_xxs_gemv_sel reads iq2_xxs, its q8_0 site reads \
+               q8_0)",
+        row: |ty| ty == BOLT_LEG || ty == GgmlType::Q8_0,
     },
 ];
 
@@ -1352,10 +1562,11 @@ fn qwen38_card_routed(ty: GgmlType) -> bool {
     crate::arch::qwen35moe::place::card_routed(ty).is_some()
 }
 
-/// The glm5next body's card rule: the types its card experts load
-/// ([`card_routed`](crate::arch::glm5next::place::card_routed)).
+/// The glm5next body's card rule: a type its card leg reads in some part
+/// ([`leg_arms`], whose arms its plan rule reads by part), the type union
+/// coverage reads as it does qwen4exp's.
 fn glm5next_card_routed(ty: GgmlType) -> bool {
-    crate::arch::glm5next::place::card_routed(ty).is_some()
+    leg_arms(Program::Glm5nextBody).is_some_and(|a| (a.gate_up)(ty) || (a.down)(ty))
 }
 
 /// gemma-embedding2's projection of the token rows to the per-layer inputs,
@@ -1365,12 +1576,10 @@ fn per_layer_model_proj(name: &str) -> bool {
     name == crate::arch::gemma_embedding2::names::PER_LAYER_MODEL_PROJ
 }
 
-/// A qwen4exp selector's key or query projection, which `Body38` reads as
-/// bf16 (`plan38::plans`), where it reads every other attention matrix as
-/// q8_0 or bf16.
-fn indexer_projection(name: &str) -> bool {
-    name.ends_with(".indexer.k_proj.weight") || name.ends_with(".indexer.q_proj.weight")
-}
+/// The `nemotron_h_moe` router instances: the (experts, kept) pairs
+/// `gpu/src/arch/nemotron_h_moe/router.rs` is built for.
+const NEMOTRON_ROUTERS: &[(u32, u32)] =
+    &[(240, 9), (304, 9), (368, 9), (432, 9), (496, 9), (128, 6)];
 
 /// The type pins of `program` (every program's when `None`), [`TYPE_PINS`]
 /// then [`ROW_PINS`], that tensor `t` is of a type none of reads, as items:
@@ -1489,7 +1698,7 @@ pub fn check_with(
                     }
                 }
                 // The glm5next body's rule: a stack passes when the program
-                // can run it — on the card by its expert rule (`card_routed`)
+                // can run it — on the card by its leg's arms (`leg_arms`)
                 // or on the host by a qdot fused kernel at the stack's row
                 // width ([`routed_unrun`], the one owner). A layer with a
                 // stack the card experts do not read keeps all its experts on
@@ -1508,11 +1717,11 @@ pub fn check_with(
                         at(t.layer, Need::RoutedFormat(t.ty));
                     }
                 }
-                // The mimo2 and solar2 bodies' rule: the same — a stack passes
-                // when the common card leg runs its type (`kernels::card_runs`)
-                // or the host runs it by a qdot fused kernel at the stack's row
-                // width.
-                Some(Program::Mimo2Body | Program::Solar2Body) => {
+                // The mimo2, solar2 and minimax-m3 bodies' rule: the same — a
+                // stack passes when the common card leg runs its type
+                // (`kernels::card_runs`) or the host runs it by a qdot fused
+                // kernel at the stack's row width.
+                Some(Program::Mimo2Body | Program::Solar2Body | Program::MiniMaxM3Body) => {
                     if routed_unrun(t, crate::placement::kernels::card_runs) {
                         at(t.layer, Need::RoutedFormat(t.ty));
                     }
@@ -1528,16 +1737,20 @@ pub fn check_with(
                 // pins' types: a part of another type is one of their items,
                 // by name and part (the default expert rule's card formats
                 // would pass q3_K and q6_K gate·up to the load's refusal).
-                Some(Program::Qwen3moeBody | Program::Qwen35Body) => {}
+                Some(Program::Qwen3moeBody | Program::Qwen35Body | Program::Raon1Body) => {}
                 // These bodies are dense: a routed stack is an item.
                 Some(Program::NemotronHBody | Program::GemmaEmbedding2Body) => {
                     at(t.layer, Need::RoutedFormat(t.ty));
                 }
-                // The latent MoE body's rule (`routed_rule`'s arm): its up
-                // and down launches read [`BOLT_LEG`] stacks, every part of
-                // another type is an item.
+                // The latent MoE body's rule: a stack passes when the
+                // program can run it — on the card by its expert rule
+                // ([`BOLT_LEG`], `routed_rule`'s arm) or on the host by a
+                // qdot fused kernel at the stack's row width
+                // ([`routed_unrun`], the one owner). A layer with a stack the
+                // card experts do not read keeps all its experts on the
+                // host.
                 Some(Program::NemotronHMoeBody) => {
-                    if t.ty != BOLT_LEG {
+                    if routed_unrun(t, |ty| ty == BOLT_LEG) {
                         at(t.layer, Need::RoutedFormat(t.ty));
                     }
                 }
@@ -1837,12 +2050,21 @@ mod tests {
                 )],
             );
         }
-        // The routed stacks are the FFN dispatch's rows (`qwen35_gate_up`,
-        // `qwen35_down`): a Q6_K gate·up is refused by name, a Q5_K down runs.
+        // The routed stacks are the placed card leg's rows (`prompt_leg_gate_up`,
+        // `prompt_leg_down`): a Q3_K gate·up is refused by name, a Q6_K gate·up
+        // and a Q5_K down run.
+        check(
+            "routed gate q3_K".into(),
+            matrix("ffn_gate_exps.weight", Role::RoutedExperts, GgmlType::Q3_K),
+            &[
+                "q3_K routed experts gate and up (the body reads q4_K, q5_K, q6_K, iq3_xxs, iq3_s, iq4_xs and q8_0)"
+                    .to_string(),
+            ],
+        );
         check(
             "routed gate q6_K".into(),
             matrix("ffn_gate_exps.weight", Role::RoutedExperts, GgmlType::Q6_K),
-            &["q6_K routed experts gate and up (the body reads q4_K and q5_K)".to_string()],
+            &none,
         );
         check(
             "routed down q5_K".into(),
@@ -1905,44 +2127,49 @@ mod tests {
         }
     }
 
-    /// The whole-card bodies' routed pins, by part: both bodies run the FFN
-    /// dispatch's rows of the card kernel table, q4_K or q5_K gate and up
-    /// and q4_K, q5_K or q6_K down — the parts the default expert rule's card
-    /// formats pass (q3_K, q6_K, q8_0 gate·up; q3_K, q8_0 down) reach the
-    /// loads' refusal otherwise.
+    /// The qwen3moe family's routed pins, by part: both bodies run the FFN
+    /// dispatch's rows of the card kernel table and the common card leg's
+    /// beside them (`prompt_leg_gate_up`, `prompt_leg_down`), one pair for the
+    /// family's placed side.
     // PIN(2026-10-10): `Body35`'s routed pins moved from the joined stacks'
     // q4_K gate·up and q4_K or q6_K down to the table's rows its dispatch
     // runs (`qwen35_gate_up`, `qwen35_down`): q5_K gate·up and down left its
     // refused types; red on the tree before the move by those two. The
     // qwen3moe body's moved the same way (q4_K gate·up, q4_K or q6_K down
     // before): the dispatch is one code path, so one row decides both.
+    // PIN(2026-10-22): `Body35`'s pins moved on to the rows of its placed card
+    // leg (`prompt_leg_gate_up`, `prompt_leg_down`: the dispatch's types
+    // and the common leg's): a q6_K, iq3_xxs, iq4_xs or q8_0 gate·up and an
+    // iq3_xxs, iq4_xs, q5_1, q8_0 or iq4_nl down left its refused types, each a type the
+    // common leg launches with a prompt GEMM; red on the tree before the move
+    // by those. The qwen3moe body's moved with them.
+    // PIN(2026-10-22): the qwen3moe body's pins moved to the same rows
+    // (`prompt_leg_gate_up`, `prompt_leg_down`): its placed side runs the common
+    // leg's layers (`placed_ffn`, one for both bodies); a q6_K, iq3_xxs, iq4_xs
+    // or q8_0 gate·up and an iq3_xxs, iq4_xs, q5_1, q8_0 or iq4_nl down left its
+    // refused types; red on the tree before the move by those.
+    // PIN(2026-10-22): both bodies' pins gain iq3_s on both parts (its prompt
+    // GEMM `gemm_iq3s` gives the table's gemm row `prompt_leg_gate_up` and
+    // `prompt_leg_down` read); red on the tree before the move by those.
     #[test]
-    fn the_whole_card_bodies_read_routed_stacks_by_part() {
+    fn the_qwen3moe_bodies_read_routed_stacks_by_part() {
+        use GgmlType::{
+            IQ2_XS, IQ3_S, IQ3_XXS, IQ4_NL, IQ4_XS, MXFP4, Q3_K, Q4_K, Q5_1, Q5_K, Q6_K, Q8_0,
+        };
         type Parts = (&'static str, &'static [GgmlType], &'static [GgmlType]);
-        let gate_up: Parts = (
-            "q4_K and q5_K",
-            &[GgmlType::Q4_K, GgmlType::Q5_K],
-            &[
-                GgmlType::Q3_K,
-                GgmlType::Q6_K,
-                GgmlType::Q8_0,
-                GgmlType::IQ4_XS,
-            ],
+        let rows: (Parts, Parts) = (
+            (
+                "q4_K, q5_K, q6_K, iq3_xxs, iq3_s, iq4_xs and q8_0",
+                &[Q4_K, Q5_K, Q6_K, IQ3_XXS, IQ3_S, IQ4_XS, Q8_0],
+                &[Q3_K, IQ2_XS, MXFP4],
+            ),
+            (
+                "q4_K, q5_K, q6_K, iq3_xxs, iq3_s, iq4_xs, q5_1, q8_0 and iq4_nl",
+                &[Q4_K, Q5_K, Q6_K, IQ3_XXS, IQ3_S, IQ4_XS, Q5_1, Q8_0, IQ4_NL],
+                &[Q3_K, IQ2_XS, MXFP4],
+            ),
         );
-        let down: Parts = (
-            "q4_K, q5_K and q6_K",
-            &[GgmlType::Q4_K, GgmlType::Q5_K, GgmlType::Q6_K],
-            &[
-                GgmlType::Q3_K,
-                GgmlType::Q8_0,
-                GgmlType::Q5_1,
-                GgmlType::IQ4_NL,
-            ],
-        );
-        let bodies = [
-            (Program::Qwen3moeBody, gate_up, down),
-            (Program::Qwen35Body, gate_up, down),
-        ];
+        let bodies = [Program::Qwen3moeBody, Program::Qwen35Body].map(|p| (p, rows.0, rows.1));
         for (program, gate_up, down) in bodies {
             for (names, part, (reads, runs, refused)) in [
                 (
@@ -1974,25 +2201,102 @@ mod tests {
         }
     }
 
+    /// The raon1 body reads routed stacks by part: a gate and an up of the common leg's gate·up
+    /// types (q4_K, q5_K), a down of its down types or q5_0 (the packed layout); a q8_0 or q6_K gate
+    /// and up and a q6_K down are items by name and part. Mutant: `resident_down_runs` without its
+    /// q5_0 arm.
+    #[test]
+    fn the_raon1_body_reads_routed_stacks_by_part() {
+        let item = |name: &str, ty: GgmlType| {
+            items(Program::Raon1Body, &matrix(name, Role::RoutedExperts, ty))
+        };
+        for name in ["ffn_gate_exps.weight", "ffn_up_exps.weight"] {
+            for ty in [GgmlType::Q4_K, GgmlType::Q5_K] {
+                assert_eq!(item(name, ty), Vec::<String>::new(), "{name} {ty}");
+            }
+            for ty in [GgmlType::Q8_0, GgmlType::Q6_K, GgmlType::Q5_0] {
+                assert_eq!(item(name, ty).len(), 1, "{name} {ty}: {:?}", item(name, ty));
+            }
+        }
+        for ty in [
+            GgmlType::Q4_K,
+            GgmlType::Q5_K,
+            GgmlType::Q8_0,
+            GgmlType::Q5_0,
+        ] {
+            assert_eq!(
+                item("ffn_down_exps.weight", ty),
+                Vec::<String>::new(),
+                "down {ty}"
+            );
+        }
+        assert_eq!(item("ffn_down_exps.weight", GgmlType::Q6_K).len(), 1);
+    }
+
+    /// The device runs SiTU at one value beta and a finite positive gate beta: the raon1 rows
+    /// cover the file's pair and no other. Mutant: the value beta of the row at another value.
+    #[test]
+    fn the_raon1_situ_rows_run_the_one_value_beta() {
+        use super::AVAILABLE;
+        let covered = |need: &Need| {
+            AVAILABLE
+                .iter()
+                .any(|a| a.programs.contains(&Program::Raon1Body) && (a.runs)(need))
+        };
+        let situ = |gate_beta: f32, value_beta: f32| models::Act::Situ {
+            gate_beta,
+            value_beta,
+        };
+        for shared in [false, true] {
+            let need = |act| Need::ExpertAct { shared, act };
+            assert!(covered(&need(situ(4.0, 25.0))), "shared {shared}");
+            for (g, v) in [(4.0, 20.0), (0.0, 25.0), (-1.0, 25.0), (f32::NAN, 25.0)] {
+                assert!(!covered(&need(situ(g, v))), "shared {shared} {g} {v}");
+            }
+        }
+    }
+
     /// The FFN pins are the card kernel table's: over every type id, a
-    /// routed part's matrix is an item (of either body) exactly when
-    /// [`qwen35_gate_up`] or [`qwen35_down`] gives its type no entry, `Body35`'s
-    /// shared expert's exactly when [`qwen35_shared`] does not, and each pin's
-    /// text names the types its row takes (a pin reads no F32 matrix).
+    /// routed part's matrix is an item exactly when its body's rows give its
+    /// type no entry (both bodies': [`prompt_leg_gate_up`],
+    /// [`prompt_leg_down`]), `Body35`'s shared expert's exactly when
+    /// [`qwen35_shared`] does not, and each pin's text names the types its row
+    /// takes (a pin reads no F32 matrix).
     #[test]
     fn the_ffn_pins_are_the_card_kernel_table() {
-        use super::{qwen35_down, qwen35_gate_up, qwen35_shared};
+        use super::{prompt_leg_down, prompt_leg_gate_up, qwen35_shared};
         type Row = fn(GgmlType) -> bool;
-        let parts: [(&str, Role, Row); 3] = [
-            ("ffn_gate_exps.weight", Role::RoutedExperts, |t| {
-                qwen35_gate_up(t).is_some()
-            }),
-            ("ffn_down_exps.weight", Role::RoutedExperts, |t| {
-                qwen35_down(t).is_some()
-            }),
-            ("ffn_up_shexp.weight", Role::SharedExpert, |t| {
-                qwen35_shared(t).is_some()
-            }),
+        let parts: [(&str, Role, Program, Row); 5] = [
+            (
+                "ffn_gate_exps.weight",
+                Role::RoutedExperts,
+                Program::Qwen3moeBody,
+                prompt_leg_gate_up,
+            ),
+            (
+                "ffn_down_exps.weight",
+                Role::RoutedExperts,
+                Program::Qwen3moeBody,
+                prompt_leg_down,
+            ),
+            (
+                "ffn_gate_exps.weight",
+                Role::RoutedExperts,
+                Program::Qwen35Body,
+                prompt_leg_gate_up,
+            ),
+            (
+                "ffn_down_exps.weight",
+                Role::RoutedExperts,
+                Program::Qwen35Body,
+                prompt_leg_down,
+            ),
+            (
+                "ffn_up_shexp.weight",
+                Role::SharedExpert,
+                Program::Qwen35Body,
+                |t| qwen35_shared(t).is_some(),
+            ),
         ];
         let rows = |row: Row| -> Vec<GgmlType> {
             (0..64u32)
@@ -2000,50 +2304,39 @@ mod tests {
                 .filter(|&t| t != GgmlType::F32 && row(t))
                 .collect()
         };
-        let programs = |role: Role| -> &'static [Program] {
-            if role == Role::SharedExpert {
-                &[Program::Qwen35Body]
-            } else {
-                &[Program::Qwen3moeBody, Program::Qwen35Body]
-            }
-        };
-        for (name, role, row) in parts {
-            for program in programs(role) {
-                for id in 0..64u32 {
-                    let ty = GgmlType::from_u32(id);
-                    if ty == GgmlType::F32 {
-                        continue;
-                    }
-                    assert_eq!(
-                        items(*program, &matrix(name, role, ty)).is_empty(),
-                        row(ty),
-                        "{program:?} {name} {ty:?}"
-                    );
+        for (name, role, program, row) in parts {
+            for id in 0..64u32 {
+                let ty = GgmlType::from_u32(id);
+                if ty == GgmlType::F32 {
+                    continue;
                 }
+                assert_eq!(
+                    items(program, &matrix(name, role, ty)).is_empty(),
+                    row(ty),
+                    "{program:?} {name} {ty:?}"
+                );
             }
         }
         // Each pin's text names, in any order, exactly the types its row
         // takes: the list inside its parentheses, "a, b and c".
-        for (name, role, row) in parts {
-            for program in programs(role) {
-                let text = items(*program, &matrix(name, role, GgmlType::BF16));
-                let [text] = text.as_slice() else {
-                    panic!("{program:?} {name}: one item for bf16, got {text:?}");
-                };
-                let list = text
-                    .split_once("(the body reads ")
-                    .and_then(|(_, l)| l.strip_suffix(')'))
-                    .unwrap_or_else(|| panic!("{name}: no type list in {text:?}"));
-                let mut named: Vec<String> = list
-                    .replace(" and ", ", ")
-                    .split(", ")
-                    .map(str::to_string)
-                    .collect();
-                let mut want: Vec<String> = rows(row).iter().map(ToString::to_string).collect();
-                named.sort();
-                want.sort();
-                assert_eq!(named, want, "{program:?} {name}: {text}");
-            }
+        for (name, role, program, row) in parts {
+            let text = items(program, &matrix(name, role, GgmlType::BF16));
+            let [text] = text.as_slice() else {
+                panic!("{program:?} {name}: one item for bf16, got {text:?}");
+            };
+            let list = text
+                .split_once("(the body reads ")
+                .and_then(|(_, l)| l.strip_suffix(')'))
+                .unwrap_or_else(|| panic!("{name}: no type list in {text:?}"));
+            let mut named: Vec<String> = list
+                .replace(" and ", ", ")
+                .split(", ")
+                .map(str::to_string)
+                .collect();
+            let mut want: Vec<String> = rows(row).iter().map(ToString::to_string).collect();
+            named.sort();
+            want.sort();
+            assert_eq!(named, want, "{program:?} {name}: {text}");
         }
     }
 
@@ -2056,6 +2349,9 @@ mod tests {
     /// table names no `Body35` launch for stays an item by name.
     // PIN(2026-10-10): red on the tree before the table's rows (the q5_K
     // down, the q8_0 and q6_K shared experts beside stacks of other types).
+    // PIN(2026-10-22): the q8_0 routed gate·up and down it held as items run on
+    // the common card leg now; the routed items it keeps are types that leg has
+    // no prompt GEMM for (an iq2_xs gate·up, an mxfp4 down).
     #[test]
     fn the_hf_qwen36_layer_shapes_are_no_items() {
         use GgmlType::{Q4_K, Q5_K, Q6_K, Q8_0};
@@ -2099,14 +2395,14 @@ mod tests {
             (
                 "ffn_gate_exps.weight",
                 Role::RoutedExperts,
-                Q8_0,
-                "q8_0 routed experts gate and up (the body reads q4_K and q5_K)",
+                GgmlType::IQ2_XS,
+                "iq2_xs routed experts gate and up (the body reads q4_K, q5_K, q6_K, iq3_xxs, iq3_s, iq4_xs and q8_0)",
             ),
             (
                 "ffn_down_exps.weight",
                 Role::RoutedExperts,
-                Q8_0,
-                "q8_0 routed experts down (the body reads q4_K, q5_K and q6_K)",
+                GgmlType::MXFP4,
+                "mxfp4 routed experts down (the body reads q4_K, q5_K, q6_K, iq3_xxs, iq3_s, iq4_xs, q5_1, q8_0 and iq4_nl)",
             ),
             (
                 "ffn_gate_shexp.weight",
@@ -2303,7 +2599,7 @@ mod tests {
     }
 
     /// A routed stack of a glm5next file passes when the program can run it
-    /// — on the card by the card experts' types (q4_K, q5_K) or on the host
+    /// — on the card by its leg's arms (q4_K, q5_K, nvfp4 in its planes) or on the host
     /// by a fused qdot kernel at its row width, so a layer with a stack the
     /// card does not read keeps its experts on the host — and a type neither
     /// side runs is an item for each layer that holds it, named by its type,
@@ -2312,6 +2608,9 @@ mod tests {
     // to card-or-host so a file's i-quant stacks (iq3_xxs, iq4_xs gate and
     // up or down) are no items; a bf16 stack, which `CardFormat::of` took but
     // no host kernel reads, is an item.
+    // PIN(2026-10-22): the glm5next leg holds NVFP4 stacks in their planes and
+    // quantizes the 32-value form their down reads, so an NVFP4 layer, which
+    // no host kernel reads, is no item (it was one).
     #[test]
     fn a_glm5next_routed_stack_runs_on_a_card_or_the_host() {
         let none = Vec::<(Option<usize>, String)>::new();
@@ -2336,6 +2635,9 @@ mod tests {
             // down) and its NextN layer (q2_K gate and up, q3_K down).
             (GgmlType::IQ2_XS, GgmlType::IQ3_XXS, none.clone()),
             (GgmlType::Q2_K, GgmlType::Q3_K, none.clone()),
+            // The card's alone: NVFP4 in its planes, which no host kernel
+            // reads (mutant: glm5next's rule left on the common leg).
+            (GgmlType::NVFP4, GgmlType::NVFP4, none.clone()),
             // No side: bf16 has no card expert and no fused qdot kernel, as
             // a gate and up or as a down.
             (GgmlType::BF16, GgmlType::Q4_K, item(GgmlType::BF16)),
@@ -2575,6 +2877,46 @@ mod tests {
                     )],
                     "{program:?} {ty}"
                 );
+            }
+        }
+    }
+
+    // PIN(2026-10-22): MXFP8/FP8_B128 dense and Q8_0 indexer refusals were wrong: both walks launch them.
+    #[test]
+    fn the_qwen38_dense_pins_read_the_by_name_sites() {
+        for (name, role, what) in [
+            ("attn_q.weight", Role::Attention, "attention matrices"),
+            (
+                "indexer.q_proj.weight",
+                Role::Attention,
+                "attention matrices",
+            ),
+            (
+                "indexer.k_proj.weight",
+                Role::Attention,
+                "attention matrices",
+            ),
+            ("ffn_gate_shexp.weight", Role::SharedExpert, "shared expert"),
+        ] {
+            for ty in gguf::QROWS
+                .iter()
+                .map(|row| row.ty)
+                .chain([GgmlType::MXFP8, GgmlType::FP8_B128])
+            {
+                let got = items(Program::Qwen38Body, &matrix(name, role, ty));
+                if matches!(
+                    ty,
+                    GgmlType::Q8_0
+                        | GgmlType::BF16
+                        | GgmlType::MXFP8
+                        | GgmlType::FP8_B128
+                        | GgmlType::F32
+                ) {
+                    assert!(got.is_empty(), "{name} {ty}: {got:?}");
+                } else {
+                    assert_eq!(got.len(), 1, "{name} {ty}: {got:?}");
+                    assert!(got[0].starts_with(&format!("{ty} {what}")), "{got:?}");
+                }
             }
         }
     }

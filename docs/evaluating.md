@@ -29,9 +29,9 @@ A checklist for a person or a coding agent (Claude Code, Codex) who wants to run
 8. **Use the model card's sampling.** Qwen3.8 without thinking: `"temperature": 0.7, "top_p": 0.8, "top_k": 20,
    "presence_penalty": 1.5, "chat_template_kwargs": {"enable_thinking": false}`. With thinking on, the answer carries
    `reasoning_content`.
-9. **Images.** Send an image to Qwen3.6 (`--mmproj <file>`, or `--hf` fetches the projector beside the model), V4.1
-   (`--mmproj`) or Clef (`/v1/systemone`) as a base64 `data:` URL. A seat with no encoder answers with an error, not a
-   guess.
+9. **Images.** Send an image to Qwen3.6 (`--mmproj <file>`, or `--hf` fetches the projector beside the model),
+   MiniCPM-V 4.7, Sage-A1.5, V4.1 (`--mmproj`) or Clef (`/v1/systemone`) as a base64 `data:` URL. A seat with no encoder
+   answers with an error, not a guess.
 10. **Agents.** Claude Code: `ANTHROPIC_BASE_URL=http://localhost:8080`. OpenAI clients: base URL
    `http://localhost:8080/v1`. Tool calls work on every generative model.
 11. **When something fails**, the error names the cause (a plan that does not fit lists every term and the
@@ -42,8 +42,9 @@ model files and the reference dumps, and they are not a test suite for an evalua
 
 ## Help wanted: hardware we have not run
 
-We test on Ampere cards (RTX 3090, RTX A6000, RTX 3060) and one AMD CPU. A contributor ran a DGX Spark (GB10, aarch64)
-from a source build. If you have an Ada or Blackwell card (RTX 40xx or 50xx, L40S, RTX PRO 6000), an Intel host, or a
-multi-card machine, please run the checklist above and file a
+We test on Ampere cards (RTX 3090, RTX A6000, RTX 3060) and one AMD CPU. An RTX 5090 (Blackwell) has run
+([#2](https://github.com/midagedev/bloomery/issues/2)), and a contributor ran a DGX Spark (GB10, aarch64) from a source
+build. If you have an Ada card (RTX 40xx, L40S), another Blackwell card, an Intel host, or a multi-card machine, please
+run the checklist above and file a
 [hardware report](https://github.com/midagedev/bloomery/issues/new?template=hardware-report.md). A report that it
 worked helps as much as one that it failed.

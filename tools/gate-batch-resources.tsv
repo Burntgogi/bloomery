@@ -13,6 +13,9 @@
 #   glm5next   --place gate: need=173,015,891,968 B (the glm5next serve log's cache line)
 #   qwen4exp   --place gate: need=92,054,154,240 B (the qwen38 serve log's cache line); the serve/residency seats add
 #              the churn pool 35.6e9 B beside it; iqleg loads the file twice (both resident): 2 x.
+#   nvtier     gate_nvtier: the all-RAM arm loads first and its load need is 105,818,045,440 B (host experts 62,397,542,400 B +
+#              tables 28,800,138,240 B + reserves 6,694,629,376 B + residency churn pool 14,620,364,800 B − OS reserve 6,694,629,376 B);
+#              the paged arm loads after it, 5.5e9 B need + 23.5e9 B arena, the smaller. [derived from the load check's refusal line]
 #   qwen38-media: the qwen38-serve row's need, qwen4exp --place gate (the text load, the media load and the servers load one
 #              after the other, never two at once; the media load's rotation tables are card bytes, none are host bytes);
 #              the server arms may run the residency pool, whose 35.6e9 B the serve row carries [derived]
@@ -23,12 +26,20 @@
 #              0.45e9 B stays on the host), KV and scratch 5e9 B, so 25.77e9 − 4.63e9 − 5e9 = 16.1e9 B of routed experts — is
 #              146.28e9 − 16.1e9 = 130.2e9 B routed on the host, plus the embedding 0.45e9 B, rounded up to 131e9 [derived]; read
 #              the plan line of the first run and replace it.
+#   solar2     --place bp under gate_solar2_twocard's 16 GiB card budget: host routed 122,361,937,920 B (the gate's plan line, 12,657
+#              experts) plus the embedding 0.45e9 B, 122.81e9, rounded up to 123e9 [derived]; its two loads run one after the other.
+#   minimaxm3  --place gate: the plan line of `gate_minimaxm3_e2e --plan` at ctx 8192 (the 3090's usable bytes; 333 of the 7,296 routed
+#              experts on the card): routed experts on the host 185.34e9 B (6,963 experts) plus the token embedding 1.31e9 B that
+#              stays on the host, 186.65e9 B, rounded up to 187e9 [derived from the plan's own host terms]. The serve gate
+#              opens the same file at the same plan, so it holds the same bytes.
+#              The prefill gate opens the same gate plan at ctx 25: a smaller cache leaves the card at least as many experts,
+#              so the e2e's 187e9 bounds its host bytes [derived].
 gate-gpu-ds41-callstream	-	237600000000
 gate-gpu-ds41-long	m	237600000000
 gate-gpu-ds41-twocard	-	237600000000
 gate-gpu-glm5next-serve	-	173015891968
 gate-gpu-glm5next-twocard	-	173015891968
-gate-gpu-nvtier	-	92054154240
+gate-gpu-nvtier	-	105818045440
 gate-gpu-qwen38-media	-	127654154240
 gate-gpu-qwen38-residency	-	127700000000
 gate-gpu-qwen38-serve	-	127654154240
@@ -39,6 +50,10 @@ gate-gpu-qwen4exp-mtp	m	92054154240
 gate-gpu-solar2-e2e	-	131000000000
 gate-gpu-solar2-prefill	-	131000000000
 gate-gpu-solar2-serve	-	131000000000
+gate-gpu-solar2-twocard	-	123000000000
+gate-gpu-minimaxm3-e2e	-	187000000000
+gate-gpu-minimaxm3-prefill	-	187000000000
+gate-gpu-minimaxm3-serve	-	187000000000
 soak-ds41	-	237600000000
 stage-gpu-load-v41	-	237600000000
 stage-gpu-load-v41-lock	-	237600000000

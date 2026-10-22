@@ -128,6 +128,10 @@ pub struct ServerConfig {
     pub model_path: String,
     /// Jinja chat template source (GGUF `tokenizer.chat_template`).
     pub chat_template: String,
+    /// The family's request preparation, which shapes a request before the
+    /// template renders it; `None` renders the request as the template reads
+    /// it.
+    pub chat_preparation: Option<ChatPreparation>,
     /// Per-request sampler builder; `None` uses [`sampling::reference_factory`].
     pub sampler: Option<SamplerFactory>,
     /// How long `/health` keeps answering 503 after an engine error before
@@ -140,6 +144,36 @@ pub struct ServerConfig {
     /// The API keys the request check asks for (`--api-key`,
     /// `--api-key-file`); an empty set checks nothing.
     pub api_keys: ApiKeys,
+}
+
+/// A family's request preparation: it shapes a request before the template
+/// renders it, and refuses it by name when it cannot.
+///
+/// The family supplies one with its chat template; `None` renders the request
+/// as the template reads it.
+pub type ChatPreparation = fn(&mut ChatRequest<'_>) -> Result<(), String>;
+
+/// What a request preparation reads and writes: the messages as the template
+/// will see them, the request body, the template's variables, and the guard
+/// that marks client text.
+pub struct ChatRequest<'a> {
+    /// The messages, flattened, as the template will see them.
+    pub messages: &'a mut Vec<Value>,
+    /// The request body.
+    pub body: &'a Map<String, Value>,
+    /// The template's variables; the preparation adds the ones the template
+    /// reads and the request body holds.
+    pub vars: &'a mut Map<String, Value>,
+    /// Marks a client text the way the request's other texts are marked.
+    marker: &'a dyn Fn(&mut Value),
+}
+
+impl ChatRequest<'_> {
+    /// Mark a client text: a special token's spelling in it stays text in the
+    /// prompt, as in every other text the client sends.
+    pub fn mark(&self, value: &mut Value) {
+        (self.marker)(value);
+    }
 }
 
 /// Connections served at once, each on a thread of its own. Past the requests
@@ -375,6 +409,7 @@ impl Server {
             tool_format: ToolFormat::of_chat_template(&template),
             object_arguments: needs_object_arguments(&template),
             thinking_off,
+            preparation: config.chat_preparation,
             think: ThinkTags::THINK,
             template,
             alias: config.model_alias,
@@ -460,9 +495,12 @@ impl Server {
             })?;
         let conn_state = Arc::clone(&state);
         accept(listener, state.shared.end.clone(), move |stream| {
-            keep_alive(stream, &conn_state.shared.answers, |req, w| {
-                route(&conn_state, req, w)
-            });
+            keep_alive(
+                stream,
+                &conn_state.shared.answers,
+                &conn_state.api_keys,
+                |req, w| route(&conn_state, req, w),
+            );
         });
         Ok((state, ended))
     }
@@ -534,6 +572,10 @@ struct State {
     /// How the template answers `reasoning_effort: "none"`
     /// ([`probe_thinking_off`]), decided once.
     thinking_off: ThinkingOff,
+    /// The family's request preparation, which shapes a request before the
+    /// template renders it; `None` renders the request as the template reads
+    /// it.
+    preparation: Option<ChatPreparation>,
     /// The tags of the model's think span, `<think>` and `</think>` until a
     /// seat names others ([`Server::with_think_tags`]).
     think: ThinkTags,
@@ -1138,11 +1180,12 @@ impl Drop for Answering<'_> {
 /// Answers `stream`'s requests in order through `route` while the client keeps
 /// the connection alive ([`next_request_arrives`]); `route` answers one
 /// request, `Ok(true)` when the connection may carry another, counted in
-/// `answers` until it returns. A request that cannot be read is a 400 and the
-/// connection closes.
+/// `answers` until it returns. Headers are authorized against `keys` before
+/// continuing or reading the body; a denied or unreadable request closes the connection.
 pub(crate) fn keep_alive(
     stream: TcpStream,
     answers: &Answers,
+    keys: &ApiKeys,
     mut route: impl FnMut(&Request, &mut TcpStream) -> io::Result<bool>,
 ) {
     let _ = stream.set_nodelay(true);
@@ -1154,7 +1197,24 @@ pub(crate) fn keep_alive(
         if !next_request_arrives(&mut r) {
             return;
         }
-        let req = match http::read_request(&mut r, &mut w) {
+        let req = match (|| -> io::Result<Option<Request>> {
+            let Some(mut req) = http::read_head(&mut r)? else {
+                return Ok(None);
+            };
+            if key_denied(keys, &mut req, &mut w)? {
+                return Ok(None);
+            }
+            if req.method == "OPTIONS" || matches!(req.path.as_str(), "/health" | "/v1/health") {
+                // These public handlers ignore bodies; unread framing cannot carry a next request.
+                req.keep_alive &= req.header("transfer-encoding").is_none()
+                    && req
+                        .header("content-length")
+                        .is_none_or(|len| len.parse::<usize>() == Ok(0));
+            } else {
+                http::read_body(&mut r, &mut w, &mut req)?;
+            }
+            Ok(Some(req))
+        })() {
             Ok(Some(req)) => req,
             Ok(None) => return,
             Err(e) if e.kind() == io::ErrorKind::InvalidData => {
@@ -1252,13 +1312,9 @@ fn deny_line(method: &str, path: &str, peer: &str) -> String {
     format!("{method} {path} from {peer}: refused, no valid API key")
 }
 
-/// The key check before either server's dispatch — this server's
-/// [`route`] and the decision server's own connection handler, the one call
-/// both make. A request that passes ([`ApiKeys::allows`]) is `Ok(false)`;
-/// one that does not is answered with llama-server's 401 (`Invalid API Key`,
-/// `authentication_error`) after the one [`deny_line`], and is `Ok(true)`:
-/// answered, and the connection may carry another request.
-pub(crate) fn key_denied(keys: &ApiKeys, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
+/// Answers a denied request's headers with llama-server's 401 and marks the connection closed.
+/// The unread body is never drained or interpreted as another request.
+fn key_denied(keys: &ApiKeys, req: &mut Request, w: &mut TcpStream) -> io::Result<bool> {
     if keys.allows(
         &req.method,
         &req.path,
@@ -1272,6 +1328,7 @@ pub(crate) fn key_denied(keys: &ApiKeys, req: &Request, w: &mut TcpStream) -> io
         .map(|a| a.to_string())
         .unwrap_or_else(|e| format!("a peer that cannot be read: {e}"));
     eprintln!("{}", deny_line(&req.method, &req.path, &peer));
+    req.keep_alive = false;
     send_error(
         w,
         req,
@@ -1287,9 +1344,6 @@ pub(crate) fn key_denied(keys: &ApiKeys, req: &Request, w: &mut TcpStream) -> io
 
 /// Dispatches one request; `Ok(true)` when the connection may carry another.
 fn route(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
-    if key_denied(&state.api_keys, req, w)? {
-        return Ok(true);
-    }
     let r = match (req.method.as_str(), req.path.as_str()) {
         ("GET", "/health" | "/v1/health") => return health(state, req, w),
         ("GET", "/v1/models" | "/models") => Ok(models(state)),
@@ -2391,13 +2445,17 @@ fn token_ids(tok: &dyn Tokenizer, v: &Value) -> Result<Vec<u32>, ApiError> {
     ::embed::input::token_ids(tok.n_vocab(), v).map_err(ApiError::from)
 }
 
-/// `/apply-template`: the render's text, as llama-server answers it. A client string's spelling of
-/// a special token is text in the ids a chat request runs ([`crate::guard`]), and `/tokenize` of
-/// this text reads it as the token: this route shows the text, not those ids.
+/// `/apply-template`: the rendered text, with its guarded token ids when requested.
+/// Media placeholders stay unexpanded, as they do in the text.
 fn apply_template(state: &State, b: &Map<String, Value>) -> Result<Value, ApiError> {
-    // The unexpanded placeholder: an image is one placeholder token in the
-    // render, and only the request that runs it expands it to its span.
-    Ok(json!({ "prompt": render_chat(state, b)?.text }))
+    let return_ids = get_b(b, "return_prompt_ids")?.unwrap_or(false);
+    let rendered = render_chat(state, b)?;
+    let ids = return_ids.then(|| rendered.ids(&*state.tok));
+    let mut reply = json!({ "prompt": rendered.text });
+    if let Some(ids) = ids {
+        reply["prompt_ids"] = json!(ids);
+    }
+    Ok(reply)
 }
 
 /// A chat template's render: its text, each image as the model's
@@ -2409,6 +2467,15 @@ struct Rendered {
     text: String,
     guarded: Option<Guarded>,
     media: Vec<Medium>,
+}
+
+impl Rendered {
+    fn ids(&self, tok: &dyn Tokenizer) -> Vec<u32> {
+        match &self.guarded {
+            Some(guarded) => guarded.encode(tok),
+            None => tok.encode(&self.text),
+        }
+    }
 }
 
 /// Renders the chat template for an OpenAI `messages` body. An array content
@@ -2526,7 +2593,6 @@ fn render_chat(state: &State, b: &Map<String, Value>) -> Result<Rendered, ApiErr
         messages.push(Value::Object(flat));
     }
     let mut vars = Map::new();
-    vars.insert("messages".into(), Value::Array(messages));
     vars.insert(
         "add_generation_prompt".into(),
         Value::Bool(get_b(b, "add_generation_prompt")?.unwrap_or(true)),
@@ -2549,6 +2615,20 @@ fn render_chat(state: &State, b: &Map<String, Value>) -> Result<Rendered, ApiErr
         Some(other) => return Err(wrong_type("tools", "an array", other)),
     }
     thinking_vars(b, &mut vars, state.thinking_off)?;
+    if let Some(preparation) = state.preparation {
+        // The family's preparation shapes the request before the template
+        // renders it: it rewrites the messages and adds the variables its
+        // template reads.
+        let mut request = ChatRequest {
+            messages: &mut messages,
+            body: b,
+            vars: &mut vars,
+            marker: &|value| guard.value(value),
+        };
+        preparation(&mut request).map_err(invalid)?;
+    }
+    // The messages go in last: a preparation may have rewritten them.
+    vars.insert("messages".into(), Value::Array(messages));
     if let Some(Value::Object(kwargs)) = b.get("chat_template_kwargs") {
         // What the kwargs put into the vars as they came is the client's text.
         for (k, v) in kwargs {
@@ -2559,12 +2639,7 @@ fn render_chat(state: &State, b: &Map<String, Value>) -> Result<Rendered, ApiErr
             }
         }
     }
-    let marked = state.template.render(&vars).map_err(|e| ApiError {
-        retry_after: false,
-        code: 500,
-        kind: "server_error",
-        message: e.to_string(),
-    })?;
+    let marked = state.template.render(&vars).map_err(template_error)?;
     let (text, guarded) = guard
         .finish(marked, &state.template, &vars)
         .map_err(guard_error)?;
@@ -2573,6 +2648,21 @@ fn render_chat(state: &State, b: &Map<String, Value>) -> Result<Rendered, ApiErr
         guarded,
         media,
     })
+}
+
+/// A template that refused the request (`raise_exception`) names the client's
+/// request, which is a 400; any other render error is the template's own,
+/// which is a 500.
+fn template_error(e: TemplateError) -> ApiError {
+    match e.refusal() {
+        Some(refusal) => invalid(refusal.to_owned()),
+        None => ApiError {
+            retry_after: false,
+            code: 500,
+            kind: "server_error",
+            message: e.to_string(),
+        },
+    }
 }
 
 /// A request whose strings cannot be guarded, or a template that cut a guarded text apart, is
@@ -2982,10 +3072,7 @@ fn media_error(e: &MediaError) -> ApiError {
 /// each image expanded to its span with its feed ([`media::expand_prompt`]),
 /// which also refuses a placeholder no image part made.
 fn chat_prompt(state: &State, rendered: &Rendered) -> Result<Prompt, ApiError> {
-    let ids = match &rendered.guarded {
-        Some(guarded) => guarded.encode(&*state.tok),
-        None => state.tok.encode(&rendered.text),
-    };
+    let ids = rendered.ids(&*state.tok);
     let Some(model) = &state.media else {
         return Ok(Prompt::from(ids));
     };
@@ -3802,7 +3889,9 @@ fn tool_scan(state: &State, b: &Map<String, Value>) -> Result<Option<Tools>, Api
             Tools::KvMarkup(spelling, ArgTypes::of_tools(b.get("tools")))
         }
         ToolFormat::Hermes => Tools::Hermes,
-        ToolFormat::QwenXml => Tools::QwenXml(ParamKinds::of_tools(b.get("tools"))),
+        ToolFormat::QwenXml(framing) => {
+            Tools::QwenXml(framing, ParamKinds::of_tools(b.get("tools")))
+        }
         ToolFormat::Unparsed => {
             return Err(ApiError {
                 retry_after: false,
@@ -4944,6 +5033,14 @@ mod tests {
                 "a number",
             ),
             (
+                "/apply-template",
+                &chat,
+                "return_prompt_ids",
+                json!("true"),
+                "a boolean",
+                "a string",
+            ),
+            (
                 "/tokenize",
                 &tokenize,
                 "add_special",
@@ -5716,6 +5813,119 @@ mod tests {
         assert!(body.contains("content"), "the generation answered: {body}");
     }
 
+    /// Refusals and public bodyless handlers answer headers without `100 Continue` or a body;
+    /// authorized requests retain both body framings, the handshake and the next keyed request.
+    #[test]
+    fn authorization_precedes_bodies_and_preserves_authorized_keep_alive() {
+        use crate::http::read_test_response as response;
+        use std::io::{BufReader, Write};
+        use std::net::TcpStream;
+
+        fn connect(addr: SocketAddr) -> BufReader<TcpStream> {
+            let stream = TcpStream::connect(addr).expect("connect");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            BufReader::new(stream)
+        }
+
+        let mut keys = ApiKeys::default();
+        keys.add("--api-key", KEY).unwrap();
+        let (addr, _state, _ended) = super::testserve::spawn_keyed(keys);
+        for key in [
+            "",
+            "Authorization: Bearer sk-wrong\r\n",
+            "X-Api-Key: sk-wrong\r\n",
+        ] {
+            for framing in ["Content-Length: 1024\r\n", "Transfer-Encoding: chunked\r\n"] {
+                for expect in ["", "Expect: 100-continue\r\n"] {
+                    let mut r = connect(addr);
+                    write!(
+                        r.get_mut(),
+                        "POST /completion HTTP/1.1\r\nConnection: keep-alive\r\n\
+                         {key}{framing}{expect}\r\n"
+                    )
+                    .expect("headers without a body");
+                    let (status, head, body) = response(&mut r);
+                    assert_eq!(status, 401, "{head}");
+                    assert!(head.contains("Connection: close"), "{head}");
+                    let v: Value = serde_json::from_slice(&body).expect("the 401's JSON");
+                    assert_eq!(v["error"]["type"], "authentication_error");
+                    let mut byte = [0];
+                    assert_eq!(r.read(&mut byte).expect("the denied connection closes"), 0);
+                }
+            }
+        }
+
+        for (method, path, framing, status) in [
+            ("GET", "/health", "Content-Length: 1024\r\n", 200),
+            ("GET", "/v1/health", "Transfer-Encoding: chunked\r\n", 200),
+            (
+                "OPTIONS",
+                "/completion",
+                "Transfer-Encoding: chunked\r\n",
+                204,
+            ),
+        ] {
+            let mut r = connect(addr);
+            write!(
+                r.get_mut(),
+                "{method} {path} HTTP/1.1\r\nConnection: keep-alive\r\n\
+                 {framing}Expect: 100-continue\r\n\r\n"
+            )
+            .expect("public headers without the ignored body");
+            let (got, head, _) = response(&mut r);
+            assert_eq!(got, status, "{head}");
+            assert!(head.contains("Connection: close"), "{head}");
+            let mut byte = [0];
+            assert_eq!(r.read(&mut byte).expect("the unread public body closes"), 0);
+        }
+
+        let ask = r#"{"prompt":"hello","max_tokens":1}"#;
+        for chunked in [false, true] {
+            let mut r = connect(addr);
+            let framing = if chunked {
+                "Transfer-Encoding: chunked\r\n".to_owned()
+            } else {
+                format!("Content-Length: {}\r\n", ask.len())
+            };
+            write!(
+                r.get_mut(),
+                "POST /completion HTTP/1.1\r\nAuthorization: {BEARER}\r\n\
+                 {framing}Expect: 100-continue\r\n\r\n"
+            )
+            .expect("authorized headers");
+            let (status, _, body) = response(&mut r);
+            assert_eq!(status, 100, "continue before sending the body");
+            assert!(body.is_empty());
+            if chunked {
+                write!(r.get_mut(), "{:x}\r\n{ask}\r\n0\r\n\r\n", ask.len()).unwrap();
+            } else {
+                r.get_mut().write_all(ask.as_bytes()).unwrap();
+            }
+            let (status, head, body) = response(&mut r);
+            assert_eq!(status, 200, "{head}");
+            assert!(head.contains("Connection: keep-alive"), "{head}");
+            let v: Value = serde_json::from_slice(&body).expect("completion JSON");
+            assert!(v.get("content").is_some(), "{v}");
+
+            write!(
+                r.get_mut(),
+                "GET /props HTTP/1.1\r\nAuthorization: {BEARER}\r\nConnection: close\r\n\r\n"
+            )
+            .expect("the next keyed request");
+            let (status, head, body) = response(&mut r);
+            assert_eq!(status, 200, "{head}");
+            let v: Value = serde_json::from_slice(&body).expect("props JSON");
+            assert!(v.is_object(), "{v}");
+            let mut byte = [0];
+            assert_eq!(r.read(&mut byte).expect("the final connection closes"), 0);
+        }
+    }
+
     /// `POST /shutdown` needs the key even from a loopback peer: without one
     /// it is the 401 and the server keeps serving; with one it is the 200
     /// and the stop, as without keys.
@@ -6358,6 +6568,7 @@ mod tests {
             let config = ServerConfig {
                 model_alias: "mock".to_owned(),
                 model_path: "mock.gguf".to_owned(),
+                chat_preparation: None,
                 chat_template: concat!(
                     "{%- for message in messages %}",
                     "{{- '<' + message.role + '>\\n' + message.content }}",
@@ -7332,6 +7543,165 @@ mod tests {
             "another effort reaches the template: {p}"
         );
         assert!(p.ends_with("<think>\n"), "its span stays open: {p}");
+    }
+
+    /// The official V4.1 encoding's prompts: DeepSeek's own encoder renders
+    /// them (the fixture's `expected` text, generated by the recipe's
+    /// `DeepseekV41Encoding`), and the official template renders the same
+    /// text for the same request.
+    ///
+    /// A case the chat API cannot express is named in the fixture as such,
+    /// and the test holds that its text is one the official encoding writes
+    /// and ours does not.
+    #[test]
+    fn the_official_v41_template_renders_the_recipe_prompts() {
+        /// The first byte at which two prompts differ, and the line each
+        /// holds there.
+        fn difference(expected: &str, got: &str) -> String {
+            let at = expected
+                .char_indices()
+                .zip(got.chars())
+                .find(|((_, a), b)| a != b)
+                .map_or_else(|| expected.len().min(got.len()), |((at, _), _)| at);
+            fn line(text: &str, at: usize) -> &str {
+                let start = text[..at].rfind('\n').map_or(0, |at| at + 1);
+                let end = text[at..].find('\n').map_or(text.len(), |i| at + i);
+                &text[start..end]
+            }
+            format!(
+                "first difference at byte {at}\n  expected: {}\n  got:      {}",
+                line(expected, at),
+                line(got, at)
+            )
+        }
+        let cases: Vec<Value> =
+            serde_json::from_str(include_str!("../tests/fixtures/v41-official/cases.json"))
+                .expect("the fixture is JSON");
+        let mut config = templated(crate::v41::TEMPLATE);
+        config.chat_preparation = Some(crate::v41::prepare);
+        let (addr, _state, _ended) =
+            super::testserve::spawn(Box::new(crate::MockEngine::new(64)), config);
+        let mut not_expressible = Vec::new();
+        for case in &cases {
+            let name = case["name"].as_str().expect("a case has a name");
+            let expected = case["expected"].as_str().expect("a case has its text");
+            let (status, answer) = applied(addr, &case["request"]);
+            assert_eq!(status, 200, "{name}: {answer}");
+            let prompt = applied_prompt(&answer);
+            if case["expressible"].as_bool().unwrap_or(true) {
+                assert_eq!(
+                    prompt,
+                    expected,
+                    "{name}: {}",
+                    difference(expected, &prompt)
+                );
+            } else {
+                assert_ne!(
+                    prompt, expected,
+                    "{name}: the case is not expressible, and renders the official text"
+                );
+                not_expressible.push(name);
+            }
+        }
+        assert_eq!(not_expressible, ["prefix-continuation"]);
+    }
+
+    /// The V4.1 preparation refuses a malformed tool call by name: a
+    /// `tool_calls` that is not an array and a call whose `function` is not
+    /// an object. The client gets a 400 that names the field, on the render
+    /// path and on the chat path alike.
+    #[test]
+    fn the_v41_preparation_refuses_a_malformed_tool_call_by_name() {
+        let mut config = templated(crate::v41::TEMPLATE);
+        config.chat_preparation = Some(crate::v41::prepare);
+        let (addr, _state, _ended) =
+            super::testserve::spawn(Box::new(crate::MockEngine::new(64)), config);
+        let cases = [
+            (
+                json!({"messages": [{"role": "assistant", "tool_calls": [{"function": 1}]}]}),
+                "messages[0].tool_calls[0].function",
+            ),
+            (
+                json!({"messages": [{"role": "assistant", "tool_calls": {"function": {}}}]}),
+                "messages[0].tool_calls",
+            ),
+        ];
+        for (body, named) in cases {
+            for path in ["/apply-template", "/v1/chat/completions"] {
+                let (status, answer) = roundtrip(addr, "POST", path, &body.to_string());
+                assert_eq!(status, 400, "{path}: {answer}");
+                assert!(answer.contains(named), "{path}: {answer}");
+            }
+        }
+    }
+
+    /// The official V4.1 template refuses a role it does not encode, by
+    /// name: the client gets a 400 that names the role, not a prompt that
+    /// silently drops the message.
+    #[test]
+    fn the_v41_template_refuses_a_role_it_cannot_encode() {
+        let mut config = templated(crate::v41::TEMPLATE);
+        config.chat_preparation = Some(crate::v41::prepare);
+        let (addr, _state, _ended) =
+            super::testserve::spawn(Box::new(crate::MockEngine::new(64)), config);
+        let body = json!({"messages": [{"role": "critic", "content": "Tighten it."}]});
+        for path in ["/apply-template", "/v1/chat/completions"] {
+            let (status, answer) = roundtrip(addr, "POST", path, &body.to_string());
+            assert_eq!(status, 400, "{path}: {answer}");
+            assert!(
+                answer.contains("unsupported message role: critic"),
+                "{path}: {answer}"
+            );
+        }
+    }
+
+    /// A server with no request preparation renders a request that carries a
+    /// tool choice and a response format as it did before the official
+    /// encoding: the two reach no template, so the response format is not
+    /// written and no tool call is forced. The tools themselves reach the
+    /// template, which every family's does.
+    #[test]
+    fn a_server_without_a_preparation_ignores_the_tool_choice_and_the_response_format() {
+        let (addr, _state, _ended) = super::testserve::spawn(
+            Box::new(crate::MockEngine::new(64)),
+            templated(crate::v41::TEMPLATE),
+        );
+        let body = json!({
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "tools": [{
+                "type": "function",
+                "function": { "name": "f", "parameters": { "type": "object" } },
+            }],
+            "tool_choice": "required",
+            "response_format": { "type": "json_object" },
+        });
+        let (status, answer) = applied(addr, &body);
+        assert_eq!(status, 200, "{answer}");
+        let prompt = applied_prompt(&answer);
+        assert!(
+            prompt.contains("### Available Tool Schemas"),
+            "the tools reach the template: {prompt}"
+        );
+        assert!(
+            !prompt.contains("## Response Format:"),
+            "the response format is not written: {prompt}"
+        );
+        assert!(
+            !prompt.ends_with("\n\n<｜DSML｜ calls>\n"),
+            "no tool call is forced: {prompt}"
+        );
+    }
+
+    /// The official V4.1 template teaches the spaced DSML markup, the one a
+    /// V4.1 model writes: the block is ` calls`, the call is ` invoke` and the
+    /// parameter is ` parameter`.
+    #[test]
+    fn the_official_v41_template_teaches_the_spaced_dsml_markup() {
+        let parsed = ChatTemplate::parse(crate::v41::TEMPLATE).expect("the template parses");
+        assert_eq!(
+            crate::dsml::ToolFormat::of_chat_template(&parsed),
+            crate::dsml::ToolFormat::Dsml(crate::dsml::Spelling::Spaced)
+        );
     }
 
     /// Any `reasoning_effort` but `"none"` asks for reasoning: on V4.1's

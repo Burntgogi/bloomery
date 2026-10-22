@@ -1,16 +1,17 @@
 //! A hybrid file planned onto a machine: the one path from a family's headers to a plan that keeps
 //! its invariants, for every family whose body mixes with GQA layers (a plane, or a ring for a window
-//! layer) and delta-rule layers (a state and a conv ring), routes every layer's experts and puts the
-//! rest of them on the host. A family reads its headers into a [`ModelSpec`] and its tensors' roles
-//! ([`PlanInputs::new`]); what the layers hold is read off the description ([`KvLayout::of`]), the
-//! program off its architecture ([`program_of`]), and the placement runs the expert rule on the
-//! layers whose stacks the card experts read ([`placement::plan_routed`]). What stays in a family is
-//! what an architecture fact forces: the keys it reads, the layers it refuses, the engine's name in
-//! the refusals that name it.
+//! layer, and an index key row a position for a layer that selects blocks) and delta-rule layers (a
+//! state and a conv ring), routes every layer's experts and puts the rest of them on the host. A
+//! family reads its headers into a [`ModelSpec`] and its tensors' roles ([`PlanInputs::new`]); what
+//! the layers hold is read off the description ([`KvLayout::of`]), the program off its architecture
+//! ([`program_of`]), and the placement runs the expert rule on the layers whose stacks the card
+//! experts read ([`placement::plan_routed`]). What stays in a family is what an architecture fact
+//! forces: the keys it reads, the layers it refuses, the engine's name in the refusals that name it.
 //!
-//! The plan refuses by name a machine that hangs an expert tier card, a context of no position and
-//! a host room that cannot hold the host experts: the bodies this plans serve no NVMe expert tier, so
-//! a plan that pages one ([`PlaceError::NoNvmeTier`]) would load experts nothing serves.
+//! The plan refuses by name a machine that hangs an expert tier card where the family's body serves
+//! none ([`PlanInputs::tier_reserve`]), a context of no position and a host room that cannot hold
+//! the host experts: the bodies this plans serve no NVMe expert tier, so a plan that pages one
+//! ([`PlaceError::NoNvmeTier`]) would load experts nothing serves.
 //!
 //! A body that makes buffers beside the plan's terms on its card (the prompt batch's rows) states
 //! their bytes in [`PlanInputs::prompt_reserve`]: the expert rule spreads within the card's budget
@@ -22,29 +23,20 @@ use std::num::NonZeroUsize;
 use std::ops::Range;
 
 use bloomery_placement::slots::{SeqTerms, Stores};
-use gguf::GgmlType;
-use models::{DeltaRule, Mixer, ModelSpec, RopeMode};
+use models::{DeltaRule, Gqa, Mixer, ModelSpec, RopeMode, Selector};
 use runtime::stores::{self, Rows};
 
 use crate::arch::coverage;
-use crate::placement::accepts::{leg_card_format, program_of, routed_rule};
+use crate::placement::accepts::{program_of, routed_rule};
 use crate::placement::ctx_ask::{PlanRefusal, Short, Side};
 use crate::placement::workstation::{self, HostNeed, HostRead};
 use crate::placement::{
-    self, Card, CardFormat, CardTotals, KvBytes, Machine, ModelTensors, PlacementError, Plan,
-    PlanLevers, Unimplemented, Violation, checked_beside, joined,
+    self, Card, CardTotals, KvBytes, Machine, ModelTensors, PlacementError, Plan, PlanLevers,
+    Unimplemented, Violation, checked_beside, joined,
 };
 
 // The prompt batch a window ring keeps room for is the batch the card walks the prompt in.
 const _: () = assert!(stores::PROMPT_BATCH == crate::moe::UNION_MAX_COLS as u64);
-
-/// The routed stacks the card experts read, each in its card format ([`leg_card_format`]): the
-/// types the common card leg runs ([`placement::kernels::card_runs`]). The rule reads a stack's
-/// type alone; a layer with a stack of any other type keeps its experts on the host.
-#[must_use]
-pub fn card_routed(ty: GgmlType) -> Option<CardFormat> {
-    placement::kernels::card_runs(ty).then(|| leg_card_format(ty))
-}
 
 /// What a plan of a hybrid file is made from, read from its headers. `H` is the family's own
 /// hyperparameters, carried for its body and never read here.
@@ -75,6 +67,11 @@ pub struct PlanInputs<H> {
     /// card keeps them out of the expert budget ([`placement::plan_routed_reserving`]), and the
     /// body refuses a load whose made bytes pass them. 0 for a family whose body makes none.
     pub prompt_reserve: u64,
+    /// `None` for a family whose body hangs no expert tier card: a machine that names one is
+    /// refused by name ([`PlaceError::Tier`]). `Some(bytes)` for a body that serves one: the card
+    /// keeps `bytes` more than [`PlanInputs::prompt_reserve`] on a machine that names a tier card,
+    /// the buffers only a tiered load makes.
+    pub tier_reserve: Option<u64>,
     /// The engine the refusals that name one name.
     engine: &'static str,
 }
@@ -198,6 +195,7 @@ impl<H> PlanInputs<H> {
             room,
             arena,
             prompt_reserve: 0,
+            tier_reserve: None,
             engine,
         })
     }
@@ -209,6 +207,40 @@ impl<H> PlanInputs<H> {
         PlanInputs {
             prompt_reserve: bytes,
             ..self
+        }
+    }
+
+    /// `self` for a body that serves an expert tier card, which makes `bytes` of card buffers
+    /// beside [`PlanInputs::prompt_reserve`] on a load with one ([`PlanInputs::tier_reserve`]).
+    #[must_use]
+    pub fn with_tier_reserve(self, bytes: u64) -> PlanInputs<H> {
+        PlanInputs {
+            tier_reserve: Some(bytes),
+            ..self
+        }
+    }
+
+    /// `self` with each delta-rule layer's state `lanes` lanes ([`KvLayout::with_lanes`]): the
+    /// stores of a load that verifies `lanes` rows a pass.
+    #[must_use]
+    pub fn with_lanes(self, lanes: NonZeroUsize) -> PlanInputs<H> {
+        PlanInputs {
+            kv: self.kv.with_lanes(lanes),
+            ..self
+        }
+    }
+
+    /// The card bytes the load of `machine` makes beside the plan's terms: the prompt batch's, and
+    /// a tiered load's more. A machine that names an expert tier card where the body serves none
+    /// is refused by name ([`PlaceError::Tier`]).
+    pub fn reserve_on(&self, machine: &Machine) -> Result<u64, PlaceError> {
+        match (machine.tiers.first(), self.tier_reserve) {
+            (Some(card), None) => Err(PlaceError::Tier {
+                card: card.name.clone(),
+                tier: 0,
+            }),
+            (Some(_), Some(more)) => Ok(self.prompt_reserve.saturating_add(more)),
+            (None, _) => Ok(self.prompt_reserve),
         }
     }
 
@@ -230,10 +262,13 @@ impl<H> PlanInputs<H> {
     }
 
     /// The placement of the file on `machine` at `ctx_max` positions under the placement's
-    /// `levers`: the expert rule on the layers whose routed stacks [`card_routed`] runs, each such
-    /// layer's id prefix on the card as far as its budget holds them, the rest on the host; refused
-    /// by name a context of no position, a machine that hangs an expert tier card, a context whose
-    /// stores do not fit the card and a host room under the host experts' need
+    /// `levers`: the expert rule on the layers whose routed stacks the program's rule carries
+    /// ([`routed_rule`]), each such
+    /// layer's id prefix on the card as far as its budget holds them, the next ids on the expert
+    /// tier card of a machine that names one, the rest on the host; refused by name a context of no
+    /// position, a machine that hangs an expert tier card where the body serves none
+    /// ([`PlanInputs::tier_reserve`]), a context whose stores do not fit the card and a host room
+    /// under the host experts' need
     /// ([`PlanInputs::plan_with_slots`]).
     pub fn plan<'a>(
         &'a self,
@@ -263,12 +298,7 @@ impl<H> PlanInputs<H> {
         if ctx_max == 0 {
             return Err(PlaceError::CtxZero);
         }
-        if let Some((tier, card)) = machine.tiers.iter().enumerate().next() {
-            return Err(PlaceError::Tier {
-                card: card.name.clone(),
-                tier,
-            });
-        }
+        let reserve = self.reserve_on(machine)?;
         let program = program_of(self.spec.arch)
             .ok_or_else(|| PlacementError::Unimplemented(self.unimplemented()))?;
         let kv = self.seq_terms().slots_of(slots.get() as u64);
@@ -279,7 +309,7 @@ impl<H> PlanInputs<H> {
             &kv,
             levers,
             routed_rule(program),
-            self.prompt_reserve,
+            reserve,
         )?;
         let need = HostNeed::of(&plan, 0).bytes();
         let room = plan.plan_at(&self.room);
@@ -292,14 +322,14 @@ impl<H> PlanInputs<H> {
                 engine: self.engine,
             });
         }
-        let plan = checked_beside(plan, self.prompt_reserve).map_err(PlaceError::Broken)?;
+        let plan = checked_beside(plan, reserve).map_err(PlaceError::Broken)?;
         for (card, totals) in machine.cards.iter().zip(&plan.cards) {
             let limit = plan.usable_bytes(card).saturating_sub(card.margin_bytes);
             refuse_reserve(
                 card,
                 card_terms(totals),
                 limit,
-                self.prompt_reserve,
+                reserve,
                 |card, reserve, left, short| PlaceError::PromptOver {
                     card,
                     reserve,
@@ -350,10 +380,22 @@ pub(crate) fn card_terms(t: &CardTotals) -> u64 {
 /// What one trunk layer holds per sequence.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Hold {
-    /// A GQA layer: K and V of `row` bytes a position, over its `window` positions when it has one.
-    Attention { row: u64, window: Option<u64> },
-    /// A delta-rule layer: its state, stamp and conv ring, whatever the context.
-    State(u64),
+    /// A GQA layer: K and V of `row` bytes a position, over its `window` positions when it has one,
+    /// and `index` bytes of index key a position over every position (0: the layer selects nothing).
+    /// A latent layer: its cached row of `row` bytes a position, no index, no window.
+    Attention {
+        row: u64,
+        index: u64,
+        window: Option<u64>,
+    },
+    /// A delta-rule layer: its first state lane and conv ring (`fixed` bytes), and the lanes'
+    /// stamps and the lanes past the first over `v_heads` heads of `d × d` f32, whatever the
+    /// context.
+    State {
+        fixed: u64,
+        v_heads: usize,
+        d: usize,
+    },
     /// A layer with no token mixer.
     Nothing,
 }
@@ -361,8 +403,11 @@ enum Hold {
 /// One file's per-layer stores, read off its description. A full GQA layer holds a plane of every
 /// position. A window layer holds that plane under [`Rows::Plane`], and
 /// [`runtime::stores::ring_rows`] rows under [`Rows::Ring`]; each row is the layer's key heads' key
-/// and value rows in f16. A delta-rule layer holds a state of `v_heads` heads of `d × d` f32, one
-/// stamped lane, and the conv ring (`runtime::stores::recurrent_bytes`, `delta_lane_bytes`).
+/// and value rows in f16. A GQA layer that selects blocks ([`Selector::BlockMax`]) attends every
+/// position it holds (it has no window) and keeps, beside its planes, one f16 index key of the
+/// selector's `d` values for every position. A delta-rule layer holds a state of `v_heads` heads of
+/// `d × d` f32 in each of its stamped lanes, and the conv ring (`runtime::stores::recurrent_bytes`,
+/// `delta_lane_bytes`): one lane, or the lanes of a load that verifies ([`KvLayout::with_lanes`]).
 #[derive(Clone, Debug)]
 pub struct KvLayout {
     /// Per trunk layer.
@@ -372,43 +417,69 @@ pub struct KvLayout {
     /// The rope rows the body copies to its card, in bytes a position: one table of `dims` f32
     /// values a position for each distinct rope (base and dims) the rotating layers turn by.
     rope_row: u64,
+    /// The block selector's sink row, in bytes a position: the index head kernel appends a value
+    /// row beside each index key, to a plane of the widest selector's key nothing reads and every
+    /// selecting layer shares; 0 for a trunk that selects nothing.
+    sink_row: u64,
+    /// The lanes of a delta-rule layer's state.
+    lanes: NonZeroUsize,
 }
 
 impl KvLayout {
     /// The layout of the trunk layers `mixers` name, window layers on the ring; a mixer whose store
-    /// this owner does not size (a latent or Mamba-2 layer, a selecting GQA layer) is refused by
-    /// name with its layer.
+    /// this owner does not size (a Mamba-2 layer, a latent layer that compresses, selects or windows,
+    /// a GQA layer with a selector other than the block selector or with a window beside it) is refused
+    /// by name with its layer.
     pub fn of<'a>(mixers: impl IntoIterator<Item = &'a Mixer>) -> Result<KvLayout, PlacementError> {
         let mut holds = Vec::new();
         let mut ropes: Vec<(u32, u32)> = Vec::new();
+        let mut sink_row = 0;
+        let mut note = |rope: &models::Rope| {
+            if rope.mode != RopeMode::None {
+                let rope = (rope.base.to_bits(), rope.dims);
+                if !ropes.contains(&rope) {
+                    ropes.push(rope);
+                }
+            }
+        };
         for (layer, mixer) in mixers.into_iter().enumerate() {
             holds.push(match mixer {
-                Mixer::Gqa(g) if g.select.is_none() => {
-                    if g.rope.mode != RopeMode::None {
-                        let rope = (g.rope.base.to_bits(), g.rope.dims);
-                        if !ropes.contains(&rope) {
-                            ropes.push(rope);
-                        }
+                Mixer::Gqa(g) => {
+                    let index = match index_row(g) {
+                        Ok(index) => index,
+                        Err(what) => return Err(unsized_store(layer, what)),
+                    };
+                    note(&g.rope);
+                    sink_row = sink_row.max(index);
+                    if let Some(Selector::BlockMax { rope, .. }) = &g.select {
+                        note(rope);
                     }
                     Hold::Attention {
                         row: u64::from(g.kv_heads)
                             * (u64::from(g.head_dim) + u64::from(g.value_dim))
                             * stores::F16_BYTES,
+                        index,
                         window: g.window.map(u64::from),
                     }
                 }
-                Mixer::DeltaRule(d) => Hold::State(state_bytes(d)),
-                Mixer::None => Hold::Nothing,
-                other => {
-                    return Err(PlacementError::Unimplemented(vec![Unimplemented {
-                        layer: Some(layer),
-                        feature: format!(
-                            "{}: this plan sizes the stores of a plain GQA layer and a \
-                             delta-rule layer",
-                            other.what()
-                        ),
-                    }]));
+                // A latent layer that compresses, selects or windows nothing holds a plane of one
+                // row a position, the latent and the key values beside it, in f16.
+                Mixer::Latent(a)
+                    if a.compress.is_none() && a.select.is_none() && a.window.is_none() =>
+                {
+                    Hold::Attention {
+                        row: (u64::from(a.latent) + u64::from(a.pe)) * stores::F16_BYTES,
+                        index: 0,
+                        window: None,
+                    }
                 }
+                Mixer::DeltaRule(d) => Hold::State {
+                    fixed: state_bytes(d),
+                    v_heads: d.v_heads as usize,
+                    d: d.d as usize,
+                },
+                Mixer::None => Hold::Nothing,
+                other => return Err(unsized_store(layer, other.what())),
             });
         }
         Ok(KvLayout {
@@ -418,6 +489,8 @@ impl KvLayout {
                 .iter()
                 .map(|&(_, dims)| u64::from(dims) * stores::F32_BYTES)
                 .sum(),
+            sink_row,
+            lanes: NonZeroUsize::MIN,
         })
     }
 
@@ -427,6 +500,13 @@ impl KvLayout {
         KvLayout { rows, ..self }
     }
 
+    /// The same layout with each delta-rule layer's state `lanes` lanes: a load that verifies
+    /// `lanes` rows a pass keeps one a row.
+    #[must_use]
+    pub fn with_lanes(self, lanes: NonZeroUsize) -> KvLayout {
+        KvLayout { lanes, ..self }
+    }
+
     /// The bytes of layers `layers` at `ctx_max` positions: what a card that runs them holds beside
     /// its weights ([`KvBytes::layer_bytes`] summed).
     #[must_use]
@@ -434,8 +514,10 @@ impl KvLayout {
         layers.map(|l| self.layer_bytes(l, ctx_max)).sum()
     }
 
-    /// The rows layer `layer` holds at `ctx_max`. A layer that keeps no positions, or is past the
-    /// trunk, holds none.
+    /// The K and V rows layer `layer` holds at `ctx_max`. A layer that keeps no positions, or is
+    /// past the trunk, holds none. The index keys of a layer that selects blocks are not counted
+    /// here: it has no window, so they are one for each of the `ctx_max` positions
+    /// ([`KvBytes::layer_bytes`] adds them).
     #[must_use]
     pub fn rows_at(&self, layer: usize, ctx_max: u64) -> u64 {
         match self.holds.get(layer) {
@@ -458,34 +540,67 @@ impl KvLayout {
     }
 }
 
-/// A delta-rule layer's state, one stamped lane and conv ring in bytes.
+/// The bytes of index key a position a GQA layer keeps: 0 for a layer that selects nothing, one f16
+/// key of the block selector's `d` values for a layer that selects blocks. A selector of another
+/// kind, or a block selector beside a window (the index keys span every position), is `Err` with
+/// the words a refusal names the mixer by.
+fn index_row(g: &Gqa) -> Result<u64, &'static str> {
+    match (&g.select, g.window) {
+        (None, _) => Ok(0),
+        (Some(Selector::BlockMax { d, .. }), None) => Ok(u64::from(*d) * stores::F16_BYTES),
+        (Some(Selector::BlockMax { .. }), Some(_)) => {
+            Err("a GQA mixer with a block selector and a window")
+        }
+        (Some(_), _) => Err("a GQA mixer with a selector other than the block selector"),
+    }
+}
+
+/// The refusal of layer `layer`, a mixer this owner does not size (`what` names it).
+fn unsized_store(layer: usize, what: &str) -> PlacementError {
+    PlacementError::Unimplemented(vec![Unimplemented {
+        layer: Some(layer),
+        feature: format!(
+            "{what}: this plan sizes the stores of a GQA layer (plain, or selecting blocks), a plain \
+             latent layer and a delta-rule layer"
+        ),
+    }])
+}
+
+/// A delta-rule layer's first state lane and conv ring in bytes, its stamps apart.
 fn state_bytes(d: &DeltaRule) -> u64 {
     let (v_heads, k_heads) = (d.v_heads as usize, d.k_heads as usize);
     let (state, conv) = (d.d as usize, d.conv as usize);
     stores::recurrent_bytes(v_heads, k_heads, state, conv)
-        + stores::delta_lane_bytes(v_heads, state, 1)
 }
 
 impl KvBytes for KvLayout {
     fn layer_bytes(&self, layer: usize, ctx_max: u64) -> u64 {
         match self.holds.get(layer) {
-            Some(Hold::Attention { row, .. }) => self.rows_at(layer, ctx_max).saturating_mul(*row),
-            Some(Hold::State(bytes)) => *bytes,
+            Some(Hold::Attention { row, index, .. }) => self
+                .rows_at(layer, ctx_max)
+                .saturating_mul(*row)
+                .saturating_add(ctx_max.saturating_mul(*index)),
+            Some(Hold::State { fixed, v_heads, d }) => {
+                fixed + stores::delta_lane_bytes(*v_heads, *d, self.lanes.get())
+            }
             Some(Hold::Nothing) | None => 0,
         }
     }
 
     fn stage_position_bytes(&self, ctx_max: u64) -> u64 {
-        self.rope_row * ctx_max
+        (self.rope_row + self.sink_row) * ctx_max
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use models::{DeltaKind, Gqa, KdaGate, Mamba2, OutGate, Rope};
+    use gguf::GgmlType;
+    use models::{DeltaKind, Gqa, KdaGate, Mamba2, OutGate, PoolRule, Rope};
     use runtime::stores::ring_rows;
 
     use super::*;
+    use crate::placement::accepts::Program;
+    use crate::placement::{CardFormat, RoutedRule};
 
     /// A GQA layer of `kv` key heads, key width `k` and value width `v`, a window of `window`
     /// positions or none, and a rope of `rope` (base, dims) or none.
@@ -515,6 +630,25 @@ mod tests {
             window,
             sinks: false,
             value_scale: None,
+        })
+    }
+
+    /// `mixer`, a GQA layer, selecting blocks by an index key of `d` values: its rope the
+    /// selector's too, as the family's description gives it.
+    fn selecting(mixer: Mixer, d: u32) -> Mixer {
+        let Mixer::Gqa(g) = mixer else {
+            panic!("{mixer:?} is not a GQA layer");
+        };
+        Mixer::Gqa(Gqa {
+            select: Some(Selector::BlockMax {
+                heads: g.kv_heads,
+                d,
+                top_k: 16,
+                block: 128,
+                local: 1,
+                rope: g.rope,
+            }),
+            ..g
         })
     }
 
@@ -639,6 +773,146 @@ mod tests {
         assert_eq!(rope([0.0, 1e7, 0.0]), 4 * 4 * 10);
     }
 
+    /// A layer that selects blocks keeps one f16 index key of the selector's `d` values for every
+    /// position beside its planes, on the plane and on the ring alike (it has no window to cut
+    /// them to); a layer that selects nothing keeps none. The widths are 2 key heads, key 16 and
+    /// value 8 values (96 B of K and V a position) and an index key of 12 values (24 B): at 9
+    /// positions a plain layer is 9 × 96 = 864 B, a selecting one 9 × (96 + 24) = 1,080 B, and past
+    /// the ring's pad (where a window layer stops growing) the selecting layer still grows with the
+    /// context. Mutant: the index keys left out, counted per window row, or counted on the plain
+    /// layer.
+    #[test]
+    fn a_block_selector_adds_an_index_key_row_a_position() {
+        let mixers = [
+            gqa(2, (16, 8), None, None),
+            selecting(gqa(2, (16, 8), None, None), 12),
+            gqa(2, (16, 8), Some(8), None),
+        ];
+        let ring = KvLayout::of(&mixers).expect("plain and selecting GQA layers are sized");
+        let plane = ring.clone().with_rows(Rows::Plane);
+        let past = ring_rows(8, u64::MAX) + 32;
+        for kv in [&ring, &plane] {
+            assert_eq!(kv.layer_bytes(0, 9), 9 * 96);
+            assert_eq!(kv.layer_bytes(1, 9), 9 * (96 + 24));
+            assert_eq!(kv.layer_bytes(1, past), past * (96 + 24));
+            assert_eq!(kv.rows_at(1, past), past);
+            assert_eq!(kv.layer_bytes(3, 9), 0);
+        }
+        assert_eq!(ring.bytes(0..3, 9), 9 * 96 + 9 * 120 + 9 * 96);
+    }
+
+    /// MiniMax-M3's cache at the released file's widths: 4 key heads of 128 are 2,048 B of f16 K and
+    /// V a position on every one of 60 layers (122,880 B), and the 57 sparse layers (all but the
+    /// first 3) keep an index key of 128 f16 values, 256 B, each (14,592 B). At 32,768 and 131,072
+    /// positions the planes are 4,026,531,840 and 16,106,127,360 B and the index keys 478,150,656
+    /// and 1,912,602,624 B [derived: 122,880 and 14,592 times the positions]. A dense layer keeps no
+    /// index keys, and a layer past the model nothing. The stage keeps one rope table of the 64
+    /// rotated values in f32 (256 B) a position, though the sparse layers' indexer rotates by the
+    /// same rope, and one sink row of the index key's 128 f16 values (256 B) a position, which the
+    /// 57 selecting layers share: 512 B. Mutant: the index keys on the dense layers, the index key
+    /// at the plane's width, the indexer's rope a second table, or a sink row a selecting layer.
+    #[test]
+    fn the_m3_cache_is_the_released_files_bytes() {
+        let rope = Some((5_000_000.0, 64));
+        let mixers: Vec<Mixer> = (0..60)
+            .map(|l| {
+                let layer = gqa(4, (128, 128), None, rope);
+                if l < 3 { layer } else { selecting(layer, 128) }
+            })
+            .collect();
+        let kv = KvLayout::of(&mixers).expect("M3's layers are sized");
+        let total = |ctx: u64| (0..64).map(|l| kv.layer_bytes(l, ctx)).sum::<u64>();
+        for l in 0..3 {
+            assert_eq!(kv.layer_bytes(l, 10), 10 * 2048, "layer {l}");
+        }
+        for l in [3, 30, 59] {
+            assert_eq!(kv.layer_bytes(l, 10), 10 * (2048 + 256), "layer {l}");
+        }
+        assert_eq!(kv.layer_bytes(60, 10), 0);
+        assert_eq!(total(1), 60 * 2048 + 57 * 256);
+        assert_eq!(total(1), 122_880 + 14_592);
+        assert_eq!(total(32_768), 4_026_531_840 + 478_150_656);
+        assert_eq!(total(131_072), 16_106_127_360 + 1_912_602_624);
+        assert_eq!(kv.stage_position_bytes(10), (64 * 4 + 128 * 2) * 10);
+    }
+
+    /// An index rotation of its own is one more table beside the layer's: the stage copies a table a
+    /// distinct (base, dims) pair of the rotations the layers turn by, the selector's included.
+    #[test]
+    fn an_index_rotation_of_its_own_is_a_table_of_its_own() {
+        let layer = selecting(gqa(1, (16, 8), None, Some((1e6, 4))), 12);
+        let Mixer::Gqa(mut g) = layer else {
+            panic!("a GQA layer");
+        };
+        let same = KvLayout::of([&Mixer::Gqa(g.clone())]).expect("sized");
+        let Some(Selector::BlockMax { rope, .. }) = &mut g.select else {
+            panic!("a block selector");
+        };
+        rope.base = 1e7;
+        let own = KvLayout::of([&Mixer::Gqa(g)]).expect("sized");
+        // Beside the tables, the selector's sink row: 12 f16 values a position.
+        assert_eq!(same.stage_position_bytes(10), (4 * 4 + 12 * 2) * 10);
+        assert_eq!(own.stage_position_bytes(10), (2 * 4 * 4 + 12 * 2) * 10);
+    }
+
+    /// The selector's sink: the head kernel appends a value row beside each index key to one
+    /// plane every selecting layer shares, so the stage keeps the widest selector's key a position
+    /// once, whatever the selecting layers' count, and a trunk that selects nothing keeps none.
+    #[test]
+    fn the_selectors_share_one_sink_row() {
+        let rows = |mixers: &[Mixer]| {
+            KvLayout::of(mixers)
+                .expect("GQA layers are sized")
+                .stage_position_bytes(10)
+        };
+        let plain = gqa(1, (16, 8), None, None);
+        assert_eq!(rows(&[plain.clone(), plain.clone()]), 0);
+        let one = [selecting(plain.clone(), 12), plain.clone()];
+        assert_eq!(rows(&one), 12 * 2 * 10);
+        let two = [selecting(plain.clone(), 12), selecting(plain, 16)];
+        assert_eq!(rows(&two), 16 * 2 * 10);
+    }
+
+    /// A GQA layer whose selector this owner does not size (a pooled-token or a stream selector) or
+    /// whose block selector sits beside a window is refused by name with its layer, never sized as
+    /// a plain layer.
+    #[test]
+    fn a_selector_this_owner_does_not_size_is_refused_by_name() {
+        let plain = gqa(1, (16, 8), None, None);
+        let Mixer::Gqa(base) = gqa(1, (16, 8), None, None) else {
+            panic!("a GQA layer");
+        };
+        let pooled = Mixer::Gqa(Gqa {
+            select: Some(Selector::TokenPool {
+                heads: 1,
+                d: 12,
+                top_k: 16,
+                pool: 4,
+                rule: PoolRule::Learned { key_eps: 1e-6 },
+            }),
+            ..base
+        });
+        let Mixer::Gqa(windowed) = selecting(gqa(1, (16, 8), None, None), 12) else {
+            panic!("a GQA layer");
+        };
+        let windowed = Mixer::Gqa(Gqa {
+            window: Some(8),
+            ..windowed
+        });
+        for (mixer, words) in [
+            (pooled, "a selector other than the block selector"),
+            (windowed, "a block selector and a window"),
+        ] {
+            let err = KvLayout::of([&plain, &mixer]).expect_err("refused");
+            let PlacementError::Unimplemented(items) = err else {
+                panic!("{err:?}, not the unimplemented list");
+            };
+            assert_eq!(items.len(), 1, "{items:?}");
+            assert_eq!(items[0].layer, Some(1));
+            assert!(items[0].feature.contains(words), "{items:?}");
+        }
+    }
+
     /// A mixer whose store this owner does not size is refused by name with its layer, never read
     /// as a layer that holds nothing.
     #[test]
@@ -662,9 +936,10 @@ mod tests {
     }
 
     /// A stack is card-routed when the common kernel table gives its type the entries this
-    /// program's leg launches, and not otherwise: the types the table runs on the card for other
-    /// families (Q8_0 and IQ4_NL) and the ones it has no row for (Q2_K, the floats) keep their
-    /// layer's experts on the host.
+    /// program's leg launches, and not otherwise, in either part, for each body on the common leg
+    /// ([`routed_rule`]): the types the table runs on the card for other families (Q8_0 and
+    /// IQ4_NL) and the ones it has no row for (Q2_K, the floats) keep their layer's experts on the
+    /// host.
     // PIN(2026-10-11): card_runs now runs Q4_K/Q5_K through the common leg.
     // PIN(2026-10-11): the leg also runs IQ2_XS, IQ3_XXS and IQ4_XS (the raw-block entries of
     // `iq_sel.rs`), so those three are card-routed too.
@@ -672,6 +947,25 @@ mod tests {
     // card-routed too.
     #[test]
     fn only_the_stacks_the_leg_runs_are_card_routed() {
+        let rules = [
+            Program::Mimo2Body,
+            Program::Solar2Body,
+            Program::MiniMaxM3Body,
+        ]
+        .map(|p| {
+            let RoutedRule::Leg { gate_up, down } = routed_rule(p) else {
+                panic!("{p:?}: a leg rule");
+            };
+            (p, gate_up, down)
+        });
+        let card_routed = |ty: GgmlType| {
+            let parts: Vec<_> = rules
+                .iter()
+                .flat_map(|(_, gate_up, down)| [gate_up(ty), down(ty)])
+                .collect();
+            assert!(parts.windows(2).all(|w| w[0] == w[1]), "{ty}: {rules:?}");
+            parts[0]
+        };
         for ty in [
             GgmlType::MXFP4,
             GgmlType::Q4_K,

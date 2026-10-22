@@ -111,7 +111,11 @@ gate-gpu-mcol	common		kernel	quant_q4k+quant_q6k
 gate-gpu-mimo2-flash	family	mimo2	kernel	attn_gqa
 gate-gpu-minicpm-text	family	minicpmv47	e2e	attn_linear_gdn_kda
 gate-gpu-minicpmv-tower	family	minicpmv47	media	serve_media
+gate-gpu-minimaxm3-e2e	family	minimax-m3	e2e	graph_fault+attn_gqa+moe_route
+gate-gpu-minimaxm3-msa	family	minimax-m3	kernel	attn_gqa
+gate-gpu-minimaxm3-prefill	family	minimax-m3	e2e	prompt_walks
 gate-gpu-minimaxm3-rope	family	minimax-m3	kernel	attn_gqa
+gate-gpu-minimaxm3-serve	family	minimax-m3	serve	seats_serve_engine
 gate-gpu-moe	family	deepseek2	e2e	graph_fault+moe_route+weights_load
 gate-gpu-mxfp8	common		kernel	quant_q8
 gate-gpu-nemotron-e2e	family	nemotron_h	e2e	graph_fault+recur_mamba2
@@ -135,10 +139,12 @@ gate-gpu-ple	common		kernel	ple_embed
 gate-gpu-q4k-sel	common		kernel	quant_q4k
 gate-gpu-q6k-ids	common		kernel	quant_q6k
 gate-gpu-qwen3-serve	family	qwen3moe	serve	seats_serve_engine+serve_http_api
+gate-gpu-qwen3-dspark	family	qwen35moe	serve	seats_serve_engine+serve_http_api+drafts_dspark
 gate-gpu-qwen35-dspark	family	qwen35moe	draft	drafts_dspark
 gate-gpu-qwen35-media	family	qwen35	media	serve_media
 gate-gpu-qwen35moe-attn	common		kernel	attn_gqa
 gate-gpu-qwen35moe-e2e	family	qwen35moe	e2e	graph_fault+attn_linear_gdn_kda+attn_gqa+moe_route
+gate-gpu-qwen35moe-leg	family	qwen35moe	tier	tier_legs+placement_sizing
 gate-gpu-qwen35moe-media	family	qwen35moe	media	serve_media
 gate-gpu-qwen35moe-moe	family	qwen35moe	kernel	moe_route
 gate-gpu-qwen35moe-mtp	family	qwen35moe	draft	drafts_mtp
@@ -170,6 +176,7 @@ gate-gpu-serve-start-glm	family	glm5next	serve	seats_serve_engine+placement_sizi
 gate-gpu-solar2-e2e	family	solar-open2	e2e	graph_fault+attn_linear_gdn_kda+moe_route
 gate-gpu-solar2-prefill	family	solar-open2	e2e	prompt_walks
 gate-gpu-solar2-serve	family	solar-open2	serve	seats_serve_engine
+gate-gpu-solar2-twocard	family	solar-open2	tier	tier_legs+placement_sizing
 gate-gpu-swap	common		residency	residency
 gate-gpu-vision	family	deepseek41	media	serve_media
 gate-gpu-vision-hw	common		kernel	serve_media
@@ -181,6 +188,7 @@ gate-safetensors	common		host	refset_readers
 gate-jinja	common		host	tokenizer_jinja
 gate-kv	family	deepseek2	host	kv_pool_checkpoint
 gate-levers	common		lever	levers
+gate-device	common		device	device_seam
 gate-mimo2-meta	family	mimo2	meta	arch_registry
 gate-model-hf	common		host	arch_registry
 gate-models	common		host	arch_registry
@@ -190,6 +198,8 @@ gate-nemotron-h-moe-host	family	nemotron_h_moe	host	model_host_ops
 gate-nemotron-h-moe-meta	family	nemotron_h_moe	meta	arch_registry
 gate-nemotron-meta	family	nemotron_h	meta	arch_registry
 gate-ops	common		host	model_host_ops
+gate-os	common		host	os_calls
+gate-record	common		host	record_core
 gate-placement	common		place	placement_sizing
 gate-prepare	tooling		corpus	-
 gate-prepare-corpus	tooling		corpus	-
@@ -215,3 +225,9 @@ gate-threads	common		host	threads_pool
 gate-tokenizer	common		host	tokenizer_jinja
 gate-union	common		host	moe_route
 gate-vision	common		media	serve_media
+gate-gpu-raon1-e2e	family	raon1	e2e	graph_fault+attn_linear_gdn_kda+attn_latent_mla+moe_route+seats_app+drafts_dspark
+gate-gpu-raon1-attn	family	raon1	kernel	attn_linear_gdn_kda+attn_latent_mla
+gate-raon1-meta	family	raon1	meta	arch_registry
+gate-raon1-tokenizer	family	raon1	tokenizer	tokenizer_jinja
+# dfl-wire
+gate-gpu-raon1-dflash	family	raon1	draft	drafts_dspark

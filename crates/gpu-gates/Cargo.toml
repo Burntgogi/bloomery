@@ -1,6 +1,6 @@
 [package]
 name = "bloomery-gpu-gates"
-version = "0.3.6"
+version = "0.3.8"
 edition = "2024"
 publish = false
 license = "MIT"
@@ -16,15 +16,19 @@ bloomery-gguf = { path = "../gguf" }
 # node dumps' manifest (re-exported from `lib.rs`), the draft sets, greedy files, KLD bases and
 # the vision set.
 bloomery-refset = { path = "../refset" }
-# Host only, through the `hf` feature: a server's `--hf <repo>[:<quant>]`, the repo's GGUF set fetched into a
-# local cache, and a DSpark draft's configuration. The gates that read no such thing do not link it.
+# Host only, through the `hf` feature: a server's `--hf <repo>[:<quant>]`, the repo's GGUF set or safetensors
+# checkpoint fetched into a local cache, and a DSpark draft's configuration. The gates that read no such thing do
+# not link it.
 bloomery-hf = { path = "../hf", optional = true }
 # Host-only checkpoint weights, through `hf` for DSpark and `clef` for the decision head.
 bloomery-safetensors = { path = "../safetensors", optional = true }
-# Host only, through the `glm5next-hf` feature: GLM-5.3-Flash's checkpoint map (`generate_glm5next`'s tensor-parallel read).
+# Host only, through the `checkpoint` feature: the checkpoint maps, a Qwen3.8 checkpoint folder a server or
+# a gate opens (`serve_seats/qwen38_folder.rs`) and GLM-5.3-Flash's (`generate_glm5next`'s tensor-parallel read).
 bloomery-model-hf = { path = "../model-hf", optional = true }
 # Host only: the lever registry, which the binaries parse once at `main`.
 bloomery-levers = { path = "../levers" }
+# Host only: the one owner of a record line's syntax — the kinds' core, the schema and the reader.
+bloomery-record.workspace = true
 # Host-only edge, live with the `gpu` feature off: the oracle table's `Arch`, and the
 # CPU model's deepseek2 names and MLA parameters for the host bin `exact_ref`.
 bloomery-model = { path = "../model" }
@@ -52,6 +56,8 @@ bloomery-gpu-mimo2 = { path = "../gpu-mimo2", optional = true }
 # The Solar-Open2 program, reached only through the `solar2` feature (its end-to-end and prefill gates and the
 # `bloomery-serve` seat).
 bloomery-gpu-solar2 = { path = "../gpu-solar2", optional = true }
+# The MiniMax-M3 program, reached only through the `minimaxm3` feature (its sparse-attention gate).
+bloomery-gpu-minimaxm3 = { path = "../gpu-minimaxm3", optional = true }
 # The EmbeddingGemma 2 encoder, reached only through the `gemma-embedding2` feature (its end-to-end
 # gate).
 bloomery-gpu-gemma-embedding2 = { path = "../gpu-gemma-embedding2", optional = true }
@@ -100,8 +106,11 @@ bloomery-vision = { path = "../vision", optional = true }
 [features]
 # The hub: `--hf` fetches, plus DSpark configuration and checkpoint weights.
 hf = ["dep:bloomery-hf", "dep:bloomery-safetensors"]
+# A safetensors checkpoint folder read as stored: a server's or a gate's `-m <folder>`, and the folder a
+# `--hf` repo that holds a checkpoint resolves to.
+checkpoint = ["hf", "dep:bloomery-model-hf"]
 # GLM-5.3-Flash read from its Hugging Face checkpoint folder: `generate_glm5next --place tp`.
-glm5next-hf = ["glm5next", "hf", "dep:bloomery-model-hf"]
+glm5next-hf = ["glm5next", "checkpoint"]
 gpu = [
     "dep:bloomery-gpu",
     "dep:bloomery-verbs",
@@ -139,6 +148,7 @@ clef = ["gpu", "dep:bloomery-decision", "bloomery-decision/safetensors", "dep:bl
 glm5next = ["deepseek41", "dep:bloomery-gpu-glm5next", "bloomery-app/glm5next"]
 mimo2 = ["gpu", "dep:bloomery-gpu-mimo2", "bloomery-app/mimo2"]
 solar2 = ["gpu", "dep:bloomery-gpu-solar2", "bloomery-app/solar2"]
+minimaxm3 = ["gpu", "dep:bloomery-gpu-minimaxm3", "bloomery-app/minimaxm3"]
 gemma-embedding2 = ["gpu", "gemma4a", "dep:bloomery-gpu-vision", "dep:bloomery-gpu-gemma-embedding2", "dep:bloomery-serve"]
 gemma4a = ["gpu", "dep:bloomery-gpu-gemma4a", "dep:bloomery-vision"]
 
@@ -158,7 +168,7 @@ required-features = ["deepseek41"]
 [[bin]]
 name = "bloomery-serve"
 path = "src/bin/bloomery_serve.rs"
-required-features = ["glm5next", "clef", "mimo2", "solar2", "gemma-embedding2", "hf"]
+required-features = ["glm5next", "clef", "mimo2", "solar2", "minimaxm3", "gemma-embedding2", "hf"]
 
 [[bin]]
 name = "bloomery-serve-ds41"
@@ -383,8 +393,20 @@ name = "gate_solar2_prefill"
 required-features = ["solar2"]
 
 [[bin]]
+name = "gate_minimaxm3_prefill"
+required-features = ["minimaxm3"]
+
+[[bin]]
+name = "gate_solar2_twocard"
+required-features = ["solar2"]
+
+[[bin]]
 name = "gate_solar2_serve"
 required-features = ["deepseek41", "solar2"]
+
+[[bin]]
+name = "gate_minimaxm3_serve"
+required-features = ["deepseek41", "minimaxm3"]
 
 [[bin]]
 name = "gate_mimo2_serve"
@@ -587,6 +609,10 @@ name = "gate_linear"
 required-features = ["gpu"]
 
 [[bin]]
+name = "gate_qwen3_dspark"
+required-features = ["deepseek41", "hf"]
+
+[[bin]]
 name = "gate_qwen35_dspark"
 required-features = ["gpu", "hf"]
 
@@ -605,6 +631,14 @@ required-features = ["gpu"]
 [[bin]]
 name = "gate_minimaxm3_rope"
 required-features = ["gpu"]
+
+[[bin]]
+name = "gate_minimaxm3_msa"
+required-features = ["minimaxm3"]
+
+[[bin]]
+name = "gate_minimaxm3_e2e"
+required-features = ["minimaxm3"]
 
 [[bin]]
 name = "gate_gemma_embedding2_e2e"
@@ -725,3 +759,18 @@ required-features = ["hf"]
 [[bin]]
 name = "gate_qwen38_media"
 required-features = ["vision", "deepseek41"]
+
+# raon-body: the Raon-1 end-to-end gate.
+[[bin]]
+name = "gate_raon1_e2e"
+required-features = ["gpu"]
+
+# raon-attn: Raon-1's RDA and gated latent attention against the HF model in f64.
+[[bin]]
+name = "gate_raon1_attn"
+required-features = ["gpu"]
+
+# dfl-wire: Raon-1's DFlash2 draft: its load, the V4.1 DSpark file refused, and its first block against the host oracle's.
+[[bin]]
+name = "gate_raon1_dflash"
+required-features = ["gpu"]

@@ -6,10 +6,11 @@
 //! `route.rs`).
 
 use super::grouped::{
-    B_COL_W, B_STAGE_W, GEMM_BM, GEMM_NT, GEMM_THREADS, IQ2XXS_SB_BYTES, IQ3XXS_SB_BYTES,
-    IQ4XS_SB_WORDS, Q3K_D, Q3K_QS, Q3K_SB_BYTES, Q3K_SCALES, Q4K_SB_WORDS, Q5K_SB_WORDS, Q6K_D,
-    Q6K_QH, Q6K_SB_BYTES, Q6K_SCALES, S8_STAGE, WT_ROW_W, WT_STAGE_W, iq2xxs_lane, iq3xxs_lane,
-    iq4xs_scale, q3k_code, q3k_scale_word, q5k_code, sbyte, ubyte, win,
+    B_COL_W, B_STAGE_W, GEMM_BM, GEMM_NT, GEMM_THREADS, IQ2XXS_SB_BYTES, IQ3S_QH, IQ3S_QS,
+    IQ3S_SB_BYTES, IQ3S_SCALES, IQ3S_SIGNS, IQ3XXS_SB_BYTES, IQ4XS_SB_WORDS, Q3K_D, Q3K_QS,
+    Q3K_SB_BYTES, Q3K_SCALES, Q4K_SB_WORDS, Q5K_SB_WORDS, Q6K_D, Q6K_QH, Q6K_SB_BYTES, Q6K_SCALES,
+    S8_STAGE, WT_ROW_W, WT_STAGE_W, iq2xxs_lane, iq3s_lane, iq3xxs_lane, iq4xs_scale, q3k_code,
+    q3k_scale_word, q5k_code, sbyte, ubyte, win,
 };
 use super::route::{
     GEMM_MAX_EXPERTS, NO_EXPERT, ROUTE_HIST, ROUTE_THREADS, ROUTE_WARPS, route_id, tile_parts,
@@ -27,7 +28,7 @@ use std::sync::Arc;
 
 // `gemm_swiglu_quant`'s contract spells the largest gate·up rule code as a
 // literal.
-const _: () = assert!(crate::kquant::act::ACT_MAX == 2);
+const _: () = assert!(crate::kquant::act::ACT_MAX == 3);
 
 #[cuda_module]
 mod gemm_kernels {
@@ -665,6 +666,62 @@ mod gemm_kernels {
         );
     }
 
+    /// [`gemm_iq3xxs`] for an IQ3_S stack: the file's byte stream, `110 · n_sb`
+    /// bytes a row, as u32 words padded at the end to a whole word; a
+    /// super-block may start at 2 mod 4. The decode names its grid entries
+    /// through `iq.rs`'s `GRID3S` device global, one load a fragment word, and
+    /// negates them by the file's raw sign bytes; the sub-block scale `2s + 1`
+    /// stays an integer factor of `isum` and the epilogue scales by `d`
+    /// (`grouped.rs`).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256, 2)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            4 * w.len() >= n_experts * rows * 110 * n_sb,
+            q6.len() >= act_cols * 128 * half_it,
+            s8.len() >= act_cols * 8 * n_sb,
+            d8.len() >= act_cols * 2 * n_sb,
+            cols.len() >= n_slots,
+            tiles.len() >= 2 * max_tiles,
+            n_tiles.len() >= 2,
+            y.len() >= n_slots * rows
+        )
+    )]
+    pub fn gemm_iq3s(
+        w: &[u32],
+        q6: &[u32],
+        s8: &[i32],
+        d8: &[f32],
+        cols: &[u32],
+        tiles: &[u32],
+        n_tiles: &[u32],
+        n_experts: u32,
+        rows: u32,
+        n_sb: u32,
+        half_it: u32,
+        act_cols: u32,
+        n_slots: u32,
+        max_tiles: u32,
+        slot_div: u32,
+        row_tiles: u32,
+        mut y: DisjointSlice<f32>,
+    ) {
+        gemm_block!(
+            dec: iq3s_dec,
+            wst: wst_direct(),
+            walk: plain,
+            sb_units: IQ3S_SB_BYTES,
+            params: (w, q6, s8, d8, cols, tiles, n_tiles, n_experts, rows, n_sb, half_it,
+                act_cols, n_slots, max_tiles, slot_div, row_tiles, y),
+        );
+    }
+
     /// [`gemm_q5k`] for an IQ4_XS stack: rows of `34 · n_sb` words. The
     /// decode reads each code word through `iq.rs`'s `kvalues_iq4nl` register
     /// table and its sub-block scales `ls − 32` from the super-block's header
@@ -723,8 +780,9 @@ mod gemm_kernels {
     /// of block `(col, b)` takes values `128·b + 4·l .. +3` of column `col` of
     /// `g` and `u`, forms the gate·up rule `kquant::act::apply(act, limit, ..)`
     /// of each pair — `elem::silu_mul` (`ACT_SILU_MUL`), ik's clamped SwiGLU
-    /// at `limit` (`ACT_SWIGLU_CLAMP`) or the OAI SwiGLU at `limit`
-    /// (`ACT_SWIGLU_OAI`), the contract admits those three codes alone —
+    /// at `limit` (`ACT_SWIGLU_CLAMP`), the OAI SwiGLU at `limit`
+    /// (`ACT_SWIGLU_OAI`) or SiTU at beta `limit` (`ACT_SITU`), the contract
+    /// admits those four codes alone —
     /// and hands the four to `q8_1_quant_vals`: the values
     /// `elem::swiglu` stores under the first rule and the bytes
     /// `q3k_quantize_q8_1` writes from them, since both run the same bodies
@@ -742,7 +800,7 @@ mod gemm_kernels {
         domain = 1,
         block = (32, 1, 1),
         requires = (
-            act <= 2,
+            act <= 3,
             g.len() >= n_cols * 256 * n_sb,
             u.len() >= n_cols * 256 * n_sb,
             q3.len() >= n_cols * 64 * half_it,

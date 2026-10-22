@@ -55,6 +55,7 @@ mod gate {
     use app::dspark::CardDspark;
     use bloomery_gpu::arch::qwen3moe::{Body35, KvQ8, Open35, Qwen35moeModel};
     use bloomery_gpu::dspark::dense::{DenseDims, DenseLayers};
+    use bloomery_gpu::dspark::head::HeadTail;
     use bloomery_gpu::dspark::{DraftLayers, DsparkBody, HeadSource, Q8Rows};
     use bloomery_gpu::rope_table::{Direction, RopeSpec, RopeTable};
     use bloomery_gpu::weights::q8_0_planes;
@@ -529,17 +530,20 @@ mod gate {
                 .map(|b| u32::from_le_bytes(*b))
                 .collect())
         };
-        let w1 = parts.head.markov_w1.buf().to_host_vec(stream)?
-            == words("markov_head.markov_w1.weight")?;
-        let w2 = parts.head.markov_w2.buf().to_host_vec(stream)?
-            == words("markov_head.markov_w2.weight")?;
-        let map = match (&parts.shape.vocab, &parts.head.to_target) {
+        let HeadTail::Markov(tables) = &parts.head.tail else {
+            return Err("the loader's head is not a Markov head".into());
+        };
+        let w1 =
+            tables.markov_w1.buf().to_host_vec(stream)? == words("markov_head.markov_w1.weight")?;
+        let w2 =
+            tables.markov_w2.buf().to_host_vec(stream)? == words("markov_head.markov_w2.weight")?;
+        let map = match (&parts.shape.vocab, &tables.to_target) {
             (DraftVocab::Reduced { to_target, .. }, Some(card)) => {
                 card.to_host_vec(stream)? == *to_target
             }
             _ => false,
         };
-        let conf = match &parts.head.conf {
+        let conf = match &tables.conf {
             Some((w, b)) => {
                 let (fw, _) = file.f32s("confidence_head.proj.weight")?;
                 let (fb, _) = file.f32s("confidence_head.proj.bias")?;

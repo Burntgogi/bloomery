@@ -51,7 +51,9 @@
 //! walk's host leg; until then it stays on the card's fault word, which the
 //! target's next readback names.
 
-use bloomery_gpu::draft::{Feed, Hidden, WalkMode};
+use bloomery_gpu::draft::{
+    DraftFeed, DraftHead, Feed, Hidden, WalkBounds, WalkMode, refuse_own, refuse_rows,
+};
 use bloomery_gpu::head::{Head, HeadNorm};
 use bloomery_gpu::host::BatchLeg;
 use bloomery_gpu::host::shell::TierShell;
@@ -59,6 +61,7 @@ use bloomery_gpu::latent::{
     INDEX_HEAD, INDEX_ROW, IndexKeyArgs, LATENT, LatentAppendArgs, Rows, pools_for,
 };
 use bloomery_gpu::media::widen_bf16;
+use bloomery_gpu::site;
 use bloomery_gpu::weights::Weights;
 use bloomery_gpu::{COL_GROUP, DeviceTensor, Gpu, GpuError, GpuModel};
 use bloomery_gpu_deepseek41::block::{Block, BlockIo, BlockPlan, enqueue_block};
@@ -82,8 +85,16 @@ use crate::tensors::{FfnNames, LatentNames, LayerNames, MixerNames};
 /// What the NextN walk's errors name.
 const WHAT: &str = "glm5next NextN";
 
-/// The most rows one walk takes: the m-column kernels' width.
+/// The program's [`WalkBounds::WALK_ROWS`] and [`WalkBounds::STORE_ROWS`]: the
+/// m-column kernels' width.
 pub const WALK_ROWS: usize = COL_GROUP;
+
+impl WalkBounds for Nextn {
+    const WALK_ROWS: usize = WALK_ROWS;
+    /// No walk is captured: the host's union call sits between its launches.
+    const GRAPH_ROWS: usize = 0;
+    const STORE_ROWS: usize = WALK_ROWS;
+}
 
 /// A target arena whose final hidden rows a NextN walk reads: where a step,
 /// a verify and a prompt batch leave their rows' streams.
@@ -96,13 +107,6 @@ pub enum GlmArena {
     Pair,
     /// A prompt batch's rows, row `i` the batch's position `i`.
     Prefill,
-}
-
-/// Which projection the draft's head runs: the target's `output`, the whole
-/// vocabulary (the load opens no row list).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum NextnHead {
-    Full,
 }
 
 /// The layer's tensor names, and the target's `output_norm` its hidden rows
@@ -578,16 +582,25 @@ impl Held {
         self.rows = self.rows.min(pos.saturating_sub(self.first));
     }
 
-    /// Whether rows `row .. row + m` hold positions `at .. at + m`.
+    /// Whether rows `row .. row + m` hold positions `at .. at + m`. A range
+    /// whose end, or whose first position, is past `usize` holds nothing.
     fn holds(&self, row: usize, m: usize, at: u32) -> bool {
-        row + m <= self.rows as usize && self.first as usize + row == at as usize
+        let (Some(end), Some(first)) = (row.checked_add(m), (self.first as usize).checked_add(row))
+        else {
+            return false;
+        };
+        end <= self.rows as usize && first == at as usize
     }
 
     /// The positions held, for a refusal's words.
     fn shown(&self) -> String {
         match self.rows {
             0 => "no position".to_string(),
-            r => format!("positions {}..{}", self.first, self.first + r),
+            r => format!(
+                "positions {}..{}",
+                self.first,
+                u64::from(self.first) + u64::from(r)
+            ),
         }
     }
 }
@@ -704,10 +717,9 @@ fn hidden_src<'a>(
         Src::Rows { rows, .. } => rows,
         Src::Pair { .. } => 2,
     };
-    if first + m > rows {
+    if first.checked_add(m).is_none_or(|end| end > rows) {
         return Err(shape(format!(
-            "rows {first}..{} of the {walk:?} arena's {rows}",
-            first + m
+            "{m} rows from row {first} of the {walk:?} arena's {rows}"
         )));
     }
     let at = pos0.checked_sub(1).ok_or_else(|| {
@@ -998,11 +1010,7 @@ impl Body {
         let n = d.embd;
         let m = feed.tokens.len();
         let pos0 = feed.pos0 as usize;
-        if !(1..=WALK_ROWS).contains(&m) {
-            return Err(shape(format!(
-                "a walk of {m} rows; a walk takes 1..={WALK_ROWS}"
-            )));
-        }
+        refuse_rows::<Nextn>(WHAT, mode, m)?;
         if pos0 + m > nx.ctx {
             return Err(shape(format!(
                 "{m} rows from position {pos0} in a store of {}",
@@ -1099,10 +1107,10 @@ impl Body {
                 &mut *span_mut(WHAT, &mut a.pack, t * 2 * n + n, n)?,
             )?;
         }
-        w.q8_gemv_mcol(
+        site::resident_gemv_cols(
             gpu,
-            BODY,
-            &nm.eh,
+            None,
+            (w, &nm.eh),
             &*span(WHAT, &a.pack, 0, m * 2 * n)?,
             m,
             &mut a.x,
@@ -1120,10 +1128,10 @@ impl Body {
             m,
             &mut a.xn,
         )?;
-        w.q8_gemv_mcol(
+        site::resident_gemv_cols(
             gpu,
-            BODY,
-            &ln.stack,
+            None,
+            (w, &ln.stack),
             &*span(WHAT, &a.xn, 0, m * n)?,
             m,
             &mut a.stack,
@@ -1275,16 +1283,19 @@ impl Body {
 }
 
 /// One NextN walk of `feed` into `head` in `mode`, with no readback
-/// ([`Body::nextn_run`]'s refusals, and a poisoned model's). A fault the
-/// walk's own calls meet is its error and poisons the model; one they do not
-/// read stays on the card's fault word, which the next readback names.
+/// ([`Body::nextn_run`]'s refusals, a poisoned model's, a row-list head — the
+/// load opens the full head alone — and the draft's own row, which this
+/// program has none of). A fault the walk's own calls meet is its error and
+/// poisons the model; one they do not read stays on the card's fault word,
+/// which the next readback names.
 pub fn nextn_walk(
     m: &mut GpuModel<Body>,
-    feed: Feed<'_, GlmArena>,
-    head: NextnHead,
+    feed: DraftFeed<'_, GlmArena>,
+    head: DraftHead,
     mode: WalkMode,
 ) -> Result<(), GpuError> {
-    let NextnHead::Full = head;
+    head.check_opened(WHAT, false)?;
+    let feed = feed.target_rows(WHAT)?;
     if let Some(fault) = m.poisoned() {
         return Err(GpuError::Poisoned { what: WHAT, fault });
     }
@@ -1295,23 +1306,22 @@ pub fn nextn_walk(
 
 /// One window's chain, one readback: `refresh` walked eager through the head,
 /// its last row's prediction the proposal's one id, written to `out[0]`; the
-/// count, 1. `own` walks past it are refused by name (a proposal holds one
-/// id), as are media rows in the refresh, a store walk's mode, a captured
-/// one and an `out` with no place. A fault any launch raised is the chain's error and poisons the
-/// model as the target's would.
+/// count, 1. `own` walks past it are refused by name as the own row's walk
+/// is (a proposal holds one id), as are media rows in the refresh, a store
+/// walk's mode, a captured one and an `out` with no place. A fault any launch
+/// raised is the chain's error and poisons the model as the target's would.
 pub fn nextn_chain(
     m: &mut GpuModel<Body>,
-    refresh: Feed<'_, GlmArena>,
+    refresh: DraftFeed<'_, GlmArena>,
     own: usize,
-    head: NextnHead,
+    head: DraftHead,
     mode: WalkMode,
     out: &mut [u32],
 ) -> Result<usize, GpuError> {
     if own != 0 {
-        return Err(shape(format!(
-            "a chain of {own} own walks; a GLM proposal holds one id"
-        )));
+        return Err(refuse_own(WHAT, &format!("a chain of {own} own walks")));
     }
+    let refresh = refresh.target_rows(WHAT)?;
     if refresh.media.is_some() {
         return Err(shape(
             "a chain whose refresh holds media rows: only a prompt call's walks read them"
@@ -1326,7 +1336,7 @@ pub fn nextn_chain(
     let place = out
         .first_mut()
         .ok_or_else(|| shape("a proposal of 1 id into 0 places".to_string()))?;
-    nextn_walk(m, refresh, head, mode)?;
+    nextn_walk(m, DraftFeed::Rows(refresh), head, mode)?;
     let (gpu, _, body) = m.body_parts(WHAT)?;
     let nx = body
         .nextn

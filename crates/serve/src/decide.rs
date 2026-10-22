@@ -8,8 +8,8 @@
 //! CORS answer [`crate::Server`] gives), and a 404 error object naming the routes for anything
 //! else ([`not_found`]: a chat client finds what to post instead). A refused request
 //! is a 400 carrying the decider's message, a request the engine cannot answer (an image) a 501
-//! `not_supported_error`. Every request is checked against the API keys first
-//! ([`crate::api::key_denied`], the same call the generative server makes). The decider runs one
+//! `not_supported_error`. Request headers are checked against the API keys before reading a body
+//! ([`crate::api::keep_alive`], the same owner as the generative server). The decider runs one
 //! request at a time behind a mutex; connections are
 //! accepted and kept alive by the same owner as [`crate::Server`]'s (at most
 //! [`crate::MAX_CONNECTIONS`] at once, a connection past them a 503).
@@ -38,8 +38,8 @@ use serde_json::{Value, json};
 
 use crate::api::{
     Answers, End, Ended, JSON, accept, cors_preflight, engine_object, error_body, exit_shutdown,
-    fatal_health, install_signals, keep_alive, key_denied, panic_text, relock, stopping,
-    stopping_message, wait_end,
+    fatal_health, install_signals, keep_alive, panic_text, relock, stopping, stopping_message,
+    wait_end,
 };
 use crate::flag::ApiKeys;
 use crate::http::{self, Request};
@@ -573,15 +573,9 @@ fn not_found(routes: &[&str]) -> String {
     )
 }
 
-/// One connection's request: the key check first — the same call the
-/// generative server's dispatch makes — then the dispatch ([`reply`]),
-/// written to `w`. `Ok(true)`: the connection may carry another request.
-/// Named, not the closure it was, so a test can drive a request through the
-/// check and the dispatch as the server does.
+/// Dispatches one authorized request through [`reply`] and writes its answer to `w`.
+/// `Ok(true)`: the connection may carry another request.
 fn answer(s: &Shared, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
-    if key_denied(&s.api_keys, req, w)? {
-        return Ok(true);
-    }
     let a = reply(s, req);
     http::respond(w, req, a.status, a.ctype, &a.extra, &a.body)?;
     Ok(true)
@@ -710,7 +704,9 @@ impl DecideServer {
         });
         let conn = Arc::clone(&shared);
         accept(listener, shared.end.clone(), move |stream| {
-            keep_alive(stream, &conn.answers, |req, w| answer(&conn, req, w));
+            keep_alive(stream, &conn.answers, &conn.api_keys, |req, w| {
+                answer(&conn, req, w)
+            });
         });
         crate::screen::draw();
         // `shared` holds a sender, so the channel cannot close while we wait.
@@ -1498,60 +1494,60 @@ mod tests {
         );
     }
 
-    /// A connected pair on loopback: the server side for [`answer`] to
-    /// write to, the client side to read what reached it.
+    /// A bounded socket pair for the connection handler and its client.
     fn pair() -> (std::net::TcpStream, TcpStream) {
         let ln = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let client = std::net::TcpStream::connect(ln.local_addr().unwrap()).unwrap();
         let (server, _) = ln.accept().unwrap();
+        for stream in [&client, &server] {
+            let bound = Some(std::time::Duration::from_secs(5));
+            stream.set_read_timeout(bound).unwrap();
+            stream.set_write_timeout(bound).unwrap();
+        }
         (client, server)
     }
 
-    /// What [`answer`] wrote, read from the client side of the pair: the
-    /// status and the body.
-    fn written(mut client: &std::net::TcpStream) -> (u16, String) {
-        use std::io::Read;
-        let mut raw = String::new();
-        client.read_to_string(&mut raw).unwrap();
-        let (head, body) = raw.split_once("\r\n\r\n").expect("a head");
-        let status = head
-            .split_whitespace()
-            .nth(1)
-            .and_then(|c| c.parse().ok())
-            .expect("a status line");
-        (status, body.to_owned())
+    /// Reads one closing response's status and body, with no interim response before it.
+    fn written(client: &std::net::TcpStream) -> (u16, String) {
+        let (status, head, body) =
+            crate::http::read_test_response(&mut std::io::BufReader::new(client));
+        assert!(head.contains("Connection: close"), "{head}");
+        (status, String::from_utf8(body).expect("a UTF-8 response"))
     }
 
-    /// The decide server checks keys before its dispatch, the generative
-    /// server's own call: without a key a route is the 401 llama-server
-    /// sends (and `/health` still answers, and `OPTIONS` passes), with the
-    /// key — from either header — the decider answers. Driven through
-    /// [`answer`] over a real socket pair because no in-crate test can run
-    /// the socket server itself: its accept loop lives in [`DecideServer::run`],
-    /// which installs the process's signals and never returns (an orderly
-    /// stop exits the process), and the server has no background-spawn
-    /// entry.
+    /// Both servers' connection owner checks headers before a body or `100 Continue`.
+    /// Denied bodies stay unsent, while either key header and the public routes still work.
     #[test]
     fn the_decide_server_checks_keys_before_its_dispatch_too() {
         let mut keys = ApiKeys::default();
         keys.add("--api-key", "sk-decide-key").unwrap();
         let s = shared_with(keys);
-
-        let with = |headers: &[(&str, &str)]| {
-            let mut req = post("/v1/rerank");
-            req.headers = headers
+        let send = |method: &str, path: &str, headers: &[(&str, &str)], denied: bool| {
+            use std::io::Write;
+            let (mut client, server) = pair();
+            let extra: String = headers
                 .iter()
-                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .map(|(k, v)| format!("{k}: {v}\r\n"))
                 .collect();
-            req
-        };
-
-        let (status, body) = {
-            let (client, mut server) = pair();
-            answer(&s, &with(&[]), &mut server).unwrap();
-            drop(server);
+            let (connection, expect, body) = if denied {
+                ("keep-alive", "Expect: 100-continue\r\n", "")
+            } else {
+                ("close", "", "hello")
+            };
+            write!(
+                client,
+                "{method} {path} HTTP/1.1\r\nConnection: {connection}\r\n\
+                 Content-Length: 5\r\n{extra}{expect}\r\n{body}"
+            )
+            .unwrap();
+            // These bounded requests and responses fit the socket buffers. Run on this thread:
+            // denied requests deliberately leave the advertised body unsent, so the handler
+            // must return from the headers alone, without an interim `100 Continue`.
+            keep_alive(server, &s.answers, &s.api_keys, |req, w| answer(&s, req, w));
             written(&client)
         };
+
+        let (status, body) = send("POST", "/v1/rerank", &[], true);
         assert_eq!(status, 401, "no key: {body}");
         let v: Value = serde_json::from_str(&body).expect("the 401's body is JSON");
         assert_eq!(
@@ -1563,12 +1559,7 @@ mod tests {
             ("Authorization", "Bearer sk-wrong"),
             ("X-Api-Key", "sk-wrong"),
         ] {
-            let (status, body) = {
-                let (client, mut server) = pair();
-                answer(&s, &with(&[wrong]), &mut server).unwrap();
-                drop(server);
-                written(&client)
-            };
+            let (status, body) = send("POST", "/v1/rerank", &[wrong], true);
             assert_eq!(status, 401, "{wrong:?}: {body}");
         }
 
@@ -1576,12 +1567,7 @@ mod tests {
             ("Authorization", "Bearer sk-decide-key"),
             ("X-Api-Key", "sk-decide-key"),
         ] {
-            let (status, body) = {
-                let (client, mut server) = pair();
-                answer(&s, &with(&[right]), &mut server).unwrap();
-                drop(server);
-                written(&client)
-            };
+            let (status, body) = send("POST", "/v1/rerank", &[right], false);
             assert_eq!(status, 200, "{right:?}: {body}");
             assert!(body.starts_with(r#"{"a":1,"timings":"#), "{body}");
         }
@@ -1595,21 +1581,7 @@ mod tests {
             ("GET", "/v1/health", 404),
             ("OPTIONS", "/v1/rerank", 204),
         ] {
-            let (status, body) = {
-                let (client, mut server) = pair();
-                answer(
-                    &s,
-                    &Request {
-                        method: method.to_owned(),
-                        path: path.to_owned(),
-                        ..closing()
-                    },
-                    &mut server,
-                )
-                .unwrap();
-                drop(server);
-                written(&client)
-            };
+            let (status, body) = send(method, path, &[], false);
             assert_eq!(status, wants, "{method} {path}: {body}");
         }
     }

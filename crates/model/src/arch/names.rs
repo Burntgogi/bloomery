@@ -333,3 +333,84 @@ mod tests {
         assert_eq!(blk(3, "attn_norm.weight"), "blk.3.attn_norm.weight");
     }
 }
+
+// ------------------------------------------------ latent attention and hyper-connections
+
+/// `blk.{l}.attn_q_a.weight` — the query's down projection to its latent.
+#[must_use]
+pub fn attn_q_a(l: usize) -> String {
+    blk(l, "attn_q_a.weight")
+}
+
+/// `blk.{l}.attn_q_a_norm.weight` — the RMS gain of the query latent.
+#[must_use]
+pub fn attn_q_a_norm(l: usize) -> String {
+    blk(l, "attn_q_a_norm.weight")
+}
+
+/// `blk.{l}.attn_q_b.weight` — the query latent's up projection to the heads.
+#[must_use]
+pub fn attn_q_b(l: usize) -> String {
+    blk(l, "attn_q_b.weight")
+}
+
+/// `blk.{l}.attn_kv_a_mqa.weight` — the key and value latent's down projection, with the key
+/// values every head shares.
+#[must_use]
+pub fn attn_kv_a_mqa(l: usize) -> String {
+    blk(l, "attn_kv_a_mqa.weight")
+}
+
+/// `blk.{l}.attn_kv_a_norm.weight` — the RMS gain of the key and value latent.
+#[must_use]
+pub fn attn_kv_a_norm(l: usize) -> String {
+    blk(l, "attn_kv_a_norm.weight")
+}
+
+/// `blk.{l}.attn_k_b.weight` — the per-head key up projection a latent layer absorbs into its
+/// query.
+#[must_use]
+pub fn attn_k_b(l: usize) -> String {
+    blk(l, "attn_k_b.weight")
+}
+
+/// `blk.{l}.attn_v_b.weight` — the per-head value up projection a latent layer applies to its
+/// attended latent.
+#[must_use]
+pub fn attn_v_b(l: usize) -> String {
+    blk(l, "attn_v_b.weight")
+}
+
+/// The sub-layer a hyper-connection mix feeds: the mixer or the feed-forward block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Sub {
+    Attn,
+    Ffn,
+}
+
+impl Sub {
+    fn stem(self) -> &'static str {
+        match self {
+            Sub::Attn => "attn",
+            Sub::Ffn => "ffn",
+        }
+    }
+}
+
+/// `blk.{l}.hc_{attn,ffn}_fn.weight` — the selector projection of the streams.
+#[must_use]
+pub fn hc_fn(l: usize, sub: Sub) -> String {
+    blk(l, &format!("hc_{}_fn.weight", sub.stem()))
+}
+
+/// `blk.{l}.hc_{attn,ffn}_scale.weight` — the mix's scalars.
+#[must_use]
+pub fn hc_scale(l: usize, sub: Sub) -> String {
+    blk(l, &format!("hc_{}_scale.weight", sub.stem()))
+}
+
+/// `blk.{l}.hc_{attn,ffn}_base.weight` — the mix's biases.
+#[must_use]
+pub fn hc_base(l: usize, sub: Sub) -> String {
+    blk(l, &format!("hc_{}_base.weight", sub.stem()))
+}

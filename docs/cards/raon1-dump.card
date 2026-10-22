@@ -1,0 +1,30 @@
+# Round raon-ref: KRAFTON's llama.cpp branch raon-1-mini-preview (fb895662d, CPU, no patch) over the Q4_K_M file (19.7 GB, one file),
+# `just dump-ref-raon1`: four prompts (26, 31, 72 and 1,536 ids) from ONE load, the layer taps of the first, each layer output and
+# router id of the next two, the last logits row of the last, and 32 greedy tokens of the first three. The phases run one after the
+# other on the same 32 threads: the wall is their sum.
+# Predicted wall [derived], seconds (MACs from the file's tensor shapes, a token: 6 routed experts 1.20 G, the 24 shared experts 0.20 G,
+# the dense layer 0 0.09 G, 18 RDA layers 1.20 G, 7 MLA layers 0.27 G = 2.96 G, the head 0.67 G on the last row only; the MLA attention
+# itself at depth 1,536: 0.36 T MACs over the 7 layers for d; bytes a token, read once: routed 0.80 GB, shared 0.18 GB, dense 0.05 GB,
+# RDA 1.02 GB, MLA 0.28 GB, head 0.55 GB = 2.9 GB):
+#   load      the CPU backend repacks the types it has an interleave for on this CPU (AVX2, no AVX-512: Q4_0, Q4_K, IQ4_NL, MXFP4;
+#             Q6_K and Q8_0 only on ARM and RISC-V): the Q4_K gate/up experts and dense rows are repacked into anonymous memory (about
+#             11 GB of the 19.7), the Q6_K, Q8_0 and Q5_0 rows stay mapped. 5-15 s
+#   cold read the first touch of every mapped page, if the file is not in the page cache: 19.7 GB at ~3 GB/s = 7 s, up to 15 s at
+#             demand-paged rates. 0-15 s
+#   prefill   1,665 ids x 2 x 2.96 G MACs = 9.9 TFLOP, plus the attention of d 0.7 TFLOP: 10.6 TFLOP through the AVX2 dots. THE ONE TERM
+#             derivation does not close: the 32-thread ggml rate on the unrepacked Q6_K/Q8_0/Q5_0 rows and on the RDA scan, expected
+#             0.5-1.0 TFLOP/s (Solar's repacked Q4_K ran 0.94 TFLOP/s overall): 11-21 s. Each 512-row ubatch reads every expert once
+#             (19.7 GB over ~120 GB/s = 0.16 s, under the compute: the DRAM's time is shadowed). 11-21 s
+#   greedy    96 tokens at 2.9 GB read a token over ~120 GB/s = 0.025 s, 0.06-0.10 s with the graph's ~40 small ops a layer and the
+#             compute of unrepacked rows: 6-10 s
+#   writes    ~0.3 GB of f32 node files through the callback's gather (a's taps): 1-3 s
+#   total     25-60 s (warm 25-50 s, cold 40-65 s); central 40 s warm; bound 1800 s.
+# What the run guarantees: CUDA hidden, the CPU lease held, no peer on the box's cores (the lease), the staging set installed only
+# when each prompt's manifest carries its `# complete` trailer. The dumper prints its load, per-prompt and per-greedy walls: the
+# prefill rate is read from d's `prompt` seconds (1,536 of the 1,665 ids).
+kind: exclusive
+reason: raon1_dump runs the vendor llama.cpp branch on 32 CPU threads and maps the whole 19.7 GB file (the Q4_K rows repacked into
+  anonymous memory, about 11 GB), evicting that much page cache; beside a timed run or a gate batch it would take their cores and their
+  memory bandwidth, so it holds the lease; why now: the Raon-1 oracle every body round (the RDA layer, the mHC site, the MLA layer with
+  the output gate, SiTU, the decode step) is judged against (round raon-ref)
+minutes: 1..3

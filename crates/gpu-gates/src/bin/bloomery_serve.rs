@@ -1,12 +1,13 @@
 //! `bloomery-serve` — one server binary, one seat a model: `--model
-//! ds41|qwen38|glm|qwen3|mimo2|solar2|nemotron|decide` picks the seat (`serve_seats`, the shared
-//! seat modules), every other flag the seat's own, parsed by the seat's own
-//! parser, so each seat's flag set is exactly its per-model binary's. The
+//! ds41|qwen38|glm|qwen3|mimo2|solar2|minimaxm3|nemotron|raon1|decide` picks the seat
+//! (`serve_seats`, the shared seat modules), every other flag the seat's own,
+//! parsed by the seat's own parser, so each seat's flag set is exactly its
+//! per-model binary's. The
 //! word is optional with a model file: with none, the file's architecture
 //! picks the seat, and a bare start or `--help` prints [`drive::MODELS`],
 //! one line a seat with a working `--hf` example.
 //!
-//!     bloomery-serve [--model ds41|qwen38|glm|qwen3|mimo2|solar2|nemotron|decide]
+//!     bloomery-serve [--model ds41|qwen38|glm|qwen3|mimo2|solar2|minimaxm3|nemotron|raon1|decide]
 //!                    [-m PATH | --model-file PATH | --hf <repo>[:<quant>]]
 //!                    [--head <weights> [--head-config <file>]]
 //!                    <the seat's own flags>
@@ -37,8 +38,9 @@
 //! Otherwise, with no `--model`, the architecture of the file's first shard
 //! picks the seat: deepseek41 and deepseek4 the ds41 seat, glm5next and
 //! glm5-next the glm seat, qwen4exp the qwen38 seat, qwen3moe and qwen35moe
-//! the qwen3 seat, mimo2 the mimo2 seat, solar-open2 the solar2 seat,
-//! nemotron_h and nemotron_h_moe the nemotron seat;
+//! the qwen3 seat, mimo2 the mimo2 seat, solar-open2 the solar2 seat, minimax-m3
+//! the minimaxm3 seat,
+//! nemotron_h and nemotron_h_moe the nemotron seat, raon1 the raon1 seat;
 //! a dense qwen35 file generates through `--model qwen3`. With no model
 //! word it keeps the decision selection rules: a file with no head is
 //! refused by name, saying what would seat it (`--head`, a row's `--hf`
@@ -117,6 +119,24 @@ mod dspark;
 #[path = "shared/ds41_draft.rs"]
 mod draft;
 
+// The qwen3 seat's draft opens through the same HF reader the dspark gates use
+// (`crate::dspark_hf`) and its verify capture records nothing (`crate::quiet`).
+#[cfg(feature = "deepseek41")]
+#[path = "shared/dspark_hf.rs"]
+#[allow(
+    dead_code,
+    reason = "the serve seat opens a draft; the gate-only readers stay unused here"
+)]
+mod dspark_hf;
+
+#[cfg(feature = "deepseek41")]
+#[path = "shared/quiet.rs"]
+#[allow(
+    clippy::duplicate_mod,
+    reason = "each binary includes the shared log by path; a seat binary may reach it twice"
+)]
+mod quiet;
+
 #[cfg(feature = "deepseek41")]
 #[path = "shared/ds41_place.rs"]
 mod place;
@@ -134,18 +154,21 @@ mod drive {
     use serve::decide::Ask;
     use serve::preflight::Driver;
 
-    use crate::serve_seats::{decide, ds41, glm, mimo2, nemotron, qwen3, qwen38, solar2};
+    use crate::serve_seats::{
+        decide, ds41, glm, mimo2, minimaxm3, nemotron, qwen3, qwen38, raon1, solar2,
+    };
 
     const NAME: &str = "bloomery-serve";
 
-    const USAGE: &str = "usage: bloomery-serve [--model ds41|qwen38|glm|qwen3|mimo2|solar2|nemotron|decide] \
+    const USAGE: &str = "usage: bloomery-serve [--model ds41|qwen38|glm|qwen3|mimo2|solar2|minimaxm3|nemotron|raon1|decide] \
                          [-m PATH | --model-file PATH | --hf <repo>[:<quant>]] [--head <weights> \
                          [--head-config <file>]] [--embd-model FILE | --embd-hf \
                          <repo>[:<quant>]] [--embd-ctx N] [--embd-cache-bytes N] [--embd-mmproj FILE | \
                          --embd-no-mmproj] [--embd-image-min-tokens N] [--embd-image-max-tokens N] \
                          <the chosen seat's own flags, as \
                          bloomery-serve-ds41, bloomery-serve-qwen38, the glm, the qwen3, the \
-                         mimo2, the solar2, the nemotron or the decide seat takes them> | --version";
+                         mimo2, the solar2, the minimaxm3, the nemotron, the raon1 or the decide seat takes \
+                         them> | --version";
 
     /// One line a seat, printed beside [`USAGE`] on `--help` and a bare
     /// start: the seat word, what it serves, and a working `--hf` example of
@@ -158,8 +181,10 @@ models (the --model word is optional with a model file: the file's architecture 
   qwen3   Qwen3-30B-A3B and Qwen3.6    --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M
   mimo2   MiMo-V2.6-Flash              --hf ggml-org/MiMo-V2.6-Flash-MOPD-GGUF:MXFP4
   solar2  Solar-Open2-250B             -m <path>
+  minimaxm3 MiniMax-M3-UD-IQ4_XS        -m <path>
   nemotron Nemotron 3 Nano             --hf nvidia/NVIDIA-Nemotron-3-Nano-4B-GGUF:Q4_K_M
   nemotron Nemotron 3.5 Bolt            -m <path>
+  raon1   Raon-1-mini                  -m <path>
   decide  a decision model by its head --hf bartowski/Cloudflare_clef-flash-GGUF:Q5_K_M
   decide  a decision model in its file --hf ggml-org/lev-GGUF:Q4_K_M";
 
@@ -181,7 +206,9 @@ models (the --model word is optional with a model file: the file's architecture 
         Qwen3,
         Mimo2,
         Solar2,
+        MinimaxM3,
         Nemotron,
+        Raon1,
     }
 
     /// A `--model` word: a generative seat's, or the decide seat's.
@@ -200,10 +227,12 @@ models (the --model word is optional with a model file: the file's architecture 
                 "qwen3" => Ok(Word::Seat(Model::Qwen3)),
                 "mimo2" => Ok(Word::Seat(Model::Mimo2)),
                 "solar2" => Ok(Word::Seat(Model::Solar2)),
+                "minimaxm3" => Ok(Word::Seat(Model::MinimaxM3)),
                 "nemotron" => Ok(Word::Seat(Model::Nemotron)),
+                "raon1" => Ok(Word::Seat(Model::Raon1)),
                 serve::decide::WORD => Ok(Word::Decide),
                 other => Err(format!(
-                    "--model is ds41, qwen38, glm, qwen3, mimo2, solar2, nemotron or {}, not {other}",
+                    "--model is ds41, qwen38, glm, qwen3, mimo2, solar2, minimaxm3, nemotron, raon1 or {}, not {other}",
                     serve::decide::WORD
                 )
                 .into()),
@@ -220,14 +249,16 @@ models (the --model word is optional with a model file: the file's architecture 
 
     impl Model {
         /// Every generative seat.
-        const ALL: [Model; 7] = [
+        const ALL: [Model; 9] = [
             Model::Ds41,
             Model::Qwen38,
             Model::Glm,
             Model::Qwen3,
             Model::Mimo2,
             Model::Solar2,
+            Model::MinimaxM3,
             Model::Nemotron,
+            Model::Raon1,
         ];
 
         /// The seat's word, as errors and the usage name it.
@@ -239,7 +270,9 @@ models (the --model word is optional with a model file: the file's architecture 
                 Model::Qwen3 => "qwen3",
                 Model::Mimo2 => "mimo2",
                 Model::Solar2 => "solar2",
+                Model::MinimaxM3 => "minimaxm3",
                 Model::Nemotron => "nemotron",
+                Model::Raon1 => "raon1",
             }
         }
 
@@ -255,10 +288,12 @@ models (the --model word is optional with a model file: the file's architecture 
                 Model::Qwen3 => matches!(arch, "qwen3moe" | "qwen35moe" | "qwen35"),
                 Model::Mimo2 => arch == "mimo2",
                 Model::Solar2 => matches!(Arch::from_name(arch), Ok(Arch::SolarOpen2)),
+                Model::MinimaxM3 => matches!(Arch::from_name(arch), Ok(Arch::MiniMaxM3)),
                 Model::Nemotron => matches!(
                     Arch::from_name(arch),
                     Ok(Arch::NemotronH | Arch::NemotronHMoe)
                 ),
+                Model::Raon1 => matches!(Arch::from_name(arch), Ok(Arch::Raon1)),
             }
         }
     }
@@ -276,7 +311,7 @@ models (the --model word is optional with a model file: the file's architecture 
             }
             let v = it.next().ok_or_else(|| {
                 format!(
-                    "--model needs a value (ds41, qwen38, glm, qwen3, mimo2, solar2, nemotron or {}): {USAGE}",
+                    "--model needs a value (ds41, qwen38, glm, qwen3, mimo2, solar2, minimaxm3, nemotron, raon1 or {}): {USAGE}",
                     serve::decide::WORD
                 )
             })?;
@@ -307,7 +342,7 @@ models (the --model word is optional with a model file: the file's architecture 
     /// the seat words. A qwen35moe file (Qwen3.6) is the qwen3 seat's.
     fn seat_of_file(generative: bool) -> Result<(Model, String), GateError> {
         let path = ref_model_path()?;
-        let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
+        let split = crate::serve_seats::header(&path)?;
         let (seat, arch) = match split.architecture() {
             Some(a) if side_seat::row(a).is_some() => {
                 return Err(format!(
@@ -374,7 +409,7 @@ models (the --model word is optional with a model file: the file's architecture 
     /// ([`ref_model_path`]) and its `<arch>.decision.type`, when it has one.
     fn file_facts() -> Result<(String, Option<String>), GateError> {
         let path = ref_model_path()?;
-        let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
+        let split = crate::serve_seats::header(&path)?;
         let decision = bloomery_gpu_gates::model_file::decision_type(&split)?.map(str::to_owned);
         Ok((
             split.architecture().unwrap_or("<missing>").to_owned(),
@@ -510,11 +545,19 @@ models (the --model word is optional with a model file: the file's architecture 
             Model::Qwen3 => qwen3::run(&rest, &side),
             Model::Mimo2 => mimo2::run(&rest, &side),
             Model::Solar2 => solar2::run(&rest, &side),
+            Model::MinimaxM3 => minimaxm3::run(&rest, &side),
             Model::Nemotron => {
                 if side.names() {
                     Err("--embd-model: the nemotron seat serves no embedding model".into())
                 } else {
                     nemotron::run(&rest)
+                }
+            }
+            Model::Raon1 => {
+                if side.names() {
+                    Err("--embd-model: the raon1 seat serves no embedding model".into())
+                } else {
+                    raon1::run(&rest)
                 }
             }
         };

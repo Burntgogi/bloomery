@@ -916,8 +916,9 @@ mod gate {
 
     /// The conversations of the module header, in order, after whatever the
     /// gate ran before them: each conversation opens with a system message of
-    /// its own, so an earlier request shares at most the first id,
-    /// `<｜begin▁of▁sentence｜>`, with any of them.
+    /// its own, so an earlier request shares at most the template's preamble
+    /// under the same kwargs (the ids before the first message's text) with
+    /// any of them.
     fn conversations(url: &dyn Fn(&str) -> String, rules: &Rules) -> Result<bool, GateError> {
         let (code, body) = curl(&url("/props"), None, false)?;
         let bos_text = json_of("/props", code, &body)?["bos_token"]
@@ -940,8 +941,24 @@ mod gate {
             .map(|i| format!("Line {i} of the report: the shipment arrived on time, complete and undamaged.\n"))
             .collect();
         let long_user = format!("{report}Summarize the report in one sentence.");
-        let off = json!({});
+        let off = json!({"enable_thinking": false});
         let on = json!({"thinking": true});
+        // PIN(2026-10-22): a BOS-only ledger rejected valid reuse of the template's preamble (the
+        // official V4.1 encoding's system and reasoning ids). The preamble under each kwargs is what
+        // two requests with different first messages share; an earlier request may have left it.
+        for kw in [&off, &on] {
+            let a = rendered(
+                url,
+                &json!([{"role": "system", "content": "A"}, {"role": "user", "content": "x"}]),
+                kw,
+            )?;
+            let b = rendered(
+                url,
+                &json!([{"role": "system", "content": "B"}, {"role": "user", "content": "y"}]),
+                kw,
+            )?;
+            ledger.0.insert(0, a[..common(&a, &b)].to_vec());
+        }
         let scripts = [
             Script {
                 name: "chat",

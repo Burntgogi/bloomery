@@ -3,7 +3,6 @@
 //! applies by token text, and the special-token list the partition walks.
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
 
 use gguf::Value;
 
@@ -184,13 +183,13 @@ pub(crate) struct Vocab {
 }
 
 struct Meta<'a> {
-    inv: &'a gguf::Inventory,
+    keys: &'a [(String, Value)],
     read: Vec<(String, String)>,
 }
 
 impl<'a> Meta<'a> {
     fn get(&mut self, key: &str) -> Option<&'a Value> {
-        let v = self.inv.value(key);
+        let v = self.keys.iter().find(|(k, _)| k == key).map(|(_, v)| v);
         let shown = match v {
             None => "(absent)".to_string(),
             Some(Value::Array(a)) => format!("array of {}", a.len()),
@@ -289,11 +288,11 @@ impl<'a> Meta<'a> {
 }
 
 impl Vocab {
-    pub(crate) fn load(path: &Path) -> Result<(Vocab, Encoding, Option<Vec<String>>), Error> {
-        let inv =
-            gguf::inventory_of(path).map_err(|e| Error::Gguf(path.display().to_string(), e))?;
+    pub(crate) fn load(
+        keys: &[(String, Value)],
+    ) -> Result<(Vocab, Encoding, Option<Vec<String>>), Error> {
         let mut m = Meta {
-            inv: &inv,
+            keys,
             read: Vec::new(),
         };
 
@@ -306,6 +305,13 @@ impl Vocab {
             None => false,
             Some("NFC") if !matches!(model, Model::Spm) => true,
             Some(name) => return Err(Error::UnsupportedNormalizer(name.to_string())),
+        };
+        // The converter's boolean spelling of the same normalizer.
+        let nfc = match m.flag("tokenizer.ggml.normalizer.nfc")? {
+            Some(true) if matches!(model, Model::Spm) => {
+                return Err(Error::UnsupportedNormalizer("nfc".to_string()));
+            }
+            flag => nfc || flag == Some(true),
         };
         let mut texts = m
             .strings("tokenizer.ggml.tokens")?
@@ -381,6 +387,9 @@ impl Vocab {
                 let merges = m
                     .strings("tokenizer.ggml.merges")?
                     .ok_or(Error::Missing("tokenizer.ggml.merges"))?;
+                // The reference NFC-normalizes the text of a pre-tokenizer that names it
+                // ([`Pre::nfc`]) whatever the header says.
+                let nfc = nfc || pre.nfc();
                 (name.to_string(), Encoding::Bpe { pre, merges, nfc })
             }
             Model::Spm if explicit_stops.is_some() => {

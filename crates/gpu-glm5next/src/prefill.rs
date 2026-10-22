@@ -114,7 +114,7 @@ use bloomery_gpu::media::{CallRows, MediaBody, MediaSpan, check_spans};
 use bloomery_gpu::prompt_timing::{Mark, PromptStats, PromptTiming, nanos};
 use bloomery_gpu::q8f32::{GemvOut, Q8_0GemvHeadsMcolArgs, Q8_0GemvMcolArgs};
 use bloomery_gpu::qsa::list_width;
-use bloomery_gpu::site::Form;
+use bloomery_gpu::site::{self, Form};
 use bloomery_gpu::weights::Weights;
 use bloomery_gpu::{COL_GROUP, DeviceTensor, Gpu, GpuError};
 use bloomery_gpu_deepseek41::attn::{self, AttnArgs, SelectedRows};
@@ -130,6 +130,7 @@ use cuda_core::DeviceBuffer;
 use model::arch::glm5next::names::Sub;
 use model::arch::glm5next::place::{self, DenseForms, FrontWidths};
 use model::moe::UNION_MAX_COLS;
+use model::placement::kernels::DownForms;
 use runtime::layer::{FfnKind, MixerKind};
 pub use runtime::prompt::PrefillMode;
 use runtime::prompt::{
@@ -138,7 +139,6 @@ use runtime::prompt::{
 };
 use runtime::sched::{self, At, LayerProgram, Overlap, PortKind};
 
-use super::WHAT as BODY;
 use super::media::{check_image_ids, stage_row};
 use super::nextn::GlmArena;
 use super::{Body, Dims, Glm5nextModel, Parts, Store, copied, f32t, f32v, prompt, q8, shape};
@@ -882,7 +882,8 @@ impl Bufs {
     /// `expert_ff` a routed expert's, over stores of `ctx` positions. The attention's partials
     /// cover `ctx` keys: a chunk selects only on stores past the dense
     /// positions, which are a list's width, so they cover a list too. The
-    /// card experts' scratch holds the card leg's buffers when `card_leg`.
+    /// card experts' scratch holds the card leg's buffers in the forms
+    /// `card_leg` names, when it names any.
     /// Load-time or first-prompt only.
     fn new(
         gpu: &Gpu,
@@ -891,7 +892,7 @@ impl Bufs {
         forms: DenseForms,
         ctx: usize,
         cap: usize,
-        card_leg: bool,
+        card_leg: DownForms,
     ) -> Result<Bufs, GpuError> {
         let stream = gpu.stream();
         let z = |len: usize| DeviceBuffer::<f32>::zeroed(stream, len);
@@ -2249,6 +2250,7 @@ impl KdaProj for KdaBatch<'_> {
             beta_raw,
             f,
             z,
+            ..
         } = y;
         let gemm = t >= GEMM_FROM;
         if gemm {
@@ -2275,56 +2277,56 @@ impl KdaProj for KdaBatch<'_> {
         for (c0, c) in chunks(t, CHUNK) {
             let xs = span(W, xn, c0 * n, c * n)?;
             if !gemm {
-                w.q8_gemv_mcol(
+                site::resident_gemv_cols(
                     gpu,
-                    BODY,
-                    &nm.qkv,
+                    None,
+                    (w, &nm.qkv),
                     &xs,
                     c,
                     &mut *span_mut(W, &mut *qkv, c0 * ch, c * ch)?,
                 )?;
             }
-            w.q8_gemv_mcol(
+            site::resident_gemv_cols(
                 gpu,
-                BODY,
-                &nm.f_a,
+                None,
+                (w, &nm.f_a),
                 &xs,
                 c,
                 &mut *span_mut(W, &mut *fa, c0 * HEAD, c * HEAD)?,
             )?;
             if !gemm {
-                w.q8_gemv_mcol(
+                site::resident_gemv_cols(
                     gpu,
-                    BODY,
-                    &nm.g_a,
+                    None,
+                    (w, &nm.g_a),
                     &xs,
                     c,
                     &mut *span_mut(W, &mut *ga, c0 * HEAD, c * HEAD)?,
                 )?;
-                w.q8_gemv_mcol(
+                site::resident_gemv_cols(
                     gpu,
-                    BODY,
-                    &nm.beta,
+                    None,
+                    (w, &nm.beta),
                     &xs,
                     c,
                     &mut *span_mut(W, &mut *beta_raw, c0 * nv, c * nv)?,
                 )?;
             }
             let fa_rows = span(W, &*fa, c0 * HEAD, c * HEAD)?;
-            w.q8_gemv_mcol(
+            site::resident_gemv_cols(
                 gpu,
-                BODY,
-                &nm.f_b,
+                None,
+                (w, &nm.f_b),
                 &fa_rows,
                 c,
                 &mut *span_mut(W, &mut *f, c0 * v, c * v)?,
             )?;
             if !gemm {
                 let ga_rows = span(W, &*ga, c0 * HEAD, c * HEAD)?;
-                w.q8_gemv_mcol(
+                site::resident_gemv_cols(
                     gpu,
-                    BODY,
-                    &nm.g_b,
+                    None,
+                    (w, &nm.g_b),
                     &ga_rows,
                     c,
                     &mut *span_mut(W, &mut *z, c0 * v, c * v)?,
@@ -2350,10 +2352,10 @@ impl KdaProj for KdaBatch<'_> {
         let (n, v) = (self.d.embd, self.d.kda.n_v * HEAD);
         for (c0, c) in chunks(t, CHUNK) {
             let gs = span(W, gated, c0 * v, c * v)?;
-            w.q8_gemv_mcol(
+            site::resident_gemv_cols(
                 gpu,
-                BODY,
-                &nm.out,
+                None,
+                (w, &nm.out),
                 &gs,
                 c,
                 &mut *span_mut(W, &mut *out, c0 * n, c * n)?,
@@ -2462,6 +2464,7 @@ impl PromptProgram<'_> {
                 fa: &mut b.fa,
                 ga: &mut b.ga,
                 beta_raw: &mut b.beta_raw,
+                write_raw: None,
                 f: &mut b.f,
                 z: &mut b.z,
                 conv: &mut b.conv,
@@ -2618,10 +2621,10 @@ impl PromptProgram<'_> {
             for (c0, c) in chunks(t, CHUNK) {
                 let qr = span(W, &b.qr, c0 * ql, c * ql)?;
                 if !gemm {
-                    w.q8_gemv_mcol(
+                    site::resident_gemv_cols(
                         gpu,
-                        BODY,
-                        &nm.q_b,
+                        None,
+                        (w, &nm.q_b),
                         &qr,
                         c,
                         &mut *span_mut(W, q, c0 * hq, c * hq)?,
@@ -2710,10 +2713,10 @@ impl PromptProgram<'_> {
                     },
                 )?;
                 if !gemm {
-                    w.q8_gemv_mcol(
+                    site::resident_gemv_cols(
                         gpu,
-                        BODY,
-                        &nm.out,
+                        None,
+                        (w, &nm.out),
                         &*span(W, av, c0 * hv, c * hv)?,
                         c,
                         &mut *span_mut(W, &mut b.out, c0 * n, c * n)?,
@@ -2869,6 +2872,9 @@ impl PromptProgram<'_> {
         }
         port.mark(at, Mark::FrontEnd as usize)?;
         let key = port.key(at);
+        if self.p.card.hostless(l) {
+            return Ok(());
+        }
         let Some(side) = self.p.card.tier().filter(|t| t.k(l) > 0) else {
             return port
                 .hybrid()
@@ -3057,6 +3063,7 @@ impl<'a> LayerProgram for PromptProgram<'a> {
     /// A routed layer's; the dense lead has none.
     fn host_leg(&self, at: At) -> bool {
         self.p.cfg.get(at.layer).is_some_and(|c| c.kind.host_leg())
+            && !self.p.card.hostless(at.layer)
     }
 
     /// The mixer sub-layer, then the block's input and the dense block with
@@ -3151,13 +3158,18 @@ impl<'a> LayerProgram for PromptProgram<'a> {
             let t = self.t[at.unit];
             let b = &mut *self.b;
             let shadowed = if self.p.card.sums(l) { &b.pre } else { &b.sh_y };
-            self.gpu.elem().enqueue_add(
-                self.gpu.stream(),
-                port.hsum(),
-                shadowed,
-                t * n,
-                &mut b.out,
-            )?;
+            if self.p.card.hostless(l) {
+                span_mut(WHAT, &mut b.out, 0, t * n)?
+                    .copy_from_device_async(&*span(WHAT, shadowed, 0, t * n)?, self.gpu.stream())?;
+            } else {
+                self.gpu.elem().enqueue_add(
+                    self.gpu.stream(),
+                    port.hsum(),
+                    shadowed,
+                    t * n,
+                    &mut b.out,
+                )?;
+            }
             self.hc_out(at.unit)?;
             port.mark(at, Mark::Back as usize)
         })();

@@ -87,6 +87,7 @@ fn family_of(arch: Arch) -> Option<&'static dyn Adapter> {
         Arch::Deepseek41 | Arch::Deepseek4 => Some(&deepseek41::Row),
         Arch::Qwen35
         | Arch::MiniMaxM3
+        | Arch::Raon1
         | Arch::SolarOpen2
         | Arch::NemotronH
         | Arch::NemotronHMoe
@@ -108,6 +109,7 @@ fn skip_of(arch: Arch) -> &'static str {
         | Arch::Glm5Next
         | Arch::MiMo2
         | Arch::MiniMaxM3
+        | Arch::Raon1
         | Arch::SolarOpen2
         | Arch::Deepseek41
         | Arch::Deepseek4
@@ -1466,6 +1468,21 @@ fn outcome_of(e: &(dyn StdError + 'static)) -> Outcome {
         cur = c.source();
     }
     Outcome::Red(e.to_string())
+}
+
+/// A family planner's error as an outcome: the first `P` in `e`'s chain as
+/// the family's `place_of` reads it, else [`outcome_of`]'s reading. A
+/// family error that wraps the placement's own transparently hides it from
+/// [`outcome_of`]'s walk, so a refusal the placement names would read red.
+fn outcome_by<P: StdError + 'static>(e: &GateError, place_of: fn(&P) -> Outcome) -> Outcome {
+    let mut cur: Option<&(dyn StdError + 'static)> = Some(e.as_ref());
+    while let Some(c) = cur {
+        if let Some(p) = c.downcast_ref::<P>() {
+            return place_of(p);
+        }
+        cur = c.source();
+    }
+    outcome_of(e.as_ref())
 }
 
 /// A [`PlacementError`] as an outcome: the read refusals a real census file

@@ -1,8 +1,8 @@
 //! The architecture registry: one [`ArchRow`] per group of `general.architecture` strings that one
 //! reader, one draft rule and one gate fixture serve. The dispatch on a file's architecture reads
 //! these rows: the reader ([`super::spec`]), a target's draft rule ([`super::draft::draft_usable`])
-//! and the fixture of a family (the `fixture` binary). A family is added by one row here, and no
-//! `match` on a model.
+//! and the fixture of a family (the `fixture` binary and the gates' budget admission).
+//! A family is added by one row here, and no `match` on a model.
 //!
 //! [`Arch::name`] and [`Arch::from_name`] stay the enum's own: a row holds function pointers, so a
 //! caller of the registry reaches every reader, and the many that only name an architecture do not
@@ -17,9 +17,29 @@ use super::draft::Rule;
 use super::{
     Arch, DEEPSEEK4, GEMMA_EMBEDDING, GEMMA_EMBEDDING2, GLM5_NEXT_LLAMA_CPP, QWEN35_BODY, Read,
     deepseek41, draft, gemma_embedding, gemma_embedding2, glm5next, mimo2, minimaxm3, nemotron_h,
-    nemotron_h_moe, qwen3moe, qwen35moe, solar2,
+    nemotron_h_moe, qwen3moe, qwen35moe, raon1, solar2,
 };
 use crate::placement::PlacementError;
+
+/// Every fixture family's spec, read by the fixture tool and the gates' budget admission.
+pub const FIXTURE_SPECS: [fn() -> crate::fixture::FixtureSpec; 7] = [
+    deepseek41::fixture::spec,
+    qwen35moe::fixture::spec,
+    qwen35moe::fixture::qwen35moe::spec,
+    glm5next::fixture::spec,
+    solar2::fixture::spec,
+    nemotron_h::fixture::spec,
+    nemotron_h_moe::fixture::spec,
+];
+
+/// The fixture spec whose architecture string is `arch`, from [`FIXTURE_SPECS`].
+#[must_use]
+pub fn fixture_spec(arch: &str) -> Option<crate::fixture::FixtureSpec> {
+    FIXTURE_SPECS
+        .iter()
+        .map(|spec| spec())
+        .find(|spec| spec.arch == arch)
+}
 
 /// A family's reader: the description of one of its files and the role of each tensor.
 pub type Reader = fn(&Split) -> Result<Read, PlacementError>;
@@ -36,8 +56,8 @@ pub enum DraftSource {
 }
 
 /// A family's gate fixture and the hub source it is made from: `fixture fetch <family>` reads the
-/// row, and an explicit `<repo>:<quant>` overrides it. The row holds data only: the fixture
-/// generators are the `fixture` binary's, so no gate that reads this registry reaches them.
+/// row, and an explicit `<repo>:<quant>` overrides it. The row holds data only; the family's
+/// fixture spec is its entry in [`FIXTURE_SPECS`].
 #[derive(Clone, Copy)]
 pub struct FixtureRow {
     /// The name `fetch` takes: the family's directory under the fixture root.
@@ -160,10 +180,16 @@ pub static ROWS: &[ArchRow] = &[
         fixture: None,
     },
     ArchRow {
-        // No `Arch` variant until a body runs the file: llama.cpp's spelling is the only string.
-        arch: None,
+        arch: Some(Arch::MiniMaxM3),
         names: &["minimax-m3"],
         read: Some(minimaxm3::spec::read),
+        draft: None,
+        fixture: None,
+    },
+    ArchRow {
+        arch: Some(Arch::Raon1),
+        names: &["raon1"],
+        read: Some(raon1::spec::read),
         draft: None,
         fixture: None,
     },
@@ -285,6 +311,7 @@ mod tests {
             "glm5next" | GLM5_NEXT_LLAMA_CPP => glm5next::spec::read,
             "mimo2" => mimo2::spec::read,
             "minimax-m3" => minimaxm3::spec::read,
+            "raon1" => raon1::spec::read,
             "solar-open2" => solar2::spec::read,
             "nemotron_h" => nemotron_h::spec::read,
             "nemotron_h_moe" => nemotron_h_moe::spec::read,
@@ -328,6 +355,7 @@ mod tests {
             Arch::Glm5next,
             Arch::Mimo2,
             Arch::SolarOpen2,
+            Arch::Raon1,
             Arch::NemotronH,
             Arch::NemotronHMoe,
             Arch::GemmaEmbedding,

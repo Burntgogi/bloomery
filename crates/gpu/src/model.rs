@@ -41,11 +41,12 @@ use slots::{ParkedSlot, PoisonWhy, SlotFault, SlotGraphs, SlotSet};
 
 use crate::fault::Fault;
 use crate::head::{Head, HeadNorm};
+use crate::host::leg_tier;
 use crate::host::nvtier::{ArenaKind, NvTier};
 use crate::host::run::{HostRun, HostWidths};
 use crate::host::swap::{BoundaryAt, MachineCfg, Residency};
 use crate::host::swap_source::{FileSwap, ResidencyGlue, ResidencySpec};
-use crate::hybrid::{Chain, HostResidency, Refusal};
+use crate::hybrid::{Boundary, BoundaryShape, Chain, HostResidency, Hybrid, Refusal, SlotMap};
 use crate::watchdog;
 use crate::weights::Weights;
 use crate::{Gpu, GpuError, Graph, NodeInfo};
@@ -694,7 +695,16 @@ impl<B: ChainBody> GpuModel<B> {
         derive: impl FnOnce(&CudaStream, &Split, Range<usize>, &mut Weights) -> Result<(), GpuError>,
         body: impl FnOnce(&Gpu, Split, &Weights, HostResidency) -> Result<B, GpuError>,
     ) -> Result<GpuModel<B>, GpuError> {
-        let (p, residency) = placed_pre(&file, plan, card, host, (&[], 0), &[], derive)?;
+        let (p, residency) = placed_pre(
+            &file,
+            CardBytes::File,
+            plan,
+            card,
+            host,
+            (&[], 0),
+            &[],
+            derive,
+        )?;
         let t_body = Instant::now();
         let body = body(&p.gpu, file, &p.weights, residency)?;
         placed_done(p, body, t_body.elapsed())
@@ -756,6 +766,43 @@ impl<B: ChainBody> GpuModel<B> {
             ResidencyGlue,
         ) -> Result<B, GpuError>,
     ) -> Result<GpuModel<B>, GpuError> {
+        GpuModel::load_placed_from(
+            file,
+            CardBytes::File,
+            plan,
+            card,
+            host,
+            residency,
+            hosted,
+            derive,
+            body,
+        )
+    }
+
+    /// [`GpuModel::load_placed_hosting`] with the card's tensors read from `bytes`: the file's
+    /// own, or a part source's when `file` is a checkpoint folder's header
+    /// ([`CardBytes::Parts`]).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "load_placed_hosting's arguments and where the card's bytes come from (rust-quality R8)"
+    )]
+    pub fn load_placed_from(
+        file: Split,
+        bytes: CardBytes<'_>,
+        plan: &Plan<'_>,
+        card: usize,
+        host: HostCfg,
+        residency: ResidencySpec,
+        hosted: (&[(usize, ExpertList)], u64),
+        derive: impl FnOnce(&CudaStream, &Split, Range<usize>, &mut Weights) -> Result<(), GpuError>,
+        body: impl FnOnce(
+            &Gpu,
+            &Arc<Split>,
+            &Weights,
+            HostResidency,
+            ResidencyGlue,
+        ) -> Result<B, GpuError>,
+    ) -> Result<GpuModel<B>, GpuError> {
         const WHAT: &str = "GpuModel::load_placed_with";
         let churn = match residency.lever {
             Residency::Off => None,
@@ -786,7 +833,7 @@ impl<B: ChainBody> GpuModel<B> {
             (&joined[..], pool.1 + hosted.1)
         };
         let file = Arc::new(file);
-        let (p, set) = placed_pre(&file, plan, card, host, extra, known, derive)?;
+        let (p, set) = placed_pre(&file, bytes, plan, card, host, extra, known, derive)?;
         let t_body = Instant::now();
         let glue = match residency.lever {
             Residency::Off => ResidencyGlue::off(),
@@ -1822,7 +1869,8 @@ fn launch_served<B: ChainBody>(
 /// over `file`'s shards, read `O_DIRECT` or — the lever's fallback —
 /// through the page cache, in pinned host memory `ctx`'s card maps or in
 /// anonymous memory, as the lever asks of `ctx`'s device: pinned on an
-/// integrated device by default ([`bloomery_levers::NvTierMem`]). `None`
+/// integrated device by default ([`bloomery_levers::NvTierMem`]), its
+/// victims taken as the lever's rule asks ([`bloomery_levers::NvTierEvict`]). `None`
 /// on a plan that pages no routed expert or reserved no arena: the host
 /// leg reads the file mapping as it stands. Refused by name: a load
 /// whose r8 pair reads a sidecar while the plan pages routed experts —
@@ -1851,7 +1899,7 @@ pub fn nvme_tier(
         ));
     }
     let mem = ArenaKind::of(ctx, levers.mem)?;
-    NvTier::of_paged(plan, file, levers.direct, arena, mem).map(|t| t.map(Arc::new))
+    NvTier::of_paged(plan, file, levers.direct, arena, mem, levers.evict).map(|t| t.map(Arc::new))
 }
 
 /// The host leg of a load on `plan`: the routed layers of `set` (the layers
@@ -1883,9 +1931,195 @@ where
     Ok(run)
 }
 
+/// The layers and the context a body that runs every layer on one card with no expert tier loads at: card `card`'s
+/// layers of `plan`, which must be `0..n_layers`, and `ctx_max` as a positive `u32` count of positions. Refused by
+/// name as `what`'s: a plan of other cards or an expert tier, another layer range, a context of no position or past
+/// the `u32` the position words count.
+pub fn one_card_run(
+    what: &'static str,
+    plan: &Plan<'_>,
+    card: usize,
+    n_layers: usize,
+) -> Result<(Range<usize>, usize), GpuError> {
+    if !plan.machine.tiers.is_empty() {
+        return Err(GpuError::shape(
+            what,
+            format!(
+                "a plan of {} cards and {} expert tiers; the program runs every layer on one card with no expert tier",
+                plan.machine.cards.len(),
+                plan.machine.tiers.len()
+            ),
+        ));
+    }
+    stage_run(what, plan, card, n_layers)
+}
+
+/// [`one_card_run`] for a body that hangs the plan's expert tier cards under its host tier: the stage card's layers
+/// and context, the tier cards the load's own to count ([`crate::host::refuse_tier_count`]). Refused by name as
+/// `what`'s: a plan of other than one stage card, another layer range, a context of no position or past the `u32`
+/// the position words count.
+pub fn stage_run(
+    what: &'static str,
+    plan: &Plan<'_>,
+    card: usize,
+    n_layers: usize,
+) -> Result<(Range<usize>, usize), GpuError> {
+    if plan.machine.cards.len() != 1 {
+        return Err(GpuError::shape(
+            what,
+            format!(
+                "a plan of {} cards; the program runs every layer on one stage card",
+                plan.machine.cards.len(),
+            ),
+        ));
+    }
+    let layers = plan
+        .machine
+        .cards
+        .get(card)
+        .map(|c| c.layers.clone())
+        .ok_or_else(|| GpuError::shape(what, format!("the plan has no card {card}")))?;
+    if layers != (0..n_layers) {
+        return Err(GpuError::shape(
+            what,
+            format!(
+                "card {card} runs layers {layers:?}; the program runs every layer (0..{n_layers})"
+            ),
+        ));
+    }
+    let ctx = usize::try_from(plan.ctx_max)
+        .ok()
+        .filter(|&c| c > 0 && u32::try_from(c).is_ok())
+        .ok_or_else(|| {
+            GpuError::shape(
+                what,
+                format!(
+                    "ctx_max {}: at least 1 and at most the positions a u32 counts",
+                    plan.ctx_max
+                ),
+            )
+        })?;
+    Ok((layers, ctx))
+}
+
+/// What the layers of a description agree on: the first layer's `value` is kept in `first`, and every other layer's
+/// must equal it, or the layer is refused by name as `what`'s `owner`.
+pub fn agreed<T: PartialEq + std::fmt::Debug>(
+    owner: &'static str,
+    what: &str,
+    l: usize,
+    first: &mut Option<T>,
+    value: T,
+) -> Result<(), GpuError> {
+    match first {
+        Some(f) if *f != value => Err(GpuError::shape(
+            owner,
+            format!("layer {l}: {what} is {value:?}, an earlier layer's {f:?}"),
+        )),
+        _ => {
+            first.get_or_insert(value);
+            Ok(())
+        }
+    }
+}
+
+/// The host tier of a hybrid body's load: the boundary of `rows` rows, the host run over `run` built by `layers`
+/// ([`host_run`]) and attached to the residency `glue`, and the [`Hybrid`] over them and the slot `map`, watching the
+/// card's fault word and keeping the host set `set` ([`HostResidency`]); the arena leg is attached when the load
+/// starts a residency machine. The one owner of a body's hybrid assembly after its stores and card experts.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the card, file, plan, run and map, the host levers and set, the glue, widths and rows, and the layers' builder, each named"
+)]
+pub fn hosted_hybrid<E>(
+    (gpu, file, plan): (&Gpu, &Arc<Split>, &Plan<'_>),
+    (run, map): (Range<usize>, SlotMap),
+    (host, set, glue): (HostCfg, HostResidency, &ResidencyGlue),
+    (widths, rows): (HostWidths, usize),
+    layers: impl FnOnce(R8Source<'_>) -> Result<Vec<HostLayer>, E>,
+) -> Result<Hybrid<HostRun>, GpuError>
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    hosted_hybrid_tiered(
+        (gpu, file, plan),
+        (run, map),
+        (host, set, glue),
+        (widths, rows),
+        None,
+        layers,
+    )
+}
+
+/// [`hosted_hybrid`] for a body that hangs the plan's expert tier cards under the host tier (`hang`,
+/// [`leg_tier::hang_tiers`]): they are attached after the [`Hybrid`] is made and before the arena leg, which a tier
+/// keeps off. `None` is [`hosted_hybrid`].
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the card, file, plan, run and map, the host levers and set, the glue, widths and rows, the tier hang and the layers' builder, each named"
+)]
+pub fn hosted_hybrid_tiered<E>(
+    (gpu, file, plan): (&Gpu, &Arc<Split>, &Plan<'_>),
+    (run, map): (Range<usize>, SlotMap),
+    (host, set, glue): (HostCfg, HostResidency, &ResidencyGlue),
+    (widths, rows): (HostWidths, usize),
+    hang: Option<&leg_tier::Hang<'_>>,
+    layers: impl FnOnce(R8Source<'_>) -> Result<Vec<HostLayer>, E>,
+) -> Result<Hybrid<HostRun>, GpuError>
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    let boundary = Boundary::with_rows(
+        gpu.context(),
+        gpu.stream(),
+        BoundaryShape {
+            hidden: widths.embd,
+            n_used: widths.n_used,
+        },
+        rows,
+    )?;
+    let experts = host_run(
+        gpu.context(),
+        plan,
+        file,
+        run.clone(),
+        host.r8,
+        set.arena(),
+        widths,
+        layers,
+    )?;
+    glue.attach_tier(experts.tier())?;
+    let mut hybrid = Hybrid::new(boundary, map, experts, run.len())?;
+    hybrid.watch_fault(gpu.fault_word())?;
+    hybrid.keep_residency(set);
+    if let Some(hang) = hang {
+        leg_tier::hang_tiers((gpu, file, plan), hang, &mut hybrid)?;
+    }
+    // The residency machine frees arena slots between passes, which a card hold keeps: a load that starts one keeps
+    // the host leg.
+    hybrid.attach_arena_leg(gpu, glue.source().is_some())?;
+    Ok(hybrid)
+}
+
+/// Where a placed load's card tensors come from ([`GpuModel::load_placed_from`]).
+pub enum CardBytes<'a> {
+    /// The file's own mapped tensors ([`Weights::load_placed`]).
+    File,
+    /// A part source's, for a file that is a checkpoint folder's header
+    /// (`gguf::Split::header_only`): card `card` of `plan` loaded on the stream, each part's file
+    /// pages released when the host config's `card_dontneed` asks (`crate::parts::load_placed`).
+    Parts(&'a PartsLoad<'a>),
+}
+
+/// A part source's load of card `card` of `plan` on the stream, `bool` the host config's
+/// `card_dontneed` ([`CardBytes::Parts`]).
+pub type PartsLoad<'a> =
+    dyn Fn(&CudaStream, &Plan<'_>, usize, bool) -> Result<Weights, GpuError> + 'a;
+
 /// The steps of a placed load before its body: the plan's card and context
 /// budget, the card, the host's memory against the plan's host need, the
-/// card's weights with `derive`'s filings, and — after the uploads, so the
+/// card's weights (`bytes`': the file's, or a part source's) with `derive`'s
+/// filings, and — after the uploads, so the
 /// card's file bytes have left the page cache first — the plan's host set
 /// read in and locked as `host` asks, with `extra`'s runs (of `extra`'s
 /// bytes) beside it and `known`'s runs known, neither read in nor locked nor
@@ -1895,8 +2129,13 @@ where
 /// (`BLOOMERY_NEED_HOOK`, first, before the load's own open of the card), a plan's card
 /// that is not one visible device ([`Gpu::open_card`]), and a
 /// host whose `MemAvailable` is under the plan's need ([`HostNeed`]).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the load's file and where its card bytes come from, its plan and card, the host's levers, the extra and known host runs, and the derive (rust-quality R8)"
+)]
 fn placed_pre(
     file: &Split,
+    bytes: CardBytes<'_>,
     plan: &Plan<'_>,
     card: usize,
     host: HostCfg,
@@ -1937,7 +2176,12 @@ fn placed_pre(
         .grant(available, least)
         .map_err(|e| GpuError::plan(what, format!("{e}{}", plan.host.room_clause())))?;
     let t = Instant::now();
-    let mut weights = Weights::load_placed(gpu.stream(), file, plan, card, host.card_dontneed)?;
+    let mut weights = match bytes {
+        CardBytes::File => {
+            Weights::load_placed(gpu.stream(), file, plan, card, host.card_dontneed)?
+        }
+        CardBytes::Parts(load) => load(gpu.stream(), plan, card, host.card_dontneed)?,
+    };
     let upload = t.elapsed();
     let t = Instant::now();
     derive(gpu.stream(), file, layers.clone(), &mut weights)?;

@@ -7,8 +7,8 @@ use super::dispatch::{self, PassCtx};
 use super::experts::ExpertKernels;
 use super::head_argmax::{HeadArgmaxKernels, HeadArgmaxState};
 use super::placed::{
-    PLACED_ROWS, Placed, PlacedOpen, StepWalk, WalkParts, counted_arena, placed_bytes,
-    placed_scratch,
+    CommonForms, PLACED_ROWS, Placed, PlacedOpen, StepWalk, WalkParts, common_forms, counted_arena,
+    placed_bytes, placed_scratch,
 };
 use super::plan::{
     FfnPlan, FfnRoute, Flash, GqaKind, GqaPlan, LayerPlan, MixerPlan, SiteTy, down_entry,
@@ -275,48 +275,27 @@ fn pins(hp: &Hparams) -> Result<RouterDims, GpuError> {
 
 /// Layer `l`'s routed stacks `[gate, up, down]` of `n` experts (or a stack of
 /// one expert: a placed layer's shared expert) of `ff` rows of `h` values:
-/// each a resident K-quant word plane of its shape, its type the file's, then
-/// the types the card kernel table's entries admit for the family's FFN
-/// dispatch ([`gate_up_entry`]: one launch reads the gate and up of one
-/// type; [`down_entry`]), a type with no entry refused by name with the
-/// layer. Returns the gate, up and down types.
+/// each a resident K-quant word plane of its shape, its type the file's (the
+/// layout checked by [`super::placed::stack_files`]), then the types the card
+/// kernel table's entries admit for the family's FFN dispatch
+/// ([`gate_up_entry`]: one launch reads the gate and up of one type;
+/// [`down_entry`]), a type with no entry refused by name with the layer.
+/// Returns the gate, up and down types.
 pub(super) fn stack_tys(
     w: &Weights,
-    [gate, up, down]: [&str; 3],
+    names: [&str; 3],
     (n, ff, h): (usize, usize, usize),
     l: usize,
 ) -> Result<[SiteTy; 3], GpuError> {
     let what = "qwen3moe::Body::load";
-    let stack = |name: &str, rows: usize, k: usize| -> Result<SiteTy, GpuError> {
-        let Some(DevWeight::KQuant { ty, w: t, k: wk }) = w.get(name) else {
-            return Err(GpuError::tensor(
-                what,
-                name,
-                "a resident K-quant word plane",
-            ));
-        };
-        let Some(site) = SiteTy::of_ggml(*ty) else {
-            return Err(GpuError::shape(
-                what,
-                format!("{name} is {ty}; no launch family reads it"),
-            ));
-        };
-        if t.rows() != rows || *wk != k {
-            return Err(GpuError::shape(
-                what,
-                format!(
-                    "{name} is {ty} {} rows x {wk}; the chain takes {rows} rows x {k}",
-                    t.rows()
-                ),
-            ));
-        }
-        Ok(site)
+    let raw = super::placed::stack_files(w, names, (n, ff, h), l, what)?;
+    let site_ty = |i: usize| {
+        let (name, ty) = (names[i], raw[i]);
+        SiteTy::of_ggml(ty).ok_or_else(|| {
+            GpuError::shape(what, format!("{name} is {ty}; no launch family reads it"))
+        })
     };
-    let tys = [
-        stack(gate, n * ff, h)?,
-        stack(up, n * ff, h)?,
-        stack(down, n * h, ff)?,
-    ];
+    let tys = [site_ty(0)?, site_ty(1)?, site_ty(2)?];
     stack_entries(tys, l)?;
     Ok(tys)
 }
@@ -336,10 +315,10 @@ fn stack_entries([gate, up, down]: [SiteTy; 3], l: usize) -> Result<(), GpuError
 
 /// Weight `name` as a dense site of `rows` rows of `k` values and the launch
 /// family the qwen3moe body's dense owner ([`qwen3moe_dense`]) picks for the
-/// type it is resident as (a K-quant word plane, Q8_0, MXFP8 or FP8_B128
-/// planes, or an F32 plane). A type the table names no dense site for, a site whose activation
-/// the arena does not carry, or a weight of another shape or form, is refused
-/// by name.
+/// site type of its resident form ([`SiteTy::of_resident`]). A form no site
+/// reads, a type the table names no dense site for, a site whose activation
+/// the arena does not carry, or a weight of another shape, is refused by
+/// name.
 pub(super) fn dense_site(
     w: &Weights,
     name: &str,
@@ -347,24 +326,13 @@ pub(super) fn dense_site(
     k: usize,
 ) -> Result<SiteTy, GpuError> {
     let what = "qwen3moe::Body::load";
-    let ty = match w.get(name) {
-        Some(DevWeight::KQuant { ty, .. }) => *ty,
-        Some(DevWeight::Q5_0 { .. }) => GgmlType::Q5_0,
-        Some(DevWeight::Q8_0 { .. }) => GgmlType::Q8_0,
-        Some(DevWeight::Mxfp8 { .. }) => GgmlType::MXFP8,
-        Some(DevWeight::Fp8B128 { .. }) => GgmlType::FP8_B128,
-        Some(DevWeight::Bf16 { .. }) => GgmlType::BF16,
-        Some(DevWeight::F32 { .. }) => GgmlType::F32,
-        Some(_) => {
-            return Err(GpuError::tensor(
-                what,
-                name,
-                "a K-quant word plane, Q8_0, MXFP8 or FP8_B128 planes, BF16 words or an F32 plane",
-            ));
-        }
-        None => return Err(GpuError::tensor(what, name, "resident")),
+    let Some(ty) = SiteTy::of_resident(w.resident(what, name)?) else {
+        return Err(GpuError::shape(
+            what,
+            format!("{name} is resident in a form no site launch reads"),
+        ));
     };
-    let family = admit_dense(what, name, ty)?;
+    let family = admit_dense(what, name, ty.ggml())?;
     site::site(w, what, name, (rows, k), family)?;
     Ok(family)
 }
@@ -490,14 +458,14 @@ fn header_stacks(file: &Split, hp: &Hparams, l: usize) -> Result<[SiteTy; 3], Gp
     Ok(tys)
 }
 
-/// Layer `l`'s routed stacks' types as a placed load's card part runs them,
-/// read from `file`'s header before any upload: `None` when the card kernel
-/// table runs no entry for them (a type no site launches, or one
-/// [`stack_entries`] refuses). Such a layer holds no card expert a placed
-/// load can run — its load refuses card experts of it by name (`placed`'s
-/// `n_card > 0` arm) and its wide arm launches nothing for a layer with none —
-/// so the plan does not refuse it. A missing tensor, or a site type of
-/// another shape, is refused by name.
+/// Layer `l`'s routed stacks' types as a placed load's dispatch runs them,
+/// read from `file`'s header before any upload: `None` when the dispatch's
+/// entries run none for them (a type no site launches, or one
+/// [`stack_entries`] refuses). Such a layer is the common card leg's
+/// ([`model::placement::accepts::qwen35_leg`]) or the host tier's, which the
+/// placed side classifies from the resident stacks (`placed`'s `n_card > 0`
+/// arm), so the plan does not refuse it. A missing tensor, or a site type of another
+/// shape, is refused by name.
 fn card_stacks(file: &Split, hp: &Hparams, l: usize) -> Result<Option<[SiteTy; 3]>, GpuError> {
     const WHAT_H: &str = "qwen3moe::Body::load";
     let (h, ff, e) = (hp.n_embd, hp.experts.ff, hp.experts.n_expert);
@@ -524,9 +492,10 @@ fn card_stacks(file: &Split, hp: &Hparams, l: usize) -> Result<Option<[SiteTy; 3
 /// Layer `l`'s plan read from `file`'s header alone: the four attention
 /// sites' types and the three routed stacks' as the card part runs them
 /// ([`card_stacks`]), which are the types [`resolve`] finds resident; a layer
-/// whose stacks the card runs none of keeps [`parts_of`]'s, which no launch
-/// reads. An attention site [`qwen3moe_dense`] does not run is refused by
-/// name, the missing activation form named. A placed load plans its card
+/// whose stacks the dispatch runs none of keeps [`parts_of`]'s, which no
+/// dispatch launch of its experts reads (the common leg's buffers are
+/// [`CommonForms`]'s). An attention site [`qwen3moe_dense`] does not run is
+/// refused by name, the missing activation form named. A placed load plans its card
 /// bytes from it before any weight is uploaded
 /// ([`GpuModel::placed_arena_bytes`]) and its wide arm reads the stacks'
 /// types from it, the resident stacks being the card's part of them.
@@ -553,6 +522,23 @@ fn header_plan(file: &Split, hp: &Hparams, l: usize) -> Result<LayerPlan, GpuErr
         mixer: MixerPlan::Gqa(g),
         ffn: f,
     })
+}
+
+/// The forms the layers the common card leg runs hold buffers of
+/// ([`CommonForms`]), from `file`'s header: every layer routes the family's
+/// experts, so each is read for its stacks' types ([`common_forms`]), `what`
+/// naming the entry point.
+fn header_common_forms(
+    file: &Split,
+    hp: &Hparams,
+    what: &'static str,
+) -> Result<CommonForms, GpuError> {
+    common_forms(
+        file,
+        what,
+        (0..hp.n_layer).map(|l| (l, hp.experts.n_expert)),
+        (hp.experts.ff, hp.n_embd),
+    )
 }
 
 /// A placed load's plans: [`resolve`]d against the resident weights, with the
@@ -804,7 +790,8 @@ impl GpuModel<Body> {
     /// counts in the card's scratch (`model::placement::workstation::placed_with_arena`),
     /// and what [`GpuModel::open_placed`] refuses to pass. The arena's forms
     /// are read from the file's header plan ([`header_plan`]), the plan the
-    /// load runs.
+    /// load runs, and the common leg's from the stacks' header types
+    /// ([`header_common_forms`]).
     pub fn placed_arena_bytes(file: &Split, ctx: usize) -> Result<u64, GpuError> {
         let what = "qwen3moe GpuModel::placed_arena_bytes";
         let hp = Hparams::read(file).map_err(|e| GpuError::plan(what, e))?;
@@ -820,7 +807,8 @@ impl GpuModel<Body> {
         let plans = (0..hp.n_layer)
             .map(|l| header_plan(file, &hp, l))
             .collect::<Result<Vec<_>, _>>()?;
-        placed_scratch(&dims, plans.len(), Forms::of(&plans, &dims))
+        let common = header_common_forms(file, &hp, what)?;
+        placed_scratch(&dims, plans.len(), (Forms::of(&plans, &dims), common))
     }
 
     /// What a whole load of `file` ([`GpuModel::open`]) holds past its
@@ -863,7 +851,7 @@ impl Body {
     /// and that side) the routed stacks are the placed side's to check, their
     /// types in the plans the header's ([`placed_plans`]), the arena held to
     /// the plan's count with the side's bytes ([`counted_arena`]) and the side
-    /// built ([`Placed::new`]).
+    /// built ([`Placed::new`]) and held to those bytes ([`Placed::within`]).
     #[allow(
         clippy::too_many_arguments,
         reason = "the load's card, file, weights, layers, cache and format, ubatch and flash, and the placed side (rust-quality R8)"
@@ -922,10 +910,13 @@ impl Body {
             None => (Ubatch::new(stream, dims, ubatch, Q32::of(&plans))?, None),
             Some((open, counted)) => {
                 refuse_stage_rows_past(what, open.plan, 0, rope.table.num_bytes() as u64)?;
-                let side = placed_bytes(&dims, plans.len(), open.rows)?;
+                let common = header_common_forms(file, &hp, what)?;
+                let side = placed_bytes(&dims, plans.len(), open.rows, common)?;
                 let arena = counted_arena(stream, (dims, forms), ubatch, counted, side)?;
                 let ub = Ubatch::placed(stream, arena, ubatch)?;
-                (ub, Some(Placed::new(gpu, w, &plans, &dims, open)?))
+                let built = Placed::new(gpu, w, &plans, &dims, open)?;
+                built.within(side)?;
+                (ub, Some(built))
             }
         };
         Ok(Body {
@@ -1281,14 +1272,15 @@ mod tests {
     /// A dense entry the qwen3moe body runs is the launch family of its file
     /// type: [`qwen3moe_dense`] maps the type to the entry,
     /// `SiteTy::of_entry` to the family `site.rs` names, and `SiteTy::ggml`
-    /// back. A type the owner does not return has no site launch, unless the
-    /// table row reads an activation the arena does not carry (Q5_0).
+    /// back. A type the owner does not return has no site launch (Q4_0 has no
+    /// table row), unless the table row reads an activation the arena does not
+    /// carry (Q5_0).
     #[test]
     fn a_dense_entry_is_the_launch_family_of_its_file_type() {
         let mut named = 0;
         for ty in [
             GgmlType::F32,
-            GgmlType::F16,
+            GgmlType::Q4_0,
             GgmlType::BF16,
             GgmlType::Q2_K,
             GgmlType::Q3_K,

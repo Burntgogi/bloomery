@@ -325,6 +325,9 @@ pub struct Listen<'a> {
     /// The model file, `/props`' `model_path`.
     pub path: &'a Path,
     pub template: String,
+    /// The family's request preparation; `None` renders the request as the
+    /// template reads it.
+    pub preparation: Option<serve::ChatPreparation>,
     /// `--slot-save-path`; `None` refuses every slot action.
     pub slot_save_path: Option<PathBuf>,
     pub api_keys: serve::flag::ApiKeys,
@@ -349,6 +352,7 @@ pub fn bind_server(engine: SeatEngine, l: Listen<'_>) -> Result<Server, ServeErr
         model_alias: l.alias,
         model_path: l.path.display().to_string(),
         chat_template: l.template,
+        chat_preparation: l.preparation,
         sampler: Some(sampler_factory()),
         fatal_linger: FATAL_LINGER,
         slot_save_path: l.slot_save_path,
@@ -551,9 +555,9 @@ impl SeatFlags {
     }
 
     /// [`bind_server`] over `engine` with these flags: the alias the flag
-    /// gave or `chat`'s, `chat`'s template, no slot file path, `slots`
-    /// slots the seat made at its open, the server settings from `levers`,
-    /// and the side model beside it.
+    /// gave or `chat`'s, `chat`'s template, no request preparation, no slot
+    /// file path, `slots` slots the seat made at its open, the server
+    /// settings from `levers`, and the side model beside it.
     pub fn bind(
         self,
         engine: SeatEngine,
@@ -579,6 +583,7 @@ impl SeatFlags {
                 alias: alias.unwrap_or(chat.name),
                 path,
                 template: chat.template,
+                preparation: None,
                 slot_save_path: None,
                 api_keys,
                 parallel: slots,

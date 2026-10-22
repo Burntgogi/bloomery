@@ -211,9 +211,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use app::arch::deepseek41::{Ds41Cfg, Ds41Draft};
+use app::arch::deepseek41::Ds41Cfg;
 use app::{Loaded, OpenLog, RowsLog, Session, SessionError};
-use bloomery_gpu::GpuError;
 use bloomery_gpu::host::route_trace::{RouteTrace, TraceHeader};
 use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::model::{Slots, StepMode};
@@ -237,7 +236,7 @@ use model::arch::deepseek41::hparams::Model as Hp41Model;
 use model::arch::deepseek41::place::PlanInputs;
 use model::arch::dspark::DraftHparams;
 use model::placement::ctx_ask::DEFAULT_SLOTS;
-use model::placement::workstation::{DeviceId, HostNeed, TierBatchBytes};
+use model::placement::workstation::{HostNeed, TierBatchBytes};
 use model::placement::{Machine, Plan, PlanLevers};
 use refset::arch::deepseek41::VERIFIED_POSITIONS;
 use runtime::width::Mode as WidthMode;
@@ -259,7 +258,7 @@ use serve::media::MediaFeed;
 #[cfg(feature = "vision")]
 use vision_seat::{Opened, PleImage, TextFacts};
 
-use super::served::{self, ServedDraft, Spark};
+use super::served::{self, ServedDraft};
 use crate::draft::{Draft, open_dspark};
 use crate::{dspark, place};
 
@@ -275,6 +274,12 @@ const USAGE: &str = "usage: bloomery-serve-ds41 [--host H] [--port P] \
 const DSML_RESPELLED: &str = "bloomery-serve: chat template: this V4.1 chat template spells \
     V4's DSML tags, but its model writes V4.1's (a space after the token: `<｜DSML｜ calls>`, \
     `<｜DSML｜ invoke>`, `<｜DSML｜ parameter>`); serving the template respelled that way";
+
+/// What the server says when it serves DeepSeek's official V4.1 prompt
+/// encoding, the one the V4.1 release's own encoder writes.
+const V41_OFFICIAL: &str = "bloomery-serve: chat template: this V4.1 model file is served with \
+    DeepSeek's official V4.1 prompt encoding (the system token, the reasoning effort and the \
+    spaced DSML tags the V4.1 release writes), not the file's own template";
 
 /// The token V4.1's chat template opens every user and tool message with.
 pub const USER_START: &str = "<｜User｜>";
@@ -555,7 +560,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     };
     let vocab = Arc::new(Vocab::new(Tokenizer::from_gguf(&path)?)?.with_user_start(USER_START)?);
     let inv = gguf::inventory_of(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let ChatSurface { template, name } = ChatSurface::read(
+    let mut surface = ChatSurface::read(
         &path,
         inv.value("tokenizer.chat_template"),
         inv.value("general.name"),
@@ -566,18 +571,41 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
 
     let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
     let inputs = PlanInputs::read(&split)?;
-    // A V4.1 model writes the spaced DSML tags whatever its GGUF's template spells
-    // (the V4.1 files carry V4's): the template is served spelled as the model writes.
-    let template = match inputs.hp.model {
-        Hp41Model::Deepseek41 => match respell(&template, Spelling::Spaced)? {
-            Some(spaced) => {
-                eprintln!("{DSML_RESPELLED}");
-                spaced
-            }
-            None => template,
-        },
-        Hp41Model::Deepseek4 => template,
+    // A V4.1 model file is served with DeepSeek's official V4.1 prompt
+    // encoding, which spells V4.1's tags, unless the client gave a template
+    // of its own. A V4 file, and any file with a client template, keeps the
+    // file's own template; a V4.1 one is respelled, because a V4.1 model
+    // writes the spaced DSML tags whatever its GGUF's template spells (the
+    // V4.1 files carry V4's): the template is served spelled as the model
+    // writes.
+    let official = match inputs.hp.model {
+        Hp41Model::Deepseek41 => Some(serve::v41::TEMPLATE),
+        Hp41Model::Deepseek4 => None,
     };
+    let template = std::mem::take(&mut surface.template);
+    let preparation: Option<serve::ChatPreparation> =
+        match official.filter(|_| a.template_file.path().is_none()) {
+            Some(official) => {
+                eprintln!("{V41_OFFICIAL}");
+                surface.template = official.to_owned();
+                // The official encoding's own request preparation, with it.
+                Some(serve::v41::prepare)
+            }
+            None => {
+                surface.template = match inputs.hp.model {
+                    Hp41Model::Deepseek41 => match respell(&template, Spelling::Spaced)? {
+                        Some(spaced) => {
+                            eprintln!("{DSML_RESPELLED}");
+                            spaced
+                        }
+                        None => template,
+                    },
+                    Hp41Model::Deepseek4 => template,
+                };
+                None
+            }
+        };
+    let ChatSurface { template, name, .. } = surface;
     let model = model_props(&split, &inputs.model);
     let tier_batch = place::tier_batch(a.place, &inputs.hp);
     // The context the load takes with the encoder's reserve `vision` and the side model's
@@ -749,6 +777,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
             alias: a.alias.unwrap_or(name),
             path: &path,
             template,
+            preparation,
             slot_save_path: a.slot_save_path,
             api_keys: a.api_keys,
             parallel: slots.get(),
@@ -968,47 +997,6 @@ struct SeatArgs {
 /// draft's context is rebuilt from when it falls behind the target.
 fn history(s: &Session<Body>) -> Option<&[u32]> {
     s.model().body(WHAT).ok().map(Body::history)
-}
-
-/// The DSpark draft of the V4.1 body: the card draft the session drives, as
-/// the owner calls it.
-impl Spark<Body> for Ds41Draft {
-    fn feed_call(&mut self, s: &mut Session<Body>, ids: &[u32]) -> Result<u32, SessionError> {
-        Ds41Draft::feed_call(self, s, ids)
-    }
-
-    fn forget(&mut self) {
-        Ds41Draft::forget(self);
-    }
-
-    fn restart(&mut self) -> Result<(), GpuError> {
-        Ds41Draft::restart(self)
-    }
-
-    fn window(&self) -> usize {
-        // V4.1's draft file always carries a window. `DraftHparams::read`
-        // refuses a missing `attention.sliding_window` by name, and
-        // `dspark::shape` stores that count as `Some`. A window of 0 fails
-        // `DsparkShape::check` (`Window`) when the body opens, before this
-        // seat runs. The expect is that invariant, not a second check.
-        Ds41Draft::window(self).expect("V4.1's DSpark draft has a window")
-    }
-
-    fn follows(&self, pos: u32) -> bool {
-        Ds41Draft::follows(self, pos)
-    }
-
-    fn resident_bytes(&self) -> usize {
-        Ds41Draft::resident_bytes(self)
-    }
-
-    fn device(&self) -> Result<DeviceId, GpuError> {
-        Ds41Draft::device(self)
-    }
-
-    fn card(&self) -> &'static str {
-        Ds41Draft::card(self)
-    }
 }
 
 /// The V4.1 session on the engine thread, and its draft.

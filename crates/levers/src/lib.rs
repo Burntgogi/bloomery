@@ -35,11 +35,12 @@ pub use registry::{
     CARD_BUDGET, CARD_DONTNEED, CED, CHECK_FINITE, DRAFT, ENGRAM_HELPER, FORCE_IDS, GEN_SLOTS,
     GEN_SLOTS_MAX, HOST_LANES, HOST_LANES_DEFAULT, HOST_LOCK, HOST_POPULATE, HOST_ROOM, HOSTSTREAM,
     LANE_PREFETCH, LANE_PREFETCH_DEFAULT, MTP_DRAFT, MTP_HEAD_ROWS, MTP_WIDTH, MTP_WINDOWS,
-    NEED_HOOK, NVTIER_BYTES, NVTIER_MEM, NVTIER_READ, PIN_MAIN, PREFILL, PREFILL_GROUP,
-    PREFILL_GROUP_DEFAULT, PREFILL_GROUP_MAX, QWEN3_KV, QWEN38_EXPERTS, R8, RESIDENCY, ROUTE_TRACE,
-    SCREEN, SPIN, STEP_STATS, THREADS, TIER_LINK, TIER_NODES, TP_NODES, WARM_PROFILE,
+    NEED_HOOK, NVTIER_BYTES, NVTIER_EVICT, NVTIER_MEM, NVTIER_READ, PIN_MAIN, PREFILL,
+    PREFILL_GROUP, PREFILL_GROUP_DEFAULT, PREFILL_GROUP_MAX, QWEN3_KV, QWEN38_EXPERTS, R8,
+    RESIDENCY, ROUTE_TRACE, SCREEN, SPIN, STEP_STATS, THREADS, TIER_LINK, TIER_NODES, TP_NODES,
+    WARM_PROFILE,
 };
-pub use registry::{SCHEMAJUMP, SPLIT_WALK, XSTREAM};
+pub use registry::{PREPARE_Q8, SCHEMAJUMP, SPLIT_WALK, XSTREAM};
 
 #[cfg(test)]
 mod tests;
@@ -661,7 +662,7 @@ pub(crate) enum Scope<'a> {
     /// The worker pool ([`pool_levers`]): it reads its two levers alone; the
     /// others are its binary's to read.
     Pool,
-    /// The host's room and the NVMe expert tier's three levers
+    /// The host's room and the NVMe expert tier's four levers
     /// ([`nvtier_levers`]), read where they act — the host's reading, the
     /// placement dial and the tier's build, all below every binary's `main`
     /// — like the pool's two.
@@ -696,7 +697,11 @@ pub(crate) fn read(env: &[(OsString, OsString)], scope: Scope<'_>) -> Result<Lev
     };
     let pool = |name: &str| name == THREADS || name == SPIN;
     let nvtier = |name: &str| {
-        name == HOST_ROOM || name == NVTIER_BYTES || name == NVTIER_READ || name == NVTIER_MEM
+        name == HOST_ROOM
+            || name == NVTIER_BYTES
+            || name == NVTIER_READ
+            || name == NVTIER_MEM
+            || name == NVTIER_EVICT
     };
     let link = |name: &str| name == TIER_LINK;
     let nodes = |name: &str| name == TIER_NODES;
@@ -1138,6 +1143,16 @@ impl Levers {
         }
     }
 
+    /// `BLOOMERY_NVTIER_EVICT`: the victim rule of the NVMe tier's arena.
+    #[must_use]
+    pub fn nvtier_evict(&self) -> NvTierEvict {
+        match self.word(NVTIER_EVICT) {
+            Some("tick") => NvTierEvict::Tick,
+            Some("heat") => NvTierEvict::Heat,
+            w => panic!("{NVTIER_EVICT} holds {w:?}, not tick or heat"),
+        }
+    }
+
     /// `BLOOMERY_TP_NODES`: the node of each rank past rank 0, in rank order;
     /// empty when unset.
     #[must_use]
@@ -1181,6 +1196,13 @@ impl Levers {
     #[must_use]
     pub fn schema_jump(&self) -> bool {
         self.flag(SCHEMAJUMP)
+    }
+
+    /// `BLOOMERY_PREPARE_Q8`: `prepare` writes the BF16 or F32 matrices its map
+    /// reads as Q8_0 in Q8_0, not as stored.
+    #[must_use]
+    pub fn prepare_q8(&self) -> bool {
+        self.flag(PREPARE_Q8)
     }
 
     /// The host tier's load settings: [`HOST_POPULATE`], [`HOST_LOCK`],
@@ -2025,7 +2047,7 @@ pub enum Draft38Off {
     /// Unset, and the last window needs `need` positions of `ctx`.
     Ctx { need: usize, ctx: usize },
     /// Unset on the Qwen3.8 seat, and the target's `name`, a matrix the
-    /// draft borrows, is `ty` (or `absent`), not the Q8_0 the draft reads.
+    /// draft borrows, is `ty` (or `absent`), not a form the draft reads.
     Borrowed { name: String, ty: String },
     /// Unset, and the draft yielded to the context
     /// ([`RungCost::of`]'s answer, the seats' plan-side rule).
@@ -2040,6 +2062,9 @@ pub enum Draft38Off {
     /// sequence a rotation table the draft's walks do not read, so it carries
     /// no draft; a set [`DRAFT`]`=mtp` is refused.
     Media,
+    /// Unset on the Qwen3.8 seat serving a checkpoint folder: the folder's
+    /// load reads no MTP layers; a set [`DRAFT`]`=mtp` is refused.
+    Folder,
 }
 
 impl fmt::Display for Draft38Off {
@@ -2072,7 +2097,7 @@ impl fmt::Display for Draft38Off {
             ),
             Draft38Off::Borrowed { name, ty } => write!(
                 f,
-                "unset: the target's {name} is {ty}; the MTP draft reads it as Q8_0"
+                "unset: the target's {name} is {ty}, not a form the MTP draft reads"
             ),
             Draft38Off::Yield(y) => y.fmt(f),
             Draft38Off::Paged { arena } => write!(
@@ -2083,6 +2108,10 @@ impl fmt::Display for Draft38Off {
             Draft38Off::Media => f.write_str(
                 "unset: --mmproj makes an image load, whose sequences hold rotation tables the \
                  MTP draft's walks do not read",
+            ),
+            Draft38Off::Folder => f.write_str(
+                "unset: a checkpoint folder's load reads no MTP layers; prepare the folder into a \
+                 split and its MTP draft to draft",
             ),
         }
     }
@@ -2579,11 +2608,12 @@ pub fn pool_levers() -> Result<PoolLevers, LeverError> {
     })
 }
 
-/// The host's room ([`HOST_ROOM`]) and the NVMe expert tier's three levers
-/// ([`NVTIER_BYTES`], [`NVTIER_READ`], [`NVTIER_MEM`]), read where they act,
-/// below every binary's `main`: the host's available bytes the room
-/// replaces, the placement dial the arena's bytes at the plan, the tier's
-/// build the read mode and the arena's memory at the load. [`PoolLevers`] is the shape.
+/// The host's room ([`HOST_ROOM`]) and the NVMe expert tier's four levers
+/// ([`NVTIER_BYTES`], [`NVTIER_READ`], [`NVTIER_MEM`], [`NVTIER_EVICT`]),
+/// read where they act, below every binary's `main`: the host's available
+/// bytes the room replaces, the placement dial the arena's bytes at the plan,
+/// the tier's build the read mode, the arena's memory and its victim rule at
+/// the load. [`PoolLevers`] is the shape.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NvTierLevers {
     /// `BLOOMERY_HOST_ROOM`: the host's room in bytes, given instead of
@@ -2597,6 +2627,19 @@ pub struct NvTierLevers {
     pub direct: bool,
     /// `BLOOMERY_NVTIER_MEM`: the memory the arena is.
     pub mem: NvTierMem,
+    /// `BLOOMERY_NVTIER_EVICT`: which filled slot a miss takes.
+    pub evict: NvTierEvict,
+}
+
+/// What `BLOOMERY_NVTIER_EVICT` asks a miss of the NVMe tier's arena to take
+/// once no slot is free; both take the oldest transient first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NvTierEvict {
+    /// `tick`, and unset: the least recently used hot slot.
+    Tick,
+    /// The hot slot whose expert has the least decayed routing count, the
+    /// least recently used among equal counts.
+    Heat,
 }
 
 /// What `BLOOMERY_NVTIER_MEM` asks the NVMe tier's arena to be.
@@ -2625,7 +2668,7 @@ impl NvTierMem {
 }
 
 /// The host room's and the NVMe expert tier's levers from the process
-/// environment ([`NvTierLevers`]'s four), parsed as [`at_main`] parses them, and
+/// environment ([`NvTierLevers`]'s five), parsed as [`at_main`] parses them, and
 /// refused, with every refusal at once, when one is set to a value its kind
 /// does not take and when a retired name is set. Nothing else: which levers
 /// a binary acts on, and which names it knows, is its `main`'s reading.
@@ -2649,6 +2692,7 @@ pub fn nvtier_levers() -> Result<NvTierLevers, LeverError> {
         bytes,
         direct,
         mem: levers.nvtier_mem(),
+        evict: levers.nvtier_evict(),
     })
 }
 

@@ -76,6 +76,7 @@ dependencies = [
  "bloomery-gpu-deepseek41",
  "bloomery-gpu-glm5next",
  "bloomery-gpu-mimo2",
+ "bloomery-gpu-minimaxm3",
  "bloomery-gpu-solar2",
  "bloomery-levers",
  "bloomery-model",
@@ -98,6 +99,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "bloomery-device"
+version = "0.1.0"
+dependencies = [
+ "bloomery-placement",
+]
+
+[[package]]
 name = "bloomery-embed"
 version = "0.1.0"
 dependencies = [
@@ -111,6 +119,7 @@ name = "bloomery-engram"
 version = "0.1.0"
 dependencies = [
  "bloomery-gguf",
+ "bloomery-os",
  "bloomery-threads",
  "libc",
  "memmap2",
@@ -130,6 +139,7 @@ dependencies = [
 name = "bloomery-gguf"
 version = "0.1.0"
 dependencies = [
+ "bloomery-os",
  "bloomery-refset",
  "libc",
  "memmap2",
@@ -167,6 +177,7 @@ dependencies = [
  "bloomery-gpu",
  "bloomery-levers",
  "bloomery-model",
+ "bloomery-models",
  "bloomery-runtime",
  "cuda-core",
  "cuda-device",
@@ -175,7 +186,7 @@ dependencies = [
 
 [[package]]
 name = "bloomery-gpu-gates"
-version = "0.3.6"
+version = "0.3.8"
 dependencies = [
  "bloomery-app",
  "bloomery-decision",
@@ -187,6 +198,7 @@ dependencies = [
  "bloomery-gpu-gemma4a",
  "bloomery-gpu-glm5next",
  "bloomery-gpu-mimo2",
+ "bloomery-gpu-minimaxm3",
  "bloomery-gpu-solar2",
  "bloomery-gpu-vision",
  "bloomery-hf",
@@ -194,6 +206,7 @@ dependencies = [
  "bloomery-model",
  "bloomery-model-hf",
  "bloomery-qdot",
+ "bloomery-record",
  "bloomery-refset",
  "bloomery-runtime",
  "bloomery-safetensors",
@@ -243,10 +256,13 @@ dependencies = [
  "bloomery-gguf",
  "bloomery-gpu",
  "bloomery-gpu-deepseek41",
+ "bloomery-hf",
  "bloomery-levers",
  "bloomery-model",
+ "bloomery-model-hf",
  "bloomery-models",
  "bloomery-runtime",
+ "bloomery-safetensors",
  "cuda-core",
 ]
 
@@ -262,6 +278,22 @@ dependencies = [
  "bloomery-models",
  "bloomery-runtime",
  "cuda-core",
+]
+
+[[package]]
+name = "bloomery-gpu-minimaxm3"
+version = "0.1.0"
+dependencies = [
+ "bloomery-gguf",
+ "bloomery-gpu",
+ "bloomery-gpu-deepseek41",
+ "bloomery-levers",
+ "bloomery-model",
+ "bloomery-models",
+ "bloomery-runtime",
+ "cuda-core",
+ "cuda-device",
+ "cuda-host",
 ]
 
 [[package]]
@@ -318,12 +350,25 @@ name = "bloomery-levers"
 version = "0.1.0"
 
 [[package]]
+name = "bloomery-metal"
+version = "0.1.0"
+dependencies = [
+ "bloomery-device",
+ "bloomery-placement",
+ "dispatch2",
+ "objc2",
+ "objc2-foundation",
+ "objc2-metal",
+]
+
+[[package]]
 name = "bloomery-model"
 version = "0.1.0"
 dependencies = [
  "bloomery-gguf",
  "bloomery-levers",
  "bloomery-models",
+ "bloomery-os",
  "bloomery-placement",
  "bloomery-qdot",
  "bloomery-refset",
@@ -341,12 +386,13 @@ version = "0.1.0"
 dependencies = [
  "bloomery-gguf",
  "bloomery-hf",
+ "bloomery-levers",
  "bloomery-model",
+ "bloomery-os",
  "bloomery-refset",
  "bloomery-safetensors",
  "bloomery-tokenizer",
  "flate2",
- "libc",
  "serde_json",
  "sha2",
  "thiserror",
@@ -359,6 +405,13 @@ dependencies = [
  "bloomery-gguf",
  "sha2",
  "thiserror",
+]
+
+[[package]]
+name = "bloomery-os"
+version = "0.1.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
@@ -379,6 +432,10 @@ dependencies = [
  "bloomery-refset",
  "bloomery-threads",
 ]
+
+[[package]]
+name = "bloomery-record"
+version = "0.1.0"
 
 [[package]]
 name = "bloomery-refset"
@@ -413,7 +470,7 @@ version = "0.1.0"
 
 [[package]]
 name = "bloomery-serve"
-version = "0.3.6"
+version = "0.3.8"
 dependencies = [
  "bloomery-decision",
  "bloomery-embed",
@@ -432,6 +489,7 @@ name = "bloomery-threads"
 version = "0.1.0"
 dependencies = [
  "bloomery-levers",
+ "bloomery-os",
  "libc",
 ]
 
@@ -621,6 +679,16 @@ checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
 dependencies = [
  "block-buffer",
  "crypto-common",
+]
+
+[[package]]
+name = "dispatch2"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "89a09f22a6c6069a18470eb92d2298acf25463f14256d24778e1230d789a2aec"
+dependencies = [
+ "bitflags",
+ "objc2",
 ]
 
 [[package]]
@@ -865,6 +933,43 @@ source = "git+https://github.com/midagedev/cuda-oxide.git?rev=87bc951864b79f723b
 dependencies = [
  "libloading",
  "thiserror",
+]
+
+[[package]]
+name = "objc2"
+version = "0.6.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a12a8ed07aefc768292f076dc3ac8c48f3781c8f2d5851dd3d98950e8c5a89f"
+dependencies = [
+ "objc2-encode",
+]
+
+[[package]]
+name = "objc2-encode"
+version = "4.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ef25abbcd74fb2609453eb695bd2f860d389e457f67dc17cafc8b8cbc89d0c33"
+
+[[package]]
+name = "objc2-foundation"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e3e0adef53c21f888deb4fa59fc59f7eb17404926ee8a6f59f5df0fd7f9f3272"
+dependencies = [
+ "bitflags",
+ "objc2",
+]
+
+[[package]]
+name = "objc2-metal"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a0125f776a10d00af4152d74616409f0d4a2053a6f57fa5b7d6aa2854ac04794"
+dependencies = [
+ "bitflags",
+ "dispatch2",
+ "objc2",
+ "objc2-foundation",
 ]
 
 [[package]]

@@ -119,11 +119,8 @@ fn read_line(r: &mut impl BufRead) -> io::Result<Option<String>> {
         .map_err(|_| bad("header is not UTF-8"))
 }
 
-/// Reads the next request; `Ok(None)` when the peer closed between requests.
-pub(crate) fn read_request(
-    r: &mut BufReader<TcpStream>,
-    w: &mut TcpStream,
-) -> io::Result<Option<Request>> {
+/// Reads the next request's headers, leaving its body unread; `Ok(None)` when the peer closed.
+pub(crate) fn read_head(r: &mut BufReader<TcpStream>) -> io::Result<Option<Request>> {
     let line = loop {
         match read_line(r)? {
             None => return Ok(None),
@@ -169,6 +166,15 @@ pub(crate) fn read_request(
     } else {
         conn.as_deref() != Some("close")
     };
+    Ok(Some(req))
+}
+
+/// Reads an authorized request's body, sending `100 Continue` first when requested.
+pub(crate) fn read_body(
+    r: &mut BufReader<TcpStream>,
+    w: &mut TcpStream,
+    req: &mut Request,
+) -> io::Result<()> {
     if req
         .header("expect")
         .is_some_and(|e| e.eq_ignore_ascii_case("100-continue"))
@@ -190,7 +196,7 @@ pub(crate) fn read_request(
         r.read_exact(&mut body)?;
         req.body = body;
     }
-    Ok(Some(req))
+    Ok(())
 }
 
 fn read_chunked(r: &mut impl BufRead) -> io::Result<Vec<u8>> {
@@ -326,9 +332,57 @@ impl<'a> EventStream<'a> {
     }
 }
 
+/// Reads one test response without consuming the next response on a persistent connection.
+/// Heads and bodies stay below 64 KiB; `100 Continue` has no body, while final responses
+/// must declare their exact body length. Truncated headers or bodies fail the test.
+#[cfg(test)]
+pub(crate) fn read_test_response(r: &mut impl BufRead) -> (u16, String, Vec<u8>) {
+    const MAX_RESPONSE: usize = 64 * 1024;
+    let mut head = String::new();
+    loop {
+        let mut line = String::new();
+        let n = r
+            .by_ref()
+            .take((MAX_RESPONSE - head.len()) as u64)
+            .read_line(&mut line)
+            .expect("response head");
+        assert!(
+            n > 0 && line.ends_with("\r\n"),
+            "incomplete response head: {head}{line}"
+        );
+        head.push_str(&line);
+        assert!(head.len() < MAX_RESPONSE, "a bounded test response head");
+        if line == "\r\n" {
+            break;
+        }
+    }
+    let status = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .expect("a status line");
+    let len = if status == 100 {
+        0
+    } else {
+        head.lines()
+            .filter_map(|line| line.split_once(':'))
+            .find_map(|(name, value)| {
+                name.eq_ignore_ascii_case("Content-Length")
+                    .then_some(value.trim())
+            })
+            .expect("a fixed-length response")
+            .parse::<usize>()
+            .expect("the response length")
+    };
+    assert!(len < MAX_RESPONSE, "a bounded test response body: {len}");
+    let mut body = vec![0; len];
+    r.read_exact(&mut body).expect("the complete response body");
+    (status, head, body)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{MAX_BODY, parse_query, read_chunked, read_request};
+    use super::{MAX_BODY, parse_query, read_body, read_chunked, read_head};
     use std::io::{BufReader, ErrorKind, Write};
     use std::net::{TcpListener, TcpStream};
 
@@ -378,10 +432,9 @@ mod tests {
             )
             .expect("the head is sent");
         let mut w = server.try_clone().expect("a writer half");
-        let err = match read_request(&mut BufReader::new(server), &mut w) {
-            Ok(_) => panic!("a body past the limit was read"),
-            Err(e) => e,
-        };
+        let mut r = BufReader::new(server);
+        let mut req = read_head(&mut r).expect("a valid head").expect("a request");
+        let err = read_body(&mut r, &mut w, &mut req).expect_err("a body past the limit");
         assert_eq!(err.kind(), ErrorKind::InvalidData);
         assert_eq!(err.to_string(), want, "a content-length past the limit");
     }

@@ -14,7 +14,7 @@
 use gguf::Split;
 
 use super::hparams::{Hparams, Variant};
-use crate::arch::classify::{Counts, classify_with};
+use crate::arch::classify::{Counts, block_role_with_nextn, block_stem, classify_with};
 use crate::placement::{ModelTensors, PlacementError, Role};
 
 /// The role of a stem qwen35moe and qwen35 share: the GDN layers' mixer, the
@@ -170,14 +170,13 @@ fn role(name: &str, hp: &Hparams) -> Option<(Role, Option<usize>)> {
         }
         _ => {}
     }
-    let (layer, stem) = name.strip_prefix("blk.")?.split_once('.')?;
-    let layer: usize = layer.parse().ok().filter(|&l| l < hp.n_layer)?;
-    let role = layer_role(stem, hp.variant);
-    if layer >= hp.n_trunk {
-        return (role.is_some() || nextn_stem(stem, hp.variant))
-            .then_some((Role::Unused, Some(layer)));
-    }
-    role.map(|r| (r, Some(layer)))
+    block_role_with_nextn(
+        name,
+        hp.n_layer,
+        hp.n_trunk,
+        |stem| layer_role(stem, hp.variant),
+        |stem| nextn_stem(stem, hp.variant),
+    )
 }
 
 /// Every tensor of `split` with its role and header facts.
@@ -193,11 +192,7 @@ pub fn classify(split: &Split, hp: &Hparams) -> Result<ModelTensors, PlacementEr
     let mut model = classify_with(
         split,
         |name| role(name, hp),
-        Counts {
-            layers: hp.n_trunk,
-            experts: hp.n_expert as u64,
-            experts_used: hp.n_used as u64,
-        },
+        Counts::new(hp.n_trunk, hp.n_expert, hp.n_used),
     )?;
     for t in &mut model.tensors {
         if t.role == Role::EngramTable {
@@ -210,11 +205,7 @@ pub fn classify(split: &Split, hp: &Hparams) -> Result<ModelTensors, PlacementEr
     // body reads none in its words.
     model.bf16_words = if hp.variant == Variant::Qwen4Exp {
         |t| {
-            let stem = t
-                .name
-                .strip_prefix("blk.")
-                .and_then(|name| name.split_once('.'))
-                .map_or(t.name.as_str(), |(_, stem)| stem);
+            let stem = block_stem(&t.name, usize::MAX).map_or(t.name.as_str(), |(_, stem)| stem);
             matches!(
                 stem,
                 "output.weight"

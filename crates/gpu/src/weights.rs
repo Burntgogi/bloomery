@@ -1,7 +1,8 @@
 //! Resident weights (package P10): every tensor of the model file uploaded
 //! once, in the device format its kernel consumes (docs/gpu-design.md
-//! decision 4 — format conversion is load-time work; per step this file only
-//! finds what was uploaded, by name, and launches [`Weights::q8_gemv`] on it).
+//! decision 4 — format conversion is load-time work; per step a site finds
+//! what was uploaded, by name, and launches the kernel its type reads:
+//! `crate::site`).
 //! A [`Weights`] owns one contiguous block range plus,
 //! optionally, the non-block tensors, so a `Stage` loads exactly its own
 //! layers — or, for a placed model, every segment its plan puts on one card
@@ -9,16 +10,16 @@
 //! `model::placement::CardFormat`'s. The gates (`gate_p10`, `gate_load_v41`)
 //! pin the uploads against independent host packings bit for bit.
 
+use crate::GpuError;
 use crate::mxfp4::{Nvfp4, Nvfp4Weight, Planes, repack};
 use crate::mxfp4_sel::Nvfp4Stack;
 use crate::q5::{pack_q5_0, pack_q5_1};
-use crate::q8f32::{E4m3Scales, E4m3Weight, GemvOut, Q8_0GemvMcolArgs, e4m3_planes};
+use crate::q8f32::{E4m3Scales, E4m3Weight, e4m3_planes};
 use crate::tensor::{DeviceTensor, window};
 use crate::upload::{Stage, UploadRing, bytes_of};
-use crate::{Gpu, GpuError};
 use ::model::placement::host_lock::PageDrop;
 use ::model::placement::{
-    CardFormat, Device, Format, ModelTensor, ModelTensors, Plan, Role, Row, Segment, Span,
+    CardFormat, Device, Format, ModelTensor, ModelTensors, Plan, Role, Row, Segment, Span, tp,
 };
 use cuda_core::{CudaStream, DeviceBuffer, DeviceCopy};
 use gguf::quant::{GgmlType, dequant_row};
@@ -225,66 +226,90 @@ fn held<T: cuda_core::DeviceCopy>(t: &DeviceTensor<T>) -> usize {
     t.buf().len() * std::mem::size_of::<T>()
 }
 
-/// One tensor, or one part of a tensor, to upload ([`Weights::load_parts`]): its header entry as
-/// the part's (name, type, dims and bytes; the offset is not read) and its rows' file bytes, one
-/// slice a run of rows, in row order.
+/// One tensor, or one part of a tensor, to upload ([`Weights::add_parts`]): its header entry as
+/// the part's (name, type, dims and bytes; the offset is not read), its rows' bytes, one slice a
+/// run of rows, in row order, and, for a type that reads them ([`GgmlType::reads_scale`]), the
+/// tensor scales its values are multiplied by: one, or one an expert of a stack, in expert order.
 pub struct TensorPart<'a> {
     pub info: TensorInfo,
     pub spans: Vec<&'a [u8]>,
+    pub scale: Option<Vec<f32>>,
 }
 
-/// What [`Weights::load_parts`]' errors name.
-const PARTS: &str = "Weights::load_parts";
+/// What [`Weights::add_parts`]' errors name.
+const PARTS: &str = "Weights::add_parts";
 
-/// Check a tensor's declared file bytes before cutting or uploading it. Empty or zero dims,
-/// partial format blocks, an overflowing byte count and a size unlike `nbytes` are refused.
-pub fn check_part_bytes(what: &'static str, t: &TensorInfo) -> Result<(), GpuError> {
-    let bytes =
-        t.ty.blck_size()
-            .zip(t.ty.type_size())
-            .filter(|&(block, _)| {
-                block > 0
-                    && !t.dims.is_empty()
-                    && t.dims.iter().all(|&d| d > 0)
-                    && t.dims[0].is_multiple_of(block)
-            })
-            .and_then(|(block, size)| gguf::tensor_bytes(block, size, &t.dims));
-    if bytes != Some(t.nbytes) {
-        return Err(GpuError::shape(
-            what,
+/// The card format and staging bytes of a part with header entry `t`, from the entry alone: a
+/// name no slot takes, a type with no card format, and a size its type and dims do not give are
+/// refused by name. NVFP4 is the one type with a card format whose values a tensor scale
+/// multiplies; its part carries the scale ([`TensorPart::scale`]). A load checks every part it plans here before it reads any
+/// ([`Weights::add_parts`] checks each again with its bytes).
+pub fn part_format(t: &TensorInfo) -> Result<(CardFormat, usize), GpuError> {
+    file_slot(&t.name)?;
+    let format = CardFormat::of(t.ty).ok_or_else(|| {
+        GpuError::shape(
+            PARTS,
             format!(
-                "tensor {}: {} {:?} do not hold {} file bytes",
-                t.name, t.ty, t.dims, t.nbytes
+                "tensor {} has type {}, which no part upload takes",
+                t.name, t.ty
             ),
-        ));
-    }
-    Ok(())
+        )
+    })?;
+    tp::check_bytes(t).map_err(|e| GpuError::shape(PARTS, e.to_string()))?;
+    let bytes = usize::try_from(t.dims[0])
+        .ok()
+        .and_then(|k| resident_size(t.ty, k, tensor_rows(t)))
+        .ok_or_else(|| {
+            GpuError::shape(
+                PARTS,
+                format!("tensor {}: resident bytes pass usize", t.name),
+            )
+        })?;
+    Ok((format, bytes))
 }
 
-/// Each part's format, shape, spans and staging bytes, checked before anything moves.
-fn part_formats(parts: &[TensorPart<'_>]) -> Result<(Vec<CardFormat>, usize), GpuError> {
+/// Each part's format, shape, scales, spans and staging bytes, checked before anything moves; a
+/// name `held` already holds is refused.
+fn part_formats(
+    parts: &[TensorPart<'_>],
+    held: impl Fn(&str) -> bool,
+) -> Result<(Vec<CardFormat>, usize), GpuError> {
     let mut seen = BTreeSet::new();
     let mut budget = 0usize;
     let mut formats = Vec::with_capacity(parts.len());
     for p in parts {
         let t = &p.info;
-        file_slot(&t.name)?;
-        if !seen.insert(t.name.as_str()) {
+        if !seen.insert(t.name.as_str()) || held(&t.name) {
             return Err(GpuError::shape(PARTS, format!("{} given twice", t.name)));
         }
-        match CardFormat::of(t.ty) {
-            Some(f) if !t.ty.reads_scale() => formats.push(f),
-            _ => {
+        let (format, bytes) = part_format(t)?;
+        formats.push(format);
+        let want = match t.dims.as_slice() {
+            [_, _, experts] => *experts,
+            _ => 1,
+        };
+        match (t.ty.reads_scale(), &p.scale) {
+            (false, None) => {}
+            (true, Some(s))
+                if u64::try_from(s.len()).ok() == Some(want) && s.iter().all(|v| v.is_finite()) => {
+            }
+            (reads, scale) => {
+                let carries = scale.as_ref().map_or("none".to_string(), |s| {
+                    let finite = s.iter().filter(|v| v.is_finite()).count();
+                    format!("{} values, {finite} finite", s.len())
+                });
                 return Err(GpuError::shape(
                     PARTS,
                     format!(
-                        "tensor {} has type {}, which no part upload takes",
-                        t.name, t.ty
+                        "tensor {}: {} {:?} reads {} finite tensor scales; the part carries {carries}",
+                        t.name,
+                        t.ty,
+                        t.dims,
+                        if reads { want } else { 0 }
                     ),
                 ));
             }
         }
-        check_part_bytes(PARTS, t)?;
         let held = p
             .spans
             .iter()
@@ -298,15 +323,6 @@ fn part_formats(parts: &[TensorPart<'_>]) -> Result<(Vec<CardFormat>, usize), Gp
                 ),
             ));
         }
-        let bytes = usize::try_from(t.dims[0])
-            .ok()
-            .and_then(|k| resident_size(t.ty, k, tensor_rows(t)))
-            .ok_or_else(|| {
-                GpuError::shape(
-                    PARTS,
-                    format!("tensor {}: resident bytes pass usize", t.name),
-                )
-            })?;
         budget = budget
             .checked_add(bytes)
             .ok_or_else(|| GpuError::shape(PARTS, "the parts' staging bytes pass usize"))?;
@@ -314,11 +330,42 @@ fn part_formats(parts: &[TensorPart<'_>]) -> Result<(Vec<CardFormat>, usize), Gp
     Ok((formats, budget))
 }
 
+/// Upload `parts` through `ring`, whose copies the caller ends with one synchronize, each part
+/// in the card format `card` names for it, else its type's ([`part_format`]): every part checked
+/// first as [`Weights::add_parts`] checks them, a name `held` holds refused. The uploaded weights
+/// by name, for the caller to file once its copies end.
+pub(crate) fn stage_parts(
+    stream: &CudaStream,
+    ring: &mut UploadRing,
+    parts: &[TensorPart<'_>],
+    held: impl Fn(&str) -> bool,
+    card: impl Fn(&TensorInfo) -> Option<CardFormat>,
+) -> Result<Vec<(String, DevWeight)>, GpuError> {
+    let (formats, _) = part_formats(parts, held)?;
+    let mut added = Vec::with_capacity(parts.len());
+    for (p, format) in parts.iter().zip(formats) {
+        let t = &p.info;
+        let dw = upload_rows(
+            stream,
+            ring,
+            PARTS,
+            card(t).unwrap_or(format),
+            t,
+            tensor_rows(t),
+            &p.spans,
+            p.scale.clone(),
+        )?;
+        added.push((t.name.clone(), dw));
+    }
+    Ok(added)
+}
+
 /// The resident weights of a layer range: every `blk.L.*` tensor with L in
 /// `layers`, what the architecture derives for those blocks, and — when
 /// loaded with globals — the non-block tensors. Load-time only; per-step
-/// code reads through `get` and never allocates.
-#[cfg_attr(test, derive(Default))]
+/// code reads through `get` and never allocates. The default holds none, for a load that adds
+/// its parts a group at a time ([`Weights::add_parts`]).
+#[derive(Default)]
 pub struct Weights {
     by_name: BTreeMap<String, DevWeight>,
     /// The file ties its head to the token embedding ([`head_tensor`]): `output.weight` is the
@@ -436,38 +483,36 @@ impl Weights {
         Weights::load_named(stream, split, keep, false)
     }
 
-    /// Upload `parts`, each a tensor or a part of one that a caller cut from its file, in the
-    /// device format its kernel consumes, as [`Weights::load_where`] uploads a whole tensor:
-    /// [`TensorPart::info`] states the part's name, type and dims, and [`TensorPart::spans`]
-    /// holds its rows' file bytes in row order. A name given twice or one a derived weight would
-    /// take, a type with no device format or one whose values a tensor scale multiplies (a scale
-    /// is not cut here), a shape unlike its byte count and spans unlike the part's bytes are
-    /// refused by name. One staging ring
-    /// carries every copy, and one synchronize ends them.
-    pub fn load_parts(stream: &CudaStream, parts: &[TensorPart<'_>]) -> Result<Weights, GpuError> {
-        let (formats, budget) = part_formats(parts)?;
+    /// Upload `parts` beside the weights held, each a tensor or a part of one that a caller cut
+    /// from its source, in the device format its kernel consumes, as [`Weights::load_where`]
+    /// uploads a whole tensor: [`TensorPart::info`] states the part's name, type and dims,
+    /// [`TensorPart::spans`] holds its rows' bytes in row order and [`TensorPart::scale`] its
+    /// tensor scales. A name given twice or held already, one a derived weight would take, a type
+    /// with no device format, scales a type reads missing, of another count or not finite, scales
+    /// a type does not read, a shape unlike its byte count and spans unlike the part's bytes are
+    /// refused by name before any of `parts` moves. One staging ring carries their copies, and one
+    /// synchronize ends them.
+    pub fn add_parts(
+        &mut self,
+        stream: &CudaStream,
+        parts: &[TensorPart<'_>],
+    ) -> Result<(), GpuError> {
+        let held = |name: &str| self.by_name.contains_key(name);
+        let (_, budget) = part_formats(parts, held)?;
         stream.context().bind_to_thread()?;
-        let mut by_name = BTreeMap::new();
         let mut ring = UploadRing::new(stream, budget)?;
-        for (p, format) in parts.iter().zip(formats) {
-            let t = &p.info;
-            let dw = upload_rows(
-                stream,
-                &mut ring,
-                PARTS,
-                format,
-                t,
-                tensor_rows(t),
-                &p.spans,
-                None,
-            )?;
-            by_name.insert(t.name.clone(), dw);
-        }
+        let added = stage_parts(stream, &mut ring, parts, held, |_| None)?;
         ring.finish(stream)?;
-        Ok(Weights {
+        self.by_name.extend(added);
+        Ok(())
+    }
+
+    /// The weights a load staged ([`stage_parts`]), once its ring's copies have ended.
+    pub(crate) fn of_staged(by_name: BTreeMap<String, DevWeight>) -> Weights {
+        Weights {
             by_name,
             tied: false,
-        })
+        }
     }
 
     /// [`Weights::load_where`], and with `tied` the token embedding is also the head
@@ -868,6 +913,51 @@ impl Weights {
         self.by_name.remove(name)
     }
 
+    /// Re-upload the resident file tensor `name` of `split` in `format`, a
+    /// layout its type has ([`CardFormat::holds`]): for a body loaded by
+    /// [`Weights::load`] whose routed card entry reads a stack in another
+    /// layout than [`CardFormat::of`] names (a Q8_0 down's file blocks as
+    /// words). The resident form is freed before the upload. A name not
+    /// resident or not in the file, a format the type has not and a type whose
+    /// values a tensor scale multiplies are refused by name. Load-time only.
+    pub fn relayout(
+        &mut self,
+        stream: &CudaStream,
+        split: &Split,
+        name: &str,
+        format: CardFormat,
+    ) -> Result<(), GpuError> {
+        const WHAT: &str = "Weights::relayout";
+        let (shard, t) = split
+            .find(name)
+            .ok_or_else(|| GpuError::tensor(WHAT, name, "a tensor of the file"))?;
+        if !format.holds(t.ty) || t.ty.reads_scale() {
+            let detail = format!("tensor {name} of {} has no {format:?} layout here", t.ty);
+            return Err(GpuError::shape(WHAT, detail));
+        }
+        let gguf = split
+            .shard(shard)
+            .ok_or_else(|| GpuError::tensor(WHAT, name, "a shard the split holds"))?;
+        let src = gguf.data(t)?;
+        if self.by_name.remove(name).is_none() {
+            return Err(GpuError::tensor(WHAT, name, "a resident weight"));
+        }
+        let mut ring = UploadRing::new(stream, upload_budget(t))?;
+        let dw = upload_rows(
+            stream,
+            &mut ring,
+            WHAT,
+            format,
+            t,
+            tensor_rows(t),
+            &[src],
+            None,
+        )?;
+        ring.finish(stream)?;
+        self.by_name.insert(name.to_owned(), dw);
+        Ok(())
+    }
+
     /// The resident weight `name`, refused by name as `what`'s when absent.
     pub fn resident(&self, what: &'static str, name: &str) -> Result<&DevWeight, GpuError> {
         self.get(name)
@@ -947,50 +1037,6 @@ impl Weights {
     /// gain, a bias); refused as [`Weights::f32_tensor`] is.
     pub fn f32_buf(&self, what: &'static str, name: &str) -> Result<&DeviceBuffer<f32>, GpuError> {
         self.f32_tensor(what, name).map(DeviceTensor::buf)
-    }
-
-    /// `y = W · x` for the resident Q8_0 weight `name` at one column of `x`
-    /// (`q8_0_gemv`, the decode shape); a weight of another variant is
-    /// refused by name as `what`'s. The multi-column launches lay their
-    /// outputs out as their bodies read them ([`crate::site::gemv`]).
-    pub fn q8_gemv(
-        &self,
-        gpu: &Gpu,
-        what: &'static str,
-        name: &str,
-        x: &DeviceBuffer<f32>,
-        y: &mut DeviceBuffer<f32>,
-    ) -> Result<(), GpuError> {
-        let (qs, d) = self.q8_planes(what, name)?;
-        gpu.q8f32().enqueue_q8_0_gemv(gpu.stream(), qs, d, x, 1, y)
-    }
-
-    /// `y = W · x` for the resident Q8_0 weight `name` over `c` columns of `x`
-    /// (1 to [`crate::COL_GROUP`], token-major), the columns' outputs
-    /// token-major into `y` (`q8_0_gemv_mcol`: each column is the one-column
-    /// gemv's bits); a weight of another variant is refused by name as
-    /// `what`'s.
-    pub fn q8_gemv_mcol(
-        &self,
-        gpu: &Gpu,
-        what: &'static str,
-        name: &str,
-        x: &DeviceBuffer<f32>,
-        c: usize,
-        y: &mut DeviceBuffer<f32>,
-    ) -> Result<(), GpuError> {
-        let (qs, d) = self.q8_planes(what, name)?;
-        gpu.q8f32().enqueue_q8_0_gemv_mcol(
-            gpu.stream(),
-            Q8_0GemvMcolArgs {
-                qs,
-                d,
-                x,
-                m: c,
-                out: GemvOut::TokenMajor,
-                y,
-            },
-        )
     }
 
     /// Every resident name, sorted.
@@ -1327,56 +1373,16 @@ fn upload_file_tensor_with<'g>(
     )
 }
 
-/// The tensor scales a tensor's values are multiplied by: the f32 values of
-/// `<stem>.scale` beside `<stem>.weight`, found through `find` (the file's
-/// tensors by name: its shard and entry), one for a tensor and one an
-/// expert, in expert order, for a routed stack (three dims, mainline's
-/// `.scale` `[n_expert]`). A type that reads them
-/// ([`GgmlType::reads_scale`]: NVFP4 and bloomery's F8 and NVFP4 rows)
-/// carries them; `None` for any other type. A name without the `.weight`
-/// suffix, a missing scale, one of another type or count, and a value that
-/// is not finite are refused by name as `what`'s.
+/// The tensor scales of `t` ([`gguf::tensor_scales`]), its refusals named as `what`'s.
 pub(crate) fn tensor_scales<'g>(
     what: &'static str,
     t: &TensorInfo,
     find: impl Fn(&str) -> Option<(&'g Gguf, &'g TensorInfo)>,
 ) -> Result<Option<Vec<f32>>, GpuError> {
-    if !t.ty.reads_scale() {
-        return Ok(None);
-    }
-    let refuse = |detail: String| GpuError::shape(what, format!("tensor {}: {detail}", t.name));
-    let stem = t.name.strip_suffix(".weight").ok_or_else(|| {
-        refuse("a scaled tensor's name ends in .weight, its scale's in .scale".into())
-    })?;
-    let name = format!("{stem}.scale");
-    let (g, s) =
-        find(&name).ok_or_else(|| refuse(format!("its scale {name} is not in the file")))?;
-    let (want, of) = match t.dims.as_slice() {
-        [_, _, n] => (*n, "one f32 value an expert is a stack's scales"),
-        _ => (1, "one f32 value is the tensor's scale"),
-    };
-    if s.ty != GgmlType::F32 || s.dims.iter().product::<u64>() != want {
-        return Err(refuse(format!(
-            "its scale {name} is {} {:?}; {of}",
-            s.ty, s.dims
-        )));
-    }
-    let scales: Vec<f32> = g
-        .data(s)?
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|b| f32::from_le_bytes(*b))
-        .collect();
-    if u64::try_from(scales.len()).ok() != Some(want) {
-        return Err(refuse(format!("its scale {name} is not {want} f32 values")));
-    }
-    if let Some((i, v)) = scales.iter().enumerate().find(|(_, v)| !v.is_finite()) {
-        return Err(refuse(format!(
-            "its scale {name} [{i}] is {v}, not a finite value"
-        )));
-    }
-    Ok(Some(scales))
+    gguf::tensor_scales(t, find).map_err(|e| match e {
+        gguf::LoadError::Scale { .. } => GpuError::shape(what, e.to_string()),
+        e => e.into(),
+    })
 }
 
 /// The bytes `t`'s upload moves, for sizing a load's staging ring: its
@@ -1789,8 +1795,9 @@ mod tests {
                     nbytes,
                 },
                 spans,
+                scale: None,
             };
-            if !std::panic::catch_unwind(|| part_formats(&[part]))
+            if !std::panic::catch_unwind(|| part_formats(&[part], |_| false))
                 .is_ok_and(|result| result.is_err())
             {
                 accepted.push((dims, nbytes));
@@ -1806,10 +1813,14 @@ mod tests {
                 nbytes: 144,
             },
             spans: vec![&[0u8; 72], &[0u8; 72]],
+            scale: None,
         };
-        assert!(part_formats(&[part]).is_ok());
+        assert!(part_formats(&[part], |_| false).is_ok());
     }
 
+    /// Every type with a card format takes a part, and of the types a tensor scale multiplies only
+    /// NVFP4, whose part carries its scale: a scaled type that gains a card format fails here
+    /// until its part upload reads the scale.
     #[test]
     fn part_formats_follows_the_scale_rule() {
         for row in gguf::QROWS {
@@ -1824,9 +1835,10 @@ mod tests {
                     nbytes,
                 },
                 spans: vec![&bytes],
+                scale: row.ty.reads_scale().then(|| vec![1.0]),
             };
-            let result = part_formats(&[part]);
-            if row.card.layout.is_some() && !row.ty.reads_scale() {
+            let result = part_formats(&[part], |_| false);
+            if row.card.layout.is_some() && (!row.ty.reads_scale() || row.ty == GgmlType::NVFP4) {
                 assert!(result.is_ok(), "{}: {result:?}", row.ty);
             } else {
                 let error = result.unwrap_err().to_string();
@@ -1839,48 +1851,78 @@ mod tests {
         }
     }
 
-    /// A part list is checked whole before any upload: a name given twice, a derived name, and a
-    /// type whose values a tensor scale multiplies are refused by name; distinct parts of types
-    /// with a card format pass, their staging bytes summed.
+    /// A part list is checked whole before any upload: a name given twice or held already, a
+    /// derived name, a type with no part upload, and tensor scales a type reads missing, of
+    /// another count or not finite, or given to a type that reads none, are refused by name;
+    /// distinct parts of types with a card format pass, an NVFP4 part with its scale and a stack
+    /// with one an expert among them, their staging bytes summed.
     #[test]
     fn a_part_list_is_refused_before_any_upload() {
-        let part = |name: &str, ty: GgmlType| {
+        let part = |name: &str, ty: GgmlType, dims: &[u64], scale: Option<Vec<f32>>| {
             let nbytes =
-                gguf::tensor_bytes(ty.blck_size().unwrap(), ty.type_size().unwrap(), &[32, 2])
-                    .unwrap();
+                gguf::tensor_bytes(ty.blck_size().unwrap(), ty.type_size().unwrap(), dims).unwrap();
             TensorPart {
                 info: TensorInfo {
                     name: name.to_string(),
-                    dims: vec![32, 2],
+                    dims: dims.to_vec(),
                     ty,
                     offset: 0,
                     nbytes,
                 },
-                spans: vec![&[0u8; 256][..nbytes as usize]],
+                spans: vec![&[0u8; 512][..nbytes as usize]],
+                scale,
             }
         };
-        let ok = [part("a", GgmlType::Q8_0), part("b", GgmlType::F32)];
-        let (formats, budget) = part_formats(&ok).unwrap_or_else(|e| panic!("{e}"));
+        let (q8, wide) = (GgmlType::Q8_0, GgmlType::F32);
+        let row = [32, 2];
+        let none = |_: &str| false;
+        let ok = [part("a", q8, &row, None), part("b", wide, &row, None)];
+        let (formats, budget) = part_formats(&ok, none).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(formats.len(), 2);
         // Q8_0 [32, 2] stages 68 plane bytes, F32 [32, 2] 256.
         assert_eq!(budget, 68 + 256);
+        let nv = |name, dims: &[u64], scale| part(name, GgmlType::NVFP4, dims, scale);
+        let scaled = [
+            nv("n", &[64, 2], Some(vec![0.5])),
+            nv("s", &[64, 1, 3], Some(vec![0.5; 3])),
+        ];
+        assert!(part_formats(&scaled, none).is_ok());
         for (bad, says) in [
             (
-                vec![part("a", GgmlType::Q8_0), part("a", GgmlType::F32)],
+                vec![part("a", q8, &row, None), part("a", wide, &row, None)],
                 "given twice",
             ),
-            (vec![part("derived.x", GgmlType::F32)], "derived"),
+            (vec![part("derived.x", wide, &row, None)], "derived"),
             (
-                vec![part("a", GgmlType::F8E4M3_ROWS)],
+                vec![part("r", GgmlType::F8E4M3_ROWS, &row, Some(vec![1.0]))],
                 "no part upload takes",
             ),
             (
-                vec![part("a", GgmlType::NVFP4_ROWS)],
-                "no part upload takes",
+                vec![nv("n", &[64, 2], None)],
+                "reads 1 finite tensor scales; the part carries none",
+            ),
+            (
+                vec![nv("s", &[64, 1, 3], Some(vec![0.5]))],
+                "reads 3 finite tensor scales; the part carries 1 values",
+            ),
+            (
+                vec![nv("n", &[64, 2], Some(vec![f32::NAN]))],
+                "the part carries 1 values, 0 finite",
+            ),
+            (
+                vec![part("q", q8, &row, Some(vec![1.0]))],
+                "reads 0 finite tensor scales",
             ),
         ] {
-            let e = part_formats(&bad).map(|_| ()).unwrap_err().to_string();
+            let e = part_formats(&bad, none)
+                .map(|_| ())
+                .unwrap_err()
+                .to_string();
             assert!(e.contains(says), "{e}");
         }
+        let e = part_formats(&ok[..1], |name| name == "a")
+            .map(|_| ())
+            .unwrap_err();
+        assert!(e.to_string().contains("a given twice"), "{e}");
     }
 }

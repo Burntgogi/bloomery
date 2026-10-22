@@ -151,18 +151,16 @@ pub static DSREF: Family = Family {
     ],
 };
 
-/// The draft file the tree runs: `$BLOOMERY_DSPARK_MODEL`, which the dspark
-/// recipes export from the V4.1 profile's `DSPARK_MODEL`.
+/// The draft file the tree runs: `$BLOOMERY_DSPARK_MODEL`
+/// ([`super::draft::dspark_lever`]), which the dspark recipes export from the
+/// V4.1 profile's `DSPARK_MODEL`.
 pub fn dspark_model() -> Result<String, RefError> {
-    match std::env::var("BLOOMERY_DSPARK_MODEL") {
-        Ok(p) if !p.is_empty() => Ok(p),
-        _ => Err(RefError::Missing {
-            path: std::path::PathBuf::new(),
-            what: "BLOOMERY_DSPARK_MODEL unset — the dspark recipes export it from the V4.1 \
-                   profile's DSPARK_MODEL"
-                .to_string(),
-        }),
-    }
+    super::draft::dspark_lever().ok_or_else(|| RefError::Missing {
+        path: std::path::PathBuf::new(),
+        what: "BLOOMERY_DSPARK_MODEL unset — the dspark recipes export it from the V4.1 \
+               profile's DSPARK_MODEL"
+            .to_string(),
+    })
 }
 
 /// ik's greedy continuation of prompt row 7, 64 steps: the long gate's

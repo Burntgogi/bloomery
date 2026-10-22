@@ -70,8 +70,9 @@
 //!   suite's first request and `t1` answer on the media server, after its image requests, with
 //!   the control's bodies byte for byte: a media load moves no text bit, and a reset takes the
 //!   images away); `image_refusals` (a placeholder typed beside an image, images that alone pass
-//!   the encoder's length, a URL that is no data URL, nine images, a GIF, each a 400 whose
-//!   message names its cause, and videos a 501); `image_after_refusals` (the first image request
+//!   the encoder's length, images past the decoded-byte budget, a URL that is no data URL,
+//!   nine images, a GIF, each a 400 whose message names its cause, and videos a 501);
+//!   `image_after_refusals` (the first image request
 //!   again is the same body: the refusals left the server and its tables as they were).
 //!   `--hf` adds two servers started from the hub, each alone on the card: `hf_picks_the_projector`
 //!   (with no projector flag the seat fetches the repo's own projector, `hf::mmproj_sibling`'s pick,
@@ -356,8 +357,8 @@ mod gate {
             .to_owned())
     }
 
-    /// The test images the gate posts by their stems: the three set D's requests name, and the one
-    /// whose tokens alone pass the encoder's length.
+    /// The test images the gate posts by their stems: the three set D's requests name, and
+    /// `max-2600x1800`, which the length row and the decode-bound row post.
     const IMAGES: [(&str, &str); 4] = [
         ("free-448x448", "tools/ref/clefvis/images/free-448x448.png"),
         ("free-640x480", "tools/ref/clefvis/images/free-640x480.png"),
@@ -771,8 +772,15 @@ mod gate {
 
         // The refusals.
         let max = png_url("max-2600x1800")?;
+        let wide = png_url("free-1024x768")?;
         let one = png_url("free-448x448")?;
         let nine = vec![one.clone(); 9];
+        // PIN(2026-10-22): five max-2600x1800 meet the 64 MiB decode bound before the encoder length.
+        // Align 32, one token per 32×32, at most 4096: 2600×1800 plans to 2432×1696 = 76×53 =
+        // 4028 tokens, 1024×768 is 32×24 = 768. The piece is start, pad and end per image and a
+        // newline, so the length is sum(counts) + 2*n + 1: 4*4028 + 768 + 2*5 + 1 = 16891 >
+        // 16384. Decoded bytes are w*h*3: 4*2600*1800*3 + 1024*768*3 = 58,519,296 < 64*1024*1024.
+        let length = vec![max.clone(), max.clone(), max.clone(), max.clone(), wide];
         let five = vec![max; 5];
         let gif = "data:image/gif;base64,R0lGODlhAQABAAAAACw=".to_owned();
         let videos = req.replacen('{', r#"{"videos": ["x"], "#, 1);
@@ -787,10 +795,17 @@ mod gate {
             ),
             (
                 "images_alone_pass_the_encoders_length",
-                with_images(req, &five, "")?,
+                with_images(req, &length, "")?,
                 400,
                 "invalid_request_error",
                 vec!["5 image(s) take", "maximum is 16384"],
+            ),
+            (
+                "images_pass_the_decoded_byte_budget",
+                with_images(req, &five, "")?,
+                400,
+                "invalid_request_error",
+                vec!["image size limits"],
             ),
             (
                 "not_a_data_url",

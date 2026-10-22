@@ -57,15 +57,15 @@ pub use body35::{
     Body35, DecodeInput35, LayerKind35, Open35, checkpoint_budget35, checkpoint_price35,
 };
 pub use body38::{
-    ALLOWED, Body38, CHECKPOINT_EVERY, DecodeInput38, LayerKind38, Prompt38, Qwen38Model, RouteTap,
-    Seq38, Store38Host, XSTREAM_COSTS, checkpoint_budget38, checkpoint_bytes, checkpoint_price38,
-    point_row_budget38, seq_positional_bytes, seq38_bytes,
+    ALLOWED, Body38, CHECKPOINT_EVERY, DecodeInput38, Folder38, LayerKind38, Model38, Prompt38,
+    Qwen38Model, RouteTap, Seq38, Store38Host, XSTREAM_COSTS, checkpoint_budget38,
+    checkpoint_bytes, checkpoint_price38, point_row_budget38, seq_positional_bytes, seq38_bytes,
 };
 pub use draft_taps::TapRowsSink;
 pub use mtp35::{Mtp35, addresses};
 pub use mtp38::{
     BorrowedPlanes, DraftRows38, Held38, MTP_GRAPH_ROWS, MTP_ROWS, MTP_STORE_ROWS, Mtp38, MtpDraft,
-    MtpFeed, MtpHead, MtpNode, MtpTaps, TargetRows, walk_launches,
+    MtpNode, MtpTaps, TargetRows, walk_launches,
 };
 pub use placed::Placed;
 pub use taps35::{Delta35Run, Ffn35Run, Gqa35Run, Layer35Run, Mixer35Run, StoreHost};

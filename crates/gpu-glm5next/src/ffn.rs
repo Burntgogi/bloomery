@@ -51,28 +51,28 @@
 //! [`BlockPlan::extra_launches`]: bloomery_gpu_deepseek41::block::BlockPlan::extra_launches
 
 use bloomery_gpu::card_leg::{CardLeg, LegBufs, LegRun, LegShape, LegStacks, LegSum};
+use bloomery_gpu::host::leg_tier::{STAGE_TIER, TierSide};
 use bloomery_gpu::host::run::HostRun;
 use bloomery_gpu::hybrid::{Boundary, Hybrid, SlotMap};
 use bloomery_gpu::kquant::{
     Act, EntryPlanes, KquantTileKernels, TileGather, TileScratch, TiledGateUpAct,
 };
 use bloomery_gpu::routed_block::wait_add;
-use bloomery_gpu::weights::{DevWeight, Weights};
-use bloomery_gpu::{DeviceTensor, Gpu, GpuError, Q8Act};
+use bloomery_gpu::weights::Weights;
+use bloomery_gpu::{Gpu, GpuError, Q8Act};
 use bloomery_gpu_deepseek41::block::{Block, BlockIo, enqueue_block};
 use bloomery_gpu_deepseek41::chain::ffn::{CardAcc, CardAccTier, FfnBatchKernels, Handoff, Places};
 use bloomery_gpu_deepseek41::router::glm5next::{N_EXPERT, N_USED};
 use bloomery_gpu_deepseek41::span::{span, span_mut};
 use cuda_core::{CudaStream, DeviceBuffer};
-use gguf::GgmlType;
 use model::arch::glm5next::place::{TIER_CHUNK, card_leg_bytes, card_tile_bytes, card_tiles_run};
 use model::arch::names::routed_stacks;
 use model::placement::accepts::{self, Program};
+use model::placement::kernels::{self, DownAct, DownEntry, DownForms, GateUpEntry};
 use models::{Ffn, LayerSpec};
 
 use crate::body::{Parts, f32t, f32v};
 use crate::tensors::{FfnNames, LayerNames, other_kind};
-use crate::tier::{STAGE_TIER, TierSide};
 
 /// The dense block's launches.
 pub(crate) const DENSE_LAUNCHES: usize = 3;
@@ -119,9 +119,10 @@ const fn leg_shape(n_embd: usize, ff: usize) -> LegShape {
 /// one-token buffers every card layer's shadow writes (a verify's or a pass's
 /// row reads its own card sum in its back, after the other rows' shadows). Made at load, after the weights,
 /// from the stacks they hold; a layer the map puts experts on holds its three
-/// stacks, each of a type the card leg's arms run ([`accepts::leg_arms`]), at
-/// `n_card` experts each, and a layer it puts none on holds none — anything
-/// else is refused by name.
+/// stacks, each of a type the body's card leg arms run ([`card_stacks`]), at
+/// `n_card` experts each, and a layer it puts none on holds none — anything else is
+/// refused by name. The rows' leg buffers hold the forms the card layers'
+/// downs read.
 pub(crate) struct CardExperts {
     /// The card leg a step's card slots run on.
     leg: CardLeg,
@@ -130,9 +131,11 @@ pub(crate) struct CardExperts {
     batch: FfnBatchKernels,
     /// Per layer of the description, `None` without card experts.
     layers: Vec<Option<CardLayer>>,
-    /// A card layer's stacks are not [`card_tiles_run`]'s: a prompt batch
-    /// runs it on the card leg, whose buffers [`CardTiles`] then holds.
-    prompt_leg: bool,
+    keep_host: bool,
+    /// The down forms of the card layers whose stacks are not
+    /// [`card_tiles_run`]'s: a prompt batch runs those on the card leg, whose
+    /// buffers [`CardTiles`] then holds in these forms.
+    prompt_leg: DownForms,
     /// Routed expert width: a gate·up slot's rows.
     ff: usize,
     /// Each row's buffers, row 0 the step's: a row of the load's rows in
@@ -145,8 +148,8 @@ pub(crate) struct CardExperts {
 /// One row's buffers of the card experts' shadow.
 struct CardRow {
     /// The card leg's buffers for one token: the norm's q8_1 form, the
-    /// gate·up's rows, the card slots' q8_1 columns and the downs, a slot's
-    /// `n_embd` rows each.
+    /// gate·up's rows, the card slots' q8_1 columns in each form the card
+    /// layers' downs read and the downs, a slot's `n_embd` rows each.
     leg: LegBufs,
     /// The card slots' weighted sum, and it plus the shared expert's output.
     acc: DeviceBuffer<f32>,
@@ -154,9 +157,14 @@ struct CardRow {
 }
 
 impl CardRow {
-    fn new(stream: &CudaStream, n_embd: usize, ff: usize) -> Result<CardRow, GpuError> {
+    fn new(
+        stream: &CudaStream,
+        n_embd: usize,
+        ff: usize,
+        downs: DownForms,
+    ) -> Result<CardRow, GpuError> {
         Ok(CardRow {
-            leg: LegBufs::new(stream, leg_shape(n_embd, ff))?,
+            leg: LegBufs::for_downs(stream, leg_shape(n_embd, ff), downs)?,
             acc: DeviceBuffer::zeroed(stream, n_embd)?,
             pre: DeviceBuffer::zeroed(stream, n_embd)?,
         })
@@ -179,10 +187,10 @@ impl CardExperts {
         map: &SlotMap,
         n_embd: usize,
         ff: usize,
-        rows: usize,
+        (rows, keep_host): (usize, bool),
     ) -> Result<CardExperts, GpuError> {
         let mut per = Vec::with_capacity(layers.len());
-        let mut prompt_leg = false;
+        let (mut downs, mut prompt_leg) = (DownForms::NONE, DownForms::NONE);
         for (l, spec) in layers.iter().enumerate() {
             // A dense block is outside the host run and has no row: no card
             // experts, which the resident-rows check below holds it to. A
@@ -209,16 +217,19 @@ impl CardExperts {
                     detail: format!("layer {l}: card experts on a dense block"),
                 });
             };
-            // The card leg's arms ([`accepts::leg_arms`]); a prompt batch runs
-            // a layer the tiles do not on the card leg.
-            let st = CardStacks::of(w, l)?;
-            prompt_leg |= !card_tiles_run(st.gate.ty, st.down.ty);
             let layer = CardLayer {
                 n_card,
                 limit: crate::body::limit_of(m.act)?,
                 names,
             };
-            LegStacks::of(w, layer.names())?.check(n_card, leg_shape(n_embd, ff))?;
+            // A prompt batch runs a layer the tiles do not on the card leg.
+            let st = card_stacks(w, &layer)?;
+            st.check(n_card, leg_shape(n_embd, ff))?;
+            let form = down_form(&st)?;
+            downs = downs.with(form);
+            if !card_tiles_run(st.gate_up_ty(), st.down_ty()) {
+                prompt_leg = prompt_leg.with(form);
+            }
             per.push(Some(layer));
         }
         let stream = gpu.stream();
@@ -227,14 +238,15 @@ impl CardExperts {
             tiles: KquantTileKernels::load(gpu.context(), gpu.fault_word())?,
             batch: FfnBatchKernels::load(gpu.context())?,
             layers: per,
+            keep_host,
             prompt_leg,
             ff,
             rows: (0..rows)
-                .map(|_| CardRow::new(stream, n_embd, ff))
+                .map(|_| CardRow::new(stream, n_embd, ff, downs))
                 .collect::<Result<Vec<_>, _>>()?,
             tier: match map.tiers() {
                 0 => None,
-                _ => Some(TierSide::new(gpu, map, layers.len(), rows)?),
+                _ => Some(TierSide::new(gpu, map, layers.len(), (rows, N_USED))?),
             },
         })
     }
@@ -243,8 +255,9 @@ impl CardExperts {
     /// every routed layer of `layers` on the card at its own id, `ff` the
     /// rank's part of the routed width, each layer's stacks of a type a
     /// rank's leg runs ([`LegStacks::of_rank`]: a Q6_K down too) at every
-    /// expert, and the buffers of the one row a rank steps. No prompt batch
-    /// and no tier card run on a rank. Load-time only.
+    /// expert, and the buffers of the one row a rank steps, in the forms its
+    /// layers' downs read. No prompt batch and no tier card run on a rank.
+    /// Load-time only.
     pub(crate) fn rank(
         gpu: &Gpu,
         w: &Weights,
@@ -252,31 +265,33 @@ impl CardExperts {
         n_embd: usize,
         ff: usize,
     ) -> Result<CardExperts, GpuError> {
-        let per = layers
-            .iter()
-            .enumerate()
-            .map(|(l, spec)| {
-                let Ffn::Moe(m) = &spec.ffn else {
-                    return Ok(None);
-                };
-                let layer = CardLayer {
-                    n_card: N_EXPERT,
-                    limit: crate::body::limit_of(m.act)?,
-                    names: routed_stacks(l),
-                };
-                LegStacks::of_rank(w, layer.names())?.check(N_EXPERT, leg_shape(n_embd, ff))?;
-                Ok(Some(layer))
-            })
-            .collect::<Result<Vec<_>, GpuError>>()?;
+        let mut downs = DownForms::NONE;
+        let mut per = Vec::with_capacity(layers.len());
+        for (l, spec) in layers.iter().enumerate() {
+            let Ffn::Moe(m) = &spec.ffn else {
+                per.push(None);
+                continue;
+            };
+            let layer = CardLayer {
+                n_card: N_EXPERT,
+                limit: crate::body::limit_of(m.act)?,
+                names: routed_stacks(l),
+            };
+            let st = LegStacks::of_rank(w, layer.names())?;
+            st.check(N_EXPERT, leg_shape(n_embd, ff))?;
+            downs = downs.with(down_form(&st)?);
+            per.push(Some(layer));
+        }
         let stream = gpu.stream();
         Ok(CardExperts {
             leg: CardLeg::load(gpu)?,
             tiles: KquantTileKernels::load(gpu.context(), gpu.fault_word())?,
             batch: FfnBatchKernels::load(gpu.context())?,
             layers: per,
-            prompt_leg: false,
+            keep_host: false,
+            prompt_leg: DownForms::NONE,
             ff,
-            rows: vec![CardRow::new(stream, n_embd, ff)?],
+            rows: vec![CardRow::new(stream, n_embd, ff, downs)?],
             tier: None,
         })
     }
@@ -284,6 +299,11 @@ impl CardExperts {
     /// Layer `l` computes experts on the card.
     pub(crate) fn has(&self, l: usize) -> bool {
         self.layer(l).is_some()
+    }
+
+    /// A fully resident layer needs no host view unless residency can move its experts.
+    pub(crate) fn hostless(&self, l: usize) -> bool {
+        !self.keep_host && self.n_card(l) == N_EXPERT
     }
 
     /// The experts of layer `l` the expert tier holds: 0 without a tier.
@@ -301,8 +321,9 @@ impl CardExperts {
         self.tier.as_ref()
     }
 
-    /// A card layer runs a prompt batch on the card leg ([`card_tiles_run`]).
-    pub(crate) fn prompt_leg(&self) -> bool {
+    /// The down forms of the card layers a prompt batch runs on the card
+    /// leg ([`card_tiles_run`]); none when every card layer is a tile layer.
+    pub(crate) fn prompt_leg(&self) -> DownForms {
         self.prompt_leg
     }
 
@@ -364,53 +385,37 @@ fn past_rows(n: usize, row: usize) -> GpuError {
     }
 }
 
-/// One resident routed stack: its name, file type and words.
-pub(crate) struct Stack<'w> {
-    pub(crate) name: String,
-    pub(crate) ty: GgmlType,
-    pub(crate) w: &'w DeviceTensor<u32>,
+/// Layer `cl`'s three resident routed stacks as the body's card leg reads
+/// them ([`LegStacks::of_arms`] over [`accepts::leg_arms`] of the glm5next
+/// body, the arms its plan rule reads): the file's blocks, or NVFP4's planes.
+/// A stack of a type no arm runs is refused by name.
+fn card_stacks<'w>(w: &'w Weights, cl: &'w CardLayer) -> Result<LegStacks<'w>, GpuError> {
+    let arms = accepts::leg_arms(Program::Glm5nextBody).ok_or_else(|| GpuError::Shape {
+        what: CARD,
+        detail: format!("{:?} runs no card leg", Program::Glm5nextBody),
+    })?;
+    LegStacks::of_arms(
+        w,
+        cl.names(),
+        arms,
+        (
+            "a resident routed gate or up stack of a type the card leg's gate·up arm runs \
+             (`placement::accepts::leg_arms`)",
+            "a resident routed down stack of a type the card leg's down arm runs \
+             (`placement::accepts::leg_arms`)",
+        ),
+    )
 }
 
-/// A layer's three resident routed stacks: the gate and up of one type the
-/// card leg's gate·up arm runs, the down of a type its down arm runs
-/// ([`accepts::leg_arms`]).
-pub(crate) struct CardStacks<'w> {
-    pub(crate) gate: Stack<'w>,
-    pub(crate) up: Stack<'w>,
-    pub(crate) down: Stack<'w>,
-}
-
-impl<'w> CardStacks<'w> {
-    pub(crate) fn of(w: &'w Weights, l: usize) -> Result<CardStacks<'w>, GpuError> {
-        const GATE_UP: &str = "a resident routed gate or up stack of a type the card leg's \
-                                gate·up arm runs (`placement::accepts::leg_arms`)";
-        const DOWN: &str = "a resident routed down stack of a type the card leg's down arm \
-                            runs (`placement::accepts::leg_arms`)";
-        let arms = accepts::leg_arms(Program::Glm5nextBody).ok_or_else(|| GpuError::Shape {
+/// The form `st`'s down entry reads ([`kernels::down`]); a down the table
+/// names no entry for, which the arms refuse first, is refused by name.
+fn down_form(st: &LegStacks<'_>) -> Result<DownAct, GpuError> {
+    kernels::down(st.down_ty())
+        .map(|(_, act)| act)
+        .ok_or_else(|| GpuError::Shape {
             what: CARD,
-            detail: format!("{:?} runs no card leg", Program::Glm5nextBody),
-        })?;
-        let of = |name: String, arm: fn(GgmlType) -> bool, need: &'static str| match w.get(&name) {
-            Some(DevWeight::KQuant { ty, w, .. }) if arm(*ty) => Ok(Stack { name, ty: *ty, w }),
-            _ => Err(GpuError::Tensor {
-                what: CARD,
-                name,
-                need,
-            }),
-        };
-        let [g, u, d] = routed_stacks(l);
-        let gate = of(g, arms.gate_up, GATE_UP)?;
-        let up = of(u, arms.gate_up, GATE_UP)?;
-        let down = of(d, arms.down, DOWN)?;
-        if up.ty != gate.ty {
-            return Err(GpuError::Tensor {
-                what: CARD,
-                name: up.name,
-                need: "the gate stack's type",
-            });
-        }
-        Ok(CardStacks { gate, up, down })
-    }
+            detail: format!("a down stack of {} with no entry", st.down_ty()),
+        })
 }
 
 /// A routed layer's names, borrowed out of their [`FfnNames::Moe`].
@@ -544,6 +549,20 @@ pub(crate) fn front(
             .enqueue_handoff_tier(stream, &h, places, targets, fault, (&mut s.sel, tsel))?;
         return hybrid.enqueue_tier_go(stream, l, p.row);
     }
+    if p.card.hostless(l) {
+        return p.card.batch.enqueue_places(
+            stream,
+            &Places {
+                ids: h.ids,
+                n: N_USED,
+                map: h.map,
+                row_off: h.row_off,
+                n_expert: N_EXPERT,
+            },
+            fault,
+            &mut s.sel,
+        );
+    }
     let target = hybrid.boundary_mut().handoff_target_of(p.row)?;
     p.k.ffn
         .enqueue_handoff(stream, &h, target, fault, &mut s.sel)?;
@@ -614,7 +633,7 @@ fn card_slots(
         missing: "card experts on the layer",
     })?;
     let k = card_row_mut(rows, p.row)?;
-    let stacks = LegStacks::of(w, cl.names())?;
+    let stacks = card_stacks(w, cl)?;
     let run = LegRun {
         layer: l,
         stacks: &stacks,
@@ -752,9 +771,9 @@ pub(crate) struct CardRows<'a> {
 /// gathered Walk A planes, and the downs by slot, slot-major from the
 /// batch's first slot (the tier layers' back reads them beside the tier's
 /// rows); on a load with a card layer the tiles do not run
-/// ([`card_tiles_run`]), the card leg's buffers for [`TIER_CHUNK`] tokens.
-/// Its bytes are [`card_tile_bytes`]'s plus, with the leg, [`card_leg_bytes`]'s,
-/// which the plan reserves.
+/// ([`card_tiles_run`]), the card leg's buffers for [`TIER_CHUNK`] tokens in
+/// the forms those layers' downs read. Its bytes are [`card_tile_bytes`]'s
+/// plus [`card_leg_bytes`]'s of those forms, which the plan reserves.
 pub(crate) struct CardTiles {
     act_x: Q8Act,
     tile: TileScratch,
@@ -765,14 +784,15 @@ pub(crate) struct CardTiles {
 
 impl CardTiles {
     /// The scratch for batches of up to `cap` tokens, with the card leg's
-    /// buffers when `leg`, refused by name when its made bytes are not the
-    /// plan's formula's. Load-time or first-prompt only.
+    /// buffers in the forms `leg` names when it names any, refused by name
+    /// when its made bytes are not the plan's formula's. Load-time or
+    /// first-prompt only.
     pub(crate) fn new(
         gpu: &Gpu,
         n_embd: usize,
         ff: usize,
         cap: usize,
-        leg: bool,
+        leg: DownForms,
     ) -> Result<CardTiles, GpuError> {
         let stream = gpu.stream();
         let slots = cap * N_USED;
@@ -781,25 +801,20 @@ impl CardTiles {
             tile: TileScratch::new(stream, slots, ff)?,
             ord: EntryPlanes::new(stream, slots, n_embd)?,
             down: DeviceBuffer::zeroed(stream, slots * n_embd)?,
-            leg: match leg {
-                true => Some(LegBufs::new(
-                    stream,
-                    LegShape {
+            leg: (leg != DownForms::NONE)
+                .then(|| {
+                    let shape = LegShape {
                         cap: TIER_CHUNK as usize,
                         slots_per_col: N_USED,
                         n: n_embd,
                         ff,
-                    },
-                )?),
-                false => None,
-            },
+                    };
+                    LegBufs::for_downs(stream, shape, leg)
+                })
+                .transpose()?,
         };
-        let want = card_tile_bytes(n_embd, ff, N_USED, cap)
-            + if leg {
-                card_leg_bytes(n_embd, ff, N_USED)
-            } else {
-                0
-            };
+        let want =
+            card_tile_bytes(n_embd, ff, N_USED, cap) + card_leg_bytes(n_embd, ff, N_USED, leg);
         if t.bytes() != want {
             return Err(GpuError::Shape {
                 what: CARD,
@@ -855,7 +870,7 @@ pub(crate) fn card_rows(
         what: W,
         missing: "card experts on the layer",
     })?;
-    let st = CardStacks::of(w, l)?;
+    let st = card_stacks(w, cl)?;
     let t = io.t;
     let slots = t * N_USED;
     k.batch.enqueue_places(
@@ -872,10 +887,10 @@ pub(crate) fn card_rows(
     )?;
     let sel: &DeviceBuffer<u32> = &*io.sel;
     let tl = &mut *io.tiles;
-    if card_tiles_run(st.gate.ty, st.down.ty) {
+    if card_tiles_run(st.gate_up_ty(), st.down_ty()) {
         card_tiles(gpu, k, cl, &st, l, n, io.normed, sel, t, tl)?;
     } else {
-        card_leg_rows(gpu, w, k, cl, l, n, io.normed, sel, t, tl)?;
+        card_leg_rows(gpu, k, cl, &st, l, n, io.normed, sel, t, tl)?;
     }
     if io.tiered {
         return Ok(());
@@ -906,7 +921,7 @@ fn card_tiles(
     gpu: &Gpu,
     k: &CardExperts,
     cl: &CardLayer,
-    st: &CardStacks<'_>,
+    st: &LegStacks<'_>,
     l: usize,
     n: usize,
     normed: &DeviceBuffer<f32>,
@@ -927,32 +942,35 @@ fn card_tiles(
     };
     k.tiles
         .enqueue_card_gather(stream, &g, fault, &mut tl.ord)?;
-    match st.gate.ty {
-        GgmlType::Q4_K | GgmlType::Q5_K => {
+    let [wg, wu, wd] = st.words()?;
+    match kernels::gate_up(st.gate_up_ty()) {
+        Some(GateUpEntry::Q4k | GateUpEntry::Q5k) => {
             let (table, h) = tl.tile.table_and_h(slots, cl.n_card);
             let a = TiledGateUpAct {
-                wg: st.gate.w,
-                wu: st.up.w,
+                wg,
+                wu,
                 act: &tl.ord,
                 table,
                 rows_per_expert: k.ff,
                 rule: Act::SwigluClamp { limit: cl.limit },
             };
             k.tiles
-                .enqueue_gate_up_tiles(stream, st.gate.ty, &a, fault, h)?;
+                .enqueue_gate_up_tiles(stream, st.gate_up_ty(), &a, fault, h)?;
         }
-        _ => return Err(unrun(&st.gate)),
+        _ => return Err(untiled(&cl.names[0])),
     }
     tl.tile.enqueue_quantize_h(gpu, slots, cl.n_card, fault)?;
-    let d = tl.tile.down(st.down.w, n, slots, cl.n_card);
-    match st.down.ty {
-        GgmlType::Q5_K => k
-            .tiles
-            .enqueue_gemv_q5k_tiles(stream, &d, fault, &mut tl.down)?,
-        GgmlType::Q4_K => gpu
-            .q4k_sel()
-            .enqueue_gemv_q4k_tiles(stream, &d, fault, &mut tl.down)?,
-        _ => return Err(unrun(&st.down)),
+    let d = tl.tile.down(wd, n, slots, cl.n_card);
+    match kernels::down(st.down_ty()) {
+        Some((DownEntry::Q5k, DownAct::Q8Act)) => {
+            k.tiles
+                .enqueue_gemv_q5k_tiles(stream, &d, fault, &mut tl.down)?
+        }
+        Some((DownEntry::Q4k, DownAct::Q8Act)) => {
+            gpu.q4k_sel()
+                .enqueue_gemv_q4k_tiles(stream, &d, fault, &mut tl.down)?
+        }
+        _ => return Err(untiled(&cl.names[2])),
     }
     Ok(())
 }
@@ -965,9 +983,9 @@ fn card_tiles(
 #[allow(clippy::too_many_arguments)]
 fn card_leg_rows(
     gpu: &Gpu,
-    w: &Weights,
     k: &CardExperts,
     cl: &CardLayer,
+    stacks: &LegStacks<'_>,
     l: usize,
     n: usize,
     normed: &DeviceBuffer<f32>,
@@ -981,7 +999,6 @@ fn card_leg_rows(
         what: W,
         missing: "the card leg's prompt buffers (a card layer the tiles do not run)",
     })?;
-    let stacks = LegStacks::of(w, cl.names())?;
     let chunk = bufs.shape().cap;
     for c0 in (0..t).step_by(chunk) {
         let cn = chunk.min(t - c0);
@@ -991,7 +1008,7 @@ fn card_leg_rows(
         let mut d = span_mut(W, &mut *down, c0 * N_USED * n, slots * n)?;
         let run = LegRun {
             layer: l,
-            stacks: &stacks,
+            stacks,
             normed: &x,
             m: cn,
             sel: &s,
@@ -1003,12 +1020,12 @@ fn card_leg_rows(
     Ok(())
 }
 
-/// A stack whose type the card leg's arms ([`accepts::leg_arms`]) run but no
-/// launch here runs.
-pub(crate) fn unrun(st: &Stack<'_>) -> GpuError {
+/// A stack `name` of a type the card leg runs but the grouped tiles have no
+/// entry for, on a layer [`card_tiles_run`] names.
+fn untiled(name: &str) -> GpuError {
     GpuError::Tensor {
         what: CARD,
-        name: st.name.clone(),
+        name: name.to_owned(),
         need: "a type the grouped tiles have an entry for (gate·up Q4_K, Q5_K; down Q5_K, Q4_K)",
     }
 }
@@ -1032,6 +1049,12 @@ pub(crate) fn back(
     }
     let n = p.d.embd;
     let s = &mut *p.s;
+    if p.card.hostless(l) {
+        return s
+            .out
+            .copy_from_device_async(&card_row(&p.card.rows, p.row)?.pre, gpu.stream())
+            .map_err(Into::into);
+    }
     let shadowed = if p.card.has(l) {
         &card_row(&p.card.rows, p.row)?.pre
     } else {

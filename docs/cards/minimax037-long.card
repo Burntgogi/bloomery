@@ -1,0 +1,16 @@
+# tape037 (commit 93c017bd0) measured 14.33..14.53 tok/s on 512-token answers [measured]; a 2048-token answer
+# reads deeper KV, so the band opens below [derived].
+kind: baseline
+question: what does one long MiniMax-M3 tape (Korean, n-predict 2048) show on the RTX A6000 with host experts
+  at the serving defaults?
+term: decode tok/s of the K3 tape (Korean, n-predict 2048), thinking as the template gives it, RTX A6000 +
+  host experts, serving defaults
+unit: tok/s
+predict: 13.0..15.0
+condition: one lease, the box quiet, the A6000 (BLOOMERY_CARD=a6000), a fresh server, two discarded warm-ups,
+  io pressure some avg10 under 5 before the tape, greedy
+reason: the release post's MiniMax tape was too short; this is its long replacement
+decide-in: publish it as the post's MiniMax tape
+decide-below: under 13.0: deeper context or the host read costs more than tape037 showed; read the plan lines
+  before publishing
+decide-above: beyond 15.0: read the plan lines (more experts on the card than tape037's)

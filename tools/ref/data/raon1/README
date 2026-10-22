@@ -1,0 +1,26 @@
+Raon-1-mini-preview oracle prompts (tools/ref/raon1-dump.sh): token ids, one decimal id a line, no BOS (the file's add_bos_token is
+false, so llama-tokenize adds none). The dumper never tokenizes (tools/ref/cb_dump.cpp): a tokenizer difference would read as a
+kernel bug.
+
+Made once, on the box, by the tokenizer of the dump's own tree (KRAFTON's llama.cpp branch raon-1-mini-preview at
+fb895662d25868756a19253ca5e0688f99b18994, /home/user/llama.cpp-raon, CPU build, libllama.so md5 fcd56f0bf8345d9d1ce89e4b713d5ed8) on
+the Q4_K_M file (vocabulary only; the pre-tokenizer is `raon`):
+
+    llama-tokenize -m <file> -f <text> --ids --no-escape --log-disable     # "[id, id, ...]", written one id a line
+
+    a.ids  26    sha256 da9b3fe96a883ae4c81ddd7e37f88acc94ccb2fd9adf57cfa14ee7b566cf8e8c   English paragraph, cut after "one by one,"
+    b.ids  31    sha256 724f0899a050c622d79f4c76dc40707df29d787a26e8d28ce64056292966d228   Korean paragraph, cut after "돌아오고 있었고,"
+    c.ids  72    sha256 c897d8c7da237a31ce8a2830c838c1648a50f0a861b3e801ac79ecea27d35102   Rust function, cut after the `.trim_matches(..)` line
+    d.ids  1536  sha256 a0b529b9ba28a6181dd6b4a08d24ebfa58b18c6c63386d58b1773fbae07ef9af   first 1,536 ids of /home/user/eval/wikitext-2-raw/wiki.test.raw
+
+    cut text sha256: a.txt b8697c5bc02ca27aadaa96572e902af16b78ac8e281f8c3a4689442fd2bd13c8
+                     b.txt 8a18b5f2508b074660e9204ea89fd985ad287fe0ce7526f1237b11c986c6f48f
+                     c.txt 632be3a31ddf377fbe346723cc742d35bab61917f1865e62a48967c82e029674
+                     wiki.test.raw 173c87a53759e0201f33e0ccf978e510c2042d7f2cb78229d9a50d79b9e7dd08 (232,026 ids)
+    The cuts are of the texts tools/ref/data/minimaxm3 and solar2 are made from (full a, b, c: sha256 db8af4d0..., beb7baf5...,
+    c7990d34..., /home/user/stage/sorc/prompts/{a,b,c}.txt). The model ends a finished sentence with its end token (llama-simple, CPU, greedy, on the
+    full a: 30 of 32 tokens, on the full b: 0), and the dumper's greedy loop runs a fixed number of steps past it, so the prompts end
+    mid-sentence: each of the cut texts decodes the full 32 tokens without the end token.
+    The texts hold no backslash, so --no-escape and the default tokenize alike.
+
+d is 1,536 ids: more than the RDA scan's 16-position chunks (the per-channel gate's chunk size) and an MLA context beyond a single ubatch's 512 rows (three ubatches).

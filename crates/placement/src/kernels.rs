@@ -5,8 +5,10 @@
 //! rest of its facts; `gguf::card` documents each entry's launcher and the
 //! layouts the entries read. A tag with no row has no entry.
 //!
-//! The card bytes of an activation form are here too ([`q8_act_bytes`]): the
-//! q8_1 form every card leg, plan and family sizes, in one place.
+//! The card bytes of an activation form are here too ([`q8_act_bytes`],
+//! [`q8_blocks32_bytes`]) and of one run of the card leg's buffers
+//! ([`leg_bytes`]): the forms every card leg, plan and family sizes, in one
+//! place.
 
 use gguf::GgmlType;
 pub use gguf::card::{
@@ -47,6 +49,30 @@ pub const fn gemm(ty: GgmlType) -> Option<GemmEntry> {
     ty.card().gemm
 }
 
+/// Whether the prompt GEMM `entry` reads its activation in 32-value blocks
+/// (`Gemm32Weight`'s entries: Q8_0, Q5_0, Q5_1, IQ4_NL and NVFP4, over a
+/// `GemmAct32`), else in the grouped GEMM's q8_1 blocks of 128 (`GemmAct`):
+/// the form a prompt walk quantizes a unit's normed rows and SwiGLU rows into
+/// for a stack of that type.
+#[must_use]
+pub const fn gemm_reads_blocks32(entry: GemmEntry) -> bool {
+    match entry {
+        GemmEntry::Q8_0
+        | GemmEntry::Q5_0
+        | GemmEntry::Q5_1
+        | GemmEntry::Iq4nl
+        | GemmEntry::Nvfp4 => true,
+        GemmEntry::Q3k
+        | GemmEntry::Q4k
+        | GemmEntry::Q5k
+        | GemmEntry::Q6k
+        | GemmEntry::Iq2xxs
+        | GemmEntry::Iq3xxs
+        | GemmEntry::Iq3s
+        | GemmEntry::Iq4xs => false,
+    }
+}
+
 /// The dense gemv site launch family for a file tensor of type `ty`.
 #[must_use]
 pub const fn dense(ty: GgmlType) -> Option<SiteEntry> {
@@ -82,12 +108,97 @@ pub const fn q8_act_bytes(cols: u64, k: u64) -> u64 {
         + 4 * cols * 2 * n_sb
 }
 
+/// The card bytes of the 32-value q8_1 activation of `cols` columns of `k`
+/// values ([`DownAct::Q8Blocks32`], `Q8Blocks32` in `crates/gpu/src/q5.rs`):
+/// per column `256 · ceil(k_blocks / 32)` code words and `k_blocks` block sums
+/// and scales, four bytes each, `k_blocks = k / 32`.
+#[must_use]
+pub const fn q8_blocks32_bytes(cols: u64, k: u64) -> u64 {
+    let k_blocks = k / 32;
+    cols * 4 * (256 * k_blocks.div_ceil(32) + 2 * k_blocks)
+}
+
+/// The down activation forms ([`DownAct`]) a card leg's buffers hold: the
+/// forms the downs of the layers a load runs on them read.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DownForms {
+    q8_act: bool,
+    blocks32: bool,
+}
+
+impl DownForms {
+    /// No form: a load with no layer of the kind.
+    pub const NONE: DownForms = DownForms {
+        q8_act: false,
+        blocks32: false,
+    };
+
+    /// The one form `act`.
+    #[must_use]
+    pub const fn of(act: DownAct) -> DownForms {
+        DownForms::NONE.with(act)
+    }
+
+    /// These forms and `act`.
+    #[must_use]
+    pub const fn with(self, act: DownAct) -> DownForms {
+        match act {
+            DownAct::Q8Act => DownForms {
+                q8_act: true,
+                ..self
+            },
+            DownAct::Q8Blocks32 => DownForms {
+                blocks32: true,
+                ..self
+            },
+        }
+    }
+
+    /// Whether `act` is one of the forms.
+    #[must_use]
+    pub const fn holds(self, act: DownAct) -> bool {
+        match act {
+            DownAct::Q8Act => self.q8_act,
+            DownAct::Q8Blocks32 => self.blocks32,
+        }
+    }
+}
+
+/// The card bytes of one run of the card leg's buffers
+/// (`bloomery_gpu::card_leg::LegBufs`) for up to `cap` tokens of `n` values,
+/// `slots_per_col` slots a token, through experts of `ff` rows, the slots'
+/// columns held in each form of `downs`: the q8_1 of the tokens' rows (a
+/// column a token), the gate·up's rows (`ff` values a slot), the slots'
+/// columns in each form and the down's rows (`n` values a slot). The one
+/// formula of those bytes: the leg's buffers and every plan that reserves
+/// them read it.
+#[must_use]
+pub const fn leg_bytes(cap: u64, slots_per_col: u64, n: u64, ff: u64, downs: DownForms) -> u64 {
+    let slots = cap * slots_per_col;
+    let q8 = if downs.q8_act {
+        q8_act_bytes(slots, ff)
+    } else {
+        0
+    };
+    let b32 = if downs.blocks32 {
+        q8_blocks32_bytes(slots, ff)
+    } else {
+        0
+    };
+    q8_act_bytes(cap, n) + 4 * slots * ff + q8 + b32 + 4 * slots * n
+}
+
 /// Whether the common card leg (`crates/gpu/src/card_leg.rs`) launches the
 /// gate·up entry of a routed gate or up stack of type `ty` in the file's
 /// blocks ([`crate::placement::CardFormat::KQuant`]): the table's [`gate_up`]
 /// row, for the entries whose launchers read a `Q8Act` of more columns than a
-/// run uses. The Q8_0 row has a launcher of that shape and no arm in the leg
-/// yet. A stack in its planes is [`card_planes_runs`]'.
+/// run uses. The Q8_0 row has a launcher of that shape and an arm in the leg
+/// (`CardLeg::launch`), which this set leaves out: the families that plan by
+/// it (GLM-5.3, MiMo, Solar-Open2, MiniMax-M3, Raon) hold `Q8Act` down buffers
+/// only, so a Q8_0 layer they planned on the card would fail at its first
+/// launch where it runs on the host today; a program whose buffers follow the
+/// down's form reads the arm through its own row ([`crate::accepts::prompt_leg_gate_up`]).
+/// A stack in its planes is [`card_planes_runs`]'.
 #[must_use]
 pub const fn card_gate_up_runs(ty: GgmlType) -> bool {
     matches!(
@@ -347,6 +458,7 @@ mod tests {
                 (GgmlType::Q8_0, GateUpEntry::Q8_0),
                 (GgmlType::Q4_K, GateUpEntry::Q4k),
                 (GgmlType::Q5_K, GateUpEntry::Q5k),
+                (GgmlType::Q6_K, GateUpEntry::Q6k),
                 (GgmlType::MXFP4, GateUpEntry::Mxfp4),
                 (GgmlType::NVFP4, GateUpEntry::Nvfp4),
                 (GgmlType::IQ2_XS, GateUpEntry::Iq2xs),
@@ -453,15 +565,42 @@ mod tests {
         assert!(!card_runs(GgmlType::NVFP4) && !card_sel32_runs(GgmlType::NVFP4));
     }
 
+    /// The GEMM entries that read 32-value blocks are the `Gemm32Weight`
+    /// ones (the file's Q8_0, Q5_0, Q5_1 and IQ4_NL blocks, NVFP4's planes); the
+    /// grouped GEMM's read q8_1 blocks of 128. A type's GEMM form is one fact:
+    /// the table's `gemm` row read through this.
+    #[test]
+    fn gemm_form_is_the_32_value_entries() {
+        let blocks32: Vec<_> = ALL
+            .iter()
+            .filter(|&&ty| gemm(ty).is_some_and(gemm_reads_blocks32))
+            .copied()
+            .collect();
+        assert_eq!(
+            blocks32,
+            [
+                GgmlType::Q5_0,
+                GgmlType::Q5_1,
+                GgmlType::Q8_0,
+                GgmlType::NVFP4,
+                GgmlType::IQ4_NL
+            ]
+        );
+    }
+
     // PIN(2026-10-20): the GEMM pairs gain NVFP4 (`gemm_nvfp4p` over its
     // planes); every other pair is unchanged.
     // PIN(2026-10-21): and IQ2_XXS (`gemm_iq2xxs`, which `GemmWeight` already
     // decoded and the latent MoE body launches); every other pair is unchanged.
+    // PIN(2026-10-22): and Q5_0 (`gemm_q5_0p` over a stack's `pack_q5_0` words,
+    // which Raon-1's Q5_0 down stacks' prompt route reads), and IQ3_S
+    // (`gemm_iq3s`, over the file's blocks); every other pair is unchanged.
     #[test]
     fn gemm_admits_exactly_the_pinned_pairs() {
         assert_eq!(
             rows(gemm),
             [
+                (GgmlType::Q5_0, GemmEntry::Q5_0),
                 (GgmlType::Q5_1, GemmEntry::Q5_1),
                 (GgmlType::Q8_0, GemmEntry::Q8_0),
                 (GgmlType::Q3_K, GemmEntry::Q3k),
@@ -472,6 +611,7 @@ mod tests {
                 (GgmlType::IQ2_XXS, GemmEntry::Iq2xxs),
                 (GgmlType::IQ3_XXS, GemmEntry::Iq3xxs),
                 (GgmlType::IQ4_NL, GemmEntry::Iq4nl),
+                (GgmlType::IQ3_S, GemmEntry::Iq3s),
                 (GgmlType::IQ4_XS, GemmEntry::Iq4xs),
             ]
         );
@@ -552,6 +692,7 @@ mod tests {
             rows(CardFormat::of),
             [
                 (GgmlType::F32, CardFormat::F32),
+                (GgmlType::F16, CardFormat::Bf16AsF32),
                 (GgmlType::Q5_0, CardFormat::Q5_0),
                 (GgmlType::Q5_1, CardFormat::Q5_1),
                 (GgmlType::Q8_0, CardFormat::Q8_0Planes),
@@ -602,6 +743,7 @@ mod tests {
         assert_eq!(
             held(CardFormat::Bf16AsF32),
             [
+                GgmlType::F16,
                 GgmlType::Q3_K,
                 GgmlType::Q4_K,
                 GgmlType::Q5_K,

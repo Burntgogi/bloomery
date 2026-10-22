@@ -21,7 +21,8 @@
 //! arguments, filters `tojson`/`from_json`/`length`/`count`/`trim`/`string`/
 //! `lower`/`upper`/`capitalize`/`default`/`items`/`safe`, tests `defined`/`undefined`/`none`/`true`/
 //! `false`/`boolean`/`string`/`number`/`mapping`/`sequence`/`iterable`, and
-//! `raise_exception`/`range`. Whitespace is Python's `str.isspace`, and
+//! `raise_exception`/`range`, and Hugging Face's `{% generation %}` block (it renders its body,
+//! in a scope of its own). Whitespace is Python's `str.isspace`, and
 //! `{{ value }}` is Python's `str()`: a list or dict as its `repr`, a float in
 //! `repr`'s shortest form. Anything else is a parse or render error, never
 //! silent output: an argument the callee does not take, a macro defined
@@ -43,10 +44,23 @@ use std::sync::Arc;
 
 use serde_json::{Map, Value};
 
+/// The prefix a template's own refusal (`raise_exception`) carries.
+const REFUSAL: &str = "raise_exception: ";
+
 /// A template that failed to parse or to render.
 #[derive(Debug, thiserror::Error)]
 #[error("chat template: {0}")]
 pub struct TemplateError(pub String);
+
+impl TemplateError {
+    /// The message the template refused the request with, when the template
+    /// refused the request itself (`raise_exception`): the client's request,
+    /// not a fault of the template. `None` for every other error.
+    #[must_use]
+    pub fn refusal(&self) -> Option<&str> {
+        self.0.strip_prefix(REFUSAL)
+    }
+}
 
 fn err<T>(msg: impl Into<String>) -> Result<T, TemplateError> {
     Err(TemplateError(msg.into()))
@@ -308,6 +322,8 @@ enum Node {
         value: Expr,
     },
     Macro(Arc<Macro>),
+    /// `{% generation %}…{% endgeneration %}`: the body renders as itself, in a scope of its own.
+    Generation(Vec<Node>),
     Break,
     Continue,
 }
@@ -486,6 +502,17 @@ impl NodeParser {
                 })
             }
             "macro" => self.macro_def(rest, src),
+            "generation" => {
+                if !rest.is_empty() {
+                    return err(format!("{{% generation %}} takes nothing: {{% {src} %}}"));
+                }
+                // The body is a call block's: a loop around the tag is not its loop.
+                let outer = std::mem::replace(&mut self.loops, 0);
+                let (body, end) = self.block(&["endgeneration"])?;
+                self.loops = outer;
+                self.expect_end(end, "endgeneration", src)?;
+                Ok(Node::Generation(body))
+            }
             _ => err(format!("unsupported tag {{% {src} %}}")),
         }
     }
@@ -1671,6 +1698,12 @@ impl Renderer {
                 v.render(&mut self.out)?;
             }
             Node::Macro(m) => self.assign(m.name.clone(), V::Macro(Arc::clone(m))),
+            Node::Generation(body) => {
+                self.frames.push(HashMap::new());
+                let r = self.nodes(body);
+                self.frames.pop();
+                r?;
+            }
             Node::Break => return Ok(Flow::Break),
             Node::Continue => return Ok(Flow::Continue),
             Node::If(arms, els) => {
@@ -1879,7 +1912,7 @@ impl Renderer {
                     ([m], []) | ([], [("message", m)]) => to_str(m)?,
                     _ => return err("raise_exception() takes 1 argument (message)"),
                 };
-                err(format!("raise_exception: {msg}"))
+                err(format!("{REFUSAL}{msg}"))
             }
             Expr::Name(n) if n == "range" => range(&args, &kwargs),
             Expr::Attr(obj, method) => {
@@ -3770,5 +3803,54 @@ mod tests {
             unreachable!()
         };
         assert_eq!(t.render(&m).expect("renders"), "1250.0");
+    }
+    /// `{% generation %}` renders its body, in a scope of its own: a `set` inside does not leak,
+    /// the enclosing loop's names are seen, and a `break` inside is not the loop's.
+    #[test]
+    fn generation_block_renders_its_body() {
+        let out = render(
+            "{% set x = 1 %}{% for i in [1, 2] %}{% generation %}{% set x = 9 %}{{ i }}{{ x }};{% endgeneration %}{% endfor %}{{ x }}",
+            json!({}),
+        );
+        assert_eq!(out, "19;29;1");
+        for src in [
+            "{% for i in [1] %}{% generation %}{% break %}{% endgeneration %}{% endfor %}",
+            "{% generation %}x",
+            "{% generation 1 %}x{% endgeneration %}",
+        ] {
+            assert!(ChatTemplate::parse(src).is_err(), "{src}");
+        }
+    }
+
+    const RAON: &str = include_str!("../tests/fixtures/raon-chat-template.jinja");
+    const RAON_RENDERS: &str = include_str!("../tests/fixtures/raon-renders.json");
+
+    /// Raon-1-mini's chat template renders as Python's jinja2 renders it in the Hugging Face
+    /// environment, byte for byte, on every case of `raon-renders.json`: the thinking spans (kept,
+    /// truncated from history, `enable_thinking` off), the content parts, the tool schemas and the
+    /// calls and their answers, and the template's own refusals by their texts.
+    #[test]
+    fn raon_template_renders_as_jinja2() {
+        let fixture: Value = serde_json::from_str(RAON_RENDERS).expect("fixture JSON");
+        let cases = fixture["cases"].as_array().expect("cases");
+        assert_eq!(cases.len(), 18);
+        let t = ChatTemplate::parse(RAON).expect("the template parses");
+        for case in cases {
+            let name = case["name"].as_str().expect("name");
+            let Value::Object(vars) = case["vars"].clone() else {
+                panic!("{name}: vars");
+            };
+            match (case["prompt"].as_str(), case["error"].as_str()) {
+                (Some(want), None) => {
+                    assert_eq!(t.render(&vars).expect(name), want, "{name}");
+                }
+                (None, Some(want)) => {
+                    let want = want.strip_prefix("TemplateError: ").expect(name);
+                    let got = t.render(&vars).expect_err(name);
+                    assert!(got.0.contains(want), "{name}: {got:?}");
+                }
+                other => panic!("{name}: {other:?}"),
+            }
+        }
     }
 }

@@ -56,7 +56,7 @@ the tested toolkit, answer 7) with LLVM 21.1.8's ARM64 release `llc` named by `C
 for example:
 
 ```sh
-cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,gemma-embedding2,hf --release --bin bloomery-serve
+cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve
 ```
 
 The binary carries `sm_86` PTX, and the driver compiles it for cc 12.1 at the first start, about 6.5 s on the Arm cores
@@ -73,7 +73,10 @@ load, as the first run did (section 3).
 Models by size, in the order to try them (`docs/models.md:12,31-34`, `docs/BUILD.md` table): Clef-Flash 4.8–9.7 GB,
 Qwen3-30B-A3B `Q4_K_M` 18.6 GB, Qwen3.6-35B-A3B `Q4_K_M` 21.2 GB; then Qwen3.8 `UD-Q4_K_XL` 111.3 GB and GLM-5.3-Flash
 `UD-Q2_K_XL` 101.3 GiB (the size chosen "to fit a DGX Spark", https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan-ledger.md#L359) if the first `MemAvailable` reading
-allows. A 64 GB Spark (section 3; announced, not yet shipping) holds only the first three.
+allows. NVIDIA's own `nvidia/Qwen3.8-Flash-Next-NVFP4` checkpoint (132.7 GB on disk) serves from its folder as
+downloaded, `bloomery-serve -m <folder>`, with every routed expert on the GB10 and the PLE table read from the folder
+on the NVMe tier (`docs/serving.md`, the seats). A 64 GB Spark (section 3; announced, not yet shipping) holds only the
+first three.
 
 ## 3. The machine
 
@@ -140,6 +143,10 @@ BLOOMERY_BOX_LOCAL=1 BLOOMERY_BOX_ENV='BLOOMERY_TIER=fixture BLOOMERY_GATE_BOUND
   reference set's identity is the first shard's full path (`AGENTS.md`; a set's `# model` line,
   `crates/refset/src/fixture.rs:19-20`). `/models/fixtures` stays the one legal root, so on a Spark it is a symlink
   (answer 2).
+- **Container drive counters.** The depth, nvtier-read and engram-rate runners resolve a model's mount through
+  `tools/ref/drive-read.sh`: `findmnt --nofsroot` removes a bind mount's bracketed root, then `lsblk` resolves the
+  whole-disk parent or kernel name. The container must expose readable `/sys/block/<disk>/stat` counters.
+  A mount or counter that cannot be read is a named exit 2 before timing, not a guessed device or a weaker witness.
 - **Card names.** A Spark's card is named neither 3090 nor A6000, and local mode takes the one local card without a name
   match. `--place gate` plans the 3090's bytes on the smallest visible card with the room for them, the GB10 here, and local mode refuses the
   two-card recipes (rc 64) ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6124298082)). Which

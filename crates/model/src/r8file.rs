@@ -510,31 +510,18 @@ fn off(path: &Path, v: u64) -> Result<libc::off_t, ModelError> {
 /// cache.
 fn sync_and_drop(file: &File, path: &Path, range: Range<u64>) -> Result<(), ModelError> {
     let (at, len) = (off(path, range.start)?, off(path, range.end - range.start)?);
-    let flags = libc::SYNC_FILE_RANGE_WAIT_BEFORE
-        | libc::SYNC_FILE_RANGE_WRITE
-        | libc::SYNC_FILE_RANGE_WAIT_AFTER;
-    // SAFETY: the descriptor is `file`'s own and lives across the call; the
-    // call reads no memory of ours.
-    if unsafe { libc::sync_file_range(file.as_raw_fd(), at, len, flags) } != 0 {
-        return Err(io_err(path, "sync_file_range", io::Error::last_os_error()));
-    }
+    os::sync_range(file.as_raw_fd(), at, len)
+        .map_err(|e| io_err(path, "sync_file_range", e.into()))?;
     drop_cached(file, path, range)
 }
 
 /// `posix_fadvise(DONTNEED)` over `range`: the kernel drops the clean pages
-/// that lie wholly inside it and no process maps.
+/// that lie wholly inside it and no process maps. A platform with no such
+/// call keeps its pages, and the drop goes on.
 fn drop_cached(file: &File, path: &Path, range: Range<u64>) -> Result<(), ModelError> {
     let (at, len) = (off(path, range.start)?, off(path, range.end - range.start)?);
-    // SAFETY: as in `sync_and_drop`: `file`'s own descriptor, no memory read.
-    let rc = unsafe { libc::posix_fadvise(file.as_raw_fd(), at, len, libc::POSIX_FADV_DONTNEED) };
-    if rc != 0 {
-        return Err(io_err(
-            path,
-            "posix_fadvise(DONTNEED)",
-            io::Error::from_raw_os_error(rc),
-        ));
-    }
-    Ok(())
+    crate::placement::host_lock::drop_cached_pages(file.as_raw_fd(), at, len)
+        .map_err(|e| io_err(path, "posix_fadvise(DONTNEED)", e.into()))
 }
 
 /// The finished `.part` becomes `out`: synced, still the file this run wrote

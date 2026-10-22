@@ -24,7 +24,7 @@
 use std::num::NonZeroU64;
 
 use gguf::{GgmlType, Split, Value};
-use runtime::dspark::{DraftVocab, DsparkShape};
+use runtime::dspark::{DraftVocab, DsparkShape, HeadKind};
 
 use super::deepseek41::hparams::HyperConnections;
 use super::{meta_arr, meta_f32, meta_u64, meta_usize, metadata, n_vocab};
@@ -115,6 +115,12 @@ impl DraftHparams {
                 detail: format!("is {:?}, not {:?}", split.architecture(), super::DFLASH),
             });
         }
+        if super::dflash2::is_dflash2(split) {
+            return Err(PlacementError::Metadata {
+                key: "architecture".to_string(),
+                detail: "is a DFlash2 draft (selector head), read by arch::dflash2".to_string(),
+            });
+        }
         let n_layer = meta_usize(split, "block_count")?;
         let head_dim = meta_usize(split, "attention.key_length")?;
         let value_length = meta_usize(split, "attention.value_length")?;
@@ -192,8 +198,10 @@ pub fn shape(hp: &DraftHparams) -> DsparkShape {
         vocab: DraftVocab::Full { n: hp.n_vocab },
         mask_id: hp.mask_token,
         window: Some(hp.window),
-        markov_rank: hp.markov_rank,
-        confidence: true,
+        head: HeadKind::Markov {
+            rank: hp.markov_rank,
+            confidence: true,
+        },
     }
 }
 
@@ -201,7 +209,7 @@ pub fn shape(hp: &DraftHparams) -> DsparkShape {
 mod tests {
     use super::{DraftExperts, DraftHparams, shape};
     use crate::arch::deepseek41::hparams::HyperConnections;
-    use runtime::dspark::DraftVocab;
+    use runtime::dspark::{DraftVocab, HeadKind};
 
     /// A draft file's hyperparameters with the geometry the shape reads.
     fn hparams() -> DraftHparams {
@@ -257,8 +265,13 @@ mod tests {
         assert_eq!(s.vocab, DraftVocab::Full { n: 129_280 });
         assert_eq!(s.mask_id, 128_799);
         assert_eq!(s.window, Some(128));
-        assert_eq!(s.markov_rank, 256);
-        assert!(s.confidence);
+        assert_eq!(
+            s.head,
+            HeadKind::Markov {
+                rank: 256,
+                confidence: true
+            }
+        );
         assert_eq!(s.check(), Ok(()));
         assert_eq!(s.width(2), 1);
     }
@@ -981,7 +994,7 @@ fn per_layer_f32(split: &Split, suffix: &str, n_layer: usize) -> Result<Vec<f32>
 }
 
 /// `target_layers`: non-empty and strictly increasing.
-fn target_layers(split: &Split) -> Result<Vec<usize>, PlacementError> {
+pub(super) fn target_layers(split: &Split) -> Result<Vec<usize>, PlacementError> {
     let key = "target_layers";
     let mut layers: Vec<usize> = Vec::new();
     for (i, v) in meta_arr(split, key)?.iter().enumerate() {
@@ -1002,7 +1015,7 @@ fn target_layers(split: &Split) -> Result<Vec<usize>, PlacementError> {
 }
 
 /// `tokenizer.ggml.mask_token_id`.
-fn mask_token(split: &Split) -> Result<u32, PlacementError> {
+pub(super) fn mask_token(split: &Split) -> Result<u32, PlacementError> {
     split
         .value(MASK_TOKEN)
         .and_then(Value::as_unsigned)

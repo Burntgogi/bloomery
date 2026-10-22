@@ -95,6 +95,13 @@
 //! `_p4` entries at count `n`, and every head's arithmetic is theirs; the gate
 //! holds the two bodies to the same bits there.
 //!
+//! The `_p16_blocks` entry ([`FlashGqaKernels::enqueue_pass_p16_blocks`]) is
+//! the `_p12_sel` body at [`HEAD`] over block ids: a key head's own list of
+//! [`LISTED_BLOCK`]-position blocks (`BlockListed`) in place of one list of
+//! rows shared by every key head, one block a (row, key head, segment) holding
+//! the key head's sixteen query heads. Both entries are instances of
+//! `seg_mma_ps`; only the walk that finds a key's cache row differs (`KeyWalk`).
+//!
 //! The `_q8` entries ([`FlashGqaKernels::enqueue_pass_q8`] and
 //! [`FlashGqaKernels::enqueue_pass_256_q8`]) are the eight-head tensor-core
 //! segment passes over the Q8_0 cache the quantizing appends write
@@ -140,6 +147,17 @@
 //! in each staged key's address, `row0 + (key − first)` less `rows` once when
 //! it reaches `rows` (a window never exceeds the ring, so one compare
 //! suffices); `ctx` stays the bound of the live count and the merge.
+//!
+//! The `_p4_ring` pass ([`FlashGqaKernels::enqueue_pass_p4_ring`]) serves
+//! heads of [`HEAD`] in groups of any multiple of [`PACK_4`] query heads (a
+//! DFlash2 draft's 20/5) over a ring of `ctx` rows a key head in which each
+//! row names its own run: `n_keys[t]` keys from ring row `row0[t]`, wrapping
+//! once at `ctx`, the key heads' planes `stride >= ctx` rows apart. A
+//! block row's own window is its own run, so rows of one block may start at
+//! different rows. It is the `_p4` scalar pass (`seg_scalar_ring_p`, a copy
+//! of `seg_scalar_p` with the ring rule in each staged key's address, the
+//! one place they differ) and the head-128 merge `gqa_flash_merge` over the
+//! counts.
 //!
 //! Both merges skip a segment whose partial is neutral (`s = 0`). Over a
 //! finite row that skip is unreachable: a row's segments are cut from its
@@ -238,6 +256,23 @@ const THREADS_P12_U32: u32 = THREADS_P12 as u32;
 const _: () = assert!(PACK_12 == 12 && THREADS_P12_U32 == 384);
 const _: () = assert!(PACK_12 + PAD_12 == MMA_ROWS && PAD_12 <= PACK_12 && PACK_12 > MMA_ROWS / 2);
 
+/// Query heads one block of the `_p16_blocks` entry takes
+/// ([`FlashGqaKernels::enqueue_pass_p16_blocks`]): a key head's whole group of
+/// sixteen (64 query heads over 4 key heads), one warp each, filling the 16-row
+/// query tile.
+pub const PACK_16: usize = GROUP_16;
+const PAD_16: usize = MMA_ROWS - PACK_16;
+const THREADS_P16: usize = PACK_16 * 32;
+const THREADS_P16_U32: u32 = THREADS_P16 as u32;
+// The `_p16_blocks` launch contract spells PACK_16 and its block out as 16 and
+// 512; its instance of `seg_mma_ps` is checked in every build, as `_p4`'s above.
+const _: () = assert!(PACK_16 == 16 && THREADS_P16_U32 == 512);
+const _: () = assert!(PACK_16 + PAD_16 == MMA_ROWS && PACK_16 > MMA_ROWS / 2);
+
+/// Positions of the block a `_p16_blocks` list entry names.
+pub const LISTED_BLOCK: usize = 128;
+const _: () = assert!(LISTED_BLOCK == 128 && LISTED_BLOCK.is_multiple_of(KEY_TILE));
+
 /// Query heads one block of [`FlashGqaKernels::enqueue_pass`] takes.
 /// The tensor-core tile is [`MMA_ROWS`] rows and pads a pack only when the
 /// pad is at most the pack and the pack is past half the tile, which five
@@ -320,6 +355,13 @@ pub fn listed_partials_v_len_256(m: usize, n_head: usize, width: usize) -> usize
 #[must_use]
 pub fn listed_partials_ms_len(m: usize, n_head: usize, width: usize) -> usize {
     partials_len(m, n_head, listed_segments(width), 2)
+}
+
+/// [`partials_v_len`] of a listed launch over lists of at most `width`
+/// ([`listed_segments`]`(width)` a row's head): the `_p16_blocks` entry's.
+#[must_use]
+pub fn listed_partials_v_len(m: usize, n_head: usize, width: usize) -> usize {
+    partials_len(m, n_head, listed_segments(width), HEAD)
 }
 
 // The cut's invariants, the ones the segment bodies and both merges rely on
@@ -1523,6 +1565,9 @@ const _: () =
     assert!(seg_blocks_hold::<PACK_4>(3, 2, 3, 4) && seg_blocks_hold::<PACK_4>(2, 3, 2, 3));
 const _: () =
     assert!(seg_blocks_hold::<PACK_4>(1, 2, 1, 5) && seg_blocks_hold::<PACK_4>(2, 1, 3, 7));
+// The `_p4_ring` entry's one pack of four over five key heads (a DFlash2
+// draft's 20/5).
+const _: () = assert!(seg_blocks_hold::<PACK_4>(2, 5, 1, 3));
 // The `_p2` entry's packs of two at group 6 (Qwen3.5-9B's 24/4) and 2.
 const _: () =
     assert!(seg_blocks_hold::<PACK_2>(3, 4, 3, 4) && seg_blocks_hold::<PACK_2>(2, 3, 1, 5));
@@ -1987,11 +2032,44 @@ unsafe fn seg_mma_p<
     }
 }
 
+/// How a listed segment pass finds the cache row of a row's key `j`: the
+/// walk [`seg_mma_ps`] takes a row's count bound from
+/// ([`KeyWalk::count_cap`]) and stages a tile through
+/// ([`KeyWalk::stage_row`]); every other step is [`seg_mma_p`]'s.
+trait KeyWalk: Copy {
+    /// The largest live count a row may carry: past it the row is refused
+    /// ([`live_keys`]).
+    fn count_cap(self) -> usize;
+
+    /// Word `word` (u64) of key `j` of row `t` for key head `kh`, in the key
+    /// and the value plane: `plane` is the key head's first value, the planes
+    /// `ctx` rows of `HEAD` f16 per key head.
+    ///
+    /// # Safety
+    /// `j` is below row `t`'s live count ([`live_keys`] at
+    /// [`KeyWalk::count_cap`]), `t` a row of the launch, `kh` a key head of
+    /// it, `word < HEAD/4`, `plane` key head `kh`'s first value, and the
+    /// entry's launch contract holds.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the staging's state is the caller's registers, passed by value"
+    )]
+    unsafe fn stage_row<const HEAD: usize>(
+        self,
+        t: usize,
+        kh: usize,
+        j: usize,
+        word: usize,
+        plane: usize,
+        ctx: usize,
+        k64: *const u64,
+        v64: *const u64,
+    ) -> (u64, u64);
+}
+
 /// A `_p12_sel` row's keys: key `j` of row `t` is cache row
-/// `list[t·width + j]`, the count at most `width`. [`seg_mma_ps`] takes a
-/// row's count bound from [`Listed::count_cap`] and stages a tile through
-/// [`Listed::stage_row`]; every other step is [`seg_mma_p`]'s. An entry at or
-/// past the cache
+/// `list[t·width + j]`, the count at most `width`, the same for every key
+/// head. An entry at or past the cache
 /// raises [`FaultSite::PoolSelect`] and stages the f16 NaN pattern in both
 /// planes, so the row's output is NaN, never a plausible value.
 #[derive(Clone, Copy)]
@@ -2001,31 +2079,17 @@ struct Listed<'a> {
     fault: FaultSink,
 }
 
-impl Listed<'_> {
-    /// The largest live count a row may carry: past it the row is refused
-    /// ([`live_keys`]).
+impl KeyWalk for Listed<'_> {
     #[inline(always)]
     fn count_cap(self) -> usize {
         self.width
     }
 
-    /// Word `word` (u64) of key `j` of row `t`, in the key and the value
-    /// plane: `plane` is the key head's first value, the planes `ctx` rows
-    /// of `HEAD` f16 per key head.
-    ///
-    /// # Safety
-    /// `j` is below row `t`'s live count ([`live_keys`] at
-    /// [`Listed::count_cap`]), `t` a row of the launch, `word < HEAD/4`,
-    /// `plane` a key head's first value, and the entry's launch contract
-    /// holds.
     #[inline(always)]
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the staging's state is the caller's registers, passed by value"
-    )]
     unsafe fn stage_row<const HEAD: usize>(
         self,
         t: usize,
+        _kh: usize,
         j: usize,
         word: usize,
         plane: usize,
@@ -2055,16 +2119,74 @@ impl Listed<'_> {
 /// the cache.
 const SEL_NAN4: u64 = 0x7e00_7e00_7e00_7e00;
 
-/// [`seg_mma_p`] over a row's [`Listed`] keys, for a pack that fills more
+/// A `_p16_blocks` row's keys: key `j` of row `t` and key head `kh` is
+/// position `j % BLOCK` of block `ids[(t·n_kv + kh)·blocks + j / BLOCK]`, so
+/// cache row `BLOCK · id + j % BLOCK`; the count is at most `blocks · BLOCK`
+/// and the list is the key head's own (one block selection for each key
+/// head). A block whose row is at or past the cache raises
+/// [`FaultSite::PoolSelect`] and stages the f16 NaN pattern, as [`Listed`].
+#[derive(Clone, Copy)]
+struct BlockListed<'a, const BLOCK: usize> {
+    ids: &'a [u32],
+    n_kv: usize,
+    blocks: usize,
+    fault: FaultSink,
+}
+
+impl<const BLOCK: usize> KeyWalk for BlockListed<'_, BLOCK> {
+    #[inline(always)]
+    fn count_cap(self) -> usize {
+        self.blocks * BLOCK
+    }
+
+    #[inline(always)]
+    unsafe fn stage_row<const HEAD: usize>(
+        self,
+        t: usize,
+        kh: usize,
+        j: usize,
+        word: usize,
+        plane: usize,
+        ctx: usize,
+        k64: *const u64,
+        v64: *const u64,
+    ) -> (u64, u64) {
+        // SAFETY: j < count <= blocks·BLOCK, so j / BLOCK < blocks, and t < m,
+        // kh < n_kv: (t·n_kv + kh)·blocks + j / BLOCK < m·n_kv·blocks <=
+        // ids.len() by the launch contract.
+        let id = unsafe {
+            *self
+                .ids
+                .get_unchecked((t * self.n_kv + kh) * self.blocks + j / BLOCK)
+        } as usize;
+        let row = id * BLOCK + j % BLOCK;
+        if row >= ctx {
+            self.fault.raise(FaultSite::PoolSelect);
+            return (SEL_NAN4, SEL_NAN4);
+        }
+        // SAFETY: row < ctx, so the row is inside the key head's plane; a row
+        // is HEAD u16 = HEAD/4 u64 and the planes start 8-byte aligned (a
+        // device allocation), so the u64 read is aligned and inside both
+        // planes.
+        unsafe {
+            let r = (plane + row * HEAD) / 4 + word;
+            (*k64.add(r), *v64.add(r))
+        }
+    }
+}
+
+/// [`seg_mma_p`] over a row's keys as `walk` finds them ([`Listed`], or
+/// [`BlockListed`]), for a pack that fills more
 /// than half of the 16-row query tile — the `_p4` entries keep their own
-/// body, and this one serves the `_p12_sel` entry. Every step is
-/// [`seg_mma_p`]'s except the row's count bound ([`Listed::count_cap`]), the
-/// tile's staging load ([`Listed::stage_row`]) and the pack's rows: `PACK`
+/// body, and this one serves the `_p12_sel` and `_p16_blocks` entries. Every
+/// step is [`seg_mma_p`]'s except the row's count bound
+/// ([`KeyWalk::count_cap`]), the
+/// tile's staging load ([`KeyWalk::stage_row`]) and the pack's rows: `PACK`
 /// heads in rows `0..PACK`, `PAD` zero rows after them, the heads past row 7
 /// read back from the accumulator's `c[2]`, `c[3]` (rows `lane/4 + 8`).
 ///
 /// SAFETY: [`seg_mma_p`]'s, with key `j < count` of row `t` read through
-/// `walk` under [`Listed::stage_row`]'s contract, a block of `PACK · 32`
+/// `walk` under [`KeyWalk::stage_row`]'s contract, a block of `PACK · 32`
 /// threads and a weight tile of `PACK · KEY_TILE` f32.
 #[inline(always)]
 #[allow(
@@ -2075,8 +2197,14 @@ const SEL_NAN4: u64 = 0x7e00_7e00_7e00_7e00;
     clippy::needless_range_loop,
     reason = "a range `for` is the loop the unroller recognizes; an iterator loop keeps its array in a local depot"
 )]
-unsafe fn seg_mma_ps<const HEAD: usize, const QW: usize, const PACK: usize, const PAD: usize>(
-    walk: Listed<'_>,
+unsafe fn seg_mma_ps<
+    W: KeyWalk,
+    const HEAD: usize,
+    const QW: usize,
+    const PACK: usize,
+    const PAD: usize,
+>(
+    walk: W,
     q: &[f32],
     kc: &[u16],
     vc: &[u16],
@@ -2199,7 +2327,7 @@ unsafe fn seg_mma_ps<const HEAD: usize, const QW: usize, const PACK: usize, cons
                 let (kw, vw) = if t0 + key < hi {
                     // SAFETY: t0 + key < hi <= the row's live count, t < m,
                     // word < HEAD/4 and plane is key head kh's first value.
-                    unsafe { walk.stage_row::<HEAD>(t, t0 + key, word, plane, ctx, k64, v64) }
+                    unsafe { walk.stage_row::<HEAD>(t, kh, t0 + key, word, plane, ctx, k64, v64) }
                 } else {
                     (0u64, 0u64)
                 };
@@ -2417,6 +2545,217 @@ unsafe fn merge_body<const HEAD: usize>(
     }
     // SAFETY: b·HEAD + d < m·n_head·HEAD <= y.len(); thread d owns it.
     unsafe { *y.get_unchecked_mut(b * HEAD + d) = acc * (1.0 / s) };
+}
+
+// ------------------------------------------------------------ the ring run body
+//
+// A row's keys as a run of a ring that starts where the row says: the
+// `_p4_ring` entry. A new body beside [`seg_scalar_p`], so that body's
+// instances stay the programs they are.
+
+/// [`seg_scalar_p`] over each row's own run of a ring: key `k` of row `t` is
+/// plane row `row0[t] + k` of a ring of `ctx` rows, less `ctx` once it reaches
+/// `ctx` ([`ring_row`]), and key head `kh`'s plane starts `kh · stride` rows
+/// in (`stride >= ctx`). The block map, the cut of the row's `n_keys[t]` keys
+/// ([`live_keys`] against `ctx`, [`seg_span`]), the staging, the scores, the
+/// fold and the partials are `seg_scalar_p`'s, so a row whose run does not
+/// wrap computes `seg_scalar_p`'s arithmetic over the plane rows from
+/// `row0[t]`, and a row's arithmetic depends only on its own keys, never on
+/// where the run starts. A start at or past `ctx` reads no key, writes the
+/// neutral partial of every segment and raises [`FaultSite::KeyCount`]; the
+/// merge then writes the row NaN (its count stands, every partial is
+/// neutral).
+///
+/// SAFETY: the entry's launch contract at `HEAD` and `packs · PACK` query
+/// heads per key head (every buffer bound it names, `stride >= ctx`), a block
+/// of `PACK · 32` threads, and the four tiles of [`seg_scalar_p`].
+#[inline(always)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a kernel entry's flat arguments, handed on (rust-quality R8)"
+)]
+#[allow(
+    clippy::needless_range_loop,
+    reason = "a range `for` is the loop the unroller recognizes; an iterator loop keeps its array in a local depot"
+)]
+unsafe fn seg_scalar_ring_p<const HEAD: usize, const QW: usize, const PACK: usize>(
+    q: &[f32],
+    kc: &[u16],
+    vc: &[u16],
+    n_keys_buf: &[u32],
+    row0_buf: &[u32],
+    scale: f32,
+    n_kv: u32,
+    ctx: u32,
+    stride: u32,
+    segs: u32,
+    seg_keys: u32,
+    m: u32,
+    packs: usize,
+    fault: FaultSink,
+    mut part_v: DisjointSlice<f32>,
+    mut part_ms: DisjointSlice<f32>,
+    qs: *mut f32,
+    ks: *mut u32,
+    vs: *mut u64,
+    ws: *mut f32,
+) {
+    const { assert!(HEAD == QW * SLICE && HEAD.is_multiple_of(2 * ILP)) };
+    const { assert!((KEY_TILE * HEAD / 4).is_multiple_of(PACK * 32)) };
+    let row_words = HEAD / 2;
+    let k_stride = row_words + 1;
+    let row_qwords = HEAD / 4;
+    let threads = PACK * 32;
+    // q values one thread stages, and K/V tile words per tile.
+    let per_thread = HEAD / 32;
+    let stage_per = KEY_TILE * row_qwords / threads;
+
+    let b = thread::blockIdx_x() as usize;
+    let nkv = n_kv as usize;
+    let n_seg = segs as usize;
+    let rows = m as usize;
+    let Some((t, seg, kh, head0, n_head)) = seg_block::<PACK>(b, rows, nkv, packs, n_seg) else {
+        return; // block-uniform
+    };
+    let tid = thread::threadIdx_x() as usize;
+    let w = tid / 32;
+    let lane = warp::lane_id() as usize;
+    let h = head0 + w;
+    let idx = (t * n_head + h) * n_seg + seg;
+    let ring = ctx as usize;
+    // SAFETY: t < m <= n_keys_buf.len() and row0_buf.len() by the launch
+    // contract.
+    let (count, row0) = unsafe {
+        (
+            *n_keys_buf.get_unchecked(t),
+            *row0_buf.get_unchecked(t) as usize,
+        )
+    };
+    if row0 >= ring && tid == 0 {
+        fault.raise(FaultSite::KeyCount);
+    }
+    let limit = if row0 < ring {
+        live_keys(count, ring)
+    } else {
+        0
+    };
+    let span = seg_span(limit, n_seg, seg_keys as usize);
+    let lo = seg * span;
+    if lo >= limit {
+        if lane == 0 {
+            // SAFETY: idx < m·n_head·segs, both slots inside part_ms.
+            unsafe {
+                *part_ms.get_unchecked_mut(2 * idx) = f32::NEG_INFINITY;
+                *part_ms.get_unchecked_mut(2 * idx + 1) = 0.0;
+            }
+        }
+        return; // block-uniform: lo and limit are the block's
+    }
+    let hi = (lo + span).min(limit);
+
+    // Row t's pack of query rows: thread `tid` stages values
+    // `per_thread·tid ..` of the pack's PACK·HEAD.
+    let qb = (t * n_head + head0) * HEAD;
+    let mut i = 0usize;
+    while i < per_thread {
+        // SAFETY: qb + per_thread·tid + i < (t·n_head + head0 + PACK)·HEAD <=
+        // m·n_head·HEAD <= q.len(); the shared index < PACK·HEAD.
+        unsafe { *qs.add(per_thread * tid + i) = *q.get_unchecked(qb + per_thread * tid + i) };
+        i += 1;
+    }
+
+    let plane = kh * stride as usize * HEAD;
+    let k64 = kc.as_ptr() as *const u64;
+    let v64 = vc.as_ptr() as *const u64;
+    let mut mx = f32::NEG_INFINITY;
+    let mut s_sum = 0.0f32;
+    let mut acc = [[0.0f32; 4]; QW];
+    let mut t0 = lo;
+    while t0 < hi {
+        thread::sync_threads();
+        // Stage the tile: 32 keys × HEAD/4 u64 of K and of V; a key at or
+        // past `hi` stages zeros.
+        let mut i = 0usize;
+        while i < stage_per {
+            let e = tid + threads * i;
+            let key = e / row_qwords;
+            let word = e - key * row_qwords;
+            let (kw, vw) = if t0 + key < hi {
+                let at = ring_row(t0 + key, 0, row0, ring);
+                // SAFETY: t0 + key < hi <= ctx and row0 < ctx, so one
+                // subtraction brings `at` below ctx <= stride: a row of key
+                // head kh's plane. A row is HEAD u16 = HEAD/4 u64 and the
+                // planes start 8-byte aligned (a device allocation), so the
+                // u64 read is aligned and inside both planes.
+                unsafe {
+                    let r = (plane + at * HEAD) / 4 + word;
+                    (*k64.add(r), *v64.add(r))
+                }
+            } else {
+                (0u64, 0u64)
+            };
+            // SAFETY: key < 32 and word < HEAD/4: 2·word + 1 < k_stride and
+            // key·HEAD/4 + word < KEY_TILE·HEAD/4.
+            unsafe {
+                *ks.add(key * k_stride + 2 * word) = kw as u32;
+                *ks.add(key * k_stride + 2 * word + 1) = (kw >> 32) as u32;
+                *vs.add(key * row_qwords + word) = vw;
+            }
+            i += 1;
+        }
+        thread::sync_threads();
+
+        // The score of key t0 + lane for head h.
+        let live = t0 + lane < hi;
+        let mut a = [0.0f32; ILP];
+        let mut wd = 0usize;
+        while wd < row_words {
+            let mut p = 0usize;
+            while p < ILP {
+                // SAFETY: lane < 32, wd + p < row_words: inside KS; the query
+                // index w·HEAD + 2(wd + p) + 1 < PACK·HEAD.
+                let (kw, q0, q1) = unsafe {
+                    (
+                        *ks.add(lane * k_stride + wd + p),
+                        *qs.add(w * HEAD + 2 * (wd + p)),
+                        *qs.add(w * HEAD + 2 * (wd + p) + 1),
+                    )
+                };
+                let k0 = half_bits_to_f32(kw as u16);
+                let k1 = half_bits_to_f32((kw >> 16) as u16);
+                a[p] = f32::mul_add(q0, k0, a[p]);
+                a[p] = f32::mul_add(q1, k1, a[p]);
+                p += 1;
+            }
+            wd += ILP;
+        }
+        let dot = (a[0] + a[1]) + (a[2] + a[3]);
+        let sc = if live { dot * scale } else { f32::NEG_INFINITY };
+
+        // SAFETY: WS and VS are this block's tiles, VS staged before the
+        // barrier above; w < PACK and lane < 32.
+        unsafe {
+            fold_tile_w_p::<HEAD, QW>(sc, live, &mut mx, &mut s_sum, &mut acc, ws, vs, w, lane)
+        };
+        t0 += KEY_TILE;
+    }
+
+    // SAFETY: idx < m·n_head·segs; dims 4·lane + 128·i .. +3 of the
+    // partial row are this lane's alone, and lane 0 writes (m, s).
+    unsafe {
+        for i in 0..QW {
+            cuda_device::thread::__unroll_config::<0>();
+            let o = idx * HEAD + 4 * lane + SLICE * i;
+            *part_v.get_unchecked_mut(o) = acc[i][0];
+            *part_v.get_unchecked_mut(o + 1) = acc[i][1];
+            *part_v.get_unchecked_mut(o + 2) = acc[i][2];
+            *part_v.get_unchecked_mut(o + 3) = acc[i][3];
+        }
+        if lane == 0 {
+            *part_ms.get_unchecked_mut(2 * idx) = mx;
+            *part_ms.get_unchecked_mut(2 * idx + 1) = s_sum;
+        }
+    }
 }
 
 // ------------------------------------------------------------ the K192 bodies
@@ -3993,12 +4332,100 @@ mod flash_gqa_kernels {
         // HEAD_256 and one pack of PACK_12 heads per key head, with the
         // list's.
         unsafe {
-            seg_mma_ps::<HEAD_256, QW_256, PACK_12, PAD_12>(
+            seg_mma_ps::<_, HEAD_256, QW_256, PACK_12, PAD_12>(
                 walk,
                 q,
                 kc,
                 vc,
                 n_sel,
+                scale,
+                n_kv,
+                ctx,
+                segs,
+                seg_keys,
+                m,
+                1,
+                part_v,
+                part_ms,
+                SharedArray::as_raw_mut_ptr(&raw mut QT),
+                SharedArray::as_raw_mut_ptr(&raw mut KT),
+                SharedArray::as_raw_mut_ptr(&raw mut VS),
+                SharedArray::as_raw_mut_ptr(&raw mut WS),
+            )
+        };
+    }
+
+    /// [`gqa_flash_seg_mma_256_p12_sel`]'s body at [`HEAD`] with block lists
+    /// (`seg_mma_ps` at [`PACK_16`] over [`BlockListed`]), one block of sixteen
+    /// warps a (row, key head, segment): the key head's sixteen query heads fill
+    /// the tile, so a tile of keys is staged once for the group. Key `j` of row
+    /// `t` and key head `kh` is position `j % 128` of block
+    /// `ids[(t·n_kv + kh)·blocks + j / 128]`, the row's live count `n_keys[t]`
+    /// (refused past `blocks · 128`), the segments cut over list positions. A
+    /// block whose row is at or past `ctx` raises [`FaultSite::PoolSelect`] on
+    /// `fault` and stages NaN. With a key head's ids `0 .. n` and the count
+    /// `c`, a row stages the dense entries' keys at count `c`, and every head's
+    /// output is theirs bit for bit; the gate holds the two bodies to the same
+    /// bits there.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(512)]
+    #[launch_contract(
+        domain = 1,
+        block = (512, 1, 1),
+        requires = (
+            n_keys.len() >= m,
+            ids.len() >= m * n_kv * blocks,
+            segs >= 1,
+            q.len() >= m * n_kv * 16 * 128,
+            kc.len() >= n_kv * ctx * 128,
+            vc.len() >= n_kv * ctx * 128,
+            part_v.len() >= m * n_kv * 16 * segs * 128,
+            part_ms.len() >= m * n_kv * 16 * segs * 2
+        )
+    )]
+    pub fn gqa_flash_seg_mma_p16_blocks(
+        q: &[f32],
+        kc: &[u16],
+        vc: &[u16],
+        ids: &[u32],
+        n_keys: &[u32],
+        scale: f32,
+        n_kv: u32,
+        ctx: u32,
+        blocks: u32,
+        segs: u32,
+        seg_keys: u32,
+        m: u32,
+        fault: FaultSink,
+        part_v: DisjointSlice<f32>,
+        part_ms: DisjointSlice<f32>,
+    ) {
+        static mut QT: SharedArray<u32, { MMA_ROWS * MMA_ROW_W }> = SharedArray::UNINIT;
+        static mut KT: SharedArray<u32, { KEY_TILE * MMA_ROW_W }> = SharedArray::UNINIT;
+        static mut VS: SharedArray<u64, { KEY_TILE * ROW_QWORDS }> = SharedArray::UNINIT;
+        static mut WS: SharedArray<f32, { PACK_16 * KEY_TILE }> = SharedArray::UNINIT;
+
+        let walk = BlockListed::<LISTED_BLOCK> {
+            ids,
+            n_kv: n_kv as usize,
+            blocks: blocks as usize,
+            fault,
+        };
+        // SAFETY: each `static mut` above is this block's own shared
+        // allocation, sized for HEAD and PACK_16; the raw form reaches it
+        // without a reference. The launch contract is `seg_mma_ps`'s at HEAD
+        // and one pack of PACK_16 heads per key head, with the block lists'.
+        unsafe {
+            seg_mma_ps::<_, HEAD, { HEAD / SLICE }, PACK_16, PAD_16>(
+                walk,
+                q,
+                kc,
+                vc,
+                n_keys,
                 scale,
                 n_kv,
                 ctx,
@@ -4437,6 +4864,87 @@ mod flash_gqa_kernels {
             )
         };
     }
+
+    /// [`gqa_flash_seg`]'s scalar pass at [`HEAD`] in blocks of [`PACK_4`]
+    /// query heads, `packs` of them per key head, over each row's own run of
+    /// a ring (`seg_scalar_ring_p` at `PACK_4`): row `t`'s `n_keys_buf[t]`
+    /// keys from plane row `row0_buf[t]` of a ring of `ctx` rows, the key
+    /// heads' planes `stride` rows apart. Block `b = ((seg·n_kv + kh)·packs +
+    /// p)·m + t`, warp `w` query head `(kh·packs + p)·4 + w`.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(128)]
+    #[launch_contract(
+        domain = 1,
+        block = (128, 1, 1),
+        requires = (
+            n_keys_buf.len() >= m,
+            row0_buf.len() >= m,
+            segs >= 1,
+            ctx >= 1,
+            stride >= ctx,
+            q.len() >= m * n_kv * packs * 4 * 128,
+            kc.len() >= n_kv * stride * 128,
+            vc.len() >= n_kv * stride * 128,
+            part_v.len() >= m * n_kv * packs * 4 * segs * 128,
+            part_ms.len() >= m * n_kv * packs * 4 * segs * 2
+        )
+    )]
+    pub fn gqa_flash_seg_p4_ring(
+        q: &[f32],
+        kc: &[u16],
+        vc: &[u16],
+        n_keys_buf: &[u32],
+        row0_buf: &[u32],
+        scale: f32,
+        n_kv: u32,
+        ctx: u32,
+        stride: u32,
+        segs: u32,
+        seg_keys: u32,
+        m: u32,
+        packs: u32,
+        fault: FaultSink,
+        part_v: DisjointSlice<f32>,
+        part_ms: DisjointSlice<f32>,
+    ) {
+        static mut QS: SharedArray<f32, { PACK_4 * HEAD }> = SharedArray::UNINIT;
+        static mut KS: SharedArray<u32, { KEY_TILE * K_STRIDE }> = SharedArray::UNINIT;
+        static mut VS: SharedArray<u64, { KEY_TILE * ROW_QWORDS }> = SharedArray::UNINIT;
+        static mut WS: SharedArray<f32, { PACK_4 * KEY_TILE }> = SharedArray::UNINIT;
+
+        // SAFETY: each `static mut` above is this block's own shared
+        // allocation, sized for HEAD and PACK_4; the raw form reaches it
+        // without a reference. The launch contract is `seg_scalar_ring_p`'s
+        // at HEAD and `packs · PACK_4` heads per key head.
+        unsafe {
+            seg_scalar_ring_p::<HEAD, 1, PACK_4>(
+                q,
+                kc,
+                vc,
+                n_keys_buf,
+                row0_buf,
+                scale,
+                n_kv,
+                ctx,
+                stride,
+                segs,
+                seg_keys,
+                m,
+                packs as usize,
+                fault,
+                part_v,
+                part_ms,
+                SharedArray::as_raw_mut_ptr(&raw mut QS),
+                SharedArray::as_raw_mut_ptr(&raw mut KS),
+                SharedArray::as_raw_mut_ptr(&raw mut VS),
+                SharedArray::as_raw_mut_ptr(&raw mut WS),
+            )
+        };
+    }
 }
 
 /// The segment entry of a packed pass: the pack's scalar or tensor-core body.
@@ -4496,6 +5004,29 @@ struct Seg<'a> {
     part_ms: &'a mut DeviceBuffer<f32>,
 }
 
+/// [`FlashGqaKernels::enqueue_pass_p4_ring`]'s arguments: those of
+/// [`GqaArgs`] at [`HEAD`], with each row's run of a ring in place of a
+/// count from row 0: row `t` attends `n_keys[t]` keys from plane row
+/// `row0[t]`, wrapping at `ring` rows, and key head `h`'s plane starts at row
+/// `h · stride` of the planes (`stride >= ring`, so rows past the ring may
+/// sit between two key heads' rings).
+pub struct GqaRingArgs<'a> {
+    pub q: &'a DeviceBuffer<f32>,
+    pub kc: &'a DeviceBuffer<u16>,
+    pub vc: &'a DeviceBuffer<u16>,
+    pub n_keys: &'a DeviceBuffer<u32>,
+    pub row0: &'a DeviceBuffer<u32>,
+    pub scale: f32,
+    pub n_kv: usize,
+    pub ring: usize,
+    pub stride: usize,
+    pub m: usize,
+    pub part_v: &'a mut DeviceBuffer<f32>,
+    pub part_ms: &'a mut DeviceBuffer<f32>,
+    pub fault: FaultSink,
+    pub y: &'a mut DeviceBuffer<f32>,
+}
+
 /// [`FlashGqaKernels::enqueue_pass_256_p12_sel`]'s arguments: those of
 /// [`GqaArgs`] with each row's list (`m · width` cache rows, ascending) and its length
 /// (`n_sel`, `m` of them) in place of the live counts.
@@ -4506,6 +5037,28 @@ pub struct GqaSelArgs<'a> {
     pub list: &'a DeviceBuffer<u32>,
     pub n_sel: &'a DeviceBuffer<u32>,
     pub width: usize,
+    pub scale: f32,
+    pub n_kv: usize,
+    pub ctx: usize,
+    pub m: usize,
+    pub part_v: &'a mut DeviceBuffer<f32>,
+    pub part_ms: &'a mut DeviceBuffer<f32>,
+    pub fault: FaultSink,
+    pub y: &'a mut DeviceBuffer<f32>,
+}
+
+/// [`FlashGqaKernels::enqueue_pass_p16_blocks`]'s arguments: those of
+/// [`GqaArgs`] with each (row, key head)'s block ids (`ids`, `m · n_kv ·
+/// blocks`, ascending, [`LISTED_BLOCK`] positions a block) in place of the
+/// rows below the live count; `n_keys` counts the keys the blocks stand for
+/// (the last block partial), at most `blocks · LISTED_BLOCK`.
+pub struct GqaBlocksArgs<'a> {
+    pub q: &'a DeviceBuffer<f32>,
+    pub kc: &'a DeviceBuffer<u16>,
+    pub vc: &'a DeviceBuffer<u16>,
+    pub ids: &'a DeviceBuffer<u32>,
+    pub n_keys: &'a DeviceBuffer<u32>,
+    pub blocks: usize,
     pub scale: f32,
     pub n_kv: usize,
     pub ctx: usize,
@@ -5009,6 +5562,102 @@ impl FlashGqaKernels {
         Ok(())
     }
 
+    /// `m` rows' attention at [`HEAD`] for `n_head` query heads over
+    /// `args.n_kv` key heads in blocks of [`PACK_4`], each row over its own
+    /// run of a ring ([`GqaRingArgs`]): `n_head` a nonzero multiple of `4 ·
+    /// n_kv` (refused by name otherwise), `args.part_v` [`partials_v_len`] and
+    /// `args.part_ms` [`partials_ms_len`] of `n_head`. The segment pass
+    /// `gqa_flash_seg_p4_ring` (`m · n_head / 4 · `[`SEGMENTS`]` blocks of
+    /// 128 threads) and `gqa_flash_merge` (`m · n_head` blocks): two launches.
+    /// A count of zero or past `args.ring`, or a start at or past it, raises
+    /// [`FaultSite::KeyCount`] on `args.fault` and its row is NaN.
+    /// Asynchronous, allocation-free, capturable.
+    pub fn enqueue_pass_p4_ring(
+        &self,
+        stream: &CudaStream,
+        args: GqaRingArgs<'_>,
+        n_head: usize,
+    ) -> Result<(), GpuError> {
+        let what = "flash_gqa::enqueue_p4_ring";
+        let GqaRingArgs {
+            q,
+            kc,
+            vc,
+            n_keys,
+            row0,
+            scale,
+            n_kv,
+            ring,
+            stride,
+            m,
+            part_v,
+            part_ms,
+            fault,
+            y,
+        } = args;
+        if n_kv == 0 || ring == 0 || m == 0 || stride < ring {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "need n_kv, ring and m >= 1 and stride >= ring, got n_kv={n_kv} ring={ring} \
+                     stride={stride} m={m}"
+                ),
+            ));
+        }
+        if n_head == 0 || !n_head.is_multiple_of(n_kv * PACK_4) {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "the kernel packs {PACK_4} query heads a block, so the group must be a \
+                     multiple of {PACK_4}; got {n_head} heads over {n_kv}"
+                ),
+            ));
+        }
+        let packs = n_head / (n_kv * PACK_4);
+        let lens = [
+            ("q", q.len(), m * n_head * HEAD),
+            ("kc", kc.len(), n_kv * stride * HEAD),
+            ("vc", vc.len(), n_kv * stride * HEAD),
+            ("n_keys", n_keys.len(), m),
+            ("row0", row0.len(), m),
+            ("part_v", part_v.len(), partials_v_len(m, n_head)),
+            ("part_ms", part_ms.len(), partials_ms_len(m, n_head)),
+            ("y", y.len(), m * n_head * HEAD),
+        ];
+        if let Some((name, got, need)) = lens.iter().find(|(_, got, need)| got < need) {
+            return Err(GpuError::shape(
+                what,
+                format!("{name}.len() {got} < {need}"),
+            ));
+        }
+        let grid = launch_u32(what, "grid", m * n_kv * packs * SEGMENTS)?;
+        let merge_grid = launch_u32(what, "merge grid", m * n_head)?;
+        let heads = launch_u32(what, "n_head", n_head)?;
+        let packs = launch_u32(what, "packs", packs)?;
+        let n_kv = launch_u32(what, "n_kv", n_kv)?;
+        let ring = launch_u32(what, "ring", ring)?;
+        let stride = launch_u32(what, "stride", stride)?;
+        let segs = launch_u32(what, "segs", SEGMENTS)?;
+        let seg_keys = launch_u32(what, "seg_keys", SEG_KEYS)?;
+        let m = launch_u32(what, "m", m)?;
+        let prep = self
+            .module
+            .prepare_gqa_flash_seg_p4_ring(LaunchConfig1D::new(grid, THREADS_P4_U32, 0))?;
+        self.module.gqa_flash_seg_p4_ring(
+            stream, &prep, q, kc, vc, n_keys, row0, scale, n_kv, ring, stride, segs, seg_keys, m,
+            packs, fault, part_v, part_ms,
+        )?;
+        let prep = self.module.prepare_gqa_flash_merge(LaunchConfig1D::new(
+            merge_grid,
+            MERGE_THREADS,
+            0,
+        ))?;
+        self.module.gqa_flash_merge(
+            stream, &prep, part_v, part_ms, n_keys, heads, ring, segs, seg_keys, m, fault, y,
+        )?;
+        Ok(())
+    }
+
     /// [`FlashGqaKernels::enqueue_pass_256_p4`] over each row's listed keys:
     /// row `t` attends the cache rows `list[t·width .. t·width + n_sel[t]]`
     /// (ascending, as `qsa`'s top-k writes them), `n_head` query heads over
@@ -5112,6 +5761,110 @@ impl FlashGqaKernels {
             .prepare_gqa_flash_merge_256(LaunchConfig1D::new(merge_grid, MERGE_THREADS_256, 0))?;
         self.module.gqa_flash_merge_256(
             stream, &prep, part_v, part_ms, n_sel, heads, width, segs, seg_keys, m, fault, y,
+        )?;
+        Ok(())
+    }
+
+    /// The `_p16_blocks` pass: `gqa_flash_seg_mma_p16_blocks` over the block
+    /// ids and `gqa_flash_merge` at the list's width (`blocks · LISTED_BLOCK`
+    /// keys, [`listed_segments`] of them): two launches. A count of zero or
+    /// past the width raises [`FaultSite::KeyCount`] and its row is NaN; a
+    /// block at or past the cache raises [`FaultSite::PoolSelect`] and its row
+    /// is NaN. `args.part_v` is [`listed_partials_v_len`] and `args.part_ms`
+    /// [`listed_partials_ms_len`] of the width. `n_head` must be `n_kv ·`
+    /// [`PACK_16`]. Asynchronous, allocation-free, capturable.
+    pub fn enqueue_pass_p16_blocks(
+        &self,
+        stream: &CudaStream,
+        args: GqaBlocksArgs<'_>,
+        n_head: usize,
+    ) -> Result<(), GpuError> {
+        let what = "flash_gqa::enqueue_p16_blocks";
+        let GqaBlocksArgs {
+            q,
+            kc,
+            vc,
+            ids,
+            n_keys,
+            blocks,
+            scale,
+            n_kv,
+            ctx,
+            m,
+            part_v,
+            part_ms,
+            fault,
+            y,
+        } = args;
+        if n_kv == 0 || ctx == 0 || m == 0 || blocks == 0 {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "need n_kv, ctx, m and blocks >= 1, got n_kv={n_kv} ctx={ctx} m={m} \
+                     blocks={blocks}"
+                ),
+            ));
+        }
+        if n_head != n_kv * PACK_16 {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "the kernel takes a key head's {PACK_16} query heads in one block, so \
+                     the group must be {PACK_16}; got {n_head} heads over {n_kv}"
+                ),
+            ));
+        }
+        let width = blocks * LISTED_BLOCK;
+        let segs = listed_segments(width);
+        let lens = [
+            ("q", q.len(), m * n_head * HEAD),
+            ("kc", kc.len(), n_kv * ctx * HEAD),
+            ("vc", vc.len(), n_kv * ctx * HEAD),
+            ("ids", ids.len(), m * n_kv * blocks),
+            ("n_keys", n_keys.len(), m),
+            (
+                "part_v",
+                part_v.len(),
+                listed_partials_v_len(m, n_head, width),
+            ),
+            (
+                "part_ms",
+                part_ms.len(),
+                listed_partials_ms_len(m, n_head, width),
+            ),
+            ("y", y.len(), m * n_head * HEAD),
+        ];
+        if let Some((name, got, need)) = lens.iter().find(|(_, got, need)| got < need) {
+            return Err(GpuError::shape(
+                what,
+                format!("{name}.len() {got} < {need}"),
+            ));
+        }
+        let grid = launch_u32(what, "grid", m * n_kv * segs)?;
+        let merge_grid = launch_u32(what, "merge grid", m * n_head)?;
+        let heads = launch_u32(what, "n_head", n_head)?;
+        let n_kv = launch_u32(what, "n_kv", n_kv)?;
+        let ctx = launch_u32(what, "ctx", ctx)?;
+        let blocks = launch_u32(what, "blocks", blocks)?;
+        let width = launch_u32(what, "width", width)?;
+        let segs = launch_u32(what, "segs", segs)?;
+        let seg_keys = launch_u32(what, "seg_keys", SEG_KEYS)?;
+        let m = launch_u32(what, "m", m)?;
+        let cfg = LaunchConfig1D::new(grid, THREADS_P16_U32, 0);
+        let prep = self.module.prepare_gqa_flash_seg_mma_p16_blocks(cfg)?;
+        self.module.gqa_flash_seg_mma_p16_blocks(
+            stream, &prep, q, kc, vc, ids, n_keys, scale, n_kv, ctx, blocks, segs, seg_keys, m,
+            fault, part_v, part_ms,
+        )?;
+        // The merge reads a row's count through the same rule at the list's
+        // width: its `ctx` argument is the width.
+        let prep = self.module.prepare_gqa_flash_merge(LaunchConfig1D::new(
+            merge_grid,
+            MERGE_THREADS,
+            0,
+        ))?;
+        self.module.gqa_flash_merge(
+            stream, &prep, part_v, part_ms, n_keys, heads, width, segs, seg_keys, m, fault, y,
         )?;
         Ok(())
     }
@@ -5670,5 +6423,251 @@ impl FlashGqaKernels {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Gpu;
+
+    /// Seeded values in [−1, 1).
+    fn seeded(n: usize, seed: u32) -> Vec<f32> {
+        let mut s = seed;
+        (0..n)
+            .map(|_| {
+                s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (s >> 8) as f32 / 8_388_608.0 - 1.0
+            })
+            .collect()
+    }
+
+    /// `max |a − b| / max |b|`.
+    fn rel_max(a: &[f64], b: &[f64]) -> f64 {
+        let top = b.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+        a.iter()
+            .zip(b)
+            .fold(0.0f64, |m, (x, y)| m.max((x - y).abs()))
+            / top
+    }
+
+    /// A `_p4_ring` launch's fixed inputs: `n_kv` key heads' planes `stride` rows apart, a ring of
+    /// `ring` rows, `n_head` query heads.
+    struct Launch<'a> {
+        k: &'a FlashGqaKernels,
+        gpu: &'a Gpu,
+        n_kv: usize,
+        n_head: usize,
+        ring: usize,
+        stride: usize,
+    }
+
+    impl Launch<'_> {
+        /// The output rows of `q` (`runs.len() · n_head` rows) over the planes `kc` and `vc`, each row's
+        /// run `(row0, n_keys)` of `runs`.
+        fn run(&self, q: &[f32], kc: &[u16], vc: &[u16], runs: &[(u32, u32)]) -> Vec<f32> {
+            let s = self.gpu.stream();
+            let m = runs.len();
+            let up_u32 = |v: Vec<u32>| DeviceBuffer::from_host(s, &v).expect("words");
+            let n_keys = up_u32(runs.iter().map(|r| r.1).collect());
+            let row0 = up_u32(runs.iter().map(|r| r.0).collect());
+            let q = DeviceBuffer::from_host(s, q).expect("q");
+            let kc = DeviceBuffer::from_host(s, kc).expect("kc");
+            let vc = DeviceBuffer::from_host(s, vc).expect("vc");
+            let zeros = |n: usize| DeviceBuffer::<f32>::zeroed(s, n).expect("scratch");
+            let (mut part_v, mut part_ms) = (
+                zeros(partials_v_len(m, self.n_head)),
+                zeros(partials_ms_len(m, self.n_head)),
+            );
+            let mut y = zeros(m * self.n_head * HEAD);
+            let args = GqaRingArgs {
+                q: &q,
+                kc: &kc,
+                vc: &vc,
+                n_keys: &n_keys,
+                row0: &row0,
+                scale: 1.0 / (HEAD as f32).sqrt(),
+                n_kv: self.n_kv,
+                ring: self.ring,
+                stride: self.stride,
+                m,
+                part_v: &mut part_v,
+                part_ms: &mut part_ms,
+                fault: self.gpu.unlabelled_sink(),
+                y: &mut y,
+            };
+            self.k
+                .enqueue_pass_p4_ring(s, args, self.n_head)
+                .expect("ring pass");
+            s.synchronize().expect("sync");
+            y.to_host_vec(s).expect("y back")
+        }
+    }
+
+    /// The ring pass is the unrolled pass bit for bit, and attention within its band: rows whose
+    /// runs start anywhere in a ring of 200 rows (planes 203 rows apart), wrap or not, span one key
+    /// to the whole ring, at groups of 4 and 8 query heads over 2 key heads. Each wrapped row equals
+    /// the same entry run alone over its keys laid out from plane row 0, so the ring's address rule
+    /// reads the keys the run names and nothing else changes; every row is within `32 · u ·
+    /// sqrt(128 + 200)` of an f64 softmax over the f16 keys. A start at or past the ring, a count
+    /// of 0 and a count past the ring write the row NaN and raise `KeyCount`; a group that is not a
+    /// multiple of 4 and planes closer than the ring are refused by name.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_ring_pass_is_the_unrolled_pass() {
+        let gpu = Gpu::with_device(0).expect("a Gpu on device 0");
+        let k = FlashGqaKernels::load(gpu.context()).expect("the flash_gqa module");
+        let (n_kv, ring, stride) = (2usize, 200usize, 203usize);
+        let plane = |seed: u32| -> Vec<u16> {
+            seeded(n_kv * stride * HEAD, seed)
+                .into_iter()
+                .map(f32_to_f16_bits)
+                .collect()
+        };
+        let (kc, vc) = (plane(11), plane(12));
+        // (row0, n): no wrap, one segment, a wrap, the whole ring from its last row and from row 37,
+        // a run ending one row past the end, the whole ring unwrapped, a wrap over three segments.
+        let runs: [(u32, u32); 8] = [
+            (0, 1),
+            (5, 64),
+            (150, 100),
+            (199, 200),
+            (37, 200),
+            (180, 21),
+            (0, 200),
+            (120, 130),
+        ];
+        let u = 1.0 / 16_777_216.0;
+        let band = 32.0 * u * ((HEAD + ring) as f64).sqrt();
+        for n_head in [8usize, 16] {
+            let launch = Launch {
+                k: &k,
+                gpu: &gpu,
+                n_kv,
+                n_head,
+                ring,
+                stride,
+            };
+            let row = n_head * HEAD;
+            let q = seeded(runs.len() * row, 13 + n_head as u32);
+            let wrapped = launch.run(&q, &kc, &vc, &runs);
+            let mut want = Vec::with_capacity(wrapped.len());
+            for (t, &(row0, n)) in runs.iter().enumerate() {
+                // Row t's keys laid out from plane row 0 of each key head.
+                let lay = |src: &[u16]| -> Vec<u16> {
+                    let mut out = vec![0u16; n_kv * stride * HEAD];
+                    for h in 0..n_kv {
+                        for j in 0..n as usize {
+                            let at = (row0 as usize + j) % ring;
+                            out[(h * stride + j) * HEAD..][..HEAD]
+                                .copy_from_slice(&src[(h * stride + at) * HEAD..][..HEAD]);
+                        }
+                    }
+                    out
+                };
+                let alone = launch.run(&q[t * row..][..row], &lay(&kc), &lay(&vc), &[(0, n)]);
+                let same = alone
+                    .iter()
+                    .zip(&wrapped[t * row..][..row])
+                    .all(|(a, b)| a.to_bits() == b.to_bits());
+                assert!(
+                    same,
+                    "n_head {n_head} row {t} (row0 {row0}, {n} keys): the ring's walk is the unrolled walk"
+                );
+                // The f64 softmax over row t's f16 keys.
+                let group = n_head / n_kv;
+                for hq in 0..n_head {
+                    let kh = hq / group;
+                    let qv = &q[(t * n_head + hq) * HEAD..][..HEAD];
+                    let key = |j: usize| (kh * stride + (row0 as usize + j) % ring) * HEAD;
+                    let scores: Vec<f64> = (0..n as usize)
+                        .map(|j| {
+                            let kr = &kc[key(j)..][..HEAD];
+                            qv.iter()
+                                .zip(kr)
+                                .map(|(&a, &b)| f64::from(a) * f64::from(half_bits_to_f32(b)))
+                                .sum::<f64>()
+                                / (HEAD as f64).sqrt()
+                        })
+                        .collect();
+                    let top = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                    let e: Vec<f64> = scores.iter().map(|s| (s - top).exp()).collect();
+                    let z: f64 = e.iter().sum();
+                    for d in 0..HEAD {
+                        want.push(
+                            e.iter()
+                                .enumerate()
+                                .map(|(j, p)| p / z * f64::from(half_bits_to_f32(vc[key(j) + d])))
+                                .sum::<f64>(),
+                        );
+                    }
+                }
+            }
+            let got: Vec<f64> = wrapped.iter().map(|&v| f64::from(v)).collect();
+            let err = rel_max(&got, &want);
+            println!("ring pass n_head {n_head}: rel_max {err:.3e}, band {band:.3e}");
+            assert!(
+                err <= band,
+                "n_head {n_head}: {err:e} past the band {band:e}"
+            );
+        }
+
+        // Refused rows: a start at the ring, no keys, more keys than the ring.
+        let launch = Launch {
+            k: &k,
+            gpu: &gpu,
+            n_kv,
+            n_head: 8,
+            ring,
+            stride,
+        };
+        let row = 8 * HEAD;
+        gpu.take_fault().expect("a clean fault word");
+        let bad = [(200u32, 10u32), (0, 0), (0, 201), (3, 4)];
+        let y = launch.run(&seeded(bad.len() * row, 21), &kc, &vc, &bad);
+        for (t, r) in bad.iter().enumerate() {
+            let nan = y[t * row..][..row].iter().all(|v| v.is_nan());
+            assert_eq!(nan, t < 3, "row {t} {r:?}: NaN only for a refused run");
+        }
+        let f = gpu
+            .take_fault()
+            .expect("the fault word")
+            .expect("a raised fault");
+        assert_eq!(f.site(), Some(FaultSite::KeyCount), "{f}");
+
+        // Host refusals.
+        let s = gpu.stream();
+        let buf = |n: usize| DeviceBuffer::<f32>::zeroed(s, n).expect("buffer");
+        let words = DeviceBuffer::from_host(s, &[1u32; 1]).expect("words");
+        let planes = DeviceBuffer::from_host(s, &vec![0u16; n_kv * stride * HEAD]).expect("planes");
+        for (n_head, ring, what) in [
+            (6usize, 200usize, "a group of 3"),
+            (8, 204, "planes closer than the ring"),
+        ] {
+            let (q, mut pv, mut pm, mut y) = (
+                buf(n_head * HEAD),
+                buf(partials_v_len(1, n_head)),
+                buf(partials_ms_len(1, n_head)),
+                buf(n_head * HEAD),
+            );
+            let args = GqaRingArgs {
+                q: &q,
+                kc: &planes,
+                vc: &planes,
+                n_keys: &words,
+                row0: &words,
+                scale: 1.0,
+                n_kv,
+                ring,
+                stride,
+                m: 1,
+                part_v: &mut pv,
+                part_ms: &mut pm,
+                fault: gpu.unlabelled_sink(),
+                y: &mut y,
+            };
+            let e = k.enqueue_pass_p4_ring(s, args, n_head).expect_err(what);
+            assert!(e.to_string().contains("enqueue_p4_ring"), "{what}: {e}");
+        }
     }
 }

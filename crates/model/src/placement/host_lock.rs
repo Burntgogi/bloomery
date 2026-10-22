@@ -32,22 +32,16 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use gguf::{Gguf, Split};
+use os::Populated;
 
 use super::{Device, ExpertList, Format, ModelTensor, PlacementError, Plan, Segment};
 use crate::r8file::{R8Error, R8Source, Sidecar};
 
 /// Bytes per page of this host (`sysconf(_SC_PAGESIZE)`), the unit a lock is
-/// taken and counted in; a host that does not answer is refused by name.
+/// taken and counted in; a host whose base page the row room cannot count in
+/// is refused by name.
 pub fn page_bytes() -> Result<u64, PlacementError> {
-    // SAFETY: `sysconf` reads a static system value and touches no memory of
-    // ours.
-    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    u64::try_from(page).ok().filter(|&p| p > 0).ok_or_else(|| {
-        PlacementError::Host(format!(
-            "sysconf(_SC_PAGESIZE) returned {page}: {}",
-            io::Error::last_os_error()
-        ))
-    })
+    os::page_bytes().map_err(|e| PlacementError::Host(e.to_string()))
 }
 
 /// About how many chunks, a thread each, a walk cuts a set into: several
@@ -793,12 +787,17 @@ impl<'a> FileMapping<'a> {
         FileMapping(map)
     }
 
-    /// Shard `s` of `split`'s mapping.
+    /// Shard `s` of `split`'s mapping; a shard that is no file's mapping (a
+    /// header alone, `Split::header_only`) is refused by name.
     pub(crate) fn shard(split: &'a Split, s: usize) -> Result<FileMapping<'a>, PlacementError> {
         let g = shard_of(split, s)?;
-        // SAFETY: `Split::open` opens every shard with `Gguf::open`, a
-        // read-only file mapping (`Weights::Mapped`), and a split has no
-        // other constructor.
+        if !g.file_backed() {
+            return Err(PlacementError::Host(format!(
+                "shard {s} is a header alone, no file's mapping: it holds no page of the file"
+            )));
+        }
+        // SAFETY: a file-backed shard's mapping is the file's own read-only
+        // mapping (`Gguf::file_backed`, `Split::open`'s `Gguf::open`).
         Ok(unsafe { FileMapping::new(g.mapping()) })
     }
 
@@ -814,9 +813,10 @@ impl<'a> FileMapping<'a> {
 /// `map` is the file's own mapping ([`FileMapping`]); `None` is a file this
 /// process maps no page of there (a resident sidecar), and only the page
 /// cache's copy goes. The one owner of page release: [`PageDrop`] and
-/// `r8file::verify` call it.
+/// `r8file::verify` call it, and [`release_file_pages`] for a file outside a
+/// split.
 pub(crate) fn drop_pages(
-    name: &HostFile,
+    name: &dyn fmt::Display,
     file: &File,
     map: Option<FileMapping<'_>>,
     at: Range<u64>,
@@ -861,83 +861,109 @@ pub(crate) fn drop_pages(
         libc::off_t::try_from(v)
             .map_err(|_| PlacementError::Host(format!("{name} offset {v} passes off_t")))
     };
-    // SAFETY: the descriptor is this file's own and lives across the call;
-    // fadvise reads no memory of ours.
-    let rc = unsafe {
-        libc::posix_fadvise(
-            file.as_raw_fd(),
-            off(first)?,
-            off(end - first)?,
-            libc::POSIX_FADV_DONTNEED,
-        )
-    };
-    if rc != 0 {
-        return Err(PlacementError::Host(format!(
-            "posix_fadvise(DONTNEED) of {name} bytes {first}..{end}: {}",
-            io::Error::from_raw_os_error(rc)
-        )));
-    }
+    drop_cached_pages(file.as_raw_fd(), off(first)?, off(end - first)?).map_err(|e| {
+        PlacementError::Host(format!(
+            "posix_fadvise(DONTNEED) of {name} bytes {first}..{end}: {e}"
+        ))
+    })?;
     Ok(end - first)
 }
 
-/// How [`populate_span`] faulted a span's pages in.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Populated {
-    /// `MADV_POPULATE_READ`.
-    Advised,
-    /// A read of one byte a page: the kernel has no `MADV_POPULATE_READ`.
-    Touched,
+/// [`PageDrop::release`] for a file outside a split (a checkpoint folder's
+/// shard): the whole pages inside bytes `at` of the file at `path`, whose
+/// whole mapping is `map`, dropped from this process's page tables and then
+/// from the page cache; the bytes dropped. For bytes a load has copied that
+/// no later reader takes from the file.
+///
+/// # Safety
+///
+/// `map` is the whole of the file's own read-only `MAP_SHARED` mapping, file
+/// offset `o` at index `o` ([`FileMapping::new`]'s contract).
+pub unsafe fn release_file_pages(
+    path: &std::path::Path,
+    map: &[u8],
+    at: Range<u64>,
+) -> Result<u64, PlacementError> {
+    let file = File::open(path)
+        .map_err(|e| PlacementError::Host(format!("open {}: {e}", path.display())))?;
+    // SAFETY: the caller's contract is `FileMapping::new`'s.
+    let map = unsafe { FileMapping::new(map) };
+    drop_pages(&path.display(), &file, Some(map), at)
+}
+
+/// The line a page drop prints once when the platform has no
+/// `posix_fadvise(DONTNEED)`: the page cache keeps the pages the call would
+/// have dropped.
+const NO_FADVISE: &str = "host pages: this platform has no posix_fadvise(DONTNEED), so the page \
+                          cache keeps the pages";
+
+/// Whether the line has been printed already.
+static SAID_FADVISE: AtomicBool = AtomicBool::new(false);
+
+/// Drop the clean pages of `fd` over `at .. at + len` from the page cache,
+/// where the platform has such a call. A platform without one keeps its
+/// pages: the refusal is the platform saying so, the line says it once, and
+/// the drop goes on. Any other error is the caller's to refuse.
+pub(crate) fn drop_cached_pages(
+    fd: std::os::fd::RawFd,
+    at: libc::off_t,
+    len: libc::off_t,
+) -> Result<(), os::OsError> {
+    match os::fadvise_dontneed(fd, at, len) {
+        Ok(()) => Ok(()),
+        Err(os::OsError::Unsupported {
+            call: "posix_fadvise",
+        }) => {
+            if !SAID_FADVISE.swap(true, Ordering::Relaxed) {
+                eprintln!("{NO_FADVISE}");
+            }
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// The line a populate prints once when the kernel has no
 /// `MADV_POPULATE_READ`.
+#[cfg(target_os = "linux")]
 const NO_POPULATE_READ: &str = "host populate: madvise(MADV_POPULATE_READ) is not in this kernel \
                                 (EINVAL; it came in Linux 5.14), so the load reads one byte a page \
                                 instead";
 
+/// The line a populate prints once when the platform has no
+/// `MADV_POPULATE_READ`.
+#[cfg(target_os = "macos")]
+const NO_POPULATE_READ: &str = "host populate: this platform has no madvise(MADV_POPULATE_READ), \
+                                so the load reads one byte a page instead";
+
 /// `madvise(MADV_POPULATE_READ)` over `span`, a live sub-slice of a set's
 /// mappings: a shard's read-only file mapping, or the sidecar's, which is its
 /// file's mapping or a resident anonymous copy.
-fn advise_populate(span: &[u8]) -> io::Result<()> {
-    // SAFETY: `span` is a live slice (the caller's contract above);
-    // MADV_POPULATE_READ faults its pages in on either kind of mapping and
-    // never writes them.
-    let rc = unsafe {
-        libc::madvise(
-            span.as_ptr().cast_mut().cast(),
-            span.len(),
-            libc::MADV_POPULATE_READ,
-        )
-    };
-    if rc == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
+fn advise_populate(span: &[u8]) -> Result<(), os::OsError> {
+    // SAFETY: `span` is a live slice (the caller's contract above), so its
+    // pages are inside one live mapping.
+    unsafe { os::advise_populate(span.as_ptr().cast_mut().cast(), span.len()) }
 }
 
 /// Fault the pages of `span` in through `advise` (the madvise call,
 /// [`advise_populate`]); a kernel that does not know the advice (EINVAL,
-/// before Linux 5.14) gets the same pages faulted by a read of one byte each
-/// `page` bytes instead. Any other refusal is the walk's, by name.
+/// before Linux 5.14) or a platform without it ([`os::OsError::Unsupported`])
+/// gets the same pages faulted by a read of one byte each `page` bytes
+/// instead. Any other refusal is the walk's, by name. The error stays typed
+/// through this seam: the fallback reads the variant and the errno.
 fn populate_span(
     span: &[u8],
     page: u64,
-    advise: impl Fn(&[u8]) -> io::Result<()>,
+    advise: impl Fn(&[u8]) -> Result<(), os::OsError>,
 ) -> Result<Populated, String> {
-    match advise(span) {
-        Ok(()) => Ok(Populated::Advised),
-        Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
-            let step = usize::try_from(page).map_err(|_| format!("a page of {page} bytes"))?;
-            for at in (0..span.len()).step_by(step) {
-                // SAFETY: `at` is below `span.len()`, so the byte is inside
-                // the live slice; the read is volatile so that it is made.
-                let _ = unsafe { std::ptr::read_volatile(span.as_ptr().add(at)) };
-            }
-            Ok(Populated::Touched)
-        }
-        Err(e) => Err(format!("madvise(MADV_POPULATE_READ): {e}")),
+    // SAFETY: `span` is a live slice (the caller's contract above), so its
+    // pages are inside one live mapping.
+    unsafe {
+        os::populate_span(span.as_ptr().cast_mut().cast(), span.len(), page, || {
+            advise(span)
+        })
     }
+    .map_err(|e| format!("madvise(MADV_POPULATE_READ): {e}"))
 }
 
 /// What one chunk's thread hands back: every span its call succeeded on —
@@ -1207,20 +1233,12 @@ fn host_pages(
 fn resident_pages(span: &[u8], page: u64) -> io::Result<(u64, u64)> {
     let n = (span.len() as u64).div_ceil(page);
     let mut vec = vec![0u8; usize::try_from(n).map_err(io::Error::other)?];
-    // SAFETY: `span` starts on a page boundary inside one live mapping (a set
-    // run starts at a page multiple of the mapping's page-aligned start), and
-    // `vec` has one byte for each of its pages. mincore only reads the page
-    // tables; nothing is written through `addr`.
-    let rc = unsafe {
-        libc::mincore(
-            span.as_ptr().cast_mut().cast(),
-            span.len(),
-            vec.as_mut_ptr(),
-        )
-    };
-    if rc != 0 {
-        return Err(io::Error::last_os_error());
-    }
+    // `span` starts on a page boundary inside one live mapping (a set run
+    // starts at a page multiple of the mapping's page-aligned start), and
+    // `vec` has one byte for each of its pages.
+    // SAFETY: the caller's contract above.
+    unsafe { os::mincore(span.as_ptr().cast_mut().cast(), span.len(), &mut vec) }
+        .map_err(io::Error::from)?;
     Ok((vec.iter().filter(|&&b| b & 1 != 0).count() as u64, n))
 }
 
@@ -1237,21 +1255,36 @@ mod tests {
     use gguf::write::{Layout, TensorDecl, Writer};
     use gguf::{Split, Weights};
 
-    /// A kernel without `MADV_POPULATE_READ` (EINVAL) gets the span's pages
-    /// read one byte each instead; an advice the kernel takes reads nothing
-    /// more, and any other refusal is named. The madvise call is the seam: the errno comes from
-    /// the test, not from the running kernel.
+    /// A kernel without `MADV_POPULATE_READ` (EINVAL) or a platform without
+    /// it (`Unsupported`) gets the span's pages read one byte each instead; an
+    /// advice the kernel takes reads nothing more, and any other refusal is
+    /// named. The madvise call is the seam: the error comes from the test, not
+    /// from the running kernel.
     #[test]
     fn a_kernel_without_populate_read_reads_a_byte_a_page() {
         let page = 4096u64;
         let span: Vec<u8> = (0..3 * 4096 + 7).map(|i| (i % 251) as u8).collect();
-        let einval = |_: &[u8]| Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+        let einval = |_: &[u8]| {
+            Err(os::OsError::Io(std::io::Error::from_raw_os_error(
+                libc::EINVAL,
+            )))
+        };
         assert_eq!(populate_span(&span, page, einval), Ok(Populated::Touched));
+        let absent = |_: &[u8]| {
+            Err(os::OsError::Unsupported {
+                call: "madvise(MADV_POPULATE_READ)",
+            })
+        };
+        assert_eq!(populate_span(&span, page, absent), Ok(Populated::Touched));
         assert_eq!(
             populate_span(&span, page, |_: &[u8]| Ok(())),
             Ok(Populated::Advised)
         );
-        let enomem = |_: &[u8]| Err(std::io::Error::from_raw_os_error(libc::ENOMEM));
+        let enomem = |_: &[u8]| {
+            Err(os::OsError::Io(std::io::Error::from_raw_os_error(
+                libc::ENOMEM,
+            )))
+        };
         let e = populate_span(&span, page, enomem).unwrap_err();
         assert!(e.starts_with("madvise(MADV_POPULATE_READ): "), "{e}");
         assert_eq!(
@@ -1396,6 +1429,25 @@ mod tests {
         );
         std::fs::remove_dir_all(&dir).unwrap();
         println!("walk: a chunk's panic is its named refusal, its taken span handed back ({e})");
+    }
+
+    /// A header alone (`Split::header_only`) is no file's mapping: a page release over it is
+    /// refused by name before any advice, as its bytes are a heap copy `MADV_DONTNEED` would zero.
+    #[test]
+    fn a_header_alone_releases_no_page() {
+        let decl = TensorDecl {
+            name: "w".to_string(),
+            dims: vec![4],
+            type_id: 0,
+            nbytes: 16,
+        };
+        let layout = Layout::new(&[], vec![decl]).unwrap();
+        let split = Split::header_only(std::env::temp_dir().join("header-alone"), &layout).unwrap();
+        let e = super::PageDrop::new(&split)
+            .release(0, 0..16)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("a header alone"), "{e}");
     }
 
     /// A cut keeps every page once and in order, and its pieces differ by at

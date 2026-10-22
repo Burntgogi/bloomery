@@ -145,12 +145,9 @@ pub(super) struct Gdn38 {
     /// The q·k·v channels and `z`.
     pub(super) x: DeviceBuffer<f32>,
     pub(super) z: DeviceBuffer<f32>,
-    /// The joined β·α gemv's output, row-major `[2·n_v][m]` (β's rows
-    /// first): at one row it is β then α, which the conv reads in place.
+    /// The joined β·α projection: β's rows token-major, then α's
+    /// (`program38::beta_alpha_rows`), which the conv reads in place.
     pub(super) ba: DeviceBuffer<f32>,
-    /// β and α token-major, copied out of `ba` at more than one row.
-    pub(super) b: DeviceBuffer<f32>,
-    pub(super) a: DeviceBuffer<f32>,
     pub(super) conv: DeviceBuffer<f32>,
     pub(super) beta: DeviceBuffer<f32>,
     pub(super) decay: DeviceBuffer<f32>,
@@ -168,11 +165,8 @@ pub(super) struct Qsa38 {
     /// The flash's partials, over a list's width.
     pub(super) part_v: DeviceBuffer<f32>,
     pub(super) part_ms: DeviceBuffer<f32>,
-    /// The indexer's raw keys and queries, row-major as the f32 gemv writes
-    /// them (`[IDX_DIM][m]`, `[IDX_HEADS·IDX_DIM][m]`), and the queries
-    /// token-major, copied out at more than one row.
+    /// The indexer's raw keys and queries, token-major.
     pub(super) kr: DeviceBuffer<f32>,
-    pub(super) qr: DeviceBuffer<f32>,
     pub(super) qi: DeviceBuffer<f32>,
     /// The selection's queries, scores and lists.
     pub(super) sel: QsaScratch,
@@ -301,8 +295,6 @@ impl Arena38 {
                 x: f(s.channels())?,
                 z: f(s.n_v * linear::HEAD)?,
                 ba: f(2 * s.n_v)?,
-                b: f(s.n_v)?,
-                a: f(s.n_v)?,
                 conv: f(s.channels())?,
                 beta: f(s.n_v)?,
                 decay: f(s.n_v)?,
@@ -322,7 +314,6 @@ impl Arena38 {
                     listed_partials_ms_len(sel, geo::N_HEAD, width),
                 )?,
                 kr: f(geo::IDX_DIM)?,
-                qr: f(geo::IDX_HEADS * geo::IDX_DIM)?,
                 qi: f(geo::IDX_HEADS * geo::IDX_DIM)?,
                 sel: QsaScratch::new(stream, sel, ctx, geo::KEPT)?,
             },
@@ -360,8 +351,6 @@ impl Arena38 {
             &g.x,
             &g.z,
             &g.ba,
-            &g.b,
-            &g.a,
             &g.conv,
             &g.beta,
             &g.decay,
@@ -373,7 +362,6 @@ impl Arena38 {
             &q.part_v,
             &q.part_ms,
             &q.kr,
-            &q.qr,
             &q.qi,
             &q.sel.q_out,
             &q.sel.scores,

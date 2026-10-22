@@ -7,7 +7,8 @@
 //! the rank's part of their inner width; the head projects the rank's part of the vocabulary.
 //! The router, the hyper-connection glue, the latent cache and its index, the norms, the
 //! low-rank inputs and the embedding run whole on every rank. The cut is the family's rule
-//! (`model::arch::glm5next::tp::cut`), applied to the file's mapped tensor bytes.
+//! (`model::arch::glm5next::tp::cut_of`, [`RankOf`]), applied to the tensors of the source a
+//! rank loads from ([`load`], `model::part::Source`): a GGUF file or a checkpoint folder.
 //!
 //! A step is the one-card step's launches at the rank's widths, the mixers' and blocks' own
 //! functions ([`crate::kda`], [`crate::mla`], [`crate::ffn`]), with every expert on the card at
@@ -30,14 +31,15 @@ use std::sync::Arc;
 use bloomery_gpu::head::Head;
 use bloomery_gpu::host::{GatherLoop, GatherSet, GatherShape, Gathers};
 use bloomery_gpu::hybrid::SlotMap;
-use bloomery_gpu::weights::{TensorPart, Weights, block_index};
+use bloomery_gpu::weights::{Weights, block_index};
 use bloomery_gpu::{Branch, DeviceTensor, Gpu, GpuError, MappedHost, WindowMut, mem_batch};
 use bloomery_gpu_deepseek41::hc::HC_STREAMS;
 use bloomery_gpu_deepseek41::router::glm5next::{N_EXPERT, N_USED};
 use cuda_core::{CudaStream, DeviceBuffer, sys};
 use gguf::Split;
-use model::arch::glm5next::names::{self, Sub};
+use model::arch::glm5next::names::Sub;
 use model::arch::glm5next::place::{KdaLanes, PlanInputs};
+use model::part::{Source, Take};
 use runtime::layer::{FfnKind, MixerKind};
 
 use crate::body::pair::write_row;
@@ -148,7 +150,7 @@ impl Rank {
             .collect::<Result<Vec<_>, _>>()?;
         gpu.context().bind_to_thread()?;
         let stream = gpu.stream();
-        let mut w = load(gpu, &file, at, spec.layers.len(), inputs.hp.n_head)?;
+        let mut w = load(gpu, &*file, at, spec.layers.len(), inputs.hp.n_head)?;
         let kinds: Vec<_> = cfg.iter().map(|c| c.kind).collect();
         Body::derive(stream, &kinds, 0..kinds.len(), &mut w)?;
         for (c, n) in cfg.iter().zip(&names) {
@@ -611,38 +613,30 @@ impl Drop for Rank {
     }
 }
 
-/// Rank `at`'s parts of the trunk's `layers` layers and of the head: every tensor of the file
-/// but the token embedding, which the host reads, and the layers past the trunk's.
-fn load(
+/// Rank `at`'s parts of the trunk's `layers` layers of `heads` heads and of the head, from
+/// `source` on `gpu` ([`bloomery_gpu::parts::load`]): every tensor the card holds
+/// (`model::arch::glm5next::tp::card_holds`: not the token embedding, which the host reads, nor
+/// the layers past the trunk's), each the part the family's cut gives the rank
+/// ([`RankOf::take`]), in its type's card format.
+pub fn load(
     gpu: &Gpu,
-    file: &Split,
+    source: &impl Source,
     at: RankOf,
     layers: usize,
     heads: usize,
 ) -> Result<Weights, GpuError> {
-    let embd = names::token_embd();
-    let mut parts = Vec::new();
-    for (shard, t) in file.iter_tensors() {
-        let keep = match block_index(&t.name)? {
-            Some(l) => l < layers,
-            None => t.name != embd,
-        };
-        if !keep {
-            continue;
-        }
-        let bytes = file
-            .shard(shard)
-            .ok_or_else(|| shape(format!("{} names shard {shard}", t.name)))?
-            .data(t)?;
-        let cut = model::arch::glm5next::tp::cut(&t.name, &t.dims, heads as u64)
-            .map_err(|e| shape(format!("{}: {e}", t.name)))?;
-        let (info, spans) = source::part_of(t, cut, at)?;
-        parts.push(TensorPart {
-            info,
-            spans: spans.into_iter().map(|r| &bytes[r]).collect(),
-        });
-    }
-    Weights::load_parts(gpu.stream(), &parts)
+    bloomery_gpu::parts::load(
+        gpu.stream(),
+        source,
+        |name, ty, dims| {
+            if !model::arch::glm5next::tp::card_holds(name, block_index(name)?, layers) {
+                return Ok(Take::Skip);
+            }
+            at.take(name, ty, dims, heads as u64)
+        },
+        |_| None,
+        false,
+    )
 }
 
 /// `gpu`'s context current on this thread, which runs every rank of a loopback in turn, and its

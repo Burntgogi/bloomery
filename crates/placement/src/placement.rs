@@ -1068,6 +1068,9 @@ pub enum PlacementError {
     /// beside its pair: the sidecar's own named refusal.
     #[error(transparent)]
     R8(#[from] crate::r8::R8Error),
+    /// A tensor-parallel cut or rank of a named tensor refused.
+    #[error(transparent)]
+    Tp(#[from] tp::TpError),
     /// An expert list that is not one: a repeated id, an id past the stack.
     #[error("expert list: {0}")]
     Experts(String),
@@ -2848,14 +2851,14 @@ fn row_cache_reserve(model: &ModelTensors, rows: &[Row]) -> u64 {
 /// ([`Role::EngramTable`]) holds while it reads one call of up to
 /// `positions` positions from the NVMe tier: per table, its rows a position
 /// ([`ModelTensor::gathered_rows`]) for every position, each row on at most
-/// `1 + ⌈(row bytes − 1) / page⌉` pages of [`workstation::ROW_PAGE`] — the
-/// ids are hashed, so a call's rows are counted on pages of their own, and
-/// a row may straddle a page boundary. The reader advises and copies one
-/// call at a time, so one call's pages are what must stay resident until
-/// its copy. A table with no per-token row count, or a room past u64, is
-/// refused by name.
-pub fn row_room(model: &ModelTensors, positions: u64) -> Result<u64, PlacementError> {
-    let page = workstation::ROW_PAGE;
+/// `1 + ⌈(row bytes − 1) / page⌉` pages of `page` — the host's base page
+/// ([`workstation::ROW_PAGE`] on this workstation, the page the caller's own
+/// host has elsewhere) — the ids are hashed, so a call's rows are counted on
+/// pages of their own, and a row may straddle a page boundary. The reader
+/// advises and copies one call at a time, so one call's pages are what must
+/// stay resident until its copy. A table with no per-token row count, or a
+/// room past u64, is refused by name.
+pub fn row_room(model: &ModelTensors, positions: u64, page: u64) -> Result<u64, PlacementError> {
     model
         .tensors
         .iter()
@@ -2887,8 +2890,8 @@ pub fn row_room(model: &ModelTensors, positions: u64) -> Result<u64, PlacementEr
 /// no churn pool beside it) and, on a unified machine, `floor` bytes more;
 /// else on the NVMe tier, where the role rule placed them ([`place_whole`]),
 /// with their reader's room for a call of up to `positions` positions
-/// ([`row_room`]) as the plan's row reserve, in place of the row cache
-/// [`totals`] set aside.
+/// ([`row_room`], on `page` pages) as the plan's row reserve, in place of
+/// the row cache [`totals`] set aside.
 ///
 /// `floor` is the prompt cache's: the caller's two saved sequence states at
 /// the plan's context. The cache's default budget is half of what the room
@@ -2896,6 +2899,10 @@ pub fn row_room(model: &ModelTensors, positions: u64) -> Result<u64, PlacementEr
 /// that takes the room whole leaves a load with no cache to serve from. A
 /// machine whose cards have memory of their own takes the room alone, as
 /// every such plan did.
+///
+/// `page` is the host's base page ([`row_room`]): the row room counts the
+/// pages a row sits on, and a host whose base page is not the one this
+/// workstation has counts its own.
 ///
 /// A plan with no such table is left as it is; [`Plan::row_tier`] reads the
 /// outcome. A table of other than one NVMe file segment, or a sum past u64,
@@ -2905,6 +2912,7 @@ pub fn row_table_tier(
     room: u64,
     floor: u64,
     positions: u64,
+    page: u64,
 ) -> Result<(), PlacementError> {
     let model = plan.model;
     let tables: Vec<usize> = (0..plan.rows.len())
@@ -2983,7 +2991,7 @@ pub fn row_table_tier(
         }
         0
     } else {
-        row_room(model, positions)?
+        row_room(model, positions, page)?
     };
     plan.host.reserve_bytes = host_arm
         .reserves
@@ -4114,6 +4122,45 @@ fn segment_shape(t: &ModelTensor, segments: &[Segment], experts: u64) -> Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn machine_accessors_use_the_first_node() {
+        let nodes = [11, 22].map(|bytes| Node {
+            host: Host {
+                usable_bytes: bytes,
+                ..host()
+            },
+            unified: Some(UnifiedPool { bytes: bytes + 1 }),
+        });
+        let mut machine = Machine {
+            cards: vec![],
+            tiers: vec![],
+            nodes: nodes.to_vec(),
+        };
+        assert_eq!(machine.host(), &nodes[0].host);
+        assert_eq!(machine.unified(), nodes[0].unified);
+        machine.host_mut().usable_bytes = 33;
+        *machine.unified_mut() = Some(UnifiedPool { bytes: 44 });
+        assert_eq!(machine.nodes[0].host.usable_bytes, 33);
+        assert_eq!(machine.nodes[0].unified, Some(UnifiedPool { bytes: 44 }));
+        assert_eq!(machine.nodes[1], nodes[1]);
+        machine.nodes.clear();
+        for mutable in [false, true] {
+            let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if mutable {
+                    machine.host_mut();
+                } else {
+                    let _ = machine.host();
+                }
+            }))
+            .unwrap_err();
+            let message = panic
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| panic.downcast_ref::<&str>().copied());
+            assert_eq!(message, Some("a machine lists this process's node first"));
+        }
+    }
 
     /// Each format's word names it back, every word apart; another word
     /// names none.
@@ -5451,14 +5498,19 @@ mod tests {
         assert_eq!(plan.n_l, vec![8]);
     }
 
+    // PIN(2026-10-22): the Qwen3.6 leg runs a Q8_0 down and (once the leg has the
+    // arm) a Q6_K gate and up through the common leg, so the layers that held those
+    // types hold types it still has no GEMM for (an MXFP4 down, an IQ2_XS gate and
+    // up); its rows are the ones the test held, and Qwen3.8's gain the MXFP4 down
+    // its Q8_0 down did not have.
     #[test]
     fn host_only_reasons_follow_the_program_and_part_in_file_order() {
         use crate::accepts::{Program, routed_rule};
-        use GgmlType::{Q4_K, Q5_K, Q6_K, Q8_0};
+        use GgmlType::{IQ2_XS, MXFP4, Q4_K, Q5_K, Q6_K};
         let model = legged(&[
             [Q4_K, Q4_K, Q6_K],
-            [Q4_K, Q4_K, Q8_0],
-            [Q6_K, Q6_K, Q6_K],
+            [Q4_K, Q4_K, MXFP4],
+            [IQ2_XS, IQ2_XS, Q6_K],
             [Q4_K, Q5_K, Q4_K],
         ]);
         let rows = |program| {
@@ -5482,6 +5534,7 @@ mod tests {
             rows(Program::Qwen38Body),
             [
                 (0, "ffn_down_exps.weight"),
+                (1, "ffn_down_exps.weight"),
                 (2, "ffn_gate_exps.weight"),
                 (2, "ffn_up_exps.weight"),
                 (2, "ffn_down_exps.weight"),
@@ -6225,16 +6278,17 @@ mod tests {
             weights + KV + context + scratch + MARGIN,
             "the margin in the arena's place"
         );
+        // A routed stack of a type with no device format (iq1_s has none) is refused by name.
         let mut odd = layered(3);
-        odd.tensors[1].ty = GgmlType::F16;
+        odd.tensors[1].ty = GgmlType::IQ1_S;
         match whole_need(&odd, &at(need), KV, load) {
             Err(e @ PlacementError::NoCardFormat { .. }) => assert_eq!(
                 e.to_string(),
-                "tensor experts 0: type f16 has no device format, but its role (routed) puts it \
+                "tensor experts 0: type iq1_s has no device format, but its role (routed) puts it \
                  on a card"
             ),
             Err(e) => panic!("{e}, not NoCardFormat"),
-            Ok(n) => panic!("an f16 stack was sized as {n:?}"),
+            Ok(n) => panic!("an iq1_s stack was sized as {n:?}"),
         }
     }
 
@@ -6473,5 +6527,34 @@ mod tests {
                 "{os}: the split's arena and window are held to its room"
             );
         }
+    }
+
+    /// The row room counts the pages a row sits on, in the host's base page:
+    /// a 90 B row sits on two pages of 4,096 B and on two of 16,384 B (it
+    /// straddles a page boundary in both), so the room of a call of 4,096
+    /// positions reading 16 rows a position is 4,096 · 16 · 2 · page —
+    /// 536,870,912 B on this workstation's page and 2,147,483,648 B on the
+    /// 16 KiB one.
+    #[test]
+    fn the_row_room_counts_the_hosts_base_page() {
+        let model = ModelTensors {
+            tensors: vec![ModelTensor {
+                name: "ple table".into(),
+                shard: 0,
+                layer: Some(0),
+                role: Role::EngramTable,
+                ty: GgmlType::Q4_K,
+                dims: vec![90, 16],
+                file_bytes: 16 * 90,
+                gathered_rows: Some(16),
+            }],
+            layers: 1,
+            experts: 0,
+            experts_used: 0,
+            bf16_words: |_| false,
+        };
+        let room = |page| row_room(&model, 4096, page).expect("the row room");
+        assert_eq!(room(4096), 536_870_912);
+        assert_eq!(room(16384), 2_147_483_648);
     }
 }

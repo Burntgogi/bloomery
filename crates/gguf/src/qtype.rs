@@ -67,7 +67,10 @@ pub const QROWS: &[QRow] = &[
     QRow { ty: T::F32, name: "f32", blck: 1, bytes: 4, dequant: true, host_act: H::F32,
            card: card!(F32           F32           -       -                   -      F32     -    -) },
     // f16: ggml.c:667
-    QRow { ty: T::F16, name: "f16", blck: 1, bytes: 2, dequant: true, host_act: H::F32, card: Card::NONE },
+    // An f16 tensor loads widened to f32 (exact), the layout a BF16 one loads in; no dense entry names
+    // it, so a site over it is the f32 site of its widened rows.
+    QRow { ty: T::F16, name: "f16", blck: 1, bytes: 2, dequant: true, host_act: H::F32,
+           card: card!(Bf16AsF32     Bf16AsF32     -       -                   -      -       -    -) },
     // q4_0 and q4_1: ggml-common.h:167-171 and :174-178 (two f16 halves for q4_1). Sized and named so
     // a file holding them opens; no decoder and no CPU matmul here, so every use is refused by name.
     QRow { ty: T::Q4_0, name: "q4_0", blck: 32, bytes: 18, dequant: false, host_act: H::None, card: Card::NONE },
@@ -75,7 +78,7 @@ pub const QROWS: &[QRow] = &[
     // q5_0: ggml.c:756, ggml-common.h:196-216; q5_1: ggml.c:777; q8_0: ggml.c:819, ggml-common.h:233-238
     // (one f16 d and 32 int8 codes)
     QRow { ty: T::Q5_0, name: "q5_0", blck: 32, bytes: 22, dequant: true, host_act: H::Q8_2X4,
-           card: card!(Q5_0          Q5_0          -       (Q5_0, Q8Blocks32)  -      Q5_0    -    -) },
+           card: card!(Q5_0          Q5_0          -       (Q5_0, Q8Blocks32)  Q5_0   Q5_0    -    -) },
     QRow { ty: T::Q5_1, name: "q5_1", blck: 32, bytes: 24, dequant: true, host_act: H::Q8_2X4,
            card: card!(Q5_1          Q5_1          -       (Q5_1, Q8Blocks32)  Q5_1   -       -    -) },
     QRow { ty: T::Q8_0, name: "q8_0", blck: 32, bytes: 34, dequant: true, host_act: H::Q8_2X4,
@@ -93,7 +96,7 @@ pub const QROWS: &[QRow] = &[
     QRow { ty: T::Q5_K, name: "q5_K", blck: 256, bytes: 176, dequant: true, host_act: H::Q8_2X4,
            card: card!(KQuant        -             Q5k     (Q5k, Q8Act)        Q5k    Q5k     -    Q5k) },
     QRow { ty: T::Q6_K, name: "q6_K", blck: 256, bytes: 210, dequant: true, host_act: H::Q8_2X4,
-           card: card!(KQuant        KQuant        -       (Q6k, Q8Act)        Q6k    Q6k     Q6k  Q6k) },
+           card: card!(KQuant        KQuant        Q6k     (Q6k, Q8Act)        Q6k    Q6k     Q6k  Q6k) },
     // q8_K: ggml's activation form, mainline's block (llama.cpp 36a73916 ggml-common.h:371-376, ggml.c:880): float d, 256 int8
     // codes, 16 int16 bsums = 292 B. ik's block adds a float sum, 296 B (c10fbbcc ggml-common.h:405-411): a divergence.
     QRow { ty: T::Q8_K, name: "q8_K", blck: 256, bytes: 292, dequant: false, host_act: H::None, card: Card::NONE },
@@ -109,7 +112,7 @@ pub const QROWS: &[QRow] = &[
     QRow { ty: T::IQ4_NL, name: "iq4_nl", blck: 32, bytes: 18, dequant: true, host_act: H::Q8_2X4,
            card: card!(-             -             -       (Iq4nl, Q8Blocks32) Iq4nl  -       -    -) },
     QRow { ty: T::IQ3_S, name: "iq3_s", blck: 256, bytes: 110, dequant: true, host_act: H::Q8K,
-           card: card!(-             -             Iq3s    (Iq3s, Q8Act)       -      -       -    -) },
+           card: card!(-             -             Iq3s    (Iq3s, Q8Act)       Iq3s   -       -    -) },
     QRow { ty: T::IQ2_S, name: "iq2_s", blck: 256, bytes: 82, dequant: false, host_act: H::None, card: Card::NONE },
     QRow { ty: T::IQ4_XS, name: "iq4_xs", blck: 256, bytes: 136, dequant: true, host_act: H::Q8K,
            card: card!(-             -             Iq4xs   (Iq4xs, Q8Act)      Iq4xs  -       -    -) },

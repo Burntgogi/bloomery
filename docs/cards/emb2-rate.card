@@ -1,0 +1,24 @@
+# The EmbeddingGemma 2 rate for the 0.3.8 release notes. bloomery-serve 0.3.8 from the release tarball serves Qwen3.6-35B-A3B
+# Q8_0 at the serving defaults on the RTX 3090 (--ctx-size 16384, no --parallel, no lever) with
+# --embd-model embeddinggemma-2-Q8_0.gguf beside it. A client on the box posts /v1/embeddings: one warm-up request, then 7
+# timed requests per arm, timed by the client's perf_counter around each HTTP call (no runner times embeddings). Arms:
+# short1 (1 input of ~20 tokens), short32 (32 inputs of ~20 tokens), long16 (16 inputs of ~500 tokens).
+# Rate [derived]: the file is 310 MB Q8_0, ~290 M parameters, of which the token table is ~half and is read by row; the layers
+# do ~2 x 150 M = 0.3 GFLOP a token. A batched prompt GEMM at 5..30 effective TFLOPS on a 3090 gives 15k..100k tok/s
+# for long16; attention at 500 positions adds little. short1 is launch and HTTP bound: 26 layers x ~10 launches x ~5 us
+# plus ~1 ms of HTTP = ~2..10 ms a request.
+kind: baseline
+question: what does one RTX 3090 give for /v1/embeddings with EmbeddingGemma 2 served beside a chat model at the
+  serving defaults?
+term: embedding tok/s = usage.prompt_tokens / request wall (median of 7), arm long16, client perf_counter
+unit: tok/s
+predict: 15000..100000
+condition: one lease (tools/ref/lease-hold.sh), the RTX 3090 only, the 0.3.8 tarball's bloomery-serve, Qwen3.6-35B-A3B
+  Q8_0 chat model, --embd-model /models/embeddinggemma-2/embeddinggemma-2-Q8_0.gguf, --ctx-size 16384; the output to
+  a file first
+reason: the 0.3.8 notes promote @juliankang4's EmbeddingGemma 2 seat and need a measured rate on our card; why now:
+  the user asked for the measurement (2026-10-22)
+decide-in: write the three arms' medians into the notes' contributor line, captioned as one RTX 3090, client-timed
+decide-below: the seat runs the inputs one at a time or pays a per-input launch set: read the server log's batch line
+  before the number goes out
+decide-above: the token table or the layer count is smaller than derived: re-read the file's header
