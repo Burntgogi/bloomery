@@ -13,8 +13,8 @@
 
 - **MoE models larger than the card, and larger than the host's RAM.** Routed experts live on the GPU and in host
   RAM; the engine counts its own routing and moves the experts it calls most onto the card while it runs. On one
-  RTX 3090 24 GB beside a 256 GB host, DeepSeek-V4.1-Flash `Q3_K_M` (347 GB) serves two requests at 34.4 tok/s in
-  total and GLM-5.3-Flash at 26.9. When the RAM cannot hold the host's experts either, Qwen3.8, GLM-5.3-Flash and
+  RTX 3090 24 GB beside a 256 GB host, DeepSeek-V4.1-Flash `Q3_K_M` (347 GB) serves two requests at 33.5 tok/s in
+  total and GLM-5.3-Flash at 25.3 (0.3.0). When the RAM cannot hold the host's experts either, Qwen3.8, GLM-5.3-Flash and
   DeepSeek-V4.1-Flash page the rest from the model file on NVMe.
 - **A prompt cache that survives other requests.** The Qwen3.8 and GLM-5.3-Flash seats keep saved prompt states in
   host RAM: a request that shares a prefix with an earlier one restores it, even after another request used the
@@ -36,52 +36,30 @@ bloomery-serve --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M --port 8080
 
 ## Status (0.3.8)
 
-0.3.8 puts Qwen3.6 and Qwen3-30B expert stacks on the card leg, and runs Raon-1-mini's prompt in wide units of up to
-256 rows. On one RTX 3090 at its 250 W cap, at the serving defaults, Qwen3.6-35B-A3B Q8_0 decodes at 89.60 tok/s
-(68.73 before, ctx 262,144) and Raon-1-mini pp512 is 2,507.5 tok/s (312.4 before). The other rows are in the
-[release notes](https://github.com/midagedev/bloomery/releases/tag/v0.3.8). Nemotron-3.5-Lightning and Sage-A1.5 load
-on seats that already exist.
+0.3.8 runs more of the Qwen3 MoE experts on the card: Qwen3.6 and Qwen3-30B `Q8_0`, `Q6_K`, `IQ4_XS` and `IQ3_S` stacks
+that stayed on the host now take the card leg. On one RTX 3090 at its 250 W cap, at the serving defaults (ctx 262,144),
+Qwen3.6-35B-A3B `Q8_0` decodes at 89.60 tok/s (68.73 before). Raon-1-mini's prompt runs in wide units: pp512 2,507.5
+tok/s (312.4 before). Nemotron-3.5-Lightning runs on the `nemotron` seat. Every row is in the
+[release notes](https://github.com/midagedev/bloomery/releases/tag/v0.3.8).
 
-| Area | State |
+| What runs | State |
 |---|---|
-| Linux x86-64, NVIDIA sm_86 (RTX 3090, RTX A6000, RTX 3060) | Runs. Every number here comes from these cards |
-| NVIDIA driver | R580 or newer (CUDA 13); an older driver is refused at the start |
-| Ada and Blackwell (sm_89, sm_120) | Blackwell ran on a user's RTX 5090 under WSL2 ([#2](https://github.com/midagedev/bloomery/issues/2)): the sm_86 PTX compiles for the card at the first start. Ada not yet run. [Reports welcome](docs/evaluating.md#help-wanted-hardware-we-have-not-run) |
-| NVIDIA DGX Spark (GB10, aarch64) | Builds and runs from source (a contributor's port, [`docs/contrib/dgx-spark.md`](docs/contrib/dgx-spark.md)): the plan treats the unified memory as one pool, `BLOOMERY_ARCH` sets sm_121, and the quant types without an aarch64 kernel run through a scalar mirror. Two Sparks over RDMA serve one model, a node owning routed experts ([#358](https://github.com/midagedev/bloomery/pull/358), [#420](https://github.com/midagedev/bloomery/pull/420)). The release binaries are x86-64 only |
-| Host CPU | x86-64 with AVX2 (x86-64-v3), AMD or Intel. Every number here comes from an 8-channel host; a 2-channel desktop host is not measured here and runs the CPU experts slower |
-| macOS, Apple silicon · AMD GPUs, Windows without WSL2 | Not supported yet · Not supported |
-| OpenAI and Anthropic APIs, streaming, tool calls | Every generative model |
-| Several requests at once (`--parallel`, default 1) | One pass on V4.1, GLM-5.3, Qwen3.8, MiMo-V2.6-Flash and a whole-card Qwen3-30B or Qwen3.6; in turn on the rest. A `--parallel` you set is never lowered. `--ctx-size` alone is one request's context: the server then serves one request at that length, as llama-server does. Unset, that length is the ladder (PIN(2026-10-14)): the lesser of 262,144 and the file's limit, one slot, halved while the plan is short of the card, and of the host where the body keeps no tier past it. A set value that does not fit is refused, never cut. The number rows on this page still sit at `--ctx-size 16384` |
-| Prompt cache (Qwen3.8, GLM-5.3) | Saved states in host RAM (`--cache-ram`; by default the lesser of 8 GiB and half the RAM the plan leaves; on Qwen3.8, 0 on a plan that pages experts from NVMe). A shared prefix restores the last checkpoint inside it; a saved state keeps checkpoints at 512·2^i positions below its end. On Qwen3.8 the card's checkpoints are 4,096 positions apart, so a shared prefix shorter than that does not restore |
-| MTP draft (Qwen3.8, GLM-5.3) | On by default; its width follows measured cost |
-| Qwen3.8 prompts | Each layer seats the prompt's most-used CPU experts on the card (`--place a` and `bp`); the extra stream ring runs only under `--place a` |
-| Quant types | Card experts in Q4_K–Q6_K, MXFP4, IQ2_XS, IQ3_XXS, IQ4_XS and IQ4_NL; host kernels add Q2_K, IQ2_XS and Q6_K (`UD-Q2_K_XL` files load). Qwen3.8 `UD-Q3_K_XL` runs on the card: faster than `UD-Q4_K_XL` on long prompts and decode, slower at P = 512. IQ3_S runs on the card too, so GLM-5.3 `UD-IQ4_XS` and `UD-Q2_K_XL` keep routed experts on the card. A file's q4_0 and q4_1 tensors open. BF16 dense weights load in their own words. IQ1_M routed experts are not loaded yet |
-| Cards | One card, or one card plus one expert-tier card (`--place bp`). With `--place` unset and two cards visible, Qwen3.8 and GLM-5.3 add the second card when their plan finds it pays |
-| Host RAM under the model | Runs on Qwen3.8, GLM-5.3 and V4.1: the routed experts the RAM cannot hold are paged from the model file on NVMe through a RAM arena. Tokens equal the all-RAM load, except where GLM-5.3's decode computes the arena's experts on the card (a pinned arena, the default on an integrated GPU such as DGX Spark's): the card quantizes the activation as q8_1 and sums in its own order ([Serving](docs/serving.md)). A plan keeps 512 MiB under the free RAM it reads, and a paged load shrinks its arena when it finds less RAM than planned. A paged Qwen3.8 load serves one slot by default with the MTP draft off; a set `BLOOMERY_DRAFT=mtp` runs, and a set `--parallel` is served unless the room's floor refuses it by name. Adaptive residency runs on it. In 0.3.1 a set `--parallel` of 2 or more on a paged Qwen3.8 plan failed at load. On WSL2 with the model on a Windows drive, set `BLOOMERY_NVTIER_READ=buffered` |
-| MiMo-V2.6-Flash | Its hot routed experts sit on the card, the rest on the host. After a 5,620-token prompt it decodes at 34.0 tok/s (0.2.10: 19.1), first token at 52.9 s (RTX A6000, `--place` unset, 0.3.0's release check) |
-| Text embeddings | EmbeddingGemma v1 (300M) and EmbeddingGemma 2, Q8_0, beside a chat model: `--embd-model FILE` or `--embd-hf ggml-org/embeddinggemma-2-GGUF:Q8_0`. `/v1/embeddings` and `/embedding` return mean-pooled vectors; `dimensions` selects 128, 256, 512 or the full output width (768), normalized after the cut. V1 takes up to 2048 tokens per input; v2 takes up to 8192. The side seat reserves its bytes before the chat plan places experts. See [serving](docs/serving.md) |
-| Image input | V4.1, Qwen3.6, MiniCPM-V 4.7, GLM-5.3 and the Clef decide seat, with `--mmproj <file>` (llama-server's flag). Under `--hf` with no `--mmproj`, a seat takes the projector in the model's repo when it costs the text model no card experts or context; otherwise it prints the projector's bytes and serves text (`--no-mmproj` skips it). Images go in as base64 (`data:` URLs), not fetched URLs. A request with an image to a seat started without an encoder is refused by name |
+| NVIDIA cards | Compute capability 8.6 or newer, driver R580 or newer (CUDA 13); an older driver is refused at the start. Run here: RTX 3090, RTX A6000, RTX 3060 (WSL2). Run by users: RTX 5090 ([#2](https://github.com/midagedev/bloomery/issues/2)), DGX Spark (GB10, from source: [`docs/contrib/dgx-spark.md`](docs/contrib/dgx-spark.md)). Ada (sm_89): no report yet |
+| Host CPU | x86-64 with AVX2 (x86-64-v3), AMD or Intel. The release binaries are x86-64 only |
+| OS | Linux x86-64 with glibc 2.34 or newer; Windows through WSL2. macOS (a Metal backend is in progress, [#593](https://github.com/midagedev/bloomery/issues/593)) and AMD GPUs are not supported yet |
 
-### Known issues and limits (0.3.8)
+### Known limits (0.3.8)
 
-- **DeepSeek V4.1 on two cards (`--place bp`) is not faster than one card (`--place a`).** Unset `--place` picks `a`.
-- **The Qwen3.6 real-tier e2e gate's `split` residency clause can fail on one run and pass on the next at the same commit** (on an RTX 3090, logits distance from the off run up to 4.879e-1 against its 0.26 band, then 1.6–1.8e-1 on a rerun). The experts it streams follow the lane rate measured at runtime, so the clause's distance moves from run to run. This is a developer gate, not a change in what a load serves.
-- **On Qwen3.8 loads that page experts through the NVMe tier, `gate-gpu-qwen38-serve`'s real tier was 70/72 on 0.3.2's
-  baseline (`f382b474`), with two preexisting paged failures.** It was not re-run for this note, and the 0.3.4
-  release pass has no paged row. A default load keeps the draft off.
-- **The nemotron seat (Nemotron 3 Nano 4B, Nemotron 3.5 Bolt and Nemotron-3.5-Lightning) serves one slot on one card** ([the nemotron seat](docs/serving.md#the-seats) names what it refuses and when it keeps a prefix); `--place bp` on Bolt is refused by name. Lightning's UD-Q4_K_XL file is a placed load: the whole-card expert body is IQ2_XXS, which is Bolt's, and the other expert types stay on the host. No decode rate is stated for it.
-- **Unset context is the seats' ladder (PIN(2026-10-14)).** With `--ctx-size` unset, one slot asks the lesser of
-  262,144 and the file's limit and halves while the plan is short of the card, and of the host where the body keeps
-  no tier past it. A set `--ctx-size` that does not fit is refused
-  and is never cut. `--ctx-size` sets the context by hand.
-- **Qwen3.8's MTP draft:** a request that keeps a cached prefix runs with the draft off. The prompt-state save after a
-  request adds 100–160 ms to the next request's first token ([#46](https://github.com/midagedev/bloomery/issues/46)).
-- **Quant types not loaded yet:** Q2_0, IQ2_S, IQ2_XXS and IQ1_M routed experts
-  ([#48](https://github.com/midagedev/bloomery/issues/48)).
-- **Not measured here:** Ada cards (sm_89), and a 2-channel desktop host's CPU experts.
+- DeepSeek V4.1 on two cards (`--place bp`) is not faster than one card (`--place a`). Unset `--place` picks `a`.
+- The `nemotron`, `raon1`, `solar2` and `minimaxm3` seats serve one slot and keep no saved prompt states; `--parallel` above 1 is refused by name.
+- `--place bp` is refused by name on the `nemotron` seat, Qwen3.6 and Qwen3-30B; they run one card plus the host tier.
+- Nemotron-3.5-Lightning `UD-Q4_K_XL` is a placed load: its whole-card expert body is IQ2_XXS, and the other expert types stay on the host.
+- IQ2_S and IQ1_M routed experts do not load.
+- GLM-5.3 holds at most 16,384 positions a slot; a `--ctx-size` whose slot share is larger is refused at the start.
 
-To try it and judge it fairly (against llama-server too): [`docs/evaluating.md`](docs/evaluating.md). Full limits:
-[`docs/serving.md`](docs/serving.md#limits).
+Models and what each needs: [`docs/models.md`](docs/models.md). Flags, seats and every limit:
+[`docs/serving.md`](docs/serving.md#limits). To try it and judge it fairly, against llama-server too:
+[`docs/evaluating.md`](docs/evaluating.md).
 
 ## Install
 
@@ -109,7 +87,7 @@ The tarballs are on the [releases page](https://github.com/midagedev/bloomery/re
 
 ## Use
 
-One binary, seven seats; the file's architecture picks the seat, and `--place` can stay unset on every model.
+One binary, ten seats; the file's architecture picks the seat, and `--place` can stay unset on every model.
 
 | Seat | Serves | One command |
 |---|---|---|
@@ -120,9 +98,10 @@ One binary, seven seats; the file's architecture picks the seat, and `--place` c
 | `mimo2` | [MiMo-V2.6-Flash](https://huggingface.co/ggml-org/MiMo-V2.6-Flash-MOPD-GGUF) | `bloomery-serve --hf ggml-org/MiMo-V2.6-Flash-MOPD-GGUF:MXFP4` |
 | `decide` | [Clef-Flash](https://huggingface.co/Cloudflare/clef-flash) and [lev](https://huggingface.co/ggml-org/lev-GGUF) (decision models) | `bloomery-serve --hf bartowski/Cloudflare_clef-flash-GGUF:Q5_K_M` |
 
-The seventh seat, `nemotron`, serves Nemotron 3 Nano 4B (new in 0.3.3) and Nemotron 3.5 Bolt 74B-A9B (new in 0.3.4)
-from a file on disk, tested as `NVIDIA-Nemotron3-Nano-4B-Q4_K_M.gguf` and `NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB.gguf`:
-`bloomery-serve -m PATH/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB.gguf`.
+Four more seats serve a file on disk:
+`nemotron` (Nemotron 3 Nano 4B, Nemotron 3.5 Bolt 74B-A9B, Nemotron-3.5-Lightning 30B-A3B), `raon1`
+(Raon-1-mini-preview, with its DFlash2 draft file beside it), `minimaxm3` (MiniMax-M3) and `solar2` (Solar-Open2-250B
+on two cards, `--place bp`). For example: `bloomery-serve -m PATH/raon-1-mini-preview-Q4_K_M.gguf`.
 The table above lists the seats with a checked `--hf` row. The qwen38 seat also serves NVIDIA's NVFP4 checkpoint
 folder as downloaded, with no conversion, on a card that holds every routed expert such as a DGX Spark's GB10:
 `bloomery-serve -m PATH/Qwen3.8-Flash-Next-NVFP4` or `bloomery-serve --hf nvidia/Qwen3.8-Flash-Next-NVFP4`
