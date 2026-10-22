@@ -26,8 +26,8 @@
 //!   is one page from the first. `MADV_WILLNEED` is unaffected — that path does
 //!   not consult the VMA flags — so [`Site::prefetch`] still works.
 //! * **Prefetch is a cold-path lever and a warm-path tax.** It costs one
-//!   syscall per row whether or not the page is resident, so a caller that
-//!   expects hits should not pay it.
+//!   syscall per distinct merged page run whether or not its pages are
+//!   resident, so a caller that expects hits should not pay it.
 //! * **Borrowing moves the faults onto whoever reads.** A consumer that reads
 //!   through the mapping takes one minor fault per row no matter who advised
 //!   the pages, and the engine's step is its calling thread's serial time. So
