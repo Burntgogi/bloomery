@@ -1246,7 +1246,8 @@ mod gate {
         const ROW: usize = 17;
         let s = cx.gpu.stream();
         let bd = DeviceBuffer::from_host(s, &vec![0.0f32; N_EXPERT])?;
-        let cases: [(&str, [(usize, f32); 2], [f32; 2], bool); 4] = [
+        type Case = (&'static str, [(usize, f32); 2], [f32; 2], bool);
+        let cases: [Case; 4] = [
             ("clean", [(0, 1.0), (1, 0.0)], [1.0, 0.0], false),
             ("nan_weight", [(0, f32::NAN), (1, 0.0)], [1.0, 0.0], true),
             ("overflow_+inf", [(0, 1.0), (1, 1.0)], [f32::MAX; 2], true),

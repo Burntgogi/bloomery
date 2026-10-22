@@ -2507,6 +2507,10 @@ impl Gen {
     /// The whole generation on `slot` alone, its calls one at a time; a run
     /// of fixed ids is fed in calls of `quantum` ids, or whole.
     #[cfg(test)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "test driver: the arguments of the prompt and pump calls it chains"
+    )]
     fn run(
         &mut self,
         slot: &mut Slot,

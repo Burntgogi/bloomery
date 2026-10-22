@@ -55,20 +55,22 @@ fn values(r: &mut Lcg, ty: GgmlType, n: usize, range: (f32, f32)) -> Vec<u8> {
     }
 }
 
-/// The file's tensors: name, ggml dims (the contiguous axis first), type and the range of an F32
-/// one. `out` is the type of the latent layer's output projection.
-fn tensors(out: GgmlType) -> Vec<(String, Vec<usize>, GgmlType, (f32, f32))> {
+/// One tensor of the file: its name, ggml dims (the contiguous axis first), type and the range of
+/// an F32 one.
+type Spec<N> = (N, Vec<usize>, GgmlType, (f32, f32));
+
+/// The file's tensors. `out` is the type of the latent layer's output projection.
+fn tensors(out: GgmlType) -> Vec<Spec<String>> {
     use GgmlType::{F32, Q4_K, Q5_0, Q6_K, Q8_0};
     let mix = 2 * STREAMS + (STREAMS - 1) * (STREAMS - 1);
     let small = (-0.05, 0.05);
-    let mut t: Vec<(String, Vec<usize>, GgmlType, (f32, f32))> = vec![
+    let mut t: Vec<Spec<String>> = vec![
         ("token_embd.weight".into(), vec![E, VOCAB], Q4_K, small),
         ("output.weight".into(), vec![E, VOCAB], Q6_K, small),
         ("output_norm.weight".into(), vec![E], F32, (0.5, 1.5)),
     ];
     for l in 0..LAYERS {
-        let mut layer: Vec<(&str, Vec<usize>, GgmlType, (f32, f32))> =
-            vec![("attn_norm.weight", vec![E], F32, (0.5, 1.5))];
+        let mut layer: Vec<Spec<&str>> = vec![("attn_norm.weight", vec![E], F32, (0.5, 1.5))];
         if l == LAYERS - 1 {
             layer.extend([
                 ("attn_q_a.weight", vec![E, Q_LORA], Q6_K, small),

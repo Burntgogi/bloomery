@@ -2107,8 +2107,13 @@ pub enum CardBytes<'a> {
     /// A part source's, for a file that is a checkpoint folder's header
     /// (`gguf::Split::header_only`): card `card` of `plan` loaded on the stream, each part's file
     /// pages released when the host config's `card_dontneed` asks (`crate::parts::load_placed`).
-    Parts(&'a dyn Fn(&CudaStream, &Plan<'_>, usize, bool) -> Result<Weights, GpuError>),
+    Parts(&'a PartsLoad<'a>),
 }
+
+/// A part source's load of card `card` of `plan` on the stream, `bool` the host config's
+/// `card_dontneed` ([`CardBytes::Parts`]).
+pub type PartsLoad<'a> =
+    dyn Fn(&CudaStream, &Plan<'_>, usize, bool) -> Result<Weights, GpuError> + 'a;
 
 /// The steps of a placed load before its body: the plan's card and context
 /// budget, the card, the host's memory against the plan's host need, the

@@ -2162,6 +2162,10 @@ impl ElemKernels {
     /// Enqueue `y = rms_norm(x, gain, eps)` over `m` tokens of `k` values
     /// (token-major). `k` a positive multiple of 32; `x`, `y` hold `k * m`
     /// f32, `gain` holds `k`. Asynchronous, allocation-free, capturable.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "host launcher: one argument per kernel argument it binds (rust-quality R8)"
+    )]
     pub fn enqueue_rms_norm(
         &self,
         stream: &CudaStream,
@@ -2209,6 +2213,10 @@ impl ElemKernels {
     /// `t*nd` — the host YaRN cache, uploaded per step). `nd` even and at
     /// least 2. `dst` holds `m * n_vec * nd` f32 in `src`'s layout.
     /// Asynchronous, allocation-free, capturable.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "host launcher: one argument per kernel argument it binds (rust-quality R8)"
+    )]
     pub fn enqueue_rope(
         &self,
         stream: &CudaStream,
@@ -2498,6 +2506,10 @@ impl ElemKernels {
     /// m]`), `w` the router weights (`n_exp * m` f32, `[n_exp, m]`); `y`
     /// holds `rows * m` f32, token-major. Asynchronous, allocation-free,
     /// capturable.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "host launcher: one argument per kernel argument it binds (rust-quality R8)"
+    )]
     pub fn enqueue_weighted_sum(
         &self,
         stream: &CudaStream,

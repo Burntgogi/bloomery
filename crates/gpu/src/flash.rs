@@ -852,6 +852,7 @@ mod flash_kernels {
             y.len() >= q_rows * latent
         )
     )]
+    #[allow(clippy::too_many_arguments)]
     pub fn flash_latent(
         q: &[f32],
         kv: &[u16],

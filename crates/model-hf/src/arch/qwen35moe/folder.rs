@@ -505,8 +505,7 @@ mod tests {
         assert_eq!(read(&got.runs[1]), vec![0x40u8; 480]);
         let refusal = |folder: &Folder, p: &Plan, ty, rows| {
             ple_rows(folder, p, &decl(ty, rows), &m)
-                .err()
-                .expect("refused")
+                .expect_err("refused")
                 .to_string()
         };
         let e = refusal(&folder, &p, GgmlType::F8E4M3_ROWS, 6);

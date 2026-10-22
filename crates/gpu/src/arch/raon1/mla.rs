@@ -925,7 +925,7 @@ pub(super) fn rows_wide(
             e_off: LATENT,
             extra: d.extra,
             gain: kv_norm,
-            pos: &*b.pos,
+            pos: b.pos,
             eps: d.latent_eps,
             fault,
             cache: &mut *b.cache,
