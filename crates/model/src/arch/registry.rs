@@ -16,8 +16,8 @@ use gguf::Split;
 use super::draft::Rule;
 use super::{
     Arch, DEEPSEEK4, GEMMA_EMBEDDING, GEMMA_EMBEDDING2, GLM5_NEXT_LLAMA_CPP, QWEN35_BODY, Read,
-    deepseek41, draft, gemma_embedding, gemma_embedding2, glm5next, mimo2, minimaxm3, nemotron_h,
-    nemotron_h_moe, qwen3moe, qwen35moe, raon1, solar2,
+    deepseek41, draft, flint, gemma_embedding, gemma_embedding2, glm5next, mimo2, minimaxm3,
+    nemotron_h, nemotron_h_moe, qwen3moe, qwen35moe, raon1, solar2,
 };
 use crate::placement::PlacementError;
 
@@ -252,6 +252,13 @@ pub static ROWS: &[ArchRow] = &[
         draft: None,
         fixture: None,
     },
+    ArchRow {
+        arch: Some(Arch::Flint),
+        names: &["flint"],
+        read: Some(flint::spec::read),
+        draft: None,
+        fixture: None,
+    },
 ];
 
 /// The row whose strings include `arch`.
@@ -360,6 +367,7 @@ mod tests {
             Arch::NemotronHMoe,
             Arch::GemmaEmbedding,
             Arch::GemmaEmbedding2,
+            Arch::Flint,
         ] {
             let rows = ROWS.iter().filter(|r| r.arch == Some(arch)).count();
             assert_eq!(rows, 1, "{arch:?} is in {rows} rows");

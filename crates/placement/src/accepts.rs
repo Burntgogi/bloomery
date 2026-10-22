@@ -80,6 +80,7 @@ pub fn program_of(arch: Arch) -> Option<Program> {
         Arch::NemotronH => Some(Program::NemotronHBody),
         Arch::NemotronHMoe => Some(Program::NemotronHMoeBody),
         Arch::GemmaEmbedding | Arch::GemmaEmbedding2 => Some(Program::GemmaEmbedding2Body),
+        Arch::Flint => None,
     }
 }
 

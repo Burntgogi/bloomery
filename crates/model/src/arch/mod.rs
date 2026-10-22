@@ -17,6 +17,7 @@ pub mod deepseek41;
 pub mod dflash2;
 pub mod draft;
 pub mod dspark;
+pub mod flint;
 pub mod gemma_embedding;
 pub mod gemma_embedding2;
 mod gemma_encoder;
@@ -150,8 +151,7 @@ fn architecture_is(is: &str) -> PlacementError {
 }
 
 /// An architecture a file's `general.architecture` names, when this crate has
-/// a reader or a program for it. `nemotron_h_moe` and both Gemma encoders
-/// have a reader and no program.
+/// a reader or a program for it. Flint has a reader and no executable program.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Arch {
     Deepseek2,
@@ -167,6 +167,7 @@ pub enum Arch {
     NemotronHMoe,
     GemmaEmbedding,
     GemmaEmbedding2,
+    Flint,
 }
 
 impl Arch {
@@ -200,6 +201,7 @@ impl Arch {
             "nemotron_h_moe" => Ok(Arch::NemotronHMoe),
             GEMMA_EMBEDDING => Ok(Arch::GemmaEmbedding),
             GEMMA_EMBEDDING2 => Ok(Arch::GemmaEmbedding2),
+            "flint" => Ok(Arch::Flint),
             other => Err(ModelError::UnknownArchitecture(other.to_string())),
         }
     }
@@ -226,6 +228,7 @@ impl Arch {
             Arch::NemotronHMoe => "nemotron_h_moe",
             Arch::GemmaEmbedding => GEMMA_EMBEDDING,
             Arch::GemmaEmbedding2 => GEMMA_EMBEDDING2,
+            Arch::Flint => "flint",
         }
     }
 }
@@ -1149,6 +1152,7 @@ mod tests {
             Arch::NemotronHMoe,
             Arch::GemmaEmbedding,
             Arch::GemmaEmbedding2,
+            Arch::Flint,
         ] {
             assert_eq!(Arch::from_name(a.name()).unwrap(), a);
         }

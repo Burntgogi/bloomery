@@ -82,6 +82,9 @@ pub enum Arch {
     Raon1,
     GemmaEmbedding,
     GemmaEmbedding2,
+    /// Flint: dense lead, sigmoid MoE with one shared MLP, and independently
+    /// masked sliding attention and RoPE. No executable program is registered.
+    Flint,
 }
 
 impl Arch {
@@ -106,6 +109,7 @@ impl Arch {
             Arch::Raon1 => "raon1",
             Arch::GemmaEmbedding => "gemma-embedding",
             Arch::GemmaEmbedding2 => "gemma-embedding2",
+            Arch::Flint => "flint",
         }
     }
 }

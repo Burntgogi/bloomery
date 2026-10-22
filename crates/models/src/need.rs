@@ -521,7 +521,7 @@ pub fn needs(spec: &ModelSpec) -> Vec<(Need, Option<LayerIdx>)> {
                         scaled: g.value_scale.is_some(),
                     },
                 });
-                if g.rope.mode != RopeMode::None {
+                if g.qk_norm || g.rope.mode != RopeMode::None {
                     at(Need::QkRope {
                         qk_norm: g.qk_norm,
                         head: g.head_dim,
