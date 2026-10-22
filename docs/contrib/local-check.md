@@ -101,6 +101,12 @@ items to finish before a case can remove its tree. A delayed TERM-handler case
 checks that the lane's last write has completed; a teardown failure still fails
 the self-test rather than being hidden by its count summary.
 
+The router replay self-tests (`tools/ref/window-union.py` and `tools/ref/router-coverage.py`, each with
+`--self-test`) run without a card or model. Placement counts must lie in `0..n_expert`, explicit
+layer ranges may not overlap, and a spread total must fit its eligible layers. Repeated single-value
+options and repeated `--k` entries are refused rather than silently replacing a placement or report row.
+Both command lines name a refused `--n-l`; `bursts` reports it without a Python traceback.
+
 Exceptions:
 
 - **`just` is a T0 prerequisite.** Three T0 units call it: `recipes-self-test`, `check-recipes` and the self-test of
