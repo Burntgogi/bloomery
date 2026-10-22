@@ -198,9 +198,10 @@ card and reads the PLE table from the folder on the NVMe tier, so a plan that pu
 `BLOOMERY_RESIDENCY` other than `off`, and `BLOOMERY_DRAFT=mtp` are refused by name; unset, the MTP draft stays off,
 as the folder's MTP layers are not read.
 
-The nemotron seat serves Nemotron 3 Nano 4B (`--model nemotron -m PATH`) whole on one card, one slot: `--parallel`
-above 1, a placement of more than one card or with a tier card, and a draft lever are refused by name. The body has
-no prompt batch, so a prompt runs one decode step per token, at the decode rate. A Mamba-2 state cannot step back: a
+The nemotron seat serves Nemotron 3 Nano 4B (`--model nemotron -m PATH`), Nemotron 3.5 Bolt 74B-A9B and
+Nemotron-3.5-Lightning 30B-A3B, one sequence: `--parallel` above 1, a placement of more than one card or with a
+tier card, and a draft lever are refused by name. The prompt path is the body's batched one: a prompt of several ids
+runs in passes of many rows, one Mamba-2 pass a layer over the pass's rows. A Mamba-2 state cannot step back: a
 request keeps what the slot holds only when its prompt extends the whole held sequence, and any other prompt resets
 the slot and is read again. The seat runs no prompt cache; a snapshot or a resume is refused by name.
 
@@ -218,7 +219,7 @@ bartowski/Cloudflare_clef-flash-GGUF:Q5_K_M` needs no head flag. The earlier `qw
 file: `--head joint_head.safetensors`, its `joint_head_config.json` beside it. A `--head` beside a `clef` file names the
 head instead of the file's own.
 
-**Concurrent requests.** Every generative seat but nemotron (one slot, above) takes `--parallel N` (unset, one slot; a set
+**Concurrent requests.** Every generative seat but nemotron, raon1, solar2 and minimaxm3 (one slot each, above) takes `--parallel N` (unset, one slot; a set
 `--ctx-size` with no `--parallel` serves one slot at the whole of it — the flag is one request's context, as
 llama-server reads it, and the startup line says so). A count you set is never lowered. The N slots are resident sequences
 inside the one model, switched by pointer exchange: nothing parks, and each round advances every busy slot by one
@@ -226,7 +227,7 @@ token or one drafted pass. Where the body runs several slots' rows as one pass, 
 all of them: on a whole-card Qwen3-30B or Qwen3.6, on V4.1 and MiMo-V2.6-Flash (two slots' rows a pass), and on GLM-5.3 and Qwen3.8, where a greedy
 request's drafted verify window rides the same pass (two windows a pass; with the draft off, the plain rows). A
 placed Qwen3-30B or Qwen3.6 (`--place a`), a sampled request on a drafting GLM-5.3 or Qwen3.8 load, V4.1 with the
-lookup draft step their slots in turn (Qwen3.8 under `--place bp` runs one pass since 0.3.1), a select and a step a slot each round. At a
+lookup draft and Qwen3.8 under `--place bp` step their slots in turn, a select and a step a slot each round. At a
 fixed expert placement each request answers the tokens of its run alone on the same server; under adaptive residency
 the placement follows every stream's passes (see [Limits](#limits)). Under more slots than one the context splits as
 llama-server splits it with `-np N` and no `-kvu`: a set `--ctx-size` is the total and each slot holds `total / N`
@@ -276,8 +277,10 @@ counters; a load that attached no tier prints none). Limits of a paged load, as 
 - Qwen3.8's prompt cache default is 0 on a plan the tier splits, and its `cache ram=…` line names the arena beside
   the load's own host need, so the two anonymous heaps cannot outrun `MemAvailable` into the OOM killer. GLM-5.3's
   default counts the arena inside the host need. `--cache-ram` sets the budget past both.
-- Unset, adaptive residency is off on a paged plan (the `residency` record says `paged`): a promotion would read
-  the expert cold through the file mapping. A paged Qwen3.8 seat serves with `BLOOMERY_RESIDENCY` set.
+- Unset, adaptive residency is off on a paged plan: the Qwen3.8 seat's unset word resolves `off` there, and the
+  `residency unset` record says so. A `BLOOMERY_RESIDENCY` word set on such a plan is served as given — the
+  residency machine's victim fills read through the NVMe tier's reader while the step's ids stay pinned in the arena
+  — so a paged Qwen3.8 seat serves with `BLOOMERY_RESIDENCY` set.
 - GLM-5.3 has no refusal of its own for slots or the draft. Its NextN draft layer's routed experts are host
   experts too, so the trunk's room is the host room less them.
 - V4.1 refuses a paged plan under an r8 pair that reads a sidecar, by name (`BLOOMERY_R8=off` reads the source and
@@ -311,7 +314,7 @@ decode starts warm (on by default, with `--place` unset, `a` or `bp`). On Qwen3.
 decode has routed experts of its own puts the pool back where it found it at its end, so a long prompt does not
 reset the placement its reply decodes from; a fresh server's calls keep it.
 
-**Prompt cache (Qwen3.8, GLM-5.3).** `--cache-ram` (MiB; 0 turns it off) keeps saved sequence states in host RAM.
+**Prompt cache (V4.1, Qwen3.8, GLM-5.3).** `--cache-ram` (MiB; 0 turns it off) keeps saved sequence states in host RAM.
 By default the budget is the lesser of 8 GiB and half the host RAM the plan leaves, with every slot's checkpoints and
 the residency's churn pool counted in; the checkpoint budget follows the slot context. A request that continues an
 earlier conversation (its prompt holds the whole earlier prompt) restores that state even after another request used
@@ -323,10 +326,10 @@ MiMo and Qwen3 seats run no prompt cache: a request keeps the longest prefix the
 by name. `timings.cache_ms` and `/metrics`'
 `prompt_cache_seconds_total` count the cache's work.
 
-**Image input (V4.1, Qwen3.6, GLM-5.3, Clef).** These seats read images when they have a vision encoder: `--mmproj <file>`,
+**Image input (V4.1, Qwen3.6, MiniCPM-V 4.7, Sage-A1.5, GLM-5.3, Clef).** These seats read images when they have a vision encoder: `--mmproj <file>`,
 llama-server's flag, naming the model's encoder GGUF. On V4.1 the file is `mmproj-DeepSeek-V4.1-Flash-BF16.gguf`.
 Under `--hf` with no `--mmproj`, every image seat takes the repo's own projector beside the model, unless `--no-mmproj`
-says none. The V4.1, Qwen3.6 and GLM-5.3 seats load it only when the text model keeps the same card experts and
+says none. The V4.1, qwen3 and GLM-5.3 seats load it only when the text model keeps the same card experts and
 context with the encoder as without it, also when the encoder sits on a card off the plan; otherwise one vision line gives the projector's bytes and cost, and the seat serves text. Qwen3-30B-A3B has no encoder, and `--mmproj` there is refused by name. A file of
 another encoder is refused by name. Images travel inside the request as PNG or JPEG bytes: an OpenAI `image_url`
 part holding a `data:` URL, or an Anthropic `image` block with a base64 source; any other URL is refused, not
@@ -409,7 +412,8 @@ and the model fits) states no need and consults no hook; a set hook is named on 
 - One model a server; one expert tier card at most (`--place bp`).
 - Concurrent streams run as one pass on a whole-card Qwen3-30B or Qwen3.6, on V4.1, MiMo-V2.6-Flash, GLM-5.3 and Qwen3.8; a placed
   Qwen3-30B or Qwen3.6 and a sampled request on a drafting load step in turn. A new request's prompt runs whole while the other
-  streams wait. The decide seat serves one request at a time, and the nemotron seat one slot; DSpark drafts never rejoin — `--parallel > 1` with
+  streams wait. The decide seat serves one request at a time, and the nemotron, raon1, solar2 and minimaxm3 seats one
+  slot each; DSpark drafts never rejoin — `--parallel > 1` with
   `BLOOMERY_DRAFT=dspark` is refused by name.
 - With adaptive residency on, a request's tokens follow the placement its passes ran on, and the placement follows
   the history of passes (the requests before it and the streams beside it): the same history gives the same tokens
@@ -465,8 +469,8 @@ In progress: serving on N cards for every model; Clef from the IQ and Q2_K files
 ## EmbeddingGemma 2 images
 
 A side seat serves the `gemma-embedding2` encoder beside a generative model. Build `bloomery-serve` with
-`--features glm5next,clef,mimo2,solar2,gemma-embedding2,vision` through `cargo oxide`, and add these flags to the chat
-model's command:
+`--features glm5next,clef,mimo2,solar2,minimaxm3,gemma-embedding2,hf,vision` through `cargo oxide`, and add these flags
+to the chat model's command:
 
 ```text
 --embd-model embeddinggemma-2-Q8_0.gguf

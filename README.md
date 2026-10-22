@@ -160,8 +160,8 @@ one request's decode at depth 4096. Measured on 0.3.0 (2026-10-12), on a 32-core
 | GLM-5.3-Flash `UD-Q4_K_XL` | 34.0 | 22.7 | 218 / 262 |
 | Qwen3.8-Flash-Next `UD-Q4_K_XL` | — ³ | 90.5 | — / 1,777 |
 
-¹ with `BLOOMERY_RESIDENCY=mid-p32-s1` · ² 29.1 with `BLOOMERY_RESIDENCY=mid-p0-s1` · ³ 0.3.0's measurement: two requests ran in
-turn on an expert-tier load. 0.3.1 runs them in one pass; not re-measured here.
+¹ with `BLOOMERY_RESIDENCY=mid-p32-s1` · ² 29.1 with `BLOOMERY_RESIDENCY=mid-p0-s1` · ³ under `--place bp` the Qwen3.8 seat runs two requests in
+turn, a slot at a time.
 ⁷ the nemotron seat serves one slot. Bolt's rows are 0.3.4's sittings (n=4, prompt at e92fa8bde, decode at 44495f0ba);
 on one RTX A6000 the same sittings read 87.4 tok/s at depth 4096 and 2,143 / 2,772 prompt tok/s.
 
