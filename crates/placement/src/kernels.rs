@@ -48,14 +48,18 @@ pub const fn gemm(ty: GgmlType) -> Option<GemmEntry> {
 }
 
 /// Whether the prompt GEMM `entry` reads its activation in 32-value blocks
-/// (`Gemm32Weight`'s entries: Q8_0, Q5_1, IQ4_NL and NVFP4, over a
+/// (`Gemm32Weight`'s entries: Q8_0, Q5_0, Q5_1, IQ4_NL and NVFP4, over a
 /// `GemmAct32`), else in the grouped GEMM's q8_1 blocks of 128 (`GemmAct`):
 /// the form a prompt walk quantizes a unit's normed rows and SwiGLU rows into
 /// for a stack of that type.
 #[must_use]
 pub const fn gemm_reads_blocks32(entry: GemmEntry) -> bool {
     match entry {
-        GemmEntry::Q8_0 | GemmEntry::Q5_1 | GemmEntry::Iq4nl | GemmEntry::Nvfp4 => true,
+        GemmEntry::Q8_0
+        | GemmEntry::Q5_0
+        | GemmEntry::Q5_1
+        | GemmEntry::Iq4nl
+        | GemmEntry::Nvfp4 => true,
         GemmEntry::Q3k
         | GemmEntry::Q4k
         | GemmEntry::Q5k
