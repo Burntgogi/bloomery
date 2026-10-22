@@ -7,6 +7,13 @@
 //! the vocabulary's pre-tokenizer; SentencePiece merges a whole fragment by
 //! token score. Both metaspace encoders spell U+0020 as U+2581. Decoding
 //! concatenates token pieces without stripping a SentencePiece space prefix.
+//!
+//! Explicit `tokenizer.ggml.eog_token_ids` replaces heuristic stops, preserving
+//! GGUF encoding and token attributes. The private `tokenizer.bloomery.eog_token_ids`
+//! also selects HF encoding; if both are present their sorted, deduplicated sets
+//! must agree. Explicit lists must be nonempty integer arrays of in-range ids.
+//! Flint uses the pinned mainline ordered split program (including its collapsed
+//! letter categories), not an HF encoding alias; see the pre-tokenizer module.
 
 mod bpe;
 mod collapse_table;
@@ -46,7 +53,7 @@ pub enum Error {
     UnsupportedPre(String),
     #[error("tokenizer.ggml.normalizer {0:?} is not supported for this tokenizer model")]
     UnsupportedNormalizer(String),
-    #[error("tokenizer.bloomery.eog_token_ids {0}")]
+    #[error("{0}")]
     InvalidStops(String),
     #[error("tokenizer.ggml.token_type has {types} entries for {tokens} tokens")]
     TokenTypesShort { types: usize, tokens: usize },
@@ -404,7 +411,8 @@ impl Tokenizer {
         self.vocab.add_eos
     }
 
-    /// End-of-generation ids, ascending.
+    /// End-of-generation ids, ascending and unique. An explicit GGUF stop
+    /// array replaces inferred stops, without changing special-token parsing.
     pub fn eog(&self) -> &[u32] {
         &self.vocab.eog
     }
@@ -471,7 +479,7 @@ mod tests {
     use gguf::Value;
     use gguf::write::{Layout, Writer};
 
-    use super::{Error, Tokenizer, attr};
+    use super::{Error, Tokenizer, attr, byte_to_cpt_table};
 
     /// A gemma4 vocabulary of a few tokens: six CONTROL tokens, one
     /// USER_DEFINED token, the 256 `<0xXX>` byte tokens but `missing_byte`,
@@ -672,6 +680,160 @@ mod tests {
             );
         }
         assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// A byte vocabulary with Flint's stop roles, without a downloaded fixture.
+    fn flint_header() -> Vec<(String, Value)> {
+        let mut texts: Vec<Value> = byte_to_cpt_table()
+            .into_iter()
+            .map(|cp| Value::String(char::from_u32(cp).unwrap().to_string()))
+            .collect();
+        texts.extend(
+            [
+                "<|begin_of_text|>",
+                "<|end_of_text|>",
+                "<|user|>",
+                "<|observation|>",
+                "<|developer|>",
+                "<|channel|>",
+            ]
+            .map(|s| Value::String(s.into())),
+        );
+        let mut types = vec![Value::I32(1); 256];
+        // The two inferred stop roles must retain GGUF's CONTROL overrides.
+        types.extend([3, 3, 1, 1, 3, 3].map(Value::I32));
+        vec![
+            ("tokenizer.ggml.model".into(), Value::String("gpt2".into())),
+            ("tokenizer.ggml.pre".into(), Value::String("flint".into())),
+            ("tokenizer.ggml.tokens".into(), Value::Array(texts)),
+            ("tokenizer.ggml.token_type".into(), Value::Array(types)),
+            ("tokenizer.ggml.merges".into(), Value::Array(vec![])),
+            ("tokenizer.ggml.bos_token_id".into(), Value::U32(256)),
+            ("tokenizer.ggml.eos_token_id".into(), Value::U32(257)),
+            (
+                "tokenizer.ggml.eog_token_ids".into(),
+                Value::Array([260, 259, 257, 258, 260].map(Value::U32).to_vec()),
+            ),
+        ]
+    }
+
+    #[test]
+    fn flint_stops_preserve_gguf_encoding_and_special_parsing() {
+        let mut header = flint_header();
+        let tok = from_header(&header).unwrap();
+        assert_eq!(tok.eog(), &[257, 258, 259, 260]);
+        assert!(!tok.add_bos());
+        assert!(!tok.add_eos());
+        // The byte ids are their byte values: no NFC, prefix space or automatic BOS/EOS.
+        for text in ["", "e\u{301}", "HelloWorld", " 中", "1234567"] {
+            let want: Vec<u32> = text.bytes().map(u32::from).collect();
+            assert_eq!(tok.encode(text, true, true), want, "{text:?}");
+        }
+        for (id, text) in [
+            (257, "<|end_of_text|>"),
+            (258, "<|user|>"),
+            (259, "<|observation|>"),
+            (260, "<|developer|>"),
+        ] {
+            assert_eq!(tok.encode(text, false, true), [id]);
+            assert_eq!(
+                tok.encode(text, false, false),
+                text.bytes().map(u32::from).collect::<Vec<_>>(),
+            );
+            let original = if matches!(id, 258 | 259) {
+                attr::NORMAL
+            } else {
+                0
+            };
+            assert_eq!(tok.attr(id), Some(original | attr::CONTROL));
+            assert!(tok.piece(id, false).is_empty());
+            assert_eq!(tok.piece(id, true), text.as_bytes());
+        }
+        assert_eq!(tok.attr(261), Some(attr::USER_DEFINED));
+        assert_eq!(tok.encode("<|channel|>", false, false), [261]);
+
+        // An explicit list wins over scalar EOS and name-based guesses, not attributes.
+        header.last_mut().unwrap().1 = Value::Array(vec![Value::U32(260)]);
+        let tok = from_header(&header).unwrap();
+        assert_eq!(tok.eog(), &[260]);
+        assert_eq!(tok.specials().eos, Some(257));
+        assert_eq!(tok.encode("<|user|>", false, true), [258]);
+        header.pop();
+        // Without the array, the pinned mainline guesses three, not developer.
+        assert_eq!(from_header(&header).unwrap().eog(), &[257, 258, 259]);
+    }
+
+    #[test]
+    fn explicit_stop_sources_validate_and_agree_as_sets() {
+        let mut header = flint_header();
+        for value in [
+            Value::Array(vec![]),
+            Value::Array(vec![Value::I32(-1)]),
+            Value::Array(vec![Value::U32(262)]),
+            Value::Array(vec![Value::U64(u64::MAX)]),
+            Value::Array(vec![Value::F32(257.0)]),
+            Value::Array(vec![Value::Bool(true)]),
+            Value::Array(vec![Value::String("257".into())]),
+            Value::U32(257),
+        ] {
+            header.last_mut().unwrap().1 = value;
+            let error = from_header(&header).err().expect("invalid GGUF stop list");
+            assert!(error.to_string().contains("tokenizer.ggml.eog_token_ids"));
+        }
+        // All integer widths follow the existing metadata integer contract.
+        for id in [
+            Value::I8(1),
+            Value::U8(1),
+            Value::I16(1),
+            Value::U16(1),
+            Value::I32(1),
+            Value::U32(1),
+            Value::I64(1),
+            Value::U64(1),
+        ] {
+            header.last_mut().unwrap().1 = Value::Array(vec![id.clone(), id]);
+            assert_eq!(from_header(&header).unwrap().eog(), &[1]);
+        }
+
+        header[1].1 = Value::String("qwen35".into());
+        header.last_mut().unwrap().1 =
+            Value::Array(vec![Value::U32(260), Value::U32(257), Value::U32(260)]);
+        header.push((
+            "tokenizer.bloomery.eog_token_ids".into(),
+            Value::Array(vec![Value::I32(257), Value::I32(260)]),
+        ));
+        let tok = from_header(&header).unwrap();
+        assert_eq!(tok.eog(), &[257, 260]);
+        // Equal arrays retain the private key's HF attribute contract.
+        assert_eq!(tok.attr(261), Some(attr::CONTROL));
+        assert_eq!(tok.attr(258), Some(attr::NORMAL));
+        header.last_mut().unwrap().1 = Value::Array(vec![Value::U32(260)]);
+        let error = from_header(&header)
+            .err()
+            .expect("conflicting stop sources");
+        assert!(matches!(error, Error::InvalidStops(_)));
+        let error = error.to_string();
+        assert!(error.contains("tokenizer.ggml.eog_token_ids"));
+        assert!(error.contains("tokenizer.bloomery.eog_token_ids"));
+    }
+
+    #[test]
+    fn flint_replaces_invalid_utf8_without_normalizing_valid_text() {
+        let tok = from_header(&flint_header()).unwrap();
+        for (bytes, text) in [
+            (&b"\xc0\x80"[..], "\u{fffd}\u{fffd}"),
+            (&b"\xf4\x90\x80\x80"[..], "\u{fffd}\u{fffd}\u{fffd}\u{fffd}"),
+            (&b"\xe2\x82"[..], "\u{fffd}\u{fffd}"),
+            ("e\u{301}".as_bytes(), "e\u{301}"),
+        ] {
+            assert_eq!(
+                tok.encode(bytes, false, false),
+                text.bytes().map(u32::from).collect::<Vec<_>>(),
+                "{bytes:?}"
+            );
+        }
+        // The pinned reference preserves surrogate encodings, unlike overlong forms.
+        assert_eq!(tok.encode(b"\xed\xa0\x80", false, false), [237, 160, 128]);
     }
 
     #[test]
@@ -971,7 +1133,11 @@ mod tests {
         ] {
             let mut marked = kvs.clone();
             marked.push(stop.clone());
-            for (kvs, want) in [(kvs, legacy), (&marked, hf)] {
+            let mut ggml = kvs.clone();
+            ggml.push(("tokenizer.ggml.eog_token_ids".into(), stop.1.clone()));
+            let mut both = marked.clone();
+            both.push(("tokenizer.ggml.eog_token_ids".into(), stop.1.clone()));
+            for (kvs, want) in [(kvs, legacy), (&ggml, legacy), (&marked, hf), (&both, hf)] {
                 let tok = from_header(kvs).unwrap();
                 assert_eq!(tok.encode(text, false, false), want, "{text:?}");
             }

@@ -2,8 +2,8 @@
 //! runs them: [`Pre::DeepseekV3`] (`deepseek-v3`, `hunyuan-dense`,
 //! `joyai-llm`), [`Pre::Qwen2`] (`qwen2`, `solar-open`), [`Pre::Glm4`] (`glm4`),
 //! [`Pre::Qwen35`] (`qwen35`), [`Pre::Pixtral`] (`pixtral`),
-//! [`Pre::MiniMaxM2`] (`minimax-m2`), [`Pre::Gemma4`] (`gemma4`) and
-//! [`Pre::Raon`] (`raon`).
+//! [`Pre::MiniMaxM2`] (`minimax-m2`), [`Pre::Gemma4`] (`gemma4`),
+//! [`Pre::Raon`] (`raon`) and [`Pre::Flint`] (`flint`).
 //!
 //! ## deepseek-v3
 //!
@@ -131,6 +131,22 @@
 //! optional space with the newlines and slashes after it; a run of whitespace ending in a
 //! newline; a whitespace run but its last space when a word follows. The reference applies NFC
 //! before this ([`Pre::nfc`]). [`split_raon`] is that function line for line.
+//!
+//! ## flint
+//!
+//! Three ordered passes: `\p{N}{1,3}`, `[一-龥぀-ゟ゠-ヿ]+`, then case/mark
+//! words with optional contractions, punctuation/symbol runs and whitespace.
+//! The first two passes share [`split_ordered`] with deepseek-v3; they isolate
+//! numbers and CJK before the final pass can attach a prefix or contraction.
+//! In mainline a37cc46104eb50900d5ab4a9ba02a0abdac039db, `unicode_regex_split`
+//! maps every letter subcategory (`Lu`, `Ll`, `Lt`, `Lm`, `Lo`) to `L`, even
+//! for ASCII. The two word alternatives therefore reduce to
+//! `[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+` plus an optional ASCII contraction.
+//! [`match_flint`] implements that effective program, not GPT4O's case split.
+//! Official Hugging Face uses true subcategories and Unicode contraction folding:
+//! the pretokenizer boundaries of `HelloWorld` and `x'ſy` differ. Matching final
+//! IDs with the pinned vocabulary does not establish identical split programs.
+//! No normalization or prefix space is added.
 //!
 //! ## gemma4
 //!
@@ -411,6 +427,31 @@ fn match_minimax_m2(c: &[u8], i: usize, hi: usize) -> usize {
     match_space(c, i, hi)
 }
 
+/// Flint's final regex on collapsed text: both case classes are `L|M` in
+/// the reference, so their ordered greedy alternatives consume the same run.
+fn match_flint(c: &[u8], i: usize, hi: usize) -> usize {
+    let x = c[i];
+    let prefix = !is_newline(x) && !is_letter(x) && !is_number(x);
+    let start = i + usize::from(prefix);
+    let n = run(c, start, hi, is_letter_or_mark);
+    let end = if n > 0 {
+        start + n
+    } else {
+        // A mark may be both prefix and word; the optional prefix backs off.
+        i + run(c, i, hi, is_letter_or_mark)
+    };
+    if end > i {
+        return end + contraction(c, end, hi, |k| c[k].to_ascii_lowercase()) - i;
+    }
+    let start = i + usize::from(x == b' ');
+    let n = run(c, start, hi, is_punct_or_symbol);
+    if n > 0 {
+        let end = start + n;
+        return end + run(c, end, hi, is_newline) - i;
+    }
+    match_space(c, i, hi)
+}
+
 /// Re-split every piece of `pieces` (lengths, in codepoints) with a matcher
 /// `m(i, hi)` that returns the match length at `i` inside `[.., hi)`, 0 for
 /// none. Unmatched runs become pieces of their own.
@@ -478,11 +519,13 @@ pub(crate) enum Pre {
     /// `raon`: the reference's hand-written splitter with the CJK run, the letter run joined by
     /// single spaces and the digits in threes from the end; the text is NFC-normalized first.
     Raon,
+    /// `flint`: numbers, CJK, then the reference's collapsed case/mark regex.
+    Flint,
 }
 
 impl Pre {
     /// The names this crate runs, as `tokenizer.ggml.pre` spells them.
-    pub(crate) const NAMES: [(&'static str, Pre); 11] = [
+    pub(crate) const NAMES: [(&'static str, Pre); 12] = [
         ("deepseek-v3", Pre::DeepseekV3),
         ("hunyuan-dense", Pre::DeepseekV3),
         ("joyai-llm", Pre::DeepseekV3),
@@ -494,6 +537,7 @@ impl Pre {
         ("minimax-m2", Pre::MiniMaxM2),
         ("gemma4", Pre::Gemma4),
         ("raon", Pre::Raon),
+        ("flint", Pre::Flint),
     ];
 
     /// Whether a word that is itself a vocabulary token is taken whole,
@@ -508,11 +552,10 @@ impl Pre {
         matches!(self, Pre::Raon)
     }
 
-    /// Whether the text is decoded by the newer reference's strict UTF-8 reader before its NFC step
-    /// (`unicode::decode_strict`): an overlong form is not a codepoint there. The older readers' tree
-    /// accepts it.
+    /// Whether the reference decodes UTF-8 strictly, independently of NFC.
+    /// An overlong form is not a codepoint there; older readers accept it.
     pub(crate) fn strict_utf8(self) -> bool {
-        matches!(self, Pre::Raon)
+        matches!(self, Pre::Raon | Pre::Flint)
     }
 
     /// Whether BPE runs as Hugging Face's does ([`crate::bpe::Bpe::new`]).
@@ -531,7 +574,8 @@ impl Pre {
             | Pre::Qwen35Hf
             | Pre::Pixtral
             | Pre::MiniMaxM2
-            | Pre::Raon => Spelling::ByteLevel,
+            | Pre::Raon
+            | Pre::Flint => Spelling::ByteLevel,
         }
     }
 }
@@ -543,7 +587,8 @@ pub(crate) fn split<'s>(pre: Pre, cpts: &[u32], s: &'s mut Scratch) -> &'s [usiz
     let class = if pre.hf() { collapse_hf } else { collapse };
     s.collapsed.extend(cpts.iter().map(|&cp| class(cp)));
     match pre {
-        Pre::DeepseekV3 => split_deepseek_v3(cpts, s),
+        Pre::DeepseekV3 => split_ordered(cpts, s, match_word),
+        Pre::Flint => split_ordered(cpts, s, match_flint),
         Pre::Qwen2 => {
             split_custom(cpts, &s.collapsed, 1, &mut s.b);
             &s.b
@@ -693,8 +738,13 @@ fn split_qwen35<'s>(cpts: &[u32], s: &'s mut Scratch, hf: bool) -> &'s [usize] {
     &s.b
 }
 
-/// [`split`] for [`Pre::DeepseekV3`]: the three regexes in turn.
-fn split_deepseek_v3<'s>(cpts: &[u32], s: &'s mut Scratch) -> &'s [usize] {
+/// Numbers, then CJK, then the vocabulary's final word regex, each pass
+/// re-splitting only the pieces the previous pass left.
+fn split_ordered<'s>(
+    cpts: &[u32],
+    s: &'s mut Scratch,
+    word: impl Fn(&[u8], usize, usize) -> usize,
+) -> &'s [usize] {
     let c = &s.collapsed;
 
     s.a.clear();
@@ -705,7 +755,7 @@ fn split_deepseek_v3<'s>(cpts: &[u32], s: &'s mut Scratch) -> &'s [usize] {
     resplit(&s.b, &mut s.a, |i, hi| {
         cpts[i..hi].iter().take_while(|&&cp| is_cjk(cp)).count()
     });
-    resplit(&s.a, &mut s.b, |i, hi| match_word(c, i, hi));
+    resplit(&s.a, &mut s.b, |i, hi| word(c, i, hi));
     &s.b
 }
 
@@ -858,6 +908,49 @@ mod tests {
                 w
             })
             .collect()
+    }
+
+    /// Hand-derived pieces of the ordered program, including piece-local
+    /// whitespace/contractions and the reference's loss of case distinctions.
+    #[test]
+    fn flint_ordered_splits() {
+        let cases: &[(&str, &[&str])] = &[
+            ("1234567", &["123", "456", "7"]),
+            ("abc1234def", &["abc", "123", "4", "def"]),
+            ("x²³ ١٢٣٤", &["x", "²³", " ", "١٢٣", "٤"]),
+            (" 12345 ", &[" ", "123", "45", " "]),
+            ("a中b", &["a", "中", "b"]),
+            (" 日本語テストabc", &[" ", "日本語テスト", "abc"]),
+            ("a \t中b", &["a", " \t", "中", "b"]),
+            ("中'RE", &["中", "'RE"]),
+            ("中\u{301}A", &["中", "\u{301}A"]),
+            // These are the literal CJK ranges, not every Han character.
+            ("\u{4e00}A\u{9fa5}B", &["\u{4e00}", "A", "\u{9fa5}", "B"]),
+            ("\u{9fa6}A", &["\u{9fa6}A"]),
+            ("\u{3040}A\u{30ff}B", &["\u{3040}", "A", "\u{30ff}", "B"]),
+            ("HelloWorld", &["HelloWorld"]),
+            ("iPhone ÜBERüber", &["iPhone", " ÜBERüber"]),
+            ("A\u{301}B", &["A\u{301}B"]),
+            (".\u{301}a", &[".\u{301}a"]),
+            ("\u{301}.", &["\u{301}", "."]),
+            ("it'sa WE'RE", &["it's", "a", " WE'RE"]),
+            ("can't've", &["can't", "'ve"]),
+            ("x'ſy", &["x", "'ſy"]),
+            ("rock'n'roll", &["rock", "'n", "'roll"]),
+            ("x/\n/y", &["x", "/\n", "/y"]),
+            ("x = y;", &["x", " =", " y", ";"]),
+            ("a  b", &["a", " ", " b"]),
+            ("a \r\n b", &["a", " \r\n", " b"]),
+            ("a\u{a0}\u{a0}b", &["a", "\u{a0}", "\u{a0}b"]),
+            ("end \t", &["end", " \t"]),
+            (" \n\t", &[" \n", "\t"]),
+            // Unmatched runs are retained, not treated as punctuation.
+            ("\0\0.", &["\0\0", "."]),
+            ("", &[]),
+        ];
+        for &(text, want) in cases {
+            assert_eq!(words(Pre::Flint, text), want, "{text:?}");
+        }
     }
 
     /// The qwen2 splitter's alternatives, one case each, as its reference
