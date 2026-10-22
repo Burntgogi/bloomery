@@ -106,6 +106,7 @@ The router replay self-tests (`tools/ref/window-union.py` and `tools/ref/router-
 layer ranges may not overlap, and a spread total must fit its eligible layers. Repeated single-value
 options and repeated `--k` entries are refused rather than silently replacing a placement or report row.
 Both command lines name a refused `--n-l`; `bursts` reports it without a Python traceback.
+For `bursts`, omitting `--n-l` keeps the host-only replay; explicitly passing an empty value is refused.
 
 Exceptions:
 

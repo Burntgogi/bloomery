@@ -464,6 +464,7 @@ def self_test():
             ("window-union.py", [cli, "--n-l", "0:0", "--k", "2,2"], "--k"),
             ("router-coverage.py", ["bursts", cli, "--window", "4", "--n-l", "0:17"], "--n-l"),
             ("router-coverage.py", ["bursts", cli, "--window", "4", "--n-l", "5:1"], "--n-l"),
+            ("router-coverage.py", ["bursts", cli, "--window", "4", "--n-l", ""], "--n-l"),
             ("router-coverage.py", ["bursts", cli, "--window", "4", "--n-l", "0:1", "--n-l", "0:5"], "--n-l"),
         ]
         for tool, args, flag in cases:

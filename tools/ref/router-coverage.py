@@ -463,12 +463,12 @@ def burst_stats(s, card, window, keep=None):
 
 
 def bursts(set_dirs, window, spec=None, keep=None):
-    wu = window_union() if spec else None
+    wu = window_union() if spec is not None else None
     for d in set_dirs:
         s = read_manifest(d)
         if keep is not None and not set(keep) <= set(s["layers"]):
             raise SetError(f"{d}: --layers {sorted(set(keep) - set(s['layers']))} not in the set")
-        if spec:
+        if spec is not None:
             try:
                 n_l = wu.parse_n_l(spec, s["layers"], s["n_expert"])
             except wu.rc.SetError as e:
