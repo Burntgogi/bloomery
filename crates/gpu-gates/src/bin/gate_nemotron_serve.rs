@@ -31,7 +31,8 @@
 //! One server as a user starts it, `--port 0` and no other flag:
 //!
 //! - `load_and_listen`: it listens; the `load` record comes before the `listening` record; the load
-//!   names the file's `arch` word, `slots=1` and the file's layer count (the body's hparams), and
+//!   names the file's `arch` word, `slots=1` and the layers the load runs (Bolt's trunk: `block_count`
+//!   less the next-token block the file carries and does not load; Nano's `n_layer`), and
 //!   its `ctx` and the `listening` record's are the `ctx` line's: the context the plan chose is the
 //!   context the load made. FAIL-first: a seat whose load takes a context other than the plan's (a
 //!   fixed one, or the slot context halved) is red.
@@ -40,7 +41,11 @@
 //!   each from an empty cache (`cache_prompt: false`), answers the ids the file's body gives
 //!   directly on the same split the server feeds the seat — a several-id head through the body's
 //!   batched prompt call and the last id as a step — then each answer fed back, or a prefix of them ending at an end-of-generation id.
-//!   FAIL-first: a prefill that skips the first id moves the ids and the clause is red.
+//!   A `nemotron_h_moe` file whose whole-card plan fails at the seat's least context opens placed,
+//!   as the seat does, and the session opens that same way at [`SESSION_CTX`].
+//!   FAIL-first: a prefill that skips the first id moves the ids and the clause is red. A session
+//!   that opens a placed file whole asks for IQ2_XXS stacks the file does not hold, and the clause
+//!   is red.
 //! - `chat_is_200`: `/v1/chat/completions` of the same turn at temperature 0 and `max_tokens`
 //!   [`N`] is a 200 whose `usage` counts the prompt's ids and the completion's tokens, and whose
 //!   message text is inside the text of the chat run's ids.
@@ -70,16 +75,19 @@ mod gate {
     use bloomery_gpu::model::ChainBody;
     use bloomery_gpu::{Gpu, GpuError, GpuModel, NemotronHModel, NemotronHMoeModel};
     use bloomery_gpu_gates::ctx_ladder::{ctx_line, default_line_held, field, rung_above};
+    use bloomery_gpu_gates::generate::{Place, SEAT_STEPS};
     use bloomery_gpu_gates::record;
     use bloomery_gpu_gates::serve_client::{
         Answer, SeatGate, Served, agree, chat_is_those_ids, check, greedy, rendered, server_log,
         tokenized,
     };
-    use bloomery_gpu_gates::{GateError, checks_failed, generate, ref_model_path};
+    use bloomery_gpu_gates::{GateError, checks_failed, generate, gpu_census, ref_model_path};
     use gguf::Split;
     use model::arch::Arch;
     use model::arch::nemotron_h::hparams::Hparams as NanoHparams;
     use model::arch::nemotron_h_moe::hparams::Hparams as BoltHparams;
+    use model::arch::nemotron_h_moe::place::{self as moe_place, Experts};
+    use model::placement::PlanLevers;
     use serde_json::json;
 
     const USAGE: &str = "usage: gate_nemotron_serve --dir <dir>";
@@ -111,6 +119,17 @@ mod gate {
         model: "nemotron",
         kinds: record::BLOOMERY_SERVE_NEMOTRON,
     };
+
+    /// The levers the nemotron seat acts on (`serve_seats/nemotron.rs`
+    /// `ACTS_ON`). The session's plan reads the same list.
+    const SEAT_ACTS: &[&str] = &[
+        bloomery_levers::CARD_BUDGET,
+        bloomery_levers::SCREEN,
+        bloomery_levers::SCHEMAJUMP,
+        bloomery_levers::HOST_POPULATE,
+        bloomery_levers::HOST_LOCK,
+        bloomery_levers::CARD_DONTNEED,
+    ];
 
     /// The file's trained context.
     fn trained_ctx(file: &Path) -> Result<u64, GateError> {
@@ -285,16 +304,68 @@ mod gate {
     ) -> Result<(Vec<Vec<u32>>, Vec<u32>), GateError> {
         let split = Split::open(file).map_err(|e| format!("open {}: {e}", file.display()))?;
         let mut m = open(Gpu::new()?, split, SESSION_CTX)?;
+        answers(&mut m, prompts, prose, feed_head)
+    }
+
+    /// The ids `m` gives, from an empty cache each time: each prompt, then the
+    /// extension's held split (the prose prompt and its answer, the answer's
+    /// last id, [`N`] more).
+    fn answers<B: ChainBody>(
+        m: &mut GpuModel<B>,
+        prompts: &[&[u32]],
+        prose: &[u32],
+        feed_head: fn(&mut GpuModel<B>, &[u32]) -> Result<(), GpuError>,
+    ) -> Result<(Vec<Vec<u32>>, Vec<u32>), GateError> {
         let mut out = Vec::new();
         for ids in prompts {
             m.reset()?;
-            out.push(seat_answer(&mut m, ids, feed_head)?);
+            out.push(seat_answer(m, ids, feed_head)?);
         }
         m.reset()?;
-        let held = seat_answer(&mut m, prose, feed_head)?;
+        let held = seat_answer(m, prose, feed_head)?;
         let last = *held.last().ok_or("an empty held answer")?;
         let first = m.step(&[last])?;
-        Ok((out, continue_from(&mut m, first, N)?))
+        Ok((out, continue_from(m, first, N)?))
+    }
+
+    /// The Bolt session. A file the whole-card plan holds opens whole, as
+    /// before. A file that plan refuses at the seat's least context opens
+    /// placed: the seat's rule (`serve_seats/nemotron.rs`), and the open the
+    /// server just ran. The placed plan is made again at [`SESSION_CTX`].
+    /// FAIL-first: the whole-card open of a file whose routed stacks are not
+    /// IQ2_XXS, which names the stack and stops before any id.
+    fn bolt_session(
+        file: &Path,
+        prompts: &[&[u32]],
+        prose: &[u32],
+    ) -> Result<(Vec<Vec<u32>>, Vec<u32>), GateError> {
+        let split = Split::open(file).map_err(|e| format!("open {}: {e}", file.display()))?;
+        let inputs = moe_place::read(&split).map_err(|e| format!("{}: {e}", file.display()))?;
+        let levers = bloomery_levers::at_main(SEAT_ACTS)?;
+        let plan_levers = PlanLevers::from_levers(&levers)?;
+        let census = gpu_census::census()?;
+        let place = Place::choose_untiered(None, &census, "nemotron")?.place;
+        let n_layers = inputs.model.layers;
+        let whole = (place.machine_untiered()?)(n_layers);
+        if let Err(e) = inputs.plan(&whole, SEAT_STEPS.floor, &plan_levers) {
+            println!(
+                "session: the whole plan at {} positions refuses ({e}); placed at {SESSION_CTX}",
+                SEAT_STEPS.floor
+            );
+        } else {
+            drop(split);
+            println!("session: whole at {SESSION_CTX} positions");
+            return session_ids(file, prompts, prose, NemotronHMoeModel::open, bolt_head);
+        }
+        let machine = (place.machine_placed()?)(n_layers);
+        let plan = inputs.plan_with(
+            &machine,
+            u64::try_from(SESSION_CTX)?,
+            &plan_levers,
+            Experts::Placed,
+        )?;
+        let mut m = NemotronHMoeModel::open_placed(split, &plan, 0, levers.host())?;
+        answers(&mut m, prompts, prose, bolt_head)
     }
 
     /// The file's body, read once from its `general.architecture` at `run` — the gate's one
@@ -305,8 +376,9 @@ mod gate {
         /// `nemotron_h`, a Nemotron 3 Nano file: the seat's prefill one `GpuModel::step` over the
         /// ids.
         Nano,
-        /// `nemotron_h_moe`, a Nemotron 3.5 Bolt file: the seat's prefill the body's batched
-        /// `GpuModel::prefill`.
+        /// `nemotron_h_moe`. A file the whole-card plan holds opens whole; a
+        /// file that plan refuses opens placed, the seat's rule. The seat's
+        /// prefill is the body's batched `GpuModel::prefill`.
         Bolt,
     }
 
@@ -337,12 +409,15 @@ mod gate {
             }
         }
 
-        /// The file's layer count, the body's own hparams.
+        /// The layers the load runs. Bolt's `n_layer` counts the next-token
+        /// block the file carries and does not load; the load record is the
+        /// trunk. Nano has no such block.
+        /// FAIL-first: a Bolt load whose record counts `block_count`.
         fn layers(&self, file: &Path, split: &Split) -> Result<u64, GateError> {
             let in_file = |e| format!("{}: {e}", file.display());
             let n = match self {
                 Body::Nano => NanoHparams::read(split).map_err(in_file)?.n_layer,
-                Body::Bolt => BoltHparams::read(split).map_err(in_file)?.n_layer,
+                Body::Bolt => BoltHparams::read(split).map_err(in_file)?.n_trunk,
             };
             Ok(u64::try_from(n)?)
         }
@@ -357,7 +432,7 @@ mod gate {
         ) -> Result<(Vec<Vec<u32>>, Vec<u32>), GateError> {
             match self {
                 Body::Nano => session_ids(file, prompts, prose, NemotronHModel::open, nano_head),
-                Body::Bolt => session_ids(file, prompts, prose, NemotronHMoeModel::open, bolt_head),
+                Body::Bolt => bolt_session(file, prompts, prose),
             }
         }
     }
