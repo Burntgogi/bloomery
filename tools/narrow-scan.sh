@@ -69,9 +69,10 @@
 # auxiliary-dir rule (bloomery-<track>-<suffix>): once the track's worktree is gone, `just box-tracks --remove
 # <track>-narrow-base <track>-narrow-head` clears them (the main tree's: `narrow-base narrow-head`).
 #
-# A side whose box command ends rc 255 (ssh lost the box) runs once more: its recorded remote runner is ended first (the
-# stop's control call below), then the side runs again in the same remote dir. One line says so, the MANIFEST carries
-# `retried=<sides>` and the done line `(retried: <sides>)`; a second 255 ends the run rc 255. No other code is retried.
+# A side whose box command ends rc 255 (ssh lost the box) runs once more only after its stop control call succeeds.
+# A failed control call ends the run with its status (70 at the 30 s control bound), without reusing the remote dir.
+# After a successful stop the side retries in that same dir; the MANIFEST carries `retried=<sides>` and the done line
+# `(retried: <sides>)`. A second side-command 255 ends the run rc 255. No other side-command code is retried.
 #
 # Stopping (INT/TERM): the side in flight ends from both ends, by recorded pids, never by a name match. Each attempt
 # gets a unique .narrow-scan-<side>-<pid>.<nonce>.pid under the box's ~/.cache/bloomery/narrow-scan, outside the synced
@@ -102,7 +103,7 @@
 #
 # NARROW_BOUND (default 7200 s, a hang guard: no box-job length needs approval) bounds the whole run: each side's box command runs under `timeout` with what
 # is left. A cut build keeps its compiled crates, so running again continues it. Exit codes: 0 done; 64 usage; 75
-# contention (the box guard, or the lock); 70 the box's toolchain; 1 a build or scan failed; 2 a scan set could not be derived or
+# contention (the box guard, or the lock); 70 the box's toolchain or stop control; 1 a build or scan failed; 2 a scan set could not be derived or
 # the sides' sets name different bins; 124 the bound; 130 INT and 143 TERM; the `affected` run's own code otherwise.
 set -uo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -511,7 +512,9 @@ remote_stop() {
   if kill -0 "$bp" 2> /dev/null; then
     kill -TERM "$bp" 2> /dev/null || true
     echo "narrow-scan: the stop's control call did not return in 30 s: the runner may still be running on the box ($1; control $2; 'just box-gc --dry-run' lists orphans)" >&2
+    return 70
   fi
+  wait "$bp"
 }
 
 # stop_run <rc>: INT or TERM. The side in flight (ACTIVE_*, set by run_side) is ended from both ends, then the EXIT trap releases the lock.
@@ -618,6 +621,7 @@ self_test() {
   [ "$(grep -c -- '--no-jit' "$t/runner.sh")" = 3 ]; ok "runner: one --no-jit scan per bin" $?
   sed -n "/^cat > \"\$P\" <<'NARROW_PTX_SCAN_EOF'$/,/^NARROW_PTX_SCAN_EOF$/p" "$t/runner.sh" | sed '1d;$d' | cmp -s - "$t/ptx-scan.sh"; ok "runner: ptx-scan.sh embedded verbatim" $?
   [ "$(grep -c '^echo "narrow-scan: wall: ' "$t/runner.sh")" = 6 ]; ok "runner: a wall line per build group, the extractor and each scan" $?
+  # PIN(2026-10-22): Replace source-text and stop-log assertions with process cancellation and FIFO lock tests.
   # The remote commands run real processes; a sync between stop and launch must not erase the stop.
   # shellcheck source=tools/ref/cancel-stubs.sh
   source "$ROOT/tools/ref/cancel-stubs.sh"
@@ -632,7 +636,8 @@ self_test() {
     printf 'exec %q "$@"\n' "$(type -P cat)"
   } > "$t/remote-bin/cat"
   chmod +x "$t/remote-bin/cat"
-  printf '%s\n' '#!/usr/bin/env bash' '[ "${1:-}" != -n ] || shift' 'shift' 'cd "$HOME" || exit 70' 'exec bash -c "$*"' > "$t/remote-bin/ssh"
+  printf '%s\n' '#!/usr/bin/env bash' '[ -z "${STUB_STOP_RC:-}" ] || exit "$STUB_STOP_RC"' \
+    '[ "${1:-}" != -n ] || shift' 'shift' 'cd "$HOME" || exit 70' 'exec bash -c "$*"' > "$t/remote-bin/ssh"
   chmod +x "$t/remote-bin/ssh"
   export PATH=$remote_path
   remote_call() (
@@ -974,6 +979,7 @@ case $BLOOMERY_REMOTE in rb | *narrow-base) side=base ;; esac
 if [ "${STUB_FAIL_SIDE:-}" = "$side" ] && { [ -n "${STUB_FAIL_ALWAYS:-}" ] || [ ! -e "$STUB_LOG.failed-$side" ]; }; then
   : > "$STUB_LOG.failed-$side"
   echo "$side $BLOOMERY_REMOTE failed rc=$STUB_FAIL_RC" >> "$STUB_LOG"
+  [ -z "${STUB_DELAYED:-}" ] || printf '%s\n' "$*" > "$STUB_LOG.delayed-command"
   cat > /dev/null
   exit "$STUB_FAIL_RC"
 fi
@@ -991,6 +997,21 @@ if [ -n "${STUB_BLOCK:-}" ]; then
   mkdir -p "$STUB_REMOTE/$(basename "$BLOOMERY_REMOTE")" && cd "$STUB_REMOTE/$(basename "$BLOOMERY_REMOTE")" || exit 70
   echo "$side $BLOOMERY_REMOTE blocked" >> "$STUB_LOG"
   printf 'exec sleep 60\n' | PATH="$STUB_BIN:$PATH" bash -c "$*"
+  exit $?
+fi
+# Execute the real remote supervisor on retry; the first command is released by the test only after this one finishes.
+if [ "$side" = head ] && [ -n "${STUB_DELAYED:-}" ]; then
+  for f in "$HOME"/.cache/bloomery/narrow-scan/.narrow-scan-*.stop; do
+    [ ! -e "$f" ] || basename "$f" .stop >> "$STUB_LOG.cancelled-id"
+  done
+  cat > /dev/null
+  bash -c "$*" <<'NARROW_RETRY_EOF'
+for f in "$HOME"/.cache/bloomery/narrow-scan/.narrow-scan-*.pid; do
+  [ ! -f "$f" ] || basename "$f" >> "$STUB_LOG.retry-id"
+done
+printf retry > "$STUB_LOG.retry-ran"
+printf '%s\n' '=== narrow-scan begin gate_x' 'ptx-scan: mod0 bundle=b bytes=1' '=== narrow-scan end gate_x rc=0'
+NARROW_RETRY_EOF
   exit $?
 fi
 rf=$(mktemp)
@@ -1072,6 +1093,24 @@ NARROW_STUB_EOF
   # ssh rc 255 on a side: the side runs once more (its recorded remote runner is ended first, by the control call); a second
   # 255 or any other code is not retried.
   mkdir -p "$t/remote/rh"
+  STUB_DELAYED=1 STUB_FAIL_SIDE=head STUB_FAIL_RC=255 wt_run "$t/delayed.log" "$wb" --worktree --out "$t/delayed-out"
+  [ "$rc" = 0 ] && [ "$(cat "$t/delayed.log.retry-ran" 2> /dev/null)" = retry ]
+  ok "retry: the real remote supervisor runs the replacement attempt" $?
+  local cancelled_id retry_id
+  cancelled_id=$(cat "$t/delayed.log.cancelled-id" 2> /dev/null)
+  retry_id=$(cat "$t/delayed.log.retry-id" 2> /dev/null)
+  [ -n "$cancelled_id" ] && [ -n "$retry_id" ] && [ "$cancelled_id" != "$retry_id" ]
+  ok "retry: actual attempts publish distinct cancellation identities" $?
+  rc=0
+  printf 'printf late > "%s"\n' "$t/delayed-ran" |
+    HOME="$t/home" bash -c "$(cat "$t/delayed.log.delayed-command")" > "$t/delayed-release.log" 2>&1 || rc=$?
+  [ "$rc" = 143 ] && [ ! -e "$t/delayed-ran" ]
+  ok "retry: the delayed cancelled attempt cannot start after its replacement finishes" $?
+  for want in 70 255; do
+    STUB_STOP_RC=$want STUB_FAIL_SIDE=head STUB_FAIL_RC=255 wt_run "$t/stop-$want.log" "$wb" --worktree --out "$t/stop-$want-out"
+    [ "$rc" = "$want" ] && [ "$(grep -c '^head rh ' "$t/stop-$want.log")" = 1 ] && [ ! -e "$t/stop-$want-out/MANIFEST" ]
+    ok "retry: control failure $want ends the CLI without starting another attempt" $?
+  done
   STUB_REMOTE=$t/remote STUB_FAIL_SIDE=head STUB_FAIL_RC=255 wt_run "$t/r255.log" "$wb" --worktree --out "$t/r255-out"
   [ "$rc" = 0 ] && grep -qx 'retried=head' "$t/r255-out/MANIFEST"
   ok "retry: a dropped side succeeds on retry and the MANIFEST records it" $?
@@ -1450,7 +1489,7 @@ for side in base head; do
     # ssh lost the box: the remote runner it started may still run, so it is ended by its recorded pid first; then the side runs
     # once more, in the same remote dir (its compiled crates kept). Once only: a second 255 ends the run.
     echo "narrow-scan: $side: ssh lost the box (rc 255); ending its recorded remote runner and running the side once more" >&2
-    remote_stop "$dir" "$ACTIVE_RPIDF"
+    remote_stop "$dir" "$ACTIVE_RPIDF" || exit $?
     RETRIED=${RETRIED:+$RETRIED,}$side
     left=$((BOUND - (SECONDS - T0)))
     [ "$left" -ge 60 ] || die 124 "the bound of ${BOUND}s is spent before the $side side's retry: run again, the dirs keep their compiled crates"
