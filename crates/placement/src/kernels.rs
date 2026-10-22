@@ -483,7 +483,7 @@ mod tests {
     }
 
     /// The GEMM entries that read 32-value blocks are the `Gemm32Weight`
-    /// ones (the file's Q8_0, Q5_1 and IQ4_NL blocks, NVFP4's planes); the
+    /// ones (the file's Q8_0, Q5_0, Q5_1 and IQ4_NL blocks, NVFP4's planes); the
     /// grouped GEMM's read q8_1 blocks of 128. A type's GEMM form is one fact:
     /// the table's `gemm` row read through this.
     #[test]
@@ -496,6 +496,7 @@ mod tests {
         assert_eq!(
             blocks32,
             [
+                GgmlType::Q5_0,
                 GgmlType::Q5_1,
                 GgmlType::Q8_0,
                 GgmlType::NVFP4,
