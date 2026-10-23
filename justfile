@@ -2072,17 +2072,17 @@ gate-gpu-head:
 gate-gpu-mcol:
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-mcol && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_mcol && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_mcol'
 
-# bloomery-gpu's lib tests through tools/gate.sh --oxide (its bound, cargo's exit code), with no gate lock, so the
-# batch keeps them on the 3090 (lane A). The hw_ tests (graph.rs' capture, replay, host flags and node kinds;
-# checkpoint.rs; host/step.rs' boundary) run small kernels on device 0. A test that holds a stream shut (checkpoint.rs'
-# Hold) or parks one on a wait it opens only after a driver call of its own (host/tier.rs' parking_work) is named
+# bloomery-gpu's lib tests compile without a lock, then tools/gate.sh --gpu runs the compiled
+# test executable under tools/gpu-gate.sh's shared card lock and runtime bound. The hw_ tests
+# (graph.rs' capture, replay, host flags and node kinds; checkpoint.rs; host/step.rs' boundary) use device 0.
+# A test that holds a stream shut (checkpoint.rs' Hold) or parks one on a wait it opens only after a driver call (host/tier.rs' parking_work) is named
 # hw_held_ and runs in a second pass, one at a time: a device-wide sync in a parallel test (any cuMemFree) takes the
 # driver's lock while it waits for that stream, and the call that would open it queues behind it. hold::require_serial_pass
 # refuses by name anywhere else. Then the lib tests of bloomery-verbs, the RDMA link's verbs, which open no NIC. just gate
 # runs it.
 [group('canary')]
 gate-gpu-lib:
-    ./tools/box.sh 'bash tools/gate.sh --oxide -p bloomery-gpu --release --lib -- --include-ignored --skip hw_held_ && RUST_TEST_THREADS=1 bash tools/gate.sh --oxide -p bloomery-gpu --release --lib -- --include-ignored hw_held_ && bash tools/gate.sh --release -p bloomery-verbs --lib'
+    ./tools/box.sh 'bash tools/gate.sh --gpu --oxide -p bloomery-gpu --release --lib -- --include-ignored --skip hw_held_ && RUST_TEST_THREADS=1 bash tools/gate.sh --gpu --oxide -p bloomery-gpu --release --lib -- --include-ignored hw_held_ && bash tools/gate.sh --release -p bloomery-verbs --lib'
 
 # bloomery-gpu-gates 라이브러리의 단위 시험(호스트 전용, 카드·게이트 락 없음). ptx.rs의 컨테이너 판독 계약 —
 # 8의 배수 길이 페이로드의 마지막 본문, 번들 경계, 파서가 거부한 섹션은 빈 표가 아니라 오류 — 이 여기서 돈다.

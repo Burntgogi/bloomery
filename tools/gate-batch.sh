@@ -968,6 +968,7 @@ RT
   # The GPU hold's box-side writer is the real tools/gpu-gate.sh (with the real lease-probe.sh it sources): the fake box below runs
   # its --gpuhold calls on the fixture, so the batch's hold is the real one end to end.
   cp "$(dirname "$self")/gpu-gate.sh" "$t/tools/gpu-gate.sh"
+  cp "$(dirname "$self")/gate.sh" "$t/tools/gate.sh"
   mkdir -p "$t/tools/nightly"
   cp "$(dirname "$self")/nightly/units.sh" "$t/tools/nightly/units.sh"
   cp "$(dirname "$self")/ref/lease-probe.sh" "$t/tools/ref/lease-probe.sh"
@@ -1445,6 +1446,36 @@ FP
   # has run — on today's runner, 20 s and then in lane A. Lane B, idle, steals it onto the A6000;
   # the times row and the ledger key name that card.
   local slow_a='steal-slow@FAKE_SLEEP=20,FAKE_UNTIL=gen_b'
+  if gb_part 16; then
+  cp "$t/justfile" "$t/justfile.gpu"
+  cp "$t/tools/gate-batch-resources.tsv" "$t/resources.gpu"
+  cat >> "$t/justfile" <<'JF'
+
+lib-fixed:
+    ./tools/box.sh 'bash tools/gate.sh --gpu --oxide -p x --lib'
+
+lib-any:
+    ./tools/box.sh 'BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gate.sh --gpu --oxide -p x --lib'
+
+lib-script:
+    bash tools/lib-call.sh
+
+[group('solo-real')]
+lib-a6000:
+    BLOOMERY_CARD=a6000 ./tools/box.sh 'bash tools/gate.sh --gpu --oxide -p x --lib'
+JF
+  printf '%s\n' 'BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gate.sh --gpu --oxide -p x --lib' > "$t/tools/lib-call.sh"
+  printf 'lib-a6000\t-\t1000\n' >> "$t/tools/gate-batch-resources.tsv"
+  check 'a plain host gate stays card-free beside the opt-in GPU mode' 0 '^host[[:space:]]F[[:space:]]balanced[[:space:]]-' "${gb[@]}" --classes
+  check 'a locked lib with no card override is fixed to the 3090' 0 '^lib-fixed[[:space:]]A[[:space:]]fixed[[:space:]]3090' "${gb[@]}" --classes
+  check 'a locked lib with any has both card candidates' 0 '^lib-any[[:space:]]F[[:space:]]balanced[[:space:]]3090,a6000' "${gb[@]}" --classes
+  check 'a transitive locked lib retains its any card candidates' 0 '^lib-script[[:space:]]F[[:space:]]balanced[[:space:]]3090,a6000' "${gb[@]}" --classes
+  check 'a locked lib accepts the solo-real A6000 box pick' 0 '^lib-a6000[[:space:]]B[[:space:]]fixed[[:space:]]-' "${gb[@]}" --tier fixture --classes
+  printf '%s\n' '' "[group('host')]" 'lib-host:' "    ./tools/box.sh 'bash tools/gate.sh --gpu --oxide -p hd --lib'" >> "$t/justfile"
+  check 'a locked lib cannot run in the card-free host class' 65 'lib-host' "${gb[@]}" --classes
+  cp "$t/justfile.gpu" "$t/justfile"
+  cp "$t/resources.gpu" "$t/tools/gate-batch-resources.tsv"
+  fi
   if gb_part 1; then
   rc=$(steal_case steal-a "$slow_a	A	3090	30	$d" "host	B	none	70	$d" "steal-bal	A	3090	60	$d" \
     "plain-any	B	a6000	10	$d" -- "$slow_a" host steal-bal plain-any)
@@ -4225,6 +4256,8 @@ def closure(name, seen):
 
 
 GPU_GATE = "tools/gpu-gate.sh"
+GATE_ENTRY = r"(?:gpu-gate\.sh\b|gate\.sh\s+--gpu\b)"
+GATE_REF = re.compile(r"tools/" + GATE_ENTRY)
 ANY = "BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any}"
 # The names the structural rule (walk() and takes_lease below) cannot see: timing-card.sh, a library a
 # timing runner sources, which takes no lease itself; gpu-ab.py, a Python runner walk() does not read;
@@ -4300,16 +4333,16 @@ def takes_lease(path):
 # call's card form: `BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any}` (balanced), none (the 3090), or
 # any other BLOOMERY_GATE_CARD on the call (a form this runner does not read: refused). A mention in
 # a message (echo, printf, die, fail, say) is not a script the file runs.
-# tools/gpu-gate.sh itself is the runner a call reaches, and its text is not followed; nor is this file's
-# (check-recipes runs its --classes): its patterns and messages name the runner in strings the call pattern
-# would read as calls. A stub-test
+# Both gate runners are leaves: the call's mode owns whether gate.sh reaches the GPU runner.
+# Following gate.sh's conditional body would falsely give its CPU callers a GPU lock. This file's
+# patterns and messages are not followed either (check-recipes runs its --classes). A stub-test
 # harness (a directory named *-tests, tools/ref/card-tests) is named in the reason and not read: it
 # runs the lease and runner code against a lock of its own, and its fixtures hold both on purpose.
 WALK_DEPTH = 6
 BARE = re.compile(r"([A-Za-z0-9_.-][A-Za-z0-9_./-]*\.(?:sh|bash))\b")
-GATE_CALL = re.compile(CMD + r"(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*(?:bash\s+|exec\s+)?[^\s;&|#'\"]*gpu-gate\.sh\b", re.M)
+GATE_CALL = re.compile(CMD + r"(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*(?:bash\s+|exec\s+)?[^\s;&|#'\"]*" + GATE_ENTRY, re.M)
 BATCH = "tools/gate-batch.sh"
-RUNNER_SELF = {GPU_GATE, BATCH}
+RUNNER_SELF = {GPU_GATE, "tools/gate.sh", BATCH}
 MESSAGE = re.compile(r"^[\s{(!]*(?:echo|printf|die|fail|say)\b")
 
 
@@ -4423,7 +4456,7 @@ def classify(name):
             continue
         oxide = "cargo oxide" in text
         for seg in SEGMENT.split(text):
-            if GPU_GATE in seg:
+            if GATE_REF.search(seg):
                 if ANY in seg:
                     lanes_seen.add("B")
                     forms.add("any")
@@ -4737,7 +4770,7 @@ for n in sorted(recipes):
         continue
     text = "\n".join(body(m) for m in closure(n, set()))
     why = [f"[group('{g}')]" for g in ("solo", "solo-real", "v41-load") if group_of(n, g)]
-    why += [w for w, hit in (("a tools/gpu-gate.sh call", GPU_GATE in text), ("a box.sh card pick", BOX_CARD.search(text))) if hit]
+    why += [w for w, hit in (("a tools/gpu-gate.sh call", GATE_REF.search(text)), ("a box.sh card pick", BOX_CARD.search(text))) if hit]
     if why:
         host_bad.append(f"recipe {n}: [group('host')] with {' and '.join(why)} — a host recipe opens no card and runs beside other items")
 if host_bad:
@@ -4877,7 +4910,7 @@ for n in sorted(recipes):
         if lane in ("T", "R"):
             why.append(reason)
         elif pick:
-            if GPU_GATE not in text or "3090" in GATE_FORMS[n]:
+            if not GATE_REF.search(text) or "3090" in GATE_FORMS[n]:
                 seen = ", ".join(sorted(GATE_FORMS[n])) or "none"
                 why.append(f"{pick.group(0)} with no tools/gpu-gate.sh call that takes the pick (script forms: {seen}) — "
                            "the fixture tier fixes the recipe to the A6000's lane")
