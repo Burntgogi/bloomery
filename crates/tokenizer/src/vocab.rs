@@ -545,7 +545,7 @@ impl Vocab {
         }
     }
 
-    /// The reference's text-based attribute rules, in its order.
+    /// Apply reference attribute rules in order, including pre-tokenizer-specific stop names.
     fn apply_overrides(&mut self) {
         self.detect("eot", EOT_NAMES, |s| &mut s.eot);
         self.detect("eom", EOM_NAMES, |s| &mut s.eom);
@@ -567,18 +567,14 @@ impl Vocab {
             .into_iter()
             .flatten()
             .collect();
-        for name in EOG_NAMES {
+        for name in EOG_NAMES.iter().chain(if self.pre == "flint" {
+            ["<|user|>", "<|observation|>"].as_slice()
+        } else {
+            &[]
+        }) {
             if let Some(id) = self.id_of(name) {
                 eog.insert(id);
                 self.attrs[id as usize] |= attr::CONTROL;
-            }
-        }
-        if self.pre == "flint" {
-            for name in ["<|user|>", "<|observation|>"] {
-                if let Some(id) = self.id_of(name) {
-                    eog.insert(id);
-                    self.attrs[id as usize] |= attr::CONTROL;
-                }
             }
         }
         for name in ALWAYS_RENDERED {
