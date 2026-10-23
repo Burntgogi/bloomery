@@ -1,0 +1,46 @@
+# Round xmuse3: Muse Spark Open's prompt rate on plan (b′) (`--place bp`: the A6000 the stage, the 3090 an expert tier,
+# the host the rest) at the serving defaults, where the common stream rule picks `admit` and the ring is dark. The row
+# every Muse stream lever is measured against; no stream lever is in this tree.
+# Calibration [measured]: pp512 34.07..34.28 tok/s on plan (a) (A6000 + host, int039 6adfcd6a8, depth-serve 2 rounds,
+# ~/.cache/bloomery/muse/box-muse-time.log) = 242 ms a layer a 512-row pass; less the card front ~10 ms and the join
+# ~2 ms, the host union over plan (a)'s ~220..225 host experts is ~230 ms: h = 1.02..1.05 ms an expert at m = 16
+# columns (XSTREAM_COSTS' t(m) = 28.1 + 57.6 m = 0.95 ms, the band's top, is 7..10 % under it).
+# Decomposition per 512-row pass and layer on (b′) [derived]:
+#   host CPU   the union over 191 host experts (256 less the stage's ~36 and the tier's ~29) x 1.02..1.05 ms
+#              = 195..201 ms: the bound
+#   stage SM   front (attention, router, dense) ~10 ms before the union; the stage's ~36 experts as `_sel` slots,
+#              16 columns x 18.5 us = 0.30 ms each, ~11 ms, under the union (0 on the wall)
+#   tier SM    ~29 experts x 0.30 ms = ~9 ms plus the tier's rows back, under the union (0)
+#   PCIe       the rows and ids down, the sums up, ~17 MB: 0.7 ms; the residency's admits ride the pick phase
+#   host DRAM  191 x 12.98 MB = 2.5 GB in ~200 ms: 12 GB/s of 137
+#   => 207..213 ms a layer x 62 = 12.8..13.2 s a pass: pp512 38.8..40.0. The residency's call picks (`admit`) move
+#      the hottest host experts onto the stage's pool for the call and take columns off the union: up to +10 %
+#      [derived, no record of Muse's picks]: written 38.5..44.
+# Companion (not this card's term): pp4096 the same per pass over eight passes plus the attention's K/V reads
+# (plan (a) measured pp4096 = pp512 x 0.997): 38..44.
+# The stream levers this row is the base of [derived, docs in the round's report]: the common rule's per-expert test
+# (xsplit `streams`, `m_min` 537 > the 512-row pass) keeps the ring dark at 512 on every lane; streaming by the
+# balance alone, the ring pass as a route GEMM (card ~0.05 ms an expert), the stage lane under a tier, and a second
+# lane on the 3090 take bp's pp512 to ~70, ~93 and ~120..127.
+# Sitting (on the lead's go, both cards in the timing witness):
+#   BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/xmuse3-pp.card BLOOMERY_TIMING_CARDS=a6000+3090
+#     DEPTH_SERVE_CTX=4224' tools/ref/depth-serve.sh <this tree>:512 <this tree>:4096
+kind: baseline
+question: what does the Muse Spark Open seat's prompt pass run at on plan (b′), the A6000 the stage and the 3090 an
+  expert tier beside the host, at the serving defaults (the stream rule's `admit`, the ring dark)?
+term: pp tok/s @ P = 512, bloomery-serve --model musespark at the serving defaults (place unset -> bp), A6000 + 3090 +
+  host, depth-serve rows (timings.prompt_per_second)
+unit: tok/s
+predict: 38.5..44
+condition: depth-serve under BLOOMERY_TIMING_CARDS=a6000+3090 in its own lease, one fresh server a row; the server's
+  `place unset` record names bp, its `plan` record a tier0 card holding experts and its `xstream=` line `admit`, else
+  the row is void; the witness (both cards, mem, pgmajfault) shows no other model load and the host's experts
+  resident (majflt near 0)
+reason: the base row of every Muse stream lever on the two-card default; plan (a)'s row is measured, (b′)'s is not,
+  and the levers' predictions are written against it
+decide-in: write the row beside plan (a)'s, then open the stream levers in their derived order: the rule's balance
+  (common xsplit) and Muse's ring pass as a route GEMM first, then the stage lane under a tier, then the 3090 lane
+decide-below: the union is not the only wall: read the tier layers' join wait and the stage's front against the
+  union's per-layer time before any stream lever, since a lever on the union predicts less than derived there
+decide-above: the call picks move more columns than counted: read the residency's pick records (admits a layer,
+  their columns) and re-derive the host columns before pricing the stream levers

@@ -142,8 +142,8 @@ mod gate {
 
     use bloomery_gpu_gates::record;
     use bloomery_gpu_gates::serve_client::{
-        Answer, SeatGate, Served, check, curl, greedy, held_ms, ids_of, json_of, metric, plan_run,
-        server_log, together, tokenized,
+        Answer, SeatGate, Served, check, curl, greedy, held_ms, ids_of, json_of, metric,
+        no_residency_host, residency_lever_is, server_log, together, tokenized,
     };
     use bloomery_gpu_gates::{GateError, checks_failed, gpu_census, ref_model_path};
     use model::arch::minimaxm3::place::PlanInputs;
@@ -253,50 +253,22 @@ mod gate {
         Ok(ok)
     }
 
-    /// `--plan` of `args` with `BLOOMERY_RESIDENCY` set to `residency`, or removed when it is
-    /// `None`, so a value in the parent environment cannot stand in for unset.
+    /// `--plan` of `args` with `BLOOMERY_RESIDENCY` set to `word`, or removed when it is `None`
+    /// ([`SeatGate::plan_under`]).
     fn plan_under(
         seat: &SeatGate,
         dir: &Path,
         name: &str,
         file: &Path,
         args: &[&str],
-        residency: Option<&str>,
+        word: Option<&str>,
     ) -> Result<(ExitStatus, record::Log, String), GateError> {
-        let d = dir.join(name);
-        std::fs::create_dir_all(&d)?;
-        let (mut cmd, mut all) = seat.command(file)?;
-        match residency {
-            Some(word) => {
-                cmd.env(bloomery_levers::RESIDENCY, word);
-            }
-            None => {
-                cmd.env_remove(bloomery_levers::RESIDENCY);
-            }
-        }
-        all.extend(args.iter().copied().map(str::to_owned));
-        let all: Vec<&str> = all.iter().map(String::as_str).collect();
-        let err = d.join("server.err");
-        let (status, lines) = plan_run(cmd, &all, &err)?;
-        println!("{name}: {} --plan: {status}", args.join(" "));
-        let text = lines.join("\n");
-        if !status.success() {
-            println!("{name} stderr:\n{text}");
-        }
-        Ok((status, server_log(&err, seat.kinds)?, text))
-    }
-
-    /// The lever record is `word` with why `why`.
-    fn lever_is(log: &record::Log, word: &str, why: &str) -> Result<bool, GateError> {
-        Ok(match log.first(&record::RESIDENCY_LEVER)? {
-            Some(l) => l.word("residency")? == word && l.word("why")? == why,
-            None => false,
-        })
-    }
-
-    /// No `residency host` record.
-    fn no_host(log: &record::Log) -> Result<bool, GateError> {
-        Ok(log.first(&record::RESIDENCY_HOST)?.is_none())
+        seat.plan_under(
+            (dir, name),
+            file,
+            args,
+            &[(bloomery_levers::RESIDENCY, word)],
+        )
     }
 
     /// The lever, then the plan, then the churn pool's host record.
@@ -365,17 +337,17 @@ mod gate {
         let folder = file.is_dir();
         let (serving_word, in_order) = if folder {
             (
-                lever_is(&serving, "off", "fixed_place")? && no_host(&serving)?,
+                residency_lever_is(&serving, "off", "fixed_place")? && no_residency_host(&serving)?,
                 lever_before_plan(&serving)?,
             )
         } else {
             (
-                lever_is(&serving, bloomery_levers::RESIDENCY_SERVING, "place")?,
+                residency_lever_is(&serving, bloomery_levers::RESIDENCY_SERVING, "place")?,
                 hosted_in_order(&serving)?,
             )
         };
-        let gate_ok = lever_is(&gate, "off", "fixed_place")? && no_host(&gate)?;
-        let off_ok = lever_is(&off, "off", "set")? && no_host(&off)?;
+        let gate_ok = residency_lever_is(&gate, "off", "fixed_place")? && no_residency_host(&gate)?;
+        let off_ok = residency_lever_is(&off, "off", "set")? && no_residency_host(&off)?;
         let exits = serving_status.success() && gate_status.success() && off_status.success();
         let refused = if folder {
             let (status, log, text) = plan_under(

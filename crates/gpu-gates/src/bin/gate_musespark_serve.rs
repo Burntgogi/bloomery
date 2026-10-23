@@ -75,7 +75,8 @@
 //!   load names `muse-spark`, one slot, the file's layer count and [`CTX`]; the listening record
 //!   names one slot and [`CTX`]; `/health` answers 200. FAIL-first: a seat that loads another
 //!   context than the one it was asked for names it in the load record and the clause is red. The
-//!   `load` record's `prompt` word (`steps`: one decode step an id) is printed, not pinned.
+//!   `load` record's `prompt` word (`batch`: the prompt's passes through every layer) is printed,
+//!   not pinned.
 //! - `chat_answers_a_turn`: `/v1/chat/completions` of one user turn at temperature 0,
 //!   `reasoning_effort` `low` and `max_tokens` 512 is a 200 whose `usage` counts a prompt and at
 //!   most 512 completion tokens, whose message holds neither marker of the protocol, and whose
@@ -114,7 +115,9 @@ mod gate {
     use std::process::ExitStatus;
 
     use bloomery_gpu_gates::record;
-    use bloomery_gpu_gates::serve_client::{SeatGate, check, plan_run, server_log};
+    use bloomery_gpu_gates::serve_client::{
+        SeatGate, check, no_residency_host, residency_lever_is, server_log,
+    };
     use bloomery_gpu_gates::{GateError, checks_failed, gpu_census, ref_model_path};
     use gguf::Split;
     use model::arch::musespark::place::PlanInputs;
@@ -254,8 +257,7 @@ mod gate {
     }
 
     /// `--plan` of `args` with `BLOOMERY_RESIDENCY` set to `residency` and `BLOOMERY_XSTREAM` to
-    /// `xstream`, each removed when it is `None`, so a value in the parent environment cannot
-    /// stand in for unset.
+    /// `xstream`, each removed when it is `None` ([`SeatGate::plan_under`]).
     fn plan_under(
         seat: &SeatGate,
         dir: &Path,
@@ -264,48 +266,11 @@ mod gate {
         args: &[&str],
         (residency, xstream): (Option<&str>, Option<&str>),
     ) -> Result<(ExitStatus, record::Log, String), GateError> {
-        let d = dir.join(name);
-        std::fs::create_dir_all(&d)?;
-        let (mut cmd, mut all) = seat.command(file)?;
-        match residency {
-            Some(word) => {
-                cmd.env(bloomery_levers::RESIDENCY, word);
-            }
-            None => {
-                cmd.env_remove(bloomery_levers::RESIDENCY);
-            }
-        }
-        match xstream {
-            Some(word) => {
-                cmd.env(bloomery_levers::XSTREAM, word);
-            }
-            None => {
-                cmd.env_remove(bloomery_levers::XSTREAM);
-            }
-        }
-        all.extend(args.iter().copied().map(str::to_owned));
-        let all: Vec<&str> = all.iter().map(String::as_str).collect();
-        let err = d.join("server.err");
-        let (status, lines) = plan_run(cmd, &all, &err)?;
-        println!("{name}: {} --plan: {status}", args.join(" "));
-        let text = lines.join("\n");
-        if !status.success() {
-            println!("{name} stderr:\n{text}");
-        }
-        Ok((status, server_log(&err, seat.kinds)?, text))
-    }
-
-    /// The lever record is `word` with why `why`.
-    fn lever_is(log: &record::Log, word: &str, why: &str) -> Result<bool, GateError> {
-        Ok(match log.first(&record::RESIDENCY_LEVER)? {
-            Some(l) => l.word("residency")? == word && l.word("why")? == why,
-            None => false,
-        })
-    }
-
-    /// No `residency host` record.
-    fn no_host(log: &record::Log) -> Result<bool, GateError> {
-        Ok(log.first(&record::RESIDENCY_HOST)?.is_none())
+        let levers = [
+            (bloomery_levers::RESIDENCY, residency),
+            (bloomery_levers::XSTREAM, xstream),
+        ];
+        seat.plan_under((dir, name), file, args, &levers)
     }
 
     /// The lever record of an unset word on a serving placement: a word the plan resolved (its
@@ -377,8 +342,8 @@ mod gate {
         )?;
         let exits = serving_status.success() && gate_status.success() && off_status.success();
         let serving_ok = lever_resolved(&serving)?;
-        let gate_ok = lever_is(&gate, "off", "fixed_place")? && no_host(&gate)?;
-        let off_ok = lever_is(&off, "off", "set")? && no_host(&off)?;
+        let gate_ok = residency_lever_is(&gate, "off", "fixed_place")? && no_residency_host(&gate)?;
+        let off_ok = residency_lever_is(&off, "off", "set")? && no_residency_host(&off)?;
         println!(
             "residency default: exit 0 {exits}; unset lever {:?} is resolved, ahead of the plan, \
              with its churn pool after it exactly where it is not off {serving_ok}; --place gate \

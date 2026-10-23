@@ -429,16 +429,54 @@ impl SeatGate {
         file: &Path,
         args: &[&str],
     ) -> Result<(std::process::ExitStatus, Log, String), GateError> {
+        self.plan_under((dir, name), file, args, &[])
+    }
+
+    /// [`SeatGate::plan`] with each of `levers` set on the server to its
+    /// value, or removed from its environment where the value is `None`, so a
+    /// value in this binary's environment cannot stand in for unset; the
+    /// text printed when the run fails. A gate names each lever at its call,
+    /// a `(lever, value)` pair, where `tools/check-defaults.py` reads its pins.
+    pub fn plan_under(
+        &self,
+        (dir, name): (&Path, &str),
+        file: &Path,
+        args: &[&str],
+        levers: &[(&str, Option<&str>)],
+    ) -> Result<(std::process::ExitStatus, Log, String), GateError> {
         let d = dir.join(name);
         std::fs::create_dir_all(&d)?;
-        let (cmd, mut all) = self.command(file)?;
+        let (mut cmd, mut all) = self.command(file)?;
+        for &(lever, value) in levers {
+            match value {
+                Some(v) => cmd.env(lever, v),
+                None => cmd.env_remove(lever),
+            };
+        }
         all.extend(args.iter().map(|a| (*a).to_owned()));
         let all: Vec<&str> = all.iter().map(String::as_str).collect();
         let err = d.join("server.err");
         let (status, lines) = plan_run(cmd, &all, &err)?;
         println!("{name}: {} --plan: {status}", args.join(" "));
-        Ok((status, server_log(&err, self.kinds)?, lines.join("\n")))
+        let text = lines.join("\n");
+        if !status.success() {
+            println!("{name} stderr:\n{text}");
+        }
+        Ok((status, server_log(&err, self.kinds)?, text))
     }
+}
+
+/// The `residency lever` record is `word` with why `why`.
+pub fn residency_lever_is(log: &Log, word: &str, why: &str) -> Result<bool, GateError> {
+    Ok(match log.first(&record::RESIDENCY_LEVER)? {
+        Some(l) => l.word("residency")? == word && l.word("why")? == why,
+        None => false,
+    })
+}
+
+/// No `residency host` record: the load holds no churn pool.
+pub fn no_residency_host(log: &Log) -> Result<bool, GateError> {
+    Ok(log.first(&record::RESIDENCY_HOST)?.is_none())
 }
 
 /// `ids` agree with `reference`, a run that did not stop at the

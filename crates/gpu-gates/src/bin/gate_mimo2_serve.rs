@@ -285,8 +285,8 @@ mod gate {
     use bloomery_gpu_gates::record::{self, Log};
     use bloomery_gpu_gates::serve_client::{
         Answer, PrefixRestore, PrefixTurns, Served, agree, chat_is_those_ids, check, curl,
-        edit_and_extension, greedy, held_ms, json_of, metric, prefix_restore, rendered, serve_cmd,
-        server_log, together, tokenized, utf8,
+        edit_and_extension, greedy, held_ms, json_of, metric, no_residency_host, prefix_restore,
+        rendered, residency_lever_is, serve_cmd, server_log, together, tokenized, utf8,
     };
     use bloomery_gpu_gates::slots_gate;
     use bloomery_gpu_gates::{GateError, RefManifest, checks_failed, data_dir, ref_model_path};
@@ -1023,10 +1023,7 @@ mod gate {
             log.first(&record::PLAN)?,
             log.first(&record::RESIDENCY_HOST)?,
         );
-        let word = match &lever {
-            Some(l) => l.word("residency")? == "mid-p0-s1" && l.word("why")? == "place",
-            None => false,
-        };
+        let word = residency_lever_is(&log, "mid-p0-s1", "place")?;
         let in_order = matches!(
             (&lever, &plan, &host),
             (Some(l), Some(p), Some(h)) if l.at() < p.at() && p.at() < h.at()
@@ -1057,15 +1054,10 @@ mod gate {
             &["--parallel", "2", "--ctx", &largest],
             Pins::default(),
         )?;
-        let no_room = match wide.first(&record::RESIDENCY_LEVER)? {
-            Some(l) => l.word("residency")? == "off" && l.word("why")? == "no_card_experts",
-            None => false,
-        } && wide.first(&record::RESIDENCY_HOST)?.is_none();
+        let no_room =
+            residency_lever_is(&wide, "off", "no_card_experts")? && no_residency_host(&wide)?;
         let (_, off_log, _) = plan_pinned(dir, "plan-residency-off", file, &["--ctx", &ctx], OFF)?;
-        let off = match off_log.first(&record::RESIDENCY_LEVER)? {
-            Some(l) => l.word("residency")? == "off" && l.word("why")? == "set",
-            None => false,
-        } && off_log.first(&record::RESIDENCY_HOST)?.is_none();
+        let off = residency_lever_is(&off_log, "off", "set")? && no_residency_host(&off_log)?;
         let exits = status.is_some_and(|s| s.success());
         println!(
             "residency default: exit 0 {exits}; at ctx {ctx} the lever record is mid-p0-s1 (place), \

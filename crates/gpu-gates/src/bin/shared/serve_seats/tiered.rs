@@ -38,7 +38,7 @@ use bloomery_levers::{
 use gguf::Split;
 use model::arch::Arch;
 use model::arch::place_hybrid::PlanInputs;
-use model::placement::ctx_ask::{DEFAULT_SLOTS, probe_of};
+use model::placement::ctx_ask::{Chosen, DEFAULT_SLOTS, probe_of};
 use model::placement::workstation::TierBatchBytes;
 use model::placement::{Machine, PlacementError, Plan, PlanLevers};
 use serve::reasoning::ThinkTags;
@@ -212,8 +212,10 @@ pub trait Tiered: Seat + Sized + 'static {
 
     /// Whether the plan of a load on `place` keeps the expert stream's ring out of the expert budget
     /// ([`Tiered::with_ring`]): the body's prompt calls stream host experts there (`BLOOMERY_XSTREAM`
-    /// by the common rule, `shared/xstream_rule.rs`). Asked before the plan, so the run's plan and
-    /// the open's are one. False by default: a body that streams none.
+    /// by the common rule, `shared/xstream_rule.rs`). Asked before the plan; the run keeps the ring
+    /// only where the rule would start the stream on the plan (a residency pick other than `off`,
+    /// and, unset, host experts to stream and room for the ring), and the open plans what the run
+    /// kept ([`Open::ring`]). False by default: a body that streams none.
     fn ring(_levers: &Levers, _place: Place) -> bool {
         false
     }
@@ -390,6 +392,21 @@ fn refuse_tier_slots<S: Tiered>(place: Place, slots: usize) -> Result<(), GateEr
     .into())
 }
 
+/// The context and the plan of every slot around it over `inputs` ([`choose_ctx`], every seat's):
+/// `asked` the context and slots the flags asked, then the machine, the plan's levers, the slots
+/// the plan counts and the placement its refusals name.
+fn plan_at<'a, H>(
+    split: &Split,
+    asked: (Option<usize>, usize),
+    inputs: &'a PlanInputs<H>,
+    (machine, levers, slots, place): (&'a Machine, &PlanLevers, NonZeroUsize, Place),
+) -> Result<Chosen<Plan<'a>>, GateError> {
+    choose_ctx(split, asked, (None, None), |c| {
+        probe_of(inputs.plan_with_slots(machine, c, levers, slots))
+            .map_err(|e| format!("--place {}: {e}", place.name()))
+    })
+}
+
 /// Loads the model, and the embedding model `side` names beside it, and serves until the listener
 /// or the engine fails; `Ok` carries why the server ended.
 pub fn run<S: Tiered>(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateError> {
@@ -461,10 +478,13 @@ pub fn run<S: Tiered>(args: &[String], side: &side_seat::Flags) -> Result<ServeE
     refuse_tier_slots::<S>(chosen.place, slots)?;
     chosen.record().eprint();
     let place = chosen.place;
-    // The plan's inputs on this placement: the stream's ring out of the expert budget where the
-    // seat streams, which the probe's plan and the open's both count.
-    let ring = S::ring(&levers, place);
-    let inputs = if ring { S::with_ring(inputs)? } else { inputs };
+    // The plan's inputs on this placement where the seat streams, read again from the headers: the
+    // stream's ring out of the expert budget. Whether the load keeps them is settled below.
+    let ring_inputs = if S::ring(&levers, place) {
+        Some(S::with_ring(S::read(&split)?)?)
+    } else {
+        None
+    };
     // The side model's seat before the plan, which holds its bytes when it sits on the stage card.
     let side_seat = side.as_ref().map(|s| s.seat(place)).transpose()?;
     let embedding = side_seat.as_ref().and_then(|s| s.reserve);
@@ -488,18 +508,50 @@ pub fn run<S: Tiered>(args: &[String], side: &side_seat::Flags) -> Result<ServeE
     // card, a second card, a context the card cannot hold, a host room that cannot hold the host
     // experts and a budget that binds are refused here by name, before any load; the load plans
     // the same.
-    let asked = choose_ctx(&split, (a.ctx, slots), (None, None), |c| {
-        probe_of(inputs.plan_with_slots(&machine, c, &plan_levers, n))
-            .map_err(|e| format!("--place {}: {e}", place.name()))
-    })?;
-    eprintln!("{}", asked.line());
-    let slot_ctx = usize::try_from(asked.slot_ctx)?;
-    let plan = asked.plan;
+    let asking = (a.ctx, slots);
+    let on = (&machine, &plan_levers, n, place);
+    let plain = plan_at(&split, asking, &inputs, on)?;
+    // Where the seat streams, the ring's plan beside it, and the pick is fitted to the plan the load
+    // runs. An unset `BLOOMERY_XSTREAM` keeps no ring where the plan without it holds every expert
+    // on the card (the rule then ends at `off`: nothing to stream) or where the plan cannot hold
+    // the ring (the rule then sizes it from what the card leaves free at the load,
+    // [`PlanInputs::streaming`]).
+    let set = levers.xstream().is_some();
+    let ringed = match &ring_inputs {
+        Some(r) => match plan_at(&split, asking, r, on) {
+            Ok(p) if set || plain.plan.host.experts > 0 => Some(p),
+            Ok(_) => None,
+            Err(e) if !set => {
+                eprintln!("xstream ring: the plan cannot hold it, so it plans without: {e}");
+                None
+            }
+            Err(e) => return Err(e),
+        },
+        None => None,
+    };
+    let (mut asked, plain) = match ringed {
+        Some(p) => (p, Some(plain)),
+        None => (plain, None),
+    };
     let pick = if source.is_some() {
         Some(folder_residency(&levers)?)
     } else {
-        S::residency(&levers, &flags, place, &plan)?
+        S::residency(&levers, &flags, place, &asked.plan)?
     };
+    // A pick of `off` ends the stream rule at `off`: the load runs the plan without the ring, so the
+    // card keeps those bytes for experts and context. The pick holds there, for `off` reads no
+    // room.
+    let ring = match plain {
+        Some(plain) if pick.as_ref().is_none_or(|p| p.word == "off") => {
+            asked = plain;
+            false
+        }
+        Some(_) => true,
+        None => false,
+    };
+    eprintln!("{}", asked.line());
+    let slot_ctx = usize::try_from(asked.slot_ctx)?;
+    let plan = asked.plan;
     record::plan(place.name(), &machine, &plan).eprint();
     let (residency, extra) = match pick {
         Some(pick) => S::settle(&plan, pick)?,
