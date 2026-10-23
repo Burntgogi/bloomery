@@ -50,8 +50,8 @@ The current backend pin does not enforce this major during a build. The actual-o
 `CUDA_OXIDE_REQUIRED_LLC_MAJOR=21` policy reports the selected path/version without verbose mode and refuses
 another major or an invalid explicit override before LLVM optimization and PTX emission, not before Cargo
 host compilation. It was verified by actual LLVM 21/23 device builds and a host-only build; no GPU was run.
-Do not enable that setting against the current pin, which ignores it. Land the fork change, tag the old pin,
-install the matching backend and update the dependency pins, lockfile, notices and project configuration together.
+Do not enable that setting against the current pin, which ignores it. Tag the old pin before landing the fork change,
+then install the matching backend and update the dependency pins, lockfile, notices and project configuration together.
 Until that cutover, the explicit selection and doctor check remain required; see the [toolchain ledger](upstream/nvlabs-ledger.md), row 50.
 
 ## The CPU flag
