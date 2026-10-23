@@ -19,6 +19,10 @@ The common needs walk emits q/k normalization even on NoPE layers. `program_of(F
 refusals. The generic router's `norm` flag describes requested normalization, **not** an implementation
 of Flint's denominator floor or activated-value scaling.
 
+Fault formatting uses `bloomery_device::fault`'s shared layout/decoder and the
+`gpu::arch::step_order` registry. Flint's registry row uses neutral code order;
+it does not describe a runnable step.
+
 Run `BLOOMERY_MODEL=<pinned GGUF or header prefix> BLOOMERY_BOX_LOCAL=1 just gate-flint-meta`.
 The gate hashes the first 5,470,528 bytes before using `gguf::inventory_of`, `write::Layout`
 and `Split::header_only`; it reads no tensor payload and never treats a sparse file as real weights.
