@@ -1715,7 +1715,8 @@ fn serve_union<'w>(
 }
 
 /// [`serve_union`]'s one call: the plan in `s.plan` served from the tier when
-/// there is one and the plan names an expert.
+/// there is one, an empty plan's included, so the tier is told of every
+/// column the layer serves ([`TierSlots::note_union`]).
 fn serve_one<'w>(
     stacks: [ExpertStack<'w>; 3],
     run: LegRun,
@@ -1726,8 +1727,8 @@ fn serve_one<'w>(
     tier: Option<&'w LayerTier>,
 ) -> Result<(), ModelError> {
     match tier {
-        Some(tier) if s.plan.n() > 0 => serve_tiered(stacks, run, x, lists, out, s, tier),
-        _ => serve_planned(stacks, run, x, lists, out, s),
+        Some(tier) => serve_tiered(stacks, run, x, lists, out, s, tier),
+        None => serve_planned(stacks, run, x, lists, out, s),
     }
 }
 
@@ -1756,7 +1757,8 @@ struct Batching<'t> {
 /// whole call's, bit for bit. A layer under `2B` and the lane's slots is
 /// refused by name ([`TierError::BatchFloor`]) before any claim, and so is an
 /// expert past the stacks'. The host segment's experts compute first, under
-/// the first batch's fill.
+/// the first batch's fill. A call with no arena id (an empty plan, or the
+/// host segment's ids alone) claims nothing and is told as one that fits.
 fn serve_tiered<'w>(
     stacks: [ExpertStack<'w>; 3],
     run: LegRun,
@@ -1782,12 +1784,26 @@ fn serve_tiered<'w>(
             .filter(|e| !tier.host.contains(e)),
     );
     if s.tier_ids.is_empty() {
+        tier.slots.note_union(
+            tier.layer,
+            &s.plan.ids,
+            &s.plan.off,
+            &s.plan.cols,
+            lists.len(),
+            false,
+        );
         return serve_planned(stacks, run, x, lists, out, s);
     }
     let slots = tier.slots.slots(tier.layer);
     if slots >= 2 * batch && s.tier_ids.len() <= slots - 2 * batch {
-        tier.slots
-            .note_union(tier.layer, &s.plan.ids, &s.plan.off, lists.len(), false);
+        tier.slots.note_union(
+            tier.layer,
+            &s.plan.ids,
+            &s.plan.off,
+            &s.plan.cols,
+            lists.len(),
+            false,
+        );
         let pin = tier
             .slots
             .ensure_pinned(tier.layer, &s.tier_ids, Claim::Keep)?;
@@ -1805,8 +1821,14 @@ fn serve_tiered<'w>(
         }
         .into());
     }
-    tier.slots
-        .note_union(tier.layer, &s.plan.ids, &s.plan.off, lists.len(), true);
+    tier.slots.note_union(
+        tier.layer,
+        &s.plan.ids,
+        &s.plan.off,
+        &s.plan.cols,
+        lists.len(),
+        true,
+    );
     let batching = Batching {
         tier,
         keep: slots - 2 * batch,
@@ -2470,16 +2492,19 @@ pub trait TierSlots: Send + Sync {
     /// ticket's pin (the claim found it so), and an id whose slot lends
     /// nothing is in flight until the wait: a step computes the first early
     /// and the second after its wait. The default fills on the caller, the
-    /// ticket ready. `columns` is the call's column count. With `column_off`,
+    /// ticket ready. `columns` advances the tier's column clock; without
+    /// `column_off`, zero keeps selections at the endpoint another leg counted.
+    /// With `column_off`,
     /// `ids` is the full union plan, including host ids, and `ids[d]` routes
-    /// `column_off[d + 1] - column_off[d]` columns; without, each id routes once.
+    /// `off[d + 1] - off[d]` columns at positions `positions[off[d]..off[d + 1]]`,
+    /// where `column_off` is `(off, positions)`; without, each id routes once.
     fn prefetch_pinned<'a>(
         &'a self,
         layer: usize,
         ids: &[u32],
         claim: Claim,
         _columns: u64,
-        _column_off: Option<&[usize]>,
+        _column_off: Option<(&[usize], &[usize])>,
     ) -> Result<Ticket<'a>, TierError> {
         self.ensure_pinned(layer, ids, claim).map(Ticket::ready)
     }
@@ -2494,7 +2519,7 @@ pub trait TierSlots: Send + Sync {
     /// `batched` when its arena ids are more than the layer's slots less two
     /// batches. `ids` are the call's distinct ids, ascending, those of the
     /// plan's host segment included, and the columns that list `ids[d]`
-    /// number `off[d + 1] - off[d]`. A call refused before its path is told
+    /// are `positions[off[d]..off[d + 1]]`. A call refused before its path is told
     /// is not told. It must not lock or allocate unless its tier keeps books
     /// of the call (a gate's record of it, or the routing counts its
     /// victims are ranked by); a tier that keeps none takes the default.
@@ -2503,6 +2528,7 @@ pub trait TierSlots: Send + Sync {
         _layer: usize,
         _ids: &[u32],
         _off: &[usize],
+        _positions: &[usize],
         _cols: usize,
         _batched: bool,
     ) {
@@ -2899,33 +2925,7 @@ impl HostLayer {
         out: &mut [f32],
         scratch: &mut HostScratch,
     ) -> Result<(), ModelError> {
-        self.experts_into_on(Lanes::host_tier(), src, x, experts, out, scratch, None)
-    }
-
-    /// [`HostLayer::experts_into`] on a load that prepared union slabs: a
-    /// tiered layer's one column prefetches its misses and, when that ticket
-    /// is still in flight and the one-column plan fits the slabs, computes
-    /// the hits through [`serve_step_split`] while they fill. A ready ticket
-    /// keeps today's [`serve`] on `scratch`. A layer with no tier, or a call
-    /// that passes no slabs, is [`HostLayer::experts_into`].
-    pub fn experts_into_resident(
-        &self,
-        src: R8Source<'_>,
-        x: &Tensor2,
-        experts: &[(u32, f32)],
-        out: &mut [f32],
-        scratch: &mut HostScratch,
-        union: &mut UnionScratch,
-    ) -> Result<(), ModelError> {
-        self.experts_into_on(
-            Lanes::host_tier(),
-            src,
-            x,
-            experts,
-            out,
-            scratch,
-            Some(union),
-        )
+        self.experts_into_on(Lanes::host_tier(), src, x, experts, out, scratch, None, 1)
     }
 
     /// [`HostLayer::experts_into`] with its two row dispatches laid over the
@@ -2933,8 +2933,9 @@ impl HostLayer {
     /// `union` is the load's slabs. With them, a tiered call's claim is
     /// [`TierSlots::prefetch_pinned`]: a ready ticket, or a plan that does
     /// not fit, waits and then runs today's [`serve`]; a pending ticket whose
-    /// plan fits runs the one-list split. Without them the claim is
-    /// [`TierSlots::ensure_pinned`] and the serve is today's, as before.
+    /// plan fits runs the one-list split. Without slabs the ticket is
+    /// waited before serving. `columns` is one for a new column, zero if
+    /// another tier leg already counted it.
     #[allow(
         clippy::too_many_arguments,
         reason = "the leg's pieces, plus the load's slabs when the call is resident"
@@ -2948,6 +2949,7 @@ impl HostLayer {
         out: &mut [f32],
         scratch: &mut HostScratch,
         union: Option<&mut UnionScratch>,
+        columns: u64,
     ) -> Result<(), ModelError> {
         self.read_beside(src)?;
         let split = src.split();
@@ -2965,7 +2967,8 @@ impl HostLayer {
         if self.tier.is_some()
             && let Some(union) = union
         {
-            return self.serve_column_resident(lanes, split, x, experts, out, scratch, union);
+            return self
+                .serve_column_resident(lanes, split, x, experts, out, scratch, union, columns);
         }
         // The call's ids stay pinned until the leg's reads end: no claim of
         // a lane's victim takes one of their slots between the fill and the
@@ -2976,7 +2979,8 @@ impl HostLayer {
                 scratch.tier_ids.extend(experts.iter().map(|&(e, _)| e));
                 Some(
                     tier.slots
-                        .ensure_pinned(tier.layer, &scratch.tier_ids, Claim::Step)?,
+                        .prefetch_pinned(tier.layer, &scratch.tier_ids, Claim::Step, columns, None)?
+                        .wait()?,
                 )
             }
             None => None,
@@ -3087,16 +3091,14 @@ impl HostLayer {
         out: &mut [f32],
         scratch: &mut HostScratch,
         union: &mut UnionScratch,
+        columns: u64,
     ) -> Result<(), ModelError> {
         let lists: [&[(u32, f32)]; 1] = [experts];
         let tier = self.tier.as_ref().expect("a resident column has a tier");
         self.prepare_step_ids(tier, &lists, union)?;
-        if union.tier_ids.is_empty() {
-            return self.serve_column(lanes, split, x, experts, out, scratch);
-        }
         let ticket =
             tier.slots
-                .prefetch_pinned(tier.layer, &union.tier_ids, Claim::Step, 1, None)?;
+                .prefetch_pinned(tier.layer, &union.tier_ids, Claim::Step, columns, None)?;
         if ticket.is_ready() || !union.plan.fits(union.max_slots) {
             let _pin = ticket.wait()?;
             return self.serve_column(lanes, split, x, experts, out, scratch);
@@ -3231,9 +3233,6 @@ impl HostLayer {
             form: self.form,
             lanes,
         };
-        if scratch.tier_ids.is_empty() {
-            return serve_union(stacks, run, x, lists, out, scratch, None);
-        }
         // The claim is made now and the misses fill on the tier's threads;
         // the pin lasts until the union's reads end, as `experts_into_on`'s
         // ids are.
@@ -3242,7 +3241,7 @@ impl HostLayer {
             &scratch.plan.ids,
             Claim::Step,
             lists.len() as u64,
-            Some(&scratch.plan.off),
+            Some((&scratch.plan.off, &scratch.plan.cols)),
         )?;
         tier.lend(&mut stacks);
         if ticket.is_ready() || !scratch.plan.fits(scratch.max_slots) {
@@ -4201,6 +4200,7 @@ mod tests {
         layer: usize,
         ids: Vec<u32>,
         off: Vec<usize>,
+        positions: Vec<usize>,
         cols: usize,
         batched: bool,
     }
@@ -4346,10 +4346,17 @@ mod tests {
             ids: &[u32],
             claim: super::Claim,
             columns: u64,
-            column_off: Option<&[usize]>,
+            column_off: Option<(&[usize], &[usize])>,
         ) -> Result<super::Ticket<'a>, super::TierError> {
-            if let Some(off) = column_off {
-                self.note_union(layer, ids, off, usize::try_from(columns).unwrap(), false);
+            if let Some((off, positions)) = column_off {
+                self.note_union(
+                    layer,
+                    ids,
+                    off,
+                    positions,
+                    usize::try_from(columns).unwrap(),
+                    false,
+                );
             }
             self.ensured.lock().unwrap().push((layer, ids.to_vec()));
             let pin = self.pin_batch(ids, claim, false);
@@ -4401,11 +4408,20 @@ mod tests {
             self.filled.then(|| &self.parts[3 * id as usize + part][..])
         }
 
-        fn note_union(&self, layer: usize, ids: &[u32], off: &[usize], cols: usize, batched: bool) {
+        fn note_union(
+            &self,
+            layer: usize,
+            ids: &[u32],
+            off: &[usize],
+            positions: &[usize],
+            cols: usize,
+            batched: bool,
+        ) {
             self.told.lock().unwrap().push(Told {
                 layer,
                 ids: ids.to_vec(),
                 off: off.to_vec(),
+                positions: positions.to_vec(),
                 cols,
                 batched,
             });
@@ -4860,6 +4876,7 @@ mod tests {
                 layer: 4,
                 ids: vec![2, 3, 4, 5, 6, 7],
                 off: vec![0, 1, 2, 4, 5, 6, 7],
+                positions: vec![0, 0, 0, 1, 1, 1, 0],
                 cols: 2,
                 batched: true
             }],
@@ -4877,6 +4894,7 @@ mod tests {
                 layer: 4,
                 ids: vec![0, 2, 7],
                 off: vec![0, 1, 3, 4],
+                positions: vec![0, 0, 1, 1],
                 cols: 2,
                 batched: false
             }],
@@ -5125,6 +5143,7 @@ mod tests {
                 layer: 4,
                 ids: claim_ids.to_vec(),
                 off: vec![0, 1, 3, 4, 5, 7],
+                positions: vec![1, 0, 1, 1, 2, 0, 2],
                 cols,
                 batched: false,
             }],
@@ -5370,6 +5389,7 @@ mod tests {
                 &mut got,
                 &mut hs,
                 Some(&mut us),
+                1,
             )
             .unwrap();
         let bits = |v: &[f32]| v.iter().map(|v| v.to_bits()).collect::<Vec<_>>();

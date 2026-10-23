@@ -17,7 +17,8 @@
 //! split among them.
 //!
 //! At most [`MAX_CONNECTIONS`] connections are served at once, one thread each;
-//! a connection past them gets a 503 with `Retry-After` and is closed. A
+//! one connection past them gets a 503 with `Retry-After` on a separate thread;
+//! further arrivals close at once while that refusal is being written. A
 //! connection that sends nothing of a next request for [`KEEP_ALIVE_IDLE`] is
 //! closed, so an idle client gives its place back. An `accept` that fails
 //! while the listener still stands is a named line on stderr and the loop goes
@@ -194,6 +195,9 @@ pub const KEEP_ALIVE_IDLE: Duration = Duration::from_secs(5);
 
 /// How long one read inside a request may wait (llama-server's `--timeout`).
 const REQUEST_READ: Duration = Duration::from_secs(600);
+
+/// The longest a response write may make no progress.
+const RESPONSE_WRITE: Duration = Duration::from_secs(10);
 
 /// How long the accept loop waits after a failed `accept` that will fail again
 /// at once: out of descriptors or memory, or the same failure twice in a row.
@@ -762,16 +766,16 @@ fn after_accept_error(e: &io::Error, listener_stands: bool, repeats: u32) -> Opt
     })
 }
 
-/// One live connection's place under [`MAX_CONNECTIONS`], given back when its
+/// One live connection's place under its limit, given back when its
 /// thread ends, by a return or a panic.
 struct Permit(Arc<AtomicUsize>);
 
 impl Permit {
-    /// A place, or `None` when [`MAX_CONNECTIONS`] are live.
-    fn take(live: &Arc<AtomicUsize>) -> Option<Permit> {
+    /// A place, or `None` when `limit` connections are live.
+    fn take(live: &Arc<AtomicUsize>, limit: usize) -> Option<Permit> {
         let held = live.fetch_add(1, Ordering::SeqCst);
         let permit = Permit(Arc::clone(live));
-        (held < MAX_CONNECTIONS).then_some(permit)
+        (held < limit).then_some(permit)
     }
 }
 
@@ -792,6 +796,7 @@ where
 {
     let port = listener.local_addr().map_or(0, |a| a.port());
     let live = Arc::new(AtomicUsize::new(0));
+    let refusing = Arc::new(AtomicUsize::new(0));
     let serve = Arc::new(serve);
     thread::spawn(move || {
         let mut repeats = 0;
@@ -799,7 +804,7 @@ where
             match conn {
                 Ok(stream) => {
                     repeats = 0;
-                    admit(&serve, &live, port, stream);
+                    admit(&serve, &live, &refusing, port, stream);
                 }
                 Err(e) => {
                     let stands = listener.local_addr().is_ok();
@@ -1034,44 +1039,58 @@ pub(crate) fn stopping(reason: &str) -> String {
     format!("the engine failed and the server is stopping: {reason}")
 }
 
-/// Serves `stream` on a thread of its own, named `serve:<port>`, or refuses it
-/// with a 503 when [`MAX_CONNECTIONS`] are live or no thread can be started.
-fn admit<F>(serve: &Arc<F>, live: &Arc<AtomicUsize>, port: u16, stream: TcpStream)
-where
+/// Serves `stream` on a thread named `serve:<port>`, or writes a 503 on the
+/// listener's one refusal thread when [`MAX_CONNECTIONS`] are live. A busy
+/// refusal thread or a failed spawn closes the connection at once.
+fn admit<F>(
+    serve: &Arc<F>,
+    live: &Arc<AtomicUsize>,
+    refusing: &Arc<AtomicUsize>,
+    port: u16,
+    stream: TcpStream,
+) where
     F: Fn(TcpStream) + Send + Sync + 'static,
 {
-    let Some(permit) = Permit::take(live) else {
-        refuse(
-            stream,
-            &format!("the server is serving {MAX_CONNECTIONS} connections, its limit"),
-        );
-        return;
-    };
-    // The spawn consumes the stream even when it fails; the clone answers then.
-    let answer = match stream.try_clone() {
-        Ok(s) => s,
-        Err(e) => {
-            refuse(stream, &format!("cannot hold the connection: {e}"));
-            return;
+    let (permit, full) = match Permit::take(live, MAX_CONNECTIONS) {
+        Some(permit) => (permit, false),
+        None => {
+            let Some(permit) = Permit::take(refusing, 1) else {
+                return;
+            };
+            (permit, true)
         }
     };
     let serve = Arc::clone(serve);
     let spawned = thread::Builder::new()
-        .name(format!("serve:{port}"))
+        .name(if full {
+            format!("refuse:{port}")
+        } else {
+            format!("serve:{port}")
+        })
         .spawn(move || {
             let _permit = permit;
-            serve(stream);
+            if full {
+                refuse(
+                    stream,
+                    &format!("the server is serving {MAX_CONNECTIONS} connections, its limit"),
+                );
+            } else {
+                serve(stream);
+            }
         });
     if let Err(e) = spawned {
-        refuse(answer, &format!("cannot start a connection thread: {e}"));
+        eprintln!("bloomery-serve: cannot start a connection thread: {e}");
     }
 }
 
 /// Answers a connection the server does not serve with a 503 carrying
 /// `Retry-After`, then closes it after reading what the client sent, for at most
-/// about [`REFUSE_DRAIN`] twice.
+/// about [`REFUSE_DRAIN`] twice. Runs on the connection's thread, never the
+/// listener's accept loop.
 fn refuse(mut stream: TcpStream, message: &str) {
-    let _ = stream.set_write_timeout(Some(REFUSE_DRAIN));
+    if stream.set_write_timeout(Some(REFUSE_DRAIN)).is_err() {
+        return;
+    }
     let body = error_body(503, "unavailable_error", message);
     let sent = http::respond(
         &mut stream,
@@ -1189,6 +1208,9 @@ pub(crate) fn keep_alive(
     mut route: impl FnMut(&Request, &mut TcpStream) -> io::Result<bool>,
 ) {
     let _ = stream.set_nodelay(true);
+    if stream.set_write_timeout(Some(RESPONSE_WRITE)).is_err() {
+        return;
+    }
     let Ok(mut w) = stream.try_clone() else {
         return;
     };
@@ -2230,7 +2252,7 @@ fn metrics(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> 
         } else {
             0.0
         };
-        let rows: [(&str, &str, &str, String); 18] = [
+        let rows: [(&str, &str, &str, String); 19] = [
             (
                 "counter",
                 "prompt_tokens_total",
@@ -2333,6 +2355,12 @@ fn metrics(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> 
                 "requests_processing",
                 "Number of request processing.",
                 busy.to_string(),
+            ),
+            (
+                "counter",
+                "requests_cancelled_before_prompt_total",
+                "Requests cancelled before their prompt started",
+                s.n_cancelled_before_prompt_total.to_string(),
             ),
             (
                 "gauge",
@@ -3120,6 +3148,7 @@ fn run_gen(
     input: &Prompt,
     prompt: Value,
     p: &GenParams,
+    peer: TcpStream,
     sink: &mut dyn FnMut(Event<'_>, usize) -> io::Result<()>,
 ) -> Result<(Result<Outcome, GenError>, usize), ApiError> {
     if let Some(reason) = state.fatal() {
@@ -3149,6 +3178,10 @@ fn run_gen(
     // slot, as any refused sampling field does.
     let sampler = genloop::sampler_of(&state.shared.sampler, p)
         .map_err(|e| invalid(format!("the sampler refuses the sampling parameters: {e}")))?;
+    let client = Arc::new(Client {
+        stream: peer,
+        gone: Mutex::new(false),
+    });
     let (events, rx) = mpsc::channel();
     let submit = Submit {
         p: p.clone(),
@@ -3157,6 +3190,7 @@ fn run_gen(
         media: input.feeds.clone(),
         sampler,
         events,
+        client: Arc::clone(&client),
     };
     relock(&state.shared.board)
         .enqueue(input.held.clone(), submit)
@@ -3164,10 +3198,29 @@ fn run_gen(
     state.shared.work.notify_one();
     let mut slot = None;
     loop {
-        let Ok(m) = rx.recv() else {
-            return Err(engine_gone(state, slot.is_some()));
-        };
         let at = slot.unwrap_or(0);
+        if (slot.is_none() || !p.stream)
+            && let Err(e) = client.check()
+        {
+            let cancelled =
+                relock(&state.shared.board).cancel(|sub| Arc::ptr_eq(&sub.client, &client));
+            if cancelled {
+                relock(&state.shared.stats).n_cancelled_before_prompt_total += 1;
+            }
+            return Ok((Err(GenError::Client(e)), at));
+        }
+        let received = if p.stream && slot.is_some() {
+            rx.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected)
+        } else {
+            rx.recv_timeout(Duration::from_millis(100))
+        };
+        let m = match received {
+            Ok(m) => m,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(engine_gone(state, slot.is_some()));
+            }
+        };
         let sent = match m {
             Msg::Started(s) => {
                 slot = Some(s);
@@ -3197,22 +3250,42 @@ pub(crate) fn client_gone() -> io::Error {
     io::Error::new(io::ErrorKind::BrokenPipe, "the client went away")
 }
 
-/// Whether the client of `w` is still there, asked at the generation's
-/// events: a one-byte peek with the socket in non-blocking mode, so nothing
-/// waits and no byte of a pipelined next request is consumed. Readable bytes
-/// and nothing to read are a client; no bytes at all (`Ok(0)`), a reset or an
-/// abort are [`client_gone`]; any other failure is returned as it is. The
-/// socket is blocking again on return, on every path: the connection's reader
-/// shares it, and the answer is written to it.
+/// The response side's failure shared by the HTTP and engine threads. A socket
+/// error is consumed by `take_error`, so the first observer remembers it.
+pub(crate) struct Client {
+    stream: TcpStream,
+    gone: Mutex<bool>,
+}
+
+impl Client {
+    pub(crate) fn check(&self) -> io::Result<()> {
+        let mut gone = relock(&self.gone);
+        if *gone {
+            return Err(client_gone());
+        }
+        let result = probe_client(&self.stream);
+        #[cfg(test)]
+        if result.is_err() {
+            testserve::CLIENT_PROBE.with_borrow_mut(|pause| {
+                if let Some((probed, resume)) = pause.take() {
+                    probed.send(()).expect("the probe observer");
+                    resume
+                        .recv_timeout(Duration::from_secs(10))
+                        .expect("the probe resumes");
+                }
+            });
+        }
+        *gone = result.is_err();
+        result
+    }
+}
+
+/// A transport error ends a request. Read EOF alone also describes a client
+/// that closed only its write side and is still waiting for the response.
 fn probe_client(w: &TcpStream) -> io::Result<()> {
-    w.set_nonblocking(true)?;
-    let peeked = w.peek(&mut [0u8; 1]);
-    w.set_nonblocking(false)?;
-    match peeked {
-        Ok(0) => Err(client_gone()),
-        Ok(_) => Ok(()),
-        Err(e) => match e.kind() {
-            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted => Ok(()),
+    match w.take_error()? {
+        None => Ok(()),
+        Some(e) => match e.kind() {
             io::ErrorKind::ConnectionReset
             | io::ErrorKind::ConnectionAborted
             | io::ErrorKind::BrokenPipe
@@ -3223,11 +3296,10 @@ fn probe_client(w: &TcpStream) -> io::Result<()> {
 }
 
 /// [`run_gen`] for a request that answers once the generation is whole: it
-/// sends nothing while the generation runs, so its sink only watches the
-/// client of `w` ([`probe_client`]), and a client that closed ends the request
-/// at the next event, as a stream's failed write does. The outer error is that
-/// client's, whose connection ends with no answer; the inner one the request's
-/// answer, an engine error a 500.
+/// sends nothing while the generation runs. The shared transport check ends
+/// a failed connection while preserving a client's write-side shutdown. The
+/// outer error is that client's, whose connection ends with no answer; the
+/// inner one is the request's answer, an engine error a 500.
 fn run_whole(
     state: &State,
     input: &Prompt,
@@ -3235,7 +3307,7 @@ fn run_whole(
     p: &GenParams,
     w: &TcpStream,
 ) -> io::Result<Result<(Outcome, usize), ApiError>> {
-    match run_gen(state, input, prompt, p, &mut |_, _| probe_client(w)) {
+    match run_gen(state, input, prompt, p, w.try_clone()?, &mut |_, _| Ok(())) {
         Err(e) => Ok(Err(e)),
         Ok((Err(GenError::Client(e)), _)) => Err(e),
         Ok((Err(e), _)) => Ok(Err(engine_error(&e))),
@@ -3705,6 +3777,7 @@ fn completion(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<boo
             ),
         };
     }
+    let peer = w.try_clone()?;
     let mut stream: Option<EventStream<'_>> = None;
     let mut w_opt = Some(w);
     let tpt = p.timings_per_token;
@@ -3744,7 +3817,7 @@ fn completion(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<boo
             };
             sse(s, &v)
         };
-        run_gen(state, &input, prompt.clone(), &p, &mut sink)
+        run_gen(state, &input, prompt.clone(), &p, peer, &mut sink)
     };
     let slot = r.as_ref().map_or(0, |(_, slot)| *slot);
     finish_stream(req, stream, w_opt, r.map(|(o, _)| o), |s, o| {
@@ -4035,6 +4108,7 @@ fn chat(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
             },
         };
     }
+    let peer = w.try_clone()?;
     let mut stream: Option<EventStream<'_>> = None;
     let mut w_opt = Some(w);
     let tpt = p.timings_per_token;
@@ -4104,7 +4178,7 @@ fn chat(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
                 }
             }
         };
-        run_gen(state, &input, prompt, &p, &mut sink).map(|(o, _)| o)
+        run_gen(state, &input, prompt, &p, peer, &mut sink).map(|(o, _)| o)
     };
     let r = match markup {
         Some(e) => Err(tool_markup_error(&e)),
@@ -6228,7 +6302,7 @@ mod tests {
     /// with an engine the test paces a step at a time.
     mod gone_client {
         use std::io::{self, Read, Write};
-        use std::net::{TcpListener, TcpStream};
+        use std::net::{SocketAddr, TcpListener, TcpStream};
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::mpsc;
@@ -6236,15 +6310,26 @@ mod tests {
 
         use crate::api::{probe_client, relock, testserve};
         use crate::sched::Use;
-        use crate::{Engine, EngineError, MockEngine, Tokenizer};
+        use crate::{Engine, EngineError, MockEngine, SavedState, StateError, Tokenizer};
 
-        /// The mock engine with every `next` held at a gate: the call is
-        /// counted, then waits for a permit the test sends, so the test
-        /// decides how many steps the generation takes.
+        /// The mock engine with every `next` and every snapshot held at a
+        /// gate: the call is counted, then waits for a permit the test sends,
+        /// so the test decides how many steps the generation takes and where
+        /// a move between slots that take it in turns stands.
         struct Gated {
             inner: MockEngine,
             calls: Arc<AtomicUsize>,
             permits: mpsc::Receiver<()>,
+            prefilled: Arc<AtomicUsize>,
+        }
+
+        impl Gated {
+            fn gate(&self) -> Result<(), EngineError> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.permits
+                    .recv()
+                    .map_err(|_| EngineError("the test's gate closed".to_owned()))
+            }
         }
 
         impl Engine for Gated {
@@ -6252,6 +6337,7 @@ mod tests {
                 self.inner.tokenizer()
             }
             fn prefill(&mut self, ids: &[u32]) -> Result<(), EngineError> {
+                self.prefilled.fetch_add(1, Ordering::SeqCst);
                 self.inner.prefill(ids)
             }
             fn next(
@@ -6259,10 +6345,7 @@ mod tests {
                 last: u32,
                 logits_out: Option<&mut [f32]>,
             ) -> Result<u32, EngineError> {
-                self.calls.fetch_add(1, Ordering::SeqCst);
-                self.permits
-                    .recv()
-                    .map_err(|_| EngineError("the test's gate closed".to_owned()))?;
+                self.gate()?;
                 self.inner.next(last, logits_out)
             }
             fn reset(&mut self) -> Result<(), EngineError> {
@@ -6273,6 +6356,446 @@ mod tests {
             }
             fn describe(&self) -> String {
                 "the gated mock".to_owned()
+            }
+            fn save_state(&self, out: &mut dyn Write) -> Result<SavedState, StateError> {
+                self.gate()?;
+                self.inner.save_state(out)
+            }
+            fn restore_state(&mut self, input: &mut dyn Read) -> Result<SavedState, StateError> {
+                self.inner.restore_state(input)
+            }
+        }
+
+        #[cfg(unix)]
+        fn reset(client: TcpStream) {
+            use std::os::fd::AsRawFd;
+            let linger = libc::linger {
+                l_onoff: 1,
+                l_linger: 0,
+            };
+            // SAFETY: the socket is live and linger points to a value of the stated size.
+            let rc = unsafe {
+                libc::setsockopt(
+                    client.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_LINGER,
+                    (&linger as *const libc::linger).cast(),
+                    std::mem::size_of_val(&linger) as libc::socklen_t,
+                )
+            };
+            assert_eq!(rc, 0, "linger: {}", io::Error::last_os_error());
+            drop(client);
+        }
+
+        /// A greedy `/completion` of `prompt` for `n_predict` tokens, its answer unread.
+        fn complete(addr: SocketAddr, prompt: &str, n_predict: usize) -> TcpStream {
+            let body =
+                format!(r#"{{"prompt":"{prompt}","temperature":0,"n_predict":{n_predict}}}"#);
+            testserve::send_request(addr, "POST", "/completion", &[], &body)
+        }
+
+        /// The whole answer `s` reads, a 200: its JSON body.
+        fn answer(mut s: TcpStream) -> serde_json::Value {
+            s.set_read_timeout(Some(Duration::from_secs(3)))
+                .expect("timeout");
+            let mut raw = String::new();
+            s.read_to_string(&mut raw).expect("answer");
+            assert!(raw.starts_with("HTTP/1.0 200"), "{raw}");
+            serde_json::from_str(raw.split_once("\r\n\r\n").expect("head").1).expect("JSON")
+        }
+
+        #[test]
+        fn lifecycle_half_closed_request_receives_its_whole_answer() {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let (permit, permits) = mpsc::channel();
+            let (addr, state, _ended) = testserve::spawn(
+                Box::new(Gated {
+                    inner: MockEngine::new(1024),
+                    calls: Arc::clone(&calls),
+                    permits,
+                    prefilled: Arc::new(AtomicUsize::new(0)),
+                }),
+                testserve::mock_config(),
+            );
+            let client = complete(addr, "abab", 1);
+            wait_for("the first step", || calls.load(Ordering::SeqCst) == 1);
+            client
+                .shutdown(std::net::Shutdown::Write)
+                .expect("half close");
+            permit.send(()).expect("release");
+            let body = answer(client);
+            assert_eq!(body["content"], "a");
+            assert_eq!(body["tokens_predicted"], 1);
+            assert_eq!(
+                relock(&state.shared.stats).n_cancelled_before_prompt_total,
+                0
+            );
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn lifecycle_reset_while_queued_never_prefills() {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let prefilled = Arc::new(AtomicUsize::new(0));
+            let (permit, permits) = mpsc::channel();
+            let server = super::super::Server::bind_with(
+                "127.0.0.1:0",
+                Box::new(Gated {
+                    inner: MockEngine::new(1024),
+                    calls: Arc::clone(&calls),
+                    permits,
+                    prefilled: Arc::clone(&prefilled),
+                }),
+                testserve::mock_config(),
+                crate::SlotConfig {
+                    queue_depth: Some(1),
+                    ..crate::SlotConfig::default()
+                },
+            )
+            .expect("bind");
+            let addr = server.local_addr().expect("addr");
+            let (state, _ended) = server.start().expect("start");
+            let first = complete(addr, "abab", 1);
+            wait_for("the first request", || calls.load(Ordering::SeqCst) == 1);
+            let second = complete(addr, "cdcd", 1);
+            wait_for("the queued request", || {
+                relock(&state.shared.board).waiting() == 1
+            });
+            reset(second);
+            wait_for("the queued connection's release", || {
+                state.shared.answers.in_flight() == 1
+            });
+            assert_eq!(
+                relock(&state.shared.board).waiting(),
+                0,
+                "the reset connection still occupies the queue"
+            );
+            let third = complete(addr, "efef", 1);
+            wait_for(
+                "the next live request queued before the engine returns",
+                || relock(&state.shared.board).waiting() == 1,
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            permit.send(()).expect("release first");
+            answer(first);
+            wait_for("the next live request", || {
+                calls.load(Ordering::SeqCst) == 2
+            });
+            permit.send(()).expect("release next");
+            answer(third);
+            assert_eq!(
+                prefilled.load(Ordering::SeqCst),
+                2,
+                "a reset request reached prefill"
+            );
+            let (status, metrics) = testserve::roundtrip(addr, "GET", "/metrics", &[], "");
+            assert_eq!(status, 200, "{metrics}");
+            assert!(
+                metrics.contains("llamacpp:requests_cancelled_before_prompt_total 1\n"),
+                "{metrics}"
+            );
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn lifecycle_concurrent_reset_never_starts_a_prompt() {
+            use crate::api::Client;
+            use crate::genloop::GenParams;
+            use crate::media::Held;
+            use crate::worker::Submit;
+            use std::sync::Mutex;
+
+            let prefilled = Arc::new(AtomicUsize::new(0));
+            let (permit, permits) = mpsc::channel();
+            let (addr, state, _ended) = testserve::spawn(
+                Box::new(Gated {
+                    inner: MockEngine::new(1024),
+                    calls: Arc::new(AtomicUsize::new(0)),
+                    permits,
+                    prefilled: Arc::clone(&prefilled),
+                }),
+                testserve::mock_config(),
+            );
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+            let peer = TcpStream::connect(listener.local_addr().expect("addr")).expect("connect");
+            let (stream, _) = listener.accept().expect("accept");
+            let client = Arc::new(Client {
+                stream,
+                gone: Mutex::new(false),
+            });
+            let (probed, consumed) = mpsc::channel();
+            let (resume, resumed) = mpsc::channel();
+            reset(peer);
+            let observer = Arc::clone(&client);
+            let pause = Mutex::new(Some((probed, resumed)));
+            let (checked, checking) = mpsc::channel();
+            let live = Arc::new(AtomicUsize::new(0));
+            super::super::admit(
+                &Arc::new(move |_: TcpStream| {
+                    testserve::CLIENT_PROBE.with_borrow_mut(|hook| *hook = relock(&pause).take());
+                    wait_for("the reset error", || observer.check().is_err());
+                    checked.send(()).expect("the checker finished");
+                }),
+                &live,
+                &Arc::new(AtomicUsize::new(0)),
+                0,
+                client.stream.try_clone().expect("the checker's connection"),
+            );
+            consumed
+                .recv_timeout(Duration::from_secs(3))
+                .expect("the first observer consumed the reset");
+            let (events, received) = mpsc::channel();
+            relock(&state.shared.board)
+                .enqueue(
+                    Held::from(vec![97, 98, 97, 98]),
+                    Submit {
+                        p: GenParams {
+                            n_predict: 1,
+                            ..super::super::default_params(&state)
+                        },
+                        prompt: serde_json::Value::Null,
+                        settings: serde_json::Value::Null,
+                        media: Vec::new(),
+                        sampler: None,
+                        events,
+                        client,
+                    },
+                )
+                .unwrap_or_else(|_| panic!("queue refused"));
+            state.shared.work.notify_one();
+            wait_for("the worker's admission", || {
+                let board = relock(&state.shared.board);
+                board.waiting() == 0 && board.free() == 0
+            });
+            let admitted = received.recv_timeout(Duration::from_millis(200));
+            permit.send(()).expect("release any incorrect prefill");
+            resume.send(()).expect("publish the reset");
+            checking
+                .recv_timeout(Duration::from_secs(3))
+                .expect("the first checker");
+            wait_for("the checker's connection release", || {
+                live.load(Ordering::SeqCst) == 0
+            });
+            assert!(
+                matches!(admitted, Err(mpsc::RecvTimeoutError::Timeout)),
+                "the worker admitted a request while its reset was being observed"
+            );
+            assert!(
+                matches!(
+                    received.recv_timeout(Duration::from_secs(3)),
+                    Err(mpsc::RecvTimeoutError::Disconnected)
+                ),
+                "the reset request sent an event"
+            );
+            wait_for("the cancelled slot's release", || {
+                relock(&state.shared.board).free() == 1
+            });
+            assert_eq!(prefilled.load(Ordering::SeqCst), 0);
+            let (status, metrics) = testserve::roundtrip(addr, "GET", "/metrics", &[], "");
+            assert_eq!(status, 200, "{metrics}");
+            assert!(
+                metrics.contains("llamacpp:requests_cancelled_before_prompt_total 1\n"),
+                "{metrics}"
+            );
+        }
+
+        /// Two slots that take the engine in turns, A running on slot 0 and
+        /// B's ended state parked idle on slot 1: a request for slot 1 whose
+        /// client left while it waited is cancelled before the engine moves,
+        /// and one whose client resets while A's snapshot is taken for the
+        /// move takes B's handed-back state with its prompt. A completes and
+        /// the server serves on.
+        #[cfg(unix)]
+        #[test]
+        fn lifecycle_resets_around_a_turn_switch_leave_the_turns_serving() {
+            use crate::api::Server;
+            use crate::swap::Turn;
+            use crate::{Park, SlotConfig, SwapEngine};
+
+            let calls = Arc::new(AtomicUsize::new(0));
+            let prefilled = Arc::new(AtomicUsize::new(0));
+            let (permit, permits) = mpsc::channel();
+            let gated = Gated {
+                inner: MockEngine::new(1024),
+                calls: Arc::clone(&calls),
+                permits,
+                prefilled: Arc::clone(&prefilled),
+            };
+            let swap = SwapEngine::new(Box::new(gated), 2, Park::States { budget: 1 << 20 })
+                .unwrap_or_else(|e| panic!("swap engine: {e}"));
+            let slots = SlotConfig {
+                parallel: 2,
+                ..SlotConfig::default()
+            };
+            let server = Server::bind_with(
+                "127.0.0.1:0",
+                Box::new(swap),
+                testserve::mock_config(),
+                slots,
+            )
+            .expect("bind");
+            let addr = server.local_addr().expect("addr");
+            let (state, _ended) = server.start().expect("start");
+            // Lets the `k`-th gated call run once it waits.
+            let release = |k: usize, what: &str| {
+                wait_for(what, || calls.load(Ordering::SeqCst) == k);
+                permit.send(()).expect(what);
+            };
+            let queued = |what: &str| wait_for(what, || relock(&state.shared.board).waiting() == 1);
+            let a = complete(addr, "abab", 40);
+            wait_for("A's prompt step", || calls.load(Ordering::SeqCst) == 1);
+            let b = complete(addr, "cdcd", 1);
+            queued("B queued");
+            release(1, "A's prompt step");
+            release(2, "A's second step");
+            release(3, "A parked for B");
+            release(4, "B's prompt step");
+            assert_eq!(answer(b)["content"], "c");
+            release(5, "B parked idle for A");
+            wait_for("A's third step", || calls.load(Ordering::SeqCst) == 6);
+            assert_eq!(
+                relock(&state.shared.turns).as_deref(),
+                Some(&[Turn::Running, Turn::Idle][..]),
+                "the fixture: A runs on slot 0 and slot 1 is idle"
+            );
+            assert_eq!(
+                relock(&state.shared.stats).parked_bytes,
+                16 + 4 * 4,
+                "the fixture: B's four positions parked"
+            );
+
+            let gone = complete(addr, "efef", 1);
+            queued("the request that leaves queued");
+            reset(gone);
+            wait_for("its connection's release", || {
+                state.shared.answers.in_flight() == 1
+            });
+            release(6, "A's third step");
+            wait_for("A's fourth step", || calls.load(Ordering::SeqCst) == 7);
+            assert_eq!(prefilled.load(Ordering::SeqCst), 2, "A's and B's prompts");
+            assert_eq!(
+                relock(&state.shared.stats).n_cancelled_before_prompt_total,
+                1,
+                "the request that left was cancelled before the engine moved"
+            );
+
+            let reset_in_move = complete(addr, "ghgh", 1);
+            queued("the request that resets queued");
+            release(7, "A's fourth step");
+            wait_for("A parked for the move", || {
+                calls.load(Ordering::SeqCst) == 8
+            });
+            reset(reset_in_move);
+            wait_for("its connection's release", || {
+                state.shared.answers.in_flight() == 1
+            });
+            // Permits ahead for the rest: the move, the reset request's
+            // prompt, A's remaining steps and one more request.
+            for _ in 0..64 {
+                permit.send(()).expect("release the rest");
+            }
+            assert_eq!(answer(a)["tokens_predicted"], 40);
+            assert_eq!(answer(complete(addr, "ijij", 1))["content"], "i");
+        }
+
+        #[test]
+        fn lifecycle_stalled_writers_release_their_connection() {
+            for streaming in [false, true] {
+                let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+                let mut client =
+                    TcpStream::connect(listener.local_addr().expect("addr")).expect("connect");
+                let (server, _) = listener.accept().expect("accept");
+                let live = Arc::new(AtomicUsize::new(0));
+                let (done, completed) = mpsc::channel();
+                let serve = Arc::new(move |server| {
+                    super::super::keep_alive(
+                        server,
+                        &Default::default(),
+                        &Default::default(),
+                        |req, w| {
+                            assert!(
+                                w.write_timeout()? == Some(Duration::from_secs(10)),
+                                "response writes must time out after ten seconds"
+                            );
+                            w.set_write_timeout(Some(Duration::from_millis(100)))?;
+                            let body = vec![b'x'; 16 << 20];
+                            let result = if streaming {
+                                super::super::http::EventStream::start(
+                                    w,
+                                    req,
+                                    200,
+                                    "text/event-stream",
+                                )?
+                                .send(&body)
+                            } else {
+                                super::super::http::respond(w, req, 200, "text/plain", &[], &body)
+                            };
+                            let kind = result.expect_err("the reader made no progress").kind();
+                            assert!(
+                                matches!(kind, io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut),
+                                "{kind:?}"
+                            );
+                            Ok(false)
+                        },
+                    );
+                    done.send(()).expect("done");
+                });
+                super::super::admit(&serve, &live, &Arc::new(AtomicUsize::new(0)), 0, server);
+                client
+                    .write_all(b"GET /health HTTP/1.0\r\n\r\n")
+                    .expect("request");
+                let result = completed.recv_timeout(Duration::from_secs(3));
+                drop(client);
+                result.expect("the stalled writer did not finish");
+                wait_for("the writer's connection release", || {
+                    live.load(Ordering::SeqCst) == 0
+                });
+            }
+        }
+
+        #[test]
+        fn lifecycle_refusal_does_not_block_admission() {
+            use super::super::MAX_CONNECTIONS;
+
+            for (held, rejecting) in [
+                (MAX_CONNECTIONS, 0),
+                (MAX_CONNECTIONS, 1),
+                (MAX_CONNECTIONS - 1, 1),
+            ] {
+                let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+                let mut client =
+                    TcpStream::connect(listener.local_addr().expect("addr")).expect("connect");
+                client
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .expect("timeout");
+                let (server, _) = listener.accept().expect("accept");
+                let live = Arc::new(AtomicUsize::new(held));
+                let refusing = Arc::new(AtomicUsize::new(rejecting));
+                let serve = Arc::new(|mut stream: TcpStream| {
+                    stream.write_all(b"admitted").expect("answer")
+                });
+                let start = Instant::now();
+                super::super::admit(&serve, &live, &refusing, 0, server);
+                assert!(
+                    start.elapsed() < super::super::REFUSE_DRAIN / 2,
+                    "accept waited {:?} for a refusal",
+                    start.elapsed()
+                );
+                let mut answer = String::new();
+                client.read_to_string(&mut answer).expect("answer");
+                if held < MAX_CONNECTIONS {
+                    assert_eq!(answer, "admitted", "a refusal blocked a free place");
+                } else if rejecting == 0 {
+                    assert!(answer.starts_with("HTTP/1.1 503"), "{answer}");
+                    assert!(answer.contains("Retry-After: 1\r\n"), "{answer}");
+                } else {
+                    assert!(answer.is_empty(), "an extra refusal was admitted: {answer}");
+                }
+                drop(client);
+                wait_for("the connection's permit release", || {
+                    live.load(Ordering::SeqCst) == held
+                        && refusing.load(Ordering::SeqCst) == rejecting
+                });
             }
         }
 
@@ -6300,8 +6823,8 @@ mod tests {
 
         /// The probe over a real socket pair: a quiet peer and a peer with
         /// bytes pending are clients (the bytes are still there to read, the
-        /// next request's among them), a peer that closed is gone, and the
-        /// socket is blocking again after a probe that found a client — the
+        /// next request's among them), read EOF permits an answer, and the
+        /// socket stays blocking after a probe that found a client — the
         /// connection's reader shares it.
         #[test]
         fn the_probe_tells_a_client_from_a_gone_one_and_leaves_the_socket_blocking() {
@@ -6326,16 +6849,16 @@ mod tests {
 
             drop(client);
             assert_eq!(server.read(&mut got).expect("the end of the stream"), 0);
-            let gone = probe_client(&server).expect_err("a closed client is gone");
-            assert_eq!(gone.kind(), io::ErrorKind::BrokenPipe, "{gone}");
-            assert_eq!(gone.to_string(), "the client went away");
+            // PIN(2026-10-23): EOF permits a response to a write-side shutdown; reset is checked separately.
+            probe_client(&server).expect("EOF alone does not close the response side");
         }
 
-        /// A whole-answer request whose client closes its socket after the
+        /// A whole-answer request whose client resets its socket after the
         /// generation started ends at the next event and frees its slot. The
         /// engine is held at a gate and given one step at a time: a
         /// generation that is not cancelled takes every step the test gives,
         /// to a context the mock never ends, and the slot is still running.
+        #[cfg(unix)]
         #[test]
         fn a_whole_answer_whose_client_closed_ends_at_the_next_event() {
             const STEPS: usize = 24;
@@ -6345,6 +6868,7 @@ mod tests {
                 inner: MockEngine::new(1 << 16),
                 calls: Arc::clone(&calls),
                 permits,
+                prefilled: Arc::new(AtomicUsize::new(0)),
             };
             let (addr, state, _ended) =
                 testserve::spawn(Box::new(engine), testserve::mock_config());
@@ -6361,7 +6885,7 @@ mod tests {
             );
             wait_for("the generation's first step", || called() >= 1);
             assert!(!free(), "the request holds the slot");
-            drop(client);
+            reset(client);
 
             for step in 1..=STEPS {
                 permit.send(()).expect("the engine holds its gate");

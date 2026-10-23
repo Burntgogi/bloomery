@@ -485,7 +485,9 @@ gguf 7 2 0
 # PIN(2026-10-23): gpu 2269 -> 2266 blocks; checked windows replace the MTP hidden-row views and the store inbox view.
 # PIN(2026-10-23): gpu 2266 -> 2267 blocks, new held-stream error test queues one copy
 # into its private staging extent and keeps it lent until the lane drains.
-gpu 2267 281 10
+# PIN(2026-10-23): gpu 2267 -> 2268 blocks, new test-only pinned source view
+# for the XStream fallback copy's lifetime contract, with its SAFETY line.
+gpu 2268 281 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.
@@ -726,7 +728,10 @@ sampler 4 4 1
 # handling (api.rs, libc already the workspace's) — the handlers' pipe pair, the reader thread's read,
 # the zeroed sigaction and its registration, the handler's stderr write with _exit on a second
 # interrupt and its one-byte write on the first, each with its SAFETY line.
-serve 6 0 0
+# PIN(2026-10-23): serve 6 -> 11 blocks, new code, not old code relaxed: the terminal width ioctl and the PTY viewport test, each with its SAFETY invariant.
+# PIN(2026-10-24): serve 11 -> 12 blocks, new test code: a live socket receives SO_LINGER
+# with a correctly sized linger value to reproduce a peer reset without timing assumptions.
+serve 12 0 0
 threads 3 0 1
 tokenizer 0 0 0
 # PIN(2026-10-14): verbs 0 -> 57 blocks, 22 fns, 2 impls, new crate, moved from gpu-gates/src/bin/shared/verbs.rs (45

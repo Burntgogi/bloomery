@@ -4138,8 +4138,8 @@ mod gate {
     /// whose missing refusal would move a slot last.
     #[derive(Clone, Copy, Debug)]
     enum G5 {
-        /// Three rows in one pass, a row a slot: the body's refusal naming
-        /// the points its walk lays.
+        /// Three rows in one pass, a row a slot: the common owner's sequence
+        /// limit refuses it before the body runs.
         Bound,
         /// The taps armed.
         Taps,
@@ -4155,7 +4155,7 @@ mod gate {
     impl G5 {
         fn says(self) -> &'static str {
             match self {
-                G5::Bound => "a pass of three slots' rows (naming the points the walk lays)",
+                G5::Bound => "a pass of three slots' rows (naming the sequence limit)",
                 G5::Taps => "a pass with the taps armed",
                 G5::Held => "a pass beside slot 1's step failed past its launch",
                 G5::Two => "a pass of slot 0's two rows",
@@ -4234,12 +4234,10 @@ mod gate {
         let both: [(usize, &[u32]); 2] = [(0, &[t0]), (1, &[t1])];
         let mut before = slot_positions(m)?;
         let named = match case {
-            // The owner's bound holds four rows, so three reach the body,
-            // whose walk lays no point for them.
             G5::Bound => refused_by(
                 &m.step_slots(&[(0, &[t0]), (1, &[t1]), (2, &[t1])]),
-                GLM_BODY,
-                "the walk lays",
+                "GpuModel::step_slots",
+                "SlotRows::MAX_SLOTS",
             ),
             G5::Taps => {
                 set_taps(m, true)?;
@@ -4392,6 +4390,7 @@ mod gate {
 
     /// (h1)'s drafted rounds a slot: (sd)'s first group's passes.
     const H_ROUNDS: usize = SLOT_PASSES;
+    const H_SLOTS: usize = 4;
 
     /// (h2)'s forced kept rows a round, slot 0's and slot 1's: every pair of
     /// one and two rows.
@@ -5100,6 +5099,55 @@ mod gate {
         ok &= clause_timed("slots", "(h2) forced keeps", || h2_kept(s, (a, b)));
         ok &= clause_timed("slots", "(h3) refusals", || h3_refusals(s, inputs, (a, b)));
         ok &= clause_timed("slots", "(h4) walk", || h4_walk(s, (a, b)));
+        ok &= clause_timed("slots", "(h5) round limits", || h5_round_limits(s, [a, b]));
+        Ok(ok)
+    }
+
+    /// Four drafted windows use legal passes and return the same ids as
+    /// each window run independently.
+    fn h5_round_limits(s: &mut Session<Body>, prompts: [&[u32]; 2]) -> Result<bool, GateError> {
+        s.add_slots(H_SLOTS)?;
+        let mut ok = true;
+        for mode in [StepMode::Eager, StepMode::Graph] {
+            s.model_mut().set_mode(mode);
+            let mut expected = Vec::new();
+            for slot in 0..H_SLOTS {
+                let r = h_solo(s, prompts[slot % prompts.len()], &[None])?;
+                expected.push(r.ids[1..r.ids.len() - 1].to_vec());
+            }
+            let mut drafts = Vec::new();
+            let mut lasts = Vec::new();
+            for slot in 0..H_SLOTS {
+                let mut d = d_open(s)?;
+                let r = d_start(s, &mut d, slot, prompts[slot % prompts.len()])?;
+                lasts.push(r.last()?);
+                drafts.push(d);
+            }
+            let mut outs = vec![Vec::new(); drafts.len()];
+            let mut windows: Vec<_> = drafts
+                .iter_mut()
+                .zip(&mut outs)
+                .enumerate()
+                .map(|(slot, (draft, out))| app::mtp::SlotWindow {
+                    slot,
+                    last: lasts[slot],
+                    depth: 1,
+                    draft,
+                    out,
+                })
+                .collect();
+            let (commits, passes) = app::mtp::pass_slots(s, &mut windows)?;
+            let same = outs == expected
+                && passes == 2
+                && s.selected() == 0
+                && commits.len() == drafts.len();
+            println!(
+                "stagger-draft (h5) {mode:?} four windows passes={passes} solo_ids={} {}",
+                outs == expected,
+                verdict(same)
+            );
+            ok &= same;
+        }
         Ok(ok)
     }
 
@@ -5385,23 +5433,33 @@ mod gate {
     fn hostless_open(
         path: &std::path::Path,
         host: bloomery_levers::HostCfg,
+        slots: usize,
         ids: &[u32],
         mode: Option<StepMode>,
     ) -> Result<(bool, Glm5nextModel, PlanInputs), GateError> {
         let file = Split::open(path)?;
         let inputs = PlanInputs::read(&file)?;
-        let machine = slot_machine(&inputs, 1)?;
+        let machine = slot_machine(&inputs, slots)?;
         let plan = inputs.plan_slots(
             &machine,
             SLOT_CTX as u64,
             &PlanLevers::default(),
             KdaLanes::One,
-            1,
+            slots,
         )?;
         if plan.host.experts != 0 || plan.n_l != [288] {
             return Err("hostless: the fixture must hold every routed expert on the card".into());
         }
-        let mut m = Body::open_placed(file, &plan, &inputs, 0, host)?;
+        let mut m = Body::open_placed_slots(
+            file,
+            &plan,
+            &inputs,
+            0,
+            host,
+            Residency::Off,
+            KdaLanes::One,
+            slots,
+        )?;
         let no_views = {
             let (_, _, body) = m.body_parts("hostless")?;
             body.hybrid_mut().host_mut().is_empty()
@@ -5429,6 +5487,7 @@ mod gate {
                 route_trace: true,
                 ..host
             },
+            1,
             ids,
             None,
         )?;
@@ -5464,7 +5523,7 @@ mod gate {
         tier::sc("hostless NVFP4 placed load and generation")?;
         let path = hostless_fixture(GgmlType::NVFP4)?;
         let ids = [1, 2, 3, 4];
-        let (no_views, mut m, inputs) = hostless_open(&path, levers.host(), &ids, None)?;
+        let (no_views, mut m, inputs) = hostless_open(&path, levers.host(), 3, &ids, None)?;
         let mut outputs = Vec::new();
         for mode in [StepMode::Eager, StepMode::Graph] {
             m.reset()?;
@@ -5491,6 +5550,22 @@ mod gate {
         println!(
             "hostless: nvfp4 no_host_views={no_views} host_memops={host_ops} eager=graph=batch finite logits tokens={token},{next} {}",
             verdict(ok && generated)
+        );
+        m.add_slots(3)?;
+        let rows = [(0, &ids[..1]), (1, &ids[..1]), (2, &ids[..1])];
+        let captures = m.capture_slots(&[(0, 1), (1, 1), (2, 1)]);
+        let steps = m.step_slots(&rows);
+        let verifies = m.verify_slots(&rows);
+        let limits_ok = [
+            captures.map(|_| ()),
+            steps.map(|_| ()),
+            verifies.map(|_| ()),
+        ]
+        .iter()
+        .all(|r| matches!(r, Err(e) if e.to_string().contains("SlotRows::MAX_SLOTS")));
+        println!(
+            "hostless: three sequences refused before capture, step and verify {}",
+            verdict(limits_ok)
         );
         // A forced row of the hostless layer serves no host row: no host sum, and the
         // block's output is the card sum plus the shared expert's.
@@ -5523,7 +5598,7 @@ mod gate {
         let eager = Some(StepMode::Eager);
         let mut trace_ok = true;
         for (routed, path) in [(GgmlType::NVFP4, &path), (GgmlType::Q4_K, &q4k)] {
-            let (bare, m, _) = hostless_open(path, levers.host(), &ids, eager)?;
+            let (bare, m, _) = hostless_open(path, levers.host(), 1, &ids, eager)?;
             let want = m.logits()?;
             drop(m);
             let (viewless, m, set) = match traced_open(path, levers.host(), &ids) {
@@ -5554,7 +5629,7 @@ mod gate {
             );
             trace_ok &= ok;
         }
-        Ok(ok && generated && forced_ok && trace_ok)
+        Ok(ok && generated && limits_ok && forced_ok && trace_ok)
     }
 
     pub fn run() -> Result<(), GateError> {
@@ -5655,7 +5730,7 @@ mod gate {
                 nextn,
                 prompts: [a, b],
             };
-            let mut s = Session::from_model(body.open(SLOTS)?, u32::try_from(SLOT_CTX)?);
+            let mut s = Session::from_model(body.open(H_SLOTS)?, u32::try_from(SLOT_CTX)?);
             s.model_mut().set_mode(StepMode::Graph);
             s.add_slots(SLOTS)?;
             let t = Instant::now();

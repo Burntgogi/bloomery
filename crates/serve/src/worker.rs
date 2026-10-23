@@ -19,7 +19,7 @@
 //! last event is sent, so the response a client reads finds the slot free
 //! and the counters final. A client gone ends its request at the next event,
 //! a stream's or a whole answer's alike: its HTTP thread's sink fails (a
-//! stream's write, a whole answer's socket reading closed), the thread drops
+//! stream's write or the shared transport-error check), the thread drops
 //! its channel, the engine thread's send fails, and the slot is released.
 //!
 //! An engine whose slots take it in turns ([`Engine::turns`]) is run by the
@@ -74,6 +74,8 @@ pub(crate) struct Stats {
     pub t_predicted_ms_total: f64,
     /// Engine calls: a prompt's, and each step of one slot or several.
     pub n_decode_total: u64,
+    /// Requests whose client or event receiver left before their prompt started.
+    pub n_cancelled_before_prompt_total: u64,
     /// Over every engine call, the slots it carried.
     pub n_busy_slots_total: u64,
     /// The longest a request's sequence grew (prompt and generation, `n_past`).
@@ -115,6 +117,7 @@ pub(crate) struct Submit {
     /// ([`crate::genloop::sampler_of`]).
     pub sampler: Option<Sampler>,
     pub events: mpsc::Sender<Msg>,
+    pub client: Arc<crate::api::Client>,
 }
 
 /// What the engine thread tells a request's HTTP thread.
@@ -125,9 +128,9 @@ pub(crate) enum Msg {
     Text(String, Timings),
     /// The last message.
     Done(Result<Outcome, GenError>),
-    /// The request was not started: the state of the request on the engine
-    /// could not be parked. Sent before any other message; the request may
-    /// succeed later as it is.
+    /// The request took its slot but did not start: the state of the request
+    /// on the engine could not be parked. Its one message after
+    /// [`Msg::Started`]; the request may succeed later as it is.
     Refused(String),
 }
 
@@ -624,9 +627,18 @@ impl Worker {
 
     /// A request that took `slot`: its prompt (`held`, with its images'
     /// feeds), run now, or planned as calls of the engine's quantum that
-    /// [`Worker::prompts`] runs one a round ([`Worker::interleaves`]).
-    /// Returns whether it runs on (an error ended it otherwise).
+    /// [`Worker::prompts`] runs one a round ([`Worker::interleaves`]). A
+    /// request whose client left is cancelled before anything runs, here or,
+    /// when the slots take turns, in [`Worker::begin`] before the engine
+    /// moves. Returns whether it runs on (an error ended it otherwise).
     fn start(&mut self, slot: usize, held: &Held, sub: Submit) -> Result<bool, Dead> {
+        if self.turns.is_none()
+            && (sub.client.check().is_err() || sub.events.send(Msg::Started(slot)).is_err())
+        {
+            relock(&self.sh.stats).n_cancelled_before_prompt_total += 1;
+            relock(&self.sh.board).release(slot);
+            return Ok(false);
+        }
         let Submit {
             p,
             prompt,
@@ -634,8 +646,8 @@ impl Worker {
             media,
             sampler,
             events,
+            client: _,
         } = sub;
-        let _ = events.send(Msg::Started(slot));
         *relock(&self.sh.board).view_mut(slot) = SlotView {
             id_task: self.sh.next_id(),
             prompt,
@@ -1124,11 +1136,19 @@ impl Worker {
             .map(|a| a.slot)
     }
 
-    /// The first pending request's prompt: the engine moves to its slot (a
-    /// live request's state that cannot be parked refuses it by name), its
-    /// prompt runs, and its turn begins.
+    /// The first pending request's prompt: unless its client left, the engine
+    /// moves to its slot (a live request's state that cannot be parked refuses
+    /// it by name), its prompt runs, and its turn begins. Nothing after the
+    /// move cancels it: the move may hand the slot's parked state back, which
+    /// only its prompt takes ([`Slot::reuse`]).
     fn begin(&mut self) -> Result<(), Dead> {
         let p = self.t_mut().pending.remove(0);
+        if p.sub.client.check().is_err() || p.sub.events.send(Msg::Started(p.slot)).is_err() {
+            relock(&self.sh.stats).n_cancelled_before_prompt_total += 1;
+            relock(&self.sh.board).release(p.slot);
+            self.show_turns();
+            return Ok(());
+        }
         match self.switch(p.slot, true)? {
             Switched::Refused(why) => {
                 relock(&self.sh.stats).n_swap_refused_total += 1;
