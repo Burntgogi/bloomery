@@ -24,6 +24,8 @@ VERSION = 2
 STATE = ("idents", "lib_root", "lib_roots", "_mods", "_bases", "_macros", "_exported", "_text",
          "_traits", "ids", "nodes", "adj", "file_root", "builds", "_rules", "_own_rules",
          "_dispatch", "_rows_nodes", "_enum_nodes", "_family_dirs", "_facts")
+_SCALARS = (str, int, bool)
+_CONTAINERS = {"list": list, "tuple": tuple, "set": set, "frozenset": frozenset}
 
 
 def _digest(data):
@@ -175,10 +177,10 @@ def current(reach):
 
 
 def _encode(value):
-    if value is None or type(value) in (str, int, bool):
+    if value is None or type(value) in _SCALARS:
         return value
     if isinstance(value, (list, tuple, set, frozenset)):
-        return [type(value).__name__, [_encode(v) for v in value]]
+        return [type(value).__name__, [v if v is None or type(v) in _SCALARS else _encode(v) for v in value]]
     if isinstance(value, dict):
         return ["dict", [[_encode(k), _encode(v)] for k, v in value.items()]]
     name = type(value).__name__
@@ -192,16 +194,15 @@ def _encode(value):
 
 
 def _decode(value, module):
-    if value is None or type(value) in (str, int, bool):
+    if value is None or type(value) in _SCALARS:
         return value
     if not isinstance(value, list) or len(value) != 2 or not isinstance(value[0], str):
         raise ValueError("invalid Reach value")
     name, body = value
-    containers = {"list": list, "tuple": tuple, "set": set, "frozenset": frozenset}
-    if name in containers:
+    if name in _CONTAINERS:
         if not isinstance(body, list):
             raise ValueError("invalid Reach container")
-        return containers[name](_decode(v, module) for v in body)
+        return _CONTAINERS[name](v if v is None or type(v) in _SCALARS else _decode(v, module) for v in body)
     if name == "dict":
         if not isinstance(body, list):
             raise ValueError("invalid Reach map")
@@ -247,14 +248,16 @@ def _typed(value, annotation):
     if origin in (typing.Union, types.UnionType):
         return any(_typed(value, a) for a in args)
     if origin in (list, set, frozenset):
-        return type(value) is origin and all(_typed(v, args[0]) for v in value)
+        if type(value) is not origin:
+            return False
+        return all(type(v) is args[0] for v in value) if args[0] in _SCALARS else all(_typed(v, args[0]) for v in value)
     if origin is dict:
         return type(value) is dict and all(_typed(k, args[0]) and _typed(v, args[1]) for k, v in value.items())
     if origin is tuple:
         if type(value) is not tuple:
             return False
         if len(args) == 2 and args[1] is Ellipsis:
-            return all(_typed(v, args[0]) for v in value)
+            return all(type(v) is args[0] for v in value) if args[0] in _SCALARS else all(_typed(v, args[0]) for v in value)
         return len(value) == len(args) and all(_typed(v, a) for v, a in zip(value, args))
     if type(value) is not annotation:
         return False

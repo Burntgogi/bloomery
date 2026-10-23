@@ -6354,19 +6354,19 @@ def rust_lex(text: str) -> tuple[str, str]:
     i, n = 0, len(text)
     while i < n:
         c = text[i]
-        if text.startswith("//", i):
+        if c == "/" and text.startswith("//", i):
             j = text.find("\n", i)
             j = n if j < 0 else j
             _blank(code, i, j)
             _blank(shape, i, j)
             i = j
             continue
-        if text.startswith("/*", i):
+        if c == "/" and text.startswith("/*", i):
             depth, j = 1, i + 2
             while j < n and depth:
-                if text.startswith("/*", j):
+                if text[j] == "/" and text.startswith("/*", j):
                     depth, j = depth + 1, j + 2
-                elif text.startswith("*/", j):
+                elif text[j] == "*" and text.startswith("*/", j):
                     depth, j = depth - 1, j + 2
                 else:
                     j += 1

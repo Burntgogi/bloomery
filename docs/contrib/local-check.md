@@ -71,6 +71,9 @@ The persistent structural cache must preserve these inputs across fresh processe
 The selected profiles of every box call remain inputs, including shell defaults and inherited model overrides.
 Changing a selected profile or called source invalidates its consumer; an unrelated private profile or unreached
 source does not. Shared box inputs remain mandatory for every box command.
+The cache codec transfers scalar leaves without recursive dispatch; container reconstruction and strict field,
+index, source-provenance and input-stability validation remain unchanged. Rust comment scanning checks the
+leading delimiter before probing a comment opener, without changing literal handling or line positions.
 
 The mapped checkpoint reader is `bloomery-safetensors`; `gate-safetensors` owns its dtype, span and shard tests.
 `f32_values` also checks directly constructed `Raw` values: shape and dtype must account for the complete
