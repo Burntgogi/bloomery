@@ -691,7 +691,7 @@ impl CacheRam {
     /// The `flag`'s value (`--cache-ram`, `--park-ram`), `mib` MiB, in
     /// bytes; refused by name past u64.
     pub fn parse_mib(flag: &str, mib: &str) -> Result<u64, GateError> {
-        let n: u64 = mib.parse()?;
+        let n: u64 = serve::flag::number(flag, mib)?;
         Ok(n.checked_mul(1 << 20)
             .ok_or_else(|| format!("{flag} {n} MiB passes u64 bytes"))?)
     }
