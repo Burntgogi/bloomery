@@ -60,8 +60,9 @@
 //!
 //! The stream arm (`stream`, fixture tier): the `mid` budget under the common residency machine (`Residency::Mid`, half
 //! the smallest layer's card experts pinned and one spare, the host set read in) with the prompt calls' expert stream on
-//! (`XMode::Split`): the host experts of a hosted layer the stream's rule sends to the card land in its ring and run the
-//! card's `_sel` launches beside the stage slots, their rows joined into the card's sum before the host's. It runs the
+//! (`XMode::Split`): the host experts of a hosted layer the stream's rule sends to the card land in its ring and run as
+//! the common route GEMM over the ring's half beside the stage slots' `_sel` launches, their rows joined into the
+//! card's sum before the host's. It runs the
 //! forced clause, whose calls (each layer's passes) stream, and the span clause, and then:
 //! - `prefill_stream_streamed`: over every call the forced clause made, the stream's records and the body's ring passes
 //!   agree: each streamed layer has one ring pass of its walk and layer that joined as many experts, and no ring pass

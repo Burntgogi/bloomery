@@ -40,7 +40,7 @@ use super::names::{
 };
 use super::spec;
 use crate::arch::names::blk;
-use crate::arch::place_hybrid;
+use crate::arch::place_hybrid::{self, RingForms, ring_pass_bytes_in};
 use crate::moe::UNION_TAIL_MAX_COLS;
 use crate::placement::kernels::{self, SiteAct, q8_act_bytes};
 use crate::placement::workstation::{self, TierBatchBytes};
@@ -344,6 +344,49 @@ pub fn stream_ring_bytes(hp: &Hparams, model: &ModelTensors) -> Result<u64, Plac
         (hp.n_expert as u64, STREAM_HALF_SLOTS),
         0,
     )
+}
+
+/// The card bytes a streaming plan keeps out of the expert budget (`BLOOMERY_XSTREAM=split`): the
+/// ring ([`stream_ring_bytes`]) beside the ring pass's route GEMM buffers at [`pass_rows_max`] rows
+/// over a half of [`STREAM_HALF_SLOTS`] ([`ring_pass_bytes_in`], in the forms the file's routed
+/// stacks read, [`RingForms::of`]). Refused by name: as [`stream_ring_bytes`] refuses, a model with
+/// no expert width, and routed stacks of a type no route GEMM reads.
+pub fn stream_bytes(hp: &Hparams, model: &ModelTensors) -> Result<u64, PlacementError> {
+    let ring = stream_ring_bytes(hp, model)?;
+    let ff = hp
+        .expert_ff
+        .first()
+        .copied()
+        .ok_or_else(|| PlacementError::Metadata {
+            key: "expert_feed_forward_length".to_string(),
+            detail: "names no layer's width".to_string(),
+        })?;
+    let ty = |stem: &str| {
+        let name = blk(0, stem);
+        model
+            .tensors
+            .iter()
+            .find(|t| t.name == name)
+            .map(|t| t.ty)
+            .ok_or_else(|| PlacementError::Tensor {
+                name,
+                detail: "is not in the file: the ring pass reads the routed stacks".to_string(),
+            })
+    };
+    let (gate, down) = (ty(FFN_GATE_EXPS)?, ty(FFN_DOWN_EXPS)?);
+    let forms = RingForms::of(gate, down).ok_or_else(|| PlacementError::Tensor {
+        name: blk(0, FFN_GATE_EXPS),
+        detail: format!("is {gate:?} beside a {down:?} down: no route GEMM reads the pair"),
+    })?;
+    let pass = ring_pass_bytes_in(
+        pass_rows_max(hp.n_used),
+        hp.n_used,
+        hp.latent,
+        ff,
+        STREAM_HALF_SLOTS as usize,
+        forms,
+    );
+    Ok(ring + pass as u64)
 }
 
 impl PlanInputs {

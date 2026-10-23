@@ -59,6 +59,7 @@ use super::stream::{RingPass, XSide};
 use super::tier::{TierSum, enqueue_tier_sum};
 use super::{Body, Kernels, Layer, RouteOut, Shape, Taps, enqueue_head, stack};
 use crate::arch::hybrid::{Site, WideCx, norm_rows, project_wide, wide_acts_at};
+use crate::card_leg::{RouteBlock, StackW};
 use crate::card_slots::{CardAcc, ColPlaces};
 use crate::elem::EmbedRowsArgs;
 use crate::flash::PlaneAppend;
@@ -68,7 +69,7 @@ use crate::head::Head;
 use crate::host::BatchLeg;
 use crate::host::run::HostRun;
 use crate::host::served::prompt_pass;
-use crate::host::xstream::{LandBatch, with_ring_windows};
+use crate::host::xstream::{LandBatch, RingStacks, with_ring_windows};
 use crate::iq_sel::IqGateUp;
 use crate::kquant::{Act as GateAct, SelDown};
 use crate::model::GpuModel;
@@ -77,7 +78,7 @@ use crate::rope_table::Direction;
 use crate::site::{WideActs, WideKernels};
 use crate::tensor::{Pitched, dtod_2d};
 use crate::weights::Weights;
-use crate::{Gpu, GpuError, Q8Act, Window, launch_u32};
+use crate::{DeviceTensor, Gpu, GpuError, Q8Act, Window, launch_u32};
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::GgmlType;
 use model::arch::musespark::hparams::Hparams;
@@ -933,14 +934,14 @@ impl PassWalk<'_> {
     }
 
     /// [`PassWalk::experts`], and with `ring` the stream's slots of the layer
-    /// between the stage slots' down and the norm: the union's places of the
-    /// pass's slots (the stage's below `n_card`, `n_card + i` for the `i`-th
-    /// streamed expert) into `ring.union` for the back's sum, then per landing
-    /// batch, behind its own landed event, the batch's ring slots of the
-    /// pass's slots (every slot outside the batch [`HOST`](crate::hybrid::HOST))
-    /// and the same `_sel` launches over the half's stacks — a slot outside
-    /// the batch neither read nor written, the up rows quantized again whole
-    /// (a stage slot's column is the same bits) before the batch's down. The
+    /// between the stage slots' down and the norm: the latent rows in the
+    /// route GEMM's form, the union's places of the pass's slots (the stage's
+    /// below `n_card`, `n_card + i` for the `i`-th streamed expert) into
+    /// `ring.union` for the back's sum, then per landing batch, behind its own
+    /// landed event, the route GEMM over the half's stacks of the batch's
+    /// slots ([`RingGemm::enqueue_batch`](crate::ring_gemm::RingGemm::enqueue_batch))
+    /// — a slot outside the batch neither read nor written — each slot's down
+    /// row into its row of the slots' downs beside the stage slots'. The
     /// streamed experts the ring pass joined; `None` without a ring.
     fn experts_with(
         &mut self,
@@ -1001,8 +1002,8 @@ impl PassWalk<'_> {
             Some(RingPass {
                 r,
                 acc_k,
-                sel: rsel,
                 union,
+                gemm: rg,
             }) => {
                 let ctx = gpu.context();
                 let cols = [
@@ -1011,7 +1012,8 @@ impl PassWalk<'_> {
                     stack(w, &stacks.down)?.cols(),
                 ];
                 let rows = [sh.ff, sh.ff, sh.latent];
-                let iq = &cx.k.iq;
+                let kernels = (Some(cx.gemm), &cx.k.g32);
+                rg.enqueue_rows(gpu, &cx.k.g32, &b.lat2, m, fault)?;
                 with_ring_windows(&r, ctx, sh.n_expert, rows, cols, |union_map, half| {
                     acc_k.enqueue_places_cols(
                         stream,
@@ -1019,47 +1021,16 @@ impl PassWalk<'_> {
                         fault,
                         union,
                     )?;
+                    let blk = ring_block(half, sh)?;
                     for batch in &r.batches {
-                        if let Some(event) = batch.event.as_deref() {
-                            stream.wait(event)?;
-                        }
-                        batch.with_map(ctx, sh.n_expert, |row| {
-                            acc_k.enqueue_places_cols(
-                                stream,
-                                &ring_places(&b.ids, row, sh, m),
-                                fault,
-                                &mut *rsel,
-                            )
-                        })?;
-                        iq.enqueue_gate_up(
-                            stream,
-                            &IqGateUp {
-                                ty: GgmlType::IQ2_XXS,
-                                wg: half.gate,
-                                wu: half.up,
-                                act: &b.lat_q,
-                                sel: &*rsel,
-                                n_slots: slots,
-                                rows_per_expert: sh.ff,
-                                slots_per_col: sh.top_k,
-                                rule: GateAct::SiluMul,
-                            },
+                        rg.enqueue_batch(
+                            gpu,
+                            kernels,
+                            &blk,
+                            batch,
+                            (&b.ids, slots, sh.top_k, sh.n_expert),
+                            (&mut b.down, GateAct::SiluMul),
                             fault,
-                            &mut b.up,
-                        )?;
-                        gpu.quantize_q8_1_cols_at(&b.up, 0, &mut b.up_q, slots, fault)?;
-                        iq.enqueue_gemv_sel(
-                            stream,
-                            GgmlType::IQ2_XXS,
-                            &SelDown {
-                                w: half.down,
-                                act: &b.up_q,
-                                sel: &*rsel,
-                                n_slots: slots,
-                                rows_per_expert: sh.latent,
-                            },
-                            fault,
-                            &mut b.down,
                         )?;
                     }
                     Ok(())
@@ -1234,8 +1205,8 @@ impl PassWalk<'_> {
     /// sums, then the FFN back. A layer that streamed sums its card slots by
     /// the stream's union places (`union`: the places and their count, the
     /// stage's `n_card` and the streamed experts past it), so the streamed
-    /// experts' rows join the card's sum; a stream on a tier layer is refused
-    /// by name (the ring serves a load with no expert tier).
+    /// experts' rows join the card's sum, on a tier layer before the tier's
+    /// join.
     fn hosted_back(
         &mut self,
         side: &PlacedSide,
@@ -1245,13 +1216,7 @@ impl PassWalk<'_> {
         let l = at.layer;
         let n_tier = side.tier.as_ref().map_or(0, |t| t.k(l));
         if n_tier > 0 {
-            if union.is_some() {
-                return Err(GpuError::protocol(
-                    WHAT,
-                    format!("layer {l}: a stream on a layer the expert tier holds experts of"),
-                ));
-            }
-            return self.tier_back(side, leg, (at, n_tier));
+            return self.tier_back(side, leg, (at, n_tier), union);
         }
         let (gpu, sh, m) = (self.cx.gpu, self.cx.sh, self.cx.m);
         let stream = gpu.stream();
@@ -1285,7 +1250,8 @@ impl PassWalk<'_> {
     }
 
     /// [`PassWalk::hosted_back`] of a layer whose `n_tier` experts the expert
-    /// tier holds: the card slots' sum into `moe`, the tier's rows joined
+    /// tier holds: the card slots' sum into `moe` (by `union`'s places and
+    /// count when the layer streamed, else the stage's), the tier's rows joined
     /// through the port — normed into the spent `down` rows and summed into
     /// the spent `lat2` rows ([`enqueue_tier_sum`]) — the two cards' sums, then
     /// the host's, into `moe`.
@@ -1294,12 +1260,12 @@ impl PassWalk<'_> {
         side: &PlacedSide,
         leg: &mut BatchLeg<'_, HostRun>,
         (at, n_tier): (At, usize),
+        union: Option<(&DeviceBuffer<u32>, usize)>,
     ) -> Result<(), GpuError> {
         let l = at.layer;
         let (gpu, sh, m) = (self.cx.gpu, self.cx.sh, self.cx.m);
         let stream = gpu.stream();
         let a = &self.layers[l];
-        let n_card = a.n_card;
         let fault = gpu.layer_sink(l)?;
         let t = side.tier.as_ref().ok_or(GpuError::state(
             WHAT,
@@ -1307,13 +1273,14 @@ impl PassWalk<'_> {
         ))?;
         let gain = self.cx.w.f32_buf(WHAT, &a.post_exp_norm)?;
         let b = &mut *self.b;
+        let (sel, n_card) = union.unwrap_or((&b.sel, a.n_card));
         if n_card > 0 {
             side.acc_k.enqueue_card_acc(
                 stream,
                 &CardAcc {
                     down: &b.down2,
                     w: &b.weights,
-                    sel: &b.sel,
+                    sel,
                     n: sh.latent,
                     m,
                     n_card,
@@ -1383,6 +1350,27 @@ enum Sum {
     Moe,
     /// The card's slots' sum plus the host's.
     Lat,
+}
+
+/// The half's stacks `half` as the route GEMM of the file's IQ2_XXS reads them (the kernel table's
+/// GEMM entry, `kernels::gemm`): the gate and up of `sh.ff` rows an expert, the down of
+/// `sh.latent`. Refused by name: a type the table names no route GEMM for.
+fn ring_block<'a>(half: &RingStacks<'a>, sh: Shape) -> Result<RouteBlock<'a>, GpuError> {
+    let route = |t: &'a DeviceTensor<u32>| {
+        StackW::Words(t)
+            .route(GgmlType::IQ2_XXS)
+            .ok_or(GpuError::state(
+                WHAT,
+                "a route GEMM entry for the IQ2_XXS stacks (`kernels::gemm`)",
+            ))
+    };
+    Ok(RouteBlock {
+        gate: route(half.gate)?,
+        up: route(half.up)?,
+        down: route(half.down)?,
+        ff: sh.ff,
+        hidden: sh.latent,
+    })
 }
 
 /// A placed load's pass `(1, m, Batch)` through the host tier's batch port

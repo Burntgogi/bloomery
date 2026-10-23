@@ -40,7 +40,7 @@
 //! `BLOOMERY_XSTREAM` resolves by the rule `generate_qwen3moe` and the Qwen3.8
 //! seat run (`shared/xstream_rule.rs`): set as given; unset `split` under
 //! `--place a` with a residency (`admit` when the card has no room for the
-//! ring), `admit` under `--place bp` (the ring serves no expert tier), `off`
+//! ring), `admit` under `--place bp` (`split` set runs the ring beside the tier), `off`
 //! under `gate` and beside `BLOOMERY_RESIDENCY=off`. Where the rule starts the
 //! stream (`plans_ring`: `BLOOMERY_XSTREAM=split`, or unset on plan (a) with the
 //! residency not set `off`) the plan keeps the ring's bytes out of the expert
@@ -397,11 +397,12 @@ impl Tiered for Muse {
         )
     }
 
-    /// The inputs of a plan that keeps the stream's ring out of the expert
-    /// budget ([`PlanInputs::streaming`] by [`place::stream_ring_bytes`]).
+    /// The inputs of a plan that keeps the stream's ring and its ring pass's
+    /// buffers out of the expert budget ([`PlanInputs::streaming`] by
+    /// [`place::stream_bytes`]).
     fn with_ring(inputs: PlanInputs<Self::H>) -> Result<PlanInputs<Self::H>, GateError> {
-        let ring = place::stream_ring_bytes(&inputs.hp, &inputs.model)?;
-        Ok(inputs.streaming(ring))
+        let bytes = place::stream_bytes(&inputs.hp, &inputs.model)?;
+        Ok(inputs.streaming(bytes))
     }
 
     fn register() {

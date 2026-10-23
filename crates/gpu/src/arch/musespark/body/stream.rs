@@ -7,10 +7,11 @@
 //! A call opens on the machine inside the pass its boundary opened ([`super::prefill`]); each pass is one walk of one
 //! unit. At a hosted layer's shadow the pass picks ([`PromptStream::unit_pick`]): under `split` the host experts the
 //! stream's rule sends to the card land in a half of its ring, in landing batches, and the serve leaves them out. The
-//! card's route then runs the layer's stage slots, and the ring's slots batch by batch, each batch behind its own
-//! landed event, through the same IQ2_XXS `_sel` launches over the half's stacks ([`RingPass`]); the back sums the
-//! card's slots by the stream's union places (`n_card + i` for the `i`-th streamed expert), so a streamed expert's
-//! row joins the sum where a host expert's would, before the host's sums add.
+//! card's route then runs the layer's stage slots through the IQ2_XXS `_sel` launches, and the ring's slots batch by
+//! batch, each batch behind its own landed event, as the common route GEMM over the half's stacks
+//! ([`RingPass`], [`RingGemm`]); the back sums the card's slots by the stream's union places (`n_card + i` for the
+//! `i`-th streamed expert), so a streamed expert's row joins the sum where a host expert's would, before the host's
+//! sums add.
 //!
 //! The IQ2_XXS stacks are the file's blocks on the card, so the machine stages each part as the file holds it
 //! ([`crate::host::swap::Transform::Identity`]): the stage slots, the ring's slots and the host read the same bytes.
@@ -21,8 +22,11 @@ use crate::host::prompt_stream::PromptStream;
 use crate::host::swap::{CallPick, CallReport};
 use crate::host::swap_source::{DEADLINE, PlanStacks, hosted_stacks};
 use crate::host::xstream::{Costs, RingLayer, XCfg, XLayer, XMode, XReport, XStreamBody};
+use crate::ring_gemm::RingGemm;
 use crate::{Gpu, GpuError};
 use cuda_core::{CudaStream, DeviceBuffer};
+use gguf::GgmlType;
+use model::arch::place_hybrid::RingForms;
 use model::placement::Plan;
 
 const WHAT: &str = "musespark::stream";
@@ -36,15 +40,16 @@ pub const STREAM_FLOOR: u32 = 32;
 /// The stream rule's costs for the file's IQ2_XXS experts (latent 4,096 by 4,096 a part, three parts): the host
 /// union's `t(m) = a + c·m` of `docs/research/muse-spark-attach.md` §5, "Prefill, P = 512" [derived: `a` the h1fold
 /// fit, `c` the Q3_K column fit scaled by the expert's 50.33/35.39 MMAC a column and the upper IQ2_XXS unpack penalty,
-/// 1.5, the end the load's measured pp512 sits at]; the card's, the `_sel` launches' column (each slot reads its
-/// expert's 12.98 MB whole, so a column is one weight read at the card's bandwidth and nothing is fixed per expert
-/// past its launch share) [derived, unmeasured]. No record of this file's union has fitted the row: the per-file
-/// override ([`Body::set_xstream_costs`]) takes a calibrated one.
+/// 1.5, the end the load's measured pp512 sits at]. The card's ring pass runs the streamed slots as the route GEMM
+/// over the ring's half ([`RingGemm`]), which reads an expert's blocks once a tile of up to 64 of its slots: the fixed
+/// part, the expert's 12.98 MB read once at the card's DRAM rate; a column, the expert's 50.33 M int8 MACs at a fifth
+/// of the card's dense int8 rate [derived from the expert's shape, unmeasured]. No record of this file's union or ring
+/// pass has fitted the row: the per-file override ([`Body::set_xstream_costs`]) takes a calibrated one.
 pub const XSTREAM_COSTS: Costs = Costs {
     host_us_per_col: 57.6,
     host_us_fixed: 28.1,
-    card_us_fixed: 0.0,
-    card_us_per_col: 18.5,
+    card_us_fixed: 20.0,
+    card_us_per_col: 1.6,
 };
 
 /// The residency machine's stacks of a placed load of `n_layer` layers: every layer's gate, up and down by the common
@@ -54,38 +59,39 @@ pub(super) fn stacks(plan: &Plan<'_>, n_layer: usize) -> Result<PlanStacks, GpuE
     hosted_stacks(plan.model, "musespark stacks", (n_layer, false))
 }
 
-/// The prompt calls' host streaming and the buffers the card's ring pass writes, once a `split` armed them.
+/// The prompt calls' host streaming and the buffers the card's ring pass reads and writes, once a `split` armed them.
 #[derive(Default)]
 pub(super) struct XSide {
     /// The calls' host streaming: off until [`Body::set_xstream`] sets it.
     pub(super) stream: PromptStream,
-    /// The ring pass's places, from the first `split` on.
+    /// The ring pass's places and route GEMM buffers, from the first `split` on.
     ring: Option<RingPlaces>,
     /// Per ring pass of the last streaming call, its walk, its layer and the streamed experts its slots joined into
     /// the card's sum: what a gate holds the stream's records to ([`Body::take_stream_joined`]).
     joined: Vec<(usize, usize, usize)>,
     /// The walk the call runs, from 0: the joined entries' walk, as the records name theirs.
     walk: usize,
-    /// The card bytes the ring may take past the stream's keep-free: the ring a streaming plan reserves
-    /// ([`stream_ring_bytes`](model::arch::musespark::place::stream_ring_bytes)), so a ring never takes the card's margin;
-    /// set at the load.
+    /// The card bytes the ring may take past the stream's keep-free: the ring's part of what a streaming plan reserves
+    /// ([`stream_ring_bytes`](model::arch::musespark::place::stream_ring_bytes); the plan keeps the ring pass's buffers
+    /// beside it, [`stream_bytes`](model::arch::musespark::place::stream_bytes)), so a ring never takes the card's
+    /// margin or the pass's buffers' room; set at the load.
     ring_room: Option<u64>,
 }
 
-/// The ring pass's places, `slots` words each: a landing batch's ring slots of the pass's routed slots, and the
-/// union's places the back sums by.
+/// The ring pass's buffers: the union's places the back sums by, `slots` words, and the route GEMM's buffers over a
+/// half of the ring.
 struct RingPlaces {
-    sel: DeviceBuffer<u32>,
     union: DeviceBuffer<u32>,
+    gemm: RingGemm,
 }
 
 /// One hosted layer's ring pass ([`super::prefill`]'s card route): the stream's view of the layer, the places' kernels
-/// and the buffers they write.
+/// and the buffers the pass writes.
 pub(super) struct RingPass<'a> {
     pub(super) r: RingLayer,
     pub(super) acc_k: &'a CardSlotKernels,
-    pub(super) sel: &'a mut DeviceBuffer<u32>,
     pub(super) union: &'a mut DeviceBuffer<u32>,
+    pub(super) gemm: &'a mut RingGemm,
 }
 
 impl XSide {
@@ -94,18 +100,28 @@ impl XSide {
         self.ring_room = Some(bytes);
     }
 
-    /// The ring pass's places for passes of up to `slots` routed slots. Load-time only (the first `split`); a second
-    /// arming is refused by name.
-    fn arm(&mut self, stream: &CudaStream, slots: usize) -> Result<(), GpuError> {
+    /// The ring pass's buffers for passes of up to `rows` rows of `top_k` routed slots each, `latent` values a row and
+    /// `ff` a slot's gate and up row, over a half of `half_slots` slots: the route GEMM's in the forms the file's
+    /// IQ2_XXS stacks read ([`RingForms::of`]). Load-time only (the first `split`); a second arming is refused by name.
+    fn arm(
+        &mut self,
+        gpu: &Gpu,
+        (rows, top_k, latent, ff): (usize, usize, usize, usize),
+        half_slots: usize,
+    ) -> Result<(), GpuError> {
         if self.ring.is_some() {
             return Err(GpuError::state(
                 WHAT,
                 "a stream side not yet armed for the ring",
             ));
         }
+        let forms = RingForms::of(GgmlType::IQ2_XXS, GgmlType::IQ2_XXS).ok_or(GpuError::state(
+            WHAT,
+            "a route GEMM entry for the IQ2_XXS stacks (`kernels::gemm`)",
+        ))?;
         self.ring = Some(RingPlaces {
-            sel: DeviceBuffer::zeroed(stream, slots)?,
-            union: DeviceBuffer::zeroed(stream, slots)?,
+            union: DeviceBuffer::zeroed(gpu.stream(), rows * top_k)?,
+            gemm: RingGemm::new(gpu, (rows, top_k, latent, ff), half_slots, forms)?,
         });
         self.joined.reserve(64);
         Ok(())
@@ -137,8 +153,8 @@ impl XSide {
         Ok(RingPass {
             r,
             acc_k,
-            sel: &mut p.sel,
             union: &mut p.union,
+            gemm: &mut p.gemm,
         })
     }
 
@@ -235,13 +251,16 @@ impl Body {
 impl XStreamBody for Body {
     /// What the next prompt calls move (`BLOOMERY_XSTREAM`): `off` until set here. `Split` starts the expert stream
     /// at its first setting ([`PromptStream::start_split`]: the ring sized from the card's free bytes past the
-    /// stream's keep-free, the lane's probe, [`XSTREAM_COSTS`] for the rule) and arms the ring pass's places; the
-    /// stream then stays for the load's life, idle under `admit` and `off`. Refused by name: `admit` or `split` on a
-    /// whole-card load or one with no residency machine, `split` on a load with an expert tier card or when the
+    /// stream's keep-free, the lane's probe, [`XSTREAM_COSTS`] for the rule) and arms the ring pass's buffers; the
+    /// stream then stays for the load's life, idle under `admit` and `off`. The ring serves the stage card beside an
+    /// expert tier card too: a tier layer's back sums the stage's and the streamed slots by the stream's union places
+    /// before the tier's join. Refused by name: `admit` or `split` on a whole-card load or one with no residency
+    /// machine, `split` when the
     /// stream cannot start (the card's room among the refusals), and any change while a call streams.
     fn set_xstream(&mut self, gpu: &Gpu, mode: XMode) -> Result<(), GpuError> {
         const WHAT_S: &str = "musespark::Body::set_xstream";
         let (experts, top_k, rows) = (self.sh.n_expert, self.sh.top_k, self.prompt.rows());
+        let (latent, ff) = (self.sh.latent, self.sh.ff);
         let room = self.xs.ring_room;
         let Some(p) = self.placed.as_mut() else {
             if mode == XMode::Off {
@@ -253,16 +272,13 @@ impl XStreamBody for Body {
                 "a placed load (the host tier the stream serves)",
             ));
         };
-        self.xs
-            .stream
-            .check_mode(&p.hybrid, (mode, p.side.tier.is_some()))?;
+        self.xs.stream.check_mode(&p.hybrid, (mode, false))?;
         if mode == XMode::Split
-            && PromptStream::start_split(&mut p.hybrid, gpu, || {
+            && let Some(half) = PromptStream::start_split(&mut p.hybrid, gpu, || {
                 XCfg::new(XSTREAM_COSTS, experts, top_k, DEADLINE, room)
             })?
-            .is_some()
         {
-            self.xs.arm(gpu.stream(), rows * top_k)?;
+            self.xs.arm(gpu, (rows, top_k, latent, ff), half)?;
         }
         self.xs.stream.set_mode(mode);
         Ok(())

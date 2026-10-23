@@ -1,46 +1,51 @@
-# Round xmuse3: Muse Spark Open's prompt rate on plan (b′) (`--place bp`: the A6000 the stage, the 3090 an expert tier,
-# the host the rest) at the serving defaults, where the common stream rule picks `admit` and the ring is dark. The row
-# every Muse stream lever is measured against; no stream lever is in this tree.
+# Round xmuse3: Muse Spark Open's prompt pass on plan (b′) (`--place bp`: the A6000 the stage, the 3090 an expert
+# tier, the host the rest), the expert stream's stage lane beside the tier against the serving default. Same binary,
+# two lever arms: unset (the common rule's `admit` at bp, the ring dark) and BLOOMERY_XSTREAM=split (this tree's ring
+# pass as the route GEMM over the ring's half, crate::ring_gemm, on the stage card beside the tier).
 # Calibration [measured]: pp512 34.07..34.28 tok/s on plan (a) (A6000 + host, int039 6adfcd6a8, depth-serve 2 rounds,
 # ~/.cache/bloomery/muse/box-muse-time.log) = 242 ms a layer a 512-row pass; less the card front ~10 ms and the join
 # ~2 ms, the host union over plan (a)'s ~220..225 host experts is ~230 ms: h = 1.02..1.05 ms an expert at m = 16
-# columns (XSTREAM_COSTS' t(m) = 28.1 + 57.6 m = 0.95 ms, the band's top, is 7..10 % under it).
-# Decomposition per 512-row pass and layer on (b′) [derived]:
-#   host CPU   the union over 191 host experts (256 less the stage's ~36 and the tier's ~29) x 1.02..1.05 ms
-#              = 195..201 ms: the bound
-#   stage SM   front (attention, router, dense) ~10 ms before the union; the stage's ~36 experts as `_sel` slots,
-#              16 columns x 18.5 us = 0.30 ms each, ~11 ms, under the union (0 on the wall)
-#   tier SM    ~29 experts x 0.30 ms = ~9 ms plus the tier's rows back, under the union (0)
-#   PCIe       the rows and ids down, the sums up, ~17 MB: 0.7 ms; the residency's admits ride the pick phase
-#   host DRAM  191 x 12.98 MB = 2.5 GB in ~200 ms: 12 GB/s of 137
-#   => 207..213 ms a layer x 62 = 12.8..13.2 s a pass: pp512 38.8..40.0. The residency's call picks (`admit`) move
-#      the hottest host experts onto the stage's pool for the call and take columns off the union: up to +10 %
-#      [derived, no record of Muse's picks]: written 38.5..44.
-# Companion (not this card's term): pp4096 the same per pass over eight passes plus the attention's K/V reads
-# (plan (a) measured pp4096 = pp512 x 0.997): 38..44.
-# The stream levers this row is the base of [derived, docs in the round's report]: the common rule's per-expert test
-# (xsplit `streams`, `m_min` 537 > the 512-row pass) keeps the ring dark at 512 on every lane; streaming by the
-# balance alone, the ring pass as a route GEMM (card ~0.05 ms an expert), the stage lane under a tier, and a second
-# lane on the 3090 take bp's pp512 to ~70, ~93 and ~120..127.
-# Sitting (on the lead's go, both cards in the timing witness):
+# columns (XSTREAM_COSTS' t(m) = 28.1 + 57.6 m = 0.95 ms sits 7..10 % under it).
+# The lane [derived from host/xstream.rs]: a fill thread copies the expert into pinned staging, then the copy engine
+# reads staging over PCIe: three DRAM passes a byte (the source read, the staging write, the DMA read). One lane at
+# the held rate (LANE_HELD_B_PER_US 20.41 GB/s) is 0.655 ms an expert beside the union (burst share 0.030 at m = 16);
+# its DRAM is ~61 GB/s. Two lanes (this card and the 3090) would ask 122 GB/s of the host's 137 before the union's
+# reads: DRAM-bound, so the 3090 lane is out of this card. muse2card B4's 158..169 assumed a raw 26.28 GB/s copy with
+# no staging, a 34 us grouped GEMM and no DRAM term; it does not hold against the code.
+# The rule [derived, runtime/src/xsplit.rs]: with the old card row (the `_sel` per-slot GEMV, 18.5 us a column) m* =
+# 16.8 and m_min = 537 > the 512-row pass, so the ring was dark on every pass; with the route GEMM's row (20 us fixed,
+# 1.6 us a column) m* = 12.1 and m_min = 386: the ring lights at 512.
+# Base arm per pass and layer [derived]: host CPU, the union over ~191 host experts x 1.02..1.05 ms = 195..201 ms (the
+#   bound); stage SM front ~10 ms, its ~36 `_sel` experts ~11 ms and the tier's ~29 ~9 ms under the union (0); PCIe
+#   the rows and sums ~0.7 ms; DRAM 12 GB/s of 137. 207..213 ms x 62 = 12.8..13.2 s: 38.8..40.0, the call picks'
+#   admits up to +10 %: 38.5..44.
+# Split arm per pass and layer [derived]: the ring's room (stream_bytes, ~3.5 GB on the A6000) moves ~4 stage experts
+#   a layer to the host, ~195 host experts. Balanced at H x h' = S x 0.655 ms, h' = h x 1.0..1.33 (fill threads take
+#   union cores): S = 119..133 streamed, H = 76..62 on the host, T = 78..87 ms (lane-bound); the card's ring GEMM
+#   S x 0.046 ms = 5.5..6.1 ms under the lane (0); DRAM 59..67 GB/s lane + 11..13 union, under 137. T + front 10 +
+#   join 2 = 90..99 ms x 62 = 5.6..6.1 s: 83..92 tok/s.
+# Effect: 83..92 over 38.5..44 = +89..+139 %. The rule's balance prices copy + card as a serial sum (0.70 against
+# 0.655 ms), streaming ~4 % fewer than the balance: inside the band.
+# Sitting (on the lead's go, both cards in the timing witness, ~13 min: 2 arms x 3 rounds, a fresh server each,
+# load 40..110 s):
 #   BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/xmuse3-pp.card BLOOMERY_TIMING_CARDS=a6000+3090
-#     DEPTH_SERVE_CTX=4224' tools/ref/depth-serve.sh <this tree>:512 <this tree>:4096
-kind: baseline
-question: what does the Muse Spark Open seat's prompt pass run at on plan (b′), the A6000 the stage and the 3090 an
-  expert tier beside the host, at the serving defaults (the stream rule's `admit`, the ring dark)?
+#     DEPTH_SERVE_CTX=4224' tools/ref/depth-serve.sh <this tree>:512 env=BLOOMERY_XSTREAM=split:<this tree>:512
+kind: ab
+question: does the expert stream's stage lane beside the expert tier (BLOOMERY_XSTREAM=split, the ring pass as the
+  route GEMM) raise the Muse Spark Open seat's prompt rate on plan (b′) over the serving default's admit?
 term: pp tok/s @ P = 512, bloomery-serve --model musespark at the serving defaults (place unset -> bp), A6000 + 3090 +
-  host, depth-serve rows (timings.prompt_per_second)
-unit: tok/s
-predict: 38.5..44
-condition: depth-serve under BLOOMERY_TIMING_CARDS=a6000+3090 in its own lease, one fresh server a row; the server's
-  `place unset` record names bp, its `plan` record a tier0 card holding experts and its `xstream=` line `admit`, else
-  the row is void; the witness (both cards, mem, pgmajfault) shows no other model load and the host's experts
-  resident (majflt near 0)
-reason: the base row of every Muse stream lever on the two-card default; plan (a)'s row is measured, (b′)'s is not,
-  and the levers' predictions are written against it
-decide-in: write the row beside plan (a)'s, then open the stream levers in their derived order: the rule's balance
-  (common xsplit) and Muse's ring pass as a route GEMM first, then the stage lane under a tier, then the 3090 lane
-decide-below: the union is not the only wall: read the tier layers' join wait and the stage's front against the
-  union's per-layer time before any stream lever, since a lever on the union predicts less than derived there
-decide-above: the call picks move more columns than counted: read the residency's pick records (admits a layer,
-  their columns) and re-derive the host columns before pricing the stream levers
+  host, depth-serve rows (timings.prompt_per_second) — (split - unset) / unset, paired by round
+unit: %
+predict: +89..+139
+rounds: 3
+condition: depth-serve under BLOOMERY_TIMING_CARDS=a6000+3090 in its own lease, one fresh server an arm and a round,
+  the arm order rotated every round; each server's `place unset` record names bp and its `plan` record a tier0 card
+  holding experts; the unset arm's `xstream=` line names admit and the split arm's split, else the row is void; the
+  witness (both cards, mem, pgmajfault) shows no other model load and no row carries [cpu-busy] or [other-busy]
+decide-in: turn the unset rule's bp arm to split for a body whose ring runs beside its tier (the check_mode fact
+  the body passes), land, and write the row beside plan (a)'s
+decide-below: read the split arm's stream records (streamed experts and columns a layer, the lane's rate) against
+  S = 119..133 and 0.655 ms an expert; a slower lane is the staging's DRAM passes (a registered source next), fewer
+  streamed is the rule's balance
+decide-above: re-derive the base: the union's per-expert cost at bp or the admits the base arm's picks made are not
+  the counted ones; read the base arm's pick records before any further lever

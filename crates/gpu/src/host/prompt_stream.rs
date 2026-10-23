@@ -123,14 +123,15 @@ impl PromptStream {
     }
 
     /// The guards every family's `set_xstream` runs before it sets `mode`
-    /// ([`PromptStream::set_mode`]), `tiered` whether the load hangs an
-    /// expert tier. Refused by name: any change while a call streams,
-    /// `Admit` or `Split` on a tier with no residency machine, and `Split` on
-    /// a `tiered` load (the ring serves the stage card of a load with none).
+    /// ([`PromptStream::set_mode`]), `tier_refused` whether the load hangs an
+    /// expert tier whose layers the family's card route runs no ring beside
+    /// (a route that sums a tier layer's card slots only in the tier's join).
+    /// Refused by name: any change while a call streams, `Admit` or `Split`
+    /// on a tier with no residency machine, and `Split` where `tier_refused`.
     pub fn check_mode<H: HostExperts>(
         &self,
         tier: &HostTier<H>,
-        (mode, tiered): (XMode, bool),
+        (mode, tier_refused): (XMode, bool),
     ) -> Result<(), GpuError> {
         if self.on {
             return Err(GpuError::state(
@@ -144,10 +145,10 @@ impl PromptStream {
                 "a residency machine (BLOOMERY_RESIDENCY=mid-p<P>-s<S>) for admit or split",
             ));
         }
-        if mode == XMode::Split && tiered {
+        if mode == XMode::Split && tier_refused {
             return Err(GpuError::shape(
                 "BLOOMERY_XSTREAM",
-                "split on a load with an expert tier: the stream's ring serves the stage card \
+                "split on a load with an expert tier: this family's ring serves the stage card \
                  of a load with none",
             ));
         }

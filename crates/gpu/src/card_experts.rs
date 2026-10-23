@@ -42,17 +42,18 @@ use std::mem::ManuallyDrop;
 use cuda_core::{CudaStream, DeviceBuffer};
 use model::arch::models::{Ffn, LayerSpec};
 
-use model::arch::place_hybrid::ring_pass_bytes;
+use model::arch::place_hybrid::RingForms;
 use model::placement::kernels::{self, DownAct, DownForms};
 
 use crate::card_leg::{
-    self, CardLeg, LegBufs, LegRun, LegShape, LegStacks, LegSum, RouteBlock, RouteIo, RouteW,
+    self, CardLeg, LegBufs, LegRun, LegShape, LegStacks, LegSum, RouteBlock, RouteW,
 };
 use crate::card_slots::{CardSlotKernels, Places};
-use crate::gemm::{Gemm32Kernels, GemmAct32, GemmRoute};
+use crate::gemm::Gemm32Kernels;
 use crate::host::xstream::RingLayer;
 use crate::hybrid::SlotMap;
 use crate::kquant::Act;
+use crate::ring_gemm::RingGemm;
 use crate::weights::Weights;
 use crate::{DeviceTensor, Gpu, GpuError};
 
@@ -141,33 +142,9 @@ impl CardBufs {
 pub struct CardBatch {
     bufs: CardBufs,
     sel: DeviceBuffer<u32>,
-    /// The ring pass's GEMM buffers, once the expert stream armed them
-    /// ([`CardExperts::arm_ring`]).
+    /// The ring pass's GEMM buffers in the 32-value form, once the expert
+    /// stream armed them ([`CardExperts::arm_ring`]).
     ring: Option<RingGemm>,
-}
-
-/// The ring pass's GEMM buffers of a prompt batch of up to `cap` tokens
-/// ([`CardExperts::arm_ring`]): the batch's normed rows in the 32-value
-/// GEMM's form, the gate and up rows of every slot, their SwiGLU in the
-/// down's form and the route table over a half of the expert stream's ring.
-/// Their bytes are `place_hybrid::ring_pass_bytes` of the same widths, the
-/// one formula the plan reserves them by.
-struct RingGemm {
-    x: GemmAct32,
-    g: DeviceBuffer<f32>,
-    u: DeviceBuffer<f32>,
-    h: GemmAct32,
-    route: GemmRoute,
-}
-
-impl RingGemm {
-    fn bytes(&self) -> usize {
-        self.x.bytes()
-            + self.g.num_bytes()
-            + self.u.num_bytes()
-            + self.h.bytes()
-            + self.route.bytes()
-    }
 }
 
 impl CardBatch {
@@ -497,11 +474,11 @@ impl CardExperts {
     }
 
     /// The ring pass's GEMM buffers in `cb` for a half of `half_slots` slots
-    /// of the expert stream's ring (`RingGemm`): made once, when the
-    /// stream starts; a second arming at the same half is nothing. Refused by
-    /// name: a re-arming at another half, and buffers whose made bytes are
-    /// not `place_hybrid::ring_pass_bytes` of their widths. Load-time or
-    /// first-prompt only.
+    /// of the expert stream's ring ([`RingGemm`], in the 32-value form the
+    /// ring pass reads): made once, when the stream starts; a second arming at
+    /// the same half is nothing. Refused by name: a re-arming at another half,
+    /// and buffers whose made bytes are not `place_hybrid::ring_pass_bytes` of
+    /// their widths. Load-time or first-prompt only.
     pub fn arm_ring(
         &self,
         gpu: &Gpu,
@@ -510,38 +487,19 @@ impl CardExperts {
     ) -> Result<(), GpuError> {
         let what = self.family.what;
         if let Some(r) = &cb.ring {
-            if r.route.n_experts() == half_slots {
+            if r.half_slots() == half_slots {
                 return Ok(());
             }
             return Err(GpuError::shape(
                 what,
                 format!(
                     "the ring pass's buffers armed for a half of {} slots, asked for {half_slots}",
-                    r.route.n_experts()
+                    r.half_slots()
                 ),
             ));
         }
-        let stream = gpu.stream();
-        let cap = cb.bufs.cap();
-        let slots = cap * self.family.n_used;
-        let ring = RingGemm {
-            x: GemmAct32::new(stream, cap, self.n)?,
-            g: DeviceBuffer::zeroed(stream, slots * self.ff)?,
-            u: DeviceBuffer::zeroed(stream, slots * self.ff)?,
-            h: GemmAct32::new(stream, slots, self.ff)?,
-            route: GemmRoute::new(stream, slots, half_slots)?,
-        };
-        let want = ring_pass_bytes(cap, self.family.n_used, self.n, self.ff, half_slots);
-        if ring.bytes() != want {
-            return Err(GpuError::shape(
-                what,
-                format!(
-                    "the ring pass's buffers made {} bytes; the plan reserves {want} \
-                     (place_hybrid::ring_pass_bytes)",
-                    ring.bytes()
-                ),
-            ));
-        }
+        let shape = (cb.bufs.cap(), self.family.n_used, self.n, self.ff);
+        let ring = RingGemm::new(gpu, shape, half_slots, RingForms::BLOCKS32)?;
         cb.ring = Some(ring);
         Ok(())
     }
@@ -727,13 +685,13 @@ impl CardExperts {
             what,
             missing: "the ring pass's GEMM buffers (CardExperts::arm_ring at the stream's start)",
         })?;
-        if rg.route.n_experts() != r.half_slots {
+        if rg.half_slots() != r.half_slots {
             return Err(GpuError::shape(
                 what,
                 format!(
                     "layer {l}: the ring pass's buffers armed for a half of {} slots, the ring's \
                      is {}",
-                    rg.route.n_experts(),
+                    rg.half_slots(),
                     r.half_slots
                 ),
             ));
@@ -768,7 +726,7 @@ impl CardExperts {
             rule,
         };
         self.k.leg.enqueue(gpu, &mut bufs.leg, &card, None)?;
-        g32.enqueue_quantize_gemm32(stream, io.normed, io.m, &mut rg.x, fault)?;
+        rg.enqueue_rows(gpu, g32, io.normed, io.m, fault)?;
         card_leg::with_ring(&stacks, layer.n_card, r, ctx, |half| {
             let [gate, up, down] = half.routes()?;
             if [gate, up, down]
@@ -791,30 +749,13 @@ impl CardExperts {
                 hidden: self.n,
             };
             for b in &r.batches {
-                b.with_map(ctx, n_expert, |row| {
-                    g32.enqueue_route_remap(stream, ids, row, n_slots, &mut rg.route, fault)
-                })?;
-                if let Some(e) = b.event.as_deref() {
-                    stream.wait(e)?;
-                }
-                let RingGemm { x, g, u, h, route } = &mut *rg;
-                blk.enqueue_rule(
+                rg.enqueue_batch(
                     gpu,
                     (None, g32),
-                    (&*route, n_used),
-                    n_slots,
-                    (
-                        RouteIo {
-                            x128: None,
-                            x32: Some(&*x),
-                            g,
-                            u,
-                            h128: None,
-                            h32: Some(h),
-                            y: bufs.leg.down_mut(),
-                        },
-                        rule,
-                    ),
+                    &blk,
+                    b,
+                    (ids, n_slots, n_used, n_expert),
+                    (bufs.leg.down_mut(), rule),
                     fault,
                 )?;
             }

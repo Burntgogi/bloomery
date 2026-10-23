@@ -32,7 +32,7 @@ use crate::placement::ctx_ask::{PlanRefusal, Short, Side};
 use crate::placement::workstation::{self, HostNeed, HostRead};
 use crate::placement::{
     self, Card, CardTotals, KvBytes, Machine, ModelTensors, PlacementError, Plan, PlanLevers,
-    Unimplemented, Violation, checked_beside, joined,
+    Unimplemented, Violation, checked_beside, joined, kernels,
 };
 
 // The prompt batch a window ring keeps room for is the batch the card walks the prompt in.
@@ -56,7 +56,7 @@ const fn act32_bytes(cols: usize, k: usize) -> usize {
 #[must_use]
 pub const fn wide_bytes(cols: usize, k: usize) -> usize {
     let q128 = if k.is_multiple_of(256) {
-        crate::placement::kernels::q8_act_bytes(cols as u64, k as u64) as usize
+        kernels::q8_act_bytes(cols as u64, k as u64) as usize
     } else {
         0
     };
@@ -75,11 +75,49 @@ pub const fn route_bytes(cols: usize) -> usize {
     4 * (cols + 2 * (cols / GEMM_TILE_COLS + 1) + 2 + cols)
 }
 
+/// The forms a ring pass's route GEMMs read their rows in, by the stacks' file types: the gate's and
+/// up's (one type, so one form), then the down's — `true` where the kernel table's GEMM entry for
+/// the type reads q8 blocks of 32 (`kernels::gemm_reads_blocks32`, `GemmAct32`), `false` for the
+/// grouped GEMM's q8_1 blocks of 128 (`GemmAct`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RingForms {
+    pub gate_up32: bool,
+    pub down32: bool,
+}
+
+impl RingForms {
+    /// Both reads in the 32-value form.
+    pub const BLOCKS32: RingForms = RingForms {
+        gate_up32: true,
+        down32: true,
+    };
+
+    /// The forms of a gate and up of type `gate_up` and a down of type `down`; `None` where the
+    /// kernel table names no route GEMM for one of them.
+    #[must_use]
+    pub const fn of(gate_up: gguf::GgmlType, down: gguf::GgmlType) -> Option<RingForms> {
+        match (kernels::gemm(gate_up), kernels::gemm(down)) {
+            (Some(g), Some(d)) => Some(RingForms {
+                gate_up32: kernels::gemm_reads_blocks32(g),
+                down32: kernels::gemm_reads_blocks32(d),
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// Card bytes of `cols` columns of `k` values in one route GEMM's read form: the 32-value
+/// form's where `blocks32`, else the grouped GEMM's q8_1 blocks of 128.
+const fn ring_act_bytes(cols: usize, k: usize, blocks32: bool) -> usize {
+    if blocks32 {
+        act32_bytes(cols, k)
+    } else {
+        kernels::q8_act_bytes(cols as u64, k as u64) as usize
+    }
+}
+
 /// Card bytes of a prompt batch's ring pass over a half of `half` slots of the expert stream's ring
-/// (the card experts' ring GEMM buffers, made when the stream starts): the batch's `rows` normed
-/// rows of `n` values in the 32-value form, every slot's gate and up rows (`rows · n_used` slots of
-/// `ff` f32 values each), their SwiGLU in the 32-value form and the route table of those slots over
-/// the half. The one formula of those bytes: the body holds its made bytes to it.
+/// with both reads in the 32-value form ([`ring_pass_bytes_in`] at [`RingForms::BLOCKS32`]).
 #[must_use]
 pub const fn ring_pass_bytes(
     rows: usize,
@@ -88,11 +126,32 @@ pub const fn ring_pass_bytes(
     ff: usize,
     half: usize,
 ) -> usize {
+    ring_pass_bytes_in(rows, n_used, n, ff, half, RingForms::BLOCKS32)
+}
+
+/// Card bytes of a prompt batch's ring pass over a half of `half` slots of the expert stream's ring
+/// (the ring GEMM buffers, made when the stream starts): the batch's `rows` normed rows of `n`
+/// values in the gate's and up's form, every slot's gate and up rows (`rows · n_used` slots of
+/// `ff` f32 values each), their SwiGLU in the down's form and the route table of those slots over
+/// the half, the forms `forms`. The one formula of those bytes: the body holds its made bytes to
+/// it.
+#[must_use]
+pub const fn ring_pass_bytes_in(
+    rows: usize,
+    n_used: usize,
+    n: usize,
+    ff: usize,
+    half: usize,
+    forms: RingForms,
+) -> usize {
     let slots = rows * n_used;
     let routed = if half < slots { half } else { slots };
     let zeros = if half == 1 { slots } else { 0 };
     let route = 4 * (slots + 2 * (slots / GEMM_TILE_COLS + routed) + 2 + zeros);
-    act32_bytes(rows, n) + 2 * 4 * slots * ff + act32_bytes(slots, ff) + route
+    ring_act_bytes(rows, n, forms.gate_up32)
+        + 2 * 4 * slots * ff
+        + ring_act_bytes(slots, ff, forms.down32)
+        + route
 }
 
 /// The card bytes a prompt call's expert stream takes beside the plan's terms
