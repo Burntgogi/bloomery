@@ -23,7 +23,11 @@ Fault formatting uses `bloomery_device::fault`'s shared layout/decoder and the
 `gpu::arch::step_order` registry. Flint's registry row uses neutral code order;
 it does not describe a runnable step.
 
-Run `BLOOMERY_MODEL=<pinned GGUF or header prefix> BLOOMERY_BOX_LOCAL=1 just gate-flint-meta`.
+Run `BLOOMERY_BOX_ENV="BLOOMERY_MODEL=/absolute/path/flint-header.gguf" BLOOMERY_BOX_LOCAL=1 just gate-flint-meta`.
+Set `BLOOMERY_ENV_FILE` to the local toolchain environment file if it is not `~/bloomery-env.sh`.
+Keep the outer `BLOOMERY_MODEL` unset or a tool-profile name: `box.sh` reads it before launching the command.
+The model-path assignment belongs in `BLOOMERY_BOX_ENV`, which reaches the test after profile resolution;
+that channel accepts paths without whitespace.
 The gate hashes the first 5,470,528 bytes before using `gguf::inventory_of`, `write::Layout`
 and `Split::header_only`; it reads no tensor payload and never treats a sparse file as real weights.
 The pinned header yielded 779 tensors, 49 layers, 2 dense/47 routed blocks, 49 head-normalization
@@ -35,6 +39,29 @@ The independent common Jinja and tokenizer changes are tracked by #632; a reader
 those changes are present in an older checkout. Fixture/refset registration is intentionally absent:
 the artifact license/provenance conflict below is unresolved, and runtime support still requires the
 remaining acceptance rows. This header gate is not an end-to-end model gate.
+
+### Runtime handoff checked on main `2a7005b8`
+
+The design, common template support, tokenizer/four-EOG contract and reader (#676–#680) are merged.
+The existing header recipe was exercised on the exact 5,470,528-byte prefix above: four reader tests and
+the pinned-header test passed, still reporting the missing program and operation bindings.
+No full weights or GPU were needed for that check.
+
+The maintainer [assigned the model port and offered card runs](https://github.com/midagedev/bloomery/issues/632#issuecomment-6352066886),
+and named a forthcoming head128 sink/SWA attention, QK RMS and sigmoid256/top6 train.
+Those complete contracts are not in this main snapshot or the inspected public heads of #726 (`1723485602c1`)
+and #747 (`f883e84f8d2c`). Existing ring and sink-merge ingredients do not establish the combined attention
+operation; `route_body` still lacks 256/top6 and its normalization-floor policy.
+Obtain the train's fetchable ref before duplicating those primitives.
+
+The next bounded host change is the existing router description/selection contract: distinguish normalization
+policies, preserve every current model's arithmetic, and have Flint request `max(sum_selected, 2^-14)`.
+A differently normalized row must remain ineligible; the absent-bias, 256/top6 and `Need::Program` refusals stay
+until real device bindings are supplied. Reconcile that interface with the pending train before device work.
+Then close shared IQ4_XS, selected card/tier down forms and six-slot F32 handoff in their existing common owners,
+followed by paging/resident slots, reference provenance and the body/app/seat.
+Each device slice needs its numerical/fault gates and the maintainer's offered hardware proof before admission.
+
 
 ## 1. Sources and observed artifact
 
@@ -166,14 +193,14 @@ Do not claim runtime support by adding the name to an enum or relaxing a shape/t
 
 | ID | Current limitation | Required common change before an executable attach |
 |---|---|---|
-| G1 | [`models::needs`][needs] emits `QkRope` only when RoPE is enabled, hiding NoPE QK normalization | Emit the existing need for normalization **or** rotation; bind head128 normalization with `mode=None` truthfully. No identity-RoPE table. |
+| G1 | NoPE normalization-need generation is present; the executable head128 norm-only binding is missing | Preserve the emitted normalization **or** rotation need; bind head128 normalization with `mode=None` truthfully. No identity-RoPE table. |
 | G2 | Existing head128/group8 attention lacks the complete sink/SWA contract; MiMo's window pass is K192/V128 | Complete the described head128 operation in `rope_neox` / `flash_gqa`, including genuine NoPE append, sink merge, window/ring positions, prompt and slot paths. Never pad heads to 192 or copy MiMo's body. |
 | G3 | Sigmoid256/top6 is absent; higher-level `shared_routed` and router shape admission require bias | Add the real instance and normalization policy; bind absent bias through `RouteLayer.bias=None`, which the lower `RouteBlock` already supports. Price/load the BF16 router through its supported F32 widening. |
 | G4 | Layer42 shared IQ4_XS has routed/GEMM operations but no ordinary dense site, and `BlockPlan` rejects it | Extend the **common** dense/gated block's real layout, load, launch, scratch and prompt binding. Keep the role `SharedExpert`; do not relabel it as routed or silently requantize it. |
 | G5 | The common card wrapper uses Q8Act-only buffers and `LegStacks::of`; Q6_K/Q8_0 down do not both pass that path | Carry selected arms and actual down forms through `CardExperts`, `LegBufs::for_downs`, loader, planner, residency and tier. Existing Q6_K/Q8_0 arithmetic is not the missing piece. |
 | G6 | Common tier accumulation supports six slots, but F32 `enqueue_handoff_tier` accepts eight | Add the six-slot F32 handoff instance in the existing owner; preserve the eight-slot entry. A DeepSeek Q8_1 handoff is not an interchangeable input contract. |
 | G7 | `place_hybrid` rejects paged experts; common `Hybrid<F>` has `RESIDENT=false` | Lift matching plan/load/host-source and resident-slot plumbing in the existing adapters. Do not remove refusal before the loaded body and seat actually implement the capability. |
-| G8 | Tokenizer, original template and EOG ingestion are not a complete Flint chat contract | Extend the common tokenizer/Jinja/stop owners as in §7; keep the original template and existing GLM-format tool parser. |
+| G8 | Common original-template, tokenizer and four-EOG support is present through #677/#678 | Bind the existing chat/tool/stop owners when the executable seat attaches; keep the original template and GLM-format tool parser. |
 
 Attention implementation boundary: the existing head128 ring pass and value-head128 sink merge
 are promising ingredients, **not an already callable Flint operation**. Their partial segmentation
