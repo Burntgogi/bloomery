@@ -402,21 +402,23 @@ class RecipeKeyCLI(unittest.TestCase):
                                      {"gate-called": "run", "gate-linked": "skip"})
 
     def test_parameterized_source_macro_keeps_argument_bound_calls(self):
-        files = runtime_files()
-        files["crates/app/src/bin/called.rs"] = "fn main() { dep::run(); }\n"
-        files["crates/dep/src/lib.rs"] += (
-            "mod hidden;\n"
-            "macro_rules! call { ($module:ident) => { $module::run() }; }\n"
-            "pub fn run() { call!(hidden); }\n"
-        )
-        files["crates/dep/src/hidden.rs"] = 'pub fn run() { println!("hidden1"); }\n'
-        ws = Workspace(self, files)
-        ws.green("gate-called", "gate-linked")
-        rel = "crates/dep/src/hidden.rs"
-        with ws.changed(rel, files[rel].replace("hidden1", "hidden2"), restore_mtime=True):
-            rows = ws.keys("gate-called", "gate-linked", ledger=True)
-            ws.assert_status(rows, {"gate-called": "run", "gate-linked": "skip"})
-            self.assert_file(rows["gate-called"], rel)
+        for parameter in ("module", "모듈"):
+            with self.subTest(parameter=parameter):
+                files = runtime_files()
+                files["crates/app/src/bin/called.rs"] = "fn main() { dep::run(); }\n"
+                files["crates/dep/src/lib.rs"] += (
+                    "mod hidden;\n"
+                    f"macro_rules! call {{ (${parameter}:ident) => {{ ${parameter}::run() }}; }}\n"
+                    "pub fn run() { call!(hidden); }\n"
+                )
+                files["crates/dep/src/hidden.rs"] = 'pub fn run() { println!("hidden1"); }\n'
+                ws = Workspace(self, files)
+                ws.green("gate-called", "gate-linked")
+                rel = "crates/dep/src/hidden.rs"
+                with ws.changed(rel, files[rel].replace("hidden1", "hidden2"), restore_mtime=True):
+                    rows = ws.keys("gate-called", "gate-linked", ledger=True)
+                    ws.assert_status(rows, {"gate-called": "run", "gate-linked": "skip"})
+                    self.assert_file(rows["gate-called"], rel)
 
     def test_features_and_test_roots(self):
         ws = Workspace(self, runtime_files())

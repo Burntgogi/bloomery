@@ -3666,12 +3666,12 @@ def _assoc_units(shape: str, a: int, b: int, ctx: tuple[str, ...], hdr: tuple[in
 
 @functools.cache
 def _source_macro_bodies(text: str, test: bool) -> dict[int, str]:
-    """Lexed definition bodies, indexed exactly like rust_facts, for expansion safety checks."""
+    """Lexed definition bodies without metavariables except $crate, indexed like rust_facts."""
     _, shape = build_view(text, test)
     raw: list = []
     _module_units(shape, 0, len(shape), (), raw, [])
     return {k: shape[a:b] for k, (kind, _, _, a, b, _, _) in enumerate(raw)
-            if kind == "macro_rules!" and not re.search(r"\$\s*(?!crate\b)[A-Za-z_]\w*", shape[a:b])}
+            if kind == "macro_rules!" and not re.search(r"\$(?!\s*crate\b)", shape[a:b])}
 
 
 @functools.cache
