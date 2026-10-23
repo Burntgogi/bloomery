@@ -872,7 +872,7 @@ impl Body {
                 WHAT,
                 "expert tier buffers",
                 inputs.tier_reserve.unwrap_or(0),
-                (t.bytes() + TierBatch::bytes_of(prefill::T_MAX)) as u64,
+                (t.bytes() + TierBatch::bytes_of(prefill::T_MAX, N_USED)) as u64,
                 "the step's tier side, and the prompt batch's tier places and the join's copies",
             )?;
         }

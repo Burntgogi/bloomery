@@ -50,8 +50,10 @@ pub enum Program {
     /// The nemotron_h_moe body (`crates/gpu/src/arch/nemotron_h_moe`):
     /// whole-card, the Nano's Mamba-2 and NoPE GQA layers over the shared
     /// hybrid owner (`crates/gpu/src/arch/hybrid.rs`) and the latent MoE layer,
-    /// whose routed up and down stacks and shared expert are IQ2_XXS read by
-    /// `iq2_xxs_gemv_sel` ([`BOLT_LEG`]).
+    /// whose routed up and down stacks are IQ2_XXS read by `iq2_xxs_gemv_sel`
+    /// ([`BOLT_LEG`]) or both of a 32-value-block type the card leg's relu²
+    /// form reads ([`bolt_leg_runs`]), and whose shared expert is IQ2_XXS or a
+    /// Q8_0 site.
     NemotronHMoeBody,
     /// The EmbeddingGemma encoders (`crates/gpu-gemma-embedding2`): one
     /// pass of a dense trunk on a card, no routed experts.
@@ -375,6 +377,17 @@ pub const DS41_LEG: [GgmlType; 3] = [GgmlType::Q3_K, GgmlType::Q3_K, GgmlType::Q
 /// one type its `iq2_xxs_gemv_sel` launches read, in the file's blocks.
 pub const BOLT_LEG: GgmlType = GgmlType::IQ2_XXS;
 
+/// Whether the latent MoE body runs a routed up or down stack of type `ty` on
+/// the card: [`BOLT_LEG`] by its `iq2_xxs_gemv_sel` launches, or a
+/// 32-value-block type by the card leg's relu² form
+/// ([`kernels::card_sel32_runs`]: Q5_1, Q8_0, IQ4_NL). A layer runs one form
+/// for both stacks, so the load refuses by name a layer whose up and down
+/// take different forms.
+#[must_use]
+pub const fn bolt_leg_runs(ty: GgmlType) -> bool {
+    matches!(ty, BOLT_LEG) || kernels::card_sel32_runs(ty)
+}
+
 /// The muse-spark body's routed stacks: a gate, an up and a down of the one
 /// type its `iq2_xxs_gate_up_sel` and `iq2_xxs_gemv_sel` launches read, in
 /// the file's blocks.
@@ -414,8 +427,8 @@ pub fn leg_arms(p: Program) -> Option<LegArms> {
             down: |ty| ty == DS41_LEG[2],
         }),
         Program::NemotronHMoeBody => Some(LegArms {
-            gate_up: |ty| ty == BOLT_LEG,
-            down: |ty| ty == BOLT_LEG,
+            gate_up: bolt_leg_runs,
+            down: bolt_leg_runs,
         }),
         Program::Raon1Body => Some(LegArms {
             gate_up: kernels::card_gate_up_runs,
@@ -489,9 +502,9 @@ pub fn routed_rule(p: Program) -> RoutedRule {
     }
 }
 
-/// The latent MoE body's plan arm: [`BOLT_LEG`], in its card format.
+/// The latent MoE body's plan arm: [`bolt_leg_runs`], in its card format.
 fn bolt_leg_card(ty: GgmlType) -> Option<CardFormat> {
-    (ty == BOLT_LEG).then(|| leg_card_format(ty))
+    bolt_leg_runs(ty).then(|| leg_card_format(ty))
 }
 
 /// The muse-spark body's plan arm: [`MUSESPARK_LEG`], in its card format.

@@ -5,7 +5,9 @@
 //! [`read`] refuses a file whose features no program runs, every one listed);
 //! the plan is the hybrid trunk's ([`PlanInputs::plan_with`]): the whole model
 //! on one card, each routed stack in the format the body's `_sel` launches
-//! read, and the routed experts where [`Experts`] says. [`PlanInputs::plan`]
+//! read (IQ2_XXS, or a 32-value-block type in the card leg's relu² form:
+//! [`crate::placement::accepts::bolt_leg_runs`]), and the routed experts where
+//! [`Experts`] says. [`PlanInputs::plan`]
 //! is the whole card's. A plan under [`Experts::Placed`] or [`Experts::Host`]
 //! may put experts on the host; the load still refuses that until the body has
 //! a host tier.
@@ -20,7 +22,7 @@ use super::hparams::{Hparams, Kind};
 use super::spec;
 pub use crate::arch::hybrid::{Experts, Holds, KvLayout, PlaceError, PlanInputs};
 use crate::placement::PlacementError;
-use crate::placement::kernels::q8_act_bytes;
+use crate::placement::kernels::{card_sel32_runs, q8_act_bytes};
 
 /// The rows the plan keeps a prompt pass's buffers for: the host union's columns, the most a
 /// placed load's pass takes. A whole-card load's pass is the card's room, at least these.
@@ -84,6 +86,8 @@ pub struct PassDims {
     pub route_n: Vec<usize>,
     /// The experts' GEMM forms, `(k, slots a row)`.
     pub gemm_acts: Vec<(usize, usize)>,
+    /// The 32-value GEMM forms of 32-value routed stacks, `(k, slots a row)`.
+    pub gemm32_acts: Vec<(usize, usize)>,
     /// The NVFP4 gemv run forms' widths.
     pub run_k: Vec<usize>,
     /// The q8 blocks of 32 the wide GEMMs read, one a site width.
@@ -124,7 +128,8 @@ fn route_bytes(slots: usize, experts: usize) -> usize {
 /// `d_inner` rows; the query and attention rows (`2 · n_head · HEAD`); the host sums on a placed
 /// load (`width`); the flash's partials for at most [`MAX_PASS_ROWS`] rows; the word record, the
 /// ids, the places, the shared expert's slots and the positions; the GEMM routes and activation
-/// forms; the flash split's sub-group rows; and the Mamba-2 pass scratch.
+/// forms, the 32-value GEMMs' among them; the flash split's sub-group rows; and the Mamba-2 pass
+/// scratch.
 #[must_use]
 pub fn pass_bytes(d: &PassDims, rows: usize) -> usize {
     let cut = rows.next_multiple_of(COLS);
@@ -159,6 +164,10 @@ pub fn pass_bytes(d: &PassDims, rows: usize) -> usize {
         + d.gemm_acts
             .iter()
             .map(|&(k, per_row)| per_row * cut * act_col_bytes(k))
+            .sum::<usize>()
+        + d.gemm32_acts
+            .iter()
+            .map(|&(k, per_row)| per_row * cut * act32_col_bytes(k))
             .sum::<usize>();
     let forms = d
         .slots
@@ -185,26 +194,60 @@ fn add<T: PartialEq>(list: &mut Vec<T>, item: T) {
     }
 }
 
-/// The widths of a placed pass for a file of `hp`, from its headers alone: an upper bound of
-/// what the body collects from its loaded layers, since the plan knows neither the layers' types
-/// nor how many experts of each the card holds. Every routed layer's table and forms are counted
-/// (the body's, only the layers with experts on the card), a router table at the layer's whole
-/// expert count, and every site width as a gemv run form and as a wide GEMM form (the body's, the
-/// NVFP4 and the Q8_0 sites' only): the Mamba-2 in-projection's `hidden` and the out-projection's
-/// `d_inner`, the attention's `hidden` and `n_head · value_len`, the latent pair and the shared
-/// expert.
+/// Which of the body's two card forms a file's routed stacks take ([`forms_of`]): IQ2_XXS (the
+/// `_sel` fallback's q8_1 forms and the grouped GEMM's), and a 32-value-block type (the 32-value
+/// GEMM's forms; the relu² form's step buffers are scratch, not the pass's).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Forms {
+    pub iq2: bool,
+    pub sel32: bool,
+}
+
+/// The forms `split`'s routed up stacks take, over every MoE layer of `hp`: a layer whose up is
+/// IQ2_XXS counts the first, one of a 32-value-block type the second. A layer of another type
+/// counts neither (its experts stay on the host: the coverage pin names it, and the load refuses
+/// a pair of two forms by name).
 #[must_use]
-pub fn pass_dims(hp: &Hparams) -> PassDims {
+pub fn forms_of(split: &Split, hp: &Hparams) -> Forms {
+    let mut forms = Forms::default();
+    for (l, _) in hp.experts.iter().enumerate().filter(|(_, e)| e.is_some()) {
+        let name = crate::arch::names::blk(l, super::names::FFN_UP_EXPS);
+        match split.find(&name).map(|(_, t)| t.ty) {
+            Some(gguf::GgmlType::IQ2_XXS) => forms.iq2 = true,
+            Some(ty) if card_sel32_runs(ty) => forms.sel32 = true,
+            _ => {}
+        }
+    }
+    forms
+}
+
+/// The widths of a placed pass for a file of `hp` whose routed stacks take `forms`, from its
+/// headers alone: an upper bound of what the body collects from its loaded layers, since the plan
+/// does not know how many experts of each layer the card holds. Every routed layer's table and
+/// each form's activations are counted (the body's, only the layers with experts on the card, in
+/// their own form), a router table at the layer's whole expert count, and every site width as a
+/// gemv run form and as a wide GEMM form (the body's, the NVFP4 and the Q8_0 sites' only): the
+/// Mamba-2 in-projection's `hidden` and the out-projection's `d_inner`, the attention's `hidden`
+/// and `n_head · value_len`, the latent pair and the shared expert.
+#[must_use]
+pub fn pass_dims(hp: &Hparams, forms: Forms) -> PassDims {
     let width = hp.experts_width() as usize;
     let top_k = hp.top_k_max();
     let experts = || hp.experts.iter().flatten();
     let mut slots: Vec<(usize, usize)> = Vec::new();
     let mut gemm_acts: Vec<(usize, usize)> = Vec::new();
+    let mut gemm32_acts: Vec<(usize, usize)> = Vec::new();
     for e in experts() {
-        add(&mut slots, (width, COLS));
-        add(&mut slots, (e.ff, top_k * COLS));
-        add(&mut gemm_acts, (width, 1));
-        add(&mut gemm_acts, (e.ff, top_k));
+        if forms.iq2 {
+            add(&mut slots, (width, COLS));
+            add(&mut slots, (e.ff, top_k * COLS));
+            add(&mut gemm_acts, (width, 1));
+            add(&mut gemm_acts, (e.ff, top_k));
+        }
+        if forms.sel32 {
+            add(&mut gemm32_acts, (width, 1));
+            add(&mut gemm32_acts, (e.ff, top_k));
+        }
     }
     if hp.shared_ff > 0 {
         add(&mut slots, (hp.n_embd, COLS));
@@ -240,6 +283,7 @@ pub fn pass_dims(hp: &Hparams) -> PassDims {
         slots,
         route_n: experts().map(|e| e.n_expert).collect(),
         gemm_acts,
+        gemm32_acts,
         run_k: sites.clone(),
         wide_k: sites,
         placed: true,
@@ -247,12 +291,13 @@ pub fn pass_dims(hp: &Hparams) -> PassDims {
 }
 
 /// The card bytes the plan keeps out of the expert budget for a load's prompt pass: the pass's
-/// buffers at [`PASS_ROWS`] rows of a placed load ([`pass_dims`]). A placed load's pass is exactly
-/// these rows (`min(PASS_ROWS, ctx)` rounded down to 64), whose bytes the body holds to this figure;
-/// a whole-card load's pass takes the card's room past it, never fewer rows.
+/// buffers at [`PASS_ROWS`] rows of a placed load of a file whose routed stacks take `forms`
+/// ([`pass_dims`]). A placed load's pass is exactly these rows (`min(PASS_ROWS, ctx)` rounded down
+/// to 64), whose bytes the body holds to this figure; a whole-card load's pass takes the card's
+/// room past it, never fewer rows.
 #[must_use]
-pub fn pass_reserve_bytes(hp: &Hparams) -> u64 {
-    pass_bytes(&pass_dims(hp), PASS_ROWS) as u64
+pub fn pass_reserve_bytes(hp: &Hparams, forms: Forms) -> u64 {
+    pass_bytes(&pass_dims(hp, forms), PASS_ROWS) as u64
 }
 
 /// `split`'s hyperparameters, then its tensors' roles, then its description,
@@ -270,7 +315,7 @@ pub fn describe(split: &Split) -> Result<PlanInputs, PlacementError> {
         model: read.tensors,
         spec: read.spec,
         kv: kv_layout(&hp),
-        prompt_reserve: pass_reserve_bytes(&hp),
+        prompt_reserve: pass_reserve_bytes(&hp, forms_of(split, &hp)),
     })
 }
 
@@ -330,6 +375,7 @@ mod tests {
                 .flat_map(|(n, layers)| std::iter::repeat_n(n, layers))
                 .collect(),
             gemm_acts,
+            gemm32_acts: Vec::new(),
             run_k: vec![4096, 8192, 1024, 5376],
             wide_k: vec![4096, 8192, 1024, 5376],
             placed,
@@ -352,5 +398,18 @@ mod tests {
         assert_eq!(PASS_ROWS, 512);
         assert_eq!(pass_bytes(&bolt(true), PASS_ROWS), 426_763_612);
         assert_eq!(pass_bytes(&bolt(false), PASS_ROWS), 426_763_612 - 2_095_104);
+    }
+
+    /// The 32-value GEMM forms of a file whose routed stacks are 32-value types (Lightning's: no
+    /// latent, so the experts read the 2,688-wide hidden; 6 slots a token of experts 1,856 wide)
+    /// are 8,847,360 B of the pass at the union's 512 rows [derived]: 512 columns of 2,688 values
+    /// (42 steps of 64, 80 B a step: 1,720,320) and 6 x 512 of 1,856 (29 steps: 7,127,040).
+    /// Mutant: the term left out of `pass_bytes`, or counted at one column a row.
+    #[test]
+    fn the_32_value_forms_are_their_columns_at_the_unions_rows() {
+        let mut d = bolt(true);
+        let base = pass_bytes(&d, PASS_ROWS);
+        d.gemm32_acts = vec![(2688, 1), (1856, 6)];
+        assert_eq!(pass_bytes(&d, PASS_ROWS) - base, 8_847_360);
     }
 }

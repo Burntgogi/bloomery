@@ -619,7 +619,7 @@ impl Body {
         let tier = self
             .card
             .any_tier()
-            .then(|| TierBatch::new(gpu.stream(), cap))
+            .then(|| TierBatch::new(gpu.stream(), cap, N_USED))
             .transpose()?;
         let batch = Batch {
             bufs,
@@ -1082,8 +1082,8 @@ impl<'a> LayerProgram for PromptProgram<'a> {
         if self.card.tier_k(l) == 0 {
             return Ok(());
         }
-        let (tier, tb) = tier_parts(self.tier, self.tier_batch.as_deref_mut())?;
-        tier.keep_for_join(gpu, t, &b.weights, tb)
+        let (_, tb) = tier_parts(self.tier, self.tier_batch.as_deref_mut())?;
+        tb.keep(gpu.stream(), t * N_USED, &b.weights)
     }
 
     /// A routed layer's host sums (the walk's serve uploaded them) plus the

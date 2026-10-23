@@ -1683,6 +1683,12 @@ gate-gpu-minimaxm3-serve:
 gate-gpu-minimaxm3-twocard:
     BLOOMERY_MODEL=minimax-m3 BLOOMERY_CARD=both ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-minimaxm3-twocard && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features minimaxm3,checkpoint --release --bin gate_minimaxm3_prefill && BLOOMERY_GATE_BOUND=2400 bash tools/gpu-gate.sh gate_minimaxm3_prefill --arm bp && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_minimaxm3_serve && D=target/minimaxm3-serve-twocard && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_BOUND=1800 bash tools/gpu-gate.sh gate_minimaxm3_serve --dir $D'
 
+# Nemotron-H MoE (Lightning) with its 32-value experts on the card (Relu2Leg for the step, the 32-value GEMM for the
+# prompt): host, card (the 3090's room, split) and whole (the A6000's room) arms near the host path [derived: 8..12 min,
+# mostly the build; three 25.5 GB loads].
+gate-gpu-nemotron-h-moe-card32:
+    BLOOMERY_MODEL=nemotron_h_moe ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-nemotron-h-moe-card32 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_nemotron_h_moe_card32 && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-a6000} bash tools/gpu-gate.sh gate_nemotron_h_moe_card32'
+
 # MiMo-V2 plan (b') on the A6000 and the 3090 (the 3090 an expert tier): the load, the walk equal to the union bit for
 # bit, eager equal to replay, the batch equal to the union and sent [derived: about 8..12 min warm]; the bound is
 # 2400 s.

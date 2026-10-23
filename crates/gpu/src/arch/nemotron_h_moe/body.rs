@@ -3,12 +3,15 @@
 //! once, the caches, the scan stores and the router results allocated once,
 //! and the per-step record refreshed before every enqueue or replay.
 
-use super::moe::{MoeKernels, MoeLayer, MoeScratch, MoeShape, Routing, moe_layer, routed};
+use super::moe::{
+    MoeKernels, MoeLayer, MoeScratch, MoeShape, Routing, moe_layer, routed, sel32_words,
+};
 use super::placed::{PLACED_ROWS, Placed, PlacedOpen, StepWalk, plan_map};
 use crate::arch::hybrid::{
     self, Acts, Cx, DecodeInput, GqaLayer, Kernels, MambaLayer, Names, Site, WORD_POS, WORD_TOKEN,
     Words, attention_heads, derive_zero_conv_bias, gqa_layer, mamba_layer, mamba_shape,
 };
+use crate::card_leg::Relu2Leg;
 use crate::flash_gqa::GROUP_16;
 use crate::flash_gqa_prefill::FlashGqaPrefill;
 use crate::head::Head;
@@ -123,11 +126,10 @@ impl GpuModel<Body> {
     ) -> Result<GpuModel<Body>, GpuError> {
         // The trunk's blocks: the next-token block a file may close with is
         // carried, never loaded.
-        let n_layers = Hparams::read(&file)
-            .map_err(|e| GpuError::plan(WHAT, e))?
-            .n_trunk;
-        GpuModel::load_blocks(gpu, &file, ctx, 0..n_layers, true, |gpu, w| {
+        let hp = Hparams::read(&file).map_err(|e| GpuError::plan(WHAT, e))?;
+        GpuModel::load_blocks(gpu, &file, ctx, 0..hp.n_trunk, true, |gpu, w| {
             Body::derive(gpu.stream(), &file, w)?;
+            sel32_words(gpu.stream(), &file, w, &hp)?;
             Body::load(gpu, &file, w, ctx, Open::Whole { pass_rows })
         })
     }
@@ -360,7 +362,7 @@ impl Body {
                 // The plan kept the pass's bytes out of the expert budget
                 // (`place::pass_reserve_bytes`): the rows are the largest inside that
                 // reserve, and the made bytes are held to it.
-                let reserve = place::pass_reserve_bytes(&hp);
+                let reserve = place::pass_reserve_bytes(&hp, place::forms_of(file, &hp));
                 let inside = (reserve as usize).saturating_add(FIT_RESERVE);
                 let rows = choose_pass_rows(&sizes, (ctx, None), inside, PLACED_ROWS)?;
                 let prompt = Prompt::new(stream, &sizes, rows)?;
@@ -376,6 +378,17 @@ impl Body {
             }
         };
         let ctx_ = gpu.context();
+        // The relu² form's buffers, one an expert width of the layers whose
+        // card experts are 32-value stacks, and its modules where there is one.
+        let mut relu2: Vec<usize> = Vec::new();
+        for ff in layers.iter().filter_map(|l| match l {
+            Layer::Moe(m) => m.relu2_ff(),
+            _ => None,
+        }) {
+            if !relu2.contains(&ff) {
+                relu2.push(ff);
+            }
+        }
         Ok(Body {
             prompt,
             placed,
@@ -383,12 +396,15 @@ impl Body {
             mk: MoeKernels {
                 routers: Routers::load(ctx_)?,
                 iq: QuantSelKernels::load(ctx_, gpu.fault_word())?,
+                relu2: (!relu2.is_empty())
+                    .then(|| Relu2Leg::load(gpu))
+                    .transpose()?,
             },
             q38: Q38Kernels::load(ctx_)?,
             prefill: FlashGqaPrefill::load(ctx_)?,
             acts,
             s: hybrid::Scratch::new(stream, &sh, hp.n_head, 0)?,
-            ms: MoeScratch::new(stream, moe, hidden, ff)?,
+            ms: MoeScratch::new(stream, moe, (hidden, ff), &relu2)?,
             r: DeviceBuffer::zeroed(stream, hidden)?,
             words: Words::new(n_kv),
             sh,

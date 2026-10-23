@@ -5,14 +5,13 @@
 //! run), its stacks through the leg's gate·up arm at the routed SwiGLU (plain: MiMo's limit is 0)
 //! and its `Q8Act` down arm; the stage card's side is the common [`TierSide`].
 //!
-//! A tier layer's join is one weighted sum over the stage card's and the tier's slots in slot
-//! order (`ds41_ffn_card_acc_8_tier`, the fma chain of the card sum the one-card layer runs), plus
-//! `x1`, then the host's sum: the layer's output is the one-card layer's over the union of the two
-//! cards' experts, bit for bit. The step's handoff writes the tier's image and places with the
-//! host's (`RouteBlock::front_tiered`) and the back waits for both ([`Hybrid::enqueue_tier_back`]);
-//! a prompt batch downloads each slot's tier place with the host's rows
-//! ([`Hybrid::enqueue_download_tiered`]) and its back reads the tier's rows through the batch
-//! port's join ([`bloomery_gpu::host::BatchLeg::join_tiered`]).
+//! A tier layer's join is the common one ([`tier_join`]): one weighted sum over the stage card's
+//! and the tier's slots in slot order, plus `x1`, then the host's sum: the layer's output is the
+//! one-card layer's over the union of the two cards' experts, bit for bit. The step's handoff
+//! writes the tier's image and places with the host's (`RouteBlock::front_tiered`) and the back
+//! waits for both ([`tier_join::enqueue_step_join`]); a prompt batch downloads each slot's tier
+//! place with the host's rows ([`Hybrid::enqueue_download_tiered`]) and its back reads the tier's
+//! rows through the batch port's join ([`bloomery_gpu::host::BatchLeg::join_tiered`]).
 //!
 //! What is MiMo's here is the node family that reads the file's description ([`NODE_FAMILY`]) and
 //! the base the sum is added to: MiMo's routed block has no shared expert, so it is `x1` alone.
@@ -26,10 +25,11 @@ use bloomery_gpu::host::run::HostRun;
 use bloomery_gpu::hybrid::{BatchKey, Hybrid, SlotMap};
 use bloomery_gpu::routed_block::RouteBlock;
 use bloomery_gpu::{Gpu, GpuError};
-use bloomery_gpu_deepseek41::chain::ffn::{CardAccTier, FfnBatchKernels};
+use bloomery_gpu_deepseek41::chain::ffn::FfnBatchKernels;
 use bloomery_gpu_deepseek41::router::mimo2::{N_USED, RouterKernels};
-use bloomery_gpu_deepseek41::span::{span, span_mut};
-use cuda_core::{CudaStream, DeviceBuffer};
+pub(crate) use bloomery_gpu_deepseek41::tier_join::TierBatch;
+use bloomery_gpu_deepseek41::tier_join::{self, TierSlots};
+use cuda_core::DeviceBuffer;
 use gguf::Split;
 use model::ModelError;
 use model::arch::mimo2::place::{self, PlanInputs};
@@ -106,31 +106,6 @@ impl LegFamily for Mimo2 {
 /// MiMo's tier node service ([`leg_tier::node_family`]).
 pub const NODE_FAMILY: NodeFamily = leg_tier::node_family::<Mimo2>();
 
-/// The prompt batch's tier buffers for up to `cap` positions: each slot's tier place, and the
-/// copies of the slots' weights and tier places a tier layer's join reads after the next unit's
-/// front has routed over the shared ones.
-pub(crate) struct TierBatch {
-    places: DeviceBuffer<u32>,
-    join_weights: DeviceBuffer<f32>,
-    join_places: DeviceBuffer<u32>,
-}
-
-impl TierBatch {
-    /// The buffers for batches of up to `cap` positions. First-prompt only.
-    pub(crate) fn new(stream: &CudaStream, cap: usize) -> Result<TierBatch, GpuError> {
-        Ok(TierBatch {
-            places: DeviceBuffer::zeroed(stream, cap * N_USED)?,
-            join_weights: DeviceBuffer::zeroed(stream, cap * N_USED)?,
-            join_places: DeviceBuffer::zeroed(stream, cap * N_USED)?,
-        })
-    }
-
-    /// Device bytes [`TierBatch::new`] makes for `cap` positions: three words a slot.
-    pub(crate) const fn bytes_of(cap: usize) -> usize {
-        3 * size_of::<u32>() * cap * N_USED
-    }
-}
-
 /// The stage card's side of a tiered load: the common tier side (the slot map's tier view and the
 /// step's tier places) and the join's kernels.
 pub(crate) struct TierParts {
@@ -155,7 +130,8 @@ impl TierParts {
         })
     }
 
-    /// Device bytes the step's side holds; the batch's are [`TierBatch::bytes`].
+    /// Device bytes the step's side holds; the batch's are [`TierBatch::bytes`] (the common
+    /// [`tier_join::TierBatch`] at [`N_USED`] slots a position).
     pub(crate) fn bytes(&self) -> usize {
         self.side.bytes()
     }
@@ -166,10 +142,10 @@ impl TierParts {
         &mut self.side
     }
 
-    /// Layer `l`'s back of the step on a tier layer (module doc): the wait for the host and the
-    /// tier, the sum over the stage card's slots (`card`'s step rows at the handoff's places `sel`)
-    /// and the tier's rows with the router's `weights`, plus `x1`, then the host's sum, into
-    /// `dest`. Three launches after the wait.
+    /// Layer `l`'s back of the step on a tier layer (module doc): the common step join
+    /// ([`tier_join::enqueue_step_join`]) of the page's one row over the stage card's slots
+    /// (`card`'s step rows at the handoff's places `sel`) and the tier's rows with the router's
+    /// `weights`, plus `x1`, then the host's sum, into `dest`. Three launches after the wait.
     pub(crate) fn enqueue_step_back(
         &self,
         gpu: &Gpu,
@@ -178,31 +154,20 @@ impl TierParts {
         hybrid: &Hybrid<HostRun>,
         (x1, dest): (&DeviceBuffer<f32>, &mut DeviceBuffer<f32>),
     ) -> Result<(), GpuError> {
-        let stream = gpu.stream();
-        let (n_card, n_tier) = (card.n_card(l), card.tier_k(l));
-        hybrid.enqueue_tier_back(stream, l, 0)?;
-        let join = card.step_join(sel);
-        let acc = CardAccTier {
-            down: join.down,
-            trows: hybrid.tier_rows(0)?,
+        let slots = TierSlots {
             w: weights,
-            sel: join.sel,
             tsel: self.side.tsel(0)?,
             n: self.n,
-            m: 1,
-            n_card,
-            n_tier,
+            n_card: card.n_card(l),
+            n_tier: card.tier_k(l),
             n_used: N_USED,
         };
-        self.kernels.enqueue_card_acc_tier(stream, &acc, join.acc)?;
-        gpu.elem()
-            .enqueue_add(stream, join.acc, x1, self.n, join.pre)?;
-        gpu.elem().enqueue_add(
-            stream,
-            hybrid.boundary().hsum_of(0)?,
-            join.pre,
-            self.n,
-            dest,
+        tier_join::enqueue_step_join(
+            gpu,
+            &self.kernels,
+            (hybrid, l, 0),
+            (card.step_join(sel), &slots),
+            (x1, dest),
         )
     }
 
@@ -222,33 +187,17 @@ impl TierParts {
             gpu,
             (key.layer, m),
             ids,
-            (self.side.places(), &mut tb.places),
+            (self.side.places(), tb.places_mut()),
         )?;
-        hybrid.enqueue_download_tiered(gpu.stream(), [normed, weights], ids, &[&tb.places], key)
-    }
-
-    /// The copies of a unit's `m` rows' weights and tier places the join reads, after the unit's
-    /// shadow and before the next unit's front routes over the shared buffers.
-    pub(crate) fn keep_for_join(
-        &self,
-        gpu: &Gpu,
-        m: usize,
-        weights: &DeviceBuffer<f32>,
-        tb: &mut TierBatch,
-    ) -> Result<(), GpuError> {
-        let (stream, slots) = (gpu.stream(), m * N_USED);
-        span_mut(WHAT, &mut tb.join_weights, 0, slots)?
-            .copy_from_device_async(&*span(WHAT, weights, 0, slots)?, stream)?;
-        span_mut(WHAT, &mut tb.join_places, 0, slots)?
-            .copy_from_device_async(&*span(WHAT, &tb.places, 0, slots)?, stream)?;
-        Ok(())
+        hybrid.enqueue_download_tiered(gpu.stream(), [normed, weights], ids, &[tb.places()], key)
     }
 
     /// Layer `l`'s join of a tier layer over a unit's `m` rows, once the host leg has landed the
-    /// tier's rows `trows` ([`bloomery_gpu::host::BatchLeg::join_tiered`]): every token's slots in
-    /// slot order from the stage card's downs (`cb`'s, at its places) or the tier's rows, at the
-    /// weights and places [`TierParts::keep_for_join`] kept, then `x1` added, into `cb`'s sum plus
-    /// the base, which the back adds the host's sums to.
+    /// tier's rows `trows` ([`bloomery_gpu::host::BatchLeg::join_tiered`]): the common join
+    /// ([`tier_join::enqueue_join`]) of every token's slots from the stage card's downs (`cb`'s,
+    /// at its places) or the tier's rows, at the weights and places [`TierBatch::keep`]
+    /// kept, then `x1` added, into `cb`'s sum plus the base, which the back adds the host's sums
+    /// to.
     pub(crate) fn enqueue_join_rows(
         &self,
         gpu: &Gpu,
@@ -256,23 +205,13 @@ impl TierParts {
         (cb, tb): (&mut CardBatch, &TierBatch),
         (trows, x1): (&DeviceBuffer<f32>, &DeviceBuffer<f32>),
     ) -> Result<(), GpuError> {
-        let stream = gpu.stream();
-        let (n_card, n_tier) = (card.n_card(l), card.tier_k(l));
-        let join = cb.join();
-        let acc = CardAccTier {
-            down: join.down,
-            trows,
-            w: &tb.join_weights,
-            sel: join.sel,
-            tsel: &tb.join_places,
-            n: self.n,
-            m,
-            n_card,
-            n_tier,
-            n_used: N_USED,
-        };
-        self.kernels.enqueue_card_acc_tier(stream, &acc, join.acc)?;
-        gpu.elem()
-            .enqueue_add(stream, join.acc, x1, m * self.n, join.pre)
+        let slots = tb.slots(self.n, (card.n_card(l), card.tier_k(l), N_USED));
+        tier_join::enqueue_join(
+            gpu,
+            (gpu.stream(), &self.kernels),
+            (&mut cb.join(), &slots),
+            (trows, m),
+            x1,
+        )
     }
 }
