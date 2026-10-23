@@ -410,6 +410,7 @@ mod gate {
         ctx: u64,
         share: impl Fn(u64) -> u64,
     ) -> Result<PlanLevers, GateError> {
+        // The plan's floor holds the prompt reserve beside the dense, KV and set-aside bytes.
         let all = inputs.plan(machine, ctx, &PlanLevers::default())?;
         let (c, card) = (&all.cards[0], &machine.cards[0]);
         let no_experts = c.dense_bytes
@@ -419,7 +420,8 @@ mod gate {
             + card
                 .set_aside_bytes()
                 .ok_or("the card's set-aside is unbounded")?
-            + card.margin_bytes;
+            + card.margin_bytes
+            + inputs.prompt_reserve;
         Ok(PlanLevers {
             card_budget_bytes: Some(no_experts + share(c.expert_bytes)).into(),
         })
