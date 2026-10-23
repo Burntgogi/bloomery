@@ -924,7 +924,7 @@ dump-ref-emb2-audio:
 
 # Audio tower: bounded mel chunks, Conformer soft rows and clean/tapped equality.
 gate-gpu-gemma4a:
-    ./tools/box.sh 'bash tools/gate.sh --oxide --release -p bloomery-gpu-gemma4a --lib -- --include-ignored'
+    ./tools/box.sh 'bash tools/gate.sh --gpu --oxide --release -p bloomery-gpu-gemma4a --lib -- --include-ignored'
     ./tools/box.sh 'bash tools/gate.sh --oxide --release -p bloomery-gpu-gates --features gemma4a --bin gate_gemma4a'
     ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gemma4a --release --bin gate_gemma4a && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_gemma4a'
 
@@ -1580,7 +1580,7 @@ gate-gpu-gemma-embedding-serve:
     BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_gemma_embedding2_serve && D=target/embedding-serve-gate-$(date +%s)-$$ && mkdir -p "$D" && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_gemma_embedding2_serve --v1 --dir "$D"'
 
 gate-gpu-gemma-embedding2-e2e *ARGS:
-    ./tools/box.sh 'bash tools/gate.sh --oxide --release -p bloomery-gpu-gemma-embedding2 --lib -- --include-ignored'
+    ./tools/box.sh 'bash tools/gate.sh --gpu --oxide --release -p bloomery-gpu-gemma-embedding2 --lib -- --include-ignored'
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::gemma_embedding2::spec::tests::key_bounds_are_the_symmetric_mask --exact'
     ./tools/box.sh 'bash tools/gate.sh --oxide --release -p bloomery-gpu-gates --features gemma-embedding2,vision,deepseek41 --bin gate_gemma_embedding2_e2e'
     BLOOMERY_MODEL=gemma-embedding2 ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gemma-embedding2,vision,deepseek41 --release --bin gate_gemma_embedding2_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_gemma_embedding2_e2e {{ARGS}}'
@@ -2168,11 +2168,11 @@ gate-gpu-ds41-comp:
 gate-gpu-ds41-index:
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-ds41-index && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_index && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_index'
 
-# V4.1 디바이스 크레이트의 lib 시험(게이트 락 없음): 오라클 세트가 닿지 않는 큰 위치에서도 rope 표가 ggml 레시피와 같다.
-# hw_ 시험(experts.rs의 gate·up 합 오류가 활성화 앞에서 난다)은 #[ignore]라 --include-ignored로 같이 돌고 카드 0번을 연다.
+# V4.1 device-linked lib tests: rope tables match ggml even at positions outside the oracle set.
+# Include ignored hw_ checks for pre-activation gate/up errors under the common GPU card lock.
 [group('canary')]
 gate-gpu-ds41-lib:
-    ./tools/box.sh 'bash tools/gate.sh --oxide -p bloomery-gpu-deepseek41 --release --lib -- --include-ignored'
+    ./tools/box.sh 'bash tools/gate.sh --gpu --oxide -p bloomery-gpu-deepseek41 --release --lib -- --include-ignored'
 
 # V4.1 서버 엔진 결합(gpu-gates의 bind, deepseek41 기능 뒤에 있어 gate-gpu-gates-lib가 빌드하지 않는다)과 모든 서버 좌석이 나눠 쓰는
 # 비전 좌석(vision_seat: 플래그, 투영기↔텍스트 검사, 인코더 자리와 reserve, 표의 위치당 바이트, `vision` 레코드)과 임베딩 모델의
@@ -3077,9 +3077,9 @@ gate-gpu-vision-lib:
 
 # The image-tower crate's `hw_` tests, which open a card (the lib recipe above runs the rest): the Gemma4 tower's fused 3x3 pooling
 # mean against the gather followed by the group mean, bit for bit, and the tower's held scratch bytes against its card figure. The
-# card is the box's 3090 pin, with no gate lock, as the other device-linked libs' `hw_` tests.
+# shared GPU runner owns card selection and the runtime lock.
 gate-gpu-vision-hw:
-    ./tools/box.sh 'bash tools/gate.sh --oxide -p bloomery-gpu-vision --release --lib -- --ignored'
+    ./tools/box.sh 'bash tools/gate.sh --gpu --oxide -p bloomery-gpu-vision --release --lib -- --ignored'
 
 # The glm5v image tower on the card (the mmproj of GLM-5.3-Flash: llama.cpp's `glm4v` graph with a per-head q/k norm, a clamped
 # SwiGLU and an erf GELU; 24 blocks of heads of 64, a 2x2 convolution merger) against the glm5next vision seat's tap set B
@@ -3260,7 +3260,7 @@ gate-gpu-glm5next-media:
 # bin refuses the lever. Fixture-only (tools/ref/fixture-only.sh): the real file's ranks are loaded across nodes, not on
 # one card.
 gate-gpu-glm5next-tp:
-    BLOOMERY_MODEL=glm5next ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-gpu-glm5next-tp && bash tools/gate.sh --oxide -p bloomery-gpu-glm5next --release --features hf --lib -- --include-ignored tp:: && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features glm5next --bin gate_glm5next_tp -- --include-ignored && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next --release --bin gate_glm5next_tp && unset BLOOMERY_CARD_BUDGET && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_glm5next_tp'
+    BLOOMERY_MODEL=glm5next ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-gpu-glm5next-tp && bash tools/gate.sh --gpu --oxide -p bloomery-gpu-glm5next --release --features hf --lib -- --include-ignored tp:: && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features glm5next --bin gate_glm5next_tp -- --include-ignored && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next --release --bin gate_glm5next_tp && unset BLOOMERY_CARD_BUDGET && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_glm5next_tp'
 
 # The serve seat's media call of the same fixture (`bloomery-serve --mmproj` on a GLM file), gate_glm5next_e2e's `--only media-seat`
 # ((sm), `shared/glm5next_media.rs`'s `seat`, built with the `vision` feature the other recipes leave out): the encoder file of

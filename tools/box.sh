@@ -1198,14 +1198,14 @@ if [ "$LOCAL" = 1 ]; then
   LOCALX="{ [ \"\${BLOOMERY_LOCK_DIR-}\" = $(printf %q "$LOCK_DIR") ] || { echo \"box.sh: the environment file or BLOOMERY_BOX_ENV set BLOOMERY_LOCK_DIR after local mode's guard probed the lock directory; set it before tools/box.sh\" >&2; exit 64; }; } && "
   LOCALX+="{ [ \"\${BLOOMERY_ARCH:-sm_86}\" = $RECIPE_ARCH ] || { echo \"box.sh: the environment file set BLOOMERY_ARCH=\$BLOOMERY_ARCH, and the recipe expanded $RECIPE_ARCH (this side's BLOOMERY_ARCH, unset: sm_86): name it in the environment, where the recipes read it\" >&2; exit 64; }; } && "
 fi
-# cargo oxide를 스크립트 안에서 부르는 명령(gate.sh --oxide, release/build.sh)도 같은 확인을 거친다.
+# Script-internal cargo-oxide calls, including locked GPU lib tests, share the pin check.
 # release/build.sh --check는 바이너리만 읽고 빌드하지 않으므로 거치지 않는다. 그 부분만 빼고 보므로,
 # 같은 명령 안의 다른 release/build.sh 빌드는 여전히 확인을 거친다.
 # 확인은 BLOOMERY_BOX_ENV 뒤에 돈다: 거기서 CARGO_HOME이나 PATH를 바꾸면 빌드가 쓰는 그 설치를 확인한다.
 OXCHECK=
 OXCMD=$*
 case "${OXCMD//release\/build.sh --check/}" in
-  *"cargo oxide"* | *"gate.sh --oxide"* | *"release/build.sh"*) OXCHECK=$OXCLI ;;
+  *"cargo oxide"* | *"gate.sh --oxide"* | *"gate.sh --gpu --oxide"* | *"release/build.sh"*) OXCHECK=$OXCLI ;;
 esac
 # serve의 build.rs가 `/props`의 version에 새기는 커밋. 박스 사본에는 .git이 없어서(rsync가 뺀다) 여기서 넘긴다.
 # 이 트리에 커밋에 없는 변경이 있으면 `-dirty`를 붙인다 — 그 바이너리는 그 커밋의 것이 아니다.

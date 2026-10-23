@@ -158,7 +158,9 @@ runner's forced-card policy.
 The host-only self-test exercises these selection paths with isolated locks,
 leases and query responses; it does not measure physical GPU occupancy.
 
-`gate-gpu-lib` compiles each CUDA library-test pass outside the card lock using
+`gate-gpu-lib`, `gate-gpu-gemma4a`, `gate-gpu-gemma-embedding2-e2e`,
+`gate-gpu-ds41-lib`, `gate-gpu-vision-hw` and `gate-gpu-glm5next-tp` compile their
+hardware-enabled CUDA library-test passes outside the card lock using
 `tools/gate.sh --gpu --oxide`. Its native `--lib` Cargo call uses a capture-only
 target runner: compilation never executes the test. Cargo owns the executable,
 arguments, package working directory and runtime environment (including native
@@ -170,6 +172,11 @@ tests before locking. A preconfigured scalar or environment runner is overridden
 an array-valued runner conflicts with the scalar override and Cargo refuses it
 before either runner executes. Compiler output remains visible, including
 cargo-oxide's non-JSON banners.
+`box.sh` checks the resolved cargo-oxide installation against the workspace pin
+for this wrapper too, after applying `BLOOMERY_BOX_ENV`. A stale installation
+stops with 70 before any build or test starts. The wrapper regression executes
+the actual queued commands, checking both refusal and the absence of a child;
+the pinned installation and non-building commands remain positive controls.
 
 Replay enters `tools/gpu-gate.sh --executable` in Cargo's context. The common GPU
 runner therefore applies card selection and `CUDA_VISIBLE_DEVICES` **after** the
