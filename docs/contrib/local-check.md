@@ -69,11 +69,14 @@ Absolute paths and raw identifiers retain conservative owner/dependency bounds w
 uncertain; Cargo-selected roots and declared Rust modules are source regardless of their filename suffix.
 The persistent structural cache must preserve these inputs across fresh processes.
 The selected profiles of every box call remain inputs, including shell defaults and inherited model overrides.
-Changing a selected profile or called source invalidates its consumer; an unrelated private profile or unreached
-source does not. Shared box inputs remain mandatory for every box command.
+Changing a selected profile or called source invalidates its consumer; an unrelated private profile or source
+outside the retained input bound does not. Shared box inputs remain mandatory for every box command.
 The cache codec transfers scalar leaves without recursive dispatch; container reconstruction and strict field,
 index, source-provenance and input-stability validation remain unchanged. Rust comment scanning checks the
 leading delimiter before probing a comment opener, without changing literal handling or line positions.
+Parameterized source macros keep their owner's conservative compilation/dependency bound until argument
+substitution is understood. Explicit-directory enumeration and child-stat failures refuse the key rather than
+publish a digest of an incomplete file set.
 
 The mapped checkpoint reader is `bloomery-safetensors`; `gate-safetensors` owns its dtype, span and shard tests.
 `f32_values` also checks directly constructed `Raw` values: shape and dtype must account for the complete

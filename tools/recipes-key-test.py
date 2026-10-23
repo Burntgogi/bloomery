@@ -401,6 +401,23 @@ class RecipeKeyCLI(unittest.TestCase):
                     ws.assert_status(ws.keys("gate-called", "gate-linked", ledger=True),
                                      {"gate-called": "run", "gate-linked": "skip"})
 
+    def test_parameterized_source_macro_keeps_argument_bound_calls(self):
+        files = runtime_files()
+        files["crates/app/src/bin/called.rs"] = "fn main() { dep::run(); }\n"
+        files["crates/dep/src/lib.rs"] += (
+            "mod hidden;\n"
+            "macro_rules! call { ($module:ident) => { $module::run() }; }\n"
+            "pub fn run() { call!(hidden); }\n"
+        )
+        files["crates/dep/src/hidden.rs"] = 'pub fn run() { println!("hidden1"); }\n'
+        ws = Workspace(self, files)
+        ws.green("gate-called", "gate-linked")
+        rel = "crates/dep/src/hidden.rs"
+        with ws.changed(rel, files[rel].replace("hidden1", "hidden2"), restore_mtime=True):
+            rows = ws.keys("gate-called", "gate-linked", ledger=True)
+            ws.assert_status(rows, {"gate-called": "run", "gate-linked": "skip"})
+            self.assert_file(rows["gate-called"], rel)
+
     def test_features_and_test_roots(self):
         ws = Workspace(self, runtime_files())
         items = ("gate-called", "gate-feature", "gate-test")
@@ -432,6 +449,52 @@ class RecipeKeyCLI(unittest.TestCase):
         ws.write("tools/key-data/new.txt", "new child\n")
         ws.assert_status(ws.keys("gate-called", "gate-linked", ledger=True),
                          {"gate-called": "run", "gate-linked": "skip"})
+
+    def test_directory_reads_refuse_enumeration_and_stat_errors(self):
+        files = runtime_files()
+        files["crates/dep/src/used.rs"] = (
+            'pub fn run() { let _ = std::fs::read_dir("tools/key-data").unwrap(); }\n'
+        )
+        files["tools/key-data/child.txt"] = "held\n"
+        ws = Workspace(self, files)
+        baseline = ws.green("gate-called")
+        self.assert_file(baseline["gate-called"], "tools/key-data/child.txt")
+        # Inject at the OS boundary in a child: chmod refusals depend on the caller's privilege.
+        driver = r'''
+import importlib.util
+import os
+from pathlib import Path
+import sys
+sys.path.insert(0, str(Path.cwd() / "tools"))
+spec = importlib.util.spec_from_file_location("loaded_recipes", "tools/recipes.py")
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+mode = sys.argv[1]
+target = str(Path.cwd() / "tools/key-data")
+if mode == "stat":
+    target += "/child.txt"
+    original = os.stat
+    def failing(path, *args, **kwargs):
+        if isinstance(path, (str, bytes, os.PathLike)) and os.path.abspath(os.fsdecode(path)) == target:
+            raise OSError(5, "directory child stat failed", target)
+        return original(path, *args, **kwargs)
+    os.stat = failing
+else:
+    original = os.scandir
+    def failing(path):
+        if os.path.abspath(os.fsdecode(path)) == target:
+            raise PermissionError(13, "directory enumeration denied", target)
+        return original(path)
+    os.scandir = failing
+raise SystemExit(module.main(["key", "--manifest", sys.argv[2], "--ledger", sys.argv[3], "gate-called"]))
+'''
+        for mode in ("enumeration", "stat"):
+            with self.subTest(operation=mode):
+                observed = ws.run(sys.executable, "-c", driver, mode, str(ws.manifest), str(ws.ledger))
+                fields = observed.stdout.strip().split("\t", 3)
+                self.assertEqual(fields[:3], ["-", "gate-called", "error"], observed.stdout + observed.stderr)
+                self.assertIn("tools/key-data", fields[3])
 
     def test_missing_linked_source_and_include_are_named_errors(self):
         ws = Workspace(self, runtime_files())

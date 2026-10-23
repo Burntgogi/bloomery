@@ -1111,10 +1111,14 @@ class Tree:
         return ok
 
     def directory_files(self, rel: str) -> set[str]:
-        """Every regular file read under an explicit directory, including ignored and symlinked children."""
+        """Every regular file under an explicit directory; unreadable entries are errors."""
         out: set[str] = set()
         seen: set[str] = set()
-        for base, dirs, files in os.walk(os.path.join(self.root, rel), followlinks=True):
+
+        def unlisted(error):
+            raise error
+
+        for base, dirs, files in os.walk(os.path.join(self.root, rel), followlinks=True, onerror=unlisted):
             real = os.path.realpath(base)
             if real in seen:
                 dirs.clear()
@@ -1122,7 +1126,7 @@ class Tree:
             seen.add(real)
             for name in files:
                 path = os.path.join(base, name)
-                if os.path.isfile(path):
+                if stat.S_ISREG(os.stat(path).st_mode):
                     out.add(os.path.relpath(path, self.root))
         return out
 
@@ -3666,7 +3670,8 @@ def _source_macro_bodies(text: str, test: bool) -> dict[int, str]:
     _, shape = build_view(text, test)
     raw: list = []
     _module_units(shape, 0, len(shape), (), raw, [])
-    return {k: shape[a:b] for k, (kind, _, _, a, b, _, _) in enumerate(raw) if kind == "macro_rules!"}
+    return {k: shape[a:b] for k, (kind, _, _, a, b, _, _) in enumerate(raw)
+            if kind == "macro_rules!" and not re.search(r"\$\s*(?!crate\b)[A-Za-z_]\w*", shape[a:b])}
 
 
 @functools.cache
