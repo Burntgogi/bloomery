@@ -546,6 +546,13 @@ models (the --model word is optional with a model file: the file's architecture 
                     Err("--embd-model: the decide seat answers its row's POST routes and no embeddings route".into()),
                 );
             }
+            // The decision seat places no card, so the placement flags' start does not run for
+            // it; the variables and short spellings of the flags it does take are read as the
+            // generative seats' are, `LLAMA_API_KEY` among them.
+            let rest = match llama_launch::seat_from_env(NAME, rest, llama_launch::SERVE) {
+                Ok(v) => v,
+                Err(e) => return exit_with(NAME, Err(e)),
+            };
             return ended(decide::run(&rest, from, repo.as_deref()));
         }
         let (seat, arch) = match seat_of_file(matches!(word, Some(Word::Seat(Model::Qwen3)))) {

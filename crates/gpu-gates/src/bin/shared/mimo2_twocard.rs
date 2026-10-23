@@ -131,10 +131,10 @@ pub fn run(path: &Path, levers: &bloomery_levers::Levers) -> Result<bool, GateEr
     let union_bytes = stage.dense_bytes + stage.expert_bytes + stage.kv_bytes + tier_bytes;
     let usable = workstation::A6000.usable_bytes();
     println!(
-        "two-card plan (b′) under a card budget of {} B at ctx {ctx}: stage {} experts ({} B), tier {} experts \
+        "two-card plan (b′) under a card budget of {} at ctx {ctx}: stage {} experts ({} B), tier {} experts \
          ({tier_bytes} B) on {} layers, host {} experts ({} B); the reference's union {union_bytes} B of the A6000's \
          {usable} (plan values)",
-        budget.card_budget_bytes,
+        model::placement::card_budget::in_bytes(&budget.card_budget_bytes),
         stage.experts,
         stage.expert_bytes,
         plan.cards.get(1).map_or(0, |c| c.experts),

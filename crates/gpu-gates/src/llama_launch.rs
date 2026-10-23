@@ -6,20 +6,19 @@
 //! parsers to read through [`args`] or [`args_os`] (a binary that looks its arguments up by name
 //! has no list to pass down).
 //!
-//! A start reads the `LLAMA_ARG_*` variables of the environment ([`llama_env`]) and cuts the flags
-//! and variables out of the arguments. The variables of the other flags a launcher's seat takes
-//! under llama's spelling are carried as those flags unless the command line gives them
-//! ([`Reads`]), and a variable bloomery does not read has a line saying so. [`resolve`] says what
-//! they come to on the launcher's seat:
-//! the levers they are, handed over in place of the environment's before the binary reads its own
+//! A start reads the `LLAMA_ARG_*` variables of the environment, and `LLAMA_API_KEY`
+//! ([`llama_env`]), and cuts the flags and variables out of the arguments. The variables of the
+//! other flags a launcher's seat takes under llama's spelling are carried as those flags unless
+//! the command line gives them ([`Reads`], [`Meet`]), the short spellings of those flags are
+//! respelled as the flags ([`respell`]), and a variable bloomery does not read has a line saying
+//! so. [`resolve`] says what they come to on the launcher's seat: the levers they are, handed
+//! over in place of the environment's before the binary reads its own
 //! (`bloomery_levers::override_with`), the `--place` word the cards come to, appended to the
 //! arguments for the seat to parse, and a line for each reading, printed on stderr. A flag the seat
 //! has no thing for is refused by name. `--list-devices` prints the census as llama-server does and
 //! ends the start ([`answer_list_devices`]).
 
-#[cfg(feature = "gpu")]
-use std::ffi::OsStr;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 #[cfg(feature = "gpu")]
 use std::sync::OnceLock;
 
@@ -35,16 +34,35 @@ use crate::llama_place::{LIST_DEVICES, take_with_env};
 /// The prefix of llama-server's environment variables.
 const PREFIX: &str = "LLAMA_ARG_";
 
+/// The one variable a server seat reads that has no [`PREFIX`]: `--api-key`'s.
+const API_KEY: &str = "LLAMA_API_KEY";
+
 /// A flag a seat takes under llama's spelling and the variable llama-server reads it from.
 #[derive(Clone, Copy, Debug)]
 pub struct EnvFlag {
     /// The spelling the seat's parser is handed.
     pub flag: &'static str,
-    /// Every spelling a command line may give it: one of them replaces the variable.
+    /// Every spelling a command line may give it: one of them gives the flag, which [`Meet`] says
+    /// the variable's value does then.
     pub spelled: &'static [&'static str],
     /// llama-server's variable: the `.set_env("...")` of the flag's `add_opt` in `common/arg.cpp`
     /// of ggml-org/llama.cpp at commit f5027fb, the line being that `.set_env`'s.
     pub var: &'static str,
+    /// What the variable's value does when the command line gives the flag too.
+    pub meet: Meet,
+}
+
+/// What a variable's value does beside the same flag on the command line. llama-server reads the
+/// variables first and the command line after.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Meet {
+    /// The command line's flag replaces the variable: a flag that holds one value.
+    Replace,
+    /// Both count: a flag that adds each value it is given to a set, the API keys.
+    Add,
+    /// [`Meet::Add`] for a secret: the line that says the variable was read names the flag and
+    /// never the value.
+    AddSecret,
 }
 
 /// The other variables a launcher reads: the flags its seat takes under llama's spelling, and
@@ -80,66 +98,85 @@ pub const SEAT_FLAGS: &[EnvFlag] = &[
         flag: "--ctx-size",
         spelled: &["-c", "--ctx-size", "--ctx"],
         var: "LLAMA_ARG_CTX_SIZE", // line 1651
+        meet: Meet::Replace,
     },
     EnvFlag {
         flag: "--ubatch-size",
         spelled: &["-ub", "--ubatch-size"],
         var: "LLAMA_ARG_UBATCH", // line 1684
+        meet: Meet::Replace,
     },
     EnvFlag {
         flag: "--cache-ram",
         spelled: &["-cram", "--cache-ram"],
         var: "LLAMA_ARG_CACHE_RAM", // line 1726
+        meet: Meet::Replace,
     },
     EnvFlag {
         flag: "--mmproj",
         spelled: &["-mm", "--mmproj", "--no-mmproj"],
         var: "LLAMA_ARG_MMPROJ", // line 2588
+        meet: Meet::Replace,
     },
     EnvFlag {
         flag: "--image-min-tokens",
         spelled: &["--image-min-tokens"],
         var: "LLAMA_ARG_IMAGE_MIN_TOKENS", // line 2647
+        meet: Meet::Replace,
     },
     EnvFlag {
         flag: "--image-max-tokens",
         spelled: &["--image-max-tokens"],
         var: "LLAMA_ARG_IMAGE_MAX_TOKENS", // line 2654
+        meet: Meet::Replace,
     },
     EnvFlag {
         flag: "--parallel",
         spelled: &["-np", "--parallel"],
         var: "LLAMA_ARG_N_PARALLEL", // line 2556
+        meet: Meet::Replace,
     },
     EnvFlag {
         flag: "--alias",
         spelled: &["-a", "--alias"],
         var: "LLAMA_ARG_ALIAS", // line 3035
+        meet: Meet::Replace,
     },
     EnvFlag {
         flag: "--host",
         spelled: &["--host"],
         var: "LLAMA_ARG_HOST", // line 3349
+        meet: Meet::Replace,
     },
     EnvFlag {
         flag: "--port",
         spelled: &["--port"],
         var: "LLAMA_ARG_PORT", // line 3356
+        meet: Meet::Replace,
+    },
+    EnvFlag {
+        flag: "--api-key",
+        spelled: &["--api-key"],
+        var: API_KEY, // line 3542
+        meet: Meet::AddSecret,
     },
     EnvFlag {
         flag: "--api-key-file",
         spelled: &["--api-key-file"],
         var: "LLAMA_ARG_API_KEY_FILE", // line 3559
+        meet: Meet::Add,
     },
     EnvFlag {
         flag: "--slot-save-path",
         spelled: &["--slot-save-path"],
         var: "LLAMA_ARG_SLOT_SAVE_PATH", // line 3667
+        meet: Meet::Replace,
     },
     EnvFlag {
         flag: "--chat-template-file",
         spelled: &["--chat-template-file"],
         var: "LLAMA_ARG_CHAT_TEMPLATE_FILE", // line 3813
+        meet: Meet::Replace,
     },
 ];
 
@@ -179,14 +216,9 @@ impl Launcher<'_> {
         A: AsRef<OsStr> + Clone + From<String>,
     {
         let env = llama_env(std::env::vars_os())?;
-        let (flags, mut rest, mut notes) = take_with_env(args, &env)?;
-        let given: Vec<&str> = rest.iter().filter_map(|a| a.as_ref().to_str()).collect();
-        let (carried, more) = carry_env(&env, &given, self.reads);
+        let (flags, rest, mut notes) = take_with_env(args, &env)?;
+        let (mut rest, more) = seat_args(rest, &env, self.reads)?;
         notes.extend(more);
-        for (flag, value) in carried {
-            rest.push(A::from(flag.to_owned()));
-            rest.push(A::from(value));
-        }
         self.say(&notes);
         if flags.is_empty() {
             return Ok(rest);
@@ -279,29 +311,37 @@ pub fn file_layers() -> Result<Option<u64>, GateError> {
     Ok(split.arch_get_u64("block_count"))
 }
 
-/// The `LLAMA_ARG_*` variables of `vars` as text. A name of another kind is left alone; a value
-/// that is no UTF-8 is refused under its name.
+/// The `LLAMA_ARG_*` variables of `vars` and `LLAMA_API_KEY` as text. A name of another kind is
+/// left alone; a value that is no UTF-8 is refused under its name (the value of a key is not
+/// printed).
 pub fn llama_env(
     vars: impl IntoIterator<Item = (OsString, OsString)>,
 ) -> Result<Vec<(String, String)>, GateError> {
     let mut out = Vec::new();
     for (name, value) in vars {
-        let Some(name) = name.to_str().filter(|n| n.starts_with(PREFIX)) else {
+        let Some(name) = name
+            .to_str()
+            .filter(|n| n.starts_with(PREFIX) || *n == API_KEY)
+        else {
             continue;
         };
-        let value = value
-            .into_string()
-            .map_err(|v| format!("{name}: the value {v:?} is not UTF-8"))?;
+        let value = value.into_string().map_err(|v| {
+            if name == API_KEY {
+                format!("{name}: the value is not UTF-8")
+            } else {
+                format!("{name}: the value {v:?} is not UTF-8")
+            }
+        })?;
         out.push((name.to_owned(), value));
     }
     Ok(out)
 }
 
-/// What the `LLAMA_ARG_*` variables of `env` that are no placement flag's come to for a launcher
-/// that reads `reads`, given the arguments `given` it has: each variable of a flag the seat takes
-/// is carried as that flag and its value unless the command line gives the flag, and a line says
-/// which; every other variable has a line saying bloomery does not read it. The last of a name
-/// counts, as in [`take_with_env`].
+/// What the variables of `env` that are no placement flag's come to for a launcher that reads
+/// `reads`, given the arguments `given` it has: each variable of a flag the seat takes is carried
+/// as that flag and its value, unless the command line gives the flag and the flag holds one
+/// value ([`Meet`]), and a line says which; every other variable has a line saying bloomery does
+/// not read it. A key's value is in no line. The last of a name counts, as in [`take_with_env`].
 pub fn carry_env(
     env: &[(String, String)],
     given: &[&str],
@@ -324,17 +364,125 @@ pub fn carry_env(
             notes.push(format!("{var} is set, and bloomery does not read it"));
             continue;
         };
-        match read.spelled.iter().find(|s| given.contains(*s)) {
-            Some(on_the_line) => notes.push(format!(
+        let on_the_line = read.spelled.iter().find(|s| given.contains(*s));
+        if let (Some(on_the_line), Meet::Replace) = (on_the_line, read.meet) {
+            notes.push(format!(
                 "{var} is set, and the command line's {on_the_line} replaces it"
-            )),
-            None => {
-                carried.push((read.flag, value.to_owned()));
-                notes.push(format!("{var} is read as {} {value}", read.flag));
-            }
+            ));
+            continue;
         }
+        carried.push((read.flag, value.to_owned()));
+        let shown = if read.meet == Meet::AddSecret {
+            "(value not printed)"
+        } else {
+            value
+        };
+        notes.push(match on_the_line {
+            Some(on_the_line) => format!(
+                "{var} is read as {} {shown}, added to the command line's {on_the_line}",
+                read.flag
+            ),
+            None => format!("{var} is read as {} {shown}", read.flag),
+        });
     }
     (carried, notes)
+}
+
+/// `rest`, the arguments less the placement flags, as a seat reads them under llama's spellings:
+/// the variables of `env` carried as the flags they stand for ([`carry_env`]), each single-dash
+/// spelling respelled as its flag ([`respell`]), and a prompt cache without a limit refused
+/// ([`refuse_unbounded_cache`]); with a line for each variable.
+pub fn seat_args<A>(
+    rest: Vec<A>,
+    env: &[(String, String)],
+    reads: Reads,
+) -> Result<(Vec<A>, Vec<String>), GateError>
+where
+    A: AsRef<OsStr> + From<String>,
+{
+    let (carried, notes) = {
+        let given: Vec<&str> = rest.iter().filter_map(|a| a.as_ref().to_str()).collect();
+        carry_env(env, &given, reads)
+    };
+    let mut out = respell(rest, reads);
+    for (flag, value) in carried {
+        out.push(A::from(flag.to_owned()));
+        out.push(A::from(value));
+    }
+    refuse_unbounded_cache(&out, reads)?;
+    Ok((out, notes))
+}
+
+/// [`seat_args`] over the process's own variables, its lines printed on stderr under `bin`: the
+/// start of a seat that places no card (the decision seat), whose arguments the placement flags'
+/// start does not read, so each placement variable is named as one it does not act on
+/// ([`unplaced`]).
+pub fn seat_from_env(bin: &str, args: Vec<String>, reads: Reads) -> Result<Vec<String>, GateError> {
+    let env = llama_env(std::env::vars_os())?;
+    let (args, notes) = seat_args(args, &env, reads)?;
+    for line in unplaced(&env).into_iter().chain(notes) {
+        eprintln!("{bin}: {line}");
+    }
+    Ok(args)
+}
+
+/// A line for each placement variable of `env` ([`crate::llama_place::reads_var`]), for a seat
+/// that places no card: set, it changes nothing there, and a variable set is said, not dropped.
+pub fn unplaced(env: &[(String, String)]) -> Vec<String> {
+    env.iter()
+        .filter(|(name, _)| crate::llama_place::reads_var(name))
+        .map(|(name, _)| format!("{name} is set, and this seat places no card"))
+        .collect()
+}
+
+/// `args` with each single-dash spelling the table of `reads` gives a flag (`-cram`, `-a`, `-mm`,
+/// `-c`) respelled as the flag: the seats' parsers read the flags' own spellings and only some of
+/// the short ones, and llama-server's users type the short ones. A spelling with two dashes
+/// stays, `--no-mmproj` among them: it is a switch of its own.
+pub fn respell<A>(args: Vec<A>, reads: Reads) -> Vec<A>
+where
+    A: AsRef<OsStr> + From<String>,
+{
+    args.into_iter()
+        .map(|a| {
+            let flag = a.as_ref().to_str().and_then(|arg| {
+                reads
+                    .flags
+                    .iter()
+                    .find(|e| !arg.starts_with("--") && e.spelled.contains(&arg))
+                    .map(|e| e.flag)
+            });
+            match flag {
+                Some(flag) => A::from(flag.to_owned()),
+                None => a,
+            }
+        })
+        .collect()
+}
+
+/// A negative `--cache-ram`, refused by name where the seat takes the flag. llama-server reads
+/// `-1` as a prompt cache with no limit; the cache here is host memory beside the load's host
+/// set, so it always has a budget, and a budget is MiB.
+pub fn refuse_unbounded_cache<A: AsRef<OsStr>>(args: &[A], reads: Reads) -> Result<(), GateError> {
+    const FLAG: &str = "--cache-ram";
+    if !reads.flags.iter().any(|e| e.flag == FLAG) {
+        return Ok(());
+    }
+    let text: Vec<Option<&str>> = args.iter().map(|a| a.as_ref().to_str()).collect();
+    for pair in text.windows(2) {
+        if let [Some(FLAG), Some(value)] = pair
+            && value.starts_with('-')
+        {
+            return Err(format!(
+                "{FLAG} {value} (also -cram and LLAMA_ARG_CACHE_RAM): llama-server reads a \
+                 negative count as a prompt cache with no limit, and this cache is host memory \
+                 beside the load, so it always has a budget; give MiB, 0 turns it off, unset \
+                 takes half of what the host leaves past the load, at most llama-server's default"
+            )
+            .into());
+        }
+    }
+    Ok(())
 }
 
 /// `args` with the model `LLAMA_ARG_MODEL` (a path, `-m`) or `LLAMA_ARG_HF_REPO` (`-hf`, the
@@ -477,7 +625,8 @@ mod tests {
     }
 
     /// Only llama-server's variable names are read from the environment, whatever other names it
-    /// holds, and a value that is no UTF-8 is refused under its name.
+    /// holds (`LLAMA_API_KEY` is the one with no `LLAMA_ARG_` prefix), and a value that is no
+    /// UTF-8 is refused under its name, a key's without the bytes.
     #[test]
     fn only_llama_variables_are_read_and_a_non_utf8_value_is_named() {
         use std::os::unix::ffi::OsStringExt;
@@ -486,6 +635,8 @@ mod tests {
             ("PATH", "/bin"),
             ("LLAMA_ARG_DEVICE", "CUDA0"),
             ("HOME", "/root"),
+            ("LLAMA_API_KEY", "k1"),
+            ("LLAMA_API_KEYS", "no"),
             ("LLAMA_ARG_CTX_SIZE", "4096"),
         ]
         .map(|(k, v)| (OsString::from(k), OsString::from(v)));
@@ -493,6 +644,7 @@ mod tests {
             llama_env(vars).expect("text"),
             [
                 ("LLAMA_ARG_DEVICE".to_owned(), "CUDA0".to_owned()),
+                ("LLAMA_API_KEY".to_owned(), "k1".to_owned()),
                 ("LLAMA_ARG_CTX_SIZE".to_owned(), "4096".to_owned())
             ]
         );
@@ -500,6 +652,12 @@ mod tests {
         let bad = [(OsString::from("LLAMA_ARG_DEVICE"), bytes)];
         let e = llama_env(bad).expect_err("bytes").to_string();
         assert!(e.starts_with("LLAMA_ARG_DEVICE: the value"), "{e}");
+        let key = [(
+            OsString::from("LLAMA_API_KEY"),
+            OsString::from_vec(vec![b's', 0xff]),
+        )];
+        let e = llama_env(key).expect_err("bytes").to_string();
+        assert_eq!(e, "LLAMA_API_KEY: the value is not UTF-8");
         assert!(llama_env([(OsString::from("HOME"), OsString::from_vec(vec![0xff]))]).is_ok());
     }
 
@@ -683,8 +841,9 @@ mod tests {
         );
     }
 
-    /// The seat table's variables are llama-server's `LLAMA_ARG_*` names, each once and none a
-    /// placement flag's; each flag is among its own spellings; a flag is named once.
+    /// The seat table's variables are llama-server's `LLAMA_ARG_*` names and `LLAMA_API_KEY`, each
+    /// once and none a placement flag's; each flag is among its own spellings; a flag is named
+    /// once; only the key's flag holds a secret.
     #[test]
     fn the_seat_table_names_each_variable_and_flag_once() {
         let mut vars: Vec<&str> = SEAT_FLAGS.iter().map(|e| e.var).collect();
@@ -696,7 +855,13 @@ mod tests {
         flags.dedup();
         assert_eq!(flags.len(), SEAT_FLAGS.len(), "a flag has one variable");
         for e in SEAT_FLAGS {
-            assert!(e.var.starts_with(PREFIX), "{}", e.var);
+            assert!(e.var.starts_with(PREFIX) || e.var == API_KEY, "{}", e.var);
+            assert_eq!(
+                e.meet == Meet::AddSecret,
+                e.flag == "--api-key",
+                "{}",
+                e.flag
+            );
             assert!(
                 !crate::llama_place::reads_var(e.var),
                 "{}: a placement flag's",
@@ -705,5 +870,135 @@ mod tests {
             assert!(e.var != MODEL && e.var != HF_REPO, "{}", e.var);
             assert!(e.spelled.contains(&e.flag), "{}", e.flag);
         }
+    }
+
+    /// The keys are added, never replaced, as llama-server reads the variables first and then the
+    /// command line, and a key's value is in no line: `LLAMA_API_KEY` is `--api-key`, beside the
+    /// command line's own, and a launcher that takes no key says it does not read it.
+    #[test]
+    fn the_key_variables_add_to_the_command_lines_keys_and_print_no_key() {
+        let env = env_of(&[
+            ("LLAMA_API_KEY", "s3cret"),
+            ("LLAMA_ARG_API_KEY_FILE", "/run/keys"),
+        ]);
+        let (carried, notes) = carry_env(&env, &[], SEAT);
+        assert_eq!(
+            carried,
+            [
+                ("--api-key", "s3cret".to_owned()),
+                ("--api-key-file", "/run/keys".to_owned())
+            ]
+        );
+        assert_eq!(
+            notes,
+            [
+                "LLAMA_API_KEY is read as --api-key (value not printed)",
+                "LLAMA_ARG_API_KEY_FILE is read as --api-key-file /run/keys"
+            ]
+        );
+        let (carried, notes) =
+            carry_env(&env, &["--api-key", "other", "--api-key-file", "/k"], SEAT);
+        assert_eq!(carried.len(), 2, "the variables still count: {carried:?}");
+        assert_eq!(
+            notes,
+            [
+                "LLAMA_API_KEY is read as --api-key (value not printed), added to the command \
+                 line's --api-key",
+                "LLAMA_ARG_API_KEY_FILE is read as --api-key-file /run/keys, added to the command \
+                 line's --api-key-file"
+            ]
+        );
+        for notes in [
+            carry_env(&env, &[], NONE).1,
+            carry_env(&env, &["--api-key", "x"], NONE).1,
+        ] {
+            assert_eq!(
+                notes,
+                [
+                    "LLAMA_API_KEY is set, and bloomery does not read it",
+                    "LLAMA_ARG_API_KEY_FILE is set, and bloomery does not read it"
+                ]
+            );
+        }
+    }
+
+    /// A single-dash spelling the table gives a flag becomes the flag, in any position a flag can
+    /// be and only as a whole argument; a double-dash spelling stays (`--no-mmproj` is a switch
+    /// of its own), and a launcher that reads none respells none.
+    #[test]
+    fn a_short_spelling_becomes_its_flag() {
+        let line = |s: &str| -> Vec<String> { s.split_whitespace().map(str::to_owned).collect() };
+        assert_eq!(
+            respell(
+                line("-cram 512 -a chat -mm p.gguf -c 4096 -np 2 -ub 512"),
+                SEAT
+            ),
+            line(
+                "--cache-ram 512 --alias chat --mmproj p.gguf --ctx-size 4096 --parallel 2 --ubatch-size 512"
+            )
+        );
+        let kept = line("--no-mmproj --ctx 8 -cramx -cr --cache-ram 1 -m x.gguf");
+        assert_eq!(respell(kept.clone(), SEAT), kept);
+        let given = line("-cram 512");
+        assert_eq!(respell(given.clone(), NONE), given);
+    }
+
+    /// A negative `--cache-ram` is refused by name on a seat that takes the flag, however it was
+    /// given (the variable is carried as the flag first); a count passes, a seat without the flag
+    /// leaves it to its own parser, and `-1` as another flag's value is not the cache's.
+    #[test]
+    fn an_unbounded_cache_is_refused_by_name() {
+        let line = |s: &str| -> Vec<String> { s.split_whitespace().map(str::to_owned).collect() };
+        for ok in [
+            "--cache-ram 0",
+            "--cache-ram 8192",
+            "--seed -1 --cache-ram 64",
+            "--alias -1",
+        ] {
+            assert!(refuse_unbounded_cache(&line(ok), SEAT).is_ok(), "{ok}");
+        }
+        assert!(refuse_unbounded_cache(&line("--cache-ram -1"), NONE).is_ok());
+        let by_flag = seat_args(line("-cram -1"), &[], SEAT).expect_err("the short spelling");
+        let by_variable = seat_args(
+            line("--port 1"),
+            &env_of(&[("LLAMA_ARG_CACHE_RAM", "-1")]),
+            SEAT,
+        )
+        .expect_err("the variable");
+        for e in [by_flag.to_string(), by_variable.to_string()] {
+            assert!(
+                e.starts_with("--cache-ram -1 (also -cram and LLAMA_ARG_CACHE_RAM): ")
+                    && e.contains("give MiB, 0 turns it off"),
+                "{e}"
+            );
+        }
+        let (args, notes) = seat_args(
+            line("-cram 512"),
+            &env_of(&[("LLAMA_ARG_CTX_SIZE", "4096")]),
+            SEAT,
+        )
+        .expect("a count");
+        assert_eq!(args, line("--cache-ram 512 --ctx-size 4096"));
+        assert_eq!(notes, ["LLAMA_ARG_CTX_SIZE is read as --ctx-size 4096"]);
+    }
+
+    /// A seat that places no card names each placement variable set, in the order the
+    /// environment holds them, and none of the others.
+    #[test]
+    fn a_seat_that_places_no_card_names_the_placement_variables() {
+        let env = env_of(&[
+            ("LLAMA_ARG_DEVICE", "CUDA0"),
+            ("LLAMA_ARG_CTX_SIZE", "4096"),
+            ("LLAMA_ARG_N_GPU_LAYERS", "99"),
+            ("LLAMA_API_KEY", "k"),
+        ]);
+        assert_eq!(
+            unplaced(&env),
+            [
+                "LLAMA_ARG_DEVICE is set, and this seat places no card",
+                "LLAMA_ARG_N_GPU_LAYERS is set, and this seat places no card"
+            ]
+        );
+        assert!(unplaced(&[]).is_empty());
     }
 }

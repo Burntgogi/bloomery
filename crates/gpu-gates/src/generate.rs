@@ -455,7 +455,8 @@ impl Place {
     /// refused by name ([`refuse_card_lists`]), and so is one beside tier
     /// nodes, whose cards no ordinal of this process names. The margin the
     /// lever gives a card is on the resolved card's spec
-    /// ([`Place::keeping_free`]).
+    /// ([`Place::keeping_free`]). The levers are read here; [`Place::on_with`]
+    /// takes them parsed.
     pub fn on(self, census: &[DeviceInfo]) -> Result<Place, GateError> {
         if self.tp() {
             return Err(
@@ -464,13 +465,40 @@ impl Place {
                     .into(),
             );
         }
-        let budget = bloomery_levers::card_budget()?;
-        let margin = bloomery_levers::card_margin()?;
-        let nodes = bloomery_levers::tier_nodes()?;
-        refuse_card_lists(&self.spelled(), &budget, &margin, census, nodes.len())?;
-        if !nodes.is_empty() {
-            return self.on_nodes(census, &nodes)?.keeping_free(&margin);
-        }
+        self.on_with(
+            census,
+            &bloomery_levers::card_budget()?,
+            &bloomery_levers::card_margin()?,
+            &bloomery_levers::tier_nodes()?,
+        )
+    }
+
+    /// [`Place::on`] with the levers it reads given parsed: `budget`
+    /// (`BLOOMERY_CARD_BUDGET`) and `margin` (`BLOOMERY_CARD_MARGIN`) refused
+    /// against the census and the tier nodes before any card resolves, the
+    /// tier cards on `nodes` when it is not empty, and `margin` on each
+    /// resolved card's spec at the end of either path, so a margin reaches the
+    /// machine's cards the same way whatever the cards came from.
+    fn on_with(
+        self,
+        census: &[DeviceInfo],
+        budget: &card_budget::CardBudget,
+        margin: &card_budget::CardBudget,
+        nodes: &[SocketAddr],
+    ) -> Result<Place, GateError> {
+        refuse_card_lists(&self.spelled(), budget, margin, census, nodes.len())?;
+        let placed = if nodes.is_empty() {
+            self.on_census(census)?
+        } else {
+            self.on_nodes(census, nodes)?
+        };
+        placed.keeping_free(margin)
+    }
+
+    /// The placement on `census` alone ([`Place::on`]'s path with no tier
+    /// nodes): each pick resolved, the word printed by its names where the
+    /// devices are not the alias's.
+    fn on_census(self, census: &[DeviceInfo]) -> Result<Place, GateError> {
         let resolved = workstation::resolve(self.picks(), census)
             .map_err(|e| format!("--place {}: {e}", self.spelled()))?;
         let mut specs = [None; 1 + MAX_TIERS];
@@ -491,13 +519,12 @@ impl Place {
                 .collect();
             word = Box::leak(names.join("+").into_boxed_str());
         }
-        Place {
+        Ok(Place {
             word,
             specs,
             resolved: true,
             ..self
-        }
-        .keeping_free(&margin)
+        })
     }
 
     /// The placement with the margin `margin` on each resolved card's spec
@@ -2701,18 +2728,19 @@ mod tests {
         );
     }
 
-    /// A margin on a placement reaches the machine's cards: the one value on
-    /// every card, a list entry on the card of that ordinal alone, a card the
-    /// margin names none at the plan's own margin, and a margin that leaves a
-    /// card no usable byte is refused naming the card.
+    /// The levers `Place::on` reads reach the machine's cards through
+    /// `Place::on_with`: a margin is the one value on every card, a list entry
+    /// on the card of that ordinal alone, a card the margin names none at the
+    /// plan's own margin, and a margin that leaves a card no usable byte is
+    /// refused naming the card.
     #[test]
     fn a_margin_reaches_the_machines_cards() {
         use model::placement::card_budget::CardBudget;
 
         let two = census(&["A6000", "3090"]);
-        let placed = Place::Bp.on(&two).expect("two cards");
+        let on = |m: &CardBudget| Place::Bp.on_with(&two, &CardBudget::Unset, m, &[]);
         let margins = |m: &CardBudget| {
-            let kept = placed.keeping_free(m).expect("a margin");
+            let kept = on(m).expect("a margin");
             let machine = kept.machine(None, Some(BATCH)).expect("stage + tier")(43);
             (machine.cards[0].margin_bytes, machine.tiers[0].margin_bytes)
         };
@@ -2725,8 +2753,11 @@ mod tests {
             margins(&CardBudget::Per(vec![(1, 3 << 30)])),
             (workstation::MARGIN, 3 << 30)
         );
-        let e = placed
-            .keeping_free(&CardBudget::Per(vec![(1, RTX_3090.usable_bytes())]))
+        assert_eq!(
+            margins(&CardBudget::Per(vec![(0, 3 << 30)])),
+            (3 << 30, workstation::MARGIN)
+        );
+        let e = on(&CardBudget::Per(vec![(1, RTX_3090.usable_bytes())]))
             .expect_err("no usable byte")
             .to_string();
         assert!(
@@ -2779,6 +2810,41 @@ mod tests {
                 e.contains(lever) && e.contains("BLOOMERY_TIER_NODES puts the tier cards on nodes"),
                 "{e}"
             );
+        }
+        // `Place::on_with` runs the same refusals before it resolves a card or reads a node, each
+        // lever under its own name and the tier nodes counted.
+        let node: SocketAddr = "127.0.0.1:9".parse().expect("an address");
+        for (budget, margin, nodes, want) in [
+            (
+                Per(vec![(5, 1)]),
+                Unset,
+                vec![],
+                "the per-card budget CUDA5=1 names CUDA5",
+            ),
+            (
+                Unset,
+                Per(vec![(5, 1)]),
+                vec![],
+                "the per-card margin CUDA5=1 names CUDA5",
+            ),
+            (
+                Unset,
+                Shares(vec![(0, 1)]),
+                vec![],
+                "BLOOMERY_CARD_MARGIN takes bytes, not shares",
+            ),
+            (
+                Per(vec![(0, 1)]),
+                Unset,
+                vec![node],
+                "BLOOMERY_TIER_NODES puts the tier cards on nodes",
+            ),
+        ] {
+            let e = Place::Bp
+                .on_with(&two, &budget, &margin, &nodes)
+                .expect_err(want)
+                .to_string();
+            assert!(e.starts_with("--place bp: ") && e.contains(want), "{e}");
         }
     }
 
@@ -2923,15 +2989,28 @@ impl Place {
         set: Option<&str>,
         census: &[DeviceInfo],
     ) -> Result<DraftCard, GateError> {
-        let lever = |v: &str, e: &dyn std::fmt::Display| -> GateError {
-            format!("BLOOMERY_DSPARK_CARD={v:?}: {e}").into()
-        };
+        let margin = bloomery_levers::card_margin()?;
         let placed = if self.resolved {
             self
         } else {
             self.on(census)?
         };
-        let cards = placed.card_specs()?;
+        placed.draft_card(set, census, &margin)
+    }
+
+    /// [`Place::draft_on`] on a resolved placement (`self`), the margin lever's value
+    /// `margin` given parsed: a card that joins the plan to hold the draft keeps the margin
+    /// the lever gives it ([`card_budget::keep_free`]), as the placement's own cards do.
+    fn draft_card(
+        self,
+        set: Option<&str>,
+        census: &[DeviceInfo],
+        margin: &card_budget::CardBudget,
+    ) -> Result<DraftCard, GateError> {
+        let lever = |v: &str, e: &dyn std::fmt::Display| -> GateError {
+            format!("BLOOMERY_DSPARK_CARD={v:?}: {e}").into()
+        };
+        let cards = self.card_specs()?;
         let spec = match set {
             Some(v) => {
                 let picks = workstation::word_picks(v, 0).map_err(|e| match e {
@@ -2968,7 +3047,7 @@ impl Place {
             },
             None => DraftCard {
                 at: Device::Card(cards.len()),
-                spec: card_budget::keep_free(&bloomery_levers::card_margin()?, spec)
+                spec: card_budget::keep_free(margin, spec)
                     .map_err(|e| format!("the DSpark draft's card: {e}"))?,
                 holder: true,
             },
@@ -3116,6 +3195,27 @@ mod draft_card_tests {
         }
         let e = at(Place::A, None, &[]).expect_err("no device");
         assert!(e.contains("no visible device is A6000"), "{e}");
+    }
+
+    /// The card that joins a plan to hold the draft keeps the margin the lever gives it: the one
+    /// value, the list's entry for its ordinal, its own where the list names it none; the
+    /// placement's own cards are not this card.
+    #[test]
+    fn a_draft_holder_keeps_the_margin_the_lever_gives_it() {
+        use model::placement::card_budget::CardBudget::{Every, Per, Unset};
+        use model::placement::workstation::MARGIN;
+
+        let c = census(&["A6000", "3090"]);
+        let placed = Place::A.on_with(&c, &Unset, &Unset, &[]).expect("a");
+        let holder = |margin| {
+            let d = placed.draft_card(None, &c, &margin).expect("a card");
+            assert!(d.holder, "the 3090 beside plan (a) joins the plan");
+            d.spec.margin()
+        };
+        assert_eq!(holder(Unset), MARGIN);
+        assert_eq!(holder(Every(2 << 30)), 2 << 30);
+        assert_eq!(holder(Per(vec![(1, 3 << 30)])), 3 << 30);
+        assert_eq!(holder(Per(vec![(0, 3 << 30)])), MARGIN);
     }
 
     /// A draft opens on the card its plan reserved on: the same place in the

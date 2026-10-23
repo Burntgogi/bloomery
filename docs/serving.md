@@ -135,7 +135,8 @@ Your OpenAI client works unchanged. bloomery speaks llama-server's HTTP API and 
 - **The flags**: `-m`/`--model-file`, `--hf <repo>[:<quant>]` (download, resume, sha256 check, never fetched
   twice; it also fetches the model's MTP draft when the repo publishes it, as unsloth's Qwen3.8-Flash-Next GGUFs
   do under `MTP/`, landing it beside the set, where the run picks it up), `--parallel/-np`, `--queue-depth`,
-  `--cache-ram`, `--ctx/--ctx-size` (unset, every generative seat and the decide seat take one slot at the lesser of
+  `--cache-ram/-cram` (MiB; `0` turns the prompt cache off; llama-server's `-1`, no limit, is refused by name: the
+  cache is host memory beside the load), `--ctx/--ctx-size` (unset, every generative seat and the decide seat take one slot at the lesser of
   262,144 and the file's limit, and halve that while the plan is short of the card — and of the host, where the body
   keeps no tier past it — down to 4,096; one `ctx` line names the rule. A set value is the total the slots split, and
   one that does not fit is refused, never cut. PIN(2026-10-14): `generate::choose_ctx` over `ctx_ask::choose`),
@@ -337,17 +338,31 @@ is `-dev CUDA1 -ngl 99`.
   | `-np`, `--parallel` | `LLAMA_ARG_N_PARALLEL` |
   | `-a`, `--alias` | `LLAMA_ARG_ALIAS` |
   | `--host`, `--port` | `LLAMA_ARG_HOST`, `LLAMA_ARG_PORT` |
+  | `--api-key` | `LLAMA_API_KEY` |
   | `--api-key-file` | `LLAMA_ARG_API_KEY_FILE` |
   | `--slot-save-path` | `LLAMA_ARG_SLOT_SAVE_PATH` |
   | `--chat-template-file` | `LLAMA_ARG_CHAT_TEMPLATE_FILE` |
   | `-m` (the model file), `-hf` (`--hf`) | `LLAMA_ARG_MODEL`, `LLAMA_ARG_HF_REPO` (`bloomery-serve` only; both set is refused) |
 
   The names are the same `.set_env(...)` lines of `common/arg.cpp` (commit f5027fb). A seat that takes none of a flag
-  refuses it by its name after the line that says which variable it came from.
+  refuses it by its name after the line that says which variable it came from. The decision seat of `bloomery-serve`
+  reads them too, for the flags it takes, and names each placement variable that is set (`LLAMA_ARG_DEVICE` and the
+  rest of the table above) as one it does not act on: that seat places no card.
+- **The keys add.** `LLAMA_API_KEY` is `--api-key` (the one name in the table with no `LLAMA_ARG_` prefix, line 3542)
+  and `LLAMA_ARG_API_KEY_FILE` is `--api-key-file`. llama-server reads the variables before the command line and adds
+  every key it is given, so here too the variable's keys count beside the command line's: a key flag does not replace
+  them. The line that says a variable was read never prints a key. A variable that names no key (`LLAMA_API_KEY=`) ends
+  the start by name, as `--api-key ""` does, and does not leave the server open.
+- **Short spellings.** The command line's `-c`, `-ub`, `-np`, `-a`, `-mm` and `-cram` are respelled as `--ctx-size`,
+  `--ubatch-size`, `--parallel`, `--alias`, `--mmproj` and `--cache-ram` before a seat parses
+  (`llama_launch::respell`); a seat that takes none of the flag refuses it by the long name.
+- **`-cram -1` is refused by name.** llama-server reads a negative count as a prompt cache with no limit (`-cram`,
+  line 1719: "-1 - no limit, 0 - disable"). The cache here is host memory beside the load's host set, so it always has
+  a budget: MiB, `0` for none, or unset for the default (half of what the host leaves past the load, at most
+  llama-server's 8192 MiB). A negative count is refused with that, as `--cache-ram`, `-cram` or `LLAMA_ARG_CACHE_RAM`.
 - **A variable bloomery does not read has a line saying so.** `LLAMA_ARG_FLASH_ATTN`, `LLAMA_ARG_THREADS` and the rest
   of llama-server's names that no flag of ours stands for are named, one line each, never silently dropped; so is a
-  server variable on a launcher that takes none (the generate launchers). `LLAMA_API_KEY` is not a `LLAMA_ARG_*` name
-  and is not read: pass the key with `--api-key`.
+  server variable on a launcher that takes none (the generate launchers), `LLAMA_API_KEY` among them.
 
 ### The other launchers
 
@@ -370,7 +385,9 @@ cards stay. `-fitt`'s margin is read wherever a placement is resolved, on every 
 `--place` word the cards come to, so a stage its body does not serve is refused there, as before.
 
 `generate_glm5next` and `generate_qwen3moe` read their own flags by name and refuse any other argument by name, with the
-flags they have; before, a misspelled flag ran the default.
+flags they have; before, a misspelled flag ran the default. The other launchers read their flags in one pass that
+refuses an argument it has no flag for, by name, with the usage (`bloomery-chat` and `generate_ds41` in their own parse,
+`bloomery-serve` and the single-seat servers in the seat's).
 
 ## The seats
 
