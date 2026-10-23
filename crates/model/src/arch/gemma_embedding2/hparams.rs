@@ -11,9 +11,7 @@ use gguf::Split;
 
 use super::names;
 use crate::arch::names::blk;
-use crate::arch::{
-    finite_positive, metadata, mul, n_vocab, per_layer_count, per_layer_items, positive,
-};
+use crate::arch::{finite_positive, mul, n_vocab, per_layer_count, positive};
 use crate::placement::PlacementError;
 
 pub use crate::arch::gemma_encoder::Attn;
@@ -76,7 +74,8 @@ impl Hparams {
         for (l, &heads) in kv.iter().enumerate() {
             crate::arch::check_kv(split, n_head, l, heads)?;
         }
-        let sliding = sliding(split, n_layer)?;
+        let sliding =
+            crate::arch::per_layer_bool(split, "attention.sliding_window_pattern", n_layer)?;
         let hp = Hparams {
             n_layer,
             n_embd,
@@ -179,19 +178,4 @@ pub fn key_bounds(reach: Option<usize>, t: usize, n: usize) -> (usize, usize) {
         ),
         None => (0, n),
     }
-}
-
-/// `attention.sliding_window_pattern` as one bool per layer. A scalar, a
-/// length other than `n_layer` or a value that is no bool is refused by
-/// name: the file's own form is the per-layer array.
-fn sliding(split: &Split, n_layer: usize) -> Result<Vec<bool>, PlacementError> {
-    let key = "attention.sliding_window_pattern";
-    per_layer_items(split, key, n_layer)?
-        .iter()
-        .enumerate()
-        .map(|(l, v)| {
-            v.as_bool()
-                .ok_or_else(|| metadata(split, key, format!("has no bool at layer {l}")))
-        })
-        .collect()
 }

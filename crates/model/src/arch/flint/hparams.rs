@@ -4,8 +4,8 @@ use super::roles;
 use crate::arch::hybrid::{layers_agree, no_nextn};
 use crate::arch::{
     check_kv, dims_agree, expert_counts, finite_positive, meta_bool, meta_usize, metadata, mul,
-    n_vocab, one_expert_group, optional_f32, optional_usize, per_layer_count, per_layer_items,
-    plain_rope, positive, sigmoid_gating,
+    n_vocab, one_expert_group, optional_usize, per_layer_bool, per_layer_count, plain_rope,
+    positive, sigmoid_gating,
 };
 use crate::placement::PlacementError;
 use gguf::Split;
@@ -32,17 +32,6 @@ pub(super) struct Hparams {
     pub rope: Vec<bool>,
     pub base: f32,
     pub defaults: Vec<String>,
-}
-
-fn mask(split: &Split, suffix: &str, n: usize) -> Result<Vec<bool>, PlacementError> {
-    per_layer_items(split, suffix, n)?
-        .iter()
-        .enumerate()
-        .map(|(l, v)| {
-            v.as_bool()
-                .ok_or_else(|| metadata(split, suffix, format!("has no bool at layer {l}")))
-        })
-        .collect()
 }
 
 impl Hparams {
@@ -88,8 +77,8 @@ impl Hparams {
         plain_rope(split)?;
         let base = finite_positive(split, "rope.freq_base")?;
         let window = positive(split, "attention.sliding_window")?;
-        let swa = mask(split, "attention.sliding_window_pattern", layers)?;
-        let rope = mask(split, "attention.rope_pattern", layers)?;
+        let swa = per_layer_bool(split, "attention.sliding_window_pattern", layers)?;
+        let rope = per_layer_bool(split, "attention.rope_pattern", layers)?;
         let dense_lead = meta_usize(split, "leading_dense_block_count")?;
         if dense_lead > layers {
             return Err(metadata(
@@ -107,19 +96,12 @@ impl Hparams {
         let norm = meta_bool(split, "expert_weights_norm")?;
         let mut defaults = Vec::new();
         sigmoid_gating(split, None, &mut defaults)?;
-        let scale = match optional_f32(split, "expert_weights_scale")? {
+        let scale = match split.value(&split.arch_key("expert_weights_scale")) {
             None => {
                 defaults.push("expert_weights_scale = 1 (llama.cpp's default)".into());
                 1.0
             }
-            Some(v) if v.is_finite() && v > 0.0 => v,
-            Some(v) => {
-                return Err(metadata(
-                    split,
-                    "expert_weights_scale",
-                    format!("is {v}, not a finite positive value"),
-                ));
-            }
+            Some(_) => finite_positive(split, "expert_weights_scale")?,
         };
         for (l, &count) in kv.iter().enumerate() {
             check_kv(split, heads, l, count)?;

@@ -181,12 +181,6 @@ fn metadata_refusals_name_the_invalid_input() {
         ("rope.freq_base", V::F32(f32::NAN)),
         ("attention.layer_norm_rms_epsilon", V::F32(f32::INFINITY)),
         ("attention.sliding_window", V::U32(0)),
-        ("attention.sliding_window_pattern", V::Bools(vec![true])),
-        (
-            "attention.sliding_window_pattern",
-            V::I32s(vec![1, 0, 1, 0]),
-        ),
-        ("attention.rope_pattern", V::Bool(true)),
         ("leading_dense_block_count", V::U32(5)),
         ("feed_forward_length", V::U32(0)),
         ("expert_feed_forward_length", V::U32(0)),
@@ -194,6 +188,11 @@ fn metadata_refusals_name_the_invalid_input() {
         ("expert_shared_count", V::U32(0)),
         ("expert_shared_feed_forward_length", V::U32(8)),
         ("expert_weights_scale", V::F32(f32::NAN)),
+        ("expert_weights_scale", V::F32(f32::INFINITY)),
+        ("expert_weights_scale", V::F32(f32::NEG_INFINITY)),
+        ("expert_weights_scale", V::F32(0.0)),
+        ("expert_weights_scale", V::F32(-1.0)),
+        ("expert_weights_scale", V::Bool(true)),
         ("expert_weights_norm", V::U32(1)),
         ("expert_gating_func", V::U32(1)),
     ] {
@@ -208,10 +207,46 @@ fn metadata_refusals_name_the_invalid_input() {
         }
     }
     for key in ["attention.sliding_window_pattern", "attention.rope_pattern"] {
+        for bad in [
+            None,
+            Some(V::Bool(true)),
+            Some(V::Bools(vec![true; 3])),
+            Some(V::Bools(vec![true; 5])),
+            Some(V::I32s(vec![1, 0, 1, 0])),
+        ] {
+            let mut kv = keys();
+            kv.retain(|(k, _)| *k != key);
+            if let Some(value) = bad {
+                kv.push((key, value));
+            }
+            assert!(
+                matches!(check(key,&kv,&tensors()),Err(PlacementError::Metadata{key:actual,..}) if actual==format!("flint.{key}"))
+            );
+        }
+    }
+}
+
+#[test]
+fn router_scale_defaults_only_when_absent() {
+    for scale in [None, Some(0.5), Some(2.0)] {
         let mut kv = keys();
-        kv.retain(|(k, _)| *k != key);
-        assert!(
-            matches!(check(key,&kv,&tensors()),Err(PlacementError::Metadata{key:actual,..}) if actual==format!("flint.{key}"))
+        kv.retain(|(k, _)| *k != "expert_weights_scale");
+        if let Some(value) = scale {
+            kv.push(("expert_weights_scale", V::F32(value)));
+        }
+        let r = check("scale", &kv, &tensors()).unwrap();
+        for layer in &r.spec.layers[1..] {
+            let Ffn::Moe(m) = &layer.ffn else {
+                panic!("not routed")
+            };
+            assert_eq!(m.router.scale, scale.unwrap_or(1.0));
+        }
+        assert_eq!(
+            r.defaults
+                .iter()
+                .filter(|d| d.starts_with("expert_weights_scale"))
+                .count(),
+            usize::from(scale.is_none())
         );
     }
 }

@@ -10,6 +10,10 @@ body, app session or serve seat. No GPU, inference, performance or weight-conten
 `arch/flint` reads independent bool SWA/RoPE masks, explicit head widths, the dense lead,
 sigmoid router facts, optional selection bias and one explicitly sized ungated shared MLP.
 It reuses the common metadata validators, tensor stems, classification and dimension checks.
+`arch::per_layer_bool` owns exact-length bool-array validation for both Flint masks and
+GemmaEmbedding2's sliding mask: missing keys, scalars, wrong lengths and non-bool items are refused.
+Present `expert_weights_scale` uses `arch::finite_positive`; only an absent key defaults to 1,
+with that default recorded.
 The common needs walk emits q/k normalization even on NoPE layers. `program_of(Flint)` remains
 `None`; missing program, head128 sinks/SWA, NoPE normalization and 256/top6 bindings remain coverage
 refusals. The generic router's `norm` flag describes requested normalization, **not** an implementation

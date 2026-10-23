@@ -366,6 +366,23 @@ fn per_layer_items<'a>(
     Ok(items)
 }
 
+/// `<architecture>.<suffix>` as exactly one bool per layer.
+/// Non-arrays, other lengths and non-bool items are refused by name.
+fn per_layer_bool(
+    split: &Split,
+    suffix: &str,
+    n_layer: usize,
+) -> Result<Vec<bool>, PlacementError> {
+    per_layer_items(split, suffix, n_layer)?
+        .iter()
+        .enumerate()
+        .map(|(l, v)| {
+            v.as_bool()
+                .ok_or_else(|| metadata(split, suffix, format!("has no bool at layer {l}")))
+        })
+        .collect()
+}
+
 /// `<architecture>.<suffix>` as one shared count expanded to every trunk
 /// layer or an array of the trunk's counts: an array of `n_trunk` counts, or
 /// of the file's `n_layer` counts (a next-token layer's entries close it),
