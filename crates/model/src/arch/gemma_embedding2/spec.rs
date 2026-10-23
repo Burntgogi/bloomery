@@ -544,6 +544,13 @@ mod tests {
             let err = load("gemma-emb2-other", kv, &tensors()).expect_err(key);
             assert!(err.contains(key) && err.contains(want), "{key}: {err}");
         }
+        for value in [V::Bool(true), V::Bools(vec![true; N + 1])] {
+            let key = "attention.sliding_window_pattern";
+            let mut kv = keys();
+            set_key(&mut kv, key, value);
+            let err = load("gemma-emb2-pattern", kv, &tensors()).expect_err(key);
+            assert!(err.contains(key), "{err}");
+        }
     }
 
     /// A tokenizer other than `gemma4`, or a pre-tokenizer of another name,

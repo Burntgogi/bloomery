@@ -81,6 +81,7 @@ crates/gpu-gates/src/bin/shared/dspark_hf.rs	qwen	1	baseline O 1: own path: an a
 crates/gpu-gates/src/bin/shared/emb2_image.rs	gemma	1	baseline O 1: own path: an alias row in tools/model-tokens.tsv or a move into the family directory
 crates/gpu-gates/src/bin/shared/route_trace38.rs	qwen	3	baseline O 3: own path: an alias row in tools/model-tokens.tsv or a move into the family directory
 crates/gpu-gates/src/bin/shared/routed_legs.rs	deepseek	8	baseline P 9: MK2 program by body
+crates/gpu-gates/src/bin/shared/routed_legs.rs	flint	2	PIN(2026-10-23) flint: family_of and skip_of match every models::Arch exhaustively; the header-only reader has no program or routed-legs adapter
 crates/gpu-gates/src/bin/shared/routed_legs.rs	gemma	4	baseline P 5: MK2 program by body
 crates/gpu-gates/src/bin/shared/routed_legs.rs	glm	7	baseline P 8: MK2 program by body
 crates/gpu-gates/src/bin/shared/routed_legs.rs	mimo	4	baseline P 5: MK2 program by body
@@ -141,6 +142,7 @@ crates/model/src/arch/dspark.rs	deepseek	1	baseline O 1: own path: an alias row 
 crates/model/src/arch/hybrid.rs	qwen	1	baseline O 1: own path: an alias row in tools/model-tokens.tsv or a move into the family directory
 crates/model/src/arch/mod.rs	clef	1	baseline A 1: MK1a/MK1b ArchRow registry
 crates/model/src/arch/mod.rs	deepseek	14	baseline A 15: MK1a/MK1b ArchRow registry
+crates/model/src/arch/mod.rs	flint	4	PIN(2026-10-23) flint: the module declaration and architecture variant with from_name and name arms remain outside the ArchRow registry
 crates/model/src/arch/mod.rs	gemma	11	baseline A 13: MK1a/MK1b ArchRow registry
 crates/model/src/arch/mod.rs	glm	5	baseline A 6: MK1a/MK1b ArchRow registry
 crates/model/src/arch/mod.rs	mimo	4	baseline A 5: MK1a/MK1b ArchRow registry
@@ -150,12 +152,14 @@ crates/model/src/bin/bloomery-decode.rs	deepseek	3	baseline R 4: MK1a one regist
 crates/model-hf/src/bin/prepare.rs	qwen	1	PIN(2026-10-20) qwen: the checkpoint architecture selected by the converter
 crates/model/src/bin/r8conv.rs	deepseek	1	baseline T 1: case-table row, a fixture label or default path
 crates/models/src/lib.rs	deepseek	4	baseline A 4: MK1a/MK1b ArchRow registry
+crates/models/src/lib.rs	flint	2	PIN(2026-10-23) flint: ModelSpec.arch names the reader by an enum variant and name arm until ModelSpec carries the registry's name
 crates/models/src/lib.rs	gemma	4	baseline A 4: MK1a/MK1b ArchRow registry
 crates/models/src/lib.rs	glm	3	baseline A 3: MK1a/MK1b ArchRow registry
 crates/models/src/lib.rs	mimo	2	baseline A 2: MK1a/MK1b ArchRow registry
 crates/models/src/lib.rs	nemotron	4	baseline A 4: MK1a/MK1b ArchRow registry
 crates/models/src/lib.rs	qwen	9	baseline A 9: MK1a/MK1b ArchRow registry
 crates/placement/src/accepts.rs	deepseek	10	PIN(2026-10-21) deepseek: MK2 program by body; +1 is the family's word in the common Program::name owner, which the model's own code does not carry yet
+crates/placement/src/accepts.rs	flint	1	PIN(2026-10-23) flint: program_of matches every models::Arch; the header-only reader must explicitly return no program until a body is registered
 crates/placement/src/accepts.rs	gemma	5	PIN(2026-10-21) gemma: MK2 program by body; +1 is the family's word in the common Program::name owner, which the model's own code does not carry yet
 crates/placement/src/accepts.rs	glm	5	PIN(2026-10-21) glm: MK2 program by body; +1 is the family's word in the common Program::name owner, which the model's own code does not carry yet
 crates/placement/src/accepts.rs	mimo	5	PIN(2026-10-21) mimo: MK2 program by body; +1 is the family's word in the common Program::name owner, which the model's own code does not carry yet
