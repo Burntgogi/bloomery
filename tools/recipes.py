@@ -198,7 +198,7 @@ from a recipe parameter is left out (the ptx-scan, sass-scan and lds-scan recipe
 only. A bin tools/release/build.sh ships is held to that file's feature list instead, in any
 dir, and the one line that names a departure is that rule's (`bin_problems`). The fix is the union (each build gives the
 bin every feature any build gives it), or a target dir of its own for a bin no runner starts from target/release
-(tools/gpu-gate.sh runs `target/release/<bin>` only); `--arch` is not part of the key: cargo-oxide's only target-dir
+(tools/gpu-gate.sh runs `target/release/<bin>` or the test artifact gate.sh --gpu compiled); `--arch` is not part of the key: cargo-oxide's only target-dir
 option is `--cargo-target-dir`, and the justfile passes one `{{arch}}` to every build.
 """
 
@@ -447,6 +447,8 @@ def parse_cargo(args: list[str], raw: str, via_gate_sh: bool = False) -> Invocat
     if via_gate_sh:
         sub = "test"
         rest = list(args)
+        if rest and rest[0] == "--gpu":
+            rest = rest[1:]
         if rest and rest[0] == "--oxide":
             oxide = True
             rest = rest[1:]
@@ -9822,7 +9824,7 @@ def key_self_test(expect, real: Side) -> None:
         m = edit("crates/gpu-gates/src/bin/gate_q4k_sel.rs", append("\n// key probe\n"))
         expect(m == {"gpu", "mac", "fmt"}, f"gate_q4k_sel.rs moves {sorted(m)}, not gpu mac fmt")
         m = edit("tools/gpu-gate.sh", append("\n# key probe\n"))
-        expect(m == {"gpu", "args", "mac", "fmt"}, f"tools/gpu-gate.sh moves {sorted(m)}")
+        expect(m == {"gpu", "cpu", "args", "mac", "fmt"}, f"tools/gpu-gate.sh moves {sorted(m)}")
         m = edit("docs/HARDWARE.md", append("\nkey probe\n"))
         expect(m == {"mac", "fmt"}, f"docs/HARDWARE.md moves {sorted(m)}, not only the whole-tree keys")
         cpu_lib = sorted(f for f in sa.graph.inputs("gate-sampler").files if f.startswith("crates/sampler/src/"))

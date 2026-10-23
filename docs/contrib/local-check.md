@@ -158,6 +158,41 @@ runner's forced-card policy.
 The host-only self-test exercises these selection paths with isolated locks,
 leases and query responses; it does not measure physical GPU occupancy.
 
+`gate-gpu-lib` compiles each CUDA library-test pass outside the card lock using
+`tools/gate.sh --gpu --oxide`. Its native `--lib` Cargo call uses a capture-only
+target runner: compilation never executes the test. Cargo owns the executable,
+arguments, package working directory and runtime environment (including native
+library paths); a private temporary capture retains that context and is removed
+on exit. Zero or multiple captured tests are refused with 64. Explicit `--target`
+and doctests are refused; the runner forces the compiler's native target and its
+capture runner rather than allowing a configured cross target or runner to execute
+tests before locking. A preconfigured scalar or environment runner is overridden;
+an array-valued runner conflicts with the scalar override and Cargo refuses it
+before either runner executes. Compiler output remains visible, including
+cargo-oxide's non-JSON banners.
+
+Replay enters `tools/gpu-gate.sh --executable` in Cargo's context. The common GPU
+runner therefore applies card selection and `CUDA_VISIBLE_DEVICES` **after** the
+captured environment, with the same timing-lease refusals and lock as ordinary bins.
+Compilation has the gate bound; after compilation, lock waits remain outside the
+single runtime bound owned by `gpu-gate.sh`. The child status is preserved,
+including 124/137 for timeout, 75 for contention and 69 for an unopenable lock.
+The `hw_held_` pass still uses `RUST_TEST_THREADS=1`; the no-NIC `bloomery-verbs`
+tests run afterward without a card lock. Host-only oxide tests do not use `--gpu`.
+Batch placement recognizes `gate.sh --gpu` as a call to the same GPU lock owner,
+including its `any` and box-selected card forms. A plain CPU `gate.sh` call stays
+card-free; the classifier does not follow the runner's conditional implementation.
+
+`bash tools/gpu-gate.sh --self-test --part 4` checks the library path against an
+ordinary GPU bin with real lock files and subprocesses: compilation while the card
+is held, no test child before release, other-card isolation, the serial pass,
+failure/refusal/timeout statuses and cancellation cleanup. The test consumer reads
+package-relative data and uses Cargo's manifest environment; on Linux `cc` builds a
+shared library whose function the consumer calls after loading it by name. Only
+Cargo's compilation boundary and device discovery are fixtures. This proves runner
+behavior without a GPU, not CUDA execution or
+freedom from OOM on a physical card.
+
 The outer `box.sh` selector requires a successful process query for
 `BLOOMERY_CARD=a6000` and `both`. Failure, even with partial output or a held
 Bloomery lock, stops with rc 75 before the command runs. Its self-test executes

@@ -3,6 +3,8 @@
 # target/release/<이름>을 카드의 게이트 락 아래에서 상한과 함께 돌리고, 그 종료 코드를
 # 그대로 돌려준다. 이름 뒤의 인자는 바이너리에 그대로 붙는다.
 #   ./tools/box.sh 'cargo oxide build … --bin gate_p3 && bash tools/gpu-gate.sh gate_p3'
+# `--executable PATH [args...]` runs a compiled test executable with the same card/lock/bound
+# contract. tools/gate.sh --gpu builds it before entering this runner and checks libtest's result.
 #
 # 막는 실패: 매달린 GPU 게이트 하나가 게이트 락을 무기한 쥐는 것. 락은 3090 게이트를 한 줄로 세우는 자리라,
 # 한 게이트가 서면 그 락을 기다리는 트랙이 전부 선다. CPU 게이트의 900초 상한(tools/gate.sh)과 같은 값을
@@ -356,7 +358,7 @@ pace() {
 # runs one (K, or `all`: the parts one after another here).
 # No verdict reads the machine's load: a wait that is not a judged bound ends on its event, and its clock (fs seconds for one wait, cap
 # seconds for a helper's whole life) only catches a hang. A run that is late is waited for while its process lives.
-SELFTEST_PARTS=3
+SELFTEST_PARTS=4
 self_test() {
   local self t n=0 bad=0 out rc rc1 p1 r1 r2 prc fs=300 cap=870 part=${1:-all}
   gg_part() { [ "$part" = all ] || [ "$part" = "$1" ]; }
@@ -1579,6 +1581,194 @@ PY
   case_ '  … the lease held: it times the card, 75 at the bound' 75 'no gate lock \(local\) was free within 4 s' any "$t/lease" "${LOC[@]}"
   fi
   exec 7>&-
+  if gg_part 4; then
+  # Only the compiler and hardware discovery are replaced. Both entry points below use the
+  # real runner, flock, timeout and subprocess cleanup against the same isolated lock files.
+  mkdir -p "$t/tree/package/native"
+  printf '%s\n' package-data > "$t/tree/package/consumer.txt"
+  # Build a real loader consumer: Python may link math statically, so it is not a shared-object fixture.
+  python3 - "$t/tree/package/native/libgate-fixture.so" <<'PY' || return 1
+import subprocess
+import sys
+
+if sys.platform == "linux":
+    subprocess.run(["cc", "-shared", "-fPIC", "-x", "c", "-o", sys.argv[1], "-"],
+                   input="int gate_fixture_value(void) { return 37; }\n", text=True, check=True)
+PY
+  printf '%s\n' '#!/bin/sh' 'printf "host: %s\n" "${LIB_HOST:-x86_64-unknown-linux-gnu}"' > "$t/bin/rustc"
+  cat > "$t/bin/cargo" <<'PY'
+#!/usr/bin/env python3
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tomllib
+
+args = sys.argv[1:]
+if args[0] == "oxide":
+    args = args[args.index("--") + 1:]
+test_args = args[args.index("--") + 1:] if "--" in args else []
+args = args[:args.index("--")] if "--" in args else args
+exe = os.environ.get("LIB_EXE", os.path.abspath("target/release/lib-test"))
+package = os.path.abspath("package")
+context = dict(os.environ, CARGO_MANIFEST_DIR=package)
+context["LD_LIBRARY_PATH"] = package + "/native" + (":" + context["LD_LIBRARY_PATH"] if context.get("LD_LIBRARY_PATH") else "")
+print("compiler output before capture", flush=True)
+if os.environ.get("LIB_COMPILED"):
+    Path(os.environ["LIB_COMPILED"]).write_text("compiled\n", encoding="utf-8")
+code = int(os.environ.get("LIB_COMPILE_EXIT", "0"))
+if code:
+    sys.exit(code)
+if "--config" not in args:
+    os.chdir(package)
+    os.execve(exe, [exe, *test_args], context)
+config = tomllib.loads(args[args.index("--config") + 1])
+target = args[args.index("--target") + 1]
+runner = [config["target"][target]["runner"]]
+for _ in range(int(os.environ.get("LIB_CAPTURES", "1"))):
+    subprocess.run([*runner, exe, *test_args], cwd=package, env=context, check=True)
+if os.environ.get("LIB_CAPTURE_CORRUPT"):
+    next(Path(runner[0]).parent.glob("run-*.json")).write_text("{broken", encoding="utf-8")
+print("compiler output after capture", flush=True)
+PY
+  cat > "$t/tree/target/release/lib-test" <<'PY'
+#!/usr/bin/env python3
+import ctypes
+import os
+import signal
+import sys
+from pathlib import Path
+
+# Consumer behavior: package-relative data, Cargo's manifest environment, and the native loader
+# must still work after replay; echoing the captured environment would not prove this.
+assert Path("consumer.txt").read_text(encoding="utf-8") == "package-data\n"
+assert (Path(os.environ["CARGO_MANIFEST_DIR"]) / "consumer.txt").read_text(encoding="utf-8") == "package-data\n"
+if sys.platform == "linux":
+    assert ctypes.CDLL("libgate-fixture.so").gate_fixture_value() == 37
+
+if "hw_held_" in sys.argv and os.environ.get("RUST_TEST_THREADS") != "1":
+    sys.exit(97)
+with open(os.environ["LIB_STARTED"], "w", encoding="utf-8") as stream:
+    stream.write(str(os.getpid()))
+signal.signal(signal.SIGTERM, lambda *_: sys.exit(int(os.environ.get("LIB_TERM", "143"))))
+if os.environ.get("LIB_IGNORE_TERM"):
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+if os.environ.get("LIB_READY"):
+    with open(os.environ["LIB_READY"], "w", encoding="utf-8") as stream:
+        stream.write("up\n")
+if os.environ.get("LIB_HOLD"):
+    with open(os.environ["LIB_HOLD"], encoding="utf-8") as stream:
+        stream.readline()
+print("lib-card=" + os.environ.get("CUDA_VISIBLE_DEVICES", ""))
+print("test result: ok. " + os.environ.get("LIB_PASSED", "1") + " passed; 0 failed;")
+sys.exit(int(os.environ.get("LIB_EXIT", "0")))
+PY
+  chmod +x "$t/bin/cargo" "$t/bin/rustc" "$t/tree/target/release/lib-test"
+  lib_gate() {
+    local o=$1 c=$2
+    shift 2
+    (cd "$t/tree" && timeout --kill-after=10 "$((cap + 30))" "${gate_env[@]}" \
+      BLOOMERY_GATE_CARD="$c" BLOOMERY_LEASE_LOCK="$t/lease" BLOOMERY_LEASE_PROC="$t/proc" \
+      LIB_COMPILED="$t/compiled" LIB_STARTED="$t/started" RUSTC="$t/bin/rustc" "$@" \
+      bash -c 'echo "$$" > "$1"; shift; exec bash "$@"' _ "$t/lib-runner" \
+      "${self%/*}/gate.sh" --test-locks "${TL:-$t}" --gpu --oxide -p bloomery-gpu --release --lib -- --include-ignored "${LIB_FILTER:-probe}") > "$o" 2>&1
+  }
+  # Ordinary binary holds the card: compilation completes, but libtest never starts.
+  fifos
+  gate "$t/first" 3090 "$t/lease" CUDA_VISIBLE_DEVICES="$GPU_3090" STUB_READY="$t/ready" STUB_HOLD="$t/hold" &
+  p1=$!
+  event 'ordinary gate holds the card'
+  rc=0
+  lib_gate "$t/out" 3090 || rc=$?
+  [ -f "$t/compiled" ] && echo compiled >> "$t/out"
+  [ ! -e "$t/started" ] && echo child-not-started >> "$t/out"
+  judge_all 'lib test contends with an ordinary GPU bin, but compiles outside its lock' "$rc" 75 '^compiled$' '^child-not-started$'
+  rc=0
+  lib_gate "$t/out" a6000 || rc=$?
+  judge 'lib test can use the other card while the ordinary bin holds the 3090' "$rc" 0 "^lib-card=$GPU_A6000$"
+  rc=0
+  lib_gate "$t/out" any || rc=$?
+  judge 'lib test any selects the free A6000 while the 3090 is held' "$rc" 0 "^lib-card=$GPU_A6000$"
+  rc=0
+  lib_gate "$t/out" any BLOOMERY_BOX_CARD=local BLOOMERY_LOCK_DIR="$t" CUDA_VISIBLE_DEVICES=GPU-caller || rc=$?
+  judge 'lib test local mode preserves the caller visible devices' "$rc" 0 '^lib-card=GPU-caller$'
+  rc=0
+  (cd "$t/tree" && "${gate_env[@]}" LIB_STARTED="$t/host-started" \
+    bash "${self%/*}/gate.sh" --release -p bloomery-verbs --lib) > "$t/out" 2>&1 || rc=$?
+  [ -f "$t/host-started" ] && echo host-started >> "$t/out"
+  judge 'host-only verbs path runs without taking the held card lock' "$rc" 0 '^host-started$'
+  rm -f "$t/started"
+  streams "$t/lib-output"
+  lib_gate "$t/lib-output" 3090 CUDA_VISIBLE_DEVICES="$GPU_3090" GATE_TEST_CAP="$cap" &
+  p2=$!
+  relay "$t/lib-output" "$t/out" 'waits for the gate lock' 3 &
+  r1=$!
+  event 'lib test queues behind ordinary bin'
+  local child_waited=no
+  [ -e "$t/started" ] || child_waited=yes
+  echo go >&4
+  rc=0 rc1=0
+  wait "$p2" || rc=$?
+  wait "$p1" || rc1=$?
+  wait "$r1"
+  cat "$t/first" >> "$t/out"
+  [ "$child_waited" != yes ] || echo child-not-started >> "$t/out"
+  judge_all 'lib test starts after the ordinary bin releases the shared card' "$rc" 0 '^child-not-started$' "^lib-card=$GPU_3090$"
+  judge 'ordinary holder exits successfully on the same card' "$rc1" 0 "^ran on $GPU_3090$"
+  # Reverse direction, including the held pass's real serial-env requirement.
+  fifos
+  LIB_FILTER=hw_held_ lib_gate "$t/lib-first" 3090 RUST_TEST_THREADS=1 LIB_READY="$t/ready" LIB_HOLD="$t/hold" &
+  p1=$!
+  event 'held lib pass owns the card'
+  case_ 'ordinary GPU bin cannot start while the held lib pass owns its card' 75 'no gate lock' 3090 "$t/lease"
+  echo go >&4
+  rc=0
+  wait "$p1" || rc=$?
+  cp "$t/lib-first" "$t/out"
+  judge 'held lib pass finishes under its serial environment' "$rc" 0 '^lib-card='
+  case_ 'ordinary GPU bin runs after the held lib pass releases its card' 0 '^ran on ' 3090 "$t/lease"
+  for row in 'LIB_EXIT=23:23' 'LIB_PASSED=0:78' 'LIB_COMPILE_EXIT=29:29' 'LIB_CAPTURES=0:64' 'LIB_CAPTURES=2:64' 'LIB_CAPTURE_CORRUPT=1:1' "LIB_EXE=$t/tree:2" "LIB_EXE=$t/missing:2" 'BLOOMERY_GATE_BOUND=0:64' 'BLOOMERY_GATE_CARD=bad:64'; do
+    rm -f "$t/started"
+    rc=0
+    lib_gate "$t/out" 3090 "${row%:*}" || rc=$?
+    judge "lib path preserves ${row%:*}" "$rc" "${row##*:}" '.|^$'
+    case "$row" in
+      LIB_COMPILE_EXIT=* | LIB_CAPTURE* | LIB_EXE=* | BLOOMERY_*)
+        [ ! -e "$t/started" ] && echo child-not-started >> "$t/out"
+        judge 'compile failure or refused input starts no test child' "$rc" "${row##*:}" '^child-not-started$' ;;
+    esac
+  done
+  mkdir -p "$t/lib-unopenable/gate.lock"
+  rc=0
+  TL="$t/lib-unopenable" lib_gate "$t/out" 3090 || rc=$?
+  judge 'lib path keeps lock-open failure code' "$rc" 69 '.'
+  # A runtime bound and an external signal both stop the child and release the lock.
+  for stop in bound kill signal; do
+    fifos
+    rm -f "$t/started"
+    if [ "$stop" = bound ] || [ "$stop" = kill ]; then
+      lib_gate "$t/lib-first" 3090 BLOOMERY_GATE_BOUND=1 LIB_HOLD="$t/hold" LIB_IGNORE_TERM="$([ "$stop" = kill ] && echo 1)" &
+    else
+      lib_gate "$t/lib-first" 3090 LIB_READY="$t/ready" LIB_HOLD="$t/hold" LIB_TERM=23 &
+    fi
+    p1=$!
+    if [ "$stop" = signal ]; then
+      event 'lib test ready for cancellation'
+      kill -TERM "$(cat "$t/lib-runner")"
+    fi
+    rc=0
+    wait "$p1" || rc=$?
+    cp "$t/lib-first" "$t/out"
+    case "$stop" in bound) prc=124 ;; kill) prc=137 ;; signal) prc=23 ;; esac
+    judge "lib path propagates $stop" "$rc" "$prc" '.'
+    if [ -f "$t/started" ]; then
+      pid_start "$(cat "$t/started")"
+      [ -n "$PID_START" ] || echo child-stopped >> "$t/out"
+    fi
+    judge "lib child is stopped after $stop" "$rc" "$prc" '^child-stopped$'
+    case_ "shared card lock is free after lib $stop" 0 '^ran on ' 3090 "$t/lease"
+  done
+  fi
   echo "gpu-gate self-test: $((n - bad)) of $n ok"
   [ "$bad" = 0 ]
 }
@@ -1653,14 +1843,25 @@ if [ "${1:-}" = --v41-queue ]; then
   v41_queue_view
   exit 0
 fi
+DIRECT=0
+if [ "${1:-}" = --executable ]; then
+  DIRECT=1
+  shift
+fi
 NAME=${1:-}
-[ -n "$NAME" ] || { echo "usage: gpu-gate.sh <target/release binary> [args...]" >&2; exit 64; }
+[ -n "$NAME" ] || { echo "usage: gpu-gate.sh <target/release binary> [args...] | --executable <path> [args...]" >&2; exit 64; }
 shift
 # shellcheck source=tools/gate-bound.sh
 source "${BASH_SOURCE[0]%/*}/gate-bound.sh"
 gate_bound gpu-gate.sh || exit $?
-EXE=./target/release/$NAME
-[ -x "$EXE" ] || { echo "gpu-gate.sh: no $EXE — the recipe builds it before calling this" >&2; exit 2; }
+if [ "$DIRECT" = 1 ]; then
+  EXE=$NAME
+  case $EXE in /* | ./* | ../*) ;; *) EXE=./$EXE ;; esac
+  NAME=${EXE##*/}
+else
+  EXE=./target/release/$NAME
+fi
+[ -f "$EXE" ] && [ -x "$EXE" ] || { echo "gpu-gate.sh: no executable file $EXE — the recipe builds it before calling this" >&2; exit 2; }
 # BLOOMERY_GATE_V41_LOAD=1: the run loads the whole V4.1 model (the recipe carries [group('v41-load')] and
 # exports it), so it also takes the box-wide V4.1 load lock below. 0 or unset: it does not.
 V41=${BLOOMERY_GATE_V41_LOAD:-0}
