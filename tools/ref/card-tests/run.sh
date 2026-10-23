@@ -777,15 +777,6 @@ rc_is 'box.sh: a cargo oxide command reaches the stub ssh' 0 box "$B/tools/box.s
 sshlog 'box.sh: a cargo oxide command checks the installed cargo-oxide against the pin' "cargo install --list .*not the pin $PIN"
 rc_is 'box.sh: a cargo oxide command with BLOOMERY_BOX_ENV runs' 0 box env BLOOMERY_BOX_ENV=CARGO_HOME=/opt/c "$B/tools/box.sh" 'cargo oxide build'
 sshlog 'box.sh: the cargo-oxide check runs after BLOOMERY_BOX_ENV' 'export CARGO_HOME=/opt/c && .*\{ __p='
-for cmd in 'bash tools/gate.sh --oxide -p x --release --lib' 'bash tools/release/build.sh 0.1.0 abcdef0' \
-  'bash tools/release/build.sh --check /tmp/out && bash tools/release/build.sh 0.1.0 abcdef0'; do
-  rc_is "box.sh: '$cmd' reaches the stub ssh" 0 box "$B/tools/box.sh" "$cmd"
-  sshlog "box.sh: '$cmd' checks the installed cargo-oxide too" "cargo install --list .*not the pin $PIN"
-done
-for cmd in 'cargo check' 'bash tools/release/build.sh --check /tmp/out'; do
-  rc_is "box.sh: '$cmd' reaches the stub ssh" 0 box "$B/tools/box.sh" "$cmd"
-  if grep -q 'cargo install --list' "$tmp/ssh.log"; then fail "box.sh: '$cmd' does not check cargo-oxide" 'the check is in it' "$tmp/ssh.log"; else pass "box.sh: '$cmd' does not check cargo-oxide"; fi
-done
 OXCLI=$(sed -n "s/^OXCLI='\(.*\)'\$/\1/p" "$B/tools/box.sh")
 OXCLI=${OXCLI//OXREV/$PIN}
 # PIN(2026-10-20): the rev cases use per-root metadata so dropping --root cannot pass.
@@ -794,11 +785,13 @@ cat > "$tmp/oxstub/cargo" << 'SH'
 #!/bin/sh
 root=${CARGO_INSTALL_ROOT:-${CARGO_HOME:-$HOME/.cargo}}
 case "$*" in
+  'check') touch "$OX_STARTED"; exit 0 ;;
   'install --list') ;;
   'install --list --root '*) [ "$#" = 4 ] || exit 64; root=$4 ;;
   *) exit 64 ;;
 esac
 [ ! -f "$root/install-list" ] || cat "$root/install-list"
+exit "${STUB_OXLIST_RC:-0}"
 SH
 printf '#!/bin/sh\nexit 0\n' > "$tmp/oxpath/bin/cargo-oxide"
 cp "$tmp/oxpath/bin/cargo-oxide" "$tmp/oxhome/bin/cargo-oxide"
@@ -839,9 +832,8 @@ run 'box.sh: a non-executable Cargo home entry falls back to PATH' 0 '^ran$' \
   PATH="$tmp/oxstub:$tmp/oxpath/bin:/usr/bin:/bin" bash -c "${OXCLI} echo ran"
 run 'box.sh: no cargo-oxide in Cargo home or on PATH is refused' 70 'cannot resolve cargo-oxide executable' \
   env HOME="$tmp/oxdefault" CARGO_HOME="$tmp/oxempty" PATH="$tmp/oxstub:/usr/bin:/bin" bash -c "${OXCLI} echo ran"
-printf '\nexit 23\n' >> "$tmp/oxstub/cargo"
 run 'box.sh: a failed install-list cannot verify the pin' 70 'cannot read cargo-oxide install record' \
-  env HOME="$tmp/oxdefault" CARGO_HOME="$tmp/oxempty" CARGO_INSTALL_ROOT="$tmp/oxhome" \
+  env HOME="$tmp/oxdefault" CARGO_HOME="$tmp/oxempty" CARGO_INSTALL_ROOT="$tmp/oxhome" STUB_OXLIST_RC=23 \
   PATH="$tmp/oxstub:$tmp/oxpath/bin:/usr/bin:/bin" bash -c "${OXCLI} echo ran"
 rc_is 'box.sh: BLOOMERY_BOX_WAIT and BLOOMERY_HOLD_OWNER reach the guard' 0 box env BLOOMERY_BOX_WAIT=0 BLOOMERY_HOLD_OWNER=03 "$B/tools/box.sh" true
 sshlog 'box.sh: lease_guard 0 03' '^stub \( cd ~/repo/x && \. tools/ref/lease-probe\.sh && lease_guard 0 03 \) && source '
@@ -1138,6 +1130,35 @@ qrc() {
   printf '%s\n' "$QID" > "$QH/repo/x/.sync-id"
   rc_is "$name" "$want" env -u SIGNALBOX_CARD HOME="$QH" PATH="$Q/bin:$PATH" "$@" bash -c "$(cat "$Q/job.sh")"
 }
+# Execute the wrapper commands, not a copy of their selector: a stale compiler must
+# stop the entire job before the build starts. BLOOMERY_BOX_ENV selects the install.
+mkdir -p "$QH/repo/x/tools/release"
+printf 'touch "$OX_STARTED"\n' > "$QH/repo/x/tools/gate.sh"
+cp "$QH/repo/x/tools/gate.sh" "$QH/repo/x/tools/release/build.sh"
+chmod +x "$tmp/oxhome/bin/cargo-oxide"
+OX_ENV=(CARGO_HOME="$tmp/oxhome" CARGO_INSTALL_ROOT="$tmp/oxhome"
+  PATH="$tmp/oxstub:$tmp/oxpath/bin:$Q/bin:$PATH" OX_STARTED="$Q/oxide-started")
+for cmd in 'bash tools/gate.sh --oxide -p x --release --lib' \
+  'bash tools/gate.sh --gpu --oxide -p x --release --lib' \
+  'bash tools/release/build.sh 0.1.0 abcdef0' \
+  'bash tools/release/build.sh --check /tmp/out && bash tools/release/build.sh 0.1.0 abcdef0'; do
+  qjob BLOOMERY_BOX_ENV="CARGO_HOME=$tmp/oxempty" -- "$cmd"
+  rm -f "$Q/oxide-started"
+  printf 'cargo-oxide v0.2.1 (https://example.org/oxide#4da6c138):\n' > "$tmp/oxpath/install-list"
+  qrun "box.sh job: '$cmd' refuses a stale compiler" 70 "not the pin $PIN" "${OX_ENV[@]}"
+  nofile "box.sh job: '$cmd' did not start with a stale compiler" "$Q/oxide-started"
+  printf 'cargo-oxide v0.2.1 (https://example.org/oxide#%s):\n' "${PIN:0:8}" > "$tmp/oxpath/install-list"
+  qrc "box.sh job: '$cmd' accepts the selected pinned compiler" 0 "${OX_ENV[@]}"
+  if [ -e "$Q/oxide-started" ]; then pass "box.sh job: '$cmd' started with the pin"; else fail "box.sh job: '$cmd' started with the pin" 'no marker'; fi
+done
+printf 'cargo-oxide v0.2.1 (https://example.org/oxide#4da6c138):\n' > "$tmp/oxpath/install-list"
+for cmd in 'cargo check' 'bash tools/release/build.sh --check /tmp/out'; do
+  qjob BLOOMERY_BOX_ENV="CARGO_HOME=$tmp/oxempty" -- "$cmd"
+  rm -f "$Q/oxide-started"
+  qrc "box.sh job: '$cmd' needs no pinned compiler" 0 "${OX_ENV[@]}"
+  if [ -e "$Q/oxide-started" ]; then pass "box.sh job: '$cmd' started without the pin"; else fail "box.sh job: '$cmd' started without the pin" 'no marker'; fi
+done
+
 # A card lane is the job's gate lock: BLOOMERY_GATE_CARD is that card (any: the daemon's), so a recipe's ${BLOOMERY_GATE_CARD:-any} never
 # names another lock (gpu-gate.sh's 64); none exports none, and an entry of BLOOMERY_BOX_ENV still wins.
 SHOW='echo "dev=$CUDA_VISIBLE_DEVICES card=$BLOOMERY_BOX_CARD sbc=${SIGNALBOX_CARD-} gc=${BLOOMERY_GATE_CARD-unset}"; exit 3'
