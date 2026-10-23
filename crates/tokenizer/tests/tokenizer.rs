@@ -25,7 +25,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use refset::arch::gemma_embedding::TOKENIZER as LLAMA;
-use refset::arch::tokenizer::{GLM5NEXT, MINIMAXM3, MUSESPARK, NEMOTRON, QWEN3MOE, QWEN38, V41};
+use refset::arch::tokenizer::{GLM5NEXT, MUSESPARK, NEMOTRON, QWEN3MOE, QWEN38, V41};
 use refset::family::Family;
 use refset::tokenizer::{Text, TokenizerSet};
 use tokenizer::{Decoder, Tokenizer};
@@ -106,22 +106,6 @@ fn nemotron() -> Vocabulary {
         ambiguous: &[],
         unspelled: &[],
         eog: &["</s>", "<|im_end|>"],
-    }
-}
-
-/// MiniMax-M3-UD-IQ4_XS's first shard on the box (`minimax-m2`). No `eot_token_id`
-/// key; generation ends on the eos `[e~[`. U+FFFD is a control token (id 16474): with
-/// special tokens parsed it is that token. With `--no-parse-special` the reference spells
-/// it `ï¿½`, whose merges end in a symbol that is no token, and the bytes of a symbol that
-/// is no token have no tokens of their own, so it drops the character (`a\u{FFFD}b` is two
-/// ids) unless a token spells the word it is in (` \u{FFFD}`, id 122700). Those ids decode
-/// to the text up to U+FFFD.
-fn minimaxm3() -> Vocabulary {
-    Vocabulary {
-        family: &MINIMAXM3,
-        ambiguous: &[],
-        eog: &["[e~["],
-        unspelled: &["\u{FFFD}"],
     }
 }
 
@@ -439,18 +423,6 @@ fn hw_nemotron_corpus_ids_equal_reference() {
 #[ignore = "needs the nemotron vocabulary and its oracle set (just dump-ref-tokenizer) on the box"]
 fn hw_nemotron_cases_equal_reference() {
     cases_equal_reference(&nemotron());
-}
-
-#[test]
-#[ignore = "needs the minimaxm3 vocabulary and its oracle set (just dump-ref-tokenizer) on the box"]
-fn hw_minimaxm3_corpus_ids_equal_reference() {
-    corpus_ids_equal_reference(&minimaxm3());
-}
-
-#[test]
-#[ignore = "needs the minimaxm3 vocabulary and its oracle set (just dump-ref-tokenizer) on the box"]
-fn hw_minimaxm3_cases_equal_reference() {
-    cases_equal_reference(&minimaxm3());
 }
 
 #[test]

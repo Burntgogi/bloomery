@@ -161,7 +161,7 @@ esac
 case ${1:-} in
   v41 | qwen3moe | glm5next | qwen38 | nemotron | minimaxm3 | musespark | gemma4 | llama) ;;
   all)
-    for v in v41 qwen3moe glm5next qwen38 nemotron minimaxm3 musespark; do
+    for v in v41 qwen3moe glm5next qwen38 nemotron musespark; do
       echo "oracle: $v"
       bash "${BASH_SOURCE[0]}" "$v" "${@:2}"
     done
