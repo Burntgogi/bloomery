@@ -152,7 +152,7 @@ PY
   ) || exit $?
   # Explicit native target and highest-priority CLI runner config prevent a configured cross
   # target or runner from executing a test before the card lock is taken.
-  run_bounded timeout --kill-after=10 "$BOUND" "${RUN[@]}" "${BUILD_ARGS[@]}" --target "$HOST" --config "$RUNNER_CONFIG" -- "${ARGS[@]}"
+  run_bounded timeout --kill-after=10 "$BOUND" "${RUN[@]}" ${BUILD_ARGS[@]+"${BUILD_ARGS[@]}"} --target "$HOST" --config "$RUNNER_CONFIG" -- ${ARGS[@]+"${ARGS[@]}"}
   rc=$?
   [ "$rc" = 0 ] || exit "$rc"
   [ -z "$BIN_SIGNAL" ] || exit 143
@@ -171,15 +171,15 @@ with captures[0].open(encoding="utf-8") as stream:
     context = json.load(stream)
 os.chdir(context["cwd"])
 os.execvpe("bash", ["bash", runner, *runner_args, "--executable", *context["argv"]], context["env"])
-' "$CAPTURE" "$GPU_RUNNER" "${GPU_ARGS[@]}")
+' "$CAPTURE" "$GPU_RUNNER" ${GPU_ARGS[@]+"${GPU_ARGS[@]}"})
   ARGS=()
 fi
 run_tests() {
   if [ "$GPU" = 1 ]; then
     # gpu-gate.sh owns the runtime bound, after its lock waits.
-    run_bounded "${RUN[@]}" "${ARGS[@]}"
+    run_bounded "${RUN[@]}" ${ARGS[@]+"${ARGS[@]}"}
   else
-    run_bounded timeout --kill-after=10 "$BOUND" "${RUN[@]}" "${ARGS[@]}"
+    run_bounded timeout --kill-after=10 "$BOUND" "${RUN[@]}" ${ARGS[@]+"${ARGS[@]}"}
   fi
 }
 if [ "${#FILTERS[@]}" = 0 ] || [ "$LISTING" = 1 ]; then
