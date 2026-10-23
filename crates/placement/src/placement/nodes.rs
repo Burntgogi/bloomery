@@ -97,7 +97,7 @@ pub fn lower_routed(plan: &mut Plan<'_>, owned: &[u64]) -> Result<(), PlacementE
         ));
     }
     super::check_tiers(&plan.machine.tiers)?;
-    super::check_devices(plan.machine, plan.card_budget)?;
+    super::check_devices(plan.machine, &plan.card_budget)?;
     let mut n_l = vec![0; plan.model.layers];
     let mut tier_n_l = vec![vec![0; plan.model.layers]; owned.len() - 1];
     let mut rows = plan.rows.clone();
@@ -170,7 +170,7 @@ pub fn lower_routed(plan: &mut Plan<'_>, owned: &[u64]) -> Result<(), PlacementE
         rows,
         &kv,
         (n_l, tier_n_l),
-        plan.card_budget,
+        plan.card_budget.clone(),
     )?;
     lowered.host.arena_columns = plan.host.arena_columns;
     lowered.budget_from_pool = plan.budget_from_pool;
@@ -279,7 +279,7 @@ pub fn routed_host<'a>(
         nvme_bytes: 0,
         n_l: vec![0; model.layers],
         tier_n_l: Vec::new(),
-        card_budget: None,
+        card_budget: super::card_budget::CardBudget::Unset,
         budget_from_pool: false,
     })
 }

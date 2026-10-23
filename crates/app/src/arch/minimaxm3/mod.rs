@@ -9,7 +9,8 @@
 //! every layer's key and value rows at those positions, every sparse layer's
 //! index keys, and the last position's logits. Every store is a plane of
 //! positions a later position never reads before it writes, so a cut keeps
-//! every held position. The body serves one sequence.
+//! every held position. This session holds one sequence; the serve seat parks
+//! more ([`bloomery_gpu_minimaxm3`]'s `Slots`).
 //!
 //! The session's shape is the common owner's ([`super::Batch`]): what the
 //! placement plans, how the prompt runs and how a cut is kept are shared with

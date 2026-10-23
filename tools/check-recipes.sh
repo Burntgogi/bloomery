@@ -379,6 +379,7 @@ pytools_list() {
     "tools/flow/pplb.py --self-test"
     "tools/flow/q38_step.py --self-test"
     "tools/flow/q38width.py --self-test"
+    "tools/flow/resplay.py --self-test"
     "tools/flow/routes.py --self-test"
     "tools/gate_class.py --self-test"
     "tools/gate-paths-merge.py --self-test"
@@ -479,32 +480,57 @@ blk_boxqcodes() {
 }
 # The fixture variants' table (tools/fixture-variants.tsv) against the tree, and the rules ref-paths.sh applies to a variant, on a
 # temporary fixture root: six columns a row, unique tags of lower-case letters and digits, a family that has a fixture directory in
-# fixture-dirs.tsv's table, recipes that are recipes of the justfile; then the paths (a variant's root, its set prefix, the directory a
+# fixture-dirs.tsv's table, a non-empty map and recipes column (the reader's own refusal, crates/model/src/fixture/variant.rs),
+# recipes that are recipes of the justfile; then the paths (a variant's root, its set prefix, the directory a
 # writer is given) and each refusal by name and exit code: a real tier, a tag the table does not name, one of another family, one
 # that is no tag, a family with no fixture file, a variant file that is not there.
 blk_fixturevariants() {
-  local jf=$JF tsv rp dirs d n=0 out vars
+  local jf=$JF tsv rp dirs d out vars summary
   tsv=$(dirname "$0")/fixture-variants.tsv rp=$(dirname "$0")/ref/ref-paths.sh dirs=$(dirname "$0")/fixture-dirs.tsv
   d=$(mktemp -d)
   # shellcheck disable=SC2064
   trap "rm -rf '$d'" RETURN
-  local tags="" line tag family recipes r cols
-  while IFS= read -r line; do
-    case $line in '' | '#'*) continue ;; esac
-    n=$((n + 1))
-    cols=$(awk -F'\t' '{ print NF }' <<< "$line")
-    [ "$cols" = 6 ] || { echo "check-recipes: $tsv row $n has $cols columns, want 6 (tag family scope map recipes why)" >&2; return 1; }
-    IFS=$'\t' read -r tag family _ _ recipes _ <<< "$line"
-    case $tag in '' | *[!a-z0-9]*) echo "check-recipes: $tsv: '$tag' is not lower-case letters and digits" >&2; return 1 ;; esac
-    case " $tags " in *" $tag "*) echo "check-recipes: $tsv names the tag $tag twice" >&2; return 1 ;; esac
-    tags="$tags $tag"
-    awk -F'\t' -v f="$family" '$0 !~ /^#/ && $1 == f && $2 != "self" { found = 1 } END { exit !found }' "$dirs" ||
-      { echo "check-recipes: $tsv: family $family has no fixture directory row in $dirs" >&2; return 1; }
-    for r in $recipes; do
-      grep -qE "^$r:" "$jf" || { echo "check-recipes: $tsv: $r is no recipe of the justfile" >&2; return 1; }
-    done
-  done < "$tsv"
-  [ "$n" -gt 0 ] || { echo "check-recipes: $tsv holds no variant" >&2; return 1; }
+  # rows TSV: the table's row shape. The reader (crates/model/src/fixture/variant.rs) refuses a row
+  # whose map or recipes column is empty at run time ("the map and the recipes are not empty"); the
+  # checker refuses it here first, by name. bash's read folds an empty tab-separated column into the
+  # next one, so the columns come out by awk.
+  rows() {
+    local file=$1 n=0 tags="" line tag family map recipes r cols
+    while IFS= read -r line; do
+      case $line in '' | '#'*) continue ;; esac
+      n=$((n + 1))
+      cols=$(awk -F'\t' '{ print NF }' <<< "$line")
+      [ "$cols" = 6 ] || { echo "check-recipes: $file row $n has $cols columns, want 6 (tag family scope map recipes why)" >&2; return 1; }
+      tag=$(awk -F'\t' '{ print $1 }' <<< "$line") family=$(awk -F'\t' '{ print $2 }' <<< "$line")
+      map=$(awk -F'\t' '{ print $4 }' <<< "$line") recipes=$(awk -F'\t' '{ print $5 }' <<< "$line")
+      case $tag in '' | *[!a-z0-9]*) echo "check-recipes: $file: '$tag' is not lower-case letters and digits" >&2; return 1 ;; esac
+      case " $tags " in *" $tag "*) echo "check-recipes: $file names the tag $tag twice" >&2; return 1 ;; esac
+      tags="$tags $tag"
+      [ -n "$map" ] || { echo "check-recipes: $file row $n: the map column is empty (the reader refuses it: \"the map and the recipes are not empty\")" >&2; return 1; }
+      [ -n "$recipes" ] || { echo "check-recipes: $file row $n: the recipes column is empty (the reader refuses it: \"the map and the recipes are not empty\")" >&2; return 1; }
+      awk -F'\t' -v f="$family" '$0 !~ /^#/ && $1 == f && $2 != "self" { found = 1 } END { exit !found }' "$dirs" ||
+        { echo "check-recipes: $file: family $family has no fixture directory row in $dirs" >&2; return 1; }
+      for r in $recipes; do
+        grep -qE "^$r:" "$jf" || { echo "check-recipes: $file: $r is no recipe of the justfile" >&2; return 1; }
+      done
+    done < "$file"
+    [ "$n" -gt 0 ] || { echo "check-recipes: $file holds no variant" >&2; return 1; }
+    printf '%s row(s):%s\n' "$n" "$tags"
+  }
+  summary=$(rows "$tsv") || return 1
+  # The empty-column refusal, proven on a one-row table whose other columns are well-formed.
+  for bad in map recipes; do
+    if [ "$bad" = map ]; then
+      printf 'badrec\tglm5next\tall\t\tgate-x\tself-test\n' > "$d/bad.tsv"
+    else
+      printf 'badrec\tglm5next\tall\tffn_gate=q4_K\t\tself-test\n' > "$d/bad.tsv"
+    fi
+    out=$(rows "$d/bad.tsv" 2>&1) && { echo "check-recipes: fixture-variants.tsv: an empty $bad column read as fine: $out" >&2; return 1; }
+    case $out in
+      *"row 1: the $bad column is empty"*) ;;
+      *) echo "check-recipes: fixture-variants.tsv: wanted 'row 1: the $bad column is empty' in: $out" >&2; return 1 ;;
+    esac
+  done
   grep -qE '^fixture-requant FAMILY TAG:' "$jf" || { echo "check-recipes: the justfile has no fixture-requant recipe" >&2; return 1; }
   # The tier's paths on a temporary root: $d/fixtures/<dir>/ the fixture, $d/fixture-variants/<tag>/<dir>/ its variant.
   tag=$(awk -F'\t' '$0 !~ /^#/ && NF { print $1; exit }' "$tsv") family=$(awk -F'\t' '$0 !~ /^#/ && NF { print $2; exit }' "$tsv")
@@ -601,7 +627,7 @@ blk_fixturevariants() {
   f_out=$(env -i PATH="$PATH" BLOOMERY_MODEL=deepseek41 bash -c '. "$1" && dspark_model' _ "$rp" 2>"$d/f.err") || f_rc=$?
   [ "$f_rc" = 0 ] && [ "$f_out" = "$real" ] || { echo "check-recipes: dspark_model, real tier: rc=$f_rc out='$f_out', want '$real' ($(cat "$d/f.err"))" >&2; return 1; }
   echo "check-recipes: deepseek41 fixture draft: source stays up, dspark_model refuses"
-  echo "check-recipes: fixture variants ok ($n row(s): $tags )"
+  echo "check-recipes: fixture variants ok ($summary)"
 }
 
 # The fixture directory table (tools/fixture-dirs.tsv) as ref-paths.sh reads it, on a temporary fixture root: a row with a directory

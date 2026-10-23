@@ -3964,12 +3964,15 @@ fn chat_finish_reason(o: &Outcome, m: &Message) -> &'static str {
 }
 
 /// The scan a chat request's output gets: none, or the markup of the
-/// server's template; a request that asks for tool calls under a template
+/// server's template (Muse Spark's, which also splits its reasoning, on every
+/// turn); a request that asks for tool calls under a template
 /// whose markup no parser reads is refused, never answered with the calls
 /// left in `content`.
 fn tool_scan(state: &State, b: &Map<String, Value>) -> Result<Option<Tools>, ApiError> {
     if !parses_tools(b) {
-        return Ok(None);
+        // Muse Spark's reasoning is a message to `self`, which only its recipient scan splits out
+        // (the template names no think tag), so a turn with no tools is scanned too.
+        return Ok(matches!(state.tool_format, ToolFormat::MuseSpark).then_some(Tools::MuseSpark));
     }
     Ok(Some(match state.tool_format {
         ToolFormat::Dsml(spelling) => Tools::Dsml(spelling),
@@ -3980,15 +3983,16 @@ fn tool_scan(state: &State, b: &Map<String, Value>) -> Result<Option<Tools>, Api
         ToolFormat::QwenXml(framing) => {
             Tools::QwenXml(framing, ParamKinds::of_tools(b.get("tools")))
         }
+        ToolFormat::MuseSpark => Tools::MuseSpark,
         ToolFormat::Unparsed => {
             return Err(ApiError {
                 retry_after: false,
                 code: 501,
                 kind: "not_supported_error",
                 message: "the chat template's tool-call markup has no parser in this server \
-                          (DSML, GLM's and Solar's key/value markup, Hermes' and Qwen's XML \
-                          are parsed): send the request without tools or with tool_choice \
-                          \"none\""
+                          (DSML, GLM's and Solar's key/value markup, Hermes' and Qwen's XML, \
+                          and Muse's recipient markup are parsed): send the request without \
+                          tools or with tool_choice \"none\""
                     .to_owned(),
             });
         }

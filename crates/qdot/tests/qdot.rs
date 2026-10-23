@@ -14,8 +14,8 @@ mod common;
 use common::{q82_blocks, restore_q82x4};
 use gguf::GgmlType;
 use gguf::quant::{
-    dequant_row, half_to_f32, quantize_row_q8_0_roundtrip, quantize_row_q8_2_x4_roundtrip,
-    quantize_row_q8_k_roundtrip,
+    ActivationFormat, Nvfp4Rows, activation_format, dequant_row, half_to_f32,
+    quantize_row_q8_0_roundtrip, quantize_row_q8_2_x4_roundtrip, quantize_row_q8_k_roundtrip,
 };
 #[cfg(target_arch = "x86_64")]
 use qdot::dot_row_avx2;
@@ -5497,6 +5497,142 @@ fn hw_iq2xxs_tile_matches_dot_row() {
     iq_tile_synthetic(GgmlType::IQ2_XXS, 66, 256, &[4096, 768, 256], &IQ2XXS_ENDS);
 }
 
+/// Clause of one row set: for c = 1..=WIDE_COLS and every starting column of
+/// the cyclic list `acols`, every row's `dot_row_cols_wide` over the c columns
+/// from there equals `dot_row` per column, bit for bit — c past the list's
+/// length repeats its columns, so the eight-column groups after the first
+/// read the same columns at other slots. The outputs start as NaN, so an
+/// unwritten one fails too. Returns the calls made.
+fn assert_wide_matches(
+    ty: GgmlType,
+    label: &str,
+    k: usize,
+    row_bytes: usize,
+    bytes: &[u8],
+    acols: &[Vec<u8>],
+) -> usize {
+    assert!(
+        qdot::has_wide(ty),
+        "{label}: {ty:?} has no wide kernel on this CPU — the clause would compare dot_row_cols \
+         with dot_row"
+    );
+    let rows = bytes.len() / row_bytes;
+    let n = acols.len();
+    let mut want = vec![0.0f32; rows * n];
+    for r in 0..rows {
+        let src = &bytes[r * row_bytes..(r + 1) * row_bytes];
+        for (j, a) in acols.iter().enumerate() {
+            want[r * n + j] = dot_row(ty, src, a, k).unwrap();
+        }
+    }
+    let mut calls = 0;
+    for c in 1..=qdot::WIDE_COLS {
+        for s in 0..n {
+            let idx: Vec<usize> = (0..c).map(|i| (s + i) % n).collect();
+            let cols: Vec<&[u8]> = idx.iter().map(|&j| acols[j].as_slice()).collect();
+            for r in 0..rows {
+                let src = &bytes[r * row_bytes..(r + 1) * row_bytes];
+                let mut out = vec![f32::NAN; c];
+                qdot::dot_row_cols_wide(ty, src, &cols, k, &mut out).unwrap();
+                for (slot, (&j, &got)) in idx.iter().zip(&out).enumerate() {
+                    let w = want[r * n + j];
+                    assert_eq!(
+                        got.to_bits(),
+                        w.to_bits(),
+                        "{label}: row {r}, c = {c}, slot {slot} (column {j}): wide {got:e} \
+                         (bits {:#x}) vs dot_row {w:e} (bits {:#x})",
+                        got.to_bits(),
+                        w.to_bits()
+                    );
+                }
+                calls += 1;
+            }
+        }
+    }
+    calls
+}
+
+/// IQ2_XXS wide clause: random rows (every grid index, sign index and scale nibble, `d` of
+/// either sign) and the ends of [`IQ2XXS_ENDS`] at k = 4096 (Muse Spark's experts), 768 and
+/// 256, against the ±3.0 and seeded columns — `dot_row_cols_wide` = `dot_row` per column, bit
+/// for bit, at every column count 1..=WIDE_COLS.
+#[test]
+#[ignore = "hw: needs the box (AVX2)"]
+fn hw_iq2xxs_wide_matches_dot_row() {
+    let ty = GgmlType::IQ2_XXS;
+    let (block, gran) = (66, 256);
+    let mut rng = Lcg(0x31DE_1A2E);
+    let fields = f16_scale_fields(ty);
+    for k in [4096, 768, 256] {
+        let nb = k / gran;
+        let row_bytes = nb * block;
+        let cols = legacy_tile_columns(ty, k, vec![]);
+        let mut rows = Vec::new();
+        for _ in 0..LEGACY_RANDOM_ROWS * nb {
+            rows.extend_from_slice(&iq_random_block(&mut rng, block, fields));
+        }
+        let calls = assert_wide_matches(ty, "random rows", k, row_bytes, &rows, &cols);
+        eprintln!(
+            "{ty:?} wide: random rows (k = {k}): {calls} calls, c = 1..={}, bit-identical",
+            qdot::WIDE_COLS
+        );
+        let rows = legacy_end_rows(&IQ2XXS_ENDS, nb, |end| end());
+        let calls = assert_wide_matches(ty, "end rows", k, row_bytes, &rows, &cols);
+        eprintln!(
+            "{ty:?} wide: end rows (k = {k}): {calls} calls, c = 1..={}, bit-identical",
+            qdot::WIDE_COLS
+        );
+    }
+}
+
+/// A wide call's column count outside `1..=WIDE_COLS`, an `out` of another length and a short
+/// column are named refusals, before any kernel runs — on a type with a wide kernel and on one
+/// without.
+#[test]
+fn dot_row_cols_wide_refuses_bad_shapes() {
+    for (ty, k, row_bytes) in [(GgmlType::IQ2_XXS, 256, 66), (GgmlType::Q6_K, 256, 210)] {
+        let wrow = vec![0u8; row_bytes];
+        let a = vec![0u8; col_bytes(ty, k)];
+        let many: Vec<&[u8]> = vec![a.as_slice(); qdot::WIDE_COLS + 1];
+        let mut out = vec![0.0f32; qdot::WIDE_COLS + 1];
+        assert_eq!(
+            qdot::dot_row_cols_wide(ty, &wrow, &many, k, &mut out),
+            Err(QdotError::WideShape {
+                cols: qdot::WIDE_COLS + 1,
+                outs: qdot::WIDE_COLS + 1
+            }),
+            "{ty:?}"
+        );
+        assert_eq!(
+            qdot::dot_row_cols_wide(ty, &wrow, &[], k, &mut []),
+            Err(QdotError::WideShape { cols: 0, outs: 0 }),
+            "{ty:?}"
+        );
+        assert_eq!(
+            qdot::dot_row_cols_wide(ty, &wrow, &many[..9], k, &mut out[..10]),
+            Err(QdotError::WideShape { cols: 9, outs: 10 }),
+            "{ty:?}"
+        );
+        let short = &a[..a.len() - 1];
+        assert_eq!(
+            qdot::dot_row_cols_wide(ty, &wrow, &[a.as_slice(), short], k, &mut out[..2]),
+            Err(QdotError::ShortActivationCol {
+                have: a.len() - 1,
+                need: a.len(),
+                k
+            }),
+            "{ty:?}"
+        );
+        let e = qdot::dot_row_cols_wide(ty, &wrow, &many, k, &mut out)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains(&format!("1..={} columns", qdot::WIDE_COLS)),
+            "{ty:?}: {e}"
+        );
+    }
+}
+
 /// IQ4_NL tile clause: random rows and the ends of [`IQ4NL_ENDS`] at each of
 /// [`LEGACY_TILE_KS`] (640 is the routed down; 736 and 96 end in tail blocks),
 /// then the file's first routed-expert rows — tile = `dot_row` per column, bit
@@ -7429,4 +7565,930 @@ fn hw_card_swiglu_clamp_scalar_matches_avx2() {
             );
         }
     }
+}
+
+// ------------------------------------------------------- NVFP4 blocks x Q8_2_X4
+// NVFP4's dot has no ik source and no model-file caller here, so its clauses are synthetic: random blocks of valid
+// scales and every code nibble, held to the exact f64 dot of the decoded weights and the column's values within a
+// derived band, to the scalar mirror bit for bit, and to the scale table that decodes its bytes.
+//
+// The band, derived before the run. Every integer sum is exact (a lane partial is at most 4·12·127 and a group sum
+// 16·12·127, far under 2^24) and so is each scale times an activation scale (a 4-bit and an 8-bit significand), so the
+// only roundings are the FMAs that fold a term into its lane (`nb / 2` groups, and two tail blocks for an odd `nb`,
+// each one rounding of the product and the sum together) and the eight-lane hsum's three levels: `n = nb / 2 +
+// 2·(nb % 2) + 3`, and `|dot − exact| ≤ γ_n · Σ|w·x|`, since a lane's terms sum in absolute value to at most the
+// absolute products of its own values. The f64 reference's own sum adds `k · 2^-53 · Σ|w·x|`.
+
+/// Row lengths of the NVFP4 clauses: 64 (a lone tail block, two q8_2 tail blocks and no group), 128 (one x4 group), 192
+/// (a group and a tail), 576 (four groups and a tail), 2048 and 4096 (sixteen and thirty-two groups).
+const NVFP4_BLOCK_KS: [usize; 6] = [64, 128, 192, 576, 2048, 4096];
+
+/// One NVFP4 block: the four scale bytes, then the 32 code bytes `qs(i)` gives.
+fn nvfp4_block(d: [u8; 4], qs: impl Fn(usize) -> u8) -> Vec<u8> {
+    let mut b = d.to_vec();
+    b.extend((0..32).map(qs));
+    b
+}
+
+/// A finite UE4M3 scale byte: in a window where every group of a row matters (exponents 6 to 9), or anywhere from zero
+/// and the subnormals to the largest, 0x7E.
+fn nvfp4_scale(rng: &mut Lcg, window: bool) -> u8 {
+    if window {
+        0x30 + (rng.next_u32() % 0x20) as u8
+    } else {
+        (rng.next_u32() % 0x7F) as u8
+    }
+}
+
+/// `rows` rows of `nb` random blocks: any code nibble (negative zero and both extremes among them), the scales of
+/// alternate blocks from the window and from the whole range.
+fn nvfp4_block_rows(rng: &mut Lcg, rows: usize, nb: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    for r in 0..rows * nb {
+        let d = std::array::from_fn(|_| nvfp4_scale(rng, r % 2 == 0));
+        let codes: [u8; 32] = std::array::from_fn(|_| (rng.next_u32() >> 7) as u8);
+        out.extend(nvfp4_block(d, |i| codes[i]));
+    }
+    out
+}
+
+/// Rows of `nb` equal blocks at the ends of the input space: the largest scale (0x7E) with every code +12 and every code
+/// -12, the smallest subnormal scale, a zero scale, and every code negative zero.
+fn nvfp4_block_end_rows(nb: usize) -> Vec<Vec<u8>> {
+    [
+        ([0x7E; 4], 0x77u8),
+        ([0x7E; 4], 0xFF),
+        ([0x01; 4], 0x77),
+        ([0x00; 4], 0x77),
+        ([0x38; 4], 0x88),
+        ([0x7E, 0x00, 0x01, 0x38], 0x5A),
+    ]
+    .into_iter()
+    .map(|(d, code)| (0..nb).flat_map(|_| nvfp4_block(d, |_| code)).collect())
+    .collect()
+}
+
+/// Columns for a row of `k` values, each through `quantize_col`: seeded activations of four magnitudes, one with a lone
+/// outlier a block, the constants ±3.0 and zeros — [`qdot::TILE_COLS`] of them.
+fn nvfp4_block_columns(rng: &mut Lcg, k: usize) -> Vec<Vec<u8>> {
+    let mut xs: Vec<Vec<f32>> = [1.0f32, 40.0, 0.02, 7.5]
+        .into_iter()
+        .map(|amp| (0..k).map(|_| amp * rng.unit()).collect())
+        .collect();
+    xs.push(
+        (0..k)
+            .map(|i| if i % 32 == 7 { 90.0 } else { 0.25 * rng.unit() })
+            .collect(),
+    );
+    xs.extend([vec![3.0; k], vec![-3.0; k], vec![0.0; k]]);
+    xs.into_iter()
+        .map(|x| {
+            let mut col = vec![0u8; col_bytes(GgmlType::NVFP4, k)];
+            quantize_col(GgmlType::NVFP4, &x, &mut col);
+            col
+        })
+        .collect()
+}
+
+/// `(Σ w·x, Σ |w·x|)` in f64 of a row's decoded weights (`dequant_row`, exact in f32) and a column's values.
+fn nvfp4_block_exact(row: &[u8], col: &[u8], k: usize) -> (f64, f64) {
+    let mut w = vec![0.0f32; k];
+    dequant_row(GgmlType::NVFP4, row, &mut w).unwrap();
+    w.iter()
+        .zip(restore_q82x4(col))
+        .fold((0.0, 0.0), |(v, va), (&w, x)| {
+            let p = f64::from(w) * x;
+            (v + p, va + p.abs())
+        })
+}
+
+/// The derived band of a `k`-value row whose absolute products sum to `v_abs`.
+fn nvfp4_block_band(k: usize, v_abs: f64) -> f64 {
+    let nb = k / 64;
+    let n = (nb / 2 + 2 * (nb % 2) + 3) as f64;
+    let u = 2f64.powi(-24);
+    (n * u / (1.0 - n * u) + k as f64 * 2f64.powi(-53)) * v_abs
+}
+
+/// The dot at every length of [`NVFP4_BLOCK_KS`], on random rows and the end rows, against each column: within the derived
+/// band of the exact f64 dot, and `dot_row` (the AVX2 kernel on x86_64) the scalar mirror's bits.
+#[test]
+fn nvfp4_dot_is_the_exact_dot_within_its_band() {
+    let mut rng = Lcg(0x4E_F4);
+    let (mut cells, mut worst) = (0usize, 0.0f64);
+    for k in NVFP4_BLOCK_KS {
+        let nb = k / 64;
+        let row_bytes = nb * 36;
+        let mut rows = nvfp4_block_rows(&mut rng, 6, nb);
+        rows.extend(nvfp4_block_end_rows(nb).into_iter().flatten());
+        let cols = nvfp4_block_columns(&mut rng, k);
+        for (r, row) in rows.chunks_exact(row_bytes).enumerate() {
+            for (c, col) in cols.iter().enumerate() {
+                let got = dot_row(GgmlType::NVFP4, row, col, k).unwrap();
+                let (v, v_abs) = nvfp4_block_exact(row, col, k);
+                let (err, band) = ((f64::from(got) - v).abs(), nvfp4_block_band(k, v_abs));
+                assert!(
+                    err <= band,
+                    "k = {k}, row {r}, column {c}: dot {got:e} is {err:e} from the exact {v:e}, band {band:e}"
+                );
+                if band > 0.0 {
+                    worst = worst.max(err / band);
+                }
+                let mirror = dot_row_scalar(GgmlType::NVFP4, row, col, k).unwrap();
+                assert_eq!(
+                    got.to_bits(),
+                    mirror.to_bits(),
+                    "k = {k}, row {r}, column {c}: dot {got:e} against the scalar mirror {mirror:e}"
+                );
+                cells += 1;
+            }
+        }
+    }
+    eprintln!("nvfp4 dot: {cells} cells within the band, worst err/band {worst:.3}");
+}
+
+/// Every byte in every sub-block position of a block (and of a lone tail block): a UE4M3 scale gives the exact dot of
+/// its decode (`ue4m3_to_f32_half`), a byte that is no scale (bit 7 set, 0x7F) makes the row's value NaN.
+#[test]
+fn nvfp4_scale_bytes_decode_as_ue4m3_and_a_non_scale_is_nan() {
+    for nb in [1usize, 2] {
+        let k = 64 * nb;
+        let mut col = vec![0u8; col_bytes(GgmlType::NVFP4, k)];
+        let x: Vec<f32> = (0..k).map(|i| (i as f32 - 40.0) / 17.0).collect();
+        quantize_col(GgmlType::NVFP4, &x, &mut col);
+        for sub in 0..4 * nb {
+            for byte in 0..=255u8 {
+                let mut row = Vec::new();
+                for b in 0..nb {
+                    let mut d = [0x38u8; 4];
+                    if sub / 4 == b {
+                        d[sub % 4] = byte;
+                    }
+                    row.extend(nvfp4_block(d, |i| (i as u8).wrapping_mul(0x35) ^ 0x71));
+                }
+                let got = dot_row(GgmlType::NVFP4, &row, &col, k).unwrap();
+                if gguf::quant::ue4m3_to_f32_half(byte).is_err() {
+                    assert!(
+                        got.is_nan(),
+                        "nb {nb} sub-block {sub} scale {byte:#04x}: {got}"
+                    );
+                } else {
+                    let (v, v_abs) = nvfp4_block_exact(&row, &col, k);
+                    let (err, band) = ((f64::from(got) - v).abs(), nvfp4_block_band(k, v_abs));
+                    assert!(
+                        err <= band,
+                        "nb {nb} sub-block {sub} scale {byte:#04x}: dot {got:e} is {err:e} from {v:e}, band {band:e}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// The column's bytes, the row's block contract, the refusals by name, and a tile call (NVFP4 has no tile kernel) giving
+/// each column `dot_row`'s value.
+#[test]
+fn nvfp4_shapes_refusals_and_tile_fallback() {
+    let ty = GgmlType::NVFP4;
+    assert!(supports(ty));
+    assert_eq!(activation_format(ty), Ok(Some(ActivationFormat::Q8_2X4)));
+    assert_eq!(qdot::k_granularity(ty), 64);
+    assert!(qdot::fuses(ty, 64) && !qdot::fuses(ty, 96));
+    assert!(!qdot::has_tile(ty));
+    // 64-value blocks, 36 bytes each; the column is q8_2_x4 groups of 128 values and q8_2 tails of 32.
+    assert_eq!(col_bytes(ty, 2048), 144 * 16);
+    assert_eq!(col_bytes(ty, 192), 144 + 2 * 36);
+    assert_eq!(col_bytes(ty, 64), 2 * 36);
+    let (wrow, acol) = (vec![0u8; 36 * 32], vec![0u8; 144 * 16]);
+    assert_eq!(
+        dot_row(ty, &wrow, &acol, 96),
+        Err(QdotError::UnalignedK { k: 96, gran: 64 })
+    );
+    assert_eq!(
+        dot_row(ty, &wrow[..36 * 32 - 1], &acol, 2048),
+        Err(QdotError::ShortWeightRow {
+            have: 36 * 32 - 1,
+            need: 36 * 32,
+            k: 2048
+        })
+    );
+    assert_eq!(
+        dot_row(ty, &wrow, &acol[..144 * 16 - 1], 2048),
+        Err(QdotError::ShortActivationCol {
+            have: 144 * 16 - 1,
+            need: 144 * 16,
+            k: 2048
+        })
+    );
+    assert_eq!(dot_row(ty, &wrow, &acol, 2048).unwrap(), 0.0);
+    let mut rng = Lcg(0x4E_71);
+    for k in [64, 192, 2048] {
+        let row = nvfp4_block_rows(&mut rng, 1, k / 64);
+        let cols = nvfp4_block_columns(&mut rng, k);
+        for c in 1..=qdot::TILE_COLS {
+            let refs: Vec<&[u8]> = cols[..c].iter().map(Vec::as_slice).collect();
+            let mut out = vec![f32::NAN; c];
+            qdot::dot_row_cols(ty, &row, &refs, k, &mut out).unwrap();
+            for (j, (&got, col)) in out.iter().zip(&refs).enumerate() {
+                let want = dot_row(ty, &row, col, k).unwrap();
+                assert_eq!(
+                    got.to_bits(),
+                    want.to_bits(),
+                    "k = {k}, c = {c}, column {j}"
+                );
+            }
+        }
+    }
+}
+
+/// The AVX2 kernel is the scalar mirror bit for bit on any column bytes a q8_2_x4 column can hold — every code, -128
+/// among them, finite bf16 scales, any sums — and not only the encoder's.
+#[cfg(target_arch = "x86_64")]
+#[test]
+#[ignore = "hw: needs the box (AVX2)"]
+fn hw_nvfp4_avx2_is_its_scalar_mirror_on_any_column_bytes() {
+    let mut rng = Lcg(0x4E_AA);
+    let mut cells = 0usize;
+    for k in NVFP4_BLOCK_KS {
+        let nb = k / 64;
+        let rows = nvfp4_block_rows(&mut rng, 8, nb);
+        let (groups, tails) = (nb / 2, 2 * (nb % 2));
+        for _ in 0..8 {
+            let mut col: Vec<u8> = (0..col_bytes(GgmlType::NVFP4, k))
+                .map(|_| (rng.next_u32() >> 9) as u8)
+                .collect();
+            // A bf16 scale with its exponent's top bit clear is finite and at most 2.
+            for g in 0..groups {
+                for j in 0..4 {
+                    col[g * 144 + 2 * j + 1] &= 0xBF;
+                }
+            }
+            for t in 0..tails {
+                col[groups * 144 + t * 36 + 1] &= 0xBF;
+            }
+            for row in rows.chunks_exact(nb * 36) {
+                let avx2 = dot_row_avx2(GgmlType::NVFP4, row, &col, k).unwrap();
+                let mirror = dot_row_scalar(GgmlType::NVFP4, row, &col, k).unwrap();
+                assert!(avx2.is_finite(), "k = {k}: {avx2}");
+                assert_eq!(
+                    avx2.to_bits(),
+                    mirror.to_bits(),
+                    "k = {k}: AVX2 {avx2:e} against the mirror {mirror:e}"
+                );
+                cells += 1;
+            }
+        }
+    }
+    eprintln!("nvfp4 avx2: {cells} cells bit-identical to the scalar mirror");
+}
+
+// ------------------------------------------------- NVFP4 rows x Q8_2_X4
+// bloomery's NVFP4 rows ([`GgmlType::NVFP4_ROWS`]): ModelOpt's groups of 16 values, a UE4M3 scale each,
+// value `2i` the low nibble of code byte `i`. One row is read as two planes (`dot_nvfp4_planes_row`) or as
+// 9-byte groups (`dot_row`); the reference is `quant::Nvfp4Rows`, the engine's own decode.
+
+/// Row widths: one block, a group, a group and a tail, the model widths and one with a long run of groups and a tail.
+const NVFP4_KS: [usize; 10] = [32, 64, 96, 128, 160, 224, 512, 3072, 4128, 6144];
+
+/// f32's unit roundoff.
+const NVFP4_U: f64 = 1.0 / 16_777_216.0;
+
+/// A scale byte drawn over the format: zero, the subnormals, the smallest normal, one, the largest scale, or any scale.
+fn nvfp4_scale_byte(rng: &mut Lcg) -> u8 {
+    match rng.next_u32() % 8 {
+        0 => 0x00,
+        1 => 1 + (rng.next_u32() % 7) as u8,
+        2 => 0x08,
+        3 => 0x38,
+        4 => 0x7E,
+        _ => (rng.next_u32() % 0x7F) as u8,
+    }
+}
+
+/// A row's planes: every nibble drawn (negative zero and both extreme codes among them), a scale a group.
+fn nvfp4_planes(rng: &mut Lcg, k: usize) -> (Vec<u8>, Vec<u8>) {
+    let codes = (0..k / 2).map(|_| rng.next_u32() as u8).collect();
+    let scales = (0..k / 16).map(|_| nvfp4_scale_byte(rng)).collect();
+    (codes, scales)
+}
+
+/// The rows at the format's ends: the largest value everywhere, the most negative, negative zero, and a zero scale.
+fn nvfp4_end_rows(k: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let planes = |code: u8, scale: u8| (vec![code; k / 2], vec![scale; k / 16]);
+    vec![
+        planes(0x77, 0x7E),
+        planes(0xFF, 0x7E),
+        planes(0x88, 0x38),
+        planes(0x35, 0x00),
+    ]
+}
+
+/// The planes as the row form: per group the scale byte, then its 8 code bytes.
+fn nvfp4_interleave(codes: &[u8], scales: &[u8]) -> Vec<u8> {
+    scales
+        .iter()
+        .zip(codes.chunks(8))
+        .flat_map(|(&s, c)| std::iter::once(s).chain(c.iter().copied()))
+        .collect()
+}
+
+/// The planes as mainline's blocks (`k` a multiple of 64): per block its four scales, then the 32 code bytes, each
+/// group's eight bytes in split order (value `j` and `j + 8` the low and high nibble of byte `j`) where the planes
+/// hold pair order (value `2i` and `2i + 1`).
+fn nvfp4_to_blocks(codes: &[u8], scales: &[u8]) -> Vec<u8> {
+    let value = |g: usize, v: usize| {
+        let byte = codes[8 * g + v / 2];
+        if v.is_multiple_of(2) {
+            byte & 0xF
+        } else {
+            byte >> 4
+        }
+    };
+    scales
+        .chunks(4)
+        .enumerate()
+        .flat_map(|(b, d)| {
+            let qs = (0..32).map(move |i| {
+                let (g, j) = (4 * b + i / 8, i % 8);
+                value(g, j) | (value(g, j + 8) << 4)
+            });
+            d.iter().copied().chain(qs).collect::<Vec<u8>>()
+        })
+        .collect()
+}
+
+/// Quantized columns of one width: values of several amplitudes, a spike over small values, and zeros.
+fn nvfp4_columns(rng: &mut Lcg, k: usize) -> Vec<Vec<u8>> {
+    let mut xs: Vec<Vec<f32>> = [1.0f32, 1e-3, 37.0, 3e4]
+        .iter()
+        .map(|&amp| (0..k).map(|_| rng.unit() * amp).collect())
+        .collect();
+    let mut spike: Vec<f32> = (0..k).map(|_| rng.unit() * 1e-3).collect();
+    spike[k / 3] = 1000.0;
+    xs.push(spike);
+    xs.push(vec![0.0; k]);
+    xs.iter()
+        .map(|x| {
+            let mut col = vec![0u8; col_bytes(GgmlType::NVFP4_ROWS, k)];
+            quantize_col(GgmlType::NVFP4_ROWS, x, &mut col);
+            col
+        })
+        .collect()
+}
+
+/// A column that need not come from the encoder: any code bytes (-128 among them, which `sign` wraps), any sums,
+/// and a finite bf16 scale a group (at most 4).
+#[cfg(target_arch = "x86_64")]
+fn nvfp4_raw_column(rng: &mut Lcg, k: usize) -> Vec<u8> {
+    let nbg = k / 128;
+    let tails = k / 32 - 4 * nbg;
+    let mut col: Vec<u8> = (0..col_bytes(GgmlType::NVFP4_ROWS, k))
+        .map(|_| rng.next_u32() as u8)
+        .collect();
+    let mut set_d = |at: usize, rng: &mut Lcg| {
+        let bits = ((rng.unit() * 4.0).to_bits() >> 16) as u16;
+        col[at..at + 2].copy_from_slice(&bits.to_le_bytes());
+    };
+    for g in 0..nbg {
+        for l in 0..4 {
+            set_d(g * 144 + 2 * l, rng);
+        }
+    }
+    for t in 0..tails {
+        set_d(nbg * 144 + 36 * t, rng);
+    }
+    col
+}
+
+/// The exact f64 dot of the row's decode (`Nvfp4Rows`, tensor scale 1) with the column's restored
+/// values, and the band the f32 kernel stays in, derived before the run. A leaf is what one fmadd
+/// adds to its lane: an integer sum (at most 16·12·128, exact in f32) times a scale that is a 4-bit
+/// significand times a bf16 activation scale (12 bits, exact), so each leaf is exact. In an x4
+/// group the lanes are combined first, so a leaf is one 16-value group's sum; in a tail block a
+/// lane holds four values, so a leaf is four. A lane takes one fmadd a group and one a tail block
+/// (`nb / 4 + nb % 4`), then three reduction levels: `n = nb / 4 + nb % 4 + 3` roundings, the band
+/// `γ_n · Σ|leaf|`. The f64 reference's own sum adds `k · 2^-53 · Σ|w · a|`.
+fn nvfp4_exact(codes: &[u8], scales: &[u8], acol: &[u8], k: usize) -> (f64, f64) {
+    let mut w = vec![0.0f32; k];
+    Nvfp4Rows::new(1.0)
+        .decode_planes(codes, scales, &mut w)
+        .expect("a row of valid scales decodes");
+    let a = restore_q82x4(acol);
+    let (mut dot, mut leaves) = (0.0f64, 0.0f64);
+    let grouped = k / 128 * 128;
+    let terms: Vec<f64> = w.iter().zip(&a).map(|(&x, &y)| f64::from(x) * y).collect();
+    for leaf in terms[..grouped]
+        .chunks(16)
+        .chain(terms[grouped..].chunks(4))
+    {
+        let sum: f64 = leaf.iter().sum();
+        dot += sum;
+        leaves += sum.abs();
+    }
+    let wa: f64 = terms.iter().map(|t| t.abs()).sum();
+    let nb = k / 32;
+    let n = (nb / 4 + nb % 4 + 3) as f64;
+    let band = n * NVFP4_U / (1.0 - n * NVFP4_U) * leaves + k as f64 * 2f64.powi(-53) * wa;
+    (dot, band)
+}
+
+/// Every entry that reads one NVFP4 row, over every row, column and width, against [`nvfp4_exact`]:
+/// the plane kernel and its scalar mirror, and `dot_row` on the row form and (at multiples of 64) on
+/// mainline's block form, which must give the plane kernel's bits (three layouts, one float order), and the
+/// plane tile over the row's columns, whose every value is the plane kernel's. A wrong nibble order, scale lane,
+/// tail or scale decode moves whole groups, far past the band.
+#[test]
+fn nvfp4_rows_dot_is_the_exact_dot_within_its_band() {
+    let mut rng = Lcg(0x4e56_4650_3420);
+    let mut worst = 0.0f64;
+    for &k in &NVFP4_KS {
+        let mut rows: Vec<(Vec<u8>, Vec<u8>)> =
+            (0..10).map(|_| nvfp4_planes(&mut rng, k)).collect();
+        rows.extend(nvfp4_end_rows(k));
+        let cols = nvfp4_columns(&mut rng, k);
+        for (r, (codes, scales)) in rows.iter().enumerate() {
+            let row_form = nvfp4_interleave(codes, scales);
+            let refs: Vec<&[u8]> = cols.iter().map(Vec::as_slice).collect();
+            let mut tile = vec![f32::NAN; refs.len()];
+            qdot::dot_nvfp4_planes_row_cols(codes, scales, &refs, k, &mut tile);
+            for (c, acol) in cols.iter().enumerate() {
+                let at = format!("k = {k} row {r} column {c}");
+                let (exact, band) = nvfp4_exact(codes, scales, acol, k);
+                let planes = qdot::dot_nvfp4_planes_row(codes, scales, acol, k);
+                let scalar = qdot::dot_nvfp4_planes_row_scalar(codes, scales, acol, k);
+                let via_row = dot_row(GgmlType::NVFP4_ROWS, &row_form, acol, k).unwrap();
+                let via_row_scalar =
+                    dot_row_scalar(GgmlType::NVFP4_ROWS, &row_form, acol, k).unwrap();
+                for (path, got) in [("planes", planes), ("scalar", scalar), ("dot_row", via_row)] {
+                    let err = (f64::from(got) - exact).abs();
+                    assert!(
+                        err <= band,
+                        "{at}: {path} {got:e} is {err:e} from the exact {exact:e}, band {band:e}"
+                    );
+                    if band > 0.0 {
+                        worst = worst.max(err / band);
+                    }
+                }
+                if k % 64 == 0 {
+                    let blocks = nvfp4_to_blocks(codes, scales);
+                    let via_blocks = dot_row(GgmlType::NVFP4, &blocks, acol, k).unwrap();
+                    let via_blocks_scalar =
+                        dot_row_scalar(GgmlType::NVFP4, &blocks, acol, k).unwrap();
+                    assert_eq!(
+                        planes.to_bits(),
+                        via_blocks.to_bits(),
+                        "{at}: mainline's block form against the planes"
+                    );
+                    assert_eq!(
+                        scalar.to_bits(),
+                        via_blocks_scalar.to_bits(),
+                        "{at}: the mirror's block form"
+                    );
+                }
+                assert_eq!(
+                    planes.to_bits(),
+                    scalar.to_bits(),
+                    "{at}: kernel against its mirror"
+                );
+                assert_eq!(
+                    planes.to_bits(),
+                    tile[c].to_bits(),
+                    "{at}: the plane tile against the planes"
+                );
+                assert_eq!(
+                    planes.to_bits(),
+                    via_row.to_bits(),
+                    "{at}: the row form against the planes"
+                );
+                assert_eq!(
+                    scalar.to_bits(),
+                    via_row_scalar.to_bits(),
+                    "{at}: the mirror's two forms"
+                );
+            }
+        }
+    }
+    println!("nvfp4 rows: worst err/band {worst:.3}");
+    assert!(worst < 1.0);
+}
+
+/// Pair order against mainline's split order, which the three layouts split between them: code bytes
+/// all `0x42` (low nibble the doubled value 2, high nibble 4), scales 1 and 2 alternating by group, a
+/// column that is 1 on even values and 0 on odd. At scale `s` a 16-value group in pair order puts
+/// its low nibbles on the even values, eight of `1 · s`: `8 s a`. In split order the low nibbles
+/// are values 0 to 7 and the high ones 8 to 15, so the even values are four of `1 · s` and four of
+/// `2 · s`: `12 s a`. Over 64 values (scales 1, 2, 1, 2) the planes and the row form give
+/// `(8 + 16) · 2 = 48 a` and mainline's block, on the same bytes, `(12 + 24) · 2 = 72 a`.
+#[test]
+fn nvfp4_layouts_read_their_own_nibble_order() {
+    let k = 64;
+    let d = [0x38u8, 0x40, 0x38, 0x40];
+    let (codes, scales) = (vec![0x42u8; 32], d.to_vec());
+    let x: Vec<f32> = (0..k).map(|v| if v % 2 == 0 { 1.0 } else { 0.0 }).collect();
+    let mut col = vec![0u8; col_bytes(GgmlType::NVFP4_ROWS, k)];
+    quantize_col(GgmlType::NVFP4_ROWS, &x, &mut col);
+    let a = restore_q82x4(&col)[0];
+    assert!(a > 0.0);
+
+    let (exact, band) = nvfp4_exact(&codes, &scales, &col, k);
+    assert!(
+        (exact / a - 48.0).abs() < 1e-9,
+        "the reference decode reads pair order: {} a",
+        exact / a
+    );
+    let row = nvfp4_interleave(&codes, &scales);
+    for (path, got) in [
+        (
+            "planes",
+            qdot::dot_nvfp4_planes_row(&codes, &scales, &col, k),
+        ),
+        (
+            "scalar",
+            qdot::dot_nvfp4_planes_row_scalar(&codes, &scales, &col, k),
+        ),
+        (
+            "rows",
+            dot_row(GgmlType::NVFP4_ROWS, &row, &col, k).unwrap(),
+        ),
+    ] {
+        assert!(
+            (f64::from(got) - 48.0 * a).abs() <= band,
+            "{path}: {got:e}, pair order wants {:e}, split order {:e}",
+            48.0 * a,
+            72.0 * a
+        );
+    }
+
+    let block = nvfp4_block(d, |_| 0x42);
+    let (exact, v_abs) = nvfp4_block_exact(&block, &col, k);
+    assert!(
+        (exact / a - 72.0).abs() < 1e-9,
+        "mainline's decode reads split order: {} a",
+        exact / a
+    );
+    let got = dot_row(GgmlType::NVFP4, &block, &col, k).unwrap();
+    assert!(
+        (f64::from(got) - 72.0 * a).abs() <= nvfp4_block_band(k, v_abs),
+        "block: {got:e}, split order wants {:e}, pair order {:e}",
+        72.0 * a,
+        48.0 * a
+    );
+}
+
+/// Every byte at every scale position, in a row of one group (eight scales) and one with a tail
+/// (ten): a byte up to 0x7E is a scale and the dot stays within its band, any other byte (bit 7
+/// set, or 0x7F, E4M3's NaN) makes the dot NaN exactly where `Nvfp4Rows` refuses the row, through
+/// the plane kernel, its mirror, its tile and every form.
+#[test]
+fn nvfp4_rows_scale_bytes_poison_the_row_when_they_are_no_scale() {
+    let mut rng = Lcg(0x0053_4341_4c45);
+    for k in [128usize, 160] {
+        let codes: Vec<u8> = (0..k / 2).map(|_| rng.next_u32() as u8).collect();
+        let x: Vec<f32> = (0..k).map(|_| rng.unit()).collect();
+        let mut col = vec![0u8; col_bytes(GgmlType::NVFP4_ROWS, k)];
+        quantize_col(GgmlType::NVFP4_ROWS, &x, &mut col);
+        for at in 0..k / 16 {
+            for byte in 0..=255u8 {
+                let mut scales = vec![0x38u8; k / 16];
+                scales[at] = byte;
+                let row_form = nvfp4_interleave(&codes, &scales);
+                let mut got = vec![
+                    qdot::dot_nvfp4_planes_row(&codes, &scales, &col, k),
+                    qdot::dot_nvfp4_planes_row_scalar(&codes, &scales, &col, k),
+                    dot_row(GgmlType::NVFP4_ROWS, &row_form, &col, k).unwrap(),
+                    dot_row_scalar(GgmlType::NVFP4_ROWS, &row_form, &col, k).unwrap(),
+                ];
+                if k % 64 == 0 {
+                    let blocks = nvfp4_to_blocks(&codes, &scales);
+                    got.push(dot_row(GgmlType::NVFP4, &blocks, &col, k).unwrap());
+                    got.push(dot_row_scalar(GgmlType::NVFP4, &blocks, &col, k).unwrap());
+                }
+                let mut tile = [0.0f32; 2];
+                qdot::dot_nvfp4_planes_row_cols(
+                    &codes,
+                    &scales,
+                    &[&col[..], &col[..]],
+                    k,
+                    &mut tile,
+                );
+                got.extend(tile);
+                let mut w = vec![0.0f32; k];
+                let refused = Nvfp4Rows::new(1.0)
+                    .decode_planes(&codes, &scales, &mut w)
+                    .is_err();
+                assert_eq!(
+                    refused,
+                    byte > 0x7E,
+                    "k = {k} scale {at} byte {byte:#04x}: the decode's refusal"
+                );
+                if refused {
+                    assert!(
+                        got.iter().all(|g| g.is_nan()),
+                        "k = {k} scale {at} byte {byte:#04x}: {got:?} is no NaN"
+                    );
+                } else {
+                    let (exact, band) = nvfp4_exact(&codes, &scales, &col, k);
+                    for g in got {
+                        assert!(
+                            (f64::from(g) - exact).abs() <= band,
+                            "k = {k} scale {at} byte {byte:#04x}: {g:e} against {exact:e}, band {band:e}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The type's entries and its row agree: Q8_2_X4 columns of MXFP4's shape and bytes, 32-value granularity, no
+/// `dot_row_cols` tile (the planes have their own, `dot_nvfp4_planes_row_cols`), `dot_row`'s named refusals, and
+/// the plane entries, which panic by name on a layout or a tile shape they cannot read.
+#[test]
+fn nvfp4_rows_entries_and_refusals() {
+    let ty = GgmlType::NVFP4_ROWS;
+    assert!(supports(ty) && qdot::fuses(ty, 32) && !qdot::fuses(ty, 48));
+    assert_eq!(qdot::k_granularity(ty), 32);
+    assert!(!qdot::has_tile(ty));
+    assert_eq!(activation_format(ty), Ok(Some(ActivationFormat::Q8_2X4)));
+    let mut rng = Lcg(0x454e_5452);
+    for k in [32, 64, 96, 128, 160, 4128] {
+        assert_eq!(col_bytes(ty, k), col_bytes(GgmlType::MXFP4, k), "k = {k}");
+        let x: Vec<f32> = (0..k).map(|_| rng.unit()).collect();
+        let (mut a, mut b) = (vec![0u8; col_bytes(ty, k)], vec![0u8; col_bytes(ty, k)]);
+        quantize_col(ty, &x, &mut a);
+        quantize_col(GgmlType::MXFP4, &x, &mut b);
+        assert_eq!(a, b, "k = {k}: MXFP4's column");
+        if k % 64 == 0 {
+            let mut c = vec![0u8; col_bytes(GgmlType::NVFP4, k)];
+            quantize_col(GgmlType::NVFP4, &x, &mut c);
+            assert_eq!(a, c, "k = {k}: mainline's block takes the same column");
+        }
+    }
+    let (codes, scales) = nvfp4_planes(&mut rng, 64);
+    let row = nvfp4_interleave(&codes, &scales);
+    let col = nvfp4_columns(&mut rng, 64).remove(0);
+    assert_eq!(
+        dot_row(ty, &row, &col, 48),
+        Err(QdotError::UnalignedK { k: 48, gran: 32 })
+    );
+    assert_eq!(
+        dot_row(ty, &row[..35], &col, 64),
+        Err(QdotError::ShortWeightRow {
+            have: 35,
+            need: 36,
+            k: 64
+        })
+    );
+    assert_eq!(
+        dot_row(ty, &row, &col[..col.len() - 1], 64),
+        Err(QdotError::ShortActivationCol {
+            have: col.len() - 1,
+            need: col.len(),
+            k: 64
+        })
+    );
+    let outs = [&col[..], &col[..]];
+    let mut cols = [0.0f32; 2];
+    qdot::dot_row_cols(ty, &row, &outs, 64, &mut cols).unwrap();
+    assert_eq!(cols, [dot_row(ty, &row, &col, 64).unwrap(); 2]);
+
+    let panic_text = |f: &dyn Fn() -> f32| -> String {
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        match r.expect_err("the plane entry must refuse") {
+            e if e.is::<String>() => *e.downcast::<String>().unwrap(),
+            e => (*e.downcast::<&str>().unwrap()).to_owned(),
+        }
+    };
+    let run = |c: &[u8], s: &[u8], a: &[u8], k: usize| qdot::dot_nvfp4_planes_row(c, s, a, k);
+    for (what, text) in [
+        (
+            "an unaligned k",
+            panic_text(&|| run(&codes, &scales, &col, 48)),
+        ),
+        (
+            "a short code plane",
+            panic_text(&|| run(&codes[..31], &scales, &col, 64)),
+        ),
+        (
+            "a short scale plane",
+            panic_text(&|| run(&codes, &scales[..3], &col, 64)),
+        ),
+        (
+            "a short column",
+            panic_text(&|| run(&codes, &scales, &col[..col.len() - 1], 64)),
+        ),
+    ] {
+        assert!(text.contains("dot_nvfp4_planes_row"), "{what}: {text}");
+    }
+
+    // The tile entry: a column count outside 1..=TILE_COLS and an output of another length are its own refusals, a
+    // plane or any column's shape the plane entry's.
+    let tile = |cols: &[&[u8]], outs: usize, k: usize, codes: &[u8], scales: &[u8]| {
+        let mut out = vec![0.0f32; outs];
+        qdot::dot_nvfp4_planes_row_cols(codes, scales, cols, k, &mut out);
+        out[0]
+    };
+    let nine = vec![&col[..]; qdot::TILE_COLS + 1];
+    let short = &col[..col.len() - 1];
+    for (what, text, name) in [
+        (
+            "no columns",
+            panic_text(&|| tile(&[], 0, 64, &codes, &scales)),
+            "dot_nvfp4_planes_row_cols",
+        ),
+        (
+            "more than TILE_COLS columns",
+            panic_text(&|| tile(&nine, nine.len(), 64, &codes, &scales)),
+            "dot_nvfp4_planes_row_cols",
+        ),
+        (
+            "an output of another length",
+            panic_text(&|| tile(&[&col[..], &col[..]], 3, 64, &codes, &scales)),
+            "dot_nvfp4_planes_row_cols",
+        ),
+        (
+            "a short second column",
+            panic_text(&|| tile(&[&col[..], short], 2, 64, &codes, &scales)),
+            "dot_nvfp4_planes_row",
+        ),
+        (
+            "a short code plane",
+            panic_text(&|| tile(&[&col[..], &col[..]], 2, 64, &codes[..31], &scales)),
+            "dot_nvfp4_planes_row",
+        ),
+        (
+            "an unaligned k",
+            panic_text(&|| tile(&[&col[..], &col[..]], 2, 48, &codes, &scales)),
+            "dot_nvfp4_planes_row",
+        ),
+    ] {
+        assert!(text.contains(name), "{what}: {text}");
+    }
+}
+
+/// The AVX2 plane kernel against its mirror, bit for bit, on columns that need not come from the
+/// encoder (any codes, including -128, which `sign` wraps; finite bf16 scales; any sums) and on
+/// encoder columns at the model widths, with every scale of the format, and the row form's kernel
+/// and mainline's block form's against the planes'. A row holding a byte that is no scale is NaN in all.
+#[cfg(target_arch = "x86_64")]
+#[test]
+#[ignore = "hw: needs the box (AVX2)"]
+fn hw_nvfp4_rows_avx2_is_its_scalar_mirror() {
+    let mut rng = Lcg(0x4156_5832);
+    let same = |a: f32, b: f32| a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan());
+    for &k in &NVFP4_KS {
+        let mut cols = nvfp4_columns(&mut rng, k);
+        cols.extend((0..4).map(|_| nvfp4_raw_column(&mut rng, k)));
+        let mut rows: Vec<(Vec<u8>, Vec<u8>)> =
+            (0..12).map(|_| nvfp4_planes(&mut rng, k)).collect();
+        rows.extend(nvfp4_end_rows(k));
+        let mut bad = nvfp4_planes(&mut rng, k);
+        let last = bad.1.len() - 1;
+        bad.1[last] = 0x7F;
+        rows.push(bad);
+        for (r, (codes, scales)) in rows.iter().enumerate() {
+            let row_form = nvfp4_interleave(codes, scales);
+            for (c, acol) in cols.iter().enumerate() {
+                let at = format!("k = {k} row {r} column {c}");
+                let avx = qdot::dot_nvfp4_planes_row_avx2(codes, scales, acol, k);
+                let mirror = qdot::dot_nvfp4_planes_row_scalar(codes, scales, acol, k);
+                let form = dot_row_avx2(GgmlType::NVFP4_ROWS, &row_form, acol, k).unwrap();
+                assert!(
+                    same(avx, mirror),
+                    "{at}: AVX2 {avx:e} against the mirror {mirror:e}"
+                );
+                assert!(
+                    same(form, avx),
+                    "{at}: the row form {form:e} against the planes {avx:e}"
+                );
+                if k % 64 == 0 {
+                    let blocks = nvfp4_to_blocks(codes, scales);
+                    let block = dot_row_avx2(GgmlType::NVFP4, &blocks, acol, k).unwrap();
+                    assert!(
+                        same(block, avx),
+                        "{at}: mainline's block {block:e} against the planes {avx:e}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// The plane tile against the plane kernel, bit for bit: at every width of [`NVFP4_KS`], random rows, the format's
+/// end rows and rows holding a byte that is no scale (NaN in every column; one in the first group, one in the last
+/// scale), against the encoder's columns and raw ones (any codes, any sums), at every column count `1..=TILE_COLS`
+/// with the columns rotated so each tile slot meets each column. A slot holds a payload no dot has until the tile
+/// writes it, so a slot left unwritten, one that reads another's column, a tail, a scale lane or a poison check done
+/// wrong shows as a differing bit; the band to the exact dot is `nvfp4_rows_dot_is_the_exact_dot_within_its_band`'s.
+#[cfg(target_arch = "x86_64")]
+#[test]
+#[ignore = "hw: needs the box (AVX2)"]
+fn hw_nvfp4_planes_tile_matches_the_column_kernel() {
+    assert!(
+        std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma"),
+        "the tile runs with AVX2 and FMA only; without them this clause would compare the column kernel with itself"
+    );
+    const UNWRITTEN: f32 = f32::from_bits(0x7FC0_0001);
+    let mut rng = Lcg(0x4e56_5449_4c45);
+    let mut calls = 0usize;
+    for &k in &NVFP4_KS {
+        let mut cols = nvfp4_columns(&mut rng, k);
+        cols.extend((0..4).map(|_| nvfp4_raw_column(&mut rng, k)));
+        let mut rows: Vec<(Vec<u8>, Vec<u8>)> = (0..6).map(|_| nvfp4_planes(&mut rng, k)).collect();
+        rows.extend(nvfp4_end_rows(k));
+        for (at, byte) in [(0, 0x80), (k / 16 - 1, 0x7F)] {
+            let mut bad = nvfp4_planes(&mut rng, k);
+            bad.1[at] = byte;
+            rows.push(bad);
+        }
+        for (r, (codes, scales)) in rows.iter().enumerate() {
+            let want: Vec<f32> = cols
+                .iter()
+                .map(|a| qdot::dot_nvfp4_planes_row_avx2(codes, scales, a, k))
+                .collect();
+            for c in 1..=qdot::TILE_COLS {
+                for shift in 0..cols.len() {
+                    let pick: Vec<usize> = (0..c).map(|j| (shift + j) % cols.len()).collect();
+                    let refs: Vec<&[u8]> = pick.iter().map(|&p| cols[p].as_slice()).collect();
+                    let mut out = vec![UNWRITTEN; c];
+                    qdot::dot_nvfp4_planes_row_cols(codes, scales, &refs, k, &mut out);
+                    for (j, (&got, &p)) in out.iter().zip(&pick).enumerate() {
+                        assert_eq!(
+                            got.to_bits(),
+                            want[p].to_bits(),
+                            "k = {k} row {r} c = {c} shift {shift} slot {j} (column {p}): tile {got:e} \
+                             against the column kernel {:e}",
+                            want[p]
+                        );
+                    }
+                    calls += 1;
+                }
+            }
+        }
+    }
+    eprintln!("nvfp4 planes tile: {calls} calls, c = 1..=8, bit-identical to the column kernel");
+}
+
+// ------------------------------------------------- NVFP4 rows' codes in block order
+// `nvfp4_codes_to_blocks` (AVX2 where the machine has it) and its scalar mirror against the
+// per-value rule written out here: decode each group's 16 values in the rows' order, then write
+// them in the block's order. Lengths of 0, 8, 24 (a tail alone), 32, 40 (a step and a tail) and one
+// expert's gate row bytes at K = 6,144.
+
+/// Group `g`'s 16 code values of NVFP4 rows' bytes: value `2i` the low nibble of byte `i`, `2i + 1`
+/// its high nibble.
+fn nvfp4_rows_values(group: &[u8]) -> [u8; 16] {
+    std::array::from_fn(|v| (group[v / 2] >> (4 * (v % 2))) & 0x0f)
+}
+
+/// Block-ordered bytes `nvfp4_codes_to_blocks` writes, and its scalar mirror, equal the per-value
+/// rule over random bytes; a refusal writes nothing. Mutant: the AVX2 body's `unpacklo_epi64`
+/// swapped for `unpackhi_epi64` — every 32-byte step differs, the scalar arm stays green.
+#[test]
+fn nvfp4_codes_to_blocks_follows_the_value_rule() {
+    let mut rng = Rng(0x0DD5_EED5_0000_0004);
+    for len in [0usize, 8, 24, 32, 40, 3072] {
+        let src = random_bytes(&mut rng, len);
+        let mut want = vec![0u8; len];
+        for (g, o) in src
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .zip(want.as_chunks_mut::<8>().0.iter_mut())
+        {
+            let v = nvfp4_rows_values(g);
+            for (j, b) in o.iter_mut().enumerate() {
+                *b = v[j] | (v[j + 8] << 4);
+            }
+        }
+        let mut got = vec![0xA5u8; len];
+        qdot::nvfp4_codes_to_blocks(&src, &mut got).unwrap();
+        assert!(
+            got == want,
+            "{len} bytes: the dispatch differs from the value rule at byte {:?}",
+            first_diff(&got, &want)
+        );
+        let mut scalar = vec![0x5Au8; len];
+        qdot::nvfp4_codes_to_blocks_scalar(&src, &mut scalar).unwrap();
+        assert!(
+            scalar == want,
+            "{len} bytes: the scalar mirror differs from the value rule at byte {:?}",
+            first_diff(&scalar, &want)
+        );
+    }
+    let src = random_bytes(&mut rng, 16);
+    let mut dst = [0xA5u8; 16];
+    assert_eq!(
+        qdot::nvfp4_codes_to_blocks(&src[..12], &mut dst[..12]),
+        Err(QdotError::UnalignedK { k: 24, gran: 16 })
+    );
+    assert_eq!(
+        qdot::nvfp4_codes_to_blocks(&src, &mut dst[..8]),
+        Err(QdotError::RowGroupBytes {
+            buf: "nvfp4 codes destination",
+            have: 8,
+            need: 16,
+        })
+    );
+    assert!(dst.iter().all(|&b| b == 0xA5), "a refusal wrote into dst");
 }

@@ -39,6 +39,7 @@ use bloomery_gpu::card_experts::{CardBatch, CardExperts, CardFamily};
 use bloomery_gpu::gemm::{Gemm32Kernels, GemmInput, GemmKernels, GemmRoute};
 use bloomery_gpu::host::leg_tier::TierSide;
 use bloomery_gpu::host::run::HostRun;
+use bloomery_gpu::host::xstream::{LandBatch, RingLayer};
 use bloomery_gpu::hybrid::{BatchKey, Boundary, Hybrid, SlotMap};
 use bloomery_gpu::kquant::Act;
 use bloomery_gpu::model::agreed;
@@ -200,7 +201,7 @@ impl SharedWide {
         Ok(SharedWide {
             gemm: GemmKernels::load(gpu.context())?,
             route: GemmRoute::new(stream, cap, 1)?,
-            x: WideActs::new(stream, WideActs::wants_of(gate_up), cap, embd)?,
+            x: WideActs::new(stream, WideActs::wants_of(gate_up).without_f32(), cap, embd)?,
             h: WideActs::new(stream, WideActs::wants_of(down), cap, ff)?,
             g: DeviceBuffer::zeroed(stream, cap * ff)?,
             u: DeviceBuffer::zeroed(stream, cap * ff)?,
@@ -261,7 +262,7 @@ impl SharedWide {
             x: &input,
             gate: g,
             up: u,
-            rows: h.swiglu_rows(None),
+            rows: h.swiglu_rows(),
             y,
         };
         site::gated(gpu, &kernels, &block, (m, m), io, fault)
@@ -663,6 +664,13 @@ impl<R: RouterEntry> Routed<R> {
         })
     }
 
+    /// Layer `l` computes routed experts on the card: the layers a
+    /// residency machine holds stage stacks of.
+    #[must_use]
+    pub fn card_has(&self, l: usize) -> bool {
+        self.card.has(l)
+    }
+
     /// The experts of layer `l` the expert tier holds: 0 off the tier, and on
     /// every layer of a load with none.
     #[must_use]
@@ -696,6 +704,18 @@ impl<R: RouterEntry> Routed<R> {
     #[must_use]
     pub fn batch_bytes(&self) -> usize {
         self.batch.as_ref().map_or(0, BatchBufs::bytes)
+    }
+
+    /// The ring pass's GEMM buffers of the batch's card experts for a half of
+    /// `half_slots` slots of the expert stream's ring
+    /// ([`CardExperts::arm_ring`]), made when the stream starts. Nothing on a
+    /// load with no batch or no card experts in it: the ring pass then
+    /// refuses by name.
+    pub fn arm_ring(&mut self, gpu: &Gpu, half_slots: usize) -> Result<(), GpuError> {
+        match self.batch.as_mut().and_then(|b| b.card.as_mut()) {
+            Some(cb) => self.card.arm_ring(gpu, cb, half_slots),
+            None => Ok(()),
+        }
     }
 
     /// The last token's routed expert ids, in router rank order: the picks
@@ -896,9 +916,9 @@ pub fn dense<R: RouterEntry>(
 }
 
 /// The batch: the parts of a unit of `m` rows, the step's launches over its
-/// rows. A unit runs `front_rows`, `download`, `shadow_rows` and `back_rows`
-/// in that order, no other unit's `front_rows` between the first two and the
-/// next two.
+/// rows. A unit runs `front_rows`, `download`, `shadow_rows` (or its two
+/// halves, `shared_rows` then `card_rows`) and `back_rows` in that order, no
+/// other unit's `front_rows` between the first two and the next two.
 impl<R: RouterEntry> Routed<R> {
     /// Layer `l`'s `ffn_norm` of the unit's `m` rows of the residual `x1` and
     /// the router over them, into the batch's buffers.
@@ -959,10 +979,23 @@ impl<R: RouterEntry> Routed<R> {
 
     /// Layer `l`'s shared expert and, where the slot map puts any, card
     /// experts over the `m` rows [`Routed::front_rows`] wrote, under the host
-    /// leg: the shared expert's rows (per column below [`GATED_FROM`] rows, on
-    /// `site::gated` from it), `x1s = x1 + shared`, and the card sum plus
-    /// `x1s`.
+    /// leg: [`Routed::shared_rows`], then [`Routed::card_rows`] with no
+    /// landing to wait for.
     pub fn shadow_rows(
+        &mut self,
+        gw: (&Gpu, &Weights),
+        lm: (usize, usize),
+        x1: &DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        self.shared_rows(gw, lm, x1)?;
+        self.card_rows(gw, lm, (&[], None))
+    }
+
+    /// Layer `l`'s shared expert over the `m` rows [`Routed::front_rows`]
+    /// wrote: the shared expert's rows (per column below [`GATED_FROM`] rows,
+    /// on `site::gated` from it) and `x1s = x1 + shared`, the base
+    /// [`Routed::card_rows`] adds the card sum to.
+    pub fn shared_rows(
         &mut self,
         (gpu, w): (&Gpu, &Weights),
         (l, m): (usize, usize),
@@ -971,8 +1004,6 @@ impl<R: RouterEntry> Routed<R> {
         let Routed {
             layers,
             k,
-            route,
-            card,
             rules,
             shared_ff,
             block,
@@ -1007,15 +1038,54 @@ impl<R: RouterEntry> Routed<R> {
             )?;
         }
         gpu.elem()
-            .enqueue_add(gpu.stream(), x1, &b.sh, m * n, &mut b.x1s)?;
+            .enqueue_add(gpu.stream(), x1, &b.sh, m * n, &mut b.x1s)
+    }
+
+    /// Layer `l`'s card experts, where the slot map puts any, over the `m`
+    /// rows [`Routed::front_rows`] wrote: the card sum plus the base
+    /// [`Routed::shared_rows`] wrote, after the engine stream has waited each
+    /// landing batch's event of the layer's pick (`land`, the residency
+    /// machine's admits into the stage stacks, which the slot map's card
+    /// copy the route reads names already). One route over the whole map,
+    /// each slot's rows the step's under the same map. With the expert
+    /// stream's `ring` of the layer (a walk under `split`) the streamed
+    /// experts' slots run over the ring's half into the same card sum, one
+    /// GEMM batch a landing batch of the ring, each behind its own batch's
+    /// copies, so a batch computes while the next lands
+    /// ([`RouteBlock::card_rows_ring`]); the host's sum leaves them out.
+    pub fn card_rows(
+        &mut self,
+        (gpu, w): (&Gpu, &Weights),
+        (l, m): (usize, usize),
+        (land, ring): (&[LandBatch], Option<&RingLayer>),
+    ) -> Result<(), GpuError> {
+        let Routed {
+            route,
+            card,
+            rules,
+            batch,
+            k,
+            ..
+        } = self;
+        let b = batch.as_mut().ok_or_else(no_batch)?;
+        b.check(l, m)?;
+        for event in land.iter().filter_map(|lb| lb.event.as_deref()) {
+            gpu.stream().wait(event)?;
+        }
         let rule = rules.0;
-        route.card_rows(
-            (gpu, w),
-            (card, b.card.as_mut()),
-            (l, m),
-            (&b.x1s, rule),
-            (&b.normed, &b.weights, &b.ids),
-        )?;
+        let cb = b.card.as_mut();
+        let rows = (&b.normed, &b.weights, &b.ids);
+        match ring {
+            Some(r) => route.card_rows_ring(
+                (gpu, w, &k.g32),
+                (card, cb),
+                (l, m),
+                (&b.x1s, rule),
+                rows,
+                r,
+            )?,
+            None => route.card_rows((gpu, w), (card, cb), (l, m), (&b.x1s, rule), rows)?,
+        }
         if card.tier_k(l) == 0 {
             return Ok(());
         }

@@ -714,15 +714,20 @@ pub fn std_normal_cdf(z: f64) -> f64 {
     if z >= 0.0 { 1.0 - tail } else { tail }
 }
 
-/// The standard deviation, in logit units, of one id's logit between two
+/// V4.1's standard deviation, in logit units, of one id's logit between two
 /// independent implementations of one quantized model.
 ///
-/// [derived]: the family's σ of an engine's top1-top2 margin against the
-/// exact one is 0.35 (the exact-forced diagnostic of `gate-gpu-e2e`, rig-log
-/// plan 「모델」: 0.35 scalar, 0.36 MMA); a margin is the difference of two
-/// logits, so one logit's error is σ/√2 and two implementations' difference
-/// of it is σ again.
-pub const SIGMA_LOGIT: f64 = 0.35;
+/// [derived]: V4.1's σ of an engine's top1-top2 margin against the exact one
+/// is 0.35 (the exact-forced diagnostic of `gate-gpu-e2e`, rig-log plan
+/// 「모델」: 0.35 scalar, 0.36 MMA); a margin is the difference of two logits,
+/// so one logit's error is σ/√2 and two implementations' difference of it is
+/// σ again.
+///
+/// It is measured for V4.1 alone. A family's gate states its own σ in its
+/// description (`Gate::sigma_logit` of the end-to-end gates, `Case::sigma_logit`
+/// of the prefill clauses) and carries this value there until its own is
+/// measured.
+pub const SIGMA_LOGIT_V41: f64 = 0.35;
 
 /// The f64 log-softmax of a logits row.
 #[must_use]
@@ -740,17 +745,17 @@ pub fn log_softmax(row: &[f32]) -> Vec<f64> {
 }
 
 /// The standard deviation of one id's log-probability between two
-/// implementations, by its probability `p` in the row compared against and
-/// that row's `Σ p²` (`sq`).
+/// implementations of a family whose logit differs by `sigma`, by its
+/// probability `p` in the row compared against and that row's `Σ p²` (`sq`).
 ///
 /// [derived]: `Δlp_i = Δl_i − Σ_j p_j·Δl_j` (the log-sum-exp moves by the
 /// probability-weighted logit moves); with each logit's difference
-/// independent at [`SIGMA_LOGIT`], `Var = σ²·(1 − 2·p_i + Σ_j p_j²)`, at most
-/// `2σ²`. A common shift of every logit cancels in the log-softmax, so
-/// correlated logit errors only lower it.
+/// independent at `sigma`, `Var = σ²·(1 − 2·p_i + Σ_j p_j²)`, at most `2σ²`. A
+/// common shift of every logit cancels in the log-softmax, so correlated
+/// logit errors only lower it.
 #[must_use]
-pub fn sigma_lp(p: f64, sq: f64) -> f64 {
-    SIGMA_LOGIT * (1.0 - 2.0 * p + sq).max(0.0).sqrt()
+pub fn sigma_lp(sigma: f64, p: f64, sq: f64) -> f64 {
+    sigma * (1.0 - 2.0 * p + sq).max(0.0).sqrt()
 }
 
 /// The bound on the worst |z| of `n` ids: the `k` at which `n` two-sided
@@ -988,6 +993,24 @@ mod tests {
         assert_eq!(r.actual_ge_floor, 1);
 
         assert_eq!(sigma_forced(&[vec![]], &[vec![]], &exact[..1], 0.5), None);
+    }
+
+    /// The band's σ is the family's, an argument: `sigma_lp` is that σ times the
+    /// row's spread `√(1 − 2p + Σp²)` (a half-and-half row: `p = sq = 0.5`, a
+    /// spread of `√0.5`), and a larger σ gives a wider band. Mutant: the V4.1
+    /// value in place of the argument, which puts the 0.2 and 0.7 rows below
+    /// out of band.
+    #[test]
+    fn sigma_lp_is_the_given_sigma_times_the_rows_spread() {
+        let (p, sq) = (0.5, 0.5);
+        let spread = 0.5f64.sqrt();
+        for sigma in [0.2, SIGMA_LOGIT_V41, 0.7] {
+            assert!(
+                (sigma_lp(sigma, p, sq) - sigma * spread).abs() < 1e-12,
+                "sigma {sigma}"
+            );
+        }
+        assert!(sigma_lp(0.7, p, sq) > sigma_lp(0.2, p, sq));
     }
 
     /// Φ against tabulated values, both tails.

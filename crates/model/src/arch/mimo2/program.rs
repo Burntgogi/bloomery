@@ -344,6 +344,7 @@ mod tests {
                 yarn: None,
             },
             qk_norm: false,
+            o_norm: false,
             out_gate: OutGate::None,
             select: None,
             window,
@@ -380,6 +381,8 @@ mod tests {
             top_k: 8,
             expert_ff: 2048,
             latent: None,
+            pre_exp_norm: false,
+            post_exp_norm: None,
             act: Act::SwiGlu { limit: None },
             router: Router {
                 score: Score::Sigmoid,

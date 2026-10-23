@@ -44,6 +44,9 @@ pub enum ResidualKind {
     Plain,
     /// Hyper-connection streams around every sub-layer.
     Hc,
+    /// The plain stream with each sub-layer's input and output scaled by its
+    /// own learned constants.
+    AlphaBeta,
 }
 
 /// One layer's sub-layer programs.
@@ -73,6 +76,7 @@ impl Layer {
             residual: match spec.residual {
                 Residual::Plain => ResidualKind::Plain,
                 Residual::Hc => ResidualKind::Hc,
+                Residual::AlphaBeta { .. } => ResidualKind::AlphaBeta,
             },
         }
     }
@@ -183,6 +187,8 @@ mod tests {
                         top_k: 8,
                         expert_ff: 2048,
                         latent: None,
+                        pre_exp_norm: false,
+                        post_exp_norm: None,
                         act,
                         router: Router {
                             score: Score::Sigmoid,

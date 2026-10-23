@@ -188,10 +188,11 @@
 //!   total, and the second sequence does not fit past the first (the auto
 //!   default spent the card's free bytes on the one-sequence cache): the
 //!   server never listens, which the clause names as the split's check red;
-//!   a placed load kept on the turns leaves the placed arm's (v2) and (v3)
-//!   red and its round clause's `placed_slots_rounds_hold_a_round_of_both`
-//!   red, no `placed slots` line, and `ctx_default`'s placed arm's
-//!   `placed_slots_are_resident` and `placed_ctx_is_the_plans_ctx_max` red.
+//!   a placed load kept on the turns leaves the placed arm's (v2)
+//!   `placed_slots_rounds_carry_both_slots` at ~1.0 and
+//!   `placed_slots_rounds_run_one_pass` red (`passes=rows`). The hold
+//!   clause still sees a record of `rows=2`, and `placed_slots_are_resident`
+//!   and `placed_ctx_is_the_plans_ctx_max` do not move.
 //! - `slots_set_total_is_its_whole_fit`, the whole slots arm: its one
 //!   whole-fit line is at the arm's set total `t` and says the load fits. The
 //!   line's need less its cache term is the rest no context moves, and the
@@ -204,20 +205,20 @@
 //!   puts its line at half the total.
 //! - `slots_rounds_run_one_pass`, on both arms (a qwen3moe file's `Body`, a
 //!   qwen35moe file's `Body35`), and the seat's `parallel` line names the
-//!   shape the open decided. The no-flag arm is one pass when it prints no
-//!   plan (`slots_parallel_line_names_one_pass`: the whole model) and turns
-//!   when it prints one (`slots_parallel_line_names_turns`: the whole load
-//!   does not fit, so `qwen3::pass_of` names the fallback loop). The placed
-//!   arm (`placed_slots_parallel_line_names_turns`) is that loop. FAIL-first:
-//!   the word printed flipped, red on the arm and on the one-slot arm's
-//!   `one_slot_parallel_line_names_one_pass`. A server
+//!   shape the open decided. Both arms are one pass
+//!   (`slots_parallel_line_names_one_pass`,
+//!   `placed_slots_parallel_line_names_one_pass`): a placed load serves
+//!   several slots' rows as one pass (`Body3::serves_one_pass`), and a
+//!   printed plan does not name turns. The lookup draft stays turns in
+//!   `pass_of` and is not this clause. FAIL-first: the word `turns`, red
+//!   on that arm. A server
 //!   of `--parallel 2` under `BLOOMERY_STEP_STATS=1` prints a `slots round`
 //!   record a round of several slots — two greedy streamed requests of the
 //!   slots clause's prompts, each first run alone on that server and then
 //!   both together — and over the together run every record holds the
 //!   shape the line named: `passes=1` over `rows` of 2..=`MAX_TOKENS` on
-//!   `slots=2` when the arm printed no plan (`slots_rounds_run_one_pass`),
-//!   and `passes=rows` when it printed one (`slots_rounds_run_in_turn`);
+//!   `slots=2` (`slots_rounds_run_one_pass`, and
+//!   `placed_slots_rounds_run_one_pass` on the placed arm);
 //!   the window holds a round of both
 //!   (`slots_rounds_hold_a_round_of_both`: at least one record of `rows=2`)
 //!   — the one thing the records can see of both advancing in the same
@@ -231,10 +232,9 @@
 //!   records and the two prompt-call bookings) prints beside it,
 //!   unpinned: a round server's solo rounds are the two requests'
 //!   admission skew and its mirror at the tail, a race the worker counts
-//!   in passes, which no code bounds. No pass-count condition on the
-//!   clause (the placed arm steps
-//!   in turn inside a round, `passes=rows`, by design, and the whole
-//!   arm's one pass is the clause above's own pin); and the rows the
+//!   in passes, which no code bounds. The hold clause is not a pass-count
+//!   pin (a turns mutant still prints a record of `rows=2`; the pass count
+//!   is `slots_rounds_run_one_pass`); and the rows the
 //!   records carry plus
 //!   the solo rounds between them (a round of one row is a select and a
 //!   `next`, no record; their count the `/metrics` `n_decode_total` deltas
@@ -245,12 +245,12 @@
 //!   (`slots_rounds_rows_sum_the_decoded_tokens`). The same clause on the
 //!   placed arm (`slots-rounds-placed`,
 //!   `--place a` under the slots clause's budget, the lever on too) holds
-//!   `passes=rows`, the default loop (`placed_slots_rounds_run_in_turn`),
+//!   `passes=1` (`placed_slots_rounds_run_one_pass`),
 //!   and its window holds a round of both
 //!   (`placed_slots_rounds_hold_a_round_of_both`).
-//!   FAIL-first: a load that prints no plan and `passes=rows` is red on
-//!   `slots_rounds_run_one_pass`; a load that prints a plan and `passes=1`
-//!   is red on `slots_rounds_run_in_turn`. A seat that serves one slot at a
+//!   FAIL-first: a together record of `passes=rows`, or the word `turns`,
+//!   is red on `slots_rounds_run_one_pass` or
+//!   `placed_slots_rounds_run_one_pass`. A seat that serves one slot at a
 //!   time prints no record of both and the hold clause is red on both arms,
 //!   while a server that only stretches one-slot runs between two-row rounds
 //!   is the (v2) busy ratio's red, not the records'.
@@ -489,6 +489,15 @@
 //! `bloomery_placement::placement::ctx_ask`'s tests; a set share past the
 //! file's limit, by `bloomery_placement::placement::ctx`'s.
 //!
+//! - `mtp_ids_match_the_plain_path`: on a file whose header carries the in-file
+//!   next-token layer, greedy output under `BLOOMERY_DRAFT=mtp` equals the same
+//!   prompt under `BLOOMERY_DRAFT=off` for [`MTP_N`] tokens, and the drafted
+//!   completion's `draft_n_accepted` is above 0. A file without the layer prints
+//!   that the clause is pinned to [`MTP_FILE`] and starts no second server. The
+//!   pinned file with no layer is red. FAIL-first: dropping the id compare leaves
+//!   a draft that changes tokens green; treating accepted as `>= 0` leaves a
+//!   server that proposes nothing green.
+//!
 //! The server is stopped by the handle this binary spawned it with before
 //! the CLI loads. Logs per file in `<dir>/<n>/` (`server.err`, `gen.log`,
 //! the responses).
@@ -521,7 +530,7 @@ mod gate {
 
     use bloomery_gpu::arch::qwen3moe::router::MAX_TOKENS;
     use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_size;
-    use bloomery_gpu::arch::qwen3moe::{KvQ8, Qwen35moeModel, checkpoint_budget35};
+    use bloomery_gpu::arch::qwen3moe::{Body35, KvQ8, Qwen35moeModel, checkpoint_budget35};
     use bloomery_gpu::linear::{KHeadMap, LinearShape};
     use bloomery_gpu_gates::beside;
     use bloomery_gpu_gates::ctx_ladder::{
@@ -539,6 +548,7 @@ mod gate {
     use bloomery_gpu_gates::{GateError, checks_failed};
     use gguf::{Gguf, Split};
     use model::arch::qwen35moe::hparams::{Hparams, Kind};
+    use model::arch::qwen35moe::mtp::{InFile, in_file};
     use model::placement::WholeLoad;
     use model::placement::workstation::{A6000, DeviceInfo, GRANULE, RTX_3090};
     use refset::arch::qwen35moe::vis::{self, CHATIDS, DECODE};
@@ -546,6 +556,7 @@ mod gate {
     use refset::family::Family;
     use serde_json::{Value, json};
     use threads::helper::{Placement, spawn_helper};
+    use tokenizer::Tokenizer;
     use vision::arch::card::CardBytes;
     use vision::arch::qwen3vl::{self, TokenLimits};
 
@@ -564,6 +575,14 @@ mod gate {
 
     /// The raw prompt every file continues.
     const PROSE: &str = "The lighthouse keeper counted the steps as he climbed: one hundred and twelve, the same as every night, until the hundred and thirteenth";
+
+    /// How many greedy tokens the drafted and undrafted runs are compared over.
+    /// A comparison length, not a measured result.
+    const MTP_N: usize = 16;
+
+    /// The file `gate_qwen35moe_mtp` loads: the one whose header carries the
+    /// next-token layer. Fixture files do not, and the clause is pinned here.
+    const MTP_FILE: &str = "/models/qwen36-hf/unsloth-mtp/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf";
 
     /// The edit clause's turn, and the same turn with its user message
     /// changed: the resend diverges inside the rows the first run's prompt
@@ -1489,7 +1508,7 @@ mod gate {
         } = whole_terms(line)?;
         // The whole load's need at `ctx` positions, the line's other terms kept.
         let need_at = |ctx: u64| -> Result<u64, GateError> {
-            let planes = cache_planes(model, split, ctx)?;
+            let planes = cache_planes(model, split, ctx, default_lanes(split))?;
             rest.checked_add(model::placement::allocator_bytes(GRANULE, planes))
                 .ok_or_else(|| format!("the whole load's need at {ctx} passes u64 bytes").into())
         };
@@ -1594,7 +1613,7 @@ mod gate {
         ok: &mut bool,
     ) -> Result<(), GateError> {
         let split = Split::open(model).map_err(|e| format!("open {}: {e}", model.display()))?;
-        let planes = cache_planes(model, &split, GRANULE_CTX as u64)?;
+        let planes = cache_planes(model, &split, GRANULE_CTX as u64, default_lanes(&split))?;
         let expected = model::placement::allocator_bytes(GRANULE, planes.iter().copied());
         let raw: u64 = planes.iter().sum();
         let d = dir.join("ctx-granule");
@@ -1648,15 +1667,33 @@ mod gate {
         Ok(())
     }
 
+    /// The lanes a delta store of the seat's default load holds on `split`: a
+    /// file that carries a usable next-token layer serves the MTP draft with
+    /// the draft unset (one slot, the whole load, no media), and that load
+    /// verifies on [`Body35::VERIFY_LANES`] lanes; any other file one lane.
+    fn default_lanes(split: &Split) -> usize {
+        if matches!(in_file(split), Ok(InFile::Draft(_))) {
+            Body35::VERIFY_LANES
+        } else {
+            1
+        }
+    }
+
     /// The cache planes the body allocates for one sequence of `ctx` rows of
     /// `model`'s file (`split`), in its allocation order — the order the
     /// allocator's shared granules are counted in: f16's `k` and `v` a
     /// plain-attention layer, a qwen35moe file's recurrent layers' `state`
-    /// and `ring` (`LinearShape`'s lengths, one lane as `Body35` allocates
-    /// them), which no context moves. A qwen35moe file's layers are the
-    /// reader's trunk (`Hparams::kinds`): a next-token layer past the trunk
-    /// holds no sequence plane.
-    fn cache_planes(model: &Path, split: &Split, ctx: u64) -> Result<Vec<u64>, GateError> {
+    /// and `ring` (`LinearShape`'s lengths), which no context moves: the
+    /// state `lanes` times, and a load of more than one lane a word a lane
+    /// past the ring (`RecStore`'s stamps), as `Body35` allocates them. A
+    /// qwen35moe file's layers are the reader's trunk (`Hparams::kinds`): a
+    /// next-token layer past the trunk holds no sequence plane.
+    fn cache_planes(
+        model: &Path,
+        split: &Split,
+        ctx: u64,
+        lanes: usize,
+    ) -> Result<Vec<u64>, GateError> {
         let num = |key: &str| -> Result<u64, GateError> {
             split
                 .arch_get_u64(key)
@@ -1691,8 +1728,11 @@ mod gate {
                 for kind in &trunk.kinds {
                     match kind {
                         Kind::DeltaRule => {
-                            planes.push(4 * shape.state_len() as u64);
+                            planes.push(4 * lanes as u64 * shape.state_len() as u64);
                             planes.push(4 * shape.ring_len() as u64);
+                            if lanes > 1 {
+                                planes.push(4 * lanes as u64);
+                            }
                         }
                         Kind::Attention => {
                             planes.push(plane);
@@ -2373,8 +2413,8 @@ mod gate {
         // the total, as the allocator rounds them.
         let need2 = |x: u64| -> Result<u64, GateError> {
             let rows = x / 2;
-            let mut planes = cache_planes(model, &split, rows)?;
-            planes.extend(cache_planes(model, &split, rows)?);
+            let mut planes = cache_planes(model, &split, rows, 1)?;
+            planes.extend(cache_planes(model, &split, rows, 1)?);
             rest.checked_add(model::placement::allocator_bytes(GRANULE, planes))
                 .ok_or_else(|| {
                     format!("the two-slot whole load's need at {x} passes u64 bytes").into()
@@ -2397,11 +2437,10 @@ mod gate {
     /// started with `BLOOMERY_STEP_STATS=1` and the arm's flags and
     /// environment into its own directory: two greedy streamed requests of
     /// the slots clause's prompts, each first run alone on that server and
-    /// then both together, the `slots round` records between read back. The
-    /// no-flag arm follows the load it printed: no plan, and every
-    /// together-run record holds `passes=1` (`slots_rounds_run_one_pass`);
-    /// a plan, and every record holds `passes=rows`
-    /// (`slots_rounds_run_in_turn`). On both arms the window holds a round
+    /// then both together, the `slots round` records between read back.
+    /// Both arms are one pass: every together-run record holds `passes=1`
+    /// (`slots_rounds_run_one_pass`, `placed_slots_rounds_run_one_pass` on
+    /// the placed arm). On both arms the window holds a round
     /// of both ([`rounds_hold_a_round_of_both`]: at least one record of
     /// `rows=2` — the records carry no round of one stepping slot, so the
     /// records cannot see one-slot stretches, and the window's solo count
@@ -2409,9 +2448,8 @@ mod gate {
     /// and the rows the records carry, with
     /// the solo rounds the `/metrics` decode deltas count, sum to the
     /// tokens the two requests decoded beyond their prompts' first
-    /// (`slots_rounds_rows_sum_the_decoded_tokens`); on the placed arm
-    /// every record holds `passes=rows`, the default loop
-    /// (`placed_slots_rounds_run_in_turn`).
+    /// (`slots_rounds_rows_sum_the_decoded_tokens`). A printed plan names
+    /// the split and does not choose turns.
     /// `BLOOMERY_STEP_STATS=1` moves no computation on this server — the seat
     /// and the fallback loop branch on it only to print the record — so the
     /// together-equals-alone bits of these runs stand for the default server.
@@ -2438,7 +2476,7 @@ mod gate {
             "placed_",
             &["--place", "a"],
             &[("BLOOMERY_CARD_BUDGET", PLACED_BUDGET)],
-            false,
+            true,
         );
         let mut arms = vec![whole];
         if routed(seat) {
@@ -2474,26 +2512,20 @@ mod gate {
             let addr = s.address(&err_log, 600, Duration::from_secs(1))?;
             let url = |p: &str| format!("http://{addr}{p}");
             // The shape the seat's open decided, by the line it printed before its load: one pass
-            // of the busy rows on the whole-card load, a select and a step a slot beside the host
-            // tier (`qwen3::pass_of`); the rounds below hold the records to the same shape.
+            // of the busy rows (`qwen3::pass_of`, `Body3::serves_one_pass`), whole-card and
+            // placed. The rounds below hold the records to that shape. A printed plan is still
+            // read: it names the split and does not choose turns.
             let log = std::fs::read_to_string(&err_log)?;
-            // PIN(2026-10-22): the no-flag arm is one pass only while it
-            // prints no plan (the whole model). A plan is the placed load —
-            // the whole load does not fit at this total, the same fact
-            // `unplaced_default_names_itself` holds — and `pass_of` names
-            // turns. The word and the records follow that line.
-            // FAIL-first: a load with no plan whose records hold `passes=rows`,
-            // or a load with a plan whose records hold `passes=1`.
-            let one_pass = if one_pass {
-                let plan = routed_split(&seat_records(&log, &err_log))?;
-                println!(
-                    "{dir_name}: plan (host, card, ctx) {plan:?}; a round is {}",
-                    if plan.is_none() { "one pass" } else { "turns" }
-                );
-                plan.is_none()
-            } else {
-                one_pass
-            };
+            // PIN(2026-10-22): a placed load of `Body` or `Body35` serves
+            // several slots' rows as one pass. A printed plan is that load
+            // and names `one`, the same as a whole-card load. Lookup stays
+            // turns in `pass_of` and is not an arm here.
+            // FAIL-first: the word `turns`, or a together record of `passes=rows`.
+            let plan = routed_split(&seat_records(&log, &err_log))?;
+            println!(
+                "{dir_name}: plan (host, card, ctx) {plan:?}; a round is {}",
+                if one_pass { "one pass" } else { "turns" }
+            );
             let parallel = log.lines().find(|l| l.starts_with("parallel rule="));
             println!("{dir_name}: {parallel:?}");
             check(
@@ -2611,10 +2643,9 @@ mod gate {
     /// ≥ 1.5, pulled to ~1.0 by one busy a round). The solo count is
     /// printed, not pinned: on a round server it is the two requests'
     /// admission skew and its mirror at the tail (equal `n_predict`), a
-    /// race the worker counts in passes, which no code bounds. No
-    /// pass-count condition either: the placed arm steps in turn inside a
-    /// round (`passes=rows`) by design, and the whole-card arm's one pass
-    /// is `slots_rounds_run_one_pass`'s own pin.
+    /// race the worker counts in passes, which no code bounds. The hold
+    /// is not a pass-count pin: a turns mutant still prints a record of
+    /// `rows=2`. The pass count is `slots_rounds_run_one_pass`.
     // PIN(2026-10-06): the criterion reads the engine's own `slots round`
     // records, not the SSE arrival timestamps it read before — a client-side
     // clock on a shared box clumps one stream's events under load (the same
@@ -2792,9 +2823,9 @@ mod gate {
         // at the slot ctx held, one slot's planes at no position reserved
         // (named only where not 0), the count its KV term plus that reserve.
         let split = Split::open(model).map_err(|e| format!("open {}: {e}", model.display()))?;
-        let fixed: u64 = cache_planes(model, &split, 0)?.iter().sum();
+        let fixed: u64 = cache_planes(model, &split, 0, 1)?.iter().sum();
         let both = match slot {
-            Some(s) => Some(2 * cache_planes(model, &split, s)?.iter().sum::<u64>()),
+            Some(s) => Some(2 * cache_planes(model, &split, s, 1)?.iter().sum::<u64>()),
             None => None,
         };
         let (kv, reserve) = (num("(its KV term "), num(" reserve "));
@@ -4176,7 +4207,7 @@ mod gate {
         let rows = total / slots;
         let mut planes = Vec::new();
         for _ in 0..slots {
-            planes.extend(cache_planes(model, &split, rows)?);
+            planes.extend(cache_planes(model, &split, rows, 1)?);
             planes.push(rows * rope * 4);
         }
         let want = model::placement::allocator_bytes(GRANULE, planes);
@@ -4468,6 +4499,133 @@ mod gate {
         }
     }
 
+    /// Greedy drafted ids equal the plain path's, and the drafted completion
+    /// accepted at least one token. A file with no in-file next-token layer
+    /// prints the pin and starts no server; the pinned path with no layer is red.
+    /// A spawn, tokenize or completion failure is red and does not stop the
+    /// file's later clauses or the next file.
+    fn mtp_ids_match_the_plain_path(
+        model: &Path,
+        dir: &Path,
+        ok: &mut bool,
+    ) -> Result<(), GateError> {
+        let file = match Split::open(model) {
+            Ok(file) => file,
+            Err(e) => {
+                println!("mtp open {}: {e}", model.display());
+                check(ok, "mtp_ids_match_the_plain_path", false);
+                return Ok(());
+            }
+        };
+        let drafted = matches!(in_file(&file), Ok(InFile::Draft(_)));
+        let passed = if !drafted {
+            if model == Path::new(MTP_FILE) {
+                println!(
+                    "{}: the pinned file carries no in-file next-token layer",
+                    model.display()
+                );
+                Some(false)
+            } else {
+                println!(
+                    "{}: no in-file next-token layer; mtp_ids_match_the_plain_path is pinned to \
+                     {MTP_FILE}",
+                    model.display()
+                );
+                None
+            }
+        } else {
+            Some(mtp_pair(model, dir))
+        };
+        if let Some(passed) = passed {
+            check(ok, "mtp_ids_match_the_plain_path", passed);
+        }
+        Ok(())
+    }
+
+    /// The two serves, one after the other so one card is free for the second.
+    /// `false` when either fails to listen or to complete.
+    fn mtp_pair(model: &Path, dir: &Path) -> bool {
+        let ids = match Tokenizer::from_gguf(model) {
+            Ok(tok) => tok.encode(PROSE, false, true),
+            Err(e) => {
+                println!("mtp tokenize {}: {e}", model.display());
+                return false;
+            }
+        };
+        let utf8 = match model.to_str() {
+            Some(m) => m,
+            None => {
+                println!("mtp: the model path is not UTF-8");
+                return false;
+            }
+        };
+        let once = |name: &str, word: &str| -> Option<(Answer, Value)> {
+            let sub = dir.join(name);
+            if let Err(e) = std::fs::create_dir_all(&sub) {
+                println!("mtp {name} dir: {e}");
+                return None;
+            }
+            let mut cmd = match serve_cmd() {
+                Ok(cmd) => cmd,
+                Err(e) => {
+                    println!("mtp {name} command: {e}");
+                    return None;
+                }
+            };
+            cmd.env("BLOOMERY_DRAFT", word);
+            let mut s = match Served::spawn_cmd(
+                cmd,
+                &[
+                    "--model",
+                    "qwen3",
+                    "--port",
+                    "0",
+                    "--parallel",
+                    "1",
+                    "-m",
+                    utf8,
+                ],
+                &sub,
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    println!("mtp {name} spawn: {e}");
+                    return None;
+                }
+            };
+            let err_log = sub.join("server.err");
+            let addr = match s.address(&err_log, 600, Duration::from_secs(1)) {
+                Ok(addr) => addr,
+                Err(e) => {
+                    println!("mtp {name} never listened: {e}");
+                    return None;
+                }
+            };
+            let url = |p: &str| format!("http://{addr}{p}");
+            match serve_client::greedy(&url, ids.clone(), MTP_N, &sub, name, false) {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    println!("mtp {name} greedy: {e}");
+                    None
+                }
+            }
+        };
+        let Some((on, on_body)) = once("mtp-on", "mtp") else {
+            return false;
+        };
+        let Some((off, _)) = once("mtp-off", "off") else {
+            return false;
+        };
+        let accepted = on_body["timings"]["draft_n_accepted"].as_u64();
+        let same = on.tokens == off.tokens;
+        println!(
+            "mtp drafted {} ids, plain {} ids, draft_n_accepted {accepted:?}",
+            on.tokens.len(),
+            off.tokens.len()
+        );
+        same && accepted.is_some_and(|n| n > 0)
+    }
+
     pub fn run() -> Result<(), GateError> {
         bloomery_levers::at_main(&[])?;
         let a = parse_args()?;
@@ -4566,6 +4724,7 @@ mod gate {
                 // walk.
                 placed_answers_a_prompt_past_the_gemm_walk(model, &dir, &mut ok)?;
             }
+            mtp_ids_match_the_plain_path(model, &dir, &mut ok)?;
             if a.images {
                 images(model, &dir, &mut ok)?;
             }

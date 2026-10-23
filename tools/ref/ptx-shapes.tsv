@@ -179,12 +179,14 @@ generate_ds41   glm5next_router_pick                     0           0
 generate_ds41   gqa_flash_fold_mma_256_p12_sel           0           0
 generate_ds41   gqa_flash_merge                          0           0
 generate_ds41   gqa_flash_merge_256                      0           0
+generate_ds41   gqa_flash_merge_h128_swa                0           0
 generate_ds41   gqa_flash_merge_sink                     0           0
 generate_ds41   gqa_flash_seg                            0           0
 generate_ds41   gqa_flash_seg_256                        0           0
 generate_ds41   gqa_flash_seg_256_p2                     0           0
 generate_ds41   gqa_flash_seg_256_p4                     0           0
 generate_ds41   gqa_flash_seg_g5                         0           0
+generate_ds41   gqa_flash_seg_h128_swa                   0           0
 generate_ds41   gqa_flash_seg_k192                       0           0
 generate_ds41   gqa_flash_seg_k192_ring                  0           0
 generate_ds41   gqa_flash_seg_mma                        0           0
@@ -205,6 +207,7 @@ generate_ds41   gqa_prefill_flash_256_p2_lower           0           0
 generate_ds41   gqa_prefill_flash_256_p4                 0           0
 generate_ds41   gqa_prefill_flash_256_q8                 0           0
 generate_ds41   gqa_prefill_flash_512_p4                 0           0
+generate_ds41   gqa_prefill_flash_512_p4_lower           0           0
 generate_ds41   gqa_prefill_flash_q8                     0           0
 generate_ds41   grouped_buckets                          0           0
 generate_ds41   grouped_tiles                            0           0
@@ -375,6 +378,7 @@ generate_ds41   q8_0_gemv_sel_f32                        0           0
 generate_ds41   q8_1_quantize_gated                      0           0
 generate_ds41   q8_1_quantize_ord                        0           0
 generate_ds41   q8_1_quantize_sel                        0           0
+generate_ds41   qk_rms_append                            0           0
 generate_ds41   qsa_key_append                           0           0
 generate_ds41   qsa_pool                                 0           0
 generate_ds41   qsa_score                                0           0
@@ -396,6 +400,8 @@ generate_ds41   qwen35moe_router_route_512               0           0
 generate_ds41   qwen3moe_combine                         0           0
 generate_ds41   qwen3moe_combine_host                    0           0
 generate_ds41   qwen3moe_combine_host_sh                 0           0
+generate_ds41   qwen3moe_combine_tier                    0           0
+generate_ds41   qwen3moe_combine_tier_sh                 0           0
 generate_ds41   qwen3moe_gate_up_swiglu_q4k              0           0
 generate_ds41   qwen3moe_gate_up_swiglu_q4k_prefetch     0           0
 generate_ds41   qwen3moe_head_q6k_argmax                 0           0
@@ -433,6 +439,8 @@ generate_ds41   sigmoid_128_4_router                     0           0
 generate_ds41   sigmoid_128_4_router_pick                0           0
 generate_ds41   sigmoid_128_6_router                     0           0
 generate_ds41   sigmoid_128_6_router_pick                0           0
+generate_ds41   sigmoid_256_6_router                     0           0
+generate_ds41   sigmoid_256_6_router_pick                0           0
 generate_ds41   sigmoid_320_8_router                     0           0
 generate_ds41   sigmoid_320_8_router_pick                0           0
 generate_ds41   sigmoid_rows                         0           0
@@ -445,6 +453,20 @@ generate_ds41   swiglu_quant32_sel                       0           0
 generate_ds41   tier_fault_copy                          0           0
 generate_ds41   touch                                    0           0
 generate_ds41   weighted_sum                             0           0
+generate_ds41	mul_rows	0	0
+generate_ds41	mix_rows	0	0
+generate_ds41	scale_rows	0	0
+generate_ds41	gain_rms_norm	0	0
+generate_ds41	sigmoid_16_8_router	0	0
+generate_ds41	sigmoid_16_8_router_pick	0	0
+generate_ds41	gqa_flash_merge_64	0	0
+generate_ds41	gqa_flash_seg_64	0	0
+generate_ds41	gqa_flash_seg_mma_64	0	0
+generate_ds41	iq2_xxs_gate_up_sel	0	0
+generate_ds41	sigmoid_256_8_router	0	0
+generate_ds41	sigmoid_256_8_router_pick	0	0
+generate_ds41	softcap_rows	0	0
+generate_ds41	swiglu_rule_rows	0	0
 # PIN(2026-09-25): ds41_attn_seg_stage is the staged prefix segment pass (prefill only, never on the decode path); its ring ⧺ staging source keeps a few registers more than ds41_attn_seg, which already sits at the 128-register cap of a 512-thread block, and ptxas spills 8 bytes. ds41_attn_seg_sel_stage fits in 112 with none.
 # PIN(2026-10-21): raon_hc_route (Raon's mHC route, one block a token and layer) keeps its 4x3 and 4x4 route matrices in per-thread arrays the while loops index at run time: hz 48 B + e 64 B = 112 B of JIT local; the rest of its work is shared memory. ptxas spills nothing.
 

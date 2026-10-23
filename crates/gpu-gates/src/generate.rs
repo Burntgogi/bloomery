@@ -39,9 +39,9 @@ use bloomery_gpu::{DeviceTensor, Gpu, GpuError, GpuModel};
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::Split;
 use model::placement::workstation::{
-    self, CardSpec, DeviceId, DeviceInfo, Pick, PickError, PickWhy, TierBatchBytes, TierDraft,
+    self, CardSpec, DeviceId, DeviceInfo, Pick, PickError, PickWhy, TierBatchBytes,
 };
-use model::placement::{self, Device, ExpertList, Machine, Plan, Role, Row};
+use model::placement::{self, Device, ExpertList, Machine, Plan, Reserve, Role, Row, card_budget};
 use runtime::{Advance, Committed, Out, Target, Want};
 use tokenizer::Tokenizer;
 
@@ -450,7 +450,12 @@ impl Place {
     /// earlier card is. A list of names spelled as an alias that lands on
     /// other devices than the alias does here prints as its names. With
     /// `BLOOMERY_TIER_NODES` set, the tier cards are its nodes'
-    /// ([`Place::on_nodes`]).
+    /// ([`Place::on_nodes`]). A per-card `BLOOMERY_CARD_BUDGET` or
+    /// `BLOOMERY_CARD_MARGIN` naming a device `census` does not list is
+    /// refused by name ([`refuse_card_lists`]), and so is one beside tier
+    /// nodes, whose cards no ordinal of this process names. The margin the
+    /// lever gives a card is on the resolved card's spec
+    /// ([`Place::keeping_free`]).
     pub fn on(self, census: &[DeviceInfo]) -> Result<Place, GateError> {
         if self.tp() {
             return Err(
@@ -459,9 +464,12 @@ impl Place {
                     .into(),
             );
         }
+        let budget = bloomery_levers::card_budget()?;
+        let margin = bloomery_levers::card_margin()?;
         let nodes = bloomery_levers::tier_nodes()?;
+        refuse_card_lists(&self.spelled(), &budget, &margin, census, nodes.len())?;
         if !nodes.is_empty() {
-            return self.on_nodes(census, &nodes);
+            return self.on_nodes(census, &nodes)?.keeping_free(&margin);
         }
         let resolved = workstation::resolve(self.picks(), census)
             .map_err(|e| format!("--place {}: {e}", self.spelled()))?;
@@ -483,12 +491,26 @@ impl Place {
                 .collect();
             word = Box::leak(names.join("+").into_boxed_str());
         }
-        Ok(Place {
+        Place {
             word,
             specs,
             resolved: true,
             ..self
-        })
+        }
+        .keeping_free(&margin)
+    }
+
+    /// The placement with the margin `margin` on each resolved card's spec
+    /// ([`card_budget::keep_free`]), so the machine the placement lays out
+    /// gives each card its own `margin_bytes`; a card the margin names none
+    /// keeps its own.
+    fn keeping_free(self, margin: &card_budget::CardBudget) -> Result<Place, GateError> {
+        let mut specs = self.specs;
+        for spec in specs.iter_mut().flatten() {
+            *spec = card_budget::keep_free(margin, *spec)
+                .map_err(|e| format!("--place {}: {e}", self.spelled()))?;
+        }
+        Ok(Place { specs, ..self })
     }
 
     /// [`Place::on`] with the tiers on the nodes at `nodes`, one a tier
@@ -712,12 +734,10 @@ impl Place {
     /// a placement that names a tier card is planned with no batch bytes, so
     /// the plan's own refusal of the tier reaches the seat.
     pub fn machine_untiered(self) -> Result<impl Fn(usize) -> Machine + Copy, GateError> {
-        let none = TierBatchBytes {
-            staging: 0,
-            scratch: 0,
-            host: 0,
-        };
-        self.machine(None, (!self.tier_cards().is_empty()).then_some(none))
+        self.machine(
+            None,
+            (!self.tier_cards().is_empty()).then_some(workstation::NO_TIER_BATCH),
+        )
     }
 
     /// The machine a placed load plans over, by layer count: the placement's
@@ -738,30 +758,40 @@ impl Place {
         Ok(move |layers| workstation::placed_on(stage, layers, workstation::SCRATCH))
     }
 
-    /// The machine the placement plans over, by layer count. `draft_bytes`
-    /// is the DSpark draft's resident bytes when the draft is served on the
-    /// placement's first tier card ([`Place::draft_card`]); `batch` is the
-    /// expert tier's prompt-batch bytes the plan reserves on each tier card
-    /// and the host (the model's own figure, from its hyperparameters). A
-    /// figure handed to a placement with no tier card is refused by name, a
-    /// placement with tier cards without `batch` too, and every refusal of
-    /// `workstation::plan_tiers` before the machine is planned.
+    /// The machine the placement plans over, by layer count. `draft` is the
+    /// DSpark draft's seat ([`Place::draft_on`]): its resident bytes reserved
+    /// on the card it sits on, by that card's place in the plan's device list
+    /// (the stage is 0, then the tiers, then the draft's own card where it
+    /// is none of the placement's and joins the plan as a reserve-only
+    /// member), so the plan sets them aside on that card before its experts;
+    /// `batch` is the expert tier's prompt-batch bytes the plan reserves on
+    /// each tier card and the host (the model's own figure, from its
+    /// hyperparameters). A batch handed to a placement with no tier card is
+    /// refused by name, a placement with tier cards without `batch` too, a
+    /// draft on a card past the plan's device list likewise (the card is
+    /// outside the plan), a draft's own card beside tiers that plan on nodes
+    /// of their own too, and every refusal of `workstation::plan_holding`
+    /// before the machine is planned.
     pub fn machine(
         self,
-        draft_bytes: Option<u64>,
+        draft: Option<DraftSeat>,
         batch: Option<TierBatchBytes>,
     ) -> Result<impl Fn(usize) -> Machine + Copy, GateError> {
-        if draft_bytes.is_some() && self.draft_card().is_none() {
+        let specs = self.card_specs()?;
+        let (stage, tiers) = (specs[0], &specs[1..]);
+        let tiered = self.n > 1;
+        let reserve = draft.map(|d| d.reserve);
+        let holder = draft.and_then(|d| d.holder);
+        if holder.is_some() && self.own_pools {
             return Err(format!(
-                "--place {}: no tier card holds a draft reserve; the draft's card is outside the plan",
+                "--place {}: the DSpark draft's card joins the plan as a reserve-only member of \
+                 this process's node, and the placement plans its tier cards on nodes of their \
+                 own",
                 self.name()
             )
             .into());
         }
-        let specs = self.card_specs()?;
-        let (stage, tiers) = (specs[0], &specs[1..]);
-        let tiered = self.n > 1;
-        let draft = draft_bytes.map(|bytes| TierDraft { on: 0, bytes });
+        let holders: &[CardSpec] = holder.as_slice();
         match batch {
             Some(_) if !tiered => {
                 return Err(format!(
@@ -772,7 +802,7 @@ impl Place {
                 .into());
             }
             Some(b) => {
-                workstation::check_tiers(stage, tiers, draft, b)?;
+                workstation::check_holding(stage, tiers, holders, reserve, b)?;
             }
             None if tiered => {
                 return Err(format!(
@@ -782,15 +812,28 @@ impl Place {
                 )
                 .into());
             }
-            None => {}
+            None => {
+                workstation::check_holding(
+                    stage,
+                    tiers,
+                    holders,
+                    reserve,
+                    workstation::NO_TIER_BATCH,
+                )?;
+            }
         }
-        Ok(move |layers| match batch {
-            None => workstation::plan_on(stage, layers),
-            Some(b) => self
-                .machine_with(|stage, tiers| {
-                    Ok(workstation::plan_tiers(layers, stage, tiers, draft, b)?)
-                })
-                .expect("Place::machine checked the placement's cards before planning"),
+        Ok(move |layers| {
+            self.machine_with(|stage, tiers| {
+                Ok(workstation::plan_holding(
+                    layers,
+                    stage,
+                    tiers,
+                    holder.as_slice(),
+                    reserve,
+                    batch.unwrap_or(workstation::NO_TIER_BATCH),
+                )?)
+            })
+            .expect("Place::machine checked the placement's cards before planning")
         })
     }
 
@@ -845,20 +888,97 @@ impl Place {
         self.cards()[1..].to_vec()
     }
 
-    /// The card a DSpark draft must sit on under this placement: the first
-    /// tier card, whose plan reserves the draft's bytes; `None` where the
-    /// plan reserves nothing and the draft's card is the caller's choice.
-    pub fn draft_card(self) -> Option<&'static str> {
-        self.tier_cards().first().copied()
-    }
-
-    /// The device of the draft's card ([`Place::draft_card`]) once resolved.
+    /// The device of the first tier card, where a DSpark draft sits when
+    /// `BLOOMERY_DSPARK_CARD` names none ([`Place::draft_on`]), once resolved;
+    /// `None` under a placement with no tier card.
     pub fn draft_device(self) -> Option<DeviceId> {
         (self.n > 1)
             .then_some(self.specs[1])
             .flatten()
             .and_then(|s| s.device)
     }
+}
+
+/// The flags a launcher reads of its own: those that take no value and those that take one,
+/// and whether the shared diagnosis flags ([`Diag`]) are among them.
+#[derive(Clone, Copy)]
+pub struct Known<'a> {
+    pub bare: &'a [&'a str],
+    pub valued: &'a [&'a str],
+    pub diag: bool,
+}
+
+/// Refuse the first argument of `args` (argv[0] first, as [`crate::llama_launch::args`] gives
+/// them) that is no flag of `known`, by name with the flags it has: a launcher that looks its
+/// flags up by name would otherwise let a typo run the default. A valued flag takes the next
+/// argument whatever it looks like, and one with none is refused too.
+pub fn refuse_unknown(bin: &str, args: &[String], known: Known<'_>) -> Result<(), GateError> {
+    let diag = known.diag;
+    let bare = |a: &str| known.bare.contains(&a) || (diag && Diag::BARE.contains(&a));
+    let valued = |a: &str| known.valued.contains(&a) || (diag && Diag::VALUED.contains(&a));
+    let mut it = args.iter().skip(1);
+    while let Some(arg) = it.next() {
+        if bare(arg.as_str()) {
+            continue;
+        }
+        if !valued(arg.as_str()) {
+            let mut flags: Vec<String> = known.bare.iter().map(|f| (*f).to_owned()).collect();
+            flags.extend(known.valued.iter().map(|f| format!("{f} <value>")));
+            if diag {
+                flags.push(Diag::USAGE.to_owned());
+            }
+            return Err(format!(
+                "{bin}: unknown argument {arg:?}; its flags are {}",
+                flags.join(" ")
+            )
+            .into());
+        }
+        if it.next().is_none() {
+            return Err(format!("{bin}: {arg} needs a value").into());
+        }
+    }
+    Ok(())
+}
+
+/// `--place {word}`'s refusals against the per-card levers, before any card is
+/// resolved: a `BLOOMERY_CARD_BUDGET` or `BLOOMERY_CARD_MARGIN` list naming a
+/// device `census` does not list ([`card_budget::check_visible`]), shares as a
+/// margin, and a list of either beside `tier_nodes` tier nodes, whose cards
+/// are another process's, no ordinal of this one's.
+fn refuse_card_lists(
+    word: &str,
+    budget: &card_budget::CardBudget,
+    margin: &card_budget::CardBudget,
+    census: &[DeviceInfo],
+    tier_nodes: usize,
+) -> Result<(), GateError> {
+    card_budget::check_visible(budget, census).map_err(|e| format!("--place {word}: {e}"))?;
+    card_budget::check_margin_visible(margin, census)
+        .map_err(|e| format!("--place {word}: {e}"))?;
+    if let card_budget::CardBudget::Shares(_) = margin {
+        return Err(format!(
+            "--place {word}: {} takes bytes, not shares: {margin}",
+            bloomery_levers::CARD_MARGIN
+        )
+        .into());
+    }
+    if tier_nodes > 0 {
+        for (lever, value) in [
+            (bloomery_levers::CARD_BUDGET, budget),
+            (bloomery_levers::CARD_MARGIN, margin),
+        ] {
+            if value.listed().is_some() {
+                return Err(format!(
+                    "--place {word}: {lever}={value} names cards by this process's CUDA \
+                     ordinals, and {} puts the tier cards on nodes of their own; give one value \
+                     for every card",
+                    bloomery_levers::TIER_NODES
+                )
+                .into());
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Whether the tier node at `addr`, whose census gave `spec`, is another
@@ -1224,6 +1344,18 @@ impl Default for Diag {
 }
 
 impl Diag {
+    /// The flags that take no value ([`Diag::take`] takes each).
+    pub const BARE: [&'static str; 3] = ["--table", "--ignore-eos", "--serve-feed"];
+
+    /// The flags that take a value ([`Diag::take`] takes each).
+    pub const VALUED: [&'static str; 5] = [
+        "--top2",
+        "--repeat",
+        "--rows",
+        "--dump-table",
+        "--card-table",
+    ];
+
     /// The flags, as a usage line shows them.
     pub const USAGE: &'static str = "[--top2 K [--rows FILE]] [--repeat R] [--table] \
                                      [--ignore-eos] [--serve-feed] [--dump-table FILE] \
@@ -1857,13 +1989,16 @@ pub fn card_table(loaded: &CardTable, file: &CardTable, path: &Path) -> Result<R
 
 #[cfg(test)]
 mod tests {
-    use model::placement::Machine;
     use model::placement::devices::census_usable;
     use model::placement::workstation::{
         self, A6000, CardSpec, DeviceInfo, RTX_3090, TierBatchBytes,
     };
+    use model::placement::{Device, Machine};
 
-    use super::{BreakEven, GateError, Place, TierRule, off_host};
+    use super::{
+        BreakEven, Diag, DraftSeat, GateError, Known, Place, TierRule, off_host, refuse_card_lists,
+        refuse_unknown,
+    };
     use std::net::SocketAddr;
 
     const BATCH: TierBatchBytes = workstation::tier_batch_bytes(5120, 2304, 6, 512);
@@ -1893,16 +2028,46 @@ mod tests {
         assert_eq!(Place::Gate.cards(), vec![RTX_3090.name]);
         assert_eq!(Place::Bp.cards(), vec![A6000.name, RTX_3090.name]);
         assert_eq!(Place::Bp.tier_cards(), vec![RTX_3090.name]);
-        assert!(Place::A.tier_cards().is_empty() && Place::Gate.draft_card().is_none());
-        assert_eq!(Place::Bp.draft_card(), Some(RTX_3090.name));
+        assert!(Place::A.tier_cards().is_empty());
+        assert_eq!(
+            [Place::A, Place::Gate, Place::Bp].map(|p| p.draft_device().is_some()),
+            [false, false, true]
+        );
         let a = Place::A.machine(None, None).expect("a");
         let gate = Place::Gate.machine(None, None).expect("gate");
         for layers in [0, 1, 43, 47, 48, 78] {
             assert_eq!(a(layers), workstation::plan_a(layers));
             assert_eq!(gate(layers), workstation::plan_gate(layers));
             for draft in [None, Some(1_843_200_000)] {
-                let bp = Place::Bp.machine(draft, Some(BATCH)).expect("bp");
-                assert_eq!(bp(layers), workstation::plan_bp(layers, draft, BATCH));
+                let seat = |at: usize, holder: Option<CardSpec>| {
+                    draft.map(|bytes| DraftSeat {
+                        reserve: workstation::draft_reserve(Device::Card(at), bytes),
+                        holder,
+                    })
+                };
+                let bp = Place::Bp.machine(seat(1, None), Some(BATCH));
+                assert_eq!(
+                    bp.expect("bp")(layers),
+                    workstation::plan_bp(layers, draft, BATCH)
+                );
+                let on_a = Place::A.machine(seat(0, None), None).expect("a");
+                assert_eq!(
+                    on_a(layers),
+                    workstation::plan_a_draft(layers, draft).expect("the stage holds the draft")
+                );
+                let held = Place::A.machine(seat(1, Some(RTX_3090)), None).expect("a");
+                assert_eq!(
+                    held(layers),
+                    workstation::plan_holding(
+                        layers,
+                        A6000,
+                        &[],
+                        &[RTX_3090],
+                        seat(1, None).map(|s| s.reserve),
+                        workstation::NO_TIER_BATCH
+                    )
+                    .expect("the 3090 holds the draft")
+                );
             }
         }
     }
@@ -2476,6 +2641,147 @@ mod tests {
             .collect()
     }
 
+    /// A launcher's table names the flags it reads: a typo, a stray word and a valued flag with no
+    /// value are refused by name, a value that looks like a flag is a value, and the diagnosis
+    /// flags count only where the table says so.
+    #[test]
+    fn a_launcher_refuses_a_flag_its_table_does_not_name() {
+        let args = |line: &str| -> Vec<String> {
+            std::iter::once("bin")
+                .chain(line.split_whitespace())
+                .map(str::to_owned)
+                .collect()
+        };
+        let own = Known {
+            bare: &["--time"],
+            valued: &["-n", "--tokens"],
+            diag: false,
+        };
+        let with_diag = Known { diag: true, ..own };
+        let refused = |line: &str, known: Known<'_>| {
+            refuse_unknown("bin", &args(line), known)
+                .expect_err(line)
+                .to_string()
+        };
+        assert!(refuse_unknown("bin", &args(""), own).is_ok());
+        assert!(refuse_unknown("bin", &args("--time -n 4 --tokens 1,2"), own).is_ok());
+        assert!(refuse_unknown("bin", &args("--tokens --time"), own).is_ok());
+        assert!(refuse_unknown("bin", &args("--top2 3 --table --rows f"), with_diag).is_ok());
+        let e = refused("--tiem", own);
+        assert!(
+            e.starts_with(
+                "bin: unknown argument \"--tiem\"; its flags are --time -n <value> --tokens <value>"
+            ),
+            "{e}"
+        );
+        assert!(refused("stray", own).contains("unknown argument \"stray\""));
+        assert!(refused("--table", own).contains("unknown argument \"--table\""));
+        assert!(refused("--nope", with_diag).contains(Diag::USAGE));
+        assert_eq!(refused("--time -n", own), "bin: -n needs a value");
+        assert_eq!(refused("--top2", with_diag), "bin: --top2 needs a value");
+    }
+
+    /// The diagnosis flags' two name lists are the flags [`Diag::take`] takes, with and without a
+    /// value, and no other.
+    #[test]
+    fn the_diagnosis_flag_tables_are_what_take_takes() {
+        for flag in Diag::BARE {
+            let mut none = std::iter::empty();
+            assert!(Diag::default().take(flag, &mut none).expect(flag), "{flag}");
+        }
+        for flag in Diag::VALUED {
+            let mut one = std::iter::once("1".to_owned());
+            assert!(Diag::default().take(flag, &mut one).expect(flag), "{flag}");
+            assert!(one.next().is_none(), "{flag} took its value");
+        }
+        assert!(
+            !Diag::default()
+                .take("--tokens", &mut std::iter::empty())
+                .expect("not the diagnosis flags'")
+        );
+    }
+
+    /// A margin on a placement reaches the machine's cards: the one value on
+    /// every card, a list entry on the card of that ordinal alone, a card the
+    /// margin names none at the plan's own margin, and a margin that leaves a
+    /// card no usable byte is refused naming the card.
+    #[test]
+    fn a_margin_reaches_the_machines_cards() {
+        use model::placement::card_budget::CardBudget;
+
+        let two = census(&["A6000", "3090"]);
+        let placed = Place::Bp.on(&two).expect("two cards");
+        let margins = |m: &CardBudget| {
+            let kept = placed.keeping_free(m).expect("a margin");
+            let machine = kept.machine(None, Some(BATCH)).expect("stage + tier")(43);
+            (machine.cards[0].margin_bytes, machine.tiers[0].margin_bytes)
+        };
+        assert_eq!(
+            margins(&CardBudget::Unset),
+            (workstation::MARGIN, workstation::MARGIN)
+        );
+        assert_eq!(margins(&CardBudget::Every(2 << 30)), (2 << 30, 2 << 30));
+        assert_eq!(
+            margins(&CardBudget::Per(vec![(1, 3 << 30)])),
+            (workstation::MARGIN, 3 << 30)
+        );
+        let e = placed
+            .keeping_free(&CardBudget::Per(vec![(1, RTX_3090.usable_bytes())]))
+            .expect_err("no usable byte")
+            .to_string();
+        assert!(
+            e.starts_with("--place bp: card 3090: a margin of") && e.contains("leaves none"),
+            "{e}"
+        );
+    }
+
+    /// The per-card levers are refused against the census and the tier nodes
+    /// before any card resolves, each by name: a device the census lacks in
+    /// either list, shares as a margin, and a list beside tier nodes; one value
+    /// for every card passes everywhere.
+    #[test]
+    fn card_lists_are_refused_against_the_census_and_the_tier_nodes() {
+        use model::placement::card_budget::CardBudget::{Every, Per, Shares, Unset};
+
+        let two = census(&["A6000", "3090"]);
+        let check = |budget, margin, nodes| refuse_card_lists("bp", &budget, &margin, &two, nodes);
+        for ok in [
+            check(Unset, Unset, 0),
+            check(Per(vec![(1, 1)]), Per(vec![(0, 1)]), 0),
+            check(Shares(vec![(0, 3), (1, 1)]), Every(1), 0),
+            check(Every(1), Every(1), 2),
+        ] {
+            assert!(ok.is_ok(), "{ok:?}");
+        }
+        let refused = |r: Result<(), GateError>| r.expect_err("refused").to_string();
+        let e = refused(check(Per(vec![(5, 1)]), Unset, 0));
+        assert!(
+            e.starts_with("--place bp: the per-card budget CUDA5=1 names CUDA5"),
+            "{e}"
+        );
+        let e = refused(check(Unset, Per(vec![(5, 1)]), 0));
+        assert!(
+            e.starts_with("--place bp: the per-card margin CUDA5=1 names CUDA5"),
+            "{e}"
+        );
+        let e = refused(check(Unset, Shares(vec![(0, 1)]), 0));
+        assert!(
+            e.contains("BLOOMERY_CARD_MARGIN takes bytes, not shares: CUDA0=1x"),
+            "{e}"
+        );
+        for (budget, margin, lever) in [
+            (Per(vec![(0, 1)]), Unset, "BLOOMERY_CARD_BUDGET=CUDA0=1"),
+            (Shares(vec![(0, 1)]), Unset, "BLOOMERY_CARD_BUDGET=CUDA0=1x"),
+            (Unset, Per(vec![(1, 2)]), "BLOOMERY_CARD_MARGIN=CUDA1=2"),
+        ] {
+            let e = refused(check(budget, margin, 1));
+            assert!(
+                e.contains(lever) && e.contains("BLOOMERY_TIER_NODES puts the tier cards on nodes"),
+                "{e}"
+            );
+        }
+    }
+
     /// The word's refusals, each by name before any plan: more tiers than a
     /// slot map names, a name no card has, a card named twice; then the
     /// placement's: more tier cards than the body serves, and a draft or a
@@ -2513,13 +2819,41 @@ mod tests {
         );
         assert!(Place::Bp.serves("deepseek41", 1).is_ok() && Place::A.serves("x", 0).is_ok());
         let machine_err =
-            |p: Place, d: Option<u64>, b: Option<TierBatchBytes>| match p.machine(d, b) {
+            |p: Place, d: Option<DraftSeat>, b: Option<TierBatchBytes>| match p.machine(d, b) {
                 Ok(_) => panic!("{} {d:?} {b:?} was planned", p.name()),
                 Err(e) => e.to_string(),
             };
+        let draft = |at: usize, holder: Option<CardSpec>| {
+            Some(DraftSeat {
+                reserve: workstation::draft_reserve(Device::Card(at), 1),
+                holder,
+            })
+        };
+        assert!(Place::A.machine(draft(0, None), None).is_ok());
+        assert!(Place::A.machine(draft(1, Some(RTX_3090)), None).is_ok());
         assert_eq!(
-            machine_err(Place::A, Some(1), None),
-            "--place a: no tier card holds a draft reserve; the draft's card is outside the plan"
+            machine_err(Place::A, draft(1, None), None),
+            "the DSpark draft reserve is on Card(1), outside the plan: a reserve sits on one of \
+             the plan's 1 cards, stage first, or on the host"
+        );
+        assert_eq!(
+            machine_err(Place::A, draft(2, Some(RTX_3090)), None),
+            "the DSpark draft reserve is on Card(2), outside the plan: a reserve sits on one of \
+             the plan's 2 cards, stage first, or on the host"
+        );
+        assert!(
+            machine_err(Place::A, draft(1, Some(A6000)), None)
+                .contains("2 plan cards are this one device"),
+            "a holder that is the stage's own device is the plan's refusal"
+        );
+        let own_pools = Place {
+            own_pools: true,
+            ..Place::Bp
+        };
+        assert!(
+            machine_err(own_pools, draft(2, Some(RTX_3090)), Some(BATCH))
+                .contains("a reserve-only member of this process's node"),
+            "a holder beside tiers that plan in nodes of their own is refused by name"
         );
         assert_eq!(
             machine_err(Place::Gate, None, Some(BATCH)),
@@ -2534,29 +2868,71 @@ mod tests {
     }
 }
 
+/// Where a DSpark draft sits in a placement ([`Place::draft_on`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DraftCard {
+    /// The card's place in the plan's device list: the placement's cards, the
+    /// stage first, then — when the card is none of them — the one more it
+    /// makes.
+    pub at: Device,
+    pub spec: CardSpec,
+    /// Whether the card is none of the placement's and joins the plan as a
+    /// reserve-only member to hold the draft.
+    pub holder: bool,
+}
+
+/// A DSpark draft's seat in a plan: the reserve its plan takes on the card it
+/// sits on and, where that card joins the plan as a reserve-only member, the
+/// card ([`Place::machine`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DraftSeat {
+    pub reserve: Reserve,
+    pub holder: Option<CardSpec>,
+}
+
+impl DraftCard {
+    /// The seat of a draft of `bytes` on this card.
+    #[must_use]
+    pub fn seat(self, bytes: u64) -> DraftSeat {
+        DraftSeat {
+            reserve: workstation::draft_reserve(self.at, bytes),
+            holder: self.holder.then_some(self.spec),
+        }
+    }
+}
+
 /// The DSpark draft's card, by device.
 impl Place {
-    /// The card a DSpark draft loads on under this placement, on `census`:
-    /// `set` (`BLOOMERY_DSPARK_CARD`) is one card as a `--place` list word
-    /// names one — a CUDA ordinal (`1`, `cuda1`) or a card name exactly one
-    /// visible device carries ([`workstation::resolve`]). Under a placement
-    /// with a tier card the draft sits on the first tier card, whose plan
-    /// reserves its bytes: `set` may name that device and no other. With no
-    /// tier, `set`'s card, it may be the stage's own; unset, the visible
-    /// device of the fewest usable bytes, ties to the higher ordinal — the
-    /// 3090 on this workstation wherever it is in view (beside the A6000
-    /// under `a`, the stage itself under `gate`), and on two cards of one
-    /// name the one that is not plan (a)'s stage. Each refusal by name.
-    pub fn draft_spec(
+    /// The card a DSpark draft loads on under this placement, on `census`, by
+    /// its place in the plan's device list (the placement's cards, the stage
+    /// first), with its device. `set` (`BLOOMERY_DSPARK_CARD`) is one card as
+    /// a `--place` list word names one — a CUDA ordinal (`1`, `cuda1`) or a
+    /// card name exactly one visible device carries ([`workstation::resolve`]).
+    /// Unset, the draft sits on the first tier card where the placement has
+    /// one (its plan holds the rest of that card for experts, the stage's
+    /// prefix unmoved), else on the visible device of the fewest usable bytes,
+    /// ties to the higher ordinal — the 3090 on this workstation wherever it is
+    /// in view, the stage itself when it is the only card or the placement
+    /// is `gate`. A card of the placement is its place in the list; any other
+    /// visible device is the plan's one more card, a reserve-only member that
+    /// holds the draft and no expert ([`DraftCard::holder`]), so the draft's
+    /// bytes leave that card's budget in the plan and no card that holds
+    /// experts loses one. Each refusal by name.
+    pub fn draft_on(
         self,
         set: Option<&str>,
         census: &[DeviceInfo],
-    ) -> Result<CardSpec, GateError> {
+    ) -> Result<DraftCard, GateError> {
         let lever = |v: &str, e: &dyn std::fmt::Display| -> GateError {
             format!("BLOOMERY_DSPARK_CARD={v:?}: {e}").into()
         };
-        let named = match set {
-            None => None,
+        let placed = if self.resolved {
+            self
+        } else {
+            self.on(census)?
+        };
+        let cards = placed.card_specs()?;
+        let spec = match set {
             Some(v) => {
                 let picks = workstation::word_picks(v, 0).map_err(|e| match e {
                     workstation::WordError::TooManyTiers { .. } => lever(
@@ -2565,72 +2941,99 @@ impl Place {
                     ),
                     e => lever(v, &e),
                 })?;
-                let spec = workstation::resolve(&picks, census).map_err(|e| lever(v, &e))?;
-                Some((v, spec[0]))
+                workstation::resolve(&picks, census).map_err(|e| lever(v, &e))?[0]
+            }
+            None if self.n > 1 => cards[1],
+            None => {
+                let last = census
+                    .len()
+                    .checked_sub(1)
+                    .and_then(|k| u8::try_from(k).ok())
+                    .ok_or_else(|| {
+                        format!(
+                            "the DSpark draft's card: {} visible devices (visible: {})",
+                            census.len(),
+                            workstation::visible(census)
+                        )
+                    })?;
+                workstation::resolve(&[Pick::Rank(last)], census)
+                    .map_err(|e| format!("the DSpark draft's card: {e}"))?[0]
             }
         };
-        let on = |s: CardSpec| s.device.map_or_else(|| "?".to_string(), |d| d.to_string());
-        if self.n > 1 {
-            let placed = if self.resolved {
-                self
-            } else {
-                self.on(census)?
-            };
-            let tier = placed.card_specs()?[1];
-            return match named {
-                None => Ok(tier),
-                Some((_, s)) if s.device == tier.device => Ok(tier),
-                Some((v, s)) => Err(format!(
-                    "BLOOMERY_DSPARK_CARD={v:?} is {} ({}) under --place {}: the draft sits on \
-                     the tier card {} ({}), whose plan reserves its bytes; unset the lever or \
-                     name that card",
-                    on(s),
-                    s.name,
-                    self.name(),
-                    on(tier),
-                    tier.name
+        Ok(match cards.iter().position(|c| c.same_device(&spec)) {
+            Some(i) => DraftCard {
+                at: Device::Card(i),
+                spec: cards[i],
+                holder: false,
+            },
+            None => DraftCard {
+                at: Device::Card(cards.len()),
+                spec: card_budget::keep_free(&bloomery_levers::card_margin()?, spec)
+                    .map_err(|e| format!("the DSpark draft's card: {e}"))?,
+                holder: true,
+            },
+        })
+    }
+
+    /// Refuse a draft that opens on `opens` when its plan reserved the bytes on
+    /// another card, or on a card past the plan's device list: the device the
+    /// load opens is the device the reserve left, by name and before any
+    /// allocation.
+    pub fn check_draft_card(self, seat: DraftSeat, opens: &DraftCard) -> Result<(), GateError> {
+        let reserve = seat.reserve;
+        let cards = usize::from(self.n) + usize::from(seat.holder.is_some());
+        match reserve.on {
+            Device::Card(i) if i < cards => {}
+            on => {
+                return Err(format!(
+                    "--place {}: the draft's reserve is on {on:?} and the plan has {cards} cards: \
+                     the draft's card is outside the plan",
+                    self.name()
                 )
-                .into()),
-            };
+                .into());
+            }
         }
-        if let Some((_, s)) = named {
-            return Ok(s);
+        if reserve.on != opens.at || seat.holder.is_some() != opens.holder {
+            return Err(format!(
+                "--place {}: the DSpark draft opens on {:?} and its plan reserved its {} B on \
+                 {:?}: the load's device is the reserve's",
+                self.name(),
+                opens.at,
+                reserve.bytes,
+                reserve.on
+            )
+            .into());
         }
-        let last = census
-            .len()
-            .checked_sub(1)
-            .and_then(|k| u8::try_from(k).ok())
-            .ok_or_else(|| {
-                format!(
-                    "the DSpark draft's card: {} visible devices (visible: {})",
-                    census.len(),
-                    workstation::visible(census)
-                )
-            })?;
-        let spec = workstation::resolve(&[Pick::Rank(last)], census)
-            .map_err(|e| format!("the DSpark draft's card: {e}"))?;
-        Ok(spec[0])
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod draft_card_tests {
     use model::placement::workstation::{A6000, DeviceInfo, RTX_3090};
+    use model::placement::{Device, Reserve};
 
-    use super::Place;
     use super::tests::census;
+    use super::{DraftCard, DraftSeat, Place};
 
-    /// `BLOOMERY_DSPARK_CARD`'s card on a census ([`Place::draft_spec`]):
-    /// unset, the 3090 wherever it is in view (beside the A6000 under `a`,
-    /// the stage under `gate`, the tier under `bp`), in both enumeration
-    /// orders; set, an ordinal or a name one device carries, the tier's
-    /// device alone under `bp`; on two cards of one name, the non-stage one
-    /// unset and either by its ordinal.
+    /// `BLOOMERY_DSPARK_CARD`'s card on a census ([`Place::draft_on`]), by its
+    /// place in the plan's device list: unset, the tier under `bp`, the stage
+    /// under `gate` and on one card, and under `a` beside a second card that
+    /// card as the plan's one more, reserve-only member; set, an ordinal or a
+    /// name one device carries, a card of the placement or any other visible
+    /// device as that member.
     #[test]
-    fn the_draft_card_is_found_by_device() {
+    fn the_draft_card_is_a_card_of_the_plan() {
         let at = |p: Place, set: Option<&str>, c: &[DeviceInfo]| {
-            p.draft_spec(set, c)
-                .map(|s| (s.name, s.device.map(|d| d.ordinal)))
+            p.draft_on(set, c)
+                .map(|d| {
+                    (
+                        d.at,
+                        d.spec.name,
+                        d.spec.device.map(|d| d.ordinal),
+                        d.holder,
+                    )
+                })
                 .map_err(|e| e.to_string())
         };
         for order in [["3090", "A6000"], ["A6000", "3090"]] {
@@ -2638,62 +3041,71 @@ mod draft_card_tests {
             let o = |n: &str| {
                 Some(u32::try_from(order.iter().position(|m| *m == n).expect(n)).expect("small"))
             };
-            for p in [Place::A, Place::Gate, Place::Bp] {
-                assert_eq!(
-                    at(p, None, &c),
-                    Ok((RTX_3090.name, o("3090"))),
-                    "{}",
-                    p.name()
-                );
-            }
+            let tier = (Device::Card(1), RTX_3090.name, o("3090"), false);
+            let stage = (Device::Card(0), A6000.name, o("A6000"), false);
+            let held = (Device::Card(1), RTX_3090.name, o("3090"), true);
+            assert_eq!(at(Place::Bp, None, &c), Ok(tier));
             assert_eq!(
-                at(Place::A, Some("A6000"), &c),
-                Ok((A6000.name, o("A6000")))
+                at(Place::A, None, &c),
+                Ok(held),
+                "the 3090 beside plan (a) joins the plan, the A6000 keeps every expert"
             );
             assert_eq!(
-                at(Place::Gate, Some("a6000"), &c),
-                Ok((A6000.name, o("A6000")))
+                at(Place::Gate, None, &c),
+                Ok((Device::Card(0), RTX_3090.name, o("3090"), false))
             );
+            assert_eq!(at(Place::A, Some("A6000"), &c), Ok(stage));
             let ordinal = format!("cuda{}", o("A6000").expect("A6000"));
-            assert_eq!(
-                at(Place::A, Some(&ordinal), &c),
-                Ok((A6000.name, o("A6000")))
-            );
-            let tier = o("3090").expect("3090").to_string();
-            assert_eq!(
-                at(Place::Bp, Some(&tier), &c),
-                Ok((RTX_3090.name, o("3090")))
-            );
+            assert_eq!(at(Place::A, Some(&ordinal), &c), Ok(stage));
+            let tier_word = o("3090").expect("3090").to_string();
+            assert_eq!(at(Place::Bp, Some(&tier_word), &c), Ok(tier));
             assert_eq!(
                 at(Place::Bp.on(&c).expect("bp"), Some("3090"), &c),
-                Ok((RTX_3090.name, o("3090")))
+                Ok(tier)
             );
-            let e = at(Place::Bp, Some("A6000"), &c).expect_err("the stage under bp");
-            assert!(
-                e.starts_with("BLOOMERY_DSPARK_CARD=\"A6000\" is cuda")
-                    && e.contains("the draft sits on the tier card"),
-                "{e}"
+            assert_eq!(
+                at(Place::Bp, Some("A6000"), &c),
+                Ok(stage),
+                "the stage is a card of bp"
+            );
+            assert_eq!(at(Place::A, Some("3090"), &c), Ok(held));
+            assert_eq!(
+                at(Place::Gate, Some("a6000"), &c),
+                Ok((Device::Card(1), A6000.name, o("A6000"), true))
             );
         }
         let one = census(&["3090"]);
-        assert_eq!(at(Place::Gate, None, &one), Ok((RTX_3090.name, Some(0))));
-        assert_eq!(at(Place::A, None, &one), Ok((RTX_3090.name, Some(0))));
-        let e = at(Place::A, Some("A6000"), &one).expect_err("no A6000");
+        assert_eq!(
+            at(Place::Gate, None, &one),
+            Ok((Device::Card(0), RTX_3090.name, Some(0), false))
+        );
+        let one = census(&["A6000"]);
+        assert_eq!(
+            at(Place::A, None, &one),
+            Ok((Device::Card(0), A6000.name, Some(0), false)),
+            "one card: the stage is the only room"
+        );
+        let e = at(Place::A, Some("3090"), &one).expect_err("no 3090");
         assert!(
-            e.starts_with("BLOOMERY_DSPARK_CARD=\"A6000\": no visible device is A6000"),
+            e.starts_with("BLOOMERY_DSPARK_CARD=\"3090\": no visible device is 3090"),
             "{e}"
         );
         let two = census(&["3090", "3090"]);
-        assert_eq!(at(Place::A, None, &two), Ok((RTX_3090.name, Some(1))));
-        assert_eq!(at(Place::A, Some("0"), &two), Ok((RTX_3090.name, Some(0))));
+        let stage_zero = Place::parse("cuda0").expect("cuda0");
         assert_eq!(
-            at(Place::Bp, Some("cuda1"), &two),
-            Ok((RTX_3090.name, Some(1)))
+            at(stage_zero, None, &two),
+            Ok((Device::Card(1), RTX_3090.name, Some(1), true))
         );
-        let e = at(Place::A, Some("3090"), &two).expect_err("two of one name");
+        assert_eq!(
+            at(stage_zero, Some("0"), &two),
+            Ok((Device::Card(0), RTX_3090.name, Some(0), false))
+        );
+        assert_eq!(
+            at(stage_zero, Some("cuda1"), &two),
+            Ok((Device::Card(1), RTX_3090.name, Some(1), true))
+        );
+        let e = at(stage_zero, Some("3090"), &two).expect_err("two of one name");
         assert!(e.contains("2 visible devices carry the name 3090"), "{e}");
-        let e = at(Place::Bp, Some("cuda0"), &two).expect_err("the stage of two");
-        assert!(e.contains("the draft sits on the tier card"), "{e}");
         for (v, want) in [
             ("a6000+3090", "the lever names one card"),
             ("4090", "names the card \"4090\""),
@@ -2703,6 +3115,57 @@ mod draft_card_tests {
             assert!(e.contains(want), "{v}: {e}");
         }
         let e = at(Place::A, None, &[]).expect_err("no device");
-        assert!(e.contains("0 visible devices"), "{e}");
+        assert!(e.contains("no visible device is A6000"), "{e}");
+    }
+
+    /// A draft opens on the card its plan reserved on: the same place in the
+    /// plan's device list is accepted, another card or a card past the list is
+    /// refused by name before any allocation.
+    #[test]
+    fn a_draft_opens_on_the_card_its_reserve_is_on() {
+        let c = census(&["A6000", "3090"]);
+        let draft = |p: Place, set| p.draft_on(set, &c).expect("a card");
+        let seat = |on: usize, holder: bool| DraftSeat {
+            reserve: Reserve {
+                on: Device::Card(on),
+                name: "DSpark draft",
+                bytes: 8,
+            },
+            holder: holder.then(|| draft(Place::A, None).spec),
+        };
+        let tier: DraftCard = draft(Place::Bp, None);
+        let stage: DraftCard = draft(Place::Bp, Some("A6000"));
+        let held: DraftCard = draft(Place::A, None);
+        assert!(Place::Bp.check_draft_card(seat(1, false), &tier).is_ok());
+        assert!(Place::Bp.check_draft_card(seat(0, false), &stage).is_ok());
+        assert!(Place::A.check_draft_card(seat(1, true), &held).is_ok());
+        assert_eq!(
+            tier.seat(8),
+            seat(1, false),
+            "the seat of a tier card holds no spec"
+        );
+        assert_eq!(held.seat(8), seat(1, true));
+        assert_eq!(
+            Place::Bp
+                .check_draft_card(seat(1, false), &stage)
+                .expect_err("opens on the stage, reserved on the tier")
+                .to_string(),
+            "--place bp: the DSpark draft opens on Card(0) and its plan reserved its 8 B on \
+             Card(1): the load's device is the reserve's"
+        );
+        assert!(
+            Place::A
+                .check_draft_card(seat(1, false), &held)
+                .expect_err("reserved on a card the plan does not have")
+                .to_string()
+                .contains("outside the plan"),
+        );
+        assert!(
+            Place::A
+                .check_draft_card(seat(0, false), &held)
+                .expect_err("opens on the member, reserved on the stage")
+                .to_string()
+                .contains("the load's device is the reserve's"),
+        );
     }
 }

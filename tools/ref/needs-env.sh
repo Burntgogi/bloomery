@@ -11,6 +11,9 @@
 # exit (a run by hand does). The call must be the first command of every box.sh command of the recipe and name the recipe
 # itself; gate-batch refuses a recipe that does not.
 #
+# A variable may state a machine fact rather than an address: BLOOMERY_CARD_ALL_EXPERTS says one card holds every routed
+# expert of the plan (a 128 GB GB10), which gate-gpu-qwen4exp-nvfp4 needs; a smaller card defers it by name.
+#
 # Exit codes: 67 VAR is unset or empty, 64 a missing recipe name or variable, or a variable that is no name.
 set -euo pipefail
 if [ $# != 2 ] || [ -z "$1" ] || [ -z "$2" ]; then

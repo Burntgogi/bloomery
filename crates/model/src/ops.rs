@@ -996,29 +996,80 @@ pub fn matmul_q_group_swiglu(
 /// ```compile_fail,E0451
 /// # fn forge(up: &model::ops::ShardTensor) -> model::ops::ShardTensor {
 /// // A handle naming another shard than the one its header came from.
-/// model::ops::ShardTensor { shard: up.shard() + 1, info: up.info().clone() }
+/// model::ops::ShardTensor {
+///     shard: up.shard() + 1,
+///     info: up.info().clone(),
+///     runs: None,
+///     scale: None,
+/// }
 /// # }
 /// ```
 #[derive(Clone, Debug)]
 pub struct ShardTensor {
     shard: usize,
     info: TensorInfo,
+    /// Where the stack's matrices lie when the split keeps them in runs of its
+    /// files' own; `None`: the `n_expert` equal runs from the header's offset.
+    runs: Option<Arc<StackRuns>>,
+    /// The tensor scales a type that reads them ([`GgmlType::reads_scale`]) is
+    /// dotted with, one an expert of a stack (one the tensor): the split's own
+    /// placement carries them for a located stack, the `<stem>.scale` beside
+    /// the tensor ([`gguf::tensor_scales`]) for any other. The one owner of a
+    /// tensor scale for both sources, and for both layouts; `None` for a type
+    /// that reads none.
+    scale: Option<Arc<[f32]>>,
 }
 
 impl ShardTensor {
-    /// The tensor `name` and the shard the split found it in.
+    /// The tensor `name` and the shard the split found it in, with the
+    /// placement and the tensor scales the split keeps for it ([`placed`],
+    /// [`gguf::tensor_scales`]). A tensor of a type that reads a tensor scale
+    /// whose scales the split lacks or holds otherwise is refused by name
+    /// here, at load.
     pub fn find(split: &Split, name: &str) -> Result<ShardTensor, crate::ModelError> {
         let (shard, info) = split
             .find(name)
             .ok_or_else(|| crate::ModelError::MissingTensor(name.to_string()))?;
+        let (runs, scale) = match placed(split, name)? {
+            Some(Placed { runs, scales }) => (Some(Arc::new(runs)), placed_scales(info, scales)?),
+            None => (
+                None,
+                gguf::tensor_scales(info, |n| {
+                    let (s, i) = split.find(n)?;
+                    Some((split.shard(s)?, i))
+                })?
+                .map(Arc::from),
+            ),
+        };
         Ok(ShardTensor {
             shard,
             info: info.clone(),
+            runs,
+            scale,
         })
     }
 
     pub fn info(&self) -> &TensorInfo {
         &self.info
+    }
+
+    /// Where a stack's rows lie in each of its matrices.
+    pub fn layout(&self) -> RowLayout {
+        self.runs.as_ref().map_or(RowLayout::Rows, |r| r.layout)
+    }
+
+    /// The tensor scale expert `e` of a stack is dotted with (`e` 0 for a tensor
+    /// that is not one): 1 for a type that reads none. A type that reads one
+    /// on a handle that carries none, or none for `e`, is refused by name — a
+    /// dot runs scaled or not at all.
+    pub(crate) fn scale_of(&self, e: usize) -> Result<f32, crate::ModelError> {
+        if !self.info.ty.reads_scale() {
+            return Ok(1.0);
+        }
+        let scale = self.scale.as_deref().ok_or_else(|| unscaled(&self.info))?;
+        scale.get(e).copied().ok_or_else(|| {
+            crate::ModelError::MissingTensor(format!("expert {e} of {}", self.info.name))
+        })
     }
 
     pub fn shard(&self) -> usize {
@@ -1050,16 +1101,30 @@ impl ShardTensor {
             k: k_of(&self.info),
             n: n_of(&self.info),
             bytes: self.file(split)?.data(&self.info)?,
+            scale_plane: &[],
             layout: RowLayout::Rows,
+            scale: self.scale_of(0)?,
         })
     }
 
     /// Matrix `e` of a stacked tensor `{k, n, n_expert}` as a dispatch weight:
     /// the `e`-th of the stack's `n_expert` equal byte runs — the cut
-    /// `moe::expert_view` makes, without a header of its own.
+    /// `moe::expert_view` makes, without a header of its own — or, for a
+    /// located stack, the runs [`StackRuns`] puts it at, in the stack's layout;
+    /// at the expert's tensor scale either way.
     pub fn expert<'a>(&self, split: &'a Split, e: usize) -> Result<Weight<'a>, crate::ModelError> {
-        let stack = self.file(split)?.data(&self.info)?;
-        expert_weight(&self.info, stack, e, RowLayout::Rows)
+        let file = self.file(split)?;
+        let scale = self.scale_of(e)?;
+        match &self.runs {
+            None => expert_weight(
+                &self.info,
+                file.data(&self.info)?,
+                e,
+                RowLayout::Rows,
+                scale,
+            ),
+            Some(runs) => runs.cut(&self.info, file.mapping(), e, scale),
+        }
     }
 
     /// The stacked tensor as a union call reads it, its bytes resolved once
@@ -1068,8 +1133,63 @@ impl ShardTensor {
         &'a self,
         split: &'a Split,
     ) -> Result<ExpertStack<'a>, crate::ModelError> {
-        ExpertStack::of(&self.info, self.file(split)?.data(&self.info)?)
+        let file = self.file(split)?;
+        let scale = self.scale.as_deref();
+        match &self.runs {
+            None => ExpertStack::of(&self.info, file.data(&self.info)?, scale),
+            Some(runs) => ExpertStack::located(&self.info, file.mapping(), runs, scale),
+        }
     }
+}
+
+/// The refusal of a dot over a tensor of a type that reads its tensor scale
+/// ([`GgmlType::reads_scale`]) where no scale was carried to it: a header of a
+/// one-file model holds none, and a dot without it is a defined wrong value.
+fn unscaled(info: &TensorInfo) -> crate::ModelError {
+    crate::ModelError::Gguf(gguf::LoadError::Scale {
+        name: info.name.clone(),
+        detail: format!(
+            "a {} tensor is dotted with its tensor scale, which this entry carries none of \
+             (a split's tensor carries it: `ShardTensor::find`)",
+            info.ty
+        ),
+    })
+}
+
+/// The tensor scales a split's placement holds for stack `info`
+/// ([`Placed::scales`]), as [`gguf::tensor_scales`] checks the ones beside a
+/// tensor: one an expert, each finite, for a type that reads a tensor scale,
+/// and none for another.
+fn placed_scales(
+    info: &TensorInfo,
+    scales: Vec<f32>,
+) -> Result<Option<Arc<[f32]>>, crate::ModelError> {
+    let refuse = |detail: String| {
+        crate::ModelError::Gguf(gguf::LoadError::Scale {
+            name: info.name.clone(),
+            detail,
+        })
+    };
+    let want = if info.ty.reads_scale() {
+        stack_cut(info)?.0
+    } else {
+        0
+    };
+    if scales.len() != want {
+        return Err(refuse(format!(
+            "the placement holds {} tensor scales for {} of {}: one an expert for a type that \
+             reads a tensor scale, none for another",
+            scales.len(),
+            info.dims.get(2).copied().unwrap_or(0),
+            info.ty
+        )));
+    }
+    if let Some((e, v)) = scales.iter().enumerate().find(|(_, v)| !v.is_finite()) {
+        return Err(refuse(format!(
+            "the placement's tensor scale [{e}] is {v}, not a finite value"
+        )));
+    }
+    Ok((want > 0).then(|| Arc::from(scales)))
 }
 
 /// A stack header's cut: its `n_expert` and the bytes of one expert's matrix,
@@ -1093,14 +1213,17 @@ fn stack_cut(info: &TensorInfo) -> Result<(usize, usize), crate::ModelError> {
 }
 
 /// Matrix `e` of stack `info` over the stack's bytes `stack`, its rows in
-/// `layout`; an expert past the stack is refused by name. The host tier's
-/// NVMe arena cuts the same matrix over a slot's bytes (`e` 0, the slot
-/// holding one expert).
+/// `layout` and dotted with the tensor scale `scale`; an expert past the stack
+/// is refused by name. A [`RowLayout::Planes`] matrix is cut as one run of its
+/// codes then its group scales. The host tier's NVMe arena cuts the same matrix
+/// over a slot's bytes (`e` 0, the slot holding one expert; `scale` that of its
+/// own id).
 pub(crate) fn expert_weight<'a>(
     info: &TensorInfo,
     stack: &'a [u8],
     e: usize,
     layout: RowLayout,
+    scale: f32,
 ) -> Result<Weight<'a>, crate::ModelError> {
     let (n_expert, per) = stack_cut(info)?;
     if e >= n_expert {
@@ -1109,12 +1232,20 @@ pub(crate) fn expert_weight<'a>(
             info.name
         )));
     }
+    let (k, n) = (k_of(info), n_of(info));
+    let matrix = &stack[e * per..(e + 1) * per];
+    let (bytes, scale_plane) = match layout {
+        RowLayout::Planes => matrix.split_at(n * k / 2),
+        RowLayout::Rows | RowLayout::R8 => (matrix, &matrix[..0]),
+    };
     Ok(Weight {
         ty: info.ty,
-        k: k_of(info),
-        n: n_of(info),
-        bytes: &stack[e * per..(e + 1) * per],
+        k,
+        n,
+        bytes,
+        scale_plane,
         layout,
+        scale,
     })
 }
 
@@ -1129,6 +1260,13 @@ pub enum RowLayout {
     /// sidecar's layout, read only by [`qdot::dot_q3k_r8_cols`], a group at a
     /// time. Only the host tier's r8 stack makes a matrix of it.
     R8,
+    /// [`GgmlType::NVFP4_ROWS`] rows as a checkpoint stores a matrix: a run
+    /// of the codes of every row (`k / 2` bytes a row, value `2i` the low
+    /// nibble of byte `i`) and a run of the UE4M3 scale of every 16-value
+    /// group (`k / 16` bytes a row). The two runs lie wherever the file keeps
+    /// them, so a row is not one slice: only the planes row dot reads it,
+    /// given its code row and its scale row.
+    Planes,
 }
 
 impl RowLayout {
@@ -1136,7 +1274,7 @@ impl RowLayout {
     /// which the tile reads whole.
     fn grain(self) -> usize {
         match self {
-            RowLayout::Rows => 1,
+            RowLayout::Rows | RowLayout::Planes => 1,
             RowLayout::R8 => qdot::Q3K_R8_ROWS,
         }
     }
@@ -1146,8 +1284,255 @@ impl RowLayout {
         match self {
             RowLayout::Rows => "rows",
             RowLayout::R8 => "r8",
+            RowLayout::Planes => "planes",
         }
     }
+}
+
+/// Bytes of the codes run of an `n`-row matrix of `k`-value
+/// [`GgmlType::NVFP4_ROWS`] rows in [`RowLayout::Planes`]: `n · k / 2`.
+fn planes_codes_bytes(k: usize, n: usize) -> usize {
+    n * (k / 2)
+}
+
+/// Bytes of the group scales run of the same matrix: `n · k / 16`.
+fn planes_scales_bytes(k: usize, n: usize) -> usize {
+    n * (k / 16)
+}
+
+/// Where a stack's matrices lie in the file that holds them, when they are
+/// not the `n_expert` equal runs of one tensor: matrix `e` is the `codes_per`
+/// bytes at file offset `codes_at[e]` (the offsets a checkpoint folder's shard
+/// header gives, in no order) and, in [`RowLayout::Planes`], the `scales_per`
+/// bytes of group scales at `scales_at[e]` — wherever the folder keeps them,
+/// adjacent to the codes or a region away. Made only by [`StackRuns::new`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct StackRuns {
+    layout: RowLayout,
+    codes_at: Vec<u64>,
+    scales_at: Vec<u64>,
+    codes_per: u64,
+    scales_per: u64,
+    /// The largest offset of each table, so a stack over a file checks its
+    /// bounds once.
+    codes_last: u64,
+    scales_last: u64,
+}
+
+impl StackRuns {
+    /// The runs of `layout`: `codes_at` (file offsets, one an expert) of
+    /// `codes_per` bytes and, for planes, `scales_at` of `scales_per` bytes.
+    /// Whether the counts and sizes fit a stack's header is checked where a
+    /// stack is made over them ([`StackRuns::shape`]). Refused by name: the r8
+    /// layout, which reads a sidecar, not file runs; a second run for a layout
+    /// that has none; planes without one a matrix.
+    pub fn new(
+        layout: RowLayout,
+        codes_at: Vec<u64>,
+        scales_at: Vec<u64>,
+        codes_per: u64,
+        scales_per: u64,
+    ) -> Result<StackRuns, crate::ModelError> {
+        let refuse = |what: &'static str| {
+            Err(crate::ModelError::HostLayout {
+                what,
+                tensor: String::new(),
+                layout: layout.name(),
+            })
+        };
+        match layout {
+            RowLayout::R8 => {
+                return refuse(
+                    "located runs: the r8 layout is read from its sidecar, not from file runs",
+                );
+            }
+            RowLayout::Rows if !scales_at.is_empty() || scales_per != 0 => {
+                return refuse("located runs: the rows layout has no second run");
+            }
+            RowLayout::Planes if scales_at.len() != codes_at.len() || scales_per == 0 => {
+                return refuse("located runs: planes hold one scales run for every codes run");
+            }
+            RowLayout::Rows | RowLayout::Planes => {}
+        }
+        let last = |at: &[u64]| at.iter().copied().max().unwrap_or(0);
+        Ok(StackRuns {
+            layout,
+            codes_last: last(&codes_at),
+            scales_last: last(&scales_at),
+            codes_at,
+            scales_at,
+            codes_per,
+            scales_per,
+        })
+    }
+
+    /// Expert `e`'s file ranges, its codes (or rows) run then its group scales
+    /// run, which is empty for a layout with one. `None` for an expert past
+    /// the stack.
+    pub(crate) fn ranges(&self, e: usize) -> Option<[Range<u64>; 2]> {
+        let codes = *self.codes_at.get(e)?;
+        let scales = self.scales_at.get(e).copied().unwrap_or(0);
+        Some([
+            codes..codes + self.codes_per,
+            scales..scales + self.scales_per,
+        ])
+    }
+
+    /// The experts the runs place.
+    pub(crate) fn n_expert(&self) -> usize {
+        self.codes_at.len()
+    }
+
+    /// The stack `info`'s `n_expert` and the bytes of one matrix, checked
+    /// against these runs over a file of `len` bytes. Refused by name: a
+    /// header that is not a stack, an offset count other than `n_expert`, the
+    /// planes layout on a type that is not `NVFP4_ROWS` (or the reverse), runs
+    /// whose sizes are not the header's matrix (planes: `n · k / 2` code bytes
+    /// and `n · k / 16` scale bytes), and a run that ends past the file.
+    fn shape(&self, info: &TensorInfo, len: usize) -> Result<(usize, usize), crate::ModelError> {
+        let (n_expert, per) = stack_cut(info)?;
+        if self.codes_at.len() != n_expert {
+            return Err(crate::ModelError::Shape {
+                what: "located stack: one offset an expert",
+                want_ne0: n_expert,
+                want_ne1: 1,
+                got_ne0: self.codes_at.len(),
+                got_ne1: 1,
+            });
+        }
+        if (self.layout == RowLayout::Planes) != (info.ty == GgmlType::NVFP4_ROWS) {
+            return Err(crate::ModelError::HostLayout {
+                what: "located stack: the planes layout holds NVFP4_ROWS rows, and NVFP4_ROWS \
+                       rows are located in no other layout",
+                tensor: info.name.clone(),
+                layout: self.layout.name(),
+            });
+        }
+        let (k, n) = (k_of(info), n_of(info));
+        let (want_codes, want_scales) = match self.layout {
+            RowLayout::Planes => (planes_codes_bytes(k, n), planes_scales_bytes(k, n)),
+            RowLayout::Rows | RowLayout::R8 => (per, 0),
+        };
+        if (self.codes_per, self.scales_per) != (want_codes as u64, want_scales as u64) {
+            return Err(crate::ModelError::Shape {
+                what: "located stack: the runs' bytes are the header's matrix (codes, then scales)",
+                want_ne0: want_codes,
+                want_ne1: want_scales,
+                got_ne0: self.codes_per as usize,
+                got_ne1: self.scales_per as usize,
+            });
+        }
+        for (last, per) in [
+            (self.codes_last, self.codes_per),
+            (self.scales_last, self.scales_per),
+        ] {
+            if last.checked_add(per).is_none_or(|end| end > len as u64) {
+                return Err(crate::ModelError::Gguf(gguf::LoadError::OutOfBounds {
+                    name: info.name.clone(),
+                    base: 0,
+                    off: last,
+                    nbytes: per,
+                    len: len as u64,
+                }));
+            }
+        }
+        Ok((n_expert, per))
+    }
+
+    /// Matrix `e` of stack `info` over the file's bytes `span` (file offset `o`
+    /// at index `o`) as a dispatch weight: its runs at their offsets, in the
+    /// runs' layout, dotted at `scale`. An expert past the stack is refused by
+    /// name, as [`StackRuns::shape`] refuses the rest.
+    fn cut<'s>(
+        &self,
+        info: &TensorInfo,
+        span: &'s [u8],
+        e: usize,
+        scale: f32,
+    ) -> Result<Weight<'s>, crate::ModelError> {
+        let (n_expert, _) = self.shape(info, span.len())?;
+        if e >= n_expert {
+            return Err(crate::ModelError::MissingTensor(format!(
+                "expert {e} of {}",
+                info.name
+            )));
+        }
+        let (bytes, scale_plane) = self.runs_in(span, e);
+        Ok(Weight {
+            ty: info.ty,
+            k: k_of(info),
+            n: n_of(info),
+            bytes,
+            scale_plane,
+            layout: self.layout,
+            scale,
+        })
+    }
+
+    /// Expert `e`'s runs of `span`: its codes (or rows) and its group scales,
+    /// which are empty for a layout with none. `e` and the runs' fit to
+    /// `span` are [`StackRuns::shape`]'s.
+    fn runs_in<'s>(&self, span: &'s [u8], e: usize) -> (&'s [u8], &'s [u8]) {
+        let codes = self.codes_at[e] as usize;
+        let scales = self.scales_at.get(e).map_or(0, |&at| at as usize);
+        (
+            &span[codes..codes + self.codes_per as usize],
+            &span[scales..scales + self.scales_per as usize],
+        )
+    }
+}
+
+/// What a split keeps for a stack it holds in runs of its own: where its
+/// matrices lie and the tensor scale of each ([`ShardTensor::find`] carries
+/// both).
+pub(crate) struct Placed {
+    runs: StackRuns,
+    scales: Vec<f32>,
+}
+
+/// The placement `split` keeps for stack `name`: `Some` when its matrices lie
+/// at offsets of their own in the shard — a checkpoint folder's experts, each
+/// where the folder stores it — `None` for a tensor that is the `n_expert`
+/// equal runs from its header's offset, as every GGUF's is. The one place a
+/// split's own placement enters the host tier ([`ShardTensor::find`], and
+/// the page walks of `placement::host_lock`): a split that keeps none
+/// answers `None` for every name.
+pub(crate) fn placed(split: &Split, name: &str) -> Result<Option<Placed>, crate::ModelError> {
+    let Some(gguf::Place::Stack {
+        codes_at,
+        scales_at,
+        codes_per,
+        scales_per,
+        layout,
+        scales,
+        ..
+    }) = split.place(name)
+    else {
+        return Ok(None);
+    };
+    let layout = match layout {
+        gguf::StackLayout::Rows => RowLayout::Rows,
+        gguf::StackLayout::Planes => RowLayout::Planes,
+    };
+    Ok(Some(Placed {
+        runs: StackRuns::new(
+            layout,
+            codes_at.clone(),
+            scales_at.clone(),
+            *codes_per,
+            *scales_per,
+        )?,
+        scales: scales.clone(),
+    }))
+}
+
+/// The runs of [`placed`], for a caller that walks bytes (the host tier's page
+/// locks) and has no use for the tensor scales.
+pub(crate) fn stack_runs(
+    split: &Split,
+    name: &str,
+) -> Result<Option<StackRuns>, crate::ModelError> {
+    Ok(placed(split, name)?.map(|p| p.runs))
 }
 
 /// A routed Q3_K stack of a split model read from its r8 sidecar
@@ -1214,13 +1599,19 @@ impl R8Stack {
     /// Matrix `e` as a dispatch weight: its rows in [`RowLayout::R8`].
     pub(crate) fn expert(&self, e: usize) -> Result<Weight<'_>, crate::ModelError> {
         let stack = self.sidecar.data_of(&self.info)?;
-        expert_weight(&self.source.info, stack, e, RowLayout::R8)
+        expert_weight(
+            &self.source.info,
+            stack,
+            e,
+            RowLayout::R8,
+            self.source.scale_of(e)?,
+        )
     }
 
     /// The stack as a union call reads it, its bytes resolved once.
     pub(crate) fn stack(&self) -> Result<ExpertStack<'_>, crate::ModelError> {
         let bytes = self.sidecar.data_of(&self.info)?;
-        let mut s = ExpertStack::of(&self.source.info, bytes)?;
+        let mut s = ExpertStack::of(&self.source.info, bytes, None)?;
         s.layout = RowLayout::R8;
         Ok(s)
     }
@@ -1229,10 +1620,11 @@ impl R8Stack {
 /// A stacked expert tensor `{k, n, n_expert}` as a union call reads it,
 /// resolved once per call: matrix `e` is the `e`-th of the stack's `n_expert`
 /// equal byte runs — the cut [`ShardTensor::expert`] and `moe::expert_view`
-/// make — so every matrix has the stack's type, shape and row layout. With
-/// a [`StackTier`] lent ([`ExpertStack::with_tier`]), the matrix of an id
-/// outside the plan's host segment is the NVMe tier's slot instead, the same
-/// bytes in the arena.
+/// make — or, for a located stack ([`ExpertStack::located`]), the runs
+/// [`StackRuns`] puts it at; either way every matrix has the stack's type,
+/// shape and row layout. With a [`StackTier`] lent ([`ExpertStack::with_tier`]),
+/// the matrix of an id outside the plan's host segment is the NVMe tier's slot
+/// instead, the same bytes in the arena.
 #[derive(Clone, Copy)]
 pub(crate) struct ExpertStack<'w> {
     name: &'w str,
@@ -1240,9 +1632,16 @@ pub(crate) struct ExpertStack<'w> {
     k: usize,
     n: usize,
     n_expert: usize,
-    /// Bytes of one expert's matrix.
+    /// Bytes of one expert's matrix, all its runs.
     per: usize,
     bytes: &'w [u8],
+    /// Where each matrix's runs lie in `bytes`; `None`: the matrix is the
+    /// `per` bytes at `e · per`.
+    runs: Option<&'w StackRuns>,
+    /// The tensor scale each expert's matrix is dotted with, `n_expert` of
+    /// them for a type that reads one ([`GgmlType::reads_scale`]), indexed by
+    /// id whichever bytes a tier lends; `None` for a type that reads none.
+    scale: Option<&'w [f32]>,
     layout: RowLayout,
     tier: Option<StackTier<'w>>,
 }
@@ -1285,9 +1684,16 @@ impl<'w> StackTier<'w> {
 
 impl<'w> ExpertStack<'w> {
     /// The stack `info` over its bytes `bytes`, read from the file `info`
-    /// came from, row after row.
-    pub(crate) fn of(info: &'w TensorInfo, bytes: &'w [u8]) -> Result<Self, crate::ModelError> {
+    /// came from, row after row, its experts dotted with `scale` — a type that
+    /// reads a tensor scale takes one an expert and is refused by name without
+    /// them; every other type takes none.
+    pub(crate) fn of(
+        info: &'w TensorInfo,
+        bytes: &'w [u8],
+        scale: Option<&'w [f32]>,
+    ) -> Result<Self, crate::ModelError> {
         let (n_expert, per) = stack_cut(info)?;
+        check_stack_scale(info, n_expert, scale)?;
         Ok(ExpertStack {
             name: &info.name,
             ty: info.ty,
@@ -1296,14 +1702,50 @@ impl<'w> ExpertStack<'w> {
             n_expert,
             per,
             bytes,
+            runs: None,
+            scale,
             layout: RowLayout::Rows,
             tier: None,
         })
     }
 
-    /// `info`, a stack of `gguf` — a one-file model's own header.
+    /// The stack `info` whose matrices lie where `runs` puts them in `span`,
+    /// the bytes of the file that holds them (file offset `o` at index `o`),
+    /// in the runs' layout and dotted with `scale` as for [`ExpertStack::of`].
+    /// Refused by name as [`StackRuns::shape`] refuses.
+    pub(crate) fn located(
+        info: &'w TensorInfo,
+        span: &'w [u8],
+        runs: &'w StackRuns,
+        scale: Option<&'w [f32]>,
+    ) -> Result<Self, crate::ModelError> {
+        let (n_expert, per) = runs.shape(info, span.len())?;
+        check_stack_scale(info, n_expert, scale)?;
+        Ok(ExpertStack {
+            name: &info.name,
+            ty: info.ty,
+            k: k_of(info),
+            n: n_of(info),
+            n_expert,
+            per,
+            bytes: span,
+            runs: Some(runs),
+            scale,
+            layout: runs.layout,
+            tier: None,
+        })
+    }
+
+    /// Expert `e`'s tensor scale: 1 for a stack of a type that reads none.
+    /// `e` is one of the stack's experts, as for [`ExpertStack::matrix`].
+    fn scale(&self, e: u32) -> f32 {
+        self.scale.map_or(1.0, |s| s[e as usize])
+    }
+
+    /// `info`, a stack of `gguf` — a one-file model's own header, which
+    /// carries no tensor scale: a type that reads one is refused by name.
     pub(crate) fn in_file(gguf: &'w Gguf, info: &'w TensorInfo) -> Result<Self, crate::ModelError> {
-        ExpertStack::of(info, gguf.data(info)?)
+        ExpertStack::of(info, gguf.data(info)?, None)
     }
 
     /// The stack with the NVMe tier's slots lent for every id outside the
@@ -1330,39 +1772,93 @@ impl<'w> ExpertStack<'w> {
         self.n / self.layout.grain()
     }
 
-    /// Expert `e`'s matrix as a warm fills it: its bytes and the units a row
-    /// pass over it cuts them in. `None` when `e` is a tier id whose slot is
-    /// unfilled — a warm never fills one.
-    pub(crate) fn warm_span(&self, e: u32) -> Option<WarmSpan<'w>> {
-        if let Some(t) = self.tier
-            && t.lends(e)
-        {
-            let bytes = t.slots.slot(t.layer, e, t.part)?;
-            return Some(WarmSpan {
-                bytes,
-                units: self.units(),
-            });
-        }
-        Some(WarmSpan {
-            bytes: self.matrix(e),
-            units: self.units(),
-        })
+    /// Expert `e`'s matrix as a warm fills it: the span of its rows' run and,
+    /// for planes, the span of its group scales' run, each with the units a
+    /// row pass over it cuts them in (a row of either run is a unit's share).
+    /// `None` when `e` is a tier id whose slot is unfilled — a warm never
+    /// fills one.
+    pub(crate) fn warm_spans(&self, e: u32) -> Option<[Option<WarmSpan<'w>>; 2]> {
+        let m = self.matrix_of(e)?;
+        let units = self.units();
+        Some([
+            Some(WarmSpan {
+                bytes: m.rows,
+                units,
+            }),
+            (!m.scale_plane.is_empty()).then_some(WarmSpan {
+                bytes: m.scale_plane,
+                units,
+            }),
+        ])
     }
 
     /// Expert `e`'s matrix bytes: the tier's slot for an id the tier lends,
     /// else the stack's own. `e` is one of the stack's experts: a union call
     /// checks its ids against the stack by name before any pass.
-    fn matrix(&self, e: u32) -> &'w [u8] {
+    fn matrix(&self, e: u32) -> MatrixBytes<'w> {
+        self.matrix_of(e).expect(
+            "host union: a tier id's slot is filled and checked before the call \
+             (HostLayer::experts_step_union_into)",
+        )
+    }
+
+    /// [`ExpertStack::matrix`], `None` for a tier id whose slot is unfilled.
+    /// A slot is one run of the matrix's `per` bytes, a planes matrix's codes
+    /// then its group scales; one of another length is the tier check's
+    /// refusal ([`StackTier`]), so this cut never reads past it.
+    fn matrix_of(&self, e: u32) -> Option<MatrixBytes<'w>> {
         if let Some(t) = self.tier
             && t.lends(e)
         {
-            return t.slots.slot(t.layer, e, t.part).expect(
-                "host union: a tier id's slot is filled and checked before the call \
-                 (HostLayer::experts_step_union_into)",
-            );
+            let slot = t.slots.slot(t.layer, e, t.part)?;
+            let codes = match self.layout {
+                RowLayout::Planes => planes_codes_bytes(self.k, self.n).min(slot.len()),
+                RowLayout::Rows | RowLayout::R8 => slot.len(),
+            };
+            let (rows, scale_plane) = slot.split_at(codes);
+            return Some(MatrixBytes { rows, scale_plane });
         }
         let e = e as usize;
-        &self.bytes[e * self.per..(e + 1) * self.per]
+        Some(match self.runs {
+            Some(runs) => {
+                let (rows, scale_plane) = runs.runs_in(self.bytes, e);
+                MatrixBytes { rows, scale_plane }
+            }
+            None => MatrixBytes {
+                rows: &self.bytes[e * self.per..(e + 1) * self.per],
+                scale_plane: &[],
+            },
+        })
+    }
+}
+
+/// The refusal of stack `info` of `n_expert` experts over `scale`: a type that
+/// reads a tensor scale ([`GgmlType::reads_scale`]) takes one an expert and is
+/// refused by name without them, where the dot would run unscaled.
+fn check_stack_scale(
+    info: &TensorInfo,
+    n_expert: usize,
+    scale: Option<&[f32]>,
+) -> Result<(), crate::ModelError> {
+    if info.ty.reads_scale() && scale.is_none_or(|s| s.len() != n_expert) {
+        return Err(unscaled(info));
+    }
+    Ok(())
+}
+
+/// The bytes of one matrix as a pair reads them: its rows' run (a planes
+/// matrix's codes) and, for [`RowLayout::Planes`], the run of its group
+/// scales; empty for any other layout.
+#[derive(Clone, Copy)]
+struct MatrixBytes<'a> {
+    rows: &'a [u8],
+    scale_plane: &'a [u8],
+}
+
+impl MatrixBytes<'_> {
+    /// Bytes of the matrix, every run.
+    fn len(&self) -> usize {
+        self.rows.len() + self.scale_plane.len()
     }
 }
 
@@ -1377,24 +1873,45 @@ pub struct Weight<'a> {
     ty: GgmlType,
     k: usize,
     n: usize,
+    /// The rows' run; for [`RowLayout::Planes`], the codes of every row.
     bytes: &'a [u8],
+    /// The run of group scales of a [`RowLayout::Planes`] matrix; empty for
+    /// any other layout.
+    scale_plane: &'a [u8],
     layout: RowLayout,
+    /// The tensor scale every row dot is multiplied by (a type that reads
+    /// one, [`GgmlType::reads_scale`]); 1 for any other matrix.
+    scale: f32,
 }
 
 impl<'a> Weight<'a> {
     /// `info` read from `gguf`, which must be the file `info` came from — a
-    /// one-file model, whose headers have no other.
+    /// one-file model, whose headers carry no tensor scale: a type that reads
+    /// one is refused by name.
     pub(crate) fn in_file(
         gguf: &'a Gguf,
         info: &TensorInfo,
     ) -> Result<Weight<'a>, crate::ModelError> {
+        if info.ty.reads_scale() {
+            return Err(unscaled(info));
+        }
         Ok(Weight {
             ty: info.ty,
             k: k_of(info),
             n: n_of(info),
             bytes: gguf.data(info)?,
+            scale_plane: &[],
             layout: RowLayout::Rows,
+            scale: 1.0,
         })
+    }
+
+    /// The matrix's runs as a pair reads them.
+    fn matrix_bytes(&self) -> MatrixBytes<'a> {
+        MatrixBytes {
+            rows: self.bytes,
+            scale_plane: self.scale_plane,
+        }
     }
 
     pub fn ty(&self) -> GgmlType {
@@ -1411,6 +1928,7 @@ impl<'a> Weight<'a> {
         self.n
     }
 
+    /// The rows' bytes; for a planes matrix, the codes of every row.
     pub fn bytes(&self) -> &'a [u8] {
         self.bytes
     }
@@ -1594,10 +2112,13 @@ impl<'a> Weights<'a> {
         }
     }
 
-    fn bytes(self, i: usize) -> Result<&'a [u8], crate::ModelError> {
+    fn bytes(self, i: usize) -> Result<MatrixBytes<'a>, crate::ModelError> {
         match self {
-            Weights::File(gguf, ws) => Ok(gguf.data(ws[i])?),
-            Weights::Resolved(ws) => Ok(ws[i].bytes),
+            Weights::File(gguf, ws) => Ok(MatrixBytes {
+                rows: gguf.data(ws[i])?,
+                scale_plane: &[],
+            }),
+            Weights::Resolved(ws) => Ok(ws[i].matrix_bytes()),
         }
     }
 
@@ -1607,6 +2128,16 @@ impl<'a> Weights<'a> {
         match self {
             Weights::File(..) => RowLayout::Rows,
             Weights::Resolved(ws) => ws[i].layout,
+        }
+    }
+
+    /// Pair `i`'s tensor scale ([`Weight::scale`]). A file header carries none,
+    /// so one whose type reads a tensor scale is refused by name.
+    fn scale(self, i: usize) -> Result<f32, crate::ModelError> {
+        match self {
+            Weights::File(_, ws) if ws[i].ty.reads_scale() => Err(unscaled(ws[i])),
+            Weights::File(..) => Ok(1.0),
+            Weights::Resolved(ws) => Ok(ws[i].scale),
         }
     }
 }
@@ -1825,7 +2356,7 @@ fn group_core(
         }
     };
     let into = matches!(sink, Sink::Into { .. });
-    let mut bytes: Flex<&[u8]> = Flex::new();
+    let mut bytes: Flex<MatrixBytes> = Flex::new();
     let mut meta: Flex<PairMeta> = Flex::new();
     let mut slot_of: Flex<usize> = Flex::new();
     let mut cols_of: Flex<Option<&[usize]>> = Flex::new();
@@ -1858,6 +2389,7 @@ fn group_core(
             });
         }
         let out_cols = src.out_cols();
+        let scale = ws.scale(i)?;
         let b = ws.bytes(i)?;
         // Fused path decided per pair, exactly the single-pair rule: qdot
         // dots the quantized codes directly, so activations are quantized
@@ -1866,9 +2398,21 @@ fn group_core(
         let fused = qdot::fuses(ty, k);
         let layout = ws.layout(i);
         assert!(
-            layout == RowLayout::Rows || (fused && n.is_multiple_of(layout.grain())),
+            matches!(layout, RowLayout::Rows | RowLayout::Planes)
+                || (fused && n.is_multiple_of(layout.grain())),
             "a row-lane matrix is made only where qdot fuses Q3_K at its k, of whole row-lane \
              groups (R8Stack::of): n = {n}"
+        );
+        assert!(
+            layout != RowLayout::Planes
+                || (ty == GgmlType::NVFP4_ROWS
+                    && fused
+                    && b.rows.len() == planes_codes_bytes(k, n)
+                    && b.scale_plane.len() == planes_scales_bytes(k, n)),
+            "a planes matrix is made only for fused NVFP4_ROWS rows, a codes run and a scales \
+             run (StackRuns::shape): {ty} with {} and {} bytes for {n} rows of {k} values",
+            b.rows.len(),
+            b.scale_plane.len()
         );
         let cb = if fused {
             Some(qdot::col_bytes(ty, k))
@@ -2041,8 +2585,9 @@ fn group_core(
             ty,
             k,
             n,
-            row_bytes: b.len() / n,
+            row_bytes: (b.rows.len() + b.scale_plane.len()) / n,
             layout,
+            scale,
         });
         slot_of.push(slot);
         cols_of.push(src.cols());
@@ -2132,7 +2677,7 @@ enum Sink<'o> {
 fn record_rows(
     site: &'static str,
     meta: &Flex<PairMeta>,
-    bytes: &Flex<&[u8]>,
+    bytes: &Flex<MatrixBytes<'_>>,
     ns: u64,
     pacc: &profile::CallAcc,
 ) {
@@ -2255,7 +2800,8 @@ impl<T> Default for Flex<T> {
 /// One (weight view, activation block) pair plus everything a row needs. Its
 /// rows run in [`PairWork::compute_rows`]: file rows there, row-lane groups in
 /// [`PairWork::compute_groups`]. The two cut a row's columns into tile runs
-/// differently — greedy runs of [`qdot::TILE_COLS`] against even runs — and
+/// differently — greedy runs of [`qdot::TILE_COLS`] (of [`qdot::WIDE_COLS`]
+/// for a type with a wide kernel) against even runs — and
 /// write the same values, because every qdot tile writes each (row, column)'s
 /// `dot_row` value bit for bit.
 /// A group is heterogeneous: `ty`/`k`/`n` are this pair's own, not the call's.
@@ -2263,7 +2809,11 @@ struct PairWork<'a> {
     ty: GgmlType,
     k: usize,
     n: usize,
+    /// The rows' run; for [`RowLayout::Planes`], the codes of every row.
     bytes: &'a [u8],
+    /// The run of group scales of a [`RowLayout::Planes`] pair; empty for any
+    /// other layout.
+    scale_plane: &'a [u8],
     row_bytes: usize,
     /// Fused qdot columns: (stride `cb`, quantized byte buffer) as raw parts
     /// — a deferred dispatch's claimer may still be writing them when this
@@ -2283,6 +2833,10 @@ struct PairWork<'a> {
     /// Where each row's bytes lie: a row-lane pair computes its rows a group
     /// at a time.
     layout: RowLayout,
+    /// The tensor scale each of the pair's dots is multiplied by, once, after
+    /// the dot ([`PairMeta::scale`]): 1 for a pair of a type that reads none,
+    /// and for a row-lane or r8 pair, which is of one.
+    scale: f32,
     /// The slot whose columns this pair reads, and the claim table when
     /// quantization is deferred into the dispatch (`None`: the pre-pass
     /// completed every column before any row runs).
@@ -2305,8 +2859,12 @@ struct PairMeta {
     ty: GgmlType,
     k: usize,
     n: usize,
+    /// Bytes of one row, every run of it.
     row_bytes: usize,
     layout: RowLayout,
+    /// The tensor scale each of the pair's dots is multiplied by
+    /// ([`Weight::scale`]).
+    scale: f32,
 }
 
 impl<'a> PairWork<'a> {
@@ -2316,7 +2874,7 @@ impl<'a> PairWork<'a> {
     /// pair's column map.
     fn new(
         out: &mut Tensor2,
-        bytes: &'a [u8],
+        bytes: MatrixBytes<'a>,
         src: (SharedQuantCols, usize, Option<&'a [usize]>),
         m: PairMeta,
         slot: usize,
@@ -2337,7 +2895,7 @@ impl<'a> PairWork<'a> {
     /// columns: `n · ne1` cells from there, column `t` at `t · n`.
     fn at(
         (out_ptr, ne1): (SharedOut, usize),
-        bytes: &'a [u8],
+        bytes: MatrixBytes<'a>,
         src: (SharedQuantCols, usize, Option<&'a [usize]>),
         m: PairMeta,
         slot: usize,
@@ -2352,7 +2910,8 @@ impl<'a> PairWork<'a> {
             ty: m.ty,
             k: m.k,
             n: m.n,
-            bytes,
+            bytes: bytes.rows,
+            scale_plane: bytes.scale_plane,
             row_bytes: m.row_bytes,
             fused_cols,
             q_f32,
@@ -2361,6 +2920,7 @@ impl<'a> PairWork<'a> {
             ne1,
             out: out_ptr,
             layout: m.layout,
+            scale: m.scale,
             slot,
             defer,
         }
@@ -2406,34 +2966,54 @@ impl<'a> PairWork<'a> {
             if self.layout == RowLayout::R8 {
                 return self.compute_groups(rows, acol, cb, lvl, acc);
             }
+            if self.layout == RowLayout::Planes {
+                return self.compute_planes(rows, acol, cb, lvl, acc);
+            }
             // Fused rows: `qdot` dots the weight bytes and the quantized
             // columns directly — no f32 row, ROW_BUF untouched;
             // `add_dequant_w` stays 0 (the dequant is in the dot timer). A
             // lone column takes `qdot::dot_row`; runs of up to
             // `qdot::TILE_COLS` columns take `qdot::dot_row_cols`, which
-            // unpacks the row's blocks once per run and writes each column's
-            // `dot_row` value bit for bit.
+            // unpacks the row's blocks once per run, and a type with a wide
+            // kernel (`qdot::has_wide`) takes runs of up to `qdot::WIDE_COLS`
+            // through `qdot::dot_row_cols_wide`, which unpacks them once per
+            // run of that width; each writes each column's `dot_row` value
+            // bit for bit.
+            let wide = qdot::has_wide(ty);
+            let run = if wide {
+                qdot::WIDE_COLS
+            } else {
+                qdot::TILE_COLS
+            };
             for r in rows {
                 let src = &self.bytes[r * self.row_bytes..(r + 1) * self.row_bytes];
                 let t_dot = if lvl >= 2 { Some(Instant::now()) } else { None };
                 let mut t0 = 0;
                 while t0 < self.ne1 {
-                    let m = (self.ne1 - t0).min(qdot::TILE_COLS);
+                    let m = (self.ne1 - t0).min(run);
                     if m == 1 {
                         let c = self.col(t0);
                         let v = qdot::dot_row(ty, src, &acol[c * cb..(c + 1) * cb], k)?;
                         // SAFETY: cell `t0 * n + r` is inside this chunk's row range — see the SharedOut construction site.
-                        unsafe { self.out.write(t0 * n + r, v) };
+                        unsafe { self.out.write(t0 * n + r, v * self.scale) };
                     } else {
-                        let cols: [&[u8]; qdot::TILE_COLS] = std::array::from_fn(|i| {
-                            let c = self.col(t0 + i.min(m - 1));
-                            &acol[c * cb..(c + 1) * cb]
-                        });
-                        let mut v = [0.0f32; qdot::TILE_COLS];
-                        qdot::dot_row_cols(ty, src, &cols[..m], k, &mut v[..m])?;
+                        let mut v = [0.0f32; qdot::WIDE_COLS];
+                        if wide {
+                            let cols: [&[u8]; qdot::WIDE_COLS] = std::array::from_fn(|i| {
+                                let c = self.col(t0 + i.min(m - 1));
+                                &acol[c * cb..(c + 1) * cb]
+                            });
+                            qdot::dot_row_cols_wide(ty, src, &cols[..m], k, &mut v[..m])?;
+                        } else {
+                            let cols: [&[u8]; qdot::TILE_COLS] = std::array::from_fn(|i| {
+                                let c = self.col(t0 + i.min(m - 1));
+                                &acol[c * cb..(c + 1) * cb]
+                            });
+                            qdot::dot_row_cols(ty, src, &cols[..m], k, &mut v[..m])?;
+                        }
                         for (i, &v) in v[..m].iter().enumerate() {
                             // SAFETY: cell `(t0 + i) * n + r` is inside this chunk's row range — see the SharedOut construction site.
-                            unsafe { self.out.write((t0 + i) * n + r, v) };
+                            unsafe { self.out.write((t0 + i) * n + r, v * self.scale) };
                         }
                     }
                     t0 += m;
@@ -2468,7 +3048,7 @@ impl<'a> PairWork<'a> {
                             let xc = &q_f32[c * k..(c + 1) * k];
                             let v = qdot::dot_f32(src, xc).expect("support is per (cpu, k)");
                             // SAFETY: cell `t * n + r` is inside this chunk's row range — see the SharedOut construction site.
-                            unsafe { self.out.write(t * n + r, v) };
+                            unsafe { self.out.write(t * n + r, v * self.scale) };
                         }
                         if let Some(t_dot) = t_dot {
                             acc.add_dot(t_dot.elapsed().as_nanos() as u64);
@@ -2498,7 +3078,7 @@ impl<'a> PairWork<'a> {
                             a += row[i] * xc[i];
                         }
                         // SAFETY: cell `t * n + r` is inside this chunk's row range — see the SharedOut construction site.
-                        unsafe { self.out.write(t * n + r, a) };
+                        unsafe { self.out.write(t * n + r, a * self.scale) };
                     }
                     if let Some(t_dot) = t_dot {
                         acc.add_dot(t_dot.elapsed().as_nanos() as u64);
@@ -2555,6 +3135,58 @@ impl<'a> PairWork<'a> {
                         // SharedOut construction site.
                         unsafe { self.out.write((t0 + i) * n + g * G + r, val) };
                     }
+                }
+                t0 += m;
+            }
+            if let Some(t_dot) = t_dot {
+                acc.add_dot(t_dot.elapsed().as_nanos() as u64);
+            }
+        }
+        Ok(())
+    }
+
+    /// Rows `rows` of a [`RowLayout::Planes`] pair across every token column
+    /// against the quantized columns `acol` of `cb` bytes: each row's code
+    /// row and scale row, one in each run of the matrix, through the planes
+    /// tile in runs of up to [`qdot::TILE_COLS`] columns
+    /// ([`qdot::dot_nvfp4_planes_row_cols`], each column's
+    /// [`qdot::dot_nvfp4_planes_row`] value bit for bit), times the matrix's
+    /// tensor scale.
+    fn compute_planes(
+        &self,
+        rows: Range<usize>,
+        acol: &[u8],
+        cb: usize,
+        lvl: u8,
+        acc: &mut profile::CallAcc,
+    ) -> Result<(), crate::ModelError> {
+        let (k, n) = (self.k, self.n);
+        let (code_row, scale_row) = (k / 2, k / 16);
+        let (codes, scales) = (self.bytes, self.scale_plane);
+        assert!(
+            codes.len() == n * code_row && scales.len() == n * scale_row,
+            "a planes pair's runs are {} code and {} scale bytes, got {} and {}",
+            n * code_row,
+            n * scale_row,
+            codes.len(),
+            scales.len()
+        );
+        for r in rows {
+            let codes = &codes[r * code_row..(r + 1) * code_row];
+            let scales = &scales[r * scale_row..(r + 1) * scale_row];
+            let t_dot = if lvl >= 2 { Some(Instant::now()) } else { None };
+            let mut t0 = 0;
+            while t0 < self.ne1 {
+                let m = (self.ne1 - t0).min(qdot::TILE_COLS);
+                let cols: [&[u8]; qdot::TILE_COLS] = std::array::from_fn(|i| {
+                    let c = self.col(t0 + i.min(m - 1));
+                    &acol[c * cb..(c + 1) * cb]
+                });
+                let mut v = [0.0f32; qdot::TILE_COLS];
+                qdot::dot_nvfp4_planes_row_cols(codes, scales, &cols[..m], k, &mut v[..m]);
+                for (i, &v) in v[..m].iter().enumerate() {
+                    // SAFETY: cell `(t0 + i) * n + r` is inside this chunk's row range — see the SharedOut construction site.
+                    unsafe { self.out.write((t0 + i) * n + r, v * self.scale) };
                 }
                 t0 += m;
             }
@@ -3202,7 +3834,7 @@ struct Arm {
 fn run_group(
     slots: &Flex<QuantSlot<'_>>,
     map: &PairMap<'_, '_>,
-    bytes: &Flex<&[u8]>,
+    bytes: &Flex<MatrixBytes<'_>>,
     meta: &Flex<PairMeta>,
     outs: &mut [Tensor2],
     lvl: u8,
@@ -3256,7 +3888,7 @@ fn run_group(
         let s = *map.slot_of.get(i);
         pairs.push(PairWork::new(
             out,
-            bytes.get(i),
+            *bytes.get(i),
             (*shared.get(s), slots.get(s).x.ne1(), *map.cols_of.get(i)),
             *meta.get(i),
             s,
@@ -3317,7 +3949,9 @@ fn tile_units(ty: GgmlType) -> Option<(u64, u64)> {
         GgmlType::IQ4_XS => Some((146, 95)),
         // The grid types decode a super-block's eight sub-blocks in a loop, so their fixed part is large.
         GgmlType::IQ2_XS => Some((624, 102)),
-        GgmlType::IQ2_XXS => Some((598, 134)),
+        // The IQ2_XXS tile is the wide kernel's one group (`qdot::dot_row_cols_wide`): the block's
+        // pack, and each column's eight sub-blocks against it with its sum in a register.
+        GgmlType::IQ2_XXS => Some((584, 92)),
         GgmlType::IQ3_XXS => Some((692, 106)),
         GgmlType::IQ3_S => Some((780, 96)),
         // Per 32-value block (`qdot::k_granularity`): a quarter of an x4 group's instructions.
@@ -3330,9 +3964,10 @@ fn tile_units(ty: GgmlType) -> Option<(u64, u64)> {
 }
 
 /// What one unit of a pair costs a lane when its columns go through the tile
-/// kernel in runs of up to [`qdot::TILE_COLS`], as `compute_rows` walks them:
-/// per super-block one fixed unpack per run plus each column's share. `None`
-/// for a pair without a tile kernel on this machine.
+/// kernel in runs of up to [`qdot::TILE_COLS`] — [`qdot::WIDE_COLS`] for a type
+/// with a wide kernel ([`qdot::has_wide`]) — as `compute_rows` walks them: per
+/// super-block one fixed unpack per run plus each column's share. `None` for a
+/// pair without a tile kernel on this machine.
 fn tile_cost(p: &PairWork<'_>) -> Option<u64> {
     p.fused_cols
         .and_then(|_| unit_tile_cost(p.ty, p.layout, p.k, p.ne1))
@@ -3344,6 +3979,8 @@ fn unit_tile_cost(ty: GgmlType, layout: RowLayout, k: usize, ne1: usize) -> Opti
     match layout {
         RowLayout::Rows => tile_cost_of(ty, k, ne1),
         RowLayout::R8 => r8_tile_cost(k, ne1),
+        // The planes tile (`qdot::dot_nvfp4_planes_row_cols`) has no `tile_units` row, so a planes pair is cut by `row_cost`.
+        RowLayout::Planes => None,
     }
 }
 
@@ -3403,6 +4040,10 @@ fn lane_tile_cost(ty: GgmlType, k: usize, ne1: usize) -> Option<u64> {
 }
 
 /// [`tile_cost`] of a fused row of `ty` over `k` values against `ne1` columns.
+/// A type with a wide kernel unpacks a row once a run of [`qdot::WIDE_COLS`]
+/// and is priced at its tile's units ([`tile_units`]): its tile is the wide
+/// kernel's one group, so the row's fixed part is the wide run's unpack and
+/// its per-column part a column of a group.
 fn tile_cost_of(ty: GgmlType, k: usize, ne1: usize) -> Option<u64> {
     let (fixed, per_col) = tile_units(ty)?;
     if !qdot::has_tile(ty) {
@@ -3410,7 +4051,12 @@ fn tile_cost_of(ty: GgmlType, k: usize, ne1: usize) -> Option<u64> {
     }
     let m = ne1.max(1) as u64;
     let sb = (k / qdot::k_granularity(ty)) as u64;
-    Some(sb * (m.div_ceil(qdot::TILE_COLS as u64) * fixed + m * per_col))
+    let run = if qdot::has_wide(ty) {
+        qdot::WIDE_COLS
+    } else {
+        qdot::TILE_COLS
+    };
+    Some(sb * (m.div_ceil(run as u64) * fixed + m * per_col))
 }
 
 /// One lane of a row dispatch: the next unclaimed unit ([`RowSet`]) and the
@@ -4375,10 +5021,19 @@ impl<'p> UnionPlanView<'p> {
 
     /// Column `j`'s weighted sum into `o`, from zero in the order of its list
     /// `list` — the one-column call's order — over the downs in `store`, slot
-    /// `q`'s at `store[q·w..(q + 1)·w]`, `w` the width of `o`. Expert `d`'s
-    /// slots are the ones from `slot[d]` on: `off` for a call that ran whole,
-    /// the batch order's for one served in batches.
-    fn sum_col(self, slot: &[usize], store: &[f32], list: &[(u32, f32)], j: usize, o: &mut [f32]) {
+    /// `q`'s at `store[q·w..(q + 1)·w]`, `w` the width of `o`; with `post`,
+    /// each down normed before its weight ([`PostNorm::add_normed`]). Expert
+    /// `d`'s slots are the ones from `slot[d]` on: `off` for a call that ran
+    /// whole, the batch order's for one served in batches.
+    fn sum_col(
+        self,
+        slot: &[usize],
+        store: &[f32],
+        list: &[(u32, f32)],
+        post: Option<&PostNorm>,
+        j: usize,
+        o: &mut [f32],
+    ) {
         let w_col = o.len();
         o.fill(0.0);
         for &(e, w) in list {
@@ -4391,8 +5046,14 @@ impl<'p> UnionPlanView<'p> {
                 .binary_search(&j)
                 .expect("a listing column is in its expert's columns");
             let q = slot[d] + t;
-            for (o, &dv) in o.iter_mut().zip(&store[q * w_col..(q + 1) * w_col]) {
-                *o += w * dv;
+            let row = &store[q * w_col..(q + 1) * w_col];
+            match post {
+                Some(post) => post.add_normed(o, w, row),
+                None => {
+                    for (o, &dv) in o.iter_mut().zip(row) {
+                        *o += w * dv;
+                    }
+                }
             }
         }
     }
@@ -4457,6 +5118,82 @@ pub enum ExpertForm {
     Relu2,
 }
 
+/// A layer's norm of each routed expert's down row before the row's router
+/// weight applies: the row scaled by `gain`, then divided by the root of its
+/// mean square plus `eps` (the card's `gain_rms_norm`). An architecture whose
+/// experts' outputs are normed before their weights (muse-spark's
+/// `ffn_post_exp_norm`) cannot sum the weighted rows first, so the leg's sum
+/// takes each row through the norm as it adds it ([`PostNorm::add_normed`]).
+/// An activation fact the architecture decides, beside the sums that read it.
+pub struct PostNorm {
+    gain: Box<[f32]>,
+    eps: f32,
+}
+
+impl PostNorm {
+    /// The norm of rows as wide as `gain` at `eps`; `None` for an epsilon
+    /// that is not finite and positive.
+    #[must_use]
+    pub fn new(gain: Vec<f32>, eps: f32) -> Option<PostNorm> {
+        (eps.is_finite() && eps > 0.0).then(|| PostNorm {
+            gain: gain.into_boxed_slice(),
+            eps,
+        })
+    }
+
+    /// The width of the rows it norms.
+    #[must_use]
+    pub fn width(&self) -> usize {
+        self.gain.len()
+    }
+
+    /// The reciprocal root `row` scales by: the products `row ⊙ gain` first,
+    /// their squares summed in eight running sums (lane `i` takes the values
+    /// at `i` mod 8) added lane 0 to 7, over the width, plus `eps`. That order
+    /// is the host's one result.
+    fn scale(&self, row: &[f32]) -> f32 {
+        let n = row.len();
+        debug_assert_eq!(n, self.gain.len(), "a gain of the row's width");
+        let body = n - n % 8;
+        let (row_body, row_tail) = row.split_at(body);
+        let (gain_body, gain_tail) = self.gain.split_at(body);
+        let mut lanes = [0.0f32; 8];
+        let ((row_chunks, _), (gain_chunks, _)) =
+            (row_body.as_chunks::<8>(), gain_body.as_chunks::<8>());
+        for (r, g) in row_chunks.iter().zip(gain_chunks) {
+            for ((&r, &g), l) in r.iter().zip(g).zip(&mut lanes) {
+                let v = r * g;
+                *l += v * v;
+            }
+        }
+        for ((&r, &g), l) in row_tail.iter().zip(gain_tail).zip(&mut lanes) {
+            let v = r * g;
+            *l += v * v;
+        }
+        let sum_sq: f32 = lanes.iter().sum();
+        1.0 / (sum_sq / n as f32 + self.eps).sqrt()
+    }
+
+    /// `row` normed in place: each value `(row · gain) · scale`, the scale
+    /// [`PostNorm::scale`]'s.
+    pub fn norm(&self, row: &mut [f32]) {
+        let scale = self.scale(row);
+        for (r, &g) in row.iter_mut().zip(&self.gain) {
+            *r = *r * g * scale;
+        }
+    }
+
+    /// `o += w · norm(row)`, value by value: the same products and scale as
+    /// [`PostNorm::norm`], so the sum is the one over the normed row, with
+    /// `row` left as it is.
+    pub fn add_normed(&self, o: &mut [f32], w: f32, row: &[f32]) {
+        let scale = self.scale(row);
+        for ((o, &r), &g) in o.iter_mut().zip(row).zip(&self.gain) {
+            *o += w * (r * g * scale);
+        }
+    }
+}
+
 /// One stack of a union call, read off its [`ExpertStack`]: the weight type,
 /// the values a row contracts, its rows, the bytes of a row, the bytes of one
 /// input column in the type's encoding, and where its rows lie.
@@ -4477,7 +5214,10 @@ impl UnionStack {
     /// row-lane stack's groups) are [`crate::ModelError::HostLayout`]; a type
     /// without a fused kernel at `k` is
     /// [`crate::ModelError::HostStack`], naming `what`, the stack, its type
-    /// and `k`, which every expert of the stack shares.
+    /// and `k`, which every expert of the stack shares. Also refused by name:
+    /// the planes layout on a type that is not `NVFP4_ROWS`, and `NVFP4_ROWS`
+    /// in any other layout. (A type that reads a tensor scale never reaches a
+    /// stack without one an expert: [`ExpertStack::of`] refuses it.)
     pub(crate) fn of(
         s: &ExpertStack<'_>,
         what: &'static str,
@@ -4500,6 +5240,16 @@ impl UnionStack {
                 layout: s.layout.name(),
             });
         }
+        // The planes layout is NVFP4_ROWS' and NVFP4_ROWS has no other the
+        // host reads: a mismatch would dot bytes as rows they are not.
+        if (s.layout == RowLayout::Planes) != (s.ty == GgmlType::NVFP4_ROWS) {
+            return Err(crate::ModelError::HostLayout {
+                what: "host union: the planes layout holds NVFP4_ROWS rows, and NVFP4_ROWS rows \
+                       are read in no other layout",
+                tensor: s.name.to_owned(),
+                layout: s.layout.name(),
+            });
+        }
         host_stack_runs(what, s.name, s.ty, k)?;
         Ok(UnionStack {
             ty: s.ty,
@@ -4514,9 +5264,9 @@ impl UnionStack {
     /// A union call's `[gate, up, down]` stacks, each checked by
     /// [`UnionStack::of`]: gate and up map `embd -> ff`, down maps
     /// `ff -> embd`; the gate and the up share one row layout, so their pass
-    /// walks one kind of unit, and the down is read row after row — the r8
-    /// sidecar holds gates and ups only. The one check both a call and a host
-    /// tier's load make.
+    /// walks one kind of unit, and the down is read a row at a time (rows or
+    /// planes, never r8: the r8 sidecar holds gates and ups only). The one
+    /// check both a call and a host tier's load make.
     pub(crate) fn of_call(
         stacks: &[ExpertStack<'_>; 3],
         embd: usize,
@@ -4549,7 +5299,7 @@ impl UnionStack {
                 layout: s.layout.name(),
             })
         };
-        if call[2].layout != RowLayout::Rows {
+        if call[2].layout == RowLayout::R8 {
             return layout_refusal(
                 "host union: the down must be read row after row",
                 &stacks[2],
@@ -4571,13 +5321,16 @@ impl UnionStack {
             && gguf::activation_format(self.ty) == gguf::activation_format(other.ty)
     }
 
-    fn meta(&self) -> PairMeta {
+    /// The pair facts of one expert's matrix of this stack; `scale` is the
+    /// expert's tensor scale ([`ExpertStack::scale`]).
+    fn meta(&self, scale: f32) -> PairMeta {
         PairMeta {
             ty: self.ty,
             k: self.k,
             n: self.n,
             row_bytes: self.row_bytes,
             layout: self.layout,
+            scale,
         }
     }
 
@@ -4947,7 +5700,8 @@ impl RowSet for UnionRows<'_, '_> {
         // slot of the plan (asserted where the pass is built).
         let out = unsafe { self.out.offset(first * st.n) };
         let g = self.grain();
-        let work = PairWork::at((out, m), bytes, src, st.meta(), 0, None);
+        let meta = st.meta(self.sources[s].scale(self.plan.ids[d]));
+        let work = PairWork::at((out, m), bytes, src, meta, 0, None);
         let rows = units.start * g..units.end * g;
         // SAFETY: the units are pair `p`'s and this participant's alone (this
         // fn's `# Safety`); the input columns were written before this read,
@@ -5055,7 +5809,8 @@ fn room<'s, T>(slab: &'s mut [T], len: usize, what: &str) -> &'s mut [T] {
 /// quantized, every expert's gate and up, every slot's combine quantized,
 /// every expert's down, every column's sum. Every (row, column) dot is
 /// `compute_rows`' — the tile kernel over runs of up to [`qdot::TILE_COLS`]
-/// of the expert's columns — every column's quantization and combine is the
+/// of the expert's columns, or the wide kernel over runs of up to
+/// [`qdot::WIDE_COLS`] for a type with one — every column's quantization and combine is the
 /// one call any path makes for it, and none depends on the call's width or
 /// on who runs it.
 pub(crate) struct UnionCall<'c, 'w> {
@@ -5068,6 +5823,9 @@ pub(crate) struct UnionCall<'c, 'w> {
     down: UnionStack,
     /// How the two row passes lay their units over the participants.
     spread: Lanes,
+    /// The norm each down takes before its weight in the sums, when the
+    /// layer has one.
+    post: Option<&'c PostNorm>,
 }
 
 impl<'c, 'w> UnionCall<'c, 'w> {
@@ -5104,6 +5862,7 @@ impl<'c, 'w> UnionCall<'c, 'w> {
             up,
             down,
             spread: Lanes::Flat,
+            post: None,
         })
     }
 
@@ -5111,6 +5870,13 @@ impl<'c, 'w> UnionCall<'c, 'w> {
     /// says (flat by default): the same values, bit for bit, whichever lanes.
     pub(crate) fn spread_over(self, spread: Lanes) -> Self {
         UnionCall { spread, ..self }
+    }
+
+    /// The call whose sums take each down through `post` before its weight
+    /// ([`PostNorm::add_normed`]); `None`, the plain weighted sum (the
+    /// default).
+    pub(crate) fn post_normed(self, post: Option<&'c PostNorm>) -> Self {
+        UnionCall { post, ..self }
     }
 
     /// The cells the gate/up pass writes: two columns a slot gated — the
@@ -5125,8 +5891,10 @@ impl<'c, 'w> UnionCall<'c, 'w> {
 
     /// The call's passes, in order, through `slabs` into `out`: column `j`
     /// of `out` (`out[j·embd..(j + 1)·embd]`) is `lists[j]`'s weighted sum of
-    /// its experts' downs of column `j` of x, from zero in list order.
-    /// `lists` are the lists the plan was built from, one per column of x.
+    /// its experts' downs of column `j` of x, from zero in list order, each
+    /// down normed first for a call with a post-norm
+    /// ([`UnionCall::post_normed`]). `lists` are the lists the plan was built
+    /// from, one per column of x.
     ///
     /// A call past [`DEFER_MAX_COLS`] columns runs five passes over the pool:
     /// x quantized — once more in the up's encoding when the up's rows read
@@ -5567,7 +6335,7 @@ impl<'c, 'w> UnionCall<'c, 'w> {
         let (cols, embd) = (self.x.ne1(), self.down.n);
         if cols <= UNION_INLINE_COLS {
             for (j, o) in out.chunks_exact_mut(embd).enumerate() {
-                self.plan.sum_col(slot, store, lists[j], j, o);
+                self.plan.sum_col(slot, store, lists[j], self.post, j, o);
             }
             return false;
         }
@@ -5581,7 +6349,7 @@ impl<'c, 'w> UnionCall<'c, 'w> {
                 // SAFETY: the method's contract — column `j` is in this
                 // participant's chunk, inside `out` (see the construction site).
                 let o = unsafe { out.cells_mut(j * embd, embd) };
-                self.plan.sum_col(slot, store, lists[j], j, o);
+                self.plan.sum_col(slot, store, lists[j], self.post, j, o);
             }
         });
         true
@@ -5609,6 +6377,10 @@ fn matmul_q_one(
     let lvl = profile::level();
     let mut pacc = profile::CallAcc::new();
     let t_call = if lvl > 0 { Some(Instant::now()) } else { None };
+    // A header of a one-file model carries no tensor scale (see `unscaled`).
+    if ty.reads_scale() {
+        return Err(unscaled(w));
+    }
     let bytes = gguf.data(w)?;
     let row_bytes = bytes.len() / n;
     let fused = qdot::fuses(ty, k);
@@ -5635,8 +6407,11 @@ fn matmul_q_one(
     slot_of.push(0);
     let mut cols_of: Flex<Option<&[usize]>> = Flex::new();
     cols_of.push(None);
-    let mut bytes_f: Flex<&[u8]> = Flex::new();
-    bytes_f.push(bytes);
+    let mut bytes_f: Flex<MatrixBytes> = Flex::new();
+    bytes_f.push(MatrixBytes {
+        rows: bytes,
+        scale_plane: &[],
+    });
     let mut meta: Flex<PairMeta> = Flex::new();
     meta.push(PairMeta {
         ty,
@@ -5644,6 +6419,7 @@ fn matmul_q_one(
         n,
         row_bytes,
         layout: RowLayout::Rows,
+        scale: 1.0,
     });
     let mut out = Tensor2::scratch(n, x.ne1);
     // SAFETY: the construction-site argument in `run_group`'s pair build —
@@ -5718,6 +6494,10 @@ pub(crate) fn matvec_q_local(
             got_ne0: out.len(),
             got_ne1: 1,
         });
+    }
+    // A header of a one-file model carries no tensor scale (see `unscaled`).
+    if ty.reads_scale() {
+        return Err(unscaled(w));
     }
     let bytes = gguf.data(w)?;
     let row_bytes = bytes.len() / n;
@@ -6009,6 +6789,125 @@ mod tests {
         }
     }
 
+    /// `n` rows of `k` values of `ty` over finite bytes: a Q8_0 block's f16
+    /// scale 2^-4 and varied codes, f32 or f16 values from a short cycle.
+    fn finite_rows(ty: GgmlType, k: usize, n: usize) -> Vec<u8> {
+        let f16 = [0x3C00u16, 0xB800, 0x3400, 0xBC00, 0x4000, 0x3800];
+        let f32s = [1.0f32, -0.5, 0.25, -2.0, 0.75, 3.0];
+        match ty {
+            GgmlType::Q8_0 => (0..n * k / 32)
+                .flat_map(|b| {
+                    let codes = (0..32).map(move |i| ((b * 7 + i * 5) % 41) as i8 - 20);
+                    0x2C00u16
+                        .to_le_bytes()
+                        .into_iter()
+                        .chain(codes.map(|c| c as u8))
+                })
+                .collect(),
+            GgmlType::F16 => (0..n * k)
+                .flat_map(|i| f16[i % f16.len()].to_le_bytes())
+                .collect(),
+            GgmlType::F32 => (0..n * k)
+                .flat_map(|i| f32s[i % f32s.len()].to_le_bytes())
+                .collect(),
+            other => panic!("no finite rows for {other}"),
+        }
+    }
+
+    /// The pair's tensor scale multiplies every cell the rows arm writes,
+    /// once, after the dot, in each of its write sites: a fused row against
+    /// one column and against a tile of columns (Q8_0), an f32 row against
+    /// f32 columns (F32) and the dequantized row (F16). A scale of 1 leaves
+    /// the cell's bits, and a power of two moves them exactly, so each cell at
+    /// scale `s` is the cell at scale 1 times `s`, bit for bit.
+    #[test]
+    fn a_rows_pair_is_multiplied_by_its_tensor_scale_in_every_write_site() {
+        for (ty, k) in [
+            (GgmlType::Q8_0, 64),
+            (GgmlType::F32, 32),
+            (GgmlType::F16, 32),
+        ] {
+            let n = 5;
+            let bytes = finite_rows(ty, k, n);
+            for cols in [1usize, 3] {
+                let x = Tensor2::from_vec(
+                    k,
+                    cols,
+                    (0..k * cols)
+                        .map(|i| (i % 13) as f32 / 13.0 - 0.4)
+                        .collect(),
+                );
+                let run = |scale: f32| {
+                    let w = Weight {
+                        ty,
+                        k,
+                        n,
+                        bytes: &bytes,
+                        scale_plane: &[],
+                        layout: RowLayout::Rows,
+                        scale,
+                    };
+                    let mut out = [Tensor2::zeros(n, cols)];
+                    matmul_q_group_into("test", &[w], &[&x], &mut out).unwrap();
+                    out[0].data.clone()
+                };
+                let base = run(1.0);
+                assert!(
+                    base.iter().any(|v| v.abs() > 1e-3),
+                    "{ty} {cols} columns: the cells are not all zero"
+                );
+                for scale in [0.5f32, 4.0] {
+                    let want: Vec<u32> = base.iter().map(|v| (v * scale).to_bits()).collect();
+                    let got: Vec<u32> = run(scale).iter().map(|v| v.to_bits()).collect();
+                    assert_eq!(got, want, "{ty} {cols} columns at scale {scale}");
+                }
+            }
+        }
+    }
+
+    /// A type that reads a tensor scale ([`GgmlType::reads_scale`]) is dotted at
+    /// it or not at all: every entry that takes a header of a one-file model,
+    /// which carries no scale, refuses such a tensor by name — the tensor, its
+    /// type and its scale — before qdot is asked for a kernel, instead of
+    /// running the dot unscaled. Over zero bytes an unscaled dot would be 0,
+    /// so the refusal is the only thing that tells. The headers are the file's
+    /// NVFP4 tensor and the same header given each of bloomery's own scale
+    /// types, which a located split's shards carry.
+    #[test]
+    fn a_header_of_a_scale_reading_type_is_refused_by_every_entry_that_carries_no_scale() {
+        let path = one_tensor_file(GgmlType::NVFP4, 64);
+        let g = Gguf::open(&path).unwrap();
+        let file_header = g.find("w").unwrap();
+        let x = Tensor2::zeros(64, 1);
+        let mut out = [0.0f32; 2];
+        for ty in [GgmlType::NVFP4, GgmlType::NVFP4_ROWS, GgmlType::F8E4M3_ROWS] {
+            assert!(ty.reads_scale());
+            let mut header = file_header.clone();
+            header.ty = ty;
+            let w = &header;
+            let errors = [
+                ("matmul_q", refusal(matmul_q(&g, w, &x))),
+                ("matmul_q_group", refusal(matmul_q_group(&g, &[w], &[&x]))),
+                (
+                    "matmul_q_group_swiglu",
+                    refusal(matmul_q_group_swiglu(&g, &[w], &[GroupInput::Ready(&x)])),
+                ),
+                (
+                    "matvec_q_local",
+                    refusal(matvec_q_local(&g, w, x.col(0), &mut out)),
+                ),
+                ("Weight::in_file", refusal(Weight::in_file(&g, w))),
+            ];
+            for (entry, e) in &errors {
+                assert!(
+                    e.contains('w') && e.contains(&ty.to_string()) && e.contains("tensor scale"),
+                    "{entry} over {ty}: the refusal names the tensor, the type and its scale, got {e:?}"
+                );
+            }
+        }
+        std::fs::remove_file(&path).unwrap();
+    }
+
     /// No CPU matmul takes a BF16 weight: every entry that reaches the scalar arm of the
     /// fused decision refuses it with an error naming the type, instead of running it
     /// against f32 activations. A Q8_0 or Q2_0 weight takes the fused arm in every entry
@@ -6148,6 +7047,8 @@ mod tests {
             n_expert,
             per,
             bytes,
+            runs: None,
+            scale: None,
             layout: RowLayout::Rows,
             tier: None,
         }
@@ -6328,7 +7229,9 @@ mod tests {
             k,
             n,
             bytes: &rows,
+            scale_plane: &[],
             layout: RowLayout::Rows,
+            scale: 1.0,
         };
         let r8 = Weight {
             bytes: &lanes,
@@ -6385,7 +7288,9 @@ mod tests {
             k,
             n,
             bytes: &lanes[..rows.len() / 16 * n],
+            scale_plane: &[],
             layout: RowLayout::R8,
+            scale: 1.0,
         };
         let x = Tensor2::from_vec(k, 1, (0..k).map(|i| i as f32 / k as f32 - 0.5).collect());
         let mut out = [Tensor2::zeros(n, 1)];
@@ -7169,5 +8074,622 @@ mod ccd_tests {
         let full = warm_walk(&spans, &map, 1, || false, &mut |_: &[u8], _, _| {});
         assert!(!full.cut);
         assert_eq!(warm_share(&spans, &map, 1, || false), full);
+    }
+}
+
+/// The planes layout's gates: where a located stack's matrices lie, what the
+/// tensor scale of a stack is and where it is refused, what a planes row dots
+/// to, and the fixtures the union call's gate reads (`moe::planes_union_tests`).
+#[cfg(test)]
+pub(crate) mod planes_tests {
+    use super::{
+        ExpertStack, RowLayout, ShardTensor, StackRuns, Tensor2, UnionStack, matmul_q_group_into,
+        placed_scales, planes_codes_bytes, planes_scales_bytes,
+    };
+    use gguf::quant::Nvfp4Rows;
+    use gguf::write::{Layout, TensorDecl, Writer};
+    use gguf::{GgmlType, Split, TensorInfo};
+    use std::sync::Arc;
+
+    fn next(state: &mut u64) -> u64 {
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        *state >> 33
+    }
+
+    /// An `n`-row matrix of `k`-value `NVFP4_ROWS` rows in the planes layout,
+    /// as made: random code bytes, then a defined UE4M3 scale a group (exponent
+    /// 3 to 10, any mantissa).
+    pub(crate) fn planes_matrix(k: usize, n: usize, seed: u64) -> Vec<u8> {
+        let mut st = seed;
+        let mut m: Vec<u8> = (0..planes_codes_bytes(k, n))
+            .map(|_| next(&mut st) as u8)
+            .collect();
+        m.extend(
+            (0..planes_scales_bytes(k, n))
+                .map(|_| (((3 + next(&mut st) % 8) << 3) | (next(&mut st) % 8)) as u8),
+        );
+        m
+    }
+
+    /// The header of an `NVFP4_ROWS` stack `{k, n, n_expert}`.
+    pub(crate) fn stack_info(name: &str, [k, n, n_expert]: [usize; 3]) -> TensorInfo {
+        TensorInfo {
+            name: name.to_string(),
+            dims: vec![k as u64, n as u64, n_expert as u64],
+            ty: GgmlType::NVFP4_ROWS,
+            offset: 0,
+            nbytes: (n_expert * (planes_codes_bytes(k, n) + planes_scales_bytes(k, n))) as u64,
+        }
+    }
+
+    /// How a checkpoint folder keeps a stack's two runs.
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) enum Order {
+        /// An expert's scales run right after its codes run.
+        Adjacent,
+        /// Every expert's codes in one region of the file, every expert's
+        /// scales in another, the two in different expert orders.
+        Separated,
+    }
+
+    pub(crate) const ORDERS: [Order; 2] = [Order::Adjacent, Order::Separated];
+
+    /// The matrices `mats` (each codes then scales, `n` rows of `k` values) of
+    /// one stack, appended to `span` in a scrambled expert order with junk
+    /// between the runs, as `order` keeps them: the runs that name where.
+    pub(crate) fn place(
+        span: &mut Vec<u8>,
+        mats: &[Vec<u8>],
+        (k, n): (usize, usize),
+        order: Order,
+    ) -> StackRuns {
+        let (cp, sp) = (planes_codes_bytes(k, n), planes_scales_bytes(k, n));
+        let n_expert = mats.len();
+        let scrambled: Vec<usize> = (0..n_expert)
+            .rev()
+            .filter(|e| e % 2 == 0)
+            .chain((0..n_expert).filter(|e| e % 2 == 1))
+            .collect();
+        let (mut codes_at, mut scales_at) = (vec![0u64; n_expert], vec![0u64; n_expert]);
+        let put = |span: &mut Vec<u8>, bytes: &[u8], junk: usize| {
+            let at = span.len() as u64;
+            span.extend(bytes);
+            span.extend(std::iter::repeat_n(0xEE, junk));
+            at
+        };
+        match order {
+            Order::Adjacent => {
+                for &e in &scrambled {
+                    codes_at[e] = put(span, &mats[e][..cp], 0);
+                    scales_at[e] = put(span, &mats[e][cp..], 7);
+                }
+            }
+            Order::Separated => {
+                for &e in &scrambled {
+                    codes_at[e] = put(span, &mats[e][..cp], 5);
+                }
+                span.extend([0xEE; 40]);
+                for e in (0..n_expert).rev() {
+                    scales_at[e] = put(span, &mats[e][cp..], 3);
+                }
+            }
+        }
+        StackRuns::new(RowLayout::Planes, codes_at, scales_at, cp as u64, sp as u64)
+            .expect("planes runs of equal counts")
+    }
+
+    /// The runs of `n_expert` matrices of `n` rows of `k` values laid expert
+    /// after expert, each expert's codes then its scales: the stack a GGUF
+    /// would hold, named as located runs.
+    pub(crate) fn contiguous(k: usize, n: usize, n_expert: usize) -> StackRuns {
+        let (cp, sp) = (
+            planes_codes_bytes(k, n) as u64,
+            planes_scales_bytes(k, n) as u64,
+        );
+        let at = |e: usize| e as u64 * (cp + sp);
+        StackRuns::new(
+            RowLayout::Planes,
+            (0..n_expert).map(at).collect(),
+            (0..n_expert).map(|e| at(e) + cp).collect(),
+            cp,
+            sp,
+        )
+        .expect("planes runs of equal counts")
+    }
+
+    /// Stack `{k, n, 5}` whose matrices lie in `span` as `order` keeps them,
+    /// after some junk: the matrices as made, the span and the runs.
+    fn scattered(k: usize, n: usize, order: Order) -> (Vec<Vec<u8>>, Vec<u8>, StackRuns) {
+        let mats: Vec<Vec<u8>> = (0..5).map(|e| planes_matrix(k, n, 100 + e)).collect();
+        let mut span = vec![0xEE; 17];
+        let runs = place(&mut span, &mats, (k, n), order);
+        (mats, span, runs)
+    }
+
+    fn scales_of_five() -> Vec<f32> {
+        (0..5).map(|e| 0.5 + e as f32).collect()
+    }
+
+    /// A located stack's matrix `e` is its two runs at their offsets and its
+    /// scale `scale[e]`, wherever the experts lie and whether an expert's
+    /// scales run follows its codes run or lies a region away. The equal-run
+    /// cut a stack had before reads another matrix for the same span.
+    #[test]
+    fn a_located_stack_cuts_its_matrices_at_its_runs() {
+        let (k, n) = (96, 4);
+        let scale = scales_of_five();
+        for order in super::planes_tests::ORDERS {
+            let (mats, span, runs) = scattered(k, n, order);
+            let info = stack_info("exps", [k, n, 5]);
+            let stack = ExpertStack::located(&info, &span, &runs, Some(&scale)).unwrap();
+            let equal = ExpertStack::of(&info, &span, Some(&scale)).unwrap();
+            for (e, want) in mats.iter().enumerate() {
+                let (codes, scales) = want.split_at(planes_codes_bytes(k, n));
+                let m = stack.matrix(e as u32);
+                assert_eq!(
+                    (m.rows, m.scale_plane),
+                    (codes, scales),
+                    "{order:?}: expert {e}'s runs"
+                );
+                assert_eq!(stack.scale(e as u32), scale[e], "{order:?}: expert {e}");
+                let w = runs.cut(&info, &span, e, scale[e]).unwrap();
+                assert_eq!(
+                    (w.bytes, w.scale_plane, w.layout, w.scale, w.ty),
+                    (
+                        codes,
+                        scales,
+                        RowLayout::Planes,
+                        scale[e],
+                        GgmlType::NVFP4_ROWS
+                    ),
+                    "{order:?}: expert {e}'s weight"
+                );
+                let [c, sc] = runs.ranges(e).unwrap();
+                match order {
+                    Order::Adjacent => assert_eq!(sc.start, c.end, "{order:?}: adjacent runs"),
+                    Order::Separated => assert!(sc.start > c.end, "{order:?}: a region away"),
+                }
+            }
+            assert_ne!(
+                equal.matrix(0).rows,
+                &mats[0][..planes_codes_bytes(k, n)],
+                "{order:?}: the stack's old cut reads another matrix for a scattered expert"
+            );
+            let past = runs
+                .cut(&info, &span, 5, 1.0)
+                .map(drop)
+                .unwrap_err()
+                .to_string();
+            assert!(past.contains("expert 5 of exps"), "{past}");
+        }
+    }
+
+    /// Every way located runs do not fit their stack is a named error, none
+    /// a clamped or a defaulted read.
+    #[test]
+    fn located_runs_are_refused_by_name_where_they_do_not_fit() {
+        let (k, n) = (96, 4);
+        let (_, span, runs) = scattered(k, n, Order::Separated);
+        let info = stack_info("exps", [k, n, 5]);
+        let scale = scales_of_five();
+        let (cp, sp) = (
+            planes_codes_bytes(k, n) as u64,
+            planes_scales_bytes(k, n) as u64,
+        );
+        let refused = |info: &TensorInfo, runs: &StackRuns, scale: Option<&[f32]>| {
+            ExpertStack::located(info, &span, runs, scale)
+                .map(drop)
+                .unwrap_err()
+                .to_string()
+        };
+        let planes = |codes: Vec<u64>, scales: Vec<u64>, cp: u64, sp: u64| {
+            StackRuns::new(RowLayout::Planes, codes, scales, cp, sp)
+        };
+        let (codes_at, scales_at) = (runs.codes_at.clone(), runs.scales_at.clone());
+
+        let few = planes(codes_at[..4].to_vec(), scales_at[..4].to_vec(), cp, sp).unwrap();
+        assert!(refused(&info, &few, Some(&scale)).contains("one offset an expert"));
+        let lone = planes(codes_at.clone(), scales_at[..4].to_vec(), cp, sp).unwrap_err();
+        assert!(
+            lone.to_string()
+                .contains("one scales run for every codes run")
+        );
+        let empty = planes(codes_at.clone(), scales_at.clone(), cp, 0).unwrap_err();
+        assert!(
+            empty
+                .to_string()
+                .contains("one scales run for every codes run")
+        );
+        let wide = planes(codes_at.clone(), scales_at.clone(), cp + 1, sp).unwrap();
+        let wide = refused(&info, &wide, Some(&scale));
+        assert!(
+            wide.contains("the runs' bytes are the header's matrix"),
+            "{wide}"
+        );
+        let past = |mut at: Vec<u64>| {
+            at[2] = span.len() as u64 - 3;
+            at
+        };
+        for (what, far) in [
+            (
+                "codes",
+                planes(past(codes_at.clone()), scales_at.clone(), cp, sp),
+            ),
+            (
+                "scales",
+                planes(codes_at.clone(), past(scales_at.clone()), cp, sp),
+            ),
+        ] {
+            let far = refused(&info, &far.unwrap(), Some(&scale));
+            assert!(
+                far.contains("exceeds the file"),
+                "a {what} run past the file: {far}"
+            );
+        }
+
+        let mut q4k = info.clone();
+        q4k.ty = GgmlType::Q4_K;
+        let planes_of_q4k = refused(&q4k, &runs, None);
+        assert!(
+            planes_of_q4k.contains("planes layout holds NVFP4_ROWS"),
+            "{planes_of_q4k}"
+        );
+        let rows =
+            StackRuns::new(RowLayout::Rows, codes_at.clone(), Vec::new(), cp + sp, 0).unwrap();
+        let rows_of_fp4 = refused(&info, &rows, Some(&scale));
+        assert!(
+            rows_of_fp4.contains("located in no other layout"),
+            "{rows_of_fp4}"
+        );
+        let second = StackRuns::new(RowLayout::Rows, codes_at.clone(), scales_at.clone(), cp, sp);
+        assert!(
+            second
+                .unwrap_err()
+                .to_string()
+                .contains("rows layout has no second run")
+        );
+        let r8 = StackRuns::new(RowLayout::R8, codes_at, Vec::new(), cp + sp, 0).unwrap_err();
+        assert!(r8.to_string().contains("r8 layout"), "{r8}");
+
+        let none = refused(&info, &runs, None);
+        assert!(
+            none.contains("exps") && none.contains("tensor scale"),
+            "{none}"
+        );
+        let short = refused(&info, &runs, Some(&scale[..4]));
+        assert!(short.contains("tensor scale"), "{short}");
+    }
+
+    /// The scales a placement holds are checked as the ones beside a tensor
+    /// are ([`gguf::tensor_scales`]): one an expert, each finite, for a type
+    /// that reads a tensor scale, and none for another.
+    #[test]
+    fn a_placements_tensor_scales_are_checked_as_the_siblings_are() {
+        let info = stack_info("exps", [96, 4, 5]);
+        let scale = scales_of_five();
+        let ok = placed_scales(&info, scale.clone()).unwrap().unwrap();
+        assert_eq!(&ok[..], &scale[..]);
+        let refused = |info: &TensorInfo, scales: Vec<f32>| {
+            placed_scales(info, scales)
+                .map(drop)
+                .unwrap_err()
+                .to_string()
+        };
+        let count = refused(&info, scale[..4].to_vec());
+        assert!(
+            count.contains("4 tensor scales") && count.contains("one an expert"),
+            "{count}"
+        );
+        let none = refused(&info, Vec::new());
+        assert!(none.contains("0 tensor scales"), "{none}");
+        let mut nan = scale.clone();
+        nan[3] = f32::NAN;
+        assert!(refused(&info, nan).contains("[3] is NaN, not a finite value"));
+        let mut q4k = info.clone();
+        q4k.ty = GgmlType::Q4_K;
+        assert!(placed_scales(&q4k, Vec::new()).unwrap().is_none());
+        assert!(refused(&q4k, scale).contains("none for another"));
+    }
+
+    /// A GGUF of the tensors `(name, type, dims, bytes)`, opened as a split in
+    /// a directory of its own (removed on drop).
+    pub(crate) struct File {
+        dir: std::path::PathBuf,
+        pub(crate) split: Split,
+    }
+
+    impl File {
+        pub(crate) fn write(tag: &str, tensors: &[(&str, GgmlType, &[u64], &[u8])]) -> File {
+            let dir =
+                std::env::temp_dir().join(format!("bloomery-ops-{tag}-{}", std::process::id()));
+            if dir.exists() {
+                std::fs::remove_dir_all(&dir).unwrap();
+            }
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("m.gguf");
+            let decls = tensors
+                .iter()
+                .map(|&(name, ty, dims, b)| TensorDecl {
+                    name: name.to_string(),
+                    dims: dims.to_vec(),
+                    type_id: ty.as_u32(),
+                    nbytes: b.len() as u64,
+                })
+                .collect();
+            let layout = Layout::new(&[], decls).unwrap();
+            let mut w = Writer::new(std::fs::File::create(&path).unwrap(), layout).unwrap();
+            for &(name, _, _, b) in tensors {
+                w.tensor(name, b).unwrap();
+            }
+            w.finish().unwrap();
+            File {
+                split: Split::open(&path).unwrap(),
+                dir,
+            }
+        }
+    }
+
+    impl Drop for File {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// The tensor scale of a stack has one owner whichever source filled it:
+    /// the `<stem>.scale` sibling of a GGUF stack (read by `find`, refused by
+    /// name where it is missing) or the placement's scales of a located stack.
+    /// Either way `scale_of(e)` is the expert's, `expert(e)` carries it in its
+    /// weight and `stack()` in its stack — for the equal runs of a GGUF's
+    /// NVFP4 blocks and for the located runs of NVFP4_ROWS planes.
+    #[test]
+    fn a_stack_carries_its_expert_scales_from_either_source() {
+        let (k, n, n_expert) = (64usize, 2usize, 3usize);
+        let blocks = vec![0u8; n_expert * n * 36];
+        let sibling: Vec<u8> = [0.25f32, 0.5, 4.0]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let dims = [k as u64, n as u64, n_expert as u64];
+        let sc_dims = [n_expert as u64];
+        let bare = File::write("bare", &[("x.weight", GgmlType::NVFP4, &dims, &blocks)]);
+        let missing = ShardTensor::find(&bare.split, "x.weight")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            missing.contains("x.weight") && missing.contains("x.scale"),
+            "{missing}"
+        );
+        let gguf = File::write(
+            "sibling",
+            &[
+                ("x.weight", GgmlType::NVFP4, &dims, &blocks),
+                ("x.scale", GgmlType::F32, &sc_dims, &sibling),
+            ],
+        );
+        let t = ShardTensor::find(&gguf.split, "x.weight").unwrap();
+        assert_eq!(t.layout(), RowLayout::Rows);
+        let want = [0.25f32, 0.5, 4.0];
+        for (e, &s) in want.iter().enumerate() {
+            assert_eq!(t.scale_of(e).unwrap(), s, "sibling: expert {e}");
+            assert_eq!(
+                t.expert(&gguf.split, e).unwrap().scale,
+                s,
+                "sibling weight {e}"
+            );
+            assert_eq!(
+                t.stack(&gguf.split).unwrap().scale(e as u32),
+                s,
+                "sibling stack {e}"
+            );
+        }
+        assert!(
+            t.scale_of(3)
+                .unwrap_err()
+                .to_string()
+                .contains("expert 3 of x.weight")
+        );
+
+        // A located stack of planes in a file's own bytes, its scales the
+        // placement's: the handle the split's placement makes.
+        let (k, n) = (96, 4);
+        let mats: Vec<Vec<u8>> = (0..5).map(|e| planes_matrix(k, n, 40 + e)).collect();
+        let mut local = Vec::new();
+        let at_local = place(&mut local, &mats, (k, n), Order::Separated);
+        let file = File::write(
+            "span",
+            &[("span", GgmlType::I8, &[local.len() as u64], &local)],
+        );
+        let base = file.split.shard(0).unwrap().data_base();
+        let shift = |v: &[u64]| v.iter().map(|&o| o + base).collect::<Vec<u64>>();
+        let runs = StackRuns::new(
+            RowLayout::Planes,
+            shift(&at_local.codes_at),
+            shift(&at_local.scales_at),
+            at_local.codes_per,
+            at_local.scales_per,
+        )
+        .unwrap();
+        let info = stack_info("exps", [k, n, 5]);
+        let scales = scales_of_five();
+        let located = ShardTensor {
+            shard: 0,
+            scale: placed_scales(&info, scales.clone()).unwrap(),
+            info,
+            runs: Some(Arc::new(runs)),
+        };
+        assert_eq!(located.layout(), RowLayout::Planes);
+        for (e, mat) in mats.iter().enumerate() {
+            let (codes, plane) = mat.split_at(planes_codes_bytes(k, n));
+            let w = located.expert(&file.split, e).unwrap();
+            assert_eq!(
+                (w.bytes, w.scale_plane, w.scale),
+                (codes, plane, scales[e]),
+                "located {e}"
+            );
+            let m = located.stack(&file.split).unwrap();
+            assert_eq!(m.scale(e as u32), scales[e], "located stack {e}");
+            assert_eq!(
+                (m.matrix(e as u32).rows, m.matrix(e as u32).scale_plane),
+                (codes, plane),
+                "located stack {e}'s runs"
+            );
+        }
+    }
+
+    /// The union call takes `NVFP4_ROWS` in the planes layout and only there,
+    /// and a type that reads a tensor scale only over a stack made with one an
+    /// expert: each refusal is by name, before any kernel is asked for.
+    #[test]
+    fn a_union_stack_refuses_what_would_be_dotted_at_the_wrong_layout_or_scale() {
+        let (k, n) = (128, 4);
+        let info = stack_info("exps", [k, n, 3]);
+        let (cp, sp) = (planes_codes_bytes(k, n), planes_scales_bytes(k, n));
+        let bytes = vec![0u8; 3 * (cp + sp)];
+        let scale = [1.0f32; 3];
+        let rows = ExpertStack::of(&info, &bytes, Some(&scale)).unwrap();
+        let e = UnionStack::of(&rows, "the gate", k, n)
+            .map(drop)
+            .unwrap_err();
+        assert!(e.to_string().contains("read in no other layout"), "{e}");
+        let at = |s: usize, e: usize| (e * (cp + sp) + s * cp) as u64;
+        let runs = StackRuns::new(
+            RowLayout::Planes,
+            (0..3).map(|e| at(0, e)).collect(),
+            (0..3).map(|e| at(0, e) + cp as u64).collect(),
+            cp as u64,
+            sp as u64,
+        )
+        .unwrap();
+        let planes = ExpertStack::located(&info, &bytes, &runs, Some(&scale)).unwrap();
+        UnionStack::of(&planes, "the gate", k, n).expect("planes NVFP4_ROWS with its scales");
+        for ty in [GgmlType::NVFP4, GgmlType::NVFP4_ROWS] {
+            let mut unscaled = info.clone();
+            unscaled.ty = ty;
+            let e = ExpertStack::of(&unscaled, &bytes, None)
+                .map(drop)
+                .unwrap_err();
+            let e = e.to_string();
+            assert!(
+                e.contains("exps") && e.contains("tensor scale"),
+                "{ty}: {e}"
+            );
+        }
+    }
+
+    /// `n` rows of `k` values whose every 32-value block has one scale, a
+    /// power of two in both its groups: the rows an MXFP4 kernel reads too.
+    fn pow2_matrix(k: usize, n: usize, seed: u64) -> Vec<u8> {
+        let mut m = planes_matrix(k, n, seed);
+        let mut st = seed ^ 0x5eed;
+        let codes = n * k / 2;
+        for r in 0..n {
+            for b in 0..k / 32 {
+                let byte = ((3 + next(&mut st) % 8) << 3) as u8;
+                m[codes + r * (k / 16) + 2 * b..][..2].fill(byte);
+            }
+        }
+        m
+    }
+
+    /// One planes row as the MXFP4 row of the same values: block `b`'s E8M0
+    /// scale (2^(e − 7) as `e + 120`) then its 16 bytes, value `j` the low
+    /// nibble of byte `j` and `j + 16` the high.
+    fn mxfp4_row(codes: &[u8], scales: &[u8], k: usize) -> Vec<u8> {
+        let mut row = Vec::new();
+        for b in 0..k / 32 {
+            let code = |j: usize| {
+                let byte = codes[16 * b + j / 2];
+                if j.is_multiple_of(2) {
+                    byte & 0xF
+                } else {
+                    byte >> 4
+                }
+            };
+            row.push((scales[2 * b] >> 3) + 120);
+            row.extend((0..16).map(|j| code(j) | (code(j + 16) << 4)));
+        }
+        row
+    }
+
+    fn column(k: usize, c: usize, seed: u64) -> Vec<f32> {
+        let mut st = seed + c as u64;
+        (0..k)
+            .map(|_| (next(&mut st) % 2001) as f32 / 2000.0 - 0.5)
+            .collect()
+    }
+
+    /// A planes matrix through the dispatch writes, for every (row, column),
+    /// the planes row dot times its tensor scale, whether its scales run
+    /// follows its codes run or lies a region away and whether its columns
+    /// fit one tile run or take two (eleven: eight and three); that dot is
+    /// qdot's own MXFP4 kernel's value on the same rows (a layout both
+    /// kernels read: within f32's summation order), and the dequantized
+    /// row's against the unquantized column within the activation's half
+    /// step a value.
+    #[test]
+    fn a_planes_matrix_dots_to_its_dequantized_rows() {
+        for (order, (k, cols)) in super::planes_tests::ORDERS
+            .into_iter()
+            .flat_map(|o| [(96, 1), (160, 3), (640, 2), (160, 11)].map(|kc| (o, kc)))
+        {
+            let n = 9;
+            let scale = 0.37f32;
+            let m = pow2_matrix(k, n, 7 + k as u64);
+            let info = stack_info("w", [k, n, 1]);
+            let mut span = vec![0xEE; 3];
+            let runs = place(&mut span, std::slice::from_ref(&m), (k, n), order);
+            let w = runs.cut(&info, &span, 0, scale).unwrap();
+            let xs: Vec<Vec<f32>> = (0..cols).map(|c| column(k, c, 41)).collect();
+            let x = Tensor2::from_vec(k, cols, xs.concat());
+            let mut out = [Tensor2::zeros(n, cols)];
+            matmul_q_group_into("test", &[w], &[&x], &mut out).unwrap();
+            let (codes, scales) = m.split_at(n * k / 2);
+            for (c, xc) in xs.iter().enumerate() {
+                let mut acol = vec![0u8; qdot::col_bytes(GgmlType::NVFP4_ROWS, k)];
+                qdot::quantize_col(GgmlType::NVFP4_ROWS, xc, &mut acol);
+                for r in 0..n {
+                    let (cr, sr) = (
+                        &codes[r * k / 2..][..k / 2],
+                        &scales[r * k / 16..][..k / 16],
+                    );
+                    let got = out[0].data[c * n + r];
+                    let dot = qdot::dot_nvfp4_planes_row(cr, sr, &acol, k);
+                    assert_eq!(
+                        got.to_bits(),
+                        (dot * scale).to_bits(),
+                        "{order:?} k {k} row {r} column {c}"
+                    );
+                    let mx =
+                        qdot::dot_row(GgmlType::MXFP4, &mxfp4_row(cr, sr, k), &acol, k).unwrap();
+                    assert!(
+                        (dot - mx).abs() <= 1e-5 * (mx.abs() + 1.0),
+                        "k {k} row {r} column {c}: planes {dot} against qdot's MXFP4 {mx}"
+                    );
+                    let mut w = vec![0.0f32; k];
+                    Nvfp4Rows::new(1.0).decode_planes(cr, sr, &mut w).unwrap();
+                    let exact: f64 = w
+                        .iter()
+                        .zip(xc)
+                        .map(|(a, b)| f64::from(*a) * f64::from(*b))
+                        .sum();
+                    let half_step: f64 = (0..k / 32)
+                        .map(|b| {
+                            let xb = &xc[32 * b..32 * b + 32];
+                            let amax = xb.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+                            let wsum: f32 = w[32 * b..32 * b + 32].iter().map(|v| v.abs()).sum();
+                            f64::from(wsum) * f64::from(amax) / 127.0 / 2.0
+                        })
+                        .sum();
+                    let band = f64::from(scale) * (half_step * 1.05 + 1e-5 * exact.abs() + 1e-4);
+                    assert!(
+                        (f64::from(got) - f64::from(scale) * exact).abs() <= band,
+                        "k {k} row {r} column {c}: {got} against the dequantized {}",
+                        f64::from(scale) * exact
+                    );
+                }
+            }
+        }
     }
 }

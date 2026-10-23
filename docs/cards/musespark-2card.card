@@ -1,0 +1,46 @@
+# Round muse2card: Muse Spark Open on both cards, plan (b′) (`--place bp`; the seat's unset `--place` takes it when two
+# cards are in view): the A6000 the stage card (every layer, the head, the token embedding, its id prefix of each
+# layer's experts), the 3090 an expert tier holding each layer's next ids, the host the rest. Serving defaults,
+# depth-serve's --ctx-size 4352 (D 4096 + n_predict 128 - 1 fits).
+# Plan [derived from the placement's rule; the run's `plan` record prints the values]: A6000 usable 47.45 GiB less
+# dense + head + embedding 18.25 GiB, KV ~0.75 GB at 4352, context + scratch + margin 1.63 GB: ~24..29 GB of experts,
+# 1,850..2,230 triples of 12.98 MB; 3090 usable 25.35 GB less 1.6 GB set-aside and the tier batch's ~80 MB: ~1,820
+# triples. 23..25.5 % of the 15,872 triples on cards (22.6..25.5 % of the picks if the routing is uniform over ids).
+# Decode, one token, D = 6 (serial per layer: the next layer's dense waits for this layer's sum):
+#   host DRAM   6.44 GB active x 0.745..0.77 = 4.80..4.96 GB at 137 GB/s: 35.0..36.2 ms (the bound of the expert half)
+#   card SM     dense + head 18.67 GB on the A6000 at 567..701 GB/s: 26.6..32.9 ms, serial with the host's half
+#   tier SM     ~57 tier slots a token, 0.74 GB on the 3090: ~1 ms, under the host's shadow (0 on the wall)
+#   stage slots ~70 card slots a token, 0.9 GB: ~1.4 ms, under the host's shadow (0)
+#   bridge      62 x 21..36 us: 1.3..2.2 ms; launches ~1,600 x 0.852 us: ~1.4 ms
+#   PCIe        boundary rows and the tier's x and rows, < 0.2 ms
+#   => 64.3..72.7 ms: 13.75..15.55 tok/s, written 13.5..15.6. One card (a) the same terms with 11.7..14 % on the
+#      card: 13.0..14.3 tok/s; the tier is worth +6..7 % [derived].
+# Tier break-even (the seat's TIER_RULE, docs/research/place-any-card.md 2.4) [derived]: one more expert on a card
+#   saves s = (8 / 256) x 12.98 MB / 137 GB/s = 2.96 us a token; a tier costs c = 1.9..2.5 ms a token (V4.1's c_two,
+#   docs/cards/glmbp-ab.card:28, until this card's sitting measures Muse's) -> E* = ceil(c / s) = 642..845. The rule
+#   takes 845, the band's top: the tier is kept only where it pays at the larger cost. This plan's tier holds ~1,820,
+#   so the unset place is bp either way; a sitting's verdict replaces the formula.
+# Companions read from the same rows (not this card's term): pp512 43..62 tok/s (a 512-row pass: card dense ~10 ms a
+# layer + the host union over its ~191 experts at 0.64..0.95 ms each, 122..181 ms, the tier's ~29 experts and the
+# stage's ~36 under it; 62 layers), pp4096 42..60 (eight such passes and the attention's K/V reads, ~2.5 s).
+# Sitting (on the lead's go, both cards in the timing witness):
+#   BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/musespark-2card.card BLOOMERY_TIMING_CARDS=a6000+3090
+#     DEPTH_SERVE_CTX=4352' tools/ref/depth-serve.sh <this tree>:6 <this tree>:512 <this tree>:4096
+kind: baseline
+question: what does the Muse Spark Open seat decode at depth 6 on plan (b′), the A6000 the stage and the 3090 an
+  expert tier beside the host, at the serving defaults?
+term: tg tok/s @ n=1, D = 6, bloomery-serve --model musespark at the serving defaults (place unset -> bp), A6000 +
+  3090 + host, depth-serve rows (timings.predicted_per_second over 127 steps)
+unit: tok/s
+predict: 13.5..15.6
+condition: depth-serve under BLOOMERY_TIMING_CARDS=a6000+3090 in its own lease, one fresh server a row; the server's
+  `place unset` record names bp and its `plan` record a tier0 card holding experts, else the row is void; the witness
+  (both cards, mem, pgmajfault) shows no other model load and the host's experts resident (majflt near 0)
+reason: the 0.3.9 release states Muse's measured decode and prompt rows; the user asked for both cards in use, and
+  this is the first row of the two-card plan
+decide-in: write the two-card row with its lease and witness beside the companions, then open stage B's expert
+  stream (the prompt's host union is the bound the stream lifts)
+decide-below: read the step's per-layer host wait against 0.57 ms and the plan record's card shares; a host leg
+  slower than its bytes is the finding (thread count, the union's column cap at n = 1)
+decide-above: re-derive the serial sum: the host's half ran under the next layer's dense (an overlap this card
+  does not count), or the cards hold more of the picks than their share of the ids

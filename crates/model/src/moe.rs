@@ -30,10 +30,10 @@ use gguf::{GgmlType, Gguf, Split, TensorInfo};
 
 use crate::ModelError;
 use crate::ops::{
-    self, DEFER_MAX_COLS, ExpertForm, ExpertStack, GroupClaims, GroupInput, Lanes, R8Stack,
-    RowLayout, ShardTensor, StackTier, Tensor2, Tensor2View, UnionCall, UnionPlanView, UnionSlabs,
-    UnionStack, WarmSpan, Weight, defers, matmul_q, matmul_q_group, matmul_q_group_into_on,
-    matmul_q_group_swiglu, matmul_q_group_swiglu_into_on,
+    self, DEFER_MAX_COLS, ExpertForm, ExpertStack, GroupClaims, GroupInput, Lanes, PostNorm,
+    R8Stack, RowLayout, ShardTensor, StackTier, Tensor2, Tensor2View, UnionCall, UnionPlanView,
+    UnionSlabs, UnionStack, WarmSpan, Weight, defers, matmul_q, matmul_q_group,
+    matmul_q_group_into_on, matmul_q_group_swiglu, matmul_q_group_swiglu_into_on,
 };
 use crate::profile;
 use crate::r8file::{R8Error, R8Source};
@@ -955,20 +955,24 @@ impl HostScratch {
 }
 
 /// How one host leg of one token runs: the experts' form (which stacks the
-/// leg reads and their combine) and how the leg's rows are laid over the
-/// pool.
+/// leg reads and their combine), how the leg's rows are laid over the pool,
+/// and the norm each expert's down takes before its weight when the layer has
+/// one ([`HostLayer::set_post_norm`]).
 #[derive(Clone, Copy)]
-struct LegRun {
+struct LegRun<'n> {
     form: ExpertForm,
     lanes: Lanes,
+    post: Option<&'n PostNorm>,
 }
 
-impl LegRun {
-    /// The gated leg without a clamp, rows in the pool's flat lanes.
-    fn flat() -> LegRun {
+impl LegRun<'_> {
+    /// The gated leg without a clamp, rows in the pool's flat lanes, the
+    /// plain weighted sum.
+    fn flat() -> LegRun<'static> {
         LegRun {
             form: ExpertForm::Gated { limit: 0.0 },
             lanes: Lanes::Flat,
+            post: None,
         }
     }
 }
@@ -989,7 +993,7 @@ enum ExpertLegs<'w> {
 /// scratch's width, so no push grows a list.
 fn serve<'w>(
     weights: impl Fn(u32) -> Result<ExpertLegs<'w>, ModelError>,
-    run: LegRun,
+    run: LegRun<'_>,
     x: &Tensor2,
     experts: &[(u32, f32)],
     out: &mut [f32],
@@ -1031,7 +1035,7 @@ fn serve<'w>(
 fn serve_resolved(
     gu: &[Weight<'_>],
     down: &[Weight<'_>],
-    run: LegRun,
+    run: LegRun<'_>,
     x: &Tensor2,
     experts: &[(u32, f32)],
     out: &mut [f32],
@@ -1096,8 +1100,13 @@ fn serve_resolved(
     }
     let t_sum = if lvl > 0 { Some(Instant::now()) } else { None };
     for (&(_, w), d) in experts.iter().zip(&downs[..n]) {
-        for (o, &dv) in out.iter_mut().zip(d.col(0)) {
-            *o += w * dv;
+        match run.post {
+            Some(post) => post.add_normed(out, w, d.col(0)),
+            None => {
+                for (o, &dv) in out.iter_mut().zip(d.col(0)) {
+                    *o += w * dv;
+                }
+            }
         }
     }
     if let Some(t_sum) = t_sum {
@@ -1659,7 +1668,8 @@ fn check_union_call(
 /// the gate's and the up's activation rule; every distinct expert's gate and
 /// up over the columns that list it, one row dispatch in expert order — each
 /// weight row read once per call, its runs of up to [`qdot::TILE_COLS`]
-/// listed columns through the tile kernel, which writes each column's
+/// listed columns through the tile kernel (of up to [`qdot::WIDE_COLS`]
+/// through the wide kernel, for a type with one), which writes each column's
 /// `dot_row` value; every slot's combine, quantized in the down's encoding;
 /// every expert's down over its combines, one row dispatch; and each
 /// column's sum, in that column's list order from zero — the order its
@@ -1678,7 +1688,7 @@ fn check_union_call(
 /// ([`serve_tiered`]); without, every id from `stacks`' own bytes.
 fn serve_union<'w>(
     stacks: [ExpertStack<'w>; 3],
-    run: LegRun,
+    run: LegRun<'_>,
     x: Tensor2View<'_>,
     lists: &[&[(u32, f32)]],
     out: &mut [f32],
@@ -1719,7 +1729,7 @@ fn serve_union<'w>(
 /// column the layer serves ([`TierSlots::note_union`]).
 fn serve_one<'w>(
     stacks: [ExpertStack<'w>; 3],
-    run: LegRun,
+    run: LegRun<'_>,
     x: Tensor2View<'_>,
     lists: &[&[(u32, f32)]],
     out: &mut [f32],
@@ -1761,7 +1771,7 @@ struct Batching<'t> {
 /// host segment's ids alone) claims nothing and is told as one that fits.
 fn serve_tiered<'w>(
     stacks: [ExpertStack<'w>; 3],
-    run: LegRun,
+    run: LegRun<'_>,
     x: Tensor2View<'_>,
     lists: &[&[(u32, f32)]],
     out: &mut [f32],
@@ -1840,7 +1850,7 @@ fn serve_tiered<'w>(
 /// `batching` says.
 fn serve_batched<'w>(
     stacks: [ExpertStack<'w>; 3],
-    run: LegRun,
+    run: LegRun<'_>,
     x: Tensor2View<'_>,
     lists: &[&[(u32, f32)]],
     out: &mut [f32],
@@ -1874,7 +1884,9 @@ fn serve_batched<'w>(
         let from = g.checked_sub(1).map_or(0, |p| ends[p]);
         from..ends[g]
     };
-    let whole = UnionCall::new(plan.view(), stacks, x, run.form)?.spread_over(run.lanes);
+    let whole = UnionCall::new(plan.view(), stacks, x, run.form)?
+        .spread_over(run.lanes)
+        .post_normed(run.post);
     let mut xqs = whole.quantize_batched(xq, xq_up, passes);
     slot.clear();
     slot.resize(plan.n(), 0);
@@ -1913,7 +1925,9 @@ fn serve_batched<'w>(
         for (i, &d) in order[span(g)].iter().enumerate() {
             slot[d as usize] = base + sub.off[i];
         }
-        let batch_call = UnionCall::new(sub.view(), stacks, x, run.form)?.spread_over(run.lanes);
+        let batch_call = UnionCall::new(sub.view(), stacks, x, run.form)?
+            .spread_over(run.lanes)
+            .post_normed(run.post);
         batch_call.run_batch(&mut xqs, gu, qc, &mut store[base * embd..], None, passes)?;
         base += sub.cols.len();
         drop(pin);
@@ -1938,7 +1952,7 @@ fn serve_batched<'w>(
 )]
 fn serve_step_split<'w>(
     stacks: [ExpertStack<'w>; 3],
-    run: LegRun,
+    run: LegRun<'_>,
     x: Tensor2View<'_>,
     lists: &[&[(u32, f32)]],
     out: &mut [f32],
@@ -1982,7 +1996,9 @@ fn serve_step_split<'w>(
         ..
     } = batches;
     let (order, ids) = (&*order, &*ids);
-    let whole = UnionCall::new(plan.view(), stacks, x, run.form)?.spread_over(run.lanes);
+    let whole = UnionCall::new(plan.view(), stacks, x, run.form)?
+        .spread_over(run.lanes)
+        .post_normed(run.post);
     let deferred = defers(x.ne1());
     let mut xqs = if deferred {
         whole.x_rooms(xq, xq_up)
@@ -2014,7 +2030,9 @@ fn serve_step_split<'w>(
         for (i, &d) in order[span].iter().enumerate() {
             slot[d as usize] = base + sub.off[i];
         }
-        let call = UnionCall::new(sub.view(), stacks, x, run.form)?.spread_over(run.lanes);
+        let call = UnionCall::new(sub.view(), stacks, x, run.form)?
+            .spread_over(run.lanes)
+            .post_normed(run.post);
         let claim = deferred.then(|| GroupClaims {
             x: g == 0,
             states: &mut claims[..],
@@ -2039,7 +2057,7 @@ fn serve_step_split<'w>(
 /// scratch.
 fn serve_planned(
     stacks: [ExpertStack<'_>; 3],
-    run: LegRun,
+    run: LegRun<'_>,
     x: Tensor2View<'_>,
     lists: &[&[(u32, f32)]],
     out: &mut [f32],
@@ -2049,7 +2067,9 @@ fn serve_planned(
         out.fill(0.0);
         return Ok(());
     }
-    let call = UnionCall::new(s.plan.view(), stacks, x, run.form)?.spread_over(run.lanes);
+    let call = UnionCall::new(s.plan.view(), stacks, x, run.form)?
+        .spread_over(run.lanes)
+        .post_normed(run.post);
     let slabs = UnionSlabs {
         xq: &mut s.xq,
         xq_up: &mut s.xq_up,
@@ -2143,6 +2163,7 @@ fn announce_paths(stacks: &[(GgmlType, usize, RowLayout)]) {
         let path = match layout {
             RowLayout::Rows => "fused",
             RowLayout::R8 => "r8",
+            RowLayout::Planes => "planes",
         };
         eprintln!("load host_tier type={ty} k={k} path={path}");
     }
@@ -2168,7 +2189,7 @@ impl GateUp {
 
     fn layout(&self) -> RowLayout {
         match self {
-            GateUp::File(_) => RowLayout::Rows,
+            GateUp::File(t) => t.layout(),
             GateUp::R8(_) => RowLayout::R8,
         }
     }
@@ -2617,6 +2638,9 @@ pub struct HostLayer {
     ff: usize,
     form: ExpertForm,
     tier: Option<LayerTier>,
+    /// The norm each expert's down row takes before its weight
+    /// ([`HostLayer::set_post_norm`]); `None`, the plain weighted sum.
+    post: Option<PostNorm>,
 }
 
 impl HostLayer {
@@ -2764,7 +2788,7 @@ impl HostLayer {
         }
         paths.extend([
             (up.source().info().ty, embd, up.layout()),
-            (down_stack.info().ty, ff, RowLayout::Rows),
+            (down_stack.info().ty, ff, down_stack.layout()),
         ]);
         announce_paths(&paths);
         Ok(HostLayer {
@@ -2775,7 +2799,29 @@ impl HostLayer {
             ff,
             form,
             tier: None,
+            post: None,
         })
+    }
+
+    /// Give the layer the norm each routed expert's down row takes before
+    /// its router weight ([`PostNorm`]): from then on every call that serves
+    /// the layer — the one-column leg, the union and the step union, from the
+    /// mapping or the tier — sums the normed, weighted rows in list order
+    /// from zero. Load-time only. A norm of another width than the down's
+    /// rows is refused by name.
+    pub fn set_post_norm(&mut self, post: PostNorm) -> Result<(), ModelError> {
+        let embd = self.down.info().dims[1] as usize;
+        if post.width() != embd {
+            return Err(ModelError::Shape {
+                what: "host layer post-expert norm: a gain of the down's rows",
+                want_ne0: embd,
+                want_ne1: 1,
+                got_ne0: post.width(),
+                got_ne1: 1,
+            });
+        }
+        self.post = Some(post);
+        Ok(())
     }
 
     /// Give this layer — the `layer`-th of the run — the NVMe tier's arena
@@ -2818,7 +2864,9 @@ impl HostLayer {
             return cut();
         }
         match tier.slots.slot(tier.layer, e, part) {
-            Some(bytes) => ops::expert_weight(stack.info(), bytes, 0, layout),
+            Some(bytes) => {
+                ops::expert_weight(stack.info(), bytes, 0, layout, stack.scale_of(e as usize)?)
+            }
             None => Err(TierError::Unfilled {
                 layer: tier.layer,
                 id: e,
@@ -2843,14 +2891,16 @@ impl HostLayer {
 
     /// Where each stack's rows lie, `[gate, up, down]` — every expert of a
     /// stack has its stack's layout: [`RowLayout::R8`] for a stack the layer
-    /// reads from the r8 sidecar, which no path reads as Q3_K rows. A relu²
-    /// layer's gate slot carries its up's layout. What the load's reading
-    /// made of the layer, for a caller that holds it to that reading.
+    /// reads from the r8 sidecar, which no path reads as Q3_K rows, and
+    /// [`RowLayout::Planes`] for a stack whose experts the split keeps where a
+    /// checkpoint folder stores them. A relu² layer's gate slot carries its
+    /// up's layout. What the load's reading made of the layer, for a caller
+    /// that holds it to that reading.
     pub fn layouts(&self) -> [RowLayout; 3] {
         [
             self.gate.as_ref().map_or(self.up.layout(), GateUp::layout),
             self.up.layout(),
-            RowLayout::Rows,
+            self.down.layout(),
         ]
     }
 
@@ -3018,7 +3068,7 @@ impl HostLayer {
             return Ok(());
         }
         let weights = |e: u32| -> Result<ExpertLegs<'_>, ModelError> {
-            let down = self.tier_or_mapping(e, 2, &self.down, RowLayout::Rows, || {
+            let down = self.tier_or_mapping(e, 2, &self.down, self.down.layout(), || {
                 self.down.expert(split, e as usize)
             })?;
             match &self.gate {
@@ -3042,6 +3092,7 @@ impl HostLayer {
         let run = LegRun {
             form: self.form,
             lanes,
+            post: self.post.as_ref(),
         };
         serve(weights, run, x, experts, out, scratch)
     }
@@ -3108,6 +3159,7 @@ impl HostLayer {
         let run = LegRun {
             form: self.form,
             lanes,
+            post: self.post.as_ref(),
         };
         serve_step_split(stacks, run, x.view(), &lists, out, union, tier, ticket)
     }
@@ -3162,6 +3214,7 @@ impl HostLayer {
         let run = LegRun {
             form: self.form,
             lanes,
+            post: self.post.as_ref(),
         };
         serve_union(
             self.stacks_of(split)?,
@@ -3232,6 +3285,7 @@ impl HostLayer {
         let run = LegRun {
             form: self.form,
             lanes,
+            post: self.post.as_ref(),
         };
         // The claim is made now and the misses fill on the tier's threads;
         // the pin lasts until the union's reads end, as `experts_into_on`'s
@@ -3304,25 +3358,28 @@ impl HostLayer {
                     self.up.source().info().name
                 )));
             }
-            let mut all: [Option<WarmSpan<'a>>; 3] = [None; 3];
+            // A matrix is one span, or two for planes: its codes and its
+            // group scales.
+            let mut all: [[Option<WarmSpan<'a>>; 2]; 3] = [[None; 2]; 3];
             let parts = &mut all[..warmed.len()];
             for (part, stack) in warmed.iter().enumerate() {
-                let Some(span) = stack.warm_span(id) else {
+                let Some(spans) = stack.warm_spans(id) else {
                     continue 'ids;
                 };
-                if span.bytes.len() != stack.per() {
+                let got: usize = spans.iter().flatten().map(|s| s.bytes.len()).sum();
+                if got != stack.per() {
                     return Err(TierError::SlotLength {
                         layer: self.tier.as_ref().map_or(0, |t| t.layer),
                         id,
                         part,
-                        got: span.bytes.len(),
+                        got,
                         want: stack.per(),
                     }
                     .into());
                 }
-                parts[part] = Some(span);
+                parts[part] = spans;
             }
-            out.extend(parts.iter().copied().flatten());
+            out.extend(parts.iter().flatten().copied().flatten());
         }
         Ok(())
     }
@@ -5428,5 +5485,431 @@ mod tests {
             "every slot the step read was pinned"
         );
         std::fs::remove_file(&path).unwrap();
+    }
+}
+
+/// The union call over located `NVFP4_ROWS` stacks in the planes layout: the
+/// host tier's read of a checkpoint folder's experts in place.
+#[cfg(test)]
+mod planes_union_tests {
+    use super::{Claim, LegRun, TierError, TierPin, TierSlots, UnionScratch, serve_union};
+    use crate::ops::planes_tests::{ORDERS, Order, contiguous, place, planes_matrix, stack_info};
+    use crate::ops::{ExpertStack, StackRuns, StackTier, Tensor2};
+    use gguf::GgmlType;
+    use gguf::quant::Nvfp4Rows;
+
+    const TY: GgmlType = GgmlType::NVFP4_ROWS;
+    const EMBD: usize = 160;
+    const FF: usize = 96;
+    const N_EXPERT: usize = 6;
+
+    /// A checkpoint folder's layer: expert `e`'s gate, up and down — the
+    /// checkpoint's w1, w3 and w2 — each stack's matrices in a scrambled order
+    /// with junk between the runs, the three stacks in one file. `mats[e]` is
+    /// `[gate, up, down]` as made.
+    struct Folder {
+        span: Vec<u8>,
+        runs: [StackRuns; 3],
+        mats: Vec<[Vec<u8>; 3]>,
+    }
+
+    /// Expert `e`'s tensor scale in stack `stack`: distinct and not powers of
+    /// two, so a scale left out, swapped between stacks or between experts
+    /// moves the answer far past any band.
+    fn scale(stack: usize, e: usize) -> f32 {
+        0.2 + 0.125 * e as f32 + 0.5 * stack as f32
+    }
+
+    fn scales(stack: usize) -> Vec<f32> {
+        (0..N_EXPERT).map(|e| scale(stack, e)).collect()
+    }
+
+    fn folder(order: Order) -> Folder {
+        let mats: Vec<[Vec<u8>; 3]> = (0..N_EXPERT)
+            .map(|e| {
+                let s = 1000 * e as u64;
+                [
+                    planes_matrix(EMBD, FF, s + 1),
+                    planes_matrix(EMBD, FF, s + 2),
+                    planes_matrix(FF, EMBD, s + 3),
+                ]
+            })
+            .collect();
+        let stack = |s: usize| -> Vec<Vec<u8>> { mats.iter().map(|m| m[s].clone()).collect() };
+        let mut span = vec![0xEE; 24];
+        let shapes = [(EMBD, FF), (EMBD, FF), (FF, EMBD)];
+        let runs = [0, 2, 1].map(|s| place(&mut span, &stack(s), shapes[s], order));
+        // `place` ran in the order gate, down, up: put them back in stack order.
+        let [gate, down, up] = runs;
+        Folder {
+            span,
+            runs: [gate, up, down],
+            mats,
+        }
+    }
+
+    /// The same matrices as three contiguous runs, expert after expert, each
+    /// expert's codes then its scales.
+    fn plain(f: &Folder) -> ([Vec<u8>; 3], [StackRuns; 3]) {
+        let spans: [Vec<u8>; 3] =
+            std::array::from_fn(|s| f.mats.iter().flat_map(|m| m[s].iter().copied()).collect());
+        let shapes = [(EMBD, FF), (EMBD, FF), (FF, EMBD)];
+        let runs = shapes.map(|(k, n)| contiguous(k, n, N_EXPERT));
+        (spans, runs)
+    }
+
+    fn lists(cols: usize) -> Vec<Vec<(u32, f32)>> {
+        (0..cols)
+            .map(|j| {
+                let w = 0.25 + 0.125 * j as f32;
+                vec![
+                    ((j % N_EXPERT) as u32, w),
+                    (((5 * j + 1) % N_EXPERT) as u32, -w),
+                ]
+            })
+            .collect()
+    }
+
+    /// `serve_union` over the stacks `spans` and `runs` make, `x`'s columns
+    /// and `lists`.
+    fn run(
+        spans: [&[u8]; 3],
+        runs: &[StackRuns; 3],
+        x: &Tensor2,
+        lists: &[Vec<(u32, f32)>],
+    ) -> Vec<f32> {
+        run_on(spans, runs, x, lists, None)
+    }
+
+    /// [`run`] with the ids of `tier` (outside its host segment) read from its
+    /// slots instead of the stacks' own bytes.
+    fn run_on(
+        spans: [&[u8]; 3],
+        runs: &[StackRuns; 3],
+        x: &Tensor2,
+        lists: &[Vec<(u32, f32)>],
+        tier: Option<(&Slots, std::ops::Range<u32>)>,
+    ) -> Vec<f32> {
+        let infos = [
+            stack_info("gate_exps", [EMBD, FF, N_EXPERT]),
+            stack_info("up_exps", [EMBD, FF, N_EXPERT]),
+            stack_info("down_exps", [FF, EMBD, N_EXPERT]),
+        ];
+        let tensor_scales = [scales(0), scales(1), scales(2)];
+        let stacks: [ExpertStack<'_>; 3] = std::array::from_fn(|s| {
+            let stack =
+                ExpertStack::located(&infos[s], spans[s], &runs[s], Some(&tensor_scales[s]))
+                    .expect("a stack that fits its runs");
+            match &tier {
+                Some((slots, host)) => stack.with_tier(StackTier::new(*slots, 0, host, s)),
+                None => stack,
+            }
+        });
+        let cols = x.ne1;
+        let mut us = UnionScratch::new_routed(EMBD, FF, cols, 2).unwrap();
+        let refs: Vec<&[(u32, f32)]> = lists.iter().map(Vec::as_slice).collect();
+        let mut out = vec![0.0f32; cols * EMBD];
+        serve_union(
+            stacks,
+            LegRun::flat(),
+            x.view(),
+            &refs,
+            &mut out,
+            &mut us,
+            None,
+        )
+        .expect("the union call runs");
+        out
+    }
+
+    fn quantized(v: &[f32]) -> Vec<u8> {
+        let mut q = vec![0u8; qdot::col_bytes(TY, v.len())];
+        qdot::quantize_col(TY, v, &mut q);
+        q
+    }
+
+    /// `m`'s `n` rows of `k` values (codes then scales, as made) dotted with
+    /// the quantized column `acol`, each at `scale`.
+    fn dots(m: &[u8], k: usize, n: usize, acol: &[u8], scale: f32) -> Vec<f32> {
+        let (codes, scales) = m.split_at(n * k / 2);
+        (0..n)
+            .map(|r| {
+                qdot::dot_nvfp4_planes_row(
+                    &codes[r * k / 2..][..k / 2],
+                    &scales[r * k / 16..][..k / 16],
+                    acol,
+                    k,
+                ) * scale
+            })
+            .collect()
+    }
+
+    /// One column's leg written out on the source matrices, never through a
+    /// stack: x quantized, each listed expert's gate and up dotted at its
+    /// scale, the combine quantized, the down dotted at its scale, the
+    /// weighted sum in list order from zero.
+    fn transcription(f: &Folder, x: &[f32], list: &[(u32, f32)]) -> Vec<f32> {
+        let xq = quantized(x);
+        let mut out = vec![0.0f32; EMBD];
+        for &(e, w) in list {
+            let (m, e) = (&f.mats[e as usize], e as usize);
+            let gate = dots(&m[0], EMBD, FF, &xq, scale(0, e));
+            let up = dots(&m[1], EMBD, FF, &xq, scale(1, e));
+            let mut par = vec![0.0f32; FF];
+            assert!(qdot::swiglu_clamp(&gate, &up, 0.0, &mut par));
+            let down = dots(&m[2], FF, EMBD, &quantized(&par), scale(2, e));
+            for (o, d) in out.iter_mut().zip(&down) {
+                *o += w * d;
+            }
+        }
+        out
+    }
+
+    fn bits(v: &[f32]) -> Vec<u32> {
+        v.iter().map(|v| v.to_bits()).collect()
+    }
+
+    fn column(c: usize) -> Vec<f32> {
+        (0..EMBD)
+            .map(|i| (((i * 31 + c * 17) % 97) as f32 - 48.0) / 40.0)
+            .collect()
+    }
+
+    /// The union call over a located stack — the experts where the folder
+    /// stores them, in no order, an expert's scales run after its codes run or
+    /// a region away — gives the bits of the same experts in one contiguous
+    /// planes run each, and the bits of the leg written out on the source
+    /// matrices, at 1 and 3 columns (the claiming passes) and 9 (the pool's
+    /// five).
+    #[test]
+    fn a_located_planes_stack_gives_the_union_call_the_contiguous_run_bits() {
+        for order in ORDERS {
+            let f = folder(order);
+            let (spans, plain) = plain(&f);
+            for cols in [1usize, 3, 9] {
+                let lists = lists(cols);
+                let xs: Vec<Vec<f32>> = (0..cols).map(column).collect();
+                let x = Tensor2::from_vec(EMBD, cols, xs.concat());
+                let got = run([&f.span, &f.span, &f.span], &f.runs, &x, &lists);
+                let want = run([&spans[0], &spans[1], &spans[2]], &plain, &x, &lists);
+                assert!(
+                    got.iter().all(|v| v.is_finite()) && got.iter().any(|v| v.abs() > 1e-3),
+                    "{order:?} {cols} columns: the call's values are finite and not all zero"
+                );
+                assert_eq!(
+                    bits(&got),
+                    bits(&want),
+                    "{order:?} {cols} columns: located against contiguous"
+                );
+                for (j, (xc, list)) in xs.iter().zip(&lists).enumerate() {
+                    assert_eq!(
+                        bits(&got[j * EMBD..(j + 1) * EMBD]),
+                        bits(&transcription(&f, xc, list)),
+                        "{order:?} {cols} columns: column {j} against the leg on the source matrices"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A tier whose slots lend every `(id, part)` as one run of the matrix as
+    /// made — a planes expert's codes then its scales, what the arena holds —
+    /// or, `filled` off, nothing. The `slot` of the trait and no more: a
+    /// union of stacks over it reads nothing else.
+    struct Slots {
+        mats: Vec<[Vec<u8>; 3]>,
+        filled: bool,
+    }
+
+    impl TierSlots for Slots {
+        fn ensure_as(&self, _: usize, _: &[u32], _: Claim) -> Result<(), TierError> {
+            unreachable!("a stack over these slots reads `slot` alone")
+        }
+        fn pin<'a>(&'a self, _: usize, _: &[u32]) -> Result<TierPin<'a>, TierError> {
+            unreachable!("a stack over these slots reads `slot` alone")
+        }
+        fn slots(&self, _: usize) -> usize {
+            unreachable!("a stack over these slots reads `slot` alone")
+        }
+        fn ensure_pinned<'a>(
+            &'a self,
+            _: usize,
+            _: &[u32],
+            _: Claim,
+        ) -> Result<TierPin<'a>, TierError> {
+            unreachable!("a stack over these slots reads `slot` alone")
+        }
+        fn slot(&self, _: usize, id: u32, part: usize) -> Option<&[u8]> {
+            self.filled.then(|| &self.mats[id as usize][part][..])
+        }
+    }
+
+    /// A planes stack lent by the NVMe tier reads its slot — one run of the
+    /// matrix, codes then scales — as the same two runs the file holds: the
+    /// union call over a tier whose host segment is two of the six experts
+    /// gives the bits of the file-only call, the warm spans of a lent id are
+    /// the codes' and the scales' of the matrix as made, and an unfilled slot
+    /// warms nothing.
+    #[test]
+    fn a_planes_slot_is_read_as_the_two_runs_of_its_matrix() {
+        let f = folder(Order::Separated);
+        let slots = Slots {
+            mats: f.mats.clone(),
+            filled: true,
+        };
+        let host = 2..4u32;
+        let cols = 9;
+        let lists = lists(cols);
+        let xs: Vec<Vec<f32>> = (0..cols).map(column).collect();
+        let x = Tensor2::from_vec(EMBD, cols, xs.concat());
+        let spans = [&f.span[..], &f.span[..], &f.span[..]];
+        let want = run(spans, &f.runs, &x, &lists);
+        let got = run_on(spans, &f.runs, &x, &lists, Some((&slots, host.clone())));
+        assert_eq!(
+            bits(&got),
+            bits(&want),
+            "a lent slot against the file's runs"
+        );
+        let empty = Slots {
+            mats: Vec::new(),
+            filled: false,
+        };
+        let info = stack_info("gate_exps", [EMBD, FF, N_EXPERT]);
+        let tensor_scales = scales(0);
+        let located =
+            || ExpertStack::located(&info, &f.span, &f.runs[0], Some(&tensor_scales)).unwrap();
+        let lent = located().with_tier(StackTier::new(&slots, 0, &host, 0));
+        let unfilled = located().with_tier(StackTier::new(&empty, 0, &host, 0));
+        let cp = EMBD * FF / 2;
+        for e in 0..N_EXPERT as u32 {
+            let (codes, plane) = f.mats[e as usize][0].split_at(cp);
+            let spans = lent
+                .warm_spans(e)
+                .expect("a filled slot or the file's runs");
+            let [Some(c), Some(p)] = spans else {
+                panic!("expert {e}: a planes matrix warms two spans, got {spans:?}")
+            };
+            assert_eq!((c.bytes, p.bytes), (codes, plane), "expert {e}'s spans");
+            assert_eq!((c.units, p.units), (FF, FF), "expert {e}'s units");
+            assert_eq!(
+                unfilled.warm_spans(e).is_some(),
+                host.contains(&e),
+                "expert {e}: only the host segment's ids warm with no slot filled"
+            );
+        }
+    }
+
+    /// `(scale · Σ w·a, band)` of one planes cell: the exact f64 dot of the
+    /// row's unscaled dequantized values `w` with the activation `a` the call
+    /// quantizes, times the stack's tensor scale, and the band of the leg's
+    /// value, derived before the run. Per 32-value block `b` of `a`, `W_b =
+    /// Σ|w|` and `M_b = max|a|` over it:
+    ///
+    /// 1. `a`'s q8_2 quantization: `d_a = bf16(M_b/127)` is within 2^-8 of
+    ///    `M_b/127`, a code `nearest_int(fl(a·fl(1/d_a)))` is at most 127 in
+    ///    magnitude, and `|d_a·q − a| ≤ (M_b/254)(1 + 2^-7)`. Summed:
+    ///    `Σ_b W_b·(M_b/254)(1 + 2^-7)`.
+    /// 2. Float order. A block is two exact integer sums, each times its
+    ///    group's UE4M3 half (exact), added (one rounding), times `d_a` (one),
+    ///    and added to the running sum in block order (one a block): `nb` adds
+    ///    and two roundings, then the tensor scale's one multiply: `n = nb + 3`,
+    ///    `γ_n·Σ|leaves|` with `|w·d_a·q| ≤ |w|·M_b·(128/127)(1 + 2^-7)`.
+    /// 3. The f64 reference's own sum: `k·2^-53·Σ|w·a|`.
+    ///
+    /// All three are multiplied by the tensor scale.
+    fn cell(w: &[f32], a: &[f32], scale: f32) -> (f64, f64) {
+        let n = (w.len() / 32 + 3) as f64;
+        let u = 2f64.powi(-24);
+        let (mut quant, mut leaves, mut dot, mut wa) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+        for (bw, ba) in w.chunks(32).zip(a.chunks(32)) {
+            let m = ba.iter().fold(0.0f64, |m, &v| m.max(f64::from(v).abs()));
+            let wb: f64 = bw.iter().map(|&v| f64::from(v).abs()).sum();
+            quant += wb * m / 254.0 * (1.0 + 2f64.powi(-7));
+            leaves += wb * m * (128.0 / 127.0) * (1.0 + 2f64.powi(-7));
+            for (&x, &y) in bw.iter().zip(ba) {
+                dot += f64::from(x) * f64::from(y);
+                wa += (f64::from(x) * f64::from(y)).abs();
+            }
+        }
+        let band = quant + n * u / (1.0 - n * u) * leaves + w.len() as f64 * 2f64.powi(-53) * wa;
+        (f64::from(scale) * dot, f64::from(scale) * band)
+    }
+
+    /// The dequantized values of row `r` of `m` (`n` rows of `k` values, codes
+    /// then scales, as made), tensor scale left out.
+    fn dequantized(m: &[u8], k: usize, n: usize, r: usize) -> Vec<f32> {
+        let (codes, scales) = m.split_at(n * k / 2);
+        let mut w = vec![0.0f32; k];
+        Nvfp4Rows::new(1.0)
+            .decode_planes(
+                &codes[r * k / 2..][..k / 2],
+                &scales[r * k / 16..][..k / 16],
+                &mut w,
+            )
+            .unwrap();
+        w
+    }
+
+    /// The planes twin of the NVFP4 blocks' dequant gate
+    /// (`tests/union.rs`): a located layer served for six slots, one expert a
+    /// column at weight 1.0 so each output column is its slot's down, with
+    ///
+    /// - stage 1, each gate and up row's value (the planes row dot of the
+    ///   call's quantized column, times the expert's tensor scale) within
+    ///   [`cell`]'s band of the f64 dot of the row's dequantized values with the
+    ///   activation, times the scale;
+    /// - stage 2, each output cell within the band of the f64 dot of the down
+    ///   row's dequantized values with the combine from those stage-1 values,
+    ///   times the down's scale.
+    #[test]
+    fn a_located_planes_layer_is_within_the_derived_band_of_the_dequant_dot() {
+        for order in ORDERS {
+            let f = folder(order);
+            let slots: Vec<u32> = (0..N_EXPERT as u32).rev().collect();
+            let lists: Vec<Vec<(u32, f32)>> = slots.iter().map(|&e| vec![(e, 1.0)]).collect();
+            let xs: Vec<Vec<f32>> = (0..slots.len()).map(column).collect();
+            let x = Tensor2::from_vec(EMBD, slots.len(), xs.concat());
+            let got = run([&f.span, &f.span, &f.span], &f.runs, &x, &lists);
+            let (mut outside, mut worst) = (0usize, 0.0f64);
+            let mut judge = |what: String, got: f64, (exact, band): (f64, f64)| {
+                let err = (got - exact).abs();
+                if err.is_nan() || err > band {
+                    outside += 1;
+                    eprintln!("{what}: {got:e} is {err:e} from {exact:e}, band {band:e}");
+                } else if band > 0.0 {
+                    worst = worst.max(err / band);
+                }
+            };
+            for (j, &e) in slots.iter().enumerate() {
+                let e = e as usize;
+                let xq = quantized(&xs[j]);
+                let mut stage1 = [vec![0.0f32; FF], vec![0.0f32; FF]];
+                for (stack, out) in stage1.iter_mut().enumerate() {
+                    *out = dots(&f.mats[e][stack], EMBD, FF, &xq, scale(stack, e));
+                    for (r, &v) in out.iter().enumerate() {
+                        let w = dequantized(&f.mats[e][stack], EMBD, FF, r);
+                        let cell = cell(&w, &xs[j], scale(stack, e));
+                        judge(
+                            format!("{order:?} stage 1 stack {stack} slot {j} row {r}"),
+                            f64::from(v),
+                            cell,
+                        );
+                    }
+                }
+                let mut h = vec![0.0f32; FF];
+                assert!(qdot::swiglu_clamp(&stage1[0], &stage1[1], 0.0, &mut h));
+                for o in 0..EMBD {
+                    let w = dequantized(&f.mats[e][2], FF, EMBD, o);
+                    let cell = cell(&w, &h, scale(2, e));
+                    judge(
+                        format!("{order:?} stage 2 slot {j} out {o}"),
+                        f64::from(got[j * EMBD + o]),
+                        cell,
+                    );
+                }
+            }
+            println!("planes {order:?}: {outside} cells outside the band, max err/band {worst:.3}");
+            assert_eq!(outside, 0, "{order:?}: every cell within the derived band");
+        }
     }
 }

@@ -41,9 +41,7 @@ pub fn machine(
         _ => return Err("the history requires exactly one tier node".into()),
     };
     let mut machine = workstation::plan_on(stage, layers);
-    machine
-        .tiers
-        .push(workstation::tier_card(tier, None, batch));
+    machine.tiers.push(workstation::tier_card(tier, batch));
     machine
         .host_mut()
         .reserves

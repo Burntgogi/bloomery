@@ -7,6 +7,7 @@
 use std::time::Instant;
 
 use bloomery_gpu::GpuError;
+use bloomery_gpu::route_core::sigmoid;
 use bloomery_gpu_gates::flip::Flip;
 use bloomery_gpu_gates::tier;
 use bloomery_gpu_gates::{
@@ -460,6 +461,40 @@ pub fn top_ids(v: &[f32], k: usize) -> Vec<usize> {
     ids.sort_by(|&a, &b| v[b].total_cmp(&v[a]).then(a.cmp(&b)));
     ids.truncate(k);
     ids
+}
+
+/// The band within which two experts' selection values may cross between two paths: each expert's score moves by
+/// `σ'(z) · Δz`, with `σ'(z) = s (1 − s)` at its own score `s` and `Δz` the router-logit error, taken as `eps` (the
+/// error relative to the layer's peak logit) times that peak `z_max`; the two errors add.
+pub fn cross_band(eps: f32, z_max: f32, a: f32, b: f32) -> f32 {
+    eps * z_max * (a * (1.0 - a) + b * (1.0 - b))
+}
+
+/// A sigmoid router's selection over one row of logits: the scores `σ(z)`, each expert's selection value
+/// (`score + bias`), the experts ranked by it and the layer's peak `|z|` (the `z_max` of [`cross_band`]).
+pub struct Selection {
+    pub scores: Vec<f32>,
+    /// The selection value of each expert.
+    pub values: Vec<f32>,
+    /// `(expert, value)`, larger first, the larger id first on a tie (the device's rule).
+    pub rank: Vec<(u32, f32)>,
+    pub z_max: f32,
+}
+
+/// The [`Selection`] of `logits` under the layer's selection `bias`, scored by the device's own sigmoid
+/// ([`bloomery_gpu::route_core::sigmoid`]); the experts the shorter of the two covers.
+pub fn selection_order(bias: &[f32], logits: &[f32]) -> Selection {
+    let scores: Vec<f32> = logits.iter().map(|&z| sigmoid(z)).collect();
+    let values: Vec<f32> = scores.iter().zip(bias).map(|(s, b)| s + b).collect();
+    let mut rank: Vec<(u32, f32)> = (0..).zip(values.iter().copied()).collect();
+    rank.sort_by(|a, b| b.1.total_cmp(&a.1).then(b.0.cmp(&a.0)));
+    let z_max = logits.iter().fold(0.0f32, |m, z| m.max(z.abs()));
+    Selection {
+        scores,
+        values,
+        rank,
+        z_max,
+    }
 }
 
 /// The fixed walk: a multiplicative walk through ids the vocabulary holds.

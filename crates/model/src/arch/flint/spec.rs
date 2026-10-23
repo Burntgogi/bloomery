@@ -47,6 +47,7 @@ pub fn read(split: &Split) -> Result<Read, PlacementError> {
                     }
                 },
                 qk_norm: true,
+                o_norm: false,
                 out_gate: OutGate::None,
                 select: None,
                 window: hp.swa[l]
@@ -66,6 +67,8 @@ pub fn read(split: &Split) -> Result<Read, PlacementError> {
                     top_k: spec_u32("expert_used_count", hp.used)?,
                     expert_ff: spec_u32("expert_feed_forward_length", hp.expert_ff[l])?,
                     latent: None,
+                    pre_exp_norm: false,
+                    post_exp_norm: None,
                     act,
                     router: Router {
                         score: Score::Sigmoid,
@@ -107,6 +110,7 @@ pub fn read(split: &Split) -> Result<Read, PlacementError> {
             hc: None,
             engram: None,
             encoder: None,
+            logit_epilogue: None,
             chat,
         },
         tensors,

@@ -19,10 +19,13 @@
 //! ([`crate::video`]); each of its groups is a media span. Text and all media spans share one
 //! pass, with BOS and EOS around the whole input.
 //!
-//! The side model runs one request at a time. A failure in it ends the server as an engine's does:
+//! The side model runs one request at a time. Text inputs of one request that carry no image and
+//! no audio share one call, which packs them up to the model's context; an image or audio input
+//! keeps its own pass. A failure in it ends the server as an engine's does:
 //! the request gets a 500, `/health` and every later request a 503, and the server exits after its
 //! linger. A request that waited for the model while the server failed or began its stop gets the
-//! 503 and no pass, and so does the rest of an array once that happens between its passes.
+//! 503 and no pass. Stop is seen before the shared text call and between it and a later media
+//! pass, not between the text inputs of that call.
 
 use std::io;
 use std::net::TcpStream;
@@ -573,80 +576,146 @@ fn inputs_with(
     prepare(side, video, &request)
 }
 
-/// Every input's pooled vector, through the side model under its lock, each pass after
-/// [`open`] holds. A model failure, a panic in it, its lock poisoned, and a vector that is not its
-/// width or not finite are fatal ([`fail`]).
-fn run(state: &State, side: &Side, inputs: &[Input]) -> Result<Vec<Vec<f32>>, ApiError> {
+/// A vector that is not the model's width or not finite is fatal ([`fail`]).
+fn vector_ok(state: &State, side: &Side, v: &[f32]) -> Result<(), ApiError> {
     let width = side.width();
-    let mut pooled = Vec::with_capacity(inputs.len());
-    for input in inputs {
+    if v.len() != width {
+        let n = v.len();
+        return Err(fail(
+            state,
+            side,
+            format!("the embedding model gave {n} values, not its width {width}"),
+        ));
+    }
+    if v.iter().any(|x| !x.is_finite()) {
+        return Err(fail(
+            state,
+            side,
+            "the embedding model gave a value that is not finite".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Cache `v` when `key` is set. The model's lock is the caller's; this takes the cache's.
+fn store(state: &State, side: &Side, key: Option<[u8; 32]>, v: &[f32]) -> Result<(), ApiError> {
+    if let (Some(cache), Some(key)) = (&side.cache, key) {
+        cache
+            .lock()
+            .map_err(|_| fail(state, side, "the embedding cache's lock is poisoned".into()))?
+            .insert(key, crate::embed_cache::Value::Vector(v.to_vec()));
+    }
+    Ok(())
+}
+
+fn model_poisoned(state: &State, side: &Side) -> ApiError {
+    fail(
+        state,
+        side,
+        "the embedding model's lock is poisoned: a request panicked while it held it".into(),
+    )
+}
+
+fn model_panicked(state: &State, side: &Side, panic: Box<dyn std::any::Any + Send>) -> ApiError {
+    let what = panic_text(&*panic);
+    fail(state, side, format!("the embedding model panicked: {what}"))
+}
+
+/// Every input's pooled vector, through the side model under its lock. Text inputs with no image
+/// and no audio share one [`Embed::embed_batch`]; an image or audio input keeps its own pass.
+/// Each call is after [`open`] holds. A model failure, a panic in it, its lock poisoned, and a
+/// vector that is not its width or not finite are fatal ([`fail`]).
+fn run(state: &State, side: &Side, inputs: &[Input]) -> Result<Vec<Vec<f32>>, ApiError> {
+    let mut pooled = vec![None; inputs.len()];
+    let mut pending: Vec<(usize, Option<[u8; 32]>)> = Vec::new();
+    for (i, input) in inputs.iter().enumerate() {
         open(state)?;
         let key = side
             .cache
             .as_ref()
             .filter(|_| input.audio.is_empty())
             .and_then(|_| crate::embed_cache::vector_key(&input.ids, &input.images));
-        if let (Some(cache), Some(key)) = (&side.cache, &key) {
+        if let (Some(cache), Some(hit)) = (&side.cache, key) {
             let mut cache = cache
                 .lock()
                 .map_err(|_| fail(state, side, "the embedding cache's lock is poisoned".into()))?;
-            if let Some(crate::embed_cache::Value::Vector(v)) = cache.get(key) {
+            if let Some(crate::embed_cache::Value::Vector(v)) = cache.get(&hit) {
                 open(state)?;
-                pooled.push(v);
+                pooled[i] = Some(v);
                 continue;
             }
         }
+        if input.images.is_empty() && input.audio.is_empty() {
+            pending.push((i, key));
+        }
+    }
+    if !pending.is_empty() {
         let Ok(mut model) = side.embed.lock() else {
+            return Err(model_poisoned(state, side));
+        };
+        open(state)?;
+        let batch: Vec<&[u32]> = pending
+            .iter()
+            .map(|&(i, _)| inputs[i].ids.as_slice())
+            .collect();
+        let vectors = match panic::catch_unwind(AssertUnwindSafe(|| model.embed_batch(&batch))) {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => return Err(fail(state, side, e.0)),
+            Err(p) => return Err(model_panicked(state, side, p)),
+        };
+        if vectors.len() != pending.len() {
+            let n = vectors.len();
+            let want = pending.len();
             return Err(fail(
                 state,
                 side,
-                "the embedding model's lock is poisoned: a request panicked while it held it"
-                    .into(),
+                format!("the embedding model gave {n} vectors, not {want}"),
             ));
+        }
+        for ((i, key), v) in pending.into_iter().zip(vectors) {
+            vector_ok(state, side, &v)?;
+            store(state, side, key, &v)?;
+            pooled[i] = Some(v);
+        }
+    }
+    for (i, input) in inputs.iter().enumerate() {
+        if pooled[i].is_some() {
+            continue;
+        }
+        open(state)?;
+        let key = side
+            .cache
+            .as_ref()
+            .filter(|_| input.audio.is_empty())
+            .and_then(|_| crate::embed_cache::vector_key(&input.ids, &input.images));
+        let Ok(mut model) = side.embed.lock() else {
+            return Err(model_poisoned(state, side));
         };
         open(state)?;
         let v = match panic::catch_unwind(AssertUnwindSafe(|| {
-            if input.images.is_empty() && input.audio.is_empty() {
-                model.embed(&input.ids)
-            } else {
-                model.embed_media(&input.ids, &input.images, &input.audio)
-            }
+            model.embed_media(&input.ids, &input.images, &input.audio)
         })) {
             Ok(Ok(v)) => v,
             Ok(Err(e)) => return Err(fail(state, side, e.0)),
-            Err(p) => {
-                let what = panic_text(&*p);
-                return Err(fail(
+            Err(p) => return Err(model_panicked(state, side, p)),
+        };
+        vector_ok(state, side, &v)?;
+        store(state, side, key, &v)?;
+        pooled[i] = Some(v);
+    }
+    pooled
+        .into_iter()
+        .enumerate()
+        .map(|(i, v)| {
+            v.ok_or_else(|| {
+                fail(
                     state,
                     side,
-                    format!("the embedding model panicked: {what}"),
-                ));
-            }
-        };
-        if v.len() != width {
-            let n = v.len();
-            return Err(fail(
-                state,
-                side,
-                format!("the embedding model gave {n} values, not its width {width}"),
-            ));
-        }
-        if v.iter().any(|x| !x.is_finite()) {
-            return Err(fail(
-                state,
-                side,
-                "the embedding model gave a value that is not finite".into(),
-            ));
-        }
-        if let (Some(cache), Some(key)) = (&side.cache, key) {
-            cache
-                .lock()
-                .map_err(|_| fail(state, side, "the embedding cache's lock is poisoned".into()))?
-                .insert(key, crate::embed_cache::Value::Vector(v.clone()));
-        }
-        pooled.push(v);
-    }
-    Ok(pooled)
+                    format!("the embedding model gave no vector for input {i}"),
+                )
+            })
+        })
+        .collect()
 }
 
 /// Ends the server on the side model's `error`, as an engine's failure does

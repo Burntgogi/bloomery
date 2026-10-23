@@ -89,7 +89,9 @@ pub unsafe fn publish_n<const E: usize>(
 /// `ids[at + s]`, then sums the `U` scores in f64 in slot order, takes
 /// [`renorm_divisor`] of the sum narrowed to f32, and writes each weight
 /// `score / sum · scale` to `weights[at + s]`, raising [`FaultSite::Router`]
-/// on one that is not finite.
+/// on one that is not finite. With `REFUSE_NAN`, a non-finite selection
+/// value writes NaN weights instead: [`take`] never selects a NaN, so the
+/// ids stay the finite rank order and no slot's weight is a defined pick.
 ///
 /// # Safety
 ///
@@ -102,7 +104,7 @@ pub unsafe fn publish_n<const E: usize>(
     reason = "the selecting block's shared arrays, its lane and scale, the fault and the outputs"
 )]
 #[inline(always)]
-pub unsafe fn select_n<const E: usize, const U: usize>(
+pub unsafe fn select_n<const E: usize, const U: usize, const REFUSE_NAN: bool>(
     score: *const f32,
     sel_v: *const f32,
     slot_p: *mut f32,
@@ -165,25 +167,48 @@ pub unsafe fn select_n<const E: usize, const U: usize>(
     if lane != 0 {
         return;
     }
-    let mut sum = 0.0f64;
-    let mut s = 0usize;
-    while s < U {
-        // SAFETY: s < U, this lane's own write.
-        sum += f64::from(unsafe { *slot_p.add(s) });
-        s += 1;
-    }
-    let sum = renorm_divisor(sum as f32);
-    let mut s = 0usize;
-    while s < U {
-        // SAFETY: s < U, this lane's own write.
-        let wt = unsafe { *slot_p.add(s) } / sum * scale;
-        if !wt.is_finite() {
-            fault.raise(FaultSite::Router);
+    // A non-finite lane is not a winner. Refuse it by NaN weights so the
+    // finite rank order in `ids` is not a defined pick.
+    let mut poisoned = false;
+    if const { REFUSE_NAN } {
+        let mut e = 0usize;
+        while e < E {
+            // SAFETY: e < E; `sel_v` was published by the caller's barrier.
+            if !unsafe { *sel_v.add(e) }.is_finite() {
+                poisoned = true;
+            }
+            e += 1;
         }
-        // SAFETY: at + s < at + U is inside weights by this fn's contract;
-        // lane 0 is the only writer.
-        unsafe { *weights.get_unchecked_mut(at + s) = wt };
-        s += 1;
+    }
+    if poisoned {
+        let mut s = 0usize;
+        while s < U {
+            fault.raise(FaultSite::Router);
+            // SAFETY: at + s < at + U; lane 0 is the only writer.
+            unsafe { *weights.get_unchecked_mut(at + s) = f32::NAN };
+            s += 1;
+        }
+    } else {
+        let mut sum = 0.0f64;
+        let mut s = 0usize;
+        while s < U {
+            // SAFETY: s < U, this lane's own write.
+            sum += f64::from(unsafe { *slot_p.add(s) });
+            s += 1;
+        }
+        let sum = renorm_divisor(sum as f32);
+        let mut s = 0usize;
+        while s < U {
+            // SAFETY: s < U, this lane's own write.
+            let wt = unsafe { *slot_p.add(s) } / sum * scale;
+            if !wt.is_finite() {
+                fault.raise(FaultSite::Router);
+            }
+            // SAFETY: at + s < at + U is inside weights by this fn's contract;
+            // lane 0 is the only writer.
+            unsafe { *weights.get_unchecked_mut(at + s) = wt };
+            s += 1;
+        }
     }
 }
 
@@ -206,7 +231,7 @@ pub unsafe fn select_n<const E: usize, const U: usize>(
     reason = "a kernel entry's arguments and the shared arrays it declares (rust-quality R8)"
 )]
 #[inline(always)]
-pub unsafe fn router_body<S: Score, const E: usize, const U: usize>(
+pub unsafe fn router_body<S: Score, const E: usize, const U: usize, const REFUSE_NAN: bool>(
     w: &[f32],
     x: &[f32],
     bias: &[f32],
@@ -271,7 +296,9 @@ pub unsafe fn router_body<S: Score, const E: usize, const U: usize>(
     if tid < 32 {
         // SAFETY: the barrier above published score and sel_v; ids and
         // weights hold U entries from 0 by this fn's contract.
-        unsafe { select_n::<E, U>(score, sel_v, slot_p, lane, scale, fault, ids, weights, 0) };
+        unsafe {
+            select_n::<E, U, REFUSE_NAN>(score, sel_v, slot_p, lane, scale, fault, ids, weights, 0)
+        };
         if lane == 0 {
             // SAFETY: `ticket` is done[0], inside `done` by this fn's
             // contract; every block has drawn its ticket by now.
@@ -297,7 +324,7 @@ pub unsafe fn router_body<S: Score, const E: usize, const U: usize>(
     reason = "a kernel entry's arguments and the shared arrays it declares (rust-quality R8)"
 )]
 #[inline(always)]
-pub unsafe fn pick_body<const E: usize, const U: usize>(
+pub unsafe fn pick_body<const E: usize, const U: usize, const REFUSE_NAN: bool>(
     probs: &[f32],
     bias: &[f32],
     n_expert: u32,
@@ -325,7 +352,7 @@ pub unsafe fn pick_body<const E: usize, const U: usize>(
         // ids and weights hold U entries from U · token by this fn's
         // contract.
         unsafe {
-            select_n::<E, U>(
+            select_n::<E, U, REFUSE_NAN>(
                 score,
                 sel_v,
                 slot_p,
@@ -344,7 +371,8 @@ pub unsafe fn pick_body<const E: usize, const U: usize>(
 /// holding `N_EXPERT` and `N_USED`, the three `#[cuda_module]` entries
 /// (`$router`, `$scores`, `$pick`), `RouterOut` and `RouterKernels` at those
 /// counts, compiled into the crate that invokes it (`gpu-deepseek41`'s
-/// `glm5next` and `mimo2`; Bolt's five, `arch/nemotron_h_moe/router.rs`; the 128/6 one below). The expert and slot counts are tokens, not constants, so the
+/// `glm5next` and `mimo2`; Bolt's five, `arch/nemotron_h_moe/router.rs`; the
+/// 128/6 and 256/8 ones below). The expert and slot counts are tokens, not constants, so the
 /// entries' `launch_contract` literals and the module's constants are one
 /// source. The entry names are the PTX entry names, and `$p_router`,
 /// `$p_scores` and `$p_pick` the `prepare_*` launchers `#[cuda_module]`
@@ -359,6 +387,55 @@ macro_rules! sigmoid_router_instance {
             kernels: $kernels:ident,
             entries: $router:ident, $pick:ident,
             prepare: $p_router:ident, $p_pick:ident $(,)?
+        }
+    ) => {
+        $crate::sigmoid_router_instance! {
+            @instance
+            $(#[$meta])*
+            pub mod $m {
+                experts: $e,
+                used: $u,
+                kernels: $kernels,
+                entries: $router, $pick,
+                prepare: $p_router, $p_pick,
+                refuse_nan: false,
+            }
+        }
+    };
+    (
+        $(#[$meta:meta])*
+        pub mod $m:ident {
+            experts: $e:tt,
+            used: $u:tt,
+            kernels: $kernels:ident,
+            entries: $router:ident, $pick:ident,
+            prepare: $p_router:ident, $p_pick:ident,
+            refuse_nan: $refuse:tt $(,)?
+        }
+    ) => {
+        $crate::sigmoid_router_instance! {
+            @instance
+            $(#[$meta])*
+            pub mod $m {
+                experts: $e,
+                used: $u,
+                kernels: $kernels,
+                entries: $router, $pick,
+                prepare: $p_router, $p_pick,
+                refuse_nan: $refuse,
+            }
+        }
+    };
+    (
+        @instance
+        $(#[$meta:meta])*
+        pub mod $m:ident {
+            experts: $e:tt,
+            used: $u:tt,
+            kernels: $kernels:ident,
+            entries: $router:ident, $pick:ident,
+            prepare: $p_router:ident, $p_pick:ident,
+            refuse_nan: $refuse:tt $(,)?
         }
     ) => {
         $(#[$meta])*
@@ -461,7 +538,7 @@ macro_rules! sigmoid_router_instance {
                 // contract's, the launcher passes k a positive multiple of 32,
                 // and `done[0]` is zero before the launch.
                 unsafe {
-                    router_body::<Sigmoid, N_EXPERT, N_USED>(
+                    router_body::<Sigmoid, N_EXPERT, N_USED, $refuse>(
                         w,
                         x,
                         bias,
@@ -522,7 +599,7 @@ macro_rules! sigmoid_router_instance {
                 // reaches each `static mut` without a reference); the block is
                 // 128 threads, converged; the lengths are the launch contract's.
                 unsafe {
-                    pick_body::<N_EXPERT, N_USED>(
+                    pick_body::<N_EXPERT, N_USED, $refuse>(
                         probs,
                         bias,
                         n_expert,
@@ -816,5 +893,56 @@ crate::sigmoid_router_instance! {
         kernels: sigmoid_128_6_router_kernels,
         entries: sigmoid_128_6_router, sigmoid_128_6_router_pick,
         prepare: prepare_sigmoid_128_6_router, prepare_sigmoid_128_6_router_pick,
+    }
+}
+
+crate::sigmoid_router_instance! {
+    /// The sigmoid router at 256 experts and the top 6: the same rule as
+    /// `sigmoid_128_6` (biased sigmoid, the kept unbiased scores renormalized)
+    /// at another expert count. The launch's `scale` is the file's
+    /// `expert_weights_scale` (1 for the row this instance was built for).
+    /// MiMo's 256/top-8 instance is a different row and is not this one.
+    pub mod sigmoid_256_6 {
+        experts: 256,
+        used: 6,
+        kernels: sigmoid_256_6_router_kernels,
+        entries: sigmoid_256_6_router, sigmoid_256_6_router_pick,
+        prepare: prepare_sigmoid_256_6_router, prepare_sigmoid_256_6_router_pick,
+    }
+}
+
+crate::sigmoid_router_instance! {
+    /// The sigmoid router at 256 experts and the top 8: the same rule as
+    /// `sigmoid_256_6` at the other pick count, the common instance Muse
+    /// Spark's router runs (`exp_probs_b` steering the selection only, the
+    /// kept unbiased scores renormalized, scale 1). The shape's row in
+    /// `models::shape::ROUTERS` is the one MiMo's own compiled instance
+    /// holds (`mimo2_router`): the pick ranges coincide, so `router_row` at
+    /// 256 stays that row and this is the second compiled instance of it. A
+    /// non-finite selection value writes NaN weights, so the finite rank
+    /// order is not a defined pick, as at the fixture's `sigmoid_16_8`.
+    pub mod sigmoid_256_8 {
+        experts: 256,
+        used: 8,
+        kernels: sigmoid_256_8_router_kernels,
+        entries: sigmoid_256_8_router, sigmoid_256_8_router_pick,
+        prepare: prepare_sigmoid_256_8_router, prepare_sigmoid_256_8_router_pick,
+        refuse_nan: true,
+    }
+}
+
+crate::sigmoid_router_instance! {
+    /// The sigmoid router at 16 experts and the top 8: the same rule as
+    /// `sigmoid_256_8` at the muse-spark fixture's expert count (the mini
+    /// keeps the real file's top 8 over its 16 rivals). The real file's own
+    /// count is `sigmoid_256_8`'s. A non-finite selection value writes NaN
+    /// weights, so the finite rank order is not a defined pick.
+    pub mod sigmoid_16_8 {
+        experts: 16,
+        used: 8,
+        kernels: sigmoid_16_8_router_kernels,
+        entries: sigmoid_16_8_router, sigmoid_16_8_router_pick,
+        prepare: prepare_sigmoid_16_8_router, prepare_sigmoid_16_8_router_pick,
+        refuse_nan: true,
     }
 }

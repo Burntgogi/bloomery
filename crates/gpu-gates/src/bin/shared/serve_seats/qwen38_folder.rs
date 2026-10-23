@@ -1,6 +1,6 @@
 //! A Qwen3.8 checkpoint folder as a server or a gate opens it: a model path that is a directory is
-//! one, read as stored (`model_hf::arch::qwen35moe::folder::open`, no prepare step). A build
-//! without the `checkpoint` feature refuses it by name.
+//! one, read as stored (`model_hf::folder::open`, no prepare step). A build without the
+//! `checkpoint` feature refuses it by name.
 
 use std::path::Path;
 
@@ -20,18 +20,36 @@ pub struct Opened {
     pub parts: Box<dyn FnOnce(Split) -> Folder38>,
 }
 
-/// The checkpoint folder `path` opened for a load: a Qwen3.8 checkpoint; any other folder is
-/// refused by name.
+/// The checkpoint folder `path` opened for a load: a Qwen3.8 checkpoint; a folder of any other
+/// architecture is refused by name.
 #[cfg(feature = "checkpoint")]
 pub fn open(path: &Path) -> Result<Opened, GateError> {
-    let f = model_hf::arch::qwen35moe::folder::open(path)
+    let mut f = model_hf::folder::open(path)
         .map_err(|e| format!("checkpoint folder {}: {e}", path.display()))?;
-    let (source, ple) = (f.source, f.ple);
+    if f.header.architecture() != Some("qwen4exp") {
+        return Err(format!(
+            "checkpoint folder {}: a {} model, where this seat serves qwen4exp",
+            path.display(),
+            f.header.architecture().unwrap_or("<no architecture>")
+        )
+        .into());
+    }
+    let ple = f
+        .rows
+        .remove(&model::arch::qwen35moe::names::per_layer_token_embd());
+    if let Some(name) = f.rows.keys().next() {
+        return Err(format!(
+            "checkpoint folder {}: the row table {name}, which this seat does not read",
+            path.display()
+        )
+        .into());
+    }
+    let source = f.source;
     Ok(Opened {
         header: f.header,
         tokenizer: f.tokenizer,
         draft: f.draft.map_err(|e| e.to_string()),
-        parts: Box::new(move |header| Folder38::new(header, source, ple)),
+        parts: Box::new(move |header| Folder38::with(header, source, ple)),
     })
 }
 

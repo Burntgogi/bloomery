@@ -41,6 +41,7 @@ use crate::gemm::Gemm32Kernels;
 use crate::host::handoff::{Handoff, HandoffKernels};
 use crate::host::leg_tier::{STAGE_TIER, TierSide};
 use crate::host::run::HostRun;
+use crate::host::xstream::RingLayer;
 use crate::hybrid::{Boundary, Hybrid};
 use crate::kquant::Act;
 use crate::weights::Weights;
@@ -511,6 +512,43 @@ impl<R: RouterEntry> RouteBlock<R> {
         };
         let row_off = self.layer(l)?.row_off;
         card.enqueue_rows(gpu, w, cb, l, rule, &io, (ids, &self.slots, row_off))
+    }
+
+    /// [`RouteBlock::card_rows`] with the expert stream's ring `ring` of
+    /// layer `l` beside the card's stacks ([`CardExperts::enqueue_rows_ring`]):
+    /// the card sum over the card's and the streamed experts' slots plus
+    /// `base` into `cb`'s `pre`, the streamed slots' GEMMs (`g32`) one batch a
+    /// landing batch of the ring, each behind its own batch's copies. A layer
+    /// with no card experts or no `cb` is refused by name: the stream rides a
+    /// layer the card route runs.
+    pub fn card_rows_ring(
+        &self,
+        (gpu, w, g32): (&Gpu, &Weights, &Gemm32Kernels),
+        (card, cb): (&CardExperts, Option<&mut CardBatch>),
+        (l, m): (usize, usize),
+        (base, rule): (&DeviceBuffer<f32>, Act),
+        (normed, weights, ids): (&DeviceBuffer<f32>, &DeviceBuffer<f32>, &DeviceBuffer<u32>),
+        ring: &RingLayer,
+    ) -> Result<(), GpuError> {
+        let cb = cb.ok_or(GpuError::State {
+            what: self.what,
+            missing: "the batch's card experts' buffers",
+        })?;
+        let io = Io {
+            normed,
+            weights,
+            x1: base,
+            m,
+        };
+        let row_off = self.layer(l)?.row_off;
+        card.enqueue_rows_ring(
+            (gpu, w, g32),
+            cb,
+            (l, rule),
+            &io,
+            (ids, &self.slots, row_off),
+            ring,
+        )
     }
 
     /// Enqueue layer `l`'s back of the step: the wait, then the add of the

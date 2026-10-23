@@ -1,4 +1,4 @@
-//! The MiniMax-M3 prefill gate: the prompt batch (`bloomery_gpu_minimaxm3::prefill`: up to `T_MAX` rows a unit, every
+//! The MiniMax-M3.1-Flash prefill gate: the prompt batch (`bloomery_gpu_minimaxm3::prefill`: up to `T_MAX` rows a unit, every
 //! layer over the whole unit, the index keys of the unit's rows before any row is scored, the block-max selection over
 //! each row's own live count, the routed block over the unit's slots) is the one-token step run per id to within the
 //! family's own band, in the logits row and in every layer's output, and the stores it leaves are the ones the next step
@@ -10,19 +10,40 @@
 //! over the layers from that prefix on: a top-4 near tie can flip between the batch's GEMM sum order and the step's gemv,
 //! and a flip is a discrete exchange of experts, not a rounding of the activations.
 //!
-//! The prompt lengths straddle the unit: `P = 1` (a unit of one row, the step's shape), `7` (rows short of any alignment),
-//! `T_MAX` (one whole unit) and `T_MAX + 1` (a whole unit and a unit of one row: the K and V planes and the index keys
-//! cross the cut between two units). The ids are the fixed walk of `e2e::walk`, none of the oracle's: the clauses compare
-//! the engine's two paths to each other and need no reference.
+//! The prompt lengths straddle the unit and the shared expert's gated threshold: `P = 1` (a unit of one row, the step's
+//! shape), `7` (rows short of the gated GEMMs), `16` and `17` (rows past it, short of a unit), `T_MAX` (one whole unit),
+//! `T_MAX + 1` (a whole unit and a unit of one row: the K and V planes and the index keys cross the cut between two
+//! units) and `2 · T_MAX + 1` (two whole units, which the prompt group runs together, and a unit of one row; the flash
+//! of the dense and the sparse layers runs in more than one launch in each unit). The ids are the fixed walk of
+//! `e2e::walk`, none of the oracle's: the clauses compare the engine's two paths to each other and need no reference.
 //!
 //! The clauses (all self-consistency) are the common ones ([`prefill_clauses`]): `prefill_near_steps`,
 //! `prefill_then_step_near_steps`, `prefill_group_is_group_one` and `fault_word_clean`, and the family's own,
 //! `prefill_batch_forms`, which runs first and on no file: the batch's wide pools quantize the input of every projection
-//! type the loader accepts (each type alone at both widths, then a mix), so a file whose projections are K-quants
-//! prefills as the released file's Q8_0 ones do.
+//! type the loader accepts (each type alone at both widths, then a mix), so a model whose projections are K-quants
+//! prefills as the checkpoint folder's MXFP8 ones do.
 //!
-//! The family has no fixture file, so the fixture tier is refused by name before anything loads; the real tier's file is
-//! the one the end-to-end gate reads.
+//! The real tier's model is the checkpoint folder the end-to-end gate reads; the fixture tier's is its fixture cut.
+//!
+//! The stream arm (`BLOOMERY_RESIDENCY=mid-p<P>-s<S> BLOOMERY_XSTREAM=split`, a plan that leaves host experts): the seat
+//! sets the body's host streaming at the load and the gate drives the stream rule to stream ([`SPLIT_COSTS`]), so the
+//! common clauses' prompt calls run streamed experts on the card over the ring's slots while the steps run them on the
+//! host — `prefill_near_steps` holds the two to the family's band. Then `prefill_stream_streamed`: a prompt of
+//! [`STREAM_P`] ids streamed an expert on some layer (its stream records), or the arm proved nothing and fails by name.
+//!
+//! The two-card arm (`--arm bp`, `just gate-gpu-minimaxm3-twocard` under `BLOOMERY_CARD=both`): plan (b′) (the A6000 the
+//! stage card, the 3090 an expert tier holding each layer's next ids after the stage's prefix, the host the rest), planned
+//! under one card budget no environment moves (`seat::TWO_BUDGET`), in the real tier only. Before the common clauses it holds, against the reference — the plan with every tier segment on the stage card
+//! (`tier_twocard::union_plan`), the A6000 alone, opened first and released:
+//! - `two_card_load`: the plan puts experts on the tier, and the load's tier opened on the 3090 beside the stage card with
+//!   the plan's experts on each layer;
+//! - `two_card_first_tokens_are_union`: [`TWO_WALK`] decode steps of the walk read the reference's ids and logits rows bit
+//!   for bit — the routed block joins the tier's slots in the slot order the union's card sum runs (the same join the
+//!   Solar-Open2 two-card gate pins) — and the walk sent every tier layer a routed slot (or the run proves nothing there and
+//!   fails by name);
+//! - `two_card_eager_is_replay`: the walk eager and as the captured graph's replays reads the same ids and logits bits.
+//!
+//! The common clauses then run on the two-card load, and the tier must have served their batches (`two_card_batch_sent`).
 
 #[cfg(feature = "minimaxm3")]
 fn main() -> std::process::ExitCode {
@@ -66,20 +87,36 @@ mod prefill_clauses;
 mod seat;
 
 #[cfg(feature = "minimaxm3")]
+#[allow(
+    dead_code,
+    reason = "the two-card gates share the module; each takes the helpers it reads"
+)]
+#[path = "shared/tier_twocard.rs"]
+mod tier_twocard;
+
+#[cfg(feature = "minimaxm3")]
 mod gate {
-    use crate::lcpp_e2e::{arm_arg, model_path};
+    use crate::lcpp_e2e::{Arm, Dims as SeatDims, Seat, arm_arg, model_path};
     use crate::prefill_clauses::Case;
     use crate::seat;
+    use crate::tier_twocard::{
+        Leg, Sent, same, sent_between, sent_every, tier_counts, tier_on_3090,
+    };
     use bloomery_gpu::Gpu;
     use bloomery_gpu::arch::hybrid::Site;
     use bloomery_gpu::flash_gqa::HEAD;
     use bloomery_gpu::gemm::Gemm32Kernels;
+    use bloomery_gpu::host::served::TierBody;
+    use bloomery_gpu::host::xstream::{Costs, XMode};
+    use bloomery_gpu::model::StepMode;
     use bloomery_gpu::site::{SiteTy, WideActs, WideKernels};
     use bloomery_gpu_gates::tier::{self, Tag, Tier};
     use bloomery_gpu_gates::{GateError, checks_failed, verdict};
+    use bloomery_gpu_minimaxm3::MiniMaxM3Model;
     use bloomery_gpu_minimaxm3::attn::MsaShape;
     use bloomery_gpu_minimaxm3::body::{Dims, INDEX, PROJ};
     use bloomery_gpu_minimaxm3::prefill::{Batch, T_MAX};
+    use bloomery_gpu_minimaxm3::stream::XSTREAM_COSTS;
     use cuda_core::DeviceBuffer;
     use refset::arch::minimaxm3::ARCH;
 
@@ -88,15 +125,23 @@ mod gate {
     /// The recipe the file is the one of.
     const RECIPE: &str = "gate-gpu-minimaxm3-prefill";
 
-    /// The prompt lengths: one row, rows short of an alignment, one whole unit, a unit and a row.
-    const LENGTHS: [usize; 4] = [1, 7, T_MAX, T_MAX + 1];
+    /// The prompt lengths: one row, rows short of the gated GEMMs, rows past them and short of a unit, one whole
+    /// unit, a unit and a row, two units and a row.
+    const LENGTHS: [usize; 7] = [1, 7, 16, 17, T_MAX, T_MAX + 1, LONGEST];
+
+    /// The longest prompt: two whole units and a unit of one row.
+    const LONGEST: usize = 2 * T_MAX + 1;
 
     /// Positions of the cache beyond the longest prompt and the step after it.
     const CTX_SPARE: usize = 8;
 
+    /// Decode steps of the two-card arm's walk: each layer's tier holds the ids after the stage's prefix, so the walk's
+    /// routing must reach every tier layer (`two_card_first_tokens_are_union` fails by name where it does not).
+    const TWO_WALK: usize = 32;
+
     /// The synthetic batch's widths: the model width, and the output projection's (the query heads of [`HEAD`] values).
     /// Both are whole blocks of the q8_1 form's 128 values and of the q8 form's 64-value step.
-    const EMBD: usize = 3072;
+    const EMBD: usize = 6144;
     const QUERY_HEADS: usize = 64;
 
     /// The clause `prefill_batch_forms`: whether a batch cut for the sites it is told of quantizes the input of each of
@@ -112,7 +157,7 @@ mod gate {
             heads: QUERY_HEADS,
             kv_heads: 4,
             rms_eps: 1.0e-6,
-            rope_base: 5.0e6,
+            rope_base: 1.0e7,
             ctx: 256,
         };
         let q_width = QUERY_HEADS * HEAD;
@@ -170,14 +215,91 @@ mod gate {
         Ok(ok)
     }
 
+    /// What the tier was sent since `m` loaded; `None` on a load with no tier.
+    fn counts(m: &MiniMaxM3Model) -> Result<Option<Sent>, GateError> {
+        Ok(tier_counts(m.body(NAME)?.hybrid()))
+    }
+
+    /// `ids` one decode step each from a reset, every step's id and logits row.
+    fn feed(m: &mut MiniMaxM3Model, ids: &[u32]) -> Result<Leg, GateError> {
+        m.reset()?;
+        let mut leg = Leg::default();
+        for &id in ids {
+            leg.tokens.push(m.step(&[id])?);
+            leg.logits.push(m.logits()?);
+        }
+        Ok(leg)
+    }
+
+    /// The two-card arm's own clauses (module doc) on `two`, which [`seat::two_card`] loaded; the load is left as
+    /// [`seat::open`] leaves one, the step captured. `Ok((pass, tier layers))`.
+    fn two_card_clauses(two: &mut seat::TwoCard) -> Result<(bool, Vec<usize>), GateError> {
+        let tier_layers: Vec<usize> = (0..two.planned.len())
+            .filter(|&l| two.planned[l] > 0)
+            .collect();
+        let m = two.loaded.model_mut();
+        let mut pass = true;
+
+        tier::sc("two_card_load")?;
+        tier_on_3090(
+            "arm bp load",
+            two.opened,
+            (&m.gpu().device_name()?, m.resident_bytes()),
+            m.body(NAME)?.hybrid(),
+        )?;
+        let loaded: Vec<u64> = {
+            let hybrid = m.body(NAME)?.hybrid();
+            let set = hybrid.tiers().first().map(|t| t.set());
+            (0..two.planned.len())
+                .map(|l| set.and_then(|s| s.ids(l)).map_or(0, |ids| ids.len() as u64))
+                .collect()
+        };
+        let load_ok = !tier_layers.is_empty() && loaded == two.planned;
+        println!(
+            "two_card_load: the tier holds experts on {} layers; the load's tier experts by layer {} the plan's {}",
+            tier_layers.len(),
+            if loaded == two.planned {
+                "are"
+            } else {
+                "are not"
+            },
+            verdict(load_ok)
+        );
+        if loaded != two.planned {
+            println!("  loaded {loaded:?}\n  planned {:?}", two.planned);
+        }
+        pass &= load_ok;
+
+        tier::sc("two_card_first_tokens_are_union")?;
+        m.set_mode(StepMode::Graph);
+        let before = counts(m)?;
+        let replay = feed(m, &two.walk)?;
+        let sent = sent_between(before, counts(m)?);
+        let want = Leg {
+            tokens: two.reference.0.clone(),
+            logits: two.reference.1.clone(),
+            kept: Vec::new(),
+        };
+        pass &= same("two_card_first_tokens_are_union", &want, &replay);
+        pass &= sent_every(
+            "two_card_first_tokens_are_union walk",
+            sent.as_ref(),
+            &tier_layers,
+            false,
+        );
+
+        tier::sc("two_card_eager_is_replay")?;
+        m.set_mode(StepMode::Eager);
+        let eager = feed(m, &two.walk)?;
+        pass &= same("two_card_eager_is_replay", &eager, &replay);
+        m.set_mode(StepMode::Graph);
+        m.capture_step()?;
+        m.reset()?;
+        Ok((pass, tier_layers))
+    }
+
     pub fn run() -> Result<(), GateError> {
         let tier_now = Tier::from_env()?;
-        if tier_now == Tier::Fixture {
-            return Err(format!(
-                "{NAME}: the family has no fixture file: the gate runs in the real tier (`just {RECIPE}`)"
-            )
-            .into());
-        }
         // Before the file loads: a pool the batch was cut wrong for fails in seconds, not after the load.
         if tier::run_clause("prefill_batch_forms", Tag::SelfConsistency)? && !batch_forms()? {
             println!("clause prefill_batch_forms FAIL");
@@ -185,20 +307,87 @@ mod gate {
             return Err(checks_failed());
         }
         let path = model_path(tier_now, RECIPE, ARCH)?;
-        let ctx = T_MAX + 1 + CTX_SPARE;
+        let ctx = LONGEST + CTX_SPARE;
         let t = std::time::Instant::now();
         let arm = arm_arg()?;
-        let mut seat = seat::open(&path, ctx, arm)?;
+        if arm == Arm::Bp {
+            return two_card_run(&path, (ctx, tier_now), t);
+        }
+        let mut seat = seat::open_loaded(&path, ctx, arm)?;
         let dims = seat.dims();
+        let split = drive_split(&mut seat)?;
         println!(
-            "load arm={} layers={} embd={} vocab={} ctx={ctx} t_max={T_MAX} in {:.1} s (runtime value)",
+            "load arm={} layers={} embd={} vocab={} ctx={ctx} t_max={T_MAX} xstream={} in {:.1} s (runtime value)",
             arm.word(),
             dims.layers,
             dims.embd,
             dims.vocab,
+            seat.model().body(NAME)?.xstream_word(),
             t.elapsed().as_secs_f64()
         );
-        let case = Case {
+        let common = crate::prefill_clauses::run(NAME, &case(dims, tier_now), &mut seat);
+        if split
+            && tier::run_clause("prefill_stream_streamed", Tag::SelfConsistency)?
+            && !stream_streamed(&mut seat, dims.vocab)?
+        {
+            println!("clause prefill_stream_streamed FAIL");
+            println!("{}", tier::tally_line());
+            return Err(checks_failed());
+        }
+        common
+    }
+
+    /// The stream arm's prompt length: a group of two whole units, past the walk's gate at [`SPLIT_COSTS`].
+    const STREAM_P: usize = 2 * T_MAX;
+
+    /// The stream arm's rule costs: the family's, with a host column of a tenth of a second, so the stream's floor sits
+    /// under one column and every host expert a unit routes streams until the ring's half or the balance cuts it.
+    const SPLIT_COSTS: Costs = Costs {
+        host_us_per_col: 1.0e5,
+        ..XSTREAM_COSTS
+    };
+
+    /// Under `BLOOMERY_XSTREAM=split` (the seat set it at the load), the rule's costs the stream arm runs at
+    /// ([`SPLIT_COSTS`]); whether the load streams. Nothing otherwise.
+    fn drive_split(seat: &mut seat::Loaded) -> Result<bool, GateError> {
+        let (_, _, body) = seat.model_mut().body_parts(NAME)?;
+        if body.xstream_mode() != XMode::Split {
+            return Ok(false);
+        }
+        body.set_xstream_costs(SPLIT_COSTS)?;
+        Ok(true)
+    }
+
+    /// The clause `prefill_stream_streamed` (module doc): a prompt of [`STREAM_P`] ids of the fixed walk from a reset, and
+    /// its stream records. A load whose plan leaves no host expert, or a ring the card holds too few slots for, streams
+    /// nothing and fails here by name.
+    fn stream_streamed(seat: &mut seat::Loaded, vocab: usize) -> Result<bool, GateError> {
+        let ids = crate::e2e::walk(STREAM_P, vocab);
+        seat.reset()?;
+        seat.prompt(&ids)?;
+        let (_, _, body) = seat.model_mut().body_parts(NAME)?;
+        let (layers, call) = body.take_xstream_records();
+        let streamed: usize = layers.iter().map(|(_, x)| x.streamed).sum();
+        let mut on: Vec<usize> = layers
+            .iter()
+            .filter(|(_, x)| x.streamed > 0)
+            .map(|(_, x)| x.layer)
+            .collect();
+        on.sort_unstable();
+        on.dedup();
+        let ok = streamed > 0;
+        println!(
+            "prefill_stream_streamed: a prompt of {STREAM_P} ids streamed {streamed} experts on layers {on:?} \
+             (call {call:?}) {}",
+            verdict(ok)
+        );
+        seat.reset()?;
+        Ok(ok)
+    }
+
+    /// The clauses' case on a load of `dims` in tier `tier_now`.
+    fn case(dims: SeatDims, tier_now: Tier) -> Case {
+        Case {
             lengths: LENGTHS.to_vec(),
             tap_ceil: seat::prefill_ceil,
             tap_ceils: seat::prefill_ceils,
@@ -207,10 +396,49 @@ mod gate {
             // a flip is a discrete exchange of experts: the comparison is deferred, as the
             // end-to-end gate defers its top-logprobs clause.
             logit_bound: None,
+            sigma_logit: seat::SIGMA_LOGIT,
             vocab: dims.vocab,
             embd: dims.embd,
             tier: tier_now,
-        };
-        crate::prefill_clauses::run(NAME, &case, seat.as_mut())
+        }
+    }
+
+    /// The two-card arm (module doc): its loads and own clauses, then the common clauses on the two-card load, which must
+    /// have sent the tier their batches.
+    fn two_card_run(
+        path: &std::path::Path,
+        (ctx, tier_now): (usize, Tier),
+        t: std::time::Instant,
+    ) -> Result<(), GateError> {
+        // The walk's positions too: the reference and the two-card load hold the same cache rows.
+        let ctx = ctx.max(TWO_WALK + 1);
+        let mut two = seat::two_card(
+            path,
+            (ctx, tier_now),
+            (TWO_WALK, crate::e2e::walk),
+            crate::tier_twocard::union_plan,
+        )?;
+        let (pass, layers) = two_card_clauses(&mut two)?;
+        let mut loaded = two.loaded;
+        let dims = loaded.dims();
+        println!(
+            "load arm=bp layers={} embd={} vocab={} ctx={ctx} t_max={T_MAX} in {:.1} s (runtime value, both loads)",
+            dims.layers,
+            dims.embd,
+            dims.vocab,
+            t.elapsed().as_secs_f64()
+        );
+        let before = counts(loaded.model())?;
+        let common = crate::prefill_clauses::run(NAME, &case(dims, tier_now), &mut loaded);
+        tier::sc("two_card_batch_sent")?;
+        let sent = sent_between(before, counts(loaded.model())?);
+        let batch = sent_every("two_card_batch_sent", sent.as_ref(), &layers, true);
+        common?;
+        if !(pass && batch) {
+            println!("arm bp FAIL");
+            println!("{}", tier::tally_line());
+            return Err(checks_failed());
+        }
+        Ok(())
     }
 }

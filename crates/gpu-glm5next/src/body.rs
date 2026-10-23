@@ -1727,6 +1727,7 @@ impl Body {
             },
             cols: prefill::T_MAX.min(ctx),
             card_dontneed: host.card_dontneed,
+            bytes: bloomery_gpu::model::CardBytes::File,
         };
         leg_tier::hang_tiers((gpu, &file, plan), &hang, &mut hybrid)?;
         // The residency machine frees arena slots between passes, which a

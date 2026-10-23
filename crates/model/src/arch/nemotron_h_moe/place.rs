@@ -20,6 +20,240 @@ use super::hparams::{Hparams, Kind};
 use super::spec;
 pub use crate::arch::hybrid::{Experts, Holds, KvLayout, PlaceError, PlanInputs};
 use crate::placement::PlacementError;
+use crate::placement::kernels::q8_act_bytes;
+
+/// The rows the plan keeps a prompt pass's buffers for: the host union's columns, the most a
+/// placed load's pass takes. A whole-card load's pass is the card's room, at least these.
+pub const PASS_ROWS: usize = crate::moe::UNION_MAX_COLS;
+
+/// The kernels' constants the pass's buffers are sized by (the columns of a gemv run, the leading
+/// words of the word record, the flash's head width, key-head group, segments and rows of one pass
+/// the attention takes at once, the GEMMs' column tile and 32-value step) and the widest router
+/// instance's expert count, the `probs` rows; the body holds each equal to the kernels' by
+/// assertion.
+pub const COLS: usize = 8;
+/// See [`COLS`].
+pub const WORD_HEAD: usize = 1;
+/// See [`COLS`].
+pub const HEAD: usize = 128;
+/// See [`COLS`].
+pub const SPLIT_GROUP: usize = 8;
+/// See [`COLS`].
+pub const FLASH_SEGMENTS: usize = 80;
+/// See [`COLS`].
+pub const MAX_PASS_ROWS: usize = 8;
+/// See [`COLS`].
+pub const GEMM_BN: usize = 64;
+/// See [`COLS`].
+pub const GEMM32_STEP: usize = 64;
+/// See [`COLS`].
+pub const WIDEST_ROUTER: usize = 496;
+
+/// The widths a prompt pass's buffers are cut from, every one a fact of the file or the kernels
+/// ([`pass_bytes`]). The body collects them from its loaded layers; the plan from the file's
+/// headers ([`pass_dims`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PassDims {
+    /// `embedding_length`.
+    pub hidden: usize,
+    /// The key heads of an attention layer.
+    pub n_kv: usize,
+    /// The query heads of an attention layer.
+    pub n_head: usize,
+    /// A Mamba-2 layer's in-projection row: `d_inner + conv_dim + ssm_heads`.
+    pub in_proj: usize,
+    /// A Mamba-2 layer's inner width.
+    pub d_inner: usize,
+    /// A Mamba-2 layer's scan heads.
+    pub ssm_heads: usize,
+    /// A Mamba-2 layer's conv channels.
+    pub conv_dim: usize,
+    /// The values the routed experts read and write.
+    pub width: usize,
+    /// The experts a token keeps.
+    pub top_k: usize,
+    /// The shared expert's width.
+    pub shared_ff: usize,
+    /// The widest routed expert's up width; 0 where no layer is a MoE layer.
+    pub ff: usize,
+    /// The widest router instance's expert count (the `probs` rows).
+    pub n_expert: usize,
+    /// The q8_1 slot forms the `_sel` fallback reads, `(k, columns)`.
+    pub slots: Vec<(usize, usize)>,
+    /// The routed tables' expert counts, one a table.
+    pub route_n: Vec<usize>,
+    /// The experts' GEMM forms, `(k, slots a row)`.
+    pub gemm_acts: Vec<(usize, usize)>,
+    /// The NVFP4 gemv run forms' widths.
+    pub run_k: Vec<usize>,
+    /// The q8 blocks of 32 the wide GEMMs read, one a site width.
+    pub wide_k: Vec<usize>,
+    /// Whether the pass runs on a placed load: its rows' places and the host's sums are buffers of
+    /// the pass.
+    pub placed: bool,
+}
+
+/// Bytes of one q8_1 activation column of `k` values (a `Q8Act`'s or a `GemmAct`'s).
+fn act_col_bytes(k: usize) -> usize {
+    q8_act_bytes(1, k as u64) as usize
+}
+
+/// Bytes of one `GemmAct32` column of `k` values: per 64-value step sixteen code words, two
+/// scales and two sums.
+fn act32_col_bytes(k: usize) -> usize {
+    k.div_ceil(GEMM32_STEP) * (16 + 2 + 2) * 4
+}
+
+/// Bytes of a `GemmRoute` table for `slots` slots over `experts` experts.
+fn route_bytes(slots: usize, experts: usize) -> usize {
+    let tiles = slots / GEMM_BN + experts.min(slots);
+    let zeros = if experts == 1 { slots } else { 0 };
+    (slots + 2 * tiles + 2 + zeros) * 4
+}
+
+/// The device bytes the pass's buffers hold at `rows` rows of `d`, every buffer the body's
+/// `Prompt::new` allocates, by the same widths, four bytes a value. The one formula of those bytes:
+/// the plan keeps them out of the expert budget ([`pass_reserve_bytes`]), the body's fit check
+/// counts them before it allocates and asserts it allocated exactly them. Every row buffer is cut
+/// at `rows` rounded up to [`COLS`], so a run of [`COLS`] columns past the pass's last row writes
+/// inside its buffer, at the one-column floor where a width is 0. Terms: the residual streams twice,
+/// the normed row and the sums (`4 · hidden`); the router's scores (`n_expert`) and weights
+/// (`top_k`); the latent and the weighted sums (`2 · width`); the slots' up and down rows
+/// (`top_k · ff`, `top_k · width`); the shared expert's up and relu² rows; the key and value rows
+/// twice (`4 · n_kv · HEAD`); the trunk's row buffers (`2 · hidden`); a Mamba-2 layer's in-projection,
+/// `d_inner` rows; the query and attention rows (`2 · n_head · HEAD`); the host sums on a placed
+/// load (`width`); the flash's partials for at most [`MAX_PASS_ROWS`] rows; the word record, the
+/// ids, the places, the shared expert's slots and the positions; the GEMM routes and activation
+/// forms; the flash split's sub-group rows; and the Mamba-2 pass scratch.
+#[must_use]
+pub fn pass_bytes(d: &PassDims, rows: usize) -> usize {
+    let cut = rows.next_multiple_of(COLS);
+    let kv_width = d.n_kv * HEAD;
+    let f = size_of::<f32>();
+    let hsum_width = if d.placed { d.width } else { 0 };
+    let attn_rows = cut.min(MAX_PASS_ROWS);
+    let z = |n: usize| cut * n.max(1) * f;
+    let f32s = 4 * z(d.hidden)
+        + z(d.n_expert)
+        + z(d.top_k)
+        + z(d.width) * 2
+        + z(d.top_k * d.ff)
+        + z(d.top_k * d.width)
+        + z(d.shared_ff) * 2
+        + 2 * z(kv_width)
+        + 2 * z(d.hidden)
+        + z(d.in_proj)
+        + z(d.d_inner)
+        + 2 * z(d.n_head * HEAD)
+        + 2 * z(kv_width)
+        + 2 * z(0)
+        + z(hsum_width)
+        + attn_rows * d.n_head * FLASH_SEGMENTS * (HEAD + 2) * f;
+    let u32s = (WORD_HEAD + d.n_kv + rows + cut * d.top_k + cut * d.top_k + cut + 2 * cut)
+        * size_of::<u32>();
+    let gemm = route_bytes(cut, 1)
+        + d.route_n
+            .iter()
+            .map(|&n| route_bytes(d.top_k * cut, n))
+            .sum::<usize>()
+        + d.gemm_acts
+            .iter()
+            .map(|&(k, per_row)| per_row * cut * act_col_bytes(k))
+            .sum::<usize>();
+    let forms = d
+        .slots
+        .iter()
+        .map(|&(k, cols)| cols * act_col_bytes(k))
+        .sum::<usize>()
+        + d.run_k
+            .iter()
+            .map(|&k| COLS * act_col_bytes(k))
+            .sum::<usize>()
+        + d.wide_k
+            .iter()
+            .map(|&k| cut * act32_col_bytes(k))
+            .sum::<usize>();
+    let split = 2 * rows * d.n_kv * SPLIT_GROUP * HEAD * f;
+    let mamba2 = rows * d.conv_dim * f + 2 * rows * d.ssm_heads * f;
+    f32s + u32s + gemm + forms + split + mamba2
+}
+
+/// `item` pushed to `list` unless it is there.
+fn add<T: PartialEq>(list: &mut Vec<T>, item: T) {
+    if !list.contains(&item) {
+        list.push(item);
+    }
+}
+
+/// The widths of a placed pass for a file of `hp`, from its headers alone: an upper bound of
+/// what the body collects from its loaded layers, since the plan knows neither the layers' types
+/// nor how many experts of each the card holds. Every routed layer's table and forms are counted
+/// (the body's, only the layers with experts on the card), a router table at the layer's whole
+/// expert count, and every site width as a gemv run form and as a wide GEMM form (the body's, the
+/// NVFP4 and the Q8_0 sites' only): the Mamba-2 in-projection's `hidden` and the out-projection's
+/// `d_inner`, the attention's `hidden` and `n_head · value_len`, the latent pair and the shared
+/// expert.
+#[must_use]
+pub fn pass_dims(hp: &Hparams) -> PassDims {
+    let width = hp.experts_width() as usize;
+    let top_k = hp.top_k_max();
+    let experts = || hp.experts.iter().flatten();
+    let mut slots: Vec<(usize, usize)> = Vec::new();
+    let mut gemm_acts: Vec<(usize, usize)> = Vec::new();
+    for e in experts() {
+        add(&mut slots, (width, COLS));
+        add(&mut slots, (e.ff, top_k * COLS));
+        add(&mut gemm_acts, (width, 1));
+        add(&mut gemm_acts, (e.ff, top_k));
+    }
+    if hp.shared_ff > 0 {
+        add(&mut slots, (hp.n_embd, COLS));
+        add(&mut slots, (hp.shared_ff, COLS));
+        add(&mut gemm_acts, (hp.n_embd, 1));
+        add(&mut gemm_acts, (hp.shared_ff, 1));
+    }
+    let mut sites: Vec<usize> = Vec::new();
+    for k in [
+        hp.n_embd,
+        hp.ssm.d_inner,
+        hp.n_head * hp.value_len,
+        width,
+        hp.shared_ff,
+    ] {
+        if k > 0 {
+            add(&mut sites, k);
+        }
+    }
+    PassDims {
+        hidden: hp.n_embd,
+        n_kv: hp.kv.iter().copied().max().unwrap_or(0),
+        n_head: hp.n_head,
+        in_proj: hp.ssm.d_inner + hp.ssm.conv_dim + hp.ssm.n_heads,
+        d_inner: hp.ssm.d_inner,
+        ssm_heads: hp.ssm.n_heads,
+        conv_dim: hp.ssm.conv_dim,
+        width,
+        top_k,
+        shared_ff: hp.shared_ff,
+        ff: experts().map(|e| e.ff).max().unwrap_or(0),
+        n_expert: WIDEST_ROUTER,
+        slots,
+        route_n: experts().map(|e| e.n_expert).collect(),
+        gemm_acts,
+        run_k: sites.clone(),
+        wide_k: sites,
+        placed: true,
+    }
+}
+
+/// The card bytes the plan keeps out of the expert budget for a load's prompt pass: the pass's
+/// buffers at [`PASS_ROWS`] rows of a placed load ([`pass_dims`]). A placed load's pass is exactly
+/// these rows (`min(PASS_ROWS, ctx)` rounded down to 64), whose bytes the body holds to this figure;
+/// a whole-card load's pass takes the card's room past it, never fewer rows.
+#[must_use]
+pub fn pass_reserve_bytes(hp: &Hparams) -> u64 {
+    pass_bytes(&pass_dims(hp), PASS_ROWS) as u64
+}
 
 /// `split`'s hyperparameters, then its tensors' roles, then its description,
 /// the first that fails being the error; then a file with a feature the
@@ -36,6 +270,7 @@ pub fn describe(split: &Split) -> Result<PlanInputs, PlacementError> {
         model: read.tensors,
         spec: read.spec,
         kv: kv_layout(&hp),
+        prompt_reserve: pass_reserve_bytes(&hp),
     })
 }
 
@@ -55,4 +290,67 @@ pub fn kv_layout(hp: &Hparams) -> KvLayout {
                 Kind::Moe => Holds::Nothing,
             }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PASS_ROWS, PassDims, pass_bytes};
+
+    /// Bolt's widths as the plan collects them ([`super::pass_dims`]): 4,096 wide; 32 query heads
+    /// over 2 key heads of 128; Mamba-2 of inner 8,192, 128 heads and 10,240 conv channels; routed
+    /// experts read and write 1,024 (the latent), 9 a token, of the widths 1,536, 2,048, 2,304 and
+    /// 2,560 over 40 layers of 240, 304, 368, 432 and 496 experts (12, 6, 9, 10 and 3 layers); the
+    /// shared expert 5,376 wide; the widest router 496.
+    fn bolt(placed: bool) -> PassDims {
+        let ffs = [1536, 2048, 2304, 2560];
+        let mut slots = vec![(1024, 8)];
+        let mut gemm_acts = vec![(1024, 1)];
+        for ff in ffs {
+            slots.push((ff, 72));
+            gemm_acts.push((ff, 9));
+        }
+        slots.extend([(4096, 8), (5376, 8)]);
+        gemm_acts.extend([(4096, 1), (5376, 1)]);
+        PassDims {
+            hidden: 4096,
+            n_kv: 2,
+            n_head: 32,
+            in_proj: 18_560,
+            d_inner: 8192,
+            ssm_heads: 128,
+            conv_dim: 10_240,
+            width: 1024,
+            top_k: 9,
+            shared_ff: 5376,
+            ff: 2560,
+            n_expert: 496,
+            slots,
+            route_n: [(240, 12), (304, 6), (368, 9), (432, 10), (496, 3)]
+                .into_iter()
+                .flat_map(|(n, layers)| std::iter::repeat_n(n, layers))
+                .collect(),
+            gemm_acts,
+            run_k: vec![4096, 8192, 1024, 5376],
+            wide_k: vec![4096, 8192, 1024, 5376],
+            placed,
+        }
+    }
+
+    /// The pass's reserve at the union's 512 rows, 426,763,612 B [derived] from Bolt's widths, four
+    /// bytes a value, term by term: the row buffers 230,053,888 (a row 4 x 4,096 residual and sums,
+    /// 496 scores, 9 weights, 2 x 1,024 latent and sums, 9 x 2,560 up, 9 x 1,024 down, 2 x 5,376
+    /// shared, 4 x 256 key and value, 2 x 4,096 trunk, 18,560 in-projection, 8,192 inner, 2 x 4,096
+    /// query and attention, 1,024 host sums; the flash's partials of 8 rows 8 x 32 x 80 x 130
+    /// values) + the word record, ids, places and positions 45,068 + the GEMM routes and forms
+    /// 151,976,848 (40 tables, and 9 x 512 columns of each expert width, 512 of 1,024, 4,096 and
+    /// 5,376) + the slot, run and wide forms 14,803,392 + the flash split's rows 8,388,608 + the
+    /// Mamba-2 scratch 21,495,808 (512 x 10,240 conv outputs, 512 x 128 x 2 words). A placed load's
+    /// host sums are 2,095,104 of it (512 x 1,024 values less the one-column floor a load with none
+    /// keeps). Mutant: a term left out, or the rows counted at 256.
+    #[test]
+    fn the_pass_reserve_is_the_terms_at_the_unions_columns() {
+        assert_eq!(PASS_ROWS, 512);
+        assert_eq!(pass_bytes(&bolt(true), PASS_ROWS), 426_763_612);
+        assert_eq!(pass_bytes(&bolt(false), PASS_ROWS), 426_763_612 - 2_095_104);
+    }
 }

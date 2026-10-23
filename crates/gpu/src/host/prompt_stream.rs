@@ -24,6 +24,16 @@
 //! last card layer prices an admit's way back, which no front follows
 //! ([`PromptStream::return_cost`]), and the call's end issues what is left.
 //! The stream's placement never stays.
+//!
+//! A walk of several units that share one pick a layer runs the same steps
+//! in every family: the first unit picks at its shadow and the later units'
+//! card routes read the pick it holds for them
+//! ([`PromptStream::unit_pick`], [`PromptStream::unit_read`]), the last
+//! unit's back owes the layer's return ([`PromptStream::unit_back`]), and
+//! the walk's end returns the last layer and refuses a pick still held
+//! ([`PromptStream::end_walk`]). The guards every family's `set_xstream`
+//! shares are [`PromptStream::check_mode`]'s, and the stream's start at a
+//! first `split` is [`PromptStream::start_split`].
 
 use cuda_core::CudaStream;
 use runtime::sched::At;
@@ -33,8 +43,8 @@ use super::BatchLeg;
 use super::HostExperts;
 use super::HostTier;
 use super::swap::{CallCfg, CallPick, CallReport};
-use super::xstream::{Costs, LandBatch, RingLayer, XLayer, XMode, XReport};
-use crate::GpuError;
+use super::xstream::{Costs, LandBatch, PROBE, RingLayer, XCfg, XLayer, XMode, XReport};
+use crate::{Gpu, GpuError};
 
 /// What the stream's errors name.
 const WHAT: &str = "prompt stream";
@@ -85,6 +95,17 @@ pub struct PromptStream {
     /// stream's end.
     xlayers: Vec<(usize, XLayer)>,
     xend: Option<XReport>,
+    /// The walk's first unit's pick of a layer, held for its later units'
+    /// card routes ([`PromptStream::unit_pick`]).
+    held: Option<Held>,
+}
+
+/// The first unit's pick of a layer, for the walk's later units' card
+/// routes: the layer, its landing batches, and whether the layer streams.
+struct Held {
+    layer: usize,
+    land: Vec<LandBatch>,
+    streams: bool,
 }
 
 impl PromptStream {
@@ -99,6 +120,57 @@ impl PromptStream {
     /// calls move.
     pub fn set_mode(&mut self, mode: XMode) {
         self.mode = Some(mode);
+    }
+
+    /// The guards every family's `set_xstream` runs before it sets `mode`
+    /// ([`PromptStream::set_mode`]), `tiered` whether the load hangs an
+    /// expert tier. Refused by name: any change while a call streams,
+    /// `Admit` or `Split` on a tier with no residency machine, and `Split` on
+    /// a `tiered` load (the ring serves the stage card of a load with none).
+    pub fn check_mode<H: HostExperts>(
+        &self,
+        tier: &HostTier<H>,
+        (mode, tiered): (XMode, bool),
+    ) -> Result<(), GpuError> {
+        if self.on {
+            return Err(GpuError::state(
+                "PromptStream::check_mode",
+                "no prompt call streaming",
+            ));
+        }
+        if mode != XMode::Off && tier.swap().is_none() {
+            return Err(GpuError::state(
+                "BLOOMERY_XSTREAM",
+                "a residency machine (BLOOMERY_RESIDENCY=mid-p<P>-s<S>) for admit or split",
+            ));
+        }
+        if mode == XMode::Split && tiered {
+            return Err(GpuError::shape(
+                "BLOOMERY_XSTREAM",
+                "split on a load with an expert tier: the stream's ring serves the stage card \
+                 of a load with none",
+            ));
+        }
+        Ok(())
+    }
+
+    /// The expert stream on `gpu` at a family's first `Split`
+    /// ([`HostTier::xstream_start`], its probe [`PROBE`] host experts, `cfg`
+    /// the stream's shape with its routed kind's costs row): the ring's slots
+    /// a half, which the family's card route arms its ring pass for; `None`
+    /// when the stream runs already — it stays for the load's life, idle
+    /// under `Admit` and `Off`. The stream's own refusals at its start (the
+    /// card's room among them).
+    pub fn start_split<H: HostExperts>(
+        tier: &mut HostTier<H>,
+        gpu: &Gpu,
+        cfg: impl FnOnce() -> XCfg,
+    ) -> Result<Option<usize>, GpuError> {
+        if tier.xstream().is_some() {
+            return Ok(None);
+        }
+        let x = tier.xstream_start(gpu.context(), gpu.stream(), cfg(), PROBE)?;
+        Ok(Some(x.half_slots()))
     }
 
     /// A prompt call is streaming: no lever change and no cost change while
@@ -204,6 +276,7 @@ impl PromptStream {
         self.xend = None;
         self.ubatch = 0;
         self.owed = None;
+        self.held = None;
         self.returning = returns && !self.return_at_end;
         self.call_end = end;
         let mode = self.mode();
@@ -470,6 +543,107 @@ impl PromptStream {
             tier.call_return(l, stream)?;
         }
         Ok(())
+    }
+
+    /// Under host streaming, unit `at.unit` of a walk of `units` units at
+    /// layer `at.layer`'s shadow, before its card route: the return the walk
+    /// owes here ([`PromptStream::return_at_shadow`]), then the first unit's
+    /// pick of the layer from its `m` rows ([`PromptStream::pick`]) or, for
+    /// a later unit, the pick the first unit held for it
+    /// ([`PromptStream::unit_read`]). The layer's ring view and landing
+    /// batches, which the unit's card route reads, each GEMM batch behind
+    /// its own batch's event. Refused by name: a later unit with no pick of
+    /// the layer held. Nothing when no call streams.
+    pub fn unit_pick<H: HostExperts>(
+        &mut self,
+        port: &mut BatchLeg<'_, H>,
+        at: At,
+        (m, units): (usize, usize),
+        walk_end: usize,
+        card: impl Fn(usize) -> bool,
+    ) -> Result<(Option<RingLayer>, Vec<LandBatch>), GpuError> {
+        if !self.on {
+            return Ok((None, Vec::new()));
+        }
+        self.return_at_shadow(port, at, walk_end)?;
+        if at.unit == 0 {
+            return self.pick(port, at, (m, units), walk_end, card);
+        }
+        let l = at.layer;
+        let held = self.held.take().filter(|h| h.layer == l).ok_or_else(|| {
+            GpuError::protocol(
+                WHAT,
+                format!(
+                    "unit {}'s card route of layer {l} with no pick of the layer's first unit \
+                     held",
+                    at.unit
+                ),
+            )
+        })?;
+        let ring = if held.streams {
+            port.hybrid().xstream_ring(l)
+        } else {
+            None
+        };
+        Ok((ring, held.land))
+    }
+
+    /// Under host streaming, after unit `at.unit`'s card route of layer
+    /// `at.layer` over what [`PromptStream::unit_pick`] gave it (`land`, and
+    /// whether the layer streams): the pick held for the walk's next unit
+    /// unless this is the last of `units`, then the unit's read
+    /// ([`PromptStream::read`]), the last unit's the layer's last read of
+    /// its slots. Nothing when no call streams.
+    pub fn unit_read<H: HostExperts>(
+        &mut self,
+        port: &mut BatchLeg<'_, H>,
+        (at, units): (At, usize),
+        (land, streams): (Vec<LandBatch>, bool),
+        card: impl Fn(usize) -> bool,
+    ) -> Result<(), GpuError> {
+        if !self.on {
+            return Ok(());
+        }
+        let last = at.unit + 1 == units;
+        if !last {
+            self.held = Some(Held {
+                layer: at.layer,
+                land,
+                streams,
+            });
+        }
+        self.read(port, at.layer, last, card)
+    }
+
+    /// After unit `at.unit`'s back of layer `at.layer` in a walk of `units`
+    /// units ending at `walk_end`: once the last unit's host service of a
+    /// layer with card experts (`card`) has run, the returning call's last
+    /// walk owes the layer's return ([`PromptStream::owe_return`]).
+    pub fn unit_back(&mut self, (at, units): (At, usize), walk_end: usize, card: bool) {
+        if at.unit + 1 == units && card && self.returns_here(walk_end) {
+            self.owe_return(at.layer);
+        }
+    }
+
+    /// After a walk: refused by name while a layer's pick is still held (a
+    /// later unit's card route did not read it); then the return of the
+    /// walk's last returned layer, which no shadow follows
+    /// ([`PromptStream::return_owed`]).
+    pub fn end_walk<H: HostExperts>(
+        &mut self,
+        tier: &mut HostTier<H>,
+        stream: &CudaStream,
+    ) -> Result<(), GpuError> {
+        if let Some(h) = self.held.take() {
+            return Err(GpuError::protocol(
+                WHAT,
+                format!(
+                    "layer {}'s pick held past the walk: a unit's card route did not read it",
+                    h.layer
+                ),
+            ));
+        }
+        self.return_owed(tier, stream)
     }
 
     /// A walk of the streaming call ran: its records name it by the next

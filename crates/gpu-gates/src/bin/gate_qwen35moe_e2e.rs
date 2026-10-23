@@ -216,8 +216,17 @@
 //!   set's prompt as ubatches of [`PLACED_UBATCH`] rows, whose layers run
 //!   the card's experts through the wide GEMMs over a per-layer map and the
 //!   host's once a unit, against the pass run, within the same bands; (o3)
-//!   a ubatch resize and a pass of two resident slots refused by name, the
-//!   ubatch kept; (o4) the host tier served slots on both of its ports;
+//!   a ubatch resize refused by name, the ubatch kept, and two slots of the
+//!   placed load in one pass (`GpuModel::step_slots`) give the greedy ids of
+//!   the same two prompts stepped in turn, in graph mode and in eager mode:
+//!   the batch set's tokens and the lcg walk [`q35_clauses::lcg_ids`] draws
+//!   over the load's vocabulary, as many ids as the set's — one construction
+//!   on every tier and fixture variant, so the two prompts differ — each
+//!   prefilled on the pass path from zero stores and then 4 steps —
+//!   FAIL-first: both columns served from one prompt, or the columns swapped,
+//!   reddens the id compare; `step_slots` still refused on the placed load
+//!   fails the clause by name;
+//!   (o4) the host tier served slots on both of its ports;
 //!   (o7) the file planned on device 0 under no budget, a plan that keeps
 //!   every routed expert on the card (a refusal by name where the card holds
 //!   no such plan), loaded by the placed opener (`q3place::open_qwen35`): the
@@ -395,7 +404,7 @@ mod gate {
     use super::q3place::{self, PlaceQ3};
     use super::q35_clauses::{
         self as q35, Geometry35, PathRun, Slots35, decode_run, fresh, lcg_ids, refed_after_cut,
-        refused, same_run, same_store, stores, uncut_call,
+        same_run, same_store, stores, uncut_call,
     };
     use super::residency_clauses;
     use app::Session;
@@ -403,11 +412,13 @@ mod gate {
     use bloomery_gpu::arch::qwen3moe::ubatch::UBATCH;
     use bloomery_gpu::arch::qwen3moe::{
         Body35, Delta35Run, Gqa35Run, KvQ8, LayerKind35, Mixer35Run, Open35, PrefillPath,
-        PrefillStep, Qwen35moeModel, StoreHost, WIDE_FROM,
+        PrefillStep, Qwen35moeModel, StoreHost, WIDE_FROM, WideRoute,
     };
+    use bloomery_gpu::gemm::{GEMM_BN, GemmTile};
     use bloomery_gpu::host::PassKind;
     use bloomery_gpu::host::swap::{CallPick, CallReport, PassReport, Residency};
     use bloomery_gpu::host::xstream::{Costs, XLayer, XMode};
+    use bloomery_gpu::hybrid::{HOST, SlotMap};
     use bloomery_gpu::linear::{Q_SCALE, RING_ROWS, expf_ik};
     use bloomery_gpu::model::{ChainBody, StepMode};
     use bloomery_gpu::route_core::sigmoid;
@@ -3157,6 +3168,7 @@ mod gate {
         cfg()
             .plan_levers
             .card_budget_bytes
+            .every()
             .unwrap_or(REAL_PLACED_BUDGET)
     }
 
@@ -3253,7 +3265,7 @@ mod gate {
         };
         let q = PlaceQ3::qwen35(&file, Place::parse("cuda0")?, o)?;
         let levers = PlanLevers {
-            card_budget_bytes: Some(placed_budget()),
+            card_budget_bytes: Some(placed_budget()).into(),
         };
         let plan = q.plan(CTX, &levers)?;
         for line in q.records(&plan, None)? {
@@ -3340,21 +3352,28 @@ mod gate {
         // (o5)
         ok &= wide_arm(&mut m, "placed ", PLACED_UBATCH)?;
         // (o3)
+        // PIN(2026-10-22): a ubatch resize stays refused (the arena is the
+        // plan's count). A pass of two resident slots is the placed body's
+        // one pass: each column's greedy ids are that prompt stepped in
+        // turn. Was a named refusal of the pass.
+        // FAIL-first: both columns served from one prompt, or the columns
+        // swapped, reddens the id compare; `step_slots` still refused fails
+        // the clause by name.
         let u0 = m.ubatch()?;
         let resize = m.set_ubatch(U_GATE).err();
-        m.add_slots(2)?;
-        let pass = refused(
-            m.step_slots(&[(0, &[tok]), (1, &[tok])]),
-            "qwen35moe slots",
-            "on a placed load",
-        );
-        let named = resize.is_some() && m.ubatch()? == u0 && pass;
+        let kept = resize.is_some() && m.ubatch()? == u0;
         println!(
-            "placed refusals: ubatches of {U_GATE}: {} (ubatch {u0} kept); a pass of two \
-             resident slots named {pass} {}",
+            "placed refusals: ubatches of {U_GATE}: {} (ubatch {u0} kept) {}",
             resize.map_or("accepted".to_string(), |e| e.to_string()),
-            verdict(named)
+            verdict(kept)
         );
+        m.add_slots(2)?;
+        // The second slot steps the lcg walk the (n) clause steps, over this
+        // load's vocabulary, as many ids as `toks`: one construction on every
+        // tier and fixture variant, never the ids of the set the first slot
+        // steps (the fixture's batch set holds `TEXT_TOKENS`).
+        let walk = lcg_ids(toks.len(), m.body("gate_qwen35moe_e2e")?.vocab());
+        let pass = placed_two_slots(&mut m, toks, &walk)?;
         // (o4)
         let stats = m
             .body("gate_qwen35moe_e2e")?
@@ -3369,8 +3388,58 @@ mod gate {
             stats.batch_host_slots,
             verdict(served)
         );
-        ok_scratch &= named && served;
+        ok_scratch &= kept && pass && served;
         Ok(ok && ok_scratch)
+    }
+
+    /// (o3)'s two slots: each prompt stepped alone on slot 0 from zero
+    /// stores, then both in one pass. The greedy ids match column for
+    /// column, in graph mode and in eager mode. The second prompt is the
+    /// caller's lcg walk ([`lcg_ids`] over the load's vocabulary), as many
+    /// ids as the first: the two differ on every tier and fixture variant,
+    /// so a column swap is not the same ids.
+    fn placed_two_slots(m: &mut Qwen35moeModel, a: &[u32], b: &[u32]) -> Result<bool, GateError> {
+        const SLOT_STEPS: usize = 4;
+        if a == b {
+            return Err("(o3): the two prompts are the same".into());
+        }
+        let mut ok = true;
+        for mode in [StepMode::Graph, StepMode::Eager] {
+            m.set_mode(mode);
+            let solo = |m: &mut Qwen35moeModel, prompt: &[u32]| -> Result<Vec<u32>, GateError> {
+                m.select_slot(0)?;
+                fresh(m)?;
+                let mut ids = vec![m.prefill_with(prompt, PrefillPath::Pass)?];
+                for t in 0..SLOT_STEPS {
+                    ids.push(m.step(&[ids[t]])?);
+                }
+                Ok(ids)
+            };
+            let sa = solo(m, a)?;
+            let sb = solo(m, b)?;
+            m.select_slot(0)?;
+            fresh(m)?;
+            let mut ga = vec![m.prefill_with(a, PrefillPath::Pass)?];
+            m.select_slot(1)?;
+            fresh(m)?;
+            let mut gb = vec![m.prefill_with(b, PrefillPath::Pass)?];
+            let mut same = ga[0] == sa[0] && gb[0] == sb[0];
+            for t in 0..SLOT_STEPS {
+                let out = m.step_slots(&[(0, &[ga[t]]), (1, &[gb[t]])])?;
+                let &[ia, ib] = out.ids.as_slice() else {
+                    return Err(format!("(o3): a pass gave {:?}", out.ids).into());
+                };
+                same &= ia == sa[t + 1] && ib == sb[t + 1];
+                ga.push(ia);
+                gb.push(ib);
+            }
+            println!(
+                "placed slots ({mode:?}): one pass of two slots vs each prompt stepped in turn {}",
+                verdict(same)
+            );
+            ok &= same;
+        }
+        Ok(ok)
     }
 
     /// (o7) (module doc): the whole-card load's five greedy tokens first, its
@@ -3555,7 +3624,7 @@ mod gate {
         let (want, top) = (u64::try_from(want_layers / 2)?, placed_budget());
         let budget = q.budget_for_card_experts(CTX, want, placed_budget())?;
         let levers = PlanLevers {
-            card_budget_bytes: Some(budget),
+            card_budget_bytes: Some(budget).into(),
         };
         let plan = q.plan(CTX, &levers)?;
         for line in q.records(&plan, None)? {
@@ -3714,6 +3783,10 @@ mod gate {
         call_same: bool,
         /// The wide unit's greedy id and logits.
         wide: (u32, Vec<f32>),
+        /// The wide unit's card route read back with the plan's slot map rows
+        /// ([`common_route`]); the reference holds the empty tables of its
+        /// no-card layers.
+        route: Option<(WideRoute, Vec<Vec<u32>>)>,
         /// The host tier's slots on the step and the batch ports.
         host_slots: (u64, u64),
     }
@@ -3737,7 +3810,7 @@ mod gate {
         let q = PlaceQ3::qwen35(&file, Place::parse("cuda0")?, o)?;
         let budget = pick(&q)?;
         let levers = PlanLevers {
-            card_budget_bytes: Some(budget),
+            card_budget_bytes: Some(budget).into(),
         };
         let plan = q.plan(CTX, &levers)?;
         for line in q.records(&plan, None)? {
@@ -3822,6 +3895,34 @@ mod gate {
             .ok_or("an open_placed load with no placed side")?
             .hybrid()
             .stats();
+        // (o9r)'s readback: the wide unit's card route, with the plan's slot
+        // map rows (the map the wide arm reads, the shared expert's HOST
+        // entry after each) as their oracle; both loads read back (the
+        // host-only reference holds the empty tables of its no-card layers).
+        let route = match m.body("gate_qwen35moe_e2e")?.wide_route(m.gpu().stream())? {
+            Some(r) => {
+                let n_expert = r
+                    .layers
+                    .first()
+                    .ok_or("a map read back for every layer")?
+                    .map
+                    .len()
+                    .checked_sub(1)
+                    .ok_or("a map of no expert")?;
+                let tiers: Vec<usize> = (0..plan.machine.expert_tiers().count())
+                    .map(|i| plan.machine.cards.len() + i)
+                    .collect();
+                let rows = SlotMap::of_plan_tiers(&plan, 0, &tiers, 0..n_layer(), n_expert)
+                    .map_err(|e| e.to_string())?
+                    .stage_view();
+                let rows: Vec<Vec<u32>> = rows
+                    .chunks(n_expert)
+                    .map(|row| row.iter().copied().chain([HOST]).collect())
+                    .collect();
+                Some((r, rows))
+            }
+            None => None,
+        };
         Ok(CommonRun {
             experts,
             counts,
@@ -3830,8 +3931,150 @@ mod gate {
             taps,
             call_same,
             wide,
+            route,
             host_slots: (stats.host_slots, stats.batch_host_slots),
         })
+    }
+
+    /// The routed table the wide arm's remap builds from `ids` through `map`:
+    /// the slots whose map value is a card slot below `n_card`, grouped by
+    /// that slot (ascending slot order within an expert, the ids' order),
+    /// cut into tiles of at most [`GEMM_BN`], and the refused count (an id
+    /// past the map, or a map value at or past the card set that is not
+    /// [`HOST`]). (o9r)'s oracle, the rule `gemm_route_remap` states.
+    fn oracle_route(ids: &[u32], map: &[u32], n_card: usize) -> (Vec<u32>, Vec<GemmTile>, usize) {
+        let mut per: std::collections::BTreeMap<u32, Vec<u32>> = Default::default();
+        let mut refused = 0usize;
+        for (s, &id) in ids.iter().enumerate() {
+            match map.get(id as usize).copied() {
+                Some(HOST) => {}
+                Some(v) if (v as usize) < n_card => per.entry(v).or_default().push(s as u32),
+                _ => refused += 1,
+            }
+        }
+        let mut cols = Vec::new();
+        let mut tiles = Vec::new();
+        for (&e, slots) in &per {
+            for chunk in slots.chunks(GEMM_BN) {
+                tiles.push(GemmTile {
+                    expert: e,
+                    start: cols.len() as u32,
+                    len: chunk.len() as u32,
+                });
+                cols.extend_from_slice(chunk);
+            }
+        }
+        (cols, tiles, refused)
+    }
+
+    /// (o9r) (module doc): the wide arm's card route after (o9)'s wide unit,
+    /// read back against the plan's own: every layer's map is the plan's slot
+    /// map row for it with [`HOST`] after it (the shared expert's id, which
+    /// the remap skips) — the per-layer cut a plan of unequal layer counts
+    /// stresses —, every layer's table refused no slot, every
+    /// table's tiles tile its slot list in order (each window inside the
+    /// list, its slots ascending, its expert below the layer's card count,
+    /// its length 1..=[`GEMM_BN`]), and the last walked layer's table and
+    /// places are the oracle's ([`oracle_route`] over the unit's ids and that
+    /// layer's map; each slot's routed place the map at its id, its shared
+    /// slot [`HOST`]). The oracle needs the unit's ids, which the arena holds
+    /// only for the last layer that walked (each layer's router overwrites
+    /// them), so the table oracle is the last layer's alone; the maps of
+    /// every layer and the tables' shape are held for all. FAIL-first: the
+    /// layer's card route reading another layer's map (mutant: `card_wide`
+    /// passing `side.maps[0]` for every layer) reddens the map of every layer
+    /// past the first whose count differs, and the remap's `n_experts` launch
+    /// argument one lower (mutant: `enqueue_route_remap`'s `route.n_experts`
+    /// read as `route.n_experts − 1`) reddens the last layer's table, its
+    /// top expert's slots listed as refused.
+    fn common_route(route: &Option<(WideRoute, Vec<Vec<u32>>)>) -> Result<bool, GateError> {
+        tier::sc(
+            "(o9r) the wide arm's card route against the plan's own (the maps, the last layer's \
+             table)",
+        )?;
+        let Some((route, rows)) = route else {
+            println!("placed common route: no placed side read back FAIL");
+            return Ok(false);
+        };
+        let (mut maps, mut no_refused, mut shape) = (true, true, true);
+        for (l, layer) in route.layers.iter().enumerate() {
+            maps &= rows
+                .get(l)
+                .is_some_and(|row| row.as_slice() == layer.map.as_slice());
+            no_refused &= layer.refused == 0;
+            let mut at = 0usize;
+            let mut last_e = None;
+            for t in &layer.tiles {
+                let (s, n) = (t.start as usize, t.len as usize);
+                shape &= s == at
+                    && (1..=GEMM_BN).contains(&n)
+                    && (t.expert as usize) < layer.n_card
+                    && last_e.is_none_or(|e| e <= t.expert)
+                    && layer
+                        .cols
+                        .get(s..s + n)
+                        .is_some_and(|w| w.windows(2).all(|p| p[0] < p[1]));
+                at = s + n;
+                last_e = Some(t.expert);
+            }
+            shape &= at <= layer.cols.len();
+        }
+        let last = route.layers.last().ok_or("a layer's route read back")?;
+        let (cols, tiles, refused) = oracle_route(&route.ids, &last.map, last.n_card);
+        // The table's slot list is the walk's buffer: its first `cols.len()`
+        // entries are the routed slots, the rest capacity no tile reads.
+        let table = last.cols.get(..cols.len()) == Some(cols.as_slice())
+            && last.tiles == tiles
+            && refused == last.refused;
+        if !table {
+            let col_at = last.cols.iter().zip(&cols).position(|(a, b)| a != b);
+            let tile_at = last.tiles.iter().zip(&tiles).position(|(a, b)| a != b);
+            println!(
+                "placed common route: the last layer's table against the oracle's: slots {} vs {} \
+                 (first apart {col_at:?}: {:?} vs {:?}), tiles {} vs {} (first apart {tile_at:?}: \
+                 {:?} vs {:?}), refused {} vs {refused}",
+                last.cols.len(),
+                cols.len(),
+                col_at.map(|i| &last.cols[i..(i + 4).min(last.cols.len())]),
+                col_at.map(|i| &cols[i..(i + 4).min(cols.len())]),
+                last.tiles.len(),
+                tiles.len(),
+                tile_at.map(|i| &last.tiles[i]),
+                tile_at.map(|i| &tiles[i]),
+                last.refused,
+            );
+        }
+        let pitch = route.ids.len().div_ceil(PLACED_UBATCH);
+        let used = pitch
+            .checked_sub(1)
+            .ok_or("a router pitch of no routed slot")?;
+        let sized = route.ids.len() == PLACED_UBATCH * pitch && route.sel.len() == route.ids.len();
+        let places = sized
+            && route
+                .ids
+                .iter()
+                .zip(&route.sel)
+                .enumerate()
+                .all(|(s, (&id, &p))| {
+                    (s % pitch < used && last.map.get(id as usize) == Some(&p))
+                        || (s % pitch == used && p == HOST)
+                });
+        let ok = maps && no_refused && shape && table && places;
+        println!(
+            "placed common route: {} layers' maps the plan's rows {}, no slot refused {}, the \
+             tables' shape held {}, the last layer's table the oracle's ({} tiles of {} slots) \
+             {}, its places the map's {} {}",
+            route.layers.len(),
+            verdict(maps),
+            verdict(no_refused),
+            verdict(shape),
+            tiles.len(),
+            cols.len(),
+            verdict(table),
+            verdict(places),
+            verdict(ok)
+        );
+        Ok(ok)
     }
 
     /// (o9) (module doc): the file's placed load with no card expert (the host
@@ -3971,6 +4214,8 @@ mod gate {
             verdict(tight)
         );
         ok &= tight;
+        // (o9r): the route the wide arm ran, against the plan's own.
+        ok &= common_route(&got.route)?;
         println!("placed common: {}", verdict(ok));
         Ok(ok)
     }
@@ -4064,7 +4309,7 @@ mod gate {
         };
         let q = PlaceQ3::qwen35(&file, Place::parse("cuda0")?, o)?;
         let levers = PlanLevers {
-            card_budget_bytes: Some(placed_budget()),
+            card_budget_bytes: Some(placed_budget()).into(),
         };
         let plan = q.plan(CTX, &levers)?;
         let mid = residency_clauses::mid_of(&plan.n_l);

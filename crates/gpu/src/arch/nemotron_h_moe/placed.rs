@@ -73,14 +73,14 @@ pub(super) fn plan_map(plan: &Plan<'_>, hp: &Hparams) -> Result<(SlotMap, usize)
         .cards
         .first()
         .ok_or(GpuError::shape(WHAT, "a plan of no card"))?;
-    if plan.machine.cards.len() != 1 || !plan.machine.tiers.is_empty() || spec.layers != (0..n) {
+    let n_tiers = plan.machine.expert_tiers().count();
+    if plan.machine.cards.len() != 1 || n_tiers != 0 || spec.layers != (0..n) {
         return Err(GpuError::shape(
             WHAT,
             format!(
-                "a plan of {} cards and {} expert tiers, card 0 running layers {:?}; the body \
-                 runs every layer (0..{n}) on one card with no expert tier",
+                "a plan of {} cards and {n_tiers} expert tiers, card 0 running layers {:?}; the \
+                 body runs every layer (0..{n}) on one card with no expert tier",
                 plan.machine.cards.len(),
-                plan.machine.tiers.len(),
                 spec.layers
             ),
         ));

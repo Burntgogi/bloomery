@@ -4,12 +4,13 @@
 //! end) — the card leg of Qwen3.8 UD-Q3_K_XL's routed experts, where the
 //! gate·up stacks are IQ3_XXS and the down stack IQ4_NL, and of GLM-5.3-Flash
 //! UD-Q2_K_XL's, where gate·up and down are IQ2_XS, IQ3_XXS or IQ4_XS, of
-//! unsloth's GLM-5.3-Flash UD-IQ4_XS, whose gate·up stacks are IQ3_S, and of
+//! unsloth's GLM-5.3-Flash UD-IQ4_XS, whose gate·up stacks are IQ3_S, of
 //! Nemotron 3.5 Bolt's 24GB file, whose routed up and down stacks are IQ2_XXS
-//! (experts without a gate, so both run as one-stack entries):
+//! (experts without a gate, so both run as one-stack entries), and of Muse
+//! Spark's, whose gated gate·up and down stacks are IQ2_XXS:
 //!
-//! - `iq2_xs_gate_up_sel`, `iq3_xxs_gate_up_sel`, `iq3_s_gate_up_sel`,
-//!   `iq4_xs_gate_up_sel`: the
+//! - `iq2_xxs_gate_up_sel`, `iq2_xs_gate_up_sel`, `iq3_xxs_gate_up_sel`,
+//!   `iq3_s_gate_up_sel`, `iq4_xs_gate_up_sel`: the
 //!   [`crate::iq`] gate·up
 //!   with its rule as a launch argument ([`crate::kquant::act`]), one warp a
 //!   thread row, eight rows a 256-thread block; thread row `n = slot ·
@@ -22,6 +23,8 @@
 //!   `iq4_xs_rows` over `IqFormat::repack` of the same row, bit for bit;
 //!   only the reading differs (the raw-block windows below). IQ3_S has no
 //!   plane kernels: its row equals `iq.rs`'s host rule (`lane_partial_host`).
+//!   IQ2_XXS's entry fills the block's shared table ([`Iq2XxsTab`]) as its
+//!   `down_tab` entry does, ahead of any return.
 //! - `iq2_xs_gemv_sel`, `iq3_xxs_gemv_sel`, `iq3_s_gemv_sel`, `iq4_xs_gemv_sel`:
 //!   the same
 //!   per-row dot as a down — slot `s` dots the rows of expert `sel[s]` with
@@ -392,7 +395,8 @@ impl RawSb for Iq4Xs {
 /// columns of `256 · n_grp` q words and `2 · n_sb` scales (`n_grp =
 /// ceil(n_sb / 4)`), `sel.len() >= n_slots`, `h.len() >= n_slots ·
 /// rows_per_expert`; `row < n_slots · rows_per_expert` is the calling warp's
-/// row (one warp a row), all 32 lanes of the warp here
+/// row (one warp a row), all 32 lanes of the warp here; `tab` is `D`'s
+/// table, filled by the entry before any return
 /// (rust-quality R28: a crate-internal fn over unchecked reads under a
 /// caller-kept boundary).
 #[allow(
@@ -400,7 +404,7 @@ impl RawSb for Iq4Xs {
     reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
 )]
 #[inline(always)]
-pub(crate) fn gate_up_sel_body<D: RawSb<Tab = ()>>(
+pub(crate) fn gate_up_sel_body<D: RawSb>(
     wg: &[u32],
     wu: &[u32],
     q: &[u32],
@@ -416,6 +420,7 @@ pub(crate) fn gate_up_sel_body<D: RawSb<Tab = ()>>(
     fault: FaultSink,
     row: usize,
     h: &mut DisjointSlice<f32>,
+    tab: D::Tab,
 ) {
     // In u32: the launchers bound n_slots · rows_per_expert to u32, and a
     // usize division is a 64-bit emulation ahead of the first weight load.
@@ -460,8 +465,8 @@ pub(crate) fn gate_up_sel_body<D: RawSb<Tab = ()>>(
         let ((xw, dx), (wgw, gai, gd), (wuw, uai, ud)) = unsafe {
             (
                 a.col(0, b),
-                D::sub(wg, x, b & 7, ()),
-                D::sub(wu, x, b & 7, ()),
+                D::sub(wg, x, b & 7, tab),
+                D::sub(wu, x, b & 7, tab),
             )
         };
         let i = D::dot(&wgw, gai, &xw);
@@ -777,7 +782,7 @@ pub fn iq4_nl_row_dot32_host(
 
 /// A gate·up launch ([`QuantSelKernels::enqueue_gate_up`]).
 pub struct IqGateUp<'a> {
-    /// The format of both stacks: IQ2_XS, IQ3_XXS, IQ3_S or IQ4_XS.
+    /// The format of both stacks: IQ2_XXS, IQ2_XS, IQ3_XXS, IQ3_S or IQ4_XS.
     pub ty: GgmlType,
     /// The gate stack: `n_experts · rows_per_expert` rows of the file's
     /// super-blocks as the KQuant word stream ([`stream_words`] words a
@@ -906,8 +911,8 @@ fn stack_experts(
 }
 
 impl QuantSelKernels {
-    /// Enqueue the i-quant gate·up of `a.ty` (IQ2_XS, IQ3_XXS, IQ3_S or
-    /// IQ4_XS):
+    /// Enqueue the i-quant gate·up of `a.ty` (IQ2_XXS, IQ2_XS, IQ3_XXS,
+    /// IQ3_S or IQ4_XS):
     /// slot `s` writes `h[s · rows_per_expert ..][..rows_per_expert]` as
     /// `a.rule` over the rows of expert `sel[s]` of both stacks dotted with
     /// column `s / slots_per_col` of `a.act` (module doc for [`HOST`] and ids

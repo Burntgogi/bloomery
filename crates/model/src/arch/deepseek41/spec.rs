@@ -94,6 +94,7 @@ pub fn spec_of(
             None => None,
         },
         encoder: None,
+        logit_epilogue: None,
         chat,
     })
 }
@@ -214,6 +215,8 @@ fn layer_of(
         top_k: spec_u32("expert_used_count", e.n_used)?,
         expert_ff,
         latent: None,
+        pre_exp_norm: false,
+        post_exp_norm: None,
         act: Act::SwiGlu {
             limit: Some(kind.swiglu_limit),
         },
@@ -326,6 +329,8 @@ pub fn draft_of(hp: &DraftHparams) -> Result<DraftSpec, PlacementError> {
                     top_k: spec_u32("expert_used_count", e.n_used)?,
                     expert_ff,
                     latent: None,
+                    pre_exp_norm: false,
+                    post_exp_norm: None,
                     act: Act::SwiGlu {
                         limit: Some(hp.swiglu_limit[l]),
                     },

@@ -157,6 +157,7 @@ fn inputs() -> PlanInputs {
         hc: None,
         engram: None,
         encoder: None,
+        logit_epilogue: None,
         chat: ChatSpec {
             pre: String::new(),
             template: None,
@@ -208,6 +209,7 @@ fn draft() -> MtpDraft {
                     yarn: None,
                 },
                 qk_norm: true,
+                o_norm: false,
                 out_gate: OutGate::Packed,
                 select: None,
                 window: None,
@@ -219,6 +221,8 @@ fn draft() -> MtpDraft {
                 top_k: 10,
                 expert_ff: 640,
                 latent: None,
+                pre_exp_norm: false,
+                post_exp_norm: None,
                 act: Act::SwiGlu { limit: None },
                 router: Router {
                     score: Score::Softmax,
@@ -306,6 +310,7 @@ fn machine(usable: u64) -> Machine {
             layers: 0..LAYERS,
             head: true,
             token_embedding: false,
+            reserve_only: false,
             reserves: Vec::new(),
         }],
         tiers: Vec::new(),

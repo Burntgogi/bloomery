@@ -20,7 +20,8 @@
 //!
 //! **The ring.** Card memory beside the stacks, sized once at the load from
 //! what the card holds free past `keep_free` ([`XCfg::keep_free`]), in two
-//! halves of [`XStream::half_slots`] slots; per part (gate, up, down) a slot
+//! halves of [`XStream::half_slots`] slots; per part (gate, up and down, or
+//! each one's three planes: an NVFP4 planes expert, [`MAX_PARTS`]) a slot
 //! holds the widest layer's part. A layer's stream lands in one half, its
 //! experts packed at their layer's part bytes from the half's first slot,
 //! so a grouped GEMM reads the half as a stack of `half_slots` experts. The
@@ -81,6 +82,7 @@ use super::{Drain, poll_drained};
 use crate::Gpu;
 use crate::GpuError;
 use crate::graph::{MappedHost, cu, mem_batch, op_wait_geq, op_write};
+use crate::tensor::DeviceTensor;
 
 /// The stream lever: `off`, `admit` (the residency machine's pick alone) or
 /// `split` (the pick, then the stream). The values a binary takes are the
@@ -418,15 +420,76 @@ pub struct RingLayer {
     /// router's experts of `u32`.
     pub ring_map: sys::CUdeviceptr,
     pub union_map: sys::CUdeviceptr,
-    /// Per part (gate, up, down) the half's first slot.
-    pub parts: [sys::CUdeviceptr; PARTS],
+    /// Per part the half's first slot, in the source's part order: gate, up
+    /// and down, each one part or [`RingLayer::planes`] parts in a row; 0
+    /// past the source's parts.
+    pub parts: [sys::CUdeviceptr; MAX_PARTS],
+    /// The parts a matrix takes: 1 (its bytes whole), or 3 for an NVFP4
+    /// planes expert (its codes, block scales and tensor scale, each a stack
+    /// of the half's slots).
+    pub planes: usize,
     /// The landing batches the layer's copies split into, a GEMM batch each
     /// ([`LandBatch`]): the ring pass runs one per batch, waiting its event.
     pub batches: Vec<LandBatch>,
 }
 
-/// An expert's parts: gate, up, down.
+/// An expert's matrices: gate, up, down.
 pub const PARTS: usize = 3;
+
+/// The most parts the ring holds an expert in: each matrix whole ([`PARTS`]),
+/// or in three planes, an NVFP4 planes expert's codes, block scales and
+/// tensor scale (`super::swap::Transform`).
+pub const MAX_PARTS: usize = 3 * PARTS;
+
+/// A half of the expert stream's ring as a family's routed launches read a
+/// layer's stacks ([`with_ring_windows`]): its gate, up and down, each a
+/// stack of the half's slots at the layer's own types and row words.
+pub struct RingStacks<'a> {
+    pub gate: &'a DeviceTensor<u32>,
+    pub up: &'a DeviceTensor<u32>,
+    pub down: &'a DeviceTensor<u32>,
+}
+
+/// Layer `r`'s stream on the card for the length of `f`: its union map of
+/// `n_expert` words, and its half's gate, up and down ([`RingStacks`]),
+/// `half_slots` experts of `rows[p]` rows of `cols[p]` words in each part
+/// `p`; the windows are given back after `f` on every path.
+pub fn with_ring_windows<T>(
+    r: &RingLayer,
+    ctx: &Arc<CudaContext>,
+    n_expert: usize,
+    rows: [usize; PARTS],
+    cols: [usize; PARTS],
+    f: impl FnOnce(&DeviceBuffer<u32>, &RingStacks<'_>) -> Result<T, GpuError>,
+) -> Result<T, GpuError> {
+    // SAFETY: the stream's union row is `n_expert` words of its mapped host
+    // rows, and its half holds `half_slots` experts of the layer's part bytes
+    // in each part from the half's first slot — its gate and up rows of the
+    // card stacks' words, its down rows likewise (`XStream::ring_layer`); all
+    // stay allocated while the stream lives, past `f`'s launches, and the
+    // windows are given back below.
+    let (union_map, gate, up, down) = unsafe {
+        (
+            crate::tensor::window::<u32>(r.union_map, n_expert, ctx),
+            DeviceTensor::<u32>::window(r.parts[0], r.half_slots * rows[0], cols[0], ctx),
+            DeviceTensor::<u32>::window(r.parts[1], r.half_slots * rows[1], cols[1], ctx),
+            DeviceTensor::<u32>::window(r.parts[2], r.half_slots * rows[2], cols[2], ctx),
+        )
+    };
+    let ran = f(
+        &union_map,
+        &RingStacks {
+            gate: &gate,
+            up: &up,
+            down: &down,
+        },
+    );
+    drop(std::mem::ManuallyDrop::into_inner(union_map).into_raw_parts());
+    for w in [gate, up, down] {
+        DeviceTensor::release(w);
+    }
+    ran
+}
 
 /// The card bytes a ring leaves free when it sizes itself: half the margin
 /// the placement's expert rule leaves (`placement::workstation::MARGIN`),
@@ -481,6 +544,10 @@ fn lane_rate(probe: impl IntoIterator<Item = (u64, bool)>) -> f64 {
 /// What the refusal of a ring the card has no room for names: a caller that
 /// resolves an unset lever tells it from every other refusal by it.
 pub const XSTREAM_ROOM: &str = "XStream ring room";
+
+/// What the refusal of a stream on a map with no host expert on a layer with stage stacks names ([`XSTREAM_ROOM`]'s
+/// reader's twin): nothing streams where the card holds every expert.
+pub const XSTREAM_NO_HOST: &str = "XStream host experts";
 
 /// The ring's halves.
 const HALVES: usize = 2;
@@ -668,21 +735,14 @@ impl LaneShared {
                         ),
                     ));
                 }
-                match piece.transform {
-                    // SAFETY: [at, at + want) lies inside the staging page
-                    // (the slot's span, checked above); no copy reads the
-                    // slot until its staged word publishes this use, and
-                    // this thread holds the slot's only job until then. The
-                    // word's Release store follows these stores in program
-                    // order.
-                    Transform::Identity => unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            piece.bytes.as_ptr(),
-                            self.staging.host_at(at),
-                            want,
-                        );
-                    },
-                }
+                // SAFETY: [at, at + want) lies inside the staging page (the
+                // slot's span, checked above); no copy reads the slot until
+                // its staged word publishes this use, and this thread holds
+                // the slot's only job until then, so this is the span's one
+                // reference while it lives. The word's Release store follows
+                // these stores in program order.
+                let dst = unsafe { std::slice::from_raw_parts_mut(self.staging.host_at(at), want) };
+                piece.transform.apply(piece.bytes, dst)?;
                 at += want;
             }
             Ok(())
@@ -755,7 +815,7 @@ enum Lane {
 /// widest layer's part.
 struct DeviceRing {
     parts: Vec<DeviceBuffer<u32>>,
-    widest: [usize; PARTS],
+    widest: Vec<usize>,
     half: usize,
 }
 
@@ -820,8 +880,9 @@ impl XStream {
     /// timed, a witness beside the rate the rule prices, [`lane_rate`] of the
     /// same experts by where their bytes sit. Refused by name: a ring of fewer
     /// than `cfg.min_half` slots a half, no layer with stage stacks, a part
-    /// not a whole number of words, more parts than [`PARTS`], an empty
-    /// probe. Load-time only.
+    /// not a whole number of words, a part count other than [`PARTS`] or
+    /// [`MAX_PARTS`] or other than another layer's, an empty probe.
+    /// Load-time only.
     pub fn new(
         ctx: &Arc<CudaContext>,
         stream: &CudaStream,
@@ -830,21 +891,27 @@ impl XStream {
         cfg: XCfg,
     ) -> Result<XStream, GpuError> {
         const WHAT: &str = "XStream::new";
-        let mut widest = [0usize; PARTS];
+        let mut widest: Vec<usize> = Vec::new();
         let mut slot_bytes = 0usize;
         for l in 0..layers {
             let parts = source.part_bytes(l);
             if parts.is_empty() {
                 continue;
             }
-            if parts.len() != PARTS || parts.iter().any(|&b| b == 0 || b % 4 != 0) {
+            let count = !(parts.len() == PARTS || parts.len() == MAX_PARTS)
+                || (!widest.is_empty() && widest.len() != parts.len());
+            if count || parts.iter().any(|&b| b == 0 || b % 4 != 0) {
                 return Err(GpuError::shape(
                     WHAT,
                     format!(
-                        "layer {l}: expert parts of {parts:?} bytes; the stream holds {PARTS}, each \
-                         a nonzero multiple of 4"
+                        "layer {l}: expert parts of {parts:?} bytes; the stream holds {PARTS} or \
+                         {MAX_PARTS} an expert, the same count every layer, each a nonzero \
+                         multiple of 4"
                     ),
                 ));
+            }
+            if widest.is_empty() {
+                widest = vec![0; parts.len()];
             }
             for (w, &b) in widest.iter_mut().zip(parts) {
                 *w = (*w).max(b);
@@ -865,7 +932,7 @@ impl XStream {
             ));
         }
         // A slot's bytes rounded to the GEMMs' 16-byte stack alignment.
-        let widest = widest.map(|b| b.next_multiple_of(16));
+        let widest: Vec<usize> = widest.iter().map(|b| b.next_multiple_of(16)).collect();
         let per_slot: usize = widest.iter().sum();
         let (free, _) = card_mem(ctx)?;
         let mut room = free.saturating_sub(cfg.keep_free);
@@ -1326,7 +1393,7 @@ impl XStream {
         const WHAT: &str = "XStream copy";
         let source = Arc::clone(self.source());
         let parts = source.part_bytes(layer);
-        if parts.len() != PARTS || i >= self.ring.half {
+        if parts.len() != self.ring.widest.len() || i >= self.ring.half {
             return Err(GpuError::shape(
                 WHAT,
                 format!(
@@ -1413,7 +1480,9 @@ impl XStream {
                                 WHAT,
                                 format!(
                                     "layer {layer} expert {id} part {p}: {} source bytes ({:?}) \
-                                     for a part of {len}",
+                                     for a part of {len}; the pageable lane copies a part as \
+                                     its source holds it, a transformed part stages through the \
+                                     pinned lane",
                                     piece.bytes.len(),
                                     piece.transform
                                 ),
@@ -1467,8 +1536,8 @@ impl XStream {
         let b = self.cur.get(layer)?.as_ref()?;
         let parts = self.source().part_bytes(layer);
         let e = self.cfg.experts;
-        let mut at = [0; PARTS];
-        for (p, a) in at.iter_mut().enumerate() {
+        let mut at = [0; MAX_PARTS];
+        for (p, a) in at.iter_mut().enumerate().take(self.ring.widest.len()) {
             *a = self
                 .ring
                 .at(b.half, p, 0, parts.get(p).copied().unwrap_or(0));
@@ -1479,6 +1548,7 @@ impl XStream {
             ring_map: self.rows.dev_at(2 * b.half * e * 4),
             union_map: self.rows.dev_at((2 * b.half + 1) * e * 4),
             parts: at,
+            planes: self.ring.widest.len() / PARTS,
             batches: (0..self.land_n.get(layer).copied().unwrap_or(0))
                 .map(|b| LandBatch {
                     map: self.land.row_dev(layer, b + 1),

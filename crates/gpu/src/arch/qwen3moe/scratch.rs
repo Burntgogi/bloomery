@@ -28,6 +28,7 @@ use crate::flash_gqa::{
 use crate::flash_gqa_prefill::{FlashGqaPrefill, GqaPrefillArgs, GqaPrefillQ8Args};
 use crate::gemm::GEMM_MAX_SLOTS;
 use crate::linear::{self, LinearShape};
+use crate::site::WideForms;
 use chain::arch::qwen3moe::router::ubatch_at;
 
 pub(super) use crate::recur::{RecStore, fresh_stamps, stamps_at};
@@ -1074,7 +1075,8 @@ impl KvPlanes {
 /// What an arena holds beyond the K-quant chain's buffers, from the sites
 /// its plans launch (`Forms::of`): the wide arm's activation forms — each
 /// input's q8_1 blocks of 128 for a K-quant site, its q8 blocks of 32 for a
-/// Q8_0 site — and on the gemv arm the gate and up rows of an unfused
+/// Q8_0 site, and the SwiGLU rows' f32 rows for a down that reads those
+/// (`WideForms`) — and on the gemv arm the gate and up rows of an unfused
 /// gate·up, and the row-major output of a K-quant site launched alone at
 /// more than one row (`cols` values a column); and on a chain with a layer
 /// that keeps its shared expert apart, that expert's buffers (`apart`); and
@@ -1085,9 +1087,9 @@ impl KvPlanes {
 /// the arena held before any other type ran.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Forms {
-    pub(super) hid: Wants,
-    pub(super) attn: Wants,
-    pub(super) h: Wants,
+    pub(super) hid: WideForms,
+    pub(super) attn: WideForms,
+    pub(super) h: WideForms,
     pub(super) glu: bool,
     pub(super) cols: usize,
     pub(super) apart: Option<ApartForms>,
@@ -1099,30 +1101,14 @@ pub(super) struct Forms {
 /// wide arm, the forms of the shared expert's SwiGLU rows its downs read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct ApartForms {
-    pub(super) h: Wants,
-}
-
-/// Which quantized forms of one wide input the sites read.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct Wants {
-    pub(super) q128: bool,
-    pub(super) q32: bool,
+    pub(super) h: WideForms,
 }
 
 impl Forms {
     pub(super) const KQUANT: Forms = Forms {
-        hid: Wants {
-            q128: true,
-            q32: false,
-        },
-        attn: Wants {
-            q128: true,
-            q32: false,
-        },
-        h: Wants {
-            q128: true,
-            q32: false,
-        },
+        hid: WideForms::q8(true, false),
+        attn: WideForms::q8(true, false),
+        h: WideForms::q8(true, false),
         glu: false,
         cols: 0,
         apart: None,

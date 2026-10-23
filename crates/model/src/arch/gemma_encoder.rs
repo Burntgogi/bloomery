@@ -233,6 +233,7 @@ pub(crate) fn layer_spec(
                 yarn: None,
             },
             qk_norm: true,
+            o_norm: false,
             out_gate: OutGate::None,
             select: None,
             window: None,

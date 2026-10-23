@@ -1,10 +1,9 @@
 //! GPU gate for GLM-5.3-Flash's attach of the NVMe expert tier (the split dial's arena, `Body::open_placed`'s host run
 //! through the common `host_run`): the six clauses of `shared/nvtier_family.rs` (`plan`, `attach`, `bits`, `card`,
-//! `refuse`, `residency`) on the gate placement — in the fixture tier the `q6kdown` variant
-//! (`tools/fixture-variants.tsv`: Q6_K routed downs, every routed layer on the host), planned under the header's card
-//! budget — a paged arm against an all-RAM arm on the same file, the residency off. GLM's load attaches the step
-//! port's card leg, so the paged arm runs on both arena memories: the host leg's (`anon`) for `bits` and the card
-//! leg's (`pinned`) for `card`.
+//! `refuse`, `residency`) on the gate placement — in the fixture tier the plain fixture, planned under a card budget
+//! derived from the plan itself (the Tiers paragraph), not the header's — a paged arm against an all-RAM arm on the
+//! same file, the residency off. GLM's load attaches the step port's card leg, so the paged arm runs on both arena
+//! memories: the host leg's (`anon`) for `bits` and the card leg's (`pinned`) for `card`.
 //!
 //! Each arm's host room and arena reach the plan through `PlanInputs` (`room`, `arena`), so the gate sets no
 //! environment beyond the paged arm's child's arena memory: the all-RAM arm's room is the plan's need, the paged
@@ -19,12 +18,19 @@
 //! same arena. GLM has no r8 sidecar, so the family's r8 refusal has no counterpart.
 //!
 //! Tiers: every clause is self-consistency (the arms and the plan's own numbers), so it runs on a fixture and on the
-//! real file alike, except on a fixture that keeps no more than one routed layer on the host (the plain fixture): the
-//! clauses that read the paged experts are left to the real tier by name (`no-host-layer`, [`tier::host_clause`]), and
-//! the `q6kdown` variant, whose four routed layers all stay on the host, runs them: its floor holds three times the
-//! heaviest layer's host-served experts, so its need leaves fewer than [`nvtier_family::SLOTS`] slot sets above it and
-//! the arena is what fits. A variant whose routed layers the card reads (`iq4xs`, `q2kxl`) is refused by name there,
-//! so no such variant lists this gate.
+//! real file alike. The fixture tier's card budget is the least one its plan accepts, read off the plan itself
+//! ([`floor_budget`]): the floor a zero-budget probe is refused by name with (`PlacementError::CardBudgetFloor`: the
+//! card's dense granules, its KV, context, scratch, reserves, margin and what the caller holds beside the plan), the
+//! budget that holds no routed expert on the card — so every routed layer's experts stay on the host, the tier pages
+//! them, and every layer stays one the card leg runs (the fixture's stacks are the arena entries' own types: Q4_K and
+//! Q5_K gate·up, Q5_K and Q6_K down). The header's recorded budget instead cards half the experts of every
+//! card-eligible layer, under which the host holds the whole of its share and nothing pages. The NextN plan reserves
+//! the draft's card bytes and arena out of the same budget, so its probes carry their own least budget, derived the
+//! same way ([`Glm::place_nextn`]). The floor holds three times the heaviest layer's host-served experts
+//! (`ArenaDial::floor`, `base + 3 W`), so the need may leave fewer than [`nvtier_family::SLOTS`] slot sets above it
+//! and the arena is what fits. No fixture variant lists this gate: the paged layers come from the budget, not from a
+//! type map, and a variant whose stacks the arena entries do not take would fail `card` red (its leg `off_types`),
+//! not defer.
 
 #[cfg(feature = "glm5next")]
 fn main() -> std::process::ExitCode {
@@ -61,10 +67,7 @@ mod gate {
     use bloomery_gpu_glm5next::{Body, PrefillMode, checkpoint_price};
     use bloomery_levers::{GlmAt, GlmWhy, HostCfg, glm_residency_at_plan, glm_unset};
     use gguf::Split;
-    use model::arch::glm5next::hparams::Hparams;
     use model::arch::glm5next::place::{NextnInputs, PlaceError, PlanInputs};
-    use model::arch::names::routed_stacks;
-    use model::placement::accepts::{self, Program};
     use model::placement::workstation::HostRead;
     use model::placement::{Machine, PlacementError, PlanLevers};
     use runtime::{Out, Target, Want};
@@ -86,30 +89,24 @@ mod gate {
     /// GLM's file and placement, as the family's closures read them.
     struct Glm {
         path: String,
+        /// The trunk's plan levers: in the fixture tier the least card budget its plan accepts
+        /// (no routed expert on the card, so the tier has host-served experts to page), in the
+        /// real tier the caller's.
         place: PlanLevers,
+        /// [`Glm::place`] for the NextN probes: the NextN plan holds the draft's card bytes and
+        /// arena beside the plan, so in the fixture tier its least budget is its own floor's, not
+        /// the trunk's.
+        place_nextn: PlanLevers,
         host: HostCfg,
     }
 
     impl Glm {
         /// The inputs of `file` with `arm`'s room and arena.
-        fn inputs(&self, file: &Split, arm: Arm) -> Result<PlanInputs, GateError> {
+        fn inputs(file: &Split, arm: Arm) -> Result<PlanInputs, GateError> {
             let mut inputs = PlanInputs::read(file)?;
             inputs.room = (arm.room, HostRead::Given);
             inputs.arena = arm.arena;
             Ok(inputs)
-        }
-
-        /// The trunk's routed layers whose experts stay on the host, from the file's types: a layer
-        /// whose three stacks the card leg does not run (`accepts::leg_runs`, the arms the plan's
-        /// rule reads).
-        fn host_layers(file: &Split, hp: &Hparams) -> usize {
-            (hp.dense_lead..hp.n_trunk)
-                .filter(|&l| {
-                    let ty = routed_stacks(l).map(|name| file.find(&name).map(|(_, info)| info.ty));
-                    !matches!(ty, [Some(gate), Some(up), Some(down)]
-                        if accepts::leg_runs(Program::Glm5nextBody, [gate, up, down]) == Some(true))
-                })
-                .count()
         }
 
         /// The gate placement of `inputs`' layers, its checkpoints reserved once at the gate's context.
@@ -143,9 +140,9 @@ mod gate {
             nextn: &NextnInputs,
             arm: Arm,
         ) -> Result<Result<(PlanFacts, u64), PlacementError>, GateError> {
-            let inputs = self.inputs(file, arm)?;
+            let inputs = Glm::inputs(file, arm)?;
             let machine = Glm::machine(&inputs)?;
-            match inputs.plan_nextn(&machine, u64::try_from(CTX)?, &self.place, nextn) {
+            match inputs.plan_nextn(&machine, u64::try_from(CTX)?, &self.place_nextn, nextn) {
                 Ok(plan) => Ok(Ok((
                     PlanFacts::of(&plan.plan, GLM_CARD)?,
                     plan.nextn.host.expert_bytes,
@@ -266,7 +263,7 @@ mod gate {
 
         fn plan(&self, arm: Arm) -> Result<Result<PlanFacts, PlacementError>, GateError> {
             let file = Split::open(&self.path).map_err(|e| format!("open: {e}"))?;
-            let inputs = self.inputs(&file, arm)?;
+            let inputs = Glm::inputs(&file, arm)?;
             let machine = Glm::machine(&inputs)?;
             match inputs.plan(&machine, u64::try_from(CTX)?, &self.place) {
                 Ok(plan) => Ok(Ok(PlanFacts::of(&plan, GLM_CARD)?)),
@@ -277,7 +274,7 @@ mod gate {
 
         fn load(&self, arm: Arm, _r8: bool) -> Result<Session<Body>, GateError> {
             let file = Split::open(&self.path).map_err(|e| format!("open: {e}"))?;
-            let inputs = self.inputs(&file, arm)?;
+            let inputs = Glm::inputs(&file, arm)?;
             let machine = Glm::machine(&inputs)?;
             let cfg = self.cfg();
             let plan = <Body as Open>::plan(&inputs, &machine, CTX, &cfg)?;
@@ -323,7 +320,7 @@ mod gate {
         /// (`serve_seats/glm.rs`, `residency_at`), the why in the family gate's names ([`why_name`]).
         fn unset_residency(&self, arm: Arm) -> Result<(String, &'static str), GateError> {
             let file = Split::open(&self.path).map_err(|e| format!("open: {e}"))?;
-            let inputs = self.inputs(&file, arm)?;
+            let inputs = Glm::inputs(&file, arm)?;
             let machine = Glm::machine(&inputs)?;
             let plan = inputs.plan(&machine, u64::try_from(CTX)?, &self.place)?;
             let unset = glm_unset(GlmAt {
@@ -351,17 +348,10 @@ mod gate {
         /// with no clause of its own beside the pass-through of a word that is not `mid` (`:2141`): the table of
         /// [`Unset::serving`] holds as it is, its `place` and `shrunk` being the rule's `Serving` and `Moved`.
         /// On the 3090 the plan holds no routed expert on the card, so the first clause (`:1287`) answers `off`,
-        /// `no_card_experts`, whatever the arena; on the A6000 the card experts, the pool and the headroom decide.
+        /// `no_card_experts`, whatever the arena (the fixture tier's derived budget holds none either,
+        /// [`Glm::place`]); on the A6000 the card experts, the pool and the headroom decide.
         fn expected_residency(&self, plan: &PlanFacts) -> Unset {
             Unset::serving(&plan.room)
-        }
-
-        /// More than one routed layer stays on the host, so the tier has something to page: an
-        /// approximation of the plan's own condition, whose miss is a red clause, never a deferral.
-        fn host_layers_enough(&self) -> Result<bool, GateError> {
-            let file = Split::open(&self.path).map_err(|e| format!("open: {e}"))?;
-            let hp = PlanInputs::read(&file)?.hp;
-            Ok(Glm::host_layers(&file, &hp) > 1)
         }
 
         fn refusals(&self, paged: Arm, slots: u64) -> Vec<Refusal<'_>> {
@@ -373,18 +363,68 @@ mod gate {
         }
     }
 
+    /// The least card budget the plan `make` builds accepts: the floor its zero-budget probe is refused by name
+    /// with ([`PlacementError::CardBudgetFloor`]'s `floor`: the card's dense granules, its KV, context, scratch,
+    /// reserves, margin and what the caller holds beside the plan). At it the plan holds no routed expert on the
+    /// card, every routed layer's experts the host's — the placement a paged arm pages through the tier.
+    ///
+    /// # Errors
+    /// A probe that plans at a zero budget, or is refused for a reason other than the floor's, each by name.
+    fn floor_budget(
+        make: impl FnOnce(&PlanLevers) -> Result<(), PlaceError>,
+    ) -> Result<u64, GateError> {
+        match make(&PlanLevers {
+            card_budget_bytes: Some(0).into(),
+        }) {
+            Err(PlaceError::Placement(PlacementError::CardBudgetFloor { floor, .. })) => Ok(floor),
+            Err(e) => Err(format!("the zero card budget's probe: {e}").into()),
+            Ok(()) => Err(
+                "the zero card budget's probe planned: the card holds routed experts at no budget"
+                    .into(),
+            ),
+        }
+    }
+
     pub fn run() -> Result<(), GateError> {
         let levers = bloomery_levers::at_main(&tier::acts_on(&[])?)?;
         record::at_main(NAME, record::GATE_NVTIER);
         crate::gate_card::init()?;
         glm5next_tier::init_file()?;
         let path = glm5next_tier::model_path()?;
-        let place = glm5next_tier::plan_levers(&levers, 0)?;
+        let mut place = glm5next_tier::plan_levers(&levers, 0)?;
+        // The fixture tier plans under the least budget its own plan accepts, not the header's: the
+        // header's cards half the experts of every card-eligible layer, under which the host holds
+        // the whole of its share and nothing pages. The NextN plan holds the draft's card bytes and
+        // arena beside the plan, so its least budget is its own.
+        let mut place_nextn = place.clone();
+        if tier::Tier::from_env()? == tier::Tier::Fixture {
+            let file = Split::open(&path).map_err(|e| format!("open: {e}"))?;
+            let probe = Glm::inputs(
+                &file,
+                Arm {
+                    room: u64::MAX,
+                    arena: None,
+                },
+            )?;
+            let machine = Glm::machine(&probe)?;
+            let ctx = u64::try_from(CTX)?;
+            let budget = floor_budget(|l| probe.plan(&machine, ctx, l).map(|_| ()))?;
+            let nextn = NextnInputs::read(&probe)?;
+            let nextn_budget =
+                floor_budget(|l| probe.plan_nextn(&machine, ctx, l, &nextn).map(|_| ()))?;
+            place.card_budget_bytes = Some(budget).into();
+            place_nextn.card_budget_bytes = Some(nextn_budget).into();
+            println!(
+                "{NAME}: the fixture tier's card budget: the plan's floor {budget} B, the NextN plan's \
+                 {nextn_budget} B, no routed expert on the card"
+            );
+        }
         crate::nvtier_family::gate(
             NAME,
             &Glm {
                 path,
                 place,
+                place_nextn,
                 host: levers.host(),
             },
         )

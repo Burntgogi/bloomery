@@ -135,6 +135,13 @@
 //!   turns' least likely id is a first difference at a confident gap and the
 //!   clause is red.
 //!
+//! - (two-card) plan (b′) beside the union on the A6000 alone
+//!   (`shared/mimo2_twocard.rs`, its module doc): `two_card_load`,
+//!   `two_card_first_tokens_are_union`, `two_card_eager_is_replay`,
+//!   `two_card_batch_is_union` and `two_card_batch_sent`, on loads of their
+//!   own; `--two-card` runs them alone (`just gate-gpu-mimo2-twocard`, both
+//!   cards), and no other run does.
+//!
 //! `--only s|p|o|c|t|b|slots|r` runs one clause on the load (`slots` and `r` on
 //! their own loads); `--step-sets short` takes
 //! (t)'s two 4-token sets only, `--step-sets long` the 1,024- and
@@ -181,6 +188,18 @@ mod mimo2_open;
 )]
 #[path = "shared/residency_clauses.rs"]
 mod residency_clauses;
+
+#[cfg(feature = "mimo2")]
+#[allow(
+    dead_code,
+    reason = "the two-card helpers serve several gates; each takes the helpers it reads"
+)]
+#[path = "shared/tier_twocard.rs"]
+mod tier_twocard;
+
+#[cfg(feature = "mimo2")]
+#[path = "shared/mimo2_twocard.rs"]
+mod mimo2_twocard;
 
 #[cfg(feature = "mimo2")]
 mod gate {
@@ -1819,6 +1838,17 @@ mod gate {
     pub fn run() -> Result<(), GateError> {
         let levers = bloomery_levers::at_main(&[CARD_BUDGET])?;
         crate::gate_card::init()?;
+        if std::env::args().any(|a| a == "--two-card") {
+            if word_after("--only").is_some() || word_after("--step-sets").is_some() {
+                return Err(
+                    "--two-card runs the two-card clauses alone: no --only or --step-sets".into(),
+                );
+            }
+            let t = Instant::now();
+            let ok = crate::mimo2_twocard::run(Path::new(MODEL), &levers)?;
+            elapsed("(two-card)", &t);
+            return if ok { Ok(()) } else { Err(checks_failed()) };
+        }
         let only = only()?;
         let sets = step_sets(only)?;
         if only == Only::Slots {

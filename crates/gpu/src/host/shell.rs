@@ -77,10 +77,13 @@ impl<E: HostExperts> TierShell<E> {
         self.glue.take_passes()
     }
 
-    /// Arm (or disarm) `layers` taps of `embd` values. The caller drops its
-    /// captured chains first: a capture holds the tap copies it was taken
-    /// with.
+    /// Arm (or disarm) `layers` taps of `embd` values on `gpu`'s card. The
+    /// caller drops its captured chains first: a capture holds the tap copies
+    /// it was taken with.
     pub fn set_taps(&mut self, gpu: &Gpu, layers: usize, on: bool) -> Result<(), GpuError> {
+        // A two-card load may leave the tier card's context current (any read
+        // of the tier binds it); the taps are made in `gpu`'s.
+        gpu.context().bind_to_thread()?;
         self.taps = if on {
             Some(
                 (0..layers)
@@ -100,6 +103,9 @@ impl<E: HostExperts> TierShell<E> {
             what: self.what,
             missing: "armed taps (set_taps)",
         })?;
+        // `to_host_vec` enqueues its copy before it binds, so a tier card's
+        // context left current would take the copy of `gpu`'s stream.
+        gpu.context().bind_to_thread()?;
         let mut out = Vec::with_capacity(taps.len() * self.embd);
         for t in taps {
             out.extend(t.to_host_vec(gpu.stream())?);

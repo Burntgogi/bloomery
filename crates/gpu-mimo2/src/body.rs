@@ -2,17 +2,20 @@
 //! [`Body`] behind `GpuModel`.
 //!
 //! All 48 layers are one card's chain: the dense layer 0 and 47 routed layers
-//! whose experts run on the card where the plan puts them ([`bloomery_gpu::card_experts`]:
-//! the common per-slot pair, in the host leg's shadow) and on the host tier
-//! otherwise. Each layer is a GQA attention over its store — a window layer a
-//! ring of the plan's rows, a full layer the plane of every position — and a
-//! block; the step is [`crate::program`]'s walk, one token at a time. A pass
-//! of several slots' rows, one row each, is `slots`'s walk over the same
+//! whose experts run on the card where the plan puts them
+//! ([`bloomery_gpu::card_experts`]: the common per-slot pair, in the host leg's
+//! shadow), on the plan's expert tier card ([`crate::tier`]) and on the host
+//! tier otherwise. Each layer is a GQA attention over its store — a window
+//! layer a ring of the plan's rows, a full layer the plane of every position —
+//! and a block; the step is [`crate::program`]'s walk, one token at a time. A
+//! pass of several slots' rows, one row each, is `slots`'s walk over the same
 //! layers (there is no verify pass of several rows of one sequence and no
 //! draft). A prompt is fed by the step an id or in batches of up to a union's
 //! columns ([`prefill`]), which leave the model in the same state bit for bit.
-//! The embedding is a host row, dequantized per step and copied into `x`
-//! before the launch.
+//! A sequence saved between calls is [`seq`]: every layer's K and V on the
+//! host, a full layer's rows up to the position and a window layer the ring its
+//! store holds. The embedding is a host row, dequantized per step and copied
+//! into `x` before the launch.
 //!
 //! The body serves resident sequence slots ([`Slots`]): a sequence is its
 //! layers' stores ([`Seq`]), and a select exchanges those handles while the
@@ -22,29 +25,41 @@
 //! rows), the batch feed's arena (written and read inside one call), the rope
 //! tables, the host tier and the taps.
 //!
-//! What the load refuses, by name: a plan of other than one card with no
-//! expert tier, card experts whose stacks are not resident in the rows the slot
-//! map counts, a description whose layers the K192 kernels or the routed block
-//! do not run
-//! ([`facts::attn_args`], [`facts::block_args`]), a resident weight of
+//! What the load refuses, by name: a plan of other than one stage card, more
+//! expert tier cards than the host tier serves, an expert tier card on a load
+//! of several sequences (their pass runs their rows as columns of one row, and
+//! the tier's handoff writes one), card experts whose stacks are not resident
+//! in the rows the slot map counts, a description whose layers the K192
+//! kernels or the routed block do not run ([`facts::attn_args`],
+//! [`facts::block_args`]), a resident weight of
 //! other rows than the description's, a non-finite sink, stores whose bytes
-//! are not the plan's, and a scratch past the plan's term.
+//! are not the plan's, a scratch past the plan's term, and a prompt batch's
+//! shared buffers and first unit past the plan's reserve for them
+//! ([`place::prompt_reserve_bytes`]), and a tiered load's own buffers past the
+//! plan's tier reserve ([`place::tier_reserve_bytes`]).
 
 use std::num::NonZeroUsize;
 use std::ops::Range;
 use std::sync::Arc;
 
 use bloomery_gpu::card_experts::CardExperts;
+use bloomery_gpu::checkpoint::saved::Identity;
 use bloomery_gpu::flash_gqa::{self, FlashGqaKernels, HEAD, HEAD_K192};
 use bloomery_gpu::head::Head;
 use bloomery_gpu::host::PassKind;
+use bloomery_gpu::host::leg_tier::{self, Hang, LegOpen};
+use bloomery_gpu::host::refuse_tier_count;
 use bloomery_gpu::host::run::{HostRun, HostWidths};
 use bloomery_gpu::host::served::{ResidencyParts, TierBody};
 use bloomery_gpu::host::shell::TierShell;
 use bloomery_gpu::host::swap::{PassReport, Residency};
 use bloomery_gpu::host::swap_source::{FileSwap, ResidencyGlue, ResidencySpec};
+use bloomery_gpu::host::tier::TierOpen;
 use bloomery_gpu::hybrid::{Boundary, BoundaryShape, Chain, HostResidency, Hybrid, SlotMap};
-use bloomery_gpu::model::{ChainBody, HostServed, Rollback, Slots, StepMode, refuse_scratch_past};
+use bloomery_gpu::model::{
+    CardBytes, ChainBody, HostServed, Rollback, Slots, StepMode, refuse_reserve_past,
+    refuse_scratch_past, stage_run,
+};
 use bloomery_gpu::rope_neox::{ROT_K192, RopeNeoxKernels};
 use bloomery_gpu::rope_table::{RopeRows, RopeSpec, RopeTable};
 use bloomery_gpu::routed_block::{RouteBlock, RouteBufs, RouteDims, RouteLayer};
@@ -69,9 +84,12 @@ use crate::card;
 use crate::ffn::{FfnNames, routed_layers};
 use crate::program;
 use crate::swap;
+use crate::tier::{self, TierBatch, TierParts};
 
 #[path = "prefill.rs"]
 pub mod prefill;
+#[path = "seq.rs"]
+pub mod seq;
 #[path = "slots.rs"]
 pub(crate) mod slots;
 use prefill::PromptState;
@@ -368,6 +386,8 @@ pub struct Body {
     slots: Arc<DeviceTensor<u32>>,
     /// The routed layers' router, handoff and tensors, over `slots`.
     routed: RouteBlock<RouterKernels>,
+    /// The stage card's side of the expert tier card, on a load that hangs one.
+    tier: Option<TierParts>,
     embd: Embedding,
     /// The position bound: a step at or past it is refused. A ring layer's
     /// store is shorter; this stays the bound of the rope table and of the
@@ -395,6 +415,9 @@ pub struct Body {
     /// The residency the body was loaded with: `off` keeps the load's slot map
     /// for the model's life.
     residency: Residency,
+    /// The load a saved sequence belongs to. A resume onto another file, card
+    /// or context is refused by name.
+    who: Identity,
 }
 
 /// The walk's parts, lent apart from the host tier.
@@ -408,6 +431,8 @@ pub(crate) struct Parts<'s> {
     pub stores: &'s mut [Store],
     pub ropes: &'s [RopeBase],
     pub routed: &'s RouteBlock<RouterKernels>,
+    /// The stage card's side of the expert tier card, on a load that hangs one.
+    pub tier: Option<&'s mut TierParts>,
     pub taps: Option<&'s mut [DeviceBuffer<f32>]>,
     pub ctx: usize,
 }
@@ -571,11 +596,13 @@ impl Body {
     /// Card `card` of `plan`, which `inputs` made, resident: the layers' weights
     /// the plan puts on the card, the stores at the plan's `ctx_max`, the host
     /// tier over every routed layer and the embedding as a host row; the load's
-    /// slot map for the model's life ([`Residency::Off`]). Refused by name
-    /// (module doc): a plan of other than one card or with an expert tier,
-    /// card experts the resident stacks do not hold, a layer or a width no
-    /// kernel here runs, routed layers that are not one run, stores whose
-    /// bytes are not the plan's, and the machine's own refusals at the load.
+    /// slot map for the model's life ([`Residency::Off`]), and the plan's
+    /// expert tier card, when it names one, hung under the host tier. Refused
+    /// by name (module doc): a plan of other than one stage card, more expert
+    /// tier cards than the host tier serves, card experts the resident stacks
+    /// do not hold, a layer or a width no kernel here runs, routed layers that
+    /// are not one run, stores whose bytes are not the plan's, and the
+    /// machine's own refusals at the load.
     pub fn open_placed(
         file: Split,
         plan: &Plan<'_>,
@@ -606,7 +633,10 @@ impl Body {
     /// layer's churn pool ([`GpuModel::load_placed_with`]) and the body starts
     /// the machine over its slot map once its pieces are sized
     /// ([`HostServed::start_residency`]); [`Residency::Off`] keeps the load's
-    /// slot map for the model's life.
+    /// slot map for the model's life. A plan that names an expert tier card
+    /// with more than one sequence is refused by name before anything loads:
+    /// the pass of several slots' rows runs them as the columns of one row, and
+    /// the tier's handoff writes one column a row.
     pub fn open_placed_slots(
         file: Split,
         plan: &Plan<'_>,
@@ -616,6 +646,16 @@ impl Body {
         residency: Residency,
         slots: NonZeroUsize,
     ) -> Result<Mimo2Model, GpuError> {
+        let tiers = TierOpen::of_machine(plan.machine)?;
+        refuse_tier_count(WHAT, tiers.len())?;
+        if !tiers.is_empty() && slots.get() > 1 {
+            return Err(shape(format!(
+                "a load of {slots} sequences beside the expert tier card {}: their pass runs \
+                 their rows as the columns of one row, and the tier's handoff writes one column \
+                 a row (serve one sequence beside the tier, or the stage card alone)",
+                tiers[0].name
+            )));
+        }
         let spec = ResidencySpec {
             lever: residency,
             pool: ChurnHosting::Hosted,
@@ -637,7 +677,7 @@ impl Body {
                     gpu,
                     Arc::clone(file),
                     w,
-                    (plan, inputs, card),
+                    (plan, inputs, card, &tiers),
                     host,
                     (set, glue, residency),
                     slots,
@@ -648,52 +688,25 @@ impl Body {
 
     /// The body of card `card`: its layers' programs and values from the
     /// plan's description, the stores at the plan's `ctx_max`, the step's
-    /// buffers, the slot map the plan's routed segments make and the host tier
-    /// over the routed run. `residency` is the host set the load read in, the
-    /// residency glue and the lever it was made under.
+    /// buffers, the slot map the plan's routed segments make (the stage card's
+    /// and the expert tier cards' `tiers`) and the host tier over the routed
+    /// run with the tier cards hung under it. `residency` is the host set the
+    /// load read in, the residency glue and the lever it was made under.
     fn load(
         gpu: &Gpu,
         file: Arc<Split>,
         w: &Weights,
-        (plan, inputs, card): (&Plan<'_>, &PlanInputs, usize),
+        (plan, inputs, card, tiers): (&Plan<'_>, &PlanInputs, usize, &[TierOpen]),
         host: HostCfg,
         (set, glue, lever): (HostResidency, ResidencyGlue, Residency),
         seqs: NonZeroUsize,
     ) -> Result<Body, GpuError> {
         let (hp, spec) = (&inputs.hp, &inputs.spec);
-        if plan.machine.cards.len() != 1 || !plan.machine.tiers.is_empty() {
-            return Err(shape(format!(
-                "a plan of {} cards and {} expert tiers; the program runs every layer on one \
-                 card with no expert tier",
-                plan.machine.cards.len(),
-                plan.machine.tiers.len()
-            )));
-        }
-        let layers = plan
-            .machine
-            .cards
-            .get(card)
-            .map(|c| c.layers.clone())
-            .ok_or_else(|| shape(format!("the plan has no card {card}")))?;
-        if layers != (0..spec.layers.len()) {
-            return Err(shape(format!(
-                "card {card} runs layers {layers:?}; the program runs every layer of the trunk \
-                 (0..{})",
-                spec.layers.len()
-            )));
-        }
-        let ctx = usize::try_from(plan.ctx_max)
-            .ok()
-            .filter(|&c| c > 0 && u32::try_from(c).is_ok())
-            .ok_or_else(|| {
-                shape(format!(
-                    "ctx_max {}: at least 1 and at most the positions a u32 counts",
-                    plan.ctx_max
-                ))
-            })?;
+        let (layers, ctx) = stage_run(WHAT, plan, card, spec.layers.len())?;
         let dims = dims_of(inputs)?;
         let run = hosted(&spec.layers).map_err(|e| shape(e.to_string()))?;
-        let map = SlotMap::of_plan(plan, card, None, run.clone(), N_EXPERT)?;
+        let tier_cards: Vec<usize> = tiers.iter().map(|t| t.card).collect();
+        let map = SlotMap::of_plan_tiers(plan, card, &tier_cards, run.clone(), N_EXPERT)?;
         let mut thetas = Vec::new();
         let mut cfg = Vec::with_capacity(spec.layers.len());
         for (l, s) in spec.layers.iter().enumerate() {
@@ -724,8 +737,14 @@ impl Body {
         // A load planned for several sequences runs a pass of their rows
         // through the step port's columns; a load for one sequence the step.
         let rows = if seqs.get() > 1 { slots::MAX_ROWS } else { 1 };
-        let card_experts =
-            card::experts(gpu, w, &spec.layers, &map, dims.embd, hp.expert_ff, rows)?;
+        let card_experts = card::experts(
+            gpu,
+            w,
+            (&spec.layers, &map),
+            (dims.embd, hp.expert_ff),
+            rows,
+            !tiers.is_empty(),
+        )?;
         gpu.context().bind_to_thread()?;
         let stream = gpu.stream();
         // MiMo fact: only the window layers carry sinks, one per query head, file constants.
@@ -830,6 +849,45 @@ impl Body {
         let mut hybrid = Hybrid::new(boundary, map, experts, run.len())?;
         hybrid.watch_fault(gpu.fault_word())?;
         hybrid.keep_residency(set);
+        let hang = Hang {
+            tiers,
+            family: &tier::NODE_FAMILY,
+            open: LegOpen {
+                n_expert: hp.n_expert,
+                layers: spec.layers.len(),
+                hidden: dims.embd,
+                n_used: hp.n_used,
+                rows: tier::PAGE_ROWS,
+            },
+            cols: prefill::T_MAX,
+            card_dontneed: host.card_dontneed,
+            bytes: CardBytes::File,
+        };
+        leg_tier::hang_tiers((gpu, &file, plan), &hang, &mut hybrid)?;
+        let tier = (!tiers.is_empty())
+            .then(|| TierParts::new(gpu, hybrid.slots(), spec.layers.len(), dims.embd))
+            .transpose()?;
+        if let Some(t) = &tier {
+            refuse_reserve_past(
+                WHAT,
+                "expert tier buffers",
+                inputs.tier_reserve.unwrap_or(0),
+                (t.bytes() + TierBatch::bytes_of(prefill::T_MAX)) as u64,
+                "the step's tier side, and the prompt batch's tier places and the join's copies",
+            )?;
+        }
+        let who = Identity {
+            arch: "mimo2",
+            file: file
+                .shard_path(0)
+                .ok_or(GpuError::State {
+                    what: WHAT,
+                    missing: "the file's first shard",
+                })?
+                .to_path_buf(),
+            card: gpu.device_name()?,
+            ctx,
+        };
         let embd = Embedding::new(file, dims.embd)?;
         if embd.table.n_vocab() != hp.n_vocab {
             return Err(shape(format!(
@@ -852,15 +910,17 @@ impl Body {
             ropes,
             slots,
             routed,
+            tier,
             embd,
             ctx,
             seq_rows,
             at: 0,
             pending: None,
-            prompt: PromptState::new(),
+            prompt: PromptState::new(hp, inputs.prompt_reserve),
             slots_planned: seqs.get(),
             slots_made: 1,
             residency: lever,
+            who,
         };
         refuse_scratch_past(
             WHAT,
@@ -1121,6 +1181,7 @@ impl Body {
                 stores: stores.unwrap_or(self.stores.as_mut_slice()),
                 ropes: &self.ropes,
                 routed: &self.routed,
+                tier: self.tier.as_mut(),
                 taps: self.shell.taps.as_deref_mut(),
                 ctx: self.ctx,
             },
@@ -1296,8 +1357,8 @@ impl Slots for Body {
     /// ([`ChainBody::reset`]'s contract): zeroed stores of the load's rows
     /// and kv heads. Refused by name past the sequences the load's plan
     /// counts ([`Body::open_placed_slots`]), and when the card has fewer free
-    /// bytes ([`Gpu::alloc_room`]) than the stores take (the prompt batch's
-    /// buffers are unreserved and come out of the same free bytes).
+    /// bytes ([`Gpu::alloc_room`]) than the stores take (the units a prompt group
+    /// past one adds come out of the same free bytes).
     /// Load-time allocation.
     fn new_seq(&mut self, gpu: &Gpu) -> Result<Seq, GpuError> {
         if self.slots_made >= self.slots_planned {

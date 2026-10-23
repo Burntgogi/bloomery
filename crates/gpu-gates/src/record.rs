@@ -137,7 +137,7 @@ pub static TIER_COST: Kind = Kind {
 pub static PLAN: Kind = Kind {
     name: "plan",
     head: "plan",
-    doc: "The placement the engine is about to load by: its card, context, where the experts sit, the routed-expert bytes the plan pages through the NVMe tier (paged), the RAM arena they page through (arena) and the slots it holds (arena_slots), 0 and 0 and 0 on a plan that pages nothing, the host room's reading the plan was made at (room) and the plan room it was held to (plan_room, the reading less the drift margin) when it was made at one, and each plan card's device (role:name:ordinal:usable bytes; by-name for a card a census-free plan opens by its name) under the CUDA enumeration order in force, with the card's free bytes at plan time when the census read them.",
+    doc: "The placement the engine is about to load by: its card, context, where the experts sit, the routed-expert bytes the plan pages through the NVMe tier (paged), the RAM arena they page through (arena) and the slots it holds (arena_slots), 0 and 0 and 0 on a plan that pages nothing, the host room's reading the plan was made at (room) and the plan room it was held to (plan_room, the reading less the drift margin) when it was made at one, and each plan card's device (role:name:ordinal:usable bytes; the role is stage, tier<i> for an expert tier card by its place among the tier cards, or holder for a card that joins the plan to hold a reserve, a draft's, and no expert; by-name for a card a census-free plan opens by its name) under the CUDA enumeration order in force, with the card's free bytes at plan time when the census read them, and, when the card holds a file tensor in another quantization than its file's (a BF16 head in MXFP8 planes), each such tensor as tensor:file type:card format (requantized; absent when there is none).",
     parts: &[
         key("place", Word, ""),
         key("card", Word, ""),
@@ -165,6 +165,7 @@ pub static PLAN: Kind = Kind {
         opt("card_free", U64, "B"),
         opt("devices", Csv, ""),
         opt("cuda_order", Word, ""),
+        opt("requantized", Csv, "tensor:file type:card format"),
     ],
 };
 
@@ -197,7 +198,7 @@ pub static TP_RANK: Kind = Kind {
 pub static PLAN38: Kind = Kind {
     name: "plan38",
     head: "plan",
-    doc: "A qwen3moe-family placement the engine is about to load by: its card, the architecture (a placed qwen3moe or qwen35moe file names it; a qwen4exp line does not), the expert rule (host or card), the context, where the routed experts sit (each layer's id prefix on the card, a placed line stating as n_l the fewest and the most one layer keeps; under plan (b′) the expert tier card and the next ids it holds), each plan card's device as the plan record names them, the card's free bytes at plan time when the census read them, the host room's reading the plan was made at (room) and the plan room it was held to (plan_room, the reading less the drift margin) when it was made at one, and — on the placed plan a run with --place unset took because the whole file did not fit the free bytes — why it did not; for a file with a row-gathered table (a qwen4exp file's PLE table), the tier the plan reads it from (rows, host or nvme) and the host room's reading that chose it (read).",
+    doc: "A qwen3moe-family placement the engine is about to load by: its card, the architecture (a placed qwen3moe or qwen35moe file names it; a qwen4exp line does not), the expert rule (host or card), the context, where the routed experts sit (each layer's id prefix on the card, a placed line stating as n_l the fewest and the most one layer keeps; under plan (b′) the expert tier card and the next ids it holds), each plan card's device as the plan record names them, the card's free bytes at plan time when the census read them, the host room's reading the plan was made at (room) and the plan room it was held to (plan_room, the reading less the drift margin) when it was made at one, and — on the placed plan a run with --place unset took because the whole file did not fit the free bytes — why it did not; for a file with a row-gathered table (a qwen4exp file's PLE table), the tier the plan reads it from (rows, host or nvme) and the host room's reading that chose it (read), and, when the card holds a file tensor in another quantization than its file's (a BF16 head in MXFP8 planes), each such tensor as tensor:file type:card format (requantized; absent when there is none).",
     parts: &[
         key("place", Word, ""),
         key("card", Word, ""),
@@ -217,6 +218,7 @@ pub static PLAN38: Kind = Kind {
         opt("read", Word, ""),
         opt("devices", Csv, ""),
         opt("cuda_order", Word, ""),
+        opt("requantized", Csv, "tensor:file type:card format"),
     ],
 };
 
@@ -375,7 +377,7 @@ pub static HOST_LOCK: Kind = Kind {
 pub static LOAD_DRAFT: Kind = Kind {
     name: "load_draft",
     head: "load",
-    doc: "The DSpark draft's load: its card, width, the target's tapped layers, the draft's own device buffers through the allocator model (the weights then the rings in allocation order, plus the working buffers; never the captured graphs) and the working buffers alone, the reserve the placement made for it on a tier card, the card's free-bytes loss around the load (another process's allocations land in it), and the draft card's free bytes after.",
+    doc: "The DSpark draft's load: its card, width, the target's tapped layers, the draft's own device buffers through the allocator model (the weights then the rings in allocation order, plus the working buffers; never the captured graphs) and the working buffers alone, the reserve the placement made for it on the card it sits on (the stage, a tier card, or a card that joins the plan to hold the draft and no expert), the card's free-bytes loss around the load (another process's allocations land in it), and the draft card's free bytes after.",
     parts: &[
         key("draft", Word, ""),
         key("card", Word, ""),
@@ -1954,7 +1956,7 @@ pub static LISTENING_MIMO2: Kind = Kind {
 pub static LOAD_SOLAR2: Kind = Kind {
     name: "load_solar2",
     head: "load",
-    doc: "The Solar seat's model on its card: its architecture, resident bytes, the cache rows the model was loaded with (`ctx`), the resident sequences it holds (`slots`: one, the body has no more), layers, the routed experts the plan keeps on the host and on the card, the step graph's nodes, the batches a prompt group runs layer by layer (`group`: `BLOOMERY_PREFILL_GROUP`, the row's default when unset), `BLOOMERY_PIN_MAIN`'s ask (`pin_main`) and whether the engine thread's pin took (`pinned`), and the load's wall.",
+    doc: "The Solar seat's model on its card: its architecture, resident bytes, the cache rows the model was loaded with (`ctx`), the resident sequences it holds (`slots`: the served `--parallel` count, one by default), layers, the routed experts the plan keeps on the host and on the card, the step graph's nodes, the batches a prompt group runs layer by layer (`group`: `BLOOMERY_PREFILL_GROUP`, the row's default when unset), `BLOOMERY_PIN_MAIN`'s ask (`pin_main`) and whether the engine thread's pin took (`pinned`), and the load's wall.",
     parts: &[
         key("arch", Word, ""),
         key("resident_bytes", U64, "B"),
@@ -2015,6 +2017,43 @@ pub static LISTENING_MINIMAXM3: Kind = Kind {
     name: "listening_minimaxm3",
     head: "bloomery-serve-minimaxm3:",
     doc: "The MiniMax-M3 seat's placement, the context its slot serves, the slots it serves and the address it listens on.",
+    parts: &[
+        key("place", Word, ""),
+        key("ctx", U64, "positions"),
+        key("slots", U64, ""),
+        lit(" listening on http://"),
+        pos("addr", Word, ""),
+    ],
+};
+
+/// The Muse Spark seat's load.
+pub static LOAD_MUSESPARK: Kind = Kind {
+    name: "load_musespark",
+    head: "load",
+    doc: "The Muse Spark seat's model on its card: its architecture, resident bytes, the cache rows the model was loaded with (`ctx`), the resident sequences it holds (`slots`), layers, the routed experts the plan keeps on the host and on the card, the step graph's nodes, how a prompt is fed (`prompt`: `batch` or `steps`, one decode step an id), `BLOOMERY_PIN_MAIN`'s ask (`pin_main`) and whether the engine thread's pin took (`pinned`), and the load's wall.",
+    parts: &[
+        key("arch", Word, ""),
+        key("resident_bytes", U64, "B"),
+        key("ctx", U64, "positions"),
+        key("slots", U64, ""),
+        key("layers", U64, ""),
+        key("host_experts", U64, "experts"),
+        key("card_experts", U64, "experts"),
+        key("graph_nodes", U64, ""),
+        key("prompt", Word, ""),
+        key("pin_main", Word, ""),
+        key("pinned", Bool, ""),
+        lit(" in "),
+        pos("load_s", F64(1), "s"),
+        lit(" s"),
+    ],
+};
+
+/// The Muse Spark seat's address.
+pub static LISTENING_MUSESPARK: Kind = Kind {
+    name: "listening_musespark",
+    head: "bloomery-serve-musespark:",
+    doc: "The Muse Spark seat's placement, the context its slot serves, the slots it serves and the address it listens on.",
     parts: &[
         key("place", Word, ""),
         key("ctx", U64, "positions"),
@@ -2199,6 +2238,35 @@ pub static LOAD_DRAFT_GLM: Kind = Kind {
         pos("load_s", F64(1), "s"),
         lit(" s (runtime value)"),
     ],
+};
+
+/// The qwen3 seat's in-file MTP draft, loaded beside the target.
+pub static LOAD_DRAFT_Q3: Kind = Kind {
+    name: "load_draft_q3",
+    head: "load draft=mtp",
+    doc: "The qwen3 seat's MTP draft, the file's next-token layer loaded beside the target, after \
+          the load line: the layer's index in the file, its weights' and store's device bytes, \
+          its scratch bytes (the one-row arena is inside them), the head it scores with, and the \
+          load's wall.",
+    parts: &[
+        key("layer", U64, ""),
+        key("resident", U64, "B"),
+        key("scratch", U64, "B"),
+        key("head", Word, ""),
+        lit(" in "),
+        pos("load_s", F64(1), "s"),
+        lit(" s (runtime value)"),
+    ],
+};
+
+/// A qwen3 seat that drafts nothing.
+pub static LOAD_DRAFT_OFF_Q3: Kind = Kind {
+    name: "load_draft_off_q3",
+    head: "load draft=off",
+    doc: "A qwen3 seat serving a qwen35moe or qwen35 file that drafts nothing, after its load \
+          line, and why: BLOOMERY_DRAFT=off, or unset and the condition that left the plain path, \
+          or mtp on a file whose next-token layer is not a draft.",
+    parts: &[lit(" ("), pos("why", Text, ""), lit(")")],
 };
 
 /// A GLM seat that drafts nothing ([`bloomery_levers::GlmWhy`]).
@@ -2584,10 +2652,13 @@ macro_rules! kinds {
 pub mod groups {
     /// `serve_seats/tiered.rs` (the gate bins' shared seat module).
     pub mod tiered {
-        use crate::record::{Kind, NEED, PLAN};
+        use crate::record::{Kind, NEED, PLAN, RESIDENCY_LEVER};
 
         /// A tiered seat's run: the plan it loads and its need (`tiered::run`).
         pub const RUN: &[&Kind] = &[&PLAN, &NEED];
+
+        /// The residency lever's record (`tiered::residency_pick`).
+        pub const LEVER: &[&Kind] = &[&RESIDENCY_LEVER];
     }
 
     /// `serve_seats/hybrid.rs` (the seats of the bodies that run one chain on
@@ -2920,11 +2991,17 @@ pub static BLOOMERY_SERVE_QWEN3: &[&Kind] = kinds![
     groups::qwen3moe_place::PLAN,
     groups::fetch::FETCH,
     groups::fetch::SET,
-    &[&LOAD_QWEN3, &LOAD_PHASES],
+    &[
+        &LOAD_QWEN3,
+        &LOAD_PHASES,
+        &LOAD_DRAFT_Q3,
+        &LOAD_DRAFT_OFF_Q3
+    ],
     groups::vision_seat::RECORDS,
     &[&LISTENING_QWEN3],
     groups::bind::CACHE,
     groups::bind::SLOTS,
+    groups::drafted::PROMPT,
     groups::drafted::WIDTH,
     groups::ds41_draft::LOAD,
 ];
@@ -2937,7 +3014,8 @@ pub static BLOOMERY_SERVE_QWEN3: &[&Kind] = kinds![
 /// than it shared.
 pub static BLOOMERY_SERVE_MIMO2: &[&Kind] = kinds![
     groups::side_seat::SEAT,
-    &[&RESIDENCY_LEVER, &PLACE_UNSET],
+    groups::tiered::LEVER,
+    &[&PLACE_UNSET],
     groups::tiered::RUN,
     groups::residency38::HOST,
     groups::fetch::FETCH,
@@ -2948,14 +3026,17 @@ pub static BLOOMERY_SERVE_MIMO2: &[&Kind] = kinds![
 
 /// What the Solar seat of `bloomery-serve` prints, all on stderr: the
 /// placement and why (`place unset`), a `--hf` repo's resolve lines (printed by
-/// the server before the seat registers), the plan, the load and its phases,
-/// the address and each request's note of the prefix it kept less of than it
-/// shared (the KDA state keeps a prefix only where the sequence stands or at a
-/// checkpoint).
+/// the server before the seat registers), the residency lever's word and why,
+/// the plan, the churn pool's share of the host under `mid`, the load and its
+/// phases, the address and each request's note of the prefix it kept less of
+/// than it shared (the KDA state keeps a prefix only where the sequence stands
+/// or at a checkpoint).
 pub static BLOOMERY_SERVE_SOLAR2: &[&Kind] = kinds![
     groups::side_seat::SEAT,
+    groups::tiered::LEVER,
     &[&PLACE_UNSET],
     groups::tiered::RUN,
+    groups::residency38::HOST,
     groups::fetch::FETCH,
     groups::fetch::SET,
     &[&LANE, &LOAD_SOLAR2, &LOAD_PHASES, &LISTENING_SOLAR2],
@@ -2964,26 +3045,48 @@ pub static BLOOMERY_SERVE_SOLAR2: &[&Kind] = kinds![
 
 /// What the MiniMax-M3 seat of `bloomery-serve` prints, all on stderr: the
 /// placement and why (`place unset`), a `--hf` repo's resolve lines (printed by
-/// the server before the seat registers), the plan, the load and its phases,
-/// the address and each request's note of the prefix it kept less of than it
-/// shared (every store is a plane of positions, so a cut keeps every held
-/// position).
+/// the server before the seat registers), the residency lever's word and why,
+/// the plan, the churn pool's share of the host under `mid`, the load and its
+/// phases, the address and each request's note of the prefix it kept less of
+/// than it shared (every store is a plane of positions, so a cut keeps every
+/// held position).
 pub static BLOOMERY_SERVE_MINIMAXM3: &[&Kind] = kinds![
     groups::side_seat::SEAT,
+    groups::tiered::LEVER,
     &[&PLACE_UNSET],
     groups::tiered::RUN,
+    groups::residency38::HOST,
     groups::fetch::FETCH,
     groups::fetch::SET,
     &[&LANE, &LOAD_MINIMAXM3, &LOAD_PHASES, &LISTENING_MINIMAXM3],
     groups::bind::CACHE,
 ];
 
-/// What the nemotron_h seat of `bloomery-serve` prints, all on stderr: the
+/// What the Muse Spark seat of `bloomery-serve` prints, all on stderr: the
 /// placement and why (`place unset`), a `--hf` repo's resolve lines (printed by
-/// the server before the seat registers), the plan, the load and its phases,
-/// the address and each request's note of the prefix it kept less of than it
-/// shared (the Mamba-2 state keeps a prefix only at the position it stands).
+/// the server before the seat registers), the residency lever, the plan, under
+/// `mid` the churn pool's host record, the load and its phases, the address and
+/// each request's note of the prefix it kept less of than it shared.
+pub static BLOOMERY_SERVE_MUSESPARK: &[&Kind] = kinds![
+    groups::side_seat::SEAT,
+    groups::tiered::LEVER,
+    &[&PLACE_UNSET],
+    groups::tiered::RUN,
+    groups::residency38::HOST,
+    groups::fetch::FETCH,
+    groups::fetch::SET,
+    &[&LANE, &LOAD_MUSESPARK, &LOAD_PHASES, &LISTENING_MUSESPARK],
+    groups::bind::CACHE,
+];
+
+/// What the nemotron_h seat of `bloomery-serve` prints, all on stderr: the
+/// placement and why (`place unset`), the embedding side seat when one is
+/// named, a `--hf` repo's resolve lines (printed by the server before the seat
+/// registers), the plan, the load and its phases, the address and each
+/// request's note of the prefix it kept less of than it shared (the Mamba-2
+/// state keeps a prefix only at the position it stands).
 pub static BLOOMERY_SERVE_NEMOTRON: &[&Kind] = kinds![
+    groups::side_seat::SEAT,
     &[&PLACE_UNSET, &PLAN, &NEED],
     groups::fetch::FETCH,
     groups::fetch::SET,
@@ -2992,12 +3095,14 @@ pub static BLOOMERY_SERVE_NEMOTRON: &[&Kind] = kinds![
 ];
 
 /// What the raon1 seat of `bloomery-serve` prints, all on stderr: the
-/// placement and why (`place unset`), the draft rule, a `--hf` repo's resolve
-/// lines, the plan, the load and its phases, the DFlash2 draft's load, the
-/// address, each request's note of the prefix it kept less of than it shared
-/// (the RDA state keeps a prefix only at the position it stands) and the width
-/// chooser's record at a drafted request's end.
+/// placement and why (`place unset`), the embedding side seat when one is
+/// named, the draft rule, a `--hf` repo's resolve lines, the plan, the load
+/// and its phases, the DFlash2 draft's load, the address, each request's note
+/// of the prefix it kept less of than it shared (the RDA state keeps a prefix
+/// only at the position it stands) and the width chooser's record at a drafted
+/// request's end.
 pub static BLOOMERY_SERVE_RAON1: &[&Kind] = kinds![
+    groups::side_seat::SEAT,
     &[&PLACE_UNSET, &DRAFT_RULE_RAON1, &PLAN, &NEED],
     groups::fetch::FETCH,
     groups::fetch::SET,
@@ -3272,6 +3377,19 @@ pub fn host_only<'a>(
     }))
 }
 
+/// `r` with the `requantized` part `plan` and `plan38` share: each tensor of
+/// `model` the card holds in another quantization than its file's
+/// ([`model::placement::ModelTensors::requantized`]), none printed when there is
+/// none; the caller has put every part the kind lists before it.
+pub fn with_requantized(r: Record, model: &model::placement::ModelTensors) -> Record {
+    let listed = model.requantized();
+    if listed.is_empty() {
+        r
+    } else {
+        r.csv("requantized", listed)
+    }
+}
+
 /// `r` with the host room's reading and the plan room when the plan was made at
 /// one (`HostTotals::room`), the two parts `plan` and `plan38` share; the
 /// caller has put every part the kind lists before `room`.
@@ -3322,11 +3440,7 @@ pub fn plan(place: &str, machine: &Machine, plan: &Plan<'_>) -> Record {
             ),
         )
         .u("n_l_layers", held.len())
-        .w(
-            "card_budget",
-            plan.card_budget
-                .map_or_else(|| "none".to_string(), |b| b.to_string()),
-        )
+        .w("card_budget", &plan.card_budget)
         .u("paged", plan.host.nvme_expert_bytes)
         .u("arena", plan.host.nvme_arena_bytes)
         .u(
@@ -3338,19 +3452,26 @@ pub fn plan(place: &str, machine: &Machine, plan: &Plan<'_>) -> Record {
         Some(free) => r.u("card_free", free),
         None => r,
     };
-    r.csv("devices", plan_devices(machine))
-        .w("cuda_order", cuda_order())
+    let r = r
+        .csv("devices", plan_devices(machine))
+        .w("cuda_order", cuda_order());
+    with_requantized(r, plan.model)
 }
 
-/// Each card of `machine` as the `plan` record's `devices` field names it:
-/// `stage` or `tier<i>`, its name, its ordinal (`by-name` for a card a
-/// census-free plan opens by its name), its usable bytes. The UUID stays in
-/// the process: the open checks it, no record prints it.
+/// Each card of `machine` as the `plan` record's `devices` field names it: its
+/// role — `stage`, `tier<i>` (an expert tier card, `i` its place among the tier
+/// cards) or `holder` (a reserve-only member,
+/// [`model::placement::Card::reserve_only`], which holds what is reserved on it
+/// and no expert) — its name, its ordinal (`by-name` for a card a census-free
+/// plan opens by its name), its usable bytes. The UUID stays in the process: the
+/// open checks it, no record prints it.
 #[must_use]
 pub fn plan_devices(machine: &Machine) -> Vec<String> {
-    let role = |i: usize| {
+    let role = |i: usize, reserve_only: bool| {
         if i < machine.cards.len() {
             "stage".to_string()
+        } else if reserve_only {
+            "holder".to_string()
         } else {
             format!("tier{}", i - machine.cards.len())
         }
@@ -3362,7 +3483,12 @@ pub fn plan_devices(machine: &Machine) -> Vec<String> {
             let at = c
                 .device
                 .map_or_else(|| "by-name".to_string(), |d| format!("cuda{}", d.ordinal));
-            format!("{}:{}:{at}:{}", role(i), c.name, c.usable_bytes)
+            format!(
+                "{}:{}:{at}:{}",
+                role(i, c.reserve_only),
+                c.name,
+                c.usable_bytes
+            )
         })
         .collect()
 }
@@ -4186,10 +4312,10 @@ mod tests {
     fn every_binary_registers_the_groups_its_entries_require() {
         use groups::{
             bind, drafted, ds41_draft, ds41_split, fetch, host_stats, nvtier_family,
-            qwen3moe_place, residency38, serve_client, side_seat, vision_seat,
+            qwen3moe_place, residency38, serve_client, side_seat, tiered, vision_seat,
         };
         type Group = &'static [&'static Kind];
-        let table: [(&str, Group, &[Group]); 16] = [
+        let table: [(&str, Group, &[Group]); 17] = [
             (
                 "ds41 seat: Flags::encoder, Draft::from_levers, print_widths, bind::spawn",
                 BLOOMERY_SERVE_DS41,
@@ -4234,10 +4360,11 @@ mod tests {
                 ],
             ),
             (
-                "mimo2 seat: residency_set, bind::spawn",
+                "mimo2 seat: residency_pick, residency_set, bind::spawn",
                 BLOOMERY_SERVE_MIMO2,
                 &[
                     side_seat::SEAT,
+                    tiered::LEVER,
                     fetch::FETCH,
                     fetch::SET,
                     residency38::HOST,
@@ -4245,24 +4372,56 @@ mod tests {
                 ],
             ),
             (
-                "solar2 seat: bind::spawn",
+                "solar2 seat: residency_pick, residency_set, bind::spawn",
                 BLOOMERY_SERVE_SOLAR2,
-                &[side_seat::SEAT, fetch::FETCH, fetch::SET, bind::CACHE],
+                &[
+                    side_seat::SEAT,
+                    tiered::LEVER,
+                    residency38::HOST,
+                    fetch::FETCH,
+                    fetch::SET,
+                    bind::CACHE,
+                ],
             ),
             (
-                "minimaxm3 seat: bind::spawn",
+                "minimaxm3 seat: residency_pick, residency_set, bind::spawn",
                 BLOOMERY_SERVE_MINIMAXM3,
+                &[
+                    side_seat::SEAT,
+                    tiered::LEVER,
+                    residency38::HOST,
+                    fetch::FETCH,
+                    fetch::SET,
+                    bind::CACHE,
+                ],
+            ),
+            (
+                "musespark seat: Side::seat, residency_pick, settle_pick, bind::spawn",
+                BLOOMERY_SERVE_MUSESPARK,
+                &[
+                    side_seat::SEAT,
+                    tiered::LEVER,
+                    residency38::HOST,
+                    fetch::FETCH,
+                    fetch::SET,
+                    bind::CACHE,
+                ],
+            ),
+            (
+                "nemotron seat: Side::seat, bind::spawn",
+                BLOOMERY_SERVE_NEMOTRON,
                 &[side_seat::SEAT, fetch::FETCH, fetch::SET, bind::CACHE],
             ),
             (
-                "nemotron seat: bind::spawn",
-                BLOOMERY_SERVE_NEMOTRON,
-                &[fetch::FETCH, fetch::SET, bind::CACHE],
-            ),
-            (
-                "raon1 seat: print_widths, bind::spawn",
+                "raon1 seat: Side::seat, print_widths, bind::spawn",
                 BLOOMERY_SERVE_RAON1,
-                &[fetch::FETCH, fetch::SET, drafted::WIDTH, bind::CACHE],
+                &[
+                    side_seat::SEAT,
+                    fetch::FETCH,
+                    fetch::SET,
+                    drafted::WIDTH,
+                    bind::CACHE,
+                ],
             ),
             (
                 "glm seat: Flags::encoder, residency_set, SlotDrafts::open, bind::spawn",
@@ -4938,6 +5097,100 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("reads a zero total"), "a zero total: {err}");
+    }
+
+    /// A reserve-only member of the plan
+    /// ([`model::placement::Card::reserve_only`]: it holds a reserve and no
+    /// expert) prints the role `holder` in the `plan` record's `devices`, where
+    /// an expert tier card prints `tier<i>` by its place among the tier cards
+    /// and the stage `stage`; the member is no expert tier and the draft's
+    /// reserve sits on it. Mutant: `plan_devices` naming every card past the
+    /// stage `tier<i>`.
+    #[test]
+    fn a_reserve_only_member_prints_the_holder_role() {
+        use model::placement::Device;
+        use model::placement::workstation::{
+            A6000, CardSpec, DRAFT_RESERVE, NO_TIER_BATCH, RTX_3090,
+        };
+        let tier = CardSpec {
+            name: "4090",
+            ..RTX_3090
+        };
+        let draft: u64 = 8 << 30;
+        let reserve = |at| Some(workstation::draft_reserve(Device::Card(at), draft));
+        let item = |role: &str, spec: &CardSpec| {
+            format!("{role}:{}:by-name:{}", spec.name, spec.usable_bytes())
+        };
+        let machine =
+            workstation::plan_holding(1, A6000, &[tier], &[RTX_3090], reserve(2), NO_TIER_BATCH)
+                .expect("the draft's card is the third card");
+        assert_eq!(
+            plan_devices(&machine),
+            [
+                item("stage", &A6000),
+                item("tier0", &tier),
+                item("holder", &RTX_3090)
+            ]
+        );
+        assert_eq!(
+            machine.tiers[1].reserves,
+            [(DRAFT_RESERVE.to_string(), draft)]
+        );
+        assert_eq!(
+            machine.expert_tiers().count(),
+            1,
+            "the holder serves no tier"
+        );
+        let alone =
+            workstation::plan_holding(1, A6000, &[], &[RTX_3090], reserve(1), NO_TIER_BATCH)
+                .expect("the draft's card is the second card");
+        assert_eq!(
+            plan_devices(&alone),
+            [item("stage", &A6000), item("holder", &RTX_3090)]
+        );
+    }
+
+    /// A plan line names each tensor the card holds in another quantization
+    /// than its file's (`tensor:file type:card format`), and a plan with none
+    /// prints no part: a BF16 head in MXFP8 planes is listed, a Q8_0 head in
+    /// its own planes is not. Mutant: `with_requantized` printing nothing.
+    #[test]
+    fn a_plan_line_names_the_tensors_the_card_requantizes() {
+        use gguf::GgmlType;
+        use model::placement::{ModelTensor, ModelTensors, Role};
+        let head = |ty| ModelTensors {
+            tensors: vec![ModelTensor {
+                name: "output.weight".to_string(),
+                shard: 0,
+                layer: None,
+                role: Role::Head,
+                ty,
+                dims: vec![256, 16],
+                file_bytes: 0,
+                gathered_rows: None,
+            }],
+            layers: 0,
+            experts: 8,
+            experts_used: 2,
+            bf16_words: |_| false,
+        };
+        let base = || {
+            Record::new(&PLAN38)
+                .w("place", "cuda0")
+                .w("card", "3090")
+                .w("experts", "card")
+                .u("ctx_max", 1088)
+                .u("host_experts", 1)
+                .u("card_experts", 2)
+                .csv("devices", ["stage:3090:cuda0:25350373376"])
+                .w("cuda_order", "unset(FASTEST_FIRST)")
+        };
+        let plain = with_requantized(base(), &head(GgmlType::Q8_0)).line();
+        assert!(!plain.contains("requantized"), "{plain}");
+        let named = with_requantized(base(), &head(GgmlType::BF16)).line();
+        let plan = Log::of(&named, BLOOMERY_SERVE_QWEN3).one(&PLAN38).unwrap();
+        let want = format!("output.weight:{}:mxfp8_planes", GgmlType::BF16);
+        assert_eq!(plan.csv("requantized"), Ok(vec![want.as_str()]), "{named}");
     }
 
     /// An optional part the line leaves out reads as absent, and the parts

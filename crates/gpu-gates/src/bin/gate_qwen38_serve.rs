@@ -4748,7 +4748,7 @@ mod gate {
             );
             machine.cards[0].free_bytes = Some(free);
             let plan_levers = PlanLevers {
-                card_budget_bytes: Some(budget),
+                card_budget_bytes: Some(budget).into(),
             };
             Ok(inputs
                 .plan_target(
@@ -4995,8 +4995,11 @@ mod gate {
         let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
         let inputs = PlanInputs::describe(&split)?;
         let (_, plan_levers) = drafted_plan_inputs(levers, &path, &split, &inputs)?;
-        if let Some(budget) = plan_levers.card_budget_bytes {
-            cmd.env(bloomery_levers::CARD_BUDGET, budget.to_string());
+        if plan_levers.card_budget_bytes.is_set() {
+            cmd.env(
+                bloomery_levers::CARD_BUDGET,
+                plan_levers.card_budget_bytes.to_string(),
+            );
         }
         let mut served = Served38::spawn_with(&SERVER_ARGS, dir, &mut cmd)?;
         println!("server pid {}", served.child.id());

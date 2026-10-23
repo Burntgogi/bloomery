@@ -34,6 +34,8 @@
 #              opens the same file at the same plan, so it holds the same bytes.
 #              The prefill gate opens the same gate plan at ctx 25: a smaller cache leaves the card at least as many experts,
 #              so the e2e's 187e9 bounds its host bytes [derived].
+#   qwen3moe-twocard: unmeasured ceiling, the qwen38-twocard row's figure (qwen4exp --place gate need, 92,054,154,240 B).
+#              The two loads run one after the other. Not a measurement of the Qwen3-30B or Qwen3.6 plan.
 gate-gpu-ds41-callstream	-	237600000000
 gate-gpu-ds41-long	m	237600000000
 gate-gpu-ds41-twocard	-	237600000000
@@ -44,6 +46,7 @@ gate-gpu-qwen38-media	-	127654154240
 gate-gpu-qwen38-residency	-	127700000000
 gate-gpu-qwen38-serve	-	127654154240
 gate-gpu-qwen38-twocard	-	92054154240
+gate-gpu-qwen3moe-twocard	-	92054154240
 gate-gpu-qwen4exp-e2e	m	92054154240
 gate-gpu-qwen4exp-iqleg	-	184108308480
 gate-gpu-qwen4exp-mtp	m	92054154240
@@ -54,6 +57,8 @@ gate-gpu-solar2-twocard	-	123000000000
 gate-gpu-minimaxm3-e2e	-	187000000000
 gate-gpu-minimaxm3-prefill	-	187000000000
 gate-gpu-minimaxm3-serve	-	187000000000
+gate-gpu-minimaxm3-twocard	-	187000000000
+gate-gpu-mimo2-twocard	-	126000000000
 soak-ds41	-	237600000000
 stage-gpu-load-v41	-	237600000000
 stage-gpu-load-v41-lock	-	237600000000
@@ -76,3 +81,8 @@ gate-gpu-glm5next-stagger	-	173015891968
 # crate fixture/glm5next and fixture/deepseek41 shard-size comments), one server at a time.
 gate-gpu-serve-start-glm	-	8600000000
 gate-gpu-serve-start-ds41	-	15000000000
+gate-gpu-musespark-e2e	-	204000000000
+gate-gpu-musespark-prefill	-	204000000000
+gate-gpu-musespark-load	-	204000000000
+gate-gpu-musespark-serve	-	203000000000
+gate-gpu-musespark-twocard	-	204000000000

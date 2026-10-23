@@ -3,16 +3,24 @@
 //!
 //! All 60 layers are one card's chain, each a GQA layer with a per-head q/k norm and a partial NEOX rope, over a
 //! feed-forward block: the leading layers a dense block of their own width, the rest a routed block with one shared
-//! expert, whose experts run on the card where the plan puts them ([`crate::ffn::Routed`]) and on the host tier
-//! otherwise. A sparse layer also holds an index key (one f16 row of the indexer's width) for every position and
+//! expert, whose experts run on the card where the plan puts them ([`crate::ffn::Routed`]), on the plan's expert tier
+//! card ([`crate::tier`]) and on the host tier otherwise. A sparse layer also holds an index key (one f16 row of the indexer's width) for every position and
 //! attends the blocks its indexer picks ([`crate::attn`]); a dense layer attends every position. Every store is a
 //! plane of positions that a later position never reads before it writes, so a cut back to a position is the count
 //! alone. The embedding is a host row, dequantized per step and copied into `x` before the launch.
 //!
-//! What the load refuses, by name: a plan of other than one card with no expert tier, a layer that is not a GQA
+//! The model is a GGUF split or a checkpoint folder ([`Model`]): a folder's card tensors come from its part source
+//! in their stored formats (MXFP8 projections, NVFP4 routed stacks in their planes, BF16 head, F32 router), the tier
+//! card's from the same source, and its host reads the tensors the folder's located header holds in place. Every
+//! launch is picked by the tensor's type.
+//!
+//! What the load refuses, by name: a plan of other than one stage card, more expert tier cards than the host tier
+//! serves, a layer that is not a GQA
 //! layer with the q/k norm and the partial rope over a block of the kinds above, widths the kernels have no
 //! geometry for, a tensor whose type no site launches or that is not resident in the rows its launch reads, stores
-//! whose bytes are not the plan's, a step scratch past the plan's term, and `slots` other than one.
+//! whose bytes are not one sequence of the plan's layout, a plan that counts a different number of sequences
+//! than the load was asked for, a step scratch past the plan's term, a prompt batch past the plan's reserve, and a
+//! sequence past the ones the plan counts.
 
 use std::num::NonZeroUsize;
 use std::ops::Range;
@@ -21,6 +29,8 @@ use std::sync::Arc;
 use bloomery_gpu::arch::hybrid::{Acts, GqaGate, GqaLayer, Site};
 use bloomery_gpu::flash_gqa::{GROUP_16, HEAD, partials_ms_len, partials_v_len};
 use bloomery_gpu::head::Head;
+use bloomery_gpu::host::leg_tier::{Hang, LegOpen};
+use bloomery_gpu::host::refuse_tier_count;
 use bloomery_gpu::host::run::{HostRun, HostWidths};
 use bloomery_gpu::host::served::{ResidencyParts, TierBody};
 use bloomery_gpu::host::shell::TierShell;
@@ -28,9 +38,11 @@ use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::host::swap_source::{
     DEADLINE, LIVE_DELAY, PlanStacks, ResidencyGlue, ResidencySpec, hosted_stacks,
 };
+use bloomery_gpu::host::tier::TierOpen;
 use bloomery_gpu::hybrid::{Chain, HostResidency, Hybrid, SlotMap};
 use bloomery_gpu::model::{
-    ChainBody, HostServed, Rollback, agreed, hosted_hybrid, one_card_run, refuse_scratch_past,
+    CardBytes, ChainBody, HostServed, Rollback, Slots, agreed, hosted_hybrid_tiered,
+    refuse_reserve_past, refuse_scratch_past, stage_run,
 };
 use bloomery_gpu::rope_neox::ROT_PARTIAL;
 use bloomery_gpu::rope_table::{RopeRows, RopeSpec, RopeTable};
@@ -42,7 +54,7 @@ use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::Split;
 use model::arch::Arch;
 use model::arch::minimaxm3::host as minimax_host;
-use model::arch::minimaxm3::hparams::Kind;
+use model::arch::minimaxm3::hparams::Attn;
 use model::arch::minimaxm3::place::PlanInputs;
 use model::arch::names;
 use model::embed::EmbedTable;
@@ -53,6 +65,7 @@ use runtime::layer::{Layer, MixerKind, ResidualKind, hosted};
 use crate::attn::{DIM, HEADS, MsaScratch, MsaShape, N_HEAD, ROT, partials_lens};
 use crate::ffn::{CARD, Routed, RoutedDims};
 use crate::step::Kernels;
+use crate::tier;
 use bloomery_gpu_deepseek41::prompt_walk::BatchBufs;
 
 /// What the body's refusals name.
@@ -242,8 +255,13 @@ pub struct Body {
     /// The prompt batch's units: the walker's own buffers.
     pub(crate) units: BatchBufs,
     pub(crate) slots: Arc<DeviceTensor<u32>>,
-    /// The positions the stores hold: a step at `pos` needs `pos <= at`, and it leaves `pos + 1`.
+    /// The positions the live sequence's stores hold: a step at `pos` needs `pos <= at`, and it leaves
+    /// `pos + 1`. A select exchanges it with the parked sequence's.
     pub(crate) at: u32,
+    /// Sequences the load's plan counts, the live one included.
+    slots_planned: usize,
+    /// Sequences allocated, the live one included. Grows in [`Slots::new_seq`].
+    slots_made: usize,
     /// The kernels the layers launch besides `Gpu`'s own.
     pub(crate) k: Kernels,
     /// The rope table of the 64 turned values a position, which the head kernels of the attention and the indexer
@@ -265,16 +283,18 @@ pub(crate) fn shape(detail: impl Into<String>) -> GpuError {
     }
 }
 
-/// Site types a projection of the file may be: Q8_0 (the released file's), and the K-quants.
+/// Site types a projection may be: Q8_0 and the K-quants (a GGUF's), and MXFP8 (the checkpoint folder's, in its
+/// planes).
 pub const PROJ: &[SiteTy] = &[
     SiteTy::Q8_0,
     SiteTy::Q3K,
     SiteTy::Q4K,
     SiteTy::Q5K,
     SiteTy::Q6K,
+    SiteTy::Mxfp8,
 ];
 
-/// Site types of the indexer's projections: the released file's f32, or any projection type.
+/// Site types of the indexer's projections: a GGUF's f32, or any projection type.
 pub const INDEX: &[SiteTy] = &[
     SiteTy::F32,
     SiteTy::Q8_0,
@@ -282,7 +302,16 @@ pub const INDEX: &[SiteTy] = &[
     SiteTy::Q4K,
     SiteTy::Q5K,
     SiteTy::Q6K,
+    SiteTy::Mxfp8,
 ];
+
+/// The model a MiniMax load reads ([`Body::open_placed`] and its siblings): a GGUF split, or a checkpoint folder
+/// ([`Folder`]). MiniMax's folder carries nothing beside its parts.
+pub type Model = bloomery_gpu::folder::Model;
+
+/// A checkpoint folder as a MiniMax load reads it: its located header, whose in-place tensors the host reads where the
+/// folder stores them (the embedding, the host's routed stacks), and its card tensors through its part source.
+pub type Folder = bloomery_gpu::folder::Folder;
 
 /// A layer's description held to what the kernels run: a GQA layer over every position of [`HEAD`]-wide heads at
 /// group [`GROUP_16`] with the per-head q/k norm and the partial rope, and the block selector exactly when `sparse`.
@@ -376,10 +405,11 @@ fn stacks(inputs: &PlanInputs) -> Result<PlanStacks, GpuError> {
 
 impl Body {
     /// Card `card` of `plan`, which `inputs` made, resident: the layers' weights the plan puts on the card, the
-    /// stores at the plan's `ctx_max`, the host tier over every routed layer and the embedding as a host row; the
-    /// load's slot map for the model's life ([`Residency::Off`]). Refused by name (module doc).
+    /// stores at the plan's `ctx_max`, the host tier over every routed layer with the plan's expert tier card, when
+    /// it names one, hung under it, and the embedding as a host row; the load's slot map for the model's life
+    /// ([`Residency::Off`]). Refused by name (module doc).
     pub fn open_placed(
-        file: Split,
+        file: impl Into<Model>,
         plan: &Plan<'_>,
         inputs: &PlanInputs,
         card: usize,
@@ -397,14 +427,16 @@ impl Body {
     }
 
     /// [`Body::open_placed`] by a plan that counts `slots` resident sequences ([`PlanInputs::plan_with_slots`]).
-    /// The body holds one: more are refused by name, and a plan that counts another number of sequences is refused
-    /// at the load.
+    /// The live sequence is the load's; the model makes the rest ([`GpuModel::add_slots`]) and [`Slots::new_seq`]
+    /// refuses one past the plan by name. A plan that counts another number of sequences is refused by name here,
+    /// before a card is opened.
     ///
     /// Under `residency` the host set also holds each layer's churn pool ([`GpuModel::load_placed_with`]) and the
     /// body starts the machine over its slot map once its pieces are sized ([`HostServed::start_residency`]);
-    /// [`Residency::Off`] keeps the load's slot map for the model's life.
+    /// [`Residency::Off`] keeps the load's slot map for the model's life. A folder whose header locates no file is
+    /// refused by name under a residency machine ([`Folder`]); a located folder's experts stage from its parts.
     pub fn open_placed_slots(
-        file: Split,
+        file: impl Into<Model>,
         plan: &Plan<'_>,
         inputs: &PlanInputs,
         card: usize,
@@ -412,11 +444,12 @@ impl Body {
         residency: Residency,
         slots: NonZeroUsize,
     ) -> Result<MiniMaxM3Model, GpuError> {
-        if slots.get() > 1 {
-            return Err(shape(format!(
-                "{slots} resident sequences: the program holds one sequence's stores and has no slots to add"
-            )));
-        }
+        let (file, origin) = file.into().into_origin(residency)?;
+        let tiers = TierOpen::of_machine(plan.machine)?;
+        refuse_tier_count(WHAT, tiers.len())?;
+        let (layers, _) = stage_run(WHAT, plan, card, inputs.spec.layers.len())?;
+        let one = inputs.kv.bytes(layers, plan.ctx_max);
+        refuse_store_count(plan, card, one, slots)?;
         let spec = ResidencySpec {
             lever: residency,
             pool: ChurnHosting::Hosted,
@@ -426,34 +459,44 @@ impl Body {
             max_rows: LOAD_ROWS,
             stacks: Arc::new(stacks(inputs)?),
         };
-        GpuModel::load_placed_with(
+        GpuModel::load_placed_from(
             file,
+            origin.bytes(),
             plan,
             card,
             host,
             spec,
+            (&[], 0),
             |_, _, _, _| Ok(()),
             |gpu, file, w, set, glue| {
-                Body::load(gpu, file, w, (plan, inputs, card), host, (set, glue))
+                let open = (plan, inputs, card, (&tiers[..], origin.bytes()));
+                Body::load(gpu, file, w, open, host, (set, glue), slots)
             },
         )
     }
 
     /// The body of card `card`: its layers' programs and values from the plan's description, the stores at the
-    /// plan's `ctx_max`, the step's buffers, the slot map the plan's routed segments make, the routed blocks and
-    /// the host tier over the routed run. `glue` is the load's residency side, whose machine the body starts once
-    /// its pieces are sized.
+    /// plan's `ctx_max`, the step's buffers, the slot map the plan's routed segments make (the stage card's and the
+    /// expert tier cards' `tiers`, whose tensors come from `bytes` as the stage card's do), the routed blocks and
+    /// the host tier over the routed run with the tier cards hung under it. `glue` is the load's residency side,
+    /// whose machine the body starts once its pieces are sized.
     fn load(
         gpu: &Gpu,
         file: &Arc<Split>,
         w: &Weights,
-        (plan, inputs, card): (&Plan<'_>, &PlanInputs, usize),
+        (plan, inputs, card, (tiers, bytes)): (
+            &Plan<'_>,
+            &PlanInputs,
+            usize,
+            (&[TierOpen], CardBytes<'_>),
+        ),
         host: HostCfg,
         (set, glue): (HostResidency, ResidencyGlue),
+        seqs: NonZeroUsize,
     ) -> Result<Body, GpuError> {
         let (hp, spec) = (&inputs.hp, &inputs.spec);
         gpu.context().bind_to_thread()?;
-        let (layers, ctx) = one_card_run(WHAT, plan, card, spec.layers.len())?;
+        let (layers, ctx) = stage_run(WHAT, plan, card, spec.layers.len())?;
         let (dims, msa) = dims_of(inputs, ctx)?;
         let cfg: Vec<Layer> = spec.layers.iter().map(Layer::of).collect();
         for (l, kind) in cfg.iter().enumerate() {
@@ -464,9 +507,11 @@ impl Body {
             }
         }
         let run = hosted(&spec.layers).map_err(|e| shape(e.to_string()))?;
-        let map = SlotMap::of_plan(plan, card, None, run.clone(), hp.experts.n_expert)?;
+        let tier_cards: Vec<usize> = tiers.iter().map(|t| t.card).collect();
+        let map =
+            SlotMap::of_plan_tiers(plan, card, &tier_cards, run.clone(), hp.experts.n_expert)?;
         let stores = (0..spec.layers.len())
-            .map(|l| store(gpu, file, w, &dims, l, hp.kind(l) == Kind::Sparse))
+            .map(|l| store(gpu, file, w, &dims, l, hp.kind(l).attn == Attn::Sparse))
             .collect::<Result<Vec<_>, _>>()?;
         let held: u64 = stores.iter().map(|s| s.bytes() as u64).sum();
         let planned = inputs.kv.bytes(layers.clone(), plan.ctx_max);
@@ -475,16 +520,7 @@ impl Body {
                 "the stores hold {held} device bytes; the plan's layout counts {planned}"
             )));
         }
-        let counted = plan
-            .cards
-            .get(card)
-            .map(|t| t.kv_bytes)
-            .ok_or_else(|| shape(format!("the plan has no card {card}")))?;
-        if counted != planned {
-            return Err(shape(format!(
-                "the plan counts {counted} store bytes on card {card}; the load holds {planned}"
-            )));
-        }
+        refuse_store_count(plan, card, planned, seqs)?;
         let stream = gpu.stream();
         let s = Scratch::new(stream, (&dims, &msa), stores.iter().flat_map(Store::sites))?;
         let table = RopeTable::new(&RopeSpec::window(dims.rope_base, ROT_PARTIAL))?;
@@ -510,7 +546,21 @@ impl Body {
         let rules = (0..spec.layers.len())
             .map(|l| routed_oai(spec, l))
             .collect::<Result<Vec<_>, _>>()?;
-        let mut hybrid = hosted_hybrid(
+        let hang = Hang {
+            tiers,
+            family: &tier::NODE_FAMILY,
+            open: LegOpen {
+                n_expert: hp.experts.n_expert,
+                layers: spec.layers.len(),
+                hidden: dims.embd,
+                n_used: hp.experts.n_used,
+                rows: LOAD_ROWS,
+            },
+            cols: crate::prefill::T_MAX,
+            card_dontneed: host.card_dontneed,
+            bytes,
+        };
+        let mut hybrid = hosted_hybrid_tiered(
             (gpu, file, plan),
             (run.clone(), map),
             (host, set, &glue),
@@ -522,6 +572,7 @@ impl Body {
                 },
                 LOAD_ROWS,
             ),
+            Some(&hang),
             |src| {
                 run.clone()
                     .map(|l| minimax_host::layer(src, hp, l, rules[l].0, rules[l].1))
@@ -563,14 +614,27 @@ impl Body {
             },
             cur: StepInput { token: 0, pos: 0 },
             dims,
+            slots_planned: seqs.get(),
+            slots_made: 1,
         };
         refuse_scratch_past(
             WHAT,
             plan,
             card,
             body.scratch_bytes(),
-            "the step's buffers, the routed blocks' buffers and card experts, the kernels, the rope table, the \
-             host boundary, the slot map's copy",
+            "the step's buffers, the selection's block scores, the routed blocks' buffers and card experts, the \
+             kernels, the rope table, the host boundary, the slot map's copy",
+        )?;
+        let reserve = inputs
+            .prompt_batch_bytes(plan.machine)
+            .map_err(|e| GpuError::plan(WHAT, e))?;
+        refuse_reserve_past(
+            WHAT,
+            "prompt batch buffers",
+            reserve,
+            body.prompt_bytes() as u64,
+            "the rows and wide forms, the flash's partials, the units, the routed blocks' rows and card \
+             experts' batch",
         )?;
         // Last: the machine frees each layer's spare slots, and every piece above sized itself from the load's
         // map, capacity = live.
@@ -637,20 +701,29 @@ impl Body {
         self.stores.iter().map(Store::bytes).sum()
     }
 
-    /// Device bytes of the step's side of the card beside the stores and the weights: the step's buffers, the
-    /// routed blocks' buffers and card experts, the kernels' own, the rope table, the host boundary and the slot
-    /// map's copy. The term the plan sets aside as scratch and stage rows.
+    /// Device bytes of the step's side of the card beside the stores and the weights: the step's buffers,
+    /// the selection's block scores (they grow with the context), the routed blocks' buffers and card
+    /// experts, the kernels' own, the rope table, the host boundary and the slot map's copy. The term the
+    /// plan sets aside as scratch and stage rows.
     #[must_use]
     pub fn scratch_bytes(&self) -> usize {
         self.s.bytes()
-            + self.batch.bytes()
-            + self.units.bytes()
+            + self.batch.scores_bytes()
             + self.ffn.bytes()
-            + self.ffn.batch_bytes()
             + self.k.bytes()
             + self.rope.table.num_bytes()
             + self.shell.hybrid.boundary().device_bytes()
             + self.slots.buf().num_bytes()
+    }
+
+    /// Device bytes of the prompt batch's buffers beside the scratch term: the rows, the flash's partials
+    /// and the wide forms ([`Batch`](crate::prefill::Batch), the block scores apart), the units and the
+    /// routed blocks' rows and card experts' batch, a tiered load's copies of the tier places among them.
+    /// The plan keeps [`PlanInputs::prompt_reserve`] (and the tier reserve on a tiered machine) of the card
+    /// for them out of the expert budget, and the load holds their made bytes to it.
+    #[must_use]
+    pub fn prompt_bytes(&self) -> usize {
+        self.batch.bytes() - self.batch.scores_bytes() + self.units.bytes() + self.ffn.batch_bytes()
     }
 
     /// Every store's and buffer's bytes on the card, the armed taps included.
@@ -658,6 +731,7 @@ impl Body {
     pub fn bytes(&self) -> usize {
         self.store_bytes()
             + self.scratch_bytes()
+            + self.prompt_bytes()
             + self
                 .shell
                 .taps
@@ -701,7 +775,7 @@ pub fn set_taps(m: &mut MiniMaxM3Model, on: bool) -> Result<(), GpuError> {
 }
 
 /// Layer `l`'s routed experts' SwiGLU-OAI constants `(alpha, limit)`; any other activation is refused by name.
-fn routed_oai(spec: &models::ModelSpec, l: usize) -> Result<(f32, f32), GpuError> {
+pub(crate) fn routed_oai(spec: &models::ModelSpec, l: usize) -> Result<(f32, f32), GpuError> {
     match spec.layers.get(l).map(|s| &s.ffn) {
         Some(Ffn::Moe(m)) => match m.act {
             Act::SwigluOai { alpha, limit } => Ok((alpha, limit)),
@@ -716,7 +790,7 @@ fn routed_oai(spec: &models::ModelSpec, l: usize) -> Result<(f32, f32), GpuError
 }
 
 /// Layer `l`'s store and typed sites: the sites' types from the file, checked against the resident weights; the
-/// indexer's on a sparse layer.
+/// indexer's on a sparse-attention layer.
 fn store(
     gpu: &Gpu,
     file: &Split,
@@ -805,8 +879,9 @@ impl ChainBody for Body {
         crate::step::enqueue_step(gpu, w, self, input, head)
     }
 
-    /// The host tier settled and the stores empty by count. The planes keep their rows: a position is written
-    /// before a later one reads it.
+    /// The host tier settled and the live sequence's stores empty by count. The planes keep their rows: a
+    /// position is written before a later one reads it. A parked sequence keeps the written end it was exchanged
+    /// with.
     fn reset(&mut self, gpu: &Gpu) -> Result<(), GpuError> {
         self.shell.hybrid.settle(gpu.stream())?;
         self.at = 0;
@@ -865,4 +940,172 @@ impl Rollback for Body {
     fn rollback(&mut self, pos: u32) -> Result<(), GpuError> {
         self.cut(pos)
     }
+}
+
+/// One sequence's attention planes: every layer's K and V, and a sparse layer's index keys. The sites stay with
+/// the live store; they are the weights, one copy for every sequence.
+struct Planes {
+    /// `(kc, vc)` a layer, in layer order.
+    gqa: Vec<(DeviceTensor<u16>, DeviceTensor<u16>)>,
+    /// A sparse layer's index keys; `None` on a dense layer, in layer order.
+    keys: Vec<Option<DeviceBuffer<u16>>>,
+}
+
+/// One resident sequence ([`Slots`], what a select exchanges): its attention planes and the written end those
+/// planes may hold. The buffer handles and the written end move on a select, and each slot's captured steps keep
+/// addressing the planes that were live when they were captured.
+///
+/// The step walks one token and its MSA scratch is one row, so one pass of several slots is not this walk. It
+/// would run the row-wise launches once over every busy row, and each slot's sequence-bound launches (the index
+/// append, the score and the pick, the head append and the flash) once over that slot's rows and its own K/V and
+/// index-key planes. Several slots are a select and a step each.
+pub struct Seq {
+    planes: Planes,
+    /// The greatest position this sequence may have written. Parked with the planes so a cut after a swap still
+    /// measures from it. A new sequence has written nothing.
+    at: u32,
+}
+
+impl Slots for Body {
+    type Seq = Seq;
+
+    /// A sequence of the load's shape in the state the load leaves ([`ChainBody::reset`]'s contract): zeroed
+    /// planes of the live sequence's shape. Refused by name past the sequences the load's plan counts, and when
+    /// the card has fewer free bytes ([`Gpu::alloc_room`]) than the planes take. Load-time allocation.
+    fn new_seq(&mut self, gpu: &Gpu) -> Result<Seq, GpuError> {
+        if self.slots_made >= self.slots_planned {
+            return Err(shape(format!(
+                "sequence {} of a plan that counts {} resident sequences; plan the load for as many \
+                 as it serves (PlanInputs::plan_with_slots, Body::open_placed_slots)",
+                self.slots_made + 1,
+                self.slots_planned
+            )));
+        }
+        let need = self.store_bytes();
+        let free = gpu.alloc_room()?;
+        if need > free {
+            return Err(shape(format!(
+                "a sequence of {need} B of stores, and the card has {free} B free"
+            )));
+        }
+        let sparse: Vec<bool> = self.stores.iter().map(|s| s.index.is_some()).collect();
+        let planes = allocate_planes(gpu, &self.dims, &sparse)?;
+        // After the allocation, so a sequence whose planes are not the live shape is not counted and its
+        // buffers drop with this error.
+        planes_match(&self.stores, &planes)?;
+        self.slots_made += 1;
+        Ok(Seq { planes, at: 0 })
+    }
+
+    /// Exchange the live sequence's planes with `seq`'s: pointer moves, no device work. Nothing is in flight to
+    /// drain first: every call ends on a synchronized readback, and the host tier keeps no state of a sequence.
+    fn swap_seq(&mut self, _gpu: &Gpu, seq: &mut Seq) -> Result<(), GpuError> {
+        exchange_planes(&mut self.stores, &mut seq.planes)?;
+        std::mem::swap(&mut self.at, &mut seq.at);
+        Ok(())
+    }
+
+    /// Device bytes one sequence holds: its planes. The sites' weights are not among them.
+    fn seq_bytes(&self) -> usize {
+        self.store_bytes()
+    }
+}
+
+/// The plan's store bytes on `card` are `slots` sequences of `one` bytes. Refused by name otherwise. The detail
+/// names `{slots} resident sequences`, which is the refusal a one-sequence plan gives a load of two.
+fn refuse_store_count(
+    plan: &Plan<'_>,
+    card: usize,
+    one: u64,
+    slots: NonZeroUsize,
+) -> Result<(), GpuError> {
+    let want = one.saturating_mul(slots.get() as u64);
+    let counted = plan
+        .cards
+        .get(card)
+        .map(|t| t.kv_bytes)
+        .ok_or_else(|| shape(format!("the plan has no card {card}")))?;
+    if counted != want {
+        return Err(shape(format!(
+            "{slots} resident sequences: the plan counts {counted} store bytes on card {card}; a load \
+             of {slots} sequences of {} positions holds {want} (plan it with PlanInputs::plan_with_slots \
+             at the load's sequences)",
+            plan.ctx_max
+        )));
+    }
+    Ok(())
+}
+
+/// Zeroed planes of `dims`, one layer a `sparse` flag. The caller has checked the card's free bytes.
+fn allocate_planes(gpu: &Gpu, dims: &Dims, sparse: &[bool]) -> Result<Planes, GpuError> {
+    let stream = gpu.stream();
+    let mut gqa = Vec::with_capacity(sparse.len());
+    let mut keys = Vec::with_capacity(sparse.len());
+    for &is_sparse in sparse {
+        gqa.push((
+            DeviceTensor::zeroed(stream, dims.kv_heads * dims.ctx, HEAD)?,
+            DeviceTensor::zeroed(stream, dims.kv_heads * dims.ctx, HEAD)?,
+        ));
+        keys.push(if is_sparse {
+            Some(DeviceBuffer::zeroed(stream, dims.ctx * DIM)?)
+        } else {
+            None
+        });
+    }
+    Ok(Planes { gqa, keys })
+}
+
+/// `planes` are one sequence of `stores`: the same layers, the same K/V shape, the same indexer. Refused by name
+/// otherwise, before any exchange.
+fn planes_match(stores: &[Store], planes: &Planes) -> Result<(), GpuError> {
+    if planes.gqa.len() != stores.len() || planes.keys.len() != stores.len() {
+        return Err(shape(format!(
+            "a sequence of {} layers against the live {}",
+            planes.gqa.len(),
+            stores.len()
+        )));
+    }
+    for (i, store) in stores.iter().enumerate() {
+        let (kc, vc) = &planes.gqa[i];
+        if kc.rows() != store.gqa.kc.rows()
+            || kc.cols() != store.gqa.kc.cols()
+            || vc.rows() != store.gqa.vc.rows()
+            || vc.cols() != store.gqa.vc.cols()
+        {
+            return Err(shape(format!(
+                "layer {i}: a sequence's K/V planes are not the live layer's shape"
+            )));
+        }
+        match (&store.index, &planes.keys[i]) {
+            (None, None) => {}
+            (Some(live), Some(parked)) if live.keys.num_bytes() == parked.num_bytes() => {}
+            (Some(_), Some(_)) => {
+                return Err(shape(format!(
+                    "layer {i}: a sequence's index keys are not the live layer's length"
+                )));
+            }
+            _ => {
+                return Err(shape(format!(
+                    "layer {i}: a sequence's indexer is not the live layer's"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Exchange `stores`' planes with `planes`, after [`planes_match`]. A refusal moves nothing.
+fn exchange_planes(stores: &mut [Store], planes: &mut Planes) -> Result<(), GpuError> {
+    planes_match(stores, planes)?;
+    for (store, ((kc, vc), keys)) in stores
+        .iter_mut()
+        .zip(planes.gqa.iter_mut().zip(planes.keys.iter_mut()))
+    {
+        std::mem::swap(&mut store.gqa.kc, kc);
+        std::mem::swap(&mut store.gqa.vc, vc);
+        if let (Some(live), Some(parked)) = (store.index.as_mut(), keys.as_mut()) {
+            std::mem::swap(&mut live.keys, parked);
+        }
+    }
+    Ok(())
 }

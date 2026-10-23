@@ -61,15 +61,22 @@
 //! context where that is less, halved while the card cannot hold the stores
 //! and the resident bytes.
 //!
-//! The records on stderr, in order: `place unset` (word and why), one `ctx`
-//! line (`placement::ctx_ask::Chosen::line`), the `plan` record (its
-//! `ctx_max` the slot's), the `parallel` line (`rule=slots slots=1
-//! slot_ctx=C total=C from=<word> pass=one`); then the `load` record
-//! (architecture, resident bytes, the slot's context, slots, layers, the step
-//! graph's nodes and the load's wall) and, once the port is bound, the
-//! `listening` record (`record::BLOOMERY_SERVE_NEMOTRON`). `--plan` ends the
-//! process after the `parallel` line, nothing loaded. An engine error ends the
-//! process with the crash block and exit code 70, as every seat's.
+//! `--embd-model` is taken before this seat parses. The side model is seated
+//! before the plan, and the plan's stage card holds its bytes
+//! (`beside::reserve_on`, the reserve every seat counts). It loads after the
+//! chat model, and the server answers its embeddings routes from it.
+//!
+//! The records on stderr, in order: `place unset` (word and why), the
+//! `embedding_seat` record when one is named, one `ctx` line
+//! (`placement::ctx_ask::Chosen::line`, plus the stage card's reserve note
+//! when it holds the embedding model), the `plan` record (its `ctx_max` the
+//! slot's), the `parallel` line (`rule=slots slots=1 slot_ctx=C total=C
+//! from=<word> pass=one`); then the `load` record (architecture, resident
+//! bytes, the slot's context, slots, layers, the step graph's nodes and the
+//! load's wall) and, once the port is bound, the `listening` record
+//! (`record::BLOOMERY_SERVE_NEMOTRON`). `--plan` ends the process after the
+//! `parallel` line, nothing loaded. An engine error ends the process with the
+//! crash block and exit code 70, as every seat's.
 //!
 //! The levers this seat acts on ([`ACTS_ON`]) are parsed once, at `main`
 //! (`bloomery_levers::at_main`), which refuses by name a lever set outside
@@ -84,6 +91,7 @@ use std::time::Instant;
 use bloomery_gpu::host::served::prompt_pass;
 use bloomery_gpu::model::{ChainBody, StepMode};
 use bloomery_gpu::{Gpu, GpuError, GpuModel, NemotronHModel, NemotronHMoeModel};
+use bloomery_gpu_gates::beside::{self, Beside};
 use bloomery_gpu_gates::bind::{
     ChatSurface, Pass, Seat, SeatEngine, SeatFlags, Vocab, arm_screen, model_props, note_line,
     parallel_line, placement_of, slots_of,
@@ -91,6 +99,7 @@ use bloomery_gpu_gates::bind::{
 use bloomery_gpu_gates::generate::{Place, SEAT_STEPS, choose_ctx};
 use bloomery_gpu_gates::need;
 use bloomery_gpu_gates::record::{self, Record};
+use bloomery_gpu_gates::side_seat;
 use bloomery_gpu_gates::{GateError, gpu_census, ref_model_path};
 use bloomery_levers::HostCfg;
 use gguf::Split;
@@ -300,9 +309,9 @@ impl<B: ChainBody + 'static> Seat for Nemotron<B> {
     }
 }
 
-/// Loads the model and serves until the listener or the engine fails;
-/// `Ok` carries why the server ended.
-pub fn run(args: &[String]) -> Result<ServeError, GateError> {
+/// Loads the model, and the embedding model `side` names beside it, and serves until the listener
+/// or the engine fails; `Ok` carries why the server ended.
+pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateError> {
     let levers = bloomery_levers::at_main(ACTS_ON)?;
     record::at_main(NAME, record::BLOOMERY_SERVE_NEMOTRON);
     arm_screen(levers.screen());
@@ -353,15 +362,26 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let chosen = Place::choose_untiered(a.place, &census, "nemotron")?;
     chosen.record().eprint();
     let place = chosen.place;
+    // The side model's seat before the plan, which holds its bytes when it sits on the stage card.
+    let side = side.read()?;
+    let side_seat = side.as_ref().map(|s| s.seat(place)).transpose()?;
+    let held = Beside {
+        image: None,
+        embedding: side_seat.as_ref().and_then(|s| s.reserve),
+    };
     let layers = inputs.model.layers;
     // A Bolt file the card cannot hold whole at the least context a seat asks
     // loads placed: the plan keeps the experts the card's room holds and the
-    // host tier serves the rest. Everything else loads whole, as before.
-    let whole = place.machine_untiered()?(layers);
+    // host tier serves the rest. Everything else loads whole, as before. The
+    // probe and the placed machine both carry the side seat's reserve.
+    let mut whole = place.machine_untiered()?(layers);
+    beside::reserve_on(&mut whole, held);
     let placed =
         arch == Arch::NemotronHMoe && inputs.plan(&whole, SEAT_STEPS.floor, &plan_levers).is_err();
     let (machine, experts) = if placed {
-        (place.machine_placed()?(layers), Experts::Placed)
+        let mut machine = place.machine_placed()?(layers);
+        beside::reserve_on(&mut machine, held);
+        (machine, Experts::Placed)
     } else {
         (whole, Experts::Card)
     };
@@ -370,9 +390,9 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     // that binds are refused here by name, before any load.
     let asked = choose_ctx(&split, (a.ctx, slots), (None, None), |c| {
         probe_of(inputs.plan_with(&machine, c, &plan_levers, experts))
-            .map_err(|e| format!("--place {}: {e}", place.name()))
+            .map_err(|e| beside::refusal(held, format!("--place {}: {e}", place.name())))
     })?;
-    eprintln!("{}", asked.line());
+    eprintln!("{}{}", asked.line(), beside::note(&machine.cards[0]));
     let slot_ctx = usize::try_from(asked.slot_ctx)?;
     let plan = asked.plan;
     record::plan(place.name(), &machine, &plan).eprint();
@@ -460,7 +480,8 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         )?,
         _ => unreachable!("the arch check above refused every other architecture"),
     };
-    let server = a.bind(engine, chat, &path, slots, &levers, None)?;
+    let side = side_seat::Side::start(side.zip(side_seat))?;
+    let server = a.bind(engine, chat, &path, slots, &levers, side)?;
     Record::new(&record::LISTENING_NEMOTRON)
         .w("place", place.name())
         .u("ctx", slot_ctx)

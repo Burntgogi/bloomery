@@ -91,7 +91,8 @@ pub struct Shape {
     pub n_dense: usize,
     /// The latent-attention layers, in order.
     pub latent: Vec<usize>,
-    /// The routed layers whose down stack is Q6_K, which the card experts do not read.
+    /// The routed layers whose down stack is Q6_K, which the card's down arm runs like any
+    /// other 128-value down (`placement::kernels::card_down_runs`).
     pub q6k_down: Vec<usize>,
 }
 
@@ -289,7 +290,7 @@ pub fn plan_levers(levers: &bloomery_levers::Levers, extra: u64) -> Result<PlanL
     tier::budget_levers(
         Tier::from_env()?,
         facts().budget,
-        levers.card_budget_bytes(),
+        levers.card_budget(),
         extra,
     )
 }

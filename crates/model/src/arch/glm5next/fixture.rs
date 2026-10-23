@@ -12,7 +12,7 @@
 //! | f2 | L4 | KDA | routed, Q4_K gate·up, Q5_K down (card-eligible) | a routed KDA layer after the prefix |
 //! | f3 | L7 | latent | routed, as f2 | the latent mixer with its indexer and pools; index 3 as the real file's first latent layer |
 //! | f4 | L8 | KDA | routed, as f2 | the KDA layer after a latent one |
-//! | f5 | L11 | latent | routed, Q5_K gate·up, Q6_K down (host-only) | the only source layer with Q5_K gate·up, and a Q6_K down, which `accepts::routed_rule` does not run on the card: the layer keeps all its experts on the host |
+//! | f5 | L11 | latent | routed, Q5_K gate·up, Q6_K down (card-eligible) | the only source layer with Q5_K gate·up, and a Q6_K down: the plan's rule is per role, so the down's arm runs it beside the gate·up its own arm runs and the layer is card-eligible as f2 |
 //! | f6 | L45 | latent, NextN | routed, as f2 | the NextN layer, which must be the last: the file's `nextn_predict_layers` is believed only while the last layer carries `nextn.eh_proj` |
 //!
 //! What it keeps: every (role, type) pair of the source's routed stacks (gate
@@ -36,7 +36,7 @@
 //!
 //! The card budget ([`Budget`]) is planned, not fixed: under it the plan of the
 //! written file with its NextN layer, at the e2e gate's context, holds half
-//! of the experts, 144 of 288, on every card-eligible layer (f2 to f4).
+//! of the experts, 144 of 288, on every card-eligible layer (f2 to f5).
 
 use gguf::{Split, Value};
 
@@ -245,7 +245,7 @@ fn card_experts(split: &Split, budget: Option<u64>) -> Result<CardExperts, Fixtu
     let nextn = NextnInputs::read(&inputs)?;
     let machine = workstation::plan_gate(inputs.model.layers);
     let levers = PlanLevers {
-        card_budget_bytes: budget,
+        card_budget_bytes: budget.into(),
     };
     let plan = inputs
         .plan_nextn(&machine, BUDGET_CTX, &levers, &nextn)

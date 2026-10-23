@@ -34,7 +34,7 @@ mod gate {
             &machine,
             CTX,
             &PlanLevers {
-                card_budget_bytes: Some(budget),
+                card_budget_bytes: Some(budget).into(),
             },
             &[half, inputs.model.experts - half],
         )?;

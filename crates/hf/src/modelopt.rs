@@ -21,6 +21,14 @@
 //! block's decode refuses it, rather than stripped of bit 7. `<stem>.input_scale`, the activation
 //! scale ModelOpt calibrates for 4-bit activations, has no place in the block; the reader leaves it.
 //!
+//! compressed-tensors' `nvfp4-pack-quantized` ([`Format::Nvfp4Ct`]) stores the same codes and block
+//! scales as `<stem>.weight_packed` and `<stem>.weight_scale` and a `<stem>.weight_global_scale` `g`
+//! that is a divisor: the tensor scale is `1 / g` in f32, where ModelOpt's `weight_scale_2` is the
+//! multiplier itself. Past that one value it is read as ModelOpt's NVFP4 is, so every reader of the
+//! normalized tensor is the same. Its `<stem>.input_global_scale`, the scale of a 4-bit activation,
+//! is read and refused unless one finite positive F32, and then unused: activations are quantized
+//! to 8 bits here.
+//!
 //! MLX's affine quantization stores a weight `<stem>.weight` as U32 words holding `bits`-bit codes
 //! along the last dim, with `<stem>.scales` and `<stem>.biases`, BF16 `[.., k/64]`, one pair a
 //! group of 64 values; a value is `scale · code + bias`. A routed stack is one tensor whose first
@@ -33,7 +41,7 @@ use std::ops::Range;
 
 use gguf::quant::{
     E4m3Rows, GgmlType, Nvfp4Rows, Q8Block, QuantError, check_fp8_b128, check_mlx_affine,
-    check_mxfp8, e8m0_to_f32_half, fp4_pair, ue4m3_to_f32_half,
+    check_mxfp8, e8m0_to_f32_half, fp4_pair, nvfp4_group_to_block, ue4m3_to_f32_half,
 };
 
 use crate::csf;
@@ -115,6 +123,7 @@ pub struct Normal {
 /// |---|---|---|
 /// | NVFP4 (ModelOpt) | NVFP4 (40), `.scale` a tensor or an expert (`linear`, `experts`) | [`GgmlType::NVFP4_ROWS`], `.scale` the table's |
 /// | NVFP4 with `csf` or `csf_32x2_v1` scales | as NVFP4, the scales decoded first ([`csf`]) | none |
+/// | NVFP4 compressed-tensors | as NVFP4, `.scale` the reciprocal of `weight_global_scale` | as NVFP4 |
 /// | F8_E4M3 with one scale a block (MXFP8's E8M0 a 32 values, an FP8 block format's), a row or the tensor | the card type the format is held in ([`Format::card_type`]): [`GgmlType::FP8_B128`] or [`GgmlType::MXFP8`], values as stored, each row block the scale of the checkpoint's block it lies in (`fp8`) | none |
 /// | MLX affine, 4 or 8 bits, groups of 64 | the card type the format is held in: [`GgmlType::MLX_A4`] or [`GgmlType::MLX_A8`], each group's words, scale and bias as stored, a stack one tensor `[k, rows, n_expert]` (`mlx_affine`) | none |
 /// | BF16, F32 | Q8_0, F32 or BF16 as [`Plain`] says | none |
@@ -124,10 +133,11 @@ pub struct Normal {
 #[must_use]
 pub fn type_of(format: Format, role: Use) -> Option<u32> {
     match (format, role) {
-        (Format::Nvfp4 | Format::Nvfp4Csf | Format::Nvfp4Csf32, Use::Matrix(_)) => {
-            Some(GgmlType::NVFP4.as_u32())
-        }
-        (Format::Nvfp4, Use::Rows) => Some(GgmlType::NVFP4_ROWS.as_u32()),
+        (
+            Format::Nvfp4 | Format::Nvfp4Csf | Format::Nvfp4Csf32 | Format::Nvfp4Ct,
+            Use::Matrix(_),
+        ) => Some(GgmlType::NVFP4.as_u32()),
+        (Format::Nvfp4 | Format::Nvfp4Ct, Use::Rows) => Some(GgmlType::NVFP4_ROWS.as_u32()),
         (
             Format::Mxfp8
             | Format::Fp8Block { .. }
@@ -225,7 +235,7 @@ pub fn normalize<'a>(
     let type_id = type_of(format, role)
         .ok_or_else(|| refuse(format!("read as {role:?} has no GGUF type here")))?;
     let encoding = match format {
-        Format::Nvfp4 => None,
+        Format::Nvfp4 | Format::Nvfp4Ct => None,
         Format::Nvfp4Csf => Some(csf::Encoding::Csf),
         Format::Nvfp4Csf32 => Some(csf::Encoding::Csf32),
         Format::MlxAffine { .. } => {
@@ -549,7 +559,7 @@ fn scale_grid<'a>(
                 .ok_or_else(|| refuse(first, "is not a part of a compressed block scale".into()))?;
             return Ok(Some(grid(stem.to_string(), dims, 1, [1, 16])));
         }
-        Format::Nvfp4 => {
+        Format::Nvfp4 | Format::Nvfp4Ct => {
             let Some((first, dims)) = two_d()? else {
                 return Ok(None);
             };
@@ -673,14 +683,112 @@ fn nvfp4<'a>(
     })
 }
 
-/// The tensor scale and block-scale name of plain NVFP4 rows. Checks the
-/// code and scale planes' shapes and byte counts without copying either.
+/// The names of the scales a plain NVFP4 weight's place lists, in the order its format reads them.
+struct Scales<'p> {
+    block: &'p str,
+    tensor: &'p str,
+    /// compressed-tensors' `input_global_scale`, when the place lists one.
+    input: Option<&'p str>,
+}
+
+/// The scales `placed` lists for `weight`: a block scale and a tensor scale, and for
+/// [`Format::Nvfp4Ct`] an input scale after them.
+fn scales_of<'p>(weight: &str, placed: &'p Placed) -> Result<Scales<'p>, Error> {
+    match placed.companions.as_slice() {
+        [block, tensor] => Ok(Scales {
+            block,
+            tensor,
+            input: None,
+        }),
+        [block, tensor, input] if placed.format == Format::Nvfp4Ct => Ok(Scales {
+            block,
+            tensor,
+            input: Some(input),
+        }),
+        names => Err(Error::Shape {
+            name: weight.to_string(),
+            what: format!("its place names {names:?}, not a block scale and a tensor scale"),
+        }),
+    }
+}
+
+/// The multiplier GGUF keeps beside an NVFP4 weight, from the tensor scale `stored` under `name`:
+/// ModelOpt's `weight_scale_2` as it is, compressed-tensors' `weight_global_scale`, a divisor, as
+/// its reciprocal, refused unless positive with a finite reciprocal.
+fn multiplier(format: Format, weight: &str, name: &str, stored: f32) -> Result<f32, Error> {
+    if format != Format::Nvfp4Ct {
+        return Ok(stored);
+    }
+    let scale = 1.0 / stored;
+    if stored > 0.0 && scale.is_finite() {
+        return Ok(scale);
+    }
+    Err(Error::Format {
+        name: weight.to_string(),
+        format,
+        what: format!(
+            "weight_global_scale {name} is {stored}, not a positive divisor with a finite reciprocal"
+        ),
+    })
+}
+
+/// The `input_global_scale` `name` of the compressed-tensors NVFP4 `weight`: one F32, finite and
+/// positive, or refused by name. The value is not used.
+fn input_scale<'a>(
+    get: &impl Fn(&str) -> Result<Raw<'a>, safetensors::Error>,
+    weight: &str,
+    format: Format,
+    name: &str,
+) -> Result<f32, Error> {
+    let t = get(name)?;
+    let refuse = |what: String| Error::Format {
+        name: weight.to_string(),
+        format,
+        what,
+    };
+    let (Dtype::F32, &[a, b, c, d]) = (t.dtype, t.bytes) else {
+        return Err(refuse(format!(
+            "input scale {name} is {} {:?}, not one F32",
+            t.dtype.name(),
+            t.shape
+        )));
+    };
+    let scale = f32::from_le_bytes([a, b, c, d]);
+    if !(scale.is_finite() && scale > 0.0) {
+        return Err(refuse(format!(
+            "input scale {name} is {scale}, not a finite positive F32"
+        )));
+    }
+    Ok(scale)
+}
+
+/// The checked input scale of the compressed-tensors NVFP4 `weight` placed as `placed`, or `None`
+/// when its place lists none (ModelOpt's NVFP4 keeps its `input_scale` out of the place).
+///
+/// # Errors
+///
+/// A place that does not list the weight's scales, a tensor `get` refuses or lacks, and an input
+/// scale that is not one finite positive F32, each by name.
+pub fn input_global_scale<'a>(
+    get: &impl Fn(&str) -> Result<Raw<'a>, safetensors::Error>,
+    weight: &str,
+    placed: &Placed,
+) -> Result<Option<f32>, Error> {
+    scales_of(weight, placed)?
+        .input
+        .map(|name| input_scale(get, weight, placed.format, name))
+        .transpose()
+}
+
+/// The tensor scale (the multiplier of [`multiplier`]) and block-scale name of plain NVFP4 rows.
+/// Checks the code and scale planes' shapes and byte counts without copying either, and a
+/// compressed-tensors weight's input scale.
 pub fn nvfp4_rows_scale<'a, 'p>(
     get: &impl Fn(&str) -> Result<Raw<'a>, safetensors::Error>,
     weight: &str,
     placed: &'p Placed,
 ) -> Result<(f32, &'p str), Error> {
-    if placed.format != Format::Nvfp4 {
+    if !matches!(placed.format, Format::Nvfp4 | Format::Nvfp4Ct) {
         return Err(Error::Format {
             name: weight.to_string(),
             format: placed.format,
@@ -689,15 +797,11 @@ pub fn nvfp4_rows_scale<'a, 'p>(
     }
     let shape = |name: String, what: String| Error::Shape { name, what };
     let wname = weight.to_string();
-    let [sname, tname] = placed.companions.as_slice() else {
-        return Err(shape(
-            wname,
-            format!(
-                "its place names {:?}, not a block scale and a tensor scale",
-                placed.companions
-            ),
-        ));
-    };
+    let Scales {
+        block: sname,
+        tensor: tname,
+        input,
+    } = scales_of(weight, placed)?;
     let (w, s) = (get(&wname)?, get(sname)?);
     let &[rows, half] = w.shape else {
         return Err(shape(
@@ -729,7 +833,7 @@ pub fn nvfp4_rows_scale<'a, 'p>(
     }
     if s.dtype != Dtype::F8E4M3 || s.shape != [rows, half / 8] || s.bytes.len() != size / 8 {
         return Err(shape(
-            sname.clone(),
+            sname.to_string(),
             format!(
                 "{} {:?}; the groups are F8_E4M3 [{rows}, {}]",
                 s.dtype.name(),
@@ -743,16 +847,20 @@ pub fn nvfp4_rows_scale<'a, 'p>(
         (Dtype::F32, &[a, b, c, d]) => f32::from_le_bytes([a, b, c, d]),
         _ => {
             return Err(shape(
-                tname.clone(),
+                tname.to_string(),
                 format!("{} {:?}, not one F32", t.dtype.name(), t.shape),
             ));
         }
     };
     if !scale.is_finite() {
         return Err(shape(
-            tname.clone(),
+            tname.to_string(),
             format!("tensor scale {scale} is not finite"),
         ));
+    }
+    let scale = multiplier(placed.format, weight, tname, scale)?;
+    if let Some(input) = input {
+        input_scale(get, weight, placed.format, input)?;
     }
     Ok((scale, sname))
 }
@@ -1147,15 +1255,7 @@ fn append<'a>(
     (weight, placed): (&str, &Placed),
     out: &mut Nvfp4,
 ) -> Result<[usize; 2], Error> {
-    let [block_scale, tensor_scale] = placed.companions.as_slice() else {
-        return Err(Error::Shape {
-            name: weight.to_string(),
-            what: format!(
-                "its place names {:?}, not a block scale and a tensor scale",
-                placed.companions
-            ),
-        });
-    };
+    let scales = scales_of(weight, placed)?;
     let typed = |name: &str, want: Dtype| -> Result<(String, Raw<'a>), Error> {
         let unfilled = |name: &str, what| Error::Shape {
             name: name.to_string(),
@@ -1183,7 +1283,7 @@ fn append<'a>(
             format!("k = {k}, not a positive multiple of the 64 values of a block"),
         ));
     }
-    let (sname, s) = typed(block_scale, Dtype::F8E4M3)?;
+    let (sname, s) = typed(scales.block, Dtype::F8E4M3)?;
     if s.shape != [rows, k / 16] {
         return Err(shape(
             &sname,
@@ -1194,11 +1294,15 @@ fn append<'a>(
             ),
         ));
     }
-    let (tname, t) = typed(tensor_scale, Dtype::F32)?;
+    let (tname, t) = typed(scales.tensor, Dtype::F32)?;
     let scale = <[u8; 4]>::try_from(t.bytes)
         .map(f32::from_le_bytes)
         .map_err(|_| shape(&tname, format!("shape {:?}, not one value", t.shape)))?;
     finite(&tname, &t)?;
+    let scale = multiplier(placed.format, weight, &tname, scale)?;
+    if let Some(input) = scales.input {
+        input_scale(get, weight, placed.format, input)?;
+    }
 
     let bytes = rows
         .checked_mul(k / 64)
@@ -1244,12 +1348,7 @@ fn append<'a>(
             }
             out.blocks.extend_from_slice(d);
             for g in w.as_chunks::<8>().0 {
-                // Value j is the (j % 2) nibble of byte j / 2; the block's byte j holds value j
-                // low and value j + 8 high.
-                out.blocks.extend((0..8).map(|j| {
-                    let nib = |b: u8| (b >> (4 * (j % 2))) & 0x0f;
-                    nib(g[j / 2]) | nib(g[4 + j / 2]) << 4
-                }));
+                out.blocks.extend(nvfp4_group_to_block(g));
             }
         }
     }
@@ -2573,6 +2672,7 @@ mod tests {
             Format::Nvfp4,
             Format::Nvfp4Csf,
             Format::Nvfp4Csf32,
+            Format::Nvfp4Ct,
             Format::Mxfp8,
             Format::Fp8Block {
                 rows: 128,
@@ -3253,5 +3353,302 @@ mod tests {
             e.contains("m.scales") && e.contains("groups are [2, 2, 2]"),
             "{e}"
         );
+    }
+
+    /// One `weight_global_scale` an expert, in the range the real file holds.
+    const GLOBALS: [f32; 4] = [8548.7, 16887.3, 4248.1, 18229.9];
+
+    /// The codes and valid UE4M3 scale bytes of expert `e`, `rows` by `k` values.
+    fn expert_bytes(e: usize, rows: usize, k: usize) -> (Vec<u8>, Vec<u8>) {
+        let codes = (0..rows * k / 2)
+            .map(|i| (i * 131 % 251 + e * 71) as u8)
+            .collect();
+        let scales = (0..rows * k / 16)
+            .map(|i| ((i * 29 + e * 13) % 126) as u8)
+            .collect();
+        (codes, scales)
+    }
+
+    /// A safetensors file of the tensors `list`.
+    fn file(list: Vec<(String, &str, Vec<usize>, Vec<u8>)>) -> Safetensors {
+        let refs: Vec<(&str, &str, &[usize], &[u8])> = list
+            .iter()
+            .map(|(n, d, s, b)| (n.as_str(), *d, s.as_slice(), b.as_slice()))
+            .collect();
+        Safetensors::parse(write(&refs)).unwrap()
+    }
+
+    /// The compressed-tensors tensors of the experts `c.<e>` of [`GLOBALS`] and the ModelOpt
+    /// tensors `m.<e>` that store the same codes and block scales with `weight_scale_2` the f32
+    /// reciprocal of the expert's global scale.
+    fn twins(rows: usize, k: usize) -> (Safetensors, Safetensors) {
+        let (mut ct, mut mo) = (vec![], vec![]);
+        for (e, g) in GLOBALS.iter().enumerate() {
+            let (codes, scales) = expert_bytes(e, rows, k);
+            let (w, s) = (vec![rows, k / 2], vec![rows, k / 16]);
+            ct.extend([
+                (
+                    format!("c.{e}.weight_packed"),
+                    "U8",
+                    w.clone(),
+                    codes.clone(),
+                ),
+                (
+                    format!("c.{e}.weight_scale"),
+                    "F8_E4M3",
+                    s.clone(),
+                    scales.clone(),
+                ),
+                (
+                    format!("c.{e}.weight_global_scale"),
+                    "F32",
+                    vec![],
+                    g.to_le_bytes().to_vec(),
+                ),
+                (
+                    format!("c.{e}.input_global_scale"),
+                    "F32",
+                    vec![],
+                    1.0f32.to_le_bytes().to_vec(),
+                ),
+            ]);
+            mo.extend([
+                (format!("m.{e}.weight"), "U8", w, codes),
+                (format!("m.{e}.weight_scale"), "F8_E4M3", s, scales),
+                (
+                    format!("m.{e}.weight_scale_2"),
+                    "F32",
+                    vec![],
+                    (1.0f32 / g).to_le_bytes().to_vec(),
+                ),
+            ]);
+        }
+        (file(ct), file(mo))
+    }
+
+    /// The place of the compressed-tensors weight `stem`: its block scale, global scale and
+    /// input scale.
+    fn ct_own(stem: &str) -> (String, Placed) {
+        let companions = ["weight_scale", "weight_global_scale", "input_global_scale"]
+            .map(|s| format!("{stem}.{s}"));
+        (
+            format!("{stem}.weight_packed"),
+            Placed {
+                format: Format::Nvfp4Ct,
+                companions: companions.to_vec(),
+            },
+        )
+    }
+
+    /// Compressed-tensors NVFP4 experts normalize to what ModelOpt's NVFP4 of the same codes and
+    /// block scales gives with `weight_scale_2 = 1 / g`, bit for bit: a linear and a stack as
+    /// matrices, a linear as a row table, and a cut of each by rows and by experts; each
+    /// expert's `.scale` is the f32 reciprocal of its own global scale, and every decoded value
+    /// is the stored code and block scale divided by the global scale.
+    ///
+    /// FAIL-first: a `.scale` of `g` instead of `1 / g`, or of the first expert's `1 / g` for
+    /// every expert, differs in the `.scale` and the decoded values.
+    #[test]
+    fn compressed_tensors_nvfp4_normalizes_to_the_modelopt_form_with_the_reciprocal_scale() {
+        let (rows, k) = (3, 128);
+        let (ct, mo) = twins(rows, k);
+        let n = GLOBALS.len();
+        let ct_owned: Vec<_> = (0..n).map(|e| ct_own(&format!("c.{e}"))).collect();
+        let mo_owned: Vec<_> = (0..n).map(|e| own(&format!("m.{e}"))).collect();
+        let (cs, ms) = (sources(&ct_owned), sources(&mo_owned));
+        let m = Use::Matrix(Plain::Q8_0);
+        let same = |role, c: &[(&str, &Placed)], m: &[(&str, &Placed)]| {
+            let a = normalize(|x| ct.raw(x), c, role).unwrap();
+            let b = normalize(|x| mo.raw(x), m, role).unwrap();
+            assert_eq!(a, b, "{role:?} {:?}", c[0].0);
+            a
+        };
+        let stack = same(m, &cs, &ms);
+        assert_eq!(stack.type_id, GgmlType::NVFP4.as_u32());
+        assert_eq!(stack.dims, [k as u64, rows as u64, n as u64]);
+        for e in 0..n {
+            let one = same(m, &cs[e..=e], &ms[e..=e]);
+            assert_eq!(one.dims, [k as u64, rows as u64]);
+            let rows_of = same(Use::Rows, &cs[e..=e], &ms[e..=e]);
+            assert_eq!(rows_of.type_id, GgmlType::NVFP4_ROWS.as_u32());
+            assert_eq!(rows_of.scale, one.scale);
+            let (scale, name) = nvfp4_rows_scale(&|x| ct.raw(x), cs[e].0, cs[e].1).unwrap();
+            assert_eq!(
+                (scale, name),
+                (one.scale[0], ct_owned[e].1.companions[0].as_str())
+            );
+        }
+        let per = stack.bytes.len() / n;
+        for (e, g) in GLOBALS.iter().enumerate() {
+            assert_eq!(
+                stack.scale[e].to_bits(),
+                (1.0f32 / g).to_bits(),
+                "expert {e}"
+            );
+            let (codes, scales) = expert_bytes(e, rows, k);
+            let blocks = &stack.bytes[e * per..][..per];
+            for (r, row) in blocks.chunks_exact(k / 64 * 36).enumerate() {
+                let mut v = vec![0.0f32; k];
+                dequant_row(GgmlType::NVFP4, row, &mut v).unwrap();
+                for (i, got) in v.iter().enumerate() {
+                    // Value `i` is the low nibble of its pair's byte when `i` is even.
+                    let byte = codes[r * k / 2 + i / 2];
+                    let code = if i % 2 == 0 { byte & 0x0f } else { byte >> 4 };
+                    let doubled = fp4_pair(code)[0];
+                    let half = ue4m3_to_f32_half(scales[r * k / 16 + i / 16]).unwrap();
+                    let want = f64::from(doubled) * f64::from(half) / f64::from(*g);
+                    let got = f64::from(*got * stack.scale[e]);
+                    assert!(
+                        (got - want).abs() <= want.abs() * 3e-7,
+                        "expert {e} row {r} value {i}: {got} against {want}"
+                    );
+                }
+            }
+        }
+        let dims = [k as u64, rows as u64];
+        for (role, part) in [(m, (1, 1..3)), (m, (0, 0..64))] {
+            let c = normalize_part(|x| ct.raw(x), &cs[..1], role, &dims, part.clone()).unwrap();
+            let o = normalize_part(|x| mo.raw(x), &ms[..1], role, &dims, part.clone()).unwrap();
+            assert_eq!(c, o, "{part:?}");
+        }
+        let dims = [k as u64, rows as u64, n as u64];
+        let c = normalize_part(|x| ct.raw(x), &cs, m, &dims, (2, 1..3)).unwrap();
+        let o = normalize_part(|x| mo.raw(x), &ms, m, &dims, (2, 1..3)).unwrap();
+        assert_eq!(c, o);
+        assert_eq!(c.scale.len(), 2);
+    }
+
+    /// A one-row compressed-tensors weight of `k` values beside the given global and input scales,
+    /// each as `(dtype, shape, bytes)`, its place naming both.
+    fn ct_triple(
+        k: usize,
+        global: (&str, &[usize], &[u8]),
+        input: (&str, &[usize], &[u8]),
+    ) -> (Safetensors, (String, Placed)) {
+        let (codes, scales) = expert_bytes(0, 1, k);
+        let st = file(vec![
+            ("t.weight_packed".into(), "U8", vec![1, k / 2], codes),
+            ("t.weight_scale".into(), "F8_E4M3", vec![1, k / 16], scales),
+            (
+                "t.weight_global_scale".into(),
+                global.0,
+                global.1.to_vec(),
+                global.2.to_vec(),
+            ),
+            (
+                "t.input_global_scale".into(),
+                input.0,
+                input.1.to_vec(),
+                input.2.to_vec(),
+            ),
+        ]);
+        (st, ct_own("t"))
+    }
+
+    /// A global scale that is no positive divisor, and an input scale that is no finite positive
+    /// F32, are refused by name by every reader of the weight: the normalize of a matrix, a stack
+    /// and a row table, the rows' scale and [`input_global_scale`]; any other positive value of
+    /// the input scale is accepted and changes nothing.
+    ///
+    /// FAIL-first: reading the global scale as a multiplier accepts 0 and negative ones;
+    /// dropping the input scale's check accepts NaN, 0 and negative ones.
+    #[test]
+    fn compressed_tensors_scalars_that_are_no_scale_are_refused_by_name() {
+        let one = 1.0f32.to_le_bytes();
+        let f32_scalar = |v: f32| ("F32", &[][..], v.to_le_bytes().to_vec());
+        let build = |global: f32, input: f32| {
+            let (g, i) = (f32_scalar(global), f32_scalar(input));
+            ct_triple(64, (g.0, g.1, &g.2), (i.0, i.1, &i.2))
+        };
+        let readers = |st: &Safetensors, w: &(String, Placed)| {
+            let get = |n: &str| st.raw(n);
+            let src = [(w.0.as_str(), &w.1)];
+            let m = Use::Matrix(Plain::Q8_0);
+            vec![
+                normalize(get, &src, m).map(|_| ()),
+                normalize(get, &[src[0], src[0]], m).map(|_| ()),
+                normalize(get, &src, Use::Rows).map(|_| ()),
+                nvfp4_rows_scale(&get, src[0].0, src[0].1).map(|_| ()),
+                input_global_scale(&get, src[0].0, src[0].1).map(|_| ()),
+            ]
+        };
+        let (st, w) = build(2.0, 1.0);
+        for r in readers(&st, &w) {
+            r.unwrap();
+        }
+        let get = |n: &str| st.raw(n);
+        assert_eq!(input_global_scale(&get, &w.0, &w.1).unwrap(), Some(1.0));
+        let (mo, mown) = (fixture(), own(STEMS[0]));
+        assert_eq!(
+            input_global_scale(&|n| mo.raw(n), &mown.0, &mown.1).unwrap(),
+            None
+        );
+
+        let base = normalize(get, &[(&w.0, &w.1)], Use::Matrix(Plain::Q8_0)).unwrap();
+        for input in [0.25f32, 1e-30, 1e30] {
+            let (st, w) = build(2.0, input);
+            let n = normalize(|n| st.raw(n), &[(&w.0, &w.1)], Use::Matrix(Plain::Q8_0)).unwrap();
+            assert_eq!(n, base, "input scale {input}");
+        }
+        for (input, shown) in [
+            (f32::NAN, "NaN"),
+            (f32::INFINITY, "inf"),
+            (f32::NEG_INFINITY, "-inf"),
+            (0.0, "0"),
+            (-0.0, "-0"),
+            (-1.0, "-1"),
+        ] {
+            let (st, w) = build(2.0, input);
+            let want =
+                format!("input scale t.input_global_scale is {shown}, not a finite positive F32");
+            for e in readers(&st, &w) {
+                let e = e.unwrap_err().to_string();
+                assert!(
+                    e.starts_with("t.weight_packed: NVFP4-compressed-tensors input scale"),
+                    "{e}"
+                );
+                assert!(e.contains(&want), "{e}");
+            }
+        }
+        let bf16 = [0x80u8, 0x3f];
+        let two_values = [one, one].concat();
+        for (dtype, shape, bytes, want) in [
+            ("BF16", &[][..], &bf16[..], "is BF16 [], not one F32"),
+            ("F32", &[2][..], &two_values[..], "is F32 [2], not one F32"),
+        ] {
+            let (g, i) = (f32_scalar(2.0), (dtype, shape, bytes));
+            let (st, w) = ct_triple(64, (g.0, g.1, &g.2), i);
+            for e in readers(&st, &w) {
+                let e = e.unwrap_err().to_string();
+                assert!(
+                    e.contains("t.input_global_scale") && e.contains(want),
+                    "{e}"
+                );
+            }
+        }
+        for (global, shown, shape_error) in [
+            (f32::NAN, "NaN", true),
+            (f32::INFINITY, "inf", true),
+            (0.0, "0", false),
+            (-0.0, "-0", false),
+            (-2.0, "-2", false),
+            (
+                1e-45,
+                "0.000000000000000000000000000000000000000000001",
+                false,
+            ),
+        ] {
+            let (st, w) = build(global, 1.0);
+            for e in readers(&st, &w).into_iter().take(4) {
+                let e = e.unwrap_err().to_string();
+                assert!(e.contains("t.weight_global_scale"), "{e}");
+                if !shape_error {
+                    assert!(
+                        e.contains(&format!("weight_global_scale t.weight_global_scale is {shown}, not a positive divisor with a finite reciprocal")),
+                        "{e}"
+                    );
+                }
+            }
+        }
     }
 }

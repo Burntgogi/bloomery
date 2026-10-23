@@ -7,6 +7,11 @@
 //! the recipe gives (both cards in view, `BLOOMERY_CARD=both`):
 //!
 //! - `refusals_before_any_load`'s `--place bp` half needs two visible cards.
+//!
+//! The seat's unset `--place` runs plan (b′) on a census of two cards (the
+//! plan's tier holds past the seat's break-even, `TIER_RULE`) and `a` on one
+//! ([`unset_place`]); the parent's clauses that leave `--place` unset hold
+//! the placement it runs on the census they see.
 //! - `server_ids_are_the_session_ids` and `ids_see_an_id_short` need one: the
 //!   session opens on the gate card (`shared/gate_card.rs`).
 //!
@@ -49,7 +54,8 @@
 //!   no host halved it. Under a room halfway between the host need of the
 //!   rung below the default and of the default (two plans made here at
 //!   `PLAN_ROOM`, `HostNeed::of`) the line is `ctx rule=halved` at that rung,
-//!   `host-short`, and the plan's `ctx_max` is that rung: the body serves no
+//!   `host-short`, and the plan's `ctx_max` is that rung (the host needs are
+//!   those of the placement the unset flag runs, [`unset_place`]): the body serves no
 //!   NVMe tier (`PlaceError::NoNvmeTier`), and a shorter context keeps more
 //!   experts on the card. Under a room a GiB under the floor's need the
 //!   process exits non-zero within [`REFUSE_WITHIN`] with the words of
@@ -68,7 +74,8 @@
 //!   `BLOOMERY_RESIDENCY=off` it prints `off` with why `set` and no pool
 //!   record.
 //! - `plan_only_names_its_default`: `--plan` with no `--place`, `--ctx` or
-//!   `--parallel` exits 0 and prints `place unset` (the word `a`), the plan
+//!   `--parallel` exits 0 and prints `place unset` (the word of
+//!   [`unset_place`]: `bp` on two cards, `a` on one), the plan
 //!   record and the `parallel` line, in that order, and no `load` or
 //!   `listening` record. The `parallel` line is the default's one slot:
 //!   `slots=1 slot_ctx=<ctx_max> total=<ctx_max> from=default pass=one`. The
@@ -84,12 +91,14 @@
 //! - `refusals_before_any_load`: `--ctx 1 --parallel 2` — a split that
 //!   leaves a slot no position — exits non-zero within [`REFUSE_WITHIN`],
 //!   its stderr names the split and no `load` record is printed. On a
-//!   census of two cards, `--place bp` exits non-zero the same way, its stderr
-//!   holding the text of `PlaceError::Tier` for the tier card the placement
-//!   names ([`tier_refusal`]); on one card the `bp` half is a
-//!   `deferred(two cards)` line. FAIL-first: a seat that takes a slot of no
-//!   position is still running at the bound and the clause is red; a tier
-//!   refusal that names another card or tier is red.
+//!   census of two cards, `--place bp --parallel 2` exits non-zero the same
+//!   way, its stderr holding the seat's refusal of a tier card beside several
+//!   sequences ([`tier_slots_refusal`]: the body serves its tier beside one);
+//!   on one card the `bp` half is a `deferred(two cards)` line. FAIL-first: a
+//!   seat that takes a slot of no position is still running at the bound and
+//!   the clause is red; a seat that leaves the refusal to the body plans and
+//!   opens the load, whose refusal names no `--place`, and the clause is
+//!   red.
 //! - `slots_total_is_planned`: the plan counts every slot's positions. At
 //!   the one-slot default context `c` (`--parallel 1 --plan`), `--parallel 2
 //!   --ctx c --plan` exits 0 and its `parallel` line splits it (`slots=2
@@ -177,11 +186,13 @@
 //!   holds a pass's buffers and the card experts' buffers of two rows, which
 //!   the plan's fixed scratch term covers and a load of one sequence does not
 //!   allocate.
-//!   Two rounds, each of two requests in flight together at
-//!   `cache_prompt: false` — the batch prompt with the prose prompt, then the
-//!   prose prompt with the batch prompt started first — answer each prompt's
-//!   ids bit for bit as the one-slot server answered them, the two requests
-//!   of a round on different slots (`id_slot`), and the server's
+//!   Three rounds, each of two requests posted at once at
+//!   `cache_prompt: false` (the second is admitted while the first holds its
+//!   slot, on a body of any speed) — the batch prompt with the prose prompt,
+//!   the prose prompt with the batch prompt, the chat prompt with the prose
+//!   prompt — answer each prompt's ids bit for bit as the one-slot server
+//!   answered them, the two requests of a round on different slots
+//!   (`id_slot`), and the server's
 //!   `swaps_total` is 0 or absent (the slots are resident, no state is
 //!   parked). The one-slot server's ids are the session's
 //!   (`server_ids_are_the_session_ids`), so this is the session's ids by
@@ -191,14 +202,27 @@
 //!   of 0 leaves the resident bytes short of the stores; a budget without
 //!   the added stores plans another split and the plan line is red.
 //!
+//! One server more, `--ctx` [`CTX`], `--parallel 1`, `--cache-ram 1024`, its
+//! own load:
+//!
+//! - `prefix_c_restores_the_nearest_checkpoint_from_the_host_cache` and
+//!   `prefix_c_ids_are_a_fresh_runs` ([`prefix_restore`]): prompt A of
+//!   [`PREFIX_LEN`] ids, B another prompt that takes the slot (A's state is
+//!   saved), then C sharing [`PREFIX_SHARED`] of A's ids. C's `cache_n` is
+//!   that shared prefix — a window ring keeps it, there is no checkpoint to
+//!   fall back to — and C's ids equal C fed fresh (`cache_prompt: false`).
+//!   FAIL-first: a snapshot that copies no rows, or a resume that writes
+//!   none back, moves C's ids; a seat that still refuses the snapshot keeps
+//!   `cache_n` 0.
+//!
 //! Then one server more of the one-slot shape (`--parallel 1` at [`CTX`], the
 //! one-slot server's budget), under `BLOOMERY_PREFILL_GROUP=1`:
 //!
 //! - `load_group_follows_the_lever`: the one-slot server's `load` record, run
 //!   with the lever unset, holds `group` the row's default
 //!   (`bloomery_levers::PREFILL_GROUP_DEFAULT`, 2); this server's holds 1, on
-//!   the one-slot server's plan (the plan reserves none of the prompt batch's
-//!   units) and with fewer resident bytes (a group of one holds one unit of
+//!   the one-slot server's plan (the plan reserves the batch's shared buffers
+//!   and first unit, not the units past it) and with fewer resident bytes (a group of one holds one unit of
 //!   the batch's buffers, the default's group more, and the load makes them
 //!   once). FAIL-first: a seat that pins the group to 1 records `group=1` for
 //!   the default server and the clause is red; a seat that does not act on the
@@ -260,14 +284,15 @@ mod gate {
     use bloomery_gpu_gates::generate::Place;
     use bloomery_gpu_gates::record::{self, Log};
     use bloomery_gpu_gates::serve_client::{
-        Answer, PrefixTurns, Served, agree, chat_is_those_ids, check, curl, edit_and_extension,
-        greedy, json_of, metric, rendered, serve_cmd, server_log, tokenized, utf8,
+        Answer, PrefixRestore, PrefixTurns, Served, agree, chat_is_those_ids, check, curl,
+        edit_and_extension, greedy, held_ms, json_of, metric, prefix_restore, rendered, serve_cmd,
+        server_log, together, tokenized, utf8,
     };
     use bloomery_gpu_gates::slots_gate;
     use bloomery_gpu_gates::{GateError, RefManifest, checks_failed, data_dir, ref_model_path};
     use bloomery_levers::CARD_BUDGET;
     use gguf::Split;
-    use model::arch::mimo2::place::{PlaceError, PlanInputs};
+    use model::arch::mimo2::place::PlanInputs;
     use model::placement::PlanLevers;
     use model::placement::workstation::{HostNeed, HostRead, PLAN_ROOM, RTX_3090};
     use refset::arch::mimo2::{BATCH, IK};
@@ -280,6 +305,22 @@ mod gate {
 
     /// The tokens each request makes.
     const N: usize = 16;
+
+    /// Ids of prompt A on the prefix server, and how many of them C shares.
+    /// A's written end after [`N`] tokens is `PREFIX_LEN + N - 1`, and the
+    /// depth back to the shared prefix stays inside a window ring's cut.
+    const PREFIX_LEN: usize = 64;
+    const PREFIX_SHARED: usize = 32;
+
+    /// The texts the prefix clause repeats. A and B differ at the first id;
+    /// C's tail diverges from A at [`PREFIX_SHARED`].
+    const PREFIX_A: &str = "The lighthouse keeper counted the steps. ";
+    const PREFIX_B: &str = "A copper kettle whistled on the stove. ";
+    const PREFIX_TAIL: &str = "Then the foghorn answered from the reef.";
+
+    /// `--cache-ram` on the prefix server, in MiB: a set budget, so the
+    /// default's holding rule does not turn the cache off.
+    const PREFIX_RAM_MIB: &str = "1024";
 
     /// Cache rows of the loaded server and of the session it is held to: the
     /// 4,096-position set's step at position 4,096, with a margin of whole 64
@@ -301,7 +342,7 @@ mod gate {
 
     /// The clauses the child of a census of two or more owes: each prints its
     /// own `check` line, and the parent's verdict needs every one.
-    const CHILD_CLAUSES: [&str; 9] = [
+    const CHILD_CLAUSES: [&str; 11] = [
         "load_and_listen",
         "completion_ids",
         "chat_is_those_ids",
@@ -311,6 +352,8 @@ mod gate {
         "two_slots_decode_as_one_slot_runs",
         "server_ids_are_the_session_ids",
         "ids_see_an_id_short",
+        "prefix_c_restores_the_nearest_checkpoint_from_the_host_cache",
+        "prefix_c_ids_are_a_fresh_runs",
     ];
 
     /// How long a refused server may take to exit: it refuses before any
@@ -351,25 +394,22 @@ mod gate {
         RTX_3090.usable_bytes()
     }
 
-    /// The text the seat prints for a `--place bp` it refuses: the flag's
-    /// prefix and `PlaceError::Tier`, the refusal of a machine with an expert
-    /// tier card (the program hangs no expert tier), for the first tier card
-    /// the placement names, tier 0.
-    ///
-    /// # Errors
-    /// No card of the census for `bp`, or a placement with no tier card.
-    fn tier_refusal() -> Result<String, GateError> {
-        let place = Place::Bp.on_host()?;
-        let card = place
-            .tier_cards()
-            .first()
-            .map(|c| (*c).to_owned())
-            .ok_or("the bp placement names no tier card")?;
-        Ok(format!(
-            "--place {}: {}",
-            Place::Bp.name(),
-            PlaceError::Tier { card, tier: 0 }
-        ))
+    /// The text the seat prints for a `--place bp --parallel 2` it refuses
+    /// before the plan: the body serves its expert tier card beside one
+    /// sequence (the seat's `TIER_SLOTS`).
+    fn tier_slots_refusal() -> String {
+        format!(
+            "--place {} with --parallel 2: the mimo2 body serves its expert tier card beside one \
+             sequence",
+            Place::Bp.name()
+        )
+    }
+
+    /// The placement the seat's unset `--place` runs on a census of `cards`:
+    /// plan (b′) on two, whose tier holds past the seat's break-even, and
+    /// `a` on one.
+    fn unset_place(cards: usize) -> Place {
+        if cards >= 2 { Place::Bp } else { Place::A }
     }
 
     /// The server loads the whole host set: up to this many polls a second
@@ -714,6 +754,7 @@ mod gate {
     fn plan_only_names_its_default(
         dir: &Path,
         file: &Path,
+        cards: usize,
         ok: &mut bool,
     ) -> Result<Option<Defaulted>, GateError> {
         let trained = trained_ctx(file)?;
@@ -729,16 +770,17 @@ mod gate {
             (&place, &plan, parallel_at),
             (Some(a), Some(b), Some(c)) if a.at() < b.at() && b.at() < c
         );
+        let unset = unset_place(cards).name();
         let word_a = match &place {
-            Some(p) => p.word("place")? == "a",
+            Some(p) => p.word("place")? == unset,
             None => false,
         };
         let no_load = log.first(&record::LOAD_MIMO2)?.is_none()
             && log.first(&record::LISTENING_MIMO2)?.is_none();
         let exits = status.is_some_and(|s| s.success());
         println!(
-            "plan only: exit 0 {exits}; place unset, plan, parallel in order {in_order}; place word a \
-             {word_a}; no load or listening record {no_load}"
+            "plan only: exit 0 {exits}; place unset, plan, parallel in order {in_order}; place word \
+             {unset} {word_a}; no load or listening record {no_load}"
         );
         let ctx_max = match &plan {
             Some(p) => Some(p.u64("ctx_max")?),
@@ -843,12 +885,15 @@ mod gate {
     fn default_plan_need(
         file: &Path,
         levers: &bloomery_levers::Levers,
-        slot_ctx: u64,
+        (slot_ctx, cards): (u64, usize),
     ) -> Result<u64, GateError> {
         let split = Split::open(file).map_err(|e| format!("open {}: {e}", file.display()))?;
         let mut inputs = PlanInputs::describe(&split)?;
         inputs.room = (PLAN_ROOM, HostRead::Given);
-        let machine = Place::A.on_host()?.machine(None, None)?(inputs.model.layers);
+        let place = unset_place(cards).on_host()?;
+        let batch =
+            (!place.tier_cards().is_empty()).then(|| bloomery_gpu_mimo2::tier::tier_batch(&inputs));
+        let machine = place.machine(None, batch)?(inputs.model.layers);
         let slots = NonZeroUsize::new(usize::try_from(DEFAULT_SLOTS)?).ok_or("no default slot")?;
         let plan =
             inputs.plan_with_slots(&machine, slot_ctx, &PlanLevers::from_levers(levers)?, slots)?;
@@ -860,7 +905,7 @@ mod gate {
     fn host_room_halves_the_default(
         dir: &Path,
         file: &Path,
-        levers: &bloomery_levers::Levers,
+        (levers, cards): (&bloomery_levers::Levers, usize),
         base: Option<&Defaulted>,
         ok: &mut bool,
     ) -> Result<(), GateError> {
@@ -902,8 +947,8 @@ mod gate {
         // the default's: the default's experts pass the room, the rung below's
         // do not, so the default halves once, short of the host.
         let (need_below, need_default) = (
-            default_plan_need(file, levers, below)?,
-            default_plan_need(file, levers, base.ctx_max)?,
+            default_plan_need(file, levers, (below, cards))?,
+            default_plan_need(file, levers, (base.ctx_max, cards))?,
         );
         if need_default <= need_below {
             return Err(format!(
@@ -939,7 +984,7 @@ mod gate {
         // (iii) A room a GiB under the floor's need holds no rung: refused by
         // name before any load.
         let floor = *rungs(limit).last().ok_or("no rung")?;
-        let short = default_plan_need(file, levers, floor)? - SHORT_OF_NEED;
+        let short = default_plan_need(file, levers, (floor, cards))? - SHORT_OF_NEED;
         let refused = refusal_under(
             dir,
             file,
@@ -1090,19 +1135,19 @@ mod gate {
             &SPLIT_REFUSAL,
         )?;
         if cards >= 2 {
-            let want = tier_refusal()?;
+            let want = tier_slots_refusal();
             pass &= refusal(
                 dir,
                 file,
                 "refuse-bp",
-                &["--place", "bp", "--port", "0"],
+                &["--place", "bp", "--parallel", "2", "--port", "0"],
                 &[&want],
             )?;
             check(ok, "refusals_before_any_load", pass);
         } else {
             println!(
-                "deferred(two cards) refusals_before_any_load (--place bp): {cards} card in view; \
-                 the tier-card refusal needs a census of two"
+                "deferred(two cards) refusals_before_any_load (--place bp --parallel 2): {cards} card \
+                 in view; the tier-slots refusal needs a census of two"
             );
             check(ok, "refusals_before_any_load (the split only)", pass);
         }
@@ -1318,55 +1363,38 @@ mod gate {
         }))
     }
 
-    /// What a request of a round answered, and the slot it ran on.
+    /// What a request of a round answered, the slot it ran on and about how long it held it.
     struct Ran {
         tokens: Vec<u32>,
         stop: String,
         slot: Option<u64>,
+        /// The server's `prompt_ms` plus `predicted_ms` ([`held_ms`]): the window a request
+        /// posted beside it has to arrive in to take the other slot.
+        held_ms: f64,
     }
 
-    /// How long a round's first request is in flight before its second is
-    /// posted: the engine thread admits it to the other slot.
-    const POST_GAP: Duration = Duration::from_millis(300);
-
-    /// A round of two requests in flight together on `addr`: `first` posted,
-    /// `gap` later `second`, each a greedy `/completion` of [`N`] ids at
-    /// `cache_prompt: false`, its body kept in `d` under its name.
-    fn together(
+    /// A round's two requests at once on `addr` ([`together`]), each a greedy `/completion` of
+    /// [`N`] ids at `cache_prompt: false`, its body kept in `d` under its name.
+    fn round(
         addr: &str,
         d: &Path,
-        gap: Duration,
         first: (&str, &Answer),
         second: (&str, &Answer),
     ) -> Result<[Ran; 2], GateError> {
-        let post = |(name, a): (&str, &Answer)| {
-            let (addr, d, name, prompt) = (
-                addr.to_owned(),
-                d.to_path_buf(),
-                name.to_owned(),
-                a.prompt.clone(),
-            );
-            move || -> Result<Ran, String> {
-                let url = |p: &str| format!("http://{addr}{p}");
-                let (a, v) =
-                    greedy(&url, prompt, N, &d, &name, false).map_err(|e| e.to_string())?;
+        together(
+            addr,
+            (first.0, &first.1.prompt),
+            (second.0, &second.1.prompt),
+            |url, name, prompt| {
+                let (a, v) = greedy(url, prompt.to_vec(), N, d, name, false)?;
                 Ok(Ran {
                     tokens: a.tokens,
                     stop: a.stop,
                     slot: v["id_slot"].as_u64(),
+                    held_ms: held_ms(name, &v)?,
                 })
-            }
-        };
-        std::thread::scope(|sc| {
-            let a = sc.spawn(post(first));
-            std::thread::sleep(gap);
-            let b = sc.spawn(post(second));
-            let a = a.join().map_err(|_| "a round's first request panicked")??;
-            let b = b
-                .join()
-                .map_err(|_| "a round's second request panicked")??;
-            Ok([a, b])
-        })
+            },
+        )
     }
 
     /// `two_slots_decode_as_one_slot_runs` (the module header): a server of
@@ -1455,20 +1483,15 @@ mod gate {
             ("chat", &one.chat),
         ];
         let get = |n: &str| by.iter().find(|(m, _)| *m == n).map(|&(_, a)| a);
-        let rounds = [
-            ("batch", "prose", POST_GAP),
-            ("prose", "batch", POST_GAP),
-            ("chat", "prose", Duration::ZERO),
-        ];
+        let rounds = [("batch", "prose"), ("prose", "batch"), ("chat", "prose")];
         let mut same = true;
-        for (i, (f, g, gap)) in rounds.into_iter().enumerate() {
+        for (i, (f, g)) in rounds.into_iter().enumerate() {
             let (Some(fa), Some(ga)) = (get(f), get(g)) else {
                 return Err(format!("round {i}: no one-slot answer for {f} or {g}").into());
             };
-            let ran = together(
+            let ran = round(
                 &addr,
                 &d,
-                gap,
                 (&format!("round{i}-{f}"), fa),
                 (&format!("round{i}-{g}"), ga),
             )?;
@@ -1477,9 +1500,10 @@ mod gate {
                 .all(|(r, a)| !r.tokens.is_empty() && r.tokens == a.tokens && r.stop == a.stop);
             let apart = matches!((ran[0].slot, ran[1].slot), (Some(a), Some(b)) if a != b);
             println!(
-                "round {i}: {f} on slot {:?} and {g} on slot {:?} in flight together; ids equal \
-                 the one-slot server's {equal}; on different slots {apart}",
-                ran[0].slot, ran[1].slot
+                "round {i}: {f} on slot {:?} (held {:.1} ms) and {g} on slot {:?} (held {:.1} ms) \
+                 in flight together; ids equal the one-slot server's {equal}; on different slots \
+                 {apart}",
+                ran[0].slot, ran[0].held_ms, ran[1].slot, ran[1].held_ms
             );
             same &= equal && apart;
         }
@@ -1633,6 +1657,74 @@ mod gate {
         Ok(())
     }
 
+    /// The slot dropped and not saved (`POST /slots/0?action=erase`): the
+    /// prompt cache keeps what it held.
+    fn erase(url: &dyn Fn(&str) -> String) -> Result<(), GateError> {
+        let (st, body) = curl(&url("/slots/0?action=erase"), Some(&json!({})), false)?;
+        json_of("/slots/0?action=erase", st, &body)?;
+        Ok(())
+    }
+
+    /// The shared-prefix clause ([`prefix_restore`]) on a server of its own
+    /// (`--ctx` [`CTX`], `--parallel 1`, `--cache-ram` [`PREFIX_RAM_MIB`]).
+    /// C's `cache_n` is [`PREFIX_SHARED`]: a window ring keeps that prefix,
+    /// and the check name says "checkpoint" because the helper owns it.
+    ///
+    /// FAIL-first: a snapshot that copies no rows, or a resume that writes
+    /// none back, moves C's ids (`prefix_c_ids_are_a_fresh_runs`); a seat
+    /// that still refuses the snapshot keeps `cache_n` 0
+    /// (`prefix_c_restores_the_nearest_checkpoint_from_the_host_cache`).
+    fn prefix_cache(dir: &Path, file: &Path, ok: &mut bool) -> Result<(), GateError> {
+        let ctx = CTX.to_string();
+        let (mut s, d) = spawn_budgeted(
+            dir,
+            "prefix",
+            file,
+            &[
+                "--ctx",
+                &ctx,
+                "--parallel",
+                "1",
+                "--port",
+                "0",
+                "--cache-ram",
+                PREFIX_RAM_MIB,
+            ],
+            gate_budget(),
+        )?;
+        let err_log = d.join("server.err");
+        let addr = match s.address(&err_log, LISTEN_POLLS, Duration::from_secs(1)) {
+            Ok(addr) => addr,
+            Err(e) => {
+                println!("the prefix server never listened: {e}");
+                println!(
+                    "server stderr:\n{}",
+                    std::fs::read_to_string(&err_log).unwrap_or_default()
+                );
+                check(
+                    ok,
+                    "prefix_c_restores_the_nearest_checkpoint_from_the_host_cache",
+                    false,
+                );
+                check(ok, "prefix_c_ids_are_a_fresh_runs", false);
+                return Ok(());
+            }
+        };
+        let url = |p: &str| format!("http://{addr}{p}");
+        let t = PrefixRestore {
+            a: PREFIX_A,
+            b: PREFIX_B,
+            tail: PREFIX_TAIL,
+            a_len: PREFIX_LEN,
+            shared: PREFIX_SHARED,
+            kept: PREFIX_SHARED as u64,
+            n: N,
+        };
+        let restored = prefix_restore(&url, &d, ok, &t, &|| erase(&url));
+        println!("prefix server stopped: {}", s.stop()?);
+        restored
+    }
+
     /// The clauses after the refusals, in this process: the server's, the
     /// two-slot server's against them, then the session's on a census of one.
     fn after_refusals(
@@ -1660,6 +1752,7 @@ mod gate {
             ),
             None => {}
         }
+        prefix_cache(dir, file, ok)?;
         Ok(())
     }
 
@@ -1680,8 +1773,8 @@ mod gate {
             );
             after_refusals(&a.dir, &file, &levers, cards, &mut ok)?;
         } else {
-            let base = plan_only_names_its_default(&a.dir, &file, &mut ok)?;
-            host_room_halves_the_default(&a.dir, &file, &levers, base.as_ref(), &mut ok)?;
+            let base = plan_only_names_its_default(&a.dir, &file, cards, &mut ok)?;
+            host_room_halves_the_default(&a.dir, &file, (&levers, cards), base.as_ref(), &mut ok)?;
             residency_default_is_the_machine(&a.dir, &file, &mut ok)?;
             refusals_before_any_load(&a.dir, &file, cards, &mut ok)?;
             slots_total_is_planned(&a.dir, &file, &mut ok)?;

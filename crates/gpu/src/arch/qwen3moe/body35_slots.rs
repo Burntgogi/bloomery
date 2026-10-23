@@ -17,7 +17,10 @@
 //! run alone, and a row's arithmetic in every launch does not depend on the
 //! rows beside it (a pass of `m` rows leaves its `m` steps' bits,
 //! `gate_qwen35moe_e2e` (p)), so every row is its slot's own step bit for
-//! bit. The pass ends in one head of every row ([`Tail::One`]): the rows
+//! bit. A placed load runs that FFN as one pass of the rows through the
+//! host tier's step port ([`ColsWalk`]): each column's handoff, one go,
+//! the card leg over the rows. The pass ends in one head of every row
+//! ([`Tail::One`]): the rows
 //! read the lm_head once, each row's logits and token its one-row head's
 //! (`Head`'s rows are independent).
 //!
@@ -35,6 +38,7 @@ use super::delta;
 use super::dispatch::{self, PassCtx};
 use super::head_argmax::HeadArgmaxState;
 use super::image::MediaCarrier;
+use super::placed::{ColsMix, ColsWalk, Placed, slot_chain};
 use super::plan::LayerPlan;
 use super::plan::{DeltaPlan, FfnPlan, GqaKind, GqaPlan, MixerPlan};
 use super::program::{self, Tail, layer_ctx};
@@ -42,6 +46,7 @@ use super::scratch::{Append256, Arena, FlashPass, Io, KvPlanes, LayerStore, RecS
 use crate::flash_gqa::{partials_ms_len, partials_v_len_256};
 use crate::gated_quant::GateLayout;
 use crate::head::Head;
+use crate::host::StepLeg;
 use crate::hybrid::Chain;
 use crate::linear::{self, conv::ConvArgs, delta::DeltaArgs, norm_gate::NormGateArgs};
 use crate::media::rope_table;
@@ -53,7 +58,7 @@ use crate::tensor::{Window, WindowMut};
 use crate::weights::Weights;
 use crate::{Gpu, GpuError};
 use chain::arch::qwen3moe::ops::{ChainOps, LayerCtx};
-use chain::arch::qwen3moe::walk::Walk;
+use chain::arch::qwen3moe::walk::{self, Walk};
 use cuda_core::{CudaStream, DeviceBuffer};
 use std::ops::Range;
 
@@ -74,16 +79,17 @@ impl SlotRows for Body35 {
     /// One head of every row: the pass's rows read the lm_head once.
     const HEADS: RowHeads = RowHeads::One;
 
-    /// Never read: a whole-card load serves no host work, and a placed load
-    /// refuses the pass in [`SlotRows::plan_slots`].
-    fn chain_of(_rows: &[SlotRange]) -> Chain {
-        Chain::Step
+    /// The chain the placed replay serves ([`slot_chain`]). A whole-card
+    /// load has no host service of the pass.
+    fn chain_of(rows: &[SlotRange]) -> Chain {
+        slot_chain(rows)
     }
 
     /// Plan the pass of `rows` (the busy slots' ranges in pass order, any
     /// slot's first) over `ids` (every row's token), `parked`
     /// every busy slot's sequence but slot 0's — the live one — in `rows`
-    /// order. Refused by name before anything moves: a placed load, the
+    /// order. Refused by name before anything moves: a load that verifies
+    /// drafted rows, the
     /// layer taps armed, ranges that do not tile the pass from row 0, a
     /// parked count other than the ranges past slot
     /// 0, an id count other than the rows, and for each slot on its own
@@ -100,7 +106,7 @@ impl SlotRows for Body35 {
         ids: &[u32],
     ) -> Result<(), GpuError> {
         self.slots_planned = None;
-        self.whole_card()?;
+        self.refuse_verify()?;
         if self.taps.is_some() {
             return Err(GpuError::state(
                 WHAT,
@@ -135,8 +141,10 @@ impl SlotRows for Body35 {
     /// `parked` as [`SlotRows::plan_slots`] takes it: slot 0's rows over the
     /// live stores, every other slot's over its parked sequence's. An eager
     /// pass needs the plan of these very ranges; a capture records the
-    /// launches only. Refused by name: a placed load, ranges as the plan
-    /// refuses them, more rows than the pass arena holds, any other heads.
+    /// launches only. A placed load runs the FFN as one pass of the rows
+    /// ([`walk_placed`]). Refused by name: a load that verifies drafted rows,
+    /// ranges as the plan refuses them, more rows than the pass arena
+    /// holds, any other heads.
     fn enqueue_slots(
         &mut self,
         gpu: &Gpu,
@@ -145,7 +153,7 @@ impl SlotRows for Body35 {
         parked: &mut [&mut Slot35],
         rows: &[SlotRange],
     ) -> Result<(), GpuError> {
-        self.whole_card()?;
+        self.refuse_verify()?;
         let total = SlotRowOrder::Any.admit(WHAT, rows, parked.len())?;
         if total > self.a.rows {
             return Err(GpuError::shape(
@@ -180,6 +188,7 @@ impl SlotRows for Body35 {
             mma,
             slot_in,
             slot_lane,
+            placed,
             ..
         } = self;
         let live = rope_table(rope, seq_rope.as_ref());
@@ -220,44 +229,37 @@ impl SlotRows for Body35 {
                 rows: r.rows.clone(),
             });
         }
-        let rows = a.rows;
-        let mut ops = Slots35 {
-            c: &c,
-            seqs: &mut seqs,
-            s: a,
-            head,
-            state: head_state,
+        let Some(placed) = placed.as_mut() else {
+            let rows = a.rows;
+            let mut ops = Slots35 {
+                c: &c,
+                seqs: &mut seqs,
+                s: a,
+                head: Some((head, head_state)),
+            };
+            return Walk::new(&mut ops, c.plans, total).run(rows);
         };
-        Walk::new(&mut ops, c.plans, total).run(rows)
+        walk_placed(&c, &mut seqs, a, total, (head, head_state), placed)
     }
 }
 
 impl Body35 {
-    /// The launches of the captured pass of several slots of `key` (each
-    /// `(slot, rows)`, in pass order) without its head: the row-wise
-    /// launches at every row of the pass with one embedding
+    /// The launches of the captured whole-card pass of several slots of
+    /// `key` (each `(slot, rows)`, in pass order) without its head: the
+    /// row-wise launches at every row of the pass with one embedding
     /// ([`Body35::pass_launches`]), and each busy slot past the first's
     /// sequence-bound launches ([`seq_launches`]). The head of the pass's
     /// rows adds the copy of the rows into its input and its own launches.
+    /// A placed pass's handoff, go and card leg are not in this count.
     #[must_use]
     pub fn slots_launches(&self, key: &[(usize, usize)]) -> usize {
         let rows = key.iter().map(|&(_, m)| m).sum();
         self.pass_launches(rows) + key.len().saturating_sub(1) * seq_launches(&self.plans)
     }
 
-    /// Refused by name on a placed load: its prompt runs through the host
-    /// tier's batch port and its step through the placed chain, one
-    /// sequence each, and neither runs a pass of several slots; and on a
-    /// load that verifies drafted rows, whose delta stores keep their lanes
-    /// for one sequence's verify.
-    fn whole_card(&self) -> Result<(), GpuError> {
-        if self.placed.is_some() {
-            return Err(GpuError::shape(
-                WHAT,
-                "a pass of several slots on a placed load: its host tier's batch port and its \
-                 placed chain run one sequence",
-            ));
-        }
+    /// Refused by name on a load that verifies drafted rows, whose delta
+    /// stores keep their lanes for one sequence's verify.
+    fn refuse_verify(&self) -> Result<(), GpuError> {
         if self.lanes() > 1 {
             return Err(GpuError::shape(
                 WHAT,
@@ -307,13 +309,60 @@ struct SlotSeq35<'a> {
 
 /// The pass (module doc) as the ops the chain's walk orders: the row-wise
 /// launches over all `R` rows of the arena `s`, the launches bound to a
-/// sequence per busy slot of `seqs`, the one head of every row last.
+/// sequence per busy slot of `seqs`, the one head of every row last
+/// (`head`; a placed pass's head is its walk's, [`walk_placed`]).
 struct Slots35<'a, 'q> {
     c: &'a PassCtx<'a>,
     seqs: &'a mut [SlotSeq35<'q>],
     s: &'a mut Arena,
-    head: &'a mut Head,
-    state: &'a mut HeadArgmaxState,
+    head: Option<(&'a mut Head, &'a mut HeadArgmaxState)>,
+}
+
+/// A placed load's pass (module doc): each layer's front through the
+/// slots' ops ([`Mix35`]: the slots' embedding ahead of layer 0, then the
+/// sequence-bound launches) and then that layer's FFN as [`ColsWalk`],
+/// whose tail is the one head of every row.
+fn walk_placed(
+    c: &PassCtx<'_>,
+    seqs: &mut [SlotSeq35<'_>],
+    s: &mut Arena,
+    m: usize,
+    (head, state): (&mut Head, &mut HeadArgmaxState),
+    Placed {
+        hybrid, side, pass, ..
+    }: &mut Placed,
+) -> Result<(), GpuError> {
+    let mut leg = StepLeg::new(c.gpu.stream(), hybrid);
+    ColsWalk {
+        c,
+        s,
+        m,
+        side,
+        rows: pass,
+        mix: Mix35 { seqs, m },
+        tail: Tail::One { head, state },
+    }
+    .walk(&mut leg)
+}
+
+/// A placed pass's mixer: layer `layer`'s front over the slots' ops
+/// ([`walk::front`]), leaving the FFN input in the arena for [`ColsWalk`].
+struct Mix35<'a, 's> {
+    seqs: &'a mut [SlotSeq35<'s>],
+    m: usize,
+}
+
+impl ColsMix for Mix35<'_, '_> {
+    fn mix_layer(&mut self, layer: usize, c: &PassCtx<'_>, s: &mut Arena) -> Result<(), GpuError> {
+        let cx = LayerCtx::of(c.plans, layer, self.m)?;
+        let mut ops = Slots35 {
+            c,
+            seqs: &mut *self.seqs,
+            s,
+            head: None,
+        };
+        walk::front(&mut ops, cx)
+    }
 }
 
 impl ChainOps for Slots35<'_, '_> {
@@ -567,12 +616,14 @@ impl ChainOps for Slots35<'_, '_> {
         dispatch::experts(&layer_ctx(self.c, l)?, f, self.s, l.m, None)
     }
 
-    /// The one head of every row ([`Tail::One`]).
+    /// The one head of every row ([`Tail::One`]); a placed pass's mixer
+    /// ops hold none, its walk running the head.
     fn head(&mut self, m: usize) -> Result<(), GpuError> {
-        let tail = &mut Tail::One {
-            head: &mut *self.head,
-            state: &mut *self.state,
-        };
+        let (head, state) = self.head.as_mut().ok_or(GpuError::state(
+            WHAT,
+            "the pass's head (a placed pass's walk runs it)",
+        ))?;
+        let tail = &mut Tail::One { head, state };
         program::enqueue_tail(self.c, self.s, m, tail)
     }
 }

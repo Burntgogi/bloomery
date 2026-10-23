@@ -11,7 +11,9 @@
 //! per-position). So does the Qwen3.6 body
 //! of a qwen35moe file ([`Body35`]): the same schedule's wide half
 //! (`PrefillPath::Wide`) and the checkpoints' keep rule — the nearest
-//! checkpoint a marked prompt call took at or below the cut.
+//! checkpoint a marked prompt call took at or below the cut. Its in-file
+//! next-token layer is [`mtp35`]'s [`MtpBody`](crate::mtp::MtpBody), one id
+//! a proposal, driven by the shared window.
 //!
 //! A Qwen3.6 body opened with media
 //! ([`Open35::media`](bloomery_gpu::arch::qwen3moe::Open35::media)) is a
@@ -36,6 +38,8 @@ use runtime::{Speculative, TapSink, Tapped, TappedPrompt, Want};
 use crate::mtp::{MtpBody, MtpDraft};
 use crate::{Keep, Prompt, Session, SessionError, cut_positions, keep_positions};
 mod mtp;
+mod mtp35;
+pub use mtp35::Prompt35;
 
 const WHAT: &str = "qwen4exp session";
 
@@ -142,8 +146,10 @@ impl Prompt for Body35 {
 }
 
 /// The units a Qwen3.6 prompt call of `n` ids runs as: the wide ubatch walk
-/// from [`GEMM_FROM`] ids on, passes below.
-fn path35(n: usize) -> PrefillPath {
+/// from [`GEMM_FROM`] ids on, passes below. The drafted prompt uses the same
+/// choice ([`mtp35`]): the window stores one path at open, and this one
+/// depends on the length.
+pub(super) fn path35(n: usize) -> PrefillPath {
     if n >= GEMM_FROM {
         PrefillPath::Wide
     } else {

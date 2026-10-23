@@ -35,6 +35,7 @@ use gguf::{Gguf, Split};
 use os::Populated;
 
 use super::{Device, ExpertList, Format, ModelTensor, PlacementError, Plan, Segment};
+use crate::ops::{StackRuns, stack_runs};
 use crate::r8file::{R8Error, R8Source, Sidecar};
 
 /// Bytes per page of this host (`sysconf(_SC_PAGESIZE)`), the unit a lock is
@@ -443,15 +444,17 @@ impl HostSet {
 }
 
 /// Where the host reads expert `id` of `t`, a routed stack of `experts`:
-/// the file and the bytes of its mapping — the sidecar's when `src` reads
-/// one that holds `t` and `sidecar` asks for it, else the shard's.
-pub fn expert_run(
+/// the file and the runs of its mapping — the sidecar's when `src` reads one
+/// that holds `t` and `sidecar` asks for it, else the shard's. The expert's
+/// one run and an empty second, or for a planes stack a checkpoint folder
+/// locates its codes run then its scales run, each where the folder keeps it.
+pub fn expert_runs(
     src: R8Source<'_>,
     t: &ModelTensor,
     experts: u64,
     id: u32,
     sidecar: bool,
-) -> Result<(HostFile, Range<u64>), PlacementError> {
+) -> Result<(HostFile, [Range<u64>; 2]), PlacementError> {
     let (_, per) = super::per_expert(t, experts)?;
     if u64::from(id) >= experts {
         return Err(PlacementError::tensor(
@@ -471,14 +474,66 @@ pub fn expert_run(
     Ok(match held {
         Some((sc, i)) => (
             HostFile::Sidecar(sc.path().to_path_buf()),
-            sc.gguf().data_base() + i.offset + bytes.start
-                ..sc.gguf().data_base() + i.offset + bytes.end,
+            [
+                sc.gguf().data_base() + i.offset + bytes.start
+                    ..sc.gguf().data_base() + i.offset + bytes.end,
+                0..0,
+            ],
         ),
-        None => {
-            let base = shard_of(split, s)?.data_base() + info.offset;
-            (HostFile::Shard(s), base + bytes.start..base + bytes.end)
-        }
+        None => match runs_of(split, t)? {
+            // A stack the folder stores expert by expert: its matrix is where
+            // the runs put it, not at an equal stride from the header's
+            // offset; a planes matrix is two runs.
+            Some(runs) => {
+                let ranges = runs.ranges(id as usize).ok_or_else(|| {
+                    PlacementError::tensor(t, format!("has no located run for expert {id}"))
+                })?;
+                (HostFile::Shard(s), ranges)
+            }
+            None => {
+                let base = shard_of(split, s)?.data_base() + info.offset;
+                (
+                    HostFile::Shard(s),
+                    [base + bytes.start..base + bytes.end, 0..0],
+                )
+            }
+        },
     })
+}
+
+/// The page ranges of `bytes`, a span of whole experts (`per` bytes each,
+/// counted from the stack's first) of a located stack: expert `e`'s matrix is
+/// the runs `runs` puts it at, so a span of experts is one range of pages a
+/// run, in expert order (a planes expert's codes then its scales), not one
+/// range of the span's own length. A span that cuts an expert, or names one
+/// past the runs, is the detail of a refusal.
+fn located_pages(
+    runs: &StackRuns,
+    per: u64,
+    bytes: &Range<u64>,
+    page: u64,
+) -> Result<Vec<Range<u64>>, String> {
+    let (first, end) = (bytes.start / per, bytes.end / per);
+    if !bytes.start.is_multiple_of(per)
+        || !bytes.end.is_multiple_of(per)
+        || u64::try_from(runs.n_expert()).ok().is_none_or(|n| end > n)
+    {
+        return Err(format!(
+            "the plan's bytes {bytes:?} are not whole experts of the {} located runs",
+            runs.n_expert()
+        ));
+    }
+    Ok((first as usize..end as usize)
+        .flat_map(|e| runs.ranges(e).expect("an expert below the runs' count"))
+        .filter(|r| !r.is_empty())
+        .map(|r| r.start / page..r.end.div_ceil(page))
+        .collect())
+}
+
+/// The runs `split` keeps for stack `t`, when its experts lie at offsets of
+/// their own in the shard ([`stack_runs`]).
+fn runs_of(split: &Split, t: &ModelTensor) -> Result<Option<StackRuns>, PlacementError> {
+    stack_runs(split, &t.name).map_err(|e| PlacementError::tensor(t, e.to_string()))
 }
 
 /// Page ranges `[first, end)` of one mapping.
@@ -1186,6 +1241,7 @@ fn host_pages(
             ));
         };
         let held = sidecar.and_then(|sc| sc.find(&t.name).map(|i| (sc.gguf(), i)));
+        let runs = runs_of(split, t)?;
         for span in seg.spans(t, plan.model.experts)? {
             if s != t.shard || span.bytes.end > info.nbytes {
                 return Err(PlacementError::tensor(
@@ -1195,6 +1251,21 @@ fn host_pages(
                         t.shard, span.bytes, info.nbytes
                     ),
                 ));
+            }
+            if let Some(runs) = &runs {
+                // The stack's experts lie where the folder stores them: each
+                // expert of the span is its own run, not a share of one.
+                if held.is_some() {
+                    return Err(PlacementError::tensor(
+                        t,
+                        "is a located stack, which the r8 sidecar cannot hold",
+                    ));
+                }
+                let (_, per) = super::per_expert(t, plan.model.experts_of(t))?;
+                let runs = located_pages(runs, per, &span.bytes, page)
+                    .map_err(|detail| PlacementError::tensor(t, detail))?;
+                pages[s].extend(runs);
+                continue;
             }
             let (base, into) = match held {
                 Some((sg, side_info)) => {
@@ -1244,7 +1315,8 @@ fn resident_pages(span: &[u8], page: u64) -> io::Result<(u64, u64)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{HostSet, Populated, cut, populate_span, walk};
+    use super::{HostSet, Populated, cut, located_pages, populate_span, walk};
+    use crate::ops::{RowLayout, StackRuns};
     use crate::placement::PlacementError;
     use crate::r8file::{self, HostR8, R8Error, R8Source, Sidecar};
     use std::fs::File;
@@ -1483,5 +1555,64 @@ mod tests {
             }
         }
         assert!(cut(&[], 3).is_empty(), "no pages, no pieces");
+    }
+
+    /// A located stack's host segment is a range of pages for each run of
+    /// each of its experts — a planes expert's codes then its scales —
+    /// wherever the folder stores them: experts 1 and 2 of a stack whose
+    /// experts lie out of order lock exactly their own runs' pages, not the
+    /// pages an equal-stride stack's experts 1 and 2 would, and an expert's
+    /// scales are pages of their own where the folder keeps them a region
+    /// away. A span that cuts an expert, or names one past the runs, is
+    /// refused by name.
+    #[test]
+    fn a_located_stacks_host_span_is_the_pages_of_its_experts_runs() {
+        let page = 4096u64;
+        let (cp, sp) = (2 * page + 512, page / 2 + 64);
+        let per = cp + sp;
+        let codes = vec![40, 10 * page + 24, 5 * page + 8, 20 * page];
+        let region = 60 * page;
+        let separated = vec![
+            region + 3,
+            region + 9 * page,
+            region + 5 * page + 100,
+            region + 7,
+        ];
+        let adjacent: Vec<u64> = codes.iter().map(|&c| c + cp).collect();
+        for (what, scales) in [("separated", separated), ("adjacent", adjacent)] {
+            let runs =
+                StackRuns::new(RowLayout::Planes, codes.clone(), scales.clone(), cp, sp).unwrap();
+            let pages = |a: u64, len: u64| a / page..(a + len).div_ceil(page);
+            let expert = |e: usize| [pages(codes[e], cp), pages(scales[e], sp)];
+            assert_eq!(
+                located_pages(&runs, per, &(per..3 * per), page).unwrap(),
+                [expert(1), expert(2)].concat(),
+                "{what}: experts 1 and 2: the pages of the runs the offsets name, codes then scales"
+            );
+            let equal_stride = (codes[0] + per) / page..(codes[0] + 3 * per).div_ceil(page);
+            assert!(
+                !located_pages(&runs, per, &(per..3 * per), page)
+                    .unwrap()
+                    .contains(&equal_stride),
+                "{what}: not the pages of one run from the first expert's offset"
+            );
+            assert_eq!(
+                located_pages(&runs, per, &(0..4 * per), page).unwrap(),
+                (0..4).flat_map(expert).collect::<Vec<_>>(),
+                "{what}: the whole stack: every expert's runs"
+            );
+            let cut = located_pages(&runs, per, &(per + 1..2 * per), page).unwrap_err();
+            assert!(
+                cut.contains("not whole experts of the 4 located runs"),
+                "{what}: {cut}"
+            );
+            assert!(located_pages(&runs, per, &(0..5 * per), page).is_err());
+        }
+        let rows = StackRuns::new(RowLayout::Rows, codes.clone(), Vec::new(), per, 0).unwrap();
+        assert_eq!(
+            located_pages(&rows, per, &(per..2 * per), page).unwrap(),
+            vec![codes[1] / page..(codes[1] + per).div_ceil(page)],
+            "a rows stack is one run an expert"
+        );
     }
 }

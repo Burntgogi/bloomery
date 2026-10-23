@@ -1,0 +1,53 @@
+# Round hostsimd2: Muse Spark's post-expert norm folded into the host union's own sums. The layer holds the norm
+# (HostLayer::set_post_norm, the rule model::ops::PostNorm), and the union's sum pass and the one-column leg's sum
+# take each expert's down through it before its weight (PostNorm::add_normed: the same products, scale and adds
+# as the old norm-in-place then weighted add, so every column is the same bits; gpu lib
+# a_post_norm_layer_norms_each_experts_row_before_its_weight pins it, now with a wide call whose sums run over the
+# pool). Gone from the prompt call: HostRun::experts_post's single-thread copy of x into one column a routed slot,
+# the zero-fill of the slot rows, the per-slot norm and the weighted sum, and the union's 8x quantize of the copied
+# columns and its copy of the store into the slot rows. Also in the tree, both 0 on this term [derived]: the
+# IQ2_XXS 8-column tile restructured as the wide tile's one group (no engine path reaches it: compute_rows sends
+# every IQ2_XXS run of two or more columns to the wide tile), and its tile_units row (every unit of the union's
+# passes is an IQ2_XXS row, so only the row's fixed/per-column ratio enters the cut, and the steal blocks absorb it).
+# Against int039 6faa40c4c (iq2simd's wide tile and the xstream prompt stream in).
+# Decomposition per layer, pp512, host slots n_h (4096 when nothing streams; xstream's split keeps fewer) [derived]:
+# - experts_post, one thread, at n_h = 4096: x copied into 4096 columns, 67 MB stored with write-allocate at the
+#   core's 15..20 GB/s -> 3.4..4.5 ms; the slot rows zeroed, 67 MB -> 2.7..4.5 ms; the norm and sum read the rows
+#   (67 MB from the pool's writes at ~25 GB/s) and write them back -> 4..6 ms; out zeroed, 8.4 MB -> 0.4 ms.
+#   10.5..15.4 ms.
+# - The pool's share: 7/8 of x's quantize (58.7 MB read) 0.5..0.7 ms, the store-to-rows copy's 67 MB of writes
+#   0.6..0.9 ms; the norm now in the pool's sum pass +0.05 ms. 1.0..1.5 ms.
+# - Saved 11.5..16.9 ms a layer at n_h = 4096, x n_h / 4096 under a split.
+# Base: iq2simd's 127..192 ms a layer (7.9..11.9 s a pass) with nothing streamed -> +6.3..+15.3 %; a split that
+# keeps half the slots (n_h ~ 2048) and a 5..8 s pass -> +4.7..+11.6 %. Band +4..+15 %. pp4096 the same band
+# (eight ubatches of the same calls), printed beside it.
+kind: ab
+question: does folding the post-expert norm into the union's sums take experts_post's single-thread copy,
+  zero-fill, norm and sum (and the union's 8x x quantize and its store copy) off Muse Spark's prompt pass?
+term: pp tok/s @ P = 512, prose prompt (corpus-prose.ids), Muse Spark UD-IQ2_XXS, A6000 + host, place a, serve
+  defaults (--ctx-size 4160) - (hostsimd2 - base) / base, arms rotated by round in one invocation
+unit: %
+predict: +4..+15
+rounds: 2
+condition: one lease, one invocation from /Users/hckim/repo/bloomery-hostsimd2 (it builds this tree's
+  bloomery-serve) after the base tree's own release build of bloomery-serve at int039 6faa40c4c (a clean tree, e.g.
+  bloomery-int039base): BLOOMERY_MODEL=muse-spark BLOOMERY_AB_ROUNDS=2 BLOOMERY_BOX_ENV='DEPTH_SERVE_N=64
+  BLOOMERY_LEASE_CARD=docs/cards/hostsimd2-pp.card' just depth-serve bloomery-int039base:512 bloomery-hostsimd2:512
+  bloomery-int039base:4096 bloomery-hostsimd2:4096. Both arms hold the same plan (host code only; the musespark
+  union-columns patch, if applied, moves only host slab bytes), so their plan, pass and xstream lines print the
+  same card experts, pass rows and streamed experts, and their tg rows agree within the window's ~5 %. The xstream
+  records give n_h per layer (4096 less the streamed slots), which places the result in the band. A row marked
+  [cold], [cpu-busy] or [other-busy] is void, and so is a window whose majflt differs by more than the load's own
+  scatter between arms. Box time 13..32 min [derived: iq2simd's sitting, the same arms and prompts, plus the two
+  serve builds]
+decide-in: land it; the host term per layer is then rows (93..145 ms at n_h = 4096) beside O' ~3..5 ms (x quantize,
+  combines, sums, joins) and the residual iq2simd's O left unexplained: price that residual first, from one
+  BLOOMERY_PROFILE=1 run's host_x_quant, host_gate_up, host_h_quant, host_down and host_sum against the layer's wall,
+  then open the rows lever (the IQ2_XXS signs on the weight side once a run, ik's form, ~-25..-30 % of the rows)
+decide-below: under +4 %: experts_post was off the wall (the layer card-bound under the split, or the core's stores
+  ran faster than 15..20 GB/s); read n_h from the xstream records and union_ms per layer from one
+  BLOOMERY_STEP_STATS=1 run of each arm; land it at >= 0 (same bits, a smaller host call), and the miss names the
+  term: the split's balance or the copy rate
+decide-above: past +15 %: the copies cost more than derived (write-allocate under 15 GB/s, or the 67 MB slot rows
+  evicting the union's working set from L3); re-derive O from the profile parts and price O' and the card's ~11 ms
+  serial share next

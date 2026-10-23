@@ -3,8 +3,9 @@
 //!
 //! MiMo facts that fix this file: the routed block has no shared expert, so
 //! the shadow is the card slots alone and the layer's back adds the host's sum
-//! to `acc + x1`; the routed SwiGLU is the description's limit (0: plain); no
-//! expert tier hangs on these experts.
+//! to `acc + x1`; the routed SwiGLU is the description's limit (0: plain). On
+//! a load that hangs an expert tier card, a layer the tier holds experts of
+//! leaves its card slots' downs for the join ([`crate::tier`]).
 
 use bloomery_gpu::card_experts::{CardExperts, CardFamily};
 use bloomery_gpu::hybrid::SlotMap;
@@ -33,15 +34,20 @@ const FAMILY: CardFamily = CardFamily {
 
 /// The card experts of `layers` (the description) as `map` places them and
 /// `w` holds them, `n` wide with routed experts `ff` wide, with buffers for a
-/// pass of `rows` rows when `rows` is more than one. Load-time only.
+/// pass of `rows` rows when `rows` is more than one; `tiered` on a load that
+/// hangs the map's expert tier card ([`CardExperts::tiered`]). Load-time
+/// only.
 pub(crate) fn experts(
     gpu: &Gpu,
     w: &Weights,
-    layers: &[LayerSpec],
-    map: &SlotMap,
-    n: usize,
-    ff: usize,
+    (layers, map): (&[LayerSpec], &SlotMap),
+    (n, ff): (usize, usize),
     rows: usize,
+    tiered: bool,
 ) -> Result<CardExperts, GpuError> {
-    CardExperts::new(gpu, w, FAMILY, layers, map, (n, ff), rows)
+    if tiered {
+        CardExperts::tiered(gpu, w, FAMILY, layers, map, (n, ff), rows)
+    } else {
+        CardExperts::new(gpu, w, FAMILY, layers, map, (n, ff), rows)
+    }
 }

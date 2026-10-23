@@ -1,9 +1,11 @@
 //! A placed load of qwen3moe (Qwen3-30B-A3B), qwen35moe
 //! (Qwen3.6-35B-A3B), or dense qwen35, as `generate_qwen3moe` and the qwen3 serve seat
-//! open one under `--place`: the placement word's stage card
-//! (`generate::Place`, an alias or a card list of one card; a tier card is
-//! refused by name, the program hangs none), the machine
-//! `model::placement::workstation::placed_with_arena` lays out on it with the scratch
+//! open one under `--place`: the placement word's cards
+//! (`generate::Place`; one expert tier is planned, and more than one is
+//! refused by name), the machine [`laid`] lays out — one card as
+//! `workstation::placed_with_arena`, a stage and one tier as
+//! `workstation::plan_tiers` with this model's tier batch and the stage held
+//! as the placed load holds it — with the scratch
 //! the body's placed load holds past the m = 1 scratch, the plan by the
 //! expert rule over the stacks `routed_rule` loads — the trunk on the card,
 //! each layer's routed id prefix as the budget holds, the rest on the host
@@ -31,13 +33,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use bloomery_gpu::arch::qwen3moe::{
     Body, Body35, KvQ8, Open35, OpenOpts, Qwen35moeModel, checkpoint_price35,
 };
+use bloomery_gpu::host::SERVED_TIERS;
 use bloomery_gpu::linear::{KHeadMap, LinearShape};
 use bloomery_gpu::model::{GpuModel, Slots};
 use bloomery_gpu::rope_neox::q8_plane_lens;
 use bloomery_gpu::{Gpu, Qwen3moeModel};
 use bloomery_gpu_gates::GateError;
 use bloomery_gpu_gates::beside::{self, Beside};
-use bloomery_gpu_gates::generate::{Place, PlaceWhy, choose_ctx, short_in};
+use bloomery_gpu_gates::generate::{Place, PlaceWhy, TierRule, choose_ctx, short_in};
 use bloomery_gpu_gates::image_plan;
 use bloomery_gpu_gates::qwen_seat::{Family, decode_mma};
 use bloomery_gpu_gates::record::{self, Record};
@@ -100,9 +103,16 @@ pub const PLACED_LEVERS: [&str; 4] = [
     bloomery_levers::CARD_DONTNEED,
 ];
 
+/// The tier cards this body serves, and no break-even: no sitting has shown
+/// the tier not slower, so two cards run `a` and the plan is not asked.
+const TIER_RULE: TierRule = TierRule {
+    tiers: SERVED_TIERS,
+    break_even: None,
+    basis: "",
+};
+
 /// The placement a qwen3moe or qwen35moe binary's `--place` names, and why,
-/// on `census` (`Place::choose_untiered`: the body serves no tier card):
-/// `flag` as given when set,
+/// on `census` (`Place::choose` by [`TIER_RULE`]): `flag` as given when set,
 /// else `a`, the plan never asked. An unset load still takes
 /// [`PlaceQ3::unplaced_on`]'s pick, the same card; the caller prints
 /// [`PlaceWhy::record`].
@@ -111,7 +121,13 @@ pub const PLACED_LEVERS: [&str; 4] = [
     reason = "the CLI and the qwen3 seat choose by the rule; the e2e gates include the planner without it"
 )]
 pub fn choose(flag: Option<Place>, census: &[DeviceInfo]) -> Result<PlaceWhy, GateError> {
-    Place::choose_untiered(flag, census, "qwen3")
+    Place::choose(flag, census, TIER_RULE, |offer| {
+        Err(format!(
+            "--place unset: no sitting has shown the tier not slower, so the plan is not asked for {}",
+            offer.name()
+        )
+        .into())
+    })
 }
 
 /// The plan inputs of one of the two architectures; the qwen35moe ones,
@@ -146,6 +162,13 @@ pub struct PlaceQ3 {
     /// The cache format this load counts in — the same choice `inputs.kv`
     /// carries, kept beside it for the plane list [`kv_bytes`] splits.
     kv: KvQ8,
+    /// The delta lanes this load's whole-fit verdict prices a qwen35 family
+    /// file's delta layers at ([`delta_planes`]): one on a plain load, the
+    /// load's verify lanes on a load that verifies drafted rows
+    /// (`GpuModel::open_verifying`, `GpuModel::open_mtp`) — the serve seat's,
+    /// from its draft word. A qwen3moe file has no delta layer, and the
+    /// CLI's and the gates' loads are plain.
+    lanes: usize,
     /// The sequences the load holds, whose rows every machine of it carries
     /// ([`laid`]).
     seqs: Seqs,
@@ -204,9 +227,12 @@ fn fixed_seq_bytes(inputs: &Inputs) -> u64 {
     (0..layers_of(inputs)).map(|l| kv.layer_bytes(l, 0)).sum()
 }
 
-/// The machine a placed load of `inputs`'s file lays out on `spec`'s card
-/// over `arena` ([`workstation::placed_with_arena`]), with the rows of what `seqs` holds past the
-/// plan's one-sequence terms: on the card, a [`SLOTS_RESERVE`] of every
+/// The machine a placed load of `inputs`'s file lays out on `specs`' cards
+/// over `arena`: one card as [`workstation::placed_with_arena`], or a stage
+/// and one expert tier as [`workstation::plan_tiers`] with this model's tier
+/// batch and the stage held as the placed load holds it
+/// ([`q3::stage_placed`]). Then the rows of what `seqs` holds past the
+/// plan's one-sequence terms: on the stage card, a [`SLOTS_RESERVE`] of every
 /// resident sequence's fixed stores ([`fixed_seq_bytes`]) but the live one's
 /// — the plan's KV term at the total counts the per-position rows of every
 /// slot's share and the fixed stores once — none where they are 0; on the
@@ -217,14 +243,33 @@ fn fixed_seq_bytes(inputs: &Inputs) -> u64 {
 /// context the machine is laid for; on a media load each slot's rotation
 /// table holds as many positions.
 fn laid(
-    spec: CardSpec,
+    specs: &[CardSpec],
     inputs: &Inputs,
     arena: u64,
     seqs: Seqs,
     slot_ctx: u64,
     media: Media,
 ) -> Result<Machine, GateError> {
-    let mut machine = workstation::placed_with_arena(spec, layers_of(inputs), arena);
+    let layers = layers_of(inputs);
+    let mut machine = match specs {
+        [stage] => workstation::placed_with_arena(*stage, layers, arena),
+        [stage, tier] => {
+            let batch = match inputs {
+                Inputs::Qwen3(i) => q3::tier_batch(&i.hp),
+                Inputs::Qwen35(i) => q35::leg_tier_batch(&i.hp),
+            };
+            let mut machine = workstation::plan_tiers(layers, *stage, &[*tier], None, batch)?;
+            q3::stage_placed(&mut machine, arena);
+            machine
+        }
+        other => {
+            return Err(format!(
+                "a qwen plan runs one stage card and at most one expert tier; {} cards were named",
+                other.len()
+            )
+            .into());
+        }
+    };
     let past = u64::try_from(seqs.slots.saturating_sub(1))
         .map_or(u64::MAX, |n| n.saturating_mul(fixed_seq_bytes(inputs)));
     if past > 0 {
@@ -273,11 +318,11 @@ pub fn share(o: &Open35, ctx: usize, slots: usize) -> Open35 {
 }
 
 impl PlaceQ3 {
-    /// `place` resolved against `census`, refused by name when it names an
-    /// expert tier card.
-    fn resolve(place: Place, census: &[DeviceInfo]) -> Result<Place, GateError> {
+    /// `place` resolved against `census`. More than one expert tier card is
+    /// refused by name: `arch`'s body serves [`SERVED_TIERS`].
+    fn resolve(place: Place, census: &[DeviceInfo], arch: &str) -> Result<Place, GateError> {
         let place = place.on(census)?;
-        place.serves("qwen3moe", 0)?;
+        place.serves(arch, SERVED_TIERS)?;
         Ok(place)
     }
 
@@ -301,7 +346,7 @@ impl PlaceQ3 {
         kv: KvQ8,
         beside: Beside,
     ) -> Result<PlaceQ3, GateError> {
-        let place = PlaceQ3::resolve(place, census)?;
+        let place = PlaceQ3::resolve(place, census, "qwen3moe")?;
         let mut inputs = q3::PlanInputs::read(file)?;
         if kv == KvQ8::Q8 {
             inputs.kv = inputs.kv.in_q8();
@@ -313,7 +358,7 @@ impl PlaceQ3 {
             tables: None,
         };
         let machine = laid(
-            place.card_specs()?[0],
+            &place.card_specs()?,
             &inputs,
             arena,
             Seqs::ONE,
@@ -325,6 +370,7 @@ impl PlaceQ3 {
             arch: "qwen3moe",
             inputs,
             kv,
+            lanes: 1,
             seqs: Seqs::ONE,
             media,
             machine,
@@ -356,7 +402,27 @@ impl PlaceQ3 {
         seqs: Seqs,
         beside: Beside,
     ) -> Result<PlaceQ3, GateError> {
-        let place = PlaceQ3::resolve(place, census)?;
+        PlaceQ3::qwen35_lanes(file, place, census, o, seqs, beside, 1)
+    }
+
+    /// [`PlaceQ3::qwen35_on`] with the delta lanes (`lanes`, at least one)
+    /// its whole-fit verdict prices a delta layer at ([`delta_planes`]): the
+    /// serve seat's, which opens loads that verify drafted rows.
+    fn qwen35_lanes(
+        file: &Split,
+        place: Place,
+        census: &[DeviceInfo],
+        o: Open35,
+        seqs: Seqs,
+        beside: Beside,
+        lanes: usize,
+    ) -> Result<PlaceQ3, GateError> {
+        let arch = if file.architecture() == Some("qwen35") {
+            "qwen35"
+        } else {
+            "qwen35moe"
+        };
+        let place = PlaceQ3::resolve(place, census, arch)?;
         let mut inputs = q35::PlanInputs::describe(file)?;
         if o.kv == KvQ8::Q8 {
             inputs.kv = inputs.kv.in_q8();
@@ -375,7 +441,7 @@ impl PlaceQ3 {
         };
         let inputs = Inputs::Qwen35(Box::new(inputs));
         let machine = laid(
-            place.card_specs()?[0],
+            &place.card_specs()?,
             &inputs,
             arena,
             seqs,
@@ -384,13 +450,10 @@ impl PlaceQ3 {
         )?;
         Ok(PlaceQ3 {
             place,
-            arch: if file.architecture() == Some("qwen35") {
-                "qwen35"
-            } else {
-                "qwen35moe"
-            },
+            arch,
             inputs,
             kv: o.kv,
+            lanes,
             seqs,
             media,
             machine,
@@ -424,7 +487,7 @@ impl PlaceQ3 {
     ) -> Result<u64, GateError> {
         let card_experts = |budget: u64| -> Result<Option<u64>, GateError> {
             let levers = PlanLevers {
-                card_budget_bytes: Some(budget),
+                card_budget_bytes: Some(budget).into(),
             };
             match self.plan(ctx, &levers) {
                 Ok(plan) => Ok(Some(plan.cards.first().ok_or("a plan of no card")?.experts)),
@@ -486,7 +549,14 @@ impl PlaceQ3 {
         load: Result<WholeLoad, String>,
     ) -> Result<Whole, GateError> {
         let layers = 0..self.layers();
-        let kv = kv_bytes(&layers, &self.inputs, (self.kv, self.media), slots, ctx);
+        let kv = kv_bytes(
+            &layers,
+            &self.inputs,
+            (self.kv, self.media),
+            self.lanes,
+            slots,
+            ctx,
+        );
         whole_on(
             self.place.card_specs()?[0],
             inputs_model(&self.inputs),
@@ -512,7 +582,8 @@ impl PlaceQ3 {
 
     /// The `plan` record of `plan`: the card, the architecture, the expert
     /// rule, the routed experts on the card and the host, the fewest and
-    /// the most one layer keeps on the card, the card's free bytes when the
+    /// the most one layer keeps on the card, the expert tier card and the
+    /// experts it holds when the plan has one, the card's free bytes when the
     /// census read them, the host room the plan was made at when it had
     /// one, and its device. `why` names what made a run with `--place`
     /// unset take this placed plan.
@@ -542,6 +613,12 @@ impl PlaceQ3 {
                     plan.n_l.iter().max().copied().unwrap_or(0)
                 ),
             );
+        let r = match (self.machine.tiers.first(), plan.tier_n_l.first()) {
+            (Some(t), Some(n)) => r
+                .w("tier", &t.name)
+                .u("tier_experts", n.iter().sum::<u64>()),
+            _ => r,
+        };
         let r = match self.machine.cards.first().and_then(|c| c.free_bytes) {
             Some(free) => r.u("card_free", free),
             None => r,
@@ -565,6 +642,7 @@ impl PlaceQ3 {
         let r = r
             .csv("devices", record::plan_devices(plan.machine))
             .w("cuda_order", record::cuda_order());
+        let r = record::with_requantized(r, plan.model);
         let program = match self.inputs {
             Inputs::Qwen3(_) => Program::Qwen3moeBody,
             Inputs::Qwen35(_) => Program::Qwen35Body,
@@ -583,7 +661,8 @@ impl PlaceQ3 {
 /// slot, layer by layer, holds the planes this function lists through the
 /// card's allocation granule ([`placement::allocator_bytes`]) — the engine allocates
 /// each plane its own buffer per layer (`KvPlanes::new`, mirrored by
-/// [`gqa_planes`]) and each added slot repeats the set
+/// [`gqa_planes`], and a delta layer's `RecStore`, mirrored by
+/// [`delta_planes`] at the load's `lanes`) and each added slot repeats the set
 /// ([`Slots::new_seq`]), so the verdict counts the granules those
 /// allocations round to, not the raw sum a `KvBytes` layer gives. One slot
 /// is the one-sequence load, plus that rounding. `slots` is at least one;
@@ -593,6 +672,7 @@ fn kv_bytes(
     layers: &std::ops::Range<usize>,
     inputs: &Inputs,
     (kv, media): (KvQ8, Media),
+    lanes: usize,
     slots: usize,
     ctx: u64,
 ) -> u64 {
@@ -608,19 +688,19 @@ fn kv_bytes(
                     Some(Kind::Attention) => {
                         gqa_planes(&mut planes, i.hp.n_head_kv, i.hp.head_dim, kv, rows);
                     }
-                    // The shape of the file's own delta layers, its lengths
-                    // the two buffers `RecStore::new` zeroes; the head map
-                    // enters neither length, and a qwen3.6 delta layer is
+                    // The shape of the file's own delta layers; the head map
+                    // enters none of its lengths, and a qwen3.6 delta layer is
                     // the tiled one (`delta_shape` of the gpu side's plan).
                     Some(Kind::DeltaRule) => {
-                        let shape = LinearShape {
-                            n_k: i.hp.k_heads,
-                            n_v: i.hp.v_heads,
-                            map: KHeadMap::Tiled,
-                        };
-                        // One state lane, `Body35`'s `LANES`.
-                        planes.push(4 * shape.state_len() as u64);
-                        planes.push(4 * shape.ring_len() as u64);
+                        delta_planes(
+                            &mut planes,
+                            LinearShape {
+                                n_k: i.hp.k_heads,
+                                n_v: i.hp.v_heads,
+                                map: KHeadMap::Tiled,
+                            },
+                            lanes,
+                        );
                     }
                     None => {}
                 },
@@ -633,6 +713,25 @@ fn kv_bytes(
         }
     }
     placement::allocator_bytes(GRANULE, planes)
+}
+
+/// The plane bytes a delta layer of `shape` holds at `lanes` lanes onto
+/// `planes`: the two buffers `RecStore::new` zeroes — the state, a lane, and
+/// the conv ring once (`LinearShape::lens`) — and, on a load that keeps a
+/// lane a verify row, the `lanes` u32 stamps its stamped store holds
+/// (`RecStore::stamped`); the engine's layout prices the same count
+/// (`KvLayout::of_lanes`, `runtime::stores`'s terms).
+///
+/// # Panics
+///
+/// On no lane, by name.
+fn delta_planes(planes: &mut Vec<u64>, shape: LinearShape, lanes: usize) {
+    assert!(lanes >= 1, "delta_planes: a state of at least one lane");
+    planes.push(4 * lanes as u64 * shape.state_len() as u64);
+    planes.push(4 * shape.ring_len() as u64);
+    if lanes > 1 {
+        planes.push(4 * lanes as u64);
+    }
 }
 
 /// The GQA cache planes' bytes at `rows` positions onto `planes`, in the
@@ -913,14 +1012,29 @@ pub fn unplaced_qwen35_slots(
     seqs: Seqs,
     beside: Beside,
 ) -> Result<Unplaced, GateError> {
+    unplaced_qwen35_lanes(file, census, o, seqs, beside, 1)
+}
+
+/// [`unplaced_qwen35_slots`] with the delta lanes (`lanes`, at least one)
+/// its whole-fit verdict prices a delta layer at ([`delta_planes`]): the
+/// serve seat's, which opens loads that verify drafted rows.
+fn unplaced_qwen35_lanes(
+    file: &Split,
+    census: &[DeviceInfo],
+    o: &Open35,
+    seqs: Seqs,
+    beside: Beside,
+    lanes: usize,
+) -> Result<Unplaced, GateError> {
     let at = share(o, o.ctx, seqs.slots);
-    let probe = PlaceQ3::qwen35_on(
+    let probe = PlaceQ3::qwen35_lanes(
         file,
         PlaceQ3::unplaced_on(census)?,
         census,
         at,
         seqs,
         beside,
+        lanes,
     )?;
     let whole = probe.whole_at(u64::try_from(o.ctx)?, seqs.slots, qwen35_whole(file, at))?;
     probe.unplaced(o.ctx, &whole)
@@ -993,7 +1107,10 @@ pub fn serve_open35(split: &Split, ctx: usize, kv: KvQ8, media: bool) -> Result<
 /// The serve seat's load of `slots` resident sequences at `total` positions,
 /// decided on one census reading: under `--place`, the placed plan there;
 /// unset, the whole model while the whole-fit verdict takes it, else the
-/// placed plan ([`unplaced_qwen3_slots`], [`unplaced_qwen35_slots`]).
+/// placed plan ([`unplaced_qwen3_slots`], [`unplaced_qwen35_lanes`]). The
+/// verdict prices a qwen35 family file's delta layers at `lanes` lanes
+/// (at least one): one on a plain load, the load's verify lanes on a load
+/// that verifies drafted rows — the seat's, from its draft word.
 ///
 /// # Errors
 /// The plan's or the verdict's refusal.
@@ -1005,6 +1122,7 @@ pub fn serve_load(
     (split, census): (&Split, &[DeviceInfo]),
     (total, slots): (usize, usize),
     o: ServeOpts<'_>,
+    lanes: usize,
 ) -> Result<ServeLoad, GateError> {
     let unplaced = match (
         Family::from_name(split.architecture().unwrap_or("<missing>")),
@@ -1013,7 +1131,7 @@ pub fn serve_load(
         (Some(Family::Qwen35moe | Family::Qwen35), Some(p)) => {
             let at = share(&serve_open35(split, total, o.kv, o.media)?, total, slots);
             let seqs = seqs_qwen35(split, at.ubatch, slots)?;
-            let q = PlaceQ3::qwen35_on(split, p, census, at, seqs, o.beside)?;
+            let q = PlaceQ3::qwen35_lanes(split, p, census, at, seqs, o.beside, lanes)?;
             let plan = q.plan(total, o.levers)?;
             let whole = q.whole_card_qwen35(split, &plan, (total, slots), at)?;
             return Ok(ServeLoad::Placed {
@@ -1026,7 +1144,7 @@ pub fn serve_load(
         (Some(Family::Qwen35moe | Family::Qwen35), None) => {
             let open = serve_open35(split, total, o.kv, o.media)?;
             let seqs = seqs_qwen35(split, open.ubatch, slots)?;
-            unplaced_qwen35_slots(split, census, &open, seqs, o.beside)?
+            unplaced_qwen35_lanes(split, census, &open, seqs, o.beside, lanes)?
         }
         (Some(Family::Qwen3moe), Some(p)) => {
             let q = PlaceQ3::qwen3_on(split, p, census, total, o.kv, o.beside)?;
@@ -1080,13 +1198,30 @@ pub fn serve_choice(
     (set, slots): (Option<usize>, usize),
     o: ServeOpts<'_>,
 ) -> Result<(Chosen<ServeLoad>, Reads), GateError> {
+    serve_choice_lanes(split, (set, slots), o, 1)
+}
+
+/// [`serve_choice`] with the delta lanes (`lanes`, at least one) the
+/// whole-fit verdict prices a qwen35 family file's delta layers at
+/// ([`delta_planes`]): the serve seat's, which opens loads that verify
+/// drafted rows.
+#[allow(
+    dead_code,
+    reason = "the serve seat reads it; the routed legs and the types gate read the plain count, and the CLI and the e2e gates include the planner without it"
+)]
+pub fn serve_choice_lanes(
+    split: &Split,
+    (set, slots): (Option<usize>, usize),
+    o: ServeOpts<'_>,
+    lanes: usize,
+) -> Result<(Chosen<ServeLoad>, Reads), GateError> {
     let before = census_reads();
     let census = census()?;
     let mut probes = 0;
     let plan_at = |c: u64| -> Result<Probe<ServeLoad>, GateError> {
         probes += 1;
         let total = usize::try_from(c)?.saturating_mul(slots);
-        let load = match serve_load((split, &census), (total, slots), o) {
+        let load = match serve_load((split, &census), (total, slots), o, lanes) {
             Ok(load) => load,
             Err(e) => return short_or(e),
         };
@@ -1382,6 +1517,56 @@ pub(super) mod tests {
     use super::*;
     use bloomery_gpu_gates::generate::choose_ctx_of;
     use model::placement::ModelTensor;
+
+    /// A drafted verdict's delta bytes are the engine's lane formula
+    /// ([`delta_planes`]): at Qwen3.6's shape (32 value heads of 128, 16 key
+    /// heads, a 4-tap conv) one lane is the state in place with the ring and
+    /// no stamp, and `Body35::VERIFY_LANES` lanes hold the other lanes and a
+    /// u32 stamp a lane — `runtime::stores`'s own terms, the ones
+    /// `KvLayout::of_lanes` sums and the load's stamped stores hold
+    /// (`RecStore::stamped`).
+    #[allow(
+        dead_code,
+        reason = "`generate_qwen3moe`'s test calls it; every other bin that includes this file leaves it unused"
+    )]
+    pub(crate) fn a_drafted_verdict_prices_the_engines_lanes() {
+        use runtime::stores::{U32_BYTES, delta_lane_bytes, recurrent_bytes};
+        const V: usize = 32;
+        const K: usize = 16;
+        const D: usize = 128;
+        const CONV: usize = 4;
+        let shape = LinearShape {
+            n_k: K,
+            n_v: V,
+            map: KHeadMap::Tiled,
+        };
+        let sum = |lanes: usize| {
+            let mut planes = Vec::new();
+            delta_planes(&mut planes, shape, lanes);
+            planes.iter().sum::<u64>()
+        };
+        // The engine's bytes at the same count: `gdn_bytes`'s own terms, the
+        // ones `KvLayout::of_lanes` puts in a delta layer's `recurrent`.
+        let engine = |lanes: usize| {
+            recurrent_bytes(V, K, D, CONV)
+                + if lanes > 1 {
+                    delta_lane_bytes(V, D, lanes)
+                } else {
+                    0
+                }
+        };
+        let lanes = Body35::VERIFY_LANES;
+        assert_eq!(sum(1), engine(1), "one lane: the state in place, no stamp");
+        assert_eq!(
+            sum(lanes),
+            engine(lanes),
+            "the verdict prices every lane a drafted load's store holds"
+        );
+        assert_eq!(
+            sum(lanes) - sum(1),
+            (lanes as u64 - 1) * 4 * V as u64 * D as u64 * D as u64 + U32_BYTES * lanes as u64
+        );
+    }
 
     #[allow(
         dead_code,

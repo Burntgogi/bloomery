@@ -1,0 +1,19 @@
+# The Muse Spark Open real file's CPU node dumps (UD-IQ2_XXS, 225.6 GB in six shards,
+# /models/Muse-Spark-Open-816B-A42B-UD-IQ2_XXS), `just dump-ref-musespark`: the five prompts (41, 53, 116, 1,536 and
+# 2,560 ids) from ONE load, into ref_musespark_{a,b,c,d,e}. The phases run one after the other.
+# Predicted wall [derived], seconds:
+#   load      225.6 GB mmapped from /models (nvme0) at ~3-5 GB/s when the page cache holds none of it; nothing repacked on
+#             this AVX2 CPU (IQ2_XXS, Q6_K, Q8_0, Q4_K): 45-75 s
+#   prefill   4,306 ids x 2 x ~42 G MACs a token (42B active: 8 of 256 latent experts, the dense attention, the head)
+#             = ~360 TFLOP at an effective 1-2 TOP/s on 32 Zen 3 cores (IQ2_XXS dequant in the dot): 180-360 s
+#   greedy    192 tokens reading ~12 GB a token (the active experts at 2.06 bpw, the dense part, the Q6_K head) over
+#             ~100-140 GB/s of host DRAM: 16-25 s
+#   writes    a's 26 taps x 62 layers x 41 rows and e's l_out x 2,560 rows, 32 KB a row: ~8 GB at ~2 GB/s: 4-10 s
+#   total     4-8 min, bound 3600 s.
+# What the run guarantees: CUDA hidden, the CPU lease held, the staging set installed only when each prompt's manifest
+# carries its `# complete` trailer.
+kind: exclusive
+reason: musespark_dump runs mainline llama.cpp on 32 CPU threads over a 225 GB mmap; beside a timed run or a gate batch
+  it would take their cores and their page cache, so it holds the lease; why now: the real tier's oracle sets the Muse
+  real-file e2e and placement rounds read (release 0.3.9's headline)
+minutes: 4..15

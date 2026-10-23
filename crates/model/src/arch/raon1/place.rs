@@ -1,9 +1,10 @@
 //! A Raon-1 file planned onto a machine: the common hybrid owner's plan ([`place_hybrid`]) over
 //! this family's reading. What each layer holds is read off the description (an RDA layer's
 //! state and conv ring, a latent layer's plane of cached rows), and a machine that hangs an
-//! expert tier card is refused by name ([`PlaceError::Tier`]) until a body serves one. The
-//! family's own is the reading, and the lanes a verifying load's delta layers hold
-//! ([`VERIFY_LANES`]).
+//! expert tier card is refused by name ([`PlaceError::Tier`]) until a body serves one. The down
+//! arm admits the common downs, a Q6_K down included, beside a gate and up the leg runs, and a
+//! packed Q5_0. The family's own is the reading, and the lanes a verifying load's delta layers
+//! hold ([`VERIFY_LANES`]).
 
 use std::num::NonZeroUsize;
 

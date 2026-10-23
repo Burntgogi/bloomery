@@ -45,12 +45,19 @@
 //! stops before any load by the plan's own refusal. `--ctx` is the slot's
 //! context, chosen by `generate::choose_ctx` as every seat's is.
 //!
-//! The records on stderr: the `draft rule` line, `place unset`, one `ctx`
-//! line, the `plan` record, the `parallel` line, then the `load` record, the
-//! draft's `load draft=dflash2` record when one loads and, once the port is
-//! bound, the `listening` record (`record::BLOOMERY_SERVE_RAON1`); the width
-//! chooser's `mtp width` record at each drafted request's end. `--plan` ends
-//! the process after the `parallel` line, nothing loaded.
+//! `--embd-model` is taken before this seat parses. The side model is seated
+//! before the plan; the stage card holds its bytes beside the draft's reserve
+//! (`beside::reserve_on`). It loads after the chat model, and the server
+//! answers its embeddings routes from it.
+//!
+//! The records on stderr: the `draft rule` line, `place unset`, the
+//! `embedding_seat` record when one is named, one `ctx` line (plus the stage
+//! card's reserve note when it holds the embedding model), the `plan` record,
+//! the `parallel` line, then the `load` record, the draft's `load
+//! draft=dflash2` record when one loads and, once the port is bound, the
+//! `listening` record (`record::BLOOMERY_SERVE_RAON1`); the width chooser's
+//! `mtp width` record at each drafted request's end. `--plan` ends the process
+//! after the `parallel` line, nothing loaded.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -60,6 +67,7 @@ use app::Session;
 use bloomery_gpu::arch::raon1::Body;
 use bloomery_gpu::model::{ChainBody, StepMode};
 use bloomery_gpu::{Gpu, GpuModel};
+use bloomery_gpu_gates::beside::{self, Beside};
 use bloomery_gpu_gates::bind::{
     ChatSurface, Pass, Seat, SeatEngine, SeatFlags, Vocab, arm_screen, model_props, note_line,
     parallel_line, placement_of, slots_of,
@@ -67,6 +75,7 @@ use bloomery_gpu_gates::bind::{
 use bloomery_gpu_gates::generate::{Place, choose_ctx};
 use bloomery_gpu_gates::need;
 use bloomery_gpu_gates::record::{self, Record};
+use bloomery_gpu_gates::side_seat;
 use bloomery_gpu_gates::{GateError, gpu_census, ref_model_path};
 use bloomery_levers::Levers;
 use gguf::Split;
@@ -74,9 +83,9 @@ use model::arch::Arch;
 use model::arch::dflash2::Hparams as DraftHparams;
 use model::arch::models::ReasoningFormat;
 use model::arch::raon1::place::{PlanInputs, VERIFY_LANES};
-use model::placement::PlanLevers;
 use model::placement::ctx_ask::{DEFAULT_SLOTS, probe_of};
-use model::placement::workstation::{DRAFT_RESERVE, DeviceId};
+use model::placement::workstation::{DeviceId, draft_reserve};
+use model::placement::{Device, PlanLevers};
 use runtime::width::Mode as WidthMode;
 use serve::{CacheNote, Drafted, EngineProps, Saved, ServeError};
 use tokenizer::Tokenizer;
@@ -582,9 +591,9 @@ impl Seat for Raon1 {
     }
 }
 
-/// Loads the model and serves until the listener or the engine fails;
-/// `Ok` carries why the server ended.
-pub fn run(args: &[String]) -> Result<ServeError, GateError> {
+/// Loads the model, and the embedding model `side` names beside it, and serves until the listener
+/// or the engine fails; `Ok` carries why the server ended.
+pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateError> {
     let levers = bloomery_levers::at_main(ACTS_ON)?;
     record::at_main(NAME, record::BLOOMERY_SERVE_RAON1);
     arm_screen(levers.screen());
@@ -640,6 +649,13 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let chosen = Place::choose_untiered(a.place, &census, "raon1")?;
     chosen.record().eprint();
     let place = chosen.place;
+    // The side model's seat before the plan, which holds its bytes when it sits on the stage card.
+    let side = side.read()?;
+    let side_seat = side.as_ref().map(|s| s.seat(place)).transpose()?;
+    let held = Beside {
+        image: None,
+        embedding: side_seat.as_ref().and_then(|s| s.reserve),
+    };
     // A drafted load verifies a block's rows: each delta layer keeps a lane a row, and the card
     // holds the draft beside the target, both counted before the context is sized.
     let inputs = match &draft {
@@ -648,15 +664,14 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     };
     let mut machine = place.machine_untiered()?(inputs.model.layers);
     if let Some(d) = &draft {
-        machine.cards[0]
-            .reserves
-            .push((DRAFT_RESERVE.to_owned(), d.reserve));
+        machine.reserve(draft_reserve(Device::Card(0), d.reserve))?;
     }
+    beside::reserve_on(&mut machine, held);
     let asked = choose_ctx(&split, (a.ctx, slots), (None, None), |c| {
         probe_of(inputs.plan(&machine, c, &plan_levers))
-            .map_err(|e| format!("--place {}: {e}", place.name()))
+            .map_err(|e| beside::refusal(held, format!("--place {}: {e}", place.name())))
     })?;
-    eprintln!("{}", asked.line());
+    eprintln!("{}{}", asked.line(), beside::note(&machine.cards[0]));
     let slot_ctx = usize::try_from(asked.slot_ctx)?;
     let plan = asked.plan;
     record::plan(place.name(), &machine, &plan).eprint();
@@ -683,7 +698,8 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     drop(split);
     let vocab = Arc::new(Vocab::new(tok)?);
     let engine = SeatEngine::spawn(move || Raon1::open(open), slot_ctx, vocab, device, props, 0)?;
-    let server = a.bind(engine, chat, &path, slots, &levers, None)?;
+    let side = side_seat::Side::start(side.zip(side_seat))?;
+    let server = a.bind(engine, chat, &path, slots, &levers, side)?;
     Record::new(&record::LISTENING_RAON1)
         .w("place", place.name())
         .u("ctx", slot_ctx)

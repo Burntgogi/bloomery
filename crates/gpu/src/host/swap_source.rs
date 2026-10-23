@@ -57,7 +57,7 @@ use cuda_core::{CudaContext, CudaStream, sys};
 use gguf::Split;
 use gguf::quant::GgmlType;
 use model::arch::names::routed_stacks;
-use model::placement::host_lock::{HostFile, HostSet, expert_run};
+use model::placement::host_lock::{HostFile, HostSet, expert_runs};
 use model::placement::{ModelTensor, ModelTensors, Plan};
 use model::r8file::R8Pair;
 use runtime::swaprule::KeptRows;
@@ -379,28 +379,55 @@ pub struct ResidencySpec {
 
 // --------------------------------------------------------------- source
 
-/// One layer's parts: the file tensors, the stage stacks' base addresses and
-/// slots, and each part's bytes — this layer's own, as the file holds its
-/// stacks.
+/// One layer's parts: the file tensors (its stacks), the stage stacks' base
+/// addresses and slots, and each part's bytes and what of its stack it is —
+/// this layer's own, as the file holds its stacks. A stack is one part, or
+/// three for NVFP4 rows a folder locates ([`Plane`]), so `base`, `parts` and
+/// `of` run over the parts and `tensors` over the stacks.
 struct LayerParts {
     tensors: Vec<ModelTensor>,
     base: Vec<sys::CUdeviceptr>,
     slots: usize,
     parts: Vec<usize>,
+    of: Vec<(usize, Plane)>,
+    /// Per stack, its experts' tensor scales as little-endian bytes, 4 an
+    /// expert: the [`Plane::Scale`] part's source; empty for a stack read
+    /// whole.
+    scales: Vec<Vec<u8>>,
+}
+
+/// What a part of an expert is of its stack: the stack's bytes whole (a
+/// K-quant, IQ, Q5_1, Q8_0 or MXFP4 stack, the card holding the file's
+/// blocks), or one plane of NVFP4 rows a checkpoint folder locates
+/// (`gguf::Place::Stack`), which the card holds as NVFP4 planes
+/// (`DevWeight::Nvfp4Stack`): the codes, staged in the card's block order
+/// ([`Transform::Nvfp4Codes`]), the block scales, staged checked
+/// ([`Transform::Ue4m3Scales`]), and the expert's tensor scale, the f32 the
+/// folder's header holds for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Plane {
+    Whole,
+    Codes,
+    BlockScales,
+    Scale,
 }
 
 /// What the per-layer parts check reads of one stack name's resident weight
 /// ([`Weights::get`]): `None` when the load holds no weight of the name,
-/// else the resident stack's file-block type (`DevWeight::KQuant`: a K-quant,
-/// IQ, Q5_1, Q8_0 or MXFP4 stack as the file stores its blocks), its words and rows, and its
-/// buffer's device address. `ty` is `None` — and the words and rows stand
-/// unread — for a weight of another device format, which the check refuses
-/// beside its layer's other parts.
+/// else the resident stack's type, its words and rows, and its buffer's
+/// device address — a file-block type (`DevWeight::KQuant`: a K-quant, IQ,
+/// Q5_1, Q8_0 or MXFP4 stack as the file stores its blocks), or
+/// [`GgmlType::NVFP4_ROWS`] for NVFP4 planes (`DevWeight::Nvfp4Stack`), whose
+/// words, rows and address are its code plane's and `nvfp4` its block-scale
+/// plane's words and address, then its tensor scales' count and address.
+/// `ty` is `None` — and the rest stands unread — for a weight of another
+/// device format, which the check refuses beside its layer's other parts.
 struct FoundStack {
     ty: Option<GgmlType>,
     words: usize,
     rows: usize,
     ptr: sys::CUdeviceptr,
+    nvfp4: Option<[(usize, sys::CUdeviceptr); 2]>,
 }
 
 impl FoundStack {
@@ -412,29 +439,59 @@ impl FoundStack {
                 words: w.buf().len(),
                 rows: w.rows(),
                 ptr: w.buf().cu_deviceptr(),
+                nvfp4: None,
+            },
+            DevWeight::Nvfp4Stack { qs, e, scales, .. } => FoundStack {
+                ty: Some(GgmlType::NVFP4_ROWS),
+                words: qs.buf().len(),
+                rows: qs.rows(),
+                ptr: qs.buf().cu_deviceptr(),
+                nvfp4: Some([
+                    (e.buf().len(), e.buf().cu_deviceptr()),
+                    (scales.buf().len(), scales.buf().cu_deviceptr()),
+                ]),
             },
             _ => FoundStack {
                 ty: None,
                 words: 0,
                 rows: 0,
                 ptr: 0,
+                nvfp4: None,
             },
+        }
+    }
+
+    /// The stack's parts in stage order, each its base address and what of
+    /// the stack it is: the stack whole, or its three planes.
+    fn parts(&self) -> Vec<(sys::CUdeviceptr, Plane)> {
+        match self.nvfp4 {
+            None => vec![(self.ptr, Plane::Whole)],
+            Some([(_, e), (_, s)]) => vec![
+                (self.ptr, Plane::Codes),
+                (e, Plane::BlockScales),
+                (s, Plane::Scale),
+            ],
         }
     }
 }
 
 /// Layer `l`'s parts and slots from what the load holds of its stacks:
-/// `names` its stack names in stack order, `types` the K-quants its kernels
+/// `names` its stack names in stack order, `types` the types its kernels
 /// read them in, `found` and `tensors` what the load's weights and the plan
-/// hold of each name, and `experts` the routed experts a stack holds. Each
-/// part is its tensor's `file_bytes / experts`; the slots are the last
-/// stack's rows over its tensor's `dims[1]`. `Ok(None)`: the load holds
-/// none of the layer's stacks. Refused by name, every error naming
-/// `FileSwap::new`, the entry point the check serves: a names and types
-/// count that differs, a stack not a resident K-quant of its listed type, a
-/// name the plan does not hold, a part not a whole number of 4-byte words,
-/// and a stack too short for its slots. Pure host code: the tests below
-/// exercise layers whose layouts differ without a model file.
+/// hold of each name, and `experts` the routed experts a stack holds. A
+/// stack of whole experts is one part of its tensor's `file_bytes /
+/// experts`; NVFP4 rows held as card planes are three: an expert's `rows ·
+/// k / 2` code bytes, `rows · k / 16` block-scale bytes and its 4-byte
+/// tensor scale (`dims` `[k, rows, experts]`), whose first two make the
+/// tensor's bytes an expert. The slots are the last stack's rows over its
+/// tensor's `dims[1]`. `Ok(None)`: the load holds none of the layer's
+/// stacks. Refused by name, every error naming `FileSwap::new`, the entry
+/// point the check serves: a names and types count that differs, a stack
+/// not resident as its listed type, a name the plan does not hold, a part
+/// not a whole number of 4-byte words, planes that are not the tensor's
+/// bytes or not whole 64-value blocks, and a stack too short for its slots.
+/// Pure host code: the tests below exercise layers whose layouts differ
+/// without a model file.
 fn layer_parts(
     l: usize,
     names: &[String],
@@ -468,7 +525,8 @@ fn layer_parts(
             _ => Err(GpuError::tensor(
                 WHAT,
                 n.clone(),
-                "a resident K-quant routed stack beside the layer's other parts",
+                "a resident routed stack of its listed type (a K-quant, or NVFP4 rows as card \
+                 planes) beside the layer's other parts",
             )),
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -485,19 +543,73 @@ fn layer_parts(
         .collect();
     let slots =
         stacks_of[stacks_of.len() - 1].rows / tensors[tensors.len() - 1].dims[1].max(1) as usize;
+    let mut parts = Vec::with_capacity(per.len());
     for (i, st) in stacks_of.iter().enumerate() {
-        if per[i] == 0 || !per[i].is_multiple_of(4) || st.words * 4 < slots * per[i] {
+        let Some(planes) = st.nvfp4 else {
+            if per[i] == 0 || !per[i].is_multiple_of(4) || st.words * 4 < slots * per[i] {
+                return Err(GpuError::shape(
+                    WHAT,
+                    format!(
+                        "layer {l} part {i}: {} bytes an expert, a stack of {} words for \
+                         {slots} slots",
+                        per[i], st.words
+                    ),
+                ));
+            }
+            parts.push(per[i]);
+            continue;
+        };
+        let dim = |d: usize| tensors[i].dims.get(d).copied().unwrap_or(0) as usize;
+        let (k, rows) = (dim(0), dim(1));
+        // Bytes an expert in each plane, and the words (f32s for the scales)
+        // each plane holds.
+        let bytes = [rows * (k / 2), rows * (k / 16), 4];
+        let words = [st.words, planes[0].0, planes[1].0];
+        if k == 0
+            || !k.is_multiple_of(64)
+            || rows == 0
+            || bytes[0] + bytes[1] != per[i]
+            || words.iter().zip(&bytes).any(|(&w, &b)| w * 4 < slots * b)
+        {
             return Err(GpuError::shape(
                 WHAT,
                 format!(
-                    "layer {l} part {i}: {} bytes an expert, a stack of {} words for \
-                     {slots} slots",
-                    per[i], st.words
+                    "stack {}: NVFP4 planes of {k} values a row, {rows} rows and {} bytes an \
+                     expert, planes of {}, {} and {} words for {slots} slots",
+                    names[i], per[i], st.words, planes[0].0, planes[1].0
                 ),
             ));
         }
+        parts.extend(bytes);
     }
-    Ok(Some((per, slots)))
+    Ok(Some((parts, slots)))
+}
+
+/// The tensor scales of the NVFP4 rows stack `t` of `experts` experts where
+/// the folder's header holds them (`gguf::Place::Stack`), as little-endian
+/// bytes, 4 an expert: the [`Plane::Scale`] parts' source. Refused by name: a
+/// stack the split does not locate as matrices, and one whose scales do not
+/// number its experts.
+fn tensor_scales(split: &Split, t: &ModelTensor, experts: u64) -> Result<Vec<u8>, GpuError> {
+    match split.place(&t.name) {
+        Some(gguf::Place::Stack { scales, .. }) if scales.len() as u64 == experts => {
+            Ok(scales.iter().flat_map(|s| s.to_le_bytes()).collect())
+        }
+        Some(gguf::Place::Stack { scales, .. }) => Err(GpuError::shape(
+            "FileSwap::new",
+            format!(
+                "stack {}: {} tensor scales for {experts} experts",
+                t.name,
+                scales.len()
+            ),
+        )),
+        _ => Err(GpuError::tensor(
+            "FileSwap::new",
+            t.name.clone(),
+            "NVFP4 rows a checkpoint folder locates, each expert's matrix where the folder keeps \
+             it, beside its tensor scale",
+        )),
+    }
 }
 
 /// The one convert step is built from the first card layer's parts: a card
@@ -610,19 +722,38 @@ impl FileSwap {
                 out.push(None);
                 continue;
             };
-            // The check held every name: a resident K-quant stack of its
-            // listed type and a tensor of the plan.
+            // The check held every name: a resident stack of its listed type
+            // and a tensor of the plan.
+            let tensors: Vec<ModelTensor> = tensors
+                .into_iter()
+                .map(|t| t.cloned().expect("a plan tensor the check held"))
+                .collect();
+            let (mut base, mut of) = (Vec::new(), Vec::new());
+            for (i, st) in found.iter().enumerate() {
+                for (ptr, plane) in st
+                    .as_ref()
+                    .expect("a resident stack the check held")
+                    .parts()
+                {
+                    base.push(ptr);
+                    of.push((i, plane));
+                }
+            }
+            let scales = tensors
+                .iter()
+                .enumerate()
+                .map(|(i, t)| match of.contains(&(i, Plane::Scale)) {
+                    true => tensor_scales(pair.source().split(), t, experts),
+                    false => Ok(Vec::new()),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
             out.push(Some(LayerParts {
-                tensors: tensors
-                    .into_iter()
-                    .map(|t| t.cloned().expect("a plan tensor the check held"))
-                    .collect(),
-                base: found
-                    .iter()
-                    .map(|st| st.as_ref().expect("a resident stack the check held").ptr)
-                    .collect(),
+                tensors,
+                base,
                 slots,
                 parts,
+                of,
+                scales,
             }));
         }
         let first = out
@@ -655,6 +786,13 @@ impl FileSwap {
     /// drops would take from under the host ([`NvTier::refuse_held_pages`]).
     pub fn attach_tier(&self, tier: &Arc<NvTier>) -> Result<(), GpuError> {
         const WHAT: &str = "FileSwap::attach_tier";
+        if self.planes() {
+            return Err(GpuError::shape(
+                WHAT,
+                "an NVMe tier over NVFP4 rows a checkpoint folder locates: the arena holds an \
+                 expert's file run whole, a planes expert stages from its matrices' two runs",
+            ));
+        }
         if !tier.drops_reach(self.pair.split()) {
             return Err(GpuError::shape(
                 WHAT,
@@ -681,16 +819,39 @@ impl FileSwap {
         self.convert.is_some()
     }
 
+    /// Whether a layer's stacks are NVFP4 rows the card holds as planes
+    /// ([`Plane`]).
+    fn planes(&self) -> bool {
+        self.layers
+            .iter()
+            .flatten()
+            .any(|p| p.of.iter().any(|&(_, plane)| plane != Plane::Whole))
+    }
+
     /// Part `part` of layer `layer`'s expert `id` as a static load uploads it
-    /// to a card slot: the source file's bytes, whatever the host reads.
+    /// to a card slot: the source file's bytes, whatever the host reads. A
+    /// plane of NVFP4 rows is refused by name: its slot's bytes are its
+    /// transform's ([`Transform`]), no run of the file's.
     pub fn card_bytes(&self, layer: usize, id: u32, part: usize) -> Result<&[u8], GpuError> {
         const WHAT: &str = "FileSwap::card_bytes";
         let p = self.layer(layer, WHAT)?;
-        let per = *p
+        let (per, &(stack, plane)) = p
             .parts
             .get(part)
+            .zip(p.of.get(part))
             .ok_or_else(|| GpuError::shape(WHAT, format!("part {part} of an expert")))?;
-        let t = &p.tensors[part];
+        let per = *per;
+        if plane != Plane::Whole {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "layer {layer} part {part}: {plane:?} of {}, a plane the lane stages, no run \
+                     of the file",
+                    p.tensors[stack].name
+                ),
+            ));
+        }
+        let t = &p.tensors[stack];
         let split = self.pair.source().split();
         let (s, info) = split.find(&t.name).ok_or(GpuError::tensor(
             WHAT,
@@ -721,18 +882,19 @@ impl FileSwap {
             })
     }
 
-    /// Where the host reads part `part` of layer `layer`'s expert `id`: the
+    /// Where the host reads stack `stack` of layer `layer`'s expert `id`: the
     /// sidecar's run when it holds the stack and the pair reads one, else the
-    /// source's.
-    fn run(
+    /// source's; a planes stack's codes run then its scales run, the second
+    /// empty for a stack of whole runs ([`expert_runs`]).
+    fn runs(
         &self,
         layer: usize,
         id: u32,
-        part: usize,
+        stack: usize,
         what: &'static str,
-    ) -> Result<(HostFile, Range<u64>), GpuError> {
-        let t = &self.layer(layer, what)?.tensors[part];
-        expert_run(self.pair.source(), t, self.experts, id, true)
+    ) -> Result<(HostFile, [Range<u64>; 2]), GpuError> {
+        let t = &self.layer(layer, what)?.tensors[stack];
+        expert_runs(self.pair.source(), t, self.experts, id, true)
             .map_err(|e| GpuError::plan(what, e))
     }
 }
@@ -746,15 +908,52 @@ impl SwapSource for FileSwap {
             .map_or(&[], |p| p.parts.as_slice())
     }
 
+    /// A plane of NVFP4 rows reads the folder's matrix where it keeps it
+    /// (`gguf::Split::matrix`) — its codes or its block scales — or the
+    /// expert's tensor scale the header holds, each with the transform that
+    /// makes it the card plane's bytes ([`Plane`]); a stack read whole reads
+    /// as below.
     fn source(&self, layer: usize, id: u32, part: usize) -> Result<Piece<'_>, GpuError> {
         const WHAT: &str = "FileSwap::source";
         let p = self.layer(layer, WHAT)?;
-        let per = *p
+        let (per, &(stack, plane)) = p
             .parts
             .get(part)
+            .zip(p.of.get(part))
             .ok_or_else(|| GpuError::shape(WHAT, format!("part {part} of an expert")))?;
-        let t = &p.tensors[part];
+        let per = *per;
+        let t = &p.tensors[stack];
         let src = self.pair.source();
+        if plane != Plane::Whole {
+            let (bytes, transform) = match plane {
+                Plane::Scale => (
+                    p.scales[stack].get(4 * id as usize..4 * id as usize + 4),
+                    Transform::Identity,
+                ),
+                Plane::Codes | Plane::BlockScales => {
+                    let m = src
+                        .split()
+                        .matrix(&t.name, id as usize)
+                        .map_err(|e| GpuError::plan(WHAT, e))?;
+                    match plane {
+                        Plane::Codes => (Some(m.codes), Transform::Nvfp4Codes),
+                        _ => (Some(m.block_scales), Transform::Ue4m3Scales),
+                    }
+                }
+                Plane::Whole => unreachable!("a whole stack reads below"),
+            };
+            return match bytes {
+                Some(bytes) if bytes.len() == per => Ok(Piece { bytes, transform }),
+                got => Err(GpuError::shape(
+                    WHAT,
+                    format!(
+                        "layer {layer} expert {id}: {plane:?} of {} is {} bytes, the part {per}",
+                        t.name,
+                        got.map_or(0, <[u8]>::len)
+                    ),
+                )),
+            };
+        }
         let side = src
             .sidecar()
             .filter(|side| side.file_bytes(&t.name).is_some());
@@ -878,12 +1077,14 @@ impl SwapSource for FileSwap {
         if let Some(tier) = self.tier_serving(layer, id) {
             return tier.ensure_victim(layer, &[id]);
         }
-        let parts = self.layer(layer, WHAT)?.parts.len();
-        for part in 0..parts {
-            let (file, at) = self.run(layer, id, part, WHAT)?;
-            self.set
-                .populate_run(self.pair.source(), &file, &at)
-                .map_err(|e| GpuError::plan(WHAT, e))?;
+        let stacks = self.layer(layer, WHAT)?.tensors.len();
+        for stack in 0..stacks {
+            let (file, runs) = self.runs(layer, id, stack, WHAT)?;
+            for at in runs.iter().filter(|r| !r.is_empty()) {
+                self.set
+                    .populate_run(self.pair.source(), &file, at)
+                    .map_err(|e| GpuError::plan(WHAT, e))?;
+            }
         }
         Ok(())
     }
@@ -895,15 +1096,17 @@ impl SwapSource for FileSwap {
         if let Some(tier) = self.tier_serving(layer, id) {
             return Ok(tier.slot_filled(layer, id));
         }
-        let parts = self.layer(layer, WHAT)?.parts.len();
-        for part in 0..parts {
-            let (file, at) = self.run(layer, id, part, WHAT)?;
-            let serves = self
-                .set
-                .serves(self.pair.source(), &file, &at)
-                .map_err(|e| GpuError::plan(WHAT, e))?;
-            if !serves {
-                return Ok(false);
+        let stacks = self.layer(layer, WHAT)?.tensors.len();
+        for stack in 0..stacks {
+            let (file, runs) = self.runs(layer, id, stack, WHAT)?;
+            for at in runs.iter().filter(|r| !r.is_empty()) {
+                let serves = self
+                    .set
+                    .serves(self.pair.source(), &file, at)
+                    .map_err(|e| GpuError::plan(WHAT, e))?;
+                if !serves {
+                    return Ok(false);
+                }
             }
         }
         Ok(true)
@@ -1118,6 +1321,19 @@ mod tests {
             words,
             rows,
             ptr: 0,
+            nvfp4: None,
+        })
+    }
+
+    /// A resident NVFP4 planes stack of `slots` experts of `rows` rows of
+    /// `k` values: its code plane, block-scale plane and tensor scales whole.
+    fn planes(slots: usize, rows: usize, k: usize) -> Option<FoundStack> {
+        Some(FoundStack {
+            ty: Some(GgmlType::NVFP4_ROWS),
+            words: slots * rows * k / 8,
+            rows: slots * rows,
+            ptr: 0x1000,
+            nvfp4: Some([(slots * rows * k / 64, 0x2000), (slots, 0x3000)]),
         })
     }
 
@@ -1128,7 +1344,94 @@ mod tests {
             words: 0,
             rows: 0,
             ptr: 0,
+            nvfp4: None,
         })
+    }
+
+    /// NVFP4 rows held as card planes are three parts a stack — the codes
+    /// (`rows · k / 2` bytes), the block scales (`rows · k / 16`) and the
+    /// 4-byte tensor scale — in plane order, at the planes' own addresses;
+    /// the slots are the down's rows over its rows an expert. Planes that
+    /// are not the tensor's bytes, and a scale plane short of the slots, are
+    /// refused by name. Mutant: a planes stack read as one part of
+    /// `file_bytes / experts` — the nine-part arm takes three.
+    #[test]
+    fn nvfp4_planes_stacks_hold_three_parts_a_matrix() {
+        // MiniMax-M3.1's shape, small: gate and up 64 rows of 128 values, the
+        // down 128 rows of 64; four slots of eight experts.
+        let names = names(&["layer.3.gate", "layer.3.up", "layer.3.down"]);
+        let types = [GgmlType::NVFP4_ROWS; 3];
+        let per = |rows: u64, k: u64| rows * k * 9 / 16;
+        let t = [
+            stack(
+                3,
+                "layer.3.gate",
+                GgmlType::NVFP4_ROWS,
+                &[128, 64, 8],
+                per(64, 128),
+            ),
+            stack(
+                3,
+                "layer.3.up",
+                GgmlType::NVFP4_ROWS,
+                &[128, 64, 8],
+                per(64, 128),
+            ),
+            stack(
+                3,
+                "layer.3.down",
+                GgmlType::NVFP4_ROWS,
+                &[64, 128, 8],
+                per(128, 64),
+            ),
+        ];
+        let tensors: Vec<Option<&ModelTensor>> = t.iter().map(Some).collect();
+        let found = [planes(4, 64, 128), planes(4, 64, 128), planes(4, 128, 64)];
+        match layer_parts(3, &names, &types, &found, &tensors, 8) {
+            Ok(Some((parts, slots))) => {
+                let m = [64 * 64, 64 * 8, 4];
+                assert_eq!(parts, [m, m, m].concat());
+                assert_eq!(slots, 4);
+            }
+            other => panic!("NVFP4 planes stacks hold three parts each, got {other:?}"),
+        }
+        let held = found[0].as_ref().expect("a planes stack").parts();
+        assert_eq!(
+            held,
+            [
+                (0x1000, Plane::Codes),
+                (0x2000, Plane::BlockScales),
+                (0x3000, Plane::Scale)
+            ]
+        );
+        let off = stack(3, "layer.3.gate", GgmlType::NVFP4_ROWS, &[128, 64, 8], 999);
+        let wrong = vec![Some(&off), tensors[1], tensors[2]];
+        match layer_parts(3, &names, &types, &found, &wrong, 8) {
+            Err(GpuError::Shape { detail, .. }) => {
+                assert!(
+                    detail.starts_with("stack layer.3.gate: NVFP4 planes"),
+                    "{detail}"
+                );
+            }
+            other => panic!("planes that are not the tensor's bytes are refused, got {other:?}"),
+        }
+        let short = [
+            planes(4, 64, 128),
+            planes(4, 64, 128),
+            planes(3, 128, 64).map(|mut f| {
+                f.rows = 4 * 128;
+                f
+            }),
+        ];
+        match layer_parts(3, &names, &types, &short, &tensors, 8) {
+            Err(GpuError::Shape { detail, .. }) => {
+                assert!(
+                    detail.starts_with("stack layer.3.down: NVFP4 planes"),
+                    "{detail}"
+                );
+            }
+            other => panic!("planes short of the slots are refused, got {other:?}"),
+        }
     }
 
     fn names(of: &[&str]) -> Vec<String> {
@@ -1254,7 +1557,8 @@ mod tests {
                     (what, need),
                     (
                         "FileSwap::new",
-                        "a resident K-quant routed stack beside the layer's other parts"
+                        "a resident routed stack of its listed type (a K-quant, or NVFP4 rows \
+                         as card planes) beside the layer's other parts"
                     )
                 );
                 assert_eq!(name, "layer.2.gate");
@@ -1333,6 +1637,8 @@ mod tests {
             base: Vec::new(),
             slots: 8,
             parts: parts.to_vec(),
+            of: Vec::new(),
+            scales: Vec::new(),
         })
     }
 

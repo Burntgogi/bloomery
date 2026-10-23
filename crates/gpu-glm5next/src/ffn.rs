@@ -253,11 +253,11 @@ impl CardExperts {
 
     /// A tensor-parallel rank's card experts (`crate::tp`): every expert of
     /// every routed layer of `layers` on the card at its own id, `ff` the
-    /// rank's part of the routed width, each layer's stacks of a type a
-    /// rank's leg runs ([`LegStacks::of_rank`]: a Q6_K down too) at every
-    /// expert, and the buffers of the one row a rank steps, in the forms its
-    /// layers' downs read. No prompt batch and no tier card run on a rank.
-    /// Load-time only.
+    /// rank's part of the routed width, each layer's stacks of a type the
+    /// common leg runs ([`LegStacks::of`], the common arms, a Q6_K down
+    /// among them) at every expert, and the buffers of the one row a rank
+    /// steps, in the forms its layers' downs read. No prompt batch and no tier
+    /// card run on a rank. Load-time only.
     pub(crate) fn rank(
         gpu: &Gpu,
         w: &Weights,
@@ -277,7 +277,7 @@ impl CardExperts {
                 limit: crate::body::limit_of(m.act)?,
                 names: routed_stacks(l),
             };
-            let st = LegStacks::of_rank(w, layer.names())?;
+            let st = LegStacks::of(w, layer.names())?;
             st.check(N_EXPERT, leg_shape(n_embd, ff))?;
             downs = downs.with(down_form(&st)?);
             per.push(Some(layer));
@@ -716,7 +716,7 @@ pub(crate) fn rank_moe(
         &mut s.sel,
     )?;
     let k = card_row_mut(rows, p.row)?;
-    let stacks = LegStacks::of_rank(w, cl.names())?;
+    let stacks = LegStacks::of(w, cl.names())?;
     let run = LegRun {
         layer: l,
         stacks: &stacks,

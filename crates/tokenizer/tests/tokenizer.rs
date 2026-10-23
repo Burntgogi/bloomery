@@ -25,7 +25,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use refset::arch::gemma_embedding::TOKENIZER as LLAMA;
-use refset::arch::tokenizer::{GLM5NEXT, MINIMAXM3, NEMOTRON, QWEN3MOE, QWEN38, V41};
+use refset::arch::tokenizer::{GLM5NEXT, MINIMAXM3, MUSESPARK, NEMOTRON, QWEN3MOE, QWEN38, V41};
 use refset::family::Family;
 use refset::tokenizer::{Text, TokenizerSet};
 use tokenizer::{Decoder, Tokenizer};
@@ -122,6 +122,19 @@ fn minimaxm3() -> Vocabulary {
         ambiguous: &[],
         eog: &["[e~["],
         unspelled: &["\u{FFFD}"],
+    }
+}
+
+/// Muse Spark Open's first shard on the box (`gpt-4o`, the GPT4O regex under its own name).
+/// The header carries `eot_token_id`, so no role is ambiguous; generation ends on the eos and
+/// `<|eot|>`, the eot PR 30616 adds to the EOG set by name (the eos's own text is pinned with
+/// the ids, once the set is dumped).
+fn musespark() -> Vocabulary {
+    Vocabulary {
+        family: &MUSESPARK,
+        ambiguous: &[],
+        eog: &["<|eot|>"],
+        unspelled: &[],
     }
 }
 
@@ -438,4 +451,16 @@ fn hw_minimaxm3_corpus_ids_equal_reference() {
 #[ignore = "needs the minimaxm3 vocabulary and its oracle set (just dump-ref-tokenizer) on the box"]
 fn hw_minimaxm3_cases_equal_reference() {
     cases_equal_reference(&minimaxm3());
+}
+
+#[test]
+#[ignore = "needs the musespark vocabulary and its oracle set (just dump-ref-tokenizer) on the box"]
+fn hw_musespark_corpus_ids_equal_reference() {
+    corpus_ids_equal_reference(&musespark());
+}
+
+#[test]
+#[ignore = "needs the musespark vocabulary and its oracle set (just dump-ref-tokenizer) on the box"]
+fn hw_musespark_cases_equal_reference() {
+    cases_equal_reference(&musespark());
 }

@@ -10,21 +10,24 @@
 //! K-quants.
 //!
 //! A routed block runs around its host leg; the card computes the experts the
-//! slot map puts on it ([`bloomery_gpu::card_experts`]), the host tier the rest.
+//! slot map puts on it ([`bloomery_gpu::card_experts`]), the expert tier card
+//! those it puts there ([`crate::tier`]), the host tier the rest.
 //! The three parts are the common routed block's ([`bloomery_gpu::routed_block`])
 //! over MiMo's router instance and names:
 //! - [`front`]: `ffn_norm` RMS into the boundary's handoff region, the
 //!   sigmoid router over 256 experts with the selection bias (top 8, the
 //!   weights from the unbiased scores, normalized and scaled), the handoff
 //!   into the host-mapped image — each slot's place in the card's stacks, or
-//!   the host mark, from the layer's slot-map row — and the go. Three kernels
-//!   and the go.
+//!   the host mark, from the layer's slot-map row; on a tiered load the tier's
+//!   image and places too — and the go. Three kernels and the go.
 //! - [`shadow`]: while the host computes, the card's slots, six launches
 //!   ([`bloomery_gpu::card_experts`]) ending in the card sum plus `x1`; none on a layer with
 //!   no card experts.
 //! - [`back`]: the wait, then the add of the host's routed sum and the
 //!   shadow's `acc + x1` (`x1` alone on a layer with no card experts). One
-//!   kernel after the wait.
+//!   kernel after the wait. On a layer the expert tier holds experts of, the
+//!   wait is the host's and the tier's, and the card sum is the join over both
+//!   cards' slots ([`crate::tier::TierParts::enqueue_step_back`]).
 //!
 //! MiMo facts that fix this file: the routed block has no shared expert, so
 //! the shadow is the card experts alone; the routed sum plus the residual is
@@ -50,6 +53,7 @@ use model::r8file::R8Source;
 use runtime::layer::FfnKind;
 
 use crate::body::{Parts, WHAT, shape};
+use crate::tier::TierParts;
 
 /// The block's tensors, named once at load.
 pub(crate) enum FfnNames {
@@ -155,7 +159,9 @@ pub(crate) fn front(
     l: usize,
 ) -> Result<(), GpuError> {
     let s = &mut *p.s;
-    p.routed.front((gpu, w), &mut s.route, &s.x1, (hybrid, l))
+    let tier = p.tier.as_deref_mut().map(TierParts::side_mut);
+    p.routed
+        .front_tiered((gpu, w), &mut s.route, &s.x1, (hybrid, l), tier)
 }
 
 /// Enqueue layer `l`'s card experts, when it has any, in its host leg's
@@ -178,7 +184,8 @@ pub(crate) fn shadow(
 /// Enqueue layer `l`'s wait and the add of the host's routed sum to the
 /// shadow's `acc + x1` (`x1` on a layer with no card experts) into `dest`,
 /// after its [`shadow`]: the head's input after the last layer and `x`
-/// otherwise.
+/// otherwise. A tier layer's back is the tier's (module doc); a tier layer
+/// on a load with no tier side is refused by name.
 pub(crate) fn back(
     gpu: &Gpu,
     p: &mut Parts<'_>,
@@ -188,7 +195,20 @@ pub(crate) fn back(
 ) -> Result<(), GpuError> {
     let s = &mut *p.s;
     let dest = dest.unwrap_or(&mut s.x);
-    p.routed.back(gpu, hybrid, p.card, l, (&s.x1, dest))
+    if p.card.tier_k(l) == 0 {
+        return p.routed.back(gpu, hybrid, p.card, l, (&s.x1, dest));
+    }
+    let tier = p.tier.as_deref().ok_or(GpuError::State {
+        what: WHAT,
+        missing: "the stage card's tier side",
+    })?;
+    tier.enqueue_step_back(
+        gpu,
+        (&mut *p.card, l),
+        (s.route.sel(), s.route.weights()),
+        hybrid,
+        (&s.x1, dest),
+    )
 }
 
 /// The host views of the routed layers `run`, each from [`host::layer`]; a

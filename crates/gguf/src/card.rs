@@ -92,6 +92,10 @@ pub enum GateUpEntry {
     /// `block_q6_K` stream over the `Q8Act`'s q6 plane) in
     /// `crates/gpu/src/q6k_sel.rs`.
     Q6k,
+    /// `QuantSelKernels::enqueue_gate_up` (`iq2_xxs_gate_up_sel`, the file's
+    /// 66-byte `block_iq2_xxs` stream through the block's shared table) in
+    /// `crates/gpu/src/iq_sel.rs`.
+    Iq2xxs,
     /// `QuantSelKernels::enqueue_gate_up` (`iq2_xs_gate_up_sel`, the file's
     /// 74-byte `block_iq2_xs` stream) in `crates/gpu/src/iq_sel.rs`.
     Iq2xs,
@@ -137,6 +141,10 @@ pub enum DownEntry {
     /// 256-value super-blocks, `Q8Act`) in `crates/gpu/src/kquant/sel.rs`,
     /// which no model body launches.
     Q8_0,
+    /// `QuantSelKernels::enqueue_gemv_sel_cols` (`iq2_xxs_gemv_sel`, over
+    /// `Q8Act` through the block's shared table, `slots_per_col` 1 for a
+    /// down) in `crates/gpu/src/iq_sel.rs`.
+    Iq2xxs,
     /// `QuantSelKernels::enqueue_gemv_sel` (`iq2_xs_gemv_sel`, over `Q8Act`) in
     /// `crates/gpu/src/iq_sel.rs`.
     Iq2xs,
@@ -385,6 +393,7 @@ impl DownEntry {
             | DownEntry::Q6k
             | DownEntry::Q5_1
             | DownEntry::Q8_0
+            | DownEntry::Iq2xxs
             | DownEntry::Iq2xs
             | DownEntry::Iq3xxs
             | DownEntry::Iq3s
@@ -466,6 +475,10 @@ macro_rules! card {
     };
 }
 pub(crate) use card;
+
+/// The values of one block of [`CardFormat::Nvfp4Planes`]: NVFP4's block, 32 code bytes and four
+/// UE4M3 scales, whichever NVFP4 file type the planes were made from.
+const NVFP4_PLANES_BLOCK: u64 = 64;
 
 impl GgmlType {
     /// The card columns of the type's row; `Card::NONE` for a tag with no
@@ -557,8 +570,9 @@ impl CardFormat {
     /// this format, in bytes, in the order the upload allocates them: q8_0's
     /// code plane, then its scale plane; one buffer in every other format —
     /// the upload's own arithmetic. `None` exactly where the upload refuses: a
-    /// zero dimension, `k` off the type's block, or a `ty` this format is not
-    /// the loader's format for.
+    /// zero dimension, `k` off the type's block (off the planes' 64-value block
+    /// for [`CardFormat::Nvfp4Planes`]), or a `ty` this format is not the
+    /// loader's format for.
     #[must_use]
     pub fn buffer_bytes(self, ty: GgmlType, k: u64, rows: u64) -> Option<Vec<u64>> {
         let blck = ty.blck_size()?;
@@ -593,10 +607,12 @@ impl CardFormat {
                 ]
             }
             CardFormat::Nvfp4Planes => {
-                vec![
-                    rows.checked_mul(blocks.checked_mul(32)?)?,
-                    rows.checked_mul(blocks.checked_mul(4)?)?,
-                ]
+                // The planes hold NVFP4's 64-value blocks whatever the file's block (NVFP4_ROWS
+                // groups 16): a code nibble a value and a UE4M3 scale a 16 values.
+                if !k.is_multiple_of(NVFP4_PLANES_BLOCK) {
+                    return None;
+                }
+                vec![rows.checked_mul(k / 2)?, rows.checked_mul(k / 16)?]
             }
             CardFormat::Mxfp8Planes => {
                 // Whole scale words a row: a row's four blocks a word.
@@ -680,5 +696,29 @@ impl CardFormat {
         self.buffer_bytes(ty, k, rows)?
             .into_iter()
             .try_fold(0u64, u64::checked_add)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CardFormat;
+    use crate::quant::GgmlType;
+
+    /// NVFP4's planes hold a code nibble a value and a UE4M3 scale a 16 values, whichever NVFP4
+    /// file type they were made from: NVFP4's 64-value blocks and NVFP4_ROWS' 16-value groups
+    /// count the same bytes, and a width off the planes' 64-value block is refused for both.
+    /// Mutant, the count before NVFP4_ROWS loaded in planes: blocks of the file type's own block
+    /// (NVFP4_ROWS: four times the codes and scales).
+    #[test]
+    fn nvfp4_planes_count_from_the_planes_geometry() {
+        let planes = CardFormat::Nvfp4Planes;
+        let (k, rows) = (512, 3);
+        let want = Some(vec![rows * k / 2, rows * k / 16]);
+        assert_eq!(planes.buffer_bytes(GgmlType::NVFP4, k, rows), want);
+        assert_eq!(planes.buffer_bytes(GgmlType::NVFP4_ROWS, k, rows), want);
+        for ty in [GgmlType::NVFP4_ROWS, GgmlType::NVFP4] {
+            assert_eq!(planes.buffer_bytes(ty, 48, rows), None, "{ty}");
+        }
+        assert_eq!(planes.buffer_bytes(GgmlType::NVFP4_ROWS, 96, rows), None);
     }
 }

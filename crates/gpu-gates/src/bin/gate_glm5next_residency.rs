@@ -38,16 +38,23 @@
 //!   in its slot, part by part, the bytes a static load uploads for it; and
 //!   the source's parts are the header's: each card layer's part sizes are
 //!   its three stacks' own (each stack's type and shape as the header states
-//!   them), the card layers hold one layout, and no layer whose down the
-//!   header gives as Q6_K holds a card part (mutant: every part of a layer
-//!   sized at its first stack's — the down's slots then sit at the gate's
-//!   stride, which the load's stack-size check, the byte check and `c1` all
-//!   pass, and the header's down size does not).
-//!   PIN(2026-10-01): the file's card layers share one part layout —
-//!   `accepts::routed_rule` admits the card leg's types, not Q6_K, and
-//!   `eligible` needs every stack of a layer routable, so the one Q5_K
-//!   gate/up layer, whose down is Q6_K, has no card slot — and per-layer part
-//!   sizes are not exercised by this file.
+//!   them), and no layer whose stacks the plan's per-role rule does not run
+//!   (`accepts::leg_runs`: a Q6_K gate and up) holds a card part (mutant:
+//!   every part of a layer sized at its first stack's — the down's slots
+//!   then sit at the gate's stride, which the load's stack-size check, the
+//!   byte check and `c1` all pass, and the header's down size does not).
+//!   PIN(2026-10-01): the file's card layers shared one part layout — the
+//!   every-role rule left the one Q5_K gate/up layer, whose down is Q6_K, on
+//!   the host, so per-layer part sizes were not exercised by this file.
+//!   PIN(2026-10-22): the plan's rule is per role, so a Q6_K down beside a
+//!   gate and up its arm runs takes card slots where the plan holds them,
+//!   its parts its header's own — a layout beside the Q4_K layers' — and the
+//!   layout count printed.
+//!   PIN(2026-10-23): the layout count is pinned to the plan's own
+//!   derivation: as many distinct [gate, up, down] part sizes as the layers
+//!   the plan gives card experts (`plan.n_l[l] > 0`) hold in the header, and
+//!   the count the load reports equals it (mutant: every part sized at the
+//!   first stack's, the clause's own above — the header's down size does not).
 //! - `steps` (the steps feed refused under the machine): a prompt fed one
 //!   decode step an id is refused by name while the machine runs, and the
 //!   batch feed still serves after it (mutant: the steps arm of the feed
@@ -186,6 +193,7 @@ mod gate {
     use model::arch::glm5next::place::{
         NEXTN_ARENA_BYTES, NextnInputs, NextnPlan, PlaceError, PlanInputs, prompt_reserve_bytes,
     };
+    use model::placement::accepts::{self, Program};
     use model::placement::churn::ChurnPool;
     use model::placement::{Machine, ModelTensors, Plan, Violation};
     use refset::arch::glm5next::vis::PROFILE;
@@ -539,11 +547,13 @@ mod gate {
 
     /// `transform`: each admitted expert's slot against its static bytes,
     /// part by part; then every layer's parts in the source against the
-    /// header's.
+    /// header's, and the part layouts the load reports as many as the plan's
+    /// layers hold in the header (the clause's PIN).
     fn transform_clause(
         s: &Session<Body>,
         model: &ModelTensors,
         seeds: &[(usize, Vec<u32>)],
+        plan: &Plan<'_>,
     ) -> Result<bool, GateError> {
         let m = s.model();
         let b = m.body(NAME)?;
@@ -561,7 +571,7 @@ mod gate {
         let mut layouts: Vec<Vec<(GgmlType, usize)>> = Vec::new();
         let mut off_header = Vec::new();
         let mut q6k_down = Vec::new();
-        let mut on_q6k = Vec::new();
+        let mut off_rule = Vec::new();
         for l in 0..model.layers {
             let parts = source.part_bytes(l);
             let header = header_parts(model, l)?;
@@ -570,13 +580,16 @@ mod gate {
                 .is_some_and(|h| h.last().is_some_and(|&(ty, _)| ty == GgmlType::Q6_K))
             {
                 q6k_down.push(l);
-                if !parts.is_empty() {
-                    on_q6k.push(l);
-                }
-                continue;
             }
             if parts.is_empty() {
                 continue;
+            }
+            // The plan's rule is per role: a layer holds card parts only when
+            // every stack's type its role's arm runs (`accepts::leg_runs`).
+            if let Some(h) = header.as_ref()
+                && accepts::leg_runs(Program::Glm5nextBody, [h[0].0, h[1].0, h[2].0]) != Some(true)
+            {
+                off_rule.push(l);
             }
             cards.push(l);
             match header {
@@ -596,23 +609,39 @@ mod gate {
             })
             .collect::<Vec<_>>()
             .join(" and ");
+        // The plan's own layouts: the distinct [gate, up, down] part sizes of
+        // the layers it gives card experts, as the header states them. The
+        // count the load reports must equal it (the clause's PIN).
+        let mut want: Vec<Vec<(GgmlType, usize)>> = Vec::new();
+        for (l, &n) in plan.n_l.iter().enumerate() {
+            if n == 0 {
+                continue;
+            }
+            let h = header_parts(model, l)?.ok_or_else(|| {
+                format!("layer {l}: the plan gives it card experts and the header states no three stacks")
+            })?;
+            if !want.contains(&h) {
+                want.push(h);
+            }
+        }
         let ok = (checked > 0 || !glm5next_tier::skew()?)
             && bad.is_empty()
             && !cards.is_empty()
             && off_header.is_empty()
-            && layouts.len() == 1
-            && !q6k_down.is_empty()
-            && on_q6k.is_empty();
+            && off_rule.is_empty()
+            && layouts.len() == want.len()
+            && !q6k_down.is_empty();
         println!(
             "transform: {checked} admitted experts on {} card layers, {} parts differing from a \
-             static load{}; card parts {layout} (layouts: {}), the header's on all but {off_header:?}; \
-             Q6_K-down layers {q6k_down:?}, those with card parts {on_q6k:?}: {}",
+             static load{}; card parts {layout} (layouts: {}, the plan's {}), the header's on all but {off_header:?}, \
+             past the rule's arms {off_rule:?}; Q6_K-down layers {q6k_down:?}: {}",
             cards.len(),
             bad.len(),
             bad.first()
                 .map(|f| format!(" (first {f})"))
                 .unwrap_or_default(),
             layouts.len(),
+            want.len(),
             verdict(ok)
         );
         Ok(ok)
@@ -875,7 +904,7 @@ mod gate {
         let Some(card) = machine.cards.first() else {
             return Err("the gate machine has no stage card".into());
         };
-        if !machine.tiers.is_empty() {
+        if machine.expert_tiers().next().is_some() {
             return Err(
                 "the gate machine holds tier cards; the front walked here is the \
                         no-tiers one"
@@ -1360,7 +1389,7 @@ mod gate {
         pass &= crate::residency_clauses::passes_clause(&first.passes, STEPS);
 
         tier::sc("transform: every admitted expert holds the bytes a static load uploads")?;
-        pass &= transform_clause(&s, &inputs.model, &seeds)?;
+        pass &= transform_clause(&s, &inputs.model, &seeds, &plan)?;
         tier::sc("steps: the steps feed is refused under the machine")?;
         pass &= steps_clause(&mut s, &ids)?;
 

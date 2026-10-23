@@ -349,7 +349,7 @@ mod gate {
         gib: u64,
     ) -> Result<Result<Plan<'a>, String>, GateError> {
         let levers = PlanLevers {
-            card_budget_bytes: Some(gib << 30),
+            card_budget_bytes: Some(gib << 30).into(),
         };
         let inputs = &c.inputs;
         let planned = if c.node_host {
@@ -1125,7 +1125,7 @@ mod gate {
                 plan.machine,
                 CTX as u64,
                 &PlanLevers {
-                    card_budget_bytes: Some(gib << 30),
+                    card_budget_bytes: Some(gib << 30).into(),
                 },
                 Experts::Card,
             )?;
@@ -1562,7 +1562,7 @@ mod gate {
                 &machine,
                 CTX as u64,
                 &PlanLevers {
-                    card_budget_bytes: Some(gib << 30),
+                    card_budget_bytes: Some(gib << 30).into(),
                 },
                 Experts::Card,
             )?

@@ -3,6 +3,8 @@
 //! embedding calls, and named refusals. One visible card keeps the side seat on the stage.
 //! The plain 12 GiB plan leaves host experts; adding the reserve to the side run's
 //! budget restores that split. At the unchanged budget the side run must seat fewer experts.
+//! The same file beside the nemotron_h fixture: at one context the stage card's need grows by
+//! the side seat's reserve, and `/v1/embeddings` answers.
 
 #[cfg(feature = "gemma-embedding2")]
 fn main() -> std::process::ExitCode {
@@ -25,7 +27,7 @@ mod gate {
 
     use bloomery_gpu::arch::qwen3moe::KvQ8;
     use bloomery_gpu_gates::beside::{self, Beside};
-    use bloomery_gpu_gates::generate::Place;
+    use bloomery_gpu_gates::generate::{Place, SEAT_STEPS};
     use bloomery_gpu_gates::record::{self, Log};
     use bloomery_gpu_gates::serve_client::{
         Served, check, curl, ids_of, json_of, metric, plan_run, serve_cmd, server_log, tokenized,
@@ -487,7 +489,7 @@ mod gate {
         let p = q.plan(
             CTX,
             &PlanLevers {
-                card_budget_bytes: Some(BUDGET + reserve),
+                card_budget_bytes: Some(BUDGET + reserve).into(),
             },
         )?;
         let mut held = p.machine.clone();
@@ -769,6 +771,157 @@ mod gate {
         if ok { Ok(()) } else { Err(checks_failed()) }
     }
 
+    /// The nemotron_h fixture beside EmbeddingGemma 2, on the one card this gate already requires.
+    /// The fixture is dense, so two plans at [`SEAT_STEPS`]'s floor differ by the side seat's
+    /// stage reserve, and `/v1/embeddings` answers with that file's name and a finite vector of
+    /// its width. raon1 has no fixture file.
+    fn nemotron_embeddings(
+        dir: &Path,
+        embedding: &str,
+        arch: &str,
+        embd_ctx: u64,
+    ) -> Result<bool, GateError> {
+        let fixture = refset::fixture::first_shard("nemotron_h")?;
+        let ctx = SEAT_STEPS.floor.to_string();
+        let plain = nemotron_plan(
+            &fixture,
+            embedding,
+            &ctx,
+            &dir.join("nemotron-plain"),
+            false,
+        )?;
+        let reserved = nemotron_plan(&fixture, embedding, &ctx, &dir.join("nemotron-side"), true)?;
+        let seat = reserved
+            .first(&record::EMBEDDING_SEAT)?
+            .ok_or("nemotron plan: no embedding_seat record")?;
+        let reserve = seat.u64("reserve")?;
+        let plain_b = stage_bytes(&plain)?;
+        let side_b = stage_bytes(&reserved)?;
+        println!(
+            "nemotron need plain {plain_b} B, with the side seat {side_b} B, reserve {reserve} B"
+        );
+        let counted = reserve > 0
+            && seat.word("seat")? == "stage-reserve"
+            && seat.word("arch")? == arch
+            && reserve == seat.u64("bytes")?
+            && seat.u64("ctx")? == embd_ctx
+            && plain
+                .first(&record::PLAN)?
+                .ok_or("nemotron plan: missing plan record")?
+                .u64("ctx_max")?
+                == SEAT_STEPS.floor
+            && reserved
+                .first(&record::PLAN)?
+                .ok_or("nemotron plan: missing plan record")?
+                .u64("ctx_max")?
+                == SEAT_STEPS.floor
+            && side_b
+                == plain_b
+                    .checked_add(reserve)
+                    .ok_or("nemotron need bytes overflow")?;
+        let live = nemotron_live(dir, &fixture, embedding, &ctx)?;
+        Ok(counted && live)
+    }
+
+    fn nemotron_args<'a>(
+        model: &'a str,
+        embedding: &'a str,
+        ctx: &'a str,
+        side: bool,
+    ) -> Vec<&'a str> {
+        let mut args = vec![
+            "--model",
+            "nemotron",
+            "-m",
+            model,
+            "--port",
+            "0",
+            "--place",
+            "a",
+            "--ctx",
+            ctx,
+            "--parallel",
+            "1",
+        ];
+        if side {
+            args.extend(["--embd-model", embedding]);
+        }
+        args
+    }
+
+    fn nemotron_plan(
+        model: &str,
+        embedding: &str,
+        ctx: &str,
+        dir: &Path,
+        side: bool,
+    ) -> Result<Log, GateError> {
+        std::fs::create_dir_all(dir)?;
+        let err = dir.join("plan.err");
+        let (status, _) = plan_run(
+            serve_cmd()?,
+            &nemotron_args(model, embedding, ctx, side),
+            &err,
+        )?;
+        if !status.success() {
+            return Err(format!("nemotron plan failed ({status}): {}", err.display()).into());
+        }
+        server_log(
+            &err,
+            &[&record::PLAN, &record::NEED, &record::EMBEDDING_SEAT],
+        )
+    }
+
+    fn stage_bytes(log: &Log) -> Result<u64, GateError> {
+        let need = log
+            .first(&record::NEED)?
+            .ok_or("nemotron plan: missing need record")?;
+        let cards = need.csv("cards")?;
+        let [one] = cards[..] else {
+            return Err(format!("nemotron plan: need names {} cards", cards.len()).into());
+        };
+        let (_, bytes) = one
+            .rsplit_once(':')
+            .ok_or("nemotron plan: need cards is not name:bytes")?;
+        Ok(bytes.parse()?)
+    }
+
+    fn nemotron_live(
+        dir: &Path,
+        model: &str,
+        embedding: &str,
+        ctx: &str,
+    ) -> Result<bool, GateError> {
+        let work = dir.join("nemotron-live");
+        std::fs::create_dir_all(&work)?;
+        let mut served = Served::spawn_cmd(
+            serve_cmd()?,
+            &nemotron_args(model, embedding, ctx, true),
+            &work,
+        )?;
+        let addr = served.address(&work.join("server.err"), 600, Duration::from_secs(1))?;
+        let (status, text) = curl(
+            &format!("http://{addr}/v1/embeddings"),
+            Some(&json!({"input":"a"})),
+            false,
+        )?;
+        println!("nemotron /v1/embeddings HTTP {status}");
+        let live = if status == 200 {
+            let v: Value = serde_json::from_str(&text)
+                .map_err(|e| format!("nemotron /v1/embeddings: {e}: {text}"))?;
+            let rows = vector(&v)?;
+            let name = Path::new(embedding)
+                .file_name()
+                .ok_or("embedding file name")?
+                .to_string_lossy();
+            rows.len() == 768 && v["model"] == name.as_ref()
+        } else {
+            false
+        };
+        println!("nemotron server stopped {}", served.stop()?);
+        Ok(live)
+    }
+
     pub fn run() -> Result<(), GateError> {
         bloomery_levers::at_main(&[])?;
         record::at_main(
@@ -1025,6 +1178,13 @@ mod gate {
             "embedding_as_chat_refused",
             !status.success() && text.contains("embedding model") && text.contains("--embd-model"),
         );
+        if !v1 {
+            check(
+                &mut ok,
+                "nemotron_embeddings",
+                nemotron_embeddings(&dir, embedding, arch, ctx as u64)?,
+            );
+        }
         if ok { Ok(()) } else { Err(checks_failed()) }
     }
 }

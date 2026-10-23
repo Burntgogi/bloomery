@@ -194,7 +194,7 @@ mod tests {
             nvme_bytes: 0,
             n_l: Vec::new(),
             tier_n_l: Vec::new(),
-            card_budget: None,
+            card_budget: crate::placement::card_budget::CardBudget::Unset,
             budget_from_pool: false,
         }
     }

@@ -55,7 +55,7 @@ recommended — a load streams the file to the card, and V4.1 reads its engram t
 | Solar-Open2-250B `Q4_K_M` | one card, plus an expert tier card under `--place bp` | the routed experts the card does not hold | 151.8 GB (four shards) |
 
 Ornith-1.5-35B's `Q4_K_M` plans the same weight bytes as Qwen3.6-35B's (21,311,258,624 B at the allocator's granules, `--plan` on both files), so its GPU and host RAM cells are Qwen3.6's; the 0.55 GB its file holds beyond is the next-token layer, which the load does not read.
-Sage-A1.5's `Q4_K_M` plans the same weight bytes as Qwen3.6-35B's too (21,311,258,624 B, `--plan` on both files). It passes the `qwen3` serve gate, and it answers with thinking on and off, calls tools on `/v1/chat/completions` and reads an image through its `mmproj`. The seat has no draft for its next-token layer: `BLOOMERY_DRAFT=mtp` is refused by name.
+Sage-A1.5's `Q4_K_M` plans the same weight bytes as Qwen3.6-35B's too (21,311,258,624 B, `--plan` on both files). It passes the `qwen3` serve gate, and it answers with thinking on and off, calls tools on `/v1/chat/completions` and reads an image through its `mmproj`. `BLOOMERY_DRAFT=mtp` drafts its next-token layer on a whole-card load of one sequence; a media load, a placed load and `--parallel` above 1 refuse it by name.
 
 **The NVMe expert tier** (Qwen3.8, GLM-5.3, V4.1): when the host RAM cannot hold the experts the plan leaves on the
 host, the plan pages the overflow through a RAM arena filled from the model file on NVMe. The tokens equal the
@@ -71,7 +71,7 @@ README's status rows name the types still not loaded.
 IQ3_S and IQ4_XS (a gate·up and a down), and the down of a Q5_0, Q5_1 or IQ4_NL stack. The types with no card kernel
 are Q2_K, Q2_0, Q4_0, Q4_1, Q8_1, Q8_K, IQ1_S, IQ1_M, IQ2_S, Q1_0, TQ1_0 and TQ2_0; of those only Q2_K and Q2_0
 have a host matmul, so a `UD-Q2_K_XL` file loads. GLM-5.3's token embedding may be q4_K, q5_K or q6_K. On GLM-5.3 a
-layer whose down is Q6_K keeps its experts on the host.
+layer whose down is Q6_K runs its experts on the card beside a card gate and up.
 
 **Recommended** (the configuration every number in the README ran on): a 32-core AVX2 CPU with 8 DDR4
 channels, 256 GB of RAM, an RTX A6000 48 GB, and an RTX 3090 24 GB beside it for `--place bp`. Cards are found

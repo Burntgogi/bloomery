@@ -8,8 +8,8 @@ use models::{Act, Ffn, Moe, Router, Score, Shared};
 
 use crate::arch::stems::{MOE_ROUTER, MOE_STACKS, SELECTION_BIAS, SHARED, Stem, join, req};
 use crate::arch::{
-    expert_counts, finite_positive, meta_bool, mul, one_expert_group, positive, sigmoid_gating,
-    spec_u32,
+    expert_counts, finite_positive, meta_bool, metadata, mul, one_expert_group, optional_usize,
+    positive, sigmoid_gating, spec_u32,
 };
 use crate::placement::{PlacementError, Role};
 
@@ -26,6 +26,7 @@ pub(in crate::arch) const KEYS: &[&str] = &[
     "expert_used_count",
     "expert_feed_forward_length",
     "expert_shared_count",
+    "expert_shared_feed_forward_length",
     "expert_gating_func",
     "expert_weights_scale",
     "expert_weights_norm",
@@ -40,10 +41,13 @@ pub struct Experts {
     pub n_expert: usize,
     /// `expert_used_count`.
     pub n_used: usize,
-    /// `expert_feed_forward_length`: one routed expert's width, and one shared expert's.
+    /// `expert_feed_forward_length`: one routed expert's width.
     pub ff: usize,
-    /// `expert_shared_count`: shared experts, run as one block of `ff · n_shared` values.
+    /// `expert_shared_count`: shared experts, run as one block.
     pub n_shared: usize,
+    /// The shared block's width: `expert_shared_feed_forward_length` when the file carries it,
+    /// else `ff · n_shared`.
+    pub shared_width: usize,
     /// `expert_weights_scale`: the factor on the kept weights.
     pub weights_scale: f32,
     /// `expert_weights_norm`: the kept weights are renormalized to sum to one.
@@ -54,7 +58,7 @@ impl Experts {
     /// The shared block's width.
     #[must_use]
     pub fn shared_ff(&self) -> usize {
-        self.ff * self.n_shared
+        self.shared_width
     }
 
     /// The router and experts of `split`'s keys; a count of 0, a router other than the sigmoid one
@@ -68,7 +72,13 @@ impl Experts {
         let (n_expert, n_used) = expert_counts(split)?;
         let ff = positive(split, "expert_feed_forward_length")?;
         let n_shared = positive(split, "expert_shared_count")?;
-        mul(split, "expert_shared_count", ff, n_shared)?;
+        let shared_width = match optional_usize(split, "expert_shared_feed_forward_length")? {
+            Some(0) => {
+                return Err(metadata(split, "expert_shared_feed_forward_length", "is 0"));
+            }
+            Some(w) => w,
+            None => mul(split, "expert_shared_count", ff, n_shared)?,
+        };
         sigmoid_gating(split, None, defaults)?;
         one_expert_group(split, router)?;
         Ok(Experts {
@@ -76,6 +86,7 @@ impl Experts {
             n_used,
             ff,
             n_shared,
+            shared_width,
             weights_scale: finite_positive(split, "expert_weights_scale")?,
             weights_norm: meta_bool(split, "expert_weights_norm")?,
         })
@@ -109,6 +120,8 @@ impl Experts {
             top_k: spec_u32("expert_used_count", self.n_used)?,
             expert_ff: spec_u32("expert_feed_forward_length", self.ff)?,
             latent: None,
+            pre_exp_norm: false,
+            post_exp_norm: None,
             act,
             router: Router {
                 score: Score::Sigmoid,

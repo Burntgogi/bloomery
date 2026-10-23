@@ -348,8 +348,8 @@ pub(super) fn pass_launches(plans: &[LayerPlan], m: usize) -> usize {
 /// The quantizer launches a wide input takes for sites of types `tys`: one
 /// for each of the q8_1-of-128 and q8-of-32 forms one of them reads.
 pub(super) fn wide_quants(tys: &[SiteTy]) -> usize {
-    let (q128, q32) = crate::site::WideActs::wants_of(tys);
-    usize::from(q128) + usize::from(q32)
+    let want = crate::site::WideActs::wants_of(tys);
+    usize::from(want.q128) + usize::from(want.q32)
 }
 
 /// A unit's front: its embedding rows with their positions and live key
@@ -1095,6 +1095,7 @@ fn slots_down(
             )?,
             GateUpEntry::Q8_0
             | GateUpEntry::Q6k
+            | GateUpEntry::Iq2xxs
             | GateUpEntry::Iq2xs
             | GateUpEntry::Iq3xxs
             | GateUpEntry::Iq3s
@@ -1168,6 +1169,7 @@ fn slots_down(
             DownEntry::Q5_0
             | DownEntry::Q5_1
             | DownEntry::Q8_0
+            | DownEntry::Iq2xxs
             | DownEntry::Iq2xs
             | DownEntry::Iq3xxs
             | DownEntry::Iq3s
@@ -1321,6 +1323,7 @@ fn apart_down(
         GateUpEntry::Q5k => kk.kq.enqueue_gate_up_q5k(stream, &gate_up, c.sink, h)?,
         GateUpEntry::Q8_0
         | GateUpEntry::Q6k
+        | GateUpEntry::Iq2xxs
         | GateUpEntry::Iq2xs
         | GateUpEntry::Iq3xxs
         | GateUpEntry::Iq3s
@@ -1369,6 +1372,7 @@ fn apart_down(
         DownEntry::Q5_0
         | DownEntry::Q5_1
         | DownEntry::Q8_0
+        | DownEntry::Iq2xxs
         | DownEntry::Iq2xs
         | DownEntry::Iq3xxs
         | DownEntry::Iq3s

@@ -18,6 +18,7 @@ pub const PREFILL_GROUP: &str = "BLOOMERY_PREFILL_GROUP";
 pub const ENGRAM_HELPER: &str = "BLOOMERY_ENGRAM_HELPER";
 pub const STEP_STATS: &str = "BLOOMERY_STEP_STATS";
 pub const CARD_BUDGET: &str = "BLOOMERY_CARD_BUDGET";
+pub const CARD_MARGIN: &str = "BLOOMERY_CARD_MARGIN";
 pub const PIN_MAIN: &str = "BLOOMERY_PIN_MAIN";
 pub const DRAFT: &str = "BLOOMERY_DRAFT";
 pub const CHECK_FINITE: &str = "BLOOMERY_CHECK_FINITE";
@@ -260,15 +261,47 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
     LeverSpec {
         name: CARD_BUDGET,
         class: Class::C,
-        kind: Kind::Bytes,
+        kind: Kind::CardBytes,
         default: Unset::Means(
             "each card's own usable bytes, or on a unified pool the budget that leaves the NVMe \
              tier's floor",
         ),
-        doc: "Placement: every card of a plan plans with `min(usable, budget)` usable \
-              bytes, so a large card stands in for a smaller one; a budget below a card's \
-              floor is refused with each term. `M` and `G` are binary units. The `plan` \
-              line prints `card_budget=`.",
+        doc: "Placement: a card of a plan plans with `min(usable, budget)` usable bytes, so a \
+              large card stands in for a smaller one. One value is every card's budget; \
+              `CUDA0=38G,CUDA1=20G` gives each card named its own, by the CUDA ordinal \
+              `--list-devices` prints, and a card it does not name plans with its own usable \
+              bytes. `CUDA0=3x,CUDA1=1x` gives each card named a share instead: the plan \
+              holds the routed experts on the cards in that proportion, as many as the tightest \
+              card's room lets it, and the host tier the rest, each card's budget its floor \
+              (dense tensors, cache, context, scratch, reserves, margin) and its share; a list \
+              is all bytes or all shares. The cards are still `--place`'s (unset: the common \
+              rule's), each planned on its budget. Refused by name: an entry that is no \
+              `CUDA<N>=<bytes>` or `CUDA<N>=<n>x`, a card named twice, a card the census does \
+              not list, a list on a plan whose card came from no census or a tier node's, a \
+              budget below a card's floor (with each term), and shares on a plan that places no \
+              routed expert on a card, that name none of its cards, or whose named cards cannot \
+              hold their floor. `M` and `G` are binary units. The `plan` line prints \
+              `card_budget=` in the bytes the plan resolved.",
+        site: Site::Parsed {
+            left: &[],
+            phase: Phase::Load,
+        },
+    },
+    LeverSpec {
+        name: CARD_MARGIN,
+        class: Class::C,
+        kind: Kind::CardBytes,
+        default: Unset::Means("each card's own margin, 1 GiB on this workstation's plans"),
+        doc: "Placement: the bytes a card of a plan keeps free past its context and scratch, \
+              which the expert rule never plans into (llama-server's `-fitt`). One value is \
+              every card's margin; `CUDA0=1G,CUDA1=2G` gives each card named its own, by the \
+              CUDA ordinal `--list-devices` prints, and a card it does not name keeps its own. \
+              It replaces the plan's margin and is not a budget: the card's usable bytes stay \
+              the budget's. Read where a `--place` is resolved against the census, so every \
+              binary acts on it. Refused by name: an entry that is no `CUDA<N>=<bytes>`, a \
+              card named twice, a card the census does not list, shares (`<n>x`), a list on a \
+              plan whose tier cards are another node's, and a margin that leaves a card no \
+              usable byte. `M` and `G` are binary units.",
         site: Site::Parsed {
             left: &[],
             phase: Phase::Load,
@@ -911,11 +944,12 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         class: Class::A,
         kind: Kind::Words(&["off", "admit", "split"]),
         default: Unset::Means(
-            "Qwen3.8 (`generate_qwen3moe`): `split` under `--place a` with a residency (`admit` when \
-             the card has no room for the ring), `admit` under `--place bp` with one, `off` \
-             everywhere else",
+            "Qwen3.8 (`generate_qwen3moe`, `bloomery-serve-qwen38`), and the Muse Spark and \
+             MiniMax-M3.1 seats (`bloomery-serve`, MiniMax-M3.1's gates): `split` under `--place a` \
+             with a residency (`admit` when the card has no room for the ring), `admit` under \
+             `--place bp` with one, `off` everywhere else",
         ),
-        doc: "Qwen3.8 prompt calls fed by ubatches under adaptive residency \
+        doc: "Qwen3.8, Muse Spark and MiniMax-M3.1 prompt calls fed by ubatches or passes under adaptive residency \
               (`BLOOMERY_RESIDENCY=mid-…`): what each card layer's walk moves before its card \
               route. `admit` moves the residency's pool toward the ubatch's hottest host experts \
               (`host::swap` call mode, a count of at least the walk's floor), and the call's picks \
@@ -934,7 +968,11 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               serves no expert tier), `off` everywhere else; `admit` and `split` are refused by \
               name beside `BLOOMERY_RESIDENCY=off` and on a qwen3moe or qwen35moe file, `split` on \
               a load with an expert tier. The load line prints `xstream=`, \
-              every streamed layer an `xstream` record, every call `xstream end`.",
+              every streamed layer an `xstream` record, every call `xstream end`. A MiniMax-M3.1 \
+              load (its gates' seat, `Body::set_xstream`) takes it through the common prompt walk: \
+              `split` streams the host experts the rule sends to the card into the ring's half and \
+              runs their slots there beside the card's stacks (NVFP4 planes staged from the \
+              checkpoint folder's parts).",
         site: Site::Parsed {
             left: &[],
             phase: Phase::Load,
@@ -1509,15 +1547,17 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         name: "BLOOMERY_DSPARK_CARD",
         class: Class::C,
         kind: Kind::Text,
-        default: Unset::Means("the 3090"),
+        default: Unset::Means("the tier card under `bp`, else the smallest visible card"),
         doc: "`generate_ds41` and `bloomery-serve-ds41` under `BLOOMERY_DRAFT=dspark`: the \
               card the DSpark draft loads on, one card as a `--place` list word names it (a \
               CUDA ordinal, `1` or `cuda1`, or a card name exactly one visible device \
-              carries); it may be the target's own card. Unset, the visible device of the \
-              fewest usable bytes (the 3090). A word no visible device answers, or a name two \
-              carry, is refused by name. Under `--place bp` the draft sits on the expert tier \
-              card (the 3090), whose plan reserves its bytes, and a word naming another device \
-              is refused.",
+              carries); it may be the target's own card. Unset, the placement's first expert \
+              tier card where it has one (`--place bp`), else the visible device of the \
+              fewest usable bytes. The plan sets the draft's bytes aside on that card before \
+              its experts: on a card of the placement at its place in the plan, on any other \
+              visible device as a card that joins the plan to hold the draft and no expert. \
+              A word no visible device answers, a name two carry, and a list are refused by \
+              name.",
         site: Site::Direct {
             at: &[InPlace {
                 file: "crates/gpu-gates/src/bin/shared/ds41_dspark.rs",
@@ -1715,6 +1755,19 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         Some("ref/lease-probe.sh"),
         "The directory of the timing lease, the holds and the gate locks, `/root` when \
          unset; `tools/box.sh`'s local mode sets it, `~/.cache/bloomery/locks` by default.",
+    ),
+    path(
+        "BLOOMERY_MM31_FOLDER",
+        Some("ref/mm31-dump.sh"),
+        "The MiniMax-M3.1-Flash checkpoint folder or its fixture cut: `tools/ref/mm31-dump.sh` \
+         dumps it (the tool profile's model when unset) and the folder reader's gate opens it by \
+         its map.",
+    ),
+    path(
+        "BLOOMERY_MM31_HF",
+        None,
+        "The MiniMax-M3.1-Flash folder whose tokenizer files, config.json and chat template the \
+         vocabulary and encode gates of the hf crate read.",
     ),
     path(
         "BLOOMERY_MODEL",
@@ -1997,6 +2050,12 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         Some("box.sh"),
         "Mac side: the card a box command runs on, `3090`, `a6000` or `both`; \
          `tools/box.sh` sets `CUDA_VISIBLE_DEVICES` from it.",
+    ),
+    runner(
+        "BLOOMERY_CARD_ALL_EXPERTS",
+        Some("ref/needs-env.sh"),
+        "Set on a machine whose one card holds every routed expert of Qwen3.8-Flash-Next's NVFP4 split (a GB10 Spark, \
+         128 GB): `gate-gpu-qwen4exp-nvfp4` runs only where it is set, and a batch defers it by name elsewhere.",
     ),
     runner(
         "BLOOMERY_CHAIN_ATTN_LAYERS",

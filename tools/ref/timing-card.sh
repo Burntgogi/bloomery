@@ -50,12 +50,13 @@ source "${BASH_SOURCE[0]%/*}/lease.sh"
 TIMING_GPU=${BLOOMERY_TIMING_GPU:-$GPU_A6000}
 if [ "$TIMING_GPU" = "$GPU_3090" ]; then OTHER_GPU=$GPU_A6000; else OTHER_GPU=$GPU_3090; fi
 export CUDA_VISIBLE_DEVICES=$TIMING_GPU
-# A DSpark run (BLOOMERY_DRAFT=dspark) puts its draft on the other card — the placement's tier card
-# under bp, else BLOOMERY_DSPARK_CARD's pick, else the smallest visible card (dspark::draft_spec) — so
-# that card must be visible too; the timing card stays device 0. The draft file
-# is the profile's DSPARK_MODEL unless the caller names one. dspark_env prints the same two
-# assignments for a runner that sets the lever per arm (depth-ds41.sh); in the two-card mode the cards
-# are the mode's two (the draft sits on the 3090 beside the expert tier).
+# A DSpark run (BLOOMERY_DRAFT=dspark) puts its draft on the other card — BLOOMERY_DSPARK_CARD's pick, else
+# the placement's tier card under bp, else the smallest visible card (Place::draft_on), which joins the plan
+# as a holder (a card with the draft and no expert) when it is none of the placement's — so that card must
+# be visible too; the timing card stays device 0. The draft file is the profile's DSPARK_MODEL unless the
+# caller names one. dspark_env prints the same two assignments for a runner that sets the lever per arm
+# (depth-ds41.sh); in the two-card mode the cards are the mode's two (the draft sits on the 3090 beside the
+# expert tier).
 # An empty draft path is refused by name (exit 66), never exported: on the fixture tier a fixture with
 # no single draft leaves DSPARK_MODEL empty and its reason in DSPARK_MODEL_WHY (ref-paths.sh).
 # shellcheck source=tools/ref/dspark-path.sh

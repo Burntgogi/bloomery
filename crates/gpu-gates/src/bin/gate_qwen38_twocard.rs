@@ -708,7 +708,7 @@ mod gate {
         gib: u64,
     ) -> Result<(Option<Plan<'a>>, Option<String>), GateError> {
         let levers = PlanLevers {
-            card_budget_bytes: Some(gib << 30),
+            card_budget_bytes: Some(gib << 30).into(),
         };
         match inputs.plan_with(bp, ctx as u64, &levers, Experts::Card) {
             Ok(plan) => {
@@ -1117,7 +1117,7 @@ mod gate {
         /// gate's budget: one slot is [`PlanInputs::plan_with`] itself.
         fn plan(&self, slots: usize) -> Result<Plan<'a>, GateError> {
             let levers = PlanLevers {
-                card_budget_bytes: Some(self.gib << 30),
+                card_budget_bytes: Some(self.gib << 30).into(),
             };
             Ok(self
                 .inputs

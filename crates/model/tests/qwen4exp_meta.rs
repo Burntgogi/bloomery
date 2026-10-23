@@ -945,7 +945,7 @@ fn hw_qwen4exp_card_plan() {
                 p.nvme_bytes,
                 &p.n_l,
                 p.ctx_max,
-                p.card_budget
+                &p.card_budget
             )
         )
     };
@@ -1063,7 +1063,7 @@ fn hw_qwen4exp_card_plan() {
             + stage
             + MARGIN;
         let levers = PlanLevers {
-            card_budget_bytes: Some(floor),
+            card_budget_bytes: Some(floor).into(),
         };
         let pair = (
             inputs.plan_with(&machine, KV_AT[0].0, &levers, Experts::Card),
@@ -1385,7 +1385,7 @@ fn hw_qwen4exp_q3_card_plan() {
                 p.nvme_bytes,
                 &p.n_l,
                 p.ctx_max,
-                p.card_budget
+                &p.card_budget
             )
         )
     };
@@ -1495,7 +1495,7 @@ fn hw_qwen4exp_q3_card_plan() {
             + stage
             + MARGIN;
         let levers = PlanLevers {
-            card_budget_bytes: Some(floor),
+            card_budget_bytes: Some(floor).into(),
         };
         let pair = (
             inputs.plan_with(&machine, KV_AT[0].0, &levers, Experts::Card),

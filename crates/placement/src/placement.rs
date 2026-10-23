@@ -13,9 +13,10 @@
 //! keep the same number of experts on it, give or take one — the count
 //! `n_l` — and the rest stay on the host. Which experts a layer keeps is an
 //! [`ExpertList`]: the id prefix `[0, n_l)`. A card byte budget
-//! (`BLOOMERY_CARD_BUDGET`, [`card_budget`]) caps every card's usable bytes
-//! before the rule runs — the lever comes in as [`PlanLevers`], which a
-//! binary parses once — and the census's free reading caps them below that:
+//! (`BLOOMERY_CARD_BUDGET`, [`card_budget`]: one for every card, or one per
+//! card) caps a card's usable bytes before the rule runs — the lever comes in
+//! as [`PlanLevers`], which a binary parses once — and the census's free
+//! reading caps them below that:
 //! while another process holds the device, fewer experts fit
 //! ([`Card::free_bytes`], [`capped`]).
 //!
@@ -167,6 +168,27 @@ impl ModelTensors {
         }
     }
 
+    /// Each file tensor whose card format ([`ModelTensors::card_format`]) is a
+    /// quantization other than its file's, in tensor order: the loader's
+    /// choice ([`file_card_format`]: a BF16 head in MXFP8 planes), which the
+    /// plan record states so the change of values is never silent. A re-layout
+    /// of the file's own values is not listed: its own type's planes, bf16
+    /// widened or kept as words, a K-quant decoded to f32.
+    #[must_use]
+    pub fn requantized(&self) -> Vec<Requantized> {
+        self.tensors
+            .iter()
+            .filter_map(|t| {
+                let card = self.card_format(t)?;
+                requantizes(t.ty, card).then(|| Requantized {
+                    name: t.name.clone(),
+                    file: t.ty,
+                    card,
+                })
+            })
+            .collect()
+    }
+
     /// The experts of routed stack `t` ([`stack_experts`]).
     #[must_use]
     pub fn experts_of(&self, t: &ModelTensor) -> u64 {
@@ -227,6 +249,11 @@ pub struct Card {
     /// draft model's resident bytes, say): taken from the budget with the
     /// context and the scratch ([`Card::set_aside_bytes`]).
     pub reserves: Vec<(String, u64)>,
+    /// A tier card with an expert cap of 0: it holds its reserves and no
+    /// expert, and serves no tier. The plan refuses one with no reserve
+    /// ([`PlacementError::IdleTier`]); a body hangs a tier only under the
+    /// tier cards that are not reserve-only ([`Machine::expert_tiers`]).
+    pub reserve_only: bool,
 }
 
 impl Card {
@@ -344,6 +371,18 @@ pub struct Node {
     pub unified: Option<UnifiedPool>,
 }
 
+/// Bytes a load puts on a device beside the plan's tensors, by what they are
+/// for (a draft model's resident bytes, say): the one shape a named reserve
+/// takes, entered by [`Machine::reserve`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Reserve {
+    /// The device that holds them: `Card(i)` over [`Machine::all_cards`], the
+    /// stage cards first (0 is the first stage card), or the host.
+    pub on: Device,
+    pub name: &'static str,
+    pub bytes: u64,
+}
+
 /// The devices: the cards in stage order, the expert tier cards and the
 /// nodes. The NVMe tier has no figure here — it holds its tensors in place
 /// and never loads them.
@@ -429,6 +468,14 @@ impl Machine {
         self.cards.iter().chain(&self.tiers)
     }
 
+    /// The tier cards that hold experts, in tier order: [`Machine::tiers`]
+    /// less the reserve-only members ([`Card::reserve_only`]), which the plan
+    /// lists after them. What a body hangs under its host tier, and what the
+    /// tier's prompt batch is sized for.
+    pub fn expert_tiers(&self) -> impl Iterator<Item = &Card> {
+        self.tiers.iter().filter(|t| !t.reserve_only)
+    }
+
     /// Whether card `i` of [`Machine::all_cards`] takes its bytes from this
     /// process's node, whose pool and host the plan holds: every stage card,
     /// and a tier card unless the machine lists a node of its own for each
@@ -446,6 +493,39 @@ impl Machine {
             None => self.cards.get(i),
             Some(t) => self.tiers.get(t),
         }
+    }
+
+    /// Set `reserve.bytes` aside on `reserve.on`, by what they are for: the one
+    /// way a named reserve enters a machine. On a card the plan takes them from
+    /// the card's budget with its context and scratch, before any expert
+    /// ([`Card::set_aside_bytes`]): a reserve larger than the room leaves the
+    /// card no expert, and one past its dense tensors is the budget floor's
+    /// refusal. On the host they join its reserves. A card past the device list
+    /// and the NVMe tier or nowhere are refused by name
+    /// ([`PlacementError::ReserveOffPlan`]) and nothing is set aside: the bytes
+    /// would sit on a device the plan does not count.
+    pub fn reserve(&mut self, reserve: Reserve) -> Result<(), PlacementError> {
+        let Reserve { on, name, bytes } = reserve;
+        let stages = self.cards.len();
+        let cards = stages + self.tiers.len();
+        let held = match on {
+            Device::Card(i) => match i.checked_sub(stages) {
+                None => self.cards.get_mut(i),
+                Some(t) => self.tiers.get_mut(t),
+            }
+            .map(|card| &mut card.reserves),
+            Device::Host => Some(&mut self.host_mut().reserves),
+            Device::Nvme | Device::Unused => None,
+        };
+        let Some(held) = held else {
+            return Err(PlacementError::ReserveOffPlan {
+                reserve: name.to_string(),
+                on,
+                cards,
+            });
+        };
+        held.push((name.to_string(), bytes));
+        Ok(())
     }
 
     /// The stage card a whole load of this machine is sized against
@@ -521,6 +601,39 @@ pub fn file_card_format(name: &str, ty: GgmlType, k: u64) -> Option<CardFormat> 
         Some(CardFormat::Mxfp8Planes)
     } else {
         Some(CardFormat::Bf16Raw)
+    }
+}
+
+/// Whether `card` is a quantized layout other than file type `file`'s own
+/// ([`CardFormat::of`]): the card then holds values the file does not.
+fn requantizes(file: GgmlType, card: CardFormat) -> bool {
+    CardFormat::of(file) != Some(card)
+        && matches!(
+            card,
+            CardFormat::Q5_0
+                | CardFormat::Q5_1
+                | CardFormat::Q8_0Planes
+                | CardFormat::Nvfp4Planes
+                | CardFormat::Mxfp8Planes
+                | CardFormat::Fp8B128Planes
+        )
+}
+
+/// A file tensor the card holds in another quantization than its file's
+/// ([`ModelTensors::requantized`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Requantized {
+    pub name: String,
+    /// The tensor's type in the file.
+    pub file: GgmlType,
+    /// Its format on the card.
+    pub card: CardFormat,
+}
+
+/// `name:file type:card format`, as the plan record lists it.
+impl fmt::Display for Requantized {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}:{}", self.name, self.file, self.card.label())
     }
 }
 
@@ -1045,9 +1158,10 @@ pub struct Plan<'a> {
     /// holds — the ids after the stage card's `n_l` and the earlier
     /// tiers'. The host holds the rest.
     pub tier_n_l: Vec<Vec<u64>>,
-    /// The card byte budget the plan was made under: every card planned
-    /// with `min(usable, budget)` usable bytes ([`Plan::usable_bytes`]).
-    pub card_budget: Option<u64>,
+    /// The card byte budget the plan was made under: a card planned with
+    /// `min(usable, budget)` usable bytes, its budget [`card_budget::of`]
+    /// ([`Plan::usable_bytes`]).
+    pub card_budget: card_budget::CardBudget,
     /// The card budget is the one [`plan_in_pool`] lowered to the NVMe
     /// expert tier's floor, not one the caller gave.
     pub budget_from_pool: bool,
@@ -1206,12 +1320,18 @@ pub enum PlacementError {
          routed expert on the host; plan without it"
     )]
     HostRoutedTier { card: String, tier: usize },
-    /// A draft reserve on a tier the plan does not have.
+    /// A named reserve ([`Machine::reserve`]) on a device the plan does not
+    /// count: a card past the device list (`cards` counts the stage cards and
+    /// the tier cards), the NVMe tier, or nowhere.
     #[error(
-        "the draft's reserve is on tier {on}, and the plan has {tiers} tier cards: the draft's \
-         card is outside the plan"
+        "the {reserve} reserve is on {on:?}, outside the plan: a reserve sits on one of the \
+         plan's {cards} cards, stage first, or on the host"
     )]
-    DraftOffPlan { on: usize, tiers: usize },
+    ReserveOffPlan {
+        reserve: String,
+        on: Device,
+        cards: usize,
+    },
     /// A layer the plan's per-layer expert counts ([`Plan::n_l`],
     /// [`Plan::tier_n_l`]) do not reach: `layers` is how many they hold.
     #[error("layer {layer} is past the plan's per-layer expert counts ({layers} layers)")]
@@ -1273,6 +1393,40 @@ pub enum PlacementError {
         margin: u64,
         beside: u64,
     },
+    /// A per-card budget on a plan with a card no CUDA ordinal of this
+    /// process names ([`card_budget::check`]).
+    #[error("card {card}: the per-card budget {budget} names cards by CUDA ordinal, and {why}")]
+    CardBudgetCard {
+        card: String,
+        budget: String,
+        why: &'static str,
+    },
+    /// A per-card budget or margin (`what`) naming a device the census does
+    /// not list ([`card_budget::check_visible`]).
+    #[error(
+        "the per-card {what} {budget} names CUDA{ordinal}, which this process's census does not \
+         list (visible: {visible})"
+    )]
+    CardBudgetUnseen {
+        what: &'static str,
+        ordinal: u32,
+        budget: String,
+        visible: String,
+    },
+    /// A margin that leaves a card no usable byte ([`card_budget::keep_free`]).
+    #[error(
+        "card {card}: a margin of {margin} B kept free leaves none of its {usable} B a plan may \
+         use"
+    )]
+    CardMargin {
+        card: String,
+        margin: u64,
+        usable: u64,
+    },
+    /// A budget by shares the plan cannot turn into a budget per card
+    /// ([`card_budget::split`]), with the terms that say why.
+    #[error("card budget {shares}: {why}")]
+    CardShares { shares: String, why: String },
     /// A card whose device another process holds: what it had free at plan
     /// time is below the card's floor — the dense tensors, KV, set-aside,
     /// margin and what the caller holds beside the plan, before any expert
@@ -1856,12 +2010,16 @@ fn routed_row_on_as(
         }
     }
     if !host.is_empty() {
-        if t.ty == GgmlType::NVFP4 {
+        // The host dots an nvfp4 stack's file blocks with its scales; a card
+        // holds them as planes, and a residency swap copies file bytes into a
+        // card slot, so one stack is not split between the two.
+        if t.ty == GgmlType::NVFP4 && !segments.is_empty() {
             return Err(PlacementError::tensor(
                 t,
                 format!(
-                    "an nvfp4 stack with experts {host} on the host, which has no nvfp4 kernel: \
-                     every expert of it must be on a card"
+                    "an nvfp4 stack with experts {host} on the host and the rest on a card, \
+                     which holds them as planes where a residency swap copies the file's \
+                     blocks: every expert of it must be on a card, or every one on the host"
                 ),
             ));
         }
@@ -2155,18 +2313,19 @@ fn footprint(
 /// pool the budget [`plan_in_pool`] lowers to the NVMe expert tier's floor.
 #[derive(Clone, Debug, Default)]
 pub struct PlanLevers {
-    /// The card budget `BLOOMERY_CARD_BUDGET` sets, in bytes: every card of
-    /// the plan plans with `min(usable, budget)`; `None` unset, each card's
-    /// own usable bytes, or on a unified pool the budget [`plan_in_pool`]
-    /// lowers to the NVMe expert tier's floor.
-    pub card_budget_bytes: Option<u64>,
+    /// The card budget `BLOOMERY_CARD_BUDGET` sets, in bytes: a card of the
+    /// plan plans with `min(usable, budget)`, its budget one for every card
+    /// or its own entry ([`card_budget::of`]); unset, each card's own usable
+    /// bytes, or on a unified pool the budget [`plan_in_pool`] lowers to the
+    /// NVMe expert tier's floor. One value converts from `Option<u64>`.
+    pub card_budget_bytes: card_budget::CardBudget,
 }
 
 impl PlanLevers {
     /// The placement's levers of a binary's one parse.
     pub fn from_levers(levers: &bloomery_levers::Levers) -> Result<PlanLevers, PlacementError> {
         Ok(PlanLevers {
-            card_budget_bytes: levers.card_budget_bytes(),
+            card_budget_bytes: levers.card_budget(),
         })
     }
 }
@@ -2179,7 +2338,15 @@ pub fn plan<'a>(
     kv: &dyn KvBytes,
     levers: &PlanLevers,
 ) -> Result<Plan<'a>, PlacementError> {
-    plan_with(model, machine, ctx_max, kv, levers.card_budget_bytes)
+    plan_rule(
+        model,
+        machine,
+        ctx_max,
+        kv,
+        &levers.card_budget_bytes,
+        Some(RoutedRule::PerType(CardFormat::of_routed)),
+        0,
+    )
 }
 
 /// The bytes the plan may take from `card`: its usable bytes, capped by the
@@ -2207,7 +2374,7 @@ fn capped(card: &Card, budget: Option<u64>) -> u64 {
 /// card whose layers cannot keep one expert keeps none; one that cannot hold
 /// even its dense tensors shows up in [`Plan::violations`], not as an error
 /// here. The `n_l` experts of a layer are its id prefix `[0, n_l)`. With
-/// `card_budget`, every card plans
+/// `card_budget`, one value for every card, every card plans
 /// with `min(usable, budget)` usable bytes, and a card whose dense tensors,
 /// KV, context, scratch and margin pass that is refused
 /// ([`PlacementError::CardBudgetFloor`]). A card whose census free reading
@@ -2229,7 +2396,7 @@ pub fn plan_with<'a>(
         machine,
         ctx_max,
         kv,
-        card_budget,
+        &card_budget.into(),
         Some(RoutedRule::PerType(CardFormat::of_routed)),
         0,
     )
@@ -2251,7 +2418,7 @@ pub fn plan_routed<'a>(
         machine,
         ctx_max,
         kv,
-        levers.card_budget_bytes,
+        &levers.card_budget_bytes,
         Some(routed),
         0,
     )
@@ -2280,7 +2447,7 @@ pub fn plan_routed_reserving<'a>(
         machine,
         ctx_max,
         kv,
-        levers.card_budget_bytes,
+        &levers.card_budget_bytes,
         Some(routed),
         reserve,
     )
@@ -2314,7 +2481,12 @@ pub fn plan_host_routed_reserving<'a>(
     levers: &PlanLevers,
     reserve: u64,
 ) -> Result<Plan<'a>, PlacementError> {
-    if let Some((t, tier)) = machine.tiers.iter().enumerate().next() {
+    if let Some((t, tier)) = machine
+        .tiers
+        .iter()
+        .enumerate()
+        .find(|(_, tier)| !tier.reserve_only)
+    {
         return Err(PlacementError::HostRoutedTier {
             card: tier.name.clone(),
             tier: t,
@@ -2325,7 +2497,7 @@ pub fn plan_host_routed_reserving<'a>(
         machine,
         ctx_max,
         kv,
-        levers.card_budget_bytes,
+        &levers.card_budget_bytes,
         None,
         reserve,
     )
@@ -2333,8 +2505,10 @@ pub fn plan_host_routed_reserving<'a>(
 
 /// [`plan_with`], the expert rule run on each card's layers eligible under
 /// `routed`, and on none without it, within each card's budget less
-/// `reserve` ([`plan_routed_reserving`]); the routed stacks' card segments
-/// in the format `routed` gives them.
+/// `reserve` ([`plan_routed_reserving`]), the budget per card under a
+/// per-card `card_budget` ([`card_budget::of`], refused on a machine whose
+/// card no CUDA ordinal of this process names: [`card_budget::check`]); the
+/// routed stacks' card segments in the format `routed` gives them.
 #[allow(
     clippy::too_many_arguments,
     reason = "the planners' one body: the model, machine, context and cache, and the rule's three inputs"
@@ -2344,7 +2518,7 @@ fn plan_rule<'a>(
     machine: &'a Machine,
     ctx_max: u64,
     kv: &dyn KvBytes,
-    card_budget: Option<u64>,
+    card_budget: &card_budget::CardBudget,
     routed: Option<RoutedRule>,
     reserve: u64,
 ) -> Result<Plan<'a>, PlacementError> {
@@ -2369,6 +2543,17 @@ fn plan_rule<'a>(
         }
     }
     check_tiers(&machine.tiers)?;
+    card_budget::check(card_budget, machine)?;
+    let by_shares;
+    let card_budget = match card_budget {
+        card_budget::CardBudget::Shares(shares) => {
+            by_shares = resolve_shares(
+                shares, model, machine, ctx_max, kv, &rows, &stacks, routed, reserve,
+            )?;
+            &by_shares
+        }
+        other => other,
+    };
     check_devices(machine, card_budget)?;
     let mut n_l = vec![0u64; model.layers];
     let none_held = vec![0u64; model.layers];
@@ -2386,7 +2571,7 @@ fn plan_rule<'a>(
             rows: &rows,
             eligible: &eligible,
             routed,
-            card_budget,
+            card_budget: card_budget::of(card_budget, card),
             kv: kv_card + stage_rows,
             reserve,
         };
@@ -2402,9 +2587,12 @@ fn plan_rule<'a>(
                 *h += p;
             }
         }
+        // A reserve-only member has an expert cap of 0: no layer is eligible,
+        // so its fill plans no expert and still holds its reserves to the
+        // card's budget and free floors.
         let eligible = match routed {
-            Some(r) => eligible(0..model.layers, &stacks, model, r)?,
-            None => Vec::new(),
+            Some(r) if !tier.reserve_only => eligible(0..model.layers, &stacks, model, r)?,
+            _ => Vec::new(),
         };
         let fill = Fill {
             model,
@@ -2413,7 +2601,7 @@ fn plan_rule<'a>(
             rows: &rows,
             eligible: &eligible,
             routed,
-            card_budget,
+            card_budget: card_budget::of(card_budget, tier),
             kv: kv_tier,
             reserve,
         };
@@ -2424,7 +2612,12 @@ fn plan_rule<'a>(
         // (`plan_host_routed` refuses one), and its empty `eligible` would
         // refuse the tier as idle.
         let left = eligible.iter().any(|&l| held[l] < model.layer_experts(l));
-        if !left && own.iter().all(|&n| n == 0) {
+        let idle = if tier.reserve_only {
+            tier.reserves.is_empty()
+        } else {
+            !left && own.iter().all(|&n| n == 0)
+        };
+        if idle {
             return Err(PlacementError::IdleTier {
                 card: tier.name.clone(),
                 tier: t,
@@ -2466,10 +2659,120 @@ fn plan_rule<'a>(
         rows,
         &kv_bytes,
         (n_l, tier_n_l),
-        card_budget,
+        card_budget.clone(),
     )?;
     plan.reserve_beside(reserve)?;
     Ok(plan)
+}
+
+/// A budget by shares ([`card_budget::CardBudget::Shares`]) as the budget per
+/// card the expert rule plans with. Each card the shares name that takes
+/// experts plans with its floor — the granules of its dense uploads, its KV,
+/// context, scratch, reserves, margin and `reserve` — and its part of the
+/// routed experts' bytes ([`card_budget::split`]): every routed stack whole,
+/// as a tier card is offered them, in the proportion of the shares and as many
+/// in all as the card whose room is tightest for its share holds, the host
+/// tier taking the rest. A card the shares do not name plans with its own
+/// bytes. Refused by name ([`PlacementError::CardShares`]): a plan that puts no
+/// routed expert on a card (`routed` none), shares none of whose cards take
+/// experts or has a share above 0, and a named card whose floor passes the
+/// bytes it may plan with.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the planner's own inputs: shares, model, machine, context, cache, rows, stacks, rule"
+)]
+fn resolve_shares(
+    shares: &[(u32, u64)],
+    model: &ModelTensors,
+    machine: &Machine,
+    ctx_max: u64,
+    kv: &dyn KvBytes,
+    rows: &[Option<Row>],
+    stacks: &[Vec<usize>],
+    routed: Option<RoutedRule>,
+    reserve: u64,
+) -> Result<card_budget::CardBudget, PlacementError> {
+    let text = card_budget::CardBudget::Shares(shares.to_vec()).to_string();
+    let refuse = |why: String| PlacementError::CardShares {
+        shares: text.clone(),
+        why,
+    };
+    let Some(routed) = routed else {
+        return Err(refuse(
+            "this plan places no routed expert on a card, so there is nothing to share out"
+                .to_owned(),
+        ));
+    };
+    let cards: Vec<&Card> = machine.all_cards().collect();
+    let zeros = vec![0u64; model.layers];
+    // `(ordinal, floor)` and the split's input, one entry per named card that takes experts.
+    let mut named: Vec<(u32, u64)> = Vec::new();
+    let mut parts: Vec<card_budget::ShareCard> = Vec::new();
+    for (c, card) in cards.iter().enumerate() {
+        let Some(ordinal) = card.device.map(|d| d.ordinal) else {
+            continue;
+        };
+        let Some(&(_, weight)) = shares.iter().find(|&&(o, _)| o == ordinal) else {
+            continue;
+        };
+        if card.reserve_only {
+            continue;
+        }
+        let tier = c >= machine.cards.len();
+        let (kv_card, _, stage_rows) = card_kv(card, kv, ctx_max);
+        let layers = if tier {
+            0..model.layers
+        } else {
+            card.layers.clone()
+        };
+        let own = eligible(layers, stacks, model, routed)?;
+        let uploads = card_uploads(model, c, rows, &own, routed)?;
+        let dense = footprint(card.granule_bytes, &uploads, &zeros)?;
+        let kv = kv_card.saturating_add(stage_rows);
+        let floor = plan_floor(card, dense, kv, reserve);
+        let cap = capped(card, None);
+        let Some((floor, room)) = floor.and_then(|f| Some((f, cap.checked_sub(f)?))) else {
+            return Err(refuse(format!(
+                "card {}: its floor {} B = dense uploads {dense} B + KV {} B + context {} B + \
+                 scratch {} B + reserves {} B + margin {} B + beside {reserve} B passes the {cap} B \
+                 it may plan with, so it holds no expert",
+                card.name,
+                floor.map_or_else(|| "past u64".to_owned(), |f| f.to_string()),
+                kv,
+                card.context_bytes,
+                card.scratch_bytes,
+                card.reserve_bytes().unwrap_or(u64::MAX),
+                card.margin_bytes,
+            )));
+        };
+        named.push((ordinal, floor));
+        parts.push(card_budget::ShareCard { weight, room });
+    }
+    if named.is_empty() {
+        return Err(refuse(format!(
+            "it names no card of this plan that takes experts (the plan's cards: {})",
+            cards
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
+    if parts.iter().all(|p| p.weight == 0) {
+        return Err(refuse(
+            "none of the plan's cards it names has a share above 0".to_owned(),
+        ));
+    }
+    let routable = eligible(0..model.layers, stacks, model, routed)?;
+    let caps: Vec<u64> = (0..model.layers).map(|l| model.layer_experts(l)).collect();
+    let experts = card_uploads(model, cards.len(), rows, &routable, routed)?;
+    let total = footprint(cards[0].granule_bytes, &experts, &caps)?;
+    let per = named
+        .iter()
+        .zip(card_budget::split(&parts, total))
+        .map(|(&(ordinal, floor), x)| (ordinal, floor + x))
+        .collect();
+    Ok(card_budget::CardBudget::Per(per))
 }
 
 /// A card's KV cache and its ring shadows over the layers its stage runs,
@@ -2517,7 +2820,10 @@ fn check_tiers(tiers: &[Card]) -> Result<(), PlacementError> {
 /// Refuse cards of one device ([`Card::same_device`]) whose budgets under
 /// `card_budget` sum past the device's usable bytes
 /// ([`PlacementError::DeviceTwice`]).
-fn check_devices(machine: &Machine, card_budget: Option<u64>) -> Result<(), PlacementError> {
+fn check_devices(
+    machine: &Machine,
+    card_budget: &card_budget::CardBudget,
+) -> Result<(), PlacementError> {
     let cards: Vec<&Card> = machine.all_cards().collect();
     for (i, card) in cards.iter().enumerate() {
         if cards[..i].iter().any(|c| c.same_device(card)) {
@@ -2528,9 +2834,9 @@ fn check_devices(machine: &Machine, card_budget: Option<u64>) -> Result<(), Plac
             continue;
         }
         let usable = same.iter().map(|c| c.usable_bytes).max().unwrap_or(0);
-        let budgets = same
-            .iter()
-            .try_fold(0u64, |sum, c| sum.checked_add(capped(c, card_budget)));
+        let budgets = same.iter().try_fold(0u64, |sum, c| {
+            sum.checked_add(capped(c, card_budget::of(card_budget, c)))
+        });
         if budgets.is_none_or(|b| b > usable) {
             return Err(PlacementError::DeviceTwice {
                 card: card.name.clone(),
@@ -2544,7 +2850,8 @@ fn check_devices(machine: &Machine, card_budget: Option<u64>) -> Result<(), Plac
 }
 
 /// One card's expert rule: card `c` of [`Machine::all_cards`], its budget
-/// usable − KV − set-aside − margin − `reserve`, its uploads over `eligible`.
+/// usable − KV − set-aside − margin − `reserve`, its uploads over `eligible`;
+/// `card_budget` is the card's own ([`card_budget::of`]).
 struct Fill<'m, 'r> {
     model: &'m ModelTensors,
     card: &'m Card,
@@ -2600,10 +2907,11 @@ impl Fill<'_, '_> {
 /// `card`'s floor in a plan whose caller holds `beside` bytes of it beside
 /// the plan ([`Fill::reserve`]): [`Card::floor_bytes`] with the margin and
 /// those as its `past`. Both floor checks ([`check_floor`],
-/// [`check_free_floor`]) take it from here, so the floor they name is the
-/// least budget at which the expert rule's own budget (usable less KV,
-/// set-aside, margin and `beside`, in [`Fill::run`]) reaches the dense
-/// uploads. `None` past u64 bytes.
+/// [`check_free_floor`]) and the share split's floors ([`resolve_shares`])
+/// take it from here, so the floor they name is the least budget at which
+/// the expert rule's own budget (usable less KV, set-aside, margin and
+/// `beside`, in [`Fill::run`]) reaches the dense uploads. `None` past u64
+/// bytes.
 fn plan_floor(card: &Card, dense: u64, kv: u64, beside: u64) -> Option<u64> {
     card.margin_bytes
         .checked_add(beside)
@@ -3635,9 +3943,9 @@ pub fn plan_in_pool<'a>(
         Err(PlacementError::HostRoomFloor { room, floor, .. }) => floor.saturating_sub(*room),
         _ => return first,
     };
-    let (Some(_), None, Some(card)) = (
+    let (Some(_), card_budget::CardBudget::Unset, Some(card)) = (
         machine.unified(),
-        levers.card_budget_bytes,
+        &levers.card_budget_bytes,
         machine.cards.first(),
     ) else {
         return first;
@@ -3650,7 +3958,7 @@ pub fn plan_in_pool<'a>(
         };
         budget = lower;
         let refused = match make(&PlanLevers {
-            card_budget_bytes: Some(budget),
+            card_budget_bytes: card_budget::CardBudget::Every(budget),
         }) {
             Ok(mut plan) => {
                 plan.budget_from_pool = true;
@@ -3698,7 +4006,7 @@ fn totals<'a>(
     rows: Vec<Row>,
     kv_bytes: &[(u64, u64, u64)],
     counts: (Vec<u64>, Vec<Vec<u64>>),
-    card_budget: Option<u64>,
+    card_budget: card_budget::CardBudget,
 ) -> Result<Plan<'a>, PlacementError> {
     let (n_l, tier_n_l) = counts;
     let mut routing = vec![false; model.layers];
@@ -3775,7 +4083,8 @@ fn totals<'a>(
                 reserve_bytes: card
                     .reserve_bytes()
                     .expect("the card floor checked its reserves"),
-                headroom_bytes: i128::from(capped(card, card_budget)) - i128::from(used),
+                headroom_bytes: i128::from(capped(card, card_budget::of(&card_budget, card)))
+                    - i128::from(used),
             })
         })
         .collect::<Result<_, PlacementError>>()?;
@@ -3810,7 +4119,7 @@ fn totals<'a>(
     // The room the machine's figure leaves past the plan's host need, the
     // need's own arithmetic (`HostNeed`).
     host.headroom_bytes =
-        workstation::HostNeed::of_totals(machine.host(), &host, card_budget.is_some(), 0)
+        workstation::HostNeed::of_totals(machine.host(), &host, card_budget.is_set(), 0)
             .headroom(workstation::HostNeed::machine_room(machine.host()));
     Ok(Plan {
         model,
@@ -3892,11 +4201,11 @@ impl Plan<'_> {
     }
 
     /// The usable bytes `card` planned with: its own, capped by the device's
-    /// free bytes at plan time and by the plan's card budget
-    /// ([`capped`]'s one cap).
+    /// free bytes at plan time and by its budget under the plan's card budget
+    /// ([`capped`]'s one cap, [`card_budget::of`]).
     #[must_use]
     pub fn usable_bytes(&self, card: &Card) -> u64 {
-        capped(card, self.card_budget)
+        capped(card, card_budget::of(&self.card_budget, card))
     }
 
     /// The experts the host serves on layer `l`, resident or paged from the
@@ -4316,7 +4625,7 @@ mod tests {
             nvme_bytes: 0,
             n_l: Vec::new(),
             tier_n_l: Vec::new(),
-            card_budget: Some(budget),
+            card_budget: card_budget::CardBudget::Every(budget),
             budget_from_pool: false,
         }
     }
@@ -4373,8 +4682,8 @@ mod tests {
         let run = |m: &Machine, levers: &PlanLevers, short: &dyn Fn(u64) -> u64, other_at: u64| {
             let mut calls = Vec::new();
             let got = plan_in_pool(m, levers, |l| {
-                let budget = capped(&m.cards[0], l.card_budget_bytes);
-                calls.push(l.card_budget_bytes);
+                let budget = capped(&m.cards[0], l.card_budget_bytes.every());
+                calls.push(l.card_budget_bytes.every());
                 if budget <= other_at {
                     return Err(PlacementError::HostRoom("other".to_string()));
                 }
@@ -4383,7 +4692,10 @@ mod tests {
                     s => Err(floor(s)),
                 }
             });
-            (got.map(|p| (p.card_budget, p.budget_from_pool)), calls)
+            (
+                got.map(|p| (p.card_budget.every(), p.budget_from_pool)),
+                calls,
+            )
         };
         let (on, off) = (pool(true), pool(false));
         let unset = PlanLevers::default();
@@ -4415,7 +4727,7 @@ mod tests {
         // The first plan's result: a discrete card, a given budget, a
         // shortfall past the card's whole budget.
         let given = PlanLevers {
-            card_budget_bytes: Some(96 << 30),
+            card_budget_bytes: Some(96 << 30).into(),
         };
         for (m, levers, short) in [(&off, &unset, 1), (&on, &given, 1), (&on, &unset, full + 1)] {
             let (got, calls) = run(m, levers, &|_| short, 0);
@@ -4480,6 +4792,7 @@ mod tests {
             layers,
             head,
             token_embedding,
+            reserve_only: false,
             reserves: Vec::new(),
         }
     }
@@ -4574,6 +4887,60 @@ mod tests {
 
     const HEAD: u64 = 4_352;
     const EXPERT: u64 = 576;
+
+    /// A BF16 head the loader places in MXFP8 planes is the one tensor the plan
+    /// names as requantized: a head off the planes' 128-value block keeps its
+    /// words, a Q8_0 head its own planes, a BF16 embedding is widened, and none
+    /// of those changes the file's values. Mutant: `requantizes` true for every
+    /// card format other than the file type's own, which lists the words-kept
+    /// head as well.
+    #[test]
+    fn a_bf16_head_in_mxfp8_planes_is_named_as_requantized() {
+        let tensor = |name: &str, role, ty, k: u64| ModelTensor {
+            name: name.to_string(),
+            shard: 0,
+            layer: None,
+            role,
+            ty,
+            dims: vec![k, 16],
+            file_bytes: 0,
+            gathered_rows: (role == Role::TokenEmbedding).then_some(1),
+        };
+        let model = |tensors: Vec<ModelTensor>| ModelTensors {
+            tensors,
+            layers: 0,
+            experts: 8,
+            experts_used: 2,
+            bf16_words: |_| false,
+        };
+        let embed = tensor(
+            "token_embd.weight",
+            Role::TokenEmbedding,
+            GgmlType::BF16,
+            256,
+        );
+        let planes = model(vec![
+            embed.clone(),
+            tensor(HEAD_TENSOR, Role::Head, GgmlType::BF16, 256),
+        ]);
+        let listed = planes.requantized();
+        assert_eq!(
+            listed,
+            vec![Requantized {
+                name: HEAD_TENSOR.to_string(),
+                file: GgmlType::BF16,
+                card: CardFormat::Mxfp8Planes,
+            }]
+        );
+        assert_eq!(
+            listed[0].to_string(),
+            format!("output.weight:{}:mxfp8_planes", GgmlType::BF16)
+        );
+        for (ty, k) in [(GgmlType::BF16, 320), (GgmlType::Q8_0, 256)] {
+            let kept = model(vec![embed.clone(), tensor(HEAD_TENSOR, Role::Head, ty, k)]);
+            assert!(kept.requantized().is_empty(), "a {ty} head of {k} values");
+        }
+    }
 
     /// A model of 4 layers with every role's bf16 tensor (an attention
     /// matrix, a hyper-connection, a shared expert and its one-row gate, a
@@ -5378,7 +5745,7 @@ mod tests {
                     4096,
                     &NoKv,
                     &PlanLevers {
-                        card_budget_bytes: budget,
+                        card_budget_bytes: budget.into(),
                     },
                     RoutedRule::PerType(|_| Some(CardFormat::KQuant)),
                 )
@@ -5477,10 +5844,12 @@ mod tests {
     /// An nvfp4 stack loads in its planes under the default expert rule, and
     /// its card segment counts one f32 scale an expert it holds after the
     /// planes, where a dense nvfp4 tensor's segment holds its one scale. A
-    /// split that leaves an expert of it on the host is refused by name: the
-    /// host has no nvfp4 kernel.
+    /// split that leaves some experts of it on the host and the rest on a card
+    /// is refused by name (the card's planes are not the file's blocks a swap
+    /// copies); the whole stack on the host is its file bytes there, which the
+    /// host's nvfp4 dot reads.
     #[test]
-    fn an_nvfp4_stack_holds_a_scale_an_expert_and_no_host_expert() {
+    fn an_nvfp4_stack_holds_a_scale_an_expert_and_is_not_split() {
         use GgmlType::NVFP4;
         assert_eq!(CardFormat::of_routed(NVFP4), Some(CardFormat::Nvfp4Planes));
         assert_eq!(CardFormat::of_routed(GgmlType::Q5_K), None);
@@ -5517,12 +5886,21 @@ mod tests {
             [4 * 128, 4 * 16, 4]
         );
         let err = routed_row(i, t, 0, list(&[0, 1]), &model)
-            .expect_err("experts on the host")
+            .expect_err("a split between a card and the host")
             .to_string();
         assert!(
-            err.contains("ffn_gate_exps.weight") && err.contains("no nvfp4 kernel"),
+            err.contains("ffn_gate_exps.weight") && err.contains("every one on the host"),
             "{err}"
         );
+        let host = routed_row_on(i, t, 0, Vec::new(), &model).expect("every expert on the host");
+        let [seg] = host.segments.as_slice() else {
+            panic!("one host segment, got {:?}", host.segments);
+        };
+        assert_eq!(
+            (seg.device, seg.format, seg.resident_bytes),
+            (Device::Host, Format::HostFile, t.file_bytes)
+        );
+        assert_eq!(seg.experts.as_ref().map(ExpertList::len), Some(8));
     }
 
     /// A card leg judges a layer by its parts: Qwen3-30B's leg (a Q4_K or
@@ -6194,6 +6572,364 @@ mod tests {
         plan_with(&model, &quiet, 4096, &NoKv, None).expect("a trunk at the free bytes");
     }
 
+    /// A reserve entered by [`Machine::reserve`] leaves the card before any
+    /// expert: the stage card of three layers holds all 24 experts with none,
+    /// 19 under five experts' bytes, none under the whole room. Under a card
+    /// budget, the reserve and the dense tensors are the floor: one byte under
+    /// it is the budget floor's refusal, at it the card holds no expert, and
+    /// one expert's bytes more hold one.
+    #[test]
+    fn a_reserve_leaves_the_card_fewer_experts() {
+        let model = layered(3);
+        let machine = |reserve: Option<u64>| {
+            let mut machine = Machine {
+                cards: vec![bytes_card("stage", HEAD + 24 * EXPERT, 0..3)],
+                tiers: Vec::new(),
+                nodes: vec![Node {
+                    host: host(),
+                    unified: None,
+                }],
+            };
+            if let Some(bytes) = reserve {
+                machine
+                    .reserve(Reserve {
+                        on: Device::Card(0),
+                        name: "draft",
+                        bytes,
+                    })
+                    .expect("the stage card is card 0");
+            }
+            machine
+        };
+        let experts = |reserve: Option<u64>, budget: Option<u64>| {
+            plan_with(&model, &machine(reserve), 4096, &NoKv, budget)
+                .map(|plan| plan.cards[0].experts)
+        };
+        assert_eq!(experts(None, None).expect("plans"), 24);
+        assert_eq!(experts(Some(0), None).expect("plans"), 24);
+        assert_eq!(experts(Some(5 * EXPERT), None).expect("plans"), 19);
+        assert_eq!(experts(Some(24 * EXPERT), None).expect("plans"), 0);
+        let reserve = 10 * EXPERT;
+        let floor = HEAD + reserve;
+        match experts(Some(reserve), Some(floor - 1)) {
+            Err(PlacementError::CardBudgetFloor {
+                floor: named,
+                reserves,
+                ..
+            }) => assert_eq!((named, reserves), (floor, reserve)),
+            other => panic!("{other:?}, not the budget floor's refusal"),
+        }
+        assert_eq!(experts(Some(reserve), Some(floor)).expect("plans"), 0);
+        assert_eq!(
+            experts(Some(reserve), Some(floor + EXPERT - 1)).expect("plans"),
+            0
+        );
+        assert_eq!(
+            experts(Some(reserve), Some(floor + EXPERT)).expect("plans"),
+            1
+        );
+        assert_eq!(
+            experts(None, Some(floor + EXPERT)).expect("plans"),
+            11,
+            "the same budget without the reserve holds what the reserve took"
+        );
+    }
+
+    /// [`Machine::reserve`] takes a card by its place in
+    /// [`Machine::all_cards`]: the stage cards first, then the tiers; the host
+    /// by its own device. A place past the list, the NVMe tier and nowhere are
+    /// refused by name and set nothing aside.
+    #[test]
+    fn a_reserve_is_addressed_by_the_whole_device_list() {
+        let mut machine = Machine {
+            cards: vec![bytes_card("stage", 1_000, 0..3)],
+            tiers: vec![card("tier", 0..0, false, false)],
+            nodes: vec![Node {
+                host: host(),
+                unified: None,
+            }],
+        };
+        let reserve = |on, name, bytes| Reserve { on, name, bytes };
+        for r in [
+            reserve(Device::Card(0), "on the stage", 1),
+            reserve(Device::Card(1), "on the tier", 2),
+            reserve(Device::Host, "on the host", 3),
+        ] {
+            machine.reserve(r).expect("a device of the plan");
+        }
+        assert_eq!(machine.cards[0].reserves, [("on the stage".to_string(), 1)]);
+        assert_eq!(machine.tiers[0].reserves, [("on the tier".to_string(), 2)]);
+        assert!(
+            machine
+                .host()
+                .reserves
+                .contains(&("on the host".to_string(), 3))
+        );
+        let before = machine.clone();
+        for (on, shown) in [
+            (Device::Card(2), "Card(2)"),
+            (Device::Nvme, "Nvme"),
+            (Device::Unused, "Unused"),
+        ] {
+            match machine.reserve(reserve(on, "off the list", 4)) {
+                Err(e @ PlacementError::ReserveOffPlan { cards: 2, .. }) => assert_eq!(
+                    e.to_string(),
+                    format!(
+                        "the off the list reserve is on {shown}, outside the plan: a reserve \
+                         sits on one of the plan's 2 cards, stage first, or on the host"
+                    )
+                ),
+                other => panic!("{other:?}, not ReserveOffPlan"),
+            }
+        }
+        assert_eq!(machine, before, "a refused reserve sets nothing aside");
+    }
+
+    /// A reserve-only tier member ([`Card::reserve_only`]) holds its reserve and
+    /// no expert: the stage card's experts are what the plan without the member
+    /// holds, the member's counts are 0 on every layer, and it is the expert
+    /// tiers' count that excludes it. One with no reserve is the idle tier's
+    /// refusal; one whose reserve passes its room is the budget floor's, under
+    /// a card budget, as for any card.
+    #[test]
+    fn a_reserve_only_member_holds_a_reserve_and_no_expert() {
+        let model = layered(3);
+        let member = |reserve: Option<u64>, tiers: usize| {
+            let mut machine = Machine {
+                cards: vec![bytes_card("stage", HEAD + 5 * EXPERT, 0..3)],
+                tiers: (0..tiers)
+                    .map(|i| Card {
+                        reserve_only: true,
+                        ..bytes_card(&format!("holder{i}"), 10 * EXPERT, 0..0)
+                    })
+                    .collect(),
+                nodes: vec![Node {
+                    host: host(),
+                    unified: None,
+                }],
+            };
+            if let Some(bytes) = reserve {
+                machine
+                    .reserve(Reserve {
+                        on: Device::Card(1),
+                        name: "draft",
+                        bytes,
+                    })
+                    .expect("the member is card 1");
+            }
+            machine
+        };
+        let stage = member(None, 0);
+        let alone = plan_with(&model, &stage, 4096, &NoKv, None).expect("plans");
+        let held = member(Some(4 * EXPERT), 1);
+        let plan = plan_with(&model, &held, 4096, &NoKv, None).expect("plans");
+        assert_eq!(plan.n_l, alone.n_l, "the stage card's prefix does not move");
+        assert_eq!(plan.tier_n_l, vec![vec![0, 0, 0]]);
+        assert_eq!(plan.cards[1].experts, 0);
+        assert_eq!(plan.host.experts, alone.host.experts);
+        assert_eq!(held.expert_tiers().count(), 0);
+        assert_eq!(held.tiers.len(), 1);
+        match plan_with(&model, &member(None, 1), 4096, &NoKv, None) {
+            Err(PlacementError::IdleTier { card, tier: 0 }) => assert_eq!(card, "holder0"),
+            other => panic!("{other:?}, not IdleTier"),
+        }
+        let over = member(Some(11 * EXPERT), 1);
+        assert!(
+            !plan_with(&model, &over, 4096, &NoKv, None)
+                .expect("plans")
+                .violations()
+                .is_empty(),
+            "a reserve past the member's room is a violation"
+        );
+        match plan_with(&model, &over, 4096, &NoKv, Some(10 * EXPERT)) {
+            Err(PlacementError::CardBudgetFloor { card, .. }) => assert_eq!(card, "holder0"),
+            other => panic!("{other:?}, not the budget floor's refusal"),
+        }
+        let host_routed = plan_host_routed(&model, &held, 4096, &NoKv, &PlanLevers::default());
+        assert!(host_routed.is_ok(), "{host_routed:?}: no expert tier card");
+        assert_eq!(
+            host_routed.expect("plans").host.experts,
+            24,
+            "every routed expert on the host"
+        );
+    }
+
+    /// A per-card budget caps a card by its own entry, found by the card's
+    /// device ordinal: the expert rule and [`Plan::usable_bytes`] read it, a
+    /// card the list does not name plans with its own bytes, an entry under
+    /// the card's floor is refused naming the card, and a census-free card
+    /// under a list is refused by name ([`card_budget::check`]).
+    #[test]
+    fn a_per_card_budget_caps_each_card_by_its_own_entry() {
+        let model = layered(3);
+        let full = HEAD + 24 * EXPERT + 100_000;
+        let half = HEAD + 12 * EXPERT;
+        let on = |device: Option<u32>| Machine {
+            cards: vec![Card {
+                device: device.map(|ordinal| devices::DeviceId {
+                    ordinal,
+                    uuid: [7; 16],
+                }),
+                ..bytes_card("stage", full, 0..3)
+            }],
+            tiers: Vec::new(),
+            nodes: vec![Node {
+                host: host(),
+                unified: None,
+            }],
+        };
+        let list = |entries: &[(u32, u64)]| PlanLevers {
+            card_budget_bytes: card_budget::CardBudget::Per(entries.to_vec()),
+        };
+        let named = on(Some(1));
+        let p = plan(&model, &named, 4096, &NoKv, &list(&[(0, 1), (1, half)])).expect("plans");
+        assert_eq!(
+            (p.cards[0].experts, p.usable_bytes(&named.cards[0])),
+            (12, half)
+        );
+        let other = on(Some(0));
+        let p = plan(&model, &other, 4096, &NoKv, &list(&[(1, half)])).expect("plans");
+        assert_eq!(
+            (p.cards[0].experts, p.usable_bytes(&other.cards[0])),
+            (24, full)
+        );
+        match plan(&model, &named, 4096, &NoKv, &list(&[(1, HEAD - 1)])) {
+            Err(PlacementError::CardBudgetFloor { card, budget, .. }) => {
+                assert_eq!((card.as_str(), budget), ("stage", HEAD - 1));
+            }
+            other => panic!("{:?}, not the stage's budget floor", other.map(|_| ())),
+        }
+        let census_free = on(None);
+        match plan(&model, &census_free, 4096, &NoKv, &list(&[(0, half)])) {
+            Err(PlacementError::CardBudgetCard { card, .. }) => assert_eq!(card, "stage"),
+            other => panic!("{:?}, not a census-free card's refusal", other.map(|_| ())),
+        }
+    }
+
+    /// A budget by shares becomes a budget per card from the plan's own terms: each named
+    /// card plans with its floor and its part of the routed experts, in the proportion of the
+    /// shares and as many in all as the tightest card's room for its share lets, the host tier
+    /// taking the rest, and the plan's record states the bytes. 3:1 over a stage and a tier of
+    /// 24 experts' room each holds all 24 as 18 and 6 (the default fill leaves the tier idle);
+    /// 1:1 with a tier of 2 experts' room holds 4 as 2 and 2 and leaves 20 to the host. A floor
+    /// past the card, a plan that places no routed expert on a card, shares that name no card
+    /// of the plan and shares of 0 are refused naming the cause.
+    #[test]
+    fn shares_become_a_budget_per_card_from_the_plans_terms() {
+        let model = layered(3);
+        let device = |ordinal: u32| {
+            Some(devices::DeviceId {
+                ordinal,
+                uuid: [u8::try_from(ordinal).expect("small") + 7; 16],
+            })
+        };
+        let on = |stage: u64, tier: u64| Machine {
+            cards: vec![Card {
+                device: device(0),
+                ..bytes_card("stage", stage, 0..3)
+            }],
+            tiers: vec![Card {
+                device: device(1),
+                ..bytes_card("tier", tier, 0..0)
+            }],
+            nodes: vec![Node {
+                host: host(),
+                unified: None,
+            }],
+        };
+        let shares = |entries: &[(u32, u64)]| PlanLevers {
+            card_budget_bytes: card_budget::CardBudget::Shares(entries.to_vec()),
+        };
+        let roomy = on(HEAD + 24 * EXPERT, 24 * EXPERT);
+        let p = plan(&model, &roomy, 4096, &NoKv, &shares(&[(0, 3), (1, 1)])).expect("plans");
+        assert_eq!(p.n_l, vec![6, 6, 6]);
+        assert_eq!(p.tier_n_l, vec![vec![2, 2, 2]]);
+        assert_eq!(p.host.experts, 0);
+        assert_eq!(
+            p.card_budget,
+            card_budget::CardBudget::Per(vec![(0, HEAD + 18 * EXPERT), (1, 6 * EXPERT)])
+        );
+        assert!(matches!(
+            plan_with(&model, &roomy, 4096, &NoKv, None),
+            Err(PlacementError::IdleTier { .. })
+        ));
+        let tight = on(HEAD + 24 * EXPERT, 2 * EXPERT);
+        let p = plan(&model, &tight, 4096, &NoKv, &shares(&[(0, 1), (1, 1)])).expect("plans");
+        assert_eq!(p.n_l, vec![1, 1, 0]);
+        assert_eq!(p.tier_n_l, vec![vec![1, 0, 1]]);
+        assert_eq!(p.host.experts, 20);
+        assert_eq!(
+            p.card_budget,
+            card_budget::CardBudget::Per(vec![(0, HEAD + 2 * EXPERT), (1, 2 * EXPERT)])
+        );
+        // Every term of a card's floor is in its part: context, scratch, reserves, margin and
+        // what the caller holds beside the plan.
+        let held = |c: &Card| Card {
+            context_bytes: 1_000,
+            scratch_bytes: 2_000,
+            margin_bytes: 3_000,
+            reserves: vec![("draft".to_string(), 4_000)],
+            ..c.clone()
+        };
+        let slack = on(HEAD + 24 * EXPERT + 100_000, 24 * EXPERT + 100_000);
+        let held_machine = Machine {
+            cards: vec![held(&slack.cards[0])],
+            tiers: vec![held(&slack.tiers[0])],
+            ..slack.clone()
+        };
+        let beside = 5_000;
+        let p = plan_routed_reserving(
+            &model,
+            &held_machine,
+            4096,
+            &NoKv,
+            &shares(&[(0, 3), (1, 1)]),
+            RoutedRule::PerType(CardFormat::of_routed),
+            beside,
+        )
+        .expect("plans");
+        assert_eq!(p.n_l, vec![6, 6, 6]);
+        let past = 1_000 + 2_000 + 3_000 + 4_000 + beside;
+        assert_eq!(
+            p.card_budget,
+            card_budget::CardBudget::Per(vec![
+                (0, HEAD + past + 18 * EXPERT),
+                (1, past + 6 * EXPERT)
+            ])
+        );
+        let refused = |machine: &Machine, levers: &PlanLevers| match plan(
+            &model, machine, 4096, &NoKv, levers,
+        ) {
+            Err(PlacementError::CardShares { shares, why }) => (shares, why),
+            other => panic!("{:?}, not a shares refusal", other.map(|_| ())),
+        };
+        let (named, why) = refused(&on(HEAD - 1, 24 * EXPERT), &shares(&[(0, 1), (1, 1)]));
+        assert_eq!(named, "CUDA0=1x,CUDA1=1x");
+        assert!(
+            why.starts_with("card stage: its floor 4352 B = dense uploads 4352 B")
+                && why.contains("passes the 4351 B it may plan with"),
+            "{why}"
+        );
+        let (_, why) = refused(&roomy, &shares(&[(5, 1)]));
+        assert!(
+            why.contains("names no card of this plan that takes experts")
+                && why.contains("stage, tier"),
+            "{why}"
+        );
+        let (_, why) = refused(&roomy, &shares(&[(0, 0), (5, 1)]));
+        assert!(why.contains("has a share above 0"), "{why}");
+        let stage_only = Machine {
+            tiers: Vec::new(),
+            ..roomy.clone()
+        };
+        match plan_host_routed(&model, &stage_only, 4096, &NoKv, &shares(&[(0, 1)])) {
+            Err(PlacementError::CardShares { why, .. }) => {
+                assert!(why.contains("places no routed expert on a card"), "{why}");
+            }
+            other => panic!("{:?}, not a shares refusal", other.map(|_| ())),
+        }
+    }
+
     /// A plan whose caller keeps `BESIDE` bytes of the card beside it
     /// ([`plan_routed_reserving`]) names a budget floor that counts them, as
     /// the expert rule's budget does: the floor is the least budget that
@@ -6225,7 +6961,7 @@ mod tests {
         };
         let plan_at = |budget: u64, beside: u64| {
             let levers = PlanLevers {
-                card_budget_bytes: Some(budget),
+                card_budget_bytes: Some(budget).into(),
             };
             plan_routed_reserving(
                 &model,

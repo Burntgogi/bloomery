@@ -4,7 +4,7 @@
 //! are the ones the next step reads; the prompt group changes no bit.
 //!
 //! The batch keeps its own arithmetic (the GEMM sites and the f16 prefill flash), so it is the steps' within a band, not
-//! bit for bit. The band is the error model's ([`SIGMA_LOGIT`](bloomery_gpu_gates::prompts::SIGMA_LOGIT), [`seat::tap_ceil`]): the two paths differ first by sum order
+//! bit for bit. The band is the error model's ([`seat::SIGMA_LOGIT`], [`seat::tap_ceil`]): the two paths differ first by sum order
 //! (`P = 1`: each GEMM site adds the same block dots as the gemv in another f32 order) or by the prefill flash's f16 query
 //! and weights (`P ≥ 2`), and every site after quantizes its input to q8_1 blocks of 32 values. Two inputs `e` apart
 //! (`e` well under the step `d = amax/127`) round to codes a whole step apart with probability `e/d` a value, so past one
@@ -121,6 +121,7 @@ mod gate {
             tap_ceils: seat::tap_ceils,
             group: 2,
             logit_bound: Some(k_of(TOP)),
+            sigma_logit: seat::SIGMA_LOGIT,
             vocab: dims.vocab,
             embd: dims.embd,
             tier: tier_now,

@@ -76,7 +76,7 @@ mod gate {
     const NO_ID: u32 = u32::MAX;
     /// The scale of the seeded query rows.
     const Q_SCALE: f32 = 3.0;
-    const THETA: f32 = 5.0e6;
+    const THETA: f32 = 1.0e7;
     const EPS: f32 = 1.0e-6;
     /// The rope check's tokens, last position and cache height.
     const ROPE_M: usize = 9;

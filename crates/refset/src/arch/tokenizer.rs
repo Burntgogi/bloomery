@@ -14,7 +14,11 @@
 //! `nemotron_h`, which that tree refuses, so its set is read by
 //! `/home/user/llama.cpp-mainline`, whose `pixtral` pre is the LLAMA3 regex
 //! with `ignore_merges`. MiniMax-M3's file is read by `/home/user/llama.cpp-solar2`
-//! (the Solar-Open2 patch on mainline `6ea215d17`; [`MINIMAXM3_BUILD`]). A family pins the tree its oracle is built from, the
+//! (the Solar-Open2 patch on mainline `6ea215d17`; [`MINIMAXM3_BUILD`]).
+//! Muse Spark Open's `gpt-4o` pre is this tree's `minimax-m2` regex under its
+//! own name, and its set is read by `/home/user/llama.cpp-muse`
+//! (mainline at PR 30616's merge, no patch; [`MUSESPARK_BUILD`], the same tree
+//! the musespark node dumps are read by). A family pins the tree its oracle is built from, the
 //! `# build` line its set states after `crates/tokenizer/tools/oracle.sh` has
 //! checked the tree (`tools/ref/emb2/oracle-tree.sh`): the upstream commit's
 //! first 9 digits, and for a tree with a local patch `+` and the 12 digits
@@ -57,6 +61,12 @@ pub(crate) const NEMOTRON_BUILD: &str = super::qwen35::LCPP_BUILD;
 /// dumps are read by (`cd0a5b6a1`) rejects an overlong form byte by byte, and its ids equal this tree's on every other text.
 // PIN(2026-10-21): the commit and the patch, not one machine's llama-tokenize and libllama.so.0 md5s, which no rebuild matched.
 pub(crate) const MINIMAXM3_BUILD: &str = "6ea215d17+1616f7f3d842";
+
+/// The tree `/home/user/llama.cpp-muse`, whose `llama-tokenize` loads Muse Spark Open's file
+/// (the merge of PR 30616, no patch): the commit the musespark node-dump family reads the same
+/// tree at ([`super::musespark::COMMIT`]).
+// PIN(2026-10-23): the commit, not one machine's llama-tokenize and libllama.so.0 md5s, which no rebuild matched.
+pub const MUSESPARK_BUILD: &str = super::musespark::COMMIT;
 
 /// V4.1's set (`deepseek-v3` pre-tokenizer), from the file the tree runs.
 pub static V41: Family = Family {
@@ -146,6 +156,20 @@ pub static MINIMAXM3: Family = Family {
     consumers: &["gate-tokenizer"],
 };
 
+/// Muse Spark Open's set (`gpt-4o` pre-tokenizer).
+pub static MUSESPARK: Family = Family {
+    name: "tokenizer-musespark",
+    sets: &["ref-tokenizer-musespark"],
+    resolve: None,
+    recipe: "just dump-ref-tokenizer musespark",
+    identity: Identity::Vocabulary,
+    arch: None,
+    build: Some(Build::Is(MUSESPARK_BUILD)),
+    runs: Some(musespark_model),
+    draft_runs: None,
+    consumers: &["gate-tokenizer"],
+};
+
 /// The Qwen3-MoE vocabulary file: `$BLOOMERY_QWEN3MOE_VOCAB`, else
 /// [`QWEN3MOE_MODEL`]. An empty value counts as unset.
 fn qwen3moe_model() -> Result<String, RefError> {
@@ -171,6 +195,10 @@ fn minimaxm3_model() -> Result<String, RefError> {
     Ok(super::minimaxm3::MODEL.to_string())
 }
 
+fn musespark_model() -> Result<String, RefError> {
+    Ok(super::musespark::MODEL.to_string())
+}
+
 /// The families, in the order `refset-check` lists them.
 pub static FAMILIES: &[&Family] = &[
     &V41,
@@ -179,14 +207,15 @@ pub static FAMILIES: &[&Family] = &[
     &QWEN38,
     &NEMOTRON,
     &MINIMAXM3,
+    &MUSESPARK,
     &super::gemma_embedding::TOKENIZER,
 ];
 
 #[cfg(test)]
 mod tests {
     use super::{
-        ARCH, FAMILIES, GLM5NEXT, MINIMAXM3, MINIMAXM3_BUILD, NEMOTRON, NEMOTRON_BUILD, QWEN3MOE,
-        QWEN38, TILDE_BUILD, TOKREF_BUILD, V41,
+        ARCH, FAMILIES, GLM5NEXT, MINIMAXM3, MINIMAXM3_BUILD, MUSESPARK, MUSESPARK_BUILD, NEMOTRON,
+        NEMOTRON_BUILD, QWEN3MOE, QWEN38, TILDE_BUILD, TOKREF_BUILD, V41,
     };
     use crate::RefError;
     use crate::emb2::LCPP_BUILD;
@@ -247,7 +276,7 @@ mod tests {
     /// without a patch are mainline's, whose commit the pin states as it is.
     #[test]
     fn the_vocabularies_are_rows_of_the_table() {
-        assert_eq!(crate::arch::families(ARCH).len(), 7);
+        assert_eq!(crate::arch::families(ARCH).len(), 8);
         for f in FAMILIES {
             assert!(std::ptr::eq(crate::arch::named(f.name).unwrap_or(&V41), *f));
             assert!(
@@ -268,6 +297,7 @@ mod tests {
             (&QWEN38, TOKREF_BUILD, true),
             (&NEMOTRON, NEMOTRON_BUILD, false),
             (&MINIMAXM3, MINIMAXM3_BUILD, true),
+            (&MUSESPARK, MUSESPARK_BUILD, false),
             (&super::super::gemma_embedding::TOKENIZER, LCPP_BUILD, false),
         ] {
             assert_eq!(pin(f), want, "{} pins the wrong tree", f.name);
@@ -286,6 +316,7 @@ mod tests {
                 "ref-tokenizer-qwen38",
                 "ref-tokenizer-nemotron",
                 "ref-tokenizer-minimaxm3",
+                "ref-tokenizer-musespark",
                 "ref-tokenizer-llama",
             ]
         );

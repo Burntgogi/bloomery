@@ -235,11 +235,28 @@ pub fn slots_given(
     Ok((slots, from))
 }
 
+/// A serving seat's `--place` word, the one reader of the placement grammar:
+/// [`Place::parse`](crate::generate::Place::parse) (`a`, `gate`, `bp`, `tp`, or a card
+/// list `<stage>[+<tier>…]` of card names and device ordinals). `serves` is the
+/// `(body, tiers)` of a body that serves a fixed count of expert tier cards: a
+/// list of more is refused by name here, before any plan. `None` leaves the
+/// count to the seat's plan, which refuses a tier its body cannot serve.
+pub fn place_word(
+    v: &str,
+    serves: Option<(&str, usize)>,
+) -> Result<crate::generate::Place, GateError> {
+    let place = crate::generate::Place::parse(v)?;
+    if let Some((body, tiers)) = serves {
+        place.serves(body, tiers)?;
+    }
+    Ok(place)
+}
+
 /// The flags every serving seat takes beside its own: the listener (`--host`,
 /// `--port`, `--queue-depth`), the keys (`--api-key`, `--api-key-file`), the
 /// context (`--ctx`, under every spelling `serve::flag::CTX` lists), the
-/// placement word (`--place`), the alias, the chat template file, `--parallel`
-/// (and `-np`) and `--plan`.
+/// placement word (`--place`, read by [`place_word`]), the alias, the chat
+/// template file, `--parallel` (and `-np`) and `--plan`.
 pub struct SeatFlags {
     pub host: String,
     pub port: u16,
@@ -295,7 +312,7 @@ impl SeatFlags {
                 "--host" => a.host = v.to_owned(),
                 "--port" => a.port = serve::flag::number(flag, v)?,
                 f if serve::flag::CTX.contains(&f) => a.ctx = Some(serve::flag::number(flag, v)?),
-                "--place" => a.place = Some(crate::generate::Place::parse(v)?),
+                "--place" => a.place = Some(place_word(v, None)?),
                 "--alias" => a.alias = Some(v.to_owned()),
                 TemplateFile::FLAG => a.template_file.set(v),
                 "--parallel" | "-np" => a.parallel = Some(serve::flag::number(flag, v)?),
@@ -3603,6 +3620,55 @@ mod tests {
             i128::from(available) - i128::from(terms) - i128::from(2 * slot)
         );
         assert_eq!(pool.mem_left, i128::from(available) - i128::from(two));
+    }
+
+    /// The nemotron, raon1 and tiered seats read `--place` through
+    /// [`SeatFlags`], which reads it as [`place_word`] does: every word
+    /// `Place::parse` takes parses to the placement it names, a list of tier
+    /// cards stays the seat's plan to refuse (`None`), a body that serves a
+    /// count refuses more by name, and a word no card or ordinal spells is
+    /// refused.
+    #[test]
+    fn the_seats_read_the_place_word_as_one_grammar() {
+        use super::{SeatFlags, place_word};
+        use model::placement::workstation::{A6000, RTX_3090};
+        let usage = "usage";
+        let seat = |word: &str| {
+            let args = ["--place".to_owned(), word.to_owned()];
+            SeatFlags::parse(&args, usage, |_, _| Ok(false))
+        };
+        for (word, name, cards) in [
+            ("a", "a", vec![A6000.name]),
+            ("gate", "gate", vec![RTX_3090.name]),
+            ("bp", "bp", vec![A6000.name, RTX_3090.name]),
+            ("a6000+3090", "bp", vec![A6000.name, RTX_3090.name]),
+            ("3090+a6000", "3090+a6000", vec![RTX_3090.name, A6000.name]),
+            ("cuda1+0", "cuda1+0", vec!["cuda1", "cuda0"]),
+            ("tp", "tp", vec![A6000.name]),
+        ] {
+            let p = place_word(word, None).unwrap_or_else(|e| panic!("{word}: {e}"));
+            assert_eq!((p.name(), p.cards()), (name, cards), "{word}");
+            let flags = seat(word).unwrap_or_else(|e| panic!("{word}: {e}"));
+            assert_eq!(flags.place, Some(p), "{word}");
+        }
+        let many = "cuda0+cuda1+cuda2";
+        assert_eq!(place_word(many, None).expect(many).tier_cards().len(), 2);
+        assert_eq!(
+            seat(many).expect(many).place.map(|p| p.tier_cards().len()),
+            Some(2)
+        );
+        place_word("bp", Some(("body", 1))).expect("one tier card");
+        let e = place_word(many, Some(("body", 1)))
+            .expect_err(many)
+            .to_string();
+        assert_eq!(
+            e,
+            "--place cuda0+cuda1+cuda2: 2 expert tier cards, and the body body serves 1 at most"
+        );
+        for refused in [place_word("b2", None).map(|_| ()), seat("b2").map(|_| ())] {
+            let e = refused.expect_err("b2").to_string();
+            assert!(e.starts_with("--place is a, gate, bp"), "{e}");
+        }
     }
 
     mod media {

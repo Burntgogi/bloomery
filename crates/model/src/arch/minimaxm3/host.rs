@@ -2,7 +2,7 @@
 //! [`HostLayer`] serves by, read from the hyperparameters and the tensor names — the one place
 //! that wires them into a [`HostLayerSpec`].
 
-use super::hparams::{Hparams, Kind};
+use super::hparams::{FfnKind, Hparams};
 use crate::ModelError;
 use crate::arch::names;
 use crate::moe::{HostLayer, HostLayerSpec};
@@ -26,7 +26,7 @@ pub fn layer(
             hp.n_layer
         )));
     }
-    if hp.kind(layer) == Kind::Dense {
+    if hp.kind(layer).ffn == FfnKind::Dense {
         return Err(ModelError::MissingTensor(format!(
             "layer {layer}'s routed stacks: a layer of the host run that is a dense block (the \
              file's first {} layers are)",

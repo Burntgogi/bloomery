@@ -69,6 +69,8 @@
 //! - room: a ring the card's free bytes past `keep_free` cannot hold is
 //!   refused by its own name (`XSTREAM_ROOM`), which a caller resolving an
 //!   unset lever tells from every other refusal.
+//! - cap: a ring capped at no card bytes (`XCfg::room_cap`) is refused by the same name however many bytes the card has
+//!   free, so a plan's ring reserve bounds the ring (its mutant: the cap not applied, which starts the ring).
 //! - drop: a stream of more experts than staging slots into a half whose
 //!   read the engine stream holds, dropped with fill threads waiting for a
 //!   slot those copies drain, and the read let go [`DROP_HOLD`] into the
@@ -730,6 +732,28 @@ mod gate {
             verdict(room_ok)
         );
         ok &= room_ok;
+
+        // cap: the card's free bytes are no bound here (`keep_free` 0), the cap alone is.
+        let mut capped = cfg(2, 4);
+        capped.room_cap = Some(0);
+        let cap_ok = matches!(
+            XStream::new(
+                ctx,
+                stream,
+                Arc::clone(&src) as Arc<dyn SwapSource>,
+                L,
+                capped
+            ),
+            Err(GpuError::Shape {
+                what: XSTREAM_ROOM,
+                ..
+            })
+        );
+        println!(
+            "cap: a ring capped at no bytes refused by {XSTREAM_ROOM:?} {}",
+            verdict(cap_ok)
+        );
+        ok &= cap_ok;
 
         // drop: layer 0's next stream takes the half whose read the engine
         // stream holds; past the staging slots, its fill threads wait for

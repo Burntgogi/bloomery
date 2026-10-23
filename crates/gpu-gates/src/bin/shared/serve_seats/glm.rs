@@ -503,7 +503,7 @@ impl Placed {
         (set, slots): (Option<usize>, usize),
         (images, side): (&Images<'_>, Option<&Side>),
     ) -> Result<Placed, GateError> {
-        let tier_batch = glm_place::tier_batch(place, &inputs.hp);
+        let tier_batch = glm_place::tier_batch(place, inputs);
         // Every machine reserves its checkpoints at the slot context it is
         // laid for: the choice's probes each at their own, the load's at the
         // context it is granted; and the encoder's reserve, as the printed plan does.
@@ -1820,5 +1820,43 @@ impl Seat for Glm {
     /// other note of the prompt cache prints as its line.
     fn note(note: &CacheNote) {
         note_line(WHAT, note);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_args;
+    use model::placement::workstation::{A6000, RTX_3090};
+
+    /// The seat reads `--place` as the shared grammar with the one tier card
+    /// the GLM body serves: each word it took before parses to the placement it
+    /// names, a list of more tier cards is refused by name at parse, and a
+    /// word no card or ordinal spells is too.
+    #[test]
+    fn the_place_word_is_the_shared_grammar_with_the_glm_tier_count() {
+        let args = |word: &str| [String::from("--place"), word.to_owned()];
+        for (word, name, cards) in [
+            ("a", "a", vec![A6000.name]),
+            ("gate", "gate", vec![RTX_3090.name]),
+            ("bp", "bp", vec![A6000.name, RTX_3090.name]),
+            ("a6000+3090", "bp", vec![A6000.name, RTX_3090.name]),
+            ("cuda1+0", "cuda1+0", vec!["cuda1", "cuda0"]),
+            ("tp", "tp", vec![A6000.name]),
+        ] {
+            let a = parse_args(&args(word)).unwrap_or_else(|e| panic!("{word}: {e}"));
+            let p = a.place.expect(word);
+            assert_eq!((p.name(), p.cards()), (name, cards), "{word}");
+        }
+        let Err(e) = parse_args(&args("cuda0+cuda1+cuda2")) else {
+            panic!("two tier cards parsed");
+        };
+        assert_eq!(
+            e.to_string(),
+            "--place cuda0+cuda1+cuda2: 2 expert tier cards, and the glm5next body serves 1 at most"
+        );
+        let Err(e) = parse_args(&args("b2")) else {
+            panic!("b2 is no card or ordinal");
+        };
+        assert!(e.to_string().starts_with("--place is a, gate, bp"), "{e}");
     }
 }

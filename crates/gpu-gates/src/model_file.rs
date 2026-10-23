@@ -11,7 +11,7 @@
 //! checkpoint and no GGUF set resolves to the checkpoint's folder only for a caller that can
 //! open checkpoints; other callers refuse it before fetching its files.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use gguf::Split;
@@ -28,6 +28,35 @@ pub use fetch::{
 /// The refusal when nothing names the model.
 pub(crate) const NONE: &str = "no model file: pass -m PATH (the first shard, or a checkpoint folder) \
                                or --hf <repo>[:<quant>], or set BLOOMERY_REF_MODEL";
+
+/// The header of the model at `path`, which a server seats it by and `-ngl N` is compared with:
+/// its GGUF split's first shard, or a checkpoint folder's when `path` is a directory, which the
+/// map its config names reads (`model_hf::folder::open`), so the seat is chosen from the header's
+/// `general.architecture` as a split's is.
+pub fn header(path: &Path) -> Result<Split, GateError> {
+    if path.is_dir() {
+        return folder_header(path);
+    }
+    Split::open(path).map_err(|e| format!("open {}: {e}", path.display()).into())
+}
+
+/// The header of the checkpoint folder `path`.
+#[cfg(feature = "checkpoint")]
+fn folder_header(path: &Path) -> Result<Split, GateError> {
+    model_hf::folder::open(path)
+        .map(|f| f.header)
+        .map_err(|e| format!("checkpoint folder {}: {e}", path.display()).into())
+}
+
+/// A checkpoint folder in a build without the `checkpoint` feature, refused by name.
+#[cfg(not(feature = "checkpoint"))]
+fn folder_header(path: &Path) -> Result<Split, GateError> {
+    Err(format!(
+        "{} is a directory: a checkpoint folder is opened by a build with the checkpoint feature",
+        path.display()
+    )
+    .into())
+}
 
 /// A present decision marker is a string; malformed metadata is not an absent head.
 pub fn decision_type(file: &Split) -> Result<Option<&str>, GateError> {
@@ -80,8 +109,36 @@ pub fn hf_projector() -> Result<Option<PathBuf>, GateError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Split, decision_type};
+    use super::{Split, decision_type, header};
     use gguf::Value;
+
+    /// A path that is no model file is refused naming it, and a directory is a checkpoint folder:
+    /// a build without the `checkpoint` feature refuses it by that name instead of failing to
+    /// open it as a GGUF file, which `-ngl N` read as the file's layer count before.
+    #[test]
+    fn a_header_is_a_file_or_a_checkpoint_folder() {
+        let e = match header(std::path::Path::new("/no/such/model.gguf")) {
+            Ok(_) => panic!("no such file opened"),
+            Err(e) => e.to_string(),
+        };
+        assert!(e.starts_with("open /no/such/model.gguf: "), "{e}");
+        #[cfg(not(feature = "checkpoint"))]
+        {
+            let dir = std::env::temp_dir();
+            let e = match header(&dir) {
+                Ok(_) => panic!("a directory opened as a model file"),
+                Err(e) => e.to_string(),
+            };
+            assert_eq!(
+                e,
+                format!(
+                    "{} is a directory: a checkpoint folder is opened by a build with the \
+                     checkpoint feature",
+                    dir.display()
+                )
+            );
+        }
+    }
 
     #[test]
     fn decision_header_distinguishes_absent_string_and_malformed_markers() {

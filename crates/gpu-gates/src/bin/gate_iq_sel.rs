@@ -1,6 +1,8 @@
 //! GPU gate for the i-quant expert-select entries over raw blocks
-//! (`bloomery_gpu::iq_sel`) on one card: the IQ2_XS, IQ3_XXS, IQ3_S and IQ4_XS
-//! gate·ups, the IQ4_NL down `_sel32` (Qwen3.8 UD-Q3_K_XL's card-leg formats),
+//! (`bloomery_gpu::iq_sel`) on one card: the IQ2_XXS, IQ2_XS, IQ3_XXS, IQ3_S
+//! and IQ4_XS
+//! gate·ups (IQ2_XXS's through its shared table, Muse Spark's gated
+//! experts), the IQ4_NL down `_sel32` (Qwen3.8 UD-Q3_K_XL's card-leg formats),
 //! the IQ2_XS, IQ3_XXS, IQ3_S and IQ4_XS downs over `Q8Act`
 //! (GLM-5.3-Flash UD-Q2_K_XL's and UD-IQ4_XS's), and IQ2_XXS's one-stack
 //! entry, Nemotron 3.5 Bolt's routed up and down (clauses 10, 12 and 13).
@@ -217,7 +219,8 @@ mod gate {
     /// iteration (nine super-blocks).
     const KS_DOWN: [usize; 2] = [2048, 2304];
     /// The formats of the gate·ups.
-    const GU_FMTS: [IqFormat; 4] = [
+    const GU_FMTS: [IqFormat; 5] = [
+        IqFormat::Iq2Xxs,
         IqFormat::Iq2Xs,
         IqFormat::Iq3Xxs,
         IqFormat::Iq3S,
@@ -247,7 +250,12 @@ mod gate {
     /// PIN(2026-10-12): the two IQ3_S rows (K = 4,096 and 2,304), the first
     /// run's larger-of-sweep values 1.2379e-2 and 7.5603e-3 rounded up as the
     /// rows above (to 1.5e-2 and 9.0e-3); the assertion is the composed bound.
-    const REL_PIN_GU: [(IqFormat, usize, f64); 9] = [
+    /// PIN(2026-10-23): the two IQ2_XXS rows (K = 4,096 and 2,304) are
+    /// DERIVED, not measured — IQ2_XS's dot class at the same widths (same
+    /// grid table, same eight-value sub-block count a row); the assertion is
+    /// the composed bound either way. Re-pin from the first run's printed
+    /// larger-of-sweep if it exceeds these.
+    const REL_PIN_GU: [(IqFormat, usize, f64); 11] = [
         (IqFormat::Iq3Xxs, 2560, 1.2e-2),
         (IqFormat::Iq3Xxs, 2304, 2.0e-2),
         (IqFormat::Iq3Xxs, 4096, 1.4e-2),
@@ -257,6 +265,8 @@ mod gate {
         (IqFormat::Iq2Xs, 2304, 1.4e-2),
         (IqFormat::Iq3S, 4096, 1.5e-2),
         (IqFormat::Iq3S, 2304, 9.0e-3),
+        (IqFormat::Iq2Xxs, 4096, 1.7e-2),
+        (IqFormat::Iq2Xxs, 2304, 1.4e-2),
     ];
     /// PIN(2026-10-06): the down's, both K, the dot-level 0.4 % class
     /// widened by the sampled rows' spread.
@@ -1991,8 +2001,9 @@ mod gate {
     /// gate·up; IQ2_XS takes GLM's width and the partial-lane one.
     fn gu_ks(fmt: IqFormat) -> &'static [usize] {
         match fmt {
-            // No gate·up: Bolt's IQ2_XXS experts have no gate (clause 13).
-            IqFormat::Iq2Xxs => &[],
+            // Muse's gate width and the partial-lane tail; Bolt's gate-less
+            // IQ2_XXS stacks stay clause 13's.
+            IqFormat::Iq2Xxs => &[4096, 2304],
             IqFormat::Iq2Xs => &[4096, 2304],
             IqFormat::Iq3Xxs => &[2560, 2304, 4096],
             IqFormat::Iq3S => &[4096, 2304],

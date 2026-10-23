@@ -84,9 +84,9 @@ use super::image::{
 };
 use super::mtp35::Mtp35;
 use super::placed::{
-    BatchWalk, CommonForms, PLACED_ROWS, Placed, PlacedOpen, StepWalk, WalkParts, apart_plans,
-    common_forms as placed_forms, counted_arena, placed_bytes, placed_scratch, prompt_rows,
-    tally_shape,
+    BatchWalk, CommonForms, PLACED_ROWS, Placed, PlacedOpen, StepWalk, WalkParts, WideRoute,
+    apart_plans, common_forms as placed_forms, counted_arena, placed_bytes, placed_scratch,
+    prompt_rows, tally_shape,
 };
 use super::plan::{
     FfnPlan, FfnRoute, Flash, GqaKind, Kind35, LayerPlan, MixerPlan, SharedPlan, SiteTy, down_sel,
@@ -96,7 +96,7 @@ use super::prefill::{PrefillPath, PrefillPlan, PrefillStep, WIDE_FROM};
 use super::program::{Program, Tail};
 use super::scratch::{
     ApartForms, Arena, Dims, Forms, KvPlanes, LANE, LaneWord, LayerStore, PassRecord, RecStore,
-    RopeRows, StepParams, Wants,
+    RopeRows, StepParams,
 };
 use super::slot_pass::SlotIn;
 use super::swap35;
@@ -384,7 +384,8 @@ pub struct Body35 {
     /// load that did not ask for it.
     pub(super) mtp: Option<Mtp35>,
     /// Lanes of every delta store: 1 on a plain load, [`Body35::VERIFY_LANES`]
-    /// on a load that verifies drafted rows ([`GpuModel::open_verifying`]).
+    /// on a load that verifies drafted rows ([`GpuModel::open_verifying`],
+    /// [`GpuModel::open_mtp`]).
     lanes: usize,
     /// The word naming the committed lane of every delta launch's walk; `Some`
     /// iff `lanes > 1`. The arenas hold views of it ([`Arena::run_lanes`]).
@@ -703,17 +704,23 @@ impl Forms {
                 alone(f.down_ty, d.hidden);
             }
         }
-        let wants = |tys: &[SiteTy]| {
-            let (q128, q32) = crate::site::WideActs::wants_of(tys);
-            Wants { q128, q32 }
-        };
+        let wants = crate::site::WideActs::wants_of;
         Forms {
-            hid: wants(&hid),
-            attn: wants(&attn),
+            // An input's f32 rows are the arena's own normed rows.
+            hid: wants(&hid).without_f32(),
+            attn: wants(&attn).without_f32(),
             h: wants(&h),
             glu,
             cols,
-            apart: (!apart.is_empty()).then(|| ApartForms { h: wants(&apart) }),
+            // The shared expert's f32 rows are held whatever its down reads: the
+            // wide part counts them (`wide::arena_bytes`), and the plan's card
+            // bytes with it.
+            apart: (!apart.is_empty()).then(|| ApartForms {
+                h: crate::site::WideForms {
+                    f32: true,
+                    ..wants(&apart)
+                },
+            }),
             out_gate,
         }
     }
@@ -1033,8 +1040,14 @@ impl GpuModel<Body35> {
     /// whether it carries a draft — the reason a file with none is refused is
     /// `model::arch::draft::draft_usable`'s, before any upload — and a media
     /// load, whose rotation tables are per sequence, is refused by name.
+    ///
+    /// The load holds [`Body35::VERIFY_LANES`] lanes a delta store, as
+    /// [`GpuModel::open_verifying`]'s does, with its refusals: the layer's
+    /// every proposal is verified by a pass of several rows, whose commit
+    /// keeps any `1..=m` of them, and one lane holds only the last row's
+    /// state.
     pub fn open_mtp(gpu: Gpu, file: Split, o: Open35) -> Result<GpuModel<Body35>, GpuError> {
-        GpuModel::open_lanes(gpu, file, o, PLAIN_LANES, true)
+        GpuModel::open_lanes(gpu, file, o, Body35::VERIFY_LANES, true)
     }
 
     /// [`GpuModel::open`] for a load that will verify drafted rows
@@ -1203,12 +1216,16 @@ impl GpuModel<Body35> {
         let counted = model::placement::workstation::counted_arena_bytes(card);
         let specs = pre.layers.clone();
         let (top_k, max_rows) = tally_shape(&pre.d)?;
-        // The stack table checks only the layers the plan gives card experts:
-        // the machine keeps each layer's card count.
+        // The stack table checks only the layers the plan gives the stage card
+        // experts. The tier cards are named so a routed segment on one is the
+        // tier's, not a card the map refuses.
         let n_expert = usize::try_from(plan.model.experts).map_err(|_| {
             GpuError::shape(WHAT_P, "a plan of more experts than the host addresses")
         })?;
-        let carded = SlotMap::of_plan(plan, 0, None, 0..n_layers, n_expert)?;
+        let tier_cards: Vec<usize> = (0..plan.machine.expert_tiers().count())
+            .map(|i| plan.machine.cards.len() + i)
+            .collect();
+        let carded = SlotMap::of_plan_tiers(plan, 0, &tier_cards, 0..n_layers, n_expert)?;
         let residency = ResidencySpec {
             lever: residency,
             pool: ChurnHosting::Hosted,
@@ -1241,6 +1258,7 @@ impl GpuModel<Body35> {
                     set,
                     glue,
                     arch: "qwen35moe",
+                    family: &super::tier_leg::QWEN35_FAMILY,
                     rows: PLACED_ROWS,
                 };
                 let mut body =
@@ -1461,6 +1479,18 @@ impl Body35 {
         self.placed.as_ref()
     }
 
+    /// The placed load's wide card route as its last prompt unit left it
+    /// ([`Placed::wide_route`]): the ubatch arena's routed ids beside every
+    /// layer's map and table and the last walked layer's places, a blocking
+    /// read on `stream` for gates and diagnostics. `None` on a load that is
+    /// not a placed one.
+    pub fn wide_route(&self, stream: &CudaStream) -> Result<Option<WideRoute>, GpuError> {
+        let Some(placed) = &self.placed else {
+            return Ok(None);
+        };
+        Ok(Some(placed.wide_route(stream, self.u.route.ids())?))
+    }
+
     /// Device bytes of the layer stores: the attention layers' K/V planes
     /// and the delta layers' states and conv rings.
     #[must_use]
@@ -1475,9 +1505,9 @@ impl Body35 {
     }
 
     /// Lanes of a delta store on a load that verifies drafted rows
-    /// ([`GpuModel::open_verifying`]): a lane for each of a pass's
-    /// [`MAX_PASS_ROWS`] rows, which is the count the plan prices
-    /// (`KvLayout::of_lanes`).
+    /// ([`GpuModel::open_verifying`], [`GpuModel::open_mtp`]): a lane for
+    /// each of a pass's [`MAX_PASS_ROWS`] rows, which is the count the plan
+    /// prices (`KvLayout::of_lanes`).
     pub const VERIFY_LANES: usize = MAX_PASS_ROWS;
 
     /// Lanes of every delta store: 1, or [`Body35::VERIFY_LANES`] on a load

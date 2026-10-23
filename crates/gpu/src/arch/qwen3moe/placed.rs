@@ -1,14 +1,20 @@
 //! A placed load of the family's chain ([`Placed`]): `Body` (Qwen3-30B-A3B)
 //! and `Body35` (Qwen3.6-35B-A3B) with the trunk on the card and the routed
 //! experts split by a placement plan — each layer's experts the plan puts on
-//! the card in its stacks, the rest on the host tier (`crate::host`), which
-//! computes them with qdot's fused kernels while the card runs its own.
+//! the stage card in its stacks, the ones it puts on an expert tier through
+//! the common card leg (`tier_leg`, [`crate::host::leg_tier`]), the rest on
+//! the host tier (`crate::host`), which computes them with qdot's fused
+//! kernels while the cards run their own. A plan of no expert tier is the
+//! stage card and the host alone; the load hangs at most one tier card.
 //!
 //! The walks are layer programs of their own over a host leg (the FFN half
 //! splits around the leg, which the chain's walk does not lay out): the
 //! decode step `(1, 1, Step)` through the tier's step port ([`StepWalk`],
-//! captured), a prompt unit `(1, m, Batch)` of up to [`PlacedOpen::rows`]
-//! rows through its batch port ([`BatchWalk`]): a unit of up to
+//! captured), a pass of resident slots `(1, m, Step)` of up to
+//! [`MAX_PASS_ROWS`] columns through the same port ([`ColsWalk`],
+//! [`Chain::Cols`] when more than one column), a prompt unit
+//! `(1, m, Batch)` of up to [`PlacedOpen::rows`] rows through its batch
+//! port ([`BatchWalk`]): a unit of up to
 //! [`GEMV_COLS`] rows runs the gemv arm's launches below, a longer one the
 //! wide arm's (`wide::ffn_front`, `wide::ffn_card`, `wide::ffn_combine`) over
 //! the layer's own map and table of the card's experts. A layer's parts:
@@ -17,7 +23,10 @@
 //!   [`Program`]), the FFN norm with its q8_1 form and the router — the norm into the step
 //!   boundary's activation, or the arena's for a unit — then the host leg's
 //!   send: the step's handoff into the page with each routed slot's place
-//!   and the go; a unit's download of its rows and routing with its places
+//!   and the go — a slot pass hands each column off, then one go; on a
+//!   layer the tier holds experts of, the tier handoff writes the stage
+//!   page and the tier image and the go waits for the tier (`tier_leg`);
+//!   a unit's download of its rows and routing with its places
 //!   (`hostleg`);
 //! - the shadow: the card's routed experts of the layer when it has any —
 //!   by the layer's leg ([`FfnLeg`], `accepts::qwen35_leg`): the dispatch's
@@ -34,7 +43,9 @@
 //! - the back: the step's wait (a unit's serve and upload are the walk's),
 //!   then the combine of the card's slots with the host's routed sum, the
 //!   residual and the shared expert (`hostleg`), into the next layer's
-//!   input — the head's after the last layer of the step.
+//!   input — the head's after the last layer of the step. On a layer the
+//!   tier holds experts of, the tier's slots in the same slot order
+//!   (`tier_leg`) join into that sum in the one combine.
 //!
 //! The slot map is the plan's for the load's life while the load's
 //! residency glue runs no machine ([`Placed`]'s `glue`): its card copy is
@@ -55,12 +66,20 @@
 //! expert, the gated one (`Body35`'s) sees it kept apart on every layer
 //! ([`apart_plans`]).
 //!
+//! A pass of several columns ([`ColsWalk`]) and a prompt unit
+//! ([`BatchWalk`]) are refused by name when any layer holds a tier expert.
+//! A hung tier that holds no expert of any layer leaves the pass and the
+//! unit on their existing path.
+//!
 //! Numerics: the routing is the whole-card chain's bit for bit (the step's
 //! norm and router are `norm_quant` and the router, which the whole-card
 //! step's fused launch writes bit for bit); the host's experts are qdot's
 //! (q8_K activations, the host's sum order), the card's the K-quant
 //! family's — the same Walk A arithmetic as the whole-card launches — so a
 //! placed load agrees with the whole-card one to the error of those sums.
+//! A pass of resident slots runs each slot's sequence-bound launches as the
+//! whole-card pass does and each column's routed experts as the step does,
+//! so each column is that slot's own step.
 
 use super::body::{Kernels, stack_tys};
 use super::dispatch::{self, Ctx, PassCtx, SharedDenseBufs};
@@ -71,27 +90,34 @@ use super::plan::{
 };
 use super::program::{Program, Stores, Tail, enqueue_tail};
 use super::scratch::{Arena, Dims, Forms, Io};
+use super::tier_leg::{self, TierCombineArgs, TierJoin};
 use super::wide::{self, CardRoute, GEMV_COLS, HostSide, arena_bytes};
 use crate::card_leg::{
     CardLeg, LegBufs, LegRun, LegShape, LegStacks, RouteBlock, RouteIo, RouteW, leg_bytes_for,
 };
-use crate::gemm::{Gemm32Kernels, GemmRoute};
+use crate::gemm::{Gemm32Kernels, GemmRoute, GemmTile};
 use crate::host::handoff::{Handoff, HandoffKernels};
+use crate::host::leg_tier::{self, Hang, LegOpen, TierSide};
 use crate::host::prompt_stream::PromptStream;
 use crate::host::run::{HostRun, HostWidths};
 use crate::host::served::{ResidencyParts, TierBody};
 use crate::host::swap::PassReport;
 use crate::host::swap_source::DEADLINE;
 use crate::host::swap_source::{FileSwap, ResidencyGlue};
+use crate::host::tier::TierOpen;
 use crate::host::xstream::{self, Costs, LAND_BATCHES, LandBatch, RingLayer, XCfg};
-use crate::host::{BatchLeg, PassKind, StepLeg};
-use crate::hybrid::{Boundary, BoundaryShape, Chain, HOST, HostResidency, Hybrid, SlotMap};
+use crate::host::{BatchLeg, PassKind, StepLeg, refuse_tier_count};
+use crate::hybrid::{
+    Boundary, BoundaryShape, Chain, HOST, HandoffLayout, HandoffTarget, HostResidency, Hybrid,
+    SlotMap,
+};
 use crate::kquant::{Act, GateUpAct, SelDown};
-use crate::model::fit::{act_col_bytes, act32_col_bytes, route_bytes};
+use crate::model::fit::{act_col_bytes, route_bytes};
 use crate::model::lookup::{f32_gain, f32_tensor, kq_weight};
+use crate::model::{MAX_PASS_ROWS, SlotRange};
 use crate::q4k_sel::QuantSel;
 use crate::quant_sel::QuantSelKernels;
-use crate::site::{self, WideActs};
+use crate::site::{self, WideActs, WideForms};
 use crate::tensor::{DeviceTensor, Q8Act, Window, WindowMut};
 use crate::weights::{DevWeight, Weights};
 use crate::{FaultSink, Gpu, GpuError};
@@ -122,6 +148,15 @@ pub(super) const PLACED_ROWS: usize = UNION_MAX_COLS;
 
 /// The rows of a placed decode step: the step arena's one row.
 const STEP_ROWS: usize = 1;
+
+/// A pass of several columns beside a tier expert. The page is one column,
+/// so the rounds run a slot at a time.
+const PASS_BESIDE_TIER: &str = "a pass of several slots beside an expert tier: the page is one \
+                                column, so the rounds run a slot at a time";
+
+/// A prompt unit beside a tier expert. The tier serves the step.
+const PROMPT_BESIDE_TIER: &str =
+    "a prompt unit beside an expert tier: the tier serves the step, one column";
 
 /// The shared expert of a placed Qwen3.6 layer, run by its plan's types
 /// ([`shared_ffn`]): the placed twin of the whole-card load's
@@ -272,25 +307,21 @@ impl CommonForms {
             return bufs;
         }
         let slots = rows * shape.pitch;
-        let acts = |cols: usize, k: usize, (q128, q32): (bool, bool)| {
-            cols * (usize::from(q128) * act_col_bytes(k) + usize::from(q32) * act32_col_bytes(k))
-        };
         bufs + 2 * slots * shape.ff * 4
-            + acts(rows, shape.hidden, (self.x128, self.x32))
-            + acts(slots, shape.ff, (self.h128, self.h32))
+            + WideForms::q8(self.x128, self.x32).bytes(rows, shape.hidden)
+            + WideForms::q8(self.h128, self.h32).bytes(slots, shape.ff)
     }
 }
 
 /// The residency machine's tally shape for a placed load over arena dims
 /// `d`: the ids a row routes a layer, and the rows a pass runs. The ids are
 /// the step boundary's `n_used` (the router's routed slots, not the shared
-/// expert's), which the step port notes slot by slot; the rows are the
-/// step's one ([`STEP_ROWS`]): a placed load refuses a pass of several rows
-/// (`body35::enqueue_rows`), and a prompt unit's rows go through the batch
-/// port, which notes no id (a prompt call keeps 0 rows). A chain of dense
-/// FFNs is refused by name.
+/// expert's), which the step port notes slot by slot; the rows are a pass
+/// of slots ([`MAX_PASS_ROWS`]). A one-row step keeps one row of that. A
+/// prompt unit's rows go through the batch port, which notes no id (a
+/// prompt call keeps 0 rows). A chain of dense FFNs is refused by name.
 pub(super) fn tally_shape(d: &Dims) -> Result<(usize, usize), GpuError> {
-    Ok((RouteShape::of(d)?.used, STEP_ROWS))
+    Ok((RouteShape::of(d)?.used, MAX_PASS_ROWS))
 }
 
 /// What the host leg's launches take a placed chain to be: the experts a
@@ -384,8 +415,18 @@ impl CommonRows {
         let wide = (rows > GEMV_COLS)
             .then(|| {
                 Ok::<_, GpuError>(CommonWide {
-                    x: WideActs::new(stream, (forms.x128, forms.x32), rows, shape.hidden)?,
-                    h: WideActs::new(stream, (forms.h128, forms.h32), slots, shape.ff)?,
+                    x: WideActs::new(
+                        stream,
+                        WideForms::q8(forms.x128, forms.x32),
+                        rows,
+                        shape.hidden,
+                    )?,
+                    h: WideActs::new(
+                        stream,
+                        WideForms::q8(forms.h128, forms.h32),
+                        slots,
+                        shape.ff,
+                    )?,
                     g: DeviceBuffer::zeroed(stream, slots * shape.ff)?,
                     u: DeviceBuffer::zeroed(stream, slots * shape.ff)?,
                 })
@@ -583,6 +624,8 @@ pub(super) struct PlacedKernels {
     g32: Option<Gemm32Kernels>,
     /// The common card leg's modules, on a load with a common-leg layer.
     card: Option<CardLeg>,
+    /// The tier join, on a load that hangs an expert tier.
+    join: Option<TierJoin>,
 }
 
 /// What every placed walk reads besides the arena: each layer's card
@@ -604,6 +647,10 @@ pub(super) struct PlacedSide {
     live: bool,
     shape: RouteShape,
     k: PlacedKernels,
+    /// The stage card's side of an expert tier, when the plan hangs one.
+    /// Its places are the handoff's and sit outside [`Placed::device_bytes`]:
+    /// the plan's scratch is the stage side's.
+    tier: Option<TierSide>,
     /// The rows of the most a unit walks.
     pub(super) cap: usize,
 }
@@ -668,6 +715,36 @@ pub struct Placed {
     glue: ResidencyGlue,
 }
 
+/// What [`Placed::wide_route`] read back: the unit's routed ids, the places
+/// the last walked layer's front cut, and each layer's card-expert side, for
+/// gates and diagnostics.
+pub struct WideRoute {
+    /// The unit's routed ids, token-major at the router's pitch (the shared
+    /// expert's id last a token).
+    pub ids: Vec<u32>,
+    /// The last walked layer's places of the unit's slots, token-major at the
+    /// router's pitch ([`HOST`] for the host's and the shared expert's).
+    pub sel: Vec<u32>,
+    /// Each layer's side, in layer order.
+    pub layers: Vec<WideRouteLayer>,
+}
+
+/// One layer's side of a [`WideRoute`]: its card expert count, its map of the
+/// experts to their card slots or [`HOST`], and its routed table as the last
+/// unit's card route left it.
+pub struct WideRouteLayer {
+    /// The layer's card experts.
+    pub n_card: usize,
+    /// The layer's map, `n_expert + 1` words (the last the shared expert's
+    /// [`HOST`], which the wide arm's remap skips).
+    pub map: Vec<u32>,
+    /// The table's slot list and tiles ([`GemmRoute::read_back`]).
+    pub cols: Vec<u32>,
+    pub tiles: Vec<GemmTile>,
+    /// The slots the table refused (an expert id past the card set).
+    pub refused: usize,
+}
+
 /// What [`Placed::new`] builds a load's placed side from.
 pub(super) struct PlacedOpen<'a> {
     /// The plan the load's weights were uploaded by; its card 0 the load's.
@@ -682,6 +759,8 @@ pub(super) struct PlacedOpen<'a> {
     pub(super) glue: ResidencyGlue,
     /// The architecture the host run's refusals name.
     pub(super) arch: &'static str,
+    /// The tier node service, when the plan hangs an expert tier.
+    pub(super) family: &'static crate::host::node::NodeFamily,
     /// The most rows a prompt unit holds: the arena's, [`PLACED_ROWS`] on a
     /// load that runs the wide arm.
     pub(super) rows: usize,
@@ -694,7 +773,8 @@ impl Placed {
     /// launches take ([`stack_tys`]: the table's gate·up and down entries the
     /// FFN dispatch launches; a stack of other rows would leave slots that
     /// neither side sums), the shared expert of a gated router's chain
-    /// admitted by its plan's types ([`shared_ffn`]), the boundary of one row, the host tier over every layer's
+    /// admitted by its plan's types ([`shared_ffn`]), the step boundary of one
+    /// row of [`MAX_PASS_ROWS`] columns, the host tier over every layer's
     /// routed stacks (qdot's, refused by name for a stack no fused kernel
     /// serves) watching the fault word and holding the host set, its batch
     /// port for units of up to `o.rows` rows, and the buffers (past
@@ -703,8 +783,9 @@ impl Placed {
     /// ([`ResidencyGlue::attach_tier`]), and the machine it may hold is
     /// started by the body once its pieces are sized
     /// ([`HostServed::start_residency`](crate::model::HostServed::start_residency)).
-    /// A plan of other than one card, with an expert tier, or not of every
-    /// layer is refused by name. Load-time only.
+    /// A plan of other than one stage card, of more than one expert tier, or
+    /// not of every layer is refused by name. One expert tier is hung under
+    /// the host tier ([`leg_tier::hang_tiers`]). Load-time only.
     pub(super) fn new(
         gpu: &Gpu,
         w: &Weights,
@@ -719,24 +800,27 @@ impl Placed {
             .cards
             .first()
             .ok_or(GpuError::shape(WHAT, "a plan of no card"))?;
-        if o.plan.machine.cards.len() != 1
-            || !o.plan.machine.tiers.is_empty()
-            || spec.layers != (0..n)
-        {
+        let n_tiers = o.plan.machine.expert_tiers().count();
+        refuse_tier_count(WHAT, n_tiers)?;
+        if o.plan.machine.cards.len() != 1 || spec.layers != (0..n) {
             return Err(GpuError::shape(
                 WHAT,
                 format!(
                     "a plan of {} cards and {} expert tiers, card 0 running layers {:?}; the \
-                     program runs every layer (0..{n}) on one card with no expert tier",
+                     program runs every layer (0..{n}) on one stage card and at most one expert \
+                     tier",
                     o.plan.machine.cards.len(),
-                    o.plan.machine.tiers.len(),
+                    n_tiers,
                     spec.layers
                 ),
             ));
         }
         let shape = RouteShape::of(d)?;
         let stream = gpu.stream();
-        let map = SlotMap::of_plan(o.plan, 0, None, 0..n, shape.n_expert)?;
+        let tier_cards: Vec<usize> = (0..n_tiers)
+            .map(|i| o.plan.machine.cards.len() + i)
+            .collect();
+        let map = SlotMap::of_plan_tiers(o.plan, 0, &tier_cards, 0..n, shape.n_expert)?;
         let ffn = plans
             .iter()
             .enumerate()
@@ -752,13 +836,15 @@ impl Placed {
         } else {
             Vec::new()
         };
-        let boundary = Boundary::new(
+        let boundary = Boundary::with_cols(
             gpu.context(),
             stream,
             BoundaryShape {
                 hidden: shape.hidden,
                 n_used: shape.used,
             },
+            1,
+            MAX_PASS_ROWS,
         )?;
         let widths = HostWidths {
             embd: shape.hidden,
@@ -789,7 +875,39 @@ impl Placed {
         let mut hybrid = Hybrid::new(boundary, map, experts, n)?;
         hybrid.watch_fault(gpu.fault_word())?;
         hybrid.keep_residency(o.set);
+        // The tier page is one column. The batch port's width is the placed
+        // load's unit rows, so the plan's tier reserve is checked at that
+        // width. Empty of a tier, the hang is nothing and the batch port is
+        // made once, as a load of no tier.
+        if n_tiers == 1 {
+            let tiers = TierOpen::of_machine(o.plan.machine)?;
+            let hang = Hang {
+                tiers: &tiers,
+                family: o.family,
+                open: LegOpen {
+                    n_expert: shape.n_expert,
+                    layers: n,
+                    hidden: shape.hidden,
+                    n_used: shape.used,
+                    rows: tier_leg::PAGE_ROWS,
+                },
+                cols: o.rows,
+                card_dontneed: o.host.card_dontneed,
+                bytes: crate::model::CardBytes::File,
+            };
+            leg_tier::hang_tiers((gpu, &o.file, o.plan), &hang, &mut hybrid)?;
+        }
         hybrid.prepare_batch(gpu.context(), o.rows)?;
+        let tier = if n_tiers == 1 {
+            Some(TierSide::new(
+                gpu,
+                hybrid.slots(),
+                n,
+                (tier_leg::PAGE_ROWS, shape.used),
+            )?)
+        } else {
+            None
+        };
         let ctx = gpu.context();
         let k = PlacedKernels {
             handoff: HandoffKernels::load(ctx)?,
@@ -799,6 +917,7 @@ impl Placed {
                 .then(|| Gemm32Kernels::load(ctx))
                 .transpose()?,
             card: common.any().then(|| CardLeg::load(gpu)).transpose()?,
+            join: (n_tiers == 1).then(|| TierJoin::load(ctx)).transpose()?,
         };
         let placed = Placed {
             hybrid,
@@ -809,6 +928,7 @@ impl Placed {
                 live,
                 shape,
                 k,
+                tier,
                 cap: o.rows,
             },
             step: PlacedRows::new(stream, shape, STEP_ROWS, (&[], common))?,
@@ -869,6 +989,7 @@ impl Placed {
             ));
         }
         if self.hybrid.xstream().is_none() {
+            // The plan reserves no ring: it takes what the card's margin leaves past the keep-free.
             let cfg = XCfg::new(costs, shape.n_expert, shape.used, DEADLINE, None);
             self.hybrid
                 .xstream_start(gpu.context(), gpu.stream(), cfg, xstream::PROBE)?;
@@ -914,8 +1035,72 @@ impl Placed {
         self.side.ffn.iter().map(|f| f.n_card).collect()
     }
 
+    /// The wide arm's card route as the last prompt unit left it, read back
+    /// with `ids` (the ubatch arena's routed ids) for gates and diagnostics:
+    /// every layer's map of the experts to their card slots or [`HOST`], its
+    /// routed table ([`GemmRoute::read_back`], [`GemmRoute::refused_back`])
+    /// and the places the last walked layer's front cut. A layer with no card
+    /// expert holds the empty table (its oracle's). Blocking reads on
+    /// `stream`. Refused by name on a load whose pass arena holds no wide
+    /// tables (no unit past [`GEMV_COLS`] ran), a layer the load holds no map
+    /// for, and a layer with card experts whose table is missing.
+    pub fn wide_route(
+        &self,
+        stream: &CudaStream,
+        ids: &DeviceBuffer<u32>,
+    ) -> Result<WideRoute, GpuError> {
+        if self.pass.routes.is_empty() {
+            return Err(GpuError::state(
+                WHAT,
+                "the pass rows hold no wide tables (no unit past the gemv arm's cut ran)",
+            ));
+        }
+        let missing = |what: &'static str| GpuError::state(WHAT, what);
+        let mut layers = Vec::with_capacity(self.side.ffn.len());
+        for (l, f) in self.side.ffn.iter().enumerate() {
+            let map = self
+                .side
+                .maps
+                .get(l)
+                .ok_or_else(|| missing("a map of the card's experts for every layer"))?
+                .to_host_vec(stream)?;
+            let route = self.pass.routes.get(l).and_then(Option::as_ref);
+            let (cols, tiles, refused) = match route {
+                Some(route) => {
+                    let (cols, tiles) = route.read_back(stream)?;
+                    (cols, tiles, route.refused_back(stream)?.len())
+                }
+                None if f.n_card == 0 => (Vec::new(), Vec::new(), 0),
+                None => return Err(missing("a table of the card's experts for every layer")),
+            };
+            layers.push(WideRouteLayer {
+                n_card: f.n_card,
+                map,
+                cols,
+                tiles,
+                refused,
+            });
+        }
+        Ok(WideRoute {
+            ids: ids.to_host_vec(stream)?,
+            sel: self.pass.sel.to_host_vec(stream)?,
+            layers,
+        })
+    }
+
+    /// Some layer holds an expert on the hung expert tier ([`TierSide::any`]):
+    /// the load runs no pass of several slots beside one — the tier's page is
+    /// one column, so its rounds run a slot at a time — and a hung tier that
+    /// holds no expert leaves the pass on its path.
+    #[must_use]
+    pub fn tier_any(&self) -> bool {
+        self.side.tier.as_ref().is_some_and(TierSide::any)
+    }
+
     /// Device bytes the placed side holds: the slot map's card copy, the
-    /// layers' maps, the buffers, the host sums and the boundary.
+    /// layers' maps, the buffers, the host sums and the boundary. The tier
+    /// side's places are the handoff's and sit outside this count: the plan's
+    /// scratch is the stage side's.
     #[must_use]
     pub fn device_bytes(&self) -> usize {
         self.side.slots.buf().num_bytes()
@@ -1856,6 +2041,7 @@ fn gate_up_sel(
         GateUpEntry::Q5k => kq.enqueue_gate_up_q5k(stream, a, sink, h),
         GateUpEntry::Q8_0
         | GateUpEntry::Q6k
+        | GateUpEntry::Iq2xxs
         | GateUpEntry::Iq2xs
         | GateUpEntry::Iq3xxs
         | GateUpEntry::Iq3s
@@ -1908,7 +2094,8 @@ fn down_arm(ty: GgmlType) -> Result<DownArm, GpuError> {
         }
         // These read `Q8Act` columns (the i-quant downs of `iq_sel.rs`, MXFP4)
         // and have no launch on the placed side.
-        DownEntry::Iq2xs
+        DownEntry::Iq2xxs
+        | DownEntry::Iq2xs
         | DownEntry::Iq3xxs
         | DownEntry::Iq3s
         | DownEntry::Iq4xs
@@ -1965,6 +2152,109 @@ fn down_sel(
             .q6_sel
             .enqueue_gemv_q6k_sel(stream, wd, act, sel, n_slots, hidden, y),
     }
+}
+
+/// Layer `layer`'s tier handoff and go: the stage page and the tier image
+/// in one launch, then the go that waits for the tier. A load with no tier
+/// side is refused by name. One column.
+fn tier_go(
+    side: &mut PlacedSide,
+    sel: &mut DeviceBuffer<u32>,
+    hybrid: &mut Hybrid<HostRun>,
+    route: (&DeviceBuffer<u32>, &DeviceBuffer<f32>),
+    layer: usize,
+    sink: FaultSink,
+    stream: &CudaStream,
+) -> Result<(), GpuError> {
+    let (ids, weights) = route;
+    let shape = side.shape;
+    let PlacedSide { tier, slots, k, .. } = side;
+    let tier = tier
+        .as_mut()
+        .ok_or(GpuError::state(WHAT, "the stage card's tier side"))?;
+    let h = Handoff {
+        ids,
+        weights,
+        map: slots.buf(),
+        row_off: layer * shape.n_expert,
+        n_expert: shape.n_expert,
+    };
+    {
+        let (places, tsel) = tier.handoff_parts(0)?;
+        let targets = hybrid.tier_handoff(0, leg_tier::STAGE_TIER)?;
+        k.handoff
+            .enqueue_handoff_tier(stream, &h, places, targets, sink, (sel, tsel))?;
+    }
+    hybrid.enqueue_tier_go(stream, layer, 0)
+}
+
+/// The combine of a layer the tier holds experts of: the stage card's slots
+/// and the tier's, in slot order, with the host's sums (`tier_leg`). `n_tier`
+/// is the layer's experts on the tier. `out` as [`combine`].
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one join's context, side, rows, arena, width, both sums, the tier's experts and the output"
+)]
+fn combine_tier(
+    c: &Ctx<'_>,
+    side: &PlacedSide,
+    rows: &PlacedRows,
+    s: &mut Arena,
+    m: usize,
+    sums: (&DeviceBuffer<f32>, &DeviceBuffer<f32>),
+    n_tier: usize,
+    out: Option<&mut DeviceBuffer<f32>>,
+) -> Result<(), GpuError> {
+    let (hsum, trows) = sums;
+    let f = side
+        .ffn
+        .get(c.layer)
+        .ok_or(GpuError::state(WHAT, "a placed FFN for every layer"))?;
+    let shape = side.shape;
+    let Arena {
+        x,
+        down,
+        route,
+        ffn_inp,
+        ..
+    } = s;
+    let shared = match (&f.shared, &rows.shared) {
+        (Some(_), Some(r)) => Some((&r.y, shape.used)),
+        (None, _) => None,
+        (Some(_), None) => {
+            return Err(GpuError::state(WHAT, "the shared expert's buffers"));
+        }
+    };
+    let tsel = side
+        .tier
+        .as_ref()
+        .ok_or(GpuError::state(WHAT, "the stage card's tier side"))?
+        .tsel(0)?;
+    let join = side.k.join.as_ref().ok_or(GpuError::state(
+        WHAT,
+        "the tier join of a load with an expert tier",
+    ))?;
+    join.enqueue(
+        c.gpu.stream(),
+        TierCombineArgs {
+            down,
+            trows,
+            w: route.weights(),
+            sel: &rows.sel,
+            tsel,
+            hsum,
+            resid: ffn_inp,
+            shared,
+            rows: shape.hidden,
+            pitch: shape.pitch,
+            n_used: shape.used,
+            n_card: f.n_card,
+            n_tier,
+            m,
+            fault: c.sink,
+            y: out.unwrap_or(x),
+        },
+    )
 }
 
 /// The combine of layer `l`'s `m` rows of arena `s` with the host's sums
@@ -2299,14 +2589,31 @@ impl<'a, S: Stores + ?Sized> LayerProgram for StepWalk<'a, S> {
     type Port = StepLeg<'a, HostRun>;
 
     /// The mixer, the norm into the boundary's activation and the router,
-    /// then the handoff into the page with the places, and the go.
+    /// then the handoff into the page with the places, and the go. On a
+    /// layer the tier holds experts of, the tier handoff and go replace
+    /// them.
     fn front(&mut self, port: &mut StepLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
         let l = at.layer;
         self.p.mixer(l)?;
         let p = &mut self.p;
         let lc = ctx_of(p.c, l)?;
-        let hy = port.hybrid();
-        route(&lc, &lc.p.ffn, p.s, 1, Some(hy.boundary_mut().normed_mut()))?;
+        let tier_k = p.side.tier.as_ref().map_or(0, |t| t.k(l));
+        {
+            let normed = port.hybrid().boundary_mut().normed_mut();
+            route(&lc, &lc.p.ffn, p.s, 1, Some(normed))?;
+        }
+        let stream = lc.gpu.stream();
+        if tier_k > 0 {
+            return tier_go(
+                p.side,
+                &mut p.rows.sel,
+                port.hybrid(),
+                (p.s.route.ids(), p.s.route.weights()),
+                l,
+                lc.sink,
+                stream,
+            );
+        }
         let shape = p.side.shape;
         let h = Handoff {
             ids: p.s.route.ids(),
@@ -2315,13 +2622,12 @@ impl<'a, S: Stores + ?Sized> LayerProgram for StepWalk<'a, S> {
             row_off: l * shape.n_expert,
             n_expert: shape.n_expert,
         };
-        let stream = lc.gpu.stream();
-        let target = hy.boundary_mut().handoff_target_of(0)?;
+        let target = port.hybrid().boundary_mut().handoff_target_of(0)?;
         p.side
             .k
             .handoff
             .enqueue_handoff(stream, &h, target, lc.sink, &mut p.rows.sel)?;
-        hy.boundary().enqueue_go_of(stream, l, 0)
+        port.hybrid().boundary().enqueue_go_of(stream, l, 0)
     }
 
     /// The card's routed experts and the shared expert (the norm's f32 rows
@@ -2335,26 +2641,45 @@ impl<'a, S: Stores + ?Sized> LayerProgram for StepWalk<'a, S> {
 
     /// The wait, the combine — into the head's input after the last layer
     /// — the layer's tap row when taps are on, and the host tier told the
-    /// layer is enqueued (an eager step is served there).
+    /// layer is enqueued (an eager step is served there). On a layer the
+    /// tier holds experts of, the wait covers the tier and the combine
+    /// joins its slots.
     fn back(&mut self, port: &mut StepLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
         let l = at.layer;
         let last = l + 1 == self.p.c.plans.len();
         let StepWalk { p, tail } = self;
         let lc = ctx_of(p.c, l)?;
         let stream = lc.gpu.stream();
+        let tier_k = p.side.tier.as_ref().map_or(0, |t| t.k(l));
         let hy = port.hybrid();
-        hy.boundary().enqueue_back_of(stream, 0, l)?;
-        let hsum = hy.boundary().hsum_of(0)?;
-        match tail {
-            Tail::Step { head, taps, .. } => {
-                let out = last.then(|| head.input_mut());
-                combine(&lc, p.side, p.rows, p.s, 1, hsum, out)?;
-                if let Some(t) = taps {
-                    let src: &DeviceBuffer<f32> = if last { head.input_mut() } else { &p.s.x };
-                    t.rows[l].copy_from_device_async(src, stream)?;
+        if tier_k > 0 {
+            hy.enqueue_tier_back(stream, l, 0)?;
+            let sums = hy.tier_join_rows(0)?;
+            match tail {
+                Tail::Step { head, taps, .. } => {
+                    let out = last.then(|| head.input_mut());
+                    combine_tier(&lc, p.side, p.rows, p.s, 1, sums, tier_k, out)?;
+                    if let Some(t) = taps {
+                        let src: &DeviceBuffer<f32> = if last { head.input_mut() } else { &p.s.x };
+                        t.rows[l].copy_from_device_async(src, stream)?;
+                    }
                 }
+                _ => combine_tier(&lc, p.side, p.rows, p.s, 1, sums, tier_k, None)?,
             }
-            _ => combine(&lc, p.side, p.rows, p.s, 1, hsum, None)?,
+        } else {
+            hy.boundary().enqueue_back_of(stream, 0, l)?;
+            let hsum = hy.boundary().hsum_of(0)?;
+            match tail {
+                Tail::Step { head, taps, .. } => {
+                    let out = last.then(|| head.input_mut());
+                    combine(&lc, p.side, p.rows, p.s, 1, hsum, out)?;
+                    if let Some(t) = taps {
+                        let src: &DeviceBuffer<f32> = if last { head.input_mut() } else { &p.s.x };
+                        t.rows[l].copy_from_device_async(src, stream)?;
+                    }
+                }
+                _ => combine(&lc, p.side, p.rows, p.s, 1, hsum, None)?,
+            }
         }
         port.hybrid().row_enqueued(l, 0)
     }
@@ -2364,6 +2689,238 @@ impl<'a, S: Stores + ?Sized> LayerProgram for StepWalk<'a, S> {
         let StepWalk { p, tail } = self;
         enqueue_tail(p.c, p.s, p.m, tail)
     }
+}
+
+/// The chain a pass of `rows` replays. One column is the step; more columns
+/// are one [`Chain::Cols`]. The placed replay serves it. A whole-card load
+/// has no host service of the pass.
+pub(super) fn slot_chain(rows: &[SlotRange]) -> Chain {
+    match rows.last().map(|r| r.rows.end).unwrap_or(0) {
+        0 | 1 => Chain::Step,
+        m => Chain::Cols(m),
+    }
+}
+
+/// What a pass of columns mixes before the placed FFN: one layer's
+/// sequence-bound launches, the body's own.
+pub(super) trait ColsMix {
+    /// Layer `layer` over the pass's rows, leaving each row's FFN input in
+    /// the arena.
+    fn mix_layer(&mut self, layer: usize, c: &PassCtx<'_>, s: &mut Arena) -> Result<(), GpuError>;
+}
+
+/// A pass of resident slots `(1, m, Step)` through the host tier's step
+/// port: [`ColsMix`] a layer, then that layer's placed FFN over the `m`
+/// columns, then the [`Tail`]. The tail is one head of every row.
+pub(super) struct ColsWalk<'a, M: ColsMix> {
+    pub(super) c: &'a PassCtx<'a>,
+    pub(super) s: &'a mut Arena,
+    pub(super) m: usize,
+    pub(super) side: &'a mut PlacedSide,
+    pub(super) rows: &'a mut PlacedRows,
+    pub(super) mix: M,
+    pub(super) tail: Tail<'a>,
+}
+
+impl<'a, M: ColsMix> ColsWalk<'a, M> {
+    /// Walk every layer through `leg`, then the tail. No row, a row past
+    /// the page or past [`MAX_PASS_ROWS`], a chain of no layer, or a tail
+    /// other than one head of every row is refused by name.
+    pub(super) fn walk(mut self, leg: &mut StepLeg<'a, HostRun>) -> Result<(), GpuError> {
+        let cols = leg.hybrid().boundary().layout().cols();
+        if self.m == 0 || self.m > MAX_PASS_ROWS || self.m > cols || self.c.plans.is_empty() {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "a slot pass of {} rows over {} layers on a page of {cols} columns; a pass \
+                     is 1..={MAX_PASS_ROWS} rows of a chain",
+                    self.m,
+                    self.c.plans.len()
+                ),
+            ));
+        }
+        if !matches!(self.tail, Tail::One { .. }) {
+            return Err(GpuError::shape(
+                WHAT,
+                "a slot pass ends in one head of every row",
+            ));
+        }
+        if self.m > 1 && self.side.tier.as_ref().is_some_and(TierSide::any) {
+            return Err(GpuError::shape(WHAT, PASS_BESIDE_TIER));
+        }
+        let o = Overlap {
+            units: 1,
+            cols: self.m,
+            port: PortKind::Step,
+        };
+        sched::walk(o, self.c.plans.len(), leg, &mut self)
+    }
+}
+
+impl<'a, M: ColsMix> LayerProgram for ColsWalk<'a, M> {
+    type Port = StepLeg<'a, HostRun>;
+
+    /// The mixer's layer, the norm into the boundary's activation and the
+    /// router, then each column's handoff into the page and the one go. On
+    /// a layer the tier holds experts of, one column takes the tier handoff
+    /// and go; several columns are refused by name.
+    fn front(&mut self, port: &mut StepLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
+        let l = at.layer;
+        self.mix.mix_layer(l, self.c, self.s)?;
+        let lc = ctx_of(self.c, l)?;
+        let tier_k = self.side.tier.as_ref().map_or(0, |t| t.k(l));
+        if tier_k > 0 && self.m != 1 {
+            return Err(GpuError::shape(WHAT, PASS_BESIDE_TIER));
+        }
+        {
+            let normed = port.hybrid().boundary_mut().normed_mut();
+            route(&lc, &lc.p.ffn, self.s, self.m, Some(normed))?;
+        }
+        if tier_k > 0 {
+            return tier_go(
+                self.side,
+                &mut self.rows.sel,
+                port.hybrid(),
+                (self.s.route.ids(), self.s.route.weights()),
+                l,
+                lc.sink,
+                lc.gpu.stream(),
+            );
+        }
+        let shape = self.side.shape;
+        handoff_columns(
+            &self.side.k.handoff,
+            self.side.slots.buf(),
+            shape,
+            self.s.route.ids(),
+            self.s.route.weights(),
+            port.hybrid().boundary_mut(),
+            self.m,
+            l,
+            lc.sink,
+            lc.gpu.stream(),
+            &mut self.rows.sel,
+        )?;
+        port.hybrid()
+            .boundary()
+            .enqueue_go_of(lc.gpu.stream(), l, 0)
+    }
+
+    /// The card's routed experts and the shared expert over the pass's
+    /// rows (the norm's f32 rows are the boundary's).
+    fn shadow(&mut self, port: &mut StepLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
+        let lc = ctx_of(self.c, at.layer)?;
+        let normed = port.hybrid().boundary().normed();
+        shadow(&lc, self.side, self.rows, self.s, Some(normed), self.m)
+    }
+
+    /// The wait, the combine into the arena's `x`, and the host tier told
+    /// the layer is enqueued (an eager pass is served there). On a layer
+    /// the tier holds experts of, the wait covers the tier and the combine
+    /// joins its slots; several columns are refused by name.
+    fn back(&mut self, port: &mut StepLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
+        let l = at.layer;
+        let lc = ctx_of(self.c, l)?;
+        let stream = lc.gpu.stream();
+        let tier_k = self.side.tier.as_ref().map_or(0, |t| t.k(l));
+        let hy = port.hybrid();
+        if tier_k > 0 {
+            if self.m != 1 {
+                return Err(GpuError::shape(WHAT, PASS_BESIDE_TIER));
+            }
+            hy.enqueue_tier_back(stream, l, 0)?;
+            let sums = hy.tier_join_rows(0)?;
+            combine_tier(
+                &lc, self.side, self.rows, self.s, self.m, sums, tier_k, None,
+            )?;
+        } else {
+            hy.boundary().enqueue_back_of(stream, 0, l)?;
+            let hsum = hy.boundary().hsum_of(0)?;
+            combine(&lc, self.side, self.rows, self.s, self.m, hsum, None)?;
+        }
+        port.hybrid().row_enqueued(l, 0)
+    }
+
+    /// The walk's [`Tail`].
+    fn end(&mut self, _: usize) -> Result<(), GpuError> {
+        enqueue_tail(self.c, self.s, self.m, &mut self.tail)
+    }
+}
+
+/// Column `0..m` of layer `layer` into the step page: each column's routed
+/// ids, weights and activation, at the router's pitch (the shared slot
+/// stays [`HOST`]), through the handoff, into that column of the page.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one column handoff's kernels, map, shape, routing, page, rows, layer, fault, stream and places (rust-quality R8)"
+)]
+fn handoff_columns(
+    handoff: &HandoffKernels,
+    map: &DeviceBuffer<u32>,
+    shape: RouteShape,
+    ids: &DeviceBuffer<u32>,
+    weights: &DeviceBuffer<f32>,
+    boundary: &mut Boundary,
+    m: usize,
+    layer: usize,
+    sink: FaultSink,
+    stream: &CudaStream,
+    sel: &mut DeviceBuffer<u32>,
+) -> Result<(), GpuError> {
+    let RouteShape {
+        used,
+        pitch,
+        hidden,
+        n_expert,
+        ..
+    } = shape;
+    let cols = boundary.layout().cols();
+    let base = boundary.layout().handoff();
+    if pitch < used || base.n_used != used || m == 0 || m > cols {
+        return Err(GpuError::shape(
+            WHAT,
+            format!(
+                "a handoff of {m} columns of {used} routed slots at pitch {pitch} on a page of \
+                 {cols} columns of {} routed slots",
+                base.n_used
+            ),
+        ));
+    }
+    let HandoffTarget { x, seq, image, .. } = boundary.handoff_target_of(0)?;
+    let word = size_of::<u32>();
+    for j in 0..m {
+        let ids_j = Window::of(ids, j * pitch * word, used)?;
+        let w_j = Window::of(weights, j * pitch * word, used)?;
+        let x_j = Window::of(x, j * hidden * word, hidden)?;
+        let mut sel_j = WindowMut::of_mut(sel, j * pitch * word, used)?;
+        let shifted = HandoffLayout {
+            seq: base.seq,
+            ids: base.ids + j * used,
+            weights: base.weights + j * used,
+            x: base.x + j * hidden,
+            n_used: base.n_used,
+            hidden: base.hidden,
+        };
+        handoff.enqueue_handoff(
+            stream,
+            &Handoff {
+                ids: &ids_j,
+                weights: &w_j,
+                map,
+                row_off: layer * n_expert,
+                n_expert,
+            },
+            HandoffTarget {
+                x: &x_j,
+                seq,
+                image: &mut *image,
+                layout: shifted,
+            },
+            sink,
+            &mut sel_j,
+        )?;
+    }
+    Ok(())
 }
 
 /// A prompt unit's walk `(1, m, Batch)` of up to [`PlacedSide::cap`] rows
@@ -2430,6 +2987,9 @@ impl<'a, S: Stores + ?Sized> BatchWalk<'a, S> {
                 ),
             ));
         }
+        if self.p.side.tier.as_ref().is_some_and(TierSide::any) {
+            return Err(GpuError::shape(WHAT, PROMPT_BESIDE_TIER));
+        }
         Ok(Overlap {
             units: 1,
             cols: m,
@@ -2492,6 +3052,9 @@ impl<'a, S: Stores + ?Sized> LayerProgram for BatchWalk<'a, S> {
     /// wide arm's front past [`GEMV_COLS`] rows), the download of the unit's
     /// rows, weights and ids, and the places.
     fn front(&mut self, port: &mut BatchLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
+        if self.p.side.tier.as_ref().is_some_and(TierSide::any) {
+            return Err(GpuError::shape(WHAT, PROMPT_BESIDE_TIER));
+        }
         let l = at.layer;
         self.p.mixer(l)?;
         let p = &mut self.p;

@@ -28,14 +28,15 @@ use std::ffi::{OsStr, OsString};
 use std::fmt::{self, Write as _};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 mod registry;
 use registry::REGISTRY;
 pub use registry::{
-    CARD_BUDGET, CARD_DONTNEED, CED, CHECK_FINITE, DRAFT, ENGRAM_HELPER, FORCE_IDS, GEN_SLOTS,
-    GEN_SLOTS_MAX, HOST_LANES, HOST_LANES_DEFAULT, HOST_LOCK, HOST_POPULATE, HOST_ROOM, HOSTSTREAM,
-    LANE_PREFETCH, LANE_PREFETCH_DEFAULT, MTP_DRAFT, MTP_HEAD_ROWS, MTP_WIDTH, MTP_WINDOWS,
-    NEED_HOOK, NVTIER_BYTES, NVTIER_EVICT, NVTIER_MEM, NVTIER_READ, PIN_MAIN, PREFILL,
+    CARD_BUDGET, CARD_DONTNEED, CARD_MARGIN, CED, CHECK_FINITE, DRAFT, ENGRAM_HELPER, FORCE_IDS,
+    GEN_SLOTS, GEN_SLOTS_MAX, HOST_LANES, HOST_LANES_DEFAULT, HOST_LOCK, HOST_POPULATE, HOST_ROOM,
+    HOSTSTREAM, LANE_PREFETCH, LANE_PREFETCH_DEFAULT, MTP_DRAFT, MTP_HEAD_ROWS, MTP_WIDTH,
+    MTP_WINDOWS, NEED_HOOK, NVTIER_BYTES, NVTIER_EVICT, NVTIER_MEM, NVTIER_READ, PIN_MAIN, PREFILL,
     PREFILL_GROUP, PREFILL_GROUP_DEFAULT, PREFILL_GROUP_MAX, QWEN3_KV, QWEN38_EXPERTS, R8,
     RESIDENCY, ROUTE_TRACE, SCREEN, SPIN, STEP_STATS, THREADS, TIER_LINK, TIER_NODES, TP_NODES,
     WARM_PROFILE,
@@ -97,6 +98,10 @@ pub(crate) enum Kind {
     Multiple { of: u64 },
     /// A byte count ([`parse_bytes`]).
     Bytes,
+    /// A [`CardBudget`] ([`card_budget_value`]): one byte count, or
+    /// `CUDA<N>=<bytes>` per card, comma-separated, or `CUDA<N>=<n>x` shares
+    /// per card.
+    CardBytes,
     /// A non-empty path.
     Path,
     /// One of these words, or else a non-empty path: a word is never read
@@ -181,6 +186,9 @@ impl Kind {
                 BytesError::NotBytes(_) => refused(None),
                 BytesError::Overflow(_) => refused(Some(e.reason())),
             }),
+            Kind::CardBytes => card_budget_value(v)
+                .map(Value::CardBudget)
+                .map_err(|why| refused(why.as_deref())),
             Kind::Path if !v.is_empty() => Ok(Value::Path(PathBuf::from(v))),
             Kind::PathOr(words) => match words.iter().find(|&&w| w == v) {
                 Some(&w) => Ok(Value::Word(w)),
@@ -263,6 +271,11 @@ impl Kind {
             Kind::Bytes => {
                 "bytes, or a whole number of MiB or GiB with an M or G suffix".to_string()
             }
+            Kind::CardBytes => format!(
+                "bytes for every card, or CUDA<N>=<bytes> for each card named, comma-separated, \
+                 each card once (N its CUDA ordinal, {DIGITS}; bytes a count, or a whole number \
+                 of MiB or GiB with an M or G suffix)"
+            ),
             Kind::Path => "a non-empty path".to_string(),
             Kind::PathOr(words) => format!("{}, or a non-empty path", words.join(", ")),
             Kind::File => "the path of an existing regular file".to_string(),
@@ -330,6 +343,154 @@ pub fn residency_word(v: &str) -> Option<ResidencyWord> {
     }
 }
 
+/// What [`CARD_BUDGET`] asks a plan's cards for: a card plans with
+/// `min(usable, budget)` usable bytes, or with the bytes that give it a share
+/// of the experts the cards hold. The placement applies it per card
+/// (`placement::card_budget`); this crate owns its spelling
+/// ([`card_budget_value`]). [`CARD_MARGIN`] reads the same spelling for the
+/// bytes a card keeps free.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum CardBudget {
+    /// Unset: each card plans with its own usable bytes.
+    #[default]
+    Unset,
+    /// One budget every card of the plan takes.
+    Every(u64),
+    /// A budget per card, by this process's CUDA ordinal (the `CUDA<N>`
+    /// `--list-devices` prints), in the order given, each ordinal once; a
+    /// card the list does not name plans with its own usable bytes.
+    Per(Vec<(u32, u64)>),
+    /// A share per card, by CUDA ordinal as [`CardBudget::Per`] names them,
+    /// each ordinal once and at least one share above 0: the plan turns the
+    /// shares into a budget per card from its own expert bytes
+    /// (`placement::card_budget::split`), so the cards hold experts in this
+    /// proportion. The shares are whole numbers of parts, `CUDA0=3x,CUDA1=1x`.
+    Shares(Vec<(u32, u64)>),
+}
+
+impl CardBudget {
+    /// Whether a budget is set, one, per card or by shares.
+    #[must_use]
+    pub fn is_set(&self) -> bool {
+        *self != CardBudget::Unset
+    }
+
+    /// The one budget every card takes; `None` unset, per card or by shares.
+    #[must_use]
+    pub fn every(&self) -> Option<u64> {
+        match self {
+            CardBudget::Every(b) => Some(*b),
+            CardBudget::Unset | CardBudget::Per(_) | CardBudget::Shares(_) => None,
+        }
+    }
+
+    /// The `(ordinal, value)` entries of a per-card list, bytes or shares; `None` for
+    /// unset and one value for every card.
+    #[must_use]
+    pub fn listed(&self) -> Option<&[(u32, u64)]> {
+        match self {
+            CardBudget::Per(list) | CardBudget::Shares(list) => Some(list),
+            CardBudget::Unset | CardBudget::Every(_) => None,
+        }
+    }
+}
+
+/// A plan's one budget, or none: what a caller that sizes every card alike
+/// hands over.
+impl From<Option<u64>> for CardBudget {
+    fn from(bytes: Option<u64>) -> CardBudget {
+        bytes.map_or(CardBudget::Unset, CardBudget::Every)
+    }
+}
+
+/// The value as the lever spells it (`none` unset): what a record prints.
+impl fmt::Display for CardBudget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CardBudget::Unset => write!(f, "none"),
+            CardBudget::Every(b) => write!(f, "{b}"),
+            CardBudget::Per(per) => {
+                for (i, (o, b)) in per.iter().enumerate() {
+                    let sep = if i == 0 { "" } else { "," };
+                    write!(f, "{sep}CUDA{o}={b}")?;
+                }
+                Ok(())
+            }
+            CardBudget::Shares(shares) => {
+                for (i, (o, w)) in shares.iter().enumerate() {
+                    let sep = if i == 0 { "" } else { "," };
+                    write!(f, "{sep}CUDA{o}={w}x")?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// `v` in [`CARD_BUDGET`]'s grammar, the one owner of it: one byte count
+/// ([`parse_bytes`]) for every card, or `CUDA<N>=<bytes>` entries separated
+/// by `,`, `CUDA` in any ASCII case and `N` a whole number with no sign or
+/// leading zero, each ordinal once; or the same entries as shares,
+/// `CUDA<N>=<n>x` with `n` a whole number, every entry of a list one kind and
+/// one share above 0 at least. A refusal's reason names the entry where the
+/// grammar alone does not say why; `None` where it does.
+pub fn card_budget_value(v: &str) -> Result<CardBudget, Option<String>> {
+    if !v.contains('=') {
+        return match parse_bytes(v) {
+            Ok(b) => Ok(CardBudget::Every(b)),
+            Err(e @ BytesError::Overflow(_)) => Err(Some(e.reason().to_string())),
+            Err(BytesError::NotBytes(_)) => Err(None),
+        };
+    }
+    let mut per: Vec<(u32, u64)> = Vec::new();
+    let mut shared: Option<bool> = None;
+    for entry in v.split(',') {
+        let (card, bytes) = entry
+            .split_once('=')
+            .ok_or_else(|| Some(format!("{entry:?} is no CUDA<N>=<bytes> entry")))?;
+        let ordinal = card
+            .get(..4)
+            .filter(|p| p.eq_ignore_ascii_case("cuda"))
+            .and_then(|_| whole(&card[4..]).ok())
+            .and_then(|n| u32::try_from(n).ok())
+            .ok_or_else(|| Some(format!("{card:?} names no device as CUDA<N>")))?;
+        let share = bytes.ends_with(['x', 'X']);
+        if *shared.get_or_insert(share) != share {
+            return Err(Some(format!(
+                "CUDA{ordinal}: a list is all bytes or all shares (`<n>x`), not both"
+            )));
+        }
+        let n = if share {
+            let parts = &bytes[..bytes.len() - 1];
+            whole(parts).map_err(|e| match e {
+                NotWhole::Syntax => Some(format!(
+                    "{bytes:?} for CUDA{ordinal} is no share (a whole number, then x)"
+                )),
+                NotWhole::Overflow => Some(format!("CUDA{ordinal}: {OVERFLOW}")),
+            })?
+        } else {
+            parse_bytes(bytes).map_err(|e| match e {
+                BytesError::NotBytes(_) => Some(format!("{bytes:?} for CUDA{ordinal} is no bytes")),
+                BytesError::Overflow(_) => Some(format!("CUDA{ordinal}: {}", e.reason())),
+            })?
+        };
+        if per.iter().any(|&(o, _)| o == ordinal) {
+            return Err(Some(format!("CUDA{ordinal} is given twice")));
+        }
+        per.push((ordinal, n));
+    }
+    if shared != Some(true) {
+        return Ok(CardBudget::Per(per));
+    }
+    match per.iter().try_fold(0u64, |sum, &(_, w)| sum.checked_add(w)) {
+        None => Err(Some(format!("the shares sum to {OVERFLOW}"))),
+        Some(0) => Err(Some(
+            "every share is 0: a split needs one above 0".to_string(),
+        )),
+        Some(_) => Ok(CardBudget::Shares(per)),
+    }
+}
+
 /// A set `BLOOMERY_MTP_HEAD_ROWS`: the head the MTP draft scores with.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MtpHead<'a> {
@@ -350,6 +511,8 @@ pub(crate) enum Value {
     Count(u64),
     /// A [`Kind::Bytes`] count.
     Bytes(u64),
+    /// A [`Kind::CardBytes`] budget, never [`CardBudget::Unset`].
+    CardBudget(CardBudget),
     /// A [`Kind::Path`], [`Kind::PathOr`], [`Kind::File`] or [`Kind::Program`] path.
     Path(PathBuf),
     /// A [`Kind::FileAt`] path and offset.
@@ -544,6 +707,9 @@ pub(crate) enum Why {
     NotActedOn(String),
     /// A `BLOOMERY_*` name no row names, and the row name nearest to it.
     Unknown(&'static str),
+    /// A value handed over in place of the environment's ([`override_with`])
+    /// that no override can carry: what stops it.
+    Override(&'static str),
 }
 
 /// One variable a reading refused: its name, its value as set (lossily, when
@@ -569,6 +735,7 @@ impl fmt::Display for Refusal {
                 "no row of the lever registry names it (the nearest is {nearest}); unset it or \
                  fix the name"
             ),
+            Why::Override(why) => write!(f, "{why}"),
         }
     }
 }
@@ -679,6 +846,11 @@ pub(crate) enum Scope<'a> {
     /// The expert tiers' nodes ([`tier_nodes`]), read where a load takes its
     /// tier cards, below every binary's `main`.
     TierNodes,
+    /// The cards' budget ([`card_budget`]), read where a placement meets the
+    /// census, below every binary's `main`, which still refuses it in a
+    /// binary that does not act on it; and the cards' margin
+    /// ([`card_margin`]), read there too.
+    CardBudget,
 }
 
 /// The levers of `scope` over `env`, every name once — the last of a name
@@ -706,6 +878,7 @@ pub(crate) fn read(env: &[(OsString, OsString)], scope: Scope<'_>) -> Result<Lev
     let link = |name: &str| name == TIER_LINK;
     let nodes = |name: &str| name == TIER_NODES;
     let hook = |name: &str| name == NEED_HOOK;
+    let margin = |name: &str| name == CARD_MARGIN;
     let mut entries = Vec::new();
     let mut refused = Vec::new();
     for row in REGISTRY {
@@ -718,6 +891,7 @@ pub(crate) fn read(env: &[(OsString, OsString)], scope: Scope<'_>) -> Result<Lev
                             || link(row.name)
                             || nodes(row.name)
                             || hook(row.name)
+                            || margin(row.name)
                             || acts_on.contains(&row.name)
                     }
                     Scope::Every => true,
@@ -731,6 +905,8 @@ pub(crate) fn read(env: &[(OsString, OsString)], scope: Scope<'_>) -> Result<Lev
                     Scope::TierLink => continue,
                     Scope::TierNodes if nodes(row.name) || link(row.name) => true,
                     Scope::TierNodes => continue,
+                    Scope::CardBudget if row.name == CARD_BUDGET || margin(row.name) => true,
+                    Scope::CardBudget => continue,
                 };
                 match (get(row.name), scope) {
                     (Some(v), Scope::Main { bin, .. }) if !acts => refused.push(Refusal {
@@ -867,7 +1043,7 @@ impl Levers {
     /// (or one that is not UTF-8), and when a retired name is set. A binary
     /// reads with [`at_main`] instead.
     pub fn from_env() -> Result<Levers, LeverError> {
-        let env: Vec<(OsString, OsString)> = std::env::vars_os().collect();
+        let env = process_env();
         read(&env, Scope::Every)
     }
 
@@ -963,13 +1139,25 @@ impl Levers {
         self.flag(STEP_STATS)
     }
 
-    /// `BLOOMERY_CARD_BUDGET`: a card budget in bytes; `None` unset.
+    /// `BLOOMERY_CARD_BUDGET`: the cards' budget, one or per card;
+    /// [`CardBudget::Unset`] unset.
     #[must_use]
-    pub fn card_budget_bytes(&self) -> Option<u64> {
-        match self.entry(CARD_BUDGET).value {
-            None => None,
-            Some(Value::Bytes(b)) => Some(b),
-            ref v => panic!("{CARD_BUDGET} holds {v:?}, not bytes"),
+    pub fn card_budget(&self) -> CardBudget {
+        match &self.entry(CARD_BUDGET).value {
+            None => CardBudget::Unset,
+            Some(Value::CardBudget(b)) => b.clone(),
+            v => panic!("{CARD_BUDGET} holds {v:?}, not a card budget"),
+        }
+    }
+
+    /// `BLOOMERY_CARD_MARGIN`: the bytes each card keeps free, one value or
+    /// one per card; [`CardBudget::Unset`] unset, each card's own margin.
+    #[must_use]
+    pub fn card_margin(&self) -> CardBudget {
+        match &self.entry(CARD_MARGIN).value {
+            None => CardBudget::Unset,
+            Some(Value::CardBudget(b)) => b.clone(),
+            v => panic!("{CARD_MARGIN} holds {v:?}, not a card byte list"),
         }
     }
 
@@ -2574,6 +2762,147 @@ pub enum HostLanes {
     Ccd,
 }
 
+/// What an override cannot carry: a name read from the environment alone in
+/// some file, which a value handed over would never reach.
+const NO_OVERRIDE: &str = "a flag cannot set it: a reader of it takes its value from the \
+                           environment only; set it in the environment";
+
+/// What a second hand-over meets.
+const OVERRIDE_ONCE: &str = "the process's overrides were handed over once already; a front \
+                             hands them all in one call";
+
+/// The Direct levers whose in-place reader asks [`override_of`] before the
+/// environment, so an override reaches it. A Direct lever not listed is
+/// refused as an override.
+const READ_WITH_OVERRIDE: &[&str] = &["BLOOMERY_DSPARK_CARD"];
+
+/// The overrides a front handed over ([`override_with`]), in the order given.
+static OVERRIDES: OnceLock<Vec<(&'static str, String)>> = OnceLock::new();
+
+/// `env` with `overrides` after it: a reading takes the last of a name given
+/// twice, so an override replaces the environment's value.
+fn merged(
+    mut env: Vec<(OsString, OsString)>,
+    overrides: &[(&'static str, String)],
+) -> Vec<(OsString, OsString)> {
+    env.extend(
+        overrides
+            .iter()
+            .map(|(name, value)| (OsString::from(name), OsString::from(value))),
+    );
+    env
+}
+
+/// The environment a reading parses: the process's, with the overrides
+/// ([`override_with`]) over it.
+fn process_env() -> Vec<(OsString, OsString)> {
+    merged(
+        std::env::vars_os().collect(),
+        OVERRIDES.get().map_or(&[][..], Vec::as_slice),
+    )
+}
+
+/// The override handed over for `name`, for the in-place reader of a Direct
+/// lever to take before it reads the environment; `None` where there is none.
+/// Only the names of [`override_with`]'s Direct list have one.
+#[must_use]
+pub fn override_of(name: &str) -> Option<&'static str> {
+    OVERRIDES
+        .get()?
+        .iter()
+        .rev()
+        .find(|(k, _)| *k == name)
+        .map(|(_, v)| v.as_str())
+}
+
+/// The checked overrides, each row's name with its value, and the notes for
+/// the environment values they replace.
+type Overrides = (Vec<(&'static str, String)>, Vec<String>);
+
+/// `pairs` as overrides of the environment's values, checked: each name a
+/// row the override reaches, each value one its kind takes, every refusal at
+/// once; and the notes for the environment values it replaces.
+fn checked_overrides(
+    pairs: &[(&str, String)],
+    env: &[(OsString, OsString)],
+) -> Result<Overrides, LeverError> {
+    let mut set = Vec::new();
+    let mut refused = Vec::new();
+    for (name, value) in pairs {
+        let refuse = |why: Why| Refusal {
+            name: (*name).to_string(),
+            value: value.clone(),
+            why,
+        };
+        let Some(row) = spec(name) else {
+            refused.push(refuse(Why::Unknown(nearest(name))));
+            continue;
+        };
+        let taken = match row.site {
+            Site::Retired { why, .. } => Err(Why::Retired(why)),
+            Site::Parsed { left: [], .. } => row.kind.parse(value).map(drop).map_err(Why::Value),
+            Site::Direct { .. } if READ_WITH_OVERRIDE.contains(&row.name) => {
+                if row.kind == Kind::Text {
+                    Ok(())
+                } else {
+                    row.kind.parse(value).map(drop).map_err(Why::Value)
+                }
+            }
+            _ => Err(Why::Override(NO_OVERRIDE)),
+        };
+        match taken {
+            Ok(()) => set.push((row.name, value.clone())),
+            Err(why) => refused.push(refuse(why)),
+        }
+    }
+    if !refused.is_empty() {
+        return Err(LeverError { refused });
+    }
+    let notes = set
+        .iter()
+        .filter_map(|(name, value)| {
+            let name: &str = name;
+            let old = env.iter().rev().find(|(k, _)| k == name)?.1.as_os_str();
+            (old != OsStr::new(value)).then(|| {
+                format!(
+                    "{name}: the environment's value {:?} is replaced by {value:?}",
+                    lossy(old)
+                )
+            })
+        })
+        .collect();
+    Ok((set, notes))
+}
+
+/// Values a front hands over in place of the environment's, once, before any
+/// reading ([`at_main`] and the others, [`override_of`]): what a command-line
+/// flag sets, which replaces what the environment holds. Each name must be a
+/// row an override reaches: a Parsed lever no file reads in place, or a Direct
+/// lever whose reader asks [`override_of`]; each value one its kind takes
+/// (a Text lever's is its owner's to check). Refused, with every refusal at
+/// once: a name no row names, a retired name, a name an override cannot
+/// reach, a value its kind refuses, and a second call that hands over any.
+/// The lines to print are the environment values replaced. The process
+/// environment is read, never written.
+pub fn override_with(pairs: &[(&str, String)]) -> Result<Vec<String>, LeverError> {
+    let env: Vec<(OsString, OsString)> = std::env::vars_os().collect();
+    let (set, notes) = checked_overrides(pairs, &env)?;
+    if set.is_empty() {
+        return Ok(notes);
+    }
+    OVERRIDES.set(set).map_err(|set| LeverError {
+        refused: set
+            .iter()
+            .map(|(name, value)| Refusal {
+                name: (*name).to_string(),
+                value: value.clone(),
+                why: Why::Override(OVERRIDE_ONCE),
+            })
+            .collect(),
+    })?;
+    Ok(notes)
+}
+
 /// A binary's one reading of the levers, first thing in `main`. `acts_on`
 /// names the Parsed levers its run acts on — the pool's two, [`THREADS`] and
 /// [`SPIN`], it always does — and a binary whose child inherits its
@@ -2581,9 +2910,10 @@ pub enum HostLanes {
 /// Parsed lever set to a value its kind does not take, or set when `acts_on`
 /// leaves it out; a retired name that is set; a `BLOOMERY_*` name no row
 /// names. A name in `acts_on` that is not a Parsed lever panics by name — a
-/// caller's mistake. With `--levers` among the process's arguments it prints
-/// the reading's table — `-` for a lever the binary does not act on — on
-/// stdout and exits 0 instead.
+/// caller's mistake. The environment it reads is the process's with the
+/// values of [`override_with`] over it. With `--levers` among the process's
+/// arguments it prints the reading's table — `-` for a lever the binary does
+/// not act on — on stdout and exits 0 instead.
 pub fn at_main(acts_on: &[&str]) -> Result<Levers, LeverError> {
     at_main_with_flags(acts_on, |name| {
         std::env::args_os().skip(1).any(|a| a == name)
@@ -2602,7 +2932,7 @@ pub fn at_main_with_flags(
         .map(Path::new)
         .and_then(Path::file_name)
         .map_or_else(|| "unnamed".to_string(), lossy);
-    let env: Vec<(OsString, OsString)> = std::env::vars_os().collect();
+    let env = process_env();
     let levers = read(&env, Scope::Main { bin: &bin, acts_on })?;
     if has_flag("--levers") {
         print!("{}", levers.table());
@@ -2627,7 +2957,7 @@ pub struct PoolLevers {
 /// when a retired name is set. Nothing else: which levers a binary acts on,
 /// and which names it knows, is its `main`'s reading.
 pub fn pool_levers() -> Result<PoolLevers, LeverError> {
-    let env: Vec<(OsString, OsString)> = std::env::vars_os().collect();
+    let env = process_env();
     let levers = read(&env, Scope::Pool)?;
     Ok(PoolLevers {
         threads: levers.threads(),
@@ -2700,7 +3030,7 @@ impl NvTierMem {
 /// does not take and when a retired name is set. Nothing else: which levers
 /// a binary acts on, and which names it knows, is its `main`'s reading.
 pub fn nvtier_levers() -> Result<NvTierLevers, LeverError> {
-    let env: Vec<(OsString, OsString)> = std::env::vars_os().collect();
+    let env = process_env();
     let levers = read(&env, Scope::NvTier)?;
     let bytes_of = |name: &str| match &levers.entry(name).value {
         None => None,
@@ -2744,7 +3074,7 @@ pub struct NeedLevers {
 /// its `main`'s reading, which refuses `HOST_LOCK` in a binary that does not
 /// act on it, so the flag here is false there.
 pub fn need_levers() -> Result<NeedLevers, LeverError> {
-    let env: Vec<(OsString, OsString)> = std::env::vars_os().collect();
+    let env = process_env();
     let levers = read(&env, Scope::Need)?;
     let hook = levers.path(NEED_HOOK).map(Path::to_path_buf);
     Ok(NeedLevers {
@@ -2769,7 +3099,7 @@ pub enum TierLink {
 /// parses it, and refused when it is set to a value its kind does not take
 /// and when a retired name is set. Nothing else.
 pub fn tier_link() -> Result<TierLink, LeverError> {
-    let env: Vec<(OsString, OsString)> = std::env::vars_os().collect();
+    let env = process_env();
     let levers = read(&env, Scope::TierLink)?;
     match &levers.entry(TIER_LINK).value {
         None | Some(Value::Word("shared")) => Ok(TierLink::Shared),
@@ -2794,13 +3124,31 @@ pub fn tier_ip(ip: std::net::IpAddr) -> bool {
 /// kind does not take and when a retired name is set: the address of each
 /// expert tier's node, in tier order; empty when unset. An off-host node requires RDMA.
 pub fn tier_nodes() -> Result<Vec<SocketAddr>, LeverError> {
-    let env: Vec<(OsString, OsString)> = std::env::vars_os().collect();
+    let env = process_env();
     let levers = read(&env, Scope::TierNodes)?;
     match &levers.entry(TIER_NODES).value {
         None => Ok(Vec::new()),
         Some(Value::Addrs(a)) => Ok(a.clone()),
         v => panic!("{TIER_NODES} holds {v:?}, not socket addresses"),
     }
+}
+
+/// `BLOOMERY_CARD_BUDGET` from the process environment ([`CARD_BUDGET`]),
+/// parsed as [`at_main`] parses it, and refused when it is set to a value its
+/// kind does not take and when a retired name is set: read where a placement
+/// is resolved against the census, which the ordinals of a per-card list are
+/// checked against. Nothing else.
+pub fn card_budget() -> Result<CardBudget, LeverError> {
+    let env = process_env();
+    Ok(read(&env, Scope::CardBudget)?.card_budget())
+}
+
+/// `BLOOMERY_CARD_MARGIN` from the process environment ([`CARD_MARGIN`]), read
+/// as [`card_budget`] reads its lever, where a placement is resolved against
+/// the census: the bytes each card keeps free, [`CardBudget::Unset`] unset.
+pub fn card_margin() -> Result<CardBudget, LeverError> {
+    let env = process_env();
+    Ok(read(&env, Scope::CardBudget)?.card_margin())
 }
 
 /// The registry as a Markdown table — name, class, what it takes, what unset

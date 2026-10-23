@@ -1,6 +1,7 @@
 //! GPU kernel gate for package P4 (docs/gpu-design.md work package): the
 //! element-wise and reduction kernels of `bloomery_gpu::elem` — embedding row
-//! dequant, rms_norm, rope, swiglu, residual add, routed-expert weighted sum,
+//! dequant, rms_norm, rope, swiglu, the logit softcap (`softcap_rows`),
+//! residual add, routed-expert weighted sum,
 //! argmax. Two layers per op (the package's gate rule):
 //! - **Asserted**: device output vs a host scalar reference computed in this
 //!   binary from the SAME input, f64 where a sum is involved, mirroring the
@@ -399,6 +400,94 @@ fn run() -> Result<(), GateError> {
                 }
             }
         }
+    }
+
+    // ============================================================= softcap
+    // `y = cap·tanh(y/cap)` in place, the head's epilogue: no oracle row
+    // (the reference fuses it into the head dump), so synthetic logits at
+    // the head's own cap (20) and one smaller (7), values planted across
+    // tanh's range and past its saturation, plus the NaN and ±inf a
+    // poisoned logit row can hold.
+    {
+        let mut case = 0u32;
+        for (cap, name) in [(20.0f32, "head"), (7.0, "small")] {
+            for n in [1024usize, 65536] {
+                case += 1;
+                // Small logits, ±cap (tanh saturates to ±1), values past ±cap
+                // and one NaN, one +inf, one -inf in every case.
+                let mut x = activations(n, 1, 8000 + case * 17);
+                x[0] = f32::NAN;
+                x[1] = f32::INFINITY;
+                x[2] = f32::NEG_INFINITY;
+                for &i in &[3usize, 4, 5] {
+                    x[i] = cap * 1e3 * (i as f32 - 4.0);
+                }
+                let mut y_dev = DeviceBuffer::from_host(stream, &x)?;
+                elem.enqueue_softcap_rows(stream, &mut y_dev, n, cap)?;
+                stream.synchronize()?;
+                let y = y_dev.to_host_vec(stream)?;
+                // In place: the rerun starts again from `x`.
+                y_dev = DeviceBuffer::from_host(stream, &x)?;
+                elem.enqueue_softcap_rows(stream, &mut y_dev, n, cap)?;
+                stream.synchronize()?;
+                let rerun = bits_equal(&y, &y_dev.to_host_vec(stream)?);
+
+                let y_ref: Vec<f32> = x.iter().map(|&v| (v / cap).tanh() * cap).collect();
+                // `max_rel_err` refuses a non-finite side, so the band runs
+                // on the finite tail past the six planted values.
+                let rel = max_rel_err(&y[6..], &y_ref[6..])?;
+                // The device tanh is libdevice's and the host's differs by
+                // ulps (crate::gelu's note), so a band, not bits; the planted
+                // NaN and the two infs are exact: tanh's own values.
+                let nan_nan = y[0].is_nan();
+                let inf_cap = y[1] == cap && y[2] == -cap;
+                let pass = rel <= PLAIN_BAND && rerun && nan_nan && inf_cap;
+                println!(
+                    "shape op=softcap cap={name}({cap}) n={n} max_rel_err={rel:.3e} \
+                     bit_identical_rerun={rerun} nan_stays_nan={nan_nan} inf_is_pm_cap={inf_cap} \
+                     ik_rel=n/a (fused into the head in the reference) {}",
+                    verdict(pass)
+                );
+                if !pass {
+                    ok = false;
+                }
+            }
+        }
+        // Refusals by name: a zero and a non-finite cap, a zero n, a short y.
+        for (cap, why) in [
+            (0.0f32, "cap_zero"),
+            (f32::NAN, "cap_nan"),
+            (f32::INFINITY, "cap_inf"),
+        ] {
+            let mut y_dev = DeviceBuffer::zeroed(stream, 8)?;
+            let refused = elem
+                .enqueue_softcap_rows(stream, &mut y_dev, 8, cap)
+                .is_err();
+            println!(
+                "refusal op=softcap {why} refused={refused} {}",
+                verdict(refused)
+            );
+            if !refused {
+                ok = false;
+            }
+        }
+        let mut y_dev = DeviceBuffer::zeroed(stream, 8)?;
+        let refused = elem
+            .enqueue_softcap_rows(stream, &mut y_dev, 0, 20.0)
+            .is_err();
+        println!(
+            "refusal op=softcap n_zero refused={refused} {}",
+            verdict(refused)
+        );
+        ok &= refused;
+        let refused = elem
+            .enqueue_softcap_rows(stream, &mut y_dev, 9, 20.0)
+            .is_err();
+        println!(
+            "refusal op=softcap y_short refused={refused} {}",
+            verdict(refused)
+        );
+        ok &= refused;
     }
 
     // =============================================================== add
