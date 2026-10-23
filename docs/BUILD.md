@@ -11,7 +11,7 @@ The `just` recipes and `tools/box.sh` are the maintainers' tooling for one remot
 | Rust | `nightly-2026-08-28`, with `rust-src`, `rustc-dev`, `llvm-tools`, `clippy`, `rustfmt` | `rust-toolchain.toml` |
 | cuda-oxide (`cuda-device`, `cuda-host`) | declared rev `1691162ab9204ef21b0329c2e8059815420dfd5a` (upstream: NVIDIA/cuda-rust), source rev `87bc951864b79f723b4da9c11fa229f5600aefcb` | `[workspace.dependencies]` in `Cargo.toml` (NVIDIA/cuda-rust), source from the `[patch]` fork `midagedev/cuda-oxide` at that rev (the declared rev plus the patches `THIRD_PARTY_NOTICES.md` lists); `just deny` fails if either floats |
 | `cargo-oxide` | 0.2.1, from the same fork and rev | the install command below; `cargo oxide doctor` must pass |
-| LLVM | 21 (`llc` with the NVPTX target); the development machine uses 21.1.8 from the LLVM release tarball | on `PATH`, or `CUDA_OXIDE_LLC` |
+| LLVM | 21 (`llc` with the NVPTX target); the development machine uses 21.1.8 from the LLVM release tarball | select explicitly with `CUDA_OXIDE_LLC`; a higher-priority Rust sysroot tool can override `PATH` |
 | Clang | 21 with its resource headers (`clang-21` or `libclang-common-21-dev` on Ubuntu), for bindgen | on `PATH` |
 | CUDA toolkit | 13.3, with the cuRAND headers (`libcurand-dev` on Ubuntu) | `CUDA_TOOLKIT_PATH` |
 | NVIDIA driver | 615.71.09 on the development machine | — |
@@ -36,10 +36,23 @@ An environment like this one works on the development machine. Adjust the paths 
 ```sh
 export PATH=$HOME/.cargo/bin:$HOME/opt/LLVM-21.1.8-Linux-X64/bin:/usr/local/cuda-13.3/bin:$PATH
 export CUDA_TOOLKIT_PATH=/usr/local/cuda-13.3
+export CUDA_OXIDE_LLC=$HOME/opt/LLVM-21.1.8-Linux-X64/bin/llc
 cargo oxide doctor
 ```
 
-cuda-oxide's README says the pipeline prefers the `llc` of the Rust toolchain, then `llc-23`, `llc-22` and `llc-21` on `PATH`; `CUDA_OXIDE_LLC=/path/to/llc` pins one. Which `llc` the development machine's builds pick is set in its environment file, which is not in this repository.
+The pipeline selects an explicit `CUDA_OXIDE_LLC` first, then the Rust toolchain's `llc`, then `llc-23`,
+`llc-22` and `llc-21` on `PATH`. The pinned Rust nightly includes LLVM 23, so putting LLVM 21 on `PATH`
+alone does not select the supported compiler. Pin the actual LLVM 21 executable as above and read the
+`llc (LLVM)` path/version from `cargo oxide doctor`.
+
+The current backend pin does not enforce this major during a build. The actual-owner enforcement change is
+[cuda-oxide #2](https://github.com/midagedev/cuda-oxide/pull/2): an optional
+`CUDA_OXIDE_REQUIRED_LLC_MAJOR=21` policy reports the selected path/version without verbose mode and refuses
+another major or an invalid explicit override before LLVM optimization and PTX emission, not before Cargo
+host compilation. It was verified by actual LLVM 21/23 device builds and a host-only build; no GPU was run.
+Do not enable that setting against the current pin, which ignores it. Land the fork change, tag the old pin,
+install the matching backend and update the dependency pins, lockfile, notices and project configuration together.
+Until that cutover, the explicit selection and doctor check remain required; see the [toolchain ledger](upstream/nvlabs-ledger.md), row 50.
 
 ## The CPU flag
 
