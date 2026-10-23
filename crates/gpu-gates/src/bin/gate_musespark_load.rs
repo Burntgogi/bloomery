@@ -113,6 +113,7 @@ mod gate {
                 .set_aside_bytes()
                 .ok_or("the card's set-aside is unbounded")?
             + card.margin_bytes
+            + inputs.prompt_reserve
             + c.expert_bytes / 2;
         Ok(PlanLevers {
             card_budget_bytes: Some(kept).into(),
