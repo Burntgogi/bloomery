@@ -4,7 +4,8 @@
 //! `loopcontrols` extension, `tojson` as `json.dumps` with its `ensure_ascii`,
 //! `indent`, `separators` and `sort_keys`), with the lexer's newline rules
 //! (`\r\n` and `\r` read as `\n`, one trailing newline dropped), and `-`
-//! whitespace control, `set` (plain and `ns.attr`), `namespace(...)` (a
+//! whitespace control, `set` (plain and `ns.attr`, expressions or block captures;
+//! capture-local assignments stay inside the body), `namespace(...)` (a
 //! mapping or pairs, then keywords), `for` with tuple unpacking, an `if`
 //! filter and `loop.*`, `break`/`continue`, `if`/`elif`/`else`, `macro`
 //! outside any `for` and macro (called by name with positional and keyword
@@ -19,14 +20,16 @@
 //! `.items()`/`.keys()`/`.values()`/`.get()`/`.strip()`/`.lstrip()`/
 //! `.rstrip()`/`.split()`/`.startswith()`/`.endswith()` with Python's
 //! arguments, filters `tojson`/`from_json`/`length`/`count`/`trim`/`string`/
-//! `lower`/`upper`/`capitalize`/`default`/`items`/`safe`, tests `defined`/`undefined`/`none`/`true`/
+//! `lower`/`upper`/`capitalize`/`default`/`items`/`safe`/`replace` (Python string
+//! conversion, optional integer count, positional or keyword arguments), tests `defined`/`undefined`/`none`/`true`/
 //! `false`/`boolean`/`string`/`number`/`mapping`/`sequence`/`iterable`, and
 //! `raise_exception`/`range`, and Hugging Face's `{% generation %}` block (it renders its body,
 //! in a scope of its own). Whitespace is Python's `str.isspace`, and
 //! `{{ value }}` is Python's `str()`: a list or dict as its `repr`, a float in
 //! `repr`'s shortest form. Anything else is a parse or render error, never
 //! silent output: an argument the callee does not take, a macro defined
-//! inside a `for` or a macro, a macro body that names `varargs`, `kwargs` or
+//! inside a `for`, a macro or a capture, filters on a block-set target,
+//! a macro body that names `varargs`, `kwargs` or
 //! `caller`, a macro used as a value, an undefined value, a namespace or a
 //! range inside a list or dict literal, `capitalize` on a first character
 //! whose title case is not its upper case, a `\N{...}` escape, a division by
@@ -36,6 +39,7 @@
 //! namespaces. Object keys keep the order they were parsed or built in, as a
 //! Python dict's (serde_json's `preserve_order`).
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -100,6 +104,7 @@ impl ChatTemplate {
             depth: 0,
             loops: 0,
             in_macro: false,
+            captures: 0,
         };
         let (body, end) = p.block(&[])?;
         if let Some(tag) = end {
@@ -319,13 +324,19 @@ enum Node {
     Set {
         name: String,
         attr: Option<String>,
-        value: Expr,
+        value: SetValue,
     },
     Macro(Arc<Macro>),
     /// `{% generation %}…{% endgeneration %}`: the body renders as itself, in a scope of its own.
     Generation(Vec<Node>),
     Break,
     Continue,
+}
+
+#[derive(Debug)]
+enum SetValue {
+    Expr(Expr),
+    Capture(Vec<Node>),
 }
 
 /// A `{% macro name(params) %}` definition.
@@ -400,6 +411,8 @@ struct NodeParser {
     loops: usize,
     /// Inside a macro body.
     in_macro: bool,
+    /// Capture bodies around the tag; macros there need lexical closures.
+    captures: usize,
 }
 
 impl NodeParser {
@@ -481,11 +494,36 @@ impl NodeParser {
                 let mut t = Lexer::new(rest)?;
                 let name = t.name()?;
                 let attr = if t.eat_op(".") { Some(t.name()?) } else { None };
-                if !t.eat_op("=") {
-                    return err(format!("block set is not supported: {src}"));
+                if attr.is_none()
+                    && matches!(
+                        name.as_str(),
+                        "true" | "false" | "none" | "True" | "False" | "None"
+                    )
+                {
+                    return err(format!("invalid set target {name}"));
                 }
-                let value = t.expr()?;
-                t.end(src)?;
+                let value = if t.eat_op("=") {
+                    let value = t.expr()?;
+                    t.end(src)?;
+                    SetValue::Expr(value)
+                } else {
+                    if t.eat_op("|") {
+                        return err(format!("filters on block set are not supported: {src}"));
+                    }
+                    t.end(src)?;
+                    self.captures += 1;
+                    let result = self.block(&["endset"]);
+                    self.captures -= 1;
+                    let (body, end) = result?;
+                    if end.is_some()
+                        && let Some(Seg::Stmt(end)) = self.segs.get(self.at.saturating_sub(1))
+                        && end.trim_matches(py_space) != "endset"
+                    {
+                        return err(format!("endset takes nothing: {{% {end} %}}"));
+                    }
+                    self.expect_end(end, "endset", src)?;
+                    SetValue::Capture(body)
+                };
                 Ok(Node::Set { name, attr, value })
             }
             "break" | "continue" => {
@@ -519,6 +557,11 @@ impl NodeParser {
 
     /// `{% macro name(a, b=default) %}…{% endmacro %}`.
     fn macro_def(&mut self, rest: &str, src: &str) -> Result<Node, TemplateError> {
+        if self.captures > 0 {
+            return err(format!(
+                "{{% {src} %}}: a macro inside a block set capture is not supported"
+            ));
+        }
         if self.loops > 0 || self.in_macro {
             return err(format!(
                 "{{% {src} %}}: a macro inside a for loop or a macro is not supported"
@@ -1050,6 +1093,9 @@ impl Lexer {
                 self.expect_op("=")?;
                 kwargs.push((k, self.expr()?));
             } else {
+                if !kwargs.is_empty() {
+                    return err("positional argument after keyword argument");
+                }
                 args.push(self.expr()?);
             }
             if self.eat_op(")") {
@@ -1715,7 +1761,21 @@ impl Renderer {
                 return self.nodes(els);
             }
             Node::Set { name, attr, value } => {
-                let v = self.eval(value)?;
+                let v = match value {
+                    SetValue::Expr(e) => self.eval(e)?,
+                    SetValue::Capture(body) => {
+                        let out = std::mem::take(&mut self.out);
+                        self.frames.push(HashMap::new());
+                        let result = self.nodes(body);
+                        self.frames.pop();
+                        let captured = std::mem::replace(&mut self.out, out);
+                        let flow = result?;
+                        if flow != Flow::Next {
+                            return Ok(flow);
+                        }
+                        V::J(Value::String(captured))
+                    }
+                };
                 match attr {
                     None => self.assign(name.clone(), v),
                     Some(a) => match (self.lookup(name), v) {
@@ -2312,21 +2372,7 @@ fn call_method(o: &V, method: &str, args: &[V], kwargs: &[(&str, V)]) -> Result<
             ))
         }
         (V::J(Value::String(s)), "split") => {
-            if args.len() > 2 {
-                return err("split() takes at most 2 arguments");
-            }
-            let mut given = [args.first(), args.get(1)];
-            for (k, a) in kwargs {
-                let i = match *k {
-                    "sep" => 0,
-                    "maxsplit" => 1,
-                    other => return err(format!("split() takes no argument {other}")),
-                };
-                if given[i].is_some() {
-                    return err(format!("split(): {k} given twice"));
-                }
-                given[i] = Some(a);
-            }
+            let given = bind_args("split()", ["sep", "maxsplit"], args, kwargs)?;
             V::J(Value::Array(
                 split(s, given[0], given[1])?
                     .into_iter()
@@ -2439,6 +2485,9 @@ fn filter(
     if name == "default" {
         return default_filter(v, args, kwargs);
     }
+    if name == "replace" {
+        return replace_filter(v, args, kwargs);
+    }
     if !args.is_empty() || !kwargs.is_empty() {
         return err(format!("|{name} takes no arguments"));
     }
@@ -2487,23 +2536,82 @@ fn filter(
     })
 }
 
+/// Bind positional and keyword arguments once, retaining references to the values.
+fn bind_args<'a, const N: usize>(
+    callee: &str,
+    names: [&str; N],
+    args: &'a [V],
+    kwargs: &'a [(&str, V)],
+) -> Result<[Option<&'a V>; N], TemplateError> {
+    if args.len() > N {
+        return err(format!("{callee} takes at most {N} arguments"));
+    }
+    let mut slots = std::array::from_fn(|i| args.get(i));
+    for (k, v) in kwargs {
+        let Some(i) = names.iter().position(|n| n == k) else {
+            return err(format!("{callee} takes no argument {k}"));
+        };
+        if slots[i].replace(v).is_some() {
+            return err(format!("{callee}: {k} given twice"));
+        }
+    }
+    Ok(slots)
+}
+
+/// `replace(old, new, count=None)` without autoescape: Python's `str()` on
+/// the input and both strings, then non-overlapping, character-safe replacement.
+fn replace_filter(v: V, args: &[V], kwargs: &[(&str, V)]) -> Result<V, TemplateError> {
+    let slots = bind_args("|replace", ["old", "new", "count"], args, kwargs)?;
+    let old = slots[0].ok_or_else(|| TemplateError("|replace requires old".into()))?;
+    let new = slots[1].ok_or_else(|| TemplateError("|replace requires new".into()))?;
+    let count = match slots[2] {
+        None | Some(V::J(Value::Null)) => usize::MAX,
+        Some(V::J(Value::Bool(b))) => usize::from(*b),
+        Some(V::J(Value::Number(n))) if n.is_i64() => {
+            usize::try_from(n.as_i64().expect("integer")).unwrap_or(usize::MAX)
+        }
+        Some(other) => {
+            return err(format!(
+                "|replace: count must be an integer or none, got {other:?}"
+            ));
+        }
+    };
+    let old = match old {
+        V::J(Value::String(s)) => Cow::Borrowed(s.as_str()),
+        other => Cow::Owned(to_str(other)?),
+    };
+    let new = match new {
+        V::J(Value::String(s)) => Cow::Borrowed(s.as_str()),
+        other => Cow::Owned(to_str(other)?),
+    };
+    let s = match v {
+        V::J(Value::String(s)) => s,
+        other => to_str(&other)?,
+    };
+    if count == 0 || old == new {
+        return Ok(V::J(Value::String(s)));
+    }
+    let mut matches = s.match_indices(old.as_ref()).take(count);
+    let Some((first, matched)) = matches.next() else {
+        return Ok(V::J(Value::String(s)));
+    };
+    let mut out = String::with_capacity(s.len());
+    out.push_str(&s[..first]);
+    out.push_str(new.as_ref());
+    let mut end = first + matched.len();
+    for (start, matched) in matches {
+        out.push_str(&s[end..start]);
+        out.push_str(new.as_ref());
+        end = start + matched.len();
+    }
+    out.push_str(&s[end..]);
+    Ok(V::J(Value::String(out)))
+}
+
 /// jinja2's `default(default_value='', boolean=False)`: the value, or the
 /// default when the value is undefined (or, under `boolean`, false).
 fn default_filter(v: V, args: &[V], kwargs: &[(&str, V)]) -> Result<V, TemplateError> {
-    let mut slots: [Option<&V>; 2] = [args.first(), args.get(1)];
-    if args.len() > 2 {
-        return err("|default takes at most two arguments");
-    }
-    for (k, x) in kwargs {
-        let at = match *k {
-            "default_value" => 0,
-            "boolean" => 1,
-            other => return err(format!("|default takes no argument {other}")),
-        };
-        if slots[at].replace(x).is_some() {
-            return err(format!("|default: {k} given twice"));
-        }
-    }
+    let slots = bind_args("|default", ["default_value", "boolean"], args, kwargs)?;
     let boolean = match slots[1] {
         None => false,
         Some(V::J(Value::Bool(b))) => *b,
@@ -2794,6 +2902,206 @@ mod tests {
         assert_eq!(render(src, json!({"d": {"a": 1, "b": 2}})), "0a1b|3|o");
     }
 
+    /// Captures use a local body frame, then bind the string in the surrounding
+    /// frame. Namespace mutations, unlike plain assignments, cross that boundary.
+    #[test]
+    fn block_set_captures_output_and_preserves_scope() {
+        for (src, want) in [
+            (
+                "before{% set x %}{{ 'é🙂' }}{% endset %}after[{{ x }}]",
+                "beforeafter[é🙂]",
+            ),
+            (
+                "{% set x %}{% endset %}{{ x is defined }}|{{ x is string }}|{{ x|length }}",
+                "True|True|0",
+            ),
+            (
+                "{% set x = 'outer' %}{% set x %}{{ x }}{% set x = 'inner' %}{{ x }}{% endset %}[{{ x }}]",
+                "[outerinner]",
+            ),
+            (
+                "{% set x = 'outer' %}{% set a %}{% set x = 'local' %}{% set b %}{{ x }}{% endset %}{{ b }}{% endset %}{{ a }}|{{ x }}|{{ b is defined }}",
+                "local|outer|False",
+            ),
+            (
+                "{% set x = 'outer' %}{% for i in [1,2] %}{% set x %}{{ i }}:{{ loop.index }}{% endset %}{{ x }};{% endfor %}{{ x }}",
+                "1:1;2:2;outer",
+            ),
+            (
+                "{% macro m(p) %}{% set x %}{{ p }}{% set p = 'local' %}{{ p }}{% endset %}{{ p }}[{{ x }}]{% endmacro %}{% set x %}{{ m('arg') }}{% endset %}{{ x }}|{{ p is defined }}",
+                "arg[arglocal]|False",
+            ),
+            (
+                "{% set ns = namespace(n=0) %}{% set ns.text %}{% set ns.n = 2 %}{% set ns = namespace(n=7) %}{{ ns.n }}{% endset %}{{ ns.n }}:{{ ns.text }}",
+                "2:7",
+            ),
+            (
+                "{% set ns = namespace() %}{% for i in [1,2] %}{% set ns.text %}{{ i }}{% endset %}{% endfor %}{{ ns.text }}",
+                "2",
+            ),
+            (
+                "{% if true %}{% set x %}yes{% endset %}{% endif %}{{ x }}",
+                "yes",
+            ),
+            (
+                "a  {%- set x -%}  b {{ 'c' }}  {%- endset -%} d[{{ x }}]",
+                "ad[b c]",
+            ),
+            (
+                "{% set x %}\n  body\n  {% endset %}\n[{{ x }}]",
+                "[  body\n]",
+            ),
+            (
+                "{% set x %}{{ '</think>\\x00é<think>'|replace('\\x00','')|replace('<think>','')|replace('</think>','') }}{% endset %}{{ x }}",
+                "é",
+            ),
+        ] {
+            assert_eq!(render(src, json!({})), want, "{src}");
+        }
+    }
+
+    #[test]
+    fn block_set_preserves_loop_control_and_refusals() {
+        for (src, want) in [
+            (
+                "{% set ns = namespace(text='old', n=0) %}{% for i in [1,2] %}A{% set ns.text %}discard{% set ns.n = i %}{% break %}{% endset %}B{% endfor %}{{ ns.text }}:{{ ns.n }}",
+                "Aold:1",
+            ),
+            (
+                "{% set ns = namespace(text='old') %}{% for i in [1,2] %}{{ i }}{% set ns.text %}{% if i == 1 %}{% continue %}{% endif %}new{% endset %}!{% endfor %}{{ ns.text }}",
+                "12!new",
+            ),
+            (
+                "{% set x %}{% for i in [1,2,3] %}{% if i == 2 %}{% break %}{% endif %}{{ i }}{% endfor %}done{% endset %}{{ x }}",
+                "1done",
+            ),
+        ] {
+            assert_eq!(render(src, json!({})), want, "{src}");
+        }
+        let t = ChatTemplate::parse(
+            "outside{% set x %}inside{% set y %}{{ raise_exception('capture refused') }}{% endset %}{% endset %}",
+        ).expect("parses");
+        let e = t
+            .render(&Map::new())
+            .expect_err("capture must propagate refusal");
+        assert_eq!(e.refusal(), Some("capture refused"));
+        assert!(render_err("{% set x %}{{ 1 / 0 }}{% endset %}", json!({}),).contains("zero"));
+        assert!(
+            render_err("{% set obj.text %}body{% endset %}", json!({"obj": {}}),)
+                .contains("not a namespace")
+        );
+    }
+
+    #[test]
+    fn block_set_rejects_malformed_and_unsupported_syntax() {
+        for (src, want) in [
+            ("{% set x %}body", "missing {% endset %}"),
+            ("{% endset %}", "unsupported tag"),
+            ("{% set x %}{% endfor %}", "unsupported tag"),
+            ("{% set x %}{% endset x %}", "endset takes nothing"),
+            ("{% set x %}{% endset = 1 %}", "endset takes nothing"),
+            ("{% set %}body{% endset %}", "expected a name"),
+            ("{% set 1 %}body{% endset %}", "expected a name"),
+            ("{% set true %}body{% endset %}", "invalid set target"),
+            ("{% set None %}body{% endset %}", "invalid set target"),
+            ("{% set a,b %}body{% endset %}", "trailing"),
+            ("{% set ns.a.b %}body{% endset %}", "trailing"),
+            ("{% set ns['a'] %}body{% endset %}", "trailing"),
+            ("{% set x | trim %}body{% endset %}", "filters on block set"),
+            (
+                "{% set x %}{% macro m() %}body{% endmacro %}{% endset %}",
+                "macro inside a block set capture",
+            ),
+            ("{% set x %}{% break %}{% endset %}", "outside a for loop"),
+        ] {
+            let e = ChatTemplate::parse(src).err().expect("must refuse");
+            assert!(e.0.contains(want), "{src}: {e}");
+        }
+        let captures = |n| format!("{}x{}", "{% set x %}".repeat(n), "{% endset %}".repeat(n));
+        parse_on_small_stack(captures(63)).expect("64 blocks parse");
+        assert!(
+            parse_on_small_stack(captures(64))
+                .expect_err("65 blocks")
+                .contains("template nesting deeper than 64")
+        );
+    }
+
+    /// Replacement follows Python string conversion and counts non-overlapping
+    /// matches, including empty matches at Unicode character boundaries.
+    #[test]
+    fn replace_converts_strings_and_honors_count() {
+        for (src, want) in [
+            ("{{ 'aaaaa'|replace('aa','X') }}", "XXa"),
+            ("{{ 'aaaaa'|replace('aa','X',1) }}", "Xaaa"),
+            ("{{ 'aaaaa'|replace('aa','X',0) }}", "aaaaa"),
+            ("{{ 'aaaaa'|replace('aa','X',-2) }}", "XXa"),
+            ("{{ 'aaaaa'|replace('aa','X',none) }}", "XXa"),
+            ("{{ 'aaaaa'|replace('aa','X',true) }}", "Xaaa"),
+            ("{{ 'aaaaa'|replace('aa','X',false) }}", "aaaaa"),
+            ("{{ 'abc'|replace('missing','x') }}", "abc"),
+            ("{{ 'abc'|replace('b','b') }}", "abc"),
+            ("{{ 'é🙂é'|replace('é','界',count=1) }}", "界🙂é"),
+            ("{{ 'é🙂'|replace('','-') }}", "-é-🙂-"),
+            ("{{ 'é🙂'|replace('','-',2) }}", "-é-🙂"),
+            ("{{ 'é🙂'|replace('','-',0) }}", "é🙂"),
+            ("{{ ''|replace('','x') }}", "x"),
+            ("{{ 'x'|replace('','') }}", "x"),
+            ("{{ 'é🙂'|replace('','-',9223372036854775807) }}", "-é-🙂-"),
+            ("{{ 'a\\x00a'|replace('\\x00','') }}", "aa"),
+            ("{{ 121|replace(1,none) }}", "None2None"),
+            ("{{ true|replace(true,false) }}", "False"),
+            ("{{ ['a']|replace('a','b') }}", "['b']"),
+            ("{{ u|replace('','x') }}", "x"),
+            ("{{ 'ab'|replace(u,'-') }}", "-a-b-"),
+            ("{{ 'aba'|replace('a',u) }}", "b"),
+            ("{{ 'aba'|replace(new='X',count=1,old='a') }}", "Xba"),
+            ("{{ 'aba'|replace('a',new='X',count=1) }}", "Xba"),
+        ] {
+            assert_eq!(render(src, json!({})), want, "{src}");
+        }
+    }
+
+    #[test]
+    fn replace_refuses_invalid_arguments() {
+        for (src, want) in [
+            ("{{ 'a'|replace }}", "requires old"),
+            ("{{ 'a'|replace('a') }}", "requires new"),
+            ("{{ 'a'|replace(new='b') }}", "requires old"),
+            ("{{ 'a'|replace('a','b',other=1) }}", "no argument other"),
+            ("{{ 'a'|replace('a','b',old='c') }}", "old given twice"),
+            ("{{ 'a'|replace('a','b',new='c') }}", "new given twice"),
+            ("{{ 'a'|replace('a','b',1,count=2) }}", "count given twice"),
+            ("{{ 'a'|replace(old='a',old='b',new='c') }}", "given twice"),
+            (
+                "{{ 'a'|replace(old='a','b') }}",
+                "positional argument after keyword",
+            ),
+            ("{{ 'a'|replace('a','b','1') }}", "count must be an integer"),
+            ("{{ 'a'|replace('a','b',1.0) }}", "count must be an integer"),
+            ("{{ 'a'|replace('a','b',u) }}", "count must be an integer"),
+            ("{{ 'a'|replace('a','b',[]) }}", "count must be an integer"),
+        ] {
+            let e = ChatTemplate::parse(src)
+                .and_then(|t| t.render(&Map::new()))
+                .expect_err("must refuse");
+            assert!(e.0.contains(want), "{src}: {e}");
+        }
+    }
+
+    #[test]
+    fn keyword_callees_refuse_excess_positional_arguments() {
+        for (src, callee) in [
+            ("{{ 'a'|replace('a','b',1,2) }}", "|replace"),
+            ("{{ u|default(1, true, 2) }}", "|default"),
+            ("{{ 'a'.split(',', 1, 2) }}", "split()"),
+        ] {
+            let e = ChatTemplate::parse(src)
+                .and_then(|t| t.render(&Map::new()))
+                .expect_err("excess arguments must not produce output");
+            assert!(e.0.contains(callee), "{src}: {e}");
+        }
+    }
+
     #[test]
     fn a_tuple_reads_as_a_list_on_the_right_of_in_only() {
         let src = "{{ 'a' in ('a', 'b') }}{{ 'c' not in ('a', 'b',) }}{{ 'a' in ('a') }}";
@@ -2823,7 +3131,6 @@ mod tests {
                    {{ e|default('d', true) }}|{{ u|default }}|{{ e|default(boolean=true, default_value='k') }}";
         assert_eq!(render(src, json!({"x": "v", "e": ""})), "d|v||d||k");
         for (src, want) in [
-            ("{{ u|default(1, true, 2) }}", "at most two"),
             ("{{ u|default(other=1) }}", "no argument other"),
             (
                 "{{ u|default(1, boolean=true, default_value=2) }}",

@@ -26,7 +26,9 @@
 //!   caller that runs other sequences' passes between a sequence's own lands
 //!   each pass at its end instead ([`Choosing::finish_pass`]), so no other
 //!   call is read as its wall. A plain pass whose draft proposed (a shadow,
-//!   a cut to 0) holds the draft's walk and is no reading of the plain step.
+//!   a cut to 0) holds the draft's walk and is no reading of the plain step,
+//!   and a verify a window cut below the ids a chain draft walked holds the
+//!   walks past its width and is no reading of its width.
 //!
 //! Until every width's cost holds [`Rule::min_timings`] readings the passes
 //! rotate the widths, widest first, and nothing is decided. Past that two
@@ -52,11 +54,18 @@
 //! readings taken since, and the gate decides on their median. One fast
 //! reading cannot open the gate and one slow one cannot hold it closed, and
 //! one probe after a load step replaces a median read under the old load. A
-//! proposal shorter than the draft's width (the context's end) moves neither
-//! the mean nor the gate.
+//! proposal shorter than the room it was handed (the context's end) moves
+//! neither the mean nor the gate.
 //!
-//! The draft proposes its whole width whenever it proposes, and the pass
-//! verifies the front `k` ids. While closed, a plain pass asks the draft one
+//! A draft proposes into the room the chooser hands it, and the pass
+//! verifies the front `k` ids. A draft that makes its whole proposal in one
+//! call is handed its whole width. A chain draft ([`Draft::CHAIN`]), whose
+//! ids are walks of its own one after another, is handed the width the pass
+//! plans to verify (the warm-up's or a probe's width, else the gate's) and
+//! stops there: a window's own profile can then cut that width, never widen
+//! it, and the mean and the calibration hear of the positions a proposal
+//! reached, a position past them keeping what it last heard. A shadow walks
+//! the whole width. While closed, a plain pass asks the draft one
 //! thing — to walk the rows waiting for its next walk before its step
 //! overwrites their arena ([`Draft::before_plain`]) — and hears the position
 //! through [`Draft::held`], but every [`Rule::shadow_every`]th: that
@@ -65,9 +74,10 @@
 //! current so the chooser can open again. A proposal no row of which a pass
 //! verifies (a shadow, a cut to 0) is [`Draft::unproposed`].
 //!
-//! A pass of several sequences' windows ([`Choosing::round_ran`]) runs the
-//! draft's whole width and is only counted: its wall is the round's, no
-//! width's.
+//! A round of several sequences' windows runs the widths [`Batch`] chooses
+//! for the whole round, priced by the round's rows and wall. Each window is
+//! counted ([`Choosing::round_ran`]) and feeds its slot's conditional
+//! acceptance ([`Choosing::batch_profile`]); no width's wall is read from it.
 //!
 //! [`Mode::Fixed`] passes every call to the draft untouched: every proposal
 //! verified whole, no clock read, nothing counted.
@@ -390,6 +400,163 @@ fn expected(a: &[f64], k: usize) -> f64 {
     e
 }
 
+/// Widths for one shared verify round of decode windows, priced by its total
+/// rows. Readings belong to one active-slot count; a change of count starts
+/// fresh readings rather than reusing another batch's wall.
+#[derive(Default)]
+pub struct Batch {
+    slots: usize,
+    costs: Vec<Timings>,
+    passes: u32,
+    probe: usize,
+    caps: Vec<usize>,
+    candidate: Vec<usize>,
+}
+
+impl Batch {
+    /// Cut each slot's maximum width using its conditional acceptance profile.
+    /// `allowed` is the body's supported draft-width set; a slot already at
+    /// zero has no draft. Fixed mode leaves all widths untouched.
+    pub fn choose<'a>(
+        &mut self,
+        mode: Mode,
+        profiles: impl ExactSizeIterator<Item = &'a [f64]> + Clone,
+        widths: &mut [usize],
+        allowed: std::ops::RangeInclusive<usize>,
+    ) -> Result<(), WidthError> {
+        if profiles.len() != widths.len() || widths.is_empty() {
+            return Err(WidthError::Rule(
+                "batch profiles and widths must name the same nonempty slots",
+            ));
+        }
+        if allowed.is_empty() {
+            return Err(WidthError::Rule("batch allowed-width set is empty"));
+        }
+        for (a, &width) in profiles.clone().zip(widths.iter()) {
+            if width > 0 && !allowed.contains(&width) {
+                return Err(WidthError::Rule(
+                    "batch width outside the body's allowed set",
+                ));
+            }
+            if width > a.len() {
+                return Err(WidthError::Rule(
+                    "batch width exceeds its acceptance profile",
+                ));
+            }
+            if a.iter().any(|p| !p.is_finite() || !(0.0..=1.0).contains(p)) {
+                return Err(WidthError::Rule(
+                    "batch acceptance must be finite and in [0, 1]",
+                ));
+            }
+        }
+        let slots = widths.len();
+        let end = widths
+            .iter()
+            .try_fold(slots, |n, &w| n.checked_add(w))
+            .and_then(|n| n.checked_add(1))
+            .ok_or(WidthError::Rule("batch row count overflow"))?;
+        if mode == Mode::Fixed {
+            return Ok(());
+        }
+        if self.slots != slots {
+            self.slots = slots;
+            self.costs.clear();
+            self.passes = 0;
+            self.probe = 0;
+        }
+        self.costs.resize_with(end.max(self.costs.len()), || {
+            Timings::new("batch", Rule::DEFAULT.timings)
+        });
+        let max = widths.iter().copied().max().unwrap_or(0);
+        let min = (*allowed.start()).min(max);
+        // Bracket the row costs; selected rounds supply intermediate readings.
+        for cap in [max, min] {
+            let rows = slots + widths.iter().map(|&w| w.min(cap)).sum::<usize>();
+            if self.costs[rows].len() < Rule::DEFAULT.min_timings {
+                for w in widths {
+                    *w = (*w).min(cap);
+                }
+                return Ok(());
+            }
+        }
+        self.passes += 1;
+        if self.passes >= Rule::DEFAULT.probe_every {
+            self.passes = 0;
+            self.probe = if self.probe < min || self.probe >= max {
+                min
+            } else {
+                self.probe + 1
+            };
+            for w in widths {
+                *w = (*w).min(self.probe);
+            }
+            return Ok(());
+        }
+        self.caps.clear();
+        self.caps.extend_from_slice(widths);
+        self.candidate.clear();
+        self.candidate.extend(widths.iter().map(|&w| w.min(min)));
+        widths.copy_from_slice(&self.candidate);
+        let mut kept: f64 = profiles
+            .clone()
+            .zip(widths.iter())
+            .map(|(a, &w)| expected(a, w))
+            .sum();
+        let start = slots + widths.iter().sum::<usize>();
+        let mut best = kept / self.cost(start);
+        // Conditional probabilities make each slot's marginal yield decrease.
+        // Taking the largest next yield maximizes tokens for each row budget.
+        for rows in start + 1..end {
+            let mut next = None;
+            for (i, a) in profiles.clone().enumerate() {
+                let k = self.candidate[i];
+                if k < self.caps[i] {
+                    let gain = expected(a, k + 1) - expected(a, k);
+                    if next.is_none_or(|(_, g)| gain > g) {
+                        next = Some((i, gain));
+                    }
+                }
+            }
+            let Some((i, gain)) = next else { break };
+            self.candidate[i] += 1;
+            kept += gain;
+            let rate = kept / self.cost(rows);
+            if rate > best * Rule::DEFAULT.margin {
+                best = rate;
+                widths.copy_from_slice(&self.candidate);
+            }
+        }
+        Ok(())
+    }
+
+    fn cost(&mut self, rows: usize) -> f64 {
+        if let Some(ms) = self.costs[rows].median() {
+            return ms;
+        }
+        let lo = (self.slots..rows)
+            .rev()
+            .find(|&r| self.costs[r].len() > 0)
+            .expect("the narrowest batch was sampled");
+        let hi = (rows + 1..self.costs.len())
+            .find(|&r| self.costs[r].len() > 0)
+            .expect("the full batch was sampled");
+        let a = self.costs[lo].median().expect("a sampled cost");
+        let b = self.costs[hi].median().expect("a sampled cost");
+        a + (b - a) * ((rows - lo) as f64 / (hi - lo) as f64)
+    }
+
+    /// Record the whole round of `rows` verified rows, including drafting and
+    /// commits, in milliseconds.
+    pub fn observe(&mut self, rows: usize, ms: f64) -> Result<(), WidthError> {
+        if rows < self.slots || rows >= self.costs.len() {
+            return Err(WidthError::Rule(
+                "batch reading outside the chosen row range",
+            ));
+        }
+        self.costs[rows].push(ms)
+    }
+}
+
 /// What a pass ran, as its proposal left it, for its wall's reading.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
@@ -401,6 +568,16 @@ enum Kind {
     /// A plain step after the draft's proposal (a shadow, a cut to 0): its
     /// wall holds the draft's whole chain, no reading.
     Walked,
+    /// A verify whose window cut it below the ids a chain draft walked: its
+    /// wall holds the walks past its width, no reading.
+    Cut,
+}
+
+impl Kind {
+    /// Whether the pass verifies a proposal.
+    fn verifies(self) -> bool {
+        matches!(self, Kind::Verify | Kind::Cut)
+    }
 }
 
 /// The pass in flight since its proposal.
@@ -560,12 +737,15 @@ pub struct Choosing<D, C = Wall> {
     passes: u64,
     /// The calibration `g_i`, one a proposal index.
     gains: Vec<f64>,
+    /// Conditional acceptance of round windows, which carry no probabilities.
+    batch_gains: Vec<f64>,
+    batch_tested: Vec<u64>,
     /// The tests each `g_i` has taken.
     tested: Vec<u64>,
-    /// The running mean of the draft's `p_i` over its full proposals, and
-    /// how many it has seen.
+    /// The running mean of the draft's `p_i` over the proposals that filled
+    /// their room, and how many of them reached each position.
     mean: Vec<f64>,
-    seen: u64,
+    seen: Vec<u64>,
     /// The gate's profile, `mean_i · g_i`, reused.
     gated: Vec<f64>,
     /// The last readings of each width's cost: index `k` the passes that
@@ -640,9 +820,11 @@ where
             since_shadow: 0,
             passes: 0,
             gains: vec![1.0; D::WIDTH],
+            batch_gains: vec![1.0; D::WIDTH],
+            batch_tested: vec![0; D::WIDTH],
             tested: vec![0; D::WIDTH],
             mean: vec![0.0; D::WIDTH],
-            seen: 0,
+            seen: vec![0; D::WIDTH],
             gated: vec![0.0; D::WIDTH],
             costs: (0..widths)
                 .map(|k| Timings::new(if k == 0 { "step" } else { "verify" }, rule.timings))
@@ -686,6 +868,7 @@ impl<D, C: Clock> Choosing<D, C> {
     /// prompt over the same ids with spans spliced in) goes through it, so the two have one owner.
     pub fn prompt_by<R>(&mut self, f: impl FnOnce(&mut D) -> R) -> R {
         self.drop_flight();
+        self.reset_batch();
         f(&mut self.draft)
     }
 
@@ -752,16 +935,42 @@ impl<D, C: Clock> Choosing<D, C> {
         }
     }
 
+    /// The conditional acceptance learned from whole-round windows.
+    pub fn batch_profile(&self) -> &[f64] {
+        &self.batch_gains
+    }
+
+    fn reset_batch(&mut self) {
+        self.batch_gains.fill(1.0);
+        self.batch_tested.fill(0);
+    }
+
     /// A pass of several sequences' windows ran this draft's window (its
     /// [`Draft::propose`] and the round's record called on the draft itself,
-    /// the chooser bypassed): `rows` ran, `kept` were kept. Counted; no cost
-    /// read (the wall is the round's) and nothing in flight survives it.
+    /// the chooser bypassed): `rows` ran, `kept` were kept. Counted, and its
+    /// rows feed [`Choosing::batch_profile`]; no cost read (the wall is the
+    /// round's, [`Batch::observe`]) and nothing in flight survives it.
     pub fn round_ran(&mut self, rows: usize, kept: usize) {
         if self.mode == Mode::Fixed {
             return;
         }
         self.drop_flight();
-        self.ran(rows.saturating_sub(1), kept);
+        let k = rows.saturating_sub(1);
+        let j = kept.saturating_sub(1);
+        let tested = j + usize::from(j < k);
+        for (i, (a, n)) in self
+            .batch_gains
+            .iter_mut()
+            .zip(&mut self.batch_tested)
+            .enumerate()
+            .take(tested)
+        {
+            *n = n.saturating_add(1);
+            let hit = if i < j { 1.0 } else { 0.0 };
+            let weight = self.rule.calibrate.max(1.0 / *n as f64);
+            *a += weight * (hit - *a);
+        }
+        self.ran(k, kept);
     }
 
     /// The pass that just ran landed now, the target at `pos`: its wall is
@@ -798,9 +1007,16 @@ impl<D, C: Clock> Choosing<D, C> {
             Some(d) => d.as_secs_f64() * 1e3,
             None => -(f.at - now).as_secs_f64() * 1e3,
         };
-        if f.kind == Kind::Walked {
-            positive("plain pass", ms)?;
-            return Ok(());
+        match f.kind {
+            Kind::Walked => {
+                positive("plain pass", ms)?;
+                return Ok(());
+            }
+            Kind::Cut => {
+                positive("verify", ms)?;
+                return Ok(());
+            }
+            Kind::Verify | Kind::Step => {}
         }
         let k = f.width;
         let ms = positive(self.costs[k].what, ms)?;
@@ -929,12 +1145,13 @@ impl<D, C: Clock> Choosing<D, C> {
         }
     }
 
-    /// The proposal's probabilities into the mean: a running mean until the
-    /// calibration's step is the smaller, then that step.
+    /// The proposal's probabilities of its first `n` ids into the mean: each
+    /// position a running mean until the calibration's step is the smaller,
+    /// then that step.
     fn learn(&mut self, n: usize) {
-        self.seen += 1;
-        let step = (1.0 / self.seen as f64).max(self.rule.calibrate);
-        for (m, &p) in self.mean[..n].iter_mut().zip(&self.p) {
+        for ((m, seen), &p) in self.mean[..n].iter_mut().zip(&mut self.seen).zip(&self.p) {
+            *seen += 1;
+            let step = (1.0 / *seen as f64).max(self.rule.calibrate);
             *m += step * (f64::from(p) - *m);
         }
     }
@@ -1037,12 +1254,21 @@ impl<D, C: Clock> Choosing<D, C> {
         0
     }
 
-    /// This pass a verify of the proposal's front `k` ids, written to `out`;
-    /// `probe` a closed chooser's probe.
-    fn verify(&mut self, out: &mut [u32], k: usize, pos: u32, at: Duration, probe: bool) -> usize {
+    /// This pass a verify of the proposal's front `k` ids, written to `out`,
+    /// the draft having walked `walked` ids for it (`k` for a draft whose
+    /// proposal costs its whole width whatever the pass verifies); `probe` a
+    /// closed chooser's probe.
+    fn verify(
+        &mut self,
+        out: &mut [u32],
+        (k, walked): (usize, usize),
+        pos: u32,
+        at: Duration,
+        probe: bool,
+    ) -> usize {
         out[..k].copy_from_slice(&self.ids[..k]);
         self.flight = Some(Flight {
-            kind: Kind::Verify,
+            kind: if k < walked { Kind::Cut } else { Kind::Verify },
             width: k,
             pos,
             at,
@@ -1065,6 +1291,7 @@ where
 {
     const WIDTH: usize = D::WIDTH;
     const TAPS: TapNeed = D::TAPS;
+    const CHAIN: bool = D::CHAIN;
 
     fn prompt(&mut self, t: &mut T, ids: &[u32]) -> Result<u32, T::Error> {
         self.prompt_by(|d| d.prompt(t, ids))
@@ -1072,6 +1299,7 @@ where
 
     fn begin(&mut self, t: &T, prompt: &[u32], first: u32) -> Result<(), T::Error> {
         self.drop_flight();
+        self.reset_batch();
         self.draft.begin(t, prompt, first)
     }
 
@@ -1079,10 +1307,10 @@ where
     /// proposal first — a shadow in flight, the warm-up's rotation or a
     /// width's readings started over, a probe — then while closed a plain
     /// step (the draft's waiting rows walked first, [`Draft::before_plain`])
-    /// or a shadow, else the draft's own
-    /// proposal with its probabilities, the gate decided on the mean they
-    /// move, and the front ids of the window's width ([`Choosing::cut`]) as
-    /// the pass's rows.
+    /// or a shadow, else the draft's own proposal with its probabilities
+    /// (a chain draft's into the width the pass plans to verify), the gate
+    /// decided on the mean they move, and the front ids of the window's
+    /// width ([`Choosing::cut`]) as the pass's rows.
     fn propose(&mut self, t: &mut T, last: u32, out: &mut [u32]) -> Result<usize, T::Error> {
         if self.mode == Mode::Fixed {
             return self.draft.propose(t, last, out);
@@ -1140,21 +1368,27 @@ where
             self.draft.unproposed();
             return Ok(self.plain(Kind::Walked, pos, at));
         }
+        let depth = if D::CHAIN {
+            forced.unwrap_or(self.width).min(room)
+        } else {
+            room
+        };
         let n = self
             .draft
-            .propose_p(t, last, &mut self.ids[..room], &mut self.p)?;
+            .propose_p(t, last, &mut self.ids[..depth], &mut self.p)?;
         if n == 0 {
             return Ok(self.plain(Kind::Step, pos, at));
         }
         check_p(&self.p[..n])?;
         self.profile(n);
-        if n == D::WIDTH {
+        let filled = n == depth;
+        if filled {
             self.learn(n);
         }
         let k = match forced {
             Some(k) => k.min(n),
             None => {
-                if n == D::WIDTH {
+                if filled {
                     self.gate();
                 }
                 if self.width == 0 { 0 } else { self.cut(n) }
@@ -1164,7 +1398,8 @@ where
             self.draft.unproposed();
             return Ok(self.plain(Kind::Walked, pos, at));
         }
-        Ok(self.verify(out, k, pos, at, probe))
+        let walked = if D::CHAIN { n } else { k };
+        Ok(self.verify(out, (k, walked), pos, at, probe))
     }
 
     /// The verify of `rows` kept its first `accepted` rows: the cost and the
@@ -1183,7 +1418,7 @@ where
         let k = rows.len() - 1;
         match (self.turn.take(), &mut self.flight) {
             (Some(Turn::Verify { k: chose }), Some(f))
-                if chose == k && f.kind == Kind::Verify && f.ends.is_none() =>
+                if chose == k && f.kind.verifies() && f.ends.is_none() =>
             {
                 f.ends = u32::try_from(accepted).ok().map(|a| f.pos + a);
                 let predicted = f.predicted;
@@ -1201,17 +1436,18 @@ where
     /// A step: the chooser's plain pass, counted, a pending shadow scored
     /// against `next`, the draft told it was held back; any other step
     /// (the caller's own, outside a pass) the draft's plain
-    /// [`Draft::stepped`], and nothing in flight survives it.
+    /// [`Draft::stepped`], with batch acceptance reset and nothing in flight.
     fn stepped(&mut self, t: &mut T, last: u32, next: u32) -> Result<(), T::Error> {
         if self.mode == Mode::Fixed {
             return self.draft.stepped(t, last, next);
         }
         if self.turn.take() != Some(Turn::Plain) {
             self.drop_flight();
+            self.reset_batch();
             return self.draft.stepped(t, last, next);
         }
         match &mut self.flight {
-            Some(f) if f.kind != Kind::Verify && f.ends.is_none() => f.ends = Some(f.pos + 1),
+            Some(f) if !f.kind.verifies() && f.ends.is_none() => f.ends = Some(f.pos + 1),
             _ => self.drop_flight(),
         }
         self.score_shadow(next);
@@ -1225,11 +1461,14 @@ mod tests {
     use std::cell::Cell;
     use std::rc::Rc;
 
-    use super::{Choosing, Chosen, Mode, Rule, Tally, Wall, WidthError, expected};
+    use super::{Batch, Choosing, Chosen, Mode, Rule, Tally, Wall, WidthError, expected};
     use crate::mock::{Call, Clockwork, Mock, MockError, Quiet};
-    use crate::{Advance, Committed, Draft, Plain, Speculative, Stop, TapNeed, Target, generate};
+    use crate::{
+        Advance, Committed, Draft, Plain, Speculative, Stop, TapNeed, Target, Want, generate,
+    };
 
-    /// The draft's own walk on the mock's clock, µs, every proposal.
+    /// The draft's own walk on the mock's clock, µs, every proposal; a chain
+    /// draft's, every id.
     const DRAFT_US: u64 = 500;
     const STEP_US: u64 = 37_450;
     /// Verifies of 2, 3 and 4 rows at W(3) = 2.15 of the step, the rows
@@ -1242,8 +1481,9 @@ mod tests {
     /// a counter of its own, `⌊(k + 1)·a⌋ > ⌊k·a⌋` making its stream hold
     /// exactly its rate over any long run. Like the engine's card draft it
     /// refuses to propose unless it holds every position before the
-    /// target's, and it queues a held position until its next call.
-    struct Scored {
+    /// target's, and it queues a held position until its next call. `C` is
+    /// [`Draft::CHAIN`]: a chain draft's proposal walks one id at a time.
+    struct Scored<const C: bool = false> {
         acc: Rc<Cell<[f64; 3]>>,
         p: Rc<Cell<[f32; 3]>>,
         draws: [u64; 3],
@@ -1251,6 +1491,8 @@ mod tests {
         at: u32,
         queued: u32,
         proposals: u64,
+        /// The ids every proposal held, summed.
+        walked: u64,
         held: u64,
         unproposed: u64,
         plains: u64,
@@ -1259,8 +1501,8 @@ mod tests {
         open: u64,
     }
 
-    impl Scored {
-        fn new(acc: &Rc<Cell<[f64; 3]>>, p: &Rc<Cell<[f32; 3]>>) -> Scored {
+    impl<const C: bool> Scored<C> {
+        fn new(acc: &Rc<Cell<[f64; 3]>>, p: &Rc<Cell<[f32; 3]>>) -> Scored<C> {
             Scored {
                 acc: Rc::clone(acc),
                 p: Rc::clone(p),
@@ -1269,6 +1511,7 @@ mod tests {
                 at: 0,
                 queued: 0,
                 proposals: 0,
+                walked: 0,
                 held: 0,
                 unproposed: 0,
                 plains: 0,
@@ -1289,9 +1532,10 @@ mod tests {
         }
     }
 
-    impl Draft<Mock> for Scored {
+    impl<const C: bool> Draft<Mock> for Scored<C> {
         const WIDTH: usize = 3;
         const TAPS: TapNeed = TapNeed::None;
+        const CHAIN: bool = C;
 
         fn prompt(&mut self, t: &mut Mock, ids: &[u32]) -> Result<u32, MockError> {
             let next = Plain.prompt(t, ids)?;
@@ -1323,13 +1567,14 @@ mod tests {
             self.flush();
             assert_eq!(self.at, t.pos(), "the draft missed a position");
             assert_eq!(self.open, 0, "a proposal never verified was not dropped");
+            let n = out.len().min(3);
             if let Some(c) = &self.clock {
-                c.advance(DRAFT_US);
+                c.advance(if C { DRAFT_US * n as u64 } else { DRAFT_US });
             }
             self.proposals += 1;
+            self.walked += n as u64;
             self.open += 1;
             let truth = t.greedy_after(last, 3);
-            let n = out.len().min(3);
             for i in 0..n {
                 out[i] = if self.right(i) {
                     truth[i]
@@ -1383,13 +1628,11 @@ mod tests {
         }
     }
 
-    type Spec = Speculative<Choosing<Scored, Rc<Clockwork>>, 4>;
-
     /// A chooser over a [`Scored`] draft on the mock, standing after a
     /// prompt, its steps costing `STEP_US` and its verifies `by_rows`.
-    struct Rig {
+    struct Rig<const C: bool = false> {
         t: Mock,
-        spec: Spec,
+        spec: Speculative<Choosing<Scored<C>, Rc<Clockwork>>, 4>,
         clock: Rc<Clockwork>,
         acc: Rc<Cell<[f64; 3]>>,
         last: u32,
@@ -1406,6 +1649,12 @@ mod tests {
         }
 
         fn with(acc: [f64; 3], p: [f32; 3], by_rows: &[u64], mode: Mode, rule: Rule) -> Rig {
+            Rig::build(acc, p, by_rows, mode, rule)
+        }
+    }
+
+    impl<const C: bool> Rig<C> {
+        fn build(acc: [f64; 3], p: [f32; 3], by_rows: &[u64], mode: Mode, rule: Rule) -> Rig<C> {
             let clock = Clockwork::new(STEP_US, 0);
             clock.verify_rows(by_rows);
             let acc = Rc::new(Cell::new(acc));
@@ -1442,7 +1691,7 @@ mod tests {
             }
         }
 
-        fn choosing(&mut self) -> &mut Choosing<Scored, Rc<Clockwork>> {
+        fn choosing(&mut self) -> &mut Choosing<Scored<C>, Rc<Clockwork>> {
             self.spec.draft_mut()
         }
 
@@ -1954,6 +2203,40 @@ mod tests {
         }
     }
 
+    /// A chain draft walks the width the pass plans to verify and no more:
+    /// on a profile whose third id loses it settles on 2, the ids its
+    /// proposals held equal the ids the passes verified, and its positions a
+    /// microsecond come within 2 % of the best fixed width's at a walk an id.
+    /// Handed its whole width, it would walk a third id every window.
+    #[test]
+    fn a_chain_draft_walks_the_width_it_verifies() {
+        let acc = [0.95, 0.90, 0.30];
+        let mut r = Rig::<true>::build(
+            acc,
+            acc.map(|a| a as f32),
+            &LINEAR,
+            Mode::Cost,
+            Rule::DEFAULT,
+        );
+        r.run(600);
+        let (walked, calls) = (r.choosing().draft().walked, r.rows().len());
+        let (t0, p0) = (r.clock.now.get(), r.t.pos());
+        r.run(400);
+        assert_eq!(r.choosing().width(), 2, "settled elsewhere");
+        let verified: usize = r.rows()[calls..].iter().map(|m| m - 1).sum();
+        let walked = r.choosing().draft().walked - walked;
+        assert_eq!(walked, verified as u64, "walked past the verified width");
+        let rate = f64::from(r.t.pos() - p0) / (r.clock.now.get() - t0) as f64;
+        let best = (1..=3)
+            .map(|k| expected(&acc, k) / (LINEAR[k - 1] + k as u64 * DRAFT_US) as f64)
+            .fold(1.0 / STEP_US as f64, f64::max);
+        assert!(
+            rate >= best * 0.98,
+            "{:.4} of the best fixed width's rate",
+            rate / best
+        );
+    }
+
     /// The gate moves on the mean profile alone and keeps its margin: an
     /// open chooser stays open while a drafted width beats the plain step
     /// and closes once none does, a closed one opens only past the margin,
@@ -2009,7 +2292,7 @@ mod tests {
         };
         c.width = 3;
         c.mean.copy_from_slice(&[0.8, 0.81, 0.85]);
-        c.seen = 1_000;
+        c.seen.fill(1_000);
         assert_eq!(window(&mut c, [0.9, 0.9, 0.9]), 3, "a sure window cut");
         assert_eq!(
             window(&mut c, [0.5, 0.2, 0.2]),
@@ -2301,7 +2584,10 @@ mod tests {
         }
         assert!(r.choosing().shadow.n > 0, "no shadow pending");
         let _ = r.choosing().take_tally();
+        let gains = r.choosing().gains().to_vec();
         r.choosing().round_ran(4, 2);
+        assert_eq!(r.choosing().gains(), gains);
+        assert_eq!(r.choosing().batch_profile(), &[1.0, 0.0, 1.0]);
         assert_eq!(r.choosing().shadow.n, 0, "the round left the shadow up");
         assert!(r.choosing().flight.is_none());
         let t = r.choosing().take_tally();
@@ -2310,6 +2596,62 @@ mod tests {
             (1, 1, 1, 0),
             "{t:?}"
         );
+        r.choosing().round_ran(4, 4);
+        assert_eq!(r.choosing().gains(), gains);
+        assert_eq!(r.choosing().batch_profile(), &[1.0, 0.5, 1.0]);
+        r.choosing().round_ran(4, 3);
+        assert_eq!(r.choosing().gains(), gains);
+        assert_eq!(r.choosing().batch_profile(), &[1.0, 2.0 / 3.0, 0.5]);
+        Draft::begin(r.spec.draft_mut(), &r.t, &[], r.last).unwrap();
+        assert_eq!(r.choosing().gains(), gains);
+        assert_eq!(r.choosing().batch_profile(), &[1.0; 3]);
+        assert_eq!(r.choosing().batch_tested, [0; 3]);
+    }
+
+    #[test]
+    fn batch_acceptance_resets_on_an_external_step() {
+        for held in [false, true] {
+            let mut r = Rig::with(
+                [0.40, 0.20, 0.10],
+                [0.6, 0.5, 0.4],
+                &[71_000, 95_000, 118_000],
+                Mode::Cost,
+                Rule::DEFAULT,
+            );
+            r.run(200);
+            let gains = r.choosing().gains().to_vec();
+            let tested = r.choosing().tested.clone();
+            r.choosing().round_ran(4, 1);
+            assert_eq!(r.choosing().batch_profile(), &[0.0, 1.0, 1.0]);
+            assert_eq!(r.choosing().batch_tested, [1, 0, 0]);
+
+            // A chooser-owned plain pass keeps this request's observations.
+            r.choosing().warm.clear();
+            r.choosing().warm.push_back(0);
+            r.run(1);
+            assert_eq!(r.passes.last().unwrap().rows, 1);
+            assert_eq!(r.choosing().batch_profile(), &[0.0, 1.0, 1.0]);
+            assert_eq!(r.choosing().batch_tested, [1, 0, 0]);
+
+            // A cached request can start with only its last prompt token.
+            let next = r.t.step(r.last, Want::Argmax).unwrap().argmax();
+            if held {
+                Draft::held(r.spec.draft_mut(), &mut r.t, r.last, next).unwrap();
+            } else {
+                Draft::stepped(r.spec.draft_mut(), &mut r.t, r.last, next).unwrap();
+            }
+            assert_eq!(r.choosing().batch_profile(), &[1.0; 3]);
+            assert_eq!(r.choosing().batch_tested, [0; 3]);
+            assert_eq!(r.choosing().gains(), gains);
+            assert_eq!(r.choosing().tested, tested);
+            assert!(r.choosing().flight.is_none());
+            assert_eq!(r.choosing().shadow.n, 0);
+
+            r.choosing().round_ran(4, 4);
+            assert_eq!(r.choosing().batch_profile(), &[1.0; 3]);
+            assert_eq!(r.choosing().batch_tested, [1; 3]);
+            assert_eq!(r.choosing().gains(), gains);
+        }
     }
 
     /// A prompt call of the draft's own shape ([`Choosing::prompt_by`]) forgets the pass in flight
@@ -2335,6 +2677,9 @@ mod tests {
         }
         assert!(r.choosing().shadow.n > 0, "no shadow pending");
         assert!(r.choosing().flight.is_some(), "no pass in flight");
+        let gains = r.choosing().gains().to_vec();
+        r.choosing().batch_gains.fill(0.25);
+        r.choosing().batch_tested.fill(4);
         let got = r.choosing().prompt_by(|_| 7_u32);
         assert_eq!(got, 7);
         assert_eq!(r.choosing().shadow.n, 0, "the prompt left the shadow up");
@@ -2342,6 +2687,11 @@ mod tests {
             r.choosing().flight.is_none(),
             "the prompt left a pass in flight"
         );
+        assert_eq!(r.choosing().batch_profile(), &[1.0; 3]);
+        assert_eq!(r.choosing().batch_tested, [0; 3]);
+        r.choosing().round_ran(4, 1);
+        assert_eq!(r.choosing().gains(), gains);
+        assert_eq!(r.choosing().batch_profile(), &[0.0, 1.0, 1.0]);
     }
 
     /// Input the chooser has no answer for is refused by name, never read as
@@ -2434,7 +2784,7 @@ mod tests {
             let acc = Rc::new(Cell::new([0.8; 3]));
             let p = Rc::new(Cell::new([0.8; 3]));
             assert!(
-                Scored::new(&acc, &p)
+                Scored::<false>::new(&acc, &p)
                     .choosing_by(Mode::Cost, rule, Wall::new())
                     .is_err()
             );
@@ -2506,6 +2856,108 @@ mod tests {
             .accept(&mut r.t, &rows, &[0; 4], 0)
             .unwrap_err();
         assert!(matches!(e, MockError::Width(WidthError::NoRowKept)), "{e}");
+    }
+
+    #[test]
+    fn batch_width_prices_all_slots_and_their_rows() {
+        let times = [
+            0.0, 10.0, 11.0, 14.0, 30.0, 50.0, 70.0, 90.0, 110.0, 130.0, 150.0, 170.0, 190.0,
+            210.0, 230.0, 250.0, 270.0,
+        ];
+        for (slots, want) in [(1, vec![2]), (2, vec![1, 0]), (4, vec![0; 4])] {
+            let mut batch = Batch::default();
+            let profiles = vec![&[0.8, 0.8, 0.8][..]; slots];
+            let mut widths = vec![3; slots];
+            batch
+                .choose(Mode::Cost, profiles.iter().copied(), &mut widths, 0..=3)
+                .unwrap();
+            assert_eq!(widths, vec![3; slots]);
+            for _ in 0..Rule::DEFAULT.min_timings {
+                batch.observe(slots * 4, times[slots * 4]).unwrap();
+            }
+            widths.fill(3);
+            batch
+                .choose(Mode::Cost, profiles.iter().copied(), &mut widths, 0..=3)
+                .unwrap();
+            assert_eq!(widths, vec![0; slots], "sample the opposite endpoint next");
+            for (rows, &ms) in times.iter().enumerate().take(slots * 4 + 1).skip(slots) {
+                for _ in 0..Rule::DEFAULT.min_timings {
+                    batch.observe(rows, ms).unwrap();
+                }
+            }
+            widths.fill(3);
+            batch
+                .choose(Mode::Cost, profiles.iter().copied(), &mut widths, 0..=3)
+                .unwrap();
+            assert_eq!(widths, want, "batch of {slots}");
+            widths.fill(3);
+            batch
+                .choose(Mode::Fixed, profiles.iter().copied(), &mut widths, 0..=3)
+                .unwrap();
+            assert_eq!(widths, vec![3; slots]);
+        }
+        // Only the two endpoint row counts read: every width between is
+        // priced on the line through them.
+        let mut batch = Batch::default();
+        let profiles = [&[0.8, 0.8, 0.8][..]; 2];
+        let mut widths = [3, 3];
+        for (rows, ms) in [(8, 28.0), (2, 10.0)] {
+            batch
+                .choose(Mode::Cost, profiles.into_iter(), &mut widths, 0..=3)
+                .unwrap();
+            assert_eq!(widths.iter().sum::<usize>() + 2, rows, "endpoint {rows}");
+            for _ in 0..Rule::DEFAULT.min_timings {
+                batch.observe(rows, ms).unwrap();
+            }
+            widths.fill(3);
+        }
+        assert_eq!((batch.cost(3), batch.cost(5)), (13.0, 19.0));
+        batch
+            .choose(Mode::Cost, profiles.into_iter(), &mut widths, 0..=3)
+            .unwrap();
+        assert_eq!(widths, [1, 1], "the rate peaks between the endpoints");
+        let mut glm = Batch::default();
+        let mut widths = [1, 1];
+        for _ in 0..=Rule::DEFAULT.min_timings {
+            glm.choose(
+                Mode::Cost,
+                [&[0.0][..], &[0.0][..]].into_iter(),
+                &mut widths,
+                1..=1,
+            )
+            .unwrap();
+            glm.observe(2, 1.0).unwrap();
+            glm.observe(4, 100.0).unwrap();
+            assert_eq!(widths, [1, 1], "GLM NextN admits only paired rows");
+        }
+        // PIN(2026-10-23): the prompt-row overflow case went with `choose`'s
+        // prompt-row count; a batch round holds decode windows only, one row a
+        // slot plus each width, and a width is bounded by its profile.
+        let p = &[0.8][..];
+        for (profiles, mut widths, allowed, why) in [
+            (vec![], vec![1], 0..=3, "same nonempty slots"),
+            (vec![], vec![], 0..=3, "same nonempty slots"),
+            (
+                vec![p],
+                vec![1],
+                std::ops::RangeInclusive::new(2, 1),
+                "set is empty",
+            ),
+            (vec![p], vec![2], 0..=1, "outside the body's allowed set"),
+            (vec![p], vec![2], 0..=3, "exceeds its acceptance profile"),
+            (
+                vec![&[f64::NAN][..]],
+                vec![1],
+                0..=3,
+                "finite and in [0, 1]",
+            ),
+            (vec![&[1.1][..]], vec![1], 0..=3, "finite and in [0, 1]"),
+        ] {
+            let error = Batch::default()
+                .choose(Mode::Fixed, profiles.iter().copied(), &mut widths, allowed)
+                .unwrap_err();
+            assert!(error.to_string().contains(why), "{error}");
+        }
     }
 
     /// `E(k)` is row 0 and the accepted ids, and the tally's `E` the mean

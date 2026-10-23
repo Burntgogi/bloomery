@@ -324,6 +324,9 @@ pub enum QuantError {
     /// the span.
     #[error("f8_e4m3 value {at} is byte {byte:#04x}, E4M3's NaN")]
     E4m3Nan { at: usize, byte: u8 },
+    /// An F8_E4M3 value whose product with the tensor scale is not finite.
+    #[error("f8_e4m3 value {at} is byte {byte:#04x}, its scaled value is not finite")]
+    E4m3NonFinite { at: usize, byte: u8 },
 }
 
 /// Dequantize `n = dst.len()` values of one contiguous span of type `ty`.
@@ -955,10 +958,11 @@ fn ue4m3(byte: u8) -> Result<f32, &'static str> {
 /// Rows of bloomery's F8 type ([`GgmlType::F8E4M3_ROWS`], one byte a value) decoded: each byte an
 /// F8_E4M3 value (OCP E4M3FN: a sign bit, four exponent bits of bias 7, three
 /// mantissa bits, `m · 2^-9` at exponent 0) times the tensor's scale, the one
-/// rounding of the exact value's product with the scale. 0x7F and 0xFF,
-/// E4M3's NaNs, hold no value: a span holding one is refused by name.
+/// rounding of the exact value's product with the scale. A span holding
+/// 0x7F or 0xFF (E4M3's NaNs), or a scaled value that is not finite, is
+/// refused by name before any value is written.
 pub struct E4m3Rows {
-    /// Each byte's value times the scale; a NaN byte's entry is never read.
+    /// Each byte's value times the scale, including non-finite results.
     table: [f32; 256],
 }
 
@@ -978,13 +982,35 @@ impl E4m3Rows {
         E4m3Rows { table }
     }
 
+    /// Whether every byte in `src` has a finite value at the tensor's scale.
+    ///
+    /// # Errors
+    ///
+    /// The first non-finite scaled value, [`QuantError::E4m3Nan`] for a NaN
+    /// byte or [`QuantError::E4m3NonFinite`] otherwise, naming its index.
+    pub fn check(&self, src: &[u8]) -> Result<(), QuantError> {
+        if let Some(at) = src
+            .iter()
+            .position(|&b| !self.table[usize::from(b)].is_finite())
+        {
+            let byte = src[at];
+            return Err(if byte & 0x7F == 0x7F {
+                QuantError::E4m3Nan { at, byte }
+            } else {
+                QuantError::E4m3NonFinite { at, byte }
+            });
+        }
+        Ok(())
+    }
+
     /// `src`'s bytes decoded into `dst`, one value a byte.
     ///
     /// # Errors
     ///
     /// [`QuantError::ShortSrc`] when `src` holds fewer bytes than `dst`
-    /// values, and [`QuantError::E4m3Nan`] for the first NaN byte, before any
-    /// value of the span is written.
+    /// values. The first byte whose scaled value is not finite is
+    /// [`QuantError::E4m3Nan`] for a NaN byte or [`QuantError::E4m3NonFinite`]
+    /// otherwise, before any value of the span is written.
     pub fn decode(&self, src: &[u8], dst: &mut [f32]) -> Result<(), QuantError> {
         let src = src.get(..dst.len()).ok_or(QuantError::ShortSrc {
             ty: GgmlType::F8E4M3_ROWS,
@@ -992,9 +1018,7 @@ impl E4m3Rows {
             need: dst.len(),
             n: dst.len(),
         })?;
-        if let Some(at) = src.iter().position(|&b| b & 0x7F == 0x7F) {
-            return Err(QuantError::E4m3Nan { at, byte: src[at] });
-        }
+        self.check(src)?;
         for (o, &b) in dst.iter_mut().zip(src) {
             *o = self.table[usize::from(b)];
         }
@@ -1040,44 +1064,94 @@ impl Nvfp4Rows {
     /// sub-block 0), before any value of the span is written.
     pub fn decode(&self, src: &[u8], dst: &mut [f32]) -> Result<(), QuantError> {
         let ty = GgmlType::NVFP4_ROWS;
-        if !dst.len().is_multiple_of(16) {
-            return Err(QuantError::UnalignedDst {
-                ty,
-                dst: dst.len(),
-                blck: 16,
-            });
-        }
-        let need = dst.len() / 16 * 9;
+        let need = Self::group_count(dst.len())? * 9;
         let src = src.get(..need).ok_or(QuantError::ShortSrc {
             ty,
             src: src.len(),
             need,
             n: dst.len(),
         })?;
-        let (groups, _) = src.as_chunks::<9>();
-        let undefined = groups.iter().enumerate().find_map(|(block, g)| {
-            let why = match ue4m3(g[0]) {
-                Err(why) => Some(why),
-                Ok(half) => g[1..]
-                    .iter()
-                    .flat_map(|&q| fp4_pair(q))
-                    .any(|v| !(half * f32::from(v) * self.scale).is_finite())
-                    .then_some("a value times the tensor scale leaves f32's range"),
-            };
-            why.map(|why| (block, g[0], why))
+        let groups = src.as_chunks::<9>().0.iter().map(|g| {
+            let [scale, codes @ ..] = g;
+            (*scale, codes)
         });
+        self.decode_groups(groups, dst)
+    }
+
+    /// Separate code and block-scale planes decoded with the same rounding
+    /// and refusals as [`Self::decode`], without packing an intermediate row.
+    pub fn decode_planes(
+        &self,
+        codes: &[u8],
+        scales: &[u8],
+        dst: &mut [f32],
+    ) -> Result<(), QuantError> {
+        let groups = Self::group_count(dst.len())?;
+        let take = |src: &[u8], need| {
+            if src.len() < need {
+                Err(QuantError::ShortSrc {
+                    ty: GgmlType::NVFP4_ROWS,
+                    src: src.len(),
+                    need,
+                    n: dst.len(),
+                })
+            } else {
+                Ok(())
+            }
+        };
+        take(codes, groups * 8)?;
+        take(scales, groups)?;
+        let groups = codes[..groups * 8]
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .zip(&scales[..groups])
+            .map(|(codes, &scale)| (scale, codes));
+        self.decode_groups(groups, dst)
+    }
+
+    fn group_count(values: usize) -> Result<usize, QuantError> {
+        if !values.is_multiple_of(16) {
+            return Err(QuantError::UnalignedDst {
+                ty: GgmlType::NVFP4_ROWS,
+                dst: values,
+                blck: 16,
+            });
+        }
+        Ok(values / 16)
+    }
+
+    fn decode_groups<'a>(
+        &self,
+        groups: impl Iterator<Item = (u8, &'a [u8; 8])> + Clone,
+        dst: &mut [f32],
+    ) -> Result<(), QuantError> {
+        let undefined = groups
+            .clone()
+            .enumerate()
+            .find_map(|(block, (byte, codes))| {
+                let why = match ue4m3(byte) {
+                    Err(why) => Some(why),
+                    Ok(half) => codes
+                        .iter()
+                        .flat_map(|&q| fp4_pair(q))
+                        .any(|v| !(half * f32::from(v) * self.scale).is_finite())
+                        .then_some("a value times the tensor scale leaves f32's range"),
+                };
+                why.map(|why| (block, byte, why))
+            });
         if let Some((block, byte, why)) = undefined {
             return Err(QuantError::UndefinedScale {
-                ty,
+                ty: GgmlType::NVFP4_ROWS,
                 block,
                 sub: 0,
                 byte,
                 why,
             });
         }
-        for (g, out) in groups.iter().zip(dst.as_chunks_mut::<16>().0) {
-            let half = self.halves[usize::from(g[0])];
-            for (pair, &q) in out.as_chunks_mut::<2>().0.iter_mut().zip(&g[1..]) {
+        for ((byte, codes), out) in groups.zip(dst.as_chunks_mut::<16>().0) {
+            let half = self.halves[usize::from(byte)];
+            for (pair, &q) in out.as_chunks_mut::<2>().0.iter_mut().zip(codes) {
                 let [l, h] = fp4_pair(q);
                 pair[0] = half * f32::from(l) * self.scale;
                 pair[1] = half * f32::from(h) * self.scale;
@@ -2569,6 +2643,46 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn e4m3_rows_refuse_nonfinite_products_before_writing() {
+        for scale in [f32::MAX, -f32::MAX, f32::MAX / 2.0, -f32::MAX / 2.0] {
+            let rows = super::E4m3Rows::new(scale);
+            for byte in [0x40u8, 0xC0, 0x7E, 0xFE, 0x38, 0xB8, 0x00, 0x80] {
+                let sign = if byte & 0x80 == 0 { 1.0 } else { -1.0 };
+                let want = (sign * ue4m3(byte & 0x7F) * f64::from(scale)) as f32;
+                let mut dst = [f32::from_bits(0x7FC0_1234), -0.0];
+                let before = dst.map(f32::to_bits);
+                let got = rows.decode(&[0x38, byte, 0x7F], &mut dst);
+                if want.is_finite() {
+                    got.unwrap();
+                    assert_eq!(dst.map(f32::to_bits), [scale.to_bits(), want.to_bits()]);
+                } else {
+                    let error = got.expect_err("a scaled value outside f32 must be refused");
+                    let text = error.to_string();
+                    assert!(
+                        text.contains("value 1") && text.contains("not finite"),
+                        "{text}"
+                    );
+                    assert!(text.contains(&format!("{byte:#04x}")), "{text}");
+                    assert_eq!(dst.map(f32::to_bits), before);
+                }
+            }
+        }
+        for scale in [f32::INFINITY, f32::NEG_INFINITY, f32::NAN] {
+            let mut dst = [42.0, -0.0];
+            let before = dst.map(f32::to_bits);
+            let error = super::E4m3Rows::new(scale)
+                .decode(&[0x38, 0x00], &mut dst)
+                .expect_err("a non-finite scale must be refused");
+            let text = error.to_string();
+            assert!(
+                text.contains("value 0") && text.contains("not finite"),
+                "{text}"
+            );
+            assert_eq!(dst.map(f32::to_bits), before);
+        }
+    }
+
     /// A split holding a PLE table in bloomery's F8 rows and its `.scale`,
     /// opened through `Split::open`: each row, decoded at the scale read from
     /// the file, is the reference's (every byte that holds a value appears).
@@ -2961,13 +3075,20 @@ mod tests {
             for (r, (codes, scales)) in rows.iter().enumerate() {
                 let want = modelopt_row(codes, scales, scale);
                 let mut got = vec![0.0f32; want.len()];
-                decode.decode(&nvfp4_rows(codes, scales), &mut got).unwrap();
-                for (i, (g, w)) in got.iter().zip(&want).enumerate() {
-                    assert_eq!(
-                        g.to_bits(),
-                        *w,
-                        "scale {scale:e} row {r} value {i}: got {g:e}"
-                    );
+                for separate in [false, true] {
+                    got.fill(f32::NAN);
+                    if separate {
+                        decode.decode_planes(codes, scales, &mut got).unwrap();
+                    } else {
+                        decode.decode(&nvfp4_rows(codes, scales), &mut got).unwrap();
+                    }
+                    for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                        assert_eq!(
+                            g.to_bits(),
+                            *w,
+                            "scale {scale:e} row {r} value {i} separate={separate}: got {g:e}"
+                        );
+                    }
                 }
             }
         }
@@ -2996,6 +3117,10 @@ mod tests {
                 }
             );
             assert!(e.to_string().contains("block 3 sub-block 0"), "{e}");
+            assert_eq!(dst, [0.0; 80], "a refusal must leave dst unchanged");
+            let mut scales = [0x38; 5];
+            scales[3] = byte;
+            assert_eq!(decode.decode_planes(&[0x38; 40], &scales, &mut dst), Err(e));
             assert_eq!(dst, [0.0; 80], "a refusal must leave dst unchanged");
         }
         for (code, byte, divisor) in [(0x77, 0x38, 8.0), (0x22, 0x40, 2.0)] {
@@ -3030,6 +3155,26 @@ mod tests {
                 blck: 16
             })
         );
+        assert!(matches!(
+            decode.decode_planes(&[0x38; 8], &[0x38], &mut [0.0; 8]),
+            Err(QuantError::UnalignedDst { dst: 8, .. })
+        ));
+        assert!(matches!(
+            decode.decode_planes(&[0x38; 7], &[0x38], &mut [0.0; 16]),
+            Err(QuantError::ShortSrc {
+                src: 7,
+                need: 8,
+                ..
+            })
+        ));
+        assert!(matches!(
+            decode.decode_planes(&[0x38; 8], &[], &mut [0.0; 16]),
+            Err(QuantError::ShortSrc {
+                src: 0,
+                need: 1,
+                ..
+            })
+        ));
         assert_eq!(
             decode.decode(&[0x38; 9], &mut [0.0; 32]),
             Err(QuantError::ShortSrc {

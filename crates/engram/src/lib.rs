@@ -26,8 +26,8 @@
 //!   is one page from the first. `MADV_WILLNEED` is unaffected — that path does
 //!   not consult the VMA flags — so [`Site::prefetch`] still works.
 //! * **Prefetch is a cold-path lever and a warm-path tax.** It costs one
-//!   syscall per row whether or not the page is resident, so a caller that
-//!   expects hits should not pay it.
+//!   syscall per distinct merged page run whether or not its pages are
+//!   resident, so a caller that expects hits should not pay it.
 //! * **Borrowing moves the faults onto whoever reads.** A consumer that reads
 //!   through the mapping takes one minor fault per row no matter who advised
 //!   the pages, and the engine's step is its calling thread's serial time. So
@@ -406,11 +406,8 @@ impl Site {
 
     /// Start the reads for `ids` and return without waiting.
     ///
-    /// One `madvise(WILLNEED)` per row, which is how ik's own port does it: the
-    /// kernel submits each row's page(s) and the later touch finds them in
-    /// flight. That turns 48 serial faults into one batch at the drive's queue
-    /// depth. The cost is one syscall per row, paid whether or not the page is
-    /// already resident.
+    /// One `madvise(WILLNEED)` per distinct page run. Repeated and neighbouring
+    /// rows share advice; the later touch finds their reads in flight.
     pub fn prefetch(&self, ids: &[u32]) -> Result<(), EngramError> {
         self.view().prefetch(ids)
     }
@@ -640,16 +637,29 @@ impl TableBytes<'_> {
         Ok((first, end - first))
     }
 
-    /// One `madvise(advice)` over each row's pages, `op` naming it in a
-    /// refusal.
+    /// The distinct page runs of `ids`, sorted and joined at page boundaries.
+    fn page_runs(&self, ids: &[u32]) -> Result<Vec<(usize, usize)>, EngramError> {
+        let mut spans: Vec<(usize, usize)> = Vec::new();
+        for (first, last) in adjacent_runs(ids) {
+            let (at, len) = self.run_pages(first, last)?;
+            match spans.last_mut() {
+                Some((start, size)) if at <= *start + *size => {
+                    *size = (*start + *size).max(at + len) - *start;
+                }
+                _ => spans.push((at, len)),
+            }
+        }
+        Ok(spans)
+    }
+
+    /// One `madvise(advice)` per distinct page run, `op` naming a refusal.
     fn advise(
         &self,
         ids: &[u32],
         advice: libc::c_int,
         op: &'static str,
     ) -> Result<(), EngramError> {
-        for &id in ids {
-            let (first, len) = self.pages(id)?;
+        for (first, len) in self.page_runs(ids)? {
             self.advise_pages(first, len, advice, op)?;
         }
         Ok(())
@@ -673,6 +683,11 @@ impl TableBytes<'_> {
         advice: libc::c_int,
         op: &'static str,
     ) -> Result<(), EngramError> {
+        #[cfg(test)]
+        use crate::tests::recording_madvise as madvise;
+        #[cfg(not(test))]
+        use libc::madvise;
+
         // SAFETY: every caller supplies whole pages inside the file mapping
         // `bytes` lies in; madvise reads and writes no memory of ours
         // through them. The one advice that can change what a read returns
@@ -682,7 +697,7 @@ impl TableBytes<'_> {
         // files and nothing else), where it drops the page-table entries and
         // the next touch reads the file's bytes again. A run table's
         // (`rows::RunTable`) maps its files read-only too.
-        let rc = unsafe { libc::madvise(first as *mut libc::c_void, len, advice) };
+        let rc = unsafe { madvise(first as *mut libc::c_void, len, advice) };
         if rc == 0 {
             Ok(())
         } else {
@@ -690,19 +705,18 @@ impl TableBytes<'_> {
         }
     }
 
-    /// [`Site::prefetch`]'s read: `WILLNEED` over each row's pages.
+    /// [`Site::prefetch`]'s read: `WILLNEED` over the distinct page runs.
     fn prefetch(&self, ids: &[u32]) -> Result<(), EngramError> {
         self.advise(ids, libc::MADV_WILLNEED, "madvise(WILLNEED)")
     }
 
-    /// [`Site::populate`]'s read: `POPULATE_READ` over each row's pages.
+    /// [`Site::populate`]'s read: `POPULATE_READ` over the distinct page runs.
     fn populate(&self, ids: &[u32]) -> Result<(), EngramError> {
         let page = u64::try_from(self.page).expect("a page size fits a u64");
-        for &id in ids {
-            let (first, len) = self.pages(id)?;
+        for (first, len) in self.page_runs(ids)? {
             let addr = first as *mut libc::c_void;
-            // SAFETY: the range is whole pages inside the mapping (`pages`
-            // rounds a row out to the mapping's own pages).
+            // SAFETY: page_runs joins only overlapping or adjacent whole
+            // pages inside the same file mapping.
             unsafe { os::populate_span(addr, len, page, || os::advise_populate(addr, len)) }
                 .map_err(|e| self.io("madvise(POPULATE_READ)", e.into()))?;
         }
@@ -839,6 +853,16 @@ pub trait RowTables: Send + Sync {
     fn table(&self, i: usize) -> Option<&dyn RowTable>;
 }
 
+impl<T: RowTable> RowTables for Vec<T> {
+    fn count(&self) -> usize {
+        self.len()
+    }
+
+    fn table(&self, i: usize) -> Option<&dyn RowTable> {
+        self.get(i).map(|t| t as &dyn RowTable)
+    }
+}
+
 impl RowTables for Engram {
     fn count(&self) -> usize {
         self.sites.len()
@@ -972,6 +996,93 @@ fn faults_of(who: libc::c_int) -> Faults {
 #[cfg(test)]
 mod tests {
     use super::{EngramError, RawTensorInfo, Site, adjacent_runs};
+
+    std::thread_local! {
+        static MADVISE_CALLS: std::cell::RefCell<Vec<(usize, usize, libc::c_int)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// # Safety
+    /// `addr` and `len` must name whole pages inside a read-only file mapping.
+    pub(super) unsafe fn recording_madvise(
+        addr: *mut libc::c_void,
+        len: usize,
+        advice: libc::c_int,
+    ) -> libc::c_int {
+        // SAFETY: the caller supplies whole pages in a read-only file mapping.
+        let rc = unsafe { libc::madvise(addr, len, advice) };
+        if rc == 0 {
+            MADVISE_CALLS.with_borrow_mut(|calls| calls.push((addr as usize, len, advice)));
+        }
+        rc
+    }
+
+    // PIN(2026-10-23): this syscall test subsumes page_runs_advise_each_requested_page_once.
+    #[test]
+    fn prefetch_advises_the_requested_page_runs() {
+        let page = super::page_size();
+        let path = std::env::temp_dir().join(format!("engram-advice-{}", std::process::id()));
+        for row_bytes in [12, page, page + 12] {
+            for offset in [0, 3] {
+                let base = page + offset;
+                let len = base + row_bytes * 32 + page;
+                std::fs::File::create(&path)
+                    .unwrap()
+                    .set_len(len as u64)
+                    .unwrap();
+                let tensor = RawTensorInfo {
+                    name: "blk.1.engram_embd.weight".to_string(),
+                    dims: vec![(row_bytes / 4) as u64, 32],
+                    type_id: 0,
+                    offset: offset as u64,
+                    nbytes: Some((row_bytes * 32) as u64),
+                };
+                let site = Site::open(&path, page as u64, len as u64, &tensor).unwrap();
+                let ids = [31, 15, 2, 0, 2, 1, 8, 9];
+                let mut expected = std::collections::BTreeSet::new();
+                for &id in &ids {
+                    let start = site.map.as_ptr() as usize + base + id as usize * row_bytes;
+                    expected.extend(start / page..=(start + row_bytes - 1) / page);
+                }
+                let expected: Vec<_> = expected.into_iter().collect();
+                for prefetch in [Site::prefetch, <Site as super::RowTable>::prefetch] {
+                    MADVISE_CALLS.with_borrow_mut(Vec::clear);
+                    prefetch(&site, &ids).unwrap();
+                    let calls = MADVISE_CALLS.with_borrow_mut(std::mem::take);
+                    assert!(
+                        !calls.is_empty(),
+                        "prefetch must advise the requested pages"
+                    );
+                    assert!(
+                        calls.iter().all(|&(at, len, advice)| {
+                            at.is_multiple_of(page)
+                                && len > 0
+                                && len.is_multiple_of(page)
+                                && advice == libc::MADV_WILLNEED
+                        }),
+                        "prefetch must use WILLNEED over whole pages"
+                    );
+                    let actual: Vec<_> = calls
+                        .iter()
+                        .flat_map(|&(at, len, _)| at / page..(at + len) / page)
+                        .collect();
+                    assert_eq!(
+                        actual, expected,
+                        "prefetch must advise exactly the row pages"
+                    );
+                    assert!(calls.windows(2).all(|w| w[0].0 + w[0].1 < w[1].0));
+                    prefetch(&site, &[]).unwrap();
+                    assert!(MADVISE_CALLS.with_borrow(Vec::is_empty));
+                    assert!(matches!(
+                        prefetch(&site, &[0, 32]),
+                        Err(EngramError::RowOutOfRange { .. })
+                    ));
+                    assert!(MADVISE_CALLS.with_borrow(Vec::is_empty));
+                }
+            }
+        }
+        std::fs::remove_file(&path).unwrap();
+    }
 
     /// A table whose start or end passes u64 is past the end of its file, named
     /// with the data base and the header's offset: an F32 [4, 1] table in an

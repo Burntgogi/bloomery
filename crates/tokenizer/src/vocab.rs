@@ -1,6 +1,13 @@
 //! The vocabulary as the reference loads it (`llama_vocab::impl::load`):
 //! token texts and attributes, the special ids, the attribute overrides it
 //! applies by token text, and the special-token list the partition walks.
+//!
+//! `tokenizer.ggml.eog_token_ids` is an authoritative, nonempty stop set:
+//! integer ids are bounds-checked, sorted and deduplicated. It replaces guessed
+//! stops without disabling GGUF's token-attribute/role overrides or changing BPE.
+//! The private `tokenizer.bloomery.eog_token_ids` additionally selects the HF
+//! raw-text/BPE contract. When both keys occur, their canonical sets must agree;
+//! the private key still selects HF semantics. Neither list changes BOS/EOS insertion.
 
 use std::collections::{HashMap, HashSet};
 
@@ -239,6 +246,32 @@ impl<'a> Meta<'a> {
         }
     }
 
+    fn stops(&mut self, key: &'static str, n: usize) -> Result<Option<Vec<u32>>, Error> {
+        self.ints(key)?
+            .map(|ids| {
+                if ids.is_empty() {
+                    return Err(Error::InvalidStops(format!("{key} is empty")));
+                }
+                let mut stops = ids
+                    .into_iter()
+                    .map(|id| {
+                        u32::try_from(id)
+                            .ok()
+                            .filter(|&id| (id as usize) < n)
+                            .ok_or_else(|| {
+                                Error::InvalidStops(format!(
+                                    "{key} contains id {id} outside the vocabulary of {n}"
+                                ))
+                            })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                stops.sort_unstable();
+                stops.dedup();
+                Ok(stops)
+            })
+            .transpose()
+    }
+
     fn scores(&mut self, n_tokens: usize) -> Result<Vec<f32>, Error> {
         const KEY: &str = "tokenizer.ggml.scores";
         let mut scores = match self.get(KEY) {
@@ -327,30 +360,16 @@ impl Vocab {
         }
 
         let n = texts.len();
-        let explicit_stops = m
-            .ints("tokenizer.bloomery.eog_token_ids")?
-            .map(|ids| {
-                if ids.is_empty() {
-                    return Err(Error::InvalidStops("is empty".into()));
-                }
-                let mut stops = ids
-                    .into_iter()
-                    .map(|id| {
-                        u32::try_from(id)
-                            .ok()
-                            .filter(|&id| (id as usize) < n)
-                            .ok_or_else(|| {
-                                Error::InvalidStops(format!(
-                                    "contains id {id} outside the vocabulary of {n}"
-                                ))
-                            })
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                stops.sort_unstable();
-                stops.dedup();
-                Ok(stops)
-            })
-            .transpose()?;
+        let explicit_stops = m.stops("tokenizer.bloomery.eog_token_ids", n)?;
+        let ggml_stops = m.stops("tokenizer.ggml.eog_token_ids", n)?;
+        if let (Some(hf), Some(ggml)) = (&explicit_stops, &ggml_stops)
+            && hf != ggml
+        {
+            return Err(Error::InvalidStops(
+                "tokenizer.bloomery.eog_token_ids conflicts with tokenizer.ggml.eog_token_ids"
+                    .into(),
+            ));
+        }
         let hf_texts = explicit_stops.as_ref().map(|_| texts.clone());
         let mut token_to_id = HashMap::with_capacity(n);
         let mut attrs = Vec::with_capacity(n);
@@ -373,14 +392,13 @@ impl Vocab {
                 };
                 let pre = crate::named(&Pre::NAMES, name)
                     .ok_or_else(|| Error::UnsupportedPre(name.to_string()))?;
-                // The explicit stop list marks a Hugging Face tokenizer, whose qwen35 runs as
-                // its tokenizer.json does.
+                // Only the private stop key marks a Hugging Face tokenizer.
                 let pre = match (pre, explicit_stops.is_some()) {
                     (Pre::Qwen35, true) => Pre::Qwen35Hf,
                     (pre, false) => pre,
                     (_, true) => {
                         return Err(Error::InvalidStops(format!(
-                            "marks a Hugging Face qwen35 tokenizer, not pre-tokenizer {name:?}"
+                            "tokenizer.bloomery.eog_token_ids marks a Hugging Face qwen35 tokenizer, not pre-tokenizer {name:?}"
                         )));
                     }
                 };
@@ -394,7 +412,7 @@ impl Vocab {
             }
             Model::Spm if explicit_stops.is_some() => {
                 return Err(Error::InvalidStops(
-                    "marks a Hugging Face qwen35 tokenizer, not SentencePiece".into(),
+                    "tokenizer.bloomery.eog_token_ids marks a Hugging Face qwen35 tokenizer, not SentencePiece".into(),
                 ));
             }
             Model::Spm => (
@@ -495,6 +513,9 @@ impl Vocab {
             v.eog = stops;
         } else {
             v.apply_overrides();
+            if let Some(stops) = ggml_stops {
+                v.eog = stops;
+            }
         }
         Ok((v, encoding, hf_texts))
     }
@@ -524,7 +545,7 @@ impl Vocab {
         }
     }
 
-    /// The reference's text-based attribute rules, in its order.
+    /// Apply reference attribute rules in order, including pre-tokenizer-specific stop names.
     fn apply_overrides(&mut self) {
         self.detect("eot", EOT_NAMES, |s| &mut s.eot);
         self.detect("eom", EOM_NAMES, |s| &mut s.eom);
@@ -546,7 +567,11 @@ impl Vocab {
             .into_iter()
             .flatten()
             .collect();
-        for name in EOG_NAMES {
+        for name in EOG_NAMES.iter().chain(if self.pre == "flint" {
+            ["<|user|>", "<|observation|>"].as_slice()
+        } else {
+            &[]
+        }) {
             if let Some(id) = self.id_of(name) {
                 eog.insert(id);
                 self.attrs[id as usize] |= attr::CONTROL;

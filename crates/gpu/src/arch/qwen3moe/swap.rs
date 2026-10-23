@@ -188,19 +188,21 @@ mod tests {
         }
     }
 
-    /// Qwen3.8's leg, as its table held it: a Q4_K, Q5_K, IQ3_XXS or IQ4_XS
-    /// gate and up of one type with a Q5_1, Q8_0 or IQ4_NL down is a card
-    /// layer, and the refusal's text lists the types as the table did; a Q4_K
+    /// Qwen3.8's leg (`accepts::qwen38_gate_up`: the planes leg's gate·up
+    /// types that have a prompt GEMM): a Q4_K, Q5_K, IQ3_XXS, IQ3_S, IQ4_XS or
+    /// NVFP4 gate and up of one type with a Q5_1, Q8_0, IQ4_NL or NVFP4 down is
+    /// a card layer, and the refusal's text lists those types; a Q4_K
     /// down (a down type its gate·up reads) and a Q6_K one (a type no part
     /// reads) are refused. Mutant: Qwen3.6's down arm for Qwen3.8's — the
     /// Q5_1 and IQ4_NL arms are refused, the Q4_K one passes.
     #[test]
     fn qwen38s_leg_keeps_its_table() {
-        use GgmlType::{IQ3_XXS, IQ4_NL, IQ4_XS, NVFP4, Q4_K, Q5_1, Q5_K, Q6_K, Q8_0};
+        use GgmlType::{IQ3_S, IQ3_XXS, IQ4_NL, IQ4_XS, NVFP4, Q4_K, Q5_1, Q5_K, Q6_K, Q8_0};
         for ok in [
             [Q4_K, Q4_K, Q5_1],
             [Q5_K, Q5_K, Q8_0],
             [IQ3_XXS, IQ3_XXS, IQ4_NL],
+            [IQ3_S, IQ3_S, Q5_1],
             [IQ4_XS, IQ4_XS, Q8_0],
             [NVFP4, NVFP4, NVFP4],
         ] {
@@ -213,12 +215,16 @@ mod tests {
             [Q5_1, Q5_1, Q5_1],
         ] {
             let text = layer::<Leg38>(bad).expect_err(&format!("{bad:?} is refused"));
+            // PIN(2026-10-22): IQ3_S joined the list. `qwen38_gate_up` reads the planes leg's
+            // gate·up types that have a prompt GEMM, and `gemm_iq3s` gave IQ3_S one; the gate·up
+            // dispatch runs it on the leg's shared arm. Mutant: IQ3_S dropped from
+            // `card_gate_up_runs` (the list and the IQ3_S card layer above both turn red).
             assert_eq!(
                 text,
                 format!(
                     "layer 0's gate {}, up {} and down {}: the card leg runs a gate and an up \
-                     of one type, [Q4_K, Q5_K, IQ3_XXS, IQ4_XS, NVFP4], and a down of [Q5_1, \
-                     Q8_0, IQ4_NL, NVFP4]",
+                     of one type, [Q4_K, Q5_K, IQ3_XXS, IQ3_S, IQ4_XS, NVFP4], and a down \
+                     of [Q5_1, Q8_0, IQ4_NL, NVFP4]",
                     bad[0], bad[1], bad[2]
                 )
             );

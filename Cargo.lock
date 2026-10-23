@@ -85,6 +85,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bloomery-chain"
+version = "0.1.0"
+dependencies = [
+ "bloomery-gguf",
+ "bloomery-model",
+ "bloomery-runtime",
+]
+
+[[package]]
 name = "bloomery-decision"
 version = "0.1.0"
 dependencies = [
@@ -151,6 +160,8 @@ dependencies = [
 name = "bloomery-gpu"
 version = "0.1.0"
 dependencies = [
+ "bloomery-chain",
+ "bloomery-device",
  "bloomery-engram",
  "bloomery-gguf",
  "bloomery-levers",
@@ -190,6 +201,7 @@ version = "0.3.8"
 dependencies = [
  "bloomery-app",
  "bloomery-decision",
+ "bloomery-device",
  "bloomery-engram",
  "bloomery-gguf",
  "bloomery-gpu",
@@ -354,7 +366,9 @@ name = "bloomery-metal"
 version = "0.1.0"
 dependencies = [
  "bloomery-device",
+ "bloomery-gguf",
  "bloomery-placement",
+ "bloomery-refset",
  "dispatch2",
  "objc2",
  "objc2-foundation",

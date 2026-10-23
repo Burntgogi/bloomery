@@ -33,8 +33,12 @@ use std::mem::ManuallyDrop;
 use std::ops::Range;
 
 /// The lm_head tensor's name, and the token embedding that serves as it when the file ties them.
-pub const HEAD_TENSOR: &str = "output.weight";
+pub use ::model::placement::HEAD_TENSOR;
 const EMBED_TENSOR: &str = "token_embd.weight";
+
+fn file_format(t: &TensorInfo) -> Option<CardFormat> {
+    ::model::placement::file_card_format(&t.name, t.ty, *t.dims.first()?)
+}
 
 /// The file tensor that is `split`'s lm_head: `output.weight`, or `token_embd.weight` when the
 /// file carries no `output.weight` (tied embeddings: llama.cpp's loader falls back to the token
@@ -246,7 +250,7 @@ const PARTS: &str = "Weights::add_parts";
 /// ([`Weights::add_parts`] checks each again with its bytes).
 pub fn part_format(t: &TensorInfo) -> Result<(CardFormat, usize), GpuError> {
     file_slot(&t.name)?;
-    let format = CardFormat::of(t.ty).ok_or_else(|| {
+    let format = file_format(t).ok_or_else(|| {
         GpuError::shape(
             PARTS,
             format!(
@@ -258,7 +262,8 @@ pub fn part_format(t: &TensorInfo) -> Result<(CardFormat, usize), GpuError> {
     tp::check_bytes(t).map_err(|e| GpuError::shape(PARTS, e.to_string()))?;
     let bytes = usize::try_from(t.dims[0])
         .ok()
-        .and_then(|k| resident_size(t.ty, k, tensor_rows(t)))
+        .and_then(|k| format.resident_bytes(t.ty, k as u64, tensor_rows(t) as u64))
+        .and_then(|bytes| usize::try_from(bytes).ok())
         .ok_or_else(|| {
             GpuError::shape(
                 PARTS,
@@ -1107,12 +1112,9 @@ fn tensor_rows(t: &TensorInfo) -> usize {
     t.dims[1..].iter().product::<u64>() as usize
 }
 
-/// Resident device bytes a file tensor of this type and shape takes in the
-/// formats above (`rows` as [`tensor_rows`] counts them); `None` when the
-/// type has no device format or the shape has no layout in it. The uploads
-/// refuse and check by the same arithmetic ([`CardFormat::resident_bytes`]),
-/// so a census totals check against a loaded `Weights::resident_bytes` pins
-/// the two together.
+/// Resident bytes in the type's default card format, with `rows` rows of
+/// `k` values; `None` when the type or shape has no layout. A file tensor's
+/// name can select another format: its census uses [`part_format`].
 #[must_use]
 pub fn resident_size(ty: GgmlType, k: usize, rows: usize) -> Option<usize> {
     let (k, rows) = (u64::try_from(k).ok()?, u64::try_from(rows).ok()?);
@@ -1354,7 +1356,7 @@ fn upload_file_tensor_with<'g>(
     t: &TensorInfo,
     find: impl Fn(&str) -> Option<(&'g Gguf, &'g TensorInfo)>,
 ) -> Result<DevWeight, GpuError> {
-    let Some(format) = CardFormat::of(t.ty) else {
+    let Some(format) = file_format(t) else {
         return Err(GpuError::shape(
             "Weights::load",
             format!("tensor {} has type {} with no device format", t.name, t.ty),
@@ -1386,15 +1388,13 @@ pub(crate) fn tensor_scales<'g>(
 }
 
 /// The bytes `t`'s upload moves, for sizing a load's staging ring: its
-/// resident size where its type has a device layout, its file bytes
-/// otherwise — a sizing hint, never a contract (the uploads check their own
-/// lengths).
+/// resident size in its named file format, its file bytes otherwise. This
+/// is a sizing hint, never a contract: the uploads check their own lengths.
 fn upload_budget(t: &TensorInfo) -> usize {
-    usize::try_from(t.dims[0])
-        .ok()
-        .and_then(|k| resident_size(t.ty, k, tensor_rows(t)))
-        .or_else(|| usize::try_from(t.nbytes).ok())
-        .unwrap_or(usize::MAX)
+    part_format(t).map_or_else(
+        |_| usize::try_from(t.nbytes).unwrap_or(usize::MAX),
+        |(_, bytes)| bytes,
+    )
 }
 
 /// Pack `rows` rows of file tensor `t` — all of them, or an expert stack's
@@ -1561,8 +1561,13 @@ fn upload_rows(
             } else {
                 E4m3Scales::Fp8B128
             };
-            let (qs, e) = e4m3_planes(scales, &flat_of(src, take)?, rows, k)
-                .map_err(|err| GpuError::shape(what, format!("tensor {name}: {err}")))?;
+            let bytes = flat_of(src, take)?;
+            let (qs, e) = if t.ty == GgmlType::BF16 {
+                crate::q8f32::bf16_mxfp8_planes(&bytes, rows, k)
+            } else {
+                e4m3_planes(scales, &bytes, rows, k)
+            }
+            .map_err(|err| GpuError::shape(what, format!("tensor {name}: {err}")))?;
             let qs = upload_packed(stream, ring, what, name, &qs, rows, k / 4)?;
             let e = upload_packed(stream, ring, what, name, &e, rows, k / 128)?;
             match scales {
@@ -1698,7 +1703,10 @@ pub fn q8_0_planes(blocks: &[Q8Block]) -> (Vec<u32>, Vec<u16>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{HEAD_TENSOR, TensorPart, derived_slot_free, file_slot, head_tensor, part_formats};
+    use super::{
+        HEAD_TENSOR, TensorPart, derived_slot_free, file_slot, head_tensor, part_format,
+        part_formats, upload_budget,
+    };
     use gguf::Split;
     use gguf::write::{Layout, TensorDecl, Writer};
     use gguf::{GgmlType, TensorInfo};
@@ -1723,6 +1731,29 @@ mod tests {
             w.tensor(n, &[0u8; 32]).unwrap_or_else(|e| panic!("{e}"));
         }
         w.finish().unwrap_or_else(|e| panic!("{e}"));
+    }
+
+    #[test]
+    fn file_upload_budget_counts_the_named_format() {
+        for (name, ty, k, bytes) in [
+            (HEAD_TENSOR, GgmlType::BF16, 256, 16_896),
+            (HEAD_TENSOR, GgmlType::BF16, 320, 40_960),
+            ("token_embd.weight", GgmlType::BF16, 256, 65_536),
+            ("plain.weight", GgmlType::BF16, 256, 65_536),
+            (HEAD_TENSOR, GgmlType::F32, 256, 65_536),
+            (HEAD_TENSOR, GgmlType::Q8_0, 256, 17_408),
+        ] {
+            let (block, size) = (ty.blck_size().unwrap(), ty.type_size().unwrap());
+            let t = TensorInfo {
+                name: name.into(),
+                ty,
+                dims: vec![k, 64],
+                offset: 0,
+                nbytes: k / block * size * 64,
+            };
+            assert_eq!(part_format(&t).unwrap().1, bytes, "{name} {ty} k={k}");
+            assert_eq!(upload_budget(&t), bytes, "{name} {ty} k={k}");
+        }
     }
 
     /// The head is `output.weight` when the file has it, the token embedding

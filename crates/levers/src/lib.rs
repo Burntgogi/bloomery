@@ -2016,8 +2016,7 @@ pub struct Draft38At<'a> {
     pub logits: bool,
     /// `BLOOMERY_ROUTE_TRACE` is set.
     pub route_trace: bool,
-    /// The MTP draft file the run would open, and whether a regular file is
-    /// there.
+    /// The MTP source the run would open, and whether it is present.
     pub file: &'a Path,
     pub file_is_there: bool,
     /// Every path the unset pick checked, in order. Empty means the caller
@@ -2062,9 +2061,19 @@ pub enum Draft38Off {
     /// sequence a rotation table the draft's walks do not read, so it carries
     /// no draft; a set [`DRAFT`]`=mtp` is refused.
     Media,
-    /// Unset on the Qwen3.8 seat serving a checkpoint folder: the folder's
-    /// load reads no MTP layers; a set [`DRAFT`]`=mtp` is refused.
+    /// Unset on the Qwen3.8 seat serving a checkpoint folder without an MTP layer;
+    /// a set [`DRAFT`]`=mtp` is refused.
     Folder,
+    /// Unset on the Qwen3.8 seat serving a checkpoint folder whose MTP layer the draft
+    /// does not read, `why` the layer's refusal; a set [`DRAFT`]`=mtp` is refused with it.
+    FolderMtp { why: String },
+    /// Unset on the Qwen3.8 seat with `slots` resident sequences, more than
+    /// one, whatever the draft's source (a GGUF draft file or a checkpoint
+    /// folder's MTP layer): a drafted load runs a round of sampled or
+    /// id-banning requests as one pass, as a plain load does, and also walks
+    /// every slot's draft over its row, one store walk beside the pass; a
+    /// set [`DRAFT`]`=mtp` runs.
+    Slots { slots: usize },
 }
 
 impl fmt::Display for Draft38Off {
@@ -2109,9 +2118,15 @@ impl fmt::Display for Draft38Off {
                 "unset: --mmproj makes an image load, whose sequences hold rotation tables the \
                  MTP draft's walks do not read",
             ),
-            Draft38Off::Folder => f.write_str(
-                "unset: a checkpoint folder's load reads no MTP layers; prepare the folder into a \
-                 split and its MTP draft to draft",
+            Draft38Off::Folder => f.write_str("unset: the checkpoint folder holds no MTP layer"),
+            Draft38Off::FolderMtp { why } => write!(
+                f,
+                "unset: the checkpoint folder's MTP layer is not one the draft reads: {why}"
+            ),
+            Draft38Off::Slots { slots } => write!(
+                f,
+                "unset: --parallel {slots}; a drafted load also walks each slot's draft over every \
+                 row of a sampled or id-banning request; set {DRAFT}=mtp to draft on {slots} slots"
             ),
         }
     }
@@ -2541,8 +2556,10 @@ pub struct HostCfg {
     /// same-binary arm.
     pub r8: bool,
     /// The load is made for a route trace ([`ROUTE_TRACE`] set,
-    /// [`Levers::host`]): a Qwen3.8 load, which can run a layer without its
-    /// host leg, keeps every one, where the host service writes the trace.
+    /// [`Levers::host`]): a load that can run a layer without its host leg
+    /// (Qwen3.8, GLM-5.3) keeps every one, where the host service writes the
+    /// trace, and holds a host view only of a layer with an expert off the
+    /// card.
     pub route_trace: bool,
 }
 

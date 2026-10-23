@@ -1243,26 +1243,43 @@ fn spawn_failing(
     std::net::SocketAddr,
     std::sync::mpsc::Receiver<String>,
 ) {
-    spawn_mock(&["--port", "0", "--mock-fail-at", &k.to_string()])
+    let (child, addr, lines, _startup) =
+        spawn_mock(&["--port", "0", "--mock-fail-at", &k.to_string()]);
+    (child, addr, lines)
 }
 
 /// Starts `bloomery-serve <args>` (which must bind port 0); returns the child,
-/// its address and a channel of its stderr lines.
+/// its address, a channel of its stderr lines and the startup line.
 fn spawn_mock(
     args: &[&str],
 ) -> (
     Reaped,
     std::net::SocketAddr,
     std::sync::mpsc::Receiver<String>,
+    String,
+) {
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_bloomery-serve"));
+    command.args(args);
+    spawn_command(&mut command)
+}
+
+fn spawn_command(
+    command: &mut std::process::Command,
+) -> (
+    Reaped,
+    std::net::SocketAddr,
+    std::sync::mpsc::Receiver<String>,
+    String,
 ) {
     use std::io::BufRead;
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_bloomery-serve"))
-        .args(args)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("spawn bloomery-serve");
-    let err = child.stderr.take().expect("stderr");
+    let mut child = Reaped(
+        command
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn bloomery-serve"),
+    );
+    let err = child.0.stderr.take().expect("stderr");
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         for line in std::io::BufReader::new(err).lines().map_while(Result::ok) {
@@ -1278,7 +1295,101 @@ fn spawn_mock(
         .rsplit_once("http://")
         .and_then(|(_, a)| a.parse().ok())
         .unwrap_or_else(|| panic!("no address in {first:?}"));
-    (Reaped(child), addr, rx)
+    (child, addr, rx, first)
+}
+
+/// The process's startup, refusals, error bodies and argv carry no API key.
+#[test]
+fn a_key_never_reaches_what_the_process_prints_or_serves() {
+    const KEY: &str = "sk-this-is-the-secret-key";
+    const SENT: &str = "sk-a-wrong-key-the-client-sent";
+    let (_served, addr, lines, startup) = spawn_mock(&["--port", "0", "--api-key", KEY]);
+    let ask = r#"{"prompt":"I believe the meaning of life is","max_tokens":4}"#;
+    for headers in [&[][..], &[("Authorization", SENT)][..]] {
+        let reply = common::call_headers(addr, "POST", "/completion", headers, Some(ask));
+        assert_eq!(reply.status, 401, "{}", reply.body);
+        for secret in [KEY, SENT] {
+            assert!(!reply.body.contains(secret), "the 401 body carries a key");
+            assert!(!reply.head.contains(secret), "the 401 head carries a key");
+        }
+    }
+    assert!(
+        startup.contains("listening on"),
+        "the startup line: {startup}"
+    );
+    assert!(!startup.contains(KEY), "the startup line carries a key");
+    let mut refusals = 0;
+    while refusals < 2 {
+        let line = lines
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the refusals' stderr lines");
+        assert!(
+            !line.contains(KEY),
+            "a printed line carries the server key: {line}"
+        );
+        assert!(
+            !line.contains(SENT),
+            "a printed line carries the sent key: {line}"
+        );
+        if line.contains("refused") {
+            refusals += 1;
+        }
+    }
+    let bearer = format!("Bearer {KEY}");
+    for (method, path, body, wants) in [
+        ("GET", "/props", "", 200),
+        ("POST", "/tokenize", "{ not json", 400),
+    ] {
+        let reply = common::call_headers(
+            addr,
+            method,
+            path,
+            &[("Authorization", &bearer)],
+            Some(body),
+        );
+        assert_eq!(reply.status, wants, "{method} {path}: {}", reply.body);
+        assert!(
+            !reply.body.contains(KEY),
+            "{method} {path} carries a key: {}",
+            reply.body
+        );
+    }
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn a_failed_startup_reaps_its_child() {
+    let dir = common::fresh_dir("failed-startup");
+    let pidfile = dir.join("child.pid");
+    let mut leaked = Vec::new();
+    for failure in ["bad-address", "closed-stderr"] {
+        let mut command = std::process::Command::new("sh");
+        command.args([
+            "-c",
+            "echo $$ > \"$1\"; if [ \"$2\" = bad-address ]; then echo invalid-startup >&2; else exec 2>&-; fi; read line",
+            "startup-fixture",
+        ]);
+        command
+            .arg(&pidfile)
+            .arg(failure)
+            .stdin(std::process::Stdio::piped());
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                spawn_command(&mut command)
+            }))
+            .is_err(),
+            "{failure} must refuse startup"
+        );
+        let pid = std::fs::read_to_string(&pidfile).expect("child pid");
+        if std::path::Path::new(&format!("/proc/{}", pid.trim())).exists() {
+            leaked.push(failure);
+        }
+    }
+    common::drop_dir(&dir);
+    assert!(
+        leaked.is_empty(),
+        "startup left unreaped children: {leaked:?}"
+    );
 }
 
 #[test]
@@ -1354,7 +1465,7 @@ fn hw_props_engine_object() {
         "--alias",
         "two words",
     ];
-    let (served, addr, _stderr) = spawn_mock(&args);
+    let (served, addr, _stderr, _startup) = spawn_mock(&args);
     let props = get(addr, "/props").json();
     let e = &props["engine"];
     assert_eq!(e["name"], "bloomery", "{props}");
@@ -3308,11 +3419,12 @@ fn served_ids(addr: std::net::SocketAddr, body: &Value) -> (Vec<u64>, Value) {
     (ids, v)
 }
 
-/// A drafting engine serves what needs the logits row — sampling, and a banned
-/// end-of-generation id — through plain steps, llama-server's default
-/// temperature included: each request's ids are the plain engine's, and it
-/// drafts nothing (no draft counts in its `timings`, `/metrics`' draft sums
-/// unmoved); a greedy request after them still drafts. The sampled requests
+/// A drafting engine that drafts no sampled request serves what needs the
+/// logits row — sampling, and a banned end-of-generation id — through plain
+/// steps, llama-server's default temperature included: each request's ids
+/// are the plain engine's, and it drafts nothing (no draft counts in its
+/// `timings`, `/metrics`' draft sums unmoved); a greedy request after them
+/// still drafts. The sampled requests
 /// branch: some seed's ids are not the greedy ones. Mutant: the refusal of a
 /// sampled or id-banning request under a draft restored (a 400).
 #[test]

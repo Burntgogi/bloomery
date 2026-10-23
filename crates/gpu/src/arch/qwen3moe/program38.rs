@@ -15,7 +15,9 @@
 //!   starts every stream from the embedding); on the PLE layer the previous
 //!   combine alone, the PLE site into the other stream buffer, then a plain
 //!   mix; the mixer — the gated delta rule ([`GdnPlan`]) or the selecting
-//!   attention ([`QsaPlan`]); the feed-forward site's mix, its combine of the
+//!   attention ([`QsaPlan`]), the projection it reads last (the delta rule's
+//!   `z`, the attention's q) on the walk's [`Branch`] beside its other
+//!   launches up to that read; the feed-forward site's mix, its combine of the
 //!   mixer's output first; the router; the host leg's send (the step's
 //!   handoff and go, the pass's download);
 //! - the shadow: on a layer with card experts the card leg ([`Card38`]:
@@ -68,6 +70,7 @@ use crate::fault::{FaultSink, LAYER_HEAD};
 use crate::flash_gqa::{FlashGqaKernels, GqaSelArgs};
 use crate::flash_gqa_prefill::FlashGqaPrefill;
 use crate::gemm::{Gemm32Kernels, GemmKernels};
+use crate::graph::Forked;
 use crate::hc_gated::{
     Before, HcGatedKernels, HcMatrix, HcScratch, HcWideKernels, MixArgs, SiteWeights,
 };
@@ -90,8 +93,8 @@ use crate::rope_neox::{PartialNeoxArgs, RopeNeoxKernels};
 use crate::site;
 use crate::tensor::{DeviceTensor, Window, WindowMut};
 use crate::weights::Weights;
-use crate::{Gpu, GpuError};
-use cuda_core::DeviceBuffer;
+use crate::{Branch, Gpu, GpuError};
+use cuda_core::{CudaStream, DeviceBuffer};
 use runtime::sched::{self, At, LayerProgram, Overlap, PortKind};
 use std::ops::Range;
 
@@ -273,7 +276,20 @@ impl Ctx38<'_> {
         m: usize,
         y: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
-        site::resident_gemv_cols(self.gpu, Some(&self.k.g32), (self.w, name), x, m, y)
+        self.dense_gemv_on(self.gpu.stream(), name, x, m, y)
+    }
+
+    /// [`Ctx38::dense_gemv`] on `stream`, which the caller orders before
+    /// the output's readers.
+    fn dense_gemv_on(
+        &self,
+        stream: &CudaStream,
+        name: &str,
+        x: &DeviceBuffer<f32>,
+        m: usize,
+        y: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        site::resident_gemv_cols_on(self.gpu, stream, Some(&self.k.g32), (self.w, name), x, m, y)
     }
 
     /// The mix of `site` over `m` columns of `res`, after `before`, into
@@ -484,9 +500,10 @@ fn tap(
 impl Parts38<'_> {
     /// Layer `l`'s front up to its feed-forward site: the embedding in front
     /// of layer 0, the attention site (with the PLE site on its layer), the
-    /// mixer into `y` (module doc). Each launch bound to a sequence runs once
-    /// a sequence of the unit ([`Seqs38`]).
-    fn front(&mut self, l: usize) -> Result<(), GpuError> {
+    /// mixer into `y`, one of its projections on `branch` (module doc). Each
+    /// launch bound to a sequence runs once a sequence of the unit
+    /// ([`Seqs38`]).
+    fn front(&mut self, branch: &mut Branch, l: usize) -> Result<(), GpuError> {
         let (plans, gpu, m) = (self.plans, self.c.gpu, self.m);
         let p = plan_of(plans, l)?;
         let sink = gpu.layer_sink(l)?;
@@ -556,8 +573,8 @@ impl Parts38<'_> {
             tap(&mut self.taps, &s.res[self.cur], l - 1, gpu)?;
         }
         match &p.mixer {
-            Mixer38::Gdn(g) => gdn(c, g, l, &mut self.seqs, s, (m, self.each), sink),
-            Mixer38::Qsa(q) => qsa(c, q, l, &mut self.seqs, s, m, sink),
+            Mixer38::Gdn(g) => gdn(c, g, branch, &mut self.seqs, s, (l, m, self.each), sink),
+            Mixer38::Qsa(q) => qsa(c, q, branch, &mut self.seqs, s, (l, m), sink),
         }
     }
 
@@ -593,7 +610,7 @@ impl Parts38<'_> {
         let x = x.unwrap_or(&s.ffn_x);
         self.c.k.router.enqueue_fused(
             stream,
-            f32_tensor(self.c.w, &p.ffn.router)?,
+            gated::RouterWeight::of(self.c.w, WHAT, &p.ffn.router)?,
             x,
             self.m,
             sink,
@@ -615,26 +632,51 @@ impl Parts38<'_> {
 
     /// Layer `l`'s shared expert over `x` (`None`: the arena's `ffn_x`) into
     /// `sh_y`: gate and up, SwiGLU, down.
-    fn shared(&mut self, l: usize, x: Option<&DeviceBuffer<f32>>) -> Result<(), GpuError> {
+    fn shared(
+        &mut self,
+        stream: &CudaStream,
+        l: usize,
+        x: Option<&DeviceBuffer<f32>>,
+    ) -> Result<(), GpuError> {
         let p = plan_of(self.plans, l)?;
         let (c, m) = (&self.c, self.m);
         let s = &mut *self.s;
         let x = x.unwrap_or(&s.ffn_x);
-        c.dense_gemv(&p.ffn.gate_sh, x, m, &mut s.sh_g)?;
-        c.dense_gemv(&p.ffn.up_sh, x, m, &mut s.sh_u)?;
+        c.dense_gemv_on(stream, &p.ffn.gate_sh, x, m, &mut s.sh_g)?;
+        c.dense_gemv_on(stream, &p.ffn.up_sh, x, m, &mut s.sh_u)?;
         c.gpu
             .elem()
-            .enqueue_swiglu(c.gpu.stream(), &s.sh_g, &s.sh_u, geo::FF * m, &mut s.sh_h)?;
-        c.dense_gemv(&p.ffn.down_sh, &s.sh_h, m, &mut s.sh_y)
+            .enqueue_swiglu(stream, &s.sh_g, &s.sh_u, geo::FF * m, &mut s.sh_h)?;
+        c.dense_gemv_on(stream, &p.ffn.down_sh, &s.sh_h, m, &mut s.sh_y)
     }
 
-    /// Layer `l`'s card leg over `x` (`None`: the arena's `ffn_x`), when it
-    /// has card experts: the places in the arena's `sel`, the router's
-    /// weights, into the card sum ([`Card38::enqueue`]).
-    fn card(&mut self, l: usize, x: Option<&DeviceBuffer<f32>>) -> Result<(), GpuError> {
+    /// Layer `l`'s shadow over `x` (`None`: the arena's `ffn_x`): the shared
+    /// expert on `branch` beside the card leg on the main stream, joined
+    /// before the main stream's next launch, so the block's sum reads both.
+    /// A layer without card experts has no card leg to run beside, so its
+    /// shared expert runs on the main stream and the layer forks nothing.
+    /// Every walk here holds at most [`super::scratch38::PASS_ROWS`] rows.
+    fn beside(
+        &mut self,
+        branch: &mut Branch,
+        l: usize,
+        x: Option<&DeviceBuffer<f32>>,
+    ) -> Result<(), GpuError> {
         if !self.card.has(l) {
-            return Ok(());
+            let gpu = self.c.gpu;
+            return self.shared(gpu.stream(), l, x);
         }
+        let fork = branch.fork()?;
+        self.shared(fork.stream(), l, x)?;
+        self.card(l, x)?;
+        fork.join()
+    }
+
+    /// Layer `l`'s card leg over `x` (`None`: the arena's `ffn_x`): the
+    /// places in the arena's `sel`, the router's weights, into the card sum
+    /// ([`Card38::enqueue`], which refuses a layer without card experts by
+    /// name).
+    fn card(&mut self, l: usize, x: Option<&DeviceBuffer<f32>>) -> Result<(), GpuError> {
         let s = &*self.s;
         let x = x.unwrap_or(&s.ffn_x);
         if self.tier_k(l) > 0 {
@@ -937,20 +979,20 @@ struct GdnIo<'b> {
 
 /// A delta layer's mixer at `m` rows, layer `l` of each sequence of
 /// `seqs`, the attention site's mix in `s.mixed`, its output projection into
-/// `s.y`: the projections over every row ([`gdn_in`]), each sequence's conv
-/// and delta step over its rows and its store, in row mode when `each`
-/// ([`gdn_seq`]), then the gated norm and the output projection over every
-/// row ([`gdn_out`]).
+/// `s.y`: the projections over every row, `z` on `branch` ([`gdn_in`]), each
+/// sequence's conv and delta step over its rows and its store, in row mode
+/// when `each` ([`gdn_seq`]), the join, then the gated norm and the output
+/// projection over every row ([`gdn_out`]).
 fn gdn(
     c: &Ctx38<'_>,
     gp: &GdnPlan,
-    l: usize,
+    branch: &mut Branch,
     seqs: &mut Seqs38<'_>,
     s: &mut Arena38,
-    (m, each): (usize, bool),
+    (l, m, each): (usize, usize, bool),
     sink: FaultSink,
 ) -> Result<(), GpuError> {
-    gdn_in(c, gp, s, m)?;
+    let fork = gdn_in(c, gp, branch, s, m)?;
     let nv = GDN.n_v;
     {
         let Arena38 { gdn: g, pos, .. } = &mut *s;
@@ -1005,26 +1047,37 @@ fn gdn(
             }
         }
     }
+    fork.join()?;
     gdn_out(c, gp, s, m, sink)
 }
 
-/// A delta layer's projections over every row of `s.mixed`: q·k·v, `z` and
-/// the joined β·α into `ba` ([`beta_alpha_rows`]): one launch at one row,
-/// past it β's rows and α's rows of the joined weight, one launch each.
-fn gdn_in(c: &Ctx38<'_>, gp: &GdnPlan, s: &mut Arena38, m: usize) -> Result<(), GpuError> {
+/// A delta layer's projections over every row of `s.mixed`: q·k·v, then
+/// `branch` forked, the joined β·α into `ba` ([`beta_alpha_rows`]: one
+/// launch at one row, past it β's rows and α's rows of the joined weight,
+/// one launch each) and `z` on the branch, beside the conv and the delta
+/// step. The fork returned is joined before the gated norm reads `z`.
+fn gdn_in<'b>(
+    c: &Ctx38<'_>,
+    gp: &GdnPlan,
+    branch: &'b mut Branch,
+    s: &mut Arena38,
+    m: usize,
+) -> Result<Forked<'b>, GpuError> {
     let nv = GDN.n_v;
     let Arena38 { mixed, gdn: g, .. } = s;
     c.dense_gemv(&gp.qkv, mixed, m, &mut g.x)?;
-    c.dense_gemv(&gp.z, mixed, m, &mut g.z)?;
+    let fork = branch.fork()?;
     if m == 1 {
-        return c.dense_gemv(&gp.beta_alpha, mixed, 1, &mut g.ba);
+        c.dense_gemv(&gp.beta_alpha, mixed, 1, &mut g.ba)?;
+    } else {
+        let g32 = Some(&c.k.g32);
+        for (i, part) in [(0, nv), (nv, nv)].into_iter().enumerate() {
+            let mut y = beta_alpha_mut(&mut g.ba, m, i)?;
+            site::resident_gemv_rows(c.gpu, g32, (c.w, &gp.beta_alpha, part), mixed, m, &mut y)?;
+        }
     }
-    let g32 = Some(&c.k.g32);
-    for (i, part) in [(0, nv), (nv, nv)].into_iter().enumerate() {
-        let mut y = beta_alpha_mut(&mut g.ba, m, i)?;
-        site::resident_gemv_rows(c.gpu, g32, (c.w, &gp.beta_alpha, part), mixed, m, &mut y)?;
-    }
-    Ok(())
+    c.dense_gemv_on(fork.stream(), &gp.z, mixed, m, &mut g.z)?;
+    Ok(fork)
 }
 
 /// β's rows and α's rows of the joined projection `ba` over `m` rows, each
@@ -1181,22 +1234,22 @@ struct AttendIo<'b> {
 
 /// A selecting attention layer's mixer at `m` rows, layer `l` of each
 /// sequence of `seqs`, the attention site's mix in `s.mixed`, its output
-/// projection into `s.y`: q, k and v over every row ([`qsa_qkv`]); each
-/// sequence's indexer keys ([`qsa_keys`]) and attention ([`qsa_attend`])
-/// over its rows and its store, the indexer queries over every row between
-/// ([`qsa_query`]: after one sequence's keys, before several sequences'
-/// keys); then the gate and the output projection over every row
-/// ([`qsa_out`]).
+/// projection into `s.y`: q, k and v over every row, q on `branch`
+/// ([`qsa_qkv`]); each sequence's indexer keys ([`qsa_keys`]) and attention
+/// ([`qsa_attend`]) over its rows and its store, the indexer queries over
+/// every row between ([`qsa_query`]: after one sequence's keys, before
+/// several sequences' keys) and the join before the first attention; then
+/// the gate and the output projection over every row ([`qsa_out`]).
 fn qsa(
     c: &Ctx38<'_>,
     qp: &QsaPlan,
-    l: usize,
+    branch: &mut Branch,
     seqs: &mut Seqs38<'_>,
     s: &mut Arena38,
-    m: usize,
+    (l, m): (usize, usize),
     sink: FaultSink,
 ) -> Result<(), GpuError> {
-    qsa_qkv(c, qp, s, m)?;
+    let fork = qsa_qkv(c, qp, branch, s, m)?;
     match seqs {
         Seqs38::One { stores, .. } => {
             let (kv, raw, pooled) = qsa_of(stores, l)?;
@@ -1217,6 +1270,7 @@ fn qsa(
                 qsa_keys(c, qp, (raw, pooled), keys, m, sink)?;
             }
             qsa_query(c, qp, s, m)?;
+            fork.join()?;
             let Arena38 {
                 qsa: qa,
                 pos,
@@ -1241,6 +1295,7 @@ fn qsa(
         }
         Seqs38::Slots(seqs) => {
             qsa_query(c, qp, s, m)?;
+            fork.join()?;
             let (h, d) = (geo::HIDDEN, geo::IDX_DIM);
             let Arena38 {
                 mixed,
@@ -1288,12 +1343,22 @@ fn qsa(
 }
 
 /// A selecting layer's q (with each head's gate), k and v over every row
-/// of `s.mixed`.
-fn qsa_qkv(c: &Ctx38<'_>, qp: &QsaPlan, s: &mut Arena38, m: usize) -> Result<(), GpuError> {
+/// of `s.mixed`: `branch` forked, k and v, then q on the branch, beside
+/// them and the indexer's keys and queries. The fork returned is joined
+/// before the attention reads q.
+fn qsa_qkv<'b>(
+    c: &Ctx38<'_>,
+    qp: &QsaPlan,
+    branch: &'b mut Branch,
+    s: &mut Arena38,
+    m: usize,
+) -> Result<Forked<'b>, GpuError> {
     let Arena38 { mixed, qsa: qa, .. } = s;
-    c.dense_gemv(&qp.q, mixed, m, &mut qa.qg)?;
+    let fork = branch.fork()?;
     c.dense_gemv(&qp.k, mixed, m, &mut qa.k)?;
-    c.dense_gemv(&qp.v, mixed, m, &mut qa.v)
+    c.dense_gemv(&qp.v, mixed, m, &mut qa.v)?;
+    c.dense_gemv_on(fork.stream(), &qp.q, mixed, m, &mut qa.qg)?;
+    Ok(fork)
 }
 
 /// A selecting layer's indexer keys of one sequence's `m` rows: their
@@ -1477,6 +1542,7 @@ fn qsa_out(
 
 /// The captured decode step's walk `(1, 1, Step)`, into `head`.
 pub(super) struct Step38<'a> {
+    pub(super) branch: &'a mut Branch,
     pub(super) p: Parts38<'a>,
     pub(super) head: &'a mut Head,
 }
@@ -1501,7 +1567,7 @@ impl<'a> LayerProgram for Step38<'a> {
     /// then the handoff into the page and the go.
     fn front(&mut self, port: &mut StepLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
         let l = at.layer;
-        self.p.front(l)?;
+        self.p.front(self.branch, l)?;
         let hy = port.hybrid();
         self.p.ffn_mix(l, Some(hy.boundary_mut().normed_mut()))?;
         self.p.route(l, Some(hy.boundary().normed()))?;
@@ -1512,11 +1578,11 @@ impl<'a> LayerProgram for Step38<'a> {
         })
     }
 
-    /// The card leg, then the shared expert, over the boundary's activation.
+    /// The shared expert beside the card leg over the boundary's activation
+    /// ([`Parts38::beside`]).
     fn shadow(&mut self, port: &mut StepLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
         let x = port.hybrid().boundary().normed();
-        self.p.card(at.layer, Some(x))?;
-        self.p.shared(at.layer, Some(x))
+        self.p.beside(self.branch, at.layer, Some(x))
     }
 
     /// The wait, the gated sum, and the host tier told the layer is enqueued
@@ -1547,6 +1613,7 @@ impl<'a> LayerProgram for Step38<'a> {
 /// `head`, a head of `m` rows (one projection and one argmax for every
 /// row), and each of `copies` after it. Each row is bit for bit its step.
 pub(super) struct Verify38<'a> {
+    pub(super) branch: &'a mut Branch,
     pub(super) p: Parts38<'a>,
     pub(super) head: &'a mut Head,
     pub(super) copies: Vec<RowsCopy<'a>>,
@@ -1595,7 +1662,7 @@ impl<'a> LayerProgram for Verify38<'a> {
     /// in one launch and the go.
     fn front(&mut self, port: &mut StepLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
         let l = at.layer;
-        self.p.front(l)?;
+        self.p.front(self.branch, l)?;
         let hy = port.hybrid();
         self.p.ffn_mix(l, Some(hy.boundary_mut().normed_mut()))?;
         self.p.route(l, Some(hy.boundary().normed()))?;
@@ -1608,12 +1675,11 @@ impl<'a> LayerProgram for Verify38<'a> {
         })
     }
 
-    /// The card leg, then the shared expert, over the boundary's
-    /// activations.
+    /// The shared expert beside the card leg over the boundary's
+    /// activations ([`Parts38::beside`]).
     fn shadow(&mut self, port: &mut StepLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
         let x = port.hybrid().boundary().normed();
-        self.p.card(at.layer, Some(x))?;
-        self.p.shared(at.layer, Some(x))
+        self.p.beside(self.branch, at.layer, Some(x))
     }
 
     /// The wait, the gated sum over the `m` columns' host sums, and the host
@@ -1644,8 +1710,10 @@ impl<'a> LayerProgram for Verify38<'a> {
 }
 
 /// An eager pass's walk `(1, m, Batch)`: every layer through the batch port;
-/// the head is the caller's ([`Pass38::head`]).
+/// the head and the final rows are the caller's ([`Pass38::head`],
+/// [`Pass38::finals`]).
 pub(super) struct Pass38<'a> {
+    pub(super) branch: &'a mut Branch,
     pub(super) p: Parts38<'a>,
 }
 
@@ -1684,6 +1752,21 @@ impl<'a> Pass38<'a> {
             .copy_from_device_async(&row, gpu.stream())?;
         head.enqueue(gpu, self.p.c.w)
     }
+
+    /// After the walk of a prompt call's pass that runs no head, when the
+    /// call's tap reads its rows ([`super::body38::Prompt38Sink`]): the last
+    /// layer's combine alone over the unit's columns, the one the head's mix
+    /// applies first ([`Parts38::head_mix`]), so each row holds the target's
+    /// final streams. One launch.
+    pub(super) fn finals(&mut self) -> Result<(), GpuError> {
+        let p = &mut self.p;
+        let gpu = p.c.gpu;
+        let fault = gpu.layer_sink(p.plans.len().saturating_sub(1))?;
+        let s = &mut *p.s;
+        p.c.k
+            .hc
+            .enqueue_combine(gpu.stream(), &mut s.res[p.cur], &s.y, p.m, fault, &s.hc)
+    }
 }
 
 impl<'a> LayerProgram for Pass38<'a> {
@@ -1702,7 +1785,7 @@ impl<'a> LayerProgram for Pass38<'a> {
     /// slot's place into the arena's `sel` from the slot map's card copy.
     fn front(&mut self, port: &mut BatchLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
         let l = at.layer;
-        self.p.front(l)?;
+        self.p.front(self.branch, l)?;
         self.p.ffn_mix(l, None)?;
         self.p.route(l, None)?;
         let key = port.key(at);
@@ -1736,10 +1819,10 @@ impl<'a> LayerProgram for Pass38<'a> {
         )
     }
 
-    /// The card leg, then the shared expert, over the arena's `ffn_x`.
+    /// The shared expert beside the card leg over the arena's `ffn_x`
+    /// ([`Parts38::beside`]).
     fn shadow(&mut self, _: &mut BatchLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
-        self.p.card(at.layer, None)?;
-        self.p.shared(at.layer, None)
+        self.p.beside(self.branch, at.layer, None)
     }
 
     /// The gated sum over the host sums the walk's serve uploaded, or the

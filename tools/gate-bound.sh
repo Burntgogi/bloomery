@@ -512,6 +512,8 @@ bounded_bg_get() {
 #                      child slow to end (slow) is waited for, so the runner is not gone while it still shuts down
 #   timeout-fork       fork-exit is the monitor that exits before it reached its command: monitor-exit; the real
 #                      timeout's own case is lease.sh's `fork` form and stack-watch.sh's fork-exit rows
+#   remote-handshake  tools/narrow-scan.sh --self-test: a pre-PID stop survives sync, a new attempt is independent,
+#                      and overlapping stops reap the remote monitor, runner and TERM-ignoring descendant
 #   cleanup-status     cleanup-fail: a stop that fails is the runner's status (70), a signal's included
 #   cleanup-alive      a stop that fails with the monitor alive returns 70 while the monitor still lives: no wait on it
 #   stop-signal        a signal during an explicit stop's cleanup ends the runner on it once the cleanup is done

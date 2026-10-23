@@ -10,10 +10,13 @@ use gguf::Split;
 use tokenizer::Tokenizer;
 
 /// A checkpoint folder opened for a load: its header, which plans as a split's first shard does,
-/// its tokenizer, and the load of its parts, which takes the header back once it has planned.
+/// its tokenizer, its MTP layer's header (`None` for a folder without one, or why the folder's
+/// preparation refuses it), and the load of its parts, which takes the header back once it has
+/// planned.
 pub struct Opened {
     pub header: Split,
     pub tokenizer: Tokenizer,
+    pub draft: Result<Option<Split>, String>,
     pub parts: Box<dyn FnOnce(Split) -> Folder38>,
 }
 
@@ -27,8 +30,25 @@ pub fn open(path: &Path) -> Result<Opened, GateError> {
     Ok(Opened {
         header: f.header,
         tokenizer: f.tokenizer,
+        draft: f.draft.map_err(|e| e.to_string()),
         parts: Box::new(move |header| Folder38::new(header, source, ple)),
     })
+}
+
+/// The checkpoint folder's MTP header, borrowing its target's embedding and head; a folder
+/// without an MTP layer, and one whose layer the preparation refuses, are refused by name.
+#[cfg(feature = "checkpoint")]
+pub fn draft(path: &Path) -> Result<Split, GateError> {
+    open(path)?
+        .draft
+        .map_err(|e| format!("checkpoint folder {}: its MTP layer: {e}", path.display()))?
+        .ok_or_else(|| format!("checkpoint folder {} holds no MTP layer", path.display()).into())
+}
+
+/// A checkpoint folder's draft in a build without checkpoint support, refused by name.
+#[cfg(not(feature = "checkpoint"))]
+pub fn draft(path: &Path) -> Result<Split, GateError> {
+    open(path).map(|f| f.header)
 }
 
 /// A checkpoint folder in a build without the `checkpoint` feature, refused by name.

@@ -35,7 +35,17 @@ runs of the same binary scatter on one machine. *DSpark* is V4.1's draft model f
 
 Paste what each command printed into the pull request: for `contrib-check`, its header block, its unit lines and its
 `DONE` line; for a gate, its summary lines and its exit code. Name the machine as `CONTRIBUTING.md` asks ("Pull requests
-for your own hardware"). CI runs `just contrib-check --tier t0` on every pull request (`.github/workflows/pr.yml`).
+for your own hardware"). CI runs `just contrib-check --tier t0` and the clippy ratchet lint on every pull request
+(`.github/workflows/pr.yml`).
+
+**The pull-request lint.** CI lints the whole workspace with clippy against the ratchet: the `lint` job runs
+`tools/mac-check.sh lint` on x86_64 Linux, which runs the `lint` recipe's own command and ends red when its `^warning:`
+count is above the one number in `tools/lint-ratchet.txt` (the job's log names the count and the ratchet on one line).
+The same lint runs locally: `just mac-lint` on a Mac, and on x86_64 Linux `CUDA_TOOLKIT_PATH=<the headers>
+LIBCLANG_PATH=/usr/lib/llvm-18/lib tools/mac-check.sh lint`, with the CUDA 13.3 headers and libclang this section lists
+(`tools/nightly/fetch-cuda-headers.sh <dir>` fetches the headers from the pinned `.deb` files). When the count is over
+the ratchet, fix the warnings: the ratchet is never raised to make a lint pass (AGENTS.md, "Never relax a gate or a
+lint"); a count below it can bring the number down.
 
 `just pre-review` (`tools/review/local.py`) runs only the reviewer by default, in at most 10 minutes; `--full` adds the
 validator as the pull request review runs it. Nothing is posted, and the pull request's own review stays the review of
@@ -58,6 +68,9 @@ workspaces. Called-source edits must invalidate a recorded green result even whe
 Absolute paths and raw identifiers retain conservative owner/dependency bounds when structural resolution is
 uncertain; Cargo-selected roots and declared Rust modules are source regardless of their filename suffix.
 The persistent structural cache must preserve these inputs across fresh processes.
+The selected profiles of every box call remain inputs, including shell defaults and inherited model overrides.
+Changing a selected profile or called source invalidates its consumer; an unrelated private profile or unreached
+source does not. Shared box inputs remain mandatory for every box command.
 
 The mapped checkpoint reader is `bloomery-safetensors`; `gate-safetensors` owns its dtype, span and shard tests.
 `f32_values` also checks directly constructed `Raw` values: shape and dtype must account for the complete
@@ -84,7 +97,7 @@ nightly sets `x86-64-v3` for its own machine (`tools/nightly/run.sh:55`), and bo
 
 Output: a header (commit, host, CPU features, toolchain, `RUSTFLAGS`, bound, log directory), one line per unit,
 `<name> rc=<n> <seconds>s`, under a red one its failing tests or first red lines and its log path, then
-`DONE tier=… total=… red=… wall=…s`. Each unit's log is in `target/contrib-check/<time>/<name>.log`. Every unit, in
+`DONE tier=… total=… red=… wall=…s`. Each unit's log is in `target/contrib-check/<time>.<unique>/<name>.log`. Every unit, in
 both tiers, runs under a bound of `CONTRIB_UNIT_BOUND` seconds (default 1200) through GNU `timeout`, or `gtimeout` when
 only that is installed; a host with neither (macOS as shipped) runs units unbounded, and the header says so. Exit: 0
 every unit green, 1 a unit red, 64 usage, 69 a prerequisite is missing (named, with how it is made), 70 a list the
@@ -101,25 +114,35 @@ The flowcounts weekly reads its record parser and schema, routing data and stati
 Use `python3 tools/recipes.py why tools/bloomery/hf.py --recipe weekly-gpu-ds41-flowcounts` to inspect that boundary.
 The script walk is conservative: a helper's prose must not turn the self-tests that use it into dependencies of
 the helper itself. The regression holds both the absent hub input and the retained executable inputs.
+Includes and repository-path literals on inner lines of a multiline Rust attribute are inputs too.
+The recipe self-test checks that changing either selects the compiling recipes; attribute contents
+must not bypass input discovery while the module/`cfg` scanner skips their syntax.
 
 The gate-batch self-test waits for stopped fixture lanes and their registered
 items to finish before a case can remove its tree. A delayed TERM-handler case
 checks that the lane's last write has completed; a teardown failure still fails
 the self-test rather than being hidden by its count summary.
 
+The router replay self-tests (`tools/ref/window-union.py` and `tools/ref/router-coverage.py`, each with
+`--self-test`) run without a card or model. Placement counts must lie in `0..n_expert`, explicit
+layer ranges may not overlap, and a spread total must fit its eligible layers. Repeated single-value
+options and repeated `--k` entries are refused rather than silently replacing a placement or report row.
+Both command lines name a refused `--n-l`; `bursts` reports it without a Python traceback.
+For `bursts`, omitting `--n-l` keeps the host-only replay; explicitly passing an empty value is refused.
+
 Exceptions:
 
-- **`just` is a T0 prerequisite.** Three T0 units call it: `recipes-self-test`, `check-recipes` and the self-test of
-  `tools/check-comment-only.py`. The script's own preflight checks only `python3` and `rustup`
-  ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6124298082)).
+- **`just` is a T0 prerequisite.** The T0 unit `check-recipes` calls it, directly and through two self-tests it runs:
+  `tools/recipes.py --self-test` and `tools/check-comment-only.py --self-test`. The script's own preflight checks only
+  `python3` and `rustup` ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6124298082)).
 - **aarch64 Linux.** `tools/nightly/install.sh` installs the x86_64 packages only. One DGX Spark ran T1 with the CUDA 13.3
   headers of the `nvidia/cuda:13.3.1-devel-ubuntu24.04` image, LLVM 21.1.8's libclang, the distribution's numpy and
   PIL, and `just` built from source (same link).
 - **The Mac's environment file.** `just mac-static` checks the Linux build, so bindgen needs the CUDA 13.3 headers and
   an x86_64 Linux `/usr/include` on the Mac, beside libclang from the Xcode command line tools. The header of
   `tools/mac-check.sh` copies the two directories from the maintainers' workstation. Any x86_64 Linux host with CUDA 13.3
-  has the same two, `/usr/local/cuda-13.3/include` and `/usr/include`; without CUDA there, the headers are in the three
-  `.deb` files `tools/nightly/install.sh` names.
+  has the same two, `/usr/local/cuda-13.3/include` and `/usr/include`; without CUDA there,
+  `tools/nightly/fetch-cuda-headers.sh` unpacks the headers from the `.deb` files `tools/nightly/cuda-debs.tsv` pins.
 
 The CPU guard's synthetic process IDs are derived from each case's shell PID,
 so a low PID in a container cannot replace a fixture process. Its live pair
@@ -143,6 +166,48 @@ existing lease rules. An explicit `BLOOMERY_GATE_CARD=a6000` keeps the gate
 runner's forced-card policy.
 The host-only self-test exercises these selection paths with isolated locks,
 leases and query responses; it does not measure physical GPU occupancy.
+
+`gate-gpu-lib`, `gate-gpu-gemma4a`, `gate-gpu-gemma-embedding2-e2e`,
+`gate-gpu-ds41-lib`, `gate-gpu-vision-hw` and `gate-gpu-glm5next-tp` compile their
+hardware-enabled CUDA library-test passes outside the card lock using
+`tools/gate.sh --gpu --oxide`. Its native `--lib` Cargo call uses a capture-only
+target runner: compilation never executes the test. Cargo owns the executable,
+arguments, package working directory and runtime environment (including native
+library paths); a private temporary capture retains that context and is removed
+on exit. Zero or multiple captured tests are refused with 64. Explicit `--target`
+and doctests are refused; the runner forces the compiler's native target and its
+capture runner rather than allowing a configured cross target or runner to execute
+tests before locking. A preconfigured scalar or environment runner is overridden;
+an array-valued runner conflicts with the scalar override and Cargo refuses it
+before either runner executes. Compiler output remains visible, including
+cargo-oxide's non-JSON banners.
+`box.sh` checks the resolved cargo-oxide installation against the workspace pin
+for this wrapper too, after applying `BLOOMERY_BOX_ENV`. A stale installation
+stops with 70 before any build or test starts. The wrapper regression executes
+the actual queued commands, checking both refusal and the absence of a child;
+the pinned installation and non-building commands remain positive controls.
+
+Replay enters `tools/gpu-gate.sh --executable` in Cargo's context. The common GPU
+runner therefore applies card selection and `CUDA_VISIBLE_DEVICES` **after** the
+captured environment, with the same timing-lease refusals and lock as ordinary bins.
+Compilation has the gate bound; after compilation, lock waits remain outside the
+single runtime bound owned by `gpu-gate.sh`. The child status is preserved,
+including 124/137 for timeout, 75 for contention and 69 for an unopenable lock.
+The `hw_held_` pass still uses `RUST_TEST_THREADS=1`; the no-NIC `bloomery-verbs`
+tests run afterward without a card lock. Host-only oxide tests do not use `--gpu`.
+Batch placement recognizes `gate.sh --gpu` as a call to the same GPU lock owner,
+including its `any` and box-selected card forms. A plain CPU `gate.sh` call stays
+card-free; the classifier does not follow the runner's conditional implementation.
+
+`bash tools/gpu-gate.sh --self-test --part 4` checks the library path against an
+ordinary GPU bin with real lock files and subprocesses: compilation while the card
+is held, no test child before release, other-card isolation, the serial pass,
+failure/refusal/timeout statuses and cancellation cleanup. The test consumer reads
+package-relative data and uses Cargo's manifest environment; on Linux `cc` builds a
+shared library whose function the consumer calls after loading it by name. Only
+Cargo's compilation boundary and device discovery are fixtures. This proves runner
+behavior without a GPU, not CUDA execution or
+freedom from OOM on a physical card.
 
 The outer `box.sh` selector requires a successful process query for
 `BLOOMERY_CARD=a6000` and `both`. Failure, even with partial output or a held
@@ -376,8 +441,9 @@ cards.
 - **`contrib-check` flags and states:** `--base`, `--require T2`, a `report.txt` per run (the header and the log
   directory carry its facts), the `SKIP` and `DEFER` unit states (no unit is skipped in T0 or T1), and a call of
   `mac-static` on a Mac (`just mac-static` stays the Mac's static tier beside this command).
-- **T1 in CI.** `.github/workflows/pr.yml` runs T0 only: T1 needs three NVIDIA `.deb` files unpacked by hand, more than
-  apt packages (its header).
+- **T1 in CI.** `.github/workflows/pr.yml` runs T0 and the `lint` job only: T1 also builds the host tier in release
+  mode, which the nightly's own machine does (the lint job already fetches the pinned `.deb` headers through
+  `tools/nightly/fetch-cuda-headers.sh`, the same one owner the nightly installer uses).
 - **An example environment file** for local mode (reference row 2).
 - **One model path resolver** for the path literals of reference row 9.
 - **A root-relative set identity,** so the fixtures could sit under another root: it comes as its own change when a

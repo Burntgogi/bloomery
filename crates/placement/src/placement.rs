@@ -108,12 +108,13 @@ pub struct ModelTensors {
     /// one token uses.
     pub experts: u64,
     pub experts_used: u64,
-    /// Whether its program reads bf16 matrix `t` of a dense role in its words
-    /// ([`CardFormat::Bf16Raw`], [`ModelTensors::card_format`]): the
-    /// architecture's classifier names each tensor a bf16 site, head or
-    /// embedding lookup reads (qwen4exp's projections); a tensor of the same
-    /// role its program reads as f32 values (a conv, an inject, the parts of
-    /// a joined stack) is not one. `|_| false` loads every bf16 tensor as f32
+    /// Whether its program reads bf16 tensor `t` of a dense role or the
+    /// router in its words ([`CardFormat::Bf16Raw`],
+    /// [`ModelTensors::card_format`]): the architecture's classifier names
+    /// each tensor a bf16 site, head, embedding lookup or router reads
+    /// (qwen4exp's projections and router); a tensor of the same role its
+    /// program reads as f32 values (a conv, an inject, the parts of a joined
+    /// stack) is not one. `|_| false` loads every bf16 tensor as f32
     /// values ([`CardFormat::Bf16AsF32`]).
     pub bf16_words: fn(&ModelTensor) -> bool,
 }
@@ -135,17 +136,21 @@ impl ModelTensors {
     /// [`CardFormat::of`] of its type, except
     /// - an engram gain, which the card reads as f32 values whatever its
     ///   type: a K-quant one is decoded at load;
-    /// - a bf16 matrix (two or more dims) [`ModelTensors::bf16_words`] names,
-    ///   of a role whose matrices the bf16 dense site, head and embedding
-    ///   lookup read (attention, a hyper-connection, a shared expert, a dense
-    ///   FFN, an engram's dense projections, the head, the token embedding):
-    ///   [`CardFormat::Bf16Raw`], which those kernels widen as they read it
-    ///   (`crate::kernels`' `SiteEntry::Bf16`, `HeadEntry::Bf16`,
-    ///   `EmbedEntry::Bf16`). Every other bf16 tensor (a vector, a router, a
-    ///   norm, a matrix it does not name) stays [`CardFormat::Bf16AsF32`]:
-    ///   the kernels that read those read f32 values.
+    /// - a bf16 tensor [`ModelTensors::bf16_words`] names, of a role whose
+    ///   tensors the bf16 dense site, head, embedding lookup and router read
+    ///   (attention, a hyper-connection, a shared expert with its gate, a
+    ///   dense FFN, an engram's dense projections, the head, the token
+    ///   embedding, the router): [`CardFormat::Bf16Raw`], which those kernels
+    ///   widen as they read it (`crate::kernels`' `SiteEntry::Bf16`,
+    ///   `HeadEntry::Bf16`, `EmbedEntry::Bf16`, the router's bf16 entries).
+    ///   Every other bf16 tensor (a norm, a tensor it does not name) stays
+    ///   [`CardFormat::Bf16AsF32`]: the kernels that read those read f32
+    ///   values.
     #[must_use]
     pub fn card_format(&self, t: &ModelTensor) -> Option<CardFormat> {
+        if t.role == Role::Head && t.name == HEAD_TENSOR {
+            return file_card_format(HEAD_TENSOR, t.ty, *t.dims.first()?);
+        }
         match (t.role, card_format_of_role(t.ty, t.role)) {
             (
                 Role::Attention
@@ -154,11 +159,10 @@ impl ModelTensors {
                 | Role::DenseFfn
                 | Role::EngramDense
                 | Role::Head
-                | Role::TokenEmbedding,
+                | Role::TokenEmbedding
+                | Role::Router,
                 Some(CardFormat::Bf16AsF32),
-            ) if (self.bf16_words)(t) && t.ty == GgmlType::BF16 && t.dims.len() >= 2 => {
-                Some(CardFormat::Bf16Raw)
-            }
+            ) if (self.bf16_words)(t) && t.ty == GgmlType::BF16 => Some(CardFormat::Bf16Raw),
             (_, f) => f,
         }
     }
@@ -503,9 +507,24 @@ pub enum Device {
     Unused,
 }
 
-/// The format a file tensor of type `ty` in role `role` loads in on a
-/// card: [`CardFormat::of`], except an engram gain, which the card reads
-/// as f32 values whatever its type — a K-quant one is decoded at load.
+/// The independent output projection, separate from its norm and hyper-connection.
+pub const HEAD_TENSOR: &str = "output.weight";
+
+/// Resident format of file tensor `name` of type `ty`, its rows `k` values wide, as the loader
+/// makes it: a BF16 [`HEAD_TENSOR`] occupies MXFP8 planes when `k` is a multiple of 128 and keeps
+/// its words otherwise; every other tensor, a tied embedding included, takes its type's format.
+#[must_use]
+pub fn file_card_format(name: &str, ty: GgmlType, k: u64) -> Option<CardFormat> {
+    if name != HEAD_TENSOR || ty != GgmlType::BF16 {
+        CardFormat::of(ty)
+    } else if k.is_multiple_of(128) {
+        Some(CardFormat::Mxfp8Planes)
+    } else {
+        Some(CardFormat::Bf16Raw)
+    }
+}
+
+/// The card format by role. Engram gains are decoded to f32 at load.
 #[must_use]
 pub fn card_format_of_role(ty: GgmlType, role: Role) -> Option<CardFormat> {
     match (role, CardFormat::of(ty)) {
@@ -974,8 +993,8 @@ pub struct HostTotals {
     /// plan's host need, since the room binds there.
     pub headroom_bytes: i128,
     /// The host room the plan was made at: the reading it took and the
-    /// room it was held to ([`workstation::plan_room`], the reading less
-    /// [`workstation::HOST_DRIFT`]); `None` for a plan made without one.
+    /// room it was held to ([`Plan::plan_at`], including the machine caps);
+    /// `None` for a plan made without one.
     pub room: Option<(u64, u64)>,
 }
 
@@ -2449,14 +2468,7 @@ fn plan_rule<'a>(
         (n_l, tier_n_l),
         card_budget,
     )?;
-    // What the caller plans beside this plan on each card comes out of a
-    // unified pool too.
-    if machine.unified().is_some() {
-        let here = (0..machine.all_cards().count()).filter(|&c| machine.on_this_node(c));
-        let beside = reserve * here.count() as u64;
-        plan.host.pool_card_bytes += beside;
-        plan.host.headroom_bytes -= i128::from(beside);
-    }
+    plan.reserve_beside(reserve)?;
     Ok(plan)
 }
 
@@ -2850,15 +2862,20 @@ fn row_cache_reserve(model: &ModelTensors, rows: &[Row]) -> u64 {
 /// The page-cache bytes a reader of `model`'s row-gathered tables
 /// ([`Role::EngramTable`]) holds while it reads one call of up to
 /// `positions` positions from the NVMe tier: per table, its rows a position
-/// ([`ModelTensor::gathered_rows`]) for every position, each row on at most
-/// `1 + ⌈(row bytes − 1) / page⌉` pages of `page` — the host's base page
-/// ([`workstation::ROW_PAGE`] on this workstation, the page the caller's own
-/// host has elsewhere) — the ids are hashed, so a call's rows are counted on
-/// pages of their own, and a row may straddle a page boundary. The reader
+/// ([`ModelTensor::gathered_rows`]) for every position, each physical plane of
+/// a row on at most `1 + ceil((plane bytes - 1) / page)` host base pages.
+/// Split rows are packed; NVFP4 part-source rows have separate code and scale
+/// planes. The ids are hashed, so a call's rows are counted on pages of their
+/// own, and each plane may straddle a page boundary. The reader
 /// advises and copies one call at a time, so one call's pages are what must
 /// stay resident until its copy. A table with no per-token row count, or a
 /// room past u64, is refused by name.
-pub fn row_room(model: &ModelTensors, positions: u64, page: u64) -> Result<u64, PlacementError> {
+pub fn row_room(
+    model: &ModelTensors,
+    positions: u64,
+    page: u64,
+    source: RowTableSource,
+) -> Result<u64, PlacementError> {
     model
         .tensors
         .iter()
@@ -2867,7 +2884,21 @@ pub fn row_room(model: &ModelTensors, positions: u64, page: u64) -> Result<u64, 
             let rows = t.gathered_rows.ok_or_else(|| {
                 PlacementError::tensor(t, "a row-gathered table without a per-token row count")
             })?;
-            let pages = 1 + row_bytes(t)?.saturating_sub(1).div_ceil(page);
+            let bytes = row_bytes(t)?;
+            let span = |bytes: u64| 1 + bytes.saturating_sub(1).div_ceil(page);
+            let pages = match (source, t.ty) {
+                (RowTableSource::Parts, GgmlType::NVFP4_ROWS) => {
+                    if !bytes.is_multiple_of(9) {
+                        return Err(PlacementError::tensor(
+                            t,
+                            "NVFP4 row bytes are not whole groups",
+                        ));
+                    }
+                    let groups = bytes / 9;
+                    span(groups * 8) + span(groups)
+                }
+                _ => span(bytes),
+            };
             positions
                 .checked_mul(rows)
                 .and_then(|n| n.checked_mul(pages))
@@ -2882,6 +2913,15 @@ pub fn row_room(model: &ModelTensors, positions: u64, page: u64) -> Result<u64, 
         })
 }
 
+/// Where a row reader obtains its table. Part sources have no split host set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RowTableSource {
+    /// A split's mappings, held on the host when its room permits.
+    Split,
+    /// A part source's file ranges, gathered from the NVMe tier.
+    Parts,
+}
+
 /// Where `plan`'s row-gathered tables ([`Role::EngramTable`]) are read
 /// from, the one rule for a plan whose maker sizes their reader: on the
 /// host in their file bytes when `room` — the host's available bytes
@@ -2891,7 +2931,8 @@ pub fn row_room(model: &ModelTensors, positions: u64, page: u64) -> Result<u64, 
 /// else on the NVMe tier, where the role rule placed them ([`place_whole`]),
 /// with their reader's room for a call of up to `positions` positions
 /// ([`row_room`], on `page` pages) as the plan's row reserve, in place of
-/// the row cache [`totals`] set aside.
+/// the row cache [`totals`] set aside. [`RowTableSource::Parts`] stays on
+/// NVMe, with its row window sized for the stored planes.
 ///
 /// `floor` is the prompt cache's: the caller's two saved sequence states at
 /// the plan's context. The cache's default budget is half of what the room
@@ -2913,6 +2954,7 @@ pub fn row_table_tier(
     floor: u64,
     positions: u64,
     page: u64,
+    source: RowTableSource,
 ) -> Result<(), PlacementError> {
     let model = plan.model;
     let tables: Vec<usize> = (0..plan.rows.len())
@@ -2973,7 +3015,7 @@ pub fn row_table_tier(
         .bytes()
         .checked_add(floor)
         .ok_or_else(|| past("the host's need with the prompt cache's floor"))?;
-    let new = if held <= room {
+    let new = if source == RowTableSource::Split && held <= room {
         plan.nvme_bytes = plan.nvme_bytes.checked_sub(moved).ok_or_else(|| {
             PlacementError::tensor(
                 named,
@@ -2991,7 +3033,7 @@ pub fn row_table_tier(
         }
         0
     } else {
-        row_room(model, positions, page)?
+        row_room(model, positions, page, source)?
     };
     plan.host.reserve_bytes = host_arm
         .reserves
@@ -3806,31 +3848,45 @@ fn card_total(card: &Card, totals: &CardTotals, heap: &Heap) -> u64 {
 }
 
 impl Plan<'_> {
-    /// The room a plan with the host room `room` is made at, which this
-    /// plan then names ([`HostTotals::room`]): the one caller of
-    /// [`workstation::plan_room`] for a plan's tiers, and the one place a
-    /// stated room reaches the plan's host headroom before a tier reads it.
+    fn reserve_beside(&mut self, reserve: u64) -> Result<(), PlacementError> {
+        if self.machine.unified().is_some() {
+            let here = (0..self.machine.all_cards().count())
+                .filter(|&c| self.machine.on_this_node(c))
+                .count() as u64;
+            let past = || PlacementError::Metadata {
+                key: "unified pool reserve".into(),
+                detail: "the card share and bytes beside the plan pass u64".into(),
+            };
+            let beside = reserve.checked_mul(here).ok_or_else(past)?;
+            self.host.pool_card_bytes = self
+                .host
+                .pool_card_bytes
+                .checked_add(beside)
+                .ok_or_else(past)?;
+            self.host.headroom_bytes -= i128::from(beside);
+        }
+        Ok(())
+    }
+
+    /// The room the plan's tiers use: [`workstation::plan_room`], capped by
+    /// the machine's host room and its unified pool. The pool's reading already
+    /// leaves out the cards' context self cost; [`workstation::HostNeed`] counts
+    /// the cards and the bytes reserved beside the plan, so none is subtracted
+    /// from the room again. The reading and effective room are recorded in
+    /// [`HostTotals::room`].
     ///
-    /// A [`workstation::HostRead::Given`] room is the caller's statement of
-    /// the host's room, so the plan's headroom is the tighter of it and the
-    /// machine's figure ([`workstation::HostNeed::machine_room`]) past the
-    /// plan's host terms ([`workstation::HostNeed::headroom`]), the same term
-    /// a split plan takes ([`expert_nvme_tier`]) — a churn pool beside a
-    /// plan that fits the room and not the pool is then refused by name
-    /// ([`churn::OverHost`]), not by the load's host check. A stated room
-    /// past the figure leaves the figure, which holds the plan whatever the
-    /// room ([`Plan::violations`]). A room that was read leaves the
-    /// headroom as it is, the machine's figure: a reading moves between a
-    /// plan and its load and is held at the load
-    /// ([`workstation::HostNeed::check`]). Naming a room again recomputes
-    /// the headroom from the plan's terms.
+    /// A [`workstation::HostRead::Given`] room also sets the host headroom from
+    /// the plan's terms at that room. A read room keeps the headroom at the
+    /// machine's figure until a tier splits the plan: the reading can move
+    /// between the plan and its load, where [`workstation::HostNeed::check`]
+    /// holds it. A split plan's headroom is what its effective room leaves.
     pub fn plan_at(&mut self, room: &(u64, workstation::HostRead)) -> u64 {
-        let planned = workstation::plan_room(room);
+        let figure = workstation::HostNeed::machine_room(self.machine.host());
+        let pool = self.machine.unified().map_or(u64::MAX, |pool| pool.bytes);
+        let planned = workstation::plan_room(room).min(figure).min(pool);
         self.host.room = Some((room.0, planned));
         if room.1 == workstation::HostRead::Given {
-            let figure = workstation::HostNeed::machine_room(self.machine.host());
-            self.host.headroom_bytes =
-                workstation::HostNeed::of(self, 0).headroom(planned.min(figure));
+            self.host.headroom_bytes = workstation::HostNeed::of(self, 0).headroom(planned);
         }
         planned
     }
@@ -4520,15 +4576,15 @@ mod tests {
     const EXPERT: u64 = 576;
 
     /// A model of 4 layers with every role's bf16 tensor (an attention
-    /// matrix, a hyper-connection, a shared expert, a router, an FFN norm,
-    /// the head and the token embedding, 256-value rows) beside a routed
-    /// q4_K stack, its readers' choice `bf16_words`, planned on `n` cards of
-    /// `4 / n` layers each: every bf16 tensor's card segment is on the card
-    /// that runs it, in the format `ModelTensors::card_format` names, at its
-    /// format's bytes. With `bf16_words` the matrices of the dense roles keep
-    /// their words (the file's bytes); the router and the norm, and every
-    /// tensor without it, are f32 values (twice the file's bytes): the plan
-    /// of a model that does not set it is the one it was.
+    /// matrix, a hyper-connection, a shared expert and its one-row gate, a
+    /// router, an FFN norm, the head and the token embedding, 256-value rows)
+    /// beside a routed q4_K stack, its readers' choice `bf16_words`, planned
+    /// on `n` cards of `4 / n` layers each: every bf16 tensor's card segment
+    /// is on the card that runs it, in the format `ModelTensors::card_format`
+    /// names, at its format's bytes. With `bf16_words` the tensors of the
+    /// dense roles and the router keep their words (the file's bytes); the
+    /// norm, and every tensor without it, are f32 values (twice the file's
+    /// bytes): the plan of a model that does not set it is the one it was.
     #[test]
     fn a_bf16_matrix_keeps_its_words_where_its_readers_read_them() {
         let bf16 = |name: String, layer, role, rows: &[u64]| {
@@ -4545,12 +4601,25 @@ mod tests {
                 gathered_rows: (role == Role::TokenEmbedding).then_some(1),
             }
         };
+        assert_eq!(
+            file_card_format(HEAD_TENSOR, GgmlType::BF16, 320),
+            Some(CardFormat::Bf16Raw)
+        );
+        assert_eq!(
+            file_card_format(HEAD_TENSOR, GgmlType::Q8_0, 256),
+            Some(CardFormat::Q8_0Planes)
+        );
+        assert_eq!(
+            file_card_format("token_embd.weight", GgmlType::BF16, 256),
+            CardFormat::of(GgmlType::BF16)
+        );
         let raw = [
             Role::Attention,
             Role::HyperConnection,
             Role::SharedExpert,
             Role::Head,
             Role::TokenEmbedding,
+            Role::Router,
         ];
         for bf16_words in [false, true] {
             for n in [1usize, 2, 4] {
@@ -4561,6 +4630,7 @@ mod tests {
                         ("attn", Role::Attention, &[16][..]),
                         ("hc", Role::HyperConnection, &[4]),
                         ("shexp", Role::SharedExpert, &[8]),
+                        ("shexp gate", Role::SharedExpert, &[]),
                         ("router", Role::Router, &[9]),
                         ("norm", Role::FfnNorm, &[]),
                     ] {
@@ -4570,7 +4640,8 @@ mod tests {
                     }
                 }
                 for (name, role) in [
-                    ("bf16 head", Role::Head),
+                    (HEAD_TENSOR, Role::Head),
+                    ("output_hc_up.weight", Role::Head),
                     ("bf16 embd", Role::TokenEmbedding),
                 ] {
                     model.tensors.push(bf16(name.into(), None, role, &[16]));
@@ -4604,7 +4675,12 @@ mod tests {
                         continue;
                     }
                     seen += 1;
-                    let (format, bytes) = if bf16_words && raw.contains(&t.role) {
+                    let (format, bytes) = if t.name == HEAD_TENSOR {
+                        (
+                            CardFormat::Mxfp8Planes,
+                            t.file_bytes / 2 + t.file_bytes / 64,
+                        )
+                    } else if bf16_words && raw.contains(&t.role) {
                         (CardFormat::Bf16Raw, t.file_bytes)
                     } else {
                         (CardFormat::Bf16AsF32, 2 * t.file_bytes)
@@ -4627,7 +4703,7 @@ mod tests {
                         t.name
                     );
                 }
-                assert_eq!(seen, 4 * 5 + 2, "n={n}");
+                assert_eq!(seen, 4 * 6 + 3, "n={n}");
             }
         }
     }
@@ -5929,6 +6005,89 @@ mod tests {
         }
     }
 
+    #[test]
+    fn plan_room_uses_the_host_and_unified_limits_once() {
+        use workstation::{HOST_DRIFT, HostNeed, HostRead, OS_RESERVE};
+        let model = layered(3);
+        let pool = 1 << 30;
+        for context in [1_000, workstation::CONTEXT] {
+            for host_room in [pool - 100, pool + 100] {
+                let machine = Machine {
+                    cards: vec![Card {
+                        context_bytes: context,
+                        free_bytes: Some(pool),
+                        ..bytes_card("pool", 2 * pool, 0..3)
+                    }],
+                    tiers: Vec::new(),
+                    nodes: vec![Node {
+                        host: Host {
+                            usable_bytes: host_room + 64,
+                            reserves: vec![(OS_RESERVE.into(), 64)],
+                        },
+                        unified: Some(UnifiedPool { bytes: pool }),
+                    }],
+                };
+                let mut plan = plan_with(&model, &machine, 4096, &NoKv, None).unwrap();
+                for read in [HostRead::Given, HostRead::MemAvailable] {
+                    for room in [pool - 200, pool + HOST_DRIFT + 200] {
+                        let reading = (room, read.clone());
+                        let want = workstation::plan_room(&reading).min(host_room).min(pool);
+                        assert_eq!(plan.plan_at(&reading), want);
+                        assert_eq!(plan.host.room, Some((room, want)));
+                        if read == HostRead::Given {
+                            assert_eq!(
+                                plan.host.headroom_bytes,
+                                HostNeed::of(&plan, 0).headroom(want)
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_pool_reserve_counts_local_cards_without_overflow() {
+        let model = layered(4);
+        for ranks in [1, 2, 4] {
+            let machine = Machine {
+                cards: (0..ranks)
+                    .map(|rank| Card {
+                        head: rank + 1 == ranks,
+                        token_embedding: rank == 0,
+                        ..bytes_card(
+                            &format!("pool-{rank}"),
+                            1 << 30,
+                            rank * 4 / ranks..(rank + 1) * 4 / ranks,
+                        )
+                    })
+                    .collect(),
+                tiers: Vec::new(),
+                nodes: vec![Node {
+                    host: host(),
+                    unified: Some(UnifiedPool { bytes: 1 << 40 }),
+                }],
+            };
+            let mut plan = plan_with(&model, &machine, 4096, &NoKv, None).unwrap();
+            let before = plan.host.pool_card_bytes;
+            let headroom = plan.host.headroom_bytes;
+            let n = ranks as u64;
+            let reserve = (u64::MAX - before) / n;
+            plan.reserve_beside(reserve)
+                .expect("the largest reserve fits u64");
+            assert_eq!(plan.host.pool_card_bytes, before + reserve * n);
+            assert_eq!(plan.host.headroom_bytes, headroom - i128::from(reserve * n));
+            let before = (plan.host.pool_card_bytes, plan.host.headroom_bytes);
+            for reserve in [1, u64::MAX, (u64::MAX / n).saturating_add(1)] {
+                assert!(plan.reserve_beside(reserve).is_err());
+                assert_eq!(
+                    (plan.host.pool_card_bytes, plan.host.headroom_bytes),
+                    before
+                );
+            }
+        }
+    }
+
     /// The census reads a card on its primary context, so an idle card's
     /// reading is its usable bytes less the context's own creation cost,
     /// which the card's context term counts again: the plan counts the
@@ -6553,8 +6712,49 @@ mod tests {
             experts_used: 0,
             bf16_words: |_| false,
         };
-        let room = |page| row_room(&model, 4096, page).expect("the row room");
-        assert_eq!(room(4096), 536_870_912);
-        assert_eq!(room(16384), 2_147_483_648);
+        for source in [RowTableSource::Split, RowTableSource::Parts] {
+            let room = |page| row_room(&model, 4096, page, source).expect("the row room");
+            assert_eq!(room(4096), 536_870_912);
+            assert_eq!(room(16384), 2_147_483_648);
+        }
+
+        let mut model = model;
+        let table = &mut model.tensors[0];
+        table.ty = GgmlType::NVFP4_ROWS;
+        table.dims = vec![160, 100];
+        table.file_bytes = 90 * 100;
+        table.gathered_rows = Some(1);
+        let touched: u64 = [80, 10]
+            .into_iter()
+            .map(|width| {
+                let start = 256 + 99 * width;
+                (start + width - 1) / 4096 - start / 4096 + 1
+            })
+            .sum();
+        assert_eq!(touched, 3);
+        let reserve =
+            row_room(&model, 1, 4096, RowTableSource::Parts).expect("the separate-plane row room");
+        assert!(
+            reserve >= touched * 4096,
+            "{reserve} B reserved for {touched} pages"
+        );
+        model.tensors[0].gathered_rows = Some(16);
+        for (source, want) in [
+            (RowTableSource::Split, 536_870_912),
+            (RowTableSource::Parts, 1_073_741_824),
+        ] {
+            for page in [4096, 16384] {
+                assert_eq!(
+                    row_room(&model, 4096, page, source).unwrap(),
+                    want * (page / 4096)
+                );
+            }
+        }
+        model.tensors[0].file_bytes = 89 * 100;
+        let e = row_room(&model, 4096, 4096, RowTableSource::Parts).unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("NVFP4 row bytes are not whole groups")
+        );
     }
 }

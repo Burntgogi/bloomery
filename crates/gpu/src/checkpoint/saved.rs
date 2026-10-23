@@ -40,8 +40,9 @@
 //! the state is read only once the copy has landed ([`Pending::land`]). The
 //! rows the copy reads are not cut, reset or replaced before then.
 //!
-//! The host memory of a state taken by [`SeqState::save`] is pageable: each
-//! copy runs on the engine stream, one synchronize at the end.
+//! The host memory of a state taken by [`SeqState::save`] is pageable, every
+//! page written by the host before the copies ([`crate::tensor::dtoh_2d`]):
+//! each copy runs on the engine stream, one synchronize at the end.
 
 use std::fmt;
 use std::path::PathBuf;
@@ -192,6 +193,26 @@ pub struct Lent<'s, 'p, 'r> {
 }
 
 impl Lent<'_, '_, '_> {
+    /// The host array bytes a save with `points` inner checkpoints holds.
+    /// Padding between the arrays is not charged to the cache.
+    pub fn bytes(&self, points: usize) -> Result<u64, GpuError> {
+        let rows = self.positional.iter().try_fold(0usize, |n, s| {
+            n.checked_add(s.run.planes.checked_mul(s.run.len)?.checked_mul(2)?)
+        });
+        let recurrent = self
+            .recurrent
+            .iter()
+            .try_fold(0usize, |n, s| n.checked_add(s.len()));
+        rows.and_then(|rows| {
+            recurrent?
+                .checked_mul(points.checked_add(1)?)?
+                .checked_mul(4)?
+                .checked_add(rows)
+        })
+        .and_then(|n| u64::try_from(n).ok())
+        .ok_or_else(|| shape("a snapshot's host bytes pass the address space".to_owned()))
+    }
+
     fn spans(&self) -> Vec<usize> {
         self.positional.iter().flat_map(Spans::sizes).collect()
     }
@@ -311,6 +332,14 @@ impl SaveLane {
             stream: ctx.new_stream()?,
             staging: Staging::pinned(ctx, limit)?,
         })
+    }
+
+    fn copy<R>(&self, send: impl FnOnce() -> Result<R, GpuError>) -> Result<R, GpuError> {
+        let result = send();
+        if result.is_err() {
+            self.stream.synchronize()?;
+        }
+        result
     }
 
     /// The pinned staging the lane's states are made in.
@@ -559,8 +588,11 @@ impl<T> SeqState<T> {
         let runs = lent.runs();
         let strips = plan_whole(&runs).map_err(|e| shape(e.to_string()))?;
         let one: usize = lens.iter().sum();
-        let mut rows = vec![0u16; runs.iter().map(Run::values).sum()];
-        let mut recurrent = vec![0f32; one * (1 + points.len())];
+        // Filled before the copies overwrite them, so that the host has
+        // written every page (`dtoh_2d`); a zero fill would come back from
+        // the allocator as pages nothing has written yet.
+        let mut rows = vec![u16::MAX; runs.iter().map(Run::values).sum()];
+        let mut recurrent = vec![f32::NAN; one * (1 + points.len())];
         let (rows_at, rows_len) = (rows.as_mut_ptr().cast::<u8>(), rows.len() * 2);
         let rec_at = recurrent.as_mut_ptr().cast::<u8>();
         // SAFETY: both vectors are neither read nor freed before the
@@ -634,51 +666,41 @@ impl<T> SeqState<T> {
         let ready = engine.record_event(None)?;
         lane.stream.wait(&ready)?;
         let start = ctx.new_event(timed)?;
+        let end = ctx.new_event(timed)?;
         start.record(&lane.stream)?;
-        let (rows_at, rows_len) = (staged.rows_ptr(), staged.rows_bytes());
-        let rec_at = staged.recurrent_ptr();
-        // SAFETY: the extent is the staging's, lent to this state alone; it is
-        // neither read nor returned before the copy lands — the end event is
-        // held with it below, and every failure path synchronizes the lane's
-        // stream first.
-        let sent = unsafe {
-            read_into(
-                &lane.stream,
-                lent,
-                &strips,
-                (rows_at, rows_len),
-                (rec_at, one * 4),
-            )
-        };
-        let calls = match sent {
-            Ok(n) => n,
-            Err(e) => {
-                lane.stream.synchronize()?;
-                return Err(e);
-            }
-        };
-        if !points.is_empty() {
-            let ats: Vec<u32> = points.iter().map(|&(at, _)| at).collect();
-            // SAFETY: the points' region of the extent is this state's alone,
-            // read or freed only after the end event below has completed (it
-            // is held with the extent); the checkpoints refuse a write to the
-            // slots until then ([`Checkpoints::guard_points`]) and wait for
-            // the context before freeing them.
-            let queued = unsafe {
-                ckpt.enqueue_points(
+        let (calls, end) = lane.copy(|| {
+            let (rows_at, rows_len) = (staged.rows_ptr(), staged.rows_bytes());
+            let rec_at = staged.recurrent_ptr();
+            // SAFETY: the extent is the staging's, lent to this state alone; it is
+            // neither read nor returned before the copy lands — the end event is
+            // held with it below, and every failure path synchronizes the lane's
+            // stream first.
+            let sent = unsafe {
+                read_into(
                     &lane.stream,
-                    &ats,
-                    rec_at.add(one * 4).cast::<f32>(),
-                    one * points.len(),
+                    lent,
+                    &strips,
+                    (rows_at, rows_len),
+                    (rec_at, one * 4),
                 )
             };
-            if let Err(e) = queued {
-                lane.stream.synchronize()?;
-                return Err(e);
+            let calls = sent?;
+            if !points.is_empty() {
+                let ats: Vec<u32> = points.iter().map(|&(at, _)| at).collect();
+                // SAFETY: the points' region is this state's alone. A failed
+                // enqueue or end event waits for the lane before it is returned.
+                unsafe {
+                    ckpt.enqueue_points(
+                        &lane.stream,
+                        &ats,
+                        rec_at.add(one * 4).cast::<f32>(),
+                        one * points.len(),
+                    )
+                }?;
             }
-        }
-        let end = ctx.new_event(timed)?;
-        end.record(&lane.stream)?;
+            end.record(&lane.stream)?;
+            Ok((calls, end))
+        })?;
         let end = Arc::new(end);
         staged.hold(Arc::clone(&end));
         ckpt.guard_points(Arc::clone(&end));
@@ -709,6 +731,7 @@ impl<T> SeqState<T> {
         points: &[(u32, T)],
         ckpt: &Checkpoints,
     ) -> Result<Vec<usize>, GpuError> {
+        lent.bytes(points.len())?;
         let lens = lent.lens();
         if lens != ckpt.lens() {
             return Err(shape(format!(
@@ -926,6 +949,71 @@ mod tests {
     use super::*;
     use crate::checkpoint::hold;
 
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_held_a_failed_end_event_does_not_return_the_extent_under_its_copy() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        for failure in ["end event creation", "end event recording"] {
+            let (ctx, stream) = crate::capsync::fresh_stream(0).expect("CUDA device 0");
+            let lane = SaveLane::new(&ctx, 2 << 20).expect("a lane");
+            let source = DeviceBuffer::<u16>::zeroed(&stream, 1024).expect("a source");
+            stream.synchronize().expect("the source is ready");
+            let pool = lane.staging.clone();
+            let mut staged = pool.lend(1024, 0).expect("a lend").expect("room");
+            let hold = hold::Hold::on(&lane.stream).expect("a held lane");
+            let (queued_tx, queued_rx) = mpsc::channel();
+            let (done_tx, done_rx) = mpsc::channel();
+            let (job, _) = threads::helper::spawn_helper(
+                "test-save",
+                threads::helper::Placement::Float,
+                move || {
+                    let result: Result<(), GpuError> = lane.copy(|| {
+                        // SAFETY: the extent is held until the copy's error
+                        // boundary finishes waiting for the lane.
+                        unsafe {
+                            dtoh_2d(
+                                &lane.stream,
+                                &source,
+                                0,
+                                staged.rows_ptr(),
+                                staged.rows_bytes(),
+                                Pitched {
+                                    width: 2048,
+                                    rows: 1,
+                                    dev_pitch: 2048,
+                                    host_pitch: 2048,
+                                },
+                            )
+                        }?;
+                        queued_tx.send(()).expect("the copy is queued");
+                        Err(shape(failure.to_owned()))
+                    });
+                    drop(staged);
+                    done_tx.send(result.is_err()).expect("the error returned");
+                },
+            )
+            .expect("the save thread");
+            queued_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("a queued copy");
+            let early = match done_rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(value) => Some(value),
+                Err(mpsc::RecvTimeoutError::Timeout) => None,
+                Err(e) => panic!("the save thread disappeared: {e}"),
+            };
+            let lent = pool.stats().lent;
+            hold.open();
+            job.join().expect("the save thread");
+            let failed = early.unwrap_or_else(|| done_rx.recv().expect("the save's error"));
+            assert!(failed, "{failure} was lost");
+            assert!(early.is_none(), "{failure} returned before the copy landed");
+            assert_eq!(lent, 2 << 20, "{failure} returned the extent early");
+            assert_eq!(pool.stats().lent, 0);
+        }
+    }
+
     /// A state of 5 positions carries rows 0..5 of a two-plane store, the
     /// recurrent stores at 5 and the point at 3; put back on an empty model it
     /// restores the rows and the stores, the checkpoints hold exactly the
@@ -934,7 +1022,9 @@ mod tests {
     #[test]
     #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
     fn hw_a_state_goes_and_comes_back() {
-        let (ctx, stream) = crate::capsync::fresh_stream(0).expect("CUDA device 0 with a stream");
+        let gpu = crate::Gpu::new().expect("CUDA device 0");
+        let ctx = Arc::clone(gpu.context());
+        let stream = gpu.stream_handle();
         let who = Identity {
             arch: "test",
             file: PathBuf::from("/x"),
@@ -950,7 +1040,23 @@ mod tests {
             c.take(&stream, 3, &mut [&mut rec]).expect("a take at 3"),
             runtime::seqstate::Take::Copy { .. }
         ));
-        rec.copy_from_host(&stream, &[5.0; 4]).expect("rec");
+        let values = [5.0f32, -0.0, 7.0, -2.0];
+        rec.copy_from_host(&stream, &values).expect("rec");
+        let token = |rec: &DeviceBuffer<f32>| {
+            let mut out = DeviceBuffer::<u32>::zeroed(&stream, 3).expect("token and fault");
+            gpu.elem()
+                .enqueue_argmax_finite_fault(
+                    &stream,
+                    rec,
+                    rec.len(),
+                    gpu.fault_sink(crate::LAYER_HEAD),
+                    &mut out,
+                )
+                .expect("the next token");
+            out.to_host_vec(&stream).expect("token and fault")
+        };
+        let next = token(&rec);
+        assert_eq!(next[0], 2, "the largest logit");
         let s = {
             let mut spans = [Spans::planes(&mut kv, 2, 16, 10).expect("spans")];
             let lent = Lent {
@@ -960,6 +1066,14 @@ mod tests {
             SeqState::save(&stream, who.clone(), 5, &lent, 'c', vec![(3, 'p')], &c).expect("a save")
         };
         assert_eq!(s.bytes(), 2 * 10 * 2 + 2 * 16);
+        assert_eq!(
+            s.host.recurrent()[..4]
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            values.map(f32::to_bits),
+            "a save keeps recurrent bits, including signed zero"
+        );
         assert_eq!(
             (s.keep_point(4), s.keep_point(2), s.keep_point(9)),
             (3, 0, 5)
@@ -1001,7 +1115,15 @@ mod tests {
         assert_eq!(&back[..10], &plane[..10]);
         assert_eq!(&back[16..26], &plane[16..26]);
         assert_eq!(back[10], 9, "a row past the positions is not carried");
-        assert_eq!(rec.to_host_vec(&stream).expect("rec"), [5.0; 4]);
+        assert_eq!(
+            rec.to_host_vec(&stream)
+                .expect("rec")
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            values.map(f32::to_bits)
+        );
+        assert_eq!(token(&rec), next, "the resumed next token and fault bits");
         assert_eq!(d.positions(), [3]);
         d.cut(3, 5).expect("a cut to the adopted point");
         d.apply(&stream, &mut [&mut rec]).expect("its restore");

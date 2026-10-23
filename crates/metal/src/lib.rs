@@ -25,9 +25,9 @@ pub mod fault;
 #[cfg(target_os = "macos")]
 mod handle;
 #[cfg(target_os = "macos")]
+pub mod kernels;
+#[cfg(target_os = "macos")]
 pub mod library;
-#[cfg(any(target_os = "macos", test))]
-mod pages;
 #[cfg(target_os = "macos")]
 pub mod stream;
 

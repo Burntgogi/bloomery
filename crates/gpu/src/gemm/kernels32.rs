@@ -9,13 +9,13 @@
 //! `f32tile.rs`) or are written out here.
 
 use super::act32::quant32_group;
-use super::f32tile::{ByteRows, F32Rows, STAGE_FLOATS, STAGES, f32_tile_body};
+use super::f32tile::{ByteRows, F32Rows, STAGE_FLOATS, STAGES, bf16_mma_body, f32_tile_body};
 use super::gemm32::{
     B32_ROW, B32_STAGE_W, D32_ROW, D32_STAGE_W, GEMM32_GROUP, GEMM32_RASTER_BYTES,
     GEMM32_THREADS_U32, IQ4_NL_BLOCK_BYTES, Q5_1_BLOCK_WORDS, Q8_0_BLOCK_BYTES, W32_ROW,
     W32_STAGE_W, iq4_nl_file_block, mma_m16n8k16_s32_s8_zero, q8_0_file_block, raster32,
 };
-use super::grouped::{GEMM_BM, GEMM_NT, GEMM_THREADS};
+use super::grouped::{GEMM_BM, GEMM_NT, GEMM_THREADS, VOTE_WORDS};
 use super::remap::remap_id;
 use super::route::{
     GEMM_MAX_EXPERTS, NO_EXPERT, ROUTE_HIST, ROUTE_THREADS, ROUTE_WARPS, tile_parts, tile_word,
@@ -46,7 +46,6 @@ mod gemm32_kernels {
     use cuda_device::async_copy::{
         cp_async_ca_4, cp_async_cg_16, cp_async_commit_group, cp_async_wait_group,
     };
-    use cuda_device::float::{fma_rn_f32, mul_rn_f32};
     use cuda_device::shared::cvta_generic_to_shared_u32;
     use cuda_device::vector::U32x4;
     use cuda_device::wmma::{ldmatrix_x4_shared_u32, mma_m16n8k32_s32_s8};
@@ -1183,6 +1182,90 @@ mod gemm32_kernels {
         };
     }
 
+    /// Dense prompt product with BF16 operands and F32 accumulation.
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            rows >= 1,
+            n >= 1,
+            4 * qs.len() >= rows * k,
+            128 * e.len() >= rows * k,
+            x.len() >= n * k,
+            y.len() >= rows * n
+        )
+    )]
+    pub fn mxfp8_mma_gemm(
+        qs: &[u32],
+        e: &[u32],
+        x: &[f32],
+        rows: u32,
+        k: u32,
+        n: u32,
+        mut y: DisjointSlice<f32>,
+    ) {
+        static mut STAGE: SharedArray<f32, { STAGES * STAGE_FLOATS }, 16> = SharedArray::UNINIT;
+        // SAFETY: this block's aligned shared allocation, accessed without a reference.
+        let sh = unsafe { SharedArray::as_raw_mut_ptr(&raw mut STAGE) };
+        // SAFETY: the checked launch supplies 256 converged threads, the grid,
+        // aligned activations and the weight and output spans in the contract.
+        unsafe {
+            bf16_mma_body(
+                ByteRows::<Mxfp8Bytes>::new(qs, e),
+                x,
+                rows,
+                k,
+                n,
+                &mut y,
+                sh,
+            )
+        };
+    }
+
+    /// Dense prompt product with BF16 operands and F32 accumulation.
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            rows >= 1,
+            n >= 1,
+            4 * qs.len() >= rows * k,
+            128 * e.len() >= rows * k,
+            x.len() >= n * k,
+            y.len() >= rows * n
+        )
+    )]
+    pub fn fp8_b128_mma_gemm(
+        qs: &[u32],
+        e: &[u32],
+        x: &[f32],
+        rows: u32,
+        k: u32,
+        n: u32,
+        mut y: DisjointSlice<f32>,
+    ) {
+        static mut STAGE: SharedArray<f32, { STAGES * STAGE_FLOATS }, 16> = SharedArray::UNINIT;
+        // SAFETY: this block's aligned shared allocation, accessed without a reference.
+        let sh = unsafe { SharedArray::as_raw_mut_ptr(&raw mut STAGE) };
+        // SAFETY: the checked launch supplies 256 converged threads, the grid,
+        // aligned activations and the weight and output spans in the contract.
+        unsafe {
+            bf16_mma_body(
+                ByteRows::<Fp8B128Bytes>::new(qs, e),
+                x,
+                rows,
+                k,
+                n,
+                &mut y,
+                sh,
+            )
+        };
+    }
+
     /// [`swiglu_quant32`] under a gate·up rule of the K-quant family
     /// (`kquant::act`): each value is `apply(act, limit, g, u)` — ik's
     /// clamped SwiGLU at `limit` (`ACT_SWIGLU_CLAMP`), the OAI SwiGLU at
@@ -1291,6 +1374,8 @@ mod gemm32_kernels {
 /// Owns no context and no stream — every enqueue takes the engine stream, so
 /// launches order with the rest of the step and are capturable.
 pub struct Gemm32Kernels {
+    #[cfg(bloomery_nvfp4_mma)]
+    pub(super) native: super::nvfp4mma::Kernels,
     pub(super) module: gemm32_kernels::LoadedModule,
     /// One wave of `gemm_q8_0p_slab` on the card ([`q8_0p_wave`]).
     pub(super) q8_0p_wave: u32,
@@ -1303,7 +1388,12 @@ impl Gemm32Kernels {
         // the module above; every launcher checks its launch contract.
         let module = unsafe { crate::shared_module!(gemm32_kernels, ctx)? };
         let q8_0p_wave = q8_0p_wave(ctx, &module)?;
-        Ok(Gemm32Kernels { module, q8_0p_wave })
+        Ok(Gemm32Kernels {
+            module,
+            q8_0p_wave,
+            #[cfg(bloomery_nvfp4_mma)]
+            native: super::nvfp4mma::Kernels::load(ctx)?,
+        })
     }
 }
 

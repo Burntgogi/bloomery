@@ -114,7 +114,7 @@ struct Yielding {
     log: Arc<Mutex<Vec<Call>>>,
     at: Vec<(Kind, usize, usize, Then)>,
     slow: Option<(usize, Duration)>,
-    counts: [[usize; 2]; 2],
+    counts: [[usize; 4]; 2],
     cur: usize,
 }
 
@@ -129,7 +129,7 @@ impl Yielding {
             log: Arc::clone(log),
             at: Vec::new(),
             slow: None,
-            counts: [[0; 2]; 2],
+            counts: [[0; 4]; 2],
             cur: 0,
         }
     }
@@ -287,6 +287,87 @@ fn beside(addr: SocketAddr, latch: &Latch, prompt: &str, n: usize) -> (Reply, Re
 fn alone(prompt: &str, n: usize) -> Value {
     let addr = crate::common::start(4096);
     post(addr, "/completion", &completion(prompt, n)).json()["tokens"].clone()
+}
+
+/// The ids a request holds reach its streaming client before the engine runs
+/// another request's prompt call: with A decoding and B and C queued behind
+/// it, A's stream carries two ids before B's first prompt call, and B's
+/// stream its first id before the call of C's prompt that follows B's last,
+/// for a B prompt of one call (with and without a quantum) and of five.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_a_decode_answer_reaches_the_client_before_a_new_prompt_starts() {
+    for (quantum, prompt, call) in [(None, "abab", 1), (Some(Q), "abab", 1), (Some(Q), B5, 5)] {
+        let log = new_log();
+        let decoded = Arc::new(Latch::default());
+        let starting = Arc::new(Latch::default());
+        let prompting = Arc::new(Latch::default());
+        let mut engine = Yielding::new(quantum, &log);
+        engine.inner = engine.inner.with_slots(4);
+        engine
+            .at
+            .push((Kind::Next, 0, 2, Then::Hold(Arc::clone(&decoded))));
+        engine
+            .at
+            .push((Kind::Pre, 1, 1, Then::Hold(Arc::clone(&starting))));
+        engine
+            .at
+            .push((Kind::Pre, 2, call, Then::Hold(Arc::clone(&prompting))));
+        let addr = start_n(Box::new(engine), 4, None, None);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let chunks = Arc::clone(&seen);
+        let a = std::thread::spawn(move || {
+            let mut body = completion(A, 6);
+            body["stream"] = json!(true);
+            super::read_stream(addr, &body, &chunks);
+        });
+        assert!(decoded.wait_entered(BOUND), "A never decoded");
+        let seen_b = Arc::new(Mutex::new(Vec::new()));
+        let chunks = Arc::clone(&seen_b);
+        let b = std::thread::spawn(move || {
+            let mut body = completion(prompt, 6);
+            body["stream"] = json!(true);
+            super::read_stream(addr, &body, &chunks);
+        });
+        wait_deferred(addr, 1, BOUND);
+        let c = post_bg(addr, completion(&format!("{B5}{B5}"), 6));
+        wait_deferred(addr, 2, BOUND);
+        decoded.release();
+        let mut deliveries = Vec::new();
+        for (latch, want) in [(&starting, (2, 0)), (&prompting, (2, 1))] {
+            let entered = latch.wait_entered(BOUND);
+            let end = Instant::now() + BOUND;
+            let delivered = loop {
+                let [a, b] = [&seen, &seen_b].map(|chunks| {
+                    chunks
+                        .lock()
+                        .expect("seen")
+                        .iter()
+                        .filter(|(_, _, last, chunk)| {
+                            !last && !chunk["content"].as_str().expect("chunk content").is_empty()
+                        })
+                        .count()
+                });
+                if (a >= want.0 && b >= want.1) || Instant::now() >= end {
+                    break (a, b);
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            latch.release();
+            deliveries.push((entered, delivered, want));
+        }
+        a.join().expect("A stream");
+        b.join().expect("B stream");
+        let c = c.join().expect("C");
+        assert_eq!(c.status, 200, "{}", c.body);
+        for (boundary, (entered, delivered, want)) in deliveries.into_iter().enumerate() {
+            assert!(entered, "prompt boundary {boundary} never reached");
+            assert!(
+                delivered.0 >= want.0 && delivered.1 >= want.1,
+                "only {delivered:?} tokens before boundary {boundary}, call {call}, quantum {quantum:?}"
+            );
+        }
+    }
 }
 
 /// A prompt of five quanta that takes a slot while the other decodes runs as
@@ -596,6 +677,95 @@ fn document() -> Value {
     json!({"prompt": "ab", "n_predict": 100, "return_tokens": true,
         "response_format": {"type": "json_schema",
             "json_schema": {"name": "r", "schema": schema}}})
+}
+
+/// A run of fixed ids reaches its streaming client before another request's
+/// fill finishes: beside a decoding stream, of two streams of [`document`],
+/// the first carries its 24-byte property name while the second's last fill
+/// call is held, with and without a quantum, and with a third property after
+/// that name or none; both streams give the same valid document.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_a_schema_fill_reaches_the_client_before_the_next_fill_finishes() {
+    for quantum in [None, Some(Q)] {
+        for more in [false, true] {
+            let log = new_log();
+            let decoded = Arc::new(Latch::default());
+            let filling = Arc::new(Latch::default());
+            let mut engine = Yielding::new(quantum, &log);
+            engine.inner = engine.inner.with_slots(4);
+            engine
+                .at
+                .push((Kind::Next, 0, 2, Then::Hold(Arc::clone(&decoded))));
+            engine
+                .at
+                .push((Kind::Next, 2, 2, Then::Hold(Arc::clone(&filling))));
+            let addr = start_n(Box::new(engine), 4, None, None);
+            let running = post_bg(addr, completion(A, 60));
+            assert!(decoded.wait_entered(BOUND), "the decoding slot never ran");
+            let mut body = document();
+            if more {
+                body["response_format"]["json_schema"]["schema"]["properties"]["z"] =
+                    json!({"type": "boolean"});
+            }
+            body["stream"] = json!(true);
+            let mut readers = Vec::new();
+            let mut streams = Vec::new();
+            for queued in 1..=2 {
+                let seen = Arc::new(Mutex::new(Vec::new()));
+                let chunks = Arc::clone(&seen);
+                let body = body.clone();
+                readers.push(std::thread::spawn(move || {
+                    super::read_stream(addr, &body, &chunks);
+                }));
+                streams.push(seen);
+                wait_deferred(addr, queued, BOUND);
+            }
+            decoded.release();
+            let entered = filling.wait_entered(BOUND);
+            let deadline = Instant::now() + BOUND;
+            let delivered = loop {
+                let text: String = streams[0]
+                    .lock()
+                    .expect("seen")
+                    .iter()
+                    .map(|(_, _, _, chunk)| chunk["content"].as_str().expect("content"))
+                    .collect();
+                if text.contains("abcdefghijklmnopqrstuvwx") || Instant::now() >= deadline {
+                    break text;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            filling.release();
+            for reader in readers {
+                reader.join().expect("schema stream");
+            }
+            let running = running.join().expect("decoding stream");
+            assert_eq!(running.status, 200, "{}", running.body);
+            assert!(entered, "B's final fill never ran: {:?}", calls(&log));
+            assert!(
+                delivered.contains("abcdefghijklmnopqrstuvwx"),
+                "A's fill waited for B: {delivered:?}, quantum {quantum:?}, more {more}"
+            );
+            let texts: Vec<String> = streams
+                .iter()
+                .map(|seen| {
+                    let chunks = seen.lock().expect("seen");
+                    assert!(chunks.last().expect("last chunk").2, "stream never ended");
+                    chunks
+                        .iter()
+                        .map(|(_, _, _, chunk)| chunk["content"].as_str().expect("content"))
+                        .collect()
+                })
+                .collect();
+            assert_eq!(texts[0], texts[1], "the schema streams differ");
+            let value: Value = serde_json::from_str(&texts[0]).expect("schema document");
+            for key in ["a", "abcdefghijklmnopqrstuvwx"] {
+                assert!(value[key].is_boolean(), "{value}");
+            }
+            assert_eq!(value["z"].is_boolean(), more, "{value}");
+        }
+    }
 }
 
 /// B's calls on slot 1 in `calls`, cut after each of its steps: the prompt's

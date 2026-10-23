@@ -23,6 +23,10 @@
 //!   named tie (ours the oracle's runner-up, the oracle's margin at most twice our distance at the
 //!   two ids, the logits within `FREE_BAND`). The layer outputs are printed: a flip in any of the
 //!   3,000 positions before it may lie on their path.
+//! - (rt) the load made for a route trace (`HostCfg::route_trace`): it opens, every layer keeps its
+//!   host leg, which writes the trace, and the host run holds no view (no CPU kernel reads an NVFP4
+//!   stack); the batch set's ids by eager steps as one prompt call fill a complete trace, every
+//!   slot on the card, and each step's logits are the plain load's bit for bit.
 //! - Recorded, not judged: the batch run and the D3K step against the other pair of sets, the Q8_0
 //!   rounding's share of the distance.
 //!
@@ -64,6 +68,10 @@ mod qwen38_folder;
 mod qwen38_open;
 
 #[cfg(feature = "gpu")]
+#[path = "shared/quiet.rs"]
+mod quiet;
+
+#[cfg(feature = "gpu")]
 mod gate {
     use std::path::Path;
     use std::time::Instant;
@@ -76,7 +84,11 @@ mod gate {
     use crate::qwen38_folder;
     use crate::qwen38_open::{Open38, open_split};
 
-    use bloomery_gpu::arch::qwen3moe::{Model38, Prompt38, Qwen38Model, RouteTap};
+    use bloomery_gpu::arch::qwen3moe::{
+        Body38, Model38, Prompt38, Qwen38Model, RouteTap, TargetRows,
+    };
+    use bloomery_gpu::draft::{DraftFeed, DraftHead, Feed, Hidden, WalkMode};
+    use bloomery_gpu::host::route_trace::{RouteTrace, TraceHeader, TraceSet};
     use bloomery_gpu::host::swap::Residency;
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu_gates::flip;
@@ -84,11 +96,14 @@ mod gate {
     use bloomery_gpu_gates::{
         GateError, RefManifest, checks_failed, data_dir, ref_model_path, verdict,
     };
+    use bloomery_levers::HostCfg;
     use gguf::GgmlType;
+    use model::arch::models::headpick::HeadSet;
     use model::arch::qwen35moe::names;
     use model::arch::qwen35moe::place::{Experts, PlanInputs};
     use model::placement::{ModelTensors, PlanLevers, Role};
     use refset::arch::qwen4exp::nvfp4::{BATCH, BATCH_BF16, D3K, D3K_BF16, HF};
+    use runtime::Advance;
 
     /// Cache rows: D3K's step at position 3,000, with room.
     const CTX: usize = 3072;
@@ -142,10 +157,15 @@ mod gate {
         open_split(path).map(Model38::from)
     }
 
-    /// (l): the plan on the one visible card, every routed expert on it, and the load.
-    fn open(path: &Path, d: &Dims) -> Result<(Qwen38Model, bool), GateError> {
+    /// (l): the plan on the one visible card, every routed expert on it, and the load under
+    /// `host`.
+    fn open(
+        path: &Path,
+        d: &Dims,
+        levers: &bloomery_levers::Levers,
+        host: HostCfg,
+    ) -> Result<(Qwen38Model, bool), GateError> {
         let file = model_of(path)?;
-        let levers = bloomery_levers::at_main(&[])?;
         let specs = Place::A.on_host()?.card_specs()?;
         let [card] = specs[..] else {
             return Err(format!("--place a resolved to {} cards, not one", specs.len()).into());
@@ -153,6 +173,42 @@ mod gate {
         let t = Instant::now();
         let ub = bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for(CTX)?;
         let plan_levers = PlanLevers::default();
+        if levers.draft() == Some("mtp") {
+            let inputs = PlanInputs::describe(file.header())?;
+            let draft = qwen38_folder::draft(path)?;
+            let mtp = model::arch::qwen35moe::place::MtpInputs::read(
+                &draft,
+                file.header(),
+                &inputs,
+                HeadSet::Full,
+            )?;
+            let machine = model::arch::qwen35moe::place::machine_for_experts(
+                card,
+                inputs.spec.layers.len(),
+                ub as u64,
+                Experts::Card,
+            );
+            let plan = inputs.plan_mtp_with_slots(
+                &machine,
+                CTX as u64,
+                &plan_levers,
+                &mtp,
+                Experts::Card,
+                1,
+            )?;
+            let ok = plan.plan.host.experts == 0
+                && plan.plan.n_l.iter().all(|&n| n == d.n_expert as u64);
+            println!(
+                "(l) folder MTP draft_resident_bytes={} arena_bytes={} {}",
+                plan.draft_resident_bytes(),
+                plan.arena_bytes,
+                verdict(ok)
+            );
+            let mut model =
+                Body38::open_placed_mtp_slots(file, &plan, &inputs, 0, host, ub, &draft, &mtp, 1)?;
+            model.set_mode(StepMode::Graph);
+            return Ok((model, ok));
+        }
         let planned = Open38 {
             card,
             ctx: CTX,
@@ -160,7 +216,7 @@ mod gate {
             experts: Experts::Card,
             slots: 1,
             plan_levers: &plan_levers,
-            host: levers.host(),
+            host,
             room: None,
             residency: Residency::Off,
         }
@@ -270,6 +326,26 @@ mod gate {
         Ok(ok || !judged)
     }
 
+    fn logits_kl(oracle: &[f32], ours: &[f32]) -> Result<f64, GateError> {
+        if oracle.is_empty() || oracle.len() != ours.len() {
+            return Err("NVFP4 KL: empty or unequal logits rows".into());
+        }
+        for row in [oracle, ours] {
+            if row.iter().any(|x| x.is_nan() || *x == f32::INFINITY)
+                || !row.iter().any(|x| x.is_finite())
+            {
+                return Err("NVFP4 KL: invalid logits distribution".into());
+            }
+        }
+        let p = bloomery_gpu_gates::prompts::log_softmax(oracle);
+        let q = bloomery_gpu_gates::prompts::log_softmax(ours);
+        Ok(p.iter()
+            .zip(q)
+            .filter(|(lp, _)| lp.is_finite())
+            .map(|(lp, lq)| lp.exp() * (lp - lq))
+            .sum())
+    }
+
     /// (p) or (g), `tag`: the batch set by `path` (one pass or one ubatch walk, `how`) from a
     /// reset; its last argmax against the oracle's.
     fn batch_by(
@@ -286,9 +362,10 @@ mod gate {
         let ok = top == argmax(&oracle);
         println!(
             "({tag}) the batch set by {how}: last argmax ours={top} oracle={} logits_rel={:.3e} \
-             (printed) {}",
+             kld={:.9} (printed) {}",
             argmax(&oracle),
             rel(&ours, &oracle),
+            logits_kl(&oracle, &ours)?,
             verdict(ok)
         );
         Ok(ok)
@@ -322,10 +399,11 @@ mod gate {
             let rels = layer_rels(man, &r.taps, d.row, d.n_layer)?;
             print_layers(name, &rels, 0, FREE_BAND);
             let step_ok = top == oracle_top || tie;
+            let kl = logits_kl(&oracle, ours)?;
             println!(
                 "(t) {name}: position {pos} after {} ids by ubatches ({fed:.1} s, runtime value); \
                  argmax ours={top} oracle={oracle_top} (its runner-up {oracle_2}, margin {margin:.4}, \
-                 our distance at the two {dist:.4}{}); logits_rel {logits_rel:.3e}; worst \
+                 our distance at the two {dist:.4}{}); logits_rel {logits_rel:.3e}; kld={kl:.9}; worst \
                  l_out_rel {:.3e} (printed) {}",
                 prefill.len(),
                 if tie { ", a named tie" } else { "" },
@@ -344,9 +422,10 @@ mod gate {
     /// The dense form of the loaded dense projections of `model`: the head's
     /// type, BF16 as the checkpoint stores it (what `prepare` writes by default, judged by the
     /// `_bf16` sets) or Q8_0 (what `BLOOMERY_PREPARE_Q8=1` writes, or another converter, judged by
-    /// the others). Every other BF16 or Q8_0 tensor but the indexer's projections, which `prepare`
-    /// keeps in BF16 beside either form, must be of the head's type: the sets hold one form or the
-    /// other. This picks the reference sets only; the model loader refuses Q8_0 indexer projections.
+    /// the others). Every other BF16 or Q8_0 tensor but the indexer's projections and the router
+    /// with its shared gate, which `prepare` keeps in BF16 beside either form, must be of the
+    /// head's type: the sets hold one form or the other. This picks the reference sets only; the
+    /// model loader refuses Q8_0 indexer projections.
     /// A head of another type or none, and a mixed split, are refused by name.
     fn dense_of(model: &ModelTensors) -> Result<Dense, String> {
         let tensors: Vec<(&str, GgmlType)> = model
@@ -365,10 +444,13 @@ mod gate {
         let indexer: Vec<String> = (0..model.layers)
             .flat_map(|l| [names::indexer_q_proj(l), names::indexer_k_proj(l)])
             .collect();
+        let router: Vec<String> = (0..model.layers)
+            .flat_map(|l| [names::ffn_gate_inp(l), names::ffn_gate_inp_shexp(l)])
+            .collect();
         if let Some((name, other)) = tensors.iter().find(|(n, t)| {
             matches!(t, GgmlType::BF16 | GgmlType::Q8_0)
                 && *t != ty
-                && !indexer.iter().any(|i| i == n)
+                && !indexer.iter().chain(&router).any(|i| i == n)
         }) {
             return Err(format!(
                 "{name} is {other:?} beside a {ty:?} {head}, a dense form no pair of sets holds"
@@ -423,10 +505,166 @@ mod gate {
         })
     }
 
+    /// (rt): the load of `path` made for a route trace, the trace attached and `toks` run from a
+    /// reset as one prompt call ([`run_steps`]), against `want`, the plain load's logits of the
+    /// same steps. A load that fails is a named FAIL.
+    fn traced(
+        path: &Path,
+        d: &Dims,
+        levers: &bloomery_levers::Levers,
+        (toks, want): (&[u32], &[Vec<f32>]),
+    ) -> Result<bool, GateError> {
+        let host = HostCfg {
+            route_trace: true,
+            ..levers.host()
+        };
+        let mut m = match open(path, d, levers, host) {
+            Ok((m, _)) => m,
+            Err(e) => {
+                println!(
+                    "(rt) the load for a route trace FAILED: {e} {}",
+                    verdict(false)
+                );
+                return Ok(false);
+            }
+        };
+        let dir =
+            std::env::temp_dir().join(format!("gate_qwen4exp_nvfp4-trace-{}", std::process::id()));
+        m.reset()?;
+        let (_, _, body) = m.body_parts("rt")?;
+        let tier = body.hybrid_mut();
+        let views = tier.host_mut().len();
+        let layers = tier.slots().layers();
+        let trace = RouteTrace::create(
+            &dir,
+            TraceHeader {
+                model: path.to_path_buf(),
+                arch: "qwen4exp".to_owned(),
+                build: "gate_qwen4exp_nvfp4".to_owned(),
+                n_expert: d.n_expert,
+                n_used: d.n_used,
+                first_layer: layers.start,
+                n_layer: layers.len(),
+                extra: Vec::new(),
+            },
+        )?;
+        tier.attach_route_trace(trace)?;
+        tier.route_prompt(0, toks.len())?;
+        let same = run_steps(&mut m, toks)?
+            .logits
+            .iter()
+            .flatten()
+            .map(|v| v.to_bits())
+            .eq(want.iter().flatten().map(|v| v.to_bits()));
+        m.body_parts("rt")?
+            .2
+            .hybrid_mut()
+            .take_route_trace()
+            .ok_or("(rt): the route trace left the tier")?
+            .finish()?;
+        let set = TraceSet::read(&dir)?;
+        std::fs::remove_dir_all(&dir)?;
+        let on_card = set.kinds.iter().flatten().all(|&k| k == b'C');
+        let ok = views == 0 && set.complete == Some(toks.len() as u64) && on_card && same;
+        println!(
+            "(rt) the load for a route trace: host views {views} (want 0), trace positions {:?} \
+             (want {}), every slot on the card {on_card}, logits the plain load's bit for bit \
+             {same} {}",
+            set.complete,
+            toks.len(),
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
+    fn mtp(mut m: Qwen38Model, prompt: &[u32]) -> Result<bool, GateError> {
+        m.reset()?;
+        m.prompt38(prompt, Prompt38::Pass)?;
+        let hidden = m.target_streams(TargetRows::Pass, prompt.len())?;
+        let width = hidden.len() / prompt.len();
+        let mut ok = true;
+        for rows in 1..=4 {
+            let mut eager = None;
+            for mode in [WalkMode::Eager, WalkMode::Graph, WalkMode::Graph] {
+                m.poison_mtp_scratch()?;
+                let out = m.mtp_draft(
+                    DraftFeed::Rows(Feed {
+                        tokens: &prompt[..rows],
+                        pos0: 0,
+                        hidden: Hidden::Host(&hidden[..rows * width]),
+                        media: None,
+                    }),
+                    DraftHead::Full,
+                    mode,
+                )?;
+                let state = m
+                    .mtp_l_out()?
+                    .into_iter()
+                    .map(f32::to_bits)
+                    .collect::<Vec<_>>();
+                let got = (
+                    out.tokens,
+                    out.p.into_iter().map(f32::to_bits).collect::<Vec<_>>(),
+                    state,
+                );
+                match &eager {
+                    None => eager = Some(got),
+                    Some(want) => ok &= *want == got,
+                }
+            }
+            println!(
+                "(mtp-g) rows={rows} poisoned scratch: eager = graph = replay {}",
+                verdict(ok)
+            );
+        }
+        m.reset()?;
+        let mut plain = vec![m.prompt38(prompt, Prompt38::Auto)?];
+        while plain.len() < 32 {
+            plain.push(m.step(&[*plain.last().ok_or("no plain token")?])?);
+        }
+        m.reset()?;
+        let mut session = app::Session::from_model(m, CTX as u32);
+        let draft = app::mtp::MtpDraft::open(session.model(), Prompt38::Auto, StepMode::Graph)?;
+        let mut spec =
+            session.with_draft::<app::mtp::MtpDraft<Body38>, 4>(draft, &mut crate::quiet::Quiet)?;
+        let first = spec.prompt(&mut session, prompt)?;
+        spec.begin(&session, prompt, first)?;
+        let mut drafted = vec![first];
+        while drafted.len() < plain.len() {
+            spec.pass(
+                &mut session,
+                *drafted.last().ok_or("no draft token")?,
+                &mut drafted,
+            )?;
+        }
+        let same = drafted[..plain.len()] == plain;
+        println!(
+            "(mtp-v) greedy target oracle: {} tokens plain = verified {}",
+            plain.len(),
+            verdict(same)
+        );
+        Ok(ok && same)
+    }
+
     pub fn run() -> Result<(), GateError> {
+        let levers = bloomery_levers::at_main(&[bloomery_levers::DRAFT])?;
+        if let Some(word) = levers.draft()
+            && !matches!(word, "off" | "mtp")
+        {
+            return Err(
+                format!("BLOOMERY_DRAFT={word:?}: this gate supports only off or mtp").into(),
+            );
+        }
         let path = ref_model_path()?;
         println!("model {}", path.display());
         let d = dims(&path)?;
+        if levers.draft() == Some("mtp") {
+            let batch = set(d.dense.batch.0)?;
+            let (_, toks, _) = batch.step()?;
+            let (m, mut ok) = open(&path, &d, &levers, levers.host())?;
+            ok &= mtp(m, toks)?;
+            return if ok { Ok(()) } else { Err(checks_failed()) };
+        }
         let Dense {
             ty,
             q8_indexer,
@@ -457,7 +695,7 @@ mod gate {
             }
         }
         let (_, toks, _) = batch.step()?;
-        let (mut m, mut ok) = open(&path, &d)?;
+        let (mut m, mut ok) = open(&path, &d, &levers, levers.host())?;
         let vocab = m.body("run")?.vocab();
         m.reset()?;
         let r = run_steps(&mut m, toks)?;
@@ -478,6 +716,8 @@ mod gate {
             &batch,
         )?;
         ok &= d3k_step(&mut m, &d, vocab, (d3k_name, &d3k), (other_d3k, &d3k_other))?;
+        drop(m);
+        ok &= traced(&path, &d, &levers, (toks, &r.logits))?;
         if ok { Ok(()) } else { Err(checks_failed()) }
     }
 
@@ -485,12 +725,28 @@ mod gate {
     mod tests {
         use super::*;
 
+        #[test]
+        fn logits_kl_compares_distributions_and_refuses_invalid_rows() {
+            let p = [0.0, 1.0, f32::NEG_INFINITY];
+            assert!(logits_kl(&p, &[4.0, 5.0, f32::NEG_INFINITY]).unwrap().abs() < 1e-12);
+            assert!(logits_kl(&p, &[1.0, 0.0, f32::NEG_INFINITY]).unwrap() > 0.4);
+            for q in [
+                &[][..],
+                &[0.0][..],
+                &[0.0, f32::NAN, 0.0][..],
+                &[f32::NEG_INFINITY; 3][..],
+            ] {
+                assert!(logits_kl(&p, q).is_err());
+            }
+        }
+
         /// The sets follow the split's dense form: `prepare`'s default split (every dense matrix
         /// BF16) the `_bf16` pair; its `BLOOMERY_PREPARE_Q8=1` split (Q8_0, the indexer's
         /// projections BF16) and a Q8_0 split another converter wrote (the indexer Q8_0 too) the
-        /// Q8_0 pair; a projection of the other form, a head of a third type and no head are
-        /// refused by name. Mutants: the form read as one type whatever the head, the pairs
-        /// swapped, the mixed check dropped, the indexer not exempt.
+        /// Q8_0 pair, the router BF16 beside either; a projection of the other form, a head of a
+        /// third type and no head are refused by name. Mutants: the form read as one type
+        /// whatever the head, the pairs swapped, the mixed check dropped, the indexer or the
+        /// router not exempt.
         #[test]
         fn a_split_is_judged_by_the_sets_of_its_dense_form() {
             let split = |dense, indexer| -> Vec<(String, GgmlType)> {
@@ -529,7 +785,7 @@ mod gate {
                     layers: 4,
                     experts: 1,
                     experts_used: 1,
-                    bf16_words: |t| t.name != names::ffn_gate_inp(0),
+                    bf16_words: |_| true,
                 })
             };
             let (bf16, q8) = (GgmlType::BF16, GgmlType::Q8_0);
@@ -551,6 +807,7 @@ mod gate {
             assert_eq!(of(&unused), Ok(rewritten));
             let mut values = split(q8, bf16);
             values.push((names::ffn_gate_inp(0), bf16));
+            values.push((names::ffn_gate_inp_shexp(0), bf16));
             assert_eq!(of(&values), Ok(rewritten));
             assert_eq!(of(&split(bf16, bf16)), Ok(stored));
             assert_eq!(of(&split(q8, bf16)), Ok(rewritten));

@@ -367,8 +367,8 @@ pub struct PlanInputs {
     /// the room less the draft layer's routed experts. A gate that plans an
     /// arm by a room of its own sets it, read [`HostRead::Given`].
     ///
-    /// The plan is made at [`workstation::plan_room`]: a read room less
-    /// [`workstation::HOST_DRIFT`], a given room as given.
+    /// The effective room is [`Plan::plan_at`]'s: the reading's plan room,
+    /// capped by the machine's host room and unified pool.
     pub room: (u64, HostRead),
     /// The arena's bytes `BLOOMERY_NVTIER_BYTES` gave the split dial
     /// ([`workstation::nvtier_arena_given`]), `None` unset; the split takes it
@@ -1510,7 +1510,7 @@ mod tests {
         use crate::placement::workstation::{HostNeed, HostRead};
         use crate::placement::{
             Card, Host, Machine, ModelTensor, ModelTensors, Node, PlacementError, Plan, PlanLevers,
-            Role, UnifiedPool, Violation,
+            PoolNeed, Role, UnifiedPool,
         };
 
         const LAYERS: usize = 4;
@@ -1930,27 +1930,42 @@ mod tests {
         /// next-token layer's card bytes and arena, its routed experts on the
         /// host and the front on a plan with it. A pool of exactly the need the
         /// plan's host headroom counts plans clean, and one byte under it is
-        /// refused once, by the pool's bound, naming those bytes beside the
-        /// plan.
+        /// refused by the host floor before pool validation.
+        // PIN(2026-10-23): capped tier rooms refuse at the host floor before pool validation.
         #[test]
         fn slot_plans_on_one_pool_count_the_bytes_beside_once() {
             let (inputs, nextn) = (inputs(), nextn());
             let levers = PlanLevers::default();
             let front = prompt_reserve_bytes(&inputs, CTX, false);
             let ample: u64 = 1 << 40;
-            let check = |at: &str, plan: &dyn Fn(u64) -> Result<i128, PlaceError>, beside: u64| {
-                let room = plan(ample).unwrap_or_else(|e| panic!("{at}, an ample pool: {e}"));
+            let check = |at: &str,
+                         plan: &dyn Fn(u64) -> Result<(i128, PoolNeed), PlaceError>,
+                         beside: u64| {
+                let (room, pool) =
+                    plan(ample).unwrap_or_else(|e| panic!("{at}, an ample pool: {e}"));
                 let need = ample - u64::try_from(room).expect("a headroom within the pool");
+                let physical = i128::from(ample)
+                    + i128::from(pool.cards)
+                    + i128::from(pool.host)
+                    + i128::from(beside)
+                    - i128::from(pool.pool);
+                assert_eq!(
+                    i128::from(need),
+                    physical,
+                    "{at}: every beside byte counted once"
+                );
                 if let Err(e) = plan(need) {
                     panic!("{at}, a pool of the host's need {need} B: {e}");
                 }
                 match plan(need - 1) {
-                    Err(PlaceError::Broken(v)) => match v.as_slice() {
-                        [Violation::PoolOver { beside: b, .. }] => {
-                            assert_eq!(*b, beside, "{at}: the bytes beside the plan");
+                    Err(PlaceError::Placement(PlacementError::PoolBudget { last, .. })) => {
+                        match *last {
+                            PlacementError::HostRoomFloor { room, floor, .. } => {
+                                assert_eq!(floor - room, 1, "{at}: the exact one-byte shortfall");
+                            }
+                            e => panic!("{at}: {e:?}, not the host floor"),
                         }
-                        v => panic!("{at}: {v:?}, not one PoolOver"),
-                    },
+                    }
                     other => panic!("{at}, a pool one byte under the need: {other:?}"),
                 }
             };
@@ -1960,7 +1975,12 @@ mod tests {
                     &|pool| {
                         inputs
                             .plan_slots(&unified(pool), CTX, &levers, KdaLanes::One, n)
-                            .map(|p| p.host.headroom_bytes)
+                            .map(|p| {
+                                (
+                                    p.host.headroom_bytes,
+                                    p.pool_need().expect("a unified pool"),
+                                )
+                            })
                     },
                     front,
                 );
@@ -1981,7 +2001,12 @@ mod tests {
                     &|pool| {
                         inputs
                             .plan_nextn_slots(&unified(pool), CTX, &levers, &nextn, n)
-                            .map(|p| p.host_headroom_bytes)
+                            .map(|p| {
+                                (
+                                    p.host_headroom_bytes,
+                                    p.plan.pool_need().expect("a unified pool"),
+                                )
+                            })
                     },
                     beside,
                 );
@@ -2012,6 +2037,122 @@ mod tests {
             }
             i.room = (room, HostRead::Given);
             i
+        }
+
+        #[test]
+        fn nvme_room_is_capped_by_the_unified_pool() {
+            let levers = PlanLevers {
+                card_budget_bytes: Some(1 << 30),
+            };
+            for slots in [1, 2, 4] {
+                let ample = unified(1 << 40);
+                let wide = routed(1 << 40);
+                let whole = wide
+                    .plan_slots(&ample, CTX, &levers, KdaLanes::One, slots)
+                    .unwrap();
+                let pool = HostNeed::of(&whole, 0).bytes() - 1;
+                let m = unified(pool);
+                let tight = routed(pool);
+                let expected = tight
+                    .plan_slots(&m, CTX, &levers, KdaLanes::One, slots)
+                    .expect("the trunk fits with NVMe");
+                let plan = wide
+                    .plan_slots(&m, CTX, &levers, KdaLanes::One, slots)
+                    .expect("a larger host reading keeps the same pool budget");
+                assert!(plan.host.nvme_expert_bytes > 0);
+                assert_eq!(plan.n_l, expected.n_l);
+                assert_eq!(format!("{:?}", plan.rows), format!("{:?}", expected.rows));
+                assert_eq!(plan.host.headroom_bytes, expected.host.headroom_bytes);
+                assert!(
+                    plan.violations_beside(prompt_reserve_bytes(&wide, CTX, false))
+                        .is_empty()
+                );
+            }
+            assert!(
+                routed(1 << 40)
+                    .plan_slots(&unified(1 << 30), CTX, &levers, KdaLanes::One, 1)
+                    .is_err()
+            );
+        }
+
+        #[test]
+        fn nextn_nvme_room_is_capped_by_the_unified_pool() {
+            let levers = PlanLevers {
+                card_budget_bytes: Some(1 << 30),
+            };
+            let nextn = nextn();
+            for slots in [1, 2, 4] {
+                let ample = unified(1 << 40);
+                let wide = routed(1 << 40);
+                let whole = wide
+                    .plan_nextn_slots(&ample, CTX, &levers, &nextn, slots)
+                    .unwrap();
+                let pool = HostNeed::of(&whole.plan, whole.nextn.host.expert_bytes).bytes() - 1;
+                let m = unified(pool);
+                let tight = routed(pool);
+                let expected = tight
+                    .plan_nextn_slots(&m, CTX, &levers, &nextn, slots)
+                    .expect("the trunk and NextN fit with NVMe");
+                let plan = wide
+                    .plan_nextn_slots(&m, CTX, &levers, &nextn, slots)
+                    .expect("NextN keeps the same pool budget");
+                assert!(plan.plan.host.nvme_expert_bytes > 0);
+                assert_eq!(plan.plan.n_l, expected.plan.n_l);
+                assert_eq!(
+                    format!("{:?}", plan.plan.rows),
+                    format!("{:?}", expected.plan.rows)
+                );
+                assert_eq!(plan.host_headroom_bytes, expected.host_headroom_bytes);
+                assert!(
+                    plan.plan
+                        .violations_beside(
+                            plan.nextn_card_bytes()
+                                + plan.arena_bytes
+                                + prompt_reserve_bytes(&wide, CTX, false)
+                                + plan.nextn.host.expert_bytes
+                        )
+                        .is_empty()
+                );
+            }
+        }
+
+        #[test]
+        fn node_nvme_room_is_capped_by_the_unified_pool() {
+            let levers = PlanLevers {
+                card_budget_bytes: Some(1 << 30),
+            };
+            for ranks in [1, 2, 4] {
+                let wide = routed(1 << 40);
+                let owned = vec![wide.model.experts / ranks; ranks as usize];
+                let mut m = unified(1 << 40);
+                for rank in 1..ranks {
+                    let mut tier = m.cards[0].clone();
+                    tier.name = format!("tier-{rank}");
+                    tier.head = false;
+                    tier.layers = 0..0;
+                    m.tiers.push(tier);
+                    m.nodes.push(m.nodes[0].clone());
+                }
+                let whole = wide
+                    .plan_nodes(&m, CTX, &levers, KdaLanes::Two, &owned)
+                    .unwrap();
+                let pool = HostNeed::of(&whole, 0).bytes() - 1;
+                m.host_mut().usable_bytes = pool;
+                *m.unified_mut() = Some(UnifiedPool { bytes: pool });
+                m.cards[0].free_bytes = Some(pool);
+                let tight = routed(pool);
+                let expected = tight
+                    .plan_nodes(&m, CTX, &levers, KdaLanes::Two, &owned)
+                    .expect("the node-owned experts fit with NVMe");
+                let plan = wide
+                    .plan_nodes(&m, CTX, &levers, KdaLanes::Two, &owned)
+                    .expect("each rank keeps the same local pool budget");
+                assert!(plan.host.nvme_expert_bytes > 0, "{ranks} ranks");
+                assert_eq!(plan.n_l, expected.n_l);
+                assert_eq!(plan.tier_n_l, expected.tier_n_l);
+                assert_eq!(plan.tier_n_l.len(), ranks as usize - 1);
+                assert_eq!(format!("{:?}", plan.rows), format!("{:?}", expected.rows));
+            }
         }
 
         /// A machine that hangs an expert tier card is refused, by layer

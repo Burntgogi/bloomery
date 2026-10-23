@@ -288,6 +288,36 @@ class RecipeKeyCLI(unittest.TestCase):
                 for item in items:
                     self.assertEqual(rows[item][0] == baseline[item][0], expected[item] == "skip")
 
+    def test_profiles_and_reached_sources_invalidate_their_consumers(self):
+        files = runtime_files()
+        files["justfile"] += (
+            "gate-profiled:\n"
+            "    BLOOMERY_MODEL=${BLOOMERY_MODEL:-qwen35moe} ./tools/box.sh 'cargo run -p app --bin called'\n"
+            "    BLOOMERY_MODEL=deepseek2 ./tools/box.sh 'cargo run -p app --bin linked'\n"
+            "gate-other-profile:\n"
+            "    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo run -p app --bin linked'\n"
+        )
+        for override, selected in ((None, "qwen35moe"), ("glm5next", "glm5next")):
+            with self.subTest(inherited_profile=override):
+                ws = Workspace(self, files)
+                for profile in ("deepseek2", "qwen3moe", "qwen35moe", "glm5next"):
+                    ws.write(f"tools/ref/models/{profile}.sh", f"PROFILE_VALUE={profile}-1\n")
+                if override is not None:
+                    ws.env["BLOOMERY_MODEL"] = override
+                items = ("gate-profiled", "gate-other-profile")
+                ws.green(*items)
+                mutations = (
+                    (f"tools/ref/models/{selected}.sh", ("run", "skip")),
+                    ("tools/ref/models/deepseek2.sh", ("run", "skip")),
+                    ("tools/ref/models/qwen3moe.sh", ("skip", "run")),
+                    ("crates/dep/src/used.rs", ("run", "skip")),
+                    ("crates/dep/src/unused.rs", ("skip", "skip")),
+                )
+                for rel, verdicts in mutations:
+                    changed = (ws.root / rel).read_text().replace("1", "2")
+                    with self.subTest(input=rel), ws.changed(rel, changed, restore_mtime=True):
+                        ws.assert_status(ws.keys(*items, ledger=True), dict(zip(items, verdicts)))
+
     def test_recipe_dependencies_and_dependency_only_wrapper(self):
         ws = Workspace(self, runtime_files())
         items = ("gate-build", "gate-wrap", "gate-only")

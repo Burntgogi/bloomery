@@ -61,6 +61,9 @@
 //!   or no residency, prints `off` on the second, red there;
 //! - the positions the server serves: `/props`' `n_ctx` is the context it
 //!   was started at ([`props_ctx`]);
+//! - `shared_system_prompt_stays_in_the_slot`: different questions sharing one
+//!   system message keep its message-start checkpoint in the live slot and
+//!   answer a fresh run's ids. Removing the message-start registration keeps zero;
 //! - `systemone_is_the_schema_path` (`shared/systemone_clause.rs`, the clause
 //!   `gate_qwen3_serve` holds too; the plain arm's main server, after
 //!   `cache`): the rows of `tools/ref/clef/suite.jsonl` that fit the
@@ -170,11 +173,27 @@
 //!   young window beside the first's decoding one, a window with no
 //!   proposal riding a pass only while its draft skips (`pass_slots`' own
 //!   case).
+//!   Then the drafted sampled clauses ([`slots_drafted_sampled`]): the
+//!   sampled rounds clauses' pair (below) banning the end ids
+//!   (`ignore_eos`), so each request draws in drafted passes alone and
+//!   steps beside the other on this drafted load: over the together run
+//!   every record is `cmd=step` of `passes=1` carrying both slots
+//!   (`slots_drafted_sampled_rounds_run_one_pass`: the seat runs a drafted
+//!   load's round of plain steps as one pass of its rows) and each
+//!   request's together ids are its alone ones
+//!   (`slots_drafted_sampled_together_alone`); then the pair with no ban,
+//!   the second asking 8 ids: the first steps beside it and then drafts
+//!   alone from the state its rows of the pass told its draft, its draft
+//!   proposals an id past the second's at least half its alone run's
+//!   (`slots_drafted_sampled_tail_drafts`) and some accepted
+//!   (`slots_drafted_sampled_tail_accepts`, deferred by name in the
+//!   fixture tier, whose target accepts no proposal).
 //!   Then one more server of `--parallel 2` under the seat's own defaults
-//!   — no `--place`, no `BLOOMERY_DRAFT`, no `BLOOMERY_RESIDENCY`, no
-//!   `BLOOMERY_MTP_WIDTH` (the user's case: the unset rule picks the
-//!   placement, the adaptive residency runs, the draft runs behind the
-//!   width chooser; `BLOOMERY_STEP_STATS=1` for (v3)'s records). Its
+//!   but the draft (no `--place`, no `BLOOMERY_RESIDENCY`, no
+//!   `BLOOMERY_MTP_WIDTH`, and `BLOOMERY_DRAFT=mtp`, as the unset draft is
+//!   off on two slots, `draft_slot_share`'s clause): the unset rule picks
+//!   the placement, the adaptive residency runs, the draft runs behind the
+//!   width chooser; `BLOOMERY_STEP_STATS=1` for (v3)'s records. Its
 //!   residency and width clauses, like the `xstream=` clause's second line,
 //!   rest on the unset rule picking an adaptive word on the box: where it
 //!   picks `off` (MemAvailable under the churn pool), each of them fails by
@@ -192,8 +211,8 @@
 //!   one-id flush the chooser's `mtp width` record is its own aggregate —
 //!   windows the widths above 0 and E inside the window's rows
 //!   (`slots_default_width_record_is_the_choosers`; a round of both slots
-//!   runs the draft's whole width, so whether a run cuts a narrower window
-//!   here is not fixed, and the cut is the width chooser's server's,
+//!   runs the widths its timings choose, so whether a run cuts a narrower
+//!   window here is not fixed, and the cut is the width chooser's server's,
 //!   `width_cost_cut_a_window`); and `POST /residency/reset` is a
 //!   200 whose `diff` is 0, with the server's `residency reset` record
 //!   carrying the same counts
@@ -226,7 +245,12 @@
 //!   sequence left) turns the off clause red; a pass laid in the rows'
 //!   arrival order is refused by name in the order that puts slot 1's row
 //!   first and the server dies, red on that late line and every line after
-//!   it. Of the seat's own defaults: a seat that opens with
+//!   it; a drafted load's plain rounds a slot at a time (its open's
+//!   `step_pass` false under the draft) print `passes=2`, red on the
+//!   drafted sampled round clause alone; a row of the pass its draft is not
+//!   told of leaves no refresh, and the tail's first proposal is refused by
+//!   name, red on the tail clause. Of the seat's own defaults: a seat that
+//!   opens with
 //!   `Body38::open_placed` runs no residency machine whatever the rule — no
 //!   `residency host` record and no `residency pass`, and the reset is the
 //!   server's 501; a draft run with no chooser prints no `mtp width` record.
@@ -241,8 +265,8 @@
 //!   drafted server this gate starts pins `BLOOMERY_MTP_WIDTH=fixed` (the
 //!   clauses that compare draft counts across two runs of a server hold the
 //!   fixed window; a chooser its clock drives promises no count twice), and
-//!   the seat under its own defaults (the slots clause's second server)
-//!   holds the chooser's records but no id equality.
+//!   the seat under its own defaults but the draft (the slots clause's
+//!   second server) holds the chooser's records but no id equality.
 //! - the shared-prefix clause ([`prefix`], a server of its own under
 //!   `BLOOMERY_DRAFT=off` and `BLOOMERY_RESIDENCY=off` at a context of two
 //!   checkpoint spacings): a prompt past the first spacing answered and
@@ -271,11 +295,11 @@
 //! Then the server is killed by the handle this binary spawned it with and
 //! waited for — the drafted arm ends here — and, on the plain arm, more
 //! servers start on the card, one at a time: the `ctx` clause's three, the
-//! `paged` clause's eight, the draft share clause's two and the residency
+//! `paged` clause's probes, the draft share clause's three and the residency
 //! word's one (they stop before the load, or are refused before it, but the
 //! `paged` clause's small card and the draft share clause's unset-draft
 //! server, stopped at their load's draft record), the `paged` clause's
-//! `generate_qwen3moe` run (whole, two tokens), then the slots clause's two
+//! `generate_qwen3moe` runs (one and four slots, two tokens each), then the slots clause's two
 //! and the sampled rounds' one (above).
 //!
 //! - `ctx` ([`ctx`]): a server with no `--ctx-size` prints its default's
@@ -296,10 +320,9 @@
 //!   `--ctx-size` serves its default one slot with no `paged` line (the
 //!   rule has no count to reduce, and the placement left the draft off) on a
 //!   plan that pages (`paged_default_serves_one_column`, the `cache` line's
-//!   arena), `--parallel 2` is accepted by the
-//!   plan and its server's end is printed, not judged (PIN(2026-10-12):
-//!   the clause `paged_parallel_serves_one_pass` returns when the server's
-//!   named error after the plan is fixed), and
+//!   arena), `--parallel 4` serves four requests as one pass, each with its
+//!   alone ids (`paged_parallel_serves_one_pass`, `paged_parallel_ids_as_alone`), with
+//!   a round of all four slots in one pass (`paged_parallel_rounds_carry_all_slots`), and
 //!   `BLOOMERY_DRAFT=mtp` serves one slot with the draft on
 //!   (`paged_draft_mtp_serves_one_slot`);
 //!   at 40 GiB, where the tier pages experts with no arena, `--parallel 2`
@@ -346,8 +369,12 @@
 //!   positions a slot, a window needs five) an unset draft turns off, its
 //!   `load draft=off` record naming the ten positions of the two slots past
 //!   the eight (`draft_unset_yields_to_the_slot_share`), and a set one is
-//!   refused by name before its plan (`draft_set_is_refused_by_name`); the
-//!   fixture tier defers the clause by name (the draft file is the real
+//!   refused by name before its plan (`draft_set_is_refused_by_name`); at
+//!   the default context of `--parallel 2` the unset draft is off by the
+//!   slot count, on this split as on a checkpoint folder, so a server with
+//!   `BLOOMERY_MTP_WIDTH` set beside it is refused by name before its plan,
+//!   the refusal naming the two slots (`draft_unset_is_off_on_two_slots`);
+//!   the fixture tier defers the clause by name (the draft file is the real
 //!   file's);
 //! - `residency_loads_the_word` ([`residency_loads_the_word`]): a server of
 //!   the main arguments under `BLOOMERY_RESIDENCY=mid-p0-s1`, stopped before
@@ -439,9 +466,10 @@
 //! the drafted arm's main server and the drafting clauses' own servers, `off`
 //! on the plain arm's main server and the plain clauses' own) and
 //! `BLOOMERY_RESIDENCY` (`off`; the residency word's server sets its word) —
-//! the slots clause's second server alone sets neither: it is the seat under
-//! its own defaults (the user's case); the unhosted-pool clause's servers
-//! set the draft `off` and leave the residency unset. The drafted arm's main
+//! the slots clause's second server sets the draft `mtp` and leaves the
+//! residency unset: it is the seat under its own defaults but the draft,
+//! which the unset rule leaves off on two slots; the unhosted-pool clause's
+//! servers set the draft `off` and leave the residency unset. The drafted arm's main
 //! server also takes the drafting load's `BLOOMERY_CARD_BUDGET`
 //! (`tier::plan_levers`: in the fixture tier the header's budget plus the
 //! draft's card bytes at `CTX`, as a drafting load plans there; the runner
@@ -488,7 +516,7 @@ mod gate {
     use bloomery_gpu_gates::record::{self, Fields, ReadError};
     use bloomery_gpu_gates::serve_client::{
         LookupCompletion, PrefixRestore, curl, ids_of, json_of, metric, parse_ids, prefix_restore,
-        server_log, slot_erased,
+        server_log, shared_system_prompt, slot_erased,
     };
     use bloomery_gpu_gates::tier::{self, Tag};
     use bloomery_gpu_gates::{GateError, checks_failed, ref_model_path, verdict};
@@ -606,6 +634,9 @@ mod gate {
     const DRAFTED_LATE_ROUNDS: u64 = 4;
     const DRAFTED_LATE_POLL: Duration = Duration::from_millis(50);
     const DRAFTED_LATE_POLLS: usize = 600;
+    /// The drafted sampled tail clause's short request: the long one steps
+    /// beside it this many rounds, then drafts alone.
+    const DRAFTED_SAMPLED_SHORT: usize = 8;
     /// The one chat turn the chat clauses send.
     const CHAT: &str = "What is the capital of France? Answer in one word.";
     /// The chat's reply length.
@@ -1911,69 +1942,76 @@ mod gate {
         Ok((h, rx))
     }
 
-    /// One streamed request run to its end on its own thread: its answer, or
-    /// `None` a request that failed (a red check, not the clause's end).
-    fn run_streamed(
-        addr: &str,
-        ids: &[u32],
-        n: usize,
+    /// One streamed request already posted, run to its end on its own thread
+    /// ([`answers`]): its answer, or `None` a request that failed (a red
+    /// check, not the clause's end).
+    fn answer(
+        clause: &str,
+        run: (JoinHandle<()>, StreamedRx),
         what: &str,
     ) -> Result<Option<Streamed>, GateError> {
-        let (h, rx) = streamed(addr, ids, n)?;
-        h.join()
-            .map_err(|_| format!("slots: the {what} request's thread panicked"))?;
-        let ran = rx
-            .recv()
-            .map_err(|_| format!("slots: the {what} request's thread gave no answer"))?;
-        match ran {
-            Ok(s) => Ok(Some(s)),
-            Err(e) => {
-                println!("slots: the {what} request failed: {e}");
-                Ok(None)
-            }
-        }
+        Ok(answers(clause, vec![(run, what)])?.remove(0))
     }
 
     /// `/completion` of `ids` sampled at [`SAMPLED_TEMPERATURE`] with
-    /// [`SAMPLED_SEED`], streamed ([`streamed_with`]): a request that never
-    /// drafts (any sampling steps), its ids a function of its logits rows
-    /// and the seed alone (the server seeds each request's sampler from its
-    /// own `seed`).
+    /// [`SAMPLED_SEED`], streamed ([`streamed_with`]), banning the end ids
+    /// when `ignore_eos`: its ids a function of its logits rows and the seed
+    /// alone (the server seeds each request's sampler from its own `seed`).
+    /// It steps on a load that drafts nothing; on a drafted load it drafts
+    /// while its slot runs alone in the round, banning or not.
     fn sampled_stream(
         addr: &str,
         ids: &[u32],
         n: usize,
+        ignore_eos: bool,
     ) -> Result<(JoinHandle<()>, StreamedRx), GateError> {
         streamed_with(
             addr,
             json!({
                 "prompt": ids, "n_predict": n, "temperature": SAMPLED_TEMPERATURE,
-                "seed": SAMPLED_SEED, "return_tokens": true, "cache_prompt": false, "stream": true,
+                "seed": SAMPLED_SEED, "ignore_eos": ignore_eos, "return_tokens": true,
+                "cache_prompt": false, "stream": true,
             }),
         )
     }
 
-    /// One sampled streamed request ([`sampled_stream`]) run to its end on
-    /// its own thread ([`run_streamed`]'s shape).
-    fn run_sampled(
-        addr: &str,
-        ids: &[u32],
-        n: usize,
-        what: &str,
-    ) -> Result<Option<Streamed>, GateError> {
-        let (h, rx) = sampled_stream(addr, ids, n)?;
-        h.join()
-            .map_err(|_| format!("slots: the {what} request's thread panicked"))?;
-        let ran = rx
-            .recv()
-            .map_err(|_| format!("slots: the {what} request's thread gave no answer"))?;
-        match ran {
-            Ok(s) => Ok(Some(s)),
-            Err(e) => {
-                println!("slots: the {what} request failed: {e}");
-                Ok(None)
+    /// The answers of streamed requests already posted, in order, each
+    /// thread joined: `None` a request that failed (a red check, not the
+    /// clause's end), named in a line under `clause`.
+    fn answers(
+        clause: &str,
+        runs: Vec<((JoinHandle<()>, StreamedRx), &str)>,
+    ) -> Result<Vec<Option<Streamed>>, GateError> {
+        let mut out = Vec::new();
+        for ((h, rx), what) in runs {
+            h.join()
+                .map_err(|_| format!("{clause}: the {what} request's thread panicked"))?;
+            let ran = rx
+                .recv()
+                .map_err(|_| format!("{clause}: the {what} request's thread gave no answer"))?;
+            match ran {
+                Ok(s) => out.push(Some(s)),
+                Err(e) => {
+                    println!("{clause}: the {what} request failed: {e}");
+                    out.push(None);
+                }
             }
         }
+        Ok(out)
+    }
+
+    /// Whether every request of `together` answered ids, each the ids of the
+    /// same request in `alone`.
+    fn ids_as_alone<'a>(
+        alone: impl ExactSizeIterator<Item = &'a Option<Streamed>>,
+        together: &[Option<Streamed>],
+    ) -> bool {
+        alone.len() == together.len()
+            && alone.zip(together).all(|(a, t)| {
+                a.as_ref()
+                    .zip(t.as_ref())
+                    .is_some_and(|(a, t)| !t.tokens.is_empty() && a.tokens == t.tokens)
+            })
     }
 
     /// The busy slots the server has booked over its `decodes` engine calls:
@@ -2037,10 +2075,11 @@ mod gate {
     /// and the load, `listening` and `/props` name the split ((v4)). Then,
     /// on the same server, the off slot beside a drafted window and the late
     /// request in both orders ([`slots_drafted_beside`]). The second server,
-    /// into `<dir>/slots-default`, is the seat under its own defaults at
-    /// `--parallel 2` — `--place a`, neither lever set (the user's case: the
-    /// A6000 stages, the adaptive residency and the draft run) — and runs
-    /// the together pair once ([`slots_default_residency`]).
+    /// into `<dir>/slots-default`, is the seat under its own defaults but the
+    /// draft at `--parallel 2` (`--place a`, the residency unset and
+    /// `BLOOMERY_DRAFT=mtp`: the A6000 stages, the adaptive residency and the
+    /// draft run), and runs the together pair once
+    /// ([`slots_default_residency`]).
     // PIN(2026-10-05): the swap clause (`swap_rejoins_the_draft`) is removed — the
     /// turn path it checked (`serve::SwapEngine`, the park of a preempted request's
     /// state) left the seat with the resident slots, and its coverage (a preempted
@@ -2084,6 +2123,9 @@ mod gate {
                     "slots_drafted_off_slot_steps_beside_a_window",
                     "slots_drafted_late_request_together_alone",
                     "slots_drafted_late_request_other_order_together_alone",
+                    "slots_drafted_sampled_rounds_run_one_pass",
+                    "slots_drafted_sampled_together_alone",
+                    "slots_drafted_sampled_tail_drafts",
                 ] {
                     check(&mut ok, name, false);
                 }
@@ -2156,7 +2198,7 @@ mod gate {
         }
         let mut alone = Vec::new();
         for (ids, what) in [(&a_ids, "alone A"), (&b_ids, "alone B")] {
-            alone.push(run_streamed(&addr, ids, SLOTS_PREDICT, what)?);
+            alone.push(answer("slots", streamed(&addr, ids, SLOTS_PREDICT)?, what)?);
         }
         let decode0 = metric(&url, "n_decode_total")?.unwrap_or(f64::NAN);
         let busy0 = busy_total(&url, decode0)?;
@@ -2168,23 +2210,11 @@ mod gate {
         // Both posted at once: the prompts serialize on the engine thread (a
         // round or two of skew), so nearly every round carries both slots —
         // the (v2) bound's shape.
-        let first = streamed(&addr, &a_ids, SLOTS_PREDICT)?;
-        let second = streamed(&addr, &b_ids, SLOTS_PREDICT)?;
-        let mut together = Vec::new();
-        for ((h, rx), what) in [(first, "together A"), (second, "together B")] {
-            h.join()
-                .map_err(|_| format!("slots: the {what} request's thread panicked"))?;
-            let ran = rx
-                .recv()
-                .map_err(|_| format!("slots: the {what} request's thread gave no answer"))?;
-            match ran {
-                Ok(s) => together.push(Some(s)),
-                Err(e) => {
-                    println!("slots: the {what} request failed: {e}");
-                    together.push(None);
-                }
-            }
-        }
+        let runs = vec![
+            (streamed(&addr, &a_ids, SLOTS_PREDICT)?, "together A"),
+            (streamed(&addr, &b_ids, SLOTS_PREDICT)?, "together B"),
+        ];
+        let together = answers("slots", runs)?;
         let decode1 = metric(&url, "n_decode_total")?.unwrap_or(f64::NAN);
         let busy1 = busy_total(&url, decode1)?;
         let swaps = metric(&url, "swaps_total")?;
@@ -2206,14 +2236,7 @@ mod gate {
         check(
             &mut ok,
             "slots_alone_ids_stay",
-            together[0].as_ref().is_some_and(|t| !t.tokens.is_empty())
-                && together[1].as_ref().is_some_and(|t| !t.tokens.is_empty())
-                && alone[0]
-                    .as_ref()
-                    .is_some_and(|a| a.tokens == together[0].as_ref().unwrap().tokens)
-                && alone[1]
-                    .as_ref()
-                    .is_some_and(|a| a.tokens == together[1].as_ref().unwrap().tokens),
+            ids_as_alone(alone.iter(), &together),
         );
         check(
             &mut ok,
@@ -2244,13 +2267,15 @@ mod gate {
             Some("pass"),
         )?;
         ok &= slots_drafted_beside(&url, &addr, &err_log, [&a_ids, &b_ids], &alone)?;
+        ok &= slots_drafted_sampled(&addr, &err_log, [&a_ids, &b_ids])?;
         println!("slots server stopped: {}", served.stop()?);
         slots_default_residency(dir, &mut ok)
     }
 
     /// The slots clause's second server (the module header): the seat under
-    /// its own defaults at `--parallel 2` — no `--place`, no lever set (the
-    /// user's case) — runs the together pair once and holds (v2) and (v3)
+    /// its own defaults at `--parallel 2` but the draft (no `--place`, no
+    /// residency or width lever, `BLOOMERY_DRAFT=mtp` set as the unset draft
+    /// is off on two slots) runs the together pair once and holds (v2) and (v3)
     /// alone; under the adaptive residency a stream's bits need not equal
     /// its alone run's, so no id equality is asked. The recipe leaves the
     /// box env file's CUDA_VISIBLE_DEVICES pin (the 3090) in place, so the
@@ -2263,15 +2288,19 @@ mod gate {
     /// reset route answers 200 and prints its `residency reset` record;
     /// and, after a one-id flush, the draft's width chooser (`cost`, the
     /// unset lever) prints its `mtp width` record as the chooser's own
-    /// aggregate. The fixture tier defers that last clause by name: beside
-    /// the fixture's card budget the unset rule leaves the draft off, so no
-    /// chooser runs, and the draft is the real file's in any case.
+    /// aggregate. The fixture tier defers that last clause by name: the
+    /// draft is the real file's, which proposes nothing a random-weight
+    /// target accepts.
     fn slots_default_residency(dir: &Path, ok: &mut bool) -> Result<bool, GateError> {
         let own = dir.join("slots-default");
         std::fs::create_dir_all(&own)?;
         let err_log = own.join("server.err");
+        // PIN(2026-10-23): the draft is set, where this server took the unset draft. Unset
+        // on two slots it is off on a GGUF split as on a checkpoint folder (`draft_for_slots`),
+        // so this server keeps the drafted residency, rounds and chooser it holds by the set
+        // word, and the unset rule's two-slot answer is `draft_unset_is_off_on_two_slots`.
         let mut cmd = Command::new(Served38::exe()?);
-        cmd.env_remove(bloomery_levers::DRAFT)
+        cmd.env(bloomery_levers::DRAFT, "mtp")
             .env_remove(bloomery_levers::RESIDENCY)
             .env_remove(bloomery_levers::MTP_HEAD_ROWS)
             .env_remove(bloomery_levers::MTP_DRAFT)
@@ -2377,23 +2406,11 @@ mod gate {
         let decode0 = metric(&url, "n_decode_total")?.unwrap_or(f64::NAN);
         let busy0 = busy_total(&url, decode0)?;
         let before = seat_log(&err_log)?.all(&record::SLOTS_ROUND)?.len();
-        let first = streamed(&addr, &a_ids, SLOTS_PREDICT)?;
-        let second = streamed(&addr, &b_ids, SLOTS_PREDICT)?;
-        let mut together = Vec::new();
-        for ((h, rx), what) in [(first, "default A"), (second, "default B")] {
-            h.join()
-                .map_err(|_| format!("slots-default: the {what} request's thread panicked"))?;
-            let ran = rx.recv().map_err(|_| {
-                format!("slots-default: the {what} request's thread gave no answer")
-            })?;
-            match ran {
-                Ok(s) => together.push(Some(s)),
-                Err(e) => {
-                    println!("slots-default: the {what} request failed: {e}");
-                    together.push(None);
-                }
-            }
-        }
+        let runs = vec![
+            (streamed(&addr, &a_ids, SLOTS_PREDICT)?, "default A"),
+            (streamed(&addr, &b_ids, SLOTS_PREDICT)?, "default B"),
+        ];
+        let together = answers("slots-default", runs)?;
         let decode1 = metric(&url, "n_decode_total")?.unwrap_or(f64::NAN);
         let busy1 = busy_total(&url, decode1)?;
         let swaps = metric(&url, "swaps_total")?;
@@ -2446,13 +2463,12 @@ mod gate {
         );
         // The chooser's record of each slot's request prints at that slot's
         // next prompt call: a one-id flush on each prompt, which takes the
-        // slot that holds its ids. A round of both slots runs the draft's
-        // whole width and is only counted ([`Choosing::round_ran`]): a pass
-        // below the draft's width comes only from a head or tail round beside
-        // the other's prompt, which a run need not have, so the cut is
-        // [`width_cost`]'s clause. FAIL-first: a seat that runs the draft
-        // with no chooser prints no record; a record off by a window turns
-        // the sum red.
+        // slot that holds its ids. A round of both slots runs the widths the
+        // round's timings choose and is counted at the rows it ran
+        // ([`Choosing::round_ran`]): whether a run cuts a window depends on
+        // those timings, so the cut is [`width_cost`]'s clause. FAIL-first: a
+        // seat that runs the draft with no chooser prints no record; a record
+        // off by a window turns the sum red.
         let mut flushed = true;
         for ids in [&a_ids, &b_ids] {
             let flush = json!({
@@ -2907,14 +2923,159 @@ mod gate {
                 late[0].as_ref().map_or(0, |s| s.tokens.len()),
                 late[1].as_ref().map_or(0, |s| s.tokens.len()),
             );
+            check(&mut ok, name, ids_as_alone(want.into_iter(), &late));
+        }
+        Ok(ok)
+    }
+
+    /// A sampled pair's rounds (the sampled rounds clauses, the module
+    /// header) on a `--parallel 2` server that prints its `slots round`
+    /// records: the sampled streamed requests of `ids`, banning the end ids
+    /// when `ignore_eos`, each run alone and then both together. Over the
+    /// together run every record is one `step` pass of both slots
+    /// (`<name>_rounds_run_one_pass`), and each request's together ids are
+    /// its alone ones (`<name>_together_alone`): each row of the pass and its
+    /// logits bit for bit its step alone, each answer and logits row its own
+    /// request's. The alone runs print no record (a round of one active
+    /// request is a select and a call).
+    fn sampled_pair(
+        name: &str,
+        addr: &str,
+        err_log: &Path,
+        ids: [&[u32]; 2],
+        ignore_eos: bool,
+    ) -> Result<bool, GateError> {
+        let mut ok = true;
+        let alone = [
+            answer(
+                name,
+                sampled_stream(addr, ids[0], SLOTS_PREDICT, ignore_eos)?,
+                "alone A",
+            )?,
+            answer(
+                name,
+                sampled_stream(addr, ids[1], SLOTS_PREDICT, ignore_eos)?,
+                "alone B",
+            )?,
+        ];
+        let before = seat_log(err_log)?.all(&record::SLOTS_ROUND)?.len();
+        let runs = vec![
+            (
+                sampled_stream(addr, ids[0], SLOTS_PREDICT, ignore_eos)?,
+                "together A",
+            ),
+            (
+                sampled_stream(addr, ids[1], SLOTS_PREDICT, ignore_eos)?,
+                "together B",
+            ),
+        ];
+        let together = answers(name, runs)?;
+        println!(
+            "{name}: alone {:?} ids, together {:?} ids",
+            alone
+                .iter()
+                .map(|s| s.as_ref().map(|s| s.tokens.len()))
+                .collect::<Vec<_>>(),
+            together
+                .iter()
+                .map(|s| s.as_ref().map(|s| s.tokens.len()))
+                .collect::<Vec<_>>(),
+        );
+        rounds_carry_both_in_one_pass(
+            &mut ok,
+            &format!("{name}_rounds_run_one_pass"),
+            err_log,
+            before,
+            Some("step"),
+        )?;
+        check(
+            &mut ok,
+            &format!("{name}_together_alone"),
+            ids_as_alone(alone.iter(), &together),
+        );
+        Ok(ok)
+    }
+
+    /// The drafted sampled clauses (the module header) on the slots clause's
+    /// server, after [`slots_drafted_beside`]: the sampled pair of `ids`
+    /// banning the end ids, which draws in drafted passes alone and steps
+    /// together on this drafted load ([`sampled_pair`],
+    /// `slots_drafted_sampled_*`); then the pair with no
+    /// ban, `ids[1]` asking [`DRAFTED_SAMPLED_SHORT`] ids, so `ids[0]` steps
+    /// beside it and then drafts alone from the state its rows in the pass
+    /// told its draft: its proposals an id past the short request's are at
+    /// least half its alone run's an id
+    /// (`slots_drafted_sampled_tail_drafts`; a draft its rows were not told
+    /// to has no refresh to propose from, refused by name), and some are
+    /// accepted
+    /// (`slots_drafted_sampled_tail_accepts`, which the fixture tier defers).
+    /// Refused by name before either check unless the short request answered
+    /// its [`DRAFTED_SAMPLED_SHORT`] ids and a `slots round` record of the
+    /// tail run is one `step` pass of both rows: the tail checks hold only
+    /// for a long request whose rows rode a pass beside the short one.
+    fn slots_drafted_sampled(
+        addr: &str,
+        err_log: &Path,
+        ids: [&[u32]; 2],
+    ) -> Result<bool, GateError> {
+        let mut ok = sampled_pair("slots_drafted_sampled", addr, err_log, ids, true)?;
+        let alone = answer(
+            "slots-drafted-sampled",
+            sampled_stream(addr, ids[0], SLOTS_PREDICT, false)?,
+            "alone long",
+        )?;
+        let before = seat_log(err_log)?.all(&record::SLOTS_ROUND)?.len();
+        let runs = vec![
+            (
+                sampled_stream(addr, ids[0], SLOTS_PREDICT, false)?,
+                "tail long",
+            ),
+            (
+                sampled_stream(addr, ids[1], DRAFTED_SAMPLED_SHORT, false)?,
+                "tail short",
+            ),
+        ];
+        let mut tail = answers("slots-drafted-sampled", runs)?;
+        let short = tail
+            .pop()
+            .flatten()
+            .ok_or("sampled tail: short request failed")?;
+        if short.tokens.len() != DRAFTED_SAMPLED_SHORT {
+            return Err("sampled tail: short request ended before its requested length".into());
+        }
+        let rounds = seat_log(err_log)?.all(&record::SLOTS_ROUND)?;
+        let shared = rounds.iter().skip(before).any(|r| {
+            r.word("cmd") == Ok("step") && r.u64("rows") == Ok(2) && r.u64("passes") == Ok(1)
+        });
+        if !shared {
+            return Err("sampled tail: no shared plain round exercised the refresh".into());
+        }
+        let tail = tail.remove(0);
+        // Proposals an id the request could draft: every id alone, the ids
+        // past the short request's on the tail.
+        let per_id = |s: &Streamed, from: usize| {
+            (s.tokens.len() > from).then(|| s.drafts.0 as f64 / (s.tokens.len() - from) as f64)
+        };
+        let (a, t) = (
+            alone.as_ref().and_then(|s| per_id(s, 0)),
+            tail.as_ref().and_then(|s| per_id(s, DRAFTED_SAMPLED_SHORT)),
+        );
+        println!(
+            "slots-drafted-sampled: alone {:?} (ids, drafted, accepted), beside the short one \
+             {:?}; proposals an id {a:?} and {t:?}",
+            alone.as_ref().map(|s| (s.tokens.len(), s.drafts)),
+            tail.as_ref().map(|s| (s.tokens.len(), s.drafts)),
+        );
+        check(
+            &mut ok,
+            "slots_drafted_sampled_tail_drafts",
+            a.zip(t).is_some_and(|(a, t)| a > 0.0 && 2.0 * t >= a),
+        );
+        if tier::run_clause("slots_drafted_sampled_tail_accepts", Tag::FileBound)? {
             check(
                 &mut ok,
-                name,
-                late.iter().zip(want).all(|(l, a)| {
-                    l.as_ref()
-                        .zip(a.as_ref())
-                        .is_some_and(|(l, a)| !l.tokens.is_empty() && l.tokens == a.tokens)
-                }),
+                "slots_drafted_sampled_tail_accepts",
+                tail.is_some_and(|s| s.drafts.1 > 0),
             );
         }
         Ok(ok)
@@ -2943,21 +3104,10 @@ mod gate {
             polls += 1;
         }
         let second = streamed(addr, ids[1], SLOTS_PREDICT)?;
-        let mut late = Vec::new();
-        for ((h, rx), what) in [(first, what[0]), (second, what[1])] {
-            h.join()
-                .map_err(|_| format!("slots-drafted: the late {what} request's thread panicked"))?;
-            let ran = rx.recv().map_err(|_| {
-                format!("slots-drafted: the late {what} request's thread gave no answer")
-            })?;
-            match ran {
-                Ok(s) => late.push(Some(s)),
-                Err(e) => {
-                    println!("slots-drafted: the late {what} request failed: {e}");
-                    late.push(None);
-                }
-            }
-        }
+        let late = answers(
+            "slots-drafted late",
+            vec![(first, what[0]), (second, what[1])],
+        )?;
         Ok((polls, late))
     }
 
@@ -3009,7 +3159,7 @@ mod gate {
             .into());
         }
         let decode0 = metric(url, "n_decode_total")?.unwrap_or(f64::NAN);
-        let (h, rx) = streamed(addr, a_ids, SLOTS_PREDICT)?;
+        let run = streamed(addr, a_ids, SLOTS_PREDICT)?;
         let mut polls = 0;
         while polls < DRAFTED_LATE_POLLS
             && metric(url, "n_decode_total")?.unwrap_or(decode0)
@@ -3026,18 +3176,7 @@ mod gate {
             .iter()
             .filter(|r| r.u64("rows") == Ok(2))
             .count();
-        h.join()
-            .map_err(|_| "slots-drafted off: the drafted request's thread panicked")?;
-        let drafted = match rx
-            .recv()
-            .map_err(|_| "slots-drafted off: the drafted request's thread gave no answer")?
-        {
-            Ok(s) => Some(s),
-            Err(e) => {
-                println!("slots-drafted off: the drafted request failed: {e}");
-                None
-            }
-        };
+        let drafted = answer("slots-drafted off", run, "drafted")?;
         let f = greedy(url, err_log, &strip, n, false)?;
         f.show("slots-drafted off: the same ids fresh");
         // PIN(2026-10-12): the cut rejoins the slot's draft at the turn's end (round kp-draft),
@@ -3238,19 +3377,12 @@ mod gate {
 
     /// The sampled rounds clauses (the module header) on one server of
     /// `--parallel 2` under `BLOOMERY_DRAFT=off`, `BLOOMERY_RESIDENCY=off`
-    /// and `BLOOMERY_STEP_STATS=1`, into its own directory: two sampled
-    /// streamed requests of the slots clause's prompts — temperature
-    /// [`SAMPLED_TEMPERATURE`], [`SAMPLED_SEED`] each, so a request's ids
-    /// are a function of its logits rows alone (the server seeds each
-    /// request's sampler from its own `seed`) — each first run alone on
-    /// that server and then both together, the together run's `slots
-    /// round` records read back — every one `cmd=step` of `passes=1`
-    /// carrying both slots (`rows=2`, `slots=2`), and each request's
-    /// together ids its alone run's: the seat runs a round of plain steps
-    /// as one pass of its rows, each row's answer and lent logits row its
-    /// own. The alone runs are on this server, the load the together run
-    /// runs (the plan of 2 sequences); a `--parallel 1` load's ids are no
-    /// reference (the placement differs).
+    /// and `BLOOMERY_STEP_STATS=1`, into its own directory: the sampled
+    /// pair of the slots clause's prompts ([`sampled_pair`]), every round of
+    /// its together run one `step` pass of both slots and each request's
+    /// together ids its alone run's. The alone runs are on this server, the
+    /// load the together run runs (the plan of 2 sequences); a
+    /// `--parallel 1` load's ids are no reference (the placement differs).
     fn slots_sampled_rounds(dir: &Path) -> Result<bool, GateError> {
         let mut ok = true;
         let d = dir.join("slots-sampled");
@@ -3293,66 +3425,7 @@ mod gate {
             rendered(&url, json!([{ "role": "user", "content": TURN_A }]))?,
             rendered(&url, json!([{ "role": "user", "content": SLOTS_B }]))?,
         );
-        let mut alone = Vec::new();
-        for (ids, what) in [(&a_ids, "alone A"), (&b_ids, "alone B")] {
-            alone.push(run_sampled(&addr, ids, SLOTS_PREDICT, what)?);
-        }
-        // The alone runs print no record (a round of one active request is a
-        // select and a step); taken anyway, so the together run's records are
-        // exactly the ones after this point.
-        let before = seat_log(&err_log)?.all(&record::SLOTS_ROUND)?.len();
-        let first = sampled_stream(&addr, &a_ids, SLOTS_PREDICT)?;
-        let second = sampled_stream(&addr, &b_ids, SLOTS_PREDICT)?;
-        let mut together = Vec::new();
-        for ((h, rx), what) in [(first, "together A"), (second, "together B")] {
-            h.join()
-                .map_err(|_| format!("slots-sampled: the {what} request's thread panicked"))?;
-            let ran = rx.recv().map_err(|_| {
-                format!("slots-sampled: the {what} request's thread gave no answer")
-            })?;
-            match ran {
-                Ok(s) => together.push(Some(s)),
-                Err(e) => {
-                    println!("slots-sampled: the {what} request failed: {e}");
-                    together.push(None);
-                }
-            }
-        }
-        let rounds = seat_log(&err_log)?.all(&record::SLOTS_ROUND)?;
-        let window = &rounds[before.min(rounds.len())..];
-        let every = !window.is_empty()
-            && window.iter().all(|r| {
-                r.word("cmd") == Ok("step")
-                    && r.u64("passes") == Ok(1)
-                    && r.u64("rows") == Ok(2)
-                    && r.u64("slots") == Ok(2)
-            });
-        println!(
-            "slots-sampled: {} record(s) in the together window, {} of them one pass of 2 rows \
-             (alone {} and {} ids, together {} and {} ids)",
-            window.len(),
-            window
-                .iter()
-                .filter(|r| r.word("cmd") == Ok("step") && r.u64("passes") == Ok(1))
-                .count(),
-            alone[0].as_ref().map_or(0, |s| s.tokens.len()),
-            alone[1].as_ref().map_or(0, |s| s.tokens.len()),
-            together[0].as_ref().map_or(0, |s| s.tokens.len()),
-            together[1].as_ref().map_or(0, |s| s.tokens.len()),
-        );
-        check(&mut ok, "slots_sampled_rounds_run_one_pass", every);
-        check(
-            &mut ok,
-            "slots_sampled_together_alone",
-            together[0].as_ref().is_some_and(|t| !t.tokens.is_empty())
-                && together[1].as_ref().is_some_and(|t| !t.tokens.is_empty())
-                && alone[0]
-                    .as_ref()
-                    .is_some_and(|a| a.tokens == together[0].as_ref().unwrap().tokens)
-                && alone[1]
-                    .as_ref()
-                    .is_some_and(|a| a.tokens == together[1].as_ref().unwrap().tokens),
-        );
+        ok &= sampled_pair("slots_sampled", &addr, &err_log, [&a_ids, &b_ids], false)?;
         println!("slots-sampled server stopped: {}", served.stop()?);
         Ok(ok)
     }
@@ -3804,14 +3877,22 @@ mod gate {
     /// (`draft_unset_yields_to_the_slot_share`); with `BLOOMERY_DRAFT=mtp`
     /// set the server is refused by name before its plan record, the
     /// message's total the same ten positions (`draft_set_is_refused_by_name`).
+    /// At the default context the window fits, and the slot count alone turns
+    /// the unset draft off on this split, as on a checkpoint folder
+    /// (`draft_for_slots`): a server of `--parallel 2` with
+    /// `BLOOMERY_MTP_WIDTH` set and the draft unset is refused by name before
+    /// its plan record, the refusal naming the width lever and the two slots
+    /// (`draft_unset_is_off_on_two_slots`).
     /// FAIL-first: a seat that judges the window on the total `--ctx-size`
     /// (eight, past five) keeps the unset draft and refuses it at the context
     /// the rule chose, so the first clause's server exits with the refusal
     /// before its load; a refusal whose total is one window short (the
     /// `VERIFY_ROWS` a slot) turns the second clause red; a seat whose check
     /// passes a set draft loads it, so its server prints a `plan` record and
-    /// no refusal. The fixture tier defers the clause by name: the draft file
-    /// is the real file's.
+    /// no refusal; a seat that keeps the slot rule to checkpoint folders drafts
+    /// on this split's two slots, takes the width lever and prints its `plan`
+    /// record, red on the third. The fixture tier defers the clause by name:
+    /// the draft file is the real file's.
     fn draft_slot_share(dir: &Path) -> Result<bool, GateError> {
         // The draft is the real file's: its draft file sits beside the target,
         // which a fixture's directory is not known to hold.
@@ -3824,49 +3905,67 @@ mod gate {
         let err_log = own.join("server.err");
         let positions = (<Body38 as MtpBody>::VERIFY_ROWS + 1) * 2;
         let mut ok = true;
+        // Each server runs with the residency off and the draft's levers unset
+        // but `env`.
+        let server = |env: &[(&str, &str)]| -> Result<Command, GateError> {
+            let mut cmd = Command::new(Served38::exe()?);
+            cmd.env(bloomery_levers::RESIDENCY, "off")
+                .env_remove(bloomery_levers::DRAFT)
+                .env_remove(bloomery_levers::MTP_HEAD_ROWS)
+                .env_remove(bloomery_levers::MTP_DRAFT)
+                .env_remove(bloomery_levers::MTP_WIDTH)
+                .envs(env.iter().copied());
+            Ok(cmd)
+        };
+        // A server refused before its plan, to its exit or its `plan` record:
+        // its exit, its log and whether it planned.
+        let refused =
+            |what: &str,
+             env: &[(&str, &str)],
+             args: &[&str]|
+             -> Result<(Option<std::process::ExitStatus>, String, bool), GateError> {
+                let mut served = Served38::spawn_with(args, &own, &mut server(env)?)?;
+                let mut status = None;
+                for _ in 0..POLLS {
+                    status = served.child.try_wait()?;
+                    let text = std::fs::read_to_string(&err_log)?;
+                    let planned = matches!(
+                        record::Log::of(&text, record::BLOOMERY_SERVE_QWEN38)
+                            .first(&record::PLAN38),
+                        Ok(Some(_))
+                    );
+                    if status.is_some() || planned {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_secs(1));
+                }
+                let text = std::fs::read_to_string(&err_log)?;
+                println!("draft-share: {what}: exit {status:?}");
+                if status.is_none() {
+                    println!("draft-share: the {what} server stopped: {}", served.stop()?);
+                }
+                let planned = record::Log::of(&text, record::BLOOMERY_SERVE_QWEN38)
+                    .first(&record::PLAN38)?
+                    .is_some();
+                Ok((status, text, planned))
+            };
+        let last_lines = |what: &str, text: &str| {
+            println!("draft-share: the {what} server's last lines:");
+            for l in text.lines().rev().take(20).collect::<Vec<_>>().iter().rev() {
+                println!("  {l}");
+            }
+        };
 
         // The set draft: refused before the plan record and any load.
-        let mut cmd = Command::new(Served38::exe()?);
-        cmd.env(bloomery_levers::DRAFT, "mtp")
-            .env(bloomery_levers::RESIDENCY, "off")
-            .env_remove(bloomery_levers::MTP_HEAD_ROWS)
-            .env_remove(bloomery_levers::MTP_DRAFT)
-            .env_remove(bloomery_levers::MTP_WIDTH);
         let args: Vec<&str> = DEFAULT_ARGS.iter().chain(&FLAGS).copied().collect();
-        let mut served = Served38::spawn_with(&args, &own, &mut cmd)?;
-        let mut status = None;
-        for _ in 0..POLLS {
-            status = served.child.try_wait()?;
-            let text = std::fs::read_to_string(&err_log)?;
-            let planned = matches!(
-                record::Log::of(&text, record::BLOOMERY_SERVE_QWEN38).first(&record::PLAN38),
-                Ok(Some(_))
-            );
-            if status.is_some() || planned {
-                break;
-            }
-            std::thread::sleep(Duration::from_secs(1));
-        }
-        let text = std::fs::read_to_string(&err_log)?;
-        println!("draft-share: set draft: exit {status:?}");
-        if status.is_none() {
-            println!(
-                "draft-share: the set-draft server stopped: {}",
-                served.stop()?
-            );
-        }
+        let (status, text, planned) =
+            refused("set-draft", &[(bloomery_levers::DRAFT, "mtp")], &args)?;
         let want = format!(
             "a slot's context of 4 leaves no positions for the MTP draft's window; --ctx-size \
              names a total of at least {positions}"
         );
-        let planned = record::Log::of(&text, record::BLOOMERY_SERVE_QWEN38)
-            .first(&record::PLAN38)?
-            .is_some();
         if !text.contains(&want) {
-            println!("draft-share: the set-draft server's last lines:");
-            for l in text.lines().rev().take(20).collect::<Vec<_>>().iter().rev() {
-                println!("  {l}");
-            }
+            last_lines("set-draft", &text);
         }
         check(
             &mut ok,
@@ -3874,15 +3973,32 @@ mod gate {
             status.is_some_and(|s| !s.success()) && text.contains(&want) && !planned,
         );
 
+        // The unset draft at the default context of two slots: off by the slot
+        // count, so the width lever beside it is refused by name.
+        let args: Vec<&str> = DEFAULT_ARGS[..4]
+            .iter()
+            .chain(&["--parallel", "2"])
+            .copied()
+            .collect();
+        let (status, text, planned) =
+            refused("two-slot", &[(bloomery_levers::MTP_WIDTH, "fixed")], &args)?;
+        let why = bloomery_levers::Draft38Off::Slots { slots: 2 }.to_string();
+        let named = text.contains(&format!(
+            "BLOOMERY_MTP_WIDTH picks the width a drafted window verifies; the server drafts \
+             nothing ({why})"
+        ));
+        if !named {
+            last_lines("two-slot", &text);
+        }
+        check(
+            &mut ok,
+            "draft_unset_is_off_on_two_slots",
+            status.is_some_and(|s| !s.success()) && named && !planned,
+        );
+
         // The unset draft: off, and the load's record names why.
-        let mut cmd = Command::new(Served38::exe()?);
-        cmd.env(bloomery_levers::RESIDENCY, "off")
-            .env_remove(bloomery_levers::DRAFT)
-            .env_remove(bloomery_levers::MTP_HEAD_ROWS)
-            .env_remove(bloomery_levers::MTP_DRAFT)
-            .env_remove(bloomery_levers::MTP_WIDTH);
         let args: Vec<&str> = DEFAULT_ARGS[..4].iter().chain(&FLAGS).copied().collect();
-        let mut served = Served38::spawn_with(&args, &own, &mut cmd)?;
+        let mut served = Served38::spawn_with(&args, &own, &mut server(&[])?)?;
         let mut off = None;
         for _ in 0..POLLS {
             let text = std::fs::read_to_string(&err_log)?;
@@ -3911,9 +4027,7 @@ mod gate {
             off.as_deref().unwrap_or("none")
         );
         if off.is_none() {
-            for l in text.lines().rev().take(20).collect::<Vec<_>>().iter().rev() {
-                println!("  {l}");
-            }
+            last_lines("unset-draft", &text);
         }
         let why = bloomery_levers::Draft38Off::Ctx {
             need: positions,
@@ -3936,13 +4050,13 @@ mod gate {
 
     /// The NVMe tier's paged rule (the seat's module doc,
     /// `bloomery_levers::paged_columns`) on the gate plan at two rooms
-    /// (`BLOOMERY_HOST_ROOM`, the split dial's default arena), each server
-    /// stopped at its `parallel` line, before its load, or refused before it
-    /// prints one. At 27 GiB the plan pages its host experts through the
+    /// (`BLOOMERY_HOST_ROOM`, the split dial's default arena). Planning probes
+    /// stop before the load; request clauses wait for listening and completion.
+    /// At 27 GiB the plan pages its host experts through the
     /// tier's RAM arena (`bloomery_placement`'s
     /// `the_paged_rule_reads_the_arena` derives both rooms on the Mac):
     /// the flagless server serves its default one slot with no `paged` line,
-    /// the `cache` line naming the arena; `--parallel 2` serves two
+    /// the `cache` line naming the arena; `--parallel 4` serves four
     /// slots as one pass over the arena, and `BLOOMERY_DRAFT=mtp` serves
     /// one slot with the draft on (PIN(2026-10-12): the rule refused it by
     /// name; a paged step reads its columns' ids from the arena in one union
@@ -4174,46 +4288,73 @@ mod gate {
             },
         );
 
-        // PIN(2026-10-12): `paged_parallel_is_refused_by_name` became
-        // this clause. The refusal's cause is gone — a paged step of several
-        // columns reads its ids from the arena (the placement's floor counts a
-        // column a slot, `gate_nvtier`'s census clause), so `--parallel 2`
-        // serves two slots as one pass.
-        let (line, failed, text) =
-            run(&[(bloomery_levers::HOST_ROOM, "27G")], &["--parallel", "2"])?;
-        let paged = paged_line(&text);
-        println!("paged: {}", paged.as_deref().unwrap_or("no paged line"));
-        let served = line.as_deref().is_some_and(|l| {
-            field(l, "slots").as_deref() == Some("2")
-                && field(l, "from").as_deref() == Some("flag")
-                && field(l, "pass").as_deref() == Some("one")
-        });
-        let named = paged.as_deref().is_some_and(|l| {
-            field(l, "rule").as_deref() == Some("served")
-                && field(l, "asked_slots").as_deref() == Some("2")
-                && field(l, "slots").as_deref() == Some("2")
-                && field(l, "arena").and_then(|v| v.parse::<u64>().ok()) > Some(0)
-        });
-        // PIN(2026-10-12): not judged in this release. The server accepts the
-        // count (the parallel and paged lines above) and then ends with a
-        // named error the gate does not keep; the clause returns as a check
-        // when the cause is named and fixed. Its three terms and the
-        // server's last lines are printed so the next run names it.
-        println!(
-            "paged: --parallel 2 at 27G: exited {}, served {served}, named {named} (printed, \
-             not judged); the server's last lines:",
-            if failed { "unsuccessfully" } else { "cleanly" }
+        // PIN(2026-10-23): judge the paged parallel clause again, through listening
+        // and requests; the plan's arena floor counts every resident slot's columns.
+        let mut cmd = Command::new(Served38::exe()?);
+        cmd.env(bloomery_levers::HOST_ROOM, "27G")
+            .env(bloomery_levers::DRAFT, "off")
+            .env(bloomery_levers::RESIDENCY, "off")
+            .env(bloomery_levers::STEP_STATS, "1")
+            .env_remove(bloomery_levers::NVTIER_BYTES);
+        let args: Vec<&str> = SERVER_ARGS[..SERVER_ARGS.len() - 1]
+            .iter()
+            .copied()
+            .chain(["4"])
+            .collect();
+        let mut parallel = Served38::spawn_with(&args, &own, &mut cmd)?;
+        let addr = parallel.address(&err_log, POLLS, POLL)?;
+        let text = std::fs::read_to_string(&err_log)?;
+        let line = parallel_line(&err_log)?.ok_or("paged: no parallel line")?;
+        let paged = paged_line(&text).ok_or("paged: no paged line")?;
+        let served = parallel_agrees(&line, Some(4)) == Some(true)
+            && field(&line, "pass").as_deref() == Some("one");
+        let named = field(&paged, "rule").as_deref() == Some("served")
+            && field(&paged, "asked_slots").as_deref() == Some("4")
+            && field(&paged, "slots").as_deref() == Some("4")
+            && field(&paged, "arena").and_then(|v| v.parse::<u64>().ok()) > Some(0);
+        check(
+            &mut ok,
+            "paged_parallel_serves_one_pass",
+            served && named && listened(&text)?,
         );
-        for l in text
-            .lines()
-            .rev()
-            .take(8)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-        {
-            println!("paged:   {l}");
+        let prompts = [prompt, TURN_A, TURN_B, SLOTS_B];
+        let request = |prompt: &str| {
+            streamed_with(
+                &addr,
+                json!({
+                    "prompt": prompt, "n_predict": N_PREDICT, "temperature": 0,
+                    "return_tokens": true, "ignore_eos": true,
+                    "cache_prompt": false, "stream": true,
+                }),
+            )
+        };
+        let mut alone = Vec::new();
+        for p in prompts {
+            alone.extend(answers("paged", vec![(request(p)?, p)])?);
         }
+        let before = seat_log(&err_log)?.all(&record::SLOTS_ROUND)?.len();
+        let runs = prompts
+            .iter()
+            .map(|p| Ok((request(p)?, *p)))
+            .collect::<Result<Vec<_>, GateError>>()?;
+        let together = answers("paged", runs)?;
+        check(
+            &mut ok,
+            "paged_parallel_ids_as_alone",
+            ids_as_alone(alone.iter(), &together)
+                && together
+                    .iter()
+                    .all(|s| s.as_ref().is_some_and(|s| s.tokens.len() == N_PREDICT)),
+        );
+        let rounds = seat_log(&err_log)?.all(&record::SLOTS_ROUND)?;
+        let rounds = &rounds[before..];
+        check(
+            &mut ok,
+            "paged_parallel_rounds_carry_all_slots",
+            rounds.iter().any(|r| r.u64("rows") == Ok(4))
+                && rounds.iter().all(|r| r.u64("passes") == Ok(1)),
+        );
+        println!("paged: the parallel server stopped: {}", parallel.stop()?);
 
         // PIN(2026-10-12): `paged_draft_is_refused_by_name` became this
         // clause. The refusal is gone by rule: a paged step of several
@@ -4471,66 +4612,99 @@ mod gate {
         // with its file there, its plan pages, and the run drafts nothing —
         // its `load draft=off` record names the paged rule at the arena it
         // names, and no `load draft=mtp` line prints. The residency is pinned
-        // off, as at the small card. It runs whole: `-n 2` past its load.
-        let mut cmd = Command::new(std::env::current_exe()?.with_file_name("generate_qwen3moe"));
-        cmd.env(bloomery_levers::HOST_ROOM, "27G")
-            .env(bloomery_levers::RESIDENCY, "off")
-            .env_remove(bloomery_levers::DRAFT)
-            .env_remove(bloomery_levers::NVTIER_BYTES)
-            .env_remove(bloomery_levers::MTP_HEAD_ROWS)
-            .env_remove(bloomery_levers::MTP_DRAFT)
-            .env_remove(bloomery_levers::MTP_WIDTH);
-        let mut run = Served38::spawn_with(&["--prompt", prompt, "-n", "2"], &own, &mut cmd)?;
-        let mut status = None;
-        for _ in 0..POLLS {
-            status = run.child.try_wait()?;
-            if status.is_some() {
-                break;
+        // off, as at the small card. It runs whole: `-n 2` past its load. The
+        // four-slot run sets the draft off and answers each slot from the arena.
+        for slots in [1, 4] {
+            let mut cmd =
+                Command::new(std::env::current_exe()?.with_file_name("generate_qwen3moe"));
+            cmd.env(bloomery_levers::HOST_ROOM, "27G")
+                .env(bloomery_levers::GEN_SLOTS, slots.to_string())
+                .env(bloomery_levers::RESIDENCY, "off")
+                .env_remove(bloomery_levers::DRAFT)
+                .env_remove(bloomery_levers::NVTIER_BYTES)
+                .env_remove(bloomery_levers::MTP_HEAD_ROWS)
+                .env_remove(bloomery_levers::MTP_DRAFT)
+                .env_remove(bloomery_levers::MTP_WIDTH);
+            if slots > 1 {
+                cmd.env(bloomery_levers::DRAFT, "off");
             }
-            std::thread::sleep(POLL);
-        }
-        if status.is_none() {
+            let args = if slots == 1 {
+                ["--prompt", prompt, "-n", "2"]
+            } else {
+                ["--tokens", "1,2,3,4", "-n", "2"]
+            };
+            let mut run = Served38::spawn_with(&args, &own, &mut cmd)?;
+            let mut status = None;
+            for _ in 0..POLLS {
+                status = run.child.try_wait()?;
+                if status.is_some() {
+                    break;
+                }
+                std::thread::sleep(POLL);
+            }
+            if status.is_none() {
+                println!(
+                    "paged: generate_qwen3moe stopped at the bound: {}",
+                    run.stop()?
+                );
+            }
+            let out = std::fs::read_to_string(own.join("server.out"))?;
+            let head =
+                "load draft=off (unset: the plan pages host experts through the NVMe tier's ";
+            let arena = out.lines().find_map(|l| {
+                l.strip_prefix(head)?
+                    .split_once(" B RAM arena")?
+                    .0
+                    .parse::<u64>()
+                    .ok()
+            });
+            let off = record::Log::of(&out, record::GENERATE_QWEN3MOE)
+                .first(&record::LOAD_DRAFT_OFF38)?
+                .map(|f| f.text("why").map(str::to_owned))
+                .transpose()?;
+            let drafted = out.lines().any(|l| l.starts_with("load draft=mtp"));
             println!(
-                "paged: generate_qwen3moe stopped at the bound: {}",
-                run.stop()?
+                "paged: generate_qwen3moe exit {status:?}: load draft=off ({}), load draft=mtp {drafted}",
+                off.as_deref().unwrap_or("none")
+            );
+            if off.is_none() {
+                let err = std::fs::read_to_string(own.join("server.err")).unwrap_or_default();
+                let tail: Vec<&str> = err.lines().rev().take(20).collect();
+                println!("paged: generate_qwen3moe's last stderr lines:");
+                for l in tail.iter().rev() {
+                    println!("  {l}");
+                }
+            }
+            let why = arena.map(|arena| bloomery_levers::Draft38Off::Paged { arena }.to_string());
+            check(
+                &mut ok,
+                if slots == 1 {
+                    "paged_cli_drafts_nothing_by_the_rule"
+                } else {
+                    "paged_cli_parallel_serves_as_asked"
+                },
+                status.is_some_and(|s| s.success())
+                    && if slots == 1 {
+                        arena.is_some_and(|a| a > 0) && why.is_some() && off == why
+                    } else {
+                        record::Log::of(&out, record::GENERATE_QWEN3MOE)
+                            .all(&record::NVTIER)?
+                            .iter()
+                            .any(|n| n.u64("arena_granted").is_ok_and(|a| a > 0))
+                    }
+                    && !drafted
+                    && (slots == 1
+                        || (0..slots).all(|slot| {
+                            out.lines().any(|l| {
+                                l.strip_prefix("tokens ")
+                                    .and_then(|l| l.strip_suffix(&format!(" slot={slot}")))
+                                    .is_some_and(|ids| {
+                                        parse_ids(ids).is_ok_and(|ids| ids.len() == 2)
+                                    })
+                            })
+                        })),
             );
         }
-        let out = std::fs::read_to_string(own.join("server.out"))?;
-        let head = "load draft=off (unset: the plan pages host experts through the NVMe tier's ";
-        let arena = out.lines().find_map(|l| {
-            l.strip_prefix(head)?
-                .split_once(" B RAM arena")?
-                .0
-                .parse::<u64>()
-                .ok()
-        });
-        let off = record::Log::of(&out, record::GENERATE_QWEN3MOE)
-            .first(&record::LOAD_DRAFT_OFF38)?
-            .map(|f| f.text("why").map(str::to_owned))
-            .transpose()?;
-        let drafted = out.lines().any(|l| l.starts_with("load draft=mtp"));
-        println!(
-            "paged: generate_qwen3moe exit {status:?}: load draft=off ({}), load draft=mtp {drafted}",
-            off.as_deref().unwrap_or("none")
-        );
-        if off.is_none() {
-            let err = std::fs::read_to_string(own.join("server.err")).unwrap_or_default();
-            let tail: Vec<&str> = err.lines().rev().take(20).collect();
-            println!("paged: generate_qwen3moe's last stderr lines:");
-            for l in tail.iter().rev() {
-                println!("  {l}");
-            }
-        }
-        let why = arena.map(|arena| bloomery_levers::Draft38Off::Paged { arena }.to_string());
-        check(
-            &mut ok,
-            "paged_cli_drafts_nothing_by_the_rule",
-            status.is_some_and(|s| s.success())
-                && arena.is_some_and(|a| a > 0)
-                && why.is_some()
-                && off == why
-                && !drafted,
-        );
         Ok(ok)
     }
 
@@ -4576,15 +4750,16 @@ mod gate {
             let plan_levers = PlanLevers {
                 card_budget_bytes: Some(budget),
             };
-            Ok(if drafted {
-                inputs
-                    .plan_mtp_with_slots(&machine, c, &plan_levers, &mtp, experts, 1)
-                    .is_ok()
-            } else {
-                inputs
-                    .plan_with_slots(&machine, c, &plan_levers, experts, 1)
-                    .is_ok()
-            })
+            Ok(inputs
+                .plan_target(
+                    &machine,
+                    c,
+                    &plan_levers,
+                    experts,
+                    drafted.then_some(&mtp),
+                    1,
+                )
+                .is_ok())
         };
         let rungs = ctx_ladder::rungs(limit38(&inputs)?.0);
         for pair in rungs.windows(2) {
@@ -4733,6 +4908,7 @@ mod gate {
 
         ok &= props_ctx(&url)?;
         ok &= cache(&url, &err_log, false, "plain")?;
+        ok &= shared_system_prompt(&url, dir, TURN_A, [TURN_A, TURN_B], N_PREDICT)?;
         // Last on the main server: its requests leave the slot another conversation's.
         ok &= crate::systemone_clause::is_the_schema_path(&url, dir)?;
 
@@ -4743,7 +4919,8 @@ mod gate {
         ok &= draft_slot_share(dir)?;
         ok &= residency_loads_the_word(dir)?;
         // The resident slots together (the module header): its own servers,
-        // the first with the draft on, the second the seat's own defaults.
+        // the first with the draft on, the second the seat's own defaults but
+        // the draft.
         ok &= slots_flow_together(dir)?;
         // An unset residency whose churn pool the host's room cannot take
         // keeps its P and runs the pool from the file (the module header):

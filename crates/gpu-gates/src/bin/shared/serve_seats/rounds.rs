@@ -1,19 +1,20 @@
 //! The serve seats' one owner of a round run as passes: a seat whose body
 //! has [`SlotRows`] and decided at its open to run one pass overrides
 //! [`Seat::step_slots`] through [`step_round`] with [`step_rows_one_pass`]
-//! and its drafted twin [`Seat::pass_slots`] through [`pass_round`] with
+//! ([`step_rows_drafted`] on a load that drafts with the MTP draft) and its
+//! drafted twin [`Seat::pass_slots`] through [`pass_round`] with
 //! [`pass_rows_one_pass`]; any other seat keeps the defaults,
 //! [`bind::step_rows_in_turn`] and [`bind::pass_rows_in_turn`].
 //!
 //! [`bind::step_rows_in_turn`]: bloomery_gpu_gates::bind::step_rows_in_turn
 //! [`bind::pass_rows_in_turn`]: bloomery_gpu_gates::bind::pass_rows_in_turn
 
-use app::mtp::{MtpBody, SlotWindow};
+use app::mtp::{MtpBody, SlotWalks, SlotWindow};
 use bloomery_gpu::model::SlotRows;
 use bloomery_gpu_gates::GateError;
 use bloomery_gpu_gates::bind::{Seat, SlotPassRow, SlotStep, pass_rows_in_turn, step_rows_in_turn};
 use bloomery_gpu_gates::record;
-use runtime::{Widths, Window};
+use runtime::{Target, Widths, Window};
 use serve::Drafted;
 
 use super::drafted::SlotDrafts;
@@ -161,6 +162,48 @@ where
     Ok(out.passes)
 }
 
+/// One round of several slots' plain steps on a load that drafts with the
+/// MTP draft as passes of `GpuModel::step_slots` ([`step_rows_one_pass`]),
+/// each slot's draft told of its row as a step alone tells it: before the
+/// pass, on each row's slot, [`SlotDrafts::gather_row`] (shared prompt rows
+/// walked now, step and verify rows gathered), then the gathered rows in one
+/// store walk ([`SlotWalks::run`], the pass overwriting the arenas they
+/// read); after it [`SlotDrafts::after_row`] with the position the row ran
+/// from and its answer (the next refresh the row's, its hidden row in the
+/// pass's arena, which no later pass of the round overwrites: a round past
+/// [`SlotRows::MAX_ROWS`] rows runs the pass that holds slot 0 last,
+/// [`app::Session::step_slots_rounds`]).
+/// A slot whose draft is off rides the pass as a plain row its draft is
+/// told nothing of, as its step alone. A row's answer and lent logits row
+/// are the pass's, bit for bit its step alone, so a sampling or
+/// id-banning request's ids are its alone ids. Returns the passes it ran;
+/// refused as [`step_rows_one_pass`] refuses, and as the table refuses a
+/// slot past it.
+pub(crate) fn step_rows_drafted<B, const M: usize>(
+    s: &mut app::Session<B>,
+    rows: &mut [SlotStep],
+    drafts: &mut SlotDrafts<B, M>,
+) -> Result<usize, GateError>
+where
+    B: MtpBody + SlotRows,
+    B::Seq: 'static,
+    Window<M>: Widths,
+{
+    let mut p0 = Vec::with_capacity(rows.len());
+    let mut walks = SlotWalks::default();
+    for r in rows.iter() {
+        s.select_slot(r.slot)?;
+        p0.push(s.pos());
+        drafts.gather_row(s, r.slot, r.last, &mut walks)?;
+    }
+    walks.run(s)?;
+    let passes = step_rows_one_pass(s, rows)?;
+    for (r, &p) in rows.iter().zip(&p0) {
+        drafts.after_row(r.slot, p, r.last, r.next)?;
+    }
+    Ok(passes)
+}
+
 /// One round of several slots' drafted passes as passes of
 /// `GpuModel::verify_slots` (the drafted seat override of every family
 /// whose body has `SlotRows`): [`app::mtp::pass_slots`] over the rows —
@@ -170,25 +213,25 @@ where
 /// depth the seat's one-slot pass proposes, its kept ids into `out` and
 /// what it drafted into `drafted`, exactly as the fallback loop's `pass`
 /// fills them. Returns the passes it ran. The windows run the draft's
-/// whole width past the slot's width chooser, which only counts them
-/// (`runtime::width::Choosing::round_ran`): the pass packs every window at
-/// the full depth, so a cut row is no work saved, and its wall is the
-/// round's, no width's.
+/// batch width selected by `runtime::width::Batch`, using each slot's
+/// acceptance profile and the complete round's wall time. A zero width
+/// skips that pass's proposal without turning the slot's draft off.
 ///
 /// Rows are laid in slot order ([`slot_order`]), each row's kept ids and
 /// counts back to that row; each slot's rows are bit for bit its own
 /// wherever they sit in the pass. A round whose windows' rows
 /// pass the body's [`SlotRows::MAX_ROWS`] runs as more than one pass, cut
-/// between windows — a window is never split: its rows are one verify of
-/// its sequence — every pass bit for bit its windows run alone. A slot
+/// between windows by their proposals' rows, every window's proposal made
+/// first and the pass that holds slot 0 last ([`pass_slots`]) — a window
+/// is never split: its rows are one verify of its sequence — every pass
+/// bit for bit its windows run alone. A slot
 /// whose draft skips (its window the one plain row) rides the same pass as
 /// a drafted one, [`pass_slots`]'s own case. A slot whose draft the seat
 /// turned off ([`SlotDrafts::is_off`]) runs before the passes, alone: its
 /// slot selected and the table's own pass on it, the plain step the
 /// fallback loop runs for it, its draft told nothing and never asked to
-/// propose — [`pass_slots`] proposes on every window and refuses a window
-/// of depth 0 by name, and an off draft holds no refresh at the slot's
-/// position — so a round with off slots runs one more pass for each. No row
+/// propose, since an off draft holds no refresh at the slot's position.
+/// A round with off slots runs one more pass for each. No row
 /// the server sends is refused here that the fallback loop would run: the
 /// rows are distinct slots below the seat's [`Seat::slots`] (`bind`'s own
 /// named refusal), so the fallback is the seat's open decision alone
@@ -202,6 +245,7 @@ pub(crate) fn pass_rows_one_pass<B, const M: usize>(
     rows: &mut [SlotPassRow],
     drafts: &mut SlotDrafts<B, M>,
     depth: usize,
+    allowed: std::ops::RangeInclusive<usize>,
 ) -> Result<usize, GateError>
 where
     B: MtpBody + SlotRows,
@@ -226,12 +270,8 @@ where
     }
     // `on` keeps each window's row index, the key its answer goes back by.
     let on = slot_order(on, |i| rows[i].slot);
-    // A pass's windows: as many as their most rows — the token before a
-    // full-depth proposal — fit the body's pass; a window past the bound is
-    // refused by name, a depth the body's pass of several slots cannot hold.
     let w = 1 + depth.min(B::WIDTH);
-    let per = <B as SlotRows>::MAX_ROWS / w;
-    if per == 0 {
+    if w > <B as SlotRows>::MAX_ROWS {
         return Err(format!(
             "a drafted window of {w} rows past this body's pass of several slots' {} \
              (SlotRows::MAX_ROWS)",
@@ -239,52 +279,83 @@ where
         )
         .into());
     }
-    for pass in on.chunks(per) {
-        let specs = drafts.specs_mut();
-        if let Some(&i) = pass
-            .iter()
-            .find(|&&i| specs.get(rows[i].slot).is_none_or(Option::is_none))
-        {
-            return Err(format!("slot {}: the seat holds no draft of it", rows[i].slot).into());
+    let (specs, batch, widths) = drafts.round_mut();
+    if let Some(&i) = on
+        .iter()
+        .find(|&&i| specs.get(rows[i].slot).is_none_or(Option::is_none))
+    {
+        return Err(format!("slot {}: the seat holds no draft of it", rows[i].slot).into());
+    }
+    widths.clear();
+    widths.extend(on.iter().map(|&i| {
+        let draft = specs[rows[i].slot]
+            .as_ref()
+            .expect("a checked draft")
+            .draft();
+        if draft.draft().skipping() {
+            0
+        } else {
+            depth.min(B::WIDTH)
         }
-        let mut taken: Vec<_> = pass.iter().map(|&i| specs[rows[i].slot].take()).collect();
-        let mut outs: Vec<Vec<u32>> = pass
-            .iter()
-            .map(|&i| std::mem::take(&mut rows[i].out))
-            .collect();
-        let run = {
-            let mut windows: Vec<SlotWindow<'_, B>> = Vec::with_capacity(pass.len());
-            for ((&i, spec), out) in pass.iter().zip(&mut taken).zip(&mut outs) {
-                out.clear();
-                windows.push(SlotWindow {
-                    slot: rows[i].slot,
-                    last: rows[i].last,
-                    depth,
-                    // The check above took every row's draft.
-                    draft: spec
-                        .as_mut()
-                        .expect("a draft the check above took")
-                        .draft_mut()
-                        .draft_mut(),
-                    out,
-                });
-            }
-            app::mtp::pass_slots(s, &mut windows)
+    }));
+    let mode = specs[rows[on[0]].slot]
+        .as_ref()
+        .expect("a checked draft")
+        .draft()
+        .mode();
+    if on.len() > 1 {
+        let profiles = on.iter().map(|&i| {
+            specs[rows[i].slot]
+                .as_ref()
+                .expect("a checked draft")
+                .draft()
+                .batch_profile()
+        });
+        batch.choose(mode, profiles, widths, allowed)?;
+    }
+    let started = std::time::Instant::now();
+    let mut taken: Vec<_> = on.iter().map(|&i| specs[rows[i].slot].take()).collect();
+    let mut outs: Vec<Vec<u32>> = on
+        .iter()
+        .map(|&i| std::mem::take(&mut rows[i].out))
+        .collect();
+    let run = {
+        let mut windows: Vec<SlotWindow<'_, B>> = Vec::with_capacity(on.len());
+        for (((&i, spec), out), &width) in on.iter().zip(&mut taken).zip(&mut outs).zip(&*widths) {
+            out.clear();
+            windows.push(SlotWindow {
+                slot: rows[i].slot,
+                last: rows[i].last,
+                depth: width,
+                // The check above took every row's draft.
+                draft: spec
+                    .as_mut()
+                    .expect("a draft the check above took")
+                    .draft_mut()
+                    .draft_mut(),
+                out,
+            });
+        }
+        app::mtp::pass_slots(s, &mut windows)
+    };
+    for ((&i, spec), out) in on.iter().zip(taken).zip(outs) {
+        specs[rows[i].slot] = spec;
+        rows[i].out = out;
+    }
+    let (done, ran) = run?;
+    let verified_rows: usize = done.iter().map(|c| c.rows).sum();
+    for (&i, c) in on.iter().zip(done) {
+        if let Some(spec) = specs[rows[i].slot].as_mut() {
+            spec.draft_mut().round_ran(c.rows, c.kept);
+        }
+        rows[i].drafted = Drafted {
+            proposed: if c.proposed { c.rows - 1 } else { 0 },
+            accepted: c.kept - 1,
         };
-        for ((&i, spec), out) in pass.iter().zip(taken).zip(outs) {
-            specs[rows[i].slot] = spec;
-            rows[i].out = out;
-        }
-        for (&i, c) in pass.iter().zip(run?) {
-            if let Some(spec) = specs[rows[i].slot].as_mut() {
-                spec.draft_mut().round_ran(c.rows, c.kept);
-            }
-            rows[i].drafted = Drafted {
-                proposed: if c.proposed { c.rows - 1 } else { 0 },
-                accepted: c.kept - 1,
-            };
-        }
-        passes += 1;
+    }
+    passes += ran;
+    if on.len() > 1 && mode == runtime::width::Mode::Cost {
+        batch.observe(verified_rows, started.elapsed().as_secs_f64() * 1000.0)?;
     }
     Ok(passes)
 }

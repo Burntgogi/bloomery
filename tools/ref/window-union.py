@@ -15,6 +15,8 @@ The placement says which (layer, expert) pairs a card holds; every other selecte
 one more expert per eligible layer in ascending order, cycling — at an equal cost per expert. The plan
 line `generate_ds41` prints (`card_experts=`, `n_l=<min>..<max> on <n> layers`) is the check on it.
 Layer l's card keeps the id prefix [0, n_l), as the placement does.
+Counts must be in 0..n_expert, explicit layer ranges must not overlap, and a spread total must fit
+the eligible layers. Single-value options and entries in --k may not be repeated.
 
 --policy says how the card set moves over a set's positions: static (the default) keeps the set above
 for every position; strata starts from it and replays the swap rule --rule (tools/ref/router-residency.py's
@@ -39,10 +41,16 @@ Per set and k:
     slots    mean host slots per row (Σ_l over one row) and mean union per window
 
 then, per layer range, the pooled ratio per k. The last block (`all`) pools every set's windows.
+
+Zero-host windows count toward `windows` but not the mean or percentiles of the ratio. A zero
+predicted or pooled denominator prints `nan` (range tables use `-`), not a measured ratio of zero.
+When no window fits within a chunk, measured means also print `nan`; actual zero work prints 0.
 """
 import importlib.util
 import io
+import math
 import os
+import subprocess
 import sys
 import tempfile
 from array import array
@@ -66,42 +74,49 @@ def parse_range(text):
     return lo, hi
 
 
-def parse_n_l(spec, layers):
-    """Per-layer card counts from an explicit spec or the spread rule."""
+def parse_n_l(spec, layers, n_expert):
+    """Validated per-layer card counts from an explicit spec or the spread rule."""
     n_l = {l: 0 for l in layers}
-    if spec.startswith("spread:"):
-        total, _, span = spec[len("spread:"):].partition("@")
-        lo, hi = parse_range(span)
-        eligible = [l for l in layers if lo <= l <= hi]
-        left = int(total)
-        if not eligible:
-            raise rc.SetError(f"--n-l {spec!r}: no eligible layer in {lo}-{hi}")
-        while left > 0:
-            for l in eligible:
-                if left == 0:
-                    break
-                n_l[l] += 1
-                left -= 1
-        return n_l
-    for part in spec.split(","):
-        span, _, n = part.partition(":")
-        lo, hi = parse_range(span)
-        for l in range(lo, hi + 1):
-            if l not in n_l:
-                raise rc.SetError(f"--n-l names layer {l}, which the set does not trace")
-            n_l[l] = int(n)
+    try:
+        if spec.startswith("spread:"):
+            total, _, span = spec[len("spread:"):].partition("@")
+            lo, hi = parse_range(span)
+            eligible = [l for l in layers if lo <= l <= hi]
+            left = int(total)
+            if not eligible:
+                raise rc.SetError(f"--n-l {spec!r}: no eligible layer in {lo}-{hi}")
+            capacity = len(eligible) * n_expert
+            if not 0 <= left <= capacity:
+                raise rc.SetError(f"--n-l {spec!r}: spread total {left} is outside 0..{capacity}")
+            while left > 0:
+                for l in eligible:
+                    if left == 0:
+                        break
+                    n_l[l] += 1
+                    left -= 1
+            return n_l
+        named = set()
+        for part in spec.split(","):
+            span, _, count = part.partition(":")
+            lo, hi = parse_range(span)
+            n = int(count)
+            if not 0 <= n <= n_expert:
+                raise rc.SetError(f"--n-l {spec!r}: count {n} is outside 0..{n_expert}")
+            for l in range(lo, hi + 1):
+                if l not in n_l:
+                    raise rc.SetError(f"--n-l names layer {l}, which the set does not trace")
+                if l in named:
+                    raise rc.SetError(f"--n-l names layer {l} more than once")
+                named.add(l)
+                n_l[l] = n
+    except ValueError as e:
+        raise rc.SetError(f"--n-l {spec!r}: {e}") from None
     return n_l
 
 
-def card_sets(layers, n_l, n_expert):
-    """Per layer, the ids the card holds: the id prefix [0, n_l)."""
-    out = {}
-    for l in layers:
-        n = n_l[l]
-        if n > n_expert:
-            raise rc.SetError(f"layer {l}: n_l {n} is above n_expert {n_expert}")
-        out[l] = set(range(n))
-    return out
+def card_sets(layers, n_l):
+    """Per layer, the id prefix admitted by parse_n_l."""
+    return {l: set(range(n_l[l])) for l in layers}
 
 
 def predict(counts, tokens, card, k):
@@ -216,8 +231,8 @@ def report(set_dirs, spec, ks, ranges, policy=None):
     layers_all = {k: {} for k in ks}
     slots_all = {}
     for s in sets:
-        n_l = parse_n_l(spec, s["layers"])
-        card = card_sets(s["layers"], n_l, s["n_expert"])
+        n_l = parse_n_l(spec, s["layers"], s["n_expert"])
+        card = card_sets(s["layers"], n_l)
         counts = rc.read_counts(s)
         name = os.path.basename(os.path.normpath(s["dir"]))
         print(f"\n## {name}: {s['tokens']} tokens, chunk {s['header'].get('chunk', '-')}, "
@@ -238,8 +253,10 @@ def report(set_dirs, spec, ks, ranges, policy=None):
                 pu += u
                 ps += sl
             m = summary(win[k])
-            print(f"{k}\t{m['windows']}\t{pu / ps:.3f}\t{m['mean']:.3f}\t{m['p10']:.3f}\t{m['p90']:.3f}\t"
-                  f"{m['pooled']:.3f}\t{m['union']:.1f}\t{sum(win[k][1]) / len(win[k][1]):.1f}")
+            predicted = pu / ps if ps else float("nan")
+            slots_per_window = sum(win[k][1]) / m["windows"] if m["windows"] else float("nan")
+            print(f"{k}\t{m['windows']}\t{predicted:.3f}\t{m['mean']:.3f}\t{m['p10']:.3f}\t{m['p90']:.3f}\t"
+                  f"{m['pooled']:.3f}\t{m['union']:.1f}\t{slots_per_window:.1f}")
             pooled_all[k][0].extend(win[k][0])
             pooled_all[k][1].extend(win[k][1])
             for l, (u, sl) in per_layer[k].items():
@@ -278,7 +295,12 @@ def main(argv):
     link = {"expert_bytes": None, "step_ms": None, "gbps": 26.28}
     gbps_set = False
     it = iter(argv)
+    seen = set()
     for a in it:
+        if a.startswith("--"):
+            if a in seen:
+                sys.exit(f"window-union: {a} supplied more than once")
+            seen.add(a)
         if a == "--n-l":
             spec = next(it)
         elif a == "--policy":
@@ -300,6 +322,8 @@ def main(argv):
             sets.append(a)
     if not sets or spec is None or any(k < 1 for k in ks):
         sys.exit(__doc__)
+    if len(set(ks)) != len(ks):
+        sys.exit("window-union: --k repeats a window size")
     strata = None
     if policy == "strata":
         if (link["expert_bytes"] is None) != (link["step_ms"] is None):
@@ -360,7 +384,7 @@ def self_test():
     with tempfile.TemporaryDirectory() as root:
         # every row the same two experts, nothing on the card: a k-row pass reads 1/k of k passes
         same = rc.read_manifest(_fake_set(root, "same", {0: [(3, 7)] * 8}, E, K))
-        card = card_sets(same["layers"], parse_n_l("0:0", same["layers"]), E)
+        card = card_sets(same["layers"], parse_n_l("0:0", same["layers"], E))
         win, per_layer, slots = measure(same, card, (2, 4))
         assert abs(summary(win[2])["mean"] - 1 / 2) < 1e-12 and abs(summary(win[4])["pooled"] - 1 / 4) < 1e-12
         assert slots[0] == 2.0 and per_layer[4][0] == (2 * 5, 8 * 5), per_layer[4][0]
@@ -371,7 +395,7 @@ def self_test():
         # the shared expert 0 sits on the card (the id prefix of one): what is left does not share
         rows = [(0, t + 1) for t in range(8)]
         shared = rc.read_manifest(_fake_set(root, "shared", {0: rows}, E, K))
-        on_card = card_sets(shared["layers"], parse_n_l("0:1", shared["layers"]), E)
+        on_card = card_sets(shared["layers"], parse_n_l("0:1", shared["layers"], E))
         assert on_card == {0: {0}}, on_card
         win, _, slots = measure(shared, on_card, (2,))
         assert summary(win[2])["mean"] == 1.0 and slots[0] == 1.0
@@ -381,18 +405,37 @@ def self_test():
         chunked = rc.read_manifest(_fake_set(root, "chunked", {0: [(3, 7)] * 8}, E, K, chunk=4))
         win, _, _ = measure(chunked, {0: set()}, (2, 4))
         assert summary(win[2])["windows"] == 6 and summary(win[4])["windows"] == 2
+        # Zero-host windows have no ratio but still count; an empty window set has no measured means.
+        host = _fake_set(root, "host", {0: [(9, 10)] * 8}, E, K, chunk=4)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            report([chunked["dir"], host], "0:8", (2, 8), "0-0")
+        table = [[float(c) for c in line.split("\t")] for line in buf.getvalue().splitlines()
+                 if line.startswith(("2\t", "8\t"))]
+        zero, active, pooled = [row for row in table if row[0] == 2]
+        assert zero[:2] == [2, 6] and all(math.isnan(v) for v in zero[2:7]) and zero[7:] == [0, 0], zero
+        assert active == [2, 6, 0.5, 0.5, 0.5, 0.5, 0.5, 2, 4], active
+        assert pooled == [2, 12, 0.5, 0.5, 0.5, 0.5], pooled
+        zero, active, pooled = [row for row in table if row[0] == 8]
+        assert zero[:2] == [8, 0] and all(math.isnan(v) for v in zero[2:]), zero
+        assert active[:3] == [8, 0, 0.125] and all(math.isnan(v) for v in active[3:]), active
+        assert pooled[:2] == [8, 0] and all(math.isnan(v) for v in pooled[2:]), pooled
         # the prediction: 16 experts each picked once in 8 rows, p = 1/8: 16 (1 - (7/8)^2) over 2 x 2
         u, sl = predict([1] * E, 8, set(), 2)
         assert abs(u / sl - 16 * (1 - (7 / 8) ** 2) / 4) < 1e-12 and abs(sl - 4.0) < 1e-12
         # the spread rule: 2414 over layers 2..39 is 64 on 2..21, 63 on 22..39, 0 on 0 and 1
-        n_l = parse_n_l("spread:2414@2-39", list(range(40)))
+        n_l = parse_n_l("spread:2414@2-39", list(range(40)), 256)
         assert [n_l[l] for l in (0, 1, 2, 21, 22, 39)] == [0, 0, 64, 64, 63, 63] and sum(n_l.values()) == 2414
-        assert n_l == parse_n_l("2-21:64,22-39:63", list(range(40)))
-        try:
-            card_sets([0], {0: E + 1}, E)
-            raise AssertionError("an n_l above n_expert was accepted")
-        except rc.SetError:
-            pass
+        assert n_l == parse_n_l("2-21:64,22-39:63", list(range(40)), 256)
+        assert parse_n_l("spread:32@0-1", [0, 1], E) == {0: E, 1: E}
+        assert parse_n_l("0:0,1:16", [0, 1], E) == {0: 0, 1: E}
+        for spec in ("0:-1", "0:17", "0-1:4,1:9", "spread:-5@0-1",
+                     "spread:33@0-1", "5:1", "0:x"):
+            try:
+                parse_n_l(spec, [0, 1], E)
+                raise AssertionError(f"invalid --n-l {spec!r} was accepted")
+            except rc.SetError:
+                pass
         # a resident mask: nothing resident reads today's result for any card, and the card's own
         # membership as the mask over an empty card reads the card's result
         for s_, c_ in ((shared, on_card), (chunked, {0: set()}), (same, card)):
@@ -403,7 +446,7 @@ def self_test():
             member = {0: [[e in c_[0] for e in ids[t * K:(t + 1) * K]] for t in range(s_["tokens"])]}
             assert measure(s_, {0: set()}, (2, 3), member) == base
         # strata with nothing on the card is the static host-only measure, number for number
-        n0 = parse_n_l("0:0", same["layers"])
+        n0 = parse_n_l("0:0", same["layers"], E)
         assert measure(same, {0: set()}, (2, 4), strata_on_card(same, n0, "mid")) == \
             measure(same, {0: set()}, (2, 4))
         # the rule moves the card set: seed {0} (the id prefix, n_l 1), every row (3, 7), rule mid. Boundary 4
@@ -411,8 +454,8 @@ def self_test():
         # the host, rows 4-7 only 7. Windows of 2: three of U 2 / S 4, one across the flip of U 2 / S 3, three
         # of U 1 / S 2 -> 11 / 21; static keeps 0 and reads 2 / 4 every window.
         rows37 = rc.read_manifest(_fake_set(root, "rows37", {0: [(3, 7)] * 8}, E, K))
-        n1 = parse_n_l("0:1", rows37["layers"])
-        c1 = card_sets(rows37["layers"], n1, E)
+        n1 = parse_n_l("0:1", rows37["layers"], E)
+        c1 = card_sets(rows37["layers"], n1)
         empty = {0: set()}
         win, per_layer, slots = measure(rows37, empty, (2,), strata_on_card(rows37, n1, "mid"))
         assert per_layer[2][0] == (11, 21) and slots[0] == 1.5, (per_layer[2][0], slots[0])
@@ -436,6 +479,21 @@ def self_test():
         with redirect_stdout(buf):
             report([rows037["dir"]], "0:1", (2,), "0-0", dict(rule="mid", link=None))
         assert "host slots per row 1.6 of 2" in buf.getvalue(), buf.getvalue()
+        cli = _fake_set(root, "cli", {0: [(3, 7)] * 8, 1: [(3, 7)] * 8}, E, K)
+        cases = [
+            ("window-union.py", [cli, "--n-l", "0:-1", "--k", "2"], "--n-l"),
+            ("window-union.py", [cli, "--n-l", "0:1", "--n-l", "0:5"], "--n-l"),
+            ("window-union.py", [cli, "--n-l", "0:0", "--k", "2,2"], "--k"),
+            ("router-coverage.py", ["bursts", cli, "--window", "4", "--n-l", "0:17"], "--n-l"),
+            ("router-coverage.py", ["bursts", cli, "--window", "4", "--n-l", "5:1"], "--n-l"),
+            ("router-coverage.py", ["bursts", cli, "--window", "4", "--n-l", ""], "--n-l"),
+            ("router-coverage.py", ["bursts", cli, "--window", "4", "--n-l", "0:1", "--n-l", "0:5"], "--n-l"),
+        ]
+        for tool, args, flag in cases:
+            result = subprocess.run([sys.executable, os.path.join(_here, tool), *args],
+                                    capture_output=True, text=True, timeout=30)
+            assert result.returncode == 1, (tool, args, result.stdout, result.stderr)
+            assert flag in result.stderr and "Traceback" not in result.stderr, result.stderr
     print("window-union: self-test ok")
     return 0
 

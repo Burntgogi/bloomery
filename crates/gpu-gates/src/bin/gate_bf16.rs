@@ -20,6 +20,10 @@
 //!    1,024 × 128), plus a 19 × 128 tail, through `site::gemv` at every
 //!    width in 1..=8 (the token-major gemv), `site::resident_gemv` at one
 //!    (the call GLM's `body::gemv` is) and `site::gemm` at 64 columns (the tile).
+//!    On GB10 that `site::gemm` runs the BF16-operand MMA product: its outputs
+//!    are held to the operand band, and a subnormal first activation in column
+//!    1 leaves every other column's outputs their bits (`mma.neighbours`,
+//!    `shared/dense_file.rs`); the bit checks then read the exact tile's outputs.
 //! 2. f32: the same tensors loaded as f32 values (`Weights::load_where`,
 //!    `CardFormat::Bf16AsF32`, the load of every body that does not set
 //!    `bf16_words`) through the F32 site at 1..=8 and 64 columns: bit for bit
@@ -64,7 +68,9 @@ fn main() -> std::process::ExitCode {
 }
 
 mod gate {
-    use crate::dense_file::{Decl, by_name, check, columns, decl, host_rows, q8_0_bytes};
+    use crate::dense_file::{
+        Decl, by_name, check, columns, decl, host_rows, mma_neighbours, q8_0_bytes,
+    };
     use bloomery_gpu::gemm::{Gemm32Kernels, GemmInput, GemmKernels, GemmRoute};
     use bloomery_gpu::head::{Head, HeadNorm};
     use bloomery_gpu::q8f32::Bf16GemvIdsArgs;
@@ -72,6 +78,7 @@ mod gate {
     use bloomery_gpu::site::{self, SiteTy, SiteWeight, WideIn, WideKernels};
     use bloomery_gpu::weights::Weights;
     use bloomery_gpu::{Fault, FaultSite, Gpu, LAYER_NONE};
+    use bloomery_gpu_gates::rounding::check_mma;
     use bloomery_gpu_gates::{
         GateError, GateRng, checks_failed, no_local_depot, verdict, write_gguf,
     };
@@ -183,7 +190,19 @@ mod gate {
             .iter()
             .enumerate()
             .filter(|(_, t)| keep(&t.name))
-            .map(|(i, t)| placement::whole_on_card(i, t, 0, &model))
+            .map(|(i, t)| {
+                placement::whole_on_card(i, t, 0, &model).map(|mut row| {
+                    // This gate retains the BF16 head pins; gate_mxfp8 checks default conversion.
+                    if t.name == HEAD && t.ty == GgmlType::BF16 {
+                        let format = placement::CardFormat::Bf16Raw;
+                        row.segments[0].format = placement::Format::Card(format);
+                        row.segments[0].resident_bytes = format
+                            .resident_bytes(t.ty, t.dims[0], t.dims[1])
+                            .expect("fixed BF16 fixture dimensions");
+                    }
+                    row
+                })
+            })
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("rows: {e}"))?;
         Ok(Weights::load_rows(gpu.stream(), split, &model, &rows, 0)?)
@@ -325,6 +344,29 @@ mod gate {
                     let src = (ty, w, SiteWeight::Resident(name));
                     let table = (route, GemmInput::PerSlot);
                     site::gemm(gpu, &kernels, src, rows, &x_in, table, m, &mut y_dev)?;
+                    if gpu.context().compute_capability()? == (12, 1) {
+                        stream.synchronize()?;
+                        let mma = y_dev.to_host_vec(stream)?;
+                        ok &= check_mma(name, (&mma, &x, k), wf);
+                        let tag = format!("shape={name} rows={rows} k={k} m={m}");
+                        ok &= mma_neighbours(
+                            gpu,
+                            &kernels,
+                            (src, route),
+                            (&x, k, rows),
+                            ("bf16", &tag),
+                        )?;
+                        // PIN(2026-10-22): GB10 BF16 operand rounding replaces the site's F32 bit
+                        // contract with the band/KL check above; the exact tile's output replaces
+                        // the site's here, so the bit checks below hold for the exact tile only.
+                        gpu.q8f32().enqueue_bf16_tile(
+                            stream,
+                            w.bf16(WHAT, name)?,
+                            &x_dev,
+                            m,
+                            &mut y_dev,
+                        )?;
+                    }
                     "gemm"
                 }
                 _ => {
@@ -467,11 +509,16 @@ mod gate {
             }
         }
         let tile = gpu.q8f32().enqueue_bf16_tile(stream, words, &x, 2, &mut y);
+        let mma = gpu.q8f32().enqueue_bf16_mma(stream, words, &x, 2, &mut y);
         stream.synchronize()?;
-        let pass = gemv_ok && tile.as_ref().is_err_and(|e| e.to_string().contains("96"));
+        let pass = gemv_ok
+            && [&tile, &mma]
+                .iter()
+                .all(|r| r.as_ref().is_err_and(|e| e.to_string().contains("96")));
         println!(
-            "bf16 clause=refusal k=96 gemv_outputs={gemv_ok} tile={:?} {}",
+            "bf16 clause=refusal k=96 gemv_outputs={gemv_ok} tile={:?} mma={:?} {}",
             tile.as_ref().map_err(ToString::to_string),
+            mma.as_ref().map_err(ToString::to_string),
             verdict(pass)
         );
         Ok(pass)

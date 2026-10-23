@@ -16,9 +16,10 @@
 //! asks for the stored form and is refused beside it. Qwen3.8's decode reads about 9.27 GiB
 //! of weights a token from the stored split where the Q8_0 one reads 5.73, the head alone
 //! 0.55 GiB more
-//! (1,271,398,400 bytes of BF16 against 34 bytes a 32 values). Each shard is written as
-//! `<name>.part` and renamed when whole. The disk must hold the split and a tenth
-//! more. The written split is opened and its hyperparameters read as the server reads them.
+//! (1,271,398,400 bytes of BF16 against 34 bytes a 32 values). The output shard paths must
+//! not exist. A private temporary directory holds the entire split until it passes the
+//! server's reader; the first shard is published last. A persistent `<out prefix>.prepare.lock`
+//! file serializes writers of that prefix. The disk must hold the split and a tenth more.
 //! One line per tensor, a summary line, and exit status 1 with the error on any failure. Before
 //! any shard is written, the tokenizer serving builds from the header is checked to split text
 //! and stop generation where Hugging Face's does.
@@ -124,81 +125,170 @@ fn run(args: &[String], q8: bool) -> Res<()> {
 
     let get = |n: &str| folder.raw(n);
     let mut tensor_scales: std::collections::HashMap<String, Vec<f32>> = Default::default();
-    for (no, (shard, layout)) in shards.into_iter().enumerate() {
-        let path = PathBuf::from(format!("{prefix}-{:05}-of-{count:05}.gguf", no + 1));
-        let part = path.with_extension("gguf.part");
-        let mut w = Writer::new(BufWriter::new(File::create(&part)?), layout)?;
-        for p in shard {
-            let t = Instant::now();
-            let name = &p.decl.name;
-            match p.make {
-                Make::Scale { of } => {
-                    let s = tensor_scales
-                        .remove(&of)
-                        .ok_or_else(|| format!("{name}: {of} gave no scale"))?;
-                    w.tensor(
-                        name,
-                        &s.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>(),
-                    )?;
-                }
-                Make::Tensor(m) if m.role == Use::Rows => {
-                    // A row table's parts, one at a time, all with the table's one scale.
-                    let (mut failed, mut scale) = (None, vec![]);
-                    let parts = m.parts(&plan, get).map_while(|n| match n {
-                        Ok(n) => {
-                            scale = n.scale;
-                            Some(n.bytes)
+    let (shards, layouts): (Vec<_>, Vec<_>) = shards.into_iter().unzip();
+    write_split(
+        prefix,
+        layouts,
+        |no, w| {
+            for p in &shards[no] {
+                let t = Instant::now();
+                let name = &p.decl.name;
+                match &p.make {
+                    Make::Scale { of } => {
+                        let s = tensor_scales
+                            .remove(of)
+                            .ok_or_else(|| format!("{name}: {of} gave no scale"))?;
+                        w.tensor(
+                            name,
+                            &s.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>(),
+                        )?;
+                    }
+                    Make::Tensor(m) if m.role == Use::Rows => {
+                        // A row table's parts, one at a time, all with the table's one scale.
+                        let (mut failed, mut scale) = (None, vec![]);
+                        let parts = m.parts(&plan, get).map_while(|n| match n {
+                            Ok(n) => {
+                                scale = n.scale;
+                                Some(n.bytes)
+                            }
+                            Err(e) => {
+                                failed = Some(e);
+                                None
+                            }
+                        });
+                        let written = w.tensor_parts(name, parts);
+                        if let Some(e) = failed {
+                            return Err(e.into());
                         }
-                        Err(e) => {
-                            failed = Some(e);
-                            None
+                        written?;
+                        tensor_scales.insert(name.clone(), scale);
+                    }
+                    Make::Tensor(m) => {
+                        let mut n: Normal = modelopt::normalize(get, &m.placed(&plan)?, m.role)?;
+                        for step in &m.steps {
+                            step.apply(&checkpoint.geometry, name, &mut n)?;
                         }
-                    });
-                    let written = w.tensor_parts(name, parts);
-                    if let Some(e) = failed {
-                        return Err(e.into());
-                    }
-                    written?;
-                    tensor_scales.insert(name.clone(), scale);
-                }
-                Make::Tensor(m) => {
-                    let mut n: Normal = modelopt::normalize(get, &m.placed(&plan)?, m.role)?;
-                    for step in &m.steps {
-                        step.apply(&checkpoint.geometry, name, &mut n)?;
-                    }
-                    if n.type_id != p.decl.type_id {
-                        return Err(format!(
-                            "{name}: type {}, declared {}",
-                            n.type_id, p.decl.type_id
-                        )
-                        .into());
-                    }
-                    w.tensor(name, &n.bytes)?;
-                    if !n.scale.is_empty() {
-                        tensor_scales.insert(name.clone(), n.scale);
+                        if n.type_id != p.decl.type_id {
+                            return Err(format!(
+                                "{name}: type {}, declared {}",
+                                n.type_id, p.decl.type_id
+                            )
+                            .into());
+                        }
+                        w.tensor(name, &n.bytes)?;
+                        if !n.scale.is_empty() {
+                            tensor_scales.insert(name.clone(), n.scale);
+                        }
                     }
                 }
+                println!(
+                    "prepare: {name} type={} bytes={} secs={:.3}",
+                    p.decl.type_id,
+                    p.decl.nbytes,
+                    t.elapsed().as_secs_f64()
+                );
             }
+            Ok(())
+        },
+        |first| {
+            // The split opens as the server opens it, its hyperparameters and layers whole.
+            let split = gguf::Split::open(first)?;
+            let read = model::arch::spec(&split)?;
             println!(
-                "prepare: {name} type={} bytes={} secs={:.3}",
-                p.decl.type_id,
-                p.decl.nbytes,
-                t.elapsed().as_secs_f64()
+                "prepare: the split opens: {} layers, {} tensors",
+                read.spec.layers.len(),
+                split.tensor_count()
             );
+            Ok(())
+        },
+    )
+}
+
+fn write_split(
+    prefix: &str,
+    layouts: Vec<Layout>,
+    mut write: impl FnMut(usize, &mut Writer<BufWriter<File>>) -> Res<()>,
+    validate: impl FnOnce(&Path) -> Res<()>,
+) -> Res<()> {
+    let lock_path = format!("{prefix}.prepare.lock");
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|e| format!("{lock_path}: open lock: {e}"))?;
+    match lock.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => {
+            return Err(format!("{prefix}: prepare output is busy").into());
         }
-        w.finish()?;
-        std::fs::rename(&part, &path)?;
-        println!("prepare: wrote {}", path.display());
+        Err(std::fs::TryLockError::Error(e)) => {
+            return Err(format!("{lock_path}: lock: {e}").into());
+        }
     }
-    // The split opens as the server opens it, its hyperparameters and layers whole.
-    let split = gguf::Split::open(format!("{prefix}-00001-of-{count:05}.gguf"))?;
-    let read = model::arch::spec(&split)?;
-    println!(
-        "prepare: the split opens: {} layers, {} tensors",
-        read.spec.layers.len(),
-        split.tensor_count()
-    );
-    Ok(())
+    let count = layouts.len();
+    let paths: Vec<_> = (1..=count)
+        .map(|no| PathBuf::from(format!("{prefix}-{no:05}-of-{count:05}.gguf")))
+        .collect();
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_nanos();
+    let stage = PathBuf::from(format!("{prefix}.part.{}.{nonce}", std::process::id()));
+    let mut staged = false;
+    let mut published = vec![];
+    let result = (|| {
+        for path in &paths {
+            match std::fs::symlink_metadata(path) {
+                Ok(_) => return Err(format!("{}: output already exists", path.display()).into()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(format!("{}: stat: {e}", path.display()).into()),
+            }
+        }
+        std::fs::create_dir(&stage)?;
+        staged = true;
+        for (no, layout) in layouts.into_iter().enumerate() {
+            let part = stage.join(paths[no].file_name().expect("a shard has a filename"));
+            let mut w = Writer::new(BufWriter::new(File::create_new(&part)?), layout)?;
+            write(no, &mut w)?;
+            w.finish()?;
+        }
+        validate(&stage.join(paths[0].file_name().expect("a shard has a filename")))?;
+        // The first shard is the entry point; its siblings are immutable before it appears.
+        for path in paths.iter().rev() {
+            let part = stage.join(path.file_name().expect("a shard has a filename"));
+            model::fileio::rename_noreplace(&part, path)
+                .map_err(|e| format!("{}: publish: {e}", path.display()))?;
+            published.push(path);
+        }
+        for path in &paths {
+            println!("prepare: wrote {}", path.display());
+        }
+        Ok(())
+    })();
+    let mut cleanup = vec![];
+    if result.is_err() {
+        for path in published {
+            if let Err(e) = std::fs::remove_file(path) {
+                cleanup.push(format!("{}: remove published shard: {e}", path.display()));
+            }
+        }
+    }
+    if staged && let Err(e) = std::fs::remove_dir_all(&stage) {
+        cleanup.push(format!("{}: remove temporary split: {e}", stage.display()));
+    }
+    if let Err(e) = lock.unlock() {
+        cleanup.push(format!("{lock_path}: unlock: {e}"));
+    }
+    if cleanup.is_empty() {
+        result
+    } else {
+        let cleanup = cleanup.join("; ");
+        match result {
+            Ok(()) => Err(format!("split published; cleanup failed: {cleanup}").into()),
+            Err(e) => Err(format!("{e}; cleanup failed: {cleanup}").into()),
+        }
+    }
 }
 
 fn plan_shards(
@@ -259,6 +349,207 @@ mod tests {
     use model_hf::arch::qwen35moe::Checkpoint;
     use model_hf::arch::qwen35moe::folder::{plan_tensors, served_as_hf};
     use safetensors::Dtype;
+    fn split_fixture(count: usize) -> Vec<super::Layout> {
+        (0..count)
+            .map(|no| {
+                super::Layout::new(
+                    &[
+                        ("split.no".into(), gguf::Value::U16(no as u16)),
+                        ("split.count".into(), gguf::Value::U16(count as u16)),
+                        ("split.tensors.count".into(), gguf::Value::I32(count as i32)),
+                    ],
+                    vec![TensorDecl {
+                        name: format!("t{no}"),
+                        dims: vec![2],
+                        type_id: 0,
+                        nbytes: 8,
+                    }],
+                )
+                .unwrap()
+            })
+            .collect()
+    }
+
+    fn split_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("prepare-{tag}-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn split_failure_preserves_existing_shards() {
+        use super::*;
+        let dir = split_dir("failure");
+        let prefix = dir.join("model");
+        let prefix = prefix.to_str().unwrap();
+        write_split(
+            prefix,
+            split_fixture(2),
+            |no, w| {
+                w.tensor(&format!("t{no}"), &[1; 8])?;
+                Ok(())
+            },
+            |first| {
+                gguf::Split::open(first)?;
+                Ok(())
+            },
+        )
+        .unwrap();
+        let paths: Vec<_> = (1..=2)
+            .map(|no| format!("{prefix}-{no:05}-of-00002.gguf"))
+            .collect();
+        let before: Vec<_> = paths.iter().map(|p| std::fs::read(p).unwrap()).collect();
+        let result = write_split(
+            prefix,
+            split_fixture(2),
+            |no, w| {
+                if no == 1 {
+                    return Err("later shard failed".into());
+                }
+                w.tensor(&format!("t{no}"), &[2; 8])?;
+                Ok(())
+            },
+            |_| Ok(()),
+        );
+        assert!(result.is_err());
+        for (path, before) in paths.iter().zip(before) {
+            assert_eq!(std::fs::read(path).unwrap(), before, "{path}");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn split_concurrent_writers_cannot_change_a_successful_output() {
+        use super::*;
+        let dir = split_dir("concurrent");
+        let prefix = dir.join("model");
+        let prefix = prefix.to_str().unwrap();
+        let path = format!("{prefix}-00001-of-00001.gguf");
+        let mut other = None;
+        let first = write_split(
+            prefix,
+            split_fixture(1),
+            |_, w| {
+                let second = write_split(
+                    prefix,
+                    split_fixture(1),
+                    |_, w| {
+                        w.tensor("t0", &[2; 8])?;
+                        Ok(())
+                    },
+                    |_| Ok(()),
+                );
+                other = Some(second.map(|()| std::fs::read(&path).unwrap()));
+                w.tensor("t0", &[1; 8])?;
+                Ok(())
+            },
+            |_| Ok(()),
+        );
+        match other.unwrap() {
+            Ok(bytes) => assert_eq!(std::fs::read(&path).unwrap(), bytes),
+            Err(e) => {
+                assert!(e.to_string().contains("busy"), "{e}");
+                first.unwrap();
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn split_is_complete_and_validated_before_its_first_shard_appears() {
+        use super::*;
+        for count in [1, 2, 4] {
+            let dir = split_dir(&format!("complete-{count}"));
+            let prefix = dir.join("model");
+            let prefix = prefix.to_str().unwrap();
+            let first = format!("{prefix}-00001-of-{count:05}.gguf");
+            write_split(
+                prefix,
+                split_fixture(count),
+                |no, w| {
+                    assert!(!Path::new(&first).exists());
+                    w.tensor(&format!("t{no}"), &[no as u8; 8])?;
+                    Ok(())
+                },
+                |staged| {
+                    assert!(!Path::new(&first).exists());
+                    let split = gguf::Split::open(staged)?;
+                    assert_eq!(split.shard_count(), count);
+                    assert_eq!(split.tensor_count(), count);
+                    Ok(())
+                },
+            )
+            .unwrap();
+            let split = gguf::Split::open(&first).unwrap();
+            assert_eq!(split.shard_count(), count);
+            for (no, layout) in split_fixture(count).into_iter().enumerate() {
+                let mut expected = Writer::new(vec![], layout).unwrap();
+                expected.tensor(&format!("t{no}"), &[no as u8; 8]).unwrap();
+                assert_eq!(
+                    std::fs::read(split.shard_path(no).unwrap()).unwrap(),
+                    expected.finish().unwrap()
+                );
+            }
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn split_write_validation_and_publication_errors_clean_only_their_own_files() {
+        use super::*;
+        for (case, failed_shard, invalid, conflict) in [
+            ("write-first", Some(0), false, None),
+            ("write-later", Some(1), false, None),
+            ("validate", None, true, None),
+            ("publish-first", None, false, Some(1)),
+            ("publish-last", None, false, Some(0)),
+        ] {
+            let dir = split_dir(case);
+            let prefix = dir.join("model");
+            let prefix = prefix.to_str().unwrap();
+            let paths: Vec<_> = (1..=2)
+                .map(|no| format!("{prefix}-{no:05}-of-00002.gguf"))
+                .collect();
+            let result = write_split(
+                prefix,
+                split_fixture(2),
+                |no, w| {
+                    if failed_shard == Some(no) {
+                        return Err("injected write failure".into());
+                    }
+                    w.tensor(&format!("t{no}"), &[1; 8])?;
+                    Ok(())
+                },
+                |first| {
+                    gguf::Split::open(first)?;
+                    if invalid {
+                        return Err("injected validation failure".into());
+                    }
+                    if let Some(no) = conflict {
+                        std::fs::write(&paths[no], b"external file")?;
+                    }
+                    Ok(())
+                },
+            );
+            assert!(result.is_err(), "{case}");
+            for (no, path) in paths.iter().enumerate() {
+                if conflict == Some(no) {
+                    assert_eq!(std::fs::read(path).unwrap(), b"external file", "{case}");
+                } else {
+                    assert!(!Path::new(path).exists(), "{case}: {path}");
+                }
+            }
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let name = entry.unwrap().file_name();
+                assert!(
+                    !name.to_string_lossy().contains(".part"),
+                    "{case}: {name:?}"
+                );
+            }
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
     #[test]
     fn shard_budget_counts_scales_metadata_and_padding() {
         use super::*;
@@ -578,8 +869,9 @@ mod tests {
     /// UD-Q4_K_XL holds in Q8_0, a BF16 matrix in the checkpoint (the head and the token
     /// embedding among them), is BF16, and Q8_0 only when `BLOOMERY_PREPARE_Q8` asks; every other
     /// tensor (the NVFP4 stacks, the PLE table's F8 rows, the gains, the scales) is the same
-    /// either way. Synthetic F32 matrices require the Q8_0 rewrite; BF16 and F32 routed stacks
-    /// are refused with either lever value. Dropping either refusal fails these assertions.
+    /// either way. Router parts keep their stored F32 or BF16 type with either lever value.
+    /// Other synthetic F32 matrices require the Q8_0 rewrite; BF16 and F32 routed stacks are
+    /// refused with either lever value. Dropping either refusal fails these assertions.
     /// `--keep-bf16` asks for the stored form: taken alone, refused beside the lever.
     #[test]
     fn a_bf16_matrix_is_written_as_stored_unless_q8_is_asked() {
@@ -642,6 +934,45 @@ mod tests {
                 (*ty, *ty)
             };
             assert_eq!((*ty, rewritten[name]), want, "{name}");
+        }
+        for (router, shared) in [
+            (Dtype::F32, Dtype::Bf16),
+            (Dtype::Bf16, Dtype::F32),
+            (Dtype::F32, Dtype::F32),
+        ] {
+            let mut mixed = entries.clone();
+            let parts = [
+                (
+                    "model.language_model.layers.0.mlp.gate.weight",
+                    names::ffn_gate_inp(0),
+                    router,
+                ),
+                (
+                    "model.language_model.layers.0.mlp.shared_expert_gate.weight",
+                    names::ffn_gate_inp_shexp(0),
+                    shared,
+                ),
+            ];
+            for (source, _, dtype) in &parts {
+                mixed.iter_mut().find(|(n, _, _)| n == source).unwrap().1 = *dtype;
+            }
+            for q8 in [false, true] {
+                let (_, planned) = plan_tensors(&checkpoint, &quant, &mixed, q8).unwrap();
+                for (_, target, dtype) in &parts {
+                    let p = planned.iter().find(|p| p.decl.name == *target).unwrap();
+                    let want = if *dtype == Dtype::F32 {
+                        GgmlType::F32
+                    } else {
+                        GgmlType::BF16
+                    };
+                    assert_eq!(p.decl.type_id, want.as_u32(), "{target}, q8={q8}");
+                    assert_eq!(
+                        p.decl.nbytes,
+                        p.decl.dims.iter().product::<u64>() * want.type_size().unwrap(),
+                        "{target}, q8={q8}"
+                    );
+                }
+            }
         }
         for (target, source) in [
             (

@@ -69,16 +69,23 @@
 # auxiliary-dir rule (bloomery-<track>-<suffix>): once the track's worktree is gone, `just box-tracks --remove
 # <track>-narrow-base <track>-narrow-head` clears them (the main tree's: `narrow-base narrow-head`).
 #
-# A side whose box command ends rc 255 (ssh lost the box) runs once more: its recorded remote runner is ended first (the
-# stop's READONLY call below), then the side runs again in the same remote dir. One line says so, the MANIFEST carries
-# `retried=<sides>` and the done line `(retried: <sides>)`; a second 255 ends the run rc 255. No other code is retried.
+# A side whose box command ends rc 255 (ssh lost the box) runs once more only after its stop control call succeeds.
+# A failed control call ends the run with its status (70 at the 30 s control bound), without reusing the remote dir.
+# After a successful stop the side retries in that same dir; the MANIFEST carries `retried=<sides>` and the done line
+# `(retried: <sides>)`. A second side-command 255 ends the run rc 255. No other side-command code is retried.
 #
-# Stopping (INT/TERM): the side in flight ends from both ends, by pids it recorded and never by a name match. Its box
-# command writes the pid of the `timeout` it started to .narrow-scan-<side>-<pid>.pid in the remote dir (removed when the
-# runner ends, and by the next sync if a run died); the stop reads that file in one READONLY box call (no sync, no guard
-# wait) and signals that pid, whose TERM `timeout` passes to the runner's process group, then signals the local box.sh's
-# process group (job control makes it a group of its own: box.sh, its ssh and rsync) by the pid written under DIR at its
-# start. A stop that finds no file prints so (the runner had not started or had ended).
+# Stopping (INT/TERM): the side in flight ends from both ends, by recorded pids, never by a name match. Each attempt
+# gets a unique .narrow-scan-<side>-<pid>.<nonce>.pid under the box's ~/.cache/bloomery/narrow-scan, outside the synced
+# tree. Its .stop marker survives a sync; a retry gets another name, so a delayed old attempt stays cancelled.
+# The stop writes that marker before reading the supervisor's pid. The side publishes its pid before checking the
+# marker and starting the runner. A later stop signals that supervisor, which uses this tree's gate-bound.sh owner
+# to end and reap the timeout's process group, including children that ignore TERM. The owner is shipped in the
+# command: an older BASE need not have it. The runner's timeout still has its 10 s KILL and the remaining NARROW_BOUND.
+# The stop uses plain SSH (bash under BLOOMERY_BOX_LOCAL=1), without sync, a guard wait or reading the synced tree.
+# box.sh's READONLY path still loads that tree's model profiles, so it cannot stop an attempt before the first sync.
+# It waits up to 15 s for a registered supervisor's cleanup; the whole control call stays bounded at 30 s. Then the local
+# box.sh process group (its ssh and rsync too) is signalled by the pid written under DIR. A finished attempt removes
+# its temporary runner, pid and stop marker. If the side never arrives, its pending stop marker stays in the cache.
 #
 # It runs no gate and takes no timing lease, no hold, no card and no gate lock: `--no-jit` loads nothing on a card, and
 # the box commands are builds and ptxas. box.sh's own guard still waits while a sitting's lease or hold is up (rc 75 is
@@ -96,12 +103,14 @@
 #
 # NARROW_BOUND (default 7200 s, a hang guard: no box-job length needs approval) bounds the whole run: each side's box command runs under `timeout` with what
 # is left. A cut build keeps its compiled crates, so running again continues it. Exit codes: 0 done; 64 usage; 75
-# contention (the box guard, or the lock); 70 the box's toolchain; 1 a build or scan failed; 2 a scan set could not be derived or
+# contention (the box guard, or the lock); 70 the box's toolchain or stop control; 1 a build or scan failed; 2 a scan set could not be derived or
 # the sides' sets name different bins; 124 the bound; 130 INT and 143 TERM; the `affected` run's own code otherwise.
 set -uo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 # shellcheck source=tools/nightly/units.sh
 source "$ROOT/tools/nightly/units.sh" # tree_commit labels the head tree, archive_tree reads a base commit
+# shellcheck source=tools/gate-bound.sh
+source "$ROOT/tools/gate-bound.sh"
 PKG=bloomery-gpu-gates # the package the ptx-scan recipe builds; tools/recipes.py SCAN_PACKAGE
 ARCH=sm_86 # the arch of the scans, the recipes' default (BLOOMERY_ARCH, tools/arch.sh); the pairs are built at no other
 USAGE="usage: narrow-scan.sh BASE [HEAD | --worktree] [--out DIR] [--dry-run] [--keep-ptx] [--scan-only] | --self-test"
@@ -428,26 +437,73 @@ lock_release() { # drops this process's flock. The directory is removed only whe
   return 0
 }
 
-# side_command <bound s> <pid file>: the one box.sh argument each side runs. The runner arrives on stdin, so the command writes it to a
-# temp file and runs it under `timeout`, started in the background so that its pid (the `timeout`, which passes a TERM to the runner's
-# process group) is written to <pid file> in the remote dir; the file goes when the runner ends. The command's rc comes back whatever
-# came before it (the guard's 75, the backend's 70). The leading `:` names `cargo oxide`, which makes box.sh check the pinned backend
-# before the command, as it does for a recipe.
+# side_command <bound s> <pid file>: the one box.sh argument each side runs. Its supervisor owns the bounded child
+# and the remote cancellation handshake (the header). Keep the command in one AND-list term so a refused guard or
+# backend preflight cannot fall through into it. The leading `:` makes box.sh check cargo oxide before the command.
 side_command() {
-  printf '%s' ': cargo oxide && T=$(mktemp) && cat > "$T" && { [ -s "$T" ] || { echo "narrow-scan: the runner arrived empty on stdin" >&2; rm -f "$T"; exit 65; }; } && { timeout --kill-after=10 '"$1"' bash "$T" </dev/null & echo $! > '"$2"'; wait $!; }; rc=$?; rm -f "$T" '"$2"'; exit $rc'
+  printf '%s\n' ': cargo oxide && {'
+  declare -f stop_pid_ok lease_stop group_live group_clear run_bounded
+  printf 'P="$HOME/.cache/bloomery/narrow-scan/%s"\nB=%s\n' "$2" "$1"
+  cat <<'NARROW_SIDE_EOF'
+mkdir -p "${P%/*}" || { echo "narrow-scan: cannot create remote control directory" >&2; exit 70; }
+T=
+trap 'rm -f "$T" "$P.tmp" "$P" "$P.stop"' EXIT
+trap 'exit 143' TERM
+trap 'exit 130' INT
+trap 'exit 129' HUP
+[ ! -e "$P.stop" ] || exit 143
+T=$(mktemp) || exit 70
+cat > "$T" || exit $?
+[ -s "$T" ] || { echo "narrow-scan: the runner arrived empty on stdin" >&2; exit 65; }
+printf '%s\n' "$$" > "$P.tmp" && mv -f "$P.tmp" "$P" || {
+  echo "narrow-scan: cannot publish remote supervisor pid in $P" >&2; exit 70;
+}
+[ ! -e "$P.stop" ] || exit 143
+rc=0
+run_bounded --clear timeout --kill-after=10 "$B" bash "$T" </dev/null || rc=$?
+if [ -n "$BIN_SIGNAL" ] && [ "$rc" != 70 ]; then rc=143; fi
+exit "$rc"
+}
+NARROW_SIDE_EOF
 }
 
-# stop_command <pid file>: the READONLY box command of a stop: signals the pid the side command recorded, if the file is there.
+# stop_command <pid file>: record the stop before looking for a supervisor; wait for its cleanup if it has started.
 stop_command() {
-  printf '%s' 'p=$(cat '"$1"' 2>/dev/null); if [ -n "$p" ]; then kill -TERM "$p" && echo "narrow-scan: signalled the recorded remote pid $p"; else echo "narrow-scan: no remote pid recorded in '"$1"' (the runner had not started or had ended)"; fi'
+  printf '%s\n' '{'
+  declare -f stop_pid_ok
+  printf 'P="$HOME/.cache/bloomery/narrow-scan/%s"\n' "$1"
+  cat <<'NARROW_STOP_EOF'
+mkdir -p "${P%/*}" && : > "$P.stop" || {
+  echo "narrow-scan: cannot record remote stop in $P.stop" >&2; exit 70;
+}
+if p=$(cat "$P" 2>/dev/null); then
+  stop_pid_ok narrow-scan "$p" || exit 70
+  if ! kill -TERM "$p" 2>/dev/null && [ -e "$P" ]; then
+    echo "narrow-scan: cannot signal remote supervisor $p ($P)" >&2; exit 70;
+  fi
+  k=0
+  while [ -e "$P" ] && [ "$k" -lt 150 ]; do sleep 0.1; k=$((k + 1)); done
+  [ ! -e "$P" ] || { echo "narrow-scan: remote supervisor $p did not finish cleanup in 15 s ($P)" >&2; exit 70; }
+else
+  [ ! -e "$P" ] || { echo "narrow-scan: cannot read remote supervisor pid in $P" >&2; exit 70; }
+fi
+echo "narrow-scan: stop recorded for $P"
+}
+NARROW_STOP_EOF
 }
 
-# remote_stop <remote dir> <pid file>: the stop's one READONLY box call (no sync, no guard wait: a sitting does not delay it),
-# bounded at 30 s.
+# remote_stop <remote dir> <pid file>: a self-contained control command, independent of the synced tree and its
+# model profiles. The local mode follows box.sh's selection; the transport is bounded at 30 s.
 remote_stop() {
   local bp k=0
-  env -u BLOOMERY_CARD -u BLOOMERY_BOX_ENV -u BLOOMERY_TIER BLOOMERY_REMOTE="$1" BLOOMERY_BOX_READONLY=1 BLOOMERY_BOX_WAIT=0 \
-    "$ROOT/tools/box.sh" "$(stop_command "$2")" < /dev/null >&2 2>&1 9>&- &
+  (
+    trap - INT TERM
+    if [ "${BLOOMERY_BOX_LOCAL:-0}" = 1 ]; then
+      exec bash -s
+    else
+      exec ssh "${BLOOMERY_BOX:-ws}" bash -s
+    fi
+  ) <<< "$(stop_command "$2")" >&2 2>&1 9>&- &
   bp=$!
   while kill -0 "$bp" 2> /dev/null && [ "$k" -lt 150 ]; do
     sleep 0.2 9>&-
@@ -455,8 +511,10 @@ remote_stop() {
   done
   if kill -0 "$bp" 2> /dev/null; then
     kill -TERM "$bp" 2> /dev/null || true
-    echo "narrow-scan: the stop's box call did not return in 30 s: the runner may still be running on the box ($1/$2; 'just box-gc --dry-run' lists orphans)" >&2
+    echo "narrow-scan: the stop's control call did not return in 30 s: the runner may still be running on the box ($1; control $2; 'just box-gc --dry-run' lists orphans)" >&2
+    return 70
   fi
+  wait "$bp"
 }
 
 # stop_run <rc>: INT or TERM. The side in flight (ACTIVE_*, set by run_side) is ended from both ends, then the EXIT trap releases the lock.
@@ -465,7 +523,7 @@ stop_run() {
   local bp
   trap '' INT TERM # a second signal does not cut the stop short
   if [ -n "$ACTIVE_NAME" ]; then
-    echo "narrow-scan: stopped: ending the $ACTIVE_NAME side ($ACTIVE_DIR/$ACTIVE_RPIDF on the box, $ACTIVE_PIDF here)" >&2
+    echo "narrow-scan: stopped: ending the $ACTIVE_NAME side ($ACTIVE_DIR; control $ACTIVE_RPIDF on the box, $ACTIVE_PIDF here)" >&2
     remote_stop "$ACTIVE_DIR" "$ACTIVE_RPIDF"
     if [ -f "$ACTIVE_PIDF" ]; then
       bp=$(cat "$ACTIVE_PIDF")
@@ -480,7 +538,7 @@ stop_run() {
 # the background and is waited for, so a stop signal is handled at once (a trap waits for a foreground command); its pid goes to
 # <out>/<name>.box.pid, and its stderr through a fifo to <out>/<name>.build.log and ours.
 run_side() {
-  local name=$1 rev=$2 dir=$3 runner=$4 out=$5 bound=$6 src rc t0 cmd fifo tp bp
+  local name=$1 rev=$2 dir=$3 runner=$4 out=$5 bound=$6 src rc t0 cmd fifo tp bp token
   shift 6
   if [ "$rev" = worktree ]; then
     src=$ROOT
@@ -490,7 +548,9 @@ run_side() {
     mkdir -p "$src" 9>&-
     archive_tree "$ROOT" "$rev" "$src" 9>&- || die 1 "git archive $rev failed (git $ARCHIVE_GIT_RC, tar $ARCHIVE_TAR_RC)"
   fi
-  ACTIVE_RPIDF=.narrow-scan-$name-$$.pid
+  token=$(mktemp "$out/.narrow-scan-$name-$$.XXXXXX" 9>&-) || die 70 "cannot name the $name attempt"
+  ACTIVE_RPIDF=${token##*/}.pid
+  rm -f "$token" 9>&-
   cmd=$(side_command "$bound" "$ACTIVE_RPIDF")
   echo "narrow-scan: $name: $rev -> $dir (bound ${bound}s)" >&2
   t0=$SECONDS
@@ -561,18 +621,97 @@ self_test() {
   [ "$(grep -c -- '--no-jit' "$t/runner.sh")" = 3 ]; ok "runner: one --no-jit scan per bin" $?
   sed -n "/^cat > \"\$P\" <<'NARROW_PTX_SCAN_EOF'$/,/^NARROW_PTX_SCAN_EOF$/p" "$t/runner.sh" | sed '1d;$d' | cmp -s - "$t/ptx-scan.sh"; ok "runner: ptx-scan.sh embedded verbatim" $?
   [ "$(grep -c '^echo "narrow-scan: wall: ' "$t/runner.sh")" = 6 ]; ok "runner: a wall line per build group, the extractor and each scan" $?
-  case $(side_command 900 .p-1) in *"cargo oxide"*) ;; *) false ;; esac; ok "side command: names cargo oxide, so box.sh checks the backend" $?
-  rc=0; got=$(cd "$t" && bash -c "$(side_command 900 .p-empty)" < /dev/null 2>&1) || rc=$?
-  [ "$rc" = 65 ] && grep -qF "the runner arrived empty on stdin" <<< "$got" && [ ! -e "$t/.p-empty" ]; ok "side command: an empty runner ends 65 by name, never an empty scan's 0" $?
-  grep -qE -- '^ +-u BLOOMERY_BOX_QUEUE -u BLOOMERY_Q_CLASS -u BLOOMERY_Q_CARD -u BLOOMERY_Q_PRED_S GIT_CEILING' "$0"; ok "side call: the queue's settings are unset, so the runner's stdin reaches the box" $?
-  case $(side_command 900 .p-1) in *"timeout --kill-after=10 900 bash"*) ;; *) false ;; esac; ok "side command: the runner runs under the bound" $?
-  case $(side_command 900 .p-1) in *'echo $! > .p-1'*) ;; *) false ;; esac; ok "side command: the runner's pid is recorded in the named file" $?
-  case $(side_command 900 .p-1) in *'rm -f "$T" .p-1'*) ;; *) false ;; esac; ok "side command: the pid file goes when the runner ends" $?
-  sc=$(stop_command .p-1 2> /dev/null)
-  ro=$(sed -n "s/^    ro_build='\(.*\)'$/\1/p" "$ROOT/tools/box.sh")
-  [ -n "$sc" ] && [ -n "$ro" ] && ! [[ $sc =~ $ro ]] && [[ $sc != *target/* ]]; ok "drift: box.sh's READONLY mode accepts the stop command (no build word, no target/)" $?
-  got=$(cd "$t" && bash -c "$(stop_command .no-such.pid 2> /dev/null)" 2>&1)
-  grep -qF "no remote pid recorded in .no-such.pid" <<< "$got"; ok "stop command: with no pid file it says so and signals nothing" $?
+  # PIN(2026-10-22): Replace source-text and stop-log assertions with process cancellation and FIFO lock tests.
+  # The remote commands run real processes; a sync between stop and launch must not erase the stop.
+  # shellcheck source=tools/ref/cancel-stubs.sh
+  source "$ROOT/tools/ref/cancel-stubs.sh"
+  local remote_path="$t/remote-bin:$PATH" supervisor stopper other_stopper child monitor grandchild sentinel ready waits stop_rc
+  mkdir -p "$t/remote-command" "$t/remote-home" "$t/sync-source" "$t/remote-bin"
+  if ! command -v timeout > /dev/null 2>&1; then
+    cancel_timeout "$t/remote-bin/timeout"
+    chmod +x "$t/remote-bin/timeout"
+  fi
+  {
+    printf '%s\n' '#!/usr/bin/env bash' '[ "$#" != 0 ] || [ -z "${TRANSFER_READY:-}" ] || : > "$TRANSFER_READY"'
+    printf 'exec %q "$@"\n' "$(type -P cat)"
+  } > "$t/remote-bin/cat"
+  chmod +x "$t/remote-bin/cat"
+  printf '%s\n' '#!/usr/bin/env bash' '[ -z "${STUB_STOP_RC:-}" ] || exit "$STUB_STOP_RC"' \
+    '[ "${1:-}" != -n ] || shift' 'shift' 'cd "$HOME" || exit 70' 'exec bash -c "$*"' > "$t/remote-bin/ssh"
+  chmod +x "$t/remote-bin/ssh"
+  export PATH=$remote_path
+  remote_call() (
+    cd "$t/remote-command" || exit 70
+    exec env HOME="$t/remote-home" PATH="$remote_path" LEASE_STOP_GRACE=4 bash -c "$1"
+  )
+  rc=0; remote_call "$(side_command 60 .empty.pid)" < /dev/null > "$t/empty.log" 2>&1 || rc=$?
+  [ "$rc" = 65 ]; ok "remote: an empty runner is refused with 65" $?
+  printf 'printf ran > "%s"\nexit 23\n' "$t/remote-ran" > "$t/short-runner"
+  HOME="$t/remote-home" BLOOMERY_BOX_LOCAL=0 remote_stop "$t/remote-command" .before.pid > "$t/before-stop.log" 2>&1
+  HOME="$t/remote-home" BLOOMERY_BOX_LOCAL=0 remote_stop "$t/remote-command" .before.pid >> "$t/before-stop.log" 2>&1
+  rsync -a --delete "$t/sync-source/" "$t/remote-command/"; ok "remote: the pending side finishes its sync" $?
+  rc=0; remote_call "$(side_command 60 .before.pid)" < "$t/short-runner" > "$t/before.log" 2>&1 || rc=$?
+  [ "$rc" = 143 ] && [ ! -e "$t/remote-ran" ]; ok "remote: repeated stops before PID publication survive sync and prevent execution" $?
+  rm -f "$t/remote-ran"
+  rc=0; remote_call "$(side_command 60 .retry.pid)" < "$t/short-runner" > "$t/retry.log" 2>&1 || rc=$?
+  [ "$rc" = 23 ] && [ "$(cat "$t/remote-ran" 2> /dev/null)" = ran ]; ok "remote: a new attempt runs independently and preserves the runner's status" $?
+  rm -f "$t/remote-ran"
+  rc=0; remote_call "guard() { return 75; }; guard && $(side_command 60 .guard.pid)" < "$t/short-runner" > "$t/guard.log" 2>&1 || rc=$?
+  [ "$rc" = 75 ] && [ ! -e "$t/remote-ran" ]; ok "remote: a refused box preflight starts nothing and preserves its status" $?
+  # Hold the real cat after the side's initial check, then cancel before PID publication and finish the transfer.
+  mkfifo "$t/transfer.fifo"
+  exec 8<> "$t/transfer.fifo"
+  TRANSFER_READY="$t/transfer.ready" remote_call "$(side_command 60 .transfer.pid)" < "$t/transfer.fifo" 8>&- > "$t/transfer.log" 2>&1 &
+  supervisor=$!
+  waits=0
+  until [ -e "$t/transfer.ready" ] || ! kill -0 "$supervisor" 2> /dev/null || [ "$waits" = 1200 ]; do
+    sleep 0.1
+    waits=$((waits + 1))
+  done
+  [ -e "$t/transfer.ready" ]; ok "remote: the runner transfer is in flight" $?
+  HOME="$t/remote-home" BLOOMERY_BOX_LOCAL=1 remote_stop "$t/remote-command" .transfer.pid > "$t/transfer-stop.log" 2>&1
+  cat "$t/short-runner" >&8
+  exec 8>&-
+  rc=0; wait "$supervisor" || rc=$?
+  [ "$rc" = 143 ] && [ ! -e "$t/remote-ran" ]; ok "remote: a stop during transfer prevents the runner from starting" $?
+  cat > "$t/held-runner" <<'NARROW_HELD_EOF'
+trap 'exit 0' TERM
+bash -c 'trap "" TERM INT HUP; echo "$$" > "$1"; exec sleep 60' _ "$HELD_PID.gc" &
+kid=$!
+printf '%s %s\n' "$$" "$PPID" > "$HELD_PID"
+wait "$kid"
+NARROW_HELD_EOF
+  sleep 60 &
+  sentinel=$!
+  HELD_PID="$t/held.pid" remote_call "$(side_command 60 .held.pid)" < "$t/held-runner" > "$t/held.log" 2>&1 &
+  supervisor=$!
+  ready=0 waits=0
+  until { cancel_ready "$t/held.pid" && [ -s "$t/held.pid.gc" ] && ready=1; } || ! kill -0 "$supervisor" 2> /dev/null || [ "$waits" = 1200 ]; do
+    sleep 0.1
+    waits=$((waits + 1))
+  done
+  [ "$ready" = 1 ]; ok "remote: the runner and its TERM-ignoring descendant are ready" $?
+  remote_call "$(stop_command .held.pid)" > "$t/held-stop.log" 2>&1 &
+  stopper=$!
+  remote_call "$(stop_command .held.pid)" > "$t/held-stop-again.log" 2>&1 &
+  other_stopper=$!
+  rc=0 stop_rc=0
+  wait "$stopper" || rc=$?
+  wait "$other_stopper" || stop_rc=$?
+  [ "$rc" = 0 ] && [ "$stop_rc" = 0 ]; ok "remote: overlapping stops both complete" $?
+  rc=0; wait "$supervisor" || rc=$?
+  child='' monitor='' grandchild=''
+  read -r child monitor < "$t/held.pid" || true
+  grandchild=$(cat "$t/held.pid.gc" 2> /dev/null) || true
+  [ "$rc" = 143 ]; ok "remote: cancellation is not success even when the runner handles TERM with exit 0" $?
+  [ -n "$child" ] && [ -n "$monitor" ] && [ -n "$grandchild" ] &&
+    ! cancel_alive "$child" && ! cancel_alive "$monitor" && ! cancel_alive "$grandchild"
+  ok "remote: stop completion leaves no live monitor, runner or TERM-ignoring descendant" $?
+  cancel_alive "$sentinel"; ok "remote: cancellation leaves an unrelated process alive" $?
+  for f in "$child" "$monitor" "$grandchild" "$sentinel"; do
+    [ -z "$f" ] || ! cancel_alive "$f" || kill -KILL "$f" 2> /dev/null || true
+  done
+  wait "$sentinel" 2> /dev/null || true
   grep -q "the build with features gpu failed" "$t/runner.sh" && grep -q "the extractor build failed" "$t/runner.sh"; ok "runner: a failed build ends it by name" $?
   # --keep-ptx: the runner keeps each bin's modules and sends them after the scan's block; unset it is the plain runner
   make_runner "$t/set.tsv" "$t/ptx-scan.sh" "$t/runner-0.sh" 0 && cmp -s "$t/runner.sh" "$t/runner-0.sh"; ok "keep off: an explicit 0 writes the runner the default writes" $?
@@ -808,35 +947,6 @@ self_test() {
   fifo_blocked "lock: a logger blocked on the FIFO does not keep the flock after the holder exits" "$tee_line"
   wline=$(grep -F '> "$fifo" &' <<< "$body" | head -n 1)
   fifo_blocked "lock: a writer blocked on the FIFO does not keep the flock after the holder exits" "( : )${wline#*\)}"
-  miss=0
-  for site in \
-    'tee "$out/$name.build.log" 9>&- < "$fifo" >&2 &' \
-    './tools/box.sh "$cmd" < "$runner" 2>&1 > "$out/$name.scan.out"' \
-    ') 9>&- > "$fifo" &' \
-    '"$ROOT/tools/box.sh" "$(stop_command "$2")" < /dev/null >&2 2>&1 9>&- &' \
-    'archive_tree "$ROOT" "$rev" "$src" 9>&- ||' \
-    'split_logs "$OUT/$side.scan.out" "$OUT/$side" "${BINS[@]}" 9>&-' \
-    'split_ptx "$OUT/$side.scan.out" "$OUT/$side" "${BINS[@]}" 9>&-' \
-    'WT_KEY1=$(worktree_key "$BASE_SHA" 9>&-)' \
-    '"$ROOT/tools/affected-gates.sh" "$AFFECTED_RANGE" --narrow "${ARGS[@]}" 9>&-' \
-    'sleep 0.2 9>&-' \
-    'rm -rf "$src" 9>&-' \
-    'mkdir -p "$src" 9>&-' \
-    'rm -f "$fifo" 9>&-' \
-    'mkfifo "$fifo" 9>&-' \
-    'rm -f "$fifo" "$ACTIVE_PIDF" 9>&-' \
-    'cat "$OUT/$side.split.err" >&2 9>&-' \
-    "'; } 9>&-)| \$({" \
-    'cat "$OUT/narrowed.txt" 9>&-' \
-    'cat "$OUT/narrowed.err" >&2 9>&-' \
-    'ptx_scan_md5=$(md5_of "$ROOT/tools/ptx-scan.sh" 9>&-)' \
-    'cp -R "$CACHE_ENTRY/base/." "$OUT/base/" 9>&-' \
-    'rm -rf "$CACHE_ENTRY" 9>&-' \
-    'cache_check "$CACHE_ENTRY" "$OUT/base-cache.key" "${BINS[@]}" 9>&-'
-  do
-    grep -qF "$site" <<< "$body" || miss=1
-  done
-  [ "$miss" = 0 ]; ok "lock: a launch while the lock is held closes fd 9" $?
   # the runner's build lines are the ptx-scan recipe's: a recipe edit that this script does not follow is red
   recipe=$(awk '/^ptx-scan /{f=1; next} f && /^[^ ]/{exit} f' "$ROOT/justfile")
   grep -qF "cargo oxide build --arch {{arch}} -- -p $PKG --features {{FEATURES}} --release --bin {{BIN}}" <<< "$recipe"; ok "drift: the ptx-scan recipe still builds with this runner's cargo oxide line" $?
@@ -862,12 +972,6 @@ self_test() {
   cat > "$w/tools/box.sh" <<'NARROW_STUB_EOF'
 #!/usr/bin/env bash
 here=$(cd "$(dirname "$0")/.." && pwd)
-# The stop's read-only call: its command runs in the fake remote dir, as box.sh's READONLY mode runs it on the box.
-if [ "${BLOOMERY_BOX_READONLY:-0}" = 1 ]; then
-  echo "readonly $BLOOMERY_REMOTE" >> "$STUB_LOG"
-  cd "$STUB_REMOTE/$(basename "$BLOOMERY_REMOTE")" || exit 66
-  exec bash -c "$*"
-fi
 side=head
 case $BLOOMERY_REMOTE in rb | *narrow-base) side=base ;; esac
 # STUB_FAIL_SIDE=<side> STUB_FAIL_RC=<rc>: that side's first box call ends <rc> (255: ssh lost the box) before it runs
@@ -875,6 +979,7 @@ case $BLOOMERY_REMOTE in rb | *narrow-base) side=base ;; esac
 if [ "${STUB_FAIL_SIDE:-}" = "$side" ] && { [ -n "${STUB_FAIL_ALWAYS:-}" ] || [ ! -e "$STUB_LOG.failed-$side" ]; }; then
   : > "$STUB_LOG.failed-$side"
   echo "$side $BLOOMERY_REMOTE failed rc=$STUB_FAIL_RC" >> "$STUB_LOG"
+  [ -z "${STUB_DELAYED:-}" ] || printf '%s\n' "$*" > "$STUB_LOG.delayed-command"
   cat > /dev/null
   exit "$STUB_FAIL_RC"
 fi
@@ -892,6 +997,21 @@ if [ -n "${STUB_BLOCK:-}" ]; then
   mkdir -p "$STUB_REMOTE/$(basename "$BLOOMERY_REMOTE")" && cd "$STUB_REMOTE/$(basename "$BLOOMERY_REMOTE")" || exit 70
   echo "$side $BLOOMERY_REMOTE blocked" >> "$STUB_LOG"
   printf 'exec sleep 60\n' | PATH="$STUB_BIN:$PATH" bash -c "$*"
+  exit $?
+fi
+# Execute the real remote supervisor on retry; the first command is released by the test only after this one finishes.
+if [ "$side" = head ] && [ -n "${STUB_DELAYED:-}" ]; then
+  for f in "$HOME"/.cache/bloomery/narrow-scan/.narrow-scan-*.stop; do
+    [ ! -e "$f" ] || basename "$f" .stop >> "$STUB_LOG.cancelled-id"
+  done
+  cat > /dev/null
+  bash -c "$*" <<'NARROW_RETRY_EOF'
+for f in "$HOME"/.cache/bloomery/narrow-scan/.narrow-scan-*.pid; do
+  [ ! -f "$f" ] || basename "$f" >> "$STUB_LOG.retry-id"
+done
+printf retry > "$STUB_LOG.retry-ran"
+printf '%s\n' '=== narrow-scan begin gate_x' 'ptx-scan: mod0 bundle=b bytes=1' '=== narrow-scan end gate_x rc=0'
+NARROW_RETRY_EOF
   exit $?
 fi
 rf=$(mktemp)
@@ -918,6 +1038,7 @@ NARROW_STUB_EOF
   chmod +x "$w/tools/"*.sh
   mkdir -p "$w/tools/nightly"
   cp "$ROOT/tools/nightly/units.sh" "$w/tools/nightly/units.sh"
+  cp "$ROOT/tools/gate-bound.sh" "$w/tools/gate-bound.sh"
   git -C "$w" init -q && git -C "$w" config user.email test@test && git -C "$w" config user.name test && git -C "$w" config commit.gpgsign false
   echo base > "$w/marker.txt"
   git -C "$w" add -A && git -C "$w" commit -q -m base
@@ -969,14 +1090,30 @@ NARROW_STUB_EOF
   # --keep-ptx and --scan-only. Unset, the run is the one above: no ptx dir, the affected run, the MANIFEST as before.
   [ ! -e "$t/wt-out/base/gate_x.ptx" ] && [ ! -e "$t/wt-out/head/gate_x.ptx" ] && ! grep -q 'keep_ptx' "$t/wt-out/MANIFEST" && grep -qx 'affected_rc=0' "$t/wt-out/MANIFEST" \
     && ! grep -q 'PTX_SCAN_KEEP' "$t/wt-out/runner.sh"; ok "keep off: no ptx dir, no runner keep line, the MANIFEST as before" $?
-  # ssh rc 255 on a side: the side runs once more (its recorded remote runner is ended first, by the READONLY stop call); a second
+  # ssh rc 255 on a side: the side runs once more (its recorded remote runner is ended first, by the control call); a second
   # 255 or any other code is not retried.
   mkdir -p "$t/remote/rh"
+  STUB_DELAYED=1 STUB_FAIL_SIDE=head STUB_FAIL_RC=255 wt_run "$t/delayed.log" "$wb" --worktree --out "$t/delayed-out"
+  [ "$rc" = 0 ] && [ "$(cat "$t/delayed.log.retry-ran" 2> /dev/null)" = retry ]
+  ok "retry: the real remote supervisor runs the replacement attempt" $?
+  local cancelled_id retry_id
+  cancelled_id=$(cat "$t/delayed.log.cancelled-id" 2> /dev/null)
+  retry_id=$(cat "$t/delayed.log.retry-id" 2> /dev/null)
+  [ -n "$cancelled_id" ] && [ -n "$retry_id" ] && [ "$cancelled_id" != "$retry_id" ]
+  ok "retry: actual attempts publish distinct cancellation identities" $?
+  rc=0
+  printf 'printf late > "%s"\n' "$t/delayed-ran" |
+    HOME="$t/home" bash -c "$(cat "$t/delayed.log.delayed-command")" > "$t/delayed-release.log" 2>&1 || rc=$?
+  [ "$rc" = 143 ] && [ ! -e "$t/delayed-ran" ]
+  ok "retry: the delayed cancelled attempt cannot start after its replacement finishes" $?
+  for want in 70 255; do
+    STUB_STOP_RC=$want STUB_FAIL_SIDE=head STUB_FAIL_RC=255 wt_run "$t/stop-$want.log" "$wb" --worktree --out "$t/stop-$want-out"
+    [ "$rc" = "$want" ] && [ "$(grep -c '^head rh ' "$t/stop-$want.log")" = 1 ] && [ ! -e "$t/stop-$want-out/MANIFEST" ]
+    ok "retry: control failure $want ends the CLI without starting another attempt" $?
+  done
   STUB_REMOTE=$t/remote STUB_FAIL_SIDE=head STUB_FAIL_RC=255 wt_run "$t/r255.log" "$wb" --worktree --out "$t/r255-out"
-  [ "$rc" = 0 ] && [ "$(grep -c '^head rh ' "$t/r255.log")" = 2 ] && grep -qx 'readonly rh' "$t/r255.log" \
-    && grep -qF "narrow-scan: head: ssh lost the box (rc 255); ending its recorded remote runner and running the side once more" <<< "$got" \
-    && grep -qx 'retried=head' "$t/r255-out/MANIFEST" && grep -q '^narrow-scan: done: .*(retried: head)' <<< "$got"
-  ok "retry: a side whose ssh ends rc 255 runs once more, names the retry and the run ends rc 0" $?
+  [ "$rc" = 0 ] && grep -qx 'retried=head' "$t/r255-out/MANIFEST"
+  ok "retry: a dropped side succeeds on retry and the MANIFEST records it" $?
   rm -f "$t/r255.log.failed-head"
   STUB_REMOTE=$t/remote STUB_FAIL_SIDE=head STUB_FAIL_RC=255 STUB_FAIL_ALWAYS=1 wt_run "$t/r255b.log" "$wb" --worktree --out "$t/r255b-out"
   [ "$rc" = 255 ] && [ "$(grep -c '^head rh ' "$t/r255b.log")" = 2 ] && grep -qF "narrow-scan: head: ssh lost the box again (rc 255): retried once, not again" <<< "$got"
@@ -1083,24 +1220,21 @@ NARROW_STUB_EOF
     got=$(HOME="$t/home" STUB_LOG="$log" NARROW_WAIT=0 bash "$tree/tools/narrow-scan.sh" "$@" 2>&1)
     rc=$?
   }
-  # The fake `timeout` execs the command, so the runner is one process (the real one ends its whole process group on a TERM).
-  mkdir -p "$t/fakebin" "$t/remote"
-  printf '%s\n' '#!/bin/sh' 'shift 2' 'exec "$@"' > "$t/fakebin/timeout"
-  chmod +x "$t/fakebin/timeout"
+  mkdir -p "$t/remote"
   : > "$t/stop-stub.log"
-  HOME="$t/home" STUB_LOG="$t/stop-stub.log" STUB_BLOCK=1 STUB_REMOTE="$t/remote" STUB_BIN="$t/fakebin" \
+  HOME="$t/home" STUB_LOG="$t/stop-stub.log" STUB_BLOCK=1 STUB_REMOTE="$t/remote" STUB_BIN="$t/remote-bin" \
     bash "$t/names/bloomery-aa/tools/narrow-scan.sh" "$wb" --worktree --out "$t/stop-out" > "$t/stop.log" 2>&1 &
   sp=$!
   pf='' k=0
   while [ -z "$pf" ] && [ "$k" -lt 100 ] && kill -0 "$sp" 2> /dev/null; do
-    for f in "$t"/remote/*/.narrow-scan-*.pid; do [ ! -e "$f" ] || pf=$f; done
+    for f in "$t"/home/.cache/bloomery/narrow-scan/.narrow-scan-*.pid; do [ ! -e "$f" ] || pf=$f; done
     [ -n "$pf" ] || sleep 0.2
     k=$((k + 1))
   done
-  [ -n "$pf" ]; ok "stop: the box command records the pid of the runner it started" $?
+  [ -n "$pf" ]; ok "stop: the box command publishes its supervisor pid" $?
   rp=$(cat "$pf" 2> /dev/null || echo 0)
   case $rp in '' | *[!0-9]*) rp=0 ;; esac
-  [ "$rp" -gt 1 ] && kill -0 "$rp" 2> /dev/null; ok "stop: … and that pid is the live runner" $?
+  [ "$rp" -gt 1 ] && kill -0 "$rp" 2> /dev/null; ok "stop: the recorded supervisor is alive" $?
   trk_run "$t/names/bloomery-aa" "$t/same.log" "$wb" "$wb" --out "$t/same-out"
   [ "$rc" = 75 ] && grep -qF "is held by pid $sp" <<< "$got"; ok "lock: a second run on the same pair is refused rc 75, naming the holder" $?
   trk_run "$t/names/bloomery-bb" "$t/bb.log" "$wb" "$wb" --out "$t/bb-out"
@@ -1115,8 +1249,6 @@ NARROW_STUB_EOF
   { wait "$sp"; src=$?; } 2> /dev/null
   [ "$gone" = 0 ] && [ "$src" = 143 ]; ok "stop: a TERM ends the run at once, rc 143" $?
   [ "$rp" -gt 1 ] && ! kill -0 "$rp" 2> /dev/null; ok "stop: the recorded remote pid is gone" $?
-  grep -qx "readonly ~/repo/bloomery-aa-narrow-base" "$t/stop-stub.log" && grep -qF "signalled the recorded remote pid $rp" "$t/stop.log"
-  ok "stop: it signalled exactly that pid, through a read-only call on the side's dir" $?
   # A directory glob misses the flock file, so the check takes that file. The probe's directory
   # carries this shell's pid (a subshell keeps $$); remove it after a take that succeeded.
   free=1
@@ -1163,8 +1295,8 @@ NARROW_STUB_EOF
     if kill -0 "$hp" 2> /dev/null; then kill -KILL "$hp" 2> /dev/null; gone=1; fi
     src=0
     { wait "$hp"; src=$?; } 2> /dev/null
-    [ "$gone" = 0 ] && [ "$src" = "$want" ] && grep -qF "no remote pid recorded in .narrow-scan-base-$hp.pid" "$t/hang-$sig.log"
-    ok "stop $sig: before any runner started it says so and ends rc $want" $?
+    [ "$gone" = 0 ] && [ "$src" = "$want" ]
+    ok "stop $sig: before any runner started it ends rc $want" $?
     [ "$hs" -gt 1 ] && ! kill -0 "$hs" 2> /dev/null; ok "stop $sig: … and the local box.sh is gone" $?
     hc=$(cat "$t/remote/hang-sleep.pid" 2> /dev/null || echo 0)
     case $hc in '' | *[!0-9]*) hc=0 ;; esac
@@ -1357,7 +1489,7 @@ for side in base head; do
     # ssh lost the box: the remote runner it started may still run, so it is ended by its recorded pid first; then the side runs
     # once more, in the same remote dir (its compiled crates kept). Once only: a second 255 ends the run.
     echo "narrow-scan: $side: ssh lost the box (rc 255); ending its recorded remote runner and running the side once more" >&2
-    remote_stop "$dir" ".narrow-scan-$side-$$.pid"
+    remote_stop "$dir" "$ACTIVE_RPIDF" || exit $?
     RETRIED=${RETRIED:+$RETRIED,}$side
     left=$((BOUND - (SECONDS - T0)))
     [ "$left" -ge 60 ] || die 124 "the bound of ${BOUND}s is spent before the $side side's retry: run again, the dirs keep their compiled crates"

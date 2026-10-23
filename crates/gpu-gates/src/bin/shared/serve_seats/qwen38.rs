@@ -23,9 +23,11 @@
 //! takes the first shard's place in every rule and plan, its tokenizer is the
 //! vocabulary, and the engine loads every card tensor from the folder's parts
 //! ([`Folder38`]) and reads its PLE rows where the folder stores them. Such a
-//! load holds every tensor on the stage card and runs no residency machine and
-//! no MTP draft: unset, the draft goes off naming the folder
-//! ([`draft_off_for`]); `BLOOMERY_DRAFT=mtp` is refused by name.
+//! load holds every tensor on the stage card and runs no residency machine.
+//! Unless `BLOOMERY_MTP_DRAFT` names a file, its MTP draft is the folder's own
+//! MTP layer, under the draft rule below; a folder without the layer turns the
+//! unset draft off naming the folder and refuses `BLOOMERY_DRAFT=mtp` by name
+//! ([`draft_off_for`]).
 //! The `plan` record, then the `load` and `capture` lines of the qwen4exp
 //! open, go to stderr as `generate_qwen3moe` prints them, then `listening on
 //! http://<addr>` once the model is loaded and the port is bound (`--port 0`
@@ -114,10 +116,15 @@
 //! as one pass of their windows (`app::mtp::pass_slots`, every slot's rows
 //! verified together, the round cut into passes at the body's
 //! `SlotRows::MAX_ROWS`), and its round of plain steps (a sampling or
-//! id-banning request's) a select and a step a row, each step told to its
-//! slot's draft; on a load that drafts nothing every request steps, and the
-//! round of the busy slots' steps runs as one pass of their rows
-//! (`GpuModel::step_slots`, each row bit for bit its step alone). The
+//! id-banning request's) as one pass of their rows, each row told to its
+//! slot's draft as its step alone would be (`rounds::step_rows_drafted`:
+//! every slot's waiting draft rows walked in one store walk before the
+//! pass), slot 0 among the busy slots or not (a pass that leaves it out
+//! leaves its waiting rows where its draft reads them,
+//! `Body38::enqueue_slots`). On a load that drafts nothing every request steps, and the
+//! round of the busy slots' steps runs as one pass of their rows (`GpuModel::step_slots`,
+//! each row bit for bit its step alone). A lookup load runs its rounds a
+//! select and a call a row. The
 //! sequences are switched by pointer exchange, and one draft is held a
 //! resident slot — its host state never moved, its device side parking
 //! with the sequence on every switch — so each request's tokens are its
@@ -240,7 +247,12 @@
 //! total under 5 a slot), each printed as a `load draft=off (<why>)` record
 //! after the `load` line (`no file at <path>[, <path>…]`, every place the pick looked), never a
 //! refusal; `BLOOMERY_DRAFT=mtp` set with stores that short is refused by
-//! name before the plan. Unset, the draft then yields to the context
+//! name before the plan. Unset, the draft also goes off under `--parallel`
+//! above 1, whatever its source ([`draft_for_slots`]: a `load draft=off`
+//! record naming the slots): a drafted load runs a round of sampled or
+//! id-banning requests as one pass, as a plain load does, and also walks
+//! every slot's draft over its row, one store walk beside the pass. Unset, the draft
+//! then yields to the context
 //! (`bloomery_levers::RungCost::of`, at [`ctx38`]'s caller): it goes off
 //! when the plan with it leaves a slot fewer positions than the plan
 //! without it, a set `--ctx-size` included, one `draft yield` record naming
@@ -261,10 +273,12 @@
 //! most and none while no width beats the plain step, `fixed` the draft's
 //! three ids whole — the greedy ids the plain server's, `pass_rows` 4;
 //! under `cost` a request's `mtp width` record prints at the slot's next
-//! prompt call. A sampling or id-banning request takes plain
-//! steps (the server's loop asks a pass only of a greedy request with no
-//! banned id), each step's row the target's, read before the step is told
-//! to the draft; its ids are the plain server's. A `load draft=mtp` line
+//! prompt call. A sampling or id-banning request drafts while its slot runs
+//! alone in the round, each kept id its draw from its verified row
+//! (`Seat::pass_sampled`; an id-banning request's draw sets the banned
+//! logits to -inf first), and takes plain steps beside another busy slot.
+//! Each step's row is the target's, read before the step is told to the
+//! draft; its ids are the plain server's. A `load draft=mtp` line
 //! follows the `load` line, then the `mtp head` record (which head, what
 //! picked it and why), and `/props`' `engine.draft` names the draft
 //! with its resident bytes as the card's `draft` class. Every other word of
@@ -383,9 +397,11 @@ use bloomery_levers::{
 use cuda_core::sys;
 use gguf::Split;
 use model::arch::models::Mixer;
+use model::arch::models::headpick::HeadSet;
 use model::arch::qwen35moe::head_list::{HeadPick, head_rows_of};
 use model::arch::qwen35moe::place::{
-    Experts, MtpInputs, PlaceError, PlanInputs, machine_for_experts, serve_ctx, tier_batch,
+    Experts, MtpInputs, PlaceError, PlanInputs, machine_for_experts, serve_ctx, tensor_places,
+    tier_batch, widen_card_route,
 };
 use model::placement::churn::ChurnPool;
 use model::placement::ctx_ask::{DEFAULT_SLOTS, Rule};
@@ -429,10 +445,6 @@ const USAGE: &str = "usage: bloomery-serve-qwen38 [--host H] [--port P] [--place
 /// offer, the draft's window): the plan every Qwen3.8 measurement ran at, and
 /// `generate_qwen3moe`'s default.
 const CTX: usize = 4096;
-
-/// The token every message of the chat template opens with: a prompt call is
-/// cut at the first and the last inside it.
-const MESSAGE_START: &str = "<|im_start|>";
 
 /// Why a cut leaves the MTP draft proposing nothing
 /// ([`SlotDrafts::turn_off`]): the body did not keep its side at the kept
@@ -592,12 +604,15 @@ impl Place38 {
     /// ([`POINT_ROWS_RESERVE`], one row a point, [`point_row_budget38`]), which the plan's host need, the NVMe tier's
     /// floor and its arena then count. The stage card carries the side model's reserve, the
     /// image encoder's when its tower sits there and, on a media load, a rotation table of `ctx`
-    /// rows for every slot ([`vision_seat::TABLES_RESERVE`]).
+    /// rows for every slot ([`vision_seat::TABLES_RESERVE`]). Its card route runs the whole
+    /// ubatch at once when the plan under `levers` keeps every card expert by it
+    /// ([`widen_card_route`]).
     fn machine(
         self,
         inputs: &PlanInputs,
         (ctx, ub): (u64, u64),
         experts: Experts,
+        levers: &PlanLevers,
         mtp: Option<&MtpInputs>,
         slots: usize,
     ) -> Result<Machine, GateError> {
@@ -631,7 +646,11 @@ impl Place38 {
                 .reserves
                 .push((POINT_ROWS_RESERVE.to_owned(), pinned(slots, bytes)));
         }
-        Ok(machine)
+        Ok(widen_card_route(machine, ub, |m| {
+            inputs
+                .plan_target(m, ctx, levers, experts, mtp, slots)
+                .map(|p| tensor_places(&p))
+        })?)
     }
 }
 
@@ -655,6 +674,9 @@ fn gdn_layers(inputs: &PlanInputs) -> usize {
 
 /// The MTP draft file at `path`, which `from` picked; an error names both.
 fn open_draft(path: &Path, from: DraftFrom) -> Result<Split, GateError> {
+    if path.is_dir() {
+        return super::qwen38_folder::draft(path);
+    }
     Split::open(path).map_err(|e| {
         format!(
             "open the MTP draft {} ({}): {e}",
@@ -873,7 +895,7 @@ fn draft38(
                 logits: false,
                 route_trace: levers.route_trace().is_some(),
                 file,
-                file_is_there: file.is_file(),
+                file_is_there: file.is_file() || file.is_dir(),
                 looked,
                 need: window_positions(slots),
                 ctx,
@@ -895,8 +917,9 @@ fn draft38(
 
 /// [`draft38`]'s answer `(mtp, off)` on a load that carries no MTP draft, for the reason `why`
 /// ([`Draft38Off::Media`]: an image load, whose sequences the engine's `GpuModel::enable_media`
-/// refuses a draft beside; [`Draft38Off::Folder`]: a checkpoint folder's, which reads no MTP
-/// layers): `BLOOMERY_DRAFT=mtp` is refused by name; the other words keep the plain path, `off`
+/// refuses a draft beside; [`Draft38Off::Folder`]: a checkpoint folder without an MTP layer;
+/// [`Draft38Off::FolderMtp`]: one whose MTP layer the draft does not read): `BLOOMERY_DRAFT=mtp`
+/// is refused by name; the other words keep the plain path, `off`
 /// as set, and a draft the rule would have run goes off with `why`, while a reason it was
 /// already off for stands. The lever words that name the draft are then refused by the seat's
 /// own rule (`refuse_mtp_levers`).
@@ -906,15 +929,14 @@ pub(crate) fn draft_off_for(
     (mtp, off): (bool, Option<Draft38Off>),
 ) -> Result<(bool, Option<Draft38Off>), GateError> {
     if word == Some("mtp") {
-        let load = match why {
-            Draft38Off::Folder => {
-                "with a checkpoint folder: the folder's load reads no MTP layers; \
-                                   serve a prepared split with its draft"
+        let load = match &why {
+            Draft38Off::Folder => "with a checkpoint folder that holds no MTP layer".to_string(),
+            Draft38Off::FolderMtp { why } => {
+                format!("with a checkpoint folder whose MTP layer the draft does not read ({why})")
             }
-            _ => {
-                "with --mmproj: an image load carries no MTP draft (the media load refuses it); \
+            _ => "with --mmproj: an image load carries no MTP draft (the media load refuses it); \
                   drop --mmproj"
-            }
+                .to_string(),
         };
         return Err(format!(
             "BLOOMERY_DRAFT=mtp {load}, or set BLOOMERY_DRAFT=off (unset, the draft goes off by \
@@ -927,6 +949,47 @@ pub(crate) fn draft_off_for(
     } else {
         (false, off)
     })
+}
+
+/// [`draft38`]'s answer `(mtp, off)` on a load whose draft is the checkpoint folder's own MTP
+/// layer, `layer` as the folder prepared it (`Ok(None)`: the folder holds none; `Err`: the
+/// preparation's refusal): a prepared layer drafts when `reads`, the draft's reader, takes it,
+/// asked only while the draft is on; none, or one the preparation or the reader refuses, is
+/// [`draft_off_for`]'s ([`Draft38Off::Folder`], [`Draft38Off::FolderMtp`]).
+pub(crate) fn folder_draft_for(
+    layer: &Result<Option<Split>, String>,
+    reads: impl FnOnce(&Split) -> Result<(), GateError>,
+    word: Option<&str>,
+    (mtp, off): (bool, Option<Draft38Off>),
+) -> Result<(bool, Option<Draft38Off>), GateError> {
+    let why = match layer {
+        Ok(None) => Draft38Off::Folder,
+        Err(why) => Draft38Off::FolderMtp { why: why.clone() },
+        Ok(Some(_)) if !mtp => return Ok((mtp, off)),
+        Ok(Some(layer)) => match reads(layer) {
+            Ok(()) => return Ok((mtp, off)),
+            Err(e) => Draft38Off::FolderMtp { why: e.to_string() },
+        },
+    };
+    draft_off_for(why, word, (mtp, off))
+}
+
+/// [`draft38`]'s answer `(mtp, off)` with `slots` resident sequences, whatever the draft's
+/// source (a GGUF draft file or a checkpoint folder's MTP layer): a draft the unset rule would
+/// have run goes off on more than one slot ([`Draft38Off::Slots`]), as a drafted load walks every
+/// slot's draft over its row of a round of sampled or id-banning requests, one store walk beside
+/// the round's one pass (`rounds::step_rows_drafted`); a set word runs as set, and a reason the
+/// draft was already off for stands.
+pub(crate) fn draft_for_slots(
+    slots: usize,
+    word: Option<&str>,
+    (mtp, off): (bool, Option<Draft38Off>),
+) -> (bool, Option<Draft38Off>) {
+    if mtp && word.is_none() && slots > 1 {
+        (false, Some(Draft38Off::Slots { slots }))
+    } else {
+        (mtp, off)
+    }
 }
 
 /// The residency the load of `plan` at `place` runs: `set` (the word and
@@ -954,7 +1017,7 @@ fn residency38_at(
 /// The plans the seat can load, by context: the file's inputs at `place`
 /// under the expert rule, the placement levers and the draft, every
 /// per-sequence term counted `slots` times
-/// ([`PlanInputs::plan_with_slots`]).
+/// ([`PlanInputs::plan_target`]).
 struct Plans<'a> {
     inputs: &'a PlanInputs,
     place: Place38,
@@ -978,30 +1041,18 @@ impl Plans<'_> {
             self.inputs,
             (ctx, u64::try_from(ub)?),
             self.experts,
+            self.levers,
             self.mtp,
             self.slots,
         )?;
-        match self.mtp {
-            None => {
-                self.inputs.plan_with_slots(
-                    &machine,
-                    ctx,
-                    self.levers,
-                    self.experts,
-                    self.slots,
-                )?;
-            }
-            Some(mi) => {
-                self.inputs.plan_mtp_with_slots(
-                    &machine,
-                    ctx,
-                    self.levers,
-                    mi,
-                    self.experts,
-                    self.slots,
-                )?;
-            }
-        }
+        self.inputs.plan_target(
+            &machine,
+            ctx,
+            self.levers,
+            self.experts,
+            self.mtp,
+            self.slots,
+        )?;
         Ok(())
     }
 
@@ -1026,20 +1077,18 @@ impl Plans<'_> {
             self.inputs,
             (c, u64::try_from(ub)?),
             self.experts,
+            self.levers,
             self.mtp,
             self.slots,
         )?;
-        let plan = match self.mtp {
-            None => {
-                self.inputs
-                    .plan_with_slots(&machine, c, self.levers, self.experts, self.slots)?
-            }
-            Some(mi) => {
-                self.inputs
-                    .plan_mtp_with_slots(&machine, c, self.levers, mi, self.experts, self.slots)?
-                    .plan
-            }
-        };
+        let plan = self.inputs.plan_target(
+            &machine,
+            c,
+            self.levers,
+            self.experts,
+            self.mtp,
+            self.slots,
+        )?;
         let lever = match set {
             Some((r, word)) => Lever38::Set(r, word),
             None => Lever38::Unset(residency38_unset(self.feed.residency_at(self.place))),
@@ -1289,13 +1338,14 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     let (draft_path, draft_from) = draft_file(levers.mtp_draft(), &path);
     let draft_looked = draft_places(&path);
     // A checkpoint folder is opened once, here: its header plans as a split's first shard
-    // does, its tokenizer is the vocabulary, and the engine thread loads its parts.
-    let (split, folder, folder_tok) = if path.is_dir() {
+    // does, its tokenizer is the vocabulary, its MTP layer is the draft's own, and the engine
+    // thread loads its parts.
+    let (split, folder, folder_tok, folder_draft) = if path.is_dir() {
         let f = super::qwen38_folder::open(&path)?;
-        (f.header, Some(f.parts), Some(f.tokenizer))
+        (f.header, Some(f.parts), Some(f.tokenizer), Some(f.draft))
     } else {
         let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
-        (split, None, None)
+        (split, None, None, None)
     };
     // The stage card's first open is made before the room is read
     // (`Gpu::hold_card`: its context and the bundle), so the plans' room has
@@ -1334,10 +1384,23 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         &draft_looked,
         &inputs,
     )?;
-    let (mtp, draft_off) = match folder {
-        Some(_) => draft_off_for(Draft38Off::Folder, levers.draft(), (mtp, draft_off))?,
+    // The folder's own MTP layer drafts when the draft's reader takes it, whatever head the
+    // load picks below; none, or one the preparation or the reader refuses, refuses a set `mtp`
+    // and turns an unset draft off before the image seat reads the draft's word, the target
+    // served as stored.
+    let (mtp, draft_off) = match folder_draft.as_ref().filter(|_| draft_path == path) {
+        Some(layer) => folder_draft_for(
+            layer,
+            |d| {
+                MtpInputs::read(d, &split, &inputs, HeadSet::Full)?;
+                Ok(())
+            },
+            levers.draft(),
+            (mtp, draft_off),
+        )?,
         None => (mtp, draft_off),
     };
+    let (mtp, draft_off) = draft_for_slots(slots, levers.draft(), (mtp, draft_off));
     // A draft lever set on a server that drafts nothing is refused, with
     // why — asked once the yield below has said its last word, so a draft
     // the plan turns off refuses them the same as one the rule did.
@@ -1397,19 +1460,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         a.template_file.path(),
         "qwen3.8",
     )?;
-    // The message start the server cuts prompt calls at, when both the
-    // vocabulary and the template have it.
-    let has_start = tok
-        .special_tokens()
-        .iter()
-        .any(|&id| tok.text(id) == Some(MESSAGE_START));
-    let in_template = template.contains(MESSAGE_START);
-    let vocab = Vocab::new(tok)?;
-    let vocab = Arc::new(if has_start && in_template {
-        vocab.with_user_start(MESSAGE_START)?
-    } else {
-        vocab
-    });
+    let vocab = Arc::new(Vocab::new(tok)?.with_chat_template(&template)?);
 
     // The plan record, and `/props` from the same plan the load runs by:
     // under the draft `plan_mtp_with`'s, its draft's card bytes (granules,
@@ -1520,7 +1571,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         let ctx = ctx38(&plans, a.ctx)?.ctx;
         let at = u64::try_from(ctx)?;
         let ub = u64::try_from(ubatch_for(ctx)?)?;
-        let machine = place.machine(&inputs, (at, ub), experts, None, slots)?;
+        let machine = place.machine(&inputs, (at, ub), experts, &plan_levers, None, slots)?;
         let plan = inputs.plan_with_slots(&machine, at, &plan_levers, experts, slots)?;
         Ok(vision_seat::Cost::of(&plan, at))
     })?;
@@ -1690,10 +1741,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         mtp_inputs = None;
     }
     eprintln!("{}", rule.line);
-    eprint_noted(&format!(
-        "{} message_start={MESSAGE_START} in_vocab={has_start} in_template={in_template}",
-        cache.line()
-    ));
+    eprint_noted(&cache.line());
     // The rounds of several slots, decided once (the open takes it through
     // `SeatArgs`): one pass of the busy rows, a slot at a time beside an
     // expert tier card ([`Place38::tiered`]).
@@ -1730,6 +1778,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         &inputs,
         (u64::try_from(ctx)?, u64::try_from(ub)?),
         experts,
+        &plan_levers,
         mtp_inputs.as_ref(),
         slots,
     )?;
@@ -1756,20 +1805,8 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
             (with.plan, bytes)
         }
     };
-    // The one-column rule holds at the plan the load runs: the cache's
-    // bound only lowers the context the rule read, which leaves the card
-    // more experts and the host fewer, so a paged load whose slots step
-    // together is the seat's own breach. The rule serves the asked count,
-    // so several slots that step together are that breach.
-    if plan.host.nvme_arena_bytes > 0 && pass.together(slots) {
-        return Err(format!(
-            "the load's plan pages host experts through the NVMe tier's {} B RAM arena at \
-             {slots} slots, the draft {}: the one-column rule read another plan",
-            plan.host.nvme_arena_bytes,
-            if mtp { "on" } else { "off" }
-        )
-        .into());
-    }
+    // PIN(2026-10-23): the planner's slot-aware arena floor replaces the one-column
+    // refusal; a paged pass reads every slot's experts through the same arena.
     let line = Record::new(&record::PLAN38)
         .w("place", a.place.name())
         .w("card", machine.cards[0].name.as_str())
@@ -1911,7 +1948,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
 /// The terms of a plan that the seat's records and rules read: the stage
 /// card's experts a layer and in all, the host leg's experts, the routed
 /// bytes it holds resident and on the NVMe tier, that tier's RAM arena (the
-/// one-column rule's term), the tables the host holds and the experts the
+/// paged rule's term), the tables the host holds and the experts the
 /// tier cards hold. The main thread records them from the plan it ruled by;
 /// the engine thread holds the plan it loads by to them ([`Q38::open`]).
 #[derive(Clone, Debug)]
@@ -2076,12 +2113,13 @@ struct Q38 {
     /// the fallback loop.
     one_pass: bool,
     /// Whether a round of several slots' plain steps runs as one pass of the
-    /// busy rows ([`Q38::step_slots`]): a load that drafts nothing, of more
-    /// than one resident slot, with no expert tier card. A drafted load's
-    /// plain rounds — a sampling or id-banning request's steps — keep the
-    /// fallback loop: each of its steps is told to its slot's draft
-    /// ([`SlotDrafts::step_with_row`]), which a pass of plain steps does
-    /// not do.
+    /// busy rows ([`Q38::step_slots`]): a load of more than one resident
+    /// slot with no expert tier card, plain or MTP-drafted. A drafted load's
+    /// plain rounds (a sampling or id-banning request's steps) tell each row
+    /// to its slot's draft around the pass
+    /// ([`super::rounds::step_rows_drafted`]). A lookup load keeps the
+    /// fallback loop: its contexts follow each step at the selected slot's
+    /// position.
     step_pass: bool,
     /// [`Seat::step_stats`]: the `BLOOMERY_STEP_STATS` the binary parsed.
     stats: bool,
@@ -2145,7 +2183,9 @@ impl Q38 {
         let opened: Duration;
         let mut m = match a.mtp {
             false => {
-                let machine = a.place.machine(&inputs, ctx_ub, a.experts, None, a.slots)?;
+                let machine =
+                    a.place
+                        .machine(&inputs, ctx_ub, a.experts, &a.plan_levers, None, a.slots)?;
                 check_reserve(&machine, a.slots, ckpt)?;
                 let plan = inputs.plan_with_slots(
                     &machine,
@@ -2175,9 +2215,14 @@ impl Q38 {
                     .ok_or("a drafted load with no head picked")?;
                 let draft = open_draft(&a.draft_path, a.draft_from)?;
                 let mtp = MtpInputs::read(&draft, model.header(), &inputs, head.rows.clone())?;
-                let machine = a
-                    .place
-                    .machine(&inputs, ctx_ub, a.experts, Some(&mtp), a.slots)?;
+                let machine = a.place.machine(
+                    &inputs,
+                    ctx_ub,
+                    a.experts,
+                    &a.plan_levers,
+                    Some(&mtp),
+                    a.slots,
+                )?;
                 check_reserve(&machine, a.slots, ckpt)?;
                 let plan = inputs.plan_mtp_with_slots(
                     &machine,
@@ -2365,7 +2410,7 @@ impl Q38 {
             residency,
             break_even: a.mtp.then(|| break_even_of(a.place)),
             one_pass: pass_of_slots && a.mtp,
-            step_pass: pass_of_slots && !a.mtp && !a.lookup,
+            step_pass: pass_of_slots && !a.lookup,
             stats: a.stats,
             census,
             branch: std::cell::RefCell::new(vec![None; a.slots]),
@@ -2793,12 +2838,14 @@ impl Seat for Q38 {
 
     /// One round of several slots' plain steps
     /// ([`super::rounds::step_round`]): while the open decided so
-    /// ([`Q38::step_pass`], a plain load) one pass of the busy rows through
+    /// ([`Q38::step_pass`]) one pass of the busy rows through
     /// [`super::rounds::step_rows_one_pass`] — laid in slot order, each
-    /// row's answer and lent logits row its own, slot 0 left selected — and
-    /// the call's `residency pass` records after it, else the fallback
-    /// (`bind::step_rows_in_turn`: a select and a step a row, each step told
-    /// to its slot's draft on a drafted load).
+    /// row's answer and lent logits row its own, slot 0 left selected; on
+    /// an MTP-drafted load each row told to its slot's draft as its step
+    /// would be ([`super::rounds::step_rows_drafted`]) — and the call's
+    /// `residency pass` records after it. A round that leaves slot 0 out
+    /// leaves its waiting hidden rows where its draft reads them
+    /// (`Body38::enqueue_slots`).
     fn step_slots(&mut self, rows: &mut [SlotStep]) -> Result<(), String> {
         let one_pass = self.step_pass;
         super::rounds::step_round(
@@ -2811,7 +2858,11 @@ impl Seat for Q38 {
                 for r in rows.iter() {
                     q.before_call_at(r.slot);
                 }
-                super::rounds::step_rows_one_pass(&mut q.s, rows)
+                if q.drafts.mtp() {
+                    super::rounds::step_rows_drafted(&mut q.s, rows, &mut q.drafts)
+                } else {
+                    super::rounds::step_rows_one_pass(&mut q.s, rows)
+                }
             },
             Q38::print_passes,
         )
@@ -2824,8 +2875,10 @@ impl Seat for Q38 {
     /// round cut into passes at the body's `SlotRows::MAX_ROWS`, a slot
     /// whose draft a cut turned off stepped alone before them, and what the
     /// fallback loop's per-row `pass` would print at its slot printed first
-    /// — else the fallback (a select and a pass a row). The open decides
-    /// once, so a load that cannot run one pass never tries it at run time:
+    /// else the fallback (a select and a pass a row). A round that leaves
+    /// slot 0 out leaves its refresh where its draft reads it
+    /// (`Body38::enqueue_slots`). The open decides which loads can run one pass,
+    /// so a load without that support never tries it at run time:
     /// a refusal on either path is the server's to die on, never a
     /// fallback. The rows are distinct slots below [`Seat::slots`] (the
     /// engine's own named refusal), a slot whose draft skips rides the pass
@@ -2848,6 +2901,7 @@ impl Seat for Q38 {
                     rows,
                     &mut q.drafts,
                     <Body38 as MtpBody>::WIDTH,
+                    0..=<Body38 as MtpBody>::WIDTH,
                 )
             },
             Q38::print_passes,
@@ -2939,6 +2993,10 @@ impl Seat for Q38 {
             device: None,
         });
         p
+    }
+
+    fn snapshot_size(&mut self) -> Result<Option<u64>, GateError> {
+        Ok(Some(self.s.model_mut().seq_save_bytes()?))
     }
 
     /// The sequence state (`GpuModel::seq_save`, the draft's rows within it)

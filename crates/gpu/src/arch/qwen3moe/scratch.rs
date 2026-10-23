@@ -18,7 +18,6 @@ use super::body::KvQ8;
 use super::image::MediaRows;
 use super::plan::Flash;
 use super::router::{MAX_TOKENS, RouterDims, RouterOut};
-use super::ubatch::UBATCH;
 use super::wide::{GEMV_COLS, Wide};
 use crate::GpuError;
 use crate::fault::FaultSink;
@@ -29,6 +28,7 @@ use crate::flash_gqa::{
 use crate::flash_gqa_prefill::{FlashGqaPrefill, GqaPrefillArgs, GqaPrefillQ8Args};
 use crate::gemm::GEMM_MAX_SLOTS;
 use crate::linear::{self, LinearShape};
+use chain::arch::qwen3moe::router::ubatch_at;
 
 pub(super) use crate::recur::{RecStore, fresh_stamps, stamps_at};
 use crate::rope_neox::{
@@ -212,12 +212,11 @@ impl Dims {
         ))
     }
 
-    /// The most tokens a ubatch may hold: the router's
-    /// ([`RouterDims::ubatch`]), or for a dense chain at most [`UBATCH`] and
-    /// one slot each in one GEMM route table.
+    /// The most tokens a ubatch may hold in one GEMM route table: at the
+    /// router's slots a token ([`RouterDims::ubatch`]), or a dense chain's
+    /// one.
     pub(super) fn ubatch_most(&self) -> usize {
-        self.router
-            .map_or(UBATCH.min(GEMM_MAX_SLOTS), |r| r.ubatch())
+        ubatch_at(self.slots(), GEMM_MAX_SLOTS)
     }
 }
 
@@ -441,7 +440,10 @@ impl KvPlanes {
     /// [`enqueue_head_norm_neox_append`](crate::rope_neox::RopeNeoxKernels::enqueue_head_norm_neox_append)'s
     /// f16 launch, or its q8_0 twin's on a q8_0 cache. Asynchronous,
     /// allocation-free, capturable.
-    pub(super) fn append_128(
+    ///
+    /// # Safety
+    /// Among the first `s.m` positions in `s.pos`, those below `s.ctx` are pairwise distinct.
+    pub(super) unsafe fn append_128(
         &mut self,
         neox: &RopeNeoxKernels,
         stream: &CudaStream,
@@ -463,48 +465,54 @@ impl KvPlanes {
             fault,
         } = s;
         match self {
-            KvPlanes::F16 { k: kc, v: vc } => neox.enqueue_head_norm_neox_append(
-                stream,
-                NeoxArgs {
-                    q,
-                    k,
-                    v,
-                    gq,
-                    gk,
-                    table,
-                    pos,
-                    eps,
-                    n_head,
-                    n_kv,
-                    ctx,
-                    m,
-                    fault,
-                    cache_k: kc,
-                    cache_v: vc,
-                },
-            ),
-            KvPlanes::Q8 { kq, kd, vq, vd } => neox.enqueue_head_norm_neox_append_q8(
-                stream,
-                NeoxQ8Args {
-                    q,
-                    k,
-                    v,
-                    gq,
-                    gk,
-                    table,
-                    pos,
-                    eps,
-                    n_head,
-                    n_kv,
-                    ctx,
-                    m,
-                    fault,
-                    kq,
-                    kd,
-                    vq,
-                    vd,
-                },
-            ),
+            // SAFETY: the enclosing helper requires distinct cache-valid positions per sequence.
+            KvPlanes::F16 { k: kc, v: vc } => unsafe {
+                neox.enqueue_head_norm_neox_append(
+                    stream,
+                    NeoxArgs {
+                        q,
+                        k,
+                        v,
+                        gq,
+                        gk,
+                        table,
+                        pos,
+                        eps,
+                        n_head,
+                        n_kv,
+                        ctx,
+                        m,
+                        fault,
+                        cache_k: kc,
+                        cache_v: vc,
+                    },
+                )
+            },
+            // SAFETY: the enclosing helper requires distinct cache-valid positions per sequence.
+            KvPlanes::Q8 { kq, kd, vq, vd } => unsafe {
+                neox.enqueue_head_norm_neox_append_q8(
+                    stream,
+                    NeoxQ8Args {
+                        q,
+                        k,
+                        v,
+                        gq,
+                        gk,
+                        table,
+                        pos,
+                        eps,
+                        n_head,
+                        n_kv,
+                        ctx,
+                        m,
+                        fault,
+                        kq,
+                        kd,
+                        vq,
+                        vd,
+                    },
+                )
+            },
         }
     }
 
@@ -954,7 +962,10 @@ impl KvPlanes {
     /// ([`RopeNeoxKernels::enqueue_head_norm_neox_append_rows`]): each row
     /// [`KvPlanes::append_128`]'s row over its own planes. Asynchronous,
     /// allocation-free, capturable.
-    pub(super) fn append_128_rows(
+    ///
+    /// # Safety
+    /// Within each sequence in `table`, cache-valid positions in `s.pos` are pairwise distinct.
+    pub(super) unsafe fn append_128_rows(
         neox: &RopeNeoxKernels,
         stream: &CudaStream,
         table: &RowTable<'_>,
@@ -975,25 +986,28 @@ impl KvPlanes {
             m,
             fault,
         } = s;
-        neox.enqueue_head_norm_neox_append_rows(
-            stream,
-            table,
-            NeoxRowsArgs {
-                q,
-                k,
-                v,
-                gq,
-                gk,
-                table: rope,
-                pos,
-                eps,
-                n_head,
-                n_kv,
-                ctx,
-                m,
-                fault,
-            },
-        )
+        // SAFETY: the enclosing helper requires distinct cache-valid positions per sequence.
+        unsafe {
+            neox.enqueue_head_norm_neox_append_rows(
+                stream,
+                table,
+                NeoxRowsArgs {
+                    q,
+                    k,
+                    v,
+                    gq,
+                    gk,
+                    table: rope,
+                    pos,
+                    eps,
+                    n_head,
+                    n_kv,
+                    ctx,
+                    m,
+                    fault,
+                },
+            )
+        }
     }
 
     /// The head-128 tensor-core decode flash of `s`'s rows over several
@@ -1165,7 +1179,7 @@ impl ApartRows {
             .map(|b| b.num_bytes())
             .sum::<usize>()
             + self.sel.num_bytes()
-            + self.act.iter().map(act_bytes).sum::<usize>()
+            + self.act.iter().map(Q8Act::device_bytes).sum::<usize>()
     }
 }
 
@@ -1994,13 +2008,8 @@ impl Arena {
             + self.cols.as_ref().map_or(0, DeviceBuffer::num_bytes)
             + self.apart.as_ref().map_or(0, ApartRows::bytes)
             + self.route.bytes()
-            + acts.map(act_bytes).sum::<usize>()
+            + acts.map(Q8Act::device_bytes).sum::<usize>()
     }
-}
-
-/// Device bytes of one quantized activation's planes.
-fn act_bytes(a: &Q8Act) -> usize {
-    a.q3.num_bytes() + a.q4.num_bytes() + a.q6.num_bytes() + a.s8.num_bytes() + a.d8.num_bytes()
 }
 
 #[cfg(test)]

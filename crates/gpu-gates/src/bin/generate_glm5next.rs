@@ -100,13 +100,17 @@
 //! two rows is captured before the prompt (a `capture` line of its nodes).
 //! Each kept token prints its `step`
 //! line and, under `--time`, a `time step` line (its window's wall over the
-//! window's kept rows, the row a plain step's wall compares with; `--warm W`
-//! marks the first W), and each window a `time pass` line (its wall from the
-//! proposal through the commit, the rows it kept, `kind=mtp`, or `plain` for
+//! delivered tokens, including the full wall when the token limit cuts the
+//! window; `--warm W` marks the first W), and each window a `time pass` line
+//! (its wall from the proposal through the commit, the rows it kept, `kind=mtp`, or `plain` for
 //! a window with no proposal). The feed's `time prompt` wall holds the
 //! draft's store walks over the prompt's units. The `mtp summary` line counts the proposals
-//! and the windows by rows kept; the `SMOKE` footer is over the kept
-//! positions past the warm ones. `lookup` and `dspark` are refused by name,
+//! and the windows by rows kept, and rates all their positions over all their
+//! wall time. The `SMOKE` footer rates delivered tokens past the warm ones
+//! over the full wall of every pass that delivered a counted token. A pass
+//! crossing the warm boundary is counted in full and is not marked warm;
+//! its counted `time step` rows share its wall and its warm rows carry zero.
+//! Token 0 belongs to the prompt time. `lookup` and `dspark` are refused by name,
 //! as are `--pair`, `--logits` and the route trace beside the draft. Unset or
 //! `off`, the load, the plan and every step are the plain run's.
 //!
@@ -213,12 +217,17 @@ mod glm_place;
 mod gen_slots;
 
 #[cfg(feature = "glm5next")]
+#[path = "shared/gen_time.rs"]
+mod gen_time;
+
+#[cfg(feature = "glm5next")]
 mod cli {
     use std::net::SocketAddr;
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
     use crate::gen_slots;
+    use crate::gen_time::Windows;
     use crate::glm_place;
     use app::arch::glm5next::{GlmCfg, open_nextn, open_pair, open_resident, open_resident_slots};
     use app::mtp::MtpDraft;
@@ -1257,15 +1266,7 @@ mod cli {
         }
     }
 
-    /// What the drafted generation's windows kept: every kept token at its
-    /// position with its window's wall over the window's kept rows, and every
-    /// window's proposal, kept rows and wall in ms.
-    struct Windows {
-        kept: Vec<(u32, u32, f64)>,
-        passes: Vec<(bool, usize, usize, f64)>,
-    }
-
-    impl PassSink<Session<Body>> for Windows {
+    impl PassSink<Session<Body>> for Windows<VERIFY_ROWS> {
         type Error = GateError;
 
         fn begin(&mut self, _: &Session<Body>) -> Result<(), GateError> {
@@ -1280,9 +1281,8 @@ mod cli {
             wall: Duration,
         ) -> Result<(), GateError> {
             let ms = wall.as_secs_f64() * 1e3;
-            let per = ms / c.kept as f64;
             for (r, &token) in (0u32..).zip(tokens) {
-                self.kept.push((c.pos + r, token, per));
+                self.kept.push((c.pos + r, token));
             }
             self.passes.push((c.proposed, c.kept, c.rows, ms));
             Ok(())
@@ -1327,7 +1327,7 @@ mod cli {
             .u("fed", a.ids.len())
             .f("feed_s", feed.as_secs_f64())
             .print();
-        let mut sink = Windows {
+        let mut sink = Windows::<VERIFY_ROWS> {
             kept: Vec::with_capacity(a.n_gen + VERIFY_ROWS),
             passes: Vec::with_capacity(a.n_gen),
         };
@@ -1345,6 +1345,7 @@ mod cli {
         // Generated token i >= 1 is kept token i - 1; the last window may
         // keep one past -n.
         let rows = &sink.kept[..a.n_gen - 1];
+        let times = sink.times(rows.len(), a.warm);
         if a.timed {
             let ms = feed.as_secs_f64() * 1e3;
             Record::new(&record::TIME_PROMPT)
@@ -1355,7 +1356,7 @@ mod cli {
                 .w("kind", a.prefill.name())
                 .print();
         }
-        for (i, &(pos, token, per)) in (1usize..).zip(rows) {
+        for (i, (&(pos, token), &per)) in (1usize..).zip(rows.iter().zip(&times.step_ms)) {
             Record::new(&record::STEP)
                 .u("i", i)
                 .u("pos", pos)
@@ -1370,62 +1371,23 @@ mod cli {
             }
         }
         if a.timed {
-            // Pass k's first kept position is generated token `at`.
-            let mut at = 1;
-            for (k, &(proposed, kept, _, ms)) in (1usize..).zip(&sink.passes) {
-                Record::new(&record::TIME_PASS)
-                    .u("i", k)
-                    .flag("warm", at <= a.warm)
-                    .f("ms", ms)
-                    .u("positions", kept)
-                    .w("kind", if proposed { "mtp" } else { "plain" })
-                    .print();
-                at += kept;
+            for line in sink.pass_times(a.warm) {
+                line.print();
             }
         }
         Record::new(&record::TOKENS)
             .list("tokens", &out.tokens[..a.n_gen])
             .print();
-        let counted: Vec<f64> = rows[a.warm.min(rows.len())..].iter().map(|r| r.2).collect();
-        let counted_ms: f64 = counted.iter().sum();
-        let rate = counted.len() as f64 * 1e3 / counted_ms;
-        let mut kept = [0u64; VERIFY_ROWS];
-        let mut widths = [0u64; VERIFY_ROWS];
-        for &(_, k, rows, _) in &sink.passes {
-            kept[k - 1] += 1;
-            widths[rows - 1] += 1;
-        }
         let proposals = sink.passes.iter().filter(|p| p.0).count();
         record::mtp_stats(
-            Record::new(&record::MTP_SUMMARY)
-                .u("proposals", proposals)
-                .list("kept", &kept)
-                .list("widths", &widths)
-                .u("positions", sink.passes.iter().map(|p| p.1).sum::<usize>())
-                .u("passes", sink.passes.len())
-                .f("tok/s(positions)", rate),
+            sink.summary(&times),
             spec.draft().stats().as_ref(),
             proposals,
         )?
         .print();
         if a.timed {
-            let mut sorted = counted.clone();
-            sorted.sort_by(f64::total_cmp);
-            let p50 = sorted[sorted.len() / 2];
-            let mean = counted_ms / counted.len() as f64;
-            Record::new(&record::SMOKE)
-                .w("mode", mode_name(a.mode))
-                .w("place", a.place)
-                .u("prompt_tokens", a.ids.len())
-                .u("depth", a.ids.len())
-                .u("generated", a.n_gen)
-                .u("warm", a.warm)
-                .u("steps", counted.len())
-                .f("p50_ms", p50)
-                .f("mean_ms", mean)
-                .f("tok/s(p50)", 1e3 / p50)
-                .u("positions", counted.len())
-                .f("tok/s(positions)", rate)
+            times
+                .smoke(mode_name(a.mode), a.place, a.ids.len(), a.n_gen, a.warm)
                 .print();
         }
         for (kind, r) in s

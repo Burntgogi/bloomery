@@ -5,6 +5,9 @@
 //! output bit for bit holds it to the same transcription (`gate_gemm`'s
 //! `g32_*` cases, `gate_glm5next_gemm`).
 
+use crate::rounding::scaled_sum;
+use gguf::quant::{KVALUES_MXFP4, QuantError, ue4m3_to_f32_half};
+
 /// A `GemmAct32`'s three planes on the host, in the device layout: codes,
 /// scales, sums.
 pub type Planes32 = (Vec<u32>, Vec<f32>, Vec<i32>);
@@ -81,8 +84,8 @@ pub fn host_act(x: &[f32], k: usize, n: usize) -> (HostAct, Planes32) {
 /// column `col` of `a`, three ways: the contract's transcription (per block
 /// the exact i32 dot, then `acc = fma(d_a, d_w·f32(isum), acc)`, the min
 /// term `fma(m_w, f32(s_a), ·)` inside for Q5_1, from 0, blocks in
-/// increasing k), the f64 value and its band's magnitude
-/// `Σ_b (|D_b| + |M_b|)`.
+/// increasing k, each step a [`scaled_sum`] into the F32 accumulator), the
+/// f64 value and its band's magnitude `Σ_b (|D_b| + |M_b|)`.
 #[must_use]
 pub fn dot32(
     wq: &[i8],
@@ -104,9 +107,13 @@ pub fn dot32(
             .sum();
         let dw = wd[b];
         let (da, sa) = (a.d[col * kb + b], a.s[col * kb + b]);
-        let t = dw * isum as f32;
-        let t = if mins { wm[b].mul_add(sa as f32, t) } else { t };
-        acc = da.mul_add(t, acc);
+        let (m, s) = if mins { (wm[b], sa as f32) } else { (0.0, 0.0) };
+        acc = scaled_sum(
+            [f64::from(dw), f64::from(m)],
+            [isum as f32, s],
+            da,
+            f64::from(acc),
+        ) as f32;
         let dd = f64::from(da) * f64::from(dw) * f64::from(isum);
         let mm = if mins {
             f64::from(da) * f64::from(wm[b]) * f64::from(sa)
@@ -124,12 +131,13 @@ pub fn dot32(
 /// unit in turn) and the tensor's `scale` — against column `col` of `a`,
 /// three ways: the contract's transcription (per unit the two exact i32
 /// sub-block dots, `acc = fma(d_a, fma(d1, f32(i1), d0·f32(i0)), acc)` from
-/// 0, units in increasing k, the stored value `scale·acc`), the f64 value
+/// 0, units in increasing k, each step a [`scaled_sum`] into an F64
+/// accumulator, the stored value `scale·acc` one more), the f64 value
 /// `scale · Σ_b d_a·(d0·i0 + d1·i1)` and its band's magnitude.
 #[must_use]
 pub fn dot32_nv(wq: &[i8], wsc: &[f32], scale: f32, a: &HostAct, col: usize) -> (f32, f64, f64) {
     let kb = a.k / 32;
-    let (mut acc, mut y, mut mag) = (0.0f32, 0.0f64, 0.0f64);
+    let (mut acc, mut y, mut mag) = (0.0f64, 0.0f64, 0.0f64);
     for b in 0..kb {
         let (wb, ab) = (
             &wq[32 * b..32 * b + 32],
@@ -144,14 +152,108 @@ pub fn dot32_nv(wq: &[i8], wsc: &[f32], scale: f32, a: &HostAct, col: usize) -> 
                 .sum()
         };
         let (i0, i1) = (dot(&wb[..16], &ab[..16]), dot(&wb[16..], &ab[16..]));
-        let tv = d0 * i0 as f32;
-        let tv = d1.mul_add(i1 as f32, tv);
-        acc = da.mul_add(tv, acc);
+        acc = scaled_sum(
+            [f64::from(d0), f64::from(d1)],
+            [i0 as f32, i1 as f32],
+            da,
+            acc,
+        );
         let t = f64::from(da) * (f64::from(d0) * f64::from(i0) + f64::from(d1) * f64::from(i1));
         y += t;
         mag += t.abs();
     }
-    (scale * acc, f64::from(scale) * y, f64::from(scale) * mag)
+    (
+        scaled_sum([acc, 0.0], [scale, 0.0], 1.0, 0.0) as f32,
+        f64::from(scale) * y,
+        f64::from(scale) * mag,
+    )
+}
+
+/// One output of the native NVFP4 product (`gemm_nvfp4_mma`, W4A4): weight
+/// row `(wq, wsc, scale)` as [`dot32_nv`] takes it, against column `col` of
+/// `a` packed as that product's activation producer packs it. The column
+/// scale `gs` is `max_b d_b · (127/6)` over the blocks holding a nonzero
+/// code, 1 when none does. Each 16-value sub-block of values `code·d_b`
+/// takes the UE4M3 scale nearest `amax / (6·gs)`, and each value divided by
+/// that scale times `gs` takes the nearest E2M1 level, ties to even both
+/// times. A sub-block whose scale does not decode to a normal f32 is packed
+/// again from `code · (d_b/gs)` against `amax / 6` and the scale alone.
+/// Returns the f64 value `scale · gs · Σ_s w_s·a_s·Σ codes` and its band's
+/// magnitude; both are NaN when a block of the column was refused.
+///
+/// # Errors
+///
+/// [`QuantError::NotUe4m3`] from the scale table, whose bytes are all
+/// UE4M3 scales.
+pub fn dot32_nv_fp4(
+    wq: &[i8],
+    wsc: &[f32],
+    scale: f32,
+    a: &HostAct,
+    col: usize,
+) -> Result<(f64, f64), QuantError> {
+    let (k, kb) = (a.k, a.k / 32);
+    let codes = &a.codes[col * k..(col + 1) * k];
+    let d = &a.d[col * kb..(col + 1) * kb];
+    if d.iter().any(|v| !v.is_finite()) {
+        return Ok((f64::NAN, f64::NAN));
+    }
+    let max = (0..kb)
+        .filter(|&b| codes[32 * b..32 * b + 32].iter().any(|&c| c != 0))
+        .fold(0.0f32, |m, b| m.max(d[b]));
+    let gs = if max > 0.0 { max * (127.0 / 6.0) } else { 1.0 };
+    let halves = (0..0x7f)
+        .map(ue4m3_to_f32_half)
+        .collect::<Result<Vec<_>, _>>()?;
+    let scales: Vec<f64> = halves.iter().map(|&h| 2.0 * f64::from(h)).collect();
+    let levels: Vec<f64> = KVALUES_MXFP4[..8]
+        .iter()
+        .map(|&v| f64::from(v) / 2.0)
+        .collect();
+    // The index of the ascending table's entry nearest x, ties to the even index.
+    let nearest = |table: &[f64], x: f64| {
+        (1..table.len()).fold(0, |best, i| {
+            let (di, db) = ((x - table[i]).abs(), (x - table[best]).abs());
+            if di < db || (di == db && i % 2 == 0) {
+                i
+            } else {
+                best
+            }
+        })
+    };
+    let (mut y, mut mag) = (0.0f64, 0.0f64);
+    for (s, q) in codes.as_chunks::<16>().0.iter().enumerate() {
+        let pack = |unit: f32, g: f32| {
+            let v = q.map(|c| f32::from(c) * unit);
+            let amax = v.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+            let byte = nearest(&scales, f64::from(amax / (6.0 * g)));
+            (v, amax, byte, halves[byte] * 2.0 * g)
+        };
+        let (mut v, amax, mut byte, mut decoded) = pack(d[s / 2], gs);
+        if !amax.is_finite()
+            || !(6.0 * gs).is_finite()
+            || decoded < f32::MIN_POSITIVE
+            || !(1.0 / decoded).is_finite()
+        {
+            let nonzero = q.iter().any(|&c| c != 0);
+            (v, _, byte, decoded) = pack(if nonzero { d[s / 2] / gs } else { 0.0 }, 1.0);
+        }
+        let inv = if decoded > 0.0 { 1.0 / decoded } else { 0.0 };
+        let isum: i32 = v
+            .iter()
+            .zip(&wq[16 * s..16 * s + 16])
+            .map(|(&x, &w)| {
+                let t = x * inv;
+                let code = KVALUES_MXFP4[nearest(&levels, f64::from(t.abs()))];
+                i32::from(w) * i32::from(if t < 0.0 { -code } else { code })
+            })
+            .sum();
+        let t = f64::from(wsc[s]) * f64::from(halves[byte]) * f64::from(isum);
+        y += t;
+        mag += t.abs();
+    }
+    let g = f64::from(scale) * f64::from(gs);
+    Ok((g * y, g.abs() * mag))
 }
 
 /// The f32 roundings that separate a `gemm_q5_0p` output from the Q5_0
@@ -178,4 +280,60 @@ pub fn dot32_nv(wq: &[i8], wsc: &[f32], scale: f32, a: &HostAct, col: usize) -> 
 #[must_use]
 pub fn q5_0p_gemv_roundings(kb: usize) -> usize {
     kb + kb.div_ceil(32) + 6
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// NVFP4 outputs whose F32 walk overflows before the expert scale, at
+    /// K 64 with activation codes 127 and tensor scale 2^-120. Codes 2 under
+    /// sub-block scales 0.5 with `d_a` 2^120: the kernel keeps the sum in
+    /// F64 and stores 8128. Codes `(12 ×16, 1, 0 ×15)` and their negation
+    /// under sub-block scales `(224, 2^-10)` with `d_a` `(1 + 2^-23)·2^120`:
+    /// sub-block dots `(24384, 127)` then `(-24384, -127)`, and the second
+    /// step's fused F64 multiply-add keeps the first step's rounding error,
+    /// stored as 2^-33 (a separate product and sum would cancel to 0).
+    #[test]
+    fn nvfp4_contract_keeps_range_through_the_expert_scale() {
+        let unit: Vec<i8> = [[12; 16].as_slice(), &[1], &[0; 15]].concat();
+        let cancel = [unit.clone(), unit.iter().map(|c| -c).collect()].concat();
+        let d_cancel = f32::from_bits(0x7b80_0001);
+        for (codes, wsc, d_a, want, want_y) in [
+            (vec![2; 64], [0.5; 4], 2f32.powi(120), 8128.0, 8128.0),
+            (
+                cancel,
+                [224.0, 2f32.powi(-10), 224.0, 2f32.powi(-10)],
+                d_cancel,
+                2f32.powi(-33),
+                0.0,
+            ),
+        ] {
+            let (a, _) = host_act(&[127.0 * d_a; 64], 64, 1);
+            assert_eq!((a.codes[0], a.d[0]), (127, d_a));
+            let (got, y, _) = dot32_nv(&codes, &wsc, 2f32.powi(-120), &a, 0);
+            assert_eq!(
+                (got.to_bits(), y),
+                (want.to_bits(), want_y),
+                "{got:e} against {want:e}"
+            );
+        }
+    }
+
+    /// A Q5_1 step whose product leaves the F32 normal range: `d_a` 2^-149,
+    /// inner sum `1.5 - 2^-24`, whose F32 rounding 1.5 would tie the
+    /// subnormal product up to 2^-148; the exact inner sum gives 2^-149.
+    #[test]
+    fn plain_contract_keeps_a_subnormal_step_exact() {
+        let mut codes = vec![0i8; 32];
+        codes[0] = 1;
+        let a = HostAct {
+            k: 32,
+            codes: codes.clone(),
+            d: vec![f32::from_bits(1)],
+            s: vec![1],
+        };
+        let (got, _, _) = dot32(&codes, &[-(2f32.powi(-24))], &[1.5], &a, 0, true);
+        assert_eq!(got.to_bits(), 1);
+    }
 }

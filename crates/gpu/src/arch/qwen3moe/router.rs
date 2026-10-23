@@ -14,9 +14,10 @@
 //! `qwen3moe_router_route`, the routing alone over given logits, one warp per
 //! token. A ubatch's logits come from
 //! `qwen3moe_router_logits`: the fused entry's lane sums over a ubatch of up
-//! to [`UBATCH`] tokens as register tiles — a block of sixteen warps covers
-//! 32 tokens and 32 expert rows, each warp eight rows by eight tokens, the
-//! rows' and the tokens' values staged in shared memory — so the two ubatch
+//! to [`UBATCH`](super::ubatch::UBATCH) tokens as register tiles — a block
+//! of sixteen warps covers 32 tokens and 32 expert rows, each warp eight rows
+//! by eight tokens, the rows' and the tokens' values staged in shared memory
+//! — so the two ubatch
 //! launches leave each token's logits, ids and weights bit for bit what the
 //! fused launch leaves for it. The
 //! fused gemv is `q8f32::f32_gemv`'s row body — one warp per expert row,
@@ -53,14 +54,13 @@
 //! in range: this module writes only ids below [`WIDTH`] and allocates
 //! them zeroed.
 
-use super::ubatch::UBATCH;
 use crate::cores::l2_prefetch;
 use crate::elem::{RMS_THREADS, RMS_WARPS, rms_partial_sq, rms_scale, rms_warp_tree};
 use crate::fault::{FaultSink, FaultSite, quad_finite};
-use crate::gemm::GEMM_MAX_SLOTS;
+use crate::gemm::{GEMM_MAX_SLOTS, TileRows};
 use crate::q8_1_quant_vals;
 use crate::q8f32::{
-    TILE, f32_lane_partial_1col_w32, f32_lane_partials, f32_tile_chunk, gemv_lane_sums,
+    RowValues, TILE, f32_lane_partial_1col_w32, f32_lane_partials, f32_tile_chunk, gemv_lane_sums,
 };
 use crate::route_core::{sigmoid, take};
 use crate::tensor::{DeviceTensor, Q8Act};
@@ -71,8 +71,10 @@ use cuda_device::{
     DisjointSlice, SharedArray, kernel, launch_bounds, launch_contract, thread, threadfence, warp,
 };
 use cuda_host::cuda_module;
-use model::arch::models::shape::{self, MoeShape, RouterBody, RouterInst, rules};
+use model::arch::models::shape::{self, RouterBody, RouterInst, rules};
 use std::sync::Arc;
+
+pub use chain::arch::qwen3moe::router::RouterDims;
 
 /// Tokens one fused launch routes: the f32 gemv's column bound, and one
 /// warp of the routing block per token.
@@ -837,7 +839,10 @@ unsafe fn publish_route_gated<const PER_LANE: usize>(
 /// The gated router's fused launch body, `qwen3moe_router_fused`'s at `n + 1
 /// = 32 · PER_LANE + 1` rows: warp 0 of block `r` computes row `r`'s logit of
 /// each of the `m_cols` tokens with `f32_gemv`'s row body and stores it at
-/// `logits[c·(n + 1) + r]`, then [`publish_route_gated`].
+/// `logits[c·(n + 1) + r]`, then [`publish_route_gated`]. `w` is an F32
+/// weight's values or a BF16 weight's words
+/// ([`crate::q8f32::Bf16Words`]), whose logits are the F32 walk's over the
+/// widened values bit for bit.
 ///
 /// # Safety
 ///
@@ -845,16 +850,16 @@ unsafe fn publish_route_gated<const PER_LANE: usize>(
 /// blocks of [`FUSED_THREADS`]; `last` and `p` are 1 and `MAX_TOKENS · n`
 /// entries of the block's shared memory that nothing else touches; `1 <=
 /// m_cols <= MAX_TOKENS`, `1 <= used <= 32`, `k` a positive multiple of 32,
-/// `w.len() >= (n + 1)·k`, `x.len() >= m_cols·k`, the outputs sized as
-/// [`publish_route_gated`] takes them for `m_cols` tokens, and `done[0]`
-/// zero before the launch.
+/// `w` holds at least `(n + 1)·k` values, `x.len() >= m_cols·k`, the outputs
+/// sized as [`publish_route_gated`] takes them for `m_cols` tokens, and
+/// `done[0]` zero before the launch.
 #[allow(
     clippy::too_many_arguments,
     reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
 )]
 #[inline(always)]
-unsafe fn gated_fused_body<const PER_LANE: usize>(
-    w: &[f32],
+unsafe fn gated_fused_body<const PER_LANE: usize, W: RowValues>(
+    w: W,
     x: &[f32],
     k: u32,
     m_cols: u32,
@@ -879,7 +884,7 @@ unsafe fn gated_fused_body<const PER_LANE: usize>(
     let row = thread::blockIdx_x() as usize;
     if wi == 0 && row < rows {
         let partials = if m == 1 {
-            // SAFETY: row < rows, so w.len() >= rows·k >= (row + 1)·k, and
+            // SAFETY: row < rows, so w holds rows·k >= (row + 1)·k values, and
             // x.len() >= k (this fn's contract); k a positive multiple of 32;
             // lane < 32.
             let f0 = unsafe { f32_lane_partial_1col_w32(w, x, k, row, lane) };
@@ -1091,18 +1096,21 @@ unsafe fn norm_row_body<const PREFETCH: bool>(
 /// 32⌉`. A row at or past `ROWS` is staged as row `ROWS − 1` and its sums
 /// are not stored, as a token past `n_tok` is staged as the last token.
 /// Writes `logits[t·ROWS + r]`, each the bits the fused launch leaves for
-/// token `t`.
+/// token `t`. The weight's rows reach the stage through [`TileRows`]: an
+/// F32 weight's values copied, a BF16 weight's words widened, the same f32
+/// values either way.
 ///
 /// # Safety
 ///
 /// Every thread of the block calls it, converged; the block is
 /// [`LOGITS_THREADS`] wide and the grid `⌈n_tok / 32⌉ · B` blocks; `sh` is
 /// the block's own `STAGES · STAGE_FLOATS` shared values, 16-byte aligned;
-/// `n_tok >= 1`, `k` a positive multiple of [`LINE`], `w.len() >= ROWS·k`,
-/// `x.len() >= n_tok·k`, both 16-byte aligned, `logits.len() >= ROWS·n_tok`.
+/// `n_tok >= 1`, `k` a positive multiple of [`LINE`], `w` holds at least
+/// `ROWS·k` values, `w` and `x` (`x.len() >= n_tok·k`) 16-byte aligned,
+/// `logits.len() >= ROWS·n_tok`.
 #[inline(always)]
-unsafe fn logits_body<const ROWS: usize>(
-    w: &[f32],
+unsafe fn logits_body<const ROWS: usize, W: TileRows>(
+    w: W,
     x: &[f32],
     k: u32,
     n_tok: u32,
@@ -1137,20 +1145,17 @@ unsafe fn logits_body<const ROWS: usize>(
     macro_rules! stage_copy {
         ($s:expr, $buf:expr) => {{
             let (s, buf): (usize, usize) = ($s, $buf);
-            // SAFETY: s < stages, so s·LINE + piece + 4 <= k: the 16 source
-            // bytes lie in a row below ROWS of w (w.len() >= ROWS·k) and in
-            // a column below n_tok of x (x.len() >= n_tok·k), 16-byte aligned
-            // (k a multiple of 64, both bases 16-byte aligned: this fn's
-            // contract). The destination is this thread's own 16 bytes of
-            // stage buf < STAGES, 16-byte aligned (LINE and piece are
+            // SAFETY: s < stages, so s·LINE + piece + 4 <= k: the four
+            // values lie in a row below ROWS of w (w holds ROWS·k values) and
+            // in a column below n_tok of x (x.len() >= n_tok·k), 16-byte
+            // aligned (k a multiple of 64, both bases 16-byte aligned: this
+            // fn's contract). The destination is this thread's own 16 bytes
+            // of stage buf < STAGES, 16-byte aligned (LINE and piece are
             // multiples of four values), read by no warp until the barrier
             // after the wait that completes this copy.
             unsafe {
                 let dst = sh.add(buf * STAGE_FLOATS);
-                cp_async_cg_16(
-                    dst.add(w_dst).cast::<u32>(),
-                    w.as_ptr().add(w_off + s * LINE).cast::<u32>(),
-                );
+                w.stage(dst.add(w_dst), w_off + s * LINE);
                 cp_async_cg_16(
                     dst.add(x_dst).cast::<u32>(),
                     x.as_ptr().add(x_off + s * LINE).cast::<u32>(),
@@ -2101,83 +2106,6 @@ mod qwen3moe_router_kernels {
     }
 }
 
-/// A router's shape as its buffers and launches take it: the instance row a
-/// file's shape selected, and the experts a token keeps.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RouterDims {
-    inst: RouterInst,
-    used: usize,
-}
-
-impl RouterDims {
-    /// The dims of `shape`: its instance row, which must be one of this
-    /// module's bodies (`qwen3moe_router_*` or `gated`'s entries), and its
-    /// `top_k`. A shape no row serves, or a row another module owns, is
-    /// refused by name.
-    pub fn of(shape: MoeShape) -> Result<RouterDims, GpuError> {
-        const WHAT: &str = "qwen3moe::router::RouterDims::of";
-        let inst = shape::select_router(shape).map_err(|e| GpuError::shape(WHAT, e.to_string()))?;
-        if !matches!(inst.body, RouterBody::Qwen3moe | RouterBody::Qwen35moe) {
-            return Err(GpuError::shape(
-                WHAT,
-                format!(
-                    "{shape:?} selects {}, which this module does not run",
-                    inst.at
-                ),
-            ));
-        }
-        Ok(RouterDims {
-            inst,
-            used: shape.top_k as usize,
-        })
-    }
-
-    /// The instance row.
-    #[must_use]
-    pub fn inst(&self) -> RouterInst {
-        self.inst
-    }
-
-    /// Experts the router softmaxes over.
-    #[must_use]
-    pub fn experts(&self) -> usize {
-        self.inst.experts() as usize
-    }
-
-    /// Routed experts a token keeps.
-    #[must_use]
-    pub fn used(&self) -> usize {
-        self.used
-    }
-
-    /// Whether a shared expert's gate is the router's last row and its slot
-    /// the token's last.
-    #[must_use]
-    pub fn gated(&self) -> bool {
-        self.inst.rule.gated
-    }
-
-    /// Logits per token: one per router row.
-    #[must_use]
-    pub fn logits(&self) -> usize {
-        self.experts() + usize::from(self.gated())
-    }
-
-    /// Slots (an id and a weight each) per token: the routed ones, then a
-    /// gated shared expert's.
-    #[must_use]
-    pub fn slots(&self) -> usize {
-        self.used + usize::from(self.gated())
-    }
-
-    /// The most tokens a ubatch routing may hold: at most [`UBATCH`], and
-    /// every slot of them in one GEMM route table.
-    #[must_use]
-    pub fn ubatch(&self) -> usize {
-        UBATCH.min(GEMM_MAX_SLOTS / self.slots())
-    }
-}
-
 /// Where one router launch leaves its results, allocated once and reused by
 /// every launch and replay: per token the logits (the fused launches') and
 /// the probabilities, per slot the expert id and the weight, and the fused
@@ -2223,7 +2151,7 @@ impl RouterBufs {
         tokens: usize,
     ) -> Result<Self, GpuError> {
         let what = "qwen3moe::router::RouterBufs::for_ubatch";
-        Self::alloc(stream, dims, tokens, dims.ubatch(), what)
+        Self::alloc(stream, dims, tokens, dims.ubatch(GEMM_MAX_SLOTS), what)
     }
 
     /// The buffers for `tokens` (1..=`most`) tokens, the ticket count zeroed;
@@ -2286,7 +2214,7 @@ impl RouterBufs {
         body: RouterBody,
         per_lane: Option<u32>,
     ) -> Result<u32, GpuError> {
-        let inst = self.dims.inst;
+        let inst = self.dims.inst();
         if inst.body != body || per_lane.is_some_and(|w| w != inst.per_lane()) {
             return Err(GpuError::shape(
                 what,
@@ -2296,7 +2224,7 @@ impl RouterBufs {
                 ),
             ));
         }
-        launch_u32(what, "used", self.dims.used)
+        launch_u32(what, "used", self.dims.used())
     }
 }
 
@@ -2759,7 +2687,10 @@ pub mod gated {
         logits_body, norm_row_body, publish_route_gated,
     };
     use crate::fault::FaultSink;
+    use crate::gemm::{Bf16Rows, F32Rows};
+    use crate::q8f32::Bf16Words;
     use crate::tensor::{DeviceTensor, Q8Act};
+    use crate::weights::{DevWeight, Weights};
     use crate::{GpuError, launch_u32};
     use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
     use cuda_device::{DisjointSlice, SharedArray, kernel, launch_bounds, launch_contract};
@@ -2878,7 +2809,7 @@ pub mod gated {
             // contract's, the launcher passes k a positive multiple of 32, and
             // `done[0]` is zero before the launch.
             unsafe {
-                gated_fused_body::<PER_LANE>(
+                gated_fused_body::<PER_LANE, _>(
                     w,
                     x,
                     k,
@@ -3393,8 +3324,8 @@ pub mod gated {
             // the launcher checks k and both alignments, and the lengths are
             // the launch contract's.
             unsafe {
-                logits_body::<ROWS>(
-                    w,
+                logits_body::<ROWS, _>(
+                    F32Rows(w),
                     x,
                     k,
                     n_tok,
@@ -3507,8 +3438,72 @@ pub mod gated {
             // contract's, the launcher passes k a positive multiple of 32, and
             // `done[0]` is zero before the launch.
             unsafe {
-                gated_fused_body::<PER_LANE_WIDE>(
+                gated_fused_body::<PER_LANE_WIDE, _>(
                     w,
+                    x,
+                    k,
+                    m_cols,
+                    used,
+                    SharedArray::as_raw_mut_ptr(&raw mut LAST),
+                    SharedArray::as_raw_mut_ptr(&raw mut P),
+                    &mut logits,
+                    &mut probs,
+                    &mut ids,
+                    &mut weights,
+                    &mut done,
+                    fault,
+                );
+            }
+        }
+
+        /// `qwen35moe_router_fused_512` over a BF16 joined router weight:
+        /// `w` its words ([`ROWS_WIDE`] rows of `k / 2`, value `2j` of a row
+        /// in the low half of word `j`), each value widened as it is read
+        /// ([`Bf16Words`]), so every output is the F32 entry's over the
+        /// widened weight bit for bit.
+        #[allow(
+            clippy::too_many_arguments,
+            reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+        )]
+        #[kernel]
+        #[launch_bounds(256)]
+        #[launch_contract(
+            domain = 1,
+            block = (256, 1, 1),
+            requires = (
+                m_cols >= 1,
+                m_cols <= 8,
+                used >= 1,
+                used <= 32,
+                2 * w.len() >= ROWS_WIDE * k,
+                x.len() >= m_cols * k,
+                logits.len() >= ROWS_WIDE * m_cols,
+                probs.len() >= EXPERTS_WIDE * m_cols,
+                ids.len() >= (used + 1) * m_cols,
+                weights.len() >= (used + 1) * m_cols,
+                done.len() >= 1
+            )
+        )]
+        pub fn qwen35moe_router_fused_512_bf16(
+            w: &[u32],
+            x: &[f32],
+            k: u32,
+            m_cols: u32,
+            used: u32,
+            mut logits: DisjointSlice<f32>,
+            mut probs: DisjointSlice<f32>,
+            mut ids: DisjointSlice<u32>,
+            mut weights: DisjointSlice<f32>,
+            mut done: DisjointSlice<u32>,
+            fault: FaultSink,
+        ) {
+            static mut P: SharedArray<f32, { MAX_TOKENS * EXPERTS_WIDE }> = SharedArray::UNINIT;
+            static mut LAST: SharedArray<u32, 1> = SharedArray::UNINIT;
+            // SAFETY: LAST/P belong only to this block; all threads call converged on a ROWS_WIDE-block grid of 256 threads.
+            // The launch contract bounds m, used and all slices; the launcher checks positive k divisible by 32; done[0] is zero.
+            unsafe {
+                gated_fused_body::<PER_LANE_WIDE, _>(
+                    Bf16Words(w),
                     x,
                     k,
                     m_cols,
@@ -3558,8 +3553,47 @@ pub mod gated {
             // the launcher checks k and both alignments, and the lengths are
             // the launch contract's.
             unsafe {
-                logits_body::<ROWS_WIDE>(
-                    w,
+                logits_body::<ROWS_WIDE, _>(
+                    F32Rows(w),
+                    x,
+                    k,
+                    n_tok,
+                    &mut logits,
+                    SharedArray::as_raw_mut_ptr(&raw mut STAGE),
+                );
+            }
+        }
+
+        /// `qwen35moe_router_logits_512` over a BF16 joined router weight:
+        /// `w` its words ([`ROWS_WIDE`] rows of `k / 2`), each staged value
+        /// widened to f32 as it is stored, so every logit is the F32 entry's
+        /// over the widened weight bit for bit. `k` a positive multiple of
+        /// 64, `w` and `x` 16-byte aligned (host-checked).
+        #[kernel]
+        #[launch_bounds(512)]
+        #[launch_contract(
+            domain = 1,
+            block = (512, 1, 1),
+            requires = (
+                n_tok >= 1,
+                2 * w.len() >= ROWS_WIDE * k,
+                x.len() >= n_tok * k,
+                logits.len() >= ROWS_WIDE * n_tok
+            )
+        )]
+        pub fn qwen35moe_router_logits_512_bf16(
+            w: &[u32],
+            x: &[f32],
+            k: u32,
+            n_tok: u32,
+            mut logits: DisjointSlice<f32>,
+        ) {
+            static mut STAGE: SharedArray<f32, { STAGES * STAGE_FLOATS }, 16> = SharedArray::UNINIT;
+            // SAFETY: STAGE is this block's own 16-byte-aligned STAGES * STAGE_FLOATS shared values; all 512 threads converge.
+            // The launcher proves the logits grid, positive k divisible by LINE and both alignments; the contract bounds all slices.
+            unsafe {
+                logits_body::<ROWS_WIDE, _>(
+                    Bf16Rows(w),
                     x,
                     k,
                     n_tok,
@@ -3644,23 +3678,70 @@ pub mod gated {
         }
     }
 
-    /// Err unless `w` is a joined router weight of `rows` rows whose width
-    /// is a positive multiple of `unit` (and at most `most`): its width.
+    /// A joined router weight as the card holds it: f32 values, or a BF16
+    /// tensor's words (two values a word), which the wide instance's `_bf16`
+    /// entries widen as they read them, so its outputs are the F32 entries'
+    /// over the widened weight bit for bit.
+    #[derive(Clone, Copy)]
+    pub enum RouterWeight<'a> {
+        F32(&'a DeviceTensor<f32>),
+        Bf16 { w: &'a DeviceTensor<u32> },
+    }
+
+    impl<'a> RouterWeight<'a> {
+        /// The resident joined router weight `name`, F32 or BF16; another
+        /// form, or none, refused by name as `what`.
+        pub fn of(
+            w: &'a Weights,
+            what: &'static str,
+            name: &str,
+        ) -> Result<RouterWeight<'a>, GpuError> {
+            match w.resident(what, name)? {
+                DevWeight::F32 { w, .. } => Ok(RouterWeight::F32(w)),
+                DevWeight::Bf16 { w, .. } => Ok(RouterWeight::Bf16 { w }),
+                _ => Err(GpuError::tensor(what, name, "an f32 or bf16 tensor")),
+            }
+        }
+
+        /// The weight's rows and values a row.
+        fn shape(self) -> (usize, usize) {
+            match self {
+                RouterWeight::F32(w) => (w.rows(), w.cols()),
+                RouterWeight::Bf16 { w } => (w.rows(), 2 * w.cols()),
+            }
+        }
+
+        /// The device address of the weight's first value.
+        fn at(self) -> u64 {
+            match self {
+                RouterWeight::F32(w) => w.buf().cu_deviceptr(),
+                RouterWeight::Bf16 { w, .. } => w.buf().cu_deviceptr(),
+            }
+        }
+    }
+
+    impl<'a> From<&'a DeviceTensor<f32>> for RouterWeight<'a> {
+        fn from(w: &'a DeviceTensor<f32>) -> Self {
+            RouterWeight::F32(w)
+        }
+    }
+
+    /// Err unless a joined router weight of `(have, k)` rows and values has
+    /// `rows` rows and a width that is a positive multiple of `unit` (and
+    /// at most `most`): its width.
     fn router_width(
         what: &'static str,
-        w: &DeviceTensor<f32>,
+        (have, k): (usize, usize),
         rows: usize,
         unit: usize,
         most: usize,
     ) -> Result<usize, GpuError> {
-        let k = w.cols();
-        if w.rows() != rows || k == 0 || !k.is_multiple_of(unit) || k > most {
+        if have != rows || k == 0 || !k.is_multiple_of(unit) || k > most {
             return Err(GpuError::shape(
                 what,
                 format!(
-                    "router weight is {} x {k}, want {rows} rows of a positive multiple of {unit} \
-                     up to {most}",
-                    w.rows()
+                    "router weight is {have} x {k}, want {rows} rows of a positive multiple of \
+                     {unit} up to {most}"
                 ),
             ));
         }
@@ -3671,13 +3752,13 @@ pub mod gated {
     /// into `out`; its refusal named `what`.
     fn fused_dims(
         what: &'static str,
-        w: &DeviceTensor<f32>,
+        w: RouterWeight<'_>,
         x: &DeviceBuffer<f32>,
         m: usize,
         out: &RouterBufs,
     ) -> Result<(u32, u32, u32), GpuError> {
         let rows = out.dims().logits();
-        let k = router_width(what, w, rows, 32, usize::MAX)?;
+        let k = router_width(what, w.shape(), rows, 32, usize::MAX)?;
         if !(1..=MAX_TOKENS.min(out.tokens())).contains(&m) || x.len() < m * k {
             return Err(GpuError::shape(
                 what,
@@ -3699,13 +3780,13 @@ pub mod gated {
     /// through `w` into `out`; its refusal named `what`.
     fn ubatch_dims(
         what: &'static str,
-        w: &DeviceTensor<f32>,
+        w: RouterWeight<'_>,
         x: &DeviceBuffer<f32>,
         n: usize,
         out: &RouterBufs,
     ) -> Result<(u32, u32, u32), GpuError> {
         let rows = out.dims().logits();
-        let k = router_width(what, w, rows, LINE, usize::MAX)?;
+        let k = router_width(what, w.shape(), rows, LINE, usize::MAX)?;
         if !(1..=out.tokens()).contains(&n) || x.len() < n * k {
             return Err(GpuError::shape(
                 what,
@@ -3716,7 +3797,7 @@ pub mod gated {
                 ),
             ));
         }
-        let (w_at, x_at) = (w.buf().cu_deviceptr(), x.cu_deviceptr());
+        let (w_at, x_at) = (w.at(), x.cu_deviceptr());
         if !w_at.is_multiple_of(16) || !x_at.is_multiple_of(16) {
             return Err(GpuError::shape(
                 what,
@@ -3750,6 +3831,18 @@ pub mod gated {
         Ok((n_tok, grid))
     }
 
+    /// The refusal of a BF16 router weight at the narrow instance, which
+    /// has no BF16 entries.
+    fn narrow_bf16(what: &'static str) -> GpuError {
+        GpuError::shape(
+            what,
+            format!(
+                "a bf16 router weight at {}; only the {} instance reads bf16 words",
+                ROW.at, ROW_WIDE.at
+            ),
+        )
+    }
+
     /// The loaded gated router module, both instances. Owns no stream: each
     /// enqueue takes the engine stream.
     pub struct RouterKernels {
@@ -3773,14 +3866,15 @@ pub mod gated {
         /// Enqueue the router of `m` tokens, 1..=`MAX_TOKENS` and at most
         /// `out.tokens()`, at `out`'s instance and `used`: `w` the joined
         /// router weight (`n + 1` rows of `k`, `k` a positive multiple of
-        /// 32), `x` the tokens' `m` columns of `k` activations; results into
-        /// `out`, a token with a non-finite logit raising
+        /// 32; BF16 at the wide instance only, refused by name at the
+        /// narrow one), `x` the tokens' `m` columns of `k` activations;
+        /// results into `out`, a token with a non-finite logit raising
         /// [`FaultSite::Router`](crate::FaultSite::Router) on `fault`.
         /// Asynchronous, allocation-free, capturable.
-        pub fn enqueue_fused(
+        pub fn enqueue_fused<'w>(
             &self,
             stream: &CudaStream,
-            w: &DeviceTensor<f32>,
+            w: impl Into<RouterWeight<'w>>,
             x: &DeviceBuffer<f32>,
             m: usize,
             fault: FaultSink,
@@ -3788,10 +3882,14 @@ pub mod gated {
         ) -> Result<(), GpuError> {
             let what = "qwen3moe::router::gated::enqueue_fused";
             let (width, used) = width(what, out)?;
+            let w = w.into();
             let (k, m, grid) = fused_dims(what, w, x, m, out)?;
             let cfg = LaunchConfig1D::new(grid, FUSED_THREADS_U32, 0);
-            match width {
-                Width::Narrow => {
+            match (width, w) {
+                (Width::Narrow, RouterWeight::Bf16 { .. }) => {
+                    return Err(narrow_bf16(what));
+                }
+                (Width::Narrow, RouterWeight::F32(w)) => {
                     let prep = self.module.prepare_qwen35moe_router_fused(cfg)?;
                     self.module.qwen35moe_router_fused(
                         stream,
@@ -3809,9 +3907,27 @@ pub mod gated {
                         fault,
                     )?;
                 }
-                Width::Wide => {
+                (Width::Wide, RouterWeight::F32(w)) => {
                     let prep = self.module.prepare_qwen35moe_router_fused_512(cfg)?;
                     self.module.qwen35moe_router_fused_512(
+                        stream,
+                        &prep,
+                        w.buf(),
+                        x,
+                        k,
+                        m,
+                        used,
+                        &mut out.logits,
+                        &mut out.probs,
+                        &mut out.ids,
+                        &mut out.weights,
+                        &mut out.done,
+                        fault,
+                    )?;
+                }
+                (Width::Wide, RouterWeight::Bf16 { w, .. }) => {
+                    let prep = self.module.prepare_qwen35moe_router_fused_512_bf16(cfg)?;
+                    self.module.qwen35moe_router_fused_512_bf16(
                         stream,
                         &prep,
                         w.buf(),
@@ -3840,10 +3956,10 @@ pub mod gated {
         /// aligned; each token's results the bits
         /// [`RouterKernels::enqueue_fused`] leaves for it, its refusal raised
         /// on `fault` as there. Asynchronous, allocation-free, capturable.
-        pub fn enqueue_ubatch(
+        pub fn enqueue_ubatch<'w>(
             &self,
             stream: &CudaStream,
-            w: &DeviceTensor<f32>,
+            w: impl Into<RouterWeight<'w>>,
             x: &DeviceBuffer<f32>,
             n: usize,
             fault: FaultSink,
@@ -3851,10 +3967,14 @@ pub mod gated {
         ) -> Result<(), GpuError> {
             let what = "qwen3moe::router::gated::enqueue_ubatch";
             let (width, _) = width(what, out)?;
+            let w = w.into();
             let (k, n_tok, grid) = ubatch_dims(what, w, x, n, out)?;
             let cfg = LaunchConfig1D::new(grid, LOGITS_THREADS_U32, 0);
-            match width {
-                Width::Narrow => {
+            match (width, w) {
+                (Width::Narrow, RouterWeight::Bf16 { .. }) => {
+                    return Err(narrow_bf16(what));
+                }
+                (Width::Narrow, RouterWeight::F32(w)) => {
                     let prep = self.module.prepare_qwen35moe_router_logits(cfg)?;
                     self.module.qwen35moe_router_logits(
                         stream,
@@ -3866,9 +3986,21 @@ pub mod gated {
                         &mut out.logits,
                     )?;
                 }
-                Width::Wide => {
+                (Width::Wide, RouterWeight::F32(w)) => {
                     let prep = self.module.prepare_qwen35moe_router_logits_512(cfg)?;
                     self.module.qwen35moe_router_logits_512(
+                        stream,
+                        &prep,
+                        w.buf(),
+                        x,
+                        k,
+                        n_tok,
+                        &mut out.logits,
+                    )?;
+                }
+                (Width::Wide, RouterWeight::Bf16 { w, .. }) => {
+                    let prep = self.module.prepare_qwen35moe_router_logits_512_bf16(cfg)?;
+                    self.module.qwen35moe_router_logits_512_bf16(
                         stream,
                         &prep,
                         w.buf(),
@@ -3961,7 +4093,7 @@ pub mod gated {
         ) -> Result<(), GpuError> {
             let what = "qwen3moe::router::gated::enqueue_norm_fused";
             let used = out.used_for(what, RouterBody::Qwen35moe, Some(ROW.per_lane()))?;
-            let k = router_width(what, w, ROWS, 128, NORM_K)?;
+            let k = router_width(what, (w.rows(), w.cols()), ROWS, 128, NORM_K)?;
             if act.m() != 1 || act.k() != k || x.len() < k || gain.len() < k {
                 return Err(GpuError::shape(
                     what,
@@ -4074,7 +4206,7 @@ pub mod gated {
         ) -> Result<(), GpuError> {
             let what = "qwen3moe::router::gated::enqueue_norm_fused_m";
             let used = out.used_for(what, RouterBody::Qwen35moe, Some(ROW.per_lane()))?;
-            let k = router_width(what, w, ROWS, 128, NORM_K)?;
+            let k = router_width(what, (w.rows(), w.cols()), ROWS, 128, NORM_K)?;
             let m = act.m();
             if !(1..=MAX_TOKENS.min(out.tokens())).contains(&m)
                 || act.k() != k

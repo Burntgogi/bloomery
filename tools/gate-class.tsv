@@ -12,6 +12,7 @@ gate-alloc	common		host	model_host_ops
 gate-app	common		host	seats_app+drafts_mtp+drafts_dspark
 gate-arch-registry	common		registry	arch_registry
 gate-attn	family	deepseek2	host	model_host_ops
+gate-chain	common		host	chain_plan
 gate-decision-clef	common		constrain	decision_head
 gate-decision-lev	common		constrain	decision_head
 gate-deepseek4-meta	family	deepseek41	meta	arch_registry
@@ -29,6 +30,7 @@ gate-emb2-mel	family	gemma4a	media	serve_media
 gate-embed	common		host	ple_embed
 gate-engram	common		host	engram_verbs
 gate-ffn	family	deepseek2	host	model_host_ops
+gate-flint-meta	family	flint	meta	arch_registry
 gate-fixture	tooling		fixture-writer	-
 gate-fixture-budget	tooling		fixture-writer	-
 gate-forward	family	deepseek2	host	model_host_ops
@@ -171,6 +173,7 @@ gate-gpu-qwen4exp-mtp	family	qwen4exp	draft	drafts_mtp
 gate-gpu-qwen4exp-nvfp4	family	qwen4exp	kernel	quant_mxfp4
 gate-gpu-radio-tower	family	nemotron_h	media	serve_media
 gate-gpu-routed-legs	common		tier	tier_legs+placement_sizing
+gate-gpu-rope-writers	common		kernel	attn_gqa
 gate-gpu-serve-start-ds41	family	deepseek41	serve	seats_serve_engine+placement_sizing
 gate-gpu-serve-start-glm	family	glm5next	serve	seats_serve_engine+placement_sizing
 gate-gpu-solar2-e2e	family	solar-open2	e2e	graph_fault+attn_linear_gdn_kda+moe_route
@@ -189,6 +192,7 @@ gate-jinja	common		host	tokenizer_jinja
 gate-kv	family	deepseek2	host	kv_pool_checkpoint
 gate-levers	common		lever	levers
 gate-device	common		device	device_seam
+gate-gpu-device	common		device	device_seam
 gate-mimo2-meta	family	mimo2	meta	arch_registry
 gate-model-hf	common		host	arch_registry
 gate-models	common		host	arch_registry

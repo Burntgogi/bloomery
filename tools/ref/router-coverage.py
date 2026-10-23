@@ -40,7 +40,8 @@ compare   Two traces of the same tokens (another schedule, ubatch or backend), t
 bursts    Per window of W consecutive positions inside one chunk (--window, default 512; a window across a
           chunk edge crosses a context reset and is skipped), how bursty the routing of the host experts
           is — the experts the card does not hold (--n-l as tools/ref/window-union.py reads it: each
-          layer's id prefix; without --n-l every expert is a host expert). Two tables:
+          layer's id prefix; without --n-l every expert is a host expert). Invalid placements and repeated
+          --window, --n-l or --layers options are named errors, not a replacement placement. Two tables:
             m     per window and host expert, m = the window's selections of it, over m̄ = W x
                   n_expert_used / n_expert (every expert's mean): p50, p90, p99 and max of m / m̄ over the
                   (window, host expert) pairs the window touches, and the share of the host slots taken
@@ -462,14 +463,17 @@ def burst_stats(s, card, window, keep=None):
 
 
 def bursts(set_dirs, window, spec=None, keep=None):
-    wu = window_union() if spec else None
+    wu = window_union() if spec is not None else None
     for d in set_dirs:
         s = read_manifest(d)
         if keep is not None and not set(keep) <= set(s["layers"]):
             raise SetError(f"{d}: --layers {sorted(set(keep) - set(s['layers']))} not in the set")
-        if spec:
-            n_l = wu.parse_n_l(spec, s["layers"])
-            card = wu.card_sets(s["layers"], n_l, s["n_expert"])
+        if spec is not None:
+            try:
+                n_l = wu.parse_n_l(spec, s["layers"], s["n_expert"])
+            except wu.rc.SetError as e:
+                raise SetError(str(e)) from None
+            card = wu.card_sets(s["layers"], n_l)
         else:
             card = {l: set() for l in s["layers"]}
         b = burst_stats(s, card, window, keep)
@@ -1040,6 +1044,8 @@ def main(argv):
             it = iter(argv[1:])
             for a in it:
                 if a in ("--window", "--n-l", "--layers"):
+                    if a in opts:
+                        raise SetError(f"{a} supplied more than once")
                     v = next(it, None)
                     if v is None:
                         raise SetError(f"{a} takes a value")

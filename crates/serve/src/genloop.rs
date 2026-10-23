@@ -19,13 +19,14 @@
 //! pass that would run past the context is not run; the positions left take
 //! one step each, so the ids end where a plain run's end. `timings` then carry
 //! llama-server's `draft_n` and `draft_n_accepted`: the ids the passes proposed
-//! and kept. A request that samples takes its passes through
-//! [`Engine::advance_sampled`] on an engine that drafts sampled requests
-//! ([`Engine::drafts_sampled`]), its sampler drawing each kept id from the
-//! verified rows, and only while its slot runs alone in the round: beside
-//! another busy slot, a pass's rows are not pinned to a step's, so it steps.
-//! A request that bans an id, or samples on another drafting engine, reads the
-//! logits row every token, which a pass does not give, so it takes one
+//! and kept. A request that draws (it samples, or bans an id: `ignore_eos`'s
+//! draw is the row with the stop ids at -inf, then its sampler or the argmax)
+//! takes its passes through [`Engine::advance_sampled`] on an engine that
+//! drafts sampled requests ([`Engine::drafts_sampled`]), its draw taking each
+//! kept id from the verified rows, and only while its slot runs alone in the
+//! round: beside another busy slot, a pass's rows are not pinned to a step's,
+//! so it steps. On another drafting engine such a request reads the logits
+//! row every token, which a pass does not give, so it takes one
 //! [`Engine::next`] a token and carries no draft counts.
 //!
 //! A request that asks for probabilities ([`GenParams::logprobs`]) reads the
@@ -83,8 +84,8 @@ use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::Instant;
 
 use serde_json::{Value, json};
@@ -350,42 +351,49 @@ fn prompt_tail(held: &Held, n: usize) -> Vec<u32> {
     tail
 }
 
-/// The next id: the engine's argmax, or the sampler's draw. `banned` (the
-/// stop ids under `ignore_eos`, as llama-server's `logit_bias_eog`) get a
-/// -inf logit first, and a greedy request whose argmax is banned takes the
-/// largest other logit (first of equals).
-fn choose(
-    sampler: &mut Option<Sampler>,
-    greedy: u32,
-    logits: &mut [f32],
-    history: &[u32],
-    banned: &[u32],
-) -> u32 {
-    for &b in banned {
-        if let Some(l) = usize::try_from(b).ok().and_then(|i| logits.get_mut(i)) {
-            *l = f32::NEG_INFINITY;
+/// The draw of a request that bans ids (the stop ids under `ignore_eos`, as
+/// llama-server's `logit_bias_eog`): a copy of the row with each banned id's
+/// logit at -inf, then `draw` on it, or for a greedy request the copy's
+/// largest logit (first of equals). A step's row ([`Gen::answer`], where a
+/// greedy request whose argmax is not banned keeps it unread) and a pass's
+/// verified row ([`Engine::advance_sampled`]) are drawn from alike, so a pass
+/// never keeps a banned id: where the draft proposed one, the draw takes
+/// another and the pass stops there.
+fn banning(mut draw: Option<Sampler>, banned: Vec<u32>) -> Sampler {
+    let greedy = draw.is_none();
+    let mut row: Vec<f32> = Vec::new();
+    Box::new(move |logits: &[f32], history: &[u32]| {
+        row.clear();
+        row.extend(
+            logits
+                .iter()
+                .map(|&l| if greedy && l == 0.0 { 0.0 } else { l }),
+        );
+        for &b in &banned {
+            if let Some(l) = usize::try_from(b).ok().and_then(|i| row.get_mut(i)) {
+                *l = f32::NEG_INFINITY;
+            }
         }
-    }
-    match sampler {
-        Some(s) => s(logits, history),
-        None if banned.contains(&greedy) => sampling::argmax(logits),
-        None => greedy,
-    }
+        match &mut draw {
+            Some(s) => s(&row, history),
+            None => sampling::argmax(&row),
+        }
+    })
 }
 
 /// Whether a request takes its tokens after the first through the engine's
-/// passes when the engine drafts: one that bans no id, asks for no
-/// probabilities (`asks`) and follows no program (`constrained`, whose every
-/// token is picked from its own row), greedy ([`Engine::advance`]) or sampling
-/// on an engine that drafts sampled requests ([`Engine::advance_sampled`]).
+/// passes when the engine drafts: one that asks for no probabilities
+/// (`asks`) and follows no program (`constrained`, whose every token is
+/// picked from its own row), greedy ([`Engine::advance`]) or drawing (it
+/// samples or bans an id, [`banning`]) on an engine that drafts sampled
+/// requests ([`Engine::advance_sampled`]).
 fn takes_passes(
     sampler: Option<&Sampler>,
-    banned: &[u32],
     asks: bool,
     constrained: bool,
     engine: &dyn Engine,
 ) -> bool {
-    banned.is_empty() && !asks && !constrained && (sampler.is_none() || engine.drafts_sampled())
+    !asks && !constrained && (sampler.is_none() || engine.drafts_sampled())
 }
 
 /// The engine and its slots: what each slot's cache holds — the ids, one per
@@ -421,6 +429,9 @@ pub(crate) struct Slot {
     /// Each slot's state copy while it may still run ([`Slot::seal`]): its
     /// rows are not cut, reset or replaced before it has landed.
     saving: Vec<Option<Pending>>,
+    /// A seal's state until the next request consumes this slot. A weak
+    /// reference leaves the cache free to return its staging.
+    sealed: Vec<Option<Weak<dyn Saved>>>,
     /// Whether a request that follows a program takes the jump arm.
     jump: bool,
 }
@@ -455,6 +466,7 @@ impl Slot {
             away: None,
             off: false,
             saving: vec![None; n],
+            sealed: vec![None; n],
             jump: true,
         }
     }
@@ -532,6 +544,7 @@ impl Slot {
     }
 
     fn held_mut(&mut self, slot: usize) -> &mut Held {
+        self.sealed[slot] = None;
         if slot == self.cur {
             &mut self.held
         } else {
@@ -644,6 +657,7 @@ impl Slot {
     /// no prefix it shared is noted.
     fn reuse(&mut self, req: &Held, want: bool) -> Result<usize, EngineError> {
         let away = self.away.take();
+        let sealed = self.sealed[self.cur].take();
         // The slot's own state copy lands before its rows are cut, reset or
         // replaced; the copies of the other slots that have landed leave
         // the cache free to evict them.
@@ -669,6 +683,9 @@ impl Slot {
         if self.cache.enabled()
             && !self.held.is_empty()
             && (picked.is_some() || (saves_cut && !continues))
+            && !sealed
+                .as_ref()
+                .is_some_and(|s| self.cache.contains(s, &self.held))
         {
             self.save_held(away.as_ref())?;
         }
@@ -724,6 +741,7 @@ impl Slot {
         if !self.off && self.saving[self.cur].is_some() {
             return Err(SaveInFlight { slot: self.cur }.into());
         }
+        self.sealed[self.cur] = None;
         Ok(self.engine.as_mut())
     }
 
@@ -755,6 +773,9 @@ impl Slot {
     /// not kept; an engine failure is the request's error.
     fn save_held(&mut self, away: Option<&Arc<dyn Saved>>) -> Result<(), EngineError> {
         if self.cache.covers(&self.held) {
+            return Ok(());
+        }
+        if away.is_none() && !self.snapshot_fits()? {
             return Ok(());
         }
         let t = Instant::now();
@@ -829,12 +850,15 @@ impl Slot {
     /// the cache as a copy still running, so the next request that cuts the
     /// slot finds it saved instead of taking a snapshot on its own path. The
     /// cost here is the call that begins the copy. A pool with no room for it
-    /// ([`StateError::NoRoom`]) gives up the oldest landed state (never one
-    /// whose copy still runs) and is asked once more; only then is the state
-    /// snapshotted on this path, `fallback` in the `Save` naming the pool
-    /// `full` or `fragmented`. Nothing happens for an engine that copies on
-    /// the request path, a cache that is off, a slot that holds nothing or a
-    /// state a cached one already keeps all of.
+    /// ([`StateError::NoRoom`]) gives up its landed states, oldest first and
+    /// never one whose copy still runs, and is asked again after each, since
+    /// the room one state gives back may lie apart from the rest that is
+    /// free; only when no landed state is left is the state snapshotted on
+    /// this path, `fallback` in the `Save` naming the pool `full` or
+    /// `fragmented`. A state that passes the whole pool gives up nothing.
+    /// Nothing happens for an engine that copies on the request path, a cache
+    /// that is off, a slot that holds nothing or a state a cached one already
+    /// keeps all of.
     pub(crate) fn seal(&mut self, slot: usize) -> Result<(), EngineError> {
         if !self.cache.enabled() || !self.engine.snapshots_async() {
             return Ok(());
@@ -845,13 +869,16 @@ impl Slot {
             return Ok(());
         }
         self.settle(slot)?;
+        if !self.snapshot_fits()? {
+            return Ok(());
+        }
         let t = Instant::now();
         let mut begun = self.engine.snapshot_begin();
-        if let Err(StateError::NoRoom { need, held, .. }) = &begun {
-            // A state that passes the whole pool has no room to make.
-            if need <= held && self.evict_for_room() {
-                begun = self.engine.snapshot_begin();
-            }
+        while let Err(StateError::NoRoom { need, held, .. }) = &begun
+            && need <= held
+            && self.evict_for_room()
+        {
+            begun = self.engine.snapshot_begin();
         }
         match begun {
             Ok(p) => self.keep_pending(slot, p, ms_since(t)),
@@ -873,6 +900,23 @@ impl Slot {
         }
     }
 
+    fn snapshot_fits(&self) -> Result<bool, EngineError> {
+        let note = match self.engine.snapshot_size() {
+            Ok(Some(bytes)) => self.cache.admission(self.held.len(), bytes),
+            Ok(None) => None,
+            Err(StateError::Engine(e)) => return Err(e),
+            Err(e) => Some(CacheNote::Skip {
+                positions: self.held.len(),
+                why: format!("the engine could not size its snapshot: {e}"),
+            }),
+        };
+        if let Some(note) = note {
+            self.engine.note(&note);
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
     /// `slot`'s state taken on this path, the engine having begun no copy of
     /// it for `why`: [`StateError::NoRoom`] keeps it with the pool's state
     /// named, any other refusal is noted and keeps nothing.
@@ -887,7 +931,11 @@ impl Slot {
         let t = Instant::now();
         match self.engine.snapshot() {
             Ok(state) => {
+                let sealed = Arc::downgrade(&state);
                 self.keep(slot, state, true, Some(fallback), t);
+                if self.cache.contains(&sealed, self.held_of(slot)) {
+                    self.sealed[slot] = Some(sealed);
+                }
                 Ok(())
             }
             Err(StateError::Engine(e)) => Err(e),
@@ -924,6 +972,7 @@ impl Slot {
             self.engine.note(&note);
         }
         if kept {
+            self.sealed[slot] = Some(Arc::downgrade(pending.state()));
             self.saving[slot] = Some(pending);
             Ok(())
         } else {
@@ -1618,9 +1667,10 @@ impl Think {
 /// thread can step several slots' generations in one engine call. `ids` is
 /// non-empty and shorter than the context. [`Gen::timings`] are filled even
 /// when the sink failed midway (the caller's counters still see the work
-/// done). A greedy request that asks for no probabilities never asks the
-/// engine for its logits, and takes its tokens after the first through the
-/// engine's passes. `tick` sees the timings after every generated token.
+/// done). A greedy request that bans no id and asks for no probabilities
+/// never asks the engine for its logits, and takes its tokens after the
+/// first through the engine's passes. `tick` sees the timings after every
+/// generated token.
 pub(crate) struct Gen {
     n: usize,
     ctx_max: usize,
@@ -1628,6 +1678,9 @@ pub(crate) struct Gen {
     stops: Vec<u32>,
     /// The stop ids under `ignore_eos`, else empty.
     banned: Vec<u32>,
+    /// Whether the request is greedy: one that bans an id draws through
+    /// [`banning`] only where the engine's argmax is banned.
+    greedy: bool,
     /// The engine's logits row, or empty on a greedy request.
     logits: Vec<f32>,
     tim: Timings,
@@ -1646,8 +1699,8 @@ pub(crate) struct Gen {
     stop: StopKind,
     stopping_word: String,
     truncated: bool,
-    /// A pass's rows; 1 steps. A request with no banned id passes when it is
-    /// greedy, or samples on an engine that drafts sampled requests.
+    /// A pass's rows; 1 steps. A request passes when it is greedy, or draws
+    /// (samples or bans an id) on an engine that drafts sampled requests.
     rows: usize,
     /// The last pass's kept tokens, and how many of them the loop has taken.
     kept: Vec<u32>,
@@ -1709,14 +1762,19 @@ impl Gen {
         } else {
             Vec::new()
         };
+        let greedy = sampler.is_none();
+        let sampler = if banned.is_empty() {
+            sampler
+        } else {
+            Some(banning(sampler, banned.clone()))
+        };
         let probs = p.logprobs.as_ref().map(Ask::collector);
-        // A greedy request reads the logits only to step past a banned argmax,
-        // for the probabilities it asked for, or to pick among the ids its
-        // program allows.
+        // A greedy request that bans no id reads the logits only for the
+        // probabilities it asked for, or to pick among the ids its program
+        // allows.
         let logits = vec![
             0.0f32;
-            if sampler.is_some() || !banned.is_empty() || probs.is_some() || p.constraint.is_some()
-            {
+            if sampler.is_some() || probs.is_some() || p.constraint.is_some() {
                 slot.vocab.n_vocab()
             } else {
                 0
@@ -1724,7 +1782,6 @@ impl Gen {
         ];
         let rows = if takes_passes(
             sampler.as_ref(),
-            &banned,
             probs.is_some(),
             p.constraint.is_some(),
             slot.engine.as_ref(),
@@ -1739,6 +1796,7 @@ impl Gen {
             sampler,
             stops,
             banned,
+            greedy,
             logits,
             tim: Timings::default(),
             t1: Instant::now(),
@@ -1803,9 +1861,11 @@ impl Gen {
 
     /// The id the loop takes for an engine answer `g`: the next forced close id
     /// while one is queued (the engine's answer is discarded — the loop never
-    /// commits it, so nothing desyncs), else the sampled or greedy choice. A
-    /// request that asks for probabilities reads the row first, as the engine
-    /// wrote it, before a banned id's logit is set to -inf.
+    /// commits it, so nothing desyncs), else the request's draw from the row
+    /// (a sampled one, or one that bans an id: [`banning`] draws from a
+    /// copy) or the engine's argmax `g`, which a greedy request keeps unless
+    /// it is banned. A request that asks for probabilities reads the row as
+    /// the engine wrote it.
     fn answer(&mut self, g: u32) -> u32 {
         if let Some(c) = self.probs.as_mut() {
             c.read(&self.logits);
@@ -1828,13 +1888,12 @@ impl Gen {
                 }
             };
         }
-        choose(
-            &mut self.sampler,
-            g,
-            &mut self.logits,
-            &self.history,
-            &self.banned,
-        )
+        match self.sampler.as_mut() {
+            Some(draw) if !self.greedy || self.banned.contains(&g) => {
+                draw(&self.logits, &self.history)
+            }
+            _ => g,
+        }
     }
 
     /// Whether a close id is queued to force: the budget spent with the span
@@ -1916,7 +1975,6 @@ impl Gen {
         // the passes make at most the rest.
         let passes = takes_passes(
             self.sampler.as_ref(),
-            &self.banned,
             self.probs.is_some(),
             self.walk.is_some(),
             slot.engine.as_ref(),
@@ -2815,6 +2873,10 @@ mod cache_tests {
         fn cache_ram(&self) -> u64 {
             self.budget
         }
+        fn snapshots_async(&self) -> bool {
+            true
+        }
+
         fn snapshot(&self) -> Result<Arc<dyn Saved>, StateError> {
             std::thread::sleep(self.snapshot_takes);
             self.log.lock().expect("the log").snapshots += 1;
@@ -3244,33 +3306,22 @@ mod cache_tests {
     }
 
     /// The mock under [`MockEngine::with_async_snapshots`] in a slot of
-    /// `slots` slots, its states copied in `copy`, and a probe of the notes
-    /// the server printed.
+    /// `slots` slots, its states copied in `copy` (their room taken from a
+    /// pool of `cells` cells of [`CELL`] bytes when given), and a probe of
+    /// the notes the server printed.
     fn async_slot(
         slots: usize,
         copy: Duration,
+        cells: Option<usize>,
     ) -> (Slot, Arc<SaveStats>, Arc<Mutex<Vec<CacheNote>>>) {
         let (mock, stats) = MockEngine::new(4096)
             .with_slots(slots)
             .with_cache_ram(1 << 20)
             .with_async_snapshots(copy);
-        noted_slot(mock, slots, stats)
-    }
-
-    /// [`async_slot`] whose copies take their room from a pool of `cells`
-    /// cells of [`CELL`] bytes, and land at once.
-    fn pooled_slot(cells: usize) -> (Slot, Arc<SaveStats>, Arc<Mutex<Vec<CacheNote>>>) {
-        let (mock, stats) = MockEngine::new(4096)
-            .with_cache_ram(1 << 20)
-            .with_async_snapshots(Duration::ZERO);
-        noted_slot(mock.with_staging(CELL, cells), 1, stats)
-    }
-
-    fn noted_slot(
-        mock: MockEngine,
-        slots: usize,
-        stats: Arc<SaveStats>,
-    ) -> (Slot, Arc<SaveStats>, Arc<Mutex<Vec<CacheNote>>>) {
+        let mock = match cells {
+            Some(cells) => mock.with_staging(CELL, cells),
+            None => mock,
+        };
         let notes = Arc::new(Mutex::new(Vec::new()));
         let engine = Noted {
             inner: mock,
@@ -3286,6 +3337,9 @@ mod cache_tests {
     }
 
     impl Engine for Noted {
+        fn snapshot_size(&self) -> Result<Option<u64>, StateError> {
+            self.inner.snapshot_size()
+        }
         fn tokenizer(&self) -> Arc<dyn Tokenizer> {
             self.inner.tokenizer()
         }
@@ -3355,7 +3409,7 @@ mod cache_tests {
     /// under the copy's time and no wait noted.
     #[test]
     fn a_conversation_switch_pays_no_snapshot_on_the_request_path() {
-        let (mut slot, stats, notes) = async_slot(1, COPY);
+        let (mut slot, stats, notes) = async_slot(1, COPY, None);
         served(
             &mut slot,
             0,
@@ -3390,7 +3444,7 @@ mod cache_tests {
     /// `Landed` note, and no call ever rewrote rows the copy read.
     #[test]
     fn a_request_waits_for_its_slots_copy_before_it_cuts_the_rows() {
-        let (mut slot, stats, notes) = async_slot(1, COPY);
+        let (mut slot, stats, notes) = async_slot(1, COPY, None);
         served(
             &mut slot,
             0,
@@ -3416,7 +3470,7 @@ mod cache_tests {
     /// [`SaveInFlight`], by name, and nothing is rewritten.
     #[test]
     fn a_rewrite_under_a_running_copy_is_save_in_flight() {
-        let (mut slot, stats, _) = async_slot(1, COPY);
+        let (mut slot, stats, _) = async_slot(1, COPY, None);
         served(
             &mut slot,
             0,
@@ -3460,12 +3514,26 @@ mod cache_tests {
             .collect()
     }
 
+    /// Why each state the server evicted left, in order.
+    fn evicted(notes: &[CacheNote]) -> Vec<&'static str> {
+        notes
+            .iter()
+            .filter_map(|n| match n {
+                CacheNote::Evict { why, .. } => Some(*why),
+                _ => None,
+            })
+            .collect()
+    }
+
+    const NO_ROOM: &str = "the engine's staging pool had no room";
+
     /// A pool with no room for a state's copy gives up its oldest landed
-    /// state and is asked once more: the copy is begun, no snapshot is taken
-    /// on the request path, and the save names no fallback.
+    /// state, and no other once the copy fits: the copy is begun, no
+    /// snapshot is taken on the request path, and the save names no
+    /// fallback.
     #[test]
     fn a_full_pool_gives_up_its_oldest_landed_state_and_the_copy_is_begun() {
-        let (mut slot, stats, notes) = pooled_slot(2);
+        let (mut slot, stats, notes) = async_slot(1, Duration::ZERO, Some(2));
         for p in SHORT {
             served(&mut slot, 0, &enc(p));
         }
@@ -3482,43 +3550,65 @@ mod cache_tests {
         );
         let n = notes.lock().expect("notes");
         assert_eq!(saves(&n), [(true, true, None); 3], "{n:?}");
-        let evicted: Vec<_> = n
-            .iter()
-            .filter_map(|n| match n {
-                CacheNote::Evict { why, .. } => Some(*why),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(evicted, ["the engine's staging pool had no room"], "{n:?}");
+        assert_eq!(evicted(&n), [NO_ROOM], "{n:?}");
     }
 
-    /// When the room the oldest state gave back is in pieces, the state is
-    /// snapshotted on the request path and the `Save` names the pool
-    /// `fragmented`: its free cells could hold it, not next to each other.
-    /// (Before the eviction the pool was `full`, one cell free of two needed.)
+    /// When the room the oldest state gave back lies apart from the rest
+    /// that is free, the next oldest leaves too, until the copy fits: it is
+    /// begun, and no snapshot is taken on the request path. (The long state
+    /// needs two cells next to each other; one of four is free, then two
+    /// apart once the oldest left, then three, two of them together.)
     #[test]
-    fn a_pool_still_without_room_after_the_eviction_falls_back_named() {
-        let (mut slot, stats, notes) = pooled_slot(4);
+    fn a_fragmented_pool_gives_up_landed_states_until_the_copy_fits() {
+        let (mut slot, stats, notes) = async_slot(1, Duration::ZERO, Some(4));
         for p in SHORT {
             served(&mut slot, 0, &enc(p));
         }
         served(&mut slot, 0, &enc(LONG));
-        assert_eq!(stats.no_room.load(SeqCst), 2, "both asks found no room");
+        assert_eq!(stats.no_room.load(SeqCst), 2, "full, then in pieces");
         assert_eq!(
             stats.begun.load(SeqCst),
-            3,
-            "the long state's copy was never begun"
+            4,
+            "the long state's copy was begun"
         );
         assert_eq!(
             stats.sync_snapshots.load(SeqCst),
-            1,
-            "its snapshot, on the request path"
+            0,
+            "the request path took a snapshot"
         );
+        let n = notes.lock().expect("notes");
+        assert_eq!(saves(&n), [(true, true, None); 4], "{n:?}");
+        assert_eq!(
+            evicted(&n),
+            [NO_ROOM; 2],
+            "two states left for the room: {n:?}"
+        );
+    }
+
+    /// When no landed state is left to give up and the pool's free room is
+    /// still in pieces, around a state whose copy still runs, the state is
+    /// snapshotted on the request path and the `Save` names the pool
+    /// `fragmented`. (Of three cells, slot 0's landed state holds the first
+    /// and slot 1's running copy the second; the long state needs two next
+    /// to each other.)
+    #[test]
+    fn a_pool_still_without_room_after_the_eviction_falls_back_named() {
+        let (mut slot, stats, notes) = async_slot(2, COPY * 4, Some(3));
+        served(&mut slot, 0, &enc(SHORT[0]));
+        slot.settle(0).expect("the first copy lands");
+        served(&mut slot, 1, &enc(SHORT[1]));
+        served(&mut slot, 0, &enc(LONG));
+        assert_eq!(stats.no_room.load(SeqCst), 2, "full, then in pieces");
+        assert_eq!(
+            stats.sync_snapshots.load(SeqCst),
+            1,
+            "the long state's snapshot, on the request path"
+        );
+        assert_eq!(stats.hazards.load(SeqCst), 0, "a cut under a copy");
         let n = notes.lock().expect("notes");
         assert_eq!(
             saves(&n),
             [
-                (true, true, None),
                 (true, true, None),
                 (true, true, None),
                 (true, false, Some("fragmented")),
@@ -3526,11 +3616,9 @@ mod cache_tests {
             "{n:?}"
         );
         assert_eq!(
-            n.iter()
-                .filter(|n| matches!(n, CacheNote::Evict { .. }))
-                .count(),
-            1,
-            "one state left for the room: {n:?}"
+            evicted(&n),
+            [NO_ROOM],
+            "only the landed state left, never the running copy's: {n:?}"
         );
     }
 
@@ -3538,7 +3626,7 @@ mod cache_tests {
     /// as `full` at once: no state leaves for room that cannot be made.
     #[test]
     fn a_state_over_the_whole_pool_evicts_nothing() {
-        let (mut slot, stats, notes) = pooled_slot(1);
+        let (mut slot, stats, notes) = async_slot(1, Duration::ZERO, Some(1));
         served(&mut slot, 0, &enc(SHORT[0]));
         served(&mut slot, 0, &enc(LONG));
         assert_eq!(stats.sync_snapshots.load(SeqCst), 1);
@@ -3548,10 +3636,70 @@ mod cache_tests {
             [(true, true, None), (true, false, Some("full"))],
             "{n:?}"
         );
-        assert!(
-            n.iter().all(|n| !matches!(n, CacheNote::Evict { .. })),
-            "a state left for nothing: {n:?}"
+        assert!(evicted(&n).is_empty(), "a state left for nothing: {n:?}");
+    }
+
+    #[test]
+    fn a_sealed_sparse_state_is_not_copied_again_on_a_switch() {
+        let log = Arc::new(Mutex::new(Log::default()));
+        let mut slot = Slot::new(Box::new(Probe::new(1 << 20, false, &log)));
+        outcome(&mut slot, &[10; 20]);
+        slot.seal(0).expect("a sealed state");
+        outcome(&mut slot, &[11; 20]);
+        assert_eq!(log.lock().expect("the log").snapshots, 1);
+    }
+
+    #[test]
+    fn an_over_budget_state_is_never_copied_for_seal_or_switch() {
+        let (mock, stats) = MockEngine::new(4096)
+            .with_cache_ram(CELL)
+            .with_async_snapshots(Duration::ZERO);
+        let notes = Arc::new(Mutex::new(Vec::new()));
+        let mut slot = Slot::new(Box::new(Noted {
+            inner: mock.with_staging(CELL, 1),
+            notes: Arc::clone(&notes),
+        }));
+        served(&mut slot, 0, &enc(LONG));
+        served(&mut slot, 0, &enc(SHORT[0]));
+        assert_eq!(
+            stats.sync_snapshots.load(SeqCst),
+            0,
+            "a switch or fallback copied an oversized state"
         );
+        assert_eq!(
+            stats.no_room.load(SeqCst),
+            0,
+            "an oversized state reached staging"
+        );
+        assert_eq!(
+            stats.begun.load(SeqCst),
+            1,
+            "only the small state is copied"
+        );
+        assert!(
+            notes
+                .lock()
+                .expect("notes")
+                .iter()
+                .any(|n| matches!(n, CacheNote::Skip { why, .. } if why.contains("budget")))
+        );
+    }
+
+    #[test]
+    fn snapshot_admission_uses_array_bytes_at_the_exact_budget() {
+        for fits in [false, true] {
+            let (mut slot, stats, _) = async_slot(1, Duration::ZERO, Some(2));
+            outcome(&mut slot, &enc(SHORT[0]));
+            let bytes = slot
+                .engine
+                .snapshot_size()
+                .expect("a size")
+                .expect("known bytes");
+            slot.cache = crate::promptcache::PromptCache::new(bytes - u64::from(!fits));
+            slot.seal(0).expect("a seal");
+            assert_eq!(stats.begun.load(SeqCst), usize::from(fits));
+            assert_eq!(stats.sync_snapshots.load(SeqCst), 0);
+        }
     }
 
     /// A cache hit puts back the prefix the request keeps and nothing past
@@ -3559,7 +3707,7 @@ mod cache_tests {
     /// state's, and no state goes back whole.
     #[test]
     fn a_cache_hit_puts_back_only_the_prefix_it_keeps() {
-        let (mut slot, stats, notes) = async_slot(1, COPY);
+        let (mut slot, stats, notes) = async_slot(1, COPY, None);
         let a1 = enc("<｜User｜>the cat sat on the mat and the dog sat on the log and the ");
         let o1 = served(&mut slot, 0, &a1);
         served(&mut slot, 0, &enc("xyz uvw xyz uvw xyz "));
@@ -4080,11 +4228,34 @@ mod think_tests {
 mod sampled_tests {
     use std::sync::{Arc, Mutex};
 
-    use super::{GenParams, Slot, Timings, generate};
+    use super::{GenParams, Slot, Timings, banning, generate};
     use crate::engine::{Drafted, Engine, EngineError, Sampler, SamplingParams, Tokenizer};
     use crate::mock::{DraftMock, MockTokenizer};
     use crate::reasoning::{ThinkEntry, ThinkTags};
     use crate::sampling;
+
+    #[test]
+    fn a_greedy_banning_draw_ties_signed_zeros_by_id() {
+        let mut draw = banning(None, vec![2]);
+        for row in [[-0.0, 0.0, -1.0], [0.0, -0.0, -1.0]] {
+            assert_eq!(draw(&row, &[]), 0);
+        }
+        let mut draw = banning(None, vec![0]);
+        assert_eq!(draw(&[1.0, -0.0, 0.0], &[]), 1);
+    }
+
+    #[test]
+    fn a_sampled_banning_draw_keeps_the_rows_zero_signs() {
+        let sampler: Sampler = Box::new(|row, history| {
+            assert_eq!(row[0].to_bits(), (-0.0f32).to_bits());
+            assert_eq!(row[1].to_bits(), 0.0f32.to_bits());
+            assert_eq!(row[2], f32::NEG_INFINITY);
+            assert_eq!(history, [4, 5]);
+            sampling::argmax(row)
+        });
+        let mut draw = banning(Some(sampler), vec![2]);
+        assert_eq!(draw(&[-0.0, 0.0, -1.0], &[4, 5]), 1);
+    }
 
     /// [`DraftMock`] that logs what each request tells [`Engine::will_reply`].
     struct Replies {
@@ -4139,8 +4310,8 @@ mod sampled_tests {
 
     /// On an engine that drafts sampled requests, a sampled request tells it
     /// the tokens after its first, as a greedy one does (the passes make at
-    /// most those); the same request banning the end of generation, which
-    /// steps, tells it none.
+    /// most those), and so does the same request banning the end of
+    /// generation, which draws in those passes too.
     #[test]
     fn a_sampled_request_tells_a_drafting_engine_its_passes() {
         let replies = Arc::new(Mutex::new(Vec::new()));
@@ -4182,6 +4353,6 @@ mod sampled_tests {
             )
             .expect("a generation");
         }
-        assert_eq!(*replies.lock().expect("the replies"), [Some(7), Some(0)]);
+        assert_eq!(*replies.lock().expect("the replies"), [Some(7), Some(7)]);
     }
 }

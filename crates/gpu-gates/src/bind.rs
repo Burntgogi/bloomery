@@ -115,6 +115,22 @@ impl Vocab {
         Ok(self)
     }
 
+    /// Registers ChatML's message start when both the template and vocabulary carry it.
+    pub fn with_chat_template(self, template: &str) -> Result<Vocab, GateError> {
+        const MESSAGE_START: &str = "<|im_start|>";
+        if template.contains(MESSAGE_START)
+            && self
+                .tok
+                .special_tokens()
+                .iter()
+                .any(|&id| self.tok.text(id) == Some(MESSAGE_START))
+        {
+            self.with_user_start(MESSAGE_START)
+        } else {
+            Ok(self)
+        }
+    }
+
     /// The vocabulary itself.
     pub fn tokenizer(&self) -> &tokenizer::Tokenizer {
         &self.tok
@@ -1164,6 +1180,7 @@ enum Cmd {
     },
     /// The sequence state, as a value.
     Save,
+    SaveSize,
     /// The sequence state, as a value whose copy may still run
     /// ([`Seat::snapshot_begin`]).
     SaveBegin,
@@ -1229,6 +1246,7 @@ enum Extra {
     Splits(Vec<usize>),
     /// A `Save`'s state, or its failure with its kind ([`snapshot_of`]).
     Saved(Result<Arc<dyn Saved>, StateError>),
+    SaveSize(Result<Option<u64>, StateError>),
     /// A `SaveBegin`'s state with its copy in flight, or its failure with its
     /// kind ([`begin_of`]).
     Begun(Result<Pending, StateError>),
@@ -1457,6 +1475,10 @@ pub trait Seat: 'static {
     /// request's: the server keeps no state and serves on. Any other error is
     /// the engine's, which ends the server.
     fn snapshot(&mut self) -> Result<Arc<dyn Saved>, GateError>;
+    /// The host array bytes of a snapshot, without reading its stores.
+    fn snapshot_size(&mut self) -> Result<Option<u64>, GateError> {
+        Ok(None)
+    }
     /// Whether [`Seat::snapshot_begin`] copies the state on a stream of the
     /// seat's own, so the server may ask for it when a request ends without
     /// stopping the slots (`serve::Engine::snapshots_async`). The default is
@@ -1703,6 +1725,7 @@ impl SeatEngine {
                             (result, None, extra)
                         }
                         Cmd::Save => (Ok(0), None, Extra::Saved(snapshot_of(&mut g))),
+                        Cmd::SaveSize => (Ok(0), None, Extra::SaveSize(snapshot_size_of(&mut g))),
                         Cmd::SaveBegin => (Ok(0), None, Extra::Begun(begin_of(&mut g))),
                         Cmd::SavePoll(p) => (Ok(0), None, Extra::Polled(p.flight().poll())),
                         Cmd::SaveWait(p) => {
@@ -1858,6 +1881,17 @@ impl Link {
             (Err(e), _) => Err(StateError::Engine(EngineError(e))),
             (Ok(_), _) => Err(StateError::Engine(EngineError(
                 "the engine thread answered a save with no state".to_owned(),
+            ))),
+        }
+    }
+
+    fn snapshot_size(&self) -> Result<Option<u64>, StateError> {
+        let reply = self.ask(Cmd::SaveSize)?;
+        match (reply.result, reply.extra) {
+            (Ok(_), Extra::SaveSize(size)) => size,
+            (Err(e), _) => Err(StateError::Engine(EngineError(e))),
+            (Ok(_), _) => Err(StateError::Engine(EngineError(
+                "the engine thread answered a snapshot size with no size".to_owned(),
             ))),
         }
     }
@@ -2334,6 +2368,7 @@ fn serve_cmd<S: Seat>(
         Cmd::Keep(..)
         | Cmd::Splits { .. }
         | Cmd::Save
+        | Cmd::SaveSize
         | Cmd::SaveBegin
         | Cmd::SavePoll(_)
         | Cmd::SaveWait(_)
@@ -2560,6 +2595,12 @@ fn snapshot_of<S: Seat + ?Sized>(g: &mut S) -> Result<Arc<dyn Saved>, StateError
         .map_err(|e| seat_failure(&*e, format!("snapshot at position {at}")))
 }
 
+fn snapshot_size_of<S: Seat + ?Sized>(g: &mut S) -> Result<Option<u64>, StateError> {
+    let at = g.pos();
+    g.snapshot_size()
+        .map_err(|e| seat_failure(&*e, format!("snapshot size at position {at}")))
+}
+
 /// `state` back into the selected slot ([`Seat::resume`]), on the engine
 /// thread; a failure with its kind ([`seat_failure`]).
 fn resume_of<S: Seat + ?Sized>(g: &mut S, state: &dyn Saved) -> Result<(), StateError> {
@@ -2603,8 +2644,8 @@ fn resume_prefix_of<S: Seat + ?Sized>(
 /// server's kind: a staging pool with no room for the state
 /// (`bloomery_gpu::checkpoint::staging::NoRoom` anywhere in the chain) is
 /// `NoRoom`, its three numbers one to one, which the server answers by giving
-/// up its oldest landed state and asking once more; a refusal by name (a
-/// `GpuError` of kind `State` or `Shape` anywhere in the chain,
+/// up its landed states, oldest first, until the copy fits; a refusal by name
+/// (a `GpuError` of kind `State` or `Shape` anywhere in the chain,
 /// [`Seat::snapshot`]) is `Format`, the request's, which the server answers
 /// by keeping no state or by resetting the slot; any other failure — the
 /// card's, the driver's, a fault, an error of no known kind — is `Engine`,
@@ -3157,6 +3198,10 @@ impl Engine for SeatEngine {
         self.cache_ram
     }
 
+    fn snapshot_size(&self) -> Result<Option<u64>, StateError> {
+        self.link.snapshot_size()
+    }
+
     /// The seat's state ([`Link::snapshot`]): a refusal by name is the
     /// request's (the server keeps no state), any other failure fatal.
     fn snapshot(&self) -> Result<Arc<dyn Saved>, StateError> {
@@ -3265,12 +3310,52 @@ impl Drop for SeatEngine {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cmd, Link, Reply};
+    use super::{Cmd, Link, Reply, Vocab};
     use std::sync::mpsc;
 
     const N_VOCAB: usize = 8;
 
     // PIN(2026-10-21): Removed seat-source/copy wiring assertions; the shared binder reads parsed levers.
+
+    #[test]
+    fn chat_templates_register_only_a_special_message_start() {
+        use gguf::Value;
+        use serve::Tokenizer;
+
+        for (text, kind, template, expected) in [
+            ("<|im_start|>", 3, "<|im_start|>user", vec![2]),
+            ("<|im_start|>", 3, "{{ messages }}", vec![]),
+            ("<|im_start|>", 1, "<|im_start|>user", vec![]),
+            ("other", 3, "<|im_start|>user", vec![]),
+        ] {
+            let tok = tokenizer::Tokenizer::from_keys(&[
+                ("tokenizer.ggml.model".into(), Value::String("gpt2".into())),
+                ("tokenizer.ggml.pre".into(), Value::String("qwen2".into())),
+                (
+                    "tokenizer.ggml.tokens".into(),
+                    Value::Array(
+                        ["<s>", "</s>", text]
+                            .into_iter()
+                            .map(|s| Value::String(s.into()))
+                            .collect(),
+                    ),
+                ),
+                (
+                    "tokenizer.ggml.token_type".into(),
+                    Value::Array([3, 3, kind].into_iter().map(Value::I32).collect()),
+                ),
+                ("tokenizer.ggml.merges".into(), Value::Array(vec![])),
+                ("tokenizer.ggml.bos_token_id".into(), Value::U32(0)),
+                ("tokenizer.ggml.eos_token_id".into(), Value::U32(1)),
+            ])
+            .unwrap();
+            let vocab = Vocab::new(tok)
+                .unwrap()
+                .with_chat_template(template)
+                .unwrap();
+            assert_eq!(vocab.user_start(), expected, "{text} {kind} {template}");
+        }
+    }
 
     /// The factory's sampler is the sampler crate's chain over the request's
     /// parameters, and a parameter the chain refuses (a non-finite
@@ -4036,6 +4121,7 @@ mod tests {
         use super::super::{
             Cached, Cmd, Extra, Landing, Link, PIPE_CHUNK, PutBack, Reply, Seat, begin, begin_of,
             put_back, restore_from, resume_of, resume_prefix_of, save_into, settle, snapshot_of,
+            snapshot_size_of,
         };
         use crate::GateError;
 
@@ -4153,6 +4239,10 @@ mod tests {
         impl Seat for Caches {
             no_steps!();
 
+            fn snapshot_size(&mut self) -> Result<Option<u64>, GateError> {
+                Err((self.fail)())
+            }
+
             fn snapshot(&mut self) -> Result<Arc<dyn Saved>, GateError> {
                 Err((self.fail)())
             }
@@ -4239,12 +4329,18 @@ mod tests {
         struct Whole {
             pos: usize,
             resumes: usize,
+            snapshots: usize,
         }
 
         impl Seat for Whole {
             no_steps!();
 
+            fn snapshot_size(&mut self) -> Result<Option<u64>, GateError> {
+                Ok(Some(0))
+            }
+
             fn snapshot(&mut self) -> Result<Arc<dyn Saved>, GateError> {
+                self.snapshots += 1;
                 Ok(Arc::new(Held(30)))
             }
 
@@ -4283,6 +4379,7 @@ mod tests {
                         Cmd::SaveState(chunks) => Extra::State(save_into(&mut seat, chunks)),
                         Cmd::RestoreState(chunks) => Extra::State(restore_from(&mut seat, chunks)),
                         Cmd::Save => Extra::Saved(snapshot_of(&mut seat)),
+                        Cmd::SaveSize => Extra::SaveSize(snapshot_size_of(&mut seat)),
                         Cmd::Resume(state) => Extra::Resumed(resume_of(&mut seat, &*state)),
                         Cmd::SaveBegin => Extra::Begun(begin_of(&mut seat)),
                         Cmd::SavePoll(p) => Extra::Polled(p.flight().poll()),
@@ -4359,6 +4456,7 @@ mod tests {
             let whole = Whole {
                 pos: 30,
                 resumes: 0,
+                snapshots: 0,
             };
             assert!(!whole.snapshots_async());
             let (mut link, worker) = file_link(whole);
@@ -4373,6 +4471,20 @@ mod tests {
             );
             link.tx = None;
             assert_eq!(worker.join().expect("the file thread").resumes, 1);
+        }
+
+        #[test]
+        fn a_snapshot_size_crosses_the_link_without_copying() {
+            let (mut link, worker) = file_link(Whole {
+                pos: 30,
+                resumes: 0,
+                snapshots: 0,
+            });
+            assert_eq!(link.snapshot_size().expect("a size query"), Some(0));
+            link.tx = None;
+            let seat = worker.join().expect("the file thread");
+            assert_eq!(seat.snapshots, 0);
+            assert_eq!(seat.pos, 30);
         }
 
         /// A body's sequence state of `.0` positions, every one a point.
@@ -4807,6 +4919,7 @@ mod tests {
             ];
             for (fail, refused) in cases {
                 let (mut link, worker) = file_link(Caches { pos: 7, fail });
+                let size = link.snapshot_size().expect_err("a failed size query");
                 let saved = link.snapshot().map(|_| ()).expect_err("a failed snapshot");
                 let resumed = link.resume(&held).expect_err("a failed resume");
                 let begun = link
@@ -4816,6 +4929,7 @@ mod tests {
                 let prefix = link.resume_prefix(&held, 3).expect_err("a failed prefix");
                 let want = fail().to_string();
                 for (e, head) in [
+                    (&size, "snapshot size at position 7: "),
                     (&saved, "snapshot at position 7: "),
                     (&resumed, "resume of a state of 4 positions: "),
                     (&begun, "snapshot begun at position 7: "),

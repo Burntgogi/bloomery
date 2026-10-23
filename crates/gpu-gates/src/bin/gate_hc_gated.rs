@@ -41,8 +41,9 @@
 //!    weights and `mixed` within the bands the error model derives for the q8
 //!    step per 32 values (`wide_lo_band`, `wide_g_rel`) of `mix_ref`; four of
 //!    the columns each its one-column mix bit for bit and a rerun
-//!    bit-identical; a NaN in one column raises the quantizer's site and the
-//!    mix's and leaves the others clean;
+//!    bit-identical; over 8 columns the same bits and fault eager and in a
+//!    graph; a NaN in one column raises the quantizer's site and the mix's
+//!    and leaves the others clean;
 //!    38 columns on a 37-column scratch refused by name, and — before any
 //!    launch, the streams as they went in — planes of another shape and a
 //!    one-expert table filled for fewer slots than the mix's columns.
@@ -50,10 +51,15 @@
 //! A BF16 site (down and up in their words, `HcMatrix::Bf16`, values on
 //! the Q8_0 site's ranges) runs clauses 1, 2, 3 and 8 again: its down and
 //! up rows dotted in `card::f32_dot`'s order over the widened values, the
-//! dense gemv beside them `bf16_gemv`, and its wide arm the BF16 tile with
-//! no quantizer, so a NaN raises the mix's site alone. Maximum-finite BF16
-//! up weights that overflow the up projection raise the site and leave NaN
-//! mixed outputs in both capped and wide arms, with a finite bottleneck.
+//! dense gemv beside them `bf16_gemv`, and its wide arm the BF16 prompt
+//! product with no quantizer, so a NaN raises the mix's site alone and a
+//! subnormal column leaves the other columns' bits unchanged. On GB10 that
+//! product runs on BF16 tensor cores: the down and up within the BF16
+//! operand bands (`check_mma`), and in a range fixture each cell the MMA
+//! product when its row and column are in range and the exact replay when
+//! either is not. Maximum-finite BF16 up weights that overflow the up
+//! projection raise the site and leave NaN mixed outputs in both capped and
+//! wide arms, with a finite bottleneck.
 
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
@@ -71,12 +77,12 @@ mod gate {
     use bloomery_gpu::q8f32::{GemvOut, Q8_0GemvMcolArgs, Q8F32Kernels};
     use bloomery_gpu::weights::q8_0_planes;
     use bloomery_gpu::{DeviceTensor, Fault, FaultSite, Gpu, GpuError, LAYER_NONE};
-    use bloomery_gpu_gates::rounding::q8_32_rel;
+    use bloomery_gpu_gates::rounding::{check_mma, q8_32_rel};
     use bloomery_gpu_gates::{
         GateError, activations, bits_equal, max_rel_err, max_ulps, no_local_depot, verdict,
     };
-    use cuda_core::DeviceBuffer;
-    use gguf::quant::{GgmlType, Q8Block, half_to_f32};
+    use cuda_core::{CudaStream, DeviceBuffer};
+    use gguf::quant::{GgmlType, Q8Block, bf16_bits_to_f32, fp32_to_bf16_bits, half_to_f32};
     use runtime::hc_gated::card::{self, Act};
     use runtime::hc_gated::{
         Geometry, HcRefused, LO_BAND, MAX_COLS, MIXED_BAND, MixWeights, XN_BAND, combine, mix_ref,
@@ -455,6 +461,10 @@ mod gate {
             "hc_gated_combine_4w",
             "hc_gated_lo_4x320",
             "hc_gated_mix_4",
+            "hc_gated_up_mma_mix_4",
+            // PIN(2026-10-23): bf16_mma_gemm_columns is gone: bf16_mma_gemm keeps every
+            // cell to its own row and column, so the HC prompt products run it.
+            "bf16_mma_gemm",
         ])?;
         if !ok {
             return Err(bloomery_gpu_gates::checks_failed());
@@ -1067,22 +1077,60 @@ mod gate {
         };
         w.gemm
             .enqueue_route_dense(st, m, &mut w.route, c.gpu.unlabelled_sink())?;
-        w.hcw.enqueue_mix(
-            st,
-            WideMixArgs {
-                res: &mut res_d,
-                before,
-                w: site.weights(inject),
-                eps: EPS,
-                m,
-                fault: c.gpu.unlabelled_sink(),
-                scratch: &mut w.scratch,
-                gemm: &w.g32,
-                q8f32: &c.q8,
-                dense: &w.route,
-                mixed: &mut mixed_d,
-            },
-        )?;
+        let (hcw, g32, route) = (&w.hcw, &w.g32, &w.route);
+        let enqueue = |st: &CudaStream,
+                       res: &mut DeviceBuffer<f32>,
+                       mixed: &mut DeviceBuffer<f32>,
+                       scratch: &mut HcWideScratch| {
+            hcw.enqueue_mix(
+                st,
+                WideMixArgs {
+                    res,
+                    before,
+                    w: site.weights(inject),
+                    eps: EPS,
+                    m,
+                    fault: c.gpu.unlabelled_sink(),
+                    scratch,
+                    gemm: g32,
+                    q8f32: &c.q8,
+                    dense: route,
+                    mixed,
+                },
+            )
+        };
+        enqueue(st, &mut res_d, &mut mixed_d, &mut w.scratch)?;
+        let found_fault = if m > MAX_COLS && matches!(pre, Pre::Plain) {
+            let eager = mixed_d.to_host_vec(st)?;
+            let eager_wgt = w.scratch.wgt.to_host_vec(st)?;
+            let eager_fault = c.gpu.take_fault()?;
+            res_d.copy_from_host(st, res)?;
+            mixed_d.copy_from_host(st, &vec![f32::NAN; z.mixed])?;
+            let graph = c
+                .gpu
+                .capture(|st| enqueue(st, &mut res_d, &mut mixed_d, &mut w.scratch))?;
+            graph.launch(st)?;
+            let same = bits_equal(&eager, &mixed_d.to_host_vec(st)?)
+                && bits_equal(&eager_wgt, &w.scratch.wgt.to_host_vec(st)?);
+            let graph_fault = c.gpu.take_fault()?;
+            let same = same && eager_fault == graph_fault;
+            println!(
+                "wide[graph] m={m} eager_graph_bits={same} {}",
+                verdict(same)
+            );
+            if !same {
+                return Err("HC wide eager/graph outputs or faults differ".into());
+            }
+            graph_fault
+        } else {
+            c.gpu.take_fault()?
+        };
+        if let Planes::Bf16 { up, .. } = &site.planes
+            && m > MAX_COLS
+        {
+            // Materialize the unfused product for the existing independent glue oracle.
+            c.q8.enqueue_bf16_prompt(st, up, &w.scratch.lo, m, &mut w.scratch.g)?;
+        }
         let s = &w.scratch;
         Ok(WideOut {
             res: res_d.to_host_vec(st)?,
@@ -1093,7 +1141,7 @@ mod gate {
             g: s.g.to_host_vec(st)?[..z.xn].to_vec(),
             wgt: s.wgt.to_host_vec(st)?[..z.wgt].to_vec(),
             mixed: mixed_d.to_host_vec(st)?,
-            fault: c.gpu.take_fault()?,
+            fault: found_fault,
         })
     }
 
@@ -1228,6 +1276,67 @@ mod gate {
                 verdict(p)
             );
         }
+        if matches!(site.planes, Planes::Bf16 { .. })
+            && c.gpu.context().compute_capability()? == (12, 1)
+        {
+            let down: Vec<Vec<f32>> = site
+                .down
+                .as_chunks::<WIDE>()
+                .0
+                .iter()
+                .map(|r| r.to_vec())
+                .collect();
+            let up: Vec<Vec<f32>> = site
+                .up
+                .as_chunks::<R>()
+                .0
+                .iter()
+                .map(|r| r.to_vec())
+                .collect();
+            ok &= check_mma("hc_down", (&o.down, &o.xn, WIDE), &down);
+            ok &= check_mma("hc_up", (&o.g, &o.lo, R), &up);
+
+            // Power-of-two weights, with one bit below BF16 in every activation,
+            // make each cell's path exact and visible: a cell in an in-range row
+            // and column keeps the MMA product of the BF16-rounded activation; a
+            // cell whose row (subnormal weights) or column (subnormal or above
+            // 2^47) holds an out-of-range operand is replayed on F32 activations.
+            let (rows, k, n) = (65, 64, 9);
+            let odd_rows = [5, 13, 21, 29, 37, 45, 53, 61, 64];
+            let odd_cols = [1, 2, 3, 8];
+            let mut words = vec![0x1f80_1f80u32; rows * k / 2];
+            for row in odd_rows {
+                words[row * k / 2..(row + 1) * k / 2].fill(0x0001_0001);
+            }
+            words[6 * k / 2..7 * k / 2].fill(0x3f80_3f80);
+            let mut input = vec![f32::from_bits(0x4f80_2000); n * k];
+            input[k..2 * k].fill(f32::from_bits(0x7b80_2000));
+            for col in [2, 3, 8] {
+                input[col * k..(col + 1) * k].fill(f32::from_bits(0x200));
+            }
+            let st = c.gpu.stream();
+            let weight = DeviceTensor::upload(st, &words, rows, k / 2)?;
+            let x = DeviceBuffer::from_host(st, &input)?;
+            let mut y = DeviceBuffer::from_host(st, &vec![f32::NAN; rows * n])?;
+            c.q8.enqueue_bf16_prompt(st, &weight, &x, n, &mut y)?;
+            let actual = y.to_host_vec(st)?;
+            let cells = actual.iter().enumerate().all(|(i, value)| {
+                let (row, col) = (i % rows, i / rows);
+                let w = f32::from_bits((words[row * k / 2] & 0xffff) << 16);
+                let x = if odd_rows.contains(&row) || odd_cols.contains(&col) {
+                    input[col * k]
+                } else {
+                    bf16_bits_to_f32(fp32_to_bf16_bits(input[col * k]))
+                };
+                let expected = (f64::from(w) * f64::from(x) * k as f64) as f32;
+                value.to_bits() == expected.to_bits()
+            });
+            ok &= cells;
+            println!(
+                "wide[bf16-cell-range] mma_kept_and_masked_replayed={cells} {}",
+                verdict(cells)
+            );
+        }
         // (c) the error model's bands against the f64 rule, per column.
         let mut worst = [0.0f64; 4];
         let mut past = Vec::new();
@@ -1337,6 +1446,26 @@ mod gate {
             shown(want),
             verdict(p)
         );
+        if matches!(site.planes, Planes::Bf16 { .. }) {
+            let mut tiny = res.clone();
+            tiny[2 * WIDE..3 * WIDE].fill(f32::from_bits(0x100));
+            let many = wide_mix(c, &mut w, site, true, &tiny, Pre::Plain, m)?;
+            let one = wide_mix(c, &mut w, site, true, col(&tiny, WIDE, 2), Pre::Plain, 1)?;
+            let others = (0..m).filter(|&k| k != 2).all(|k| {
+                bits_equal(col(&many.mixed, D, k), col(&o.mixed, D, k))
+                    && bits_equal(col(&many.wgt, S, k), col(&o.wgt, S, k))
+            });
+            let same = bits_equal(col(&many.mixed, D, 2), &one.mixed)
+                && bits_equal(col(&many.wgt, S, 2), &one.wgt)
+                && bits_equal(col(&many.lo, R, 2), &one.lo)
+                && bits_equal(col(&many.down, R, 2), &one.down);
+            let p = others && same && many.fault.is_none() && one.fault.is_none();
+            ok &= p;
+            println!(
+                "wide[subnormal_columns] other_columns_clean={others} one_column_bits={same} {}",
+                verdict(p)
+            );
+        }
         let past_cols = WIDE_COLS + 1;
         let res_long = activations(WIDE, past_cols, 0x3a04);
         // A route as wide as the call, so the refusal is the scratch's own.

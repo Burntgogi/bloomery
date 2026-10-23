@@ -282,14 +282,17 @@ pub trait Engine: Send {
     }
     /// The most positions one [`Engine::advance`] evaluates: 1 for an engine
     /// without a draft. Past 1 the engine drafts its greedy requests; a request
-    /// that needs the logits row (sampling, a banned id) takes plain
-    /// [`Engine::next`] steps instead, since a draft's pass keeps the target's
-    /// argmax and reads no row. Under a draft, `next` with `Some(out)` writes
-    /// the target's row of the step it ran.
+    /// that needs the logits row (sampling, a banned id) takes
+    /// [`Engine::advance_sampled`] passes on an engine that
+    /// [`Engine::drafts_sampled`], and plain [`Engine::next`] steps on any
+    /// other, since a greedy pass keeps the target's argmax and reads no row.
+    /// Under a draft, `next` with `Some(out)` writes the target's row of the
+    /// step it ran.
     fn advance_rows(&self) -> usize {
         1
     }
-    /// One drafted pass for a request that samples, by llama.cpp's
+    /// One drafted pass for a request that draws (it samples, or bans an id:
+    /// its sampler sets the banned logits to -inf first), by llama.cpp's
     /// `common_sampler_sample_and_accept_n`. `last` and the ids the draft
     /// proposes after it are evaluated together. Then, row by row in position
     /// order, `sampler` takes an id from that row's logits, given `history`
@@ -459,6 +462,11 @@ pub trait Engine: Send {
     /// engine's saved states in. 0 (the default) turns the cache off.
     fn cache_ram(&self) -> u64 {
         0
+    }
+    /// The host bytes a snapshot would hold, without copying its stores.
+    /// `None` when the engine has no size query.
+    fn snapshot_size(&self) -> Result<Option<u64>, StateError> {
+        Ok(None)
     }
     /// Returns the engine's adaptive expert residency to the placement it
     /// loaded with, the sequence left as it stands: the one explicit call a
@@ -766,7 +774,7 @@ pub enum CacheNote {
     /// `off_path`: the state is a [`Pending`] begun when its request ended,
     /// its copy running on the engine's copy stream; `ms` is then the call
     /// that began it and [`CacheNote::Landed`] follows. `fallback`: the
-    /// engine's staging pool had no room for it even after the oldest landed
+    /// engine's staging pool had no room for it even after every landed
     /// state left, so it was taken on the request path: `full` (the pool's
     /// free bytes cannot hold it) or `fragmented` (they could, in one piece;
     /// [`StateError::fallback`]).

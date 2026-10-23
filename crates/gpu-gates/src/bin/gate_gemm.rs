@@ -21,8 +21,8 @@
 //! of 640 rows, K 2560, top-10, every slot its token's column; the blocks
 //! cycled from the ref-synth dump) and an IQ3_XXS stack of 400 rows an
 //! expert, each under the four routings — at T ∈ {1, 15, 16, 17, 64, 511,
-//! 512, 3686} for the top-10 cases, ten slots a token capping the route
-//! table at 36,864 slots — with the same checks, the T = 1 outputs against
+//! 512, 4096} for the top-10 cases, the card route's run of a whole ubatch
+//! at the route table's 40,960-slot cap — with the same checks, the T = 1 outputs against
 //! the i-quant row cores (`iq3_xxs_rows`, `iq4_xs_rows`) over the repacked
 //! stack as a diagnostic, a NaN `d` super-block's outputs NaN, and
 //! `from_ggml`'s acceptance of the two types beside its refusal of IQ2_XS.
@@ -88,8 +88,9 @@
 //! ∈ {1, 17, 512, 1000, 4095, 4096} tokens under the four routings, on a
 //! Qwen3 stack's shape (128 experts, top-8: up to 32,768 slots), a Qwen3.6
 //! one's (257 experts — the shared expert joined as the last — and nine
-//! slots a token: up to 36,864 slots, the route's cap, in 31 chunks) and a
-//! V4.1 one's (384 experts, top-6), and the dense table (`enqueue_route_dense`)
+//! slots a token: up to 36,864 slots in 31 chunks), a Qwen3.8 card route's
+//! (512 experts, ten slots a token: up to 40,960 slots, the route's cap, in
+//! 16 chunks) and a V4.1 one's (384 experts, top-6), and the dense table (`enqueue_route_dense`)
 //! at the same counts: the slot list and the tiles bit for bit the host's
 //! stable grouping — experts ascending, each expert's slots ascending, runs
 //! cut into tiles of at most `GEMM_BN`. Then at 32,768 slots: three ids past
@@ -203,7 +204,11 @@
 //!   columns: the decode ggml's, every checked output inside its band
 //!   `γ(2K/32 + 4) · Σ_b |scale·d_a·(d0·i0 + d1·i1)|` of the f64 reference
 //!   and bit for bit the contract (`gemm32::dot32_nv`); a rerun
-//!   bit-identical, a captured table and GEMM replayed.
+//!   bit-identical; at K 64 outputs whose F32 walk overflows before the
+//!   tensor scale (activation codes 127, scale 2^-120) stored as the finite
+//!   value the contract gives: 8128, and 2^-33 where two steps cancel and
+//!   only the fused F64 multiply-add keeps the residual; a captured table
+//!   and GEMM replayed.
 //! - `g32_nvfp4_routed`: the same planes under routed tables — a 16-expert
 //!   stack of 272 rows at K 4096 each slot its own column, an 8-expert stack
 //!   at K 8192 whose two slots a token share the token's column, each expert
@@ -241,6 +246,15 @@
 //! - `g32_f32tile`: `enqueue_f32_tile` bit for bit `enqueue_f32_gemv` over
 //!   chunks of up to eight columns at 96, 100, 128 and 512 rows, up to 4095
 //!   columns, nothing written past its output.
+//! - `dense_mma`: GB10's dense prompt MMA for BF16, MXFP8 and FP8_B128
+//!   weights (`enqueue_bf16_mma`, `enqueue_e4m3_mma`) at ragged shapes and
+//!   range edges: every output within the BF16 operand band, the cells of an
+//!   edge's row and column the exact tile's bits, nothing written past the
+//!   output and a graph replay the eager bits. At 130 × 130 outputs of K 128,
+//!   unit weights against activations of 1 + 2^-10: every cell K, and with a
+//!   subnormal activation in one column, then also weights of 2^60 in one row,
+//!   that column's and row's cells the exact tile's bits and every other cell
+//!   still K. A BF16 weight off a 16-byte boundary is refused by name.
 //! - `g32_refuse`: the host API's refusals, each an error holding its own
 //!   message (another check refusing first does not pass): the scratch's
 //!   K and columns, the quantizer's input and columns, an unfilled table,
@@ -275,7 +289,7 @@ mod gate {
     use bloomery_gpu::q6k_sel::Q6kSelKernels;
     use bloomery_gpu::{DeviceTensor, Fault, FaultSite, Gpu, GpuError, LAYER_NONE, Q8Act};
     use bloomery_gpu_gates::act_rule::q8_1_codes;
-    use bloomery_gpu_gates::rounding::gamma;
+    use bloomery_gpu_gates::rounding::{gamma, scaled_sum};
     use bloomery_gpu_gates::swiglu_host;
     use bloomery_gpu_gates::{
         Fnv1a64, GateError, activations, bits_equal, bytes_to_words, checks_failed, data_dir,
@@ -645,8 +659,9 @@ mod gate {
     /// the module's numeric contract transcribed — per block the exact i32
     /// `isum` and `imin`, then `acc = fma(d8, fma(−dmin, f32(imin),
     /// d·f32(isum)), acc)` (`acc = fma(d8, d·f32(isum), acc)` for a type
-    /// without mins) from `acc = 0`, blocks in increasing k. `d` and `dmin`
-    /// are f16 values, exact in f32.
+    /// without mins) from `acc = 0`, blocks in increasing k, each step a
+    /// [`scaled_sum`] into the F32 accumulator. `d` and `dmin` are f16
+    /// values, exact in f32.
     fn dot_ref(dec: &Dec, a: &[i8], d8: &[f32]) -> (f64, f64, f32) {
         let (mut y, mut mag) = (0.0f64, 0.0f64);
         let mut acc = 0.0f32;
@@ -666,14 +681,17 @@ mod gate {
                     imin += dec.mn[j / 32] * s;
                 }
             }
-            let (d, dmin) = (dec.d[sb] as f32, dec.dmin[sb] as f32);
-            let t = d * isum as f32;
-            let t = if dec.mn.is_empty() {
-                t
+            let (nd, m) = if dec.mn.is_empty() {
+                (0.0, 0.0)
             } else {
-                (-dmin).mul_add(imin as f32, t)
+                (-(dec.dmin[sb] as f32), imin as f32)
             };
-            acc = db.mul_add(t, acc);
+            acc = scaled_sum(
+                [f64::from(dec.d[sb] as f32), f64::from(nd)],
+                [isum as f32, m],
+                db,
+                f64::from(acc),
+            ) as f32;
             let dd = f64::from(db) * dec.d[sb] * f64::from(isum);
             let mm = f64::from(db) * dec.dmin[sb] * f64::from(imin);
             y += dd - mm;
@@ -843,7 +861,7 @@ mod gate {
         }
 
         /// [`Self::resident`] for a case whose largest run is `max_slots`
-        /// slots (the Qwen3.8 top-10 cases stop below TOKENS' last count).
+        /// slots.
         fn resident_at(&self, st: &Stack<'_>, max_slots: usize) -> Result<Resident, GateError> {
             let stream = self.gpu.stream();
             let n_rows = st.n_exp * st.rows;
@@ -1199,27 +1217,15 @@ mod gate {
 
     /// Every case: T × routing runs, then the rerun and graph checks.
     fn run_case(dev: &Dev<'_>, st: &Stack<'_>, seed: u64) -> Result<bool, GateError> {
-        run_case_at(dev, st, seed, &TOKENS)
-    }
-
-    /// [`run_case`] at a case's own token counts: ten slots a token (the
-    /// Qwen3.8 gate) would take TOKENS' last count past the route table's
-    /// 36,864-slot cap, so those cases stop at 3686 tokens.
-    fn run_case_at(
-        dev: &Dev<'_>,
-        st: &Stack<'_>,
-        seed: u64,
-        tokens: &[usize],
-    ) -> Result<bool, GateError> {
         if !wanted(&st.name) {
             return Ok(true);
         }
         let t0 = std::time::Instant::now();
         let stream = dev.gpu.stream();
-        let mut res = dev.resident_at(st, tokens[tokens.len() - 1] * st.input.top_k())?;
+        let mut res = dev.resident(st)?;
         let top_k = st.input.top_k();
         let mut ok = true;
-        for &n_tok in tokens {
+        for &n_tok in &TOKENS {
             for (ri, &r) in ROUTINGS.iter().enumerate() {
                 let n_slots = n_tok * top_k;
                 let ids = route_ids(
@@ -1874,6 +1880,7 @@ mod gate {
         for (stack, n_exp, top_k) in [
             ("qwen3", q3.experts(), q3.slots()),
             ("qwen35", q35.logits(), q35.slots()),
+            ("qwen38", 512usize, 10usize),
             ("v41", 384usize, 6usize),
         ] {
             let max_slots = max_tok * top_k;
@@ -2359,6 +2366,14 @@ mod gate {
         };
         let mut ok = true;
 
+        if matches!(case_filter().as_deref(), Some("dense_mma" | "nvfp4_native")) {
+            return if g32::run(&gpu, &dev.gk)? {
+                Ok(())
+            } else {
+                Err(checks_failed())
+            };
+        }
+
         // Qwen3: the model file of this profile.
         let qwen = open_model()?;
         let find_q = |name: &str| {
@@ -2539,10 +2554,6 @@ mod gate {
         Ok(ok)
     }
 
-    /// Token counts of the Qwen3.8 i-quant cases: ten slots a token cap the
-    /// route table at 36,864 slots, so the largest count is 3686 tokens.
-    const Q38_TOKENS: [usize; 8] = [1, 15, 16, 17, 64, 511, 512, 3686];
-
     /// The q8_1 quantizer's Q4_K slot of value-order word `v` (gate_iq's
     /// helper): the i-quant row kernels read their columns in that
     /// permutation.
@@ -2650,7 +2661,7 @@ mod gate {
     /// 64 experts of 640 rows, K 2560, top-10, every slot its token's column,
     /// the blocks cycled from the ref-synth dump — and an IQ3_XXS stack of
     /// 400 rows an expert (a partial 128-row slab). Each runs the four
-    /// routings at [`Q38_TOKENS`] through [`run_case_at`], the T = 1 outputs
+    /// routings at [`TOKENS`] through [`run_case`], the T = 1 outputs
     /// against the i-quant row cores, a NaN `d` super-block's outputs NaN,
     /// `from_ggml`'s acceptance of the two types, and the host API's refusal
     /// of the other i-quant type's stack.
@@ -2691,8 +2702,8 @@ mod gate {
                 k,
                 input: Input::Shared(top_k),
             };
-            let mut res = dev.resident_at(&st, Q38_TOKENS[Q38_TOKENS.len() - 1] * top_k)?;
-            ok &= run_case_at(dev, &st, seed ^ 0x61, &Q38_TOKENS)?;
+            let mut res = dev.resident(&st)?;
+            ok &= run_case(dev, &st, seed ^ 0x61)?;
             let diag = iq_rows_diag(dev, &st, &mut res, seed)?;
             println!("gemm case={name} rows_diag_max_rel_diff_vs_iq_rows={diag:.3e} (diagnostic)");
             ok &= iq_nan_d(dev, &st, seed)?;
@@ -2734,7 +2745,7 @@ mod gate {
                 k,
                 input: Input::Shared(4),
             };
-            ok &= run_case_at(dev, &st, 0x73, &TOKENS)?;
+            ok &= run_case(dev, &st, 0x73)?;
         }
         Ok(ok)
     }
@@ -2960,6 +2971,7 @@ mod gate {
                 return if gemm_arms(gpu, Some(arm))?
                     || iq_gemm_arms(gpu, Some(arm))?
                     || q8p_gemm_arms(gpu, Some(arm))?
+                    || nvfp4_gemm_arm(gpu, arm)?
                 {
                     Ok(())
                 } else {
@@ -3091,9 +3103,8 @@ mod gate {
         /// route's shapes (`gate_gemm`'s q38 cases): the routed gate — 64
         /// experts of 640 × 2560, top-10's shape — for IQ3_XXS, IQ3_S and IQ4_XS, and
         /// the routed down — 64 experts of 2560 rows × K 640, each slot its
-        /// own column — for IQ4_NL. Ten slots a token pass the route table's
-        /// 36,864-slot cap at 4096 tokens, so every arm runs 4096 tokens of
-        /// nine slots: the table's cap, the heaviest launch of the shape.
+        /// own column — for IQ4_NL. Every arm runs 4096 tokens of ten slots:
+        /// the route table's cap, the heaviest launch of the shape.
         /// `only` keeps the one arm of that name; the return says whether any
         /// arm ran.
         fn iq_gemm_arms(gpu: &bloomery_gpu::Gpu, only: Option<&str>) -> Result<bool, GateError> {
@@ -3119,7 +3130,7 @@ mod gate {
                     continue;
                 }
                 ran = true;
-                let (n_exp, top_k, rows, k, t) = (64usize, 9usize, 640usize, 2560usize, 4096usize);
+                let (n_exp, top_k, rows, k, t) = (64usize, 10usize, 640usize, 2560usize, 4096usize);
                 let n_rows = n_exp * rows;
                 let w = DeviceTensor::<u32>::upload(
                     stream,
@@ -3175,7 +3186,7 @@ mod gate {
                 }
                 ran = true;
                 let g32 = Gemm32Kernels::load(gpu.context())?;
-                let (n_exp, top_k, rows, k, t) = (64usize, 9usize, 2560usize, 640usize, 4096usize);
+                let (n_exp, top_k, rows, k, t) = (64usize, 10usize, 2560usize, 640usize, 4096usize);
                 let n_rows = n_exp * rows;
                 // 18 bytes a block, 20 blocks: 360 bytes = 90 words a row.
                 let w =
@@ -3324,6 +3335,86 @@ mod gate {
             Ok(ran)
         }
 
+        fn nvfp4_gemm_arm(gpu: &bloomery_gpu::Gpu, arm: &str) -> Result<bool, GateError> {
+            use bloomery_gpu::gemm::{
+                Gemm32Args, Gemm32Kernels, Gemm32Weight, GemmAct32, GemmInput, GemmKernels,
+                GemmRoute,
+            };
+            use bloomery_gpu::mxfp4_sel::Nvfp4Stack;
+            let (rows, k, per_slot) = match arm {
+                "gemm_nvfp4_gate_t2048" => (640usize, 2560usize, false),
+                "gemm_nvfp4_down_t2048" => (2560, 640, true),
+                _ => return Ok(false),
+            };
+            let (tokens, experts, top_k) = (2048usize, 512usize, 10usize);
+            let slots = tokens * top_k;
+            let cols = if per_slot { slots } else { tokens };
+            let stream = gpu.stream();
+            let sink = gpu.unlabelled_sink();
+            let g32 = Gemm32Kernels::load(gpu.context())?;
+            let gk = GemmKernels::load(gpu.context())?;
+            let qs = DeviceTensor::upload(
+                stream,
+                &fill_pattern(experts * rows * k / 8),
+                experts * rows,
+                k / 8,
+            )?;
+            let se: Vec<u32> = fill_pattern(experts * rows * k / 64)
+                .into_iter()
+                .map(|v| v & 0x7e7e7e7e)
+                .collect();
+            let e = DeviceTensor::upload(stream, &se, experts * rows, k / 64)?;
+            let scales = DeviceTensor::upload(stream, &vec![0.015625f32; experts], experts, 1)?;
+            let xs = DeviceBuffer::from_host(stream, &fill_pattern_f32(cols * k))?;
+            let mut act = GemmAct32::new_routed(stream, cols, k)?;
+            g32.enqueue_quantize_gemm32(stream, &xs, cols, &mut act, sink)?;
+            let ids = DeviceBuffer::from_host(stream, &gemm_ids(tokens, top_k, experts))?;
+            let mut route = GemmRoute::new(stream, slots, experts)?;
+            gk.enqueue_route(stream, &ids, slots, &mut route, sink)?;
+            let mut y = DeviceBuffer::<f32>::zeroed(stream, slots * rows)?;
+            let mut enq = |s: &CudaStream| {
+                g32.enqueue_gemm32(
+                    s,
+                    Gemm32Args {
+                        w: Gemm32Weight::Nvfp4Planes(Nvfp4Stack {
+                            qs: &qs,
+                            e: &e,
+                            scales: &scales,
+                        }),
+                        rows_per_expert: rows,
+                        act: &act,
+                        route: &route,
+                        input: if per_slot {
+                            GemmInput::PerSlot
+                        } else {
+                            GemmInput::Shared { top_k }
+                        },
+                        y: &mut y,
+                    },
+                )
+            };
+            let eager = burst(stream, &mut enq)?;
+            let graph = gpu.capture(|s| (0..N).try_for_each(|_| enq(s)))?;
+            let timed = replay(stream, &graph)?;
+            let bytes = (experts * rows * k * 9 / 16 + cols * k + slots * rows * 4) as u64;
+            print_arm(arm, rows, bytes, graph.node_count(), eager, timed);
+            let out = y.to_host_vec(stream)?;
+            let invalid = out.iter().filter(|v| !v.is_finite()).count();
+            let norm: f64 = out
+                .iter()
+                .map(|&v| f64::from(v).powi(2))
+                .sum::<f64>()
+                .sqrt();
+            println!(
+                "bench op={arm} slots={slots} k={k} experts={experts} invalid={invalid} l2={norm:.9} sample={:?}",
+                &out[..8]
+            );
+            if invalid != 0 || gpu.take_fault()?.is_some() {
+                return Err("NVFP4 benchmark produced invalid output".into());
+            }
+            Ok(true)
+        }
+
         /// The int8 dense tensor peak of the card named `name`, in TOPS — GA102
         /// whitepaper figures, the denominator the prefill literature report uses —
         /// or `None` for a card not listed.
@@ -3375,7 +3466,9 @@ mod gate {
         use bloomery_gpu::mxfp4_sel::Nvfp4Stack;
         use bloomery_gpu::q5::{Q8Blocks32, pack_q5_0};
         use bloomery_gpu::{DeviceTensor, Fault, FaultSite, Gpu, GpuError, LAYER_NONE};
-        use bloomery_gpu_gates::gemm32::{HostAct, Planes32, dot32, dot32_nv, host_act};
+        use bloomery_gpu_gates::gemm32::{
+            HostAct, Planes32, dot32, dot32_nv, dot32_nv_fp4, host_act,
+        };
         use bloomery_gpu_gates::rounding::gamma;
         use bloomery_gpu_gates::swiglu_host;
         use bloomery_gpu_gates::{
@@ -5039,8 +5132,9 @@ mod gate {
         /// [`NV_SHAPES`] × [`NV_MS`]: the decode ggml's, every checked output in its
         /// band `γ(2K/32 + 4) · Σ_b |scale·d_a·(d0·i0 + d1·i1)|` of the f64
         /// reference and bit for bit the contract's transcription
-        /// (`gemm32::dot32_nv`); a rerun bit-identical, a captured table and
-        /// GEMM replayed.
+        /// (`gemm32::dot32_nv`); a rerun bit-identical, outputs whose F32
+        /// walk overflows before the tensor scale stored finite, a captured
+        /// table and GEMM replayed.
         fn nvfp4_dense_case(dev: &Dev<'_>) -> Result<bool, GateError> {
             if !wanted("g32_nvfp4_dense") {
                 return Ok(true);
@@ -5126,6 +5220,88 @@ mod gate {
                     }
                     ok &= pass;
                 }
+            }
+            // Range: K 64, activation codes 127 and tensor scale 2^-120; the
+            // F32 walk overflows and the exact walk stores the value given.
+            // `range`: every code 2 under sub-block scales 0.5 (UE4M3 0x38),
+            // `d_a` 2^120, 8128. `cancel`: codes (12 ×16, 1, 0 ×15) then their
+            // negation under sub-block scales (224, 2^-10) (UE4M3 0x7e, 0x01),
+            // `d_a` (1 + 2^-23)·2^120; the second step's fused F64
+            // multiply-add keeps the first step's rounding error, 2^-33.
+            let (rows, k, m) = (128usize, 64usize, 1usize);
+            let unit: Vec<i8> = [[12; 16].as_slice(), &[1], &[0; 15]].concat();
+            let mut cancel = [0u8; 36];
+            cancel[..4].copy_from_slice(&[0x7e, 0x01, 0x7e, 0x01]);
+            cancel[4..12].fill(0x77);
+            cancel[12] = 0x01;
+            cancel[20..28].fill(0xff);
+            cancel[28] = 0x09;
+            let range_cases = [
+                (
+                    "range",
+                    std::array::from_fn(|i| if i < 4 { 0x38 } else { 0x22 }),
+                    vec![2; 64],
+                    [0.5; 4],
+                    2f32.powi(120),
+                    8128f32,
+                ),
+                (
+                    "cancel",
+                    cancel,
+                    [unit.clone(), unit.iter().map(|c| -c).collect()].concat(),
+                    [224.0, 2f32.powi(-10), 224.0, 2f32.powi(-10)],
+                    f32::from_bits(0x7b80_0001),
+                    2f32.powi(-33),
+                ),
+            ];
+            for (tag, block, codes, wsc, d_a, want) in range_cases {
+                let planes = repack::<Nvfp4>(&block.repeat(rows * k / 64), rows, k)?;
+                let qs = DeviceTensor::upload(stream, &planes.qs, rows, k / 8)?;
+                let e = DeviceTensor::upload(stream, &planes.e, rows, k / 64)?;
+                let scale = 2f32.powi(-120);
+                let scales = DeviceTensor::upload(stream, &[scale], 1, 1)?;
+                let nv = Nvfp4Stack {
+                    qs: &qs,
+                    e: &e,
+                    scales: &scales,
+                };
+                let mut route = GemmRoute::new(stream, m, 1)?;
+                let mut act = GemmAct32::new(stream, m, k)?;
+                let mut y = DeviceBuffer::<f32>::zeroed(stream, m * rows)?;
+                let x = vec![127.0 * d_a; k * m];
+                let xd = DeviceBuffer::from_host(stream, &x)?;
+                dev.g32
+                    .enqueue_quantize_gemm32(stream, &xd, m, &mut act, sink)?;
+                dev.gk.enqueue_route_dense(stream, m, &mut route, sink)?;
+                let got = gemm_nv(dev, nv, rows, &act, &route, GemmInput::PerSlot, &mut y, m)?;
+                let (ha, _) = host_act(&x, k, m);
+                let act_ok = ha.codes.iter().all(|&c| c == 127) && ha.d.iter().all(|&d| d == d_a);
+                let Checked {
+                    band_off,
+                    bits_off,
+                    first,
+                    ..
+                } = check_dot(
+                    2 * (k / 32) + 4,
+                    rows,
+                    &|_| Some(0),
+                    &|s| s,
+                    &|_, col| dot32_nv(&codes, &wsc, scale, &ha, col),
+                    &got,
+                    m,
+                )?;
+                let fault = gpu.take_fault()?;
+                let stored = got.iter().all(|v| v.to_bits() == want.to_bits());
+                let pass = act_ok && stored && band_off == 0 && bits_off == 0 && fault.is_none();
+                println!(
+                    "gemm32 case=g32_nvfp4_dense {tag} K={k} m={m} act_codes_127={act_ok} \
+                     want={want:e} stored_eq={stored} band_off={band_off} contract_bits_differ={bits_off} {}",
+                    verdict(pass)
+                );
+                if let Some(f) = first {
+                    println!("gemm32 case=g32_nvfp4_dense {tag} first_failure: {f}");
+                }
+                ok &= pass;
             }
             // Graph: the dense table and the NVFP4 GEMM captured, replayed.
             let (rows, k, m) = (128usize, 4096usize, 64usize);
@@ -6465,6 +6641,756 @@ mod gate {
             Ok(all)
         }
 
+        /// Ragged dense MMA tiles, tails, repeatability and graph replay.
+        fn dense_mma_case(dev: &Dev<'_>) -> Result<bool, GateError> {
+            if !wanted("dense_mma") {
+                return Ok(true);
+            }
+            use gguf::quant::{bf16_bits_to_f32, fp32_to_bf16_bits};
+            let gpu = dev.gpu;
+            let stream = gpu.stream();
+            let mut ok = true;
+            // Sparse operands exercise range changes at every reduction boundary.
+            type Edge<'a> = (&'a str, &'a [(usize, u32)], &'a [(usize, u32)], u32);
+            const OVERFLOW: Edge<'static> = (
+                "rounded_product",
+                &[(0, 0x7f00_0000)],
+                &[(0, 0x3fff_8000)],
+                0x7f7f_8000,
+            );
+            let cancel = |at| {
+                let mut w = CANCEL.1.to_vec();
+                let mut x = CANCEL.2.to_vec();
+                w[2].0 = at;
+                x[2].0 = at;
+                (w, x)
+            };
+            const CANCEL: Edge<'static> = (
+                "within_fragment",
+                &[(0, 0x7f00_0000), (1, 0x7f00_0000), (2, 0xff00_0000)],
+                &[
+                    (0, 0x3f80_0000),
+                    (1, 0x3f80_0000),
+                    (2, 0x3f80_0000),
+                    (15, 0x0040_0000),
+                ],
+                0x7f00_0000,
+            );
+            let fragment = cancel(16);
+            let stage = cancel(32);
+            let pipeline = cancel(96);
+            const BUTTERFLY: Edge<'static> = (
+                "butterfly",
+                &[
+                    (0, 0x7f00_0000),
+                    (1, 0xff00_0000),
+                    (32, 0x7f00_0000),
+                    (33, 0xff00_0000),
+                ],
+                &[
+                    (0, 0x3f80_0000),
+                    (1, 0x3f80_0000),
+                    (32, 0x3f80_0000),
+                    (33, 0x3f80_0000),
+                ],
+                0x7fc0_0000,
+            );
+            const STORE: Edge<'static> = (
+                "store_overflow",
+                &[(0, 0x7f00_0000), (1, 0x7f00_0000)],
+                &[(0, 0x3f80_0000), (1, 0x3f80_0000)],
+                0x7f80_0000,
+            );
+            let sparse = |v: &mut Vec<f32>, offset, set: &[(usize, u32)]| {
+                v.fill(0.0);
+                for &(i, b) in set {
+                    v[offset + i] = f32::from_bits(b);
+                }
+            };
+            for (rows, k, n, r, c, edge) in [
+                (1, 64, 1, 0, 0, None),
+                (17, 128, 17, 0, 0, None),
+                (33, 2560, 33, 0, 0, None),
+                (100, 256, 65, 0, 0, None),
+                (33, 640, 513, 0, 0, None),
+                (1, 128, 1, 0, 0, Some(OVERFLOW)),
+                (1, 128, 1, 0, 0, Some(CANCEL)),
+                (
+                    1,
+                    64,
+                    1,
+                    0,
+                    0,
+                    Some(("between_fragments", &fragment.0, &fragment.1, 0x7f00_0000)),
+                ),
+                (
+                    1,
+                    128,
+                    1,
+                    0,
+                    0,
+                    Some(("between_fragments", &fragment.0, &fragment.1, 0x7f00_0000)),
+                ),
+                (
+                    1,
+                    128,
+                    1,
+                    0,
+                    0,
+                    Some(("between_stages", &stage.0, &stage.1, 0x7f00_0000)),
+                ),
+                (
+                    1,
+                    128,
+                    1,
+                    0,
+                    0,
+                    Some(("pipeline_wrap", &pipeline.0, &pipeline.1, 0x7f00_0000)),
+                ),
+                (
+                    65,
+                    128,
+                    65,
+                    63,
+                    63,
+                    Some(("warp_corner", &pipeline.0, &pipeline.1, 0x7f00_0000)),
+                ),
+                (
+                    65,
+                    128,
+                    65,
+                    64,
+                    64,
+                    Some(("tile_corner", &pipeline.0, &pipeline.1, 0x7f00_0000)),
+                ),
+                (1, 128, 1, 0, 0, Some(BUTTERFLY)),
+                (1, 128, 1, 0, 0, Some(STORE)),
+            ] {
+                let mut wh = activations(k, rows, 9271 + rows as u32);
+                if let Some((_, w0, _, _)) = edge {
+                    sparse(&mut wh, r * k, w0);
+                }
+                let bits: Vec<u16> = wh.into_iter().map(fp32_to_bf16_bits).collect();
+                let wf: Vec<Vec<f32>> = bits
+                    .chunks_exact(k)
+                    .map(|r| r.iter().copied().map(bf16_bits_to_f32).collect())
+                    .collect();
+                let words: Vec<u32> = bits
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|p| u32::from(p[0]) | (u32::from(p[1]) << 16))
+                    .collect();
+                let w = DeviceTensor::upload(stream, &words, rows, k / 2)?;
+                let mut xh = activations(k, n, 9281 + n as u32);
+                if let Some((_, _, x0, _)) = edge {
+                    sparse(&mut xh, c * k, x0);
+                }
+                let x = DeviceBuffer::from_host(stream, &xh)?;
+                let formats = if edge.is_some() && k % 128 == 0 { 3 } else { 1 };
+                use bloomery_gpu::q8f32::{E4m3Scales, E4m3Weight};
+                let byte_planes = if formats > 1 {
+                    // Sparse weights are zero or +/-2^127: E4M3 +/-1 with scale 2^127.
+                    let qs: Vec<u32> = wf
+                        .iter()
+                        .flat_map(|row| row.as_chunks::<4>().0.iter())
+                        .map(|v| {
+                            v.iter().enumerate().fold(0, |word, (i, &value)| {
+                                let code = if value == 0.0 {
+                                    0
+                                } else if value < 0.0 {
+                                    0xb8
+                                } else {
+                                    0x38
+                                };
+                                word | (code << (8 * i))
+                            })
+                        })
+                        .collect();
+                    Some((
+                        DeviceTensor::upload(stream, &qs, rows, k / 4)?,
+                        DeviceTensor::upload(
+                            stream,
+                            &vec![0xfefe_fefe; rows * k / 128],
+                            rows,
+                            k / 128,
+                        )?,
+                        DeviceTensor::upload(
+                            stream,
+                            &vec![0x7f00_0000; rows * k / 128],
+                            rows,
+                            k / 128,
+                        )?,
+                    ))
+                } else {
+                    None
+                };
+                for format in 0..formats {
+                    let format_name = ["bf16", "mxfp8", "fp8_b128"][format];
+                    let enqueue = |s: &cuda_core::CudaStream, exact, y: &mut DeviceBuffer<f32>| {
+                        if format == 0 {
+                            if exact {
+                                gpu.q8f32().enqueue_bf16_tile(s, &w, &x, n, y)
+                            } else {
+                                gpu.q8f32().enqueue_bf16_mma(s, &w, &x, n, y)
+                            }
+                        } else {
+                            let (qs, mx, fp) = byte_planes.as_ref().unwrap();
+                            let weight = E4m3Weight {
+                                qs,
+                                e: if format == 1 { mx } else { fp },
+                                scales: if format == 1 {
+                                    E4m3Scales::Mxfp8
+                                } else {
+                                    E4m3Scales::Fp8B128
+                                },
+                            };
+                            if exact {
+                                dev.g32.enqueue_e4m3_tile(s, weight, &x, n, y)
+                            } else {
+                                dev.g32.enqueue_e4m3_mma(s, weight, &x, n, y)
+                            }
+                        }
+                    };
+                    let mut y = DeviceBuffer::from_host(stream, &vec![SENT; rows * n + 64])?;
+                    enqueue(stream, false, &mut y)?;
+                    stream.synchronize()?;
+                    let eager = y.to_host_vec(stream)?;
+                    let want = edge.map(|(_, _, _, bits)| bits);
+                    let name = edge.map_or("ordinary", |(name, _, _, _)| name);
+                    let tag = format!(
+                        "{format_name} rows={rows} K={k} n={n} probe={r},{c} edge={name} edge_bits={want:x?}"
+                    );
+                    let range = want.map_or_else(
+                        || eager[..rows * n].iter().all(|v| v.is_finite()),
+                        |bits| {
+                            let expected = f32::from_bits(bits);
+                            let got = eager[c * rows + r];
+                            if expected.is_nan() {
+                                got.is_nan()
+                            } else {
+                                got.to_bits() == bits
+                            }
+                        },
+                    );
+                    let quality = if edge.is_some() {
+                        let mut exact = DeviceBuffer::from_host(stream, &vec![SENT; y.len()])?;
+                        enqueue(stream, true, &mut exact)?;
+                        let exact = exact.to_host_vec(stream)?;
+                        // PIN(2026-10-23): healthy cells retain MMA values; only exceptional rows and
+                        // columns match the exact tile. The cells fixture below pins that distinction.
+                        let same = eager[..rows * n]
+                            .iter()
+                            .zip(&exact)
+                            .enumerate()
+                            .filter(|(i, _)| i % rows == r || i / rows == c)
+                            .all(|(_, (a, b))| {
+                                a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan())
+                            });
+                        println!("dense_mma {tag} exact_tile_bits={same}");
+                        let finite_quality = !f32::from_bits(want.unwrap()).is_finite()
+                            || bloomery_gpu_gates::rounding::check_mma(
+                                &tag,
+                                (&eager[..rows * n], &xh, k),
+                                &wf,
+                            );
+                        same && finite_quality
+                    } else {
+                        bloomery_gpu_gates::rounding::check_mma(
+                            &tag,
+                            (&eager[..rows * n], &xh, k),
+                            &wf,
+                        )
+                    };
+                    let tail = eager[rows * n..]
+                        .iter()
+                        .all(|v| v.to_bits() == SENT.to_bits());
+                    y.copy_from_host(stream, &vec![SENT; y.len()])?;
+                    let graph = gpu.capture(|s| enqueue(s, false, &mut y))?;
+                    y.copy_from_host(stream, &vec![SENT; y.len()])?;
+                    graph.launch(stream)?;
+                    stream.synchronize()?;
+                    let replay = y.to_host_vec(stream)?;
+                    let same = eager
+                        .iter()
+                        .zip(&replay)
+                        .all(|(a, b)| a.to_bits() == b.to_bits());
+                    println!(
+                        "dense_mma {tag} range={range} past_end_untouched={tail} eager_graph_bits={same} {}",
+                        verdict(range && tail && same && quality)
+                    );
+                    ok &= quality && range && tail && same;
+                }
+            }
+            // Each cell's path, visible with unit weights against activations
+            // one bit below BF16 (1 + 2^-10): K on the tensor cores and
+            // K·(1 + 2^-10) on the exact owner. A subnormal activation in one
+            // column, then also weights of 2^60 in one row, send that column's
+            // and that row's cells to the exact tile's bits and leave every
+            // other cell of their tiles at K.
+            {
+                use bloomery_gpu::q8f32::{E4m3Scales, E4m3Weight};
+                let (rows, k, n, odd_row, odd_col) = (130, 128, 130, 64, 129);
+                let x_of = |odd: bool| {
+                    let mut x = vec![f32::from_bits(0x3f80_2000); n * k];
+                    if odd {
+                        x[odd_col * k] = f32::from_bits(0x200);
+                    }
+                    DeviceBuffer::from_host(stream, &x)
+                };
+                // A row's words, its MXFP8 and its FP8_B128 scale words: 1 or 2^60.
+                let planes = |odd: bool| {
+                    let row = |r| odd && r == odd_row;
+                    let of = |normal: u32, big: u32, cols: usize| {
+                        let v: Vec<u32> = (0..rows)
+                            .flat_map(|r| {
+                                std::iter::repeat_n(if row(r) { big } else { normal }, cols)
+                            })
+                            .collect();
+                        DeviceTensor::upload(stream, &v, rows, cols)
+                    };
+                    Ok::<_, GpuError>((
+                        of(0x3f80_3f80, 0x5d80_5d80, k / 2)?,
+                        DeviceTensor::upload(
+                            stream,
+                            &vec![0x3838_3838u32; rows * k / 4],
+                            rows,
+                            k / 4,
+                        )?,
+                        of(0x7f7f_7f7f, 0xbbbb_bbbb, k / 128)?,
+                        of(0x3f80_0000, 0x5d80_0000, k / 128)?,
+                    ))
+                };
+                for (odd_r, odd_c) in [(false, false), (false, true), (true, true)] {
+                    let x = x_of(odd_c)?;
+                    let (w, qs, mx, fp) = planes(odd_r)?;
+                    for (format, scales) in [
+                        ("bf16", None),
+                        ("mxfp8", Some((&mx, E4m3Scales::Mxfp8))),
+                        ("fp8_b128", Some((&fp, E4m3Scales::Fp8B128))),
+                    ] {
+                        let run = |exact: bool| {
+                            let mut y = DeviceBuffer::from_host(stream, &vec![SENT; rows * n])?;
+                            match scales {
+                                None if exact => {
+                                    gpu.q8f32().enqueue_bf16_tile(stream, &w, &x, n, &mut y)?
+                                }
+                                None => gpu.q8f32().enqueue_bf16_mma(stream, &w, &x, n, &mut y)?,
+                                Some((e, scales)) => {
+                                    let weight = E4m3Weight { qs: &qs, e, scales };
+                                    if exact {
+                                        dev.g32.enqueue_e4m3_tile(stream, weight, &x, n, &mut y)?
+                                    } else {
+                                        dev.g32.enqueue_e4m3_mma(stream, weight, &x, n, &mut y)?
+                                    }
+                                }
+                            }
+                            Ok::<_, GpuError>(y.to_host_vec(stream)?)
+                        };
+                        let (mma, exact) = (run(false)?, run(true)?);
+                        let odd = |i: usize| {
+                            (odd_r && i % rows == odd_row) || (odd_c && i / rows == odd_col)
+                        };
+                        let kept = (0..rows * n)
+                            .filter(|&i| !odd(i))
+                            .all(|i| mma[i].to_bits() == (k as f32).to_bits());
+                        let replayed = (0..rows * n)
+                            .filter(|&i| odd(i))
+                            .all(|i| mma[i].to_bits() == exact[i].to_bits());
+                        println!(
+                            "dense_mma {format} cells rows={rows} K={k} n={n} row{odd_row}_odd={odd_r} \
+                             col{odd_col}_odd={odd_c} others_kept_k={kept} odd_lines_exact={replayed} {}",
+                            verdict(kept && replayed)
+                        );
+                        ok &= kept && replayed;
+                    }
+                }
+            }
+            // The tile copies a BF16 weight's words in 16-byte pieces, so a
+            // weight that does not start 16-byte aligned is refused by name.
+            let words = DeviceBuffer::from_host(stream, &vec![0x3f80_3f80u32; 64 * 32 + 1])?;
+            let w = DeviceTensor::<u32>::window_of(&words, 4, 64, 32)?;
+            let x = DeviceBuffer::from_host(stream, &vec![1.0f32; 64])?;
+            let mut y = DeviceBuffer::<f32>::zeroed(stream, 64)?;
+            let refused = matches!(
+                gpu.q8f32()
+                    .enqueue_bf16_mma(stream, &w, &x, 1, &mut y),
+                Err(e) if e.to_string().contains("is not 16-byte aligned")
+            );
+            println!(
+                "dense_mma bf16 weight_unaligned refused={refused} {}",
+                verdict(refused)
+            );
+            ok &= refused;
+            Ok(ok)
+        }
+
+        /// The input of one `nvfp4_native` case.
+        #[derive(Clone, Copy, Debug, PartialEq)]
+        enum Native {
+            /// Powers of two, exact on both formats' grids.
+            Pattern,
+            /// One signed value a column.
+            OneHot,
+            /// The pattern at subnormal magnitude.
+            Tiny,
+            /// Values off the E2M1 grid, held to the host W4A4 transcription.
+            Varied,
+            /// A NaN among zeros, a NaN beside varied values, and a varied column:
+            /// `QuantColumn`, and NaN in every row of a refused column.
+            Refused,
+            /// One expert scale and one input value at the edge of the range.
+            Range(f32, f32),
+        }
+
+        fn nvfp4_native_case(dev: &Dev<'_>) -> Result<bool, GateError> {
+            if !wanted("nvfp4_native") {
+                return Ok(true);
+            }
+            let native = GemmAct32::new_routed(dev.gpu.stream(), 1, 64)?.bytes()
+                > GemmAct32::new(dev.gpu.stream(), 1, 64)?.bytes();
+            if !native {
+                return if super::case_filter().as_deref() == Some("nvfp4_native") {
+                    Err("nvfp4_native requires the native FP4 build".into())
+                } else {
+                    Ok(true)
+                };
+            }
+            let gpu = dev.gpu;
+            let stream = gpu.stream();
+            let mut ok = true;
+            // Each input 4 bytes past a 16-byte boundary: refused by name before the launch.
+            let parent = DeviceBuffer::from_host(stream, &[1.0f32; 65])?;
+            let whole = bloomery_gpu::Window::<f32>::of(&parent, 0, 64)?;
+            let off = bloomery_gpu::Window::<f32>::of(&parent, 4, 64)?;
+            for (name, g, u) in [("g", &off, &whole), ("u", &whole, &off)] {
+                let mut act = GemmAct32::new_routed(stream, 1, 64)?;
+                let got = dev.g32.enqueue_swiglu_quant32(
+                    stream,
+                    g,
+                    u,
+                    1,
+                    &mut act,
+                    gpu.unlabelled_sink(),
+                );
+                let refused = matches!(
+                    &got,
+                    Err(bloomery_gpu::GpuError::Shape { what, detail })
+                        if *what == "NVFP4 activation"
+                            && detail.starts_with(&format!("{name} at "))
+                            && detail.contains("is not 16-byte aligned")
+                );
+                let pass = refused && gpu.take_fault()?.is_none();
+                println!(
+                    "gemm32 case=nvfp4_native misaligned={name} refused={refused} {}",
+                    verdict(pass)
+                );
+                ok &= pass;
+            }
+            for (rows, slots, k, input) in [
+                (16usize, 14usize, 128usize, Native::Pattern),
+                (128, 73, 64, Native::Pattern),
+                (144, 129, 256, Native::Pattern),
+                (48, 73, 64, Native::OneHot),
+                (16, 14, 20_480, Native::Pattern),
+                (16, 14, 64, Native::Tiny),
+                (16, 14, 64, Native::Varied),
+                (16, 3, 64, Native::Refused),
+                (
+                    16,
+                    1,
+                    64,
+                    Native::Range(2.0f32.powi(120), 2.0f32.powi(-100)),
+                ),
+                (16, 1, 64, Native::Range(2.0f32.powi(-120), f32::MAX)),
+                (16, 1, 64, Native::Range(2.0f32.powi(-120), -f32::MAX)),
+                (
+                    16,
+                    1,
+                    64,
+                    Native::Range(2.0f32.powi(-100), 2.0f32.powi(120)),
+                ),
+                (
+                    16,
+                    1,
+                    64,
+                    Native::Range(f32::from_bits(1), 2.0f32.powi(120)),
+                ),
+                (
+                    16,
+                    1,
+                    64,
+                    Native::Range(f32::from_bits(0x7b2aa555), f32::from_bits(0x40c00600)),
+                ),
+            ] {
+                let range = match input {
+                    Native::Range(scale, x) => Some((scale, x)),
+                    _ => None,
+                };
+                let (one_hot, tiny) = (input == Native::OneHot, input == Native::Tiny);
+                let refused = input == Native::Refused;
+                // Off-grid inputs meet the host W4A4 transcription and weights that vary along K.
+                let host = refused || input == Native::Varied;
+                let block_scale = if range.is_some_and(|(s, _)| s == f32::from_bits(1)) {
+                    0.001953125f32
+                } else {
+                    1.0
+                };
+                let codes: Vec<u32> = (0..2 * rows * k / 8)
+                    .map(|i| {
+                        let row = i / (k / 8) % rows;
+                        if range.is_some() {
+                            return 0x22222222;
+                        }
+                        if !(one_hot || host) {
+                            return (2 + row as u32 % 3) * 0x11111111;
+                        }
+                        let word = i % (k / 8);
+                        let at = 16 * (word / 2) + 4 * (word & 1);
+                        (0..4).fold(0u32, |bits, j| {
+                            let lo = ((row + 3 * (at + j)) & 15) as u32;
+                            let hi = ((row + 3 * (at + j + 8)) & 15) as u32;
+                            bits | (lo | (hi << 4)) << (8 * j)
+                        })
+                    })
+                    .collect();
+                let wq = DeviceTensor::upload(stream, &codes, 2 * rows, k / 8)?;
+                let we = DeviceTensor::upload(
+                    stream,
+                    &vec![
+                        if range.is_some() {
+                            if block_scale == 1.0 {
+                                0x38383838u32
+                            } else {
+                                0x01010101u32
+                            }
+                        } else {
+                            0x50483840u32
+                        };
+                        2 * rows * k / 64
+                    ],
+                    2 * rows,
+                    k / 64,
+                )?;
+                let weight_scales = range.map_or([1.0f32, 0.5], |(scale, _)| [scale; 2]);
+                let ws = DeviceTensor::upload(stream, &weight_scales, 2, 1)?;
+                let xs: Vec<f32> = (0..slots * k)
+                    .map(|i| {
+                        if let Some((_, input)) = range {
+                            return input;
+                        }
+                        if one_hot {
+                            return if i % k == i / k % k {
+                                [1.0, -1.0][i / k % 2]
+                            } else {
+                                0.0
+                            };
+                        }
+                        if refused && (i == 0 || i == k + 5) {
+                            return f32::NAN;
+                        }
+                        if refused && i < k {
+                            return 0.0;
+                        }
+                        if host {
+                            return ((i * 37 % 257) as f32 - 128.0) / 64.0;
+                        }
+                        let x =
+                            2.0f32.powi((i / k % 4) as i32 - 2) * [2.0, 1.0, 4.0, 8.0][i / 16 % 4];
+                        if tiny {
+                            x * 1.0e-40 * [1.0, 0.5][i & 1]
+                        } else {
+                            x
+                        }
+                    })
+                    .collect();
+                let x_host: Vec<f32> = xs.iter().map(|v| (v / 128.0) * 128.0).collect();
+                let x = DeviceBuffer::from_host(stream, &x_host)?;
+                let want_fault = refused.then(|| Fault::at(LAYER_NONE, FaultSite::QuantColumn));
+                let ids: Vec<u32> = (0..slots).map(|i| (i % 2) as u32).collect();
+                let ids_d = DeviceBuffer::from_host(stream, &ids)?;
+                let mut route = GemmRoute::new(stream, slots, 2)?;
+                dev.gk
+                    .enqueue_route(stream, &ids_d, slots, &mut route, gpu.unlabelled_sink())?;
+                let g = DeviceBuffer::from_host(stream, &vec![128.0f32; slots * k])?;
+                let u = DeviceBuffer::from_host(
+                    stream,
+                    &xs.iter().map(|v| v / 128.0).collect::<Vec<_>>(),
+                )?;
+                let mut plain = Vec::new();
+                for (fused, native) in [(false, true), (true, true), (false, false)] {
+                    if !native && range.is_none() && !refused {
+                        continue;
+                    }
+                    let mut act = if native {
+                        GemmAct32::new_routed(stream, slots, k)?
+                    } else {
+                        GemmAct32::new(stream, slots, k)?
+                    };
+                    let mut legacy = GemmAct32::new(stream, slots, k)?;
+                    dev.g32.enqueue_swiglu_quant32_sel(
+                        stream,
+                        &g,
+                        &u,
+                        &ids_d,
+                        2,
+                        slots,
+                        &mut legacy,
+                        gpu.unlabelled_sink(),
+                    )?;
+                    let legacy_fault = gpu.take_fault()?;
+                    let mut y = DeviceBuffer::from_host(stream, &vec![SENT; slots * rows + 16])?;
+                    let graph = {
+                        let mut enqueue = |s: &cuda_core::CudaStream| {
+                            if fused {
+                                dev.g32.enqueue_swiglu_quant32_sel(
+                                    s,
+                                    &g,
+                                    &u,
+                                    &ids_d,
+                                    2,
+                                    slots,
+                                    &mut act,
+                                    gpu.unlabelled_sink(),
+                                )?;
+                            } else {
+                                dev.g32.enqueue_quantize_gemm32(
+                                    s,
+                                    &x,
+                                    slots,
+                                    &mut act,
+                                    gpu.unlabelled_sink(),
+                                )?;
+                            }
+
+                            dev.g32.enqueue_gemm32(
+                                s,
+                                Gemm32Args {
+                                    w: Gemm32Weight::Nvfp4Planes(Nvfp4Stack {
+                                        qs: &wq,
+                                        e: &we,
+                                        scales: &ws,
+                                    }),
+                                    rows_per_expert: rows,
+                                    act: &act,
+                                    route: &route,
+                                    input: GemmInput::PerSlot,
+                                    y: &mut y,
+                                },
+                            )
+                        };
+                        enqueue(stream)?;
+                        gpu.capture(|s| enqueue(s))?
+                    };
+                    let q8_eq = !fused
+                        || (act.q().to_host_vec(stream)? == legacy.q().to_host_vec(stream)?
+                            && bits_equal(
+                                &act.d().to_host_vec(stream)?,
+                                &legacy.d().to_host_vec(stream)?,
+                            )
+                            && act.s().to_host_vec(stream)? == legacy.s().to_host_vec(stream)?);
+                    let eager = y.to_host_vec(stream)?;
+                    graph.launch(stream)?;
+                    let replay = y.to_host_vec(stream)?;
+                    let tail = eager[slots * rows..]
+                        .iter()
+                        .all(|v| v.to_bits() == SENT.to_bits());
+                    let host_want = if host {
+                        let (ha, _) = host_act(&x_host, k, slots);
+                        let host_w: Vec<i8> = (0..rows * k)
+                            .map(|i| KVALUES_MXFP4[(i / k + 3 * (i % k)) & 15])
+                            .collect();
+                        let host_wsc: Vec<f32> = (0..k / 16)
+                            .map(|s| ue4m3_half([0x40, 0x38, 0x48, 0x50][s % 4]))
+                            .collect();
+                        (0..slots * rows)
+                            .map(|i| {
+                                let (row, col) = (i % rows, i / rows);
+                                let w = &host_w[row * k..(row + 1) * k];
+                                let scale = weight_scales[ids[col] as usize];
+                                if native {
+                                    dot32_nv_fp4(w, &host_wsc, scale, &ha, col)
+                                } else {
+                                    let (_, want, mag) = dot32_nv(w, &host_wsc, scale, &ha, col);
+                                    Ok((want, mag))
+                                }
+                            })
+                            .collect::<Result<Vec<_>, _>>()?
+                    } else {
+                        Vec::new()
+                    };
+                    let wrong = eager[..slots * rows]
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, value)| {
+                            if host {
+                                let (want, mag) = host_want[*i];
+                                // The block-scaled MMA sums at the hardware's own width, so
+                                // the band is 2^-16 of the magnitude.
+                                return if want.is_nan() {
+                                    !value.is_nan()
+                                } else {
+                                    !value.is_finite()
+                                        || (f64::from(**value) - want).abs()
+                                            > mag * 2.0f64.powi(-16)
+                                };
+                            }
+                            let row = i % rows;
+                            let col = i / rows;
+                            if let Some((scale, input)) = range {
+                                let expected = (k as f64
+                                    * f64::from(input)
+                                    * f64::from(scale)
+                                    * f64::from(block_scale))
+                                    as f32;
+                                return !value.is_finite()
+                                    || (**value - expected).abs() > expected.abs() * 5.0e-7;
+                            }
+                            let dot = if one_hot {
+                                let code = (row + 3 * (col % k)) & 15;
+                                let level = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0][code & 7];
+                                let value = if code & 8 == 0 { level } else { -level };
+                                value * [2.0, 1.0, 4.0, 8.0][(col % k) / 16] * [1.0, -1.0][col % 2]
+                            } else {
+                                (k / 64) as f32
+                                    * 1360.0
+                                    * [1.0, 1.5, 2.0][row % 3]
+                                    * 2.0f32.powi((col % 4) as i32 - 2)
+                            };
+                            let expected = dot * [1.0, 0.5][ids[col] as usize];
+                            let (expected, band) = if tiny {
+                                let expected = expected * 0.75e-40;
+                                // Subnormal Q8 scales have coarser relative spacing.
+                                (expected, expected.abs() * 0.02)
+                            } else {
+                                (expected, 5.0e-7 * expected.abs().max(1.0))
+                            };
+                            !value.is_finite() || (**value - expected).abs() > band
+                        })
+                        .count();
+                    let replay_eq = bits_equal(&eager, &replay);
+                    let producer_eq = !fused || bits_equal(&eager, &plain);
+                    let hash = Fnv1a64::default().f32s(&eager).value();
+                    if !fused {
+                        plain = eager;
+                    }
+                    let pass = tail
+                        && wrong == 0
+                        && replay_eq
+                        && q8_eq
+                        && producer_eq
+                        && legacy_fault == want_fault
+                        && gpu.take_fault()? == want_fault;
+                    println!(
+                        "gemm32 case=nvfp4_native rows={rows} slots={slots} k={k} input={input:?} fused={fused} native={native} q8_eq={q8_eq} producer_eq={producer_eq} wrong={wrong} guard={tail} eager_graph_eq={replay_eq} hash={hash:016x} {}",
+                        verdict(pass)
+                    );
+                    ok &= pass;
+                }
+            }
+            Ok(ok)
+        }
+
         /// Every 32-value case.
         pub(super) fn run(gpu: &Gpu, gk: &GemmKernels) -> Result<bool, GateError> {
             let dev = Dev {
@@ -6481,10 +7407,12 @@ mod gate {
             ok &= routed_case(&dev)?;
             ok &= nvfp4_dense_case(&dev)?;
             ok &= nvfp4_routed_case(&dev)?;
+            ok &= nvfp4_native_case(&dev)?;
             ok &= q5_0p_case(&dev)?;
             ok &= iq4nl_case(&dev)?;
             ok &= remap_case(&dev)?;
             ok &= f32tile_case(&dev)?;
+            ok &= dense_mma_case(&dev)?;
             ok &= refusals(&dev)?;
             println!("gemm32 wall_s={:.1}", t0.elapsed().as_secs_f64());
             Ok(ok)
@@ -6610,6 +7538,30 @@ mod gate {
                 assert!(clean.decode_ok && clean.fail.is_none() && clean.bits_differ == 0);
                 assert_gate_failure(check_ref(&st, &ids, &codes, &d8, &y[..y.len() - 1]));
                 assert_gate_failure(check_ref(&st, &ids, &codes, &d8, &[]));
+            }
+
+            /// A K-quant step whose product leaves the F32 normal range: `d8`
+            /// 2^-149, inner sum `1.5 - 2^-24`, whose F32 rounding 1.5 would
+            /// tie the subnormal product up to 2^-148; the exact inner sum
+            /// gives 2^-149.
+            #[test]
+            fn kquant_contract_keeps_a_subnormal_step_exact() {
+                use super::super::{Dec, dot_ref};
+
+                let mut q = vec![0i8; 128];
+                q[0] = -1;
+                let dec = Dec {
+                    grp: 32,
+                    d: vec![2f64.powi(-24)],
+                    dmin: vec![-1.5],
+                    sc: vec![1; 4],
+                    mn: vec![1; 4],
+                    q,
+                };
+                let mut a = vec![0i8; 128];
+                a[0] = 1;
+                let contract = dot_ref(&dec, &a, &[f32::from_bits(1)]).2;
+                assert_eq!(contract.to_bits(), 1);
             }
         }
     }

@@ -24,8 +24,8 @@
 #   rotate-dry   6 lcpp:6 512 lcpppp:512 under BLOOMERY_DRY=1: our arm's command line and each round's
 #                order and loads as they were, and no warm-up line.
 #   majflt       the rotate run: every row ends in its majflt column — ours timed from its prompt_ids
-#                line, lcpp, lcpppp, mrs and mrspp timed from their progress lines, ik and the bin: arm
-#                the whole process — and the ours and bin: rows then carry ` | drive_read_bytes <n> (<dev>)`
+#                line, the bin: arm from its post-load prompt, lcpp, lcpppp, mrs and mrspp timed from
+#                their progress lines, ik the whole process; ours and bin: then carry ` | drive_read_bytes <n> (<dev>)`
 #                before the cold tag, the others no such column; the closing summary counts the cold rows
 #                and the means line carries the cold and probe-off counts.
 #   mrs-noiter   a mistralrs that prints no `Iteration 1/1...`: the row names it (`timed ? (no progress
@@ -212,6 +212,9 @@
 #   warm         BLOOMERY_WARM_ROWS=1, 6 4 lcpp:6: the two ours arms in one load (one C) as 6 6 4 4, each
 #                after its PRIME; 4's row cold once (a fresh load of 4 4, then clean), lcpp:6 cold twice (COLD,
 #                then FAIL rc=cold); rc 1.
+#   fault-windows  bin: and mem= loads add faults before an --arm prompt: their timed counts stay zero;
+#                faults after the prompt still tag or reject the row. An older binary or a missing
+#                prompt marker keeps the whole-process fallback. --fault-windows runs only these cases.
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
@@ -458,7 +461,14 @@ tokens='' n=32 ctx=0 sync='' arms=() place=''
 while [ $# -gt 0 ]; do
   case $1 in
     --tokens) tokens=$2; shift ;; -n) n=$2; shift ;; --ctx) ctx=$2; shift ;; --warm) shift ;;
-    --arm) arms+=("$2"); shift ;; --arm-sync) sync=1 ;; --place) place=$2; shift ;;
+    --arm)
+      if [ -n "${STUB_GEN_NO_ARM:-}" ]; then
+        echo 'generate_qwen3moe: give exactly one of --prompt, --tokens, --seed-depth' >&2
+        exit 1
+      fi
+      if [ $# -eq 1 ]; then echo 'generate_qwen3moe: --arm needs a value' >&2; exit "${STUB_GEN_PROBE_RC:-1}"; fi
+      arms+=("$2"); shift ;;
+    --arm-sync) sync=1 ;; --place) place=$2; shift ;;
   esac
   shift
 done
@@ -466,6 +476,7 @@ echo "${place:--}" >> "${TMPDIR:-/tmp}/stub-gen-place"
 count() { echo "$1" | tr ',' '\n' | grep -c .; }
 listed=1
 if [ ${#arms[@]} -eq 0 ]; then listed='' arms=("$tokens"); echo "prompt_ids [$tokens]"; fi
+echo $(($(cat "$STUB_MAJFLT") + ${STUB_GEN_LOAD_FAULTS:-0})) > "$STUB_MAJFLT"
 echo "$(for a in "${arms[@]}"; do printf '%s ' "$(count "$a")"; done)" >> "${TMPDIR:-/tmp}/stub-gen-loads"
 [ -z "${STUB_GEN_RES:-}" ] || echo "residency lever residency=$STUB_GEN_RES why=set"
 cards=''
@@ -500,7 +511,7 @@ for k in "${!arms[@]}"; do
   if [ -n "$listed" ]; then
     echo "arm i=$k arms=${#arms[@]} ids=$depth n=$n"
     if [ -n "$sync" ]; then read -r _ || { echo "error: stdin closed before arm $k" >&2; exit 65; }; fi
-    echo "prompt_ids [${arms[$k]}]"
+    [ -n "${STUB_GEN_NO_MARK:-}" ] || echo "prompt_ids [${arms[$k]}]"
   fi
   # STUB_COLD_GEN=<depth>:<K>: the first K arms of that depth add 100000 faults after their prompt ids.
   cm=${TMPDIR:-/tmp}/stub-cold-gen-$depth
@@ -617,7 +628,8 @@ stub_run() {
   rm -f "$tmp/tmp/stub-gen-loads" "$tmp/tmp"/stub-once-* "$tmp/tmp"/stub-cold-* "$tmp/tmp"/stub-srv-*
   rm -f "$tmp/tmp/stub-xid" "$tmp/tmp/stub-systemd-run" "$tmp/tmp/stub-gen-levers"
   echo 0 > "$tmp/tmp/stub-majflt"
-  (cd "$T" && env PATH="$T/bin:$PATH" TMPDIR="$tmp/tmp" BLOOMERY_DECODE_N=4 BLOOMERY_ARM_BOUND=60 \
+  # Both build stubs are the same fixture, so the comparison is declared A/A.
+  (cd "$T" && env PATH="$T/bin:$PATH" TMPDIR="$tmp/tmp" BLOOMERY_DECODE_N=4 BLOOMERY_ARM_BOUND=60 BLOOMERY_AB_AA=1 \
     STUB_BENCH_CARDS="$T/bin/stub-bench-cards" TIMING_CARDS_POLL=1 STUB_MAJFLT="$tmp/tmp/stub-majflt" \
     BLOOMERY_CPU_BUSY_COMMS=none "${e[@]}" bash tools/ref/depth-qwen3moe.sh "$@") > "$log" 2>&1
   RC=$?
@@ -637,6 +649,7 @@ want() {
 }
 heads() { grep -oE '^(DISCARD|WARMUP|ROW|FAIL) r[0-9]+ [^ ]+ [dp]=[0-9]+' "$1"; }
 
+if [ "${1:-}" != --fault-windows ]; then
 L=$tmp/rotate.log
 stub_run "$L" BLOOMERY_AB_ROUNDS=2 -- 6 lcpp:6 lcpppp:4 ik:6 mrs:6 mrspp:4 "bin:$BASEBIN:6"
 want_seq="ROW r1 ours d=6
@@ -699,7 +712,7 @@ if want majflt "$L" 14 "$END" &&
   want majflt "$L" 4 "^ROW r[12] lcpp(pp)? [dp]=[46] .*${MAJ}timed [0-9]+; " &&
   want majflt "$L" 4 "^ROW r[12] mrs(pp)? [dp]=[46] .*${MAJ}timed [0-9]+; " &&
   want majflt "$L" 2 "^ROW r[12] ik d=6 .*${MAJ}whole process; ≤ [0-9.]+ % of W 0.2000 s\)" &&
-  want majflt "$L" 2 "^ROW r[12] bin:base d=6 .*${MAJ}timed \? \(a one-arm run prints its prompt ids before its load: the whole process\); ≤ [0-9.]+ % of W 0.1200 s\)${DRV}( \[cold\])?$" &&
+  want majflt "$L" 2 "^ROW r[12] bin:base d=6 .*${MAJ}timed 0; ≤ [0-9.]+ % of W 0.1200 s\)${DRV}( \[cold\])?$" &&
   want majflt "$L" 2 "^ROW r[12] mrs d=6 .*of W 0.0600 s\)" &&
   want majflt "$L" 4 '^ROW .*\| drive_read_bytes ' &&
   want majflt "$L" 1 '^cold rows: [0-9]+ of 14 ' &&
@@ -842,9 +855,9 @@ if [ "$RC" != 1 ]; then
   fail ref-fail "rc $RC, want 1" "$L"
 elif [ "$seq" != "$want_seq" ]; then
   fail ref-fail "the rows' heads: $(echo "$seq" | paste -sd'|' -)" "$L"
-elif want ref-fail "$L" 1 "^FAIL r1 lcpppp p=4 rc=134 \| no 'pp4' row; last line: ggml_cuda_error: in function ggml_backend_cuda_graph_compute \(stub\) ${FULL}lcpppp-p4-r1\.log$" &&
-  want ref-fail "$L" 1 "^FAIL r1 lcppfit d=6 rc=0 \| llama-bench.s fit did not run: 0 model load\(s\) in its -v output, want the fit.s measuring load and the real one; last line: build: stub \(0\) ${FULL}lcppfit-d6-r1\.log$" &&
-  want ref-fail "$L" 1 "^FAIL r1 mrs d=6 rc=0 \| no 'Decode \(4 tokens @ d6\)' row; last line: .*WARN mistralrs_cli: the stub prints no row once ${FULL}mrs-d6-r1\.log$" &&
+elif want ref-fail "$L" 1 "^FAIL r1 lcpppp p=4 rc=134 \| no 'pp4' row; last line: ggml_cuda_error: in function ggml_backend_cuda_graph_compute \(stub\) ${FULL}[^ ]+$" &&
+  want ref-fail "$L" 1 "^FAIL r1 lcppfit d=6 rc=0 \| llama-bench.s fit did not run: 0 model load\(s\) in its -v output, want the fit.s measuring load and the real one; last line: build: stub \(0\) ${FULL}[^ ]+$" &&
+  want ref-fail "$L" 1 "^FAIL r1 mrs d=6 rc=0 \| no 'Decode \(4 tokens @ d6\)' row; last line: .*WARN mistralrs_cli: the stub prints no row once ${FULL}[^ ]+$" &&
   want ref-fail "$L" 11 '^ROW ' &&
   want ref-fail "$L" 1 '^=== dropped from the means and the ratios below' &&
   want ref-fail "$L" 3 '^    dropped: (lcpppp at 4|lcppfit at 6|mrs at 6)$' &&
@@ -856,7 +869,7 @@ elif want ref-fail "$L" 1 "^FAIL r1 lcpppp p=4 rc=134 \| no 'pp4' row; last line
   want ref-fail "$L" 1 '^cold rows: [0-9]+ of 11 ' &&
   want ref-fail "$L" 1 '^failed arms: 3 \(FAIL rows, ' &&
   want ref-fail "$L" 1 '^failed arms: r1 lcpppp p=4 rc=134; r1 lcppfit d=6 rc=0; r1 mrs d=6 rc=0; $'; then
-  if grep -q '^ggml_cuda_error: ' "$tmp/tmp/depth-qwen3moe-lcpppp-p4-r1.log" 2> /dev/null; then
+  if grep -q '^ggml_cuda_error: ' "$(sed -n 's/^FAIL r1 lcpppp p=4 .* | full output: //p' "$L")" 2> /dev/null; then
     pass ref-fail
   else
     fail ref-fail "the FAIL row's full output file does not hold the abort" "$L"
@@ -878,8 +891,8 @@ if [ "$RC" != 1 ]; then
   fail discard-fail "rc $RC, want 1" "$L"
 elif [ "$seq" != "$want_seq" ]; then
   fail discard-fail "the rows' heads: $(echo "$seq" | paste -sd'|' -)" "$L"
-elif want discard-fail "$L" 1 "^FAIL r0 lcpp d=6 rc=0 \| no 'tg4 @ d6' row; last line: build: stub \(0\) ${FULL}lcpp-d6-r0\.log$" &&
-  want discard-fail "$L" 1 "^FAIL r0 lcppppfit8 p=8 rc=134 \| no 'pp8' row; last line: ggml_cuda_error: .* ${FULL}lcppppfit8-p8-r0\.log$" &&
+elif want discard-fail "$L" 1 "^FAIL r0 lcpp d=6 rc=0 \| no 'tg4 @ d6' row; last line: build: stub \(0\) ${FULL}[^ ]+$" &&
+  want discard-fail "$L" 1 "^FAIL r0 lcppppfit8 p=8 rc=134 \| no 'pp8' row; last line: ggml_cuda_error: .* ${FULL}[^ ]+$" &&
   want discard-fail "$L" 1 "^FAIL r0 mrs d=6 rc=0 \| no 'Decode \(4 tokens @ d6\)' row; " &&
   want discard-fail "$L" 3 '^\[discard\] ' &&
   want discard-fail "$L" 0 '^=== dropped|^    dropped: ' &&
@@ -1064,7 +1077,7 @@ elif [ "$loads" != "6 4 5|5" ]; then
 elif [ "$(heads "$L" | paste -sd'|' -)" != "ROW r1 ours d=6|FAIL r1 ours d=4|ROW r1 ours d=5" ]; then
   fail group-fail "the rows' heads: $(heads "$L" | paste -sd'|' -)" "$L"
 elif want group-fail "$L" 1 '^ROW r1 ours d=6 .*\| slot 1/3 \|' &&
-  want group-fail "$L" 1 "^FAIL r1 ours d=4 rc=3 \| exited 3; last line: error: the stub refuses depth 4 once ${FULL}ours-d4-r1\.log$" &&
+  want group-fail "$L" 1 "^FAIL r1 ours d=4 rc=3 \| exited 3; last line: error: the stub refuses depth 4 once ${FULL}[^ ]+$" &&
   want group-fail "$L" 1 '^\[load\] r1: arm 4 failed \(rc 3\); the 1 arm\(s\) after it run in a fresh load$' &&
   want group-fail "$L" 1 '^ROW r1 ours d=5 .*\| slot 1/1 \|' &&
   want group-fail "$L" 1 '^    dropped: ours at 4$' &&
@@ -1729,13 +1742,67 @@ elif want warm "$L" 1 '^FAIL r1 lcpp d=6 rc=cold \| cold after warm-up and one r
   want warm "$L" 1 '^warm rows: 2 COLD row\(s\) ran once more: 1 clean on the retry, 1 FAIL rc=cold$'; then
   pass warm
 fi
+fi
+
+L=$tmp/bin-load-faults.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_WARM_ROWS=1 STUB_GEN_LOAD_FAULTS=100000 -- "bin:$BASEBIN:6"
+if [ "$RC" != 0 ]; then
+  fail bin-load-faults "rc $RC, want 0" "$L"
+elif want bin-load-faults "$L" 2 '^(PRIME|ROW) r1 bin:base d=6 .*\| majflt 100000 \(timed 0; ' &&
+  want bin-load-faults "$L" 0 '^(COLD|FAIL) ' &&
+  want bin-load-faults "$L" 1 '^mean bin:base d=6 .*\(n=1\)'; then
+  pass bin-load-faults
+fi
+
+L=$tmp/bin-timed-faults.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_WARM_ROWS=1 STUB_GEN_LOAD_FAULTS=100000 STUB_COLD_GEN=6:99 -- "bin:$BASEBIN:6"
+if [ "$RC" != 1 ]; then
+  fail bin-timed-faults "rc $RC, want 1" "$L"
+elif want bin-timed-faults "$L" 1 '^COLD r1 bin:base d=6 .*\| majflt 200000 \(timed 100000; ' &&
+  want bin-timed-faults "$L" 1 '^FAIL r1 bin:base d=6 rc=cold .*timed 100000; ' &&
+  want bin-timed-faults "$L" 0 '^mean bin:base '; then
+  pass bin-timed-faults
+fi
+
+for spec in NO_ARM=1 NO_MARK=1 PROBE_RC=0 PROBE_RC=70; do
+  mode=${spec//=/-}
+  L=$tmp/bin-fallback-$mode.log
+  stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_WARM_ROWS=1 STUB_GEN_LOAD_FAULTS=100000 "STUB_GEN_$spec" -- "bin:$BASEBIN:6"
+  if [ "$RC" != 1 ]; then
+    fail "bin-fallback-$mode" "rc $RC, want 1" "$L"
+  elif want "bin-fallback-$mode" "$L" 1 '^COLD r1 bin:base d=6 .*\| majflt 100000 \(timed \? .*the whole process\); ' &&
+    want "bin-fallback-$mode" "$L" 1 '^FAIL r1 bin:base d=6 rc=cold .*timed 100000; ' &&
+    want "bin-fallback-$mode" "$L" 0 '^mean bin:base '; then
+    pass "bin-fallback-$mode"
+  fi
+done
+
+for faults in load timed legacy; do
+  L=$tmp/mem-faults-$faults.log
+  extra=()
+  case $faults in
+    timed) extra=(STUB_COLD_GEN=6:99); whole=200000; timed=100000; cold=' \[cold\]' ;;
+    legacy) extra=(STUB_GEN_NO_ARM=1); whole=100000; timed='\? .*the whole process\)'; cold=' \[cold\]' ;;
+    *) whole=100000; timed=0; cold='' ;;
+  esac
+  arms=("bin:$BASEBIN:6@mem=29G")
+  arms+=("6@mem=29G")
+  stub_run "$L" BLOOMERY_AB_ROUNDS=1 STUB_GEN_LOAD_FAULTS=100000 "${extra[@]}" -- "${arms[@]}"
+  if [ "$RC" != 0 ]; then
+    fail "mem-faults-$faults" "rc $RC, want 0" "$L"
+  elif want "mem-faults-$faults" "$L" "${#arms[@]}" "^ROW r1 .*capped mem=29G .*\| majflt $whole \(timed $timed; .*${cold}$" &&
+    want "mem-faults-$faults" "$L" 0 '^FAIL '; then
+    pass "mem-faults-$faults"
+  fi
+done
 
 if [ "${DEPTH_QWEN3MOE_STUB_SHOW:-}" = 1 ]; then
   for L in "$tmp"/rotate.log "$tmp"/rotate-dry.log "$tmp"/mrs-noiter.log "$tmp"/warmup-rotate.log \
     "$tmp"/blocks.log "$tmp"/order-bad.log "$tmp"/warmup-bad.log "$tmp"/blocks-dry.log "$tmp"/ref-fail.log \
     "$tmp"/discard-fail.log "$tmp"/discard-nofit.log "$tmp"/warmup-fail.log "$tmp"/probe-*.log "$tmp"/refused-*.log "$tmp"/group-fail.log "$tmp"/twocard*.log \
     "$tmp"/srv*.log "$tmp"/place-*.log "$tmp"/mtp*.log "$tmp"/slots*.log "$tmp"/bin-slots.log "$tmp"/bin-mem.log \
-    "$tmp"/evict*.log "$tmp"/cpu-guard.log "$tmp"/warm.log "$tmp"/local*.log; do
+    "$tmp"/evict*.log "$tmp"/cpu-guard.log "$tmp"/warm.log "$tmp"/local*.log \
+    "$tmp"/bin-load-faults.log "$tmp"/bin-timed-faults.log "$tmp"/bin-fallback-*.log "$tmp"/mem-faults-*.log; do
     echo "--- ${L##*/}"
     cat "$L"
   done

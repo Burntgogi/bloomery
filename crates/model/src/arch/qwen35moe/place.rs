@@ -58,8 +58,9 @@ use crate::placement::workstation::{
     TierBatchBytes, tier_batch_host_bytes, tier_batch_staging_bytes,
 };
 use crate::placement::{
-    self, Card, CardFormat, Host, KvBytes, Machine, ModelTensor, ModelTensors, Node,
-    PlacementError, Plan, PlanLevers, RoutedRule, Unimplemented, Violation, checked, joined,
+    self, Card, CardFormat, Device, ExpertList, Format, Host, KvBytes, Machine, ModelTensor,
+    ModelTensors, Node, PlacementError, Plan, PlanLevers, RoutedRule, Unimplemented, Violation,
+    checked, joined,
 };
 use gguf::digest::hex;
 
@@ -179,15 +180,18 @@ pub struct PlanInputs {
     pub kv: KvLayout,
     /// The host's available bytes when the inputs were read, with the
     /// reading that decided ([`workstation::host_available_read`]): the PLE
-    /// table's tier follows it ([`placement::row_table_tier`]) — on the host
+    /// split table's tier follows it ([`placement::row_table_tier`]): on the host
     /// while the room holds the plan with the table there, else on the NVMe
     /// tier; the routed experts the room still cannot hold follow it there
     /// ([`placement::expert_nvme_tier`]). A gate that plans an arm by a room
-    /// of its own sets it, read [`HostRead::Given`].
+    /// of its own sets it, read [`HostRead::Given`]. Part-source tables stay
+    /// on NVMe regardless of this room ([`PlanInputs::row_source`]).
     ///
-    /// The plan is made at [`workstation::plan_room`]: a read room less
-    /// [`workstation::HOST_DRIFT`], a given room as given.
+    /// The effective room is [`Plan::plan_at`]'s: the reading's plan room,
+    /// capped by the machine's host room and unified pool.
     pub room: (u64, HostRead),
+    /// A part source's rows stay on NVMe, with room for each stored plane.
+    pub row_source: placement::RowTableSource,
     /// The arena's bytes `BLOOMERY_NVTIER_BYTES` gave the split dial
     /// ([`workstation::nvtier_arena_given`]), `None` unset; the split takes it
     /// as its `given` ([`placement::expert_nvme_tier`]). A gate that plans an
@@ -261,6 +265,19 @@ pub enum PlaceError {
         card: String,
         got: Vec<u64>,
         want: Option<u64>,
+    },
+    /// The stage card's reserve for the card route's run of the whole
+    /// ubatch ([`ROUTE_UNIT_RESERVE`]) is not the one a load of ubatches of
+    /// up to `u` positions reads ([`card_route_run`]).
+    #[error(
+        "card {card} reserves {got:?} B as \"{ROUTE_UNIT_RESERVE}\"; a load of ubatches of up to \
+         {u} positions reads no such row or one of {want} B"
+    )]
+    RouteUnitReserve {
+        card: String,
+        got: Vec<u64>,
+        u: u64,
+        want: u64,
     },
     /// A plan of no resident sequence slot.
     #[error("{slots} resident sequence slots: a plan serves at least one")]
@@ -388,6 +405,11 @@ impl PlanInputs {
             spec,
             kv,
             room,
+            row_source: if split.is_header_only() {
+                placement::RowTableSource::Parts
+            } else {
+                placement::RowTableSource::Split
+            },
             arena,
         })
     }
@@ -480,7 +502,7 @@ impl PlanInputs {
             let room = plan.plan_at(&self.room);
             let floor = 2 * self.seq_state_bytes(ctx_max, None);
             let page = os::page_bytes().map_err(|e| PlacementError::Host(e.to_string()))?;
-            placement::row_table_tier(&mut plan, room, floor, UBATCH_PLANNED, page)?;
+            self.place_rows(&mut plan, room, floor, page)?;
             plan.host.step_slots(1, placement::STEP_PORT_COLUMNS)?;
             placement::expert_nvme_tier(&mut plan, room, self.arena)?;
             Ok(plan)
@@ -594,6 +616,16 @@ impl PlanInputs {
         self.target_rule(machine, ctx_max, levers, rule, beside)
     }
 
+    fn place_rows(
+        &self,
+        plan: &mut Plan<'_>,
+        room: u64,
+        floor: u64,
+        page: u64,
+    ) -> Result<(), PlacementError> {
+        placement::row_table_tier(plan, room, floor, UBATCH_PLANNED, page, self.row_source)
+    }
+
     /// [`PlanInputs::target`] over `kv`'s per-layer bytes instead of the
     /// file's own — the multiplying view a multi-slot plan counts by.
     fn target_of<'a>(
@@ -662,9 +694,15 @@ impl PlanInputs {
             let floor = 2 * self.seq_state_bytes(ctx_max, beside.mtp);
             let room = plan.plan_at(&self.room);
             let page = os::page_bytes().map_err(|e| PlacementError::Host(e.to_string()))?;
-            placement::row_table_tier(&mut plan, room, floor, UBATCH_PLANNED, page)?;
-            plan.host
-                .step_slots(beside.slots, placement::STEP_PORT_COLUMNS)?;
+            self.place_rows(&mut plan, room, floor, page)?;
+            plan.host.step_slots(
+                if beside.mtp.is_some() {
+                    beside.slots.saturating_mul(DELTA_LANES)
+                } else {
+                    beside.slots
+                },
+                placement::STEP_PORT_COLUMNS,
+            )?;
             placement::expert_nvme_tier(&mut plan, room, self.arena)?;
             Ok(plan)
         };
@@ -948,6 +986,28 @@ impl PlanInputs {
             arena_bytes: arena,
         })
     }
+
+    /// The target's plan of `slots` resident sequences on `machine` at
+    /// `ctx_max` positions under `levers` and `experts`:
+    /// [`PlanInputs::plan_with_slots`], or with the MTP draft `mtp` beside it
+    /// [`PlanInputs::plan_mtp_with_slots`]'s target plan. Refused as they
+    /// refuse.
+    pub fn plan_target<'a>(
+        &'a self,
+        machine: &'a Machine,
+        ctx_max: u64,
+        levers: &PlanLevers,
+        experts: Experts,
+        mtp: Option<&'a MtpInputs>,
+        slots: usize,
+    ) -> Result<Plan<'a>, PlaceError> {
+        match mtp {
+            None => self.plan_with_slots(machine, ctx_max, levers, experts, slots),
+            Some(mi) => Ok(self
+                .plan_mtp_with_slots(machine, ctx_max, levers, mi, experts, slots)?
+                .plan),
+        }
+    }
 }
 
 /// A draft plan's card terms: its granules (dense, experts, rounding), its
@@ -1107,7 +1167,8 @@ pub const fn card_scratch_bytes(ubatch: u64) -> u64 {
 /// The most tokens one routed run of a ubatch walk's card route takes, and
 /// so the run buffers' width: the walk routes in runs of this many tokens
 /// (`crates/gpu/src/arch/qwen3moe/scratch38.rs`'s `ROUTE_ROWS`, restated
-/// here — the model crate does not read the gpu crate).
+/// here — the model crate does not read the gpu crate), unless the plan
+/// widened the run to the whole ubatch ([`widen_card_route`]).
 pub const CARD_ROUTE_ROWS: u64 = 2_048;
 
 /// Card bytes a ubatch walk's card route holds a run token, an upper bound
@@ -1147,9 +1208,9 @@ pub const fn card_route_scratch_bytes(u: u64) -> u64 {
 /// of up to `u` positions [derived: a tier layer's join sums the card's and
 /// the tier's slots in slot order after the host's wait, so the route keeps
 /// its card slots' down rows and places for the whole unit, not one run —
-/// (u − min(u, CARD_ROUTE_ROWS)) tokens more of 10 · 2,560 · 4 + 10 · 4 =
-/// 102,440 B — and the unit's tier places and their ranks among the tier
-/// slots, 2 · 10 · 4 = 80 B a token].
+/// (u − min(u, CARD_ROUTE_ROWS)) tokens more of [`JOIN_TOKEN_BYTES`] — and
+/// the unit's tier places and their ranks among the tier slots,
+/// 2 · 10 · 4 = 80 B a token].
 #[must_use]
 pub const fn card_tier_join_bytes(u: u64) -> u64 {
     let run = if u < CARD_ROUTE_ROWS {
@@ -1157,7 +1218,120 @@ pub const fn card_tier_join_bytes(u: u64) -> u64 {
     } else {
         CARD_ROUTE_ROWS
     };
-    (u - run) * 102_440 + u * 80
+    (u - run) * JOIN_TOKEN_BYTES + u * 80
+}
+
+/// Card bytes a tier layer's join keeps a token of the unit past the card
+/// route's run: its card slots' down rows and places [derived:
+/// 10 · 2,560 · 4 + 10 · 4], which a run holds a run token too
+/// ([`CARD_ROUTE_RUN_TOKEN_BYTES`]).
+const JOIN_TOKEN_BYTES: u64 = 102_440;
+
+/// What a stage card's reserve for its card route's run of the whole
+/// ubatch is called ([`widen_card_route`]): the bytes that run holds past
+/// the runs of [`CARD_ROUTE_ROWS`] tokens the card's scratch counts
+/// ([`route_unit_bytes`]). A load reads its run from it
+/// ([`card_route_run`]).
+const ROUTE_UNIT_RESERVE: &str = "card route's whole-ubatch run";
+
+/// The card bytes the card route's run of a whole ubatch of up to `u`
+/// positions holds past its runs of [`CARD_ROUTE_ROWS`] tokens: the
+/// `u − min(u, CARD_ROUTE_ROWS)` run tokens more
+/// ([`CARD_ROUTE_RUN_TOKEN_BYTES`]), less on a load with an expert tier
+/// (`tiered`) the down rows and places the join already keeps for them
+/// ([`card_tier_join_bytes`]). 0 for a ubatch of one such run; saturated
+/// past u64 bytes, which no card holds.
+#[must_use]
+const fn route_unit_bytes(u: u64, tiered: bool) -> u64 {
+    let past = u.saturating_sub(CARD_ROUTE_ROWS);
+    let token = if tiered {
+        CARD_ROUTE_RUN_TOKEN_BYTES - JOIN_TOKEN_BYTES
+    } else {
+        CARD_ROUTE_RUN_TOKEN_BYTES
+    };
+    past.saturating_mul(token)
+}
+
+/// Where a plan puts each tensor: each row's pieces as their device,
+/// format and experts ([`placement::Segment`]), in the plan's row order.
+pub type TensorPlaces = Vec<Vec<(Device, Format, Option<ExpertList>)>>;
+
+/// [`TensorPlaces`] of `plan`.
+#[must_use]
+pub fn tensor_places(plan: &Plan<'_>) -> TensorPlaces {
+    plan.rows
+        .iter()
+        .map(|r| {
+            r.segments
+                .iter()
+                .map(|s| (s.device, s.format, s.experts.clone()))
+                .collect()
+        })
+        .collect()
+}
+
+/// `machine`, a qwen4exp machine for ubatches of up to `ubatch` positions
+/// ([`machine_for_experts`], [`machine_bp_on`]) whose card route runs in
+/// runs of [`CARD_ROUTE_ROWS`] tokens, with that run widened to the whole
+/// ubatch when nothing the plan places moves for it: its stage card then
+/// reserves [`route_unit_bytes`] as [`ROUTE_UNIT_RESERVE`], and a ubatch
+/// walk reads each card expert's weights once instead of once a run.
+/// `plan` is the caller's plan of a machine ([`PlanInputs::plan_target`]),
+/// as where it puts each tensor ([`tensor_places`]): the run is widened
+/// when the stage card holds a routed expert and the plan of the widened
+/// machine places every tensor where the plan of `machine` does, so the
+/// wider run takes only room no expert, table or tier would use (on a
+/// unified pool the host's room shrinks with the card's reserves). The
+/// reserve is the one difference between the two machines, so a plan of the
+/// widened one that fails is the reserve not fitting, and keeps the runs.
+/// Refused as `plan` refuses `machine`.
+pub fn widen_card_route(
+    mut machine: Machine,
+    ubatch: u64,
+    plan: impl Fn(&Machine) -> Result<TensorPlaces, PlaceError>,
+) -> Result<Machine, PlaceError> {
+    let held = plan(&machine)?;
+    let bytes = route_unit_bytes(ubatch, !machine.tiers.is_empty());
+    let stage_expert = held.iter().flatten().any(|(device, _, experts)| {
+        *device == Device::Card(0) && experts.as_ref().is_some_and(|e| !e.is_empty())
+    });
+    if bytes == 0 || !stage_expert {
+        return Ok(machine);
+    }
+    let Some(stage) = machine.cards.first_mut() else {
+        return Ok(machine);
+    };
+    stage.reserves.push((ROUTE_UNIT_RESERVE.to_string(), bytes));
+    if !plan(&machine).is_ok_and(|wide| wide == held) {
+        machine.cards[0].reserves.pop();
+    }
+    Ok(machine)
+}
+
+/// The tokens one run of a load's card route takes at ubatches of up to `u`
+/// positions on `card`, the stage card of its plan's machine (`tiered`, a
+/// machine with an expert tier), and the card bytes its ubatch walk may hold
+/// past the m = 1 scratch: the whole ubatch with the run's reserve beside
+/// [`workstation::counted_arena_bytes`] on a card that holds
+/// [`ROUTE_UNIT_RESERVE`] ([`widen_card_route`]), else at most
+/// [`CARD_ROUTE_ROWS`] and the counted bytes alone. Refused by name: more
+/// than one such reserve, or one of other than [`route_unit_bytes`]'s
+/// bytes (none for a ubatch of one run).
+pub fn card_route_run(card: &Card, u: u64, tiered: bool) -> Result<(u64, u64), PlaceError> {
+    let counted = workstation::counted_arena_bytes(card);
+    let got = reserve_rows(card, ROUTE_UNIT_RESERVE);
+    let want = route_unit_bytes(u, tiered);
+    match *got.as_slice() {
+        [] => return Ok((u.min(CARD_ROUTE_ROWS), counted)),
+        [b] if b == want && want > 0 => return Ok((u, counted.saturating_add(b))),
+        _ => {}
+    }
+    Err(PlaceError::RouteUnitReserve {
+        card: card.name.clone(),
+        got,
+        u,
+        want,
+    })
 }
 
 /// Tier-card bytes a run token of the tier's block route holds
@@ -1338,17 +1512,21 @@ pub fn machine_bp_on(
     m
 }
 
+/// The bytes of each of `card`'s reserves named `name`, in order.
+fn reserve_rows(card: &Card, name: &str) -> Vec<u64> {
+    card.reserves
+        .iter()
+        .filter(|(n, _)| n == name)
+        .map(|&(_, b)| b)
+        .collect()
+}
+
 /// The stage cards' [`MTP_RESERVE`] rows against `want`: none for `None`,
 /// exactly one of `want` bytes on the one stage card for `Some`; anything
 /// else is refused by name ([`PlaceError::DraftReserve`]).
 fn check_draft_reserve(machine: &Machine, want: Option<u64>) -> Result<(), PlaceError> {
     for (i, card) in machine.cards.iter().enumerate() {
-        let got: Vec<u64> = card
-            .reserves
-            .iter()
-            .filter(|(name, _)| name == MTP_RESERVE)
-            .map(|&(_, b)| b)
-            .collect();
+        let got = reserve_rows(card, MTP_RESERVE);
         let ok = match want {
             Some(b) if i == 0 => got == [b],
             _ => got.is_empty(),
@@ -1927,8 +2105,60 @@ impl MtpInputs {
     /// absent (an unread one may be), one of another type or shape, and a
     /// tensor the file holds that is none of them.
     pub fn from_parts(draft: MtpDraft, file: &[FileTensor]) -> Result<MtpInputs, PlacementError> {
-        let tensors = mtp_tensors(&draft)?;
+        let mut tensors = mtp_tensors(&draft)?;
+        let (Mixer::Gqa(g), Ffn::Moe(m)) = (&draft.layer.mixer, &draft.layer.ffn) else {
+            return Err(PlacementError::Metadata {
+                key: "mtp layer".to_string(),
+                detail: "is not a routed GQA layer".to_string(),
+            });
+        };
         let index = draft.index;
+        let mut scales = Vec::new();
+        for t in &mut tensors {
+            let Some(f) = file.iter().find(|f| f.name == t.name(index)) else {
+                continue;
+            };
+            let Some((ty, _)) = &mut t.form else {
+                continue;
+            };
+            match (*ty, f.ty, t.load) {
+                (GgmlType::Q8_0, GgmlType::BF16, MtpLoad::Card(role))
+                    if role != Role::RoutedExperts =>
+                {
+                    *ty = f.ty
+                }
+                (GgmlType::F32, GgmlType::BF16, MtpLoad::Card(Role::Router))
+                | (GgmlType::F32, GgmlType::BF16, MtpLoad::Card(Role::SharedExpert)) => *ty = f.ty,
+                (GgmlType::Q8_0, GgmlType::FP8_B128, MtpLoad::Card(Role::RoutedExperts)) => {
+                    *ty = f.ty
+                }
+                (GgmlType::Q8_0, GgmlType::F32, MtpLoad::Widened(role)) => {
+                    *ty = f.ty;
+                    t.load = MtpLoad::Card(role);
+                }
+                (GgmlType::Q8_0, GgmlType::NVFP4, MtpLoad::Card(Role::RoutedExperts)) => {
+                    *ty = f.ty;
+                    let stem = match t.stem {
+                        "ffn_gate_exps.weight" => "ffn_gate_exps.scale",
+                        "ffn_up_exps.weight" => "ffn_up_exps.scale",
+                        "ffn_down_exps.weight" => "ffn_down_exps.scale",
+                        _ => {
+                            return Err(PlacementError::Tensor {
+                                name: f.name.clone(),
+                                detail: "is not a routed MTP stack".to_string(),
+                            });
+                        }
+                    };
+                    scales.push(MtpTensor {
+                        stem,
+                        form: Some((GgmlType::F32, vec![u64::from(m.experts)])),
+                        load: MtpLoad::Card(Role::Unread),
+                    });
+                }
+                _ => {}
+            }
+        }
+        tensors.extend(scales);
         let layer = Some(0);
         let mut model = Vec::with_capacity(file.len() + 3);
         for f in file {
@@ -1989,13 +2219,6 @@ impl MtpInputs {
             }
         }
         let map_bytes = u64::from(draft.vocab) * runtime::stores::U32_BYTES;
-        // `mtp_tensors` refused any other layer.
-        let (Mixer::Gqa(g), Ffn::Moe(m)) = (&draft.layer.mixer, &draft.layer.ffn) else {
-            return Err(PlacementError::Metadata {
-                key: "mtp layer".to_string(),
-                detail: "is not a routed GQA layer".to_string(),
-            });
-        };
         let (experts, experts_used) = (u64::from(m.experts), u64::from(m.top_k));
         let kv = MtpKv {
             kv_heads: g.kv_heads as usize,
@@ -2009,7 +2232,18 @@ impl MtpInputs {
                 layers: 1,
                 experts,
                 experts_used,
-                bf16_words: |_| false,
+                bf16_words: if file
+                    .iter()
+                    .filter(|t| {
+                        t.name.ends_with(".ffn_gate_inp.weight")
+                            || t.name.ends_with(".ffn_gate_inp_shexp.weight")
+                    })
+                    .all(|t| t.ty == GgmlType::BF16)
+                {
+                    |_| true
+                } else {
+                    |t| t.role != Role::Router && !t.name.ends_with(".ffn_gate_inp_shexp.weight")
+                },
             },
             machine: draft_machine(),
             kv,
@@ -2117,8 +2351,9 @@ mod tests {
     fn an_f8_ple_table_and_its_scale_describe() {
         use crate::arch::qwen35moe::hparams::tests::{keys, tensors};
         use crate::arch::synthetic::{Ty, V, header_typed};
-        use crate::placement::Role;
         use crate::placement::workstation::HostRead;
+        use crate::placement::{self, PlanLevers, Role};
+        use gguf::Split;
 
         let table = "per_layer_token_embd.weight";
         let scale = "per_layer_token_embd.scale";
@@ -2134,6 +2369,8 @@ mod tests {
                     (n, d, Ty::F8Rows)
                 } else if n.starts_with("blk.2.ffn_") && n.ends_with("_exps.weight") {
                     (n, vec![64, 1, 8], Ty::Nvfp4)
+                } else if n.contains(".ffn_") && n.ends_with("_exps.weight") {
+                    (n, vec![64, 1, 8], Ty::F32)
                 } else if n.ends_with(".attn_q.weight") {
                     // The query projection writes each of the 4 heads' 16
                     // values and its gate beside them.
@@ -2152,9 +2389,57 @@ mod tests {
         let pre = [("tokenizer.ggml.pre", V::Str("qwen35"))];
         let path = header_typed("q4x-f8-ple", "qwen4exp", &keys(), &pre, &typed);
         let split = gguf::Split::open(&path).expect("the synthetic header opens");
-        let inputs = super::PlanInputs::describe_in(&split, (u64::MAX, HostRead::Given));
+        let inputs = super::PlanInputs::describe_in(&split, (u64::MAX, HostRead::Given))
+            .expect("the file describes");
+        let layout = gguf::write::Layout::new(
+            split.keys(),
+            split
+                .iter_tensors()
+                .map(|(_, t)| gguf::write::TensorDecl {
+                    name: t.name.clone(),
+                    dims: t.dims.clone(),
+                    type_id: t.ty.as_u32(),
+                    nbytes: t.nbytes,
+                })
+                .collect(),
+        )
+        .unwrap();
+        let header = Split::header_only(path.clone(), &layout).unwrap();
+        assert!(!split.is_header_only());
+        assert!(header.is_header_only());
+        let source = super::PlanInputs::describe_in(&header, (u64::MAX, HostRead::Given))
+            .expect("the folder header describes");
+        let machine = super::machine(super::A6000, inputs.model.layers, 8);
+        let levers = PlanLevers {
+            card_budget_bytes: None,
+        };
+        for (input, tier) in [
+            (&inputs, placement::Device::Host),
+            (&source, placement::Device::Nvme),
+        ] {
+            for plan in [
+                input.plan_with(&machine, 4096, &levers, super::Experts::Card),
+                input.plan_nodes(&machine, 4096, &levers, &[8]),
+                input.plan_with_slots(&machine, 4096, &levers, super::Experts::Card, 2),
+            ] {
+                let plan = plan.unwrap();
+                assert_eq!(plan.row_tier().unwrap(), Some(tier));
+                if tier == placement::Device::Nvme {
+                    assert_eq!(plan.host.table_bytes, 0);
+                    assert_eq!(
+                        plan.host.row_reserve_bytes,
+                        placement::row_room(
+                            &input.model,
+                            super::UBATCH_PLANNED,
+                            os::page_bytes().unwrap(),
+                            input.row_source,
+                        )
+                        .unwrap()
+                    );
+                }
+            }
+        }
         let _ = std::fs::remove_file(&path);
-        let inputs = inputs.expect("the file describes");
         let role = |name: &str| {
             inputs
                 .model
@@ -2813,6 +3098,124 @@ mod tests {
         const LIST_ROWS: usize = 40_960;
         const MAP: u64 = 993_280;
 
+        #[test]
+        fn mtp_stored_bf16_and_nvfp4_keep_their_types_and_scales() {
+            let d = draft(HeadSet::Full);
+            let mut stored = file();
+            let mut scales = Vec::new();
+            for f in &mut stored {
+                if f.ty == GgmlType::Q8_0 {
+                    f.ty = if f.name.contains("_exps.weight") {
+                        scales.push(FileTensor {
+                            name: f.name.replace(".weight", ".scale"),
+                            shard: 0,
+                            ty: GgmlType::F32,
+                            dims: vec![512],
+                            nbytes: 512 * 4,
+                        });
+                        GgmlType::NVFP4
+                    } else if f.name.contains("_inject.weight") {
+                        GgmlType::F32
+                    } else {
+                        GgmlType::BF16
+                    };
+                    f.nbytes = f.dims.iter().product::<u64>() / f.ty.blck_size().unwrap()
+                        * f.ty.type_size().unwrap();
+                }
+            }
+            stored.extend(scales);
+            let m = MtpInputs::from_parts(d.clone(), &stored).unwrap();
+            assert!(
+                m.tensors
+                    .iter()
+                    .all(|t| !matches!(t.load, MtpLoad::Widened(_)))
+            );
+            let plan = m.draft_plan(4096).unwrap().0;
+            assert!(plan.violations().is_empty(), "{:?}", plan.violations());
+            assert_eq!(plan.n_l, [512]);
+            for t in &m.model.tensors {
+                if !t.name.contains("indexer.") {
+                    assert_ne!(t.role, Role::Unused, "{}", t.name);
+                }
+                if t.ty == GgmlType::BF16 {
+                    assert!((m.model.bf16_words)(t));
+                }
+            }
+            let scale = stored.pop().unwrap();
+            assert!(
+                MtpInputs::from_parts(d.clone(), &stored)
+                    .unwrap_err()
+                    .to_string()
+                    .contains(&scale.name)
+            );
+            stored.push(scale);
+            let f = stored
+                .iter_mut()
+                .find(|f| f.name.ends_with("attn_q.weight"))
+                .unwrap();
+            f.ty = GgmlType::F16;
+            assert!(
+                MtpInputs::from_parts(d, &stored)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("attn_q.weight")
+            );
+        }
+
+        #[test]
+        fn mtp_router_parts_use_one_resident_type() {
+            let mut mismatches = Vec::new();
+            for (router, shared, raw) in [
+                (GgmlType::BF16, GgmlType::BF16, true),
+                (GgmlType::BF16, GgmlType::F32, false),
+                (GgmlType::F32, GgmlType::BF16, false),
+                (GgmlType::F32, GgmlType::F32, false),
+            ] {
+                let mut stored = file();
+                let parts = [
+                    ("blk.48.ffn_gate_inp.weight", router),
+                    ("blk.48.ffn_gate_inp_shexp.weight", shared),
+                    ("blk.48.attn_q.weight", GgmlType::BF16),
+                ];
+                for (name, ty) in parts {
+                    let f = stored.iter_mut().find(|f| f.name == name).unwrap();
+                    f.ty = ty;
+                    f.nbytes = f.dims.iter().product::<u64>() * ty.type_size().unwrap();
+                }
+                let m = MtpInputs::from_parts(draft(HeadSet::Full), &stored).unwrap();
+                let plan = m.draft_plan(4096).unwrap().0;
+                assert!(plan.violations().is_empty(), "{:?}", plan.violations());
+                for (name, ty) in parts {
+                    let row = plan
+                        .rows
+                        .iter()
+                        .find(|r| m.model.tensors[r.tensor].name == name)
+                        .unwrap();
+                    let t = &m.model.tensors[row.tensor];
+                    assert_eq!(t.ty, ty);
+                    let words = raw || name == "blk.48.attn_q.weight";
+                    let (format, bytes) = match (ty, words) {
+                        (GgmlType::BF16, true) => (CardFormat::Bf16Raw, 2),
+                        (GgmlType::BF16, false) => (CardFormat::Bf16AsF32, 4),
+                        _ => (CardFormat::F32, 4),
+                    };
+                    let want_bytes = t.dims.iter().product::<u64>() * bytes;
+                    assert_eq!(row.segments.len(), 1);
+                    let s = &row.segments[0];
+                    if s.device != Device::Card(0)
+                        || s.format != placement::Format::Card(format)
+                        || s.resident_bytes != want_bytes
+                    {
+                        mismatches.push(format!(
+                            "router={router:?} shared={shared:?} {name}: {s:?}, \
+                             want {format:?} {want_bytes} bytes on card 0"
+                        ));
+                    }
+                }
+            }
+            assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+        }
+
         fn list(n: usize) -> HeadSet {
             HeadSet::List {
                 ids: (0..n as u32).map(|i| i * 6).collect::<Vec<_>>().into(),
@@ -2893,6 +3296,7 @@ mod tests {
             assert_eq!(count(|l| matches!(l, MtpLoad::Unread)), 4);
         }
 
+        // PIN(2026-10-22): F32 injects load directly; BF16 injects require normalization.
         #[test]
         fn a_draft_tensor_of_another_form_absent_or_foreign_is_refused() {
             let err = |f: Vec<FileTensor>| {
@@ -2904,9 +3308,9 @@ mod tests {
             f.iter_mut()
                 .find(|t| t.name == "blk.48.hc_attn_inject.weight")
                 .expect("the inject")
-                .ty = GgmlType::F32;
+                .ty = GgmlType::BF16;
             assert!(
-                err(f).contains("tensor blk.48.hc_attn_inject.weight: is f32 [10240, 4]"),
+                err(f).contains("tensor blk.48.hc_attn_inject.weight: is bf16 [10240, 4]"),
                 "type"
             );
             let mut f = file();
@@ -2964,8 +3368,9 @@ mod tests {
         use models::{Arch, ChatSpec, ModelSpec};
 
         use super::super::{
-            Beside, Experts, KvLayout, MtpInputs, PlaceError, PlanInputs, draft_card_bytes,
-            machine_bp, slot_resident_bytes, tier_batch_of,
+            Beside, Experts, KvLayout, MtpInputs, PlaceError, PlanInputs, ROUTE_UNIT_RESERVE,
+            card_route_run, draft_card_bytes, machine_bp, route_unit_bytes, slot_resident_bytes,
+            tensor_places, tier_batch_of, widen_card_route,
         };
         use super::mtp::{draft, file};
         use crate::arch::qwen35moe::hparams::{
@@ -3083,6 +3488,7 @@ mod tests {
                 spec,
                 kv,
                 room: (u64::MAX, HostRead::Given),
+                row_source: placement::RowTableSource::Split,
                 arena: None,
             }
         }
@@ -3206,21 +3612,28 @@ mod tests {
 
         /// At 1, 2 and 4 slots, the plain plan and the drafted plan's target
         /// and draft are the plans of each layer's bytes times the slots and
-        /// the bytes beside the stores times the slots past the first; and
-        /// each plan's kv classes are `SeqTerms::plan_kv` of the slots.
+        /// the bytes beside the stores times the slots past the first, the
+        /// target plan without and with the draft
+        /// ([`PlanInputs::plan_target`]) being the plain plan and the
+        /// drafted plan's target; and each plan's kv classes are
+        /// `SeqTerms::plan_kv` of the slots.
         #[test]
         fn slot_plans_count_every_term_per_slot() {
             let (inputs, machine) = (inputs(), machine());
             let mtp =
                 MtpInputs::from_parts(draft(HeadSet::Full), &file()).expect("the draft's inputs");
             let levers = PlanLevers::default();
-            for n in [1, 2, 4] {
+            for (n, columns) in [(1, 4), (2, 8), (4, 8)] {
                 let slots = n as u64;
                 let plain = inputs
                     .plan_with_slots(&machine, CTX, &levers, Experts::Host, n)
                     .expect("the plan");
                 let want = target(&inputs, &machine, slots, 0);
                 assert_eq!(view(&plain), view(&want), "{n} slots");
+                let got = inputs
+                    .plan_target(&machine, CTX, &levers, Experts::Host, None, n)
+                    .expect("the target plan");
+                assert_eq!(view(&got), view(&want), "{n} slots: the target plan");
                 assert_eq!(
                     plain.cards[0].kv_bytes,
                     inputs.seq_terms(None).plan_kv(CTX, slots),
@@ -3231,8 +3644,17 @@ mod tests {
                     .expect("the drafted plan");
                 let (draft_want, reserve) = draft_of(&mtp, slots);
                 assert_eq!(view(&drafted.draft), view(&draft_want), "{n} slots");
-                let want = target(&inputs, &machine, slots, reserve);
+                let mut want = target(&inputs, &machine, slots, reserve);
+                want.host.arena_columns = columns;
                 assert_eq!(view(&drafted.plan), view(&want), "{n} slots");
+                let got = inputs
+                    .plan_target(&machine, CTX, &levers, Experts::Host, Some(&mtp), n)
+                    .expect("the drafted target plan");
+                assert_eq!(
+                    view(&got),
+                    view(&want),
+                    "{n} slots: the drafted target plan"
+                );
                 assert_eq!(
                     drafted.plan.cards[0].kv_bytes + drafted.draft.cards[0].kv_bytes,
                     inputs.seq_terms(Some(&mtp)).plan_kv(CTX, slots),
@@ -3278,6 +3700,64 @@ mod tests {
                 });
             }
             inputs
+        }
+
+        #[test]
+        fn drafted_slot_plans_floor_the_arena_for_every_verify_row() {
+            let mut machine = machine();
+            machine.cards[0].usable_bytes = 8 << 30;
+            let mtp =
+                MtpInputs::from_parts(draft(HeadSet::Full), &file()).expect("the draft's inputs");
+            let levers = PlanLevers::default();
+            for experts in [Experts::Host, Experts::Card] {
+                for (n, columns) in [(2, 8), (1, 4), (4, 8)] {
+                    let mut inputs = routed(inputs());
+                    let (room, slot_set, lane_slots) = {
+                        let drafted = inputs
+                            .plan_mtp_with_slots(&machine, CTX, &levers, &mtp, experts, n)
+                            .expect("the resident plan");
+                        let plan = &drafted.plan;
+                        let floor = placement::ArenaFloor::of(plan).expect("the arena floor");
+                        assert_eq!(floor.columns, columns, "{experts:?}, {n} slots");
+                        assert!(floor.slot_set > 0);
+                        let lane_slots = if experts == Experts::Card { 5 } else { 0 };
+                        assert_eq!(floor.lane_slots, lane_slots);
+                        (
+                            placement::workstation::HostNeed::of(plan, 0).bytes()
+                                - plan.host.expert_bytes / 32,
+                            floor.slot_set,
+                            lane_slots,
+                        )
+                    };
+                    inputs.room = (room, HostRead::Given);
+                    let old_arena = 37 * slot_set;
+                    let slots = 10 * columns + lane_slots;
+                    let arena = slots * slot_set;
+                    inputs.arena = Some(old_arena);
+                    match inputs.plan_mtp_with_slots(&machine, CTX, &levers, &mtp, experts, n) {
+                        Err(PlaceError::Placement(PlacementError::NvTierArenaUnder {
+                            arena: got,
+                            least,
+                        })) => {
+                            assert_eq!(got, old_arena);
+                            assert_eq!(
+                                (least.columns, least.slots, least.bytes),
+                                (columns, slots, arena)
+                            );
+                        }
+                        other => panic!(
+                            "{experts:?}, {n} slots: not the arena's refusal: {:?}",
+                            other.err()
+                        ),
+                    }
+                    inputs.arena = Some(arena);
+                    let drafted = inputs
+                        .plan_mtp_with_slots(&machine, CTX, &levers, &mtp, experts, n)
+                        .expect("the exact arena floor fits");
+                    assert_eq!(drafted.plan.host.nvme_arena_bytes, arena);
+                    assert!(drafted.plan.host.nvme_expert_bytes > 0);
+                }
+            }
         }
 
         /// The stage card's headroom past the bytes a plan of several slots
@@ -3384,6 +3864,84 @@ mod tests {
         }
 
         #[test]
+        fn nvme_room_is_capped_by_the_unified_pool() {
+            let levers = PlanLevers {
+                card_budget_bytes: Some(1 << 30),
+            };
+            let mut inputs = routed(inputs());
+            for slots in [1, 2, 4] {
+                let mut machine = machine();
+                let ample = 1 << 40;
+                machine.host_mut().usable_bytes = ample;
+                *machine.unified_mut() = Some(UnifiedPool { bytes: ample });
+                inputs.room = (ample, HostRead::Given);
+                let whole = inputs
+                    .plan_with_slots(&machine, CTX, &levers, Experts::Card, slots)
+                    .unwrap();
+                let pool = placement::workstation::HostNeed::of(&whole, 0).bytes() - 1;
+                machine.cards[0].free_bytes = Some(pool);
+                machine.host_mut().usable_bytes = pool;
+                *machine.unified_mut() = Some(UnifiedPool { bytes: pool });
+                inputs.room = (pool, HostRead::Given);
+                let expected = inputs
+                    .plan_with_slots(&machine, CTX, &levers, Experts::Card, slots)
+                    .expect("the pool fits with NVMe");
+                let expected_rows = format!("{:?}", expected.rows);
+                let expected_counts = expected.n_l.clone();
+                let expected_headroom = expected.host.headroom_bytes;
+                inputs.room = (ample, HostRead::Given);
+                let plan = inputs
+                    .plan_with_slots(&machine, CTX, &levers, Experts::Card, slots)
+                    .expect("a larger host reading keeps the same pool budget");
+                assert!(plan.host.nvme_expert_bytes > 0);
+                assert_eq!(plan.n_l, expected_counts);
+                assert_eq!(format!("{:?}", plan.rows), expected_rows);
+                assert_eq!(plan.host.headroom_bytes, expected_headroom);
+            }
+        }
+
+        #[test]
+        fn node_nvme_room_is_capped_by_the_unified_pool() {
+            let levers = PlanLevers {
+                card_budget_bytes: Some(1 << 30),
+            };
+            let mut inputs = routed(inputs());
+            for ranks in [1, 2, 4] {
+                let owned = vec![inputs.model.experts / ranks; ranks as usize];
+                let ample = 1 << 40;
+                let mut m = machine();
+                m.host_mut().usable_bytes = ample;
+                *m.unified_mut() = Some(UnifiedPool { bytes: ample });
+                for rank in 1..ranks {
+                    let mut tier = m.cards[0].clone();
+                    tier.name = format!("tier-{rank}");
+                    tier.head = false;
+                    tier.layers = 0..0;
+                    m.tiers.push(tier);
+                    m.nodes.push(m.nodes[0].clone());
+                }
+                inputs.room = (ample, HostRead::Given);
+                let whole = inputs.plan_nodes(&m, CTX, &levers, &owned).unwrap();
+                let pool = placement::workstation::HostNeed::of(&whole, 0).bytes() - 1;
+                m.cards[0].free_bytes = Some(pool);
+                m.host_mut().usable_bytes = pool;
+                *m.unified_mut() = Some(UnifiedPool { bytes: pool });
+                inputs.room = (pool, HostRead::Given);
+                let expected = inputs
+                    .plan_nodes(&m, CTX, &levers, &owned)
+                    .expect("the node-owned experts fit with NVMe");
+                let expected_rows = format!("{:?}", expected.rows);
+                inputs.room = (ample, HostRead::Given);
+                let plan = inputs
+                    .plan_nodes(&m, CTX, &levers, &owned)
+                    .expect("each rank keeps the same local pool budget");
+                assert!(plan.host.nvme_expert_bytes > 0, "{ranks} ranks");
+                assert_eq!(plan.tier_n_l.len(), ranks as usize - 1);
+                assert_eq!(format!("{:?}", plan.rows), expected_rows);
+            }
+        }
+
+        #[test]
         fn node_assignments_precede_resident_and_shared_room_checks() {
             let mut inputs = routed(inputs());
             inputs.model.tensors.push(ModelTensor {
@@ -3438,7 +3996,8 @@ mod tests {
                         placement::row_room(
                             &inputs.model,
                             super::super::UBATCH_PLANNED,
-                            os::page_bytes().expect("the base page reads")
+                            os::page_bytes().expect("the base page reads"),
+                            inputs.row_source,
                         )
                         .unwrap()
                     );
@@ -3612,6 +4171,141 @@ mod tests {
                 }
                 other => panic!("want the draft reserve refused: {:?}", other.err()),
             }
+        }
+
+        /// The card route's run over the synthetic file's routed stacks
+        /// ([`routed`]: 35,389,440 B an expert): on a card that holds every
+        /// expert the plan widens it to a ubatch of 4,096 positions,
+        /// reserving 2,048 run tokens more of 170,360 B, which a load reads
+        /// back as its run and arena bytes; on a 40 GiB card the experts
+        /// fill, that reserve would take experts, so the card keeps runs of
+        /// 2,048 tokens, as do a host-routed plan and a ubatch of one run. On
+        /// one pool the card's reserves take the host's room too: at the
+        /// least room that keeps a 1 GiB PLE table on the host with every
+        /// expert on the card, the reserve would page the table from the
+        /// NVMe tier, so the card keeps its runs; a run's bytes more room
+        /// widens it. A load refuses by name a reserve of other bytes (a
+        /// tiered load's run holds 2,048 · (170,360 − 102,440) B more, the
+        /// join keeping the down rows and places), two of them, or one beside
+        /// a ubatch of one run, even of 0 B.
+        #[test]
+        fn the_card_route_runs_the_whole_ubatch_where_nothing_moves_for_it() {
+            let inputs = routed(inputs());
+            let levers = PlanLevers::default();
+            let widen_by = |inputs: &PlanInputs, machine: Machine, ub: u64, experts: Experts| {
+                widen_card_route(machine, ub, |m| {
+                    inputs
+                        .plan_with(m, CTX, &levers, experts)
+                        .map(|p| tensor_places(&p))
+                })
+                .expect("the plan")
+            };
+            let widen = |machine: Machine, ub: u64, experts: Experts| {
+                widen_by(&inputs, machine, ub, experts)
+            };
+            let unit = route_unit_bytes(4096, false);
+            assert_eq!(
+                (unit, route_unit_bytes(4096, true)),
+                (348_897_280, 139_100_160)
+            );
+            let whole = widen(machine(), 4096, Experts::Card);
+            assert_eq!(
+                whole.cards[0].reserves,
+                vec![(ROUTE_UNIT_RESERVE.to_string(), unit)]
+            );
+            let plan = inputs
+                .plan_with(&whole, CTX, &levers, Experts::Card)
+                .expect("the widened plan");
+            assert_eq!(plan.n_l, vec![512; LAYERS]);
+            assert_eq!(
+                card_route_run(&whole.cards[0], 4096, false).expect("the run"),
+                (4096, unit)
+            );
+            let mut filled = machine();
+            filled.cards[0].usable_bytes = 40 << 30;
+            let n_l = inputs
+                .plan_with(&filled, CTX, &levers, Experts::Card)
+                .expect("the plan")
+                .n_l;
+            assert!(n_l.iter().all(|&n| 0 < n && n < 512), "{n_l:?}");
+            for (m, ub, experts) in [
+                (filled, 4096, Experts::Card),
+                (machine(), 4096, Experts::Host),
+                (machine(), 2048, Experts::Card),
+            ] {
+                let kept = widen(m, ub, experts);
+                assert!(kept.cards[0].reserves.is_empty(), "{ub} {experts:?}");
+                assert_eq!(
+                    card_route_run(&kept.cards[0], ub, false).expect("the run"),
+                    (2048, 0)
+                );
+            }
+            let mut tabled = routed(self::inputs());
+            tabled.model.tensors.push(ModelTensor {
+                name: "blk.1.ple.table.weight".into(),
+                shard: 0,
+                layer: Some(1),
+                role: Role::EngramTable,
+                ty: GgmlType::F32,
+                dims: vec![256, 1 << 20],
+                file_bytes: 1 << 30,
+                gathered_rows: Some(3),
+            });
+            let pool: u64 = 1 << 40;
+            let mut pooled = machine();
+            pooled.cards[0].free_bytes = Some(pool);
+            *pooled.host_mut() = Host {
+                usable_bytes: pool,
+                reserves: Vec::new(),
+            };
+            *pooled.unified_mut() = Some(UnifiedPool { bytes: pool });
+            let table_on_host = |inputs: &PlanInputs, m: &Machine| {
+                inputs
+                    .plan_with(m, CTX, &levers, Experts::Card)
+                    .is_ok_and(|p| {
+                        p.n_l == vec![512; LAYERS]
+                            && p.row_tier().ok() == Some(Some(placement::Device::Host))
+                    })
+            };
+            let (mut lo, mut hi) = (0, pool);
+            while hi - lo > 1 {
+                let mid = lo + (hi - lo) / 2;
+                tabled.room = (mid, HostRead::Given);
+                if table_on_host(&tabled, &pooled) {
+                    hi = mid;
+                } else {
+                    lo = mid;
+                }
+            }
+            tabled.room = (hi, HostRead::Given);
+            assert!(table_on_host(&tabled, &pooled), "the least room: {hi} B");
+            let kept = widen_by(&tabled, pooled.clone(), 4096, Experts::Card);
+            assert!(kept.cards[0].reserves.is_empty(), "{hi} B of room");
+            tabled.room = (hi + unit, HostRead::Given);
+            let wide = widen_by(&tabled, pooled, 4096, Experts::Card);
+            assert_eq!(
+                wide.cards[0].reserves,
+                vec![(ROUTE_UNIT_RESERVE.to_string(), unit)]
+            );
+            assert!(table_on_host(&tabled, &wide), "{} B of room", hi + unit);
+            let refused = |rows: Vec<u64>, ub: u64, tiered: bool| {
+                let mut card = whole.cards[0].clone();
+                card.reserves = rows
+                    .iter()
+                    .map(|&b| (ROUTE_UNIT_RESERVE.to_string(), b))
+                    .collect();
+                match card_route_run(&card, ub, tiered) {
+                    Err(PlaceError::RouteUnitReserve { got, u, want, .. }) => {
+                        assert_eq!((got, u, want), (rows, ub, route_unit_bytes(ub, tiered)));
+                    }
+                    other => panic!("{rows:?} at {ub}: not refused: {other:?}"),
+                }
+            };
+            refused(vec![unit], 4096, true);
+            refused(vec![unit + 1], 4096, false);
+            refused(vec![unit, unit], 4096, false);
+            refused(vec![unit], 2048, false);
+            refused(vec![0], 2048, false);
         }
     }
 

@@ -87,7 +87,7 @@ count. A float array with a scalar fallback (GLM's clamps) stays the family's ow
 
 `tokenizer.ggml.model` may be `gpt2` (GPT-2 byte-level BPE), `gemma4` (BPE over metaspace text), or `llama`
 (SentencePiece). The shared loader is `crates/tokenizer/src/vocab.rs`. For `gpt2`, `tokenizer.ggml.pre` must be one
-of the pre-tokenizers in `pretok.rs`: `deepseek-v3`, `qwen2`, `glm4`, `qwen35`, `pixtral`, `gemma4` and two aliases.
+of the names in `Pre::NAMES` (`pretok.rs`), including `flint`; aliases live in that same table.
 A `gemma4` model always runs `gemma4`; SentencePiece uses no regex pre-tokenizer and reports `default`.
 Bloomery's optional string key `tokenizer.ggml.normalizer = "NFC"` normalizes BPE fragments after raw special-token matching, with the Unicode 9.0 tables Hugging Face's tokenizers normalizes with; omission preserves unnormalized encoding, and other values are refused.
 Model `coverage` asks `runs_pre_tokenizer`: BPE specs use the pre-tokenizer's name, and a SentencePiece spec
@@ -102,6 +102,17 @@ new `ToolFormat` variant (`models/lib.rs:602`) with its parser in `crates/serve/
 The oracle for ids is ik's `llama-tokenize` (`crates/tokenizer/tools/oracle.sh`, `tests/tokenizer.rs:243`): B. A
 vocabulary ik cannot load reads through mainline's `llama-tokenize`; its profile in `oracle.sh` sets `REF_FLAGS`
 (`--no-escape`: mainline turns a `\n` in a `-f` text into a newline by default; `--no-bos` when the file adds a BOS).
+
+Flint uses the pinned mainline's effective ordered number/CJK/word split, strict UTF-8 decoding without
+NFC, and no automatic BOS/EOS. Mainline collapses letter subcategories where the official HF regex
+distinguishes them; compare both token IDs and pretokenizer boundaries instead of assuming regex text
+means identical execution. With the pinned Flint vocabulary, the exercised Unicode/number/tag corpus
+had identical IDs against both references; that is not a claim for arbitrary vocabularies.
+`tokenizer.ggml.eog_token_ids` is the authoritative GGUF stop array: nonempty integer IDs, bounds-checked,
+sorted and deduplicated, without disabling GGUF attribute overrides or changing BPE mode. The private
+`tokenizer.bloomery.eog_token_ids` still selects HF mode; if both occur their canonical sets must agree.
+The actual Flint header supplies four stops, including developer/150018; pinned mainline's loaded
+heuristic set has only EOS/user/observation. Preserve the explicit four rather than match that heuristic.
 
 ### 3. Refset family and its reference dump
 

@@ -154,7 +154,7 @@ tests open no card and build as host code. The Mac's second condition (x86_64 an
 x86_64 Linux. A unit runs `tools/gate.sh --release --locked -p <crate> --no-fail-fast`, so the bound and the exit code have their one
 owner; `#[ignore]`d tests (the `hw_` gates, which need a card, the model files or `$BLOOMERY_DATA`) stay ignored. A non-ignored test
 that needs such a file is HOST_TEST_SKIP's, by exact libtest name and reason, and `--excluded` prints every exclusion; the rest
-of the units are every `tools/check-*.sh` minus HOST_CHECK_SKIP, then HOST_EXTRA_UNITS (the recipes.py self-test). A skip that names no `fn` of its crate, a crate outside the set or a script that is gone is an
+of the units are every `tools/check-*.sh` minus HOST_CHECK_SKIP, then HOST_EXTRA_UNITS (none now; check-recipes.sh runs the recipes.py self-test). A skip that names no `fn` of its crate, a crate outside the set or a script that is gone is an
 error of `check` and of this command, never a silent no-op.
 
 Orphan tests (`orphan-tests`). Every `#[test]` fn of every workspace target (lib, bins, tests/*.rs) is run
@@ -211,7 +211,7 @@ from a recipe parameter is left out (the ptx-scan, sass-scan and lds-scan recipe
 only. A bin tools/release/build.sh ships is held to that file's feature list instead, in any
 dir, and the one line that names a departure is that rule's (`bin_problems`). The fix is the union (each build gives the
 bin every feature any build gives it), or a target dir of its own for a bin no runner starts from target/release
-(tools/gpu-gate.sh runs `target/release/<bin>` only); `--arch` is not part of the key: cargo-oxide's only target-dir
+(tools/gpu-gate.sh runs `target/release/<bin>` or the test artifact gate.sh --gpu compiled); `--arch` is not part of the key: cargo-oxide's only target-dir
 option is `--cargo-target-dir`, and the justfile passes one `{{arch}}` to every build.
 """
 
@@ -462,6 +462,8 @@ def parse_cargo(args: list[str], raw: str, via_gate_sh: bool = False) -> Invocat
     if via_gate_sh:
         sub = "test"
         rest = list(args)
+        if rest and rest[0] == "--gpu":
+            rest = rest[1:]
         if rest and rest[0] == "--oxide":
             oxide = True
             rest = rest[1:]
@@ -602,6 +604,22 @@ class RecipeCommands:
     paths: list[str] = field(default_factory=list)  # every repository-looking path the text names
     cargo_target_dir: str = ""  # the CARGO_TARGET_DIR an `export` earlier in the same shell (one recipe line, one box.sh call) left set
     models: list[str | None] = field(default_factory=list)  # the BLOOMERY_MODEL prefix of each tools/box.sh call, in order (None: that call sets none); `env` keeps the last only
+
+    def profiles(self, environ: dict[str, str] | None = None) -> set[str]:
+        """Box profiles, with shell defaults resolved and recipe parameters left for the caller."""
+        profiles: set[str] = set()
+        for model in self.models:
+            default = re.fullmatch(r"\$\{BLOOMERY_MODEL:-([A-Za-z0-9_-]+)\}", model or "")
+            if model is None or default:
+                profile = (environ or {}).get("BLOOMERY_MODEL") or (default.group(1) if default else DEFAULT_PROFILE)
+            elif "{{" in model and environ is None:
+                continue
+            else:
+                profile = model
+            if not FAMILY_NAME.fullmatch(profile):
+                raise RecipeError(f"BLOOMERY_MODEL={profile!r}: cannot resolve model profile")
+            profiles.add(profile)
+        return profiles
 
 
 def _norm(p: str) -> str:
@@ -1279,11 +1297,8 @@ class Tree:
             s = line.strip()
             if not s or s.startswith("//"):
                 continue
-            if attr_depth > 0:
-                attr_depth += s.count("[") - s.count("]")
-                continue
             indent = len(line) - len(line.lstrip())
-            if s == "}" and inline and inline[-1][0] == indent:
+            if attr_depth == 0 and s == "}" and inline and inline[-1][0] == indent:
                 inline.pop()
                 continue
             here = inline[-1][2] if inline else test
@@ -1301,6 +1316,9 @@ class Tree:
                     (acc.test_files if here else acc.files).add(p)
                 else:
                     self.unresolved.append(f"{rel}: include of {inc} ({p} not found)")
+            if attr_depth > 0:
+                attr_depth += s.count("[") - s.count("]")
+                continue
             # `#[cfg(test)] mod x;`, `#[path = "x.rs"] mod x;`, `#[cfg(test)] #[path = "x.rs"]`: each
             # one-line attribute counts as if on a line of its own, then the item after them is read
             attrs, rest = self.lead_attrs(s)
@@ -1792,8 +1810,13 @@ class Graph:
         if rc.box:
             for g in BOX_GLOBALS:
                 files.setdefault(g, "tools/box.sh (every box command)")
-            profile = rc.env.get("BLOOMERY_MODEL", DEFAULT_PROFILE)
-            files.setdefault(f"tools/ref/models/{profile}.sh", f"profile {profile}")
+            try:
+                for profile in sorted(rc.profiles()):
+                    files.setdefault(f"tools/ref/models/{profile}.sh", f"profile {profile}")
+            except RecipeError as err:
+                errors.append(str(err))
+            if any(m is not None and "{{" in m for m in rc.models):
+                prefixes.setdefault("tools/ref/models/", "recipe parameter selects the profile")
         reads, read_errors = self.named_reads(rc)
         errors.extend(read_errors)
         for f, why in reads.items():
@@ -6701,9 +6724,7 @@ HOST_TEST_SKIP: dict[str, list[tuple[str, str]]] = {}
 # A `tools/check-*.sh` left out: script file name -> reason.
 HOST_CHECK_SKIP: dict[str, str] = {}
 # A unit that is no crate and no check script: name -> shell command, run from the tree's root.
-HOST_EXTRA_UNITS: dict[str, str] = {
-    "recipes-self-test": "python3 tools/recipes.py --self-test",
-}
+HOST_EXTRA_UNITS: dict[str, str] = {}
 HOST_GATE = "bash tools/gate.sh --release --locked"
 
 
@@ -6748,6 +6769,8 @@ def nightly_problems(
     for n in sorted(extras):
         if n in taken:
             problems.append(f"host nightly: HOST_EXTRA_UNITS names {n}, which a crate or a check script already is")
+        if "recipes.py --self-test" in extras[n] and "check-recipes.sh" in host_check_scripts(tree.root) and "check-recipes.sh" not in checks:
+            problems.append(f"host nightly: HOST_EXTRA_UNITS names {n}, which runs the recipes.py self-test that check-recipes already runs")
     in_set = {n for n, _ in host_crates(tree, lock, linked)}
     for n in sorted(linked):
         if n not in tree.packages:
@@ -8670,11 +8693,6 @@ class KeyContext:
         for n in names:
             for d in model_literal_dirs(recipes[n].text):
                 dirs.setdefault(d, f"recipe {n}")
-            rc = self.side.graph.inputs(n).commands
-            prof = f"tools/ref/models/{self.env.get('BLOOMERY_MODEL', '')}.sh"
-            if rc.box and "BLOOMERY_MODEL" not in rc.env and self.env.get("BLOOMERY_MODEL") and tree.exists(prof):
-                for d in self.literal_dirs(prof):
-                    dirs.setdefault(d, f"{prof} (the Mac's BLOOMERY_MODEL)")
         for e in self.box_env.split():
             k, _, v = e.partition("=")
             d = model_dir_of(v)
@@ -8708,7 +8726,7 @@ class KeyContext:
         the BLOOMERY_MODEL of each tools/box.sh call of its recipes, else the Mac's, else ref-paths.sh's default: tools/box.sh picks the
         profile on the Mac side and a script on the box that picks another is refused (ref-paths.sh, exit 64), so the family names
         the only fixture directory a box command opens. None — every row of FIXTURE_ROOT, never under-keyed — when the family cannot
-        be told: a value that is not a plain name (`{{FAMILY}}`, `${BLOOMERY_MODEL:-x}`), a BLOOMERY_MODEL in the item's env or
+        be told: an unresolved value such as `{{FAMILY}}`, a BLOOMERY_MODEL in the item's env or
         BLOOMERY_BOX_ENV, a dotenv file, or a recipe that runs a command on the Mac (it may call tools/box.sh with a profile of its own)."""
         st = self.settings.get("settings", {})
         if st.get("dotenv_load") or st.get("dotenv_filename") or st.get("dotenv_path"):
@@ -8724,13 +8742,13 @@ class KeyContext:
             return set()
         if self._fixture_table is None:
             self._fixture_table = fixture_table(self.side.tree.read(FIXTURE_DIRS), self.side.tree.read(REF_PATHS))
-        rows, default = self._fixture_table
-        mac = self.env.get("BLOOMERY_MODEL") or default
+        rows, _ = self._fixture_table
         dirs: set[str] = set()
-        for m in calls:
-            family = mac if m is None else m
-            if not FAMILY_NAME.fullmatch(family):
-                return None
+        try:
+            families = RecipeCommands(models=calls).profiles(self.env)
+        except RecipeError:
+            return None
+        for family in families:
             d = rows.get(family, "none")
             if d not in ("self", "none"):
                 dirs.add(d)
@@ -8781,7 +8799,7 @@ class KeyContext:
             rc = self.side.graph.inputs(n).commands
             start += rc.scripts
             if rc.box:
-                start += BOX_GLOBALS + [f"tools/ref/models/{rc.env.get('BLOOMERY_MODEL', DEFAULT_PROFILE)}.sh"]
+                start += BOX_GLOBALS + [f"tools/ref/models/{profile}.sh" for profile in sorted(rc.profiles(self.env))]
         return exec_closure(self.side.tree, start)
 
     def never(self, names: list[str], ri: RecipeInputs, envs: list[str]) -> str | None:
@@ -8915,6 +8933,9 @@ class KeyContext:
             for p in ri.prefixes:
                 found = self._directories[p] = tree.directory_files(p)
                 files |= found
+        for n in names:
+            rc = self.side.graph.inputs(n).commands
+            files |= {f"tools/ref/models/{profile}.sh" for profile in rc.profiles(self.env)}
         files |= named
         files -= set(KEY_GLOBALS)
         if scope == "closure":
@@ -10067,13 +10088,23 @@ def module_gate_self_test(expect) -> None:
             'mod plain;\n#[cfg(feature = "fy")]\nmod gated;\n#[cfg(not(feature = "fy"))]\nmod off;\n'
             '#[cfg(all(feature = "fy", feature = "fz"))]\n#[allow(dead_code)]\nmod inl {\n    mod deep;\n'
             '    const D: &str = include_str!("../data/d.txt");\n}\n#[cfg(any(test, feature = "fy"))]\nmod either;\n'
+            '#[cfg(test)]\nmod attr_test {\n'
+            '    #[doc = concat!(stringify!({\n}\n    ),\n'
+            '        include_str!("../../../attribute-test.txt"),\n'
+            '        "tools/attribute-test-data.txt"\n    )]\n'
+            '    pub struct Item;\n    const AFTER: &str = include_str!("../../../after-attribute.txt");\n}\n'
         ),
-        "crates/g/src/plain.rs": "",
+        "crates/g/src/plain.rs": '#[doc = concat!(\n    include_str!("../../../attribute.txt"),\n    "tools/attribute-data.txt"\n)]\npub struct Plain;\n',
         "crates/g/src/gated.rs": "",
         "crates/g/src/off.rs": "",
         "crates/g/src/inl/deep.rs": "",
         "crates/g/src/either.rs": "",
         "crates/g/data/d.txt": "",
+        "attribute.txt": "attribute1\n",
+        "tools/attribute-data.txt": "literal1\n",
+        "attribute-test.txt": "test attribute\n",
+        "tools/attribute-test-data.txt": "test literal\n",
+        "after-attribute.txt": "after attribute\n",
         "crates/g/src/bin/x.rs": '#[cfg(feature = "fy")]\nmod xg;\nfn main() {}\n',
         "crates/g/src/bin/xg.rs": "",
         "crates/g/src/bin/y.rs": "fn main() {}\n",
@@ -10099,6 +10130,8 @@ def module_gate_self_test(expect) -> None:
         fy = {"gate-xy", "gate-yz", "gate-liby", "gate-all"} | whole
         cases = [
             ("an ungated module", "plain.rs", every),
+            ("an include on an inner attribute line", "../../../attribute.txt", every),
+            ("a path literal on an inner attribute line", "../../../tools/attribute-data.txt", every),
             ("a module under feature = fy", "gated.rs", fy),
             ("a module under not(feature = fy)", "off.rs", {"gate-x", "gate-lib"} | whole),
             ("a module under any(test, feature = fy), which a test build compiles whatever the features", "either.rs", every),
@@ -10111,6 +10144,11 @@ def module_gate_self_test(expect) -> None:
             sels, _, _ = select([os.path.normpath(os.path.join("crates/g/src", rel))], side, side, GATE_PREFIX)
             got = {x.recipe for x in sels}
             expect(got == want, f"module gate: {what} selects {sorted(got)}, not {sorted(want)}")
+        for rel in ("attribute-test.txt", "tools/attribute-test-data.txt", "after-attribute.txt"):
+            sels, _, _ = select([rel], side, side, GATE_PREFIX)
+            got = {x.recipe for x in sels} - whole
+            expect(got == {"gate-lib", "gate-liby", "gate-all"},
+                   f"module gate: an attribute brace must leave {rel} test-only, selected {sorted(got)}")
         expect(not side.tree.unresolved, f"module gate: unresolved {side.tree.unresolved[:2]}")
 
 
@@ -10243,7 +10281,7 @@ def key_self_test(expect, real: Side) -> None:
         m = edit("crates/gpu-gates/src/bin/gate_q4k_sel.rs", append("\n// key probe\n"))
         expect(m == {"gpu", "mac", "fmt"}, f"gate_q4k_sel.rs moves {sorted(m)}, not gpu mac fmt")
         m = edit("tools/gpu-gate.sh", append("\n# key probe\n"))
-        expect(m == {"gpu", "args", "mac", "fmt"}, f"tools/gpu-gate.sh moves {sorted(m)}")
+        expect(m == {"gpu", "cpu", "args", "mac", "fmt"}, f"tools/gpu-gate.sh moves {sorted(m)}")
         m = edit("docs/HARDWARE.md", append("\nkey probe\n"))
         expect(m == {"mac", "fmt"}, f"docs/HARDWARE.md moves {sorted(m)}, not only the whole-tree keys")
         cpu_lib = sorted(f for f in sa.graph.inputs("gate-sampler").files if f.startswith("crates/sampler/src/"))
@@ -10363,8 +10401,7 @@ def key_self_test(expect, real: Side) -> None:
         empty = fam_keys([f"model-dir\t{FIXTURE_ROOT}\tempty"])
         expect(only35["q4"] == empty["q4"] and only35["mimo"] == empty["mimo"] and only35["mac"] != empty["mac"],
                "a fixture root holding another family's directory only keys a told item another way than an empty root")
-        # the Mac's BLOOMERY_MODEL is the family of an item whose recipes name none (fmt-check: a box call with no BLOOMERY_MODEL); a name that
-        # is no plain family name cannot be told, and the item keeps every row
+        # the Mac's BLOOMERY_MODEL is the family of an item whose recipes name none (fmt-check: a box call with no BLOOMERY_MODEL)
         def fmt_moved(name: str) -> bool:
             env = {"BLOOMERY_TIER": "fixture", "BLOOMERY_MODEL": name}
             write_manifest(fixture_free + fx_rows(sizes) + ["# end"])
@@ -10372,8 +10409,10 @@ def key_self_test(expect, real: Side) -> None:
             write_manifest(fixture_free + bump("qwen38") + ["# end"])
             return keys(sa, environ=env, only={"fmt": items["fmt"]})["fmt"] != before
 
-        got = {n: fmt_moved(n) for n in ("qwen4exp", "glm5next", "qwen35moe", "a b")}
-        expect(got == {"qwen4exp": True, "glm5next": False, "qwen35moe": False, "a b": True}, f"fmt-check, a qwen38 file rewritten, under the Mac's BLOOMERY_MODEL: moved {got}")
+        got = {n: fmt_moved(n) for n in ("qwen4exp", "glm5next", "qwen35moe")}
+        expect(got == {"qwen4exp": True, "glm5next": False, "qwen35moe": False}, f"fmt-check, a qwen38 file rewritten, under the Mac's BLOOMERY_MODEL: moved {got}")
+        _, err, _, _ = KeyContext(sa, mf, environ={"BLOOMERY_TIER": "fixture", "BLOOMERY_MODEL": "a b"}, settings=settings).parts(items["fmt"])
+        expect(err is not None and "BLOOMERY_MODEL='a b': cannot resolve model profile" in err, f"fmt-check: invalid inherited profile not refused by name: {err}")
         # (e) the real tier holds no fixture row: no rewrite moves a key
         real_f = fam_keys(fx_rows(sizes), {})
         expect(all(rewritten(bump(d), {}, real_f) == set() for d in sizes), "a fixture file's rewrite moved a real-tier key")
@@ -11671,6 +11710,10 @@ def narrow_self_test(expect, side: Side) -> None:
 
         lib_pair = pair("libs", "gx", libs)
         swap, kquant = pair("swap", "gate_swap", own), pair("kquant", "gate_kquant", own)
+        # PIN(2026-10-22): gate_gpu_device joins the bin carriers: its conformance kernels are its own, so a change
+        # under crates/gpu reaches its closure too, and "both bins scanned" scans it as well (the message named it
+        # "not scanned").
+        device = pair("device", "gate_gpu_device", own)
 
         def picked(*pairs) -> tuple[set[str], str]:
             got = narrow(["crates/gpu/src/model.rs"], side, side, list(pairs), gpu_rows)
@@ -11685,7 +11728,7 @@ def narrow_self_test(expect, side: Side) -> None:
         got, why = picked(lib_pair, kquant)
         expect("gate-gpu-kquant" not in got and "gate-gpu-swap" in got and "bin gate_kquant" not in why and "bin gate_swap not scanned" in why,
                f"narrow: a scan of gate_kquant does not cover gate_kquant alone: {sorted(got)} {why}")
-        got, why = picked(lib_pair, swap, kquant)
+        got, why = picked(lib_pair, swap, kquant, device)
         expect(not {"gate-gpu-swap", "gate-gpu-kquant"} & got and "not scanned" not in why, f"narrow: both bins scanned still keep a bin carrier's gates: {sorted(got)} {why}")
         got, why = picked(lib_pair, pair("swap-nobundle", "gate_swap", ("bloomery-gpu",)))
         expect("gate-gpu-swap" in got and "bin gate_swap not scanned" in why,
@@ -12248,8 +12291,47 @@ def _forked(jobs: list[tuple[str, Callable[[list[str]], None]]], serial: bool = 
     return out, times
 
 
+def profile_inputs_self_test(expect, side: Side) -> None:
+    for value, profile in (("glm5next", "glm5next"), ("${BLOOMERY_MODEL:-deepseek41}", "deepseek41")):
+        recipes = {"x": Recipe("x", [f"BLOOMERY_MODEL={value} ./tools/box.sh 'true'", "BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'true'"], [], "")}
+        probe = Side(side.tree, recipes, Graph(side.tree, recipes))
+        inputs = probe.graph.inputs("x")
+        paths = {f"tools/ref/models/{profile}.sh", "tools/ref/models/qwen3moe.sh"}
+        expect(paths <= inputs.files.keys() and not inputs.errors, f"profile inputs: {value}: {inputs.files}, {inputs.errors}")
+        expect(all("$" not in p for p in inputs.files), f"profile inputs: shell expression used as a path: {inputs.files}")
+        for env in ({}, {"BLOOMERY_MODEL": ""}, {"BLOOMERY_MODEL": "glm5next"}, {"BLOOMERY_MODEL": "qwen35moe"}):
+            context = KeyContext(probe, None, environ=env)
+            selected = env["BLOOMERY_MODEL"] if value.startswith("$") and env.get("BLOOMERY_MODEL") else profile
+            path = f"tools/ref/models/{selected}.sh"
+            expect(path in context.run_scripts(["x"]), f"profile scripts: {value}, {env}: missing {path}")
+            if value.startswith("$"):
+                context.manifest = [f"model-dir\t{d}\tabsent" for d in tree_model_dirs(side.tree.root)]
+                parts, err, _, _ = context._parts("x", ["x"], inputs, [], [])
+                expect(any(p.startswith(f"file\t{path}\t") for p in parts), f"profile key: {value}, {env}: {err}, missing {path}")
+    with tempfile.TemporaryDirectory(prefix="recipes-profile-") as tmp:
+        manifest = os.path.join(tmp, "manifest")
+        with open(manifest, "w", encoding="utf-8") as fh:
+            fh.write(f"# {MANIFEST_VERSION}\n# end\n")
+        for prefix in ("", "BLOOMERY_MODEL=${BLOOMERY_MODEL:-deepseek41} "):
+            recipes = {"x": Recipe("x", [f"{prefix}./tools/box.sh 'true'"], [], "")}
+            probe = Side(side.tree, recipes, Graph(side.tree, recipes))
+            for value in ("./glm5next", "../glm5next", "a b"):
+                parts, err, _, _ = KeyContext(probe, manifest, environ={"BLOOMERY_MODEL": value}).parts("x")
+                expect(not parts and err is not None and f"BLOOMERY_MODEL={value!r}: cannot resolve model profile" in err,
+                       f"profile key: unsupported inherited {value!r} not refused: {len(parts)} parts, {err}")
+    for value in ("${OTHER:-deepseek41}", "$BLOOMERY_MODEL", "../deepseek41"):
+        recipes = {"x": Recipe("x", [f"BLOOMERY_MODEL={value} ./tools/box.sh 'true'"], [], "")}
+        inputs = Graph(side.tree, recipes).inputs("x")
+        expect(any("BLOOMERY_MODEL" in e and value in e for e in inputs.errors), f"profile inputs: unresolved {value!r} not refused: {inputs.errors}")
+    for name in ("bench-cpu-v41-host-check", "time-cpu-v41-host", "depth-gpu-qwen3moe", "time-dma-dram"):
+        inputs = side.graph.inputs(name)
+        expect(not inputs.errors and all("$" not in p for p in inputs.files), f"profile inputs: {name}: {inputs.errors}")
+
+
 def _st_basics(fails: list[str], side: Side) -> None:
     expect = _expecting(fails)
+
+    profile_inputs_self_test(expect, side)
 
     # shell splitting and the four command shapes
     rc = recipe_commands(
@@ -12553,7 +12635,8 @@ def _st_real_tree(fails: list[str], side: Side) -> None:
     weeklies = [n for n in recipes if n.startswith(WEEKLY_PREFIX)]
     schema = sel("tools/bloomery/schema/generate_ds41.jsonl") | {n for n in weeklies if graph.inputs(n).match("tools/bloomery/schema/generate_ds41.jsonl")}
     # PIN(2026-10-20): gate-q38-serve-rules also runs the lib's serve_client tests and record schema includes.
-    expect(schema == {"gate-gpu-gates-lib", "gate-ds41-oracle", "gate-ds41-kld", "gate-ds41-bind", "gate-ds41-place", "gate-q38-serve-rules", "weekly-gpu-ds41-flowcounts"}, f"a record schema selects {sorted(schema)}")
+    # PIN(2026-10-23): gate-gpu-rope-writers compiles the lib tests and their record schema includes.
+    expect(schema == {"gate-gpu-gates-lib", "gate-gpu-rope-writers", "gate-ds41-oracle", "gate-ds41-kld", "gate-ds41-bind", "gate-ds41-place", "gate-q38-serve-rules", "weekly-gpu-ds41-flowcounts"}, f"a record schema selects {sorted(schema)}")
     flow = graph.inputs("weekly-gpu-ds41-flowcounts")
     expect(flow.match("tools/bloomery/hf.py") is None, "flowcounts must not key the unrelated hub reader through self-test prose")
     for path in ("tools/bloomery/records.py", "tools/flow/routes.py", "tools/gpu-ab.py", "tools/ref/tdist.py"):
@@ -12779,6 +12862,10 @@ def _st_pure_crates(fails: list[str], side: Side) -> None:
         with open(os.path.join(tmp, "user", "src", "lib.rs"), "a", encoding="utf-8") as fh:
             fh.write("#[test]\nfn one() {}\n")
         expect(any("HOST_EXTRA_UNITS names check-a" in g for g in nightly_problems(pt, lock, {}, {}, {}, {"check-a": "true"})), "host nightly: an extra unit that is a check script")
+        with open(os.path.join(tmp, "tools", "check-recipes.sh"), "w", encoding="utf-8") as fh:
+            fh.write("")
+        expect(any("runs the recipes.py self-test that check-recipes already runs" in g for g in nightly_problems(pt, lock, {}, {}, {}, {"st": "python3 tools/recipes.py --self-test"})), "host nightly: an extra unit that repeats the check-recipes self-test")
+        os.remove(os.path.join(tmp, "tools", "check-recipes.sh"))
         for linked, skips, checks, want in [
             ({}, {"user": [("tests::one", "needs a file")]}, {"check-b.sh": "needs a box"}, None),
             ({"nope": "r"}, {}, {}, "HOST_DEVICE_LINKED names nope, which is no workspace crate"),
@@ -12825,10 +12912,11 @@ def _st_host_crates(fails: list[str], side: Side) -> None:
     # that crate.
     # PIN(2026-10-21): bloomery-device joined with the device contract's pure tests; bloomery-metal is an empty library off macOS.
     # PIN(2026-10-21): bloomery-record joined: the record core lifted out of gpu-gates
+    # PIN(2026-10-22): bloomery-chain joined: the qwen3moe chain plan, host data moved out of bloomery-gpu.
     expect(
         host_now
         == [
-            "bloomery-app", "bloomery-decision", "bloomery-device", "bloomery-embed", "bloomery-engram", "bloomery-engram-lab", "bloomery-gguf", "bloomery-hf",
+            "bloomery-app", "bloomery-chain", "bloomery-decision", "bloomery-device", "bloomery-embed", "bloomery-engram", "bloomery-engram-lab", "bloomery-gguf", "bloomery-hf",
             "bloomery-jinja", "bloomery-levers", "bloomery-metal", "bloomery-model", "bloomery-model-hf", "bloomery-models", "bloomery-os", "bloomery-placement", "bloomery-qdot", "bloomery-record", "bloomery-refset",
             "bloomery-runtime", "bloomery-safetensors", "bloomery-sampler", "bloomery-serve", "bloomery-threads", "bloomery-tokenizer", "bloomery-verbs",
             "bloomery-vision",

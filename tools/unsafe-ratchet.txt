@@ -6,6 +6,7 @@
 # unsafe the code needs, with a `PIN(YYYY-MM-DD):` line above the crate's line naming it and the block's
 # own `// SAFETY:`; never to let existing code off.
 app 0 0 0
+chain 0 0 0
 # PIN(2026-10-02): decision 0 -> 2 blocks, new code, not old code relaxed: ops.rs sgemm's call into matrixmultiply
 # (bounds asserted before it) and pool.rs's lifetime erasure of a task the caller joins before returning, each with
 # its SAFETY line.
@@ -13,7 +14,19 @@ decision 2 0 0
 # PIN(2026-10-22): device 3 blocks, 6 fns, 5 impls, a new crate, not old code relaxed: the contract's `Elem` impls for
 # the five plain types, the two `from_raw` constructors and the two `Shared` accessors that state their invariant in
 # `# Safety`, and the mock's zeroed element, each with its SAFETY line.
-device 3 6 5
+# PIN(2026-10-22): device 3 -> 17 blocks, 6 -> 8 fns, 5 -> 9 impls, code moved in and new code, not old code relaxed:
+# the shared pages' one owner (`HostPages`, pages.rs, moved from metal) with its constructor, its two slice
+# accessors, its Send/Sync and its six blocks (the atomic view, the zeroing, the ranged copy and its tests'); the
+# `Elem` impls of u64 and f64; the `Shared::host` default's block; the mock's `HostPages` and `host_mut` blocks; and
+# the conformance clauses' two borrows of a shared buffer after the event its writer came down at. Each has its SAFETY
+# line.
+# PIN(2026-10-22): device 17 -> 18 blocks, 9 -> 3 impls, review fixes, not old code relaxed: `HostPages::copy_from`
+# (the Metal backend's copy between two windows no longer goes through a vector) adds one block with its SAFETY line,
+# and the seven `Elem` impls are one macro's, so their one SAFETY statement counts once.
+# PIN(2026-10-22): device 18 -> 20 blocks, 8 -> 10 fns, 3 -> 4 impls, new test code, not old code relaxed: the
+# counting allocator of `tests/no_alloc_on_success.rs` (its `GlobalAlloc` impl, `alloc` and `dealloc`, each forwarding
+# to the system allocator), which holds the range rules' success paths to no allocation.
+device 20 10 4
 embed 0 0 0
 # PIN(2026-10-07): engram 6 -> 7 blocks, new code, not old code relaxed: the row reads over a table's bytes in a
 # mapping the reader does not own (TableBytes, which a split's table, Qwen3.8's PLE, and a site share) advise its
@@ -28,7 +41,9 @@ embed 0 0 0
 # line.
 # PIN(2026-10-22): engram 10 -> 11 blocks, new code, not old code relaxed: RunTable maps each file that holds a
 # table's runs (a checkpoint folder's shards) read-only with memmap2's map, one block with its SAFETY line.
-engram 11 0 0
+# PIN(2026-10-23): engram 11 -> 12 blocks, 0 -> 1 fns, new test-only syscall recorder forwards
+# whole pages of a read-only file mapping to libc::madvise, one block with its SAFETY line.
+engram 12 1 0
 engram-lab 0 0 0
 gguf 7 2 0
 # PIN(2026-10-01): gpu 1354 -> 1356, a new kernel entry, not old code relaxed: kda_delta_lanes (GLM's two-row
@@ -422,7 +437,55 @@ gguf 7 2 0
 # (arch/raon1/wide.rs) copies a column window of each of a wide unit's rows; its one-writer store has its SAFETY line.
 # PIN(2026-10-22): gpu 2119 -> 2121 blocks, a new kernel entry, not old code relaxed: gemm_iq3s (gemm/grouped.rs)
 # reads the file's IQ3_S blocks: its block load (iq3s_dec) and its lane decode (iq3s_lane). Each block has its SAFETY line.
-gpu 2121 247 10
+# PIN(2026-10-22): gpu 2121 -> 2127 blocks, 247 -> 249 fns: the one-column BF16 HC entry and its shared
+# stage/mix helper add three calls and one fn; the shared byte-row ID helper and MXFP8 entry add three
+# calls and one fn. Each call keeps its buffer-bound and single-writer SAFETY contract.
+# PIN(2026-10-22): gpu 2127 -> 2150 blocks, 249 -> 251 fns, new code, not old code relaxed:
+# dense MMA staging, shared reads, calls and stores, three checked kernel entries, and block-wide replay votes.
+# The exact tile owner takes explicit coordinates for exceptional MMA replay; each block has its SAFETY invariant.
+# PIN(2026-10-23): gpu 2150 -> 2159 blocks, 251 -> 259 fns: head-128, per-sequence and K192
+# appends require distinct cache writers, including ring rows modulo the ring height. The KV
+# helpers propagate the contract to their callers, which upload consecutive positions per sequence.
+# Each new call block has its SAFETY invariant; no device operation changes.
+# PIN(2026-10-22): gpu 2159 -> 2166 blocks, 259 -> 260 fns: NVFP4 f32 selected rows decode
+# bounded code and scale planes, read a checked activation column and expert scale, and write one row per warp.
+# PIN(2026-10-23): gpu 2166 -> 2186 blocks, 260 -> 267 fns: HC's isolated MMA
+# entry, fused up/mix and checked row permutation share tile computation and
+# exact replay. Marked stores preserve healthy cells; each access has its SAFETY invariant.
+# PIN(2026-10-23): gpu 2186 -> 2231 blocks, 267 -> 268 fns, new code, not old code relaxed:
+# nvfp4mma.rs adds bounded activation quads, shared staging, register conversions, MMA and output stores,
+# and its module load. Each block has its SAFETY invariant; act_quad states its input bounds.
+# PIN(2026-10-23): range-preserving GEMM epilogues and normalized Q8 packing retain
+# 2195 blocks, 252 unsafe fns and 10 impls; the shared scale owner adds no unsafe operation.
+# PIN(2026-10-23): gpu 2231 -> 2248 blocks, 268 -> 277 fns, new code, not old code relaxed: the
+# pipelined MMA tile's asynchronous BF16 copies, ldmatrix reads, staged BF16 stores and isolated
+# line flags, MmaRows's fetch, land and range check for BF16, E4M3 and HC rows, and the HC mix's
+# warp scratch. Each block has its SAFETY invariant.
+# PIN(2026-10-23): gpu 2248 -> 2250 blocks, new code, not old code relaxed: the grouped and 32-value GEMM
+# blocks' exact-walk vote (gemm/grouped.rs exact_vote) stores its warp's word and reads the block's words
+# after the barrier. Each block has its SAFETY line.
+# PIN(2026-10-23): gpu 2250 -> 2256 blocks, a new kernel entry, not old code relaxed: q38_card_sum_shared_add
+# (q38.rs) sums through card_slots' card_acc_at, reads its shared row and gate, and stores its value, one block
+# each; the prompt route's card sum views the unit's acc, or the shared rows and block output on a layer without a
+# host leg, per run (wide38.rs), one block each where the shared view held the acc's. Each block has its SAFETY line.
+# PIN(2026-10-22): gpu 2256 -> 2269 blocks, 277 -> 278 fns, new code, not old code relaxed: the card as the device
+# contract's `Device` (device.rs): the four window constructors of its two buffers, the shared buffer's `HostPages`
+# and `host_mut` (its one unsafe fn), the engine stream's transparent view, the two window bindings a launch takes, and
+# the four driver copies (the fault words', a read, a write, a copy between windows), each with its SAFETY line.
+# PIN(2026-10-22): gpu 2269 -> 2268 blocks, review fix, one block fewer: the fault words' bulk copy and the fault
+# reader's one-word copy are one `fault::read_words` with its one block (the range checked in it), not two.
+# PIN(2026-10-23): gpu 2268 -> 2266 unsafe blocks; removing bf16_mma_gemm_columns removes its two unsafe blocks.
+# PIN(2026-10-22): gpu 2266 -> 2263 blocks, review fix, one block fewer: the fault words' bulk copy and the fault
+# reader's one-word copy are one `fault::read_words` with its one block (the range checked in it), not two.
+# gpu 2266 -> 2263 blocks: body38.rs copies a call's PLE rows to an arena through one safe window (PleHost::upload).
+# PIN(2026-10-23): gpu 2263 -> 2269 blocks, 278 -> 281 fns, new code, not old code relaxed: the gated router's
+# BF16 joined weight (Qwen3.8's router in its words, two kernel entries' body calls), and RowValues' chunk loads
+# (chunks8 and chunks32, a provided body each and a BF16 override each that loads the words before widening them)
+# replacing f32_load_chunks, with the 32-chunk walk reading w and x in a block each. Each block has its SAFETY line.
+# PIN(2026-10-23): gpu 2269 -> 2266 blocks; checked windows replace the MTP hidden-row views and the store inbox view.
+# PIN(2026-10-23): gpu 2266 -> 2267 blocks, new held-stream error test queues one copy
+# into its private staging extent and keeps it lent until the lane drains.
+gpu 2267 281 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.
@@ -500,7 +563,13 @@ gpu-deepseek41 382 44 0
 # PIN(2026-10-22): gpu-gates 88 -> 89 blocks, new code, not old code relaxed: MiniCPM-V 4.7's full-vocabulary DSpark
 # draft (shared/dspark_hf.rs) borrows the target's resident Q6_K head in place, as the DFlash2 draft does, with its
 # SAFETY line; the seat checks the draft's CUDA context against the target's first.
-gpu-gates 89 5 1
+# PIN(2026-10-23): gpu-gates 89 -> 99 blocks: head-128 and K192 append calls vouch for
+# cache writers checked before upload or generated consecutively within each plane or ring.
+# Each call has its own SAFETY line; no device memory operation is added.
+# PIN(2026-10-22): gpu-gates 99 -> 103 blocks, new code, not old code relaxed: gate_gpu_device's module load, its raise
+# kernel's FaultSink over the gate's own fault word and its atomic view of the first word for a layer past the last,
+# and the host flag's drop once the stream that waited on it is drained, each with its SAFETY line.
+gpu-gates 103 5 1
 # PIN(2026-10-15): gpu-gemma-embedding2 0 -> 1 blocks, new code, not old code relaxed: the head-512
 # launcher call requires distinct Consts::pos positions, with its SAFETY line.
 # PIN(2026-10-15): gpu-gemma-embedding2 1 -> 2 blocks, new code, not old code relaxed: Encoder::pass's call of
@@ -516,7 +585,10 @@ gpu-gemma4a 11 0 0
 # (mem_batch) and adds the parts in rank order (Gathers::enqueue_sum), each call in a block of its own with its
 # SAFETY line; the rank holds the page past every launch it enqueues.
 gpu-glm5next 7 0 0
-gpu-mimo2 0 0 0
+# PIN(2026-10-23): gpu-mimo2 0 -> 5 blocks, 0 -> 1 fns: enqueue_append propagates the
+# K192 cache-writer contract to one-token and consecutive prompt/slot callers within each ring.
+# Each call has its SAFETY invariant; no device operation changes.
+gpu-mimo2 5 1 0
 # PIN(2026-10-21): gpu-minimaxm3 0 -> 19 blocks, 0 -> 1 fns, a new crate, not old code relaxed: the score and select kernels
 # (attn.rs) read and write their buffers through raw places and shared words, each block with its SAFETY line, and
 # enqueue_index is an unsafe fn, as the head kernel it calls (the positions are distinct).
@@ -553,9 +625,9 @@ jinja 0 0 0
 levers 0 0 0
 # PIN(2026-10-22): metal 21 blocks, 6 fns, 13 impls, a new crate, not old code relaxed: the Objective-C bindings declare
 # no Metal protocol thread-safe, so the thread-safe handles and the window's raw carry `unsafe impl Send/Sync` with Apple's
-# list as their invariant; the shared pages' one owner (`HostPages`) holds every access through the contents pointer; the
-# window raw's buffer dereference and the encoder's two argument calls each carry their SAFETY line.
-metal 21 6 13
+# list as their invariant; the window raw's buffer dereference and pages and the encoder's two argument calls each carry
+# their SAFETY line. Lowered to 15 blocks, 3 fns, 11 impls when the shared pages' owner moved to the device crate.
+metal 15 3 11
 # PIN(2026-10-02): model 112 -> 114 blocks, 29 -> 30 fns, new code, not old code relaxed: the union's row lanes
 # (ops.rs PairWork::compute_lanes, the one unsafe fn) read the pass's quantized columns and write their output
 # cells, two blocks, each with its SAFETY line.

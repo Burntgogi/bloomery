@@ -2058,12 +2058,25 @@ impl RopeNeoxKernels {
 
     /// Enqueue the norm, turn and append of `args.m` tokens: one block per
     /// (token, head), `m·(n_head + n_kv)` blocks of 64 threads, token `t`
-    /// turned by the table's row `pos[t]`. The tokens of one launch must hold
-    /// distinct positions below `ctx` (the caller's positions are
-    /// consecutive); a position `>= ctx` raises [`FaultSite::CachePos`] on
-    /// `args.fault`, leaves the token's heads NaN and is not appended.
+    /// turned by the table's row `pos[t]`. A position `>= ctx` raises
+    /// [`FaultSite::CachePos`] on `args.fault`, leaves the token's heads NaN and is not appended.
     /// Asynchronous, allocation-free, capturable.
-    pub fn enqueue_head_norm_neox_append(
+    ///
+    /// # Safety
+    ///
+    /// Among the first `args.m` positions in `args.pos`, those below
+    /// `args.ctx` are pairwise distinct. Out-of-range positions never append,
+    /// so repeated invalid sentinels do not create cache writers.
+    ///
+    /// ```compile_fail,E0133
+    /// use bloomery_gpu::{GpuError, rope_neox::{NeoxArgs, RopeNeoxKernels}};
+    /// use cuda_core::CudaStream;
+    ///
+    /// fn append(k: &RopeNeoxKernels, s: &CudaStream, args: NeoxArgs<'_>) -> Result<(), GpuError> {
+    ///     k.enqueue_head_norm_neox_append(s, args)
+    /// }
+    /// ```
+    pub unsafe fn enqueue_head_norm_neox_append(
         &self,
         stream: &CudaStream,
         args: NeoxArgs<'_>,
@@ -2213,7 +2226,8 @@ impl RopeNeoxKernels {
     ///
     /// # Safety
     ///
-    /// The first `args.m` positions in `args.pos` are distinct.
+    /// Among the first `args.m` positions in `args.pos`, those below
+    /// `args.ctx` are pairwise distinct.
     pub unsafe fn enqueue_head_norm_neox_append_512(
         &self,
         stream: &CudaStream,
@@ -2281,7 +2295,8 @@ impl RopeNeoxKernels {
     ///
     /// # Safety
     ///
-    /// The `m` positions of `args.pos` are distinct: two tokens at one
+    /// Among the first `args.m` positions in `args.pos`, those below
+    /// `args.ctx` are pairwise distinct: two cache-valid tokens at one
     /// position write the same cache rows from two blocks at once.
     pub unsafe fn enqueue_head_norm_neox_append_256_whole(
         &self,
@@ -2356,7 +2371,8 @@ impl RopeNeoxKernels {
     ///
     /// # Safety
     ///
-    /// The `m` positions of `args.pos` are distinct: two tokens at one
+    /// Among the first `args.m` positions in `args.pos`, those below
+    /// `args.ctx` are pairwise distinct: two cache-valid tokens at one
     /// position write the same cache rows from two blocks at once.
     pub unsafe fn enqueue_head_norm_neox_append_128_partial(
         &self,
@@ -2418,7 +2434,21 @@ impl RopeNeoxKernels {
     /// 32-value blocks in `args`' four planes — per side the codes and the
     /// scales ([`q8_plane_lens`]), the quantization rule and refusal
     /// [`q8_block_warp`]'s. Asynchronous, allocation-free, capturable.
-    pub fn enqueue_head_norm_neox_append_q8(
+    ///
+    /// # Safety
+    ///
+    /// Among the first `args.m` positions in `args.pos`, those below
+    /// `args.ctx` are pairwise distinct, as for the f16 append.
+    ///
+    /// ```compile_fail,E0133
+    /// use bloomery_gpu::{GpuError, rope_neox::{NeoxQ8Args, RopeNeoxKernels}};
+    /// use cuda_core::CudaStream;
+    ///
+    /// fn append(k: &RopeNeoxKernels, s: &CudaStream, args: NeoxQ8Args<'_>) -> Result<(), GpuError> {
+    ///     k.enqueue_head_norm_neox_append_q8(s, args)
+    /// }
+    /// ```
+    pub unsafe fn enqueue_head_norm_neox_append_q8(
         &self,
         stream: &CudaStream,
         args: NeoxQ8Args<'_>,
@@ -2561,13 +2591,18 @@ impl RopeNeoxKernels {
     /// gives it ([`RowTable`]), its other inputs `args`' rows as that
     /// launch's. One block per (token, head), `m·(n_head + n_kv)` blocks of
     /// 64 threads; each token's arithmetic and refusal are that launch's.
-    /// The tokens of one sequence must hold distinct positions below `ctx`;
-    /// a position `>= ctx` raises [`FaultSite::CachePos`] on `args.fault`,
+    /// A position `>= ctx` raises [`FaultSite::CachePos`] on `args.fault`,
     /// leaves the token's heads NaN and is not appended. A table of other
     /// than `m` rows, more than [`ROW_PLANES`], or a plane shorter than
     /// `n_kv · ctx · HEAD` is refused by name. Asynchronous,
     /// allocation-free, capturable.
-    pub(crate) fn enqueue_head_norm_neox_append_rows(
+    ///
+    /// # Safety
+    ///
+    /// Within each sequence's rows in `planes`, the corresponding first
+    /// `args.m` positions below `args.ctx` are pairwise distinct. Different
+    /// sequences borrow disjoint planes and may use the same positions.
+    pub(crate) unsafe fn enqueue_head_norm_neox_append_rows(
         &self,
         stream: &CudaStream,
         planes: &RowTable<'_>,
@@ -2622,7 +2657,8 @@ impl RopeNeoxKernels {
         let prep = self
             .module
             .prepare_head_norm_neox_append_rows(LaunchConfig1D::new(grid, THREADS_U32, 0))?;
-        // SAFETY: the table's rows are `planes`' puts, each an f16 plane pair
+        // SAFETY: the caller guarantees distinct cache-valid positions within
+        // each sequence. The table's rows are `planes`' puts, each an f16 plane pair
         // of at least n_kv·ctx·HEAD values (checked above), borrowed by the
         // table while this enqueue runs; a graph that captures the launch
         // replays it over the same planes, which the caller keeps alive and
@@ -2643,35 +2679,66 @@ impl RopeNeoxKernels {
     /// leaves the token's heads NaN and is not appended. A non-finite
     /// `v_scale`, a short buffer or a zero count is refused by name before the
     /// launch. Asynchronous, allocation-free, capturable.
-    pub fn enqueue_neox_append_k192(
+    ///
+    /// # Safety
+    ///
+    /// Among the first `args.m` positions in `args.pos`, those below
+    /// `args.ctx` are pairwise distinct.
+    ///
+    /// ```compile_fail,E0133
+    /// use bloomery_gpu::{GpuError, rope_neox::{K192Args, RopeNeoxKernels}};
+    /// use cuda_core::CudaStream;
+    ///
+    /// fn append(k: &RopeNeoxKernels, s: &CudaStream, args: K192Args<'_>) -> Result<(), GpuError> {
+    ///     k.enqueue_neox_append_k192(s, args)
+    /// }
+    /// ```
+    pub unsafe fn enqueue_neox_append_k192(
         &self,
         stream: &CudaStream,
         args: K192Args<'_>,
     ) -> Result<(), GpuError> {
-        self.enqueue_k192(stream, args, None)
+        // SAFETY: the caller guarantees distinct cache-valid positions.
+        unsafe { self.enqueue_k192(stream, args, None) }
     }
 
     /// [`RopeNeoxKernels::enqueue_neox_append_k192`] into a ring of `rows`
     /// rows a key head ([`rope_neox_kernels::neox_append_k192_ring`]): the
     /// planes hold `n_kv · rows` rows, key position `p` is row `p mod rows`,
     /// and `args.ctx` stays the position bound (the rope table's rows and the
-    /// [`FaultSite::CachePos`] guard). The `m` positions of a launch are
-    /// distinct and within `rows` consecutive positions, so `rows >= m` is the
-    /// host's check. Refused by name before the launch, besides the plane
-    /// entry's: `rows == 0`, `rows > ctx`, `rows < m`, and a plane shorter
+    /// [`FaultSite::CachePos`] guard). Refused by name before the launch,
+    /// besides the plane entry's: `rows == 0`, `rows > ctx`, `rows < m`, and a plane shorter
     /// than `n_kv · rows` rows. Asynchronous, allocation-free, capturable.
-    pub fn enqueue_neox_append_k192_ring(
+    ///
+    /// # Safety
+    ///
+    /// Among the first `args.m` positions in `args.pos`, those below
+    /// `args.ctx` map to pairwise distinct cache rows modulo `rows`.
+    ///
+    /// ```compile_fail,E0133
+    /// use bloomery_gpu::{GpuError, rope_neox::{K192Args, RopeNeoxKernels}};
+    /// use cuda_core::CudaStream;
+    ///
+    /// fn append(k: &RopeNeoxKernels, s: &CudaStream, args: K192Args<'_>) -> Result<(), GpuError> {
+    ///     k.enqueue_neox_append_k192_ring(s, args, 2)
+    /// }
+    /// ```
+    pub unsafe fn enqueue_neox_append_k192_ring(
         &self,
         stream: &CudaStream,
         args: K192Args<'_>,
         rows: usize,
     ) -> Result<(), GpuError> {
-        self.enqueue_k192(stream, args, Some(rows))
+        // SAFETY: the caller guarantees distinct cache-valid rows modulo rows.
+        unsafe { self.enqueue_k192(stream, args, Some(rows)) }
     }
 
     /// The launch of both appends; `rows` is the ring's height, none for the
     /// planes of `ctx` rows.
-    fn enqueue_k192(
+    ///
+    /// # Safety
+    /// Cache-valid positions map to distinct rows modulo `rows.unwrap_or(args.ctx)`.
+    unsafe fn enqueue_k192(
         &self,
         stream: &CudaStream,
         args: K192Args<'_>,

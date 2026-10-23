@@ -182,10 +182,11 @@
 //! with the shared window `app::mtp::MtpDraft`, as `generate_glm5next` does:
 //! windows of two rows, the target's next token and the draft's one
 //! proposal, the draft's walks eager, `pass_rows` 2; the greedy ids are the
-//! plain run's of the same load. A sampling or id-banning request takes
-//! plain steps (the server's loop asks a pass only of a greedy request with
-//! no banned id), each step's row the target's, read before the step is told
-//! to the draft. A `load draft=mtp` record follows the `load` line, and
+//! plain run's of the same load. A sampling or id-banning request drafts
+//! while its slot runs alone in the round, each kept id its draw from its
+//! verified row (`Seat::pass_sampled`), and takes plain steps beside another
+//! busy slot, each step's row the target's, read before the step is told to
+//! the draft. A `load draft=mtp` record follows the `load` line, and
 //! `/props`' `engine.draft` names the draft (the target file, whose NextN
 //! layer it is) with the plan's bytes for it as the card's `draft` class.
 //! `BLOOMERY_DRAFT=off` is the plain path, one step a pass, with a `load
@@ -267,7 +268,7 @@ use bloomery_gpu_gates::{GateError, gpu_census, ref_model_path};
 use bloomery_gpu_glm5next::set_prefill_media;
 use bloomery_gpu_glm5next::{
     Body, Glm5nextModel, GlmArena, GlmSeq, PrefillMode, checkpoint_budget, checkpoint_price,
-    seq_bytes, seq_lane, seq_resume, seq_resume_prefix, seq_save, seq_save_async,
+    seq_bytes, seq_lane, seq_resume, seq_resume_prefix, seq_save, seq_save_async, seq_save_bytes,
 };
 use bloomery_levers::{
     ChurnHosting, GlmAt, GlmPick, ResidencyPick, ResidencyWhy, glm_residency_at_plan, glm_unset,
@@ -1299,7 +1300,8 @@ impl Glm {
         for r in rows {
             let skips = self
                 .drafted
-                .specs_mut()
+                .round_mut()
+                .0
                 .get(r.slot)
                 .and_then(Option::as_ref)
                 .is_some_and(|spec| spec.draft().draft().skipping());
@@ -1570,6 +1572,7 @@ impl Seat for Glm {
                     rows,
                     &mut g.drafted,
                     <Body as MtpBody>::WIDTH,
+                    1..=<Body as MtpBody>::WIDTH,
                 )
             },
             Glm::print_passes,
@@ -1755,6 +1758,10 @@ impl Seat for Glm {
     /// one the checkpoint spacing did not choose.
     fn splits(&self, _: usize, _: usize, _: &[usize]) -> Vec<usize> {
         Vec::new()
+    }
+
+    fn snapshot_size(&mut self) -> Result<Option<u64>, GateError> {
+        Ok(Some(seq_save_bytes(self.s.model_mut())?))
     }
 
     /// The sequence state ([`seq_save`]) and, under the draft, its side of

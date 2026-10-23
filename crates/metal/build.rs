@@ -14,6 +14,16 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// The mat-vec launch geometry, from the file the host module reads it from:
+/// the one owner of the numbers both sides use.
+#[allow(
+    dead_code,
+    reason = "the host module reads every constant; the header takes two of them"
+)]
+mod geometry {
+    include!("src/kernels/geometry.rs");
+}
+
 /// The fault site's table, written as the Metal compiler sees it.
 fn fault_sites_header() -> String {
     let mut out = String::from(
@@ -32,11 +42,23 @@ fn fault_sites_header() -> String {
          #define BLOOMERY_LAYER_NONE {}u\n\
          #define BLOOMERY_FAULT_WORDS {}u\n\
          // The word a raise stores: the layer above the site.\n\
-         #define BLOOMERY_FAULT_WORD(layer, site) (((layer) << 8) | (site))\n",
+         #define BLOOMERY_FAULT_WORD(layer, site) (((layer) << {}) | (site))\n",
         bloomery_device::fault::LAYER_NONE,
-        bloomery_device::fault::FAULT_WORDS
+        bloomery_device::fault::FAULT_WORDS,
+        bloomery_device::fault::LAYER_SHIFT
     ));
     out
+}
+
+/// The mat-vec launch geometry, written as the Metal compiler sees it.
+fn matvec_geometry_header() -> String {
+    format!(
+        "// The mat-vec launch geometry, from src/kernels/geometry.rs.\n\
+         #define BLOOMERY_MATVEC_ROWS_PER_SIMD_GROUP {}\n\
+         #define BLOOMERY_MATVEC_SIMD_GROUPS_PER_GROUP {}\n",
+        geometry::ROWS_PER_SIMD_GROUP,
+        geometry::SIMD_GROUPS_PER_GROUP
+    )
 }
 
 /// The kernels' source: the table, then every kernel file in order.
@@ -106,6 +128,7 @@ fn build_metallib(source: &Path, out_dir: &Path) -> Option<PathBuf> {
 
 fn main() {
     println!("cargo:rerun-if-changed=kernels");
+    println!("cargo:rerun-if-changed=src/kernels/geometry.rs");
     println!("cargo:rerun-if-changed=build.rs");
     // Installing the Metal Toolchain (or pointing at another one) changes
     // what `xcrun` answers: the build runs again.
@@ -117,14 +140,25 @@ fn main() {
     let kernels_dir = manifest.join("kernels");
 
     let mut kernels = Vec::new();
-    for name in ["fault", "copy", "probe"] {
+    // The order is the dependency order: norm defines the argument block the
+    // mat-vecs read, matvec_q4k the block layout and macros the Q6_K and embed
+    // files use.
+    for name in [
+        "fault",
+        "copy",
+        "probe",
+        "norm",
+        "matvec_q4k",
+        "matvec_q6k",
+        "embed",
+    ] {
         let path = kernels_dir.join(format!("{name}.metal"));
         let source =
             std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
         kernels.push((name, source));
     }
 
-    let header = fault_sites_header();
+    let header = fault_sites_header() + &matvec_geometry_header();
     let combined = combined_source(&header, &kernels);
     let source_path = out_dir.join("bloomery.metal");
     std::fs::write(&source_path, &combined).expect("the source is written");

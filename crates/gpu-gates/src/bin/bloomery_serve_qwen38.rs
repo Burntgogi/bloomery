@@ -34,9 +34,9 @@ mod qwen38_folder;
 mod drafted;
 
 // The seats' one owner of a round run as passes, a sibling of the seat as
-// in `bloomery-serve`: this seat's drafted rounds and — on a load that
-// drafts nothing — its plain rounds run through it (`step_round`); the
-// qwen3 seat's the plain ones on every load.
+// in `bloomery-serve`: this seat's drafted rounds run through it
+// (`step_round`), and so do its plain rounds on a load that drafts nothing
+// or drafts with the MTP draft; the qwen3 seat's plain ones on every load.
 #[cfg(feature = "gpu")]
 #[path = "shared/serve_seats/rounds.rs"]
 pub mod rounds;
@@ -48,11 +48,12 @@ pub mod rounds;
 #[cfg(all(test, feature = "gpu"))]
 mod tests {
     use bloomery_gpu::arch::qwen3moe::Prompt38;
+    use bloomery_gpu_gates::GateError;
     use bloomery_levers::Draft38Off;
 
     use super::qwen38::{
-        ACTS_ON, Feed38, draft_off_for, prompt_cuts, refuse_feed, refuse_lookup_feed,
-        refuse_media_feed,
+        ACTS_ON, Feed38, draft_for_slots, draft_off_for, folder_draft_for, prompt_cuts,
+        refuse_feed, refuse_lookup_feed, refuse_media_feed,
     };
 
     const STEPS: Feed38 = Feed38 {
@@ -192,19 +193,83 @@ mod tests {
         );
     }
 
-    /// A checkpoint folder's load reads no MTP layers: a set `mtp` is refused by name, and an
-    /// unset draft the rule would have run goes off naming the folder.
+    /// A checkpoint folder's own MTP layer drafts when the draft's reader takes it. A folder
+    /// without one, a layer its preparation refuses, and a prepared layer the reader refuses
+    /// each refuse a set `mtp` naming the refusal, turn an unset draft off with the refusal as
+    /// its reason (the target served), and keep a set `off` as set. Mutant: the reader's refusal
+    /// dropped (the prepared layer drafts) or propagated (the load refused).
     #[test]
     fn a_folder_load_refuses_a_set_mtp_draft_and_turns_an_unset_one_off() {
-        let why = draft_off_for(Draft38Off::Folder, Some("mtp"), (true, None))
-            .expect_err("BLOOMERY_DRAFT=mtp on a checkpoint folder")
-            .to_string();
-        assert!(
-            why.contains("BLOOMERY_DRAFT=mtp with a checkpoint folder"),
-            "{why}"
+        let layout = gguf::write::Layout::new(&[], Vec::new()).unwrap();
+        let header = || gguf::Split::header_only("mtp".into(), &layout).unwrap();
+        let ask = |layer: &Result<Option<gguf::Split>, String>,
+                   reader: Result<(), &str>,
+                   word: Option<&str>,
+                   run: (bool, Option<Draft38Off>)| {
+            folder_draft_for(layer, |_| reader.map_err(GateError::from), word, run)
+        };
+        let (f32, missing) = (
+            "mtp.fc_embedding.weight is stored F32",
+            "blk.48.attn_q.weight is not in the draft file",
         );
-        let off = draft_off_for(Draft38Off::Folder, None, (true, None)).unwrap();
-        assert_eq!(off, (false, Some(Draft38Off::Folder)));
+        for (layer, reader, why) in [
+            (Ok(None), Ok(()), Draft38Off::Folder),
+            (
+                Err(f32.to_string()),
+                Ok(()),
+                Draft38Off::FolderMtp { why: f32.into() },
+            ),
+            (
+                Ok(Some(header())),
+                Err(missing),
+                Draft38Off::FolderMtp {
+                    why: missing.into(),
+                },
+            ),
+        ] {
+            let e = ask(&layer, reader, Some("mtp"), (true, None))
+                .expect_err("BLOOMERY_DRAFT=mtp without a folder MTP layer the draft reads")
+                .to_string();
+            assert!(
+                e.contains("BLOOMERY_DRAFT=mtp with a checkpoint folder"),
+                "{e}"
+            );
+            if let Draft38Off::FolderMtp { why } = &why {
+                assert!(e.contains(why.as_str()), "{e}");
+            }
+            let off = ask(&layer, reader, None, (true, None)).unwrap();
+            assert_eq!(off, (false, Some(why)));
+            let set = ask(&layer, reader, Some("off"), (false, Some(Draft38Off::Set))).unwrap();
+            assert_eq!(set, (false, Some(Draft38Off::Set)));
+        }
+        let layer = Ok(Some(header()));
+        for word in [None, Some("mtp")] {
+            assert_eq!(
+                ask(&layer, Ok(()), word, (true, None)).unwrap(),
+                (true, None)
+            );
+        }
+    }
+
+    /// An unset draft, from a GGUF draft file or a checkpoint folder's MTP layer alike, drafts
+    /// on one slot and goes off naming the slots from the second on; a set `mtp` drafts on any
+    /// count, and a set `off` and an earlier reason stand.
+    #[test]
+    fn an_unset_draft_drafts_on_one_slot_only() {
+        assert_eq!(draft_for_slots(1, None, (true, None)), (true, None));
+        assert_eq!(
+            draft_for_slots(2, None, (true, None)),
+            (false, Some(Draft38Off::Slots { slots: 2 }))
+        );
+        assert_eq!(draft_for_slots(4, Some("mtp"), (true, None)), (true, None));
+        assert_eq!(
+            draft_for_slots(4, Some("off"), (false, Some(Draft38Off::Set))),
+            (false, Some(Draft38Off::Set))
+        );
+        assert_eq!(
+            draft_for_slots(4, None, (false, Some(Draft38Off::Gate))),
+            (false, Some(Draft38Off::Gate))
+        );
     }
 
     #[test]
@@ -212,6 +277,10 @@ mod tests {
         refuse_feed(BATCH, (2, true), Some("mid-p40-s1"))
             .expect("the seat's own feed beside every other lever");
     }
+
+    // PIN(2026-10-23): no round falls back to keep slot 0's refresh (a pass without slot 0
+    // walks into its first slot's own rows, `Body38::enqueue_slots`), so the arena model of
+    // that rule is gone; gate_qwen4exp_mtp's (z) plain rounds pin slot 0's draft on the card.
 
     /// Every accessor the seat calls on `Levers`, with the levers it reads.
     const READS: &[(&str, &[&str])] = &[

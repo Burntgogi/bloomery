@@ -106,14 +106,20 @@ impl Part<'_> {
     }
 }
 
-/// A row-gathered table's rows where a source stores them, for a reader that maps them there
-/// (a checkpoint folder's PLE table, its parts in the folder's shard files): rows of `row_bytes`
-/// bytes as the program reads them, each run a byte range of whole rows in a file, in row
-/// order, every row at the one tensor scale `scale`.
+/// One plane of a row-gathered table, in row order: each run holds whole
+/// rows of `row_bytes` bytes where the source stores them.
 #[derive(Clone, Debug, PartialEq)]
-pub struct StoredRows {
+pub struct StoredPlane {
     pub row_bytes: u64,
     pub runs: Vec<(PathBuf, Range<u64>)>,
+}
+
+/// A row-gathered table where its source stores it: F8 values, or NVFP4
+/// codes with a separate plane of block scales, at one tensor `scale`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StoredRows {
+    pub values: StoredPlane,
+    pub block_scales: Option<StoredPlane>,
     pub scale: f32,
 }
 
@@ -140,6 +146,38 @@ pub trait Source {
     /// split's placed load, `PageDrop`) drops none here.
     fn release(&self, _p: &Planned) -> Result<(), Self::Error> {
         Ok(())
+    }
+}
+
+/// A source whose plan considers only the names `keep` selects. Reads and page release use
+/// the underlying source, so several model components can share its stored tensors.
+pub struct Filtered<'s, S, F> {
+    pub source: &'s S,
+    pub keep: F,
+}
+
+impl<S: Source, F: Fn(&str) -> bool> Source for Filtered<'_, S, F> {
+    type Error = S::Error;
+
+    fn plan<E: std::fmt::Display>(
+        &self,
+        rule: impl Fn(&str, GgmlType, &[u64]) -> Result<Take, E>,
+    ) -> Result<Vec<Planned>, Self::Error> {
+        self.source.plan(|name, ty, dims| {
+            if (self.keep)(name) {
+                rule(name, ty, dims)
+            } else {
+                Ok(Take::Skip)
+            }
+        })
+    }
+
+    fn read(&self, p: &Planned) -> Result<Part<'_>, Self::Error> {
+        self.source.read(p)
+    }
+
+    fn release(&self, p: &Planned) -> Result<(), Self::Error> {
+        self.source.release(p)
     }
 }
 
@@ -188,5 +226,46 @@ impl Source for Split {
             bytes: Bytes::File(runs.into_iter().map(|r| &data[r]).collect()),
             scale,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gguf::write::{Layout, TensorDecl};
+
+    #[test]
+    fn shared_parts_are_planned_only_for_the_selected_component() {
+        let names = ["target.weight", "draft.weight"];
+        let layout = Layout::new(
+            &[],
+            names
+                .iter()
+                .map(|name| TensorDecl {
+                    name: (*name).to_string(),
+                    dims: vec![1],
+                    type_id: GgmlType::F32.as_u32(),
+                    nbytes: 4,
+                })
+                .collect(),
+        )
+        .unwrap();
+        let source = Split::header_only(PathBuf::from("/synthetic/shared-parts"), &layout).unwrap();
+        for wanted in names {
+            let selected = Filtered {
+                source: &source,
+                keep: |name: &str| name == wanted,
+            };
+            let parts = selected
+                .plan(|_, _, _| Ok::<_, std::convert::Infallible>(Take::Whole))
+                .unwrap();
+            assert_eq!(
+                parts
+                    .iter()
+                    .map(|p| p.info.name.as_str())
+                    .collect::<Vec<_>>(),
+                vec![wanted]
+            );
+        }
     }
 }

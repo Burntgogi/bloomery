@@ -76,14 +76,14 @@ pub fn anchor(pos: u32, every: u32) -> bool {
 }
 
 /// The points a save at `pos` carries, ascending, of the `held` points a
-/// ledger spaced `every` positions holds: every anchor ([`anchor`]) below
-/// `pos`, and the last point below `pos`. A request that shares only the
-/// first `n` positions of the saved prompt restores at the nearest carried
-/// point at or below `n`, which is within a factor of 2 of `n` once `n`
-/// reaches the first anchor (the anchors double), and the save carries at
-/// most log2(`pos` / `every`) + 2 points; the last point is what a save
-/// carried alone before. A position the ledger does not hold is skipped,
-/// never made up. `held` is ascending.
+/// ledger spaced `every` positions holds: the first point, every anchor
+/// ([`anchor`]) below `pos`, and the last point below `pos`. A request that
+/// shares only the first `n` positions of the saved prompt restores at the
+/// nearest carried point at or below `n`. When the ledger retains every
+/// anchor, that point is within a factor of 2 of `n` once `n` reaches the
+/// first anchor. The save carries at most two points besides the anchors.
+/// A position the ledger does not hold is skipped, never made up. `held` is
+/// ascending.
 #[must_use]
 pub fn save_points(held: &[u32], pos: u32, every: u32) -> Vec<u32> {
     let below = held.partition_point(|&p| p < pos);
@@ -91,7 +91,7 @@ pub fn save_points(held: &[u32], pos: u32, every: u32) -> Vec<u32> {
     held[..below]
         .iter()
         .enumerate()
-        .filter(|&(i, &p)| anchor(p, every) || Some(i) == last)
+        .filter(|&(i, &p)| i == 0 || anchor(p, every) || Some(i) == last)
         .map(|(_, &p)| p)
         .collect()
 }
@@ -127,8 +127,8 @@ impl Price {
     /// two ends, so the point a resumed prefix needs, where the call before
     /// ended, is never the one displaced. A ledger of this budget is made of
     /// exactly that many slots, so it is the bound on what the sequence pins;
-    /// a later call's points past them displace the least recently used that
-    /// is not an anchor ([`Ledger::take`]), never grow the pin. Refused by name
+    /// later points use [`Ledger::take`]'s order, preserving the first prefix
+    /// and anchors before later marks, and never grow the pin. Refused by name
     /// for a context of no positions or past the u32 positions, and a
     /// checkpoint [`capacity`] refuses.
     pub fn budget(self, ctx: u64) -> Result<u64, CheckpointError> {
@@ -418,11 +418,10 @@ struct Point {
 }
 
 /// The checkpoints of one model's recurrent state: at most `cap` slots,
-/// the least recently used point giving its slot up to a new one. Anchors
-/// ([`anchor`] at the spacing `every`) are the last to go: a prompt longer
-/// than the slots gives up its later marks and keeps the doubling ones a
-/// save carries ([`save_points`]), an anchor giving its slot up only when
-/// every point is one.
+/// the least recently used point giving its slot up to a new one. With
+/// nonzero spacing, the first point leaves last, and later anchors
+/// ([`anchor`] at the spacing `every`) stay before later non-anchor marks.
+/// A save carries the first point and the doubling ones ([`save_points`]).
 #[derive(Clone, Debug)]
 pub struct Ledger {
     cap: usize,
@@ -558,8 +557,10 @@ impl Ledger {
 
     /// A checkpoint at `at`, the position the model stands at: nothing at 0
     /// or where one stands; else a free slot, a new one while fewer than the
-    /// capacity are made, or the least recently used point's that is not an
-    /// anchor (an anchor's when every point is one). Refused while a cut
+    /// capacity are made, or the least recently used point's that is neither
+    /// the first point nor an anchor. With nonzero spacing, anchors leave
+    /// next and the first point only when it is the sole slot. A ledger
+    /// without spacing uses least recent order. Refused while a cut
     /// waits, and when a point stands past `at`.
     pub fn take(&mut self, at: u32) -> Result<Take, CheckpointError> {
         if self.pending.is_some() {
@@ -590,7 +591,7 @@ impl Ledger {
                 .points
                 .iter()
                 .enumerate()
-                .min_by_key(|(_, p)| (anchor(p.pos, self.every), p.used))
+                .min_by_key(|(i, p)| (self.every > 0 && *i == 0, anchor(p.pos, self.every), p.used))
                 .ok_or(CheckpointError::Budget {
                     budget: 0,
                     bytes: 0,
@@ -1326,6 +1327,7 @@ mod tests {
         );
         assert_eq!(l.stats().evicted, 63 - 23);
 
+        // PIN(2026-10-23): a full ledger preserves its first prefix before later anchors.
         let mut only = Ledger::new(2, 512).unwrap();
         for at in [512, 1_024] {
             copy(only.take(at).unwrap());
@@ -1333,20 +1335,20 @@ mod tests {
         assert_eq!(
             only.take(1_536),
             Ok(Take::Copy {
-                slot: 0,
+                slot: 1,
                 new: false,
-                evicted: Some(512)
+                evicted: Some(1_024)
             }),
-            "every point an anchor: the least recent goes"
+            "the first anchor stays"
         );
         assert_eq!(
             only.take(2_048),
             Ok(Take::Copy {
-                slot: 0,
+                slot: 1,
                 new: false,
                 evicted: Some(1_536)
             }),
-            "a later non-anchor goes before the anchor at 1,024"
+            "a later non-anchor goes before the first anchor"
         );
     }
 
@@ -1504,6 +1506,32 @@ mod tests {
         assert_eq!(
             pinned(2, Q38.budget(10_240).expect("a budget")),
             1_041_301_504
+        );
+    }
+
+    #[test]
+    fn message_boundaries_keep_the_first_prefix_with_two_slots() {
+        let price = Price {
+            point_bytes: 73_728_000,
+            every: 4_096,
+        };
+        let budget = price.budget(4_096).expect("a budget");
+        let mut ledger = Ledger::new(
+            capacity(budget, price.point_bytes).expect("two slots"),
+            price.every,
+        )
+        .expect("a ledger");
+        for at in [1_024, 2_048, 2_999] {
+            ledger.take(at).expect("a message boundary");
+        }
+        assert_eq!(ledger.keep(1_024, 2_999).at, 1_024);
+        assert_eq!(
+            save_points(&ledger.positions(), 2_999, price.every),
+            [1_024]
+        );
+        assert_eq!(
+            save_points(&[1_024, 2_048, 2_999], 3_000, price.every),
+            [1_024, 2_999]
         );
     }
 

@@ -26,8 +26,10 @@ use bloomery_device::DeviceError;
 use crate::device::MetalDevice;
 use crate::handle::Handle;
 
-/// The kernels' source, with the fault site's table in front of them.
-const SOURCE: &str = include_str!(concat!(env!("OUT_DIR"), "/bloomery.metal"));
+/// The kernels' source, with the fault site's table in front of them: the
+/// text the runtime compiles, and the text the kernel gate edits its mutants
+/// into.
+pub const SOURCE: &str = include_str!(concat!(env!("OUT_DIR"), "/bloomery.metal"));
 
 /// The metallib `build.rs` compiled, when the Metal Toolchain was there.
 #[cfg(metal_lib = "metallib")]
@@ -89,17 +91,25 @@ impl Library {
         }
         #[cfg(not(metal_lib = "metallib"))]
         {
-            Self::source_of(device)
+            Self::source_of(device, SOURCE)
         }
     }
 
     /// The library the runtime compiles from the source.
     pub fn from_source(device: &MetalDevice) -> Result<Self, DeviceError> {
-        Self::source_of(device.handle())
+        Self::source_of(device.handle(), SOURCE)
     }
 
-    fn source_of(device: &Handle<dyn MTLDevice>) -> Result<Self, DeviceError> {
-        let source = NSString::from_str(SOURCE);
+    /// The library the runtime compiles from the given source text. For the
+    /// kernel gate's mutants alone (a defect edited into the shipped source's
+    /// text, in a bin of its own, which is why it is public): every other
+    /// caller takes [`Library::from_source`].
+    pub fn from_source_text(device: &MetalDevice, text: &str) -> Result<Self, DeviceError> {
+        Self::source_of(device.handle(), text)
+    }
+
+    fn source_of(device: &Handle<dyn MTLDevice>, text: &str) -> Result<Self, DeviceError> {
+        let source = NSString::from_str(text);
         let options = MTLCompileOptions::new();
         options.setMathMode(MTLMathMode::Safe);
         options.setMathFloatingPointFunctions(MTLMathFloatingPointFunctions::Precise);

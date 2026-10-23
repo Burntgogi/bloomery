@@ -1,0 +1,27 @@
+# The Mac port's shared-crate PR (#666): qwen3moe's host program walks its layer stages through the chain crate's
+# ChainOps, and the prompt path (ubatch.rs, wide.rs) moved onto the same walk. Card side: the PR head's
+# generate_qwen3moe against main's (b75c06519), one lease, A6000.
+#
+# Decomposition [derived]: every kernel and launch is the base's (`just ptx-scan generate_qwen3moe` equal; the graph
+#   node count and eager = replay lines equal, the PR's evidence comment). The decode step replays a captured graph,
+#   so the host walk is out of the timed step: Delta decode = 0. The prompt pass encodes its launches eagerly through
+#   the walk; the walk adds no launch and no host sync, a few trait calls a layer against ~ms of card work a pass:
+#   Delta prefill < 0.05 % [derived]. Resource timeline: card SMs the wall in both; host CPU encodes under the card.
+# The term derivation cannot close: none; the sitting is the dispatch-path A/B AGENTS.md 「Measuring」 asks for.
+# Wall [derived]: 4 arms x 6 rounds = 24 processes plus warm-ups, each a ~17 GB load from the page cache and a
+#   decode of 128 tokens (depth 4096 adds a 4096-id prefill): ~1 min a process, ~25-30 min.
+kind: noninf
+question: does the PR head's qwen3moe host program decode and prefill no slower than main's?
+term: decode tok/s @ n=128, depth 6 and 4096, and pp tok/s of the 4096-id prefill, Qwen3-30B-A3B Q4_K_M, A6000 -
+  (head - main) / main, paired by round
+unit: %
+predict: -0.3..+0.3
+rounds: 6
+sd: 0.6 % same-binary per round, AGENTS.md 「Know the ruler」
+margin: 1.5 % the PR moves no kernel; a loss past the ruler's floor would be a host defect in the walk
+condition: just depth-gpu-qwen3moe in one lease on the PR tree's build, arms 6 bin:<main>:6 4096 bin:<main>:4096,
+  order rotated every round; no FAIL row, no [cold], [cpu-busy] or [other-busy] row; the full output to a file
+decide-in: merge #666
+decide-below: read the prompt rows first (the eager path is the only one the walk runs in); one nsys window of the
+  4096-id prefill on both binaries before any change
+decide-above: a gain the derivation does not hold: check both rows' plan and ubatch lines are equal before reading it

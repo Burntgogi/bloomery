@@ -15,3 +15,4 @@ nemotron_h	NemotronH	yes	no	nemotron
 nemotron_h_moe	NemotronHMoe	yes	no	nemotron-bolt
 gemma-embedding	GemmaEmbedding	yes	no	-
 gemma-embedding2	GemmaEmbedding2	yes	no	-
+flint	Flint	yes	no	-

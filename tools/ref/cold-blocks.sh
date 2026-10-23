@@ -86,10 +86,15 @@ FAILED=() FAILED_KEYS=()
 # arm_fail <round> <label> <d=|p=key> <rc> <why> [<output>]: the FAIL row in place of the arm's row; the
 # output, when there is one, goes whole to a file (a loader's reason is many lines above its tail).
 arm_fail() {
-  local r=$1 label=$2 key=$3 rc=$4 why=$5 out=${6:-} f='' last
+  local r=$1 label=$2 key=$3 rc=$4 why=$5 out=${6:-} f='' last=''
   if [ -n "$out" ]; then
-    f=${TMPDIR:-/tmp}/$ARM_FAIL_STEM-${label//[^A-Za-z0-9_.=-]/_}-${key/=/}-r$r.log
-    printf '%s\n' "$out" > "$f"
+    if f=$(mktemp "${TMPDIR:-/tmp}/$ARM_FAIL_STEM-XXXXXX") &&
+      printf 'FAIL r%s %s %s rc=%s\n%s\n' "$r" "$label" "$key" "$rc" "$out" > "$f"; then
+      :
+    else
+      f=''
+      why="$why; cannot save full output"
+    fi
     last=$(printf '%s\n' "$out" | grep -v '^[[:space:]]*$' | tail -n 1)
     echo "$out" | tail -n 20 >&2
     [ -z "$last" ] || why="$why; last line: $last"
@@ -499,8 +504,30 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = --self-test ]; then
   # discard's without one (in the list, dropping nothing), and the drop of a counted arm's label at its key.
   TMPDIR=$(mktemp -d) ARM_FAIL_STEM=runner CPU_BUSY_TAG='' OTHER_BUSY_TAG=' [other-busy]'
   row=$(arm_fail 1 lcpppp4096 p=4096 134 "no 'pp4096' row" "$(printf 'load\nggml_cuda_error: x\n\n')" 2> /dev/null)
-  check fail-row "$row" "FAIL r1 lcpppp4096 p=4096 rc=134 | no 'pp4096' row; last line: ggml_cuda_error: x | full output: $TMPDIR/runner-lcpppp4096-p4096-r1.log [other-busy]"
-  check fail-file "$(cat "$TMPDIR/runner-lcpppp4096-p4096-r1.log" 2> /dev/null | head -n 2 | paste -sd'|' -)" "load|ggml_cuda_error: x"
+  f=${row##*full output: } f=${f% [*}
+  check fail-row "$row" "FAIL r1 lcpppp4096 p=4096 rc=134 | no 'pp4096' row; last line: ggml_cuda_error: x | full output: $f [other-busy]"
+  check fail-file "$(tail -n 2 "$f" 2> /dev/null | paste -sd'|' -)" "load|ggml_cuda_error: x"
+  prev=$f
+  for label in a/b a:b a:b "$(printf '%0300d' 0)"; do
+    row=$(arm_fail 1 "$label" d=4 1 reason "body $label" 2> /dev/null)
+    f=${row##*full output: } f=${f% [*}
+    check fail-unique "$([ "$f" != "$prev" ] && [ -f "$f" ] && echo yes)" yes
+    check fail-label "$(head -n 1 "$f" 2> /dev/null)" "FAIL r1 $label d=4 rc=1"
+    check fail-body "$(tail -n 1 "$f" 2> /dev/null)" "body $label"
+    check fail-preserved "$(tail -n 1 "$prev" 2> /dev/null)" "${body:-ggml_cuda_error: x}"
+    prev=$f body="body $label"
+  done
+  row=$(arm_fail 1 ours d=4/long 1 reason body 2> /dev/null)
+  f=${row##*full output: } f=${f% [*}
+  check fail-key "$([ -f "$f" ] && head -n 1 "$f")" 'FAIL r1 ours d=4/long rc=1'
+  for mode in create write; do
+    row=$(
+      if [ "$mode" = create ]; then TMPDIR=$TMPDIR/absent
+      else mktemp() { printf '%s\n' "$TMPDIR"; }; fi
+      arm_fail 1 ours d=4 1 reason body 2> /dev/null
+    )
+    check fail-save-$mode "$([[ $row = *'cannot save full output'* && $row != *'full output: '* ]] && echo yes)" yes
+  done
   arm_fail 1 lcpppp4096 p=4096 134 "no 'pp4096' row" > /dev/null
   ROW_TAG=DISCARD
   row=$(arm_fail 0 'ours@X=1' d=6 3 "exited 3")

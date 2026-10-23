@@ -172,7 +172,7 @@ jobs:
           mkdir -p diag
           gh api --paginate "repos/$REPO/pulls/$PR/files" --jq '.[] | select(.status != "removed") | .filename' > diag/changed.txt
           # Never fails the job: a tool that cannot run is named in diagnostics.md, which the reviewer reads.
-          gh api "repos/$REPO/pulls/$PR" -H 'Accept: application/vnd.github.diff' > diag/diff.patch
+          bash trusted/tools/review/pr-diff.sh "$REPO" "$PR" pr diag/diff.patch
           ub="$HOME/.cache/bloomery-review/ub/venv/bin"
           s=$(date +%s)
           python3 trusted/tools/review/diagnostics.py --base "$PWD/base" --pr "$PWD/pr" --changed diag/changed.txt \
@@ -274,7 +274,7 @@ jobs:
             fi
           fi
           if [ "$mode" != incremental ]; then
-            gh api "repos/$REPO/pulls/$PR" -H 'Accept: application/vnd.github.diff' > ctx/diff.patch
+            bash base/tools/review/pr-diff.sh "$REPO" "$PR" pr ctx/diff.patch
           fi
           gh api --paginate "repos/$REPO/pulls/$PR/files" --jq '.[] | "\(.status)\t+\(.additions)\t-\(.deletions)\t\(.filename)"' > ctx/files.txt
           gh api --paginate "repos/$REPO/issues?labels=review-bot&state=open&per_page=100" --jq '.[] | "#\(.number) \(.title)"' > ctx/open-issues.txt

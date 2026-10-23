@@ -123,9 +123,7 @@ use super::program38::{
     Ctx38, Kernels38, Parts38, Pass38, RowsCopy, STEP_MEMOPS, Seqs38, SlotSeq38, Step38, Verify38,
     seq_launches, step_launches, verify_launches,
 };
-use super::scratch::{
-    Io, LANE, LaneWord, PassRecord, RecStore, RopeRows, StepParams, f32_view, stamps_at,
-};
+use super::scratch::{Io, LANE, LaneWord, PassRecord, RecStore, RopeRows, StepParams, stamps_at};
 use super::scratch38::{
     Arena38, LANES, PASS_ROWS, Store38, Taps38, VERIFY_ROWS, WideRecord, dims, store_rule_bytes,
 };
@@ -134,7 +132,7 @@ use super::swap38::{self, DEADLINE, LIVE_DELAY};
 use super::tier38::{TierSide38, open_tier};
 use super::ubatch::UBATCH as UBATCH_MOST;
 use super::wide38::{
-    Gemm38, STREAM_FLOOR, SplitWalk, Wide38, WideForce, WideParts, WideTaps, dense_rows,
+    Gemm38, PleRowsIn, STREAM_FLOOR, SplitWalk, Wide38, WideForce, WideParts, WideTaps, dense_rows,
     route_taps_host,
 };
 use crate::checkpoint::saved::{
@@ -163,7 +161,7 @@ use crate::prompt_timing::{PromptStats, PromptTiming, nanos};
 use crate::rope_table::{RopeSpec, RopeTable};
 use crate::tensor::WindowMut;
 use crate::weights::{Weights, tensor_scales};
-use crate::{DeviceTensor, Gpu, GpuError, launch_u32, ple};
+use crate::{Branch, DeviceTensor, Gpu, GpuError, launch_u32, ple};
 use bloomery_levers::{ChurnHosting, HostCfg};
 use cuda_core::{CudaStream, DeviceBuffer};
 use engram::hash::{History, Window};
@@ -256,7 +254,8 @@ impl SeqView for Seq38 {
 /// address whichever is live — the same rule a slot's own captures follow,
 /// each slot's graphs addressing the buffers that were live at their
 /// capture. A pass of several slots leaves a parked slot's rows in its own
-/// buffer by a copy ([`RowsCopy`]).
+/// buffer by a copy ([`RowsCopy`]), or, for the first slot of a pass that
+/// runs no row of slot 0, by walking into that buffer ([`stands_in`]).
 pub struct Slot38 {
     stores: Vec<Store38>,
     ple_ring: DeviceBuffer<f32>,
@@ -480,6 +479,7 @@ struct PleHost {
 /// them computes ([`PleHost::prompt_start`]).
 struct PleRead {
     rows: Prefetcher,
+    planes: usize,
     /// A prompt call's ubatches not yet filled, in order; while `flight`
     /// holds, the front's rows are on the helper.
     ahead: VecDeque<PleBatch>,
@@ -505,19 +505,38 @@ impl PleRead {
         stored: Option<&StoredRows>,
         name: &str,
         max_rows: usize,
+        expected_rows: usize,
     ) -> Result<PleRead, GpuError> {
         let table: Arc<dyn RowTables> = match stored {
             None => Arc::new(
                 SplitTable::open(Arc::clone(file), name).map_err(|e| GpuError::plan(WHAT, e))?,
             ),
-            Some(s) => Arc::new(
-                RunTable::open(name, s.row_bytes, &s.runs, PageAdvice::Random)
-                    .map_err(|e| GpuError::plan(WHAT, e))?,
-            ),
+            Some(s) => {
+                let open = |p: &model::part::StoredPlane| {
+                    let table = RunTable::open(name, p.row_bytes, &p.runs, PageAdvice::Random)
+                        .map_err(|e| GpuError::plan(WHAT, e))?;
+                    if table.rows() != expected_rows as u64 {
+                        return Err(GpuError::shape(
+                            WHAT,
+                            format!(
+                                "{name}: source plane has {} rows, the table {expected_rows}",
+                                table.rows()
+                            ),
+                        ));
+                    }
+                    Ok(table)
+                };
+                let values = open(&s.values)?;
+                match &s.block_scales {
+                    None => Arc::new(values),
+                    Some(scales) => Arc::new(vec![values, open(scales)?]),
+                }
+            }
         };
+        let planes = table.count();
         let rows = Prefetcher::over(
             table,
-            &[max_rows],
+            &[max_rows; 2][..planes],
             HelperOptions {
                 mode: FillMode::Touch,
                 cpu: caller_sibling(),
@@ -527,6 +546,7 @@ impl PleRead {
         .map_err(|e| GpuError::plan(WHAT, e))?;
         Ok(PleRead {
             rows,
+            planes,
             ahead: VecDeque::new(),
             flight: false,
         })
@@ -541,11 +561,10 @@ impl PleRead {
         Ok(())
     }
 
-    /// `ids`, the rows of the fill of `n` positions at `pos`, copied to
-    /// [`Prefetcher::filled`]: the batch read ahead when it is this fill's,
-    /// else read now; then the next ubatch read ahead goes to the helper, to
-    /// run while this one computes.
-    fn read(&mut self, pos: u32, n: usize, ids: &[u32]) -> Result<(), GpuError> {
+    /// `ids`, the rows of the fill of `n` positions at `pos`, on the helper:
+    /// the batch read ahead when it is this fill's, else submitted now.
+    /// [`PleRead::finish`] takes them.
+    fn start(&mut self, pos: u32, n: usize, ids: &[u32]) -> Result<(), GpuError> {
         let own = self
             .ahead
             .front()
@@ -558,14 +577,27 @@ impl PleRead {
         }
         if !self.flight {
             self.rows
-                .submit([ids])
+                .submit(std::iter::repeat_n(ids, self.planes))
                 .map_err(|e| GpuError::plan(WHAT, e))?;
+            self.flight = true;
         }
-        self.flight = false;
+        Ok(())
+    }
+
+    /// The started fill's rows ([`PleRead::start`]) copied to
+    /// [`Prefetcher::filled`]; then the next ubatch read ahead goes to the
+    /// helper, to run while this one computes.
+    fn finish(&mut self) -> Result<(), GpuError> {
+        if !std::mem::take(&mut self.flight) {
+            return Err(GpuError::state(
+                WHAT,
+                "a PLE fill finished before it started",
+            ));
+        }
         self.rows.wait().map_err(|e| GpuError::plan(WHAT, e))?;
         if let Some(next) = self.ahead.front() {
             self.rows
-                .submit([next.ids.as_slice()])
+                .submit(std::iter::repeat_n(next.ids.as_slice(), self.planes))
                 .map_err(|e| GpuError::plan(WHAT, e))?;
             self.flight = true;
         }
@@ -607,8 +639,8 @@ impl PleHost {
     /// `cap` positions, read from `tier` — the plan's
     /// ([`Plan::row_tier`]): the host, or the NVMe tier through its reader
     /// ([`PleRead`]); any other tier is refused by name. A checkpoint
-    /// folder's table (`file` its header) is read where `stored` holds its F8
-    /// rows, at its scale, from the NVMe tier alone. Load-time only.
+    /// folder's table (`file` its header) is read from its stored value and
+    /// optional block-scale planes, from the NVMe tier alone. Load-time only.
     fn new(
         file: Arc<Split>,
         stored: Option<&StoredRows>,
@@ -648,9 +680,13 @@ impl PleHost {
         let decode = match (info.ty, stored) {
             (GgmlType::IQ4_NL, None) => PleRows::Iq4Nl,
             (GgmlType::F8E4M3_ROWS, _) => PleRows::F8(Box::new(E4m3Rows::new(scale()?))),
-            (GgmlType::NVFP4_ROWS, None) => PleRows::Nvfp4(Box::new(Nvfp4Rows::new(scale()?))),
+            (GgmlType::NVFP4_ROWS, _) => PleRows::Nvfp4(Box::new(Nvfp4Rows::new(scale()?))),
             (_, None) => return Err(refuse("IQ4_NL, F8 or NVFP4 rows")),
-            (_, Some(_)) => return Err(refuse("F8 rows where a checkpoint folder stores them")),
+            (_, Some(_)) => {
+                return Err(refuse(
+                    "F8 or NVFP4 rows where a checkpoint folder stores them",
+                ));
+            }
         };
         let (Some(blck), Some(size)) = (info.ty.blck_size(), info.ty.type_size()) else {
             return Err(refuse("a sized type"));
@@ -660,11 +696,23 @@ impl PleHost {
             return Err(refuse("rows of a whole part of the model width"));
         }
         let row_bytes = width / blck * size;
-        if rows == 0
-            || info.nbytes != (rows * row_bytes) as u64
-            || stored.is_some_and(|s| s.row_bytes != row_bytes as u64)
-        {
+        if rows == 0 || rows.checked_mul(row_bytes).map(|n| n as u64) != Some(info.nbytes) {
             return Err(refuse("a whole number of rows"));
+        }
+        if let Some(s) = stored {
+            let fits = match (info.ty, &s.block_scales) {
+                (GgmlType::F8E4M3_ROWS, None) => s.values.row_bytes == width as u64,
+                (GgmlType::NVFP4_ROWS, Some(scales)) => {
+                    s.values.row_bytes == (width / 2) as u64
+                        && scales.row_bytes == (width / 16) as u64
+                }
+                _ => false,
+            };
+            if !fits {
+                return Err(refuse(
+                    "value and block-scale planes of the table's row type",
+                ));
+            }
         }
         let nvme = match tier {
             Device::Host if stored.is_some() => {
@@ -673,7 +721,7 @@ impl PleHost {
                 ));
             }
             Device::Host => None,
-            Device::Nvme => Some(PleRead::open(&file, stored, &name, cap * per_token)?),
+            Device::Nvme => Some(PleRead::open(&file, stored, &name, cap * per_token, rows)?),
             Device::Card(_) | Device::Unused => {
                 return Err(refuse(
                     "on the host or the NVMe tier, where the plan reads it",
@@ -701,7 +749,7 @@ impl PleHost {
     /// `tokens.len()` positions of `e`, and the history past them, returned:
     /// the history stays where it stands until the call's launch takes the
     /// returned one ([`Body38::launch`]). On the NVMe tier the rows come
-    /// from the reader's copy ([`PleRead::read`]), on the host from the
+    /// from the reader's copy ([`PleRead::finish`]), on the host from the
     /// mapping. A token the hash refuses (the image placeholder, an id past
     /// the vocabulary), a position other than the history's next, or a row
     /// past the table is refused by name.
@@ -713,8 +761,23 @@ impl PleHost {
     /// the unit's image spans as row ranges of `tokens`
     /// ([`Hash::ple_rows_media`]), inside which the image placeholder
     /// hashes like any id and the history takes it; outside them it is
-    /// refused as in `fill`.
+    /// refused as in `fill`. The rows named ([`PleHost::name_spanned`]),
+    /// then decoded ([`PleHost::decode`]).
     fn fill_spanned(
+        &mut self,
+        pos: u32,
+        tokens: &[u32],
+        spans: &[Range<usize>],
+    ) -> Result<History, GpuError> {
+        let hist = self.name_spanned(pos, tokens, spans)?;
+        self.decode()?;
+        Ok(hist)
+    }
+
+    /// [`PleHost::fill_spanned`]'s rows named and the history past them
+    /// returned, every refusal made; on the NVMe tier their read started
+    /// ([`PleRead::start`]). [`PleHost::decode`] takes them.
+    fn name_spanned(
         &mut self,
         pos: u32,
         tokens: &[u32],
@@ -738,6 +801,15 @@ impl PleHost {
                 format!("PLE row {r} past the table's {} rows", self.rows),
             ));
         }
+        if let Some(read) = &mut self.nvme {
+            read.start(pos, n, &self.ids[..self.named])?;
+        }
+        Ok(hist)
+    }
+
+    /// The rows [`PleHost::name_spanned`] named, decoded into the first
+    /// positions of `e`.
+    fn decode(&mut self) -> Result<(), GpuError> {
         let (ids, rb) = (&self.ids[..self.named], self.row_bytes);
         match &mut self.nvme {
             None => {
@@ -750,7 +822,7 @@ impl PleHost {
                 ple_decode(&mut self.e, self.width, &self.decode, rows)?;
             }
             Some(read) => {
-                read.read(pos, n, ids)?;
+                read.finish()?;
                 let filled = read.rows.filled();
                 if filled.len() != ids.len() * rb {
                     return Err(GpuError::shape(
@@ -762,24 +834,52 @@ impl PleHost {
                         ),
                     ));
                 }
-                ple_decode(
-                    &mut self.e,
-                    self.width,
-                    &self.decode,
-                    filled.chunks_exact(rb),
-                )?;
+                match (&self.decode, read.planes) {
+                    (PleRows::Nvfp4(fp4), 2) => {
+                        let (codes, scales) = filled.split_at(filled.len() / 9 * 8);
+                        fp4.decode_planes(codes, scales, &mut self.e[..ids.len() * self.width])
+                            .map_err(model::ModelError::from)?;
+                    }
+                    (_, 1) => ple_decode(
+                        &mut self.e,
+                        self.width,
+                        &self.decode,
+                        filled.chunks_exact(rb),
+                    )?,
+                    _ => return Err(GpuError::state(WHAT, "the PLE reader's storage planes")),
+                }
             }
         }
-        Ok(hist)
+        Ok(())
     }
 
-    /// Read a Gemm call's ubatches ahead: `tokens` at `pos`, cut into
-    /// ubatches of at most `rows` ([`ubatch_cut`], the cut the call runs),
-    /// each one's row ids computed now from a clone of the history walked
-    /// as the fills will walk it. The first ubatch's fill reads its own
-    /// rows, the call's one exposed read; each fill then hands the helper
-    /// the next ubatch's ([`PleRead::read`]). On the host nothing is read
-    /// ahead: the fills decode pages the load populated. A call whose rows
+    /// The decoded rows of the first `n` positions copied to an arena's
+    /// `e`, its first `n · HIDDEN` values: one synchronous copy.
+    fn upload(
+        &self,
+        stream: &CudaStream,
+        e: &mut DeviceBuffer<f32>,
+        n: usize,
+    ) -> Result<(), GpuError> {
+        let len = n * geo::HIDDEN;
+        let mut w = WindowMut::<f32>::of_mut(e, 0, len)?;
+        let src = self
+            .e
+            .get(..len)
+            .ok_or_else(|| GpuError::shape(WHAT, format!("{n} PLE positions at once")))?;
+        w.copy_from_host(stream, src)?;
+        Ok(())
+    }
+
+    /// Read a Gemm call's ubatches ahead: `tokens` at `pos`, cut into the
+    /// ubatches `cut` ([`call_units`], the cut the call runs across its
+    /// checkpoints), each one's row ids computed now from a clone of the
+    /// history walked as the fills will walk it. The first ubatch's fill
+    /// reads its own rows, the call's one read no walk hides but its own
+    /// layers before the PLE site on a walk that serves no host leg
+    /// ([`Body38::stage_gemm`]); each fill then hands the helper the next
+    /// ubatch's ([`PleRead::finish`]). On the host nothing is read ahead: the
+    /// fills decode pages the load populated. A call whose rows
     /// the hash refuses reads nothing ahead, and its first fill refuses it
     /// by name. `spans` are the call's image spans as position ranges
     /// ([`MediaRows::positions`]); each ubatch hashes its own part of them
@@ -788,7 +888,7 @@ impl PleHost {
         &mut self,
         pos: u32,
         tokens: &[u32],
-        rows: usize,
+        cut: impl IntoIterator<Item = usize>,
         spans: &[Range<usize>],
     ) -> Result<(), GpuError> {
         let Some(read) = &mut self.nvme else {
@@ -799,7 +899,7 @@ impl PleHost {
         let per_token = geo::HIDDEN / self.width;
         let mut hist = self.hist.clone();
         let mut at = 0usize;
-        for m in ubatch_cut(tokens.len(), rows) {
+        for m in cut {
             let Some(p) = u32::try_from(at).ok().and_then(|a| pos.checked_add(a)) else {
                 break;
             };
@@ -1102,6 +1202,8 @@ pub struct Body38 {
     rp: PassRecord<PASS_ROWS>,
     pass_hsum: DeviceBuffer<f32>,
     k: Kernels38,
+    /// The stream every walk's shared expert runs on beside its card leg.
+    branch: Branch,
     /// The slot map's card copy, and the card leg over its card experts. The
     /// host tier holds the host copy, and its residency machine, when it runs
     /// one, this `Arc`: the buffer lives until both let go.
@@ -1145,6 +1247,10 @@ pub struct Body38 {
     held: u32,
     /// The call planned and not yet launched.
     staged: Option<Staged38>,
+    /// The staged ubatch's PLE rows are named and on their read, not yet
+    /// decoded into its arena: its walk copies them in at the PLE site
+    /// ([`Body38::stage_gemm`]).
+    ple_late: bool,
     /// The sequence slots the load's plan was made for ([`Slots`]), and how
     /// many stand: the load's own sequence plus every [`Slots::new_seq`]. A
     /// sequence past the plan is refused by name.
@@ -1229,8 +1335,8 @@ type CardParts =
 /// header its plan was made from), its card tensors through its part source, and the PLE
 /// table's rows where the folder stores them, which the table's NVMe reader maps
 /// ([`StoredRows`]). The load holds every tensor on its one card and the PLE table on the NVMe
-/// tier ([`crate::parts::OnCard`]): no host set, so no residency machine, and the folder's MTP
-/// layers are not read, so no draft. Each card part's file pages leave the page cache once it is
+/// tier ([`crate::parts::OnCard`]): no host set, so no residency machine. The part source also
+/// reads the folder's MTP tensors when a draft is planned. Each part's pages leave the cache once it is
 /// staged under the host config's `card_dontneed`, as a split's card segments do.
 pub struct Folder38 {
     header: Split,
@@ -1249,27 +1355,24 @@ impl Folder38 {
         Folder38 {
             header,
             parts: Box::new(move |stream, plan, card, release| {
-                crate::parts::load_placed(stream, &source, plan, card, release)
+                let selected = model::part::Filtered {
+                    source: &source,
+                    keep: |name: &str| plan.model.tensors.iter().any(|t| t.name == name),
+                };
+                crate::parts::load_placed(stream, &selected, plan, card, release)
             }),
             ple,
         }
     }
 }
 
-/// A folder's load under `residency`, `drafted` or not, refused by name unless it runs no
-/// residency machine and no draft ([`Folder38`]).
-fn refuse_folder(residency: Residency, drafted: bool) -> Result<(), GpuError> {
+/// A folder's load under `residency`, refused unless it runs no residency machine.
+fn refuse_folder(residency: Residency) -> Result<(), GpuError> {
     if residency != Residency::Off {
         return Err(GpuError::shape(
             WHAT,
             "a checkpoint folder's load runs under BLOOMERY_RESIDENCY=off: a residency machine \
              moves experts through a host set, which the folder's load does not hold",
-        ));
-    }
-    if drafted {
-        return Err(GpuError::shape(
-            WHAT,
-            "a checkpoint folder's load runs no MTP draft: the folder's MTP layers are not read",
         ));
     }
     Ok(())
@@ -1289,10 +1392,14 @@ impl Body38 {
     /// (`HostTier::check_tier_reserves`), a plan of more than one stage card
     /// or not every layer, a
     /// layer or a width the kernels do not take, a `ubatch` outside
-    /// `1..=min(UBATCH, ctx)`, and a ubatch arena past what the plan's
-    /// scratch counts. `file` is a GGUF split or a checkpoint folder
-    /// ([`Model38`]); a folder's load is refused by name under a residency
-    /// machine or with an MTP draft ([`Folder38`]).
+    /// `1..=min(UBATCH, ctx)`, a ubatch arena past what the plan's
+    /// scratch counts, and a stage card reserve for the card route's run
+    /// that the ubatch does not read (`place::card_route_run`). The card
+    /// route runs the whole ubatch at once on a card that reserves that run
+    /// (`place::widen_card_route`), else in runs of `ROUTE_ROWS` tokens.
+    /// `file` is a GGUF split or a checkpoint folder ([`Model38`]); a
+    /// folder's load is refused by name under a residency machine or with an
+    /// MTP draft ([`Folder38`]).
     pub fn open_placed(
         file: impl Into<Model38>,
         plan: &Plan<'_>,
@@ -1509,8 +1616,12 @@ impl Body38 {
             Model38::Folder(f) => (f.header, Some((f.parts, f.ple))),
         };
         if folder.is_some() {
-            refuse_folder(residency, mtp.is_some())?;
+            refuse_folder(residency)?;
         }
+        let draft_parts = folder.as_ref().and_then(|(parts, _)| {
+            mtp.filter(|(draft, _, _)| draft.shard_path(0) == file.shard_path(0))
+                .map(|_| parts.as_ref() as &crate::model::PartsLoad<'_>)
+        });
         let (bytes, stored) = match &folder {
             Some((parts, ple)) => (CardBytes::Parts(parts.as_ref()), ple.as_ref()),
             None => (CardBytes::File, None),
@@ -1541,7 +1652,15 @@ impl Body38 {
             .get(card)
             .ok_or_else(|| GpuError::shape(WHAT, format!("the plan has no card {card}")))?;
         let layers = spec.layers.clone();
-        let counted = model::placement::workstation::counted_arena_bytes(spec);
+        // The card route's run and the arena bytes the plan counts with it.
+        let (route_run, counted) = model::arch::qwen35moe::place::card_route_run(
+            spec,
+            ubatch as u64,
+            !plan.machine.tiers.is_empty(),
+        )
+        .map_err(|e| GpuError::shape(WHAT, e.to_string()))?;
+        let route_run = usize::try_from(route_run)
+            .map_err(|_| GpuError::shape(WHAT, "the card route's run passes usize"))?;
         if plan.machine.cards.len() != 1 || layers != (0..n) {
             return Err(GpuError::shape(
                 WHAT,
@@ -1573,7 +1692,9 @@ impl Body38 {
             |stream, _, layers, w| Body38::derive(stream, &shape.kinds, layers, w),
             |gpu, file, w, set, glue| {
                 let draft = mtp
-                    .map(|(d, m, p)| Mtp38::open(gpu, w, d, m, p, host.card_dontneed, slots))
+                    .map(|(d, m, p)| {
+                        Mtp38::open(gpu, w, (d, draft_parts), m, p, host.card_dontneed, slots)
+                    })
                     .transpose()?;
                 let mut body = Body38::load_placed(
                     gpu,
@@ -1585,7 +1706,7 @@ impl Body38 {
                     host,
                     set,
                     glue,
-                    (ubatch, counted, slots),
+                    (ubatch, route_run, counted, slots),
                 )?;
                 if let Some(mut d) = draft {
                     let rows = body.rope.table.len() / body.rope.width;
@@ -1638,7 +1759,7 @@ impl Body38 {
     /// sized ([`HostServed::start_residency`], the load's last step).
     #[allow(
         clippy::too_many_arguments,
-        reason = "the load's card handle, file with its stored PLE rows, weights, plan, inputs and chain shape, the host tier's residency and levers, the residency glue, and the ubatch with the arena bytes the plan counts and the planned slots (rust-quality R8)"
+        reason = "the load's card handle, file with its stored PLE rows, weights, plan, inputs and chain shape, the host tier's residency and levers, the residency glue, and the ubatch with the card route's run, the arena bytes the plan counts and the planned slots (rust-quality R8)"
     )]
     fn load_placed(
         gpu: &Gpu,
@@ -1650,7 +1771,7 @@ impl Body38 {
         host: HostCfg,
         set: HostResidency,
         residency_glue: ResidencyGlue,
-        (ub, counted, planned): (usize, u64, usize),
+        (ub, route_run, counted, planned): (usize, usize, u64, usize),
     ) -> Result<Body38, GpuError> {
         let (spec, hp) = (&inputs.spec, &inputs.hp);
         let n = spec.layers.len();
@@ -1727,8 +1848,8 @@ impl Body38 {
         let stacks = swap38::stacks(&inputs.model, plan)?;
         // A residency machine moves experts to the host after the load, and
         // the host service writes a route trace: either keeps every host leg.
-        let keep_host = residency_glue.source().is_some() || host.route_trace;
-        let card = Card38::new(gpu, w, &stacks, &map, n, keep_host)?;
+        let machine = residency_glue.source().is_some();
+        let card = Card38::new(gpu, w, &stacks, &map, n, machine || host.route_trace)?;
         // A tier layer's join sums the card's slots and the tier's in one
         // launch, which a layer with no card expert does not run.
         if let Some(l) = run
@@ -1752,7 +1873,7 @@ impl Body38 {
         let tier = (!tiers.is_empty())
             .then(|| TierSide38::new(gpu, &map, cols))
             .transpose()?;
-        let mut wide = Wide38::new(stream, ub, &card, tier.is_some())?;
+        let mut wide = Wide38::new(stream, ub, route_run, &card, tier.is_some())?;
         let wide_bytes = (wa.bytes() + wr.bytes() + wide_hsum.num_bytes() + wide.bytes()) as u64;
         if wide_bytes > counted {
             return Err(GpuError::shape(
@@ -1777,10 +1898,8 @@ impl Body38 {
             ff: geo::FF,
             n_used: geo::N_USED,
         };
-        // The host run holds the layers with a host leg alone: a layer that
-        // keeps every expert on the card has no host view, so its stacks may
-        // be of a type no host kernel reads (NVFP4).
-        let hosted: Vec<usize> = run.clone().filter(|&l| !card.hostless(l)).collect();
+        let hosted: Vec<usize> =
+            HostRun::viewed(run.clone(), machine, (|l| card.n_card(l), geo::EXPERTS)).collect();
         let mut experts = crate::model::host_run(
             gpu.context(),
             plan,
@@ -1911,6 +2030,7 @@ impl Body38 {
             rp,
             pass_hsum,
             k: Kernels38::load(gpu)?,
+            branch: Branch::new(gpu.stream_handle())?,
             slots,
             card,
             tier,
@@ -1930,6 +2050,7 @@ impl Body38 {
             ctx,
             held: 0,
             staged: None,
+            ple_late: false,
             slots_planned: planned,
             slots_made: 1,
             slot_in: (planned > 1).then(|| SlotIn::new(stream)).transpose()?,
@@ -1993,15 +2114,15 @@ impl Body38 {
     }
 
     /// The streams' buffer that holds the target's hidden rows after a walk
-    /// of `walk`'s arena ran its head: the walk's current buffer flips once
-    /// at each PLE layer past layer 0.
+    /// of `walk`'s arena left them final ([`TargetRows`]): the walk's current
+    /// buffer flips once at each PLE layer past layer 0.
     fn final_streams(&self, walk: TargetRows) -> &DeviceBuffer<f32> {
         final_streams(&self.plans, [&self.s, &self.a, &self.wa], walk)
     }
 
     /// The target's hidden rows `0..rows` after a walk of `walk`'s arena
-    /// that ran its head, four streams of [`geo::HIDDEN`] a row. Blocking;
-    /// gate use.
+    /// that left them final ([`TargetRows`]), four streams of
+    /// [`geo::HIDDEN`] a row. Blocking; gate use.
     pub fn target_streams(
         &self,
         gpu: &Gpu,
@@ -2118,6 +2239,25 @@ impl Body38 {
             head,
             mode,
         )
+    }
+
+    /// The draft's program and its context over this body's own pieces, for
+    /// a store walk of several sequences' rows ([`Mtp38::store_rows`],
+    /// [`Mtp38::append_store`]).
+    fn mtp_with<T>(
+        &mut self,
+        gpu: &Gpu,
+        w: &Weights,
+        f: impl FnOnce(&mut Mtp38, &MtpCtx<'_>) -> Result<T, GpuError>,
+    ) -> Result<T, GpuError> {
+        let Body38 {
+            mtp, k, rope, eps, ..
+        } = self;
+        let d = mtp.as_mut().ok_or(GpuError::state(
+            WHAT,
+            "an MTP draft (Body38::open_placed_mtp)",
+        ))?;
+        f(d, &mtp_ctx(gpu, w, k, *eps, &rope.table))
     }
 
     /// One window's chain of the draft's program ([`Mtp38::run_chain`])
@@ -2276,7 +2416,15 @@ impl Body38 {
     /// a walk since the load. Gate use.
     #[must_use]
     pub fn ubatch_units(&self) -> usize {
-        self.wide.walked_units
+        self.wide.walked_units()
+    }
+
+    /// The tokens one run of the ubatch walk's card route takes
+    /// (`place::card_route_run`); `None` on a load whose slot map puts no
+    /// routed expert on the card. Gate use.
+    #[must_use]
+    pub fn card_route_run(&self) -> Option<usize> {
+        self.wide.card.as_ref().map(|c| c.run)
     }
 
     /// Whether a returning prompt call ([`super::wide38`]'s module doc) runs
@@ -3274,16 +3422,15 @@ impl Body38 {
         let hist = self.ple.fill(pos, tokens)?;
         self.last_walk = TargetRows::Pass;
         self.rp.write(stream, tokens, pos)?;
-        // SAFETY: the pass arena holds `PASS_ROWS · HIDDEN` rows of `e` and
-        // `n <= PASS_ROWS` (the record's write refused more), and `e` stays in
-        // place while the window lives (one synchronous copy).
-        let mut e = unsafe { f32_view(&self.a.ple.e, 0, n * geo::HIDDEN) };
-        e.copy_from_host(stream, &self.ple.e[..n * geo::HIDDEN])?;
+        self.ple.upload(stream, &mut self.a.ple.e, n)?;
         self.stage(pos, n, hist, None)
     }
 
     /// Launch the planned pass of `m` rows from `pos` through the batch
-    /// port, then the head of its last row into `head` when given.
+    /// port, then the head of its last row into `head` when given; with no
+    /// head and `finals` (a reader of the pass's final rows: the call's tap,
+    /// or the checkpoint after it, [`Body38::take_mark`]) the last layer's
+    /// combine alone over them ([`Pass38::finals`]).
     fn walk_pass(
         &mut self,
         gpu: &Gpu,
@@ -3291,6 +3438,7 @@ impl Body38 {
         m: usize,
         pos: u32,
         head: Option<&mut Head>,
+        finals: bool,
     ) -> Result<(), GpuError> {
         if !(1..=self.a.rows).contains(&m) {
             return Err(GpuError::shape(
@@ -3314,6 +3462,7 @@ impl Body38 {
             a,
             pass_hsum,
             k,
+            branch,
             slots,
             card,
             eps,
@@ -3322,6 +3471,7 @@ impl Body38 {
             ..
         } = self;
         let mut prog = Pass38 {
+            branch,
             p: Parts38 {
                 c: Ctx38 {
                     gpu,
@@ -3352,6 +3502,7 @@ impl Body38 {
         planted(plant, Plant::AfterLaunch)?;
         match head {
             Some(h) => prog.head(h),
+            None if finals => prog.finals(),
             None => Ok(()),
         }
     }
@@ -3360,11 +3511,12 @@ impl Body38 {
 impl Body38 {
     /// Plan a ubatch of `tokens` (1..=the load's size) at `pos`, where the
     /// stores stand: the map check ([`MapCheck::refuse`]), the armed
-    /// route taps' rows and the planted routes' positions, its PLE rows, its
-    /// record and its rows' copy to the ubatch arena, staged for
-    /// [`Body38::walk_gemm`]'s launch. Each refusal comes before anything
-    /// moves. With the timing armed, the plan's host wall is the prompt's
-    /// prologue.
+    /// route taps' rows and the planted routes' positions, its PLE rows (on
+    /// a walk that serves no host leg named and on their read, the walk
+    /// copying them in at its PLE site), its record and its rows' copy to
+    /// the ubatch arena, staged for [`Body38::walk_gemm`]'s launch. Each
+    /// refusal comes before anything moves. With the timing armed, the
+    /// plan's host wall is the prompt's prologue.
     fn plan_gemm(&mut self, stream: &CudaStream, tokens: &[u32], pos: u32) -> Result<(), GpuError> {
         let t0 = self.wide_timing.as_ref().map(|_| Instant::now());
         let r = self.stage_gemm(stream, tokens, pos);
@@ -3408,20 +3560,30 @@ impl Body38 {
         self.settle(stream)?;
         let unit = pos as usize..pos as usize + n;
         let spans = window_spans(self.media.iter().flat_map(MediaRows::positions), &unit);
-        let hist = self.ple.fill_spanned(pos, tokens, &spans)?;
+        // A walk that serves no host leg (every layer's routed experts on the
+        // card, `Card38::hostless`, and no expert tier) enqueues nothing that
+        // waits for this thread, so it takes its rows at its PLE site and
+        // their read runs under the layers before it; any other walk copies
+        // them in now.
+        self.ple_late = self.tier.is_none() && (0..self.plans.len()).all(|l| self.card.hostless(l));
+        let hist = match self.ple_late {
+            true => self.ple.name_spanned(pos, tokens, &spans)?,
+            false => self.ple.fill_spanned(pos, tokens, &spans)?,
+        };
         self.last_walk = TargetRows::Ubatch;
         self.wr.write(stream, tokens, pos)?;
-        // SAFETY: the ubatch arena holds `wide.rows · HIDDEN` values of `e`
-        // and `n <= wide.rows` (the record's write refused more), and `e`
-        // stays in place while the window lives (one synchronous copy).
-        let mut e = unsafe { f32_view(&self.wa.ple.e, 0, n * geo::HIDDEN) };
-        e.copy_from_host(stream, &self.ple.e[..n * geo::HIDDEN])?;
+        if !self.ple_late {
+            self.ple.upload(stream, &mut self.wa.ple.e, n)?;
+        }
         self.stage(pos, n, hist, None)
     }
 
     /// Launch the planned ubatch of `m` rows from `pos` through the batch
     /// port at its width, then the head of its last row into `head` when
-    /// given.
+    /// given; with `finals` (a reader of the walk's final rows: the call's
+    /// tap, or the checkpoint after it, [`Body38::take_mark`]) the last
+    /// layer's combine alone first, over every unit the head's mix leaves
+    /// ([`Gemm38::finals`]).
     fn walk_gemm(
         &mut self,
         gpu: &Gpu,
@@ -3429,6 +3591,7 @@ impl Body38 {
         m: usize,
         pos: u32,
         head: Option<&mut Head>,
+        finals: bool,
     ) -> Result<(), GpuError> {
         if !(1..=self.wide.rows).contains(&m) {
             return Err(GpuError::shape(
@@ -3439,6 +3602,7 @@ impl Body38 {
         let dense = dense_rows(pos as usize, m, self.ctx)?;
         planted(&mut self.plant, Plant::BeforeLaunch)?;
         self.launch(pos, m)?;
+        let late = std::mem::take(&mut self.ple_late);
         let io = Io {
             lane: Some(self.lane.word()),
             ..self.wr.io()
@@ -3448,6 +3612,7 @@ impl Body38 {
             plans,
             stores,
             ple_ring,
+            ple,
             rope,
             seq_rope,
             wa,
@@ -3465,6 +3630,10 @@ impl Body38 {
             plant,
             ..
         } = self;
+        let mut rows_in = |e: &mut DeviceBuffer<f32>| -> Result<(), GpuError> {
+            ple.decode()?;
+            ple.upload(gpu.stream(), e, m)
+        };
         let mut prog = Gemm38 {
             p: WideParts {
                 c: Ctx38 {
@@ -3490,13 +3659,23 @@ impl Body38 {
                 cur: 0,
                 stream,
                 media: media.as_mut(),
+                ple_rows: late.then_some(&mut rows_in as &mut PleRowsIn<'_>),
             },
         };
         let cap = prog.p.x.rows;
         let mut leg = BatchLeg::new(gpu.stream(), hybrid, wide_hsum, cap);
         leg.set_timer(wide_timing.as_mut());
         prog.walk(&mut leg)?;
+        if prog.p.ple_rows.is_some() {
+            return Err(GpuError::state(
+                WHAT,
+                "a ubatch walk past its PLE rows' site with the rows not copied in",
+            ));
+        }
         planted(plant, Plant::AfterLaunch)?;
+        if finals {
+            prog.finals(head.is_some())?;
+        }
         match head {
             Some(h) => prog.head(h),
             None => Ok(()),
@@ -3645,6 +3824,37 @@ fn ubatch_cut(n: usize, rows: usize) -> impl Iterator<Item = usize> {
     (0..n.div_ceil(rows)).map(move |i| rows.min(n - i * rows))
 }
 
+/// The units of a prompt call of `n` ids from position `from` on a path of
+/// units of at most `width` rows: each run up to the next of the call's
+/// checkpoint marks past `from` (`marks`, ascending, the call's end the last
+/// of them; none on a load that takes none), else up to the call's end, cut
+/// as [`ubatch_cut`] cuts it. A unit's rows, and whether a checkpoint is
+/// taken after it. The one cut of a call: its walks run it
+/// ([`GpuModel::feed38`]) and its PLE rows are read ahead by it
+/// ([`PleHost::prompt_start`]).
+fn call_units(from: u32, n: usize, width: usize, marks: &[u32]) -> Vec<(usize, bool)> {
+    let (from, end) = (from as usize, from as usize + n);
+    let mut stops: Vec<(usize, bool)> = marks
+        .iter()
+        .map(|&p| (p as usize, true))
+        .filter(|&(p, _)| p > from)
+        .collect();
+    if stops.last().is_none_or(|&(p, _)| p < end) {
+        stops.push((end, false));
+    }
+    let (mut units, mut at) = (Vec::new(), from);
+    for (stop, marked) in stops {
+        let k = (stop - at).div_ceil(width);
+        units.extend(
+            ubatch_cut(stop - at, width)
+                .enumerate()
+                .map(|(i, m)| (m, marked && i + 1 == k)),
+        );
+        at = stop;
+    }
+    units
+}
+
 impl GpuModel<Body38> {
     /// Arm (or disarm) the per-layer taps: after each layer the step copies
     /// its streams into the layer's tap, which [`Body38::taps`] reads back,
@@ -3701,9 +3911,13 @@ impl GpuModel<Body38> {
     /// called after each unit the path runs — every token's step, every
     /// pass, every ubatch — with the arena its rows' final streams sit in,
     /// the unit's first position and its rows, before the next unit
-    /// overwrites them. A `None` sink is [`GpuModel::prompt38`] itself: the
-    /// steps run as one call of the whole prompt; a sink's per-token steps
-    /// leave the same bits, a head readback a token.
+    /// overwrites them. A row the head's mix does not cover (a pass or a
+    /// ubatch before the last, a split walk's first unit) gets the last
+    /// layer's combine alone before the sink reads it; only a tap reads such
+    /// a row, so a call without one runs no such combine. A `None` sink is
+    /// [`GpuModel::prompt38`] itself: the steps run as one call of the whole
+    /// prompt; a sink's per-token steps leave the same bits, a head readback
+    /// a token.
     ///
     /// The call is one residency pass ([`crate::host::swap`]): its boundary
     /// before it and none inside — the passes and the ubatches run through
@@ -3870,12 +4084,12 @@ impl GpuModel<Body38> {
     }
 
     /// [`GpuModel::prompt38_with`]'s units ([`GpuModel::feed38`]); while the
-    /// load takes checkpoints ([`Body38::set_checkpoints`]) the call runs as
-    /// the runs between its marks (`Checkpoints::marks`: its start when it
-    /// continues a sequence, every [`CHECKPOINT_EVERY`] positions inside it,
-    /// its end), each on the path the whole call resolved to, a checkpoint
-    /// taken at every mark: a ubatch walk leaves the same bits cut there or
-    /// not, as a pass and a step do. The argmax after the last id.
+    /// load takes checkpoints ([`Body38::set_checkpoints`]) a checkpoint is
+    /// taken at each of the call's marks (`Checkpoints::marks`: its start
+    /// when it continues a sequence, every [`CHECKPOINT_EVERY`] positions
+    /// inside it, its end), the units cut there, each on the path the whole
+    /// call resolved to: a ubatch walk leaves the same bits cut there or not,
+    /// as a pass and a step do. The argmax after the last id.
     fn feed_marked(
         &mut self,
         tokens: &[u32],
@@ -3883,120 +4097,147 @@ impl GpuModel<Body38> {
         mut sink: Option<&mut Prompt38Sink<'_>>,
     ) -> Result<u32, GpuError> {
         const WHAT_M: &str = "qwen4exp prompt checkpoints";
-        let body = self.body(WHAT_M)?;
-        if !body.marks {
-            return self.feed38(tokens, path, sink);
-        }
         let from = self.pos();
         let to = launch_u32(WHAT_M, "positions", tokens.len())
             .ok()
             .and_then(|n| from.checked_add(n))
             .ok_or_else(|| GpuError::shape(WHAT_M, format!("{} ids from {from}", tokens.len())))?;
-        let marks = body.ckpt.marks(from, to);
+        let body = self.body(WHAT_M)?;
+        let marks = match body.marks {
+            true => body.ckpt.marks(from, to),
+            false => Vec::new(),
+        };
+        if path != Prompt38::Step {
+            return self.feed38(tokens, path, &marks, sink);
+        }
+        if marks.is_empty() {
+            return self.feed_steps(tokens, sink);
+        }
         let (mut next, mut at) = (None, from);
         for mark in marks {
             if mark > at {
                 let run = &tokens[(at - from) as usize..(mark - from) as usize];
-                next = Some(self.feed38(run, path, sink.as_deref_mut())?);
+                next = Some(self.feed_steps(run, sink.as_deref_mut())?);
                 at = mark;
             }
-            let pos = self.pos();
-            let (gpu, _, body) = self.body_parts(WHAT_M)?;
-            body.take_mark(gpu.stream(), pos)?;
+            self.mark_here(WHAT_M)?;
         }
         next.ok_or(GpuError::state(WHAT_M, "a mark at the call's end"))
     }
 
-    /// [`GpuModel::prompt38_with`]'s paths once its checks have passed, its
-    /// path resolved and its residency pass open: the resolved `path`'s
-    /// units.
+    /// The checkpoint at the model's position ([`Body38::take_mark`]).
+    fn mark_here(&mut self, what: &'static str) -> Result<(), GpuError> {
+        let pos = self.pos();
+        let (gpu, _, body) = self.body_parts(what)?;
+        body.take_mark(gpu.stream(), pos)
+    }
+
+    /// [`GpuModel::feed_marked`]'s steps: every token's body, one readback
+    /// at the end; under a tap a readback a token, the tap reading each
+    /// token's row where the step left it.
+    fn feed_steps(
+        &mut self,
+        tokens: &[u32],
+        sink: Option<&mut Prompt38Sink<'_>>,
+    ) -> Result<u32, GpuError> {
+        let Some(f) = sink else {
+            return self.step(tokens);
+        };
+        let mut next = None;
+        for &token in tokens {
+            next = Some(self.step(&[token])?);
+            let first = self.pos() - 1;
+            f(self, TargetRows::Step, first, 1)?;
+        }
+        next.ok_or(GpuError::state(
+            "qwen4exp prompt",
+            "a token read after the last step",
+        ))
+    }
+
+    /// [`GpuModel::prompt38_with`]'s passes or ubatches once its checks have
+    /// passed, its path resolved and its residency pass open: the call's
+    /// units ([`call_units`]), a checkpoint taken at each of `marks`
+    /// ([`GpuModel::feed_marked`]), and the head after the last unit alone.
+    /// A unit a checkpoint follows inside the call ends without the head: the
+    /// last layer's combine over its rows when the checkpoint keeps the last
+    /// one (the draft's point row, [`Body38::take_mark`]) or the tap reads
+    /// them, and the fault word read before the checkpoint copies a store.
     fn feed38(
         &mut self,
         tokens: &[u32],
         path: Prompt38,
+        marks: &[u32],
         mut sink: Option<&mut Prompt38Sink<'_>>,
     ) -> Result<u32, GpuError> {
         const WHAT_P: &str = "qwen4exp prompt";
         let tapped = sink.is_some();
-        match path {
-            Prompt38::Step => {
-                if !tapped {
-                    // The plain call: every token's body, one readback at the
-                    // end.
-                    return self.step(tokens);
-                }
-                // A tap reads each token's row where the step left it.
-                let mut next = None;
-                for &token in tokens {
-                    next = Some(self.step(&[token])?);
-                    let (first, rows) = (self.pos() - 1, 1usize);
-                    if let Some(f) = sink.as_deref_mut() {
-                        f(self, TargetRows::Step, first, rows)?;
-                    }
-                }
-                next.ok_or(GpuError::state(WHAT_P, "a token read after the last step"))
-            }
-            Prompt38::Gemm => {
-                let rows = self.body(WHAT_P)?.wide.rows;
-                // The call's PLE rows are read ahead: the first ubatch's fill
-                // reads its own, each later one's runs under the ubatch
-                // before it ([`PleHost::prompt_start`]).
-                let pos0 = self.pos();
-                {
-                    let (_, _, body) = self.body_parts(WHAT_P)?;
-                    let spans: Vec<_> = body.media.iter().flat_map(MediaRows::positions).collect();
-                    body.ple.prompt_start(pos0, tokens, rows, &spans)?;
-                }
-                let (mut next, mut at) = (None, 0);
-                for m in ubatch_cut(tokens.len(), rows) {
-                    let chunk = &tokens[at..at + m];
-                    at += m;
-                    let last = at == tokens.len();
-                    let pos = self.pos();
-                    {
-                        let (gpu, _, body) = self.body_parts(WHAT_P)?;
-                        body.plan_gemm(gpu.stream(), chunk, pos)?;
-                    }
-                    next = self.run_rows(m, WHAT_P, |gpu, w, body, head, pos| {
-                        body.walk_gemm(gpu, w, m, pos, last.then_some(head))?;
-                        body.stream.walk_done();
-                        Ok(last)
-                    })?;
-                    if let Some(f) = sink.as_deref_mut() {
-                        f(self, TargetRows::Ubatch, pos, m)?;
-                    }
-                }
-                next.ok_or(GpuError::state(
+        let pos0 = self.pos();
+        let body = self.body(WHAT_P)?;
+        let (width, walk) = match path {
+            Prompt38::Gemm => (body.wide.rows, TargetRows::Ubatch),
+            Prompt38::Pass => (PASS_ROWS, TargetRows::Pass),
+            Prompt38::Step | Prompt38::Auto => {
+                return Err(GpuError::state(
                     WHAT_P,
-                    "a token read after the last ubatch",
-                ))
+                    "a path of passes or ubatches `Prompt38::resolve` settles",
+                ));
             }
-            Prompt38::Pass => {
-                let n = tokens.len().div_ceil(PASS_ROWS);
-                let mut next = None;
-                for (i, chunk) in tokens.chunks(PASS_ROWS).enumerate() {
-                    let last = i + 1 == n;
-                    let pos = self.pos();
-                    {
-                        let (gpu, _, body) = self.body_parts(WHAT_P)?;
-                        body.plan_pass(gpu.stream(), chunk, pos)?;
-                    }
-                    let m = chunk.len();
-                    next = self.run_rows(m, WHAT_P, |gpu, w, body, head, pos| {
-                        body.walk_pass(gpu, w, m, pos, last.then_some(head))?;
-                        Ok(last)
-                    })?;
-                    if let Some(f) = sink.as_deref_mut() {
-                        f(self, TargetRows::Pass, pos, m)?;
-                    }
-                }
-                next.ok_or(GpuError::state(WHAT_P, "a token read after the last pass"))
-            }
-            Prompt38::Auto => Err(GpuError::state(
-                WHAT_P,
-                "a path `Prompt38::resolve` settles (it returned `auto`)",
-            )),
+        };
+        let point_row = body.mtp.is_some();
+        let units = call_units(pos0, tokens.len(), width, marks);
+        if path == Prompt38::Gemm {
+            // The call's PLE rows are read ahead: the first ubatch's fill
+            // reads its own, each later one's runs under the ubatch before
+            // it, across the call's checkpoints ([`PleHost::prompt_start`]).
+            let (_, _, body) = self.body_parts(WHAT_P)?;
+            let spans: Vec<_> = body.media.iter().flat_map(MediaRows::positions).collect();
+            body.ple
+                .prompt_start(pos0, tokens, units.iter().map(|&(m, _)| m), &spans)?;
         }
+        if marks.first() == Some(&pos0) {
+            self.mark_here(WHAT_P)?;
+        }
+        let (mut next, mut at) = (None, 0);
+        for (i, &(m, marked)) in units.iter().enumerate() {
+            let chunk = &tokens[at..at + m];
+            at += m;
+            let last = i + 1 == units.len();
+            let point = marked && !last;
+            let finals = tapped || point && point_row;
+            let pos = self.pos();
+            {
+                let (gpu, _, body) = self.body_parts(WHAT_P)?;
+                match path {
+                    Prompt38::Gemm => body.plan_gemm(gpu.stream(), chunk, pos)?,
+                    _ => body.plan_pass(gpu.stream(), chunk, pos)?,
+                }
+            }
+            next = self.run_rows(m, WHAT_P, |gpu, w, body, head, pos| {
+                let head = last.then_some(head);
+                match path {
+                    Prompt38::Gemm => {
+                        body.walk_gemm(gpu, w, m, pos, head, finals)?;
+                        body.stream.walk_done();
+                    }
+                    _ => body.walk_pass(gpu, w, m, pos, head, finals)?,
+                }
+                if point && let Some(f) = gpu.fault()? {
+                    return Err(GpuError::fault(WHAT_P, f));
+                }
+                Ok(last)
+            })?;
+            if let Some(f) = sink.as_deref_mut() {
+                f(self, walk, pos, m)?;
+            }
+            if marked {
+                self.mark_here(WHAT_P)?;
+            }
+        }
+        next.ok_or(GpuError::state(
+            WHAT_P,
+            "a token read after the call's last unit",
+        ))
     }
 }
 
@@ -4062,8 +4303,9 @@ impl Wrote38 {
 }
 
 /// The streams' buffer of `walk`'s arena (the step's, the pass's, the
-/// ubatch walk's) that holds the target's hidden rows once the walk ran its
-/// head: a walk's current buffer flips once at each PLE layer past layer 0.
+/// ubatch walk's) that holds the target's hidden rows once the walk left
+/// them final ([`TargetRows`]): a walk's current buffer flips once at each
+/// PLE layer past layer 0.
 fn final_streams<'b>(
     plans: &[Layer38],
     [s, a, wa]: [&'b Arena38; 3],
@@ -4177,6 +4419,91 @@ impl GpuModel<Body38> {
         self.note_fault(WHAT_D, r)
     }
 
+    /// One store walk of several resident sequences' rows (module doc of
+    /// `mtp38`): each `(slot, feed)`'s rows checked and staged on its slot as
+    /// [`GpuModel::mtp_walk`] checks a store walk there, then the walk's
+    /// launches once over every slot's rows, the embedding and the append a
+    /// slot, each slot's into its own store. Each slot's store and the
+    /// positions it holds come out bit for bit as its own store walk leaves
+    /// them, and the selected slot stays selected. Refused by name: a slot
+    /// named twice, rows past the store walk's
+    /// [`MTP_STORE_ROWS`](super::mtp38::MTP_STORE_ROWS), a poisoned
+    /// model, and as `mtp_walk` refuses each slot's walk, before anything but
+    /// the walk's scratch moves. A fault a launch raises stays on the card's
+    /// fault word, which the next readback names.
+    pub fn mtp_store_slots(
+        &mut self,
+        walks: &[(usize, Feed<'_, TargetRows>)],
+        head: DraftHead,
+    ) -> Result<(), GpuError> {
+        const WHAT_D: &str = "qwen4exp mtp_store_slots";
+        self.refuse_if_poisoned(WHAT_D)?;
+        if let Some((i, &(slot, _))) = walks
+            .iter()
+            .enumerate()
+            .find(|&(i, (slot, _))| walks[..i].iter().any(|(s, _)| s == slot))
+        {
+            return Err(GpuError::shape(
+                WHAT_D,
+                format!("slot {slot} named again at walk {i}: one walk a slot"),
+            ));
+        }
+        let home = self.selected();
+        let r = self.store_slots_at(walks, head);
+        let back = self.select_slot(home);
+        self.note_fault(WHAT_D, r.and(back))
+    }
+
+    /// [`GpuModel::mtp_store_slots`]'s walk, its checks done: every slot's
+    /// rows staged with that slot selected, the launches over all of them,
+    /// then each slot's append with that slot selected.
+    fn store_slots_at(
+        &mut self,
+        walks: &[(usize, Feed<'_, TargetRows>)],
+        head: DraftHead,
+    ) -> Result<(), GpuError> {
+        const WHAT_D: &str = "qwen4exp mtp_store_slots";
+        let mut blocks = Vec::with_capacity(walks.len());
+        let mut ids = Vec::new();
+        for &(slot, feed) in walks {
+            self.select_slot(slot)?;
+            let (gpu, _, body) = self.body_parts(WHAT_D)?;
+            let Body38 {
+                mtp,
+                plans,
+                s,
+                a,
+                wa,
+                wrote,
+                ..
+            } = body;
+            let d = mtp.as_mut().ok_or(GpuError::state(
+                WHAT_D,
+                "an MTP draft (Body38::open_placed_mtp)",
+            ))?;
+            let target = mtp_target(plans, [s, a, wa], wrote, DraftFeed::Rows(feed));
+            blocks.push(d.stage_store(gpu.stream(), target, feed, head, ids.len())?);
+            ids.extend_from_slice(feed.tokens);
+        }
+        if blocks.is_empty() {
+            return Ok(());
+        }
+        let (gpu, w, body) = self.body_parts(WHAT_D)?;
+        body.mtp_with(gpu, w, |d, c| d.store_rows(c, &ids, &blocks, false))?;
+        for (&(slot, _), &b) in walks.iter().zip(&blocks) {
+            self.select_slot(slot)?;
+            let (gpu, w, body) = self.body_parts(WHAT_D)?;
+            body.mtp_with(gpu, w, |d, c| d.append_store(c, b))?;
+        }
+        Ok(())
+    }
+
+    /// Fill the draft walk's scratch with NaNs without changing its inbox or stored state.
+    pub fn poison_mtp_scratch(&mut self) -> Result<(), GpuError> {
+        let (gpu, _, body) = self.body_parts("qwen4exp poison_mtp_scratch")?;
+        body.draft_mut()?.poison_scratch(gpu.stream())
+    }
+
     /// Arm (or disarm) the draft's taps ([`Mtp38::set_taps`]); its captured
     /// walks are dropped first. Load-time allocation.
     pub fn set_mtp_taps(&mut self, on: bool) -> Result<(), GpuError> {
@@ -4248,6 +4575,45 @@ impl GpuModel<Body38> {
         let pos = self.pos();
         let (gpu, _, body) = self.body_parts(WHAT_S)?;
         body.save_state(gpu.stream(), pos)
+    }
+
+    /// The host arrays a sequence save would hold, without reading the card.
+    pub fn seq_save_bytes(&mut self) -> Result<u64, GpuError> {
+        const WHAT_S: &str = "qwen4exp snapshot size";
+        let pos = self.pos();
+        let (_, _, b) = self.body_parts(WHAT_S)?;
+        let points = b.ckpt.save_points(pos);
+        let draft = if b.mtp.is_some() {
+            (b.wrote.step.parts().1 as usize)
+                .checked_add(b.wrote.pass.parts().1 as usize)
+                .and_then(|n| n.checked_mul(geo::STREAMS))
+                .and_then(|n| n.checked_mul(geo::HIDDEN))
+                .and_then(|n| {
+                    b.point_rows
+                        .iter()
+                        .filter(|(p, _)| points.contains(p))
+                        .try_fold(n, |n, (_, r)| n.checked_add(r.len()))
+                })
+                .and_then(|n| n.checked_mul(size_of::<f32>()))
+                .ok_or_else(|| GpuError::shape(WHAT_S, "draft host bytes pass the address space"))?
+        } else {
+            0
+        };
+        let mut stores = Copied::of(
+            &mut b.stores,
+            &mut b.ple_ring,
+            b.lane.lane(),
+            Some((b.ctx, pos as usize)),
+            b.mtp.as_mut(),
+        )?;
+        let (positional, mut recurrent) = stores.list_split();
+        Lent {
+            positional,
+            recurrent: &mut recurrent,
+        }
+        .bytes(points.len())?
+        .checked_add(draft as u64)
+        .ok_or_else(|| GpuError::shape(WHAT_S, "host bytes pass u64"))
     }
 
     /// [`GpuModel::seq_save`] whose copy runs on `lane`'s stream into its
@@ -4531,6 +4897,7 @@ impl ChainBody for Body38 {
             seq_rope,
             s,
             k,
+            branch,
             slots,
             card,
             tier,
@@ -4541,6 +4908,7 @@ impl ChainBody for Body38 {
             ..
         } = self;
         let prog = Step38 {
+            branch,
             p: Parts38 {
                 c: Ctx38 {
                     gpu,
@@ -4917,11 +5285,7 @@ impl Body38 {
         let hist = self.ple.fill(pos, tokens)?;
         self.last_walk = TargetRows::Pass;
         self.rp.write(stream, tokens, pos)?;
-        // SAFETY: the pass arena holds `PASS_ROWS · HIDDEN` rows of `e` and
-        // `n <= VERIFY_ROWS <= PASS_ROWS`, and `e` stays in place while the
-        // window lives (one synchronous copy).
-        let mut e = unsafe { f32_view(&self.a.ple.e, 0, n * geo::HIDDEN) };
-        e.copy_from_host(stream, &self.ple.e[..n * geo::HIDDEN])?;
+        self.ple.upload(stream, &mut self.a.ple.e, n)?;
         self.stage(pos, n, hist, Some(tokens.to_vec()))?;
         planted(&mut self.plant, Plant::BeforeLaunch)?;
         self.launch(pos, n)
@@ -4954,6 +5318,7 @@ impl Body38 {
             seq_rope,
             a,
             k,
+            branch,
             slots,
             card,
             tier,
@@ -4963,6 +5328,7 @@ impl Body38 {
             ..
         } = self;
         let prog = Verify38 {
+            branch,
             p: Parts38 {
                 c: Ctx38 {
                     gpu,
@@ -5336,7 +5702,9 @@ impl Body38 {
 
     /// Enqueue the pass of `rows` [`Body38::plan_slots`] planned into
     /// `head`, one head of every row, `parked` as there. An eager pass
-    /// needs each slot's plan; a capture records the launches only.
+    /// needs each slot's plan; a capture records the launches only. A pass
+    /// that runs no row of slot 0 leaves slot 0's final-stream rows as they
+    /// stood ([`stands_in`]).
     pub(super) fn enqueue_slots(
         &mut self,
         gpu: &Gpu,
@@ -5362,6 +5730,42 @@ impl Body38 {
                 }
             })?;
         }
+        // The homes are canonical, so the pass arena's final-stream rows are
+        // slot 0's own, where its draft's waiting rows sit. A pass that runs
+        // no row of slot 0 walks into its first slot's own rows instead: slot
+        // 0's stay as its last call left them, and the first slot's land from
+        // row 0, where its copy would put them.
+        let stand_in = rows.first().is_some_and(|r| stands_in(r.slot));
+        let swap = |b: &mut Body38, parked: &mut [&mut Slot38]| -> Result<(), GpuError> {
+            if !stand_in {
+                return Ok(());
+            }
+            let seq = parked.first_mut().ok_or_else(|| no_parked(&rows[0]))?;
+            let arena = [&mut b.s, &mut b.a, &mut b.wa];
+            std::mem::swap(
+                final_streams_mut(&b.plans, arena, TargetRows::Pass),
+                &mut seq.rows_pass,
+            );
+            Ok(())
+        };
+        swap(self, parked)?;
+        let walked = self.walk_slots(gpu, w, head, parked, rows, total);
+        let back = swap(self, parked);
+        walked.and(back)
+    }
+
+    /// [`Body38::enqueue_slots`]'s walk of the pass's `total` rows, each
+    /// parked slot past the first copied to its own final-stream rows.
+    /// The first slot's rows are written in place.
+    fn walk_slots(
+        &mut self,
+        gpu: &Gpu,
+        w: &Weights,
+        head: &mut Head,
+        parked: &mut [&mut Slot38],
+        rows: &[SlotRange],
+        total: usize,
+    ) -> Result<(), GpuError> {
         let Body38 {
             hybrid,
             plans,
@@ -5372,6 +5776,7 @@ impl Body38 {
             seq_rope,
             a,
             k,
+            branch,
             slots,
             card,
             tier,
@@ -5398,7 +5803,7 @@ impl Body38 {
         let mut others = parked.iter_mut();
         let mut seqs = Vec::with_capacity(rows.len());
         let mut copies = Vec::new();
-        for (r, rec) in rows.iter().zip(&recs) {
+        for (i, (r, rec)) in rows.iter().zip(&recs).enumerate() {
             let (stores, ple_ring, lane, table) = if r.slot == 0 {
                 live.take().ok_or_else(|| slot_twice(r))?
             } else {
@@ -5410,10 +5815,12 @@ impl Body38 {
                     rope: own,
                     ..
                 } = &mut **others.next().ok_or_else(|| no_parked(r))?;
-                copies.push(RowsCopy {
-                    rows: r.rows.clone(),
-                    to: rows_pass,
-                });
+                if i != 0 {
+                    copies.push(RowsCopy {
+                        rows: r.rows.clone(),
+                        to: rows_pass,
+                    });
+                }
                 (
                     stores.as_mut_slice(),
                     ple_ring,
@@ -5433,6 +5840,7 @@ impl Body38 {
             });
         }
         let prog = Verify38 {
+            branch,
             p: Parts38 {
                 c: Ctx38 {
                     gpu,
@@ -5483,9 +5891,11 @@ impl Body38 {
     #[must_use]
     pub fn slots_launches(&self, key: &[(usize, usize)]) -> usize {
         let rows = key.iter().map(|&(_, m)| m).sum();
+        let stand_in = key.first().is_some_and(|&(slot, _)| stands_in(slot));
         self.verify_launches(rows)
             + key.len().saturating_sub(1) * seq_launches(&self.plans)
             + key.iter().filter(|&&(slot, _)| slot != 0).count()
+            - usize::from(stand_in)
     }
 }
 
@@ -5556,6 +5966,14 @@ impl SlotRows for Body38 {
 
 /// What a pass of several slots' refusals name.
 const WHAT_SLOTS: &str = "qwen4exp slots";
+
+/// Whether a pass whose first rows are slot `first`'s runs no row of slot 0
+/// (slot 0, when busy, lays its rows first, [`slot_rows`]): its walk writes
+/// that slot's own final-stream rows in place of the arena's
+/// ([`Body38::enqueue_slots`]), and the slot's copy is not launched.
+fn stands_in(first: usize) -> bool {
+    first != 0
+}
 
 /// The pass's rows `R`, once `rows` tile `0..R` in order from row 0 with
 /// no empty range, slot 0 — when busy — first, and `parked` counts the
@@ -5855,22 +6273,16 @@ mod tests {
         }
     }
 
-    /// A checkpoint folder's load runs no residency machine and no draft: either is refused by
-    /// name, and a load under neither passes.
+    // PIN(2026-10-22): folder drafts use the placed MTP load; only residency is refused here.
     #[test]
-    fn a_folder_load_refuses_residency_and_a_draft() {
-        assert!(refuse_folder(Residency::Off, false).is_ok());
+    fn a_folder_load_refuses_residency() {
+        assert!(refuse_folder(Residency::Off).is_ok());
         let mid = Residency::Mid {
             pinned: 1,
             spares: 1,
         };
-        for (residency, drafted, need) in [
-            (mid, false, "BLOOMERY_RESIDENCY=off"),
-            (Residency::Off, true, "no MTP draft"),
-        ] {
-            let e = refuse_folder(residency, drafted).unwrap_err().to_string();
-            assert!(e.contains(need), "{e}");
-        }
+        let e = refuse_folder(mid).unwrap_err().to_string();
+        assert!(e.contains("BLOOMERY_RESIDENCY=off"), "{e}");
     }
 
     /// A checkpoint folder's F8 table, its rows in runs of two files where the folder stores
@@ -5893,8 +6305,11 @@ mod tests {
         std::fs::write(&a, [&[9u8; 7][..], &f8[..cut]].concat()).unwrap();
         std::fs::write(&b, &f8[cut..]).unwrap();
         let stored = model::part::StoredRows {
-            row_bytes: 160,
-            runs: vec![(a, 7..7 + cut as u64), (b, 0..(f8.len() - cut) as u64)],
+            values: model::part::StoredPlane {
+                row_bytes: 160,
+                runs: vec![(a, 7..7 + cut as u64), (b, 0..(f8.len() - cut) as u64)],
+            },
+            block_scales: None,
             scale: 0.375,
         };
         let open = |ty: GgmlType, tier| {
@@ -5917,14 +6332,132 @@ mod tests {
         for (ty, tier, need) in [
             (GgmlType::F8E4M3_ROWS, Device::Host, "on the NVMe tier"),
             (
+                GgmlType::IQ4_NL,
+                Device::Nvme,
+                "F8 or NVFP4 rows where a checkpoint",
+            ),
+            (
                 GgmlType::NVFP4_ROWS,
                 Device::Nvme,
-                "F8 rows where a checkpoint",
+                "value and block-scale planes",
             ),
         ] {
             let e = open(ty, tier).err().expect("refused");
             assert!(e.to_string().contains(need), "{ty}: {e}");
         }
+        let codes = &f8[..80 * 80];
+        let scales: Vec<u8> = (0..80 * 10).map(|i| 0x30 + (i % 48) as u8).collect();
+        let packed: Vec<u8> = codes
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .zip(&scales)
+            .flat_map(|(c, &s)| std::iter::once(s).chain(c.iter().copied()))
+            .collect();
+        let mut want = ple_host(GgmlType::NVFP4_ROWS.as_u32(), &packed, Some(0.375), 8).unwrap();
+        let (a, b) = (dir.join("fp4-a.safetensors"), dir.join("fp4-b.safetensors"));
+        let (cc, sc) = (30 * 80, 30 * 10);
+        std::fs::write(&a, [&[9u8; 7][..], &codes[..cc], &scales[..sc]].concat()).unwrap();
+        std::fs::write(&b, [&codes[cc..], &scales[sc..]].concat()).unwrap();
+        let stored = model::part::StoredRows {
+            values: model::part::StoredPlane {
+                row_bytes: 80,
+                runs: vec![
+                    (a.clone(), 7..7 + cc as u64),
+                    (b.clone(), 0..(codes.len() - cc) as u64),
+                ],
+            },
+            block_scales: Some(model::part::StoredPlane {
+                row_bytes: 10,
+                runs: vec![
+                    (a, 7 + cc as u64..7 + cc as u64 + sc as u64),
+                    (
+                        b,
+                        (codes.len() - cc) as u64..(codes.len() - cc + scales.len() - sc) as u64,
+                    ),
+                ],
+            }),
+            scale: 0.375,
+        };
+        let layout = ple_layout(GgmlType::NVFP4_ROWS.as_u32(), packed.len(), true);
+        let header = Arc::new(Split::header_only(dir.clone(), &layout).unwrap());
+        let mut got =
+            PleHost::new(Arc::clone(&header), Some(&stored), 16, 8, Device::Nvme).unwrap();
+        // A call with a checkpoint mark inside it (position 4) reads every
+        // unit after its first ahead, across the mark.
+        let units = super::call_units(0, tokens.len(), 2, &[4, 6]);
+        got.prompt_start(0, &tokens, units.iter().map(|&(m, _)| m), &[])
+            .unwrap();
+        let mut at = 0;
+        for (i, &(m, _)) in units.iter().enumerate() {
+            let (pos, unit) = (at as u32, &tokens[at..at + m]);
+            at += m;
+            want.hist = want.fill(pos, unit).unwrap();
+            got.hist = got.fill(pos, unit).unwrap();
+            assert_eq!(got.ids[..got.named], want.ids[..want.named]);
+            assert_eq!(got.e.len(), want.e.len());
+            assert!(
+                got.e
+                    .iter()
+                    .zip(&want.e)
+                    .all(|(g, w)| g.to_bits() == w.to_bits())
+            );
+            let ahead = got.nvme.as_ref().is_some_and(|r| r.flight);
+            assert_eq!(
+                ahead,
+                i + 1 < units.len(),
+                "unit {i}: the next unit read ahead"
+            );
+        }
+        let mut wrong_width = stored.clone();
+        wrong_width.block_scales.as_mut().unwrap().row_bytes = 9;
+        let e = PleHost::new(Arc::clone(&header), Some(&wrong_width), 16, 8, Device::Nvme)
+            .err()
+            .expect("refused");
+        assert!(
+            e.to_string().contains("value and block-scale planes"),
+            "{e}"
+        );
+        let mut short = stored;
+        short.block_scales.as_mut().unwrap().runs[1].1.end -= 10;
+        let e = PleHost::new(header, Some(&short), 16, 8, Device::Nvme)
+            .err()
+            .expect("refused");
+        assert!(e.to_string().contains("source plane has 79 rows"), "{e}");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A prompt call's units: its runs cut at the checkpoint marks past its
+    /// start, each as the ubatch cut, the unit before each mark marked; with
+    /// no marks one run of the whole call.
+    #[test]
+    fn a_call_cuts_its_units_at_its_marks() {
+        let (t, f) = (true, false);
+        for (from, n, width, marks, want) in [
+            (
+                0,
+                8192,
+                4096,
+                &[4096, 8192][..],
+                &[(4096, t), (4096, t)][..],
+            ),
+            (0, 8192, 4096, &[], &[(4096, f), (4096, f)]),
+            (100, 5000, 4096, &[100, 4096, 5100], &[(3996, t), (1004, t)]),
+            (
+                0,
+                9000,
+                4096,
+                &[4096, 8192, 9000],
+                &[(4096, t), (4096, t), (808, t)],
+            ),
+            (4090, 10, 8, &[4090, 4096, 4100], &[(6, t), (4, t)]),
+            (0, 10, 8, &[10], &[(8, f), (2, t)]),
+        ] {
+            assert_eq!(
+                super::call_units(from, n, width, marks),
+                want,
+                "{n} ids from {from}, {width} wide, marks {marks:?}"
+            );
+        }
     }
 }

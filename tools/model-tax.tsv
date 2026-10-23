@@ -46,7 +46,7 @@ crates/gpu-gates/src/bin/gate_e2e.rs	deepseek	5	baseline T 5: case-table rows, t
 crates/gpu-gates/src/bin/gate_e2e.rs	qwen	2	baseline T 2: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
 crates/gpu-gates/src/bin/gate_gemm.rs	deepseek	11	baseline T 11: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
 crates/gpu-gates/src/bin/gate_gemm.rs	gemma	1	baseline T 1: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
-crates/gpu-gates/src/bin/gate_gemm.rs	qwen	32	baseline T 32: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
+crates/gpu-gates/src/bin/gate_gemm.rs	qwen	30	baseline T 32: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
 crates/gpu-gates/src/bin/gate_head_gpu.rs	deepseek	1	baseline T 1: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
 crates/gpu-gates/src/bin/gate_hybrid.rs	deepseek	15	baseline T 15: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
 crates/gpu-gates/src/bin/gate_iq.rs	nemotron	2	baseline T 2: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
@@ -81,6 +81,7 @@ crates/gpu-gates/src/bin/shared/dspark_hf.rs	qwen	1	baseline O 1: own path: an a
 crates/gpu-gates/src/bin/shared/emb2_image.rs	gemma	1	baseline O 1: own path: an alias row in tools/model-tokens.tsv or a move into the family directory
 crates/gpu-gates/src/bin/shared/route_trace38.rs	qwen	3	baseline O 3: own path: an alias row in tools/model-tokens.tsv or a move into the family directory
 crates/gpu-gates/src/bin/shared/routed_legs.rs	deepseek	8	baseline P 9: MK2 program by body
+crates/gpu-gates/src/bin/shared/routed_legs.rs	flint	2	PIN(2026-10-23) flint: family_of and skip_of match every models::Arch exhaustively; the header-only reader has no program or routed-legs adapter
 crates/gpu-gates/src/bin/shared/routed_legs.rs	gemma	4	baseline P 5: MK2 program by body
 crates/gpu-gates/src/bin/shared/routed_legs.rs	glm	7	baseline P 8: MK2 program by body
 crates/gpu-gates/src/bin/shared/routed_legs.rs	mimo	4	baseline P 5: MK2 program by body
@@ -127,12 +128,6 @@ crates/gpu-vision/src/encoder.rs	deepseek	2	baseline D 2: media design: VideoRul
 crates/gpu/src/arch/hybrid.rs	nemotron	1	baseline O 1: own path: an alias row in tools/model-tokens.tsv or a move into the family directory
 crates/gpu/src/card_slots.rs	deepseek	24	PIN(2026-10-21) deepseek: baseline K 20 + 4, the four-slot entry `ds41_ffn_card_acc_4` (MiniMax-M3 routes 4 a token): one more copy of the per-count entry, since a `#[kernel]` entry cannot be generic over the slot count; the deferred rename of the entries by what they compute absorbs it
 crates/gpu/src/dspark/head.rs	deepseek	3	baseline K 3: rename the kernel entries by what they compute (deferred)
-crates/gpu/src/fault.rs	deepseek	4	baseline P 4: MK1b per-program fault sites (after faultcov)
-crates/gpu/src/fault.rs	gemma	2	baseline P 2: MK1b per-program fault sites (after faultcov)
-crates/gpu/src/fault.rs	glm	2	baseline P 2: MK1b per-program fault sites (after faultcov)
-crates/gpu/src/fault.rs	mimo	5	baseline P 5: MK1b per-program fault sites (after faultcov)
-crates/gpu/src/fault.rs	nemotron	4	baseline P 4: MK1b per-program fault sites (after faultcov)
-crates/gpu/src/fault.rs	qwen	4	baseline P 4: MK1b per-program fault sites (after faultcov)
 crates/gpu/src/host/handoff.rs	deepseek	35	PIN(2026-10-21) deepseek: baseline K 31 + 4, the four-slot entry `ds41_ffn_handoff_4` (MiniMax-M3 routes 4 a token): one more copy of the per-count entry, since a `#[kernel]` entry cannot be generic over the slot count; the deferred rename of the entries by what they compute absorbs it
 crates/hf/src/vocab.rs	qwen	5	PIN(2026-10-20) qwen: the qwen35 tokenizer pipeline name and regex; tokenizer programs are not yet described by ModelSpec
 crates/model/src/arch/coverage.rs	deepseek	13	baseline P 13: MK2 program by body
@@ -147,6 +142,7 @@ crates/model/src/arch/dspark.rs	deepseek	1	baseline O 1: own path: an alias row 
 crates/model/src/arch/hybrid.rs	qwen	1	baseline O 1: own path: an alias row in tools/model-tokens.tsv or a move into the family directory
 crates/model/src/arch/mod.rs	clef	1	baseline A 1: MK1a/MK1b ArchRow registry
 crates/model/src/arch/mod.rs	deepseek	14	baseline A 15: MK1a/MK1b ArchRow registry
+crates/model/src/arch/mod.rs	flint	4	PIN(2026-10-23) flint: the module declaration and architecture variant with from_name and name arms remain outside the ArchRow registry
 crates/model/src/arch/mod.rs	gemma	11	baseline A 13: MK1a/MK1b ArchRow registry
 crates/model/src/arch/mod.rs	glm	5	baseline A 6: MK1a/MK1b ArchRow registry
 crates/model/src/arch/mod.rs	mimo	4	baseline A 5: MK1a/MK1b ArchRow registry
@@ -156,12 +152,14 @@ crates/model/src/bin/bloomery-decode.rs	deepseek	3	baseline R 4: MK1a one regist
 crates/model-hf/src/bin/prepare.rs	qwen	1	PIN(2026-10-20) qwen: the checkpoint architecture selected by the converter
 crates/model/src/bin/r8conv.rs	deepseek	1	baseline T 1: case-table row, a fixture label or default path
 crates/models/src/lib.rs	deepseek	4	baseline A 4: MK1a/MK1b ArchRow registry
+crates/models/src/lib.rs	flint	2	PIN(2026-10-23) flint: ModelSpec.arch names the reader by an enum variant and name arm until ModelSpec carries the registry's name
 crates/models/src/lib.rs	gemma	4	baseline A 4: MK1a/MK1b ArchRow registry
 crates/models/src/lib.rs	glm	3	baseline A 3: MK1a/MK1b ArchRow registry
 crates/models/src/lib.rs	mimo	2	baseline A 2: MK1a/MK1b ArchRow registry
 crates/models/src/lib.rs	nemotron	4	baseline A 4: MK1a/MK1b ArchRow registry
 crates/models/src/lib.rs	qwen	9	baseline A 9: MK1a/MK1b ArchRow registry
 crates/placement/src/accepts.rs	deepseek	10	PIN(2026-10-21) deepseek: MK2 program by body; +1 is the family's word in the common Program::name owner, which the model's own code does not carry yet
+crates/placement/src/accepts.rs	flint	1	PIN(2026-10-23) flint: program_of matches every models::Arch; the header-only reader must explicitly return no program until a body is registered
 crates/placement/src/accepts.rs	gemma	5	PIN(2026-10-21) gemma: MK2 program by body; +1 is the family's word in the common Program::name owner, which the model's own code does not carry yet
 crates/placement/src/accepts.rs	glm	5	PIN(2026-10-21) glm: MK2 program by body; +1 is the family's word in the common Program::name owner, which the model's own code does not carry yet
 crates/placement/src/accepts.rs	mimo	5	PIN(2026-10-21) mimo: MK2 program by body; +1 is the family's word in the common Program::name owner, which the model's own code does not carry yet
@@ -194,9 +192,7 @@ crates/placement/src/accepts.rs	solar	5	PIN(2026-10-21) solar: Program is the ke
 crates/model/src/arch/coverage.rs	solar	9	PIN(2026-10-20) solar: the coverage rows, the token-embedding pin and the expert-stack match are keyed by Program, so each row the solar2 body runs lists its variant; the program would own its rows instead of the list naming programs
 crates/gpu-gates/src/bin/shared/routed_legs.rs	solar	2	PIN(2026-10-21) solar: family_of and skip_of match every models::Arch exhaustively; the family has no routed-legs adapter until its body has one, and the count lines take the family's word from the common Program::name owner
 crates/gpu-gates/src/record.rs	solar	4	PIN(2026-10-20) solar: a seat's load and listening lines are one Kind each and its list another; the tiered seats' load lines share every field but the architecture word, so one Kind keyed by it replaces mimo2's and this one
-crates/gpu/src/fault.rs	solar	2	PIN(2026-10-20) solar: the fault table is per architecture by design: the `SOLAR2` step order and its `step_order::of` arm
 crates/gpu-gates/src/bin/tier_server.rs	solar	2	PIN(2026-10-21) solar: the tier server's family list is one `#[cfg(feature)]` arm a family, as deepseek's and glm's rows above; a registry of node families built from the features would own the list instead
-crates/gpu/src/fault.rs	minimax	2	PIN(2026-10-21) minimax: the fault table is per architecture by design: the `MINIMAXM3` step order and its `step_order::of` arm
 crates/model/src/arch/mod.rs	raon	4	PIN(2026-10-21) raon: the family's module declaration (`pub mod raon1;`), and its `model::arch::Arch` variant with the arms of `from_name` and `name`; the module list is not a registry and the enum lists the architectures a body runs, so each family adds its directory, variant and two arms here until the registry owns them
 crates/models/src/lib.rs	raon	2	PIN(2026-10-21) raon: ModelSpec.arch names the family by an enum variant and its name arm; the variant stays until ModelSpec carries the registry's name instead
 crates/placement/src/accepts.rs	raon	5	PIN(2026-10-21) raon: program_of, Program::name, leg_arms and routed_rule match every Program or models::Arch exhaustively, so the body's variant needs an arm in each; the program would own its arms and rule instead of the matches naming programs
@@ -204,5 +200,4 @@ crates/gpu-gates/src/bin/shared/routed_legs.rs	raon	2	PIN(2026-10-21) raon: fami
 crates/model/src/arch/coverage.rs	raon	27	PIN(2026-10-21) raon: the coverage rows, the type pins and the expert-stack match are keyed by Program, so each row the raon1 body runs lists its variant; the program would own its rows instead of the list naming programs
 crates/gpu-gates/src/bin/bloomery_serve.rs	raon	12	PIN(2026-10-21) raon: MK9 seat by program: the seat word, its usage and models-table lines, the file's architecture arm and the dispatch are the variant's arms until a seat is chosen by the description's program
 crates/gpu-gates/src/record.rs	raon	6	PIN(2026-10-21) raon: MK12 per-bin Kind statics into record/<bin>.rs: the seat's draft-rule, load and listening kinds and its list are the common file's, where every seat's are
-crates/gpu/src/fault.rs	raon	1	PIN(2026-10-21) raon: the fault table is per architecture by design: the family's arm in `step_order::of`, which takes the SOLAR2 order (the same launches meet the same sites)
 crates/gpu/src/token_major.rs	qwen	3	PIN(2026-10-21) qwen: the row-major to token-major copy is shared by qwen3moe and raon1, and its entry `qwen3moe_token_major` keeps the name the PTX tables pin (tools/ref/ptx-shapes*.tsv) until the entries are renamed by what they compute

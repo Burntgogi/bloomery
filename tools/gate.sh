@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # 게이트 러너 — 박스에서, box.sh가 들어간 원격 디렉터리에서 돈다. 인자는 `cargo test` 뒤에 그대로 붙는다.
 #   ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --test mt -- --ignored --nocapture'
-# 첫 인자가 --oxide면 디바이스 크레이트용으로 `cargo oxide test --arch $BLOOMERY_ARCH --` 뒤에 붙는다(arch는
+# --oxide는 디바이스 크레이트용으로 `cargo oxide test --arch $BLOOMERY_ARCH --` 뒤에 인자를 붙인다(arch는
 # tools/arch.sh가 읽는다, 설정이 없으면 sm_86. plain cargo는 디바이스 크레이트를 빌드하지 못한다 — AGENTS.md 「Never」).
-#   ./tools/box.sh 'bash tools/gate.sh --oxide -p bloomery-gpu --release --lib'
+#   ./tools/box.sh 'bash tools/gate.sh --gpu --oxide -p bloomery-gpu --release --lib'
 #
 # 막는 실패 둘:
 #  1. 매달린 게이트(2026-09-20 q_nope2 무한루프가 gate-mt를 한 시간 넘게 붙잡음) — 900초 상한,
@@ -14,21 +14,56 @@
 #     cargo의 코드를 그대로 돌려주고, 타임아웃 문구는 타임아웃일 때만 찍는다.
 # The bound is BLOOMERY_GATE_BOUND, parsed by tools/gate-bound.sh: a value it refuses ends this runner
 # with 64 before cargo runs.
+# --gpu before --oxide selects one native --lib test target. Its bounded Cargo call compiles
+# outside the card lock and invokes a capture-only target runner, never the test. Cargo owns the
+# executable, arguments, package cwd and runtime environment; a private JSON capture retains them.
+# Replay enters gpu-gate.sh in that context, so the common runner applies card selection last and
+# alone owns the runtime bound (lock waits are outside it). No second Cargo call runs under the lock.
+# Explicit --target and doctests are refused. Other calls keep their existing cargo-test path.
+# The self-test's leading --test-locks DIR forwards gpu-gate.sh's existing isolated-lock fixture.
 #
 # A third failure it closes: a filter that matches nothing. libtest passes a run of 0 tests, so a
 # call whose test-name filter names no test that exists (or none that runs under its ignore flags) is
 # green and checks nothing. A call that carries a filter — an argument after its `--` that is not a
-# flag, nor the value of an option in LIBTEST_VALUE below — and that cargo ends with 0 fails with 78
+# flag, nor the value of an option in LIBTEST_VALUE below — and that cargo (or the GPU test) ends with 0 fails with 78
 # when the `passed` counts of its `test result:` lines sum to 0 over the whole call (one target
 # printing "running 0 tests" is normal: `--lib --test x -- f` names a test of one target). A call with
 # no filter, or with `--list`, is not judged.
 #
-# Exit codes: cargo's own (0 green, 101 a test failed, …); 124 or 137 the bound ran out; 64 the bound
-# was refused; 78 a filter matched no test that passed.
+# Exit codes: cargo's or the GPU test's own (0 green, 101 a test failed, …); 124 or 137 the bound ran
+# out; 64 invalid bound or GPU test selection; 78 a filter matched no test that passed. GPU calls
+# also preserve gpu-gate.sh's refusals (2 missing executable, 69 lock-open failure, 75 contention).
 set -uo pipefail
+# Cargo's internal target runner: record its execution context, without running the executable.
+if [ "${1:-}" = --capture-test ]; then
+  [ $# -ge 3 ] && [ -d "$2" ] || exit 64
+  shift
+  exec python3 - "$@" <<'PY'
+import json
+import os
+import sys
+import tempfile
+
+directory, executable, *args = sys.argv[1:]
+fd, path = tempfile.mkstemp(prefix="run-", suffix=".json", dir=directory)
+with os.fdopen(fd, "w", encoding="utf-8") as stream:
+    json.dump({"argv": [os.path.abspath(executable), *args], "cwd": os.getcwd(), "env": dict(os.environ)}, stream)
+PY
+fi
 # shellcheck source=tools/gate-bound.sh
 source "${BASH_SOURCE[0]%/*}/gate-bound.sh"
 gate_bound gate.sh || exit $?
+GPU_ARGS=()
+if [ "${1:-}" = --test-locks ]; then
+  [ $# -ge 4 ] && [ -d "$2" ] && [ "$3" = --gpu ] || exit 64
+  GPU_ARGS=(--test-locks "$2")
+  shift 2
+fi
+GPU=0
+if [ "${1:-}" = --gpu ]; then
+  GPU=1
+  shift
+fi
 RUN=(cargo test)
 if [ "${1:-}" = --oxide ]; then
   shift
@@ -70,8 +105,85 @@ for a in "$@"; do
     *) FILTERS+=("$a") ;;
   esac
 done
+ARGS=("$@")
+CAPTURE=''
+if [ "$GPU" = 1 ]; then
+  BUILD_ARGS=()
+  LIB=0
+  ARGS=()
+  after=0
+  for a in "$@"; do
+    if [ "$after" = 1 ]; then
+      ARGS+=("$a")
+    elif [ "$a" = -- ]; then
+      after=1
+    else
+      case "$a" in
+        --lib) LIB=1 ;;
+        --target | --target=* | --doc)
+          echo "gate.sh --gpu: only native library tests are supported; '$a' is not allowed" >&2
+          exit 64 ;;
+      esac
+      BUILD_ARGS+=("$a")
+    fi
+  done
+  [ "$LIB" = 1 ] || { echo "gate.sh --gpu: select a library test with --lib" >&2; exit 64; }
+  SELF=$(cd "${BASH_SOURCE[0]%/*}" && pwd -P)/gate.sh
+  GPU_RUNNER=${SELF%/*}/gpu-gate.sh
+  # Cargo merges runner arrays; a scalar override replaces a configured runner or refuses a
+  # type conflict instead of concatenating commands. Its path has no whitespace; the wrapper quotes arguments.
+  CAPTURE=$(mktemp -d /tmp/bloomery-gate.XXXXXX) || exit 70
+  trap '[ -z "$CAPTURE" ] || rm -rf "$CAPTURE"' EXIT
+  printf '#!/usr/bin/env bash\nexec bash %q --capture-test %q "$@"\n' "$SELF" "$CAPTURE" > "$CAPTURE/runner" || exit 70
+  chmod 700 "$CAPTURE/runner" || exit 70
+  HOST_INFO=$("${RUSTC:-rustc}" -vV) || exit $?
+  HOST=''
+  while read -r key value; do
+    [ "$key" != host: ] || HOST=$value
+  done <<< "$HOST_INFO"
+  [ -n "$HOST" ] || { echo "gate.sh --gpu: rustc did not report its host target" >&2; exit 64; }
+  RUNNER_CONFIG=$(python3 - "$HOST" "$CAPTURE/runner" <<'PY'
+import json
+import sys
+
+host, runner = sys.argv[1:]
+print("target." + json.dumps(host) + ".runner=" + json.dumps(runner))
+PY
+  ) || exit $?
+  # Explicit native target and highest-priority CLI runner config prevent a configured cross
+  # target or runner from executing a test before the card lock is taken.
+  run_bounded timeout --kill-after=10 "$BOUND" "${RUN[@]}" "${BUILD_ARGS[@]}" --target "$HOST" --config "$RUNNER_CONFIG" -- "${ARGS[@]}"
+  rc=$?
+  [ "$rc" = 0 ] || exit "$rc"
+  [ -z "$BIN_SIGNAL" ] || exit 143
+  RUN=(python3 -c '
+import json
+import os
+from pathlib import Path
+import sys
+
+directory, runner, *runner_args = sys.argv[1:]
+captures = list(Path(directory).glob("run-*.json"))
+if len(captures) != 1:
+    print("gate.sh --gpu: select exactly one library test; got " + str(len(captures)), file=sys.stderr)
+    sys.exit(64)
+with captures[0].open(encoding="utf-8") as stream:
+    context = json.load(stream)
+os.chdir(context["cwd"])
+os.execvpe("bash", ["bash", runner, *runner_args, "--executable", *context["argv"]], context["env"])
+' "$CAPTURE" "$GPU_RUNNER" "${GPU_ARGS[@]}")
+  ARGS=()
+fi
+run_tests() {
+  if [ "$GPU" = 1 ]; then
+    # gpu-gate.sh owns the runtime bound, after its lock waits.
+    run_bounded "${RUN[@]}" "${ARGS[@]}"
+  else
+    run_bounded timeout --kill-after=10 "$BOUND" "${RUN[@]}" "${ARGS[@]}"
+  fi
+}
 if [ "${#FILTERS[@]}" = 0 ] || [ "$LISTING" = 1 ]; then
-  run_bounded timeout --kill-after=10 "$BOUND" "${RUN[@]}" "$@"
+  run_tests
   rc=$?
 else
   LOG=$(mktemp)
@@ -81,7 +193,7 @@ else
     trap "" TERM INT HUP
     kill -KILL "$TEE_PID" 2> /dev/null || :
     wait "$TEE_PID" 2> /dev/null || :
-  }; rm -f "$LOG" "$LOG.out"' EXIT
+  }; rm -f "$LOG" "$LOG.out"; [ -z "$CAPTURE" ] || rm -rf "$CAPTURE"' EXIT
   # cargo's output reaches tee through a FIFO, not a pipe: in a pipeline run_bounded would run in a subshell that a TERM to this
   # runner does not reach. tee starts before run_bounded sets its trap, so until then a TERM, INT or HUP ends this runner and tee
   # with it (one that comes before tee's pid is known, as soon as it is): a tee left waiting to open the FIFO would hold this
@@ -94,7 +206,7 @@ else
   tee "$LOG" < "$LOG.out" &
   TEE_PID=$!
   [ -z "$TEE_EXIT" ] || exit "$TEE_EXIT"
-  run_bounded timeout --kill-after=10 "$BOUND" "${RUN[@]}" "$@" > "$LOG.out"
+  run_tests > "$LOG.out"
   rc=$?
   wait "$TEE_PID" || { tee_rc=$?; [ "$rc" -ne 0 ] || rc=$tee_rc; }
   TEE_PID=''

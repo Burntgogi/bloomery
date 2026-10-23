@@ -135,6 +135,13 @@ fn fixtures() -> Vec<(
             msg("", "a <tool_ca b <tool_call", vec![]),
         ),
         (
+            "a partial next opening tag remains content",
+            ON,
+            ReasoningFormat::Deepseek,
+            "<tool_call>{\"name\":\"get_time\",\"arguments\":{}}</tool_call>\n\t<tool_call",
+            msg("", "\n\t<tool_call", vec![call(0, "get_time", "{}")]),
+        ),
+        (
             "a span the prompt closed",
             CLOSED,
             ReasoningFormat::Deepseek,
@@ -213,6 +220,14 @@ fn malformed() -> Vec<(&'static str, &'static str, HermesError)> {
                 index: 0,
                 name: "f".to_owned(),
                 key: "id".to_owned(),
+            },
+        ),
+        (
+            "the second call opens at EOF",
+            "<tool_call>{\"name\":\"get_time\",\"arguments\":{}}</tool_call><tool_call>",
+            HermesError::Unterminated {
+                index: 1,
+                text: "<tool_call>".to_owned(),
             },
         ),
         (

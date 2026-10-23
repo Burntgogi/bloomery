@@ -456,8 +456,9 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         kind: Kind::Words(&["lookup", "dspark", "mtp", "off"]),
         default: Unset::Means(
             "the plain path, one token a step; `generate_qwen3moe` on a qwen4exp file and \
-             `bloomery-serve-qwen38` under `--place a`: `mtp` when the MTP draft file is there, \
-             else the plain path with a `load draft=off` record naming why; the GLM seat of \
+             `bloomery-serve-qwen38` under `--place a`: `mtp` when the MTP draft file is there \
+             (on the server, on one slot), else the plain path with a `load draft=off` record \
+             naming why; the GLM seat of \
              `bloomery-serve`: `mtp` under `--place a` or `bp` on a file of one next-token layer, else the \
              plain path, with a `draft unset` record naming why (`bloomery_levers::glm_unset`)",
         ),
@@ -481,9 +482,10 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               through a four-row window; `generate_glm5next` and the GLM seat of `bloomery-serve` on a \
               glm5next file: `mtp` serves the target file's NextN layer as the MTP draft through a \
               two-row window, and `lookup` and `dspark` are refused by name; the greedy ids are the \
-              plain run's. A server serves a \
-              request that samples or bans an id through plain steps, each step's logits row the \
-              target's, and drafts only its greedy requests. `off` is the plain path on a \
+              plain run's. A server drafts a request that samples or bans an id while its slot \
+              runs alone on a seat that drafts sampled requests (the Qwen3.8 and GLM seats), \
+              each kept id its draw from its verified row, and serves it through plain steps \
+              otherwise, each step's logits row the target's. `off` is the plain path on a \
               qwen4exp file, the same-binary arm of the unset draft. Unset in \
               `generate_qwen3moe` on a qwen4exp file follows the placement \
               (`bloomery_levers::draft38_unset`): under `--place a` the MTP draft runs when a \
@@ -500,7 +502,9 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               with no file there, with stores too short for one window (`--ctx-size` under \
               5: the server takes a window only while its rows fit), and when the target's \
               `token_embd` or `output` is not Q8_0, the format the draft reads them in (a set \
-              `mtp` is refused there by name before the load), with the same record; it \
+              `mtp` is refused there by name before the load), and under `--parallel` above 1, \
+              where a drafted server also walks each slot's draft over every row of a sampled or \
+              id-banning request (a set `mtp` drafts there), with the same record; it \
               has no `--logits` (a request that reads the logits row steps plainly) and takes \
               no route trace. The GLM seat of `bloomery-serve` takes `mtp` and `off`; unset \
               (`bloomery_levers::glm_unset`, a `draft unset` record before the plan) it drafts \
@@ -604,9 +608,11 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               many of a proposal's ids a pass verifies. `cost` \
               (unset) puts the draft behind the width chooser (`runtime::width`): each window \
               verifies the width whose expected kept positions over its measured pass wall is \
-              highest, and none while no width beats the plain step by its margin; the draft \
-              still proposes its whole width, and only the rows a pass runs change, never a \
-              token. `fixed` verifies every proposal whole, the same-binary arm. A drafting \
+              highest, and none while no width beats the plain step by its margin. A \
+              single-sequence pass can cut a full proposal to a prefix. Batched MTP rounds \
+              price all active slots together, choose proposal depths before drafting and \
+              pack complete windows within the body's row bounds. Widths never change a \
+              generated token. `fixed` verifies every proposal whole, the same-binary arm. A drafting \
               server prints an `mtp width` record a request under `cost`. Refused by name on a \
               run that drafts nothing. Read once at `main`, the policy every window of the \
               process runs by; no setter changes it between calls.",
@@ -648,8 +654,10 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               the host tier writes a route trace into \
               (`crates/gpu/src/host/route_trace.rs`): every position's routed ids per \
               layer and the slot each ran in, as a router set, a `call` row per prompt \
-              call. On a qwen4exp load it keeps every layer's host leg, where the trace is \
-              written. The servers need `BLOOMERY_PREFILL=steps`, no `BLOOMERY_DRAFT` set, \
+              call. On a qwen4exp or glm5next load it keeps every layer's host leg, where \
+              the trace is written; a layer that holds every expert on the card keeps no host \
+              view, so a load of experts no host kernel reads (NVFP4) takes a trace. The \
+              servers need `BLOOMERY_PREFILL=steps`, no `BLOOMERY_DRAFT` set, \
               and one resident slot (`--parallel` past 1 is refused; unset serves one); \
               `bloomery-serve-qwen38` also refuses a `BLOOMERY_RESIDENCY` word other than \
               `off`, and its unset draft and residency resolve `off`. The generators \

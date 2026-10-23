@@ -297,7 +297,7 @@
 # the caller's BLOOMERY_REMOTE, so box.sh's remote is that directory's basename: a tree it already
 # holds is not synced, and rsync never sends target/, so the binary already built there is the one
 # the recheck runs. The batch's own rc does not change.
-# DIR defaults to $HOME/.cache/bloomery/batches/<tree>/<stamp> (<tree> the
+# DIR defaults to $HOME/.cache/bloomery/batches/<tree>/<stamp>.<unique> (<tree> the
 # basename of this worktree's root): outside every tree, so the logs survive a `rm -rf target/`
 # cleanup of the worktrees and neither mark a tree dirty nor reach box.sh's rsync. An explicit
 # --out is still taken: under the tree's target/ it is gitignored and accepted, a DIR inside the
@@ -983,6 +983,7 @@ RT
   # The GPU hold's box-side writer is the real tools/gpu-gate.sh (with the real lease-probe.sh it sources): the fake box below runs
   # its --gpuhold calls on the fixture, so the batch's hold is the real one end to end.
   cp "$(dirname "$self")/gpu-gate.sh" "$t/tools/gpu-gate.sh"
+  cp "$(dirname "$self")/gate.sh" "$t/tools/gate.sh"
   mkdir -p "$t/tools/nightly"
   cp "$(dirname "$self")/nightly/units.sh" "$t/tools/nightly/units.sh"
   cp "$(dirname "$self")/ref/lease-probe.sh" "$t/tools/ref/lease-probe.sh"
@@ -1460,6 +1461,36 @@ FP
   # has run — on today's runner, 20 s and then in lane A. Lane B, idle, steals it onto the A6000;
   # the times row and the ledger key name that card.
   local slow_a='steal-slow@FAKE_SLEEP=20,FAKE_UNTIL=gen_b'
+  if gb_part 16; then
+  cp "$t/justfile" "$t/justfile.gpu"
+  cp "$t/tools/gate-batch-resources.tsv" "$t/resources.gpu"
+  cat >> "$t/justfile" <<'JF'
+
+lib-fixed:
+    ./tools/box.sh 'bash tools/gate.sh --gpu --oxide -p x --lib'
+
+lib-any:
+    ./tools/box.sh 'BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gate.sh --gpu --oxide -p x --lib'
+
+lib-script:
+    bash tools/lib-call.sh
+
+[group('solo-real')]
+lib-a6000:
+    BLOOMERY_CARD=a6000 ./tools/box.sh 'bash tools/gate.sh --gpu --oxide -p x --lib'
+JF
+  printf '%s\n' 'BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gate.sh --gpu --oxide -p x --lib' > "$t/tools/lib-call.sh"
+  printf 'lib-a6000\t-\t1000\n' >> "$t/tools/gate-batch-resources.tsv"
+  check 'a plain host gate stays card-free beside the opt-in GPU mode' 0 '^host[[:space:]]F[[:space:]]balanced[[:space:]]-' "${gb[@]}" --classes
+  check 'a locked lib with no card override is fixed to the 3090' 0 '^lib-fixed[[:space:]]A[[:space:]]fixed[[:space:]]3090' "${gb[@]}" --classes
+  check 'a locked lib with any has both card candidates' 0 '^lib-any[[:space:]]F[[:space:]]balanced[[:space:]]3090,a6000' "${gb[@]}" --classes
+  check 'a transitive locked lib retains its any card candidates' 0 '^lib-script[[:space:]]F[[:space:]]balanced[[:space:]]3090,a6000' "${gb[@]}" --classes
+  check 'a locked lib accepts the solo-real A6000 box pick' 0 '^lib-a6000[[:space:]]B[[:space:]]fixed[[:space:]]-' "${gb[@]}" --tier fixture --classes
+  printf '%s\n' '' "[group('host')]" 'lib-host:' "    ./tools/box.sh 'bash tools/gate.sh --gpu --oxide -p hd --lib'" >> "$t/justfile"
+  check 'a locked lib cannot run in the card-free host class' 65 'lib-host' "${gb[@]}" --classes
+  cp "$t/justfile.gpu" "$t/justfile"
+  cp "$t/resources.gpu" "$t/tools/gate-batch-resources.tsv"
+  fi
   if gb_part 1; then
   rc=$(steal_case steal-a "$slow_a	A	3090	30	$d" "host	B	none	70	$d" "steal-bal	A	3090	60	$d" \
     "plain-any	B	a6000	10	$d" -- "$slow_a" host steal-bal plain-any)
@@ -1807,6 +1838,14 @@ SH
   rc_ok 'chain: a lane item green on one key ends green' ch-lskip 3
   if [ "${res#* }" = 1 ]; then pass 'chain: … and its skip is recorded once'
   else fail 'chain: … and its skip is recorded once' "${res#* } skip lines (rc ${res% *}, 124 is the bound)"; fi
+  rc=0
+  res=$(
+    eval "$(declare -f stop_lanes | sed '1s/stop_lanes/lskip_stop_lanes/')"
+    stop_lanes() { lskip_stop_lanes "$@" || return $?; return 70; }
+    lskip_case ch-lskip-cleanup "$t/tools/gate-batch.sh"
+  ) || rc=$?
+  if [ "$rc" = 70 ] && [ -z "$res" ]; then pass 'chain: a failed lane cleanup returns its error without a result'
+  else fail 'chain: a failed lane cleanup returns its error without a result' "rc $rc, output [$res]"; fi
   mutant_of ch-lskip 's|^          claim_item "\$i" "\$lane" \|\| continue # the other lane skipped it first.*$|          true # MUTANT ch-lskip|' '# MUTANT ch-lskip$'
   res=$(lskip_case ch-lskipm "$t/tools/gate-batch-ch-lskip.sh")
   if [ "${res% *}" = 124 ] || [ "${res#* }" -gt 1 ]; then pass 'chain mutant: without the claim a green lane item skips again and again'
@@ -1988,7 +2027,13 @@ HK
   rc=$(BLOOMERY_BATCH_START_HOOK="$t/hk/no-such-hook" steal_case hook-m "plain-any	B	a6000	5	$d" -- plain-any)
   printf '%s' "$rc" > "$t/rc-hook-m"
   rc_ok 'start hook: a hook that is not there leaves the batch green' hook-m 1
-  want_count 'start hook: and is one stderr line with the shell'"'"'s 127' "$t/out-hook-m.log" '^gate-batch: start hook \(rc=127\): .*no-such-hook' 1
+  want_count 'start hook: and is one stderr line with the shell'"'"'s 127' "$t/out-hook-m.log" '^gate-batch: start hook \(rc=127\): .' 1
+  want 'start hook: the full log names the missing command' "$t/target/c-hook-m/start-hook.log" 'no-such-hook'
+  mkdir -p "$t/hk/summary"
+  echo 127 > "$t/hk/summary/start-hook.rc"
+  printf '%0250d\nsecond line\n' 0 > "$t/hk/summary/start-hook.log"
+  check 'start hook: the summary keeps at most 200 characters of its first line' 0 '^$' test \
+    "$(OUT=$t/hk/summary start_hook_say 2>&1)" = "gate-batch: start hook (rc=127): $(printf '%0200d' 0)"
   rc=$(BLOOMERY_BATCH_START_HOOK='   ' steal_case hook-b "plain-any	B	a6000	5	$d" -- plain-any)
   printf '%s' "$rc" > "$t/rc-hook-b"
   rc_ok 'start hook: a value of blanks leaves the batch green' hook-b 1
@@ -4062,7 +4107,7 @@ if [ "${1:-}" = --self-test ]; then
     *) die "--self-test takes nothing else, or --part K|all; $USAGE" ;;
   esac
 fi
-OUT='' SRC='' LIST='' DRY=0 LANES=2 LEDGER=0 RERUN=0 LMODE='' TRUST=0 TIER_FLAG='' NOHOLD=0 BUDGET_OK=0 WAIT_HOLD=''
+OUT='' OUT_AUTO=0 SRC='' LIST='' DRY=0 LANES=2 LEDGER=0 RERUN=0 LMODE='' TRUST=0 TIER_FLAG='' NOHOLD=0 BUDGET_OK=0 WAIT_HOLD=''
 CANARY=1 RED_MAIN=0
 ITEMS=()
 while [ $# -gt 0 ]; do
@@ -4226,6 +4271,8 @@ def closure(name, seen):
 
 
 GPU_GATE = "tools/gpu-gate.sh"
+GATE_ENTRY = r"(?:gpu-gate\.sh\b|gate\.sh\s+--gpu\b)"
+GATE_REF = re.compile(r"tools/" + GATE_ENTRY)
 ANY = "BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any}"
 # The names the structural rule (walk() and takes_lease below) cannot see: timing-card.sh, a library a
 # timing runner sources, which takes no lease itself; gpu-ab.py, a Python runner walk() does not read;
@@ -4301,16 +4348,16 @@ def takes_lease(path):
 # call's card form: `BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any}` (balanced), none (the 3090), or
 # any other BLOOMERY_GATE_CARD on the call (a form this runner does not read: refused). A mention in
 # a message (echo, printf, die, fail, say) is not a script the file runs.
-# tools/gpu-gate.sh itself is the runner a call reaches, and its text is not followed; nor is this file's
-# (check-recipes runs its --classes): its patterns and messages name the runner in strings the call pattern
-# would read as calls. A stub-test
+# Both gate runners are leaves: the call's mode owns whether gate.sh reaches the GPU runner.
+# Following gate.sh's conditional body would falsely give its CPU callers a GPU lock. This file's
+# patterns and messages are not followed either (check-recipes runs its --classes). A stub-test
 # harness (a directory named *-tests, tools/ref/card-tests) is named in the reason and not read: it
 # runs the lease and runner code against a lock of its own, and its fixtures hold both on purpose.
 WALK_DEPTH = 6
 BARE = re.compile(r"([A-Za-z0-9_.-][A-Za-z0-9_./-]*\.(?:sh|bash))\b")
-GATE_CALL = re.compile(CMD + r"(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*(?:bash\s+|exec\s+)?[^\s;&|#'\"]*gpu-gate\.sh\b", re.M)
+GATE_CALL = re.compile(CMD + r"(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*(?:bash\s+|exec\s+)?[^\s;&|#'\"]*" + GATE_ENTRY, re.M)
 BATCH = "tools/gate-batch.sh"
-RUNNER_SELF = {GPU_GATE, BATCH}
+RUNNER_SELF = {GPU_GATE, "tools/gate.sh", BATCH}
 MESSAGE = re.compile(r"^[\s{(!]*(?:echo|printf|die|fail|say)\b")
 
 
@@ -4424,7 +4471,7 @@ def classify(name):
             continue
         oxide = "cargo oxide" in text
         for seg in SEGMENT.split(text):
-            if GPU_GATE in seg:
+            if GATE_REF.search(seg):
                 if ANY in seg:
                     lanes_seen.add("B")
                     forms.add("any")
@@ -4738,7 +4785,7 @@ for n in sorted(recipes):
         continue
     text = "\n".join(body(m) for m in closure(n, set()))
     why = [f"[group('{g}')]" for g in ("solo", "solo-real", "v41-load") if group_of(n, g)]
-    why += [w for w, hit in (("a tools/gpu-gate.sh call", GPU_GATE in text), ("a box.sh card pick", BOX_CARD.search(text))) if hit]
+    why += [w for w, hit in (("a tools/gpu-gate.sh call", GATE_REF.search(text)), ("a box.sh card pick", BOX_CARD.search(text))) if hit]
     if why:
         host_bad.append(f"recipe {n}: [group('host')] with {' and '.join(why)} — a host recipe opens no card and runs beside other items")
 if host_bad:
@@ -4878,7 +4925,7 @@ for n in sorted(recipes):
         if lane in ("T", "R"):
             why.append(reason)
         elif pick:
-            if GPU_GATE not in text or "3090" in GATE_FORMS[n]:
+            if not GATE_REF.search(text) or "3090" in GATE_FORMS[n]:
                 seen = ", ".join(sorted(GATE_FORMS[n])) or "none"
                 why.append(f"{pick.group(0)} with no tools/gpu-gate.sh call that takes the pick (script forms: {seen}) — "
                            "the fixture tier fixes the recipe to the A6000's lane")
@@ -6004,6 +6051,7 @@ ledger_record() { # $1 = plan index, $2 = final rc: record a green item whose ke
 }
 
 if [ -z "$OUT" ]; then
+  OUT_AUTO=1
   OUT="$HOME/.cache/bloomery/batches/$(basename "$ROOT")/$(date +%Y%m%d-%H%M%S)"
 fi
 case "$OUT" in /*) ;; *) OUT="$PWD/$OUT" ;; esac
@@ -6025,9 +6073,15 @@ if [ "${below:-0}" = 1 ]; then
 fi
 
 if [ "$DRY" = 0 ]; then
-  mkdir -p "$OUT" || RC=73 die "cannot create the log directory $OUT"
-  [ -d "$OUT" ] && [ -w "$OUT" ] || RC=73 die "the log directory $OUT is not a writable directory"
-  [ ! -e "$OUT/run.log" ] || RC=73 die "$OUT already holds a batch (run.log) — give --out a new directory"
+  if [ "${OUT_AUTO:-0}" = 1 ]; then
+    mkdir -p "$(dirname "$OUT")" || RC=73 die "cannot create the log parent directory"
+    OUT=$(mktemp -d "$OUT.XXXXXX") || RC=73 die "cannot create a private log directory"
+  fi
+  # shellcheck source=tools/nightly/units.sh
+  source "$ROOT/tools/nightly/units.sh" || RC=70 die "cannot read the output directory owner"
+  output_dir_take "$OUT" || exit $?
+  trap 'rc=$?; output_dir_drop || rc=$?; exit "$rc"' EXIT
+  [ ! -e "$OUT/run.log" ] && [ ! -L "$OUT/run.log" ] || RC=73 die "$OUT already holds a batch (run.log) — give --out a new directory"
 fi
 RUNLOG=$OUT/run.log
 
@@ -6424,7 +6478,7 @@ fi
 # refusal here leaves no run.log, as the start check's does. Every exit from here on — the end, a red batch, die, INT/TERM (stop) —
 # takes it down through the EXIT trap.
 trap stop INT TERM
-trap hold_down EXIT
+trap 'rc=$?; hold_down; output_dir_drop || rc=$?; exit "$rc"' EXIT
 if [ "$HOLD_ON" = 1 ] && [ "$SKIP_N" -lt "$N" ]; then
   hold_up
   hold_beat_loop &

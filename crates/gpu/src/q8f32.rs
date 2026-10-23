@@ -88,7 +88,10 @@
 use crate::GpuError;
 use crate::fault::{FaultSink, FaultSite};
 use crate::flash::half_bits_to_f32;
-use crate::gemm::{Bf16Rows, F32T_THREADS_U32, STAGE_FLOATS, STAGES, f32_tile_body, tile_launch};
+use crate::gemm::{
+    Bf16Rows, F32T_THREADS_U32, MMA_THREADS, STAGE_FLOATS, STAGES, bf16_mma_body, bf16_mma_launch,
+    f32_tile_body, tile_launch,
+};
 use crate::launch_u32;
 use crate::tensor::DeviceTensor;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
@@ -118,6 +121,79 @@ pub trait RowValues: Copy {
     ///
     /// `i` is below the weight's value count.
     unsafe fn at(self, i: usize) -> f32;
+
+    /// The [`LANE_UNROLL`] chunk values a lane reads at `at`, values
+    /// `at + 32·j` for j = 0..8, each load issued before any value is made
+    /// from one, so the loads are in flight together.
+    ///
+    /// # Safety
+    ///
+    /// `at + 224` is below the weight's value count.
+    #[inline(always)]
+    unsafe fn chunks8(self, at: usize) -> [f32; LANE_UNROLL] {
+        // SAFETY: at + 32·j <= at + 224, below the value count by this fn's
+        // contract.
+        unsafe {
+            [
+                self.at(at),
+                self.at(at + 32),
+                self.at(at + 64),
+                self.at(at + 96),
+                self.at(at + 128),
+                self.at(at + 160),
+                self.at(at + 192),
+                self.at(at + 224),
+            ]
+        }
+    }
+
+    /// [`RowValues::chunks8`] at [`LANE_UNROLL_W32`] chunks: values
+    /// `at + 32·j` for j = 0..32.
+    ///
+    /// # Safety
+    ///
+    /// `at + 992` is below the weight's value count.
+    #[inline(always)]
+    unsafe fn chunks32(self, at: usize) -> [f32; LANE_UNROLL_W32] {
+        // SAFETY: at + 32·j <= at + 992, below the value count by this fn's
+        // contract.
+        unsafe {
+            [
+                self.at(at),
+                self.at(at + 32),
+                self.at(at + 64),
+                self.at(at + 96),
+                self.at(at + 128),
+                self.at(at + 160),
+                self.at(at + 192),
+                self.at(at + 224),
+                self.at(at + 256),
+                self.at(at + 288),
+                self.at(at + 320),
+                self.at(at + 352),
+                self.at(at + 384),
+                self.at(at + 416),
+                self.at(at + 448),
+                self.at(at + 480),
+                self.at(at + 512),
+                self.at(at + 544),
+                self.at(at + 576),
+                self.at(at + 608),
+                self.at(at + 640),
+                self.at(at + 672),
+                self.at(at + 704),
+                self.at(at + 736),
+                self.at(at + 768),
+                self.at(at + 800),
+                self.at(at + 832),
+                self.at(at + 864),
+                self.at(at + 896),
+                self.at(at + 928),
+                self.at(at + 960),
+                self.at(at + 992),
+            ]
+        }
+    }
 }
 
 impl RowValues for &[f32] {
@@ -132,6 +208,28 @@ impl RowValues for &[f32] {
 /// word `j`, `2j + 1` in its high half.
 #[derive(Clone, Copy)]
 pub(crate) struct Bf16Words<'a>(pub &'a [u32]);
+
+#[derive(Clone, Copy)]
+struct Nvfp4Values<'a> {
+    qs: &'a [u32],
+    e: &'a [u32],
+}
+
+impl RowValues for Nvfp4Values<'_> {
+    #[inline(always)]
+    unsafe fn at(self, i: usize) -> f32 {
+        let sub = i / 16;
+        let off = i % 16;
+        // SAFETY: i is inside the weight's logical span; two code words hold each sub-block.
+        let q = unsafe { *self.qs.get_unchecked(sub * 2 + (off % 8) / 4) };
+        // SAFETY: one scale word holds four sub-blocks inside the same logical span.
+        let e = unsafe { *self.e.get_unchecked(sub / 4) };
+        let (low, high) = crate::cores::table16_word(q, crate::mxfp4::E2M1);
+        let codes = if off < 8 { low } else { high };
+        let value = (codes >> (8 * (off % 4))) as u8 as i8 as f32;
+        value * crate::mxfp4::ue4m3_half((e >> (8 * (sub % 4))) & 255)
+    }
+}
 
 impl Bf16Words<'_> {
     /// The f32 of the BF16 value in half `odd` of word `w`: its sixteen bits
@@ -149,6 +247,111 @@ impl RowValues for Bf16Words<'_> {
         // below the weight's value count (this fn's contract).
         let w = unsafe { *self.0.get_unchecked(i >> 1) };
         Bf16Words::widen(w, i & 1 == 1)
+    }
+
+    // The chunks' words are loaded first and widened after: a widening
+    // between two loads waits for the first load's word, so it would hold
+    // the next load back and leave one in flight. Value `at + 32·j` is in
+    // word `at / 2 + 16·j`, in the half `at`'s parity names.
+    #[inline(always)]
+    unsafe fn chunks8(self, at: usize) -> [f32; LANE_UNROLL] {
+        let (w, odd) = (self.0, at & 1 == 1);
+        let at = at >> 1;
+        // SAFETY: word at + 16·j holds value 2·at + 32·j <= 2·at + 224,
+        // below the value count by this fn's contract.
+        let r = unsafe {
+            [
+                *w.get_unchecked(at),
+                *w.get_unchecked(at + 16),
+                *w.get_unchecked(at + 32),
+                *w.get_unchecked(at + 48),
+                *w.get_unchecked(at + 64),
+                *w.get_unchecked(at + 80),
+                *w.get_unchecked(at + 96),
+                *w.get_unchecked(at + 112),
+            ]
+        };
+        let v = |j: usize| Bf16Words::widen(r[j], odd);
+        [v(0), v(1), v(2), v(3), v(4), v(5), v(6), v(7)]
+    }
+
+    #[inline(always)]
+    unsafe fn chunks32(self, at: usize) -> [f32; LANE_UNROLL_W32] {
+        let (w, odd) = (self.0, at & 1 == 1);
+        let at = at >> 1;
+        // SAFETY: word at + 16·j holds value 2·at + 32·j <= 2·at + 992,
+        // below the value count by this fn's contract.
+        let r = unsafe {
+            [
+                *w.get_unchecked(at),
+                *w.get_unchecked(at + 16),
+                *w.get_unchecked(at + 32),
+                *w.get_unchecked(at + 48),
+                *w.get_unchecked(at + 64),
+                *w.get_unchecked(at + 80),
+                *w.get_unchecked(at + 96),
+                *w.get_unchecked(at + 112),
+                *w.get_unchecked(at + 128),
+                *w.get_unchecked(at + 144),
+                *w.get_unchecked(at + 160),
+                *w.get_unchecked(at + 176),
+                *w.get_unchecked(at + 192),
+                *w.get_unchecked(at + 208),
+                *w.get_unchecked(at + 224),
+                *w.get_unchecked(at + 240),
+                *w.get_unchecked(at + 256),
+                *w.get_unchecked(at + 272),
+                *w.get_unchecked(at + 288),
+                *w.get_unchecked(at + 304),
+                *w.get_unchecked(at + 320),
+                *w.get_unchecked(at + 336),
+                *w.get_unchecked(at + 352),
+                *w.get_unchecked(at + 368),
+                *w.get_unchecked(at + 384),
+                *w.get_unchecked(at + 400),
+                *w.get_unchecked(at + 416),
+                *w.get_unchecked(at + 432),
+                *w.get_unchecked(at + 448),
+                *w.get_unchecked(at + 464),
+                *w.get_unchecked(at + 480),
+                *w.get_unchecked(at + 496),
+            ]
+        };
+        let v = |j: usize| Bf16Words::widen(r[j], odd);
+        [
+            v(0),
+            v(1),
+            v(2),
+            v(3),
+            v(4),
+            v(5),
+            v(6),
+            v(7),
+            v(8),
+            v(9),
+            v(10),
+            v(11),
+            v(12),
+            v(13),
+            v(14),
+            v(15),
+            v(16),
+            v(17),
+            v(18),
+            v(19),
+            v(20),
+            v(21),
+            v(22),
+            v(23),
+            v(24),
+            v(25),
+            v(26),
+            v(27),
+            v(28),
+            v(29),
+            v(30),
+            v(31),
+        ]
     }
 }
 
@@ -219,6 +422,7 @@ pub(crate) unsafe fn f32_lane_partials<W: RowValues>(
     let k = k as usize;
     let w_row = row * k;
     let iters = k >> 5;
+    let m = m_cols as usize;
     let mut f0 = 0.0f32;
     let mut f1 = 0.0f32;
     let mut f2 = 0.0f32;
@@ -228,49 +432,56 @@ pub(crate) unsafe fn f32_lane_partials<W: RowValues>(
     let mut f6 = 0.0f32;
     let mut f7 = 0.0f32;
     let mut it = 0usize;
-    // The column guards are runtime tests, so a multiply-add sits behind
-    // its column's branch, and one chunk a trip would leave one load in
-    // flight. A trip takes [`LANE_UNROLL`] chunks instead: the row's words
-    // once for every column, then each live column's chunks loaded before
-    // its first multiply-add. Each column still adds its chunks in
-    // increasing `it`; the guarded walk below is the tail.
+    // A trip takes [`LANE_UNROLL`] chunks: the row's words once for every
+    // column, then the chunks of two columns at a time, both loaded before
+    // the first of their multiply-adds, so a trip waits on one load round
+    // trip per pair of columns instead of one per column and holds one
+    // pair's chunks at a time. When `m_cols` is odd, the last pair's second
+    // column reads column 0's chunks, which keeps the pair under one branch,
+    // and its sum is reset before the tail. Each column still adds its
+    // chunks in increasing `it`; the guarded walk below is the tail.
+    let odd = |c: usize| if c < m { c * k } else { 0 };
+    let (a3, a5, a7) = (odd(3), odd(5), odd(7));
     while it + LANE_UNROLL <= iters {
         let kk = it * 32 + lane;
         // SAFETY: w_row + kk + 224 < w_row + k, inside w: kk + 224 < k by
         // the loop guard (LANE_UNROLL = 8) and the safety contract.
-        let wv = unsafe { f32_load_chunks(w, w_row + kk) };
+        let wv = unsafe { w.chunks8(w_row + kk) };
         // SAFETY: kk + 224 < k <= x.len(), since m_cols >= 1.
-        f0 = unsafe { f32_fold_chunks(f0, &wv, x, kk) };
-        if m_cols > 1 {
-            // SAFETY: k + kk + 224 < 2*k <= x.len(), since m_cols > 1.
-            f1 = unsafe { f32_fold_chunks(f1, &wv, x, k + kk) };
-        }
+        let x0 = unsafe { x.chunks8(kk) };
+        // SAFETY: m_cols > 1 here, so k + kk + 224 < 2*k <= x.len().
+        let x1 = unsafe { x.chunks8(k + kk) };
+        f0 = f32_fold_values(f0, &wv, &x0);
+        f1 = f32_fold_values(f1, &wv, &x1);
         if m_cols > 2 {
             // SAFETY: 2*k + kk + 224 < 3*k <= x.len(), since m_cols > 2.
-            f2 = unsafe { f32_fold_chunks(f2, &wv, x, 2 * k + kk) };
-        }
-        if m_cols > 3 {
-            // SAFETY: 3*k + kk + 224 < 4*k <= x.len(), since m_cols > 3.
-            f3 = unsafe { f32_fold_chunks(f3, &wv, x, 3 * k + kk) };
+            let x2 = unsafe { x.chunks8(2 * k + kk) };
+            // SAFETY: a3 is 3*k when m_cols > 3 and 0 otherwise, so
+            // a3 + kk + 224 < m_cols*k <= x.len().
+            let x3 = unsafe { x.chunks8(a3 + kk) };
+            f2 = f32_fold_values(f2, &wv, &x2);
+            f3 = f32_fold_values(f3, &wv, &x3);
         }
         if m_cols > 4 {
             // SAFETY: 4*k + kk + 224 < 5*k <= x.len(), since m_cols > 4.
-            f4 = unsafe { f32_fold_chunks(f4, &wv, x, 4 * k + kk) };
-        }
-        if m_cols > 5 {
-            // SAFETY: 5*k + kk + 224 < 6*k <= x.len(), since m_cols > 5.
-            f5 = unsafe { f32_fold_chunks(f5, &wv, x, 5 * k + kk) };
+            let x4 = unsafe { x.chunks8(4 * k + kk) };
+            // SAFETY: a5 is 5*k when m_cols > 5 and 0 otherwise; as for a3.
+            let x5 = unsafe { x.chunks8(a5 + kk) };
+            f4 = f32_fold_values(f4, &wv, &x4);
+            f5 = f32_fold_values(f5, &wv, &x5);
         }
         if m_cols > 6 {
             // SAFETY: 6*k + kk + 224 < 7*k <= x.len(), since m_cols > 6.
-            f6 = unsafe { f32_fold_chunks(f6, &wv, x, 6 * k + kk) };
-        }
-        if m_cols > 7 {
-            // SAFETY: 7*k + kk + 224 < 8*k <= x.len(), since m_cols > 7.
-            f7 = unsafe { f32_fold_chunks(f7, &wv, x, 7 * k + kk) };
+            let x6 = unsafe { x.chunks8(6 * k + kk) };
+            // SAFETY: a7 is 7*k when m_cols > 7 and 0 otherwise; as for a3.
+            let x7 = unsafe { x.chunks8(a7 + kk) };
+            f6 = f32_fold_values(f6, &wv, &x6);
+            f7 = f32_fold_values(f7, &wv, &x7);
         }
         it += LANE_UNROLL;
     }
+    let live = |c: usize, f: f32| if c < m { f } else { 0.0 };
+    let (mut f3, mut f5, mut f7) = (live(3, f3), live(5, f5), live(7, f7));
     while it < iters {
         let kk = it * 32 + lane;
         // SAFETY: w_row + kk < (row + 1)·k, inside w by the safety contract.
@@ -313,30 +524,6 @@ pub(crate) unsafe fn f32_lane_partials<W: RowValues>(
     [f0, f1, f2, f3, f4, f5, f6, f7]
 }
 
-/// The [`LANE_UNROLL`] chunk values a lane reads at `at`:
-/// `v[at + 32·i]` for i = 0..8.
-///
-/// # Safety
-///
-/// `at + 224` is below `v`'s value count.
-#[inline(always)]
-unsafe fn f32_load_chunks<V: RowValues>(v: V, at: usize) -> [f32; LANE_UNROLL] {
-    // SAFETY: at + 32·i <= at + 224, below v's value count by this fn's
-    // contract.
-    unsafe {
-        [
-            v.at(at),
-            v.at(at + 32),
-            v.at(at + 64),
-            v.at(at + 96),
-            v.at(at + 128),
-            v.at(at + 160),
-            v.at(at + 192),
-            v.at(at + 224),
-        ]
-    }
-}
-
 /// `f` with the [`LANE_UNROLL`] chunks of one column added in order:
 /// `fma(w[i], x[at + 32·i], ·)` for i = 0..8, the column's loads issued
 /// before the first multiply-add.
@@ -347,7 +534,15 @@ unsafe fn f32_load_chunks<V: RowValues>(v: V, at: usize) -> [f32; LANE_UNROLL] {
 #[inline(always)]
 unsafe fn f32_fold_chunks(f: f32, w: &[f32; LANE_UNROLL], x: &[f32], at: usize) -> f32 {
     // SAFETY: at + 224 < x.len() by this fn's contract.
-    let [x0, x1, x2, x3, x4, x5, x6, x7] = unsafe { f32_load_chunks(x, at) };
+    let xv = unsafe { x.chunks8(at) };
+    f32_fold_values(f, w, &xv)
+}
+
+/// `f` with the [`LANE_UNROLL`] chunk products of one column added in
+/// order: `fma(w[i], x[i], ·)` for i = 0..8.
+#[inline(always)]
+fn f32_fold_values(f: f32, w: &[f32; LANE_UNROLL], x: &[f32; LANE_UNROLL]) -> f32 {
+    let [x0, x1, x2, x3, x4, x5, x6, x7] = *x;
     let f = f32::mul_add(w[0], x0, f);
     let f = f32::mul_add(w[1], x1, f);
     let f = f32::mul_add(w[2], x2, f);
@@ -403,7 +598,7 @@ pub unsafe fn f32_lane_partial_1col<W: RowValues>(
         let kk = it * 32 + lane;
         // SAFETY: w_row + kk + 224 < w_row + k, inside w: kk + 224 < k by
         // the loop guard (LANE_UNROLL = 8) and the caller contract.
-        let wv = unsafe { f32_load_chunks(w, w_row + kk) };
+        let wv = unsafe { w.chunks8(w_row + kk) };
         // SAFETY: kk + 224 < k <= x.len() by the loop guard and the caller
         // contract.
         f = unsafe { f32_fold_chunks(f, &wv, x, kk) };
@@ -435,16 +630,17 @@ const _: () = assert!(LANE_UNROLL_W32 == 32 && LANE_UNROLL_W32.is_multiple_of(LA
 /// `Σ_it fma(w[row·k + 32·it + lane], x[32·it + lane])`, accumulated
 /// sequentially in `it`, so the result is that function's bit for bit. The
 /// chunks past the last whole 32-chunk trip run through the 8-wide trip and
-/// then one at a time, continuing the same sum in the same order.
+/// then one at a time, continuing the same sum in the same order. A BF16
+/// weight's words ([`Bf16Words`]) give the F32 walk of its widened values.
 ///
 /// # Safety
 ///
-/// [`f32_lane_partial_1col`]'s contract: `w.len() >= (row + 1) * k`,
-/// `x.len() >= k`, `k` a positive multiple of 32, `lane < 32`. The body
-/// reads `w` and `x` unchecked within those bounds.
+/// [`f32_lane_partial_1col`]'s contract: `w` holds at least `(row + 1) * k`
+/// values, `x.len() >= k`, `k` a positive multiple of 32, `lane < 32`. The
+/// body reads `w` and `x` unchecked within those bounds.
 #[inline(always)]
-pub unsafe fn f32_lane_partial_1col_w32(
-    w: &[f32],
+pub unsafe fn f32_lane_partial_1col_w32<W: RowValues>(
+    w: W,
     x: &[f32],
     k: u32,
     row: usize,
@@ -459,9 +655,9 @@ pub unsafe fn f32_lane_partial_1col_w32(
     while it + LANE_UNROLL_W32 <= iters {
         let kk = it * 32 + lane;
         // SAFETY: kk + 992 < k by the loop guard (LANE_UNROLL_W32 = 32), so
-        // every read is inside w[w_row .. w_row + k] and x[0 .. k], both
-        // covered by the caller contract (w.len() >= (row+1)*k, x.len() >= k).
-        let (
+        // every read is inside the row's values w_row .. w_row + k, which
+        // the caller contract covers (w holds (row + 1)·k values).
+        let [
             w0,
             w1,
             w2,
@@ -494,6 +690,10 @@ pub unsafe fn f32_lane_partial_1col_w32(
             w29,
             w30,
             w31,
+        ] = unsafe { w.chunks32(w_row + kk) };
+        // SAFETY: kk + 992 < k <= x.len() by the loop guard and the caller
+        // contract.
+        let [
             x0,
             x1,
             x2,
@@ -526,74 +726,7 @@ pub unsafe fn f32_lane_partial_1col_w32(
             x29,
             x30,
             x31,
-        ) = unsafe {
-            (
-                *w.get_unchecked(w_row + kk),
-                *w.get_unchecked(w_row + kk + 32),
-                *w.get_unchecked(w_row + kk + 64),
-                *w.get_unchecked(w_row + kk + 96),
-                *w.get_unchecked(w_row + kk + 128),
-                *w.get_unchecked(w_row + kk + 160),
-                *w.get_unchecked(w_row + kk + 192),
-                *w.get_unchecked(w_row + kk + 224),
-                *w.get_unchecked(w_row + kk + 256),
-                *w.get_unchecked(w_row + kk + 288),
-                *w.get_unchecked(w_row + kk + 320),
-                *w.get_unchecked(w_row + kk + 352),
-                *w.get_unchecked(w_row + kk + 384),
-                *w.get_unchecked(w_row + kk + 416),
-                *w.get_unchecked(w_row + kk + 448),
-                *w.get_unchecked(w_row + kk + 480),
-                *w.get_unchecked(w_row + kk + 512),
-                *w.get_unchecked(w_row + kk + 544),
-                *w.get_unchecked(w_row + kk + 576),
-                *w.get_unchecked(w_row + kk + 608),
-                *w.get_unchecked(w_row + kk + 640),
-                *w.get_unchecked(w_row + kk + 672),
-                *w.get_unchecked(w_row + kk + 704),
-                *w.get_unchecked(w_row + kk + 736),
-                *w.get_unchecked(w_row + kk + 768),
-                *w.get_unchecked(w_row + kk + 800),
-                *w.get_unchecked(w_row + kk + 832),
-                *w.get_unchecked(w_row + kk + 864),
-                *w.get_unchecked(w_row + kk + 896),
-                *w.get_unchecked(w_row + kk + 928),
-                *w.get_unchecked(w_row + kk + 960),
-                *w.get_unchecked(w_row + kk + 992),
-                *x.get_unchecked(kk),
-                *x.get_unchecked(kk + 32),
-                *x.get_unchecked(kk + 64),
-                *x.get_unchecked(kk + 96),
-                *x.get_unchecked(kk + 128),
-                *x.get_unchecked(kk + 160),
-                *x.get_unchecked(kk + 192),
-                *x.get_unchecked(kk + 224),
-                *x.get_unchecked(kk + 256),
-                *x.get_unchecked(kk + 288),
-                *x.get_unchecked(kk + 320),
-                *x.get_unchecked(kk + 352),
-                *x.get_unchecked(kk + 384),
-                *x.get_unchecked(kk + 416),
-                *x.get_unchecked(kk + 448),
-                *x.get_unchecked(kk + 480),
-                *x.get_unchecked(kk + 512),
-                *x.get_unchecked(kk + 544),
-                *x.get_unchecked(kk + 576),
-                *x.get_unchecked(kk + 608),
-                *x.get_unchecked(kk + 640),
-                *x.get_unchecked(kk + 672),
-                *x.get_unchecked(kk + 704),
-                *x.get_unchecked(kk + 736),
-                *x.get_unchecked(kk + 768),
-                *x.get_unchecked(kk + 800),
-                *x.get_unchecked(kk + 832),
-                *x.get_unchecked(kk + 864),
-                *x.get_unchecked(kk + 896),
-                *x.get_unchecked(kk + 928),
-                *x.get_unchecked(kk + 960),
-                *x.get_unchecked(kk + 992),
-            )
-        };
+        ] = unsafe { x.chunks32(kk) };
         f = f32::mul_add(w0, x0, f);
         f = f32::mul_add(w1, x1, f);
         f = f32::mul_add(w2, x2, f);
@@ -632,7 +765,7 @@ pub unsafe fn f32_lane_partial_1col_w32(
         let kk = it * 32 + lane;
         // SAFETY: w_row + kk + 224 < w_row + k <= w.len(): kk + 224 < k by
         // the loop guard (LANE_UNROLL = 8) and the caller contract.
-        let wv = unsafe { f32_load_chunks(w, w_row + kk) };
+        let wv = unsafe { w.chunks8(w_row + kk) };
         // SAFETY: kk + 224 < k <= x.len() by the loop guard and the caller
         // contract.
         f = unsafe { f32_fold_chunks(f, &wv, x, kk) };
@@ -642,7 +775,7 @@ pub unsafe fn f32_lane_partial_1col_w32(
         let kk = it * 32 + lane;
         // SAFETY: kk < k by the loop guard, so both reads are inside
         // w[w_row .. w_row + k] and x[0 .. k] by the caller contract.
-        let (wv, xv) = unsafe { (*w.get_unchecked(w_row + kk), *x.get_unchecked(kk)) };
+        let (wv, xv) = unsafe { (w.at(w_row + kk), *x.get_unchecked(kk)) };
         f = f32::mul_add(wv, xv, f);
         it += 1;
     }
@@ -1337,6 +1470,75 @@ unsafe fn blocks_lane_partials_m<F: ByteBlocks>(
     })
 }
 
+/// # Safety
+/// The caller validates both planes for F, ids for n_rows, x for k*m,
+/// and y for n_rows*m. k is positive and m is in 1..=8.
+#[inline(always)]
+unsafe fn blocks_gemv_ids<F: ByteBlocks>(
+    weight: (&[u32], &[F::Scale]),
+    x: &[f32],
+    map: (&[u32], u32, u32),
+    shape: (u32, u32),
+    fault: FaultSink,
+    mut y: DisjointSlice<f32>,
+) {
+    let (qs, d) = weight;
+    let (ids, n_rows, n_matrix) = map;
+    let (k, m_cols) = shape;
+    let t = thread::threadIdx_x() as usize;
+    let row = thread::blockIdx_x() as usize * 8 + t / 32;
+    if row >= n_rows as usize {
+        return;
+    }
+    // SAFETY: row < n_rows <= ids.len() by the launch contract.
+    let id = unsafe { *ids.get_unchecked(row) };
+    let lane = warp::lane_id() as usize;
+    if id >= n_matrix {
+        if lane == 0 {
+            fault.raise(FaultSite::TokenId);
+            // SAFETY: the slots row*m_cols + c, c < m_cols <= 8, lie in
+            // row*m_cols .. (row+1)*m_cols <= n_rows*m_cols <= y.len(), the
+            // launch contract's bound; only lane 0 of the row's warp
+            // writes them.
+            unsafe {
+                store_sums(
+                    &mut y,
+                    row * m_cols as usize,
+                    1,
+                    m_cols as usize,
+                    &[f32::NAN; 8],
+                );
+            }
+        }
+        return;
+    }
+    // SAFETY: id < n_matrix puts the matrix row's words and scales inside
+    // qs and d (the host-checked code and scale extents), and
+    // column c at c*k with x.len() >= m_cols*k = (m_cols-1)*k + k; the
+    // host passes k a positive multiple of 32.
+    let f = if m_cols == 1 {
+        // SAFETY: the validated row and planes cover this one input column.
+        let f = unsafe { blocks_lane_partial_1col::<F>(qs, d, x, k, id as usize, 0, lane) };
+        [f, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    } else {
+        // SAFETY: the validated row and planes cover the m_cols input columns.
+        let Some(f) = (unsafe {
+            blocks_lane_partials_m::<F>(qs, d, x, k, id as usize, 0, k as usize, m_cols, lane)
+        }) else {
+            return;
+        };
+        f
+    };
+    let sums = gemv_lane_sums(f, m_cols);
+    if lane == 0 {
+        // SAFETY: the slots row*m_cols + c, c < m_cols <= 8, lie in
+        // row*m_cols .. (row+1)*m_cols <= n_rows*m_cols <= y.len(), the
+        // launch contract's bound; only lane 0 of the row's warp writes
+        // them.
+        unsafe { store_sums(&mut y, row * m_cols as usize, 1, m_cols as usize, &sums) };
+    }
+}
+
 /// The row's m sums from the per-lane partials: the fixed five-step
 /// butterfly per column (`warp::reduce_sum_f32`), columns past `m_cols`
 /// left at 0.0. `m_cols` must be warp-uniform — a launch-wide constant in
@@ -1704,6 +1906,36 @@ mod q8f32_kernels {
         unsafe { f32_tile_body(Bf16Rows(w), x, rows, k, n, &mut y, sh) };
     }
 
+    /// Dense prompt product with BF16 operands and F32 accumulation.
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            rows >= 1,
+            n >= 1,
+            2 * w.len() >= rows * k,
+            x.len() >= n * k,
+            y.len() >= rows * n
+        )
+    )]
+    pub fn bf16_mma_gemm(
+        w: &[u32],
+        x: &[f32],
+        rows: u32,
+        k: u32,
+        n: u32,
+        mut y: DisjointSlice<f32>,
+    ) {
+        static mut STAGE: SharedArray<f32, { STAGES * STAGE_FLOATS }, 16> = SharedArray::UNINIT;
+        // SAFETY: this block's aligned shared allocation, accessed without a reference.
+        let sh = unsafe { SharedArray::as_raw_mut_ptr(&raw mut STAGE) };
+        // SAFETY: the checked launch supplies 256 converged threads, the grid,
+        // aligned activations and the weight and output spans in the contract.
+        unsafe { bf16_mma_body(Bf16Rows(w), x, rows, k, n, &mut y, sh) };
+    }
+
     /// Q8_0 gemv against one f32 activation column, `y[r] = Σ_k' w[r, k'] ·
     /// x[k']`, the decode shape: `f32_gemv`'s skeleton, weights decoded per
     /// the module doc's device layout, each lane's share of the row walked by
@@ -1872,6 +2104,10 @@ mod q8f32_kernels {
             y.len() >= n_rows * m_cols
         )
     )]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the flat arguments (rust-quality R8)"
+    )]
     pub fn mxfp8_gemv_mcol(
         qs: &[u32],
         e: &[u32],
@@ -1879,6 +2115,8 @@ mod q8f32_kernels {
         n_rows: u32,
         k: u32,
         m_cols: u32,
+        y_row: u32,
+        y_col: u32,
         mut y: DisjointSlice<f32>,
     ) {
         let t = thread::index_1d().get() % 256;
@@ -1896,10 +2134,16 @@ mod q8f32_kernels {
         };
         let sums = gemv_lane_sums(f, m_cols);
         if lane == 0 {
-            // SAFETY: row + c*n_rows < n_rows*m_cols <= y.len();
+            // SAFETY: the launcher selects row-major or token-major strides within y;
             // this row's lane 0 alone writes these slots.
             unsafe {
-                store_sums(&mut y, row, n_rows as usize, m_cols as usize, &sums);
+                store_sums(
+                    &mut y,
+                    row * y_row as usize,
+                    y_col as usize,
+                    m_cols as usize,
+                    &sums,
+                );
             }
         }
     }
@@ -1961,6 +2205,10 @@ mod q8f32_kernels {
             y.len() >= n_rows * m_cols
         )
     )]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the flat arguments (rust-quality R8)"
+    )]
     pub fn fp8_b128_gemv_mcol(
         qs: &[u32],
         e: &[u32],
@@ -1968,6 +2216,8 @@ mod q8f32_kernels {
         n_rows: u32,
         k: u32,
         m_cols: u32,
+        y_row: u32,
+        y_col: u32,
         mut y: DisjointSlice<f32>,
     ) {
         let t = thread::index_1d().get() % 256;
@@ -1985,10 +2235,16 @@ mod q8f32_kernels {
         };
         let sums = gemv_lane_sums(f, m_cols);
         if lane == 0 {
-            // SAFETY: row + c*n_rows < n_rows*m_cols <= y.len();
+            // SAFETY: the launcher selects row-major or token-major strides within y;
             // this row's lane 0 alone writes these slots.
             unsafe {
-                store_sums(&mut y, row, n_rows as usize, m_cols as usize, &sums);
+                store_sums(
+                    &mut y,
+                    row * y_row as usize,
+                    y_col as usize,
+                    m_cols as usize,
+                    &sums,
+                );
             }
         }
     }
@@ -2141,6 +2397,78 @@ mod q8f32_kernels {
                 row,
                 &mut y,
             );
+        }
+    }
+
+    /// NVFP4 selected rows over unquantized activations, with one tensor scale per expert.
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            8 * qs.len() >= n_experts * rows_per_expert * k,
+            64 * e.len() >= n_experts * rows_per_expert * k,
+            scales.len() >= n_experts,
+            slots_per_col >= 1,
+            n_slots <= m_cols * slots_per_col,
+            x.len() >= m_cols * k,
+            sel.len() >= n_slots,
+            y.len() >= n_slots * rows_per_expert
+        )
+    )]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the flat arguments (rust-quality R8)"
+    )]
+    pub fn nvfp4_gemv_sel_f32(
+        qs: &[u32],
+        e: &[u32],
+        scales: &[f32],
+        x: &[f32],
+        sel: &[u32],
+        n_experts: u32,
+        rows_per_expert: u32,
+        n_slots: u32,
+        m_cols: u32,
+        slots_per_col: u32,
+        k: u32,
+        fault: FaultSink,
+        mut y: DisjointSlice<f32>,
+    ) {
+        let _ = m_cols;
+        let t = thread::index_1d().get() % 256;
+        let row = (thread::index_1d().get() / 256) * 8 + t / 32;
+        if row >= n_slots as usize * rows_per_expert as usize {
+            return;
+        }
+        let slot = row / rows_per_expert as usize;
+        // SAFETY: slot < n_slots <= sel.len() by the launch contract.
+        let id = unsafe { *sel.get_unchecked(slot) };
+        let lane = warp::lane_id() as usize;
+        let mut sum = f32::NAN;
+        if id < n_experts {
+            let row_abs = id as usize * rows_per_expert as usize + row % rows_per_expert as usize;
+            let col = slot / slots_per_col as usize;
+            // SAFETY: col < m_cols, whose k-value columns the launch contract covers.
+            let x = unsafe { x.get_unchecked(col * k as usize..) };
+            // SAFETY: the launch contract covers the selected row and activation column.
+            let partial =
+                unsafe { f32_lane_partial_1col(Nvfp4Values { qs, e }, x, k, row_abs, lane) };
+            sum = warp::reduce_sum_f32(partial);
+            // SAFETY: id < n_experts <= scales.len().
+            let scale = unsafe { *scales.get_unchecked(id as usize) };
+            sum *= scale;
+            if !sum.is_finite() && lane == 0 {
+                fault.raise(FaultSite::F32Product);
+                sum = f32::NAN;
+            }
+        } else if lane == 0 {
+            fault.raise(FaultSite::ExpertId);
+        }
+        if lane == 0 {
+            // SAFETY: row < n_slots * rows_per_expert <= y.len(), with one writer per row.
+            unsafe { *y.get_unchecked_mut(row) = sum };
         }
     }
 
@@ -2313,62 +2641,55 @@ mod q8f32_kernels {
         k: u32,
         m_cols: u32,
         fault: FaultSink,
-        mut y: DisjointSlice<f32>,
+        y: DisjointSlice<f32>,
     ) {
-        let t = thread::index_1d().get() % 256;
-        let row = (thread::index_1d().get() / 256) * 8 + t / 32;
-        if row >= n_rows as usize {
-            return;
-        }
-        // SAFETY: row < n_rows <= ids.len() by the launch contract.
-        let id = unsafe { *ids.get_unchecked(row) };
-        let lane = warp::lane_id() as usize;
-        if id >= n_matrix {
-            if lane == 0 {
-                fault.raise(FaultSite::TokenId);
-                // SAFETY: the slots row*m_cols + c, c < m_cols <= 8, lie in
-                // row*m_cols .. (row+1)*m_cols <= n_rows*m_cols <= y.len(), the
-                // launch contract's bound; only lane 0 of the row's warp
-                // writes them.
-                unsafe {
-                    store_sums(
-                        &mut y,
-                        row * m_cols as usize,
-                        1,
-                        m_cols as usize,
-                        &[f32::NAN; 8],
-                    );
-                }
-            }
-            return;
-        }
-        // SAFETY: id < n_matrix puts the matrix row's words and scales inside
-        // qs and d (the contract's 4·qs.len() and 32·d.len() bounds), and
-        // column c at c*k with x.len() >= m_cols*k = (m_cols-1)*k + k; the
-        // host passes k a positive multiple of 32.
-        let Some(f) = (unsafe {
-            blocks_lane_partials_m::<Q8_0Bytes>(
-                qs,
-                d,
-                x,
-                k,
-                id as usize,
-                0,
-                k as usize,
-                m_cols,
-                lane,
-            )
-        }) else {
-            return;
+        // SAFETY: the launch contract bounds each buffer; the host checks k and m.
+        unsafe {
+            blocks_gemv_ids::<Q8_0Bytes>((qs, d), x, (ids, n_rows, n_matrix), (k, m_cols), fault, y)
         };
-        let sums = gemv_lane_sums(f, m_cols);
-        if lane == 0 {
-            // SAFETY: the slots row*m_cols + c, c < m_cols <= 8, lie in
-            // row*m_cols .. (row+1)*m_cols <= n_rows*m_cols <= y.len(), the
-            // launch contract's bound; only lane 0 of the row's warp writes
-            // them.
-            unsafe { store_sums(&mut y, row * m_cols as usize, 1, m_cols as usize, &sums) };
-        }
+    }
+
+    /// Selected MXFP8 rows, with row-major output and checked vocabulary IDs.
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            4 * qs.len() >= n_matrix * k,
+            128 * e.len() >= n_matrix * k,
+            ids.len() >= n_rows,
+            x.len() >= m_cols * k,
+            y.len() >= n_rows * m_cols
+        )
+    )]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the flat arguments (rust-quality R8)"
+    )]
+    pub fn mxfp8_gemv_ids(
+        qs: &[u32],
+        e: &[u32],
+        x: &[f32],
+        ids: &[u32],
+        n_rows: u32,
+        n_matrix: u32,
+        k: u32,
+        m_cols: u32,
+        fault: FaultSink,
+        y: DisjointSlice<f32>,
+    ) {
+        // SAFETY: the launch contract bounds each buffer; the host checks k and m.
+        unsafe {
+            blocks_gemv_ids::<Mxfp8Bytes>(
+                (qs, e),
+                x,
+                (ids, n_rows, n_matrix),
+                (k, m_cols),
+                fault,
+                y,
+            )
+        };
     }
 }
 
@@ -2378,6 +2699,7 @@ mod q8f32_kernels {
 /// the rest of the step and are capturable.
 pub struct Q8F32Kernels {
     module: q8f32_kernels::LoadedModule,
+    pub(crate) dense_mma: bool,
 }
 
 impl Q8F32Kernels {
@@ -2386,7 +2708,10 @@ impl Q8F32Kernels {
         // SAFETY: this package owns the embedded device bundle produced for
         // the module above; the launcher checks its launch contract.
         let module = unsafe { crate::shared_module!(q8f32_kernels, ctx)? };
-        Ok(Q8F32Kernels { module })
+        Ok(Q8F32Kernels {
+            module,
+            dense_mma: ctx.compute_capability()? == (12, 1),
+        })
     }
 
     /// Enqueue `y = W · x` for an F32 weight of `w.rows()` rows × `w.cols()`
@@ -2546,6 +2871,45 @@ impl Q8F32Kernels {
         Ok(())
     }
 
+    /// Dense prompt product, using BF16 tensor cores on GB10 and the exact
+    /// F32-activation tile on other devices.
+    pub fn enqueue_bf16_prompt(
+        &self,
+        stream: &CudaStream,
+        w: &DeviceTensor<u32>,
+        x: &DeviceBuffer<f32>,
+        n: usize,
+        y: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        if self.dense_mma {
+            self.enqueue_bf16_mma(stream, w, x, n, y)
+        } else {
+            self.enqueue_bf16_tile(stream, w, x, n, y)
+        }
+    }
+
+    /// Dense BF16 prompt product with BF16 activations and F32 accumulation.
+    /// The weight stays in its stored BF16 words, 16-byte aligned
+    /// ([`bf16_mma_launch`]). The cells whose row or column holds an
+    /// out-of-range operand replay on the exact owner; every other cell keeps
+    /// its MMA value whatever its neighbours hold.
+    pub fn enqueue_bf16_mma(
+        &self,
+        stream: &CudaStream,
+        w: &DeviceTensor<u32>,
+        x: &DeviceBuffer<f32>,
+        n: usize,
+        y: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let t = bf16_mma_launch("Q8F32Kernels::enqueue_bf16_mma", w, x, n, y)?;
+        let prep =
+            self.module
+                .prepare_bf16_mma_gemm(LaunchConfig1D::new(t.grid, MMA_THREADS, 0))?;
+        self.module
+            .bf16_mma_gemm(stream, &prep, w.buf(), x, t.rows, t.k, t.n, y)?;
+        Ok(())
+    }
+
     /// Enqueue `y = W · x` for a Q8_0 weight in the module doc's device
     /// layout: `qs` `rows × k/4` u32 words and `d` `rows × k/32` f16 scale
     /// bits — against `m` f32 activation columns of `k = d.cols() * 32` values
@@ -2629,10 +2993,63 @@ impl Q8F32Kernels {
         Ok(())
     }
 
+    /// Project selected MXFP8 rows with the same layout and ID faults as Q8_0.
+    pub fn enqueue_mxfp8_gemv_ids(
+        &self,
+        stream: &CudaStream,
+        a: Mxfp8GemvIdsArgs<'_>,
+        fault: FaultSink,
+    ) -> Result<(), GpuError> {
+        let what = "enqueue_mxfp8_gemv_ids";
+        let Mxfp8GemvIdsArgs {
+            qs,
+            e,
+            ids,
+            rows,
+            x,
+            m,
+            y,
+        } = a;
+        let (n_matrix, k) = E4m3Weight {
+            qs,
+            e,
+            scales: E4m3Scales::Mxfp8,
+        }
+        .dimensions(what)?;
+        if rows > ids.len() || rows > n_matrix {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "{rows} listed rows: at most {} map IDs and {n_matrix} matrix rows",
+                    ids.len()
+                ),
+            ));
+        }
+        check_gemv_geometry(what, rows, k, x.len(), m, y.len())?;
+        let rows = launch_u32(what, "rows", rows)?;
+        let cfg = LaunchConfig1D::new(rows.div_ceil(8), 256, 0);
+        let prep = self.module.prepare_mxfp8_gemv_ids(cfg)?;
+        self.module.mxfp8_gemv_ids(
+            stream,
+            &prep,
+            qs.buf(),
+            e.buf(),
+            x,
+            ids,
+            rows,
+            launch_u32(what, "n_matrix", n_matrix)?,
+            launch_u32(what, "k", k)?,
+            launch_u32(what, "m", m)?,
+            fault,
+            y,
+        )?;
+        Ok(())
+    }
+
     /// Enqueue `y = W · x` for an E4M3 weight in its two planes (module doc,
     /// [`E4m3Weight`]) against `m` (1..=8) f32 activation columns of `k =
-    /// 4 · qs.cols()` values each, token-major (row r's column c at
-    /// `y[c · n_rows + r]`): `m = 1` runs `mxfp8_gemv` or `fp8_b128_gemv` as
+    /// 4 · qs.cols()` values each, with the layout selected by `out`.
+    /// `m = 1` runs `mxfp8_gemv` or `fp8_b128_gemv` as
     /// its scales say, `m > 1` the `_mcol` entry, whose column c is the
     /// `m = 1` launch of column c bit for bit. `k` must be a multiple of 128
     /// and `e` `k / 128` words a row over the same rows; another geometry is
@@ -2642,7 +3059,7 @@ impl Q8F32Kernels {
         stream: &CudaStream,
         a: E4m3GemvArgs<'_>,
     ) -> Result<(), GpuError> {
-        let E4m3GemvArgs { w, x, m, y } = a;
+        let E4m3GemvArgs { w, x, m, out, y } = a;
         let what = "enqueue_e4m3_gemv";
         let (n_rows, k) = w.dimensions(what)?;
         check_gemv_geometry(what, n_rows, k, x.len(), m, y.len())?;
@@ -2665,14 +3082,19 @@ impl Q8F32Kernels {
             return Ok(());
         }
         let m = launch_u32(what, "m", m)?;
+        let (y_row, y_col) = match out {
+            GemvOut::RowMajor => (m, 1),
+            GemvOut::TokenMajor => (1, n_rows),
+        };
         match w.scales {
             E4m3Scales::Mxfp8 => {
                 let prep = module.prepare_mxfp8_gemv_mcol(cfg)?;
-                module.mxfp8_gemv_mcol(stream, &prep, qs, e, x, n_rows, k, m, y)?;
+                module.mxfp8_gemv_mcol(stream, &prep, qs, e, x, n_rows, k, m, y_row, y_col, y)?;
             }
             E4m3Scales::Fp8B128 => {
                 let prep = module.prepare_fp8_b128_gemv_mcol(cfg)?;
-                module.fp8_b128_gemv_mcol(stream, &prep, qs, e, x, n_rows, k, m, y)?;
+                module
+                    .fp8_b128_gemv_mcol(stream, &prep, qs, e, x, n_rows, k, m, y_row, y_col, y)?;
             }
         }
         Ok(())
@@ -2843,6 +3265,45 @@ impl Q8F32Kernels {
         Ok(())
     }
 
+    /// Selected NVFP4 rows over f32 activations, without an activation quantization pass.
+    pub fn enqueue_nvfp4_gemv_sel_f32(
+        &self,
+        stream: &CudaStream,
+        w: crate::mxfp4_sel::Nvfp4Stack<'_>,
+        a: &SelArgs<'_>,
+        fault: FaultSink,
+        y: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let what = "enqueue_nvfp4_gemv_sel_f32";
+        let k =
+            w.qs.cols()
+                .checked_mul(8)
+                .ok_or_else(|| GpuError::shape(what, "NVFP4 width overflows"))?;
+        w.experts(what, k, a.rows_per_expert)?;
+        let l = sel_launch(what, w.qs.rows(), k, a, y.len())?;
+        let prep = self
+            .module
+            .prepare_nvfp4_gemv_sel_f32(LaunchConfig1D::new(l.grid, 256, 0))?;
+        self.module.nvfp4_gemv_sel_f32(
+            stream,
+            &prep,
+            w.qs.buf(),
+            w.e.buf(),
+            w.scales.buf(),
+            a.x,
+            a.sel,
+            l.n_experts,
+            l.rpe,
+            l.n_slots,
+            l.m_cols,
+            l.spc,
+            l.k,
+            fault,
+            y,
+        )?;
+        Ok(())
+    }
+
     /// [`Self::enqueue_q8_0_gemv_sel_f32`] over an E4M3 stack in its two
     /// planes (`k = 4 · w.qs.cols()`, a multiple of 128): FP8_B128's
     /// `fp8_b128_gemv_sel_f32`. An MXFP8 stack has no expert-select entry
@@ -2980,6 +3441,17 @@ impl Q8F32Kernels {
 /// launch reads, `m` activation columns (1..=8), and the output.
 pub struct Bf16GemvIdsArgs<'a> {
     pub w: &'a DeviceTensor<u32>,
+    pub ids: &'a DeviceBuffer<u32>,
+    pub rows: usize,
+    pub x: &'a DeviceBuffer<f32>,
+    pub m: usize,
+    pub y: &'a mut DeviceBuffer<f32>,
+}
+
+/// Selected rows of an MXFP8 matrix, read in place, with row-major output.
+pub struct Mxfp8GemvIdsArgs<'a> {
+    pub qs: &'a DeviceTensor<u32>,
+    pub e: &'a DeviceTensor<u32>,
     pub ids: &'a DeviceBuffer<u32>,
     pub rows: usize,
     pub x: &'a DeviceBuffer<f32>,
@@ -3176,6 +3648,7 @@ pub struct E4m3GemvArgs<'a> {
     pub w: E4m3Weight<'a>,
     pub x: &'a DeviceBuffer<f32>,
     pub m: usize,
+    pub out: GemvOut,
     pub y: &'a mut DeviceBuffer<f32>,
 }
 
@@ -3354,14 +3827,105 @@ fn check_gemv_geometry(
     Ok(())
 }
 
+/// Quantize BF16 rows to E4M3 with one upward-rounded E8M0 scale per 32 values.
+pub(crate) fn bf16_mxfp8_planes(
+    src: &[u8],
+    rows: usize,
+    k: usize,
+) -> Result<(Vec<u32>, Vec<u32>), GpuError> {
+    const WHAT: &str = "bf16_mxfp8_planes";
+    let count = rows
+        .checked_mul(k)
+        .ok_or_else(|| GpuError::shape(WHAT, "value count passes usize"))?;
+    if rows == 0 || k == 0 || !k.is_multiple_of(128) || count.checked_mul(2) != Some(src.len()) {
+        return Err(GpuError::shape(
+            WHAT,
+            format!("{rows} rows of {k} do not match {} BF16 bytes", src.len()),
+        ));
+    }
+    let mut qs = vec![0u32; count / 4];
+    let mut scales = vec![0u32; count / 128];
+    for (block, bytes) in src.as_chunks::<64>().0.iter().enumerate() {
+        let values: [f32; 32] = std::array::from_fn(|i| {
+            f32::from_bits(u32::from(u16::from_le_bytes([bytes[2 * i], bytes[2 * i + 1]])) << 16)
+        });
+        if !values.iter().all(|v| v.is_finite()) {
+            return Err(GpuError::shape(
+                WHAT,
+                format!("block {block} has a non-finite value"),
+            ));
+        }
+        let amax = values.iter().fold(f32::MIN_POSITIVE, |a, v| a.max(v.abs()));
+        let exponent = ((amax / 448.0).log2().ceil() as i32).clamp(-127, 127);
+        scales[block / 4] |= ((exponent + 127) as u32) << (8 * (block % 4));
+        let scale = 2.0f32.powi(exponent);
+        let inverse = 2.0f32.powi(-exponent);
+        for (i, value) in values.into_iter().enumerate() {
+            let magnitude = (value * inverse).abs();
+            let code = if magnitude < 1.0 / 64.0 {
+                (magnitude * 512.0).round_ties_even() as u32
+            } else {
+                let bits = magnitude.to_bits() - (120 << 23);
+                let kept = bits >> 20;
+                let tail = bits & 0x000f_ffff;
+                (kept + u32::from(tail > 0x0008_0000 || (tail == 0x0008_0000 && kept & 1 != 0)))
+                    .min(126)
+            };
+            if !(Mxfp8Bytes::value(code) * scale).is_finite() {
+                return Err(GpuError::shape(
+                    WHAT,
+                    format!("block {block} rounds a value past f32's range"),
+                ));
+            }
+            let signed = code | ((value.to_bits() >> 24) & 0x80);
+            let at = block * 32 + i;
+            qs[at / 4] |= signed << (8 * (at % 4));
+        }
+    }
+    Ok((qs, scales))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        ByteBlocks, E4m3Scales, Fp8B128Bytes, Mxfp8Bytes, check_gemv_geometry, e4m3_planes,
-        f32_lane_partial_1col_w32, f32_lane_partials, q8_0_lane_partial_1col,
+        ByteBlocks, E4m3Scales, Fp8B128Bytes, Mxfp8Bytes, bf16_mxfp8_planes, check_gemv_geometry,
+        e4m3_planes, f32_lane_partial_1col_w32, f32_lane_partials, q8_0_lane_partial_1col,
         q8_0_lane_partials_mcol,
     };
     use gguf::quant::{GgmlType, dequant_row};
+
+    #[test]
+    fn bf16_head_encoding_refuses_bad_shapes_and_non_finite_values() {
+        for (rows, k, len) in [
+            (0, 128, 0),
+            (1, 0, 0),
+            (1, 32, 64),
+            (1, 128, 255),
+            (usize::MAX, 128, 0),
+        ] {
+            assert!(bf16_mxfp8_planes(&vec![0; len], rows, k).is_err());
+        }
+        for (bits, reason) in [
+            (0x7f80u16, "non-finite"),
+            (0xff80, "non-finite"),
+            (0x7fc0, "non-finite"),
+            (0x7f7f, "f32's range"),
+            (0xff7f, "f32's range"),
+        ] {
+            let mut bytes = vec![0; 256];
+            bytes[..2].copy_from_slice(&bits.to_le_bytes());
+            let error = bf16_mxfp8_planes(&bytes, 1, 128).unwrap_err();
+            assert!(error.to_string().contains(reason), "{error}");
+        }
+        let mut bytes = [0; 256];
+        bytes[..2].copy_from_slice(&0x7f70u16.to_le_bytes());
+        let (codes, scales) = bf16_mxfp8_planes(&bytes, 1, 128).unwrap();
+        assert_eq!(codes[0], 0x77);
+        assert_eq!(scales[0], 247);
+        let (codes, scales) = bf16_mxfp8_planes(&[0; 256], 1, 128).unwrap();
+        assert_eq!(codes, vec![0; 32]);
+        assert_eq!(scales, [0]);
+    }
 
     #[test]
     fn gemv_geometry_refuses_wrapped_buffer_spans() {
@@ -3703,8 +4267,9 @@ mod tests {
                         if m == 1 {
                             // SAFETY: w covers row r and x covers k values;
                             // k is a positive multiple of 32 and lane < 32.
-                            let w32 =
-                                unsafe { f32_lane_partial_1col_w32(&w, &x, k as u32, r, lane) };
+                            let w32 = unsafe {
+                                f32_lane_partial_1col_w32(w.as_slice(), &x, k as u32, r, lane)
+                            };
                             assert_eq!(
                                 w32.to_bits(),
                                 got[0].to_bits(),

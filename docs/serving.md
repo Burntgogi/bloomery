@@ -95,6 +95,9 @@ Your OpenAI client works unchanged. bloomery speaks llama-server's HTTP API and 
   generation that ends inside the call) ends the stream with an error event naming the call: the non-streamed answer
   keeps DSML's raw text as content, and a stream cannot take its fragments back. `/v1/messages` and `/v1/responses`
   streams send a call when it closes.
+  Hermes treats a complete `<tool_call>` opener at EOF as an unterminated call, including immediately after a
+  previous call closed. Only a proper prefix of that opener remains text at EOF; neither decision depends on
+  stream chunk boundaries.
 - **Refused by name** (a 400 naming the field): `samplers` in an order other than llama-server's default list for the
   stages that are on, or naming a sampler this server lacks; typical_p, mirostat, `dry_*`, `xtc_*`, `top_n_sigma` and
   `dynatemp_*` when a request turns them on; `n_predict` or `max_tokens` outside -1..=i32::MAX (-2 does not mean "no
@@ -194,9 +197,13 @@ folder that holds `model.safetensors.index.json`, and `--hf <repo>` names a repo
 GGUF set (a `:<quant>` on that repo is refused by name, as the checkpoint is the repo's one model). Every part keeps the
 format the checkpoint stores it in. Checked with `nvidia/Qwen3.8-Flash-Next-NVFP4` on a DGX Spark's GB10, where it plans
 the same bytes and gives the same greedy ids as the GGUF split made from it. The load holds every tensor on the stage
-card and reads the PLE table from the folder on the NVMe tier, so a plan that puts a tensor elsewhere, a set
-`BLOOMERY_RESIDENCY` other than `off`, and `BLOOMERY_DRAFT=mtp` are refused by name; unset, the MTP draft stays off,
-as the folder's MTP layers are not read.
+card and reads the PLE table from the folder on the NVMe tier, so a plan that puts a tensor elsewhere and a set
+`BLOOMERY_RESIDENCY` other than `off` are refused by name. The folder's MTP layer uses the same draft and verification
+path as a shared GGUF draft, under the same `BLOOMERY_DRAFT` rule (Speculative decoding, below): `mtp` selects it,
+`off` disables it, and unset selects it where the rule would select a GGUF draft. The draft borrows the target's
+embedding and vocabulary head; its experts and dense projections keep their stored formats. A folder whose MTP layer
+the draft does not read still serves its target: `mtp` is refused with the layer's refusal, and unset turns the draft
+off with it.
 
 The nemotron seat serves Nemotron 3 Nano 4B (`--model nemotron -m PATH`), Nemotron 3.5 Bolt 74B-A9B and
 Nemotron-3.5-Lightning 30B-A3B, one sequence: `--parallel` above 1, a placement of more than one card or with a
@@ -225,8 +232,11 @@ llama-server reads it, and the startup line says so). A count you set is never l
 inside the one model, switched by pointer exchange: nothing parks, and each round advances every busy slot by one
 token or one drafted pass. Where the body runs several slots' rows as one pass, the round reads the weights once for
 all of them: on a whole-card Qwen3-30B or Qwen3.6, on V4.1 and MiMo-V2.6-Flash (two slots' rows a pass), and on GLM-5.3 and Qwen3.8, where a greedy
-request's drafted verify window rides the same pass (two windows a pass; with the draft off, the plain rows). A
-placed Qwen3-30B or Qwen3.6 (`--place a`), a sampled request on a drafting GLM-5.3 or Qwen3.8 load, V4.1 with the
+request's drafted verify window rides the same pass (two windows a pass; with the draft off, the plain rows).
+Qwen3.8 also batches sampled steps on a drafting load, with every slot's draft brought up to date in one draft pass
+before the round's pass. A round that leaves slot 0 out runs as one pass too and keeps slot 0's waiting hidden rows
+intact. A
+placed Qwen3-30B or Qwen3.6 (`--place a`), a sampled request on a drafting GLM-5.3 load, V4.1 with the
 lookup draft and Qwen3.8 under `--place bp` step their slots in turn, a select and a step a slot each round. At a
 fixed expert placement each request answers the tokens of its run alone on the same server; under adaptive residency
 the placement follows every stream's passes (see [Limits](#limits)). Under more slots than one the context splits as
@@ -301,12 +311,15 @@ by name.
 Unset, the MTP draft yields to the context: it goes off when the plan with it would leave a slot fewer positions
 than the plan without it, a set `--ctx-size`/`--ctx` included, a `draft yield` record naming its
 card bytes and the positions a slot gets either way, and the context line that follows is the plain plan's.
-`BLOOMERY_DRAFT=mtp` keeps it on whatever the context. The
+`BLOOMERY_DRAFT=mtp` keeps it on whatever the context. On Qwen3.8 an unset MTP draft also stays off under
+`--parallel` above 1, from a GGUF draft file and a checkpoint folder alike: a drafted server runs a round of sampled or
+id-banning requests as one pass, as a plain server does, but also walks every slot's draft over its row, one store
+walk beside the pass. `BLOOMERY_DRAFT=mtp` drafts on any slot count. The
 drafts run on greedy requests (`"temperature": 0`), and the MTP drafts also on sampled ones
-(the default, temperature 0.8 as in llama-server) while one request runs: each kept id is the request's own
-sampler's draw from its verified row, as llama.cpp's speculative decoding takes it. A sampled request beside
-another running one, a request that bans an id (`ignore_eos`), and a sampled request under DSpark decode one token
-a step.
+(the default, temperature 0.8 as in llama-server) and on ones that ban an id (`ignore_eos`) while one request runs:
+each kept id is the request's own draw from its verified row (its sampler's, or the argmax, with every banned id's
+logit at -inf), as llama.cpp's speculative decoding takes it. A sampled or id-banning request beside another running
+one, and one under DSpark, decode one token a step.
 
 **Adaptive residency.** V4.1, Qwen3.8 and GLM-5.3 count their own routing as they run and swap routed experts
 between the card and the host between steps; a prompt call streams its hottest host experts onto the card, so
@@ -322,8 +335,10 @@ the slot. A request that shares only part of an earlier prompt, such as the same
 restores too: a saved state keeps checkpoints at 512·2^i positions below its end and the last one, and a shared
 prefix restores at the largest of them inside it. On Qwen3.8 the card's own checkpoints are 4,096 positions
 apart, so there a shared prefix shorter than 4,096 tokens does not restore. Saving runs off the request path. The
-MiMo and Qwen3 seats run no prompt cache: a request keeps the longest prefix the slot holds, and a save is refused
-by name. `timings.cache_ms` and `/metrics`'
+MiMo and Qwen3 seats keep only the longest prefix the live slot holds; they run no saved prompt cache, and a
+save is refused by name. For Qwen3.5 and Qwen3.6, when the vocabulary and chat template both carry
+`<|im_start|>`, the seat cuts prompt calls at message starts, so a shared system prompt stays in the live slot
+for another question. Reuse still requires that slot to hold the shared prefix; another conversation can replace it. `timings.cache_ms` and `/metrics`'
 `prompt_cache_seconds_total` count the cache's work.
 
 **Image input (V4.1, Qwen3.6, MiniCPM-V 4.7, Sage-A1.5, GLM-5.3, Clef).** These seats read images when they have a vision encoder: `--mmproj <file>`,

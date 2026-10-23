@@ -307,8 +307,8 @@ struct Active {
     slot: usize,
     job: Gen,
     events: mpsc::Sender<Msg>,
-    /// Under turns: the engine call the request needs, taken from its
-    /// generation before its slot was parked.
+    /// The engine call the request needs next, taken from its generation
+    /// by a pump that ran ahead of the call ([`Worker::hold_need`]).
     need: Option<Need>,
     /// Under turns: when it last left the engine (the turns' clock).
     left: u64,
@@ -501,6 +501,7 @@ impl Worker {
                 if self.start(slot, &held, sub).is_err() {
                     return;
                 }
+                self.pump_ready();
             }
             if self.prompts().is_err() {
                 return;
@@ -511,6 +512,7 @@ impl Worker {
             if self.step().is_err() {
                 return;
             }
+            self.pump_ready();
             if self.seal_ended().is_err() {
                 return;
             }
@@ -745,6 +747,7 @@ impl Worker {
                     } else {
                         let p = self.prompting.remove(k);
                         self.active.push(p.a);
+                        self.pump_ready();
                     }
                 }
                 Err(GenError::Engine(e)) => {
@@ -768,17 +771,11 @@ impl Worker {
         let mut needs = Vec::with_capacity(self.active.len());
         let mut k = 0;
         while k < self.active.len() {
-            let a = &mut self.active[k];
-            let pumped = a
-                .job
-                .pump(&mut sink_of(&a.events), &mut tick_of(&self.sh, a.slot));
-            match pumped {
-                Ok(Need::Done) => {
-                    let mut a = self.active.remove(k);
-                    let r = a.job.finish(&mut sink_of(&a.events));
-                    self.end_request(a, r);
-                }
-                Ok(Need::Fill) => {
+            let Some(need) = self.take_need(k) else {
+                continue;
+            };
+            match need {
+                Need::Fill => {
                     // A call of its own, like a prompt's: a quantum of ids
                     // beside other busy slots. The request steps next round.
                     let quantum = self.quantum.filter(|_| self.active.len() > 1);
@@ -792,16 +789,15 @@ impl Worker {
                     }
                     // `/slots` shows the run's positions as its calls run.
                     tick_of(&self.sh, a.slot)(a.job.timings());
+                    if !self.hold_need(k) {
+                        continue;
+                    }
                     needs.push(Need::Fill);
                     k += 1;
                 }
-                Ok(need) => {
+                need => {
                     needs.push(need);
                     k += 1;
-                }
-                Err(e) => {
-                    let a = self.active.remove(k);
-                    self.end_request(a, Err(e));
                 }
             }
         }
@@ -844,7 +840,6 @@ impl Worker {
             // alone in its round: here it steps.
             let mut steps: Vec<SlotRow<'_>> = Vec::new();
             let mut step_at: Vec<usize> = Vec::new();
-            let mut passes: Vec<SlotPass<'_>> = Vec::new();
             let mut pass_at: Vec<usize> = Vec::new();
             for (i, (a, need)) in self.active.iter_mut().zip(&needs).enumerate() {
                 match *need {
@@ -858,13 +853,8 @@ impl Worker {
                         });
                     }
                     Need::Advance(last) => {
-                        pass_at.push(i);
-                        passes.push(SlotPass {
-                            slot: a.slot,
-                            last,
-                            out: a.job.kept_mut(),
-                            drafted: Drafted::default(),
-                        });
+                        pass_at.push(a.slot);
+                        a.need = Some(Need::Advance(last));
                     }
                     Need::Fill => {}
                     Need::Done => unreachable!("a finished request left the running ones"),
@@ -881,6 +871,36 @@ impl Worker {
                 Ok(())
             };
             if called.is_ok() {
+                let answers: Vec<u32> = steps.iter().map(|r| r.next).collect();
+                drop(steps);
+                let mixed = !step_at.is_empty() && !pass_at.is_empty();
+                for (i, g) in step_at.into_iter().zip(answers) {
+                    self.active[i].job.stepped(g);
+                }
+                if mixed {
+                    self.pump_ready();
+                    if self.sh.stopped() {
+                        return Ok(());
+                    }
+                }
+                // Pumping may end a request and move the remaining entries.
+                let mut passes: Vec<SlotPass<'_>> = Vec::new();
+                let mut active = self.active.iter_mut().enumerate();
+                for at in &mut pass_at {
+                    let (i, a) = active
+                        .find(|(_, a)| a.slot == *at)
+                        .expect("uncalled advances survive pumping in their original order");
+                    let Some(Need::Advance(last)) = a.need.take() else {
+                        unreachable!("an original advance keeps its uncalled need");
+                    };
+                    *at = i;
+                    passes.push(SlotPass {
+                        slot: a.slot,
+                        last,
+                        out: a.job.kept_mut(),
+                        drafted: Drafted::default(),
+                    });
+                }
                 called = if passes.len() > 1 {
                     self.slot.advance_slots(&mut passes)
                 } else if let [row] = passes.as_mut_slice() {
@@ -891,17 +911,12 @@ impl Worker {
                 } else {
                     Ok(())
                 };
-            }
-            if called.is_ok() {
-                let answers: Vec<u32> = steps.iter().map(|r| r.next).collect();
-                let drafted: Vec<Drafted> = passes.iter().map(|r| r.drafted).collect();
-                drop(steps);
-                drop(passes);
-                for (i, g) in step_at.into_iter().zip(answers) {
-                    self.active[i].job.stepped(g);
-                }
-                for (i, d) in pass_at.into_iter().zip(drafted) {
-                    self.active[i].job.advanced(d);
+                if called.is_ok() {
+                    let drafted: Vec<Drafted> = passes.iter().map(|r| r.drafted).collect();
+                    drop(passes);
+                    for (i, d) in pass_at.into_iter().zip(drafted) {
+                        self.active[i].job.advanced(d);
+                    }
                 }
             }
             called
@@ -1065,11 +1080,8 @@ impl Worker {
     /// one engine call — unless the stop was read after the change of hands,
     /// which leaves the call to the halt at the next round's top.
     fn turn(&mut self) -> Result<(), Dead> {
-        if let Some(i) = self.t().running.and_then(|r| self.index_of(r))
-            && self.active[i].need.is_none()
-            && let Some(need) = self.pump_at(i)
-        {
-            self.active[i].need = Some(need);
+        if let Some(i) = self.t().running.and_then(|r| self.index_of(r)) {
+            self.hold_need(i);
         }
         let running = self.t().running;
         let on = running.and_then(|r| self.index_of(r));
@@ -1171,9 +1183,36 @@ impl Worker {
         Ok(())
     }
 
-    /// Takes the tokens request `i` holds; its next engine call, or `None`
-    /// when it ended (and is booked).
-    fn pump_at(&mut self, i: usize) -> Option<Need> {
+    /// Every running request's tokens in hand to its client, each keeping its
+    /// next engine call ([`Worker::hold_need`]); a stop read between them
+    /// leaves the rest.
+    fn pump_ready(&mut self) {
+        let mut i = 0;
+        while i < self.active.len() && !self.sh.stopped() {
+            if self.hold_need(i) {
+                i += 1;
+            }
+        }
+    }
+
+    /// Request `i`'s next engine call ([`Worker::take_need`]) kept on it until
+    /// that call runs, so the tokens it holds reach its client before the
+    /// engine's next call; `false` when it ended (and is booked).
+    fn hold_need(&mut self, i: usize) -> bool {
+        let Some(need) = self.take_need(i) else {
+            return false;
+        };
+        self.active[i].need = Some(need);
+        true
+    }
+
+    /// Request `i`'s next engine call: the one it holds from an earlier pump,
+    /// else the one its generation gives once the tokens it holds have gone
+    /// to its client; `None` when it ended (and is booked).
+    fn take_need(&mut self, i: usize) -> Option<Need> {
+        if let Some(need) = self.active[i].need.take() {
+            return Some(need);
+        }
         let a = &mut self.active[i];
         let pumped = a
             .job
@@ -1188,7 +1227,11 @@ impl Worker {
             Err(e) => Some((self.active.remove(i), Err(e))),
         };
         if let Some((a, r)) = ended {
-            if self.t().running == Some(a.slot) {
+            if self
+                .turns
+                .as_ref()
+                .is_some_and(|t| t.running == Some(a.slot))
+            {
                 self.t_mut().running = None;
             }
             self.end_request(a, r);
@@ -1201,12 +1244,8 @@ impl Worker {
         let Some(i) = self.t().running.and_then(|r| self.index_of(r)) else {
             return Ok(());
         };
-        let need = match self.active[i].need.take() {
-            Some(n) => n,
-            None => match self.pump_at(i) {
-                Some(n) => n,
-                None => return Ok(()),
-            },
+        let Some(need) = self.take_need(i) else {
+            return Ok(());
         };
         if matches!(need, Need::Fill) {
             return match self.active[i].job.fill(&mut self.slot, None) {
