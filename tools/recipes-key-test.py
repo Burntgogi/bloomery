@@ -402,7 +402,7 @@ class RecipeKeyCLI(unittest.TestCase):
                                      {"gate-called": "run", "gate-linked": "skip"})
 
     def test_parameterized_source_macro_keeps_argument_bound_calls(self):
-        for parameter in ("module", "모듈"):
+        for parameter in ("module", "모듈", "crate\u0301x"):
             with self.subTest(parameter=parameter):
                 files = runtime_files()
                 files["crates/app/src/bin/called.rs"] = "fn main() { dep::run(); }\n"
