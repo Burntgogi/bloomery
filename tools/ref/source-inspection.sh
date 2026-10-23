@@ -2,8 +2,9 @@
 # Source provenance for timing witnesses. Callers must check tree_line's status before inserting
 # its output into another command or an array: these runners do not enable errexit.
 # tree_line <binary> <tree> [HEAD digits=9] [no-Git policy=required|box]
-# The box policy is depth-ds41's synced-tree path: without Git, only the runner's own tree may
-# use BLOOMERY_GIT_COMMIT, and its dirty count remains unknown, never a clean count.
+# The box policy is the synced-tree path of depth-ds41's and depth-qwen3moe's bin: arms: without
+# Git, only the runner's own tree may use BLOOMERY_GIT_COMMIT, and its dirty count remains unknown,
+# never a clean count.
 tree_line() {
   local bin=$1 tree=$2 digits=${3:-9} policy=${4:-required} sha head dirty status rc
   sha=$(sha256sum "$bin" 2> /dev/null | cut -c1-12)

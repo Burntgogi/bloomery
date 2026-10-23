@@ -197,6 +197,9 @@ exec "$@"
         result = runner("depth-ds41.sh", "deepseek41", f"bin:{other}:6",
                         extra={"BLOOMERY_GIT_COMMIT": "abc123"})
         expect("ds41-no-git-other-tree", result, 0, "head=? dirty_files=?")
+        # A bin: arm of another box.sh-synced tree: qwen3moe's A/B base, as DS41's.
+        result = runner("depth-qwen3moe.sh", "qwen3moe", f"bin:{other}:6")
+        expect("qwen-no-git-other-tree", result, 0, "head=? dirty_files=?")
     print(f"source-inspection-test: {checks} checks, 0 failed (dry runners, no timing)")
     return 0
 

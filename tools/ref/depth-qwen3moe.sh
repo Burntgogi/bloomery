@@ -2082,7 +2082,8 @@ for i in "${!ARMS[@]}"; do
   b=${A_BIN[$i]}
   [ -x "$b" ] || { echo "depth-qwen3moe.sh: arm '${ARMS[$i]}': no binary at $b" >&2; exit 2; }
   t=$(bin_tree "$b")
-  line=$(tree_line "$b" "$t") || exit $?
+  # A bin: arm's tree is a box.sh-synced copy with no Git, as depth-ds41.sh's.
+  line=$(tree_line "$b" "$t" 9 box) || exit $?
   BIN_LINES+=("${A_LABEL[$i]}: $line")
 done
 # A bin: arm of this tree, or bit-identical to the ours build, is refused with both paths and shas
