@@ -58,7 +58,7 @@ use model::arch::glm5next::place::KdaLanes;
 use super::nextn::{Held, Wrote};
 use super::{
     Body, GlmSlot, LANES, Parts, Plant, RowBind, RowScratch, Scratch, SeqParts, StepInput, Store,
-    cut_into, held_at, shape,
+    WHAT, cut_into, held_at, shape,
 };
 use crate::program;
 
@@ -691,9 +691,7 @@ impl Body {
             let (lanes, held) = if r.slot == 0 {
                 (&self.s.lanes, self.held)
             } else {
-                let p = parked
-                    .next()
-                    .ok_or_else(|| shape(format!("slot {}'s parked sequence", r.slot)))?;
+                let p = parked.next().ok_or_else(|| r.no_parked(WHAT))?;
                 (&p.lanes, p.held)
             };
             held_at(lanes, held, r.pos0).map_err(named)?;
