@@ -458,9 +458,9 @@
 # ours, corpus and bin: arms at bp or a, each by its placement (Placement above): a bp arm loads both cards,
 # an a arm plan (a) on the A6000 with the 3090 idle — the same lease's one-card arm beside the two-card one,
 # its row in the A6000+3090 table all the same. A gate arm (a 3090-only row) and an a arm under
-# BLOOMERY_DRAFT=dspark (its draft runs on the 3090) are refused by name before anything runs. After each of
-# our arms its `load` record's `cards` (records.py) must name the A6000 and the 3090 under bp and the A6000
-# alone under a (tools/ref/arm-place.sh place_arm_cards), or the arm is a FAIL row. An ik
+# BLOOMERY_DRAFT=dspark (its draft sits on the 3090 as a holder) are refused by name before anything runs.
+# After each of our arms its `load` record's `cards` (records.py) must name the A6000 and the 3090 under bp
+# and the A6000 alone under a (tools/ref/arm-place.sh place_arm_cards), or the arm is a FAIL row. An ik
 # arm is refused by name (ik's -ts is a
 # byte split over its own layer sizes, src/llama.cpp get_layer_sizes, which nobody has read against this
 # placement; the public reference is llama.cpp). Before the lease a card that does not answer, a 3090 off
@@ -1292,8 +1292,8 @@ done
 timing_cards_arms "$BIN" ${TC_ARMS[@]+"${TC_ARMS[@]}"} || exit $?
 # Each generate_ds41 arm's placement against the mode and the timing card (the header's Placement and Two
 # cards; tools/ref/arm-place.sh): BLOOMERY_GEN_PLACE once for the arms that follow it, an arm's place= for
-# that arm. In the two-card mode an a arm keeps the 3090 idle, so its DSpark draft, which runs there, is
-# refused.
+# that arm. In the two-card mode an a arm keeps the 3090 idle, so its DSpark draft, which an a plan seats there
+# as a holder (a card with the draft and no expert), is refused.
 PLACE_SEEN=0
 for i in "${!ARMS[@]}"; do
   [ -n "${A_PLACE[$i]}" ] || continue
@@ -1305,7 +1305,7 @@ for i in "${!ARMS[@]}"; do
   fi
   if [ -n "$TIMING_CARDS" ] && [ "${A_PLACE[$i]}" = a ] && [[ ,${A_ENV[$i]}, == *,BLOOMERY_DRAFT=dspark,* ]]; then
     if [ -n "${A_PLACE_SET[$i]}" ]; then hint=place=bp; else hint=BLOOMERY_GEN_PLACE=bp; fi
-    arm_refuse "${ARMS[$i]}" "BLOOMERY_DRAFT=dspark puts the draft on the 3090, and in the two-card mode an a arm keeps the 3090 idle: run the draft under $hint"
+    arm_refuse "${ARMS[$i]}" "BLOOMERY_DRAFT=dspark seats the draft on the 3090 as a holder, and in the two-card mode an a arm keeps the 3090 idle: run the draft under $hint"
   fi
 done
 # The placements the arms run at, for the [config] and [dry] lines when an arm's place= sets one.

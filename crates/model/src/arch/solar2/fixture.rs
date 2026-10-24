@@ -201,7 +201,7 @@ fn card_experts(split: &Split, budget: Option<u64>) -> Result<CardExperts, Fixtu
     inputs.room = (workstation::PLAN_ROOM, HostRead::Given);
     let machine = workstation::plan_gate(inputs.model.layers);
     let levers = PlanLevers {
-        card_budget_bytes: budget,
+        card_budget_bytes: budget.into(),
     };
     let plan = inputs
         .plan(&machine, BUDGET_CTX, &levers)

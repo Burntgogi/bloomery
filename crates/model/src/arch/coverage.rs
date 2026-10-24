@@ -17,8 +17,8 @@
 //! any program's pin reads, is not an item; the program itself is one.
 
 use bloomery_placement::accepts::{
-    BOLT_LEG, dense_by_name, embed_of_widened, head_of_widened, leg_arms, qwen3moe_dense,
-    resident_down_runs,
+    BOLT_LEG, MUSESPARK_LEG, dense_by_name, embed_of_widened, head_of_widened, latent_leg_runs,
+    leg_arms, qwen3moe_dense, resident_down_runs,
 };
 pub use bloomery_placement::accepts::{Program, program_of, qwen35_down, qwen35_gate_up};
 use bloomery_placement::accepts::{prompt_leg_down, prompt_leg_gate_up};
@@ -409,8 +409,14 @@ pub const AVAILABLE: &[Available] = &[
             Program::Solar2Body,
             Program::Raon1Body,
         ],
-        at: "models/src/shape.rs ROUTERS, the BiasedSigmoid body (gpu-deepseek41 router: glm5next at 288 experts, mimo2 at 256, solar2 at 320; gpu/src/route_body.rs sigmoid_128_6: raon1 and nemotron_h_moe at 128)",
-        runs: |n| routes(n, &[RouterBody::BiasedSigmoid]),
+        at: "models/src/shape.rs ROUTERS, the BiasedSigmoid body at these bodies' own (experts, \
+             kept) pairs (SIGMOID_ROUTERS; gpu-deepseek41 router: glm5next at 288 experts, mimo2 \
+             at 256, solar2 at 320; gpu/src/route_body.rs sigmoid_128_6: raon1 and nemotron_h_moe \
+             at 128)",
+        runs: |n| {
+            matches!(n, Need::Router(s) if SIGMOID_ROUTERS.contains(&(s.experts, s.top_k)))
+                && routes(n, &[RouterBody::BiasedSigmoid])
+        },
     },
     Available {
         programs: &[Program::Glm5nextBody, Program::Solar2Body],
@@ -829,6 +835,96 @@ pub const AVAILABLE: &[Available] = &[
         programs: &[Program::Raon1Body],
         at: "gpu/src/arch/raon1/body.rs Mixer (a delta or a latent mixer per layer's kind)",
         runs: |n| matches!(n, Need::MixedTrunk),
+    },
+    Available {
+        programs: &[Program::MuseSparkBody],
+        at: "models/src/shape.rs GQA, the head-64 row (gpu/src/flash_gqa.rs the _64 entries, \
+             Muse Spark's: a layer's window of positions or none)",
+        runs: |n| {
+            matches!(
+                n,
+                Need::Gqa {
+                    head: 64,
+                    value: 64,
+                    group: 8,
+                    window: _,
+                    sinks: false,
+                    scaled: false,
+                }
+            ) && gqa_row(64, 8).is_some()
+        },
+    },
+    Available {
+        programs: &[Program::MuseSparkBody],
+        at: "gpu/src/arch/musespark/body.rs (elem.rs rms_norm per head with the file's \
+             [head] gains, the NORM-pair rope on the sliding layers over the sliding base, \
+             none on the full ones)",
+        runs: |n| {
+            matches!(
+                n,
+                Need::QkRope {
+                    qk_norm: true,
+                    head: 64,
+                    mode: RopeMode::NormTail | RopeMode::None,
+                    dims: _,
+                }
+            )
+        },
+    },
+    Available {
+        programs: &[Program::MuseSparkBody],
+        at: "gpu/src/arch/musespark/body.rs (σ of the gate's own projection through elem.rs \
+             sigmoid_rows + mul_rows)",
+        runs: |n| matches!(n, Need::OutGateProj),
+    },
+    Available {
+        programs: &[Program::MuseSparkBody],
+        at: "gpu/src/elem.rs enqueue_rms_norm (a gain of ones, k the head 64)",
+        runs: |n| matches!(n, Need::OutNorm { head: 64 }),
+    },
+    Available {
+        programs: &[Program::MuseSparkBody],
+        at: "models/src/shape.rs ROUTERS, the BiasedSigmoid body at the muse-spark file's own \
+             (experts, kept) pair (gpu/src/route_body.rs sigmoid_256_8; the fixture's 16/8)",
+        runs: |n| {
+            matches!(n, Need::Router(s) if MUSE_ROUTERS.contains(&(s.experts, s.top_k)))
+                && routes(n, &[RouterBody::BiasedSigmoid])
+        },
+    },
+    Available {
+        programs: &[Program::MuseSparkBody],
+        at: "gpu/src/arch/musespark/body.rs (ffn_latent_down, the experts' \
+             iq2_xxs_gate_up_sel + iq2_xxs_gemv_sel at K = latent, ffn_latent_up)",
+        runs: |n| matches!(n, Need::LatentExperts { latent } if latent.is_multiple_of(256)),
+    },
+    Available {
+        programs: &[Program::MuseSparkBody],
+        at: "gpu/src/elem.rs enqueue_rms_norm on the latent row (ffn_pre_exp_norm)",
+        runs: |n| matches!(n, Need::PreExpNorm),
+    },
+    Available {
+        programs: &[Program::MuseSparkBody],
+        at: "gpu/src/elem.rs enqueue_gain_rms_norm on the experts' aggregate before the \
+             router weights apply (ffn_post_exp_norm)",
+        runs: |n| matches!(n, Need::PostExpNorm { .. }),
+    },
+    Available {
+        programs: &[Program::MuseSparkBody],
+        at: "gpu/src/elem.rs enqueue_mix_rows (α·stream + β·branch, each sublayer's output \
+             normed first by its own row)",
+        runs: |n| matches!(n, Need::AlphaBeta { .. }),
+    },
+    Available {
+        programs: &[Program::MuseSparkBody],
+        at: "gpu/src/head.rs enqueue_with_tail (elem.rs scale_rows + softcap_rows over the \
+             Q6_K gemv's logits)",
+        runs: |n| matches!(n, Need::LogitEpilogue { .. }),
+    },
+    Available {
+        programs: &[Program::MuseSparkBody],
+        at: "gpu/src/arch/musespark/body.rs (each layer's router and stacks at its own \
+             count and width)",
+        runs: |n| matches!(n, Need::ExpertShapes { .. }),
     },
 ];
 
@@ -1299,6 +1395,60 @@ const TYPE_PINS: &[TypePin] = &[
         what: "hyper-connection fn (the body reads the f16 rows it widens to f32)",
         reads: &[GgmlType::F16],
     },
+    TypePin {
+        programs: &[Program::MuseSparkBody],
+        role: Role::Attention,
+        matrices: true,
+        names: None,
+        what: "attention projections (the body reads q6_K and q8_0 sites)",
+        reads: &[GgmlType::Q6_K, GgmlType::Q8_0],
+    },
+    TypePin {
+        programs: &[Program::MuseSparkBody],
+        role: Role::Router,
+        matrices: false,
+        names: Some(|n| {
+            use super::musespark::names as nm;
+            n.ends_with(nm::FFN_GATE_INP) || n.ends_with(nm::EXP_PROBS_B)
+        }),
+        what: "router and selection bias (the body reads f32 and bf16)",
+        reads: &[GgmlType::F32, GgmlType::BF16],
+    },
+    TypePin {
+        programs: &[Program::MuseSparkBody],
+        role: Role::Router,
+        matrices: false,
+        names: Some(|n| {
+            use super::musespark::names as nm;
+            n.ends_with(nm::FFN_LATENT_DOWN) || n.ends_with(nm::FFN_LATENT_UP)
+        }),
+        what: "latent projections (the body reads q8_0)",
+        reads: &[GgmlType::Q8_0],
+    },
+    TypePin {
+        programs: &[Program::MuseSparkBody],
+        role: Role::FfnNorm,
+        matrices: false,
+        names: None,
+        what: "normalization gains and residual mixes (the body reads f32 and bf16)",
+        reads: &[GgmlType::F32, GgmlType::BF16],
+    },
+    TypePin {
+        programs: &[Program::MuseSparkBody],
+        role: Role::Head,
+        matrices: false,
+        names: Some(|n| n == "output.weight"),
+        what: "output head (the head reads q6_K)",
+        reads: &[GgmlType::Q6_K],
+    },
+    TypePin {
+        programs: &[Program::MuseSparkBody],
+        role: Role::Head,
+        matrices: false,
+        names: Some(|n| n == "output_norm.weight"),
+        what: "output normalization gain (the head reads f32 and bf16)",
+        reads: &[GgmlType::F32, GgmlType::BF16],
+    },
 ];
 
 /// The types a raon1 attention or delta-rule matrix reads: the sites'
@@ -1436,7 +1586,7 @@ const ROW_PINS: &[RowPin] = &[
         role: Role::RoutedExperts,
         matrices: true,
         names: Some(routed_gate_up),
-        what: "routed experts gate and up (the body reads q4_K, q5_K, q6_K, iq3_xxs, iq3_s, iq4_xs and q8_0)",
+        what: "routed experts gate and up (the body reads q4_K, q5_K, q6_K, iq2_xxs, iq3_xxs, iq3_s, iq4_xs and q8_0)",
         row: prompt_leg_gate_up,
     },
     RowPin {
@@ -1444,7 +1594,7 @@ const ROW_PINS: &[RowPin] = &[
         role: Role::RoutedExperts,
         matrices: true,
         names: Some(routed_down),
-        what: "routed experts down (the body reads q4_K, q5_K, q6_K, iq3_xxs, iq3_s, iq4_xs, q5_1, q8_0 and iq4_nl)",
+        what: "routed experts down (the body reads q4_K, q5_K, q6_K, iq2_xxs, iq3_xxs, iq3_s, iq4_xs, q5_1, q8_0 and iq4_nl)",
         row: prompt_leg_down,
     },
     RowPin {
@@ -1460,7 +1610,7 @@ const ROW_PINS: &[RowPin] = &[
         role: Role::RoutedExperts,
         matrices: true,
         names: Some(routed_gate_up),
-        what: "routed experts gate and up (the body reads q4_K, q5_K, q6_K, iq3_xxs, iq3_s, iq4_xs and q8_0)",
+        what: "routed experts gate and up (the body reads q4_K, q5_K, q6_K, iq2_xxs, iq3_xxs, iq3_s, iq4_xs and q8_0)",
         row: prompt_leg_gate_up,
     },
     RowPin {
@@ -1468,7 +1618,7 @@ const ROW_PINS: &[RowPin] = &[
         role: Role::RoutedExperts,
         matrices: true,
         names: Some(routed_down),
-        what: "routed experts down (the body reads q4_K, q5_K, q6_K, iq3_xxs, iq3_s, iq4_xs, q5_1, q8_0 and iq4_nl)",
+        what: "routed experts down (the body reads q4_K, q5_K, q6_K, iq2_xxs, iq3_xxs, iq3_s, iq4_xs, q5_1, q8_0 and iq4_nl)",
         row: prompt_leg_down,
     },
     RowPin {
@@ -1512,6 +1662,14 @@ const ROW_PINS: &[RowPin] = &[
                q8_0)",
         row: |ty| ty == BOLT_LEG || ty == GgmlType::Q8_0,
     },
+    RowPin {
+        program: Program::MuseSparkBody,
+        role: Role::TokenEmbedding,
+        matrices: true,
+        names: None,
+        what: "token embedding (the card's rows: the types embed_of_widened names)",
+        row: |ty| embed_of_widened(ty).is_some(),
+    },
 ];
 
 /// `Body35`'s projection types (`PROJ`): every attention, delta-rule and
@@ -1551,7 +1709,7 @@ fn routed_down(name: &str) -> bool {
 /// `HostLayer::build`'s own admission ([`qdot::fuses`], the check the union
 /// call makes of every stack it serves), asked here at the stack's first
 /// dim, its `k`. A program with no card expert passes `|_| false`.
-fn routed_unrun(t: &ModelTensor, card_rule: fn(GgmlType) -> bool) -> bool {
+fn routed_unrun(t: &ModelTensor, card_rule: impl Fn(GgmlType) -> bool) -> bool {
     let k = t.dims.first().copied().unwrap_or(0);
     !card_rule(t.ty) && !qdot::fuses(t.ty, usize::try_from(k).unwrap_or(usize::MAX))
 }
@@ -1562,11 +1720,12 @@ fn qwen38_card_routed(ty: GgmlType) -> bool {
     crate::arch::qwen35moe::place::card_routed(ty).is_some()
 }
 
-/// The glm5next body's card rule: a type its card leg reads in some part
-/// ([`leg_arms`], whose arms its plan rule reads by part), the type union
+/// The card rule of a body whose card leg holds the form each layer's down
+/// reads (glm5next, minimax-m3): a type program `p`'s card leg reads in some
+/// part ([`leg_arms`], whose arms its plan rule reads by part), the type union
 /// coverage reads as it does qwen4exp's.
-fn glm5next_card_routed(ty: GgmlType) -> bool {
-    leg_arms(Program::Glm5nextBody).is_some_and(|a| (a.gate_up)(ty) || (a.down)(ty))
+fn leg_card_routed(p: Program, ty: GgmlType) -> bool {
+    leg_arms(p).is_some_and(|a| (a.gate_up)(ty) || (a.down)(ty))
 }
 
 /// gemma-embedding2's projection of the token rows to the per-layer inputs,
@@ -1580,6 +1739,21 @@ fn per_layer_model_proj(name: &str) -> bool {
 /// `gpu/src/arch/nemotron_h_moe/router.rs` is built for.
 const NEMOTRON_ROUTERS: &[(u32, u32)] =
     &[(240, 9), (304, 9), (368, 9), (432, 9), (496, 9), (128, 6)];
+
+/// The glm5next, mimo2, solar2 and raon1 bodies' router instances: the
+/// (experts, kept) pairs each family's code holds, every instance imported
+/// by name — glm5next's `glm5next`, mimo2's `mimo2` and solar2's
+/// `sigmoid_320_8` (`gpu-deepseek41/src/router.rs`), raon1's
+/// `sigmoid_128_6` (`gpu/src/route_body.rs`). A shape-named instance no
+/// family imports (`sigmoid_256_6`) is none of theirs, so its needs are
+/// items for these programs.
+const SIGMOID_ROUTERS: &[(u32, u32)] = &[(288, 8), (256, 8), (320, 8), (128, 6)];
+
+/// The muse-spark body's router instances: the file's 256 experts with the
+/// top 8 (`gpu/src/route_body.rs sigmoid_256_8`, the instance the family
+/// shares with MiMo's own compiled row) and the fixture's 16 rivals at the
+/// same pick (`sigmoid_16_8`).
+const MUSE_ROUTERS: &[(u32, u32)] = &[(256, 8), (16, 8)];
 
 /// The type pins of `program` (every program's when `None`), [`TYPE_PINS`]
 /// then [`ROW_PINS`], that tensor `t` is of a type none of reads, as items:
@@ -1697,14 +1871,15 @@ pub fn check_with(
                         at(t.layer, Need::RoutedFormat(t.ty));
                     }
                 }
-                // The glm5next body's rule: a stack passes when the program
-                // can run it — on the card by its leg's arms (`leg_arms`)
-                // or on the host by a qdot fused kernel at the stack's row
-                // width ([`routed_unrun`], the one owner). A layer with a
-                // stack the card experts do not read keeps all its experts on
-                // the host.
-                Some(Program::Glm5nextBody) => {
-                    if routed_unrun(t, glm5next_card_routed) {
+                // The glm5next and minimax-m3 bodies' rule: a stack passes
+                // when the program can run it — on the card by its leg's arms
+                // (`leg_arms`: the common leg's in the file's blocks and
+                // NVFP4's planes) or on the host by a qdot fused kernel at the
+                // stack's row width ([`routed_unrun`], the one owner). A layer
+                // with a stack the card experts do not read keeps all its
+                // experts on the host.
+                Some(p @ (Program::Glm5nextBody | Program::MiniMaxM3Body)) => {
+                    if routed_unrun(t, |ty| leg_card_routed(p, ty)) {
                         at(t.layer, Need::RoutedFormat(t.ty));
                     }
                 }
@@ -1717,11 +1892,11 @@ pub fn check_with(
                         at(t.layer, Need::RoutedFormat(t.ty));
                     }
                 }
-                // The mimo2, solar2 and minimax-m3 bodies' rule: the same — a
-                // stack passes when the common card leg runs its type
+                // The mimo2 and solar2 bodies' rule: the same — a stack
+                // passes when the common card leg runs its type
                 // (`kernels::card_runs`) or the host runs it by a qdot fused
                 // kernel at the stack's row width.
-                Some(Program::Mimo2Body | Program::Solar2Body | Program::MiniMaxM3Body) => {
+                Some(Program::Mimo2Body | Program::Solar2Body) => {
                     if routed_unrun(t, crate::placement::kernels::card_runs) {
                         at(t.layer, Need::RoutedFormat(t.ty));
                     }
@@ -1744,13 +1919,21 @@ pub fn check_with(
                 }
                 // The latent MoE body's rule: a stack passes when the
                 // program can run it — on the card by its expert rule
-                // ([`BOLT_LEG`], `routed_rule`'s arm) or on the host by a
+                // ([`latent_leg_runs`], `routed_rule`'s arm) or on the host by a
                 // qdot fused kernel at the stack's row width
                 // ([`routed_unrun`], the one owner). A layer with a stack the
                 // card experts do not read keeps all its experts on the
                 // host.
                 Some(Program::NemotronHMoeBody) => {
-                    if routed_unrun(t, |ty| ty == BOLT_LEG) {
+                    if routed_unrun(t, latent_leg_runs) {
+                        at(t.layer, Need::RoutedFormat(t.ty));
+                    }
+                }
+                // The muse-spark body's rule, the same cut over its gated leg
+                // ([`MUSESPARK_LEG`]): a whole-card load that refuses a type
+                // names it here first.
+                Some(Program::MuseSparkBody) => {
+                    if routed_unrun(t, |ty| ty == MUSESPARK_LEG) {
                         at(t.layer, Need::RoutedFormat(t.ty));
                     }
                 }
@@ -1898,6 +2081,53 @@ mod tests {
             ),
         ] {
             assert!(!runs(&need), "{what} read as covered: {need}");
+        }
+    }
+
+    /// The four sigmoid bodies launch one instance each, imported by name at
+    /// its own (experts, kept) pair (`SIGMOID_ROUTERS`): a shape-named
+    /// instance no family imports — the 256/top-6 row Flint's reader selects
+    /// — is no row's for them, while each body's own pair stays covered.
+    /// Mutant: the row's `runs` without its `SIGMOID_ROUTERS` check, which
+    /// reads the 256/top-6 need as covered for all four.
+    #[test]
+    fn a_router_instance_no_sigmoid_body_launches_is_uncovered() {
+        use models::shape::{MoeShape, rules};
+
+        use super::AVAILABLE;
+        let router = |experts: u32, top_k: u32| {
+            Need::Router(MoeShape {
+                rule: rules::BIASED_SIGMOID,
+                experts,
+                top_k,
+            })
+        };
+        let runs = |program: Program, n: &Need| {
+            AVAILABLE
+                .iter()
+                .any(|a| a.programs.contains(&program) && (a.runs)(n))
+        };
+        for (program, (experts, top_k)) in [
+            (Program::Glm5nextBody, (288, 8)),
+            (Program::Mimo2Body, (256, 8)),
+            (Program::Solar2Body, (320, 8)),
+            (Program::Raon1Body, (128, 6)),
+        ] {
+            assert!(
+                runs(program, &router(experts, top_k)),
+                "{program:?}'s own router pair read as uncovered"
+            );
+        }
+        for program in [
+            Program::Glm5nextBody,
+            Program::Mimo2Body,
+            Program::Solar2Body,
+            Program::Raon1Body,
+        ] {
+            assert!(
+                !runs(program, &router(256, 6)),
+                "{program:?} read as launching the 256/top-6 sigmoid instance"
+            );
         }
     }
 
@@ -2057,7 +2287,7 @@ mod tests {
             "routed gate q3_K".into(),
             matrix("ffn_gate_exps.weight", Role::RoutedExperts, GgmlType::Q3_K),
             &[
-                "q3_K routed experts gate and up (the body reads q4_K, q5_K, q6_K, iq3_xxs, iq3_s, iq4_xs and q8_0)"
+                "q3_K routed experts gate and up (the body reads q4_K, q5_K, q6_K, iq2_xxs, iq3_xxs, iq3_s, iq4_xs and q8_0)"
                     .to_string(),
             ],
         );
@@ -2159,12 +2389,12 @@ mod tests {
         type Parts = (&'static str, &'static [GgmlType], &'static [GgmlType]);
         let rows: (Parts, Parts) = (
             (
-                "q4_K, q5_K, q6_K, iq3_xxs, iq3_s, iq4_xs and q8_0",
+                "q4_K, q5_K, q6_K, iq2_xxs, iq3_xxs, iq3_s, iq4_xs and q8_0",
                 &[Q4_K, Q5_K, Q6_K, IQ3_XXS, IQ3_S, IQ4_XS, Q8_0],
                 &[Q3_K, IQ2_XS, MXFP4],
             ),
             (
-                "q4_K, q5_K, q6_K, iq3_xxs, iq3_s, iq4_xs, q5_1, q8_0 and iq4_nl",
+                "q4_K, q5_K, q6_K, iq2_xxs, iq3_xxs, iq3_s, iq4_xs, q5_1, q8_0 and iq4_nl",
                 &[Q4_K, Q5_K, Q6_K, IQ3_XXS, IQ3_S, IQ4_XS, Q5_1, Q8_0, IQ4_NL],
                 &[Q3_K, IQ2_XS, MXFP4],
             ),
@@ -2396,13 +2626,13 @@ mod tests {
                 "ffn_gate_exps.weight",
                 Role::RoutedExperts,
                 GgmlType::IQ2_XS,
-                "iq2_xs routed experts gate and up (the body reads q4_K, q5_K, q6_K, iq3_xxs, iq3_s, iq4_xs and q8_0)",
+                "iq2_xs routed experts gate and up (the body reads q4_K, q5_K, q6_K, iq2_xxs, iq3_xxs, iq3_s, iq4_xs and q8_0)",
             ),
             (
                 "ffn_down_exps.weight",
                 Role::RoutedExperts,
                 GgmlType::MXFP4,
-                "mxfp4 routed experts down (the body reads q4_K, q5_K, q6_K, iq3_xxs, iq3_s, iq4_xs, q5_1, q8_0 and iq4_nl)",
+                "mxfp4 routed experts down (the body reads q4_K, q5_K, q6_K, iq2_xxs, iq3_xxs, iq3_s, iq4_xs, q5_1, q8_0 and iq4_nl)",
             ),
             (
                 "ffn_gate_shexp.weight",
@@ -2509,8 +2739,18 @@ mod tests {
     /// `qdot::fuses`: on x86_64 the x86-64-v3 host the engine itself requires,
     /// elsewhere the scalar mirrors, which fuse the same types.
     fn glm5next_items(tensors: Vec<ModelTensor>, needle: &str) -> Vec<(Option<usize>, String)> {
+        arch_items(Arch::Glm5Next, tensors, needle)
+    }
+
+    /// The items whose text holds `needle` of a file of `arch` whose tensors are `tensors` over
+    /// five layers of 288 experts, its description's layers empty.
+    fn arch_items(
+        arch: Arch,
+        tensors: Vec<ModelTensor>,
+        needle: &str,
+    ) -> Vec<(Option<usize>, String)> {
         let spec = ModelSpec {
-            arch: Arch::Glm5Next,
+            arch,
             hidden: 4096,
             vocab: 154_880,
             ctx_train: 1_048_576,
@@ -2520,6 +2760,7 @@ mod tests {
             hc: None,
             engram: None,
             encoder: None,
+            logit_epilogue: None,
             chat: ChatSpec {
                 pre: String::new(),
                 template: None,
@@ -2576,6 +2817,61 @@ mod tests {
         glm5next_items(tensors, "routed experts on a card")
     }
 
+    /// A routed stack of a minimax-m3 file passes when the program can run it — on the card by
+    /// its leg's arms, the glm5next body's (the common leg's in the file's blocks, NVFP4's and
+    /// NVFP4_ROWS' planes), or on the host by a fused qdot kernel at its row width — and a type
+    /// neither side runs is an item for each layer that holds it. The widths here are off every
+    /// fused kernel's K unit, so the card's arms alone decide. FAIL-first: under the mimo2 and
+    /// solar2 bodies' rule (`kernels::card_runs`, both roles in the file's blocks), where the
+    /// body sat before, the NVFP4_ROWS layer and the q6_K down are items.
+    #[test]
+    fn a_minimaxm3_routed_stack_runs_on_its_planes_leg_or_the_host() {
+        let none = Vec::<(Option<usize>, String)>::new();
+        let item = |ty: GgmlType| -> Vec<(Option<usize>, String)> {
+            [3, 4]
+                .into_iter()
+                .map(|l| (Some(l), Need::RoutedFormat(ty).to_string()))
+                .collect()
+        };
+        let routed = |gate_up: GgmlType, down: GgmlType| {
+            let stack = |layer: usize, stem: &str, ty: GgmlType| ModelTensor {
+                name: format!("blk.{layer}.{stem}.weight"),
+                shard: 0,
+                layer: Some(layer),
+                role: Role::RoutedExperts,
+                ty,
+                dims: vec![2000, 2000, 288],
+                file_bytes: 0,
+                gathered_rows: None,
+            };
+            let tensors = [3, 4]
+                .into_iter()
+                .flat_map(|l| {
+                    [
+                        stack(l, "ffn_gate_exps", gate_up),
+                        stack(l, "ffn_up_exps", gate_up),
+                        stack(l, "ffn_down_exps", down),
+                    ]
+                })
+                .collect();
+            arch_items(Arch::MiniMaxM3, tensors, "routed experts on a card")
+        };
+        let cases = [
+            (GgmlType::NVFP4_ROWS, GgmlType::NVFP4_ROWS, none.clone()),
+            (GgmlType::Q4_K, GgmlType::Q6_K, none.clone()),
+            (GgmlType::BF16, GgmlType::Q4_K, item(GgmlType::BF16)),
+        ];
+        let wrong: Vec<_> = cases
+            .iter()
+            .map(|(gate_up, down, want)| (gate_up, down, want, routed(*gate_up, *down)))
+            .filter(|(_, _, want, got)| want != &got)
+            .collect();
+        assert!(
+            wrong.is_empty(),
+            "(gate and up, down, want, got) of the cases off the rule: {wrong:#?}"
+        );
+    }
+
     /// The items of the model-level tensor `name` of role `role` and type
     /// `ty` (GLM-5.3-Flash's 4,096 by 154,880 matrix) whose text holds
     /// `needle`.
@@ -2609,8 +2905,8 @@ mod tests {
     // up or down) are no items; a bf16 stack, which `CardFormat::of` took but
     // no host kernel reads, is an item.
     // PIN(2026-10-22): the glm5next leg holds NVFP4 stacks in their planes and
-    // quantizes the 32-value form their down reads, so an NVFP4 layer, which
-    // no host kernel reads, is no item (it was one).
+    // quantizes the 32-value form their down reads, so an NVFP4 layer is no
+    // item (it was one).
     #[test]
     fn a_glm5next_routed_stack_runs_on_a_card_or_the_host() {
         let none = Vec::<(Option<usize>, String)>::new();
@@ -2635,8 +2931,10 @@ mod tests {
             // down) and its NextN layer (q2_K gate and up, q3_K down).
             (GgmlType::IQ2_XS, GgmlType::IQ3_XXS, none.clone()),
             (GgmlType::Q2_K, GgmlType::Q3_K, none.clone()),
-            // The card's alone: NVFP4 in its planes, which no host kernel
-            // reads (mutant: glm5next's rule left on the common leg).
+            // The card's in its planes and the host's by a fused qdot kernel
+            // at its 64-value block (placement's
+            // `glm5next_arms_are_the_leg_with_planes_over_both_forms` holds
+            // the rule-left-on-the-common-leg mutant).
             (GgmlType::NVFP4, GgmlType::NVFP4, none.clone()),
             // No side: bf16 has no card expert and no fused qdot kernel, as
             // a gate and up or as a down.
@@ -2696,6 +2994,7 @@ mod tests {
                 hc: None,
                 engram: None,
                 encoder: None,
+                logit_epilogue: None,
                 chat: ChatSpec {
                     pre: String::new(),
                     template: None,

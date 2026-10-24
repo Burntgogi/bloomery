@@ -1,0 +1,15 @@
+# Packed EmbeddingGemma 2, 32 inputs of 18 tokens, one pass. One short pass is launch-bound:
+# the v2 layer body is about 32 launches times 26 layers, about 5 ms of chain on the RTX A6000,
+# and 18 tokens of arithmetic (5.4 GFLOP at 5..30 TFLOPS) sit inside that chain.
+# Packed, the chain is paid once. Arithmetic is 576 x 0.3 GFLOP = 0.17 TFLOP at 5..30 effective
+# TFLOPS = 6..35 ms, so the wall is that arithmetic. The gap's 8..40 is the same band padded.
+kind: baseline
+question: what wall does one packed pass of 32 EmbeddingGemma 2 inputs of 18 tokens take on the RTX A6000?
+term: pass wall ms @ 32 inputs x 18 tokens, one packed pass, RTX A6000
+unit: ms
+predict: 6..35
+condition: one lease, the RTX A6000 only, a warm EmbeddingGemma 2 pass of 32 inputs of 18 tokens packed into one call, the output to a file first
+reason: the seat runs those inputs one pass each today (159 ms for 32 short inputs); the pack is the gap G9 change and the arithmetic at 576 rows is the term a run has to fix
+decide-in: record the wall beside the 159 ms one-at-a-time figure; the pack holds
+decide-below: the effective TFLOPS at 576 rows is above the 5..30 band, or the launch chain is under 5 ms; re-read the layer launch count before calling it a win
+decide-above: the pass still launches per input, or the GEMM at 576 rows is under 5 TFLOPS; the batch line or a profile names which

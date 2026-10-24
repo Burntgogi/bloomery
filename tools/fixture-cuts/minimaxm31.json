@@ -1,0 +1,42 @@
+{
+  "name": "minimaxm31",
+  "arch": "minimax-m3",
+  "source": "MiniMaxAI/MiniMax-M3.1-Flash",
+  "rev": "76faee1b4ac0f412e547781172e94548a6526a88",
+  "expect": {"tensors": 89632, "data_bytes": 250103411200},
+  "layers": [0, 3, 59],
+  "layer_prefix": "language_model.model.layers.",
+  "keep": [
+    "language_model.model.embed_tokens.weight",
+    "language_model.lm_head.weight",
+    "language_model.model.norm.weight"
+  ],
+  "drop": ["vision_tower.", "multi_modal_projector.", "patch_merge_mlp."],
+  "copy": [
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "generation_config.json",
+    "chat_template.jinja",
+    "special_tokens_map.json",
+    "added_tokens.json"
+  ],
+  "widths": {"ff": {"keep": 512, "align": 128}},
+  "planes": [
+    {"base": "block_sparse_moe.experts.*.w1", "axis": "rows", "width": "ff",
+     "members": {"weight_packed": 1, "weight_scale": 1}},
+    {"base": "block_sparse_moe.experts.*.w3", "axis": "rows", "width": "ff",
+     "members": {"weight_packed": 1, "weight_scale": 1}},
+    {"base": "block_sparse_moe.experts.*.w2", "axis": "cols", "width": "ff",
+     "members": {"weight_packed": 2, "weight_scale": 16}}
+  ],
+  "config": {
+    "layer_count": "text_config.num_hidden_layers",
+    "widths": {"text_config.intermediate_size": "ff"},
+    "per_layer": [
+      "text_config.moe_layer_freq",
+      "text_config.sparse_attention_config.sparse_attention_freq",
+      "text_config.sparse_attention_config.sparse_disable_index_value"
+    ],
+    "layer_names": ["quantization_config.ignored_layers"]
+  }
+}

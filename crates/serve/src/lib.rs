@@ -37,6 +37,7 @@ mod http;
 pub mod media;
 pub mod mock;
 mod models;
+pub mod museatem;
 pub mod preflight;
 mod promptcache;
 pub mod qwenxml;

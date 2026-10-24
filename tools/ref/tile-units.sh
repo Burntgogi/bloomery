@@ -2,7 +2,8 @@
 # The host expert tier's tile cost rows, derived from the code: builds qdot for x86_64-linux with the repo's
 # rustflags (no linking, so it runs on the Mac with no box), disassembles the rlib with the pinned toolchain's
 # llvm-objdump, and runs `tools/ref/asm-census.py tile-units`: the fixed and per-column units of every type qdot
-# tiles, fitted over the `qdot::tile::<C>` loops, against `tile_units` in crates/model/src/ops.rs.
+# tiles, fitted over the `qdot::tile::<C>` loops (a type with a wide kernel over that kernel's runs of 16 and 32
+# columns), against `tile_units` in crates/model/src/ops.rs.
 #
 #   tools/ref/tile-units.sh [OUT_DIR]     OUT_DIR (default: a new temp dir, printed) keeps the listing and relocations
 #

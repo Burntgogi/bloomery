@@ -195,6 +195,7 @@ pub fn layer_line(layer: &LayerSpec) -> String {
         match layer.residual {
             Residual::Plain => "plain",
             Residual::Hc => "hc",
+            Residual::AlphaBeta { .. } => "alpha-beta",
         },
         if layer.extras.is_empty() {
             String::new()

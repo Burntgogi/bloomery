@@ -1,16 +1,19 @@
 //! The one load of a part source onto a card (`model::part::Source`: a GGUF file or a
-//! checkpoint folder). The caller's rule says which tensors the card holds, whole or the part
-//! of a rank, as the source plans them; every planned part's card format is checked before any
-//! is read; then each part is read and staged in turn through one staging ring, which one
-//! synchronize ends ([`load`]). A rank of a tensor-parallel load of N ranks passes its family's
-//! cut; a one-card load passes its placement plan's card ([`OnCard`]).
+//! checkpoint folder). The caller's rule says which tensors the card holds, whole, the part of
+//! a rank, or a stack's listed experts, as the source plans them; every planned part's card
+//! format is checked before any is read; then each part is read and staged in turn through one
+//! staging ring, which one synchronize ends ([`load`]). A rank of a tensor-parallel load of N
+//! ranks passes its family's cut; a one-card load passes its placement plan's card
+//! ([`OnCard`]), and a folder whose host reads tensors where its located header holds them
+//! passes those ([`InPlace`]): the card takes its share of a stack the plan splits between it
+//! and that host, the host reads the rest where the folder stores it.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use cuda_core::CudaStream;
-use gguf::{GgmlType, TensorInfo};
+use gguf::{GgmlType, Place, Split, TensorInfo};
 use model::part::{Source, Take};
-use model::placement::{CardFormat, Device, Format, ModelTensor, Plan, Segment};
+use model::placement::{CardFormat, Device, ExpertList, Format, ModelTensor, Plan, Segment};
 
 use crate::GpuError;
 use crate::upload::UploadRing;
@@ -40,6 +43,9 @@ pub fn load<S: Source, E: std::fmt::Display>(
         budget = budget
             .checked_add(part_format(&p.info)?.1)
             .ok_or_else(|| refused("the parts' staging bytes pass usize".into()))?;
+        if let Some(format) = card(&p.info) {
+            card_layout(&p.info, format)?;
+        }
     }
     stream.context().bind_to_thread()?;
     let mut staged = BTreeMap::new();
@@ -65,19 +71,97 @@ pub fn load<S: Source, E: std::fmt::Display>(
     Ok(Weights::of_staged(staged))
 }
 
+/// The tensors a located header holds in place (`gguf::Place::File` or `gguf::Place::Stack`),
+/// which the host reads where the folder stores them: a load from a part source skips such a
+/// tensor the plan holds on the host, and takes its card's experts of such a stack the plan
+/// splits between the card and the host ([`OnCard::of_in_place`]). A tensor the part source
+/// alone makes (`gguf::Place::Made`) has no host reader.
+#[derive(Debug, Default)]
+pub struct InPlace(HashMap<String, Held>);
+
+/// How a located header holds a tensor in place ([`InPlace`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Held {
+    /// One run of a file.
+    File,
+    /// A stack of this many matrices, each read where the file keeps it.
+    Stack(usize),
+}
+
+impl InPlace {
+    /// The tensors `header` holds in place.
+    #[must_use]
+    pub fn of(header: &Split) -> InPlace {
+        InPlace(
+            header
+                .iter_tensors()
+                .filter_map(|(_, t)| {
+                    let held = match header.place(&t.name)? {
+                        Place::File { .. } => Held::File,
+                        Place::Stack { codes_at, .. } => Held::Stack(codes_at.len()),
+                        Place::Made => return None,
+                    };
+                    Some((t.name.clone(), held))
+                })
+                .collect(),
+        )
+    }
+
+    /// Whether the header holds tensor `name` in place.
+    #[must_use]
+    pub fn holds(&self, name: &str) -> bool {
+        self.0.contains_key(name)
+    }
+
+    /// The matrices of the stack `name` the header holds in place; `None` for a tensor it holds
+    /// as one file run, or not at all.
+    fn stack(&self, name: &str) -> Option<usize> {
+        match self.0.get(name)? {
+            Held::Stack(n) => Some(*n),
+            Held::File => None,
+        }
+    }
+}
+
 /// Card `card` of `plan` as a load from a part source reads it ([`load`]): each tensor the plan
-/// holds whole on that card, in the plan's card format and resident bytes; a tensor the plan
-/// uses nowhere, or reads by rows from the NVMe tier (a row-gathered table, which its own
-/// reader maps where the source stores it), is skipped. A source fills no host set and no other
-/// card, so a tensor the plan splits or holds on the host or another card is refused by name.
+/// holds whole on that card, in the plan's card format and resident bytes, and the card's
+/// experts of a stack the plan splits between that card, other cards (a stage card and its
+/// expert tier card) and a host that reads the stack where a located header holds it
+/// ([`InPlace`]), in the plan's slot order; a tensor the plan uses nowhere, or reads by rows from
+/// the NVMe tier (a row-gathered table, which its own reader maps where the source stores it), is
+/// skipped, as is a tensor the plan holds on the host where a located header holds it in place,
+/// which the host reads there, and a tensor or stack of which this card holds nothing, which the
+/// other cards' loads read. A source fills no host set, so a tensor the plan splits otherwise, or
+/// holds on the host but the source alone makes, is refused by name.
 pub struct OnCard {
-    held: HashMap<String, (CardFormat, u64)>,
+    held: HashMap<String, OnThisCard>,
     skipped: HashSet<String>,
 }
 
+/// A tensor the card holds ([`OnCard`]): the plan's card format and resident bytes, and the
+/// stack's experts the card holds of a split stack (`None` the whole tensor).
+struct OnThisCard {
+    format: CardFormat,
+    bytes: u64,
+    experts: Option<ExpertList>,
+}
+
 impl OnCard {
-    /// Card `card` of `plan`, each tensor's segments checked as the type says.
+    /// Card `card` of `plan`, each tensor's segments checked as the type says; no tensor on the
+    /// host.
     pub fn of(plan: &Plan<'_>, card: usize) -> Result<OnCard, GpuError> {
+        OnCard::of_in_place(plan, card, &InPlace::default())
+    }
+
+    /// [`OnCard::of`] whose host reads the tensors `in_place` names where they are stored: a
+    /// tensor the plan holds wholly on the host is skipped when `in_place` holds it, and refused
+    /// by name otherwise; of a stack `in_place` holds that the plan splits between this card and
+    /// the host, the card takes its segment's experts ([`OnCard::take`]).
+    pub fn of_in_place(
+        plan: &Plan<'_>,
+        card: usize,
+        in_place: &InPlace,
+    ) -> Result<OnCard, GpuError> {
         let model = plan.model;
         let rows = plan.rows.iter().map(|row| {
             model
@@ -86,13 +170,15 @@ impl OnCard {
                 .map(|t| (t, row.segments.as_slice(), model.experts_of(t)))
                 .ok_or_else(|| refused(format!("a placement row names tensor {}", row.tensor)))
         });
-        OnCard::of_rows(rows, card)
+        OnCard::of_rows(rows, card, in_place)
     }
 
-    /// The tensors of `rows` (each with its segments and its stack's experts) on card `card`.
+    /// The tensors of `rows` (each with its segments and its stack's experts) on card `card`,
+    /// the host reading the tensors `in_place` names.
     fn of_rows<'a>(
         rows: impl Iterator<Item = Result<(&'a ModelTensor, &'a [Segment], u64), GpuError>>,
         card: usize,
+        in_place: &InPlace,
     ) -> Result<OnCard, GpuError> {
         let mut held = HashMap::new();
         let mut skipped = HashSet::new();
@@ -125,14 +211,41 @@ impl OnCard {
                             "on card {card} in part, the rest of its experts elsewhere"
                         )));
                     }
-                    held.insert(t.name.clone(), (format, s.resident_bytes));
+                    held.insert(
+                        t.name.clone(),
+                        OnThisCard {
+                            format,
+                            bytes: s.resident_bytes,
+                            experts: None,
+                        },
+                    );
                 }
                 [s] if s.device == Device::Unused
                     || (s.device == Device::Nvme && t.gathered_rows.is_some()) =>
                 {
                     skipped.insert(t.name.clone());
                 }
+                segments if elsewhere_only(segments, card) => {
+                    skipped.insert(t.name.clone());
+                }
+                segments
+                    if !segments.is_empty()
+                        && segments.iter().all(|s| s.device == Device::Host) =>
+                {
+                    if !in_place.holds(&t.name) {
+                        return Err(elsewhere(
+                            "on Host, where the host reads only a tensor a located header holds \
+                             in place (a file run or a stack), and the part source makes this one"
+                                .to_string(),
+                        ));
+                    }
+                    skipped.insert(t.name.clone());
+                }
                 segments => {
+                    if let Some(share) = card_share(t, segments, card, in_place)? {
+                        held.insert(t.name.clone(), share);
+                        continue;
+                    }
                     let on: Vec<String> =
                         segments.iter().map(|s| format!("{:?}", s.device)).collect();
                     return Err(elsewhere(format!("on {}", on.join(" and "))));
@@ -142,11 +255,14 @@ impl OnCard {
         Ok(OnCard { held, skipped })
     }
 
-    /// The rule [`load`] plans by: a tensor the card holds whole, or none; a name the plan does
-    /// not hold is refused by name.
+    /// The rule [`load`] plans by: a tensor the card holds whole, the card's experts of a split
+    /// stack in the plan's slot order, or none; a name the plan does not hold is refused by name.
     pub fn take(&self, name: &str) -> Result<Take, String> {
-        if self.held.contains_key(name) {
-            Ok(Take::Whole)
+        if let Some(on) = self.held.get(name) {
+            Ok(on
+                .experts
+                .as_ref()
+                .map_or(Take::Whole, |list| Take::Experts(list.clone())))
         } else if self.skipped.contains(name) {
             Ok(Take::Skip)
         } else {
@@ -156,13 +272,13 @@ impl OnCard {
 
     /// The plan's card format of `t`.
     pub fn format(&self, t: &TensorInfo) -> Option<CardFormat> {
-        self.held.get(&t.name).map(|&(f, _)| f)
+        self.held.get(&t.name).map(|on| on.format)
     }
 
     /// Refused by name unless `w` holds every tensor the card holds, at the plan's resident
     /// bytes: a tensor the source does not make, or makes otherwise than the plan's file did.
     pub fn check(&self, w: &Weights) -> Result<(), GpuError> {
-        for (name, &(_, bytes)) in &self.held {
+        for (name, &OnThisCard { bytes, .. }) in &self.held {
             let got = w.get(name).map(|dw| dw.resident_bytes() as u64);
             if got != Some(bytes) {
                 return Err(refused(format!(
@@ -174,16 +290,18 @@ impl OnCard {
     }
 }
 
-/// Card `card` of `plan` from `source` ([`OnCard`], [`load`], each part's pages released under
-/// `release`), checked against the plan.
-pub fn load_placed<S: Source>(
+/// Card `card` of `plan` from `source` ([`OnCard::of_in_place`], [`load`], each part's pages
+/// released under `release`), checked against the plan; the host reads the tensors `in_place`
+/// names where they are stored.
+pub fn load_placed_in_place<S: Source>(
     stream: &CudaStream,
     source: &S,
     plan: &Plan<'_>,
     card: usize,
     release: bool,
+    in_place: &InPlace,
 ) -> Result<Weights, GpuError> {
-    let on = OnCard::of(plan, card)?;
+    let on = OnCard::of_in_place(plan, card, in_place)?;
     let w = load(
         stream,
         source,
@@ -195,6 +313,80 @@ pub fn load_placed<S: Source>(
     Ok(w)
 }
 
+/// Whether `segments` put something on a card other than `card` and nothing on `card`, the rest
+/// on the host: another card's load reads its segments, and the load of a card that holds a share
+/// checks the host's ([`card_share`]).
+fn elsewhere_only(segments: &[Segment], card: usize) -> bool {
+    let other = |s: &Segment| matches!(s.device, Device::Card(c) if c != card);
+    segments.iter().any(other)
+        && segments
+            .iter()
+            .all(|s| other(s) || s.device == Device::Host)
+}
+
+/// The card's share of stack `t`, whose segments are `segments`, when the plan splits it between
+/// card `card`, other cards and the host and `in_place` holds it as a stack, which the host reads
+/// where the folder stores it: one segment on the card, in a card format, holding some of the
+/// stack's experts, every other segment on another card or the host. `None` for segments of any
+/// other split, which the caller refuses by name; a card expert past the located stack's
+/// matrices, and a card segment in no card format, are refused by name.
+fn card_share(
+    t: &ModelTensor,
+    segments: &[Segment],
+    card: usize,
+    in_place: &InPlace,
+) -> Result<Option<OnThisCard>, GpuError> {
+    let Some(matrices) = in_place.stack(&t.name) else {
+        return Ok(None);
+    };
+    let mut on_card = segments.iter().filter(|s| s.device == Device::Card(card));
+    let (Some(s), None) = (on_card.next(), on_card.next()) else {
+        return Ok(None);
+    };
+    let elsewhere = segments.iter().filter(|s| s.device != Device::Card(card));
+    let Some(list) = s.experts.as_ref() else {
+        return Ok(None);
+    };
+    let card_or_host = |s: &Segment| matches!(s.device, Device::Card(_) | Device::Host);
+    if !elsewhere.clone().all(card_or_host) || elsewhere.count() == 0 {
+        return Ok(None);
+    }
+    let Format::Card(format) = s.format else {
+        return Err(refused(format!(
+            "{} is on the card as {}",
+            t.name, s.format
+        )));
+    };
+    if let Some(&e) = list.ids().iter().find(|&&e| e as usize >= matrices) {
+        return Err(refused(format!(
+            "{}: the plan puts expert {e} on card {card}, and the located stack holds {matrices} \
+             matrices",
+            t.name
+        )));
+    }
+    Ok(Some(OnThisCard {
+        format,
+        bytes: s.resident_bytes,
+        experts: Some(list.clone()),
+    }))
+}
+
+/// Refused by name unless card format `format` lays out the part `t` (its type, its row width
+/// and rows): a layout the plan's card format cannot take, before any part is read.
+fn card_layout(t: &TensorInfo, format: CardFormat) -> Result<(), GpuError> {
+    let rows: u64 = t.dims.iter().skip(1).product();
+    let k = t.dims.first().copied().unwrap_or(0);
+    format
+        .resident_bytes(t.ty, k, rows)
+        .map(|_| ())
+        .ok_or_else(|| {
+            refused(format!(
+                "{}: {} {:?} has no layout in the plan's card format {format:?}",
+                t.name, t.ty, t.dims
+            ))
+        })
+}
+
 fn refused(detail: String) -> GpuError {
     GpuError::shape(WHAT, detail)
 }
@@ -202,13 +394,15 @@ fn refused(detail: String) -> GpuError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use model::placement::{ExpertList, Role};
+    use model::placement::Role;
 
     /// The rule a load from a part source plans by: a tensor whole on the card is taken in the
-    /// plan's card format, an unused tensor and a row-gathered table on the NVMe tier are
-    /// skipped, and a tensor the plan places on the host, on another card, split, or in part
-    /// on the card is refused by name, as is a name the plan does not hold; the check refuses
-    /// weights that miss a held tensor.
+    /// plan's card format, an unused tensor, a row-gathered table on the NVMe tier and a tensor
+    /// whole on another card (that card's load reads it) are skipped, and a tensor the plan
+    /// places on the host, split, or in part on the card is refused by name, as is a name the
+    /// plan does not hold; the check refuses weights that miss a held tensor. Mutant: the
+    /// other-card arm dropped — the stage's attention on the tier card's load is refused "on
+    /// Card(0)".
     #[test]
     fn on_card_takes_the_card_s_tensors_and_refuses_the_rest() {
         let tensor = |name: &str, role, gathered_rows| ModelTensor {
@@ -232,6 +426,7 @@ mod tests {
         let stack = tensor("x.weight", Role::RoutedExperts, None);
         let table = tensor("t.weight", Role::EngramTable, Some(1));
         let unused = tensor("u.weight", Role::Attention, None);
+        let stage = tensor("s.weight", Role::Attention, None);
         let ok = [
             (&held, vec![seg(Device::Card(0), bf16, None)]),
             (
@@ -240,15 +435,21 @@ mod tests {
             ),
             (&table, vec![seg(Device::Nvme, Format::NvmeFile, None)]),
             (&unused, vec![seg(Device::Unused, Format::Unused, None)]),
+            (&stage, vec![seg(Device::Card(1), bf16, None)]),
         ];
         let of = |r: &[(&ModelTensor, Vec<Segment>)]| {
-            OnCard::of_rows(r.iter().map(|(t, s)| Ok((*t, s.as_slice(), 8))), 0)
+            OnCard::of_rows(
+                r.iter().map(|(t, s)| Ok((*t, s.as_slice(), 8))),
+                0,
+                &InPlace::default(),
+            )
         };
         let on = of(&ok).unwrap();
         assert!(matches!(on.take("a.weight"), Ok(Take::Whole)));
         assert!(matches!(on.take("x.weight"), Ok(Take::Whole)));
         assert!(matches!(on.take("t.weight"), Ok(Take::Skip)));
         assert!(matches!(on.take("u.weight"), Ok(Take::Skip)));
+        assert!(matches!(on.take("s.weight"), Ok(Take::Skip)));
         assert!(on.take("z.weight").unwrap_err().contains("z.weight"));
         let info = |name: &str| TensorInfo {
             name: name.into(),
@@ -268,7 +469,6 @@ mod tests {
                 vec![seg(Device::Host, Format::HostFile, None)],
                 "on Host",
             ),
-            (&held, vec![seg(Device::Card(1), bf16, None)], "on Card(1)"),
             (
                 &host_table,
                 vec![seg(Device::Host, Format::HostFile, None)],
@@ -291,5 +491,227 @@ mod tests {
             let e = of(&[(t, segments)]).err().expect("refused").to_string();
             assert!(e.contains(&t.name) && e.contains(named), "{e}");
         }
+    }
+
+    /// A tensor the plan holds wholly on the host is skipped when the located header holds it in
+    /// place, which the host reads there, and refused by name when the part source alone makes
+    /// it; a tensor the header holds as one file run that the plan splits between the card and
+    /// the host is refused by name. Mutant: the host arm dropped — the in-place embedding is
+    /// refused "on Host" and the folder's load never starts.
+    #[test]
+    fn on_card_skips_the_host_s_in_place_tensors_and_refuses_made_ones() {
+        let tensor = |name: &str| ModelTensor {
+            name: name.into(),
+            shard: 0,
+            layer: None,
+            role: Role::TokenEmbedding,
+            ty: GgmlType::BF16,
+            dims: vec![64, 8],
+            file_bytes: 1024,
+            gathered_rows: None,
+        };
+        let seg = |device, format, experts: Option<Vec<u32>>| Segment {
+            device,
+            format,
+            experts: experts.map(|ids| ExpertList::new(ids, 8).unwrap()),
+            resident_bytes: 1024,
+        };
+        let host = || vec![seg(Device::Host, Format::HostFile, None)];
+        let (stored, made) = (tensor("token_embd.weight"), tensor("made.weight"));
+        let in_place = InPlace(
+            [("token_embd.weight".to_string(), Held::File)]
+                .into_iter()
+                .collect(),
+        );
+        let of = |r: &[(&ModelTensor, Vec<Segment>)]| {
+            OnCard::of_rows(
+                r.iter().map(|(t, s)| Ok((*t, s.as_slice(), 8))),
+                0,
+                &in_place,
+            )
+        };
+        let on = of(&[(&stored, host())]).unwrap();
+        assert!(matches!(on.take("token_embd.weight"), Ok(Take::Skip)));
+        let e = of(&[(&made, host())]).err().expect("refused").to_string();
+        assert!(
+            e.contains("made.weight") && e.contains("on Host") && e.contains("makes"),
+            "{e}"
+        );
+        let bf16 = Format::Card(CardFormat::Bf16Raw);
+        let split = vec![
+            seg(Device::Card(0), bf16, Some((0..6).collect())),
+            seg(Device::Host, Format::HostFile, Some((6..8).collect())),
+        ];
+        let e = of(&[(&stored, split)]).err().expect("refused").to_string();
+        assert!(e.contains("on Card(0) and Host"), "{e}");
+    }
+
+    /// Of a stack the located header holds in place that the plan splits between the card, other
+    /// cards (plan (b′)'s stage and expert tier cards) and the host, the card takes its segment's
+    /// experts in the plan's slot order, at that segment's card format and resident bytes, the
+    /// other cards' loads take theirs and the host reads the rest where the folder stores them;
+    /// a card that holds none of the stack skips it. Refused by name: a card expert past the
+    /// located stack's matrices, a card segment in no card format, the rest on the NVMe tier,
+    /// two segments on this card, and a split of a stack the header does not hold in place (a
+    /// GGUF's, or a folder's whose part source makes it). Red against the load before the split
+    /// arm, which refused every split "on Card(0) and Host"; mutant: other cards left out of
+    /// the split arm — the stage's share of a tiered split is refused "on Card(0) and Card(1)
+    /// and Host".
+    #[test]
+    fn on_card_takes_its_experts_of_a_stack_split_with_the_in_place_host() {
+        let name = "stack.weight";
+        let stack = ModelTensor {
+            name: name.into(),
+            shard: 0,
+            layer: Some(3),
+            role: Role::RoutedExperts,
+            ty: GgmlType::BF16,
+            dims: vec![64, 4, 8],
+            file_bytes: 4096,
+            gathered_rows: None,
+        };
+        let seg = |device, format, ids: &[u32], experts: u64| Segment {
+            device,
+            format,
+            experts: Some(ExpertList::new(ids.to_vec(), experts).unwrap()),
+            resident_bytes: 512 * ids.len() as u64,
+        };
+        let card = Format::Card(CardFormat::Bf16Raw);
+        let host = Format::HostFile;
+        let in_place =
+            |n: usize| InPlace([(name.to_string(), Held::Stack(n))].into_iter().collect());
+        let of = |t: &ModelTensor, segments: Vec<Segment>, in_place: &InPlace| {
+            OnCard::of_rows(
+                std::iter::once(Ok((t, segments.as_slice(), t.dims[2]))),
+                0,
+                in_place,
+            )
+        };
+        let split = || {
+            vec![
+                seg(Device::Card(0), card, &[1, 4, 6], 8),
+                seg(Device::Host, host, &[0, 2, 3, 5, 7], 8),
+            ]
+        };
+        let on = of(&stack, split(), &in_place(8)).unwrap();
+        let want = ExpertList::new(vec![1, 4, 6], 8).unwrap();
+        assert_eq!(on.take(name), Ok(Take::Experts(want)));
+        let info = TensorInfo {
+            name: name.into(),
+            dims: vec![64, 4, 3],
+            ty: GgmlType::BF16,
+            offset: 0,
+            nbytes: 1536,
+        };
+        assert_eq!(on.format(&info), Some(CardFormat::Bf16Raw));
+        let e = on.check(&Weights::default()).unwrap_err().to_string();
+        assert!(e.contains(name) && e.contains("the plan holds 1536"), "{e}");
+        let two_hosts = vec![
+            seg(Device::Card(0), card, &[0], 8),
+            seg(Device::Host, host, &[1, 2, 3], 8),
+            seg(Device::Host, host, &[4, 5, 6, 7], 8),
+        ];
+        let on = of(&stack, two_hosts, &in_place(8)).unwrap();
+        let want = ExpertList::new(vec![0], 8).unwrap();
+        assert_eq!(on.take(name), Ok(Take::Experts(want)));
+        let tiered = || {
+            vec![
+                seg(Device::Card(0), card, &[1, 4], 8),
+                seg(Device::Card(1), card, &[6], 8),
+                seg(Device::Host, host, &[0, 2, 3, 5, 7], 8),
+            ]
+        };
+        let on = of(&stack, tiered(), &in_place(8)).unwrap();
+        let want = ExpertList::new(vec![1, 4], 8).unwrap();
+        assert_eq!(on.take(name), Ok(Take::Experts(want)));
+        let on = OnCard::of_rows(
+            std::iter::once(Ok((&stack, tiered().as_slice(), 8))),
+            1,
+            &in_place(8),
+        )
+        .unwrap();
+        let want = ExpertList::new(vec![6], 8).unwrap();
+        assert_eq!(on.take(name), Ok(Take::Experts(want)));
+        let stage_only = [
+            seg(Device::Card(0), card, &[1, 4], 8),
+            seg(Device::Host, host, &[0, 2, 3, 5, 6, 7], 8),
+        ];
+        let on = OnCard::of_rows(
+            std::iter::once(Ok((&stack, stage_only.as_slice(), 8))),
+            1,
+            &in_place(8),
+        )
+        .unwrap();
+        assert_eq!(on.take(name), Ok(Take::Skip));
+        for (segments, in_place, says) in [
+            (
+                split(),
+                in_place(6),
+                "expert 6 on card 0, and the located stack holds 6",
+            ),
+            (
+                vec![
+                    seg(Device::Card(0), host, &[1, 4, 6], 8),
+                    seg(Device::Host, host, &[0, 2, 3, 5, 7], 8),
+                ],
+                in_place(8),
+                "on the card as host_file",
+            ),
+            (
+                vec![
+                    seg(Device::Card(0), card, &[1, 4, 6], 8),
+                    seg(Device::Nvme, Format::NvmeFile, &[0, 2, 3, 5, 7], 8),
+                ],
+                in_place(8),
+                "on Card(0) and Nvme",
+            ),
+            (
+                vec![
+                    seg(Device::Card(0), card, &[1, 4], 8),
+                    seg(Device::Card(0), card, &[6], 8),
+                    seg(Device::Host, host, &[0, 2, 3, 5, 7], 8),
+                ],
+                in_place(8),
+                "on Card(0) and Card(0) and Host",
+            ),
+            (split(), InPlace::default(), "on Card(0) and Host"),
+        ] {
+            let e = of(&stack, segments, &in_place)
+                .err()
+                .expect("refused")
+                .to_string();
+            assert!(e.contains(name) && e.contains(says), "{says}: {e}");
+        }
+    }
+
+    /// A part whose type and dims the plan's card format lays out passes; one it does not is
+    /// refused by name before any part is read. Mutant: `card_layout` passes every part — the
+    /// refusal comes from the upload of that part, after the parts before it moved.
+    #[test]
+    fn a_layout_the_card_format_cannot_take_is_refused_by_name() {
+        let t = |ty, dims: Vec<u64>| TensorInfo {
+            name: "stack.weight".into(),
+            nbytes: 0,
+            ty,
+            dims,
+            offset: 0,
+        };
+        assert!(
+            card_layout(
+                &t(GgmlType::NVFP4, vec![256, 4, 3]),
+                CardFormat::Nvfp4Planes
+            )
+            .is_ok()
+        );
+        let e = card_layout(
+            &t(GgmlType::NVFP4, vec![256, 4, 3]),
+            CardFormat::Mxfp8Planes,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.contains("stack.weight") && e.contains("Mxfp8Planes"),
+            "{e}"
+        );
     }
 }

@@ -33,11 +33,12 @@
 //! - (iv) the chain captures (its node count is the step gate's). A
 //!   synthetic depth is no method of this model: the body is not
 //!   `Instrumented`, so a seed is a compile error, not a refusal to check.
-//! - (v) reload: a probe context holds the card across two loads; the first
-//!   model's drop gives back everything but what its chain capture took from
-//!   the context (iv) and, when the body held page-locked shadows, the one
-//!   2 MiB mapping granule that capture keeps; the second load takes what the
-//!   first took less that granule, and its drop gives back all of it.
+//! - (v) reload: a probe context holds the card across two loads, both device
+//!   bundles JIT'd on it before the first reading and by neither load; the
+//!   first model's drop gives back everything but what its chain capture took
+//!   from the context (iv) and, when the body held page-locked shadows, the
+//!   one 2 MiB mapping granule that capture keeps; the second load takes what
+//!   the first took less that granule, and its drop gives back all of it.
 //! - (vi) slots: on every layer's routed stacks, at slots 0, n/2 and n − 1,
 //!   the stack's `_sel` gemv (`q3k_gemv_sel`, `q4k_gemv_sel`) is bit for bit
 //!   the plain gemv of an upload of just that slot's expert's rows from the
@@ -88,7 +89,7 @@ mod gate {
     use bloomery_gpu_deepseek41::body::{self, Body, Deepseek41Model, OpenCfg, StepInput};
     use bloomery_gpu_deepseek41::chain::attn::join_groups;
     use bloomery_gpu_deepseek41::params::{ImageView, Table};
-    use bloomery_gpu_deepseek41::rope::{Direction, RopeSpec, RopeTable};
+    use bloomery_gpu_deepseek41::rope::{Direction, RopeKernels, RopeSpec, RopeTable};
     use bloomery_gpu_gates::oracle::for_arch;
     use bloomery_gpu_gates::tier;
     use bloomery_gpu_gates::{
@@ -120,6 +121,10 @@ mod gate {
     /// The device granule a page-locked allocation of the shadows' size takes
     /// from the card (check v).
     const PINNED_GRANULE: i128 = 2 << 20;
+
+    /// The device bundles a load binds: the probe's `Gpu` JITs the first, the
+    /// gate the second, both before check (v)'s first reading.
+    const BUNDLES: [&str; 2] = ["bloomery-gpu", "bloomery-gpu-deepseek41"];
 
     /// Check (vii)'s prompt: prose ids fed one position at a time, every
     /// position a step through the host tier.
@@ -153,6 +158,11 @@ mod gate {
         })?;
         let t = &plan.cards[0];
         let need = t.dense_bytes + t.expert_bytes + t.rounding_bytes + t.kv_bytes + t.scratch_bytes;
+        // Both bundles JIT here, before the first reading: the module pool's
+        // granule rounding then sits in `free0`, and no drop owes it (check v).
+        let _ds41_bundle = RopeKernels::load(probe.context())?;
+        let device = probe.context().ordinal();
+        let bundles_before = bundle_loads_on(device);
         let free0 = free(&probe)?;
         println!(
             "card {} is {}: {free0} B free with the probe's context; the plan puts {need} B on it \
@@ -204,6 +214,7 @@ mod gate {
         drop(m);
         let free4 = free(&probe)?;
         crate::ds41_tier::sc("(v) reload: a second load takes what the first took")?;
+        ok &= check_bundles(bundles_before, bundle_loads_on(device));
         ok &= check_reload([free0, free1, free2, free3, free4], captured, shadow_host);
         crate::ds41_tier::sc("(vii) r8 off: the source read steps the r8 load's bits")?;
         ok &= check_r8_off(&path, &cfg)?;
@@ -223,6 +234,24 @@ mod gate {
              source and steps the r8 load's bits"
         );
         Ok(())
+    }
+
+    /// [`BUNDLES`]' loads on `device` so far ([`bloomery_gpu::bundle_loads`]).
+    fn bundle_loads_on(device: usize) -> [usize; 2] {
+        BUNDLES.map(|name| bloomery_gpu::bundle_loads(device, name))
+    }
+
+    /// Check (v)'s premise: each bundle loaded once before the first reading
+    /// and never again by either load, so no reading moves by the module
+    /// pool's rounding.
+    fn check_bundles(before: [usize; 2], after: [usize; 2]) -> bool {
+        let pass = before == [1, 1] && after == [1, 1];
+        println!(
+            "check v: bundles {BUNDLES:?} loaded {before:?} times before the first reading, \
+             {after:?} after both drops (each once, before): {}",
+            verdict(pass)
+        );
+        pass
     }
 
     /// The card's free bytes, as the probe's context reads them.
@@ -769,9 +798,9 @@ mod gate {
         Ok(([before, step].concat(), pos))
     }
 
-    /// One verdict line of check (iii).
-    fn line(set: &str, what: &str, pass: bool) -> bool {
-        println!("check iii {set:<32} {what}: {}", verdict(pass));
+    /// One verdict line of the check named `check`.
+    fn line(check: &str, set: &str, what: &str, pass: bool) -> bool {
+        println!("{check} {set:<32} {what}: {}", verdict(pass));
         pass
     }
 
@@ -779,6 +808,9 @@ mod gate {
     fn bits(values: &[f32]) -> Vec<u32> {
         values.iter().map(|v| v.to_bits()).collect()
     }
+
+    /// What check (iii)'s lines name it by.
+    const IMAGE_CHECK: &str = "check iii";
 
     /// Check (iii): each set's step built, refreshed and read back.
     fn check_image(
@@ -791,8 +823,8 @@ mod gate {
         let (window, yarn) = (RopeTable::new(&specs.0)?, RopeTable::new(&specs.1)?);
         let dims = body.image().layout().dims().clone();
         println!(
-            "check iii: the step image is {} B: {} token(s), streams of ratio {:?}, {} rope values \
-             per table, {} embedding bytes, {} engram bytes per token",
+            "{IMAGE_CHECK}: the step image is {} B: {} token(s), streams of ratio {:?}, {} rope \
+             values per table, {} embedding bytes, {} engram bytes per token",
             body.image().layout().bytes(),
             dims.tokens,
             dims.stream_ratios,
@@ -816,14 +848,22 @@ mod gate {
             body.refresh(stream, &StepInput { pos })?;
             let words = body.params().to_host_vec(stream)?;
             let view = body.image().layout().view(&words)?;
-            ok &= image_matches(set, &plan, &view, dims.window, (&window, &yarn));
-            ok &= rows_match(set, &view, &embd, &engram);
+            ok &= image_matches(
+                IMAGE_CHECK,
+                set,
+                &plan,
+                &view,
+                dims.window,
+                (&window, &yarn),
+            );
+            ok &= rows_match(IMAGE_CHECK, set, &view, &embd, &engram);
         }
         Ok(ok)
     }
 
     /// The image's integers and tables against the plan and `RopeTable`.
     fn image_matches(
+        check: &str,
         set: &str,
         plan: &StepPlan,
         view: &ImageView<'_>,
@@ -840,6 +880,7 @@ mod gate {
             p - plan.raw_first[0] + 1,
         ];
         ok &= line(
+            check,
             set,
             &format!(
                 "token {} pos {} slot {} len {} — the plan's token, position, cell {} mod {window} \
@@ -869,6 +910,7 @@ mod gate {
             ];
             let bad: Vec<&str> = fields.iter().filter(|f| !f.1).map(|f| f.0).collect();
             ok &= line(
+                check,
                 set,
                 &format!(
                     "{name} (ratio {}): groups {} kept {} n_visible {:?} state_read {:?} \
@@ -904,6 +946,7 @@ mod gate {
                     ),
                 };
                 ok &= line(
+                    check,
                     set,
                     &format!("{name} row table: {at}"),
                     !got.is_empty() && got == want.as_slice(),
@@ -925,6 +968,7 @@ mod gate {
             }
         }
         ok &= line(
+            check,
             set,
             &format!(
                 "{} rope tables at position {p} — RopeTable's bit for bit{}",
@@ -942,7 +986,13 @@ mod gate {
 
     /// The caller's rows, read back in the layout's packing: four bytes to a
     /// little-endian word, the last zero-padded.
-    fn rows_match(set: &str, view: &ImageView<'_>, embd: &[u8], engram: &[u8]) -> bool {
+    fn rows_match(
+        check: &str,
+        set: &str,
+        view: &ImageView<'_>,
+        embd: &[u8],
+        engram: &[u8],
+    ) -> bool {
         let words = |bytes: &[u8]| -> Vec<u32> {
             bytes
                 .chunks(4)
@@ -955,6 +1005,7 @@ mod gate {
         };
         let (embd_words, engram_words) = (words(embd), words(engram));
         line(
+            check,
             set,
             &format!(
                 "embedding row of {} bytes and engram rows of {} bytes, back as they went",
@@ -1002,30 +1053,27 @@ mod gate {
     /// past its free keeps that granule (probe `pinprobe2.py`, shadowhost
     /// round): with shadows and a capture, the first drop leaves the capture
     /// plus exactly that granule, and the second load finds it mapped.
-    /// PIN(2026-10-04): the first load also JITs the crate's bundle, which
-    /// jitonce (412367f3) keeps per (device, bundle) past every drop — a
-    /// second granule the second load finds mapped and no drop gives back.
-    /// That granule's cause is the load itself, not the shadows or the
-    /// capture: it holds for every run of this gate, while the page-locked
-    /// granule holds only while the body held shadows (`shadow_host`) and a
-    /// capture keeps the mapping (`captured`).
+    /// PIN(2026-10-23): both bundles JIT before `before` ([`check_bundles`]),
+    /// so the module pool's 2 MiB granule, which jitonce keeps past every
+    /// drop, sits in `before` whichever bundle's JIT maps it; it moved from
+    /// the first load to the probe's open as the `bloomery-gpu` bundle grew
+    /// (int039 batch: `before` 2 MiB lower, load 1 2 MiB less, every later
+    /// reading the same). The page-locked granule holds only while the body
+    /// held shadows (`shadow_host`) and a capture keeps the mapping
+    /// (`captured`).
     fn check_reload(
         [before, first, dropped, second, end]: [u64; 5],
         captured: u64,
         shadow_host: usize,
     ) -> bool {
         let took = |a: u64, b: u64| i128::from(a) - i128::from(b);
-        // The JIT'd bundle's granule: every first load of the crate's bundle
-        // on this device takes it (PIN(2026-10-04) above).
-        let jit = PINNED_GRANULE;
         // The page-locked shadows' granule, kept by the capture's device
         // allocation (PIN(2026-09-24) above).
-        let pinned: i128 = if shadow_host > 0 && captured > 0 {
+        let granule: i128 = if shadow_host > 0 && captured > 0 {
             PINNED_GRANULE
         } else {
             0
         };
-        let granule = jit + pinned;
         let pass = took(before, dropped) == i128::from(captured) + granule
             && took(dropped, second) == took(before, first) - granule
             && end == dropped;
@@ -1042,8 +1090,8 @@ mod gate {
         if !pass {
             println!(
                 "FAIL: check v: the first drop left {} B taken besides the capture's {captured} \
-                 (allowed {granule}: the JIT'd bundle's granule, plus the shadows' {shadow_host} B \
-                 page-locked when a capture keeps it), the second load took {} B more than the \
+                 (allowed {granule}: the shadows' {shadow_host} B page-locked when a capture \
+                 keeps them), the second load took {} B more than the \
                  first (allowed {}), the second drop left {} B taken",
                 took(before, dropped) - i128::from(captured),
                 took(dropped, second) - took(before, first),

@@ -6,14 +6,15 @@
 //! and the tensor scales it reads.
 //!
 //! A GGUF file holds its tensors in their card types: a part is runs of its rows' bytes
-//! ([`part_of`]), and a scaled tensor's scales are the `.scale` beside it, one an expert along a
-//! cut of a stack's experts.
+//! ([`part_at`]), and a scaled tensor's scales are the `.scale` beside it, one an expert along a
+//! cut of a stack's experts or of the experts a list names ([`scales_at`]).
 
 use std::ops::Range;
 use std::path::PathBuf;
 
 use gguf::{GgmlType, Split, TensorInfo};
 
+use crate::placement::ExpertList;
 use crate::placement::tp::{TpError, part_of};
 
 /// Why a part was refused.
@@ -35,8 +36,15 @@ pub fn refuse(name: &str, what: impl Into<String>) -> Error {
     }
 }
 
-/// The indices of a tensor a part holds: a dim and the range along it; `None` the whole tensor.
-pub type At = Option<(usize, Range<u64>)>;
+/// The indices of a tensor a part holds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum At {
+    /// The indices `.1` along dim `.0`.
+    Along(usize, Range<u64>),
+    /// The experts the list names of a stack (`[k, rows, n_expert]`), in the list's order: a
+    /// card's slots, expert `ids()[s]` in slot `s`.
+    Experts(ExpertList),
+}
 
 /// What a load reads of a tensor.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -45,28 +53,109 @@ pub enum Take {
     Whole,
     /// The indices `.1` along dim `.0`.
     Part(usize, Range<u64>),
+    /// The experts of a stack the list names, in its order ([`At::Experts`]).
+    Experts(ExpertList),
 }
 
-/// What `rule` takes of tensor `t`: `None` skipped, else the indices it reads; a refusal of
-/// `rule` names the tensor.
+/// What `rule` takes of tensor `t`: `None` skipped, else the indices it reads (`None` the whole
+/// tensor); a refusal of `rule` names the tensor.
 pub fn take<E: std::fmt::Display>(
     rule: &impl Fn(&str, GgmlType, &[u64]) -> Result<Take, E>,
     t: &TensorInfo,
-) -> Result<Option<At>, Error> {
+) -> Result<Option<Option<At>>, Error> {
     Ok(
         match rule(&t.name, t.ty, &t.dims).map_err(|e| refuse(&t.name, e.to_string()))? {
             Take::Skip => None,
             Take::Whole => Some(None),
-            Take::Part(dim, at) => Some(Some((dim, at))),
+            Take::Part(dim, at) => Some(Some(At::Along(dim, at))),
+            Take::Experts(list) => Some(Some(At::Experts(list))),
         },
     )
 }
 
-/// One part a load reads ([`Source::plan`]): the indices it holds and its header entry (name,
-/// card type, dims and bytes).
+/// The part of the tensor `t` (a header entry of its whole bytes) at `at`, the whole tensor for
+/// `None`: the part's header entry and the byte ranges of its rows in the tensor's bytes, in the
+/// part's order. Indices along a dim are [`part_of`]'s; a stack's listed experts are each
+/// expert's run, in the list's order. A list of no expert, a list of a tensor that is not a stack
+/// of experts and an expert past the stack's are refused by name, besides [`part_of`]'s
+/// refusals.
+pub fn part_at(t: &TensorInfo, at: Option<&At>) -> Result<(TensorInfo, Vec<Range<usize>>), Error> {
+    let list = match at {
+        None => return Ok(part_of(t, None)?),
+        Some(At::Along(dim, r)) => return Ok(part_of(t, Some((*dim, r.clone())))?),
+        Some(At::Experts(list)) => list,
+    };
+    let &[_, _, n] = t.dims.as_slice() else {
+        return Err(refuse(
+            &t.name,
+            format!(
+                "{:?} is not a stack of experts, which a list of experts is taken of",
+                t.dims
+            ),
+        ));
+    };
+    if list.is_empty() {
+        return Err(refuse(&t.name, "a list of no expert takes nothing"));
+    }
+    let (mut runs, mut nbytes) = (Vec::with_capacity(list.ids().len()), 0u64);
+    for &e in list.ids() {
+        let e = u64::from(e);
+        if e >= n {
+            return Err(refuse(
+                &t.name,
+                format!("expert {e} is past the stack's {n}"),
+            ));
+        }
+        let (one, run) = part_of(t, Some((2, e..e + 1)))?;
+        nbytes += one.nbytes;
+        runs.extend(run);
+    }
+    let mut dims = t.dims.clone();
+    dims[2] = list.len();
+    Ok((
+        TensorInfo {
+            name: t.name.clone(),
+            dims,
+            ty: t.ty,
+            offset: t.offset,
+            nbytes,
+        },
+        runs,
+    ))
+}
+
+/// The tensor scales of the part at `at` of tensor `name` of `dims`, of the tensor's scales `all`
+/// (one, or one an expert of a stack): a stack's experts' own in the part's order, along its
+/// experts or by a list; `all` for any other part. An expert past `all` is refused by name.
+pub fn scales_at(
+    name: &str,
+    dims: &[u64],
+    all: Vec<f32>,
+    at: Option<&At>,
+) -> Result<Vec<f32>, Error> {
+    let pick = |e: u64| {
+        usize::try_from(e)
+            .ok()
+            .and_then(|e| all.get(e).copied())
+            .ok_or_else(|| {
+                refuse(
+                    name,
+                    format!("expert {e} is past its {} tensor scales", all.len()),
+                )
+            })
+    };
+    match at {
+        Some(At::Along(2, r)) if dims.len() == 3 => r.clone().map(pick).collect(),
+        Some(At::Experts(list)) => list.ids().iter().map(|&e| pick(u64::from(e))).collect(),
+        _ => Ok(all),
+    }
+}
+
+/// One part a load reads ([`Source::plan`]): the indices it holds (`None` the whole tensor) and
+/// its header entry (name, card type, dims and bytes).
 #[derive(Clone, Debug)]
 pub struct Planned {
-    pub at: At,
+    pub at: Option<At>,
     pub info: TensorInfo,
 }
 
@@ -195,7 +284,7 @@ impl Source for Split {
                 continue;
             }
             if let Some(at) = take(&rule, t)? {
-                let (info, _) = part_of(t, at.clone())?;
+                let (info, _) = part_at(t, at.as_ref())?;
                 out.push(Planned { at, info });
             }
         }
@@ -212,15 +301,14 @@ impl Source for Split {
             .shard(shard)
             .ok_or_else(|| refuse(name, format!("names shard {shard}")))?
             .data(t)?;
-        let (info, runs) = part_of(t, p.at.clone())?;
+        let (info, runs) = part_at(t, p.at.as_ref())?;
         let find = |n: &str| {
             let (s, t) = self.find(n)?;
             Some((self.shard(s)?, t))
         };
-        let scale = gguf::tensor_scales(t, find)?.map(|s| match &p.at {
-            Some((2, r)) if t.dims.len() == 3 => s[r.start as usize..r.end as usize].to_vec(),
-            _ => s,
-        });
+        let scale = gguf::tensor_scales(t, find)?
+            .map(|s| scales_at(name, &t.dims, s, p.at.as_ref()))
+            .transpose()?;
         Ok(Part {
             info,
             bytes: Bytes::File(runs.into_iter().map(|r| &data[r]).collect()),

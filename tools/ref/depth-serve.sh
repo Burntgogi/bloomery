@@ -104,8 +104,9 @@ if [ "$MODE" != summary ]; then
   # shellcheck source=tools/ref/ref-paths.sh
   source "$HERE/ref-paths.sh"
   # The timing card, the stale-binary rule, the guards and, through it, the lease and the witness block; this runner
-  # has local mode (the header's Local mode).
-  TIMING_LOCAL_RUNNER=1
+  # has local mode (the header's Local mode) and the two-card mode (BLOOMERY_TIMING_CARDS=a6000+3090: both cards in
+  # the server's view, each arm's Xid, cap and answer checked by timing_cards_arm).
+  TIMING_CARDS_RUNNER=1 TIMING_LOCAL_RUNNER=1
   # shellcheck source=tools/ref/timing-card.sh
   source "$HERE/timing-card.sh"
   # The server arms' start, request and stop (the llama-server runners' functions; the server here is bloomery-serve).
@@ -378,7 +379,7 @@ ds_print_plan() {
 ds_fail() {
   local why=$3
   lcpp_srv_stop
-  [ -n "$TWOCARD_WHY" ] || timing_cards_arm "" || why="$why; $TWOCARD_WHY"
+  [ -n "$TWOCARD_WHY" ] || timing_cards_arm "$(cat "${SRV_LOG:-/dev/null}" 2> /dev/null)" serve || why="$why; $TWOCARD_WHY"
   echo "FAIL r$1 ${A_LABEL[$2]} D=${A_DEP[$2]}: $why${CPU_BUSY_TAG:-}${OTHER_BUSY_TAG:-}" >&2
   if [ -r "${SRV_LOG:-}" ]; then
     echo "--- the server's log ($SRV_LOG), last 20 lines" >&2
@@ -428,12 +429,17 @@ ds_run_arm() {
   fi
   lcpp_srv_stop
   # Local mode: an Xid since the last arm's check, or the card lost, fails the arm (timing-card.sh).
-  timing_cards_arm "" || ds_fail "$r" "$i" "$TWOCARD_WHY"
+  timing_cards_arm "$(cat "$SRV_LOG")" serve || ds_fail "$r" "$i" "$TWOCARD_WHY"
   echo "ROW r$r $label D=$dep | tg_tok/s $tg | pp_tok/s $pp | load_s $load | majflt $maj${CPU_BUSY_TAG:-}${OTHER_BUSY_TAG:-}" | tee -a "$ROWS_FILE"
 }
 
 # ds_main <arm>...: the run (or, under BLOOMERY_DRY, the plan).
 ds_main() {
+  # A two-card request this machine cannot honour ends here, under its mode's tag (an opted-in runner says it itself).
+  if [ -n "${BLOOMERY_TIMING_CARDS:-}" ] && [ -n "$TIMING_CARDS_WHY" ]; then
+    if [ -n "$TIMING_LOCAL" ]; then echo "[timing-card] refused: $TIMING_CARDS_WHY" >&2; else echo "[timing-cards] refused: $TIMING_CARDS_WHY" >&2; fi
+    exit 64
+  fi
   local i r k n v maxd need
   # Local mode refused (timing-card.sh printed why as this file sourced it) ends the run here, dry or not.
   [ -z "$TIMING_LOCAL" ] || [ -z "$TIMING_CARDS_WHY" ] || exit 64

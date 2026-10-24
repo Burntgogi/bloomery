@@ -247,8 +247,9 @@ pub enum PlaceError {
         /// The planner's own refusal of the tier card.
         origin: Box<PlacementError>,
     },
-    /// A machine with an expert tier card, under a card rule whose program
-    /// hangs no tier ([`PlanInputs::plan_rule`]).
+    /// A machine with an expert tier card. [`PlanInputs::plan_rule`] does not
+    /// return it: a tier machine is planned. Callers that match every refusal
+    /// still name it.
     #[error(
         "the machine has the expert tier card {tier}; the program this plan is for hangs no \
          expert tier"
@@ -743,8 +744,10 @@ impl PlanInputs {
     /// `levers`, the routed experts by the expert rule over the layers whose
     /// three routed stacks `rule` loads — the card rule of the program that
     /// runs the plan ([`routed_rule`]: [`PROGRAM`]'s, or the qwen35moe body's
-    /// for a qwen35moe file) — the rest on the host. Refused as [`PlanInputs::plan_with`]
-    /// refuses; a machine with an expert tier card is refused by name.
+    /// for a qwen35moe file) — the rest on the host, a stage card's id prefix
+    /// first and each expert tier's next ids after it. Refused as
+    /// [`PlanInputs::plan_with`] refuses. A plan with no draft wants no
+    /// [`MTP_RESERVE`] row ([`check_draft_reserve`]).
     pub fn plan_rule<'a>(
         &'a self,
         machine: &'a Machine,
@@ -754,11 +757,6 @@ impl PlanInputs {
     ) -> Result<Plan<'a>, PlaceError> {
         if ctx_max == 0 || ctx_max > KERNEL_POSITIONS {
             return Err(PlaceError::Positions { ctx_max });
-        }
-        if let Some(tier) = machine.tiers.first() {
-            return Err(PlaceError::Tier {
-                tier: tier.name.clone(),
-            });
         }
         check_draft_reserve(machine, None)?;
         let plan = self.target_rule(machine, ctx_max, levers, Some(rule), Beside::none())?;
@@ -1465,6 +1463,25 @@ pub fn machine_for_experts(
 /// ([`MtpInputs::card_bytes`]).
 pub const MTP_RESERVE: &str = "MTP draft";
 
+/// Tokens one chunk of the Qwen3.6 card leg's prompt-batch service runs.
+/// [`tier_batch`] is the qwen4exp plan's figure, not this one.
+pub const LEG_TIER_CHUNK: u64 = 8;
+
+/// The Qwen3.6 card leg's prompt-batch bytes ([`TierBatchBytes`]): the tier
+/// card's staging, one chunk of the leg's scratch and the host's rows, for
+/// blocks of the host union's columns. [`tier_batch`] is the qwen4exp plan's
+/// figure.
+#[must_use]
+pub fn leg_tier_batch(hp: &Hparams) -> TierBatchBytes {
+    workstation::tier_leg_batch_bytes(
+        hp.n_embd as u64,
+        hp.expert_ff as u64,
+        hp.n_used as u64,
+        LEG_TIER_CHUNK,
+        crate::moe::UNION_MAX_COLS as u64,
+    )
+}
+
 /// The expert tier's prompt-batch bytes a qwen4exp plan (b′) reserves
 /// ([`machine_bp`]) for a load whose ubatches take up to `ubatch` positions.
 /// The host tier's batch port is made for blocks as wide as the ubatch
@@ -1558,7 +1575,7 @@ pub fn machine_bp_on(
     m.cards[0]
         .reserves
         .extend(draft.map(|b| (MTP_RESERVE.to_string(), b)));
-    m.tiers.push(workstation::tier_card(tier, None, batch));
+    m.tiers.push(workstation::tier_card(tier, batch));
     m.host_mut()
         .reserves
         .push((TIER_BATCH_HOST_RESERVE.to_string(), batch.host));
@@ -2331,6 +2348,7 @@ fn draft_machine() -> Machine {
             layers: 0..1,
             head: true,
             token_embedding: false,
+            reserve_only: false,
             reserves: Vec::new(),
         }],
         tiers: Vec::new(),
@@ -2464,7 +2482,7 @@ mod tests {
             .expect("the folder header describes");
         let machine = super::machine(super::A6000, inputs.model.layers, 8);
         let levers = PlanLevers {
-            card_budget_bytes: None,
+            card_budget_bytes: Default::default(),
         };
         for (input, tier) in [
             (&inputs, placement::Device::Host),
@@ -2801,6 +2819,7 @@ mod tests {
                     layers: 0..6,
                     head: true,
                     token_embedding: false,
+                    reserve_only: false,
                     reserves: Vec::new(),
                 }],
                 tiers: Vec::new(),
@@ -2959,7 +2978,7 @@ mod tests {
             let (model, machine) = (model(), machine(131 * MIB));
             let plan = card_plan(&model, &machine, &PlanLevers::default(), 3 * MIB);
             assert_eq!(plan.n_l, N_L_RESERVED);
-            assert_eq!(plan.card_budget, None);
+            assert!(!plan.card_budget.is_set());
             let c = &plan.cards[0];
             assert_eq!(
                 c.dense_bytes + c.expert_bytes + c.rounding_bytes,
@@ -2975,7 +2994,7 @@ mod tests {
         fn a_card_plan_of_no_expert_is_the_host_plan() {
             let (model, machine) = (model(), machine(131 * MIB));
             let levers = PlanLevers {
-                card_budget_bytes: Some(2 * MIB),
+                card_budget_bytes: Some(2 * MIB).into(),
             };
             let card = card_plan(&model, &machine, &levers, 0);
             let host = placement::plan_host_routed(&model, &machine, 4096, &NoKv, &levers)
@@ -2990,7 +3009,7 @@ mod tests {
                         p.nvme_bytes,
                         &p.n_l,
                         p.ctx_max,
-                        p.card_budget
+                        &p.card_budget
                     )
                 )
             };
@@ -3063,6 +3082,7 @@ mod tests {
                             yarn: None,
                         },
                         qk_norm: true,
+                        o_norm: false,
                         out_gate: OutGate::Packed,
                         select: None,
                         window: None,
@@ -3074,6 +3094,8 @@ mod tests {
                         top_k: 10,
                         expert_ff: 640,
                         latent: None,
+                        pre_exp_norm: false,
+                        post_exp_norm: None,
                         act: Act::SwiGlu { limit: None },
                         router: Router {
                             score: Score::Softmax,
@@ -3525,6 +3547,7 @@ mod tests {
                 hc: None,
                 engram: None,
                 encoder: None,
+                logit_epilogue: None,
                 chat: ChatSpec {
                     pre: String::new(),
                     template: None,
@@ -3566,6 +3589,7 @@ mod tests {
                     layers: 0..LAYERS,
                     head: true,
                     token_embedding: false,
+                    reserve_only: false,
                     reserves: Vec::new(),
                 }],
                 tiers: Vec::new(),
@@ -3661,7 +3685,7 @@ mod tests {
                     &p.n_l,
                     &p.tier_n_l,
                     p.ctx_max,
-                    p.card_budget
+                    &p.card_budget
                 )
             )
         }
@@ -3945,7 +3969,7 @@ mod tests {
             let mut inputs = routed(inputs());
             inputs.room = (pool, HostRead::Given);
             let whole = PlanLevers {
-                card_budget_bytes: Some(u64::MAX),
+                card_budget_bytes: Some(u64::MAX).into(),
             };
             for n in [1, 2] {
                 match inputs.plan_with_slots(&machine, CTX, &whole, Experts::Card, n) {
@@ -3959,7 +3983,7 @@ mod tests {
                 let plan = inputs
                     .plan_with_slots(&machine, CTX, &PlanLevers::default(), Experts::Card, n)
                     .unwrap_or_else(|e| panic!("{n} slot(s): {e}"));
-                let budget = plan.card_budget.expect("a card budget");
+                let budget = plan.card_budget.every().expect("a card budget");
                 assert!(
                     plan.budget_from_pool && budget < pool,
                     "{n} slot(s): the pool's budget, {budget} B"
@@ -3986,7 +4010,7 @@ mod tests {
         #[test]
         fn nvme_room_is_capped_by_the_unified_pool() {
             let levers = PlanLevers {
-                card_budget_bytes: Some(1 << 30),
+                card_budget_bytes: bloomery_levers::CardBudget::Every(1 << 30),
             };
             let mut inputs = routed(inputs());
             for slots in [1, 2, 4] {
@@ -4023,7 +4047,7 @@ mod tests {
         #[test]
         fn node_nvme_room_is_capped_by_the_unified_pool() {
             let levers = PlanLevers {
-                card_budget_bytes: Some(1 << 30),
+                card_budget_bytes: bloomery_levers::CardBudget::Every(1 << 30),
             };
             let mut inputs = routed(inputs());
             for ranks in [1, 2, 4] {
@@ -4097,7 +4121,7 @@ mod tests {
             assert_eq!(plan.tier_n_l, vec![vec![256; LAYERS]]);
             for budget in [None, Some(64 << 20), Some(u64::MAX)] {
                 let levers = PlanLevers {
-                    card_budget_bytes: budget,
+                    card_budget_bytes: budget.into(),
                 };
                 for owned in [[0, 512], [256, 256], [511, 1]] {
                     let result = inputs.plan_nodes(&machine, CTX, &levers, &owned);
@@ -4147,7 +4171,7 @@ mod tests {
                         &machine,
                         CTX,
                         &PlanLevers {
-                            card_budget_bytes: Some(0),
+                            card_budget_bytes: Some(0).into(),
                         },
                         &[256, 256],
                     )
@@ -4181,7 +4205,7 @@ mod tests {
                     &machine,
                     CTX,
                     &PlanLevers {
-                        card_budget_bytes: Some(u64::MAX),
+                        card_budget_bytes: Some(u64::MAX).into(),
                     },
                     &[0, 512],
                 ),

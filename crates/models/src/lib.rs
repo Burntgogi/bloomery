@@ -52,7 +52,20 @@ pub struct ModelSpec {
     /// What an encoder carries past its trunk; `None`: the model generates
     /// tokens.
     pub encoder: Option<EncoderSpec>,
+    /// The head's logit epilogue; `None`: the output projection's values are
+    /// the logits.
+    pub logit_epilogue: Option<LogitEpilogue>,
     pub chat: ChatSpec,
+}
+
+/// What the head runs on its logits after the output projection, in the
+/// graph's order: the scale, then the softcap.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LogitEpilogue {
+    /// `logit_scale`: every logit's factor.
+    pub scale: f32,
+    /// `final_logit_softcapping`: `cap·tanh(x/cap)`; 0: no cap.
+    pub softcap: f32,
 }
 
 /// The architectures a reader exists for.
@@ -85,6 +98,9 @@ pub enum Arch {
     /// Flint: dense lead, sigmoid MoE with one shared MLP, and independently
     /// masked sliding attention and RoPE. No executable program is registered.
     Flint,
+    /// Muse Spark: GQA layers whose sliding half ropes and full half does not, all of them routed
+    /// in a latent, no dense layer.
+    MuseSpark,
 }
 
 impl Arch {
@@ -110,6 +126,7 @@ impl Arch {
             Arch::GemmaEmbedding => "gemma-embedding",
             Arch::GemmaEmbedding2 => "gemma-embedding2",
             Arch::Flint => "flint",
+            Arch::MuseSpark => "muse-spark",
         }
     }
 }
@@ -241,6 +258,9 @@ pub struct Gqa {
     pub rope: Rope,
     /// A per-head RMS gain on q and k before the rope.
     pub qk_norm: bool,
+    /// A per-head gainless RMS norm on the heads' outputs, at the block
+    /// norm's epsilon, before the output gate.
+    pub o_norm: bool,
     /// The gate on the attention output; [`OutGate::None`]: the output is not gated.
     pub out_gate: OutGate,
     /// `None`: every position is attended.
@@ -556,6 +576,14 @@ pub struct Moe {
     /// and their weighted sum projected back up after (`ffn_latent_up`);
     /// `None`: they read and write the hidden row.
     pub latent: Option<u32>,
+    /// `ffn_pre_exp_norm`: a weighted RMS norm on the experts' input — the
+    /// latent, when they run in one — at the block norm's epsilon; `false`:
+    /// the projection's output is their input.
+    pub pre_exp_norm: bool,
+    /// `ffn_post_exp_norm`: the experts' aggregated output scaled by its
+    /// weight, then normalized at this epsilon, before the router's weights
+    /// apply; `None`: no norm.
+    pub post_exp_norm: Option<f32>,
     /// The routed experts' activation.
     pub act: Act,
     pub router: Router,
@@ -659,11 +687,19 @@ impl Act {
 }
 
 /// How a layer's outputs join the residual.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Residual {
     Plain,
     /// The owning spec's [`HcSpec`].
     Hc,
+    /// Per-channel α·stream + β·branch (`attn_resid_alpha`/`beta`,
+    /// `ffn_resid_alpha`/`beta`): each sublayer's output is normalized at
+    /// `eps` before it joins — the attention's weightlessly, the
+    /// feed-forward's scaled by its `post_ffw_norm` weight then normalized —
+    /// and α² + β² = 1 per channel, resolved at conversion.
+    AlphaBeta {
+        eps: f32,
+    },
 }
 
 /// Hyper-connections: the residual carried in several streams.
@@ -800,6 +836,10 @@ pub enum ToolFormat {
     /// A call on tagged lines: `<|tool_call:start|>NAME`, one `<|tool_arg:start|>KEY<|tool_arg:value|>VALUE
     /// <|tool_arg:end|>` per argument, `<|tool_call:end|>`, which Solar-Open's template teaches.
     TagKv,
+    /// Muse Spark's recipient protocol: a turn is `to=<recipient><|message|>` messages ended by
+    /// `<|eom|>` (more follow) or `<|eot|>` (the turn's end), `to=self` the reasoning span and
+    /// `to=<tool>` a call in ATEM markup (`<atem:function_calls>`).
+    MuseSpark,
 }
 
 /// A reasoning span syntax.

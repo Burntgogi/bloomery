@@ -568,22 +568,40 @@ where
     Ok(<D as Chosen<Session<B>>>::choosing(d, mode)?)
 }
 
-/// `BLOOMERY_DRAFT` as the levers hold it for a seat that takes `off`: unset
-/// and `off` are the plain path, `lookup` and `dspark` the served drafts.
-/// (`Draft::from_levers` is the V4.1 binaries' parse, which refuses `off` and
-/// registers the V4.1 draft record; this one needs neither.)
+/// `BLOOMERY_DRAFT` as the qwen3 seat reads it. Unset and `off` are
+/// [`Word::Off`] here; the seat decides afterwards whether a qwen35moe file's
+/// in-file layer drafts. `lookup` and `dspark` stay the served drafts
+/// ([`crate::draft::Draft`]). (`Draft::from_levers` is the V4.1 binaries'
+/// parse, which refuses `off` and registers the V4.1 draft record; this one
+/// needs neither.)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Word {
+    /// Unset or `off`: the seat's plain path, or a qwen35moe file's in-file
+    /// layer when that seat's default says so.
+    Off,
+    /// The n-gram draft.
+    Lookup,
+    /// The DSpark draft.
+    Dspark,
+    /// The file's own next-token layer.
+    Mtp,
+}
+
+/// [`Word`] from the levers. A word this seat does not take is refused by name.
 #[allow(
     dead_code,
     reason = "the qwen3 seat's parse; the V4.1 binary that includes this file serves no such seat"
 )]
-pub fn word(levers: &Levers) -> Result<Draft, GateError> {
+pub fn word(levers: &Levers) -> Result<Word, GateError> {
     match levers.draft() {
-        None | Some("off") => Ok(Draft::Off),
-        Some("lookup") => Ok(Draft::Lookup),
-        Some("dspark") => Ok(Draft::Dspark),
-        Some(other) => {
-            Err(format!("BLOOMERY_DRAFT is lookup, dspark, off or unset, not {other:?}").into())
-        }
+        None | Some("off") => Ok(Word::Off),
+        Some("lookup") => Ok(Word::Lookup),
+        Some("dspark") => Ok(Word::Dspark),
+        Some("mtp") => Ok(Word::Mtp),
+        Some(other) => Err(format!(
+            "BLOOMERY_DRAFT is lookup, dspark, mtp, off or unset, not {other:?}"
+        )
+        .into()),
     }
 }
 

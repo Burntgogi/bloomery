@@ -220,31 +220,30 @@ mod gate {
         let machine = match args.plan {
             PlanId::A => {
                 // A draft file asked of the one-card plan is refused by name
-                // before any device alloc. The byte count is not read.
+                // before any device alloc: the draft sits on the 3090 beside
+                // it, a reserve-only member of the plan this gate does not
+                // load. The byte count is not read.
                 if args.draft.is_some() {
-                    workstation::plan_a_draft(inputs.model.layers, Some(0))
-                        .map_err(|e| format!("plan (a): {e}"))?
-                } else {
-                    workstation::plan_a(inputs.model.layers)
+                    return Err(
+                        "plan (a): the DSpark draft sits on a card of its own beside the stage, \
+                         a reserve-only member of the plan this gate does not load: name plan bp \
+                         or no draft"
+                            .into(),
+                    );
                 }
+                workstation::plan_a(inputs.model.layers)
             }
             PlanId::B => {
                 // A draft file asked of plan (b) is refused by name before
-                // any device alloc. Plan (b) has no tier card. The byte
-                // count is not read.
-                workstation::check_tiers(
-                    workstation::A6000,
-                    &[],
-                    args.draft
-                        .as_ref()
-                        .map(|_| workstation::TierDraft { on: 0, bytes: 0 }),
-                    workstation::TierBatchBytes {
-                        staging: 0,
-                        scratch: 0,
-                        host: 0,
-                    },
-                )
-                .map_err(|e| format!("plan (b): {e}"))?;
+                // any device alloc: plan (b) is a layer cut that reserves a
+                // draft on no card. The byte count is not read.
+                if args.draft.is_some() {
+                    return Err(
+                        "plan (b): a layer cut reserves no draft on either card: the draft's \
+                         card is outside the plan"
+                            .into(),
+                    );
+                }
                 workstation::plan_b(inputs.model.layers)
             }
             PlanId::Bp => workstation::plan_bp(

@@ -1,8 +1,9 @@
 //! A fixture variant: a family's fixture requantized by ik's `llama-quantize` to one type map, so a
 //! quant type's train gate runs on a small file. This module owns the table (`tools/fixture-variants.tsv`),
 //! the map's expansion over the source's tensor names, the `--custom-q` argument that makes the
-//! quantizer retype exactly those tensors, and the check that a written variant differs from its source
-//! by the map alone.
+//! quantizer retype exactly those tensors, the recording of the variant's own card budget
+//! ([`record_budget`], after the quantizer wrote the trunk's), and the check that a written variant
+//! differs from its source by the map alone.
 //!
 //! A table row is `tag<TAB>family<TAB>scope<TAB>map<TAB>recipes<TAB>why`. The map is `role=type`
 //! words: `role` is a tensor name between `blk.<L>.` and `.weight`, `type` a ggml type name. The scope
@@ -11,13 +12,18 @@
 //!
 //! The quantizer picks a type for every tensor it sees, so the argument names every tensor of the
 //! source by its exact name: the map's tensors at their new type, every other at its own, which the
-//! quantizer copies byte for byte.
+//! quantizer copies byte for byte. The one key it cannot copy right is the card budget: a variant's
+//! experts are the map's types, so the cap that holds half of them on every card-eligible layer is
+//! the variant's own, planned by the family's planner on the written file (a family with a fixed
+//! budget keeps the trunk's value).
 
 use std::collections::{BTreeSet, HashMap};
+use std::io::{Seek, Write};
 
 use gguf::{GgmlType, Split, Value};
 
-use super::{FixtureError, KEY_VARIANT};
+use super::spec::CardBudget;
+use super::{FixtureError, KEY_CARD_BUDGET, KEY_VARIANT};
 
 /// The table, relative to the repository root.
 pub const TABLE: &str = "tools/fixture-variants.tsv";
@@ -369,7 +375,101 @@ pub fn override_kv(tag: &str) -> String {
     format!("{KEY_VARIANT}=str:{tag}")
 }
 
-fn kv_diff(source: &Split, variant: &Split, tag: &str) -> Result<(), FixtureError> {
+/// Record `budget` as [`KEY_CARD_BUDGET`] on every shard of `variant`'s set
+/// that holds the key, in place: the value is a u64, so the eight bytes of it
+/// are written and no other byte of the file moves, and the set is reopened
+/// to read the key back. Returns the value the shards held, which they must
+/// agree on; the quantizer copied the trunk's, which the family's planner
+/// replaces with the variant's own ([`super::budget::choose_written`]).
+///
+/// # Errors
+/// No shard holding the key, a shard whose value is not a u64, shards that
+/// disagree on it, or a file the patch cannot write or read back.
+pub fn record_budget(tag: &str, variant: &Split, budget: u64) -> Result<u64, FixtureError> {
+    let mut was = None;
+    for i in 0..variant.shard_count() {
+        let (Some(shard), Some(path)) = (variant.shard(i), variant.shard_path(i)) else {
+            continue;
+        };
+        let Some(value) = shard.value(KEY_CARD_BUDGET) else {
+            continue;
+        };
+        let Value::U64(old) = value else {
+            return Err(err(
+                tag,
+                format!(
+                    "{} holds {KEY_CARD_BUDGET} as {value:?}, not a u64 (the patch writes eight \
+                     bytes)",
+                    path.display()
+                ),
+            ));
+        };
+        let at = shard
+            .value_offset(KEY_CARD_BUDGET)
+            .expect("the reader records an offset for every value it parsed");
+        if let Some(w) = was
+            && w != *old
+        {
+            return Err(err(
+                tag,
+                format!(
+                    "{} holds {KEY_CARD_BUDGET} {old}, an earlier shard's {w}",
+                    path.display()
+                ),
+            ));
+        }
+        was = Some(*old);
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .map_err(|e| super::io_err(path, "open for the budget patch", e))?;
+        file.seek(std::io::SeekFrom::Start(at))
+            .and_then(|_| file.write_all(&budget.to_le_bytes()))
+            .map_err(|e| super::io_err(path, "write the budget", e))?;
+    }
+    let Some(was) = was else {
+        return Err(err(
+            tag,
+            format!("no shard holds {KEY_CARD_BUDGET} to record the budget on"),
+        ));
+    };
+    // The patch moved eight bytes inside one value; the reopened set must read
+    // them back as the budget it now holds.
+    let first = variant.shard_path(0).ok_or_else(|| {
+        err(
+            tag,
+            format!("the set names no first shard to read {KEY_CARD_BUDGET} back from"),
+        )
+    })?;
+    let again =
+        Split::open(first).map_err(|e| err(tag, format!("reading {KEY_CARD_BUDGET} back: {e}")))?;
+    for i in 0..again.shard_count() {
+        let (Some(shard), Some(path)) = (again.shard(i), again.shard_path(i)) else {
+            continue;
+        };
+        match shard.value(KEY_CARD_BUDGET) {
+            Some(Value::U64(v)) if *v == budget => {}
+            Some(got) => {
+                return Err(err(
+                    tag,
+                    format!(
+                        "{KEY_CARD_BUDGET} reads back as {got:?} in {}, want {budget}",
+                        path.display()
+                    ),
+                ));
+            }
+            None => {}
+        }
+    }
+    Ok(was)
+}
+
+fn kv_diff(
+    source: &Split,
+    variant: &Split,
+    tag: &str,
+    budget_own: bool,
+) -> Result<(), FixtureError> {
     let mismatch = |what: String| err(tag, format!("the header: {what}"));
     match variant.value(KEY_VARIANT) {
         Some(Value::String(s)) if s == tag => {}
@@ -382,6 +482,8 @@ fn kv_diff(source: &Split, variant: &Split, tag: &str) -> Result<(), FixtureErro
     }
     let skipped = |k: &str| {
         k == KEY_VARIANT
+            // A planned family's variant holds its own budget, not the trunk's.
+            || (budget_own && k == KEY_CARD_BUDGET)
             || k.starts_with("split.")
             || QUANTIZER_KEYS.contains(&k)
             || k.starts_with(QUANTIZER_KEY_PREFIX)
@@ -410,8 +512,11 @@ fn kv_diff(source: &Split, variant: &Split, tag: &str) -> Result<(), FixtureErro
 }
 
 /// Check that `variant` is `source` requantized by `row`'s map and by nothing else: the same header but
-/// for the tag, the same shard count, every tensor in the same shard with the same shape, the type the
-/// map gives it (its own when unlisted), and every unlisted tensor's bytes equal.
+/// for the tag and (a family whose `card_budget` plans one) the variant's own card budget, the same
+/// shard count, every tensor in the same shard with the same shape, the type the map gives it (its
+/// own when unlisted), and every unlisted tensor's bytes equal. The `card_budget` is the family's
+/// (its spec's, by the source's architecture): a planned family's variant holds the planner's value
+/// for the written file, a fixed family the trunk's.
 ///
 /// # Errors
 /// The first difference, naming the tensor or the key.
@@ -419,12 +524,37 @@ pub fn check(
     row: &Row,
     source: &Split,
     variant: &Split,
+    card_budget: CardBudget,
     line: &mut impl FnMut(&str),
 ) -> Result<CheckStats, FixtureError> {
     let tag = &row.tag;
     let retypes = expand(row, source)?;
     let to: HashMap<&str, GgmlType> = retypes.iter().map(|r| (r.name.as_str(), r.to)).collect();
-    kv_diff(source, variant, tag)?;
+    let budget_own = matches!(card_budget, CardBudget::Planned(_));
+    kv_diff(source, variant, tag, budget_own)?;
+    if let CardBudget::Planned(planner) = card_budget {
+        let want = super::budget::choose_written(&planner, variant)?;
+        match variant.value(KEY_CARD_BUDGET) {
+            Some(Value::U64(got)) if *got == want => {}
+            Some(got) => {
+                return Err(err(
+                    tag,
+                    format!(
+                        "{KEY_CARD_BUDGET} is {got:?}, want the planner's {want} for this file (a \
+                         variant's budget is planned on its own file, not copied from its trunk)"
+                    ),
+                ));
+            }
+            None => {
+                return Err(err(
+                    tag,
+                    format!(
+                        "{KEY_CARD_BUDGET} is missing, want the planner's {want} for this file"
+                    ),
+                ));
+            }
+        }
+    }
     if variant.shard_count() != source.shard_count() {
         return Err(err(
             tag,

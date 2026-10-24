@@ -457,6 +457,7 @@ mod tests {
                 yarn: None,
             },
             qk_norm: true,
+            o_norm: false,
             out_gate: OutGate::Packed,
             select: None,
             window: None,
@@ -486,6 +487,8 @@ mod tests {
                 top_k: 8,
                 expert_ff: q35::EXPERT_FF,
                 latent: None,
+                pre_exp_norm: false,
+                post_exp_norm: None,
                 act: Act::SwiGlu { limit: None },
                 router: Router {
                     score: Score::Softmax,

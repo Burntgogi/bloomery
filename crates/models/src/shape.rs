@@ -315,6 +315,27 @@ pub const ROUTERS: &[RouterInst] = &[
         top_k_max: 6,
         at: "gpu/src/route_body.rs sigmoid_128_6_router*",
     },
+    // 256 experts, top 6. After MiMo's 256/top-8 row: `router_row` at 256
+    // stays that row, and the pick ranges 8..=8 and 6..=6 do not overlap.
+    RouterInst {
+        body: RouterBody::BiasedSigmoid,
+        rule: BIASED_SIGMOID,
+        norm_arg: false,
+        experts: 256,
+        top_k_min: 6,
+        top_k_max: 6,
+        at: "gpu/src/route_body.rs sigmoid_256_6_router*",
+    },
+    // Muse Spark's fixture: 16 experts, the real file's top 8.
+    RouterInst {
+        body: RouterBody::BiasedSigmoid,
+        rule: BIASED_SIGMOID,
+        norm_arg: false,
+        experts: 16,
+        top_k_min: 8,
+        top_k_max: 8,
+        at: "gpu/src/route_body.rs sigmoid_16_8_router*",
+    },
 ];
 
 /// Why a shape has no instance.
@@ -648,7 +669,11 @@ impl GqaInst {
 }
 
 /// Every compiled GQA flash instance, in the order [`select_gqa`] prefers
-/// them: at one head width, a one-block-a-group row before a packed one.
+/// them: the first row of the head and value width that takes the group and
+/// covers the request. A one-block-a-group row stays ahead of a packed row
+/// of the same width, and a row that cuts no window stays ahead of the
+/// window-and-sinks row of the same pack so a shape that asks for neither
+/// keeps the row it had.
 pub const GQA: &[GqaInst] = &[
     GqaInst {
         head: 128,
@@ -659,6 +684,19 @@ pub const GQA: &[GqaInst] = &[
         sinks: false,
         value_scale: false,
         at: "gpu/src/flash_gqa.rs HEAD, GROUP",
+    },
+    // Head 128, value 128, one block of eight, with a window and sinks.
+    // After the row above: a shape that asks for neither still takes that
+    // row (`gqa_row` is the first match). Full layers launch window 0.
+    GqaInst {
+        head: 128,
+        value: 128,
+        pack: 8,
+        group: GroupRule::One,
+        window: true,
+        sinks: true,
+        value_scale: false,
+        at: "gpu/src/flash_gqa_h128_swa.rs gqa_flash_seg_h128_swa",
     },
     GqaInst {
         head: 128,
@@ -721,17 +759,36 @@ pub const GQA: &[GqaInst] = &[
         at: "gpu/src/flash_gqa.rs HEAD_K192 (the _k192 entries, scalar pass only; \
              gpu/src/rope_neox.rs neox_append_k192)",
     },
+    // Muse Spark's head 64: the `_64` entries take a window a layer's pass
+    // names (0 for the full layers' no-window rows), no sinks, no value
+    // scale. A row that asks for none of those still takes this one
+    // (`gqa_row` is the first match).
+    GqaInst {
+        head: 64,
+        value: 64,
+        pack: 8,
+        group: GroupRule::One,
+        window: true,
+        sinks: false,
+        value_scale: false,
+        at: "gpu/src/flash_gqa.rs HEAD_64, GROUP (the _64 entries)",
+    },
 ];
 
 /// The first GQA row, in [`GQA`]'s order, built for `s.head` and `s.value`
-/// that takes its group and serves its window, sinks and value scale.
+/// that takes its group and covers its window, sinks and value scale.
+///
+/// A row covers a request when it can do everything the request asks. It
+/// may also be able to do more: a window-and-sinks row covers a layer that
+/// asks for sinks and no window (the launch passes window 0).
 ///
 /// # Errors
 ///
 /// [`ShapeRefused`] naming `s` when the heads do not group, no row has its
-/// head width, none of those has its value width, none of those takes its
-/// group, or the selected row does not cut its window, fold its sinks or
-/// apply its value scale.
+/// head width, none of those has its value width, or none of those takes
+/// its group. When a row takes the group and none of them covers the
+/// request, the refusal is the first such row's, in order: its window, then
+/// its sinks, then its value scale.
 pub fn select_gqa(s: AttnShape) -> Result<GqaInst, ShapeRefused> {
     let refuse = |why| ShapeRefused {
         shape: Shape::Attn(s),
@@ -759,17 +816,27 @@ pub fn select_gqa(s: AttnShape) -> Result<GqaInst, ShapeRefused> {
             served,
         }));
     }
+    // Capability is "can", so the first group match is not always the row:
+    // the head-128 pack of eight that cuts no window is first, and a later
+    // row of the same pack covers a window or sinks.
+    let covers = |r: &GqaInst| {
+        (s.window.is_none() || r.window) && (!s.sinks || r.sinks) && (!s.scaled || r.value_scale)
+    };
+    if let Some(row) = width.iter().find(|r| r.takes(group) && covers(r)) {
+        return Ok(***row);
+    }
     let Some(row) = gqa_row_v(s.head, s.value, group) else {
-        return Err(refuse(Refusal::GqaGroup {
-            group,
-            served: width
-                .iter()
-                .map(|r| match r.group {
-                    GroupRule::One => format!("exactly {}", r.pack),
-                    GroupRule::Packs => format!("a multiple of {}", r.pack),
-                })
-                .collect(),
-        }));
+        let mut served = Vec::new();
+        for r in &width {
+            let text = match r.group {
+                GroupRule::One => format!("exactly {}", r.pack),
+                GroupRule::Packs => format!("a multiple of {}", r.pack),
+            };
+            if !served.contains(&text) {
+                served.push(text);
+            }
+        }
+        return Err(refuse(Refusal::GqaGroup { group, served }));
     };
     if let Some(positions) = s.window
         && !row.window
@@ -779,10 +846,12 @@ pub fn select_gqa(s: AttnShape) -> Result<GqaInst, ShapeRefused> {
     if s.sinks && !row.sinks {
         return Err(refuse(Refusal::Sinks));
     }
-    if s.scaled && !row.value_scale {
-        return Err(refuse(Refusal::ValueScale));
+    // The window and the sinks were not the miss, and no row covered the
+    // request, so the miss is the value scale.
+    if !s.scaled || row.value_scale {
+        unreachable!("select_gqa: a covering row of this group was not returned");
     }
-    Ok(row)
+    Err(refuse(Refusal::ValueScale))
 }
 
 /// The first row, in [`GQA`]'s order, built for `head` key values and `value`
@@ -805,7 +874,8 @@ pub fn gqa_row(head: u32, group: u32) -> Option<GqaInst> {
 mod tests {
     use super::{
         AttnShape, GQA, GroupRule, LANE_PICKS, MoeShape, ROUTERS, Refusal, RouterInst, RouterRule,
-        Shape, router_row, router_row_is, router_row_k, rules, select_gqa, select_router,
+        Shape, gqa_row_v, router_row, router_row_is, router_row_k, rules, select_gqa,
+        select_router,
     };
     use crate::{Act, Moe, Router, RouterNorm, Score, Shared};
 
@@ -892,6 +962,16 @@ mod tests {
         }
     }
 
+    /// Flint's sigmoid top-six is not the biased top-eight binding, and no
+    /// compiled body runs its rule: the 256-expert top-6 instance runs the
+    /// biased sigmoid with the epsilon-added `SelectedSum`, so every other
+    /// pair of bias and policy, Flint's `SelectedSumFloor` with or without a
+    /// selection bias among them, is refused by name.
+    // PIN(2026-10-25): the biased `SelectedSum` pair was refused as
+    // `TopK { min: 8, max: 8 }` while only MiMo's top-8 row held 256 experts;
+    // the `sigmoid_256_6` instance's row now serves exactly that pair
+    // (`sigmoid_256_6_router_is_its_row_beside_mimos_top_8` pins its identity).
+    // The other five pairs keep `NoRouterRule`.
     #[test]
     fn flints_sigmoid_top_six_is_not_the_biased_top_eight_binding() {
         for bias in [false, true] {
@@ -905,14 +985,16 @@ mod tests {
                     norm,
                     ..rules::BIASED_SIGMOID
                 };
-                let refusal = select_router(moe(rule, 256, 6))
-                    .expect_err("a sigmoid top-six binding was fabricated");
-                let expected = if bias && norm == RouterNorm::SelectedSum {
-                    Refusal::TopK { min: 8, max: 8 }
-                } else {
-                    Refusal::NoRouterRule
-                };
-                assert_eq!(refusal.why, expected);
+                let selected = select_router(moe(rule, 256, 6));
+                if bias && norm == RouterNorm::SelectedSum {
+                    assert!(
+                        selected.is_ok(),
+                        "the 256/6 instance's own rule: {selected:?}"
+                    );
+                    continue;
+                }
+                let refusal = selected.expect_err("a sigmoid top-six binding was fabricated");
+                assert_eq!(refusal.why, Refusal::NoRouterRule);
             }
         }
     }
@@ -963,30 +1045,38 @@ mod tests {
                     || r.at.contains("sigmoid_320_8_router")
                     || r.at.contains("sigmoid_128_4_router")
                     || r.at.contains("sigmoid_128_6_router")
+                    || r.at.contains("sigmoid_256_6_router")
+                    || r.at.contains("sigmoid_16_8_router")
                     || r.at.contains("nemotron_moe_router"),
                 "{}",
                 r.at
             );
         }
         // The rows that carry the body: GLM's and MiMo's, then Bolt's five, then
-        // the 320-expert instance's, then the two 128-expert ones (top 4, top 6).
+        // the 320-expert instance's, then the two 128-expert ones (top 4, top 6),
+        // then the 256-expert top-6 row.
         let widths: Vec<u32> = ROUTERS
             .iter()
             .filter(|r| super::body_eq(r.body, super::RouterBody::BiasedSigmoid))
             .map(RouterInst::experts)
             .collect();
-        assert_eq!(widths, [288, 256, 240, 304, 368, 432, 496, 320, 128, 128]);
+        assert_eq!(
+            widths,
+            [288, 256, 240, 304, 368, 432, 496, 320, 128, 128, 256, 16]
+        );
         // Coverage's `routes(n, &[BiasedSigmoid])`: the rule's shapes pass at
-        // both widths, and a width between them is refused.
+        // both widths, and a width between them is refused. 256 at top 6 is
+        // its own row; top 7 matches neither pick range.
         let routes = |s| select_router(s).is_ok_and(|r| r.body == super::RouterBody::BiasedSigmoid);
         assert!(routes(moe(rule, 256, 8)) && routes(moe(rule, 288, 8)));
         assert!(!routes(moe(rule, 272, 8)));
-        assert!(!routes(moe(rule, 256, 6)));
+        assert!(routes(moe(rule, 256, 6)));
+        assert!(!routes(moe(rule, 256, 7)));
         let e = select_router(moe(rule, 352, 8)).expect_err("a sigmoid router at 352 was selected");
         assert_eq!(
             e.why,
             Refusal::RouterWidth {
-                served: vec![288, 256, 240, 304, 368, 432, 496, 320, 128]
+                served: vec![288, 256, 240, 304, 368, 432, 496, 320, 128, 16]
             }
         );
     }
@@ -1043,6 +1133,25 @@ mod tests {
         assert_eq!(router_row_k(super::RouterBody::BiasedSigmoid, 128, 4), mm);
         let x = select_router(moe(rule, 128, 5)).expect_err("128 at top 5");
         assert!(matches!(x.why, Refusal::TopK { .. }), "{x}");
+    }
+
+    /// The biased sigmoid at 256 experts and top 6 is its own row, after
+    /// MiMo's top 8. Flint's rule is not this one (it divides by the floor
+    /// policy), so Flint has no row. `router_row` at 256 stays MiMo's. Top 7
+    /// matches neither pick range and is refused with the first row's range.
+    #[test]
+    fn sigmoid_256_6_router_is_its_row_beside_mimos_top_8() {
+        let rule = rules::BIASED_SIGMOID;
+        let fl = select_router(moe(rule, 256, 6)).expect("no router row at 256/6");
+        assert!(fl.at.contains("sigmoid_256_6_router"), "{}", fl.at);
+        assert_eq!((fl.experts(), fl.per_lane()), (256, 8));
+        assert!(router_row_is(fl, rule, false, (6, 6)));
+        assert_eq!(router_row_k(super::RouterBody::BiasedSigmoid, 256, 6), fl);
+        let mimo = select_router(moe(rule, 256, 8)).expect("no router row at 256/8");
+        assert!(mimo.at.contains("mimo2_router"), "{}", mimo.at);
+        assert_eq!(router_row(super::RouterBody::BiasedSigmoid, 256), mimo);
+        let x = select_router(moe(rule, 256, 7)).expect_err("256 at top 7");
+        assert_eq!(x.why, Refusal::TopK { min: 8, max: 8 });
     }
 
     /// Bolt's routers (top 9) select only Bolt's rows: GLM's and MiMo's
@@ -1124,6 +1233,8 @@ mod tests {
             top_k: 8,
             expert_ff: 512,
             latent: None,
+            pre_exp_norm: false,
+            post_exp_norm: None,
             act: Act::SwiGlu { limit: None },
             router: Router {
                 score: Score::Softmax,
@@ -1216,7 +1327,7 @@ mod tests {
         assert_eq!(
             e.why,
             Refusal::HeadWidth {
-                served: vec![128, 192, 256]
+                served: vec![64, 128, 192, 256]
             }
         );
         for s in [attn(24, 5, 256), attn(24, 0, 256), attn(0, 2, 256)] {
@@ -1344,35 +1455,66 @@ mod tests {
         );
     }
 
-    /// A window, sinks or a value scale on a shape every flash row serves is
-    /// refused by name: the row's kernels run none of the three.
+    /// A value scale on head 128 is refused by name: neither pack-8 row
+    /// applies one. A window or sinks on head 256, whose rows cut and fold
+    /// neither, is still refused by the first row of that width.
     #[test]
-    fn a_window_sinks_or_value_scale_is_refused_by_name() {
+    fn a_value_scale_or_an_unserved_window_is_refused_by_name() {
         let base = attn(32, 4, 128);
         assert!(select_gqa(base).is_ok());
-        let windowed = AttnShape {
-            window: Some(128),
-            ..base
-        };
-        let sunk = AttnShape {
-            sinks: true,
-            ..base
-        };
         let scaled = AttnShape {
             scaled: true,
             ..base
         };
         assert_eq!(
-            select_gqa(windowed).expect_err("a window").why,
-            Refusal::Window { positions: 128 }
-        );
-        assert_eq!(select_gqa(sunk).expect_err("sinks").why, Refusal::Sinks);
-        assert_eq!(
             select_gqa(scaled).expect_err("a value scale").why,
             Refusal::ValueScale
         );
+        let wide = attn(16, 2, 256);
+        let windowed = AttnShape {
+            window: Some(128),
+            ..wide
+        };
         let e = select_gqa(windowed).expect_err("a window");
+        assert_eq!(e.why, Refusal::Window { positions: 128 });
         assert!(e.to_string().contains("window of 128 positions"), "{e}");
+        let sunk = AttnShape {
+            sinks: true,
+            ..wide
+        };
+        assert_eq!(select_gqa(sunk).expect_err("sinks").why, Refusal::Sinks);
+    }
+
+    /// Head 128 at eight query heads a key head, with sinks, selects the
+    /// window row whether or not the layer cuts a window. The same shape
+    /// with neither stays on the first pack-8 row, which `gqa_row` returns.
+    #[test]
+    fn a_head_128_group_of_8_with_sinks_selects_the_window_row() {
+        let row_of = |window| {
+            select_gqa(AttnShape {
+                window,
+                sinks: true,
+                ..attn(32, 4, 128)
+            })
+            .unwrap_or_else(|e| panic!("{e}"))
+        };
+        for (name, window) in [("full", None), ("sliding", Some(513))] {
+            let row = row_of(window);
+            assert!(row.window && row.sinks && !row.value_scale, "{name}");
+            assert_eq!((row.head, row.value, row.pack), (128, 128, 8), "{name}");
+            assert_eq!(row.group, GroupRule::One, "{name}");
+            assert!(
+                row.at.contains("gqa_flash_seg_h128_swa"),
+                "{name}: {}",
+                row.at
+            );
+        }
+        let plain = select_gqa(attn(32, 4, 128)).unwrap_or_else(|e| panic!("{e}"));
+        assert!(!plain.window && !plain.sinks && !plain.value_scale);
+        assert!(plain.at.contains("HEAD, GROUP"), "{}", plain.at);
+        let first = gqa_row_v(128, 128, 8).expect("the pack-8 row");
+        assert!(!first.window && !first.sinks);
+        assert!(first.at.contains("HEAD, GROUP"), "{}", first.at);
     }
 
     /// GLM-5.3's biased sigmoid rule is the shared one the module exports:
@@ -1395,7 +1537,8 @@ mod tests {
         for (i, a) in GQA.iter().enumerate() {
             for b in &GQA[i + 1..] {
                 assert!(
-                    (a.head, a.pack) != (b.head, b.pack),
+                    (a.head, a.value, a.pack, a.window, a.sinks, a.value_scale)
+                        != (b.head, b.value, b.pack, b.window, b.sinks, b.value_scale),
                     "{} and {}",
                     a.at,
                     b.at

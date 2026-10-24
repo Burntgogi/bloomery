@@ -33,7 +33,12 @@ pub(crate) struct Scratch {
 impl Encoder {
     pub(crate) fn new(encoding: Encoding, vocab: &Vocab) -> Result<Self, Error> {
         match encoding {
-            Encoding::Bpe { pre, merges, nfc } => Ok(Self::Bpe {
+            Encoding::Bpe {
+                pre,
+                merges,
+                nfc,
+                hf,
+            } => Ok(Self::Bpe {
                 pre,
                 nfc,
                 bpe: bpe::Bpe::new(
@@ -42,7 +47,7 @@ impl Encoder {
                     &merges,
                     pre.spelling(),
                     pre.ignore_merges(),
-                    pre.hf(),
+                    hf,
                 )?,
             }),
             Encoding::Spm {

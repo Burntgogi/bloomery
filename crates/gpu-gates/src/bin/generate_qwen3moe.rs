@@ -84,7 +84,7 @@
 //! (`generate::Place::choose` by `q38place::Q38_RULE`), so unset keeps the
 //! cards' offer — `bp` on two cards while its plan holds the rule's
 //! break-even experts on the tier card or more and more than none, else `a`
-//! — and a card list that is none of `a`, `gate` and `bp` is refused by
+//! — and a card list of more tier cards than the body serves is refused by
 //! name. Its `--prefill` is `auto` (the default: `gemm` for a prompt
 //! of nine positions or more, `pass` below; `gemm` at every length under
 //! `bp`), `gemm` (ubatches of up to the
@@ -371,6 +371,13 @@
 //! `ctx_max`, `ctx_train` and `verified`, the deepest context the reference
 //! sets hold our numbers to ik's at (`refset::arch::qwen4exp::VERIFIED_POSITIONS`),
 //! which bounds nothing.
+//!
+//! llama-server's placement flags (`-dev`, `-sm`, `-mg`, `-ts`, `-ngl`, `--cpu-moe`, `-fit`, `-fitt`
+//! and kin) and their `LLAMA_ARG_*` variables are read first in `run` as `bloomery-serve` reads
+//! them (`bloomery_gpu_gates::llama_launch`), on the seat the file's engine is: the cards they name
+//! become the `--place` word (`--place` beside them is refused), the levers they are replace the
+//! environment's, and a flag the engine has no thing for (`--cpu-moe` on a file but a qwen4exp one,
+//! `-devd`) is refused by name. `--list-devices` prints the devices and exits.
 
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
@@ -395,6 +402,12 @@ fn dense_shortage_halves_the_default_context() {
 #[test]
 fn a_dense_header_plans_through_qwen35_on() {
     q3place::tests::a_dense_header_plans_through_qwen35_on();
+}
+
+#[cfg(all(test, feature = "gpu"))]
+#[test]
+fn a_drafted_verdict_prices_the_engines_lanes() {
+    q3place::tests::a_drafted_verdict_prices_the_engines_lanes();
 }
 
 #[cfg(feature = "gpu")]
@@ -440,8 +453,9 @@ mod cli {
     use bloomery_gpu::model::{ChainBody, MAX_PASS_ROWS, SlotRows, StepMode};
     use bloomery_gpu::{Gpu, GpuModel, NemotronHModel, NemotronHMoeModel, Qwen3moeModel};
 
-    use bloomery_gpu_gates::generate::{Place, card_words, lane_at};
+    use bloomery_gpu_gates::generate::{Known, Place, card_words, lane_at, refuse_unknown};
     use bloomery_gpu_gates::host_stats::{Probe, print_stats};
+    use bloomery_gpu_gates::llama_launch::{self, Launcher};
     use bloomery_gpu_gates::logit_rows::{ForcedFacts, ForcedRows};
     use bloomery_gpu_gates::need;
     use bloomery_gpu_gates::nodes::count_kinds;
@@ -489,6 +503,30 @@ mod cli {
 
     // `BLOOMERY_GEN_SLOTS` runs a row a slot, so its most is a pass's rows.
     const _: () = assert!(bloomery_levers::GEN_SLOTS_MAX == MAX_PASS_ROWS as u64);
+
+    /// The flags this binary reads, every mode's: any other argument is refused by name.
+    const FLAGS: Known<'static> = Known {
+        bare: &["--time", "--arm-sync", "--logits", "--last-step"],
+        valued: &[
+            "--place",
+            "--warm",
+            "--seed-depth",
+            "--prompt",
+            "-n",
+            "--tokens",
+            "--prefill",
+            "--mode",
+            "--logit-rows",
+            "--ctx",
+            "--arm",
+            "--tokens-file",
+            "--seqs",
+            "--prompt-len",
+            "--pass-rows",
+            "--dump-taps",
+        ],
+        diag: false,
+    };
 
     /// The flags whose next argument is data, even when it names a flag.
     const VALUE_FLAGS: [&str; 16] = [
@@ -1229,13 +1267,14 @@ mod cli {
 
     /// `--place` on a qwen4exp file, by the common unset rule (`Place::choose`
     /// by `q38place::Q38_RULE`) on one census reading, its `place unset`
-    /// record printed: a set word as given, `a`, `gate` or `bp` (plan (b′): the
-    /// next-largest card as the largest's expert tier; a card list spelled as
-    /// one of them is it, any other list has no Qwen3.8 plan and is refused by
-    /// name), else the cards' offer — kept when its plan holds the rule's
-    /// break-even experts on the tier card or more and more than none. The
-    /// plan the rule asks for is the load this run would open at the offer
-    /// (the draft's MTP plan when the run drafts — the offer's stage is plan
+    /// record printed: a set word as given, `a`, `gate`, `bp` (plan (b′): the
+    /// next-largest card as the largest's expert tier) or a card list (a list
+    /// spelled as one of them is it; one card plans on that card, two with the
+    /// second as the expert tier, more are refused by name), else the cards'
+    /// offer — kept when its plan holds the rule's break-even experts on the
+    /// tier card or more and more than none. The plan the rule asks for is
+    /// the load this run would open at the offer (the draft's MTP plan when
+    /// the run drafts — the offer's stage is plan
     /// (a)'s, the rule never offering the gate card, so the draft's rule
     /// reads the offer's own decision — else the plain plan of the run's
     /// slot count) at the run's context; a plan that refuses runs `a`, the
@@ -1251,14 +1290,7 @@ mod cli {
             None => None,
             Some(word) => {
                 let place = Place::parse(word)?;
-                if ![Place::A, Place::Gate, Place::Bp].contains(&place) {
-                    return Err(format!(
-                        "--place {word}: a qwen4exp plan is placed a, gate or bp (plan (b′): the \
-                         next-largest card as the largest's expert tier); a card list that is \
-                         none of them has no Qwen3.8 plan"
-                    )
-                    .into());
-                }
+                place.serves("qwen4exp", q38place::Q38_RULE.tiers)?;
                 Some(place)
             }
         };
@@ -1382,13 +1414,7 @@ mod cli {
 
     /// The stage as the unset `BLOOMERY_XSTREAM` rule reads it.
     fn stage38(place: Place) -> Stage {
-        if tiered(place) {
-            Stage::Tiered
-        } else if place == Place::Gate {
-            Stage::Other
-        } else {
-            Stage::A
-        }
+        Stage::of(place)
     }
 
     /// The machine a plan of `inputs` at ubatches of `ub` positions under
@@ -1458,10 +1484,11 @@ mod cli {
             Some(other) => return Err(format!("the PLE table's tier {other:?}").into()),
             None => r,
         };
-        Ok(r.w("read", read.word())
+        let r = r
+            .w("read", read.word())
             .csv("devices", record::plan_devices(plan.machine))
-            .w("cuda_order", record::cuda_order())
-            .line())
+            .w("cuda_order", record::cuda_order());
+        Ok(record::with_requantized(r, plan.model).line())
     }
 
     /// One pass of `rows` ids on the Qwen3.6 model: the argmax after the last.
@@ -1527,7 +1554,25 @@ mod cli {
     }
 
     pub fn run() -> Result<(), GateError> {
-        let options = Options::parse(std::env::args().skip(1))?;
+        // llama-server's placement flags and variables come out of the arguments, and the levers
+        // they are replace the environment's, before any lever is read; the seat they are read
+        // on is the file's engine.
+        let seat = || -> Result<&'static str, GateError> {
+            Ok(match open_file()?.1 {
+                Family::Qwen38 => "qwen38",
+                _ => "qwen3",
+            })
+        };
+        let launcher = Launcher {
+            bin: "generate_qwen3moe",
+            seat: &seat,
+            layers: &llama_launch::file_layers,
+            reads: llama_launch::NONE,
+        };
+        if launcher.start()? {
+            return Ok(());
+        }
+        let options = Options::parse(llama_launch::args())?;
         // A lever set to a value it does not take, or a retired name that is
         // set, is refused by name before anything loads.
         // The placement's levers act on a run that names `--place`; set on
@@ -1556,6 +1601,7 @@ mod cli {
         record::at_main_with_flags("generate_qwen3moe", record::GENERATE_QWEN3MOE, |name| {
             options.has(name)
         });
+        refuse_unknown("generate_qwen3moe", &llama_launch::args(), FLAGS)?;
         // Set, the word runs as given; unset, the Qwen3.8 rule picks it once
         // the file, the flags and plan (a) are known (`residency unset`).
         if let Some(word) = levers.residency() {

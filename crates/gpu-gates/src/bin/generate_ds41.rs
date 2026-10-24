@@ -47,11 +47,15 @@
 //! 3090 an expert tier under the host tier holding each layer's next ids
 //! (`bloomery_gpu::host::tier::TierOpen::of_machine`), with the DSpark draft's reserve
 //! when the draft runs (its header's bytes, read before the load; the draft
-//! then sits on the 3090, and a `BLOOMERY_DSPARK_CARD` naming another card is
-//! refused), and the tier's prompt-batch bytes (its staging and tile scratch
+//! then sits on the 3090 unless `BLOOMERY_DSPARK_CARD` names the A6000, the
+//! stage), and the tier's prompt-batch bytes (its staging and tile scratch
 //! for blocks of the host union's columns, from the file's header): a prompt
 //! call under `bp` is fed as `BLOOMERY_PREFILL` says, as under `a`, the tier
-//! serving its experts' slots of each batch. The `load` line's `cards=`
+//! serving its experts' slots of each batch. Under `a` and `gate` the draft's
+//! reserve sits on the card the draft loads on: the stage when that is the
+//! only card (or `gate`'s own), else the other card, which joins the plan as a
+//! reserve-only member holding the draft and no expert, so the stage keeps
+//! every expert it holds without the draft. The `load` line's `cards=`
 //! names every card the placement loaded and, under `bp`, the tier's experts
 //! and resident bytes (`tier_experts=`, `tier_bytes=`). `PLACE` may also be
 //! a card list `<stage>[+<tier>…]` of `workstation::CARDS` names
@@ -66,6 +70,12 @@
 //! figure (`host_shadow=`), the `load` line the allocation
 //! (`shadow=host <bytes>`) and the card's unified addressing the load
 //! checked; `resident_bytes` counts device bytes only.
+//!
+//! llama-server's placement flags (`-dev`, `-sm`, `-mg`, `-ts`, `-ngl`, `--cpu-moe`, `-fit`, `-fitt`,
+//! `-devd` and kin) and their `LLAMA_ARG_*` variables are read first in `run` as `bloomery-serve`
+//! reads them (`bloomery_gpu_gates::llama_launch`): the cards they name become the `--place` word
+//! (`--place` beside them is refused), the levers they are replace the environment's, and a flag
+//! this run has no thing for is refused by name. `--list-devices` prints the devices and exits.
 //!
 //! `--depth D` stands the run at depth D before its first generated token:
 //! the prompt, then the depth tables' sequence (`lcg_prompt` in
@@ -232,8 +242,11 @@
 //!
 //! `BLOOMERY_DRAFT=dspark` serves the DSpark draft at width 1
 //! (`app::arch::deepseek41::Ds41Draft`): the draft file is
-//! `$BLOOMERY_DSPARK_MODEL`, its card `BLOOMERY_DSPARK_CARD` (the 3090 when
-//! unset; `shared/ds41_dspark.rs`), and the target carries the feature tap
+//! `$BLOOMERY_DSPARK_MODEL`, its card `BLOOMERY_DSPARK_CARD` (a card of the
+//! plan: the tier card under `bp`, else the visible card of the fewest bytes —
+//! the stage when it is that card, else a card that joins the plan to hold the
+//! draft and no expert — when unset; the plan sets the draft's bytes aside on
+//! that card before its experts; `shared/ds41_dspark.rs`), and the target carries the feature tap
 //! of the draft's `target_layers`, built before the capture. The fed ids go
 //! by the prompt schedule, the draft taking the features the call hands it
 //! (every position's under steps, the draft's window under a batch); then
@@ -347,6 +360,7 @@ mod drive {
         dump_table, lane_at, mode_name, place_table, read_table, repeat_runs, seed_path,
         slot_table, write_table,
     };
+    use bloomery_gpu_gates::llama_launch::{self, Launcher};
     use bloomery_gpu_gates::need;
     use bloomery_gpu_gates::record::{self, Record};
     use bloomery_gpu_gates::{Fnv1a64, GateError, data_dir, ref_model_path, residency};
@@ -375,7 +389,7 @@ mod drive {
         format!(
             "usage: generate_ds41 [--prompt-id P | --tokens a,b,c] [--depth D] [-n N] [--ctx C] \
              [--place a|gate|bp|<stage>[+<tier>…]] [--mode eager|graph] [--time [--warm W]] \
-             [--plan] [--logits] [--warm-save] {}, or --arm SPEC [--arm SPEC ...] [--arm-sync] \
+             [--plan] [--logits] [--warm-save] [--seat-dspark] {}, or --arm SPEC [--arm SPEC ...] [--arm-sync] \
              in place of the prompt flags",
             Diag::USAGE
         )
@@ -468,6 +482,11 @@ mod drive {
         /// `--warm-save`: fold the run's residency usage into the
         /// `BLOOMERY_WARM_PROFILE` file at its end.
         warm_save: bool,
+        /// `--seat-dspark`: the plan sets the DSpark draft's bytes aside on
+        /// its card (`BLOOMERY_DSPARK_MODEL`'s header) and the run opens no
+        /// draft, so a plain run plans the card a `BLOOMERY_DRAFT=dspark` run
+        /// does.
+        seat_dspark: bool,
         /// The shared diagnosis flags ([`Diag`]).
         diag: Diag,
         /// Whether this run is the one `--dump-table` reads.
@@ -490,12 +509,13 @@ mod drive {
             sync: false,
             logits: false,
             warm_save: false,
+            seat_dspark: false,
             diag: Diag::default(),
             dump_now: false,
         };
         let (mut row, mut ids) = (None, None);
         let mut place_flag = None;
-        let mut it = std::env::args().skip(1);
+        let mut it = llama_launch::args().into_iter().skip(1);
         while let Some(flag) = it.next() {
             if flag == "--time" {
                 a.timed = true;
@@ -515,6 +535,10 @@ mod drive {
             }
             if flag == "--warm-save" {
                 a.warm_save = true;
+                continue;
+            }
+            if flag == "--seat-dspark" {
+                a.seat_dspark = true;
                 continue;
             }
             if a.diag.take(&flag, &mut it)? {
@@ -743,6 +767,18 @@ mod drive {
     ];
 
     pub fn run() -> Result<(), GateError> {
+        // llama-server's placement flags and variables come out of the arguments, and the levers
+        // they are replace the environment's, before any lever is read.
+        let seat = || -> Result<&'static str, GateError> { Ok("ds41") };
+        let launcher = Launcher {
+            bin: "generate_ds41",
+            seat: &seat,
+            layers: &llama_launch::file_layers,
+            reads: llama_launch::NONE,
+        };
+        if launcher.start()? {
+            return Ok(());
+        }
         let levers = bloomery_levers::at_main(ACTS_ON)?;
         model::ops::set_host_lanes(levers.host_lanes());
         record::at_main("generate_ds41", record::GENERATE_DS41);
@@ -833,13 +869,22 @@ mod drive {
             .ok_or("generate_ds41: no arm to run")?;
         let (depth, fed_n) = (widest.ids.len() / slots, widest.a.n_gen);
         let fed = depth + fed_n - 1;
-        let draft_file = match draft {
-            Draft::Dspark => Some(dspark::draft_hparams()?),
-            _ => None,
+        if a.seat_dspark && draft != Draft::Off {
+            return Err(format!(
+                "--seat-dspark plans a plain run's draft seat; BLOOMERY_DRAFT={} opens a draft \
+                 that seats itself",
+                draft.name()
+            )
+            .into());
+        }
+        let draft_file = if draft == Draft::Dspark || a.seat_dspark {
+            Some(dspark::draft_hparams()?)
+        } else {
+            None
         };
         let path = ref_model_path()?;
-        let reserve = match &draft_file {
-            Some((d, _)) => dspark::draft_reserve(a.place, d, &path)?,
+        let seat = match &draft_file {
+            Some((d, _)) => Some(dspark::draft_seat(a.place, d, &path)?),
             None => None,
         };
 
@@ -856,7 +901,7 @@ mod drive {
         } else {
             Some(lane_at(a.place)?)
         };
-        let machine = a.place.machine(reserve, tier_batch)?;
+        let machine = a.place.machine(seat, tier_batch)?;
         // The unset word against the plan the load will use, and the lever
         // record naming what it resolved to, before the plan record the open
         // prints. `--card-table` loads a plan it edits itself, beside a word
@@ -945,10 +990,14 @@ mod drive {
             .ok_or("generate_ds41: the open planned nothing")?;
         // The draft builds the target's feature tap, so it loads before the
         // capture: the captured step then carries the tap.
-        let spark = match &draft_file {
-            Some(file) => {
+        let spark = match draft_file
+            .as_ref()
+            .zip(seat)
+            .filter(|_| draft == Draft::Dspark)
+        {
+            Some((file, seat)) => {
                 let (d, load) =
-                    open_dspark(&mut loaded, file, &path, "generate_ds41", a.place, reserve)?;
+                    open_dspark(&mut loaded, file, &path, "generate_ds41", a.place, seat)?;
                 load.print();
                 Some(d)
             }

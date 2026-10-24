@@ -15,9 +15,11 @@
 | MiniCPM-V 4.7 35B-A3B | [`Q4_K_M`](https://huggingface.co/openbmb/MiniCPM-V-4.7-35B-A3B-gguf) (openbmb) | on the `qwen3` seat (a `qwen35moe` file); image input with `--mmproj` since 0.3.3, a tile capped at 70 tokens |
 | Clef-Flash | [`Q8_0` to `Q3_K_S`](https://huggingface.co/bartowski/Cloudflare_clef-flash-GGUF) (bartowski's upload of 2026-10-05; llama.cpp's `clef` layout carries the head, and the Q3_K files' Q3_K token embedding runs on the card; an older `qwen35`-layout file takes the release's [head file](BUILD.md#clef-flash)) | whole on one GPU, its head on the CPU; image input with an encoder |
 | Nemotron 3.5 Bolt 74B-A9B | `NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB.gguf` (by `-m`) | whole on one 24 GB GPU, one slot (`nemotron` seat); a prompt runs in batched passes |
-| Nemotron-3.5-Lightning 30B-A3B | `NVIDIA-Nemotron-3.5-Lightning-30B-A3B-UD-Q4_K_XL.gguf` (by `-m`) | on the `nemotron` seat, one slot. No latent: the experts act on the hidden (2,688), and the router keeps the top 6 of 128. The shared expert is Q8_0. The next-token block is carried and not loaded. Placed load: the whole-card expert body is IQ2_XXS (Bolt's), so this file's other expert types stay on the host. Served on a 24 GB card and on an A6000. RTX A6000 at the serving defaults (`--ctx-size 16384`, 2,944 experts on the host): 89.2 tok/s after a 25-token prompt, 79.9 tok/s after a 5,866-token prompt (0.3.8's release check) |
+| Nemotron-3.5-Lightning 30B-A3B | `NVIDIA-Nemotron-3.5-Lightning-30B-A3B-UD-Q4_K_XL.gguf` (by `-m`) | on the `nemotron` seat, one slot. No latent: the experts act on the hidden (2,688), and the router keeps the top 6 of 128. The shared expert is Q8_0. The next-token block is carried and not loaded. Placed load: the card runs its routed IQ4_NL, Q8_0 and Q5_1 stacks (IQ4_NL has no whole-card layout), so the plan holds as many experts on the card as its room allows and the rest on the host. Served on a 24 GB card and on an A6000. RTX A6000 at the serving defaults before the card ran these types (`--ctx-size 16384`, 2,944 experts on the host): 89.2 tok/s after a 25-token prompt, 79.9 tok/s after a 5,866-token prompt (0.3.8's release check) |
 | Nemotron 3 Nano 4B | `Q4_K_M` (`NVIDIA-Nemotron3-Nano-4B-Q4_K_M.gguf`, by `-m`) | whole on one GPU, one slot (`--model nemotron`); a prompt runs in batched passes |
-| MiniMax-M3 | [`UD-IQ4_XS`](https://huggingface.co/unsloth/MiniMax-M3-GGUF) (unsloth) | GPU + CPU experts (the plan sizes the share to the card); one slot (`minimaxm3` seat) |
+| MiniMax-M3.1-Flash | the vendor's NVFP4 safetensors folder (48 shards, by `-m <folder>`), no conversion | GPU + CPU experts in their own NVFP4 form (`minimaxm3` seat; `--parallel N` serves N slots). On two cards the unset placement picks `bp` (the stage on the larger card, the other card an expert tier) |
+| Muse Spark Open 816B-A42B | `UD-IQ2_XXS` (`Muse-Spark-Open-816B-A42B-UD-IQ2_XXS-00001-of-00006.gguf`, by `-m`) | GPU + CPU experts; one slot (`musespark` seat). On two cards the unset placement picks `bp`. Text only |
+| MiniMax-M3 | [`UD-IQ4_XS`](https://huggingface.co/unsloth/MiniMax-M3-GGUF) (unsloth) | GPU + CPU experts (the plan sizes the share to the card); one slot (`minimaxm3` seat). Unverified: no gate runs on this file; MiniMax-M3.1-Flash is the MiniMax the gates hold |
 | Raon-1-mini-preview | `raon-1-mini-preview-Q4_K_M.gguf` (by `-m`) | whole on one card, one slot (`raon1` seat); its DFlash2 draft (`dflash-raon-1-mini-preview-Q8_0.gguf`) beside it |
 | Solar-Open2-250B | [`Q4_K_M`](https://huggingface.co/llamaraspberryrabbit/Solar-Open2-250B-GGUF) (llamaraspberryrabbit) | GPU + CPU experts; one slot (`solar2` seat); on two cards under `--place bp` (the stage card and an expert tier) |
 | lev | [`Q4_K_M`](https://huggingface.co/ggml-org/lev-GGUF) (ggml-org) | whole on one GPU; its label readout in the file |
@@ -50,12 +52,14 @@ recommended — a load streams the file to the card, and V4.1 reads its engram t
 | GLM-5.3-Flash | 24 GB recommended | 256 GB to hold every routed expert; less pages the rest from NVMe | 199.7 GB |
 | MiMo-V2.6-Flash | the dense layers, attention and KV cache, plus the routed experts the card has room for (the plan sizes the share to the card) | the routed experts the card does not hold; with none on the card, about 161 GB (the 0.2.10 figure) | the file on the repo page |
 | DeepSeek-V4.1-Flash | 24 GB recommended | 256 GB to hold every routed expert; less pages the rest from NVMe | 347.3 GB (a source build can add a 155.7 GB r8 sidecar; the release does not use one) |
+| MiniMax-M3.1-Flash (NVFP4 folder) | RTX A6000 + RTX 3090 at `bp`, ctx 16,384: 1,063 routed experts on the A6000 and 726 on the 3090 tier, beside the dense layers, attention and KV cache | the routed experts neither card holds (5,507 on that plan) | 236 GB (48 shards) |
+| Muse Spark Open 816B-A42B `UD-IQ2_XXS` | RTX A6000 + RTX 3090 at `bp`, ctx 16,384: 1,900 routed experts on the A6000 plus the 3090 tier, beside the dense layers, attention and KV cache | the routed experts neither card holds (12,209 on that plan) | 210.1 GiB (six shards) |
 | MiniMax-M3 `UD-IQ4_XS` | the dense layers, the attention and the KV cache, plus the routed experts the card has room for (662 of them on the RTX A6000 plan at ctx 131,072) | the routed experts the card does not hold (6,634 of them on that plan) | 208.5 GB (six shards) |
 | Raon-1-mini-preview `Q4_K_M` | whole on one card (measured on a 24 GB RTX 3090) | any | 19.7 GB (one file) |
 | Solar-Open2-250B `Q4_K_M` | one card, plus an expert tier card under `--place bp` | the routed experts the card does not hold | 151.8 GB (four shards) |
 
 Ornith-1.5-35B's `Q4_K_M` plans the same weight bytes as Qwen3.6-35B's (21,311,258,624 B at the allocator's granules, `--plan` on both files), so its GPU and host RAM cells are Qwen3.6's; the 0.55 GB its file holds beyond is the next-token layer, which the load does not read.
-Sage-A1.5's `Q4_K_M` plans the same weight bytes as Qwen3.6-35B's too (21,311,258,624 B, `--plan` on both files). It passes the `qwen3` serve gate, and it answers with thinking on and off, calls tools on `/v1/chat/completions` and reads an image through its `mmproj`. The seat has no draft for its next-token layer: `BLOOMERY_DRAFT=mtp` is refused by name.
+Sage-A1.5's `Q4_K_M` plans the same weight bytes as Qwen3.6-35B's too (21,311,258,624 B, `--plan` on both files). It passes the `qwen3` serve gate, and it answers with thinking on and off, calls tools on `/v1/chat/completions` and reads an image through its `mmproj`. `BLOOMERY_DRAFT=mtp` drafts its next-token layer on a whole-card load of one sequence; a media load, a placed load and `--parallel` above 1 refuse it by name.
 
 **The NVMe expert tier** (Qwen3.8, GLM-5.3, V4.1): when the host RAM cannot hold the experts the plan leaves on the
 host, the plan pages the overflow through a RAM arena filled from the model file on NVMe. The tokens equal the
@@ -71,7 +75,7 @@ README's status rows name the types still not loaded.
 IQ3_S and IQ4_XS (a gate·up and a down), and the down of a Q5_0, Q5_1 or IQ4_NL stack. The types with no card kernel
 are Q2_K, Q2_0, Q4_0, Q4_1, Q8_1, Q8_K, IQ1_S, IQ1_M, IQ2_S, Q1_0, TQ1_0 and TQ2_0; of those only Q2_K and Q2_0
 have a host matmul, so a `UD-Q2_K_XL` file loads. GLM-5.3's token embedding may be q4_K, q5_K or q6_K. On GLM-5.3 a
-layer whose down is Q6_K keeps its experts on the host.
+layer whose down is Q6_K runs its experts on the card beside a card gate and up.
 
 **Recommended** (the configuration every number in the README ran on): a 32-core AVX2 CPU with 8 DDR4
 channels, 256 GB of RAM, an RTX A6000 48 GB, and an RTX 3090 24 GB beside it for `--place bp`. Cards are found

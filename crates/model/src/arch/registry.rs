@@ -17,12 +17,12 @@ use super::draft::Rule;
 use super::{
     Arch, DEEPSEEK4, GEMMA_EMBEDDING, GEMMA_EMBEDDING2, GLM5_NEXT_LLAMA_CPP, QWEN35_BODY, Read,
     deepseek41, draft, flint, gemma_embedding, gemma_embedding2, glm5next, mimo2, minimaxm3,
-    nemotron_h, nemotron_h_moe, qwen3moe, qwen35moe, raon1, solar2,
+    musespark, nemotron_h, nemotron_h_moe, qwen3moe, qwen35moe, raon1, solar2,
 };
 use crate::placement::PlacementError;
 
 /// Every fixture family's spec, read by the fixture tool and the gates' budget admission.
-pub const FIXTURE_SPECS: [fn() -> crate::fixture::FixtureSpec; 7] = [
+pub const FIXTURE_SPECS: [fn() -> crate::fixture::FixtureSpec; 8] = [
     deepseek41::fixture::spec,
     qwen35moe::fixture::spec,
     qwen35moe::fixture::qwen35moe::spec,
@@ -30,6 +30,7 @@ pub const FIXTURE_SPECS: [fn() -> crate::fixture::FixtureSpec; 7] = [
     solar2::fixture::spec,
     nemotron_h::fixture::spec,
     nemotron_h_moe::fixture::spec,
+    musespark::fixture::spec,
 ];
 
 /// The fixture spec whose architecture string is `arch`, from [`FIXTURE_SPECS`].
@@ -55,8 +56,28 @@ pub enum DraftSource {
     NotFetchable(&'static str),
 }
 
-/// A family's gate fixture and the hub source it is made from: `fixture fetch <family>` reads the
-/// row, and an explicit `<repo>:<quant>` overrides it. The row holds data only; the family's
+/// A family's gate fixture, by how it is made: its directory under the fixture root is the row's
+/// `family`, the one table `tools/fixture-dirs.tsv` holds for both kinds.
+#[derive(Clone, Copy)]
+pub enum Fixture {
+    /// GGUF shards `fixture fetch` makes from a hub file's header ([`FixtureRow`]).
+    Gguf(FixtureRow),
+    /// A checkpoint folder `fixture cut` makes in its stored bits ([`CutRow`]).
+    Cut(CutRow),
+}
+
+impl Fixture {
+    /// The fixture's directory under the fixture root.
+    pub fn family(&self) -> &'static str {
+        match self {
+            Fixture::Gguf(row) => row.family,
+            Fixture::Cut(row) => row.family,
+        }
+    }
+}
+
+/// A family's GGUF gate fixture and the hub source it is made from: `fixture fetch <family>` reads
+/// the row, and an explicit `<repo>:<quant>` overrides it. The row holds data only; the family's
 /// fixture spec is its entry in [`FIXTURE_SPECS`].
 #[derive(Clone, Copy)]
 pub struct FixtureRow {
@@ -67,6 +88,15 @@ pub struct FixtureRow {
     /// The repo revision the fixture's source header is the header of (`main` when `None`).
     pub rev: Option<&'static str>,
     pub draft: DraftSource,
+}
+
+/// A family's checkpoint-folder fixture: a hub folder's safetensors kept in their stored bits, the
+/// chosen layers and widths only (`fixture cut`, verified by `fixture verify`). The row holds the
+/// directory; the cut's rules, its source folder and revision are `tools/fixture-cuts/<family>.json`.
+#[derive(Clone, Copy)]
+pub struct CutRow {
+    /// The family's directory under the fixture root, and its rules file's stem.
+    pub family: &'static str,
 }
 
 /// One group of architecture strings and what serves them. A string is in one row.
@@ -81,7 +111,7 @@ pub struct ArchRow {
     /// Whether a set of this architecture can run its draft file ([`draft::draft_usable`]); `None`
     /// for an architecture with no rule.
     pub draft: Option<Rule>,
-    pub fixture: Option<FixtureRow>,
+    pub fixture: Option<Fixture>,
 }
 
 impl ArchRow {
@@ -105,7 +135,7 @@ pub static ROWS: &[ArchRow] = &[
         names: &["deepseek41", DEEPSEEK4],
         read: Some(deepseek41::spec::read),
         draft: None,
-        fixture: Some(FixtureRow {
+        fixture: Some(Fixture::Gguf(FixtureRow {
             family: "v41",
             repo: "vcruz305/DeepSeek-V4.1-Flash-GGUF",
             quant: "Q3_K_M",
@@ -113,7 +143,7 @@ pub static ROWS: &[ArchRow] = &[
             draft: DraftSource::NotFetchable(
                 "the draft fixture is made from our own DSpark copy, and no public file has its header",
             ),
-        }),
+        })),
     },
     ArchRow {
         arch: Some(Arch::Qwen3moe),
@@ -127,20 +157,20 @@ pub static ROWS: &[ArchRow] = &[
         names: &["qwen4exp"],
         read: Some(qwen35moe::spec::read),
         draft: Some(draft::qwen4exp_usable),
-        fixture: Some(FixtureRow {
+        fixture: Some(Fixture::Gguf(FixtureRow {
             family: "qwen38",
             repo: "unsloth/Qwen3.8-Flash-Next-GGUF",
             quant: "UD-Q4_K_XL",
             rev: None,
             draft: DraftSource::File("mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf"),
-        }),
+        })),
     },
     ArchRow {
         arch: Some(Arch::Qwen35moe),
         names: &["qwen35moe"],
         read: Some(qwen35moe::spec::read),
         draft: Some(draft::qwen35moe_usable),
-        fixture: Some(FixtureRow {
+        fixture: Some(Fixture::Gguf(FixtureRow {
             family: "qwen35moe",
             repo: "lmstudio-community/Qwen3.6-35B-A3B-GGUF",
             quant: "Q4_K_M",
@@ -148,7 +178,7 @@ pub static ROWS: &[ArchRow] = &[
             // file is a new fixture on purpose.
             rev: Some("68a34855558af61cbef0324d31f411be8a506b08"),
             draft: DraftSource::None,
-        }),
+        })),
     },
     ArchRow {
         arch: None,
@@ -162,7 +192,7 @@ pub static ROWS: &[ArchRow] = &[
         names: &["glm5next", GLM5_NEXT_LLAMA_CPP],
         read: Some(glm5next::spec::read),
         draft: None,
-        fixture: Some(FixtureRow {
+        fixture: Some(Fixture::Gguf(FixtureRow {
             family: "glm5next",
             repo: "unsloth/GLM-5.3-Flash-GGUF",
             quant: "UD-Q4_K_XL",
@@ -170,7 +200,7 @@ pub static ROWS: &[ArchRow] = &[
             // commit before, whose header the fixture was made from.
             rev: Some("621d456e93"),
             draft: DraftSource::None,
-        }),
+        })),
     },
     ArchRow {
         arch: Some(Arch::Mimo2),
@@ -184,7 +214,9 @@ pub static ROWS: &[ArchRow] = &[
         names: &["minimax-m3"],
         read: Some(minimaxm3::spec::read),
         draft: None,
-        fixture: None,
+        fixture: Some(Fixture::Cut(CutRow {
+            family: "minimaxm31",
+        })),
     },
     ArchRow {
         arch: Some(Arch::Raon1),
@@ -198,7 +230,7 @@ pub static ROWS: &[ArchRow] = &[
         names: &["solar-open2"],
         read: Some(solar2::spec::read),
         draft: None,
-        fixture: Some(FixtureRow {
+        fixture: Some(Fixture::Gguf(FixtureRow {
             family: "solar2",
             repo: "llamaraspberryrabbit/Solar-Open2-250B-GGUF",
             quant: "Q4_K_M",
@@ -207,28 +239,28 @@ pub static ROWS: &[ArchRow] = &[
             // it writes the same shards as `fixture generate` from the box's first shard.
             rev: Some("6e78cf22866264a9e3052c2f02ca056bf79c9ac9"),
             draft: DraftSource::None,
-        }),
+        })),
     },
     ArchRow {
         arch: Some(Arch::NemotronH),
         names: &["nemotron_h"],
         read: Some(nemotron_h::spec::read),
         draft: None,
-        fixture: Some(FixtureRow {
+        fixture: Some(Fixture::Gguf(FixtureRow {
             family: "nemotron",
             repo: "nvidia/NVIDIA-Nemotron-3-Nano-4B-GGUF",
             quant: "Q4_K_M",
             // The commit the 2,837,072,864-byte file's header was read at.
             rev: Some("ba223d14e45525f7fae81db77ea8cabeb2fc6c25"),
             draft: DraftSource::None,
-        }),
+        })),
     },
     ArchRow {
         arch: Some(Arch::NemotronHMoe),
         names: &["nemotron_h_moe"],
         read: Some(nemotron_h_moe::spec::read),
         draft: None,
-        fixture: Some(FixtureRow {
+        fixture: Some(Fixture::Gguf(FixtureRow {
             family: "nemotron-bolt",
             repo: "nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-GGUF",
             quant: "24GB",
@@ -236,7 +268,7 @@ pub static ROWS: &[ArchRow] = &[
             // the file was not compared with it.
             rev: Some("e0fecb69cb3e5e4c5e8a056fa2aec98c78e91246"),
             draft: DraftSource::None,
-        }),
+        })),
     },
     ArchRow {
         arch: Some(Arch::GemmaEmbedding),
@@ -259,6 +291,20 @@ pub static ROWS: &[ArchRow] = &[
         draft: None,
         fixture: None,
     },
+    ArchRow {
+        arch: Some(Arch::MuseSpark),
+        names: &["muse-spark"],
+        read: Some(musespark::spec::read),
+        draft: None,
+        fixture: Some(Fixture::Gguf(FixtureRow {
+            family: "musespark",
+            repo: "unsloth/Muse-Spark-Open-816B-A42B-GGUF",
+            quant: "UD-IQ2_XXS",
+            // The commit the specimen's header was read at (the design round's snapshot).
+            rev: Some("c00670568b6c"),
+            draft: DraftSource::None,
+        })),
+    },
 ];
 
 /// The row whose strings include `arch`.
@@ -266,16 +312,31 @@ pub fn row_of(arch: &str) -> Option<&'static ArchRow> {
     ROWS.iter().find(|row| row.names.contains(&arch))
 }
 
-/// The fixture row of the family whose canonical architecture string is `arch`.
+/// The GGUF fixture row of the family whose canonical architecture string is `arch`; a family
+/// whose fixture is a cut folder has none here ([`cuts`]).
 pub fn fixture_of(arch: &str) -> Option<&'static FixtureRow> {
     ROWS.iter()
         .find(|row| row.canonical() == arch)
-        .and_then(|row| row.fixture.as_ref())
+        .and_then(|row| match &row.fixture {
+            Some(Fixture::Gguf(fx)) => Some(fx),
+            _ => None,
+        })
 }
 
-/// Every fixture row, in registry order.
+/// Every GGUF fixture row, in registry order.
 pub fn fixtures() -> impl Iterator<Item = &'static FixtureRow> {
-    ROWS.iter().filter_map(|row| row.fixture.as_ref())
+    ROWS.iter().filter_map(|row| match &row.fixture {
+        Some(Fixture::Gguf(fx)) => Some(fx),
+        _ => None,
+    })
+}
+
+/// Every cut-folder fixture row, in registry order.
+pub fn cuts() -> impl Iterator<Item = &'static CutRow> {
+    ROWS.iter().filter_map(|row| match &row.fixture {
+        Some(Fixture::Cut(cut)) => Some(cut),
+        _ => None,
+    })
 }
 
 /// The registry as `tools/arch-registry.tsv` holds it: a comment line, a header line, then one
@@ -292,7 +353,7 @@ pub fn print() -> String {
         let variant = row
             .arch
             .map_or_else(|| "-".to_string(), |a| format!("{a:?}"));
-        let fixture = row.fixture.map_or("-", |f| f.family);
+        let fixture = row.fixture.map_or("-", |f| f.family());
         out.push_str(&format!(
             "{}\t{variant}\t{}\t{}\t{fixture}\n",
             row.names.join(","),
@@ -324,6 +385,7 @@ mod tests {
             "nemotron_h_moe" => nemotron_h_moe::spec::read,
             GEMMA_EMBEDDING => gemma_embedding::spec::read,
             GEMMA_EMBEDDING2 => gemma_embedding2::spec::read,
+            "muse-spark" => musespark::spec::read,
             other => panic!("{other}: no reader is named for it"),
         }
     }
@@ -368,34 +430,38 @@ mod tests {
             Arch::GemmaEmbedding,
             Arch::GemmaEmbedding2,
             Arch::Flint,
+            Arch::MuseSpark,
         ] {
             let rows = ROWS.iter().filter(|r| r.arch == Some(arch)).count();
             assert_eq!(rows, 1, "{arch:?} is in {rows} rows");
         }
     }
 
-    /// A fixture row's family name is its directory under the fixture root (unique), the row has a
-    /// reader, and the fixtures are listed in the order the fixture tool has always listed them.
+    /// A fixture row's family name is its directory under the fixture root (unique across both
+    /// kinds), the row has a reader, and each kind's fixtures are listed in the order the fixture
+    /// tool has always listed them.
     #[test]
     fn a_fixture_belongs_to_its_row() {
         let mut families: Vec<&str> = Vec::new();
         for row in ROWS {
             let Some(fx) = row.fixture else { continue };
+            let family = fx.family();
             assert!(
                 row.read.is_some(),
-                "{}: a fixture of a family with no reader",
-                fx.family
+                "{family}: a fixture of a family with no reader"
             );
-            assert!(!families.contains(&fx.family), "{} twice", fx.family);
-            families.push(fx.family);
+            assert!(!families.contains(&family), "{family} twice");
+            families.push(family);
         }
-        let archs: Vec<&str> = ROWS
-            .iter()
-            .filter(|r| r.fixture.is_some())
-            .map(|r| r.canonical())
-            .collect();
+        let archs_of = |gguf: bool| -> Vec<&str> {
+            ROWS.iter()
+                .filter(|r| matches!(r.fixture, Some(Fixture::Gguf(_))) == gguf)
+                .filter(|r| r.fixture.is_some())
+                .map(|r| r.canonical())
+                .collect()
+        };
         assert_eq!(
-            archs,
+            archs_of(true),
             [
                 "deepseek41",
                 "qwen4exp",
@@ -403,9 +469,11 @@ mod tests {
                 "glm5next",
                 "solar-open2",
                 "nemotron_h",
-                "nemotron_h_moe"
+                "nemotron_h_moe",
+                "muse-spark"
             ]
         );
+        assert_eq!(archs_of(false), ["minimax-m3"]);
     }
 
     /// A row's fixture family is the directory `tools/fixture-dirs.tsv` gives its architecture (refset
@@ -416,11 +484,30 @@ mod tests {
         for row in ROWS {
             let canonical = row.canonical();
             assert_eq!(
-                row.fixture.map(|fx| fx.family),
+                row.fixture.map(|fx| fx.family()),
                 refset::fixture::dir_of(canonical),
                 "{canonical}: the row's fixture family and tools/fixture-dirs.tsv disagree"
             );
         }
+    }
+
+    /// A cut fixture's rules are `tools/fixture-cuts/<family>.json`, and a rules file there is a
+    /// cut row's: a row with no file, or a file no row names, cuts nothing. (The rules' own name
+    /// and architecture are held to the row by `fixture`'s tests, which parse them.)
+    #[test]
+    fn a_cut_fixture_is_its_rules_file() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tools/fixture-cuts");
+        let mut files: Vec<String> = std::fs::read_dir(dir)
+            .unwrap_or_else(|e| panic!("{dir}: {e}"))
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        files.sort();
+        let mut rows: Vec<String> = cuts().map(|c| format!("{}.json", c.family)).collect();
+        rows.sort();
+        assert_eq!(
+            files, rows,
+            "tools/fixture-cuts holds a rules file per cut row and nothing else"
+        );
     }
 
     /// The draft rules are the old table's three keys, and an architecture the rows do not name
@@ -463,7 +550,11 @@ mod tests {
         let mut read = Vec::new();
         let mut bad = Vec::new();
         for row in ROWS {
-            let Some(fx) = row.fixture else { continue };
+            // A cut folder is safetensors, not a GGUF this table's readers open; its own reader
+            // reads it.
+            let Some(Fixture::Gguf(fx)) = row.fixture else {
+                continue;
+            };
             let canonical = row.canonical();
             let first = match refset::fixture::first_shard(canonical) {
                 Ok(first) => first,

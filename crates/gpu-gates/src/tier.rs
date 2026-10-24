@@ -49,7 +49,7 @@ use std::fmt::{self, Debug};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use bloomery_levers::{CARD_BUDGET, Levers};
+use bloomery_levers::{CARD_BUDGET, CardBudget, Levers};
 use gguf::Split;
 use model::fixture::KEY_CARD_BUDGET;
 use model::placement::PlanLevers;
@@ -527,11 +527,11 @@ fn input_clause_in(
 }
 
 /// The NVMe tier's clause `name` of a gate whose file keeps `host_enough` routed layers on the
-/// host (the family's count over the file's types: more than one, so the tier has something to
-/// page). It is a self-consistency clause, run in both tiers, except on a fixture whose host
+/// host (the family's count over the placement its arms run: more than one, so the tier has
+/// something to page). It is a self-consistency clause, run in both tiers, except on a fixture whose host
 /// layers are too few: there it declares [`Tag::NoHostLayer`] and the fixture tier leaves it to
-/// the real tier, its [`DEFERRED`] line naming the tag. The premise is the file's types, never the
-/// plan's placement, and it approximates the plan's own paging condition: a file it admits whose
+/// the real tier, its [`DEFERRED`] line naming the tag. The premise is the family's count, and it
+/// approximates the plan's own paging condition: a file it admits whose
 /// plan pages nothing fails the clause, loud, never deferred. A fixture variant exists to run
 /// these clauses, so a variant that fails the premise is a named error. `Ok(false)`: the clause
 /// was left, skip it.
@@ -951,12 +951,15 @@ pub struct HeaderBudget {
     pub card_set_aside: u64,
 }
 
-/// The recorded single-card budget, re-planned before a fixture gate can use it, with what the
-/// fixture tier's card sets aside past the family's.
+/// The recorded single-card budget, re-planned before a fixture gate can use it — a trunk's on
+/// its own file, a variant's on the variant's (its requant recorded the planner's cap for it, so
+/// a variant still holding its trunk's budget is stale like a trunk whose plan moved) — with what
+/// the fixture tier's card sets aside past the family's.
 ///
 /// # Errors
 /// A malformed budget, an unknown fixture family, a planned family's file the planner refuses,
-/// a stale planned budget, or the family's set-aside on the fixture tier's card.
+/// a stale planned budget (a variant's names the requant that fixes it), or the family's
+/// set-aside on the fixture tier's card.
 pub fn header_budget(split: &Split) -> Result<Option<HeaderBudget>, GateError> {
     let Some(value) = split.value(KEY_CARD_BUDGET) else {
         return Ok(None);
@@ -969,7 +972,10 @@ pub fn header_budget(split: &Split) -> Result<Option<HeaderBudget>, GateError> {
         )
     })?;
     let mut card_set_aside = 0;
-    if split.value(VERSION_KEY).is_some() && split.value(model::fixture::KEY_VARIANT).is_none() {
+    if split.value(VERSION_KEY).is_some() {
+        let variant = split
+            .value(model::fixture::KEY_VARIANT)
+            .and_then(gguf::Value::as_str);
         let spec = split
             .architecture()
             .and_then(model::arch::registry::fixture_spec)
@@ -981,7 +987,9 @@ pub fn header_budget(split: &Split) -> Result<Option<HeaderBudget>, GateError> {
                 )
             })?;
         if let model::fixture::CardBudget::Planned(planner) = spec.card_budget {
-            card_set_aside = planned(&planner, split, path, recorded)?;
+            let family =
+                model::arch::registry::fixture_of(spec.arch).map_or(spec.arch, |row| row.family);
+            card_set_aside = planned(&planner, split, path, recorded, variant, family)?;
         }
     }
     Ok(Some(HeaderBudget {
@@ -1006,24 +1014,45 @@ fn on_fixture_card(_: &model::fixture::Budget, _: &Split) -> Result<u64, GateErr
     Ok(0)
 }
 
-/// A planned family's `recorded` budget of `split` (first shard `path`) re-planned
-/// ([`model::fixture::check_budget`]), a stale one named with the regeneration step, and what the
-/// fixture tier's card sets aside past the family's ([`on_fixture_card`]).
+/// A planned family's `recorded` budget of `split` (first shard `path`; `variant` its tag, if a
+/// variant of `family`) re-planned ([`model::fixture::check_budget`]), a stale one named with the
+/// step that fixes it, and what the fixture tier's card sets aside past the family's
+/// ([`on_fixture_card`]).
 fn planned(
     planner: &model::fixture::Budget,
     split: &Split,
     path: &Path,
     recorded: u64,
+    variant: Option<&str>,
+    family: &str,
 ) -> Result<u64, GateError> {
-    model::fixture::check_budget(planner, split, recorded).map_err(|error| match error {
-        model::fixture::FixtureError::BudgetMismatch(_) => format!(
-            "{}: stale recorded fixture budget {recorded}: {error}; regenerate the fixture using \
+    model::fixture::check_budget(planner, split, recorded)
+        .map_err(|e| fixture_budget_error(path, recorded, e, variant, family))?;
+    Ok(on_fixture_card(planner, split).map_err(|e| format!("{}: {e}", path.display()))?)
+}
+
+fn fixture_budget_error(
+    path: &Path,
+    budget: u64,
+    error: model::fixture::FixtureError,
+    variant: Option<&str>,
+    family: &str,
+) -> String {
+    match (&error, variant) {
+        (model::fixture::FixtureError::BudgetMismatch(_), Some(tag)) => format!(
+            "{}: variant {tag} records a stale budget {budget}: a variant's card budget is \
+             planned on its own file; {error}; make the variant again: just fixture-requant \
+             {family} {tag}",
+            path.display()
+        ),
+        (model::fixture::FixtureError::BudgetMismatch(_), None) => format!(
+            "{}: stale recorded fixture budget {budget}: {error}; regenerate the fixture using \
              docs/contrib/local-check.md, 'When a recorded fixture budget is stale'",
             path.display()
         ),
-        _ => format!("{}: {error}", path.display()),
-    })?;
-    Ok(on_fixture_card(planner, split).map_err(|e| format!("{}: {e}", path.display()))?)
+        (_, Some(tag)) => format!("{}: variant {tag}: {error}", path.display()),
+        (_, None) => format!("{}: {error}", path.display()),
+    }
 }
 
 /// The plan's levers: the real tier's are the caller's (`BLOOMERY_CARD_BUDGET`, unset: none, as
@@ -1031,8 +1060,8 @@ fn planned(
 /// — the budget that puts half the experts on the card of every card-eligible layer — plus what
 /// the fixture tier's card sets aside past the card it was planned on ([`HeaderBudget`]) and
 /// `extra`, the card bytes a drafting load reserves out of the same budget (the draft's
-/// `card_bytes`; 0 for a target-only plan). A budget lever the caller set that differs from the
-/// recorded budget is refused by name, never planned under.
+/// `card_bytes`; 0 for a target-only plan). A budget lever the caller set that is not the
+/// recorded value — another value, or one per card — is refused by name, never planned under.
 ///
 /// # Errors
 /// An invalid tier, an error from [`header_budget`], or an error from [`budget_levers`].
@@ -1040,7 +1069,7 @@ pub fn plan_levers(split: &Split, levers: &Levers, extra: u64) -> Result<PlanLev
     budget_levers(
         Tier::from_env()?,
         header_budget(split)?,
-        levers.card_budget_bytes(),
+        levers.card_budget(),
         extra,
     )
 }
@@ -1048,12 +1077,13 @@ pub fn plan_levers(split: &Split, levers: &Levers, extra: u64) -> Result<PlanLev
 /// [`plan_levers`] of its three inputs: the tier, the header's budget and the caller's lever.
 ///
 /// # Errors
-/// The fixture tier's missing header budget, a lever that names another budget, or a header
-/// budget plus its card's set-aside and the draft reservation that overflows u64.
+/// The fixture tier's missing header budget, a lever that names another budget (another value,
+/// or one per card), or a header budget plus its card's set-aside and the draft reservation that
+/// overflows u64.
 pub fn budget_levers(
     tier: Tier,
     header: Option<HeaderBudget>,
-    lever: Option<u64>,
+    lever: CardBudget,
     extra: u64,
 ) -> Result<PlanLevers, GateError> {
     match tier {
@@ -1063,15 +1093,17 @@ pub fn budget_levers(
         Tier::Fixture => {
             let header =
                 header.ok_or_else(|| format!("the fixture header has no {KEY_CARD_BUDGET}"))?;
-            if let Some(l) = lever
-                && l != header.recorded
-            {
-                return Err(format!(
-                    "BLOOMERY_CARD_BUDGET={l} and the fixture's {KEY_CARD_BUDGET} is {}: \
-                     the fixture tier plans under the header's budget",
-                    header.recorded
-                )
-                .into());
+            match lever {
+                CardBudget::Unset => {}
+                CardBudget::Every(l) if l == header.recorded => {}
+                l => {
+                    return Err(format!(
+                        "BLOOMERY_CARD_BUDGET={l} and the fixture's {KEY_CARD_BUDGET} is {}: \
+                         the fixture tier plans under the header's one budget",
+                        header.recorded
+                    )
+                    .into());
+                }
             }
             let budget = header
                 .recorded
@@ -1085,7 +1117,7 @@ pub fn budget_levers(
                     )
                 })?;
             Ok(PlanLevers {
-                card_budget_bytes: Some(budget),
+                card_budget_bytes: CardBudget::Every(budget),
             })
         }
     }
@@ -1690,12 +1722,12 @@ mod tests {
     /// lever preferred, the real tier reading the header.
     #[test]
     fn the_budget_is_the_levers_in_the_real_tier_and_the_headers_plus_the_draft_in_the_fixture() {
-        let b = |t, h: Option<(u64, u64)>, l, x| {
+        let b = |t, h: Option<(u64, u64)>, l: Option<u64>, x| {
             let h = h.map(|(recorded, card_set_aside)| HeaderBudget {
                 recorded,
                 card_set_aside,
             });
-            budget_levers(t, h, l, x).map(|p| p.card_budget_bytes)
+            budget_levers(t, h, l.into(), x).map(|p| p.card_budget_bytes.every())
         };
         assert_eq!(b(Tier::Real, Some((9, 3)), None, 5).expect("real"), None);
         assert_eq!(b(Tier::Real, None, Some(7), 5).expect("real"), Some(7));
@@ -1716,6 +1748,15 @@ mod tests {
         assert!(b(Tier::Fixture, None, None, 0).is_err());
         assert!(b(Tier::Fixture, Some((u64::MAX, 0)), None, 1).is_err());
         assert!(b(Tier::Fixture, Some((u64::MAX, 1)), None, 0).is_err());
+        let nine = Some(HeaderBudget {
+            recorded: 9,
+            card_set_aside: 0,
+        });
+        let per = CardBudget::Per(vec![(0, 9)]);
+        let real = budget_levers(Tier::Real, nine, per.clone(), 0).expect("real");
+        assert_eq!(real.card_budget_bytes, per);
+        let e = budget_levers(Tier::Fixture, nine, per, 0).expect_err("a list");
+        assert!(e.to_string().contains("header's one budget"), "{e}");
     }
 
     #[test]
@@ -1766,7 +1807,7 @@ mod tests {
     /// the recorded budget, the counts and the regeneration step. Mutant: the mismatch mapped to
     /// the generic path-and-error text, or the card set-aside read off a family that names none.
     #[test]
-    fn a_budget_mismatch_names_the_file_and_regeneration_step() {
+    fn a_budget_mismatch_names_the_file_and_the_fix_by_kind() {
         use model::fixture::{Budget, CardExperts};
 
         let dir = temp("stale-budget");
@@ -1783,52 +1824,96 @@ mod tests {
             },
             card_set_aside: None,
         };
-        assert_eq!(planned(&planner, &split, &path, 4).unwrap(), 0);
-        let error = planned(&planner, &split, &path, 3).unwrap_err().to_string();
+        // A trunk's stale budget names the regeneration step.
+        assert_eq!(
+            planned(&planner, &split, &path, 4, None, "glm5next").unwrap(),
+            0
+        );
+        let error = planned(&planner, &split, &path, 3, None, "glm5next")
+            .unwrap_err()
+            .to_string();
         assert!(error.contains(&path.display().to_string()), "{error}");
         assert!(error.contains("stale recorded fixture budget 3"), "{error}");
-        assert!(error.contains("not [4]"), "{error}");
+        // PIN(2026-10-24): a recorded budget is the least cap holding at least half, so the check
+        // names the half it fell short of ("not at least 4"), not an exact count ("not [4]").
+        assert!(error.contains("not at least 4"), "{error}");
         assert!(error.contains("regenerate the fixture"), "{error}");
         assert!(
             error
                 .contains("docs/contrib/local-check.md, 'When a recorded fixture budget is stale'"),
             "{error}"
         );
+        // A variant's names the variant and the requant that fixes it, not a regeneration.
+        let mismatch = model::fixture::check_budget(&planner, &split, 3).unwrap_err();
+        let error = fixture_budget_error(&path, 3, mismatch, Some("q2kxl"), "glm5next");
+        assert!(error.contains("variant q2kxl"), "{error}");
+        assert!(error.contains("stale budget 3"), "{error}");
+        // PIN(2026-10-24): as above, the half a plan fell short of.
+        assert!(error.contains("not at least 4"), "{error}");
+        assert!(
+            error.contains("just fixture-requant glm5next q2kxl"),
+            "{error}"
+        );
+        assert!(!error.contains("regenerate"), "{error}");
         drop(split);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// A variant's budget is replanned on its own file before a gate can use it: every planned
+    /// family's variant is held to its planner, so the base budget a bare header records is
+    /// refused naming the variant; a fixed family's variant keeps the trunk's value unchecked.
+    /// Mutant: the check skipped on a variant again, which returns every row's base budget.
     #[test]
-    fn fixture_variants_keep_the_base_budget_without_replanning() {
+    fn a_variants_budget_is_replanned_on_its_own_file() {
         use gguf::Value;
 
         let dir = temp("variant-budget");
         let path = dir.join("variant.gguf");
+        let base = 9_490_661_376u64;
         let rows = model::fixture::variant_parse_table(include_str!(
             "../../../tools/fixture-variants.tsv"
         ))
         .unwrap();
-        for row in rows {
+        assert!(!rows.is_empty(), "the shipped table names no variant");
+        for row in &rows {
             let keys = [
-                (gguf::GENERAL_ARCHITECTURE.into(), Value::String(row.family)),
-                (KEY_CARD_BUDGET.into(), Value::U64(9_490_661_376)),
+                (
+                    gguf::GENERAL_ARCHITECTURE.into(),
+                    Value::String(row.family.clone()),
+                ),
+                (KEY_CARD_BUDGET.into(), Value::U64(base)),
                 (
                     model::fixture::KEY_VARIANT.into(),
                     Value::String(row.tag.clone()),
                 ),
             ];
             write_fixture(&path, 1, &keys);
-            assert_eq!(
-                header_budget(&Split::open(&path).unwrap())
-                    .unwrap_or_else(|e| panic!("{}: {e}", row.tag)),
-                Some(HeaderBudget {
-                    recorded: 9_490_661_376,
-                    card_set_aside: 0
-                }),
-                "{}",
-                row.tag
-            );
+            let error = header_budget(&Split::open(&path).unwrap())
+                .expect_err("a planned family's variant is held to its own plan")
+                .to_string();
+            assert!(error.contains(&row.tag), "{error}");
+            assert!(error.contains(&path.display().to_string()), "{error}");
         }
+        // A fixed family records one value for trunk and variant alike: nothing is replanned.
+        let keys = [
+            (
+                gguf::GENERAL_ARCHITECTURE.into(),
+                Value::String("nemotron_h".into()),
+            ),
+            (KEY_CARD_BUDGET.into(), Value::U64(base)),
+            (
+                model::fixture::KEY_VARIANT.into(),
+                Value::String("sometag".into()),
+            ),
+        ];
+        write_fixture(&path, 1, &keys);
+        assert_eq!(
+            header_budget(&Split::open(&path).unwrap()).unwrap(),
+            Some(HeaderBudget {
+                recorded: base,
+                card_set_aside: 0
+            })
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 

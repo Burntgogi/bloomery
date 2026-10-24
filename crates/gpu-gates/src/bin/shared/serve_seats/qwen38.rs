@@ -5,8 +5,9 @@
 //! qwen38` are each one call of [`run`], which takes the process's arguments
 //! (`--model` already taken out by the one-binary server).
 //!
-//!     bloomery-serve-qwen38 [--host 127.0.0.1] [--port 8080] [--place a|gate|bp]
-//!                           [--ctx-size C] [--alias NAME] [--cache-ram MIB]
+//!     bloomery-serve-qwen38 [--host 127.0.0.1] [--port 8080]
+//!                           [--place a|gate|bp|<stage>[+<tier>…]] [--ctx-size C]
+//!                           [--alias NAME] [--cache-ram MIB]
 //!                           [--chat-template-file PATH] [--parallel N]
 //!                           [--queue-depth Q] [--park-ram MIB] [--slot-save-path DIR]
 //!                           [--mmproj FILE | --no-mmproj] [--image-min-tokens N]
@@ -38,7 +39,11 @@
 //! leaves a position's bits a function of its own inputs, so a longer
 //! prompt's greedy ids are the walk's, not a step-fed run's).
 //!
-//! `--place` set runs its word as given; unset, the common rule every
+//! `--place` is `a`, `gate`, `bp` or a card list `<stage>[+<tier>…]`
+//! (`generate::Place`, read by `bind::place_word` as every seat reads it); a
+//! list of more tier cards than the Qwen3.8 body serves (`q38place::Q38_RULE`)
+//! and `tp` are refused by name before any plan. The word runs as given (a
+//! single named card plans on its own bytes); unset, the common rule every
 //! serving seat takes decides (`generate::Place::choose`, by this family's
 //! `q38place::Q38_RULE`: two cards keep the offer `bp` while its plan holds the
 //! rule's break-even experts on the tier card or more and more than none —
@@ -379,7 +384,7 @@ use bloomery_gpu_gates::beside::{self, Beside};
 use bloomery_gpu_gates::bind::{
     CacheRam, Cached, ChatSurface, Landing, Listen, Pass, PutBack, Seat, SeatEngine, SlotPassRow,
     SlotStep, SlotsFrom, TemplateFile, Vocab, arm_screen, begin, bind_server, eprint_noted,
-    model_props, note_line, parallel_line, placement_of, put_back, slots_of,
+    model_props, note_line, parallel_line, place_word, placement_of, put_back, slots_of,
 };
 use bloomery_gpu_gates::generate::{BreakEven, Lane, Place, lane_of};
 use bloomery_gpu_gates::need;
@@ -430,14 +435,13 @@ mod qwen38_levers;
 pub(crate) use qwen38_levers::ACTS_ON;
 #[path = "../route_trace38.rs"]
 mod route_trace38;
+use super::xstream_rule::{Stage, xstream_rule};
 use route_trace38::{TraceRun, experts_name};
-#[path = "../xstream_rule.rs"]
-mod xstream_rule;
-use xstream_rule::{Stage, xstream_rule};
 
-const USAGE: &str = "usage: bloomery-serve-qwen38 [--host H] [--port P] [--place a|gate|bp] \
-                     [--ctx-size C] [--alias NAME] [--cache-ram MIB] [--chat-template-file PATH] \
-                     [--parallel N] [--queue-depth Q] [--park-ram MIB] [--slot-save-path DIR] \
+const USAGE: &str = "usage: bloomery-serve-qwen38 [--host H] [--port P] \
+                     [--place a|gate|bp|<stage>[+<tier>…]] [--ctx-size C] [--alias NAME] \
+                     [--cache-ram MIB] [--chat-template-file PATH] [--parallel N] \
+                     [--queue-depth Q] [--park-ram MIB] [--slot-save-path DIR] \
                      [--mmproj FILE | --no-mmproj] [--image-min-tokens N] \
                      [--image-max-tokens N] [--plan] [--api-key KEY] [--api-key-file FNAME]";
 
@@ -499,25 +503,26 @@ struct Branch38 {
 }
 
 /// Which placement `--place` names, as `generate_qwen3moe` takes it.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Kind38 {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Kind38 {
     /// The stage on the largest visible card (the A6000 here, the timing
-    /// card; the default).
+    /// card; the default), and any single card a list names: the plan is
+    /// made on that card's own bytes.
     A,
-    /// The 3090, the gate card.
+    /// The word `gate`: the 3090, the gate card.
     Gate,
     /// Plan (b′): the stage as under `a`, the next-largest card its expert
-    /// tier (`q38place::machine_bp38`).
+    /// tier (`q38place::machine_bp38`), and any card list with a tier card.
     Bp,
 }
 
 /// Where `--place` puts the plan's stage card, and its expert tier card
 /// when it has one: the kind, and its cards (`generate::Place`), resolved
 /// against this process's devices once the arguments are read.
-#[derive(Clone, Copy)]
-struct Place38 {
-    kind: Kind38,
-    cards: Place,
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Place38 {
+    pub(crate) kind: Kind38,
+    pub(crate) cards: Place,
     /// The side model's reserve on the stage card, which every machine of the placement
     /// carries ([`Place38::machine`]).
     embedding: Option<u64>,
@@ -539,29 +544,44 @@ impl Place38 {
         media: false,
     };
 
-    fn parse(v: &str) -> Result<Place38, GateError> {
-        let (kind, cards) = match v {
-            "a" => (Kind38::A, Place::A),
-            "gate" => (Kind38::Gate, Place::Gate),
-            "bp" => (Kind38::Bp, Place::Bp),
-            other => {
-                return Err(format!(
-                    "--place is a, gate or bp (plan (b′): the next-largest card as the \
-                     largest's expert tier), not {other}"
-                )
-                .into());
-            }
+    /// The seat's reading of a `--place` word: the shared grammar
+    /// ([`place_word`]) with the one expert tier card the body serves
+    /// ([`q38place::Q38_RULE`]), and the kind it names ([`Place38::of`]). `tp`
+    /// is refused by name: the body has no tensor-parallel path.
+    pub(crate) fn parse(v: &str) -> Result<Place38, GateError> {
+        let cards = place_word(v, Some(("qwen4exp", q38place::Q38_RULE.tiers)))?;
+        if cards.tp() {
+            return Err(
+                "--place tp: a tensor-parallel run is planned by its family's own \
+                        path, and the Qwen3.8 seat has none"
+                    .into(),
+            );
+        }
+        Ok(Place38::of(cards))
+    }
+
+    /// `cards` as a placement of the seat, its kind read by structure: a tier
+    /// card is plan (b′), the word `gate` the gate card, any other stage —
+    /// `a`, or a single card a list names — plan (a) on that card's own
+    /// bytes.
+    fn of(cards: Place) -> Place38 {
+        let kind = if !cards.tier_cards().is_empty() {
+            Kind38::Bp
+        } else if cards == Place::Gate {
+            Kind38::Gate
+        } else {
+            Kind38::A
         };
-        Ok(Place38 {
+        Place38 {
             kind,
             cards,
             embedding: None,
             image: None,
             media: false,
-        })
+        }
     }
 
-    fn name(self) -> &'static str {
+    pub(crate) fn name(self) -> &'static str {
         self.cards.name()
     }
 
@@ -572,7 +592,7 @@ impl Place38 {
 
     /// The stage card is plan (a)'s: the placement the Qwen3.8 defaults
     /// treat as plan (a).
-    fn stage_a(self) -> bool {
+    pub(crate) fn stage_a(self) -> bool {
         matches!(self.kind, Kind38::A | Kind38::Bp)
     }
 
@@ -588,7 +608,7 @@ impl Place38 {
     /// The placement holds an expert tier card (plan (b′)): the body runs
     /// no pass of several slots on such a load (`Body38::plan_slots`
     /// refuses a load with an expert tier card by name).
-    fn tiered(self) -> bool {
+    pub(crate) fn tiered(self) -> bool {
         matches!(self.kind, Kind38::Bp)
     }
 
@@ -1825,9 +1845,10 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         None => line,
     };
     let line = record::with_room(line, plan.host.room);
-    line.csv("devices", record::plan_devices(&machine))
-        .w("cuda_order", record::cuda_order())
-        .eprint();
+    let line = line
+        .csv("devices", record::plan_devices(&machine))
+        .w("cuda_order", record::cuda_order());
+    record::with_requantized(line, plan.model).eprint();
     for line in record::host_only(
         plan.model,
         matches!(experts, Experts::Card).then(|| {

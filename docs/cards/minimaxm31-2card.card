@@ -1,0 +1,52 @@
+# Round mm31tier: MiniMax-M3.1-Flash on both cards, plan (b′) (`--place bp`; the seat's unset `--place` takes it when two
+# cards are in view once the seat carries its TIER_RULE): the A6000 the stage card (every layer, the head, its id prefix of
+# each routed layer's experts), the 3090 an expert tier holding each layer's next ids on the common card leg (NVFP4 planes:
+# `nvfp4_gate_up_sel`, `nvfp4_gemv_sel32`), the host the rest. The native safetensors folder, serving defaults, ctx 4224.
+# Bytes [derived from the folder's shapes]: an NVFP4 expert is 3 x 6144 x 3072 x 0.5625 B = 31.85 MB; 57 routed layers of
+# 128 = 7,296 experts, 232.4 GB; a token's 228 picks (top 4) read 7.26 GB. Card dense 13.1 GB a token: MXFP8 attention
+# 6.6, shared experts 3.3, the dense lead 0.7, the BF16 head 2.46.
+# Measured at (a) (A6000 + host, the same seat and folder): 15.24 tok/s @ D = 512 = 65.6 ms a token, the A6000 holding
+# ~13 % of the experts [plan line]. Taking the card's dense at 567..701 GB/s (18.7..23.1 ms) and the bridge and launches
+# (2.4..3.3 ms) out leaves the host's 0.87 x 7.26 = 6.32 GB at 142..162 GB/s [derived from the measured row].
+# Plan (b′) [derived from the placement's rule; the run's `plan` record prints the values]: the stage as at (a), ~13 %; the
+# 3090's usable 25.35 GB less its 1.6 GB set-aside and the tier batch's bytes (a prompt unit's staging and leg buffers,
+# a few MB): ~740 experts, ~10.1 %. The host keeps ~77 % (of the picks too, if the routing is uniform over ids).
+# Decode, one token, D = 512 (serial per layer: the next layer's dense waits for this layer's sum):
+#   host DRAM   0.77 x 7.26 = 5.59 GB at 142..162 GB/s: 34.5..39.4 ms (the bound of the expert half)
+#   card SM     dense + head 13.1 GB on the A6000 at 567..701 GB/s: 18.7..23.1 ms, serial with the host's half
+#   stage slots ~30 card slots a token, 0.94 GB: 1.3..1.7 ms, under the host's shadow (0 on the wall)
+#   tier SM     ~23 tier slots a token, 0.73 GB on the 3090 at ~700 GB/s (250 W): ~1.0 ms, ~18 us a layer against
+#               the host's ~0.65 ms a layer: under the host's shadow (0)
+#   PCIe        a layer's x row out (24.6 KB f32) and its tier rows back (~0.4 slots x 24.6 KB): ~2 MB a token,
+#               ~0.2 ms, and the hand-off's ~30..80 us a layer, both under the host's shadow (0)
+#   bridge      57 x 21..36 us + launches: 2.4..3.3 ms
+#   NVMe        0 (every expert resident)
+#   => 55.6..65.8 ms by the sum; against the measured (a) row, the tier takes 0.73 GB a token off the host:
+#      -4.5..-5.1 ms, 60.5..61.1 ms = 16.4..16.5 tok/s. Written 15.6..17.4 (the tier's share 8..12 %, the routing's
+#      skew over ids). The tier is worth +7..9 % [derived]; D = 4096 a few percent lower, as at (a).
+# Break-even E* [derived]: a tier expert under uniform routing is picked 4/128 a token and so takes 1.0 MB a token off
+# the host, 6.5 us at 152 GB/s; the tier's serial cost is its enqueue on the step's path, 5..10 us a layer, 0.3..0.6 ms
+# a token: E* = 46..92 experts on the tier (about one to two a routed layer). The seat's TIER_RULE takes 92.
+# Companions read from the same rows (not this card's term): pp512 and pp4096, the measured (a) rows 39.3 / 36.6 the
+# line; the prompt's host union is the bound, and the tier takes ~10 % of each unit's experts off it.
+# Sitting (on the lead's go, both cards in the timing witness; needs the seat's TIER_RULE, which needs serve_seats/
+# tiered.rs's rule hook):
+#   BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/minimaxm31-2card.card BLOOMERY_TIMING_CARDS=a6000+3090
+#     DEPTH_SERVE_CTX=4224' tools/ref/depth-serve.sh <this tree>:512 <this tree>:4096
+kind: baseline
+question: what does the MiniMax-M3.1-Flash seat decode at depth 512 on plan (b′), the A6000 the stage and the 3090 an
+  expert tier beside the host, at the serving defaults?
+term: tg tok/s @ n=1, D = 512, bloomery-serve --model minimaxm3 at the serving defaults (place unset -> bp), A6000 +
+  3090 + host, the native safetensors folder, depth-serve rows (timings.predicted_per_second over 127 steps)
+unit: tok/s
+predict: 15.6..17.4
+condition: depth-serve under BLOOMERY_TIMING_CARDS=a6000+3090 in its own lease, one fresh server a row; the server's
+  `place unset` record names bp and its `plan` record a tier0 card holding experts, else the row is void; the witness
+  (both cards, mem, pgmajfault) shows no other model load and the host's experts resident (majflt near 0)
+reason: the 0.3.9 release states M3.1's measured decode and prompt rows; the user asked for both cards in use, and this
+  is the first row of M3.1's two-card plan
+decide-in: write the two-card row with its lease and witness beside the (a) row in the README's M3.1 table
+decide-below: read the plan record's tier experts against ~740 and the step's per-layer host wait; a tier hand-off
+  past the host's ~0.65 ms a layer, or a host leg slower than its bytes, is the finding
+decide-above: re-derive the host term: the host's half ran under the next layer's dense (an overlap this card does not
+  count), or the cards hold more of the picks than their share of the ids

@@ -1,0 +1,12 @@
+Source of minimaxm31-chat-template.jinja (kept byte-exact; this file records it):
+
+The `chat_template.jinja` of the MiniMax-M3.1-Flash checkpoint folder (11,633 bytes, revision 76faee1b of the vendor's
+repository), which `hf::vocab` reads into the header as `tokenizer.chat_template` when the folder is opened.
+sha256 961e3f96b2c08d26555efdfeb3b384d5e81181bf0cfc04edbadc31c6e507b431  minimaxm31-chat-template.jinja
+
+What it changes from MiniMax-M3's template (11,756 bytes): no `thinking_mode` variable, so the thinking mode is always
+adaptive and the generation prompt opens no span (M3's, with the variable unset, also opened none); the identity line
+names M3.1 and `<model_id>8bb8149fe</model_id>` follows the thinking instructions; `reasoning_effort` (or `effort`)
+writes an `<effort>` line; the root turn carries `current_date` and `current_location`; a system or developer turn
+after the first renders as a developer turn (M3's dropped it). The reasoning tags (`<mm:think>`, `</mm:think>`), the
+turn end (`[e~[`) and the tool-call markup are the same text as M3's.

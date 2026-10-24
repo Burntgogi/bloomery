@@ -623,7 +623,7 @@ mod gate {
         ok &= tier::witness("IMAGE_TOKEN", s.image_token.unwrap_or(0), REAL_IMAGE_TOKEN);
         ok &= tier::witness(
             "plan levers' card budget",
-            cfg().plan_levers.card_budget_bytes,
+            cfg().plan_levers.card_budget_bytes.clone(),
             PlanLevers::default().card_budget_bytes,
         );
         ok &= tier::witness_card(&card()?);
@@ -789,7 +789,7 @@ mod gate {
         println!(
             "plan card={} experts={experts:?} slots={slots} ctx_max={} ubatch={ub} host_experts={} \
              card_experts={} card_layers={} ple={} room={} read={} row_reserve={} \
-             card_budget={:?}",
+             card_budget={}",
             card.name,
             p.ctx_max,
             p.host_experts,
@@ -3944,7 +3944,7 @@ mod gate {
     fn card_whole(toks: &[u32]) -> Result<bool, GateError> {
         let fixture = Tier::from_env()? == Tier::Fixture;
         let levers = PlanLevers {
-            card_budget_bytes: None,
+            card_budget_bytes: Default::default(),
         };
         let (rows, next) = verify_rows(toks)?;
         let ub = bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for(CTX)?;

@@ -1306,7 +1306,7 @@ fn hw_fixture_v41_budget() {
     let machine = workstation::plan_gate(layers);
     let at = |budget: Option<u64>, ctx: u64, slots: usize| -> Result<Vec<u64>, String> {
         let levers = PlanLevers {
-            card_budget_bytes: budget,
+            card_budget_bytes: budget.into(),
         };
         let slots = NonZeroUsize::new(slots).unwrap();
         inputs
@@ -2726,7 +2726,7 @@ fn hw_fixture_q38_budget() {
             Experts::Card,
         );
         let levers = PlanLevers {
-            card_budget_bytes: budget,
+            card_budget_bytes: budget.into(),
         };
         inputs
             .plan_with_slots(&machine, q38::BUDGET_CTX, &levers, Experts::Card, 1)
@@ -3242,8 +3242,8 @@ fn hw_fixture_glm_plan() {
 
 /// Contract 17: the recorded card budget makes the plan of the written file
 /// with its NextN layer loaded, at the e2e gate's context, hold half of the
-/// experts (144 of 288) on every card-eligible layer (f2 to f4) and none on the
-/// dense layers and the Q6_K-down layer, as `verify` re-plans it. The condition
+/// experts (144 of 288) on every card-eligible layer (f2 to f5, the Q6_K-down
+/// layer among them) and none on the dense layers, as `verify` re-plans it. The condition
 /// table is printed: the budget is the NextN plan at [`glm::BUDGET_CTX`].
 #[test]
 #[ignore = "needs the box and the GLM-5.3-Flash file (just gate-fixture)"]
@@ -3267,7 +3267,7 @@ fn hw_fixture_glm_budget() {
     let machine = workstation::plan_gate(layers);
     let with_nextn = |budget: Option<u64>, ctx: u64| -> Result<Vec<u64>, String> {
         let levers = PlanLevers {
-            card_budget_bytes: budget,
+            card_budget_bytes: budget.into(),
         };
         inputs
             .plan_nextn(&machine, ctx, &levers, &nextn)
@@ -3276,7 +3276,7 @@ fn hw_fixture_glm_budget() {
     };
     let plain = |budget: Option<u64>, ctx: u64| -> Result<Vec<u64>, String> {
         let levers = PlanLevers {
-            card_budget_bytes: budget,
+            card_budget_bytes: budget.into(),
         };
         inputs
             .plan(&machine, ctx, &levers)
@@ -3284,9 +3284,12 @@ fn hw_fixture_glm_budget() {
             .map_err(|e| e.to_string())
     };
     let ctx = glm::BUDGET_CTX;
-    // Dense f0 and f1, and f5 (a Q6_K down no card kernel runs), hold none on
-    // the card; f2 to f4 are the card-eligible layers.
-    let want = |n: u64| vec![0, 0, n, n, n, 0];
+    // Dense f0 and f1 hold none on the card; f2 to f5 are the card-eligible
+    // layers.
+    // PIN(2026-10-23): f5 joined them: the common card leg's down arm runs its
+    // Q6_K down (`kernels::card_down_runs`). Mutant: that arm without Q6_K —
+    // f5 holds 0 again.
+    let want = |n: u64| vec![0, 0, n, n, n, n];
     assert_eq!(
         with_nextn(None, ctx).unwrap(),
         want(experts),
@@ -5277,8 +5280,8 @@ fn hw_fixture_solar_plan() {
 }
 
 /// Contract 35: the recorded card budget makes the plan of the written file, at the end-to-end
-/// gate's context, hold half of the experts (160 of 320) on every card-eligible layer (f2 and f3,
-/// the Q4_K set) and none on the Q6_K-down layers (f0 and f1: no card kernel runs that stack), as
+/// gate's context, hold half of the experts (160 of 320) on every card-eligible layer (all four:
+/// the Q4_K set f2 and f3, and the Q6_K-down layers f0 and f1, whose down the card leg runs), as
 /// `verify` re-plans it; the budgetless plan holds all of them on the eligible layers. A budget
 /// 64 MiB below and 1 GiB above and an edited record are refused by name ([`budget_round_trip`]).
 #[test]
@@ -5298,7 +5301,7 @@ fn hw_fixture_solar_budget() {
     let ctx = solar::BUDGET_CTX;
     let counts = |budget: Option<u64>| -> Vec<u64> {
         let levers = PlanLevers {
-            card_budget_bytes: budget,
+            card_budget_bytes: budget.into(),
         };
         inputs
             .plan(&machine, ctx, &levers)
@@ -5306,8 +5309,10 @@ fn hw_fixture_solar_budget() {
             .n_l
             .clone()
     };
-    // The Q6_K-down layers (f0, f1) keep every expert on the host: no card kernel runs that stack.
-    let want = |n: u64| vec![0, 0, n, n];
+    // PIN(2026-10-23): the Q6_K-down layers (f0, f1) are card-eligible: the common card leg's
+    // down arm runs a Q6_K down (`kernels::card_down_runs`). Mutant: that arm without Q6_K — f0 and
+    // f1 hold 0 again.
+    let want = |n: u64| vec![n, n, n, n];
     assert_eq!(
         counts(None),
         want(experts),

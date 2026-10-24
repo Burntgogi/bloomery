@@ -41,7 +41,8 @@
 //! ([`generate`]) and checked byte for byte by [`verify`].
 //!
 //! A variant of a fixture ([`variant_check`], `tools/fixture-variants.tsv`) is the fixture requantized by ik's quantizer to a type map,
-//! every other tensor kept bit for bit and the header's `bloomery.fixture.*` keys kept, with [`KEY_VARIANT`] added; it lives under the
+//! every other tensor kept bit for bit and the header's `bloomery.fixture.*` keys kept but [`KEY_CARD_BUDGET`], planned on the variant's
+//! own file, with [`KEY_VARIANT`] added; it lives under the
 //! `fixture-variants/<tag>/` beside the fixture root (the box manifest keys every file under the root into
 //! every fixture-tier item) and its reference sets are named apart from the base's.
 //!
@@ -71,6 +72,7 @@ mod verify;
 mod write;
 
 pub use budget::check as check_budget;
+pub use budget::choose_written as choose_budget_written;
 pub use fill::{Band, CHUNK_TARGET, FloatTy, NVFP4_TENSOR_SCALE, Rule, Window, rule_for};
 pub use plan::{FilePlan, Kvs, Plan, PlannedTensor, header_sha256, plan};
 pub(crate) use plan::{int_like, items, split_layer, unsigned};
@@ -83,7 +85,8 @@ pub use spec::{
 pub use variant::{
     CheckStats, Retype, Row as VariantRow, Scope as VariantScope, TABLE as VARIANT_TABLE,
     check as variant_check, custom_q as variant_custom_q, expand as variant_expand,
-    override_kv as variant_override_kv, parse_table as variant_parse_table, row as variant_row,
+    override_kv as variant_override_kv, parse_table as variant_parse_table,
+    record_budget as variant_record_budget, row as variant_row,
 };
 pub use verify::{
     Sample, VerifyStats, check_tensor, check_units, rms_within, sample_chunks, verify,
@@ -102,7 +105,10 @@ pub const KEY_SOURCE_LAYERS: &str = "bloomery.fixture.source_layers";
 /// bytes before its data base, in split order.
 pub const KEY_SOURCE_SHA256: &str = "bloomery.fixture.source_header_sha256";
 /// u64: the card byte budget (`BLOOMERY_CARD_BUDGET`) the fixture's gate
-/// placement plans under.
+/// placement plans under — the file's own plan's cap: a trunk's chosen by its
+/// generator, a variant's by its requant (`variant_record_budget`), so the
+/// two differ when their experts' bytes do; a family with a fixed budget
+/// records one value on both.
 pub const KEY_CARD_BUDGET: &str = "bloomery.fixture.card_budget";
 /// String array: present only on a file that holds some of the planned
 /// tensors — their names, in file order.

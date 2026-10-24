@@ -42,7 +42,9 @@ use crate::latent::LATENT;
 use crate::linear::mixer_kda::{self, KdaBufs, KdaDims, KdaIn, KdaProj, KdaState};
 use crate::linear::{HEAD, LinearKernels, LinearShape};
 use crate::model::fit::{act_col_bytes, act32_col_bytes, route_bytes};
-use crate::site::{self, Form, Gated, GatedIo, SiteTy, SiteWeight, SwigluRows, WideActs, WideIn};
+use crate::site::{
+    self, Form, Gated, GatedIo, SiteTy, SiteWeight, SwigluRows, WideActs, WideForms, WideIn,
+};
 use crate::tensor::DeviceTensor;
 use crate::weights::{DevWeight, Weights};
 use crate::{Gpu, GpuError, launch_u32};
@@ -654,19 +656,19 @@ impl Kern<'_> {
     }
 }
 
-/// The normed rows `x` (`m` of the model width) in the forms asked for:
-/// `(q128, q32)`, as [`WideActs::wants_of`] names them for a set of sites.
+/// The normed rows `x` (`m` of the model width) in the quantized forms asked
+/// for, as [`WideActs::wants_of`] names them for a set of sites.
 pub(super) fn quantize_hid(
     gpu: &Gpu,
     g32: &Gemm32Kernels,
     forms: &mut Forms,
     (x, m): (&DeviceBuffer<f32>, usize),
-    (sink, (q128, q32)): (FaultSink, (bool, bool)),
+    (sink, want): (FaultSink, WideForms),
 ) -> Result<(), GpuError> {
-    if q128 {
+    if want.q128 {
         gpu.enqueue_quantize_gemm(x, m, &mut forms.hid128, sink)?;
     }
-    if q32 {
+    if want.q32 {
         g32.enqueue_quantize_gemm32(gpu.stream(), x, m, &mut forms.hid32, sink)?;
     }
     Ok(())
@@ -817,8 +819,8 @@ pub(super) fn quantize_qb(
 /// Whether a site of type `ty` reads q8 blocks of 32 alone, as the unit's gated
 /// rows and query latent are quantized for an output or query up projection.
 fn blocks32(ty: SiteTy) -> bool {
-    let (q128, q32) = WideActs::wants(ty);
-    !q128 && q32
+    let want = WideActs::wants(ty);
+    !want.q128 && want.q32
 }
 
 /// A named refusal of a projection `what` of type `ty` that reads another
@@ -850,7 +852,8 @@ pub(super) fn qb_runs(ty: SiteTy) -> Result<(), GpuError> {
 pub(super) fn rda_runs(s: &RdaSites) -> Result<(), GpuError> {
     out_runs(s.out.ty())?;
     let ty = s.f_b.ty();
-    if WideActs::wants(ty) != (false, false) {
+    let want = WideActs::wants(ty);
+    if want.q128 || want.q32 {
         return Err(GpuError::shape(
             WHAT,
             format!(
@@ -1131,17 +1134,12 @@ fn glu(
         f32: None,
     };
     let widths = (forms.dense128.k(), forms.shared32.k());
+    // The buffers are cut by width, one form a width, so they are held outside
+    // a `WideActs`; a down that reads f32 rows has no `DownForm` and is refused
+    // by name here.
     let rows = match down_form(g.down.ty(), g.ff, widths) {
-        Some(DownForm::Q128) => SwigluRows {
-            q128: Some(&mut forms.dense128),
-            q32: None,
-            f32: None,
-        },
-        Some(DownForm::Q32) => SwigluRows {
-            q128: None,
-            q32: Some(&mut forms.shared32),
-            f32: None,
-        },
+        Some(DownForm::Q128) => SwigluRows::held(Some(&mut forms.dense128), None, None),
+        Some(DownForm::Q32) => SwigluRows::held(None, Some(&mut forms.shared32), None),
         None => return Err(no_down_form(l, g)),
     };
     let io = GatedIo {
@@ -1192,8 +1190,9 @@ pub(super) fn ffn(
         Ffn::Routed(r) => {
             // The routed stacks' gate and up read the q8_1 rows; the shared
             // expert's sites read theirs.
-            let (_, q32) = WideActs::wants_of(&[r.shared.gate.ty(), r.shared.up.ty()]);
-            quantize_hid(gpu, k.g32, forms, (xn, m), (sink, (true, q32)))?;
+            let shared = WideActs::wants_of(&[r.shared.gate.ty(), r.shared.up.ty()]);
+            let want = WideForms::q8(true, shared.q32);
+            quantize_hid(gpu, k.g32, forms, (xn, m), (sink, want))?;
             routed(cx, k, rule, (l, m), (r, forms, wf), xn, scale)?;
             glu(
                 cx,

@@ -172,7 +172,7 @@ fn machine_of(
     slots: usize,
 ) -> Result<Machine, GateError> {
     let price = checkpoint_price(inputs)?;
-    let tier_batch = glmplace::tier_batch(place, &inputs.hp);
+    let tier_batch = glmplace::tier_batch(place, inputs);
     Ok(glm_machine(place, tier_batch, slots, price, ctx)?(
         inputs.model.layers,
     ))

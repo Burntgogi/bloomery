@@ -1,5 +1,7 @@
 //! One pass of the encoder over an input's ids (the crate doc's order), its
-//! launches all on the [`Gpu`]'s stream, and the rows it reads back.
+//! launches all on the [`Gpu`]'s stream, and the rows it reads back. A packed
+//! pass runs several inputs as one token sequence: attention stays inside each
+//! input, and pooling is per input.
 
 use std::collections::BTreeMap;
 
@@ -7,11 +9,11 @@ use crate::config::{DenseHead, Hparams};
 use bloomery_gpu::flash_gqa_prefill::GqaPrefillArgs;
 use bloomery_gpu::gemm::{GemmAct32, GemmInput, GemmRoute};
 use bloomery_gpu::rope_neox::{HEAD_256, PartialNeoxArgs};
-use bloomery_gpu::rope_table::RopeRows;
+use bloomery_gpu::rope_table::{Direction, RopeRows, RopeSpec, RopeTable};
 use bloomery_gpu::site::{self, SiteTy, SiteWeight, WideIn, WideKernels};
 use bloomery_gpu::weights::Weights;
-use bloomery_gpu::{DeviceTensor, FaultSink, Gpu, GpuError, Window, to_host};
-use cuda_core::DeviceBuffer;
+use bloomery_gpu::{DeviceTensor, FaultSink, Gpu, GpuError, Window, WindowMut, to_host};
+use cuda_core::{CudaStream, DeviceBuffer};
 use model::arch::gemma_embedding2::hparams::key_bounds;
 use model::arch::gemma_embedding2::names;
 
@@ -27,6 +29,13 @@ pub struct Pass {
     pub taps: Option<Taps>,
 }
 
+/// Several inputs in one pass: one pooled vector per input, in input order,
+/// and the taps when asked (`result_embd` holds the packed rows).
+pub struct Packed {
+    pub pooled: Vec<Vec<f32>>,
+    pub taps: Option<Taps>,
+}
+
 /// A pass's intermediate rows, each token-major in the reference's order.
 pub struct Taps {
     /// The token rows times `√hidden`, `n · hidden`.
@@ -34,6 +43,12 @@ pub struct Taps {
     /// Every layer's normed input slice, `[per_layer, n_layer, n]`: position
     /// `t`'s layer `l` at `(t·n_layer + l)·per_layer`.
     pub inp_per_layer: Vec<f32>,
+    /// Each layer's post-attention residual (the layer's input plus its
+    /// post-normed attention output), `n · hidden`.
+    pub attn_out: Vec<Vec<f32>>,
+    /// Each layer's post-feed-forward residual (the attention residual plus
+    /// its post-normed FFN), `n · hidden`.
+    pub ffn_out: Vec<Vec<f32>>,
     /// Each layer's output, `n · hidden`.
     pub l_out: Vec<Vec<f32>>,
     /// The output norm's rows, `n · hidden`.
@@ -119,28 +134,103 @@ impl Cx<'_> {
 }
 
 /// A reach's per-row key bounds on the card: row `t` attends keys
-/// `[first[t], count[t])` ([`key_bounds`]).
+/// `[first[t], count[t])` ([`key_bounds`] inside its own input).
 struct Keys {
     reach: Option<usize>,
     first: DeviceBuffer<u32>,
     count: DeviceBuffer<u32>,
 }
 
+/// `offsets` partitions `n`: starts, strictly increasing, `0` then the end.
+fn check_offsets(n: usize, offsets: &[usize]) -> Result<(), GpuError> {
+    let ok = offsets.len() >= 2
+        && offsets[0] == 0
+        && offsets[offsets.len() - 1] == n
+        && offsets.windows(2).all(|w| w[1] > w[0]);
+    if ok {
+        Ok(())
+    } else {
+        Err(GpuError::shape(
+            PASS,
+            format!("segment offsets do not partition {n} positions"),
+        ))
+    }
+}
+
+fn segment_at(offsets: &[usize], t: usize) -> Result<(usize, usize), GpuError> {
+    offsets
+        .windows(2)
+        .find(|w| t >= w[0] && t < w[1])
+        .map(|w| (w[0], w[1]))
+        .ok_or_else(|| GpuError::shape(PASS, format!("position {t} is in no segment")))
+}
+
+/// Position `t` in the packed rows, or its position inside its own input.
+fn position_of(offsets: &[usize], t: usize, local: bool) -> Result<u32, GpuError> {
+    let at = if local {
+        let (lo, _) = segment_at(offsets, t)?;
+        t - lo
+    } else {
+        t
+    };
+    u32::try_from(at).map_err(|_| GpuError::shape(PASS, "a rope position does not fit u32"))
+}
+
+/// The positions `0..len` a rope-table rewrite writes: each token's
+/// position in its own input, or the identity rows of a restore. Pure: the
+/// pass writes the tables from them.
+fn rope_positions(len: usize, offsets: &[usize], local: bool) -> Result<Vec<u32>, GpuError> {
+    (0..len).map(|t| position_of(offsets, t, local)).collect()
+}
+
+/// Write rope-table rows `0..positions.len()` from `positions`. The tail stays.
+fn rewrite_table(
+    stream: &CudaStream,
+    rows: &mut RopeRows,
+    base: f32,
+    positions: &[u32],
+) -> Result<(), GpuError> {
+    let spec = RopeTable::new(&RopeSpec::window(base, rows.width))?;
+    let mut host = Vec::with_capacity(positions.len() * rows.width);
+    for &p in positions {
+        spec.push(p, Direction::Forward, &mut host);
+    }
+    let mut window = WindowMut::<f32>::of_mut(&mut rows.table, 0, host.len())?;
+    window.copy_from_host(stream, &host)?;
+    Ok(())
+}
+
+/// Every row's key bounds of one reach over the packed rows: row `t`'s
+/// window inside its own input ([`key_bounds`]), shifted to the input's
+/// start. Pure: the pass uploads the rows a reach.
+fn key_bound_rows(
+    reach: Option<usize>,
+    n: usize,
+    offsets: &[usize],
+) -> Result<(Vec<u32>, Vec<u32>), GpuError> {
+    let narrow = |v: usize| {
+        u32::try_from(v).map_err(|_| GpuError::Shape {
+            what: PASS,
+            detail: format!("a key bound of {v} over {n} positions does not fit u32"),
+        })
+    };
+    let mut first = Vec::with_capacity(n);
+    let mut count = Vec::with_capacity(n);
+    for t in 0..n {
+        let (lo, hi) = segment_at(offsets, t)?;
+        let (f, c) = key_bounds(reach, t - lo, hi - lo);
+        first.push(narrow(f + lo)?);
+        count.push(narrow(c + lo)?);
+    }
+    Ok((first, count))
+}
+
 impl Keys {
-    fn new(gpu: &Gpu, reach: Option<usize>, n: usize) -> Result<Keys, GpuError> {
-        let narrow = |v: usize| {
-            u32::try_from(v).map_err(|_| GpuError::Shape {
-                what: PASS,
-                detail: format!("a key bound of {v} over {n} positions does not fit u32"),
-            })
-        };
-        let mut first = Vec::with_capacity(n);
-        let mut count = Vec::with_capacity(n);
-        for t in 0..n {
-            let (f, c) = key_bounds(reach, t, n);
-            first.push(narrow(f)?);
-            count.push(narrow(c)?);
-        }
+    /// Row `t` attends inside its own input: the symmetric window of its
+    /// position there, shifted back to the packed row. The offsets are the
+    /// inputs' starts, not a dense mask.
+    fn new(gpu: &Gpu, reach: Option<usize>, n: usize, offsets: &[usize]) -> Result<Keys, GpuError> {
+        let (first, count) = key_bound_rows(reach, n, offsets)?;
         Ok(Keys {
             reach,
             first: DeviceBuffer::from_host(gpu.stream(), &first)?,
@@ -160,6 +250,8 @@ struct Step<'a> {
     consts: &'a Consts,
     n: usize,
     cap: usize,
+    /// Several inputs share the pass, so a full layer takes the lower-bound flash.
+    packed: bool,
 }
 
 impl Step<'_> {
@@ -286,6 +378,10 @@ impl Step<'_> {
                     .flash
                     .enqueue_256_p1_lower(stream, args, &keys.first)?;
             }
+        } else if self.packed {
+            self.k
+                .flash512
+                .enqueue_p4_lower(stream, args, &keys.first)?;
         } else {
             self.k.flash512.enqueue_p4(stream, args)?;
         }
@@ -437,7 +533,14 @@ impl Encoder {
         spans: &[bloomery_gpu::media::MediaSpan<'_>],
         taps: bool,
     ) -> Result<Pass, GpuError> {
-        self.pass_inner(ids, spans, taps, None, bloomery_gpu::media::widen_bf16)
+        Self::one_pass(self.pass_inner(
+            ids,
+            spans,
+            taps,
+            None,
+            bloomery_gpu::media::widen_bf16,
+            &[],
+        )?)
     }
 
     /// Replay each layer from its supplied token-major residual (`n · hidden`
@@ -449,6 +552,7 @@ impl Encoder {
             true,
             Some(inputs),
             bloomery_gpu::media::widen_bf16,
+            &[],
         )?
         .taps
         .ok_or(GpuError::State {
@@ -464,9 +568,83 @@ impl Encoder {
         spans: &[bloomery_gpu::media::MediaSpan<'_, f32>],
         taps: bool,
     ) -> Result<Pass, GpuError> {
-        self.pass_inner(ids, spans, taps, None, |rows, dst| {
-            dst.copy_from_slice(rows)
+        Self::one_pass(self.pass_inner(
+            ids,
+            spans,
+            taps,
+            None,
+            |rows, dst| dst.copy_from_slice(rows),
+            &[],
+        )?)
+    }
+
+    /// One pooled vector from a pass of one input.
+    fn one_pass(mut packed: Packed) -> Result<Pass, GpuError> {
+        if packed.pooled.len() != 1 {
+            return Err(GpuError::State {
+                what: PASS,
+                missing: "one pooled vector",
+            });
+        }
+        Ok(Pass {
+            pooled: packed.pooled.remove(0),
+            taps: packed.taps,
         })
+    }
+
+    /// The rope launch stores token `t` at cache row `pos[t]` and turns it by
+    /// table row `pos[t]`, and the positions of one launch are distinct. A
+    /// packed pass keeps `pos[t] = t` and writes table row `t` from the token's
+    /// position in its own input, then restores the table.
+    fn rewrite_rope(&mut self, n: usize, offsets: &[usize], local: bool) -> Result<(), GpuError> {
+        let positions = rope_positions(n, offsets, local)?;
+        let (swa_base, full_base) = (self.hp.swa.rope_base, self.hp.full.rope_base);
+        rewrite_table(self.gpu.stream(), &mut self.rope_swa, swa_base, &positions)?;
+        rewrite_table(
+            self.gpu.stream(),
+            &mut self.rope_full,
+            full_base,
+            &positions,
+        )?;
+        Ok(())
+    }
+
+    /// Several inputs whose tokens sum to at most [`Encoder::ctx`], one pooled
+    /// vector each, in input order. An empty list, an empty input, a sum past
+    /// the context, or a sum that overflows is refused by name. A longer list
+    /// is the caller's split.
+    pub fn pass_packed(&mut self, inputs: &[&[u32]], taps: bool) -> Result<Packed, GpuError> {
+        if inputs.is_empty() || inputs.iter().any(|ids| ids.is_empty()) {
+            return Err(GpuError::shape(
+                PASS,
+                format!("0 positions; a pass takes 1 to {}", self.ctx),
+            ));
+        }
+        let n = inputs
+            .iter()
+            .try_fold(0usize, |n, ids| n.checked_add(ids.len()))
+            .ok_or_else(|| GpuError::shape(PASS, "packed length overflows"))?;
+        if n > self.ctx {
+            return Err(GpuError::shape(
+                PASS,
+                format!("{n} positions; a pass takes 1 to {}", self.ctx),
+            ));
+        }
+        let mut ids = Vec::with_capacity(n);
+        let mut offsets = Vec::with_capacity(inputs.len() + 1);
+        offsets.push(0);
+        for input in inputs {
+            ids.extend_from_slice(input);
+            offsets.push(ids.len());
+        }
+        self.pass_inner(
+            &ids,
+            &[],
+            taps,
+            None,
+            bloomery_gpu::media::widen_bf16,
+            &offsets,
+        )
     }
 
     fn pass_inner<T>(
@@ -476,7 +654,8 @@ impl Encoder {
         taps: bool,
         layer_inputs: Option<&[Vec<f32>]>,
         copy: fn(&[T], &mut [f32]),
-    ) -> Result<Pass, GpuError> {
+        offsets: &[usize],
+    ) -> Result<Packed, GpuError> {
         let n = ids.len();
         if n == 0 || n > self.ctx {
             return Err(GpuError::Shape {
@@ -484,6 +663,13 @@ impl Encoder {
                 detail: format!("{n} positions; a pass takes 1 to {}", self.ctx),
             });
         }
+        let one = [0, n];
+        let offsets = if offsets.is_empty() {
+            &one[..]
+        } else {
+            offsets
+        };
+        check_offsets(n, offsets)?;
         if let Some(inputs) = layer_inputs {
             if inputs.len() != self.hp.n_layer {
                 return Err(GpuError::shape(PASS, "replay needs one input per layer"));
@@ -512,6 +698,32 @@ impl Encoder {
                 ));
             }
         }
+        let packed = offsets.len() > 2;
+        if packed && let Err(e) = self.rewrite_rope(n, offsets, true) {
+            let _ = self.rewrite_rope(n, offsets, false);
+            return Err(e);
+        }
+        let outcome = self.run_pass(taps, layer_inputs, inp_scaled, n, offsets);
+        if !packed {
+            return outcome;
+        }
+        match self.rewrite_rope(n, offsets, false) {
+            Ok(()) => outcome,
+            Err(restore) => match outcome {
+                Err(pass) => Err(pass),
+                Ok(_) => Err(restore),
+            },
+        }
+    }
+
+    fn run_pass(
+        &mut self,
+        taps: bool,
+        layer_inputs: Option<&[Vec<f32>]>,
+        inp_scaled: Vec<f32>,
+        n: usize,
+        offsets: &[usize],
+    ) -> Result<Packed, GpuError> {
         let Encoder {
             gpu,
             hp,
@@ -532,7 +744,7 @@ impl Encoder {
         let emb = DeviceBuffer::from_host(stream, &inp_scaled)?;
         let keys = reaches(layers)
             .into_iter()
-            .map(|r| Keys::new(gpu, r, n))
+            .map(|r| Keys::new(gpu, r, n, offsets))
             .collect::<Result<Vec<_>, _>>()?;
         k.gemm
             .enqueue_route_dense(stream, n, &mut s.route, gpu.unlabelled_sink())?;
@@ -544,10 +756,13 @@ impl Encoder {
             consts,
             n,
             cap: *ctx,
+            packed: offsets.len() > 2,
         };
         let mut tapped = taps.then(|| Taps {
             inp_scaled: inp_scaled.clone(),
             inp_per_layer: vec![0.0; n * hp.n_layer * hp.per_layer],
+            attn_out: Vec::new(),
+            ffn_out: Vec::new(),
             l_out: Vec::new(),
             result_norm: Vec::new(),
             result_embd: Vec::new(),
@@ -580,7 +795,15 @@ impl Encoder {
                 turn,
                 bounds,
             )?;
+            if let Some(t) = &mut tapped {
+                let a = Window::<f32>::of(&s.a, 0, n * e)?;
+                t.attn_out.push(to_host(stream, &a)?);
+            }
             st.glu(s, l)?;
+            if let Some(t) = &mut tapped {
+                let c = Window::<f32>::of(&s.c, 0, n * e)?;
+                t.ffn_out.push(to_host(stream, &c)?);
+            }
             if hp.per_layer != 0 {
                 st.per_layer(s, l, &ple[l], &emb, tapped.as_mut())?;
             } else {
@@ -614,20 +837,49 @@ impl Encoder {
         }
         let rows = &mut readback[..out.len()];
         out.copy_to_host(stream, rows)?;
-        let pooled = if let Some(head) = hp.dense {
-            let weights = DeviceBuffer::from_host(stream, &vec![1.0 / n as f32; n])?;
-            let count = u32::try_from(n)
-                .map_err(|_| GpuError::shape(PASS, "pooling count does not fit u32"))?;
-            gpu.elem()
-                .enqueue_weighted_sum(stream, &s.xn, &weights, e, count, 1, &mut s.a)?;
-            k.gemm.enqueue_route_dense(stream, 1, &mut s.route, sink)?;
-            let cx = st.cx(&s.route);
-            cx.quantize(&mut s.acts, &s.a, e, 1, sink)?;
-            cx.dense(&mut s.acts, &mut s.dense, (e, head, n_out), 1, &mut out)?;
-            let pooled = Window::<f32>::of(&out, 0, n_out)?;
-            to_host(stream, &pooled)?
+        let pooled = if offsets.len() == 2 {
+            if let Some(head) = hp.dense {
+                let weights = DeviceBuffer::from_host(stream, &vec![1.0 / n as f32; n])?;
+                let count = u32::try_from(n)
+                    .map_err(|_| GpuError::shape(PASS, "pooling count does not fit u32"))?;
+                gpu.elem()
+                    .enqueue_weighted_sum(stream, &s.xn, &weights, e, count, 1, &mut s.a)?;
+                k.gemm.enqueue_route_dense(stream, 1, &mut s.route, sink)?;
+                let cx = st.cx(&s.route);
+                cx.quantize(&mut s.acts, &s.a, e, 1, sink)?;
+                cx.dense(&mut s.acts, &mut s.dense, (e, head, n_out), 1, &mut out)?;
+                let pooled = Window::<f32>::of(&out, 0, n_out)?;
+                vec![to_host(stream, &pooled)?]
+            } else {
+                vec![embed::mean(rows, n_out)]
+            }
+        } else if let Some(head) = hp.dense {
+            let mut pooled = Vec::with_capacity(offsets.len() - 1);
+            for w in offsets.windows(2) {
+                let (lo, hi) = (w[0], w[1]);
+                let seg = hi - lo;
+                // The input's rows weigh 1/seg and every other row 0: adding +0 leaves each
+                // partial sum's bits, so the mean is the solo pass's over the same rows.
+                let mut w = vec![0.0f32; n];
+                w[lo..hi].fill(1.0 / seg as f32);
+                let weights = DeviceBuffer::from_host(stream, &w)?;
+                let count = u32::try_from(n)
+                    .map_err(|_| GpuError::shape(PASS, "pooling count does not fit u32"))?;
+                gpu.elem()
+                    .enqueue_weighted_sum(stream, &s.xn, &weights, e, count, 1, &mut s.a)?;
+                k.gemm.enqueue_route_dense(stream, 1, &mut s.route, sink)?;
+                let cx = st.cx(&s.route);
+                cx.quantize(&mut s.acts, &s.a, e, 1, sink)?;
+                cx.dense(&mut s.acts, &mut s.dense, (e, head, n_out), 1, &mut out)?;
+                let input = Window::<f32>::of(&out, 0, n_out)?;
+                pooled.push(to_host(stream, &input)?);
+            }
+            pooled
         } else {
-            embed::mean(rows, n_out)
+            offsets
+                .windows(2)
+                .map(|w| embed::mean(&rows[w[0] * n_out..w[1] * n_out], n_out))
+                .collect()
         };
         if let Some(t) = &mut tapped {
             let xn = Window::<f32>::of(&s.xn, 0, n * e)?;
@@ -648,13 +900,13 @@ impl Encoder {
                 ),
             });
         }
-        if pooled.iter().any(|v| !v.is_finite()) {
+        if pooled.iter().any(|v| v.iter().any(|x| !x.is_finite())) {
             return Err(GpuError::shape(
                 PASS,
                 "pooled output contains a non-finite value",
             ));
         }
-        Ok(Pass {
+        Ok(Packed {
             pooled,
             taps: tapped,
         })
@@ -664,6 +916,68 @@ impl Encoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn packed_rows_stay_inside_each_input() {
+        // The gate's clause (b) layout: one case of each distinct length, ascending.
+        let lengths = [
+            2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 20, 23, 24, 25, 28, 29, 30,
+            31, 33, 35, 36, 37, 41, 43, 45, 48, 57, 61, 62, 202, 1734,
+        ];
+        let mut offsets = vec![0];
+        for &l in &lengths {
+            offsets.push(offsets[offsets.len() - 1] + l);
+        }
+        let n = offsets[offsets.len() - 1];
+        for reach in [None, Some(3), Some(512)] {
+            let (first, count) = key_bound_rows(reach, n, &offsets).unwrap();
+            for w in offsets.windows(2) {
+                let (lo, hi) = (w[0], w[1]);
+                for t in lo..hi {
+                    let (f, c) = (first[t] as usize, count[t] as usize);
+                    assert!(
+                        lo <= f && f <= t && t < c && c <= hi,
+                        "reach {reach:?}: row {t} attends [{f}, {c}) of [{lo}, {hi})"
+                    );
+                    assert_eq!((f - lo, c - lo), key_bounds(reach, t - lo, hi - lo));
+                }
+            }
+        }
+        let local = rope_positions(n, &offsets, true).unwrap();
+        for w in offsets.windows(2) {
+            for (i, &p) in local[w[0]..w[1]].iter().enumerate() {
+                assert_eq!(p, u32::try_from(i).unwrap());
+            }
+        }
+        assert_eq!(
+            rope_positions(n, &offsets, false).unwrap(),
+            (0..n)
+                .map(|t| u32::try_from(t).unwrap())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn segment_offsets_partition_the_packed_rows_or_are_refused() {
+        assert!(check_offsets(3, &[0, 3]).is_ok());
+        assert!(check_offsets(3, &[0, 2, 3]).is_ok());
+        for bad in [
+            vec![],
+            vec![0],
+            vec![3],
+            vec![0, 4],
+            vec![1, 3],
+            vec![0, 2, 2, 3],
+            vec![0, 1, 3, 3],
+        ] {
+            assert!(
+                check_offsets(3, &bad).is_err(),
+                "offsets {bad:?} must be refused for 3 rows"
+            );
+        }
+        assert!(matches!(segment_at(&[0, 2, 5], 4), Ok((2, 5))));
+        assert!(segment_at(&[0, 2, 5], 5).is_err());
+    }
 
     #[test]
     #[ignore = "needs a CUDA card"]

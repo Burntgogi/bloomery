@@ -59,7 +59,9 @@
 //!   at groups of one — a tiered layer's join reads its unit's route weights
 //!   and tier places after the next unit's front has routed;
 //! - structure: the stage's captured step graph holds the reference's node
-//!   count;
+//!   count with each load's own fully-carded layers' go/wait omissions added
+//!   back (the reference fully cards the tier's layers, each taking the
+//!   hostless path, where the stage keeps every tiered layer hybrid);
 //! - precondition: every layer the tier holds experts of was sent at least
 //!   one routed slot by the decode legs (the step and pair legs together, the
 //!   tier's per-layer hits), and by the call alone, whose batch the tier
@@ -485,7 +487,7 @@ mod gate {
         // on a card.
         let place_levers = match Tier::from_env()? {
             Tier::Real => PlanLevers {
-                card_budget_bytes: Some(BUDGET),
+                card_budget_bytes: Some(BUDGET).into(),
             },
             Tier::Fixture => glm5next_tier::plan_levers(&levers, 0)?,
         };
@@ -515,7 +517,7 @@ mod gate {
     fn bp_machine(inputs: &PlanInputs) -> Result<impl Fn(usize) -> Machine + Copy, GateError> {
         glm_machine(
             Place::Bp,
-            Some(place::tier_batch(&inputs.hp)),
+            Some(place::tier_batch(inputs)),
             1,
             checkpoint_price(inputs)?,
             u64::try_from(CTX)?,
@@ -532,6 +534,7 @@ mod gate {
         let budget = cfg
             .place
             .card_budget_bytes
+            .every()
             .ok_or("the gate plans under a card budget")?;
         let tier_n = plan.tier_n_l.first().ok_or("plan (b′) has no tier")?;
         let tier_layers: Vec<usize> = (0..layers)
@@ -623,15 +626,31 @@ mod gate {
         pass &= same("decode bits: pair", &want.pair, &got.pair);
         pass &= same("call bits", &want.call, &got.call);
         pass &= same("group bits: groups of two against groups of one", &g1, &g2);
-        if got.stage_nodes == want.stage_nodes {
+        // PIN(2026-10-23): the counts compare with each load's own
+        // fully-carded layers' go/wait omissions added back (two nodes a
+        // layer, the hostless path the engine's step takes): the union
+        // fully cards the tier's layers, the stage keeps every tiered layer
+        // hybrid, so the raw counts differ by two nodes a tiered layer
+        // (measured: 178 against 170 at four tiered layers).
+        let experts = plan.model.experts;
+        let omitted = |n_l: &[u64]| 2 * n_l.iter().filter(|&&n| n == experts).count();
+        if got.stage_nodes + omitted(&plan.n_l) == want.stage_nodes + omitted(&uplan.n_l) {
             println!(
-                "ok structure: stage graph of {} nodes, the reference's",
-                got.stage_nodes
+                "ok structure: stage graph of {} nodes beside the reference's {} (go/wait \
+                 omissions added back: the stage's {}, the reference's {})",
+                got.stage_nodes,
+                want.stage_nodes,
+                omitted(&plan.n_l),
+                omitted(&uplan.n_l)
             );
         } else {
             println!(
-                "FAIL structure: stage graph of {} nodes, the reference's {}",
-                got.stage_nodes, want.stage_nodes
+                "FAIL structure: stage graph of {} nodes beside the reference's {} (go/wait \
+                 omissions added back: the stage's {}, the reference's {})",
+                got.stage_nodes,
+                want.stage_nodes,
+                omitted(&plan.n_l),
+                omitted(&uplan.n_l)
             );
             pass = false;
         }

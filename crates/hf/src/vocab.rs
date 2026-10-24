@@ -16,17 +16,20 @@
 //!
 //! Every key of `tokenizer.json`, its `model` and added tokens, `tokenizer_config.json` and
 //! `generation_config.json` is named in a table below with the values serving computes the same
-//! way HF does ([`schema`]); any other key or value is refused by name. Added tokens may not
-//! overlap, so serving's longest-first split equals HF's leftmost one, and the ids HF's generate
+//! way HF does ([`schema`]); any other key or value is refused by name. The ids HF's generate
 //! stops at are written as `tokenizer.bloomery.eog_token_ids`. This nonempty id array opts
-//! serving into explicit token types and ids, without name-based overrides or model defaults.
+//! serving into explicit token types and ids, without name-based overrides or model defaults,
+//! and into HF's split on the added tokens (leftmost, then longest).
 //! Serving checks every imported spelling against HF ByteLevel's decoded bytes, including
 //! added tokens. The caller checks its split, special ids, automatic BOS/EOS and stop sets.
 //!
-//! The one pre-tokenizer the table allows is the one serving runs as `qwen35`, the name
-//! (`tokenizer.ggml.pre`) llama.cpp gives Qwen's by the hash of its output. The stop id array
-//! also makes serving encode as `tokenizer.json` does: the regex folds a contraction's case by
-//! Unicode, and BPE skips a byte the vocabulary lacks.
+//! The pre-tokenizers the table allows are the rows of [`PRE`]: each is the pipeline
+//! `tokenizer.json` spells for one name of `tokenizer.ggml.pre` (the name llama.cpp gives the
+//! vocabulary by the hash of its output), and the row `tokenizer.json` carries is the one
+//! written. A pipeline no row spells is refused by name, and a [`VocabSpec`] may name the row its
+//! model has. For the `qwen35` row the stop id array also makes serving encode as
+//! `tokenizer.json` does: the regex folds a contraction's case by Unicode, and BPE skips a byte
+//! the vocabulary lacks.
 
 use std::collections::HashMap;
 use std::fs;
@@ -48,16 +51,84 @@ pub enum Error {
     Vocab(String),
 }
 
-// The qwen35 pipeline's parts as tokenizer.json spells them, one place each.
+// The pipelines' parts as tokenizer.json spells them, one place each.
 macro_rules! byte_level {
-    () => {
-        r#"{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false}"#
+    ($space:literal, $trim:literal, $regex:literal) => {
+        concat!(
+            r#"{"type":"ByteLevel","add_prefix_space":"#,
+            $space,
+            r#","trim_offsets":"#,
+            $trim,
+            r#","use_regex":"#,
+            $regex,
+            "}"
+        )
     };
 }
 macro_rules! qwen35_regex {
     () => {
         r#""(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+""#
     };
+}
+macro_rules! minimax_m2_regex {
+    () => {
+        r#""[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+""#
+    };
+}
+// One regex split, then ByteLevel without its own regex.
+macro_rules! pre_tokenizer {
+    ($regex:ident, $behavior:literal, $invert:literal, $trim:literal) => {
+        concat!(
+            r#"{"type":"Sequence","pretokenizers":[{"type":"Split","pattern":{"Regex":"#,
+            $regex!(),
+            r#"},"behavior":""#,
+            $behavior,
+            r#"","invert":"#,
+            $invert,
+            "},",
+            byte_level!(false, $trim, false),
+            "]}"
+        )
+    };
+}
+
+/// The pre-tokenizers, each as `tokenizer.json` spells it, under its `tokenizer.ggml.pre` name.
+/// `Removed` with `invert` keeps the regex's matches and drops what lies between them, which
+/// `Isolated` keeps as pieces of their own; both regexes match every codepoint, so no gap exists
+/// and the two split alike.
+pub const PRE: [(&str, &str); 2] = [
+    (
+        "qwen35",
+        pre_tokenizer!(qwen35_regex, "Isolated", false, false),
+    ),
+    (
+        "minimax-m2",
+        pre_tokenizer!(minimax_m2_regex, "Removed", true, true),
+    ),
+];
+
+/// The names of [`PRE`], as the refusal of an unknown one lists them.
+fn pre_names() -> String {
+    PRE.map(|(name, _)| name).join(", ")
+}
+
+/// The row of [`PRE`] a `tokenizer.json` pre-tokenizer is: its name and the regex it splits by.
+fn pre_row(pre: Option<&Json>) -> Result<(&'static str, String), Error> {
+    let bad = |what: String| Error::Vocab(what);
+    let pre = pre.ok_or_else(|| bad("tokenizer.json.pre_tokenizer is missing".into()))?;
+    for (name, spelled) in PRE {
+        let row: Json = serde_json::from_str(spelled).expect("a pre-tokenizer row is JSON");
+        if &row == pre {
+            let regex = row["pretokenizers"][0]["pattern"]["Regex"]
+                .as_str()
+                .expect("a pre-tokenizer row splits by a regex");
+            return Ok((name, regex.to_string()));
+        }
+    }
+    Err(bad(format!(
+        "tokenizer.json.pre_tokenizer {pre} is unsupported; supported rows: {}",
+        pre_names()
+    )))
 }
 
 /// `tokenizer.json`.
@@ -69,22 +140,24 @@ const TOKENIZER: &Fields = &[
     ("added_tokens", Read),
     // NFC is written as `tokenizer.ggml.normalizer`, which serving applies.
     ("normalizer", Only(r#"[null, {"type":"NFC"}]"#)),
-    (
-        "pre_tokenizer",
-        Need(concat!(
-            r#"[{"type":"Sequence","pretokenizers":[{"type":"Split","pattern":{"Regex":"#,
-            qwen35_regex!(),
-            r#"},"behavior":"Isolated","invert":false},"#,
-            byte_level!(),
-            "]}]"
-        )),
-    ),
-    // ByteLevel without trim_offsets moves no id, only offsets.
+    // The row it is, in `PRE`; the keys of `keys` take it from there.
+    ("pre_tokenizer", Read),
+    // ByteLevel without trim_offsets moves no id, only offsets; as a decoder its options move
+    // nothing.
     (
         "post_processor",
-        Only(concat!("[null, ", byte_level!(), "]")),
+        Only(concat!("[null, ", byte_level!(false, false, false), "]")),
     ),
-    ("decoder", Need(concat!("[", byte_level!(), "]"))),
+    (
+        "decoder",
+        Need(concat!(
+            "[",
+            byte_level!(false, false, false),
+            ",",
+            byte_level!(true, true, true),
+            "]"
+        )),
+    ),
     ("model", Read),
 ];
 
@@ -125,7 +198,7 @@ const TOKENIZER_CONFIG: &Fields = &[
     ("eos_token", Read),
     ("pad_token", Read),
     ("sep_token", Read),
-    ("unk_token", Only("[null]")),
+    ("unk_token", Read),
     ("add_bos_token", Read),
     ("add_eos_token", Read),
     ("chat_template", Read),
@@ -135,15 +208,15 @@ const TOKENIZER_CONFIG: &Fields = &[
     ("clean_up_tokenization_spaces", Only("[false]")),
     // Serving decodes invalid UTF-8 as U+FFFD.
     ("errors", Only(r#"["replace"]"#)),
-    (
-        "pretokenize_regex",
-        Only(concat!("[", qwen35_regex!(), "]")),
-    ),
+    // The regex of the pre-tokenizer row, when present.
+    ("pretokenize_regex", Read),
     // Each builds the tokenizer from tokenizer.json; `TokenizersBackend` is
     // transformers' class for a tokenizer.json with no class of its own.
     (
         "tokenizer_class",
-        Only(r#"["Qwen2Tokenizer", "Qwen2TokenizerFast", "TokenizersBackend"]"#),
+        Only(
+            r#"["Qwen2Tokenizer", "Qwen2TokenizerFast", "PreTrainedTokenizerFast", "TokenizersBackend"]"#,
+        ),
     ),
     (
         "model_max_length",
@@ -193,6 +266,13 @@ const GENERATION: &Fields = &[
     ("temperature", Ignore(Type::Number, SAMPLING)),
     ("top_k", Ignore(Type::Number, SAMPLING)),
     ("top_p", Ignore(Type::Number, SAMPLING)),
+    (
+        "transformers_version",
+        Ignore(
+            Type::String,
+            "the writer's library version; no id depends on it",
+        ),
+    ),
 ];
 
 /// An added token's object at `path`, `id` with its id: the keys [`TOKEN`] names and HF's
@@ -210,27 +290,6 @@ fn token(token: &Json, path: &str, id: bool) -> Result<(), Error> {
     }
 }
 
-/// The first pair of added tokens HF and serving would split differently: serving cuts the
-/// longest token out first, HF the leftmost. They agree when no token's proper suffix starts
-/// another token and is shorter than it (a token inside another is cut with it).
-fn overlap(added: &HashMap<u32, (&str, bool)>) -> Option<(u32, u32)> {
-    let mut ids: Vec<u32> = added.keys().copied().collect();
-    ids.sort_unstable();
-    for &a in &ids {
-        let left = added[&a].0.as_bytes();
-        for &b in &ids {
-            let right = added[&b].0.as_bytes();
-            if a != b
-                && (1..left.len())
-                    .any(|at| left.len() - at < right.len() && right.starts_with(&left[at..]))
-            {
-                return Some((a, b));
-            }
-        }
-    }
-    None
-}
-
 const SPECIAL: [(&str, &str); 5] = [
     ("bos", "bos_token_id"),
     ("eos", "eos_token_id"),
@@ -239,14 +298,19 @@ const SPECIAL: [(&str, &str); 5] = [
     ("pad", "padding_token_id"),
 ];
 
-/// The vocabulary domain and special ids selected from `config.json`.
+/// What a model's map tells the tokenizer reader: the vocabulary size and the special ids its
+/// `config.json` names, and optionally the [`PRE`] row its model has.
 #[derive(Debug)]
-pub struct Config {
+pub struct VocabSpec {
     size: u32,
     ids: [Option<Vec<u32>>; 5],
+    pre: Option<&'static str>,
 }
 
-impl Config {
+/// The name of [`VocabSpec`] before a folder's map held it.
+pub type Config = VocabSpec;
+
+impl VocabSpec {
     /// Read only the vocabulary fields, refusing malformed counts and ids by name.
     pub fn parse(config: &Json) -> Result<Self, Error> {
         let bad = |s: &str| Error::Vocab(s.into());
@@ -267,6 +331,7 @@ impl Config {
         let mut out = Self {
             size,
             ids: std::array::from_fn(|_| None),
+            pre: None,
         };
         for (i, (kind, _)) in SPECIAL.iter().enumerate() {
             let key = format!("{kind}_token_id");
@@ -278,6 +343,19 @@ impl Config {
                 .transpose()?;
         }
         Ok(out)
+    }
+
+    /// The model's tokenizer has the [`PRE`] row `name`: [`keys`] refuses a `tokenizer.json`
+    /// whose pre-tokenizer is another row. A name no row has is refused here.
+    pub fn with_pre(mut self, name: &'static str) -> Result<Self, Error> {
+        if !PRE.iter().any(|&(row, _)| row == name) {
+            return Err(Error::Vocab(format!(
+                "pre-tokenizer row {name:?} is not one of {}",
+                pre_names()
+            )));
+        }
+        self.pre = Some(name);
+        Ok(self)
     }
 
     pub fn size(&self) -> u32 {
@@ -338,7 +416,7 @@ fn vocabulary<'a>(
     model: &'a Json,
     tok: &'a Json,
     tc: &Json,
-    config: &Config,
+    spec: &VocabSpec,
 ) -> Result<Vocabulary<'a>, Error> {
     let bad = |what: String| Error::Vocab(what);
     let vocab = model["vocab"]
@@ -347,7 +425,7 @@ fn vocabulary<'a>(
     let mut by_id: HashMap<u32, &str> = HashMap::new();
     let mut by_name: HashMap<&str, u32> = HashMap::new();
     for (t, id) in vocab {
-        let id = config.token_id(&format!("model.vocab[{t:?}] id"), id)?;
+        let id = spec.token_id(&format!("model.vocab[{t:?}] id"), id)?;
         if by_id.contains_key(&id) {
             return Err(bad(format!("duplicate vocabulary id {id}")));
         }
@@ -367,7 +445,7 @@ fn vocabulary<'a>(
         .flatten()
         .enumerate()
     {
-        let id = config.token_id("added_tokens.id", &a["id"])?;
+        let id = spec.token_id("added_tokens.id", &a["id"])?;
         let t = a["content"]
             .as_str()
             .filter(|t| !t.is_empty())
@@ -384,12 +462,6 @@ fn vocabulary<'a>(
         by_name.insert(t, id);
         added.insert(id, (t, a["special"] == true));
         by_id.insert(id, t);
-    }
-    if let Some((a, b)) = overlap(&added) {
-        return Err(bad(format!(
-            "added tokens {a} {:?} and {b} {:?} overlap, which serving splits unlike HF",
-            added[&a].0, added[&b].0
-        )));
     }
     if let Some(decoder) = tc.get("added_tokens_decoder") {
         let decoder = decoder
@@ -433,7 +505,7 @@ fn vocabulary<'a>(
         }
     }
     let (mut tokens, mut types) = (Vec::new(), Vec::new());
-    for id in 0..config.size {
+    for id in 0..spec.size {
         let (t, ty) = match (by_id.get(&id), added.get(&id)) {
             (None, _) => {
                 let pad = format!("[PAD{id}]");
@@ -502,7 +574,7 @@ type SpecialIds = (Vec<(String, Value)>, Option<Vec<u32>>);
 fn special_ids(
     tc: &Json,
     generation: &Json,
-    config: &Config,
+    spec: &VocabSpec,
     added: &HashMap<u32, (&str, bool)>,
 ) -> Result<SpecialIds, Error> {
     let bad = |what: String| Error::Vocab(what);
@@ -523,7 +595,7 @@ fn special_ids(
         let generated = generation
             .get(&field)
             .filter(|v| !v.is_null())
-            .map(|v| config.token_ids(&field, v))
+            .map(|v| spec.token_ids(&field, v))
             .transpose()?;
         let id = match named {
             Some(t) => Some(
@@ -533,7 +605,7 @@ fn special_ids(
                     .map(|(&id, _)| id)
                     .ok_or_else(|| bad(format!("{kind}_token {t:?} is no added token")))?,
             ),
-            None => config.ids[i]
+            None => spec.ids[i]
                 .as_ref()
                 .or(generated.as_ref())
                 .and_then(|ids| ids.first().copied()),
@@ -541,9 +613,9 @@ fn special_ids(
         if *kind == "eos" {
             // HF's generate stops at any of these; serving at its end-of-generation ids.
             stop = generated
-                .or_else(|| config.ids[i].clone())
+                .or_else(|| spec.ids[i].clone())
                 .or(id.map(|id| vec![id]));
-        } else if let Some(other) = [&config.ids[i], &generated]
+        } else if let Some(other) = [&spec.ids[i], &generated]
             .into_iter()
             .flatten()
             .flatten()
@@ -566,16 +638,17 @@ fn special_ids(
 ///
 /// A file that cannot be read or parsed; in `tokenizer.json`, its `model`, an added token,
 /// `tokenizer_config.json` or `generation_config.json`, a key the tables of this module do not
-/// name or a value they do not allow; a `tokenizer.json` without its vocabulary or merges, or with
-/// a merge that is not two tokens without a space whose operands and joined token are all in its
-/// vocabulary; an added token whose id or content conflicts, or whose proper suffix
-/// starts another added token; a token spelled as an unused id's `[PAD<id>]`; a vocabulary size
+/// name or a value they do not allow; a pre-tokenizer no row of [`PRE`] spells or other than the
+/// row `spec` names, and a `pretokenize_regex` other than the row's; a `tokenizer.json` without
+/// its vocabulary or merges, or with a merge that is not two tokens without a space whose
+/// operands and joined token are all in its vocabulary; an added token whose id or content
+/// conflicts; a token spelled as an unused id's `[PAD<id>]`; a vocabulary size
 /// `config.json` does not give; a special token in `tokenizer_config.json` that is neither a
 /// string nor an added token's object, or that no added token spells; a special token id that is
 /// not an id or a list of them, lies outside the vocabulary, or is a BOS, pad, unknown or
 /// separator id other than the one exported; an `add_bos_token` or `add_eos_token` that is not
 /// boolean, and a `chat_template` that is not a string, each by name.
-pub fn keys(dir: &Path, config: &Config) -> Result<Keys, Error> {
+pub fn keys(dir: &Path, spec: &VocabSpec) -> Result<Keys, Error> {
     let bad = |what: String| Error::Vocab(what);
     let read = |file: &str| crate::read_json(dir, file, Error::Io, Error::Json);
     let tok = read("tokenizer.json")?.ok_or_else(|| bad("no tokenizer.json".into()))?;
@@ -588,6 +661,17 @@ pub fn keys(dir: &Path, config: &Config) -> Result<Keys, Error> {
     ] {
         schema::check(value, file, &[table]).map_err(bad)?;
     }
+    let (pre, regex) = pre_row(tok.get("pre_tokenizer"))?;
+    if let Some(expected) = spec.pre.filter(|&expected| expected != pre) {
+        return Err(bad(format!(
+            "tokenizer.json.pre_tokenizer is the {pre:?} row, where this model's is {expected:?}"
+        )));
+    }
+    if let Some(v) = tc.get("pretokenize_regex").filter(|&v| *v != regex) {
+        return Err(bad(format!(
+            "tokenizer_config.json.pretokenize_regex {v} is unsupported; the {pre:?} row splits by {regex:?}"
+        )));
+    }
     let model = tok
         .get("model")
         .ok_or_else(|| bad("tokenizer.json has no model".into()))?;
@@ -598,16 +682,13 @@ pub fn keys(dir: &Path, config: &Config) -> Result<Keys, Error> {
         types,
         merges,
         added,
-    } = vocabulary(model, &tok, &tc, config)?;
+    } = vocabulary(model, &tok, &tc, spec)?;
     let mut out = vec![
         (
             "tokenizer.ggml.model".to_string(),
             Value::String("gpt2".into()),
         ),
-        (
-            "tokenizer.ggml.pre".to_string(),
-            Value::String("qwen35".into()),
-        ),
+        ("tokenizer.ggml.pre".to_string(), Value::String(pre.into())),
         ("tokenizer.ggml.tokens".to_string(), Value::Array(tokens)),
         ("tokenizer.ggml.token_type".to_string(), Value::Array(types)),
         ("tokenizer.ggml.merges".to_string(), Value::Array(merges)),
@@ -618,7 +699,7 @@ pub fn keys(dir: &Path, config: &Config) -> Result<Keys, Error> {
             Value::String("NFC".into()),
         ));
     }
-    let (ids, stop) = special_ids(&tc, &generation, config, &added)?;
+    let (ids, stop) = special_ids(&tc, &generation, spec, &added)?;
     out.extend(ids);
     for kind in ["bos", "eos"] {
         let key = format!("add_{kind}_token");
@@ -680,9 +761,14 @@ mod tests {
         super::keys(dir, &Config::parse(&config)?).map(|k| k.keys)
     }
 
+    /// A folder of `files` of its own: named by the process and the calling test, which runs on a
+    /// thread of that name.
     fn repo(files: &[(&str, &str)]) -> std::path::PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("hf-vocab-{}-{}", std::process::id(), files.len()));
+        let test = std::thread::current()
+            .name()
+            .unwrap_or("main")
+            .replace("::", "-");
+        let dir = std::env::temp_dir().join(format!("hf-vocab-{}-{test}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         for (name, text) in files {
             std::fs::write(dir.join(name), text).unwrap();
@@ -861,7 +947,7 @@ mod tests {
 
     /// The schema tables row by row: for every key of every table, one value accepted and one
     /// refused by the key's name, a key no table names refused in each object, and added tokens
-    /// that overlap, which serving would split unlike HF.
+    /// that overlap accepted.
     #[test]
     fn every_tokenizer_key_accepts_its_values_and_refuses_others() {
         use serde_json::json;
@@ -957,7 +1043,7 @@ mod tests {
             ["tokenizer_config.json", "", "eos_token", {"content":"<|im_end|>","special":true}, 7],
             ["tokenizer_config.json", "", "pad_token", "<|im_end|>", {"content":"<|im_end|>","lstrip":true}],
             ["tokenizer_config.json", "", "sep_token", null, "missing"],
-            ["tokenizer_config.json", "", "unk_token", null, "<|im_end|>"],
+            ["tokenizer_config.json", "", "unk_token", "<|im_end|>", "missing"],
             ["tokenizer_config.json", "", "add_bos_token", false, "yes"],
             ["tokenizer_config.json", "", "add_eos_token", false, 1],
             ["tokenizer_config.json", "", "chat_template", "t", [{"template":"t"}]],
@@ -967,7 +1053,7 @@ mod tests {
             ["tokenizer_config.json", "", "clean_up_tokenization_spaces", false, true],
             ["tokenizer_config.json", "", "errors", "replace", "ignore"],
             ["tokenizer_config.json", "", "pretokenize_regex", "$", "different"],
-            ["tokenizer_config.json", "", "tokenizer_class", "Qwen2Tokenizer", "LlamaTokenizer"],
+            ["tokenizer_config.json", "", "tokenizer_class", "PreTrainedTokenizerFast", "LlamaTokenizer"],
             ["tokenizer_config.json", "", "model_max_length", 262144, "long"],
             ["tokenizer_config.json", "", "backend", "tokenizers", "sentencepiece"],
             ["tokenizer_config.json", "", "is_local", true, "yes"],
@@ -986,7 +1072,8 @@ mod tests {
             ["generation_config.json", "", "do_sample", true, "yes"],
             ["generation_config.json", "", "temperature", 1.0, "hot"],
             ["generation_config.json", "", "top_k", 20, "20"],
-            ["generation_config.json", "", "top_p", 0.95, [0.95]]
+            ["generation_config.json", "", "top_p", 0.95, [0.95]],
+            ["generation_config.json", "", "transformers_version", "4.46.1", 4]
         ]"###)
         .unwrap();
         let mut missed = vec![];
@@ -1032,15 +1119,14 @@ mod tests {
                 other => missed.push(format!("merge {merge}: {other:?}")),
             }
         }
-        // A token inside another and a token overlapping itself split alike; a suffix of one
-        // starting another does not ("xy" then "yzw" in "xyzw": HF takes "xy", serving "yzw").
-        for (texts, refused) in [
-            (["xyz", "y"], false),
-            (["xyx", "q"], false),
-            (["xy", "yzw"], true),
-            (["yzw", "xy"], true),
-            (["xxy", "xyz"], true),
-            (["xxxy", "xyz"], true),
+        // Added tokens may overlap: serving splits on them as HF does (crates/tokenizer).
+        for texts in [
+            ["xyz", "y"],
+            ["xyx", "q"],
+            ["xy", "yzw"],
+            ["yzw", "xy"],
+            ["xxy", "xyz"],
+            ["xxxy", "xyz"],
         ] {
             let mut files = base.clone();
             let tokens = texts
@@ -1051,10 +1137,8 @@ mod tests {
                 .as_array_mut()
                 .unwrap()
                 .extend(tokens);
-            match (run(&files), refused) {
-                (Err(e), true) if e.to_string().contains("overlap") => {}
-                (Ok(_), false) => {}
-                (other, _) => missed.push(format!("added tokens {texts:?}: {other:?}")),
+            if let Err(e) = run(&files) {
+                missed.push(format!("added tokens {texts:?}: {e}"));
             }
         }
         for name in base.keys() {
@@ -1062,5 +1146,351 @@ mod tests {
         }
         std::fs::remove_dir(&dir).unwrap();
         assert!(missed.is_empty(), "{}", missed.join("\n"));
+    }
+
+    /// MiniMax's tokenizer files as shipped (its pre-tokenizer, decoder, `tokenizer_class`,
+    /// `unk_token` and `transformers_version`) over a vocabulary cut to a few tokens, among them
+    /// special tokens that overlap.
+    fn minimax_files() -> Vec<(&'static str, String)> {
+        use serde_json::json;
+        let regex = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+        let token = |id: u32, content: &str, special: bool| {
+            json!({"id":id,"content":content,"single_word":false,"lstrip":false,"rstrip":false,
+                "normalized":false,"special":special})
+        };
+        let decoded = |content: &str, special: bool| {
+            json!({"content":content,"lstrip":false,"normalized":false,"rstrip":false,
+                "single_word":false,"special":special})
+        };
+        let tokenizer = json!({"version":"1.0","truncation":null,"padding":null,
+            "added_tokens":[token(5, "]!p~[", true), token(6, "]~b]", true), token(7, "[e~[", true),
+                token(8, "<think>", false)],
+            "normalizer":{"type":"NFC"},
+            "pre_tokenizer":{"type":"Sequence","pretokenizers":[
+                {"type":"Split","pattern":{"Regex":regex},"behavior":"Removed","invert":true},
+                {"type":"ByteLevel","add_prefix_space":false,"trim_offsets":true,"use_regex":false}]},
+            "post_processor":null,
+            "decoder":{"type":"ByteLevel","add_prefix_space":true,"trim_offsets":true,"use_regex":true},
+            "model":{"type":"BPE","dropout":null,"unk_token":null,"continuing_subword_prefix":"",
+                "end_of_word_suffix":"","fuse_unk":false,"byte_fallback":false,
+                "vocab":{"a":0,"b":1,"ab":2},"merges":["a b"]}});
+        let config = json!({"add_prefix_space":false,
+            "added_tokens_decoder":{"5":decoded("]!p~[", true),"6":decoded("]~b]", true),
+                "7":decoded("[e~[", true),"8":decoded("<think>", false)},
+            "bos_token":"]~b]","clean_up_tokenization_spaces":false,"eos_token":"[e~[",
+            "pad_token":"]!p~[","model_max_length":40960000,"tokenizer_class":"PreTrainedTokenizerFast",
+            "unk_token":"[e~["});
+        let generation = json!({"bos_token_id":6,"do_sample":true,"eos_token_id":7,"temperature":1.0,
+            "top_p":0.95,"transformers_version":"4.46.1"});
+        vec![
+            ("tokenizer.json", tokenizer.to_string()),
+            ("tokenizer_config.json", config.to_string()),
+            ("generation_config.json", generation.to_string()),
+            (
+                "config.json",
+                json!({"model_type":"minimax_m3_vl","text_config":{"vocab_size":12}}).to_string(),
+            ),
+            ("chat_template.jinja", "{{ messages }}".to_string()),
+        ]
+    }
+
+    fn minimax_repo(edit: impl FnOnce(&mut Json, &mut Json)) -> std::path::PathBuf {
+        let mut files = minimax_files();
+        let (mut tokenizer, mut config) = (
+            serde_json::from_str(&files[0].1).unwrap(),
+            serde_json::from_str(&files[1].1).unwrap(),
+        );
+        edit(&mut tokenizer, &mut config);
+        files[0].1 = tokenizer.to_string();
+        files[1].1 = config.to_string();
+        repo(
+            &files
+                .iter()
+                .map(|(n, t)| (*n, t.as_str()))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    fn spec_of(dir: &Path) -> VocabSpec {
+        let config = crate::read_json(dir, "config.json", Error::Io, Error::Json).unwrap();
+        VocabSpec::parse(&config.unwrap()).unwrap()
+    }
+
+    fn remove(dir: &Path) {
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A tokenizer whose pre-tokenizer is MiniMax's is written as the `minimax-m2` row, with the
+    /// special ids by name (its `unk_token` is its eos), the stop id from `generation_config.json`
+    /// and the chat template as the file has it. The row is the pre-tokenizer's, not a constant:
+    /// the same files with Qwen's pre-tokenizer are `qwen35`.
+    #[test]
+    fn a_minimax_tokenizer_is_the_minimax_m2_row() {
+        let dir = minimax_repo(|_, _| {});
+        let keys = super::keys(&dir, &spec_of(&dir)).unwrap();
+        let value = |key: &str| get(&keys.keys, key).cloned();
+        assert_eq!(
+            value("tokenizer.ggml.pre"),
+            Some(Value::String("minimax-m2".into()))
+        );
+        for (key, id) in [
+            ("bos_token_id", 6),
+            ("eos_token_id", 7),
+            ("unknown_token_id", 7),
+        ] {
+            assert_eq!(
+                value(&format!("tokenizer.ggml.{key}")),
+                Some(Value::U32(id)),
+                "{key}"
+            );
+        }
+        assert_eq!(
+            value("tokenizer.ggml.padding_token_id"),
+            Some(Value::U32(5))
+        );
+        assert_eq!(keys.stop, [7]);
+        assert_eq!(keys.added, [5, 6, 7, 8]);
+        assert_eq!(
+            value("tokenizer.ggml.normalizer"),
+            Some(Value::String("NFC".into()))
+        );
+        assert_eq!(
+            value("tokenizer.chat_template"),
+            Some(Value::String("{{ messages }}".into()))
+        );
+        let types = [1, 1, 1, 5, 5, 3, 3, 3, 4, 5, 5, 5].map(Value::I32);
+        assert_eq!(
+            value("tokenizer.ggml.token_type"),
+            Some(Value::Array(types.to_vec()))
+        );
+        remove(&dir);
+
+        let qwen = PRE[0].1;
+        let dir = minimax_repo(|tokenizer, config| {
+            tokenizer["pre_tokenizer"] = serde_json::from_str(qwen).unwrap();
+            config.as_object_mut().unwrap().remove("unk_token");
+        });
+        let keys = super::keys(&dir, &spec_of(&dir)).unwrap();
+        assert_eq!(
+            get(&keys.keys, "tokenizer.ggml.pre"),
+            Some(&Value::String("qwen35".into()))
+        );
+        remove(&dir);
+    }
+
+    /// A pre-tokenizer no row spells is refused by name, one character of the regex off, a
+    /// `Split` that keeps the gaps beside MiniMax's regex, and a lone `ByteLevel`; so is a
+    /// `pretokenize_regex` that is another row's.
+    #[test]
+    fn a_pre_tokenizer_no_row_spells_is_refused() {
+        let regex = |tokenizer: &mut Json| {
+            tokenizer["pre_tokenizer"]["pretokenizers"][0]["pattern"]["Regex"].take()
+        };
+        for (what, edit) in [
+            (
+                "one regex character",
+                Box::new(|t: &mut Json, _: &mut Json| {
+                    let r = regex(t).as_str().unwrap().replace("{1,3}", "{1,4}");
+                    t["pre_tokenizer"]["pretokenizers"][0]["pattern"]["Regex"] = r.into();
+                }) as Box<dyn Fn(&mut Json, &mut Json)>,
+            ),
+            (
+                "the gaps kept",
+                Box::new(|t: &mut Json, _: &mut Json| {
+                    t["pre_tokenizer"]["pretokenizers"][0]["behavior"] = "Isolated".into();
+                    t["pre_tokenizer"]["pretokenizers"][0]["invert"] = false.into();
+                }),
+            ),
+            (
+                "a lone ByteLevel",
+                Box::new(|t: &mut Json, _: &mut Json| {
+                    t["pre_tokenizer"] = t["pre_tokenizer"]["pretokenizers"][1].clone();
+                }),
+            ),
+            (
+                "another row's pretokenize_regex",
+                Box::new(|_: &mut Json, c: &mut Json| {
+                    let qwen: Json = serde_json::from_str(PRE[0].1).unwrap();
+                    c["pretokenize_regex"] = qwen["pretokenizers"][0]["pattern"]["Regex"].clone();
+                }),
+            ),
+        ] {
+            let dir = minimax_repo(|t, c| edit(t, c));
+            let e = super::keys(&dir, &spec_of(&dir)).unwrap_err().to_string();
+            assert!(
+                e.contains("pre_tokenizer") || e.contains("pretokenize_regex"),
+                "{what}: {e}"
+            );
+            assert!(e.contains("unsupported"), "{what}: {e}");
+            remove(&dir);
+        }
+        let dir = minimax_repo(|t, c| {
+            let own = t["pre_tokenizer"]["pretokenizers"][0]["pattern"]["Regex"].clone();
+            c["pretokenize_regex"] = own;
+        });
+        super::keys(&dir, &spec_of(&dir)).unwrap();
+        remove(&dir);
+    }
+
+    /// A spec that names a row accepts that row and refuses another by both names; a name no row
+    /// has is refused when the spec is made.
+    #[test]
+    fn a_spec_names_its_pre_row() {
+        let dir = minimax_repo(|_, _| {});
+        super::keys(&dir, &spec_of(&dir).with_pre("minimax-m2").unwrap()).unwrap();
+        let e = super::keys(&dir, &spec_of(&dir).with_pre("qwen35").unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("minimax-m2") && e.contains("qwen35") && e.contains("pre_tokenizer"),
+            "{e}"
+        );
+        let e = spec_of(&dir).with_pre("qwen36").unwrap_err().to_string();
+        assert!(
+            e.contains("qwen36") && e.contains("minimax-m2") && e.contains("qwen35"),
+            "{e}"
+        );
+        remove(&dir);
+    }
+
+    /// The rows are distinct pipelines under distinct names, each one `tokenizer.json`'s
+    /// `pre_tokenizer` accepts, and every one of the schema's allowed pre-tokenizer values is a row.
+    #[test]
+    fn the_pre_rows_are_distinct_and_accepted() {
+        let names: std::collections::BTreeSet<_> = PRE.iter().map(|r| r.0).collect();
+        let rows: Vec<Json> = PRE
+            .iter()
+            .map(|r| serde_json::from_str(r.1).unwrap())
+            .collect();
+        assert_eq!(names.len(), PRE.len());
+        for (i, a) in rows.iter().enumerate() {
+            assert!(rows[..i].iter().all(|b| a != b), "{}", PRE[i].0);
+            assert_eq!(pre_row(Some(a)).unwrap().0, PRE[i].0);
+        }
+    }
+
+    /// Feed a key's value to a digest: a tag, then the value's bytes, a string and an array
+    /// behind their length (u32 little endian), a number as its little endian bytes.
+    fn feed(h: &mut sha2::Sha256, value: &Value) {
+        use sha2::Digest;
+        match value {
+            Value::String(s) => {
+                h.update(b"s");
+                h.update(u32::try_from(s.len()).unwrap().to_le_bytes());
+                h.update(s.as_bytes());
+            }
+            Value::U32(n) => {
+                h.update(b"u");
+                h.update(n.to_le_bytes());
+            }
+            Value::I32(n) => {
+                h.update(b"i");
+                h.update(n.to_le_bytes());
+            }
+            Value::Bool(b) => h.update([b'b', u8::from(*b)]),
+            Value::Array(items) => {
+                h.update(b"[");
+                h.update(u32::try_from(items.len()).unwrap().to_le_bytes());
+                items.iter().for_each(|item| feed(h, item));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The digest of a value: of one array key, or of every key in order with its name.
+    fn digest(keys: &[(String, Value)], only: Option<&str>) -> String {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        for (key, value) in keys.iter().filter(|(k, _)| only.is_none_or(|o| o == k)) {
+            if only.is_none() {
+                h.update(u32::try_from(key.len()).unwrap().to_le_bytes());
+                h.update(key.as_bytes());
+            }
+            feed(&mut h, value);
+        }
+        format!("{:x}", h.finalize())
+    }
+
+    fn folder(var: &str) -> std::path::PathBuf {
+        std::path::PathBuf::from(
+            std::env::var_os(var).unwrap_or_else(|| panic!("${var} names the folder")),
+        )
+    }
+
+    fn derive(dir: &Path) -> Keys {
+        super::keys(dir, &spec_of(dir)).unwrap()
+    }
+
+    /// The digest of every key `keys` derives from nvidia/Qwen3.8-Flash-Next-NVFP4's folder,
+    /// from the reader as it was before the rows of [`PRE`].
+    const QWEN38_KEYS: &str = "09dc38b98d7a8cb075c361de2671df46e4b8631b33394987b237d71921834f2b";
+
+    /// Qwen3.8-Flash-Next's vocabulary is the one `keys` derived before the pre-tokenizer rows.
+    #[test]
+    #[ignore = "needs the nvidia/Qwen3.8-Flash-Next-NVFP4 tokenizer files and config.json at $BLOOMERY_QWEN38_HF"]
+    fn hw_the_qwen38_vocabulary_is_unchanged() {
+        let keys = derive(&folder("BLOOMERY_QWEN38_HF"));
+        assert_eq!(
+            get(&keys.keys, "tokenizer.ggml.pre"),
+            Some(&Value::String("qwen35".into()))
+        );
+        assert_eq!(digest(&keys.keys, None), QWEN38_KEYS);
+    }
+
+    /// MiniMax-M3.1-Flash's folder derives MiniMax-M3's GGUF vocabulary (unsloth's UD-IQ4_XS first
+    /// shard, whose header the digests were taken from): the `minimax-m2` row, 200,064 tokens with
+    /// their types, 199,744 merges, and bos, eos and pad ids, but for id 16474. The GGUF spells it
+    /// U+FFFD as a control token and makes it the unknown token; the folder's is HF's, `ï¿½`
+    /// as a normal token, and its `unk_token` is the eos.
+    #[test]
+    #[ignore = "needs MiniMaxAI/MiniMax-M3.1-Flash's tokenizer files and config.json at $BLOOMERY_MM31_HF"]
+    fn hw_the_minimax_folder_derives_the_m3_gguf_vocabulary() {
+        let dir = folder("BLOOMERY_MM31_HF");
+        let keys = derive(&dir);
+        let value = |key: &str| get(&keys.keys, &format!("tokenizer.ggml.{key}"));
+        assert_eq!(value("pre"), Some(&Value::String("minimax-m2".into())));
+        assert_eq!(value("model"), Some(&Value::String("gpt2".into())));
+        for (key, id) in [
+            ("bos_token_id", 200_019),
+            ("eos_token_id", 200_020),
+            ("padding_token_id", 200_000),
+            ("unknown_token_id", 200_020),
+        ] {
+            assert_eq!(value(key), Some(&Value::U32(id)), "{key}");
+        }
+        assert_eq!(keys.stop, [200_020]);
+        for (key, n, pin) in [
+            (
+                "tokens",
+                200_064,
+                "f02f13cde2895d89e272a17827acd63bc96e6838832099e0192638d71c0fc613",
+            ),
+            (
+                "token_type",
+                200_064,
+                "8b65e4928e9e3c81a52ff904e38bd650eac3aa0db04f7b03c26fd3b66ae8a8d0",
+            ),
+            (
+                "merges",
+                199_744,
+                "551be7213251dff64497a95d99d1f82680e630e16ac78ebf0c80a4d78543072d",
+            ),
+        ] {
+            let Some(Value::Array(a)) = value(key) else {
+                panic!("{key} is no array");
+            };
+            assert_eq!(a.len(), n, "{key}");
+            assert_eq!(
+                digest(&keys.keys, Some(&format!("tokenizer.ggml.{key}"))),
+                pin,
+                "{key}"
+            );
+        }
+        let template = std::fs::read_to_string(dir.join("chat_template.jinja")).unwrap();
+        assert_eq!(template.len(), 11_633);
+        assert_eq!(
+            get(&keys.keys, "tokenizer.chat_template"),
+            Some(&Value::String(template))
+        );
     }
 }

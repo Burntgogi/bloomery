@@ -1,8 +1,12 @@
 //! P4: every kernel of a decode step that is not a matmul, attention or the
-//! router — the embedding row dequant, rms_norm, rope (the YaRN cos/sin cache
+//! router — the embedding row dequant, rms_norm, the gain-scaled RMS norm
+//! (`gain_rms_norm`), rope (the YaRN cos/sin cache
 //! is computed on the host and uploaded; the kernel applies it), swiglu and
 //! the tanh GELU-gated unit (`geglu_tanh`, [`crate::gelu`]'s rule), the
-//! residual add, the routed-expert weighted sum and argmax. One
+//! residual add and the two-branch gain mix (`mix_rows`), the elementwise
+//! product of two vectors (`mul_rows`), the in-place scalar `scale_rows`, the
+//! routed-expert weighted sum and argmax, and the head's
+//! logit softcap (`softcap_rows`). One
 //! `#[cuda_module]` in its own file (docs/gpu-design.md decision 6); the
 //! arithmetic bodies are cores above the module so a later fused block kernel
 //! can call the same bodies.
@@ -29,7 +33,7 @@ use crate::tensor::DeviceTensor;
 use crate::view::{Apply, Elem, Elem2, RopePair};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::atomic::{AtomicOrdering, DeviceAtomicU32};
-use cuda_device::float::mul_rn_f32;
+use cuda_device::float::{add_rn_f32, mul_rn_f32};
 use cuda_device::{
     DisjointSlice, SharedArray, kernel, launch_bounds, launch_contract, thread, warp,
 };
@@ -1201,6 +1205,43 @@ mod elem_kernels {
         e.map(|g, u| crate::kquant::act::situ(g, u, beta, crate::kquant::act::SITU_LINEAR_BETA));
     }
 
+    /// `y[i] = rule(gate[i], up[i])`, elementwise over `n` values, under a
+    /// gate·up rule of the K-quant family (`kquant::act::apply_checked`):
+    /// ik's clamped SwiGLU at `limit` (`ACT_SWIGLU_CLAMP`), the OAI SwiGLU at
+    /// `limit` (`ACT_SWIGLU_OAI`), SiTU at beta `limit` (`ACT_SITU`) or
+    /// `silu_mul` (`ACT_SILU_MUL`); the contract admits those four codes
+    /// alone. The f32 rows an f32-form down reads, each value the one the
+    /// rule's quantizing entries quantize. A non-finite gate or up value
+    /// writes NaN and raises [`FaultSite::F32Product`]: a clamp would carry it
+    /// to a finite value.
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (act <= 3, gate.len() >= n, up.len() >= n, y.len() >= n)
+    )]
+    pub fn swiglu_rule_rows(
+        gate: &[f32],
+        up: &[f32],
+        n: u32,
+        act: u32,
+        limit: f32,
+        fault: FaultSink,
+        mut y: DisjointSlice<f32>,
+    ) {
+        let i = thread::index_1d().get();
+        if i >= n as usize {
+            return;
+        }
+        // SAFETY: the `requires` above were launcher-checked, `n` is this
+        // kernel's parameter and `i` this thread's `index_1d` past the `i < n`
+        // guard, and the launch is `domain = 1` with the contract's exact 1-D
+        // block.
+        let e = unsafe { Elem2::new(gate, up, &mut y, i) };
+        e.map(|g, u| crate::kquant::act::apply_checked(act, limit, g, u, fault));
+    }
+
     /// `y[i] = max(x[i], 0)^2` over `n` values. A non-finite input is copied
     /// as it is: `max` of a non-finite is not this rule, and the square of
     /// `−inf` is not 0.
@@ -1279,6 +1320,196 @@ mod elem_kernels {
             let v = *y.get_unchecked_mut(i);
             *y.get_unchecked_mut(i) =
                 crate::route_core::router_score::<crate::route_core::SqrtSoftplus>(v);
+        }
+    }
+
+    /// `y[i] = cap·tanh(y[i]/cap)` over `n` values, in place — the head's
+    /// logit softcap epilogue (`x/cap → tanh → ·cap`). A NaN logit stays NaN
+    /// and ±inf maps to ±cap, tanh's own limits: the rule's values, not a
+    /// clamp, and no fault (the reference computes the same).
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (y.len() >= n)
+    )]
+    pub fn softcap_rows(mut y: DisjointSlice<f32>, n: u32, cap: f32) {
+        let i = thread::index_1d().get();
+        if i >= n as usize {
+            return;
+        }
+        // SAFETY: i < n <= y.len() by the launch contract; thread i owns
+        // entry i.
+        unsafe {
+            let v = *y.get_unchecked_mut(i);
+            *y.get_unchecked_mut(i) = mul_rn_f32((v / cap).tanh(), cap);
+        }
+    }
+
+    /// `y[i] = a[i] · b[i]`, elementwise over `n` values — one rounded
+    /// multiply, the product of two vectors (a gate's rows and the values it
+    /// gates). Exact in the one op; nothing is extracted into a core.
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (a.len() >= n, b.len() >= n, y.len() >= n)
+    )]
+    pub fn mul_rows(a: &[f32], b: &[f32], n: u32, mut y: DisjointSlice<f32>) {
+        let i = thread::index_1d().get();
+        if i >= n as usize {
+            return;
+        }
+        // SAFETY: i < n <= a.len(), b.len() and y.len() by the launch
+        // contract; thread i owns entry i of each.
+        let e = unsafe { Elem2::new(a, b, &mut y, i) };
+        e.map(mul_rn_f32);
+    }
+
+    /// `y[i] = a[i] · ga[i] + b[i] · gb[i]`, elementwise over `n` values —
+    /// the residual mix of two branches, each scaled by its own gain vector:
+    /// three roundings (two products, one sum), as the graph's two MUL nodes
+    /// and one ADD node produce.
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            a.len() >= n,
+            ga.len() >= n,
+            b.len() >= n,
+            gb.len() >= n,
+            y.len() >= n
+        )
+    )]
+    pub fn mix_rows(
+        a: &[f32],
+        ga: &[f32],
+        b: &[f32],
+        gb: &[f32],
+        n: u32,
+        mut y: DisjointSlice<f32>,
+    ) {
+        let i = thread::index_1d().get();
+        if i >= n as usize {
+            return;
+        }
+        // SAFETY: i < n <= every input's and y's length by the launch
+        // contract; thread i owns entry i of each.
+        unsafe {
+            let (av, gav) = (*a.get_unchecked(i), *ga.get_unchecked(i));
+            let (bv, gbv) = (*b.get_unchecked(i), *gb.get_unchecked(i));
+            *y.get_unchecked_mut(i) = add_rn_f32(mul_rn_f32(av, gav), mul_rn_f32(bv, gbv));
+        }
+    }
+
+    /// `y[i] = s · y[i]` over the first `n` values, in place — a scalar on
+    /// the head's logits before their softcap. `s` finite and nonzero: any
+    /// other is refused by name on the host, for it would read every value as
+    /// ±inf or NaN.
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(domain = 1, block = (256, 1, 1), requires = (y.len() >= n))]
+    pub fn scale_rows(mut y: DisjointSlice<f32>, n: u32, s: f32) {
+        let i = thread::index_1d().get();
+        if i >= n as usize {
+            return;
+        }
+        // SAFETY: i < n <= y.len() by the launch contract; thread i owns
+        // entry i.
+        unsafe {
+            let v = *y.get_unchecked_mut(i);
+            *y.get_unchecked_mut(i) = mul_rn_f32(v, s);
+        }
+    }
+
+    /// The RMS norm at `eps` of each row of `k` values of `x` after the row
+    /// is scaled by the gain `gain` (`ggml_rms_norm(ggml_mul(x, gain),
+    /// eps)`, one [`RMS_THREADS`] block a row): each value's product
+    /// `gv = gain·x` rounded once ([`mul_rn_f32`], the separate MUL node's
+    /// bit), the squares of those products summed in [`rms_partial_sq`]'s
+    /// order, the scale from [`rms_scale_checked`], then `scale · gv` a value
+    /// — the product recomputed, the same two roundings the graph's MUL and
+    /// NORM nodes make. A scale that is not finite and positive raises
+    /// [`FaultSite::F32Product`] from lane 0 and comes back NaN.
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (x.len() >= k * m, gain.len() >= k, y.len() >= k * m)
+    )]
+    pub fn gain_rms_norm(
+        x: &[f32],
+        gain: &[f32],
+        eps: f32,
+        k: u32,
+        m: u32,
+        fault: FaultSink,
+        mut y: DisjointSlice<f32>,
+    ) {
+        static mut WSUM: SharedArray<f32, RMS_WARPS> = SharedArray::UNINIT;
+
+        let t = thread::blockIdx_x() as usize;
+        if t >= m as usize {
+            return;
+        }
+        let tid = thread::threadIdx_x() as usize;
+        let k = k as usize;
+        let base = t * k;
+        // The row's gained values, one product a value in the caller's fixed
+        // thread order, squared and summed as `rms_partial_sq` sums a plain
+        // row's.
+        let mut acc = 0.0f32;
+        let mut it = tid;
+        while it < k {
+            // SAFETY: base + it < base + k = (t + 1)·k <= m·k <= x.len() (the
+            // `t < m` guard and the launch contract); it < k <= gain.len().
+            let gv = unsafe { mul_rn_f32(*gain.get_unchecked(it), *x.get_unchecked(base + it)) };
+            // `gv·gv + acc`, the same square fold as `rms_partial_sq`.
+            acc = gv.mul_add(gv, acc);
+            it += RMS_THREADS;
+        }
+        // SAFETY: WSUM is this block's own shared allocation; the raw form is
+        // the only way to reach it without a reference to a `static mut`.
+        // Every access is below RMS_WARPS and ordered by `sync_threads`.
+        let ws = unsafe { SharedArray::as_raw_mut_ptr(&raw mut WSUM) };
+        let part = warp::reduce_sum_f32(acc);
+        if warp::lane_id() == 0 {
+            // SAFETY: tid / 32 < RMS_WARPS; one lane per warp writes its slot.
+            unsafe {
+                *ws.add(tid / 32) = part;
+            }
+        }
+        thread::sync_threads();
+        // SAFETY: every slot was written above and is visible past the
+        // barrier.
+        let sums = unsafe {
+            [
+                *ws.add(0),
+                *ws.add(1),
+                *ws.add(2),
+                *ws.add(3),
+                *ws.add(4),
+                *ws.add(5),
+                *ws.add(6),
+                *ws.add(7),
+            ]
+        };
+        let scale = rms_scale_checked(rms_warp_tree(sums), k as u32, eps, fault, tid == 0);
+        let mut it = tid;
+        while it < k {
+            // SAFETY: the bounds of the summing loop's, and base + it <
+            // m·k <= y.len() by the launch contract; thread `tid` owns values
+            // tid, tid + RMS_THREADS, … of the row.
+            unsafe {
+                let gv = mul_rn_f32(*gain.get_unchecked(it), *x.get_unchecked(base + it));
+                *y.get_unchecked_mut(base + it) = mul_rn_f32(scale, gv);
+            }
+            it += RMS_THREADS;
         }
     }
 
@@ -2405,6 +2636,41 @@ impl ElemKernels {
         Ok(())
     }
 
+    /// Enqueue `y = rule(gate, up)` over `n` values (flat; token-major spans
+    /// of any width) into f32 rows ([`ElemKernels`]' `swiglu_rule_rows`): any
+    /// gate·up rule [`crate::kquant::Act::code`] admits, one it refuses
+    /// refused by name. A non-finite gate or up value is NaN in `y` and
+    /// raised on `fault`. Asynchronous, allocation-free, capturable.
+    pub fn enqueue_swiglu_rule(
+        &self,
+        stream: &CudaStream,
+        rule: crate::kquant::Act,
+        (gate, up): (&DeviceBuffer<f32>, &DeviceBuffer<f32>),
+        n: usize,
+        (fault, y): (FaultSink, &mut DeviceBuffer<f32>),
+    ) -> Result<(), GpuError> {
+        let what = "enqueue_swiglu_rule";
+        let (act, limit) = rule.code(what)?;
+        if n == 0 || gate.len() < n || up.len() < n || y.len() < n {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "n={n}, gate.len() {}, up.len() {}, y.len() {}",
+                    gate.len(),
+                    up.len(),
+                    y.len()
+                ),
+            ));
+        }
+        let n = launch_u32(what, "n", n)?;
+        let prep =
+            self.module
+                .prepare_swiglu_rule_rows(LaunchConfig1D::new(n.div_ceil(256), 256, 0))?;
+        self.module
+            .swiglu_rule_rows(stream, &prep, gate, up, n, act, limit, fault, y)?;
+        Ok(())
+    }
+
     /// Enqueue `y = max(x, 0)^2` over `n` values (flat). A non-finite input
     /// stays that value. Asynchronous, allocation-free, capturable.
     pub fn enqueue_relu_sqr(
@@ -2447,6 +2713,183 @@ impl ElemKernels {
             self.module
                 .prepare_sigmoid_rows(LaunchConfig1D::new(n.div_ceil(256), 256, 0))?;
         self.module.sigmoid_rows(stream, &prep, y, n)?;
+        Ok(())
+    }
+
+    /// Enqueue `y[i] = cap·tanh(y[i]/cap)` over the first `n` values of `y`,
+    /// in place (the head's logit softcap epilogue). `cap` is finite and
+    /// nonzero: any other is refused by name, for it would read every logit
+    /// as ±inf or NaN and write a constant. Asynchronous, allocation-free,
+    /// capturable.
+    pub fn enqueue_softcap_rows(
+        &self,
+        stream: &CudaStream,
+        y: &mut DeviceBuffer<f32>,
+        n: usize,
+        cap: f32,
+    ) -> Result<(), GpuError> {
+        let what = "enqueue_softcap_rows";
+        if n == 0 || y.len() < n {
+            return Err(GpuError::shape(what, format!("n={n}, y.len() {}", y.len())));
+        }
+        if !cap.is_finite() || cap == 0.0 {
+            return Err(GpuError::shape(
+                what,
+                format!("the softcap {cap} must be finite and nonzero"),
+            ));
+        }
+        let n = launch_u32(what, "n", n)?;
+        let prep =
+            self.module
+                .prepare_softcap_rows(LaunchConfig1D::new(n.div_ceil(256), 256, 0))?;
+        self.module.softcap_rows(stream, &prep, y, n, cap)?;
+        Ok(())
+    }
+
+    /// Enqueue `y[i] = a[i] · b[i]` over `n` values (flat): one rounded
+    /// multiply. Asynchronous, allocation-free, capturable.
+    pub fn enqueue_mul_rows(
+        &self,
+        stream: &CudaStream,
+        a: &DeviceBuffer<f32>,
+        b: &DeviceBuffer<f32>,
+        n: usize,
+        y: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        if n == 0 || a.len() < n || b.len() < n || y.len() < n {
+            return Err(GpuError::shape(
+                "enqueue_mul_rows",
+                format!(
+                    "n={n}, a.len() {}, b.len() {}, y.len() {}",
+                    a.len(),
+                    b.len(),
+                    y.len()
+                ),
+            ));
+        }
+        let n = launch_u32("enqueue_mul_rows", "n", n)?;
+        let prep = self
+            .module
+            .prepare_mul_rows(LaunchConfig1D::new(n.div_ceil(256), 256, 0))?;
+        self.module.mul_rows(stream, &prep, a, b, n, y)?;
+        Ok(())
+    }
+
+    /// Enqueue `y[i] = a[i]·ga[i] + b[i]·gb[i]` over `n` values (flat): the
+    /// residual mix of two branches by their own gain vectors, three roundings.
+    /// Asynchronous, allocation-free, capturable.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "host launcher: one argument per kernel argument it binds (rust-quality R8)"
+    )]
+    pub fn enqueue_mix_rows(
+        &self,
+        stream: &CudaStream,
+        a: &DeviceBuffer<f32>,
+        ga: &DeviceBuffer<f32>,
+        b: &DeviceBuffer<f32>,
+        gb: &DeviceBuffer<f32>,
+        n: usize,
+        y: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let what = "enqueue_mix_rows";
+        if n == 0 || a.len() < n || ga.len() < n || b.len() < n || gb.len() < n || y.len() < n {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "n={n}, a.len() {}, ga.len() {}, b.len() {}, gb.len() {}, y.len() {}",
+                    a.len(),
+                    ga.len(),
+                    b.len(),
+                    gb.len(),
+                    y.len()
+                ),
+            ));
+        }
+        let n = launch_u32(what, "n", n)?;
+        let prep = self
+            .module
+            .prepare_mix_rows(LaunchConfig1D::new(n.div_ceil(256), 256, 0))?;
+        self.module.mix_rows(stream, &prep, a, ga, b, gb, n, y)?;
+        Ok(())
+    }
+
+    /// Enqueue `y[i] = s·y[i]` over the first `n` values of `y`, in place
+    /// (the head's logit scale before its softcap). `s` finite and nonzero:
+    /// any other is refused by name. Asynchronous, allocation-free,
+    /// capturable.
+    pub fn enqueue_scale_rows(
+        &self,
+        stream: &CudaStream,
+        y: &mut DeviceBuffer<f32>,
+        n: usize,
+        s: f32,
+    ) -> Result<(), GpuError> {
+        let what = "enqueue_scale_rows";
+        if n == 0 || y.len() < n {
+            return Err(GpuError::shape(what, format!("n={n}, y.len() {}", y.len())));
+        }
+        if !s.is_finite() || s == 0.0 {
+            return Err(GpuError::shape(
+                what,
+                format!("the scale {s} must be finite and nonzero"),
+            ));
+        }
+        let n = launch_u32(what, "n", n)?;
+        let prep = self
+            .module
+            .prepare_scale_rows(LaunchConfig1D::new(n.div_ceil(256), 256, 0))?;
+        self.module.scale_rows(stream, &prep, y, n, s)?;
+        Ok(())
+    }
+
+    /// Enqueue `y = rms_norm(x·gain, eps)` over `m` rows of `k` values, the
+    /// norm weightless after the row is scaled by `gain` (`k` a positive
+    /// multiple of 32, host-checked; the scaled-and-normed post-sublayer norm
+    /// of a model that scales its sublayer output by a gain vector before the
+    /// weightless norm). Asynchronous, allocation-free, capturable.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "host launcher: one argument per kernel argument it binds (rust-quality R8)"
+    )]
+    pub fn enqueue_gain_rms_norm(
+        &self,
+        stream: &CudaStream,
+        x: &DeviceBuffer<f32>,
+        gain: &DeviceBuffer<f32>,
+        eps: f32,
+        k: usize,
+        m: usize,
+        y: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let what = "enqueue_gain_rms_norm";
+        if k == 0 || !k.is_multiple_of(32) {
+            return Err(GpuError::shape(
+                what,
+                format!("k must be a positive multiple of 32, got {k}"),
+            ));
+        }
+        if m == 0 || x.len() < k * m || gain.len() < k || y.len() < k * m {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "m={m}, x.len() {} (need {}), gain.len() {} (need {k}), y.len() {} (need {})",
+                    x.len(),
+                    k * m,
+                    gain.len(),
+                    y.len(),
+                    k * m
+                ),
+            ));
+        }
+        let k = launch_u32(what, "k", k)?;
+        let m = launch_u32(what, "m", m)?;
+        let prep = self
+            .module
+            .prepare_gain_rms_norm(LaunchConfig1D::new(m, RMS_THREADS_U32, 0))?;
+        let fault = crate::sink_over(&self.fault, LAYER_NONE);
+        self.module
+            .gain_rms_norm(stream, &prep, x, gain, eps, k, m, fault, y)?;
         Ok(())
     }
 

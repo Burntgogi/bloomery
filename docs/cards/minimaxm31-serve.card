@@ -1,0 +1,17 @@
+# The 0.3.9 release's MiniMax-M3.1-Flash rows: bloomery-serve at the serving defaults on the RTX A6000 + host,
+# the native safetensors folder (NVFP4 routed experts, MXFP8 dense), depth-serve arms at D = 512 and 4096, N = 128.
+# Decode: MiniMax-M3's tape037 measured 14.33..14.53 tok/s on the same card and host tier [measured]; M3.1's routed
+# experts read ~6 % more bytes a token from the host (NVFP4's E4M3 block scale against IQ4_XS) [derived], and the
+# A6000 plan holds ~13 % of the experts [plan line], so decode 13..16 at D = 512, the deep row a few percent lower.
+# Prompt: recorded beside the decode rows from the same requests (timings.prompt_per_second); no prediction is
+# claimed for it here, the first M3.1 pp rows are this sitting's.
+kind: baseline
+question: what does MiniMax-M3.1-Flash decode at on the RTX A6000 + host at the serving defaults?
+term: tg tok/s @ D = 512, N = 128, bloomery-serve at the serving defaults, RTX A6000 + host experts
+unit: tok/s
+predict: 13.0..16.5
+condition: one lease, the box quiet, the A6000, a fresh server an arm and a round, ctx 4224, greedy
+reason: the 0.3.9 release states measured pp512 / pp4096 / decode for MiniMax-M3.1-Flash
+decide-in: write the rows into the README's M3.1 table with the lease and witness lines
+decide-below: read the plan lines (experts on the card) and the host read per token against M3's tape037
+decide-above: read the plan lines: more experts on the card than the derivation's 13 %

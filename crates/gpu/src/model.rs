@@ -43,6 +43,7 @@ use crate::fault::Fault;
 use crate::head::{Head, HeadNorm};
 use crate::host::leg_tier;
 use crate::host::nvtier::{ArenaKind, NvTier};
+use crate::host::refuse_expert_tiers;
 use crate::host::run::{HostRun, HostWidths};
 use crate::host::swap::{BoundaryAt, MachineCfg, Residency};
 use crate::host::swap_source::{FileSwap, ResidencyGlue, ResidencySpec};
@@ -1141,6 +1142,19 @@ impl<B: ChainBody> GpuModel<B> {
             .nodes()
     }
 
+    /// The most nodes on one dependency path of the captured whole chain
+    /// ([`Graph::span`](crate::Graph::span)) — what a structure gate holds a
+    /// body's forks to.
+    pub fn step_graph_span(&self) -> Result<usize, GpuError> {
+        self.graphs
+            .get(1)
+            .ok_or(GpuError::state(
+                "GpuModel::step_graph_span",
+                "no captured chain",
+            ))?
+            .span()
+    }
+
     /// Enqueue the whole chain eagerly on the engine stream. Pure enqueues —
     /// the same body [`GpuModel::capture_step`] records.
     fn enqueue_chain_step(&mut self) -> Result<(), GpuError> {
@@ -1951,24 +1965,15 @@ where
 
 /// The layers and the context a body that runs every layer on one card with no expert tier loads at: card `card`'s
 /// layers of `plan`, which must be `0..n_layers`, and `ctx_max` as a positive `u32` count of positions. Refused by
-/// name as `what`'s: a plan of other cards or an expert tier, another layer range, a context of no position or past
-/// the `u32` the position words count.
+/// name as `what`'s: a plan of other cards or an expert tier card ([`refuse_expert_tiers`]: a reserve-only member
+/// is none), another layer range, a context of no position or past the `u32` the position words count.
 pub fn one_card_run(
     what: &'static str,
     plan: &Plan<'_>,
     card: usize,
     n_layers: usize,
 ) -> Result<(Range<usize>, usize), GpuError> {
-    if !plan.machine.tiers.is_empty() {
-        return Err(GpuError::shape(
-            what,
-            format!(
-                "a plan of {} cards and {} expert tiers; the program runs every layer on one card with no expert tier",
-                plan.machine.cards.len(),
-                plan.machine.tiers.len()
-            ),
-        ));
-    }
+    refuse_expert_tiers(what, plan.machine)?;
     stage_run(what, plan, card, n_layers)
 }
 
@@ -2087,6 +2092,37 @@ pub fn hosted_hybrid_tiered<E>(
 where
     E: std::error::Error + Send + Sync + 'static,
 {
+    let hosted: Vec<usize> = run.clone().collect();
+    hosted_hybrid_at(
+        (gpu, file, plan),
+        (&hosted, run.len(), map),
+        (host, set, glue),
+        (widths, rows),
+        hang,
+        layers,
+    )
+}
+
+/// [`hosted_hybrid_tiered`] over the layers of `hosted` — the model layers that carry a host share, strictly ascending,
+/// not necessarily contiguous (a layer whose experts the card holds whole is none) — of a chain of `chain` layers: the
+/// host run's views are `layers`' one per hosted layer in order, and the [`Hybrid`] counts the whole chain. A body whose
+/// every layer is hosted names `0..chain`, which is [`hosted_hybrid_tiered`]. The one owner of a body's hybrid
+/// assembly after its stores and card experts.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the card, file, plan, hosted layers, chain and map, the host levers and set, the glue, widths and rows, the tier hang and the layers' builder, each named"
+)]
+pub fn hosted_hybrid_at<E>(
+    (gpu, file, plan): (&Gpu, &Arc<Split>, &Plan<'_>),
+    (hosted, chain, map): (&[usize], usize, SlotMap),
+    (host, set, glue): (HostCfg, HostResidency, &ResidencyGlue),
+    (widths, rows): (HostWidths, usize),
+    hang: Option<&leg_tier::Hang<'_>>,
+    layers: impl FnOnce(R8Source<'_>) -> Result<Vec<HostLayer>, E>,
+) -> Result<Hybrid<HostRun>, GpuError>
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
     let boundary = Boundary::with_rows(
         gpu.context(),
         gpu.stream(),
@@ -2100,14 +2136,14 @@ where
         gpu.context(),
         plan,
         file,
-        run.clone(),
+        hosted.iter().copied(),
         host.r8,
         set.arena(),
         widths,
         layers,
     )?;
     glue.attach_tier(experts.tier())?;
-    let mut hybrid = Hybrid::new(boundary, map, experts, run.len())?;
+    let mut hybrid = Hybrid::new(boundary, map, experts, chain)?;
     hybrid.watch_fault(gpu.fault_word())?;
     hybrid.keep_residency(set);
     if let Some(hang) = hang {
@@ -2125,7 +2161,7 @@ pub enum CardBytes<'a> {
     File,
     /// A part source's, for a file that is a checkpoint folder's header
     /// (`gguf::Split::header_only`): card `card` of `plan` loaded on the stream, each part's file
-    /// pages released when the host config's `card_dontneed` asks (`crate::parts::load_placed`).
+    /// pages released when the host config's `card_dontneed` asks (`crate::parts::load_placed_in_place`).
     Parts(&'a PartsLoad<'a>),
 }
 
@@ -2257,6 +2293,30 @@ pub fn refuse_scratch_past(
             format!(
                 "the load's scratch holds {made} device bytes ({parts}); card {card}'s plan \
                  sets aside {term} for it ({rows} of them the stage's position rows)"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Refused by name, as `what`'s, when buffers the load made beside the plan's
+/// terms, `made` device bytes of `name` (`parts` says what they hold), pass the
+/// `reserve` the plan kept for them out of the expert budget
+/// (`PlanInputs::prompt_reserve`): the plan counts those bytes by the family's
+/// one formula, no sum of the body's, so the load holds them to it.
+pub fn refuse_reserve_past(
+    what: &'static str,
+    name: &str,
+    reserve: u64,
+    made: u64,
+    parts: &str,
+) -> Result<(), GpuError> {
+    if made > reserve {
+        return Err(GpuError::shape(
+            what,
+            format!(
+                "the load's {name} hold {made} device bytes ({parts}); the plan reserves \
+                 {reserve} for them"
             ),
         ));
     }
@@ -2651,5 +2711,61 @@ impl<B: Instrumented> Engine for GpuModel<B> {
 
     fn arch(&self) -> Arch {
         B::arch()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::refuse_reserve_past;
+
+    /// Buffers at the plan's reserve pass; one byte past it is refused by name with both figures
+    /// and what the buffers are. Mutant: the comparison read `>=`, or reversed.
+    #[test]
+    fn made_bytes_past_the_reserve_are_refused_by_name() {
+        refuse_reserve_past("w", "pass buffers", 100, 100, "the rows").expect("at the reserve");
+        let err = refuse_reserve_past("w", "pass buffers", 100, 101, "the rows")
+            .expect_err("one byte past the reserve")
+            .to_string();
+        assert_eq!(
+            err,
+            "w: the load's pass buffers hold 101 device bytes (the rows); the plan reserves 100 \
+             for them"
+        );
+    }
+
+    /// A reserve-only member after the stage card (the card a draft sits on) is no expert tier: a
+    /// one-card run passes with it and keeps the stage card's layers and the context. Mutant: the
+    /// check read `machine.tiers.is_empty()`.
+    #[test]
+    fn a_reserve_only_member_passes_the_one_card_run() {
+        use model::placement::workstation::{
+            A6000, NO_TIER_BATCH, RTX_3090, draft_reserve, plan_holding,
+        };
+        use model::placement::{Device, KvBytes, ModelTensors, plan_with};
+        struct NoKv;
+        impl KvBytes for NoKv {
+            fn layer_bytes(&self, _: usize, _: u64) -> u64 {
+                0
+            }
+        }
+        let model = ModelTensors {
+            tensors: Vec::new(),
+            layers: 3,
+            experts: 8,
+            experts_used: 2,
+            bf16_words: |_| false,
+        };
+        let held = plan_holding(
+            3,
+            A6000,
+            &[],
+            &[RTX_3090],
+            Some(draft_reserve(Device::Card(1), 7)),
+            NO_TIER_BATCH,
+        )
+        .expect("a holder after the stage card");
+        let plan = plan_with(&model, &held, 16, &NoKv, None).expect("the holder's plan");
+        let run = super::one_card_run("t", &plan, 0, 3).expect("a holder is no expert tier");
+        assert_eq!(run, (0..3, 16));
     }
 }

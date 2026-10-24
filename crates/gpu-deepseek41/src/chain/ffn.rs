@@ -51,7 +51,10 @@
 //!   entries, for a program with eight), the handoff also for 10: their
 //!   launchers ([`FfnKernels::enqueue_handoff`], [`FfnKernels::enqueue_post`])
 //!   pick the entry from the slot count (the handoff's own table,
-//!   [`Slots::of`] for the join) and refuse any other by name.
+//!   [`Slots::of`] for the join) and refuse any other by name. A tier layer's
+//!   card sum ([`FfnBatchKernels::enqueue_card_acc_tier`]) also has the
+//!   four-slot entry a top-4 program runs; the launchers with no four-slot
+//!   entry refuse that count by name.
 //!
 //! Launches per layer: ten kernels with card experts, seven without (one more
 //! each for a shared down projection that reads q8_1), and
@@ -131,12 +134,18 @@ const POST_THREADS: u32 = 256;
 // The join's contracts spell the slot count as a literal.
 const _: () = assert!(N_USED == 6);
 
+/// Slots a token of the `_4` entries: the join's first instance
+/// ([`Slots::Four`]), whose contracts spell it as a literal.
+const SLOTS_4: usize = 4;
+const _: () = assert!(SLOTS_4 == 4);
+
 /// Slots a token of the `_8` entries: the join's second instance
 /// ([`Slots::Eight`]), whose contracts spell it as a literal.
 const SLOTS_8: usize = 8;
 const _: () = assert!(SLOTS_8 == 8);
 // The instance table's counts are the entries' own.
-const _: () = assert!(Slots::Six.n() == N_USED && Slots::Eight.n() == SLOTS_8);
+const _: () =
+    assert!(Slots::Four.n() == SLOTS_4 && Slots::Six.n() == N_USED && Slots::Eight.n() == SLOTS_8);
 
 /// The combine of one output value: the card's slots in slot order by
 /// fused multiply-adds from zero ([`card_sum_elem`]), then `(acc + hsum) +
@@ -825,7 +834,7 @@ impl FfnKernels {
 
     /// Enqueue the combine and HC_POST of `p.n_used` slots a token
     /// (`ds41_ffn_post`/`ds41_ffn_post_streams` for 6, their `_8` entries for
-    /// 8; any other count is refused by name), one thread per value `d <
+    /// 8; any other count, four included, is refused by name), one thread per value `d <
     /// p.rows`: the combine's `y[d]`, the four new streams at `d` into `out`
     /// and, when `fold` is given, their fold by the HC_PRE result's `pre`
     /// into it. One launch. Asynchronous, allocation-free, capturable.
@@ -839,6 +848,7 @@ impl FfnKernels {
     ) -> Result<(), GpuError> {
         let slots = slots_of("ds41_ffn_post", p.n_used)?;
         let what = match (slots, fold.is_some()) {
+            (Slots::Four, _) => return Err(no_entry("ds41_ffn_post", slots)),
             (Slots::Six, true) => "ds41_ffn_post",
             (Slots::Six, false) => "ds41_ffn_post_streams",
             (Slots::Eight, true) => "ds41_ffn_post_8",
@@ -850,6 +860,7 @@ impl FfnKernels {
         let n_card = launch_u32(what, "n_card", p.n_card)?;
         let m = &self.module;
         match (slots, fold) {
+            (Slots::Four, _) => return Err(no_entry(what, slots)),
             (Slots::Six, Some(fold)) => {
                 let prep = m.prepare_ds41_ffn_post(cfg)?;
                 m.ds41_ffn_post(
@@ -909,6 +920,19 @@ fn slots_of(what: &'static str, n_used: usize) -> Result<Slots, GpuError> {
         what,
         detail: e.to_string(),
     })
+}
+
+/// `what`'s shape error for an instance of the join it has no entry for: of
+/// the join's launchers only the tier card sum
+/// ([`FfnBatchKernels::enqueue_card_acc_tier`]) has the four-slot one.
+fn no_entry(what: &'static str, slots: Slots) -> GpuError {
+    GpuError::Shape {
+        what,
+        detail: format!(
+            "{} routed slots a token: this launch has no entry for them",
+            slots.n()
+        ),
+    }
 }
 
 /// The piece's own buffers, as the last enqueued layer left them — what a

@@ -30,12 +30,11 @@ use model::arch::models::{
 use model::arch::qwen35moe::hparams::{Exp, FfnKind, Hparams, Kind, Ple, SectionOrder, Variant};
 use model::arch::qwen35moe::mtp::BorrowedHead;
 use model::arch::qwen35moe::place::{
-    Experts, FileTensor, KvLayout, MtpInputs, PlaceError, PlanInputs, mtp_head_act_bytes,
-    mtp_tensors,
+    Experts, FileTensor, KvLayout, MtpInputs, PlanInputs, mtp_head_act_bytes, mtp_tensors,
 };
 use model::placement::workstation::{CONTEXT, GRANULE, MARGIN, SCRATCH};
 use model::placement::{
-    Card, Host, Machine, ModelTensor, ModelTensors, Node, PlanLevers, Role, UnifiedPool, Violation,
+    Card, Host, Machine, ModelTensor, ModelTensors, Node, PlanLevers, Role, UnifiedPool,
 };
 
 const CTX: u64 = 4096;
@@ -157,6 +156,7 @@ fn inputs() -> PlanInputs {
         hc: None,
         engram: None,
         encoder: None,
+        logit_epilogue: None,
         chat: ChatSpec {
             pre: String::new(),
             template: None,
@@ -208,6 +208,7 @@ fn draft() -> MtpDraft {
                     yarn: None,
                 },
                 qk_norm: true,
+                o_norm: false,
                 out_gate: OutGate::Packed,
                 select: None,
                 window: None,
@@ -219,6 +220,8 @@ fn draft() -> MtpDraft {
                 top_k: 10,
                 expert_ff: 640,
                 latent: None,
+                pre_exp_norm: false,
+                post_exp_norm: None,
                 act: Act::SwiGlu { limit: None },
                 router: Router {
                     score: Score::Softmax,
@@ -306,6 +309,7 @@ fn machine(usable: u64) -> Machine {
             layers: 0..LAYERS,
             head: true,
             token_embedding: false,
+            reserve_only: false,
             reserves: Vec::new(),
         }],
         tiers: Vec::new(),
@@ -382,43 +386,74 @@ fn unified(usable: u64, pool: u64) -> Machine {
     m
 }
 
-/// A pool of exactly the need the plan's host headroom counts plans clean,
-/// and one byte under it is one `PoolOver` naming the draft's card bytes
-/// beside the plan: the two sides count the cards, the draft and the
-/// context's own creation cost alike.
+/// One routed expert's bytes across the three stacks: a Q4_K gate and up of
+/// 640 rows of 2,560 and a Q8_0 down of 2,560 rows of 640.
+const EXPERT_BYTES: u64 = 2 * (640 * 2560 / 256 * 144) + 2560 * 640 / 32 * 34;
+
+/// On one pool the drafted plan counts the draft once on each side. A pool of
+/// exactly the need the plan's host headroom counts plans clean with no
+/// expert paged from the NVMe tier, and what the pool holds past the plan's
+/// cards and host is the draft's card bytes. One byte under it, the tier's
+/// room is a byte short (`Plan::plan_at` caps it at the pool), so the plan
+/// pages some host experts instead of breaking: it stays clean, frees the
+/// host an expert's bytes less that byte, and the pool still holds the
+/// draft's card bytes beside it. The two sides count the cards, the draft and
+/// the context's own creation cost alike: counting the draft twice would
+/// split at the need, and not at all would refuse one byte under it.
+// PIN(2026-10-25): one byte under the need was one `PoolOver` naming the
+// draft's card bytes. The host room is now capped at the pool, so a pool short
+// of the need splits the host's experts onto the NVMe tier down to the split's
+// floor, and the break is a named placement refusal there, never `PoolOver`.
 #[test]
 fn a_drafted_plan_on_one_pool_counts_the_draft_once() {
     let inputs = inputs();
     let levers = PlanLevers::default();
     let q8 = mtp(BorrowedHead::Q8_0);
-    // The plan's host headroom, or its refusal.
+    // The plan's host headroom, its host experts paged from the NVMe tier and
+    // what the pool holds past its cards and host, or its refusal.
     let plan = |experts, slots, pool| {
         inputs
             .plan_mtp_with_slots(&unified(WIDE, pool), CTX, &levers, &q8, experts, slots)
-            .map(|p| p.plan.host.headroom_bytes)
+            .map(|p| {
+                let held = p.plan.pool_need().expect("a unified machine's pool terms");
+                (
+                    p.plan.host.headroom_bytes,
+                    p.plan.host.nvme_expert_bytes,
+                    held.pool - held.cards - held.host,
+                )
+            })
     };
     let ample: u64 = 1 << 40;
     for experts in [Experts::Card, Experts::Host] {
         for slots in [1, 2] {
             let at = format!("{experts:?}, {slots} slot(s)");
-            let room =
+            let beside = q8
+                .card_bytes_of(CTX, slots)
+                .expect("the draft's card bytes");
+            let (room, paged, _) =
                 plan(experts, slots, ample).unwrap_or_else(|e| panic!("{at}, an ample pool: {e}"));
+            assert_eq!(paged, 0, "{at}: an ample pool pages no expert");
             let need = ample - u64::try_from(room).expect("a headroom within the pool");
-            if let Err(e) = plan(experts, slots, need) {
-                panic!("{at}, a pool of the host's need {need} B: {e}");
-            }
-            match plan(experts, slots, need - 1) {
-                Err(PlaceError::Broken(v)) => match v.as_slice() {
-                    [Violation::PoolOver { beside, .. }] => assert_eq!(
-                        *beside,
-                        q8.card_bytes_of(CTX, slots)
-                            .expect("the draft's card bytes"),
-                        "{at}: the bytes beside the plan"
-                    ),
-                    v => panic!("{at}: {v:?}, not one PoolOver"),
-                },
-                other => panic!("{at}, a pool one byte under the need: {other:?}"),
-            }
+            let (headroom, paged, held) = plan(experts, slots, need)
+                .unwrap_or_else(|e| panic!("{at}, a pool of the host's need {need} B: {e}"));
+            assert_eq!(
+                (headroom, paged, held),
+                (0, 0, beside),
+                "{at}: the need leaves no headroom, pages no expert and holds the draft beside the plan"
+            );
+            let (headroom, paged, held) = plan(experts, slots, need - 1)
+                .unwrap_or_else(|e| panic!("{at}, a pool one byte under the need: {e}"));
+            assert!(paged > 0, "{at}: one byte under the need pages no expert");
+            assert_eq!(
+                headroom,
+                i128::from(EXPERT_BYTES) - 1,
+                "{at}: the split frees an expert's bytes"
+            );
+            assert_eq!(
+                i128::from(held),
+                i128::from(beside) + headroom,
+                "{at}: the pool holds the draft's card bytes beside the plan"
+            );
         }
     }
 }

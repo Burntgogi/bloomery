@@ -50,7 +50,8 @@ pub enum Need {
         group: u32,
         reach: Option<u32>,
     },
-    /// The per-head q/k norm (when `qk_norm`) and rope of a GQA layer.
+    /// The per-head q/k norm (when `qk_norm`) and rope of a GQA layer. A
+    /// layer with no rope and a norm carries `mode: None` and dims 0.
     QkRope {
         qk_norm: bool,
         head: u32,
@@ -62,6 +63,9 @@ pub enum Need {
     /// The GQA output multiplied by a sigmoid gate a projection of the layer input of its own
     /// writes.
     OutGateProj,
+    /// The heads' outputs RMS-normed per head, with no gain, before the output gate:
+    /// `head` values per head.
+    OutNorm { head: u32 },
     /// Latent attention over `latent`-value rows with `rope` rotated values.
     Latent {
         latent: u32,
@@ -130,6 +134,11 @@ pub enum Need {
     /// Routed experts that read and write a `latent`-value row: the layer's
     /// input projected down to it before them, their sum back up after.
     LatentExperts { latent: u32 },
+    /// A weighted RMS norm on the routed experts' input (`ffn_pre_exp_norm`).
+    PreExpNorm,
+    /// The routed experts' aggregated output scaled by `ffn_post_exp_norm`,
+    /// then normalized at `eps`, before the router's weights apply.
+    PostExpNorm { eps: f32 },
     /// Experts (`shared`: the shared expert, else the routed ones) of an
     /// activation other than SwiGLU, the one every routed body runs.
     ExpertAct { shared: bool, act: Act },
@@ -185,6 +194,9 @@ pub enum Need {
     HcGatedHead { rank: u32 },
     /// A hyper-connection wiring other than the lagged mix with the last-mix collapse.
     HcWiring { mix: HcMix, collapse: Collapse },
+    /// The residual joined per channel, α·stream + β·branch, each sublayer's
+    /// output normalized at `eps` first.
+    AlphaBeta { eps: f32 },
     /// An engram site whose gate reads `row`-value rows.
     Engram { row: u32 },
     /// A model with no engram site, for a program that runs one.
@@ -207,6 +219,8 @@ pub enum Need {
     PreTokenizer(String),
     /// A tool-call parser for the file's chat template.
     ToolParser,
+    /// The head's logit epilogue: the scale, then the tanh softcap.
+    LogitEpilogue { scale: f32, softcap: f32 },
     /// A layer program for this architecture.
     Program(&'static str),
 }
@@ -251,10 +265,12 @@ impl fmt::Display for Need {
                 mode,
                 dims,
             } => {
-                let norm = if *qk_norm {
-                    "per-head QK norm plus rope"
-                } else {
-                    "rope without a QK norm"
+                let norm = match (*qk_norm, *mode) {
+                    (true, RopeMode::None) => {
+                        return write!(f, "per-head QK norm, no rope: head {head}");
+                    }
+                    (true, _) => "per-head QK norm plus rope",
+                    (false, _) => "rope without a QK norm",
                 };
                 write!(
                     f,
@@ -265,6 +281,12 @@ impl fmt::Display for Need {
             Need::OutGate => f.write_str("attention output gate: sigmoid, interleaved with q"),
             Need::OutGateProj => {
                 f.write_str("attention output gate: sigmoid of its own projection")
+            }
+            Need::OutNorm { head } => {
+                write!(
+                    f,
+                    "a gainless per-head RMS norm on the attention output: head {head}"
+                )
             }
             Need::Latent { latent, rope, up } => match up {
                 LatentUp::KeqV => write!(f, "latent attention {latent} x rope {rope}, K = V"),
@@ -395,6 +417,13 @@ impl fmt::Display for Need {
                 "routed experts in a {latent}-value latent (ffn_latent_down before them, \
                  ffn_latent_up after their sum)"
             ),
+            Need::PreExpNorm => {
+                f.write_str("a weighted RMS norm on the routed experts' input (ffn_pre_exp_norm)")
+            }
+            Need::PostExpNorm { eps } => write!(
+                f,
+                "the routed experts' output scaled by ffn_post_exp_norm, then normed at {eps}"
+            ),
             Need::ExpertAct { shared, act } => {
                 let who = if *shared {
                     "shared expert"
@@ -457,6 +486,10 @@ impl fmt::Display for Need {
             Need::HcWiring { mix, collapse } => {
                 write!(f, "hyper-connection mix {mix:?}, collapse {collapse:?}")
             }
+            Need::AlphaBeta { eps } => write!(
+                f,
+                "the alpha/beta residual mix, each sublayer's output normed at {eps} first"
+            ),
             Need::Engram { row } => write!(f, "an engram gate of {row}-value rows"),
             Need::NoEngram => f.write_str("a model without engram sites"),
             Need::Ple {
@@ -481,6 +514,16 @@ impl fmt::Display for Need {
             Need::WeightFormat { what, ty } => write!(f, "{ty} {what}"),
             Need::PreTokenizer(name) => write!(f, "pre-tokenizer {name}"),
             Need::ToolParser => f.write_str("a tool-call parser for this template"),
+            Need::LogitEpilogue { scale, softcap } => {
+                if *softcap > 0.0 {
+                    write!(
+                        f,
+                        "logit epilogue: scale {scale}, then the tanh softcap at {softcap}"
+                    )
+                } else {
+                    write!(f, "logit epilogue: scale {scale}")
+                }
+            }
             Need::Program(arch) => write!(f, "a layer program for {arch}"),
         }
     }
@@ -525,6 +568,8 @@ pub fn needs(spec: &ModelSpec) -> Vec<(Need, Option<LayerIdx>)> {
                         scaled: g.value_scale.is_some(),
                     },
                 });
+                // A layer with no rope still norms q and k per head: the norm
+                // is not the rope's passenger.
                 if g.qk_norm || g.rope.mode != RopeMode::None {
                     at(Need::QkRope {
                         qk_norm: g.qk_norm,
@@ -537,6 +582,9 @@ pub fn needs(spec: &ModelSpec) -> Vec<(Need, Option<LayerIdx>)> {
                     OutGate::None => {}
                     OutGate::Packed => at(Need::OutGate),
                     OutGate::Proj => at(Need::OutGateProj),
+                }
+                if g.o_norm {
+                    at(Need::OutNorm { head: g.head_dim });
                 }
                 if let Some(e) = &spec.encoder
                     && e.value_norm
@@ -602,6 +650,12 @@ pub fn needs(spec: &ModelSpec) -> Vec<(Need, Option<LayerIdx>)> {
                 if let Some(latent) = m.latent {
                     at(Need::LatentExperts { latent });
                 }
+                if m.pre_exp_norm {
+                    at(Need::PreExpNorm);
+                }
+                if let Some(eps) = m.post_exp_norm {
+                    at(Need::PostExpNorm { eps });
+                }
                 if !matches!(m.act, Act::SwiGlu { .. }) {
                     at(Need::ExpertAct {
                         shared: false,
@@ -632,22 +686,29 @@ pub fn needs(spec: &ModelSpec) -> Vec<(Need, Option<LayerIdx>)> {
                 Act::Situ { .. } => at(Need::Situ { ff: *ff }),
             },
         }
-        if layer.residual == Residual::Hc
-            && let Some(hc) = spec.hc
-        {
-            at(match hc.kind {
-                HcKind::Mhc { .. } => Need::Hc {
-                    streams: hc.streams,
-                },
-                HcKind::Chart { collapse, .. } => Need::HcChart {
-                    streams: hc.streams,
-                    collapse,
-                },
-                HcKind::Gated { rank } => Need::HcGated {
-                    streams: hc.streams,
-                    rank,
-                },
-            });
+        match layer.residual {
+            Residual::Plain => {}
+            // `spec.hc` is None only where no layer is `Hc`.
+            Residual::Hc => {
+                if let Some(hc) = spec.hc {
+                    at(match hc.kind {
+                        HcKind::Mhc { .. } => Need::Hc {
+                            streams: hc.streams,
+                        },
+                        HcKind::Chart { collapse, .. } => Need::HcChart {
+                            streams: hc.streams,
+                            collapse,
+                        },
+                        HcKind::Gated { rank } => Need::HcGated {
+                            streams: hc.streams,
+                            rank,
+                        },
+                    });
+                }
+            }
+            Residual::AlphaBeta { eps } => {
+                at(Need::AlphaBeta { eps });
+            }
         }
         if let Some(e) = &spec.encoder {
             if e.post_norms {
@@ -704,6 +765,12 @@ pub fn needs(spec: &ModelSpec) -> Vec<(Need, Option<LayerIdx>)> {
         Some(HcKind::Chart { .. }) => {}
         Some(HcKind::Gated { rank }) => model(Need::HcGatedHead { rank }),
         None => {}
+    }
+    if let Some(e) = spec.logit_epilogue {
+        model(Need::LogitEpilogue {
+            scale: e.scale,
+            softcap: e.softcap,
+        });
     }
     let delta = spec
         .layers
@@ -789,5 +856,237 @@ fn select_needs(select: &Selector, at: &mut impl FnMut(Need)) {
             local: *local,
             rope: rope.dims,
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        Act, Ffn, Gqa, LayerSpec, LogitEpilogue, Mixer, ModelSpec, Moe, Need, OutGate, Residual,
+        Rope, RopeMode, Router, Score, needs,
+    };
+
+    /// One Muse-shaped layer: a Proj-gated GQA mixer whose output norm is
+    /// `o_norm`'s to have or not, over latent experts carrying the norms
+    /// `pre` and `post`, joined by `residual`, with the model-wide `logit`
+    /// epilogue, beside nothing else.
+    fn muse_spec(
+        o_norm: bool,
+        pre: bool,
+        post: Option<f32>,
+        residual: Residual,
+        logit: Option<LogitEpilogue>,
+    ) -> ModelSpec {
+        ModelSpec {
+            arch: crate::Arch::MuseSpark,
+            hidden: 8,
+            vocab: 2,
+            ctx_train: 8,
+            rms_eps: 1e-5,
+            layers: vec![LayerSpec {
+                mixer: Mixer::Gqa(Gqa {
+                    heads: 2,
+                    kv_heads: 1,
+                    head_dim: 64,
+                    value_dim: 64,
+                    rope: Rope {
+                        mode: RopeMode::NormTail,
+                        dims: 64,
+                        base: 0.0,
+                        yarn: None,
+                    },
+                    qk_norm: true,
+                    o_norm,
+                    out_gate: OutGate::Proj,
+                    select: None,
+                    window: None,
+                    sinks: false,
+                    value_scale: None,
+                }),
+                ffn: Ffn::Moe(Moe {
+                    experts: 6,
+                    top_k: 2,
+                    expert_ff: 24,
+                    latent: Some(16),
+                    pre_exp_norm: pre,
+                    post_exp_norm: post,
+                    act: Act::SwiGlu { limit: None },
+                    router: Router {
+                        score: Score::Sigmoid,
+                        bias: true,
+                        norm: crate::RouterNorm::SelectedSum,
+                        scale: 1.0,
+                        hash: false,
+                    },
+                    shared: None,
+                }),
+                residual,
+                extras: Vec::new(),
+            }],
+            mtp: Vec::new(),
+            hc: None,
+            engram: None,
+            encoder: None,
+            logit_epilogue: logit,
+            chat: crate::ChatSpec {
+                pre: String::new(),
+                template: None,
+                tools: None,
+                reasoning: None,
+            },
+        }
+    }
+
+    /// One GQA layer of head 64 with `rope`'s mode and `qk_norm`, beside
+    /// nothing else.
+    fn spec(layers: &[(RopeMode, bool)]) -> ModelSpec {
+        ModelSpec {
+            arch: crate::Arch::MuseSpark,
+            hidden: 8,
+            vocab: 2,
+            ctx_train: 8,
+            rms_eps: 1e-5,
+            layers: layers
+                .iter()
+                .map(|&(mode, qk_norm)| LayerSpec {
+                    mixer: Mixer::Gqa(Gqa {
+                        heads: 2,
+                        kv_heads: 1,
+                        head_dim: 64,
+                        value_dim: 64,
+                        rope: Rope {
+                            mode,
+                            dims: if mode == RopeMode::None { 0 } else { 64 },
+                            base: 0.0,
+                            yarn: None,
+                        },
+                        qk_norm,
+                        o_norm: false,
+                        out_gate: OutGate::None,
+                        select: None,
+                        window: None,
+                        sinks: false,
+                        value_scale: None,
+                    }),
+                    ffn: Ffn::Dense {
+                        ff: 0,
+                        act: Act::SwiGlu { limit: None },
+                    },
+                    residual: Residual::Plain,
+                    extras: Vec::new(),
+                })
+                .collect(),
+            mtp: Vec::new(),
+            hc: None,
+            engram: None,
+            encoder: None,
+            logit_epilogue: None,
+            chat: crate::ChatSpec {
+                pre: String::new(),
+                template: None,
+                tools: None,
+                reasoning: None,
+            },
+        }
+    }
+
+    /// A NoPE layer with a per-head q/k norm still needs it: the norm is not
+    /// the rope's passenger, and a reader that turns rope off must not hide
+    /// it. A NoPE layer with no norm needs neither. FAIL-first: with the need
+    /// gated on `mode != None` alone, the second row of the first assertion
+    /// fails; with the display naming the rope, the text assertion fails.
+    #[test]
+    fn a_nope_layer_with_a_qk_norm_still_needs_it() {
+        let got = needs(&spec(&[
+            (RopeMode::NormTail, true),
+            (RopeMode::None, true),
+            (RopeMode::None, false),
+        ]));
+        for (l, want) in [
+            (
+                Some(0),
+                "per-head QK norm plus rope: head 64, NORM tail, 64 of 64 dims",
+            ),
+            (Some(1), "per-head QK norm, no rope: head 64"),
+        ] {
+            let text = got
+                .iter()
+                .find(|(n, layer)| *layer == l && matches!(n, Need::QkRope { .. }))
+                .map(|(n, _)| n.to_string());
+            assert_eq!(text.as_deref(), Some(want), "layer {l:?}");
+        }
+        assert!(
+            !got.iter()
+                .any(|(n, l)| *l == Some(2) && matches!(n, Need::QkRope { .. })),
+            "a NoPE layer with no q/k norm needs no QkRope"
+        );
+    }
+
+    /// Every new fact needs its row, spelled by its own display: the normed
+    /// attention output beside the gate, the expert norms in the latent, the
+    /// alpha/beta residual and the head's logit epilogue. FAIL-first: with
+    /// any emission removed, its text row fails; with the o-norm's need
+    /// riding the gate's instead of its own field, the second test fails.
+    #[test]
+    fn the_normed_gate_experts_residual_and_epilogue_need_their_rows() {
+        let got = needs(&muse_spec(
+            true,
+            true,
+            Some(1e-8),
+            Residual::AlphaBeta { eps: 1e-8 },
+            Some(LogitEpilogue {
+                scale: 0.1767767,
+                softcap: 20.0,
+            }),
+        ));
+        for (l, want) in [
+            (
+                Some(0),
+                "a gainless per-head RMS norm on the attention output: head 64",
+            ),
+            (
+                Some(0),
+                "the alpha/beta residual mix, each sublayer's output normed at 0.00000001 first",
+            ),
+            (
+                Some(0),
+                "a weighted RMS norm on the routed experts' input (ffn_pre_exp_norm)",
+            ),
+            (
+                Some(0),
+                "the routed experts' output scaled by ffn_post_exp_norm, then normed at 0.00000001",
+            ),
+            (
+                None,
+                "logit epilogue: scale 0.1767767, then the tanh softcap at 20",
+            ),
+        ] {
+            assert!(
+                got.iter()
+                    .any(|(n, layer)| *layer == l && n.to_string() == want),
+                "{want}: not in the needs"
+            );
+        }
+    }
+
+    /// None of it without the facts: a Proj-gated layer with no output norm,
+    /// a latent mixture with no expert norms, the plain residual and no
+    /// epilogue need none of the new rows. The gate without the norm is the
+    /// cut that would hide one: the norm is not the gate's passenger, as the
+    /// q/k norm is not the rope's.
+    #[test]
+    fn a_gated_layer_without_the_norms_needs_none_of_their_rows() {
+        let got = needs(&muse_spec(false, false, None, Residual::Plain, None));
+        assert!(
+            !got.iter().any(|(n, _)| matches!(
+                n,
+                Need::OutNorm { .. }
+                    | Need::PreExpNorm
+                    | Need::PostExpNorm { .. }
+                    | Need::AlphaBeta { .. }
+                    | Need::LogitEpilogue { .. }
+            )),
+            "{got:?}"
+        );
     }
 }

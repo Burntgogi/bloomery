@@ -9,7 +9,8 @@
 //!     bloomery-serve --model solar2 [-m PATH | --hf <repo>[:<quant>]]
 //!                    [--host 127.0.0.1] [--port 8080] [--ctx C] [--alias NAME]
 //!                    [--chat-template-file PATH] [--place W] [--plan]
-//!                    [--queue-depth Q] [--api-key KEY] [--api-key-file FNAME]
+//!                    [--queue-depth Q] [--slot-save-path DIR]
+//!                    [--api-key KEY] [--api-key-file FNAME]
 //!
 //! The server takes `-m`/`--hf` out before this seat parses (its module
 //! doc); `--ctx-size` and `-c` are `--ctx` under llama-server's spellings. The
@@ -33,8 +34,10 @@
 //!
 //! The prompt call is fed in batches of up to a unit's columns
 //! (`app::Prompt for Body`), the same bits as one decode step an id; the
-//! batch's buffers come out of the card's free bytes at the load, refused by
-//! name when they do not fit.
+//! batch's buffers are the plan's prompt reserve
+//! (`place::prompt_reserve_bytes`), which the body holds its made bytes to by
+//! name at the load, and the units a prompt group past one adds come out of the
+//! card's margin.
 //!
 //! `--place W` is the shared placement word (`generate::Place`): `a` (the
 //! largest visible card), `gate`, `bp` (plan (b′): the next-largest card the
@@ -59,9 +62,11 @@
 //! more experts on the card, is what that refusal asks for.
 //!
 //! The records on stderr, in order: `place unset` (word and why), one `ctx`
-//! line (`placement::ctx_ask::Chosen::line`), the `plan` record, the
-//! `parallel` line (`rule=slots slots=1 slot_ctx=C total=C from=<word>
-//! pass=one`); then the `load` record (architecture, resident bytes, the
+//! line (`placement::ctx_ask::Chosen::line`), the `residency lever` record
+//! (the word and why), the `plan` record, under `mid` the `residency host`
+//! record of the churn pool, the `need` record, the `parallel` line
+//! (`rule=slots slots=1 slot_ctx=C total=C from=<word> pass=one`); then the
+//! `load` record (architecture, resident bytes, the
 //! slot's context, layers, the routed experts the plan keeps on the host and
 //! on the card, the step graph's nodes, the prompt group and the load's wall)
 //! and, once the port is bound, the `listening` record
@@ -76,7 +81,16 @@
 //! unset, the row's default), and `BLOOMERY_PIN_MAIN` with
 //! `BLOOMERY_HOST_LANES` (the engine thread pinned to the dispatcher's cpu
 //! slot, which gives the host legs the pool's CCD map), and the schema jump
-//! (`BLOOMERY_SCHEMAJUMP`). The load runs no adaptive expert residency.
+//! (`BLOOMERY_SCHEMAJUMP`).
+//!
+//! `BLOOMERY_RESIDENCY` is the common machine's lever: set, its word as given
+//! (refused by name where the plan's card slots leave it no room); unset, the
+//! serving word on every placement but `gate`, which the plan then keeps,
+//! moves or turns `off` with why (`bloomery_levers::residency_unset`,
+//! `residency::at_plan`). The `residency lever` record comes before the plan's
+//! own; under `mid`, the `residency host` record of the churn pool comes after
+//! the plan. Under `mid` the experts the card holds are the machine's to move
+//! by use.
 //!
 //! The model writes its reasoning between `<|think:start|>` and
 //! `<|think:end|>`, the pair its description names
@@ -110,15 +124,17 @@ const NAME: &str = "bloomery-serve-solar2";
 
 const USAGE: &str = "usage: bloomery-serve --model solar2 [-m PATH | --hf <repo>[:<quant>]] \
                      [--host H] [--port P] [--ctx C] [--alias NAME] [--chat-template-file PATH] \
-                     [--place W] [--plan] [--queue-depth Q] [--api-key KEY] \
-                     [--api-key-file FNAME]";
+                     [--place W] [--plan] [--queue-depth Q] [--slot-save-path DIR] \
+                     [--api-key KEY] [--api-key-file FNAME]";
 
 /// The levers this seat acts on: the plan's card budget and the host set's
 /// load settings, which the open reads (`PlanLevers::from_levers`,
-/// `Levers::host`), the batches a prompt group runs, the engine thread's pin,
-/// the host legs' lane rule, the start screen and the schema jump.
+/// `Levers::host`), the residency machine's word, the batches a prompt group
+/// runs, the engine thread's pin, the host legs' lane rule, the start screen
+/// and the schema jump.
 pub const ACTS_ON: &[&str] = &[
     bloomery_levers::CARD_BUDGET,
+    bloomery_levers::RESIDENCY,
     bloomery_levers::PREFILL_GROUP,
     bloomery_levers::HOST_POPULATE,
     bloomery_levers::HOST_LOCK,

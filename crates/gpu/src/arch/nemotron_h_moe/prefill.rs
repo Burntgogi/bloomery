@@ -19,7 +19,9 @@
 //! - a latent MoE layer routes the pass's rows in two launches
 //!   ([`super::router::Routers::enqueue_rows`]), runs its kept experts as
 //!   one `iq2_xxs_gemv_sel` over the pass's `TOP_K · m` slots each for the
-//!   up and the down, sums each row's slots by its weights, and runs the
+//!   up and the down (past [`COLS`] rows the grouped IQ2_XXS GEMMs), or, for
+//!   32-value stacks, as one 32-value GEMM each at any row count
+//!   ([`experts_gemm32`]), sums each row's slots by its weights, and runs the
 //!   shared expert as a one-expert `_sel` over the pass's `m` slots — the
 //!   step's launches at `m` rows, in the step's order.
 //!
@@ -57,31 +59,35 @@ use super::placed::{Placed, PlacedSide};
 use super::router::Routers;
 use super::router::{COUNTS, MAX_TOP_K};
 use crate::arch::hybrid::{RowBuffers, Shape, Site, norm_rows, residual_rows};
+use crate::card_leg::{RouteW, StackW};
 use crate::card_slots::CardAcc;
 use crate::fault::FaultSink;
 use crate::flash::PlaneAppend;
-use crate::flash_gqa::{HEAD, partials_ms_len, partials_v_len};
+use crate::flash_gqa::HEAD;
 use crate::flash_gqa_prefill::{FlashGqaPrefill, GqaPrefillArgs, SplitScratch};
 use crate::gemm::GEMM_MAX_SLOTS;
 use crate::gemm::Gemm32Kernels;
-use crate::gemm::{Gemm32Args, Gemm32Weight, GemmAct, GemmArgs, GemmInput, GemmRoute, GemmWeight};
+use crate::gemm::{
+    Gemm32Args, Gemm32Weight, GemmAct, GemmAct32, GemmArgs, GemmInput, GemmRoute, GemmWeight,
+};
 use crate::head::Head;
 use crate::host::BatchLeg;
 use crate::host::run::HostRun;
 use crate::kquant::SelDown;
 use crate::mamba2::{Mamba2Kernels, Mamba2PassScratch, PassScan};
 use crate::model::GpuModel;
-use crate::model::fit::{FIT_RESERVE, act_col_bytes, act32_col_bytes, largest_fit, route_bytes};
+use crate::model::fit::{FIT_RESERVE, largest_fit};
 use crate::mxfp4_sel::Nvfp4Stack;
 use crate::q38::{EmbedArgs, EmbedRows};
 use crate::quant_sel::QuantSelKernels;
 use crate::site::{self, SiteTy};
-use crate::site::{KGemvKernels, SiteWeight, WideActs, WideKernels};
+use crate::site::{KGemvKernels, SiteWeight, WideActs, WideForms, WideKernels};
 use crate::tensor::{Pitched, WindowMut, dtod_2d};
 use crate::weights::{DevWeight, Weights};
 use crate::{DeviceTensor, Gpu, GpuError, Q8Act, Window, launch_u32};
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::GgmlType;
+use model::arch::nemotron_h_moe::place::{self, PassDims};
 use runtime::sched::{self, At, LayerProgram, Overlap, PortKind};
 
 const WHAT: &str = "nemotron_h_moe::prefill";
@@ -92,6 +98,28 @@ const WHAT: &str = "nemotron_h_moe::prefill";
 /// chosen at load ([`choose_pass_rows`]).
 pub const PASS_ROWS_MAX: usize = 4096;
 const _: () = assert!(MAX_TOP_K * PASS_ROWS_MAX <= GEMM_MAX_SLOTS);
+
+// The plan's reserve for the pass is the formula of `place::pass_bytes`, which counts these sizes
+// as the kernels fix them.
+const _: () = assert!(COLS == place::COLS);
+const _: () = assert!(P_ROWS == place::WORD_HEAD);
+const _: () = assert!(HEAD == place::HEAD);
+const _: () = assert!(crate::flash_gqa::GROUP == place::SPLIT_GROUP);
+const _: () = assert!(crate::flash_gqa::SEGMENTS == place::FLASH_SEGMENTS);
+const _: () = assert!(crate::model::MAX_PASS_ROWS == place::MAX_PASS_ROWS);
+const _: () = assert!(crate::gemm::GEMM_BN == place::GEMM_BN);
+const _: () = assert!(crate::gemm::GEMM32_STEP == place::GEMM32_STEP);
+const _: () = {
+    let mut widest = 0;
+    let mut i = 0;
+    while i < COUNTS.len() {
+        if COUNTS[i] > widest {
+            widest = COUNTS[i];
+        }
+        i += 1;
+    }
+    assert!(widest == place::WIDEST_ROUTER);
+};
 
 /// The columns one gemv run takes: the multi-column gemvs' most.
 const COLS: usize = 8;
@@ -120,6 +148,9 @@ pub(super) struct PassSizes {
     /// The experts' GEMM forms ([`gemm_form`]): `(k, slots a row)`, a
     /// form's columns the pass's cut times that.
     gemm_acts: Vec<(usize, usize)>,
+    /// The 32-value GEMM forms of the layers whose card experts are 32-value
+    /// stacks ([`experts_gemm32`]), as `gemm_acts`.
+    gemm32_acts: Vec<(usize, usize)>,
     /// The NVFP4 gemv run forms' widths.
     run_k: Vec<usize>,
     /// The q8 blocks of 32 the wide GEMMs read, one a site width.
@@ -153,12 +184,12 @@ impl PassSizes {
         for m in moes() {
             // The q8_1 slot forms the `_sel` fallback reads: the routed
             // experts' input and the slots' squared ReLU where the card
-            // holds experts of the layer, the normed row and the shared
-            // expert's where the shared expert is an IQ2_XXS stack. A launch
-            // that reads no q8_1 form asks for none: the form's block is the
-            // K-quant's 256 values, and a width no K-quant form takes would
-            // refuse the load for a form nothing reads.
-            if m.n_card > 0 {
+            // holds IQ2_XXS experts of the layer, the normed row and the
+            // shared expert's where the shared expert is an IQ2_XXS stack. A
+            // launch that reads no q8_1 form asks for none: the form's block
+            // is the K-quant's 256 values, and a width no K-quant form takes
+            // would refuse the load for a form nothing reads.
+            if m.n_card > 0 && m.relu2_ff().is_none() {
                 want_slots(moe.width, COLS);
                 want_slots(m.ff, moe.top_k * COLS);
             }
@@ -174,6 +205,12 @@ impl PassSizes {
                 gemm_acts.push((k, per_row));
             }
         };
+        let mut gemm32_acts: Vec<(usize, usize)> = Vec::new();
+        let mut want_acts32 = |k: usize, per_row: usize| {
+            if !gemm32_acts.iter().any(|a| a.0 == k && a.1 == per_row) {
+                gemm32_acts.push((k, per_row));
+            }
+        };
         for m in moes() {
             // The table runs over the card's experts of the layer: every
             // expert on a whole-card load, the plan's share on a placed one.
@@ -182,8 +219,16 @@ impl PassSizes {
                 if !route_n.contains(&n) {
                     route_n.push(n);
                 }
-                want_acts(moe.width, 1);
-                want_acts(m.ff, moe.top_k);
+                match m.relu2_ff() {
+                    None => {
+                        want_acts(moe.width, 1);
+                        want_acts(m.ff, moe.top_k);
+                    }
+                    Some(ff) => {
+                        want_acts32(moe.width, 1);
+                        want_acts32(ff, moe.top_k);
+                    }
+                }
             }
             if m.shared_is_sel() {
                 want_acts(sh.hidden, 1);
@@ -209,6 +254,7 @@ impl PassSizes {
             slots,
             route_n,
             gemm_acts,
+            gemm32_acts,
             run_k,
             wide_k,
             placed,
@@ -221,76 +267,40 @@ impl PassSizes {
         if self.placed { self.moe.width } else { 0 }
     }
 
+    /// The widths of the pass's buffers as the plan's formula takes them
+    /// ([`place::pass_bytes`]).
+    fn dims(&self) -> PassDims {
+        let geom = self.sh.mamba.geom();
+        PassDims {
+            hidden: self.sh.hidden,
+            n_kv: self.sh.n_kv,
+            n_head: self.n_head,
+            in_proj: self.sh.mamba.in_proj_width(),
+            d_inner: geom.d_inner,
+            ssm_heads: geom.n_heads,
+            conv_dim: self.sh.mamba.conv_dim(),
+            width: self.moe.width,
+            top_k: self.moe.top_k,
+            shared_ff: self.moe.shared_ff,
+            ff: self.ff,
+            n_expert: self.n_expert,
+            slots: self.slots.clone(),
+            route_n: self.route_n.clone(),
+            gemm_acts: self.gemm_acts.clone(),
+            gemm32_acts: self.gemm32_acts.clone(),
+            run_k: self.run_k.clone(),
+            wide_k: self.wide_k.clone(),
+            placed: self.placed,
+        }
+    }
+
     /// The device bytes the pass's buffers hold at `rows` rows — every
     /// buffer [`Prompt::new`] allocates, by the same widths: what a fit
-    /// check ([`choose_pass_rows`]) counts. Pure; [`Prompt::new`] asserts
-    /// the buffers it allocated hold exactly this.
+    /// check ([`choose_pass_rows`]) counts, and what the plan keeps for them
+    /// ([`place::pass_bytes`]). Pure; [`Prompt::new`] asserts the buffers it
+    /// allocated hold exactly this.
     pub(super) fn bytes(&self, rows: usize) -> usize {
-        let (sh, moe) = (self.sh, self.moe);
-        let cut = rows.next_multiple_of(COLS);
-        let kv_width = sh.n_kv * HEAD;
-        let f = size_of::<f32>();
-        // Every cut-length f32 buffer, at the one-column floor where a
-        // width is 0 (the residual streams twice, `kh`/`vh`, the MoE row
-        // buffers, and `RowBuffers`' columns with no MLP width here).
-        let z = |n: usize| cut * n.max(1) * f;
-        let attn_rows = cut.min(crate::model::MAX_PASS_ROWS);
-        let f32s = 4 * z(sh.hidden) // x twice, sh, sum
-            + z(self.n_expert) // probs
-            + z(moe.top_k) // weights
-            + z(moe.width) * 2 // lat, moe
-            + z(moe.top_k * self.ff) // up
-            + z(moe.top_k * moe.width) // down
-            + z(moe.shared_ff) * 2 // sh_up, sh_relu
-            + 2 * z(kv_width) // kh, vh
-            + 2 * z(sh.hidden) // RowBuffers' xn, delta
-            + z(sh.mamba.in_proj_width()) // zxbcdt
-            + z(sh.mamba.geom().d_inner) // y
-            + 2 * z(self.n_head * HEAD) // q, attn
-            + 2 * z(kv_width) // k, v
-            + 2 * z(0) // RowBuffers' up, act (no MLP width)
-            + z(self.hsum_width()) // hsum
-            + (partials_v_len(attn_rows, self.n_head)
-                + partials_ms_len(attn_rows, self.n_head))
-                * f;
-        let u32s = (P_ROWS + sh.n_kv + rows // words
-            + cut * moe.top_k // ids
-            + cut * moe.top_k // sel
-            + cut // zero_ids
-            + 2 * cut) // RowBuffers' pos, n_keys
-            * size_of::<u32>();
-        let gemm = route_bytes(cut, 1) // the projections' one-expert table
-            + self
-                .route_n
-                .iter()
-                .map(|&n| route_bytes(moe.top_k * cut, n))
-                .sum::<usize>()
-            + self
-                .gemm_acts
-                .iter()
-                .map(|&(k, per_row)| per_row * cut * act_col_bytes(k))
-                .sum::<usize>();
-        let forms = self
-            .slots
-            .iter()
-            .map(|&(k, cols)| cols * act_col_bytes(k))
-            .sum::<usize>()
-            + self
-                .run_k
-                .iter()
-                .map(|&k| COLS * act_col_bytes(k))
-                .sum::<usize>()
-            + self
-                .wide_k
-                .iter()
-                .map(|&k| cut * act32_col_bytes(k))
-                .sum::<usize>();
-        // The flash split's sub-group buffers (`rows`, not the cut) and the
-        // Mamba-2 pass scratch: `rows · conv_dim` conv rows and two f32s a
-        // (token, head) for the `σ`/`dA` pre-pass.
-        let split = 2 * rows * sh.n_kv * crate::flash_gqa::GROUP * HEAD * f;
-        let mamba2 = rows * sh.mamba.conv_dim() * f + 2 * rows * sh.mamba.geom().n_heads * f;
-        f32s + u32s + gemm + forms + split + mamba2
+        place::pass_bytes(&self.dims(), rows)
     }
 }
 
@@ -437,6 +447,8 @@ struct ExpertArms {
     routes: Vec<(usize, GemmRoute)>,
     /// The q8_1 blocks of 128 the GEMMs read: `(k, columns, form)`.
     acts: Vec<(usize, usize, GemmAct)>,
+    /// The q8 blocks of 32 the 32-value GEMMs read: `(k, columns, form)`.
+    acts32: Vec<(usize, usize, GemmAct32)>,
 }
 
 /// What a projection over the pass's rows reads beside its f32 rows.
@@ -486,6 +498,7 @@ impl Prompt {
         let mut ex = ExpertArms {
             routes: Vec::new(),
             acts: Vec::new(),
+            acts32: Vec::new(),
         };
         for &n in &sizes.route_n {
             ex.routes
@@ -495,13 +508,20 @@ impl Prompt {
             let cols = per_row * cut;
             ex.acts.push((k, cols, GemmAct::new(stream, cols, k)?));
         }
+        for &(k, per_row) in &sizes.gemm32_acts {
+            let cols = per_row * cut;
+            ex.acts32.push((k, cols, GemmAct32::new(stream, cols, k)?));
+        }
         let mut runs: Vec<Q8Act> = Vec::new();
         for &k in &sizes.run_k {
             runs.push(Q8Act::with_k(stream, COLS, k)?);
         }
         let mut wide: Vec<(usize, WideActs)> = Vec::new();
         for &k in &sizes.wide_k {
-            wide.push((k, WideActs::new(stream, (false, true), cut, k)?));
+            wide.push((
+                k,
+                WideActs::new(stream, WideForms::q8(false, true), cut, k)?,
+            ));
         }
         let n_words = P_ROWS + sh.n_kv + rows;
         let prompt = Prompt {
@@ -587,6 +607,7 @@ impl Prompt {
             + b.arms.route.bytes()
             + b.ex.routes.iter().map(|r| r.1.bytes()).sum::<usize>()
             + b.ex.acts.iter().map(|a| a.2.bytes()).sum::<usize>()
+            + b.ex.acts32.iter().map(|a| a.2.bytes()).sum::<usize>()
             + b.split.num_bytes()
             + self.mamba2.device_bytes()
     }
@@ -773,8 +794,10 @@ fn moe_route(
 
 /// Layer `l`'s routed experts over the pass's `TOP_K · m` slots into `p.up`
 /// and `p.down` (the up and the squared-ReLU'd down rows of every slot a card
-/// expert serves), from the latent rows `p.lat`: past [`COLS`] rows the
-/// grouped IQ2_XXS GEMMs, up to them the `_sel` launches. A slot the host
+/// expert serves), from the experts' input rows (the latent rows `p.lat`, or
+/// the normed rows where the file has no latent): for IQ2_XXS stacks past
+/// [`COLS`] rows the grouped IQ2_XXS GEMMs, up to them the `_sel` launches;
+/// for 32-value stacks the 32-value GEMMs at any row count. A slot the host
 /// serves ([`Places::Cut`]) is neither read nor written.
 fn moe_card_experts(
     cx: &Cx<'_>,
@@ -786,6 +809,20 @@ fn moe_card_experts(
     let stream = gpu.stream();
     let fault = gpu.layer_sink(l)?;
     let slots = sh.top_k * m;
+    let x = if ml.latent_down.is_some() {
+        &p.lat
+    } else {
+        &p.buf.xn
+    };
+    if ml.relu2_ff().is_some() {
+        return experts_gemm32(
+            cx,
+            &mut p.ex,
+            (fault, ml, sh.width),
+            (&p.ids, places),
+            (x, &mut p.up, &mut p.down),
+        );
+    }
     // The grouped GEMM's IQ2_XXS entry, where the build has one.
     if let Some(ty) = GemmWeight::from_ggml(GgmlType::IQ2_XXS)
         .ok()
@@ -796,7 +833,7 @@ fn moe_card_experts(
             &mut p.ex,
             (fault, ml, sh.width, ty),
             (&p.ids, places),
-            (&p.lat, &mut p.up, &mut p.down),
+            (x, &mut p.up, &mut p.down),
         );
     }
     let sel = match places {
@@ -804,14 +841,8 @@ fn moe_card_experts(
         Places::Cut { .. } => &p.sel,
     };
     {
-        // The experts' input: the latent rows, or the normed rows where the
-        // file has no latent.
         let act = slot_form(&mut p.slots, sh.width, m)?;
-        if ml.latent_down.is_some() {
-            gpu.quantize_q8_1_cols_at(&p.lat, 0, act, m, fault)?;
-        } else {
-            gpu.quantize_q8_1_cols_at(&p.buf.xn, 0, act, m, fault)?;
-        }
+        gpu.quantize_q8_1_cols_at(x, 0, act, m, fault)?;
         let up = SelDown {
             w: stack(w, ml.up()?)?,
             act,
@@ -976,20 +1007,7 @@ fn experts_gemm(
     let (gpu, w, m) = (cx.gpu, cx.w, cx.m);
     let stream = gpu.stream();
     let slots = ml.top_k * m;
-    let n = ml.n_card;
-    let route = ex
-        .routes
-        .iter_mut()
-        .find(|r| r.0 == n)
-        .map(|r| &mut r.1)
-        .ok_or_else(|| GpuError::shape(WHAT, format!("no routed table of {n} experts")))?;
-    match places {
-        Places::Ids => cx.wk.gemm.enqueue_route(stream, ids, slots, route, fault)?,
-        Places::Cut { map } => cx
-            .g32
-            .enqueue_route_remap(stream, ids, map, slots, route, fault)?,
-    }
-    let route = &*route;
+    let route = fill_route(cx, &mut ex.routes, ml, (ids, places), fault)?;
     {
         let a = gemm_form(&mut ex.acts, latent, m)?;
         gpu.enqueue_quantize_gemm(lat, m, a, fault)?;
@@ -1020,6 +1038,124 @@ fn experts_gemm(
             y: down,
         },
     )
+}
+
+/// Layer `ml`'s routed table over the pass's `TOP_K · m` slots, filled from
+/// `ids` (through the layer's map to the card's places under
+/// [`Places::Cut`], a slot the host serves in no tile): the table of the
+/// layer's card experts in `routes`, or a named refusal where the load made
+/// none.
+fn fill_route<'r>(
+    cx: &Cx<'_>,
+    routes: &'r mut [(usize, GemmRoute)],
+    ml: &MoeLayer,
+    (ids, places): (&DeviceBuffer<u32>, Places<'_>),
+    fault: FaultSink,
+) -> Result<&'r GemmRoute, GpuError> {
+    let stream = cx.gpu.stream();
+    let slots = ml.top_k * cx.m;
+    let n = ml.n_card;
+    let route = routes
+        .iter_mut()
+        .find(|r| r.0 == n)
+        .map(|r| &mut r.1)
+        .ok_or_else(|| GpuError::shape(WHAT, format!("no routed table of {n} experts")))?;
+    match places {
+        Places::Ids => cx.wk.gemm.enqueue_route(stream, ids, slots, route, fault)?,
+        Places::Cut { map } => cx
+            .g32
+            .enqueue_route_remap(stream, ids, map, slots, route, fault)?,
+    }
+    Ok(route)
+}
+
+/// The routed experts on 32-value stacks over the pass's `TOP_K · m` slots,
+/// at any row count: the slots' table ([`fill_route`]), the up as one
+/// 32-value GEMM on the experts' input rows `x` (each row's `TOP_K` slots
+/// reading its column), the squared ReLU folded into the down's q8 blocks of
+/// 32, the down as one 32-value GEMM on each slot's own row. Each stack is
+/// read by the GEMM the kernel table names for its type ([`StackW::route`]).
+fn experts_gemm32(
+    cx: &Cx<'_>,
+    ex: &mut ExpertArms,
+    (fault, ml, width): (FaultSink, &MoeLayer, usize),
+    (ids, places): (&DeviceBuffer<u32>, Places<'_>),
+    (x, up, down): (
+        &DeviceBuffer<f32>,
+        &mut DeviceBuffer<f32>,
+        &mut DeviceBuffer<f32>,
+    ),
+) -> Result<(), GpuError> {
+    let (gpu, w, m) = (cx.gpu, cx.w, cx.m);
+    let stream = gpu.stream();
+    let slots = ml.top_k * m;
+    let route = fill_route(cx, &mut ex.routes, ml, (ids, places), fault)?;
+    {
+        let a = gemm32_form(&mut ex.acts32, width, m)?;
+        cx.g32.enqueue_quantize_gemm32(stream, x, m, a, fault)?;
+        cx.g32.enqueue_gemm32(
+            stream,
+            Gemm32Args {
+                w: gemm32_stack(w, ml.up()?)?,
+                rows_per_expert: ml.ff,
+                act: a,
+                route,
+                input: GemmInput::Shared { top_k: ml.top_k },
+                y: up,
+            },
+        )?;
+    }
+    let a = gemm32_form(&mut ex.acts32, ml.ff, slots)?;
+    cx.g32
+        .enqueue_quantize_gemm32_relu_sqr(stream, up, slots, a, fault)?;
+    cx.g32.enqueue_gemm32(
+        stream,
+        Gemm32Args {
+            w: gemm32_stack(w, ml.down()?)?,
+            rows_per_expert: width,
+            act: a,
+            route,
+            input: GemmInput::PerSlot,
+            y: down,
+        },
+    )
+}
+
+/// The 32-value GEMM form of `cols` columns of `k` values in `acts`.
+fn gemm32_form(
+    acts: &mut [(usize, usize, GemmAct32)],
+    k: usize,
+    cols: usize,
+) -> Result<&mut GemmAct32, GpuError> {
+    acts.iter_mut()
+        .find(|a| a.0 == k && a.1 >= cols)
+        .map(|a| &mut a.2)
+        .ok_or_else(|| {
+            GpuError::shape(
+                WHAT,
+                format!("no 32-value GEMM form of {cols} columns of {k}"),
+            )
+        })
+}
+
+/// The resident routed stack `name` as the 32-value GEMM reads it: the file's
+/// blocks as words, of a type the kernel table names a 32-value GEMM for.
+fn gemm32_stack<'w>(w: &'w Weights, name: &str) -> Result<Gemm32Weight<'w>, GpuError> {
+    match w.resident(WHAT, name)? {
+        DevWeight::KQuant { ty, w: t, .. } => match StackW::Words(t).route(*ty) {
+            Some(RouteW::Blocks32(g)) => Ok(g),
+            _ => Err(GpuError::tensor(
+                WHAT,
+                name,
+                "a stack of a type the 32-value GEMM reads",
+            )),
+        },
+        _ => Err(GpuError::tensor(
+            WHAT,
+            name,
+            "a weight in the file's blocks",
+        )),
+    }
 }
 
 /// The shared expert over the pass's `m` rows of `xn` past [`COLS`] rows:

@@ -11125,6 +11125,72 @@ def ref_paths_self_test(expect) -> None:
             fh.write(b"not a gguf at all")
         rc, out, err = run("qwen4exp", "fixture_budget", BLOOMERY_TIER="fixture")
         expect(rc == 65 and "is not a GGUF file" in err, f"ref-paths: a file that is no GGUF: {rc} {out!r} {err!r}")
+        write(first, whole)
+        rc, out, err = run("qwen4exp", 'echo "$FIXTURE_MODEL"', BLOOMERY_TIER="fixture", BLOOMERY_REF_MODEL="/x/own.gguf")
+        expect(rc == 0 and out.strip() == first, f"ref-paths: a GGUF fixture's model is its first shard, whatever the caller's: {rc} {out!r} {err!r}")
+
+        # A checkpoint-folder fixture (`fixture cut`, a directory with model.safetensors.index.json): the model is the folder, the
+        # first shard is the fixture file, and its budget is a decimal string in the shard's safetensors `__metadata__`.
+        with open(os.path.join(tmp, "tools/ref/models/minimax-m3.sh"), "w", encoding="utf-8") as fh:
+            fh.write("MODEL_NAME=minimax-m3\nMODEL=${BLOOMERY_REF_MODEL:-/models/real/MiniMax-M3.1-Flash}\n")
+        cut_dir = os.path.join(root, "minimaxm31")
+        os.makedirs(cut_dir)
+        with open(os.path.join(cut_dir, "model.safetensors.index.json"), "w", encoding="utf-8") as fh:
+            fh.write('{"metadata": {}, "weight_map": {}}')
+        cut_first = os.path.join(cut_dir, "model-00001-of-00002.safetensors")
+
+        def write_cut(path: str, meta: dict) -> None:
+            header = json.dumps({"__metadata__": meta}).encode()
+            header += b" " * (-len(header) % 8)
+            with open(path, "wb") as fh:
+                fh.write(len(header).to_bytes(8, "little") + header)
+
+        cut_whole = {"bloomery.fixture.version": "1", "bloomery.fixture.card_budget": "6190000000"}
+        write_cut(cut_first, cut_whole)
+        show_cut = 'echo "$MODEL|$FIXTURE_FILE|$FIXTURE_DIR|$FIXTURE_MODEL"'
+        rc, out, err = run("minimax-m3", f"{show_cut}; fixture_budget", BLOOMERY_TIER="fixture")
+        expect(rc == 0 and out.split() == [f"{cut_dir}|{cut_first}|{cut_dir}|{cut_dir}", "6190000000"],
+               f"ref-paths: a folder fixture's model is the folder and its file the first shard: {rc} {out!r} {err!r}")
+        rc, out, err = run("minimax-m3", show_cut)
+        expect(rc == 0 and out.strip() == "/models/real/MiniMax-M3.1-Flash|||", f"ref-paths: a folder family's real tier: {rc} {out!r} {err!r}")
+        rc, out, err = run("minimax-m3", show_cut, BLOOMERY_TIER="fixture", BLOOMERY_REF_MODEL="/x/own")
+        expect(rc == 0 and out.strip() == f"/x/own|{cut_first}|{cut_dir}|{cut_dir}",
+               f"ref-paths: a caller's own folder does not win, or the fixture is not named: {rc} {out!r} {err!r}")
+        rc, out, err = run("minimax-m3", 'fixture_dump_tier t && echo "$SET_PREFIX"', BLOOMERY_TIER="fixture")
+        expect(rc == 0 and out.strip() == "fx_", f"ref-paths: a folder fixture's dump is fx_: {rc} {out!r} {err!r}")
+        rc, out, err = run("minimax-m3", "fixture_dump_tier t", BLOOMERY_TIER="fixture", BLOOMERY_REF_MODEL="/x/own")
+        expect(rc == 64 and f"not the fixture {cut_dir}" in err, f"ref-paths: a folder fixture's dump of another model: {rc} {out!r} {err!r}")
+        for why, meta in (("has no bloomery.fixture.version key", {"bloomery.fixture.card_budget": "5"}),
+                          ("carries bloomery.fixture.subset", {**cut_whole, "bloomery.fixture.subset": "1"}),
+                          ("records no positive bloomery.fixture.card_budget", {"bloomery.fixture.version": "1"}),
+                          ("records no positive bloomery.fixture.card_budget", {**cut_whole, "bloomery.fixture.card_budget": "0"}),
+                          ("records no positive bloomery.fixture.card_budget", {**cut_whole, "bloomery.fixture.card_budget": "-5"}),
+                          ("records no positive bloomery.fixture.card_budget", {**cut_whole, "bloomery.fixture.card_budget": "12x"}),
+                          ("is not a string, which a safetensors metadata value is", {**cut_whole, "bloomery.fixture.card_budget": 5})):
+            write_cut(cut_first, meta)
+            rc, out, err = run("minimax-m3", "fixture_budget", BLOOMERY_TIER="fixture")
+            expect(rc == 65 and out == "" and why in err, f"ref-paths: a folder whose first shard {why} ({meta}): {rc} {out!r} {err!r}")
+        for blob in (b"short", (1 << 30).to_bytes(8, "little") + b"{}", (2).to_bytes(8, "little") + b"[]", (2).to_bytes(8, "little") + b"{{"):
+            with open(cut_first, "wb") as fh:
+                fh.write(blob)
+            rc, out, err = run("minimax-m3", "fixture_budget", BLOOMERY_TIER="fixture")
+            expect(rc == 65 and out == "" and "not a readable safetensors header" in err, f"ref-paths: a first shard that is no safetensors file ({blob[:12]!r}): {rc} {out!r} {err!r}")
+        write_cut(cut_first, cut_whole)
+        cut_second = os.path.join(cut_dir, "other-00001-of-00002.safetensors")
+        write_cut(cut_second, cut_whole)
+        rc, out, err = run("minimax-m3", show_cut, BLOOMERY_TIER="fixture")
+        expect(rc == 66 and "holds 2 first shards" in err and "other-00001-of-00002.safetensors" in err, f"ref-paths: a folder with two first shards: {rc} {out!r} {err!r}")
+        os.remove(cut_second)
+        os.remove(cut_first)
+        rc, out, err = run("minimax-m3", show_cut, BLOOMERY_TIER="fixture")
+        expect(rc == 66 and "has no fixture file" in err and "minimaxm31/*-00001-of-*.safetensors" in err and "fixture cut" in err,
+               f"ref-paths: a folder with no first shard: {rc} {out!r} {err!r}")
+        write_cut(cut_first, cut_whole)
+        stray = os.path.join(cut_dir, "stray-00001-of-00001.gguf")
+        write(stray, whole)
+        rc, out, err = run("minimax-m3", show_cut, BLOOMERY_TIER="fixture")
+        expect(rc == 66 and "both a checkpoint folder's index and GGUF first shards" in err, f"ref-paths: a folder beside a GGUF first shard: {rc} {out!r} {err!r}")
+        os.remove(stray)
 
 
 def box_tier_self_test(expect) -> None:
@@ -11245,8 +11311,10 @@ def key_reach_self_test(expect, side: Side) -> None:
     expect(chain == [], f"why: gate-gpu-p1 links hf: {chain}")
     chain = why_chains(side, "gate-gpu-glm5next-twocard", "crates/hf/src/lib.rs")
     expect(any(c.endswith("generate_glm5next: bloomery-gpu-gates -> bloomery-hf") for c in chain), f"why: gate-gpu-glm5next-twocard's chain to hf is {chain}")
+    # gate-hf runs the crate's lib tests and its minimax_encode test target, each its own package's
     chain = why_chains(side, "gate-hf", "crates/hf/src/lib.rs")
-    expect(chain == ["bloomery-hf libtest: its own package"], f"why: gate-hf's chain to hf is {chain}")
+    expect(chain == ["bloomery-hf libtest: its own package", "bloomery-hf test minimax_encode: its own package"],
+           f"why: gate-hf's chain to hf is {chain}")
     for name in ("gate-decision-clef", "gate-decision-lev"):
         expect(side.graph.inputs(name).match("crates/hf/src/lib.rs") is None, f"{name} keys unrelated hub code")
     expect(
@@ -12641,9 +12709,11 @@ def _st_real_tree(fails: list[str], side: Side) -> None:
     # PIN(2026-10-20): gate-gpu-solar2-serve joins them; its recipe builds bloomery-serve beside its own bin.
     # PIN(2026-10-21): gate-gpu-minimaxm3-serve joins them; its recipe (justfile) builds bloomery-serve beside its own bin.
     # PIN(2026-10-22): gate-gpu-qwen3-dspark joins them; its recipe builds bloomery-serve for the qwen3 seat's draft arms.
+    # PIN(2026-10-23): gate-gpu-musespark-serve joins them; its recipe builds bloomery-serve beside its own bin, whose Muse seat names the module.
+    # PIN(2026-10-23): gate-gpu-minimaxm3-twocard and gate-gpu-musespark-twocard join them; each runs its serve gate, which builds bloomery-serve.
     expect(dspark == {"gate-gpu-clef-serve", "gate-gpu-ds41-chat", "gate-gpu-ds41-draft", "gate-gpu-ds41-dspark-loop",
                       "gate-gpu-ds41-prefill", "gate-gpu-ds41-tier", "gate-gpu-ds41-twocard", "gate-gpu-gemma-embedding-serve", "gate-gpu-gemma-embedding2-serve", "gate-gpu-glm5next-serve",
-                      "gate-gpu-lev-serve", "gate-gpu-minimaxm3-serve", "gate-gpu-nemotron-h-moe-serve", "gate-gpu-nemotron-serve",
+                      "gate-gpu-lev-serve", "gate-gpu-minimaxm3-serve", "gate-gpu-minimaxm3-twocard", "gate-gpu-musespark-serve", "gate-gpu-musespark-twocard", "gate-gpu-nemotron-h-moe-serve", "gate-gpu-nemotron-serve",
                       "gate-gpu-qwen3-dspark", "gate-gpu-qwen3-serve", "gate-gpu-qwen38-media", "gate-gpu-serve-start-ds41", "gate-gpu-serve-start-glm", "gate-gpu-solar2-serve", "gate-ptx-spill", "gate-serve-draft-rules"},
            f"shared/ds41_dspark.rs (a #[path] module of the bins that name it) selects {sorted(dspark)}")
     hybrid = sel("crates/gpu/src/hybrid.rs")

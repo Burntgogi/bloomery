@@ -34,26 +34,29 @@ brew install midagedev/tap/bloomery        # Linux x86-64, NVIDIA sm_86+
 bloomery-serve --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M --port 8080
 ```
 
-## Status (0.3.8)
+## Status (0.3.9)
 
-0.3.8 runs more of the Qwen3 MoE experts on the card: Qwen3.6 and Qwen3-30B `Q8_0`, `Q6_K`, `IQ4_XS` and `IQ3_S` stacks
-that stayed on the host now take the card leg. On one RTX 3090 at its 250 W cap, at the serving defaults (ctx 262,144),
-Qwen3.6-35B-A3B `Q8_0` decodes at 89.60 tok/s (68.73 before). Raon-1-mini's prompt runs in wide units: pp512 2,507.5
-tok/s (312.4 before). Nemotron-3.5-Lightning runs on the `nemotron` seat. Every row is in the
-[release notes](https://github.com/midagedev/bloomery/releases/tag/v0.3.8).
+0.3.9 adds two large mixture-of-experts models on an RTX A6000 + RTX 3090 (the 3090 at its 250 W cap), both at the
+serving defaults with `--place` unset (it picks `bp`): Muse Spark Open 816B-A42B (`UD-IQ2_XXS` GGUF) and
+MiniMax-M3.1-Flash, read straight from its native NVFP4 safetensors folder. Muse Spark Open: pp512 90.40 tok/s, decode
+16.65 tok/s after a 512-token prompt. MiniMax-M3.1-Flash: pp512 122.57 tok/s, decode 21.03 tok/s after a 512-token
+prompt. `bloomery-serve` reads llama-server's placement flags (`-dev`, `-ts`, `-ngl`, `--cpu-moe`, `-ot`, `--fit`, …)
+with llama's meaning. Every row is in the [release notes](https://github.com/midagedev/bloomery/releases/tag/v0.3.9).
 
 | What runs | State |
 |---|---|
 | NVIDIA cards | Compute capability 8.6 or newer, driver R580 or newer (CUDA 13); an older driver is refused at the start. Run here: RTX 3090, RTX A6000, RTX 3060 (WSL2). Run by users: RTX 5090 ([#2](https://github.com/midagedev/bloomery/issues/2)), DGX Spark (GB10, from source: [`docs/contrib/dgx-spark.md`](docs/contrib/dgx-spark.md)). Ada (sm_89): no report yet |
 | Host CPU | x86-64 with AVX2 (x86-64-v3), AMD or Intel. The release binaries are x86-64 only |
-| OS | Linux x86-64 with glibc 2.34 or newer; Windows through WSL2. macOS (a Metal backend is in progress, [#593](https://github.com/midagedev/bloomery/issues/593)) and AMD GPUs are not supported yet |
+| OS | Linux x86-64 with glibc 2.34 or newer; Windows through WSL2. macOS on Apple Silicon: a Metal backend serves Qwen3.6-35B-A3B, built from source ([#593](https://github.com/midagedev/bloomery/issues/593)); the release binaries are Linux only. AMD GPUs are not supported yet |
 
-### Known limits (0.3.8)
+### Known limits (0.3.9)
 
 - DeepSeek V4.1 on two cards (`--place bp`) is not faster than one card (`--place a`). Unset `--place` picks `a`.
-- The `nemotron`, `raon1`, `solar2` and `minimaxm3` seats serve one slot and keep no saved prompt states; `--parallel` above 1 is refused by name.
+- The `nemotron`, `raon1`, `solar2` and `musespark` seats serve one slot and keep no saved prompt states; `--parallel` above 1 is refused by name.
 - `--place bp` is refused by name on the `nemotron` seat, Qwen3.6 and Qwen3-30B; they run one card plus the host tier.
 - Nemotron-3.5-Lightning `UD-Q4_K_XL` is a placed load: its whole-card expert body is IQ2_XXS, and the other expert types stay on the host.
+- Muse Spark Open always thinks: a turn's first tokens are its reasoning, so a short `max_tokens` can end with empty `content`.
+- MiniMax-M3 (not M3.1) was not checked for 0.3.9.
 - IQ2_S and IQ1_M routed experts do not load.
 - GLM-5.3 holds at most 16,384 positions a slot; a `--ctx-size` whose slot share is larger is refused at the start.
 
@@ -78,12 +81,12 @@ docker run --gpus all -p 8080:8080 -v bloomery-cache:/root/.cache/bloomery \
   ghcr.io/midagedev/bloomery --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M
 
 # or the plain tarball
-tar -xzf bloomery-0.3.8-linux-x86_64-cuda-sm86.tar.gz && cd bloomery-0.3.8-linux-x86_64-cuda-sm86
+tar -xzf bloomery-0.3.9-linux-x86_64-cuda-sm86.tar.gz && cd bloomery-0.3.9-linux-x86_64-cuda-sm86
 bin/bloomery-serve --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M --port 8080
 ```
 
 The tarballs are on the [releases page](https://github.com/midagedev/bloomery/releases)
-([0.3.8](https://github.com/midagedev/bloomery/releases/tag/v0.3.8)). From source: [`docs/BUILD.md`](docs/BUILD.md).
+([0.3.9](https://github.com/midagedev/bloomery/releases/tag/v0.3.9)). From source: [`docs/BUILD.md`](docs/BUILD.md).
 
 ## Use
 
@@ -98,10 +101,10 @@ One binary, ten seats; the file's architecture picks the seat, and `--place` can
 | `mimo2` | [MiMo-V2.6-Flash](https://huggingface.co/ggml-org/MiMo-V2.6-Flash-MOPD-GGUF) | `bloomery-serve --hf ggml-org/MiMo-V2.6-Flash-MOPD-GGUF:MXFP4` |
 | `decide` | [Clef-Flash](https://huggingface.co/Cloudflare/clef-flash) and [lev](https://huggingface.co/ggml-org/lev-GGUF) (decision models) | `bloomery-serve --hf bartowski/Cloudflare_clef-flash-GGUF:Q5_K_M` |
 
-Four more seats serve a file on disk:
+Five more seats serve a file on disk:
 `nemotron` (Nemotron 3 Nano 4B, Nemotron 3.5 Bolt 74B-A9B, Nemotron-3.5-Lightning 30B-A3B), `raon1`
-(Raon-1-mini-preview, with its DFlash2 draft file beside it), `minimaxm3` (MiniMax-M3) and `solar2` (Solar-Open2-250B
-on two cards, `--place bp`). For example: `bloomery-serve -m PATH/raon-1-mini-preview-Q4_K_M.gguf`.
+(Raon-1-mini-preview, with its DFlash2 draft file beside it), `minimaxm3` (MiniMax-M3.1-Flash's NVFP4 folder; MiniMax-M3
+unverified), `musespark` (Muse Spark Open 816B-A42B) and `solar2` (Solar-Open2-250B on two cards, `--place bp`). For example: `bloomery-serve -m PATH/raon-1-mini-preview-Q4_K_M.gguf`.
 The table above lists the seats with a checked `--hf` row. The qwen38 seat also serves NVIDIA's NVFP4 checkpoint
 folder as downloaded, with no conversion, on a card that holds every routed expert such as a DGX Spark's GB10:
 `bloomery-serve -m PATH/Qwen3.8-Flash-Next-NVFP4` or `bloomery-serve --hf nvidia/Qwen3.8-Flash-Next-NVFP4`

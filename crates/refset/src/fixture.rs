@@ -16,6 +16,13 @@
 //! fixture table: the string it returns is the one the dumper is given, so it
 //! is the one a set's `# model` states.
 //!
+//! A fixture is a GGUF split (`fixture generate`) or a checkpoint folder cut in its
+//! stored bits (`fixture cut`, `model_hf::cut`): a directory that holds
+//! `model.safetensors.index.json` is the second kind, its first shard is the
+//! `*-00001-of-*.safetensors` beside the index, and its `bloomery.fixture.*` keys are
+//! the string entries of that shard's safetensors `__metadata__`, each already the
+//! text the line shows.
+//!
 //! A fixture variant is the fixture requantized to a type map
 //! (`tools/fixture-variants.tsv`): `$BLOOMERY_FIXTURE_VARIANT` moves the root to
 //! `<parent of root>/fixture-variants/<tag>` ([`root`]), the file's `bloomery.fixture.variant`
@@ -44,6 +51,15 @@ pub const LINE_PREFIX: &str = "# fixture\t";
 /// The architecture-to-directory table, `tools/fixture-dirs.tsv`: a row `arch<TAB>dir` a line, `#` and blank lines aside. The
 /// shell reads the same file (`tools/ref/ref-paths.sh`).
 const DIRS_TABLE: &str = include_str!("../../../tools/fixture-dirs.tsv");
+
+/// The index of a checkpoint folder, the file that makes a fixture directory a folder's.
+const INDEX: &str = "model.safetensors.index.json";
+/// The file name ends of a GGUF fixture's shards and of a cut folder's.
+const GGUF: &str = ".gguf";
+const SAFETENSORS: &str = ".safetensors";
+
+/// The most a safetensors header may be: a length past it is a corrupt file, not a header to read.
+const MAX_HEADER: u64 = 64 << 20;
 
 /// A row's `dir` for a family with no fixture file of its own: a command runs on the profile's file, and there is no directory.
 const SELF: &str = "self";
@@ -243,11 +259,15 @@ pub fn variant_set_name(tag: &str, base: &str) -> String {
     }
 }
 
-/// The variant the fixture file `first_shard` is: its `bloomery.fixture.variant` key, none on a base fixture.
+/// The variant the fixture file `first_shard` is: its `bloomery.fixture.variant` key, none on a base fixture
+/// and on a cut folder's shard (a folder fixture has no variants).
 ///
 /// # Errors
 /// A file that is not a readable GGUF header, or a key that is not a string.
 pub fn variant_of(first_shard: &Path) -> Result<Option<String>, RefError> {
+    if is_safetensors(first_shard) {
+        return Ok(None);
+    }
     let file = first_shard.display().to_string();
     let g = Gguf::open(first_shard).map_err(|e| match e {
         LoadError::Io(io) => {
@@ -305,13 +325,14 @@ pub fn first_shard(arch: &str) -> Result<String, RefError> {
     ))
 }
 
-/// The fixture file of `arch` under `root`: the one file of the architecture's
-/// directory whose name matches `*-00001-of-*.gguf`, joined as
+/// The fixture file of `arch` under `root`: for a directory that holds a checkpoint folder's index
+/// (`model.safetensors.index.json`) the one `*-00001-of-*.safetensors` file beside it, for any other
+/// the one file whose name matches `*-00001-of-*.gguf`, joined as
 /// `"{root}/{dir}/{file}"` (never normalized, so a trailing `/` on `root`
 /// stays, as it does in the shell). An architecture with no fixture directory,
-/// a directory that cannot be listed, and one holding no such file or more than
-/// one are [`RefError::Missing`], naming the architecture or the directory and
-/// what was found.
+/// a directory that cannot be listed, one holding no such file or more than
+/// one, and one holding a folder's index and a GGUF first shard are [`RefError::Missing`], naming the
+/// architecture or the directory and what was found.
 pub fn first_shard_in(root: &str, arch: &str) -> Result<String, RefError> {
     let Some(dir) = dir_of(arch) else {
         let known: Vec<&str> = dirs().into_iter().map(|(a, _)| a).collect();
@@ -325,51 +346,79 @@ pub fn first_shard_in(root: &str, arch: &str) -> Result<String, RefError> {
     first_shard_at(&format!("{root}/{dir}"), "`fixture generate` writes it")
 }
 
-/// The one file of directory `at` whose name matches `*-00001-of-*.gguf`,
-/// joined as `"{at}/{file}"`: a fixture's first shard. A directory that
-/// cannot be listed, an entry that cannot be read, a first shard whose name
-/// is not UTF-8, and none or more than one are [`RefError::Missing`], naming
-/// the directory and what was found; `maker` says what writes the file.
+/// The first shard of directory `at`, joined as `"{at}/{file}"`: for a directory that holds a
+/// checkpoint folder's index (`model.safetensors.index.json`) the one `*-00001-of-*.safetensors`
+/// file beside it, for any other the one `*-00001-of-*.gguf`. A directory that cannot be listed,
+/// an entry that cannot be read, a first shard whose name is not UTF-8, none or more than one, and
+/// a folder's index beside a GGUF first shard are [`RefError::Missing`], naming the directory and
+/// what was found; `maker` says what writes a GGUF split (a folder is cut by `fixture cut`).
 pub fn first_shard_at(at: &str, maker: &str) -> Result<String, RefError> {
     let entries = std::fs::read_dir(at)
         .map_err(|e| RefError::missing(at, format!("fixture: cannot list {at}: {e}")))?;
-    let mut found: Vec<String> = Vec::new();
+    let (mut ggufs, mut shards): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
     for entry in entries {
         let name = entry
             .map_err(|e| RefError::missing(at, format!("fixture: cannot list {at}: {e}")))?
             .file_name();
-        if !is_first_shard(&name.to_string_lossy()) {
+        let kind = [GGUF, SAFETENSORS]
+            .into_iter()
+            .find(|ext| is_first_shard(&name.to_string_lossy(), ext));
+        let Some(kind) = kind else {
             continue;
-        }
+        };
         let name = name.into_string().map_err(|name| {
             RefError::missing(
                 at,
                 format!("fixture: {at} holds a first shard whose name is not UTF-8: {name:?}"),
             )
         })?;
-        found.push(name);
+        if kind == GGUF {
+            ggufs.push(name);
+        } else {
+            shards.push(name);
+        }
     }
+    let folder = Path::new(at).join(INDEX).is_file();
+    if folder && !ggufs.is_empty() {
+        ggufs.sort();
+        return Err(RefError::missing(
+            at,
+            format!(
+                "fixture: {at} holds both a checkpoint folder's index and GGUF first shards {ggufs:?}, \
+                 which are two fixtures in one directory"
+            ),
+        ));
+    }
+    let (mut found, ext, made) = if folder {
+        (shards, SAFETENSORS, "`fixture cut` writes it")
+    } else {
+        (ggufs, GGUF, maker)
+    };
     found.sort();
     match found.as_slice() {
         [one] => Ok(format!("{at}/{one}")),
         _ => Err(RefError::missing(
             at,
             format!(
-                "fixture: {at} holds {} first shards (*-00001-of-*.gguf): {found:?}, want one \
-                 ({maker})",
+                "fixture: {at} holds {} first shards (*-00001-of-*{ext}): {found:?}, want one \
+                 ({made})",
                 found.len()
             ),
         )),
     }
 }
 
-/// Whether the shell's glob `*-00001-of-*.gguf` matches `name`: not a hidden
-/// file, ending `.gguf`, with `-00001-of-` somewhere before that.
-fn is_first_shard(name: &str) -> bool {
+/// Whether the shell's glob `*-00001-of-*<ext>` matches `name`: not a hidden
+/// file, ending `ext`, with `-00001-of-` somewhere before that.
+fn is_first_shard(name: &str, ext: &str) -> bool {
     !name.starts_with('.')
         && name
-            .strip_suffix(".gguf")
+            .strip_suffix(ext)
             .is_some_and(|stem| stem.contains("-00001-of-"))
+}
+
+fn is_safetensors(path: &Path) -> bool {
+    path.extension().is_some_and(|e| e == "safetensors")
 }
 
 /// The `# fixture` line of the fixture file whose first shard is
@@ -421,6 +470,9 @@ fn without_budget(text: &str) -> String {
 /// character, and a key given twice are [`RefError::Malformed`], each naming
 /// the file and the key.
 pub fn keys(first_shard: &Path) -> Result<String, RefError> {
+    if is_safetensors(first_shard) {
+        return folder_keys(first_shard);
+    }
     let file = first_shard.display().to_string();
     let g = Gguf::open(first_shard).map_err(|e| match e {
         LoadError::Io(io) => {
@@ -436,22 +488,36 @@ pub fn keys(first_shard: &Path) -> Result<String, RefError> {
         .filter(|(k, _)| k.starts_with(KEY_PREFIX))
         .collect();
     held.sort_by(|a, b| a.0.cmp(b.0));
-    if let Some(w) = held.windows(2).find(|w| w[0].0 == w[1].0) {
+    check_held(
+        first_shard,
+        &file,
+        &held.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
+    )?;
+    let mut parts = Vec::with_capacity(held.len());
+    for (key, v) in held.into_iter().filter(|(k, _)| *k != KEY_CARD_BUDGET) {
+        parts.push(format!("{key}={}", render(&file, key, v)?));
+    }
+    Ok(parts.join(" "))
+}
+
+/// `keys`, the fixture keys of a file sorted, are one value each, hold the version key and no subset key.
+fn check_held(first_shard: &Path, file: &str, keys: &[&str]) -> Result<(), RefError> {
+    if let Some(w) = keys.windows(2).find(|w| w[0] == w[1]) {
         return Err(RefError::malformed(
             format!("fixture: {file}"),
             format!(
                 "{} is given twice, so the file states two values for it",
-                w[0].0
+                w[0]
             ),
         ));
     }
-    if !held.iter().any(|(k, _)| *k == KEY_VERSION) {
+    if !keys.contains(&KEY_VERSION) {
         return Err(RefError::missing(
             first_shard,
             format!("fixture: {file} has no {KEY_VERSION} key: it is not a fixture file"),
         ));
     }
-    if held.iter().any(|(k, _)| *k == KEY_SUBSET) {
+    if keys.contains(&KEY_SUBSET) {
         return Err(RefError::malformed(
             format!("fixture: {file}"),
             format!(
@@ -459,11 +525,111 @@ pub fn keys(first_shard: &Path) -> Result<String, RefError> {
             ),
         ));
     }
+    Ok(())
+}
+
+/// [`keys`] of a checkpoint folder's first shard: the `bloomery.fixture.` entries of its
+/// safetensors `__metadata__`, whose values are strings that already hold the text the line shows.
+/// A value that is empty or holds whitespace, `=` or a control character, and a key stated twice in
+/// the header, are [`RefError::Malformed`], as in a GGUF's; a shard with no metadata is no fixture.
+fn folder_keys(first_shard: &Path) -> Result<String, RefError> {
+    let file = first_shard.display().to_string();
+    let bad = |why: String| RefError::malformed(format!("fixture: {file}"), why);
+    let (pairs, text) = shard_metadata(first_shard)?;
+    let mut held: Vec<(&str, &str)> = pairs
+        .iter()
+        .filter(|(k, _)| k.starts_with(KEY_PREFIX))
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    held.sort_by(|a, b| a.0.cmp(b.0));
+    if let Some((k, _)) = held
+        .iter()
+        .find(|(k, _)| text.matches(&format!("{}:", json_text(k))).count() > 1)
+    {
+        return Err(bad(format!(
+            "{k} is given twice, so the file states two values for it"
+        )));
+    }
+    check_held(
+        first_shard,
+        &file,
+        &held.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
+    )?;
     let mut parts = Vec::with_capacity(held.len());
     for (key, v) in held.into_iter().filter(|(k, _)| *k != KEY_CARD_BUDGET) {
-        parts.push(format!("{key}={}", render(&file, key, v)?));
+        if let Some(c) = v
+            .chars()
+            .find(|c| c.is_whitespace() || *c == '=' || c.is_control())
+        {
+            return Err(bad(format!(
+                "{key}: the string {v:?} holds {c:?}: whitespace, `=` and control characters \
+                 cannot be told apart from the line's own separators"
+            )));
+        }
+        if v.is_empty() {
+            return Err(bad(format!("{key}: an empty value states nothing")));
+        }
+        parts.push(format!("{key}={v}"));
     }
     Ok(parts.join(" "))
+}
+
+/// `s` as a JSON string, quotes included.
+fn json_text(s: &str) -> String {
+    serde_json::Value::from(s).to_string()
+}
+
+/// A safetensors shard's `__metadata__` entries (every `bloomery.fixture.` one a string) and its
+/// header text; the tensors' table is not read.
+fn shard_metadata(shard: &Path) -> Result<(Vec<(String, String)>, String), RefError> {
+    use std::io::Read;
+    let file = shard.display().to_string();
+    let bad = |why: String| RefError::malformed(format!("fixture: {file}"), why);
+    let mut f = std::fs::File::open(shard)
+        .map_err(|e| RefError::missing(shard, format!("fixture: cannot open {file}: {e}")))?;
+    let mut len = [0u8; 8];
+    f.read_exact(&mut len).map_err(|e| {
+        bad(format!(
+            "not a readable safetensors header: no length word: {e}"
+        ))
+    })?;
+    let n = u64::from_le_bytes(len);
+    if n > MAX_HEADER {
+        return Err(bad(format!(
+            "not a readable safetensors header: it claims {n} bytes, over {MAX_HEADER}"
+        )));
+    }
+    let mut text =
+        vec![0u8; usize::try_from(n).expect("a header of at most MAX_HEADER fits usize")];
+    f.read_exact(&mut text)
+        .map_err(|e| bad(format!("not a readable safetensors header: {e}")))?;
+    let text = String::from_utf8(text).map_err(|_| bad("the header is not UTF-8".to_string()))?;
+    let v: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| bad(format!("not a readable safetensors header: {e}")))?;
+    let Some(header) = v.as_object() else {
+        return Err(bad(
+            "not a readable safetensors header: not a JSON object".to_string()
+        ));
+    };
+    let Some(meta) = header.get("__metadata__") else {
+        return Ok((Vec::new(), text));
+    };
+    let Some(meta) = meta.as_object() else {
+        return Err(bad("__metadata__ is not an object".to_string()));
+    };
+    let mut pairs = Vec::with_capacity(meta.len());
+    for (k, v) in meta {
+        match v.as_str() {
+            Some(s) => pairs.push((k.clone(), s.to_string())),
+            None if k.starts_with(KEY_PREFIX) => {
+                return Err(bad(format!(
+                    "{k}: {v} is not a string, which a safetensors metadata value is"
+                )));
+            }
+            None => {}
+        }
+    }
+    Ok((pairs, text))
 }
 
 /// The text of value `v` of `key` in the line: see [`keys`].

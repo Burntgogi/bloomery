@@ -63,6 +63,8 @@ impl Body {
         x: &[f32],
         ffn_x: Option<&[f32]>,
     ) -> Result<ForcedRow, GpuError> {
+        // A two-card load may leave the tier card's context current; the row's buffers are the stage card's.
+        gpu.context().bind_to_thread()?;
         let ctx = self.ctx();
         let n = self.dims.embd;
         if l >= self.cfg.len() {

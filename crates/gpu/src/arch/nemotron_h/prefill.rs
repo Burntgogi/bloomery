@@ -27,7 +27,7 @@ use crate::gemm::GemmRoute;
 use crate::head::Head;
 use crate::mamba2::{Mamba2PassScratch, StepsArgs};
 use crate::model::{GpuModel, MAX_PASS_ROWS};
-use crate::site::{WideActs, WideKernels};
+use crate::site::{WideActs, WideForms, WideKernels};
 use crate::tensor::WindowMut;
 use crate::weights::{DevWeight, Weights};
 use crate::{Gpu, GpuError, Window, launch_u32};
@@ -94,21 +94,18 @@ impl Prompt {
         };
         let kv_width = sh.n_kv * HEAD;
         let mut acts: Vec<ActAt> = Vec::new();
-        let mut forms: Vec<(usize, bool, bool)> = Vec::new();
+        let mut forms: Vec<(usize, WideForms)> = Vec::new();
         for s in layers.iter().flat_map(Layer::sites) {
-            let (q128, q32) = WideActs::wants(s.ty);
+            let want = WideActs::wants(s.ty).without_f32();
             match forms.iter_mut().find(|f| f.0 == s.k) {
-                Some(f) => {
-                    f.1 |= q128;
-                    f.2 |= q32;
-                }
-                None => forms.push((s.k, q128, q32)),
+                Some(f) => f.1 = f.1.union(want),
+                None => forms.push((s.k, want)),
             }
         }
-        for (k, q128, q32) in forms {
+        for (k, want) in forms {
             acts.push(ActAt {
                 k,
-                acts: WideActs::new(stream, (q128, q32), rows, k)?,
+                acts: WideActs::new(stream, want, rows, k)?,
             });
         }
         let n_words = P_ROWS + sh.n_kv + rows;

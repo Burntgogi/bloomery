@@ -365,7 +365,8 @@ enum Expr {
     ),
     Call(Box<Expr>, Vec<Expr>, Vec<(String, Expr)>),
     Filter(Box<Expr>, String, Vec<Expr>, Vec<(String, Expr)>),
-    Test(Box<Expr>, String, bool),
+    /// `x is [not] name [args]`: the value, the test, its arguments and the `not`.
+    Test(Box<Expr>, String, Vec<Expr>, bool),
     Not(Box<Expr>),
     Neg(Box<Expr>),
     Bin(Box<Expr>, BinOp, Box<Expr>),
@@ -1026,10 +1027,39 @@ impl Lexer {
             } else if self.eat_name("is") {
                 let negate = self.eat_name("not");
                 let name = self.name()?;
-                e = Expr::Test(Box::new(e), name, negate);
+                let args = self.test_args()?;
+                e = Expr::Test(Box::new(e), name, args, negate);
             } else {
                 return Ok(e);
             }
+        }
+    }
+
+    /// A test's arguments, as jinja2 reads them: a parenthesised list as a
+    /// call's, or the one primary expression (with its subscripts and
+    /// attributes) that follows the name, as `is sameas false` has. A word
+    /// that continues the enclosing expression (`else`, `if`, `or`, `and`,
+    /// `in`, `is`, `not`) opens no argument.
+    fn test_args(&mut self) -> Result<Vec<Expr>, TemplateError> {
+        if self.eat_op("(") {
+            let (args, kwargs) = self.args()?;
+            if !kwargs.is_empty() {
+                return err("a test takes no keyword argument");
+            }
+            return Ok(args);
+        }
+        let opens = match self.peek() {
+            Some(Tok::Name(n)) => !matches!(
+                n.as_str(),
+                "else" | "if" | "or" | "and" | "in" | "is" | "not"
+            ),
+            Some(Tok::Str(_) | Tok::Int(_) | Tok::Float(_) | Tok::Op("[" | "{")) => true,
+            _ => false,
+        };
+        if opens {
+            Ok(vec![self.postfix()?])
+        } else {
+            Ok(Vec::new())
         }
     }
 
@@ -1898,9 +1928,13 @@ impl Renderer {
                 let kwargs = self.eval_kwargs(kwargs)?;
                 filter(v, name, &args, &kwargs, self.floats)?
             }
-            Expr::Test(x, name, negate) => {
+            Expr::Test(x, name, args, negate) => {
                 let v = self.eval(x)?;
-                V::J(Value::Bool(test(&v, name)? != *negate))
+                let args: Vec<V> = args
+                    .iter()
+                    .map(|a| self.eval(a))
+                    .collect::<Result<_, _>>()?;
+                V::J(Value::Bool(test(&v, name, &args)? != *negate))
             }
             Expr::Not(x) => V::J(Value::Bool(!self.eval(x)?.truthy())),
             Expr::Neg(x) => match self.eval(x)? {
@@ -2488,6 +2522,9 @@ fn filter(
     if name == "replace" {
         return replace_filter(v, args, kwargs);
     }
+    if name == "join" {
+        return join_filter(v, args, kwargs);
+    }
     if !args.is_empty() || !kwargs.is_empty() {
         return err(format!("|{name} takes no arguments"));
     }
@@ -2556,6 +2593,35 @@ fn bind_args<'a, const N: usize>(
         }
     }
     Ok(slots)
+}
+
+/// `join(d='')` without autoescape: Python's `str()` of each item of a list (a mapping's keys, a
+/// string's characters; nothing for undefined), the separator's `str()` between them.
+fn join_filter(v: V, args: &[V], kwargs: &[(&str, V)]) -> Result<V, TemplateError> {
+    let slots = bind_args("|join", ["d", "attribute"], args, kwargs)?;
+    if slots[1].is_some_and(|a| !matches!(a, V::J(Value::Null))) {
+        return err("|join: attribute is not supported");
+    }
+    let sep = slots[0].map(to_str).transpose()?.unwrap_or_default();
+    let items: Vec<Value> = match v {
+        V::J(Value::Array(a)) => a,
+        V::J(Value::Object(m)) => m.into_iter().map(|(k, _)| Value::String(k)).collect(),
+        V::J(Value::String(s)) => s.chars().map(|c| Value::String(c.to_string())).collect(),
+        V::Undef => Vec::new(),
+        other => {
+            return err(format!(
+                "|join needs a list, a mapping or a string, not {other:?}"
+            ));
+        }
+    };
+    let mut out = String::new();
+    for (i, item) in items.into_iter().enumerate() {
+        if i > 0 {
+            out.push_str(&sep);
+        }
+        V::J(item).render(&mut out)?;
+    }
+    Ok(V::J(Value::String(out)))
 }
 
 /// `replace(old, new, count=None)` without autoescape: Python's `str()` on
@@ -2631,7 +2697,24 @@ fn to_str(v: &V) -> Result<String, TemplateError> {
     Ok(s)
 }
 
-fn test(v: &V, name: &str) -> Result<bool, TemplateError> {
+fn test(v: &V, name: &str, args: &[V]) -> Result<bool, TemplateError> {
+    if name == "sameas" {
+        let [other] = args else {
+            return err(format!(
+                "`is sameas` takes one argument, got {}",
+                args.len()
+            ));
+        };
+        // Identity, as Python's `is` on the values a template compares by it: the booleans and
+        // `none`; a number, a string or a container is never the same object as another value.
+        return Ok(matches!(
+            (v, other),
+            (V::J(Value::Bool(a)), V::J(Value::Bool(b))) if a == b
+        ) || matches!((v, other), (V::J(Value::Null), V::J(Value::Null))));
+    }
+    if !args.is_empty() {
+        return err(format!("`is {name}` takes no argument"));
+    }
     Ok(match name {
         "defined" => !matches!(v, V::Undef),
         "undefined" => matches!(v, V::Undef),
@@ -3314,6 +3397,70 @@ mod tests {
         }
         let e = render_err("{{ 'a'.split('') }}", vars);
         assert!(e.contains("empty separator"), "{e}");
+    }
+
+    /// `is sameas` takes its argument as jinja2 reads one: the primary that follows the name, or a
+    /// parenthesised one, by identity with the booleans and `none`; a word that continues the
+    /// expression (`else`, `and`, `or`) opens no argument, and a test with no argument refuses
+    /// one. Each expected string is jinja2 3.1.6's render in the HF environment.
+    #[test]
+    fn sameas_takes_its_argument_as_jinja2_reads_it() {
+        let vars =
+            json!({"f": false, "t": true, "z": 0, "n": null, "d": {"k": false}, "l": [false]});
+        for (src, want) in [
+            (
+                "{{ f is sameas false }}{{ f is not sameas false }}{{ z is sameas false }}{{ t is sameas false }}",
+                "TrueFalseFalseFalse",
+            ),
+            (
+                "{{ n is sameas none }}{{ f is sameas none }}{{ n is sameas (none) }}{{ f is sameas(false) }}",
+                "TrueFalseTrueTrue",
+            ),
+            (
+                "{{ d.k is sameas false }}{{ l[0] is sameas false }}{{ f is sameas d.k }}{{ f is sameas l[0] }}",
+                "TrueTrueTrueTrue",
+            ),
+            (
+                "{{ 'a' if f is sameas false else 'b' }}{{ f is sameas false and t is sameas true }}{{ f is sameas false or z }}",
+                "aTrueTrue",
+            ),
+            (
+                "{% for m in [1] %}{% set x = f is sameas false %}{{ x }}{% endfor %}",
+                "True",
+            ),
+        ] {
+            assert_eq!(render(src, vars.clone()), want, "{src}");
+        }
+        let e = render_err("{{ f is defined(1) }}", vars.clone());
+        assert!(e.contains("takes no argument"), "{e}");
+        let e = render_err("{{ f is sameas }}", vars);
+        assert!(e.contains("takes one argument"), "{e}");
+    }
+
+    /// `join(d)` as jinja2 renders it: the `str()` of each item between the separator, which is
+    /// empty when none is given; undefined joins to nothing. Each expected string is jinja2
+    /// 3.1.6's render in the HF environment.
+    #[test]
+    fn join_follows_jinja2() {
+        let vars =
+            json!({"l": ["a", 1, true, null, 2.5], "e": [], "d": {"x": 1, "y": 2}, "s": "abc"});
+        for (src, want) in [
+            ("{{ l | join(', ') }}", "a, 1, True, None, 2.5"),
+            ("{{ l | join }}", "a1TrueNone2.5"),
+            (
+                "{{ e | join('-') }}|{{ d | join('/') }}|{{ s | join('.') }}",
+                "|x/y|a.b.c",
+            ),
+            (
+                "{{ missing | join(',') }}|{{ l | join(d='+') }}",
+                "|a+1+True+None+2.5",
+            ),
+            ("{{ 'p ' ~ l | join(',') ~ ' q' }}", "p a,1,True,None,2.5 q"),
+        ] {
+            assert_eq!(render(src, vars.clone()), want, "{src}");
+        }
+        let e = render_err("{{ 3 | join(',') }}", vars);
+        assert!(e.contains("|join needs"), "{e}");
     }
 
     /// Macros as jinja2 runs them: the body sees its arguments and the top

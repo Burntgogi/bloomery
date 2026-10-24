@@ -175,7 +175,10 @@
 //!   lower layer), the rest printed; the last logits within the head's band
 //!   when no flip lies anywhere, printed otherwise; the argmax the
 //!   reference's, or one whose logit in the reference's row lies within six
-//!   head bands of the row's RMS below its top. Then the forced arm: the same
+//!   head bands of the row's RMS below its top, held under the logits'
+//!   condition: past a flip no band covers the head's input, so the tie's
+//!   cap bounds nothing there (the forced arm below holds that case). Then
+//!   the forced arm: the same
 //!   calls with the reference's picks and weights planted at every position
 //!   (`plant_prompt_routes`), so no flip can happen: every layer's live
 //!   stores within its band, no layer excused, the last logits within the
@@ -733,7 +736,7 @@ mod gate {
             prefill,
             group: 1,
         };
-        let budgeted = cfg.place.card_budget_bytes.is_some();
+        let budgeted = cfg.place.card_budget_bytes.is_set();
         let mut log = Log {
             t: Instant::now(),
             ctx,
@@ -815,17 +818,20 @@ mod gate {
             };
             map_is_plan &= on_card as u64 == planned(l);
         }
-        let readable = at(&|l| kinds[l].ffn == FfnKind::Moe && !shape.q6k_down.contains(&l));
+        // PIN(2026-10-23): the card leg runs a Q6_K down
+        // (`kernels::card_down_runs`), so every routed layer of this file is
+        // card-readable; the Q6_K-down exclusion held while the host tier
+        // kept those downs.
+        let readable = at(&|l| kinds[l].ffn == FfnKind::Moe);
         let card_ok = map_is_plan
             && card_layers.iter().all(|l| readable.contains(l))
             && (budgeted || card_layers == readable);
         let per_layer: Vec<u64> = card_layers.iter().map(|&l| planned(l)).collect();
         println!(
             "structure the plan's card experts on {} routed layers {card_layers:?}, per layer \
-             {per_layer:?}, the slot map the same ({map_is_plan}); none on a dense layer or on \
-             {:?}, and {} {}",
+             {per_layer:?}, the slot map the same ({map_is_plan}); none on a dense layer, and \
+             {} {}",
             card_layers.len(),
-            shape.q6k_down,
             if budgeted {
                 "a card budget set".to_string()
             } else {
@@ -6763,7 +6769,9 @@ mod gate {
     /// reaches (no flip at a lower layer), the rest printed; the last logits
     /// within the head's band when no flip lies anywhere, printed otherwise;
     /// the argmax the reference's, or one whose logit in the reference's row
-    /// lies within six head bands of the row's RMS below its top; the position and the checkpoints the
+    /// lies within six head bands of the row's RMS below its top, held under
+    /// the logits' condition (past a flip no band covers the head's input;
+    /// [`gemm_forced`] holds that case); the position and the checkpoints the
     /// call's. Returns the call's record.
     fn gemm_against(
         m: &mut Glm5nextModel,
@@ -6814,6 +6822,14 @@ mod gate {
         let head = bands.stream[n_layer() - 1];
         let logits_rel = rel(&logits, &want.logits);
         let logits_ok = tally.low.is_some() || logits_rel <= head;
+        // The argmax reads the same row the logits do, so it takes their
+        // excuse: past a flip no band covers the head's input, and the tie's
+        // cap bounds nothing there ([`gemm_forced`] holds that case).
+        let printed = if tally.low.is_some() {
+            "printed: a flip lies on its path"
+        } else {
+            "held"
+        };
         let top = argmax(&want.logits);
         let runner = second(&want.logits, top);
         let gap = f64::from(want.logits[top as usize]) - f64::from(want.logits[runner as usize]);
@@ -6823,7 +6839,7 @@ mod gate {
                 .logits
                 .get(tok as usize)
                 .map_or(f64::NAN, |&v| f64::from(v));
-        let argmax_ok = tok == want.after.argmax || tok_gap <= head_cap;
+        let argmax_ok = tally.low.is_some() || tok == want.after.argmax || tok_gap <= head_cap;
         let pass = tally.ok()
             && held_ok
             && logits_ok
@@ -6839,8 +6855,9 @@ mod gate {
              past it, {} of them first on their path (held); the stores of layers 0..={reach} (no flip's path) held to their bands, \
              worst {worst:.3} of it at layer \
              {worst_l}; past them (printed) worst {past:.3} at layer {past_l}; logits {logits_rel:.3e} \
-             from the reference's (band {head:.3e}, {}); argmax {tok} (reference {}, {tok_gap:.3e} \
-             below its top, cap {head_cap:.3e}; its runner-up {runner} at {gap:.3e}{}); pos {} \
+             from the reference's (band {head:.3e}, {printed}); argmax {tok} (reference {}, \
+             {tok_gap:.3e} below its top, cap {head_cap:.3e}, {printed}; its runner-up {runner} at \
+             {gap:.3e}{}); pos {} \
              checkpoints {points:?} (want {:?}), \
              {secs:.2} s (runtime value) {}",
             tally.flips,
@@ -6857,11 +6874,6 @@ mod gate {
             tally.margin_at(1.0),
             tally.margin_over,
             tally.margin_first,
-            if tally.low.is_some() {
-                "printed: a flip lies on its path"
-            } else {
-                "held"
-            },
             want.after.argmax,
             if tok == runner && tok != want.after.argmax {
                 ", ours"

@@ -429,16 +429,80 @@ impl SeatGate {
         file: &Path,
         args: &[&str],
     ) -> Result<(std::process::ExitStatus, Log, String), GateError> {
+        self.plan_under((dir, name), file, args, &[])
+    }
+
+    /// [`SeatGate::plan`] with each of `levers` set on the server to its
+    /// value, or removed from its environment where the value is `None`, so a
+    /// value in this binary's environment cannot stand in for unset; the
+    /// text printed when the run fails. A gate names each lever at its call,
+    /// a `(lever, value)` pair, where `tools/check-defaults.py` reads its pins.
+    pub fn plan_under(
+        &self,
+        (dir, name): (&Path, &str),
+        file: &Path,
+        args: &[&str],
+        levers: &[(&str, Option<&str>)],
+    ) -> Result<(std::process::ExitStatus, Log, String), GateError> {
         let d = dir.join(name);
         std::fs::create_dir_all(&d)?;
-        let (cmd, mut all) = self.command(file)?;
+        let (mut cmd, mut all) = self.command(file)?;
+        for &(lever, value) in levers {
+            match value {
+                Some(v) => cmd.env(lever, v),
+                None => cmd.env_remove(lever),
+            };
+        }
         all.extend(args.iter().map(|a| (*a).to_owned()));
         let all: Vec<&str> = all.iter().map(String::as_str).collect();
         let err = d.join("server.err");
         let (status, lines) = plan_run(cmd, &all, &err)?;
         println!("{name}: {} --plan: {status}", args.join(" "));
-        Ok((status, server_log(&err, self.kinds)?, lines.join("\n")))
+        let text = lines.join("\n");
+        if !status.success() {
+            println!("{name} stderr:\n{text}");
+        }
+        Ok((status, server_log(&err, self.kinds)?, text))
     }
+}
+
+/// The `residency lever` record is `word` with why `why`.
+pub fn residency_lever_is(log: &Log, word: &str, why: &str) -> Result<bool, GateError> {
+    Ok(match log.first(&record::RESIDENCY_LEVER)? {
+        Some(l) => l.word("residency")? == word && l.word("why")? == why,
+        None => false,
+    })
+}
+
+/// No `residency host` record: the load holds no churn pool.
+pub fn no_residency_host(log: &Log) -> Result<bool, GateError> {
+    Ok(log.first(&record::RESIDENCY_HOST)?.is_none())
+}
+
+/// The `residency lever` record of an unset word on a serving placement: a word the plan
+/// resolved (its why is neither `set` nor `fixed_place`), ahead of the plan, and the churn pool's
+/// `residency host` record after the plan exactly where the word is not `off`; the word is the
+/// serving word ([`bloomery_levers::RESIDENCY_SERVING`]) where its why is `place`.
+pub fn residency_lever_resolved(log: &Log) -> Result<bool, GateError> {
+    let (lever, plan, host) = (
+        log.first(&record::RESIDENCY_LEVER)?,
+        log.first(&record::PLAN)?,
+        log.first(&record::RESIDENCY_HOST)?,
+    );
+    let (Some(l), Some(p)) = (&lever, &plan) else {
+        return Ok(false);
+    };
+    let (word, why) = (l.word("residency")?, l.word("why")?);
+    let pool = match &host {
+        Some(h) => p.at() < h.at(),
+        None => false,
+    };
+    Ok(l.at() < p.at()
+        && why != "set"
+        && why != "fixed_place"
+        && (why != "place" || word == bloomery_levers::RESIDENCY_SERVING)
+        && ((word == "off") == host.is_none())
+        && (word == "off" || pool))
 }
 
 /// `ids` agree with `reference`, a run that did not stop at the
@@ -540,6 +604,56 @@ pub fn greedy(
         },
         v,
     ))
+}
+
+/// How long the request `v` answered held its slot, in milliseconds: the
+/// server's `timings.prompt_ms` plus `predicted_ms`, the window a request
+/// posted beside it has to arrive in to take the other slot. A timings object
+/// that lacks either is refused by name.
+pub fn held_ms(name: &str, v: &Value) -> Result<f64, GateError> {
+    ["prompt_ms", "predicted_ms"]
+        .iter()
+        .map(|k| {
+            v["timings"][k]
+                .as_f64()
+                .ok_or_else(|| format!("{name}: the answer's timings carry no {k}"))
+        })
+        .sum::<Result<f64, String>>()
+        .map_err(Into::into)
+}
+
+/// Two requests in flight on `addr`, both posted at once: the engine thread
+/// admits the second while the first holds its slot, so it takes the other
+/// slot whatever the body's speed (a gap between the posts outlives a fixture
+/// body's whole run, and the second then takes the first's freed slot).
+/// `request` runs each, given the server's URL maker, the request's name and
+/// its prompt ids; a panic or an error of either is the call's error.
+pub fn together<R: Send>(
+    addr: &str,
+    first: (&str, &[u32]),
+    second: (&str, &[u32]),
+    request: impl Fn(&dyn Fn(&str) -> String, &str, &[u32]) -> Result<R, GateError> + Sync,
+) -> Result<[R; 2], GateError> {
+    std::thread::scope(|sc| {
+        let a = sc.spawn(|| post(addr, first, &request));
+        let b = sc.spawn(|| post(addr, second, &request));
+        let a = a.join().map_err(|_| "a round's first request panicked")??;
+        let b = b
+            .join()
+            .map_err(|_| "a round's second request panicked")??;
+        Ok([a, b])
+    })
+}
+
+/// One request of [`together`], its error as text (a [`GateError`] is not
+/// `Send`).
+fn post<R>(
+    addr: &str,
+    (name, prompt): (&str, &[u32]),
+    request: &impl Fn(&dyn Fn(&str) -> String, &str, &[u32]) -> Result<R, GateError>,
+) -> Result<R, String> {
+    let url = |p: &str| format!("http://{addr}{p}");
+    request(&url, name, prompt).map_err(|e| e.to_string())
 }
 
 /// `/v1/chat/completions` of `messages` at temperature 0 and `max_tokens` `n`
@@ -910,8 +1024,69 @@ pub fn prefix_restore(
 
 #[cfg(test)]
 mod tests {
-    use super::{LookupCompletion, draft_counts, slot_erased};
+    use std::time::{Duration, Instant};
+
+    use super::{LookupCompletion, draft_counts, held_ms, slot_erased, together};
     use serde_json::json;
+
+    /// The two requests of a round start together: the second is posted while the first still
+    /// holds its slot, however short the body's whole run is, so the second starts within
+    /// `WITHIN` of the first, a fraction of a gap a fixture body outlives. Mutant: a gap between
+    /// the posts.
+    #[test]
+    fn together_posts_both_requests_at_once() {
+        const WITHIN: Duration = Duration::from_millis(150);
+        let t0 = Instant::now();
+        let ran = together(
+            "127.0.0.1:0",
+            ("first", &[1]),
+            ("second", &[2]),
+            |url, name, prompt| {
+                let start = t0.elapsed();
+                assert_eq!(url("/completion"), "http://127.0.0.1:0/completion");
+                Ok((name.to_owned(), prompt.to_vec(), start))
+            },
+        )
+        .expect("both requests ran");
+        assert_eq!(
+            ran.each_ref().map(|r| (r.0.as_str(), r.1.as_slice())),
+            [("first", &[1][..]), ("second", &[2][..])]
+        );
+        let apart = ran[1].2.abs_diff(ran[0].2);
+        assert!(apart < WITHIN, "the posts were {apart:?} apart");
+    }
+
+    /// An error of either request is the call's error, in the request's own words.
+    #[test]
+    fn together_returns_the_request_error() {
+        let ran = together("a:0", ("one", &[1]), ("two", &[2]), |_, name, _| {
+            if name == "two" {
+                Err(format!("{name} refused").into())
+            } else {
+                Ok(name.len())
+            }
+        });
+        assert_eq!(
+            ran.expect_err("the second failed").to_string(),
+            "two refused"
+        );
+    }
+
+    /// A request's held time is its prompt and predicted milliseconds; either missing is refused
+    /// by name.
+    #[test]
+    fn held_ms_sums_the_two_timings_and_refuses_a_missing_one() {
+        let timings = json!({ "timings": {"prompt_ms": 12.5, "predicted_ms": 30.0} });
+        let held = held_ms("r", &timings).expect("both present");
+        assert!((held - 42.5).abs() < 1e-9, "{held}");
+        for gone in ["prompt_ms", "predicted_ms"] {
+            let mut bad = timings.clone();
+            bad["timings"].as_object_mut().unwrap().remove(gone);
+            let e = held_ms("r", &bad).expect_err("one missing").to_string();
+            assert_eq!(e, format!("r: the answer's timings carry no {gone}"));
+        }
+        assert!(held_ms("r", &json!({})).is_err());
+    }
 
     /// A completion's draft counts: both or neither, unsigned, at least one
     /// proposal and no more accepted than proposed.

@@ -8,7 +8,7 @@
 //! records its server prints, the load and the listening record, the
 //! architecture word its load record names, the file's layers, the tags of its
 //! think span, the token that closes its turn and the context the server is
-//! asked for.
+//! asked for; and what its chat request asks beside the turn ([`Ask`]).
 
 use std::path::Path;
 use std::time::Duration;
@@ -35,7 +35,9 @@ pub struct Clauses {
     pub arch: &'static str,
     /// The layers of the file the seat serves.
     pub layers: u64,
-    /// The tags of the model's think span, as its vocabulary spells them.
+    /// The tags of the model's think span, as its vocabulary spells them; for a model with no
+    /// span (Muse Spark's reasoning is a message to `self`), the two markers of its protocol
+    /// the server must take out of the message.
     pub think: [&'static str; 2],
     /// The token that closes the model's turn, as its vocabulary spells it.
     pub turn_end: &'static str,
@@ -53,6 +55,31 @@ pub struct Clauses {
 const MAX_TOKENS: u64 = 512;
 const BUDGET: u64 = 16;
 
+/// What the chat request asks beside the turn, and what its answer must hold: the reasoning
+/// budget a think-span model's request carries, the effort a model with that knob is held to,
+/// and whether the answer must carry reasoning.
+#[derive(Clone, Copy)]
+pub struct Ask {
+    /// `reasoning_budget`: the reasoning tokens the server lets the model spend before it writes
+    /// the span's close; `None` for a model with no span to close.
+    pub budget: Option<u64>,
+    /// `reasoning_effort`, where the template reads one.
+    pub effort: Option<&'static str>,
+    /// Whether [`CHAT`] requires reasoning in the message: false for a model that may answer a
+    /// low-effort turn with none, whose reasoning is then read from the printed answer.
+    pub reasons: bool,
+}
+
+impl Ask {
+    /// A think-span model's request: the budget closes the span, the effort is the template's
+    /// default and the message holds reasoning.
+    pub const THINK_SPAN: Ask = Ask {
+        budget: Some(BUDGET),
+        effort: None,
+        reasons: true,
+    };
+}
+
 /// Polls of a second that bound the wait for a server to listen: a cold load
 /// of the whole host set.
 const LISTEN_POLLS: usize = 1000;
@@ -65,6 +92,7 @@ const ONE_SEQUENCE: &str = "holds one sequence";
 
 const CHAT: &str = "chat_splits_the_reasoning_at_the_models_tags";
 const ENDED: &str = "chat_ends_at_the_turn_end";
+const ANSWERED: &str = "chat_answers_a_turn";
 
 /// The seat of `c`, the one server the clauses drive.
 fn seat(c: &Clauses) -> SeatGate {
@@ -132,6 +160,11 @@ pub fn parallel_above_one_is_refused(c: &Clauses, dir: &Path) -> Result<bool, Ga
 /// The clauses on one server: `load_and_listen` and the chat; the server is
 /// stopped at the end.
 pub fn served(c: &Clauses, dir: &Path) -> Result<bool, GateError> {
+    served_with(c, dir, Ask::THINK_SPAN)
+}
+
+/// [`served`] with the chat request `ask` says.
+pub fn served_with(c: &Clauses, dir: &Path, ask: Ask) -> Result<bool, GateError> {
     let mut ok = true;
     let d = dir.join("serve");
     std::fs::create_dir_all(&d)?;
@@ -180,34 +213,47 @@ pub fn served(c: &Clauses, dir: &Path) -> Result<bool, GateError> {
         "load_and_listen",
         loaded && listening && in_order && health == 200,
     );
-    match chat(c, &url, &d) {
-        Ok((split, ended)) => {
-            check(&mut ok, CHAT, split);
-            if tier::run_clause(ENDED, Tag::FileBound)? {
-                check(&mut ok, ENDED, ended);
-            }
-        }
+    // The turn is answered on any file; its reasoning and its end read what the model writes, which
+    // a cut of the model's layers does not write, so those two are the real file's.
+    let (answered, split, ended) = match chat(c, ask, &url, &d) {
+        Ok(verdicts) => verdicts,
         Err(e) => {
             println!("{CHAT}: {e}");
-            check(&mut ok, CHAT, false);
-            if tier::run_clause(ENDED, Tag::FileBound)? {
-                check(&mut ok, ENDED, false);
-            }
+            (false, false, false)
         }
+    };
+    check(&mut ok, ANSWERED, answered);
+    if tier::run_clause(CHAT, Tag::FileBound)? {
+        check(&mut ok, CHAT, split);
+    }
+    if tier::run_clause(ENDED, Tag::FileBound)? {
+        check(&mut ok, ENDED, ended);
     }
     println!("server stopped: {}", s.stop()?);
     Ok(ok)
 }
 
-/// [`CHAT`] and [`ENDED`], from one request.
-fn chat(c: &Clauses, url: &dyn Fn(&str) -> String, dir: &Path) -> Result<(bool, bool), GateError> {
-    let body = json!({
+/// [`ANSWERED`], [`CHAT`] and [`ENDED`], from one request: the turn is counted, carries no think
+/// tag and stops by its end or its length; its message holds reasoning and content; it finishes
+/// at the turn end.
+fn chat(
+    c: &Clauses,
+    ask: Ask,
+    url: &dyn Fn(&str) -> String,
+    dir: &Path,
+) -> Result<(bool, bool, bool), GateError> {
+    let mut body = json!({
         "messages": [{ "role": "user", "content": TURN }],
         "temperature": 0,
         "max_tokens": MAX_TOKENS,
-        "reasoning_budget": BUDGET,
         "stream": false,
     });
+    if let Some(budget) = ask.budget {
+        body["reasoning_budget"] = json!(budget);
+    }
+    if let Some(effort) = ask.effort {
+        body["reasoning_effort"] = json!(effort);
+    }
     let (status, text) = curl(&url("/v1/chat/completions"), Some(&body), false)?;
     std::fs::write(dir.join("chat.json"), &text)?;
     let answer = json_of("/v1/chat/completions", status, &text)?;
@@ -234,8 +280,13 @@ fn chat(c: &Clauses, url: &dyn Fn(&str) -> String, dir: &Path) -> Result<(bool, 
         content.trim().len(),
         content.contains(c.turn_end) || reasoning.contains(c.turn_end)
     );
+    let stopped = matches!(finish, "stop" | "length");
     Ok((
-        counted && !reasoning.trim().is_empty() && !content.trim().is_empty() && !leaked,
+        counted && !leaked && stopped,
+        counted
+            && (!ask.reasons || !reasoning.trim().is_empty())
+            && !content.trim().is_empty()
+            && !leaked,
         ended,
     ))
 }

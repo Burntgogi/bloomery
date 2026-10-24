@@ -289,7 +289,7 @@ mod gate {
     use bloomery_gpu_gates::slots_gate;
     use bloomery_gpu_gates::tier::{self, Tag, Tier};
     use bloomery_gpu_gates::{GateError, RefManifest, checks_failed, ref_model_path, verdict};
-    use bloomery_levers::{CARD_BUDGET, HostCfg, Levers};
+    use bloomery_levers::{CARD_BUDGET, CardBudget, HostCfg, Levers};
     use gguf::digest::hex;
     use gguf::quant::{GgmlType, half_to_f32};
     use gguf::{Gguf, Split};
@@ -324,7 +324,7 @@ mod gate {
         draft: std::path::PathBuf,
         host: HostCfg,
         header_budget: Option<tier::HeaderBudget>,
-        lever_budget: Option<u64>,
+        lever_budget: CardBudget,
         shape: Shape,
         n_expert: usize,
     }
@@ -396,7 +396,7 @@ mod gate {
         tier::budget_levers(
             Tier::from_env()?,
             cfg().header_budget,
-            cfg().lever_budget,
+            cfg().lever_budget.clone(),
             extra,
         )
     }
@@ -424,7 +424,7 @@ mod gate {
             draft,
             host: levers.host(),
             header_budget,
-            lever_budget: levers.card_budget_bytes(),
+            lever_budget: levers.card_budget(),
             shape,
             n_expert,
         };
@@ -441,7 +441,7 @@ mod gate {
         ok &= tier::witness("draft layer", cfg.shape.n_layer, REAL_DRAFT_LAYER);
         ok &= tier::witness(
             "card budget",
-            cfg.lever_budget,
+            cfg.lever_budget.clone(),
             PlanLevers::default().card_budget_bytes,
         );
         ok &= tier::witness_card(&card()?);
@@ -6045,7 +6045,7 @@ mod gate {
         let ok = !fixture || (a == d && d.iter().all(|&n| n == want));
         println!(
             "(d) the drafting load's budget: card experts a layer alone {:?} and drafted {:?} \
-             under {:?} + the draft's {extra} B{} {}",
+             under {} + the draft's {extra} B{} {}",
             held(a),
             held(d),
             plan_levers(extra)?.card_budget_bytes,
@@ -6317,7 +6317,7 @@ mod gate {
         let d = &plan.draft.cards[0];
         let draft_kv = d.kv_bytes;
         println!(
-            "plan card={} ctx_max={CTX} card_budget={:?} (the draft's card bytes {extra} in it) \
+            "plan card={} ctx_max={CTX} card_budget={} (the draft's card bytes {extra} in it) \
              draft dense={} experts={} rounding={} kv={} map={} arena={} headroom={}",
             card()?.name,
             plan_levers(extra)?.card_budget_bytes,

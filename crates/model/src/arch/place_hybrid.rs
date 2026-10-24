@@ -32,11 +32,172 @@ use crate::placement::ctx_ask::{PlanRefusal, Short, Side};
 use crate::placement::workstation::{self, HostNeed, HostRead};
 use crate::placement::{
     self, Card, CardTotals, KvBytes, Machine, ModelTensors, PlacementError, Plan, PlanLevers,
-    Unimplemented, Violation, checked_beside, joined,
+    Unimplemented, Violation, checked_beside, joined, kernels,
 };
 
 // The prompt batch a window ring keeps room for is the batch the card walks the prompt in.
 const _: () = assert!(stores::PROMPT_BATCH == crate::moe::UNION_MAX_COLS as u64);
+
+/// The columns a GEMM tile holds (the route's tile table) and the values a 32-value form's step
+/// covers, as the prompt batches' wide forms and routes are sized by them; a body holds each equal
+/// to the kernels' by assertion.
+pub const GEMM_TILE_COLS: usize = 64;
+/// See [`GEMM_TILE_COLS`].
+pub const GEMM32_STEP: usize = 64;
+
+/// Card bytes of the q8 blocks of 32 of `cols` columns of `k` values (Q8_0 and Q5_0 sites' input,
+/// `GemmAct32`): per column `16 + 2 + 2` words a step of [`GEMM32_STEP`] values.
+const fn act32_bytes(cols: usize, k: usize) -> usize {
+    4 * cols * 20 * k.div_ceil(GEMM32_STEP)
+}
+
+/// The most card bytes the forms a GEMM reads take at `k` values a column, `cols` columns: both,
+/// where the width allows them. The load makes the ones its sites' types read.
+#[must_use]
+pub const fn wide_bytes(cols: usize, k: usize) -> usize {
+    let q128 = if k.is_multiple_of(256) {
+        kernels::q8_act_bytes(cols as u64, k as u64) as usize
+    } else {
+        0
+    };
+    let q32 = if k.is_multiple_of(32) {
+        act32_bytes(cols, k)
+    } else {
+        0
+    };
+    q128 + q32
+}
+
+/// Card bytes of the GEMM route's table of `cols` slots over one expert: the slot list, the tiles
+/// (a [`GEMM_TILE_COLS`] column tile each, and the expert's), the two counts and the all-zero ids.
+#[must_use]
+pub const fn route_bytes(cols: usize) -> usize {
+    4 * (cols + 2 * (cols / GEMM_TILE_COLS + 1) + 2 + cols)
+}
+
+/// The forms a ring pass's route GEMMs read their rows in, by the stacks' file types: the gate's and
+/// up's (one type, so one form), then the down's — `true` where the kernel table's GEMM entry for
+/// the type reads q8 blocks of 32 (`kernels::gemm_reads_blocks32`, `GemmAct32`), `false` for the
+/// grouped GEMM's q8_1 blocks of 128 (`GemmAct`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RingForms {
+    pub gate_up32: bool,
+    pub down32: bool,
+}
+
+impl RingForms {
+    /// Both reads in the 32-value form.
+    pub const BLOCKS32: RingForms = RingForms {
+        gate_up32: true,
+        down32: true,
+    };
+
+    /// The forms of a gate and up of type `gate_up` and a down of type `down`; `None` where the
+    /// kernel table names no route GEMM for one of them.
+    #[must_use]
+    pub const fn of(gate_up: gguf::GgmlType, down: gguf::GgmlType) -> Option<RingForms> {
+        match (kernels::gemm(gate_up), kernels::gemm(down)) {
+            (Some(g), Some(d)) => Some(RingForms {
+                gate_up32: kernels::gemm_reads_blocks32(g),
+                down32: kernels::gemm_reads_blocks32(d),
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// Card bytes of `cols` columns of `k` values in one route GEMM's read form: the 32-value
+/// form's where `blocks32`, else the grouped GEMM's q8_1 blocks of 128.
+const fn ring_act_bytes(cols: usize, k: usize, blocks32: bool) -> usize {
+    if blocks32 {
+        act32_bytes(cols, k)
+    } else {
+        kernels::q8_act_bytes(cols as u64, k as u64) as usize
+    }
+}
+
+/// Card bytes of a prompt batch's ring pass over a half of `half` slots of the expert stream's ring
+/// with both reads in the 32-value form ([`ring_pass_bytes_in`] at [`RingForms::BLOCKS32`]).
+#[must_use]
+pub const fn ring_pass_bytes(
+    rows: usize,
+    n_used: usize,
+    n: usize,
+    ff: usize,
+    half: usize,
+) -> usize {
+    ring_pass_bytes_in(rows, n_used, n, ff, half, RingForms::BLOCKS32)
+}
+
+/// Card bytes of a prompt batch's ring pass over a half of `half` slots of the expert stream's ring
+/// (the ring GEMM buffers, made when the stream starts): the batch's `rows` normed rows of `n`
+/// values in the gate's and up's form, every slot's gate and up rows (`rows · n_used` slots of
+/// `ff` f32 values each), their SwiGLU in the down's form and the route table of those slots over
+/// the half, the forms `forms`. The one formula of those bytes: the body holds its made bytes to
+/// it.
+#[must_use]
+pub const fn ring_pass_bytes_in(
+    rows: usize,
+    n_used: usize,
+    n: usize,
+    ff: usize,
+    half: usize,
+    forms: RingForms,
+) -> usize {
+    let slots = rows * n_used;
+    let routed = if half < slots { half } else { slots };
+    let zeros = if half == 1 { slots } else { 0 };
+    let route = 4 * (slots + 2 * (slots / GEMM_TILE_COLS + routed) + 2 + zeros);
+    ring_act_bytes(rows, n, forms.gate_up32)
+        + 2 * 4 * slots * ff
+        + ring_act_bytes(slots, ff, forms.down32)
+        + route
+}
+
+/// The card bytes a prompt call's expert stream takes beside the plan's terms
+/// (`BLOOMERY_XSTREAM=split`), the rule every family's streaming plan keeps room by: the ring's two
+/// halves of `half` slots, a slot the widest layer's expert at its routed stacks' file bytes per
+/// expert (`stacks(l)`, the gate, up and down of layer `l` of `model`'s `n_expert`-expert stacks; a
+/// layer with none of the three streams nothing), and `beside`, what the body makes for the ring's
+/// pass. Refused by name: a layer that holds some of its three stacks and not all, and a stack that
+/// is not one of `n_expert` experts.
+pub fn stream_ring_bytes(
+    model: &ModelTensors,
+    stacks: impl Fn(usize) -> [String; 3],
+    (n_expert, half): (u64, u64),
+    beside: u64,
+) -> Result<u64, PlacementError> {
+    let mut slot = 0;
+    for l in 0..model.layers {
+        let names = stacks(l);
+        let found: Vec<_> = names
+            .iter()
+            .map(|name| model.tensors.iter().find(|t| &t.name == name))
+            .collect();
+        if found.iter().all(Option::is_none) {
+            continue;
+        }
+        let mut expert = 0;
+        for (name, t) in names.iter().zip(found) {
+            let t = t.ok_or_else(|| PlacementError::Tensor {
+                name: name.clone(),
+                detail: "is not in the file: the stream's ring holds a layer's three routed stacks"
+                    .to_string(),
+            })?;
+            expert += placement::per_expert(t, n_expert)?.1;
+        }
+        slot = slot.max(expert);
+    }
+    Ok(2 * half * slot + beside)
+}
+
+/// The card bytes a tiered load makes beside the prompt batch's reserve: per routed slot of the
+/// prompt batch's `rows` rows (`n_used` a row), the tier place, the copy of it the join reads and
+/// the copy of the slot's route weight, three four-byte words.
+#[must_use]
+pub const fn tier_places_bytes(rows: usize, n_used: usize) -> u64 {
+    3 * 4 * (rows * n_used) as u64
+}
 
 /// What a plan of a hybrid file is made from, read from its headers. `H` is the family's own
 /// hyperparameters, carried for its body and never read here.
@@ -210,6 +371,16 @@ impl<H> PlanInputs<H> {
         }
     }
 
+    /// `self` for a load whose prompt calls stream their host experts (`BLOOMERY_XSTREAM=split`):
+    /// the prompt reserve grows by the stream's `ring` bytes ([`stream_ring_bytes`]). A load that
+    /// does not stream plans without them; its ring, if one is set later, takes what the card's
+    /// margin leaves free past the stream's keep-free.
+    #[must_use]
+    pub fn streaming(self, ring: u64) -> PlanInputs<H> {
+        let reserve = self.prompt_reserve.saturating_add(ring);
+        self.with_prompt_reserve(reserve)
+    }
+
     /// `self` for a body that serves an expert tier card, which makes `bytes` of card buffers
     /// beside [`PlanInputs::prompt_reserve`] on a load with one ([`PlanInputs::tier_reserve`]).
     #[must_use]
@@ -232,9 +403,9 @@ impl<H> PlanInputs<H> {
 
     /// The card bytes the load of `machine` makes beside the plan's terms: the prompt batch's, and
     /// a tiered load's more. A machine that names an expert tier card where the body serves none
-    /// is refused by name ([`PlaceError::Tier`]).
-    pub fn reserve_on(&self, machine: &Machine) -> Result<u64, PlaceError> {
-        match (machine.tiers.first(), self.tier_reserve) {
+    /// is refused by name ([`PlaceError::Tier`]); a reserve-only member is no tier card.
+    pub fn prompt_batch_bytes(&self, machine: &Machine) -> Result<u64, PlaceError> {
+        match (machine.expert_tiers().next(), self.tier_reserve) {
             (Some(card), None) => Err(PlaceError::Tier {
                 card: card.name.clone(),
                 tier: 0,
@@ -298,7 +469,7 @@ impl<H> PlanInputs<H> {
         if ctx_max == 0 {
             return Err(PlaceError::CtxZero);
         }
-        let reserve = self.reserve_on(machine)?;
+        let reserve = self.prompt_batch_bytes(machine)?;
         let program = program_of(self.spec.arch)
             .ok_or_else(|| PlacementError::Unimplemented(self.unimplemented()))?;
         let kv = self.seq_terms().slots_of(slots.get() as u64);
@@ -625,6 +796,7 @@ mod tests {
                 },
             ),
             qk_norm: false,
+            o_norm: false,
             out_gate: OutGate::None,
             select: None,
             window,
@@ -935,37 +1107,39 @@ mod tests {
         assert!(items[0].feature.contains("a Mamba-2 mixer"), "{items:?}");
     }
 
-    /// A stack is card-routed when the common kernel table gives its type the entries this
-    /// program's leg launches, and not otherwise, in either part, for each body on the common leg
-    /// ([`routed_rule`]): the types the table runs on the card for other families (Q8_0 and
-    /// IQ4_NL) and the ones it has no row for (Q2_K, the floats) keep their layer's experts on the
-    /// host.
+    /// A stack is card-routed when the common kernel table gives its type the entry this
+    /// program's leg launches for its part, and not otherwise, for each body on the common leg
+    /// ([`routed_rule`]): a Q6_K down is carded and a Q6_K gate or up is not; the 32-value downs
+    /// other families run (Q8_0 and IQ4_NL) and the types with no row (Q2_K, the floats) keep
+    /// their layer's experts on the host.
     // PIN(2026-10-11): card_runs now runs Q4_K/Q5_K through the common leg.
     // PIN(2026-10-11): the leg also runs IQ2_XS, IQ3_XXS and IQ4_XS (the raw-block entries of
     // `iq_sel.rs`), so those three are card-routed too.
     // PIN(2026-10-12): the leg also runs IQ3_S (`iq3_s_gate_up_sel`, `iq3_s_gemv_sel`), so it is
     // card-routed too.
+    // PIN(2026-10-22): each part by its own arm. A Q6_K down (the leg's 128-value `_sel` launch)
+    // is on the card beside a gate and up the gate·up arm runs; Q6_K has no gate·up arm. The
+    // 32-value downs (Q8_0, IQ4_NL) stay off: these bodies' leg buffers hold the 128-value form
+    // alone. Mutants: the down arm read through `card_runs` (Q6_K's down is `None`); the down arm
+    // read through `card_down_runs` (Q8_0's down is carded).
     #[test]
     fn only_the_stacks_the_leg_runs_are_card_routed() {
-        let rules = [
-            Program::Mimo2Body,
-            Program::Solar2Body,
-            Program::MiniMaxM3Body,
-        ]
-        .map(|p| {
+        let rules = [Program::Mimo2Body, Program::Solar2Body].map(|p| {
             let RoutedRule::Leg { gate_up, down } = routed_rule(p) else {
                 panic!("{p:?}: a leg rule");
             };
             (p, gate_up, down)
         });
-        let card_routed = |ty: GgmlType| {
+        // Each part's format, the same under every body's rule.
+        let arms = |ty: GgmlType| {
             let parts: Vec<_> = rules
                 .iter()
-                .flat_map(|(_, gate_up, down)| [gate_up(ty), down(ty)])
+                .map(|(_, gate_up, down)| (gate_up(ty), down(ty)))
                 .collect();
             assert!(parts.windows(2).all(|w| w[0] == w[1]), "{ty}: {rules:?}");
             parts[0]
         };
+        let k = Some(CardFormat::KQuant);
         for ty in [
             GgmlType::MXFP4,
             GgmlType::Q4_K,
@@ -975,8 +1149,9 @@ mod tests {
             GgmlType::IQ3_S,
             GgmlType::IQ4_XS,
         ] {
-            assert_eq!(card_routed(ty), Some(CardFormat::KQuant), "{ty}");
+            assert_eq!(arms(ty), (k, k), "{ty}");
         }
+        assert_eq!(arms(GgmlType::Q6_K), (None, k), "Q6_K");
         for ty in [
             GgmlType::Q8_0,
             GgmlType::IQ4_NL,
@@ -985,8 +1160,34 @@ mod tests {
             GgmlType::F32,
             GgmlType::BF16,
         ] {
-            assert_eq!(card_routed(ty), None, "{ty}");
+            assert_eq!(arms(ty), (None, None), "{ty}");
         }
+    }
+
+    /// The minimax-m3 body carries its routed parts by glm5next's planes arms: its leg buffers
+    /// hold the form each card layer's down reads, NVFP4 in its planes among them. Mutant: the
+    /// body left on the common leg (a 32-value down never carded).
+    #[test]
+    fn the_minimax_body_routes_by_the_planes_arms() {
+        let arms = |p| {
+            let RoutedRule::Leg { gate_up, down } = routed_rule(p) else {
+                panic!("{p:?}: a leg rule");
+            };
+            (gate_up, down)
+        };
+        let (mm_gu, mm_down) = arms(Program::MiniMaxM3Body);
+        let (glm_gu, glm_down) = arms(Program::Glm5nextBody);
+        for id in 0..64u32 {
+            let ty = GgmlType::from_u32(id);
+            assert_eq!((mm_gu(ty), mm_down(ty)), (glm_gu(ty), glm_down(ty)), "{ty}");
+        }
+        for ty in [GgmlType::NVFP4, GgmlType::NVFP4_ROWS, GgmlType::Q8_0] {
+            assert_eq!((mm_gu(ty), mm_down(ty)), (glm_gu(ty), glm_down(ty)), "{ty}");
+        }
+        assert!(
+            mm_down(GgmlType::Q8_0).is_some(),
+            "a 32-value down is carded"
+        );
     }
 
     /// A host room under the host experts' need is refused by name: the need, the bytes the plan

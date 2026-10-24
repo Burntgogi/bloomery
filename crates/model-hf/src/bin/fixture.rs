@@ -5,11 +5,14 @@
 //!     fixture plan <real first shard> [--draft <real draft>] [flags]
 //!     fixture generate <real first shard> <out dir> [--draft <real draft>] [flags]
 //!     fixture fetch <family | repo[:quant]> <out dir> [--rev R] [flags]
+//!     fixture cut <source folder> <out dir> --spec FILE [--shard-bytes B] [--card-budget B]
 //!     fixture verify <fixture first shard> [--source <real first shard>]
 //!                    [--draft-source <real draft>]
+//!     fixture verify <cut dir | its first shard> [--source <source folder>]
 //!     fixture variant-rules <fixture first shard> --tag T [--table FILE]
 //!     fixture variant-check <variant first shard> --source <fixture first shard> --tag T
 //!                           [--table FILE]
+//!     fixture variant-budget <variant first shard>
 //!     fixture registry
 //!
 //! The spec is the family's whose architecture the first file declares (for `verify`, the
@@ -28,7 +31,7 @@
 //! listed size with its header (fetched through the hf crate's client) at the front, in a
 //! directory beside `<out dir>` that is removed afterwards; the family's draft is the repo's
 //! file its family's source row names, when the row has one (a row can say its draft is not
-//! fetchable, and `fetch` then skips it by name). A family name (`v41`, `qwen38`, `qwen35moe`, `glm5next`, `solar2`, `nemotron`, `nemotron-bolt`)
+//! fetchable, and `fetch` then skips it by name). A family name (`v41`, `qwen38`, `qwen35moe`, `glm5next`, `solar2`, `nemotron`, `nemotron-bolt`, `musespark`)
 //! reads its row of the registry (`model::arch::registry`): repo, quant and revision; a `<repo>:<quant>` takes `main`.
 //! After writing, it runs `verify`'s check against the sparse sources it still holds, and a
 //! fixture that fails it is removed with its sidecar, so a failed fetch leaves nothing.
@@ -40,12 +43,24 @@
 //! make variant T of the fixture: a `custom-q<TAB>` line (its `--custom-q` argument, which names
 //! every tensor) and an `override-kv<TAB>` line (the tag's stamp), after the map's expansion over
 //! the fixture; it refuses a row that retypes nothing. `variant-check` holds a written variant to
-//! its source: the same header but for the tag, the same shards and shapes, the map's types, and
-//! every other tensor's bytes equal. The table is `--table`, else `tools/fixture-variants.tsv`
-//! under the working directory. `registry` prints the architecture registry's rows (the text of
+//! its source: the same header but for the tag and the card budget, the same shards and shapes, the
+//! map's types, and every other tensor's bytes equal — the budget a planned family's variant holds
+//! is the planner's value for the written file, a fixed family's the trunk's. `variant-budget`
+//! records that value on a written variant, in place (the planner's cap for the variant's own
+//! file, replacing the trunk's the quantizer copied; a fixed family's is kept as it is). The table
+//! is `--table`, else `tools/fixture-variants.tsv`
+//! under the working directory. `cut` is the fixture of a safetensors checkpoint folder in its stored
+//! bits (`cut::cut`): the layers, widths and tensor roles its spec names (`tools/fixture-cuts/<name>.json`),
+//! the tokenizer and chat files copied, and `bloomery-cut.tsv` recording each kept tensor's source range
+//! and hash; it refuses an existing `<out dir>` and writes beside it, renaming on success. `verify` of a
+//! directory (or its first shard) holds such a cut to its record and to its source folder, the one the
+//! record names unless `--source` says another (`cut::verify`). `registry` prints the architecture registry's rows (the text of
 //! `tools/arch-registry.tsv`). A flag its verb does not take, a flag given twice,
 //! `--draft-tensors` without `--draft` and `--draft-source` with no draft fixture are refused. One
 //! line per tensor, a summary line, and exit status 1 with the error on any failure.
+
+#[path = "../cut.rs"]
+mod cut;
 
 use std::error::Error;
 use std::path::{Path, PathBuf};
@@ -65,9 +80,12 @@ use model_hf::remote::{self, HeaderStat, RemoteError};
 const USAGE: &str = "usage: fixture plan <real first shard> [--draft <real draft>] [flags]
        fixture generate <real first shard> <out dir> [--draft <real draft>] [flags]
        fixture fetch <family | repo[:quant]> <out dir> [--rev R] [flags]
+       fixture cut <source folder> <out dir> --spec FILE [--shard-bytes B] [--card-budget B]
        fixture verify <fixture first shard> [--source <real first shard>] [--draft-source <real draft>]
+       fixture verify <cut dir | its first shard> [--source <source folder>]
        fixture variant-rules <fixture first shard> --tag T [--table FILE]
        fixture variant-check <variant first shard> --source <fixture first shard> --tag T [--table FILE]
+       fixture variant-budget <variant first shard>
        fixture registry
 flags of plan and generate: --seed N --card-budget B --shard-bytes B --tensors a,b,... --draft-tensors a,b,...
 flags of fetch: the same but --draft, and --rev R";
@@ -90,6 +108,8 @@ const FETCH_FLAGS: [&str; 6] = [
     "--tensors",
     "--draft-tensors",
 ];
+/// The flags `cut` takes.
+const CUT_FLAGS: [&str; 3] = ["--spec", "--shard-bytes", "--card-budget"];
 /// The flags `verify` takes.
 const VERIFY_FLAGS: [&str; 2] = ["--source", "--draft-source"];
 /// The flags `variant-rules` takes.
@@ -117,9 +137,11 @@ fn run(args: &[String]) -> Res<()> {
     let takes: &[&str] = match cmd.as_str() {
         "plan" | "generate" => &PLAN_FLAGS,
         "fetch" => &FETCH_FLAGS,
+        "cut" => &CUT_FLAGS,
         "verify" => &VERIFY_FLAGS,
         "variant-rules" => &RULES_FLAGS,
         "variant-check" => &CHECK_FLAGS,
+        "variant-budget" => &[],
         "registry" => &[],
         _ => return Err(USAGE.into()),
     };
@@ -128,9 +150,11 @@ fn run(args: &[String]) -> Res<()> {
         ("plan", [source]) => plan(source, &a),
         ("generate", [source, out]) => generate(source, out, &a),
         ("fetch", [repo, out]) => fetch(repo, out, &a),
+        ("cut", [source, out]) => cut_folder(source, out, &a),
         ("verify", [first]) => verify(first, &a),
         ("variant-rules", [source]) => variant_rules(source, &a),
         ("variant-check", [variant]) => variant_check(variant, &a),
+        ("variant-budget", [variant]) => variant_budget(variant),
         ("registry", []) => {
             print!("{}", registry::print());
             Ok(())
@@ -145,6 +169,7 @@ struct Args {
     draft: Option<String>,
     source: Option<String>,
     draft_source: Option<String>,
+    spec: Option<String>,
     tag: Option<String>,
     table: Option<String>,
     rev: Option<String>,
@@ -163,6 +188,7 @@ impl Args {
             draft: None,
             source: None,
             draft_source: None,
+            spec: None,
             tag: None,
             table: None,
             rev: None,
@@ -191,6 +217,7 @@ impl Args {
                 "--draft" => a.draft = Some(value()?),
                 "--source" => a.source = Some(value()?),
                 "--draft-source" => a.draft_source = Some(value()?),
+                "--spec" => a.spec = Some(value()?),
                 "--tag" => a.tag = Some(value()?),
                 "--table" => a.table = Some(value()?),
                 "--rev" => a.rev = Some(value()?),
@@ -419,6 +446,14 @@ fn write_fixture(
 /// `generate` from the source `repo` (`<owner>/<name>[:<quant>]`) names, its headers read by
 /// range. The sources live in `<out>.fetch.<pid>`, removed whether or not the run succeeds.
 fn fetch(target: &str, out: &str, a: &Args) -> Res<()> {
+    if let Some(row) = registry::cuts().find(|c| c.family == target) {
+        return Err(format!(
+            "{target} is a cut folder, not a GGUF fixture: `fixture cut <source folder> {out} \
+             --spec tools/fixture-cuts/{}.json`",
+            row.family
+        )
+        .into());
+    }
     let (r, rev) = match registry::fixtures().find(|s| s.family == target) {
         Some(s) => (
             RepoRef {
@@ -572,6 +607,13 @@ fn first_shard(dir: &Path, stem: &str) -> Res<PathBuf> {
 }
 
 fn verify(first: &str, a: &Args) -> Res<()> {
+    let path = Path::new(first);
+    if path.is_dir() {
+        return verify_folder(path, a);
+    }
+    if first.ends_with(".safetensors") {
+        return verify_folder(path.parent().unwrap_or(Path::new(".")), a);
+    }
     let fx = open(first)?;
     let spec = spec_of(&fx, first)?;
     let source = a.source.clone().unwrap_or_else(spec.default_source);
@@ -668,6 +710,87 @@ fn verify_fixture(
     Ok(())
 }
 
+/// `cut::cut` of the folder `source` as `--spec` says into `out`, a line per tensor and the summary.
+fn cut_folder(source: &str, out: &str, a: &Args) -> Res<()> {
+    let spec_path = a.spec.as_deref().ok_or("cut needs --spec FILE")?;
+    let text = std::fs::read_to_string(spec_path).map_err(|e| format!("read {spec_path}: {e}"))?;
+    let spec = cut::Spec::parse(&text)?;
+    let opts = cut::Options {
+        shard_bytes: a.shard_bytes.unwrap_or(cut::DEFAULT_SHARD_BYTES),
+        extra: a
+            .card_budget
+            .map(|b| vec![(model::fixture::KEY_CARD_BUDGET.to_string(), b.to_string())])
+            .unwrap_or_default(),
+    };
+    println!(
+        "fixture: cut {source} -> {out} spec={} arch={} ({spec_path}) shard_bytes={}",
+        spec.name, spec.arch, opts.shard_bytes
+    );
+    let mut line = |t: &cut::Written| {
+        println!(
+            "fixture: cut tensor {} <- {} bytes={} file={} sha256={}",
+            t.name, t.src_name, t.bytes, t.shard, t.sha256
+        );
+    };
+    let c = cut::cut(Path::new(source), Path::new(out), &spec, &opts, &mut line)?;
+    for f in &c.copied {
+        println!("fixture: cut copied {f}");
+    }
+    for f in &c.left_out {
+        println!("fixture: cut left out {f}");
+    }
+    println!(
+        "fixture: cut done tensors={} bytes={} read_bytes={} shards={} dropped_tensors={} \
+         dropped_bytes={} manifest_sha256={} secs={:.2} peak_rss_kib={} out={}",
+        c.tensors,
+        c.data_bytes,
+        c.read_bytes,
+        c.shards,
+        c.dropped_tensors,
+        c.dropped_bytes,
+        c.manifest_sha256,
+        c.secs,
+        peak_rss_kib(),
+        c.out.display()
+    );
+    Ok(())
+}
+
+/// `cut::verify` of the cut folder `dir` against its record and its source (`--source`, else the
+/// folder the record names), a line per tensor and the summary.
+fn verify_folder(dir: &Path, a: &Args) -> Res<()> {
+    if a.draft_source.is_some() {
+        return Err("--draft-source names a draft, and a cut folder has none".into());
+    }
+    let source = a.source.as_deref().map(Path::new);
+    println!(
+        "fixture: verify cut {} against {}",
+        dir.display(),
+        source.map_or("the folder its record names".to_string(), |s| s
+            .display()
+            .to_string())
+    );
+    let mut line = |t: &cut::Checked| {
+        println!(
+            "fixture: verify tensor {} bytes={} sha256={}",
+            t.name, t.bytes, t.sha256
+        );
+    };
+    let v = cut::verify(dir, source, &mut line)?;
+    println!(
+        "fixture: verify done tensors={} bytes={} read_bytes={} shards={} copied={} secs={:.2} \
+         peak_rss_kib={}",
+        v.tensors,
+        v.data_bytes,
+        v.read_bytes,
+        v.shards,
+        v.copied,
+        v.secs,
+        peak_rss_kib()
+    );
+    Ok(())
+}
+
 /// The row of `--tag` in the table.
 fn variant_row(a: &Args) -> Res<fixture::VariantRow> {
     let tag = a.tag.as_deref().ok_or("--tag is required")?;
@@ -704,12 +827,50 @@ fn variant_check(variant: &str, a: &Args) -> Res<()> {
     let row = variant_row(a)?;
     let source = a.source.as_deref().ok_or("variant-check needs --source")?;
     let (src, var) = (open(source)?, open(variant)?);
+    let spec = spec_of(&src, source)?;
     let mut line = |l: &str| println!("{l}");
-    let s = fixture::variant_check(&row, &src, &var, &mut line)?;
+    let s = fixture::variant_check(&row, &src, &var, spec.card_budget, &mut line)?;
     println!(
         "fixture: variant-check done tag={} tensors={} retyped={} copied_bytes={} shards={}",
         row.tag, s.tensors, s.retyped, s.copied_bytes, s.shards
     );
+    Ok(())
+}
+
+/// Record on the written `variant` the card budget its own file plans, in place: the family's
+/// planner chooses the cap for the variant's headers (the tag names the file a refusal speaks of),
+/// replacing the trunk's the quantizer copied; a family with a fixed budget keeps the trunk's.
+fn variant_budget(variant: &str) -> Res<()> {
+    let var = open(variant)?;
+    let tag = var
+        .value(model::fixture::KEY_VARIANT)
+        .and_then(gguf::Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| {
+            format!(
+                "{variant} carries no {}: a budget is recorded on a variant",
+                model::fixture::KEY_VARIANT
+            )
+        })?;
+    let spec = spec_of(&var, variant)?;
+    match spec.card_budget {
+        model::fixture::CardBudget::Fixed(b) => {
+            println!(
+                "fixture: variant-budget {tag}: the {} family records a fixed budget; the trunk's \
+                 {b} is kept",
+                spec.arch
+            );
+        }
+        model::fixture::CardBudget::Planned(planner) => {
+            let planned = fixture::choose_budget_written(&planner, &var)?;
+            let was = fixture::variant_record_budget(&tag, &var, planned)?;
+            let key = model::fixture::KEY_CARD_BUDGET;
+            println!(
+                "fixture: variant-budget {tag}: {key} {was} -> {planned} (planned on the \
+                 variant's own file)"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -760,6 +921,92 @@ mod tests {
                 Some("68a34855558af61cbef0324d31f411be8a506b08")
             )
         );
+    }
+
+    /// A cut row is its rules file's family: the file parses, names the row's directory and its
+    /// canonical architecture string, and `fetch` of a cut family says `cut` instead of reading a
+    /// hub repo. (The registry's own test holds a rules file to each row and each row to a file.)
+    #[test]
+    fn a_cut_row_is_its_rules_files_family_and_fetch_refuses_it() {
+        let mut cuts = 0;
+        for row in registry::ROWS {
+            let Some(registry::Fixture::Cut(c)) = row.fixture else {
+                continue;
+            };
+            cuts += 1;
+            let path = format!(
+                "{}/../../tools/fixture-cuts/{}.json",
+                env!("CARGO_MANIFEST_DIR"),
+                c.family
+            );
+            let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+            let spec = cut::Spec::parse(&text).unwrap_or_else(|e| panic!("{path}: {e}"));
+            assert_eq!(spec.name, c.family, "{path}: the rules name another family");
+            assert_eq!(
+                spec.arch,
+                row.canonical(),
+                "{path}: the rules name another architecture"
+            );
+            let args = ["fetch", c.family, "/nonexistent/out"].map(String::from);
+            let refused = run(&args)
+                .expect_err("a cut family is not fetched")
+                .to_string();
+            assert!(
+                refused.contains("is a cut folder") && refused.contains("fixture cut"),
+                "{refused}"
+            );
+        }
+        assert_eq!(cuts, registry::cuts().count());
+        assert!(cuts > 0, "no cut row to hold");
+    }
+
+    /// `cut` and `verify` take their folders and flags from the command line: a toy folder cut with
+    /// a spec file and a card budget, then verified by its directory (the source its record names),
+    /// by its first shard and with `--source`; a missing `--spec`, a flag `cut` does not take and a
+    /// draft source for a folder are each refused by name.
+    #[test]
+    fn the_command_line_cuts_and_verifies_a_folder() {
+        let w = cut::tests::world("cli");
+        let spec = w.root.join("spec.json");
+        std::fs::write(&spec, cut::tests::spec_json(&w.all, 32, 32, 16)).unwrap();
+        let (src, out) = (
+            w.src.display().to_string(),
+            w.root.join("out").display().to_string(),
+        );
+        let spec = spec.display().to_string();
+        let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let refused = |v: &[&str]| run(&args(v)).expect_err("a refused command").to_string();
+
+        run(&args(&[
+            "cut",
+            &src,
+            &out,
+            "--spec",
+            &spec,
+            "--card-budget",
+            "8589934592",
+        ]))
+        .unwrap();
+        run(&args(&["verify", &out])).unwrap();
+        let first = format!("{out}/model-00001-of-00001.safetensors");
+        run(&args(&["verify", &first, "--source", &src])).unwrap();
+        let meta = cut::read_metadata(Path::new(&first)).unwrap();
+        assert_eq!(
+            meta.get("bloomery.fixture.card_budget").map(String::as_str),
+            Some("8589934592"),
+            "--card-budget reaches the first shard's metadata"
+        );
+
+        let other = w.root.join("other").display().to_string();
+        assert!(refused(&["cut", &src, &other]).contains("cut needs --spec"));
+        assert!(
+            refused(&["cut", &src, &other, "--spec", &spec, "--seed", "1"])
+                .contains("cut does not take --seed")
+        );
+        assert!(
+            refused(&["verify", &out, "--draft-source", "x"]).contains("a cut folder has none")
+        );
+        std::fs::remove_dir_all(&w.root).unwrap();
     }
 
     /// Every written fixture of a family with a planned budget holds the budget its header records:

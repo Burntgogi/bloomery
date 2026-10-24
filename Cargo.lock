@@ -167,6 +167,7 @@ dependencies = [
  "bloomery-levers",
  "bloomery-model",
  "bloomery-os",
+ "bloomery-qdot",
  "bloomery-runtime",
  "bloomery-threads",
  "bloomery-verbs",
@@ -198,7 +199,7 @@ dependencies = [
 
 [[package]]
 name = "bloomery-gpu-gates"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "bloomery-app",
  "bloomery-decision",
@@ -342,6 +343,7 @@ dependencies = [
  "bloomery-gguf",
  "bloomery-runtime",
  "bloomery-safetensors",
+ "bloomery-tokenizer",
  "flate2",
  "regex",
  "serde_json",
@@ -463,6 +465,7 @@ name = "bloomery-refset"
 version = "0.1.0"
 dependencies = [
  "bloomery-gguf",
+ "serde_json",
  "sha2",
  "thiserror",
 ]
@@ -491,7 +494,7 @@ version = "0.1.0"
 
 [[package]]
 name = "bloomery-serve"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "bloomery-decision",
  "bloomery-embed",
@@ -521,7 +524,9 @@ version = "0.1.0"
 dependencies = [
  "bloomery-gguf",
  "bloomery-refset",
+ "flate2",
  "memchr",
+ "serde_json",
  "thiserror",
  "unicode-normalization-alignments",
 ]

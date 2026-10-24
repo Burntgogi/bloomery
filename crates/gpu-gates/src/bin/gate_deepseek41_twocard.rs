@@ -525,15 +525,15 @@ mod gate {
         cfg.body.prefill = PrefillMode::Batch;
         let draft = dspark::draft_hparams()?;
         let path = ref_model_path()?;
-        let reserve = dspark::draft_reserve(Place::Bp, &draft.0, &path)?
-            .ok_or("plan (b′) made no draft reserve")?;
+        let on = dspark::draft_seat(Place::Bp, &draft.0, &path)?;
+        let reserve = on.reserve.bytes;
         let head = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
         // The real tier plans under the gate's own budget (the lever is refused there); the
         // fixture tier under its header's plus the draft's card bytes, the lever held equal to it.
         let tier = bloomery_gpu_gates::tier::Tier::from_env()?;
         let lever = match tier {
-            bloomery_gpu_gates::tier::Tier::Real => Some(BUDGET),
-            bloomery_gpu_gates::tier::Tier::Fixture => levers.card_budget_bytes(),
+            bloomery_gpu_gates::tier::Tier::Real => bloomery_levers::CardBudget::Every(BUDGET),
+            bloomery_gpu_gates::tier::Tier::Fixture => levers.card_budget(),
         };
         cfg.place = bloomery_gpu_gates::tier::budget_levers(
             tier,
@@ -544,10 +544,11 @@ mod gate {
         let budget = cfg
             .place
             .card_budget_bytes
+            .every()
             .ok_or("the plan has no card budget")?;
         let inputs = PlanInputs::read(&head)?;
         drop(head);
-        let bp = Place::Bp.machine(Some(reserve), Some(place::tier_batch(&inputs.hp)))?;
+        let bp = Place::Bp.machine(Some(on), Some(place::tier_batch(&inputs.hp)))?;
         let layers = inputs.model.layers;
         let (two, lmachine) = (bp(layers), looped(bp(layers)));
         let plan = inputs.plan(&two, workstation::CTX_MAX, &cfg.place)?;

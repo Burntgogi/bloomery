@@ -1227,6 +1227,7 @@ mod tests {
                 n_used: N_USED,
                 ff,
                 n_shared,
+                shared_width: ff * n_shared,
                 weights_scale: 1.0,
                 weights_norm: true,
             },

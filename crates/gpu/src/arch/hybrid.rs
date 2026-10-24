@@ -1170,8 +1170,9 @@ pub struct WideCx<'a> {
 
 /// The wide forms [`project_wide`] quantizes into for the `sites` of the
 /// model that read `k` values: `cols` columns of `k` values, one of each form
-/// the types of those sites read ([`WideActs::wants_of`]); a site of another
-/// width is not counted. Load-time only.
+/// the types of those sites read ([`WideActs::wants_of`], less the f32 rows,
+/// which are the caller's `x`); a site of another width is not counted.
+/// Load-time only.
 pub fn wide_acts_at<'s>(
     stream: &CudaStream,
     sites: impl IntoIterator<Item = &'s Site>,
@@ -1182,7 +1183,7 @@ pub fn wide_acts_at<'s>(
         .filter(|s| s.k == k)
         .map(|s| s.ty)
         .collect();
-    WideActs::new(stream, WideActs::wants_of(&tys), cols, k)
+    WideActs::new(stream, WideActs::wants_of(&tys).without_f32(), cols, k)
 }
 
 /// `y = W · x` for each of `sites` over the batch's `m` rows of `x`, `rows`

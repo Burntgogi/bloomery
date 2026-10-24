@@ -9,12 +9,13 @@
 use crate::lcpp_e2e::{self, Arm, Dims, Seat, fnv1a};
 use bloomery_gpu::model::StepMode;
 use bloomery_gpu_gates::GateError;
+use bloomery_gpu_gates::prompts::SIGMA_LOGIT_V41;
 use bloomery_gpu_gates::tier::Tier;
 use bloomery_gpu_solar2::{Body, Solar2Model, set_prefill_group, set_taps};
 use gguf::Split;
 use model::arch::solar2::place::{self, PlanInputs};
 use model::placement::PlanLevers;
-use model::placement::workstation::{self, HostRead, PLAN_ROOM};
+use model::placement::workstation::{HostRead, PLAN_ROOM};
 use refset::arch::solar2::ARCH;
 use std::path::{Path, PathBuf};
 
@@ -34,6 +35,10 @@ pub const TAP_EARLY: usize = 4;
 // ceilings are re-pinned there with the full-row distances.
 pub const TAP_EARLY_CEIL: f64 = 0.05;
 pub const TAP_CEIL: f64 = 0.3;
+
+/// The standard deviation, in logit units, of one id's logit between two implementations of the model: V4.1's, until
+/// Solar-Open2's own is measured. Both Solar gates' descriptions read it (`Gate::sigma_logit`, `Case::sigma_logit`).
+pub const SIGMA_LOGIT: f64 = SIGMA_LOGIT_V41;
 
 /// The ceiling of layer `layer`'s output distance in `tier`'s file.
 ///
@@ -71,7 +76,6 @@ pub fn model_path(tier_now: Tier, recipe: &str) -> Result<PathBuf, GateError> {
 /// The including gate declares `shared/gate_card.rs` as `gate_card` beside this module.
 pub fn open(file: &Path, ctx: usize, arm: Arm) -> Result<Box<dyn Seat>, GateError> {
     let levers = bloomery_levers::at_main(&[bloomery_levers::CARD_BUDGET])?;
-    crate::gate_card::init()?;
     let split = Split::open(file).map_err(|e| format!("open {}: {e}", file.display()))?;
     // The file as it is: the gates feed ids, so the features of the file that only the tokenizer and the tool-call parser
     // carry (`PlanInputs::read` lists them as unimplemented) are not the gate's. The plan this gate holds its pins to is the
@@ -80,10 +84,7 @@ pub fn open(file: &Path, ctx: usize, arm: Arm) -> Result<Box<dyn Seat>, GateErro
     inputs.room = (PLAN_ROOM, HostRead::Given);
     // Plan (b′): the stage on the largest card, the next-largest an expert tier under the host tier, holding the tier's
     // prompt-batch bytes the file's widths give.
-    let machine = match arm {
-        Arm::A => crate::gate_card::plan_gate(inputs.model.layers),
-        Arm::Bp => workstation::plan_bp(inputs.model.layers, None, place::tier_batch(&inputs.hp)),
-    };
+    let machine = arm.machine(inputs.model.layers, place::tier_batch(&inputs.hp))?;
     let place = PlanLevers::from_levers(&levers)?;
     let plan = inputs.plan(&machine, u64::try_from(ctx)?, &place)?;
     let mut m = Body::open_placed(split, &plan, &inputs, 0, levers.host())?;

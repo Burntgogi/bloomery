@@ -62,6 +62,13 @@
 //! line (the streamed text against the vocabulary's one-shot decode of the
 //! same ids), and the `chat:` summary line.
 //!
+//! llama-server's placement flags (`-dev`, `-sm`, `-mg`, `-ts`, `-ngl`, `-fit`, `-fitt` and kin) and
+//! their `LLAMA_ARG_*` variables are read first, as `bloomery-serve` reads them
+//! (`bloomery_gpu_gates::llama_launch`), before the run list: the cards they name become the
+//! `--place` word (`--place` beside them is refused), the levers they are replace the
+//! environment's, and a flag this binary has no thing for (`--cpu-moe`, `-devd`: it runs no draft
+//! and no expert switch) is refused by name. `--list-devices` prints the devices and exits.
+//!
 //! The levers it acts on are parsed once, at `main`
 //! (`bloomery_levers::at_main`), which refuses by name a lever set outside
 //! them — the prompt feed's among them: a prompt is fed one step per id — and
@@ -92,6 +99,7 @@ mod drive {
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu_deepseek41::body::{self, Body, Deepseek41Model};
     use bloomery_gpu_gates::generate::{Generator, OpenArgs, Place, PlaceWhy};
+    use bloomery_gpu_gates::llama_launch::{self, Launcher};
     use bloomery_gpu_gates::need;
     use bloomery_gpu_gates::record::{self, Record};
     use bloomery_gpu_gates::{GateError, ref_model_path};
@@ -176,7 +184,7 @@ mod drive {
             ctx: usize::try_from(workstation::CTX_MAX)?,
         };
         let mut place_flag = None;
-        let mut it = std::env::args_os().skip(1);
+        let mut it = llama_launch::args_os().into_iter().skip(1);
         while let Some(flag) = it.next() {
             let flag = flag.to_string_lossy().into_owned();
             match flag.as_str() {
@@ -306,6 +314,19 @@ mod drive {
     }
 
     pub fn run() -> Result<(), GateError> {
+        // llama-server's placement flags and variables come out of the arguments, and the levers
+        // they are replace the environment's, before any lever is read. This binary runs no
+        // draft, so the seat it is read on has no card a draft opens on.
+        let seat = || -> Result<&'static str, GateError> { Ok("chat") };
+        let launcher = Launcher {
+            bin: "bloomery-chat",
+            seat: &seat,
+            layers: &llama_launch::file_layers,
+            reads: llama_launch::NONE,
+        };
+        if launcher.start()? {
+            return Ok(());
+        }
         let levers = bloomery_levers::at_main(&[
             ENGRAM_HELPER,
             CARD_BUDGET,

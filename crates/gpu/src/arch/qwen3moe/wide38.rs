@@ -2064,16 +2064,13 @@ impl WideParts<'_> {
             input: GemmInput::PerSlot,
         };
         // The SwiGLU writes the form the down's type reads: the q8 of its
-        // rows, or the f32 rows.
+        // rows, or the f32 rows. Both are held here beside the arena's, not as
+        // one `WideActs`: `sh_h` is the gemv arm's row too.
         let io = GatedIo {
             x: &wide_in(&u.ffn_x, &x.act_hid),
             gate: &mut s.sh_g,
             up: &mut s.sh_u,
-            rows: SwigluRows {
-                q128: None,
-                q32: Some(&mut x.act_ff),
-                f32: Some(&mut s.sh_h),
-            },
+            rows: SwigluRows::held(None, Some(&mut x.act_ff), Some(&mut s.sh_h)),
             y: &mut u.sh_y,
         };
         site::gated(c.gpu, &dense_kernels(c), &block, (m, m), io, sink)

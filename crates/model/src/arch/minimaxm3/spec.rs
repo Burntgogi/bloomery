@@ -1,10 +1,11 @@
 //! The minimax-m3 reader's [`ModelSpec`]. Every layer is GQA with the per-head q/k norm and a
-//! partial NeoX rope on a plain residual. A dense layer runs a `swigluoai` block and attends every
-//! position. A sparse layer attends the blocks its indexer picks ([`Selector::BlockMax`]) and runs
-//! the sigmoid noaux_tc router over `swigluoai` experts beside an ungated shared one: the
-//! selection bias steers the choice only, the kept scores are renormalized and scaled by
-//! `expert_weights_scale`. The chat surface carries no tool-call parser; its reasoning span is
-//! the pair the template's generation prompt opens and the model closes.
+//! partial NeoX rope on a plain residual. A dense block is `swigluoai`. A routed block is the
+//! sigmoid noaux_tc router over `swigluoai` experts beside an ungated shared one: the selection
+//! bias steers the choice only, the kept scores are renormalized and scaled by
+//! `expert_weights_scale`. A sparse-attention layer attends the blocks its indexer picks
+//! ([`Selector::BlockMax`]), whichever block it runs; a full-attention layer attends every
+//! position. The chat surface carries no tool-call parser; its reasoning span is the pair the
+//! template's generation prompt opens and the model closes.
 
 use gguf::Split;
 use models::{
@@ -12,7 +13,7 @@ use models::{
     Rope, RopeMode, Selector,
 };
 
-use super::hparams::{Hparams, Kind, SWIGLU_ALPHA, SWIGLU_LIMIT};
+use super::hparams::{Attn, FfnKind, Hparams, SWIGLU_ALPHA, SWIGLU_LIMIT};
 use super::roles;
 use crate::arch::{Read, chat_of, spec_u32};
 use crate::placement::PlacementError;
@@ -52,8 +53,8 @@ pub fn spec_of(hp: &Hparams, chat: ChatSpec) -> Result<ModelSpec, PlacementError
         yarn: None,
     };
     let layer = |l: usize| -> Result<LayerSpec, PlacementError> {
-        let sparse = hp.kind(l) == Kind::Sparse;
-        let select = if sparse {
+        let kind = hp.kind(l);
+        let select = if kind.attn == Attn::Sparse {
             let m = &hp.msa;
             Some(Selector::BlockMax {
                 heads: spec_u32("attention.indexer.head_count", m.heads)?,
@@ -74,14 +75,15 @@ pub fn spec_of(hp: &Hparams, chat: ChatSpec) -> Result<ModelSpec, PlacementError
             value_dim: spec_u32("attention.key_length", hp.head_dim)?,
             rope,
             qk_norm: true,
+            o_norm: false,
             out_gate: OutGate::None,
             select,
             window: None,
             sinks: false,
             value_scale: None,
         });
-        let ffn = match hp.kind(l) {
-            Kind::Dense => {
+        let ffn = match kind.ffn {
+            FfnKind::Dense => {
                 // The reader read the dense width whenever a layer is dense.
                 let ff = hp.dense_ff.ok_or_else(|| PlacementError::Metadata {
                     key: "feed_forward_length".to_string(),
@@ -92,7 +94,7 @@ pub fn spec_of(hp: &Hparams, chat: ChatSpec) -> Result<ModelSpec, PlacementError
                     act: ACT,
                 }
             }
-            Kind::Sparse => hp.experts.ffn(ACT)?,
+            FfnKind::Routed => hp.experts.ffn(ACT)?,
         };
         Ok(LayerSpec {
             mixer,
@@ -112,6 +114,7 @@ pub fn spec_of(hp: &Hparams, chat: ChatSpec) -> Result<ModelSpec, PlacementError
         hc: None,
         engram: None,
         encoder: None,
+        logit_epilogue: None,
         chat: ChatSpec {
             reasoning: REASONING,
             ..chat

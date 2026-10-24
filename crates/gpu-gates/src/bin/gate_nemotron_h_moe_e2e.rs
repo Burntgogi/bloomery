@@ -1233,6 +1233,8 @@ mod gate {
         };
         let all_card = inputs.plan_with(&machine, ctx, &PlanLevers::default(), Experts::Placed)?;
         let c = &all_card.cards[0];
+        // The pass's reserve comes out of the card before the experts: the budget keeps half their
+        // bytes beside it.
         let half = c.dense_bytes
             + c.rounding_bytes
             + c.kv_bytes
@@ -1241,7 +1243,8 @@ mod gate {
             + machine.cards[0]
                 .set_aside_bytes()
                 .ok_or("the card's set-aside is unbounded")?
-            + machine.cards[0].margin_bytes;
+            + machine.cards[0].margin_bytes
+            + inputs.prompt_reserve;
         let mut arms = vec![
             Arm {
                 name: "card",
@@ -1251,7 +1254,7 @@ mod gate {
             Arm {
                 name: "mid",
                 levers: PlanLevers {
-                    card_budget_bytes: Some(half),
+                    card_budget_bytes: Some(half).into(),
                 },
                 experts: Experts::Placed,
             },
@@ -1265,7 +1268,7 @@ mod gate {
             arms.push(Arm {
                 name: "room12g",
                 levers: PlanLevers {
-                    card_budget_bytes: Some(ROOM_12G),
+                    card_budget_bytes: Some(ROOM_12G).into(),
                 },
                 experts: Experts::Placed,
             });

@@ -1,16 +1,18 @@
 //! Every `minimax-m3.*` key the description reads, and the tensors the file is held to. A key
 //! the loader requires is required here, and a value this reader does not run is refused by the
-//! key's name. Which layers are dense and which sparse (an indexer, routed experts and a shared
-//! expert) is `leading_dense_block_count`; the tensors a layer carries must be exactly its kind's
-//! ([`Hparams::read`]). The dialect's authority is llama.cpp's `src/models/minimax-m3.cpp`.
+//! key's name. A layer's feed-forward block is `leading_dense_block_count` (dense, then routed).
+//! Its attention is `attention.sparse_layers` when the file carries that array, and otherwise the
+//! same lead: full attention on the dense blocks, MiniMax Sparse Attention on the routed ones.
+//! The tensors a layer carries must be exactly that pair's ([`Hparams::read`]). The dialect's
+//! authority is llama.cpp's `src/models/minimax-m3.cpp`.
 
-use gguf::Split;
+use gguf::{Split, Value};
 
 use super::roles::stems_of;
 use crate::arch::hybrid::layers_agree;
 use crate::arch::{
-    dims_agree, finite_positive, meta_usize, metadata, n_vocab, noaux, optional_usize, plain_rope,
-    positive, unread_keys_of,
+    dims_agree, finite_positive, meta_usize, metadata, n_vocab, noaux, optional_usize,
+    per_layer_items, plain_rope, positive, unread_keys_of,
 };
 use crate::placement::PlacementError;
 
@@ -21,14 +23,52 @@ pub const SWIGLU_ALPHA: f32 = 1.702;
 /// `swigluoai`'s clamp (`limit`): the gate's upper bound and the up path's two bounds.
 pub const SWIGLU_LIMIT: f32 = 7.0;
 
-/// What a layer is, from `leading_dense_block_count`: the first layers are dense, the rest sparse.
+/// How a layer attends.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Kind {
-    /// Attends every position; a dense feed-forward block.
-    Dense,
-    /// Attends the blocks its indexer picks; routed experts beside a shared one.
+pub enum Attn {
+    /// Every position.
+    Full,
+    /// The blocks its indexer picks (MiniMax Sparse Attention).
     Sparse,
 }
+
+/// A layer's feed-forward block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FfnKind {
+    /// A dense `swigluoai` block.
+    Dense,
+    /// Routed `swigluoai` experts beside an ungated shared one.
+    Routed,
+}
+
+/// What a layer is: its attention and its feed-forward block, read apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Kind {
+    /// [`Hparams::kind`]: full, or sparse with the indexer tensors.
+    pub attn: Attn,
+    /// [`Hparams::kind`]: dense, or routed.
+    pub ffn: FfnKind,
+}
+
+/// Every pair a file may name. [`layers_agree`] bans a stem another pair carries.
+const PAIRS: &[Kind] = &[
+    Kind {
+        attn: Attn::Full,
+        ffn: FfnKind::Dense,
+    },
+    Kind {
+        attn: Attn::Full,
+        ffn: FfnKind::Routed,
+    },
+    Kind {
+        attn: Attn::Sparse,
+        ffn: FfnKind::Dense,
+    },
+    Kind {
+        attn: Attn::Sparse,
+        ffn: FfnKind::Routed,
+    },
+];
 
 /// The hyperparameters of one minimax-m3 file.
 #[derive(Clone, Debug, PartialEq)]
@@ -52,13 +92,16 @@ pub struct Hparams {
     pub n_vocab: usize,
     /// `context_length`.
     pub n_ctx_train: usize,
-    /// `leading_dense_block_count`: the layers before the first sparse one.
+    /// `leading_dense_block_count`: the layers before the first routed one.
     pub dense_lead: usize,
+    /// `attention.sparse_layers` when the file carries it, one entry a layer: true where attention
+    /// is sparse. Absent, [`Hparams::kind`] follows `dense_lead`.
+    pub sparse_attn: Option<Vec<bool>>,
     /// `feed_forward_length`, the dense layers' width; `None` on a file with no dense layer.
     pub dense_ff: Option<usize>,
-    /// The sparse layers' router and experts.
+    /// The routed layers' router and experts.
     pub experts: Experts,
-    /// The sparse layers' block selection.
+    /// The block selection a sparse-attention layer runs.
     pub msa: Msa,
     /// The keys this read took a default for: the key, the value, the line.
     pub defaults: Vec<String>,
@@ -107,6 +150,7 @@ const READ: &[&str] = &[
     "attention.key_length",
     "attention.value_length",
     "attention.layer_norm_rms_epsilon",
+    "attention.sparse_layers",
     "attention.indexer.head_count",
     "attention.indexer.key_length",
     "attention.indexer.top_k",
@@ -167,9 +211,10 @@ impl Hparams {
             return Err(metadata(
                 split,
                 "leading_dense_block_count",
-                format!("is {dense_lead} for {n_layer} layers; at least one layer must be sparse"),
+                format!("is {dense_lead} for {n_layer} layers; at least one layer must route"),
             ));
         }
+        let sparse_attn = read_sparse_layers(split, n_layer)?;
         let dense_ff = (dense_lead > 0)
             .then(|| positive(split, "feed_forward_length"))
             .transpose()?;
@@ -184,6 +229,7 @@ impl Hparams {
             n_vocab: n_vocab(split)?,
             n_ctx_train: positive(split, "context_length")?,
             dense_lead,
+            sparse_attn,
             dense_ff,
             experts: Experts::read(split, "the minimax-m3 router", &mut defaults)?,
             msa: Msa::read(split, n_head_kv, &rope)?,
@@ -199,13 +245,27 @@ impl Hparams {
         Ok(hp)
     }
 
-    /// Layer `l`'s kind.
+    /// Layer `l`'s attention and feed-forward block. The feed-forward block is dense for
+    /// `l < dense_lead` and routed after it. Attention is sparse where `sparse_attn` says, and
+    /// where `l >= dense_lead` when the file carries no `attention.sparse_layers`.
     #[must_use]
     pub fn kind(&self, l: usize) -> Kind {
-        if l < self.dense_lead {
-            Kind::Dense
-        } else {
-            Kind::Sparse
+        assert!(
+            l < self.n_layer,
+            "layer {l} past the file's {} layers",
+            self.n_layer
+        );
+        let sparse = match &self.sparse_attn {
+            Some(v) => v[l],
+            None => l >= self.dense_lead,
+        };
+        Kind {
+            attn: if sparse { Attn::Sparse } else { Attn::Full },
+            ffn: if l < self.dense_lead {
+                FfnKind::Dense
+            } else {
+                FfnKind::Routed
+            },
         }
     }
 
@@ -215,12 +275,13 @@ impl Hparams {
         self.n_head / self.n_head_kv
     }
 
-    /// The model-level three and every layer's kind's required tensors are in the file, an
-    /// indexer exactly where a layer is sparse, and nothing of the other kind's: the first missing
-    /// or misplaced name, with how many more there are.
+    /// The model-level three and every layer's pair's required tensors are in the file, an
+    /// indexer exactly where attention is sparse, the dense block exactly on a dense layer, the
+    /// routed block exactly on a routed layer: the first missing or misplaced name, with how many
+    /// more there are.
     fn tensors_agree(&self, split: &Split) -> Result<(), PlacementError> {
         let kinds: Vec<Kind> = (0..self.n_layer).map(|l| self.kind(l)).collect();
-        layers_agree(split, &kinds, stems_of, &[Kind::Dense, Kind::Sparse])
+        layers_agree(split, &kinds, stems_of, PAIRS)
     }
 
     /// Layer `l`'s tensors by stem and the dims llama.cpp creates them with, ggml order.
@@ -242,8 +303,9 @@ impl Hparams {
             ("attn_output.weight", vec![h * k, e]),
             ("ffn_norm.weight", vec![e]),
         ];
-        match self.kind(l) {
-            Kind::Dense => {
+        let kind = self.kind(l);
+        match kind.ffn {
+            FfnKind::Dense => {
                 let ff = self.dense_ff.unwrap_or(0) as u64;
                 dims.extend([
                     ("ffn_gate.weight", vec![e, ff]),
@@ -251,19 +313,62 @@ impl Hparams {
                     ("ffn_down.weight", vec![ff, e]),
                 ]);
             }
-            Kind::Sparse => {
-                let m = &self.msa;
-                let (ih, id) = (m.heads as u64, m.d as u64);
-                dims.extend(self.experts.dims(e));
-                dims.extend([
-                    ("indexer.q_proj.weight", vec![e, ih * id]),
-                    ("indexer.k_proj.weight", vec![e, id]),
-                    ("indexer.q_norm.weight", vec![id]),
-                    ("indexer.k_norm.weight", vec![id]),
-                ]);
-            }
+            FfnKind::Routed => dims.extend(self.experts.dims(e)),
+        }
+        if kind.attn == Attn::Sparse {
+            let m = &self.msa;
+            let (ih, id) = (m.heads as u64, m.d as u64);
+            dims.extend([
+                ("indexer.q_proj.weight", vec![e, ih * id]),
+                ("indexer.k_proj.weight", vec![e, id]),
+                ("indexer.q_norm.weight", vec![id]),
+                ("indexer.k_norm.weight", vec![id]),
+            ]);
         }
         dims
+    }
+}
+
+/// `attention.sparse_layers` as one bool or u8 0 or 1 per layer, or absent. A scalar, a length
+/// other than `n_layer`, or any other value is refused by name: the file's own form is the
+/// per-layer array, and its entries decide which layers carry the indexer.
+fn read_sparse_layers(split: &Split, n_layer: usize) -> Result<Option<Vec<bool>>, PlacementError> {
+    let key = "attention.sparse_layers";
+    match split.value(&split.arch_key(key)) {
+        None => Ok(None),
+        Some(Value::Array(_)) => {
+            let flags = per_layer_items(split, key, n_layer)?
+                .iter()
+                .enumerate()
+                .map(|(l, v)| sparse_flag(split, l, v))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Some(flags))
+        }
+        Some(_) => Err(metadata(
+            split,
+            key,
+            "is not an array of one bool or u8 0 or 1 per layer",
+        )),
+    }
+}
+
+/// One `attention.sparse_layers` entry: a bool, or a u8 0 or 1.
+fn sparse_flag(split: &Split, l: usize, v: &Value) -> Result<bool, PlacementError> {
+    let key = "attention.sparse_layers";
+    match v {
+        Value::Bool(b) => Ok(*b),
+        Value::U8(0) => Ok(false),
+        Value::U8(1) => Ok(true),
+        Value::U8(n) => Err(metadata(
+            split,
+            key,
+            format!("has u8 {n} at layer {l}; a 0 or a 1"),
+        )),
+        _ => Err(metadata(
+            split,
+            key,
+            format!("has no bool or u8 at layer {l}"),
+        )),
     }
 }
 
@@ -380,7 +485,7 @@ impl Msa {
 
 #[cfg(test)]
 pub(super) mod tests {
-    use super::{Hparams, Kind, unread_keys};
+    use super::{Attn, FfnKind, Hparams, Kind, unread_keys};
     use crate::arch::synthetic::{V, header_shaped};
     use gguf::Split;
 
@@ -402,12 +507,22 @@ pub(super) mod tests {
     pub(in crate::arch::minimaxm3) const VOCAB: u64 = 2;
 
     pub(in crate::arch::minimaxm3) fn keys() -> Vec<(&'static str, V)> {
-        vec![
-            ("block_count", V::U32(LAYERS as u32)),
+        keys_shaped(LAYERS, LEAD, None)
+    }
+
+    /// [`keys`] at `layers` layers whose first `lead` are dense blocks, with `attention.sparse_layers`
+    /// set to `sparse` when present.
+    pub(in crate::arch::minimaxm3) fn keys_shaped(
+        layers: usize,
+        lead: usize,
+        sparse: Option<Vec<bool>>,
+    ) -> Vec<(&'static str, V)> {
+        let mut kv = vec![
+            ("block_count", V::U32(layers as u32)),
             ("context_length", V::U32(4096)),
             ("embedding_length", V::U32(E as u32)),
             ("feed_forward_length", V::U32(FF as u32)),
-            ("leading_dense_block_count", V::U32(LEAD as u32)),
+            ("leading_dense_block_count", V::U32(lead as u32)),
             ("attention.head_count", V::U32(HEADS as u32)),
             ("attention.head_count_kv", V::U32(KV as u32)),
             ("attention.key_length", V::U32(K as u32)),
@@ -427,24 +542,39 @@ pub(super) mod tests {
             ("attention.indexer.top_k", V::U32(3)),
             ("attention.indexer.block_size", V::U32(4)),
             ("attention.indexer.local_blocks", V::U32(1)),
-        ]
+        ];
+        if let Some(flags) = sparse {
+            kv.push(("attention.sparse_layers", V::Bools(flags)));
+        }
+        kv
     }
 
     /// The released file's tensor table (1,176 tensors at 60 layers), at [`keys`]' widths: the
-    /// three model-level tensors, then each layer's attention and norm tensors and its kind's
-    /// block, the sparse layers' indexer last. Written from the table, apart from the reader.
+    /// three model-level tensors, then each layer's attention and norm tensors and its pair's
+    /// block, a sparse-attention layer's indexer last. Written from the table, apart from the reader.
     pub(in crate::arch::minimaxm3) fn tensors() -> Vec<(String, Vec<u64>)> {
         tensors_lead(LEAD)
     }
 
-    /// [`tensors`] with the first `lead` layers dense.
+    /// [`tensors`] with the first `lead` layers dense. Attention follows the lead.
     fn tensors_lead(lead: usize) -> Vec<(String, Vec<u64>)> {
+        tensors_shaped(LAYERS, lead, None)
+    }
+
+    /// [`tensors`] at `layers` layers. Attention is sparse where `sparse` says, or from `lead` on
+    /// when `sparse` is absent; the feed-forward block is dense before `lead`.
+    pub(in crate::arch::minimaxm3) fn tensors_shaped(
+        layers: usize,
+        lead: usize,
+        sparse: Option<&[bool]>,
+    ) -> Vec<(String, Vec<u64>)> {
         let mut t: Vec<(String, Vec<u64>)> = vec![
             ("token_embd.weight".into(), vec![E, VOCAB]),
             ("output.weight".into(), vec![E, VOCAB]),
             ("output_norm.weight".into(), vec![E]),
         ];
-        for l in 0..LAYERS {
+        for l in 0..layers {
+            let sparse_attn = sparse.map(|s| s[l]).unwrap_or(l >= lead);
             let mut layer: Vec<(&str, Vec<u64>)> = vec![
                 ("attn_norm.weight", vec![E]),
                 ("attn_q.weight", vec![E, HEADS * K]),
@@ -471,6 +601,10 @@ pub(super) mod tests {
                     ("ffn_gate_shexp.weight", vec![E, EFF]),
                     ("ffn_up_shexp.weight", vec![E, EFF]),
                     ("ffn_down_shexp.weight", vec![EFF, E]),
+                ]);
+            }
+            if sparse_attn {
+                layer.extend([
                     ("indexer.q_proj.weight", vec![E, IDX_HEADS * IDX_D]),
                     ("indexer.k_proj.weight", vec![E, IDX_D]),
                     ("indexer.q_norm.weight", vec![IDX_D]),
@@ -593,13 +727,29 @@ pub(super) mod tests {
         assert_eq!(
             kinds,
             [
-                Kind::Dense,
-                Kind::Dense,
-                Kind::Sparse,
-                Kind::Sparse,
-                Kind::Sparse
+                Kind {
+                    attn: Attn::Full,
+                    ffn: FfnKind::Dense
+                },
+                Kind {
+                    attn: Attn::Full,
+                    ffn: FfnKind::Dense
+                },
+                Kind {
+                    attn: Attn::Sparse,
+                    ffn: FfnKind::Routed
+                },
+                Kind {
+                    attn: Attn::Sparse,
+                    ffn: FfnKind::Routed
+                },
+                Kind {
+                    attn: Attn::Sparse,
+                    ffn: FfnKind::Routed
+                },
             ]
         );
+        assert!(hp.sparse_attn.is_none());
         assert!(hp.defaults.is_empty(), "{:?}", hp.defaults);
     }
 
@@ -621,11 +771,26 @@ pub(super) mod tests {
         hp.experts.n_expert = 128;
         hp.experts.n_used = 4;
         hp.experts.ff = 3072;
+        hp.experts.shared_width = 3072;
         hp.msa.heads = 4;
         hp.msa.d = 128;
         hp.msa.top_k = 16;
         hp.msa.block = 128;
         hp
+    }
+
+    /// The shared block's width is `expert_shared_feed_forward_length` when the header carries it,
+    /// so a file whose routed width is cut and whose shared width is not (the folder fixture) reads
+    /// its own shared tensors. Mutant: the width taken as `ff · n_shared` with the key present.
+    #[test]
+    fn the_shared_width_is_its_own_key() {
+        let mut kv = keys();
+        kv.push(("expert_shared_feed_forward_length", V::U32(EFF as u32)));
+        let hp = read("shared-key", &kv, &tensors()).expect("the header reads");
+        assert_eq!(hp.experts.shared_ff() as u64, EFF);
+        let mut kv = keys();
+        kv.push(("expert_shared_feed_forward_length", V::U32(2 * EFF as u32)));
+        refused("shared-key-wide", &kv, &tensors(), "ffn_gate_shexp");
     }
 
     /// The table the reader holds a file to has the released file's 1,176 tensors and its listed
@@ -663,7 +828,13 @@ pub(super) mod tests {
         let kv = with("leading_dense_block_count", None);
         let hp = read("lead-absent", &kv, &tensors_lead(0)).expect("every layer sparse reads");
         assert_eq!((hp.dense_lead, hp.dense_ff), (0, None));
-        assert_eq!(hp.kind(0), Kind::Sparse);
+        assert_eq!(
+            hp.kind(0),
+            Kind {
+                attn: Attn::Sparse,
+                ffn: FfnKind::Routed
+            }
+        );
         assert_eq!(hp.defaults, ["leading_dense_block_count = 0 (absent)"]);
         refused(
             "lead-absent-dense",
@@ -959,5 +1130,234 @@ pub(super) mod tests {
         let mut kv = keys();
         kv.push(("attention.sliding_window", V::U32(8)));
         assert_eq!(open(&kv), ["minimax-m3.attention.sliding_window"]);
+    }
+
+    /// MiniMax-M3.1-Flash's shape: 60 layers, every one sparse attention, the first three a dense
+    /// block, no next-token layer. The header's rope base is the value it carries. Mutant: attention
+    /// still following the dense lead, or the indexer left off a dense layer.
+    #[test]
+    fn a_flash_header_splits_attention_from_the_block() {
+        const N: usize = 60;
+        const LEAD_F: usize = 3;
+        let flags = vec![true; N];
+        let mut kv = keys_shaped(N, LEAD_F, Some(flags.clone()));
+        for (k, v) in &mut kv {
+            if *k == "rope.freq_base" {
+                *v = V::F32(1.0e7);
+            }
+        }
+        let path = header_shaped(
+            "mm3-flash",
+            "minimax-m3",
+            &kv,
+            &[],
+            &tensors_shaped(N, LEAD_F, Some(&flags)),
+        );
+        let split = Split::open(&path).expect("the synthetic header opens");
+        let hp = Hparams::read(&split).expect("the flash header reads");
+        let tensors = crate::arch::minimaxm3::roles::classify(&split, &hp).expect("roles");
+        let spec = crate::arch::minimaxm3::spec::spec_of(
+            &hp,
+            models::ChatSpec {
+                pre: String::new(),
+                template: None,
+                tools: None,
+                reasoning: None,
+            },
+        )
+        .expect("the description");
+        assert!(unread_keys(&split).is_empty(), "{:?}", unread_keys(&split));
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            (hp.n_layer, hp.dense_lead, hp.rope.base),
+            (N, LEAD_F, 1.0e7)
+        );
+        assert_eq!(hp.sparse_attn.as_deref(), Some(flags.as_slice()));
+        assert!(hp.defaults.is_empty(), "{:?}", hp.defaults);
+        assert!(spec.mtp.is_empty());
+        assert_eq!(spec.layers.len(), N);
+        for (l, layer) in spec.layers.iter().enumerate() {
+            let want = Kind {
+                attn: Attn::Sparse,
+                ffn: if l < LEAD_F {
+                    FfnKind::Dense
+                } else {
+                    FfnKind::Routed
+                },
+            };
+            assert_eq!(hp.kind(l), want, "layer {l}");
+            let models::Mixer::Gqa(g) = &layer.mixer else {
+                panic!("layer {l} is not GQA");
+            };
+            assert!(
+                matches!(g.select, Some(models::Selector::BlockMax { .. })),
+                "layer {l} has no indexer"
+            );
+            if l < LEAD_F {
+                assert!(
+                    matches!(layer.ffn, models::Ffn::Dense { ff: 48, .. }),
+                    "layer {l}"
+                );
+            } else {
+                assert!(matches!(layer.ffn, models::Ffn::Moe(_)), "layer {l}");
+            }
+        }
+        let dims = |l: usize, stem: &str| {
+            hp.layer_dims(l)
+                .into_iter()
+                .find(|(s, _)| *s == stem)
+                .map(|(_, d)| d)
+        };
+        assert_eq!(dims(0, "ffn_down.weight"), Some(vec![FF, E]));
+        assert_eq!(
+            dims(0, "indexer.q_proj.weight"),
+            Some(vec![E, IDX_HEADS * IDX_D])
+        );
+        assert_eq!(dims(0, "ffn_gate_exps.weight"), None);
+        assert_eq!(dims(2, "indexer.k_norm.weight"), Some(vec![IDX_D]));
+        assert_eq!(dims(3, "ffn_gate.weight"), None);
+        assert_eq!(dims(3, "ffn_gate_exps.weight"), Some(vec![E, EFF, N_EXP]));
+        assert_eq!(dims(59, "indexer.k_proj.weight"), Some(vec![E, IDX_D]));
+        // 8 attention and norm stems, 3 dense or 8 routed, 4 indexer.
+        let layered: usize = (0..N).map(|l| hp.layer_dims(l).len()).sum();
+        assert_eq!(3 + layered, 3 + LEAD_F * 15 + (N - LEAD_F) * 20);
+        let kv = crate::arch::place_hybrid::KvLayout::of(spec.layers.iter().map(|l| &l.mixer))
+            .expect("the layers are sized");
+        let row = KV * (K + K) * 2;
+        let index = IDX_D * 2;
+        assert_eq!(kv.bytes(0..N, 64), N as u64 * (row + index) * 64);
+        let stack = E * EFF * N_EXP * 4;
+        let expert_bytes: u64 = tensors
+            .tensors
+            .iter()
+            .filter(|t| t.role == crate::placement::Role::RoutedExperts)
+            .map(|t| t.file_bytes)
+            .sum();
+        assert_eq!(expert_bytes, (N - LEAD_F) as u64 * 3 * stack);
+        assert!(tensors.tensors.iter().all(|t| {
+            let on_routed = matches!(
+                t.role,
+                crate::placement::Role::RoutedExperts | crate::placement::Role::SharedExpert
+            );
+            let on_dense = t.role == crate::placement::Role::DenseFfn;
+            (!on_routed || t.layer.is_some_and(|l| l >= LEAD_F))
+                && (!on_dense || t.layer.is_some_and(|l| l < LEAD_F))
+        }));
+    }
+
+    /// `attention.sparse_layers` is one bool or u8 0 or 1 a layer, and the tensors are that pair's.
+    /// Mutant: a short array accepted, or the indexer required only on a routed layer.
+    #[test]
+    fn a_sparse_array_must_match_the_layers_and_their_tensors() {
+        let all = vec![true; LAYERS];
+        let mut full_on_zero = all.clone();
+        full_on_zero[0] = false;
+        let with_indexer = tensors_shaped(LAYERS, LEAD, Some(&all));
+        let missing: Vec<_> = with_indexer
+            .iter()
+            .filter(|(n, _)| n != "blk.0.indexer.q_proj.weight")
+            .cloned()
+            .collect();
+        let mut i32s = keys();
+        i32s.push(("attention.sparse_layers", V::I32s(vec![1; LAYERS])));
+        let mut scalar = keys();
+        scalar.push(("attention.sparse_layers", V::U32(1)));
+        assert_all_refused(vec![
+            (
+                "sparse-short".to_string(),
+                keys_shaped(LAYERS, LEAD, Some(vec![true; LAYERS - 1])),
+                tensors(),
+                "attention.sparse_layers: has 4 values for 5 layers".to_string(),
+            ),
+            (
+                "sparse-i32".to_string(),
+                i32s,
+                tensors(),
+                "attention.sparse_layers: has no bool or u8 at layer 0".to_string(),
+            ),
+            (
+                "sparse-scalar".to_string(),
+                scalar,
+                tensors(),
+                "attention.sparse_layers: is not an array".to_string(),
+            ),
+            (
+                "sparse-no-indexer".to_string(),
+                keys_shaped(LAYERS, LEAD, Some(all)),
+                missing,
+                "blk.0.indexer.q_proj.weight: is not in the file".to_string(),
+            ),
+            (
+                "full-has-indexer".to_string(),
+                keys_shaped(LAYERS, LEAD, Some(full_on_zero)),
+                with_indexer,
+                "blk.0.indexer.q_proj.weight: is in the file".to_string(),
+            ),
+        ]);
+    }
+
+    /// A full-attention layer over routed experts reads when the array says that layer is full, and
+    /// the same tensors are refused when the array is absent. An array that restates the lead reads
+    /// the lead's pairs. Mutant: the pair refused outright, or the absent array read as all-sparse.
+    #[test]
+    fn a_full_routed_layer_is_legal_only_when_the_array_says_so() {
+        let mut flags = vec![true; LAYERS];
+        flags[2] = false;
+        let t = tensors_shaped(LAYERS, LEAD, Some(&flags));
+        refused(
+            "full-routed-unkeyed",
+            &keys(),
+            &t,
+            "blk.2.indexer.q_proj.weight: is not in the file",
+        );
+        let hp = read("full-routed", &keys_shaped(LAYERS, LEAD, Some(flags)), &t)
+            .expect("layer 2 is full attention over routed experts");
+        assert_eq!(
+            (0..LAYERS).map(|l| hp.kind(l)).collect::<Vec<_>>(),
+            [
+                Kind {
+                    attn: Attn::Sparse,
+                    ffn: FfnKind::Dense
+                },
+                Kind {
+                    attn: Attn::Sparse,
+                    ffn: FfnKind::Dense
+                },
+                Kind {
+                    attn: Attn::Full,
+                    ffn: FfnKind::Routed
+                },
+                Kind {
+                    attn: Attn::Sparse,
+                    ffn: FfnKind::Routed
+                },
+                Kind {
+                    attn: Attn::Sparse,
+                    ffn: FfnKind::Routed
+                },
+            ]
+        );
+        let agree = vec![false, false, true, true, true];
+        let hp = read(
+            "sparse-agrees",
+            &keys_shaped(LAYERS, LEAD, Some(agree)),
+            &tensors(),
+        )
+        .expect("an array that restates the lead reads");
+        assert!(hp.sparse_attn.is_some());
+        for l in 0..LAYERS {
+            let want = if l < LEAD {
+                Kind {
+                    attn: Attn::Full,
+                    ffn: FfnKind::Dense,
+                }
+            } else {
+                Kind {
+                    attn: Attn::Sparse,
+                    ffn: FfnKind::Routed,
+                }
+            };
+            assert_eq!(hp.kind(l), want, "layer {l}");
+        }
     }
 }

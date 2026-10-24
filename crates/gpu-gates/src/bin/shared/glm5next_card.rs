@@ -32,6 +32,7 @@ use bloomery_gpu::hybrid::HOST;
 use bloomery_gpu::iq_sel::IqGateUp;
 use bloomery_gpu::kquant::{Act, GateUpAct, SelDown};
 use bloomery_gpu::mxfp4_sel::Mxfp4SelKernels;
+use bloomery_gpu::q6k_sel::Q6kSelKernels;
 use bloomery_gpu::quant_sel::QuantSelKernels;
 use bloomery_gpu::weights::{DevWeight, Weights};
 use bloomery_gpu::{DeviceTensor, Gpu, Q8Act};
@@ -51,6 +52,7 @@ use model::placement::kernels::{self, DownEntry, GateUpEntry};
 struct SelKernels {
     quant: QuantSelKernels,
     mx: Mxfp4SelKernels,
+    q6k: Q6kSelKernels,
 }
 
 /// The checks (i)–(iii) on `s`'s model, whose plan put `n_l[l]` card experts
@@ -319,6 +321,11 @@ fn gemv_pair(
             };
             match entry {
                 Some(DownEntry::Q5k) => k.quant.enqueue_gemv_q5k_sel(stream, &a, sink, y)?,
+                // Q6_K's `_sel` takes the activation itself, the Q4_K
+                // launch's shape, not a `SelDown`.
+                Some(DownEntry::Q6k) => {
+                    k.q6k.enqueue_gemv_q6k_sel(stream, w, act, sel, 1, rpe, y)?
+                }
                 Some(DownEntry::Mxfp4) => k.mx.enqueue_down(stream, &a, sink, y)?,
                 Some(DownEntry::Iq2xs | DownEntry::Iq3xxs | DownEntry::Iq3s | DownEntry::Iq4xs) => {
                     k.quant.enqueue_gemv_sel(stream, ty, &a, sink, y)?
@@ -404,6 +411,7 @@ fn check_slots(
     let sk = SelKernels {
         quant: QuantSelKernels::load(ctx, word)?,
         mx: Mxfp4SelKernels::load(ctx, word)?,
+        q6k: Q6kSelKernels::load(ctx, word)?,
     };
     let (mut pairs, mut layers, mut bad) = (0usize, 0usize, Vec::new());
     for (l, list) in lists.iter().enumerate() {

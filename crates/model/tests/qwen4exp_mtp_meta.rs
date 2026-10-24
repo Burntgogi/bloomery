@@ -201,7 +201,8 @@ fn hw_qwen4exp_mtp_plan() {
         self, KERNEL_POSITIONS, MtpInputs, PlaceError, PlanInputs,
     };
     use model::placement::workstation::{A6000, RTX_3090};
-    use model::placement::{PlanLevers, Violation};
+    use model::placement::{PlanLevers, STEP_PORT_COLUMNS, Violation};
+    use runtime::stores::DELTA_LANES;
 
     let mut o = String::new();
     let mut b: Vec<String> = Vec::new();
@@ -232,10 +233,15 @@ fn hw_qwen4exp_mtp_plan() {
     )
     .unwrap_or_else(|e| panic!("MtpInputs::read with a list: {e}"));
     let levers = PlanLevers::default();
+    // A drafted plan steps `DELTA_LANES` columns a slot through the arena's floor
+    // (its verify rows), plan() one: the host terms compare without that field,
+    // which is pinned apart below.
     let view = |p: &model::placement::Plan<'_>| {
+        let mut host = p.host.clone();
+        host.arena_columns = 0;
         format!(
             "{:?}",
-            (&p.rows, &p.cards, &p.host, p.nvme_bytes, &p.n_l, p.ctx_max)
+            (&p.rows, &p.cards, &host, p.nvme_bytes, &p.n_l, p.ctx_max)
         )
     };
     for card in [A6000, RTX_3090] {
@@ -273,10 +279,17 @@ fn hw_qwen4exp_mtp_plan() {
                 );
                 let headroom = plain.cards[0].headroom_bytes
                     - i128::from(with.draft_card_bytes() + with.arena_bytes);
+                // PIN(2026-10-25): the drafted plan counts its verify lanes in the
+                // paged arena's floor (`DELTA_LANES` columns a slot, capped at the
+                // step port), plan() one column; before that the whole host terms
+                // were equal. The rest of the target's plan is still plan()'s.
+                let columns = (with.plan.host.arena_columns, plain.host.arena_columns);
+                let columns_want = (DELTA_LANES.min(STEP_PORT_COLUMNS) as u64, 1);
                 check(
                     &mut o,
                     format!(
-                        "{} ctx {ctx} {label}: the target's plan is plan()'s ({}); draft \
+                        "{} ctx {ctx} {label}: the target's plan is plan()'s but for the arena's \
+                         columns ({}); columns {columns:?} (want {columns_want:?}); draft \
                          (dense, experts, rounding, kv, map) {got:?} (want {want:?}); n_l {:?}; \
                          headroom {} = the target's {} less {}",
                         card.name,
@@ -287,6 +300,7 @@ fn hw_qwen4exp_mtp_plan() {
                         with.draft_card_bytes() + with.arena_bytes
                     ),
                     view(&with.plan) == view(&plain)
+                        && columns == columns_want
                         && got == want
                         && with.draft.n_l == [512]
                         && with.headroom_bytes == headroom,

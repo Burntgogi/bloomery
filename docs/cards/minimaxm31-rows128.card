@@ -1,0 +1,17 @@
+# MiniMax-M3.1-Flash's prompt rate with 128-row prompt units (T_MAX 16 -> 128), bloomery-serve at the serving defaults
+# on the RTX A6000 + host, depth-serve arms at D = 512 and 4096.
+# Before: pp512 39.3, pp4096 36.5 tok/s with 16-row units [measured, int039 89215ba20]. Per unit and layer the host
+# reads each distinct expert once and runs one MAC per (row, expert) slot; the wall is the larger of the two:
+# 16 rows read 42.5 experts (1.35 GB, 10.2 ms at 133 GB/s) against 54 slots x c (3.6-4.3 ms), DRAM-bound;
+# 128 rows read 106 experts (3.38 GB, 25.4 ms) against 433 slots x c (28.6-34.6 ms, c = 66-80 us), MAC-bound [derived].
+# Card front ~2 ms and PCIe ~0.25 ms sit under the host's time. pp512 55..77, pp4096 55..75 [derived].
+kind: baseline
+question: what prompt rate does MiniMax-M3.1-Flash reach with 128-row prompt units on the RTX A6000 + host?
+term: pp tok/s @ P = 512 and 4096, bloomery-serve at the serving defaults, RTX A6000 + host experts
+unit: tok/s
+predict: 55..77
+condition: one lease, the box quiet, the A6000, a fresh server an arm and a round, ctx 4224, greedy
+reason: the 0.3.9 release states measured pp512 / pp4096 / decode for MiniMax-M3.1-Flash
+decide-in: write the rows into the README's M3.1 table with the lease and witness lines
+decide-below: read the prompt stats (BatchLeg timer) for the host MAC per slot against c = 66..80 us
+decide-above: read the plan lines and the unit count: fewer units than derived

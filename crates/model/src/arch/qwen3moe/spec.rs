@@ -62,6 +62,7 @@ pub fn spec_of(
                     rope,
                     qk_norm: has.contains(names::attn_q_norm(l).as_str())
                         && has.contains(names::attn_k_norm(l).as_str()),
+                    o_norm: false,
                     out_gate: OutGate::None,
                     select: None,
                     window: None,
@@ -73,6 +74,8 @@ pub fn spec_of(
                     top_k: spec_u32("expert_used_count", e.n_used)?,
                     expert_ff: spec_u32("expert_feed_forward_length", e.ff)?,
                     latent: None,
+                    pre_exp_norm: false,
+                    post_exp_norm: None,
                     act: Act::SwiGlu { limit: None },
                     router: Router {
                         score: match e.score {
@@ -101,6 +104,7 @@ pub fn spec_of(
         hc: None,
         engram: None,
         encoder: None,
+        logit_epilogue: None,
         chat,
     })
 }

@@ -57,9 +57,9 @@
 //! hold is refused by name before the first launch.
 //! A stack of any other type is refused by name when the stacks are read
 //! ([`LegStacks::of`]), and an entry the table names but the run has no arm
-//! for is refused by name at the launch. A tensor-parallel rank's stacks may
-//! also hold a Q6_K down ([`LegStacks::of_rank`], [`kernels::rank_down_runs`]),
-//! which the Q6_K `_sel` runs over the 128-value columns.
+//! for is refused by name at the launch. A Q6_K down is in
+//! [`kernels::card_down_runs`] and runs over the 128-value columns
+//! ([`DownAct::Q8Act`]), the form [`LegBufs::new`] holds.
 //!
 //! A prompt walk that runs a unit's card slots through a route table reads
 //! each resident stack by the GEMM entry [`kernels::gemm`] names for its type
@@ -74,6 +74,7 @@ use crate::gemm::{
     Gemm32Args, Gemm32Kernels, Gemm32Weight, GemmAct, GemmAct32, GemmArgs, GemmInput, GemmKernels,
     GemmRoute, GemmWeight,
 };
+use crate::host::xstream::RingLayer;
 use crate::iq_sel::{IqDown, IqGateUp};
 use crate::kquant::{Act, GateUpAct, SelDown};
 use crate::mxfp4_sel::{Mxfp4SelKernels, Nvfp4Down, Nvfp4GateUp, Nvfp4SelKernels, Nvfp4Stack};
@@ -85,10 +86,11 @@ use crate::q8_0_sel32::{Q80SelDown, Q80SelKernels};
 use crate::quant_sel::QuantSelKernels;
 use crate::weights::{DevWeight, Weights};
 use crate::{DeviceTensor, Gpu, GpuError, Q8Act};
-use cuda_core::{CudaStream, DeviceBuffer};
+use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 use gguf::GgmlType;
 use model::placement::accepts::{self, LegArms};
 use model::placement::kernels::{self, DownAct, DownEntry, DownForms, GateUpEntry, GemmEntry};
+use std::sync::Arc;
 
 /// What the leg's errors name.
 const WHAT: &str = "CardLeg";
@@ -156,7 +158,8 @@ pub struct LegBufs {
 
 impl LegBufs {
     /// The buffers for runs of `shape` whose down entries read [`DownAct::
-    /// Q8Act`] (the K-quant, MXFP4 and IQ2_XS, IQ3_XXS, IQ3_S and IQ4_XS downs).
+    /// Q8Act`] (the K-quant, MXFP4 and IQ2_XXS, IQ2_XS, IQ3_XXS, IQ3_S and
+    /// IQ4_XS downs).
     /// Load-time or first-prompt only.
     pub fn new(stream: &CudaStream, shape: LegShape) -> Result<LegBufs, GpuError> {
         LegBufs::for_down(stream, shape, DownAct::Q8Act)
@@ -221,6 +224,13 @@ impl LegBufs {
     #[must_use]
     pub fn down(&self) -> &DeviceBuffer<f32> {
         &self.down
+    }
+
+    /// The down rows for a route GEMM over the same slots to write its
+    /// slots' rows into ([`RouteBlock::enqueue_rule`]), slot-major as a run
+    /// leaves them, so the card sum reads both alike.
+    pub(crate) fn down_mut(&mut self) -> &mut DeviceBuffer<f32> {
+        &mut self.down
     }
 }
 
@@ -348,6 +358,35 @@ impl RouteBlock<'_> {
         io: RouteIo<'_>,
         fault: FaultSink,
     ) -> Result<(), GpuError> {
+        self.enqueue_rule(
+            gpu,
+            (Some(gemm), g32),
+            (route, top_k),
+            n_slots,
+            (io, Act::SiluMul),
+            fault,
+        )
+    }
+
+    /// [`RouteBlock::enqueue`] under the gate·up rule `rule` (`kquant::act`:
+    /// `silu(g) · u`, ik's clamped SwiGLU or the OAI SwiGLU) between the
+    /// gate and up GEMMs and the down's form, the same six launches
+    /// ([`Act::SiluMul`] launches `enqueue`'s SwiGLU entries). A caller with
+    /// no grouped GEMM kernels passes `None`: a block the grouped GEMM reads
+    /// is then refused by name before the first launch.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the card, the two GEMM kernel sets, the table and its column rule, the slots, the rows and their rule, and the fault sink (rust-quality R8)"
+    )]
+    pub(crate) fn enqueue_rule(
+        &self,
+        gpu: &Gpu,
+        (gemm, g32): (Option<&GemmKernels>, &Gemm32Kernels),
+        (route, top_k): (&GemmRoute, usize),
+        n_slots: usize,
+        (io, rule): (RouteIo<'_>, Act),
+        fault: FaultSink,
+    ) -> Result<(), GpuError> {
         const WHAT_B: &str = "card_leg::RouteBlock";
         let stream = gpu.stream();
         let RouteIo {
@@ -365,10 +404,25 @@ impl RouteBlock<'_> {
                 format!("a block that reads {form}, which the rows lack"),
             )
         };
+        let grouped_k = || {
+            gemm.ok_or_else(|| {
+                GpuError::shape(
+                    WHAT_B,
+                    "a block the grouped GEMM reads, beside no grouped GEMM kernels",
+                )
+            })
+        };
+        if [self.gate, self.up, self.down]
+            .iter()
+            .any(|w| matches!(w, RouteW::Grouped(..)))
+        {
+            grouped_k()?;
+        }
         let input = GemmInput::Shared { top_k };
         match (self.gate, self.up) {
             (RouteW::Grouped(ty, wg), RouteW::Grouped(tu, wu)) if ty == tu => {
                 let act = x128.ok_or_else(|| lacks("q8_1 blocks of 128 (the gate and up)"))?;
+                let gemm = grouped_k()?;
                 for (w, y) in [(wg, &mut *g), (wu, &mut *u)] {
                     gemm.enqueue_gemm(
                         stream,
@@ -411,7 +465,8 @@ impl RouteBlock<'_> {
         match self.down {
             RouteW::Grouped(ty, w) => {
                 let act = h128.ok_or_else(|| lacks("q8_1 blocks of 128 (the down)"))?;
-                gemm.enqueue_swiglu_quant(stream, g, u, n_slots, act, fault)?;
+                let gemm = grouped_k()?;
+                gemm.enqueue_swiglu_act_quant(stream, g, u, rule, n_slots, act, fault)?;
                 gemm.enqueue_gemm(
                     stream,
                     GemmArgs {
@@ -427,7 +482,12 @@ impl RouteBlock<'_> {
             }
             RouteW::Blocks32(w) => {
                 let act = h32.ok_or_else(|| lacks("q8 blocks of 32 (the down)"))?;
-                g32.enqueue_swiglu_quant32(stream, g, u, n_slots, act, fault)?;
+                match rule {
+                    Act::SiluMul => {
+                        g32.enqueue_swiglu_quant32(stream, g, u, n_slots, act, fault)?
+                    }
+                    _ => g32.enqueue_swiglu_act_quant32(stream, g, u, rule, n_slots, act, fault)?,
+                }
                 g32.enqueue_gemm32(
                     stream,
                     Gemm32Args {
@@ -495,6 +555,20 @@ impl<'a> LegStack<'a> {
         self.w.rows()
     }
 
+    /// The stack in the form `w` of its type and row width: a ring window's
+    /// ([`with_ring`]).
+    fn with_w<'b>(&self, w: StackW<'b>) -> LegStack<'b>
+    where
+        'a: 'b,
+    {
+        LegStack {
+            name: self.name,
+            ty: self.ty,
+            w,
+            k: self.k,
+        }
+    }
+
     /// The stack's words, for an entry over the file's blocks.
     fn words(&self) -> Result<&'a DeviceTensor<u32>, GpuError> {
         match self.w {
@@ -557,22 +631,6 @@ impl<'a> LegStacks<'a> {
             LegArms {
                 gate_up: kernels::card_gate_up_runs,
                 down: kernels::card_down_runs,
-            },
-            (GATE_UP, DOWN),
-        )
-    }
-
-    /// [`LegStacks::of`] for a tensor-parallel rank, whose downs may also be
-    /// Q6_K ([`kernels::rank_down_runs`]). Allocation-free on success.
-    pub fn of_rank(w: &'a Weights, names: [&'a str; 3]) -> Result<LegStacks<'a>, GpuError> {
-        const DOWN: &str = "a resident routed down stack of a type a rank's card leg runs \
-                            (`kernels::rank_down_runs`)";
-        LegStacks::of_arms(
-            w,
-            names,
-            LegArms {
-                gate_up: kernels::card_gate_up_runs,
-                down: kernels::rank_down_runs,
             },
             (GATE_UP, DOWN),
         )
@@ -674,6 +732,110 @@ impl<'a> LegStacks<'a> {
     }
 }
 
+/// `f` over a layer's three stacks on a half of the expert stream's ring `r`,
+/// in the forms of the layer's card stacks `card` (`n_card` experts each,
+/// which give each expert's rows and each plane's row width): the half holds
+/// `r.half_slots` experts from each part's first slot ([`RingLayer::parts`]),
+/// a stack of words one part a matrix, an NVFP4 stack three (its codes, its
+/// block scales and its tensor scale). The windows are given back after `f`.
+/// Refused by name: a half whose parts are not the card stacks' form, a Q5_0
+/// stack (no ring holds one), and card stacks whose rows are not whole
+/// experts.
+pub fn with_ring<T>(
+    card: &LegStacks<'_>,
+    n_card: usize,
+    r: &RingLayer,
+    ctx: &Arc<CudaContext>,
+    f: impl FnOnce(&LegStacks<'_>) -> Result<T, GpuError>,
+) -> Result<T, GpuError> {
+    let whole = |rows: usize| n_card > 0 && rows.is_multiple_of(n_card);
+    let stacks = [&card.gate, &card.up, &card.down];
+    if let Some(st) = stacks.iter().find(|st| !whole(st.rows())) {
+        return Err(GpuError::Tensor {
+            what: WHAT,
+            name: st.name.to_owned(),
+            need: "whole experts of the layer's card count, beside the expert stream's ring",
+        });
+    }
+    let half = r.half_slots;
+    let rows = |t: &DeviceTensor<u32>| half * (t.rows() / n_card);
+    match (r.planes, card.gate.w, card.up.w, card.down.w) {
+        (1, StackW::Words(g), StackW::Words(u), StackW::Words(d)) => {
+            // SAFETY: the half holds `half_slots` experts in each part from
+            // the part's first slot at the layer's part bytes a slot, an
+            // expert's rows of the card stack's row width
+            // (`XStream::ring_layer`, the source's part bytes); the ring stays
+            // allocated while the stream lives, past `f`'s launches, and the
+            // windows are given back below.
+            let ws = unsafe {
+                [
+                    DeviceTensor::<u32>::window(r.parts[0], rows(g), g.cols(), ctx),
+                    DeviceTensor::<u32>::window(r.parts[1], rows(u), u.cols(), ctx),
+                    DeviceTensor::<u32>::window(r.parts[2], rows(d), d.cols(), ctx),
+                ]
+            };
+            let ran = f(&LegStacks {
+                gate: card.gate.with_w(StackW::Words(&ws[0])),
+                up: card.up.with_w(StackW::Words(&ws[1])),
+                down: card.down.with_w(StackW::Words(&ws[2])),
+            });
+            for w in ws {
+                DeviceTensor::release(w);
+            }
+            ran
+        }
+        (3, StackW::Nvfp4(g), StackW::Nvfp4(u), StackW::Nvfp4(d)) => {
+            // SAFETY: as the words' arm, each matrix in three parts: its codes
+            // and its block scales of the card planes' row widths, and one
+            // f32 tensor scale a slot.
+            let (qs, scales) = unsafe {
+                (
+                    [
+                        DeviceTensor::<u32>::window(r.parts[0], rows(g.qs), g.qs.cols(), ctx),
+                        DeviceTensor::<u32>::window(r.parts[1], rows(g.e), g.e.cols(), ctx),
+                        DeviceTensor::<u32>::window(r.parts[3], rows(u.qs), u.qs.cols(), ctx),
+                        DeviceTensor::<u32>::window(r.parts[4], rows(u.e), u.e.cols(), ctx),
+                        DeviceTensor::<u32>::window(r.parts[6], rows(d.qs), d.qs.cols(), ctx),
+                        DeviceTensor::<u32>::window(r.parts[7], rows(d.e), d.e.cols(), ctx),
+                    ],
+                    [
+                        DeviceTensor::<f32>::window(r.parts[2], half, 1, ctx),
+                        DeviceTensor::<f32>::window(r.parts[5], half, 1, ctx),
+                        DeviceTensor::<f32>::window(r.parts[8], half, 1, ctx),
+                    ],
+                )
+            };
+            let planes = |i: usize| {
+                StackW::Nvfp4(Nvfp4Stack {
+                    qs: &qs[2 * i],
+                    e: &qs[2 * i + 1],
+                    scales: &scales[i],
+                })
+            };
+            let ran = f(&LegStacks {
+                gate: card.gate.with_w(planes(0)),
+                up: card.up.with_w(planes(1)),
+                down: card.down.with_w(planes(2)),
+            });
+            for w in qs {
+                DeviceTensor::release(w);
+            }
+            for s in scales {
+                DeviceTensor::release(s);
+            }
+            ran
+        }
+        _ => Err(GpuError::shape(
+            WHAT,
+            format!(
+                "the expert stream's ring of {} parts a matrix beside card stacks of {} and {}: \
+                 a ring holds a stack of words in one part a matrix and an NVFP4 stack in three",
+                r.planes, card.gate.ty, card.down.ty
+            ),
+        )),
+    }
+}
+
 /// What [`CardLeg::enqueue`] reads: layer `layer`'s `stacks`, `m` tokens'
 /// normed rows `normed`, the slots' places `sel` (`m · slots_per_col` ids; an
 /// id below `n_card` is a card expert, the rest are left alone) and the
@@ -691,8 +853,9 @@ pub struct LegRun<'a> {
 /// The card slots' sum a run ends with ([`CardLeg::enqueue`]): `w` the
 /// slots' routing weights, `slots_per_col` a token and token-major, and `acc`
 /// the sum, `m` rows of `n` values. A token's slots are summed in slot order
-/// over the slots whose place is below `n_card`; `slots_per_col` is 6, 8 or
-/// 10, any other count is refused by name before the run launches anything.
+/// over the slots whose place is below `n_card`; `slots_per_col` is a count
+/// the sum has an entry for ([`CardSlots::of`]), any other is refused by name
+/// (the card sum's one refusal of a count) before the run launches anything.
 pub struct LegSum<'a> {
     pub w: &'a DeviceBuffer<f32>,
     pub acc: &'a mut DeviceBuffer<f32>,
@@ -813,6 +976,39 @@ impl CardLeg {
         self.launch(gpu, scratch, run, down)
     }
 
+    /// The card slots' sum ([`LegSum`]) of the down rows the runs over `bufs`
+    /// left, each run without a sum of its own: for a caller whose slots ran
+    /// in more than one run over different stacks. `sel` places every slot
+    /// those runs wrote below `n_card`; a token's slots are summed in slot
+    /// order. `m` outside `1..=bufs.shape().cap` and a slot count the sum has
+    /// no entry for are refused by name. Asynchronous, allocation-free,
+    /// capturable.
+    pub fn sum_rows(
+        &self,
+        gpu: &Gpu,
+        bufs: &LegBufs,
+        sel: &DeviceBuffer<u32>,
+        (layer, m, n_card): (usize, usize, usize),
+        sum: LegSum<'_>,
+    ) -> Result<(), GpuError> {
+        let shape = bufs.shape;
+        if m == 0 || m > shape.cap {
+            return Err(GpuError::Shape {
+                what: WHAT,
+                detail: format!("a sum of {m} tokens in buffers of {}", shape.cap),
+            });
+        }
+        check_sum(shape)?;
+        enqueue_sum(
+            &self.slots,
+            gpu,
+            shape,
+            (&bufs.down, sel),
+            (layer, m, n_card),
+            sum,
+        )
+    }
+
     /// The four launches of `run` into `scratch` and `down`.
     fn launch(
         &self,
@@ -895,7 +1091,11 @@ impl CardLeg {
                 self.nvfp4.enqueue_gate_up(stream, &a, fault, h)?;
             }
             Some(
-                GateUpEntry::Iq2xs | GateUpEntry::Iq3xxs | GateUpEntry::Iq3s | GateUpEntry::Iq4xs,
+                GateUpEntry::Iq2xxs
+                | GateUpEntry::Iq2xs
+                | GateUpEntry::Iq3xxs
+                | GateUpEntry::Iq3s
+                | GateUpEntry::Iq4xs,
             ) => {
                 let a = words()?;
                 let iq = IqGateUp {
@@ -1016,6 +1216,19 @@ impl CardLeg {
                 self.quant
                     .enqueue_gemv_sel(stream, st.down.ty, &d, fault, down)?;
             }
+            (Some((DownEntry::Iq2xxs, DownAct::Q8Act)), ActH::Q8Act(act)) => {
+                // The shared-table down reads a column a run of
+                // `slots_per_col` slots; a down is one column a slot.
+                let d = SelDown {
+                    w: st.down.words()?,
+                    act,
+                    sel,
+                    n_slots: slots,
+                    rows_per_expert,
+                };
+                self.quant
+                    .enqueue_gemv_sel_cols(stream, st.down.ty, &d, 1, fault, down)?;
+            }
             _ => return Err(st.down.unrun()),
         }
         Ok(())
@@ -1025,17 +1238,13 @@ impl CardLeg {
 /// The sum a run ends with is over a slot count the sum has an entry for:
 /// refused by name before the run launches anything.
 fn check_sum(shape: LegShape) -> Result<(), GpuError> {
-    if CardSlots::of(shape.slots_per_col).is_none() {
-        return Err(GpuError::Shape {
+    match CardSlots::of(shape.slots_per_col) {
+        Some(_) => Ok(()),
+        None => Err(GpuError::Shape {
             what: WHAT,
-            detail: format!(
-                "the card sum: {} routed slots a token: the sum's entries are built for 6, 8 \
-                 and 10",
-                shape.slots_per_col
-            ),
-        });
+            detail: format!("the card sum: {}", CardSlots::refusal(shape.slots_per_col)),
+        }),
     }
-    Ok(())
 }
 
 /// The card slots' weighted sum of `down` (the run's rows, `m` tokens of
@@ -1794,6 +2003,93 @@ pub(crate) mod tests {
         leg_runs_gate_up_as_its_launch(GgmlType::Q6_K);
     }
 
+    /// A Q4_K gate and up with a Q6_K down, the common leg's own stacks
+    /// ([`LegStacks::of`]): the rows are the hand launches' bit for bit (the
+    /// Q4_K gate·up, the quantizer, and `enqueue_gemv_q6k_sel` of the same
+    /// weights), for a run of every token the buffers hold and of fewer.
+    /// Mutant: the down arm launching the Q5_K `_sel` for a Q6_K stack — the
+    /// rows part from the hand launch — or [`LegStacks::of`] refusing the stacks.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_the_leg_runs_a_q6k_down_as_its_sel_launch() {
+        let gpu = Gpu::with_device(0).expect("a Gpu on device 0");
+        let stream = gpu.stream();
+        let leg = CardLeg::load(&gpu).expect("the leg");
+        let kq = QuantSelKernels::load(gpu.context(), gpu.fault_word()).expect("the kquant module");
+        let q6 = Q6kSelKernels::load(gpu.context(), gpu.fault_word()).expect("the q6k module");
+        let (gate, down) = (GgmlType::Q4_K, GgmlType::Q6_K);
+        let w = weights_for(&gpu, SHAPE, &[gate, down], |role, t| match role {
+            "down" => t == down,
+            _ => t == gate,
+        });
+        let names = [
+            stack_name("gate", gate),
+            stack_name("up", gate),
+            stack_name("down", down),
+        ];
+        let names = [names[0].as_str(), names[1].as_str(), names[2].as_str()];
+        let stacks = LegStacks::of(&w, names).expect("a Q4_K gate and up with a Q6_K down");
+        stacks.check(N_CARD, SHAPE).expect("the stacks' shape");
+        let host_normed: Vec<f32> = (0..CAP * N)
+            .map(|i| ((i * 2654435761usize) % 2001) as f32 / 1000.0 - 1.0)
+            .collect();
+        let normed = DeviceBuffer::from_host(stream, &host_normed).expect("the normed rows");
+        let sel = DeviceBuffer::from_host(stream, &SEL).expect("the places");
+        let mut bufs = LegBufs::new(stream, SHAPE).expect("the leg's buffers");
+        let rule = Act::SiluMul;
+        for m in [CAP, CAP - 1] {
+            let case = format!("Q6_K down, {m} tokens");
+            let slots = m * SPC;
+            let got = leg_rows(&gpu, &leg, &mut bufs, &stacks, &normed, &sel, m);
+
+            let mut act_x = Q8Act::with_tier_cols(stream, m, N).expect("act_x");
+            let mut h = DeviceBuffer::<f32>::zeroed(stream, slots * FF).expect("h");
+            let mut act_h = Q8Act::with_slots(stream, slots, FF).expect("act_h");
+            let mut want =
+                DeviceBuffer::from_host(stream, &vec![SENT; slots * N]).expect("the rows");
+            let sink = gpu.layer_sink(0).expect("a sink");
+            gpu.enqueue_quantize_q8_1_cols(&normed, &mut act_x, m, 0)
+                .expect("q8_1");
+            let a = GateUpAct {
+                wg: words(&w, names[0]),
+                wu: words(&w, names[1]),
+                act: &act_x,
+                sel: &sel,
+                n_slots: slots,
+                rows_per_expert: FF,
+                slots_per_col: SPC,
+                rule,
+            };
+            kq.enqueue_gate_up_q4k(stream, &a, sink, &mut h)
+                .unwrap_or_else(|e| panic!("{case}: the gate·up: {e}"));
+            let q = QuantSel {
+                x: &h,
+                cols: 0..slots,
+                sel: &sel,
+                n_card: N_CARD,
+            };
+            gpu.q4k_sel()
+                .enqueue_quantize_sel(stream, &q, sink, &mut act_h)
+                .unwrap_or_else(|e| panic!("{case}: the quantizer: {e}"));
+            q6.enqueue_gemv_q6k_sel(
+                stream,
+                words(&w, names[2]),
+                &act_h,
+                &sel,
+                slots,
+                N,
+                &mut want,
+            )
+            .unwrap_or_else(|e| panic!("{case}: the down: {e}"));
+            let want = want.to_host_vec(stream).expect("the hand rows");
+            assert!(
+                gpu.take_fault().expect("the fault word").is_none(),
+                "{case}"
+            );
+            assert_hand_rows(&case, &got, &want);
+        }
+    }
+
     /// `q6k_gate_up_sel` against its parts: the gate and up rows of a slot are
     /// the two dots `q6k_gemv_sel` writes for the slot's column (the same row
     /// walk, bit for bit, one activation column a slot), and `h` is the rule
@@ -2224,14 +2520,20 @@ pub(crate) mod tests {
     /// The tokens of the wide test's runs: one, one past a group of eight
     /// columns, and the buffers' cap.
     const WIDE_RUNS: [usize; 3] = [1, 9, WIDE_CAP];
-    /// The wide test's cases, `(gate·up type, down type)`: the seven types of
+    /// The wide test's cases, `(gate·up type, down type)`: the eight types of
     /// `kernels::card_gate_up_runs` each as a gate·up beside a down of its own
-    /// type, then the three 32-value downs (`kernels::card_down_runs`) beside
-    /// a gate·up that ran before.
-    const WIDE_CASES: [(GgmlType, GgmlType); 10] = [
+    /// type, then the three 32-value downs and the Q6_K down
+    /// (`kernels::card_down_runs`) beside a gate·up that ran before.
+    // PIN(2026-10-22): Q6_K joined `card_down_runs`, so the cases gain a Q5_K
+    // gate·up over a Q6_K down. The set was the ten rows without that pair.
+    // PIN(2026-10-23): IQ2_XXS joins both sets with its gate·up (`iq2_xxs_gate_up_sel`)
+    // and down (`iq2_xxs_gemv_sel`); the set was the eleven rows without its
+    // own-type pair.
+    const WIDE_CASES: [(GgmlType, GgmlType); 12] = [
         (GgmlType::Q4_K, GgmlType::Q4_K),
         (GgmlType::Q5_K, GgmlType::Q5_K),
         (GgmlType::MXFP4, GgmlType::MXFP4),
+        (GgmlType::IQ2_XXS, GgmlType::IQ2_XXS),
         (GgmlType::IQ2_XS, GgmlType::IQ2_XS),
         (GgmlType::IQ3_XXS, GgmlType::IQ3_XXS),
         (GgmlType::IQ3_S, GgmlType::IQ3_S),
@@ -2239,6 +2541,7 @@ pub(crate) mod tests {
         (GgmlType::Q4_K, GgmlType::Q5_1),
         (GgmlType::Q5_K, GgmlType::Q8_0),
         (GgmlType::IQ4_XS, GgmlType::IQ4_NL),
+        (GgmlType::Q5_K, GgmlType::Q6_K),
     ];
 
     /// Token `t`'s normed row: a function of `t` alone, so a column holds the
@@ -2370,7 +2673,7 @@ pub(crate) mod tests {
 
     /// A slot's rows are what a one-token run writes for it, whatever `m`
     /// (the module doc), for every type [`kernels::card_gate_up_runs`] and
-    /// [`kernels::card_down_runs`] admit, in ten cases (`WIDE_CASES`). Runs of
+    /// [`kernels::card_down_runs`] admit, in twelve cases (`WIDE_CASES`). Runs of
     /// `m` in `WIDE_RUNS` tokens of eight slots go through fresh buffers of
     /// `WIDE_CAP` tokens, so the run's columns beyond the eighth, and beyond a
     /// warp's 32, are read through the leg's own quantize steps and buffers;

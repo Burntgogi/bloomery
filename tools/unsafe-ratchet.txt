@@ -487,6 +487,24 @@ gguf 7 2 0
 # into its private staging extent and keeps it lent until the lane drains.
 # PIN(2026-10-23): gpu 2267 -> 2268 blocks, new test-only pinned source view
 # for the XStream fallback copy's lifetime contract, with its SAFETY line.
+# PIN(2026-10-22): gpu 2121 -> 2122 blocks, a new kernel entry, not old code relaxed:
+# gqa_prefill_flash_512_p4_lower (flash_gqa_prefill_512.rs), the packed encoder pass's segment bounds, with its SAFETY line.
+# PIN(2026-10-23): gpu 2122 -> 2161 blocks, 247 -> 249 fns, this release's kernels, not old code relaxed:
+# flash_gqa_h128_swa.rs (17 blocks, fold_tile), qk_rms.rs (11 blocks), arch/qwen3moe/tier_leg.rs
+# (10 blocks, tier_sum) and arch/qwen3moe/mtp35.rs (1 block); every block with its SAFETY line,
+# both new fns with a `# Safety` section.
+# PIN(2026-10-23): gpu 2159 -> 2199 blocks, 259 -> 261 fns, new code, not old code relaxed: the 0.3.9
+# integration rebased onto main, its pins above (Flint head-128 SWA attention and q/k RMS, the packed encoder
+# pass's lower prefill, the IQ3_S GEMM, the leg tier) over main's; recounted by tools/check-unsafe.sh.
+# PIN(2026-10-23): gpu 2199 -> 2239 blocks, 261 -> 264 fns, new code, not old code relaxed: Muse Spark's card body
+# (flash_gqa.rs: the head-64 flash, 25 blocks and the unsafe fns fold_tile_64, seg_scalar_64 and seg_mma_64; elem.rs:
+# the common elementwise entries swiglu_rule_rows, softcap_rows, mul_rows, mix_rows, scale_rows and gain_rms_norm, 10
+# blocks; route_body.rs: the router's 256-expert top-8 select_n, 2 blocks; quant_sel.rs: the IQ2_XXS gate/up
+# table fill, 1 block) and the qwen3moe body's two head-128 K append calls; each block with its SAFETY line, each fn
+# with its SAFETY paragraph.
+# PIN(2026-10-23): gpu 2239 -> 2242 blocks, new code, not old code relaxed: the M3.1 ring slots on the card route
+# (card_experts.rs: the ring and union maps, 1 block; card_leg.rs: the ring slot's weights and its NVFP4 planes, 2
+# blocks), each block with its SAFETY line.
 # PIN(2026-10-24): gpu 2268 -> 2272 blocks, 281 -> 282 fns, new code, not old code relaxed: the folded selected flash
 # (`flash_gqa::fold_mma_ps`, an unsafe fn under the segment pass's contract, with its row count read, its refused-row
 # and output writes, and its kernel entry's body call), each block with its SAFETY line.
@@ -528,7 +546,13 @@ gguf 7 2 0
 # copy, scale read and MMA instruction), `Mxfp8Cols` (refused, fetch, land, scale_word), the activations' MXFP8 form
 # body (`mxfp8_cols_body`: its load and its two plane stores) and the two kernel entries' body calls and shared-memory
 # view. Each block has its SAFETY line.
-gpu 2331 306 10
+# PIN(2026-10-24): gpu 2331 -> 2414 blocks, 306 -> 311 fns, new code, not old code relaxed: the 0.3.9 integration
+# rebased onto main's 2331 blocks, 306 fns, its own +83 blocks and +5 fns (the pins dated 2026-10-22 and 2026-10-23 on
+# its branch, counted against the shared base); recounted by tools/check-unsafe.sh.
+# PIN(2026-10-24): gpu 2414 -> 2418 blocks, new code, not old code relaxed: the two branch pins the rebase onto main
+# folded away, the four-slot tier handoff (ds41_ffn_handoff_4_tier, +2) and Muse's attention branch (its fork and join,
+# +2); 2331 + 83 + 2 + 2, recounted by tools/check-unsafe.sh.
+gpu 2418 311 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.
@@ -548,7 +572,10 @@ gpu 2331 306 10
 # PIN(2026-10-17): gpu-deepseek41 388 -> 385 blocks, fns unchanged, not old code relaxed: the wide
 # router scores' move to the common f32_tile_gemm (bolt-r6) takes the family's three remaining
 # wide-dot call blocks out of the crate. Measured 385 on the merged tree.
-gpu-deepseek41 382 44 0
+# PIN(2026-10-24): gpu-deepseek41 382 -> 384 blocks, new code, not old code relaxed: the four-slot tier card sum
+# (chain/ffn/batch.rs: ds41_ffn_card_acc_4_tier's card_acc_tier_at call and its store, 2 blocks), each block with its
+# SAFETY line.
+gpu-deepseek41 384 44 0
 # PIN(2026-10-01): gpu-gates 60 -> 61 blocks, new code, not old code relaxed: gate_glm5next_serve starts
 # bloomery-serve with PR_SET_PDEATHSIG set between fork and exec (one pre_exec block, its SAFETY line), as the
 # Qwen3.8 serve gate does, so a bound that ends the gate does not leave the server holding the card.
@@ -633,7 +660,11 @@ gpu-glm5next 7 0 0
 # PIN(2026-10-23): gpu-mimo2 0 -> 5 blocks, 0 -> 1 fns: enqueue_append propagates the
 # K192 cache-writer contract to one-token and consecutive prompt/slot callers within each ring.
 # Each call has its SAFETY invariant; no device operation changes.
-gpu-mimo2 5 1 0
+# PIN(2026-10-22): gpu-mimo2 0 -> 2 blocks, new code, not old code relaxed: seq.rs's two async copies of a saved
+# sequence's K/V rows (device to host and back), each with its SAFETY line.
+# PIN(2026-10-23): gpu-mimo2 5 -> 7 blocks, new code: the integration's two mimo2 blocks over main's, each
+# with its SAFETY line; recounted by tools/check-unsafe.sh.
+gpu-mimo2 7 1 0
 # PIN(2026-10-21): gpu-minimaxm3 0 -> 19 blocks, 0 -> 1 fns, a new crate, not old code relaxed: the score and select kernels
 # (attn.rs) read and write their buffers through raw places and shared words, each block with its SAFETY line, and
 # enqueue_index is an unsafe fn, as the head kernel it calls (the positions are distinct).
@@ -709,7 +740,10 @@ metal 27 7 12
 # PIN(2026-10-22): model 108 -> 109 blocks, 31 -> 32 fns, new code, not old code relaxed: host_lock's
 # release_file_pages, an unsafe fn whose caller states that the slice is a file's own read-only mapping, and the one
 # block that hands that slice to FileMapping::new, with its SAFETY line.
-model 109 32 13
+# PIN(2026-10-23): model 109 -> 110 blocks, new code, not old code relaxed: the folder host tier's NVFP4 experts
+# (ops.rs): the expert matmul's scaled SharedOut writes (four rewritten in place) and the one more write for the
+# codes-and-scales run, each with its SAFETY line.
+model 110 32 13
 # model-hf: the four blocks that left model (119 -> 115) with the fixture bin and its test, the page-fault reads (`getrusage`),
 # each with its SAFETY line; no new unsafe.
 # PIN(2026-10-22): model-hf 0 -> 1 block, new code, not old code relaxed: Checkpoint::release calls
@@ -785,7 +819,27 @@ placement 0 0 0
 # PIN(2026-10-21): qdot 217 -> 227 blocks, 95 -> 97 fns, new code, not old code relaxed: swiglu_oai's AVX2 rule, the
 # dispatch in swiglu_oai (1 block), v_swiglu_oai and its v_expf call (1 block), swiglu_oai_avx2's full-vector and
 # padded-tail bodies (two loads, the v_swiglu_oai call and the store each: 8), each with its own SAFETY line.
-qdot 227 97 0
+# PIN(2026-10-23): qdot 227 -> 240 blocks, 97 -> 104 fns, new code, not old code relaxed: the NVFP4 host core
+# (lib.rs): dot_nvfp4_q82x4_avx2 and the six unsafe helpers it reads the 9-byte rows through (nvfp4_unit_codes,
+# nvfp4_unit_pair, nvfp4_values, nvfp4_lanes, nvfp4_group_scales, nvfp4_scale_byte) with their loads, each block with
+# its SAFETY line.
+# PIN(2026-10-23): qdot 240 -> 245 blocks, 104 -> 108 fns, new code, not old code relaxed: the NVFP4 column tile
+# (dot_nvfp4_q82x4_tile_avx2, nvfp4_lanes_abs, nvfp4_planes_tile) and the qdot test's tile runner (run), each block
+# with its SAFETY line.
+# PIN(2026-10-23): qdot 245 -> 248 blocks, 108 -> 110 fns, new code, not old code relaxed: the IQ2_XXS wide tile
+# (dot_iq2xxs_q8k_wide_avx2, its column group iq2xxs_wide_group, and the dispatch wide_iq2xxs), each block with its
+# SAFETY line.
+# PIN(2026-10-23): qdot 248 -> 249 blocks, 110 -> 111 fns, new code, not old code relaxed: iq2xxs_pack, the
+# IQ2_XXS block's weight side the wide tile and the column tile (now the wide tile's one group) both read, one
+# `#[inline(always)]` fn and its block, with its SAFETY line.
+# PIN(2026-10-23): qdot 249 -> 251 blocks, 111 -> 112 fns, new code, not old code relaxed: nvfp4_codes_avx2, the NVFP4
+# Transform's code repack the expert stream stages, one fn with its block and its caller's block, each with its SAFETY
+# line.
+# PIN(2026-10-24): qdot 251 -> 255 blocks, 112 -> 115 fns, new code, not old code relaxed: the NVFP4 planes rows
+# entry's tile on offset codes, its column prep (nvfp4_prep_avx2), the x4 lane sums both share (nvfp4_group_sums, an
+# `#[inline(always)]` fn) and the run walk (nvfp4_planes_tiled; nvfp4_tile_run replaces nvfp4_planes_tile), each with
+# its SAFETY line.
+qdot 255 115 0
 record 0 0 0
 refset 0 0 0
 runtime 0 0 0

@@ -153,9 +153,11 @@
 //! The model opens as `generate_ds41`'s does (`app::Loaded`, then
 //! `Loaded::ready`), and `BLOOMERY_DRAFT=lookup|dspark` serves its draft the
 //! same way (`shared/ds41_draft.rs`): the DSpark draft's file is
-//! `$BLOOMERY_DSPARK_MODEL` and its card `BLOOMERY_DSPARK_CARD` (the 3090
-//! when unset; under `bp` the tier card, whose plan reserves the draft's
-//! bytes, and the lever may name no other), loaded once, its `load draft=dspark` line after the `load`
+//! `$BLOOMERY_DSPARK_MODEL` and its card `BLOOMERY_DSPARK_CARD` (a card of
+//! the plan, which reserves the draft's bytes there: unset, the tier card
+//! under `bp`, else the stage when it is the only card, else the other card as
+//! a reserve-only member of the plan),
+//! loaded once, its `load draft=dspark` line after the `load`
 //! line, the pair pass captured after the step. Every greedy token after a
 //! request's first then comes out of a pass (`serve::Engine::advance`), and
 //! a request that needs the logits row — `temperature` above 0 (llama-server's
@@ -223,7 +225,7 @@ use bloomery_gpu_gates::bind::{
     CacheRam, ChatSurface, Listen, Pass, Seat, SeatEngine, SlotStep, SlotsFrom, TemplateFile,
     Vocab, arm_screen, bind_server, model_props, parallel_line, placement_of,
 };
-use bloomery_gpu_gates::generate::{Lane, Place, PlaceWhy, lane_at, mode_name};
+use bloomery_gpu_gates::generate::{DraftSeat, Lane, Place, PlaceWhy, lane_at, mode_name};
 use bloomery_gpu_gates::need;
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::residency38::{Seqs, checkpoints_reserved, reserve_checkpoints};
@@ -555,7 +557,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     };
     let path = ref_model_path()?;
     let reserve = match &draft_file {
-        Some((d, _)) => dspark::draft_reserve(a.place, d, &path)?,
+        Some((d, _)) => Some(dspark::draft_seat(a.place, d, &path)?),
         None => None,
     };
     let vocab = Arc::new(Vocab::new(Tokenizer::from_gguf(&path)?)?.with_user_start(USER_START)?);
@@ -857,9 +859,10 @@ fn route_trace(
             ("placement".to_owned(), place.name().to_owned()),
             (
                 "card_budget".to_owned(),
-                levers
-                    .card_budget_bytes()
-                    .map_or_else(|| "each card's own".to_owned(), |b| b.to_string()),
+                match levers.card_budget() {
+                    bloomery_levers::CardBudget::Unset => "each card's own".to_owned(),
+                    b => b.to_string(),
+                },
             ),
             ("r8".to_owned(), yes(cfg.body.host.r8)),
             ("prefill".to_owned(), cfg.body.prefill.name().to_owned()),
@@ -892,7 +895,7 @@ fn print_plan(
     inputs: &PlanInputs,
     place: Place,
     (reserve, tier_batch, vision, embedding): (
-        Option<u64>,
+        Option<DraftSeat>,
         Option<TierBatchBytes>,
         Option<&vision_seat::Opened>,
         Option<u64>,
@@ -972,8 +975,8 @@ struct SeatArgs {
     path: PathBuf,
     draft: Draft,
     draft_file: Option<(Split, DraftHparams)>,
-    /// The draft's reserve on the placement's tier card.
-    reserve: Option<u64>,
+    /// The draft's reserve on its card of the plan.
+    reserve: Option<DraftSeat>,
     /// The tier's prompt-batch bytes on the placement's tier card.
     tier_batch: Option<TierBatchBytes>,
     /// The route trace, attached once the session is ready.
@@ -1149,9 +1152,9 @@ impl V41 {
             card_timing: false,
         };
         let mut loaded = Loaded::<Body>::from_model(m, cfg, u32::try_from(a.ctx)?);
-        let spark = match &a.draft_file {
-            Some(file) => {
-                let (d, load) = open_dspark(&mut loaded, file, &a.path, WHAT, a.place, a.reserve)?;
+        let spark = match a.draft_file.as_ref().zip(a.reserve) {
+            Some((file, reserve)) => {
+                let (d, load) = open_dspark(&mut loaded, file, &a.path, WHAT, a.place, reserve)?;
                 load.eprint();
                 Some(d)
             }

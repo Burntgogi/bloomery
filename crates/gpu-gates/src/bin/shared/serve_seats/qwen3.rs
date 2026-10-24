@@ -119,18 +119,21 @@
 //! One token a slot a round, the sequences switched by pointer exchange, no
 //! park and no re-prefill; the engine is the seat's own (`SeatEngine`), and
 //! the server steps every running slot in one call — one pass of the busy
-//! rows on a whole-card load, whose body runs several slots' rows as one
-//! pass (a qwen3moe file's `Body` and a qwen35moe file's `Body35`,
-//! `GpuModel::step_slots`, every row-wise launch once over them all), else a
-//! select and a step a row (the seat's fallback loop), a placed load's.
+//! rows when the body says the load can ([`Body3::serves_one_pass`]: a
+//! qwen3moe file's `Body` and a qwen35moe file's `Body35`, whole-card and
+//! placed with no expert tier, `GpuModel::step_slots`), else a select and a
+//! step a row (the seat's fallback loop) — beside an expert tier card the
+//! placed body runs no pass of several slots (its page is one column), so a
+//! tiered load's rounds run a slot at a time.
 //! Under `BLOOMERY_STEP_STATS=1` each round of several slots
 //! prints a `slots round` record naming its command, rows, passes and the
 //! slots the seat serves. `--parallel 1` is exactly the one-sequence server.
 //! A `parallel` line on stderr before the load names the rule (`slots`), the
 //! slots, a slot's context, the total, what set the count (`from`: the
 //! `--parallel` flag, a set `--ctx`, the default) and the shape of a round of
-//! several slots (`pass`: `one`, or `turns` on a load that keeps routed
-//! experts on the host tier). `--queue-depth Q` bounds
+//! several slots (`pass`: `one`, or `turns` under the lookup draft, whose
+//! state is a slot's own, or beside an expert tier card, whose page is one
+//! column). `--queue-depth Q` bounds
 //! the requests that wait for a slot; `--park-ram`
 //! is refused by name: the resident slots hold no parked state the flag
 //! could budget.
@@ -151,7 +154,13 @@
 //! prompt with the rows in place of their positions' embeddings ([`Seat::prefill_media`]). An image
 //! with no `--mmproj` is the server's own 400 for every seat that takes none.
 //!
-//! `BLOOMERY_DRAFT` unset or `off` is the plain path, one token a step.
+//! `BLOOMERY_DRAFT` unset on a qwen35moe or qwen35 file is the in-file
+//! next-token layer when `draft38_unset` says the MTP draft and the file
+//! carries the layer, else the plain path with the reason on `load draft=off`.
+//! `off` is the plain path. `mtp` is that layer, refused by name where the
+//! load cannot draft, and served undrafted with the reason named where the
+//! file has no layer. A qwen3moe file keeps the plain path: `mtp` is refused
+//! by name (no such layer, no verify pass).
 //! `dspark` is the draft a qwen35moe file serves (`$BLOOMERY_DSPARK_MODEL`),
 //! held by the seat as the serve seats' one owner of a served draft
 //! (`serve_seats::served`): one slot while `--parallel` names none, several
@@ -182,8 +191,9 @@ use std::time::Instant;
 
 #[path = "../qwen3moe_place.rs"]
 mod q3place;
-use app::arch::qwen3moe::GEMM_FROM;
+use app::arch::qwen3moe::{GEMM_FROM, Prompt35};
 use app::dspark::CardDspark;
+use app::mtp::{MtpBody, MtpDraft};
 use q3place::Seqs;
 
 use bloomery_gpu::arch::qwen3moe::router::MAX_TOKENS;
@@ -204,20 +214,23 @@ use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::side_seat;
 use bloomery_gpu_gates::vision_seat::{self, Opened, PleImage, TextFacts};
 use bloomery_gpu_gates::{GateError, gpu_census, ref_model_path};
-use bloomery_levers::Levers;
+use bloomery_levers::{Draft38At, Draft38Off, Levers, draft38_unset};
 use gguf::Split;
 use gguf::quant::GgmlType;
 use model::arch::qwen35moe::hparams::Hparams;
+use model::arch::qwen35moe::mtp::{InFile, in_file};
 use model::placement::PlanLevers;
 use model::placement::ctx_ask::{Chosen, DEFAULT_SLOTS};
 use runtime::Target as _;
+use runtime::seqstate::Why;
 use runtime::width::Mode as WidthMode;
 #[cfg(feature = "vision")]
 use serve::media::{MediaFeed, SharedMediaModel};
-use serve::{CacheNote, Drafted, EngineProps, Saved, ServeError};
+use serve::{CacheNote, DraftProps, Drafted, EngineProps, Saved, ServeError};
 use tokenizer::Tokenizer;
 
-use super::served::{self, ServedDraft};
+use super::drafted::SlotDrafts;
+use super::served::{self, ServedDraft, Word};
 use crate::draft::Draft;
 use crate::dspark_hf;
 use crate::quiet::Quiet;
@@ -351,7 +364,7 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
                     );
                 }
             },
-            "--place" => a.place = Some(Place::parse(v)?),
+            "--place" => a.place = Some(bind::place_word(v, None)?),
             "--cache-type-k" => a.cache_type_k = Some(v.to_owned()),
             TemplateFile::FLAG => a.template_file.set(v),
             "--cache-type-v" => {
@@ -393,10 +406,22 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
 trait Body3: Slots<Seq: 'static> + app::Prompt + app::Keep + Sized + 'static {
     /// The body name in the default media refusal.
     const ARCH: &'static str;
-    /// Whether the body runs several slots' rows as one pass on a
-    /// whole-card load (`SlotRows`), through [`Body3::one_pass_round`]:
-    /// `Body` (a qwen3moe file) and `Body35` (a qwen35moe file) both do.
+    /// Whether an undrafted in-file MTP decision prints `load draft=off`.
+    /// The qwen3moe body prints nothing of a layer it does not carry.
+    const PRINTS_MTP_OFF: bool = false;
+    /// Whether the body runs several slots' rows as one pass (`SlotRows`),
+    /// through [`Body3::one_pass_round`]: `Body` (a qwen3moe file) and
+    /// `Body35` (a qwen35moe file) both do, on a whole-card load and on a
+    /// placed one with no expert tier ([`Body3::serves_one_pass`]).
     const ONE_PASS: bool = false;
+    /// Whether a load that hangs an expert tier card holding an expert
+    /// ([`Body3::tiered`]) still runs several slots' rows as one pass. The
+    /// default is no tier: the placed body refuses a pass of several slots
+    /// beside one (the tier's page is one column), so its rounds run a slot
+    /// at a time. The seat reads this and no other answer.
+    fn serves_one_pass(tiered: bool) -> bool {
+        Self::ONE_PASS && !tiered
+    }
     /// The model of `file` with a `ctx`-row cache by `load`, decided before
     /// the open at the total its `slots` sequences of that shape split
     /// ([`decide`]), the `plan` record on stderr first when a plan loads it, then the encoder's
@@ -438,6 +463,11 @@ trait Body3: Slots<Seq: 'static> + app::Prompt + app::Keep + Sized + 'static {
     }
     /// The load runs its routed experts on the host tier too.
     fn placed(m: &GpuModel<Self>) -> Result<bool, GateError>;
+    /// The load hangs an expert tier card that holds an expert (the placed
+    /// side's `tier_any`): a load that does runs its rounds of several
+    /// slots in turns ([`Body3::serves_one_pass`]). The pre-open twin, read
+    /// off the plan, is [`Q3Load::tiered`].
+    fn tiered(m: &GpuModel<Self>) -> Result<bool, GateError>;
     /// Every pass the prompt call replays, captured after the step.
     fn capture_passes(m: &mut GpuModel<Self>) -> Result<(), GateError>;
     /// The prompt call's ubatch size.
@@ -461,7 +491,7 @@ trait Body3: Slots<Seq: 'static> + app::Prompt + app::Keep + Sized + 'static {
     /// the default: only a body of [`Body3::ONE_PASS`] takes it — `Body` (a
     /// qwen3moe file) and `Body35` (a qwen35moe file), through
     /// [`super::rounds::step_rows_one_pass`] (the seat decides at its open
-    /// from [`Body3::ONE_PASS`]).
+    /// from [`Body3::serves_one_pass`]).
     fn one_pass_round(
         s: &mut app::Session<Self>,
         rows: &mut [SlotStep],
@@ -565,6 +595,10 @@ impl Body3 for Body {
         Ok(m.body(NAME)?.placed().is_some())
     }
 
+    fn tiered(m: &Qwen3moeModel) -> Result<bool, GateError> {
+        Ok(m.body(NAME)?.placed().is_some_and(|p| p.tier_any()))
+    }
+
     fn capture_passes(m: &mut Qwen3moeModel) -> Result<(), GateError> {
         m.capture_prefill()?;
         Ok(())
@@ -600,6 +634,7 @@ impl Body3 for Body {
 
 impl Body3 for Body35 {
     const ARCH: &'static str = "qwen35moe";
+    const PRINTS_MTP_OFF: bool = true;
     const ONE_PASS: bool = true;
 
     /// As `load` decided before the open, making no fit call of its own: the
@@ -801,6 +836,10 @@ impl Body3 for Body35 {
         Ok(m.body(NAME)?.placed().is_some())
     }
 
+    fn tiered(m: &Qwen35moeModel) -> Result<bool, GateError> {
+        Ok(m.body(NAME)?.placed().is_some_and(|p| p.tier_any()))
+    }
+
     fn capture_passes(m: &mut Qwen35moeModel) -> Result<(), GateError> {
         m.capture_rows::<2>()?;
         m.capture_rows::<3>()?;
@@ -901,12 +940,11 @@ struct Q3<B: Body3> {
     s: app::Session<B>,
     ctx: usize,
     /// Whether a round of several slots runs as one pass of the busy rows
-    /// ([`Q3::step_slots`]): a whole-card load of more than one resident
-    /// slot of a body that runs several slots' rows as one pass
-    /// ([`Body3::ONE_PASS`]) — a placed load keeps the fallback loop (its
-    /// body serves each slot's rows in its own pass), as does a body with no
-    /// one pass of its slots, and a load of one slot never runs a round of
-    /// several.
+    /// ([`Q3::step_slots`]): [`Body3::serves_one_pass`] on the load — a
+    /// whole-card load, and a placed load of `Body` or `Body35` with no
+    /// expert tier — and not the lookup draft. A body with no one pass of
+    /// its slots keeps the fallback loop, and a load of one slot never runs
+    /// a round of several.
     one_pass: bool,
     /// [`Seat::step_stats`]: the `BLOOMERY_STEP_STATS` the binary parsed.
     stats: bool,
@@ -936,6 +974,7 @@ impl<B: Body3> Q3<B> {
         draft: Draft,
         dspark: Option<PathBuf>,
         width: WidthMode,
+        draft_off: Option<String>,
     ) -> Result<Q3<B>, GateError> {
         let t = Instant::now();
         let file = Split::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
@@ -960,15 +999,24 @@ impl<B: Body3> Q3<B> {
         m.set_mode(StepMode::Graph);
         let nodes = m.capture_step()?;
         let placed = B::placed(&m)?;
-        let ran = pass_of::<B>(slots, placed, draft);
+        let tiered = B::tiered(&m)?;
+        let ran = pass_of::<B>(slots, tiered, draft);
         if ran != pass {
             return Err(format!(
-                "the `parallel` line named pass={} and the load runs pass={}: the plan's host \
+                "the `parallel` line named pass={} and the load runs pass={}: the plan's tier \
                  experts and the opened body's placement disagree",
                 pass.word(),
                 ran.word()
             )
             .into());
+        }
+        // The tier's rounds, named as the qwen38 seat names them: the placed
+        // body refuses a pass of several slots beside an expert tier card.
+        if tiered && slots > 1 {
+            eprintln!(
+                "{NAME}: --place {card}: the rounds of several slots run a slot at a time: the \
+                 body runs no pass of several slots beside an expert tier card"
+            );
         }
         if !placed {
             B::capture_passes(&mut m)?;
@@ -1008,6 +1056,13 @@ impl<B: Body3> Q3<B> {
             .u("graph_nodes", nodes)
             .f("load_s", total.as_secs_f64())
             .eprint();
+        if B::PRINTS_MTP_OFF
+            && let Some(why) = &draft_off
+        {
+            Record::new(&record::LOAD_DRAFT_OFF_Q3)
+                .w("why", why)
+                .eprint();
+        }
         record::eprint_load_phases(s.model(), total, opened);
         // The tower after the model's captures, as the V4.1 seat opens its encoder.
         #[cfg(feature = "vision")]
@@ -1183,12 +1238,11 @@ impl<B: Body3> Seat for Q3<B> {
 
     /// One round of several slots ([`super::rounds::step_round`]): one pass
     /// of the busy rows while the open decided so ([`Q3::one_pass`], through
-    /// [`Body3::one_pass_round`] — a whole-card load of a body with one pass,
-    /// the rows' answers and lent logits rows from the pass's own per-row
-    /// heads, slot 0 left selected), else the seat's fallback — a select and
-    /// a step a row — the placed load's round (its body serves each slot's
-    /// rows in its own pass), every round of a body with no one pass of its
-    /// slots, and the round a load of one slot never runs.
+    /// [`Body3::one_pass_round`] — the rows' answers and lent logits rows
+    /// from the pass's own per-row heads, slot 0 left selected), else the
+    /// seat's fallback — a select and a step a row — the lookup draft's
+    /// round and every round of a body with no one pass of its slots, and
+    /// the round a load of one slot never runs.
     fn step_slots(&mut self, rows: &mut [SlotStep]) -> Result<(), String> {
         let one_pass = self.one_pass;
         super::rounds::step_round(
@@ -1249,6 +1303,288 @@ impl<B: Body3> Seat for Q3<B> {
     }
 }
 
+/// The draft's store is not cut with the target: the layer attends 0..=pos,
+/// and a cut does not leave the step arena holding the hidden row before the
+/// prefix.
+const CUT_OFF: &str = "the draft's store is not cut with the target: the layer attends 0..=pos, \
+     and a cut does not leave the step arena holding the hidden row before the prefix";
+
+/// A verify of the in-file draft: one proposal and the token before it.
+const MTP_ROWS: usize = <Body35 as MtpBody>::VERIFY_ROWS;
+
+/// The qwen35moe session and its in-file next-token draft ([`MtpDraft`]),
+/// one resident sequence. A cut that moves the position turns the draft off:
+/// the layer's store is not the checkpoint the body's cut restores.
+struct Q35Mtp {
+    drafted: SlotDrafts<Body35, MTP_ROWS>,
+    s: app::Session<Body35>,
+    ctx: usize,
+    stats: bool,
+    path: PathBuf,
+    /// The draft's resident bytes, read once at the open.
+    resident: u64,
+}
+
+impl Q35Mtp {
+    /// The whole-card load with the file's next-token layer ([`GpuModel::open_mtp`]),
+    /// the step captured, one slot, and the draft opened eager over [`Prompt35`].
+    /// The `load` record, then `load draft=mtp`. A host-expert placed load and a
+    /// media load are refused by name: they do not reach this open.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the seat's one engine-thread call takes its plan, cards and planes"
+    )]
+    fn open(
+        path: &Path,
+        ctx: usize,
+        slots: usize,
+        load: Q3Load,
+        levers: &Levers,
+        (kv, vision): (KvQ8, Option<Opened>),
+        width: WidthMode,
+    ) -> Result<Q35Mtp, GateError> {
+        if slots != 1 {
+            return Err(format!("BLOOMERY_DRAFT=mtp: {ONE_SEQUENCE}").into());
+        }
+        if vision.is_some() {
+            return Err(format!("BLOOMERY_DRAFT=mtp: {MEDIA_DRAFT}").into());
+        }
+        if matches!(load, Q3Load::Placed { whole: None, .. }) {
+            return Err(format!("BLOOMERY_DRAFT=mtp: {}", placed_no_verify()).into());
+        }
+        let t = Instant::now();
+        let file = Split::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+        let arch = file.architecture().unwrap_or("<missing>").to_owned();
+        let opened = t.elapsed();
+        let o = q3place::serve_open35(&file, ctx, kv, false)?;
+        let mut m = match load {
+            Q3Load::Whole(card) => {
+                vision_seat::print_seat(None);
+                let gpu = q3place::open_unplanned_card(card)?;
+                Qwen35moeModel::open_mtp(gpu, file, o)?
+            }
+            Q3Load::Placed {
+                q,
+                total,
+                why,
+                whole: Some(card),
+            } => {
+                let plan = q.plan(total, &PlanLevers::from_levers(levers)?)?;
+                for line in q.records(&plan, why)? {
+                    line.eprint();
+                }
+                vision_seat::print_seat(None);
+                let gpu = Gpu::open_card_after_hook(card.name, card.device)?;
+                Qwen35moeModel::open_mtp(gpu, file, o)?
+            }
+            Q3Load::Placed { whole: None, .. } => {
+                return Err(format!("BLOOMERY_DRAFT=mtp: {}", placed_no_verify()).into());
+            }
+        };
+        {
+            let (_, _, body) = m.body_parts(NAME)?;
+            body.set_checkpoints(true);
+        }
+        m.set_mode(StepMode::Graph);
+        let nodes = m.capture_step()?;
+        let at = u32::try_from(ctx).map_err(|_| format!("--ctx {ctx} passes u32"))?;
+        let mut s = app::Session::from_model(m, at);
+        let mut log = Quiet;
+        let drafted = SlotDrafts::<Body35, MTP_ROWS>::open(&mut s, 1, width, &mut log, |m| {
+            MtpDraft::open(m, Prompt35, StepMode::Eager)
+        })?;
+        let (layer, resident, scratch) = {
+            let d = s
+                .model()
+                .body(NAME)?
+                .mtp()
+                .ok_or_else(|| format!("{NAME}: open_mtp loaded no next-token layer"))?;
+            (
+                d.index() as u64,
+                d.resident_bytes() as u64,
+                d.scratch_bytes() as u64,
+            )
+        };
+        let total = t.elapsed();
+        Record::new(&record::LOAD_QWEN3)
+            .w("arch", arch)
+            .u("resident_bytes", s.model().resident_bytes())
+            .w("cache", kv.name())
+            .u("ctx", ctx)
+            .u("slots", slots)
+            .u("slot_ctx", ctx)
+            .u("layers", s.model().layers().len())
+            .u("ubatch", s.model().ubatch()?)
+            .u("graph_nodes", nodes)
+            .f("load_s", total.as_secs_f64())
+            .eprint();
+        Record::new(&record::LOAD_DRAFT_Q3)
+            .u("layer", layer)
+            .u("resident", resident)
+            .u("scratch", scratch)
+            .w("head", "full")
+            .f("load_s", total.as_secs_f64())
+            .eprint();
+        record::eprint_load_phases(s.model(), total, opened);
+        Ok(Q35Mtp {
+            drafted,
+            s,
+            ctx,
+            stats: levers.step_stats(),
+            path: path.to_path_buf(),
+            resident,
+        })
+    }
+}
+
+impl Seat for Q35Mtp {
+    fn pos(&self) -> usize {
+        self.s.pos() as usize
+    }
+
+    fn ctx_max(&self) -> usize {
+        self.ctx
+    }
+
+    fn slots(&self) -> usize {
+        self.s.slots()
+    }
+
+    fn slot_drafts(&self) -> bool {
+        self.drafted.drafts()
+    }
+
+    fn step_stats(&self) -> bool {
+        self.stats
+    }
+
+    fn prefill(&mut self, ids: &[u32]) -> Result<u32, GateError> {
+        let sel = self.s.selected();
+        self.drafted.prefill(&mut self.s, sel, ids)
+    }
+
+    /// Answer positions take no checkpoints. The prompt calls keep theirs.
+    fn prefill_row(&mut self, ids: &[u32], row: Option<&mut [f32]>) -> Result<u32, GateError> {
+        let was = {
+            let (_, _, body) = self.s.model_mut().body_parts(NAME)?;
+            let was = body.takes_checkpoints();
+            body.set_checkpoints(false);
+            was
+        };
+        let r = bind::prefill_then_step(self, ids, row);
+        let (_, _, body) = self.s.model_mut().body_parts(NAME)?;
+        body.set_checkpoints(was);
+        r
+    }
+
+    fn step(&mut self, last: u32) -> Result<u32, GateError> {
+        let sel = self.s.selected();
+        self.drafted.step(&mut self.s, sel, last)
+    }
+
+    fn step_row(&mut self, last: u32, row: &mut [f32]) -> Result<u32, GateError> {
+        let sel = self.s.selected();
+        self.drafted.step_with_row(&mut self.s, sel, last, row)
+    }
+
+    fn logits_into(&self, row: &mut [f32]) -> Result<(), GateError> {
+        Ok(self.s.model().logits_into(row)?)
+    }
+
+    fn pass(&mut self, last: u32, out: &mut Vec<u32>) -> Result<Drafted, GateError> {
+        let sel = self.s.selected();
+        self.drafted.pass(&mut self.s, sel, last, out)
+    }
+
+    fn pass_rows(&self) -> usize {
+        self.drafted.pass_rows(self.s.selected())
+    }
+
+    fn pass_sampled(
+        &mut self,
+        last: u32,
+        history: &mut Vec<u32>,
+        sampler: &mut serve::Sampler,
+        out: &mut Vec<u32>,
+    ) -> Result<Drafted, GateError> {
+        let sel = self.s.selected();
+        self.drafted
+            .pass_sampled(&mut self.s, sel, last, history, sampler, out)
+    }
+
+    fn drafts_sampled(&self) -> bool {
+        self.drafted.drafts()
+    }
+
+    fn reset(&mut self) -> Result<(), GateError> {
+        let sel = self.s.selected();
+        self.drafted.reset(&mut self.s, sel)
+    }
+
+    /// The session's cut. A cut that moves the position turns the draft off
+    /// ([`CUT_OFF`]): the body's cut does not leave the step arena holding
+    /// the hidden row before the prefix, and the layer attends `0..=pos`.
+    fn rollback(&mut self, pos: u32) -> Result<(), GateError> {
+        let held = self.s.pos();
+        self.s.cut(pos)?;
+        if pos < held {
+            self.drafted.turn_off(0, CUT_OFF)?;
+        }
+        Ok(())
+    }
+
+    /// The body's checkpoint rule ([`Session::kept`]).
+    fn keep(&self, n: usize) -> (usize, Option<String>) {
+        let asked = u32::try_from(n).unwrap_or(u32::MAX);
+        let k = self.s.kept(asked);
+        let why = match k.why {
+            Why::Current | Why::Empty => None,
+            _ => Some(k.to_string()),
+        };
+        (k.at as usize, why)
+    }
+
+    /// `/props`' `engine.draft`: the target file, whose next-token layer the
+    /// draft is. A whole-card load reports no placement, so the `draft` class
+    /// is set only where a device row exists.
+    fn props(&self, mut p: EngineProps) -> EngineProps {
+        if let Some(place) = p.placement.as_mut() {
+            for d in &mut place.devices {
+                if d.device.starts_with("GPU") {
+                    *d.class_bytes.entry("draft".to_owned()).or_default() += self.resident;
+                }
+            }
+        }
+        p.draft = Some(DraftProps {
+            model: self.path.file_name().map_or_else(
+                || self.path.display().to_string(),
+                |n| n.to_string_lossy().into_owned(),
+            ),
+            n_max: Some(<Body35 as MtpBody>::WIDTH as u64),
+            kind: Some("mtp".to_owned()),
+            path: Some(self.path.display().to_string()),
+            device: None,
+        });
+        p
+    }
+
+    fn splits(&self, first: usize, end: usize, marks: &[usize]) -> Vec<usize> {
+        <Body35 as Body3>::splits(first, end, marks)
+    }
+
+    fn snapshot(&mut self) -> Result<Arc<dyn Saved>, GateError> {
+        Err(format!("a snapshot: {NO_CACHE}").into())
+    }
+
+    fn resume(&mut self, _state: &dyn Saved) -> Result<(), GateError> {
+        Err(format!("a resume: {NO_CACHE}").into())
+    }
+
+    fn note(note: &CacheNote) {
+        note_line(NAME, note);
+    }
+}
+
 /// What the file loads as, decided before the open ([`q3place::serve_load`]).
 use q3place::ServeLoad as Q3Load;
 
@@ -1273,17 +1609,40 @@ impl Q3Load {
     fn placed_body(&self) -> bool {
         matches!(self, Q3Load::Placed { whole: None, .. })
     }
+
+    /// Whether the load hangs an expert tier that holds an expert
+    /// ([`Body3::tiered`] reads the same fact off the opened body): the
+    /// placed plan's tier experts, none on a load that opens the whole
+    /// model. The plan is the open's own ([`Body3::open`] plans at the same
+    /// total under the same levers).
+    fn tiered(&self, levers: &PlanLevers) -> Result<bool, GateError> {
+        let Q3Load::Placed {
+            q,
+            total,
+            whole: None,
+            ..
+        } = self
+        else {
+            return Ok(false);
+        };
+        Ok(q.plan(*total, levers)?
+            .tier_n_l
+            .iter()
+            .flatten()
+            .any(|&n| n > 0))
+    }
 }
 
-/// The shape of a round of `slots` slots on body `B` whose load `placed` its
-/// experts on the host tier or not: one pass of the busy rows on a body that
-/// runs one ([`Body3::ONE_PASS`]) beside no host tier, else the fallback loop
-/// (a select and a step a slot). The lookup draft's state is a slot's own, so
-/// a round of several slots takes turns under it. The one owner of the rule,
-/// which the `parallel` line names ahead of the load and the open holds the
-/// load to.
-fn pass_of<B: Body3>(slots: usize, placed: bool, draft: Draft) -> Pass {
-    Pass::of(slots, B::ONE_PASS && !placed && draft != Draft::Lookup)
+/// The shape of a round of `slots` slots on body `B`: one pass of the busy
+/// rows when [`Body3::serves_one_pass`] says the load can (a whole-card
+/// load, and a placed load of `Body` or `Body35` whose plan hangs no expert
+/// tier holding an expert), else the fallback loop (a select and a step a
+/// slot). The lookup draft's state is a slot's own, so a round of several
+/// slots takes turns under it. The one owner of the rule, which the
+/// `parallel` line names ahead of the load and the open holds the load to.
+/// The body's answer is [`Body3::serves_one_pass`].
+fn pass_of<B: Body3>(slots: usize, tiered: bool, draft: Draft) -> Pass {
+    Pass::of(slots, B::serves_one_pass(tiered) && draft != Draft::Lookup)
 }
 
 /// What the `arch` file loads as at `total` positions for `parallel`
@@ -1314,13 +1673,15 @@ fn choice_line(word: &str, r: q3place::Reads) {
 }
 
 /// The context `slots` slots serve and the load made at it
-/// ([`q3place::serve_choice`]), its choice line printed.
+/// ([`q3place::serve_choice_lanes`], at `lanes` delta lanes — the seat's,
+/// [`verdict_lanes`]), its choice line printed.
 fn ctx_and_load(
     split: &Split,
     (set, slots): (Option<usize>, usize),
     o: q3place::ServeOpts<'_>,
+    lanes: usize,
 ) -> Result<Chosen<Q3Load>, GateError> {
-    let (chosen, reads) = q3place::serve_choice(split, (set, slots), o)?;
+    let (chosen, reads) = q3place::serve_choice_lanes(split, (set, slots), o, lanes)?;
     choice_line(if set.is_some() { "set" } else { "default" }, reads);
     Ok(chosen)
 }
@@ -1536,23 +1897,220 @@ fn whole_card_refusal(word: &str, name: &str, (placement, why): (String, String)
     .into()
 }
 
-/// The draft `BLOOMERY_DRAFT` names for the `arch` file at `path`: unset and
-/// `off` are the plain path ([`served::word`]), `dspark` is the draft a
-/// qwen35moe file serves, refused by name on the other families, and `lookup`
-/// is the n-gram draft a qwen35moe or qwen35 file serves on a whole-card
-/// verifying load, refused by name on a qwen3moe file ([`lookup_refusal`]).
-fn draft_of(arch: Family, levers: &Levers, path: &Path) -> Result<Draft, GateError> {
-    let draft = served::word(levers)?;
-    match (draft, arch) {
-        (Draft::Lookup, Family::Qwen3moe) => Err(lookup_refusal(arch).into()),
-        (Draft::Dspark, Family::Qwen3moe | Family::Qwen35) => Err(format!(
+/// The body's words for a placed load ([`Body35::build`]'s doc and its lane
+/// refusal): a placed load runs no verify.
+fn placed_no_verify() -> String {
+    let lanes = Body35::VERIFY_LANES;
+    format!(
+        "a placed load runs no verify; {lanes} lanes a delta store: a load keeps 1, or {lanes} \
+         on a whole-card load that verifies drafted rows"
+    )
+}
+
+/// [`Body35::new_seq`]: the draft's K/V is one cache on the body.
+const ONE_SEQUENCE: &str = "an in-file MTP load supports one resident sequence";
+
+/// [`Body35`]'s media refusal of the next-token layer.
+const MEDIA_DRAFT: &str = "a media load: its sequences' rotation tables are their own, and the \
+     draft reads the plain table";
+
+/// What a qwen35moe or qwen35 file does with `BLOOMERY_DRAFT` unset, `off`
+/// or `mtp`, after the load is known.
+enum Choice {
+    /// The file carries a shaped next-token layer and the seat drafts it.
+    InFile,
+    /// The plain path, and why, printed on `load draft=off`.
+    Plain(String),
+}
+
+/// The positions the in-file window needs over `slots` slots: the verify's
+/// two rows and one more, the same count the Qwen3.8 seat's window uses.
+fn window_need(slots: usize) -> usize {
+    slots.saturating_mul(<Body35 as MtpBody>::VERIFY_ROWS + 1)
+}
+
+/// [`Draft38Off::Set`]'s display keeps the seat's existing width sentence.
+/// Any other why is the Qwen3.8 seat's.
+fn width_off(why: &str) -> String {
+    if why == "BLOOMERY_DRAFT=off" {
+        "BLOOMERY_MTP_WIDTH picks the width a drafted window verifies; \
+         BLOOMERY_DRAFT=off serves no draft"
+            .to_owned()
+    } else {
+        format!(
+            "BLOOMERY_MTP_WIDTH picks the width a drafted window verifies; the server \
+             drafts nothing ({why})"
+        )
+    }
+}
+
+/// The file's next-token layer, or why it is not a draft. A missing layer
+/// is the plain path: the why is the enum's own words, the stripped block's
+/// reason, or the error's.
+fn layer_choice(file: &Split) -> Choice {
+    match in_file(file) {
+        Ok(InFile::Draft(_)) => Choice::InFile,
+        Ok(InFile::Absent) => Choice::Plain(
+            "The key is absent, or the blocks past the trunk are trunk layers.".to_owned(),
+        ),
+        Ok(InFile::Unshaped) => Choice::Plain(
+            "The key is 1 and every tail tensor is a one-element vector: the role table's stub, \
+             not a draft's shapes."
+                .to_owned(),
+        ),
+        Ok(InFile::Stripped { reason }) => Choice::Plain(reason),
+        Err(e) => Choice::Plain(e.to_string()),
+    }
+}
+
+/// `BLOOMERY_DRAFT` `mtp`, `off` or unset on a qwen35moe or qwen35 file, once
+/// the load is known. `whole` is a load that opens the model on the card.
+/// Set `mtp` is refused by name where the load cannot draft. Unset takes
+/// [`draft38_unset`] and then the seat's own facts; a fact that forbids the
+/// draft leaves the plain path and names why.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the load's levers, file, slots, context, card, place and media decide the draft (rust-quality R8)"
+)]
+fn decide_q35(
+    levers: &Levers,
+    path: &Path,
+    file: &Split,
+    slots: usize,
+    slot_ctx: usize,
+    whole: bool,
+    place_name: &str,
+    media: bool,
+) -> Result<Choice, GateError> {
+    let need = window_need(slots);
+    let forbid_set = |why: String| -> Result<Choice, GateError> {
+        Err(format!("BLOOMERY_DRAFT=mtp: {why}").into())
+    };
+    match levers.draft() {
+        Some("mtp") => {
+            if media {
+                return forbid_set(MEDIA_DRAFT.to_owned());
+            }
+            if !whole {
+                return forbid_set(placed_no_verify());
+            }
+            if slots > 1 {
+                return forbid_set(ONE_SEQUENCE.to_owned());
+            }
+            if slots.saturating_mul(slot_ctx) < need {
+                return Err(format!(
+                    "a slot's context of {slot_ctx} leaves no positions for the MTP draft's \
+                     window; --ctx-size names a total of at least {need}"
+                )
+                .into());
+            }
+            Ok(layer_choice(file))
+        }
+        Some("off") => Ok(Choice::Plain(Draft38Off::Set.to_string())),
+        None => {
+            let at = Draft38At {
+                place_a: whole && place_name == "a",
+                logits: false,
+                route_trace: levers.route_trace().is_some(),
+                file: path,
+                file_is_there: true,
+                looked: &[],
+                need,
+                ctx: slot_ctx.saturating_mul(slots),
+            };
+            let mut off = draft38_unset(&at);
+            if matches!(off, Some(Draft38Off::Gate)) && !whole && place_name == "a" {
+                off = None;
+            }
+            if let Some(why) = off {
+                return Ok(Choice::Plain(why.to_string()));
+            }
+            if media {
+                return Ok(Choice::Plain(Draft38Off::Media.to_string()));
+            }
+            if !whole {
+                return Ok(Choice::Plain(placed_no_verify()));
+            }
+            if slots > 1 {
+                return Ok(Choice::Plain(ONE_SEQUENCE.to_owned()));
+            }
+            Ok(layer_choice(file))
+        }
+        Some(other) => {
+            Err(format!("BLOOMERY_DRAFT {other:?} is not an in-file draft decision").into())
+        }
+    }
+}
+
+/// The delta lanes the seat's whole-card load of a qwen35 family file keeps:
+/// [`Body35::VERIFY_LANES`] on a load that verifies drafted rows
+/// (`GpuModel::open_verifying`, `GpuModel::open_mtp`), one on a plain load —
+/// the count its whole-fit verdict prices the load at
+/// ([`q3place::serve_choice_lanes`]), decided before the load is. The draft
+/// word decides ahead of it: `dspark` and `lookup` verify a whole-card load
+/// whatever the file; `mtp` and an unset word draft the file's own
+/// next-token layer ([`layer_choice`]), which needs one text sequence on
+/// place `a` with no route trace. [`decide_q35`] keeps the load's own half —
+/// a placed load drafts nothing, and its refusals stand — so where this pick
+/// cannot know the load it takes the wider side: the verdict it feeds never
+/// under-counts the lanes of the load the seat opens.
+fn verdict_lanes(
+    levers: &Levers,
+    word: Word,
+    file: &Split,
+    place: &str,
+    media: bool,
+    slots: usize,
+) -> usize {
+    let in_file = matches!(layer_choice(file), Choice::InFile);
+    let drafted = match word {
+        Word::Dspark | Word::Lookup => true,
+        Word::Mtp => !media && slots == 1 && in_file,
+        Word::Off => {
+            levers.draft().is_none()
+                && place == "a"
+                && !media
+                && slots == 1
+                && levers.route_trace().is_none()
+                && in_file
+        }
+    };
+    if drafted { Body35::VERIFY_LANES } else { 1 }
+}
+
+/// [`Word`] from `BLOOMERY_DRAFT` for the `arch` file at `path`. `lookup` is
+/// refused by name on a qwen3moe file ([`lookup_refusal`]). `dspark` is the
+/// draft a qwen35moe file serves. `mtp` on a qwen3moe file is refused by
+/// name before any plan: that body has no in-file next-token layer and runs
+/// no verify pass.
+fn draft_of(arch: Family, levers: &Levers, path: &Path) -> Result<Word, GateError> {
+    let word = served::word(levers)?;
+    match (word, arch) {
+        (Word::Lookup, Family::Qwen3moe) => Err(lookup_refusal(arch).into()),
+        (Word::Dspark, Family::Qwen3moe | Family::Qwen35) => Err(format!(
             "BLOOMERY_DRAFT=dspark: the DSpark draft serves a qwen35moe file (Qwen3.6-35B-A3B \
              or MiniCPM-V 4.7-35B-A3B); {} is a {} file",
             path.display(),
             arch.name()
         )
         .into()),
-        (draft, _) => Ok(draft),
+        (Word::Mtp, Family::Qwen3moe) => Err(
+            "BLOOMERY_DRAFT=mtp: a qwen3moe file has no in-file next-token layer and its body \
+             runs no verify pass"
+                .into(),
+        ),
+        (word, _) => Ok(word),
+    }
+}
+
+/// `word` as the served draft the lookup and DSpark paths take. `mtp` and
+/// the plain word are [`Draft::Off`]: the in-file decision is [`decide_q35`]'s,
+/// and [`served::draft_slots`] decides a count only for DSpark.
+fn served_draft(word: Word) -> Draft {
+    match word {
+        Word::Lookup => Draft::Lookup,
+        Word::Dspark => Draft::Dspark,
+        Word::Off | Word::Mtp => Draft::Off,
     }
 }
 
@@ -1606,19 +2164,26 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         )
     })?;
     // The draft word, before anything is planned or loaded.
-    let draft = draft_of(arch, &levers, &path)?;
+    let word = draft_of(arch, &levers, &path)?;
+    let served = served_draft(word);
     // The width a drafted window verifies: the chooser's (`cost`, unset) or the
-    // draft's own (`fixed`).
+    // draft's own (`fixed`). An explicit off, and an unset qwen3moe file, refuse
+    // it here. A qwen35 file whose default may still draft does not.
     let width = WidthMode::of(levers.mtp_width())?;
-    if draft == Draft::Off && levers.mtp_width().is_some() {
+    let explicit_off = levers.draft() == Some("off");
+    if levers.mtp_width().is_some()
+        && (explicit_off || (matches!(arch, Family::Qwen3moe) && levers.draft().is_none()))
+    {
         return Err(
             "BLOOMERY_MTP_WIDTH picks the width a drafted window verifies; \
              BLOOMERY_DRAFT=off serves no draft"
                 .into(),
         );
     }
-    if draft != Draft::Off {
-        // The width chooser's record is printed on every drafted request.
+    // The width chooser's record is printed on every request that may draft.
+    let may_draft = matches!(word, Word::Lookup | Word::Dspark | Word::Mtp)
+        || (levers.draft().is_none() && matches!(arch, Family::Qwen35moe | Family::Qwen35));
+    if may_draft {
         super::drafted::serves_widths();
     }
     // The vocabulary before the plans: `--mmproj`'s encoder is held against it, and its bytes
@@ -1656,12 +2221,27 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     // (`bind::slots_of`).
     let (slots, from) = slots_given(a.parallel, a.ctx, DEFAULT_SLOTS)?;
     // The DSpark draft's window is one sequence's: several slots are refused by name.
-    let (slots, from) = served::draft_slots(a.parallel, draft, true)?.unwrap_or((slots, from));
+    // `mtp` decides no count here.
+    let (slots, from) = served::draft_slots(a.parallel, served, true)?.unwrap_or((slots, from));
     // A set `--ctx` is the total the slots split: a share under the rows a
     // slot loads at is refused before any plan.
     if let Some(total) = a.ctx {
         slot_ctx(total, slots)?;
     }
+    // The delta lanes the seat's whole-card qwen35 family load keeps
+    // ([`verdict_lanes`]): every whole-fit verdict below prices the load at
+    // them, before the load is known.
+    let lanes = match arch {
+        Family::Qwen35moe | Family::Qwen35 => verdict_lanes(
+            &levers,
+            word,
+            &split,
+            a.place.unwrap_or(Place::A).name(),
+            vision.is_some(),
+            slots,
+        ),
+        Family::Qwen3moe => 1,
+    };
     // A projector the `--hf` repo picked stays only where the load gives the text model the same
     // experts and context with the encoder as without ([`vision_seat::kept`]).
     let vision = vision_seat::kept(vision, &a.vision, |v| {
@@ -1670,6 +2250,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
             &split,
             (a.ctx, slots),
             serve_opts((a.place, &plan_levers), kv, (v, embedding)),
+            lanes,
         )?;
         let cost_ctx = asked.total;
         Ok(match asked.plan {
@@ -1695,6 +2276,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         &split,
         (a.ctx, slots),
         serve_opts((a.place, &plan_levers), kv, (vision.as_ref(), embedding)),
+        lanes,
     )?;
     let (_, image) = vision_seat::images_of(vision.as_ref());
     eprintln!(
@@ -1708,9 +2290,14 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         q3place::checkpoints_fit(seqs35(&split, slots)?, slot_ctx, load.placed_body())?;
     }
     // The shape of a round of several slots, from the load's body
-    // ([`Q3Load::placed_body`]); the open holds the opened body to it.
+    // ([`Q3Load::placed_body`], [`Q3Load::tiered`]); the open holds the
+    // opened body to it.
     let placed = load.placed_body();
-    if draft != Draft::Off && placed {
+    // A plan that hangs an expert tier holding an expert runs its rounds a
+    // slot at a time ([`Body3::serves_one_pass`]: the placed body refuses a
+    // pass of several slots beside one).
+    let tiered = load.tiered(&plan_levers)?;
+    if served != Draft::Off && placed {
         let why = match a.place {
             Some(p) => (
                 format!("--place {}", p.name()),
@@ -1723,19 +2310,40 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
                     .to_owned(),
             ),
         };
-        return Err(match draft {
+        return Err(match served {
             Draft::Dspark => whole_card_refusal("dspark", "DSpark", why),
             Draft::Lookup => whole_card_refusal("lookup", "lookup", why),
             Draft::Off => unreachable!("the plain path is never placed away"),
         });
     }
-    let draft_dir = match draft {
-        Draft::Dspark => Some(dspark_hf::dir_from_env()?),
-        Draft::Off | Draft::Lookup => None,
+    let choice = if matches!(arch, Family::Qwen35moe | Family::Qwen35)
+        && matches!(word, Word::Off | Word::Mtp)
+    {
+        Some(decide_q35(
+            &levers,
+            &path,
+            &split,
+            slots,
+            slot_ctx,
+            !placed,
+            chosen.place.name(),
+            vision.is_some(),
+        )?)
+    } else {
+        None
+    };
+    if let Some(Choice::Plain(why)) = &choice
+        && levers.mtp_width().is_some()
+    {
+        return Err(width_off(why).into());
+    }
+    let draft_dir = match word {
+        Word::Dspark => Some(dspark_hf::dir_from_env()?),
+        Word::Off | Word::Lookup | Word::Mtp => None,
     };
     let pass = match arch {
-        Family::Qwen3moe => pass_of::<Body>(slots, placed, draft),
-        _ => pass_of::<Body35>(slots, placed, draft),
+        Family::Qwen3moe => pass_of::<Body>(slots, tiered, served),
+        _ => pass_of::<Body35>(slots, tiered, served),
     };
     // The slots the seat serves, one line before the load (`from` names what
     // set the count).
@@ -1772,8 +2380,8 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     }
     .to_owned();
     let schema_jump = levers.schema_jump();
-    let engine = match arch {
-        Family::Qwen3moe => SeatEngine::spawn(
+    let engine = match (arch, choice) {
+        (Family::Qwen3moe, _) => SeatEngine::spawn(
             move || {
                 Q3::<Body>::open(
                     &open,
@@ -1783,9 +2391,10 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
                     load,
                     &levers,
                     (kv, vision),
-                    draft,
+                    served,
                     draft_dir,
                     width,
+                    None,
                 )
             },
             slot_ctx,
@@ -1794,7 +2403,15 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
             props,
             0,
         )?,
-        _ => SeatEngine::spawn(
+        (_, Some(Choice::InFile)) => SeatEngine::spawn(
+            move || Q35Mtp::open(&open, slot_ctx, slots, load, &levers, (kv, vision), width),
+            slot_ctx,
+            vocab,
+            device,
+            props,
+            0,
+        )?,
+        (_, Some(Choice::Plain(why))) => SeatEngine::spawn(
             move || {
                 Q3::<Body35>::open(
                     &open,
@@ -1804,9 +2421,32 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
                     load,
                     &levers,
                     (kv, vision),
-                    draft,
+                    Draft::Off,
+                    None,
+                    width,
+                    Some(why),
+                )
+            },
+            slot_ctx,
+            vocab,
+            device,
+            props,
+            0,
+        )?,
+        (_, None) => SeatEngine::spawn(
+            move || {
+                Q3::<Body35>::open(
+                    &open,
+                    slot_ctx,
+                    slots,
+                    pass,
+                    load,
+                    &levers,
+                    (kv, vision),
+                    served,
                     draft_dir,
                     width,
+                    None,
                 )
             },
             slot_ctx,
@@ -1844,4 +2484,38 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         .w("addr", server.local_addr()?)
         .eprint();
     Ok(server.run())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_args;
+    use model::placement::workstation::{A6000, RTX_3090};
+
+    /// The seat reads `--place` as the shared grammar and leaves a tier card
+    /// to its plan: each word it took before parses to the placement it names,
+    /// a list of tier cards is not refused at parse, and a word no card or
+    /// ordinal spells is.
+    #[test]
+    fn the_place_word_is_the_shared_grammar_and_a_tier_count_is_the_plans() {
+        let args = |word: &str| [String::from("--place"), word.to_owned()];
+        for (word, name, cards) in [
+            ("a", "a", vec![A6000.name]),
+            ("gate", "gate", vec![RTX_3090.name]),
+            ("bp", "bp", vec![A6000.name, RTX_3090.name]),
+            ("a6000+3090", "bp", vec![A6000.name, RTX_3090.name]),
+            ("cuda1+0", "cuda1+0", vec!["cuda1", "cuda0"]),
+            ("tp", "tp", vec![A6000.name]),
+        ] {
+            let a = parse_args(&args(word)).unwrap_or_else(|e| panic!("{word}: {e}"));
+            let p = a.place.expect(word);
+            assert_eq!((p.name(), p.cards()), (name, cards), "{word}");
+        }
+        let many = "cuda0+cuda1+cuda2";
+        let a = parse_args(&args(many)).unwrap_or_else(|e| panic!("{many}: {e}"));
+        assert_eq!(a.place.map(|p| p.tier_cards().len()), Some(2));
+        let Err(e) = parse_args(&args("b2")) else {
+            panic!("b2 is no card or ordinal");
+        };
+        assert!(e.to_string().starts_with("--place is a, gate, bp"), "{e}");
+    }
 }

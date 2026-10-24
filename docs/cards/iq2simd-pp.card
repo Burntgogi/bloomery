@@ -1,0 +1,47 @@
+# Round iq2simd: Muse Spark's prompt pass with the host union's IQ2_XXS rows through qdot's wide tile
+# (dot_row_cols_wide, dot_iq2xxs_q8k_wide_avx2): one weight row against up to 32 columns, each block's grid, sign
+# and scale vectors unpacked once for every column of the call, the columns dotted eight at a time with their
+# integer sums in registers; every column keeps the one-column kernel's lanes and order, so the bits are dot_row's
+# (qdot hw_iq2xxs_wide_matches_dot_row, union hw_union_relu2_matches_transcription). Against the base aada29743
+# (int039), whose union runs dot_row_cols in runs of 8 columns (the block unpacked once a run, 24 weight vectors and
+# 8 accumulators live against 16 ymm registers).
+# Decomposition [derived, round report]. Base from the lead's int039 rows (A6000 + host, place a, 2 rounds): pp512
+# 34.1..34.3 -> 14.97 s a 512-row pass -> ~241 ms a layer (62 layers); card ~11 ms, the rest host.
+# - Host per layer: rows ~195..208 ms + the rest O ~22..35 ms (x quantize of 4096 columns, combine, the sum, the
+#   caller's single-thread copy, zero-fill, post-norm and weighted sum in experts_post).
+# - Rows: 805 M (block, column) pairs a layer (4096 columns x 3 matrices x 4096 rows x 16 blocks) on 32 threads at
+#   3.96 GHz -> ~31.5 cycles a (block, column); instructions a (block, column) = 67 (tile_units' per-column) +
+#   299 x 2.44 runs / 16 columns (the unpack, m-bar 16 columns an expert) = 112.6 -> IPC ~3.6.
+# - Wide tile: ~40 inner + 3.7 pack loads + 6 tail + 5 group dispatch + ~17 unpack (270 x 264 runs / 4096) = ~72
+#   instructions a (block, column), 0.64 x today; the ports (mul pipes 16 uops -> 8 cycles, FP ~36 -> 9, loads ~14
+#   -> 7) give 15..22 cycles; the column codes' L2 re-read (260 B) is ~8 cycles at 32 B/cycle, under the shadow.
+# Rows 93..145 ms; host 115..180 ms; + card 11 + PCIe 0.7 -> 127..192 ms a layer, 7.9..11.9 s a pass:
+# pp512 43..65 tok/s = +26..+90 %. pp4096 the same band (attention adds ~0.06 s a pass); printed beside it.
+kind: ab
+question: does the host union's cost per (block, column) fall from ~31.5 to the wide tile's 15..22 cycles once
+  each IQ2_XXS block is unpacked once per row for up to 32 columns and the columns' sums stay in registers?
+term: pp tok/s @ P = 512, prose prompt (corpus-prose.ids), Muse Spark UD-IQ2_XXS, A6000 + host, place a, serve
+  defaults (--ctx-size 4160) - (iq2simd - base) / base, arms rotated by round in one invocation
+unit: %
+predict: +26..+90
+rounds: 2
+condition: one lease, one invocation from /Users/hckim/repo/bloomery-iq2simd (it builds this tree's bloomery-serve)
+  after the base tree's own release build of bloomery-serve at aada29743 (a clean tree, e.g. bloomery-iq2base):
+  BLOOMERY_MODEL=muse-spark BLOOMERY_AB_ROUNDS=2 BLOOMERY_BOX_ENV='DEPTH_SERVE_N=64
+  BLOOMERY_LEASE_CARD=docs/cards/iq2simd-pp.card' just depth-serve bloomery-iq2base:512 bloomery-iq2simd:512
+  bloomery-iq2base:4096 bloomery-iq2simd:4096. Both arms hold the same plan (no card byte moved: the wide tile is
+  host code), so their plan and pass lines print the same card experts and pass rows, and their tg rows agree
+  within the window's ~5 % (a decode step is one column an expert, which keeps dot_row; the wide tile takes only
+  an expert's runs of two or more columns). A row marked [cold], [cpu-busy] or
+  [other-busy] is void, and so is a window whose majflt differs by more than the load's own scatter between arms.
+  Box time 13..32 min [derived: 8 servers at a 1..3 min load each, prompts 2 x (15 + 10 + 120 + 80) s, decode 8 x
+  6 s; plus the two serve builds]
+decide-in: land it; the host term per layer is then rows ~93..145 ms beside O ~22..35 ms: the next lever is O
+  (experts_post's single-thread copy, zero-fill, post-norm and sum onto the pool, ~8 % of a layer), then the
+  card's ~11 ms under the host union (at most ~5 %)
+decide-below: under +26 %: the column codes' L2 stream binds (the ~10.7 B/cycle the Q4_K tile's 27 cycles imply,
+  ~24 cycles a (block, column)) or the unpack does not overlap the group work: read union_ms per layer from one
+  run's stat prompt lb rows (BLOOMERY_STEP_STATS=1) and a perf annotate of dot_iq2xxs_q8k_wide_avx2 for the stalled
+  port before landing; an L2-bound result names IQ2_XXS row lanes (the codes read once for eight rows) next
+decide-above: past +90 %: O was over-counted or the base tile spilled worse than 67 instructions a column; re-derive
+  O from the stat prompt lb rows (union_ms against the layer's wall) and price the card shadow next

@@ -900,6 +900,20 @@ pub fn fp4_pair(byte: u8) -> [i8; 2] {
     ]
 }
 
+/// One 16-value group of NVFP4 rows' codes ([`GgmlType::NVFP4_ROWS`]: value `2i` the low nibble
+/// of byte `i`, value `2i + 1` its high nibble) in the order an NVFP4 block holds them (ggml's
+/// `block_nvfp4`, the card's code plane: byte `j` holds value `j` low and value `j + 8` high), its
+/// nibbles moved and none changed. The one rule of that move: a reader of a checkpoint's code
+/// plane runs it, and qdot's AVX2 body is held to it bit for bit.
+#[inline]
+#[must_use]
+pub fn nvfp4_group_to_block(g: &[u8; 8]) -> [u8; 8] {
+    std::array::from_fn(|j| {
+        let nib = |x: u8| (x >> (4 * (j % 2))) & 0x0f;
+        nib(g[j / 2]) | (nib(g[4 + j / 2]) << 4)
+    })
+}
+
 /// The block scale of an MXFP4 block, `ggml_e8m0_to_fp32_half` (ggml-impl.h:40-45):
 /// `x >= 2 ? (x - 1) << 23 : {0x00200000, 0x00400000}[x]` as f32 bits, which is
 /// 2^(E-128) for every E — the E8M0 scale 2^(E-127) halved, the half that the
@@ -1875,7 +1889,9 @@ pub fn quantize_row_q8_0_roundtrip(x: &[f32], out: &mut [f32]) {
 /// IQ2_XS take Q8_K in ggml (ggml.c:895, :1105 on the IQK build; `iqk_set_kernels_kquants` and
 /// `iqk_set_kernels_iquants` accept Q8_K only for them), and IQ2_XXS too (ggml.c:1064, mainline's
 /// ggml-cpu.c:340); the other i-quants take Q8_K too and have no CPU matmul here. Q2_0, mainline's alone, takes Q8_0 (`f2cc7282c` ggml-cpu.c:237), the column
-/// qdot's Q2_0 kernel reads. NVFP4 has a reference decode and no CPU matmul here.
+/// qdot's Q2_0 kernel reads. NVFP4, mainline's alone, takes Q8_0 there (`ggml_vec_dot_nvfp4_q8_0`) and Q8_2_X4 here, the
+/// column qdot's NVFP4 kernel reads, so the `gate-quant` gap between the two activations is part of its band. bloomery's
+/// NVFP4 rows take Q8_2_X4 too, the same column.
 pub fn activation_format(weight: GgmlType) -> Result<Option<ActivationFormat>, QuantError> {
     match weight.row().map(|r| r.host_act) {
         Some(HostAct::Q8K) => Ok(Some(ActivationFormat::Q8K)),
@@ -2231,13 +2247,12 @@ mod tests {
     }
 
     /// A row is what the dispatchers it feeds do: a type decodes when a CPU matmul takes it, and
-    /// besides those only BF16 and NVFP4 decode (named here, not read from the row), and
+    /// besides those only BF16 decodes (named here, not read from the row), and
     /// `dequant_row` decodes one zero block exactly when the row says so.
     #[test]
     fn a_row_is_what_its_dispatchers_do() {
         for row in QROWS {
-            let expected =
-                row.host_act != HostAct::None || matches!(row.ty, GgmlType::BF16 | GgmlType::NVFP4);
+            let expected = row.host_act != HostAct::None || row.ty == GgmlType::BF16;
             assert_eq!(row.dequant, expected, "{}: decode support", row.name);
             let zero_block = dequant_row(
                 row.ty,
@@ -2284,6 +2299,10 @@ mod tests {
     // (`f2cc7282c`) names Q8_0 as its vec_dot_type.
     // PIN(2026-10-16): IQ2_XXS takes Q8_K, no longer refused: qdot fuses it, and ggml.c:1064 (mainline's
     // ggml-cpu.c:340) names Q8_K as its vec_dot_type.
+    // PIN(2026-10-23): NVFP4 takes Q8_2_X4, no longer refused: qdot fuses it against MXFP4's column. Mainline's
+    // vec_dot_type for it is Q8_0; `gate-quant` clause (c) holds the encoder to its own half step and clause (d)
+    // adds the gap to ggml's column to the band. NVFP4_ROWS, bloomery's own type with no ggml row, takes the same
+    // column.
     #[test]
     fn activation_formats_are_ggmls_vec_dot_types() {
         use super::ActivationFormat::{Q8_0, Q8_2X4, Q8K};
@@ -2301,9 +2320,11 @@ mod tests {
             (GgmlType::Q5_1, Some(Q8_2X4)),
             (GgmlType::Q8_0, Some(Q8_2X4)),
             (GgmlType::MXFP4, Some(Q8_2X4)),
+            (GgmlType::NVFP4, Some(Q8_2X4)),
             (GgmlType::Q2_0, Some(Q8_0)),
             (GgmlType::IQ4_XS, Some(Q8K)),
             (GgmlType::IQ4_NL, Some(Q8_2X4)),
+            (GgmlType::NVFP4_ROWS, Some(Q8_2X4)),
             (GgmlType::F32, None),
             (GgmlType::F16, None),
         ] {
@@ -2312,12 +2333,6 @@ mod tests {
         assert_eq!(
             activation_format(GgmlType::BF16),
             Err(QuantError::NoActivationFormat(GgmlType::BF16))
-        );
-        // No CPU matmul takes NVFP4: dequant_row reads it, activation_format
-        // refuses it by name, as it refuses BF16.
-        assert_eq!(
-            activation_format(GgmlType::NVFP4),
-            Err(QuantError::NoActivationFormat(GgmlType::NVFP4))
         );
     }
 

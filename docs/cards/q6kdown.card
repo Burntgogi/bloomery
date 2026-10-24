@@ -1,0 +1,27 @@
+# GLM UD-Q4_K_XL decode on the A6000 after a Q6_K down runs on the common card leg.
+# [derived] from docs/cards/glm-public.card's host-leg rate (130-137 GB/s, the same
+# 0.111..0.117 ms a slot as docs/cards/glmbp-ab.card) and that card's id-prefix row
+# (18.7..22.2 tok/s: 67 of 288 on 39 layers). The three Q6_K-down layers (11, 12, 44)
+# were host-only. At glmbp-ab's ~2,568 card experts (ctx 2048, plan (a), NextN), a
+# byte spread that stops when the next expert does not fit puts 61, 61 and 60 experts
+# on those layers (182 host to card) and 60..61 on the other 39. A budget of 65 x 39
+# of the old expert instead puts 179. The card byte budget stays full, and a uniform
+# hit of n_l/288 makes expected host bytes depend on card bytes, not on which layer
+# holds them: the host-byte change is about +0.1 MB a token, 0.001 ms at 130 GB/s.
+# The new leg reserve (2,089,984 B) is under one expert and does not move the 182.
+# Nothing here was timed.
+kind: baseline
+question: what is GLM UD-Q4_K_XL decode tok/s on the A6000 once a Q6_K down runs on the card?
+term: decode tok/s @ depth 512, GLM UD-Q4_K_XL, plan (a), A6000, id-prefix card experts, no MTP
+unit: tok/s
+predict: 18.7..22.2
+condition: generate_glm5next on plan (a), the A6000, the glm-public card's decode window
+  (depth 512, id prefix, no MTP); the plan's n_l on layers 11, 12 and 44 is non-zero
+reason: sets the comparison against glm-public's glmcard default row (18.7..22.2). The
+  move exchanges card bytes between layers, so the host leg at 130-137 GB/s does not
+  move the step. why now: the common down arm admits Q6_K
+decide-in: the measured decode sits in 18.7..22.2 and layers 11, 12 and 44 hold card experts
+decide-below: a Q6_K layer went card-bound, or the leg reserve dropped more experts than
+  one; re-derive the host bytes from the plan's n_l before quoting the row
+decide-above: the prefix on the Q6_K layers hit more than n_l/288; read the router before
+  calling it a win

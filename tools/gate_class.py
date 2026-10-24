@@ -45,7 +45,7 @@ GATE_PREFIX = recipes.GATE_PREFIX
 DEFAULT_ROTATION_DAYS = 7
 # The families that are not architectures: a group of gates with no registry row of its own. A family that is not in
 # the registry and not here has no owner, and the check is red.
-DECLARED_GROUPS = ("gemma4a", "gemma4v", "minicpmv47", "qwen38d")
+DECLARED_GROUPS = ("flint", "gemma4a", "gemma4v", "minicpmv47", "qwen38d")
 
 
 class GateClassError(Exception):

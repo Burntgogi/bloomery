@@ -474,7 +474,8 @@
 //! (`tier::plan_levers`: in the fixture tier the header's budget plus the
 //! draft's card bytes at `CTX`, as a drafting load plans there; the runner
 //! exports the target's alone), and `/props`' engine clauses plan under the
-//! same.
+//! same; the slots clause's second server takes it at its two slots
+//! ([`drafted_card_budget`]).
 //! `BLOOMERY_DRAFT`, `BLOOMERY_RESIDENCY` and `BLOOMERY_XSTREAM` set in this
 //! binary's environment are refused by name:
 //! the arm names the draft (a set `BLOOMERY_MTP_DRAFT` needs the drafted
@@ -586,6 +587,9 @@ mod gate {
     );
     /// The context the servers are started at (`SERVER_ARGS`).
     const CTX: usize = 4096;
+    /// The slots the seat serves under `--parallel 2`, the count of the slots clause's second
+    /// server, which runs the seat at its own defaults.
+    const SLOTS_DEFAULT: usize = 2;
     /// Session A's first turn, session B's, a later turn A resends after its
     /// reply (`cache` clause (a)), and the text A resends instead of its
     /// reply (clause (b)): the last's first id is not the reply's.
@@ -901,7 +905,7 @@ mod gate {
                 )
             }
             true => {
-                let (mtp, levers_plan) = drafted_plan_inputs(levers, &path, &split, &inputs)?;
+                let (mtp, levers_plan) = drafted_plan_inputs(levers, &path, &split, &inputs, 1)?;
                 let with = inputs.plan_mtp_with(
                     &machine,
                     u64::try_from(CTX)?,
@@ -2084,7 +2088,10 @@ mod gate {
     /// turn path it checked (`serve::SwapEngine`, the park of a preempted request's
     /// state) left the seat with the resident slots, and its coverage (a preempted
     /// request's draft rejoining) is this clause's (v1) draft-count equality.
-    fn slots_flow_together(dir: &Path) -> Result<bool, GateError> {
+    fn slots_flow_together(
+        dir: &Path,
+        levers: &bloomery_levers::Levers,
+    ) -> Result<bool, GateError> {
         let mut ok = true;
         let own = dir.join("slots");
         std::fs::create_dir_all(&own)?;
@@ -2130,7 +2137,7 @@ mod gate {
                     check(&mut ok, name, false);
                 }
                 let _ = served.stop();
-                return slots_default_residency(dir, &mut ok);
+                return slots_default_residency(dir, levers, &mut ok);
             }
         };
         let url = |p: &str| format!("http://{addr}{p}");
@@ -2269,7 +2276,7 @@ mod gate {
         ok &= slots_drafted_beside(&url, &addr, &err_log, [&a_ids, &b_ids], &alone)?;
         ok &= slots_drafted_sampled(&addr, &err_log, [&a_ids, &b_ids])?;
         println!("slots server stopped: {}", served.stop()?);
-        slots_default_residency(dir, &mut ok)
+        slots_default_residency(dir, levers, &mut ok)
     }
 
     /// The slots clause's second server (the module header): the seat under
@@ -2291,7 +2298,11 @@ mod gate {
     /// aggregate. The fixture tier defers that last clause by name: the
     /// draft is the real file's, which proposes nothing a random-weight
     /// target accepts.
-    fn slots_default_residency(dir: &Path, ok: &mut bool) -> Result<bool, GateError> {
+    fn slots_default_residency(
+        dir: &Path,
+        levers: &bloomery_levers::Levers,
+        ok: &mut bool,
+    ) -> Result<bool, GateError> {
         let own = dir.join("slots-default");
         std::fs::create_dir_all(&own)?;
         let err_log = own.join("server.err");
@@ -2306,7 +2317,19 @@ mod gate {
             .env_remove(bloomery_levers::MTP_DRAFT)
             .env_remove(bloomery_levers::MTP_WIDTH)
             .env(bloomery_levers::STEP_STATS, "1");
-        let args = ["--host", "127.0.0.1", "--port", "0", "--parallel", "2"];
+        // PIN(2026-10-25): the drafting load's budget at the two slots, where this server took the
+        // fixture runner's, the target's alone: the set draft's card bytes (PIN above) leave the
+        // least default context of two slots no room beside it, so the seat refused by name.
+        drafted_card_budget(&mut cmd, levers, SLOTS_DEFAULT)?;
+        let parallel = SLOTS_DEFAULT.to_string();
+        let args = [
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "0",
+            "--parallel",
+            parallel.as_str(),
+        ];
         let mut served = Served38::spawn_with(&args, &own, &mut cmd)?;
         println!("slots-default server pid {}", served.child.id());
         let addr = match served.address(&err_log, POLLS, POLL) {
@@ -4748,7 +4771,7 @@ mod gate {
             );
             machine.cards[0].free_bytes = Some(free);
             let plan_levers = PlanLevers {
-                card_budget_bytes: Some(budget),
+                card_budget_bytes: Some(budget).into(),
             };
             Ok(inputs
                 .plan_target(
@@ -4921,7 +4944,7 @@ mod gate {
         // The resident slots together (the module header): its own servers,
         // the first with the draft on, the second the seat's own defaults but
         // the draft.
-        ok &= slots_flow_together(dir)?;
+        ok &= slots_flow_together(dir, levers)?;
         // An unset residency whose churn pool the host's room cannot take
         // keeps its P and runs the pool from the file (the module header):
         // its own two servers.
@@ -4938,17 +4961,18 @@ mod gate {
 
     /// The MTP draft the drafted main server opens ([`draft_file`]) read
     /// against the target at `path` (`split`, `inputs`), its head the
-    /// lever's rows, and the plan levers of that load at [`CTX`] a slot:
-    /// [`tier::plan_levers`] with the draft's card bytes there as its
-    /// reserve — in the fixture tier the header's budget plus them (the
-    /// header's is the target's alone, so the target keeps the card experts
-    /// its plain load holds), in the real tier the caller's lever as it
-    /// stands.
+    /// lever's rows, and the plan levers of that load at [`CTX`] a slot of
+    /// `slots` resident sequences: [`tier::plan_levers`] with the draft's
+    /// card bytes there as its reserve — in the fixture tier the header's
+    /// budget plus them (the header's is the target's alone, so the target
+    /// keeps the card experts its plain load holds), in the real tier the
+    /// caller's lever as it stands.
     fn drafted_plan_inputs(
         levers: &bloomery_levers::Levers,
         path: &Path,
         split: &Split,
         inputs: &PlanInputs,
+        slots: usize,
     ) -> Result<(MtpInputs, PlanLevers), GateError> {
         let (draft_path, from) = draft_file(levers.mtp_draft(), path);
         let draft = Split::open(&draft_path).map_err(|e| {
@@ -4960,8 +4984,34 @@ mod gate {
         })?;
         let rows = head_rows_of(levers.mtp_head_rows(), split, inputs.spec.vocab)?.rows;
         let mtp = MtpInputs::read(&draft, split, inputs, rows)?;
-        let plan_levers = tier::plan_levers(split, levers, mtp.card_bytes(u64::try_from(CTX)?)?)?;
+        let plan_levers = tier::plan_levers(
+            split,
+            levers,
+            mtp.card_bytes_of(u64::try_from(CTX)?, slots)?,
+        )?;
         Ok((mtp, plan_levers))
+    }
+
+    /// `cmd`'s `BLOOMERY_CARD_BUDGET` for a drafting load of `slots` resident
+    /// sequences ([`drafted_plan_inputs`]): the fixture tier's runner exports
+    /// the target's alone, beside which the draft's card bytes leave no slot
+    /// of [`CTX`]. The real tier sets none unless the caller's lever is set.
+    fn drafted_card_budget(
+        cmd: &mut Command,
+        levers: &bloomery_levers::Levers,
+        slots: usize,
+    ) -> Result<(), GateError> {
+        let path = ref_model_path()?;
+        let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
+        let inputs = PlanInputs::describe(&split)?;
+        let (_, plan_levers) = drafted_plan_inputs(levers, &path, &split, &inputs, slots)?;
+        if plan_levers.card_budget_bytes.is_set() {
+            cmd.env(
+                bloomery_levers::CARD_BUDGET,
+                plan_levers.card_budget_bytes.to_string(),
+            );
+        }
+        Ok(())
     }
 
     /// The drafted arm (the module header): the main server of
@@ -4988,16 +5038,7 @@ mod gate {
         cmd.env(bloomery_levers::DRAFT, "mtp")
             .env(bloomery_levers::RESIDENCY, "off")
             .env(bloomery_levers::MTP_WIDTH, "fixed");
-        // The drafting load's budget ([`drafted_plan_inputs`]): the fixture
-        // tier's runner exports the target's alone, beside which the draft's
-        // card bytes leave no slot of [`CTX`].
-        let path = ref_model_path()?;
-        let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
-        let inputs = PlanInputs::describe(&split)?;
-        let (_, plan_levers) = drafted_plan_inputs(levers, &path, &split, &inputs)?;
-        if let Some(budget) = plan_levers.card_budget_bytes {
-            cmd.env(bloomery_levers::CARD_BUDGET, budget.to_string());
-        }
+        drafted_card_budget(&mut cmd, levers, 1)?;
         let mut served = Served38::spawn_with(&SERVER_ARGS, dir, &mut cmd)?;
         println!("server pid {}", served.child.id());
         let addr = served.address(&err_log, POLLS, POLL)?;

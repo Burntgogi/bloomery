@@ -168,6 +168,9 @@ pub struct ToolCall {
 pub struct Scanned {
     pub content: String,
     pub calls: Vec<ToolCall>,
+    /// The reasoning the scan itself split out (Muse Spark's `to=self`
+    /// span; empty for the scans that leave the split to the think tags).
+    pub reasoning: String,
     /// The call the scan has opened and not closed, once its name is read
     /// ([`Progress`]).
     pub open: Option<Progress>,
@@ -464,6 +467,11 @@ pub enum ToolFormat {
     /// `<parameter=KEY>` blocks (Qwen3.6's and Qwen3.8's markup), its values
     /// framed as the template renders a call ([`Framing`]).
     QwenXml(Framing),
+    /// Muse Spark's recipient protocol: `to=<recipient><|message|>` messages
+    /// ended by `<|eom|>`/`<|eot|>`, a `to=<tool>` message's body one ATEM
+    /// calls block ([`crate::museatem`]); the `to=self` span is the
+    /// reasoning.
+    MuseSpark,
     /// None the server parses: a chat request that asks for tool calls is
     /// refused.
     Unparsed,
@@ -521,7 +529,13 @@ impl ToolFormat {
             qwenxml::FUNCTION_OPEN,
             qwenxml::PARAM_OPEN,
         ];
-        if let Some(spelling) = KvSpelling::of_template(source) {
+        // The recipient protocol's two markers, as llama.cpp's template
+        // detection reads them (`to=commentary` and `<|eom|>`): Muse
+        // Glimmer's template carries the end token but no commentary
+        // recipient.
+        if source.contains("to=commentary") && source.contains("<|eom|>") {
+            ToolFormat::MuseSpark
+        } else if let Some(spelling) = KvSpelling::of_template(source) {
             ToolFormat::KvMarkup(spelling)
         } else if qwen.iter().all(|tag| source.contains(tag)) {
             framing().map_or(ToolFormat::Unparsed, ToolFormat::QwenXml)
@@ -612,6 +626,9 @@ pub enum Tools {
     /// Qwen3-Coder's markup, its values framed as the template renders them,
     /// typing each parameter by the request's tool schemas.
     QwenXml(Framing, ParamKinds),
+    /// Muse Spark's recipient protocol ([`crate::museatem`]): its values
+    /// carry no schema (JSON when a value parses, else the raw text).
+    MuseSpark,
 }
 
 #[derive(Debug)]
@@ -620,6 +637,7 @@ enum Scan {
     Kv(KvScan),
     Hermes(HermesScan),
     Qwen(QwenScan),
+    Muse(crate::museatem::MuseScan),
 }
 
 /// A generation whose tool-call markup does not parse: which scan refused,
@@ -696,7 +714,11 @@ impl ChatParser {
         tools: Option<Tools>,
         tags: ThinkTags,
     ) -> Self {
-        let split = format == ReasoningFormat::Deepseek || tools.is_some();
+        // Muse Spark's scan splits its own reasoning (the `to=self` span),
+        // so it wants no think split; the others track the span so markup
+        // inside it is never parsed.
+        let split = (format == ReasoningFormat::Deepseek || tools.is_some())
+            && !matches!(tools, Some(Tools::MuseSpark));
         // Qwen3-Coder's call ends an open span without `</think>`, as
         // llama.cpp's parser for the markup reads it.
         let call_ends_span = matches!(tools, Some(Tools::QwenXml(..)));
@@ -719,6 +741,7 @@ impl ChatParser {
                 Tools::KvMarkup(spelling, types) => Scan::Kv(KvScan::new(spelling, types)),
                 Tools::Hermes => Scan::Hermes(HermesScan::default()),
                 Tools::QwenXml(framing, kinds) => Scan::Qwen(QwenScan::new(kinds, framing)),
+                Tools::MuseSpark => Scan::Muse(crate::museatem::MuseScan::default()),
             }),
             streamer: None,
             total: Message::default(),
@@ -815,6 +838,7 @@ impl ChatParser {
             Some(Scan::Kv(k)) => Some(k.push(&split.content)?),
             Some(Scan::Hermes(h)) => Some(h.push(&split.content)?),
             Some(Scan::Qwen(q)) => Some(q.push(&split.content)?),
+            Some(Scan::Muse(m)) => Some(m.push(&split.content)),
         };
         self.stream(scanned.as_ref())?;
         Ok(self.emit(split, scanned))
@@ -835,6 +859,7 @@ impl ChatParser {
             Some(Scan::Kv(k)) => Some(k.finish()?),
             Some(Scan::Hermes(h)) => Some(h.finish()?),
             Some(Scan::Qwen(q)) => Some(q.finish()?),
+            Some(Scan::Muse(m)) => Some(m.finish()),
         };
         self.stream(scanned.as_ref())?;
         Ok(self.emit(split, scanned))
@@ -856,13 +881,20 @@ impl ChatParser {
 
     fn emit(&mut self, split: Split, scanned: Option<Scanned>) -> Message {
         let mut d = Message::default();
+        // The scan's own reasoning split (Muse Spark's) follows the same
+        // route as the think span's, after it.
+        let own = scanned.as_ref().map_or("", |s| s.reasoning.as_str());
         match self.format {
-            ReasoningFormat::Deepseek => d.reasoning = split.reasoning,
+            ReasoningFormat::Deepseek => {
+                d.reasoning = split.reasoning;
+                d.reasoning.push_str(own);
+            }
             ReasoningFormat::None => {
                 d.content = split.reasoning;
                 if split.closed {
                     d.content.push_str(self.tags.close);
                 }
+                d.content.push_str(own);
             }
         }
         match scanned {
@@ -886,6 +918,7 @@ impl ToolFormat {
             ToolFormat::QwenXml(framing) => qwenxml::call_parts(framing, funs),
             ToolFormat::KvMarkup(spelling) => glmxml::call_parts(spelling, funs),
             ToolFormat::Dsml(spelling) => call_parts(spelling, funs),
+            ToolFormat::MuseSpark => crate::museatem::call_parts(funs),
             ToolFormat::Unparsed => Err(Refusal {
                 message: "the chat template's tool-call markup has no inverse in this server: \
                           send the request without tool_choice \"required\" or a named function"

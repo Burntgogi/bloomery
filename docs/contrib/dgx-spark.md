@@ -79,7 +79,8 @@ Qwen3-30B-A3B `Q4_K_M` 18.6 GB, Qwen3.6-35B-A3B `Q4_K_M` 21.2 GB; then Qwen3.8 `
 `UD-Q2_K_XL` 101.3 GiB (the size chosen "to fit a DGX Spark", https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan-ledger.md#L359) if the first `MemAvailable` reading
 allows. NVIDIA's own `nvidia/Qwen3.8-Flash-Next-NVFP4` checkpoint (132.7 GB on disk) serves from its folder as
 downloaded, `bloomery-serve -m <folder>`, with every routed expert on the GB10 and the PLE table read from the folder
-on the NVMe tier (`docs/serving.md`, the seats). A 64 GB Spark (section 3; announced, not yet shipping) holds only the
+on the NVMe tier (`docs/serving.md`, the seats). Its gate, `gate-gpu-qwen4exp-nvfp4`, runs only on such a card: set
+`BLOOMERY_CARD_ALL_EXPERTS=1` there; a smaller card defers it by name. A 64 GB Spark (section 3; announced, not yet shipping) holds only the
 first three.
 
 ## 3. The machine

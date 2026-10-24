@@ -235,11 +235,29 @@ pub fn slots_given(
     Ok((slots, from))
 }
 
+/// A serving seat's `--place` word, the one reader of the placement grammar:
+/// [`Place::parse`](crate::generate::Place::parse) (`a`, `gate`, `bp`, `tp`, or a card
+/// list `<stage>[+<tier>…]` of card names and device ordinals). `serves` is the
+/// `(body, tiers)` of a body that serves a fixed count of expert tier cards: a
+/// list of more is refused by name here, before any plan. `None` leaves the
+/// count to the seat's plan, which refuses a tier its body cannot serve.
+pub fn place_word(
+    v: &str,
+    serves: Option<(&str, usize)>,
+) -> Result<crate::generate::Place, GateError> {
+    let place = crate::generate::Place::parse(v)?;
+    if let Some((body, tiers)) = serves {
+        place.serves(body, tiers)?;
+    }
+    Ok(place)
+}
+
 /// The flags every serving seat takes beside its own: the listener (`--host`,
 /// `--port`, `--queue-depth`), the keys (`--api-key`, `--api-key-file`), the
 /// context (`--ctx`, under every spelling `serve::flag::CTX` lists), the
-/// placement word (`--place`), the alias, the chat template file, `--parallel`
-/// (and `-np`) and `--plan`.
+/// placement word (`--place`, read by [`place_word`]), the alias, the chat
+/// template file, the slot actions' directory (`--slot-save-path`),
+/// `--parallel` (and `-np`) and `--plan`.
 pub struct SeatFlags {
     pub host: String,
     pub port: u16,
@@ -255,6 +273,9 @@ pub struct SeatFlags {
     /// `--api-key`/`--api-key-file`: the keys every request is checked
     /// against ([`serve::flag::ApiKeys`]).
     pub api_keys: serve::flag::ApiKeys,
+    /// `--slot-save-path`: the directory the slot actions answer from; `None`
+    /// refuses every one.
+    pub slot_save_path: Option<PathBuf>,
 }
 
 impl SeatFlags {
@@ -278,6 +299,7 @@ impl SeatFlags {
             parallel: None,
             queue_depth: None,
             api_keys: serve::flag::ApiKeys::default(),
+            slot_save_path: None,
         };
         let mut it = args.iter().map(String::as_str);
         while let Some(flag) = it.next() {
@@ -295,11 +317,12 @@ impl SeatFlags {
                 "--host" => a.host = v.to_owned(),
                 "--port" => a.port = serve::flag::number(flag, v)?,
                 f if serve::flag::CTX.contains(&f) => a.ctx = Some(serve::flag::number(flag, v)?),
-                "--place" => a.place = Some(crate::generate::Place::parse(v)?),
+                "--place" => a.place = Some(place_word(v, None)?),
                 "--alias" => a.alias = Some(v.to_owned()),
                 TemplateFile::FLAG => a.template_file.set(v),
                 "--parallel" | "-np" => a.parallel = Some(serve::flag::number(flag, v)?),
                 "--queue-depth" => a.queue_depth = Some(serve::flag::number(flag, v)?),
+                "--slot-save-path" => a.slot_save_path = Some(PathBuf::from(v)),
                 f if serve::flag::KEYS.contains(&f) => a.api_keys.add(f, v)?,
                 other => {
                     if !own(other, v)? {
@@ -318,9 +341,9 @@ impl SeatFlags {
     }
 
     /// [`bind_server`] over `engine` with these flags: the alias the flag
-    /// gave or `chat`'s, `chat`'s template, no request preparation, no slot
-    /// file path, `slots` slots the seat made at its open, the server
-    /// settings from `levers`, and the side model beside it.
+    /// gave or `chat`'s, `chat`'s template, no request preparation, the slot
+    /// file path the flag gave, `slots` slots the seat made at its open, the
+    /// server settings from `levers`, and the side model beside it.
     pub fn bind(
         self,
         engine: SeatEngine,
@@ -336,6 +359,7 @@ impl SeatFlags {
             alias,
             api_keys,
             queue_depth,
+            slot_save_path,
             ..
         } = self;
         bind_server(
@@ -347,7 +371,7 @@ impl SeatFlags {
                 path,
                 template: chat.template,
                 preparation: None,
-                slot_save_path: None,
+                slot_save_path,
                 api_keys,
                 parallel: slots,
                 queue_depth,
@@ -674,7 +698,7 @@ impl CacheRam {
     /// The `flag`'s value (`--cache-ram`, `--park-ram`), `mib` MiB, in
     /// bytes; refused by name past u64.
     pub fn parse_mib(flag: &str, mib: &str) -> Result<u64, GateError> {
-        let n: u64 = mib.parse()?;
+        let n: u64 = serve::flag::number(flag, mib)?;
         Ok(n.checked_mul(1 << 20)
             .ok_or_else(|| format!("{flag} {n} MiB passes u64 bytes"))?)
     }
@@ -3603,6 +3627,81 @@ mod tests {
             i128::from(available) - i128::from(terms) - i128::from(2 * slot)
         );
         assert_eq!(pool.mem_left, i128::from(available) - i128::from(two));
+    }
+
+    /// The nemotron, raon1 and tiered seats read `--place` through
+    /// [`SeatFlags`], which reads it as [`place_word`] does: every word
+    /// `Place::parse` takes parses to the placement it names, a list of tier
+    /// cards stays the seat's plan to refuse (`None`), a body that serves a
+    /// count refuses more by name, and a word no card or ordinal spells is
+    /// refused.
+    #[test]
+    fn the_seats_read_the_place_word_as_one_grammar() {
+        use super::{SeatFlags, place_word};
+        use model::placement::workstation::{A6000, RTX_3090};
+        let usage = "usage";
+        let seat = |word: &str| {
+            let args = ["--place".to_owned(), word.to_owned()];
+            SeatFlags::parse(&args, usage, |_, _| Ok(false))
+        };
+        for (word, name, cards) in [
+            ("a", "a", vec![A6000.name]),
+            ("gate", "gate", vec![RTX_3090.name]),
+            ("bp", "bp", vec![A6000.name, RTX_3090.name]),
+            ("a6000+3090", "bp", vec![A6000.name, RTX_3090.name]),
+            ("3090+a6000", "3090+a6000", vec![RTX_3090.name, A6000.name]),
+            ("cuda1+0", "cuda1+0", vec!["cuda1", "cuda0"]),
+            ("tp", "tp", vec![A6000.name]),
+        ] {
+            let p = place_word(word, None).unwrap_or_else(|e| panic!("{word}: {e}"));
+            assert_eq!((p.name(), p.cards()), (name, cards), "{word}");
+            let flags = seat(word).unwrap_or_else(|e| panic!("{word}: {e}"));
+            assert_eq!(flags.place, Some(p), "{word}");
+        }
+        let many = "cuda0+cuda1+cuda2";
+        assert_eq!(place_word(many, None).expect(many).tier_cards().len(), 2);
+        assert_eq!(
+            seat(many).expect(many).place.map(|p| p.tier_cards().len()),
+            Some(2)
+        );
+        place_word("bp", Some(("body", 1))).expect("one tier card");
+        let e = place_word(many, Some(("body", 1)))
+            .expect_err(many)
+            .to_string();
+        assert_eq!(
+            e,
+            "--place cuda0+cuda1+cuda2: 2 expert tier cards, and the body body serves 1 at most"
+        );
+        for refused in [place_word("b2", None).map(|_| ()), seat("b2").map(|_| ())] {
+            let e = refused.expect_err("b2").to_string();
+            assert!(e.starts_with("--place is a, gate, bp"), "{e}");
+        }
+    }
+
+    /// The seats that read their flags through [`SeatFlags`] take `--slot-save-path` as one flag:
+    /// unset it is `None`, which refuses every slot action, and given it is the directory; with no
+    /// value the flag is refused by name.
+    #[test]
+    fn the_seats_take_the_slot_save_path_through_the_common_flags() {
+        use super::SeatFlags;
+        let parse = |args: &[&str]| {
+            let args: Vec<String> = args.iter().map(|a| (*a).to_owned()).collect();
+            SeatFlags::parse(&args, "usage", |_, _| Ok(false))
+        };
+        assert_eq!(parse(&[]).expect("unset").slot_save_path, None);
+        assert_eq!(
+            parse(&["--slot-save-path", "/slots"])
+                .expect("given")
+                .slot_save_path,
+            Some(std::path::PathBuf::from("/slots"))
+        );
+        let Err(e) = parse(&["--slot-save-path"]) else {
+            panic!("a --slot-save-path with no value was taken");
+        };
+        assert!(
+            e.to_string().starts_with("--slot-save-path needs a value"),
+            "{e}"
+        );
     }
 
     mod media {

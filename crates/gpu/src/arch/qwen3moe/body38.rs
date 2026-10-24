@@ -141,6 +141,7 @@ use crate::checkpoint::saved::{
 use crate::checkpoint::staging::NoRoom;
 use crate::checkpoint::{self, Checkpoints};
 use crate::draft::{DraftFeed, DraftHead, Feed, Held, Hidden, WalkMode};
+use crate::folder::{Folder, Model};
 use crate::head::{Head, HeadNorm};
 use crate::host::nvtier::NvTier;
 use crate::host::prompt_stream::PromptStream;
@@ -172,7 +173,7 @@ use engram::{Hash, RowTables};
 use gguf::quant::{E4m3Rows, Nvfp4Rows, dequant_row};
 use gguf::{GgmlType, Split, TensorInfo};
 use model::arch::Arch;
-use model::part::{Source, StoredRows};
+use model::part::StoredRows;
 use model::placement::{Device, Plan};
 use runtime::seqstate::{Kept, Price, Take};
 use runtime::swaprule::KeptRows;
@@ -1299,38 +1300,8 @@ pub struct Body38 {
 }
 
 /// The model a Qwen3.8 load reads ([`Body38::open_placed`] and its siblings): a GGUF split, or a
-/// checkpoint folder ([`Folder38`]).
-pub enum Model38 {
-    Split(Split),
-    Folder(Folder38),
-}
-
-impl Model38 {
-    /// The header the load plans by: the split's first shard's, or the folder's
-    /// (`gguf::Split::header_only`).
-    pub fn header(&self) -> &Split {
-        match self {
-            Model38::Split(file) => file,
-            Model38::Folder(f) => &f.header,
-        }
-    }
-}
-
-impl From<Split> for Model38 {
-    fn from(file: Split) -> Model38 {
-        Model38::Split(file)
-    }
-}
-
-impl From<Folder38> for Model38 {
-    fn from(folder: Folder38) -> Model38 {
-        Model38::Folder(folder)
-    }
-}
-
-/// The card's tensors of a plan from a part source ([`crate::parts::load_placed`]).
-type CardParts =
-    Box<dyn Fn(&CudaStream, &Plan<'_>, usize, bool) -> Result<Weights, GpuError> + Send>;
+/// checkpoint folder ([`Folder38`]). A folder carries the PLE table's rows beside its parts.
+pub type Model38 = Model<Option<StoredRows>>;
 
 /// A checkpoint folder as a Qwen3.8 load reads it: its header (`gguf::Split::header_only`, the
 /// header its plan was made from), its card tensors through its part source, and the PLE
@@ -1339,45 +1310,7 @@ type CardParts =
 /// tier ([`crate::parts::OnCard`]): no host set, so no residency machine. The part source also
 /// reads the folder's MTP tensors when a draft is planned. Each part's pages leave the cache once it is
 /// staged under the host config's `card_dontneed`, as a split's card segments do.
-pub struct Folder38 {
-    header: Split,
-    parts: CardParts,
-    ple: Option<StoredRows>,
-}
-
-impl Folder38 {
-    /// The folder of header `header`, its card tensors read from `source` and its PLE rows at
-    /// `ple`.
-    pub fn new<S: Source + Send + 'static>(
-        header: Split,
-        source: S,
-        ple: Option<StoredRows>,
-    ) -> Folder38 {
-        Folder38 {
-            header,
-            parts: Box::new(move |stream, plan, card, release| {
-                let selected = model::part::Filtered {
-                    source: &source,
-                    keep: |name: &str| plan.model.tensors.iter().any(|t| t.name == name),
-                };
-                crate::parts::load_placed(stream, &selected, plan, card, release)
-            }),
-            ple,
-        }
-    }
-}
-
-/// A folder's load under `residency`, refused unless it runs no residency machine.
-fn refuse_folder(residency: Residency) -> Result<(), GpuError> {
-    if residency != Residency::Off {
-        return Err(GpuError::shape(
-            WHAT,
-            "a checkpoint folder's load runs under BLOOMERY_RESIDENCY=off: a residency machine \
-             moves experts through a host set, which the folder's load does not hold",
-        ));
-    }
-    Ok(())
-}
+pub type Folder38 = Folder<Option<StoredRows>>;
 
 impl Body38 {
     /// Card `card` of `plan`, which `inputs` made, resident: the plan's
@@ -1404,8 +1337,8 @@ impl Body38 {
     /// the rows rounded once and the MXFP8 sites their rows' MXFP8 form
     /// ([`WideForms`]), else each tile converts the f32 rows.
     /// `file` is a GGUF split or a checkpoint folder ([`Model38`]); a
-    /// folder's load is refused by name under a residency machine or with an
-    /// MTP draft ([`Folder38`]).
+    /// folder whose header locates no file is refused by name under a
+    /// residency machine ([`Model::into_origin`]).
     pub fn open_placed(
         file: impl Into<Model38>,
         plan: &Plan<'_>,
@@ -1617,22 +1550,17 @@ impl Body38 {
         if slots == 0 {
             return Err(GpuError::shape(WHAT, "a load of 0 resident sequence slots"));
         }
-        let (file, folder) = match file.into() {
-            Model38::Split(file) => (file, None),
-            Model38::Folder(f) => (f.header, Some((f.parts, f.ple))),
+        let (file, origin) = file.into().into_origin(residency)?;
+        // A draft in the folder's own MTP layer reads its tensors through the folder's parts.
+        let draft_parts = match origin.bytes() {
+            CardBytes::Parts(parts) => mtp
+                .filter(|(draft, _, _)| draft.shard_path(0) == file.shard_path(0))
+                .map(|_| parts),
+            CardBytes::File => None,
         };
-        if folder.is_some() {
-            refuse_folder(residency)?;
-        }
-        let draft_parts = folder.as_ref().and_then(|(parts, _)| {
-            mtp.filter(|(draft, _, _)| draft.shard_path(0) == file.shard_path(0))
-                .map(|_| parts.as_ref() as &crate::model::PartsLoad<'_>)
-        });
-        let (bytes, stored) = match &folder {
-            Some((parts, ple)) => (CardBytes::Parts(parts.as_ref()), ple.as_ref()),
-            None => (CardBytes::File, None),
-        };
-        refuse_tier_count(WHAT, plan.machine.tiers.len())?;
+        let bytes = origin.bytes();
+        let stored = origin.extra().and_then(Option::as_ref);
+        refuse_tier_count(WHAT, plan.machine.expert_tiers().count())?;
         let refused: Vec<String> = inputs
             .unimplemented()
             .into_iter()
@@ -2391,6 +2319,7 @@ impl Body38 {
             } else {
                 XSTREAM_COSTS_UNFITTED
             };
+            // The plan reserves no ring: it takes what the card's margin leaves past the keep-free.
             let cfg = XCfg::new(costs, geo::EXPERTS, geo::N_USED, DEADLINE, None);
             let half = self
                 .hybrid
@@ -6039,9 +5968,8 @@ const _: () = assert!(VERIFY_ROWS <= PASS_ROWS);
 #[cfg(test)]
 mod tests {
     use super::{
-        Arc, Device, E4m3Rows, GgmlType, GpuError, Nvfp4Rows, PleHost, Residency, Split,
-        checkpoint_budget38, checkpoint_bytes, checkpoint_lens, checkpoint_price38, dequant_row,
-        ple_takes, refuse_folder,
+        Arc, Device, E4m3Rows, GgmlType, GpuError, Nvfp4Rows, PleHost, Split, checkpoint_budget38,
+        checkpoint_bytes, checkpoint_lens, checkpoint_price38, dequant_row, ple_takes,
     };
     use engram::hash::{EosWindow, Window};
 
@@ -6235,18 +6163,6 @@ mod tests {
                 "{e}"
             );
         }
-    }
-
-    // PIN(2026-10-22): folder drafts use the placed MTP load; only residency is refused here.
-    #[test]
-    fn a_folder_load_refuses_residency() {
-        assert!(refuse_folder(Residency::Off).is_ok());
-        let mid = Residency::Mid {
-            pinned: 1,
-            spares: 1,
-        };
-        let e = refuse_folder(mid).unwrap_err().to_string();
-        assert!(e.contains("BLOOMERY_RESIDENCY=off"), "{e}");
     }
 
     /// A checkpoint folder's F8 table, its rows in runs of two files where the folder stores

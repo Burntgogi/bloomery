@@ -1,6 +1,7 @@
 //! GPU gate for the DSpark loop's target side: the feature tap
 //! (`body::attach_features`, `Body::read_features`) on the gate placement
-//! (`crate::gate_card::plan_gate`), its layers the draft file's `target_layers`
+//! (`crate::gate_card::plan_gate`) with the draft's reserve on its card, as
+//! the draft's own run plans it, its layers the draft file's `target_layers`
 //! (`$BLOOMERY_DSPARK_MODEL`, header only: no draft is loaded here).
 //!
 //! - `--structure`: the step and the pair pass captured with the tap hold
@@ -92,11 +93,17 @@ mod gate {
     use model::arch::deepseek41::hparams::Hparams;
     use model::arch::dspark::SCRATCH_ALLOWANCE;
     use model::placement::workstation;
+    use model::placement::{Device, Machine};
     use runtime::swaprule::KeptRows;
+    use std::sync::OnceLock;
 
     use crate::{dspark, finite};
 
     const NAME: &str = "gate_deepseek41_dsloop";
+    /// The draft's resident bytes the gate card's plan sets aside
+    /// ([`plan_gate_with_draft`]), fixed once from the draft's header before
+    /// the load.
+    static DRAFT_BYTES: OnceLock<u64> = OnceLock::new();
     /// The step captured with the tl37 draft's tap on the real file, as a literal: the plain
     /// step's 1179 nodes (1169 before the candidate mask's 2 + 4 × 2 = 10 launches, 1167 before the
     /// engram rows' wait and copy nodes) and one `ds41_hc_mean` per tapped layer. The gate's pin
@@ -229,18 +236,23 @@ mod gate {
         ])?;
         crate::gate_card::init()?;
         let mut cfg = body::OpenCfg::from_levers(&levers)?;
-        let (_, dhp) = dspark::draft_hparams()?;
+        let (draft, dhp) = dspark::draft_hparams()?;
         let layers = dhp.target_layers.clone();
         let path = crate::ds41_tier::model_path()?;
         let split = Split::open(&path).map_err(|e| format!("open {path}: {e}"))?;
         let hp = Hparams::read(&split)?;
-        // The draft is read for its header only, so the plan reserves nothing for it.
-        cfg.place = tier::plan_levers(&split, &levers, 0)?;
+        // The draft's run holds its bytes on the gate card, so the plan sets them aside there
+        // before any expert; the fixture tier's budget carries them ([`tier::plan_levers`]).
+        let reserve = dspark::draft_bytes(&draft, std::path::Path::new(&path))?;
+        DRAFT_BYTES
+            .set(reserve)
+            .map_err(|_| "gate_deepseek41_dsloop: the draft's reserve was fixed twice")?;
+        cfg.place = tier::plan_levers(&split, &levers, reserve)?;
         premises(&hp, &layers)?;
         let file = Split::open(&path).map_err(|e| format!("open {path}: {e}"))?;
         let mut m = body::open(
             file,
-            crate::gate_card::plan_gate,
+            plan_gate_with_draft,
             usize::try_from(workstation::CTX_MAX)?,
             &cfg,
         )?;
@@ -276,6 +288,19 @@ mod gate {
         }
         println!("PASSED: {NAME}");
         Ok(())
+    }
+
+    /// The gate placement ([`crate::gate_card::plan_gate`]) with the draft's
+    /// [`DRAFT_BYTES`] reserved on its one card, a `fn` for `body::open`.
+    fn plan_gate_with_draft(layers: usize) -> Machine {
+        let bytes = *DRAFT_BYTES
+            .get()
+            .expect("the draft's reserve is fixed before the load");
+        let mut machine = crate::gate_card::plan_gate(layers);
+        machine
+            .reserve(workstation::draft_reserve(Device::Card(0), bytes))
+            .expect("the gate plan's card is card 0");
+        machine
     }
 
     /// The run's own shape against the file: the two checked positions straddle the window ring's

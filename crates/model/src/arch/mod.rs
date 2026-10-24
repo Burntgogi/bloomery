@@ -26,6 +26,7 @@ pub mod hybrid;
 pub mod kda;
 pub mod mimo2;
 pub mod minimaxm3;
+pub mod musespark;
 pub mod names;
 pub mod nemotron_h;
 pub mod nemotron_h_moe;
@@ -151,7 +152,8 @@ fn architecture_is(is: &str) -> PlacementError {
 }
 
 /// An architecture a file's `general.architecture` names, when this crate has
-/// a reader or a program for it. Flint has a reader and no executable program.
+/// a reader or a program for it. Flint has a reader and no executable program;
+/// `muse-spark` has a reader and no program.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Arch {
     Deepseek2,
@@ -168,6 +170,7 @@ pub enum Arch {
     GemmaEmbedding,
     GemmaEmbedding2,
     Flint,
+    MuseSpark,
 }
 
 impl Arch {
@@ -202,6 +205,7 @@ impl Arch {
             GEMMA_EMBEDDING => Ok(Arch::GemmaEmbedding),
             GEMMA_EMBEDDING2 => Ok(Arch::GemmaEmbedding2),
             "flint" => Ok(Arch::Flint),
+            "muse-spark" => Ok(Arch::MuseSpark),
             other => Err(ModelError::UnknownArchitecture(other.to_string())),
         }
     }
@@ -229,6 +233,7 @@ impl Arch {
             Arch::GemmaEmbedding => GEMMA_EMBEDDING,
             Arch::GemmaEmbedding2 => GEMMA_EMBEDDING2,
             Arch::Flint => "flint",
+            Arch::MuseSpark => "muse-spark",
         }
     }
 }
@@ -1170,6 +1175,7 @@ mod tests {
             Arch::GemmaEmbedding,
             Arch::GemmaEmbedding2,
             Arch::Flint,
+            Arch::MuseSpark,
         ] {
             assert_eq!(Arch::from_name(a.name()).unwrap(), a);
         }

@@ -69,6 +69,8 @@ pub fn spec_of(hp: &Hparams, chat: models::ChatSpec) -> Result<ModelSpec, Placem
                         top_k: spec_u32("expert_used_count", x.top_k)?,
                         expert_ff: spec_u32("expert_feed_forward_length", x.ff)?,
                         latent,
+                        pre_exp_norm: false,
+                        post_exp_norm: None,
                         act: Act::ReluSqr,
                         router,
                         shared: Some(shared),
@@ -94,6 +96,7 @@ pub fn spec_of(hp: &Hparams, chat: models::ChatSpec) -> Result<ModelSpec, Placem
         hc: None,
         engram: None,
         encoder: None,
+        logit_epilogue: None,
         chat,
     })
 }
@@ -594,7 +597,9 @@ mod tests {
             .plan(&machine, 4, &levers)
             .expect("the gate machine holds every expert");
         assert_eq!(whole.host.experts, 0);
-        let budget = half_expert_budget(&whole);
+        // The pass's reserve comes out of the card first: the budget keeps half the experts' bytes
+        // beside it, as this clause means.
+        let budget = half_expert_budget(&whole) + inputs.prompt_reserve;
         let mut small = machine;
         small.cards[0].usable_bytes = budget;
         match inputs.plan(&small, 4, &levers) {
@@ -621,6 +626,41 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         super::super::place::read(&split)
             .unwrap_or_else(|e| panic!("the fixture layout is refused: {e}"))
+    }
+
+    /// The plan inputs carry the prompt pass's reserve, the formula's figure at the file's headers
+    /// (85,859,372 B [derived] at the fixture layout's widths and 512 rows: 256 wide hidden, inner,
+    /// latent and shared expert, 32 query heads over 2 of 128, 9 of the 240 and 496 experts of 256
+    /// and 512, a router of 496 at most), and the plan keeps it out of the expert budget: on a card
+    /// that holds half the experts beside it the reserved plan holds fewer than the same inputs
+    /// with none. Mutant: `describe` leaves the reserve out, or the plan ignores it.
+    #[test]
+    fn the_plan_inputs_reserve_the_prompt_pass() {
+        use crate::placement::{PlanLevers, workstation};
+        let inputs = fixture_inputs("nhm-reserve");
+        assert_eq!(inputs.prompt_reserve, 85_859_372);
+        let machine = workstation::plan_gate(inputs.model.layers);
+        let levers = PlanLevers::default();
+        let whole = inputs
+            .plan(&machine, 4, &levers)
+            .expect("the gate machine holds every expert");
+        let budget = half_expert_budget(&whole) + inputs.prompt_reserve;
+        let mut small = machine;
+        small.cards[0].usable_bytes = budget;
+        let mut free = inputs.clone();
+        free.prompt_reserve = 0;
+        let kept = inputs
+            .plan_with(&small, 4, &levers, Experts::Placed)
+            .unwrap_or_else(|e| panic!("a card that holds some experts is refused: {e}"));
+        let unreserved = free
+            .plan_with(&small, 4, &levers, Experts::Placed)
+            .unwrap_or_else(|e| panic!("a card that holds some experts is refused: {e}"));
+        assert!(
+            kept.cards[0].experts < unreserved.cards[0].experts,
+            "{} experts with the reserve, {} without",
+            kept.cards[0].experts,
+            unreserved.cards[0].experts
+        );
     }
 
     /// A card that holds every routed expert plans [`Experts::Placed`] as it
@@ -662,7 +702,9 @@ mod tests {
         let whole = inputs
             .plan(&machine, 4, &levers)
             .expect("the gate machine holds every expert");
-        let budget = half_expert_budget(&whole);
+        // The pass's reserve comes out of the card first: the budget keeps half the experts' bytes
+        // beside it, as this clause means.
+        let budget = half_expert_budget(&whole) + inputs.prompt_reserve;
         let mut small = machine;
         small.cards[0].usable_bytes = budget;
         let plan = inputs

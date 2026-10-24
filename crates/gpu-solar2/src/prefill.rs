@@ -35,7 +35,7 @@ use bloomery_gpu::host::run::HostRun;
 use bloomery_gpu::hybrid::Hybrid;
 use bloomery_gpu::linear::mixer_kda::{self, KdaBufs, KdaDims, KdaIn, KdaProj, KdaState, KdaVecs};
 use bloomery_gpu::model::GpuModel;
-use bloomery_gpu::site::{WideActs, WideKernels};
+use bloomery_gpu::site::{WideActs, WideForms, WideKernels};
 use bloomery_gpu::weights::Weights;
 use bloomery_gpu::{Gpu, GpuError, Pitched, dtod_2d};
 use bloomery_gpu_deepseek41::prompt_walk::{self, Batch, BatchAttention, BatchBufs, UnitRows};
@@ -173,16 +173,16 @@ impl Extra {
             )));
         }
         let stream = gpu.stream();
-        let mut arms: Vec<(usize, (bool, bool))> = Vec::new();
+        let mut arms: Vec<(usize, WideForms)> = Vec::new();
         for s in stores.iter().flat_map(Store::sites) {
             let k = s.k();
             if k == d.embd {
                 continue;
             }
-            let (q128, q32) = WideActs::wants(s.ty());
+            let want = WideActs::wants(s.ty()).without_f32();
             match arms.iter_mut().find(|a| a.0 == k) {
-                Some(a) => a.1 = (a.1.0 | q128, a.1.1 | q32),
-                None => arms.push((k, (q128, q32))),
+                Some(a) => a.1 = a.1.union(want),
+                None => arms.push((k, want)),
             }
         }
         let arms = arms

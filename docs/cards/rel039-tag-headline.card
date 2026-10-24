@@ -1,0 +1,10 @@
+kind: baseline
+question: what are 0.3.9's headline pp512, pp4096 and decode for Muse Spark Open and MiniMax-M3.1-Flash on the tagged tree, at the serving defaults on both cards?
+term: decode tok/s of Muse Spark Open UD-IQ2_XXS at D=512, the tagged tree's bloomery-serve, RTX A6000 + RTX 3090, --place unset (bp)
+unit: tok/s
+predict: 15.8..18.5
+condition: one lease per model; tools/ref/depth-serve.sh, arms D=512 and D=4096, 2 rounds, DEPTH_SERVE_CTX 4300, N 128, each round a fresh server with both cards visible and every lever unset
+reason: [measured] muse039's A/B gave 16.95 at D=512 (4 rounds, sd 0.36 %); the IQ2_XXS signed-grid table's A/B and main's rebased commits (no Muse kernel among them) add at most its own band on top; M3.1's row is read beside speed039's 21.88 at 512 and 19.49 at 4096 (2 rounds).
+decide-in: write the four numbers per model into the release notes' table with these conditions
+decide-below: under 15.8: read the plan, residency and xstream lines and the witness block before writing a number; compare with muse039's arm in the same window
+decide-above: beyond 18.5: read the witness block and the plan line before writing a number

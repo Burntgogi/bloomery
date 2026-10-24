@@ -69,7 +69,7 @@
 #                1.5/1.5, the witness's two-card lines; rc 0.
 #   twocard-arms 6@place=gate, code:4@place=gate, prose:4@place=a,BLOOMERY_DRAFT=dspark and ik:6 each
 #                refused by name before anything runs (rc 64): the gate plan loads the 3090 alone, an a
-#                arm's DSpark draft would load the 3090, ik has no two-card arm.
+#                arm's DSpark draft would seat on the 3090 as a holder, ik has no two-card arm.
 #   twocard-place  BLOOMERY_GEN_PLACE=bp, prose:4 prose:4@place=a lcpp:6, one round: each placement its own
 #                load (--place bp, --place a), its row `place <p>` and `A6000+3090`, the a arm's load record
 #                the A6000 alone, the ratio prose/prose@place=a, the [config] placements line; rc 0.
@@ -808,7 +808,7 @@ twocard_refused() {
 # refuses is the gate plan, a 3090-only row in the A6000+3090 table).
 twocard_refused twocard-arms "^depth-ds41.sh: arm '6@place=gate': place=gate is the gate plan, which loads the 3090 alone; the two-card mode times a \(plan \(a\) on the A6000, the 3090 idle\) or bp \(plan \(b′\), both cards\)$" lcpp:6 6@place=gate
 twocard_refused twocard-arms-code "^depth-ds41.sh: arm 'code:4@place=gate': place=gate is the gate plan, which loads the 3090 alone; " lcpp:6 code:4@place=gate
-twocard_refused twocard-arms-dspark "^depth-ds41.sh: arm 'prose:4@place=a,BLOOMERY_DRAFT=dspark': BLOOMERY_DRAFT=dspark puts the draft on the 3090, and in the two-card mode an a arm keeps the 3090 idle: run the draft under place=bp$" prose:4@place=a,BLOOMERY_DRAFT=dspark
+twocard_refused twocard-arms-dspark "^depth-ds41.sh: arm 'prose:4@place=a,BLOOMERY_DRAFT=dspark': BLOOMERY_DRAFT=dspark seats the draft on the 3090 as a holder, and in the two-card mode an a arm keeps the 3090 idle: run the draft under place=bp$" prose:4@place=a,BLOOMERY_DRAFT=dspark
 twocard_refused twocard-arms-ik "^depth-ds41.sh: arm 'ik:6': the two-card table.s reference is mainline llama.cpp .*; ik has no two-card arm$" lcpp:6 ik:6
 
 # A per-arm placement (red on the runner before it, which passes `place=` to the binary as a variable: the

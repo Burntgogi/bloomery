@@ -65,6 +65,7 @@ generate_ds41 ds41_expert_gate_up_tiles 680 144
 generate_ds41 ds41_ffn_card_acc 0 0
 generate_ds41 ds41_ffn_card_acc_10 0 0
 generate_ds41 ds41_ffn_card_acc_4 0 0
+generate_ds41 ds41_ffn_card_acc_4_tier 0 0
 generate_ds41 ds41_ffn_card_acc_8 0 0
 generate_ds41 ds41_ffn_card_acc_8_tier 0 0
 generate_ds41 ds41_ffn_card_acc_9 0 0
@@ -75,6 +76,7 @@ generate_ds41 ds41_ffn_handoff_10_cols 0 0
 generate_ds41 ds41_ffn_handoff_10_cols_tier 0 0
 generate_ds41 ds41_ffn_handoff_4 0 0
 generate_ds41 ds41_ffn_handoff_8 0 0
+generate_ds41 ds41_ffn_handoff_4_tier 0 0
 generate_ds41 ds41_ffn_handoff_8_tier 0 0
 generate_ds41 ds41_ffn_handoff_9 0 0
 generate_ds41 ds41_ffn_handoff_tier 0 0
@@ -448,6 +450,29 @@ generate_ds41 swiglu_quant32_sel 0 0
 generate_ds41 tier_fault_copy 0 0
 generate_ds41 touch 0 0
 generate_ds41 weighted_sum 0 0
+# PIN(2026-10-24): 0.3.9's generate_ds41 entries carry the cc 8.6 scan's values; no cc 12.1 scan has run on them yet.
+generate_ds41   gqa_flash_merge_h128_swa                 0           0
+generate_ds41   gqa_flash_seg_h128_swa                   0           0
+generate_ds41   gqa_prefill_flash_512_p4_lower           0           0
+generate_ds41   qk_rms_append                            0           0
+generate_ds41   qwen3moe_combine_tier                    0           0
+generate_ds41   qwen3moe_combine_tier_sh                 0           0
+generate_ds41   sigmoid_256_6_router                     0           0
+generate_ds41   sigmoid_256_6_router_pick                0           0
+generate_ds41   mul_rows                                 0           0
+generate_ds41   mix_rows                                 0           0
+generate_ds41   scale_rows                               0           0
+generate_ds41   gain_rms_norm                            0           0
+generate_ds41   sigmoid_16_8_router                      0           0
+generate_ds41   sigmoid_16_8_router_pick                 0           0
+generate_ds41   gqa_flash_merge_64                       0           0
+generate_ds41   gqa_flash_seg_64                         0           0
+generate_ds41   gqa_flash_seg_mma_64                     0           0
+generate_ds41   iq2_xxs_gate_up_sel                      0           0
+generate_ds41   sigmoid_256_8_router                     0           0
+generate_ds41   sigmoid_256_8_router_pick                0           0
+generate_ds41   softcap_rows                             0           0
+generate_ds41   swiglu_rule_rows                         0           0
 gate_qwen3vl_tower vis_add_f32 0 0
 gate_qwen3vl_tower vis_attn 0 0
 gate_qwen3vl_tower vis_attn_group 0 0

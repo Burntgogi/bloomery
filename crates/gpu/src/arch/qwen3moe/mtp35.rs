@@ -15,10 +15,13 @@
 //!
 //! `h` is the target's post-`output_norm` row of the position before `t`. The
 //! step's input join is the crate's `mtp_input` kernel at one stream; the
-//! layer is the chain's walk of one layer (`walk::layer`) over the family's
-//! ops ([`Program`](super::program::Program)) with a plan, weights and store
-//! of the draft's own and an arena of one row, so attention, the router, the
-//! routed and the shared experts are the trunk's launches; the
+//! join's projection runs through the trunk's site owner
+//! ([`dispatch::site_gemv`](super::dispatch::site_gemv)) at `eh_proj`'s own
+//! resident type, a K-quant reading the pack's q8_1 rows like any trunk site;
+//! the layer is the chain's walk of one layer (`walk::layer`) over the
+//! family's ops ([`Program`](super::program::Program)) with a plan, weights
+//! and store of the draft's own and an arena of one row, so attention, the
+//! router, the routed and the shared experts are the trunk's launches; the
 //! head is [`Head`] with the draft's gain over the target's own `output`
 //! buffer, read where it sits. A step is eager and enqueues the same stream
 //! as the target.
@@ -28,17 +31,26 @@
 //! see the prompt feeds every position in order. The target's matrices are
 //! never copied: the draft records their addresses at open and refuses a step
 //! by name when either has moved.
+//!
+//! A walk is eager. A captured walk is refused by name. A store walk runs
+//! this same step and does not read the head back: the layer has no
+//! store-only launch. `held` counts the positions the draft's store holds;
+//! a walk from position 0 replaces that count. The body's reset does not
+//! reach it.
 
+use super::PrefillPath;
 use super::body::{Kernels, KvQ8};
-use super::dispatch::{PassCtx, embed_into};
+use super::dispatch::{self, Ctx, PassCtx, embed_into};
 use super::mtp38::BorrowedPlanes;
 use super::plan::LayerPlan;
 use super::program::{OneLayer, Program, Tail};
 use super::scratch::{Arena, Dims, Forms, KvPlanes, StepParams};
+use crate::draft::{self, DraftHead, Feed, Hidden, WalkBounds, WalkMode};
 use crate::head::{Head, HeadNorm};
 use crate::model::lookup::f32_gain;
 use crate::mtp::{MtpInputArgs, MtpKernels};
-use crate::site;
+use crate::site::{self, Form, SiteTy};
+use crate::tensor::{Q8Act, Window};
 use crate::weights::{DevWeight, HEAD_TENSOR, Weights};
 use crate::{Gpu, GpuError, launch_u32};
 use chain::arch::qwen3moe::ops::LayerCtx;
@@ -92,10 +104,41 @@ pub struct Mtp35 {
     /// `[enorm(e) | hnorm(h)]`.
     emb: DeviceBuffer<f32>,
     pack: DeviceBuffer<f32>,
+    /// The pack's q8_1 form, [`Mtp35::enqueue`]'s `eh_proj` input when the
+    /// site reads the q8_1 rows; unread, like the trunk sites' twin
+    /// activations, at any other type.
+    act: Q8Act,
+    /// `eh_proj`'s site type, read from its resident form at the open.
+    eh_ty: SiteTy,
+    /// One target row copied out of an arena, and that row after
+    /// `output_norm`, which [`Mtp35::enqueue`] reads.
+    raw: DeviceBuffer<f32>,
+    h_row: DeviceBuffer<f32>,
     head: Head,
     mtp: MtpKernels,
     /// `token_embd` and the head matrix of the target, at open.
     borrowed: [BorrowedPlanes; 2],
+    /// Positions of this sequence the store holds: the first it does not.
+    /// A walk may start at or below it. A walk from position 0 replaces it.
+    held: u32,
+}
+
+/// Where a walk reads the target's final hidden rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MtpArena {
+    /// The head's last position, one row, read back from the host.
+    Step,
+    /// The pass arena.
+    Pass,
+    /// The prompt's ubatch arena.
+    Ubatch,
+}
+
+impl WalkBounds for Mtp35 {
+    const WALK_ROWS: usize = 2;
+    /// The layer captures no walk.
+    const GRAPH_ROWS: usize = 0;
+    const STORE_ROWS: usize = 2;
 }
 
 /// Device addresses held by [`BorrowedPlanes`]: Q8_0 or MXFP8 planes,
@@ -171,6 +214,10 @@ impl Mtp35 {
             borrow(target, &token_embd(), hidden, vocab)?,
             borrow(target, HEAD_TENSOR, hidden, vocab)?,
         ];
+        // The join's projection site, at its resident form's type: the type
+        // a file leaves `eh_proj` decides the form the step feeds it, so it
+        // is read once here, like the head's own output form.
+        let eh_ty = site::resident_type(&w, WHAT, &names.eh)?;
         let forms = Forms::of(std::slice::from_ref(&plan), &d);
         let head = Head::with_gain(
             gpu,
@@ -194,12 +241,17 @@ impl Mtp35 {
             sp: StepParams::new(stream, false)?,
             emb: DeviceBuffer::zeroed(stream, hidden)?,
             pack: DeviceBuffer::zeroed(stream, 2 * STREAMS * hidden)?,
+            act: Q8Act::with_k(stream, 1, 2 * STREAMS * hidden)?,
+            raw: DeviceBuffer::zeroed(stream, hidden)?,
+            h_row: DeviceBuffer::zeroed(stream, hidden)?,
             mtp: MtpKernels::load(gpu.context())?,
             names,
             w,
             plan,
+            eh_ty,
             head,
             borrowed,
+            held: 0,
         })
     }
 
@@ -207,6 +259,18 @@ impl Mtp35 {
     #[must_use]
     pub fn index(&self) -> usize {
         self.index
+    }
+
+    /// Values of one hidden row the walk reads.
+    #[must_use]
+    pub fn hidden(&self) -> usize {
+        self.hidden
+    }
+
+    /// Positions of this sequence the store holds: the first it does not.
+    #[must_use]
+    pub fn held(&self) -> u32 {
+        self.held
     }
 
     /// The draft's own weights, by file name.
@@ -225,13 +289,17 @@ impl Mtp35 {
     }
 
     /// Card bytes of the step's scratch: the one-row arena, the embedding row,
-    /// the join's pack and the head's rows, activations and logits, less the
-    /// residual stream counted in [`Mtp35::resident_bytes`].
+    /// the join's pack and its q8_1 form, the copied target row and its normed
+    /// row, and the head's rows, activations and logits, less the residual
+    /// stream counted in [`Mtp35::resident_bytes`].
     #[must_use]
     pub fn scratch_bytes(&self) -> usize {
         self.s.bytes()
             + self.emb.num_bytes()
             + self.pack.num_bytes()
+            + self.act.device_bytes()
+            + self.raw.num_bytes()
+            + self.h_row.num_bytes()
             + self.sp.bytes()
             + self.head.resident_bytes()
             - self.hidden * size_of::<f32>()
@@ -314,7 +382,6 @@ impl Mtp35 {
                 out: &mut self.pack,
             },
         )?;
-        site::resident_gemv(gpu, &self.w, &self.names.eh, &self.pack, &mut self.s.x)?;
         let c = PassCtx {
             gpu,
             w: &self.w,
@@ -324,6 +391,29 @@ impl Mtp35 {
             eps: self.eps,
             table,
         };
+        // The projection is the trunk's site dispatch at the weight's own
+        // type: the pack's quantizer runs only where that type reads the
+        // q8_1 rows, and the gemv takes the form it names.
+        if quantizes_pack(self.eh_ty) {
+            gpu.enqueue_quantize_q8_1_layer(&self.pack, &mut self.act, self.index)?;
+        }
+        dispatch::site_gemv(
+            &Ctx::new(
+                gpu,
+                &self.w,
+                (&self.plan, self.index),
+                k,
+                mma,
+                self.eps,
+                table,
+            )?,
+            (self.eh_ty, &self.names.eh),
+            self.hidden,
+            (&self.act, &self.pack),
+            1,
+            None,
+            &mut self.s.x,
+        )?;
         let cx = LayerCtx {
             layer: self.index,
             plan: &self.plan,
@@ -349,5 +439,352 @@ impl Mtp35 {
     /// where a fault any launch of the step raised is [`GpuError::Fault`].
     pub fn token(&self, gpu: &Gpu) -> Result<u32, GpuError> {
         self.head.token(gpu)
+    }
+
+    /// [`Mtp35::enqueue`] over the resident normed row. `enqueue` reads that
+    /// row and does not write it, and the row stays allocated for the call.
+    fn enqueue_held(
+        &mut self,
+        gpu: &Gpu,
+        target: &Weights,
+        kernels: (&Kernels, &DeviceBuffer<f32>, bool),
+        feed: (u32, usize),
+    ) -> Result<(), GpuError> {
+        // The pointer is taken before `enqueue` borrows `self`, so the two
+        // borrows of the row do not alias in the checker.
+        let h = std::ptr::from_ref(&self.h_row);
+        // SAFETY: `enqueue` reads `h` and does not write `h_row`. `h_row`
+        // stays allocated.
+        self.enqueue(gpu, target, kernels, feed, unsafe { &*h })
+    }
+}
+
+fn no_layer() -> GpuError {
+    GpuError::state(
+        WHAT,
+        "the load carries no next-token layer (open it with GpuModel::open_mtp)",
+    )
+}
+
+/// Whether a step quantizes the join's pack for an `eh_proj` of site type
+/// `ty`: the projection's gemv reads the q8_1 rows then, and the pack's f32
+/// rows at any other type ([`site::kgemv_order`]'s split, the one
+/// [`dispatch::site_gemv`] dispatches by). Not `SiteTy::kquant`: a type can
+/// read the q8_1 rows with no wide GEMM (NVFP4) and the quantizer still has
+/// to run for it.
+fn quantizes_pack(ty: SiteTy) -> bool {
+    ty.reads() == Form::Q8x128
+}
+
+/// Copy arena row `row` and RMS-norm it by the target's `output_norm` into
+/// the draft's normed row.
+fn norm_row(
+    mtp: &mut Mtp35,
+    gpu: &Gpu,
+    w: &Weights,
+    arena: &Arena,
+    eps: f32,
+    row: usize,
+) -> Result<(), GpuError> {
+    let hidden = mtp.hidden;
+    if row >= arena.rows {
+        return Err(GpuError::shape(
+            WHAT,
+            format!("hidden row {row} of a {}-row arena", arena.rows),
+        ));
+    }
+    let src = Window::<f32>::of(&arena.x, row * hidden * size_of::<f32>(), hidden)?;
+    mtp.raw.copy_from_device_async(&src, gpu.stream())?;
+    gpu.elem().enqueue_rms_norm(
+        gpu.stream(),
+        &mtp.raw,
+        f32_gain(w, "output_norm.weight")?,
+        eps,
+        hidden,
+        1,
+        &mut mtp.h_row,
+    )
+}
+
+/// One eager walk of the file's next-token layer, no readback. A captured
+/// walk is refused by name. A store walk runs the same step. A poisoned
+/// model is refused; a fault the walk raises is [`GpuModel::note_fault`]'s.
+pub fn mtp_walk(
+    m: &mut super::Qwen35moeModel,
+    feed: Feed<'_, MtpArena>,
+    head: DraftHead,
+    mode: WalkMode,
+) -> Result<(), GpuError> {
+    m.refuse_if_poisoned(WHAT)?;
+    let r = walk_rows(m, feed, head, mode);
+    m.note_fault(WHAT, r)
+}
+
+/// One window's chain: the refresh walked, then the head's argmax into
+/// `out`'s first place. An own row, a probability buffer, a store walk and a
+/// captured walk are refused by name. The proposal is one id.
+pub fn mtp_chain(
+    m: &mut super::Qwen35moeModel,
+    refresh: Feed<'_, MtpArena>,
+    own: usize,
+    head: DraftHead,
+    mode: WalkMode,
+    out: &mut [u32],
+    p: Option<&mut [f32]>,
+) -> Result<usize, GpuError> {
+    m.refuse_if_poisoned(WHAT)?;
+    let r = chain_rows(m, refresh, own, head, mode, out, p);
+    m.note_fault(WHAT, r)
+}
+
+fn chain_rows(
+    m: &mut super::Qwen35moeModel,
+    refresh: Feed<'_, MtpArena>,
+    own: usize,
+    head: DraftHead,
+    mode: WalkMode,
+    out: &mut [u32],
+    p: Option<&mut [f32]>,
+) -> Result<usize, GpuError> {
+    if own != 0 {
+        return Err(draft::refuse_own(
+            WHAT,
+            &format!("a chain of {own} own rows"),
+        ));
+    }
+    if p.is_some() {
+        return Err(GpuError::shape(
+            WHAT,
+            "a chain's probabilities: the next-token layer's head reads back its ids alone",
+        ));
+    }
+    if mode == WalkMode::Store {
+        return Err(GpuError::shape(
+            WHAT,
+            "a chain in the store walk's mode: it reads the head",
+        ));
+    }
+    if out.is_empty() {
+        return Err(GpuError::shape(WHAT, "a proposal of 1 id into 0 places"));
+    }
+    walk_rows(m, refresh, head, mode)?;
+    let (gpu, _, body) = m.body_parts(WHAT)?;
+    let id = body.mtp.as_ref().ok_or_else(no_layer)?.token(gpu)?;
+    out[0] = id;
+    Ok(1)
+}
+
+fn walk_rows(
+    m: &mut super::Qwen35moeModel,
+    feed: Feed<'_, MtpArena>,
+    head: DraftHead,
+    mode: WalkMode,
+) -> Result<(), GpuError> {
+    if mode == WalkMode::Graph {
+        return Err(GpuError::shape(
+            WHAT,
+            "a captured walk: the next-token layer runs eager",
+        ));
+    }
+    if feed.media.is_some() {
+        return Err(GpuError::shape(
+            WHAT,
+            "a media load: its sequences' rotation tables are their own, and the draft reads the \
+             plain table",
+        ));
+    }
+    head.check_opened(WHAT, false)?;
+    let Feed {
+        tokens,
+        pos0,
+        hidden,
+        media: _,
+    } = feed;
+    let n = tokens.len();
+    draft::refuse_rows::<Mtp35>(WHAT, mode, n)?;
+    let width = {
+        let (_, _, body) = m.body_parts(WHAT)?;
+        body.mtp.as_ref().ok_or_else(no_layer)?.hidden
+    };
+    if let Hidden::Host(v) = hidden
+        && v.len() != n * width
+    {
+        return Err(GpuError::shape(
+            WHAT,
+            format!("{} hidden values for {n} rows of {width}", v.len()),
+        ));
+    }
+    let step_host = match hidden {
+        Hidden::Target {
+            walk: MtpArena::Step,
+            first,
+        } => {
+            if first != 0 || n != 1 {
+                return Err(GpuError::shape(
+                    WHAT,
+                    "the step arena holds the head's last position only: a walk reads one row \
+                     from its row 0",
+                ));
+            }
+            let row = m.head_normed()?;
+            if row.len() != width {
+                return Err(GpuError::shape(
+                    WHAT,
+                    format!(
+                        "the head's normed row is {} values; the draft reads {width}",
+                        row.len()
+                    ),
+                ));
+            }
+            Some(row)
+        }
+        _ => None,
+    };
+    let (gpu, w, body) = m.body_parts(WHAT)?;
+    let Body35Fields {
+        eps,
+        u,
+        a,
+        mtp,
+        k,
+        rope,
+        seq_rope,
+        mma,
+    } = split_body(body)?;
+    if pos0 == 0 {
+        mtp.held = 0;
+    }
+    if usize::try_from(pos0).unwrap_or(usize::MAX) > mtp.held as usize {
+        let held = mtp.held;
+        return Err(GpuError::shape(
+            WHAT,
+            format!(
+                "a walk from position {pos0}: the draft's store holds this sequence's \
+                 positions below {held}, and the walk would read the keys between"
+            ),
+        ));
+    }
+    let table = crate::media::rope_table(rope, seq_rope.as_ref());
+    let mma = *mma;
+    let eps = *eps;
+    for i in 0..n {
+        let pos = (pos0 as usize).checked_add(i).ok_or_else(|| {
+            GpuError::shape(WHAT, format!("position {pos0} plus {i} passes usize"))
+        })?;
+        let t = tokens[i];
+        match hidden {
+            Hidden::Host(v) => {
+                mtp.h_row
+                    .copy_from_host(gpu.stream(), &v[i * width..(i + 1) * width])?;
+            }
+            Hidden::Target {
+                walk: MtpArena::Step,
+                ..
+            } => {
+                let row = step_host
+                    .as_ref()
+                    .ok_or_else(|| GpuError::state(WHAT, "the head's normed row of the step"))?;
+                mtp.h_row.copy_from_host(gpu.stream(), row)?;
+            }
+            Hidden::Target {
+                walk: MtpArena::Pass,
+                first,
+            } => norm_row(mtp, gpu, w, a, eps, first + i)?,
+            Hidden::Target {
+                walk: MtpArena::Ubatch,
+                first,
+            } => norm_row(mtp, gpu, w, u, eps, first + i)?,
+        }
+        mtp.enqueue_held(gpu, w, (k, table, mma), (t, pos))?;
+    }
+    let n_u = u32::try_from(n)
+        .map_err(|_| GpuError::shape(WHAT, format!("a walk of {n} rows passes u32")))?;
+    let end = pos0.checked_add(n_u).ok_or_else(|| {
+        GpuError::shape(
+            WHAT,
+            format!("a walk of {n} rows from position {pos0} passes u32"),
+        )
+    })?;
+    mtp.held = mtp.held.max(end);
+    Ok(())
+}
+
+/// The body's fields a walk borrows apart: the arenas, the draft, the rope.
+struct Body35Fields<'a> {
+    eps: &'a f32,
+    u: &'a Arena,
+    a: &'a Arena,
+    mtp: &'a mut Mtp35,
+    k: &'a Kernels,
+    rope: &'a super::scratch::RopeRows,
+    seq_rope: &'a Option<crate::media::SeqRope>,
+    mma: &'a bool,
+}
+
+fn split_body(body: &mut super::body35::Body35) -> Result<Body35Fields<'_>, GpuError> {
+    let super::body35::Body35 {
+        eps,
+        u,
+        a,
+        mtp,
+        k,
+        rope,
+        seq_rope,
+        mma,
+        ..
+    } = body;
+    Ok(Body35Fields {
+        eps,
+        u,
+        a,
+        mtp: mtp.as_mut().ok_or_else(no_layer)?,
+        k,
+        rope,
+        seq_rope,
+        mma,
+    })
+}
+
+/// A prompt call's tap ([`prompt_with35`]): called after each unit with the
+/// arena the unit's rows sit in, the unit's first position and its rows.
+pub type Prompt35Sink<'a> =
+    dyn FnMut(&mut super::Qwen35moeModel, MtpArena, u32, usize) -> Result<(), GpuError> + 'a;
+
+/// The prompt call on `path`, one residency pass, and `sink` after each unit
+/// with the ubatch arena the unit's rows sit in.
+pub fn prompt_with35(
+    m: &mut super::Qwen35moeModel,
+    ids: &[u32],
+    path: PrefillPath,
+    sink: Option<&mut Prompt35Sink<'_>>,
+) -> Result<u32, GpuError> {
+    crate::host::served::prompt_pass(m, |m| match sink {
+        None => m.prefill_hooked(ids, path, None),
+        Some(sink) => {
+            let mut hook = |model: &mut super::Qwen35moeModel, first: u32, rows: usize| {
+                sink(model, MtpArena::Ubatch, first, rows)
+            };
+            m.prefill_hooked(ids, path, Some(&mut hook))
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SiteTy, quantizes_pack};
+    use crate::site::kgemv_order;
+
+    /// The pack's quantizer runs exactly where the eh site's gemv takes the
+    /// q8_1 rows ([`kgemv_order`], the split `dispatch::site_gemv` routes
+    /// by): every K-quant, and no type whose gemv reads the f32 rows.
+    /// `SiteTy::kquant` is not that split — NVFP4 reads the q8_1 rows with
+    /// no wide GEMM — so the guard must not be written as it.
+    #[test]
+    fn the_pack_quantizes_where_the_eh_gemv_reads_q8_1() {
+        for &ty in SiteTy::ALL {
+            assert_eq!(quantizes_pack(ty), kgemv_order(ty).is_some(), "{ty}");
+        }
+        assert!(quantizes_pack(SiteTy::Q4K));
+        assert!(!quantizes_pack(SiteTy::Bf16));
     }
 }

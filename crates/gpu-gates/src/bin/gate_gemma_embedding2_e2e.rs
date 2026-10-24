@@ -30,6 +30,17 @@
 //! 5. (h) V2's normalized vectors against official sentence-transformers,
 //!    with a frozen mainline-to-HF precision budget and independent ceiling.
 //!    `--hf` runs only this clause, including the exact one-sided window check.
+//! 6. (b) V2 only: one case of each distinct length, packed into one pass while
+//!    they fit the load's context, each pooled vector held to the card set by
+//!    (t)'s rule (its band [`TWIN`] times the twin's distance, at least
+//!    [`FLOOR`]). A packed input is another realization of the graph: a segment
+//!    that starts off a key tile sums its attention in another order, so it is
+//!    held as its solo pass is, not to that pass's bits; its relative distance
+//!    from its solo pass is printed. A set with no two such cases fails by name.
+//!    An input past its band also prints its first layer and op whose packed
+//!    rows are not that input's solo pass's bits (the engine's taps: the
+//!    attention, the FFN, the layer's output, then the head), the row that
+//!    differs first and its segment start.
 
 #[cfg(feature = "gemma-embedding2")]
 fn main() -> std::process::ExitCode {
@@ -58,7 +69,7 @@ mod gate {
     use bloomery_gpu_gates::{
         GateError, RefManifest, checks_failed, data_dir, ref_model_path, verdict,
     };
-    use bloomery_gpu_gemma_embedding2::{Encoder, Pass, card_bytes};
+    use bloomery_gpu_gemma_embedding2::{Encoder, Packed, Pass, card_bytes};
     use gguf::Split;
     use model::arch::gemma_embedding2::hparams::CARD_CTX;
     use refset::arch::gemma_embedding2::{
@@ -670,6 +681,196 @@ mod gate {
         Ok(ok)
     }
 
+    /// The input's first row whose bits differ between a solo tap (its row
+    /// `t - lo`) and a packed tap (its row `t`): the input-relative row and
+    /// the tap's max abs difference over the input's rows, or `None` when
+    /// every row is bit for bit.
+    fn first_diff(
+        solo: &[f32],
+        packed: &[f32],
+        (lo, hi): (usize, usize),
+        width: usize,
+    ) -> Option<(usize, f64)> {
+        let mut worst = 0.0f64;
+        let mut row = None;
+        for t in lo..hi {
+            let at = (t - lo) * width;
+            let (a, b) = (&solo[at..at + width], &packed[t * width..(t + 1) * width]);
+            if row.is_none() && !same_bits(a, b) {
+                row = Some(t - lo);
+            }
+            worst = worst.max(
+                a.iter()
+                    .zip(b)
+                    .map(|(&x, &y)| (f64::from(x) - f64::from(y)).abs())
+                    .fold(0.0f64, f64::max),
+            );
+        }
+        row.map(|r| (r, worst))
+    }
+
+    /// An input past its band: the first layer and op whose packed rows are
+    /// not that input's solo pass's bits — the attention, the FFN, then the
+    /// layer's output, the layer's dataflow order — with the input-relative
+    /// row that differs first. Every layer tap bit for bit names the first
+    /// divergence past the layers instead (the output norm, the token rows,
+    /// or only the mean).
+    fn localize(
+        enc: &mut Encoder,
+        reach: &[Option<u32>],
+        packed: &Packed,
+        c: &Case,
+        (lo, hi): (usize, usize),
+        at: usize,
+        verbose: bool,
+    ) -> Result<(), GateError> {
+        let solo = enc.pass(&c.ids, true)?;
+        let st = solo
+            .taps
+            .as_ref()
+            .ok_or("a solo pass with taps returned none")?;
+        let pt = packed
+            .taps
+            .as_ref()
+            .ok_or("a packed pass with taps returned none")?;
+        let len = c.ids.len();
+        let e = st.inp_scaled.len() / len;
+        let law = format!("(b) {}/{lo} len {len} (lo%32 {})", c.id, lo % 32);
+        let mut first = None;
+        let mut by_layer = Vec::new();
+        for l in 0..st.l_out.len() {
+            let kind = if reach.get(l).is_some_and(|r| r.is_some()) {
+                "sliding"
+            } else {
+                "full"
+            };
+            let mut worsts = Vec::new();
+            for (op, a, b) in [
+                ("attn", &st.attn_out[l], &pt.attn_out[l]),
+                ("ffn", &st.ffn_out[l], &pt.ffn_out[l]),
+                ("l_out", &st.l_out[l], &pt.l_out[l]),
+            ] {
+                let d = first_diff(a, b, (lo, hi), e);
+                if first.is_none()
+                    && let Some((row, worst)) = d
+                {
+                    first = Some(format!(
+                        "first diff layer {l} ({kind}) op {op} row {row}, that tap's max abs \
+                         {worst:.3e}"
+                    ));
+                }
+                worsts.push(format!("{op} {:.3e}", d.map_or(0.0, |(_, w)| w)));
+            }
+            by_layer.push(format!("{l} ({kind}): {}", worsts.join(" ")));
+        }
+        let n_out = st.result_embd.len() / len;
+        let norm = first_diff(&st.result_norm, &pt.result_norm, (lo, hi), e);
+        let embd = first_diff(&st.result_embd, &pt.result_embd, (lo, hi), n_out);
+        println!(
+            "{law}: {}; result_norm max abs {:.3e}, embd {:.3e}, pooled rel {:.3e}",
+            first.as_deref().unwrap_or("every layer tap bit for bit"),
+            norm.map_or(0.0, |(_, w)| w),
+            embd.map_or(0.0, |(_, w)| w),
+            rel(&packed.pooled[at], &solo.pooled),
+        );
+        if verbose {
+            println!("{law}: per layer max abs, {}", by_layer.join("; "));
+        }
+        Ok(())
+    }
+
+    /// Clause (b): one case of each distinct length, packed while they fit
+    /// [`Encoder::ctx`], each pooled vector held to the card set `man` against
+    /// the twin `cpu` as (t) holds a solo pass.
+    fn packed_inputs(
+        enc: &mut Encoder,
+        cases: &[Case],
+        reach: &[Option<u32>],
+        (man, cpu): (&RefManifest, &RefManifest),
+    ) -> Result<bool, GateError> {
+        let mut picked: Vec<&Case> = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        for c in cases {
+            if c.ids.is_empty() || !seen.insert(c.ids.len()) {
+                continue;
+            }
+            picked.push(c);
+        }
+        picked.sort_by_key(|c| c.ids.len());
+        let mut chosen: Vec<&Case> = Vec::new();
+        let mut los = Vec::new();
+        let mut tokens = 0usize;
+        for c in picked {
+            if tokens + c.ids.len() > enc.ctx() {
+                break;
+            }
+            los.push(tokens);
+            tokens += c.ids.len();
+            chosen.push(c);
+        }
+        if chosen.len() < 2 {
+            return Err(
+                "the set has no two cases of different lengths that pack into one pass".into(),
+            );
+        }
+        let mut solos = Vec::with_capacity(chosen.len());
+        for c in &chosen {
+            solos.push(enc.pass(&c.ids, false)?.pooled);
+        }
+        let inputs: Vec<&[u32]> = chosen.iter().map(|c| c.ids.as_slice()).collect();
+        let packed = enc.pass_packed(&inputs, false)?;
+        if packed.pooled.len() != solos.len() {
+            return Err(format!(
+                "packed pass gave {} vectors, not {}",
+                packed.pooled.len(),
+                solos.len()
+            )
+            .into());
+        }
+        let mut worst = 0.0f64;
+        let mut worst_id = chosen[0].id.as_str();
+        let mut ok = true;
+        let mut past = Vec::new();
+        for ((i, c), (solo, got)) in chosen
+            .iter()
+            .enumerate()
+            .zip(solos.iter().zip(&packed.pooled))
+        {
+            let row = |m: &RefManifest| tap(m, &format!("{}/pooled", c.id));
+            let h = Held::of(got, &row(man)?, &row(cpu)?);
+            let held = h.ok();
+            println!(
+                "(b) {} {} ids: {}; against its solo pass rel {:.3e} {}",
+                c.id,
+                c.ids.len(),
+                h.line("pooled"),
+                rel(got, solo),
+                verdict(held)
+            );
+            if h.r / h.band > worst {
+                worst = h.r / h.band;
+                worst_id = c.id.as_str();
+            }
+            ok &= held;
+            if !held {
+                past.push(i);
+            }
+        }
+        if !past.is_empty() {
+            let taps = enc.pass_packed(&inputs, true)?;
+            for (n, &i) in past.iter().enumerate() {
+                let (lo, hi) = (los[i], los[i] + chosen[i].ids.len());
+                localize(enc, reach, &taps, chosen[i], (lo, hi), i, n == 0)?;
+            }
+        }
+        println!(
+            "(b) {} inputs, {tokens} tokens, worst {worst_id} at {worst:.3} of its band {}",
+            chosen.len(),
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
     pub fn run() -> Result<(), GateError> {
         bloomery_levers::at_main(&[])?;
         let args: Vec<String> = std::env::args().skip(1).collect();
@@ -778,6 +979,11 @@ mod gate {
             );
         }
         if !v1 {
+            ok &= clause(
+                "(b)",
+                "packed inputs",
+                packed_inputs(&mut enc, &cases, &encoder.reach, (&man, &cpu)),
+            );
             ok &= clause(
                 "(h)",
                 "HF sentence-transformers",

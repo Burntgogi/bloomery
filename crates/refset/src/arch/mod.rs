@@ -18,6 +18,8 @@ pub mod glm5next;
 pub mod mimo2;
 pub mod minicpmv4_7;
 pub mod minimaxm3;
+pub mod minimaxm31;
+pub mod musespark;
 pub mod nemotron_h;
 pub mod nemotron_h_moe;
 pub mod prompt_tables;
@@ -29,6 +31,11 @@ pub mod raon1;
 pub mod solar2;
 pub mod tokenizer;
 
+/// The families of the architecture MiniMax-M3 and M3.1 share, the GGUF set's llama.cpp dumps first ([`node_dumps`] answers with
+/// them) and the checkpoint folder's transformers dumps after: [`minimaxm3::FAMILIES`] then [`minimaxm31::FAMILIES`], which
+/// `minimax_rows_are_both_modules_families` holds.
+static MINIMAX_M3: &[&Family] = &[&minimaxm3::LCPP, &minimaxm31::TF, &minimaxm31::POOLED];
+
 /// Each architecture's families, by the architecture's name.
 static BY_ARCH: &[(&str, &[&Family])] = &[
     (deepseek41::ARCH, deepseek41::FAMILIES),
@@ -37,13 +44,14 @@ static BY_ARCH: &[(&str, &[&Family])] = &[
     (qwen35::ARCH, qwen35::FAMILIES),
     (glm5next::ARCH, glm5next::FAMILIES),
     (mimo2::ARCH, mimo2::FAMILIES),
-    (minimaxm3::ARCH, minimaxm3::FAMILIES),
+    (minimaxm3::ARCH, MINIMAX_M3),
     (solar2::ARCH, solar2::FAMILIES),
     (minicpmv4_7::ARCH, minicpmv4_7::FAMILIES),
     (qwen4exp::ARCH, qwen4exp::FAMILIES),
     (raon1::ARCH, raon1::FAMILIES),
     (nemotron_h::ARCH, nemotron_h::FAMILIES),
     (nemotron_h_moe::ARCH, nemotron_h_moe::FAMILIES),
+    (musespark::ARCH, musespark::FAMILIES),
     (tokenizer::ARCH, tokenizer::FAMILIES),
     (dequant::ARCH, dequant::FAMILIES),
     (quant::ARCH, quant::FAMILIES),
@@ -91,8 +99,51 @@ mod qwen_vis_tests;
 
 #[cfg(test)]
 mod tests {
-    use super::{all, named, node_dumps};
+    use super::{BY_ARCH, all, families, minimaxm3, minimaxm31, named, node_dumps};
     use crate::family::Identity;
+
+    /// One row an architecture: `families` answers with the first row of a name, so a second row would hide its families.
+    #[test]
+    fn each_architecture_has_one_row() {
+        for (i, (arch, _)) in BY_ARCH.iter().enumerate() {
+            assert!(
+                BY_ARCH[..i].iter().all(|(a, _)| a != arch),
+                "{arch} has two rows in BY_ARCH: merge them into one slice"
+            );
+        }
+    }
+
+    /// MiniMax-M3 and M3.1 share an architecture name, so one row holds both modules' families, M3's first: the gates' node dumps
+    /// stay the llama.cpp ones, and a family a module gains is in the table or this is red.
+    #[test]
+    fn minimax_rows_are_both_modules_families() {
+        let want: Vec<&str> = minimaxm3::FAMILIES
+            .iter()
+            .chain(minimaxm31::FAMILIES)
+            .map(|f| f.name)
+            .collect();
+        let got: Vec<&str> = families(minimaxm3::ARCH).iter().map(|f| f.name).collect();
+        assert_eq!(got, want);
+        assert_eq!(
+            got,
+            ["lcpp-minimaxm3", "tf-minimaxm31", "tf-minimaxm31-pooled"]
+        );
+        assert_eq!(minimaxm31::ARCH, minimaxm3::ARCH);
+        for set in minimaxm31::SETS {
+            assert!(
+                !minimaxm3::SETS.contains(set),
+                "{set} is a minimaxm3 set: one data directory holds both families"
+            );
+        }
+        assert_eq!(
+            node_dumps(minimaxm3::ARCH).map(|f| f.name),
+            Some("lcpp-minimaxm3")
+        );
+        assert!(
+            named("tf-minimaxm31").is_some_and(|f| std::ptr::eq(f, &minimaxm31::TF)),
+            "tf-minimaxm31 is not in the table"
+        );
+    }
 
     /// Every family's sets in place pass their family's check: each states
     /// the file the tree runs, names its family's ik build where the family
