@@ -27,16 +27,19 @@
 //!   rule=slots slots=1 slot_ctx=<CTX> total=<CTX> from=ctx pass=one`. FAIL-first: a seat that
 //!   plans a second slot, or prints `pass=turns`, misses the line and the clause is red.
 //! - `place_bp_follows_the_cards`: `--place bp --plan` where the census holds two cards exits 0
-//!   and prints a `plan` record whose devices name the tier card (`tier0`); where it holds one, it
-//!   exits non-zero, its stderr names the place word the placement refuses, and no `plan` record
-//!   is printed. FAIL-first: a seat that plans its one-card machine under `bp` prints no tier card
-//!   and the clause is red on two cards.
+//!   and prints a `plan` record whose devices name the tier card (`tier0`), or, where the stage
+//!   holds every routed expert (the fixture), exits non-zero naming the tier card that would hold
+//!   none ([`EMPTY_TIER`]) with no `plan` record; where it holds one card, it exits non-zero, its
+//!   stderr names the place word the placement refuses, and no `plan` record is printed.
+//!   FAIL-first: a seat that plans its one-card machine under `bp` prints no tier card and no
+//!   refusal, and the clause is red on two cards.
 //! - `place_unset_follows_the_cards`: the `plan_names_one_slot` run's `place unset` record (no
 //!   `--place`) where the census holds two cards carries the tier experts the plan of `bp` holds
 //!   and the family's break-even and basis (`TIER_RULE`: 845 experts, the tier size whose host
 //!   time saved covers the tier's fixed cost, docs/cards/musespark-2card.card), and names `bp`
 //!   exactly when the tier holds at least the break-even (the real file's tier holds the 3090's
-//!   room, ~1,820; the fixture's none, its stage holding every expert); where the census holds
+//!   room, ~1,820); where the stage holds every expert (the fixture) the plan of `bp` is refused,
+//!   the record carries no tier experts and names `a` for that refusal; where the census holds
 //!   one card it does not name `bp`. FAIL-first: a seat that keeps the untiered rule
 //!   (`Place::choose_untiered`) never asks the plan, prints no tier experts and the clause is red
 //!   on two cards.
@@ -172,6 +175,11 @@ mod gate {
         }
     }
 
+    /// What the placement's refusal of a tier card with no expert says ([`place_bp_follows_the_cards`]).
+    const EMPTY_TIER: &str = "holds no expert: the cards before it hold every routed expert";
+    /// What the unset rule's why says when the plan of `bp` was refused.
+    const TIER_REFUSED: &str = "the tier's plan refused";
+
     /// `plan_names_one_slot` and `place_unset_follows_the_cards` (the module header), on one
     /// `--plan` run; `two` whether the census holds two cards.
     fn plan_names_one_slot(
@@ -200,20 +208,22 @@ mod gate {
         const BASIS: &str = "docs/cards/musespark-2card.card";
         let (place, tier) = (unset.word("place")?, unset.opt_u64("tier_experts")?);
         let (even, basis) = (unset.opt_u64("break_even")?, unset.opt_word("basis")?);
-        // On two cards the rule asked the plan of bp for its tier: kept at the break-even or more,
-        // so the fixture, whose stage holds every expert, runs `a`.
+        // On two cards the rule asked the plan of bp for its tier: kept at the break-even or more;
+        // the fixture, whose stage holds every expert, has that plan refused and runs `a`.
+        let why = unset.text("why")?;
         let follows = if two {
-            tier.is_some_and(|t| (place == "bp") == (t >= BREAK_EVEN))
-                && even == Some(BREAK_EVEN)
-                && basis == Some(BASIS)
+            let ruled = match tier {
+                Some(t) => (place == "bp") == (t >= BREAK_EVEN),
+                None => place == "a" && why.contains(TIER_REFUSED),
+            };
+            ruled && even == Some(BREAK_EVEN) && basis == Some(BASIS)
         } else {
             place != "bp"
         };
         println!(
             "place unset on {} card(s): place={place} tier_experts={tier:?} break_even={even:?} \
-             basis={basis:?} why={:?} {follows}",
+             basis={basis:?} why={why:?} {follows}",
             if two { 2 } else { 1 },
-            unset.text("why")?
         );
         check(&mut ok, "place_unset_follows_the_cards", follows);
         Ok(ok)
@@ -235,11 +245,13 @@ mod gate {
                 None => Vec::new(),
             };
             let tiered = devices.iter().any(|d| d.starts_with("tier0"));
+            let empty = !status.success() && text.contains(EMPTY_TIER) && plan.is_none();
             println!(
-                "place-bp on two cards: exit 0 {}; plan devices {devices:?}, a tier card {tiered}",
+                "place-bp on two cards: exit 0 {}; plan devices {devices:?}, a tier card {tiered}; \
+                 refused as a tier with no expert {empty}",
                 status.success()
             );
-            status.success() && tiered
+            (status.success() && tiered) || empty
         } else {
             let named = text.contains(PLACED);
             println!(
