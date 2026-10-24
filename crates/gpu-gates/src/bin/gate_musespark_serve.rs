@@ -124,7 +124,8 @@ mod gate {
 
     use bloomery_gpu_gates::record;
     use bloomery_gpu_gates::serve_client::{
-        SeatGate, check, no_residency_host, residency_lever_is, server_log,
+        SeatGate, check, no_residency_host, residency_lever_is, residency_lever_resolved,
+        server_log,
     };
     use bloomery_gpu_gates::{GateError, checks_failed, gpu_census, ref_model_path};
     use gguf::Split;
@@ -290,32 +291,6 @@ mod gate {
         seat.plan_under((dir, name), file, args, &levers)
     }
 
-    /// The lever record of an unset word on a serving placement: a word the plan resolved (its
-    /// why is neither `set` nor `fixed_place`), ahead of the plan, and the churn pool's host
-    /// record after the plan exactly where the word is not `off`; the word is the serving word
-    /// where its why is `place`.
-    fn lever_resolved(log: &record::Log) -> Result<bool, GateError> {
-        let (lever, plan, host) = (
-            log.first(&record::RESIDENCY_LEVER)?,
-            log.first(&record::PLAN)?,
-            log.first(&record::RESIDENCY_HOST)?,
-        );
-        let (Some(l), Some(p)) = (&lever, &plan) else {
-            return Ok(false);
-        };
-        let (word, why) = (l.word("residency")?, l.word("why")?);
-        let pool = match &host {
-            Some(h) => p.at() < h.at(),
-            None => false,
-        };
-        Ok(l.at() < p.at()
-            && why != "set"
-            && why != "fixed_place"
-            && (why != "place" || word == bloomery_levers::RESIDENCY_SERVING)
-            && ((word == "off") == host.is_none())
-            && (word == "off" || pool))
-    }
-
     /// The rendered lever line, or a named absence.
     fn lever_line(log: &record::Log) -> Result<String, GateError> {
         Ok(match log.first(&record::RESIDENCY_LEVER)? {
@@ -358,7 +333,7 @@ mod gate {
             (Some("off"), None),
         )?;
         let exits = serving_status.success() && gate_status.success() && off_status.success();
-        let serving_ok = lever_resolved(&serving)?;
+        let serving_ok = residency_lever_resolved(&serving)?;
         let gate_ok = residency_lever_is(&gate, "off", "fixed_place")? && no_residency_host(&gate)?;
         let off_ok = residency_lever_is(&off, "off", "set")? && no_residency_host(&off)?;
         println!(

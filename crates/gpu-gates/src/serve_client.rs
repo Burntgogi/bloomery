@@ -479,6 +479,32 @@ pub fn no_residency_host(log: &Log) -> Result<bool, GateError> {
     Ok(log.first(&record::RESIDENCY_HOST)?.is_none())
 }
 
+/// The `residency lever` record of an unset word on a serving placement: a word the plan
+/// resolved (its why is neither `set` nor `fixed_place`), ahead of the plan, and the churn pool's
+/// `residency host` record after the plan exactly where the word is not `off`; the word is the
+/// serving word ([`bloomery_levers::RESIDENCY_SERVING`]) where its why is `place`.
+pub fn residency_lever_resolved(log: &Log) -> Result<bool, GateError> {
+    let (lever, plan, host) = (
+        log.first(&record::RESIDENCY_LEVER)?,
+        log.first(&record::PLAN)?,
+        log.first(&record::RESIDENCY_HOST)?,
+    );
+    let (Some(l), Some(p)) = (&lever, &plan) else {
+        return Ok(false);
+    };
+    let (word, why) = (l.word("residency")?, l.word("why")?);
+    let pool = match &host {
+        Some(h) => p.at() < h.at(),
+        None => false,
+    };
+    Ok(l.at() < p.at()
+        && why != "set"
+        && why != "fixed_place"
+        && (why != "place" || word == bloomery_levers::RESIDENCY_SERVING)
+        && ((word == "off") == host.is_none())
+        && (word == "off" || pool))
+}
+
 /// `ids` agree with `reference`, a run that did not stop at the
 /// end-of-generation id: all of them, or, when `stop` is `eos`, a prefix
 /// ending there.

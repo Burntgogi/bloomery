@@ -22,9 +22,8 @@
 //! in every rule and plan, its tokenizer is the vocabulary and its `chat_template.jinja` the
 //! template, and the engine loads every card tensor from the folder's parts
 //! ([`bloomery_gpu_minimaxm3::body::Folder`]) while the host reads its routed experts where the
-//! folder stores them. The plan, the `need` record and the `load` record print as a file's do.
-//! Such a load runs no residency machine: unset, the `residency lever` record names `off`;
-//! another set word is refused by name before the plan (`tiered::folder_residency`).
+//! folder stores them. The plan, the `need` record and the `load` record print as a file's do,
+//! and so does the residency: the machine stages the folder's routed experts from its parts.
 //! Sampling is the sampler crate's chain with no repetition penalty,
 //! `temperature <= 0` the engine's argmax. Any other flag is refused as an
 //! unknown argument.

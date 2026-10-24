@@ -40,12 +40,14 @@
 //!   clause is red; a seat that treats `gate` as a serving placement prints the serving word and
 //!   the gate half is red; a seat that omits the lever from the ones it acts on refuses `off` by
 //!   name and the off half is red.
-//!   A checkpoint folder's load runs no residency machine, so on a folder the unset run is the
-//!   `off` half's `fixed_place` line ahead of the plan with no pool, whatever the placement, and
-//!   the serving word set (`BLOOMERY_RESIDENCY=`[`bloomery_levers::RESIDENCY_SERVING`]) exits
-//!   non-zero naming the folder before any plan record. FAIL-first: a seat that picks the
-//!   serving word for a folder prints it and the unset half is red; a seat that lets the set word
-//!   through prints the plan and the refusal half is red.
+//!   A checkpoint folder's residency is a file's, resolved against the plan its load runs: on a
+//!   folder the unset run prints a word the plan resolved (its why neither `set` nor
+//!   `fixed_place`; the serving word where it is `place`, `off` where the plan left it no room or
+//!   no host expert, as the fixture's cut folder holds every expert on the card) ahead of the
+//!   plan, and the churn pool's `residency host` record after the plan exactly where the word is
+//!   not `off` (`serve_client::residency_lever_resolved`). FAIL-first: a seat that runs a
+//!   folder's load under `off` whatever the plan prints `off` with why `fixed_place` and the
+//!   folder half is red.
 //! - `load_and_listen`: one server at `--ctx` 2560, `--port 0`, loads and listens; the `load`
 //!   record comes before the `listening` record; the load names the file's architecture word, one
 //!   slot, the file's layer count and 2560; the listening record names one slot and 2560;
@@ -150,7 +152,8 @@ mod gate {
     use bloomery_gpu_gates::record;
     use bloomery_gpu_gates::serve_client::{
         Answer, SeatGate, Served, check, curl, greedy, held_ms, ids_of, json_of, metric,
-        no_residency_host, residency_lever_is, server_log, together, tokenized,
+        no_residency_host, residency_lever_is, residency_lever_resolved, server_log, together,
+        tokenized,
     };
     use bloomery_gpu_gates::{GateError, checks_failed, gpu_census, ref_model_path};
     use model::arch::minimaxm3::place::PlanInputs;
@@ -299,15 +302,6 @@ mod gate {
         ))
     }
 
-    /// The lever, then the plan.
-    fn lever_before_plan(log: &record::Log) -> Result<bool, GateError> {
-        let (lever, plan) = (
-            log.first(&record::RESIDENCY_LEVER)?,
-            log.first(&record::PLAN)?,
-        );
-        Ok(matches!((&lever, &plan), (Some(l), Some(p)) if l.at() < p.at()))
-    }
-
     /// The rendered lever line, or a named absence.
     fn lever_line(log: &record::Log) -> Result<String, GateError> {
         Ok(match log.first(&record::RESIDENCY_LEVER)? {
@@ -346,59 +340,41 @@ mod gate {
             &["--ctx", &ctx],
             Some("off"),
         )?;
-        // A checkpoint folder's load runs no residency machine: the unset run is `off` with why
-        // `fixed_place`, the lever's record ahead of the plan and no pool, and the serving word set
-        // is refused before any plan.
+        // A checkpoint folder's unset run is a word its plan resolved, a file's the serving word:
+        // either way the lever's record ahead of the plan and the pool after it where it runs.
         let folder = file.is_dir();
-        let (serving_word, in_order) = if folder {
-            (
-                residency_lever_is(&serving, "off", "fixed_place")? && no_residency_host(&serving)?,
-                lever_before_plan(&serving)?,
-            )
+        let serving_ok = if folder {
+            residency_lever_resolved(&serving)?
         } else {
-            (
-                residency_lever_is(&serving, bloomery_levers::RESIDENCY_SERVING, "place")?,
-                hosted_in_order(&serving)?,
-            )
+            residency_lever_is(&serving, bloomery_levers::RESIDENCY_SERVING, "place")?
+                && hosted_in_order(&serving)?
         };
         let gate_ok = residency_lever_is(&gate, "off", "fixed_place")? && no_residency_host(&gate)?;
         let off_ok = residency_lever_is(&off, "off", "set")? && no_residency_host(&off)?;
         let exits = serving_status.success() && gate_status.success() && off_status.success();
-        let refused = if folder {
-            let (status, log, text) = plan_under(
-                &seat,
-                dir,
-                "plan-residency-set",
-                &file,
-                &["--ctx", &ctx],
-                Some(bloomery_levers::RESIDENCY_SERVING),
-            )?;
-            !status.success()
-                && text.contains("checkpoint folder")
-                && log.first(&record::PLAN)?.is_none()
-        } else {
-            true
-        };
         println!(
-            "residency default ({}): exit 0 {exits}; unset lever {:?} is {} then the plan{} \
-             {serving_word} {in_order}; --place gate {:?} is off (fixed_place) with no pool \
-             {gate_ok}; set off {:?} is off (set) with no pool {off_ok}; the serving word set \
-             is refused naming the folder, before any plan {refused}",
+            "residency default ({}): exit 0 {exits}; unset lever {:?} is {}, ahead of the plan, \
+             with the pool after it {} {serving_ok}; --place gate {:?} is off (fixed_place) with \
+             no pool {gate_ok}; set off {:?} is off (set) with no pool {off_ok}",
             if folder { "a folder" } else { "a file" },
             lever_line(&serving)?,
             if folder {
-                "off (fixed_place)"
+                "resolved by the plan"
             } else {
                 bloomery_levers::RESIDENCY_SERVING
             },
-            if folder { "" } else { ", then the pool" },
+            if folder {
+                "exactly where it is not off"
+            } else {
+                "(place)"
+            },
             lever_line(&gate)?,
             lever_line(&off)?,
         );
         check(
             &mut ok,
             "residency_default_is_the_machine",
-            exits && serving_word && in_order && gate_ok && off_ok && refused,
+            exits && serving_ok && gate_ok && off_ok,
         );
         Ok(ok)
     }

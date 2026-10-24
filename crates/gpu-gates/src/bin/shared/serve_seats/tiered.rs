@@ -13,7 +13,8 @@
 //! A model path is a GGUF split, or a checkpoint folder where the seat reads one
 //! ([`Tiered::read_model`]): the common run opens the folder once, plans by its located header,
 //! serves its tokenizer and hands the header and the part source to the engine thread
-//! ([`Folder`]). A folder's load runs no residency machine ([`folder_residency`]).
+//! ([`Folder`]). A folder's residency is a file's ([`Tiered::residency`]): the machine stages a
+//! located folder's routed experts from its parts.
 
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
@@ -339,28 +340,6 @@ pub fn settle_pick(plan: &Plan<'_>, pick: ResidencyPick) -> Result<(Residency, u
     ))
 }
 
-/// `BLOOMERY_RESIDENCY` for a checkpoint folder's load, which holds no host set the residency
-/// machine moves experts through: unset, `off` (the load is one the machine runs over no
-/// placement of), a set `off` as given, any other set word refused by name before the plan. The
-/// `residency lever` record is printed as a file's load prints it.
-fn folder_residency(levers: &Levers) -> Result<ResidencyPick, GateError> {
-    record::require(record::groups::tiered::LEVER, "tiered::folder_residency");
-    let pick = levers.residency_at(ResidencyAt::FIXED);
-    if pick.why == ResidencyWhy::Set && pick.word != "off" {
-        return Err(format!(
-            "BLOOMERY_RESIDENCY={} with a checkpoint folder: its load runs under off, the \
-             residency machine moves experts through a host set the folder's load does not hold",
-            pick.word
-        )
-        .into());
-    }
-    record::residency_lever(pick).eprint();
-    eprintln!(
-        "residency: a checkpoint folder's load holds no host set the machine moves experts through"
-    );
-    Ok(pick)
-}
-
 /// The routed experts `offer`'s plan holds on its expert tier cards, which the common unset rule
 /// weighs ([`Place::choose`] by [`Tiered::TIER_RULE`]): one slot's plan at the asked context, or
 /// at one position unset — a tier card holds no store, so its experts do not move with the
@@ -533,11 +512,7 @@ pub fn run<S: Tiered>(args: &[String], side: &side_seat::Flags) -> Result<ServeE
         Some(p) => (p, Some(plain)),
         None => (plain, None),
     };
-    let pick = if source.is_some() {
-        Some(folder_residency(&levers)?)
-    } else {
-        S::residency(&levers, &flags, place, &asked.plan)?
-    };
+    let pick = S::residency(&levers, &flags, place, &asked.plan)?;
     // A pick of `off` ends the stream rule at `off`: the load runs the plan without the ring, so the
     // card keeps those bytes for experts and context. The pick holds there, for `off` reads no
     // room.
