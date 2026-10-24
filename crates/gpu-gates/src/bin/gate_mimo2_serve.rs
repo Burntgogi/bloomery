@@ -70,7 +70,8 @@
 //!   record of the churn pool after it; at the largest total two slots hold
 //!   (the KV planes take the card, the plan holds no expert to spare; read
 //!   off the seat's refusal of a total past it) the common rule prints `off`
-//!   with why `no_card_experts` and no pool; under
+//!   and no pool, with why `no_card_experts` where the plan holds no card
+//!   expert and `no_room` where the rung's leftover holds a few; under
 //!   `BLOOMERY_RESIDENCY=off` it prints `off` with why `set` and no pool
 //!   record.
 //! - `plan_only_names_its_default`: `--plan` with no `--place`, `--ctx` or
@@ -202,8 +203,8 @@
 //!   of 0 leaves the resident bytes short of the stores; a budget without
 //!   the added stores plans another split and the plan line is red.
 //!
-//! One server more, `--ctx` [`CTX`], `--parallel 1`, `--cache-ram 1024`, its
-//! own load:
+//! One server more, `--ctx` [`CTX`], `--parallel 1`, `--cache-ram 1024`,
+//! `--slot-save-path` (the clause's `erase`), its own load:
 //!
 //! - `prefix_c_restores_the_nearest_checkpoint_from_the_host_cache` and
 //!   `prefix_c_ids_are_a_fresh_runs` ([`prefix_restore`]): prompt A of
@@ -1002,8 +1003,9 @@ mod gate {
     /// host` record of the churn pool after it; at the largest total two
     /// slots hold, whose KV planes leave the plan no card expert to spare —
     /// the `ask N or less` of the seat's refusal of the trained context a
-    /// slot — the common rule turns it `off` (why `no_card_experts`) with no pool;
-    /// and under
+    /// slot — the common rule turns it `off` with no pool, why `no_card_experts`
+    /// where the plan holds no card expert and `no_room` where the leftover of
+    /// the last rung holds a few; and under
     /// `BLOOMERY_RESIDENCY=off` it prints `off` and why `set`, and no pool.
     fn residency_default_is_the_machine(
         dir: &Path,
@@ -1054,16 +1056,32 @@ mod gate {
             &["--parallel", "2", "--ctx", &largest],
             Pins::default(),
         )?;
-        let no_room =
-            residency_lever_is(&wide, "off", "no_card_experts")? && no_residency_host(&wide)?;
+        // PIN(2026-10-24): was `no_card_experts` alone. The largest total is the greatest multiple of
+        // a rung a slot holds, so the card keeps under a rung of two slots' KV, which is under two
+        // experts a layer: no expert (`no_card_experts`), or a few the plan spreads over its layers,
+        // whose fewest (1) leaves the word no room (`no_room`). The plan's card experts say which.
+        let held = wide
+            .first(&record::PLAN)?
+            .ok_or("no plan record at the largest total")?
+            .u64("card_experts")?;
+        let why = if held == 0 {
+            "no_card_experts"
+        } else {
+            "no_room"
+        };
+        let seen = match wide.first(&record::RESIDENCY_LEVER)? {
+            Some(l) => format!("{} ({})", l.word("residency")?, l.word("why")?),
+            None => "no residency lever record".to_owned(),
+        };
+        let no_room = residency_lever_is(&wide, "off", why)? && no_residency_host(&wide)?;
         let (_, off_log, _) = plan_pinned(dir, "plan-residency-off", file, &["--ctx", &ctx], OFF)?;
         let off = residency_lever_is(&off_log, "off", "set")? && no_residency_host(&off_log)?;
         let exits = status.is_some_and(|s| s.success());
         println!(
             "residency default: exit 0 {exits}; at ctx {ctx} the lever record is mid-p0-s1 (place), \
              then the plan, then the pool {word} {in_order}; at --ctx {largest} over two slots \
-             it is off (no_card_experts) with no pool {no_room}; set off prints off (set) and no pool \
-             {off}"
+             the plan holds {held} card experts and the lever is {seen}: want off ({why}) with no \
+             pool {no_room}; set off prints off (set) and no pool {off}"
         );
         check(
             ok,
@@ -1668,6 +1686,9 @@ mod gate {
     /// (`prefix_c_restores_the_nearest_checkpoint_from_the_host_cache`).
     fn prefix_cache(dir: &Path, file: &Path, ok: &mut bool) -> Result<(), GateError> {
         let ctx = CTX.to_string();
+        // Every slot action needs a save directory, `erase` too (llama-server's order); the clause
+        // saves nothing there, and the server's own log directory is made before it starts.
+        let save = dir.join("prefix");
         let (mut s, d) = spawn_budgeted(
             dir,
             "prefix",
@@ -1681,6 +1702,8 @@ mod gate {
                 "0",
                 "--cache-ram",
                 PREFIX_RAM_MIB,
+                "--slot-save-path",
+                utf8(&save)?,
             ],
             gate_budget(),
         )?;

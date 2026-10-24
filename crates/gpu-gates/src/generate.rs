@@ -2055,10 +2055,12 @@ mod tests {
         assert_eq!(Place::Gate.cards(), vec![RTX_3090.name]);
         assert_eq!(Place::Bp.cards(), vec![A6000.name, RTX_3090.name]);
         assert_eq!(Place::Bp.tier_cards(), vec![RTX_3090.name]);
-        assert!(Place::A.tier_cards().is_empty());
+        assert!(Place::A.tier_cards().is_empty() && Place::Gate.tier_cards().is_empty());
+        // PIN(2026-10-24): a draft's card is a census fact (`draft_on`), so a placement not yet
+        // resolved against one names no device, the tier's included; was the tier card's name.
         assert_eq!(
             [Place::A, Place::Gate, Place::Bp].map(|p| p.draft_device().is_some()),
-            [false, false, true]
+            [false, false, false]
         );
         let a = Place::A.machine(None, None).expect("a");
         let gate = Place::Gate.machine(None, None).expect("gate");
@@ -2174,6 +2176,7 @@ mod tests {
                 strip(gate.machine(None, None).expect("gate")(43)),
                 workstation::plan_gate(43)
             );
+            assert_eq!((a.draft_device(), gate.draft_device()), (None, None));
             let w = format!("{a6000}+{}", 1 - a6000);
             let list = Place::parse(&w)
                 .expect("ordinals")
@@ -3193,8 +3196,15 @@ mod draft_card_tests {
             let e = at(Place::A, Some(v), &census(&["A6000", "3090"])).expect_err(v);
             assert!(e.contains(want), "{v}: {e}");
         }
+        // PIN(2026-10-24): the draft's card is asked of the resolved placement, so an empty census is
+        // the placement's refusal, not a lack of the A6000 by name.
         let e = at(Place::A, None, &[]).expect_err("no device");
-        assert!(e.contains("no visible device is A6000"), "{e}");
+        assert!(
+            e.starts_with(
+                "--place a: the placement takes the largest visible card, and 0 devices are visible"
+            ),
+            "{e}"
+        );
     }
 
     /// The card that joins a plan to hold the draft keeps the margin the lever gives it: the one

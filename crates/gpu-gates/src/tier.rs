@@ -1743,7 +1743,9 @@ mod tests {
         let error = fixture_budget_error(&path, 3, mismatch, None, "glm5next");
         assert!(error.contains(&path.display().to_string()), "{error}");
         assert!(error.contains("stale recorded fixture budget 3"), "{error}");
-        assert!(error.contains("not [4]"), "{error}");
+        // PIN(2026-10-24): a recorded budget is the least cap holding at least half, so the check
+        // names the half it fell short of ("not at least 4"), not an exact count ("not [4]").
+        assert!(error.contains("not at least 4"), "{error}");
         assert!(error.contains("regenerate the fixture"), "{error}");
         assert!(
             error
@@ -1755,7 +1757,8 @@ mod tests {
         let error = fixture_budget_error(&path, 3, mismatch, Some("q2kxl"), "glm5next");
         assert!(error.contains("variant q2kxl"), "{error}");
         assert!(error.contains("stale budget 3"), "{error}");
-        assert!(error.contains("not [4]"), "{error}");
+        // PIN(2026-10-24): as above, the half a plan fell short of.
+        assert!(error.contains("not at least 4"), "{error}");
         assert!(
             error.contains("just fixture-requant glm5next q2kxl"),
             "{error}"
