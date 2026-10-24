@@ -962,6 +962,16 @@ mod tests {
         }
     }
 
+    /// Flint's sigmoid top-six is not the biased top-eight binding, and no
+    /// compiled body runs its rule: the 256-expert top-6 instance runs the
+    /// biased sigmoid with the epsilon-added `SelectedSum`, so every other
+    /// pair of bias and policy, Flint's `SelectedSumFloor` with or without a
+    /// selection bias among them, is refused by name.
+    // PIN(2026-10-25): the biased `SelectedSum` pair was refused as
+    // `TopK { min: 8, max: 8 }` while only MiMo's top-8 row held 256 experts;
+    // the `sigmoid_256_6` instance's row now serves exactly that pair
+    // (`sigmoid_256_6_router_is_its_row_beside_mimos_top_8` pins its identity).
+    // The other five pairs keep `NoRouterRule`.
     #[test]
     fn flints_sigmoid_top_six_is_not_the_biased_top_eight_binding() {
         for bias in [false, true] {
@@ -975,14 +985,16 @@ mod tests {
                     norm,
                     ..rules::BIASED_SIGMOID
                 };
-                let refusal = select_router(moe(rule, 256, 6))
-                    .expect_err("a sigmoid top-six binding was fabricated");
-                let expected = if bias && norm == RouterNorm::SelectedSum {
-                    Refusal::TopK { min: 8, max: 8 }
-                } else {
-                    Refusal::NoRouterRule
-                };
-                assert_eq!(refusal.why, expected);
+                let selected = select_router(moe(rule, 256, 6));
+                if bias && norm == RouterNorm::SelectedSum {
+                    assert!(
+                        selected.is_ok(),
+                        "the 256/6 instance's own rule: {selected:?}"
+                    );
+                    continue;
+                }
+                let refusal = selected.expect_err("a sigmoid top-six binding was fabricated");
+                assert_eq!(refusal.why, Refusal::NoRouterRule);
             }
         }
     }
@@ -1123,9 +1135,10 @@ mod tests {
         assert!(matches!(x.why, Refusal::TopK { .. }), "{x}");
     }
 
-    /// Flint's 256 experts at top 6 is its own row, after MiMo's top 8.
-    /// `router_row` at 256 stays MiMo's. Top 7 matches neither pick range
-    /// and is refused with the first row's range.
+    /// The biased sigmoid at 256 experts and top 6 is its own row, after
+    /// MiMo's top 8. Flint's rule is not this one (it divides by the floor
+    /// policy), so Flint has no row. `router_row` at 256 stays MiMo's. Top 7
+    /// matches neither pick range and is refused with the first row's range.
     #[test]
     fn sigmoid_256_6_router_is_its_row_beside_mimos_top_8() {
         let rule = rules::BIASED_SIGMOID;

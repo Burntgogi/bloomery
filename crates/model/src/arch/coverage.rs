@@ -1745,8 +1745,8 @@ const NEMOTRON_ROUTERS: &[(u32, u32)] =
 /// by name — glm5next's `glm5next`, mimo2's `mimo2` and solar2's
 /// `sigmoid_320_8` (`gpu-deepseek41/src/router.rs`), raon1's
 /// `sigmoid_128_6` (`gpu/src/route_body.rs`). A shape-named instance no
-/// family imports (`sigmoid_256_6`, Flint's) is none of theirs, so its
-/// needs are items for these programs.
+/// family imports (`sigmoid_256_6`) is none of theirs, so its needs are
+/// items for these programs.
 const SIGMOID_ROUTERS: &[(u32, u32)] = &[(288, 8), (256, 8), (320, 8), (128, 6)];
 
 /// The muse-spark body's router instances: the file's 256 experts with the
