@@ -75,7 +75,19 @@ const fn flag(name: &'static str) -> Part {
 /// A binary of this crate calls this one: the core's `bloomery_record::at_main`
 /// alone registers the kinds and leaves the leak sink out.
 pub fn at_main(bin: &'static str, kinds: &'static [&'static Kind]) {
-    bloomery_record::at_main(bin, kinds);
+    at_main_with_flags(bin, kinds, |name| {
+        std::env::args_os().skip(1).any(|a| a == name)
+    });
+}
+
+/// Initialize the records and leak sink as [`at_main`] does, querying the
+/// caller's parsed option words instead of its raw arguments.
+pub fn at_main_with_flags(
+    bin: &'static str,
+    kinds: &'static [&'static Kind],
+    has_flag: impl FnOnce(&str) -> bool,
+) {
+    bloomery_record::at_main_with_flags(bin, kinds, has_flag);
     #[cfg(feature = "gpu")]
     if kinds.iter().any(|k| std::ptr::eq(*k, &RESIDENCY_LEAK)) {
         bloomery_gpu::host::swap::set_leak_sink(eprint_leak);

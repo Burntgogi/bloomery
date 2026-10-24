@@ -208,10 +208,22 @@ static PENDING: Mutex<Vec<Needs>> = Mutex::new(Vec::new());
 /// kinds ([`print_schema`]) and exit 0; otherwise register them, after which
 /// [`Record::line`] refuses a line of any other kind, and check the groups
 /// [`require`] was given before this call. Called right after
-/// `bloomery_levers::at_main`, before any argument parse or load; a second
-/// call with another binary or list panics by name.
+/// `bloomery_levers::at_main`, before any load; a second call with another
+/// binary or list panics by name.
 pub fn at_main(bin: &'static str, kinds: &'static [&'static Kind]) {
-    if std::env::args_os().skip(1).any(|a| a == "--records-schema") {
+    at_main_with_flags(bin, kinds, |name| {
+        std::env::args_os().skip(1).any(|a| a == name)
+    });
+}
+
+/// Register or print the kinds as [`at_main`] does, querying only the
+/// caller's option words for `--records-schema`, not consumed values.
+pub fn at_main_with_flags(
+    bin: &'static str,
+    kinds: &'static [&'static Kind],
+    has_flag: impl FnOnce(&str) -> bool,
+) {
+    if has_flag("--records-schema") {
         print_schema(bin, kinds);
         std::process::exit(0);
     }

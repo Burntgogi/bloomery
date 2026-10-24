@@ -5,7 +5,7 @@
     tools/check-records.py schema [--root DIR] [--strict]
     tools/check-records.py --self-test
 
-`record::at_main(bin, LIST)` (crates/gpu-gates/src/record.rs) registers what a process may print,
+`record::at_main` and `record::at_main_with_flags` register what a process may print,
 and a line of any other kind panics by name. A seat's list is written by hand, but shared modules
 print too, after the seat registered. Twice a seat reached a shared module's print without
 registering its kind (the GLM seat and `vision`, the GLM and V4.1 seats and the `hf` fetch lines),
@@ -26,7 +26,7 @@ The rule this check holds, with `record::require` (the runtime half) beside it:
         resolved to the kinds the builder constructs, the builders it calls included; the file's
         `#[cfg(test)] mod tests` block is left out. A `Record::new(` whose argument is not `&KIND`
         is a violation (the check could not read it).
-      - a *root* is a file that calls `record::at_main`; its list is the static it names, composed
+      - a *root* is a file that calls either record startup entry; its list is the static it names, composed
         by `kinds!`.
       - the files a root *reaches* are the files its module-name references lead to, transitively
         (`X::` in the text, `X` in a `use` list, a module declared by `mod`/`#[path]` through
@@ -409,10 +409,10 @@ class Gates:
         out = {}
         for f in sorted(self.files - {RECORD}):
             t = self.src.code(f)
-            for m in re.finditer(r"\brecord::at_main\(", t):
+            for m in re.finditer(r"\brecord::at_main(?:_with_flags)?\(", t):
                 end = bracket_end(t, m.end() - 1, "(", ")")
                 args = t[m.end() : end - 1]
-                am = re.fullmatch(r"\s*[^,]+,\s*((?:[A-Za-z_0-9]+::)*)([A-Z][A-Z_0-9]*)\s*,?\s*", args, re.S)
+                am = re.fullmatch(r"\s*[^,]+,\s*((?:[A-Za-z_0-9]+::)*)([A-Z][A-Z_0-9]*)\s*(?:,\s*.*)?\s*", args, re.S)
                 if not am:
                     out.setdefault(f, []).append((None, args.strip()))
                     continue
@@ -576,9 +576,9 @@ def kind_names(g):
 
 
 def list_of_bin(g, bin_):
-    """The list name `record::at_main("<bin_>", LIST)` registers, or None."""
+    """The static list registered for the literal binary name, including parsed-flag startup."""
     for f in sorted(g.files - {RECORD}):
-        for m in re.finditer(r"\brecord::at_main\(\s*\"([^\"]*)\"\s*,\s*(?:[A-Za-z_0-9]+::)*([A-Z][A-Z_0-9]*)\s*\)", g.src.code(f)):
+        for m in re.finditer(r"\brecord::at_main(?:_with_flags)?\(\s*\"([^\"]*)\"\s*,\s*(?:[A-Za-z_0-9]+::)*([A-Z][A-Z_0-9]*)\s*(?:,|\))", g.src.code(f)):
             if m.group(1) == bin_:
                 return m.group(2)
     return None
@@ -601,7 +601,7 @@ def cmd_schema(root, strict):
         problems = []
         kinds = g.rec.resolve(lst, problems, bin_) if lst else None
         if kinds is None:
-            print(f"schema {bin_}: no record::at_main registers a list under that name {problems}")
+            print(f"schema {bin_}: no record startup registers a list under that name {problems}")
             differ += 1
             continue
         want = [names[k] for k in kinds]
@@ -792,6 +792,13 @@ def self_test():
     # root that reaches the file lists A and C
     via_builder = "use crate::record::{self, Record};\npub struct Item;\npub fn enter() {\n    record::made_ab().print();\n}\n"
     expect("a builder call resolves to the kinds it constructs", fixture(grouped=False, shared=via_builder, two="let _ = 1;"), "prints B, which one.rs's list ROOT1 lacks")
+    parsed_startup = fixture(grouped=False, shared=via_builder, two="let _ = 1;")
+    parsed_startup["bin/one.rs"] = parsed_startup["bin/one.rs"].replace(
+        'record::at_main("one", record::ROOT1)',
+        'record::at_main_with_flags("one", record::ROOT1, |flag| matches!(flag, "--records-schema"))',
+    )
+    expect("parsed-flag startup still rejects an unregistered printed kind", parsed_startup,
+           "prints B, which one.rs's list ROOT1 lacks")
 
     # a `pub use` re-export edge: the root names the item only through the crate path
     only_a = "use crate::record::{self, Record};\npub struct Item;\npub fn enter() {\n    Record::new(&crate::record::B).print();\n}\n"
