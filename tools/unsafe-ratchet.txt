@@ -529,7 +529,7 @@ gguf 7 2 0
 # body (`mxfp8_cols_body`: its load and its two plane stores) and the two kernel entries' body calls and shared-memory
 # view. Each block has its SAFETY line.
 # PIN(2026-10-24): gpu 2331 -> 2333 blocks, a new six-slot F32 tier entry, not old code relaxed:
-# ds41_ffn_handoff_6_tier calls handoff_at and handoff_tier_at under its checked launch contract;
+# ffn_handoff_6_tier calls handoff_at and handoff_tier_at under its checked launch contract;
 # both blocks state their per-thread bounds and disjoint-write SAFETY invariant.
 gpu 2333 306 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
