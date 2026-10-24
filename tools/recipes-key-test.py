@@ -402,14 +402,14 @@ class RecipeKeyCLI(unittest.TestCase):
                                      {"gate-called": "run", "gate-linked": "skip"})
 
     def test_parameterized_source_macro_keeps_argument_bound_calls(self):
-        for parameter in ("module", "모듈", "crate\u0301x"):
-            with self.subTest(parameter=parameter):
+        for parameter, name in (("module", "call"), ("모듈", "call"), ("crate\u0301x", "call"), ("module", "실행")):
+            with self.subTest(parameter=parameter, name=name):
                 files = runtime_files()
                 files["crates/app/src/bin/called.rs"] = "fn main() { dep::run(); }\n"
                 files["crates/dep/src/lib.rs"] += (
                     "mod hidden;\n"
-                    f"macro_rules! call {{ (${parameter}:ident) => {{ ${parameter}::run() }}; }}\n"
-                    "pub fn run() { call!(hidden); }\n"
+                    f"macro_rules! {name} {{ (${parameter}:ident) => {{ ${parameter}::run() }}; }}\n"
+                    f"pub fn run() {{ {name}!(hidden); }}\n"
                 )
                 files["crates/dep/src/hidden.rs"] = 'pub fn run() { println!("hidden1"); }\n'
                 ws = Workspace(self, files)

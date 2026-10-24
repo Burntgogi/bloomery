@@ -3459,7 +3459,7 @@ def _key_syntax(text: str) -> KeySyntax:
     calls = frozenset(match.group(1) for match in _MACRO_PATH_CALL.finditer(shape))
     return KeySyntax(
         frozenset(re.findall(r"\bextern\s+crate\s+([A-Za-z_]\w*)", shape)),
-        opaque or bool(re.search(r"(?<![\w:>\]])::|r#[A-Za-z_]", shape)),
+        opaque or not shape.isascii() or bool(re.search(r"(?<![\w:>\]])::|r#[A-Za-z_]", shape)),
         linkage or bool(re.search(r'\bextern\s*(?:"[^"]*"\s*)?\{', code))
         or bool(re.search(r'\binclude!\s*\(\s*(?!")\S', code)
                 or re.search(r'\binclude!\s*\(\s*"[^"]*(?<!\.rs)"', code)),
