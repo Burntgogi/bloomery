@@ -1478,13 +1478,15 @@ pub const LEG_TIER_CHUNK: u64 = 8;
 /// blocks of the host union's columns. [`tier_batch`] is the qwen4exp plan's
 /// figure.
 #[must_use]
-pub fn leg_tier_batch(hp: &Hparams) -> TierBatchBytes {
+pub fn leg_tier_batch(hp: &Hparams) -> Result<TierBatchBytes, PlacementError> {
     workstation::tier_leg_batch_bytes(
         hp.n_embd as u64,
         hp.expert_ff as u64,
         hp.n_used as u64,
         LEG_TIER_CHUNK,
         crate::moe::UNION_MAX_COLS as u64,
+        crate::placement::kernels::DownForms::of(crate::placement::kernels::DownAct::Q8Act)
+            .with(crate::placement::kernels::DownAct::Q8Blocks32),
     )
 }
 
@@ -1518,6 +1520,7 @@ const fn tier_batch_of(n_embd: u64, n_used: u64, ubatch: u64) -> TierBatchBytes 
         staging: tier_batch_staging_bytes(n_embd, n_used, cols),
         scratch: tier_route_scratch_bytes(cols),
         host: tier_batch_host_bytes(n_embd, n_used, cols),
+        leg: None,
     }
 }
 
@@ -2346,6 +2349,7 @@ fn draft_machine() -> Machine {
     Machine {
         cards: vec![Card {
             name: "mtp draft".to_string(),
+            tier_leg: None,
             device: None,
             usable_bytes: u64::MAX,
             context_bytes: 0,
@@ -2824,6 +2828,7 @@ mod tests {
             Machine {
                 cards: vec![Card {
                     name: "card".to_string(),
+                    tier_leg: None,
                     device: None,
                     usable_bytes: usable,
                     context_bytes: 0,
@@ -3595,6 +3600,7 @@ mod tests {
             Machine {
                 cards: vec![Card {
                     name: "card".to_string(),
+                    tier_leg: None,
                     device: None,
                     usable_bytes: 1 << 40,
                     context_bytes: 0,
@@ -4509,6 +4515,7 @@ mod tests {
                     staging: 496_730_112,
                     scratch: 348_980_248,
                     host: 839_188_480,
+                    leg: None,
                 }
             );
             assert_eq!(
@@ -4517,6 +4524,7 @@ mod tests {
                     staging: 62_091_264,
                     scratch: 87_233_816,
                     host: 104_898_560,
+                    leg: None,
                 }
             );
         }
