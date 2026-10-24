@@ -3935,10 +3935,12 @@ fn row_cost(p: &PairWork<'_>) -> u64 {
 /// Instructions per super-block of qdot's tile kernels, in half-instruction
 /// units: the fixed unpack of one run of a weight row, and each column's
 /// share (the block loop of `qdot::tile::<C>` in the disassembly, an inner
-/// loop counted at its trips, C = 2 and 4, fitted as fixed + C · per column).
-/// A lone column's `dot_row` costs about a run of one. `None`: no tile
-/// kernel. `tools/ref/tile-units.sh` derives every row from the kernels and
-/// ends 1 on a row the code has left behind.
+/// loop counted at its trips, C = 2 and 4, fitted as fixed + C · per column;
+/// a type with a wide kernel, `qdot::has_wide`, the wide kernel's block loop
+/// at runs of 16 and 32 columns, the runs it is priced at). A lone column's
+/// `dot_row` costs about a run of one. `None`: no tile kernel.
+/// `tools/ref/tile-units.sh` derives every row from the kernels and ends 1 on
+/// a row the code has left behind.
 fn tile_units(ty: GgmlType) -> Option<(u64, u64)> {
     match ty {
         GgmlType::Q2_K => Some((78, 94)),
@@ -3949,9 +3951,10 @@ fn tile_units(ty: GgmlType) -> Option<(u64, u64)> {
         GgmlType::IQ4_XS => Some((146, 95)),
         // The grid types decode a super-block's eight sub-blocks in a loop, so their fixed part is large.
         GgmlType::IQ2_XS => Some((624, 102)),
-        // The IQ2_XXS tile is the wide kernel's one group (`qdot::dot_row_cols_wide`): the block's
-        // pack, and each column's eight sub-blocks against it with its sum in a register.
-        GgmlType::IQ2_XXS => Some((584, 92)),
+        // The IQ2_XXS wide kernel (`qdot::dot_row_cols_wide`): the block's pack, the signed and
+        // offset values and the scales of its eight sub-blocks, then each column's eight sub-blocks
+        // against it in groups of eight, its sum in a register.
+        GgmlType::IQ2_XXS => Some((600, 75)),
         GgmlType::IQ3_XXS => Some((692, 106)),
         GgmlType::IQ3_S => Some((780, 96)),
         // Per 32-value block (`qdot::k_granularity`): a quarter of an x4 group's instructions.
@@ -6752,9 +6755,10 @@ pub fn warm_share(
 #[cfg(test)]
 mod tests {
     use super::{
-        ExpertStack, GroupInput, RowLayout, Tensor2, UnionCall, UnionPlanView, UnionStack, Weight,
-        first_non_finite_col, matmul_q, matmul_q_group, matmul_q_group_into, matmul_q_group_swiglu,
-        matvec_q_local, parse_steal, tile_cost_of, tile_units, unit_tile_cost,
+        ExpertStack, GroupInput, PostNorm, RowLayout, Tensor2, UnionCall, UnionPlanView,
+        UnionStack, Weight, first_non_finite_col, matmul_q, matmul_q_group, matmul_q_group_into,
+        matmul_q_group_swiglu, matvec_q_local, parse_steal, tile_cost_of, tile_units,
+        unit_tile_cost,
     };
     use gguf::{GgmlType, Gguf};
 
@@ -7414,6 +7418,38 @@ mod tests {
             "first_non_finite_col: {n_cases} cases over {ne1} columns, {t} pool threads, chunk \
              {s}..{e}"
         );
+    }
+
+    /// The norm is the gain, then the row over the root of its mean square plus
+    /// the epsilon: a width of whole eights and one with a tail both match the
+    /// rule in f64 to the f32 sums' rounding.
+    #[test]
+    fn the_post_norm_is_the_gain_then_the_rms_rule() {
+        for n in [256usize, 261] {
+            let gain: Vec<f32> = (0..n).map(|i| 0.5 + 0.01 * (i % 17) as f32).collect();
+            let row: Vec<f32> = (0..n)
+                .map(|i| ((i * 37) % 101) as f32 / 50.0 - 1.0)
+                .collect();
+            let eps = 1e-5f32;
+            let post = PostNorm::new(gain.clone(), eps).unwrap();
+            let mut got = row.clone();
+            post.norm(&mut got);
+            let scaled: Vec<f64> = row
+                .iter()
+                .zip(&gain)
+                .map(|(&r, &g)| f64::from(r) * f64::from(g))
+                .collect();
+            let mean_sq = scaled.iter().map(|v| v * v).sum::<f64>() / n as f64;
+            let scale = 1.0 / (mean_sq + f64::from(eps)).sqrt();
+            let peak = scaled.iter().map(|v| (v * scale).abs()).fold(0.0, f64::max);
+            for (i, (&g, v)) in got.iter().zip(&scaled).enumerate() {
+                let want = v * scale;
+                assert!(
+                    (f64::from(g) - want).abs() <= 1e-5 * peak,
+                    "width {n} value {i}: {g} against the rule's {want}"
+                );
+            }
+        }
     }
 }
 

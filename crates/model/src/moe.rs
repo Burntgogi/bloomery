@@ -3620,6 +3620,50 @@ mod tests {
         }
     }
 
+    /// A post-expert norm as wide as the down's rows is the layer's; one of
+    /// any other width — narrower, or the gate's rows — is refused by name
+    /// and leaves the layer without a norm.
+    #[test]
+    fn host_layer_set_post_norm_refuses_another_width() {
+        let (embd, ff, n_expert) = (256, 512, 2);
+        let path = layer_file("postnorm", [GgmlType::Q4_K; 3], embd, ff, n_expert);
+        let split = gguf::Split::open(&path).unwrap();
+        let built = build_layer(&split, embd, ff, n_expert);
+        std::fs::remove_file(&path).unwrap();
+        let mut layer = built.unwrap();
+        for width in [embd / 2, ff] {
+            let post = ops::PostNorm::new(vec![1.0; width], 1e-6).unwrap();
+            match layer.set_post_norm(post) {
+                Err(crate::ModelError::Shape {
+                    what,
+                    want_ne0,
+                    got_ne0,
+                    ..
+                }) => {
+                    assert_eq!(
+                        what, "host layer post-expert norm: a gain of the down's rows",
+                        "the refusal names the norm"
+                    );
+                    assert_eq!(
+                        (want_ne0, got_ne0),
+                        (embd, width),
+                        "the refusal names both widths"
+                    );
+                }
+                Err(e) => panic!("a gain of {width} rows is refused by its own name, got {e}"),
+                Ok(()) => panic!("a gain of {width} rows on a layer of {embd} must be refused"),
+            }
+            assert!(layer.post.is_none(), "a refused norm is not kept");
+        }
+        let post = ops::PostNorm::new(vec![1.0; embd], 1e-6).unwrap();
+        layer.set_post_norm(post).unwrap();
+        assert_eq!(
+            layer.post.as_ref().map(ops::PostNorm::width),
+            Some(embd),
+            "a gain of the down's rows is the layer's norm"
+        );
+    }
+
     /// A relu² layer's build, by name: a spec whose stacks carry other dims
     /// than it says is refused with the stack's own error; a relu² layer that
     /// built reads its up again in the stacks' gate slot — the file's gate

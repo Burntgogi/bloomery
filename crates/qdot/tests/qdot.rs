@@ -2537,9 +2537,9 @@ fn hw_iq2xs_kernel_predicts_ik() {
 }
 
 // ------------------------------------------------------- IQ2_XXS x Q8_K
-// ggml's x86 vec dot is the reference and no harness dumps it, so the gates stand on the
-// crate's own oracles: kernel vs mirror (bit identity, the twins' contract), ours vs the
-// dequant oracle (a band, below) and tile vs dot_row (bit identity).
+// The kernel is ik's `mul_mat_qX_K_q8_K_IQ_N<DequantizerIQ2XXS, nrc_y>` and no harness dumps
+// it, so the gates stand on the crate's own oracles: kernel vs mirror (bit identity, the twins'
+// contract), ours vs the dequant oracle (a band, below) and tile vs dot_row (bit identity).
 
 /// An IQ2_XXS block: f16 `d`, then per sub-block `s` the four grid index bytes `idx(4s)`
 /// .. `idx(4s + 3)` and the sign/scale word `aux(s)` (bits `7l .. 7l + 7` group `l`'s
@@ -2625,11 +2625,16 @@ fn hw_iq2xxs_kernel_matches_mirror() {
 /// exactly in f64, at the hand-built block ([`iq2xxs_hand_block`]), the ends' one- and
 /// three-block rows and sixteen random blocks, through `dot_row` and `dot_row_scalar`.
 ///
-/// The oracle's weights carry two f32 roundings a term (`db`, then the value), ours one
-/// fmadd a block and the closing hsum's three adds a lane, and the ×0.125 is exact, so
-/// the band is `gamma_(nb + 10) · Σ|term|` with `gamma_n = n·u / (1 − n·u)` and
-/// `u = 2^-24` — both sides' roundings over the exact dot. A wrong grid byte, sign bit or
-/// scale nibble moves a whole term.
+/// The oracle's weights carry two f32 roundings a term (`db`, then the value). Ours sums
+/// exact integer lanes in two fmadds a block and lane — the bsums fold's against the
+/// rounded `-43·d·dy`, the codes' against the rounded `d·dy` — then the closing hsum's three
+/// adds; `d = 0.125·f16` and `43·d` are exact. A lane's codes sum carries each value's code
+/// times `|grid| + 43` and its fold takes `43·Σ code` of one sub-block back out, so the sums
+/// those roundings act on are bounded by `Σ 0.125·|d|·(2s + 1)·(|grid| + 86)·|dy·q|`, that is
+/// `Σ (|w| + 0.125·|d|·(2s + 1)·86)·|dy·q|` over the values. The band is
+/// `gamma_(2nb + 10)` of that sum, with `gamma_n = n·u / (1 − n·u)` and `u = 2^-24`: both
+/// sides' roundings over the exact dot. A wrong grid byte, sign bit, scale nibble or fold
+/// term moves a whole term, far past it.
 #[test]
 fn iq2xxs_dot_is_within_its_f64_bound() {
     let mut rng = Lcg(0x2C_0F7E);
@@ -2647,7 +2652,8 @@ fn iq2xxs_dot_is_within_its_f64_bound() {
         for _ in 0..4 {
             rows.push(iq_random_block(&mut rng, 66, &[0]).repeat(nb));
         }
-        let n_u = (nb + 10) as f64 * 2f64.powi(-24);
+        // PIN(2026-10-23): gamma_(2nb + 10) over the offset sums, was gamma_(nb + 10) over Σ|term|: ik's form (hostsimd3) adds the fold's fmadd a block and lane, and its lanes carry the ±43 offset.
+        let n_u = (2 * nb + 10) as f64 * 2f64.powi(-24);
         for (r, row) in rows.iter().enumerate() {
             let mut w = vec![0.0f32; k];
             dequant_row(GgmlType::IQ2_XXS, row, &mut w).unwrap();
@@ -2655,10 +2661,15 @@ fn iq2xxs_dot_is_within_its_f64_bound() {
             for (b, wb) in w.as_chunks::<256>().0.iter().enumerate() {
                 let blk = &acol[296 * b..296 * (b + 1)];
                 let dy = f64::from(f32::from_le_bytes(blk[0..4].try_into().unwrap()));
-                for (&wv, &q) in wb.iter().zip(&blk[8..264]) {
-                    let term = f64::from(wv) * (dy * f64::from(q as i8));
+                let wblk = &row[66 * b..66 * (b + 1)];
+                let dw = f64::from(half_to_f32(u16::from_le_bytes([wblk[0], wblk[1]])));
+                for (n, (&wv, &q)) in wb.iter().zip(&blk[8..264]).enumerate() {
+                    // Sub-block n / 32's scale nibble, the top of its word's last byte.
+                    let sc = f64::from(2 * (wblk[9 + 8 * (n / 32)] >> 4) + 1);
+                    let yq = dy * f64::from(q as i8);
+                    let term = f64::from(wv) * yq;
                     exact += term;
-                    abs += term.abs();
+                    abs += (f64::from(wv).abs() + 0.125 * dw.abs() * sc * 86.0) * yq.abs();
                 }
             }
             let bound = n_u / (1.0 - n_u) * abs;

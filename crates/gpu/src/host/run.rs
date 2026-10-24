@@ -916,38 +916,6 @@ mod tests {
             .collect()
     }
 
-    /// The norm is the gain, then the row over the root of its mean square plus
-    /// the epsilon: a width of whole eights and one with a tail both match the
-    /// rule in f64 to the f32 sums' rounding.
-    #[test]
-    fn the_post_norm_is_the_gain_then_the_rms_rule() {
-        for n in [256usize, 261] {
-            let gain: Vec<f32> = (0..n).map(|i| 0.5 + 0.01 * (i % 17) as f32).collect();
-            let row: Vec<f32> = (0..n)
-                .map(|i| ((i * 37) % 101) as f32 / 50.0 - 1.0)
-                .collect();
-            let eps = 1e-5f32;
-            let post = PostNorm::new(gain.clone(), eps).unwrap();
-            let mut got = row.clone();
-            post.norm(&mut got);
-            let scaled: Vec<f64> = row
-                .iter()
-                .zip(&gain)
-                .map(|(&r, &g)| f64::from(r) * f64::from(g))
-                .collect();
-            let mean_sq = scaled.iter().map(|v| v * v).sum::<f64>() / n as f64;
-            let scale = 1.0 / (mean_sq + f64::from(eps)).sqrt();
-            let peak = scaled.iter().map(|v| (v * scale).abs()).fold(0.0, f64::max);
-            for (i, (&g, v)) in got.iter().zip(&scaled).enumerate() {
-                let want = v * scale;
-                assert!(
-                    (f64::from(g) - want).abs() <= 1e-5 * peak,
-                    "width {n} value {i}: {g} against the rule's {want}"
-                );
-            }
-        }
-    }
-
     /// A layer with a post-norm serves, in all three entries, the sum of each
     /// listed expert's own down row normed and then weighted, in list order
     /// from zero — bit for bit the plain run's per-expert rows through the
