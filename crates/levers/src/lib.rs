@@ -1505,6 +1505,9 @@ pub enum ResidencyWhy {
     },
     /// Unset, the plan holds no card expert.
     NoCardExperts,
+    /// Unset, the plan holds no host expert: the machine would have none to
+    /// move onto the card, and its spares would only displace card experts.
+    NoHostExperts,
     /// Unset, the plan's fewest card experts a layer (`fewest`) leave no
     /// room for the word's P or half of them.
     NoRoom { fewest: usize },
@@ -1534,6 +1537,7 @@ impl ResidencyWhy {
             ResidencyWhy::PrefillSteps => "prefill_steps",
             ResidencyWhy::Shrunk { .. } => "shrunk",
             ResidencyWhy::NoCardExperts => "no_card_experts",
+            ResidencyWhy::NoHostExperts => "no_host_experts",
             ResidencyWhy::NoRoom { .. } => "no_room",
             ResidencyWhy::Unhosted(_) => "pool_unhosted",
             ResidencyWhy::PoolShrunk { .. } => "pool_shrunk",
@@ -1552,6 +1556,9 @@ impl ResidencyWhy {
             )),
             ResidencyWhy::NoCardExperts => {
                 Some("unset: the plan holds no routed expert on the card".to_string())
+            }
+            ResidencyWhy::NoHostExperts => {
+                Some("unset: the plan holds no routed expert on the host".to_string())
             }
             ResidencyWhy::NoRoom { fewest } => Some(format!(
                 "unset: the plan's fewest card experts a layer ({fewest}) leave no room for the \
@@ -1913,13 +1920,18 @@ fn mid_word(p: usize, s: usize) -> &'static str {
 /// [`ResidencyWhy::Shrunk`] the word runs at the P the card slots leave,
 /// through [`ResidencyWhy::PoolShrunk`] at the first P whose pool the host
 /// takes, `off` with why where the card slots or the host leave none, on
-/// every body: an unset word never asks for its pool unhosted. A default the
+/// every body: an unset word never asks for its pool unhosted. `off` too
+/// where the plan holds no host expert (`host_experts`, the routed experts it
+/// leaves on no card; a plan with card experts only): the machine has none to
+/// move onto the card and its spares would only displace card experts, the
+/// clause [`residency38_at_plan`] holds for the Qwen3.8 word. A default the
 /// user did not set never refuses the load. A set word and every other why
 /// pass through untouched. An error of `pool_bytes` is the call's.
 pub fn residency_at_plan<E>(
     carry: UnhostedPool,
     pick: ResidencyPick,
     card_experts: impl IntoIterator<Item = u64>,
+    host_experts: u64,
     pool_bytes: impl Fn(usize) -> Result<u64, E>,
     headroom: i128,
     mem_left: i128,
@@ -1930,12 +1942,19 @@ pub fn residency_at_plan<E>(
     let Some(ResidencyWord::Mid { pinned, spares, .. }) = residency_word(pick.word) else {
         return Ok(pick);
     };
+    let layers: Vec<u64> = card_experts.into_iter().collect();
+    if host_experts == 0 && layers.iter().any(|&n| n > 0) {
+        return Ok(ResidencyPick {
+            word: "off",
+            why: ResidencyWhy::NoHostExperts,
+        });
+    }
     Ok(
         match room_for(
             carry.takes(false),
             pinned,
             spares,
-            card_experts,
+            layers,
             pool_bytes,
             headroom,
             mem_left,

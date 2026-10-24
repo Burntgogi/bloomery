@@ -47,10 +47,11 @@
 //!   from the environment prints the `residency lever` record ahead of the plan with a why the
 //!   plan resolved (not `set`, not `fixed_place`): the serving word
 //!   (`bloomery_levers::RESIDENCY_SERVING`) where it prints `place`, `off` where the plan left no
-//!   room for it, and the `residency host` record of the churn pool after the plan exactly where
-//!   the word is not `off`. `--place gate` prints `off` with why `fixed_place` and no pool.
-//!   `BLOOMERY_RESIDENCY=off` prints `off` with why `set` and no pool. FAIL-first: a seat whose
-//!   residency returns no pick prints no lever and the clause is red; a seat that treats `gate`
+//!   room for it or holds no host expert to move onto the card, and the `residency host` record of
+//!   the churn pool after the plan exactly where the word is not `off`. `--place gate` prints `off`
+//!   with why `fixed_place` and no pool. `BLOOMERY_RESIDENCY=off` prints `off` with why `set` and
+//!   no pool. FAIL-first: a seat whose residency returns no pick prints no lever and the clause is
+//!   red; a seat that treats `gate`
 //!   as a serving placement prints the serving word and the gate half is red; a seat that omits
 //!   the lever from the ones it acts on refuses `off` by name and the off half is red.
 //! - `stream_ring_is_planned`: `--place a --plan` at [`CTX`] three ways: `BLOOMERY_XSTREAM`
@@ -66,8 +67,12 @@
 //! - `xstream_line_follows_the_rule`: after the server of `load_and_listen` below has run, its
 //!   stderr carries one `xstream=` line, and the line is the rule's for the plan it loaded: `admit`
 //!   where the placement holds an expert tier card, `split` where the plan holds host experts on
-//!   plan (a), `off` (naming the plan's no host expert) where it holds none. FAIL-first: a seat
-//!   that resolves no word prints no line and the clause is red.
+//!   plan (a), `off` beside no residency where it holds none (the unset residency is `off` with
+//!   why `no_host_experts`, which the `residency lever` record names: the machine has no host
+//!   expert to move onto the card, so the rule's residency-off branch ends the line). FAIL-first:
+//!   a seat that resolves no word prints no line and the clause is red; a seat whose residency
+//!   machine runs over the all-card plan resolves `mid-p0-s1` and the clause is red on the
+//!   lever and on the line.
 //! - `parallel_above_one_is_refused` (shared): `--parallel 2 --plan` exits non-zero, its stderr
 //!   names the body's one sequence, and no `plan` record is printed. FAIL-first: a seat that takes
 //!   a second slot (`Tiered::RESIDENT`) prints its plan and the clause is red.
@@ -453,7 +458,14 @@ mod gate {
         } else if host > 0 {
             line.starts_with("xstream=split")
         } else {
-            line.starts_with("xstream=off") && line.contains("no host expert")
+            let lever = log.first(&record::RESIDENCY_LEVER)?;
+            let off_for_it = match &lever {
+                Some(l) => l.word("residency")? == "off" && l.word("why")? == "no_host_experts",
+                None => false,
+            };
+            off_for_it
+                && line.starts_with("xstream=off")
+                && line.ends_with("(unset: no residency or not --place a)")
         };
         println!(
             "the load's {line:?}: the plan holds {host} host experts{}: the rule's word {follows}",

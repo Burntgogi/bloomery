@@ -946,8 +946,9 @@ impl XStream {
                 XSTREAM_ROOM,
                 format!(
                     "the card holds {free} B free, {room} B past the {} B the ring leaves free: \
-                     {fit} slots a half of {per_slot} B, fewer than the {} a stream needs",
-                    cfg.keep_free, cfg.min_half
+                     {fit} slots of {per_slot} B fit a half, the map holds at most {} host \
+                     experts a layer, so a half of {half}, fewer than the {} a stream needs",
+                    cfg.keep_free, cfg.max_half, cfg.min_half
                 ),
             ));
         }

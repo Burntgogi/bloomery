@@ -4,9 +4,10 @@
 //! [`bloomery_levers::residency_at_plan`] resolves against its plan). The
 //! families' rules differ by clause and record (`residency38`, the GLM seat,
 //! the V4.1 and MiMo seats print their own whys); the inputs they read of the
-//! plan are these four: the card experts a layer, the churn pool's bytes at a
-//! pinned count, the host headroom and what the host's room leaves past the
-//! plan's host need (the reading less the drift margin, [`PlanRoom::mem_left`]).
+//! plan are these five: the card experts a layer, the experts the plan leaves
+//! on the host, the churn pool's bytes at a pinned count, the host headroom and
+//! what the host's room leaves past the plan's host need (the reading less the
+//! drift margin, [`PlanRoom::mem_left`]).
 
 use crate::GateError;
 use crate::record::ClimbRead;
@@ -35,6 +36,14 @@ impl<'p, 'm> PlanRoom<'p, 'm> {
     /// The plan's card experts a layer (a layer holding none included).
     pub fn card_experts(&self) -> impl Iterator<Item = u64> + '_ {
         self.plan.n_l.iter().copied()
+    }
+
+    /// The routed experts the plan leaves on the host (the `plan` record's
+    /// `host_experts`); the experts the load hosts beside the plan are not
+    /// counted.
+    #[must_use]
+    pub fn host_experts(&self) -> u64 {
+        self.plan.host.experts
     }
 
     /// The plan's host headroom less what the load hosts beside the plan.
@@ -82,8 +91,8 @@ impl<'p, 'm> PlanRoom<'p, 'm> {
 
 /// `BLOOMERY_RESIDENCY` against `plan` on the pair rule
 /// ([`residency_at_plan`]): `pick` as it is unless it is the serving word
-/// the plan has not yet seen, which the plan's card slots, host headroom and
-/// the host's room then keep, move or turn `off` with why, on every body (an
+/// the plan has not yet seen, which the plan's card slots, host experts, host
+/// headroom and the host's room then keep, move or turn `off` with why, on every body (an
 /// unset word never asks for its pool unhosted; `carry` is the loading body's
 /// `ChainBody::UNHOSTED_POOL`, a value, so this module reaches no body). The
 /// churn pool's bytes are card `card`'s.
@@ -98,6 +107,7 @@ pub fn at_plan(
         carry,
         pick,
         room.card_experts(),
+        room.host_experts(),
         |pinned| room.pool_bytes(pinned),
         room.headroom(),
         room.mem_left()?,

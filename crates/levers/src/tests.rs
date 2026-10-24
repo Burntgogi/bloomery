@@ -1335,8 +1335,8 @@ fn room_for_keeps_the_word_where_the_plan_has_room() {
 /// word `mid-p0-s1` wherever the plan's card slots hold the rule at all —
 /// its P 0 fits every plan but a one-expert layer — raised to the first P
 /// whose churn pool fits where the host does not take the pool at 0, `off`
-/// where neither side leaves a count; a set word and every other why pass
-/// through untouched.
+/// where neither side leaves a count or the plan holds no host expert; a set
+/// word and every other why pass through untouched.
 #[test]
 fn residency_at_plan_moves_the_unset_word_to_what_the_plan_leaves() {
     let pool = |fewest: usize| move |p: usize| Ok::<u64, ()>(10 * (fewest - p) as u64);
@@ -1344,18 +1344,20 @@ fn residency_at_plan_moves_the_unset_word_to_what_the_plan_leaves() {
         word: RESIDENCY_SERVING,
         why: ResidencyWhy::Place,
     };
-    let at = |n_l: &[u64], headroom: i128, mem_left: i128| {
+    let at_host = |n_l: &[u64], host: u64, headroom: i128, mem_left: i128| {
         let fewest = n_l.iter().copied().filter(|&n| n > 0).min().unwrap_or(0) as usize;
         residency_at_plan(
             UnhostedPool::Carried,
             unset,
             n_l.iter().copied(),
+            host,
             pool(fewest),
             headroom,
             mem_left,
         )
         .expect("no pool error")
     };
+    let at = |n_l: &[u64], headroom: i128, mem_left: i128| at_host(n_l, 30, headroom, mem_left);
     let big = 1 << 40;
     // The serving word wherever the plan's layers hold the rule.
     assert_eq!(at(&[42, 43], big, big), unset);
@@ -1372,6 +1374,25 @@ fn residency_at_plan_moves_the_unset_word_to_what_the_plan_leaves() {
         }
     );
     assert_eq!(at(&[0, 0], big, big).why, ResidencyWhy::NoCardExperts);
+    // A plan whose card holds every expert has none on the host for the
+    // machine to move in: its spares would only displace card experts, so the
+    // word is `off` with why, the card check first (a plan with no expert at
+    // all is the card's).
+    let whole = at_host(&[16, 16, 16, 16], 0, big, big);
+    assert_eq!(
+        (whole.word, whole.why),
+        ("off", ResidencyWhy::NoHostExperts)
+    );
+    assert_eq!(whole.why.name(), "no_host_experts");
+    assert_eq!(
+        whole.why.detail().expect("the no-host why details"),
+        "unset: the plan holds no routed expert on the host"
+    );
+    assert_eq!(
+        at_host(&[0, 0], 0, big, big).why,
+        ResidencyWhy::NoCardExperts
+    );
+    assert_eq!(at_host(&[16, 16], 1, big, big), unset);
     assert_eq!(
         at(&[1, 9], big, big)
             .why
@@ -1393,6 +1414,7 @@ fn residency_at_plan_moves_the_unset_word_to_what_the_plan_leaves() {
             UnhostedPool::Carried,
             pick,
             [30u64],
+            0,
             |_| Err::<u64, ()>(()),
             0,
             0,
@@ -1795,7 +1817,7 @@ fn an_unset_word_climbs_on_a_body_that_carries_an_unhosted_pool() {
     });
     // 10 B an expert past P on 50: the first count whose pool fits 50 B is
     // 45.
-    let v41 = residency_at_plan(UnhostedPool::Carried, serving, [50u64], pool, 50, big)
+    let v41 = residency_at_plan(UnhostedPool::Carried, serving, [50u64], 1, pool, 50, big)
         .expect("no pool error");
     assert_eq!(
         (v41.word, v41.why, v41.pool()),
@@ -2500,6 +2522,7 @@ fn a_load_that_hosts_its_pool_climbs_through_every_family_rule() {
             UnhostedPool::NotCarried,
             serving,
             [50u64],
+            1,
             pool,
             headroom,
             big,
