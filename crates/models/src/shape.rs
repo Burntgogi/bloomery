@@ -19,7 +19,7 @@
 
 use std::fmt;
 
-use crate::{Gqa, Moe, Score};
+use crate::{Gqa, Moe, RouterNorm, Score};
 
 /// How a router turns logits into ids and weights: the numeric contract a
 /// router body is written for, apart from its width.
@@ -28,8 +28,8 @@ pub struct RouterRule {
     pub score: Score,
     /// A selection bias steers the choice only.
     pub bias: bool,
-    /// The kept weights are renormalized to sum to one.
-    pub norm: bool,
+    /// The divisor policy on the kept, unbiased scores before scaling.
+    pub norm: RouterNorm,
     /// A shared expert whose weight is the sigmoid of one more router row,
     /// run as one more slot after the routed ones.
     pub gated: bool,
@@ -90,8 +90,8 @@ pub enum RouterBody {
 pub struct RouterInst {
     pub body: RouterBody,
     pub rule: RouterRule,
-    /// The body takes `norm` as a launch argument: it serves both values of
-    /// [`RouterRule::norm`], and the row's own value is not compared.
+    /// The body takes `norm` as a launch argument: it serves
+    /// [`RouterNorm::None`] and [`RouterNorm::SelectedSum`] only.
     pub norm_arg: bool,
     /// Experts the instance routes over. Lane `L` of the selecting warp owns
     /// experts `L + 32 j` below this count ([`RouterInst::per_lane`] of them
@@ -124,7 +124,11 @@ impl RouterInst {
         score_eq(self.rule.score, rule.score)
             && self.rule.bias == rule.bias
             && self.rule.gated == rule.gated
-            && (self.norm_arg || self.rule.norm == rule.norm)
+            && if self.norm_arg {
+                matches!(rule.norm, RouterNorm::None | RouterNorm::SelectedSum)
+            } else {
+                norm_eq(self.rule.norm, rule.norm)
+            }
     }
 }
 
@@ -135,31 +139,31 @@ pub const LANE_PICKS: u32 = 32;
 const SOFTMAX_TOPK: RouterRule = RouterRule {
     score: Score::Softmax,
     bias: false,
-    norm: false,
+    norm: RouterNorm::None,
     gated: false,
 };
 const SOFTMAX_NORM: RouterRule = RouterRule {
     score: Score::Softmax,
     bias: false,
-    norm: true,
+    norm: RouterNorm::SelectedSum,
     gated: false,
 };
 const SOFTMAX_NORM_GATED: RouterRule = RouterRule {
     score: Score::Softmax,
     bias: false,
-    norm: true,
+    norm: RouterNorm::SelectedSum,
     gated: true,
 };
 const BIASED_SIGMOID: RouterRule = RouterRule {
     score: Score::Sigmoid,
     bias: true,
-    norm: true,
+    norm: RouterNorm::SelectedSum,
     gated: false,
 };
 const BIASED_SQRT_SOFTPLUS: RouterRule = RouterRule {
     score: Score::SqrtSoftplus,
     bias: true,
-    norm: true,
+    norm: RouterNorm::SelectedSum,
     gated: false,
 };
 
@@ -368,7 +372,11 @@ impl fmt::Display for Shape {
                     "router {:?}{}{}{}, {} experts, top {}",
                     r.score,
                     if r.bias { " with a selection bias" } else { "" },
-                    if r.norm { " renormalized" } else { "" },
+                    match r.norm {
+                        RouterNorm::None => "",
+                        RouterNorm::SelectedSum => " renormalized",
+                        RouterNorm::SelectedSumFloor => " normalized by max(selected sum, 2^-14)",
+                    },
                     if r.gated {
                         " with a gated shared expert"
                     } else {
@@ -513,7 +521,7 @@ pub const fn router_row_is(
 ) -> bool {
     score_eq(r.rule.score, rule.score)
         && r.rule.bias == rule.bias
-        && r.rule.norm == rule.norm
+        && norm_eq(r.rule.norm, rule.norm)
         && r.rule.gated == rule.gated
         && r.norm_arg == norm_arg
         && r.top_k_min == top_k.0
@@ -535,6 +543,15 @@ pub mod rules {
     /// Sigmoid scores, a selection bias steering the choice only, the kept
     /// unbiased scores renormalized: GLM-5.3's and MiMo-V2's noaux_tc router.
     pub const BIASED_SIGMOID: RouterRule = super::BIASED_SIGMOID;
+}
+
+const fn norm_eq(a: RouterNorm, b: RouterNorm) -> bool {
+    matches!(
+        (a, b),
+        (RouterNorm::None, RouterNorm::None)
+            | (RouterNorm::SelectedSum, RouterNorm::SelectedSum)
+            | (RouterNorm::SelectedSumFloor, RouterNorm::SelectedSumFloor)
+    )
 }
 
 const fn body_eq(a: RouterBody, b: RouterBody) -> bool {
@@ -790,7 +807,7 @@ mod tests {
         AttnShape, GQA, GroupRule, LANE_PICKS, MoeShape, ROUTERS, Refusal, RouterInst, RouterRule,
         Shape, router_row, router_row_is, router_row_k, rules, select_gqa, select_router,
     };
-    use crate::{Act, Moe, Router, Score, Shared};
+    use crate::{Act, Moe, Router, RouterNorm, Score, Shared};
 
     fn moe(rule: RouterRule, experts: u32, top_k: u32) -> MoeShape {
         MoeShape {
@@ -844,10 +861,60 @@ mod tests {
     #[test]
     fn a_norm_argument_row_serves_both_norms_and_only_it() {
         let mut off = rules::BIASED_SQRT_SOFTPLUS;
-        off.norm = false;
+        off.norm = RouterNorm::None;
         assert!(select_router(moe(off, 128, 3)).is_ok());
         let e = select_router(moe(off, 384, 6)).expect_err("V4.1 at norm off");
         assert!(matches!(e.why, Refusal::RouterWidth { ref served } if served == &[128]));
+    }
+
+    #[test]
+    fn a_selected_sum_floor_is_not_a_legacy_device_policy() {
+        for row in ROUTERS {
+            let rule = RouterRule {
+                norm: RouterNorm::SelectedSumFloor,
+                ..row.rule
+            };
+            assert_eq!(
+                select_router(moe(row.rule, row.experts(), row.top_k_min)).unwrap(),
+                *row
+            );
+            assert!(!row.runs(rule));
+            assert!(!router_row_is(
+                *row,
+                rule,
+                row.norm_arg,
+                (row.top_k_min, row.top_k_max)
+            ));
+            let shape = moe(rule, row.experts(), row.top_k_min);
+            let refusal = select_router(shape).expect_err("a legacy body bound the floor policy");
+            assert_eq!(refusal.shape, Shape::Moe(shape));
+            assert_eq!(refusal.why, Refusal::NoRouterRule);
+        }
+    }
+
+    #[test]
+    fn flints_sigmoid_top_six_is_not_the_biased_top_eight_binding() {
+        for bias in [false, true] {
+            for norm in [
+                RouterNorm::None,
+                RouterNorm::SelectedSum,
+                RouterNorm::SelectedSumFloor,
+            ] {
+                let rule = RouterRule {
+                    bias,
+                    norm,
+                    ..rules::BIASED_SIGMOID
+                };
+                let refusal = select_router(moe(rule, 256, 6))
+                    .expect_err("a sigmoid top-six binding was fabricated");
+                let expected = if bias && norm == RouterNorm::SelectedSum {
+                    Refusal::TopK { min: 8, max: 8 }
+                } else {
+                    Refusal::NoRouterRule
+                };
+                assert_eq!(refusal.why, expected);
+            }
+        }
     }
 
     /// GLM-5.3-Flash (model/tests/glm5next_meta.rs:83, "router: sigmoid, 288
@@ -858,7 +925,7 @@ mod tests {
         let rule = RouterRule {
             score: Score::Sigmoid,
             bias: true,
-            norm: true,
+            norm: RouterNorm::SelectedSum,
             gated: false,
         };
         let r = select_router(moe(rule, 288, 8)).expect("GLM-5.3-Flash has no router row");
@@ -1061,7 +1128,7 @@ mod tests {
             router: Router {
                 score: Score::Softmax,
                 bias: false,
-                norm: true,
+                norm: RouterNorm::SelectedSum,
                 scale: 1.0,
                 hash: false,
             },
@@ -1316,7 +1383,7 @@ mod tests {
         let rule = RouterRule {
             score: Score::Sigmoid,
             bias: true,
-            norm: true,
+            norm: RouterNorm::SelectedSum,
             gated: false,
         };
         assert_eq!(rules::BIASED_SIGMOID, rule);

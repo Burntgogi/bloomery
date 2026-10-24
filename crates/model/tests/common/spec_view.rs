@@ -163,7 +163,11 @@ pub fn layer_line(layer: &LayerSpec) -> String {
                 act(&m.act),
                 r.score,
                 r.bias,
-                r.norm,
+                match r.norm {
+                    models::RouterNorm::None => "false",
+                    models::RouterNorm::SelectedSum => "true",
+                    models::RouterNorm::SelectedSumFloor => "max(selected sum, 2^-14)",
+                },
                 r.scale,
                 r.hash
             );

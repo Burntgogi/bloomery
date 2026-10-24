@@ -72,7 +72,11 @@ pub fn read(split: &Split) -> Result<Read, PlacementError> {
                         bias: split
                             .find(&format!("blk.{l}.{}", roles::SELECTION_BIAS))
                             .is_some(),
-                        norm: hp.norm,
+                        norm: if hp.norm {
+                            models::RouterNorm::SelectedSumFloor
+                        } else {
+                            models::RouterNorm::None
+                        },
                         scale: hp.scale,
                         hash: false,
                     },

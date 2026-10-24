@@ -569,12 +569,23 @@ pub struct Router {
     pub score: Score,
     /// A selection bias (`exp_probs_b`) that steers the choice only.
     pub bias: bool,
-    /// The kept weights are renormalized to sum to one.
-    pub norm: bool,
+    /// The divisor policy on the kept, unbiased scores before scaling.
+    pub norm: RouterNorm,
     /// The factor on the kept weights.
     pub scale: f32,
     /// The experts come from a token table (`ffn_gate_tid2eid`).
     pub hash: bool,
+}
+
+/// The normalization of the selected, unbiased router scores before scaling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RouterNorm {
+    /// Keep each selected score unchanged.
+    None,
+    /// Divide by the selected-score sum, guarded by adding `1e-20`.
+    SelectedSum,
+    /// Flint's fixed policy: divide by `max(sum_selected, 2^-14)`, not an epsilon-added sum.
+    SelectedSumFloor,
 }
 
 /// The router's score function.

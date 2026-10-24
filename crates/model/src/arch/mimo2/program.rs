@@ -189,11 +189,11 @@ pub fn block_args(l: usize, s: &LayerSpec, built: RouterBuilt) -> Result<BlockAr
         },
         Ffn::Moe(m) => {
             let r = &m.router;
-            if r.score != Score::Sigmoid || !r.norm || r.hash {
+            if r.score != Score::Sigmoid || r.norm != models::RouterNorm::SelectedSum || r.hash {
                 return Err(refuse(
                     l,
                     format!(
-                        "a router scoring by {:?}, renormalizing {}, hashed {}; the routed \
+                        "a router scoring by {:?}, normalization {:?}, hashed {}; the routed \
                          block runs the sigmoid router that renormalizes its picks, unhashed",
                         r.score, r.norm, r.hash
                     ),
@@ -384,7 +384,7 @@ mod tests {
             router: Router {
                 score: Score::Sigmoid,
                 bias: true,
-                norm: true,
+                norm: models::RouterNorm::SelectedSum,
                 scale: 1.0,
                 hash: false,
             },
@@ -518,7 +518,14 @@ mod tests {
             assert!(e.contains("layer 5") && e.contains(says), "{says}: {e}");
         };
         refuses(moe(|m| m.router.score = Score::Softmax), "sigmoid router");
-        refuses(moe(|m| m.router.norm = false), "sigmoid router");
+        refuses(
+            moe(|m| m.router.norm = models::RouterNorm::None),
+            "sigmoid router",
+        );
+        refuses(
+            moe(|m| m.router.norm = models::RouterNorm::SelectedSumFloor),
+            "sigmoid router",
+        );
         refuses(moe(|m| m.router.hash = true), "sigmoid router");
         refuses(moe(|m| m.experts = 288), "288 experts");
         refuses(moe(|m| m.top_k = 6), "top 6");

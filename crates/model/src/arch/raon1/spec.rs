@@ -206,7 +206,8 @@ mod tests {
             );
             assert_eq!(m.act, act);
             assert_eq!(m.router.score, Score::Sigmoid);
-            assert!(m.router.bias && m.router.norm && !m.router.hash);
+            assert!(m.router.bias && !m.router.hash);
+            assert_eq!(m.router.norm, models::RouterNorm::SelectedSum);
             assert_eq!(m.router.scale, 1.0);
             let shared = m.shared.expect("a shared expert");
             assert_eq!(

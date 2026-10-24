@@ -187,7 +187,7 @@ mod tests {
                         router: Router {
                             score: Score::Sigmoid,
                             bias: true,
-                            norm: true,
+                            norm: models::RouterNorm::SelectedSum,
                             scale: 2.5,
                             hash: false,
                         },

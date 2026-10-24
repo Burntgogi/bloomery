@@ -47,6 +47,7 @@ use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::Split;
 use gguf::quant::GgmlType;
 use model::arch::Arch;
+use model::arch::models::RouterNorm;
 use model::arch::models::shape::{MoeShape, rules};
 use model::arch::qwen3moe::hparams::Hparams;
 use model::arch::qwen3moe::names::{self, token_embd};
@@ -239,7 +240,11 @@ fn pins(hp: &Hparams) -> Result<RouterDims, GpuError> {
     let e = &hp.experts;
     let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
     let mut rule = rules::SOFTMAX_NORM;
-    rule.norm = e.weights_norm;
+    rule.norm = if e.weights_norm {
+        RouterNorm::SelectedSum
+    } else {
+        RouterNorm::None
+    };
     let router = RouterDims::of(MoeShape {
         rule,
         experts: count(e.n_expert),

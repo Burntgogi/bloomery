@@ -434,7 +434,7 @@ mod tests {
     use crate::linear::{KHeadMap as LinearMap, LinearShape};
     use model::arch::models::{
         Act, DeltaKind, DeltaRule, Ffn, GdnGate, Gqa, KHeadMap, LayerSpec, Mixer, Moe, OutGate,
-        Residual, Rope, RopeMode, Router, Score, Shared,
+        Residual, Rope, RopeMode, Router, RouterNorm, Score, Shared,
     };
 
     /// Qwen3.6's 16/2 heads.
@@ -490,7 +490,7 @@ mod tests {
                 router: Router {
                     score: Score::Softmax,
                     bias: false,
-                    norm: true,
+                    norm: RouterNorm::SelectedSum,
                     scale: 1.0,
                     hash: false,
                 },

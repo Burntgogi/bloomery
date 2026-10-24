@@ -74,7 +74,8 @@ fn hw_flint_header() {
                 panic!("layer {l} not routed")
             };
             assert_eq!((m.experts, m.top_k, m.expert_ff), (256, 6, 512));
-            assert!(m.router.norm && !m.router.bias);
+            assert!(!m.router.bias);
+            assert_eq!(m.router.norm, models::RouterNorm::SelectedSumFloor);
             assert_eq!(m.router.score, models::Score::Sigmoid);
             assert_eq!(m.router.scale, 1.0);
             let shared = m.shared.as_ref().unwrap();
@@ -106,6 +107,19 @@ fn hw_flint_header() {
         .count();
     assert_eq!((norms, rotary, sinks), (49, 35, 49));
     let coverage = model::arch::coverage::check(s, &r.tensors);
+    for (need, layer) in &needs {
+        if let Need::Router(shape) = need {
+            assert_eq!(
+                model::arch::models::shape::select_router(*shape)
+                    .unwrap_err()
+                    .why,
+                model::arch::models::shape::Refusal::NoRouterRule
+            );
+            assert!(coverage.iter().any(|u| {
+                u.layer == layer.map(|l| l as usize) && u.feature == need.to_string()
+            }));
+        }
+    }
     assert!(
         coverage
             .iter()

@@ -274,7 +274,11 @@ fn check_kernels(hp: &DraftHparams) -> Result<(), GpuError> {
     let e = &hp.experts;
     let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
     let mut rule = rules::BIASED_SQRT_SOFTPLUS;
-    rule.norm = e.weights_norm;
+    rule.norm = if e.weights_norm {
+        models::RouterNorm::SelectedSum
+    } else {
+        models::RouterNorm::None
+    };
     let shape = MoeShape {
         rule,
         experts: count(e.n_expert),

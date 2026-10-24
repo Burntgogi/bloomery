@@ -113,7 +113,11 @@ impl Experts {
             router: Router {
                 score: Score::Sigmoid,
                 bias: true,
-                norm: self.weights_norm,
+                norm: if self.weights_norm {
+                    models::RouterNorm::SelectedSum
+                } else {
+                    models::RouterNorm::None
+                },
                 scale: self.weights_scale,
                 hash: false,
             },

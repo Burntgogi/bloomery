@@ -111,6 +111,7 @@ mod gate {
     use cuda_core::{CudaStream, DeviceBuffer};
     use gguf::quant::GgmlType;
     use model::arch::Arch;
+    use model::arch::models::RouterNorm;
     use model::arch::models::shape::{MoeShape, rules};
     use model::arch::qwen3moe::hparams::{Hparams, Score};
     use model::arch::qwen3moe::names;
@@ -1309,7 +1310,11 @@ mod gate {
         // The file's routed shape selects the instance; the clauses below
         // are written at its pick count.
         let mut rule = rules::SOFTMAX_NORM;
-        rule.norm = e.weights_norm;
+        rule.norm = if e.weights_norm {
+            RouterNorm::SelectedSum
+        } else {
+            RouterNorm::None
+        };
         let file = RouterDims::of(MoeShape {
             rule,
             experts: u32::try_from(e.n_expert)?,
