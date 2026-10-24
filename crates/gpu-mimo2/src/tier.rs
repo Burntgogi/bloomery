@@ -34,7 +34,7 @@ use gguf::Split;
 use model::ModelError;
 use model::arch::mimo2::place::{self, PlanInputs};
 use model::moe::HostLayer;
-use model::placement::ModelTensors;
+use model::placement::{ModelTensors, PlacementError};
 use model::placement::workstation::TierBatchBytes;
 use model::r8file::R8Source;
 use models::LayerSpec;
@@ -57,7 +57,7 @@ pub const CHUNK: usize = place::TIER_CHUNK as usize;
 /// `inputs` describes: [`place::tier_batch`] over blocks of a prompt unit's rows ([`T_MAX`]), the
 /// columns the load makes the tier's batch legs for.
 #[must_use]
-pub fn tier_batch(inputs: &PlanInputs) -> TierBatchBytes {
+pub fn tier_batch(inputs: &PlanInputs) -> Result<TierBatchBytes, PlacementError> {
     place::tier_batch(&inputs.hp, T_MAX as u64)
 }
 
@@ -91,6 +91,7 @@ impl LegFamily for Mimo2 {
             n_used: hp.n_used,
             n_embd: hp.n_embd,
             ff: hp.expert_ff,
+            program: model::placement::accepts::Program::Mimo2Body,
         }
     }
 

@@ -501,8 +501,10 @@ impl Tiered for Mimo {
 
     /// The tier card's prompt-batch bytes ([`bloomery_gpu_mimo2::tier::tier_batch`]), under a
     /// placement with one.
-    fn tier_batch(place: Place, inputs: &PlanInputs) -> Option<TierBatchBytes> {
-        (!place.tier_cards().is_empty()).then(|| bloomery_gpu_mimo2::tier::tier_batch(inputs))
+    fn tier_batch(place: Place, inputs: &PlanInputs) -> Result<Option<TierBatchBytes>, GateError> {
+        Ok((!place.tier_cards().is_empty())
+            .then(|| bloomery_gpu_mimo2::tier::tier_batch(inputs))
+            .transpose()?)
     }
 
     fn flags(flag: &str, value: &str, out: &mut Flags) -> Result<bool, GateError> {

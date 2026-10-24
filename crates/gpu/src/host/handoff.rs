@@ -18,9 +18,9 @@
 //! one launch ([`HandoffKernels::enqueue_handoff_cols`]);
 //! [`HandoffKernels::enqueue_places_cols`] writes the places alone of such a
 //! row, for a walk whose routing reaches the host by a download, through
-//! `crate::card_slots`' `ds41_ffn_places`. `ffn_handoff_6_tier` and
-//! `ds41_ffn_handoff_8_tier` hand over six or eight slots of a layer an
-//! expert tier holds experts of: the same writes, the slots' tier places and the activation in f32 into
+//! `crate::card_slots`' `ds41_ffn_places`. `ds41_ffn_handoff_4_tier`,
+//! `ffn_handoff_6_tier` and `ds41_ffn_handoff_8_tier` hand over four, six or
+//! eight slots of a tier layer: the same writes, its tier places and f32 activation into
 //! the row's tier image ([`HandoffKernels::enqueue_handoff_tier`]);
 //! `ds41_ffn_handoff_10_cols_tier` is `_10_cols`'s of such a layer, every
 //! column's tier places and activation into the row's tier image
@@ -1346,8 +1346,8 @@ impl HandoffKernels {
 }
 
 impl HandoffKernels {
-    /// Enqueue the handoff of a tier layer of six or eight slots a token
-    /// (`ffn_handoff_6_tier` or `ds41_ffn_handoff_8_tier`):
+    /// Enqueue the handoff of a tier layer of four, six or eight slots a token
+    /// (`ds41_ffn_handoff_4_tier`, `ffn_handoff_6_tier`, `ds41_ffn_handoff_8_tier`):
     /// [`HandoffKernels::enqueue_handoff`]'s
     /// writes into `target`, and each slot's tier place (from `tmap`, the
     /// slot map's tier copy at the card copy's row offsets) into `tsel` and
@@ -1640,7 +1640,7 @@ fn check_tier(lay: &HandoffLayout, tl: &TierImageLayout) -> Result<HandoffSlots,
             what: "HandoffKernels::enqueue_handoff_tier",
             detail: format!(
                 "the boundary carries {} slots of {} values and the tier image {} slots, {} \
-                 f32, {} code words, {} scales; the entries hand over matching 6 or 8 slots \
+                 f32, {} code words, {} scales; the entries hand over matching 4, 6 or 8 slots \
                  and the activation in f32",
                 lay.n_used, lay.hidden, tl.n_used, tl.x_len, tl.q3_words, tl.d8_len
             ),
@@ -1787,7 +1787,7 @@ mod tests {
     }
 
     #[test]
-    fn a_token_tier_handoff_requires_matching_f32_six_or_eight_slot_images() {
+    fn a_token_tier_handoff_requires_matching_f32_four_six_or_eight_slot_images() {
         for n_used in 0..=10 {
             let lay = HandoffLayout {
                 n_used,
@@ -1801,12 +1801,12 @@ mod tests {
                 };
                 assert_eq!(
                     check_tier(&lay, &tl).is_ok(),
-                    matches!(n_used, 6 | 8) && tier_slots == n_used,
+                    matches!(n_used, 4 | 6 | 8) && tier_slots == n_used,
                     "host {n_used}, tier {tier_slots}"
                 );
             }
         }
-        for n_used in [6, 8] {
+        for n_used in [4, 6, 8] {
             let lay = HandoffLayout {
                 n_used,
                 ..boundary()

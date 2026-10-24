@@ -128,6 +128,12 @@ Host-only projections intentionally have no card totals: fixed reserves remain o
 Only a dynamic tier-leg descriptor requires the plan's selected card totals. The existing node paging
 budget regression exercises this distinction without a GPU, including OS reserve and constrained host room.
 
+The current-main cutover keeps reserve-only draft holders, per-card budgets and each
+family's activation contract. `LegTier` receives its activation converter at load;
+selected `Program` arms replace the redundant family arm hook. Qwen, Muse, MiMo and
+MiniMax sizing callers propagate checked tier descriptors rather than bypassing
+their validation. Share-budget floors use the same selected reserve calculation.
+
 A host-only public planner consumer exercised the one-byte boundaries before the first resident layer
 and before adding the other down form, plus descriptor overflow refusal. This proves planning behavior,
 not device allocation or expert arithmetic. The existing CUDA leg, batch and tier gates still need an
@@ -135,7 +141,7 @@ exact-head NVIDIA run. Flint's `Program` admission and body/app/seat remain abse
 ### Six-slot F32 tier handoff implementation
 
 `HandoffKernels::enqueue_handoff_tier` now selects a genuine six-slot F32 entry
-beside the existing eight-slot entry. Both host and tier layouts must have the
+beside the existing four- and eight-slot entries. Both host and tier layouts must have the
 same supported slot count and activation width; compressed tier images remain
 refused. The entry uses the existing copy/place/fault helpers and the existing
 subsequent go/publication protocol; no Flint router or Program is registered.
