@@ -344,6 +344,10 @@ mod tests {
     fn target_reads_refuse_unheld_or_overflowing_ranges_before_copy() {
         const WHAT: &str = "draft read";
         let held = Held::at(1, 1);
+        let e = held
+            .check_read(WHAT, "Step", 0, (0, 1), 2)
+            .expect_err("a held row outside the arena");
+        assert!(matches!(e, GpuError::Shape { what: WHAT, .. }), "{e}");
         held.check_read(WHAT, "Step", 2, (0, 1), 2)
             .expect("the held row");
         for (first, m) in [

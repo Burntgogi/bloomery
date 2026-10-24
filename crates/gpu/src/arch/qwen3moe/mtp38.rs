@@ -1632,7 +1632,7 @@ impl Mtp38 {
     /// walk of this sequence, a walk starting past the positions the store
     /// holds, a token past the vocabulary, a host hidden slice of other than
     /// the rows' values, target rows that do not hold the positions before
-    /// the rows' ([`check_target_rows`]), media rows.
+    /// the rows' ([`Held::check_read`]), media rows.
     fn checked<'f, 't>(
         &self,
         target: Option<Target38<'t>>,
