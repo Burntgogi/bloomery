@@ -427,8 +427,13 @@ impl Tiered for MiniMax {
     /// The tier's prompt-batch bytes of the file's widths and down forms over the body's prompt
     /// unit ([`bloomery_gpu_minimaxm3::tier::tier_batch`]), reserved on the tier card and the
     /// host; `None` on a placement with no tier card.
-    fn tier_batch(place: Place, inputs: &PlanInputs<Self::H>) -> Option<TierBatchBytes> {
-        (!place.tier_cards().is_empty()).then(|| bloomery_gpu_minimaxm3::tier::tier_batch(inputs))
+    fn tier_batch(
+        place: Place,
+        inputs: &PlanInputs<Self::H>,
+    ) -> Result<Option<TierBatchBytes>, GateError> {
+        Ok((!place.tier_cards().is_empty())
+            .then(|| bloomery_gpu_minimaxm3::tier::tier_batch(inputs))
+            .transpose()?)
     }
 
     /// The tags the model's description names for its think span.
