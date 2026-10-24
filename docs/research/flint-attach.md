@@ -63,6 +63,8 @@ until real device bindings are supplied. Reconcile the policy interface with the
 Then close shared IQ4_XS, selected card/tier down forms and six-slot F32 handoff in their existing common owners,
 followed by paging/resident slots, reference provenance and the body/app/seat.
 Each device slice needs its numerical/fault gates and the maintainer's offered hardware proof before admission.
+Legacy metadata booleans share `RouterNorm::from_legacy_bool`: false keeps scores and true uses the
+existing epsilon-added selected sum. Flint's distinct floor mapping stays in its reader.
 
 
 ## 1. Sources and observed artifact

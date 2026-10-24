@@ -220,11 +220,7 @@ fn layer_of(
         router: Router {
             score: Score::SqrtSoftplus,
             bias: has.contains(names::exp_probs_b(l).as_str()),
-            norm: if e.weights_norm {
-                models::RouterNorm::SelectedSum
-            } else {
-                models::RouterNorm::None
-            },
+            norm: models::RouterNorm::from_legacy_bool(e.weights_norm),
             scale: e.routed_scale,
             hash: kind.hash_routed,
         },
@@ -336,11 +332,7 @@ pub fn draft_of(hp: &DraftHparams) -> Result<DraftSpec, PlacementError> {
                     router: Router {
                         score: Score::SqrtSoftplus,
                         bias: true,
-                        norm: if e.weights_norm {
-                            models::RouterNorm::SelectedSum
-                        } else {
-                            models::RouterNorm::None
-                        },
+                        norm: models::RouterNorm::from_legacy_bool(e.weights_norm),
                         scale: e.routed_scale,
                         hash: false,
                     },

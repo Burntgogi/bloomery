@@ -43,11 +43,7 @@ pub fn spec_of(hp: &Hparams, chat: models::ChatSpec) -> Result<ModelSpec, Placem
     let router = Router {
         score: Score::Sigmoid,
         bias: true,
-        norm: if hp.weights_norm {
-            models::RouterNorm::SelectedSum
-        } else {
-            models::RouterNorm::None
-        },
+        norm: models::RouterNorm::from_legacy_bool(hp.weights_norm),
         scale: hp.weights_scale,
         hash: false,
     };

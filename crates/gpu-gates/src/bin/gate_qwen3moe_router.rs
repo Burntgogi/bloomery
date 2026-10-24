@@ -1310,11 +1310,7 @@ mod gate {
         // The file's routed shape selects the instance; the clauses below
         // are written at its pick count.
         let mut rule = rules::SOFTMAX_NORM;
-        rule.norm = if e.weights_norm {
-            RouterNorm::SelectedSum
-        } else {
-            RouterNorm::None
-        };
+        rule.norm = RouterNorm::from_legacy_bool(e.weights_norm);
         let file = RouterDims::of(MoeShape {
             rule,
             experts: u32::try_from(e.n_expert)?,
