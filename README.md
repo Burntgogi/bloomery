@@ -51,7 +51,7 @@ tok/s (312.4 before). Nemotron-3.5-Lightning runs on the `nemotron` seat. Every 
 ### Known limits (0.3.8)
 
 - DeepSeek V4.1 on two cards (`--place bp`) is not faster than one card (`--place a`). Unset `--place` picks `a`.
-- The `nemotron`, `raon1`, `solar2` and `minimaxm3` seats serve one slot and keep no saved prompt states; `--parallel` above 1 is refused by name.
+- The `nemotron`, `raon1`, `solar2` and `musespark` seats serve one slot and keep no saved prompt states; `--parallel` above 1 is refused by name.
 - `--place bp` is refused by name on the `nemotron` seat, Qwen3.6 and Qwen3-30B; they run one card plus the host tier.
 - Nemotron-3.5-Lightning `UD-Q4_K_XL` is a placed load: its whole-card expert body is IQ2_XXS, and the other expert types stay on the host.
 - IQ2_S and IQ1_M routed experts do not load.
@@ -98,10 +98,10 @@ One binary, ten seats; the file's architecture picks the seat, and `--place` can
 | `mimo2` | [MiMo-V2.6-Flash](https://huggingface.co/ggml-org/MiMo-V2.6-Flash-MOPD-GGUF) | `bloomery-serve --hf ggml-org/MiMo-V2.6-Flash-MOPD-GGUF:MXFP4` |
 | `decide` | [Clef-Flash](https://huggingface.co/Cloudflare/clef-flash) and [lev](https://huggingface.co/ggml-org/lev-GGUF) (decision models) | `bloomery-serve --hf bartowski/Cloudflare_clef-flash-GGUF:Q5_K_M` |
 
-Four more seats serve a file on disk:
+Five more seats serve a file on disk:
 `nemotron` (Nemotron 3 Nano 4B, Nemotron 3.5 Bolt 74B-A9B, Nemotron-3.5-Lightning 30B-A3B), `raon1`
-(Raon-1-mini-preview, with its DFlash2 draft file beside it), `minimaxm3` (MiniMax-M3) and `solar2` (Solar-Open2-250B
-on two cards, `--place bp`). For example: `bloomery-serve -m PATH/raon-1-mini-preview-Q4_K_M.gguf`.
+(Raon-1-mini-preview, with its DFlash2 draft file beside it), `minimaxm3` (MiniMax-M3.1-Flash's NVFP4 folder; MiniMax-M3
+unverified), `musespark` (Muse Spark Open 816B-A42B) and `solar2` (Solar-Open2-250B on two cards, `--place bp`). For example: `bloomery-serve -m PATH/raon-1-mini-preview-Q4_K_M.gguf`.
 The table above lists the seats with a checked `--hf` row. The qwen38 seat also serves NVIDIA's NVFP4 checkpoint
 folder as downloaded, with no conversion, on a card that holds every routed expert such as a DGX Spark's GB10:
 `bloomery-serve -m PATH/Qwen3.8-Flash-Next-NVFP4` or `bloomery-serve --hf nvidia/Qwen3.8-Flash-Next-NVFP4`
