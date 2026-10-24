@@ -28,6 +28,9 @@ literal text `--ctx`. The same rule covers dump directories and token-file
 paths. Ordinary options keep their last value; repeated `--arm` and
 `--tokens-file` values keep their order. `--levers` and `--records-schema`
 print their startup tables only as actual options, never as consumed values.
+The sibling `generate_metal` CLI likewise excludes consumed values from its
+startup lever query: `--prompt '--levers' -n 1` is prompt text on macOS;
+a bare `--levers` still prints the table.
 
 ## Exact model for NVIDIA validation
 
