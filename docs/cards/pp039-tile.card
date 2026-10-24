@@ -28,12 +28,12 @@
 # The one term the derivation cannot fix: whether the tile's time follows its instructions (0.67) or its FP-pipe
 # uops (0.79) at the pool's rate; the band spans both.
 #
-# Runner (lead; the base bloomery-serve at speed039 8c07144ab in ~/repo/bloomery-speed039 on the box, this tree synced
-# to ~/repo/bloomery-pp039; depth-serve builds this tree's bloomery-serve first):
-# BLOOMERY_MODEL=minimax-m3 BLOOMERY_REMOTE='~/repo/bloomery-pp039' BLOOMERY_AB_ROUNDS=2
+# Runner (lead; the base bloomery-serve at the 0.3.9 candidate 64a58296c in ~/repo/bloomery-rel039 on the box, which
+# carries speed039, this tree, the round's commit on that candidate, synced to ~/repo/bloomery-pp039r):
+# BLOOMERY_MODEL=minimax-m3 BLOOMERY_REMOTE='~/repo/bloomery-pp039r' BLOOMERY_AB_ROUNDS=2
 # BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/pp039-tile.card BLOOMERY_TIMING_CARDS=a6000+3090
-# DEPTH_SERVE_CTX=4300' just depth-serve bloomery-speed039:512 bloomery-pp039:512 bloomery-speed039:4096
-# bloomery-pp039:4096
+# DEPTH_SERVE_CTX=4300' just depth-serve bloomery-rel039:512 bloomery-pp039r:512 bloomery-rel039:4096
+# bloomery-pp039r:4096
 # Wall [derived]: build ~8 min + 8 servers (2 arms x 2 depths x 2 rounds) x (load ~180 s + pp 3..42 s + 128 steps
 # ~6 s), ~38 min.
 kind: ab
@@ -41,7 +41,7 @@ question: does the NVFP4 planes tile on offset codes with a per-call column prep
   MiniMax-M3.1's pp512 at the serving defaults on bp by the derived band?
 term: pp tok/s @ P = 512 prose ids, MiniMax-M3.1-Flash NVFP4 folder, bloomery-serve at the serving defaults (every
   lever unset: residency mid-p0-s1, xstream admit), --ctx-size 4300, RTX A6000 + RTX 3090 (bp); this tree against
-  speed039 8c07144ab, paired by round; pp4096 and tg read beside, not judged
+  the 0.3.9 candidate 64a58296c (speed039's prompt path, rebased), paired by round; pp4096 and tg read beside, not judged
 unit: %
 predict: +14..+46
 rounds: 2
