@@ -1,8 +1,7 @@
 //! The Qwen3-30B and Qwen3.6 expert tier: one card beside the stage card,
 //! hung through the common card leg ([`crate::host::leg_tier`]). What is
-//! Qwen's here is the node family — the file's reading, `silu(g)·u`, and the
-//! placed leg's arms — and the join of the tier's slots with the stage
-//! card's.
+//! Qwen's here is the node family — the file's reading and `silu(g)·u` —
+//! and the join of the tier's slots with the stage card's.
 //!
 //! The join is the host leg's combine (`hostleg`) with the tier's slots in
 //! the same slot order. A slot the stage card holds is the stage card's down;
@@ -22,7 +21,7 @@ use gguf::Split;
 use model::arch::models::{Act as SpecAct, LayerSpec, Moe};
 use model::moe::HostLayer;
 use model::placement::ModelTensors;
-use model::placement::accepts::{self, LegArms};
+use model::placement::accepts::Program;
 use model::r8file::R8Source;
 
 use crate::fault::{FaultSink, FaultSite};
@@ -51,13 +50,6 @@ const _: () = assert!(model::arch::qwen35moe::place::LEG_TIER_CHUNK == LEG_CHUNK
 /// Threads per block of both join entries.
 const THREADS: u32 = 256;
 
-/// A gate or up stack the placed leg does not run.
-const GATE_UP: &str = "a resident routed gate or up stack of a type the placed leg runs \
-                       (`accepts::prompt_leg_gate_up`)";
-
-/// A down stack the placed leg does not run.
-const DOWN: &str =
-    "a resident routed down stack of a type the placed leg runs (`accepts::prompt_leg_down`)";
 
 /// The routed activation the tier runs: `silu(g)·u`. A clamped SwiGLU, and
 /// any other activation, is refused by name.
@@ -78,18 +70,6 @@ fn qwen_act(moe: &Moe) -> Result<Act, GpuError> {
     }
 }
 
-/// The placed leg's arms ([`accepts::leg_arms`] of [`accepts::Program::Qwen3moeBody`]).
-///
-/// # Panics
-///
-/// When that program names no card-leg arms.
-fn qwen_arms() -> (LegArms, (&'static str, &'static str)) {
-    let arms = match accepts::leg_arms(accepts::Program::Qwen3moeBody) {
-        Some(arms) => arms,
-        None => panic!("{WHAT}: Program::Qwen3moeBody names no card-leg arms"),
-    };
-    (arms, (GATE_UP, DOWN))
-}
 
 /// The host views of the routed layers `run`, the refusal naming the run as
 /// `word`'s. `n_layer` is the description's layer count, so a trunk layer is
@@ -154,6 +134,7 @@ impl LegFamily for Qwen3 {
             n_used: e.n_used,
             n_embd: inputs.hp.n_embd,
             ff: e.ff,
+            program: Program::Qwen3moeBody,
         }
     }
 
@@ -175,9 +156,6 @@ impl LegFamily for Qwen3 {
         qwen_act(moe)
     }
 
-    fn tier_arms() -> Option<(LegArms, (&'static str, &'static str))> {
-        Some(qwen_arms())
-    }
 }
 
 /// Qwen3.6's facts for the common tier node service. The description's
@@ -211,6 +189,7 @@ impl LegFamily for Qwen35 {
             n_used: hp.n_used,
             n_embd: hp.n_embd,
             ff: hp.expert_ff,
+            program: Program::Qwen35Body,
         }
     }
 
@@ -232,9 +211,6 @@ impl LegFamily for Qwen35 {
         qwen_act(moe)
     }
 
-    fn tier_arms() -> Option<(LegArms, (&'static str, &'static str))> {
-        Some(qwen_arms())
-    }
 }
 
 /// Qwen3-30B's tier node service ([`leg_tier::node_family`]).

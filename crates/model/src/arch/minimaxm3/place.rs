@@ -135,13 +135,14 @@ pub const TIER_CHUNK: u64 = 16;
 /// and places. The plan reserves them on the tier card and the host, and the load checks its
 /// allocations against them.
 #[must_use]
-pub fn tier_batch(inputs: &PlanInputs, cols: u64) -> TierBatchBytes {
+pub fn tier_batch(inputs: &PlanInputs, cols: u64) -> Result<TierBatchBytes, PlacementError> {
     let hp = &inputs.hp;
-    workstation::tier_leg_batch_bytes_of(
+    workstation::tier_leg_batch_bytes(
         hp.n_embd as u64,
         hp.experts.ff as u64,
         hp.experts.n_used as u64,
-        (TIER_CHUNK, cols),
+        TIER_CHUNK,
+        cols,
         leg_downs(inputs),
     )
 }
@@ -441,9 +442,12 @@ mod tests {
                 hp.experts.n_used as u64,
                 TIER_CHUNK,
                 COLS,
+                DownForms::of(DownAct::Q8Act),
             )
         );
-        let tiered = workstation::plan_bp(LAYERS, None, tier_batch(&inputs, COLS));
+        let tiered = workstation::plan_bp(
+            LAYERS, None, tier_batch(&inputs, COLS).expect("tier bytes"),
+        );
         let plain = workstation::plan_gate(LAYERS);
         let places = 3 * 4 * 256 * 2;
         assert_eq!(inputs.tier_reserve, Some(places));

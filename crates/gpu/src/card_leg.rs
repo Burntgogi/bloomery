@@ -629,12 +629,13 @@ impl<'a> LegStacks<'a> {
             w,
             names,
             LegArms {
-                gate_up: kernels::card_gate_up_runs,
-                down: kernels::card_down_runs,
+                gate_up: accepts::planes_leg_gate_up,
+                down: accepts::planes_leg_down,
             },
             (GATE_UP, DOWN),
         )
     }
+
 
     /// [`LegStacks::of`] for a body that loads every tensor in the format
     /// [`gguf::card::CardFormat::of`] names (`Weights::load`), whose downs may
@@ -647,8 +648,8 @@ impl<'a> LegStacks<'a> {
             w,
             names,
             LegArms {
-                gate_up: kernels::card_gate_up_runs,
-                down: accepts::resident_down_runs,
+                gate_up: accepts::planes_leg_gate_up,
+                down: |ty| accepts::resident_down_runs(ty) || kernels::card_planes_runs(ty),
             },
             (GATE_UP, DOWN),
         )
@@ -668,9 +669,9 @@ impl<'a> LegStacks<'a> {
     ) -> Result<LegStacks<'a>, GpuError> {
         let [gate, up, down] = names;
         let (gate, up, down) = (
-            LegStack::of(w, gate, arms.gate_up, kernels::card_planes_runs, roles.0)?,
-            LegStack::of(w, up, arms.gate_up, kernels::card_planes_runs, roles.0)?,
-            LegStack::of(w, down, arms.down, kernels::card_planes_runs, roles.1)?,
+            LegStack::of(w, gate, arms.gate_up, arms.gate_up, roles.0)?,
+            LegStack::of(w, up, arms.gate_up, arms.gate_up, roles.0)?,
+            LegStack::of(w, down, arms.down, arms.down, roles.1)?,
         );
         if up.ty != gate.ty {
             return Err(GpuError::Tensor {
