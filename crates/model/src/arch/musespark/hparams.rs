@@ -165,6 +165,18 @@ impl Hparams {
                 format!("is 0 at layer {l}; every layer routes"),
             ));
         }
+        // One width serves the step's launches and the plan's sizing, so a
+        // file whose layers differ is refused rather than run at layer 0's.
+        if let Some(l) = expert_ff.iter().position(|&ff| ff != expert_ff[0]) {
+            return Err(metadata(
+                split,
+                "expert_feed_forward_length",
+                format!(
+                    "is {} at layer {l}, {} at layer 0; one expert width serves every layer",
+                    expert_ff[l], expert_ff[0]
+                ),
+            ));
+        }
         let latent = positive(split, "moe_latent_size")?;
         // The dialect builds the sigmoid router (muse-spark.cpp reads the key
         // and passes it to build_moe_ffn's sigmoid arm), so a file that says
@@ -217,6 +229,14 @@ impl Hparams {
         }
         crate::arch::tensors_agree(split, want)?;
         Ok(hp)
+    }
+
+    /// One routed expert's width, the same at every layer ([`Hparams::read`]
+    /// refuses a file whose layers differ). `expert_ff` holds one entry per
+    /// block and `block_count` is positive.
+    #[must_use]
+    pub fn expert_width(&self) -> usize {
+        self.expert_ff[0]
     }
 
     /// The dims the keys give layer `l`, ggml order. Every layer carries the

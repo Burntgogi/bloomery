@@ -61,7 +61,7 @@ use super::tier::{TierSum, enqueue_tier_sum};
 use super::{Body, Kernels, Layer, RouteOut, Shape, Taps, enqueue_head, stack};
 use crate::arch::hybrid::{Site, WideCx, norm_rows, project_wide, wide_acts_at};
 use crate::card_leg::{RouteBlock, StackW};
-use crate::card_slots::{CardAcc, ColPlaces};
+use crate::card_slots::ColPlaces;
 use crate::elem::EmbedRowsArgs;
 use crate::flash::PlaneAppend;
 use crate::flash_gqa::{Gqa64Args, HEAD_64, SEG_KEYS, SEGMENTS, window_segments};
@@ -327,27 +327,17 @@ impl Prompt {
     /// The buffers for passes of up to `rows` rows over `sizes`' widths and
     /// `layers`' sites, which must hold exactly the bytes
     /// [`PassSizes::bytes`] counted for them or the load fails by name. The
-    /// rope is the step's table, one row of `rope_dims` a position: a width
-    /// other than the head's is refused by name. Load-time only.
+    /// rope is the step's table, one row of the head's width a position
+    /// (`Body::load` refuses any other). Load-time only.
     pub(super) fn new(
         gpu: &Gpu,
         sizes: &PassSizes,
         layers: &[Layer],
-        (rows, rope_dims): (usize, usize),
+        rows: usize,
     ) -> Result<Prompt, GpuError> {
         let sh = sizes.sh;
         if rows == 0 {
             return Err(GpuError::shape(WHAT, "a pass of no rows"));
-        }
-        if rope_dims != sh.head {
-            return Err(GpuError::shape(
-                WHAT,
-                format!(
-                    "a rope of {rope_dims} dims over heads of {}: a pass ropes each row's \
-                     heads by one row of the table a position",
-                    sh.head
-                ),
-            ));
         }
         let stream = gpu.stream();
         let z = |n: usize| -> Result<DeviceBuffer<f32>, GpuError> {
@@ -1234,17 +1224,7 @@ impl PassWalk<'_> {
         if n_card > 0 {
             side.acc_k.enqueue_card_acc(
                 stream,
-                &CardAcc {
-                    down: &b.down2,
-                    w: &b.weights,
-                    sel,
-                    n: sh.latent,
-                    m,
-                    n_card,
-                    n_used: sh.top_k,
-                    w_pitch: sh.top_k,
-                    fault: gpu.layer_sink(l)?,
-                },
+                &sh.card_acc((&b.down2, &b.weights, sel), (m, n_card), gpu.layer_sink(l)?),
                 &mut b.moe,
             )?;
             // The latent down's rows are spent: they take the card's sum
@@ -1285,17 +1265,7 @@ impl PassWalk<'_> {
         if n_card > 0 {
             side.acc_k.enqueue_card_acc(
                 stream,
-                &CardAcc {
-                    down: &b.down2,
-                    w: &b.weights,
-                    sel,
-                    n: sh.latent,
-                    m,
-                    n_card,
-                    n_used: sh.top_k,
-                    w_pitch: sh.top_k,
-                    fault,
-                },
+                &sh.card_acc((&b.down2, &b.weights, sel), (m, n_card), fault),
                 &mut b.moe,
             )?;
         }

@@ -11,8 +11,7 @@
 //! experts run in the latent between a weighted norm and a scaled-then-normed
 //! one ([`Moe::pre_exp_norm`], [`Moe::post_exp_norm`]); the heads' outputs
 //! are normed per head before their gate ([`Gqa::o_norm`]); and the head
-//! scales then softcaps its logits ([`LogitEpilogue`]). No program runs the
-//! architecture (`program_of` is `None`), so the coverage check lists it.
+//! scales then softcaps its logits ([`LogitEpilogue`]).
 //!
 //! The chat surface: the pre-tokenizer `gpt-4o` (GPT4O's one regex, which
 //! this tree runs as `minimax-m2`'s), the file's own template, and Muse's
@@ -574,6 +573,37 @@ mod tests {
                 "{err}"
             );
         }
+    }
+
+    /// One expert width serves the step's launches and the plan's sizing, so
+    /// a file whose layers differ is refused at the first layer that does,
+    /// its tensors agreeing with its own keys (the widths whole 256-value
+    /// blocks): a reader that took layer 0's width for every layer would run
+    /// layer 2 at the wrong one.
+    #[test]
+    fn an_expert_width_that_differs_by_layer_is_named() {
+        let mut kv = keys();
+        set_key(
+            &mut kv,
+            "expert_feed_forward_length",
+            V::I32s(vec![256, 256, 512, 256, 256]),
+        );
+        let mut t = tensors();
+        for (stem, at) in [
+            (names::FFN_GATE_EXPS, 1),
+            (names::FFN_UP_EXPS, 1),
+            (names::FFN_DOWN_EXPS, 0),
+        ] {
+            let name = crate::arch::names::blk(2, stem);
+            let row = t.iter_mut().find(|(n, _, _)| *n == name).expect(&name);
+            row.1[at] = 512;
+        }
+        let err = load("muse-ff", kv, &GLOBAL, &t).expect_err("layers of two widths");
+        assert!(
+            err.contains("expert_feed_forward_length")
+                && err.contains("is 512 at layer 2, 256 at layer 0"),
+            "{err}"
+        );
     }
 
     /// A tensor missing is named with the count of the others, a tensor of

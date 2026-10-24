@@ -41,7 +41,7 @@ use super::{
     ffn_post, ffn_pre,
 };
 use crate::arch::hybrid::GqaCx;
-use crate::card_slots::{CardAcc, CardSlotKernels};
+use crate::card_slots::CardSlotKernels;
 use crate::host::handoff::{Handoff, HandoffKernels};
 use crate::host::leg_tier::{Hang, LegOpen};
 use crate::host::run::{HostRun, HostWidths};
@@ -199,7 +199,7 @@ impl Placed {
             (
                 HostWidths {
                     embd: width,
-                    ff: hp.expert_ff.iter().copied().max().unwrap_or(0),
+                    ff: hp.expert_width(),
                     n_used: hp.n_used,
                 },
                 1,
@@ -255,10 +255,16 @@ impl Placed {
         self.side.tier.as_ref().map_or(0, |t| t.k(l))
     }
 
-    /// Whether the host serves a share of layer `l`.
+    /// Whether the host serves a share of layer `l`. A layer past the model
+    /// panics by name.
     #[must_use]
     pub fn hosted(&self, l: usize) -> bool {
-        self.side.hosted.get(l).copied().unwrap_or(false)
+        self.side.hosted.get(l).copied().unwrap_or_else(|| {
+            panic!(
+                "hosted: layer {l} is past the model's {} layers",
+                self.side.hosted.len()
+            )
+        })
     }
 
     /// The residency machine's source, when the load runs one.
@@ -458,17 +464,11 @@ impl<'a> LayerProgram for StepWalk<'a> {
         if a.n_card > 0 {
             self.side.acc_k.enqueue_card_acc(
                 stream,
-                &CardAcc {
-                    down: &self.s.rows2,
-                    w: a.route.weights(),
-                    sel: &self.side.sel,
-                    n: sh.latent,
-                    m: 1,
-                    n_card: a.n_card,
-                    n_used: sh.top_k,
-                    w_pitch: sh.top_k,
-                    fault: gpu.layer_sink(l)?,
-                },
+                &sh.card_acc(
+                    (&self.s.rows2, a.route.weights(), &self.side.sel),
+                    (1, a.n_card),
+                    gpu.layer_sink(l)?,
+                ),
                 &mut self.side.acc,
             )?;
         }

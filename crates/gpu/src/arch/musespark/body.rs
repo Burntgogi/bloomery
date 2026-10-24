@@ -48,6 +48,7 @@
 //! under it.
 
 use crate::arch::hybrid::{Acts, DecodeInput, GqaCx, Names, Site, norm_rows};
+use crate::card_slots::CardAcc;
 use crate::fault::{FaultSink, FaultSite};
 use crate::flash::PlaneAppend;
 use crate::flash_gqa::{FlashGqaKernels, GROUP, Gqa64Args, HEAD_64, SEGMENTS, window_segments};
@@ -321,6 +322,34 @@ struct Shape {
     top_k: usize,
     ff: usize,
     weights_scale: f32,
+}
+
+impl Shape {
+    /// The card slots' sum over `m` rows of the layer's `n_card` card slots: `down` their
+    /// rows, `w` the rows' weights and `sel` the slots' places. The latent width, the top-k
+    /// and the weights' pitch are the shape's.
+    fn card_acc<'a>(
+        &self,
+        (down, w, sel): (
+            &'a DeviceBuffer<f32>,
+            &'a DeviceBuffer<f32>,
+            &'a DeviceBuffer<u32>,
+        ),
+        (m, n_card): (usize, usize),
+        fault: FaultSink,
+    ) -> CardAcc<'a> {
+        CardAcc {
+            down,
+            w,
+            sel,
+            n: self.latent,
+            m,
+            n_card,
+            n_used: self.top_k,
+            w_pitch: self.top_k,
+            fault,
+        }
+    }
 }
 
 /// The kernels a step launches beyond the `Gpu`'s own.
@@ -707,6 +736,18 @@ impl Body {
                 ),
             ));
         }
+        // The step and a pass rope each row's heads by one row of the table
+        // a position, so the table's width is the head's.
+        if hp.rope_dims != hp.head_dim {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "a rope of {} dims over heads of {}: a step and a pass rope each row's \
+                     heads by one row of the table a position",
+                    hp.rope_dims, hp.head_dim
+                ),
+            ));
+        }
         if hp.n_head != hp.n_head_kv * GROUP {
             return Err(GpuError::shape(
                 WHAT,
@@ -902,7 +943,7 @@ impl Body {
             Open::Placed(_) => placed_rows(hp.n_used),
         };
         let rows = choose_pass_rows(&sizes, ctx, gpu.alloc_room()?, cap)?;
-        let prompt = Prompt::new(gpu, &sizes, &layers, (rows, hp.rope_dims))?;
+        let prompt = Prompt::new(gpu, &sizes, &layers, rows)?;
         let placed = match open {
             Open::Whole => None,
             Open::Placed(o) => {

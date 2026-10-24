@@ -86,7 +86,7 @@ impl LegFamily for MuseSpark {
             n_expert: hp.n_expert,
             n_used: hp.n_used,
             n_embd: hp.latent,
-            ff: hp.expert_ff.iter().copied().max().unwrap_or(0),
+            ff: hp.expert_width(),
         }
     }
 

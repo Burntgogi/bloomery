@@ -43,13 +43,12 @@ const COSTS_LATENT: usize = 4096;
 const COSTS_FF: usize = 4096;
 
 /// The stream rule's costs for the file's IQ2_XXS experts (latent `COSTS_LATENT` by `COSTS_FF` a part, three
-/// parts): the host union's `t(m) = a + c·m` of `docs/research/muse-spark-attach.md` §5, "Prefill, P = 512" [derived:
-/// `a` the h1fold fit, `c` the Q3_K column fit scaled by the expert's 50.33/35.39 MMAC a column and the upper IQ2_XXS
-/// unpack penalty, 1.5, the end the load's measured pp512 sits at]. The card's ring pass runs the streamed slots as
-/// the route GEMM over the ring's half ([`RingGemm`]), which reads an expert's blocks once a tile of up to 64 of its
-/// slots: the fixed part, the expert's 12.98 MB read once at the card's DRAM rate; a column, the expert's 50.33 M int8
-/// MACs at a fifth of the card's dense int8 rate [derived from the expert's shape, unmeasured]. No record of this
-/// file's union or ring pass has fitted the row: the per-file override ([`Body::set_xstream_costs`]) takes a
+/// parts): the host union's `t(m) = a + c·m` of `docs/research/muse-spark-attach.md` §5, "Prefill, P = 512", `a` the
+/// union's fixed part and `c` a column's cost with IQ2_XXS's unpack penalty [derived there]. The card's ring pass runs
+/// the streamed slots as the route GEMM over the ring's half ([`RingGemm`]), which reads an expert's blocks once a tile
+/// of up to 64 of its slots: the fixed part is the expert's bytes read once at the card's DRAM rate; a column, the
+/// expert's int8 MACs at a fifth of the card's dense int8 rate [derived from the expert's shape]. The row is not fitted
+/// to a record of this file's union or ring pass: the per-file override ([`Body::set_xstream_costs`]) takes a
 /// calibrated one. A load starts from the row of its own experts' widths (`xstream_costs`), not this one.
 pub const XSTREAM_COSTS: Costs = Costs {
     host_us_per_col: 57.6,

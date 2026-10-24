@@ -78,7 +78,7 @@ pub const fn pass_rows_max(n_used: usize) -> usize {
 /// leg in chunks of [`TIER_CHUNK`].
 #[must_use]
 pub fn tier_batch(hp: &Hparams) -> TierBatchBytes {
-    let ff = hp.expert_ff.iter().copied().max().unwrap_or(0);
+    let ff = hp.expert_width();
     workstation::tier_leg_batch_bytes(
         hp.latent as u64,
         ff as u64,
