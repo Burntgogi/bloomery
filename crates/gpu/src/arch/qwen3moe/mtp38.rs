@@ -111,7 +111,7 @@ use super::scratch::{IN_IDS, IN_POS0, Inbox, KvPlanes, f32_view, param_view, put
 use super::scratch38::{PASS_ROWS, VERIFY_ROWS};
 use crate::card_slots::CardAcc;
 use crate::checkpoint::saved::Spans;
-use crate::draft::{DraftFeed, DraftHead, Feed, Hidden, WalkBounds, WalkMode, refuse_rows};
+use crate::draft::{DraftFeed, DraftHead, Feed, Held, Hidden, WalkBounds, WalkMode, refuse_rows};
 use crate::fault::Fault;
 use crate::flash_gqa::{GqaArgs, partials_ms_len, partials_v_len_256};
 use crate::gemm::{GemmAct32, GemmRoute};
@@ -818,67 +818,10 @@ pub enum TargetRows {
     Ubatch,
 }
 
-/// The positions a target arena's rows hold, row `r` position `first + r`:
-/// what the call that last wrote the arena left there, less the positions a
-/// cut took back since. No rows: the arena holds no position of the
-/// sequence. A walk that reads an arena names the positions its rows must
-/// hold ([`Hidden::Target`]); without this record it would read a stale
-/// arena silently.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Held38 {
-    first: u32,
-    rows: u32,
-}
-
-impl Held38 {
-    /// No position.
-    pub const NONE: Held38 = Held38 { first: 0, rows: 0 };
-
-    /// Rows `0 .. rows` at positions `first ..`.
-    #[must_use]
-    pub const fn at(first: u32, rows: u32) -> Held38 {
-        Held38 { first, rows }
-    }
-
-    /// The positions from `pos` on taken back.
-    pub(super) fn cut(&mut self, pos: u32) {
-        self.rows = self.rows.min(pos.saturating_sub(self.first));
-    }
-
-    /// The rows it holds, and the first position they hold.
-    #[must_use]
-    pub const fn parts(self) -> (u32, u32) {
-        (self.first, self.rows)
-    }
-
-    /// Whether rows `row .. row + m` hold positions `at .. at + m`. A range
-    /// whose end, or whose first position, is past `usize` holds nothing.
-    #[must_use]
-    pub const fn holds(self, row: usize, m: usize, at: u32) -> bool {
-        let (Some(end), Some(first)) = (row.checked_add(m), (self.first as usize).checked_add(row))
-        else {
-            return false;
-        };
-        end <= self.rows as usize && first == at as usize
-    }
-
-    /// The positions held, for a refusal's words.
-    fn shown(self) -> String {
-        match self.rows {
-            0 => "no position".to_string(),
-            r => format!(
-                "positions {}..{}",
-                self.first,
-                u64::from(self.first) + u64::from(r)
-            ),
-        }
-    }
-}
-
 /// What a sequence state carries of the draft beside its positional rows,
 /// which hold the store's ([`Mtp38::store_spans`]): the positions the store
 /// holds ([`Mtp38::held`]), and the step's and the pass's arena rows with the
-/// positions they hold ([`Held38`]) — the target's hidden rows a draft's
+/// positions they hold ([`Held`]) — the target's hidden rows a draft's
 /// waiting rows read when it rejoins the sequence. The ubatch walk's rows
 /// are not carried: after a resume that arena holds no position, and a walk
 /// that names it is refused. Beside them, for each point the state carries
@@ -887,8 +830,8 @@ impl Held38 {
 #[derive(Clone, Debug)]
 pub struct DraftRows38 {
     pub(super) held: u32,
-    pub(super) step: (Held38, Vec<f32>),
-    pub(super) pass: (Held38, Vec<f32>),
+    pub(super) step: (Held, Vec<f32>),
+    pub(super) pass: (Held, Vec<f32>),
     pub(super) point_rows: Vec<(u32, Vec<f32>)>,
 }
 
@@ -902,12 +845,12 @@ impl DraftRows38 {
 }
 
 /// The target's streams a [`Hidden::Target`] feed copies from, and the
-/// positions its rows hold ([`Held38`]): the buffer and the record together,
+/// positions its rows hold ([`Held`]): the buffer and the record together,
 /// the body's `mtp_target` resolving both over its arenas.
 #[derive(Clone, Copy)]
 pub(super) struct Target38<'a> {
     pub(super) buf: &'a DeviceBuffer<f32>,
-    pub(super) held: Held38,
+    pub(super) held: Held,
 }
 
 /// One sequence's rows of a store walk ([`Mtp38::store_rows`]): rows
@@ -1736,7 +1679,8 @@ impl Mtp38 {
                 Hidden::Host(_) => {}
                 Hidden::Target { walk, first } => {
                     let t = target.ok_or(GpuError::state(WHAT, "the target's streams to copy"))?;
-                    check_target_rows(walk, t.held, t.buf.len(), (first, m), pos0)?;
+                    t.held
+                        .check_read(WHAT, walk, t.buf.len() / WIDE, (first, m), pos0)?;
                     src = Some((t.buf, first));
                 }
             }
@@ -2644,49 +2588,6 @@ impl Mtp38 {
     }
 }
 
-/// Refuse by name the target rows a [`Hidden::Target`] feed names when a walk
-/// from `pos0` cannot copy them: `m` rows from row `first` past the `buf_len`
-/// values of the arena's buffer (a range whose end is past `usize` is past
-/// it), or rows that do not hold the positions `pos0 - 1 ..` (the row before
-/// the walk's first token, [`Held38::holds`]). Pure arithmetic; the walk
-/// copies nothing before it passes.
-fn check_target_rows(
-    walk: TargetRows,
-    held: Held38,
-    buf_len: usize,
-    (first, m): (usize, usize),
-    pos0: u32,
-) -> Result<(), GpuError> {
-    let rows = buf_len / WIDE;
-    let Some(end) = first.checked_add(m).filter(|&end| end <= rows) else {
-        return Err(GpuError::shape(
-            WHAT,
-            format!("{m} rows from row {first} of the target's {rows} streams' rows"),
-        ));
-    };
-    let at = pos0.checked_sub(1).ok_or_else(|| {
-        GpuError::shape(
-            WHAT,
-            format!(
-                "the {walk:?} arena's rows for a walk at position 0: the target \
-                 holds no row before it (a host zero row is position 0's)"
-            ),
-        )
-    })?;
-    if !held.holds(first, m, at) {
-        return Err(GpuError::shape(
-            WHAT,
-            format!(
-                "rows {first}..{end} of the {walk:?} arena as positions {at}..{} for \
-                 a walk from {pos0}: the arena holds {}",
-                at as usize + m,
-                held.shown()
-            ),
-        ));
-    }
-    Ok(())
-}
-
 /// Refuse by name a store walk ([`WalkMode::Store`]) where the head's rows
 /// are read back, `why` naming the call.
 fn refuse_store(mode: WalkMode, why: &'static str) -> Result<(), GpuError> {
@@ -2739,42 +2640,9 @@ const _: () = assert!(
 
 #[cfg(test)]
 mod tests {
-    use super::{Held38, TargetRows, WIDE, check_target_rows, media_free_rows};
+    use super::{TargetRows, media_free_rows};
     use crate::draft::{DraftFeed, Feed, Hidden};
     use crate::media::CallRows;
-
-    /// A range whose end, or whose first position, is past `usize` holds
-    /// nothing: the wrapped sum must not read as a held range.
-    #[test]
-    fn held_rows_past_usize_are_not_held() {
-        // Arena row 0 holds position 1.
-        let held = Held38::at(1, 1);
-        assert!(held.holds(0, 1, 1), "the row it holds");
-        // `usize::MAX + 1` wraps to 0, and so does `1 + usize::MAX`.
-        assert!(
-            !held.holds(usize::MAX, 1, 0),
-            "row usize::MAX of position 0"
-        );
-        assert!(!held.holds(1, usize::MAX, 2), "usize::MAX rows from row 1");
-    }
-
-    /// A feed that names rows past `usize` is refused by name before any
-    /// copy: `first + m` must not wrap into a range inside the buffer.
-    #[test]
-    fn target_rows_past_usize_are_refused_by_name() {
-        let held = Held38::at(1, 1);
-        let buf_len = 2 * WIDE;
-        // Row 0 holds position 1: a walk from position 2 reads it.
-        check_target_rows(TargetRows::Step, held, buf_len, (0, 1), 2).expect("the held row");
-        for (first, m) in [(usize::MAX, 1), (1, usize::MAX), (usize::MAX, usize::MAX)] {
-            let e = check_target_rows(TargetRows::Step, held, buf_len, (first, m), 1)
-                .expect_err("rows past usize");
-            assert!(
-                e.to_string().contains("of the target's 2 streams' rows"),
-                "{e}"
-            );
-        }
-    }
 
     /// A feed that holds media rows is refused by name, not walked without
     /// them: this draft has no media prompt call. A feed with none gives its

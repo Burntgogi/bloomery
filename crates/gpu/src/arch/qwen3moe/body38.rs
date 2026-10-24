@@ -116,7 +116,7 @@ use super::image::{
     MediaCarrier, MediaRows, imrope_sections, media_call, section_order, window_spans,
 };
 use super::mtp38::{
-    DraftRows38, DraftSeq38, Held38, Mtp38, MtpCtx, MtpDraft, MtpTaps, Target38, TargetRows,
+    DraftRows38, DraftSeq38, Mtp38, MtpCtx, MtpDraft, MtpTaps, Target38, TargetRows,
 };
 use super::plan38::{self, GDN, Kind38, Layer38, Shape38, beta_alpha, geo, router};
 use super::program38::{
@@ -140,7 +140,7 @@ use crate::checkpoint::saved::{
 };
 use crate::checkpoint::staging::NoRoom;
 use crate::checkpoint::{self, Checkpoints};
-use crate::draft::{DraftFeed, DraftHead, Feed, Hidden, WalkMode};
+use crate::draft::{DraftFeed, DraftHead, Feed, Held, Hidden, WalkMode};
 use crate::head::{Head, HeadNorm};
 use crate::host::nvtier::NvTier;
 use crate::host::prompt_stream::PromptStream;
@@ -1264,7 +1264,7 @@ pub struct Body38 {
     /// its rows' final streams sit for a caller that reads them back
     /// ([`Body38::target_streams`], [`Tapped`]).
     last_walk: TargetRows,
-    /// Each target arena's [`Held38`]: where the step, the pass (a verify's
+    /// Each target arena's [`Held`]: where the step, the pass (a verify's
     /// rows too) and the ubatch walk left their rows, which a draft's walk
     /// reads by position ([`mtp_target`]) and a sequence state carries.
     wrote: Wrote38,
@@ -2882,7 +2882,7 @@ impl Body38 {
             d.forget();
             return Err(e.into());
         }
-        wrote.step = Held38::at(pos - 1, 1);
+        wrote.step = Held::at(pos - 1, 1);
         Ok(())
     }
 
@@ -3088,23 +3088,26 @@ impl Body38 {
             return Ok(None);
         };
         let held = d.held();
-        if held > pos as usize {
-            return Err(GpuError::shape(
-                WHAT_D,
-                format!("a state at {pos} of a draft store that holds {held} positions"),
-            ));
-        }
+        let held = u32::try_from(held)
+            .ok()
+            .filter(|&held| held <= pos)
+            .ok_or_else(|| {
+                GpuError::shape(
+                    WHAT_D,
+                    format!("a state at {pos} of a draft store that holds {held} positions"),
+                )
+            })?;
         let wide = geo::STREAMS * geo::HIDDEN;
-        let rows = |walk: TargetRows, most: usize| -> Result<(Held38, Vec<f32>), GpuError> {
+        let rows = |walk: TargetRows, most: usize| -> Result<(Held, Vec<f32>), GpuError> {
             let held = self.wrote.of(walk);
-            let (first, n) = held.parts();
-            let n = n as usize;
-            if n > most || n > 0 && first as usize + n > pos as usize {
+            let (first, count) = held.parts();
+            let n = count as usize;
+            if n > most || n > 0 && u64::from(first) + u64::from(count) > u64::from(pos) {
                 return Err(GpuError::shape(
                     WHAT_D,
                     format!(
                         "the {walk:?} arena's {} at a state of {pos} positions",
-                        held_shown(first, n)
+                        held.shown()
                     ),
                 ));
             }
@@ -3116,7 +3119,7 @@ impl Body38 {
                     to_host(stream, &window)?
                 }
             };
-            Ok((Held38::at(first, u32::try_from(n).unwrap_or(u32::MAX)), v))
+            Ok((held, v))
         };
         let step = rows(TargetRows::Step, 1)?;
         let pass = rows(TargetRows::Pass, PASS_ROWS)?;
@@ -3128,7 +3131,7 @@ impl Body38 {
             .cloned()
             .collect();
         Ok(Some(DraftRows38 {
-            held: u32::try_from(held).unwrap_or(u32::MAX),
+            held,
             step,
             pass,
             point_rows,
@@ -3156,15 +3159,18 @@ impl Body38 {
         }
         let wide = geo::STREAMS * geo::HIDDEN;
         for (what, (held, v), rows) in [("step", &d.step, 1usize), ("pass", &d.pass, PASS_ROWS)] {
-            let (first, n) = held.parts();
-            let n = n as usize;
-            if n > rows || v.len() != n * wide || n > 0 && first as usize + n > pos as usize {
+            let (first, count) = held.parts();
+            let n = count as usize;
+            if n > rows
+                || v.len() != n * wide
+                || n > 0 && u64::from(first) + u64::from(count) > u64::from(pos)
+            {
                 return Err(GpuError::shape(
                     WHAT_F,
                     format!(
                         "the {what} arena's {} ({} values) put back into {rows} rows of {wide} \
                          at position {pos}",
-                        held_shown(first, n),
+                        held.shown(),
                         v.len()
                     ),
                 ));
@@ -3242,7 +3248,7 @@ impl Body38 {
         *wrote = Wrote38 {
             step: d.step.0,
             pass: d.pass.0,
-            ubatch: Held38::NONE,
+            ubatch: Held::NONE,
         };
         wrote.cut(at);
         if let Some((_, row)) = rejoin {
@@ -3392,7 +3398,7 @@ impl Body38 {
         };
         let before = std::mem::replace(&mut self.ple.hist, s.hist);
         self.held = s.pos + s.rows;
-        self.wrote.set(self.last_walk, s.pos, s.rows as usize);
+        self.wrote.set(self.last_walk, s.pos, s.rows);
         if let Some(tokens) = s.verify {
             self.pending = Some(Pending38 {
                 pos0: s.pos,
@@ -4274,31 +4280,22 @@ impl crate::host::xstream::XStreamBody for Body38 {
     }
 }
 
-/// The positions `first .. first + n`, for a refusal's words of a state's
-/// arena rows.
-fn held_shown(first: u32, n: usize) -> String {
-    match n {
-        0 => "no position".to_string(),
-        n => format!("positions {}..{}", first, first as usize + n),
-    }
-}
-
-/// Each target arena's [`Held38`]: the body's record of where the step, the
+/// Each target arena's [`Held`]: the body's record of where the step, the
 /// pass (a verify's rows too) and the ubatch walk left their rows — what a
 /// draft's walk checks its read positions against, and a sequence state
 /// carries of the two arenas a parked refresh reads.
 #[derive(Clone, Copy, Debug, Default)]
 struct Wrote38 {
-    step: Held38,
-    pass: Held38,
-    ubatch: Held38,
+    step: Held,
+    pass: Held,
+    ubatch: Held,
 }
 
 impl Wrote38 {
     /// The arena `walk`'s rows hold `rows` rows at `pos ..`, as the call that
     /// last wrote it left them.
-    fn set(&mut self, walk: TargetRows, pos: u32, rows: usize) {
-        let held = Held38::at(pos, u32::try_from(rows).unwrap_or(u32::MAX));
+    fn set(&mut self, walk: TargetRows, pos: u32, rows: u32) {
+        let held = Held::at(pos, rows);
         match walk {
             TargetRows::Step => self.step = held,
             TargetRows::Pass => self.pass = held,
@@ -4313,7 +4310,7 @@ impl Wrote38 {
         }
     }
 
-    fn of(&self, walk: TargetRows) -> Held38 {
+    fn of(&self, walk: TargetRows) -> Held {
         match walk {
             TargetRows::Step => self.step,
             TargetRows::Pass => self.pass,
@@ -5215,7 +5212,7 @@ impl Body38 {
         // sequence's prompt call may have written it since this one's, so
         // the sequence brought live holds no position there. A draft parked
         // with rows waiting in that arena skips them (`Policy::park`).
-        self.wrote.ubatch = Held38::NONE;
+        self.wrote.ubatch = Held::NONE;
         std::mem::swap(&mut self.last_walk, &mut seq.last_walk);
         // The arena rows a draft walk reads by position (the walk's graph
         // replays the shared arena's address, so the sequence's rows move as

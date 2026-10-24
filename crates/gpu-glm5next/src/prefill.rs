@@ -100,6 +100,7 @@ use std::ops::Range;
 use std::time::Instant;
 
 use bloomery_gpu::checkpoint::{Checkpoints, Pending};
+use bloomery_gpu::draft::Held;
 use bloomery_gpu::head::Head;
 use bloomery_gpu::host::BatchLeg;
 use bloomery_gpu::host::run::HostRun;
@@ -1543,7 +1544,7 @@ fn call_groups(
             for (u, run) in runs.iter().enumerate() {
                 let (_, _, body) = m.body_parts(WHAT)?;
                 body.prompt.sink = u;
-                body.wrote.prefill = super::nextn::Held::at(run.start, run.end - run.start);
+                body.wrote.prefill = Held::at(run.start, run.end - run.start);
                 s(
                     m,
                     GlmArena::Prefill,
@@ -2061,7 +2062,7 @@ impl Body {
         let end = runs.last().map_or(pos, |r| r.end);
         *held = end;
         let lastrun = runs.last().map_or(pos..pos, Clone::clone);
-        wrote.prefill = super::nextn::Held::at(lastrun.start, lastrun.end - lastrun.start);
+        wrote.prefill = Held::at(lastrun.start, lastrun.end - lastrun.start);
         *sink = g - 1;
         let mut prog = PromptProgram {
             gpu,
