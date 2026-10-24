@@ -104,8 +104,9 @@ if [ "$MODE" != summary ]; then
   # shellcheck source=tools/ref/ref-paths.sh
   source "$HERE/ref-paths.sh"
   # The timing card, the stale-binary rule, the guards and, through it, the lease and the witness block; this runner
-  # has local mode (the header's Local mode).
-  TIMING_LOCAL_RUNNER=1
+  # has local mode (the header's Local mode) and the two-card mode (BLOOMERY_TIMING_CARDS=a6000+3090: both cards in
+  # the server's view, each arm's Xid, cap and answer checked by timing_cards_arm).
+  TIMING_CARDS_RUNNER=1 TIMING_LOCAL_RUNNER=1
   # shellcheck source=tools/ref/timing-card.sh
   source "$HERE/timing-card.sh"
   # The server arms' start, request and stop (the llama-server runners' functions; the server here is bloomery-serve).
@@ -434,6 +435,11 @@ ds_run_arm() {
 
 # ds_main <arm>...: the run (or, under BLOOMERY_DRY, the plan).
 ds_main() {
+  # A two-card request this machine cannot honour ends here, under its mode's tag (an opted-in runner says it itself).
+  if [ -n "${BLOOMERY_TIMING_CARDS:-}" ] && [ -n "$TIMING_CARDS_WHY" ]; then
+    if [ -n "$TIMING_LOCAL" ]; then echo "[timing-card] refused: $TIMING_CARDS_WHY" >&2; else echo "[timing-cards] refused: $TIMING_CARDS_WHY" >&2; fi
+    exit 64
+  fi
   local i r k n v maxd need
   # Local mode refused (timing-card.sh printed why as this file sourced it) ends the run here, dry or not.
   [ -z "$TIMING_LOCAL" ] || [ -z "$TIMING_CARDS_WHY" ] || exit 64
