@@ -22,6 +22,13 @@ All its existing gate callers use this same owner. Dense generation serves no
 draft; a requested draft is refused by name. MTP, media and mixed-IQ support are
 outside this attach's verification scope.
 
+The `generate_qwen3moe` CLI consumes each value-taking option's next argument as
+data, even when it is an option word: `--prompt '--ctx' -n 1` prompts with the
+literal text `--ctx`. The same rule covers dump directories and token-file
+paths. Ordinary options keep their last value; repeated `--arm` and
+`--tokens-file` values keep their order. `--levers` and `--records-schema`
+print their startup tables only as actual options, never as consumed values.
+
 ## Exact model for NVIDIA validation
 
 - HF repository: [`lmstudio-community/Qwen3.8-27B-GGUF`](https://huggingface.co/lmstudio-community/Qwen3.8-27B-GGUF).

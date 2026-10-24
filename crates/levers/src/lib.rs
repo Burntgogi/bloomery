@@ -2585,8 +2585,18 @@ pub enum HostLanes {
 /// the reading's table — `-` for a lever the binary does not act on — on
 /// stdout and exits 0 instead.
 pub fn at_main(acts_on: &[&str]) -> Result<Levers, LeverError> {
-    let mut args = std::env::args_os();
-    let bin = args
+    at_main_with_flags(acts_on, |name| {
+        std::env::args_os().skip(1).any(|a| a == name)
+    })
+}
+
+/// Read the levers as [`at_main`] does, querying only the caller's option
+/// words for `--levers`, not values consumed by its argument parser.
+pub fn at_main_with_flags(
+    acts_on: &[&str],
+    has_flag: impl FnOnce(&str) -> bool,
+) -> Result<Levers, LeverError> {
+    let bin = std::env::args_os()
         .next()
         .as_deref()
         .map(Path::new)
@@ -2594,7 +2604,7 @@ pub fn at_main(acts_on: &[&str]) -> Result<Levers, LeverError> {
         .map_or_else(|| "unnamed".to_string(), lossy);
     let env: Vec<(OsString, OsString)> = std::env::vars_os().collect();
     let levers = read(&env, Scope::Main { bin: &bin, acts_on })?;
-    if args.any(|a| a == "--levers") {
+    if has_flag("--levers") {
         print!("{}", levers.table());
         std::process::exit(0);
     }

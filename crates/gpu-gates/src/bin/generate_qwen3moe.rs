@@ -26,10 +26,11 @@
 //!     generate_qwen3moe --dump-taps DIR --tokens-file F [--tokens-file F ...]
 //!                       --seqs S --prompt-len P [-n N] [--ctx C]
 //!
-//! Defaults: N 32, C 4096, mode graph, prefill auto, W 0. A flag given twice
-//! takes its last value. `--prompt` tokenizes the text with the file's own vocabulary
-//! (`tokenizer`, no BOS: the file sets `add_bos_token` false; no
-//! chat template) and prints the generated text after the ids.
+//! Defaults: N 32, C 4096, mode graph, prefill auto, W 0. An ordinary flag given
+//! twice takes its last value; repeated `--arm` and `--tokens-file` keep their
+//! order. Each value is data even when it spells an option. `--prompt` tokenizes
+//! the text with the file's own vocabulary (`tokenizer`, no BOS: the file sets
+//! `add_bos_token` false; no chat template) and prints the generated text after the ids.
 //!
 //! `--last-step` (a qwen3moe or qwen35moe file, refused by name on any
 //! other and beside `--time` and `--seed-depth`) feeds the prompt
@@ -483,25 +484,82 @@ mod cli {
     // `BLOOMERY_GEN_SLOTS` runs a row a slot, so its most is a pass's rows.
     const _: () = assert!(bloomery_levers::GEN_SLOTS_MAX == MAX_PASS_ROWS as u64);
 
-    /// The last value of flag `name`, if given.
-    fn flag(name: &str) -> Result<Option<String>, GateError> {
-        Ok(flags(name)?.pop())
-    }
+    /// The flags whose next argument is data, even when it names a flag.
+    const VALUE_FLAGS: [&str; 16] = [
+        "--prompt",
+        "--tokens",
+        "--seed-depth",
+        "--arm",
+        "-n",
+        "--ctx",
+        "--warm",
+        "--mode",
+        "--prefill",
+        "--place",
+        "--pass-rows",
+        "--logit-rows",
+        "--dump-taps",
+        "--tokens-file",
+        "--seqs",
+        "--prompt-len",
+    ];
 
-    /// Every value of flag `name`, in order.
-    fn flags(name: &str) -> Result<Vec<String>, GateError> {
-        let args: Vec<String> = std::env::args().collect();
-        let mut out = Vec::new();
-        for (i, a) in args.iter().enumerate() {
-            if a == name {
-                out.push(
-                    args.get(i + 1)
-                        .ok_or_else(|| format!("{name} needs a value"))?
-                        .clone(),
-                );
+    /// The option words in order, with each value consumed exactly once.
+    struct Options(Vec<(String, Option<String>)>);
+
+    impl Options {
+        fn parse(args: impl IntoIterator<Item = String>) -> Result<Self, GateError> {
+            let mut args = args.into_iter();
+            let mut words = Vec::with_capacity(args.size_hint().0);
+            while let Some(name) = args.next() {
+                let value = if VALUE_FLAGS.contains(&name.as_str()) {
+                    Some(args.next().ok_or_else(|| format!("{name} needs a value"))?)
+                } else {
+                    None
+                };
+                words.push((name, value));
             }
+            Ok(Self(words))
         }
-        Ok(out)
+
+        /// Whether `name` is an option word, never another option's value.
+        fn has(&self, name: &str) -> bool {
+            self.0.iter().any(|(word, _)| word == name)
+        }
+
+        /// Every value of flag `name`, in order.
+        fn flags<'a>(&'a self, name: &'a str) -> impl DoubleEndedIterator<Item = &'a str> {
+            self.0
+                .iter()
+                .filter(move |(word, _)| word == name)
+                .filter_map(|(_, value)| value.as_deref())
+        }
+
+        /// The last value of flag `name`, if given.
+        fn flag<'a>(&'a self, name: &'a str) -> Option<&'a str> {
+            self.flags(name).next_back()
+        }
+
+        fn check_prompt_source(&self) -> Result<(), GateError> {
+            let sources = ["--prompt", "--tokens", "--seed-depth", "--arm"]
+                .into_iter()
+                .filter(|name| self.has(name))
+                .count();
+            if sources != 1 {
+                return Err("give exactly one of --prompt, --tokens, --seed-depth, --arm".into());
+            }
+            Ok(())
+        }
+
+        fn check_dump_flags(&self) -> Result<(), GateError> {
+            if let Some(f) = NOT_WITH_DUMP.iter().find(|f| self.has(f)) {
+                return Err(format!(
+                    "--dump-taps runs each prompt one eager step per id; {f} does not apply to it"
+                )
+                .into());
+            }
+            Ok(())
+        }
     }
 
     /// Comma-separated ids.
@@ -1463,6 +1521,7 @@ mod cli {
     }
 
     pub fn run() -> Result<(), GateError> {
+        let options = Options::parse(std::env::args().skip(1))?;
         // A lever set to a value it does not take, or a retired name that is
         // set, is refused by name before anything loads.
         // The placement's levers act on a run that names `--place`; set on
@@ -1484,11 +1543,13 @@ mod cli {
             bloomery_levers::GEN_SLOTS,
             bloomery_levers::FORCE_IDS,
         ];
-        if std::env::args().any(|a| a == "--place") {
+        if options.has("--place") {
             acts_on.extend(q3place::PLACED_LEVERS);
         }
-        let levers = bloomery_levers::at_main(&acts_on)?;
-        record::at_main("generate_qwen3moe", record::GENERATE_QWEN3MOE);
+        let levers = bloomery_levers::at_main_with_flags(&acts_on, |name| options.has(name))?;
+        record::at_main_with_flags("generate_qwen3moe", record::GENERATE_QWEN3MOE, |name| {
+            options.has(name)
+        });
         // Set, the word runs as given; unset, the Qwen3.8 rule picks it once
         // the file, the flags and plan (a) are known (`residency unset`).
         if let Some(word) = levers.residency() {
@@ -1509,7 +1570,7 @@ mod cli {
         // Unset, the lever is a qwen4exp plan's card experts and nothing on
         // another family's file; only a set `card` is refused there.
         let card_set = levers.qwen38_experts_set() == Some("card");
-        if let Some(dir) = flag("--dump-taps")? {
+        if let Some(dir) = options.flag("--dump-taps") {
             if card_set {
                 return Err(
                     "BLOOMERY_QWEN38_EXPERTS=card places a qwen4exp plan's routed experts; \
@@ -1563,34 +1624,31 @@ mod cli {
                     prefill_step: false,
                 },
             );
-            return dump_taps(&dir, &levers);
+            return dump_taps(dir, &levers, &options);
         }
-        let timed = std::env::args().any(|a| a == "--time");
-        let sync = std::env::args().any(|a| a == "--arm-sync");
-        let logits = std::env::args().any(|a| a == "--logits");
-        let logit_rows = flag("--logit-rows")?.map(PathBuf::from);
-        let last_step = std::env::args().any(|a| a == "--last-step");
-        let n_gen: usize = flag("-n")?.map_or(Ok(32), |s| s.parse())?;
-        let ctx: usize = flag("--ctx")?.map_or(Ok(4096), |s| s.parse())?;
-        let warm: usize = flag("--warm")?.map_or(Ok(0), |s| s.parse())?;
-        let mode = match flag("--mode")?.as_deref() {
+        let timed = options.has("--time");
+        let sync = options.has("--arm-sync");
+        let logits = options.has("--logits");
+        let logit_rows = options.flag("--logit-rows").map(PathBuf::from);
+        let last_step = options.has("--last-step");
+        let n_gen: usize = options.flag("-n").map_or(Ok(32), |s| s.parse())?;
+        let ctx: usize = options.flag("--ctx").map_or(Ok(4096), |s| s.parse())?;
+        let warm: usize = options.flag("--warm").map_or(Ok(0), |s| s.parse())?;
+        let mode = match options.flag("--mode") {
             None | Some("graph") => StepMode::Graph,
             Some("eager") => StepMode::Eager,
             Some(o) => return Err(format!("--mode is eager or graph, not {o}").into()),
         };
-        let prefill = flag("--prefill")?;
-        let place = flag("--place")?;
-        let seed_depth: Option<usize> = flag("--seed-depth")?.map(|s| s.parse()).transpose()?;
-        let text = flag("--prompt")?;
-        let tokens = flag("--tokens")?;
-        let arm_specs = flags("--arm")?;
-        let sources = usize::from(text.is_some())
-            + usize::from(tokens.is_some())
-            + usize::from(seed_depth.is_some())
-            + usize::from(!arm_specs.is_empty());
-        if sources != 1 {
-            return Err("give exactly one of --prompt, --tokens, --seed-depth, --arm".into());
-        }
+        let prefill = options.flag("--prefill");
+        let place = options.flag("--place");
+        let seed_depth: Option<usize> = options
+            .flag("--seed-depth")
+            .map(|s| s.parse())
+            .transpose()?;
+        let text = options.flag("--prompt");
+        let tokens = options.flag("--tokens");
+        let arm_specs: Vec<&str> = options.flags("--arm").collect();
+        options.check_prompt_source()?;
         if sync && arm_specs.is_empty() {
             return Err("--arm-sync paces the arms of an --arm list, and none is given".into());
         }
@@ -1606,7 +1664,7 @@ mod cli {
         // Every other family refuses the flag by name, and a value outside
         // `1..=PASS_ROWS_MAX` (at 64 past it a multiple of 64) is refused
         // before the load.
-        let pass_rows: Option<usize> = match (family, flag("--pass-rows")?) {
+        let pass_rows: Option<usize> = match (family, options.flag("--pass-rows")) {
             (Family::NemotronHMoe, Some(word)) => {
                 let n: usize = word
                     .parse()
@@ -1630,7 +1688,6 @@ mod cli {
             }
             (_, None) => None,
         };
-        let prefill = prefill.as_deref();
         let arms: Vec<Arm> = if arm_specs.is_empty() {
             let ids: Vec<u32> = match (&text, &tokens, seed_depth) {
                 (Some(t), _, _) => tok.as_ref().ok_or("no tokenizer")?.encode(t, true, false),
@@ -1645,7 +1702,7 @@ mod cli {
                 .map(|spec| {
                     let (ids, n) = match spec.split_once('/') {
                         Some((ids, n)) => (ids, n.parse::<usize>()?),
-                        None => (spec.as_str(), n_gen),
+                        None => (*spec, n_gen),
                     };
                     Ok(Arm {
                         ids: ids_of(ids)?,
@@ -1661,7 +1718,7 @@ mod cli {
             }
             if family == Family::Qwen38
                 || timed
-                || flag("--warm")?.is_some()
+                || options.has("--warm")
                 || seed_depth.is_some()
                 || !arm_specs.is_empty()
                 || slots != 1
@@ -1719,7 +1776,7 @@ mod cli {
         let (chosen, draft_off, lane) = match family {
             Family::Qwen3 => {
                 draft_refused_on_other(&levers, family)?;
-                let (place, lane) = place_q3(place.as_deref(), prefill)?;
+                let (place, lane) = place_q3(place, prefill)?;
                 (Chosen::Qwen3(Body::path(prefill)?, place), None, lane)
             }
             Family::Qwen35 => {
@@ -1732,7 +1789,7 @@ mod cli {
                 } else {
                     draft_refused_on_other(&levers, family)?;
                 }
-                let (place, lane) = place_q3(place.as_deref(), prefill)?;
+                let (place, lane) = place_q3(place, prefill)?;
                 (Chosen::Qwen35(Body35::path(prefill)?, place), None, lane)
             }
             Family::NemotronH => {
@@ -1756,7 +1813,7 @@ mod cli {
                     return Err(no_seed38(d));
                 }
                 let (place, lane) = place38(
-                    place.as_deref(),
+                    place,
                     (&file, &levers, experts),
                     (ctx, logits, slots),
                     &arms,
@@ -2301,26 +2358,22 @@ mod cli {
 
     /// `--dump-taps DIR`: the tap dump of every `--tokens-file`'s windows on
     /// a qwen3moe file, eager, then the manifest read back.
-    fn dump_taps(dir: &str, levers: &Levers) -> Result<(), GateError> {
-        let args: Vec<String> = std::env::args().collect();
-        if let Some(f) = NOT_WITH_DUMP.iter().find(|f| args.iter().any(|a| a == *f)) {
-            return Err(format!(
-                "--dump-taps runs each prompt one eager step per id; {f} does not apply to it"
-            )
-            .into());
-        }
-        let files = flags("--tokens-file")?;
+    fn dump_taps(dir: &str, levers: &Levers, options: &Options) -> Result<(), GateError> {
+        options.check_dump_flags()?;
+        let files: Vec<&str> = options.flags("--tokens-file").collect();
         if files.is_empty() {
             return Err("--dump-taps needs at least one --tokens-file".into());
         }
-        let seqs: usize = flag("--seqs")?
+        let seqs: usize = options
+            .flag("--seqs")
             .ok_or("--dump-taps needs --seqs (prompts per --tokens-file)")?
             .parse()?;
-        let len: usize = flag("--prompt-len")?
+        let len: usize = options
+            .flag("--prompt-len")
             .ok_or("--dump-taps needs --prompt-len")?
             .parse()?;
-        let n_gen: usize = flag("-n")?.map_or(Ok(32), |s| s.parse())?;
-        let ctx: usize = flag("--ctx")?.map_or(Ok(4096), |s| s.parse())?;
+        let n_gen: usize = options.flag("-n").map_or(Ok(32), |s| s.parse())?;
+        let ctx: usize = options.flag("--ctx").map_or(Ok(4096), |s| s.parse())?;
         if len + n_gen > ctx {
             return Err(format!("--prompt-len {len} + -n {n_gen} pass --ctx {ctx}").into());
         }
@@ -3970,7 +4023,94 @@ mod cli {
 
     #[cfg(test)]
     mod tests {
-        use super::{Duration, counted_passes};
+        use super::{Duration, NOT_WITH_DUMP, Options, VALUE_FLAGS, counted_passes};
+
+        fn options(args: &[&str]) -> Options {
+            Options::parse(args.iter().map(|s| (*s).to_owned())).unwrap()
+        }
+
+        #[test]
+        fn option_shaped_values_remain_data() {
+            for value in VALUE_FLAGS.into_iter().chain([
+                "--time",
+                "--arm-sync",
+                "--logits",
+                "--last-step",
+                "--help",
+                "--levers",
+                "--records-schema",
+            ]) {
+                let args = options(&["--prompt", value]);
+                assert_eq!(args.flag("--prompt"), Some(value));
+                args.check_prompt_source().unwrap();
+                assert_eq!(args.flag("-n"), None);
+                assert_eq!(args.flag("--ctx"), None);
+                assert_eq!(args.flag("--tokens"), None);
+                if value != "--prompt" {
+                    assert!(!args.has(value), "{value} escaped the prompt");
+                }
+            }
+            let args = options(&["--prompt", "--ctx", "-n", "1"]);
+            args.check_prompt_source().unwrap();
+            assert_eq!(args.flag("-n").unwrap().parse::<usize>().unwrap(), 1);
+            for value in NOT_WITH_DUMP {
+                let args = options(&[
+                    "--dump-taps",
+                    value,
+                    "--tokens-file",
+                    value,
+                    "--seqs",
+                    "1",
+                    "--prompt-len",
+                    "8",
+                ]);
+                assert_eq!(args.flag("--dump-taps"), Some(value));
+                assert_eq!(args.flags("--tokens-file").collect::<Vec<_>>(), [value]);
+                args.check_dump_flags().unwrap();
+                let actual = options(&["--dump-taps", "out", value, "1"]);
+                let err = actual.check_dump_flags().unwrap_err();
+                assert!(err.to_string().contains(value));
+            }
+        }
+
+        #[test]
+        fn repeated_values_keep_last_or_ordered_sources() {
+            let args = options(&[
+                "--prompt", "first", "--prompt", "--tokens", "--ctx", "64", "--ctx", "128",
+            ]);
+            assert_eq!(args.flag("--prompt"), Some("--tokens"));
+            assert_eq!(args.flag("--tokens"), None);
+            args.check_prompt_source().unwrap();
+            assert_eq!(args.flag("--ctx").unwrap().parse::<usize>().unwrap(), 128);
+            let arms = options(&["--arm", "1,2/3", "--arm", "4,5/6"]);
+            assert_eq!(arms.flags("--arm").collect::<Vec<_>>(), ["1,2/3", "4,5/6"]);
+            arms.check_prompt_source().unwrap();
+            let files = options(&["--tokens-file", "--time", "--tokens-file", "--ctx"]);
+            assert_eq!(
+                files.flags("--tokens-file").collect::<Vec<_>>(),
+                ["--time", "--ctx"]
+            );
+            let conflict = options(&["--prompt", "--tokens", "--tokens", "1,2"]);
+            assert_eq!(conflict.flag("--prompt"), Some("--tokens"));
+            assert_eq!(conflict.flag("--tokens"), Some("1,2"));
+            assert!(conflict.check_prompt_source().is_err());
+        }
+
+        #[test]
+        fn missing_values_are_refused_only_for_option_words() {
+            for name in VALUE_FLAGS {
+                let err = Options::parse([name.to_owned()]).err().unwrap();
+                assert!(err.to_string().contains(name));
+                let err =
+                    Options::parse(["--prompt", "--ctx", name].into_iter().map(str::to_owned))
+                        .err()
+                        .unwrap();
+                assert!(err.to_string().contains(name));
+            }
+            let args = options(&["--prompt", "--ctx"]);
+            assert_eq!(args.flag("--prompt"), Some("--ctx"));
+            assert_eq!(args.flag("--ctx"), None);
+        }
 
         #[test]
         fn a_rate_over_no_counted_pass_is_refused() {
