@@ -266,6 +266,8 @@ profile() {
     musespark)
       # llama.cpp-muse: mainline at PR 30616's merge (the musespark node-dump tree, crates/refset/src/arch/musespark), no patch.
       # Its `gpt-4o` pre is GPT4O's one regex under its own name — this tree's spelling of the `minimax-m2` splitter.
+      # Its UTF-8 decoder is the strict one (unicode.cpp rejects an overlong form and a codepoint above U+10FFFF, byte by
+      # byte as U+FFFD), which `Pre::strict_utf8` gives the `gpt-4o` row; the other trees above accept an overlong form.
       ORACLE_TREE=/home/user/llama.cpp-muse
       BUILD_PIN=ba3c05f71da85cd0439e84ba42b0478b24d5db16 BUILD_PATCH=
       TREE_FLAGS=()

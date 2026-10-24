@@ -2,7 +2,7 @@
 //! runs them: [`Pre::DeepseekV3`] (`deepseek-v3`, `hunyuan-dense`,
 //! `joyai-llm`), [`Pre::Qwen2`] (`qwen2`, `solar-open`), [`Pre::Glm4`] (`glm4`),
 //! [`Pre::Qwen35`] (`qwen35`), [`Pre::Pixtral`] (`pixtral`),
-//! [`Pre::MiniMaxM2`] (`minimax-m2`, `gpt-4o`), [`Pre::Gemma4`] (`gemma4`),
+//! [`Pre::MiniMaxM2`] (`minimax-m2`), [`Pre::Gpt4o`] (`gpt-4o`), [`Pre::Gemma4`] (`gemma4`),
 //! [`Pre::Raon`] (`raon`) and [`Pre::Flint`] (`flint`).
 //!
 //! ## deepseek-v3
@@ -572,9 +572,11 @@ pub(crate) enum Pre {
     /// `pixtral`: the llama3 regex [`Pre::Glm4`] runs, and a word that is
     /// itself a token is taken whole ([`Pre::ignore_merges`]).
     Pixtral,
-    /// `minimax-m2`, `gpt-4o`: GPT4O's one regex, run as a regex over the
-    /// collapsed text.
+    /// `minimax-m2`: GPT4O's one regex, run as a regex over the collapsed text.
     MiniMaxM2,
+    /// `gpt-4o`: [`Pre::MiniMaxM2`]'s regex under the name of a tree whose UTF-8 reader is the
+    /// strict one ([`Pre::strict_utf8`]).
+    Gpt4o,
     /// `minimax-m2` as a Hugging Face `tokenizer.json` spells and runs it: the letter
     /// categories apart, `\p{M}` in the word classes, and Unicode 14.0's classes. Never named
     /// in a header; a vocabulary with `tokenizer.bloomery.eog_token_ids` gets it.
@@ -600,7 +602,7 @@ impl Pre {
         ("qwen35", Pre::Qwen35),
         ("pixtral", Pre::Pixtral),
         ("minimax-m2", Pre::MiniMaxM2),
-        ("gpt-4o", Pre::MiniMaxM2),
+        ("gpt-4o", Pre::Gpt4o),
         ("gemma4", Pre::Gemma4),
         ("raon", Pre::Raon),
         ("flint", Pre::Flint),
@@ -611,7 +613,7 @@ impl Pre {
     pub(crate) fn hf_reading(self) -> Option<Pre> {
         match self {
             Pre::Qwen35 => Some(Pre::Qwen35Hf),
-            Pre::MiniMaxM2 => Some(Pre::MiniMaxM2Hf),
+            Pre::MiniMaxM2 | Pre::Gpt4o => Some(Pre::MiniMaxM2Hf),
             _ => None,
         }
     }
@@ -639,9 +641,11 @@ impl Pre {
     }
 
     /// Whether the reference decodes UTF-8 strictly, independently of NFC.
-    /// An overlong form is not a codepoint there; older readers accept it.
+    /// An overlong form is not a codepoint there; older readers accept it. The trees that read
+    /// `gpt-4o`, `raon` and `flint` reject it; the trees the other names' sets are read by
+    /// (ik, the Solar-Open2 patch, mainline before the check) accept it.
     pub(crate) fn strict_utf8(self) -> bool {
-        matches!(self, Pre::Raon | Pre::Flint)
+        matches!(self, Pre::Raon | Pre::Flint | Pre::Gpt4o)
     }
 
     /// How this pre-tokenizer's words are spelled in the vocabulary.
@@ -656,6 +660,7 @@ impl Pre {
             | Pre::MiniMaxM2Hf
             | Pre::Pixtral
             | Pre::MiniMaxM2
+            | Pre::Gpt4o
             | Pre::Raon
             | Pre::Flint => Spelling::ByteLevel,
         }
@@ -685,7 +690,7 @@ pub(crate) fn split<'s>(pre: Pre, cpts: &[u32], s: &'s mut Scratch) -> &'s [usiz
         }
         Pre::Qwen35 => split_qwen35(cpts, s, false),
         Pre::Qwen35Hf => split_qwen35(cpts, s, true),
-        Pre::MiniMaxM2 => split_minimax_m2::<M2Reference>(cpts, s),
+        Pre::MiniMaxM2 | Pre::Gpt4o => split_minimax_m2::<M2Reference>(cpts, s),
         Pre::MiniMaxM2Hf => split_minimax_m2::<M2Hf>(cpts, s),
         Pre::Gemma4 => {
             split_newlines(cpts, &mut s.b);
@@ -991,13 +996,14 @@ mod tests {
         assert_eq!(crate::named(&Pre::NAMES, "solar-open"), Some(Pre::Qwen2));
     }
 
-    /// `gpt-4o` runs the minimax-m2 splitter: the reference maps both names
-    /// to GPT4O's one expression, so Muse Spark's `gpt-4o` header splits as
-    /// `minimax-m2`'s does. FAIL-first: a row of its own that runs another
-    /// splitter fails this.
+    /// `gpt-4o` is a row of its own (the UTF-8 reader of its tree is the strict one) that runs the
+    /// minimax-m2 splitter: the reference maps both names to GPT4O's one expression, so Muse
+    /// Spark's `gpt-4o` header splits as `minimax-m2`'s does. `minimax_m2_cases` runs its whole
+    /// table under both rows. FAIL-first: a `gpt-4o` row that runs another splitter fails that
+    /// table.
     #[test]
     fn gpt_4o_is_minimax_m2() {
-        assert_eq!(crate::named(&Pre::NAMES, "gpt-4o"), Some(Pre::MiniMaxM2));
+        assert_eq!(crate::named(&Pre::NAMES, "gpt-4o"), Some(Pre::Gpt4o));
     }
 
     fn words(pre: Pre, text: &str) -> Vec<String> {
@@ -1340,8 +1346,10 @@ mod tests {
             ("e\u{301}x", &["e", "\u{301}x"]),
             ("\u{301}.", &["\u{301}."]),
         ];
-        for &(text, want) in cases {
-            assert_eq!(words(Pre::MiniMaxM2, text), want, "{text:?}");
+        for pre in [Pre::MiniMaxM2, Pre::Gpt4o] {
+            for &(text, want) in cases {
+                assert_eq!(words(pre, text), want, "{pre:?} {text:?}");
+            }
         }
     }
 

@@ -905,6 +905,29 @@ mod tests {
         assert_eq!(tok.encode(b"\xed\xa0\x80", false, false), [237, 160, 128]);
     }
 
+    /// The tree that reads `gpt-4o` (Muse Spark Open's) turns an overlong form and a truncated
+    /// sequence into U+FFFD a byte at a time and passes a surrogate; the trees that read
+    /// `minimax-m2` accept `c0 80` as U+0000. FAIL-first: with `gpt-4o` on the lenient reader its
+    /// row yields a NUL byte for `c0 80`.
+    #[test]
+    fn gpt_4o_decodes_utf8_strictly_and_minimax_m2_leniently() {
+        let bytes = b"\xc0\x80 \xed\xa0\x80 \xf0\x9f\x98";
+        let replaced = |n: usize| "\u{fffd}".repeat(n).into_bytes();
+        let want = |head: Vec<u8>| {
+            [head, b" \xed\xa0\x80 ".to_vec(), replaced(3)]
+                .concat()
+                .into_iter()
+                .map(u32::from)
+                .collect::<Vec<u32>>()
+        };
+        for (pre, head) in [("gpt-4o", replaced(2)), ("minimax-m2", vec![0])] {
+            let mut header = flint_header();
+            header[1].1 = Value::String(pre.into());
+            let tok = from_header(&header).unwrap();
+            assert_eq!(tok.encode(&bytes[..], false, false), want(head), "{pre}");
+        }
+    }
+
     /// `<|eot|>` is one of the reference's end-of-generation names (Muse
     /// Spark's template ends its turns with it): a vocabulary carrying it
     /// ends a generation at it, beside its own eos. FAIL-first: with the name
