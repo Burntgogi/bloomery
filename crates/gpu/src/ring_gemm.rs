@@ -18,17 +18,17 @@ const WHAT: &str = "ring_gemm::RingGemm";
 
 /// One form's rows: q8 blocks of 32 or the grouped GEMM's q8_1 blocks of 128.
 enum Rows {
-    Blocks32(GemmAct32),
-    Q128(GemmAct),
+    Blocks32(Box<GemmAct32>),
+    Q128(Box<GemmAct>),
 }
 
 impl Rows {
     fn new(gpu: &Gpu, cols: usize, k: usize, blocks32: bool) -> Result<Rows, GpuError> {
         let stream = gpu.stream();
         Ok(if blocks32 {
-            Rows::Blocks32(GemmAct32::new(stream, cols, k)?)
+            Rows::Blocks32(Box::new(GemmAct32::new(stream, cols, k)?))
         } else {
-            Rows::Q128(GemmAct::new(stream, cols, k)?)
+            Rows::Q128(Box::new(GemmAct::new(stream, cols, k)?))
         })
     }
 
@@ -157,12 +157,12 @@ impl RingGemm {
             stream.wait(e)?;
         }
         let (x128, x32) = match &*x {
-            Rows::Q128(a) => (Some(a), None),
-            Rows::Blocks32(a) => (None, Some(a)),
+            Rows::Q128(a) => (Some(&**a), None),
+            Rows::Blocks32(a) => (None, Some(&**a)),
         };
         let (h128, h32) = match h {
-            Rows::Q128(a) => (Some(a), None),
-            Rows::Blocks32(a) => (None, Some(a)),
+            Rows::Q128(a) => (Some(&mut **a), None),
+            Rows::Blocks32(a) => (None, Some(&mut **a)),
         };
         blk.enqueue_rule(
             gpu,
