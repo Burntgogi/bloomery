@@ -384,8 +384,13 @@ impl Tiered for Muse {
     /// The tier's prompt-batch bytes of the file's widths
     /// ([`place::tier_batch`]), reserved on the tier card and the host; `None`
     /// on a placement with no tier card.
-    fn tier_batch(place: Place, inputs: &PlanInputs<Self::H>) -> Option<TierBatchBytes> {
-        (!place.tier_cards().is_empty()).then(|| place::tier_batch(&inputs.hp))
+    fn tier_batch(
+        place: Place,
+        inputs: &PlanInputs<Self::H>,
+    ) -> Result<Option<TierBatchBytes>, GateError> {
+        Ok((!place.tier_cards().is_empty())
+            .then(|| place::tier_batch(&inputs.hp))
+            .transpose()?)
     }
 
     /// The ring is kept out of the expert budget where the common rule starts

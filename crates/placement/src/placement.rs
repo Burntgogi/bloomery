@@ -2769,7 +2769,8 @@ fn resolve_shares(
         let uploads = card_uploads(model, c, rows, &own, routed)?;
         let dense = footprint(card.granule_bytes, &uploads, &zeros)?;
         let kv = kv_card.saturating_add(stage_rows);
-        let floor = plan_floor(card, dense, kv, reserve);
+        let reserves = card.selected_reserve_bytes(model, &zeros)?;
+        let floor = plan_floor(card, dense, kv, reserve, reserves);
         let cap = capped(card, None);
         let Some((floor, room)) = floor.and_then(|f| Some((f, cap.checked_sub(f)?))) else {
             return Err(refuse(format!(
@@ -2781,7 +2782,7 @@ fn resolve_shares(
                 kv,
                 card.context_bytes,
                 card.scratch_bytes,
-                card.reserve_bytes().unwrap_or(u64::MAX),
+                reserves,
                 card.margin_bytes,
             )));
         };

@@ -435,7 +435,7 @@ mod tests {
         let inputs = described("mm3-place-tier");
         let hp = &inputs.hp;
         assert_eq!(
-            tier_batch(&inputs, COLS),
+            tier_batch(&inputs, COLS).expect("tier bytes"),
             workstation::tier_leg_batch_bytes(
                 hp.n_embd as u64,
                 hp.experts.ff as u64,
@@ -443,7 +443,7 @@ mod tests {
                 TIER_CHUNK,
                 COLS,
                 DownForms::of(DownAct::Q8Act),
-            )
+            ).expect("tier bytes")
         );
         let tiered = workstation::plan_bp(
             LAYERS, None, tier_batch(&inputs, COLS).expect("tier bytes"),

@@ -19,6 +19,7 @@ use super::{roles, spec};
 use crate::arch::chat_of;
 use crate::arch::place_hybrid;
 use crate::placement::PlacementError;
+use crate::placement::kernels::{DownAct, DownForms};
 use crate::placement::workstation::{self, TierBatchBytes};
 
 // The ring rule's owner is `runtime::stores`; these names stay on this path for
@@ -101,6 +102,7 @@ pub fn prompt_shared_bytes(hp: &Hparams, cap: usize, card: bool) -> u64 {
             hp.expert_ff as u64,
             hp.n_used as u64,
             cap as u64,
+            DownForms::of(DownAct::Q8Act),
         ) as usize;
         leg + 2 * size_of::<f32>() * cap * n + size_of::<u32>() * cap * hp.n_used
     } else {
@@ -268,7 +270,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let hp = &inputs.hp;
         assert_eq!(
-            tier_batch(hp, COLS),
+            tier_batch(hp, COLS).expect("tier bytes"),
             workstation::tier_leg_batch_bytes(
                 hp.n_embd as u64,
                 hp.expert_ff as u64,
@@ -276,7 +278,7 @@ mod tests {
                 TIER_CHUNK,
                 COLS,
                 DownForms::of(DownAct::Q8Act),
-            )
+            ).expect("tier bytes")
         );
         let routed = runtime::layer::hosted(&inputs.spec.layers).map_or(0, |run| run.len());
         let tiered = workstation::plan_bp(hp.n_trunk, None, tier_batch(hp, COLS).expect("tier bytes"));
