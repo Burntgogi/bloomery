@@ -224,7 +224,7 @@ impl SlotRowOrder {
 
     /// Admit a nonempty pass and one parked sequence per range past slot 0,
     /// after checking tiling and the arena's order requirement.
-    pub fn admit(
+    pub(crate) fn admit(
         self,
         what: &'static str,
         rows: &[SlotRange],
@@ -246,7 +246,11 @@ impl SlotRowOrder {
 
 impl SlotRange {
     /// This slot's operand ids, with an invalid range refused by slot name.
-    pub fn ids<'i>(&self, what: &'static str, ids: &'i [u32]) -> Result<&'i [u32], GpuError> {
+    pub(crate) fn ids<'i>(
+        &self,
+        what: &'static str,
+        ids: &'i [u32],
+    ) -> Result<&'i [u32], GpuError> {
         ids.get(self.rows.clone()).ok_or_else(|| {
             GpuError::shape(
                 what,

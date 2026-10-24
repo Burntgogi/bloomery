@@ -205,6 +205,8 @@ C1's common owner is now `gpu::model::slots`: `SlotRowOrder` admits the ordered 
 count, while `SlotRange::ids` returns the original borrowed id slice with checked endpoints. Duplicate-slot
 and missing-parked refusals share that owner. `Any` preserves Body35's order; `RetainedPrefix` requires live
 slot 0 first only where its retained rows occupy the arena prefix. Body38 binds that policy explicitly.
+`admit` and `ids` stay crate-visible; only `tiled_rows` and `no_parked` cross the GPU crate boundary
+for the existing MiMo2 and GLM callers.
 Qwen3's pass and MiMo2 reuse the same tiling check while keeping their distinct arena/empty-pass checks;
 GLM reuses the missing-parked refusal. Program-specific binding walks remain in their callers.
 
@@ -213,14 +215,14 @@ A bounded re-inventory against implementation base `4197866`, using this note's 
 | Selected production declarations/methods | Code-bearing rows |
 |---|---:|
 | Eight retired private helpers in Body35/Body38 | 85 |
-| Common policy enum, four methods and shared duplicate-slot refusal | 65 |
+| Common policy enum, four methods and shared duplicate-slot refusal | 69 |
 
 This is not a net-deletion count: imports, bindings, impl scaffolding and other migrated loops are outside
 these selected units. The common-owner footprint exceeds the earlier forecast; the forecasted net savings
 are not claimed as measured removals. The family-wide census above remains frozen to its original snapshot.
 
-Host contract tests and a separately compiled consumer exercise admission, both order policies, borrowed
-ids and invalid endpoints without opening CUDA. This is not device eager/captured/slot evidence; the
+Host contract tests exercise crate-internal admission/id views, both order policies and invalid endpoints
+without opening CUDA. This is not device eager/captured/slot evidence; the
 complete canonical move proof and the owning gates below remain the landing contract.
 
 Proof focus: `gate-gpu-qwen35moe-e2e`, `gate-gpu-qwen4exp-e2e`, `gate-gpu-qwen4exp-mtp`; the complete current `just affected` list still applies.
