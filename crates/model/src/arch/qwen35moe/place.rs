@@ -1477,7 +1477,6 @@ pub const LEG_TIER_CHUNK: u64 = 8;
 /// card's staging, one chunk of the leg's scratch and the host's rows, for
 /// blocks of the host union's columns. [`tier_batch`] is the qwen4exp plan's
 /// figure.
-#[must_use]
 pub fn leg_tier_batch(hp: &Hparams) -> Result<TierBatchBytes, PlacementError> {
     workstation::tier_leg_batch_bytes(
         hp.n_embd as u64,
@@ -1487,6 +1486,7 @@ pub fn leg_tier_batch(hp: &Hparams) -> Result<TierBatchBytes, PlacementError> {
         crate::moe::UNION_MAX_COLS as u64,
         crate::placement::kernels::DownForms::of(crate::placement::kernels::DownAct::Q8Act)
             .with(crate::placement::kernels::DownAct::Q8Blocks32),
+        false,
     )
 }
 

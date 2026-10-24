@@ -69,6 +69,7 @@
 //! down GEMM.
 
 use crate::card_slots::{CardAcc, CardSlotKernels, CardSlots};
+use crate::expert_input::{Protection, Slots};
 use crate::fault::FaultSink;
 use crate::gemm::{
     Gemm32Args, Gemm32Kernels, Gemm32Weight, GemmAct, GemmAct32, GemmArgs, GemmInput, GemmKernels,
@@ -88,6 +89,7 @@ use crate::weights::{DevWeight, Weights};
 use crate::{DeviceTensor, Gpu, GpuError, Q8Act};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 use gguf::GgmlType;
+pub use model::ops::ExpertInput;
 use model::placement::accepts::{self, LegArms};
 use model::placement::kernels::{self, DownAct, DownEntry, DownForms, GateUpEntry, GemmEntry};
 use std::sync::Arc;
@@ -154,6 +156,7 @@ pub struct LegBufs {
     h: DeviceBuffer<f32>,
     act_h: ActForms,
     down: DeviceBuffer<f32>,
+    protection: Option<Protection>,
 }
 
 impl LegBufs {
@@ -202,7 +205,20 @@ impl LegBufs {
             h: DeviceBuffer::zeroed(stream, slots * shape.ff)?,
             act_h,
             down: DeviceBuffer::zeroed(stream, slots * shape.n)?,
+            protection: None,
         })
+    }
+
+    /// Select the loaded down-input policy before capture or execution.
+    pub fn set_expert_input(&mut self, gpu: &Gpu, policy: ExpertInput) -> Result<(), GpuError> {
+        match policy {
+            ExpertInput::Direct => self.protection = None,
+            ExpertInput::AmaxF16 if self.protection.is_none() => {
+                self.protection = Some(Protection::new(gpu, self.shape.slots())?);
+            }
+            ExpertInput::AmaxF16 => {}
+        }
+        Ok(())
     }
 
     /// The shape the buffers were made for.
@@ -215,7 +231,11 @@ impl LegBufs {
     /// their shape and forms.
     #[must_use]
     pub fn bytes(&self) -> usize {
-        self.act_x.device_bytes() + self.h.num_bytes() + self.act_h.bytes() + self.down.num_bytes()
+        self.act_x.device_bytes()
+            + self.h.num_bytes()
+            + self.act_h.bytes()
+            + self.down.num_bytes()
+            + self.protection.as_ref().map_or(0, Protection::bytes)
     }
 
     /// The down rows of the last run: `n` values a slot, slot-major, the
@@ -387,6 +407,29 @@ impl RouteBlock<'_> {
         (io, rule): (RouteIo<'_>, Act),
         fault: FaultSink,
     ) -> Result<(), GpuError> {
+        self.enqueue_input(
+            gpu,
+            (gemm, g32),
+            (route, top_k),
+            n_slots,
+            (io, rule),
+            None,
+            fault,
+        )
+    }
+
+    /// The routed block under its loaded expert-input policy.
+    #[allow(clippy::too_many_arguments, reason = "route execution contract")]
+    pub(crate) fn enqueue_input(
+        &self,
+        gpu: &Gpu,
+        (gemm, g32): (Option<&GemmKernels>, &Gemm32Kernels),
+        (route, top_k): (&GemmRoute, usize),
+        n_slots: usize,
+        (io, rule): (RouteIo<'_>, Act),
+        mut protection: Option<&mut Protection>,
+        fault: FaultSink,
+    ) -> Result<(), GpuError> {
         const WHAT_B: &str = "card_leg::RouteBlock";
         let stream = gpu.stream();
         let RouteIo {
@@ -461,12 +504,34 @@ impl RouteBlock<'_> {
                 ));
             }
         }
+        let (ids, counts) = route.expert_slots();
+        let selected = Slots {
+            ids,
+            counts,
+            routed: true,
+            n_card: 0,
+            len: n_slots,
+        };
+        if let Some(p) = protection.as_deref_mut() {
+            p.kernels.normalize(
+                gpu,
+                (g, u, &mut p.scales),
+                &selected,
+                self.ff,
+                Some(rule),
+                fault,
+            )?;
+        }
         let per_slot = GemmInput::PerSlot;
         match self.down {
             RouteW::Grouped(ty, w) => {
                 let act = h128.ok_or_else(|| lacks("q8_1 blocks of 128 (the down)"))?;
                 let gemm = grouped_k()?;
-                gemm.enqueue_swiglu_act_quant(stream, g, u, rule, n_slots, act, fault)?;
+                if protection.is_some() {
+                    gpu.enqueue_quantize_gemm(g, n_slots, act, fault)?;
+                } else {
+                    gemm.enqueue_swiglu_act_quant(stream, g, u, rule, n_slots, act, fault)?;
+                }
                 gemm.enqueue_gemm(
                     stream,
                     GemmArgs {
@@ -478,15 +543,21 @@ impl RouteBlock<'_> {
                         input: per_slot,
                         y,
                     },
-                )
+                )?;
             }
             RouteW::Blocks32(w) => {
                 let act = h32.ok_or_else(|| lacks("q8 blocks of 32 (the down)"))?;
-                match rule {
-                    Act::SiluMul => {
-                        g32.enqueue_swiglu_quant32(stream, g, u, n_slots, act, fault)?
+                if protection.is_some() {
+                    g32.enqueue_quantize_gemm32(stream, g, n_slots, act, fault)?;
+                } else {
+                    match rule {
+                        Act::SiluMul => {
+                            g32.enqueue_swiglu_quant32(stream, g, u, n_slots, act, fault)?
+                        }
+                        _ => {
+                            g32.enqueue_swiglu_act_quant32(stream, g, u, rule, n_slots, act, fault)?
+                        }
                     }
-                    _ => g32.enqueue_swiglu_act_quant32(stream, g, u, rule, n_slots, act, fault)?,
                 }
                 g32.enqueue_gemm32(
                     stream,
@@ -498,9 +569,14 @@ impl RouteBlock<'_> {
                         input: per_slot,
                         y,
                     },
-                )
+                )?;
             }
         }
+        if let Some(p) = protection {
+            p.kernels
+                .restore(gpu, y, &p.scales, &selected, self.hidden)?;
+        }
+        Ok(())
     }
 }
 
@@ -635,7 +711,6 @@ impl<'a> LegStacks<'a> {
             (GATE_UP, DOWN),
         )
     }
-
 
     /// [`LegStacks::of`] for a body that loads every tensor in the format
     /// [`gguf::card::CardFormat::of`] names (`Weights::load`), whose downs may
@@ -879,6 +954,7 @@ struct Scratch<'a> {
     act_x: &'a mut Q8Act,
     h: &'a mut DeviceBuffer<f32>,
     act_h: &'a mut ActForms,
+    protection: &'a mut Option<Protection>,
 }
 
 impl CardLeg {
@@ -924,6 +1000,7 @@ impl CardLeg {
             h,
             act_h,
             down,
+            protection,
         } = bufs;
         let shape = *shape;
         if sum.is_some() {
@@ -934,6 +1011,7 @@ impl CardLeg {
             act_x,
             h,
             act_h,
+            protection,
         };
         self.launch(gpu, scratch, run, down)?;
         let Some(sum) = sum else {
@@ -966,6 +1044,7 @@ impl CardLeg {
             act_x,
             h,
             act_h,
+            protection,
             ..
         } = bufs;
         let scratch = Scratch {
@@ -973,6 +1052,7 @@ impl CardLeg {
             act_x,
             h,
             act_h,
+            protection,
         };
         self.launch(gpu, scratch, run, down)
     }
@@ -1029,6 +1109,7 @@ impl CardLeg {
             act_x,
             h,
             act_h,
+            protection,
         } = scratch;
         if run.m == 0 || run.m > cap {
             return Err(GpuError::Shape {
@@ -1113,6 +1194,23 @@ impl CardLeg {
                 self.quant.enqueue_gate_up(stream, &iq, fault, h)?;
             }
             _ => return Err(st.gate.unrun()),
+        }
+        let selected = Slots {
+            ids: run.sel,
+            counts: run.sel,
+            routed: false,
+            n_card: run.n_card,
+            len: slots,
+        };
+        if let Some(p) = protection {
+            p.kernels.normalize(
+                gpu,
+                (h, run.normed, &mut p.scales),
+                &selected,
+                ff,
+                None,
+                fault,
+            )?;
         }
         let q = QuantSel {
             x: h,
@@ -1232,6 +1330,9 @@ impl CardLeg {
                     .enqueue_gemv_sel_cols(stream, st.down.ty, &d, 1, fault, down)?;
             }
             _ => return Err(st.down.unrun()),
+        }
+        if let Some(p) = protection {
+            p.kernels.restore(gpu, down, &p.scales, &selected, n)?;
         }
         Ok(())
     }

@@ -54,6 +54,7 @@ pub fn tier_batch(inputs: &PlanInputs) -> Result<TierBatchBytes, PlacementError>
         TIER_CHUNK,
         crate::moe::UNION_MAX_COLS as u64,
         leg_down_forms(Program::Solar2Body, &inputs.model),
+        false,
     )
 }
 
@@ -137,6 +138,7 @@ pub fn prompt_reserve_bytes(
         n_used: experts.n_used as u64,
         chunk: r as u64,
         downs,
+        input_scales: false,
     }
     .bytes(downs)?;
     ((4 * f32s + acts + wide + 2 * route_bytes(r)) as u64)

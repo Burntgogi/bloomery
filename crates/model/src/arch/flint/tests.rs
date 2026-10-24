@@ -3,7 +3,7 @@ use crate::arch::synthetic::{V, header_shaped};
 use crate::placement::PlacementError;
 use models::{Ffn, Mixer, Need, RopeMode};
 
-fn keys() -> Vec<(&'static str, V)> {
+pub(super) fn keys() -> Vec<(&'static str, V)> {
     vec![
         ("block_count", V::U32(4)),
         ("embedding_length", V::U32(16)),
@@ -36,7 +36,7 @@ fn keys() -> Vec<(&'static str, V)> {
     ]
 }
 
-fn tensors() -> Vec<(String, Vec<u64>)> {
+pub(super) fn tensors() -> Vec<(String, Vec<u64>)> {
     let mut out = vec![
         ("token_embd.weight".into(), vec![16, 2]),
         ("output.weight".into(), vec![16, 2]),
@@ -76,7 +76,7 @@ fn tensors() -> Vec<(String, Vec<u64>)> {
     out
 }
 
-fn check(
+pub(super) fn check(
     tag: &str,
     keys: &[(&str, V)],
     tensors: &[(String, Vec<u64>)],
@@ -161,12 +161,6 @@ fn masks_are_independent_and_nope_still_requires_head_norm() {
             .filter(|(n, _)| matches!(n, Need::Gqa { sinks: true, .. }))
             .count(),
         4
-    );
-    assert!(crate::arch::coverage::program_of(r.spec.arch).is_none());
-    assert!(
-        crate::arch::coverage::check(&r.spec, &r.tensors)
-            .iter()
-            .any(|item| item.feature == Need::Program("flint").to_string())
     );
 }
 

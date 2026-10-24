@@ -74,6 +74,8 @@ pub trait RouterEntry: Sized {
     const N_USED: usize;
     /// Whether an absent selection bias is a native binding, not a zero buffer.
     const OPTIONAL_BIAS: bool = false;
+    /// The selected-score normalization implemented by this compiled binding.
+    const NORM: model::arch::models::RouterNorm = model::arch::models::RouterNorm::SelectedSum;
     /// Where one token's launch leaves its results.
     type Out;
 

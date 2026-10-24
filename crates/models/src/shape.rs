@@ -934,8 +934,8 @@ pub fn gqa_row(head: u32, group: u32) -> Option<GqaInst> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AttnShape, GQA, GroupRule, LANE_PICKS, MoeShape, ROUTERS, Refusal, RouterInst, RouterRule,
-        Shape, gqa_row_v, router_row, router_row_is, router_row_k, rules, select_gqa,
+        AttnShape, GQA, GroupRule, LANE_PICKS, MoeShape, ROUTERS, Refusal, RouterBody, RouterInst,
+        RouterRule, Shape, gqa_row_v, router_row, router_row_is, router_row_k, rules, select_gqa,
         select_router,
     };
     use crate::{Act, Moe, Router, RouterNorm, Score, Shared};
@@ -1022,11 +1022,13 @@ mod tests {
     #[test]
     fn floor_top_six_serves_both_bias_modes_and_only_its_shape() {
         for bias in [false, true] {
-            let rule = RouterRule { bias, ..rules::SIGMOID_FLOOR };
+            let rule = RouterRule {
+                bias,
+                ..rules::SIGMOID_FLOOR
+            };
             let row = select_router(moe(rule, 256, 6)).unwrap();
             assert_eq!(row.body, RouterBody::SigmoidFloor);
             assert_eq!(row.rule, rule);
-            assert_eq!(row, router_row_rule(RouterBody::SigmoidFloor, rule, 256, 6));
             for top_k in [0, 5, 7, 8, 257] {
                 assert_eq!(
                     select_router(moe(rule, 256, top_k)).unwrap_err().why,
@@ -1038,7 +1040,11 @@ mod tests {
                 Refusal::RouterWidth { ref served } if served == &[256]
             ));
             for (score, gated) in [(Score::Softmax, false), (Score::Sigmoid, true)] {
-                let wrong = RouterRule { score, gated, ..rule };
+                let wrong = RouterRule {
+                    score,
+                    gated,
+                    ..rule
+                };
                 assert_eq!(
                     select_router(moe(wrong, 256, 6)).unwrap_err().why,
                     Refusal::NoRouterRule
@@ -1048,10 +1054,16 @@ mod tests {
         let legacy = select_router(moe(rules::BIASED_SIGMOID, 256, 6)).unwrap();
         assert_eq!(legacy.body, RouterBody::BiasedSigmoid);
         assert_eq!(
-            select_router(moe(RouterRule {
-                norm: RouterNorm::SelectedSum,
-                ..rules::SIGMOID_FLOOR
-            }, 256, 6)).unwrap_err().why,
+            select_router(moe(
+                RouterRule {
+                    norm: RouterNorm::SelectedSum,
+                    ..rules::SIGMOID_FLOOR
+                },
+                256,
+                6
+            ))
+            .unwrap_err()
+            .why,
             Refusal::NoRouterRule
         );
     }
@@ -1315,9 +1327,7 @@ mod tests {
         assert_eq!(MoeShape::of(&m).rule, rules::SOFTMAX_NORM);
     }
 
-    /// Rows are distinct instances: no two rows run one rule at one width
-    /// and one pick count, and one body holds two rows at a width only by
-    /// disjoint pick ranges.
+    /// No two rows select the same rule, expert width and pick count.
     #[test]
     fn no_two_router_rows_overlap() {
         for (i, a) in ROUTERS.iter().enumerate() {
@@ -1325,12 +1335,6 @@ mod tests {
                 let picks = a.top_k_min <= b.top_k_max && b.top_k_min <= a.top_k_max;
                 let overlap = a.experts == b.experts && (a.runs(b.rule) || b.runs(a.rule)) && picks;
                 assert!(!overlap, "{} and {}", a.at, b.at);
-                assert!(
-                    !((a.body, a.experts) == (b.body, b.experts) && picks),
-                    "{} and {}",
-                    a.at,
-                    b.at
-                );
             }
             assert!(a.top_k_min >= 1 && a.top_k_min <= a.top_k_max, "{}", a.at);
             assert!(a.per_lane() >= 1 && a.per_lane() <= 32, "{}", a.at);

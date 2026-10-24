@@ -134,7 +134,6 @@ pub const TIER_CHUNK: u64 = 16;
 /// (an NVFP4 down's 32-value blocks, a K- or i-quant down's 128-value form) and the host's rows
 /// and places. The plan reserves them on the tier card and the host, and the load checks its
 /// allocations against them.
-#[must_use]
 pub fn tier_batch(inputs: &PlanInputs, cols: u64) -> Result<TierBatchBytes, PlacementError> {
     let hp = &inputs.hp;
     workstation::tier_leg_batch_bytes(
@@ -144,6 +143,7 @@ pub fn tier_batch(inputs: &PlanInputs, cols: u64) -> Result<TierBatchBytes, Plac
         TIER_CHUNK,
         cols,
         leg_downs(inputs),
+        false,
     )
 }
 
@@ -245,6 +245,7 @@ mod tests {
     use super::{PROMPT_ROWS, PlaceError, PlanInputs, TIER_CHUNK, stream_bytes, tier_batch};
     use crate::arch::place_hybrid::ring_pass_bytes;
     use crate::arch::synthetic::{V, header_shaped};
+    use crate::placement::kernels::{DownAct, DownForms};
     use crate::placement::{PlacementError, PlanLevers, workstation};
 
     /// The small header's global keys: the pre-tokenizer and a template the description reads.
@@ -443,11 +444,12 @@ mod tests {
                 TIER_CHUNK,
                 COLS,
                 DownForms::of(DownAct::Q8Act),
-            ).expect("tier bytes")
+                false,
+            )
+            .expect("tier bytes")
         );
-        let tiered = workstation::plan_bp(
-            LAYERS, None, tier_batch(&inputs, COLS).expect("tier bytes"),
-        );
+        let tiered =
+            workstation::plan_bp(LAYERS, None, tier_batch(&inputs, COLS).expect("tier bytes"));
         let plain = workstation::plan_gate(LAYERS);
         let places = 3 * 4 * 256 * 2;
         assert_eq!(inputs.tier_reserve, Some(places));

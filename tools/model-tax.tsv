@@ -81,7 +81,7 @@ crates/gpu-gates/src/bin/shared/dspark_hf.rs	qwen	1	baseline O 1: own path: an a
 crates/gpu-gates/src/bin/shared/emb2_image.rs	gemma	1	baseline O 1: own path: an alias row in tools/model-tokens.tsv or a move into the family directory
 crates/gpu-gates/src/bin/shared/route_trace38.rs	qwen	3	baseline O 3: own path: an alias row in tools/model-tokens.tsv or a move into the family directory
 crates/gpu-gates/src/bin/shared/routed_legs.rs	deepseek	8	baseline P 9: MK2 program by body
-crates/gpu-gates/src/bin/shared/routed_legs.rs	flint	2	PIN(2026-10-23) flint: family_of and skip_of match every models::Arch exhaustively; the header-only reader has no program or routed-legs adapter
+crates/gpu-gates/src/bin/shared/routed_legs.rs	flint	2	PIN(2026-10-25) flint: family_of and skip_of match every models::Arch exhaustively; no common routed-legs adapter is registered, and the full-file body transitions have their own owning gate
 crates/gpu-gates/src/bin/shared/routed_legs.rs	gemma	4	baseline P 5: MK2 program by body
 crates/gpu-gates/src/bin/shared/routed_legs.rs	glm	7	baseline P 8: MK2 program by body
 crates/gpu-gates/src/bin/shared/routed_legs.rs	mimo	4	baseline P 5: MK2 program by body
@@ -130,7 +130,7 @@ crates/gpu-vision/src/encoder.rs	deepseek	2	baseline D 2: media design: VideoRul
 crates/gpu/src/arch/hybrid.rs	nemotron	1	baseline O 1: own path: an alias row in tools/model-tokens.tsv or a move into the family directory
 crates/gpu/src/card_slots.rs	deepseek	24	PIN(2026-10-21) deepseek: baseline K 20 + 4, the four-slot entry `ds41_ffn_card_acc_4` (MiniMax-M3 routes 4 a token): one more copy of the per-count entry, since a `#[kernel]` entry cannot be generic over the slot count; the deferred rename of the entries by what they compute absorbs it
 crates/gpu/src/dspark/head.rs	deepseek	3	baseline K 3: rename the kernel entries by what they compute (deferred)
-crates/gpu/src/host/handoff.rs	deepseek	38	PIN(2026-10-24) deepseek: baseline K 31 + 4 + 3, the four-slot tier entry `ds41_ffn_handoff_4_tier` (MiniMax-M3.1's bp) beside the four-slot entry `ds41_ffn_handoff_4` (MiniMax-M3 routes 4 a token): one more copy of the per-count entry, since a `#[kernel]` entry cannot be generic over the slot count; the deferred rename of the entries by what they compute absorbs it
+crates/gpu/src/host/handoff.rs	deepseek	39	PIN(2026-10-25) deepseek: fixed-slot tier preparation and launch select the existing generated ABI names beside the new six-slot entry; the per-entry module methods retain their pinned names until the deferred common-entry rename
 crates/hf/src/vocab.rs	qwen	4	PIN(2026-10-20) qwen: the qwen35 tokenizer pipeline name and regex; tokenizer programs are not yet described by ModelSpec
 crates/metal/src/bin/bloomery_serve_metal.rs	qwen	3	PIN(2026-10-23) qwen: Metal arch dispatch by program: the Metal bins open the one Metal architecture's session by name until crates/metal/src/arch picks a session by the file's architecture string
 crates/metal/src/bin/generate_metal.rs	qwen	4	PIN(2026-10-23) qwen: Metal arch dispatch by program: the Metal bins open the one Metal architecture's session by name until crates/metal/src/arch picks a session by the file's architecture string
@@ -163,7 +163,7 @@ crates/models/src/lib.rs	mimo	2	baseline A 2: MK1a/MK1b ArchRow registry
 crates/models/src/lib.rs	nemotron	4	baseline A 4: MK1a/MK1b ArchRow registry
 crates/models/src/lib.rs	qwen	9	baseline A 9: MK1a/MK1b ArchRow registry
 crates/placement/src/accepts.rs	deepseek	10	PIN(2026-10-21) deepseek: MK2 program by body; +1 is the family's word in the common Program::name owner, which the model's own code does not carry yet
-crates/placement/src/accepts.rs	flint	1	PIN(2026-10-23) flint: program_of matches every models::Arch; the header-only reader must explicitly return no program until a body is registered
+crates/placement/src/accepts.rs	flint	5	PIN(2026-10-25) flint: the implemented body registers its Program variant, name, architecture selection, expert arms and routed rule in the existing exhaustive program owners
 crates/placement/src/accepts.rs	gemma	5	PIN(2026-10-21) gemma: MK2 program by body; +1 is the family's word in the common Program::name owner, which the model's own code does not carry yet
 crates/placement/src/accepts.rs	glm	5	PIN(2026-10-21) glm: MK2 program by body; +1 is the family's word in the common Program::name owner, which the model's own code does not carry yet
 crates/placement/src/accepts.rs	mimo	5	PIN(2026-10-21) mimo: MK2 program by body; +1 is the family's word in the common Program::name owner, which the model's own code does not carry yet
@@ -216,3 +216,5 @@ crates/gpu-gates/src/record.rs	muse	4	PIN(2026-10-23) muse: MK12 per-bin Kind st
 crates/model/src/arch/coverage.rs	muse	25	PIN(2026-10-23) muse: the coverage rows, the type pins and the expert-stack match are keyed by Program, so each row the musespark body runs lists its variant; the program would own its rows instead of the list naming programs
 crates/hf/src/vocab.rs	minimax	3	PIN(2026-10-23) minimax: the minimax-m2 pre-tokenizer's name, regex and pipeline row; tokenizer programs are not yet described by ModelSpec
 crates/gpu-gates/src/prompts.rs	deepseek	1	PIN(2026-10-23) deepseek: the measured logit σ is named for the one family it was measured on (SIGMA_LOGIT_V41); other families carry it in their gate description until their own is measured
+crates/gpu-gates/src/bin/bloomery_serve.rs	flint	10	PIN(2026-10-25) flint: MK9 seat by program: the seat word, help/models list, architecture match and dispatch register the implemented shared hybrid seat until the description selects it
+crates/model/src/arch/coverage.rs	flint	11	PIN(2026-10-25) flint: the implemented Program selects its actual head128 attention, floor router, dense/shared sites, embedding/head and expert-stack capabilities in the existing coverage owners

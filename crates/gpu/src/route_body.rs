@@ -68,9 +68,11 @@ pub unsafe fn publish_n<const E: usize>(
     while e < E {
         // SAFETY: at + e < at + E, inside probs by this fn's contract.
         let p = unsafe { core::ptr::read_volatile(probs.add(at + e)) };
-        // SAFETY: any supplied bias holds E entries by this fn's contract.
         let v = match bias {
-            Some(bias) => p + unsafe { *bias.get_unchecked(e) },
+            Some(bias) => {
+                // SAFETY: e < E and any supplied bias holds E entries.
+                p + unsafe { *bias.get_unchecked(e) }
+            }
             None => p,
         };
         if !v.is_finite() {
@@ -107,7 +109,12 @@ pub unsafe fn publish_n<const E: usize>(
     reason = "the selecting block's shared arrays, its lane and scale, the fault and the outputs"
 )]
 #[inline(always)]
-pub unsafe fn select_n<const E: usize, const U: usize, const REFUSE_NAN: bool, const FLOOR: bool>(
+pub unsafe fn select_n<
+    const E: usize,
+    const U: usize,
+    const REFUSE_NAN: bool,
+    const FLOOR: bool,
+>(
     score: *const f32,
     sel_v: *const f32,
     slot_p: *mut f32,
@@ -238,7 +245,13 @@ pub unsafe fn select_n<const E: usize, const U: usize, const REFUSE_NAN: bool, c
     reason = "a kernel entry's arguments and the shared arrays it declares (rust-quality R8)"
 )]
 #[inline(always)]
-pub unsafe fn router_body<S: Score, const E: usize, const U: usize, const REFUSE_NAN: bool, const FLOOR: bool>(
+pub unsafe fn router_body<
+    S: Score,
+    const E: usize,
+    const U: usize,
+    const REFUSE_NAN: bool,
+    const FLOOR: bool,
+>(
     w: &[f32],
     x: &[f32],
     bias: Option<&[f32]>,
@@ -304,7 +317,9 @@ pub unsafe fn router_body<S: Score, const E: usize, const U: usize, const REFUSE
         // SAFETY: the barrier above published score and sel_v; ids and
         // weights hold U entries from 0 by this fn's contract.
         unsafe {
-            select_n::<E, U, REFUSE_NAN, FLOOR>(score, sel_v, slot_p, lane, scale, fault, ids, weights, 0)
+            select_n::<E, U, REFUSE_NAN, FLOOR>(
+                score, sel_v, slot_p, lane, scale, fault, ids, weights, 0,
+            )
         };
         if lane == 0 {
             // SAFETY: `ticket` is done[0], inside `done` by this fn's
@@ -331,7 +346,12 @@ pub unsafe fn router_body<S: Score, const E: usize, const U: usize, const REFUSE
     reason = "a kernel entry's arguments and the shared arrays it declares (rust-quality R8)"
 )]
 #[inline(always)]
-pub unsafe fn pick_body<const E: usize, const U: usize, const REFUSE_NAN: bool, const FLOOR: bool>(
+pub unsafe fn pick_body<
+    const E: usize,
+    const U: usize,
+    const REFUSE_NAN: bool,
+    const FLOOR: bool,
+>(
     probs: &[f32],
     bias: Option<&[f32]>,
     n_expert: u32,
@@ -982,11 +1002,23 @@ pub mod sigmoid_floor_256_6 {
     /// Both metadata bindings name the same optional-bias device entries.
     pub const ROW: RouterInst =
         shape::router_row_rule(RouterBody::SigmoidFloor, rules::SIGMOID_FLOOR, 256, 6);
-    pub const BIASED_ROW: RouterInst =
-        shape::router_row_rule(RouterBody::SigmoidFloor, rules::BIASED_SIGMOID_FLOOR, 256, 6);
-    const _: () = assert!(shape::router_row_is(ROW, rules::SIGMOID_FLOOR, false, (6, 6)));
+    pub const BIASED_ROW: RouterInst = shape::router_row_rule(
+        RouterBody::SigmoidFloor,
+        rules::BIASED_SIGMOID_FLOOR,
+        256,
+        6,
+    );
     const _: () = assert!(shape::router_row_is(
-        BIASED_ROW, rules::BIASED_SIGMOID_FLOOR, false, (6, 6)
+        ROW,
+        rules::SIGMOID_FLOOR,
+        false,
+        (6, 6)
+    ));
+    const _: () = assert!(shape::router_row_is(
+        BIASED_ROW,
+        rules::BIASED_SIGMOID_FLOOR,
+        false,
+        (6, 6)
     ));
     const _: () = assert!(N_EXPERT.is_multiple_of(ROWS_PER_BLOCK));
     const _: () = assert!(N_EXPERT.div_ceil(32) <= 32);
@@ -1045,9 +1077,18 @@ pub mod sigmoid_floor_256_6 {
             // Shared arrays belong to this block and have the body's sizes.
             unsafe {
                 router_body::<Sigmoid, N_EXPERT, N_USED, true, true>(
-                    w, x, if has_bias != 0 { Some(bias) } else { None },
-                    N_EXPERT as u32, k, scale,
-                    &mut logits, &mut probs, &mut ids, &mut weights, &mut done, fault,
+                    w,
+                    x,
+                    if has_bias != 0 { Some(bias) } else { None },
+                    N_EXPERT as u32,
+                    k,
+                    scale,
+                    &mut logits,
+                    &mut probs,
+                    &mut ids,
+                    &mut weights,
+                    &mut done,
+                    fault,
                     SharedArray::as_raw_mut_ptr(&raw mut LAST),
                     SharedArray::as_raw_mut_ptr(&raw mut SCORE),
                     SharedArray::as_raw_mut_ptr(&raw mut SEL_V),
@@ -1091,8 +1132,14 @@ pub mod sigmoid_floor_256_6 {
             // block; shared arrays belong to this block at the body's sizes.
             unsafe {
                 pick_body::<N_EXPERT, N_USED, true, true>(
-                    probs, if has_bias != 0 { Some(bias) } else { None },
-                    N_EXPERT as u32, t, scale, &mut ids, &mut weights, fault,
+                    probs,
+                    if has_bias != 0 { Some(bias) } else { None },
+                    N_EXPERT as u32,
+                    t,
+                    scale,
+                    &mut ids,
+                    &mut weights,
+                    fault,
                     SharedArray::as_raw_mut_ptr(&raw mut SCORE),
                     SharedArray::as_raw_mut_ptr(&raw mut SEL_V),
                     SharedArray::as_raw_mut_ptr(&raw mut SLOT_P),
@@ -1140,19 +1187,26 @@ pub mod sigmoid_floor_256_6 {
         if w.rows() != N_EXPERT || k == 0 || !k.is_multiple_of(32) {
             return Err(GpuError::shape(
                 what,
-                format!("router weight is {} x {k}, want 256 rows of a positive multiple of 32", w.rows()),
+                format!(
+                    "router weight is {} x {k}, want 256 rows of a positive multiple of 32",
+                    w.rows()
+                ),
             ));
         }
         Ok(k)
     }
 
     fn check_bias(what: &'static str, bias: Option<&DeviceBuffer<f32>>) -> Result<(), GpuError> {
-        if let Some(bias) = bias {
-            if bias.len() < N_EXPERT {
-                return Err(GpuError::shape(
-                    what, format!("selection bias has {} entries, want at least 256", bias.len()),
-                ));
-            }
+        if let Some(bias) = bias
+            && bias.len() < N_EXPERT
+        {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "selection bias has {} entries, want at least 256",
+                    bias.len()
+                ),
+            ));
         }
         Ok(())
     }
@@ -1188,18 +1242,43 @@ pub mod sigmoid_floor_256_6 {
             let k = weight_k(what, w)?;
             check_bias(what, bias)?;
             if x.len() < k {
-                return Err(GpuError::shape(what, format!("x.len() {} < k {k}", x.len())));
+                return Err(GpuError::shape(
+                    what,
+                    format!("x.len() {} < k {k}", x.len()),
+                ));
             }
             let k = launch_u32(what, "k", k)?;
-            let prep = self.module.prepare_sigmoid_floor_256_6_router(
-                LaunchConfig1D::new((N_EXPERT / ROWS_PER_BLOCK) as u32, ROUTER_THREADS_U32, 0),
-            )?;
-            let RouterOut { logits, probs, ids, weights, done } = out;
+            let prep = self
+                .module
+                .prepare_sigmoid_floor_256_6_router(LaunchConfig1D::new(
+                    (N_EXPERT / ROWS_PER_BLOCK) as u32,
+                    ROUTER_THREADS_U32,
+                    0,
+                ))?;
+            let RouterOut {
+                logits,
+                probs,
+                ids,
+                weights,
+                done,
+            } = out;
             // With no bias the weight slice is only an ABI borrow: the
             // kernel takes None and never loads it as a selection bias.
             self.module.sigmoid_floor_256_6_router(
-                stream, &prep, w.buf(), x, bias.unwrap_or(w.buf()), u32::from(bias.is_some()),
-                k, scale, logits, probs, ids, weights, done, fault,
+                stream,
+                &prep,
+                w.buf(),
+                x,
+                bias.unwrap_or(w.buf()),
+                u32::from(bias.is_some()),
+                k,
+                scale,
+                logits,
+                probs,
+                ids,
+                weights,
+                done,
+                fault,
             )?;
             Ok(())
         }
@@ -1231,25 +1310,53 @@ pub mod sigmoid_floor_256_6 {
             let k = weight_k(what, w)?;
             check_bias(what, bias)?;
             let tt = launch_u32(what, "t", t)?;
-            let input = k.checked_mul(t).ok_or_else(|| GpuError::shape(what, "input size overflow"))?;
-            let scores = N_EXPERT.checked_mul(t).ok_or_else(|| GpuError::shape(what, "score size overflow"))?;
-            let slots = N_USED.checked_mul(t).ok_or_else(|| GpuError::shape(what, "slot size overflow"))?;
-            if t == 0 || x.len() < input || probs.len() < scores || ids.len() < slots || weights.len() < slots {
+            let input = k
+                .checked_mul(t)
+                .ok_or_else(|| GpuError::shape(what, "input size overflow"))?;
+            let scores = N_EXPERT
+                .checked_mul(t)
+                .ok_or_else(|| GpuError::shape(what, "score size overflow"))?;
+            let slots = N_USED
+                .checked_mul(t)
+                .ok_or_else(|| GpuError::shape(what, "slot size overflow"))?;
+            if t == 0
+                || x.len() < input
+                || probs.len() < scores
+                || ids.len() < slots
+                || weights.len() < slots
+            {
                 return Err(GpuError::shape(
                     what,
-                    format!("{t} tokens of {k} (at least one): x {}, probs {}, ids {}, weights {}",
-                        x.len(), probs.len(), ids.len(), weights.len()),
+                    format!(
+                        "{t} tokens of {k} (at least one): x {}, probs {}, ids {}, weights {}",
+                        x.len(),
+                        probs.len(),
+                        ids.len(),
+                        weights.len()
+                    ),
                 ));
             }
             // The tile GEMM uses the one-token row walk and warp sum tree.
             wide.enqueue_f32_tile(stream, w, x, t, probs)?;
             gpu.elem().enqueue_sigmoid_rows(stream, probs, scores)?;
-            let prep = self.module.prepare_sigmoid_floor_256_6_router_pick(
-                LaunchConfig1D::new(tt, ROUTER_THREADS_U32, 0),
-            )?;
+            let prep = self
+                .module
+                .prepare_sigmoid_floor_256_6_router_pick(LaunchConfig1D::new(
+                    tt,
+                    ROUTER_THREADS_U32,
+                    0,
+                ))?;
             self.module.sigmoid_floor_256_6_router_pick(
-                stream, &prep, probs, bias.unwrap_or(w.buf()), u32::from(bias.is_some()),
-                tt, scale, ids, weights, fault,
+                stream,
+                &prep,
+                probs,
+                bias.unwrap_or(w.buf()),
+                u32::from(bias.is_some()),
+                tt,
+                scale,
+                ids,
+                weights,
+                fault,
             )?;
             Ok(())
         }
@@ -1259,6 +1366,8 @@ pub mod sigmoid_floor_256_6 {
         const N_EXPERT: usize = N_EXPERT;
         const N_USED: usize = N_USED;
         const OPTIONAL_BIAS: bool = true;
+        const NORM: model::arch::models::RouterNorm =
+            model::arch::models::RouterNorm::SelectedSumFloor;
         type Out = RouterOut;
 
         fn load(ctx: &Arc<CudaContext>) -> Result<Self, GpuError> {
@@ -1274,8 +1383,11 @@ pub mod sigmoid_floor_256_6 {
             &out.weights
         }
         fn out_bytes(out: &RouterOut) -> usize {
-            out.logits.num_bytes() + out.probs.num_bytes() + out.ids.num_bytes()
-                + out.weights.num_bytes() + out.done.num_bytes()
+            out.logits.num_bytes()
+                + out.probs.num_bytes()
+                + out.ids.num_bytes()
+                + out.weights.num_bytes()
+                + out.done.num_bytes()
         }
         fn route(
             &self,
@@ -1295,8 +1407,18 @@ pub mod sigmoid_floor_256_6 {
             rows: RoutedRows<'_>,
         ) -> Result<(), GpuError> {
             self.enqueue_router_rows(
-                stream, gpu, wide, r.w, x, r.bias, r.scale, t,
-                rows.probs, rows.ids, rows.weights, r.fault,
+                stream,
+                gpu,
+                wide,
+                r.w,
+                x,
+                r.bias,
+                r.scale,
+                t,
+                rows.probs,
+                rows.ids,
+                rows.weights,
+                r.fault,
             )
         }
     }

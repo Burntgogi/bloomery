@@ -228,6 +228,12 @@ pub trait Tiered: Seat + Sized + 'static {
     /// The file's plan inputs, its own `place::read`.
     fn read(split: &Split) -> Result<PlanInputs<Self::H>, PlacementError>;
 
+    /// Price the selected prompt schedule before any context probe or allocation.
+    /// A family whose schedule has fixed buffers keeps its header-derived inputs.
+    fn configure(_inputs: &mut PlanInputs<Self::H>, _group: usize) -> Result<(), GateError> {
+        Ok(())
+    }
+
     /// One of the seat's own flags (`SeatFlags::parse`'s `own`): `Ok(true)` took it.
     fn flags(flag: &str, value: &str, out: &mut Self::Flags) -> Result<bool, GateError>;
 
@@ -403,7 +409,7 @@ fn tier_experts<S: Tiered>(
     levers: &PlanLevers,
     ctx: Option<usize>,
 ) -> Result<u64, GateError> {
-    let machine = S::machine(offer, S::tier_batch(offer, inputs), inputs.model.layers)?;
+    let machine = S::machine(offer, S::tier_batch(offer, inputs)?, inputs.model.layers)?;
     let ctx = ctx.map_or(Ok(1), u64::try_from)?;
     let plan = inputs.plan(&machine, ctx, levers)?;
     Ok(plan.tier_n_l.iter().flatten().sum())
@@ -487,7 +493,8 @@ pub fn run<S: Tiered>(args: &[String], side: &side_seat::Flags) -> Result<ServeE
         a.template_file.path(),
         S::ALIAS,
     )?;
-    let inputs = S::read(&split)?;
+    let mut inputs = S::read(&split)?;
+    S::configure(&mut inputs, levers.prefill_group())?;
     let think = S::think(&inputs)?;
     let plan_levers = PlanLevers::from_levers(&levers)?;
     // The slot count and what named it (`from` on the `parallel` line); a seat of one sequence
