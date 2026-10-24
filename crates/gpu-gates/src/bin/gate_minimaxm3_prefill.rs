@@ -136,8 +136,9 @@ mod gate {
     const CTX_SPARE: usize = 8;
 
     /// Decode steps of the two-card arm's walk: each layer's tier holds the ids after the stage's prefix, so the walk's
-    /// routing must reach every tier layer (`two_card_first_tokens_are_union` fails by name where it does not).
-    const TWO_WALK: usize = 32;
+    /// routing must reach every tier layer (`two_card_first_tokens_are_union` fails by name where it does not). The real
+    /// file's tier holds few experts on some layers, so the walk is long enough to route a slot to each.
+    const TWO_WALK: usize = 96;
 
     /// The synthetic batch's widths: the model width, and the output projection's (the query heads of [`HEAD`] values).
     /// Both are whole blocks of the q8_1 form's 128 values and of the q8 form's 64-value step.
