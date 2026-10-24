@@ -1002,8 +1002,7 @@ mod tests {
             let x = DeviceBuffer::from_host(stream, &host_x).expect("the rows");
             let base: Vec<f32> = (0..CAP * N).map(|i| (i % 13) as f32 * 0.125).collect();
             let x1 = DeviceBuffer::from_host(stream, &base).expect("the base");
-            let route =
-                DeviceBuffer::from_host(stream, &vec![0.125f32; CAP * USED]).expect("weights");
+            let route = DeviceBuffer::from_host(stream, &[0.125f32; CAP * USED]).expect("weights");
             let host_sel: Vec<u32> = (0..CAP * USED)
                 .map(|i| {
                     if i % USED == USED - 1 {
