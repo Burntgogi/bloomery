@@ -28,11 +28,12 @@
 //!
 //! - **front**: the attention half, the FFN half's norm, the router, the
 //!   latent down and its weighted norm (the rows the host's experts read),
-//!   the download of those rows, the weights and the ids, and each slot's
-//!   place in the card's stacks (`ds41_ffn_places`);
-//! - **shadow**, under the host's union: the card's slots over those places
-//!   (a [`HOST`](crate::hybrid::HOST) slot's warps return first), none when
-//!   the layer holds no expert on the card;
+//!   and the download of those rows, the weights and the ids;
+//! - **shadow**, under the host's union: the call's pick of the layer, then
+//!   each slot's place in the card's stacks (`ds41_ffn_places`) over the
+//!   slot map the pick left, and the card's slots over those places (a
+//!   [`HOST`](crate::hybrid::HOST) slot's warps return first), none when the
+//!   layer holds no expert on the card;
 //! - **back**: the card slots' weighted sum (`ds41_ffn_card_acc_9`) plus the
 //!   host's sums, the latent up, the scale-then-norm and the α/β mix.
 //!
@@ -915,18 +916,40 @@ impl PassWalk<'_> {
     }
 
     /// Hosted layer `l`'s card route under the host's union ([`PlacedPass`]'s
-    /// shadow): the engine stream waits each landing batch of the layer's
-    /// pick (`land`, the residency machine's admits into the stage stacks),
-    /// then the stage slots ([`PassWalk::experts`] under [`Places::Cut`]) and,
-    /// when the layer streams, the ring's ([`PassWalk::experts_with`]). The
-    /// streamed experts the ring pass joined, if it ran.
+    /// shadow), after the layer's pick: each routed slot's place in the
+    /// card's stacks (`ds41_ffn_places`) over `side`'s slot map as the pick
+    /// left it (its admits at their slots, its victims
+    /// [`HOST`](crate::hybrid::HOST), as the host's serve reads them), the
+    /// engine stream's wait on each landing batch of the pick (`land`, the
+    /// residency machine's admits into the stage stacks), then the stage
+    /// slots ([`PassWalk::experts`] under [`Places::Cut`]) and, when the
+    /// layer streams, the ring's ([`PassWalk::experts_with`]). The streamed
+    /// experts the ring pass joined, if it ran.
     fn card_route(
         &mut self,
+        side: &PlacedSide,
         l: usize,
         land: &[LandBatch],
         ring: Option<RingPass<'_>>,
     ) -> Result<Option<usize>, GpuError> {
-        let stream = self.cx.gpu.stream();
+        let (gpu, sh, m) = (self.cx.gpu, self.cx.sh, self.cx.m);
+        let stream = gpu.stream();
+        let b = &mut *self.b;
+        side.acc_k.enqueue_places_cols(
+            stream,
+            &ColPlaces {
+                ids: &b.ids,
+                ids_pitch: sh.top_k,
+                used: sh.top_k,
+                sel_pitch: sh.top_k,
+                m,
+                map: side.slots.buf(),
+                row_off: l * side.stride,
+                n_expert: sh.n_expert,
+            },
+            gpu.layer_sink(l)?,
+            &mut b.sel,
+        )?;
         for event in land.iter().filter_map(|lb| lb.event.as_deref()) {
             stream.wait(event)?;
         }
@@ -1142,8 +1165,8 @@ impl PassWalk<'_> {
     /// Hosted layer `at.layer`'s front: the attention half, the FFN front,
     /// the download of the experts' rows, the weights and the ids to the
     /// host ([`BatchLeg::key`]'s exchange) — with each slot's tier place on a
-    /// layer the expert tier holds experts of — and each routed slot's place
-    /// in the card's stacks (module doc).
+    /// layer the expert tier holds experts of. The slots' places in the
+    /// card's stacks wait for the shadow's pick ([`PassWalk::card_route`]).
     fn hosted_front(
         &mut self,
         side: &mut PlacedSide,
@@ -1155,7 +1178,7 @@ impl PassWalk<'_> {
         self.ffn_pre(l)?;
         let (gpu, sh, m) = (self.cx.gpu, self.cx.sh, self.cx.m);
         let stream = gpu.stream();
-        let b = &mut *self.b;
+        let b = &*self.b;
         let key = leg.key(at);
         match side.tier.as_mut().filter(|t| t.k(l) > 0) {
             Some(t) => {
@@ -1173,7 +1196,7 @@ impl PassWalk<'_> {
                     sh.top_k,
                     &[t.pass_tsel()],
                     key,
-                )?;
+                )
             }
             None => leg.hybrid().enqueue_download_pitched(
                 stream,
@@ -1181,23 +1204,8 @@ impl PassWalk<'_> {
                 &b.ids,
                 sh.top_k,
                 key,
-            )?,
+            ),
         }
-        side.acc_k.enqueue_places_cols(
-            stream,
-            &ColPlaces {
-                ids: &b.ids,
-                ids_pitch: sh.top_k,
-                used: sh.top_k,
-                sel_pitch: sh.top_k,
-                m,
-                map: side.slots.buf(),
-                row_off: l * side.stride,
-                n_expert: sh.n_expert,
-            },
-            gpu.layer_sink(l)?,
-            &mut b.sel,
-        )
     }
 
     /// Hosted layer `at.layer`'s back: the card slots' weighted sum, the
@@ -1441,7 +1449,7 @@ impl<'a> LayerProgram for PlacedPass<'a, '_> {
                 Some(r) => Some(xs.ring_pass(r, &side.acc_k)?),
                 None => None,
             };
-            if let Some(n) = walk.card_route(l, &land, ring)? {
+            if let Some(n) = walk.card_route(side, l, &land, ring)? {
                 xs.joined(l, n);
                 *streamed = Some(n_card + n);
             }
