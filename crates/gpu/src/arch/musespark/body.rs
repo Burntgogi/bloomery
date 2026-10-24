@@ -94,6 +94,10 @@ const WORD_POS: usize = 0;
 const WORD_TOKEN: usize = 1;
 const ROW_WORDS: usize = 2;
 
+/// The rows in flight a load's residency tally holds: the step's one (the file
+/// has no draft to verify rows of; a prompt call keeps no rows).
+const LOAD_ROWS: usize = 1;
+
 /// The site types the projections read: Q6_K q and o through the q8_1 kgemv,
 /// Q8_0 k, v, gate and the latent pair through the f32 gemv.
 const SITE_TYPES: &[SiteTy] = &[SiteTy::Q6K, SiteTy::Q8_0];
@@ -606,7 +610,7 @@ impl GpuModel<Body> {
             delay: LIVE_DELAY,
             deadline: DEADLINE,
             top_k: n_used,
-            max_rows: placed_rows(n_used),
+            max_rows: LOAD_ROWS,
             stacks: Arc::new(stream::stacks(plan, plan.model.layers)?),
         };
         GpuModel::load_placed_with(
