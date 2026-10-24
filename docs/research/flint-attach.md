@@ -2,8 +2,9 @@
 
 Design snapshot: **`e53cabebbb9b16249c81b7c26a026da1670f7d9d`**, requested by
 [#632](https://github.com/midagedev/bloomery/issues/632). The source-gap observations below describe
-that snapshot. The current tree additionally has a **header-only reader**; it still has no Flint
-body, app session or serve seat. No GPU, inference, performance or weight-content validation is claimed.
+that snapshot. The current tree additionally has a **header-only reader** and a real common
+256/top6 floor-router binding; it still has no Flint body, app session or serve seat.
+No GPU, inference, performance or weight-content validation is claimed.
 
 ## Host reader status
 
@@ -15,10 +16,10 @@ GemmaEmbedding2's sliding mask: missing keys, scalars, wrong lengths and non-boo
 Present `expert_weights_scale` uses `arch::finite_positive`; only an absent key defaults to 1,
 with that default recorded.
 The common needs walk emits q/k normalization even on NoPE layers. `program_of(Flint)` remains
-`None`; missing program, head128 sinks/SWA, NoPE normalization and 256/top6 bindings remain coverage
-refusals. `Router.norm` and `RouterRule.norm` distinguish no normalization, the existing selected-sum
-rule and Flint's selected-sum floor; the floor description does not supply a device implementation
-or activated-value scaling.
+`None`; missing program, head128 sinks/SWA and NoPE normalization remain coverage refusals.
+`Router.norm` and `RouterRule.norm` distinguish no normalization, the existing selected-sum
+rule and Flint's selected-sum floor. The real floor-router binding is selectable in both bias
+modes; selecting that operation does not supply a whole program or activated-value scaling.
 
 Fault formatting uses `bloomery_device::fault`'s shared layout/decoder and the
 `gpu::arch::step_order` registry. Flint's registry row uses neutral code order;
@@ -50,19 +51,41 @@ No full weights or GPU were needed for that check.
 
 The maintainer [assigned the model port and offered card runs](https://github.com/midagedev/bloomery/issues/632#issuecomment-6352066886),
 and named a forthcoming head128 sink/SWA attention, QK RMS and sigmoid256/top6 train.
-Those complete contracts are not in this main snapshot or the inspected public heads of #726 (`1723485602c1`)
-and #747 (`f883e84f8d2c`). Existing ring and sink-merge ingredients do not establish the combined attention
-operation; `route_body` still lacks 256/top6 and its normalization-floor policy.
-Obtain the train's fetchable ref before duplicating those primitives.
+Those complete attention contracts are not in this main snapshot or the inspected public heads of
+#726 (`1723485602c1`) and #747 (`f883e84f8d2c`). Existing ring and sink-merge ingredients do not
+establish the combined attention operation. Obtain the train's fetchable ref before duplicating
+those primitives.
 
-The router description/selection contract now distinguishes `RouterNorm::None`, `SelectedSum` and
-`SelectedSumFloor`. Flint requests `max(sum_selected, 2^-14)`; existing model descriptions and arithmetic
-keep their rules. Compiled rows, including boolean `norm_arg` bindings, refuse the floor policy rather
-than borrow an epsilon-added implementation. The absent-bias, 256/top6 and `Need::Program` refusals stay
-until real device bindings are supplied. Reconcile the policy interface with the pending train before device work.
-Then close shared IQ4_XS, selected card/tier down forms and six-slot F32 handoff in their existing common owners,
+The common `route_body::sigmoid_floor_256_6` binding now supplies Flint's fixed
+`max(sum_selected, 2^-14)` rule. `RouterKernels::enqueue_router` and `enqueue_router_rows`
+take `Option<&DeviceBuffer<f32>>` for a real optional selection-only bias. The common
+`RouterEntry`/`RouteIn` consuming paths carry that option; `RouteBlock` allocates no zero-bias
+buffer for this binding. Absent bias borrows the existing router-weight slice only as an unused
+device ABI argument; no bias data is fabricated, copied or read. The floor policy is a compile-time
+specialization of the same score, publication and top-k bodies, not a per-step normalization flag.
+
+Both metadata bindings are `RouterBody::SigmoidFloor` at exactly 256/top6: sigmoid, no shared
+sigmoid gate, `SelectedSumFloor`, with or without selection bias. Bias changes only the ranking.
+The six selected unbiased scores are summed in f64 slot order, narrowed to f32, divided by the
+floored sum and then scaled. Equal selection keys choose larger expert ids. Nonfinite logits,
+selection keys or resulting weights raise `FaultSite::Router`; an invalid selection key poisons
+all six weights. Existing epsilon-added entries, launch ABIs and legacy norm-argument rules remain
+unchanged. A legacy `RouterEntry` given no required bias returns a named state error.
+
+`gate-flint-router` now consumes the actual floor binding through `RouterEntry` for planted and
+dense rows, both bias modes, active tiny-sum floors, zero sums, ties, nonfinite logits/bias/scale,
+one-token/batch bit equivalence and eager/captured replay. Its independent host weight expression
+uses the declared floor and rejects an epsilon-added or biased-weight implementation.
+**needs-gpu:** this implementation has no local NVIDIA numerical, capture, fault, allocation or
+JIT-resource evidence. The two new entries (`sigmoid_floor_256_6_router` and
+`sigmoid_floor_256_6_router_pick`) have no invented resource pins; the add-class PTX comparison,
+spill/JIT pinning and hardware gate remain required.
+
+The `Need::Program` refusal stays: a callable router is not a Flint body or session. Close shared
+IQ4_XS, selected card/tier down forms and six-slot F32 handoff in their existing common owners,
 followed by paging/resident slots, reference provenance and the body/app/seat.
-Each device slice needs its numerical/fault gates and the maintainer's offered hardware proof before admission.
+Each device slice needs its numerical/fault gates and the maintainer's offered hardware proof before
+whole-program admission.
 Legacy metadata booleans share `RouterNorm::from_legacy_bool`: false keeps scores and true uses the
 existing epsilon-added selected sum. Flint's distinct floor mapping stays in its reader.
 
@@ -230,13 +253,12 @@ source of the gathered weights. The shared SwiGLU output is added without a shar
 
 Three numerical obligations must stay explicit:
 
-1. Current [common router normalization][route-core] uses `sum + 1e-20`, not the reference's floor.
+1. Legacy [common router normalization][route-core] uses `sum + 1e-20`, not the reference's floor.
    This is a semantic difference for tiny scores, not a width-instance problem or a measured GPU
-   failure. The existing `Router`/`RouterRule` contract now carries the explicit policy, and the
-   reader requests `SelectedSumFloor` for Flint. Selection refuses that policy on every current
-   router row; `norm_arg` serves only the two legacy policies. The device floor binding is still
-   missing. Add it in the common operation without changing the global divisor, existing model
-   arithmetic, or hiding the difference in a Flint-only wrapper.
+   failure. `Router`/`RouterRule` carries the explicit policy; the reader requests
+   `SelectedSumFloor` and the common `sigmoid_floor_256_6` binding implements it. Legacy instances
+   keep their exact arithmetic and `norm_arg` serves only the two legacy policies. The floor
+   gate checks active tiny sums independently; GPU numerical and resource evidence is still needed.
 2. Mainline [rescales Flint's activated expert input before down projection][ref-down] with
    `build_amax_src1_f16`, then restores its scale before router weighting. This protects F16/Q8
    headroom around a maximum magnitude of 1024; it is not an architectural activation clamp.
@@ -272,7 +294,7 @@ Do not claim runtime support by adding the name to an enum or relaxing a shape/t
 |---|---|---|
 | G1 | NoPE normalization-need generation is present; the executable head128 norm-only binding is missing | Preserve the emitted normalization **or** rotation need; bind head128 normalization with `mode=None` truthfully. No identity-RoPE table. |
 | G2 | Existing head128/group8 attention lacks the complete sink/SWA contract; MiMo's window pass is K192/V128 | Complete the described head128 operation in `rope_neox` / `flash_gqa`, including genuine NoPE append, sink merge, window/ring positions, prompt and slot paths. Never pad heads to 192 or copy MiMo's body. |
-| G3 | The host description/selection policy is explicit; sigmoid256/top6 and its device floor binding are absent, and higher-level `shared_routed` admission requires bias | Add the real instance/floor operation; bind absent bias through `RouteLayer.bias=None`, which the lower `RouteBlock` already supports. Price/load the BF16 router through its supported F32 widening. |
+| G3 | Real common sigmoid256/top6 floor operation and both optional-bias metadata bindings are implemented; whole-program binding remains separate | Attach `sigmoid_floor_256_6` through `RouterEntry`, with `RouteLayer.bias=None` retaining genuine absence and no zero buffer. Price/load the BF16 router through its supported F32 widening. Run `gate-flint-router` and obtain genuine new-entry JIT pins on NVIDIA hardware. |
 | G4 | Layer42 shared IQ4_XS has routed/GEMM operations but no ordinary dense site, and `BlockPlan` rejects it | Extend the **common** dense/gated block's real layout, load, launch, scratch and prompt binding. Keep the role `SharedExpert`; do not relabel it as routed or silently requantize it. |
 | G5 | The common card wrapper uses Q8Act-only buffers and `LegStacks::of`; Q6_K/Q8_0 down do not both pass that path | Carry selected arms and actual down forms through `CardExperts`, `LegBufs::for_downs`, loader, planner, residency and tier. Existing Q6_K/Q8_0 arithmetic is not the missing piece. |
 | G6 | Common tier accumulation supports six slots, but F32 `enqueue_handoff_tier` accepts eight | Add the six-slot F32 handoff instance in the existing owner; preserve the eight-slot entry. A DeepSeek Q8_1 handoff is not an interchangeable input contract. |
