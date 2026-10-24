@@ -69,6 +69,7 @@ generate_ds41   ds41_ffn_handoff_10_cols                 0           0
 generate_ds41   ds41_ffn_handoff_10_cols_tier            0           0
 generate_ds41   ds41_ffn_handoff_4                       0           0
 generate_ds41   ds41_ffn_handoff_8                       0           0
+generate_ds41   ds41_ffn_handoff_4_tier                  0           0
 generate_ds41   ds41_ffn_handoff_8_tier                  0           0
 generate_ds41   ds41_ffn_handoff_9                       0           0
 generate_ds41   ds41_ffn_handoff_tier                    0           0
