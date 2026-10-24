@@ -52,7 +52,7 @@
 //! target's next readback names.
 
 use bloomery_gpu::draft::{
-    DraftFeed, DraftHead, Feed, Hidden, WalkBounds, WalkMode, refuse_own, refuse_rows,
+    DraftFeed, DraftHead, Feed, Held, Hidden, WalkBounds, WalkMode, refuse_own, refuse_rows,
 };
 use bloomery_gpu::head::{Head, HeadNorm};
 use bloomery_gpu::host::BatchLeg;
@@ -559,52 +559,6 @@ fn shape(detail: String) -> GpuError {
     GpuError::Shape { what: WHAT, detail }
 }
 
-/// The positions a target arena's rows hold, row `i` position `first + i`:
-/// what the call that last wrote the arena left there, less the positions a
-/// cut took back since. No rows: the arena holds no position.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct Held {
-    first: u32,
-    rows: u32,
-}
-
-impl Held {
-    /// No position.
-    pub(crate) const NONE: Held = Held { first: 0, rows: 0 };
-
-    /// Rows `0 .. rows` at positions `first ..`.
-    pub(crate) fn at(first: u32, rows: u32) -> Held {
-        Held { first, rows }
-    }
-
-    /// The positions from `pos` on taken back.
-    fn cut(&mut self, pos: u32) {
-        self.rows = self.rows.min(pos.saturating_sub(self.first));
-    }
-
-    /// Whether rows `row .. row + m` hold positions `at .. at + m`. A range
-    /// whose end, or whose first position, is past `usize` holds nothing.
-    fn holds(&self, row: usize, m: usize, at: u32) -> bool {
-        let (Some(end), Some(first)) = (row.checked_add(m), (self.first as usize).checked_add(row))
-        else {
-            return false;
-        };
-        end <= self.rows as usize && first == at as usize
-    }
-
-    /// The positions held, for a refusal's words.
-    fn shown(&self) -> String {
-        match self.rows {
-            0 => "no position".to_string(),
-            r => format!(
-                "positions {}..{}",
-                self.first,
-                u64::from(self.first) + u64::from(r)
-            ),
-        }
-    }
-}
-
 /// Each target arena's [`Held`]: the body's record of where the step, the
 /// verify and the prompt batch left their rows.
 #[derive(Clone, Copy, Debug, Default)]
@@ -717,27 +671,9 @@ fn hidden_src<'a>(
         Src::Rows { rows, .. } => rows,
         Src::Pair { .. } => 2,
     };
-    if first.checked_add(m).is_none_or(|end| end > rows) {
-        return Err(shape(format!(
-            "{m} rows from row {first} of the {walk:?} arena's {rows}"
-        )));
-    }
-    let at = pos0.checked_sub(1).ok_or_else(|| {
-        shape(format!(
-            "the {walk:?} arena's rows for a walk at position 0: the target holds no row before \
-             it (a host zero row is position 0's)"
-        ))
-    })?;
-    let held = wrote.of(walk);
-    if !held.holds(first, m, at) {
-        return Err(shape(format!(
-            "rows {first}..{} of the {walk:?} arena as positions {at}..{} for a walk from {pos0}: \
-             the arena holds {}",
-            first + m,
-            at as usize + m,
-            held.shown()
-        )));
-    }
+    wrote
+        .of(walk)
+        .check_read(WHAT, walk, rows, (first, m), pos0)?;
     Ok(Some((src, first)))
 }
 
@@ -816,7 +752,7 @@ fn read_rows(
     rows: &[&DeviceBuffer<f32>],
     wide: usize,
 ) -> Result<(Held, Vec<f32>), GpuError> {
-    let r = held.rows as usize;
+    let r = held.parts().1 as usize;
     let bufs = rows.get(..r).ok_or_else(|| {
         shape(format!(
             "{} as rows of an arena of {}",
@@ -858,8 +794,8 @@ impl Body {
         if self.nextn.is_none() {
             return Ok(0);
         }
-        (self.wrote.step.rows as usize)
-            .checked_add(self.wrote.pair.rows as usize)
+        (self.wrote.step.parts().1 as usize)
+            .checked_add(self.wrote.pair.parts().1 as usize)
             .and_then(|n| n.checked_mul(HC_STREAMS))
             .and_then(|n| n.checked_mul(self.dims.embd))
             .and_then(|n| n.checked_mul(size_of::<f32>()))
@@ -918,8 +854,12 @@ impl Body {
         }
         let wide = HC_STREAMS * self.dims.embd;
         for (what, (held, v), rows) in [("step", &d.step, 1), ("verify", &d.pair, LANES)] {
-            let r = held.rows as usize;
-            if r > rows || v.len() != r * wide || (r > 0 && held.first + held.rows > pos) {
+            let (first, count) = held.parts();
+            let r = count as usize;
+            if r > rows
+                || v.len() != r * wide
+                || r > 0 && u64::from(first) + u64::from(count) > u64::from(pos)
+            {
                 return Err(shape(format!(
                     "the {what} arena's {} ({} values) put back into {rows} rows of {wide} at \
                      position {pos}",

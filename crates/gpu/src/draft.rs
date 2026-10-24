@@ -1,8 +1,9 @@
 //! The types a draft walk is given: how it runs ([`WalkMode`]), which
 //! projection its head runs ([`DraftHead`]), where its hidden rows come from
-//! ([`Hidden`]), the rows it walks ([`Feed`], [`DraftFeed`]) and the names of
-//! its row bounds ([`WalkBounds`]). Each draft program — Qwen3.8's MTP layer
-//! and GLM's NextN layer — walks these.
+//! ([`Hidden`]), the rows it walks ([`Feed`], [`DraftFeed`]), the positions
+//! its target arenas hold ([`Held`]) and the names of its row bounds
+//! ([`WalkBounds`]). Each draft program — Qwen3.8's MTP layer and GLM's
+//! NextN layer — walks these.
 
 use crate::GpuError;
 use crate::media::CallRows;
@@ -194,4 +195,190 @@ pub fn refuse_rows<P: WalkBounds>(
         ));
     }
     Ok(())
+}
+
+/// The positions a target arena's rows hold, row `r` position `first + r`:
+/// what the call that last wrote the arena left there, less the positions a
+/// cut took back since. No rows: the arena holds no position of the
+/// sequence. A [`Hidden::Target`] feed must read the positions recorded here
+/// rather than stale rows left in the arena.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Held {
+    first: u32,
+    rows: u32,
+}
+
+impl Held {
+    /// No position.
+    pub const NONE: Held = Held { first: 0, rows: 0 };
+
+    /// Rows `0 .. rows` at positions `first ..`. Construction does not read
+    /// rows; [`Held::holds`] refuses a read past the position width.
+    #[must_use]
+    pub const fn at(first: u32, rows: u32) -> Held {
+        Held { first, rows }
+    }
+
+    /// The positions from `pos` on taken back.
+    pub fn cut(&mut self, pos: u32) {
+        self.rows = self.rows.min(pos.saturating_sub(self.first));
+    }
+
+    /// The first position and the number of rows it holds.
+    #[must_use]
+    pub const fn parts(self) -> (u32, u32) {
+        (self.first, self.rows)
+    }
+
+    /// Whether rows `row .. row + m` hold positions `at .. at + m`.
+    /// Row arithmetic must fit `usize`, and every read position must fit
+    /// `u32`. An empty range may name the boundary just after the held rows.
+    #[must_use]
+    pub fn holds(self, row: usize, m: usize, at: u32) -> bool {
+        let Some(end) = row.checked_add(m) else {
+            return false;
+        };
+        let (Ok(row), Ok(m), Ok(end)) = (u32::try_from(row), u32::try_from(m), u32::try_from(end))
+        else {
+            return false;
+        };
+        end <= self.rows
+            && self.first.checked_add(row) == Some(at)
+            && (m == 0 || at.checked_add(m - 1).is_some())
+    }
+
+    /// The positions held, for a refusal's words.
+    #[must_use]
+    pub fn shown(self) -> String {
+        match self.rows {
+            0 => "no position".to_string(),
+            rows => format!(
+                "positions {}..{}",
+                self.first,
+                u64::from(self.first) + u64::from(rows)
+            ),
+        }
+    }
+
+    /// Check the target rows of a [`Hidden::Target`] feed before any copy.
+    /// `rows` is the arena's row capacity, and `pos0` the walk's first token
+    /// position: its hidden rows must start at position `pos0 - 1`.
+    ///
+    /// # Errors
+    /// [`GpuError::Shape`] naming `what` and `walk` for rows outside the
+    /// arena, position 0 (which needs a host zero row), or positions the
+    /// arena does not hold, including overflowing row or position ranges.
+    pub fn check_read(
+        self,
+        what: &'static str,
+        walk: impl std::fmt::Debug,
+        rows: usize,
+        (first, m): (usize, usize),
+        pos0: u32,
+    ) -> Result<(), GpuError> {
+        let Some(end) = first.checked_add(m).filter(|&end| end <= rows) else {
+            return Err(GpuError::shape(
+                what,
+                format!("{m} rows from row {first} of the {walk:?} arena's {rows}"),
+            ));
+        };
+        let at = pos0.checked_sub(1).ok_or_else(|| {
+            GpuError::shape(
+                what,
+                format!(
+                    "the {walk:?} arena's rows for a walk at position 0: the target \
+                     holds no row before it (a host zero row is position 0's)"
+                ),
+            )
+        })?;
+        if !self.holds(first, m, at) {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "rows {first}..{end} of the {walk:?} arena as positions {at}..{} for \
+                     a walk from {pos0}: the arena holds {}",
+                    u128::from(at) + m as u128,
+                    self.shown()
+                ),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Held;
+    use crate::GpuError;
+
+    #[test]
+    fn held_rows_respect_row_and_position_widths_and_cuts() {
+        let held = Held::at(1, 1);
+        assert!(held.holds(0, 1, 1));
+        assert!(!held.holds(usize::MAX, 1, 0));
+        assert!(!held.holds(1, usize::MAX, 2));
+        assert!(held.holds(1, 0, 2));
+        assert!(!held.holds(2, 0, 3));
+        assert!(Held::NONE.holds(0, 0, 0));
+        assert!(!Held::NONE.holds(0, 1, 0));
+        assert!(Held::at(u32::MAX, 1).holds(0, 1, u32::MAX));
+        assert!(!Held::at(u32::MAX, 2).holds(0, 2, u32::MAX));
+        assert!(!Held::at(u32::MAX, 2).holds(1, 1, 0));
+        assert!(Held::at(u32::MAX, 2).shown().contains("4294967297"));
+        if let Ok(past_u32) = usize::try_from(u64::from(u32::MAX) + 1) {
+            assert!(!Held::at(0, u32::MAX).holds(past_u32, 0, 0));
+            assert!(!Held::at(0, u32::MAX).holds(0, past_u32, 0));
+        }
+        let mut held = Held::at(5, 3);
+        held.cut(7);
+        assert_eq!(held.parts(), (5, 2));
+        assert!(held.holds(0, 2, 5));
+        assert!(!held.holds(2, 1, 7));
+        held.cut(4);
+        assert_eq!(held.parts(), (5, 0));
+        held.cut(9);
+        assert_eq!(held.parts(), (5, 0));
+    }
+
+    #[test]
+    fn target_reads_refuse_unheld_or_overflowing_ranges_before_copy() {
+        const WHAT: &str = "draft read";
+        let held = Held::at(1, 1);
+        held.check_read(WHAT, "Step", 2, (0, 1), 2)
+            .expect("the held row");
+        for (first, m) in [
+            (0, 3),
+            (usize::MAX, 1),
+            (1, usize::MAX),
+            (usize::MAX, usize::MAX),
+        ] {
+            let e = held
+                .check_read(WHAT, "Step", 2, (first, m), 1)
+                .expect_err("rows outside the arena");
+            assert!(matches!(e, GpuError::Shape { what: WHAT, .. }), "{e}");
+        }
+        let e = held
+            .check_read(WHAT, "Step", usize::MAX, (0, usize::MAX), 2)
+            .expect_err("a position end past usize");
+        assert!(matches!(e, GpuError::Shape { what: WHAT, .. }), "{e}");
+        for (held, rows, range, pos0) in [
+            (held, 2, (0, 1), 0),
+            (Held::NONE, 2, (0, 1), 2),
+            (held, 2, (1, 1), 3),
+            (Held::at(u32::MAX - 1, 3), 3, (0, 3), u32::MAX),
+        ] {
+            let e = held
+                .check_read(WHAT, "Step", rows, range, pos0)
+                .expect_err("a target read the arena cannot provide");
+            assert!(matches!(e, GpuError::Shape { what: WHAT, .. }), "{e}");
+            if pos0 == u32::MAX {
+                assert!(e.to_string().contains("4294967297"));
+            }
+        }
+        let mut held = Held::at(5, 2);
+        held.cut(6);
+        held.check_read(WHAT, "Pair", 2, (0, 1), 6)
+            .expect("the kept row remains readable");
+        assert!(held.check_read(WHAT, "Pair", 2, (0, 2), 6).is_err());
+    }
 }

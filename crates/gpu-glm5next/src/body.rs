@@ -77,6 +77,7 @@ use std::sync::Arc;
 
 use bloomery_gpu::checkpoint::saved::Identity;
 use bloomery_gpu::checkpoint::{self, Checkpoints};
+use bloomery_gpu::draft::Held;
 use bloomery_gpu::head::Head;
 use bloomery_gpu::host::PassKind;
 use bloomery_gpu::host::leg_tier::{self, Hang, LegOpen};
@@ -2512,8 +2513,8 @@ impl Slots for Body {
         std::mem::swap(&mut self.held, &mut seq.held);
         std::mem::swap(&mut self.ckpt, &mut seq.ckpt);
         std::mem::swap(&mut self.wrote, &mut seq.wrote);
-        self.wrote.prefill = nextn::Held::NONE;
-        seq.wrote.prefill = nextn::Held::NONE;
+        self.wrote.prefill = Held::NONE;
+        seq.wrote.prefill = Held::NONE;
         let fin = program::final_streams(self.cfg.len());
         for (row, own) in self.s.rows_mut().take(rows).zip(seq.rows.iter_mut()) {
             std::mem::swap(&mut row.streams[fin], own);

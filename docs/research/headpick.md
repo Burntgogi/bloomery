@@ -388,6 +388,13 @@ cycle: `models` depends only on `gguf`. `HeadSel` is a plain `Copy` enum (`Full`
 | record fields | owner's `Kind` | same | same | none |
 | model-specific | the walk's layers and `head_x` | the host union leg inside the walk; ids-only readback (`PROBS = false`, `glm5next/mtp.rs:70-86`) | block pass, Markov loop (`markov.rs:288-302`), `ds41_markov` over listed rows | DSpark proposes a block in one pass then a serial bigram loop; GLM runs host experts mid-walk |
 
+The target-arena positions a draft reads have one owner, `gpu::draft::Held`, shared by Qwen3.8 MTP,
+its target body and GLM NextN. It records the first position and row count, cuts discarded rows,
+and checks the requested positions and arena capacity before any copy. Row arithmetic and the
+`u32` position width are checked; a stale or overflowing read is a named shape refusal.
+Each program retains its own arena enum and `Wrote` table: only the positional range and read
+contract are shared, not a model's sequence state or graph.
+
 ### 7.3 No per-model branch, flag or trait method: the check
 
 Places where the models differ, and where each sits:
