@@ -524,9 +524,9 @@ generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids]
     }
 
     pub(super) fn run() -> ExitCode {
-        // No lever row acts on this CLI; `at_main` still refuses a retired
-        // name that is set, and `--levers` prints the table.
-        if let Err(e) = bloomery_levers::at_main(&[]) {
+        // No lever row acts on this CLI; startup still refuses a retired
+        // name that is set, and a bare `--levers` prints the table.
+        if let Err(e) = bloomery_levers::at_main_with_flags(&[], has_flag) {
             eprintln!("generate_metal: {e}");
             return ExitCode::from(1);
         }
