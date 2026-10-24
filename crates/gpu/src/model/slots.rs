@@ -186,6 +186,91 @@ pub struct SlotRange {
     pub pos0: u32,
 }
 
+/// How a pass binds its live sequence's output rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SlotRowOrder {
+    /// Every slot writes its own rows independently of pass order.
+    Any,
+    /// Slot 0's retained rows occupy the arena's prefix, so it must run first.
+    RetainedPrefix,
+}
+
+impl SlotRowOrder {
+    /// Count ordered, nonempty ranges tiling the pass from row 0. An empty
+    /// pass counts as zero so callers can retain their own admission errors.
+    pub fn tiled_rows(self, what: &'static str, rows: &[SlotRange]) -> Result<usize, GpuError> {
+        let mut at = 0;
+        for (i, r) in rows.iter().enumerate() {
+            if r.rows.start != at || r.rows.is_empty() {
+                return Err(GpuError::shape(
+                    what,
+                    format!(
+                        "slot {}'s rows {:?}; the ranges tile the pass in order from row 0",
+                        r.slot, r.rows
+                    ),
+                ));
+            }
+            if self == Self::RetainedPrefix && r.slot == 0 && i != 0 {
+                return Err(GpuError::shape(
+                    what,
+                    "slot 0's rows past another slot's: slot 0's own rows hold its rows from row 0, \
+                     so a pass that runs slot 0 lays its rows first",
+                ));
+            }
+            at = r.rows.end;
+        }
+        Ok(at)
+    }
+
+    /// Admit a nonempty pass and one parked sequence per range past slot 0,
+    /// after checking tiling and the arena's order requirement.
+    pub fn admit(
+        self,
+        what: &'static str,
+        rows: &[SlotRange],
+        parked: usize,
+    ) -> Result<usize, GpuError> {
+        let at = self.tiled_rows(what, rows)?;
+        let others = rows.iter().filter(|r| r.slot != 0).count();
+        if at == 0 || parked != others {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "a pass of {at} rows with {parked} parked sequences for {others} slots past slot 0"
+                ),
+            ));
+        }
+        Ok(at)
+    }
+}
+
+impl SlotRange {
+    /// This slot's operand ids, with an invalid range refused by slot name.
+    pub fn ids<'i>(&self, what: &'static str, ids: &'i [u32]) -> Result<&'i [u32], GpuError> {
+        ids.get(self.rows.clone()).ok_or_else(|| {
+            GpuError::shape(
+                what,
+                format!(
+                    "slot {}'s rows {:?} of {} ids",
+                    self.slot,
+                    self.rows,
+                    ids.len()
+                ),
+            )
+        })
+    }
+
+    /// A busy slot with no parked sequence supplied for it.
+    pub fn no_parked(&self, what: &'static str) -> GpuError {
+        GpuError::shape(what, format!("slot {}'s parked sequence", self.slot))
+    }
+}
+
+/// A slot named twice in one pass.
+pub(crate) fn slot_twice(what: &'static str, slot: usize) -> GpuError {
+    GpuError::shape(what, format!("slot {slot} twice in one pass"))
+}
+
 /// What [`GpuModel::step_slots`] returns: every row's greedy next token in
 /// the pass's row order — the order of the rows it was handed, each slot's
 /// tokens in turn. Row `r`'s logits are its own head's, as a
@@ -551,10 +636,7 @@ where
                 ));
             }
             if out.iter().any(|r| r.slot == slot) {
-                return Err(GpuError::shape(
-                    what,
-                    format!("slot {slot} twice in one pass"),
-                ));
+                return Err(slot_twice(what, slot));
             }
             if m == 0 {
                 return Err(GpuError::shape(what, format!("slot {slot} with no token")));
@@ -1194,4 +1276,120 @@ fn no_home(slot: usize, what: &'static str) -> GpuError {
             slot.wrapping_sub(1)
         ),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SlotRange, SlotRowOrder};
+    use crate::GpuError;
+    use std::ops::Range;
+
+    fn range(slot: usize, rows: Range<usize>) -> SlotRange {
+        SlotRange {
+            slot,
+            rows,
+            pos0: 0,
+        }
+    }
+
+    fn detail(error: GpuError) -> String {
+        let GpuError::Shape { what, detail } = error else {
+            panic!("slot admission must name a shape refusal: {error}");
+        };
+        assert_eq!(what, "slot admission");
+        detail
+    }
+
+    #[test]
+    fn slot_admission_preserves_tiling_parked_count_and_arena_order() {
+        let any = SlotRowOrder::Any;
+        let prefix = SlotRowOrder::RetainedPrefix;
+        let live_first = [range(0, 0..2), range(7, 2..5)];
+        let parked_first = [range(7, 0..2), range(0, 2..5)];
+        let parked_only = [range(7, 0..2), range(3, 2..5)];
+        for order in [any, prefix] {
+            assert_eq!(order.admit("slot admission", &live_first, 1).unwrap(), 5);
+            assert_eq!(order.admit("slot admission", &parked_only, 2).unwrap(), 5);
+            assert_eq!(
+                order.admit("slot admission", &[range(0, 0..1)], 0).unwrap(),
+                1
+            );
+            for parked in [0, 2] {
+                let e = order
+                    .admit("slot admission", &live_first, parked)
+                    .unwrap_err();
+                assert_eq!(
+                    detail(e),
+                    format!(
+                        "a pass of 5 rows with {parked} parked sequences for 1 slots past slot 0"
+                    )
+                );
+            }
+            assert_eq!(
+                detail(order.admit("slot admission", &[], 0).unwrap_err()),
+                "a pass of 0 rows with 0 parked sequences for 0 slots past slot 0"
+            );
+            for rows in [
+                vec![range(4, 1..2)],
+                vec![range(4, 0..0)],
+                vec![range(4, 0..2), range(0, 1..3)],
+                vec![range(4, 0..2), range(0, 3..4)],
+                vec![range(4, 0..2), range(0, Range { start: 2, end: 1 })],
+            ] {
+                let bad = rows.last().unwrap();
+                let e = order.admit("slot admission", &rows, 9).unwrap_err();
+                assert_eq!(
+                    detail(e),
+                    format!(
+                        "slot {}'s rows {:?}; the ranges tile the pass in order from row 0",
+                        bad.slot, bad.rows
+                    )
+                );
+            }
+            // Endpoints need no sum: the largest tiling cannot wrap a row count.
+            assert_eq!(
+                order
+                    .admit("slot admission", &[range(0, 0..usize::MAX)], 0)
+                    .unwrap(),
+                usize::MAX
+            );
+        }
+        assert_eq!(any.admit("slot admission", &parked_first, 1).unwrap(), 5);
+        let order_error = detail(
+            prefix
+                .admit("slot admission", &parked_first, 9)
+                .unwrap_err(),
+        );
+        assert_eq!(
+            order_error,
+            "slot 0's rows past another slot's: slot 0's own rows hold its rows from row 0, \
+             so a pass that runs slot 0 lays its rows first"
+        );
+        let malformed_later = [range(7, 0..1), range(0, 1..2), range(3, 4..5)];
+        assert_eq!(
+            detail(
+                prefix
+                    .admit("slot admission", &malformed_later, 2)
+                    .unwrap_err()
+            ),
+            order_error
+        );
+    }
+
+    #[test]
+    fn slot_ids_borrow_the_operand_slice_and_refuse_invalid_endpoints() {
+        let ids = [17, 29, 41, 53];
+        let own = range(6, 1..3).ids("slot admission", &ids).unwrap();
+        assert_eq!(own, &[29, 41]);
+        assert_eq!(own.as_ptr(), ids[1..].as_ptr());
+        for (start, end) in [(1, 5), (3, 2), (usize::MAX, usize::MAX), (0, usize::MAX)] {
+            let rows = start..end;
+            let r = range(6, rows);
+            assert_eq!(
+                detail(r.ids("slot admission", &ids).unwrap_err()),
+                format!("slot 6's rows {:?} of 4 ids", r.rows)
+            );
+        }
+        assert_eq!(range(6, 4..4).ids("slot admission", &ids).unwrap(), &[]);
+    }
 }

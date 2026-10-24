@@ -1,8 +1,9 @@
 # Layer composition: source census and lift design (#609)
 
 Snapshot: **`faa81674ff09ebc1871652e7416cd00db49616fe`**, release main after the MiniMax/Solar/Raon merge; reviewed 2026-10-22.
-This note completes the **census and design** scope of [#609](https://github.com/midagedev/bloomery/issues/609).
-It does not implement a body lift, claim a new runnable architecture, or supply GPU/performance evidence.
+This note records the **census and design** scope of [#609](https://github.com/midagedev/bloomery/issues/609).
+Its tables remain the frozen snapshot's counts and forecasts, not current net deletions. The C1 status below
+describes the implemented row utilities; it claims neither a new runnable architecture nor GPU/performance evidence.
 
 ## 1. What was counted
 
@@ -200,6 +201,28 @@ Sources: [qwen3moe/body35_slots::slot_rows](https://github.com/midagedev/bloomer
 
 Invariant: Preserve ordered nonempty tiling, parked-count/id bounds and named refusals; require slot-0-first only for the retained-prefix arena binding, never by model name.
 
+C1's common owner is now `gpu::model::slots`: `SlotRowOrder` admits the ordered nonempty tiling and parked
+count, while `SlotRange::ids` returns the original borrowed id slice with checked endpoints. Duplicate-slot
+and missing-parked refusals share that owner. `Any` preserves Body35's order; `RetainedPrefix` requires live
+slot 0 first only where its retained rows occupy the arena prefix. Body38 binds that policy explicitly.
+Qwen3's pass and MiMo2 reuse the same tiling check while keeping their distinct arena/empty-pass checks;
+GLM reuses the missing-parked refusal. Program-specific binding walks remain in their callers.
+
+A bounded re-inventory against implementation base `4197866`, using this note's existing AST row counter:
+
+| Selected production declarations/methods | Code-bearing rows |
+|---|---:|
+| Eight retired private helpers in Body35/Body38 | 85 |
+| Common policy enum, four methods and shared duplicate-slot refusal | 65 |
+
+This is not a net-deletion count: imports, bindings, impl scaffolding and other migrated loops are outside
+these selected units. The common-owner footprint exceeds the earlier forecast; the forecasted net savings
+are not claimed as measured removals. The family-wide census above remains frozen to its original snapshot.
+
+Host contract tests and a separately compiled consumer exercise admission, both order policies, borrowed
+ids and invalid endpoints without opening CUDA. This is not device eager/captured/slot evidence; the
+complete canonical move proof and the owning gates below remain the landing contract.
+
 Proof focus: `gate-gpu-qwen35moe-e2e`, `gate-gpu-qwen4exp-e2e`, `gate-gpu-qwen4exp-mtp`; the complete current `just affected` list still applies.
 
 ### C2. Described host-layer construction
@@ -318,10 +341,10 @@ proof for each pair. The normal CLI resolves every selector exactly once before 
 9. [src/pass::proj](https://github.com/midagedev/bloomery/blob/faa81674ff09ebc1871652e7416cd00db49616fe/crates/gpu-gemma-embedding2/src/pass.rs#L76-L105) ↔ [arch/hybrid::project_wide](https://github.com/midagedev/bloomery/blob/faa81674ff09ebc1871652e7416cd00db49616fe/crates/gpu/src/arch/hybrid.rs#L1192-L1227) — binding-first; preserve stated differences before attempting a move.
 10. [src/ops::pointwise](https://github.com/midagedev/bloomery/blob/faa81674ff09ebc1871652e7416cd00db49616fe/crates/gpu-gemma4a/src/ops.rs#L18-L40) ↔ [src/pointwise::vis_clamp_f32](https://github.com/midagedev/bloomery/blob/faa81674ff09ebc1871652e7416cd00db49616fe/crates/gpu-vision/src/pointwise.rs#L98-L119) — keep distinct numerical descriptions; common lower primitives already exist.
 11. [arch/gemma4v::attention](https://github.com/midagedev/bloomery/blob/faa81674ff09ebc1871652e7416cd00db49616fe/crates/gpu-vision/src/arch/gemma4v.rs#L425-L536) ↔ [src/radio::block](https://github.com/midagedev/bloomery/blob/faa81674ff09ebc1871652e7416cd00db49616fe/crates/gpu-vision/src/radio.rs#L522-L660) — keep distinct numerical descriptions; common lower primitives already exist.
-12. [qwen3moe/body35_slots::slot_ids](https://github.com/midagedev/bloomery/blob/faa81674ff09ebc1871652e7416cd00db49616fe/crates/gpu/src/arch/qwen3moe/body35_slots.rs#L620-L627) ↔ [qwen3moe/body38::slot_ids](https://github.com/midagedev/bloomery/blob/faa81674ff09ebc1871652e7416cd00db49616fe/crates/gpu/src/arch/qwen3moe/body38.rs#L5478-L5485) — scheduled C1.
-13. [qwen3moe/body35_slots::slot_rows](https://github.com/midagedev/bloomery/blob/faa81674ff09ebc1871652e7416cd00db49616fe/crates/gpu/src/arch/qwen3moe/body35_slots.rs#L593-L617) ↔ [qwen3moe/body38::slot_rows](https://github.com/midagedev/bloomery/blob/faa81674ff09ebc1871652e7416cd00db49616fe/crates/gpu/src/arch/qwen3moe/body38.rs#L5444-L5475) — scheduled C1.
+12. [qwen3moe/body35_slots::slot_ids](https://github.com/midagedev/bloomery/blob/faa81674ff09ebc1871652e7416cd00db49616fe/crates/gpu/src/arch/qwen3moe/body35_slots.rs#L620-L627) ↔ [qwen3moe/body38::slot_ids](https://github.com/midagedev/bloomery/blob/faa81674ff09ebc1871652e7416cd00db49616fe/crates/gpu/src/arch/qwen3moe/body38.rs#L5478-L5485) — migrated to `SlotRange::ids` in C1; links retain the census snapshot.
+13. [qwen3moe/body35_slots::slot_rows](https://github.com/midagedev/bloomery/blob/faa81674ff09ebc1871652e7416cd00db49616fe/crates/gpu/src/arch/qwen3moe/body35_slots.rs#L593-L617) ↔ [qwen3moe/body38::slot_rows](https://github.com/midagedev/bloomery/blob/faa81674ff09ebc1871652e7416cd00db49616fe/crates/gpu/src/arch/qwen3moe/body38.rs#L5444-L5475) — migrated to the two `SlotRowOrder` policies in C1; links retain the census snapshot.
 14. [qwen3moe/body35_slots::for_slots](https://github.com/midagedev/bloomery/blob/faa81674ff09ebc1871652e7416cd00db49616fe/crates/gpu/src/arch/qwen3moe/body35_slots.rs#L642-L661) ↔ [qwen3moe/body38::for_slots](https://github.com/midagedev/bloomery/blob/faa81674ff09ebc1871652e7416cd00db49616fe/crates/gpu/src/arch/qwen3moe/body38.rs#L5518-L5533) — binding-first; preserve stated differences before attempting a move.
-15. [qwen3moe/body35_slots::slot_twice](https://github.com/midagedev/bloomery/blob/faa81674ff09ebc1871652e7416cd00db49616fe/crates/gpu/src/arch/qwen3moe/body35_slots.rs#L630-L632) ↔ [qwen3moe/body38::slot_twice](https://github.com/midagedev/bloomery/blob/faa81674ff09ebc1871652e7416cd00db49616fe/crates/gpu/src/arch/qwen3moe/body38.rs#L5488-L5490) — scheduled C1.
+15. [qwen3moe/body35_slots::slot_twice](https://github.com/midagedev/bloomery/blob/faa81674ff09ebc1871652e7416cd00db49616fe/crates/gpu/src/arch/qwen3moe/body35_slots.rs#L630-L632) ↔ [qwen3moe/body38::slot_twice](https://github.com/midagedev/bloomery/blob/faa81674ff09ebc1871652e7416cd00db49616fe/crates/gpu/src/arch/qwen3moe/body38.rs#L5488-L5490) — migrated to the common slot refusal in C1; links retain the census snapshot.
 16. [qwen3moe/body35::checkpoint_lens](https://github.com/midagedev/bloomery/blob/faa81674ff09ebc1871652e7416cd00db49616fe/crates/gpu/src/arch/qwen3moe/body35.rs#L223-L232) ↔ [qwen3moe/body38::checkpoint_lens](https://github.com/midagedev/bloomery/blob/faa81674ff09ebc1871652e7416cd00db49616fe/crates/gpu/src/arch/qwen3moe/body38.rs#L326-L331) — binding-first; preserve stated differences before attempting a move.
 17. [qwen3moe/body35::join_gate_inp](https://github.com/midagedev/bloomery/blob/faa81674ff09ebc1871652e7416cd00db49616fe/crates/gpu/src/arch/qwen3moe/body35.rs#L756-L765) ↔ [qwen3moe/body38::derive](https://github.com/midagedev/bloomery/blob/faa81674ff09ebc1871652e7416cd00db49616fe/crates/gpu/src/arch/qwen3moe/body38.rs#L1486-L1510) — binding-first; preserve stated differences before attempting a move.
 18. [qwen3moe/program38::gdn_seq](https://github.com/midagedev/bloomery/blob/faa81674ff09ebc1871652e7416cd00db49616fe/crates/gpu/src/arch/qwen3moe/program38.rs#L1072-L1137) ↔ [qwen3moe/wide38::gdn](https://github.com/midagedev/bloomery/blob/faa81674ff09ebc1871652e7416cd00db49616fe/crates/gpu/src/arch/qwen3moe/wide38.rs#L2110-L2192) — scheduled C4.
