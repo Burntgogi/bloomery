@@ -138,7 +138,7 @@ crates/model/src/arch/coverage.rs	deepseek	13	baseline P 13: MK2 program by body
 crates/model/src/arch/coverage.rs	gemma	18	baseline P 18: MK2 program by body
 crates/model/src/arch/coverage.rs	glm	18	baseline P 21: MK2 program by body
 crates/model/src/arch/coverage.rs	mimo	10	baseline P 10: MK2 program by body
-crates/model/src/arch/coverage.rs	nemotron	36	baseline P 36: MK2 program by body
+crates/model/src/arch/coverage.rs	nemotron	35	baseline P 36: MK2 program by body
 crates/model/src/arch/coverage.rs	qwen	58	baseline P 63: MK2 program by body
 crates/model/src/arch/draft.rs	mimo	3	baseline D 4: MK1a draft usability as an ArchRow row
 crates/model/src/arch/draft.rs	qwen	13	baseline D 15: MK1a draft usability as an ArchRow row
@@ -167,7 +167,7 @@ crates/placement/src/accepts.rs	flint	1	PIN(2026-10-23) flint: program_of matche
 crates/placement/src/accepts.rs	gemma	5	PIN(2026-10-21) gemma: MK2 program by body; +1 is the family's word in the common Program::name owner, which the model's own code does not carry yet
 crates/placement/src/accepts.rs	glm	5	PIN(2026-10-21) glm: MK2 program by body; +1 is the family's word in the common Program::name owner, which the model's own code does not carry yet
 crates/placement/src/accepts.rs	mimo	5	PIN(2026-10-21) mimo: MK2 program by body; +1 is the family's word in the common Program::name owner, which the model's own code does not carry yet
-crates/placement/src/accepts.rs	nemotron	17	PIN(2026-10-21) nemotron: MK2 program by body; +2 is the family's word in the common Program::name owner, which the model's own code does not carry yet
+crates/placement/src/accepts.rs	nemotron	15	PIN(2026-10-21) nemotron: MK2 program by body; +2 is the family's word in the common Program::name owner, which the model's own code does not carry yet
 crates/placement/src/accepts.rs	qwen	25	PIN(2026-10-21) qwen: MK2 program by body; +3 is the family's word in the common Program::name owner, which the model's own code does not carry yet.
 crates/placement/src/placement/nodes_scale.rs	deepseek	10	baseline D 10: shapes read from the fixture ModelSpec rows (deferred)
 crates/placement/src/placement/nodes_scale.rs	glm	2	baseline D 2: shapes read from the fixture ModelSpec rows (deferred)

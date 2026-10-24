@@ -6,7 +6,7 @@
 //! the plan is the hybrid trunk's ([`PlanInputs::plan_with`]): the whole model
 //! on one card, each routed stack in the format the body's `_sel` launches
 //! read (IQ2_XXS, or a 32-value-block type in the card leg's relu² form:
-//! [`crate::placement::accepts::bolt_leg_runs`]), and the routed experts where
+//! [`crate::placement::accepts::latent_leg_runs`]), and the routed experts where
 //! [`Experts`] says. [`PlanInputs::plan`]
 //! is the whole card's. A plan under [`Experts::Placed`] or [`Experts::Host`]
 //! may put experts on the host; the load still refuses that until the body has

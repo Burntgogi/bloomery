@@ -50,10 +50,7 @@ pub enum Program {
     /// The nemotron_h_moe body (`crates/gpu/src/arch/nemotron_h_moe`):
     /// whole-card, the Nano's Mamba-2 and NoPE GQA layers over the shared
     /// hybrid owner (`crates/gpu/src/arch/hybrid.rs`) and the latent MoE layer,
-    /// whose routed up and down stacks are IQ2_XXS read by `iq2_xxs_gemv_sel`
-    /// ([`BOLT_LEG`]) or both of a 32-value-block type the card leg's relu²
-    /// form reads ([`bolt_leg_runs`]), and whose shared expert is IQ2_XXS or a
-    /// Q8_0 site.
+    /// whose routed stacks run [`latent_leg_runs`] and shared expert IQ2_XXS or Q8_0.
     NemotronHMoeBody,
     /// The EmbeddingGemma encoders (`crates/gpu-gemma-embedding2`): one
     /// pass of a dense trunk on a card, no routed experts.
@@ -384,7 +381,7 @@ pub const BOLT_LEG: GgmlType = GgmlType::IQ2_XXS;
 /// for both stacks, so the load refuses by name a layer whose up and down
 /// take different forms.
 #[must_use]
-pub const fn bolt_leg_runs(ty: GgmlType) -> bool {
+pub const fn latent_leg_runs(ty: GgmlType) -> bool {
     matches!(ty, BOLT_LEG) || kernels::card_sel32_runs(ty)
 }
 
@@ -427,8 +424,8 @@ pub fn leg_arms(p: Program) -> Option<LegArms> {
             down: |ty| ty == DS41_LEG[2],
         }),
         Program::NemotronHMoeBody => Some(LegArms {
-            gate_up: bolt_leg_runs,
-            down: bolt_leg_runs,
+            gate_up: latent_leg_runs,
+            down: latent_leg_runs,
         }),
         Program::Raon1Body => Some(LegArms {
             gate_up: kernels::card_gate_up_runs,
@@ -502,9 +499,9 @@ pub fn routed_rule(p: Program) -> RoutedRule {
     }
 }
 
-/// The latent MoE body's plan arm: [`bolt_leg_runs`], in its card format.
+/// The latent MoE body's plan arm: [`latent_leg_runs`], in its card format.
 fn bolt_leg_card(ty: GgmlType) -> Option<CardFormat> {
-    bolt_leg_runs(ty).then(|| leg_card_format(ty))
+    latent_leg_runs(ty).then(|| leg_card_format(ty))
 }
 
 /// The muse-spark body's plan arm: [`MUSESPARK_LEG`], in its card format.

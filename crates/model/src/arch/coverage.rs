@@ -17,7 +17,7 @@
 //! any program's pin reads, is not an item; the program itself is one.
 
 use bloomery_placement::accepts::{
-    BOLT_LEG, MUSESPARK_LEG, bolt_leg_runs, dense_by_name, embed_of_widened, head_of_widened,
+    BOLT_LEG, MUSESPARK_LEG, dense_by_name, embed_of_widened, head_of_widened, latent_leg_runs,
     leg_arms, qwen3moe_dense, resident_down_runs,
 };
 pub use bloomery_placement::accepts::{Program, program_of, qwen35_down, qwen35_gate_up};
@@ -1919,13 +1919,13 @@ pub fn check_with(
                 }
                 // The latent MoE body's rule: a stack passes when the
                 // program can run it — on the card by its expert rule
-                // ([`bolt_leg_runs`], `routed_rule`'s arm) or on the host by a
+                // ([`latent_leg_runs`], `routed_rule`'s arm) or on the host by a
                 // qdot fused kernel at the stack's row width
                 // ([`routed_unrun`], the one owner). A layer with a stack the
                 // card experts do not read keeps all its experts on the
                 // host.
                 Some(Program::NemotronHMoeBody) => {
-                    if routed_unrun(t, bolt_leg_runs) {
+                    if routed_unrun(t, latent_leg_runs) {
                         at(t.layer, Need::RoutedFormat(t.ty));
                     }
                 }
