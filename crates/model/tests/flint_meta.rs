@@ -109,12 +109,10 @@ fn hw_flint_header() {
     let coverage = model::arch::coverage::check(s, &r.tensors);
     for (need, layer) in &needs {
         if let Need::Router(shape) = need {
-            assert_eq!(
-                model::arch::models::shape::select_router(*shape)
-                    .unwrap_err()
-                    .why,
-                model::arch::models::shape::Refusal::NoRouterRule
-            );
+            let binding = model::arch::models::shape::select_router(*shape).unwrap();
+            assert_eq!(binding.body, model::arch::models::shape::RouterBody::SigmoidFloor);
+            assert_eq!(binding.rule, shape.rule);
+            assert_eq!((binding.experts(), binding.top_k_min, binding.top_k_max), (256, 6, 6));
             assert!(coverage.iter().any(|u| {
                 u.layer == layer.map(|l| l as usize) && u.feature == need.to_string()
             }));

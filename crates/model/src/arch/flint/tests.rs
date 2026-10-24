@@ -283,10 +283,15 @@ fn normalization_policy_is_architecture_specific_and_bias_is_selection_only() {
                 let shape = models::shape::MoeShape::of(m);
                 assert_eq!(shape.rule.norm, expected);
                 assert_eq!(shape.rule.bias, bias);
-                assert_eq!(
-                    models::shape::select_router(shape).unwrap_err().why,
-                    models::shape::Refusal::NoRouterRule
-                );
+                let refusal = models::shape::select_router(shape).unwrap_err().why;
+                if norm {
+                    assert!(matches!(
+                        refusal,
+                        models::shape::Refusal::RouterWidth { ref served } if served == &[256]
+                    ));
+                } else {
+                    assert_eq!(refusal, models::shape::Refusal::NoRouterRule);
+                }
                 assert!(
                     uncovered
                         .iter()
