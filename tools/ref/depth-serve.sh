@@ -379,7 +379,7 @@ ds_print_plan() {
 ds_fail() {
   local why=$3
   lcpp_srv_stop
-  [ -n "$TWOCARD_WHY" ] || timing_cards_arm "" || why="$why; $TWOCARD_WHY"
+  [ -n "$TWOCARD_WHY" ] || timing_cards_arm "$(cat "${SRV_LOG:-/dev/null}" 2> /dev/null)" serve || why="$why; $TWOCARD_WHY"
   echo "FAIL r$1 ${A_LABEL[$2]} D=${A_DEP[$2]}: $why${CPU_BUSY_TAG:-}${OTHER_BUSY_TAG:-}" >&2
   if [ -r "${SRV_LOG:-}" ]; then
     echo "--- the server's log ($SRV_LOG), last 20 lines" >&2
@@ -429,7 +429,7 @@ ds_run_arm() {
   fi
   lcpp_srv_stop
   # Local mode: an Xid since the last arm's check, or the card lost, fails the arm (timing-card.sh).
-  timing_cards_arm "" || ds_fail "$r" "$i" "$TWOCARD_WHY"
+  timing_cards_arm "$(cat "$SRV_LOG")" serve || ds_fail "$r" "$i" "$TWOCARD_WHY"
   echo "ROW r$r $label D=$dep | tg_tok/s $tg | pp_tok/s $pp | load_s $load | majflt $maj${CPU_BUSY_TAG:-}${OTHER_BUSY_TAG:-}" | tee -a "$ROWS_FILE"
 }
 

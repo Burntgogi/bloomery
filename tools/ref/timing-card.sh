@@ -595,7 +595,8 @@ guard_cards() {
 # devices (an engine whose log names none, or one whose cards the caller checks: tools/ref/arm-place.sh's
 # place_arm_cards). With `ours` the log is one of our binaries': its first `load` record's `cards` (read by
 # tools/bloomery/records.py), the devices' own names, must be exactly two, the A6000's then the 3090's (the
-# stage card, then the tier). TWOCARD_DEVS is `<device 0> + <device 1>` for the row (the one device under
+# stage card, then the tier). With `serve` the log is bloomery-serve's: its first `need` record's `cards`, `<name>:<bytes>`
+# in the devices' order, held to the same two names. TWOCARD_DEVS is `<device 0> + <device 1>` for the row (the one device under
 # stage). In local mode the Xid checks alone, then 1 when the timing card no longer answers nvidia-smi by its
 # UUID; the second argument and the devices are not checked.
 timing_cards_arm() {
@@ -639,6 +640,22 @@ timing_cards_arm() {
         return 0
       fi
       TWOCARD_WHY="the engine's load record names cards ${CARDS:-(none)}, not the A6000 and the 3090: a one-card run in the two-card table"
+      return 1
+      ;;
+    serve)
+      rec=$(python3 "${BASH_SOURCE[0]%/*}/../bloomery/records.py" sh - CARDS=need.cards <<< "$1") || {
+        TWOCARD_WHY="records.py did not read the server's need record"
+        return 1
+      }
+      eval "$rec"
+      # The record's cards are `<name>:<bytes>` in the devices' order, each space in a name written `_`.
+      d0=${CARDS#\[} d0=${d0%\]} d0=$(sed -E 's/:[0-9]+//g' <<< "${d0//_/ }")
+      if [[ $d0 =~ ^[^,]*A6000[^,]*,[^,]*3090[^,]*$ ]]; then
+        # shellcheck disable=SC2034 # TWOCARD_DEVS is read by the runners that source this file
+        TWOCARD_DEVS="${d0//,/ + }"
+        return 0
+      fi
+      TWOCARD_WHY="the server's need record names cards ${CARDS:-(none)}, not the A6000 and the 3090: a one-card run in the two-card table"
       return 1
       ;;
   esac
