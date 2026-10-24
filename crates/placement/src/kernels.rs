@@ -16,6 +16,9 @@ pub use gguf::card::{
 };
 use models::Role;
 
+pub mod attention;
+pub mod ffn;
+
 /// The common card gate·up `_sel` entry that runs a stack of type `ty`.
 #[must_use]
 pub const fn gate_up(ty: GgmlType) -> Option<GateUpEntry> {

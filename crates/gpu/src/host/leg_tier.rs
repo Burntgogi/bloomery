@@ -40,7 +40,7 @@ use super::run::{HostRun, HostWidths};
 use super::tier::{
     TierAct, TierBlock, TierCard, TierExperts, TierInput, TierIo, TierOpen, TierSet, TierShape,
 };
-use crate::card_leg::{CardLeg, LegBufs, LegRun, LegShape, LegStacks};
+use crate::card_leg::{CardLeg, ExpertInput, LegBufs, LegRun, LegShape, LegStacks};
 use crate::hybrid::{Hybrid, SlotMap};
 use crate::kquant::Act;
 use crate::model::CardBytes;
@@ -264,18 +264,10 @@ impl LegTier {
             arms,
         })
     }
-}
 
-/// `names` read by `arms`, or by the card leg's own arms when the family
-/// named none ([`LegStacks::of`]).
-fn stacks_of<'a>(
-    arms: Option<(LegArms, (&'static str, &'static str))>,
-    w: &'a Weights,
-    names: [&'a str; 3],
-) -> Result<LegStacks<'a>, GpuError> {
-    match arms {
-        None => LegStacks::of(w, names),
-        Some((arms, roles)) => LegStacks::of_arms(w, names, arms, roles),
+    /// Select the loaded policy shared by stage-card and tier-card experts.
+    pub fn set_expert_input(&mut self, gpu: &Gpu, policy: ExpertInput) -> Result<(), GpuError> {
+        self.bufs.set_expert_input(gpu, policy)
     }
 }
 
@@ -330,7 +322,7 @@ impl TierExperts for LegTier {
             ..
         } = *shape;
         let tl = layer_of(layers, cfg, layer, W)?;
-        let stacks = LegStacks::of_arms(weights, tl.names(), *arms, STACK_ROLES)?;
+        let stacks = LegStacks::of_arms(weights, tl.names(), arms, STACK_ROLES)?;
         for c0 in (0..io.cols).step_by(cap) {
             let cn = cap.min(io.cols - c0);
             let slots = cn * slots_per_col;
@@ -365,7 +357,6 @@ impl TierExperts for LegTier {
         io: TierIo<'_>,
     ) -> Result<(), GpuError> {
         const W: &str = "LegTier::enqueue_layer";
-        let arms = self.arms;
         let tl = layer_of(&self.layers, &self.cfg, layer, W)?;
         let TierInput::F32(x) = io.act else {
             return Err(GpuError::Shape {
@@ -523,6 +514,11 @@ pub trait LegFamily {
     /// The file as the family's placement reads it.
     type Inputs;
 
+    /// The loaded down-input policy, shared with the stage card and host.
+    fn expert_input(_inputs: &Self::Inputs) -> ExpertInput {
+        ExpertInput::Direct
+    }
+
     /// `file` read as the family's placement reads it; its refusals are
     /// the family's.
     fn describe(file: &Split) -> Result<Self::Inputs, GpuError>;
@@ -569,7 +565,6 @@ pub trait LegFamily {
             limit: moe.act.swiglu_limit(),
         })
     }
-
 }
 
 /// The family `F`'s tier node service: the placement tensors of a file, the
@@ -614,7 +609,7 @@ fn node_experts<F: LegFamily>(
     let inputs = node_inputs::<F>(file, open)?;
     let widths = F::widths(&inputs);
     let shape = widths.shape(F::CHUNK);
-    Ok(Box::new(LegTier::new(
+    let mut tier = LegTier::new(
         gpu,
         F::layers(&inputs),
         &open.set,
@@ -622,7 +617,9 @@ fn node_experts<F: LegFamily>(
         shape,
         widths.program,
         F::tier_act,
-    )?))
+    )?;
+    tier.set_expert_input(gpu, F::expert_input(&inputs))?;
+    Ok(Box::new(tier))
 }
 
 fn node_host<F: LegFamily>(file: Arc<Split>, open: &NodeOpen) -> Result<HostRun, GpuError> {
@@ -640,8 +637,12 @@ fn node_host<F: LegFamily>(file: Arc<Split>, open: &NodeOpen) -> Result<HostRun,
             n_used: w.n_used,
         },
         |src| {
-            F::routed_views(src, &inputs, run)
-                .map_err(|e| GpuError::shape(F::WHAT, format!("the node host run's views: {e}")))
+            let mut views = F::routed_views(src, &inputs, run)
+                .map_err(|e| GpuError::shape(F::WHAT, format!("the node host run's views: {e}")))?;
+            for layer in &mut views {
+                layer.set_expert_input(F::expert_input(&inputs));
+            }
+            Ok::<_, GpuError>(views)
         },
     )
 }

@@ -6083,7 +6083,7 @@ mod tests {
         use workstation::{TIER_BATCH_RESERVE, tier_leg_batch_bytes};
 
         let both = DownForms::of(DownAct::Q8Act).with(DownAct::Q8Blocks32);
-        let batch = tier_leg_batch_bytes(256, 256, 1, 2, 3, both).expect("tier bytes");
+        let batch = tier_leg_batch_bytes(256, 256, 1, 2, 3, both, false).expect("tier bytes");
         let leg = batch.leg.expect("a tier leg descriptor");
         let rule = routed_rule(Program::Qwen35Body);
         for (downs, first) in [
@@ -6159,7 +6159,7 @@ mod tests {
         use workstation::{TIER_BATCH_RESERVE, TierLegScratch, tier_leg_batch_bytes};
 
         let forms = DownForms::of(DownAct::Q8Act);
-        let batch = tier_leg_batch_bytes(256, 256, 1, 1, 1, forms).expect("valid batch");
+        let batch = tier_leg_batch_bytes(256, 256, 1, 1, 1, forms, false).expect("valid batch");
         let good = batch.leg.expect("a leg descriptor");
         let mut model = legged(&[[GgmlType::Q5_K; 3]]);
         model.experts_used = 1;
@@ -6218,13 +6218,15 @@ mod tests {
             );
             assert!(
                 matches!(
-                    tier_leg_batch_bytes(leg.n_embd, leg.ff, leg.n_used, leg.chunk, 1, leg.downs),
+                    tier_leg_batch_bytes(
+                        leg.n_embd, leg.ff, leg.n_used, leg.chunk, 1, leg.downs, leg.input_scales,
+                    ),
                     Err(PlacementError::Metadata { key, .. }) if key == "tier leg scratch"
                 ),
                 "{leg:?}"
             );
         }
-        assert!(tier_leg_batch_bytes(256, 256, 8, 1, 1 << 61, forms).is_err());
+        assert!(tier_leg_batch_bytes(256, 256, 8, 1, 1 << 61, forms, false).is_err());
         let inconsistent = workstation::TierBatchBytes {
             scratch: 0,
             ..batch

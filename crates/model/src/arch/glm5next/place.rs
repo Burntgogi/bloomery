@@ -146,7 +146,6 @@ fn down_forms(downs: impl Iterator<Item = GgmlType>) -> DownForms {
         .fold(DownForms::NONE, |forms, (_, act)| forms.with(act))
 }
 
-
 /// Tokens a chunk of the tier's prompt-batch service runs at most: the
 /// stage card's chunk of the card experts' launches, which the body binds
 /// to its own constant.
@@ -166,6 +165,7 @@ pub fn tier_batch(inputs: &PlanInputs) -> Result<TierBatchBytes, PlacementError>
         TIER_CHUNK,
         crate::moe::UNION_MAX_COLS as u64,
         crate::placement::accepts::leg_down_forms(Program::Glm5nextBody, &inputs.model),
+        false,
     )
 }
 
@@ -421,7 +421,6 @@ pub enum PlaceError {
     /// A plan of no resident sequence: a load serves at least one.
     #[error("a plan of {slots} resident sequences: a load serves at least one")]
     Slots { slots: usize },
-
 }
 
 impl PlanRefusal for PlaceError {
@@ -692,7 +691,6 @@ impl PlanInputs {
         }
         Ok(plan)
     }
-
 }
 
 /// Card bytes the NextN walk's arena may hold beside the plan's tensors
@@ -1886,7 +1884,7 @@ mod tests {
             use GgmlType::{IQ3_S, IQ4_XS, NVFP4, Q4_K, Q5_K, Q6_K, Q8_0};
             let q8 = DownForms::of(DownAct::Q8Act);
             let b32 = DownForms::of(DownAct::Q8Blocks32);
-            let base = tier_batch(&inputs());
+            let base = tier_batch(&inputs()).expect("the described tier geometry");
             let hp = inputs().hp;
             let leg = |forms| {
                 leg_bytes(
@@ -1899,7 +1897,6 @@ mod tests {
             };
             assert_ne!(leg(q8), leg(b32));
             for (layers, forms) in [
-                (vec![], q8),
                 (vec![[Q4_K, Q4_K, Q5_K]], q8),
                 (vec![[Q5_K, Q5_K, Q6_K]], q8),
                 (vec![[IQ3_S, IQ3_S, IQ4_XS]], q8),
@@ -1914,7 +1911,7 @@ mod tests {
                     q8.with(DownAct::Q8Blocks32),
                 ),
             ] {
-                let batch = tier_batch(&routed_types(&layers));
+                let batch = tier_batch(&routed_types(&layers)).expect("the selected tier geometry");
                 assert_eq!(batch.scratch, leg(forms), "{layers:?}");
                 assert_eq!(batch.staging, base.staging, "{layers:?}");
                 assert_eq!(batch.host, base.host, "{layers:?}");

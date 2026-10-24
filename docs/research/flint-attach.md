@@ -2,9 +2,9 @@
 
 Design snapshot: **`e53cabebbb9b16249c81b7c26a026da1670f7d9d`**, requested by
 [#632](https://github.com/midagedev/bloomery/issues/632). The source-gap observations below describe
-that snapshot. The current tree additionally has a **header-only reader** and a real common
-256/top6 floor-router binding; it still has no Flint body, app session or serve seat.
-No GPU, inference, performance or weight-content validation is claimed.
+that snapshot. The integration based on **`e0c82e1779a8e754c53f4442800e6c3d61271a48`**
+adds an actual `gpu-flint` body, application session and shared HTTP seat, not just architecture
+admission. Device execution, GPU numerical acceptance and performance remain unverified.
 
 ## Host reader status
 
@@ -15,15 +15,15 @@ It reuses the common metadata validators, tensor stems, classification and dimen
 GemmaEmbedding2's sliding mask: missing keys, scalars, wrong lengths and non-bool items are refused.
 Present `expert_weights_scale` uses `arch::finite_positive`; only an absent key defaults to 1,
 with that default recorded.
-The common needs walk emits q/k normalization even on NoPE layers. `program_of(Flint)` remains
-`None`; missing program, head128 sinks/SWA and NoPE normalization remain coverage refusals.
-`Router.norm` and `RouterRule.norm` distinguish no normalization, the existing selected-sum
-rule and Flint's selected-sum floor. The real floor-router binding is selectable in both bias
-modes; selecting that operation does not supply a whole program or activated-value scaling.
+The common needs walk emits q/k normalization even on NoPE layers. `program_of(Flint)` selects
+`FlintBody`, whose coverage names the operations its loader actually binds: head128/group8
+sink attention, independent NoPE/NeoX and SWA masks, and the real floor router.
+`Router.norm` and `RouterRule.norm` keep the old selected-sum rule distinct from Flint's floor.
+The activated-value protection and explicit residual association are loaded FFN policies.
 
 Fault formatting uses `bloomery_device::fault`'s shared layout/decoder and the
-`gpu::arch::step_order` registry. Flint's registry row uses neutral code order;
-it does not describe a runnable step.
+`gpu::arch::step_order` registry. The body delegates fault checks and captured execution to the
+common chain runtime; the architecture registry's neutral order is not numerical evidence.
 
 Run `BLOOMERY_BOX_ENV="BLOOMERY_MODEL=/absolute/path/flint-header.gguf" BLOOMERY_BOX_LOCAL=1 just gate-flint-meta`.
 Set `BLOOMERY_ENV_FILE` to the local toolchain environment file if it is not `~/bloomery-env.sh`.
@@ -45,16 +45,14 @@ remaining acceptance rows. This header gate is not an end-to-end model gate.
 ### Runtime handoff and host policy
 
 The design, common template support, tokenizer/four-EOG contract and reader (#676–#680) are merged.
-The existing header recipe was exercised on the exact 5,470,528-byte prefix above: four reader tests and
-the pinned-header test passed, still reporting the missing program and operation bindings.
-No full weights or GPU were needed for that check.
+The pinned-header consumer now also checks actual Program coverage and planning on the complete
+local GGUF: 779 tensors, 49 layers, 2 dense/47 routed, 49 head norms, 35 rotations and 49 sinks.
+This reads the header, not tensor contents; it does not prove CUDA execution.
 
-The maintainer [assigned the model port and offered card runs](https://github.com/midagedev/bloomery/issues/632#issuecomment-6352066886),
-and named a forthcoming head128 sink/SWA attention, QK RMS and sigmoid256/top6 train.
-Those complete attention contracts are not in this main snapshot or the inspected public heads of
-#726 (`1723485602c1`) and #747 (`f883e84f8d2c`). Existing ring and sink-merge ingredients do not
-establish the combined attention operation. Obtain the train's fetchable ref before duplicating
-those primitives.
+The maintainer [assigned the model port and offered card runs](https://github.com/midagedev/bloomery/issues/632#issuecomment-6352066886).
+The later public QK-RMS, sink/SWA and sigmoid train supplies reusable primitives. The new common
+`attention_h128` binding combines those with actual ring append/attention kernels; it is not an
+identity-RoPE substitute or a padded-head adaptation of another family.
 
 The common `route_body::sigmoid_floor_256_6` binding now supplies Flint's fixed
 `max(sum_selected, 2^-14)` rule. `RouterKernels::enqueue_router` and `enqueue_router_rows`
@@ -108,10 +106,9 @@ Its nonnegative constant-weight case derives a scalar floating-operation bound;
 it is not a whole-model accuracy pin. The hardware case has not been run here.
 
 Existing program-specific admission remains unchanged: in particular the legacy
-Qwen projection/shared dispatch does not gain this site automatically. Flint
-still has no Program, attention/router binding, body or serve seat. Run the new
-consumer gate and the affected regressions on NVIDIA before claiming device
-support; reconcile full-model coverage only with the actual body integration.
+Qwen projection/shared dispatch does not gain this site automatically. Flint's implemented
+Program binds the real ordinary dense/shared operations. Run the new consumer gate and affected
+regressions on NVIDIA before claiming device support; header coverage is not arithmetic proof.
 ### Selected expert arms and tier scratch
 
 Common card and tier wrappers resolve `LegArms` from their selected `Program`, rather than assuming
@@ -133,18 +130,22 @@ family's activation contract. `LegTier` receives its activation converter at loa
 selected `Program` arms replace the redundant family arm hook. Qwen, Muse, MiMo and
 MiniMax sizing callers propagate checked tier descriptors rather than bypassing
 their validation. Share-budget floors use the same selected reserve calculation.
+`TierLegScratch::input_scales` names an optional physical f32 scale per chunk
+slot. Its checked byte formula includes `4 * chunk * n_used` when enabled,
+including an empty selected-down union; legacy descriptors leave it disabled.
+The same descriptor prices the loader's scale allocation without reserve padding.
 
 A host-only public planner consumer exercised the one-byte boundaries before the first resident layer
 and before adding the other down form, plus descriptor overflow refusal. This proves planning behavior,
 not device allocation or expert arithmetic. The existing CUDA leg, batch and tier gates still need an
-exact-head NVIDIA run. Flint's `Program` admission and body/app/seat remain absent.
+exact-head NVIDIA run. The integration's body/app/seat now consume these selected forms.
 ### Six-slot F32 tier handoff implementation
 
 `HandoffKernels::enqueue_handoff_tier` now selects a genuine six-slot F32 entry
 beside the existing four- and eight-slot entries. Both host and tier layouts must have the
 same supported slot count and activation width; compressed tier images remain
 refused. The entry uses the existing copy/place/fault helpers and the existing
-subsequent go/publication protocol; no Flint router or Program is registered.
+subsequent go/publication protocol; the integration's configured routed block consumes it.
 
 The pure layout contract passed locally after an oxide build.
 `hw_f32_tier_handoffs_conserve_six_and_eight_consumed_routes`, owned by
@@ -163,6 +164,37 @@ capabilities inferred from this primitive.
 `check-ptx-names` remains red until observed spill/JIT-local measurements can pin
 the new entry in the four existing architecture/capability tables. Offline
 no-JIT scans cannot supply that missing column, so no placeholder row is added.
+
+
+### Integrated runtime consumer and NVIDIA handoff
+
+`crates/gpu-flint` loads the validated `ModelSpec`, actual selected projection/expert forms and
+host/NVMe source through the common hosted loader. It implements the common chain, tier,
+rollback and resident-slot interfaces. `app::flint` and `bloomery-serve --model flint` use the
+existing hybrid/tiered seats, tokenizer, original chat template and stop handling.
+
+Head128 attention keeps NoPE and NeoX independent of the readable window, stores f16 KV, and
+uses `Rows::Ring.count` for capacity and checked chunking. For the released model, per-slot KV is
+`2048 * (14*C + 35*min(C,1024))` bytes. Slot state retains high-water positions: at a filled
+1024-row ring a 512-token cut is retained, whereas 513 tokens require reset/refeed.
+
+The routed/shared block loads `(routed + shared) + residual` and the reference's activated-input
+protection: `exp(ceil(log(amax / 1024) * log2(e)).clamp(0,127) * log(2))`. The down output is
+restored before route weighting; this is not an activation clamp. Legacy models keep their
+previous residual association and direct expert inputs without scale buffers or added launches.
+Prompt and tier reservations include the actual optional scales and selected buffer unions.
+
+Run the owning model-free gates `gate-gpu-flint-attn` and `gate-gpu-flint-router`, then the
+full-file `gate-gpu-flint-lib` with the complete GGUF passed through `BLOOMERY_BOX_ENV`.
+Its ignored hardware case compares eager/captured logits, interleaved resident slots,
+reset/refeed and retained/refused ring-boundary transitions. The test must be executed, not
+counted as a pass because it compiles or remains ignored.
+
+NVIDIA acceptance also requires the affected shared expert/residency/tier regressions, exact-head
+oracle comparisons and the existing per-architecture spill/JIT/resource checks. Ten new entries
+currently lack genuine measurements in the four pinned architecture/capability tables; no zero,
+placeholder or copied hardware pin is supplied. Keep the integration Draft until that evidence
+is produced. No ROCm implementation or AMD execution is implied by this CUDA attachment.
 
 
 
@@ -188,7 +220,10 @@ alignment padding, at byte **5,470,528**. Bytes after that boundary were ignored
 `fb0cc4b520f927f0b679193397ee0c36ca252426e7881283c5aa6de3e44a3a2b`.
 The existing Python header reader and Rust `gguf::inventory_of` agree on **779 tensors** and
 **25,049,218,176 encoded tensor bytes**. Shape products total **39,785,287,456 parameters** (derived).
-No full model was downloaded or executed.
+That initial design inspection fetched only the prefix. A later local CPU oracle run used the
+complete 25,054,688,704-byte GGUF (SHA-256
+`63c2ecc461ca545134b670c660e76fa20f47240f8d39b6510bfd21c4dd6e072f`).
+Mainline CPU completion is reference evidence, not execution of this CUDA body.
 
 The official repository says Apache-2.0; this exact GGUF header says `other` / `flint-preview`.
 The config/header shapes and the byte-identical 2,328-byte chat templates establish those contracts,
@@ -290,13 +325,13 @@ requires bias and derives width from a shared-count convention. Invalid mask typ
 norms/sinks/shared matrices, an out-of-range block, impossible KV grouping, zero dimensions,
 nonfinite epsilon/base, overflow and malformed optional bias all need named refusals.
 
-At this snapshot there is no Flint architecture reader or selected program. A reader-only landing
-must keep `program_of=None` and the existing **`Need::Program`** refusal in [coverage][coverage].
-Do not claim runtime support by adding the name to an enum or relaxing a shape/type row.
+The original reader-only landing retained `program_of=None` and `Need::Program` refusals.
+The integration now has actual operation consumers and Program admission; adding a name or
+loosening a type row alone would still not establish runtime support.
 
 ### Concrete common prerequisites
 
-| ID | Current limitation | Required common change before an executable attach |
+| ID | Original gap (design snapshot above) | Required common change / acceptance contract |
 |---|---|---|
 | G1 | NoPE normalization-need generation is present; the executable head128 norm-only binding is missing | Preserve the emitted normalization **or** rotation need; bind head128 normalization with `mode=None` truthfully. No identity-RoPE table. |
 | G2 | Existing head128/group8 attention lacks the complete sink/SWA contract; MiMo's window pass is K192/V128 | Complete the described head128 operation in `rope_neox` / `flash_gqa`, including genuine NoPE append, sink merge, window/ring positions, prompt and slot paths. Never pad heads to 192 or copy MiMo's body. |

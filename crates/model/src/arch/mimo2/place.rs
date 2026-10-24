@@ -121,7 +121,6 @@ pub const TIER_CHUNK: u64 = 16;
 /// plan's rule carries reads (the rule's down arm is the leg's `Q8Act` downs), and the host's rows
 /// and places ([`workstation::tier_leg_batch_bytes`]). The plan reserves them on the tier card and
 /// the host, and the load checks its allocations against them.
-#[must_use]
 pub fn tier_batch(hp: &Hparams, cols: u64) -> Result<TierBatchBytes, PlacementError> {
     workstation::tier_leg_batch_bytes(
         hp.n_embd as u64,
@@ -130,6 +129,7 @@ pub fn tier_batch(hp: &Hparams, cols: u64) -> Result<TierBatchBytes, PlacementEr
         TIER_CHUNK,
         cols,
         DownForms::of(DownAct::Q8Act),
+        false,
     )
 }
 
@@ -215,6 +215,7 @@ mod tests {
         prompt_unit_bytes, tier_batch, tier_reserve_bytes,
     };
     use crate::arch::synthetic::{V, header_shaped};
+    use crate::placement::kernels::{DownAct, DownForms};
     use crate::placement::{KvBytes, PlacementError, PlanLevers, workstation};
 
     /// A file whose next-token layers carry tensors is refused at
@@ -278,10 +279,13 @@ mod tests {
                 TIER_CHUNK,
                 COLS,
                 DownForms::of(DownAct::Q8Act),
-            ).expect("tier bytes")
+                false,
+            )
+            .expect("tier bytes")
         );
         let routed = runtime::layer::hosted(&inputs.spec.layers).map_or(0, |run| run.len());
-        let tiered = workstation::plan_bp(hp.n_trunk, None, tier_batch(hp, COLS).expect("tier bytes"));
+        let tiered =
+            workstation::plan_bp(hp.n_trunk, None, tier_batch(hp, COLS).expect("tier bytes"));
         let plain = workstation::plan_gate(hp.n_trunk);
         assert_eq!(
             inputs.prompt_batch_bytes(&plain).expect("a plain machine"),

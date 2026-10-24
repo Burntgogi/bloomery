@@ -50,7 +50,6 @@ const _: () = assert!(model::arch::qwen35moe::place::LEG_TIER_CHUNK == LEG_CHUNK
 /// Threads per block of both join entries.
 const THREADS: u32 = 256;
 
-
 /// The routed activation the tier runs: `silu(g)·u`. A clamped SwiGLU, and
 /// any other activation, is refused by name.
 fn qwen_act(moe: &Moe) -> Result<Act, GpuError> {
@@ -69,7 +68,6 @@ fn qwen_act(moe: &Moe) -> Result<Act, GpuError> {
         )),
     }
 }
-
 
 /// The host views of the routed layers `run`, the refusal naming the run as
 /// `word`'s. `n_layer` is the description's layer count, so a trunk layer is
@@ -155,7 +153,6 @@ impl LegFamily for Qwen3 {
     fn tier_act(moe: &Moe) -> Result<Act, GpuError> {
         qwen_act(moe)
     }
-
 }
 
 /// Qwen3.6's facts for the common tier node service. The description's
@@ -210,7 +207,6 @@ impl LegFamily for Qwen35 {
     fn tier_act(moe: &Moe) -> Result<Act, GpuError> {
         qwen_act(moe)
     }
-
 }
 
 /// Qwen3-30B's tier node service ([`leg_tier::node_family`]).
