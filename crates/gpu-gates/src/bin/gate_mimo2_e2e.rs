@@ -1837,7 +1837,8 @@ mod gate {
 
     pub fn run() -> Result<(), GateError> {
         let levers = bloomery_levers::at_main(&[CARD_BUDGET])?;
-        crate::gate_card::init()?;
+        // The two-card arm plans its own machine with both cards in view, so it runs before the
+        // gate card, which refuses a census of other than one visible card.
         if std::env::args().any(|a| a == "--two-card") {
             if word_after("--only").is_some() || word_after("--step-sets").is_some() {
                 return Err(
@@ -1849,6 +1850,7 @@ mod gate {
             elapsed("(two-card)", &t);
             return if ok { Ok(()) } else { Err(checks_failed()) };
         }
+        crate::gate_card::init()?;
         let only = only()?;
         let sets = step_sets(only)?;
         if only == Only::Slots {
