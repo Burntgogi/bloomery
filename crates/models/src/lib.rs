@@ -588,6 +588,14 @@ pub enum RouterNorm {
     SelectedSumFloor,
 }
 
+impl RouterNorm {
+    /// Map the legacy normalization flag to its divisor policy.
+    #[must_use]
+    pub const fn from_legacy_bool(norm: bool) -> Self {
+        if norm { Self::SelectedSum } else { Self::None }
+    }
+}
+
 /// The router's score function.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Score {

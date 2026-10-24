@@ -240,11 +240,7 @@ fn pins(hp: &Hparams) -> Result<RouterDims, GpuError> {
     let e = &hp.experts;
     let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
     let mut rule = rules::SOFTMAX_NORM;
-    rule.norm = if e.weights_norm {
-        RouterNorm::SelectedSum
-    } else {
-        RouterNorm::None
-    };
+    rule.norm = RouterNorm::from_legacy_bool(e.weights_norm);
     let router = RouterDims::of(MoeShape {
         rule,
         experts: count(e.n_expert),

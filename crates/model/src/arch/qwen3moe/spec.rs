@@ -79,11 +79,7 @@ pub fn spec_of(
                             HpScore::Softmax => Score::Softmax,
                         },
                         bias: false,
-                        norm: if e.weights_norm {
-                            models::RouterNorm::SelectedSum
-                        } else {
-                            models::RouterNorm::None
-                        },
+                        norm: models::RouterNorm::from_legacy_bool(e.weights_norm),
                         scale: 1.0,
                         hash: false,
                     },
