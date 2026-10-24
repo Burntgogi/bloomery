@@ -341,6 +341,12 @@ A fixture-tier gate reads two inputs: the family's fixture and the `fx_` referen
    the glm5next fixture (at its pinned revision) byte-identical to their files. There, `du -sh` on 2026-10-10 measured
    `glm5next` 8.0 GB, `qwen38` 11 GB, `v41` 16 GB and `v41-r8` (the V4.1 sidecar) 7.3 GB. The V4.1 DSpark draft
    fixture cannot be fetched (its source is the maintainers' own copy), and no set of it is published.
+
+   Real-shape metadata planning can use the verified headers and declared-length sparse files that
+   `tools/type-census.py build ROOT MANIFEST` reconstructs from a pinned census manifest. Their tensor bytes are
+   zero, so they are not inference inputs. Reduced fixtures cannot witness the real model's context pins:
+   `gate-qwen4exp-meta` checks the MTP boundary against its prediction plus one, as well as acceptance there and
+   `CardOver` at the next position, and needs both shared and unshared draft metadata.
 3. **Download the reference sets** into `$BLOOMERY_DATA`. They are `ik`'s output, so a contributor cannot make them, and
    they are published as one dataset, <https://huggingface.co/datasets/midagedev/bloomery-refsets>: 6.48 GB in 17 sets
    and 29,941 files (the dry run of 2026-10-10, `just refset-publish-dry`; `du -sh` of the `fx_*` directories said
