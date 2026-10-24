@@ -1240,7 +1240,10 @@ impl CardLeg {
 fn check_sum(shape: LegShape) -> Result<(), GpuError> {
     match CardSlots::of(shape.slots_per_col) {
         Some(_) => Ok(()),
-        None => Err(CardSlots::refusal(shape.slots_per_col)),
+        None => Err(GpuError::Shape {
+            what: WHAT,
+            detail: format!("the card sum: {}", CardSlots::refusal(shape.slots_per_col)),
+        }),
     }
 }
 
