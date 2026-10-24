@@ -345,6 +345,41 @@ mod tests {
         assert_eq!(ring_pass_bytes(128, 4, 6_144, 3_072, 32), 15_534_408);
     }
 
+    /// The probe's plan and the open's plan keep the same room under the stream: the run sizes the
+    /// ring once from the file it read and plans `streaming` of those bytes; the open describes the
+    /// file again and plans `streaming` of the run's bytes. Both take the plain plan's batch bytes
+    /// plus the ring's [derived from the header's widths, apart from the formula]: two halves of 32
+    /// slots, 1,179,648 B, and the pass's buffers, 81,192 B, 1,260,840 B, and they plan the same
+    /// context and expert counts. Mutant: `streaming` leaves the reserve as it was (both equal the
+    /// plain plan's, the clause naming the ring's bytes reddens).
+    #[test]
+    fn the_probe_and_the_open_keep_the_same_stream_room() {
+        let machine = workstation::plan_gate(LAYERS);
+        let plain = described("mm3-place-plain");
+        let ring = stream_bytes(&plain).expect("the routed stacks");
+        assert_eq!(ring, 1_179_648 + 81_192);
+        let probe = described("mm3-place-probe").streaming(ring);
+        let open = described("mm3-place-open").streaming(ring);
+        let room = |inputs: &PlanInputs| {
+            inputs
+                .prompt_batch_bytes(&machine)
+                .expect("the gate machine names no tier")
+        };
+        assert_eq!(room(&probe), room(&open));
+        assert_eq!(room(&probe), room(&plain) + ring);
+        let levers = PlanLevers::default();
+        let slots = NonZeroUsize::new(1).expect("a slot");
+        let probe_plan = probe
+            .plan_with_slots(&machine, 64, &levers, slots)
+            .expect("the small header plans");
+        let open_plan = open
+            .plan_with_slots(&machine, 64, &levers, slots)
+            .expect("the small header plans");
+        assert_eq!(probe_plan.ctx_max, open_plan.ctx_max);
+        assert_eq!(probe_plan.cards[0].experts, open_plan.cards[0].experts);
+        assert_eq!(probe_plan.host.experts, open_plan.host.experts);
+    }
+
     /// The card's kv class is the layers' stores [derived from the header's widths, apart from the
     /// reader]: 2 key heads × (16 + 16) × 2 B = 128 B of K and V a position, and the 3 sparse
     /// layers (2, 3 and 4) 16 f16 index-key values = 32 B more; at 64 positions the 2 dense layers

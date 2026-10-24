@@ -104,7 +104,7 @@
 //! with a residency machine (`admit` when the card has no room for the
 //! stream's ring), `admit` under a placement with an expert tier card, `off`
 //! everywhere else. A load that streams plans with the stream's room
-//! (`PlanInputs::with_stream`); the open resolves the lever last, after the
+//! (`PlanInputs::with_stream`, asked before the plan by `plans_ring`); the open resolves the lever last, after the
 //! slots, and prints its `xstream=` line (the word, then why) before the
 //! `load` record.
 //!
@@ -131,7 +131,6 @@ use std::time::Instant;
 
 use app::{Prompt, Session};
 use bloomery_gpu::GpuError;
-use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::model::{ChainBody, StepMode};
 use bloomery_gpu_gates::GateError;
 use bloomery_gpu_gates::beside::{self, Beside};
@@ -139,6 +138,7 @@ use bloomery_gpu_gates::bind::{Seat, note_line};
 use bloomery_gpu_gates::generate::{Place, TierRule};
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::side_seat;
+use bloomery_levers::Levers;
 use gguf::Split;
 use model::arch::Arch;
 use model::arch::models::ReasoningFormat;
@@ -152,7 +152,7 @@ use serve::{CacheNote, Saved, ServeError};
 use super::minimaxm3_folder;
 use super::tiered::{self, Open, Read, Tiered};
 
-use super::xstream_rule::{Stage, xstream_rule};
+use super::xstream_rule::{Stage, plans_ring, xstream_rule};
 
 use bloomery_gpu_minimaxm3::Body;
 use bloomery_gpu_minimaxm3::prefill::set_prefill_group;
@@ -184,29 +184,6 @@ pub const ACTS_ON: &[&str] = &[
     bloomery_levers::SCHEMAJUMP,
     bloomery_levers::XSTREAM,
 ];
-
-/// The stage as the unset `BLOOMERY_XSTREAM` rule reads `place` ([`xstream_rule`]): `gate` the
-/// gate's stage, a placement with an expert tier card the tiered one, any other the stage card of
-/// plan (a).
-fn stage(place: Place) -> Stage {
-    if place == Place::Gate {
-        Stage::Other
-    } else if !place.tier_cards().is_empty() {
-        Stage::Tiered
-    } else {
-        Stage::A
-    }
-}
-
-/// Whether the load's prompt calls stream (`split`) by the rule [`xstream_rule`] applies after the
-/// open, so the plan keeps the stream's room before it is made (`PlanInputs::with_stream`): `set`
-/// as given, unset at [`Stage::A`] beside a residency machine.
-fn streams(set: Option<&str>, stage: Stage, residency: Residency) -> bool {
-    match set {
-        Some(word) => word == "split",
-        None => stage == Stage::A && residency != Residency::Off,
-    }
-}
 
 /// The family's input to the common unset rule (`Place::choose`): the one
 /// expert tier card the body hangs, kept only when the plan puts at least this
@@ -242,9 +219,8 @@ impl MiniMax {
             None => minimaxm3_folder::model_at(&a.path)?,
         };
         let inputs = model::arch::minimaxm3::place::PlanInputs::describe(file.header())?;
-        let stage = stage(a.place);
-        let inputs = if streams(a.xstream, stage, a.residency) {
-            inputs.with_stream()?
+        let inputs = if a.ring {
+            MiniMax::with_ring(inputs)?
         } else {
             inputs
         };
@@ -288,7 +264,7 @@ impl MiniMax {
         // The expert stream last: a started ring takes the card's free bytes past its keep, so
         // every card buffer the open makes comes before it.
         let (gpu, _, body) = s.model_mut().body_parts(NAME)?;
-        let line = xstream_rule(gpu, body, a.xstream, stage, a.residency)?;
+        let line = xstream_rule(gpu, body, a.xstream, Stage::of(a.place), a.residency)?;
         eprintln!("{line}");
         if let Some((card, rate)) = &a.lane {
             record::lane(card, rate).eprint();
@@ -406,6 +382,22 @@ impl Tiered for MiniMax {
 
     fn accepts(arch: Arch) -> bool {
         matches!(arch, Arch::MiniMaxM3)
+    }
+
+    /// The ring is kept out of the expert budget where the common rule starts the stream at
+    /// `split` ([`plans_ring`]).
+    fn ring(levers: &Levers, place: Place) -> bool {
+        plans_ring(
+            levers.xstream(),
+            Stage::of(place),
+            levers.residency() == Some("off"),
+        )
+    }
+
+    /// The inputs of a plan that keeps the stream's ring and its ring pass's buffers out of the
+    /// expert budget (`PlanInputs::with_stream`).
+    fn with_ring(inputs: PlanInputs<Self::H>) -> Result<PlanInputs<Self::H>, GateError> {
+        Ok(inputs.with_stream()?)
     }
 
     /// A checkpoint folder's open is [`minimaxm3_folder::open`], as the end-to-end gates' seat
