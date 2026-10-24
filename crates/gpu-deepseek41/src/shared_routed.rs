@@ -491,7 +491,7 @@ fn describe<R: RouterEntry>(layers: &[LayerSpec]) -> Result<Described, GpuError>
             || m.latent.is_some()
             || r.score != Score::Sigmoid
             || !r.bias
-            || !r.norm
+            || r.norm != models::RouterNorm::SelectedSum
             || r.hash
             || shared.sigmoid_gate
         {

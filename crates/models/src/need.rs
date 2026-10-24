@@ -11,8 +11,8 @@ use gguf::GgmlType;
 use crate::shape::MoeShape;
 use crate::{
     Act, Collapse, DeltaKind, EngramSpec, Extra, Ffn, GdnGate, HcKind, HcMix, IndexKeys, KdaGate,
-    LatentUp, LayerIdx, Mixer, ModelSpec, NgramRule, OutGate, PoolRule, Residual, RopeMode, Score,
-    Selector, Source,
+    LatentUp, LayerIdx, Mixer, ModelSpec, NgramRule, OutGate, PoolRule, Residual, RopeMode,
+    RouterNorm, Score, Selector, Source,
 };
 
 /// A feature of a file the engine does not run yet: what it is, and the layer
@@ -370,8 +370,12 @@ impl fmt::Display for Need {
                 if rule.bias {
                     f.write_str(", with a selection bias")?;
                 }
-                if !rule.norm {
-                    f.write_str(", kept weights not renormalized")?;
+                match rule.norm {
+                    RouterNorm::None => f.write_str(", kept weights not renormalized")?,
+                    RouterNorm::SelectedSum => {}
+                    RouterNorm::SelectedSumFloor => {
+                        f.write_str(", kept weights divided by max(selected sum, 2^-14)")?;
+                    }
                 }
                 if rule.gated {
                     f.write_str(", the shared expert's gate as one more row")?;

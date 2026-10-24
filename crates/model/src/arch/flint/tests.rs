@@ -125,7 +125,8 @@ fn masks_are_independent_and_nope_still_requires_head_norm() {
             Ffn::Moe(m) => {
                 assert!(l > 0);
                 assert_eq!((m.experts, m.top_k, m.expert_ff), (8, 2, 8));
-                assert!(m.router.norm && !m.router.bias);
+                assert!(!m.router.bias);
+                assert_eq!(m.router.norm, models::RouterNorm::SelectedSumFloor);
                 let shared = m.shared.as_ref().unwrap();
                 assert_eq!(shared.ff, 16);
                 assert!(!shared.sigmoid_gate);
@@ -248,6 +249,51 @@ fn router_scale_defaults_only_when_absent() {
                 .count(),
             usize::from(scale.is_none())
         );
+    }
+}
+
+#[test]
+fn normalization_policy_is_architecture_specific_and_bias_is_selection_only() {
+    for norm in [false, true] {
+        for bias in [false, true] {
+            let mut kv = keys();
+            kv.iter_mut()
+                .find(|(k, _)| *k == "expert_weights_norm")
+                .unwrap()
+                .1 = V::Bool(norm);
+            let mut ts = tensors();
+            if bias {
+                for l in 1..4 {
+                    ts.push((format!("blk.{l}.exp_probs_b.bias"), vec![8]));
+                }
+            }
+            let r = check("router-policy", &kv, &ts).unwrap();
+            let expected = if norm {
+                models::RouterNorm::SelectedSumFloor
+            } else {
+                models::RouterNorm::None
+            };
+            let uncovered = crate::arch::coverage::check(&r.spec, &r.tensors);
+            for layer in &r.spec.layers[1..] {
+                let Ffn::Moe(m) = &layer.ffn else {
+                    panic!("not routed")
+                };
+                assert_eq!(m.router.norm, expected);
+                assert_eq!(m.router.bias, bias);
+                let shape = models::shape::MoeShape::of(m);
+                assert_eq!(shape.rule.norm, expected);
+                assert_eq!(shape.rule.bias, bias);
+                assert_eq!(
+                    models::shape::select_router(shape).unwrap_err().why,
+                    models::shape::Refusal::NoRouterRule
+                );
+                assert!(
+                    uncovered
+                        .iter()
+                        .any(|u| u.feature == Need::Router(shape).to_string())
+                );
+            }
+        }
     }
 }
 

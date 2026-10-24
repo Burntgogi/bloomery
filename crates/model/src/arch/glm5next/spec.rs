@@ -110,7 +110,11 @@ pub fn spec_of(
                 router: Router {
                     score: Score::Sigmoid,
                     bias: bias(l),
-                    norm: hp.weights_norm,
+                    norm: if hp.weights_norm {
+                        models::RouterNorm::SelectedSum
+                    } else {
+                        models::RouterNorm::None
+                    },
                     scale: hp.weights_scale,
                     hash: false,
                 },

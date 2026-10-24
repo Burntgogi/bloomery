@@ -22,7 +22,7 @@ use model::arch::coverage::turns_as_neox;
 use model::arch::models::shape::MoeShape;
 use model::arch::models::{
     Act, DeltaKind, Extra, Ffn, GdnGate, Gqa, HcKind, KHeadMap as SpecMap, Mixer, ModelSpec,
-    NgramRule, OutGate, PoolRule, Residual, Score, Selector,
+    NgramRule, OutGate, PoolRule, Residual, RouterNorm, Score, Selector,
 };
 
 /// What the plan's refusals name.
@@ -383,7 +383,7 @@ pub(super) fn read(spec: &ModelSpec) -> Result<Shape38, GpuError> {
             sh.ff as usize == geo::FF && sh.sigmoid_gate && sh.act == Act::SwiGlu { limit: None }
         });
         let plain = m.router.score == Score::Softmax
-            && m.router.norm
+            && m.router.norm == RouterNorm::SelectedSum
             && !m.router.bias
             && !m.router.hash
             && m.router.scale == 1.0;

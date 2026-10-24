@@ -235,7 +235,7 @@ fn hw_nemotron_h_moe_header() {
                     || m.act != Act::ReluSqr
                     || m.router.score != Score::Sigmoid
                     || !m.router.bias
-                    || !m.router.norm
+                    || m.router.norm != models::RouterNorm::SelectedSum
                     || m.router.scale != 5.0
                     || m.router.hash
                     || (sh.ff, sh.act, sh.sigmoid_gate) != (5376, Act::ReluSqr, false)

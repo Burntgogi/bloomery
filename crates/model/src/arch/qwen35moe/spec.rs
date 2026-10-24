@@ -254,7 +254,7 @@ pub(super) fn routed_at(
         router: Router {
             score: Score::Softmax,
             bias: false,
-            norm: true,
+            norm: models::RouterNorm::SelectedSum,
             scale: 1.0,
             hash: false,
         },

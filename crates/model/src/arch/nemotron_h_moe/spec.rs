@@ -43,7 +43,11 @@ pub fn spec_of(hp: &Hparams, chat: models::ChatSpec) -> Result<ModelSpec, Placem
     let router = Router {
         score: Score::Sigmoid,
         bias: true,
-        norm: hp.weights_norm,
+        norm: if hp.weights_norm {
+            models::RouterNorm::SelectedSum
+        } else {
+            models::RouterNorm::None
+        },
         scale: hp.weights_scale,
         hash: false,
     };
@@ -423,7 +427,8 @@ mod tests {
                     assert_eq!((m.top_k, m.latent), (2, Some(LATENT as u32)));
                     assert_eq!(m.act, Act::ReluSqr);
                     assert_eq!(m.router.score, Score::Sigmoid);
-                    assert!(m.router.bias && m.router.norm && !m.router.hash);
+                    assert!(m.router.bias && !m.router.hash);
+                    assert_eq!(m.router.norm, models::RouterNorm::SelectedSum);
                     assert_eq!(m.router.scale, 5.0);
                     let sh = m.shared.expect("a shared expert");
                     assert_eq!((sh.ff, sh.act, sh.sigmoid_gate), (24, Act::ReluSqr, false));

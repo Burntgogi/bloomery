@@ -95,7 +95,7 @@ pub fn spec_of(
                     bias: bias(l),
                     // The builder passes the renormalization as a constant
                     // (mimo2.cpp:218).
-                    norm: true,
+                    norm: models::RouterNorm::SelectedSum,
                     scale: hp.weights_scale,
                     hash: false,
                 },

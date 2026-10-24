@@ -2221,9 +2221,9 @@ pub(crate) fn layer_cfg(
         Ffn::Dense { ff, act } => (limit_of(*act)?, *ff as usize, false),
         Ffn::Moe(m) => {
             let r = &m.router;
-            if r.score != Score::Sigmoid || !r.norm || r.hash {
+            if r.score != Score::Sigmoid || r.norm != models::RouterNorm::SelectedSum || r.hash {
                 return Err(shape(format!(
-                    "layer {l}: a router scoring by {:?}, renormalizing {}, hashed {}; the \
+                    "layer {l}: a router scoring by {:?}, normalization {:?}, hashed {}; the \
                      routed block runs the sigmoid router that renormalizes its picks, unhashed",
                     r.score, r.norm, r.hash
                 )));
