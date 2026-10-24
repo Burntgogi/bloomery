@@ -529,7 +529,10 @@ fn qwen36_inputs() -> q35::PlanInputs {
 fn qwen36_tier(stage: CardSpec, tier: CardSpec) -> Result<(u64, u64, u64), Place35Error> {
     let inputs = qwen36_inputs();
     let machine = tiered(
-        Q36_LAYERS, stage, tier, q35::leg_tier_batch(&inputs.hp).expect("tier batch bytes"),
+        Q36_LAYERS,
+        stage,
+        tier,
+        q35::leg_tier_batch(&inputs.hp).expect("tier batch bytes"),
     );
     let plan = inputs.plan_rule(
         &machine,
@@ -546,7 +549,10 @@ fn qwen36_tier(stage: CardSpec, tier: CardSpec) -> Result<(u64, u64, u64), Place
 fn qwen3_30b_q8_bp_tier_experts() {
     let inputs = qwen3_inputs();
     let machine = tiered(
-        Q3_LAYERS, A6000, RTX_3090, q3::tier_batch(&inputs.hp).expect("tier batch bytes"),
+        Q3_LAYERS,
+        A6000,
+        RTX_3090,
+        q3::tier_batch(&inputs.hp).expect("tier batch bytes"),
     );
     let plan = inputs
         .plan(&machine, CTX, &PlanLevers::default())

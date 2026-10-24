@@ -298,6 +298,7 @@ mod gate {
             host: levers.host(),
             residency: Residency::Off,
             group: 1,
+            slots: std::num::NonZeroUsize::MIN,
         };
         let pass = bits(&file, &cfg, &inputs)?;
         println!("{NAME}: {}", tier::tally_line());

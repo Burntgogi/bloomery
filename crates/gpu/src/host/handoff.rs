@@ -281,8 +281,8 @@ mod handoff_kernels {
         unsafe { handoff_at::<SLOTS_8>(&a, d, &mut image, &mut sel) };
     }
 
-    /// [`ds41_ffn_handoff`] and the row's f32 tier image, with the same
-    /// per-thread writes and following go as [`ds41_ffn_handoff_8_tier`].
+    /// Six slots' f32 tier image, with the same per-thread writes and
+    /// following go as the four- and eight-slot tier entries.
     #[allow(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
@@ -1630,8 +1630,10 @@ impl HandoffKernels {
 /// slot entries. The generated launch checks the input and output spans.
 fn check_tier(lay: &HandoffLayout, tl: &TierImageLayout) -> Result<HandoffSlots, GpuError> {
     let slots = HandoffSlots::of(lay.n_used);
-    if !matches!(slots, Ok(HandoffSlots::Four | HandoffSlots::Six | HandoffSlots::Eight))
-        || tl.n_used != lay.n_used
+    if !matches!(
+        slots,
+        Ok(HandoffSlots::Four | HandoffSlots::Six | HandoffSlots::Eight)
+    ) || tl.n_used != lay.n_used
         || tl.x_len != lay.hidden
         || tl.q3_words != 0
         || tl.d8_len != 0
