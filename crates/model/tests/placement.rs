@@ -1371,6 +1371,7 @@ fn layered_model(layers: usize) -> ModelTensors {
 fn byte_card(name: &str, usable: u64, layers: Range<usize>) -> Card {
     Card {
         name: name.to_string(),
+        tier_leg: None,
         device: None,
         usable_bytes: usable,
         context_bytes: 0,
