@@ -169,8 +169,8 @@ const LIST_ROWS: u32 = 40_960;
 // The largest context each card holds with the draft (full head), as predicted [derived: the plan
 // test's room after its fixed terms, less the draft granules 2,785,017,856 B, the map 993,280 B
 // and the arena 48,808,108 B, over 30,720 B a position — the cache's 28,416, the draft store's
-// 2,048 and the stage rope table's 256 — the last pool counted whole, then one fewer]. Printed
-// beside the boundary the test finds; the clause holds the plan to that boundary.
+// 2,048 and the stage rope table's 256 — the last pool counted whole, then one fewer]. The clause
+// holds the boundary to this prediction plus one, as well as checking both sides of the boundary.
 // PIN(2026-10-15): the arena stays one fixed addend (mtp_arena_bytes at vocab 248,320). Room
 // 37,251,097,876 (A6000) and 11,649,066,260 (3090) over 30,720 is 1,212,600 and 379,201; the pin
 // is one fewer.
@@ -393,12 +393,12 @@ fn hw_qwen4exp_mtp_plan() {
         check(
             &mut o,
             format!(
-                "{} with the draft holds ctx {lo} ({at_max}; predicted {predicted}) and breaks \
+                "{} with the draft holds ctx {lo} ({at_max}; predicted {predicted} + 1) and breaks \
                  with CardOver at {} ({past})",
                 card.name,
                 lo + 1
             ),
-            at_max && past,
+            lo == predicted + 1 && at_max && past,
         );
     }
     let own = Split::open(OWN).unwrap_or_else(|e| panic!("open {OWN}: {e}"));
