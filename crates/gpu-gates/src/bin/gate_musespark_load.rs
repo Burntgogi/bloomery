@@ -27,8 +27,9 @@
 //!   the card's experts at slots `0..n_l` in id order and the host mark on
 //!   the rest, and the layer's card count is the plan's.
 //! - `resident_inside_the_plan`: what the load holds on the card (the
-//!   weights, the K/V planes, the step's buffers, the host boundary) stays
-//!   inside the plan's terms for them.
+//!   weights, the K/V planes, the step's buffers, the host boundary, the
+//!   prompt pass's buffers) stays inside the plan's terms for them, the
+//!   prompt reserve among them.
 
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
@@ -380,16 +381,24 @@ mod gate {
         Ok(bad.is_empty())
     }
 
-    fn resident_inside_the_plan(m: &Model, plan: &Plan<'_>) -> Result<bool, GateError> {
+    fn resident_inside_the_plan(
+        m: &Model,
+        plan: &Plan<'_>,
+        prompt_reserve: u64,
+    ) -> Result<bool, GateError> {
         const CLAUSE: &str = "resident_inside_the_plan";
         let c = &plan.cards[0];
         let resident = m.resident_bytes() as u64;
-        let planned =
-            c.dense_bytes + c.expert_bytes + c.kv_bytes + c.stage_rows_bytes + c.scratch_bytes;
+        let planned = c.dense_bytes
+            + c.expert_bytes
+            + c.kv_bytes
+            + c.stage_rows_bytes
+            + c.scratch_bytes
+            + prompt_reserve;
         let pass = resident <= planned;
         println!(
             "{CLAUSE}: resident {resident} B (runtime value) against the plan's dense + experts + \
-             kv + stage rows + scratch {planned} B {}",
+             kv + stage rows + scratch + prompt reserve {planned} B {}",
             verdict(pass)
         );
         Ok(pass)
@@ -440,7 +449,7 @@ mod gate {
             ),
             (
                 "resident_inside_the_plan",
-                Box::new(|| resident_inside_the_plan(&m, &plan)),
+                Box::new(|| resident_inside_the_plan(&m, &plan, inputs.prompt_reserve)),
             ),
         ];
         // Every clause is self-consistency, run in both tiers; the first read
