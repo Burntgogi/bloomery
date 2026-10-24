@@ -101,6 +101,9 @@ checked sizing arithmetic is used by allocation and planning; malformed or overf
 descriptors are refused by name. The plan records the selected reserve, and loaders check that amount
 instead of the machine descriptor's upper bound. No always-both allocation or reserve-equality waiver
 is used.
+Host-only projections intentionally have no card totals: fixed reserves remain owned by their machine.
+Only a dynamic tier-leg descriptor requires the plan's selected card totals. The existing node paging
+budget regression exercises this distinction without a GPU, including OS reserve and constrained host room.
 
 A host-only public planner consumer exercised the one-byte boundaries before the first resident layer
 and before adding the other down form, plus descriptor overflow refusal. This proves planning behavior,
