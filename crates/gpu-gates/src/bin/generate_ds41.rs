@@ -389,7 +389,7 @@ mod drive {
         format!(
             "usage: generate_ds41 [--prompt-id P | --tokens a,b,c] [--depth D] [-n N] [--ctx C] \
              [--place a|gate|bp|<stage>[+<tier>…]] [--mode eager|graph] [--time [--warm W]] \
-             [--plan] [--logits] [--warm-save] {}, or --arm SPEC [--arm SPEC ...] [--arm-sync] \
+             [--plan] [--logits] [--warm-save] [--seat-dspark] {}, or --arm SPEC [--arm SPEC ...] [--arm-sync] \
              in place of the prompt flags",
             Diag::USAGE
         )
@@ -482,6 +482,11 @@ mod drive {
         /// `--warm-save`: fold the run's residency usage into the
         /// `BLOOMERY_WARM_PROFILE` file at its end.
         warm_save: bool,
+        /// `--seat-dspark`: the plan sets the DSpark draft's bytes aside on
+        /// its card (`BLOOMERY_DSPARK_MODEL`'s header) and the run opens no
+        /// draft, so a plain run plans the card a `BLOOMERY_DRAFT=dspark` run
+        /// does.
+        seat_dspark: bool,
         /// The shared diagnosis flags ([`Diag`]).
         diag: Diag,
         /// Whether this run is the one `--dump-table` reads.
@@ -504,6 +509,7 @@ mod drive {
             sync: false,
             logits: false,
             warm_save: false,
+            seat_dspark: false,
             diag: Diag::default(),
             dump_now: false,
         };
@@ -529,6 +535,10 @@ mod drive {
             }
             if flag == "--warm-save" {
                 a.warm_save = true;
+                continue;
+            }
+            if flag == "--seat-dspark" {
+                a.seat_dspark = true;
                 continue;
             }
             if a.diag.take(&flag, &mut it)? {
@@ -859,9 +869,18 @@ mod drive {
             .ok_or("generate_ds41: no arm to run")?;
         let (depth, fed_n) = (widest.ids.len() / slots, widest.a.n_gen);
         let fed = depth + fed_n - 1;
-        let draft_file = match draft {
-            Draft::Dspark => Some(dspark::draft_hparams()?),
-            _ => None,
+        if a.seat_dspark && draft != Draft::Off {
+            return Err(format!(
+                "--seat-dspark plans a plain run's draft seat; BLOOMERY_DRAFT={} opens a draft \
+                 that seats itself",
+                draft.name()
+            )
+            .into());
+        }
+        let draft_file = if draft == Draft::Dspark || a.seat_dspark {
+            Some(dspark::draft_hparams()?)
+        } else {
+            None
         };
         let path = ref_model_path()?;
         let seat = match &draft_file {
@@ -971,7 +990,11 @@ mod drive {
             .ok_or("generate_ds41: the open planned nothing")?;
         // The draft builds the target's feature tap, so it loads before the
         // capture: the captured step then carries the tap.
-        let spark = match draft_file.as_ref().zip(seat) {
+        let spark = match draft_file
+            .as_ref()
+            .zip(seat)
+            .filter(|_| draft == Draft::Dspark)
+        {
             Some((file, seat)) => {
                 let (d, load) =
                     open_dspark(&mut loaded, file, &path, "generate_ds41", a.place, seat)?;
