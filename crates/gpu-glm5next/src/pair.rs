@@ -43,6 +43,7 @@
 //! rows' records moved.
 
 use bloomery_gpu::checkpoint::Checkpoints;
+use bloomery_gpu::draft::Held;
 use bloomery_gpu::head::Head;
 use bloomery_gpu::host::shell::TierShell;
 use bloomery_gpu::hybrid::Chain;
@@ -55,7 +56,7 @@ use runtime::seqstate::{Kept, Why};
 
 use model::arch::glm5next::place::KdaLanes;
 
-use super::nextn::{Held, Wrote};
+use super::nextn::Wrote;
 use super::{
     Body, GlmSlot, LANES, Parts, Plant, RowBind, RowScratch, Scratch, SeqParts, StepInput, Store,
     cut_into, held_at, shape,
@@ -184,7 +185,7 @@ impl Body {
         write_row(stream, r, &self.embd.streams, p)?;
         self.held = p + 1;
         if row == 0 {
-            self.wrote.step = super::nextn::Held::at(p, 1);
+            self.wrote.step = Held::at(p, 1);
         }
         Ok(())
     }
@@ -246,7 +247,7 @@ impl Body {
             pos0: pos,
             rows: LANES as u32,
         });
-        self.wrote.pair = super::nextn::Held::at(pos, LANES as u32);
+        self.wrote.pair = Held::at(pos, LANES as u32);
         Ok(())
     }
 
