@@ -914,7 +914,7 @@ mod tests {
                     top_k: USED as u32,
                     expert_ff: FF as u32,
                     latent: None,
-                    pre_exp_norm: None,
+                    pre_exp_norm: false,
                     post_exp_norm: None,
                     act: models::Act::SwiGlu { limit: None },
                     router: Router {

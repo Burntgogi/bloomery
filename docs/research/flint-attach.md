@@ -196,8 +196,14 @@ currently lack genuine measurements in the four pinned architecture/capability t
 placeholder or copied hardware pin is supplied. Keep the integration Draft until that evidence
 is produced. No ROCm implementation or AMD execution is implied by this CUDA attachment.
 
-
-
+Local CPU smoke on the complete artifact exercised all 47 routed layers with six fixed selected
+experts, two columns and input amplitudes 1/8192. Single-column and union execution compared
+385,024 f32 cells bit-for-bit (zero differences), with finite outputs and bounded protected
+activations. This is actual expert-weight execution, not a whole-model decode or GPU oracle.
+A separate public planner consumer checked group sizes 1/8, contexts 512/1024/2048 and slots 1/3;
+all 12 plans conserved full/window KV bytes and repeated group configuration charged no second reserve.
+The compiled CLI lists the Flint seat; opening it on this AMD-only machine stops at the named
+NVIDIA R580+/`libcuda.so.1` prerequisite, so no HTTP generation run is reported.
 
 ## 1. Sources and observed artifact
 
