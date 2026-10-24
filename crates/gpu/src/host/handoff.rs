@@ -18,7 +18,7 @@
 //! one launch ([`HandoffKernels::enqueue_handoff_cols`]);
 //! [`HandoffKernels::enqueue_places_cols`] writes the places alone of such a
 //! row, for a walk whose routing reaches the host by a download, through
-//! `crate::card_slots`' `ds41_ffn_places`. `ds41_ffn_handoff_6_tier` and
+//! `crate::card_slots`' `ds41_ffn_places`. `ffn_handoff_6_tier` and
 //! `ds41_ffn_handoff_8_tier` hand over six or eight slots of a layer an
 //! expert tier holds experts of: the same writes, the slots' tier places and the activation in f32 into
 //! the row's tier image ([`HandoffKernels::enqueue_handoff_tier`]);
@@ -310,7 +310,7 @@ mod handoff_kernels {
             tsel.len() >= 6
         )
     )]
-    pub fn ds41_ffn_handoff_6_tier(
+    pub fn ffn_handoff_6_tier(
         ids_in: &[u32],
         w_in: &[f32],
         map: &[u32],
@@ -1347,7 +1347,7 @@ impl HandoffKernels {
 
 impl HandoffKernels {
     /// Enqueue the handoff of a tier layer of six or eight slots a token
-    /// (`ds41_ffn_handoff_6_tier` or `ds41_ffn_handoff_8_tier`):
+    /// (`ffn_handoff_6_tier` or `ds41_ffn_handoff_8_tier`):
     /// [`HandoffKernels::enqueue_handoff`]'s
     /// writes into `target`, and each slot's tier place (from `tmap`, the
     /// slot map's tier copy at the card copy's row offsets) into `tsel` and
@@ -1372,7 +1372,7 @@ impl HandoffKernels {
         let slots = check_tier(&lay, &tl)?;
         let what = match slots {
             HandoffSlots::Four => "ds41_ffn_handoff_4_tier",
-            HandoffSlots::Six => "ds41_ffn_handoff_6_tier",
+            HandoffSlots::Six => "ffn_handoff_6_tier",
             _ => "ds41_ffn_handoff_8_tier",
         };
         let n = lay.hidden;
@@ -1418,8 +1418,8 @@ impl HandoffKernels {
                 )?;
             }
             HandoffSlots::Six => {
-                let prep = self.module.prepare_ds41_ffn_handoff_6_tier(cfg)?;
-                self.module.ds41_ffn_handoff_6_tier(
+                let prep = self.module.prepare_ffn_handoff_6_tier(cfg)?;
+                self.module.ffn_handoff_6_tier(
                     stream,
                     &prep,
                     h.ids,
