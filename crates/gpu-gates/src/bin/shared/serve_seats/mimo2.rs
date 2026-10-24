@@ -16,7 +16,7 @@
 //!                    [--host 127.0.0.1] [--port 8080] [--ctx C] [--alias NAME]
 //!                    [--chat-template-file PATH] [--place W] [--plan]
 //!                    [--cache-ram MIB] [--prefill batch|steps] [--parallel N]
-//!                    [--queue-depth Q]
+//!                    [--queue-depth Q] [--slot-save-path DIR]
 //!                    [--api-key KEY] [--api-key-file FNAME]
 //!
 //! The server takes `-m`/`--hf` out before this seat parses (its module
@@ -100,6 +100,8 @@
 //! budget (`bind::CacheRam`: unset, the default; `0` turns it off). A saved
 //! state is the body's sequence (`seq_save`): every layer's K and V up to the
 //! position, a window layer its ring. A second session reuses a saved prefix.
+//! `--slot-save-path DIR` names the directory the slot actions answer from (none
+//! refuses every one, as llama-server does): `erase` drops the slot's cache.
 //!
 //! `BLOOMERY_RESIDENCY` is the common machine's lever: set, its word as given
 //! (refused by name beside `--prefill steps`, and where the plan's card slots
@@ -161,7 +163,8 @@ const NAME: &str = "bloomery-serve-mimo2";
 const USAGE: &str = "usage: bloomery-serve --model mimo2 [-m PATH | --hf <repo>[:<quant>]] \
                      [--host H] [--port P] [--ctx C] [--alias NAME] [--chat-template-file PATH] \
                      [--place W] [--plan] [--cache-ram MIB] [--prefill batch|steps] \
-                     [--parallel N] [--queue-depth Q] [--api-key KEY] [--api-key-file FNAME]";
+                     [--parallel N] [--queue-depth Q] [--slot-save-path DIR] \
+                     [--api-key KEY] [--api-key-file FNAME]";
 
 /// The levers this seat acts on: the plan's card budget and the host set's
 /// load settings, which the open reads (`PlanLevers::from_levers`,

@@ -256,7 +256,8 @@ pub fn place_word(
 /// `--port`, `--queue-depth`), the keys (`--api-key`, `--api-key-file`), the
 /// context (`--ctx`, under every spelling `serve::flag::CTX` lists), the
 /// placement word (`--place`, read by [`place_word`]), the alias, the chat
-/// template file, `--parallel` (and `-np`) and `--plan`.
+/// template file, the slot actions' directory (`--slot-save-path`),
+/// `--parallel` (and `-np`) and `--plan`.
 pub struct SeatFlags {
     pub host: String,
     pub port: u16,
@@ -272,6 +273,9 @@ pub struct SeatFlags {
     /// `--api-key`/`--api-key-file`: the keys every request is checked
     /// against ([`serve::flag::ApiKeys`]).
     pub api_keys: serve::flag::ApiKeys,
+    /// `--slot-save-path`: the directory the slot actions answer from; `None`
+    /// refuses every one.
+    pub slot_save_path: Option<PathBuf>,
 }
 
 impl SeatFlags {
@@ -295,6 +299,7 @@ impl SeatFlags {
             parallel: None,
             queue_depth: None,
             api_keys: serve::flag::ApiKeys::default(),
+            slot_save_path: None,
         };
         let mut it = args.iter().map(String::as_str);
         while let Some(flag) = it.next() {
@@ -317,6 +322,7 @@ impl SeatFlags {
                 TemplateFile::FLAG => a.template_file.set(v),
                 "--parallel" | "-np" => a.parallel = Some(serve::flag::number(flag, v)?),
                 "--queue-depth" => a.queue_depth = Some(serve::flag::number(flag, v)?),
+                "--slot-save-path" => a.slot_save_path = Some(PathBuf::from(v)),
                 f if serve::flag::KEYS.contains(&f) => a.api_keys.add(f, v)?,
                 other => {
                     if !own(other, v)? {
@@ -335,9 +341,9 @@ impl SeatFlags {
     }
 
     /// [`bind_server`] over `engine` with these flags: the alias the flag
-    /// gave or `chat`'s, `chat`'s template, no request preparation, no slot
-    /// file path, `slots` slots the seat made at its open, the server
-    /// settings from `levers`, and the side model beside it.
+    /// gave or `chat`'s, `chat`'s template, no request preparation, the slot
+    /// file path the flag gave, `slots` slots the seat made at its open, the
+    /// server settings from `levers`, and the side model beside it.
     pub fn bind(
         self,
         engine: SeatEngine,
@@ -353,6 +359,7 @@ impl SeatFlags {
             alias,
             api_keys,
             queue_depth,
+            slot_save_path,
             ..
         } = self;
         bind_server(
@@ -364,7 +371,7 @@ impl SeatFlags {
                 path,
                 template: chat.template,
                 preparation: None,
-                slot_save_path: None,
+                slot_save_path,
                 api_keys,
                 parallel: slots,
                 queue_depth,
@@ -3669,6 +3676,32 @@ mod tests {
             let e = refused.expect_err("b2").to_string();
             assert!(e.starts_with("--place is a, gate, bp"), "{e}");
         }
+    }
+
+    /// The seats that read their flags through [`SeatFlags`] take `--slot-save-path` as one flag:
+    /// unset it is `None`, which refuses every slot action, and given it is the directory; with no
+    /// value the flag is refused by name.
+    #[test]
+    fn the_seats_take_the_slot_save_path_through_the_common_flags() {
+        use super::SeatFlags;
+        let parse = |args: &[&str]| {
+            let args: Vec<String> = args.iter().map(|a| (*a).to_owned()).collect();
+            SeatFlags::parse(&args, "usage", |_, _| Ok(false))
+        };
+        assert_eq!(parse(&[]).expect("unset").slot_save_path, None);
+        assert_eq!(
+            parse(&["--slot-save-path", "/slots"])
+                .expect("given")
+                .slot_save_path,
+            Some(std::path::PathBuf::from("/slots"))
+        );
+        let Err(e) = parse(&["--slot-save-path"]) else {
+            panic!("a --slot-save-path with no value was taken");
+        };
+        assert!(
+            e.to_string().starts_with("--slot-save-path needs a value"),
+            "{e}"
+        );
     }
 
     mod media {

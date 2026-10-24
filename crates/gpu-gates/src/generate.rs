@@ -2084,19 +2084,23 @@ mod tests {
                     on_a(layers),
                     workstation::plan_a_draft(layers, draft).expect("the stage holds the draft")
                 );
+                // PIN(2026-10-24): the holder is the draft seat's, so no draft plans no holder card;
+                // was the holder planned beside no draft.
                 let held = Place::A.machine(seat(1, Some(RTX_3090)), None).expect("a");
+                let holders: &[CardSpec] = if draft.is_some() { &[RTX_3090] } else { &[] };
                 assert_eq!(
                     held(layers),
                     workstation::plan_holding(
                         layers,
                         A6000,
                         &[],
-                        &[RTX_3090],
+                        holders,
                         seat(1, None).map(|s| s.reserve),
                         workstation::NO_TIER_BATCH
                     )
                     .expect("the 3090 holds the draft")
                 );
+                assert_eq!(held(layers).tiers.len(), usize::from(draft.is_some()));
             }
         }
     }
