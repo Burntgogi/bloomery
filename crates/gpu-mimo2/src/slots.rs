@@ -36,7 +36,7 @@ use bloomery_gpu::host::run::HostRun;
 use bloomery_gpu::host::shell::TierShell;
 use bloomery_gpu::hybrid::{Chain, HandoffTarget};
 use bloomery_gpu::kquant::Act;
-use bloomery_gpu::model::{ChainBody, RowHeads, SlotRange, SlotRows};
+use bloomery_gpu::model::{ChainBody, RowHeads, SlotRange, SlotRowOrder, SlotRows};
 use bloomery_gpu::rope_neox::K192Args;
 use bloomery_gpu::routed_block::{RouteBlock, RoutedRows};
 use bloomery_gpu::site;
@@ -144,28 +144,6 @@ impl PassBufs {
     }
 }
 
-/// The rows of a pass of `rows`, once they tile `0..R` in order with no empty
-/// range; else refused by name.
-fn pass_rows(rows: &[SlotRange]) -> Result<usize, GpuError> {
-    let mut at = 0;
-    for r in rows {
-        if r.rows.start != at || r.rows.is_empty() {
-            return Err(shape_in(
-                PASS,
-                format!(
-                    "slot {}'s rows {:?}; the ranges tile the pass in order from row 0",
-                    r.slot, r.rows
-                ),
-            ));
-        }
-        at = r.rows.end;
-    }
-    if at == 0 {
-        return Err(shape_in(PASS, "a pass of no row"));
-    }
-    Ok(at)
-}
-
 impl SlotRows for Body {
     const MAX_ROWS: usize = MAX_ROWS;
     const HEADS: RowHeads = RowHeads::One;
@@ -244,7 +222,10 @@ impl Body {
         rows: &[SlotRange],
         ids: &[u32],
     ) -> Result<(), GpuError> {
-        let total = pass_rows(rows)?;
+        let total = SlotRowOrder::Any.tiled_rows(PASS, rows)?;
+        if total == 0 {
+            return Err(shape_in(PASS, "a pass of no row"));
+        }
         if ids.len() != total {
             return Err(shape_in(
                 PASS,
@@ -329,7 +310,10 @@ impl Body {
         parked: &mut [&mut Seq],
         rows: &[SlotRange],
     ) -> Result<(), GpuError> {
-        let total = pass_rows(rows)?;
+        let total = SlotRowOrder::Any.tiled_rows(PASS, rows)?;
+        if total == 0 {
+            return Err(shape_in(PASS, "a pass of no row"));
+        }
         if head.m() != total {
             return Err(shape_in(
                 PASS,

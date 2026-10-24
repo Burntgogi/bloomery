@@ -46,7 +46,8 @@ use crate::hybrid::Chain;
 use crate::linear::{self, conv::ConvArgs, delta::DeltaArgs, norm_gate::NormGateArgs};
 use crate::media::rope_table;
 use crate::model::lookup::f32_gain;
-use crate::model::{MAX_PASS_ROWS, RowHeads, SlotRange, SlotRows};
+use crate::model::slots::slot_twice;
+use crate::model::{MAX_PASS_ROWS, RowHeads, SlotRange, SlotRowOrder, SlotRows};
 use crate::q38::OutGateArgs;
 use crate::tensor::{Window, WindowMut};
 use crate::weights::Weights;
@@ -112,7 +113,7 @@ impl SlotRows for Body35 {
                 "draft taps off (a pass of several slots lays none in)",
             ));
         }
-        let total = slot_rows(rows, parked.len())?;
+        let total = SlotRowOrder::Any.admit(WHAT, rows, parked.len())?;
         if ids.len() != total {
             return Err(GpuError::shape(
                 WHAT,
@@ -120,7 +121,7 @@ impl SlotRows for Body35 {
             ));
         }
         for_slots(self, parked, rows, |b, r| {
-            b.check_slot(r, slot_ids(ids, r)?)
+            b.check_slot(r, r.ids(WHAT, ids)?)
         })?;
         for_slots(self, parked, rows, |b, r| {
             b.stand_held(stream, r.pos0, r.rows.len())
@@ -145,7 +146,7 @@ impl SlotRows for Body35 {
         rows: &[SlotRange],
     ) -> Result<(), GpuError> {
         self.whole_card()?;
-        let total = slot_rows(rows, parked.len())?;
+        let total = SlotRowOrder::Any.admit(WHAT, rows, parked.len())?;
         if total > self.a.rows {
             return Err(GpuError::shape(
                 WHAT,
@@ -201,9 +202,12 @@ impl SlotRows for Body35 {
         let mut seqs = Vec::with_capacity(rows.len());
         for (r, rec) in rows.iter().zip(&recs) {
             let (stores, table) = if r.slot == 0 {
-                (live_stores.take().ok_or_else(|| slot_twice(r))?, live)
+                (
+                    live_stores.take().ok_or_else(|| slot_twice(WHAT, r.slot))?,
+                    live,
+                )
             } else {
-                let p = others.next().ok_or_else(|| no_parked(r))?;
+                let p = others.next().ok_or_else(|| r.no_parked(WHAT))?;
                 (p.stores.as_mut_slice(), rope_table(rope, p.rope.as_ref()))
             };
             seqs.push(SlotSeq35 {
@@ -613,55 +617,6 @@ fn rows_mut<'a, T>(
     WindowMut::of_mut(parent, r.start * width * size_of::<T>(), r.len() * width)
 }
 
-/// The pass's rows `R`, once `rows` tile `0..R` in order from row 0 with
-/// no empty range, the slots in any order, and `parked` counts the ranges
-/// of slots past slot 0; else refused by name.
-fn slot_rows(rows: &[SlotRange], parked: usize) -> Result<usize, GpuError> {
-    let mut at = 0;
-    for r in rows {
-        if r.rows.start != at || r.rows.is_empty() {
-            return Err(GpuError::shape(
-                WHAT,
-                format!(
-                    "slot {}'s rows {:?}; the ranges tile the pass in order from row 0",
-                    r.slot, r.rows
-                ),
-            ));
-        }
-        at = r.rows.end;
-    }
-    let others = rows.iter().filter(|r| r.slot != 0).count();
-    if at == 0 || parked != others {
-        return Err(GpuError::shape(
-            WHAT,
-            format!(
-                "a pass of {at} rows with {parked} parked sequences for {others} slots past slot 0"
-            ),
-        ));
-    }
-    Ok(at)
-}
-
-/// Slot `r.slot`'s ids of the pass's `ids`.
-fn slot_ids<'i>(ids: &'i [u32], r: &SlotRange) -> Result<&'i [u32], GpuError> {
-    ids.get(r.rows.clone()).ok_or_else(|| {
-        GpuError::shape(
-            WHAT,
-            format!("slot {}'s rows {:?} of {} ids", r.slot, r.rows, ids.len()),
-        )
-    })
-}
-
-/// Slot 0 named twice in one pass, refused.
-fn slot_twice(r: &SlotRange) -> GpuError {
-    GpuError::shape(WHAT, format!("slot {} twice in one pass", r.slot))
-}
-
-/// A busy slot past slot 0 with no parked sequence handed for it, refused.
-fn no_parked(r: &SlotRange) -> GpuError {
-    GpuError::shape(WHAT, format!("slot {}'s parked sequence", r.slot))
-}
-
 /// `f` on `b` for each range of `rows` in order, with that slot's sequence
 /// live: slot 0's the live one, every other slot's the next of `parked`,
 /// exchanged in ([`Body35::exchange`]) and back out whatever `f` returns.
@@ -677,7 +632,7 @@ fn for_slots(
             f(b, r)?;
             continue;
         }
-        let seq = &mut **others.next().ok_or_else(|| no_parked(r))?;
+        let seq = &mut **others.next().ok_or_else(|| r.no_parked(WHAT))?;
         b.exchange(seq);
         let out = f(b, r);
         b.exchange(seq);

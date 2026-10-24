@@ -153,9 +153,10 @@ use crate::host::xstream::{Costs, XCfg, XLayer, XMode, XReport};
 use crate::host::{BatchLeg, PassKind, StepLeg, refuse_tier_count};
 use crate::hybrid::{Boundary, BoundaryShape, Chain, HostResidency, Hybrid, SlotMap};
 use crate::media::{ImageSpan, MediaBody, MediaSpan, RopeBase, SeqRope, kept_rule, rope_table};
+use crate::model::slots::slot_twice;
 use crate::model::{
-    CardBytes, ChainBody, GpuModel, HostServed, Rollback, RowHeads, Rows, SlotRange, SlotRows,
-    Slots,
+    CardBytes, ChainBody, GpuModel, HostServed, Rollback, RowHeads, Rows, SlotRange, SlotRowOrder,
+    SlotRows, Slots,
 };
 use crate::prompt_timing::{PromptStats, PromptTiming, nanos};
 use crate::rope_table::{RopeSpec, RopeTable};
@@ -5630,7 +5631,7 @@ impl Body38 {
         rows: &[SlotRange],
         ids: &[u32],
     ) -> Result<(), GpuError> {
-        let total = slot_rows(rows, parked.len())?;
+        let total = SlotRowOrder::RetainedPrefix.admit(WHAT_SLOTS, rows, parked.len())?;
         if self.slot_in.is_none() {
             return Err(GpuError::shape(
                 WHAT_SLOTS,
@@ -5659,11 +5660,11 @@ impl Body38 {
         }
         self.card_leg.refuse(Walk38::Verify)?;
         for_slots(self, parked, rows, |b, r| {
-            b.check_slot(r, slot_ids(ids, r)?)
+            b.check_slot(r, r.ids(WHAT_SLOTS, ids)?)
         })?;
         planted(&mut self.plant, Plant::BeforeLaunch)?;
         for_slots(self, parked, rows, |b, r| {
-            b.launch_slot(stream, r, slot_ids(ids, r)?)
+            b.launch_slot(stream, r, r.ids(WHAT_SLOTS, ids)?)
         })?;
         self.slot_in
             .as_mut()
@@ -5730,7 +5731,7 @@ impl Body38 {
         parked: &mut [&mut Slot38],
         rows: &[SlotRange],
     ) -> Result<(), GpuError> {
-        let total = slot_rows(rows, parked.len())?;
+        let total = SlotRowOrder::RetainedPrefix.admit(WHAT_SLOTS, rows, parked.len())?;
         if !crate::capturing(gpu.stream())? {
             for_slots(self, parked, rows, |b, r| {
                 let planned = b
@@ -5757,7 +5758,9 @@ impl Body38 {
             if !stand_in {
                 return Ok(());
             }
-            let seq = parked.first_mut().ok_or_else(|| no_parked(&rows[0]))?;
+            let seq = parked
+                .first_mut()
+                .ok_or_else(|| rows[0].no_parked(WHAT_SLOTS))?;
             let arena = [&mut b.s, &mut b.a, &mut b.wa];
             std::mem::swap(
                 final_streams_mut(&b.plans, arena, TargetRows::Pass),
@@ -5822,7 +5825,7 @@ impl Body38 {
         let mut copies = Vec::new();
         for (i, (r, rec)) in rows.iter().zip(&recs).enumerate() {
             let (stores, ple_ring, lane, table) = if r.slot == 0 {
-                live.take().ok_or_else(|| slot_twice(r))?
+                live.take().ok_or_else(|| slot_twice(WHAT_SLOTS, r.slot))?
             } else {
                 let Slot38 {
                     stores,
@@ -5831,7 +5834,7 @@ impl Body38 {
                     rows_pass,
                     rope: own,
                     ..
-                } = &mut **others.next().ok_or_else(|| no_parked(r))?;
+                } = &mut **others.next().ok_or_else(|| r.no_parked(WHAT_SLOTS))?;
                 if i != 0 {
                     copies.push(RowsCopy {
                         rows: r.rows.clone(),
@@ -5985,67 +5988,11 @@ impl SlotRows for Body38 {
 const WHAT_SLOTS: &str = "qwen4exp slots";
 
 /// Whether a pass whose first rows are slot `first`'s runs no row of slot 0
-/// (slot 0, when busy, lays its rows first, [`slot_rows`]): its walk writes
+/// (slot 0, when busy, lays its rows first, [`SlotRowOrder::RetainedPrefix`]): its walk writes
 /// that slot's own final-stream rows in place of the arena's
 /// ([`Body38::enqueue_slots`]), and the slot's copy is not launched.
 fn stands_in(first: usize) -> bool {
     first != 0
-}
-
-/// The pass's rows `R`, once `rows` tile `0..R` in order from row 0 with
-/// no empty range, slot 0 — when busy — first, and `parked` counts the
-/// ranges past slot 0; else refused by name.
-fn slot_rows(rows: &[SlotRange], parked: usize) -> Result<usize, GpuError> {
-    let mut at = 0;
-    for (i, r) in rows.iter().enumerate() {
-        if r.rows.start != at || r.rows.is_empty() {
-            return Err(GpuError::shape(
-                WHAT_SLOTS,
-                format!(
-                    "slot {}'s rows {:?}; the ranges tile the pass in order from row 0",
-                    r.slot, r.rows
-                ),
-            ));
-        }
-        if r.slot == 0 && i != 0 {
-            return Err(GpuError::shape(
-                WHAT_SLOTS,
-                "slot 0's rows past another slot's: slot 0's own rows hold its rows from row 0, \
-                 so a pass that runs slot 0 lays its rows first",
-            ));
-        }
-        at = r.rows.end;
-    }
-    let others = rows.iter().filter(|r| r.slot != 0).count();
-    if at == 0 || parked != others {
-        return Err(GpuError::shape(
-            WHAT_SLOTS,
-            format!(
-                "a pass of {at} rows with {parked} parked sequences for {others} slots past slot 0"
-            ),
-        ));
-    }
-    Ok(at)
-}
-
-/// Slot `r.slot`'s ids of the pass's `ids`.
-fn slot_ids<'i>(ids: &'i [u32], r: &SlotRange) -> Result<&'i [u32], GpuError> {
-    ids.get(r.rows.clone()).ok_or_else(|| {
-        GpuError::shape(
-            WHAT_SLOTS,
-            format!("slot {}'s rows {:?} of {} ids", r.slot, r.rows, ids.len()),
-        )
-    })
-}
-
-/// Slot 0 named twice in one pass, refused.
-fn slot_twice(r: &SlotRange) -> GpuError {
-    GpuError::shape(WHAT_SLOTS, format!("slot {} twice in one pass", r.slot))
-}
-
-/// A busy slot past slot 0 with no parked sequence handed for it, refused.
-fn no_parked(r: &SlotRange) -> GpuError {
-    GpuError::shape(WHAT_SLOTS, format!("slot {}'s parked sequence", r.slot))
 }
 
 /// `f` on `b` with `seq` live — exchanged in and back out
@@ -6079,7 +6026,7 @@ fn for_slots(
     for r in rows {
         let seq = match r.slot {
             0 => None,
-            _ => Some(&mut **others.next().ok_or_else(|| no_parked(r))?),
+            _ => Some(&mut **others.next().ok_or_else(|| r.no_parked(WHAT_SLOTS))?),
         };
         on_seq(b, seq, |b| f(b, r))?;
     }

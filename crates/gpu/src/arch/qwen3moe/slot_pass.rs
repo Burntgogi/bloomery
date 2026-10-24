@@ -31,7 +31,7 @@ use crate::GpuError;
 use crate::flash_gqa::{ROW_PLANES, RowTable, partials_ms_len, partials_v_len};
 use crate::head::Head;
 use crate::model::lookup::f32_gain;
-use crate::model::{MAX_PASS_ROWS, SlotRange};
+use crate::model::{MAX_PASS_ROWS, SlotRange, SlotRowOrder};
 use crate::tensor::{Window, WindowMut};
 use chain::arch::qwen3moe::ops::{ChainOps, LayerCtx};
 use chain::arch::qwen3moe::walk::Walk;
@@ -71,12 +71,7 @@ impl SlotIn {
         let mut words = 0;
         for (j, r) in rows.iter().enumerate() {
             let at = record_at(j, r);
-            let slot_ids = ids.get(r.rows.clone()).ok_or_else(|| {
-                GpuError::shape(
-                    WHAT,
-                    format!("slot {}'s rows {:?} of {} ids", r.slot, r.rows, ids.len()),
-                )
-            })?;
+            let slot_ids = r.ids(WHAT, ids)?;
             let rec = host.get_mut(at..).ok_or_else(|| {
                 GpuError::shape(WHAT, format!("a record at word {at} of {SLOT_IN_WORDS}"))
             })?;
@@ -315,19 +310,7 @@ impl ChainOps for SlotOps<'_, '_> {
 /// range, `R` is at most `most`, and the head is one with the parked
 /// sequences as many as the ranges past slot 0; else refused by name.
 fn check(rows: &[SlotRange], most: usize, heads: usize, parked: usize) -> Result<usize, GpuError> {
-    let mut at = 0;
-    for r in rows {
-        if r.rows.start != at || r.rows.is_empty() {
-            return Err(GpuError::shape(
-                WHAT,
-                format!(
-                    "slot {}'s rows {:?}; the ranges tile the pass in order from row 0",
-                    r.slot, r.rows
-                ),
-            ));
-        }
-        at = r.rows.end;
-    }
+    let at = SlotRowOrder::Any.tiled_rows(WHAT, rows)?;
     let others = rows.iter().filter(|r| r.slot != 0).count();
     if at == 0 || at > most || heads != 1 || parked != others {
         return Err(GpuError::shape(
@@ -447,5 +430,73 @@ fn attention(
     match planes {
         Planes::Slot(kv) => kv.flash_128(&c.k.flash, stream, flash, c.mma),
         Planes::Rows(table) => KvPlanes::flash_128_rows(&c.k.flash, stream, table, flash, c.mma),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SlotRange, WHAT, check};
+
+    #[test]
+    fn slot_pass_checks_arena_heads_and_parked_sequences_after_tiling() {
+        let rows = [
+            SlotRange {
+                slot: 4,
+                rows: 0..2,
+                pos0: 8,
+            },
+            SlotRange {
+                slot: 0,
+                rows: 2..3,
+                pos0: 5,
+            },
+        ];
+        assert_eq!(check(&rows, 3, 1, 1).unwrap(), 3);
+        for (most, heads, parked) in [(2, 1, 1), (3, 0, 1), (3, 2, 1), (3, 1, 0), (3, 1, 2)] {
+            let error = check(&rows, most, heads, parked).unwrap_err();
+            let crate::GpuError::Shape { what, detail } = error else {
+                panic!("expected a slot pass shape refusal");
+            };
+            assert_eq!(what, WHAT);
+            assert_eq!(
+                detail,
+                format!(
+                    "a pass of 3 rows (1..={most}) with {heads} heads and {parked} parked \
+                     sequences for 1 slots past slot 0; the pass runs into one head of every row"
+                )
+            );
+        }
+        assert!(
+            check(&[], 3, 1, 0)
+                .unwrap_err()
+                .to_string()
+                .contains("a pass of 0 rows")
+        );
+        let malformed = [SlotRange {
+            slot: 4,
+            rows: 1..2,
+            pos0: 8,
+        }];
+        assert!(
+            check(&malformed, 0, 0, 0)
+                .unwrap_err()
+                .to_string()
+                .contains("the ranges tile")
+        );
+        assert!(
+            check(
+                &[SlotRange {
+                    slot: 0,
+                    rows: 0..usize::MAX,
+                    pos0: 0
+                }],
+                3,
+                1,
+                0
+            )
+            .unwrap_err()
+            .to_string()
+            .contains(&format!("a pass of {} rows", usize::MAX))
+        );
     }
 }
