@@ -29,6 +29,14 @@
 //! 6. `post_ffw_norm` (scale then norm, `elem`'s `gain_rms_norm`), the α/β
 //!    residual again — the next layer's input.
 //!
+//! Two stretches of a layer run on the step's [`Branch`] beside the main
+//! stream, each joined before the first launch that reads it: step 2 and
+//! step 3's per-head output norm beside the gate's projection and its
+//! sigmoid, and the router beside `ffn_latent_down` and its norm. The gate
+//! and the latent down are bandwidth-bound reads of whole matrices; the small
+//! launches beside them take the slots their blocks free. Every kernel reads
+//! and writes what it does in the serial order, so the bits are that order's.
+//!
 //! The head is the shared one over the Q6_K `output` rows, the file's scale
 //! and tanh softcap folded into its tail. Every launch is a shared kernel:
 //! the family's own code is the order they run in.
@@ -57,7 +65,7 @@ use crate::route_body::{sigmoid_16_8, sigmoid_256_8};
 use crate::site::{Form, KGemvKernels, SiteTy};
 use crate::tensor::{Q8ACT_MAX_K, dtod_2d};
 use crate::weights::{DevWeight, Weights};
-use crate::{DeviceTensor, Gpu, GpuError, Window};
+use crate::{Branch, DeviceTensor, Gpu, GpuError, Window};
 use bloomery_levers::{ChurnHosting, HostCfg};
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::{GgmlType, Split};
@@ -367,6 +375,10 @@ struct Scratch {
     /// refresh.
     host: Vec<u32>,
     host_cs: Vec<f32>,
+    /// The second stream the attention chain and the router run on beside
+    /// the gate's and the latent down's projections ([`attention`],
+    /// [`ffn_pre`]).
+    branch: Branch,
 }
 
 impl Scratch {
@@ -873,6 +885,7 @@ impl Body {
             ones_head: DeviceBuffer::from_host(stream, &vec![1.0f32; head])?,
             host: vec![0; ROW_WORDS + n_kv],
             host_cs: vec![0.0; hp.rope_dims],
+            branch: Branch::new(gpu.stream_handle())?,
         };
         // The prompt pass's rows come from the card's room after the weights,
         // the stores and the step's buffers: the largest pass whose buffers
@@ -1118,9 +1131,29 @@ fn attention(
     a.q.project(cx, acts, l, &s.xn, &mut s.q)?;
     a.k.project(cx, acts, l, &s.xn, &mut s.k)?;
     a.v.project(cx, acts, l, &s.xn, &mut s.v)?;
+    // The gate's projection and its sigmoid on the main stream, the chain from
+    // the per-head norms to the per-head output norm on the branch beside
+    // them; the gated product after the join reads both.
+    let fork = s.branch.fork()?;
     a.gate.project(cx, acts, l, &s.xn, &mut s.gate)?;
-    elem.enqueue_rms_norm(
+    // The gate's projection and its sigmoid both survive the step: the
+    // projection's rows and, beside them, their σ.
+    let width = sh.n_head * sh.head * 4;
+    dtod_2d(
         stream,
+        (&s.gate, 0),
+        (&mut s.gate_sig, 0),
+        crate::tensor::Pitched {
+            width,
+            rows: 1,
+            dev_pitch: width,
+            host_pitch: width,
+        },
+    )?;
+    elem.enqueue_sigmoid_rows(stream, &mut s.gate_sig, sh.n_head * sh.head)?;
+    let side = fork.stream();
+    elem.enqueue_rms_norm(
+        side,
         &s.q,
         cx.w.f32_buf(STEP, &a.q_norm)?,
         sh.eps,
@@ -1129,7 +1162,7 @@ fn attention(
         &mut s.qn,
     )?;
     elem.enqueue_rms_norm(
-        stream,
+        side,
         &s.k,
         cx.w.f32_buf(STEP, &a.k_norm)?,
         sh.eps,
@@ -1141,8 +1174,8 @@ fn attention(
     // row; the full layers rope nothing and the flash and the appends read
     // their norms' outputs.
     let (q_in, k_in) = if a.sliding {
-        elem.enqueue_rope(stream, &s.qn, &s.cs, sh.head, sh.n_head as u32, 1, &mut s.q)?;
-        elem.enqueue_rope(stream, &s.k2, &s.cs, sh.head, sh.n_kv as u32, 1, &mut s.k)?;
+        elem.enqueue_rope(side, &s.qn, &s.cs, sh.head, sh.n_head as u32, 1, &mut s.q)?;
+        elem.enqueue_rope(side, &s.k2, &s.cs, sh.head, sh.n_kv as u32, 1, &mut s.k)?;
         (&s.q, &s.k)
     } else {
         (&s.qn, &s.k2)
@@ -1155,11 +1188,11 @@ fn attention(
         fault,
     };
     gpu.flash()
-        .enqueue_kv_append_planes(stream, &at, head_rows(k_in, sh.head), &mut a.kc)?;
+        .enqueue_kv_append_planes(side, &at, head_rows(k_in, sh.head), &mut a.kc)?;
     gpu.flash()
-        .enqueue_kv_append_planes(stream, &at, head_rows(&s.v, sh.head), &mut a.vc)?;
+        .enqueue_kv_append_planes(side, &at, head_rows(&s.v, sh.head), &mut a.vc)?;
     cx.flash.enqueue_pass_64(
-        stream,
+        side,
         Gqa64Args {
             q: q_in,
             kc: a.kc.buf(),
@@ -1177,25 +1210,10 @@ fn attention(
         },
         false,
     )?;
-    // The gate's projection and its sigmoid both survive the step: the
-    // projection's rows and, beside them, their σ.
-    let width = sh.n_head * sh.head * 4;
-    dtod_2d(
-        stream,
-        (&s.gate, 0),
-        (&mut s.gate_sig, 0),
-        crate::tensor::Pitched {
-            width,
-            rows: 1,
-            dev_pitch: width,
-            host_pitch: width,
-        },
-    )?;
-    elem.enqueue_sigmoid_rows(stream, &mut s.gate_sig, sh.n_head * sh.head)?;
     // The per-head weightless norm of the attention output, then the gated
     // product in the flash's own rows.
     elem.enqueue_rms_norm(
-        stream,
+        side,
         &s.attn,
         &s.ones_head,
         sh.eps,
@@ -1203,6 +1221,7 @@ fn attention(
         sh.n_head,
         &mut s.qn,
     )?;
+    fork.join()?;
     elem.enqueue_mul_rows(stream, &s.qn, &s.gate_sig, sh.n_head * sh.head, &mut s.attn)?;
     a.o.project(cx, acts, l, &s.attn, &mut s.delta)?;
     elem.enqueue_rms_norm(
@@ -1258,10 +1277,11 @@ fn ffn(
     ffn_post(gpu, cx, (l, a), (s, acts), (src, dst), sh)
 }
 
-/// The FFN half's front: the norm of `src`, the router on the full stream, the
-/// latent down and the weighted norm on the latent (`ffn_pre_exp_norm`) into
-/// `lat2`, the row the experts read — the step's own buffer, or the buffer
-/// given (a hosted layer's boundary activation, which the host reads).
+/// The FFN half's front: the norm of `src`, the router on the full stream (on
+/// the step's branch), the latent down and the weighted norm on the latent
+/// (`ffn_pre_exp_norm`) into `lat2`, the row the experts read — the step's own
+/// buffer, or the buffer given (a hosted layer's boundary activation, which
+/// the host reads). The router is joined before the function returns.
 #[allow(
     clippy::too_many_arguments,
     reason = "the half's launches: its layer, the site context, the kernels, the scratch, its input and the experts' row (rust-quality R8)"
@@ -1285,15 +1305,10 @@ fn ffn_pre(
         src,
         &mut s.xn,
     )?;
-    k.routers.enqueue(
-        stream,
-        cx.w.f32_tensor(STEP, &a.router)?,
-        &s.xn,
-        cx.w.f32_buf(STEP, &a.bias)?,
-        sh.weights_scale,
-        &mut a.route,
-        fault,
-    )?;
+    // The latent down and its norm on the main stream, the router on the
+    // branch beside them; the half's next launch, after the join, reads the
+    // router's ids and weights.
+    let fork = s.branch.fork()?;
     a.latent_down.project(cx, acts, l, &s.xn, &mut s.lat)?;
     gpu.elem().enqueue_rms_norm(
         stream,
@@ -1306,7 +1321,17 @@ fn ffn_pre(
             Some(buf) => buf,
             None => &mut s.lat2,
         },
-    )
+    )?;
+    k.routers.enqueue(
+        fork.stream(),
+        cx.w.f32_tensor(STEP, &a.router)?,
+        &s.xn,
+        cx.w.f32_buf(STEP, &a.bias)?,
+        sh.weights_scale,
+        &mut a.route,
+        fault,
+    )?;
+    fork.join()
 }
 
 /// The card's experts of a layer for one token: `lat` (the step's `lat2` when

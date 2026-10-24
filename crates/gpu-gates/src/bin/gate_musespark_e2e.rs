@@ -36,6 +36,9 @@
 //!   `n_used` slots (`ds41_ffn_handoff_8`: the file routes 8 and has no
 //!   shared expert) and, where the card keeps some of its experts, their sum
 //!   (`ds41_ffn_card_acc_8`). A load with no host share has no host node.
+//!   The span, the most nodes on one dependency path, is the node count less
+//!   four a layer: the gate's gemv, its copy and its sigmoid run beside the
+//!   attention chain, and the router beside the latent down and its norm.
 //! - `eager_equals_replay`, `reset_rewinds`, `state_carries`
 //!   (self-consistency): as `gate_nemotron_h_moe_e2e`'s, over a 16-token
 //!   walk; the carried state is the K/V rows (the model holds no scan state).
@@ -603,6 +606,8 @@ mod gate {
     /// to the host (`ds41_ffn_handoff_8` at the file's 8) and a hosted layer
     /// that keeps card experts adds their gate·up, down, post-expert norm and
     /// sum (`ds41_ffn_card_acc_8`).
+    /// The span (the most nodes on one dependency path) is the node count
+    /// less the four nodes a layer's two forks run beside the rest.
     /// The pass, the captured node count, the host nodes, the listed
     /// got/want entries and every kernel entry with its count.
     fn graph_entries(
@@ -620,6 +625,7 @@ mod gate {
         m.set_mode(StepMode::Graph);
         let nodes = m.capture_step()?;
         let list = m.step_graph_nodes()?;
+        let span = m.step_graph_span()?;
         let hist = histogram(&list);
         let ([host], _) = count_kinds(&list, [sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_HOST]);
         let router = format!("sigmoid_{}_{}_router", hp.n_expert, hp.n_used);
@@ -663,9 +669,16 @@ mod gate {
         for (name, n) in &want {
             pass &= got(name) == *n;
         }
+        // Each layer forks twice (the body's `attention` and `ffn_pre`): the
+        // gate's gemv, its copy and its sigmoid beside the attention chain,
+        // and the router beside the latent down and its norm. Each fork's
+        // shorter side is off the one path the rest of the step runs on.
+        let span_want = nodes.checked_sub(4 * l);
+        pass &= span_want == Some(span);
         let listed = want
             .iter()
             .map(|(name, n)| format!("{name}={}/{n}", got(name)))
+            .chain(std::iter::once(format!("span={span}/{nodes}-4*{l}")))
             .collect::<Vec<_>>()
             .join(" ");
         let kernels = hist

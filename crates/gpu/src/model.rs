@@ -1142,6 +1142,19 @@ impl<B: ChainBody> GpuModel<B> {
             .nodes()
     }
 
+    /// The most nodes on one dependency path of the captured whole chain
+    /// ([`Graph::span`](crate::Graph::span)) — what a structure gate holds a
+    /// body's forks to.
+    pub fn step_graph_span(&self) -> Result<usize, GpuError> {
+        self.graphs
+            .get(1)
+            .ok_or(GpuError::state(
+                "GpuModel::step_graph_span",
+                "no captured chain",
+            ))?
+            .span()
+    }
+
     /// Enqueue the whole chain eagerly on the engine stream. Pure enqueues —
     /// the same body [`GpuModel::capture_step`] records.
     fn enqueue_chain_step(&mut self) -> Result<(), GpuError> {
