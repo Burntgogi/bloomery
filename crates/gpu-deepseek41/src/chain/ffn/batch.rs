@@ -652,6 +652,60 @@ mod ffn_batch_kernels {
         // SAFETY: i < n·m <= acc.len(); thread i is acc[i]'s only writer.
         unsafe { *acc.get_unchecked_mut(i) = v };
     }
+
+    /// [`ds41_ffn_card_acc_8_tier`] at four slots a token
+    /// ([`card_acc_tier_at`]): the one-card sum of four slots over the
+    /// union of the stage card's and the expert tier's.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            down.len() >= 4 * n * m,
+            trows.len() >= 4 * n * m,
+            w.len() >= 4 * m,
+            sel.len() >= 4 * m,
+            tsel.len() >= 4 * m,
+            acc.len() >= n * m
+        )
+    )]
+    pub fn ds41_ffn_card_acc_4_tier(
+        down: &[f32],
+        trows: &[f32],
+        w: &[f32],
+        sel: &[u32],
+        tsel: &[u32],
+        n: u32,
+        m: u32,
+        n_card: u32,
+        n_tier: u32,
+        mut acc: DisjointSlice<f32>,
+    ) {
+        let (n, m) = (n as usize, m as usize);
+        let i = thread::index_1d().get();
+        if i >= n * m {
+            return;
+        }
+        let a = AccTierIn {
+            down,
+            trows,
+            w,
+            sel,
+            tsel,
+            n_card,
+            n_tier,
+        };
+        // SAFETY: i < n·m, and the launch contract gives every length the
+        // helper's contract asks for at SLOTS_4 slots.
+        let v = unsafe { card_acc_tier_at::<SLOTS_4>(&a, n, i) };
+        // SAFETY: i < n·m <= acc.len(); thread i is acc[i]'s only writer.
+        unsafe { *acc.get_unchecked_mut(i) = v };
+    }
 }
 
 /// The step's Q3_K gate·up·SwiGLU as a tile entry's work
@@ -1035,7 +1089,8 @@ impl FfnBatchKernels {
     }
 
     /// Enqueue the gather of `g.n_used` slots a token (`ds41_card_gather` for
-    /// 6, `ds41_card_gather_8` for 8; any other count is refused by name):
+    /// 6, `ds41_card_gather_8` for 8; any other count, four included, is
+    /// refused by name):
     /// the q8_1 planes of `g`'s table entries into columns `0 .. g.n_slots`
     /// of `q3` and `d8`. One launch. Asynchronous, allocation-free.
     pub fn enqueue_card_gather(
@@ -1048,6 +1103,7 @@ impl FfnBatchKernels {
     ) -> Result<(), GpuError> {
         let slots = slots_of("ds41_card_gather", g.n_used)?;
         let what = match slots {
+            Slots::Four => return Err(no_entry("ds41_card_gather", slots)),
             Slots::Six => "ds41_card_gather",
             Slots::Eight => "ds41_card_gather_8",
         };
@@ -1062,6 +1118,7 @@ impl FfnBatchKernels {
         ];
         let m = &self.module;
         match slots {
+            Slots::Four => return Err(no_entry(what, slots)),
             Slots::Six => {
                 let prep = m.prepare_ds41_card_gather(cfg)?;
                 m.ds41_card_gather(
@@ -1097,9 +1154,10 @@ impl FfnBatchKernels {
     /// Enqueue `ds41_ffn_card_acc_tier`: the card sums of `a.m` tokens over
     /// the stage card's and the tier's slots, value `i` of token `t = i / a.n`
     /// into `acc[i]`: `ds41_ffn_card_acc_tier` for six slots a token,
-    /// `ds41_ffn_card_acc_8_tier` (the fma chain of `ds41_ffn_card_acc_8`)
-    /// for eight; any other count is refused by name. One launch.
-    /// Asynchronous, allocation-free, capturable.
+    /// `ds41_ffn_card_acc_4_tier` and `ds41_ffn_card_acc_8_tier` (the fma
+    /// chains of `ds41_ffn_card_acc_4` and `_8`) for four and eight; any
+    /// other count is refused by name. One launch. Asynchronous,
+    /// allocation-free, capturable.
     pub fn enqueue_card_acc_tier(
         &self,
         stream: &CudaStream,
@@ -1108,6 +1166,7 @@ impl FfnBatchKernels {
     ) -> Result<(), GpuError> {
         let slots = slots_of("ds41_ffn_card_acc_tier", a.n_used)?;
         let what = match slots {
+            Slots::Four => "ds41_ffn_card_acc_4_tier",
             Slots::Six => "ds41_ffn_card_acc_tier",
             Slots::Eight => "ds41_ffn_card_acc_8_tier",
         };
@@ -1120,6 +1179,12 @@ impl FfnBatchKernels {
             launch_u32(what, "n_tier", a.n_tier)?,
         );
         match slots {
+            Slots::Four => {
+                let prep = self.module.prepare_ds41_ffn_card_acc_4_tier(cfg)?;
+                self.module.ds41_ffn_card_acc_4_tier(
+                    stream, &prep, a.down, a.trows, a.w, a.sel, a.tsel, n, m, n_card, n_tier, acc,
+                )?;
+            }
             Slots::Six => {
                 let prep = self.module.prepare_ds41_ffn_card_acc_tier(cfg)?;
                 self.module.ds41_ffn_card_acc_tier(
