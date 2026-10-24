@@ -3573,22 +3573,29 @@ pub fn device_free_limit(device: &DeviceInfo) -> Result<u64, GateError> {
 /// device's under `--place gate` on a larger device. A stage the plan opens by
 /// name, or an ordinal the census does not hold, is a named error.
 pub fn stage_device_free_limit(plan: &Fields, census: &[DeviceInfo]) -> Result<u64, GateError> {
+    let ordinal = stage_ordinal(plan)?;
+    let device = census.iter().find(|d| d.ordinal == ordinal).ok_or_else(|| {
+        format!(
+            "a `plan` record's stage device cuda{ordinal} is no device of the census (visible: {})",
+            workstation::visible(census)
+        )
+    })?;
+    device_free_limit(device)
+}
+
+/// The CUDA ordinal of the stage card a `plan` record names: the first item of its `devices`
+/// ([`plan_devices`]). A plan with no device, or a stage opened by name (`by-name`), is a named
+/// error.
+pub fn stage_ordinal(plan: &Fields) -> Result<u32, GateError> {
     let devices = plan.csv("devices")?;
     let stage = devices
         .first()
         .ok_or_else(|| format!("a `plan` record with no device: {}", plan.line()))?;
-    let device = stage
+    Ok(stage
         .rsplit(':')
         .nth(1)
         .and_then(|at| at.strip_prefix("cuda")?.parse::<u32>().ok())
-        .and_then(|o| census.iter().find(|d| d.ordinal == o))
-        .ok_or_else(|| {
-            format!(
-                "a `plan` record's stage device {stage:?} is no device of the census (visible: {})",
-                workstation::visible(census)
-            )
-        })?;
-    device_free_limit(device)
+        .ok_or_else(|| format!("a `plan` record's stage device {stage:?} names no CUDA ordinal"))?)
 }
 
 /// The order this process's CUDA ordinals follow: `CUDA_DEVICE_ORDER`, or
@@ -5097,6 +5104,27 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("reads a zero total"), "a zero total: {err}");
+    }
+
+    /// The stage card's CUDA ordinal is the first `devices` item's ([`stage_ordinal`]), not the
+    /// lowest ordinal of the list: plan (b') on the box has the stage on cuda1 and its tier on
+    /// cuda0. A stage a plan opens by name has no ordinal, a named error. Mutants: the last item
+    /// read, the lowest ordinal taken.
+    #[test]
+    fn the_stage_ordinal_is_the_first_devices() {
+        let bp = Log::of(PLAN_BP, BLOOMERY_SERVE_DS41).one(&PLAN).unwrap();
+        assert_eq!(stage_ordinal(&bp).unwrap(), 1);
+        let one = Log::of(PLAN38_PLACED, BLOOMERY_SERVE_QWEN3)
+            .one(&PLAN38)
+            .unwrap();
+        assert_eq!(stage_ordinal(&one).unwrap(), 0);
+        let named = PLAN_BP.replace(
+            "stage:A6000:cuda1:50952404992,tier0:3090:cuda0:25350373376",
+            "stage:A6000:by-name:50952404992",
+        );
+        let by_name = Log::of(&named, BLOOMERY_SERVE_DS41).one(&PLAN).unwrap();
+        let err = stage_ordinal(&by_name).unwrap_err().to_string();
+        assert!(err.contains("names no CUDA ordinal"), "{err}");
     }
 
     /// A reserve-only member of the plan

@@ -83,24 +83,31 @@
 //!   and `--parallel 2` runs the same two prompts together, both posted at once (the second is
 //!   admitted while the first holds its slot, on a body of any speed), and each answer's tokens
 //!   and `stop_type` equal its solo run, both non-empty, on different `id_slot`. Both servers plan
-//!   at a pinned card budget ([`gate_budget`]: the gate card's usable bytes less one slot's
-//!   stores for the one-slot server, those bytes for the two-slot server): a second slot's
-//!   stores take card room, so the two-slot plan an unpinned server makes holds fewer card
-//!   experts, and another card/host split answers other ids; the two budgets differ by one
-//!   slot's stores and both sit at or under the card's usable bytes (the plan takes the lesser),
-//!   so the experts are planned in the same room and the two `plan` records name one split
-//!   (`card_experts`, `host_experts`, `n_l`). Every server of the clause runs with
-//!   `BLOOMERY_RESIDENCY=off`: the residency machine moves experts between the tiers by the
-//!   requests' heat, so a second request on one server, or two requests on two slots, run on
-//!   another split than a fresh sequence, and a near tie answers other ids. The
+//!   at a pinned budget on the stage card ([`gate_budget`]: a `BLOOMERY_CARD_BUDGET` list naming
+//!   that card alone, the gate card's usable bytes less one slot's stores for the one-slot
+//!   server, those bytes for the two-slot server): a second slot's stores take stage card room,
+//!   so the two-slot plan an unpinned server makes holds fewer stage experts, and another
+//!   card/host split answers other ids; the two budgets differ by one slot's stores and both sit
+//!   at or under the stage card's usable bytes (the plan takes the lesser), so the stage card's
+//!   experts are planned in the same room. An expert tier card (plan (b′), both cards in view)
+//!   holds no stores, so the list leaves it out and it plans at its own usable bytes in both
+//!   servers; one budget for every card would hold the one-slot server's tier lower by one
+//!   slot's stores and the host would take those experts. The stage's ordinal is the one a
+//!   `--plan` of the one-slot server's shape names. The two `plan` records then name one split
+//!   (`card_experts`, `host_experts`, `n_l`); where they do not, the clause is red by name
+//!   (`the two servers plan different splits`) before any id is compared. Every server of the
+//!   clause runs with `BLOOMERY_RESIDENCY=off`: the residency machine moves experts between the
+//!   tiers by the requests' heat, so a second request on one server, or two requests on two
+//!   slots, run on another split than a fresh sequence, and a near tie answers other ids. The
 //!   two-slot load and listening records name two slots and [`CTX`] (a slot's positions). The
 //!   resident bytes grow by one sequence's stores at [`CTX`] (`KvLayout::bytes`) and by nothing
 //!   else. `swaps_total` is absent or 0. The one-slot server is stopped before the two-slot
 //!   server starts. FAIL-first: a two-slot budget without the added stores plans another split
-//!   and the clause is red on the plan line; a select that leaves both requests on one sequence
-//!   makes the ids differ or the slots match, and the clause is red; a `seq_bytes` that
-//!   under-counts the planes makes the resident difference miss one sequence's stores, and the
-//!   clause is red.
+//!   and the clause is red on the plan line; one budget for every card, the tier card included,
+//!   plans the one-slot server's tier fewer experts and the clause is red on the plan line; a
+//!   select that leaves both requests on one sequence makes the ids differ or the slots match,
+//!   and the clause is red; a `seq_bytes` that under-counts the planes makes the resident
+//!   difference miss one sequence's stores, and the clause is red.
 //! - The premise `two_slots_decode_as_one_slot_runs`' solo runs stand on — that a server's second
 //!   request answers the ids a fresh sequence does — is checked beside them: a third server, one
 //!   slot at the one-slot
@@ -177,19 +184,27 @@ mod gate {
     /// The words of the refusal of the placement: the place word it refuses.
     const PLACED: &str = "--place bp";
 
-    /// The card budget the two-slot server of `two_slots_decode_as_one_slot_runs` plans at: the
-    /// gate card's usable bytes (`RTX_3090`'s), so whichever card the runner puts in view the
-    /// room is fixed. The one-slot server plans at this less one slot's `stores`, so both
-    /// budgets bind at or under the card's own bytes (the plan takes `min(usable, budget)`; a
-    /// budget past them is cut back and the second slot's stores come out of the experts'
-    /// room) — the experts are planned in one room and the two loads answer ids one split
-    /// computes.
-    fn gate_budget(stores: u64) -> Result<(u64, u64), GateError> {
+    /// The card budgets the servers of `two_slots_decode_as_one_slot_runs` plan at, the one-slot
+    /// server's first, each a list naming the stage card (`stage`, its CUDA ordinal) alone. The
+    /// stage card holds every slot's stores, so its experts' room is its budget less them: the
+    /// two-slot server's budget is the gate card's usable bytes (`RTX_3090`'s), so whichever card
+    /// the runner puts in view the room is fixed, and the one-slot server's is that less one
+    /// slot's `stores`. Both bind at or under the card's own bytes (the plan takes `min(usable,
+    /// budget)`; a budget past them is cut back and the second slot's stores come out of the
+    /// experts' room), so the stage card plans the same experts in both. An expert tier card
+    /// holds no stores, so its room does not move with the slots: the lists leave it out and it
+    /// plans at its own usable bytes in both servers. One budget for every card would hold the
+    /// one-slot server's tier lower by one slot's stores and the host would take those experts.
+    fn gate_budget(
+        stores: u64,
+        stage: u32,
+    ) -> Result<(bloomery_levers::CardBudget, bloomery_levers::CardBudget), GateError> {
         let two = RTX_3090.usable_bytes();
         let one = two
             .checked_sub(stores)
             .ok_or_else(|| format!("one slot's stores {stores} B past the gate card's {two} B"))?;
-        Ok((one, two))
+        let on_stage = |bytes| bloomery_levers::CardBudget::Per(vec![(stage, bytes)]);
+        Ok((on_stage(one), on_stage(two)))
     }
 
     /// The seat's facts, as the shared clauses read them.
@@ -435,15 +450,15 @@ mod gate {
         Ok(())
     }
 
-    /// `bloomery-serve` of `args` under `<dir>/<name>/`, its plan held to `budget` card bytes
-    /// (`BLOOMERY_CARD_BUDGET`: the plan takes `min(usable, budget)` of the card) and its split
-    /// fixed for the run (`BLOOMERY_RESIDENCY=off`).
+    /// `bloomery-serve` of `args` under `<dir>/<name>/`, its plan held to `budget`
+    /// (`BLOOMERY_CARD_BUDGET`: the plan takes `min(usable, budget)` of each card the budget
+    /// names) and its split fixed for the run (`BLOOMERY_RESIDENCY=off`).
     fn spawn_at(
         c: &serve_gate::Clauses,
         dir: &Path,
         name: &str,
         args: &[&str],
-        budget: u64,
+        budget: &bloomery_levers::CardBudget,
     ) -> Result<(Served, PathBuf), GateError> {
         let d = dir.join(name);
         std::fs::create_dir_all(&d)?;
@@ -473,6 +488,31 @@ mod gate {
                 Ok(None)
             }
         }
+    }
+
+    /// The CUDA ordinal of the stage card the clause's servers plan on: the stage device of the
+    /// `plan` record of a `--plan` at the one-slot server's shape. `None` where the plan does not
+    /// run or prints no record.
+    fn stage_of(c: &serve_gate::Clauses, dir: &Path, ctx: &str) -> Result<Option<u32>, GateError> {
+        let file = ref_model_path()?;
+        let seat = SeatGate {
+            model: c.model,
+            kinds: c.kinds,
+        };
+        let (status, log, _) = seat.plan(dir, "plan-stage", &file, &["--ctx", ctx])?;
+        if !status.success() {
+            return Ok(None);
+        }
+        let Some(plan) = log.first(&record::PLAN)? else {
+            println!("the stage card's plan printed no plan record");
+            return Ok(None);
+        };
+        let stage = record::stage_ordinal(&plan)?;
+        println!(
+            "the servers plan on the stage card cuda{stage} of {:?}",
+            plan.csv("devices")?
+        );
+        Ok(Some(stage))
     }
 
     /// One greedy completion of `text`, `cache_prompt` false.
@@ -636,15 +676,19 @@ mod gate {
             .kv
             .bytes(0..layers, c.ctx);
         drop(model);
-        let (budget_one, budget_two) = gate_budget(store_bytes)?;
 
         let ctx = c.ctx.to_string();
+        let Some(stage) = stage_of(c, dir, &ctx)? else {
+            check(&mut ok, NAME, false);
+            return Ok(ok);
+        };
+        let (budget_one, budget_two) = gate_budget(store_bytes, stage)?;
         let (mut one, d) = spawn_at(
             c,
             dir,
             "serve-one",
             &["--port", "0", "--ctx", &ctx],
-            budget_one,
+            &budget_one,
         )?;
         let err_log = d.join("server.err");
         let Some(addr) = listened(&mut one, &err_log, "one-slot")? else {
@@ -674,7 +718,7 @@ mod gate {
             dir,
             "serve-fresh",
             &["--port", "0", "--ctx", &ctx],
-            budget_one,
+            &budget_one,
         )?;
         let err_log = df.join("server.err");
         let Some(addr) = listened(&mut fresh, &err_log, "fresh one-slot")? else {
@@ -689,6 +733,18 @@ mod gate {
             animals_fresh.tokens
         );
         println!("fresh one-slot server stopped: {}", fresh.stop()?);
+        let second_is_fresh = !animals_fresh.tokens.is_empty()
+            && animals.tokens == animals_fresh.tokens
+            && animals.stop == animals_fresh.stop;
+        println!("the second request's ids equal a fresh server's {second_is_fresh}");
+        if let Some(step) = first_step_apart(("sequential", &animals), ("fresh", &animals_fresh)) {
+            println!("animals sequential against fresh: {step}");
+        }
+        check(
+            &mut ok,
+            "second_request_equals_a_fresh_server",
+            second_is_fresh,
+        );
 
         let total = (2 * c.ctx).to_string();
         let (mut two, d2) = spawn_at(
@@ -696,7 +752,7 @@ mod gate {
             dir,
             "serve-two",
             &["--port", "0", "--ctx", &total, "--parallel", "2"],
-            budget_two,
+            &budget_two,
         )?;
         let err_log = d2.join("server.err");
         let Some(addr) = listened(&mut two, &err_log, "two-slot")? else {
@@ -715,10 +771,19 @@ mod gate {
             c.ctx,
             2 * c.ctx
         );
-        let same_plan = planned == one_plan;
+        if planned != one_plan {
+            println!(
+                "the two servers plan different splits: the two-slot server's {planned:?} against \
+                 the one-slot server's {one_plan:?}; two splits answer other ids, so no id is \
+                 compared; two-slot load {:?}",
+                load.line()
+            );
+            check(&mut ok, NAME, false);
+            println!("two-slot server stopped: {}", two.stop()?);
+            return Ok(ok);
+        }
         let past = i128::from(resident_two) - i128::from(resident_one) - i128::from(store_bytes);
-        let loaded = same_plan
-            && one_shaped
+        let loaded = one_shaped
             && load.u64("slots")? == 2
             && load.u64("ctx")? == c.ctx
             && listen.u64("slots")? == 2
@@ -726,10 +791,10 @@ mod gate {
             && stderr.lines().any(|l| l == line)
             && past == 0;
         println!(
-            "two-slot server at {addr}; plan {planned:?} against the one-slot server's \
-             {one_plan:?}: the same split {same_plan}; load {:?}; listening {:?}; parallel line \
-             {line:?}; resident {resident_two} B against the one-slot server's {resident_one} B: \
-             past one sequence's stores {store_bytes} B, {past} B (want 0): {loaded}",
+            "two-slot server at {addr}; plan {planned:?}, the one-slot server's split; load {:?}; \
+             listening {:?}; parallel line {line:?}; resident {resident_two} B against the \
+             one-slot server's {resident_one} B: past one sequence's stores {store_bytes} B, \
+             {past} B (want 0): {loaded}",
             load.line(),
             listen.line()
         );
@@ -752,21 +817,9 @@ mod gate {
              ms); ids equal the one-slot server's {equal}; on different slots {apart}",
             ran[0].slot, ran[0].held_ms, ran[1].slot, ran[1].held_ms
         );
-        let second_is_fresh = !animals_fresh.tokens.is_empty()
-            && animals.tokens == animals_fresh.tokens
-            && animals.stop == animals_fresh.stop;
-        println!("the second request's ids equal a fresh server's {second_is_fresh}");
-        if let Some(step) = first_step_apart(("sequential", &animals), ("fresh", &animals_fresh)) {
-            println!("animals sequential against fresh: {step}");
-        }
         if let Some(step) = first_step_apart(("together", &ran[1]), ("sequential", &animals)) {
             println!("animals together against sequential: {step}");
         }
-        check(
-            &mut ok,
-            "second_request_equals_a_fresh_server",
-            second_is_fresh,
-        );
         let swaps = metric(&url, "swaps_total")?;
         println!("swaps_total {swaps:?}");
         check(
