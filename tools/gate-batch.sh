@@ -359,10 +359,14 @@
 # A skip names its source, `src=lead` or `src=round`, in run.log and the dry run. A rebase moves the
 # key of every item whose closure the landed commits touched, so a landing still reruns those; the
 # saving is in the items the rebase left alone.
-# Each item's input key is `tools/recipes.py key` (its section header lists the parts): the files its
-# targets read (the walk `just affected` uses; the whole tree for a command run on the Mac, a cargo
-# subcommand the parser does not model, or a script that walks the tree), the text of its recipe and
-# of every recipe it depends on, the scripts those name, the cargo globals and the cuda-oxide pin, its
+# Each item's input key is `tools/recipes.py key` (its section header lists the parts): its own target
+# sources, uncut reached dependency sources, build/procedural-macro compilation inputs, named script
+# reads and manifests. Compiled regular-source macro invocations add structural roots even in otherwise
+# unreached modules; implicit impls include non-.rs #[path] modules. Opaque expansion/linkage keeps
+# conservative bounds; a Mac command, unmodelled cargo subcommand or tree-walking script still keys
+# the whole tree. `just affected` keeps its broader
+# compile closure: an affected recipe need not have a changed ledger key. Keys also include the text
+# of the recipe and every dependency recipe, the scripts those name, cargo globals and cuda-oxide pin, its
 # ARGS, its full BLOOMERY_BOX_ENV (the caller's, the item's, its lane's card), the Mac-side variables
 # box.sh carries, and a box manifest read once per batch through one box.sh call (`recipes.py
 # box-manifest` behind box.sh's guard with BLOOMERY_BOX_WAIT=0: refused while the lease or a hold is
@@ -375,6 +379,17 @@
 # is not bounded by its recipe text, so a data change reruns every item — the safe side; a model
 # directory's rows enter only the keys of the items that can open it (a /models literal in the item's
 # files or recipe text, its profile among them, or a /models value in the box env).
+# Structural reach is cached privately in ~/.cache/bloomery/reach/<checkout-id>/graph.json. The cache
+# contains no green verdicts: source/code/metadata/read/probe content must still match, and malformed or
+# stale snapshots rebuild. Code-identity compilation is memoized by exact source bytes, filename and
+# optimization level; cached recipe inputs still recheck current content, and key output is validated again.
+# Immutable file-local syntax facts are memoized by exact text; bindings and macro resolution stay
+# graph-specific. Schema descriptors are reused, never value-validation verdicts. Module ancestors are
+# collected once per root/file through the existing base index, not once per reached item.
+# The snapshot persists structural owners/nodes/edges, not the recomputable resolver lookup memo.
+# Cache hydration discards eager resolver results; lookups are recomputed from the validated structure.
+# Runtime reach is not profile-pruned for keys. The v2 key format deliberately invalidates pre-reach ledger
+# entries once; an old green cannot authorize a narrower new key.
 #   Keys are computed before the lease check. An item whose key is in the ledger does not run: run.log
 # gets `<stem> rc=skip green-at=<commit> <date> lane=<L>`. Every other item runs as without --ledger;
 # one whose final rc is 0 is recorded after its key is computed again (against the same pre-batch box

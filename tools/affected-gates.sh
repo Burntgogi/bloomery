@@ -36,5 +36,8 @@
 # the crate graph's true answer. The saving is on leaf changes (serve, tokenizer, sampler, one gate
 # binary, a runner, docs); the larger value is the list itself: no forgotten gate, and a gate left out
 # is a printed record, not a judgment. It cannot see $BLOOMERY_DATA, the ik trees, or the card.
+# Ledger keys deliberately differ: `recipes.py key` may exclude proven-unreached dependency sources
+# while retaining own-target, build/proc-macro, script and opaque bounds. This affected list remains the
+# broad compile/selection contract; narrowing a key does not remove a recipe from the affected list.
 set -euo pipefail
 exec python3 "$(dirname "$0")/recipes.py" affected "$@"

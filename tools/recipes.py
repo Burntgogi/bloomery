@@ -85,6 +85,19 @@ A recipe's inputs are:
   - its own text in the justfile (a recipe whose text changed is selected), and its dependencies'
     inputs.
 
+The ledger's `key` uses a separate `Graph.key_inputs` contract: the uncut structural item graph, the selected
+targets' own module/root files, mandatory build-script/build-dependency/procedural-macro compilation inputs,
+manifest views, dep-info, explicit reads and dependency recipes. Unused linked runtime modules are not ledger
+inputs. Procedural/startup attributes are inspected throughout every runtime-active owner's compiled files
+(an uncut reached item or explicit extern-crate link activates an owner). Opaque attributes/derives retain
+their owner's compiled source/literals and linked dependency closure, not unrelated reverse/sibling packages.
+This is compilation-code ownership, not arbitrary procedural-macro filesystem completeness:
+explicit/script reads remain independently keyed.
+Opaque macros retain their owner's compilation/dependency closure. Unknown generated includes and foreign
+linkage retain the broad recipe inputs conservatively.
+Reach's complete structural facts/edges are privately cached as validated JSON, content-checked against source
+bytes, enumeration, metadata and analysis code; that cache identity never enters individual ledger keys.
+
 Honest expectation: a change in crates/gpu or crates/model selects every GPU gate — that is the
 crate graph's true answer (a one-line enum change in the fault word selects them all, and it should).
 The saving is on leaf changes (serve, tokenizer, sampler, one gate binary, a runner, docs — which no gate
@@ -230,6 +243,8 @@ import tempfile
 import time
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
+
+_REACH_LOADED_CODE = sys._getframe().f_code
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # `python3 -I` drops the script's directory
 from bloomery.fixture_dirs import FAMILY_NAME, FIXTURE_DIRS, REF_PATHS, RecipeError, fixture_table  # noqa: E402,F401
@@ -744,6 +759,7 @@ class TargetMeta:
     name: str
     src: str  # relative to the tree root
     required: list[str]
+    proc_macro: bool = False  # Cargo's target kind, not inferred from source spelling
 
 
 @dataclass
@@ -785,23 +801,23 @@ class Package:
 # a file for that recipe, never a view (`ManifestUse.whole`).
 TARGET_TABLES = ("bin", "test", "bench", "example")
 Entry = tuple[str, str, str]  # (kind, name, src) of a target whose entry a view keeps
-_TOML_MEMO: dict[tuple[str, int, int], dict] = {}
+_TOML_MEMO: dict[tuple[str, str], dict] = {}
 
 
 def read_manifest(root: str, rel: str) -> dict:
-    """`rel` parsed with tomllib, memoized on its stat. A manifest that does not parse is a named error,
+    """`rel` parsed with tomllib, memoized on its bytes. A manifest that does not parse is a named error,
     never a fallback to the whole file."""
     import tomllib
 
     p = os.path.join(root, rel)
-    st = os.stat(p)
-    k = (p, st.st_size, st.st_mtime_ns)
+    with open(p, "rb") as fh:
+        data = fh.read()
+    k = (p, hashlib.sha256(data).hexdigest())
     if k not in _TOML_MEMO:
-        with open(p, "rb") as fh:
-            try:
-                _TOML_MEMO[k] = tomllib.load(fh)
-            except tomllib.TOMLDecodeError as err:
-                raise RecipeError(f"{rel} does not parse as TOML ({err}): a package manifest is read by table") from err
+        try:
+            _TOML_MEMO[k] = tomllib.loads(data.decode("utf-8"))
+        except (tomllib.TOMLDecodeError, UnicodeDecodeError) as err:
+            raise RecipeError(f"{rel} does not parse as TOML ({err}): a package manifest is read by table") from err
     return _TOML_MEMO[k]
 
 
@@ -1033,6 +1049,7 @@ class Tree:
     def __init__(self, root: str, meta: dict | None = None):
         self.root = os.path.realpath(root)
         meta = meta if meta is not None else cargo_metadata(self.root)
+        self.metadata = meta
         wroot = os.path.realpath(meta["workspace_root"])
         members = set(meta["workspace_members"])
         self.packages: dict[str, Package] = {}
@@ -1058,6 +1075,7 @@ class Tree:
                     name=t["name"],
                     src=os.path.relpath(os.path.realpath(t["src_path"]), wroot),
                     required=list(t.get("required-features") or []),
+                    proc_macro="proc-macro" in t["kind"] or "proc-macro" in t.get("crate_types", []),
                 )
                 for t in p["targets"]
             ]
@@ -1091,6 +1109,26 @@ class Tree:
         if self._saw:
             self._saw[-1].setdefault(("d", rel), ok)
         return ok
+
+    def directory_files(self, rel: str) -> set[str]:
+        """Every regular file under an explicit directory; unreadable entries are errors."""
+        out: set[str] = set()
+        seen: set[str] = set()
+
+        def unlisted(error):
+            raise error
+
+        for base, dirs, files in os.walk(os.path.join(self.root, rel), followlinks=True, onerror=unlisted):
+            real = os.path.realpath(base)
+            if real in seen:
+                dirs.clear()
+                continue
+            seen.add(real)
+            for name in files:
+                path = os.path.join(base, name)
+                if stat.S_ISREG(os.stat(path).st_mode):
+                    out.add(os.path.relpath(path, self.root))
+        return out
 
     def read(self, rel: str) -> str:
         path = os.path.join(self.root, rel)
@@ -1686,6 +1724,7 @@ class Graph:
         self.tree = tree
         self.recipes = recipes
         self._inputs: dict[str, RecipeInputs] = {}
+        self._key_inputs: dict[str, RecipeInputs] = {}
         self._script_cache: dict[str, dict[str, str]] = {}
 
     def script_closure(self, rel: str) -> dict[str, str]:
@@ -1722,6 +1761,20 @@ class Graph:
         for s in seen:
             out.setdefault(s, f"script {rel}")
         return out
+
+    def named_reads(self, rc: RecipeCommands) -> tuple[dict[str, str], list[str]]:
+        """Script/explicit-path reads independently of Cargo's first-writer origin explanations."""
+        reads: dict[str, str] = {}
+        errors: list[str] = []
+        for s in rc.scripts + rc.paths:
+            if self.tree.exists(s):
+                for f, why in self.script_closure(s).items():
+                    reads.setdefault(f, why)
+            elif self.tree.isdir(s):
+                reads.setdefault(s.rstrip("/") + "/", "named directory")
+            elif s in rc.scripts or s.endswith(_SCRIPT_EXT):
+                errors.append(f"names {s}, which is not in the tree")
+        return reads, errors
 
     def inputs(self, name: str, _stack: tuple[str, ...] = ()) -> RecipeInputs:
         if name in self._inputs:
@@ -1768,19 +1821,11 @@ class Graph:
                 errors.append(str(err))
             if any(m is not None and "{{" in m for m in rc.models):
                 prefixes.setdefault("tools/ref/models/", "recipe parameter selects the profile")
-        for s in rc.scripts + rc.paths:
-            if self.tree.exists(s):
-                for f, why in self.script_closure(s).items():
-                    if f.endswith("/"):
-                        prefixes.setdefault(f, why)
-                    else:
-                        files.setdefault(f, why)
-                        if f in self.tree.manifest_paths:
-                            use.whole.add(f)
-            elif self.tree.isdir(s):
-                prefixes.setdefault(s.rstrip("/") + "/", "named directory")
-            elif s in rc.scripts or s.endswith(_SCRIPT_EXT):
-                errors.append(f"names {s}, which is not in the tree")
+        reads, read_errors = self.named_reads(rc)
+        errors.extend(read_errors)
+        for f, why in reads.items():
+            (prefixes if f.endswith("/") else files).setdefault(f, why)
+        use.whole |= reads.keys() & self.tree.manifest_paths
         built = {t for (_, k, t, _) in targets if k == "bin"}
         for dep in recipe.deps:
             if dep not in self.recipes:
@@ -1803,6 +1848,70 @@ class Graph:
         use.whole |= {m for m in self.tree.manifest_paths if m in CARGO_GLOBALS or any(m.startswith(p) for p in prefixes)}
         ri = RecipeInputs(files, prefixes, targets, errors, rc, use, bare)
         self._inputs[name] = ri
+        return ri
+
+    def key_inputs(self, name: str, _stack: tuple[str, ...] = ()) -> RecipeInputs:
+        """Ledger inputs, not compilation/selection inputs: uncut item reach plus mandatory reads.
+
+        Dependency recipes are closed separately: their targets are deliberately not in `inputs(name).targets`.
+        Scripts, explicit paths, manifests, build-time code and dep-info retain their conservative contracts.
+        `inputs` never calls this method; affected/narrow/release continue to use compilation ownership.
+        """
+        if name in _stack:
+            raise RecipeError(f"recipe dependency cycle: {' -> '.join(_stack + (name,))}")
+        reach = reach_of(self.tree)
+        if reach._key_snapshot is not None:
+            from bloomery import reach_cache
+
+            if not reach_cache.current(reach):
+                if _stack:
+                    raise RecipeError("source tree changed during recipe dependency analysis")
+                # A new request may follow an edit in a long-lived process. Forget derived state before
+                # beginning that request; changes during the request itself are rejected by validate().
+                self.tree._walk_cache.clear()
+                self.tree.unresolved.clear()
+                self._inputs.clear()
+                self._key_inputs.clear()
+                self._script_cache.clear()
+                reach = self.tree._reach = Reach(self.tree)
+            elif name in self._key_inputs:
+                return self._key_inputs[name]
+        reach.prepare()
+        broad = self.inputs(name)
+        reach.validate()
+        keep = reach.key_files(self, name)
+        files = {f: why for f, why in broad.files.items() if f in keep or not _linked_origin(why)}
+        prefixes = {f: why for f, why in broad.prefixes.items() if f in keep or not _linked_origin(why)}
+        if name in reach._key_wide:
+            files = {f: f"{why} (conservative: opaque generated code, macro expansion or foreign linkage)" if _linked_origin(why) else why
+                     for f, why in files.items()}
+            prefixes = {f: f"{why} (conservative: opaque generated code, macro expansion or foreign linkage)" if _linked_origin(why) else why
+                        for f, why in prefixes.items()}
+        # Origins explain the first read only: Cargo may have claimed a file also read by cat/a script.
+        # Re-union the independent read closure rather than treating that explanation as ownership.
+        reads, _ = self.named_reads(broad.commands)
+        for f, why in reads.items():
+            (prefixes if f.endswith("/") else files).setdefault(f, why)
+        for f in keep:
+            if f.endswith("/"):
+                prefixes.setdefault(f, "reached directory / mandatory compilation input")
+            elif self.tree.exists(f):
+                files.setdefault(f, "reached code / mandatory compilation input")
+        use = ManifestUse()
+        use.merge(broad.manifests)
+        errors = list(broad.errors)
+        for dep in self.recipes[name].deps:
+            if dep not in self.recipes:
+                continue
+            di = self.key_inputs(dep, _stack + (name,))
+            for f, why in di.files.items():
+                files.setdefault(f, f"{why} (via {dep})")
+            for p, why in di.prefixes.items():
+                prefixes.setdefault(p, f"{why} (via {dep})")
+            use.merge(di.manifests)
+            errors.extend(f"{dep}: {error}" for error in di.errors)
+        ri = RecipeInputs(files, prefixes, list(broad.targets), errors, broad.commands, use, broad.bare_cargo)
+        self._key_inputs[name] = ri
         return ri
 
 
@@ -2416,7 +2525,8 @@ def cmd_targets(args: argparse.Namespace) -> int:
             raise RecipeError(f"no recipe {n}")
         ri = side.graph.inputs(n)
         tl = ", ".join(f"{p}:{k}{(' ' + t) if t else ''}{('[' + ','.join(f) + ']') if f else ''}" for p, k, t, f in ri.targets)
-        print(f"{n}\t{len(ri.files)} files\t{tl}\tscripts: {' '.join(sorted(set(ri.commands.scripts))) or '-'}\truns: {' '.join(ri.commands.runs) or '-'}")
+        ki = side.graph.key_inputs(n)
+        print(f"{n}\t{len(ri.files)} compilation files, {len(ki.files)} key files\t{tl}\tscripts: {' '.join(sorted(set(ri.commands.scripts))) or '-'}\truns: {' '.join(ri.commands.runs) or '-'}")
         for e in ri.errors:
             print(f"  error: {e}")
     return 0
@@ -2460,7 +2570,7 @@ def cmd_why(args: argparse.Namespace) -> int:
         names = list(args.recipe)
     for f in args.files:
         f = _norm(f)
-        hits = [(n, side.graph.inputs(n).match(f)) for n in names]
+        hits = [(n, side.graph.key_inputs(n).match(f)) for n in names]
         if args.recipe:
             for n, w in hits:
                 print(f"{f} in the key of {n}: " + (f"yes [{w}]" if w else "no"))
@@ -2482,10 +2592,9 @@ def cmd_why(args: argparse.Namespace) -> int:
 # key against reach: a crate a gate's targets never run code of must not move that gate's key
 # ----------------------------------------------------------------------------------------------
 
-# The crates held to it, each with why: the gates whose key closure (Graph.inputs) holds a file of the crate are
-# the gates whose targets reach a unit of it (Reach). A crate edge that no target of a gate uses (an optional
-# dependency a feature turns on only for the binaries that need it, a crate the common code does not name) is the
-# gap; a commit that touches the crate then re-runs every gate that merely links it.
+# The pinned runtime crates must not enter keys merely through Cargo linkage. Manifests remain mandatory
+# compilation inputs and are not counted as runtime code by key_holders. Build scripts/proc macros and opaque
+# generated code can legitimately remain wider than runtime reach; gaps reports that distinction honestly.
 KEY_REACH_PINS = {
     "bloomery-hf": "a Hugging Face fetch or checkpoint configuration reader: its commits move only the gates whose targets run its code "
     "(model-hf, gpu-gates under the `hf` feature, and gpu-glm5next under its `hf` feature for gate-gpu-glm5next-tp's folder test)",
@@ -2511,8 +2620,8 @@ def key_holders(side: Side, crate: str, names: list[str]) -> list[str]:
     pre = side.tree.packages[crate].dir.rstrip("/") + "/"
     out = []
     for n in names:
-        ri = side.graph.inputs(n)
-        if any(f.startswith(pre) and _linked_origin(w) for f, w in ri.files.items()) or any(
+        ri = side.graph.key_inputs(n)
+        if any(f.startswith(pre) and f not in side.tree.manifest_paths and _linked_origin(w) for f, w in ri.files.items()) or any(
             (p.startswith(pre) or pre.startswith(p)) and _linked_origin(w) for p, w in ri.prefixes.items()
         ):
             out.append(n)
@@ -2520,10 +2629,12 @@ def key_holders(side: Side, crate: str, names: list[str]) -> list[str]:
 
 
 def reach_holders(side: Side, crate: str, names: list[str]) -> list[str]:
-    """The recipes of `names` with a cargo target whose reach (Reach.gate_files) holds a file of package `crate`."""
+    """Recipes whose uncut target closure reaches package code (independent of model/profile cuts)."""
     pre = side.tree.packages[crate].dir.rstrip("/") + "/"
     r = reach_of(side.tree)
-    return [n for n in names if side.graph.inputs(n).targets and any(f.startswith(pre) for f in r.gate_files(side.graph, n))]
+    return [n for n in names if any(any(f.startswith(pre) for f in
+            (r.nodes[m][1] for m in r._close(side.graph, dep, None)))
+            for dep in recipe_closure(side.recipes, n))]
 
 
 def key_reach_gap(side: Side, crate: str, names: list[str] | None = None) -> list[str]:
@@ -3187,6 +3298,8 @@ _ITEM_DEF = re.compile(r"\b(?:fn|struct|enum|union|trait|type|const|static)\s+(?
 _FN_NAME = re.compile(r"\bfn\s+(?:r#)?([A-Za-z_][A-Za-z0-9_]*)")
 _MACRO_EXPORT = re.compile(r"#\s*\[\s*macro_export\b[^\]]*\]\s*macro_rules\s*!\s*(?:r#)?([A-Za-z_][A-Za-z0-9_]*)")
 _MACRO_CALL = re.compile(r"(?<![A-Za-z0-9_:])([A-Za-z_][A-Za-z0-9_]*)\s*!\s*[(\[{]")
+_MACRO_PATH_CALL = re.compile(r"((?:(?:r#)?[A-Za-z_]\w*\s*::\s*)*(?:r#)?[A-Za-z_]\w*)\s*!\s*[(\[{]")
+_MACRO_IMPORT = re.compile(r"\b(?:use|extern\s+crate)\b")
 _WORD = re.compile(r"(?<![A-Za-z0-9_])[A-Za-z_][A-Za-z0-9_]*")
 _PUB_BEFORE = re.compile(r"\bpub\b(?:\s*\([^)]*\))?\s*$")
 _TYPE_PATH = re.compile(r"(?<![A-Za-z0-9_'])((?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*[A-Za-z_][A-Za-z0-9_]*)")
@@ -3285,6 +3398,76 @@ def _split_angles(text: str) -> list[str]:
             start = j + 1
     out.append(text[start:])
     return [x.strip() for x in out if x.strip()]
+
+
+def _key_attributes(shape: str) -> tuple[bool, bool]:
+    """(opaque expansion, foreign linkage) in all attributes of lexed Rust, including cfg_attr payloads.
+
+    cfg_attr predicates are deliberately not evaluated: any applicable startup/procedural attribute can
+    execute code without an ordinary item edge. Builtin derives are the only derives resolved here.
+    """
+    standard = {"cfg", "allow", "warn", "deny", "forbid", "expect", "doc", "test", "ignore", "inline",
+                "cold", "repr", "path", "macro_export", "must_use", "non_exhaustive",
+                "track_caller", "automatically_derived", "deprecated", "should_panic", "used"}
+    builtin_derives = {"Clone", "Copy", "Debug", "Default", "Eq", "PartialEq", "Ord", "PartialOrd", "Hash"}
+    foreign = {"no_mangle", "export_name", "link", "link_name", "link_section"}
+
+    def attribute(payload: str) -> tuple[bool, bool]:
+        match = re.match(r"\s*((?:[A-Za-z_]\w*\s*::\s*)*[A-Za-z_]\w*)", payload)
+        if match is None:
+            return True, False
+        name = re.sub(r"\s+", "", match.group(1))
+        rest = payload[match.end():].strip()
+        if name in ("cfg_attr", "derive", "unsafe"):
+            if not rest.startswith("(") or _close(rest, 0) != len(rest) - 1:
+                return True, False
+            args = _split_top(rest[1:-1])
+            if name == "derive":
+                return any(arg not in builtin_derives for arg in args), False
+            children = args[1:] if name == "cfg_attr" else args
+            flags = [attribute(child) for child in children]
+            return any(a for a, _ in flags), any(b for _, b in flags)
+        return name not in standard and name not in foreign, name in foreign
+
+    opaque = linkage = False
+    for match in re.finditer(r"#\s*!?\s*\[", shape):
+        end = _close(shape, match.end() - 1)
+        if end is None:
+            opaque = True
+            continue
+        a, b = attribute(shape[match.end():end])
+        opaque |= a
+        linkage |= b
+    return opaque, linkage
+
+
+@dataclass(frozen=True)
+class KeySyntax:
+    extern_crates: frozenset[str]
+    opaque: bool
+    foreign: bool
+    macro_calls: frozenset[str]
+    qualified: frozenset[tuple[str, ...]]
+    conditional: bool
+
+
+@functools.cache
+def _key_syntax(text: str) -> KeySyntax:
+    """File-local syntax only; bindings, macro resolution and active owners remain graph-specific."""
+    code, shape = rust_lex(text)
+    opaque, linkage = _key_attributes(shape)
+    calls = frozenset(match.group(1) for match in _MACRO_PATH_CALL.finditer(shape))
+    return KeySyntax(
+        frozenset(re.findall(r"\bextern\s+crate\s+([A-Za-z_]\w*)", shape)),
+        opaque or bool(re.search(r"(?<![\w:>\]])::|r#[A-Za-z_]", shape)),
+        linkage or bool(re.search(r'\bextern\s*(?:"[^"]*"\s*)?\{', code))
+        or bool(re.search(r'\binclude!\s*\(\s*(?!")\S', code)
+                or re.search(r'\binclude!\s*\(\s*"[^"]*(?<!\.rs)"', code)),
+        calls,
+        frozenset(tuple(part.removeprefix("r#") for part in re.split(r"\s*::\s*", call))
+                  for call in calls if "::" in call),
+        bool(re.search(r"#\s*!?\s*\[\s*cfg(?:_attr)?\b", shape)),
+    )
 
 
 def _type_names(text: str, params: frozenset[str]) -> tuple[tuple[str, ...] | None, tuple[tuple[str, ...], ...]]:
@@ -3479,6 +3662,16 @@ def _assoc_units(shape: str, a: int, b: int, ctx: tuple[str, ...], hdr: tuple[in
         end = max(_unit_end(shape, i, b, semi), i + 1)
         out.append(("assoc", ctx, m.group(2) if m is not None and m.group(2) != "_" else None, i, end, hdr, False))
         i = end
+
+
+@functools.cache
+def _source_macro_bodies(text: str, test: bool) -> dict[int, str]:
+    """Lexed bodies with only fixed $crate:: dollar paths, indexed like rust_facts."""
+    _, shape = build_view(text, test)
+    raw: list = []
+    _module_units(shape, 0, len(shape), (), raw, [])
+    return {k: shape[a:b] for k, (kind, _, _, a, b, _, _) in enumerate(raw)
+            if kind == "macro_rules!" and not re.search(r"\$(?!\s*crate\s*::)", shape[a:b])}
 
 
 @functools.cache
@@ -3720,6 +3913,10 @@ class Reach:
         self._archs: dict[tuple[str, str], tuple[frozenset[str] | None, dict[str, str]]] = {}
         self._dropped: dict[tuple[str, str], frozenset[int]] = {}
         self._dir_archs: dict[str, set[str]] | None = None
+        self._facts: dict[tuple[str, bool], RustFacts] = {}
+        self._key_snapshot = None
+        self._key_observed = {}
+        self._key_wide: set[str] = set()
 
     def text(self, f: str) -> str:
         if f not in self._text:
@@ -3727,7 +3924,10 @@ class Reach:
         return self._text[f]
 
     def facts(self, rk: RootKey, f: str) -> RustFacts:
-        return rust_facts(self.text(f), rk[2])
+        key = (f, rk[2])
+        if key not in self._facts:
+            self._facts[key] = rust_facts(self.text(f), rk[2])
+        return self._facts[key]
 
     def mods(self, rk: RootKey) -> dict[tuple[str, ...], str]:
         if rk not in self._mods:
@@ -3785,8 +3985,8 @@ class Reach:
         return path
 
     def units(self, rk: RootKey, f: str) -> list[Hit]:
-        """Every unit of file `f` in root `rk`; a file with no Rust items (a data file, an empty module) as -1."""
-        if not f.endswith(".rs"):
+        """Every unit of a Rust module; a non-source data file uses index -1."""
+        if not f.endswith(".rs") and f not in self.mods(rk).values():
             return [(rk, f, -1)]
         n = len(self.facts(rk, f).units)
         return [(rk, f, i) for i in range(n)] or [(rk, f, -1)]
@@ -4072,8 +4272,6 @@ class Reach:
         name some reached unit must say, None for an item std calls unnamed; rule 1)."""
         out = []
         for f in files:
-            if not f.endswith(".rs"):
-                continue
             facts = self.facts(rk, f)
             bases = self.bases(rk, f) or [()]
             sides: dict[ImplHead, tuple[list[list[int]], bool]] = {}
@@ -4320,7 +4518,8 @@ class Reach:
         self._gates[key] = {**full, **cut}
         return self._gates[key]
 
-    def _close(self, graph: Graph, n: str, open_rows: frozenset[int] | None) -> dict[int, tuple[int, str]]:
+    def _close(self, graph: Graph, n: str, open_rows: frozenset[int] | None,
+               extra: set[Hit] | None = None) -> dict[int, tuple[int, str]]:
         """The closure of gate `n`'s targets; `open_rows`, when given, are the only rows of the registry's table whose
         entries its dispatch edges lead to, until a unit that walks every row is reached."""
         self.dispatches()
@@ -4368,11 +4567,14 @@ class Reach:
                 own_set = self.own_rules(rk)
                 if own_set.rules and own_set not in sets:
                     sets.append(own_set)
-            own = [h for f in sorted(self.tree.tree_of(t.src, test)[0]) for h in self.units(rk, f)]
+            own = [h for f in sorted(self.tree.tree_of(t.src, test)[0]) if f in linked for h in self.units(rk, f)]
             # a test harness runs its #[test] fns, and they reach the rest; a target with none runs its main
             entries = [h for h in own if kind in ("libtest", "test") and h[2] >= 0 and self.facts(h[0], h[1]).units[h[2]].test]
             for h in entries or own:
                 seed(h, label)
+        for h in extra or ():
+            if h[1] in linked:
+                seed(h, "source macro compilation effect")
         builds = {self.tree.packages[bpkg].name: src for src, bpkg in self.builds.items() if src in linked}
         names = frozenset().union(*(rs.names for rs in sets))
         for rs in sets:
@@ -4431,6 +4633,222 @@ class Reach:
                     out.setdefault(self.nodes[m][1], m)
             self._gate_files[key] = out
         return self._gate_files[key]
+
+    def prepare(self) -> None:
+        """Materialize and persist the structural graph, never recipe/profile-specific cuts.
+
+        All target roots (including excluded-by-feature modules and test views) are discovered before publication.
+        Closure, environment and architecture decisions remain lazy and are never serialized as structural facts.
+        """
+        if self._key_snapshot is not None:
+            return
+        from bloomery import reach_cache
+
+        reach_cache.prepare(self)
+
+    def validate(self) -> None:
+        """Reject source movement during analysis/key assembly rather than publish a mixed-state green key."""
+        if self._key_snapshot is not None:
+            from bloomery import reach_cache
+
+            if not reach_cache.current(self):
+                raise RecipeError("source tree changed during reach analysis; request a fresh key")
+
+    def key_files(self, graph: Graph, n: str) -> set[str]:
+        """Uncut structural reach and mandatory compilation reads for the recipe's own targets.
+
+        Unlike gate_files this is not a runtime/profile allowlist. A selected target owns its complete module
+        tree; every linked package still owns its manifest/build script, and build dependencies and proc macros
+        retain their complete compile-time closures even if no runtime call reaches that package.
+        """
+        ri, tree = graph.inputs(n), self.tree
+        par = self._close(graph, n, None)
+        keep: set[str] = set()
+        keep |= {f for f in ri.files if f in tree.manifest_paths or f in CARGO_GLOBALS or f in OXIDE_GLOBALS
+                 or ri.files[f].startswith("dep-info")}
+        linked_packages = {p.name for p in tree.packages.values() if p.manifest in ri.files}
+        boundary = set(ri.files) | set(ri.prefixes)
+        compiled: dict[str, set[str]] = {p: set() for p in linked_packages}
+        reads: dict[str, set[str]] = {p: set() for p in linked_packages}
+        views: dict[tuple[str, str], set[RootKey]] = {}
+
+        def compile_root(pname: str, src: str, test: bool = False) -> set[str]:
+            files, lits = tree.tree_of(src, test)
+            files = files & boundary
+            for f in files:
+                compiled[pname].add(f)
+                views.setdefault((pname, f), set()).add((pname, src, test))
+            found = files | set(tree._resolve_literals(tree.packages[pname], [(f, lit) for f, lit in lits if f in files]))
+            reads[pname].update(found)
+            return found
+
+        def dependency_closure(owners: set[str]) -> set[str]:
+            # Follow every edge within the already linked boundary. all_features on just the first owner
+            # does not enable a transitive package's optional edges; Cargo may have unified those elsewhere.
+            closed = set(owners)
+            work = list(owners)
+            while work:
+                for dep in tree.packages[work.pop()].deps:
+                    if dep.pkg in linked_packages and dep.pkg not in closed:
+                        closed.add(dep.pkg)
+                        work.append(dep.pkg)
+            return closed
+
+        mandatory: set[str] = set()
+        for pname in linked_packages:
+            pkg = tree.packages[pname]
+            lib = pkg.lib()
+            if lib is not None:
+                compile_root(pname, lib.src)
+            if any(t.proc_macro for t in pkg.targets):
+                mandatory.add(pname)
+            mandatory.update(dep.pkg for dep in pkg.deps if dep.kind == "build" and dep.pkg in linked_packages)
+            for target in pkg.targets:
+                if target.kind == "build":
+                    keep |= compile_root(pname, target.src)
+        for pname, kind, tname, _ in ri.targets:
+            pkg = tree.packages[pname]
+            target = pkg.lib() if kind in ("lib", "libtest", "doctest") else pkg.find(kind, tname or "")
+            if target is not None:
+                keep |= compile_root(pname, target.src, kind not in ("lib", "doctest"))
+        for pname in dependency_closure(mandatory):
+            keep |= reads[pname]
+        safe_macros = {"assert", "assert_eq", "assert_ne", "debug_assert", "debug_assert_eq", "debug_assert_ne",
+                       "println", "print", "eprintln", "eprint", "format", "format_args", "panic", "unreachable",
+                       "unimplemented", "todo", "vec", "matches", "write", "writeln", "dbg", "concat", "stringify",
+                       "env", "option_env", "file", "line", "column", "module_path", "cfg", "include", "include_str",
+                       "include_bytes", "compile_error"}
+        # `if !(...)` and `while !(...)` are negated expressions, not calls to macros named `if`/`while`.
+        syntax_words = {"if", "while", "return", "break", "match", "let", "else", "for", "loop",
+                        "yield", "continue", "move", "async", "await", "unsafe", "const"}
+        opaque_owners: set[str] = set()
+        outside_ownership = False
+        # An unused --extern rlib is a compilation input, not necessarily part of the executable. Start
+        # with uncut reached owners, then honor explicit side-effect links even without a called item.
+        # Within each runtime-active owner scan *all* compilation files: an unreachable ctor can run.
+        active_owners = {self.nodes[m][0][0] for m in par if self.nodes[m][2] >= 0}
+        work = list(active_owners)
+        source_seeds: set[Hit] = set()
+        closed_seeds: set[Hit] = set()
+        exported_names = {name for p in linked_packages for name, hits in self.exported(p).items() if hits}
+        while True:
+            while work:
+                pname = work.pop()
+                pkg = tree.packages[pname]
+                for f in compiled[pname]:
+                    syntax = _key_syntax(self.text(f))
+                    facts_by_root = [(rk, self.facts(rk, f)) for rk in views[pname, f]]
+                    links = set(syntax.extern_crates)
+                    # Even an unused import can make rustc link a crate and run its constructors.
+                    links.update(path[0].removeprefix("r#")
+                                 for _, facts in facts_by_root for _, path, _, _ in facts.binds
+                                 if path and path[0] not in ("crate", "self", "super"))
+                    for dep in pkg.deps:
+                        if dep.pkg not in linked_packages or dep.pkg in active_owners:
+                            continue
+                        lib = tree.packages[dep.pkg].lib()
+                        if dep.key.replace("-", "_") in links or (lib is not None and lib.name.replace("-", "_") in links):
+                            active_owners.add(dep.pkg)
+                            work.append(dep.pkg)
+                    opaque = syntax.opaque
+                    outside_ownership |= syntax.foreign
+                    calls, qualified_paths = syntax.macro_calls, syntax.qualified
+                    qualified_known: set[tuple[RootKey, tuple[str, ...]]] = set()
+                    # Source macros use the existing unhygienic expansion edges, even from otherwise
+                    # unreached items: an expansion may emit a constructor or an implicit trait impl.
+                    for rk, facts in facts_by_root:
+                        known = set(self.macros(rk)) | exported_names
+                        unresolved: set[tuple[str, ...]] = set()
+                        for k, unit in enumerate(facts.units):
+                            if any(name in known for name in unit.macro_calls):
+                                source_seeds.add((rk, f, k))
+                            # Definition-site bindings are not copied into the invocation context.
+                            for name in unit.macro_calls:
+                                for g, i in self.macros(rk).get(name, ()):
+                                    body = _source_macro_bodies(self.text(g), rk[2]).get(i)
+                                    if body is None or _MACRO_IMPORT.search(body):
+                                        opaque = True
+                            for path in set(unit.sites) & qualified_paths:
+                                hits = [h for base in self.bases(rk, f) or [()]
+                                        for h in self.resolve(rk, base + unit.ctx, path) if h[2] >= 0]
+                                if hits and all(h[0][0] in linked_packages and
+                                                self.facts(h[0], h[1]).units[h[2]].kind == "macro_rules!" for h in hits):
+                                    source_seeds.add((rk, f, k))
+                                    qualified_known.add((rk, path))
+                                    for h in hits:
+                                        body = _source_macro_bodies(self.text(h[1]), h[0][2]).get(h[2])
+                                        # Imports and nested expansions may emit names absent from source edges.
+                                        # Bound the invoker, not an unrelated item elsewhere in the macro crate.
+                                        if body is None or _MACRO_IMPORT.search(body) or any(_key_attributes(body)) or any(
+                                                match.group(1).removeprefix("r#") not in syntax_words
+                                                for match in _MACRO_PATH_CALL.finditer(body)):
+                                            opaque = True
+                                else:
+                                    unresolved.add(path)
+                        qualified_known.difference_update((rk, path) for path in unresolved)
+                    # Only unconditionally named local enums are proven to import variants, never macros.
+                    # Imported/conditional paths remain opaque: a different binding may export a macro.
+                    glob_shadow = False
+                    conditional_bindings = syntax.conditional
+                    for rk, facts in facts_by_root:
+                        for ctx, path in facts.globs:
+                            hits = [h for base in self.bases(rk, f) or [()]
+                                    for h in self.walk(rk, base + ctx, path[:-1], True)
+                                    if h[2] >= 0] if len(path) == 2 and path[0] not in facts.bound and not conditional_bindings else []
+                            if not hits or any(self.facts(h[0], h[1]).units[h[2]].kind != "enum" for h in hits):
+                                glob_shadow = True
+                    for call in calls:
+                        spelling = re.split(r"\s*::\s*", call)[-1]
+                        if spelling in syntax_words:
+                            continue
+                        macro = spelling.removeprefix("r#")
+                        shadowed = glob_shadow or any(macro in facts.bound for _, facts in facts_by_root)
+                        local_source = all(macro in self.macros(rk) for rk, _ in facts_by_root)
+                        path = tuple(part.removeprefix("r#") for part in re.split(r"\s*::\s*", call))
+                        if "::" in call and all((rk, path) in qualified_known for rk, _ in facts_by_root):
+                            continue
+                        if "::" not in call and not shadowed and (macro in safe_macros or local_source):
+                            continue
+                        opaque = True
+                    if opaque:
+                        opaque_owners.add(pname)
+                        # Opaque expansion can name its package's forward dependencies, not unrelated
+                        # reverse/sibling packages. Inspect activated owners for linkage obligations too.
+                        added = dependency_closure({pname}) - active_owners
+                        active_owners.update(added)
+                        work.extend(added)
+            if source_seeds == closed_seeds:
+                break
+            par = self._close(graph, n, None, source_seeds)
+            closed_seeds = set(source_seeds)
+            added = {self.nodes[m][0][0] for m in par if self.nodes[m][2] >= 0} - active_owners
+            active_owners.update(added)
+            work.extend(added)
+        keep |= {self.nodes[m][1] for m in par}
+        # Module declarations/re-exports on the path to reached code are behavior, not merely linkage.
+        for rk, f in {(self.nodes[m][0], self.nodes[m][1]) for m in par}:
+            mods = self.mods(rk)
+            for path in self.bases(rk, f):
+                for depth in range(len(path) + 1):
+                    ancestor = mods.get(path[:depth])
+                    if ancestor in ri.files:
+                        keep.add(ancestor)
+        for m in par:
+            rk, f, k = self.nodes[m]
+            if k < 0:
+                continue
+            unit = self.facts(rk, f).units[k]
+            pkg = tree.packages[rk[0]]
+            keep.update(tree._resolve_literals(pkg, [(f, lit) for lit in unit.literals]))
+        # Macro expansion can name code in its own package and linked dependencies, but not an
+        # unrelated reverse/sibling package through ordinary Cargo paths. Named data/script reads are
+        # closed independently by Graph.key_inputs; arbitrary proc-macro I/O is outside this guarantee.
+        for pname in dependency_closure(opaque_owners):
+            keep |= reads[pname]
+        if outside_ownership:
+            self._key_wide.add(n)
+            keep |= set(ri.files) | set(ri.prefixes)
+        return keep
 
     def reason(self, graph: Graph, n: str, m: int) -> str:
         """Why gate `n` keeps unit `m`: a static chain, a registry row its model files name (with the signal that named it),
@@ -5941,19 +6359,19 @@ def rust_lex(text: str) -> tuple[str, str]:
     i, n = 0, len(text)
     while i < n:
         c = text[i]
-        if text.startswith("//", i):
+        if c == "/" and text.startswith("//", i):
             j = text.find("\n", i)
             j = n if j < 0 else j
             _blank(code, i, j)
             _blank(shape, i, j)
             i = j
             continue
-        if text.startswith("/*", i):
+        if c == "/" and text.startswith("/*", i):
             depth, j = 1, i + 2
             while j < n and depth:
-                if text.startswith("/*", j):
+                if text[j] == "/" and text.startswith("/*", j):
                     depth, j = depth + 1, j + 2
-                elif text.startswith("*/", j):
+                elif text[j] == "*" and text.startswith("*/", j):
                     depth, j = depth - 1, j + 2
                 else:
                     j += 1
@@ -7388,11 +7806,11 @@ def cmd_orphan_tests(args: argparse.Namespace) -> int:
 #   v         the key format
 #   recipe    the text of the recipe and of every recipe it depends on (just's own parse: a comment
 #             edit in the justfile does not move it), and the justfile's settings and assignments
-#   scope     `closure` — the files below come from the walk `affected` uses (crate graph, module
-#             trees, the scripts the recipe names and what they name; cfg-ignoring, so a superset) —
+#   scope     `closure` — uncut target-code reach plus mandatory compilation inputs (own module trees,
+#             build/proc-macro closures, manifests, dep-info), scripts/explicit reads and recipe dependencies —
 #             or `tree`, every file tools/box.sh ships, with the reason: a command run on the Mac, a
 #             cargo subcommand the parser does not model (`cargo fmt`), a script that walks the tree
-#   file      path relative to the tree, content sha256 (a link: its target)
+#   file      path relative to the tree, content sha256 (a link: its spelling and referent content)
 #   manifest  a package manifest the closure reads by table: path, sha256 of the item's view of it
 #             (manifest_view: the shared tables and its own targets' entries, canonical JSON — a comment
 #             or another target's entry does not move it); one read whole is a `file` part
@@ -7411,7 +7829,7 @@ def cmd_orphan_tests(args: argparse.Namespace) -> int:
 #             fixture directory (KeyContext.fixture_dirs; every file under it)
 # Not in it: the binary (its paths are per track) and the commit.
 
-KEY_VERSION = "bloomery-gate-key 1"
+KEY_VERSION = "bloomery-gate-key 2"
 MANIFEST_VERSION = "box-manifest 1"
 MAC_ENV = ("BLOOMERY_BOX", "BLOOMERY_CARD", "BLOOMERY_DATA", "BLOOMERY_FIXTURE_VARIANT", "BLOOMERY_MODEL", "BLOOMERY_REF_MODEL", "BLOOMERY_TIER", "BLOOMERY_V41_MODEL")
 # The fixture tier's files (tools/ref/ref-paths.sh: one directory a family under it). Its rows belong to the keys of fixture-tier
@@ -8239,6 +8657,7 @@ class KeyContext:
             self.manifest_error = f"the box manifest failed: {manifest_error}"
         self.settings = settings if settings is not None else justfile_settings(os.path.join(side.tree.root, "justfile"))
         self._sha: dict[str, str] = {}
+        self._links: dict[str, str | None] = {}
         self._lit: dict[str, frozenset[str]] = {}
         self._tree: list[str] | None = None
         self._fixture_table: tuple[dict[str, str], str] | None = None
@@ -8250,11 +8669,13 @@ class KeyContext:
 
     def file_part(self, rel: str) -> str:
         p = os.path.join(self.side.tree.root, rel)
-        if os.path.islink(p):
-            return f"link\t{rel}\t{os.readlink(p)}"
-        if rel not in self._sha:
-            self._sha[rel] = sha256_file(p)
-        return f"file\t{rel}\t{self._sha[rel]}"
+        digest = sha256_file(p)
+        self._sha[rel] = digest
+        spelling = os.readlink(p) if os.path.islink(p) else None
+        self._links[rel] = spelling
+        if spelling is not None:
+            return f"link\t{rel}\t{spelling}\t{digest}"
+        return f"file\t{rel}\t{digest}"
 
     def view_part(self, rel: str, wants: frozenset[Entry]) -> str:
         """The part of a manifest read by table: the sha256 of the item's view of it."""
@@ -8353,7 +8774,10 @@ class KeyContext:
         out = []
         for g in names:
             p = os.path.join(root, g)
-            out.append(f"global\t{g}\t{sha256_file(p) if os.path.isfile(p) else 'absent'}")
+            digest = sha256_file(p) if os.path.isfile(p) else "absent"
+            if digest != "absent":
+                self._sha[g] = digest
+            out.append(f"global\t{g}\t{digest}")
         toml = os.path.join(root, "Cargo.toml")
         out.append(f"global\toxide-rev\t{oxide_rev(self.side.tree.read('Cargo.toml')) if os.path.isfile(toml) else 'absent'}")
         return out
@@ -8409,7 +8833,9 @@ class KeyContext:
             hit = scan_file(self.side.tree.root, f, IK_READ)
             if hit:
                 return f"{hit} reads a reference tree, which is outside the key"
-        for f in sorted(ri.files):
+        # Safety detectors deliberately inspect the broad compilation closure, not just ledger reach.
+        detector_files = {f for n in names for f in self.side.graph.inputs(n).files}
+        for f in sorted(detector_files):
             if f.endswith(".rs") and self.side.tree.exists(f):
                 hit = scan_file(self.side.tree.root, f, HOME_LITERAL)
                 if hit:
@@ -8461,14 +8887,29 @@ class KeyContext:
         if self.manifest_error:
             return [], self.manifest_error, None, ""
         try:
-            ri = graph.inputs(name)
+            ri = graph.key_inputs(name)
         except (OSError, RecipeError) as err:
             return [], f"{name}: its inputs cannot be read: {err}", None, ""
         if ri.errors:
             return [], f"{name}: {ri.errors[0]}", None, ""
         names = recipe_closure(recipes, name)
         try:
-            return self._parts(name, names, ri, envs, argv)
+            self._sha.clear()
+            self._links.clear()
+            self._directories = {}
+            result = self._parts(name, names, ri, envs, argv)
+            for rel, digest in self._sha.items():
+                if sha256_file(os.path.join(tree.root, rel)) != digest:
+                    raise RecipeError(f"input changed during key assembly: {rel}")
+            for rel, spelling in self._links.items():
+                path = os.path.join(tree.root, rel)
+                if (os.readlink(path) if os.path.islink(path) else None) != spelling:
+                    raise RecipeError(f"link changed during key assembly: {rel}")
+            for prefix, files in self._directories.items():
+                if tree.directory_files(prefix) != files:
+                    raise RecipeError(f"directory changed during key assembly: {prefix}")
+            reach_of(tree).validate()
+            return result
         except (OSError, RecipeError) as err:
             return [], f"{name}: an input cannot be read: {err}", None, ""
 
@@ -8490,7 +8931,8 @@ class KeyContext:
                     if tree.exists(rel):
                         named.add(rel)
                     elif tree.isdir(rel):
-                        named |= {f for f in self.tree_files() if f.startswith(rel.rstrip("/") + "/")}
+                        found = self._directories[rel] = tree.directory_files(rel)
+                        named |= found
         parts = [f"v\t{KEY_VERSION}"]
         parts += [f"recipe\t{n}\t{sha256_text(recipes[n].text)}" for n in names]
         parts.append(f"recipe\t<justfile>\t{sha256_text(json.dumps(self.settings, sort_keys=True))}")
@@ -8500,7 +8942,8 @@ class KeyContext:
         else:
             files = set(ri.files)
             for p in ri.prefixes:
-                files |= {f for f in self.tree_files() if f.startswith(p)}
+                found = self._directories[p] = tree.directory_files(p)
+                files |= found
         for n in names:
             rc = self.side.graph.inputs(n).commands
             files |= {f"tools/ref/models/{profile}.sh" for profile in rc.profiles(self.env)}
@@ -8508,7 +8951,7 @@ class KeyContext:
         files -= set(KEY_GLOBALS)
         if scope == "closure":
             for u in tree.unresolved:
-                if u.split(": ", 1)[0] in files:
+                if u.split(": ", 1)[0] in self.side.graph.inputs(name).files:
                     return [], f"source walk: {u}", None, ""
         for rel in sorted(files):
             # a package manifest the closure reads by table is keyed on that view (manifest_view, the reader
@@ -10774,26 +11217,11 @@ def oxide_rev_self_test(expect) -> None:
 
 
 def key_reach_self_test(expect, side: Side) -> None:
-    """The pins of KEY_REACH_PINS on the real tree, FAIL-first on a copy of it whose gpu-gates links hf for every binary,
-    and the chains `why --recipe` prints."""
-    import copy
-
+    """The runtime key/reach pins and genuine Cargo-linkage explanation chains on the real tree."""
+    # PIN(2026-10-22): Drop the plain-link hf mutation: v2 keys exclude uncalled runtime code.
     for crate, reason in KEY_REACH_PINS.items():
         gap = key_reach_gap(side, crate)
         expect(not gap, f"{crate} ({reason}): {len(gap)} recipes key it without reaching it: {' '.join(gap[:8])}")
-    # FAIL-first: gpu-gates' optional hf dependency made plain is the edge the `hf` feature cuts. Every recipe that builds a
-    # gate binary then keys hf (gate-gpu-p1 and gate-gpu-ds41-attn call neither the fetch nor a checkpoint reader), and the
-    # measure names them.
-    tree2 = copy.copy(side.tree)
-    packages = dict(side.tree.packages)
-    gates = copy.copy(packages["bloomery-gpu-gates"])
-    gates.deps = [dataclasses.replace(d, optional=False) if d.pkg == "bloomery-hf" else d for d in gates.deps]
-    packages["bloomery-gpu-gates"] = gates
-    tree2.packages = packages
-    side2 = Side(tree2, side.recipes, Graph(tree2, side.recipes))
-    probe = ["gate-gpu-p1", "gate-gpu-ds41-attn", "gate-hf"]
-    expect(sorted(key_holders(side2, "bloomery-hf", probe)) == sorted(probe), f"FAIL-first: hf is not in every probe's key with a plain gpu-gates edge: {key_holders(side2, 'bloomery-hf', probe)}")
-    expect(key_reach_gap(side2, "bloomery-hf", probe) == ["gate-gpu-p1", "gate-gpu-ds41-attn"], f"FAIL-first: the gap of a plain gpu-gates edge is {key_reach_gap(side2, 'bloomery-hf', probe)}")
     # why --recipe: a recipe that links the crate names the chain from its target, one that does not names none
     expect(why_chains(side, "gate-gpu-p1", "crates/hf/src/lib.rs") == [], f"why: gate-gpu-p1 links hf: {why_chains(side, 'gate-gpu-p1', 'crates/hf/src/lib.rs')}")
     chain = why_chains(side, "gate-gpu-glm5next-twocard", "crates/hf/src/lib.rs")
@@ -10810,6 +11238,16 @@ def key_reach_self_test(expect, side: Side) -> None:
 def reach_self_test(expect, side: Side, row, stats: dict[str, int]) -> None:
     """The derivation (Reach) on a synthetic workspace, one file per rule it decides, and the table's check of it on
     the real tree: a draft row that leaves out a gate reaching its files through another lib, and the exceptions."""
+    for source, want in (
+        ("#[derive(Clone, Debug, PartialEq)] struct S;", (False, False)),
+        ('// #[ctor::ctor]\nconst S: &str = "#[ctor::ctor]";', (False, False)),
+        ("#[ctor::ctor] fn startup() {}", (True, False)),
+        ('#[cfg_attr(feature = "boot", ctor::ctor)] fn startup() {}', (True, False)),
+        ('#[cfg_attr(unix, cfg_attr(feature = "boot", ctor::ctor))] fn startup() {}', (True, False)),
+        ('#[cfg_attr(unix, derive(Debug, custom::Error))] enum E {}', (True, False)),
+        ('#[unsafe(link_section = ".init_array")] static INIT: fn() = boot;', (False, True)),
+    ):
+        expect(_key_attributes(rust_lex(source)[1]) == want, f"key attributes misclassify {source!r}")
     with tempfile.TemporaryDirectory(prefix="recipes-reach-") as tmp:
         files = {
             "base/Cargo.toml": "",
@@ -10832,12 +11270,18 @@ def reach_self_test(expect, side: Side, row, stats: dict[str, int]) -> None:
             "base/src/rows.rs": (
                 "pub const LIST: &str = include_str!(\"../data/list.txt\");\npub const IDLE: &str = include_str!(\"../data/idle.txt\");\n"
                 "pub const TABLE: &str = \"../tools/table.tsv\";\npub const HELD: &str = \"../tools/lib-held\";\n"
+                "pub const UNUSED: &str = \"../tools/idle.tsv\";\npub const UNUSED_DIR: &str = \"../tools/idle-held\";\n"
                 + "".join(f"pub fn {f}() -> &'static str {{\n    {c}\n}}\n" for f, c in (("list", "LIST"), ("idle", "IDLE"), ("table", "TABLE"), ("held", "HELD")))
             ),
             "mid/Cargo.toml": "",
             "mid/src/lib.rs": (
+                "mod idle;\n"
                 "pub fn call() -> u32 {\n    base::b::run();\n    base::mk!();\n    base::rows::list();\n    base::rows::table();\n"
                 "    base::rows::held();\n    base::g::K\n}\n"
+            ),
+            "mid/src/idle.rs": "pub fn idle() {}\n",
+            "tools/shared-read.sh": (
+                'cat tools/idle.tsv\nfind "$ROOT/tools/idle-held" -type f\nfind "$ROOT/base" -name Cargo.toml\n'
             ),
             "app/Cargo.toml": "",
             "app/src/lib.rs": "",
@@ -10850,7 +11294,8 @@ def reach_self_test(expect, side: Side, row, stats: dict[str, int]) -> None:
         }
         for x in "abcdefh":
             files[f"base/src/{x}.rs"] = "pub fn run() {}\n"
-        for rel in ("base/data/list.txt", "base/data/idle.txt", "tools/table.tsv", "tools/lib-held/b.ids", "tools/own-held/a.ids"):
+        for rel in ("base/data/list.txt", "base/data/idle.txt", "tools/table.tsv", "tools/lib-held/b.ids",
+                    "tools/own-held/a.ids", "tools/idle.tsv", "tools/idle-held/extra.txt"):
             files[rel] = "x\n"
         for rel, text in files.items():
             os.makedirs(os.path.join(tmp, os.path.dirname(rel)), exist_ok=True)
@@ -10901,6 +11346,26 @@ def reach_self_test(expect, side: Side, row, stats: dict[str, int]) -> None:
         # reached, and what only an unreached unit holds is not
         for f, reached in (("base/data/list.txt", True), ("tools/table.tsv", True), ("base/data/idle.txt", False)):
             expect(bool(dep_reach(st, sg, ["gate-app"], f)) == reached, f"reach: {f} {'not reached' if reached else 'reached'} through the unit that holds it")
+        ki = sg.key_inputs("gate-app")
+        for f in want:
+            expect(ki.match(f) is not None, f"key reach omits reached dependency code {f}")
+        for f in ("base/src/a.rs", "base/src/d.rs", "base/src/f.rs", "base/data/idle.txt"):
+            expect(ki.match(f) is None, f"key reach retains unused linked input {f}")
+        for f in ("app/tests/it.rs", "app/tests/common/mod.rs", "base/src/lib.rs",
+                  "tools/lib-held/b.ids", "tools/own-held/a.ids"):
+            expect(ki.match(f) is not None, f"key reach omits a root/module/directory input {f}")
+        expect(ki.match("mid/src/idle.rs") is None, "key reach retains an unused reverse-dependent module")
+        for command in ("cat tools/idle.tsv", "bash tools/shared-read.sh"):
+            scripted = Recipe("gate-read", [*rs["gate-app"].lines, command], [], "")
+            reads_graph = Graph(st, {"gate-read": scripted})
+            expect(_linked_origin(reads_graph.inputs("gate-read").files["tools/idle.tsv"]),
+                   "shared-read regression needs Cargo to have supplied the first explanation")
+            read_inputs = reads_graph.key_inputs("gate-read")
+            expect(read_inputs.match("tools/idle.tsv") is not None, f"{command}: a Cargo-first explicit/script read was erased")
+            if command.startswith("bash"):
+                expect(read_inputs.match("tools/idle-held/extra.txt") is not None,
+                       "a Cargo-first literal prefix erased a script's independent find read")
+                expect("base/Cargo.toml" in read_inputs.manifests.whole, "script directory read lost the manifest whole override")
         # the row check reads the same links: a row for a path-literal file naming the gates that reach it is clean, and
         # one that leaves gate-app out is refused with the chain
         for f in ("base/data/list.txt", "tools/table.tsv"):
@@ -10958,6 +11423,50 @@ def reach_self_test(expect, side: Side, row, stats: dict[str, int]) -> None:
                f"gate-paths: a row for a test's own directory literal not refused: {got}")
         got = gate_paths_problems(st, rs, [row("tools/lib-held/b.ids", ["gate-app", "gate-mid"])])
         expect(not got, f"gate-paths: a row for a lib's directory literal refused: {got[:2]}")
+        # Opaque expansions are bounded by their runtime-active package and forward dependencies, not
+        # reverse/sibling packages. A transitive optional edge can be linked by a different Cargo root.
+        extra = {
+            "leaf/Cargo.toml": "", "leaf/src/lib.rs": "mod idle;\npub fn leaf() {}\n",
+            "leaf/src/idle.rs": "pub fn idle() {}\n",
+            "opt/Cargo.toml": "", "opt/src/lib.rs": "mod idle;\npub fn optional() {}\n",
+            "opt/src/idle.rs": "pub fn idle() {}\n",
+            "side/Cargo.toml": "", "side/src/lib.rs": "#[derive(custom::Hidden)] pub struct Side;\n",
+        }
+        for rel, text in extra.items():
+            os.makedirs(os.path.join(tmp, os.path.dirname(rel)), exist_ok=True)
+            with open(os.path.join(tmp, rel), "w", encoding="utf-8") as fh:
+                fh.write(text)
+        leaf = pkg("leaf", [("lib", "leaf", "src/lib.rs")], ["opt"])
+        leaf["dependencies"][0]["optional"] = True
+        opaque_meta = {
+            "workspace_root": tmp, "workspace_members": ["base", "mid", "app", "leaf", "opt", "side"],
+            "packages": [
+                pkg("base", [("lib", "base", "src/lib.rs")], ["leaf"]),
+                pkg("mid", [("lib", "mid", "src/lib.rs")], ["base"]),
+                pkg("app", [("lib", "app", "src/lib.rs"), ("test", "it", "tests/it.rs")], ["mid", "base", "opt", "side"]),
+                leaf, pkg("opt", [("lib", "opt", "src/lib.rs")], []), pkg("side", [("lib", "side", "src/lib.rs")], []),
+            ],
+        }
+        for source, widened in (
+            ("#[derive(Debug)] pub struct Hidden;\n", False),
+            ("#[derive(Debug, thiserror::Error)] pub enum Hidden {}\n", True),
+            ("#[ctor::ctor] fn startup() { crate::d::run(); }\n", True),
+            ('#[cfg_attr(unix, cfg_attr(feature = "boot", ctor::ctor))] fn startup() { crate::d::run(); }\n', True),
+        ):
+            with open(os.path.join(tmp, "base/src/a.rs"), "w", encoding="utf-8") as fh:
+                fh.write(source)
+            opaque_graph = Graph(Tree(tmp, opaque_meta), rs)
+            inputs = opaque_graph.key_inputs("gate-app")
+            for rel in ("base/src/d.rs", "base/data/idle.txt", "leaf/src/idle.rs", "opt/src/idle.rs"):
+                expect((inputs.match(rel) is not None) == widened, f"opaque owner closure miskeys {rel}: {source!r}")
+            for rel in ("mid/src/idle.rs", "side/src/lib.rs"):
+                expect(inputs.match(rel) is None, f"opaque owner restored an unrelated reverse/sibling input {rel}: {source!r}")
+        with open(os.path.join(tmp, "base/src/a.rs"), "w", encoding="utf-8") as fh:
+            fh.write("extern crate side as _;\n")
+        # An extern-crate link must be declared by its importer, not only by the final application's sibling edge.
+        opaque_meta["packages"][0] = pkg("base", [("lib", "base", "src/lib.rs")], ["leaf", "side"])
+        inputs = Graph(Tree(tmp, opaque_meta), rs).key_inputs("gate-app")
+        expect(inputs.match("side/src/lib.rs") is not None, "explicit side-effect extern-crate link lost its opaque owner")
 
     # the table's check on the real tree: the held rows, and the derivation's own lines
     tree, recipes, graph = side.tree, side.recipes, side.graph
