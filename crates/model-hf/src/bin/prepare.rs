@@ -836,6 +836,20 @@ mod tests {
                 );
                 expected.keys = both.clone();
                 assert!(served_as_hf(&both, &expected).is_ok());
+                // A flag of HF's that is not a bool is refused, not read as off.
+                expected
+                    .keys
+                    .retain(|(k, _)| k != "tokenizer.ggml.add_bos_token");
+                expected
+                    .keys
+                    .push(("tokenizer.ggml.add_bos_token".into(), Value::U32(1)));
+                assert!(
+                    served_as_hf(&both, &expected)
+                        .err()
+                        .unwrap()
+                        .to_string()
+                        .contains("add_bos_token is U32(1), not a bool")
+                );
             }
         }
     }

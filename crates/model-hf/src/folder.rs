@@ -1111,7 +1111,14 @@ pub fn served_as_hf(
         ("tokenizer.ggml.add_bos_token", served.add_bos()),
         ("tokenizer.ggml.add_eos_token", served.add_eos()),
     ] {
-        if actual != expected(key).and_then(Value::as_bool).unwrap_or(false) {
+        // An absent key is the flag off; a value that is not a bool is refused, not read as off.
+        let want = match expected(key) {
+            None => false,
+            Some(v) => v
+                .as_bool()
+                .ok_or_else(|| format!("HF {key} is {v:?}, not a bool"))?,
+        };
+        if actual != want {
             return Err(format!("serving {key} differs from HF's").into());
         }
     }
