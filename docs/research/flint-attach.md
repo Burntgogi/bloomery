@@ -126,11 +126,15 @@ weights. Its host sum is precomputed and activation images are checked by
 readback: it is not expert execution or two-card completion/publication proof.
 The hardware case has not been run here.
 
-The new `ds41_ffn_handoff_6_tier` entry needs add-class PTX/JIT/resource and
+The new `ffn_handoff_6_tier` entry needs add-class PTX/JIT/resource and
 owning-gate evidence; the eight-slot and other existing entries must remain
 unchanged. No PTX resource pin is added without an observed NVIDIA JIT run.
 Actual six-slot body/tier and two-card completion remain integration work, not
 capabilities inferred from this primitive.
+`check-ptx-names` remains red until observed spill/JIT-local measurements can pin
+the new entry in the four existing architecture/capability tables. Offline
+no-JIT scans cannot supply that missing column, so no placeholder row is added.
+
 
 
 
