@@ -21,7 +21,10 @@
 //! `prefill_then_step_near_steps`, `prefill_group_is_group_one` and `fault_word_clean`, and the family's own,
 //! `prefill_batch_forms`, which runs first and on no file: the batch's wide pools quantize the input of every projection
 //! type the loader accepts (each type alone at both widths, then a mix), so a model whose projections are K-quants
-//! prefills as the checkpoint folder's MXFP8 ones do.
+//! prefills as the checkpoint folder's MXFP8 ones do; and `prefill_units_full`, after the common ones on a single card:
+//! a prompt of `2 · T_MAX` ids at the default prompt group is one walk of two whole units, and each routed layer's
+//! host leg serves each unit once over all its `T_MAX` rows (the walk's stats), so the host reads a layer's experts
+//! once a unit of `T_MAX` rows and not once a smaller cut.
 //!
 //! The real tier's model is the checkpoint folder the end-to-end gate reads; the fixture tier's is its fixture cut.
 //!
@@ -115,7 +118,9 @@ mod gate {
     use bloomery_gpu_minimaxm3::MiniMaxM3Model;
     use bloomery_gpu_minimaxm3::attn::MsaShape;
     use bloomery_gpu_minimaxm3::body::{Dims, INDEX, PROJ};
-    use bloomery_gpu_minimaxm3::prefill::{Batch, T_MAX};
+    use bloomery_gpu_minimaxm3::prefill::{
+        Batch, T_MAX, set_prefill_group, set_prompt_stats, take_prompt_stats,
+    };
     use bloomery_gpu_minimaxm3::stream::XSTREAM_COSTS;
     use cuda_core::DeviceBuffer;
     use refset::arch::minimaxm3::ARCH;
@@ -335,7 +340,79 @@ mod gate {
             println!("{}", tier::tally_line());
             return Err(checks_failed());
         }
+        if tier::run_clause("prefill_units_full", Tag::SelfConsistency)?
+            && !units_full(&mut seat, dims.vocab)?
+        {
+            println!("clause prefill_units_full FAIL");
+            println!("{}", tier::tally_line());
+            return Err(checks_failed());
+        }
         common
+    }
+
+    /// The prompt length of `prefill_units_full`: two whole units, one walk of the default prompt group.
+    const UNITS_P: usize = 2 * T_MAX;
+
+    /// The prompt group `prefill_units_full` runs at: the lever's default, which a serving load runs.
+    const UNITS_GROUP: usize = bloomery_levers::PREFILL_GROUP_DEFAULT as usize;
+
+    /// The clause `prefill_units_full` (module doc): a prompt of [`UNITS_P`] ids of the fixed walk from a reset, at
+    /// [`UNITS_GROUP`] units a walk, with the walk's timing armed. It holds the walk's stats to one walk of two units, and
+    /// every routed layer to one serve a unit, each over `T_MAX` columns. A call that walked no routed layer proves
+    /// nothing and fails by name. The seat leaves at group 1 with the timing disarmed, as it came.
+    fn units_full(seat: &mut seat::Loaded, vocab: usize) -> Result<bool, GateError> {
+        let ids = crate::e2e::walk(UNITS_P, vocab);
+        seat.reset()?;
+        set_prefill_group(seat.model_mut(), UNITS_GROUP)?;
+        set_prompt_stats(seat.model_mut(), true)?;
+        let fed = seat.prompt(&ids);
+        let stats = take_prompt_stats(seat.model_mut());
+        set_prompt_stats(seat.model_mut(), false)?;
+        set_prefill_group(seat.model_mut(), 1)?;
+        seat.reset()?;
+        fed?;
+        let Some(st) = stats? else {
+            println!("prefill_units_full: a prompt of {UNITS_P} ids left no walk stats FAIL");
+            return Ok(false);
+        };
+        let mut layers: Vec<usize> = st.rows.iter().map(|r| r.layer).collect();
+        layers.sort_unstable();
+        layers.dedup();
+        let serves = |l: usize, u: usize| {
+            st.rows
+                .iter()
+                .filter(|r| r.layer == l && r.unit == u)
+                .count()
+        };
+        let short: Vec<(usize, usize, usize)> = st
+            .rows
+            .iter()
+            .filter(|r| r.cols != T_MAX)
+            .map(|r| (r.layer, r.unit, r.cols))
+            .collect();
+        let once = layers
+            .iter()
+            .all(|&l| serves(l, 0) == 1 && serves(l, 1) == 1);
+        let experts =
+            st.rows.iter().map(|r| r.experts).sum::<usize>() as f64 / st.rows.len().max(1) as f64;
+        let ok = st.walks == 1
+            && st.ubatches == 2
+            && !layers.is_empty()
+            && st.rows.len() == 2 * layers.len()
+            && once
+            && short.is_empty();
+        println!(
+            "prefill_units_full: a prompt of {UNITS_P} ids at group {UNITS_GROUP}: {} walks, {} units, {} routed layers, \
+             {} serves (one a unit a layer {}), units short of {T_MAX} columns {short:?}, {experts:.1} host experts a \
+             serve {}",
+            st.walks,
+            st.ubatches,
+            layers.len(),
+            st.rows.len(),
+            verdict(once),
+            verdict(ok)
+        );
+        Ok(ok)
     }
 
     /// The stream arm's prompt length: a group of two whole units, past the walk's gate at [`SPLIT_COSTS`].

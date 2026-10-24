@@ -36,10 +36,13 @@ pub type PlanInputs = place_hybrid::PlanInputs<Hparams>;
 const ENGINE: &str = "MiniMax-M3";
 
 /// The rows a unit of the body's prompt batch holds. A unit reads each hosted expert its rows pick
-/// once, so more rows divide those reads over more rows; 128 is where the host pool's reads fall
-/// under its multiply-adds, which more rows do not shorten, and 256 only doubles the unit's buffers.
-/// The host union takes up to [`crate::moe::UNION_MAX_COLS`] columns.
-pub const PROMPT_ROWS: usize = 128;
+/// once and runs every (expert, row) slot through the NVFP4 column tile. At 128 rows the host's
+/// read of a unit's experts and its tile instructions take about the same time; at 256 the read
+/// halves a row while the instructions a row stay, so the host leg is its multiply-adds and more
+/// rows, or one union over a group's units, no longer shorten it. Two units of 256 still fill the
+/// default prompt group of a 512-id call, whose second unit's attention runs under the first's host
+/// leg. The host union takes up to [`crate::moe::UNION_MAX_COLS`] columns.
+pub const PROMPT_ROWS: usize = 256;
 
 /// The rows one flash launch of the prompt batch runs at most: the batch's partials hold this many
 /// rows of the dense layers' decode flash (a row's partials are the largest of any flash the batch
@@ -169,8 +172,8 @@ fn leg_downs(inputs: &PlanInputs) -> DownForms {
 /// The slots of each half of the expert stream's ring a streaming plan keeps room for
 /// ([`stream_bytes`]) [derived: at the ring pass's route GEMMs the stream rule's crossover is about
 /// 18 columns of a walk, and a walk of the default group (two units of [`PROMPT_ROWS`] rows, four
-/// picks a row over 128 experts) averages 8 columns an expert, so the experts past it are the hot
-/// tail of a layer's host experts, under 32; a half of 32 NVFP4 experts is about 1 GB].
+/// picks a row over 128 experts) averages 16 columns an expert, so the experts past it are about a
+/// quarter of a layer's host experts, under 32; a half of 32 NVFP4 experts is about 1 GB].
 pub const STREAM_HALF_SLOTS: u64 = 32;
 
 /// The card bytes the prompt calls' expert stream takes on an M3 load (`BLOOMERY_XSTREAM=split`):
@@ -290,15 +293,16 @@ mod tests {
                 ffn: FfnKind::Routed
             }
         );
-        // The batch's buffers at PROMPT_ROWS = 128 rows [derived from the header's widths, apart
-        // from the formula]: the f32 words 4 B × (128 × 1,527 + 16 × 8 × 80 × 18) = 1,519,104 B
+        // The batch's buffers at PROMPT_ROWS = 256 rows [derived from the header's widths, apart
+        // from the formula]: the f32 words 4 B × (256 × 1,527 + 16 × 8 × 80 × 18) = 2,300,928 B
         // (a row's 1,527 words: batch rows 672, selection 7, unit 194, routed block 430, dense
-        // block 224; the partials 184,320 words, 16 rows of 8 query heads), the wide forms 88,064 B,
-        // three routes 3,168 B and the card leg 90,112 B. Mutants: the partials counted at the
-        // batch's 128 rows, the card leg or the routes left out, the reserve left 0.
+        // block 224; the partials 184,320 words, 16 rows of 8 query heads), the wide forms
+        // 176,128 B, three routes 6,288 B (4 B × (2 × 256 + 2 × 5 + 2) each) and the card leg
+        // 180,224 B. Mutants: the partials counted at the batch's 256 rows, the card leg or the
+        // routes left out, the reserve left 0, the unit left at 128 rows.
         assert_eq!(
             described.prompt_reserve,
-            1_519_104 + 88_064 + 3_168 + 90_112
+            2_300_928 + 176_128 + 6_288 + 180_224
         );
         match refused {
             Err(PlacementError::Unimplemented(items)) => {
@@ -325,16 +329,16 @@ mod tests {
     /// A streaming plan keeps the stream's room [derived from the header's widths, apart from the
     /// formula]: the ring's two halves of 32 slots, a slot the widest routed layer's three F32
     /// stacks per expert (64 × 24 × 4 B each, 18,432 B), 1,179,648 B; the ring pass's buffers at
-    /// 128 rows of 2 picks (256 slots): the rows' 32-value form 10,240 B, the gate and up rows
-    /// 49,152 B, their SwiGLU's 32-value form 20,480 B and the route over 32 experts 1,320 B. At
-    /// M3.1's widths (6,144 wide, 3,072 an expert, 4 picks) the pass is 15,534,408 B. A plan that
+    /// 256 rows of 2 picks (512 slots): the rows' 32-value form 20,480 B, the gate and up rows
+    /// 98,304 B, their SwiGLU's 32-value form 40,960 B and the route over 32 experts 2,376 B. At
+    /// M3.1's widths (6,144 wide, 3,072 an expert, 4 picks) the pass is 31,068,552 B. A plan that
     /// does not stream keeps none of it. Mutants: `with_stream` leaves the reserve as it was, the
     /// ring counted at one half, the pass's gate and up rows left out.
     #[test]
     fn a_streaming_plan_keeps_the_streams_room() {
         let inputs = described("mm3-place-stream");
         let base = inputs.prompt_reserve;
-        let pass = 10_240 + 49_152 + 20_480 + 1_320;
+        let pass = 20_480 + 98_304 + 40_960 + 2_376;
         assert_eq!(ring_pass_bytes(PROMPT_ROWS, 2, 64, 24, 32), pass);
         assert_eq!(
             stream_bytes(&inputs).expect("the routed stacks"),
@@ -342,14 +346,17 @@ mod tests {
         );
         let streaming = inputs.with_stream().expect("the routed stacks");
         assert_eq!(streaming.prompt_reserve, base + 1_179_648 + pass as u64);
-        assert_eq!(ring_pass_bytes(128, 4, 6_144, 3_072, 32), 15_534_408);
+        assert_eq!(
+            ring_pass_bytes(PROMPT_ROWS, 4, 6_144, 3_072, 32),
+            31_068_552
+        );
     }
 
     /// The probe's plan and the open's plan keep the same room under the stream: the run sizes the
     /// ring once from the file it read and plans `streaming` of those bytes; the open describes the
     /// file again and plans `streaming` of the run's bytes. Both take the plain plan's batch bytes
     /// plus the ring's [derived from the header's widths, apart from the formula]: two halves of 32
-    /// slots, 1,179,648 B, and the pass's buffers, 81,192 B, 1,260,840 B, and they plan the same
+    /// slots, 1,179,648 B, and the pass's buffers, 162,120 B, 1,341,768 B, and they plan the same
     /// context and expert counts. Mutant: `streaming` leaves the reserve as it was (both equal the
     /// plain plan's, the clause naming the ring's bytes reddens).
     #[test]
@@ -357,7 +364,7 @@ mod tests {
         let machine = workstation::plan_gate(LAYERS);
         let plain = described("mm3-place-plain");
         let ring = stream_bytes(&plain).expect("the routed stacks");
-        assert_eq!(ring, 1_179_648 + 81_192);
+        assert_eq!(ring, 1_179_648 + 162_120);
         let probe = described("mm3-place-probe").streaming(ring);
         let open = described("mm3-place-open").streaming(ring);
         let room = |inputs: &PlanInputs| {
@@ -413,7 +420,7 @@ mod tests {
 
     /// A machine that names an expert tier card (plan (b′)) is planned: the body serves one. The
     /// card keeps the prompt batch's reserve on either machine and, on the tiered one, the tier
-    /// places' copies beside it ([`tier_places_bytes`]: 3 × 4 B × 128 rows × 2 slots). The tier's batch bytes are the common leg's: runs of
+    /// places' copies beside it ([`tier_places_bytes`]: 3 × 4 B × 256 rows × 2 slots). The tier's batch bytes are the common leg's: runs of
     /// [`TIER_CHUNK`] tokens over blocks of the unit's `cols` rows, in the forms the leg's routed
     /// downs read: the header's F32 downs run on no leg, so the 128-value form
     /// ([`workstation::tier_leg_batch_bytes`]). The plan reaches the placement, which refuses the
@@ -438,7 +445,7 @@ mod tests {
         );
         let tiered = workstation::plan_bp(LAYERS, None, tier_batch(&inputs, COLS));
         let plain = workstation::plan_gate(LAYERS);
-        let places = 3 * 4 * 128 * 2;
+        let places = 3 * 4 * 256 * 2;
         assert_eq!(inputs.tier_reserve, Some(places));
         assert_eq!(
             inputs.prompt_batch_bytes(&plain).expect("a plain machine"),

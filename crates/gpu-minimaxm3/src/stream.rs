@@ -9,6 +9,7 @@ use bloomery_gpu::host::xstream::{Costs, XLayer, XMode, XReport, XStreamBody};
 use bloomery_gpu::{Gpu, GpuError};
 use bloomery_gpu_deepseek41::prompt_walk::{SplitFacts, StreamFacts};
 use bloomery_gpu_deepseek41::router::sigmoid_128_4::RouterKernels;
+use model::arch::minimaxm3::place;
 
 use crate::body::Body;
 
@@ -29,8 +30,13 @@ pub const XSTREAM_COSTS: Costs = Costs {
 };
 
 /// The least count a pick admits from on a load whose lane never probed: the V4.1 walk's floor (its
-/// flow model's threshold), which no M3.1 record has priced for its own routing.
-pub const STREAM_FLOOR: u32 = 32;
+/// flow model's threshold), which no M3.1 record has priced for its own routing, held as a share of
+/// the unit's rows. A pick compares one unit's counts times the walk's units with it, so at the
+/// default group of two units, 32 a 128-row unit admits an expert one row in eight of the unit routes
+/// to, and a wider [`place::PROMPT_ROWS`] raises the count with the rows rather than admitting colder
+/// experts.
+pub const STREAM_FLOOR: u32 = 32 * (place::PROMPT_ROWS / 128) as u32;
+const _: () = assert!(place::PROMPT_ROWS.is_multiple_of(128));
 
 /// What the family hands the walk ([`StreamFacts`]).
 const FACTS: StreamFacts = StreamFacts {

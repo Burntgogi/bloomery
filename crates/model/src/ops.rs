@@ -3147,9 +3147,9 @@ impl<'a> PairWork<'a> {
 
     /// Rows `rows` of a [`RowLayout::Planes`] pair across every token column
     /// against the quantized columns `acol` of `cb` bytes: each row's code
-    /// row and scale row, one in each run of the matrix, through the planes
-    /// tile in runs of up to [`qdot::TILE_COLS`] columns
-    /// ([`qdot::dot_nvfp4_planes_row_cols`], each column's
+    /// row and scale row, one in each run of the matrix, in one call of the
+    /// planes entry over the chunk's rows and every column
+    /// ([`qdot::dot_nvfp4_planes_rows_cols`], each column's
     /// [`qdot::dot_nvfp4_planes_row`] value bit for bit), times the matrix's
     /// tensor scale.
     fn compute_planes(
@@ -3171,28 +3171,22 @@ impl<'a> PairWork<'a> {
             codes.len(),
             scales.len()
         );
-        for r in rows {
-            let codes = &codes[r * code_row..(r + 1) * code_row];
-            let scales = &scales[r * scale_row..(r + 1) * scale_row];
-            let t_dot = if lvl >= 2 { Some(Instant::now()) } else { None };
-            let mut t0 = 0;
-            while t0 < self.ne1 {
-                let m = (self.ne1 - t0).min(qdot::TILE_COLS);
-                let cols: [&[u8]; qdot::TILE_COLS] = std::array::from_fn(|i| {
-                    let c = self.col(t0 + i.min(m - 1));
-                    &acol[c * cb..(c + 1) * cb]
-                });
-                let mut v = [0.0f32; qdot::TILE_COLS];
-                qdot::dot_nvfp4_planes_row_cols(codes, scales, &cols[..m], k, &mut v[..m]);
-                for (i, &v) in v[..m].iter().enumerate() {
-                    // SAFETY: cell `(t0 + i) * n + r` is inside this chunk's row range — see the SharedOut construction site.
-                    unsafe { self.out.write((t0 + i) * n + r, v * self.scale) };
-                }
-                t0 += m;
-            }
-            if let Some(t_dot) = t_dot {
-                acc.add_dot(t_dot.elapsed().as_nanos() as u64);
-            }
+        let t_dot = if lvl >= 2 { Some(Instant::now()) } else { None };
+        qdot::dot_nvfp4_planes_rows_cols(
+            (codes, scales),
+            rows,
+            k,
+            (self.ne1, |t| {
+                let c = self.col(t);
+                &acol[c * cb..(c + 1) * cb]
+            }),
+            |r, t, v| {
+                // SAFETY: cell `t * n + r` is inside this chunk's row range — see the SharedOut construction site.
+                unsafe { self.out.write(t * n + r, v * self.scale) };
+            },
+        );
+        if let Some(t_dot) = t_dot {
+            acc.add_dot(t_dot.elapsed().as_nanos() as u64);
         }
         Ok(())
     }
@@ -3982,7 +3976,8 @@ fn unit_tile_cost(ty: GgmlType, layout: RowLayout, k: usize, ne1: usize) -> Opti
     match layout {
         RowLayout::Rows => tile_cost_of(ty, k, ne1),
         RowLayout::R8 => r8_tile_cost(k, ne1),
-        // The planes tile (`qdot::dot_nvfp4_planes_row_cols`) has no `tile_units` row, so a planes pair is cut by `row_cost`.
+        // The planes tile (`qdot::dot_nvfp4_planes_rows_cols`) has no `tile_units` row, so a planes pair is cut
+        // by `row_cost`.
         RowLayout::Planes => None,
     }
 }

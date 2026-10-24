@@ -1,0 +1,64 @@
+# Round pp039: MiniMax-M3.1's host prompt leg is the NVFP4 planes tile's instructions. Lever A: the tile dots the
+# offset codes (w + 12, MXFP4's unsigned side) against the column's codes as they are, and takes each column's
+# 16-value code sums off in integers from a prep built once a call (qdot::dot_nvfp4_planes_rows_cols), so the per-column
+# sign fold and the per-column scale build leave the inner loop; bit-identical to the one-column kernel. With it,
+# walk039's 256-row prompt unit (place::PROMPT_ROWS and its prefill_units_full clause, byte-identical to 9e20c03e3),
+# without which A sits under the DRAM line; and M3.1's admit floor held as a share of the unit's rows
+# (gpu-minimaxm3 stream.rs STREAM_FLOOR = 32 x PROMPT_ROWS / 128 = 64): at 32 a 256-row unit halved the share an
+# expert needs to be admitted, which is walk039's decode +3.2 % at D = 512, -3.5 % at 4096 and its admit at 4096
+# 1.19 -> 1.65..2.85 s [d from m: ab-walk039.log against speed039's off arm].
+#
+# Decomposition per 128 rows of a routed layer, bp, host share 0.755 of 128 experts, top-4, NVFP4 expert 31.85 MB,
+# 442,368 128-value groups an expert [derived, /Users/hckim/.cache/bloomery/placegen/pp039-decomp.md]:
+#   tile per group of a row, run of C columns: base 65/101/135/169/201/234/267/324 instructions [asm, walk039];
+#   this tree 30 + 22 C (C >= 2) [counted from the source]; FP-pipe uops base 28 + 27 C, this tree 24 + 21 C.
+#   over Poisson column counts (balanced runs here, runs of 8 in base): 7.23 -> 5.09 G instructions a 128 rows at
+#   T = 128 (0.70; uops 0.80), 7.00 -> 4.67 G at T = 256 (0.67; uops 0.79) [derived, pp039_model.py].
+#   host DRAM: 21.3 ms a 128 rows at T = 128 (3.03 GB at 142 GB/s), 10.8 ms at T = 256.
+#   base wall 22.13 ms a 128-row unit-layer (pp512 101.47 off) [m: probe-m31-xstream.log]; T = 256 alone measured
+#   -0.5 % pp512 [m: ab-walk039.log], so the union is compute-bound at both T, R = 318..335 G instr/s.
+#   A alone at T = 128: the union falls to the DRAM line, 22.13 -> ~21.7 ms, +2..+5 %: under the shadow.
+#   A + T = 256: compute 20.9..22.0 ms x 0.67..0.79 = 13.9..17.4 ms a 128 rows, over DRAM 10.8; wall + 0.4..0.65.
+#   admit (the serving word on bp) at speed039's admit share: 0.65..0.9 s at P = 512 (walk 1 0.741 s [d from m,
+#   xadmit039]), 0.95..1.45 s at P = 4096 (7 later walks), A's shorter union exposing up to 0.15..0.25 s more.
+# => pp512 at the serving defaults 89.34 -> 102..131 (+14..+46 %, central +29 %); pp4096 97.96 -> 118..150
+#    (+20..+53 %, central +35 %); xstream off pp512 101.47 -> 124..157; tg512 and tg4096 within +-1.5 % of the base
+#    [derived: the picks admit at the base's share; -128 MiB of 3090 tier room, 4 experts, -0.06 %; the one-column
+#    decode kernel does not move].
+# The one term the derivation cannot fix: whether the tile's time follows its instructions (0.67) or its FP-pipe
+# uops (0.79) at the pool's rate; the band spans both.
+#
+# Runner (lead; the base bloomery-serve at speed039 8c07144ab in ~/repo/bloomery-speed039 on the box, this tree synced
+# to ~/repo/bloomery-pp039; depth-serve builds this tree's bloomery-serve first):
+# BLOOMERY_MODEL=minimax-m3 BLOOMERY_REMOTE='~/repo/bloomery-pp039' BLOOMERY_AB_ROUNDS=2
+# BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/pp039-tile.card BLOOMERY_TIMING_CARDS=a6000+3090
+# DEPTH_SERVE_CTX=4300' just depth-serve bloomery-speed039:512 bloomery-pp039:512 bloomery-speed039:4096
+# bloomery-pp039:4096
+# Wall [derived]: build ~8 min + 8 servers (2 arms x 2 depths x 2 rounds) x (load ~180 s + pp 3..42 s + 128 steps
+# ~6 s), ~38 min.
+kind: ab
+question: does the NVFP4 planes tile on offset codes with a per-call column prep, on 256-row prompt units, lift
+  MiniMax-M3.1's pp512 at the serving defaults on bp by the derived band?
+term: pp tok/s @ P = 512 prose ids, MiniMax-M3.1-Flash NVFP4 folder, bloomery-serve at the serving defaults (every
+  lever unset: residency mid-p0-s1, xstream admit), --ctx-size 4300, RTX A6000 + RTX 3090 (bp); this tree against
+  speed039 8c07144ab, paired by round; pp4096 and tg read beside, not judged
+unit: %
+predict: +14..+46
+rounds: 2
+sd: 0.56 % /Users/hckim/.cache/bloomery/placegen/ab-walk039.log, the speed039 and walk039 trees' pp512 at the serving
+  defaults over 2 rounds
+condition: one lease, BLOOMERY_TIMING_CARDS=a6000+3090, a fresh server an arm and a round; each arm's server log names
+  xstream=admit and residency mid-p0-s1; the changed arm's load line plans the prompt batch at 256 rows; distinct
+  tokens of the 128 steps equal between the arms within the greedy margin (the tile is bit-identical, so only the
+  256-row unit's batch shape can move a token); tg512 and tg4096 read beside: a tg below the base by more than
+  1.5 % at either depth holds the landing until a BLOOMERY_STEP_STATS=1 prompt on each tree reads `call stream
+  admitted` a walk and `stat summary` host_slots_mean (the floor's share not holding the pick volume)
+decide-in: land with the owning gates (gate-qdot with hw_nvfp4_planes_tile_matches_the_column_kernel,
+  hw_nvfp4_planes_rows_match_the_column_kernel and hw_nvfp4_planes_tile_refuses_code_minus_128; gate-ops;
+  gate-gpu-minimaxm3-prefill, -e2e, -serve, -twocard), walk039's prefill_units_full clause with it; then price lever B
+  (split on a tiered load) at the new host rate
+decide-below: under +14 %: the tile's time follows neither count at the pool's rate; run the qdot-rate NVFP4_ROWS@6144
+  lines (C = 4 and 8, one core) on both trees and one BLOOMERY_STEP_STATS=1 prompt of 512 ids on each, reading `stat
+  prompt lb` union_ns against experts and slots, before landing
+decide-above: above +46 %: the base arm ran slow or admit's cost fell past its band; check the base arm against
+  89.34 and the distinct tokens, then read the admit records (call stream admitted, stat prompt lb wait_ns)

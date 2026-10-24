@@ -8335,6 +8335,33 @@ fn nvfp4_rows_entries_and_refusals() {
     ] {
         assert!(text.contains(name), "{what}: {text}");
     }
+
+    // The rows entry: rows past either plane are its own refusal, a column's shape the plane entry's.
+    let rows_entry = |rows: std::ops::Range<usize>, cols: &[&[u8]], k: usize| {
+        let mut last = 0.0f32;
+        qdot::dot_nvfp4_planes_rows_cols(
+            (&codes, &scales),
+            rows,
+            k,
+            (cols.len(), |j| cols[j]),
+            |_, _, v| last = v,
+        );
+        last
+    };
+    for (what, text, name) in [
+        (
+            "a row past the planes",
+            panic_text(&|| rows_entry(0..2, &[&col[..], &col[..]], 64)),
+            "dot_nvfp4_planes_rows_cols",
+        ),
+        (
+            "a short second column",
+            panic_text(&|| rows_entry(0..1, &[&col[..], short], 64)),
+            "dot_nvfp4_planes_row",
+        ),
+    ] {
+        assert!(text.contains(name), "{what}: {text}");
+    }
 }
 
 /// The AVX2 plane kernel against its mirror, bit for bit, on columns that need not come from the
@@ -8387,8 +8414,9 @@ fn hw_nvfp4_rows_avx2_is_its_scalar_mirror() {
 
 /// The plane tile against the plane kernel, bit for bit: at every width of [`NVFP4_KS`], random rows, the format's
 /// end rows and rows holding a byte that is no scale (NaN in every column; one in the first group, one in the last
-/// scale), against the encoder's columns and raw ones (any codes, any sums), at every column count `1..=TILE_COLS`
-/// with the columns rotated so each tile slot meets each column. A slot holds a payload no dot has until the tile
+/// scale), against the encoder's columns and raw ones (any codes but -128, which the tile refuses by name in
+/// `hw_nvfp4_planes_tile_refuses_code_minus_128`; any sums), at every column count `1..=TILE_COLS` with the columns
+/// rotated so each tile slot meets each column. A slot holds a payload no dot has until the tile
 /// writes it, so a slot left unwritten, one that reads another's column, a tail, a scale lane or a poison check done
 /// wrong shows as a differing bit; the band to the exact dot is `nvfp4_rows_dot_is_the_exact_dot_within_its_band`'s.
 #[cfg(target_arch = "x86_64")]
@@ -8404,7 +8432,7 @@ fn hw_nvfp4_planes_tile_matches_the_column_kernel() {
     let mut calls = 0usize;
     for &k in &NVFP4_KS {
         let mut cols = nvfp4_columns(&mut rng, k);
-        cols.extend((0..4).map(|_| nvfp4_raw_column(&mut rng, k)));
+        cols.extend((0..4).map(|_| nvfp4_tile_raw_column(&mut rng, k)));
         let mut rows: Vec<(Vec<u8>, Vec<u8>)> = (0..6).map(|_| nvfp4_planes(&mut rng, k)).collect();
         rows.extend(nvfp4_end_rows(k));
         for (at, byte) in [(0, 0x80), (k / 16 - 1, 0x7F)] {
@@ -8438,6 +8466,132 @@ fn hw_nvfp4_planes_tile_matches_the_column_kernel() {
         }
     }
     eprintln!("nvfp4 planes tile: {calls} calls, c = 1..=8, bit-identical to the column kernel");
+}
+
+/// The byte offsets of a Q8_2_X4 column's codes at `k`: each x4 group's 128 after its 16-byte head, each tail
+/// block's 32 after its 4-byte head.
+#[cfg(target_arch = "x86_64")]
+fn nvfp4_code_bytes(k: usize) -> impl Iterator<Item = usize> {
+    let nbg = k / 128;
+    let tails = k / 32 - 4 * nbg;
+    let groups = (0..nbg).flat_map(|g| g * 144 + 16..g * 144 + 144);
+    let tail = (0..tails).flat_map(move |t| nbg * 144 + 36 * t + 4..nbg * 144 + 36 * t + 36);
+    groups.chain(tail)
+}
+
+/// [`nvfp4_raw_column`] with each code -128 made -127: a column the tile takes, any other code and any sums.
+#[cfg(target_arch = "x86_64")]
+fn nvfp4_tile_raw_column(rng: &mut Lcg, k: usize) -> Vec<u8> {
+    let mut col = nvfp4_raw_column(rng, k);
+    for at in nvfp4_code_bytes(k) {
+        if col[at] == 0x80 {
+            col[at] = 0x81;
+        }
+    }
+    col
+}
+
+/// The rows entry against the plane kernel, bit for bit, as the host union calls it: a run of rows past one row
+/// block (random rows, the end rows, a row holding a byte that is no scale), from a first row past 0, against column
+/// counts of one run (2, 8), of two balanced runs (9, 16) and of three (17), each column an encoder's or a raw one's
+/// through the column accessor, every value to its own (row, column) cell. A run's columns read with another run's
+/// preps, a prep built of one row block and read by the next, a run cut that loses or repeats a column, or a value
+/// written to another cell shows as a differing bit or a cell left unwritten.
+#[cfg(target_arch = "x86_64")]
+#[test]
+#[ignore = "hw: needs the box (AVX2)"]
+fn hw_nvfp4_planes_rows_match_the_column_kernel() {
+    assert!(
+        std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma"),
+        "the tile runs with AVX2 and FMA only; without them this clause would compare the column kernel with itself"
+    );
+    const UNWRITTEN: f32 = f32::from_bits(0x7FC0_0001);
+    const ROWS: usize = 150;
+    const FIRST: usize = 3;
+    let mut rng = Lcg(0x524f_5753_4e56);
+    for k in [128usize, 3072, 4128] {
+        let mut cols = nvfp4_columns(&mut rng, k);
+        cols.extend((0..4).map(|_| nvfp4_tile_raw_column(&mut rng, k)));
+        let mut rows: Vec<(Vec<u8>, Vec<u8>)> =
+            (0..ROWS - 5).map(|_| nvfp4_planes(&mut rng, k)).collect();
+        rows.extend(nvfp4_end_rows(k));
+        let mut bad = nvfp4_planes(&mut rng, k);
+        bad.1[k / 32] = 0x7F;
+        rows.insert(ROWS / 2, bad);
+        let codes: Vec<u8> = rows.iter().flat_map(|r| r.0.iter().copied()).collect();
+        let scales: Vec<u8> = rows.iter().flat_map(|r| r.1.iter().copied()).collect();
+        for ncols in [2usize, 8, 9, 16, 17] {
+            let pick: Vec<usize> = (0..ncols).map(|j| (3 * j + ncols) % cols.len()).collect();
+            let mut out = vec![UNWRITTEN; ROWS * ncols];
+            qdot::dot_nvfp4_planes_rows_cols(
+                (&codes, &scales),
+                FIRST..ROWS,
+                k,
+                (ncols, |j| cols[pick[j]].as_slice()),
+                |r, j, v| {
+                    assert!(
+                        out[j * ROWS + r].to_bits() == UNWRITTEN.to_bits(),
+                        "k = {k} ncols {ncols}: cell (row {r}, column {j}) written twice"
+                    );
+                    out[j * ROWS + r] = v;
+                },
+            );
+            for (r, (c, sc)) in rows.iter().enumerate() {
+                for (j, &p) in pick.iter().enumerate() {
+                    let got = out[j * ROWS + r];
+                    if r < FIRST {
+                        assert_eq!(
+                            got.to_bits(),
+                            UNWRITTEN.to_bits(),
+                            "k = {k} ncols {ncols}: row {r} lies before the call's rows and was written"
+                        );
+                        continue;
+                    }
+                    let want = qdot::dot_nvfp4_planes_row_avx2(c, sc, &cols[p], k);
+                    assert_eq!(
+                        got.to_bits(),
+                        want.to_bits(),
+                        "k = {k} ncols {ncols} row {r} slot {j} (column {p}): rows entry {got:e} against the column \
+                         kernel {want:e}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// The tile refuses a column holding the code -128 by name, in an x4 group or in a tail block: no encoder writes it,
+/// the one-column kernel's sign fold wraps it to -128 where its product needs +128, and the tile's offset dot would
+/// read it as itself, so the two would part on that column without a word.
+#[cfg(target_arch = "x86_64")]
+#[test]
+#[ignore = "hw: needs the box (AVX2)"]
+fn hw_nvfp4_planes_tile_refuses_code_minus_128() {
+    assert!(
+        std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma"),
+        "the tile runs with AVX2 and FMA only"
+    );
+    let mut rng = Lcg(0x4d49_4e31_3238);
+    let k = 160;
+    let (codes, scales) = nvfp4_planes(&mut rng, k);
+    let clean = nvfp4_columns(&mut rng, k).remove(0);
+    for (where_, at) in [("an x4 group", 16 + 77), ("a tail block", 144 + 4 + 9)] {
+        let mut col = clean.clone();
+        col[at] = 0x80;
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut out = [0.0f32; 2];
+            qdot::dot_nvfp4_planes_row_cols(&codes, &scales, &[&clean[..], &col[..]], k, &mut out);
+        }));
+        let text = match r.expect_err("the tile must refuse a column holding -128") {
+            e if e.is::<String>() => *e.downcast::<String>().unwrap(),
+            e => (*e.downcast::<&str>().unwrap()).to_owned(),
+        };
+        assert!(
+            text.contains("dot_nvfp4_planes_rows_cols")
+                && text.contains("column 1 holds the code -128"),
+            "-128 in {where_}: {text}"
+        );
+    }
 }
 
 // ------------------------------------------------- NVFP4 rows' codes in block order

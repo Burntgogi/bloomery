@@ -831,7 +831,11 @@ placement 0 0 0
 # PIN(2026-10-23): qdot 249 -> 251 blocks, 111 -> 112 fns, new code, not old code relaxed: nvfp4_codes_avx2, the NVFP4
 # Transform's code repack the expert stream stages, one fn with its block and its caller's block, each with its SAFETY
 # line.
-qdot 251 112 0
+# PIN(2026-10-24): qdot 251 -> 255 blocks, 112 -> 115 fns, new code, not old code relaxed: the NVFP4 planes rows
+# entry's tile on offset codes, its column prep (nvfp4_prep_avx2), the x4 lane sums both share (nvfp4_group_sums, an
+# `#[inline(always)]` fn) and the run walk (nvfp4_planes_tiled; nvfp4_tile_run replaces nvfp4_planes_tile), each with
+# its SAFETY line.
+qdot 255 115 0
 record 0 0 0
 refset 0 0 0
 runtime 0 0 0

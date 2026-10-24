@@ -168,8 +168,9 @@ fn bench_tile(ty: GgmlType, k: usize, row_bytes: usize, rows: usize, cols: usize
 }
 
 /// The NVFP4 plane tile's rate: `rows` plane rows (`k / 2` code bytes and `k / 16` scale bytes each) dotted
-/// against `cols` columns through `dot_nvfp4_planes_row_cols`, single-threaded, as the host union walks a run of
-/// columns. One column runs the one-column kernel, so the tile's ratio reads against C = 1 on the same filler.
+/// against `cols` columns through `dot_nvfp4_planes_rows_cols`, one call a pass over every row, single-threaded, as
+/// the host union walks a pair's rows. One column runs the one-column kernel, so the tile's ratio reads against
+/// C = 1 on the same filler.
 /// The codes are any bytes and each scale a UE4M3 byte in 0x30..0x50, a finite window.
 fn bench_planes_tile(k: usize, rows: usize, cols: usize) {
     let mut s = 0x9E3779B97F4A7C15u64;
@@ -200,28 +201,21 @@ fn bench_planes_tile(k: usize, rows: usize, cols: usize) {
         })
         .collect();
     let refs: Vec<&[u8]> = acols.iter().map(Vec::as_slice).collect();
-    let mut out = vec![0.0f32; cols];
-    let row = |r: usize| {
-        (
-            &codes[r * code_row..(r + 1) * code_row],
-            &scales[r * scale_row..(r + 1) * scale_row],
-        )
-    };
-
     let mut acc = 0.0f32;
-    for r in 0..rows.min(4096) {
-        let (c, sc) = row(r);
-        qdot::dot_nvfp4_planes_row_cols(c, sc, &refs, k, &mut out);
-        acc += out.iter().sum::<f32>();
-    }
+    let mut pass = |rows: std::ops::Range<usize>| {
+        qdot::dot_nvfp4_planes_rows_cols(
+            (&codes, &scales),
+            rows,
+            k,
+            (cols, |j| refs[j]),
+            |_, _, v| acc += v,
+        );
+    };
+    pass(0..rows.min(4096));
     let passes = 6u32;
     let t0 = Instant::now();
     for _ in 0..passes {
-        for r in 0..rows {
-            let (c, sc) = row(r);
-            qdot::dot_nvfp4_planes_row_cols(c, sc, &refs, k, &mut out);
-            acc += out.iter().sum::<f32>();
-        }
+        pass(0..rows);
     }
     let dt = t0.elapsed();
     let row_bytes = code_row + scale_row;
