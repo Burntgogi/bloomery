@@ -1243,7 +1243,7 @@ mod tests {
         let operations = 4.0 * 256.0 + 2.0 * 512.0 + 16.0;
         let eps = f64::from(f32::EPSILON);
         let gamma = operations * eps / (1.0 - operations * eps);
-        for (c, row) in rows.chunks_exact(N).enumerate() {
+        for (c, row) in rows.as_chunks::<N>().0.iter().enumerate() {
             let x = f64::from(input[c * N]);
             for (r, &got) in row.iter().enumerate() {
                 let expected = x * x * if r % 2 == 0 { 0.5 } else { 0.25 };
