@@ -1685,9 +1685,10 @@ gate-gpu-minimaxm3-twocard:
 
 # Nemotron-H MoE (Lightning) with its 32-value experts on the card (Relu2Leg for the step, the 32-value GEMM for the
 # prompt): host, card (the 3090's room, split) and whole (the A6000's room, box.sh's pick) arms near the host path [derived: 8..12 min,
-# mostly the build; three 25.5 GB loads].
+# mostly the build; three 25.5 GB loads]. The nemotron_h_moe profile's file is Bolt's (IQ2_XXS stacks); the gate runs
+# Lightning's UD-Q4_K_XL, which BLOOMERY_REF_MODEL moves the profile to.
 gate-gpu-nemotron-h-moe-card32:
-    BLOOMERY_MODEL=nemotron_h_moe BLOOMERY_CARD=a6000 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-nemotron-h-moe-card32 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_nemotron_h_moe_card32 && bash tools/gpu-gate.sh gate_nemotron_h_moe_card32'
+    BLOOMERY_REF_MODEL="${BLOOMERY_REF_MODEL:-/models/Nemotron-3.5-Lightning/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-UD-Q4_K_XL.gguf}" BLOOMERY_MODEL=nemotron_h_moe BLOOMERY_CARD=a6000 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-nemotron-h-moe-card32 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_nemotron_h_moe_card32 && bash tools/gpu-gate.sh gate_nemotron_h_moe_card32'
 
 # MiMo-V2 plan (b') on the A6000 and the 3090 (the 3090 an expert tier): the load, the walk equal to the union bit for
 # bit, eager equal to replay, the batch equal to the union and sent [derived: about 8..12 min warm]; the bound is
@@ -3376,9 +3377,11 @@ gate-gemma-embedding-meta:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::gemma_embedding:: --nocapture && bash tools/gate.sh --release -p bloomery-model --test gemma_embedding_meta -- --ignored --nocapture'
 
 # Flint header-only reader and coverage refusals. BLOOMERY_MODEL names the pinned
-# UD-Q4_K_XL GGUF or a prefix through its padded header; no payload or GPU is read.
+# UD-Q4_K_XL GGUF or a prefix through its padded header; no payload or GPU is read. No profile
+# holds the file, so a batch defers the recipe by name (needs-env) until BLOOMERY_BOX_ENV or the
+# item's env sets BLOOMERY_MODEL to it; the reader's unit tests also run in gate-ops.
 gate-flint-meta:
-    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::flint --nocapture && bash tools/gate.sh --release -p bloomery-model --test flint_meta -- --ignored --nocapture'
+    ./tools/box.sh 'bash tools/ref/needs-env.sh gate-flint-meta BLOOMERY_MODEL && bash tools/gate.sh --release -p bloomery-model --lib -- arch::flint --nocapture && bash tools/gate.sh --release -p bloomery-model --test flint_meta -- --ignored --nocapture'
 
 # mimo2 (MiMo-V2.6-Flash) end-to-end: the program loaded once by the gate placement, the 3090's bytes on either card
 # (every routed expert on the host tier, the host set derived at about 161.5 GB), against ik's sets (refset `ik-mimo2`,
