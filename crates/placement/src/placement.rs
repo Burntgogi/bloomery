@@ -1208,6 +1208,139 @@ pub struct Plan<'a> {
     pub budget_from_pool: bool,
 }
 
+/// The one-stage reference of a one-expert-tier plan: the stage holds the union
+/// of its routed ids and the tier's, and the host segments are unchanged.
+/// `flat` is the same stage machine with the tier removed. The reference uses
+/// the stage's actual capacity, not the artificial budget that split the sets.
+pub fn union_plan<'a>(plan: &Plan<'a>, flat: &'a Machine) -> Result<Plan<'a>, PlacementError> {
+    if plan.machine.cards.len() != 1
+        || plan.machine.expert_tiers().count() != 1
+        || flat.cards.len() != 1
+        || !flat.tiers.is_empty()
+        || !plan.machine.cards[0].same_device(&flat.cards[0])
+    {
+        return Err(PlacementError::Stages(
+            "union reference needs one stage, one expert tier and the same stage without tiers"
+                .into(),
+        ));
+    }
+    let model = plan.model;
+    let tier = Device::Card(plan.machine.cards.len());
+    let mut out = plan.clone();
+    for row in &mut out.rows {
+        let t = &model.tensors[row.tensor];
+        if t.role != Role::RoutedExperts {
+            continue;
+        }
+        let ids = |d: Device| -> Vec<u32> {
+            row.segments
+                .iter()
+                .filter(|s| s.device == d)
+                .filter_map(|s| s.experts.as_ref())
+                .flat_map(|e| e.ids().iter().copied())
+                .collect()
+        };
+        let on_tier = ids(tier);
+        if on_tier.is_empty() {
+            continue;
+        }
+        let mut union = ids(Device::Card(0));
+        union.extend(on_tier);
+        let n = union.len() as u64;
+        let mut format = None;
+        for segment in row
+            .segments
+            .iter()
+            .filter(|s| s.device == Device::Card(0) || s.device == tier)
+        {
+            let Format::Card(selected) = segment.format else {
+                return Err(PlacementError::tensor(
+                    t,
+                    "union reference needs resident card expert segments",
+                ));
+            };
+            if format.is_some_and(|f| f != selected) {
+                return Err(PlacementError::tensor(
+                    t,
+                    "union reference cannot join different selected card formats",
+                ));
+            }
+            format = Some(selected);
+        }
+        let card = routed_row_on_as(
+            row.tensor,
+            t,
+            0,
+            vec![(0, ExpertList::new(union, model.experts_of(t))?)],
+            model,
+            format,
+        )?;
+        let segments = card
+            .segments
+            .into_iter()
+            .filter(|s| s.device == Device::Card(0))
+            .chain(
+                row.segments
+                    .iter()
+                    .filter(|s| !matches!(s.device, Device::Card(_)))
+                    .cloned(),
+            )
+            .collect();
+        *row = Row {
+            segments,
+            ..row.clone()
+        };
+        if let Some(l) = t.layer.and_then(|l| out.n_l.get_mut(l)) {
+            *l = n;
+        }
+    }
+    out.machine = flat;
+    out.cards.truncate(1);
+    out.tier_n_l.clear();
+    out.card_budget = card_budget::CardBudget::default();
+    out.budget_from_pool = false;
+    let (heaps, _) = card_heaps(model, flat, &out.rows);
+    let card = &flat.cards[0];
+    let total = &mut out.cards[0];
+    total.expert_bytes = out
+        .rows
+        .iter()
+        .flat_map(|r| {
+            r.segments.iter().filter_map(|s| {
+                (model.tensors[r.tensor].role == Role::RoutedExperts && s.device == Device::Card(0))
+                    .then_some(s.resident_bytes)
+            })
+        })
+        .sum();
+    total.experts = out.n_l.iter().sum();
+    total.rounding_bytes = heaps[0].taken - total.dense_bytes - total.expert_bytes;
+    total.reserve_bytes = card.selected_reserve_bytes(model, &out.n_l)?;
+    let used = card
+        .floor_with_reserves(
+            heaps[0].taken,
+            total.kv_bytes,
+            total.stage_rows_bytes,
+            total.reserve_bytes,
+        )
+        .ok_or_else(|| card.bytes_past_u64())?;
+    total.headroom_bytes = i128::from(capped(card, None)) - i128::from(used);
+    let limit = capped(card, None).saturating_sub(card.margin_bytes);
+    if used > limit {
+        return Err(PlacementError::Metadata {
+            key: "union reference".into(),
+            detail: Violation::CardOver {
+                card: card.name.clone(),
+                total: used,
+                limit,
+            }
+            .to_string(),
+        });
+    }
+    out.host.headroom_bytes = workstation::HostNeed::of_totals(flat.host(), &out.host, false, 0)
+        .headroom(workstation::HostNeed::machine_room(flat.host()));
+    Ok(out)
+}
+
 /// Why a placement could not be built; each variant names what it refused.
 #[derive(Debug, thiserror::Error)]
 pub enum PlacementError {
@@ -6374,6 +6507,148 @@ mod tests {
         let plan = plan_routed(&unnamed, &m1, 4096, &NoKv, &levers, union)
             .expect("the per-type rule places a stack of no part");
         assert_eq!(plan.n_l, vec![8]);
+    }
+
+    #[test]
+    fn a_union_recounts_uploads_selected_forms_and_capacity() {
+        use crate::kernels::{DownAct, DownForms};
+        use workstation::{TIER_BATCH_RESERVE, tier_leg_batch_bytes};
+
+        let mut model = legged(&[
+            [GgmlType::IQ3_S, GgmlType::IQ3_S, GgmlType::Q5_K],
+            [GgmlType::IQ4_XS, GgmlType::IQ4_XS, GgmlType::Q8_0],
+        ]);
+        model.experts_used = 6;
+        let forms = DownForms::of(DownAct::Q8Act).with(DownAct::Q8Blocks32);
+        let batch = tier_leg_batch_bytes(256, 256, 6, 2, 3, forms, false).unwrap();
+        let mut stage = bytes_card("stage", 1 << 30, 0..2);
+        stage.tier_leg = batch.leg;
+        stage
+            .reserves
+            .push((TIER_BATCH_RESERVE.into(), batch.card().unwrap()));
+        let flat = Machine {
+            cards: vec![stage],
+            tiers: Vec::new(),
+            nodes: vec![Node {
+                host: host(),
+                unified: None,
+            }],
+        };
+        let machine = Machine {
+            tiers: vec![bytes_card("tier", 1 << 30, 0..0)],
+            ..flat.clone()
+        };
+        let rule = crate::accepts::routed_rule(crate::accepts::Program::FlintBody);
+        let (index, iq3) = model
+            .tensors
+            .iter()
+            .enumerate()
+            .find(|(_, t)| t.role == Role::RoutedExperts && t.ty == GgmlType::IQ3_S)
+            .unwrap();
+        assert!(matches!(
+            routed_row(
+                index,
+                iq3,
+                0,
+                ExpertList::new(vec![0], model.experts).unwrap(),
+                &model
+            ),
+            Err(PlacementError::NoCardFormat { .. })
+        ));
+        let mut rows = plan_routed(&model, &flat, 1, &NoKv, &PlanLevers::default(), rule)
+            .unwrap()
+            .rows;
+        for row in &mut rows {
+            let tensor = &model.tensors[row.tensor];
+            if tensor.role == Role::RoutedExperts {
+                let device = usize::from(tensor.layer == Some(1));
+                *row = routed_row_on_as(
+                    row.tensor,
+                    tensor,
+                    0,
+                    vec![(device, ExpertList::new(vec![0], model.experts).unwrap())],
+                    &model,
+                    rule.format(tensor).unwrap(),
+                )
+                .unwrap();
+            }
+        }
+        let plan = totals(
+            &model,
+            &machine,
+            1,
+            rows,
+            &[(0, 0, 0); 2],
+            (vec![1, 0], vec![vec![0, 1]]),
+            card_budget::CardBudget::default(),
+        )
+        .unwrap();
+        let joined = union_plan(&plan, &flat).unwrap();
+        assert_eq!(joined.n_l, [1, 1]);
+        assert!(joined.tier_n_l.is_empty());
+        assert_eq!(
+            joined.cards[0].expert_bytes,
+            plan.cards[0].expert_bytes + plan.cards[1].expert_bytes
+        );
+        assert_eq!(joined.cards[0].experts, 2);
+        let heap = card_heaps(&model, &flat, &joined.rows).0.remove(0);
+        assert_eq!(
+            joined.cards[0].rounding_bytes,
+            heap.taken - joined.cards[0].dense_bytes - joined.cards[0].expert_bytes
+        );
+        let reserve = batch.staging + batch.leg.unwrap().bytes(forms).unwrap();
+        assert_eq!(joined.cards[0].reserve_bytes, reserve);
+        assert_eq!(
+            joined.card_reserve(0, TIER_BATCH_RESERVE).unwrap(),
+            Some(reserve)
+        );
+        assert!(reserve > plan.cards[0].reserve_bytes);
+        assert_eq!(joined.cards[0].kv_bytes, plan.cards[0].kv_bytes);
+        for (before, after) in plan.rows.iter().zip(&joined.rows) {
+            let host = |row: &Row| {
+                row.segments
+                    .iter()
+                    .filter(|s| !matches!(s.device, Device::Card(_)))
+                    .map(|s| {
+                        (
+                            s.device,
+                            s.resident_bytes,
+                            s.experts.as_ref().map(|e| e.ids().to_vec()),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(host(before), host(after));
+        }
+        let mut conflicting = plan.clone();
+        let row = conflicting
+            .rows
+            .iter_mut()
+            .find(|r| r.segments.iter().any(|s| s.device == Device::Card(1)))
+            .unwrap();
+        let mut other = row
+            .segments
+            .iter()
+            .find(|s| s.device == Device::Card(1))
+            .unwrap()
+            .clone();
+        other.device = Device::Card(0);
+        other.format = Format::Card(CardFormat::F32);
+        row.segments.push(other);
+        assert!(matches!(
+            union_plan(&conflicting, &flat),
+            Err(PlacementError::Tensor { .. })
+        ));
+        let mut short = flat.clone();
+        short.cards[0].usable_bytes = joined.cards[0].bytes() - 1;
+        assert!(matches!(union_plan(&plan, &short),
+            Err(PlacementError::Metadata { key, .. }) if key == "union reference"));
+        let mut wrong = flat.clone();
+        wrong.cards.clear();
+        assert!(matches!(
+            union_plan(&plan, &wrong),
+            Err(PlacementError::Stages(_))
+        ));
     }
 
     /// Scratch enters each expert candidate's footprint monotonically.
