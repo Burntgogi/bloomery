@@ -1770,7 +1770,13 @@ gate-gpu-flint-router:
 
 # Full-file eager/captured, resident-slot and ring-retention consumer transitions.
 gate-gpu-flint-lib:
-    ./tools/box.sh 'bash tools/gate.sh --gpu --oxide --release -p bloomery-gpu-flint --lib -- --include-ignored'
+    ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-flint-lib && bash tools/gate.sh --gpu --oxide --release -p bloomery-gpu-flint --lib -- --include-ignored --exact tests::hw_full_file_capture_slots_reset_and_ring_boundary'
+
+# Real two-card top-six prompt/decode, union reference, capture and tier fault recovery.
+[group('solo')]
+[group('v41-load')]
+gate-gpu-flint-twocard:
+    BLOOMERY_CARD=both ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-flint-twocard && export BLOOMERY_GATE_V41_LOAD=1 && bash tools/gate.sh --gpu --oxide --release -p bloomery-gpu-flint --lib -- --include-ignored --exact two_card_tests::hw_two_card_full_file_union_capture_publication_fault_reset'
 
 # Muse Spark's 256-expert top-8 sigmoid router (`sigmoid_256_8`). Model-free like the Flint one,
 # plus the bias clause: the selection follows the biased scores, the weights the unbiased ones.

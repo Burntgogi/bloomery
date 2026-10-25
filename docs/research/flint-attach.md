@@ -652,6 +652,116 @@ Keep the integration Draft. Korean numerical/oracle acceptance, cc12.1 resource 
 affected common-owner coverage beyond the exercised consumers, two-card operation, dynamic
 residency/NVMe, streamed HTTP and spontaneous tool selection are not established by this run.
 
+## 11. Current-main integration and trajectory instruments
+
+The linear integration candidate starts at main
+`43073091be21e48cda40d79fe6dae1dfcfd643d5`; it preserves the published behavioral
+and resource evidence in section 10 as historical evidence, not acceptance of a new head.
+The placement integration keeps both the cached upload `Footprint` and candidate-selected
+tier scratch/reserves. No compiler pin, numerical band or model admission was widened.
+
+### The common union must retain selected formats and recount its allocation
+
+`model::placement::union_plan` now owns the shared one-stage/one-tier reference transform.
+It retains the actual selected card format, refuses incompatible formats, preserves host
+assignments and KV, and recomputes expert bytes, upload-heap rounding, selected reserves and
+actual-stage headroom. The artificial budget that split the experts is not the reference's
+physical capacity. The old shared helper is removed and its consumers use the common owner.
+The standalone DS41 and Qwen3.8 transforms have different contracts and remain separate.
+
+A public host-only consumer over the complete pinned GGUF reproduced the former generic
+transform's `NoCardFormat` refusal on `blk.2.ffn_gate_exps.weight` (`IQ3_S`). The corrected
+transform preserves the program-selected format rather than admitting IQ3_S generically.
+With the workstation's 3090 stage/A6000 tier figures, 1024 context and an 8 GiB per-card
+planning budget, its union contains 5,197 experts and 9,959,514,112 expert bytes, equal to
+the assigned rows, with no plan violations. This is real-file planning, not device loading.
+The pure regression also covers mixed selected down forms, heap/reserve recounting,
+unchanged generic refusal, conflicting formats and insufficient union capacity.
+
+### CPU and GPU use one forced-ID diagnostic artifact layout
+
+`tools/ref/flint_trace.cpp` and the `bloomery-gpu-flint` example `trace_flint` consume exactly
+96 whitespace-separated decimal IDs: one 22-ID batched prefill, then 74 one-ID calls.
+They do not retokenize, sample, or stop at an input EOG. Each observation saves the latest
+processed row: prompt position 21, then positions 22 through 95, predicting positions
+22 through 96. Earlier prompt rows are not claimed as captured history.
+
+The diagnostic format is `flint-trajectory-v1`, not a reference-set family or accuracy gate:
+
+- `tokens.ids` and `steps.tsv`: exact inputs and each call's processed/predicted position
+  and raw argmax.
+- `logits.f32`: little-endian F32 `[75][150144]` in every arm.
+- With taps: `layers.f32` `[75][49][2048]` and `norm.f32` `[75][2048]`.
+  Untapped arms explicitly mark those tensors absent.
+- CPU `tensors.tsv` records actual node types, dimensions, strides and selected rows.
+  GPU artifacts retain the actual expert assignments, loaded slots, device/plan facts,
+  graph nodes and completion counters.
+- A new output directory is required. `MANIFEST.tsv` is published only after successful
+  capture; a partial run cannot masquerade as complete. External receipts identify the
+  model, source/diagnostic overlay, toolchain, libraries and binary hashes.
+
+Build the CPU consumer against the preserved mainline revision
+`a37cc46104eb50900d5ab4a9ba02a0abdac039db`, with shell variables naming its source,
+built library directory and the new diagnostic executable:
+
+```sh
+c++ -std=c++17 -O2 -I"$LLAMA_SRC/include" -I"$LLAMA_SRC/ggml/include" \
+  tools/ref/flint_trace.cpp -L"$LLAMA_LIB" -Wl,-rpath,"$LLAMA_LIB" \
+  -lllama -lggml -lggml-cpu -lggml-base -o "$CPU_TRACE"
+CUDA_VISIBLE_DEVICES= "$CPU_TRACE" -m "$MODEL" --ids "$IDS" \
+  --prompt 22 --ctx 1024 --out "$CPU_OUT"
+```
+
+The CPU callback arm was actually run on the complete model: 75 calls, 3,675 layer vectors,
+zero preceding argmax mismatches, and final argmax 26007. Its complete final-logit SHA-256
+is `083c8aa95aab025c0183c2ee3c4788642499533d5a2ee4e280c1125302c23bf9`, bit-identical
+to the preserved callback-free original row. The model was rehashed in this round.
+
+The GPU build uses the pinned oxide toolchain. Actual capture runs belong inside an
+authorized runner configuration with its normal card locks and bounds; `TRACE` names
+the compiled example in that checkout's target directory:
+
+```sh
+cargo oxide build --arch sm_86 -- -p bloomery-gpu-flint --release --example trace_flint
+bash tools/gpu-gate.sh --executable "$TRACE" -m "$MODEL" --ids "$IDS" \
+  --prompt 22 --ctx 1024 --slots 2 --mode graph --out "$GPU_OUT"
+```
+
+Use separate new output directories for Graph/untapped, Eager/untapped and Eager/tapped
+(`--taps`) arms. Arming taps forces Eager; the consumer explicitly restores the requested
+mode afterwards, and Graph decode must actually capture. The instrument admits only
+the existing card-budget lever; do not assume other inherited levers were applied.
+Context 1024 is per slot, two slots total 2048, matching the original HTTP setup.
+Compare the actual per-layer placement, not just model identity or aggregate counts.
+
+Diagnose the original `313b9f0` production source with the separately recorded example
+overlay first; then bridge the same controls onto the integration candidate. A new binary
+on a larger card is not automatically the original 3090 trajectory. A control mismatch
+stops causal attribution. If layer outputs agree but the final norm/head does not, isolate
+that operation on matching inputs; intended quantization is neither a demonstrated bug
+nor automatic permission to waive the Korean flip.
+
+### Dedicated real two-card consumer
+
+`gate-gpu-flint-twocard` runs
+`two_card_tests::hw_two_card_full_file_union_capture_publication_fault_reset`.
+It requires the complete pinned GGUF in inner `BLOOMERY_MODEL`, two distinct visible
+devices, and actual expert assignments to both cards at every routed layer. It compares
+batched prompt and changed-input decode logits/layer rows with the same plan's one-card
+union, checks ranked six-slot publication and stage/tier capture/completion, then raises
+a real quantizer fault on the tier GPU while the stage is clean and checks propagation,
+poison, refusal, reset and refeed. No unsafe fault-injection API is added.
+
+The one-card library recipe keeps its exact original test filter. Both full-file recipes
+refuse the fixture tier. The two-card recipe takes the existing `both`/big-load runner
+path and has a derived host-resource ceiling, not a measured RSS claim. It does not prove
+dynamic residency/NVMe, loss/deadline recovery or a Korean oracle result.
+
+The new GPU diagnostic and two-card case require fresh NVIDIA execution. Hikari's existing
+work was explicitly left undisturbed; the new window waits for its owner. No cc12.1 values
+were inferred and the remaining resource/oracle acceptance stays open.
+
+
 
 [needs]: https://github.com/midagedev/bloomery/blob/e53cabebbb9b16249c81b7c26a026da1670f7d9d/crates/models/src/need.rs#L505-L531
 [stems]: https://github.com/midagedev/bloomery/blob/e53cabebbb9b16249c81b7c26a026da1670f7d9d/crates/model/src/arch/stems.rs#L61-L125
