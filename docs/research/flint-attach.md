@@ -595,6 +595,64 @@ The Python reader intentionally skips array values. Their recorded values came f
 `gguf::inventory_of(...).meta`, not `None` values treated as absent GGUF facts. The recipe above
 revalidates the **whole header hash**, including those arrays, without a second parser.
 
+## 10. Single-card NVIDIA acceptance and remaining numerical boundary
+
+The runtime at `313b9f0f88c90fcfae2365a4af53cd077762eb7c` was exercised on one RTX 3090,
+cc8.6, driver 595.91.07 (CUDA API 13.2), with nightly-2026-08-28, cuda-oxide `87bc9518`,
+LLVM 21.1.8 and CUDA toolkit 13.3.0 / ptxas 13.3.33. The complete 25,054,688,704-byte
+GGUF was downloaded separately on that runner and its full SHA-256 matched
+`63c2ecc461ca545134b670c660e76fa20f47240f8d39b6510bfd21c4dd6e072f`.
+
+- `just gate-gpu-flint-attn` and `just gate-gpu-flint-router`: exit 0, including loaded
+  NoPE/NeoX ring consumers, floor/optional-bias routing, capture/replay and named faults.
+- `just gate-gpu-flint-lib`: exit 0; the full-file capture/slots/reset/ring-boundary test
+  ran with **1 passed, 0 failed, 0 ignored**. Its bitwise consistency is not a mainline oracle.
+- The real HTTP seat loaded 49 layers and two resident slots, exposed the original template,
+  generated English and Korean turns to EOG 150003, split reasoning, parsed a required
+  `get_weather` call with `{"location":"Seoul"}`, and preserved messages under concurrent
+  requests. The four stop spellings tokenized to the four expected IDs; natural emission of
+  all four stop IDs was not tested.
+- A full `generate_ds41` scan and the pre-pin spill gate JITed all 436 entries without a
+  resource cache. The only ten violations were the new unpinned entries, each measured
+  `spill=0, jit_local=0`; the 26 vision entries passed. These observations supply only the
+  ten `sm_86`/cc8.6 rows. The three cc12.1 tables still need thirty genuine measurements.
+
+### Independent greedy comparison remains partly red
+
+The English raw continuation exactly matched pinned mainline CPU
+`a37cc46104eb50900d5ab4a9ba02a0abdac039db`. The Korean continuation did not: the first
+different generated ID is index 74, after the same 22 prompt IDs and 74 generated IDs
+(next absolute position 96). Mainline chooses 26007 (`라`); Bloomery chooses 29263 (` 정`).
+Both eventually answer `4`, which does not turn the comparison green.
+
+A standalone consumer linked to the preserved mainline library replayed that original
+prompt-then-single-token trajectory with zero preceding raw-argmax mismatches. Its complete
+150,144-logit rows at context 1024 and 2048 were bit-identical. At the divergence:
+
+| Observation | Margin `logit(26007) - logit(29263)` | Selected ID |
+|---|---:|---:|
+| Mainline CPU, original trajectory | +0.608115554 | 26007 |
+| Bloomery probability diagnostic, original trajectory | -0.018128157 | 29263 |
+| Bloomery, same 96 IDs supplied as one prefill | +0.361473739 | 26007 |
+
+The GPU margins are differences of reported pre-sampling log probabilities; the diagnostic
+reproduced the original first 75 generated IDs. Probability collection reads each row and
+uses plain per-token stepping, rather than establishing equality of every execution mode.
+
+This is not an exact tie or a demonstrated context-capacity defect. The common FFN owner
+explicitly uses F32-activation Q8_0 GEMV for narrow/decode rows and quantized-activation
+GEMM for wide prompt units (`shared_routed.rs`, `GATED_FROM=9`). Mainline also quantizes
+the output head's activations and BF16 router operands differently. These are source-backed
+numerical differences, not a proven localization of the Korean flip. No precision mode,
+compiler pin, tie rule, tolerance or acceptance criterion was changed to force matching text.
+Comparable follow-up traces must retain the original prompt/decode trajectory and can use
+the existing 49-layer `Body::taps` and mainline `l_out` callbacks.
+
+Keep the integration Draft. Korean numerical/oracle acceptance, cc12.1 resource rows,
+affected common-owner coverage beyond the exercised consumers, two-card operation, dynamic
+residency/NVMe, streamed HTTP and spontaneous tool selection are not established by this run.
+
+
 [needs]: https://github.com/midagedev/bloomery/blob/e53cabebbb9b16249c81b7c26a026da1670f7d9d/crates/models/src/need.rs#L505-L531
 [stems]: https://github.com/midagedev/bloomery/blob/e53cabebbb9b16249c81b7c26a026da1670f7d9d/crates/model/src/arch/stems.rs#L61-L125
 [coverage]: https://github.com/midagedev/bloomery/blob/e53cabebbb9b16249c81b7c26a026da1670f7d9d/crates/model/src/arch/coverage.rs#L1654-L1770
