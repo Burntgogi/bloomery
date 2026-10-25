@@ -2,8 +2,8 @@
 
 bloomery runs on a Mac's GPU through its own Metal backend: `bloomery-serve-metal` serves the llama-server HTTP API,
 and `generate_metal` runs one prompt from the command line. The host side is Rust; the kernels are Metal Shading
-Language. One architecture runs so far, Qwen3.6-35B-A3B (`qwen35moe`). The release binaries are Linux only, so on a Mac
-you build from source. The port's map and design are in [`contrib/mac.md`](contrib/mac.md) and issue
+Language. One architecture runs so far, Qwen3.6-35B-A3B (`qwen35moe`). The release carries a signed and notarized Apple
+Silicon build; building from source works too. The port's map and design are in [`contrib/mac.md`](contrib/mac.md) and issue
 [#593](https://github.com/midagedev/bloomery/issues/593).
 
 ## What you need
@@ -13,12 +13,26 @@ you build from source. The port's map and design are in [`contrib/mac.md`](contr
   [@avlp12](https://github.com/avlp12) (#593).
 - Memory: after the open, the model holds 20.3 GB (MLX 4-bit) or 21.8 GB (Q4_K_M) of device memory at a 4,096-row
   context, measured on the M4 Pro. A 48 GB Mac is tested; a 32 GB Mac is untested.
-- [rustup](https://rustup.rs). `rust-toolchain.toml` pins the nightly, and rustup installs it on the first build. The
-  Metal backend links no CUDA code, so plain `cargo` builds it.
-- Xcode's Metal toolchain is optional: with `xcrun metal` the build writes a metallib, and without it the kernels
-  compile from source when the binary starts.
+- To build from source: [rustup](https://rustup.rs), whose `cargo` comes first in `PATH` (Homebrew's `rust` builds
+  with its stable compiler and fails on the pinned crates). `rust-toolchain.toml` pins the nightly, and rustup installs
+  it on the first build. The Metal backend links no CUDA code, so plain `cargo` builds it. Xcode's Metal toolchain is
+  optional: with `xcrun metal` the build writes a metallib, and without it the kernels compile from their embedded
+  source when the binary starts (the release's binaries do this).
 
-## Build
+## Install
+
+```sh
+brew install midagedev/tap/bloomery
+# or the installer: the latest release, sha256-checked, symlinks into ~/.local/bin
+curl -fsSL https://raw.githubusercontent.com/midagedev/bloomery/main/tools/release/install.sh | sh
+```
+
+Both install `bloomery-serve-metal`, `generate_metal` and the converter as `bloomery-prepare`. The tarball
+`bloomery-<version>-macos-arm64-metal.tar.gz` on the [releases page](https://github.com/midagedev/bloomery/releases)
+holds the same three binaries under `bin/` (the converter as `prepare`). The commands below spell the source build's
+`target/release/` paths; an installed binary runs by its name.
+
+## Build from source
 
 ```sh
 git clone https://github.com/midagedev/bloomery && cd bloomery

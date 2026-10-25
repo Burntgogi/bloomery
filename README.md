@@ -20,7 +20,7 @@
 </p>
 
 ```sh
-brew install midagedev/tap/bloomery        # Linux x86-64, NVIDIA sm_86+, driver R580+
+brew install midagedev/tap/bloomery        # Linux x86-64 with NVIDIA sm_86+, or an Apple Silicon Mac
 bloomery-serve --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M --port 8080
 ```
 
@@ -90,14 +90,17 @@ The tarballs are on the [releases page](https://github.com/midagedev/bloomery/re
 
 ### Apple Silicon
 
-Built from source (the release binaries are Linux only), on macOS 26.2 or newer. One architecture runs so far:
-Qwen3.6-35B-A3B, from a Q4_K_M GGUF or from an MLX 4-bit folder that `prepare` converts once.
+macOS 26.2 or newer; the binaries are signed and notarized. One architecture runs so far: Qwen3.6-35B-A3B, from a
+Q4_K_M GGUF or from an MLX 4-bit folder that `bloomery-prepare` converts once.
 
 ```sh
-git clone https://github.com/midagedev/bloomery && cd bloomery
-cargo build --release -p bloomery-metal --bin bloomery-serve-metal -p bloomery-model-hf --bin prepare
-target/release/prepare PATH/Qwen3.6-35B-A3B-4bit OUT/qwen36-mlx4      # mlx-community's folder, once
-target/release/bloomery-serve-metal -m OUT/qwen36-mlx4-00001-of-00001.gguf --port 8080
+# Homebrew, or the same installer as on Linux (bloomery-0.3.9-macos-arm64-metal.tar.gz on the releases page)
+brew install midagedev/tap/bloomery
+curl -fsSL https://raw.githubusercontent.com/midagedev/bloomery/main/tools/release/install.sh | sh
+
+bloomery-serve-metal -m PATH/Qwen3.6-35B-A3B-Q4_K_M.gguf --port 8080
+bloomery-prepare PATH/Qwen3.6-35B-A3B-4bit OUT/qwen36-mlx4             # mlx-community's folder, once
+bloomery-serve-metal -m OUT/qwen36-mlx4-00001-of-00001.gguf --port 8080
 ```
 
 On an M4 Pro 48 GB (development loop, three rounds, tok/s): decode 101.2 and a 4,096-id prompt at 1,076.5 on the MLX
@@ -147,9 +150,9 @@ adaptive residency: [`docs/serving.md`](docs/serving.md).
 | What runs | State |
 |---|---|
 | NVIDIA cards | Compute capability 8.6 or newer, driver R580 or newer (CUDA 13); an older driver is refused at the start. Run here: RTX 3090, RTX A6000, RTX 3060 (WSL2). Run by users: RTX 5090 ([#2](https://github.com/midagedev/bloomery/issues/2)), DGX Spark (GB10, from source: [`docs/contrib/dgx-spark.md`](docs/contrib/dgx-spark.md)), one model across several Sparks. Ada (sm_89): no report yet |
-| Apple Silicon | macOS 26.2 or newer, built from source; Qwen3.6-35B-A3B, one slot, text only ([`docs/mac.md`](docs/mac.md)). Run here: M1 Pro, M4 Pro 48 GB. Run by users: M3 Ultra, M5 Ultra ([#593](https://github.com/midagedev/bloomery/issues/593)). On an M5 the prompt's GEMMs run on the neural accelerators, picked by the device |
-| Host CPU | x86-64 with AVX2 (x86-64-v3), AMD or Intel. The release binaries are x86-64 only |
-| OS | Linux x86-64 with glibc 2.34 or newer; Windows through WSL2; macOS from source. AMD GPUs are not supported yet |
+| Apple Silicon | macOS 26.2 or newer, the release's signed binaries (Homebrew, the installer or the tarball); Qwen3.6-35B-A3B, one slot, text only ([`docs/mac.md`](docs/mac.md)). Run here: M1 Pro, M4 Pro 48 GB. Run by users: M3 Ultra, M5 Ultra ([#593](https://github.com/midagedev/bloomery/issues/593)). On an M5 the prompt's GEMMs run on the neural accelerators, picked by the device |
+| Host CPU | x86-64 with AVX2 (x86-64-v3), AMD or Intel, for the CUDA build; the Metal build runs on Apple Silicon |
+| OS | Linux x86-64 with glibc 2.34 or newer; Windows through WSL2; macOS 26.2 or newer on Apple Silicon. AMD GPUs are not supported yet |
 
 ## Numbers
 
