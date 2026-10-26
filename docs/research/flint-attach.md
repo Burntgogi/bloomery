@@ -133,15 +133,32 @@ A compiled public `file_site` consumer on the pinned header refused all three
 layer42 shared matrices before this change and accepts their IQ4_XS/Q8x128
 bindings after it. This reads no payload and proves neither loading nor arithmetic.
 `hw_iq4_shared_loads_and_runs_narrow_columns_and_wide_replay`, owned by
-`gate-gpu-ds41-lib`, covers real packed-weight loading, unequal matrix widths,
-one/eight-column block execution and the wide-prompt transition/captured replay.
-Its nonnegative constant-weight case derives a scalar floating-operation bound;
-it is not a whole-model accuracy pin. The hardware case has not been run here.
+`gate-gpu-ds41-lib`, covers real packed-weight loading, unchanged stored words,
+the ordinary `SharedExpert` layout, unequal matrix widths, one/eight-column block
+execution and the wide-prompt transition/captured replay. Wide scratch holds only
+the q8_1 input and down forms these sites read. Its nonnegative constant-weight
+case derives a scalar floating-operation bound; it is not a whole-model accuracy pin.
 
 Existing program-specific admission remains unchanged: in particular the legacy
 Qwen projection/shared dispatch does not gain this site automatically. Flint's implemented
 Program binds the real ordinary dense/shared operations. Run the new consumer gate and affected
 regressions on NVIDIA before claiming device support; header coverage is not arithmetic proof.
+
+On 2026-10-26, source `203f5125a3c48a5b700c6f43318cfcb9c77ff169` executed the owning
+DS41 library on Hikari GPU0 (RTX3090 cc8.6, driver595.91.07):38 passed,0 failed,0 ignored,
+28.61s, including the named IQ4 consumer above. Rust1.99.1 / pinned cuda-oxide9df9e7ce
+with repository patch31ab6a1d3f58 and LLVM21.1.8 were used.
+Its canonical comparison to main15778e2c covered4bins/8carriers/1657entries: all identical,
+non-JIT resource rows equal; no JIT-resource comparison is claimed.
+All-target native Clippy/formatting and current-head GitHub T0/lint passed.
+The original execution request5a907e86-7ac6-4219-a3b6-e3cf1de84e03 exited0 but credential
+cleanup remains unconfirmed; test success does not certify credential revocation.
+Raw logs and canonical manifests remain in the contribution workspace's
+`flint-closure-20261026` and its matching remote evidence directory. GPU1 was not stopped.
+Later documentation-only commits are not a new GPU execution. Wider affected real-model,
+placement and residency coverage remains explicit for maintainer review; #782 is review-ready,
+not merged, and this does not establish a Flint oracle, physical cc12.1, ROCm or performance.
+
 ### Selected expert arms and tier scratch
 
 Common card and tier wrappers resolve `LegArms` from their selected `Program`, rather than assuming
@@ -225,7 +242,6 @@ capabilities inferred from this primitive.
 `check-ptx-names` remains red until observed spill/JIT-local measurements can pin
 the new entry in the four existing architecture/capability tables. Offline
 no-JIT scans cannot supply that missing column, so no placeholder row is added.
-
 
 ### Integrated runtime consumer and NVIDIA handoff
 
