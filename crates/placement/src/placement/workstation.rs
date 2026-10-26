@@ -632,7 +632,6 @@ pub fn tier_leg_batch_bytes(
     )
 }
 
-
 /// The common leg's staging, host rows and selected-form scratch, refusing
 /// invalid geometry or overflowing byte counts before placement.
 pub fn try_tier_leg_batch_bytes_of(

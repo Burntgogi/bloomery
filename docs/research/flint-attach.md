@@ -107,16 +107,15 @@ unchanged. A legacy `RouterEntry` given no required bias returns a named state e
 dense rows, both bias modes, active tiny-sum floors, zero sums, ties, nonfinite logits/bias/scale,
 one-token/batch bit equivalence and eager/captured replay. Its independent host weight expression
 uses the declared floor and rejects an epsilon-added or biased-weight implementation.
-**needs-gpu:** this implementation has no local NVIDIA numerical, capture, fault, allocation or
-JIT-resource evidence. The two new entries (`sigmoid_floor_256_6_router` and
-`sigmoid_floor_256_6_router_pick`) have no invented resource pins; the add-class PTX comparison,
-spill/JIT pinning and hardware gate remain required.
+The two entries (`sigmoid_floor_256_6_router` and
+`sigmoid_floor_256_6_router_pick`) need same-toolchain add-class PTX/JIT comparisons
+and measured resource pins; compiling an entry or running a numerical gate is not
+a resource census. No unmeasured pin is supplied.
 
-The `Need::Program` refusal stays: a callable router is not a Flint body or session. Close shared
-IQ4_XS, selected card/tier down forms and six-slot F32 handoff in their existing common owners,
-followed by paging/resident slots, reference provenance and the body/app/seat.
-Each device slice needs its numerical/fault gates and the maintainer's offered hardware proof before
-whole-program admission.
+The loaded `FlintBody`, app session and serve seat now compose these common owners.
+Program coverage is present; it must not be confused with whole-model numerical
+acceptance. Paging/resident slots, reference provenance, eager/captured execution,
+HTTP behavior and affected common/tier consumers retain their own acceptance gates.
 Legacy metadata booleans share `RouterNorm::from_legacy_bool`: false keeps scores and true uses the
 existing epsilon-added selected sum. Flint's distinct floor mapping stays in its reader.
 
@@ -889,15 +888,13 @@ and executed hardware case; compiled/ignored tests are not such evidence. Preser
 existing workloads unless their owner authorizes a separate window. Physical cc12.1
 resource values must be measured, never inferred from an sm_86 build or cc8.6 run.
 
-## 12. Existing-PR cutover and same-input head probe — 2026-10-26
+## 12. Shared-contract integration and same-input head probe — 2026-10-26
 
-The existing #799 branch now integrates fixed main
-`15778e2cb2dd7af428d2dd14259e6b0ea8ca6b89` by ordinary merges, preserving both its
-original `ebce5badb6f375c74930ff26a4eb50e7e74ce97d` ancestry and the previous D6 replay.
-It also preserves the component histories of #781, #782 and #783. This is not a replacement
-PR or a force-push. The cutover adopts main's Rust1.99.1 and pinned cuda-oxide9df9e7ce /
-repository backend patch31ab6a1d3f58, not a contribution-specific compiler override.
-The older nightly/87bc runtime arrays remain evidence of their own source/toolchain only.
+The integrated contracts use main
+`15778e2cb2dd7af428d2dd14259e6b0ea8ca6b89`'s Rust1.99.1 and pinned
+cuda-oxide9df9e7ce / repository backend patch31ab6a1d3f58, not a model-specific
+compiler override. Older nightly/87bc arrays remain evidence of their own
+source and toolchain only.
 
 Current-main's prequantized leg input and metadata-only `Common` remain separate.
 Both ordinary and prequantized entry points retain the loaded `AmaxF16` protection state.
@@ -905,14 +902,14 @@ The already-activated card leg normalizes with `rule=None`: its second device AB
 is unread, so it borrows the distinct existing down buffer rather than allocating or copying
 a fake input. A hardware regression compares ordinary input with prequantized captured replay,
 including changed amplitudes, Direct/AmaxF16, full/partial batches and skipped/tail canaries.
-Compilation is not evidence that this new hardware case has executed.
-
-The cutover's production/test source `cb77a4788116c00a02122a56f47efff97c3ba47f`
+Historical integration source `082cf7ffac3bb5b5d574b489062732735985feeb`
 passed native all-target Clippy and formatting, with three warning lines against ratchet three.
 Its host library run passed chain23, GGUF67, placement206 and model563 (five model tests
-ignored); zero tests were filtered by the historical known-base-test skip.
-Common-name and unsafe ownership checks also passed after the contract reconciliation.
-These checks are distinct from current-head NVIDIA/model acceptance.
+ignored), with zero filtered tests. Common-name and unsafe ownership checks also passed.
+On RTX3090 cc8.6 / driver595.91.07, its protected-prequantized, mixed/empty-tier and
+complete-GGUF consumers each passed one hardware case, zero failed/ignored. Its attention
+and router executables also exited0. These are source-specific results, not execution
+of later ownership/API repairs or whole-model oracle acceptance.
 
 ### Measured head/upstream separation, not a precision fix
 
@@ -938,13 +935,11 @@ and upstream contributions; they do not identify the first upstream operation or
 head difference to one quantization step. No production precision, tolerance, tie rule or oracle
 criterion was changed, and no existing GPU arm was replayed for this CPU-only probe.
 
-Raw inputs, complete output rows, bit-identity controls, exact margins and reproduction source
-are retained under the contribution workspace's `flint-closure-20261026/head-probe/`.
-Original v2 GPU arrays remain at their earlier remote locations; they were not overwritten
-or reattributed to this cutover. Keep #799 Draft pending exact-source runtime acceptance,
-the Korean numerical/oracle decision, genuine physical cc12.1 resource measurements and
-remaining affected common/residency/tier/NVMe coverage. Component review readiness is not
-whole-model admission, merge, issue closure, ROCm support or a performance result.
+These source-specific cross-input results are not a run of a later integration.
+Whole-model acceptance still requires exact-source runtime proof, disposition of
+the Korean numerical/oracle mismatch, genuine physical cc12.1 resource measurements
+and remaining affected common/residency/tier/NVMe coverage. Component proof is not
+whole-model admission, ROCm support or a performance result.
 
 
 [needs]: https://github.com/midagedev/bloomery/blob/e53cabebbb9b16249c81b7c26a026da1670f7d9d/crates/models/src/need.rs#L505-L531
