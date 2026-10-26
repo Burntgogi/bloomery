@@ -177,7 +177,7 @@ mod tests {
     use super::super::hparams::tests::{LAYERS, keys, tensors};
     use super::{PROMPT_ROWS, PlaceError, PlanInputs, prompt_reserve_bytes, tier_batch};
     use crate::arch::synthetic::{Ty, V, header_shaped, header_typed};
-    use crate::placement::{Device, PlacementError, PlanLevers, Violation, workstation};
+    use crate::placement::{Device, PlacementError, PlanLevers, workstation};
 
     /// The small header's file, described; each test names its own file (the tests run in
     /// threads of one process).
@@ -400,36 +400,25 @@ mod tests {
         );
         let levers = PlanLevers::default();
         let mut machine = workstation::plan_gate(LAYERS);
-        machine.cards[0].usable_bytes = machine.cards[0].margin_bytes;
-        let short = loop {
-            match inputs.plan(&machine, 64, &levers) {
-                Err(PlaceError::Broken(v)) => {
-                    let over = v
-                        .iter()
-                        .find_map(|v| match v {
-                            Violation::CardOver { total, limit, .. } => Some(total - limit),
-                            _ => None,
-                        })
-                        .unwrap_or_else(|| panic!("{v:?}, no card over its limit"));
-                    machine.cards[0].usable_bytes += over;
-                }
-                Err(PlaceError::PromptOver {
-                    reserve: got,
-                    left,
-                    short,
-                    ..
-                }) => {
-                    assert_eq!((got, short), (reserve, reserve - left));
-                    break short;
-                }
-                other => panic!("{other:?}, not the reserve's refusal"),
-            }
-        };
-        machine.cards[0].usable_bytes += short - 1;
-        assert!(matches!(
-            inputs.plan(&machine, 64, &levers),
-            Err(PlaceError::PromptOver { short: 1, .. })
-        ));
+        let host_only = crate::placement::plan_host_routed(
+            &inputs.model,
+            &machine,
+            64,
+            &inputs.seq_terms(),
+            &levers,
+        )
+        .expect("the host-only reference plans");
+        let dense = crate::arch::place_hybrid::card_terms(&host_only.cards[0]);
+        machine.cards[0].usable_bytes = machine.cards[0].margin_bytes + dense + reserve - 1;
+        match inputs.plan(&machine, 64, &levers) {
+            Err(PlaceError::PromptOver {
+                reserve: got,
+                left,
+                short,
+                ..
+            }) => assert_eq!((got, left, short), (reserve, reserve - 1, 1)),
+            other => panic!("{other:?}, not the reserve's one-byte refusal"),
+        }
         machine.cards[0].usable_bytes += 1;
         let plan = inputs
             .plan(&machine, 64, &levers)
