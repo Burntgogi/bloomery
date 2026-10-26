@@ -6,6 +6,39 @@ that snapshot. The integration adds an actual `gpu-flint` body, application sess
 HTTP seat, not just architecture admission. Sections 10–11 retain source-specific historical
 execution evidence; section 12 records the current existing-PR cutover and remaining acceptance.
 
+## Six-slot handoff closure checks — 2026-10-26
+
+The existing #781 branch was ordinarily merged with main
+`15778e2cb2dd7af428d2dd14259e6b0ea8ca6b89`; its published history was not rewritten.
+On source `9bfa55adc257f7e6aae4952aca06246eddaeef70`, the owning DS41 library ran on
+Hikari's RTX 3090 (GPU0): **38 passed, 0 failed, 0 ignored**, in 28.75 seconds.
+`hw_f32_tier_handoffs_conserve_consumed_routes` exercised four, six and eight routes,
+including partial widths, invalid IDs, poisoned unconsumed rows and changed-input graph replay.
+The following host-only changes format the guard and replace a redundant slot-dependent
+error label with the common `F32 tier handoff` context. The measured common-name census
+falls from 39 to 37; the ABI-stable generated kernel names and dispatch stay unchanged.
+The earlier GPU run is not relabeled as a run of these later commits.
+
+The original remote request timed out while its child continued; a separate read-only
+collector recovered the original successful log rather than replaying the run.
+Original-request credential cleanup remains unconfirmed and is not implied by test success.
+Raw evidence is retained outside Git under
+`/home/jmtai04/flint-completion-4dadee0-20261025T205648Z/evidence/closure-20261026/`;
+local receipts are under `flint-closure-20261026` in the contribution workspace.
+The actual `generate_ds41` carrier at `b9b6e013ebfab5748688be52e9a5d398ac2fc9a3`
+subsequently measured `ffn_handoff_6_tier` on sm_86 / physical cc8.6:
+ptxas13.3.33 spill0, driver-JIT local0, both register counts26 (driver595.91.07,
+JIT CUDA13.2, Rust1.99.1 / cuda-oxide9df9e7ce / repository patch31ab6a1d3f58).
+Only that measured row is added. Its normalized entry digest is
+`a176a9a5846778e40ba99fc2be637d90` (decl1, 163 lines).
+This resource request also exceeded the gateway window; a read-only collector recovered
+the original scan, with no remaining owned process and GPU1 active/healthy.
+The original script recorded exit23 after producing the complete successful scan;
+a post-timeout stdout write failure is the explanation inferred from its final curl step,
+not an invented exit0 for the request. The original credential cleanup remains unconfirmed.
+Accessible cards establish only cc8.6. The other three sm_86/sm_121/sm_121a + physical
+cc12.1 rows remain unmeasured and absent; #781 stays Draft until that gate is dispositioned.
+
 ## Host reader status
 
 `arch/flint` reads independent bool SWA/RoPE masks, explicit head widths, the dense lead,
