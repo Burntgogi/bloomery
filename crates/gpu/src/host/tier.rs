@@ -257,25 +257,27 @@ impl TierOpen {
     /// The expert tier cards `machine` names, in tier order: each card's
     /// index in [`Machine::all_cards`] (after the stage cards), its name, its
     /// device, and the node `BLOOMERY_TIER_NODES` names for it, the lever's
-    /// `t`-th address for tier `t`. Empty without a tier. A lever that names
-    /// another count of nodes than the machine's tiers is refused by name.
+    /// `t`-th address for tier `t`. Empty without a tier; a reserve-only
+    /// member ([`model::placement::Card::reserve_only`]) serves no tier and
+    /// is not one, and the plan lists it after the tiers that are. A lever
+    /// that names another count of nodes than the machine's expert tiers is
+    /// refused by name.
     pub fn of_machine(machine: &Machine) -> Result<Vec<TierOpen>, GpuError> {
         const WHAT: &str = "TierOpen::of_machine";
         let nodes = bloomery_levers::tier_nodes().map_err(|e| GpuError::plan(WHAT, e))?;
-        if !nodes.is_empty() && nodes.len() != machine.tiers.len() {
+        let tiers = machine.expert_tiers().count();
+        if !nodes.is_empty() && nodes.len() != tiers {
             return Err(GpuError::shape(
                 WHAT,
                 format!(
-                    "{} names {} tier nodes for a plan of {} expert tiers: one a tier",
+                    "{} names {} tier nodes for a plan of {tiers} expert tiers: one a tier",
                     bloomery_levers::TIER_NODES,
                     nodes.len(),
-                    machine.tiers.len()
                 ),
             ));
         }
         Ok(machine
-            .tiers
-            .iter()
+            .expert_tiers()
             .enumerate()
             .map(|(i, t)| TierOpen {
                 card: machine.cards.len() + i,

@@ -117,7 +117,6 @@ mod gate {
         self, Body, BodyMeta, DECODE_INPUT, Deepseek41Model, FeatureRows, OpenCfg, PrefillMode,
         TIER_MAP_BEFORE_UPLOAD, TierOpen,
     };
-    use bloomery_gpu_gates::generate::Place;
     use bloomery_gpu_gates::{GateError, checks_failed, prose_ids};
     use bloomery_levers::{
         CARD_BUDGET, CARD_DONTNEED, ENGRAM_HELPER, HOST_LOCK, HOST_POPULATE, R8,
@@ -729,8 +728,7 @@ mod gate {
         };
         let tmachine = tier_machine(&machine, &inputs.hp)?;
         let draft = dspark::draft_hparams()?;
-        let reserve = dspark::draft_reserve(Place::Bp, &draft.0, std::path::Path::new(&path))?
-            .ok_or("plan (b′) made no draft reserve")?;
+        let reserve = dspark::draft_bytes(&draft.0, std::path::Path::new(&path))?;
         let k3 = tier_depth(
             &inputs,
             &bloomery_gpu_gates::tier::plan_levers(&split()?, &levers, reserve)?,

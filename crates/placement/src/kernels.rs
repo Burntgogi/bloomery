@@ -67,6 +67,10 @@ pub const fn gemm_reads_blocks32(entry: GemmEntry) -> bool {
         | GemmEntry::Q5k
         | GemmEntry::Q6k
         | GemmEntry::Iq2xxs
+        | GemmEntry::Iq2xs
+        | GemmEntry::Iq2s
+        | GemmEntry::Iq1s
+        | GemmEntry::Iq1m
         | GemmEntry::Iq3xxs
         | GemmEntry::Iq3s
         | GemmEntry::Iq4xs => false,
@@ -207,7 +211,11 @@ pub const fn card_gate_up_runs(ty: GgmlType) -> bool {
             GateUpEntry::Q4k
                 | GateUpEntry::Q5k
                 | GateUpEntry::Mxfp4
+                | GateUpEntry::Iq2xxs
                 | GateUpEntry::Iq2xs
+                | GateUpEntry::Iq2s
+                | GateUpEntry::Iq1s
+                | GateUpEntry::Iq1m
                 | GateUpEntry::Iq3xxs
                 | GateUpEntry::Iq3s
                 | GateUpEntry::Iq4xs
@@ -218,12 +226,11 @@ pub const fn card_gate_up_runs(ty: GgmlType) -> bool {
 /// Whether the common card leg launches the down entry of a routed down stack
 /// of type `ty` in the file's blocks: the table's [`down`] row, for the entries whose launchers take
 /// an activation of more columns than a run uses, with the form the leg
-/// quantizes for them: the 128-value [`DownAct::Q8Act`] (Q4_K, Q5_K, MXFP4,
-/// IQ2_XS, IQ3_XXS, IQ3_S, IQ4_XS) or the 32-value [`DownAct::Q8Blocks32`] (Q5_1,
-/// Q8_0, IQ4_NL). The Q6_K launcher takes such an activation; the leg's arm for
-/// it runs on a tensor-parallel rank alone ([`rank_down_runs`]), so a plan that
-/// reads this keeps a Q6_K down's experts off the card. The Q5_0 row reads the
-/// packed layout, not the file's blocks.
+/// quantizes for them: the 128-value [`DownAct::Q8Act`] (Q4_K, Q5_K, Q6_K,
+/// MXFP4, IQ2_XXS, IQ2_XS, IQ3_XXS, IQ3_S, IQ4_XS) or the 32-value [`DownAct::Q8Blocks32`]
+/// (Q5_1, Q8_0, IQ4_NL). A Q6_K down reads [`DownAct::Q8Act`], the form the
+/// common families' down buffers hold. The Q5_0 row reads the packed layout,
+/// not the file's blocks.
 #[must_use]
 pub const fn card_down_runs(ty: GgmlType) -> bool {
     matches!(
@@ -231,8 +238,13 @@ pub const fn card_down_runs(ty: GgmlType) -> bool {
         Some((
             DownEntry::Q4k
                 | DownEntry::Q5k
+                | DownEntry::Q6k
                 | DownEntry::Mxfp4
+                | DownEntry::Iq2xxs
                 | DownEntry::Iq2xs
+                | DownEntry::Iq2s
+                | DownEntry::Iq1s
+                | DownEntry::Iq1m
                 | DownEntry::Iq3xxs
                 | DownEntry::Iq3s
                 | DownEntry::Iq4xs,
@@ -242,15 +254,6 @@ pub const fn card_down_runs(ty: GgmlType) -> bool {
             DownAct::Q8Blocks32
         ))
     )
-}
-
-/// Whether a tensor-parallel rank's card leg launches the down entry of a routed
-/// down stack of type `ty`: [`card_down_runs`]' entries and the Q6_K one over a
-/// [`DownAct::Q8Act`]. A rank holds every expert of its layers on its card and
-/// has no host tier to leave a Q6_K down to.
-#[must_use]
-pub const fn rank_down_runs(ty: GgmlType) -> bool {
-    card_down_runs(ty) || matches!(down(ty), Some((DownEntry::Q6k, DownAct::Q8Act)))
 }
 
 /// Whether the common card leg's relu² form launches the 32-value-block `_sel`
@@ -266,15 +269,23 @@ pub const fn card_sel32_runs(ty: GgmlType) -> bool {
     )
 }
 
-/// Whether the common card leg runs a routed stack of `ty` in any of the three
-/// roles: the gate·up and the down rows both have launches the leg runs
-/// ([`card_gate_up_runs`], [`card_down_runs`]). A plan reads a stack's type
-/// alone, so a stack is a card stack when its type runs in every role; the leg
-/// itself checks each role by its own rule ([`card_gate_up_runs`] for a gate or
-/// up stack, [`card_down_runs`] for a down stack).
+/// Whether a type runs in every role the common leg launches
+/// ([`card_gate_up_runs`] and [`card_down_runs`]). The plans do not read
+/// this: each role has its own arm, so a Q6_K down (in [`card_down_runs`],
+/// not here) is on the card beside a gate and up [`card_gate_up_runs`] admits.
 #[must_use]
 pub const fn card_runs(ty: GgmlType) -> bool {
     card_gate_up_runs(ty) && card_down_runs(ty)
+}
+
+/// Whether the common card leg runs a routed down stack of `ty` over the
+/// 128-value [`DownAct::Q8Act`]: the one form the mimo2 and solar2 bodies'
+/// leg buffers and an expert tier card's leg hold, so their plans place a
+/// down only by this. Q6_K is one; the 32-value downs (Q5_1, Q8_0, IQ4_NL)
+/// are not.
+#[must_use]
+pub const fn card_q8act_down_runs(ty: GgmlType) -> bool {
+    card_down_runs(ty) && matches!(down(ty), Some((_, DownAct::Q8Act)))
 }
 
 /// Whether the common card leg runs a routed stack of `ty` in its planes
@@ -454,6 +465,19 @@ mod tests {
     // PIN(2026-10-19): the gate·up, down, activation-form and up pairs gain
     // NVFP4 (`nvfp4_gate_up_sel`, `nvfp4_gemv_sel32` over its planes); the
     // file-block run sets (`card_runs` and its parts) are unchanged.
+    // PIN(2026-10-23): the gate·up, down, activation-form pairs and the
+    // file-block run sets gain IQ2_XXS (`iq2_xxs_gate_up_sel` through the
+    // block's shared table, `iq2_xxs_gemv_sel` as its down); every other pair
+    // is unchanged.
+    // PIN(2026-10-23): the gate·up, down, activation-form and up pairs, the
+    // planes run set and the planes layout gain NVFP4_ROWS, which takes
+    // NVFP4's routed card columns (a folder's routed stack loads as NVFP4
+    // planes); every other pair is unchanged.
+    // PIN(2026-10-25): the gate·up, down, activation-form pairs and the
+    // file-block run sets gain IQ2_S, IQ1_S and IQ1_M (`iq2_s_gate_up_sel`,
+    // `iq1_s_gate_up_sel`, `iq1_m_gate_up_sel` through the block's shared
+    // table, and their `_gemv_sel` downs); IQ2_XS also takes the file-block
+    // layout and a routed column. Every other pair is unchanged.
     #[test]
     fn gate_up_admits_exactly_the_pinned_pairs() {
         assert_eq!(
@@ -465,10 +489,15 @@ mod tests {
                 (GgmlType::Q6_K, GateUpEntry::Q6k),
                 (GgmlType::MXFP4, GateUpEntry::Mxfp4),
                 (GgmlType::NVFP4, GateUpEntry::Nvfp4),
+                (GgmlType::IQ2_XXS, GateUpEntry::Iq2xxs),
                 (GgmlType::IQ2_XS, GateUpEntry::Iq2xs),
                 (GgmlType::IQ3_XXS, GateUpEntry::Iq3xxs),
+                (GgmlType::IQ1_S, GateUpEntry::Iq1s),
                 (GgmlType::IQ3_S, GateUpEntry::Iq3s),
+                (GgmlType::IQ2_S, GateUpEntry::Iq2s),
                 (GgmlType::IQ4_XS, GateUpEntry::Iq4xs),
+                (GgmlType::IQ1_M, GateUpEntry::Iq1m),
+                (GgmlType::NVFP4_ROWS, GateUpEntry::Nvfp4),
             ]
         );
     }
@@ -490,17 +519,23 @@ mod tests {
                 (GgmlType::Q6_K, DownEntry::Q6k),
                 (GgmlType::MXFP4, DownEntry::Mxfp4),
                 (GgmlType::NVFP4, DownEntry::Nvfp4),
+                (GgmlType::IQ2_XXS, DownEntry::Iq2xxs),
                 (GgmlType::IQ2_XS, DownEntry::Iq2xs),
                 (GgmlType::IQ3_XXS, DownEntry::Iq3xxs),
+                (GgmlType::IQ1_S, DownEntry::Iq1s),
                 (GgmlType::IQ4_NL, DownEntry::Iq4nl),
                 (GgmlType::IQ3_S, DownEntry::Iq3s),
+                (GgmlType::IQ2_S, DownEntry::Iq2s),
                 (GgmlType::IQ4_XS, DownEntry::Iq4xs),
+                (GgmlType::IQ1_M, DownEntry::Iq1m),
+                (GgmlType::NVFP4_ROWS, DownEntry::Nvfp4),
             ]
         );
     }
 
-    /// The K-quant, MXFP4 and i-quant (IQ2_XS, IQ3_XXS, IQ3_S, IQ4_XS) downs read
-    /// the 128-value `Q8Act`; every other down reads the 32-value `Q8Blocks32`.
+    /// The K-quant, MXFP4 and i-quant (IQ2_XXS, IQ2_XS, IQ3_XXS, IQ1_S, IQ3_S,
+    /// IQ2_S, IQ4_XS, IQ1_M) downs read the 128-value `Q8Act`; every other down reads the 32-value
+    /// `Q8Blocks32`.
     #[test]
     fn down_reads_the_activation_form_of_its_entry() {
         let forms: Vec<_> = ALL
@@ -518,11 +553,16 @@ mod tests {
                 (GgmlType::Q6_K, DownAct::Q8Act),
                 (GgmlType::MXFP4, DownAct::Q8Act),
                 (GgmlType::NVFP4, DownAct::Q8Blocks32),
+                (GgmlType::IQ2_XXS, DownAct::Q8Act),
                 (GgmlType::IQ2_XS, DownAct::Q8Act),
                 (GgmlType::IQ3_XXS, DownAct::Q8Act),
+                (GgmlType::IQ1_S, DownAct::Q8Act),
                 (GgmlType::IQ4_NL, DownAct::Q8Blocks32),
                 (GgmlType::IQ3_S, DownAct::Q8Act),
+                (GgmlType::IQ2_S, DownAct::Q8Act),
                 (GgmlType::IQ4_XS, DownAct::Q8Act),
+                (GgmlType::IQ1_M, DownAct::Q8Act),
+                (GgmlType::NVFP4_ROWS, DownAct::Q8Blocks32),
             ]
         );
     }
@@ -539,6 +579,7 @@ mod tests {
                 (GgmlType::Q8_0, DownEntry::Q8_0),
                 (GgmlType::NVFP4, DownEntry::Nvfp4),
                 (GgmlType::IQ4_NL, DownEntry::Iq4nl),
+                (GgmlType::NVFP4_ROWS, DownEntry::Nvfp4),
             ]
         );
         for ty in ALL {
@@ -556,12 +597,12 @@ mod tests {
         assert!(up(GgmlType::Q5_0).is_some() && !card_sel32_runs(GgmlType::Q5_0));
     }
 
-    /// The leg runs NVFP4 from its planes and no other type; no type runs
-    /// both from the file's blocks and from planes.
+    /// The leg runs NVFP4 and NVFP4_ROWS from their planes and no other type;
+    /// no type runs both from the file's blocks and from planes.
     #[test]
     fn card_planes_runs_admits_exactly_nvfp4() {
         let runs: Vec<GgmlType> = ALL.into_iter().filter(|&ty| card_planes_runs(ty)).collect();
-        assert_eq!(runs, [GgmlType::NVFP4]);
+        assert_eq!(runs, [GgmlType::NVFP4, GgmlType::NVFP4_ROWS]);
         assert_eq!(
             CardFormat::of(GgmlType::NVFP4),
             Some(CardFormat::Nvfp4Planes)
@@ -587,7 +628,30 @@ mod tests {
                 GgmlType::Q5_1,
                 GgmlType::Q8_0,
                 GgmlType::NVFP4,
-                GgmlType::IQ4_NL
+                GgmlType::IQ4_NL,
+                GgmlType::NVFP4_ROWS
+            ]
+        );
+    }
+
+    // PIN(2026-10-27): IQ4_XS adds the existing selected GEMV as an ordinary site.
+    #[test]
+    fn dense_admits_exactly_the_pinned_pairs() {
+        assert_eq!(
+            rows(dense),
+            [
+                (GgmlType::F32, SiteEntry::F32),
+                (GgmlType::Q5_0, SiteEntry::Q5_0),
+                (GgmlType::Q8_0, SiteEntry::Q8_0),
+                (GgmlType::Q3_K, SiteEntry::Q3k),
+                (GgmlType::Q4_K, SiteEntry::Q4k),
+                (GgmlType::Q5_K, SiteEntry::Q5k),
+                (GgmlType::Q6_K, SiteEntry::Q6k),
+                (GgmlType::BF16, SiteEntry::Bf16),
+                (GgmlType::NVFP4, SiteEntry::Nvfp4),
+                (GgmlType::IQ4_XS, SiteEntry::Iq4xs),
+                (GgmlType::MXFP8, SiteEntry::Mxfp8),
+                (GgmlType::FP8_B128, SiteEntry::Fp8B128),
             ]
         );
     }
@@ -599,6 +663,11 @@ mod tests {
     // PIN(2026-10-22): and Q5_0 (`gemm_q5_0p` over a stack's `pack_q5_0` words,
     // which Raon-1's Q5_0 down stacks' prompt route reads), and IQ3_S
     // (`gemm_iq3s`, over the file's blocks); every other pair is unchanged.
+    // PIN(2026-10-23): and NVFP4_ROWS (`gemm_nvfp4p` over NVFP4's planes, the
+    // routed card columns it takes); every other pair is unchanged.
+    // PIN(2026-10-25): and IQ2_XS, IQ2_S, IQ1_S and IQ1_M (`gemm_iq2xs`,
+    // `gemm_iq2s`, `gemm_iq1s`, `gemm_iq1m` over the file's blocks); every
+    // other pair is unchanged.
     #[test]
     fn gemm_admits_exactly_the_pinned_pairs() {
         assert_eq!(
@@ -613,10 +682,15 @@ mod tests {
                 (GgmlType::Q6_K, GemmEntry::Q6k),
                 (GgmlType::NVFP4, GemmEntry::Nvfp4),
                 (GgmlType::IQ2_XXS, GemmEntry::Iq2xxs),
+                (GgmlType::IQ2_XS, GemmEntry::Iq2xs),
                 (GgmlType::IQ3_XXS, GemmEntry::Iq3xxs),
+                (GgmlType::IQ1_S, GemmEntry::Iq1s),
                 (GgmlType::IQ4_NL, GemmEntry::Iq4nl),
                 (GgmlType::IQ3_S, GemmEntry::Iq3s),
+                (GgmlType::IQ2_S, GemmEntry::Iq2s),
                 (GgmlType::IQ4_XS, GemmEntry::Iq4xs),
+                (GgmlType::IQ1_M, GemmEntry::Iq1m),
+                (GgmlType::NVFP4_ROWS, GemmEntry::Nvfp4),
             ]
         );
     }
@@ -632,6 +706,8 @@ mod tests {
 
     // PIN(2026-10-20): the head and embedding pairs gain BF16 (`bf16_gemv`
     // over the head's words, `embed_rows_bf16`); every other pair is unchanged.
+    // PIN(2026-10-25): the head gains Q5_K (the `_sel` Q5_K gemv over the matrix
+    // as one expert, one row); every other pair is unchanged.
     #[test]
     fn head_admits_exactly_the_pinned_pairs() {
         assert_eq!(
@@ -639,6 +715,7 @@ mod tests {
             [
                 (GgmlType::Q8_0, HeadEntry::Q8_0),
                 (GgmlType::Q4_K, HeadEntry::Q4k),
+                (GgmlType::Q5_K, HeadEntry::Q5k),
                 (GgmlType::Q6_K, HeadEntry::Q6k),
                 (GgmlType::BF16, HeadEntry::Bf16),
             ]
@@ -660,6 +737,117 @@ mod tests {
         );
     }
 
+    /// The layout of each file type and its default routed layout: Q5_K,
+    /// MXFP8 and IQ4_XS require a program-specific routed rule.
+    // PIN(2026-10-23): NVFP4_ROWS loads as NVFP4's planes (its routed card
+    // columns); every other pair is unchanged.
+    // PIN(2026-10-25): IQ2_XS, IQ1_S, IQ2_S and IQ1_M load as the file's
+    // blocks, as IQ2_XXS does; every other pair is unchanged.
+    // PIN(2026-10-27): ordinary IQ4_XS matrices retain their file blocks.
+    #[test]
+    fn the_card_layouts_are_the_pinned_pairs() {
+        assert_eq!(
+            rows(CardFormat::of),
+            [
+                (GgmlType::F32, CardFormat::F32),
+                (GgmlType::F16, CardFormat::Bf16AsF32),
+                (GgmlType::Q5_0, CardFormat::Q5_0),
+                (GgmlType::Q5_1, CardFormat::Q5_1),
+                (GgmlType::Q8_0, CardFormat::Q8_0Planes),
+                (GgmlType::Q3_K, CardFormat::KQuant),
+                (GgmlType::Q4_K, CardFormat::KQuant),
+                (GgmlType::Q5_K, CardFormat::KQuant),
+                (GgmlType::Q6_K, CardFormat::KQuant),
+                (GgmlType::BF16, CardFormat::Bf16AsF32),
+                (GgmlType::NVFP4, CardFormat::Nvfp4Planes),
+                (GgmlType::IQ2_XXS, CardFormat::KQuant),
+                (GgmlType::IQ2_XS, CardFormat::KQuant),
+                (GgmlType::IQ1_S, CardFormat::KQuant),
+                (GgmlType::IQ2_S, CardFormat::KQuant),
+                (GgmlType::IQ4_XS, CardFormat::KQuant),
+                (GgmlType::IQ1_M, CardFormat::KQuant),
+                (GgmlType::MXFP8, CardFormat::Mxfp8Planes),
+                (GgmlType::NVFP4_ROWS, CardFormat::Nvfp4Planes),
+                (GgmlType::FP8_B128, CardFormat::Fp8B128Planes),
+            ]
+        );
+        for ty in ALL {
+            let routed = CardFormat::of(ty)
+                .filter(|_| !matches!(ty, GgmlType::Q5_K | GgmlType::MXFP8 | GgmlType::IQ4_XS));
+            assert_eq!(CardFormat::of_routed(ty), routed, "{ty:?}");
+        }
+    }
+
+    /// The types each layout holds: the types it is the load layout of, the
+    /// K-quants as decoded f32, bf16 as raw words, and in the file's blocks
+    /// every type a routed entry reads in them.
+    #[test]
+    fn each_layout_holds_exactly_the_pinned_types() {
+        let held = |f: CardFormat| -> Vec<GgmlType> {
+            ALL.into_iter().filter(|&ty| f.holds(ty)).collect()
+        };
+        assert_eq!(
+            held(CardFormat::KQuant),
+            [
+                GgmlType::Q5_1,
+                GgmlType::Q8_0,
+                GgmlType::Q3_K,
+                GgmlType::Q4_K,
+                GgmlType::Q5_K,
+                GgmlType::Q6_K,
+                GgmlType::MXFP4,
+                GgmlType::IQ2_XXS,
+                GgmlType::IQ2_XS,
+                GgmlType::IQ3_XXS,
+                GgmlType::IQ1_S,
+                GgmlType::IQ4_NL,
+                GgmlType::IQ3_S,
+                GgmlType::IQ2_S,
+                GgmlType::IQ4_XS,
+                GgmlType::IQ1_M,
+            ]
+        );
+        // PIN(2026-10-25): and the four i-quants whose layout is now the file's
+        // blocks.
+        assert_eq!(
+            held(CardFormat::Bf16AsF32),
+            [
+                GgmlType::F16,
+                GgmlType::Q3_K,
+                GgmlType::Q4_K,
+                GgmlType::Q5_K,
+                GgmlType::Q6_K,
+                GgmlType::BF16,
+                GgmlType::IQ2_XXS,
+                GgmlType::IQ2_XS,
+                GgmlType::IQ1_S,
+                GgmlType::IQ2_S,
+                GgmlType::IQ4_XS,
+                GgmlType::IQ1_M,
+            ]
+        );
+        // PIN(2026-10-22): independent BF16 heads also occupy MXFP8 planes.
+        assert_eq!(
+            held(CardFormat::Mxfp8Planes),
+            [GgmlType::BF16, GgmlType::MXFP8]
+        );
+        // PIN(2026-10-23): NVFP4_ROWS's routed stacks load as NVFP4's planes.
+        assert_eq!(
+            held(CardFormat::Nvfp4Planes),
+            [GgmlType::NVFP4, GgmlType::NVFP4_ROWS]
+        );
+        for (f, ty) in [
+            (CardFormat::Q5_0, GgmlType::Q5_0),
+            (CardFormat::Q5_1, GgmlType::Q5_1),
+            (CardFormat::Q8_0Planes, GgmlType::Q8_0),
+            (CardFormat::Fp8B128Planes, GgmlType::FP8_B128),
+            (CardFormat::F32, GgmlType::F32),
+            (CardFormat::Bf16Raw, GgmlType::BF16),
+        ] {
+            assert_eq!(held(f), [ty], "{f:?}");
+        }
+    }
+
     /// A card entry reads a layout the card loader can build: every type a
     /// row names has a [`CardFormat`] of its own, or is one of the file-block
     /// types a program's routed stack keeps as `KQuant`.
@@ -678,6 +866,9 @@ mod tests {
     /// The common card leg runs exactly the pinned types, each of which has
     /// both rows: the K-quants, MXFP4 and the i-quants whose raw-block gate·up
     /// and `Q8Act` down entries `iq_sel.rs` launches.
+    // PIN(2026-10-23): IQ2_XXS joins `card_runs` with its gate·up and down
+    // entries (the PIN above the gate·up pairs); every other type is unchanged.
+    // PIN(2026-10-25): and IQ1_S, IQ2_S and IQ1_M, with theirs.
     #[test]
     fn card_runs_admits_exactly_the_pinned_types() {
         let runs: Vec<GgmlType> = ALL.into_iter().filter(|&ty| card_runs(ty)).collect();
@@ -687,10 +878,14 @@ mod tests {
                 GgmlType::Q4_K,
                 GgmlType::Q5_K,
                 GgmlType::MXFP4,
+                GgmlType::IQ2_XXS,
                 GgmlType::IQ2_XS,
                 GgmlType::IQ3_XXS,
+                GgmlType::IQ1_S,
                 GgmlType::IQ3_S,
+                GgmlType::IQ2_S,
                 GgmlType::IQ4_XS,
+                GgmlType::IQ1_M,
             ]
         );
         for ty in runs {
@@ -699,9 +894,12 @@ mod tests {
     }
 
     /// The leg checks each role by its own rule: the gate·up and down sets
-    /// differ (Q5_1, Q8_0 and IQ4_NL run only as downs; Q8_0's gate·up row has
-    /// no arm), the Q5_0 down row has no arm, and a tensor-parallel rank's
-    /// downs are the planner's and Q6_K, which the planner's set leaves out.
+    /// differ (Q5_1, Q8_0, IQ4_NL and Q6_K run only as downs; Q8_0's gate·up
+    /// row has no arm) and the Q5_0 down row has no arm. A rank's downs are
+    /// that same down set.
+    // PIN(2026-10-22): Q6_K joined `card_down_runs` (the Q8Act down the leg
+    // already launches), so the rank-only extra is empty. It was `[Q6_K]`
+    // while the common down set left Q6_K out.
     #[test]
     fn the_leg_admits_each_role_by_its_own_rule() {
         let gate_up_runs: Vec<GgmlType> = ALL
@@ -715,10 +913,14 @@ mod tests {
                 GgmlType::Q4_K,
                 GgmlType::Q5_K,
                 GgmlType::MXFP4,
+                GgmlType::IQ2_XXS,
                 GgmlType::IQ2_XS,
                 GgmlType::IQ3_XXS,
+                GgmlType::IQ1_S,
                 GgmlType::IQ3_S,
-                GgmlType::IQ4_XS
+                GgmlType::IQ2_S,
+                GgmlType::IQ4_XS,
+                GgmlType::IQ1_M
             ]
         );
         assert_eq!(
@@ -728,24 +930,22 @@ mod tests {
                 GgmlType::Q8_0,
                 GgmlType::Q4_K,
                 GgmlType::Q5_K,
+                GgmlType::Q6_K,
                 GgmlType::MXFP4,
+                GgmlType::IQ2_XXS,
                 GgmlType::IQ2_XS,
                 GgmlType::IQ3_XXS,
+                GgmlType::IQ1_S,
                 GgmlType::IQ4_NL,
                 GgmlType::IQ3_S,
-                GgmlType::IQ4_XS
+                GgmlType::IQ2_S,
+                GgmlType::IQ4_XS,
+                GgmlType::IQ1_M
             ]
         );
         assert!(gate_up(GgmlType::Q8_0).is_some() && !card_gate_up_runs(GgmlType::Q8_0));
-        for ty in [GgmlType::Q6_K, GgmlType::Q5_0] {
-            assert!(down(ty).is_some() && !card_down_runs(ty), "{ty:?}");
-        }
-        let rank_extra: Vec<GgmlType> = ALL
-            .into_iter()
-            .filter(|&ty| rank_down_runs(ty) != card_down_runs(ty))
-            .collect();
-        assert_eq!(rank_extra, [GgmlType::Q6_K]);
-        assert!(rank_down_runs(GgmlType::Q6_K));
+        assert!(down(GgmlType::Q6_K).is_some() && card_down_runs(GgmlType::Q6_K));
+        assert!(down(GgmlType::Q5_0).is_some() && !card_down_runs(GgmlType::Q5_0));
     }
 
     /// A type id the enum does not name has no row in any operation.

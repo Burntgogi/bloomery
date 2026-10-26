@@ -127,7 +127,7 @@ use bloomery_gpu::weights::DevWeight;
 use super::ced::{Ced, Mode};
 use super::*;
 use crate::chain::attn::{AttnBatch, BatchIo, ChunkCaches, ChunkSource};
-use crate::chain::ffn::{BatchLayer, BlockIo, FfnBatch, JoinIo, STAGE_TIER};
+use crate::chain::ffn::{BatchLayer, BlockIo, FfnBatch, JoinIo, LEG_PIECE, STAGE_TIER};
 use crate::chain::glue::{GlueBatch, PromptRows};
 use crate::chain::nanos;
 use crate::hc::{HC_MAX_TOKENS, HC_MIX};
@@ -245,9 +245,18 @@ impl CallMedia<'_> {
 /// gives the held buffers the tap's rows, which a call that hands features
 /// over needs (refused by name without them). Once the buffers hold what the
 /// body's tap needs, a call does nothing.
+///
+/// A file whose attention tensors are in formats the batch's launches do not
+/// read (`AttnChain::batch_formats`) is fed as steps instead: the body's feed
+/// becomes [`PrefillMode::Steps`], no buffers are made, and the refusal that
+/// decided it is [`Body::batch_refusal`]. Under a residency the steps feed
+/// is refused, so the load is refused by name with both facts.
 pub fn prepare_prefill(m: &mut Deepseek41Model) -> Result<(), GpuError> {
-    let (gpu, _, body) = m.body_parts(WHAT)?;
-    body.make_batch_once(gpu)
+    let (gpu, w, body) = m.body_parts(WHAT)?;
+    match body.attn.batch_formats(w) {
+        Ok(()) => body.make_batch_once(gpu),
+        Err(why) => body.feed_steps_for(&why),
+    }
 }
 
 /// Make the prompt batch's media half ([`prepare_prefill`]'s buffers first,
@@ -1296,9 +1305,17 @@ fn reads_q8(w: &Weights, name: &str) -> bool {
 /// form when the down reads one, the down and past one token its copy
 /// token-major; then over the block the buckets, the tile table, the gather
 /// into run order, the gate·up, its q8_1 form and the down when there are
-/// card experts, and the card sum — or, on a `tiered` layer, whose card sum
-/// the post runs, the three copies of the block's routing it holds for it.
-fn shadow_entries(w: &Weights, l: usize, chunks: &[Range<usize>], card: bool, tiered: bool) -> u64 {
+/// fused card experts (`card`: `Some(true)`), or per piece of the block the
+/// common leg's quantize, gate·up, q8_1 form and down when they run on the
+/// leg (`Some(false)`), and the card sum — or, on a `tiered` layer, whose card
+/// sum the post runs, the three copies of the block's routing it holds for it.
+fn shadow_entries(
+    w: &Weights,
+    l: usize,
+    chunks: &[Range<usize>],
+    card: Option<bool>,
+    tiered: bool,
+) -> u64 {
     let q3k = |name: &str| {
         matches!(
             w.get(name),
@@ -1314,12 +1331,18 @@ fn shadow_entries(w: &Weights, l: usize, chunks: &[Range<usize>], card: bool, ti
         .iter()
         .map(|r| {
             let m = r.len() as u64;
-            let routed = 2 * u64::from(card);
+            let routed = 2 * u64::from(card.is_some());
             let gate_up = if gate_up_q3k { 1 } else { m };
             2 + routed + gate_up + u64::from(down_q8) + 1 + u64::from(m > 1)
         })
         .sum();
-    per_chunk + if card { 6 } else { 0 } + if tiered { 3 } else { 1 }
+    let tokens = chunks.iter().map(|r| r.len()).sum::<usize>();
+    let block = match card {
+        None => 0,
+        Some(true) => 6,
+        Some(false) => 4 * tokens.div_ceil(LEG_PIECE) as u64,
+    };
+    per_chunk + block + if tiered { 3 } else { 1 }
 }
 
 /// The positions `b .. b + u` cut into chunks: at every multiple of
@@ -1345,6 +1368,21 @@ impl Body {
             what: WHAT,
             missing: "the prompt batch's buffers, made at load (body::prepare_prefill)",
         })
+    }
+
+    /// Feed prompts as steps because the batch's launches do not read the
+    /// file's tensors, `why` the refusal; refused by name, with the reason,
+    /// where the levers do not take the steps feed.
+    fn feed_steps_for(&mut self, why: &GpuError) -> Result<(), GpuError> {
+        super::refuse_steps_under_residency(PrefillMode::Steps, self.levers.residency).map_err(
+            |e| GpuError::Shape {
+                what: "BLOOMERY_PREFILL",
+                detail: format!("the prompt batch cannot run this file ({why}); {e}"),
+            },
+        )?;
+        self.levers.prefill = PrefillMode::Steps;
+        self.batch_refusal = Some(why.to_string());
+        Ok(())
     }
 
     /// Make the batch's buffers when none are held: the attention piece over
@@ -1616,6 +1654,9 @@ impl Body {
         let mut ffn = FfnBatch::new(gpu, n, hp.experts.ff, [T_MAX, sets], self.tier.is_some())?;
         if self.levers.hoststream {
             ffn.enable_stream(stream)?;
+        }
+        if self.card_leg {
+            ffn.prepare_leg(gpu)?;
         }
         let set = |k: usize| -> Result<BatchSet, GpuError> {
             let z = |len: usize| DeviceBuffer::<f32>::zeroed(stream, len);
@@ -2716,7 +2757,7 @@ impl<'a> GroupCx<'a> {
         let batch = &mut *self.batch;
         let own = set_of(&mut batch.sets, m.set)?;
         let card = CardStacks::of(w, l)?;
-        let entries = shadow_entries(w, l, &m.cuts[r.full..], card.is_some(), tiered);
+        let entries = shadow_entries(w, l, &m.cuts[r.full..], card.map(|s| s.fused()), tiered);
         let block = BlockIo {
             set: m.set,
             chunks: &m.cuts[r.full..],
@@ -2775,7 +2816,7 @@ impl<'a> GroupCx<'a> {
         self.ffn
             .enqueue_batch_block_kept(gpu, bl, card, &mut batch.ffn, &block)?;
         // The shadow's entries and the places taken again.
-        let entries = shadow_entries(w, l, &m.cuts[r.full..], card.is_some(), tiered);
+        let entries = shadow_entries(w, l, &m.cuts[r.full..], card.map(|s| s.fused()), tiered);
         self.tally.shadow(i, m.set, entries + 1)
     }
 

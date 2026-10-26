@@ -103,6 +103,16 @@ pub(super) fn open(side: &Side, seat: &EncoderSeat) -> Result<Box<dyn Embed>, St
     load().map_err(|e| e.to_string())
 }
 
+impl Model {
+    /// One packed pass of `chunk`, whose tokens already fit [`Encoder::ctx`].
+    fn pack_inputs(&mut self, chunk: &[&[u32]]) -> Result<Vec<Vec<f32>>, EmbedError> {
+        self.encoder
+            .pass_packed(chunk, false)
+            .map(|packed| packed.pooled)
+            .map_err(|e| EmbedError(e.to_string()))
+    }
+}
+
 struct Model {
     encoder: Encoder,
     audio: Option<Box<dyn bloomery_gpu_vision::Tower>>,
@@ -212,6 +222,34 @@ impl Embed for Model {
             .pass(ids, false)
             .map(|pass| pass.pooled)
             .map_err(|e| EmbedError(e.to_string()))
+    }
+
+    /// Packs inputs into passes of at most [`Encoder::ctx`] tokens and splits
+    /// the rest, in order. [`Encoder::ctx`] is the pass's context.
+    fn embed_batch(&mut self, inputs: &[&[u32]]) -> Result<Vec<Vec<f32>>, EmbedError> {
+        let budget = self.encoder.ctx();
+        let mut out = Vec::with_capacity(inputs.len());
+        let mut chunk: Vec<&[u32]> = Vec::new();
+        let mut tokens = 0usize;
+        for ids in inputs {
+            if ids.is_empty() || ids.len() > budget {
+                return Err(EmbedError(format!(
+                    "{} positions; a pass takes 1 to {budget}",
+                    ids.len()
+                )));
+            }
+            if !chunk.is_empty() && tokens + ids.len() > budget {
+                out.extend(self.pack_inputs(&chunk)?);
+                chunk.clear();
+                tokens = 0;
+            }
+            chunk.push(*ids);
+            tokens += ids.len();
+        }
+        if !chunk.is_empty() {
+            out.extend(self.pack_inputs(&chunk)?);
+        }
+        Ok(out)
     }
 
     #[cfg(feature = "vision")]

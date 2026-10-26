@@ -289,7 +289,7 @@ mod gate {
     use bloomery_gpu_gates::slots_gate;
     use bloomery_gpu_gates::tier::{self, Tag, Tier};
     use bloomery_gpu_gates::{GateError, RefManifest, checks_failed, ref_model_path, verdict};
-    use bloomery_levers::{CARD_BUDGET, HostCfg, Levers};
+    use bloomery_levers::{CARD_BUDGET, CardBudget, HostCfg, Levers};
     use gguf::digest::hex;
     use gguf::quant::{GgmlType, half_to_f32};
     use gguf::{Gguf, Split};
@@ -323,8 +323,8 @@ mod gate {
         path: std::path::PathBuf,
         draft: std::path::PathBuf,
         host: HostCfg,
-        header_budget: Option<u64>,
-        lever_budget: Option<u64>,
+        header_budget: Option<tier::HeaderBudget>,
+        lever_budget: CardBudget,
         shape: Shape,
         n_expert: usize,
     }
@@ -390,12 +390,13 @@ mod gate {
 
     /// The plan's levers for a load that reserves `extra` card bytes for the
     /// draft out of the same budget (0: the target alone): the real tier's
-    /// lever, or the header's budget plus `extra` (`tier::budget_levers`).
+    /// lever, or the header's budget on the fixture tier's card plus `extra`
+    /// (`tier::budget_levers`).
     fn plan_levers(extra: u64) -> Result<PlanLevers, GateError> {
         tier::budget_levers(
             Tier::from_env()?,
             cfg().header_budget,
-            cfg().lever_budget,
+            cfg().lever_budget.clone(),
             extra,
         )
     }
@@ -415,15 +416,15 @@ mod gate {
         let draft = draft_path(&levers, &path)?;
         let file = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
         let inputs = PlanInputs::describe(&file)?;
-        let shape = crate::q38_arch::shape_of(&inputs.hp)?;
+        let shape = crate::q38_arch::shape_of(&inputs.spec)?;
         let header_budget = tier::header_budget(&file)?;
-        let n_expert = inputs.hp.n_expert;
+        let n_expert = inputs.spec.routed().map_or(0, |m| m.experts as usize);
         let cfg = Cfg {
             path,
             draft,
             host: levers.host(),
             header_budget,
-            lever_budget: levers.card_budget_bytes(),
+            lever_budget: levers.card_budget(),
             shape,
             n_expert,
         };
@@ -440,7 +441,7 @@ mod gate {
         ok &= tier::witness("draft layer", cfg.shape.n_layer, REAL_DRAFT_LAYER);
         ok &= tier::witness(
             "card budget",
-            cfg.lever_budget,
+            cfg.lever_budget.clone(),
             PlanLevers::default().card_budget_bytes,
         );
         ok &= tier::witness_card(&card()?);
@@ -1444,7 +1445,7 @@ mod gate {
             )?;
             let taps = m.mtp_taps()?;
             let mut flipped = vec![false; rows];
-            for t in 0..rows {
+            for (t, flipped_t) in flipped.iter_mut().enumerate().take(rows) {
                 let at = c0 + t;
                 let span = at * WIDE..(at + 1) * WIDE;
                 let e = if vs_ik {
@@ -1473,7 +1474,7 @@ mod gate {
                     })
                     .flatten()
                 {
-                    flipped[t] = true;
+                    *flipped_t = true;
                     r.flips += 1;
                     let cap = flip::flip_cap(router_b, ik_v);
                     let gap_cap = flip::margin_cap(router_b, ik_v);
@@ -1490,7 +1491,7 @@ mod gate {
                 }
                 let l_out = &w.l_out[t * WIDE..(t + 1) * WIDE];
                 pin_row(host, g, at, &taps, t, l_out, &mut r.pins);
-                if vs_ik && !flipped[t] {
+                if vs_ik && !*flipped_t {
                     r.l_out_held += 1;
                     let d = rel(l_out, &g.l_out[span]);
                     r.l_out_worst = r.l_out_worst.max(d);
@@ -3255,7 +3256,7 @@ mod gate {
     }
 
     /// The store comparison's shape: the e2e gate's `(v)` rule in one bool —
-    /// the committed delta lane, the conv ring's eight slots before the
+    /// the committed delta lane and its carry, the conv ring's eight slots before the
     /// count, the K/V planes' and raw keys' rows below it, the pools
     /// complete at the count (a pool a rejected row completed is read only
     /// at a count that completes it again), the PLE ring's fourteen slots
@@ -3297,15 +3298,19 @@ mod gate {
         let layers = a.0.len() == b.0.len()
             && a.0.iter().zip(&b.0).all(|(x, y)| match (x, y) {
                 (
-                    Store38Host::Rec { state: s, ring: r },
+                    Store38Host::Rec {
+                        state: s,
+                        ring: r,
+                        carry: c,
+                    },
                     Store38Host::Rec {
                         state: s2,
                         ring: r2,
+                        carry: c2,
                     },
                 ) => {
-                    s.len() == s2.len()
-                        && s.iter().zip(s2).all(|(u, v)| u.to_bits() == v.to_bits())
-                        && ring_same(r, r2, CONV_RING, conv_ch, 8)
+                    let bits = bloomery_gpu_gates::bits_equal;
+                    bits(s, s2) && ring_same(r, r2, CONV_RING, conv_ch, 8) && bits(c, c2)
                 }
                 (
                     Store38Host::Qsa { k, v, raw, pooled },
@@ -6044,7 +6049,7 @@ mod gate {
         let ok = !fixture || (a == d && d.iter().all(|&n| n == want));
         println!(
             "(d) the drafting load's budget: card experts a layer alone {:?} and drafted {:?} \
-             under {:?} + the draft's {extra} B{} {}",
+             under {} + the draft's {extra} B{} {}",
             held(a),
             held(d),
             plan_levers(extra)?.card_budget_bytes,
@@ -6098,28 +6103,35 @@ mod gate {
         let (file, draft_file) = (open_target()?, open_draft()?);
         let mut paged_inputs = PlanInputs::describe(&file)?;
         let mut room = paged_inputs.room.0;
-        let mut paged = None;
         let mut refused = None;
-        for _ in 0..24 {
-            paged_inputs.room = (room, HostRead::Given);
-            match paged_inputs.plan_mtp_with(
-                &machine,
-                CTX,
-                &plan_levers(extra)?,
-                mtp,
-                Experts::Card,
-            ) {
-                Ok(p) if p.plan.host.nvme_expert_bytes > 0 && p.plan.host.nvme_arena_bytes > 0 => {
-                    paged = Some(p);
-                    break;
-                }
-                Ok(_) => room /= 2,
-                Err(e) => {
-                    refused = Some(e);
-                    break;
+        // The plan leaves the search by the labelled break, not through a variable the next
+        // round's write to `room` could see borrowed (the borrow checker of the stable
+        // toolchain reads such a variable as live across the loop).
+        let paged = 'search: {
+            for _ in 0..24 {
+                paged_inputs.room = (room, HostRead::Given);
+                match paged_inputs.plan_mtp_with(
+                    &machine,
+                    CTX,
+                    &plan_levers(extra)?,
+                    mtp,
+                    Experts::Card,
+                ) {
+                    Ok(p)
+                        if p.plan.host.nvme_expert_bytes > 0
+                            && p.plan.host.nvme_arena_bytes > 0 =>
+                    {
+                        break 'search Some(p);
+                    }
+                    Ok(_) => room /= 2,
+                    Err(e) => {
+                        refused = Some(e);
+                        break 'search None;
+                    }
                 }
             }
-        }
+            None
+        };
         let Some(plan) = paged else {
             // The split dial gives an arena only where half the host leg lies above the floor
             // and the arena's least (`ArenaDial::peak`); the fixture's four layers, half of
@@ -6160,7 +6172,7 @@ mod gate {
         // `extra` (the stage card's own headroom does not see R);
         // its partner is the plain plan's stage-card headroom at the same lever. The
         // expected relation, term by term: both stage cards hold the same fixed terms; the
-        // planner's identity `MtpPlan::headroom = T.headroom + T.reserves - R` holds; the expert
+        // planner's identity `MtpPlan::headroom = T.headroom - R` holds; the expert
         // rule took `moved` bytes (experts and their rounding) off the card to make room for R,
         // and the remainder R - moved is the slack of a rule that moves whole experts: under one
         // expert's card bytes plus a granule for each of a layer's three routed stacks. The
@@ -6179,8 +6191,7 @@ mod gate {
             )
         };
         let same_terms = fixed(p) == fixed(t);
-        let identity =
-            plan.headroom_bytes == t.headroom_bytes + i128::from(t.reserve_bytes) - i128::from(r);
+        let identity = plan.headroom_bytes == t.headroom_bytes - i128::from(r);
         let moved = i128::from(p.expert_bytes + p.rounding_bytes)
             - i128::from(t.expert_bytes + t.rounding_bytes);
         let remainder = i128::from(r) - moved;
@@ -6317,7 +6328,7 @@ mod gate {
         let d = &plan.draft.cards[0];
         let draft_kv = d.kv_bytes;
         println!(
-            "plan card={} ctx_max={CTX} card_budget={:?} (the draft's card bytes {extra} in it) \
+            "plan card={} ctx_max={CTX} card_budget={} (the draft's card bytes {extra} in it) \
              draft dense={} experts={} rounding={} kv={} map={} arena={} headroom={}",
             card()?.name,
             plan_levers(extra)?.card_budget_bytes,
@@ -6350,7 +6361,7 @@ mod gate {
         );
 
         let head_file = open_target()?;
-        let host = Host::open(&head_file, &draft, inputs.hp.rms_eps)?;
+        let host = Host::open(&head_file, &draft, inputs.spec.rms_eps)?;
         m.set_mtp_taps(true)?;
         let mut r = Replay::new();
         let mut last = None;

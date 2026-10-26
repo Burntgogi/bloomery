@@ -14,6 +14,8 @@ workspace = true
 
 [dependencies]
 bloomery-gguf = { path = "../gguf" }
+# A normalized tensor's new memory is advised onto huge pages.
+bloomery-os.workspace = true
 # `dspark` returns the draft's geometry as the runtime's `DsparkShape`; the runtime depends on the model
 # description only, so hf does not close a cycle.
 bloomery-runtime = { path = "../runtime" }
@@ -28,3 +30,5 @@ thiserror = { workspace = true }
 # The checkpoint headers in tests/fixtures are kept gzipped.
 flate2 = "1.1.10"
 sha2 = { workspace = true }
+# The vocabulary the folder reader derives runs through the tokenizer in tests/.
+bloomery-tokenizer = { path = "../tokenizer" }

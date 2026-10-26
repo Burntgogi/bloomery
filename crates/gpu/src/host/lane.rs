@@ -34,7 +34,7 @@ use std::time::{Duration, Instant};
 
 use cuda_core::{CudaContext, CudaStream, sys};
 
-use super::swap::{SwapSource, Transform};
+use super::swap::{Piece, SwapSource};
 use super::xstream::FILL_THREADS;
 use crate::GpuError;
 use crate::graph::{MappedHost, cu};
@@ -327,23 +327,25 @@ impl Ring {
         Ok(k * self.slot_bytes + at)
     }
 
-    /// `bytes` into ring slot `k` at byte `at`. The caller is slot `k`'s one
-    /// host writer, the lane thread that holds the slot's job, and writes it
-    /// only once the copy stream has read its previous use (`drained`).
-    fn write(&self, k: usize, at: usize, bytes: &[u8]) -> Result<(), GpuError> {
-        let off = self.span(k, at, bytes.len(), "SwapMachine ring write")?;
+    /// `piece`'s bytes into ring slot `k` at byte `at`, turned into the
+    /// slot's by its transform ([`super::swap::Transform::apply`]). The caller is slot
+    /// `k`'s one host writer, the lane thread that holds the slot's job, and
+    /// writes it only once the copy stream has read its previous use
+    /// (`drained`).
+    fn write(&self, k: usize, at: usize, piece: &Piece<'_>) -> Result<(), GpuError> {
+        let len = piece.bytes.len();
+        let off = self.span(k, at, len, "SwapMachine ring write")?;
         // SAFETY: [off, off + len) lies inside the page (checked above); no
         // copy reads ring slot k until the staging word publishes this use,
         // and the thread holding the slot's job is its only host writer (job
         // n + RING_SLOTS writes the slot only once job n's copy has drained
-        // it). The word's Release store follows these stores in program
-        // order, which x86 (TSO) keeps in the coherent write-back pinned
-        // page, and the copy engine reads the page over PCIe with no SM cache
-        // between: the copy the word lets through reads these bytes.
-        unsafe {
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.page.host_at(off), bytes.len());
-        }
-        Ok(())
+        // it), so this is the span's one reference while it lives. The word's
+        // Release store follows these stores in program order, which x86
+        // (TSO) keeps in the coherent write-back pinned page, and the copy
+        // engine reads the page over PCIe with no SM cache between: the copy
+        // the word lets through reads these bytes.
+        let dst = unsafe { std::slice::from_raw_parts_mut(self.page.host_at(off), len) };
+        piece.transform.apply(piece.bytes, dst)
     }
 
     /// Enqueue on `stream` the copy of `len` bytes at byte `at` of ring slot
@@ -577,9 +579,7 @@ impl Shared {
                         ),
                     ));
                 }
-                match piece.transform {
-                    Transform::Identity => self.ring.write(job.ring, at, piece.bytes)?,
-                }
+                self.ring.write(job.ring, at, &piece)?;
                 at += want;
             }
             Ok(())

@@ -5,8 +5,9 @@
 //! qwen38` are each one call of [`run`], which takes the process's arguments
 //! (`--model` already taken out by the one-binary server).
 //!
-//!     bloomery-serve-qwen38 [--host 127.0.0.1] [--port 8080] [--place a|gate|bp]
-//!                           [--ctx-size C] [--alias NAME] [--cache-ram MIB]
+//!     bloomery-serve-qwen38 [--host 127.0.0.1] [--port 8080]
+//!                           [--place a|gate|bp|<stage>[+<tier>…]] [--ctx-size C]
+//!                           [--alias NAME] [--cache-ram MIB]
 //!                           [--chat-template-file PATH] [--parallel N]
 //!                           [--queue-depth Q] [--park-ram MIB] [--slot-save-path DIR]
 //!                           [--mmproj FILE | --no-mmproj] [--image-min-tokens N]
@@ -38,7 +39,11 @@
 //! leaves a position's bits a function of its own inputs, so a longer
 //! prompt's greedy ids are the walk's, not a step-fed run's).
 //!
-//! `--place` set runs its word as given; unset, the common rule every
+//! `--place` is `a`, `gate`, `bp` or a card list `<stage>[+<tier>…]`
+//! (`generate::Place`, read by `bind::place_word` as every seat reads it); a
+//! list of more tier cards than the Qwen3.8 body serves (`q38place::Q38_RULE`)
+//! and `tp` are refused by name before any plan. The word runs as given (a
+//! single named card plans on its own bytes); unset, the common rule every
 //! serving seat takes decides (`generate::Place::choose`, by this family's
 //! `q38place::Q38_RULE`: two cards keep the offer `bp` while its plan holds the
 //! rule's break-even experts on the tier card or more and more than none —
@@ -379,7 +384,7 @@ use bloomery_gpu_gates::beside::{self, Beside};
 use bloomery_gpu_gates::bind::{
     CacheRam, Cached, ChatSurface, Landing, Listen, Pass, PutBack, Seat, SeatEngine, SlotPassRow,
     SlotStep, SlotsFrom, TemplateFile, Vocab, arm_screen, begin, bind_server, eprint_noted,
-    model_props, note_line, parallel_line, placement_of, put_back, slots_of,
+    model_props, note_line, parallel_line, place_word, placement_of, put_back, slots_of,
 };
 use bloomery_gpu_gates::generate::{BreakEven, Lane, Place, lane_of};
 use bloomery_gpu_gates::need;
@@ -396,8 +401,8 @@ use bloomery_levers::{
 };
 use cuda_core::sys;
 use gguf::Split;
-use model::arch::models::Mixer;
 use model::arch::models::headpick::HeadSet;
+use model::arch::models::{Mixer, ModelSpec};
 use model::arch::qwen35moe::head_list::{HeadPick, head_rows_of};
 use model::arch::qwen35moe::place::{
     Experts, MtpInputs, PlaceError, PlanInputs, machine_for_experts, serve_ctx, tensor_places,
@@ -430,14 +435,13 @@ mod qwen38_levers;
 pub(crate) use qwen38_levers::ACTS_ON;
 #[path = "../route_trace38.rs"]
 mod route_trace38;
+use super::xstream_rule::{Stage, xstream_rule};
 use route_trace38::{TraceRun, experts_name};
-#[path = "../xstream_rule.rs"]
-mod xstream_rule;
-use xstream_rule::{Stage, xstream_rule};
 
-const USAGE: &str = "usage: bloomery-serve-qwen38 [--host H] [--port P] [--place a|gate|bp] \
-                     [--ctx-size C] [--alias NAME] [--cache-ram MIB] [--chat-template-file PATH] \
-                     [--parallel N] [--queue-depth Q] [--park-ram MIB] [--slot-save-path DIR] \
+const USAGE: &str = "usage: bloomery-serve-qwen38 [--host H] [--port P] \
+                     [--place a|gate|bp|<stage>[+<tier>…]] [--ctx-size C] [--alias NAME] \
+                     [--cache-ram MIB] [--chat-template-file PATH] [--parallel N] \
+                     [--queue-depth Q] [--park-ram MIB] [--slot-save-path DIR] \
                      [--mmproj FILE | --no-mmproj] [--image-min-tokens N] \
                      [--image-max-tokens N] [--plan] [--api-key KEY] [--api-key-file FNAME]";
 
@@ -499,25 +503,26 @@ struct Branch38 {
 }
 
 /// Which placement `--place` names, as `generate_qwen3moe` takes it.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Kind38 {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Kind38 {
     /// The stage on the largest visible card (the A6000 here, the timing
-    /// card; the default).
+    /// card; the default), and any single card a list names: the plan is
+    /// made on that card's own bytes.
     A,
-    /// The 3090, the gate card.
+    /// The word `gate`: the 3090, the gate card.
     Gate,
     /// Plan (b′): the stage as under `a`, the next-largest card its expert
-    /// tier (`q38place::machine_bp38`).
+    /// tier (`q38place::machine_bp38`), and any card list with a tier card.
     Bp,
 }
 
 /// Where `--place` puts the plan's stage card, and its expert tier card
 /// when it has one: the kind, and its cards (`generate::Place`), resolved
 /// against this process's devices once the arguments are read.
-#[derive(Clone, Copy)]
-struct Place38 {
-    kind: Kind38,
-    cards: Place,
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Place38 {
+    pub(crate) kind: Kind38,
+    pub(crate) cards: Place,
     /// The side model's reserve on the stage card, which every machine of the placement
     /// carries ([`Place38::machine`]).
     embedding: Option<u64>,
@@ -539,29 +544,44 @@ impl Place38 {
         media: false,
     };
 
-    fn parse(v: &str) -> Result<Place38, GateError> {
-        let (kind, cards) = match v {
-            "a" => (Kind38::A, Place::A),
-            "gate" => (Kind38::Gate, Place::Gate),
-            "bp" => (Kind38::Bp, Place::Bp),
-            other => {
-                return Err(format!(
-                    "--place is a, gate or bp (plan (b′): the next-largest card as the \
-                     largest's expert tier), not {other}"
-                )
-                .into());
-            }
+    /// The seat's reading of a `--place` word: the shared grammar
+    /// ([`place_word`]) with the one expert tier card the body serves
+    /// ([`q38place::Q38_RULE`]), and the kind it names ([`Place38::of`]). `tp`
+    /// is refused by name: the body has no tensor-parallel path.
+    pub(crate) fn parse(v: &str) -> Result<Place38, GateError> {
+        let cards = place_word(v, Some(("qwen4exp", q38place::Q38_RULE.tiers)))?;
+        if cards.tp() {
+            return Err(
+                "--place tp: a tensor-parallel run is planned by its family's own \
+                        path, and the Qwen3.8 seat has none"
+                    .into(),
+            );
+        }
+        Ok(Place38::of(cards))
+    }
+
+    /// `cards` as a placement of the seat, its kind read by structure: a tier
+    /// card is plan (b′), the word `gate` the gate card, any other stage —
+    /// `a`, or a single card a list names — plan (a) on that card's own
+    /// bytes.
+    fn of(cards: Place) -> Place38 {
+        let kind = if !cards.tier_cards().is_empty() {
+            Kind38::Bp
+        } else if cards == Place::Gate {
+            Kind38::Gate
+        } else {
+            Kind38::A
         };
-        Ok(Place38 {
+        Place38 {
             kind,
             cards,
             embedding: None,
             image: None,
             media: false,
-        })
+        }
     }
 
-    fn name(self) -> &'static str {
+    pub(crate) fn name(self) -> &'static str {
         self.cards.name()
     }
 
@@ -572,7 +592,7 @@ impl Place38 {
 
     /// The stage card is plan (a)'s: the placement the Qwen3.8 defaults
     /// treat as plan (a).
-    fn stage_a(self) -> bool {
+    pub(crate) fn stage_a(self) -> bool {
         matches!(self.kind, Kind38::A | Kind38::Bp)
     }
 
@@ -588,7 +608,7 @@ impl Place38 {
     /// The placement holds an expert tier card (plan (b′)): the body runs
     /// no pass of several slots on such a load (`Body38::plan_slots`
     /// refuses a load with an expert tier card by name).
-    fn tiered(self) -> bool {
+    pub(crate) fn tiered(self) -> bool {
         matches!(self.kind, Kind38::Bp)
     }
 
@@ -621,7 +641,7 @@ impl Place38 {
             Kind38::A | Kind38::Gate => machine_for_experts(self.spec()?, layers, ub, experts),
             Kind38::Bp => {
                 let draft = mtp.map(|m| m.card_bytes_of(ctx, slots)).transpose()?;
-                q38place::machine_bp38(self.cards, layers, ub, draft, tier_batch(&inputs.hp, ub))?
+                q38place::machine_bp38(self.cards, layers, ub, draft, tier_batch(&inputs.spec, ub))?
             }
         };
         beside::reserve_on(
@@ -633,9 +653,13 @@ impl Place38 {
         );
         if self.media {
             let rows = u64::try_from(slots)?.saturating_mul(ctx);
+            let head = inputs.spec.gqa().ok_or(
+                "the description holds no attention layer to rotate an image's positions by",
+            )?;
+            let width = head.rope.dims as usize;
             machine.cards[0].reserves.push((
                 vision_seat::TABLES_RESERVE.to_owned(),
-                rows.saturating_mul(vision_seat::table_bytes_per_position(inputs.hp.rope_dims)),
+                rows.saturating_mul(vision_seat::table_bytes_per_position(width)),
             ));
         }
         reserve_checkpoints(&mut machine, seqs38(inputs, slots), ctx)?;
@@ -1256,7 +1280,7 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
 }
 
 /// What `--mmproj` opened for the plans: the encoder file held against the text model's embedding
-/// width, its vocabulary's image ids, the file's IMROPE sections and its PLE image token
+/// width, its vocabulary's image ids, the description's IMROPE sections and its PLE image token
 /// (`token` the vocabulary's id to text), and seated for
 /// a plan on `place` ([`vision_seat::open_seat`]); the file is `--mmproj`'s, else, where the seat
 /// `takes` the `--hf` repo's projector, that one ([`vision_seat::Flags::encoder`]), and `None`
@@ -1265,7 +1289,7 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
 fn vision_of(
     flags: &vision_seat::Flags,
     (place, takes): (Place, bool),
-    hp: &model::arch::qwen35moe::hparams::Hparams,
+    spec: &ModelSpec,
     token: &dyn Fn(u32) -> Option<String>,
 ) -> Result<Option<vision_seat::Opened>, GateError> {
     #[cfg(not(feature = "vision"))]
@@ -1279,11 +1303,8 @@ fn vision_of(
         place,
         &[vision::arch::qwen3vl::PROJECTOR_TYPE],
         &vision_seat::TextFacts {
-            n_embd: hp.n_embd,
-            imrope: Some(hp.rope_sections),
-            ple: vision_seat::PleImage::of(
-                hp.exp.as_ref().and_then(|exp| exp.ple).map(|ple| ple.image),
-            ),
+            ple: vision_seat::PleImage::of_spec(spec),
+            ..vision_seat::TextFacts::of_imrope(spec)?
         },
         token,
     )
@@ -1444,7 +1465,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     let vision = vision_of(
         &a.vision,
         (draft_at.cards, !mtp && !feed.stepped()),
-        &inputs.hp,
+        &inputs.spec,
         &token,
     )?;
     let (mtp, draft_off) = if vision.is_some() {
@@ -1825,9 +1846,10 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         None => line,
     };
     let line = record::with_room(line, plan.host.room);
-    line.csv("devices", record::plan_devices(&machine))
-        .w("cuda_order", record::cuda_order())
-        .eprint();
+    let line = line
+        .csv("devices", record::plan_devices(&machine))
+        .w("cuda_order", record::cuda_order());
+    record::with_requantized(line, plan.model).eprint();
     for line in record::host_only(
         plan.model,
         matches!(experts, Experts::Card).then(|| {
@@ -2121,6 +2143,11 @@ struct Q38 {
     /// fallback loop: its contexts follow each step at the selected slot's
     /// position.
     step_pass: bool,
+    /// Whether a plain step reads the PLE rows of the id it answers ahead
+    /// ([`Q38::read_ahead`]): the body's next call is then that slot's, on
+    /// a load of one slot or one whose rounds run as one pass
+    /// ([`Pass::One`]); a round of turns steps another slot next.
+    reads_ahead: bool,
     /// [`Seat::step_stats`]: the `BLOOMERY_STEP_STATS` the binary parsed.
     stats: bool,
     /// The load's tier census as the last call left it, on a load whose plan
@@ -2173,7 +2200,7 @@ impl Q38 {
         // difference.
         let mut inputs = PlanInputs::describe(model.header())?;
         inputs.room = a.room.clone();
-        let cap = serve_ctx(u64::try_from(a.ctx)?, &inputs.hp)?;
+        let cap = serve_ctx(u64::try_from(a.ctx)?, &inputs.spec)?;
         let ub = ubatch_for(a.ctx)?;
         let ctx_ub = (u64::try_from(a.ctx)?, u64::try_from(ub)?);
         // The sequences the load makes pin the body's budget at this context;
@@ -2265,7 +2292,7 @@ impl Q38 {
             a.ctx,
             a.slots,
             a.ctx,
-            inputs.hp.n_ctx_train,
+            inputs.spec.ctx_train,
             m.layers().len(),
             m.body(WHAT)?.store_bytes(),
             a.feed.name(),
@@ -2411,6 +2438,7 @@ impl Q38 {
             break_even: a.mtp.then(|| break_even_of(a.place)),
             one_pass: pass_of_slots && a.mtp,
             step_pass: pass_of_slots && !a.lookup,
+            reads_ahead: a.pass == Pass::One,
             stats: a.stats,
             census,
             branch: std::cell::RefCell::new(vec![None; a.slots]),
@@ -2534,6 +2562,25 @@ impl Q38 {
                 .u("reply", b.reply)
                 .eprint();
         }
+    }
+
+    /// The PLE rows of `out`'s one id read ahead ([`Body38::prefetch_input`])
+    /// while the server takes the answer, where that id is the input of the
+    /// body's next call ([`Q38::reads_ahead`]), one plain step of the slot
+    /// ([`Seat::pass_rows`] 1: no draft, or the slot's draft off).
+    fn read_ahead(&mut self, out: &[u32]) -> Result<(), GateError> {
+        if let &[next] = out
+            && self.reads_ahead
+            && self.pass_rows() == 1
+        {
+            let pos = self.s.pos();
+            self.s
+                .model_mut()
+                .body_parts("bloomery-serve-qwen38")?
+                .2
+                .prefetch_input(next, pos)?;
+        }
+        Ok(())
     }
 
     /// The call's `tier census` record ([`Q38::print_census`]); then the
@@ -2711,6 +2758,18 @@ impl Seat for Q38 {
         Ok(next)
     }
 
+    fn prefill_only(&mut self, ids: &[u32]) -> Result<(), GateError> {
+        self.before_call();
+        let sel = self.s.selected();
+        if self.feed == Prompt38::Step {
+            self.prefill_steps(ids)?;
+        } else {
+            self.drafts.prefill_only(&mut self.s, sel, ids, self.feed)?;
+        }
+        self.print_passes()?;
+        Ok(())
+    }
+
     /// The resident encoder's media description ([`vision_seat::Resident::media`]); `None`
     /// without `--mmproj`, a seat that takes no image.
     #[cfg(feature = "vision")]
@@ -2749,6 +2808,7 @@ impl Seat for Q38 {
         self.before_call();
         let sel = self.s.selected();
         let next = self.drafts.step(&mut self.s, sel, last)?;
+        self.read_ahead(&[next])?;
         self.print_passes()?;
         Ok(next)
     }
@@ -2802,6 +2862,7 @@ impl Seat for Q38 {
         self.before_call();
         let sel = self.s.selected();
         let d = self.drafts.pass(&mut self.s, sel, last, out)?;
+        self.read_ahead(out)?;
         self.print_passes()?;
         Ok(d)
     }
@@ -2826,6 +2887,7 @@ impl Seat for Q38 {
         let d = self
             .drafts
             .pass_sampled(&mut self.s, sel, last, history, sampler, out)?;
+        self.read_ahead(out)?;
         self.print_passes()?;
         Ok(d)
     }

@@ -39,6 +39,7 @@ pub mod router;
 pub mod shared_routed;
 pub mod span;
 pub mod swap;
+pub mod tier_join;
 pub mod transpose;
 
 pub use body::NODE_FAMILY;

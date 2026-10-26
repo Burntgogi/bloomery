@@ -982,6 +982,7 @@ mod site_tests {
         let (q32, q128, q256) = (Some(32), Some(Q8_1_BLOCK), Some(QK_K));
         for arm in [Arm::Gemv, Arm::Gemm, Arm::Expert] {
             assert_eq!(site_rel(GgmlType::Q3_K, arm), q(q256, q128), "Q3_K {arm:?}");
+            assert_eq!(site_rel(GgmlType::IQ4_XS, arm), q(q256, q128), "IQ4_XS {arm:?}");
             for ty in [GgmlType::Q4_K, GgmlType::Q5_K, GgmlType::Q6_K] {
                 assert_eq!(site_rel(ty, arm), q(q32, q128), "{ty} {arm:?}");
             }
@@ -1039,6 +1040,35 @@ mod site_tests {
             for arm in [Arm::Gemv, Arm::Gemm] {
                 assert_eq!(site_rel(ty, arm), None, "{ty} {arm:?}");
             }
+        }
+    }
+
+    /// The rounding relation follows the common site's activation forms and
+    /// the grouped GEMM's existing decoders.
+    #[test]
+    fn site_rel_reads_the_forms_the_launches_name() {
+        use gguf::card::{SiteAct, SiteEntry};
+        for entry in [
+            SiteEntry::Q3k,
+            SiteEntry::Q4k,
+            SiteEntry::Q5k,
+            SiteEntry::Q6k,
+            SiteEntry::Iq4xs,
+        ] {
+            assert_eq!(entry.reads(), SiteAct::Q8x128);
+        }
+        assert_eq!(SiteEntry::Q8_0.reads(), SiteAct::Q8x32);
+        assert_eq!(SiteEntry::F32.reads(), SiteAct::F32);
+        assert_eq!(SiteEntry::Q5_0.reads(), SiteAct::Q8Blocks32);
+        let gpu = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../gpu/src");
+        let read = |file: &str| {
+            std::fs::read_to_string(gpu.join(file))
+                .unwrap_or_else(|e| panic!("crates/gpu/src/{file}: {e}"))
+        };
+        assert!(read("gemm/mod.rs").contains("(Q8_0, IQ4_NL, Q5_1), over [`GemmAct32`]"));
+        let grouped = read("gemm/grouped.rs");
+        for variant in ["Iq3Xxs", "Iq4Xs"] {
+            assert!(grouped.contains(variant), "the grouped GEMM no longer decodes {variant}");
         }
     }
 

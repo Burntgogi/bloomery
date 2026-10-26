@@ -9,6 +9,7 @@ node_link	tier	crates/gpu/src/host/node.rs crates/gpu/src/host/link.rs crates/gp
 placement_sizing	placement	crates/placement/src/placement.rs crates/placement/src/placement/workstation.rs crates/placement/src/placement/card_budget.rs crates/placement/src/placement/ctx.rs crates/placement/src/placement/ctx_ask.rs crates/placement/src/placement/devices.rs crates/placement/src/placement/paged_drop.rs crates/placement/src/placement/churn.rs crates/placement/src/slots.rs crates/placement/src/accepts.rs crates/placement/src/r8.rs
 placement_nodes	placement	crates/placement/src/placement/nodes.rs crates/placement/src/placement/nodes_scale.rs crates/placement/src/placement/tp.rs crates/placement/src/placement/need_hook.rs crates/placement/src/placement/qwen38_cards.rs
 weights_load	load	crates/gpu/src/weights.rs crates/gpu/src/upload.rs crates/gpu/src/tensor.rs crates/gpu/src/view.rs
+checkpoint_folder	load	crates/model-hf/src/folder.rs crates/model-hf/src/arch/mod.rs
 prompt_walks	prompt	crates/gpu/src/host/prompt_stream.rs crates/gpu/src/host/batch.rs crates/gpu/src/host/run.rs crates/gpu/src/host/step.rs crates/runtime/src/prompt.rs crates/runtime/src/splitwalk.rs crates/runtime/src/xsplit.rs crates/gpu/src/prompt_timing.rs
 seats_app	seat	crates/app/src/lib.rs crates/app/src/dspark.rs crates/app/src/mtp.rs
 seats_serve_engine	seat	crates/serve/src/engine.rs crates/serve/src/worker.rs crates/serve/src/sched.rs crates/serve/src/models.rs crates/serve/src/genloop.rs crates/serve/src/slotfile.rs
@@ -16,7 +17,7 @@ drafts_mtp	draft	crates/model/src/arch/draft.rs crates/gpu/src/mtp.rs crates/run
 drafts_dspark	draft	crates/model/src/arch/dspark.rs crates/gpu/src/dspark/*.rs crates/runtime/src/dspark.rs crates/runtime/src/selector.rs
 residency	residency	crates/gpu/src/host/residency.rs crates/gpu/src/host/census.rs crates/runtime/src/warmprof.rs crates/gpu/src/host/swap_source.rs crates/runtime/src/swaprule.rs
 serve_http_api	serve	crates/serve/src/api.rs crates/serve/src/http.rs crates/serve/src/oaicompl.rs crates/serve/src/anthropic.rs crates/serve/src/responses.rs crates/serve/src/sampling.rs crates/serve/src/stop.rs crates/serve/src/logprobs.rs crates/serve/src/promptcache.rs crates/serve/src/preflight.rs crates/serve/src/reasoning.rs crates/serve/src/flag.rs
-serve_toolcall	serve	crates/serve/src/callstream.rs crates/serve/src/dsml.rs crates/serve/src/glmxml.rs crates/serve/src/hermes.rs crates/serve/src/qwenxml.rs
+serve_toolcall	serve	crates/serve/src/callstream.rs crates/serve/src/dsml.rs crates/serve/src/glmxml.rs crates/serve/src/hermes.rs crates/serve/src/museatem.rs crates/serve/src/qwenxml.rs
 serve_media	media	crates/serve/src/media.rs crates/serve/src/video.rs crates/vision/src/image.rs crates/vision/src/video.rs crates/vision/src/media.rs crates/gpu/src/media.rs
 serve_embed	serve	crates/serve/src/embed.rs crates/serve/src/embeddings.rs crates/serve/src/embed_cache.rs
 constrain	constrain	crates/serve/src/constrain/mod.rs crates/serve/src/constrain/program.rs crates/serve/src/constrain/schema.rs crates/serve/src/constrain/vocab.rs crates/serve/src/decide.rs crates/serve/src/systemone.rs
@@ -30,14 +31,14 @@ quant_mxfp4	quant	crates/gpu/src/mxfp4.rs crates/gpu/src/mxfp4_sel.rs
 quant_gated	quant	crates/gpu/src/gated_quant.rs crates/gpu/src/quant_sel.rs crates/gpu/src/fused.rs
 quant_gemm	quant	crates/gpu/src/gemm/mod.rs crates/gpu/src/gemm/act.rs crates/gpu/src/gemm/act32.rs crates/gpu/src/gemm/gemm32.rs crates/gpu/src/gemm/grouped.rs crates/gpu/src/gemm/kernels.rs crates/gpu/src/gemm/kernels32.rs crates/gpu/src/gemm/f32tile.rs crates/gpu/src/gemm/remap.rs crates/gpu/src/gemm/swiglu.rs
 quant_host_qdot	quant	crates/qdot/src/lib.rs crates/gguf/src/quant.rs
-attn_gqa	attn	crates/gpu/src/flash_gqa.rs crates/gpu/src/flash_gqa_prefill.rs crates/gpu/src/flash_gqa_prefill_512.rs crates/gpu/src/flash.rs crates/gpu/src/rope_neox.rs crates/gpu/src/rope_table.rs
+attn_gqa	attn	crates/gpu/src/flash_gqa.rs crates/gpu/src/flash_gqa_prefill.rs crates/gpu/src/flash_gqa_prefill_512.rs crates/gpu/src/flash.rs crates/gpu/src/rope_neox.rs crates/gpu/src/rope_norm.rs crates/gpu/src/rope_table.rs
 attn_latent_mla	attn	crates/gpu/src/latent.rs crates/gpu-glm5next/src/mla.rs
 attn_linear_gdn_kda	recur	crates/gpu/src/linear/conv.rs crates/gpu/src/linear/delta.rs crates/gpu/src/linear/mixer_kda.rs crates/gpu/src/linear/norm_gate.rs crates/gpu/src/linear/out_gate.rs crates/gpu-glm5next/src/kda.rs crates/model/src/arch/kda.rs
 recur_mamba2	recur	crates/gpu/src/mamba2.rs crates/gpu/src/mamba2_ssd.rs crates/model/src/mamba2.rs crates/gpu/src/recur.rs
 recur_state	recur	crates/runtime/src/seqstate.rs crates/runtime/src/state.rs
 attn_ds41_csa_hca	attn	crates/gpu-deepseek41/src/attn.rs crates/gpu-deepseek41/src/compress.rs crates/gpu-deepseek41/src/indexer.rs crates/gpu-deepseek41/src/index_key.rs crates/gpu-deepseek41/src/hc.rs crates/gpu/src/hc_gated.rs
 moe_route	moe	crates/gpu/src/moe_fused.rs crates/gpu/src/router.rs crates/gpu/src/route_core.rs crates/gpu/src/route_body.rs crates/gpu/src/cand.rs crates/gpu/src/gemm/route.rs
-kv_pool_checkpoint	kv	crates/gpu/src/kpool.rs crates/gpu/src/checkpoint.rs crates/gpu/src/checkpoint/saved.rs crates/gpu/src/checkpoint/staging.rs crates/runtime/src/stores.rs crates/runtime/src/savemap.rs crates/model/src/kv.rs
+kv_pool_checkpoint	kv	crates/gpu/src/kpool.rs crates/gpu/src/checkpoint.rs crates/gpu/src/checkpoint/planes.rs crates/gpu/src/checkpoint/saved.rs crates/gpu/src/checkpoint/staging.rs crates/runtime/src/stores.rs crates/runtime/src/savemap.rs crates/model/src/kv.rs
 graph_fault	graph	crates/gpu/src/graph.rs crates/gpu/src/lane.rs crates/gpu/src/fault.rs crates/gpu/src/watchdog.rs crates/gpu/src/capsync.rs
 ple_embed	load	crates/gpu/src/ple.rs crates/embed/src/lib.rs
 head_sample	host	crates/gpu/src/head.rs crates/sampler/src/lib.rs crates/runtime/src/stop.rs

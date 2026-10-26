@@ -1,0 +1,18 @@
+# The Muse Spark Open gate fixture's CPU node dumps (four layers from source layers 0-3, hidden 1024, 16 experts x 256 IQ2_XXS,
+# 323 MB in three shards, /models/fixtures/musespark), `BLOOMERY_TIER=fixture just dump-ref-musespark`: the five prompts of the real
+# file's dump (41, 53, 116, 1,536 and 2,560 ids) from ONE load, into fx_ref_musespark_{a,b,c,d,e}. The phases run one after the other.
+# Predicted wall [derived], seconds:
+#   load      323 MB from the page cache (written minutes before), nothing repacked on this AVX2 CPU (IQ2_XXS, Q6_K, Q8_0): 1 s
+#   prefill   4,306 ids x 2 x ~0.5 G MACs (four layers: q/gate 1024x1024 Q6_K/Q8_0, k/v 1024x128, out 1024x1024, latent 1024x512 twice,
+#             top-8 of 16 experts at 512x256 x3, router 1024x16; ~25 M MACs a layer; the head 1024 x 202,048 = 0.21 G MACs on every
+#             row) = ~1.9 TFLOP of mostly the head at an effective 0.5-1.0 TFLOP/s: 2-4 s
+#   greedy    192 tokens reading ~0.35 GB a token (the head's Q6_K rows dominate) over ~120 GB/s: 1 s
+#   writes    the five sets' node files (a's 26 taps x 4 layers x 41 rows; e's l_out x 2,560 rows): 1 s
+#   total     5-10 s, bound 1800 s.
+# What the run guarantees: CUDA hidden, the CPU lease held, the staging set installed only when each prompt's manifest carries its
+# `# complete` trailer.
+kind: exclusive
+reason: musespark_dump runs mainline llama.cpp on 32 CPU threads; beside a timed run or a gate batch it would take their cores, so
+  it holds the lease; why now: the fixture tier's oracle sets gate_musespark_e2e reads, without which the gate ends by name before
+  the card loads (round musebody)
+minutes: 1..2

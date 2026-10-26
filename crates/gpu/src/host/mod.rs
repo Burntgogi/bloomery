@@ -192,7 +192,7 @@ const _: () = assert!(MAX_TIERS <= u32::BITS as usize);
 /// since the tier's experts would otherwise be served by nobody or by the
 /// host unasked.
 pub fn refuse_expert_tiers(what: &'static str, machine: &Machine) -> Result<(), GpuError> {
-    match machine.tiers.as_slice() {
+    match machine.expert_tiers().collect::<Vec<_>>().as_slice() {
         [] => Ok(()),
         tiers => Err(GpuError::shape(
             what,
@@ -1633,7 +1633,7 @@ impl<H: HostExperts> HostTier<H> {
             }
         }
         let (l, host) = first.ok_or(GpuError::state(
-            WHAT,
+            xstream::XSTREAM_NO_HOST,
             "a layer with stage stacks and host experts",
         ))?;
         cfg.max_half = max_half;
@@ -2009,6 +2009,22 @@ impl<H: HostExperts> HostTier<H> {
     /// refused without a tier.
     pub fn tier_rows(&self, row: usize) -> Result<&DeviceBuffer<f32>, GpuError> {
         self.page_ref("HostTier::tier_rows")?.rows_of(row)
+    }
+
+    /// Row `row`'s host sum and the tiers' routed rows, together, for a join
+    /// that adds both in one launch. Refused without a tier, and for a row
+    /// the page or the boundary does not carry. The two buffers are fields
+    /// of the tier, so one method can hand both out.
+    pub fn tier_join_rows(
+        &self,
+        row: usize,
+    ) -> Result<(&DeviceBuffer<f32>, &DeviceBuffer<f32>), GpuError> {
+        let hsum = self.step.boundary.hsum_of(row)?;
+        let page = self.tier_page.as_ref().ok_or(GpuError::state(
+            "HostTier::tier_rows",
+            "an expert tier (HostTier::attach_tiers)",
+        ))?;
+        Ok((hsum, page.rows_of(row)?))
     }
 
     /// Enqueue a tier layer's go of layer `layer`, row `row`, on the stage
@@ -2752,9 +2768,9 @@ impl<H: HostExperts> HostTier<H> {
                 listed |= mask;
                 i += 1;
             }
-            for t in 0..k {
+            for (t, slot) in pass.iter_mut().enumerate().take(k) {
                 match self.tiers[t].replay(chain, &self.tier_lists[t]) {
-                    Ok(p) => pass[t] = p,
+                    Ok(p) => *slot = p,
                     Err(e) => {
                         let at = self.tier_lists[t].first().map_or(0, |p| p.0);
                         return Err(self.fail_tier(SERVE, at, t, e));
@@ -3494,6 +3510,33 @@ mod tests {
                 .contains("the host tier serves one tier card; N >= 2 lands"),
             "{err}"
         );
+    }
+
+    /// A reserve-only member after the tiers (the card a draft sits on) is no
+    /// expert tier: a load that hangs no tier passes with it, and the tier
+    /// opens list the expert tier cards alone; a plan's expert tier is refused
+    /// and opened as before.
+    #[test]
+    fn a_reserve_only_member_is_no_expert_tier() {
+        use model::placement::Device;
+        use model::placement::workstation::{
+            A6000, NO_TIER_BATCH, RTX_3090, draft_reserve, plan_bp, plan_holding,
+        };
+
+        let draft = Some(draft_reserve(Device::Card(1), 7));
+        let held = plan_holding(43, A6000, &[], &[RTX_3090], draft, NO_TIER_BATCH)
+            .expect("a holder after the stage card");
+        assert!(super::refuse_expert_tiers("t", &held).is_ok());
+        assert!(
+            super::tier::TierOpen::of_machine(&held)
+                .expect("no tier node lever")
+                .is_empty()
+        );
+        let bp = plan_bp(43, Some(7), NO_TIER_BATCH);
+        assert!(super::refuse_expert_tiers("t", &bp).is_err());
+        let opens = super::tier::TierOpen::of_machine(&bp).expect("no tier node lever");
+        assert_eq!(opens.len(), 1);
+        assert_eq!((opens[0].card, opens[0].name.as_str()), (1, RTX_3090.name));
     }
 
     /// A routed count is the ids' tally times the scale: scale 1 is the one

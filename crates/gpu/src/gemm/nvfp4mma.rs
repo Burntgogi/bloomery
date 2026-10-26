@@ -4,11 +4,13 @@
 
 use super::act32::ColsForm;
 use super::f32tile::{
-    Bf16Cols, Bf16Rows, ByteRows, MMA_THREADS, MmaCols, MmaRows, STAGE_FLOATS, STAGES, TileLaunch,
-    TileRows, bf16_mma_body, form_col, mma_fits, store_refused,
+    Bf16Cols, Bf16Rows, ByteRows, HcUpMixArgs, MMA_THREADS, MmaCols, MmaRows, OutForm,
+    STAGE_FLOATS, STAGES as MMA_STAGES, TileLaunch, TileRows, bf16_mma_body,
+    bf16_mma_norm_gate_body, form_col, mma_fits, refuse_or, store_refused,
 };
 use super::{GemmAct32, GemmRoute};
 use crate::GpuError;
+use crate::linear::norm_gate::NormGateTail;
 use crate::q8f32::{E4m3Weight, Mxfp8Bytes};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::vector::F32x4;
@@ -318,92 +320,279 @@ fn mma(c: [f32; 4], a: [u32; 4], b: [u32; 2], sa: u32, sb: u32) -> [f32; 4] {
     [d0, d1, d2, d3]
 }
 
-/// The K walk both native kernels share, over two shared stages of
-/// [`TILE_ROWS`] weight rows and 64 activation rows: each thread stages half
-/// `$half` of shared row `$sr` from weight row `$wrow` (`$wq` codes, `$we`
-/// scales) and, for `$sr < 64`, from activation column `$col` (`$aq`, `$ae`),
-/// the next step's words held in registers across the barrier; then `$body`
-/// reads the step's stage through `$wp`, `$bp` and `$sp`. Every thread of
-/// the block runs it, `$steps` steps of 64 values.
-macro_rules! nvfp4_walk {
+/// 64-value halves of one K-walk step: each takes one MMA per fragment, so a
+/// step's barrier and copies serve two.
+const HALVES: usize = 2;
+/// u32 words of one K-walk stage row: each half's eight code words.
+const ROW_W: usize = HALVES * 8;
+/// u32 words of one stage's [`TILE_ROWS`] weight rows.
+const W_STAGE: usize = TILE_ROWS * ROW_W;
+/// u32 words of one stage's 64 activation rows, the weight rows' pitch.
+const B_STAGE: usize = 64 * ROW_W;
+/// u32 words of one half's scale words: the weight rows', then the
+/// activation rows'.
+const S_HALF: usize = TILE_ROWS + 64;
+const S_STAGE: usize = HALVES * S_HALF;
+/// The K walk's shared stages: a step's planes land two steps ahead.
+const STAGES: usize = 3;
+/// u32 words of a route tile's [`TileColumns`]: each of its 64 columns' slot,
+/// then its input scale's bits.
+const COLUMN_WORDS: usize = 2 * 64;
+const _: () = assert!(
+    (STAGES * (W_STAGE + B_STAGE + S_STAGE) + COLUMN_WORDS) * 4 <= 48 * 1024
+        && 64 * PAIR_PITCH <= STAGES * W_STAGE
+);
+
+/// A route tile's column slots and input scales in the block's
+/// [`COLUMN_WORDS`] shared words. The thread that copies column `sr < 64`
+/// (half 0 of shared row `sr`) writes its two before the K walk, whose
+/// first barrier publishes them, so the epilogue reads them without waiting
+/// on a global load; a dead column holds its tile's last live column's.
+#[derive(Clone, Copy)]
+struct TileColumns(*mut u32);
+
+impl TileColumns {
+    /// Column `sr`'s slot `slot` and input scale `ag[col]`, by half 0 of
+    /// shared row `sr < 64`.
+    ///
+    /// # Safety
+    /// `self` is the block's [`COLUMN_WORDS`] shared words, which no thread
+    /// reads before the walk's first barrier.
+    #[inline(always)]
+    unsafe fn put(self, (sr, half): (usize, usize), slot: usize, ag: &[f32], col: usize) {
+        if sr < 64 && half == 0 {
+            let scale = ag[col].to_bits();
+            // SAFETY: sr < 64, this thread's own slot word.
+            unsafe { *self.0.add(sr) = slot as u32 };
+            // SAFETY: 64 + sr < COLUMN_WORDS, this thread's own scale word.
+            unsafe { *self.0.add(64 + sr) = scale };
+        }
+    }
+
+    /// Column `c`'s slot and input scale.
+    ///
+    /// # Safety
+    /// `c < 64`, after the walk's first barrier.
+    #[inline(always)]
+    unsafe fn get(self, c: usize) -> (usize, f32) {
+        // SAFETY: c < 64, a slot word the barrier published.
+        let slot = unsafe { *self.0.add(c) } as usize;
+        // SAFETY: 64 + c < COLUMN_WORDS, its scale word.
+        let scale = f32::from_bits(unsafe { *self.0.add(64 + c) });
+        (slot, scale)
+    }
+}
+
+/// The u32 word where 16-byte chunk `q` of a stage row starts, half `q / 2`'s
+/// chunk `q % 2`. The chunk number is XORed with bit 1 of the row index (onto
+/// its bit 1) and bit 2 (onto its bit 0), so neither the eight rows one
+/// `ldmatrix` phase reads at one chunk nor the four rows' two chunks of one
+/// half that eight threads copy and pack at a time meet a bank twice.
+#[inline(always)]
+const fn chunk(row: usize, q: usize) -> usize {
+    row * ROW_W + 4 * (q ^ ((row & 2) | ((row >> 2) & 1)))
+}
+// Every row's chunks are aligned, inside the row and distinct; the eight rows
+// one `ldmatrix` phase reads at one chunk, and the four rows' two chunks of
+// one half that eight threads (`sr = tid / 2`, `half = tid & 1`) copy and pack
+// at a time, cover the 32 banks once.
+const _: () = {
+    use cuda_device::swizzle::{WARP_LANES, conflict_degree};
+    let mut row = 0;
+    while row < TILE_ROWS {
+        let mut seen = 0usize;
+        let mut q = 0;
+        while q < 2 * HALVES {
+            let at = chunk(row, q);
+            assert!(at.is_multiple_of(4) && row * ROW_W <= at && at + 4 <= (row + 1) * ROW_W);
+            seen |= 1 << ((at - row * ROW_W) / 4);
+            let mut ldmatrix = [0; WARP_LANES];
+            let mut copy = [0; WARP_LANES];
+            let mut i = 0;
+            while i < WARP_LANES {
+                ldmatrix[i] = chunk(row / 8 * 8 + i / 4, q) + i % 4;
+                copy[i] = chunk(row / 4 * 4 + i / 8, q / 2 * 2 + i / 4 % 2) + i % 4;
+                i += 1;
+            }
+            assert!(conflict_degree(&ldmatrix, 4) == 1 && conflict_degree(&copy, 4) == 1);
+            q += 1;
+        }
+        assert!(seen == (1 << (2 * HALVES)) - 1);
+        row += 1;
+    }
+};
+
+/// One thread's `cp.async` copies of step `$s` (64-value steps `HALVES * $s`
+/// on, below `$steps`) into stage `$st` (`$s % STAGES`) of `nvfp4_walk!`'s
+/// shared arrays `$wp`, `$bp`, `$sp` (its arguments): of each half, half
+/// `$half` of weight row `$wrow`'s codes and, for `$sr < 64`, of activation
+/// column `$col`'s, into shared row `$sr`; and half `$half`'s scale words. One
+/// group, empty for a step past the last. `$full` (a literal) says every step
+/// below `$steps` has both halves, so only the step itself is checked.
+macro_rules! nvfp4_copy {
     (
+        $full:literal,
+        ($s:expr, $st:expr),
         ($wq:ident, $we:ident, $wrow:ident),
         ($aq:ident, $ae:ident, $col:ident),
         ($steps:ident, $sr:ident, $half:ident),
-        ($wp:ident, $bp:ident, $sp:ident),
+        ($wp:ident, $bp:ident, $sp:ident)
+    ) => {{
+        let s: usize = $s;
+        let st: usize = $st;
+        if HALVES * s < $steps {
+            for h in 0..HALVES {
+                ::cuda_device::thread::__unroll_config::<0>();
+                let k = HALVES * s + h;
+                if $full || k < $steps {
+                    let at = chunk($sr, 2 * h + $half);
+                    // SAFETY: the weight row's aligned half of 64-value step k is in the checked plane
+                    // (K divides 64); sr < TILE_ROWS, h < HALVES and half < 2 put at, this thread's
+                    // own aligned four-word chunk, inside row sr of stage st of W, read by no other
+                    // thread before the barrier after the wait that completes it.
+                    unsafe {
+                        cuda_device::async_copy::cp_async_cg_16(
+                            $wp.add(st * W_STAGE + at),
+                            $wq.as_ptr().add(($wrow * $steps + k) * 8 + 4 * $half),
+                        )
+                    };
+                    if $sr < 64 {
+                        // SAFETY: col is a live column whose aligned half of step k is in the plane;
+                        // sr < 64, h < HALVES and half < 2 put at, this thread's own aligned four-word
+                        // chunk, inside row sr of stage st of B, read by no other thread before the
+                        // barrier after the wait that completes it.
+                        unsafe {
+                            cuda_device::async_copy::cp_async_cg_16(
+                                $bp.add(st * B_STAGE + at),
+                                $aq.as_ptr().add(($col * $steps + k) * 8 + 4 * $half),
+                            )
+                        };
+                    }
+                }
+            }
+            let k = HALVES * s + $half;
+            if $full || k < $steps {
+                // SAFETY: the weight row's scale word of step k is in the plane; this thread owns
+                // that half's word of the row in stage st.
+                unsafe {
+                    cuda_device::async_copy::cp_async_ca_4(
+                        $sp.add(st * S_STAGE + $half * S_HALF + $sr),
+                        $we.as_ptr().add($wrow * $steps + k),
+                    )
+                };
+                if $sr < 64 {
+                    // SAFETY: the live column's scale word of step k is in the plane; this thread
+                    // owns that half's word of the column in stage st.
+                    unsafe {
+                        cuda_device::async_copy::cp_async_ca_4(
+                            $sp.add(st * S_STAGE + $half * S_HALF + TILE_ROWS + $sr),
+                            $ae.as_ptr().add($col * $steps + k),
+                        )
+                    };
+                }
+            }
+        }
+        // SAFETY: commits only this thread's copies of the step as one group.
+        unsafe { cuda_device::async_copy::cp_async_commit_group() };
+    }};
+}
+
+/// The K walk both native kernels share, over [`STAGES`] shared stages of
+/// [`TILE_ROWS`] weight rows and 64 activation rows, [`HALVES`] 64-value
+/// halves a step: each thread copies half `$half` of shared row `$sr` from
+/// weight row `$wrow` (`$wq` codes, `$we` scales) and, for `$sr < 64`, from
+/// activation column `$col` (`$aq`, `$ae`) two steps ahead
+/// ([`nvfp4_copy`]), and before a step's barrier turns its own weight halves
+/// of the step's stage into the MMA's nibble order ([`packed_pair`]); then
+/// `$body` reads each live half `$h` of the stage, in K order: its codes
+/// through `$wp` and `$bp` at [`chunk`] `2 * $h` and `2 * $h + 1`, its scale
+/// words through `$sp`. Every thread of the block runs it, `$steps` 64-value
+/// steps in all. `$full` (a literal) says `$steps` is even, so every step has
+/// both halves and none of the walk's half checks remain.
+macro_rules! nvfp4_walk {
+    (
+        $full:literal,
+        ($wq:ident, $we:ident, $wrow:ident),
+        ($aq:ident, $ae:ident, $col:ident),
+        ($steps:ident, $sr:ident, $half:ident),
+        ($wp:ident, $bp:ident, $sp:ident, $h:ident),
         $body:block
     ) => {{
-        let wi = $wrow * $steps * 8 + 4 * $half;
-        // SAFETY: K is positive and divides 64; the weight row and both aligned halves are in the checked plane.
-        let mut w = unsafe { (*$wq.as_ptr().add(wi).cast::<cuda_device::vector::U32x4>()).0 };
-        let mut av = cuda_device::vector::U32x4::new([0; 4]);
-        if $sr < 64 {
-            // SAFETY: col is a live column and each half is an aligned four-word vector.
-            av = unsafe {
-                *$aq.as_ptr()
-                    .add($col * $steps * 8 + 4 * $half)
-                    .cast::<cuda_device::vector::U32x4>()
-            };
-        }
-        let mut sw = if $half == 0 { $we[$wrow * $steps] } else { 0 };
-        let mut sb = if $half == 0 && $sr < 64 {
-            $ae[$col * $steps]
-        } else {
-            0
-        };
+        nvfp4_copy!(
+            $full,
+            (0, 0),
+            ($wq, $we, $wrow),
+            ($aq, $ae, $col),
+            ($steps, $sr, $half),
+            ($wp, $bp, $sp)
+        );
+        nvfp4_copy!(
+            $full,
+            (1, 1),
+            ($wq, $we, $wrow),
+            ($aq, $ae, $col),
+            ($steps, $sr, $half),
+            ($wp, $bp, $sp)
+        );
+        // The stage this step reads, and the one its copies of step + 2 fill.
+        let (mut st, mut fill) = (0, 2);
         let mut step = 0;
-        while step < $steps {
-            // SAFETY: this selects one of W's two disjoint stages.
-            let $wp = unsafe { $wp.add((step & 1) * 1536) };
-            // SAFETY: this selects one of B's two disjoint stages.
-            let $bp = unsafe { $bp.add((step & 1) * 768) };
-            // SAFETY: this selects one of S's two disjoint stages.
-            let $sp = unsafe { $sp.add((step & 1) * 192) };
-            let p0 = packed_pair(w[0], w[1]);
-            let p1 = packed_pair(w[2], w[3]);
-            let packed = cuda_device::vector::U32x4::new([p0[0], p0[1], p1[0], p1[1]]);
-            // SAFETY: each thread owns one aligned four-word half of its shared row.
-            unsafe {
-                *$wp.add($sr * 12 + 4 * $half)
-                    .cast::<cuda_device::vector::U32x4>() = packed;
-            }
-            if $sr < 64 {
-                // SAFETY: each thread owns one aligned four-word half of its shared activation row.
-                unsafe {
-                    *$bp.add($sr * 12 + 4 * $half)
-                        .cast::<cuda_device::vector::U32x4>() = av;
-                }
-            }
-            if $half == 0 {
-                // SAFETY: the first thread of each row owns its weight scale word.
-                unsafe {
-                    *$sp.add($sr) = sw;
-                }
-                if $sr < 64 {
-                    // SAFETY: the first thread of each live activation row owns its scale word.
+        while HALVES * step < $steps {
+            let halves = if $full {
+                HALVES
+            } else {
+                ($steps - HALVES * step).min(HALVES)
+            };
+            // SAFETY: each step commits one group, so the newest is step + 1's and waiting for all
+            // but one completes this thread's copies of this step.
+            unsafe { cuda_device::async_copy::cp_async_wait_group(1) };
+            // SAFETY: st < STAGES, so stage st starts inside the STAGES·W_STAGE words of W.
+            let ws = unsafe { $wp.add(st * W_STAGE) };
+            // SAFETY: st < STAGES, so stage st starts inside the STAGES·B_STAGE words of B.
+            let bs = unsafe { $bp.add(st * B_STAGE) };
+            // SAFETY: st < STAGES, so stage st starts inside the STAGES·S_STAGE words of S.
+            let ss = unsafe { $sp.add(st * S_STAGE) };
+            for h in 0..HALVES {
+                ::cuda_device::thread::__unroll_config::<0>();
+                if h < halves {
+                    let own = chunk($sr, 2 * h + $half);
+                    // SAFETY: sr < TILE_ROWS and 2 * h + half < 2 * HALVES, so own is an aligned
+                    // four-word chunk inside row sr of stage st of W; the wait above completed
+                    // this thread's copy of it.
+                    let w = unsafe { (*ws.add(own).cast::<cuda_device::vector::U32x4>()).0 };
+                    let p0 = packed_pair(w[0], w[1]);
+                    let p1 = packed_pair(w[2], w[3]);
+                    // SAFETY: the same chunk; chunk maps each (row, q) to its own words, so this
+                    // thread is its one writer, and no thread reads it before the barrier below.
                     unsafe {
-                        *$sp.add(TILE_ROWS + $sr) = sb;
+                        *ws.add(own).cast::<cuda_device::vector::U32x4>() =
+                            cuda_device::vector::U32x4::new([p0[0], p0[1], p1[0], p1[1]]);
                     }
                 }
             }
+            // Publishes the stage and tells that every thread is done with step - 1's, which the
+            // copies of step + 2 refill.
             thread::sync_threads();
-            if step + 1 < $steps {
-                let wi = $wrow * $steps * 8 + (step + 1) * 8 + 4 * $half;
-                // SAFETY: the next step is in the same aligned live weight row.
-                w = unsafe { (*$wq.as_ptr().add(wi).cast::<cuda_device::vector::U32x4>()).0 };
-                if $sr < 64 {
-                    let ai = $col * $steps * 8 + (step + 1) * 8 + 4 * $half;
-                    // SAFETY: the next step is in this aligned live activation column.
-                    av = unsafe { *$aq.as_ptr().add(ai).cast::<cuda_device::vector::U32x4>() };
-                }
-                if $half == 0 {
-                    sw = $we[$wrow * $steps + step + 1];
-                    if $sr < 64 {
-                        sb = $ae[$col * $steps + step + 1];
-                    }
+            nvfp4_copy!(
+                $full,
+                (step + 2, fill),
+                ($wq, $we, $wrow),
+                ($aq, $ae, $col),
+                ($steps, $sr, $half),
+                ($wp, $bp, $sp)
+            );
+            let ($wp, $bp) = (ws, bs);
+            for $h in 0..HALVES {
+                ::cuda_device::thread::__unroll_config::<0>();
+                if $h < halves {
+                    // SAFETY: h < halves <= HALVES, so half h's S_HALF scale words lie inside the
+                    // S_STAGE words of stage st of S.
+                    let $sp = unsafe { ss.add($h * S_HALF) };
+                    $body
                 }
             }
-            $body
+            st = if st + 1 == STAGES { 0 } else { st + 1 };
+            fill = if fill + 1 == STAGES { 0 } else { fill + 1 };
             step += 1;
         }
     }};
@@ -559,6 +748,97 @@ impl MmaCols for Mxfp8Cols<'_> {
     }
 }
 
+/// A 32-value block's UE8M0 scale byte for its largest magnitude `amax`,
+/// `ceil(log2(amax / 448))` biased and clamped to 1..=254, and the inverse
+/// scale its values are multiplied by before E4M3 rounding.
+#[inline(always)]
+fn ue8m0_block(amax: f32) -> (u32, f32) {
+    let bits = (amax * (1.0 / 448.0)).to_bits();
+    let exp = ((bits >> 23) + u32::from(bits & 0x7f_ffff != 0)).clamp(1, 254);
+    (exp, f32::from_bits((254 - exp) << 23))
+}
+
+/// [`Mxfp8Cols`]' planes of an epilogue's output columns ([`OutForm`]), with
+/// `mxfp8_cols_body`'s bits: each 32-value block's E4M3 words and its scale
+/// byte, and each column's refusal word, zero before the launch and ORed by
+/// its pieces.
+#[derive(Clone, Copy)]
+struct Mxfp8Out {
+    qs: *mut u32,
+    e: *mut u32,
+    refused: *mut u32,
+}
+
+impl Mxfp8Out {
+    /// Writes the E4M3 words of the 32-value block from value `at` (a
+    /// multiple of 32) that lane `l`'s `v` is value `at + l` of, lane 4q's
+    /// word values 4q .. 4q + 3 as `mxfp8_cols_body`'s lane q writes them;
+    /// the block's UE8M0 exponent, the same in every lane.
+    ///
+    /// # Safety
+    ///
+    /// The whole warp calls converged, and the block's 8 words lie inside the
+    /// form.
+    #[inline(always)]
+    unsafe fn block(self, v: f32, at: usize) -> u32 {
+        use cuda_device::convert::cvt_rn_satfinite_e4m3x2_f32;
+        let lane = warp::lane_id() as usize;
+        let mut amax = v.abs();
+        amax = amax.max(warp::shuffle_xor_f32(amax, 1));
+        amax = amax.max(warp::shuffle_xor_f32(amax, 2));
+        amax = amax.max(warp::shuffle_xor_f32(amax, 4));
+        amax = amax.max(warp::shuffle_xor_f32(amax, 8));
+        amax = amax.max(warp::shuffle_xor_f32(amax, 16));
+        let (exp, inv) = ue8m0_block(amax);
+        let scaled = v * inv;
+        let pair = u32::from(cvt_rn_satfinite_e4m3x2_f32(
+            scaled,
+            warp::shuffle_xor_f32(scaled, 1),
+        ));
+        let word = pair | (warp::shuffle_xor(pair, 2) << 16);
+        if lane.is_multiple_of(4) {
+            // SAFETY: word (at + lane) / 4 is this lane's own (this fn's
+            // contract).
+            unsafe { *self.qs.add((at + lane) / 4) = word };
+        }
+        exp
+    }
+}
+
+impl OutForm for Mxfp8Out {
+    const WRITES: bool = true;
+
+    #[inline(always)]
+    #[allow(clippy::needless_range_loop, reason = "indexed CUDA-unrolled arrays")]
+    unsafe fn store<const N: usize>(self, v: [f32; N], c: usize, row0: usize, k: usize) {
+        const { assert!(N == 1 || N == 4) };
+        let at = c * k + row0;
+        let mut fits = true;
+        let mut scales = 0u32;
+        for b in 0..N {
+            thread::__unroll_config::<0>();
+            fits &= mma_fits(v[b]);
+            // SAFETY: block b lies inside column c's values (this fn's
+            // contract).
+            scales |= unsafe { self.block(v[b], at + 32 * b) } << (8 * b);
+        }
+        if warp::lane_id() == 0 {
+            if N == 1 {
+                // SAFETY: byte at / 32 is the block's byte of its scale word,
+                // inside the form's scale words; lane 0 of this warp is its
+                // only writer.
+                unsafe { *self.e.cast::<u8>().add(at / 32) = scales as u8 };
+            } else {
+                // SAFETY: word at / 128 is the head's scale word inside the
+                // form's scale words; lane 0 of this warp is its only writer.
+                unsafe { *self.e.add(at / 128) = scales };
+            }
+        }
+        // SAFETY: c is a live column the form holds (this fn's contract).
+        unsafe { refuse_or(self.refused, c, fits) };
+    }
+}
+
 /// The first `n` columns of `k` f32 values (`k` a multiple of 128) as
 /// [`Mxfp8Cols`]' planes: each 32-value block's scale exponent
 /// `ceil(log2(amax / 448))` as a UE8M0 byte, the block's values over that
@@ -596,9 +876,7 @@ unsafe fn mxfp8_cols_body(
             amax = amax.max(warp::shuffle_xor_f32(amax, 1));
             amax = amax.max(warp::shuffle_xor_f32(amax, 2));
             amax = amax.max(warp::shuffle_xor_f32(amax, 4));
-            let bits = (amax * (1.0 / 448.0)).to_bits();
-            let exp = ((bits >> 23) + u32::from(bits & 0x7f_ffff != 0)).clamp(1, 254);
-            let inv = f32::from_bits((254 - exp) << 23);
+            let (exp, inv) = ue8m0_block(amax);
             let lo = u32::from(cvt_rn_satfinite_e4m3x2_f32(v[0] * inv, v[1] * inv));
             let hi = u32::from(cvt_rn_satfinite_e4m3x2_f32(v[2] * inv, v[3] * inv));
             // SAFETY: word at / 4 is this lane's own.
@@ -774,7 +1052,7 @@ mod native {
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]
     #[kernel]
-    #[launch_bounds(256)]
+    #[launch_bounds(256, 2)]
     #[launch_contract(domain = 1, block = (256, 1, 1))]
     pub fn gemm_nvfp4_mma(
         wq: &[u32],
@@ -822,15 +1100,22 @@ mod native {
         let expert = tiles[2 * tile] as usize;
         let (start, len) = super::super::route::tile_parts(tiles[2 * tile + 1]);
         let (start, len) = (start as usize, len as usize);
-        static mut W: cuda_device::SharedArray<u32, 3072, 16> = cuda_device::SharedArray::UNINIT;
-        static mut B: cuda_device::SharedArray<u32, 1536, 16> = cuda_device::SharedArray::UNINIT;
-        static mut S: cuda_device::SharedArray<u32, 384, 16> = cuda_device::SharedArray::UNINIT;
+        static mut W: cuda_device::SharedArray<u32, { STAGES * W_STAGE }, 16> =
+            cuda_device::SharedArray::UNINIT;
+        static mut B: cuda_device::SharedArray<u32, { STAGES * B_STAGE }, 16> =
+            cuda_device::SharedArray::UNINIT;
+        static mut S: cuda_device::SharedArray<u32, { STAGES * S_STAGE }, 16> =
+            cuda_device::SharedArray::UNINIT;
+        static mut C: cuda_device::SharedArray<u32, COLUMN_WORDS, 16> =
+            cuda_device::SharedArray::UNINIT;
         // SAFETY: W is this block's shared weight allocation.
         let wp = unsafe { cuda_device::SharedArray::as_raw_mut_ptr(&raw mut W) };
         // SAFETY: B is this block's shared activation allocation.
         let bp = unsafe { cuda_device::SharedArray::as_raw_mut_ptr(&raw mut B) };
         // SAFETY: S is this block's shared scale allocation.
         let sp = unsafe { cuda_device::SharedArray::as_raw_mut_ptr(&raw mut S) };
+        // SAFETY: C is this block's shared column allocation.
+        let columns = TileColumns(unsafe { cuda_device::SharedArray::as_raw_mut_ptr(&raw mut C) });
         let row = rt * TILE_ROWS + 16 * (tid / 32);
         let g = lane / 4;
         let t = lane & 3;
@@ -844,91 +1129,111 @@ mod native {
         } else {
             source / slot_div as usize
         };
+        // SAFETY: the block's column words, before the walk.
+        unsafe { columns.put((sr, half), source, ag, col) };
         let mut acc = [0.0f32; 32];
-        nvfp4_walk!(
-            (wq, we, wr),
-            (aq, ae, col),
-            (steps, sr, half),
-            (wp, bp, sp),
-            {
-                if row < rows {
-                    let r = 16 * (tid / 32) + g;
-                    let a_off = (16 * (tid / 32) + (lane & 15)) * 12 + 4 * (lane >> 4);
-                    // SAFETY: all lanes issue the load; its four sets of eight aligned rows lie in the live shared stage.
-                    let a = unsafe {
-                        ldmatrix_x4_shared_u32(cvta_generic_to_shared_u32(
-                            wp.add(a_off).cast_const().cast::<u8>(),
-                        ))
-                    };
-                    // SAFETY: each pair of lanes reads the scale row selected by the MMA layout.
-                    let sa = unsafe { *sp.add(r + 8 * (t & 1)) };
-                    for n in 0..8 {
-                        ::cuda_device::thread::__unroll_config::<0>();
-                        if n >= nt {
-                            continue;
+        // An even K walk over whole row tiles runs without the walk's and the
+        // fragments' checks: a tile of fewer than 64 columns also runs its
+        // dead fragments, over copies of its last live column (`source`),
+        // which no store reads.
+        macro_rules! walk {
+            ($full:literal) => {
+                nvfp4_walk!(
+                    $full,
+                    (wq, we, wr),
+                    (aq, ae, col),
+                    (steps, sr, half),
+                    (wp, bp, sp, h),
+                    {
+                        if $full || row < rows {
+                            let r = 16 * (tid / 32) + g;
+                            let a_off = chunk(16 * (tid / 32) + (lane & 15), 2 * h + (lane >> 4));
+                            // SAFETY: all lanes issue the load; its four sets of eight aligned rows
+                            // lie in the live shared stage.
+                            let a = unsafe {
+                                ldmatrix_x4_shared_u32(cvta_generic_to_shared_u32(
+                                    wp.add(a_off).cast_const().cast::<u8>(),
+                                ))
+                            };
+                            // SAFETY: each pair of lanes reads the scale row selected by the MMA layout.
+                            let sa = unsafe { *sp.add(r + 8 * (t & 1)) };
+                            for n in 0..8 {
+                                ::cuda_device::thread::__unroll_config::<0>();
+                                if !$full && n >= nt {
+                                    continue;
+                                }
+                                let br = n * 8 + g;
+                                let b_off = chunk(n * 8 + (lane & 7), 2 * h + ((lane >> 3) & 1));
+                                // SAFETY: the whole warp loads two sets of eight aligned rows within
+                                // this activation stage.
+                                let b = unsafe {
+                                    ldmatrix_x2_shared_u32(cvta_generic_to_shared_u32(
+                                        bp.add(b_off).cast_const().cast::<u8>(),
+                                    ))
+                                };
+                                // SAFETY: the activation scale follows the weight scales in this half's scale words.
+                                let sb = unsafe { *sp.add(TILE_ROWS + br) };
+                                let c = mma(
+                                    [acc[n * 4], acc[n * 4 + 1], acc[n * 4 + 2], acc[n * 4 + 3]],
+                                    a,
+                                    b,
+                                    sa,
+                                    sb,
+                                );
+                                acc[n * 4] = c[0];
+                                acc[n * 4 + 1] = c[1];
+                                acc[n * 4 + 2] = c[2];
+                                acc[n * 4 + 3] = c[3];
+                            }
                         }
-                        let br = n * 8 + g;
-                        let b_off = (n * 8 + (lane & 7)) * 12 + 4 * ((lane >> 3) & 1);
-                        // SAFETY: the whole warp loads two sets of eight aligned rows within this activation stage.
-                        let b = unsafe {
-                            ldmatrix_x2_shared_u32(cvta_generic_to_shared_u32(
-                                bp.add(b_off).cast_const().cast::<u8>(),
-                            ))
-                        };
-                        // SAFETY: the activation scale follows the weight scales in this 192-word stage.
-                        let sb = unsafe { *sp.add(TILE_ROWS + br) };
-                        let c = mma(
-                            [acc[n * 4], acc[n * 4 + 1], acc[n * 4 + 2], acc[n * 4 + 3]],
-                            a,
-                            b,
-                            sa,
-                            sb,
-                        );
-                        acc[n * 4] = c[0];
-                        acc[n * 4 + 1] = c[1];
-                        acc[n * 4 + 2] = c[2];
-                        acc[n * 4 + 3] = c[3];
                     }
-                }
-            }
-        );
+                )
+            };
+        }
+        if steps.is_multiple_of(HALVES) && rows.is_multiple_of(TILE_ROWS) {
+            walk!(true);
+        } else {
+            walk!(false);
+        }
         if row >= rows {
             return;
         }
         let weight_scale = ws[expert];
+        // The lane's sixteen columns, fragment n's column j at i = 2n + j: their
+        // slots and input scales are all read before the first store.
+        let column_of = |i: usize| 8 * (i / 2) + 2 * t + (i & 1);
+        let mut slot = [0usize; 16];
+        let mut input_scale = [0.0f32; 16];
         #[unroll]
-        for n in 0..8 {
-            #[unroll]
-            for j in 0..2 {
-                let c = n * 8 + 2 * t + j;
-                if c < len {
-                    let slot = cols[start + c] as usize;
-                    let column = if slot_div == 1 {
-                        slot
-                    } else {
-                        slot / slot_div as usize
-                    };
-                    let input_scale = ag[column];
-                    // SAFETY: this lane owns the first row of this live column; row counts divide 16.
-                    unsafe {
-                        *y.get_unchecked_mut(slot * rows + row + g) =
-                            crate::gemm::grouped::scaled_sum(
-                                [f64::from(acc[n * 4 + j]), 0.0],
-                                [weight_scale, 0.0],
-                                input_scale,
-                                0.0,
-                            ) as f32;
-                    }
-                    // SAFETY: this lane owns the row eight positions later in the same live column.
-                    unsafe {
-                        *y.get_unchecked_mut(slot * rows + row + g + 8) =
-                            crate::gemm::grouped::scaled_sum(
-                                [f64::from(acc[n * 4 + j + 2]), 0.0],
-                                [weight_scale, 0.0],
-                                input_scale,
-                                0.0,
-                            ) as f32;
-                    }
+        for i in 0..16 {
+            if column_of(i) < len {
+                // SAFETY: column_of(i) < len <= 64, after the walk's barriers.
+                (slot[i], input_scale[i]) = unsafe { columns.get(column_of(i)) };
+            }
+        }
+        #[unroll]
+        for i in 0..16 {
+            if column_of(i) < len {
+                let (n, j) = (i / 2, i & 1);
+                // SAFETY: this lane owns the first row of this live column; row counts divide 16.
+                unsafe {
+                    *y.get_unchecked_mut(slot[i] * rows + row + g) =
+                        crate::gemm::grouped::scaled_sum(
+                            [f64::from(acc[n * 4 + j]), 0.0],
+                            [weight_scale, 0.0],
+                            input_scale[i],
+                            0.0,
+                        ) as f32;
+                }
+                // SAFETY: this lane owns the row eight positions later in the same live column.
+                unsafe {
+                    *y.get_unchecked_mut(slot[i] * rows + row + g + 8) =
+                        crate::gemm::grouped::scaled_sum(
+                            [f64::from(acc[n * 4 + j + 2]), 0.0],
+                            [weight_scale, 0.0],
+                            input_scale[i],
+                            0.0,
+                        ) as f32;
                 }
             }
         }
@@ -946,7 +1251,7 @@ mod native {
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]
     #[kernel]
-    #[launch_bounds(256)]
+    #[launch_bounds(256, 2)]
     #[launch_contract(domain = 1, block = (256, 1, 1))]
     pub fn gate_up_nvfp4_mma(
         gq: &[u32],
@@ -983,10 +1288,13 @@ mod native {
         let expert = tiles[2 * tile] as usize;
         let (start, len) = super::super::route::tile_parts(tiles[2 * tile + 1]);
         let (start, len) = (start as usize, len as usize);
-        static mut W: cuda_device::SharedArray<u32, 3072, 16> = cuda_device::SharedArray::UNINIT;
-        static mut B: cuda_device::SharedArray<u32, 1536, 16> = cuda_device::SharedArray::UNINIT;
-        static mut S: cuda_device::SharedArray<u32, 384, 16> = cuda_device::SharedArray::UNINIT;
-        static mut V: cuda_device::SharedArray<f32, { 64 * PAIR_PITCH }, 16> =
+        static mut W: cuda_device::SharedArray<u32, { STAGES * W_STAGE }, 16> =
+            cuda_device::SharedArray::UNINIT;
+        static mut B: cuda_device::SharedArray<u32, { STAGES * B_STAGE }, 16> =
+            cuda_device::SharedArray::UNINIT;
+        static mut S: cuda_device::SharedArray<u32, { STAGES * S_STAGE }, 16> =
+            cuda_device::SharedArray::UNINIT;
+        static mut C: cuda_device::SharedArray<u32, COLUMN_WORDS, 16> =
             cuda_device::SharedArray::UNINIT;
         // SAFETY: W is this block's shared weight allocation.
         let wp = unsafe { cuda_device::SharedArray::as_raw_mut_ptr(&raw mut W) };
@@ -994,8 +1302,10 @@ mod native {
         let bp = unsafe { cuda_device::SharedArray::as_raw_mut_ptr(&raw mut B) };
         // SAFETY: S is this block's shared scale allocation.
         let sp = unsafe { cuda_device::SharedArray::as_raw_mut_ptr(&raw mut S) };
-        // SAFETY: V is this block's shared SwiGLU tile.
-        let vp = unsafe { cuda_device::SharedArray::as_raw_mut_ptr(&raw mut V) };
+        // SAFETY: C is this block's shared column allocation.
+        let columns = TileColumns(unsafe { cuda_device::SharedArray::as_raw_mut_ptr(&raw mut C) });
+        // The SwiGLU tile reuses W once every warp has finished the walk.
+        let vp = wp.cast::<f32>();
         let wi = tid / 32;
         let (wr, wc) = (wi & 3, wi >> 2);
         let g = lane / 4;
@@ -1012,106 +1322,134 @@ mod native {
         } else {
             source / slot_div as usize
         };
+        // SAFETY: the block's column words, before the walk.
+        unsafe { columns.put((sr, half), source, ag, col) };
+        let (gate_scale, up_scale) = (gw[expert], uw[expert]);
         let mut gacc = [0.0f32; 16];
         let mut uacc = [0.0f32; 16];
-        nvfp4_walk!(
-            (wq, we, wrow),
-            (aq, ae, col),
-            (steps, sr, half),
-            (wp, bp, sp),
-            {
-                let a_off = (16 * wr + (lane & 15)) * 12 + 4 * (lane >> 4);
-                // SAFETY: all lanes issue the load; its four sets of eight aligned gate rows lie in the live stage.
-                let a_gate = unsafe {
-                    ldmatrix_x4_shared_u32(cvta_generic_to_shared_u32(
-                        wp.add(a_off).cast_const().cast::<u8>(),
-                    ))
-                };
-                // SAFETY: as the gate's, PAIR_ROWS shared rows later: the up's rows.
-                let a_up = unsafe {
-                    ldmatrix_x4_shared_u32(cvta_generic_to_shared_u32(
-                        wp.add(a_off + PAIR_ROWS * 12).cast_const().cast::<u8>(),
-                    ))
-                };
-                let r = 16 * wr + g + 8 * (t & 1);
-                // SAFETY: each pair of lanes reads the gate scale row selected by the MMA layout.
-                let sa_gate = unsafe { *sp.add(r) };
-                // SAFETY: the up's scale row, PAIR_ROWS words after the gate's.
-                let sa_up = unsafe { *sp.add(PAIR_ROWS + r) };
-                for n in 0..4 {
-                    ::cuda_device::thread::__unroll_config::<0>();
-                    let nn = 4 * wc + n;
-                    if nn >= nt {
-                        continue;
+        // An even K walk runs without the walk's and the fragments' checks: a
+        // tile of fewer than 64 columns also runs its dead fragments, over
+        // copies of its last live column (`source`), which no store reads.
+        macro_rules! walk {
+            ($full:literal) => {
+                nvfp4_walk!(
+                    $full,
+                    (wq, we, wrow),
+                    (aq, ae, col),
+                    (steps, sr, half),
+                    (wp, bp, sp, h),
+                    {
+                        let a_row = 16 * wr + (lane & 15);
+                        let a_off = chunk(a_row, 2 * h + (lane >> 4));
+                        // SAFETY: all lanes issue the load; its four sets of eight aligned gate
+                        // rows lie in the live stage.
+                        let a_gate = unsafe {
+                            ldmatrix_x4_shared_u32(cvta_generic_to_shared_u32(
+                                wp.add(a_off).cast_const().cast::<u8>(),
+                            ))
+                        };
+                        // SAFETY: all lanes issue the load; its four sets of eight aligned rows are the
+                        // gate's rows 16 * wr + (lane & 15) < PAIR_ROWS (wr < 4) moved PAIR_ROWS rows on,
+                        // the up's rows, inside the TILE_ROWS rows of the live stage.
+                        let a_up = unsafe {
+                            ldmatrix_x4_shared_u32(cvta_generic_to_shared_u32(
+                                wp.add(chunk(PAIR_ROWS + a_row, 2 * h + (lane >> 4)))
+                                    .cast_const()
+                                    .cast::<u8>(),
+                            ))
+                        };
+                        let r = 16 * wr + g + 8 * (t & 1);
+                        // SAFETY: each pair of lanes reads the gate scale row selected by the MMA layout.
+                        let sa_gate = unsafe { *sp.add(r) };
+                        // SAFETY: r < PAIR_ROWS, so PAIR_ROWS + r < TILE_ROWS is the up's scale row in this
+                        // half's scale words.
+                        let sa_up = unsafe { *sp.add(PAIR_ROWS + r) };
+                        for n in 0..4 {
+                            ::cuda_device::thread::__unroll_config::<0>();
+                            let nn = 4 * wc + n;
+                            if !$full && nn >= nt {
+                                continue;
+                            }
+                            let b_off = chunk(nn * 8 + (lane & 7), 2 * h + ((lane >> 3) & 1));
+                            // SAFETY: the whole warp loads two sets of eight aligned rows within this activation stage.
+                            let b = unsafe {
+                                ldmatrix_x2_shared_u32(cvta_generic_to_shared_u32(
+                                    bp.add(b_off).cast_const().cast::<u8>(),
+                                ))
+                            };
+                            // SAFETY: the activation scale follows the weight scales in this half's scale words.
+                            let sb = unsafe { *sp.add(TILE_ROWS + nn * 8 + g) };
+                            let c = mma(
+                                [
+                                    gacc[n * 4],
+                                    gacc[n * 4 + 1],
+                                    gacc[n * 4 + 2],
+                                    gacc[n * 4 + 3],
+                                ],
+                                a_gate,
+                                b,
+                                sa_gate,
+                                sb,
+                            );
+                            gacc[n * 4] = c[0];
+                            gacc[n * 4 + 1] = c[1];
+                            gacc[n * 4 + 2] = c[2];
+                            gacc[n * 4 + 3] = c[3];
+                            let c = mma(
+                                [
+                                    uacc[n * 4],
+                                    uacc[n * 4 + 1],
+                                    uacc[n * 4 + 2],
+                                    uacc[n * 4 + 3],
+                                ],
+                                a_up,
+                                b,
+                                sa_up,
+                                sb,
+                            );
+                            uacc[n * 4] = c[0];
+                            uacc[n * 4 + 1] = c[1];
+                            uacc[n * 4 + 2] = c[2];
+                            uacc[n * 4 + 3] = c[3];
+                        }
                     }
-                    let b_off = (nn * 8 + (lane & 7)) * 12 + 4 * ((lane >> 3) & 1);
-                    // SAFETY: the whole warp loads two sets of eight aligned rows within this activation stage.
-                    let b = unsafe {
-                        ldmatrix_x2_shared_u32(cvta_generic_to_shared_u32(
-                            bp.add(b_off).cast_const().cast::<u8>(),
-                        ))
-                    };
-                    // SAFETY: the activation scale follows the weight scales in this 192-word stage.
-                    let sb = unsafe { *sp.add(TILE_ROWS + nn * 8 + g) };
-                    let c = mma(
-                        [
-                            gacc[n * 4],
-                            gacc[n * 4 + 1],
-                            gacc[n * 4 + 2],
-                            gacc[n * 4 + 3],
-                        ],
-                        a_gate,
-                        b,
-                        sa_gate,
-                        sb,
-                    );
-                    gacc[n * 4] = c[0];
-                    gacc[n * 4 + 1] = c[1];
-                    gacc[n * 4 + 2] = c[2];
-                    gacc[n * 4 + 3] = c[3];
-                    let c = mma(
-                        [
-                            uacc[n * 4],
-                            uacc[n * 4 + 1],
-                            uacc[n * 4 + 2],
-                            uacc[n * 4 + 3],
-                        ],
-                        a_up,
-                        b,
-                        sa_up,
-                        sb,
-                    );
-                    uacc[n * 4] = c[0];
-                    uacc[n * 4 + 1] = c[1];
-                    uacc[n * 4 + 2] = c[2];
-                    uacc[n * 4 + 3] = c[3];
-                }
+                )
+            };
+        }
+        if steps.is_multiple_of(HALVES) {
+            walk!(true);
+        } else {
+            walk!(false);
+        }
+        thread::sync_threads();
+        // The lane's eight columns, fragment n's column j & 1 at i = 2n + (j & 1):
+        // their input scales are all read before the first store.
+        let column_of = |i: usize| (4 * wc + i / 2) * 8 + 2 * t + (i & 1);
+        let mut input_scale = [0.0f32; 8];
+        #[unroll]
+        for i in 0..8 {
+            if column_of(i) < len {
+                // SAFETY: column_of(i) < len <= 64, after the walk's barriers.
+                input_scale[i] = unsafe { columns.get(column_of(i)) }.1;
             }
-        );
-        let (gate_scale, up_scale) = (gw[expert], uw[expert]);
+        }
         #[unroll]
         for n in 0..4 {
             #[unroll]
             for j in 0..4 {
-                let c = (4 * wc + n) * 8 + 2 * t + (j & 1);
+                let i = 2 * n + (j & 1);
+                let c = column_of(i);
                 if c < len {
-                    let slot = cols[start + c] as usize;
-                    let column = if slot_div == 1 {
-                        slot
-                    } else {
-                        slot / slot_div as usize
-                    };
-                    let input_scale = ag[column];
                     let gv = crate::gemm::grouped::scaled_sum(
                         [f64::from(gacc[n * 4 + j]), 0.0],
                         [gate_scale, 0.0],
-                        input_scale,
+                        input_scale[i],
                         0.0,
                     ) as f32;
                     let uv = crate::gemm::grouped::scaled_sum(
                         [f64::from(uacc[n * 4 + j]), 0.0],
                         [up_scale, 0.0],
-                        input_scale,
+                        input_scale[i],
                         0.0,
                     ) as f32;
                     let v = if gv.is_finite() && uv.is_finite() {
@@ -1133,6 +1471,8 @@ mod native {
         let mut item = 4 * wi + (lane >> 3);
         while item - (lane >> 3) < 2 * 64 {
             let (c, blk) = (item / 2, item & 1);
+            // SAFETY: c < len <= 64, after the walk's barriers.
+            let slot = (c < len).then(|| unsafe { columns.get(c) }.0);
             let v = if c < len {
                 // SAFETY: the barrier published this live column's aligned quad.
                 unsafe {
@@ -1144,8 +1484,7 @@ mod native {
                 [0.0; 4]
             };
             let (word, sum, dv, refused) = super::super::act32::quant32_lane(v, lane);
-            if c < len {
-                let slot = cols[start + c] as usize;
+            if let Some(slot) = slot {
                 let b = 2 * rt + blk;
                 // SAFETY: one lane owns word i of block b < 2·osteps of this live slot's column.
                 unsafe {
@@ -1235,7 +1574,7 @@ mod native {
         n: u32,
         mut y: DisjointSlice<f32>,
     ) {
-        static mut STAGE: SharedArray<f32, { STAGES * STAGE_FLOATS }, 16> = SharedArray::UNINIT;
+        static mut STAGE: SharedArray<f32, { MMA_STAGES * STAGE_FLOATS }, 16> = SharedArray::UNINIT;
         // SAFETY: this block's aligned shared allocation, accessed without a reference.
         let sh = unsafe { SharedArray::as_raw_mut_ptr(&raw mut STAGE) };
         let cols = Mxfp8Cols {
@@ -1250,6 +1589,141 @@ mod native {
         // K a multiple of 128, 16-byte aligned planes and activation words and
         // the spans in the contract.
         unsafe { bf16_mma_body(Mxfp8Rows { qs, e }, cols, rows, k, n, &mut y, sh) };
+    }
+
+    /// [`mxfp8_w8a8_gemm`] as a gate projection with the shared sigmoid norm
+    /// at its store (`f32tile.rs`'s `bf16_mma_norm_gate_body`), which also
+    /// writes the output's MXFP8 form (`yq`, `ye`, `yrefused` zero before
+    /// the launch) for the site that reads it.
+    #[allow(clippy::too_many_arguments, reason = "flat kernel ABI")]
+    #[kernel]
+    #[launch_bounds(256, 2)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            rows >= 128,
+            n >= 1,
+            4 * qs.len() >= rows * k,
+            128 * e.len() >= rows * k,
+            x.len() >= n * k,
+            4 * xq.len() >= n * k,
+            128 * xe.len() >= n * k,
+            refused.len() >= n,
+            o.len() >= rows * n,
+            gain.len() >= 128,
+            z.len() >= rows * n,
+            y.len() >= rows * n,
+            4 * yq.len() >= rows * n,
+            128 * ye.len() >= rows * n,
+            yrefused.len() >= n
+        )
+    )]
+    pub fn mxfp8_w8a8_norm_gate(
+        qs: &[u32],
+        e: &[u32],
+        x: &[f32],
+        xq: &[u32],
+        xe: &[u32],
+        refused: &[u32],
+        rows: u32,
+        k: u32,
+        n: u32,
+        o: &[f32],
+        gain: &[f32],
+        eps: f32,
+        fault: crate::fault::FaultSink,
+        mut z: DisjointSlice<f32>,
+        mut y: DisjointSlice<f32>,
+        mut yq: DisjointSlice<u32>,
+        mut ye: DisjointSlice<u32>,
+        mut yrefused: DisjointSlice<u32>,
+    ) {
+        static mut STAGE: SharedArray<f32, { MMA_STAGES * STAGE_FLOATS }, 16> = SharedArray::UNINIT;
+        // SAFETY: this block's aligned shared allocation, accessed without a reference.
+        let sh = unsafe { SharedArray::as_raw_mut_ptr(&raw mut STAGE) };
+        let cols = Mxfp8Cols {
+            pairs: Bf16Cols {
+                words: xq,
+                refused,
+                exact: x,
+            },
+            e: xe,
+        };
+        let w = Mxfp8Rows { qs, e };
+        let form = Mxfp8Out {
+            qs: yq.as_mut_ptr(),
+            e: ye.as_mut_ptr(),
+            refused: yrefused.as_mut_ptr(),
+        };
+        // SAFETY: the checked launch gives 256 converged threads and the MMA
+        // grid, rows a multiple of HEAD, k a multiple of 128, 16-byte-aligned
+        // qs and xq, the contract's spans of qs, e, x, xq, xe, refused, o,
+        // gain, z, y and the output form's yq, ye and yrefused, and sh this
+        // block's aligned MMA_STAGES·STAGE_FLOATS floats.
+        unsafe {
+            bf16_mma_norm_gate_body(
+                w, cols, rows, k, n, o, gain, eps, fault, &mut z, &mut y, form, sh,
+            )
+        };
+    }
+
+    /// `hc_gated_up_mma_mix_4`, also writing `mixed`'s MXFP8 form: its
+    /// E4M3 words and scale words and each column's refusal word, zero
+    /// before the launch.
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            hidden > 0, m > 8,
+            w.len() >= 4 * hidden * 160,
+            lo.len() >= m * 320,
+            lo_words.len() >= m * 160,
+            lo_refused.len() >= m,
+            xn.len() >= m * 4 * hidden,
+            g.len() >= m * 4 * hidden,
+            mixed.len() >= m * hidden,
+            4 * qs.len() >= m * hidden,
+            128 * e.len() >= m * hidden,
+            refused.len() >= m
+        )
+    )]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    pub fn hc_gated_up_mma_mix_4_mxfp8(
+        w: &[u32],
+        lo: &[f32],
+        lo_words: &[u32],
+        lo_refused: &[u32],
+        xn: &[f32],
+        hidden: u32,
+        m: u32,
+        fault: crate::fault::FaultSink,
+        mut g: DisjointSlice<f32>,
+        mut mixed: DisjointSlice<f32>,
+        mut qs: DisjointSlice<u32>,
+        mut e: DisjointSlice<u32>,
+        mut refused: DisjointSlice<u32>,
+    ) {
+        static mut STAGE: SharedArray<f32, { MMA_STAGES * STAGE_FLOATS }, 16> = SharedArray::UNINIT;
+        // SAFETY: this block's aligned shared allocation, accessed without a reference.
+        let sh = unsafe { SharedArray::as_raw_mut_ptr(&raw mut STAGE) };
+        let x = (lo, lo_words, lo_refused, xn);
+        let form = Mxfp8Out {
+            qs: qs.as_mut_ptr(),
+            e: e.as_mut_ptr(),
+            refused: refused.as_mut_ptr(),
+        };
+        // SAFETY: the checked launch gives 256 converged threads, the MMA grid
+        // and the spans above, the form's planes for the m columns of `hidden`
+        // values, `hidden` a multiple of 128; sh is this block's allocation.
+        unsafe {
+            crate::hc_gated::up_mma_mix_body(w, x, (hidden, m), fault, &mut g, &mut mixed, form, sh)
+        };
     }
 }
 
@@ -1270,6 +1744,40 @@ pub(super) struct GateUpArgs<'a> {
     pub(super) slot_div: u32,
     pub(super) n_cols: usize,
     pub(super) act: &'a mut GemmAct32,
+}
+
+pub(super) struct SwigluArgs<'a> {
+    pub(super) g: &'a DeviceBuffer<f32>,
+    pub(super) u: &'a DeviceBuffer<f32>,
+    pub(super) selected: Option<(&'a DeviceBuffer<u32>, u32)>,
+    pub(super) rule: crate::kquant::Act,
+    pub(super) cols: u32,
+    pub(super) act: &'a mut GemmAct32,
+}
+
+/// [`Kernels::mxfp8_w8a8_norm_gate`]'s arguments: the weight `w` over the
+/// MXFP8 `form` of `x`, the checked launch `t`, the exact replay's scratch
+/// `z`, the norm and gate operands `tail`, and the output form's words,
+/// scale words and zeroed refusal words `out` ([`GemmAct32::out_planes`]).
+pub(super) struct NativeNormGateArgs<'a> {
+    pub(super) w: E4m3Weight<'a>,
+    pub(super) x: &'a DeviceBuffer<f32>,
+    pub(super) form: &'a ColsForm,
+    pub(super) t: &'a TileLaunch,
+    pub(super) z: &'a mut DeviceBuffer<f32>,
+    pub(super) tail: NormGateTail<'a>,
+    pub(super) out: [&'a mut DeviceBuffer<u32>; 3],
+}
+
+pub(super) struct ProductArgs<'a> {
+    pub(super) w: crate::mxfp4_sel::Nvfp4Stack<'a>,
+    pub(super) act: &'a GemmAct32,
+    pub(super) route: &'a GemmRoute,
+    pub(super) rows: u32,
+    pub(super) slots: u32,
+    pub(super) max_tiles: u32,
+    pub(super) slot_div: u32,
+    pub(super) y: &'a mut DeviceBuffer<f32>,
 }
 
 impl Kernels {
@@ -1306,14 +1814,17 @@ impl Kernels {
     pub(super) fn swiglu(
         &self,
         stream: &CudaStream,
-        g: &DeviceBuffer<f32>,
-        u: &DeviceBuffer<f32>,
-        selected: Option<(&DeviceBuffer<u32>, u32)>,
-        rule: crate::kquant::Act,
-        cols: u32,
-        act: &mut GemmAct32,
+        a: SwigluArgs<'_>,
         fault: crate::fault::FaultSink,
     ) -> Result<(), GpuError> {
+        let SwigluArgs {
+            g,
+            u,
+            selected,
+            rule,
+            cols,
+            act,
+        } = a;
         let (code, limit) = rule.code("NVFP4 activation")?;
         crate::tensor::check_alignment::<cuda_device::vector::F32x4, _>(
             "NVFP4 activation",
@@ -1444,18 +1955,17 @@ impl Kernels {
         self.quantize(stream, act)
     }
 
-    pub(super) fn product(
-        &self,
-        stream: &CudaStream,
-        w: crate::mxfp4_sel::Nvfp4Stack<'_>,
-        act: &GemmAct32,
-        route: &GemmRoute,
-        rows: u32,
-        slots: u32,
-        max_tiles: u32,
-        slot_div: u32,
-        y: &mut DeviceBuffer<f32>,
-    ) -> Result<(), GpuError> {
+    pub(super) fn product(&self, stream: &CudaStream, a: ProductArgs<'_>) -> Result<(), GpuError> {
+        let ProductArgs {
+            w,
+            act,
+            route,
+            rows,
+            slots,
+            max_tiles,
+            slot_div,
+            y,
+        } = a;
         let a = act
             .native
             .as_ref()
@@ -1524,6 +2034,65 @@ impl Kernels {
         let (xq, xe, refused) = (&form.words, &form.scales, &form.refused);
         self.module.mxfp8_w8a8_gemm(
             stream, &prep, qs, e, x, xq, xe, refused, t.rows, t.k, t.n, y,
+        )?;
+        Ok(())
+    }
+
+    /// [`Self::mxfp8_w8a8`] with the shared sigmoid norm `a.tail` at its
+    /// store and the MXFP8 form of its output into `a.out`, which has room
+    /// for it ([`native::mxfp8_w8a8_norm_gate`]); `a.z` is the exact
+    /// replay's scratch.
+    pub(super) fn mxfp8_w8a8_norm_gate(
+        &self,
+        stream: &CudaStream,
+        a: NativeNormGateArgs<'_>,
+    ) -> Result<(), GpuError> {
+        let NativeNormGateArgs {
+            w,
+            x,
+            form,
+            t,
+            z,
+            tail,
+            out: [yq, ye, yrefused],
+        } = a;
+        let cfg = LaunchConfig1D::new(t.grid, MMA_THREADS, 0);
+        let prep = self.module.prepare_mxfp8_w8a8_norm_gate(cfg)?;
+        let (qs, e) = (w.qs.buf(), w.e.buf());
+        let (xq, xe, refused) = (&form.words, &form.scales, &form.refused);
+        self.module.mxfp8_w8a8_norm_gate(
+            stream, &prep, qs, e, x, xq, xe, refused, t.rows, t.k, t.n, tail.o, tail.w, tail.eps,
+            tail.fault, z, tail.y, yq, ye, yrefused,
+        )?;
+        Ok(())
+    }
+
+    /// `hc_gated_up_mma_mix_4` over the checked launch `a.cfg`, also writing
+    /// `mixed`'s MXFP8 form into `a.planes`
+    /// ([`native::hc_gated_up_mma_mix_4_mxfp8`]).
+    pub(super) fn hc_up_mix_mxfp8(
+        &self,
+        stream: &CudaStream,
+        a: HcUpMixArgs<'_>,
+    ) -> Result<(), GpuError> {
+        let HcUpMixArgs {
+            cfg,
+            w,
+            lo,
+            lo_words,
+            lo_refused,
+            xn,
+            hidden,
+            m,
+            fault,
+            g,
+            mixed,
+            planes: [qs, e, refused],
+        } = a;
+        let prep = self.module.prepare_hc_gated_up_mma_mix_4_mxfp8(cfg)?;
+        self.module.hc_gated_up_mma_mix_4_mxfp8(
+            stream, &prep, w, lo, lo_words, lo_refused, xn, hidden, m, fault, g, mixed, qs, e,
+            refused,
         )?;
         Ok(())
     }

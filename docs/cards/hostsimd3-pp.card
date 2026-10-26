@@ -1,0 +1,51 @@
+# Round hostsimd3: the IQ2_XXS kernels in ik's form (iqk_gemm_iquants.cpp mul_mat_qX_K_q8_K_IQ_N with
+# DequantizerIQ2XXS, the body ik's AVX2 build runs below 32 columns): the grid signs applied on the weight side once
+# a block, the values offset by +43 onto maddubs' unsigned side, the offset folded back out through the column's
+# bsums (one madd and one fmadd a block and column). Every column of a wide run now runs per sub-block one maddubs
+# (its codes a memory operand), one madd and one add, where the old form signed each column's codes itself (a load,
+# a sign_epi8 by the block's sign vectors, then the maddubs and madd). The one-column kernel takes the same form
+# through q8k_block_step. Not bit-identical to the base: the lanes carry other partial sums and each block adds the
+# fold's fmadd; qdot's f64 band (iq2xxs_dot_is_within_its_f64_bound, re-pinned) is the proof.
+# Against int039 2b9904efd (hostsimd2's post-norm fold and one-group tile in).
+# Decomposition per (block, column) of the wide kernel at m = 15.5 columns a run (264 runs per 4096 columns)
+# [derived, from the code; the lead's tools/ref/tile-units.sh prints both kernels' block loops]:
+# - base: inner 39 (per sub-block load, sign_epi8, maddubs, madd, add) + tail 7 + the pack 292 / 15.5 = 18.8 +
+#   group reloads ~4 = ~69 instructions; new: inner 23 + tail 11.5 (dy, the fold's madd, two cvt, two fmadd, acc)
+#   + the pack 300 / 15.5 = 19.4 + reloads ~3.2 = ~57.6. -17 % (-8..-25 % over the count's uncertainty).
+# - Unit demand per (block, column), cycles: dispatch 11.6 -> 9.6 (6 a cycle), vector pipes 10.4 -> 9.8, the two
+#   int-mul pipes 8.0 -> 8.5, the L2 column stream 9.25 both (296 B a column block; the bsums line is already
+#   fetched). Step at the measured qdot IPC 2.9..3.6: 19..24 -> 16..20 cycles. Floors and the IPC-constant model
+#   both give -16..-17 % of the rows term; if the L2 column stream binds (~25 B a cycle sustained, ~11.8 cycles
+#   both arms) the effect is ~0.
+# - Rows 93..145 ms a layer at n_h = 4096 (hostsimd2's paper) -> -12..-22 %; rows are 0.70..0.91 of the layer
+#   (110..181 ms after hostsimd2's fold) -> pp +8..+25 %. pp4096 the same band (eight ubatches of the same calls).
+# Resource timeline per layer, pp512 [derived]: host CPU rows 77..124 ms + O' 3..5 ms + the residual; card SMs ~11 ms
+# serial; PCIe ~0.7 ms serial; host DRAM 25..40 of 147 GB/s (under the host's compute); NVMe 0. The wall is the sum
+# and the host still holds it; the next flow lever is the card's ~11 ms under the host union.
+kind: ab
+question: does the IQ2_XXS kernels' ik form (grid signs on the weight side, the +43 offset folded out through the
+  bsums) shorten the host union's rows term on Muse Spark's prompt pass?
+term: pp tok/s @ P = 512, prose prompt (corpus-prose.ids), Muse Spark UD-IQ2_XXS, A6000 + host, place a, serve
+  defaults (--ctx-size 4160) - (hostsimd3 - base) / base, arms rotated by round in one invocation
+unit: %
+predict: +8..+25
+rounds: 2
+condition: one lease, one invocation from /Users/hckim/repo/bloomery-hostsimd3 (it builds this tree's
+  bloomery-serve) after the base tree's own release build of bloomery-serve at int039 2b9904efd (a clean tree, e.g.
+  bloomery-int039base moved to that commit): BLOOMERY_MODEL=muse-spark BLOOMERY_AB_ROUNDS=2
+  BLOOMERY_BOX_ENV='DEPTH_SERVE_N=64 BLOOMERY_LEASE_CARD=docs/cards/hostsimd3-pp.card' just depth-serve
+  bloomery-int039base:512 bloomery-hostsimd3:512 bloomery-int039base:4096 bloomery-hostsimd3:4096. Both arms hold
+  the same plan (host code only), so their plan, pass and xstream lines print the same card experts, pass rows and
+  streamed experts; their tg rows agree within the window's ~5 % (the one-column kernel's instruction count moves
+  under 3 %). The xstream records give n_h per layer, which places the result in the band. A row marked [cold],
+  [cpu-busy] or [other-busy] is void, and so is a window whose majflt differs by more than the load's own scatter
+  between arms. Box time 13..32 min [derived: hostsimd2's sitting, the same arms and prompts, plus the two serve
+  builds]
+decide-in: land it; the host term per layer is then rows 77..124 ms beside O' and the card's ~11 ms serial share:
+  open the overlap of the card's share under the host union (async, <= 6..10 %), and price the integer fold for the
+  q8k_block_step family (the fold's cvt and fmadd into the codes' integer sum, -2..-3 instructions a block and column)
+decide-below: under +8 %: the L2 column stream binds or the IPC fell; read union_ms per layer from one
+  BLOOMERY_STEP_STATS=1 run of each arm and perf annotate the wide kernel's block loop on both; land it at an effect
+  above the ruler (the sums stay within the f64 band), hold it at or under 0 and name the unit that binds
+decide-above: past +25 %: the base kernel cost more than counted (its sign_epi8 chain or group reloads spilled);
+  re-derive both block loops from tile-units.sh's listing and price the card's serial share next

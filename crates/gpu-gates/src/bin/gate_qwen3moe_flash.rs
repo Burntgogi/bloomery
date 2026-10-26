@@ -163,6 +163,28 @@
 //! scratch shorter than the launch refused by name, nothing enqueued.
 //! The referee reads the full cache planes from key zero (`first = 0`);
 //! `p0` is the query's prefix length, not a cut of those planes.
+//!
+//! The head-64 entries (`enqueue_pass_64`, Muse Spark's: [`GROUP`] query
+//! heads a key head of 64 values, a layer's window 2048 or none) on a
+//! synthetic f16 cache of 2 key heads × 4,096 rows and a seeded query, at
+//! the module band with the 64-value head's own counts — 16 fused
+//! multiply-adds a score partial (γ(19)), the tensor core's four k16 steps
+//! (2·γ(66) beside the query's f16 rounding). Asserted, window off, at
+//! counts 1, the tile edges 63/64/65, 2,047, 2,048, 4,095 and the cache's
+//! full 4,096: every count of both passes within the band of the exact
+//! attention of every query head, a rerun bit-identical, the rows at or
+//! past the count NaN changing no bit. Windowed at 2048, at 1 (below the
+//! window), 2,047/2,048/2,049 (its edge) and 3,072/4,096 (past it): within
+//! the band of the exact attention over the window's own keys, and bit for
+//! bit the windowless launch over the window's keys re-based at row 0 — the
+//! same rows, the same walk, no window arithmetic of its own to hide
+//! behind. The prefill shape ([`ROWS`] rotated rows at counts spread over
+//! the cache) each bit for bit its one-row launch, at both windows and both
+//! passes; the `key_count` fault rows of the decode clause (row 3 one past
+//! the cache, row 5 zero) at both windows; the captured launch of both
+//! passes at both windows two nodes — the segment node `n_kv ·` the window's
+//! segments, the merge `n_head` — replaying the eager bits; a `part_v` one
+//! short refused by name.
 
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
@@ -173,8 +195,9 @@ fn main() -> std::process::ExitCode {
 mod gate {
     use bloomery_gpu::fault::{Fault, FaultSink, FaultSite, LAYER_NONE};
     use bloomery_gpu::flash_gqa::{
-        FlashGqaKernels, GROUP, GROUP_5, GROUP_16, GqaArgs, GqaQ8Args, HEAD, KEY_TILE, SEG_KEYS,
-        SEGMENTS, partials_ms_len, partials_v_len, seg_span,
+        FlashGqaKernels, GROUP, GROUP_5, GROUP_16, Gqa64Args, GqaArgs, GqaQ8Args, HEAD, HEAD_64,
+        KEY_TILE, SEG_KEYS, SEGMENTS, partials_ms_len, partials_v_len, partials_v_len_64, seg_span,
+        window_cut, window_segments,
     };
     use bloomery_gpu::flash_gqa_prefill::{
         FlashGqaPrefill, GqaPrefillArgs, GqaPrefillQ8Args, KEY_TILE as PREF_TILE, SplitScratch,
@@ -2170,6 +2193,520 @@ mod gate {
         Ok(pass)
     }
 
+    /// The head-64 clauses' cache (module doc): Muse Spark's geometry —
+    /// [`GROUP`] query heads a key head of 64 values over [`H64_CTX`] rows,
+    /// a layer's window [`H64_WINDOW`] or none.
+    const H64_KV: usize = 2;
+    const H64_CTX: usize = 4_096;
+    const H64_WINDOW: usize = 2_048;
+    /// One-row launch counts at no window: the tile edges 63/64/65, the
+    /// window's own boundary and the cache's full height.
+    const H64_COUNTS: [usize; 8] = [1, 63, 64, 65, 2_047, 2_048, 4_095, 4_096];
+    /// The windowed clause's counts: below the window, at its edge, past it
+    /// and the cache's full height.
+    const H64_WIN_COUNTS: [usize; 6] = [1, 2_047, 2_048, 2_049, 3_072, 4_096];
+
+    /// The exact attention of one head-64 query head in f64 and each pass's
+    /// bound: the module band with the 64-value head's own counts (module
+    /// doc).
+    struct Exact64 {
+        o: Vec<f64>,
+        bound_ours: Vec<f64>,
+        bound_mma: Vec<f64>,
+    }
+
+    /// [`Exact64`] of query head `q` (64 values) over `n` of the key and
+    /// value rows at `scale`, a launch of `segs` segments a row's head.
+    fn exact64(q: &[f32], kh: &[f32], vh: &[f32], n: usize, scale: f32, segs: usize) -> Exact64 {
+        let ex = exact_attn(q, kh, vh, HEAD_64, n, scale);
+        let ExactAttn {
+            o,
+            a,
+            a16,
+            pb,
+            x,
+            xmax,
+            ..
+        } = ex;
+        // The cut read through `seg_span`, as the 128-value head's.
+        let span = seg_span(n, segs, SEG_KEYS);
+        let live = n.div_ceil(span);
+        let r = (n.div_ceil(KEY_TILE) + live) as f64;
+        // 16 fused multiply-adds a score partial, two combine levels and the
+        // scale; the tensor core's four k16 steps, its order undocumented.
+        let (es_o, es_m) = (gamma(19), 2f64.powi(-11) + 2.0 * gamma(66));
+        let acc_o = gamma(span + live + 8);
+        let (mut bo, mut bm) = (vec![0.0f64; HEAD_64], vec![0.0f64; HEAD_64]);
+        for d in 0..HEAD_64 {
+            let (mut t_o, mut t_m, mut pv) = (0.0f64, 0.0f64, 0.0f64);
+            for j in 0..n {
+                let v = f64::from(vh[j * HEAD_64 + d]);
+                let dev = (v - o[d]).abs();
+                let ee = 4.0 * U + 2.0 * U * x[j];
+                t_o += pb[j] * (es_o * a[j] + ee + 4.0 * U * r + 2.0 * U * xmax) * dev;
+                t_m += pb[j] * (es_m * a16[j] + ee + 4.0 * U * r + 2.0 * U * xmax) * dev;
+                pv += pb[j] * v.abs();
+            }
+            bo[d] = t_o + acc_o * (pv + o[d].abs()) + 2.0 * U * o[d].abs();
+            bm[d] = t_m + acc_o * (pv + o[d].abs()) + 2.0 * U * o[d].abs();
+        }
+        Exact64 {
+            o,
+            bound_ours: bo,
+            bound_mma: bm,
+        }
+    }
+
+    /// One launch of `m` head-64 query rows at `window` over the cache
+    /// planes, into fresh scratch, raising on `fault`, read back — the
+    /// head-64 `run_once`.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the kernel, the card, the launch's own geometry and pass"
+    )]
+    fn run_once_64(
+        k: &FlashGqaKernels,
+        (stream, fault): (&CudaStream, FaultSink),
+        q: &DeviceBuffer<f32>,
+        n_keys: &DeviceBuffer<u32>,
+        (kc, vc): (&DeviceBuffer<u16>, &DeviceBuffer<u16>),
+        scale: f32,
+        n_kv: usize,
+        ctx: usize,
+        window: usize,
+        mma: bool,
+    ) -> Result<Vec<f32>, GateError> {
+        let (n_head, m) = (n_kv * GROUP, n_keys.len());
+        let mut pv = DeviceBuffer::<f32>::zeroed(stream, partials_v_len_64(m, n_head))?;
+        let mut pms = DeviceBuffer::<f32>::zeroed(stream, partials_ms_len(m, n_head))?;
+        let mut y = DeviceBuffer::<f32>::zeroed(stream, m * n_head * HEAD_64)?;
+        k.enqueue_pass_64(
+            stream,
+            Gqa64Args {
+                q,
+                kc,
+                vc,
+                n_keys,
+                scale,
+                n_kv,
+                ctx,
+                m,
+                window,
+                part_v: &mut pv,
+                part_ms: &mut pms,
+                fault,
+                y: &mut y,
+            },
+            mma,
+        )?;
+        stream.synchronize()?;
+        Ok(y.to_host_vec(stream)?)
+    }
+
+    /// The head-64 entries (module doc): both passes over a seeded cache,
+    /// window off and on. Returns whether every clause held.
+    fn head64(k: &FlashGqaKernels, gpu: &Gpu, scale: f32) -> Result<bool, GateError> {
+        let stream = gpu.stream();
+        let unl = gpu.unlabelled_sink();
+        let run = (stream, unl);
+        let (n_kv, ctx) = (H64_KV, H64_CTX);
+        let n_head = n_kv * GROUP;
+        let to16 = |v: Vec<f32>| -> Vec<u16> { v.iter().map(|&x| f32_to_f16_bits(x)).collect() };
+        let kb = to16(activations(HEAD_64, n_kv * ctx, 740));
+        let vb = to16(activations(HEAD_64, n_kv * ctx, 741));
+        // The oracle's values are the planes' f16 bits, as the deep clause's.
+        let (kf, vf): (Vec<f32>, Vec<f32>) = (
+            kb.iter().map(|&h| half_to_f32(h)).collect(),
+            vb.iter().map(|&h| half_to_f32(h)).collect(),
+        );
+        let (kc, vc) = (
+            DeviceBuffer::from_host(stream, &kb)?,
+            DeviceBuffer::from_host(stream, &vb)?,
+        );
+        let q: Vec<f32> = activations(HEAD_64, n_head, 742)
+            .iter()
+            .map(|v| v * SEED_Q_SCALE)
+            .collect();
+        let qd = DeviceBuffer::from_host(stream, &q)?;
+        // One one-row launch of `count` keys at `window` through `mma` over
+        // `ck`/`cv`.
+        let launch = |q: &[f32],
+                      count: usize,
+                      window: usize,
+                      mma: bool,
+                      ck: &DeviceBuffer<u16>,
+                      cv: &DeviceBuffer<u16>|
+         -> Result<Vec<f32>, GateError> {
+            let nk = DeviceBuffer::from_host(stream, &[u32::try_from(count)?])?;
+            run_once_64(
+                k,
+                run,
+                &DeviceBuffer::from_host(stream, q)?,
+                &nk,
+                (ck, cv),
+                scale,
+                n_kv,
+                ctx,
+                window,
+                mma,
+            )
+        };
+        // The NaN twins: every row at or past the count NaN.
+        let nanify = |b: &[u16], past: usize| -> Vec<u16> {
+            b.iter()
+                .enumerate()
+                .map(|(i, &h)| {
+                    if (i / HEAD_64) % ctx >= past {
+                        NAN16
+                    } else {
+                        h
+                    }
+                })
+                .collect()
+        };
+        // A cache's planes with each key head's window re-based at row 0, the
+        // rows past it NaN so the twin's ctx stride equals the cache's.
+        let rebase = |b: &[u16], first: usize, rows: usize| -> Vec<u16> {
+            b.chunks(ctx * HEAD_64)
+                .flat_map(|p| {
+                    p[first * HEAD_64..(first + rows) * HEAD_64]
+                        .iter()
+                        .copied()
+                        .chain(std::iter::repeat_n(NAN16, (ctx - rows) * HEAD_64))
+                })
+                .collect()
+        };
+        let mut ok = true;
+
+        // Window off (module doc): the band, a rerun, the NaN rows past the
+        // count.
+        for &count in &H64_COUNTS {
+            let exacts: Vec<Exact64> = (0..n_head)
+                .map(|h| {
+                    let plane = (h / GROUP) * ctx * HEAD_64;
+                    exact64(
+                        &q[h * HEAD_64..(h + 1) * HEAD_64],
+                        &kf[plane..plane + count * HEAD_64],
+                        &vf[plane..plane + count * HEAD_64],
+                        count,
+                        scale,
+                        SEGMENTS,
+                    )
+                })
+                .collect();
+            let (nan_k, nan_v) = if count == 65 || count == H64_CTX {
+                (
+                    &DeviceBuffer::from_host(stream, &nanify(&kb, count))?,
+                    &DeviceBuffer::from_host(stream, &nanify(&vb, count))?,
+                )
+            } else {
+                (&kc, &vc)
+            };
+            for mma in [false, true] {
+                let name = if mma { "mma" } else { "scalar" };
+                let y = launch(&q, count, 0, mma, &kc, &vc)?;
+                let rerun = bits_equal(&y, &launch(&q, count, 0, mma, &kc, &vc)?);
+                let mut worst = 0.0f64;
+                let mut band = true;
+                for (h, ex) in exacts.iter().enumerate() {
+                    let bound = if mma { &ex.bound_mma } else { &ex.bound_ours };
+                    for d in 0..HEAD_64 {
+                        let e = (f64::from(y[h * HEAD_64 + d]) - ex.o[d]).abs() / bound[d];
+                        worst = worst.max(e);
+                        band &= e <= 1.0;
+                    }
+                }
+                let nan_same = if count == 65 || count == H64_CTX {
+                    bits_equal(&y, &launch(&q, count, 0, mma, nan_k, nan_v)?)
+                } else {
+                    true
+                };
+                let pass_ok = band && rerun && nan_same;
+                println!(
+                    "flash h64 window=0 count={count} pass={name} measured/bound {worst:.3e} \
+                     band={band} rerun={rerun} nan_past_count_same={nan_same} {}",
+                    verdict(pass_ok)
+                );
+                ok &= pass_ok;
+            }
+        }
+
+        // Window on (module doc): the band over the window's own keys, and
+        // the re-based twin bit for bit.
+        for &count in &H64_WIN_COUNTS {
+            let (first, n_w) = window_cut(count, H64_WINDOW);
+            let segs = window_segments(H64_WINDOW);
+            let exacts: Vec<Exact64> = (0..n_head)
+                .map(|h| {
+                    let plane = (h / GROUP) * ctx * HEAD_64;
+                    exact64(
+                        &q[h * HEAD_64..(h + 1) * HEAD_64],
+                        &kf[plane + first * HEAD_64..plane + count * HEAD_64],
+                        &vf[plane + first * HEAD_64..plane + count * HEAD_64],
+                        n_w,
+                        scale,
+                        segs,
+                    )
+                })
+                .collect();
+            let (rk, rv) = (
+                DeviceBuffer::from_host(stream, &rebase(&kb, first, n_w))?,
+                DeviceBuffer::from_host(stream, &rebase(&vb, first, n_w))?,
+            );
+            for mma in [false, true] {
+                let name = if mma { "mma" } else { "scalar" };
+                let y = launch(&q, count, H64_WINDOW, mma, &kc, &vc)?;
+                let mut worst = 0.0f64;
+                let mut band = true;
+                for (h, ex) in exacts.iter().enumerate() {
+                    let bound = if mma { &ex.bound_mma } else { &ex.bound_ours };
+                    for d in 0..HEAD_64 {
+                        let e = (f64::from(y[h * HEAD_64 + d]) - ex.o[d]).abs() / bound[d];
+                        worst = worst.max(e);
+                        band &= e <= 1.0;
+                    }
+                }
+                let twin = launch(&q, n_w, 0, mma, &rk, &rv)?;
+                let twin_same = bits_equal(&y, &twin);
+                let pass_ok = band && twin_same;
+                println!(
+                    "flash h64 window={H64_WINDOW} count={count} first={first} pass={name} \
+                     measured/bound {worst:.3e} band={band} rebased_twin_bit_same={twin_same} {}",
+                    verdict(pass_ok)
+                );
+                ok &= pass_ok;
+            }
+        }
+
+        // The prefill shape (module doc): one launch of ROWS rotated rows at
+        // spread counts, each bit for bit its one-row launch.
+        let rows: Vec<Vec<f32>> = (0..ROWS)
+            .map(|t| {
+                (0..n_head)
+                    .flat_map(|h| q[((h + t) % n_head) * HEAD_64..][..HEAD_64].iter().copied())
+                    .collect()
+            })
+            .collect();
+        let limits = spread_counts(ctx)?;
+        let rq = DeviceBuffer::from_host(stream, &rows.concat())?;
+        let lk = DeviceBuffer::from_host(stream, &limits)?;
+        for window in [0, H64_WINDOW] {
+            for mma in [false, true] {
+                let name = if mma { "mma" } else { "scalar" };
+                let all = run_once_64(k, run, &rq, &lk, (&kc, &vc), scale, n_kv, ctx, window, mma)?;
+                let mut same = true;
+                for (t, row) in rows.iter().enumerate() {
+                    let one = run_once_64(
+                        k,
+                        run,
+                        &DeviceBuffer::from_host(stream, row)?,
+                        &DeviceBuffer::from_host(stream, &limits[t..=t])?,
+                        (&kc, &vc),
+                        scale,
+                        n_kv,
+                        ctx,
+                        window,
+                        mma,
+                    )?;
+                    same &=
+                        bits_equal(&all[t * n_head * HEAD_64..(t + 1) * n_head * HEAD_64], &one);
+                }
+                println!(
+                    "flash h64 rows m={ROWS} window={window} pass={name} keys={limits:?} ctx={ctx}: \
+                     each row = its one-row launch bit for bit {}",
+                    verdict(same)
+                );
+                ok &= same;
+            }
+        }
+
+        // The fault rows (module doc): row 3 one past the cache, row 5 zero,
+        // at both windows, labelled with layer 13.
+        for window in [0, H64_WINDOW] {
+            let layer = 13usize;
+            let faulted = (stream, gpu.layer_sink(layer)?);
+            let want = Some(Fault::at(u32::try_from(layer)?, FaultSite::KeyCount));
+            let (bad_hi, bad_zero) = (3usize, 5usize);
+            let mut bad = limits.clone();
+            bad[bad_hi] = u32::try_from(ctx + 1)?;
+            bad[bad_zero] = 0;
+            let bad_d = DeviceBuffer::from_host(stream, &bad)?;
+            let before = gpu.fault()?;
+            let y = run_once_64(
+                k,
+                faulted,
+                &rq,
+                &lk,
+                (&kc, &vc),
+                scale,
+                n_kv,
+                ctx,
+                window,
+                false,
+            )?;
+            let after_clean = gpu.fault()?;
+            let yb = run_once_64(
+                k,
+                faulted,
+                &rq,
+                &bad_d,
+                (&kc, &vc),
+                scale,
+                n_kv,
+                ctx,
+                window,
+                false,
+            )?;
+            let raised = gpu.take_fault()?;
+            let mut others_same = true;
+            let mut bad_nan = true;
+            let w = n_head * HEAD_64;
+            for r in 0..ROWS {
+                let (a, b) = (&y[r * w..(r + 1) * w], &yb[r * w..(r + 1) * w]);
+                if r == bad_hi || r == bad_zero {
+                    bad_nan &= b.iter().all(|v| v.is_nan());
+                } else {
+                    others_same &= bits_equal(a, b);
+                }
+            }
+            let y2 = run_once_64(
+                k,
+                faulted,
+                &rq,
+                &lk,
+                (&kc, &vc),
+                scale,
+                n_kv,
+                ctx,
+                window,
+                false,
+            )?;
+            let clean_again = bits_equal(&y, &y2) && gpu.fault()?.is_none();
+            let pass = before.is_none()
+                && after_clean.is_none()
+                && raised == want
+                && bad_nan
+                && others_same
+                && clean_again;
+            println!(
+                "flash h64 fault window={window} m={ROWS} counts {} (past ctx {}) and 0 at rows \
+                 {bad_hi}, {bad_zero}: word \"{}\" (want \"{}\", clean before {} and after the \
+                 clean run {}), those rows NaN {bad_nan}, other rows bit-identical {others_same}, \
+                 clean rerun bits and word clean {clean_again} {}",
+                ctx + 1,
+                ctx,
+                raised.map_or_else(|| "none".to_owned(), |f| f.to_string()),
+                want.map_or_else(String::new, |f| f.to_string()),
+                before.is_none(),
+                after_clean.is_none(),
+                verdict(pass)
+            );
+            ok &= pass;
+        }
+
+        // The captured launch (module doc): two nodes replaying the eager
+        // bits, the segment grid the window's own.
+        let nk1 = DeviceBuffer::from_host(stream, &[u32::try_from(ctx)?])?;
+        for window in [0, H64_WINDOW] {
+            let segs = window_segments(window);
+            for mma in [false, true] {
+                let name = if mma { "mma" } else { "scalar" };
+                let want = launch(&q, ctx, window, mma, &kc, &vc)?;
+                let (mut pv, mut pms, mut y) = (
+                    DeviceBuffer::<f32>::zeroed(stream, partials_v_len_64(1, n_head))?,
+                    DeviceBuffer::<f32>::zeroed(stream, partials_ms_len(1, n_head))?,
+                    DeviceBuffer::<f32>::zeroed(stream, n_head * HEAD_64)?,
+                );
+                let graph = gpu.capture(|s| {
+                    k.enqueue_pass_64(
+                        s,
+                        Gqa64Args {
+                            q: &qd,
+                            kc: &kc,
+                            vc: &vc,
+                            n_keys: &nk1,
+                            scale,
+                            n_kv,
+                            ctx,
+                            m: 1,
+                            window,
+                            part_v: &mut pv,
+                            part_ms: &mut pms,
+                            fault: gpu.unlabelled_sink(),
+                            y: &mut y,
+                        },
+                        mma,
+                    )
+                })?;
+                graph.launch(stream)?;
+                stream.synchronize()?;
+                let nodes = graph.nodes()?;
+                let grids = |prefix: &str| -> Vec<[u32; 3]> {
+                    nodes
+                        .iter()
+                        .filter_map(|n| n.kernel.as_ref())
+                        .filter(|kn| kn.name.starts_with(prefix))
+                        .map(|kn| kn.grid)
+                        .collect()
+                };
+                let (seg, merge) = (grids("gqa_flash_seg"), grids("gqa_flash_merge"));
+                let want_seg = vec![[u32::try_from(n_kv * segs)?, 1, 1]];
+                let want_merge = vec![[u32::try_from(n_head)?, 1, 1]];
+                let shape = nodes.len() == 2
+                    && nodes.iter().all(|n| n.kernel.is_some())
+                    && seg == want_seg
+                    && merge == want_merge;
+                let same = bits_equal(&y.to_host_vec(stream)?, &want);
+                let pass = shape && same;
+                println!(
+                    "flash h64 graph window={window} pass={name} nodes={} seg_grids={seg:?} (want \
+                     {want_seg:?}) merge_grids={merge:?} (want {want_merge:?}) \
+                     replay_bits_eager={same} {}",
+                    nodes.len(),
+                    verdict(pass)
+                );
+                ok &= pass;
+            }
+        }
+
+        // A `part_v` one short: refused by name.
+        let mut pv = DeviceBuffer::<f32>::zeroed(stream, partials_v_len_64(1, n_head) - 1)?;
+        let mut pms = DeviceBuffer::<f32>::zeroed(stream, partials_ms_len(1, n_head))?;
+        let mut yr = DeviceBuffer::<f32>::zeroed(stream, n_head * HEAD_64)?;
+        let r = k.enqueue_pass_64(
+            stream,
+            Gqa64Args {
+                q: &qd,
+                kc: &kc,
+                vc: &vc,
+                n_keys: &nk1,
+                scale,
+                n_kv,
+                ctx,
+                m: 1,
+                window: 0,
+                part_v: &mut pv,
+                part_ms: &mut pms,
+                fault: unl,
+                y: &mut yr,
+            },
+            false,
+        );
+        let named = matches!(
+            &r,
+            Err(GpuError::Shape {
+                what: "flash_gqa::enqueue_64",
+                detail,
+            }) if detail.contains("part_v.len()")
+        );
+        println!(
+            "flash h64 part_v one short refused by name {named} {}",
+            verdict(named)
+        );
+        ok &= named;
+        Ok(ok)
+    }
+
     pub fn run() -> Result<(), GateError> {
         // A lever set to a value it does not take, or a retired name that is
         // set, is refused by name before anything loads.
@@ -2417,6 +2954,7 @@ mod gate {
         ok &= q8_window_refusal(&kp, &gpu, scale)?;
         ok &= group5(&k, &gpu, scale)?;
         ok &= group16(&k, &gpu, scale)?;
+        ok &= head64(&k, &gpu, 1.0f32 / (HEAD_64 as f32).sqrt())?;
         println!("gate_qwen3moe_flash: {}", verdict(ok));
         if !ok {
             return Err(checks_failed());

@@ -1,4 +1,4 @@
-//! A Bolt load whose routed experts the card cannot all hold: the plan's card
+//! A nemotron_h_moe load whose routed experts the card does not all hold: the plan's card
 //! segment of each layer's stacks resident, the rest served by the common
 //! host tier ([`crate::host`]) in relu². A layer the plan holds whole runs the
 //! whole-card layer ([`super::moe::moe_layer`]); a layer with a host share
@@ -11,8 +11,9 @@
 //!   with each slot's place in the card's stacks, and the go;
 //! - **shadow**, under the host's work: the shared expert's up, then the
 //!   card's slots (the latent's q8_1, up, squared ReLU, down over the places
-//!   the handoff wrote; a [`HOST`](crate::hybrid::HOST) slot's warps return
-//!   before their first load), then the shared expert's down;
+//!   the handoff wrote, in the layer's form, [`super::moe::card_slots`]; a
+//!   [`HOST`](crate::hybrid::HOST) slot's warps return before their first
+//!   load), then the shared expert's down;
 //! - **back**: the wait, the card's slots' weighted sum (`ds41_ffn_card_acc_9`,
 //!   the places below the layer's card count) plus the host's sum in the latent,
 //!   the latent up, the shared expert, the residual.
@@ -32,7 +33,9 @@
 //! map's rows cover every layer, only the MoE layers' hold experts).
 
 use super::body::Layer;
-use super::moe::{MoeKernels, MoeLayer, MoeScratch, MoeShape, Shared, one_expert, stack};
+use super::moe::{
+    MoeKernels, MoeLayer, MoeScratch, MoeShape, Shared, card_down, card_slots, one_expert,
+};
 use crate::arch::hybrid::{self, Acts, Cx, gqa_layer, mamba_layer, residual};
 use crate::card_slots::{CardAcc, CardSlotKernels, ColPlaces};
 use crate::fault::FaultSink;
@@ -42,13 +45,12 @@ use crate::host::handoff::{Handoff, HandoffKernels};
 use crate::host::run::{HostRun, HostWidths};
 use crate::host::served::{ResidencyParts, TierBody};
 use crate::hybrid::{Boundary, BoundaryShape, Chain, HostResidency, Hybrid, SlotMap};
-use crate::kquant::SelDown;
 use crate::routed_block::handoff_go;
 use crate::tensor::DeviceTensor;
 use crate::{Gpu, GpuError};
 use bloomery_levers::HostCfg;
 use cuda_core::{CudaStream, DeviceBuffer};
-use gguf::{GgmlType, Split};
+use gguf::Split;
 use model::arch::nemotron_h_moe::host::routed_layers;
 use model::arch::nemotron_h_moe::hparams::Hparams;
 use model::moe::UNION_MAX_COLS;
@@ -73,14 +75,14 @@ pub(super) fn plan_map(plan: &Plan<'_>, hp: &Hparams) -> Result<(SlotMap, usize)
         .cards
         .first()
         .ok_or(GpuError::shape(WHAT, "a plan of no card"))?;
-    if plan.machine.cards.len() != 1 || !plan.machine.tiers.is_empty() || spec.layers != (0..n) {
+    let n_tiers = plan.machine.expert_tiers().count();
+    if plan.machine.cards.len() != 1 || n_tiers != 0 || spec.layers != (0..n) {
         return Err(GpuError::shape(
             WHAT,
             format!(
-                "a plan of {} cards and {} expert tiers, card 0 running layers {:?}; the body \
-                 runs every layer (0..{n}) on one card with no expert tier",
+                "a plan of {} cards and {n_tiers} expert tiers, card 0 running layers {:?}; the \
+                 body runs every layer (0..{n}) on one card with no expert tier",
                 plan.machine.cards.len(),
-                plan.machine.tiers.len(),
                 spec.layers
             ),
         ));
@@ -418,7 +420,6 @@ fn shadow(
 ) -> Result<(), GpuError> {
     let (gpu, what) = (cx.gpu, cx.what);
     let stream = gpu.stream();
-    let fault = gpu.layer_sink(l)?;
     {
         // The shared expert's up reads the norm's (hidden, 1) q8_1 form
         // before the experts' quantize may overwrite it (`moe`'s module doc);
@@ -434,27 +435,8 @@ fn shadow(
         }
     }
     if m.n_card > 0 {
-        let width = sh.width;
-        let act = acts.q8_1_at(what, width, 1)?;
-        gpu.enqueue_quantize_q8_1_layer(leg.hybrid().boundary().normed(), act, l)?;
-        let up = SelDown {
-            w: stack(cx.w, what, m.up()?)?,
-            act,
-            sel: &side.sel,
-            n_slots: sh.top_k,
-            rows_per_expert: m.ff,
-        };
-        k.iq.enqueue_gemv_sel_cols(stream, GgmlType::IQ2_XXS, &up, sh.top_k, fault, &mut s.up)?;
-        let act = acts.q8_1_at(what, m.ff, sh.top_k)?;
-        gpu.enqueue_quantize_q8_1_layer_relu_sqr(&s.up, act, l)?;
-        let down = SelDown {
-            w: stack(cx.w, what, m.down()?)?,
-            act,
-            sel: &side.sel,
-            n_slots: sh.top_k,
-            rows_per_expert: width,
-        };
-        k.iq.enqueue_gemv_sel(stream, GgmlType::IQ2_XXS, &down, fault, &mut s.down)?;
+        let input = leg.hybrid().boundary().normed();
+        card_slots(cx, (k, sh), (l, m), (input, &side.sel), (s.slots(), acts))?;
     }
     match &m.shared {
         Shared::Sel { down, .. } => {
@@ -491,7 +473,7 @@ fn back(
             side.acc_k.enqueue_card_acc(
                 stream,
                 &CardAcc {
-                    down: &s.down,
+                    down: card_down(m, s)?,
                     w: m.route.weights(),
                     sel: &side.sel,
                     n: width,

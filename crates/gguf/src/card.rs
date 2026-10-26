@@ -55,12 +55,13 @@
 //!   over two weight planes, with a fused weighted combine. The MXFP4 entries
 //!   are that file's per-slot pair over the file's own blocks.
 //! - `crates/gpu/src/iq.rs`'s `IqFormat` plane row cores (IQ2_XS, IQ3_XXS,
-//!   IQ4_XS, Q2_K) are run by gates only; IQ2_XS, IQ3_XXS, IQ3_S and IQ4_XS
-//!   reach a launch through `crates/gpu/src/iq_sel.rs`, their entries (IQ3_S
-//!   has no plane row core). Q2_K has no launcher of that shape.
-//! - V4.1's BF16 and Q3_K embedding rows (`chain/glue.rs` in
-//!   `crates/gpu-deepseek41`): the BF16 rows are that family's own; the
-//!   Q3_K rows have the common entry.
+//!   IQ4_XS, Q2_K) are run by gates only; IQ2_XS, IQ2_S, IQ1_S, IQ1_M, IQ3_XXS,
+//!   IQ3_S and IQ4_XS reach a launch through `crates/gpu/src/iq_sel.rs`, their
+//!   entries (IQ2_S, IQ1_S, IQ1_M and IQ3_S have no plane row core). Q2_K has
+//!   no launcher of that shape.
+//! - V4.1's BF16, Q3_K and Q5_K embedding rows and its IQ4_NL Engram rows
+//!   (`chain/glue.rs` in `crates/gpu-deepseek41`): the BF16 and IQ4_NL rows
+//!   are that family's own; the Q3_K and Q5_K rows have the common entry.
 //! - The grouped tile entries (`crates/gpu/src/kquant/tiles.rs`, and
 //!   `grouped_tiles` and `q4k_gemv_tiles` in `crates/gpu/src/q4k_sel.rs`) run
 //!   the Q4_K and Q5_K stacks the `_sel` entries already name and add no type.
@@ -92,9 +93,22 @@ pub enum GateUpEntry {
     /// `block_q6_K` stream over the `Q8Act`'s q6 plane) in
     /// `crates/gpu/src/q6k_sel.rs`.
     Q6k,
+    /// `QuantSelKernels::enqueue_gate_up` (`iq2_xxs_gate_up_sel`, the file's
+    /// 66-byte `block_iq2_xxs` stream through the block's shared table) in
+    /// `crates/gpu/src/iq_sel.rs`.
+    Iq2xxs,
     /// `QuantSelKernels::enqueue_gate_up` (`iq2_xs_gate_up_sel`, the file's
     /// 74-byte `block_iq2_xs` stream) in `crates/gpu/src/iq_sel.rs`.
     Iq2xs,
+    /// `QuantSelKernels::enqueue_gate_up` (`iq2_s_gate_up_sel`, the file's
+    /// 82-byte `block_iq2_s` stream) in `crates/gpu/src/iq_sel.rs`.
+    Iq2s,
+    /// `QuantSelKernels::enqueue_gate_up` (`iq1_s_gate_up_sel`, the file's
+    /// 50-byte `block_iq1_s` stream) in `crates/gpu/src/iq_sel.rs`.
+    Iq1s,
+    /// `QuantSelKernels::enqueue_gate_up` (`iq1_m_gate_up_sel`, the file's
+    /// 56-byte `block_iq1_m` stream) in `crates/gpu/src/iq_sel.rs`.
+    Iq1m,
     /// `QuantSelKernels::enqueue_gate_up` (`iq3_xxs_gate_up_sel`) in
     /// `crates/gpu/src/iq_sel.rs`.
     Iq3xxs,
@@ -137,9 +151,22 @@ pub enum DownEntry {
     /// 256-value super-blocks, `Q8Act`) in `crates/gpu/src/kquant/sel.rs`,
     /// which no model body launches.
     Q8_0,
+    /// `QuantSelKernels::enqueue_gemv_sel_cols` (`iq2_xxs_gemv_sel`, over
+    /// `Q8Act` through the block's shared table, `slots_per_col` 1 for a
+    /// down) in `crates/gpu/src/iq_sel.rs`.
+    Iq2xxs,
     /// `QuantSelKernels::enqueue_gemv_sel` (`iq2_xs_gemv_sel`, over `Q8Act`) in
     /// `crates/gpu/src/iq_sel.rs`.
     Iq2xs,
+    /// `QuantSelKernels::enqueue_gemv_sel` (`iq2_s_gemv_sel`, over `Q8Act`) in
+    /// `crates/gpu/src/iq_sel.rs`.
+    Iq2s,
+    /// `QuantSelKernels::enqueue_gemv_sel` (`iq1_s_gemv_sel`, over `Q8Act`) in
+    /// `crates/gpu/src/iq_sel.rs`.
+    Iq1s,
+    /// `QuantSelKernels::enqueue_gemv_sel` (`iq1_m_gemv_sel`, over `Q8Act`) in
+    /// `crates/gpu/src/iq_sel.rs`.
+    Iq1m,
     /// `QuantSelKernels::enqueue_gemv_sel` (`iq3_xxs_gemv_sel`, over `Q8Act`) in
     /// `crates/gpu/src/iq_sel.rs`.
     Iq3xxs,
@@ -188,6 +215,14 @@ pub enum GemmEntry {
     Q6k,
     /// `GemmWeight::Iq2Xxs` (`gemm_iq2xxs`).
     Iq2xxs,
+    /// `GemmWeight::Iq2Xs` (`gemm_iq2xs`).
+    Iq2xs,
+    /// `GemmWeight::Iq2S` (`gemm_iq2s`).
+    Iq2s,
+    /// `GemmWeight::Iq1S` (`gemm_iq1s`).
+    Iq1s,
+    /// `GemmWeight::Iq1M` (`gemm_iq1m`).
+    Iq1m,
     /// `GemmWeight::Iq3Xxs` (`gemm_iq3xxs`).
     Iq3xxs,
     /// `GemmWeight::Iq3S` (`gemm_iq3s`).
@@ -355,6 +390,11 @@ pub enum HeadEntry {
     /// `Q8F32Kernels::enqueue_bf16_gemv` over BF16 words and normed f32 rows,
     /// then `argmax_finite_fault`.
     Bf16,
+    /// The q8_1 quantizer, the `_sel` Q5_K gemv over the matrix as one expert
+    /// (`QuantSelKernels::enqueue_gemv_q5k_sel`), then `argmax_fault`; one
+    /// row (`m = 1`), whose logits the sel gemv writes in the layout the
+    /// argmax reads.
+    Q5k,
 }
 
 /// A card embedding row lookup: the rows of the ids dequantized token-major,
@@ -392,7 +432,11 @@ impl DownEntry {
             | DownEntry::Q6k
             | DownEntry::Q5_1
             | DownEntry::Q8_0
+            | DownEntry::Iq2xxs
             | DownEntry::Iq2xs
+            | DownEntry::Iq2s
+            | DownEntry::Iq1s
+            | DownEntry::Iq1m
             | DownEntry::Iq3xxs
             | DownEntry::Iq3s
             | DownEntry::Iq4xs
@@ -474,6 +518,10 @@ macro_rules! card {
 }
 pub(crate) use card;
 
+/// The values of one block of [`CardFormat::Nvfp4Planes`]: NVFP4's block, 32 code bytes and four
+/// UE4M3 scales, whichever NVFP4 file type the planes were made from.
+const NVFP4_PLANES_BLOCK: u64 = 64;
+
 impl GgmlType {
     /// The card columns of the type's row; `Card::NONE` for a tag with no
     /// row, which has no layout and no entry.
@@ -551,10 +599,11 @@ impl CardFormat {
     /// [`Card::layout`]; `None` when the loader has none. `None` is not a
     /// refusal by itself: a routed stack of such a type stays on the host,
     /// and a tensor its role puts on a card is refused by the plan with
-    /// `placement::PlacementError::NoCardFormat`. IQ2_XXS loads in the file's
-    /// blocks ([`CardFormat::KQuant`]), which `iq2_xxs_gemv_sel` reads for a
-    /// routed stack and for a dense matrix as a stack of one expert (the
-    /// latent MoE body's shared expert).
+    /// `placement::PlacementError::NoCardFormat`. IQ2_XXS, IQ2_XS, IQ2_S,
+    /// IQ1_S and IQ1_M load in the file's blocks ([`CardFormat::KQuant`]),
+    /// which `iq2_xxs_gemv_sel` and its kin read for a routed stack and for a
+    /// dense matrix as a stack of one expert (the latent MoE body's shared
+    /// expert).
     #[must_use]
     pub fn of(ty: GgmlType) -> Option<CardFormat> {
         ty.card().layout
@@ -564,8 +613,9 @@ impl CardFormat {
     /// this format, in bytes, in the order the upload allocates them: q8_0's
     /// code plane, then its scale plane; one buffer in every other format —
     /// the upload's own arithmetic. `None` exactly where the upload refuses: a
-    /// zero dimension, `k` off the type's block, or a `ty` this format is not
-    /// the loader's format for.
+    /// zero dimension, `k` off the type's block (off the planes' 64-value block
+    /// for [`CardFormat::Nvfp4Planes`]), or a `ty` this format is not the
+    /// loader's format for.
     #[must_use]
     pub fn buffer_bytes(self, ty: GgmlType, k: u64, rows: u64) -> Option<Vec<u64>> {
         let blck = ty.blck_size()?;
@@ -600,10 +650,12 @@ impl CardFormat {
                 ]
             }
             CardFormat::Nvfp4Planes => {
-                vec![
-                    rows.checked_mul(blocks.checked_mul(32)?)?,
-                    rows.checked_mul(blocks.checked_mul(4)?)?,
-                ]
+                // The planes hold NVFP4's 64-value blocks whatever the file's block (NVFP4_ROWS
+                // groups 16): a code nibble a value and a UE4M3 scale a 16 values.
+                if !k.is_multiple_of(NVFP4_PLANES_BLOCK) {
+                    return None;
+                }
+                vec![rows.checked_mul(k / 2)?, rows.checked_mul(k / 16)?]
             }
             CardFormat::Mxfp8Planes => {
                 // Whole scale words a row: a row's four blocks a word.
@@ -650,7 +702,7 @@ impl CardFormat {
     /// [`CardFormat::Bf16Raw`] for bf16, which only a reader that picks it
     /// uses, or the layout a routed card entry of `ty` reads a stack in
     /// (`DownEntry::layout`): the file's blocks
-    /// ([`CardFormat::KQuant`]) of q5_1, q8_0, iq2_xs, iq3_xxs, iq3_s,
+    /// ([`CardFormat::KQuant`]) of q5_1, q8_0, iq2_xs, iq2_s, iq1_s, iq1_m, iq3_xxs, iq3_s,
     /// iq4_xs, iq4_nl and mxfp4, which only a program's
     /// `placement::RoutedFormat` picks.
     #[must_use]
@@ -687,5 +739,29 @@ impl CardFormat {
         self.buffer_bytes(ty, k, rows)?
             .into_iter()
             .try_fold(0u64, u64::checked_add)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CardFormat;
+    use crate::quant::GgmlType;
+
+    /// NVFP4's planes hold a code nibble a value and a UE4M3 scale a 16 values, whichever NVFP4
+    /// file type they were made from: NVFP4's 64-value blocks and NVFP4_ROWS' 16-value groups
+    /// count the same bytes, and a width off the planes' 64-value block is refused for both.
+    /// Mutant, the count before NVFP4_ROWS loaded in planes: blocks of the file type's own block
+    /// (NVFP4_ROWS: four times the codes and scales).
+    #[test]
+    fn nvfp4_planes_count_from_the_planes_geometry() {
+        let planes = CardFormat::Nvfp4Planes;
+        let (k, rows) = (512, 3);
+        let want = Some(vec![rows * k / 2, rows * k / 16]);
+        assert_eq!(planes.buffer_bytes(GgmlType::NVFP4, k, rows), want);
+        assert_eq!(planes.buffer_bytes(GgmlType::NVFP4_ROWS, k, rows), want);
+        for ty in [GgmlType::NVFP4_ROWS, GgmlType::NVFP4] {
+            assert_eq!(planes.buffer_bytes(ty, 48, rows), None, "{ty}");
+        }
+        assert_eq!(planes.buffer_bytes(GgmlType::NVFP4_ROWS, 96, rows), None);
     }
 }

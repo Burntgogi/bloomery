@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use gguf::Split;
 use model::moe::{HostLayer, HostScratch, UNION_MAX_COLS, UnionScratch};
+use model::ops::PostNorm;
 use model::r8file::{R8Pair, R8Source};
 use model::{Tensor2, Tensor2View};
 
@@ -379,6 +380,83 @@ impl HostRun {
     }
 }
 
+impl HostRun {
+    /// Give layer `layer` the norm each of its routed experts' output rows
+    /// takes before the row's weight ([`PostNorm`]): `gain` the layer's
+    /// post-expert weight, `embd` values, and `eps` the norm's epsilon. The
+    /// layer holds it ([`HostLayer::set_post_norm`]), so every call that
+    /// serves the layer returns the sum of the normed, weighted rows, the norm
+    /// taken in the leg's own sum; a layer without one keeps the plain
+    /// weighted sum. Load-time only. Refused by name: a layer with no host
+    /// share, a gain of another width and an epsilon that is not finite and
+    /// positive.
+    pub fn set_post_norm(
+        &mut self,
+        layer: usize,
+        gain: Vec<f32>,
+        eps: f32,
+    ) -> Result<(), GpuError> {
+        const WHAT: &str = "HostRun::set_post_norm";
+        view_of(&self.layers, layer, WHAT)?;
+        if gain.len() != self.widths.embd {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "layer {layer}: a gain of {} values for rows of {}",
+                    gain.len(),
+                    self.widths.embd
+                ),
+            ));
+        }
+        let Some(post) = PostNorm::new(gain, eps) else {
+            return Err(GpuError::shape(
+                WHAT,
+                format!("layer {layer}: an epsilon of {eps}, finite and positive wanted"),
+            ));
+        };
+        self.layers[layer]
+            .as_mut()
+            .expect("view_of found the layer's host view")
+            .set_post_norm(post)?;
+        Ok(())
+    }
+
+    /// The union call of layer `layer` (`step`: the step port's form, whose
+    /// NVMe ids read from the arena).
+    fn union_call(
+        &mut self,
+        layer: usize,
+        x: Tensor2View<'_>,
+        lists: &[&[(u32, f32)]],
+        out: &mut [f32],
+        step: bool,
+    ) -> Result<(), GpuError> {
+        let what = if step {
+            "HostRun::experts_step_union_into"
+        } else {
+            "HostRun::experts_union_into"
+        };
+        if self.zero_sum(layer, lists, (x.ne0(), x.ne1()), out, what)? {
+            return Ok(());
+        }
+        let (view, src, scratch) = self.union_of(layer, what)?;
+        if step {
+            view.experts_step_union_into(src, x, lists, out, scratch)?;
+        } else {
+            view.experts_union_into(src, x, lists, out, scratch)?;
+        }
+        // A layer with an arena reads the ids it serves from the arena's
+        // slots, batch by batch; the plan's host segment and a layer with
+        // none read the mapping.
+        self.reads.arena_or_file(
+            self.tier.as_deref(),
+            layer,
+            lists.iter().flat_map(|l| l.iter().map(|&(id, _)| id)),
+        );
+        Ok(())
+    }
+}
+
 impl HostExperts for HostRun {
     fn experts_into(
         &mut self,
@@ -446,21 +524,7 @@ impl HostExperts for HostRun {
         lists: &[&[(u32, f32)]],
         out: &mut [f32],
     ) -> Result<(), GpuError> {
-        const WHAT: &str = "HostRun::experts_union_into";
-        if self.zero_sum(layer, lists, (x.ne0(), x.ne1()), out, WHAT)? {
-            return Ok(());
-        }
-        let (view, src, scratch) = self.union_of(layer, WHAT)?;
-        view.experts_union_into(src, x, lists, out, scratch)?;
-        // A layer with an arena reads the ids it serves from the arena's
-        // slots, batch by batch; the plan's host segment and a layer with
-        // none read the mapping.
-        self.reads.arena_or_file(
-            self.tier.as_deref(),
-            layer,
-            lists.iter().flat_map(|l| l.iter().map(|&(id, _)| id)),
-        );
-        Ok(())
+        self.union_call(layer, x, lists, out, false)
     }
 
     /// The union with the NVMe tier's ids read from the arena
@@ -473,18 +537,7 @@ impl HostExperts for HostRun {
         lists: &[&[(u32, f32)]],
         out: &mut [f32],
     ) -> Result<(), GpuError> {
-        const WHAT: &str = "HostRun::experts_step_union_into";
-        if self.zero_sum(layer, lists, (x.ne0(), x.ne1()), out, WHAT)? {
-            return Ok(());
-        }
-        let (view, src, scratch) = self.union_of(layer, WHAT)?;
-        view.experts_step_union_into(src, x, lists, out, scratch)?;
-        self.reads.arena_or_file(
-            self.tier.as_deref(),
-            layer,
-            lists.iter().flat_map(|l| l.iter().map(|&(id, _)| id)),
-        );
-        Ok(())
+        self.union_call(layer, x, lists, out, true)
     }
 
     fn reads(&self) -> Option<HostReads> {
@@ -514,6 +567,19 @@ mod tests {
     /// `have` and nothing else, in a directory of its own that the test
     /// removes.
     fn file_with(have: &[(usize, usize)], dir: &std::path::Path) -> Arc<Split> {
+        file_with_data(have, dir, &|_, nbytes| {
+            let block = [[0x00, 0x24].as_slice(), &[1u8; 32]].concat();
+            block.repeat(nbytes / block.len())
+        })
+    }
+
+    /// [`file_with`] with the bytes of each stack `data` makes from its name and
+    /// byte count (a whole number of q8_0 blocks of 34 bytes).
+    fn file_with_data(
+        have: &[(usize, usize)],
+        dir: &std::path::Path,
+        data: &dyn Fn(&str, usize) -> Vec<u8>,
+    ) -> Arc<Split> {
         // The stacks' bytes: q8_0 rows of `k` columns, `rows` rows an expert.
         let bytes = |k: usize, rows: usize| 34 * (k / 32) * rows * EXPERTS;
         let decls: Vec<(String, Vec<u64>, usize)> = have
@@ -544,11 +610,10 @@ mod tests {
         .unwrap();
         let path = dir.join("model.gguf");
         let mut writer = Writer::new(std::fs::File::create_new(&path).unwrap(), layout).unwrap();
-        let block = [[0x00, 0x24].as_slice(), &[1u8; 32]].concat();
         for (name, _, nbytes) in &decls {
-            let data = block.repeat(nbytes / block.len());
-            assert_eq!(data.len(), *nbytes);
-            writer.tensor(name, &data).unwrap();
+            let bytes = data(name, *nbytes);
+            assert_eq!(bytes.len(), *nbytes);
+            writer.tensor(name, &bytes).unwrap();
         }
         writer.finish().unwrap();
         Arc::new(Split::open(&path).unwrap())
@@ -561,6 +626,19 @@ mod tests {
         ff_of: fn(usize) -> usize,
         body: impl FnOnce(Arc<Split>) + std::panic::UnwindSafe,
     ) {
+        with_file_data_ff(have, ff_of, None, body);
+    }
+
+    /// The bytes of a stack a test file holds, from its name and byte count.
+    type StackData<'a> = &'a dyn Fn(&str, usize) -> Vec<u8>;
+
+    /// [`with_file_ff`] over the bytes `data` makes, the repeated block's when `None`.
+    fn with_file_data_ff(
+        have: &[usize],
+        ff_of: fn(usize) -> usize,
+        data: Option<StackData<'_>>,
+        body: impl FnOnce(Arc<Split>) + std::panic::UnwindSafe,
+    ) {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
         let dir = std::env::temp_dir().join(format!(
             "bloomery-host-run-{}-{}",
@@ -569,7 +647,10 @@ mod tests {
         ));
         std::fs::create_dir(&dir).unwrap();
         let have: Vec<(usize, usize)> = have.iter().map(|&l| (l, ff_of(l))).collect();
-        let file = file_with(&have, &dir);
+        let file = match data {
+            Some(data) => file_with_data(&have, &dir, data),
+            None => file_with(&have, &dir),
+        };
         let result = std::panic::catch_unwind(move || body(file));
         std::fs::remove_dir_all(&dir).unwrap();
         if let Err(panic) = result {
@@ -817,5 +898,183 @@ mod tests {
             let e = run.prepare_union(3).unwrap_err().to_string();
             assert!(e.contains("slabs for 3 columns"), "{e}");
         });
+    }
+
+    /// The bytes of a stack whose experts differ in direction, not only in
+    /// scale: block `b` of expert `e` holds the quants `(13b + 5i + 7e) % 23 - 11`
+    /// under one scale, so a norm of the experts' sum is not the sum of their
+    /// norms.
+    fn distinct(_name: &str, nbytes: usize) -> Vec<u8> {
+        let blocks = nbytes / 34;
+        let per_expert = blocks / EXPERTS;
+        (0..blocks)
+            .flat_map(|b| {
+                let e = b / per_expert;
+                let quants = (0..32).map(move |i| ((13 * b + 5 * i + 7 * e) % 23) as i8 - 11);
+                [0x00u8, 0x24].into_iter().chain(quants.map(|q| q as u8))
+            })
+            .collect()
+    }
+
+    /// A layer with a post-norm serves, in all three entries, the sum of each
+    /// listed expert's own down row normed and then weighted, in list order
+    /// from zero — bit for bit the plain run's per-expert rows through the
+    /// same norm, in a narrow union call and a wide one (its sums over the
+    /// pool) — an empty list zero, and a layer without one the plain run's
+    /// sum. FAIL-first: the norm of the weighted sum (or no norm) is
+    /// far from the rows' (the experts differ in direction), so a post path
+    /// that norms the aggregate or skips the norm fails here.
+    #[test]
+    fn a_post_norm_layer_norms_each_experts_row_before_its_weight() {
+        const SET: [usize; 2] = [1, 2];
+        // Columns of the wide call: past the narrow calls' columns.
+        const WIDE: usize = model::ops::DEFER_MAX_COLS + 4;
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        let column = |c: usize| Tensor2 {
+            ne0: WIDTH,
+            ne1: 1,
+            data: (0..WIDTH)
+                .map(|i| (((i * 31 + c * 17) % 97) as f32 - 48.0) / 120.0)
+                .collect(),
+        };
+        with_file_data_ff(
+            &SET,
+            |_| WIDTH,
+            Some(&distinct),
+            |file| {
+                let build = |file: Arc<Split>| {
+                    let mut run =
+                        HostRun::build_at(file, SET, false, WIDTHS, |src| views(src, &SET))
+                            .unwrap();
+                    run.prepare_union(WIDE).unwrap();
+                    run
+                };
+                let mut plain = build(Arc::clone(&file));
+                let mut post = build(file);
+                let gain: Vec<f32> = (0..WIDTH).map(|i| 0.5 + 0.01 * (i % 17) as f32).collect();
+                let eps = 1e-8f32;
+                post.set_post_norm(1, gain.clone(), eps).unwrap();
+                let norm = PostNorm::new(gain, eps).unwrap();
+                // The rule written out on the plain run's own rows.
+                let want = |plain: &mut HostRun, layer: usize, x: &Tensor2, list: &[(u32, f32)]| {
+                    let mut sum = vec![0.0f32; WIDTH];
+                    let mut agg = vec![0.0f32; WIDTH];
+                    for &(e, w) in list {
+                        let mut row = vec![0.0f32; WIDTH];
+                        plain
+                            .experts_into(layer, x, &[(e, 1.0)], &mut row, 1)
+                            .unwrap();
+                        for (a, &d) in agg.iter_mut().zip(&row) {
+                            *a += w * d;
+                        }
+                        norm.norm(&mut row);
+                        for (o, &d) in sum.iter_mut().zip(&row) {
+                            *o += w * d;
+                        }
+                    }
+                    (sum, agg)
+                };
+                let (x0, x1) = (column(0), column(1));
+                let l0: &[(u32, f32)] = &[(1, 0.75), (0, 0.25)];
+                let l1: &[(u32, f32)] = &[(1, 0.5)];
+                let (want0, agg0) = want(&mut plain, 1, &x0, l0);
+                let (want1, _) = want(&mut plain, 1, &x1, l1);
+                let far = |a: &[f32], b: &[f32]| {
+                    let num: f64 = a
+                        .iter()
+                        .zip(b)
+                        .map(|(&a, &b)| f64::from(a - b).powi(2))
+                        .sum();
+                    let den: f64 = b.iter().map(|&b| f64::from(b).powi(2)).sum();
+                    (num / den).sqrt()
+                };
+                let mut agg_normed = agg0.clone();
+                norm.norm(&mut agg_normed);
+                assert!(
+                    far(&agg_normed, &want0) > 1e-3,
+                    "the experts' rows must differ in direction for the rule to tell its order from the aggregate's"
+                );
+                let mut plain_sum = vec![0.0f32; WIDTH];
+                plain.experts_into(1, &x0, l0, &mut plain_sum, 1).unwrap();
+                assert!(
+                    far(&plain_sum, &want0) > 1e-3,
+                    "the post-norm moves the plain sum"
+                );
+
+                let mut got = vec![7.0f32; WIDTH];
+                post.experts_into(1, &x0, l0, &mut got, 1).unwrap();
+                assert_eq!(bits(&got), bits(&want0), "the column call");
+                let mut two = Tensor2 {
+                    ne0: WIDTH,
+                    ne1: 2,
+                    data: x0.data.clone(),
+                };
+                two.data.extend_from_slice(&x1.data);
+                let lists = [l0, l1];
+                for union in [
+                    HostExperts::experts_union_into,
+                    HostExperts::experts_step_union_into,
+                ] {
+                    let mut out = vec![7.0f32; 2 * WIDTH];
+                    union(&mut post, 1, two.view(), &lists, &mut out).unwrap();
+                    assert_eq!(bits(&out[..WIDTH]), bits(&want0), "union column 0");
+                    assert_eq!(bits(&out[WIDTH..]), bits(&want1), "union column 1");
+                }
+                // A call past the narrow ones' columns runs its sums over the
+                // pool; every column is still the rule's.
+                let wide = Tensor2 {
+                    ne0: WIDTH,
+                    ne1: WIDE,
+                    data: (0..WIDE)
+                        .flat_map(|j| if j % 2 == 0 { &x0.data } else { &x1.data })
+                        .copied()
+                        .collect(),
+                };
+                let wide_lists: Vec<&[(u32, f32)]> = (0..WIDE)
+                    .map(|j| if j % 2 == 0 { l0 } else { l1 })
+                    .collect();
+                for union in [
+                    HostExperts::experts_union_into,
+                    HostExperts::experts_step_union_into,
+                ] {
+                    let mut out = vec![7.0f32; WIDE * WIDTH];
+                    union(&mut post, 1, wide.view(), &wide_lists, &mut out).unwrap();
+                    for (j, col) in out.as_chunks::<WIDTH>().0.iter().enumerate() {
+                        let want = if j % 2 == 0 { &want0 } else { &want1 };
+                        assert_eq!(bits(col), bits(want), "wide union column {j}");
+                    }
+                }
+                let mut empty = vec![7.0f32; WIDTH];
+                post.experts_into(1, &x0, &[], &mut empty, 1).unwrap();
+                assert!(
+                    empty.iter().all(|&v| v == 0.0),
+                    "an empty list sums to zero"
+                );
+                let mut other = vec![7.0f32; WIDTH];
+                let mut want_other = vec![7.0f32; WIDTH];
+                post.experts_into(2, &x0, l0, &mut other, 1).unwrap();
+                plain.experts_into(2, &x0, l0, &mut want_other, 1).unwrap();
+                assert_eq!(
+                    bits(&other),
+                    bits(&want_other),
+                    "a layer without a post-norm"
+                );
+                let e = post
+                    .set_post_norm(0, vec![1.0; WIDTH], eps)
+                    .unwrap_err()
+                    .to_string();
+                assert!(e.contains("layer 0 carries no host share"), "{e}");
+                let e = post
+                    .set_post_norm(1, vec![1.0; WIDTH - 1], eps)
+                    .unwrap_err()
+                    .to_string();
+                assert!(e.contains("a gain of"), "{e}");
+                let e = post
+                    .set_post_norm(1, vec![1.0; WIDTH], 0.0)
+                    .unwrap_err()
+                    .to_string();
+                assert!(e.contains("an epsilon of"), "{e}");
+            },
+        );
     }
 }

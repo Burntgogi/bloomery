@@ -37,6 +37,10 @@ pub mod image_plan;
 #[cfg(feature = "gpu")]
 pub mod iq_rows;
 pub mod kld;
+#[cfg(feature = "gpu")]
+pub mod kv_planes;
+pub mod llama_launch;
+pub mod llama_place;
 pub mod logit_rows;
 pub mod model_file;
 pub mod need;
@@ -69,6 +73,7 @@ pub mod slots_gate;
 pub mod swiglu_host;
 pub mod tap_dump;
 pub mod tier;
+pub mod ubatch_pick;
 // The image encoder's pieces the serve seats share; the tower itself is `bloomery-gpu-vision`'s, behind `vision`.
 #[cfg(any(feature = "vision", feature = "deepseek41"))]
 pub mod vision_seat;
@@ -199,7 +204,8 @@ pub fn bench_arm(
 /// runners and the C++ harnesses read. An empty value counts as unset, as in
 /// the profile. `open_model` and any gate that prints the path read it here,
 /// so the printed name is the file that was opened. Under `BLOOMERY_TIER=fixture`
-/// ([`tier`]) the file must be a whole fixture: a path that is not one is a
+/// ([`tier`]) the file must be a whole fixture ([`model_arch`]: a GGUF split's
+/// keys, a checkpoint folder's header and fixture cut): a path that is not one is a
 /// named error here, never a gate that ran on a real file under the fixture's
 /// name. The real tier, and no tier, return the path unread. A command that
 /// runs the V4.1 profile reads the file's other owner too (`gguf::v41`, which
@@ -222,10 +228,62 @@ pub fn ref_model_path() -> Result<PathBuf, GateError> {
     };
     let tier = tier::Tier::from_env()?;
     if tier == tier::Tier::Fixture {
-        let g = Gguf::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
-        tier.check_file(&path, g.iter_kv().map(|(k, _)| k))?;
+        model_arch(tier, &path)?;
     }
     Ok(path)
+}
+
+/// The architecture the model at `path` names: a GGUF split's, from its first shard's header, or
+/// a checkpoint folder's ([`folder_arch`]). Under `tier` the fixture tier holds the model to a
+/// whole fixture: a file's keys by [`tier::Tier::check_file`], a folder by [`folder_arch`].
+pub fn model_arch(tier: tier::Tier, path: &Path) -> Result<Option<String>, GateError> {
+    if path.is_dir() {
+        return folder_arch(tier, path);
+    }
+    let g = Gguf::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    tier.check_file(path, g.iter_kv().map(|(k, _)| k))?;
+    Ok(g.architecture().map(str::to_owned))
+}
+
+/// The architecture the checkpoint folder `dir`'s header names (`model_hf::folder::open`). Under
+/// the fixture tier the folder is that architecture's fixture cut, `refset::fixture::first_shard`'s
+/// directory, and its first shard's `bloomery.fixture.*` keys are a whole fixture's
+/// (`refset::fixture::keys` refuses any other by name); a header that names no architecture is
+/// refused there by name.
+#[cfg(feature = "checkpoint")]
+pub fn folder_arch(tier: tier::Tier, dir: &Path) -> Result<Option<String>, GateError> {
+    let f = model_hf::folder::open(dir)
+        .map_err(|e| format!("checkpoint folder {}: {e}", dir.display()))?;
+    let arch = f.header.architecture().map(str::to_owned);
+    if tier == tier::Tier::Fixture {
+        let named = arch.as_deref().ok_or_else(|| {
+            format!(
+                "checkpoint folder {}: its header names no architecture, so no fixture cut is its",
+                dir.display()
+            )
+        })?;
+        let first = PathBuf::from(refset::fixture::first_shard(named)?);
+        if first.parent() != Some(dir) {
+            return Err(format!(
+                "checkpoint folder {}: the fixture tier runs the {named} fixture, whose first shard is {}",
+                dir.display(),
+                first.display()
+            )
+            .into());
+        }
+        refset::fixture::keys(&first)?;
+    }
+    Ok(arch)
+}
+
+/// A checkpoint folder in a build without the `checkpoint` feature, refused by name.
+#[cfg(not(feature = "checkpoint"))]
+pub fn folder_arch(_tier: tier::Tier, dir: &Path) -> Result<Option<String>, GateError> {
+    Err(format!(
+        "{} is a directory: a checkpoint folder is opened by a build with the checkpoint feature",
+        dir.display()
+    )
+    .into())
 }
 
 pub use refset::data_dir;
@@ -1015,8 +1073,8 @@ pub fn topk_ids_logical_in(man: &RefManifest, row: &RefRow) -> Result<Vec<i32>, 
 #[cfg(test)]
 mod tests {
     use super::{
-        GateError, GgmlType, NAN_F16, bench_arm, dequant_row, exit_status, failure_status,
-        first_ids, kquant_d_at, max_rel_err, quantile,
+        GateError, GgmlType, NAN_F16, bench_arm, bits_equal, dequant_row, exit_status,
+        failure_status, first_ids, kquant_d_at, max_rel_err, quantile,
     };
 
     /// A failed run ends 1, and 75 when the need hook refused its load,
@@ -1098,6 +1156,18 @@ mod tests {
             &[1.0, 2.0],
             1.5
         ))));
+    }
+
+    /// The store and replay checks lean on [`bits_equal`]: a shorter side is
+    /// a difference, `-0.0` is not `0.0`, and a NaN matches only its own bits.
+    #[test]
+    fn bits_equal_takes_the_length_and_every_bit() {
+        let nan = f32::from_bits(0x7fc0_0001);
+        assert!(bits_equal(&[1.0, -0.0, nan], &[1.0, -0.0, nan]));
+        assert!(!bits_equal(&[1.0, -0.0], &[1.0]));
+        assert!(!bits_equal(&[1.0], &[1.0, -0.0]));
+        assert!(!bits_equal(&[-0.0], &[0.0]));
+        assert!(!bits_equal(&[nan], &[f32::NAN]));
     }
 
     /// `f32::max` drops NaN, so a fold alone scores an all-NaN output as 0.

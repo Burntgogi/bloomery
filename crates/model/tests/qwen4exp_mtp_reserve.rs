@@ -23,19 +23,18 @@
 use gguf::GgmlType;
 use model::arch::models::headpick::HeadSet;
 use model::arch::models::{
-    Act, Arch, Borrows, ChatSpec, Ffn, Gqa, HcKind, HcSpec, LayerSpec, Mixer, ModelSpec, Moe,
-    MtpDraft, MtpHeadNorm, MtpInput, MtpSource, OutGate, Residual, Rope, RopeMode, Router, Score,
+    Act, Arch, Borrows, ChatSpec, DeltaKind, DeltaRule, EngramSpec, Extra, Ffn, GdnGate, Gqa,
+    HcKind, HcSpec, KHeadMap, LayerSpec, Mixer, ModelSpec, Moe, MtpDraft, MtpHeadNorm, MtpInput,
+    MtpSource, NgramRule, OutGate, PoolRule, Residual, Rope, RopeMode, Router, Score, Selector,
     Shared,
 };
-use model::arch::qwen35moe::hparams::{Exp, FfnKind, Hparams, Kind, Ple, SectionOrder, Variant};
 use model::arch::qwen35moe::mtp::BorrowedHead;
 use model::arch::qwen35moe::place::{
-    Experts, FileTensor, KvLayout, MtpInputs, PlaceError, PlanInputs, mtp_head_act_bytes,
-    mtp_tensors,
+    Experts, FileTensor, KvLayout, MtpInputs, PlanInputs, mtp_head_act_bytes, mtp_tensors,
 };
 use model::placement::workstation::{CONTEXT, GRANULE, MARGIN, SCRATCH};
 use model::placement::{
-    Card, Host, Machine, ModelTensor, ModelTensors, Node, PlanLevers, Role, UnifiedPool, Violation,
+    Card, Host, Machine, ModelTensor, ModelTensors, Node, PlanLevers, Role, UnifiedPool,
 };
 
 const CTX: u64 = 4096;
@@ -48,65 +47,115 @@ const WIDE: u64 = 8 << 30;
 
 /// The slot tests' file: three delta layers, the PLE site on the second, a
 /// selecting attention layer; Qwen3.8's widths.
-fn hparams() -> Hparams {
-    Hparams {
-        variant: Variant::Qwen4Exp,
-        n_layer: LAYERS,
-        n_trunk: LAYERS,
-        n_embd: 2560,
-        n_head: 16,
-        n_head_kv: 2,
-        head_dim: 256,
-        rope_dims: 64,
-        rope_sections: [11, 11, 10, 0],
-        rope_order: SectionOrder::Tyxz,
-        rope_base: 1e7,
-        rms_eps: 1e-6,
-        n_vocab: 248_320,
-        n_ctx_train: 262_144,
-        n_expert: 512,
-        n_used: 10,
-        expert_ff: 640,
-        shared_ff: Some(640),
-        ff: None,
-        conv: 4,
-        state: 128,
-        v_heads: 48,
+fn description() -> ModelSpec {
+    let rope = Rope {
+        mode: RopeMode::Imrope {
+            sections: [11, 11, 10, 0],
+        },
+        dims: 64,
+        base: 1e7,
+        yarn: None,
+    };
+    let gdn = Mixer::DeltaRule(DeltaRule {
+        kind: DeltaKind::Gdn {
+            khead_map: KHeadMap::Tiled,
+            gate: GdnGate::Sigmoid,
+        },
         k_heads: 16,
-        interval: LAYERS,
-        kinds: vec![
-            Kind::DeltaRule,
-            Kind::DeltaRule,
-            Kind::DeltaRule,
-            Kind::Attention,
-        ],
-        ffns: vec![FfnKind::Routed; LAYERS],
-        exp: Some(Exp {
-            hc_streams: 4,
-            hc_rank: 320,
-            idx_heads: 4,
-            idx_dim: 128,
-            idx_top_k: 2048,
-            ratios: vec![0, 0, 0, 4],
-            ple: Some(Ple {
-                layer: 1,
-                ngram: 3,
-                heads_per_ngram: 4,
-                conv: 4,
-                eos: 0,
-                image: None,
-                row: 256,
+        v_heads: 48,
+        d: 128,
+        conv: 4,
+    });
+    let attention = Mixer::Gqa(Gqa {
+        heads: 16,
+        kv_heads: 2,
+        head_dim: 256,
+        value_dim: 256,
+        rope,
+        qk_norm: true,
+        o_norm: false,
+        out_gate: OutGate::Packed,
+        select: Some(Selector::TokenPool {
+            heads: 4,
+            d: 128,
+            top_k: 2048,
+            pool: 4,
+            rule: PoolRule::Mean { rope },
+        }),
+        window: None,
+        sinks: false,
+        value_scale: None,
+    });
+    let layer = |l: usize, mixer: Mixer| LayerSpec {
+        mixer,
+        ffn: Ffn::Moe(Moe {
+            experts: 512,
+            top_k: 10,
+            expert_ff: 640,
+            latent: None,
+            pre_exp_norm: false,
+            post_exp_norm: None,
+            act: Act::SwiGlu { limit: None },
+            router: Router {
+                score: Score::Softmax,
+                bias: false,
+                norm: models::RouterNorm::SelectedSum,
+                scale: 1.0,
+                hash: false,
+            },
+            shared: Some(Shared {
+                ff: 640,
+                act: Act::SwiGlu { limit: None },
+                sigmoid_gate: true,
             }),
         }),
-        defaults: Vec::new(),
+        residual: Residual::Hc,
+        extras: if l == 1 { vec![Extra::Ple] } else { Vec::new() },
+    };
+    ModelSpec {
+        arch: Arch::Qwen4Exp,
+        hidden: 2560,
+        vocab: 248_320,
+        ctx_train: 262_144,
+        rms_eps: 1e-6,
+        layers: vec![
+            layer(0, gdn.clone()),
+            layer(1, gdn.clone()),
+            layer(2, gdn),
+            layer(3, attention),
+        ],
+        mtp: Vec::new(),
+        hc: Some(HcSpec {
+            streams: 4,
+            kind: HcKind::Gated { rank: 320 },
+        }),
+        engram: Some(EngramSpec {
+            heads: 4,
+            max_ngram: 3,
+            key_length: 256,
+            rule: NgramRule::Ple {
+                eos: 0,
+                image: None,
+                conv: 4,
+                dilation: 3,
+            },
+        }),
+        encoder: None,
+        logit_epilogue: None,
+        chat: ChatSpec {
+            pre: String::new(),
+            template: None,
+            tools: None,
+            reasoning: None,
+        },
     }
 }
 
 /// A layer's norm, and its routed stacks in types the card experts read: a
 /// Q4_K gate and up of 640 rows of 2,560, a Q8_0 down of 2,560 rows of 640.
 fn inputs() -> PlanInputs {
-    let hp = hparams();
-    let kv = KvLayout::of(&hp);
+    let spec = description();
+    let kv = KvLayout::of_spec(&spec).expect("the description's layout");
     let tensor = |l: usize, stem: &str, role: Role, ty: GgmlType, dims: Vec<u64>| {
         let values: u64 = dims.iter().product();
         ModelTensor {
@@ -146,26 +195,7 @@ fn inputs() -> PlanInputs {
             vec![640, 2560, EXPERTS],
         ));
     }
-    let spec = ModelSpec {
-        arch: Arch::Qwen4Exp,
-        hidden: 2560,
-        vocab: 248_320,
-        ctx_train: 262_144,
-        rms_eps: 1e-6,
-        layers: Vec::new(),
-        mtp: Vec::new(),
-        hc: None,
-        engram: None,
-        encoder: None,
-        chat: ChatSpec {
-            pre: String::new(),
-            template: None,
-            tools: None,
-            reasoning: None,
-        },
-    };
     PlanInputs {
-        hp,
         model: ModelTensors {
             tensors,
             layers: LAYERS,
@@ -208,6 +238,7 @@ fn draft() -> MtpDraft {
                     yarn: None,
                 },
                 qk_norm: true,
+                o_norm: false,
                 out_gate: OutGate::Packed,
                 select: None,
                 window: None,
@@ -219,6 +250,8 @@ fn draft() -> MtpDraft {
                 top_k: 10,
                 expert_ff: 640,
                 latent: None,
+                pre_exp_norm: false,
+                post_exp_norm: None,
                 act: Act::SwiGlu { limit: None },
                 router: Router {
                     score: Score::Softmax,
@@ -306,6 +339,7 @@ fn machine(usable: u64) -> Machine {
             layers: 0..LAYERS,
             head: true,
             token_embedding: false,
+            reserve_only: false,
             reserves: Vec::new(),
         }],
         tiers: Vec::new(),
@@ -382,43 +416,74 @@ fn unified(usable: u64, pool: u64) -> Machine {
     m
 }
 
-/// A pool of exactly the need the plan's host headroom counts plans clean,
-/// and one byte under it is one `PoolOver` naming the draft's card bytes
-/// beside the plan: the two sides count the cards, the draft and the
-/// context's own creation cost alike.
+/// One routed expert's bytes across the three stacks: a Q4_K gate and up of
+/// 640 rows of 2,560 and a Q8_0 down of 2,560 rows of 640.
+const EXPERT_BYTES: u64 = 2 * (640 * 2560 / 256 * 144) + 2560 * 640 / 32 * 34;
+
+/// On one pool the drafted plan counts the draft once on each side. A pool of
+/// exactly the need the plan's host headroom counts plans clean with no
+/// expert paged from the NVMe tier, and what the pool holds past the plan's
+/// cards and host is the draft's card bytes. One byte under it, the tier's
+/// room is a byte short (`Plan::plan_at` caps it at the pool), so the plan
+/// pages some host experts instead of breaking: it stays clean, frees the
+/// host an expert's bytes less that byte, and the pool still holds the
+/// draft's card bytes beside it. The two sides count the cards, the draft and
+/// the context's own creation cost alike: counting the draft twice would
+/// split at the need, and not at all would refuse one byte under it.
+// PIN(2026-10-25): one byte under the need was one `PoolOver` naming the
+// draft's card bytes. The host room is now capped at the pool, so a pool short
+// of the need splits the host's experts onto the NVMe tier down to the split's
+// floor, and the break is a named placement refusal there, never `PoolOver`.
 #[test]
 fn a_drafted_plan_on_one_pool_counts_the_draft_once() {
     let inputs = inputs();
     let levers = PlanLevers::default();
     let q8 = mtp(BorrowedHead::Q8_0);
-    // The plan's host headroom, or its refusal.
+    // The plan's host headroom, its host experts paged from the NVMe tier and
+    // what the pool holds past its cards and host, or its refusal.
     let plan = |experts, slots, pool| {
         inputs
             .plan_mtp_with_slots(&unified(WIDE, pool), CTX, &levers, &q8, experts, slots)
-            .map(|p| p.plan.host.headroom_bytes)
+            .map(|p| {
+                let held = p.plan.pool_need().expect("a unified machine's pool terms");
+                (
+                    p.plan.host.headroom_bytes,
+                    p.plan.host.nvme_expert_bytes,
+                    held.pool - held.cards - held.host,
+                )
+            })
     };
     let ample: u64 = 1 << 40;
     for experts in [Experts::Card, Experts::Host] {
         for slots in [1, 2] {
             let at = format!("{experts:?}, {slots} slot(s)");
-            let room =
+            let beside = q8
+                .card_bytes_of(CTX, slots)
+                .expect("the draft's card bytes");
+            let (room, paged, _) =
                 plan(experts, slots, ample).unwrap_or_else(|e| panic!("{at}, an ample pool: {e}"));
+            assert_eq!(paged, 0, "{at}: an ample pool pages no expert");
             let need = ample - u64::try_from(room).expect("a headroom within the pool");
-            if let Err(e) = plan(experts, slots, need) {
-                panic!("{at}, a pool of the host's need {need} B: {e}");
-            }
-            match plan(experts, slots, need - 1) {
-                Err(PlaceError::Broken(v)) => match v.as_slice() {
-                    [Violation::PoolOver { beside, .. }] => assert_eq!(
-                        *beside,
-                        q8.card_bytes_of(CTX, slots)
-                            .expect("the draft's card bytes"),
-                        "{at}: the bytes beside the plan"
-                    ),
-                    v => panic!("{at}: {v:?}, not one PoolOver"),
-                },
-                other => panic!("{at}, a pool one byte under the need: {other:?}"),
-            }
+            let (headroom, paged, held) = plan(experts, slots, need)
+                .unwrap_or_else(|e| panic!("{at}, a pool of the host's need {need} B: {e}"));
+            assert_eq!(
+                (headroom, paged, held),
+                (0, 0, beside),
+                "{at}: the need leaves no headroom, pages no expert and holds the draft beside the plan"
+            );
+            let (headroom, paged, held) = plan(experts, slots, need - 1)
+                .unwrap_or_else(|e| panic!("{at}, a pool one byte under the need: {e}"));
+            assert!(paged > 0, "{at}: one byte under the need pages no expert");
+            assert_eq!(
+                headroom,
+                i128::from(EXPERT_BYTES) - 1,
+                "{at}: the split frees an expert's bytes"
+            );
+            assert_eq!(
+                i128::from(held),
+                i128::from(beside) + headroom,
+                "{at}: the pool holds the draft's card bytes beside the plan"
+            );
         }
     }
 }

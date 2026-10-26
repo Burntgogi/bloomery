@@ -23,6 +23,15 @@
 //! One line per tensor, a summary line, and exit status 1 with the error on any failure. Before
 //! any shard is written, the tokenizer serving builds from the header is checked to split text
 //! and stop generation where Hugging Face's does.
+//!
+//!     prepare <folder> --plan
+//!
+//! prints the plan of any folder a map reads (`model_hf::folder::open` picks the map by the
+//! config's `model_type`) and writes nothing; it reads the headers and the tokenizer files only.
+//! The plan is the tensors and bytes by where a load reads them and by type, the folder tensors
+//! the map skips by reason, and the size of the vocabulary serving checked against Hugging Face's.
+//! It is the stored form, which `--keep-bf16` names too; it takes no `--shard-gib` and refuses
+//! `BLOOMERY_PREPARE_Q8=1`, whose rewrite it does not plan.
 
 use std::error::Error;
 use std::fs::File;
@@ -37,7 +46,10 @@ use gguf::write::{Layout, Writer};
 use hf::modelopt::{self, Normal, Use};
 use model_hf::arch::qwen35moe::folder::{self, Make, Planned};
 
-const USAGE: &str = "usage: prepare <folder> <out prefix> [--shard-gib <n>] [--keep-bf16]";
+const USAGE: &str = concat!(
+    "usage: prepare <folder> <out prefix> [--shard-gib <n>] [--keep-bf16]\n",
+    "       prepare <folder> --plan"
+);
 
 type Res<T> = Result<T, Box<dyn Error>>;
 
@@ -57,18 +69,33 @@ fn main() -> ExitCode {
     }
 }
 
-/// The split of the folder `args` name; `q8` (`BLOOMERY_PREPARE_Q8`) writes its BF16 matrices the
-/// map reads as Q8_0, and its F32 matrices, in Q8_0.
+/// The split of the folder `args` name, or with `--plan` its plan; `q8` (`BLOOMERY_PREPARE_Q8`)
+/// writes its BF16 matrices the map reads as Q8_0, and its F32 matrices, in Q8_0.
 fn run(args: &[String], q8: bool) -> Res<()> {
-    let (mut shard_gib, mut keep_bf16, mut paths) = (48u64, false, vec![]);
+    let (mut shard_gib, mut keep_bf16, mut plan, mut paths) = (None, false, false, vec![]);
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
-            "--shard-gib" => shard_gib = it.next().ok_or(USAGE)?.parse()?,
+            "--shard-gib" => shard_gib = Some(it.next().ok_or(USAGE)?.parse::<u64>()?),
             "--keep-bf16" => keep_bf16 = true,
+            "--plan" => plan = true,
             _ => paths.push(a),
         }
     }
+    if plan {
+        let [dir] = paths[..] else {
+            return Err(USAGE.into());
+        };
+        if shard_gib.is_some() || q8 {
+            return Err(format!(
+                "--plan prints the folder's stored form and writes no shard: it takes no \
+                 --shard-gib, and {PREPARE_Q8}=1 asks for a Q8_0 rewrite it does not plan"
+            )
+            .into());
+        }
+        return print_plan(Path::new(dir));
+    }
+    let shard_gib = shard_gib.unwrap_or(48);
     let [dir, prefix] = paths[..] else {
         return Err(USAGE.into());
     };
@@ -289,6 +316,19 @@ fn write_split(
             Err(e) => Err(format!("{e}; cleanup failed: {cleanup}").into()),
         }
     }
+}
+
+/// The plan of the folder `dir`, whichever map reads it: headers and tokenizer, no tensor bytes.
+fn print_plan(dir: &Path) -> Res<()> {
+    let opened = model_hf::folder::open(dir)?;
+    for line in model_hf::folder::plan_lines(&opened.header, &opened.skipped) {
+        println!("prepare: plan {line}");
+    }
+    println!(
+        "prepare: plan tokenizer: {} tokens, its specials and stop set as Hugging Face's",
+        opened.tokenizer.n_vocab()
+    );
+    Ok(())
 }
 
 fn plan_shards(
@@ -796,8 +836,48 @@ mod tests {
                 );
                 expected.keys = both.clone();
                 assert!(served_as_hf(&both, &expected).is_ok());
+                // A flag of HF's that is not a bool is refused, not read as off.
+                expected
+                    .keys
+                    .retain(|(k, _)| k != "tokenizer.ggml.add_bos_token");
+                expected
+                    .keys
+                    .push(("tokenizer.ggml.add_bos_token".into(), Value::U32(1)));
+                assert!(
+                    served_as_hf(&both, &expected)
+                        .err()
+                        .unwrap()
+                        .to_string()
+                        .contains("add_bos_token is U32(1), not a bool")
+                );
             }
         }
+    }
+
+    /// `--plan` takes the folder alone: another path, a shard size and the Q8_0 rewrite are refused
+    /// before any folder is read, a folder with no config is refused by its name, and the write
+    /// form's own refusals stand.
+    #[test]
+    fn plan_takes_a_folder_alone() {
+        use super::*;
+
+        let refused = |args: &[&str], q8| {
+            let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            run(&args, q8).unwrap_err().to_string()
+        };
+        for args in [&["--plan"][..], &["--plan", "a", "b"], &["a"]] {
+            let e = refused(args, false);
+            assert!(e.contains("usage: prepare <folder> <out prefix>"), "{e}");
+            assert!(e.contains("prepare <folder> --plan"), "{e}");
+        }
+        let e = refused(&["--plan", "--shard-gib", "1", "a"], false);
+        assert!(e.contains("takes no --shard-gib"), "{e}");
+        let e = refused(&["--plan", "a"], true);
+        assert!(e.contains(PREPARE_Q8), "{e}");
+        let e = refused(&["--plan", "/nonexistent-folder"], false);
+        assert!(e.contains("/nonexistent-folder/config.json"), "{e}");
+        let e = refused(&["a", "b", "--keep-bf16"], true);
+        assert!(e.contains("--keep-bf16 keeps the BF16 matrices"), "{e}");
     }
 
     /// Serving's tokenizer, built from a Qwen3.8 folder's files as `prepare` builds it, encodes

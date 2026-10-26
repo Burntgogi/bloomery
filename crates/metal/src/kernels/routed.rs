@@ -29,7 +29,7 @@ use super::{
 
 /// The slots a tile of the grouped GEMM holds at most: the route table's cut
 /// and the GEMM's activation tile (`ROUTE_TILE`, `ROUTED_ACTS`).
-pub const ROUTE_TILE: usize = 32;
+pub const ROUTE_TILE: usize = 64;
 
 /// The weight rows of a grouped GEMM's tile (`ROUTED_ROWS`): the plain tile's
 /// rows, and the pair's two tensors of half as many outputs.
@@ -40,7 +40,7 @@ pub const ROUTED_ROWS: usize = 64;
 pub const LOGIT_STRIDE: usize = router_geom::ROWS.div_ceil(4) * 4;
 
 /// The threads of the route table's one threadgroup (`ROUTE_THREADS`).
-const TABLE_THREADS: usize = 1024;
+pub const TABLE_THREADS: usize = 1024;
 
 /// The threads of the combine's threadgroup a row.
 const COMBINE_THREADS: usize = 256;
@@ -84,6 +84,8 @@ pub(crate) struct RoutedPipelines {
     q4k: RoutedFamily,
     q6k: RoutedFamily,
     a4: RoutedFamily,
+    q8_0: RoutedFamily,
+    q5k: RoutedFamily,
     f32w: Pipeline,
     select: Pipeline,
     table: Pipeline,
@@ -92,11 +94,16 @@ pub(crate) struct RoutedPipelines {
 }
 
 impl RoutedPipelines {
+    /// The pipelines of `library`, the grouped GEMM's from its GEMMs' library
+    /// ([`Library::gemm_library`]).
     pub(crate) fn new(library: &Library) -> Result<Self, DeviceError> {
+        let gemm = library.gemm_library();
         Ok(Self {
-            q4k: RoutedFamily::new(library, "q4k")?,
-            q6k: RoutedFamily::new(library, "q6k")?,
-            a4: RoutedFamily::new(library, "a4")?,
+            q4k: RoutedFamily::new(gemm, "q4k")?,
+            q6k: RoutedFamily::new(gemm, "q6k")?,
+            a4: RoutedFamily::new(gemm, "a4")?,
+            q8_0: RoutedFamily::new(gemm, "q8_0")?,
+            q5k: RoutedFamily::new(gemm, "q5k")?,
             f32w: library.pipeline("gemm_f32w_store_f32")?,
             select: library.pipeline("route_rows_select")?,
             table: library.pipeline("route_table")?,
@@ -110,6 +117,8 @@ impl RoutedPipelines {
             Quant::Q4K => &self.q4k,
             Quant::Q6K => &self.q6k,
             Quant::A4 => &self.a4,
+            Quant::Q8_0 => &self.q8_0,
+            Quant::Q5K => &self.q5k,
         }
     }
 }

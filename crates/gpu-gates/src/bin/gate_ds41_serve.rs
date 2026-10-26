@@ -2625,7 +2625,7 @@ mod gate {
         let plain_probe = read_ids(PROBE_IDS)?;
         let (_, hp) = dspark::draft_hparams()?;
         let draft_path = dspark::draft_path()?;
-        let draft_card = dspark::draft_card(Place::Gate)?;
+        let draft_card = dspark::draft_card(Place::Gate)?.spec;
         let draft_device = format!(
             "GPU{}",
             nvidia_smi_index(draft_card.name, draft_card.device)?
@@ -2873,11 +2873,11 @@ mod gate {
         let (draft, _) = dspark::draft_hparams()?;
         let draft_path = dspark::draft_path()?;
         let path = ref_model_path()?;
-        let reserve = dspark::draft_reserve(Place::Bp, &draft, &path)?
-            .ok_or("plan (b′) made no draft reserve")?;
+        let on = dspark::draft_seat(Place::Bp, &draft, &path)?;
+        let reserve = on.reserve.bytes;
         let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
         let inputs = PlanInputs::read(&split)?;
-        let machine_of = Place::Bp.machine(Some(reserve), Some(place::tier_batch(&inputs.hp)))?;
+        let machine_of = Place::Bp.machine(Some(on), Some(place::tier_batch(&inputs.hp)))?;
         std::fs::create_dir_all(&a.dir)?;
         let exe = Served::exe()?;
         let err_log = a.dir.join("server.err");

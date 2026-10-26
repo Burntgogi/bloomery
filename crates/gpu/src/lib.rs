@@ -44,8 +44,10 @@ pub mod elem;
 pub mod fault;
 pub mod flash;
 pub mod flash_gqa;
+pub mod flash_gqa_h128_swa;
 pub mod flash_gqa_prefill;
 pub mod flash_gqa_prefill_512;
+pub mod folder;
 pub mod fused;
 pub mod gated_quant;
 pub mod gelu;
@@ -83,10 +85,13 @@ pub mod q6k_ids;
 pub mod q6k_sel;
 pub mod q8_0_sel32;
 pub mod q8f32;
+pub mod qk_rms;
 pub mod qsa;
 pub mod quant_sel;
 pub(crate) mod recur;
+pub(crate) mod ring_gemm;
 pub mod rope_neox;
+pub mod rope_norm;
 pub mod rope_table;
 pub mod route_body;
 pub mod route_core;
@@ -325,6 +330,18 @@ impl GpuError {
 pub fn launch_u32(what: &'static str, name: &'static str, v: usize) -> Result<u32, GpuError> {
     u32::try_from(v)
         .map_err(|_| GpuError::shape(what, format!("{name} = {v} does not fit the kernel's u32")))
+}
+
+/// The first of `lens`' `(name, len, need)` buffers shorter than a launch
+/// reads or writes, as a `Shape` error of the entry point `what`.
+pub(crate) fn short(what: &'static str, lens: &[(&str, usize, usize)]) -> Result<(), GpuError> {
+    match lens.iter().find(|(_, got, need)| got < need) {
+        Some((name, got, need)) => Err(GpuError::shape(
+            what,
+            format!("{name}.len() {got} < {need}"),
+        )),
+        None => Ok(()),
+    }
 }
 
 /// Columns a group of [`ColGroups`] holds at most: the m-column cores'.
@@ -2173,6 +2190,13 @@ fn raw_device_integrated(dev: cuda_core::sys::CUdevice) -> Result<bool, GpuError
 /// Load-time only.
 pub(crate) fn row_prefetch(ctx: &CudaContext) -> Result<bool, GpuError> {
     raw_device_integrated(ctx.cu_device())
+}
+
+/// Whether `ctx`'s device runs the dense prompt sites and the wide BF16
+/// router on the BF16 tensor-core tile (`gemm::bf16_mma_body`): GB10, compute
+/// capability 12.1. Other devices keep the exact F32 products. Load-time only.
+pub fn dense_mma(ctx: &CudaContext) -> Result<bool, GpuError> {
+    Ok(ctx.compute_capability()? == (12, 1))
 }
 
 /// The room a device allocation can take on an integrated device: the

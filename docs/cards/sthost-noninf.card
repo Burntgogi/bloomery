@@ -1,0 +1,33 @@
+# The sthost round's non-regression card: the row dispatch gains a layout (planes: a matrix's codes for every row and
+# its block scales, two runs the file keeps wherever it keeps them), one tensor scale an expert applied once per output
+# cell (every layout's, 1.0 for a type that reads none), and a table of file offsets beside a stack's bytes. On every
+# layout that existed before, the added work is: one branch on the layout in `compute_rows`, one `Option` test of the
+# offsets and one empty-slice pair in `ExpertStack::matrix`, two words and a float more in `PairWork`, per matrix cut
+# about 10 ns; a token cuts 4 experts x 3 stacks x 57 layers = 684 of them, so 7 us; and one f32 multiply by 1.0 per
+# output cell, at most 4 experts x (2 x 4096 + 4096) cells x 57 layers = 2.8 M cells a token at 1 ns, spread over
+# the pool's 24+ workers: 0.12 ms worst case, on the compute that sits under the ~53 ms host-DRAM wall (rig-log
+# plan.md 「흐름 모델」's 18.9 tok/s). Together at most 0.2 % and 0.013 % expected [derived from the code; no timed run
+# behind it]. The planes arm itself is on no existing model's path. The band leaves room for what the derivation
+# cannot close, the link layout of a rebuilt binary (a fixed first arm read 0.3-0.8 % slow before the runner rotated
+# arm order).
+kind: noninf
+question: does the row dispatch with the planes layout wired in decode as fast as the base's, the changed arm no slower
+  than the base by more than the margin?
+term: bloomery-decode tok/s @ n = 96 (BLOOMERY_DECODE_N default), the runner's default prompt, the default reference
+  profile, the A6000 box, changed tree vs base tree, interleaved in one lease, paired by round
+unit: %
+predict: -0.2..0.1
+rounds: 8
+sd: 0.6 % AGENTS.md 「Know the ruler」 same-binary scatter, the default
+margin: 1.0 % the default: about the ruler's spread at 4-6 rounds; at 8 rounds the paired interval is 0.71 %, which
+  the band's lower edge clears
+condition: the lead's go, then from this tree with the base tree built beside it (`just build-decode` in both),
+  BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/sthost-noninf.card' BLOOMERY_AB_ROUNDS=8 just ab-decode
+  <the base tree>; the runner rotates arm order every round, netdata is frozen under the lease, and no other compute
+  runs on the box (the witness blocks open and close each round with the card name, clocks and Xid counters); a round
+  with a [cold] or [other-busy] row is void
+decide-in: the planes wiring costs nothing the ruler resolves: land it as it is
+decide-below: re-derive the dispatch terms before landing: perf-record the changed arm (-e cpu-clock, cut with --time)
+  and read `compute_rows` and `ExpertStack::matrix` first, since the added branches are the only code on the old path
+decide-above: check arm identity and the link layout first (an A/A arm through BLOOMERY_AB_ENVS), then record the gain
+  as noise; nothing in the change shortens a term of the old path

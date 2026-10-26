@@ -7,10 +7,10 @@
 
 use bloomery_gpu_gates::GateError;
 use bloomery_gpu_gates::beside::{self, Beside};
+use bloomery_gpu_gates::bind::place_word;
 use bloomery_gpu_gates::generate::{Place, TierRule, choose_ctx_of};
 use bloomery_gpu_gates::residency38::glm_machine;
 use bloomery_gpu_glm5next::checkpoint_price;
-use model::arch::glm5next::hparams::Hparams;
 use model::arch::glm5next::place::{
     KdaLanes, NextnInputs, ORACLE_POSITIONS, PlaceError, PlanInputs,
 };
@@ -32,19 +32,17 @@ pub const TIER_RULE: TierRule = TierRule {
     basis: "docs/cards/glmbp-ab.card",
 };
 
-/// A GLM binary's `--place` word (`Place::parse`), refused by name before
+/// A GLM binary's `--place` word (`bind::place_word`), refused by name before
 /// any plan when it lists more tier cards than the GLM body serves.
 pub fn parse(v: &str) -> Result<Place, GateError> {
-    let place = Place::parse(v)?;
-    place.serves("glm5next", SERVED_TIERS)?;
-    Ok(place)
+    place_word(v, Some(("glm5next", SERVED_TIERS)))
 }
 
 /// The expert tier's prompt-batch bytes `place`'s plan reserves for the file
-/// of hyperparameters `hp` (`model::arch::glm5next::place::tier_batch`),
-/// which `Place::machine` takes; `None` under a placement with no tier card.
-pub fn tier_batch(place: Place, hp: &Hparams) -> Option<TierBatchBytes> {
-    (!place.tier_cards().is_empty()).then(|| model::arch::glm5next::place::tier_batch(hp))
+/// `inputs` describes (`model::arch::glm5next::place::tier_batch`), which
+/// `Place::machine` takes; `None` under a placement with no tier card.
+pub fn tier_batch(place: Place, inputs: &PlanInputs) -> Option<TierBatchBytes> {
+    (!place.tier_cards().is_empty()).then(|| model::arch::glm5next::place::tier_batch(inputs))
 }
 
 /// The experts `place`'s tier cards hold in its plan at `ctx` positions
@@ -65,7 +63,7 @@ pub fn tier_experts(
 ) -> Result<u64, GateError> {
     let machine = glm_machine(
         place,
-        tier_batch(place, &inputs.hp),
+        tier_batch(place, inputs),
         slots,
         checkpoint_price(inputs)?,
         ctx,

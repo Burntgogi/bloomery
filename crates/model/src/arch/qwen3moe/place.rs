@@ -1,6 +1,7 @@
 //! The qwen3moe program's plans: what a placed load of a Qwen3-30B-A3B
 //! (`qwen3moe`) or a Qwen3.6-35B-A3B (`qwen35moe`) file runs on one card and
-//! the host tier. The program (`gpu::arch::qwen3moe`'s `Body` and `Body35`)
+//! the host tier, or on a stage card with one expert tier beside that host.
+//! The program (`gpu::arch::qwen3moe`'s `Body` and `Body35`)
 //! puts every tensor but the routed stacks on the card — attention or delta
 //! rule, router, shared expert, embedding and head — and the routed experts
 //! by the expert rule over the layers whose three stacks its card experts
@@ -8,9 +9,11 @@
 //!
 //! A qwen35moe file plans through `qwen35moe::place::PlanInputs::plan_rule`
 //! with [`routed_rule`] of [`Program::Qwen35Body`] (its headers, roles and caches are that module's);
-//! a qwen3moe file through [`PlanInputs`] here. Both run on the machine
-//! `workstation::placed_with_arena` lays out: one card with the workstation's context and margin
-//! and a scratch the caller sizes from the program's own arenas.
+//! a qwen3moe file through [`PlanInputs`] here. One card is the machine
+//! `workstation::placed_with_arena` lays out. A stage with one expert tier is
+//! [`workstation::plan_tiers`], then [`stage_placed`]: the tier card holds no
+//! layer, and the stage keeps the token embedding and the scratch the placed
+//! load holds.
 
 use gguf::Split;
 
@@ -18,6 +21,7 @@ use super::hparams::Hparams;
 use super::roles;
 use crate::placement::accepts::{Program, routed_rule};
 use crate::placement::ctx_ask::PlanRefusal;
+use crate::placement::workstation::{self, TierBatchBytes};
 use crate::placement::{
     self, KvBytes, Machine, ModelTensors, PlacementError, Plan, PlanLevers, Violation, checked,
     joined,
@@ -33,6 +37,38 @@ use runtime::stores::{F32_BYTES, kv_plane_bytes};
 /// type (a Q3_K, a Q2_K), or of one of these in a part no launch runs it in (a
 /// Q6_K gate over a Q3_K down), keeps its experts on the host.
 pub const PROGRAM: Program = Program::Qwen3moeBody;
+
+/// Tokens one chunk of the tier's prompt-batch service runs: the stage gemv
+/// pass. GLM and Solar name the same chunk.
+pub const TIER_CHUNK: u64 = 8;
+
+/// The expert tier's prompt-batch bytes ([`TierBatchBytes`]) for blocks of
+/// the host union's columns ([`crate::moe::UNION_MAX_COLS`]): the tier card's
+/// staging, one chunk of the card leg's scratch and the host's rows.
+#[must_use]
+pub fn tier_batch(hp: &Hparams) -> TierBatchBytes {
+    workstation::tier_leg_batch_bytes(
+        hp.n_embd as u64,
+        hp.experts.ff as u64,
+        hp.experts.n_used as u64,
+        TIER_CHUNK,
+        crate::moe::UNION_MAX_COLS as u64,
+    )
+}
+
+/// The stage card [`workstation::plan_tiers`] lays, held as a placed load
+/// holds it: the token embedding on the card, and scratch of the m = 1
+/// scratch plus `arena`. [`workstation::plan_tiers`] leaves the embedding off
+/// the card and the scratch at the m = 1 figure.
+///
+/// # Panics
+///
+/// When the machine has no stage card.
+pub fn stage_placed(machine: &mut Machine, arena: u64) {
+    let card = machine.cards.first_mut().expect("a plan has a stage card");
+    card.token_embedding = true;
+    card.scratch_bytes = workstation::SCRATCH + arena;
+}
 
 /// A qwen3moe file's per-layer cache: every layer's K and V planes, a
 /// position's `2 · kv_heads · head_dim` values — f16, or q8_0's two-plane
@@ -92,11 +128,6 @@ pub enum PlaceError {
     /// A context of no position.
     #[error("ctx_max 0: a plan holds at least one position")]
     Positions,
-    /// A machine with an expert tier card: the program hangs none.
-    #[error(
-        "the machine has the expert tier card {tier}; the qwen3moe program hangs no expert tier"
-    )]
-    Tier { tier: String },
 }
 
 impl PlanRefusal for PlaceError {
@@ -138,9 +169,10 @@ impl PlanInputs {
 
     /// The placement of the file on `machine` at `ctx_max` positions under
     /// `levers`: the routed experts by the expert rule over the layers whose
-    /// stacks [`routed_rule`] of [`PROGRAM`] loads, the rest on the host. Refused when it
-    /// cannot be built or breaks an invariant (every violation listed), at a
-    /// context of 0, and on a machine with an expert tier card.
+    /// stacks [`routed_rule`] of [`PROGRAM`] loads, the rest on the host, a
+    /// stage card's id prefix first and each expert tier's next ids after it.
+    /// Refused when it cannot be built or breaks an invariant (every violation
+    /// listed), and at a context of 0.
     pub fn plan<'a>(
         &'a self,
         machine: &'a Machine,
@@ -149,11 +181,6 @@ impl PlanInputs {
     ) -> Result<Plan<'a>, PlaceError> {
         if ctx_max == 0 {
             return Err(PlaceError::Positions);
-        }
-        if let Some(tier) = machine.tiers.first() {
-            return Err(PlaceError::Tier {
-                tier: tier.name.clone(),
-            });
         }
         let plan = placement::plan_routed(
             &self.model,

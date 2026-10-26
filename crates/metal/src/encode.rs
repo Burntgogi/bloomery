@@ -136,6 +136,9 @@ pub struct ComputeEncoder<'r> {
     count: EncodeCount,
     /// A dispatch was encoded since the last barrier.
     group_open: bool,
+    /// What this encoder was asked, for the encode trace.
+    #[cfg(feature = "encode-trace")]
+    trace: crate::trace::EncoderTrace,
     _recording: PhantomData<&'r ()>,
 }
 
@@ -146,6 +149,14 @@ pub struct EncodeCount {
     pub groups: usize,
     pub dispatches: usize,
     pub barriers: usize,
+}
+
+impl core::ops::AddAssign for EncodeCount {
+    fn add_assign(&mut self, other: Self) {
+        self.groups += other.groups;
+        self.dispatches += other.dispatches;
+        self.barriers += other.barriers;
+    }
 }
 
 impl ComputeEncoder<'_> {
@@ -160,18 +171,27 @@ impl ComputeEncoder<'_> {
     pub(crate) fn concurrent(
         buffer: &ProtocolObject<dyn MTLCommandBuffer>,
     ) -> Result<ComputeEncoder<'_>, DeviceError> {
+        Self::concurrent_detached(buffer)
+    }
+
+    /// [`ComputeEncoder::concurrent`] with no borrow of the buffer: the
+    /// holder of the encoder ends it before the buffer is committed, as
+    /// [`TokenRecording`](crate::stream::TokenRecording) does.
+    pub(crate) fn concurrent_detached(
+        buffer: &ProtocolObject<dyn MTLCommandBuffer>,
+    ) -> Result<ComputeEncoder<'static>, DeviceError> {
         Self::with_encoder(buffer, |buffer| {
             buffer.computeCommandEncoderWithDispatchType(MTLDispatchType::Concurrent)
         })
     }
 
     /// An encoder from `make`, refused by name when the command buffer makes none.
-    fn with_encoder<'a>(
-        buffer: &'a ProtocolObject<dyn MTLCommandBuffer>,
+    fn with_encoder<'r>(
+        buffer: &ProtocolObject<dyn MTLCommandBuffer>,
         make: impl FnOnce(
             &ProtocolObject<dyn MTLCommandBuffer>,
         ) -> Option<Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>>,
-    ) -> Result<ComputeEncoder<'a>, DeviceError> {
+    ) -> Result<ComputeEncoder<'r>, DeviceError> {
         let encoder = make(buffer).ok_or_else(|| {
             DeviceError::backend(
                 "compute encoder",
@@ -179,6 +199,8 @@ impl ComputeEncoder<'_> {
             )
         })?;
         Ok(ComputeEncoder {
+            #[cfg(feature = "encode-trace")]
+            trace: crate::trace::EncoderTrace::open(buffer, encoder.dispatchType()),
             encoder,
             max_threads_per_group: None,
             count: EncodeCount::default(),
@@ -191,6 +213,8 @@ impl ComputeEncoder<'_> {
     pub fn set_pipeline(&mut self, pipeline: &Pipeline) {
         self.encoder.setComputePipelineState(pipeline.metal());
         self.max_threads_per_group = Some(pipeline.max_threads_per_group());
+        #[cfg(feature = "encode-trace")]
+        self.trace.set_pipeline(pipeline);
     }
 
     /// The binding at `index`; an index past [`MAX_BINDINGS`] is refused by
@@ -218,6 +242,8 @@ impl ComputeEncoder<'_> {
                         slot,
                     );
                 }
+                #[cfg(feature = "encode-trace")]
+                self.trace.set_buffer(index, buffer, offset_bytes.get());
             }
             BindingKind::Bytes(data) => {
                 let ptr = NonNull::from(data).cast::<c_void>();
@@ -228,6 +254,8 @@ impl ComputeEncoder<'_> {
                     self.encoder
                         .setBytes_length_atIndex(ptr, to_ns(data.len()), slot);
                 }
+                #[cfg(feature = "encode-trace")]
+                self.trace.set_bytes(index, data);
             }
         }
         Ok(())
@@ -252,6 +280,8 @@ impl ComputeEncoder<'_> {
                 detail: format!("{groups_x} groups of {threads_per_group} threads wrap"),
             })?;
         self.submit(width, groups_y, threads_per_group);
+        #[cfg(feature = "encode-trace")]
+        self.trace.dispatch(groups_x, groups_y, threads_per_group);
         self.count.dispatches += 1;
         if !self.group_open {
             self.group_open = true;
@@ -323,6 +353,8 @@ impl ComputeEncoder<'_> {
     pub fn memory_barrier(&mut self) {
         self.encoder
             .memoryBarrierWithScope(MTLBarrierScope::Buffers);
+        #[cfg(feature = "encode-trace")]
+        self.trace.barrier();
         self.count.barriers += 1;
         self.group_open = false;
     }

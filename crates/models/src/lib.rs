@@ -15,6 +15,7 @@
 //! list names what it means in its own comment.
 
 mod encoder;
+mod formats;
 pub mod headpick;
 mod need;
 mod role;
@@ -52,7 +53,20 @@ pub struct ModelSpec {
     /// What an encoder carries past its trunk; `None`: the model generates
     /// tokens.
     pub encoder: Option<EncoderSpec>,
+    /// The head's logit epilogue; `None`: the output projection's values are
+    /// the logits.
+    pub logit_epilogue: Option<LogitEpilogue>,
     pub chat: ChatSpec,
+}
+
+/// What the head runs on its logits after the output projection, in the
+/// graph's order: the scale, then the softcap.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LogitEpilogue {
+    /// `logit_scale`: every logit's factor.
+    pub scale: f32,
+    /// `final_logit_softcapping`: `cap·tanh(x/cap)`; 0: no cap.
+    pub softcap: f32,
 }
 
 /// The architectures a reader exists for.
@@ -85,6 +99,12 @@ pub enum Arch {
     /// Flint: dense lead, sigmoid MoE with one shared MLP, and independently
     /// masked sliding attention and RoPE. No executable program is registered.
     Flint,
+    /// Muse Spark: GQA layers whose sliding half ropes and full half does not, all of them routed
+    /// in a latent, no dense layer.
+    MuseSpark,
+    /// A dense Llama: GQA layers with the pairwise (NORM) rope and a SwiGLU
+    /// feed-forward block of `feed_forward_length`, on an untied head.
+    Llama,
 }
 
 impl Arch {
@@ -110,6 +130,8 @@ impl Arch {
             Arch::GemmaEmbedding => "gemma-embedding",
             Arch::GemmaEmbedding2 => "gemma-embedding2",
             Arch::Flint => "flint",
+            Arch::MuseSpark => "muse-spark",
+            Arch::Llama => "llama",
         }
     }
 }
@@ -241,6 +263,9 @@ pub struct Gqa {
     pub rope: Rope,
     /// A per-head RMS gain on q and k before the rope.
     pub qk_norm: bool,
+    /// A per-head gainless RMS norm on the heads' outputs, at the block
+    /// norm's epsilon, before the output gate.
+    pub o_norm: bool,
     /// The gate on the attention output; [`OutGate::None`]: the output is not gated.
     pub out_gate: OutGate,
     /// `None`: every position is attended.
@@ -511,7 +536,8 @@ pub struct Rope {
 /// How a rope pairs a head's values.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RopeMode {
-    /// GPT-J pairs over the last `dims` values.
+    /// GPT-J pairs over the last `dims` values; with `dims == head_dim` it is
+    /// llama's NORM rope, pairs `(2i, 2i + 1)` over the whole head.
     NormTail,
     /// NeoX halves over the first `dims` values.
     Neox,
@@ -556,6 +582,14 @@ pub struct Moe {
     /// and their weighted sum projected back up after (`ffn_latent_up`);
     /// `None`: they read and write the hidden row.
     pub latent: Option<u32>,
+    /// `ffn_pre_exp_norm`: a weighted RMS norm on the experts' input — the
+    /// latent, when they run in one — at the block norm's epsilon; `false`:
+    /// the projection's output is their input.
+    pub pre_exp_norm: bool,
+    /// `ffn_post_exp_norm`: the experts' aggregated output scaled by its
+    /// weight, then normalized at this epsilon, before the router's weights
+    /// apply; `None`: no norm.
+    pub post_exp_norm: Option<f32>,
     /// The routed experts' activation.
     pub act: Act,
     pub router: Router,
@@ -659,11 +693,19 @@ impl Act {
 }
 
 /// How a layer's outputs join the residual.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Residual {
     Plain,
     /// The owning spec's [`HcSpec`].
     Hc,
+    /// Per-channel α·stream + β·branch (`attn_resid_alpha`/`beta`,
+    /// `ffn_resid_alpha`/`beta`): each sublayer's output is normalized at
+    /// `eps` before it joins — the attention's weightlessly, the
+    /// feed-forward's scaled by its `post_ffw_norm` weight then normalized —
+    /// and α² + β² = 1 per channel, resolved at conversion.
+    AlphaBeta {
+        eps: f32,
+    },
 }
 
 /// Hyper-connections: the residual carried in several streams.
@@ -800,6 +842,42 @@ pub enum ToolFormat {
     /// A call on tagged lines: `<|tool_call:start|>NAME`, one `<|tool_arg:start|>KEY<|tool_arg:value|>VALUE
     /// <|tool_arg:end|>` per argument, `<|tool_call:end|>`, which Solar-Open's template teaches.
     TagKv,
+    /// Muse Spark's recipient protocol: a turn is `to=<recipient><|message|>` messages ended by
+    /// `<|eom|>` (more follow) or `<|eot|>` (the turn's end), `to=self` the reasoning span and
+    /// `to=<tool>` a call in ATEM markup (`<atem:function_calls>`).
+    MuseSpark,
+}
+
+impl ToolFormat {
+    /// The format a chat template's call markup spells, for the formats a
+    /// description names from the template alone (`formats`' table). `None`:
+    /// no such markup, so no parser is named for the file.
+    #[must_use]
+    pub fn of_template(template: &str) -> Option<ToolFormat> {
+        formats::tool_of(template)
+    }
+}
+
+/// The markup of [`ToolFormat::QwenXml`], spelled once: the template table
+/// names a file's format by the markers its template teaches, and the
+/// server's scanner reads a reply by the same strings.
+pub mod function_xml {
+    /// Opens a call.
+    pub const CALL_OPEN: &str = "<tool_call>";
+    /// Closes a call.
+    pub const CALL_CLOSE: &str = "</tool_call>";
+    /// Opens the call's function, its name to the `>` (`<function=NAME>`).
+    pub const FUNCTION_OPEN: &str = "<function=";
+    /// Closes the function.
+    pub const FUNCTION_CLOSE: &str = "</function>";
+    /// Opens a parameter, its name to the `>` (`<parameter=KEY>`).
+    pub const PARAM_OPEN: &str = "<parameter=";
+    /// Closes a parameter.
+    pub const PARAM_CLOSE: &str = "</parameter>";
+    /// Ends a value a template frames on lines of its own
+    /// (`<parameter=KEY>\nVALUE\n</parameter>`): the newline before the tag
+    /// and the one after it are the markup's own.
+    pub const PARAM_VALUE_CLOSE: &str = "\n</parameter>\n";
 }
 
 /// A reasoning span syntax.
@@ -820,6 +898,13 @@ impl ReasoningFormat {
         open: "<think>",
         close: "</think>",
     };
+
+    /// The span a chat template opens (`formats`' table). `None`: the
+    /// template opens no span, so the output is not split.
+    #[must_use]
+    pub fn of_template(template: &str) -> Option<ReasoningFormat> {
+        formats::span_of(template)
+    }
 }
 
 /// A draft, read to be paired with a target.
@@ -971,6 +1056,24 @@ pub struct BlockDraft {
 }
 
 impl ModelSpec {
+    /// The first routed mixture: the one every routed layer of a file shares
+    /// (the readers hold them to one count and width). `None`: no layer
+    /// routes, the whole feed-forward side is dense.
+    #[must_use]
+    pub fn routed(&self) -> Option<&Moe> {
+        self.layers.iter().find_map(LayerSpec::moe)
+    }
+
+    /// The first GQA layer's mixer: the head shape and rope the trunk's
+    /// attention layers share. `None`: no layer attends.
+    #[must_use]
+    pub fn gqa(&self) -> Option<&Gqa> {
+        self.layers.iter().find_map(|l| match &l.mixer {
+            Mixer::Gqa(g) => Some(g),
+            _ => None,
+        })
+    }
+
     /// The layers before the first routed one.
     #[must_use]
     pub fn dense_lead(&self) -> u32 {

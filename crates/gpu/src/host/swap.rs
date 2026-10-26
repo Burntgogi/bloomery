@@ -279,11 +279,63 @@ impl Residency {
 
 // ----------------------------------------------------------------- source
 
-/// How the lane turns an expert's source bytes into its slot's bytes.
+/// How the lane turns an expert's source bytes into its slot's bytes, as it
+/// stages them: the same bytes, moved and checked, so a slot is its source's
+/// length ([`Transform::apply`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Transform {
     /// The slot holds the source bytes as they are.
     Identity,
+    /// NVFP4 rows' code plane (a checkpoint folder's) into the card's NVFP4
+    /// code plane: each 16-value group's nibbles in the block's order
+    /// (`qdot::nvfp4_codes_to_blocks`, [`crate::mxfp4`]'s card layout).
+    Nvfp4Codes,
+    /// UE4M3 block scales as they are, the card's NVFP4 scale plane, each
+    /// byte checked: one that is no UE4M3 scale is refused by name, as the
+    /// card's NVFP4 load refuses it ([`crate::mxfp4::repack`]).
+    Ue4m3Scales,
+}
+
+impl Transform {
+    /// `src`, a part as its source holds it, into `dst`, its slot's bytes.
+    /// Refused by name, before `dst` is written: lengths that differ, codes
+    /// of no whole 16-value groups, a block-scale byte that is no UE4M3 scale
+    /// (bit 7 set, or E4M3's NaN 0x7F).
+    pub fn apply(self, src: &[u8], dst: &mut [u8]) -> Result<(), GpuError> {
+        const WHAT: &str = "Transform::apply";
+        if src.len() != dst.len() {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "{self:?}: {} source bytes into a slot part of {}",
+                    src.len(),
+                    dst.len()
+                ),
+            ));
+        }
+        match self {
+            Transform::Identity => dst.copy_from_slice(src),
+            Transform::Nvfp4Codes => qdot::nvfp4_codes_to_blocks(src, dst)
+                .map_err(|e| GpuError::shape(WHAT, format!("{self:?}: {e}")))?,
+            Transform::Ue4m3Scales => {
+                // Every UE4M3 scale byte is below 0x7F: the max is one pass the
+                // compiler vectorizes, the position only for the refusal.
+                if src.iter().fold(0u8, |m, &b| m.max(b)) >= 0x7F {
+                    let at = src.iter().position(|&b| b >= 0x7F).unwrap_or(0);
+                    return Err(GpuError::shape(
+                        WHAT,
+                        format!(
+                            "{self:?}: byte {at} is {:#04x}, no UE4M3 scale (bit 7 set, or E4M3's \
+                             NaN)",
+                            src[at]
+                        ),
+                    ));
+                }
+                dst.copy_from_slice(src);
+            }
+        }
+        Ok(())
+    }
 }
 
 /// One part of an expert as its source holds it: `bytes`, turned into the
@@ -4263,8 +4315,54 @@ mod tests {
     use super::super::slots::{HOST, Slot, SlotMap};
     use super::{
         CardTable, LATE_RING, LateAt, LateFlip, LateRing, Residency, SetDiff, SlotLedger,
-        SlotState, TableCheck, TableOff, Tally,
+        SlotState, TableCheck, TableOff, Tally, Transform,
     };
+    use crate::GpuError;
+
+    /// A slot part is its source's bytes moved and checked: the codes in the
+    /// block's order (`qdot`'s rule), the block scales and the identity as
+    /// they are; a scale byte that is no UE4M3 scale (0x7F, and bit 7 set)
+    /// and lengths that differ are refused by name with the slot unwritten.
+    /// Mutant: `Ue4m3Scales` copying without its check — the 0x7F and 0x80
+    /// arms take the bytes.
+    #[test]
+    fn a_transform_moves_its_bytes_and_refuses_a_byte_that_is_no_scale() {
+        let src: Vec<u8> = (0..64u8).map(|i| i.wrapping_mul(37)).collect();
+        let mut want = vec![0u8; src.len()];
+        qdot::nvfp4_codes_to_blocks_scalar(&src, &mut want).expect("whole groups");
+        let mut got = vec![0xA5u8; src.len()];
+        Transform::Nvfp4Codes
+            .apply(&src, &mut got)
+            .expect("whole groups");
+        assert_eq!(got, want, "the codes in the block's order");
+        let scales: Vec<u8> = (0..0x7Fu8).collect();
+        let mut slot = vec![0xA5u8; scales.len()];
+        Transform::Ue4m3Scales
+            .apply(&scales, &mut slot)
+            .expect("every byte below 0x7F is a scale");
+        assert_eq!(slot, scales);
+        Transform::Identity.apply(&src, &mut got).expect("equal");
+        assert_eq!(got, src);
+        for bad in [0x7Fu8, 0x80, 0xFF] {
+            let mut part = vec![0x10u8; 32];
+            part[19] = bad;
+            let mut slot = vec![0xA5u8; 32];
+            match Transform::Ue4m3Scales.apply(&part, &mut slot) {
+                Err(GpuError::Shape { detail, .. }) => assert!(
+                    detail.contains("byte 19") && detail.contains("no UE4M3 scale"),
+                    "{detail}"
+                ),
+                other => panic!("byte {bad:#04x} is no scale, got {other:?}"),
+            }
+            assert!(slot.iter().all(|&b| b == 0xA5), "a refusal wrote the slot");
+        }
+        match Transform::Identity.apply(&src, &mut [0u8; 63]) {
+            Err(GpuError::Shape { detail, .. }) => {
+                assert!(detail.contains("64 source bytes"), "{detail}");
+            }
+            other => panic!("lengths that differ are refused, got {other:?}"),
+        }
+    }
 
     /// A card table against its map and ledger: the map's own copy is off
     /// neither; a copy that kept a landed flip's victim in its old slot is

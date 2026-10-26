@@ -1,14 +1,22 @@
 //! `bloomery-serve --model mimo2` — the llama-server-compatible HTTP API on
 //! the MiMo-V2.6-Flash engine: a mimo2 file, its layers on one card, the
-//! routed experts the plan puts on the card and the rest on the host tier
+//! routed experts the plan puts on the card, on an expert tier card under a
+//! placement with one (plan (b′), `--place bp`) and the rest on the host tier
 //! (`placement::plan_routed` through `PlanInputs::plan_with_slots`), opened as
 //! `gate_mimo2_e2e` opens it (`app::Loaded`, in graph mode with the step
 //! captured).
 //!
+//! An unset `--place` with two cards in view takes the tier card when the
+//! plan's tier holds at least [`TIER_RULE`]'s break-even (`Place::choose`).
+//! The body serves its tier beside one sequence ([`Tiered::TIER_SLOTS`]):
+//! with `--parallel` past 1 an unset `--place` runs `a`, and a set placement
+//! with a tier card is refused by name before the plan.
+//!
 //!     bloomery-serve --model mimo2 [-m PATH | --hf <repo>[:<quant>]]
 //!                    [--host 127.0.0.1] [--port 8080] [--ctx C] [--alias NAME]
 //!                    [--chat-template-file PATH] [--place W] [--plan]
-//!                    [--prefill batch|steps] [--parallel N] [--queue-depth Q]
+//!                    [--cache-ram MIB] [--prefill batch|steps] [--parallel N]
+//!                    [--queue-depth Q] [--slot-save-path DIR]
 //!                    [--api-key KEY] [--api-key-file FNAME]
 //!
 //! The server takes `-m`/`--hf` out before this seat parses (its module
@@ -26,7 +34,7 @@
 //! then steps the last, as `bloomery-serve --model qwen3` does; a round of
 //! several slots is one pass of every busy slot's row (`GpuModel::step_slots`,
 //! the body's `SlotRows`, through `serve_seats::rounds::step_rows_one_pass`),
-//! the `parallel` line's `pass=one`; a prompt cache is refused by name, and
+//! the `parallel` line's `pass=one`; the prompt cache is `--cache-ram`, and
 //! the load refuses an expert tier card.
 //!
 //! `--parallel N` serves N resident sequences (`app::Session::add_slots`):
@@ -43,9 +51,10 @@
 //! batches of up to a union's columns (`batch`, the default), or one decode
 //! step an id (`steps`, the same-binary arm); the two leave the same bits. A
 //! word other than those is refused naming the flag and the word. The batch
-//! feed's buffers come out of the card's free bytes at the load, refused by
-//! name when they do not fit, and the group lever is not read: a group runs
-//! one batch.
+//! feed's shared buffers and first unit are the plan's reserve
+//! (`place::prompt_reserve_bytes`, held by the body when it makes them), and the
+//! units a prompt group past one adds come out of the card's free bytes,
+//! refused by name when they do not fit.
 //!
 //! `--place W` is the shared placement word (`generate::Place`): `a` (the
 //! largest visible card), `gate`, or one card of the census by name or
@@ -73,7 +82,8 @@
 //! line (`placement::ctx_ask::Chosen::line`: the rule — `set`, `target` or
 //! `halved`, with the memory a halving was short of —, a slot's context, the
 //! slots, the total and the model's limit), the `plan`
-//! record (its `ctx_max` a slot's), the `parallel` line (`rule=slots
+//! record (its `ctx_max` a slot's), the `cache` line (`bind::CacheRam::line`),
+//! the `parallel` line (`rule=slots
 //! slots=N slot_ctx=C total=N·C from=<word> pass=one`); then the `load`
 //! record (architecture, resident bytes of every slot, a slot's context,
 //! slots, layers, the routed experts the plan keeps on the host and on the
@@ -86,14 +96,18 @@
 //! (`app::Keep for Body`): the caches are per-position and the body takes its
 //! rollback as given, so every held position is keepable and a resend that
 //! diverges at `j` re-feeds from `j` and nothing before it. No prompt call is
-//! cut (`Seat::splits` marks nowhere). The seat runs no prompt cache: a save
-//! and a resume are refused by name.
+//! cut (`Seat::splits` marks nowhere). `--cache-ram MIB` is the prompt cache's
+//! budget (`bind::CacheRam`: unset, the default; `0` turns it off). A saved
+//! state is the body's sequence (`seq_save`): every layer's K and V up to the
+//! position, a window layer its ring. A second session reuses a saved prefix.
+//! `--slot-save-path DIR` names the directory the slot actions answer from (none
+//! refuses every one, as llama-server does): `erase` drops the slot's cache.
 //!
 //! `BLOOMERY_RESIDENCY` is the common machine's lever: set, its word as given
 //! (refused by name beside `--prefill steps`, and where the plan's card slots
 //! leave it no room); unset, the serving word on every placement but `gate`,
 //! which the plan then keeps, moves or turns `off` with why
-//! ([`bloomery_levers::residency_unset`], [`residency::at_plan`]). Its
+//! ([`bloomery_levers::residency_unset`], [`bloomery_gpu_gates::residency::at_plan`]). Its
 //! `residency lever` record (and, under `mid`, the `residency host` record of
 //! the churn pool) comes before the plan's own. Under `mid` the experts the
 //! card holds are the machine's to move by use, in the host leg's shadow.
@@ -105,9 +119,10 @@
 //! unset, the row's default, 2; the `load` record's `group` is what the body
 //! holds), and `BLOOMERY_PIN_MAIN` with `BLOOMERY_HOST_LANES` (the engine
 //! thread pinned to the dispatcher's cpu slot, which gives the host legs the
-//! pool's CCD map). The plan reserves no card bytes for the prompt batch, so
-//! the batch's units, a group of 2's included, come out of the card's margin
-//! and are refused by name past its free bytes. The seat
+//! pool's CCD map). The plan reserves the prompt batch's shared buffers and
+//! first unit, so the units a group past one adds, a group of 2's second and
+//! third included, come out of the card's margin and are refused by name past
+//! its free bytes. The seat
 //! sits behind the `deepseek41` feature beside `mimo2`: the server surface it
 //! binds through (`bind`, the `serve` and `sampler` crates) is scoped to
 //! `deepseek41`; it runs no V4.1 code.
@@ -119,31 +134,34 @@ use app::arch::mimo2::Mimo2Cfg;
 use app::{Loaded, OpenArgs, OpenLog, Session, SessionError};
 use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::model::StepMode;
+use bloomery_gpu_gates::GateError;
 use bloomery_gpu_gates::beside::{self, Beside};
-use bloomery_gpu_gates::bind::{Seat, SlotStep, note_line};
-use bloomery_gpu_gates::generate::{Lane, Place};
+use bloomery_gpu_gates::bind::{Cached, PutBack, Seat, SlotStep, note_line, put_back};
+use bloomery_gpu_gates::generate::{Lane, Place, TierRule};
 use bloomery_gpu_gates::record::{self, Record};
-use bloomery_gpu_gates::residency38::{churn_bytes, residency_room, residency_set};
 use bloomery_gpu_gates::side_seat;
-use bloomery_gpu_gates::{GateError, residency};
-use bloomery_gpu_mimo2::{Body, Mimo2Model, PrefillMode};
-use bloomery_levers::{ChurnHosting, Levers, ResidencyAt, ResidencyPick, ResidencyWhy};
+use bloomery_gpu_mimo2::{
+    Body, Mimo2Model, MimoSeq, PrefillMode, seq_bytes, seq_resume, seq_resume_prefix, seq_save,
+};
+use bloomery_levers::{Levers, ResidencyPick};
 use gguf::Split;
 use model::arch::Arch;
 use model::arch::mimo2::place::PlanInputs;
+use model::placement::workstation::TierBatchBytes;
 use model::placement::{Machine, PlacementError, Plan};
 use runtime::Target as _;
 use serve::{CacheNote, Saved, ServeError};
 
 use super::rounds;
-use super::tiered::{self, Tiered};
+use super::tiered::{self, CacheFlag, Tiered};
 
 const NAME: &str = "bloomery-serve-mimo2";
 
 const USAGE: &str = "usage: bloomery-serve --model mimo2 [-m PATH | --hf <repo>[:<quant>]] \
                      [--host H] [--port P] [--ctx C] [--alias NAME] [--chat-template-file PATH] \
-                     [--place W] [--plan] [--prefill batch|steps] [--parallel N] \
-                     [--queue-depth Q] [--api-key KEY] [--api-key-file FNAME]";
+                     [--place W] [--plan] [--cache-ram MIB] [--prefill batch|steps] \
+                     [--parallel N] [--queue-depth Q] [--slot-save-path DIR] \
+                     [--api-key KEY] [--api-key-file FNAME]";
 
 /// The levers this seat acts on: the plan's card budget and the host set's
 /// load settings, which the open reads (`PlanLevers::from_levers`,
@@ -164,24 +182,37 @@ pub const ACTS_ON: &[&str] = &[
     bloomery_levers::SCHEMAJUMP,
 ];
 
+/// The family's input to the common unset rule (`Place::choose`): the one
+/// expert tier card the body hangs, kept only when the plan puts at least this
+/// many experts on it — the tier size whose host time saved covers a two-card
+/// step's cost on the step's path (docs/cards/mimo2-2card.card).
+pub const TIER_RULE: TierRule = TierRule {
+    tiers: bloomery_gpu::host::SERVED_TIERS,
+    break_even: Some(1_553),
+    basis: "docs/cards/mimo2-2card.card",
+};
+
 /// Whether a round of several slots runs as one pass of the busy rows
 /// (`GpuModel::step_slots`, the body's `SlotRows`): the `parallel` line's
 /// `pass=` word and [`Seat::step_slots`] read this one value.
 const ONE_PASS: bool = true;
 
-/// Why the seat takes no sequence state: it runs no prompt cache.
-const NO_CACHE: &str = "the mimo2 seat runs no prompt cache";
+/// What [`Cached::of`] names this seat's state as.
+const WHOSE: &str = "a mimo2 body's";
 
 /// The flags this seat takes beside the common ones ([`SeatFlags`]).
 struct Flags {
     /// `--prefill`: how a prompt call is fed.
     prefill: PrefillMode,
+    /// `--cache-ram` and the budget over it.
+    cache_ram: CacheFlag,
 }
 
 impl Default for Flags {
     fn default() -> Self {
         Flags {
             prefill: PrefillMode::Batch,
+            cache_ram: CacheFlag::default(),
         }
     }
 }
@@ -292,7 +323,7 @@ impl Mimo {
         let args = OpenArgs {
             place: a.place.name(),
             machine: beside::with_reserve(
-                a.place.machine_untiered()?,
+                a.place.machine(None, a.tier_batch)?,
                 Beside {
                     image: None,
                     embedding: a.embedding,
@@ -391,17 +422,50 @@ impl Seat for Mimo {
         Vec::new()
     }
 
-    /// Never asked: the seat's prompt cache budget is 0.
+    /// The sequence state ([`seq_save`]), as the prompt cache holds it.
     fn snapshot(&mut self) -> Result<Arc<dyn Saved>, GateError> {
-        Err(format!("a snapshot: {NO_CACHE}").into())
+        let state = seq_save(self.s.model_mut())?;
+        Ok(Arc::new(Cached::<MimoSeq, ()>::landed(state, ())))
     }
 
-    fn resume(&mut self, _state: &dyn Saved) -> Result<(), GateError> {
-        Err(format!("a resume: {NO_CACHE}").into())
+    /// The state put back ([`seq_resume`]) after the session's reset.
+    fn resume(&mut self, state: &dyn Saved) -> Result<(), GateError> {
+        put_back(self, state, WHOSE, |g, body| {
+            seq_resume(g.s.model_mut(), body).map(|()| body.positions())
+        })
+        .map(drop)
+    }
+
+    /// The first `n` positions the state can be cut to put back after the
+    /// session's reset ([`seq_resume_prefix`]): the sequence's next call runs
+    /// as it would have after the whole state's resume and a rollback to the
+    /// returned position.
+    fn resume_prefix(&mut self, state: &dyn Saved, n: usize) -> Result<usize, GateError> {
+        let n = u32::try_from(n).unwrap_or(u32::MAX);
+        put_back(self, state, WHOSE, |g, body| {
+            seq_resume_prefix(g.s.model_mut(), body, n)
+        })
     }
 
     fn note(note: &CacheNote) {
         note_line(NAME, note);
+    }
+}
+
+impl PutBack for Mimo {
+    type Body = MimoSeq;
+    type Side = ();
+
+    fn takes(&self, _side: &()) -> Result<(), GateError> {
+        Ok(())
+    }
+
+    fn reset_selected(&mut self) -> Result<(), GateError> {
+        Ok(self.s.model_mut().reset()?)
+    }
+
+    fn unpark(&mut self, _side: &()) -> Result<(), GateError> {
+        Ok(())
     }
 }
 
@@ -416,6 +480,8 @@ impl Tiered for Mimo {
     const FAMILY: &'static str = "mimo2";
     const SERVES: &'static str = "mimo2";
     const RESIDENT: bool = true;
+    const TIER_SLOTS: bool = false;
+    const TIER_RULE: TierRule = TIER_RULE;
 
     fn accepts(arch: Arch) -> bool {
         matches!(arch, Arch::Mimo2)
@@ -433,6 +499,12 @@ impl Tiered for Mimo {
         PlanInputs::read(split)
     }
 
+    /// The tier card's prompt-batch bytes ([`bloomery_gpu_mimo2::tier::tier_batch`]), under a
+    /// placement with one.
+    fn tier_batch(place: Place, inputs: &PlanInputs) -> Option<TierBatchBytes> {
+        (!place.tier_cards().is_empty()).then(|| bloomery_gpu_mimo2::tier::tier_batch(inputs))
+    }
+
     fn flags(flag: &str, value: &str, out: &mut Flags) -> Result<bool, GateError> {
         match flag {
             "--prefill" => {
@@ -440,68 +512,45 @@ impl Tiered for Mimo {
                     .ok_or_else(|| format!("--prefill is batch or steps, not {value}"))?;
                 Ok(true)
             }
-            _ => Ok(false),
+            _ => out.cache_ram.take(flag, value),
         }
+    }
+
+    /// [`CacheFlag::budget`] over the plan's store bytes ([`seq_bytes`]: one position, each
+    /// window layer's ring whole): a default under one saved state is off.
+    fn cache_budget(
+        flags: &Self::Flags,
+        plan: &Plan<'_>,
+        pool: u64,
+        slot_ctx: usize,
+        inputs: &model::arch::place_hybrid::PlanInputs<Self::H>,
+    ) -> Result<u64, GateError> {
+        flags
+            .cache_ram
+            .budget(plan, pool, slot_ctx, |n| seq_bytes(inputs, slot_ctx, n))
     }
 
     /// `BLOOMERY_RESIDENCY`: set as given, else the serving word on a serving placement, which
     /// the plan keeps, moves or turns off. The steps feed ends a decode pass per prompt id, which
-    /// the machine's rule counts.
+    /// the machine's rule counts. The body's pool is what it declares.
     fn residency(
         levers: &Levers,
         flags: &Flags,
         place: Place,
         plan: &Plan<'_>,
     ) -> Result<Option<ResidencyPick>, GateError> {
-        let pick = levers.residency_at(ResidencyAt {
-            serving_place: place != Place::Gate,
-            check_finite: false,
-            route_trace: false,
-            prefill_steps: flags.prefill == PrefillMode::Steps,
-        });
-        if pick.why == ResidencyWhy::Set
-            && pick.word != "off"
-            && flags.prefill == PrefillMode::Steps
-        {
-            return Err(format!(
-                "BLOOMERY_RESIDENCY={} is refused beside --prefill steps (each prompt id would \
-                 end a pass the rule counts)",
-                pick.word
-            )
-            .into());
-        }
-        let pick = residency::at_plan(
-            <Body as bloomery_gpu::model::ChainBody>::UNHOSTED_POOL,
+        tiered::residency_pick(
+            levers,
+            place,
             plan,
-            0,
-            pick,
-        )?;
-        record::residency_lever(pick).eprint();
-        if let Some(d) = pick.why.detail() {
-            eprintln!("{d}");
-        }
-        Ok(Some(pick))
+            flags.prefill == PrefillMode::Steps,
+            <Body as bloomery_gpu::model::ChainBody>::UNHOSTED_POOL,
+        )
+        .map(Some)
     }
 
     fn settle(plan: &Plan<'_>, pick: ResidencyPick) -> Result<(Residency, u64), GateError> {
-        let residency = Residency::parse(pick.word)?;
-        if pick.why == ResidencyWhy::Set {
-            residency_room(plan, residency, pick.word)?;
-        }
-        residency_set(
-            plan,
-            0,
-            residency,
-            ChurnHosting::Hosted,
-            pick.word,
-            0,
-            Record::eprint,
-        )?;
-        // The hosted churn pool is host bytes the load holds beside the plan.
-        Ok((
-            residency,
-            churn_bytes(plan, 0, (residency, ChurnHosting::Hosted))?,
-        ))
+        tiered::settle_pick(plan, pick)
     }
 
     fn open(a: tiered::Open<Flags>) -> Result<Mimo, GateError> {

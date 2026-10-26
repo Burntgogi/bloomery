@@ -1,0 +1,15 @@
+Source of musespark-chat-template.jinja (kept byte-exact; this file records it):
+
+The `tokenizer.chat_template` value of the Muse Spark Open specimen the musespark gates load
+(unsloth/Muse-Spark-Open-816B-A42B-GGUF rev c00670568b6c, UD-IQ2_XXS, first shard; 16,295 bytes, the
+`TEMPLATE` length `crates/model/tests/musespark_meta.rs` pins), read from the shard's header.
+sha256 2341a2d3b1f1b0ac92b6237d46e2fff495109bd3305cacdea54726f5e98411db  musespark-chat-template.jinja
+
+It differs from llama.cpp's `models/templates/muse-spark.jinja` (PR 30616): the effort map is
+{low 8, medium 32, high 256, xhigh 512} with the default `xhigh` (the PR's: {minimal 1, low 16, medium 64, high 256},
+no default); the embedded bytes are the specimen's contract. A turn is `<|start|>ROLE<|message|>` … `<|eot|>`; an
+assistant message's reasoning is a `to=self` message ended by `<|eom|>`, its answer a `to=user` message ended by
+`<|eot|>`, and the generation prompt is `<|start|>assistant`, so the model writes its own ` to=…<|message|>`. It
+reads `strftime_now` where it is defined (the server defines none: the `Current date` line is then left out unless
+the request sends `current_date`). Not in `FIXTURE_TEMPLATES`: only the render test and the reply-split test
+(`hw_musespark_*` in `serve.rs`) read it.

@@ -168,8 +168,8 @@ const DRAFT_MAP: u64 = 993_280;
 const LIST_ROWS: u32 = 40_960;
 // The largest context each card holds with the draft (full head), as predicted [derived: the plan
 // test's room after its fixed terms, less the draft granules 2,785,017,856 B, the map 993,280 B
-// and the arena 48,808,108 B, over 30,720 B a position — the cache's 28,416, the draft store's
-// 2,048 and the stage rope table's 256 — the last pool counted whole, then one fewer]. The clause
+// and the arena 48,849,324 B, over 30,720 B a position (the cache's 28,416, the draft store's
+// 2,048 and the stage rope table's 256), the last pool counted whole, then one fewer]. The clause
 // holds the boundary to this prediction plus one, as well as checking both sides of the boundary.
 // PIN(2026-10-15): the arena stays one fixed addend (mtp_arena_bytes at vocab 248,320). Room
 // 37,251,097,876 (A6000) and 11,649,066,260 (3090) over 30,720 is 1,212,600 and 379,201; the pin
@@ -180,7 +180,16 @@ const LIST_ROWS: u32 = 40_960;
 // PIN(2026-10-24): the arena falls 4,718,592 B (the store walk's query rows and turned queries),
 // so the room is 37,293,565,204 (A6000) and 11,691,533,588 (3090) over 30,720: 1,213,983 and
 // 380,583; the pin is one fewer.
-const CARD_MAX_CTX_MTP: [(&str, u64); 2] = [("A6000", 1_213_982), ("3090", 380_582)];
+// PIN(2026-10-24): HC's BF16 bottleneck adds (4,096 + 64) · 644 = 2,679,040 B to the target
+// scratch and draft arena. Rooms 37,290,886,164 and 11,688,854,548 over 30,720 give these boundaries.
+// PIN(2026-10-24): the GDN layers' carries take 17,902,656 B (qwen4exp_meta's KV_AT), so the room is
+// 37,275,662,548 (A6000) and 11,673,630,932 (3090) over 30,720: 1,213,400 and 380,001; the pin is one
+// fewer.
+// PIN(2026-10-25): HC and carry terms leave 37,272,983,508 and 11,670,951,892 B over 30,720 B.
+// PIN(2026-10-25): the ubatch arena's flash rows leave the target scratch, 100,663,296 B at 4,096
+// positions: rooms 37,373,646,804 and 11,771,615,188 over 30,720 give 1,216,590 and 383,190; the pin
+// is one fewer.
+const CARD_MAX_CTX_MTP: [(&str, u64); 2] = [("A6000", 1_216_589), ("3090", 383_189)];
 
 /// The plan with the shared draft (`place::PlanInputs::plan_mtp`): on each
 /// card at 4,096 and 32,768 positions the target's plan is `plan`'s field
@@ -201,7 +210,8 @@ fn hw_qwen4exp_mtp_plan() {
         self, KERNEL_POSITIONS, MtpInputs, PlaceError, PlanInputs,
     };
     use model::placement::workstation::{A6000, RTX_3090};
-    use model::placement::{PlanLevers, Violation};
+    use model::placement::{PlanLevers, STEP_PORT_COLUMNS, Violation};
+    use runtime::stores::DELTA_LANES;
 
     let mut o = String::new();
     let mut b: Vec<String> = Vec::new();
@@ -232,14 +242,19 @@ fn hw_qwen4exp_mtp_plan() {
     )
     .unwrap_or_else(|e| panic!("MtpInputs::read with a list: {e}"));
     let levers = PlanLevers::default();
+    // A drafted plan steps `DELTA_LANES` columns a slot through the arena's floor
+    // (its verify rows), plan() one: the host terms compare without that field,
+    // which is pinned apart below.
     let view = |p: &model::placement::Plan<'_>| {
+        let mut host = p.host.clone();
+        host.arena_columns = 0;
         format!(
             "{:?}",
-            (&p.rows, &p.cards, &p.host, p.nvme_bytes, &p.n_l, p.ctx_max)
+            (&p.rows, &p.cards, &host, p.nvme_bytes, &p.n_l, p.ctx_max)
         )
     };
     for card in [A6000, RTX_3090] {
-        let machine = place::machine(card, inputs.hp.n_layer, place::UBATCH_PLANNED);
+        let machine = place::machine(card, inputs.spec.layers.len(), place::UBATCH_PLANNED);
         for ctx in [4096u64, 32_768] {
             let plain = inputs
                 .plan(&machine, ctx, &levers)
@@ -273,10 +288,17 @@ fn hw_qwen4exp_mtp_plan() {
                 );
                 let headroom = plain.cards[0].headroom_bytes
                     - i128::from(with.draft_card_bytes() + with.arena_bytes);
+                // PIN(2026-10-25): the drafted plan counts its verify lanes in the
+                // paged arena's floor (`DELTA_LANES` columns a slot, capped at the
+                // step port), plan() one column; before that the whole host terms
+                // were equal. The rest of the target's plan is still plan()'s.
+                let columns = (with.plan.host.arena_columns, plain.host.arena_columns);
+                let columns_want = (DELTA_LANES.min(STEP_PORT_COLUMNS) as u64, 1);
                 check(
                     &mut o,
                     format!(
-                        "{} ctx {ctx} {label}: the target's plan is plan()'s ({}); draft \
+                        "{} ctx {ctx} {label}: the target's plan is plan()'s but for the arena's \
+                         columns ({}); columns {columns:?} (want {columns_want:?}); draft \
                          (dense, experts, rounding, kv, map) {got:?} (want {want:?}); n_l {:?}; \
                          headroom {} = the target's {} less {}",
                         card.name,
@@ -287,6 +309,7 @@ fn hw_qwen4exp_mtp_plan() {
                         with.draft_card_bytes() + with.arena_bytes
                     ),
                     view(&with.plan) == view(&plain)
+                        && columns == columns_want
                         && got == want
                         && with.draft.n_l == [512]
                         && with.headroom_bytes == headroom,
@@ -297,7 +320,7 @@ fn hw_qwen4exp_mtp_plan() {
             for ctx in [4096u64, 4352, 32_768] {
                 let machine = place::machine_for_experts(
                     card,
-                    inputs.hp.n_layer,
+                    inputs.spec.layers.len(),
                     place::UBATCH_PLANNED.min(ctx),
                     experts,
                 );
@@ -369,7 +392,7 @@ fn hw_qwen4exp_mtp_plan() {
             - at.draft.cards[0].kv_bytes;
         let limit = at.plan.usable_bytes(spec) - spec.margin_bytes;
         let kv = |ctx: u64| -> u64 {
-            (0..inputs.hp.n_layer)
+            (0..inputs.spec.layers.len())
                 .map(|l| model::placement::KvBytes::layer_bytes(&inputs.kv, l, ctx))
                 .sum::<u64>()
                 + ctx * DRAFT_KV_ROW
@@ -471,8 +494,23 @@ fn hw_qwen4exp_mtp_plan() {
 // (`place::mtp_arena_bytes`, 4,718,592 B less): plan (a)'s drafted row gains 2 experts, both cards'
 // totals the same 2, and the tier keeps its 7,236 experts on other layers [the box's planner on
 // this tree printed this row].
+// PIN(2026-10-24): HC's BF16 bottleneck and refusal narrow the A6000's split by one layer;
+// the tier keeps 7,236 experts, with their types and granules moving with the split.
+// PIN(2026-10-24): the A6000 242 on the first 47 layers and 241 on the rest, 11,615 experts (was 243
+// on the first 5, 11,621), both cards 393 on the first 35 layers (was 41), the tier's 22,676,889,600 B
+// of experts (was 22,674,944,000) and 146,415,616 B of rounding (was 148,361,216); the host 5,725
+// experts (was 5,719). The GDN layers' carries (17,902,656 B of kv) take 6 experts off plan (a)'s
+// drafted row and both cards' totals lose the same 6: the tier keeps its 7,236 experts, on other
+// layers [derived: the planner on this tree over the file's tensor table (its headers) printed this
+// row].
+// PIN(2026-10-25): the combined HC and carry reserves move one expert off each card's prefix;
+// the tier still holds 7,236 experts, with 22,677,401,600 B and 145,903,616 B of rounding.
+// PIN(2026-10-25): the A6000 243 on the first 43 layers and 242 on the rest (was 242 on the first
+// 46), both cards 394 on the first 31 layers (was 393 on the first 34). The ubatch arena's flash rows
+// leave the stage's scratch, 100,663,296 B at 4,096 positions; the tier keeps its 7,236 experts, its
+// bytes and rounding [derived: the planner on this tree over the pinned headers printed this row].
 const BP_DRAFTED: (u64, usize, u64, u64, usize, u64, u64, u64) =
-    (243, 5, 242, 393, 41, 7_236, 22_674_944_000, 148_361_216);
+    (243, 43, 242, 394, 31, 7_236, 22_677_401_600, 145_903_616);
 
 /// Plan (b′) of the Qwen3.8 file with the shared draft (`place::machine_bp`
 /// with `MtpInputs::card_bytes` as the A6000's reserve, `plan_mtp_with`
@@ -509,9 +547,9 @@ fn hw_qwen4exp_bp_mtp_plan() {
     let mtp = MtpInputs::read(&draft, &target, &inputs, HeadSet::Full)
         .unwrap_or_else(|e| panic!("MtpInputs::read {SHARED}: {e}"));
     let (ctx, u) = (4096u64, 4096u64);
-    let n = inputs.hp.n_layer;
+    let n = inputs.spec.layers.len();
     let levers = PlanLevers::default();
-    let batch = tier_batch(&inputs.hp, u);
+    let batch = tier_batch(&inputs.spec, u);
     let bytes = mtp
         .card_bytes(ctx)
         .unwrap_or_else(|e| panic!("card_bytes: {e}"));

@@ -466,7 +466,7 @@ mod gate {
             let p = planned.facts();
             println!(
                 "plan card={} ctx_max={} ubatch={UBATCH} host_experts={} card_experts={} \
-                 card_budget={:?} media={media}",
+                 card_budget={} media={media}",
                 self.card.name,
                 p.ctx_max,
                 p.host_experts,
@@ -1391,7 +1391,7 @@ mod gate {
             card,
             host: levers.host(),
             plan_levers: PlanLevers {
-                card_budget_bytes: Some(budget),
+                card_budget_bytes: Some(budget).into(),
             },
         };
 

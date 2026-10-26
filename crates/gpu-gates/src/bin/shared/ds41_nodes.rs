@@ -55,26 +55,28 @@ impl Predicted {
 /// or kv, being K-quants, already had the norm leave it; two more on a
 /// layer the candidate mask gives a role — the source's block keys and
 /// selection, a consumer's compaction and remap; one more for the
-/// q8_1 of the heads when wo_a is a K-quant and one for wo_a's when wo_b
-/// is a q3_K/q4_K) and the MoE sub-layer's (its own count: ten with card
+/// q8_1 of the heads when wo_a reads q8_1 and one for wo_a's when wo_b
+/// does; a projection of Q5_K, Q8_0 or BF16 weights reads f32 and takes no
+/// q8_1 launch, so index keys cost two when their projection is one) and the MoE sub-layer's (its own count: ten with card
 /// experts, seven without, one more for a q8_1 shared down projection);
 /// the glue's (the broadcast, three and two per engram site and one more
 /// for the looked-up rows' q8_1 when wkv is a K-quant, the collapse and
 /// the head's four) and the gather — less one launch for each projection
 /// a Q3_K row join folds into another's (`join_projections`). The types
 /// come from `split`. Printed as the table G2 pins.
+/// Whether a layer whose MoE piece enqueues `ffn_launches` kernels (`FfnPiece::launches`) runs card
+/// experts: the piece enqueues 7 without them and 10 with them, one more in either case when the
+/// shared expert's down reads q8_1 rows.
+pub fn has_card_experts(ffn_launches: usize) -> bool {
+    ffn_launches >= 10
+}
+
 pub fn predicted(split: &Split, hp: &Hparams, body: &Body) -> Result<Predicted, GateError> {
     let ty = |name: String| {
         split
             .find(&name)
             .map(|(_, t)| t.ty)
             .ok_or_else(|| format!("{name} is not in the file"))
-    };
-    let kquant = |t: GgmlType| {
-        matches!(
-            t,
-            GgmlType::Q3_K | GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K
-        )
     };
     let q8_1 = |t: GgmlType| matches!(t, GgmlType::Q3_K | GgmlType::Q4_K);
     let mut kinds: Vec<(String, usize, usize, usize)> = Vec::new();
@@ -98,19 +100,30 @@ pub fn predicted(split: &Split, hp: &Hparams, body: &Body) -> Result<Predicted, 
         let folded = usize::from(join_qkv) * (1 + usize::from(k.indexer))
             + usize::from(join_query)
             + usize::from(join_kv_gate);
+        // PIN(2026-10-25): the launches that only quantize an activation to q8_1 go with the
+        // weights that read it (`Dense::reads_q8_1`: Q3_K and Q4_K); a Q5_K, Q8_0 or BF16
+        // projection reads the f32 activation (ISTA's dense types). The index keys' q8_1 of the
+        // pooled row follows indexer.attn_k, the indexer's q8_1 of the normed input indexer.proj,
+        // and wo_a's q8_1 of the heads wo_a itself; Q3_K files count as before.
+        let keys_q8_1 = k.index_keys && q8_1(ty(names::indexer_attn_k(l))?);
+        let proj_q8_1 = k.indexer && q8_1(ty(names::indexer_proj(l))?);
         let attn = 14 - folded
             + own.map_or(0, |c| 1 + if c.gated { 2 } else { 1 })
-            + if k.index_keys { 3 } else { 0 }
+            + if k.index_keys {
+                2 + usize::from(keys_q8_1)
+            } else {
+                0
+            }
             + match (k.indexer, own) {
                 (false, _) => 0,
                 (true, Some(_)) => 4,
-                (true, None) if normed_q8_1 => 4,
+                (true, None) if normed_q8_1 || !proj_q8_1 => 4,
                 (true, None) => 5,
             }
             // PIN(2026-10-02): the candidate mask's launches (candwire): two on its
             // source and two on each consumer, 2 + 4 × 2 = 10 a step on the V4.1 file.
             + 2 * usize::from(hp.candidate_role(l).is_some())
-            + usize::from(kquant(ty(names::attn_output_a(l))?))
+            + usize::from(q8_1(ty(names::attn_output_a(l))?))
             + usize::from(q8_1(ty(names::attn_output_b(l))?));
         let ffn = body
             .ffn_launches(l)
@@ -131,7 +144,11 @@ pub fn predicted(split: &Split, hp: &Hparams, body: &Body) -> Result<Predicted, 
                 None => "",
             },
             if k.engram.is_some() { "+engram" } else { "" },
-            if ffn > 7 { "+card" } else { "+host-only" }
+            if has_card_experts(ffn) {
+                "+card"
+            } else {
+                "+host-only"
+            }
         );
         match kinds.iter_mut().find(|e| e.0 == name) {
             Some(e) => e.3 += 1,

@@ -8,9 +8,11 @@ use std::fmt;
 
 /// The routed slot counts the join's device entries are built for: one
 /// entry per count, picked at launch, and every other count refused by
-/// name.
+/// name. A launcher with no entry for one of them refuses it by name too.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Slots {
+    /// Four slots a token (MiniMax-M3.1-Flash): the `_4` entries.
+    Four,
     /// Six slots a token (DeepSeek-V4.1): the original entries.
     Six,
     /// Eight slots a token (GLM-5.3-Flash): the `_8` entries.
@@ -27,7 +29,7 @@ impl fmt::Display for SlotsRefused {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{} routed slots a token: the join's entries are built for 6 and 8",
+            "{} routed slots a token: the join's entries are built for 4, 6 and 8",
             self.n_used
         )
     }
@@ -39,6 +41,7 @@ impl Slots {
     /// The instance for `n_used` slots a token, or the count refused.
     pub fn of(n_used: usize) -> Result<Slots, SlotsRefused> {
         match n_used {
+            4 => Ok(Slots::Four),
             6 => Ok(Slots::Six),
             8 => Ok(Slots::Eight),
             _ => Err(SlotsRefused { n_used }),
@@ -49,6 +52,7 @@ impl Slots {
     #[must_use]
     pub const fn n(self) -> usize {
         match self {
+            Slots::Four => 4,
             Slots::Six => 6,
             Slots::Eight => 8,
         }
@@ -94,24 +98,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn slots_of_takes_six_and_eight_only() {
+    fn slots_of_takes_four_six_and_eight_only() {
         for n in 0..=16 {
             match Slots::of(n) {
                 Ok(s) => {
-                    assert!(n == 6 || n == 8, "{n} slots picked an instance");
+                    assert!(matches!(n, 4 | 6 | 8), "{n} slots picked an instance");
                     assert_eq!(s.n(), n);
                 }
                 Err(e) => {
-                    assert!(n != 6 && n != 8, "{n} slots refused");
+                    assert!(!matches!(n, 4 | 6 | 8), "{n} slots refused");
                     assert_eq!(e, SlotsRefused { n_used: n });
                     let text = e.to_string();
                     assert!(text.starts_with(&format!("{n} routed slots")), "{text}");
                 }
             }
         }
+        assert_eq!(Slots::of(4), Ok(Slots::Four));
         assert_eq!(Slots::of(6), Ok(Slots::Six));
         assert_eq!(Slots::of(8), Ok(Slots::Eight));
-        for n in [5, 7, 9] {
+        for n in [3, 5, 7, 9] {
             assert_eq!(Slots::of(n), Err(SlotsRefused { n_used: n }));
         }
     }

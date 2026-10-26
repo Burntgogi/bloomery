@@ -91,6 +91,7 @@ pub fn spec() -> FixtureSpec {
         card_budget: CardBudget::Planned(Budget {
             ctx: BUDGET_CTX,
             card_experts,
+            card_set_aside: None,
         }),
         window: Window::new(D_MIN, D_MAX).expect("[2^-14, 2^-6] is inside the normal f16 values"),
         ff: None,
@@ -118,7 +119,7 @@ fn card_experts(split: &Split, budget: Option<u64>) -> Result<CardExperts, Fixtu
     super::card_experts_with(
         split,
         budget,
-        |inputs| workstation::placed_with_arena(RTX_3090, inputs.hp.n_trunk, PLACED_SCRATCH),
+        |inputs| workstation::placed_with_arena(RTX_3090, inputs.spec.layers.len(), PLACED_SCRATCH),
         |inputs, machine, levers| {
             inputs.plan_rule(
                 machine,

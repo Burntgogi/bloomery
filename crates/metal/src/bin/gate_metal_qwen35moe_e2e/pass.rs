@@ -5,7 +5,7 @@
 //! - `q_short` (p′): a prompt of at most a step's window of ids is the step
 //!   path: the batch session and the steps session leave the same pick, logits
 //!   row bits, delta lanes, conv rings and key and value rows, and the batch
-//!   session's rows arena was never opened.
+//!   session ran no pass.
 //! - `q_state` (u): the prompt as one pass against the same ids stepped one at
 //!   a time: layer 0's recurrent state and conv ring within [`U_L0_REL`] of
 //!   the stepped run's; every delta layer's state distance printed.
@@ -21,10 +21,29 @@
 //! - `q_fault`: an id past the vocabulary in a pass raises the token-id site
 //!   at layer 0, the position does not move, the next pass and the next step
 //!   are refused by poison, and after the reset a pass runs clean.
+//! - `q_layers`: an unprofiled pass is one command buffer a layer and one
+//!   host wait, and it leaves the profiled pass's pick, logits row and
+//!   stores bit for bit, the profiled pass committing a buffer an op.
 //! - `q_free`: the same N greedy tokens teacher-forced through the pass run
 //!   and the stepped run: every layer's output of every token within
 //!   [`FREE_BAND`] of the stepped run's, and the routers' picks differing in
 //!   no more than [`FREE_FLIPS_MAX`] sites.
+//! - `q_mark`: a pass's copies of its delta stores (`StateOut::after_rows`)
+//!   move none of its bits (pick, logits row, every store); the copy after
+//!   its last row, taken as a point and cut back to, is the pass's own end
+//!   state bit for bit; a copy's ring slots of the positions before the pass
+//!   are the ring the pass found; and a copy is the same bits whichever other
+//!   copies the pass takes.
+//! - `q_mark_cut`: a prompt marked at two positions inside a pass, cut back
+//!   to each mark and continued to the end, twice: the same pick, logits row
+//!   and stores both times, and the tokens after it within `q_free`'s band of
+//!   the stepped run's.
+//! - `q_tensor`: `q_free` with the pass's GEMMs on the tensor-op kernels
+//!   (`Library::with_tensor_gemms`), forced on any device that builds them,
+//!   held to the same band and cap: the tensor path's dot band is `q_free`'s
+//!   f16 operand roundings plus an f32 sum of at most K − 1 additions a term
+//!   (the kernels gate's `gemm_band`), under 2^-11 of a dot's magnitude at
+//!   K = 2,048, so the pass is another realization of the same rule.
 
 use std::path::Path;
 
@@ -36,9 +55,11 @@ use bloomery_metal::arch::qwen3moe::session::{
 };
 use bloomery_metal::device::MetalDevice;
 use bloomery_metal::kernels::{CONV_TAPS, HEAD_COLS, HEAD_DIM, KV_HEADS, RING_ROWS, VALUE_HEADS};
-use bloomery_metal::library::Library;
+use bloomery_metal::library::{GemmPath, Library};
 use runtime::prompt::PrefillMode;
+use runtime::{Target, Want};
 
+use super::chain;
 use super::flip;
 use super::free::{FREE_BAND, FREE_FLIPS_MAX};
 use super::keep;
@@ -88,9 +109,24 @@ const CONV_ROWS: usize = CONV_TAPS - 1;
 /// A row of the cache: one cell's key (or value) heads.
 const KV_ROW: usize = KV_HEADS * HEAD_DIM;
 
+/// The ids of `q_layers`'s pass: more than a step's window, so the pass runs
+/// every rows arm.
+const Q_LAYERS_IDS: usize = 100;
+
 /// The greedy tokens `q_free` teacher-forces: with the fixture's four layers,
 /// the sixteen router sites [`FREE_FLIPS_MAX`] is derived over.
 const FREE_STEPS: usize = 4;
+
+/// The ids `q_mark` passes, and the rows its copies follow: an inner row
+/// before the ring's length, one past it, and the last.
+const MARK_IDS: usize = 40;
+const MARK_ROWS: [u32; 3] = [6, 25, 39];
+
+/// The marks `q_mark_cut` puts inside its prompt's second pass (a point every
+/// [`MARK_EVERY`]): one where the ring is all that pass's rows, one whose ring
+/// the pass's last rows overwrite.
+const MARK_CUTS: [u32; 2] = [700, 1017];
+const MARK_EVERY: u32 = 512;
 
 /// The ids of a prompt of `n` ids: the d1k set's first.
 pub(super) fn prompt_ids(n: usize) -> Result<Vec<u32>, String> {
@@ -331,13 +367,14 @@ pub fn q_short(device: &MetalDevice, library: &Library, path: &Path) -> Clause {
         }
         notes.push(n.to_string());
     }
-    if let Some(bytes) = batch.rows_arena_bytes() {
+    let passes = batch.stats().passes;
+    if passes != 0 {
         return Err(format!(
-            "a prompt of at most a step's window opened the rows arena ({bytes} bytes)"
+            "prompts of at most a step's window ran {passes} passes; they are steps"
         ));
     }
     Ok(Verdict::Noted(format!(
-        "prompts of {} ids leave the steps run's pick, logits, states, rings and cache rows bit for bit; no rows arena opened",
+        "prompts of {} ids leave the steps run's pick, logits, states, rings and cache rows bit for bit; no pass ran",
         notes.join(", ")
     )))
 }
@@ -348,7 +385,7 @@ pub fn q_state(device: &MetalDevice, library: &Library, path: &Path) -> Clause {
     let ctx = ids.len() + 1;
     let mut pass = open(device, library, path, ctx, 2048, PrefillMode::Batch)?;
     let a = run_prompt(&mut pass, &ids)?;
-    if pass.rows_arena_bytes().is_none() {
+    if pass.stats().passes == 0 {
         return Err("a prompt of 1,024 ids did not take the pass".to_string());
     }
     drop(pass);
@@ -530,10 +567,10 @@ pub fn q_ref(device: &MetalDevice, library: &Library, path: &Path) -> Clause {
     let b = traced_step(&mut steps, *tok)?;
     let mut worst_ratio = 0f64;
     let (mut worst_a, mut worst_b) = (0f64, 0f64);
-    for l in 0..n {
+    for (l, want) in ik_out.iter().enumerate().take(n) {
         let (ea, eb) = (
-            flip::rel_to(&a.outs[l], &ik_out[l]),
-            flip::rel_to(&b.outs[l], &ik_out[l]),
+            flip::rel_to(&a.outs[l], want),
+            flip::rel_to(&b.outs[l], want),
         );
         worst_a = flip::worse(worst_a, ea);
         worst_b = flip::worse(worst_b, eb);
@@ -576,6 +613,31 @@ pub fn q_ref(device: &MetalDevice, library: &Library, path: &Path) -> Clause {
 /// `q_free`: the greedy tokens of the stepped run teacher-forced through the
 /// pass run.
 pub fn q_free(device: &MetalDevice, library: &Library, path: &Path) -> Clause {
+    free_run(device, library, path, "q_free")
+}
+
+/// `q_tensor`: `q_free` with the pass's GEMMs from the tensor-op program
+/// `tensor_text` (the shipped one, or a mutant's).
+pub fn q_tensor(device: &MetalDevice, library: &Library, tensor_text: &str, path: &Path) -> Clause {
+    let tensor = Library::tensor_from_source_text(device, tensor_text)
+        .map_err(|e| format!("the tensor-op GEMMs do not build here: {e}"))?;
+    let forced = library.with_tensor_gemms(tensor);
+    if forced.gemm_path() != GemmPath::TensorOps {
+        return Err(format!(
+            "the forced library's GEMMs are {}, not the tensor-op ones",
+            forced.gemm_path().name()
+        ));
+    }
+    let line = free_run(device, &forced, path, "q_tensor")?;
+    match line {
+        Verdict::Noted(line) => Ok(Verdict::Noted(format!("tensor-op GEMMs: {line}"))),
+        other => Ok(other),
+    }
+}
+
+/// The greedy tokens of the stepped run teacher-forced through the pass run,
+/// both sessions on `library`'s kernels.
+fn free_run(device: &MetalDevice, library: &Library, path: &Path, clause: &str) -> Clause {
     let ids = prompt_ids(1024)?;
     let ctx = ids.len() + FREE_STEPS + 1;
     let mut pass = open(device, library, path, ctx, 2048, PrefillMode::Batch)?;
@@ -595,7 +657,7 @@ pub fn q_free(device: &MetalDevice, library: &Library, path: &Path) -> Clause {
         if a.top == b.top {
             agree += 1;
         }
-        println!("q_free token {t}: picks pass={} steps={}", a.top, b.top);
+        println!("{clause} token {t}: picks pass={} steps={}", a.top, b.top);
         tok = b.top;
     }
     let line = format!(
@@ -672,5 +734,241 @@ pub fn q_fault(device: &MetalDevice, library: &Library, path: &Path) -> Clause {
     Ok(Verdict::Noted(format!(
         "a pass with id {bad} raised {fault} and left the position at 0; the next pass and step \
          were refused by poison; after the reset a pass of 12 ids ran clean"
+    )))
+}
+
+/// A pass of [`Q_LAYERS_IDS`] ids as the prompt runs it and as the profile runs
+/// it: what each left, and the buffers and waits each moved.
+pub fn q_layers(device: &MetalDevice, library: &Library, path: &Path) -> Clause {
+    let both = prompt_ids(2 * Q_LAYERS_IDS)?;
+    let (ids, other) = both.split_at(Q_LAYERS_IDS);
+    let mut s = open(
+        device,
+        library,
+        path,
+        Q_LAYERS_IDS + 1,
+        2048,
+        PrefillMode::Batch,
+    )?;
+    // A first pass of other ids, outside the counted one, leaves its rows in
+    // the arena: a row an op reads before the op ahead of it wrote holds those.
+    s.pass(other, PassOut::None, StateOut::default())
+        .map_err(says)?;
+    s.reset().map_err(says)?;
+    let before = s.stats();
+    let one = s
+        .pass(ids, PassOut::Last, StateOut::default())
+        .map_err(says)?;
+    let moved = chain::moved(&s, before);
+    let layers = s.layer_count() as u64;
+    if moved.submits != layers || moved.waits != 1 {
+        return Err(format!(
+            "a pass of {Q_LAYERS_IDS} ids committed {} command buffers and waited {} times; a \
+             buffer a layer ({layers}) and one wait are expected",
+            moved.submits, moved.waits
+        ));
+    }
+    let logits = bits(s.logits_row().map_err(says)?);
+    let one_stores = read_stores(&mut s, one.id, logits)?;
+    s.reset().map_err(says)?;
+    let mut samples = Vec::new();
+    let before = s.stats();
+    let per_op = s
+        .pass_profile(ids, PassOut::Last, &mut samples)
+        .map_err(says)?;
+    let moved = chain::moved(&s, before);
+    if moved.submits != samples.len() as u64 {
+        return Err(format!(
+            "the profiled pass committed {} command buffers for {} ops; one an op is expected",
+            moved.submits,
+            samples.len()
+        ));
+    }
+    let logits = bits(s.logits_row().map_err(says)?);
+    let per_op_stores = read_stores(&mut s, per_op.id, logits)?;
+    if let Some(why) = differs(
+        "a buffer a layer against a buffer an op",
+        &one_stores,
+        &per_op_stores,
+    ) {
+        return Err(why);
+    }
+    if one.count != per_op.count {
+        return Err(format!(
+            "the layers' buffers encoded {:?}; the ops' buffers {:?}",
+            one.count, per_op.count
+        ));
+    }
+    Ok(Verdict::Noted(format!(
+        "a pass of {Q_LAYERS_IDS} ids is {layers} command buffers (one a layer) and one wait, and \
+         leaves the pick, logits row, states, rings and cache rows of the profiled pass's {} \
+         buffers bit for bit",
+        samples.len()
+    )))
+}
+
+/// The pass of `ids` from zero stores taking copies after the rows `after`,
+/// and what it left.
+fn copied_pass(s: &mut Session, ids: &[u32], after: &[u32]) -> Result<Stores, String> {
+    s.reset().map_err(says)?;
+    let passed = s
+        .pass(ids, PassOut::Last, StateOut { after_rows: after })
+        .map_err(says)?;
+    let logits = bits(s.logits_row().map_err(says)?);
+    read_stores(s, passed.id, logits)
+}
+
+/// The delta layers' stores at `at`, a point the session holds: one step on
+/// from the position, then the cut back to it. The attention rows read are
+/// those before `at`, which neither the step nor the cut moves.
+fn stores_at_point(s: &mut Session, at: u32, end: &Stores) -> Result<Stores, String> {
+    Target::step(s, end.pick, Want::Argmax).map_err(says)?;
+    Target::cut(s, at).map_err(says)?;
+    read_stores(s, end.pick, end.logits.clone())
+}
+
+/// The first delta layer whose ring in `at`, a copy after row `r` of a pass
+/// from 0, differs from `found` (the ring that pass found) in a slot of a
+/// position before the pass: slots `r + 1..`, which the copy takes from the
+/// ring as it was.
+fn found_slots(at: &Stores, found: &Stores, r: usize) -> Option<usize> {
+    at.layers
+        .iter()
+        .zip(&found.layers)
+        .position(|(a, f)| match (a, f) {
+            (Store::Rec { ring: a, .. }, Store::Rec { ring: f, .. }) => {
+                let from = (r + 1) * (f.len() / RING_ROWS);
+                bits(&a[from..]) != bits(&f[from..])
+            }
+            _ => false,
+        })
+}
+
+/// `q_mark`: a pass's copies are its own state at their rows and move none of
+/// its bits.
+pub fn q_mark(device: &MetalDevice, library: &Library, path: &Path) -> Clause {
+    let ids = prompt_ids(MARK_IDS)?;
+    let mut s = open(
+        device,
+        library,
+        path,
+        MARK_IDS + 2,
+        2048,
+        PrefillMode::Batch,
+    )?;
+    s.reset().map_err(says)?;
+    let found = read_stores(&mut s, 0, Vec::new())?;
+    let plain = copied_pass(&mut s, &ids, &[])?;
+    let [inner, outer, last] = MARK_ROWS;
+    let mut seen: Vec<(u32, Stores)> = Vec::new();
+    for after in [[inner, last], [outer, last], [inner, outer]] {
+        let what = format!("the pass copying after rows {after:?}");
+        let got = copied_pass(&mut s, &ids, &after)?;
+        if let Some(why) = differs(&what, &got, &plain) {
+            return Err(format!("{why}, against the pass with no copies"));
+        }
+        for &r in &after {
+            s.checkpoint_copy(r + 1).map_err(says)?;
+        }
+        // Descending, so each cut finds the point it names.
+        for &r in after.iter().rev() {
+            let at = stores_at_point(&mut s, r + 1, &got)?;
+            let held = format!("{what}: the point at {} from its copy", r + 1);
+            if r == last
+                && let Some(why) = differs(&held, &at, &plain)
+            {
+                return Err(format!("{why}, against the pass's own end"));
+            }
+            if (r as usize) + 1 < RING_ROWS
+                && let Some(l) = found_slots(&at, &found, r as usize)
+            {
+                return Err(format!(
+                    "{held}: delta layer {l}'s ring slots before the pass are not the ring the \
+                     pass found"
+                ));
+            }
+            match seen.iter().find(|(row, _)| *row == r) {
+                Some((_, first)) => {
+                    if let Some(why) = differs(&held, &at, first) {
+                        return Err(format!("{why}, against the same row's copy beside another"));
+                    }
+                }
+                None => seen.push((r, at)),
+            }
+        }
+    }
+    Ok(Verdict::Noted(format!(
+        "{MARK_IDS} ids as one pass copying after rows {MARK_ROWS:?} two at a time: the pick, logits \
+         row and every store of the pass with none; the copy after the last row is the pass's end, \
+         the copy after row {inner} keeps the found ring before the pass, and each copy the same \
+         beside either other"
+    )))
+}
+
+/// `q_mark_cut`: cut back to a mark inside a pass and continued, twice, and
+/// the tokens after it against the stepped run's.
+pub fn q_mark_cut(device: &MetalDevice, library: &Library, path: &Path) -> Clause {
+    let ids = prompt_ids(1024)?;
+    let ctx = ids.len() + FREE_STEPS + 1;
+    let mut steps = open(device, library, path, ctx, 2048, PrefillMode::Steps)?;
+    let (_, pick) = keep::prompt_bits(&mut steps, &ids)?;
+    let mut want = Vec::with_capacity(FREE_STEPS);
+    let mut tok = pick;
+    for _ in 0..FREE_STEPS {
+        let t = traced_step(&mut steps, tok)?;
+        tok = t.top;
+        want.push(t);
+    }
+    let mut s = open(device, library, path, ctx, MARK_EVERY, PrefillMode::Batch)?;
+    s.reset().map_err(says)?;
+    Target::prompt_marked(&mut s, &ids, &MARK_CUTS, Want::Argmax).map_err(says)?;
+    if s.stats().passes == 0 {
+        return Err("a prompt of 1,024 ids did not take the pass".to_string());
+    }
+    let layers = s.layer_count();
+    let mut notes = Vec::new();
+    // Descending: a cut drops the points past it.
+    for &u in MARK_CUTS.iter().rev() {
+        let rest = &ids[u as usize..];
+        let mut first: Option<Stores> = None;
+        for _ in 0..2 {
+            Target::cut(&mut s, u).map_err(says)?;
+            let (logits, pick) = keep::prompt_bits(&mut s, rest)?;
+            let got = read_stores(&mut s, pick, logits)?;
+            match &first {
+                Some(a) => {
+                    if let Some(why) = differs(&format!("continued from {u} again"), &got, a) {
+                        return Err(why);
+                    }
+                }
+                None => first = Some(got),
+            }
+        }
+        let start = first.as_ref().map_or(pick, |a| a.pick);
+        let (mut worst, mut flips) = (0f64, 0usize);
+        let mut tok = pick;
+        for b in &want {
+            let a = traced_step(&mut s, tok)?;
+            for l in 0..layers {
+                worst = flip::worse(worst, flip::rel_to(&a.outs[l], &b.outs[l]));
+                flips +=
+                    usize::from(a.ids[l][..a.ids[l].len() - 1] != b.ids[l][..b.ids[l].len() - 1]);
+            }
+            tok = b.top;
+        }
+        let line = format!(
+            "from {u}: {FREE_STEPS} teacher-forced tokens worst layer output {worst:.3e} of the \
+             stepped run's (band {FREE_BAND}), {flips} router sites with other picks (cap \
+             {FREE_FLIPS_MAX}), pick {start} against the stepped run's {pick}"
+        );
+        if worst > FREE_BAND || flips > FREE_FLIPS_MAX {
+            return Err(line);
+        }
+        notes.push(line);
+    }
+    Ok(Verdict::Noted(format!(
+        "1,024 ids in passes of {MARK_EVERY} marked at {MARK_CUTS:?}, cut back to each and \
+         continued twice: the same pick, logits row and stores; {}",
+        notes.join("; ")
     )))
 }

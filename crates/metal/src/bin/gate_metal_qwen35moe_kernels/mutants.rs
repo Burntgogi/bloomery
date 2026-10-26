@@ -14,16 +14,24 @@
 //! `attn_bounds` also have a kernel-side contract, and the kernel mutants
 //! below pin that side. The gate's refusal loop turns red on a deleted launch
 //! check; a table that stayed green on one would be wrong.
+//!
+//! The tensor-op GEMMs' mutants ([`TENSOR_MUTANTS`]) edit their own program's
+//! text ([`TENSOR_SOURCE`]) and are caught by the `tensor_*` clauses, which
+//! run those kernels on any device that compiles them.
 
-use bloomery_metal::library::SOURCE;
+#[path = "../shared/mutants.rs"]
+mod program;
 
-/// A defect and the clause that must be red on it.
-pub struct Mutant {
-    pub name: &'static str,
-    pub clause: &'static str,
-    pub why: &'static str,
-    /// `(find, replace, occurrences of find)`, applied in order.
-    pub edits: &'static [(&'static str, &'static str, usize)],
+pub use program::{Mutant, Program, source_of};
+
+/// Every mutant of both tables, with the program it edits.
+pub fn all() -> impl Iterator<Item = (&'static Mutant, Program)> {
+    program::all(MUTANTS, TENSOR_MUTANTS)
+}
+
+/// The mutant of this name, and the program it edits.
+pub fn find(name: &str) -> Option<(&'static Mutant, Program)> {
+    all().find(|(m, _)| m.name == name)
 }
 
 const TAIL_STORE_FIND: &str =
@@ -546,6 +554,16 @@ pub const MUTANTS: &[Mutant] = &[
         )],
     },
     Mutant {
+        name: "head_last_group",
+        clause: "head_partial",
+        why: "the final reduction stops one candidate short, so the last threadgroup's winner is lost",
+        edits: &[(
+            "for (uint g = tid; g < groups; g += HEAD_THREADS) {",
+            "for (uint g = tid; g < groups - 1u; g += HEAD_THREADS) {",
+            1,
+        )],
+    },
+    Mutant {
         name: "head_ticket",
         clause: "head_ticket",
         why: "the step id is one past the selected row",
@@ -598,6 +616,26 @@ pub const MUTANTS: &[Mutant] = &[
         edits: &[(
             "uint slot = (args.pos + r) % BLOOMERY_DELTA_RING_ROWS;",
             "uint slot = (args.pos + r + 1u) % BLOOMERY_DELTA_RING_ROWS;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "snap_row_late",
+        clause: "delta_rows_snap",
+        why: "the rows launch copies the state lane one row after the row its copy names",
+        edits: &[(
+            "if (copy < copies && r == snaps->after[copy]) {",
+            "if (copy < copies && r == snaps->after[copy] + 1u) {",
+            1,
+        )],
+    },
+    Mutant {
+        name: "snap_ring_dropped",
+        clause: "delta_rows_snap",
+        why: "the rows launch leaves a copy's conv ring unwritten",
+        edits: &[(
+            "    snap[(ulong)k * snaps.ring_len + s * args.ch + c] = v;",
+            "    (void)v;",
             1,
         )],
     },
@@ -956,13 +994,13 @@ pub const MUTANTS: &[Mutant] = &[
         why: "the pair's output is not scaled by the slot's route weight",
         edits: &[
             (
-                "p[o] = pair_swiglu(c[i][j].x, c[i][j + 2].x) * rw;",
-                "p[o] = pair_swiglu(c[i][j].x, c[i][j + 2].x);",
+                "p[o] = pair_swiglu(c[i][0].x, c[i][1].x) * rw;",
+                "p[o] = pair_swiglu(c[i][0].x, c[i][1].x);",
                 1,
             ),
             (
-                "p[o + 1] = pair_swiglu(c[i][j].y, c[i][j + 2].y) * rw;",
-                "p[o + 1] = pair_swiglu(c[i][j].y, c[i][j + 2].y);",
+                "p[o + 1] = pair_swiglu(c[i][0].y, c[i][1].y) * rw;",
+                "p[o + 1] = pair_swiglu(c[i][0].y, c[i][1].y);",
                 1,
             ),
         ],
@@ -973,13 +1011,13 @@ pub const MUTANTS: &[Mutant] = &[
         why: "the pair applies silu to the up projection and multiplies by the gate",
         edits: &[
             (
-                "p[o] = pair_swiglu(c[i][j].x, c[i][j + 2].x) * rw;",
-                "p[o] = pair_swiglu(c[i][j + 2].x, c[i][j].x) * rw;",
+                "p[o] = pair_swiglu(c[i][0].x, c[i][1].x) * rw;",
+                "p[o] = pair_swiglu(c[i][1].x, c[i][0].x) * rw;",
                 1,
             ),
             (
-                "p[o + 1] = pair_swiglu(c[i][j].y, c[i][j + 2].y) * rw;",
-                "p[o + 1] = pair_swiglu(c[i][j + 2].y, c[i][j].y) * rw;",
+                "p[o + 1] = pair_swiglu(c[i][0].y, c[i][1].y) * rw;",
+                "p[o + 1] = pair_swiglu(c[i][1].y, c[i][0].y) * rw;",
                 1,
             ),
         ],
@@ -989,8 +1027,8 @@ pub const MUTANTS: &[Mutant] = &[
         clause: "grouped_gemm",
         why: "the pair's activation rows are the places' own, not the slots' pass rows",
         edits: &[(
-            "const ulong src_row = args.gather != 0u ? (ulong)(sorted[place] / BLOOMERY_EXPERT_SLOTS) : (ulong)place;",
-            "const ulong src_row = (ulong)place;",
+            "args.gather != 0u ? (ulong)(sorted[b_place] / BLOOMERY_EXPERT_SLOTS) : (ulong)b_place;",
+            "(ulong)b_place;",
             1,
         )],
     },
@@ -998,19 +1036,35 @@ pub const MUTANTS: &[Mutant] = &[
         name: "routed_dead_fragment",
         clause: "grouped_gemm",
         why: "a fragment row-block that holds live rows but fewer than a block is treated as dead",
-        edits: &[(
-            "live[i] = gm + 16 * i < count;",
-            "live[i] = gm + 16 * i + 8 < count;",
-            1,
-        )],
+        edits: &[("switch ((count + 7) / 8) {", "switch (count / 8) {", 1)],
     },
     Mutant {
         name: "routed_range_off",
         clause: "grouped_gemm",
         why: "the grouped GEMM's f16 range check is gone, so an activation past the half range casts to inf",
         edits: &[(
-            "const bool4 over = !(fabs(v) <= 65504.f);",
-            "const bool4 over = bool4(false);",
+            "const bool4 bad = !(fabs(v) <= 65504.f);",
+            "const bool4 bad = bool4(false);",
+            1,
+        )],
+    },
+    Mutant {
+        name: "routed_upper_rows",
+        clause: "grouped_oracle",
+        why: "the tile's second half of activation rows multiplies the first half's",
+        edits: &[(
+            "arow[i] = sb + (8 * i + fm) * LDA + fn;",
+            "arow[i] = sb + ((8 * i) % (ROUTED_ACTS / 2) + fm) * LDA + fn;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "routed_last_row_unstaged",
+        clause: "grouped_oracle",
+        why: "a run that fills its last fragment leaves that fragment's last row unstaged",
+        edits: &[(
+            "const bool b_stage = (short)(tiitg / 2) < 8 * NA;",
+            "const bool b_stage = (short)(tiitg / 2) < 8 * NA - 1;",
             1,
         )],
     },
@@ -1050,25 +1104,360 @@ pub const MUTANTS: &[Mutant] = &[
             1,
         )],
     },
+    Mutant {
+        name: "q8_0_lane_quarter",
+        clause: "q8_0_matvec",
+        why: "a Q8_0 lane dots its activations with the other quarter of the block's codes",
+        edits: &[(
+            "device const int8_t * qs = blk.qs + 8 * lane.il;",
+            "device const int8_t * qs = blk.qs + 8 * (lane.il ^ 1);",
+            1,
+        )],
+    },
+    Mutant {
+        name: "q8_0_tail_store",
+        clause: "q8_0_row_tail",
+        why: "the store of a pair no longer stops at the last row",
+        edits: &[(TAIL_STORE_FIND, TAIL_STORE_REPLACE, 1)],
+    },
+    Mutant {
+        name: "q8_0_norm_gain",
+        clause: "q8_0_norm",
+        why: "the Q8_0 norm load drops the gain of a value",
+        edits: &[("a0 *= gain[base + l + 0];", "a0 *= 1.f;", 1)],
+    },
+    Mutant {
+        name: "q8_0_seg_weights",
+        clause: "q8_0_seg",
+        why: "a segment reads the weights of the first segment",
+        edits: &[("W + (ulong)args.segs[s].wblocks,", "W,", 1)],
+    },
+    Mutant {
+        name: "q8_0_head_scale",
+        clause: "q8_0_headnorm",
+        why: "a Q8_0 block takes the neighbouring head's scale",
+        edits: &[(
+            "const int head = ib / (BLOOMERY_DELTA_HEAD_COLS / 32);",
+            "const int head = (ib / (BLOOMERY_DELTA_HEAD_COLS / 32)) ^ 1;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "q8_0_sum_sq",
+        clause: "q8_0_pair",
+        why: "the Q8_0 norm load's sum of squares drops a value",
+        edits: &[(
+            "*sum_sq += (a0 * a0 + a1 * a1) + (a2 * a2 + a3 * a3);\n                a0 *= gain[base + l + 0];",
+            "*sum_sq += (a0 * a0 + a1 * a1) + a2 * a2;\n                a0 *= gain[base + l + 0];",
+            1,
+        )],
+    },
+    Mutant {
+        name: "q8_0_fold_slot",
+        clause: "q8_0_fold",
+        why: "the Q8_0 fold maps every eight blocks, not every sixteen, to a slot",
+        edits: &[(
+            "        return isfinite(sum);\n    }\n\n    static inline int fold_blocks() {\n        return BLOOMERY_EXPERT_SLOTS * (BLOOMERY_EXPERT_K / values_per_block());\n    }\n\n    static inline int fold_slot(int ib) {\n        return ib / (BLOOMERY_EXPERT_K / values_per_block());",
+            "        return isfinite(sum);\n    }\n\n    static inline int fold_blocks() {\n        return BLOOMERY_EXPERT_SLOTS * (BLOOMERY_EXPERT_K / values_per_block());\n    }\n\n    static inline int fold_slot(int ib) {\n        return ib / 8;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "q8_0_dot_short",
+        clause: "q8_0_head",
+        why: "the Q8_0 code dot stops one value short of the lane's eight",
+        edits: &[(
+            "FOR_UNROLL (short i = 0; i < 8; ++i) {\n            sumq += qs[i] * lane.yl[i];",
+            "FOR_UNROLL (short i = 0; i < 7; ++i) {\n            sumq += qs[i] * lane.yl[i];",
+            1,
+        )],
+    },
+    Mutant {
+        name: "q8_0_value_unsigned",
+        clause: "q8_0_embed",
+        why: "the Q8_0 value reads its code as unsigned",
+        edits: &[(
+            "return (float)blk.qs[j] * (float)blk.d;",
+            "return (float)(uint8_t)blk.qs[j] * (float)blk.d;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "q8_0_chunk_half",
+        clause: "q8_0_gemm",
+        why: "a GEMM chunk stages the other half of its Q8_0 block",
+        edits: &[(
+            "device const int8_t * q = blk.qs + 16 * il;",
+            "device const int8_t * q = blk.qs + 16 * (il ^ 1);",
+            1,
+        )],
+    },
+    Mutant {
+        name: "q8_0_gemm_seg_out",
+        clause: "q8_0_gemm_seg",
+        why: "every GEMM segment stores at the first segment's output offset",
+        edits: &[(
+            "                           x,\n                           y + args.segs[s].out,",
+            "                           x,\n                           y,",
+            1,
+        )],
+    },
+    Mutant {
+        name: "q8_0_stage_unsigned",
+        clause: "q8_0_grouped",
+        why: "the GEMM staging reads the Q8_0 codes as unsigned",
+        edits: &[(
+            "reg[j / 4][j % 4] = (float)q[j] * d;",
+            "reg[j / 4][j % 4] = (float)(uint8_t)q[j] * d;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "q5k_high_bit",
+        clause: "q5k_matvec",
+        why: "the second group's fifth bit is read two bits up, not one",
+        edits: &[(
+            "const uint8_t hm2 = hm1 << 1;",
+            "const uint8_t hm2 = hm1 << 2;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "q5k_tail_store",
+        clause: "q5k_row_tail",
+        why: "the store of a pair no longer stops at the last row",
+        edits: &[(TAIL_STORE_FIND, TAIL_STORE_REPLACE, 1)],
+    },
+    Mutant {
+        name: "q5k_plain_load",
+        clause: "q5k_norm",
+        why: "the Q5_K load takes the plain form: no gain, no sum of squares",
+        edits: &[(
+            "Q4K::load<LOAD>(lane, block, gain, scale, sum_sq);",
+            "Q4K::load<LOAD_PLAIN>(lane, block, gain, scale, sum_sq);",
+            1,
+        )],
+    },
+    Mutant {
+        name: "q5k_seg_weights",
+        clause: "q5k_seg",
+        why: "a segment reads the weights of the first segment",
+        edits: &[("W + (ulong)args.segs[s].wblocks,", "W,", 1)],
+    },
+    Mutant {
+        name: "q5k_head_halves",
+        clause: "q5k_headnorm",
+        why: "the first half of a Q5_K block takes the second head's scale",
+        edits: &[("return lo * (d * (sc8[0]", "return hi * (d * (sc8[0]", 1)],
+    },
+    Mutant {
+        name: "q5k_dmin_sign",
+        clause: "q5k_pair",
+        why: "the Q5_K dmin correction is added, not subtracted",
+        edits: &[("- dmin * (lane.sumy[0]", "+ dmin * (lane.sumy[0]", 1)],
+    },
+    Mutant {
+        name: "q5k_fold_slot",
+        clause: "q5k_fold",
+        why: "the Q5_K fold maps every four blocks, not every two, to a slot",
+        edits: &[(
+            "        return Q4K::sums_finite(lane);\n    }\n\n    static inline int fold_blocks() {\n        return BLOOMERY_EXPERT_SLOTS * (BLOOMERY_EXPERT_K / values_per_block());\n    }\n\n    static inline int fold_slot(int ib) {\n        return ib / (BLOOMERY_EXPERT_K / values_per_block());",
+            "        return Q4K::sums_finite(lane);\n    }\n\n    static inline int fold_blocks() {\n        return BLOOMERY_EXPERT_SLOTS * (BLOOMERY_EXPERT_K / values_per_block());\n    }\n\n    static inline int fold_slot(int ib) {\n        return ib / 4;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "q5k_nibble_group",
+        clause: "q5k_head",
+        why: "the third group's nibbles are read from the first group's bytes",
+        edits: &[(
+            "acc1[2] += lane.yh[l + 0] * (q2[l] & 0x0F);",
+            "acc1[2] += lane.yh[l + 0] * (q1[l] & 0x0F);",
+            1,
+        )],
+    },
+    Mutant {
+        name: "q5k_fifth_bit",
+        clause: "q5k_embed",
+        why: "a value in a group's second half takes the first half's fifth bit",
+        edits: &[(
+            "const uint fifth = (blk.qh[l] >> (2 * group + high)) & 1;",
+            "const uint fifth = (blk.qh[l] >> (2 * group)) & 1;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "q5k_chunk_group",
+        clause: "q5k_gemm",
+        why: "a GEMM chunk takes the scale and min of the group two chunks on",
+        edits: &[(
+            "const float2 sm = group_scale(blk, il >> 1);",
+            "const float2 sm = group_scale(blk, il >> 2);",
+            1,
+        )],
+    },
+    Mutant {
+        name: "q5k_gemm_seg_out",
+        clause: "q5k_gemm_seg",
+        why: "every GEMM segment stores at the first segment's output offset",
+        edits: &[(
+            "                           x,\n                           y + args.segs[s].out,",
+            "                           x,\n                           y,",
+            1,
+        )],
+    },
+    Mutant {
+        name: "q5k_scale_byte",
+        clause: "q5k_grouped",
+        why: "the second half's groups take the mins' bytes as their scales",
+        edits: &[(
+            "const short at = (s & 1) + 4 * (s >> 2);",
+            "const short at = (s & 1) + 2 * (s >> 2);",
+            1,
+        )],
+    },
 ];
 
-/// The mutant of this name.
-pub fn find(name: &str) -> Option<&'static Mutant> {
-    MUTANTS.iter().find(|m| m.name == name)
-}
-
-/// The kernels' source with the mutant's edits applied.
-pub fn source_of(mutant: &Mutant) -> Result<String, String> {
-    let mut text = SOURCE.to_string();
-    for (find, replace, count) in mutant.edits {
-        let found = text.matches(find).count();
-        if found != *count {
-            return Err(format!(
-                "mutant {}: {find:?} occurs {found} times, not {count}",
-                mutant.name
-            ));
-        }
-        text = text.replace(find, replace);
-    }
-    Ok(text)
-}
+/// The tensor-op GEMMs' defects, at least one for each `tensor_*` clause.
+pub const TENSOR_MUTANTS: &[Mutant] = &[
+    Mutant {
+        name: "tensor_k_step_skipped",
+        clause: "tensor_gemm_q4k",
+        why: "the dense tile's K loop stops one step short: the last 32 columns are never multiplied",
+        edits: &[(
+            "    for (int k0 = 0; k0 < cols; k0 += BK) {",
+            "    for (int k0 = 0; k0 + BK < cols; k0 += BK) {",
+            1,
+        )],
+    },
+    Mutant {
+        name: "tensor_rows_offset",
+        clause: "tensor_gemm_q6k",
+        why: "the dense op's weight fragment starts one staged row late: every output takes the next weight row",
+        edits: &[(
+            "auto ta = tensor_rows<T, TENSOR_SM>(sb + tm * LDA);\n    auto tw = tensor_rows<T, TENSOR_SN>(sa + tn * LDA);",
+            "auto ta = tensor_rows<T, TENSOR_SM>(sb + tm * LDA);\n    auto tw = tensor_rows<T, TENSOR_SN>(sa + (tn + 1) * LDA);",
+            1,
+        )],
+    },
+    Mutant {
+        name: "tensor_resid_stores",
+        clause: "tensor_gemm_a4",
+        why: "the residual epilogue stores the product over the output instead of adding to it",
+        edits: &[("*p = RESID ? *p + ct[i] : ct[i];", "*p = ct[i];", 1)],
+    },
+    Mutant {
+        name: "tensor_seg_out",
+        clause: "tensor_gemm_seg",
+        why: "every segment stores at the first segment's output offset",
+        edits: &[("y + args.segs[s].out", "y", 1)],
+    },
+    Mutant {
+        name: "tensor_range_no_raise",
+        clause: "tensor_gemm_range",
+        why: "an activation past the half range stages NaN but raises no quantizer site",
+        edits: &[(
+            "            if (any(bad)) {\n                raise(faults, layer, BLOOMERY_FAULT_SITE_QUANT_COLUMN);",
+            "            if (any(bad)) {",
+            1,
+        )],
+    },
+    Mutant {
+        name: "tensor_pair_swapped",
+        clause: "tensor_grouped_q4k",
+        why: "the pair's gate and up accumulators swap places in the SwiGLU",
+        edits: &[("pair_swiglu(cg[i], cu[i])", "pair_swiglu(cu[i], cg[i])", 1)],
+    },
+    Mutant {
+        name: "tensor_routed_short_block",
+        clause: "tensor_grouped_q4k",
+        why: "a SIMD group's second block of places runs only when the run passes it by more than 8: a run ending 1 to 8 places into the block leaves them unstored",
+        edits: &[(
+            "const bool live1 = tm + TENSOR_RM < count;",
+            "const bool live1 = tm + TENSOR_RM + 8 < count;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "tensor_routed_block_rows",
+        clause: "tensor_grouped_a4",
+        why: "a SIMD group's second block of places reads the first block's staged rows",
+        edits: &[(
+            "auto ta1 = tensor_rows<T, TENSOR_RM>(sb + (tm + TENSOR_RM) * LDA);",
+            "auto ta1 = tensor_rows<T, TENSOR_RM>(sb + tm * LDA);",
+            1,
+        )],
+    },
+    Mutant {
+        name: "tensor_routed_k_step_skipped",
+        clause: "tensor_grouped_q6k",
+        why: "the routed tile's K loops (pair and plain) stop one step short",
+        edits: &[(
+            "        for (int k0 = 0; k0 < (int)args.cols; k0 += BK) {",
+            "        for (int k0 = 0; k0 + BK < (int)args.cols; k0 += BK) {",
+            2,
+        )],
+    },
+    Mutant {
+        name: "tensor_tile_no_raise",
+        clause: "tensor_grouped_a4",
+        why: "a tile the table cannot write stores nothing but raises no expert-id site",
+        edits: &[(
+            "            raise(faults, args.layer, BLOOMERY_FAULT_SITE_EXPERT_ID);",
+            "",
+            1,
+        )],
+    },
+    Mutant {
+        name: "tensor_q8_0_rotate",
+        clause: "tensor_q8_0_gemm",
+        why: "a Q8_0 chunk's values rotate inside each four as they are staged",
+        edits: &[(
+            "reg[j / 4][j % 4] = (float)q[j] * d;",
+            "reg[j / 4][(j + 1) % 4] = (float)q[j] * d;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "tensor_q8_0_seg_out",
+        clause: "tensor_q8_0_gemm_seg",
+        why: "every segment stores at the first segment's output offset",
+        edits: &[("y + args.segs[s].out", "y", 1)],
+    },
+    Mutant {
+        name: "tensor_q8_0_chunk_half",
+        clause: "tensor_q8_0_grouped",
+        why: "a routed chunk stages the other half of its Q8_0 block",
+        edits: &[(
+            "device const int8_t * q = blk.qs + 16 * il;",
+            "device const int8_t * q = blk.qs + 16 * (il ^ 1);",
+            1,
+        )],
+    },
+    Mutant {
+        name: "tensor_q5k_min_sign",
+        clause: "tensor_q5k_gemm",
+        why: "the staged Q5_K value adds the group's min",
+        edits: &[(
+            "reg[j / 4][j % 4] = sm.x * (float)code(blk, (uint)(16 * il + j)) - sm.y;",
+            "reg[j / 4][j % 4] = sm.x * (float)code(blk, (uint)(16 * il + j)) + sm.y;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "tensor_q5k_seg_out",
+        clause: "tensor_q5k_gemm_seg",
+        why: "every segment stores at the first segment's output offset",
+        edits: &[("y + args.segs[s].out", "y", 1)],
+    },
+    Mutant {
+        name: "tensor_q5k_scale_words",
+        clause: "tensor_q5k_grouped",
+        why: "a group's scale words come from the other half of the table",
+        edits: &[(
+            "blk.scales + ((s >> 1) & 1), sc16);",
+            "blk.scales + ((s >> 2) & 1), sc16);",
+            1,
+        )],
+    },
+];

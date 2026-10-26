@@ -20,6 +20,7 @@ mod collapse_table;
 mod decode;
 mod encoder;
 mod guard;
+mod letter_case_table;
 mod merge;
 mod pretok;
 mod spelling;
@@ -115,6 +116,10 @@ pub struct Tokenizer {
     /// Partition order: longest text first.
     specials: Vec<u32>,
     finders: Vec<Finder<'static>>,
+    /// Whether the partition cuts leftmost-longest, as Hugging Face's `tokenizers` splits on its
+    /// added tokens (a vocabulary marked as one, [`Pre::hf_reading`]), where the reference's
+    /// order, kept for every other vocabulary, cuts the longest token first.
+    leftmost: bool,
     /// The special tokens' spellings, as [`Tokenizer::guard`] searches them.
     spellings: guard::Spellings,
     pieces: Vec<Box<[u8]>>,
@@ -141,6 +146,7 @@ impl Tokenizer {
     /// checkpoint folder's header, which no file holds, reads as a GGUF file's.
     pub fn from_keys(keys: &[(String, gguf::Value)]) -> Result<Tokenizer, Error> {
         let (vocab, encoding, hf_texts) = Vocab::load(keys)?;
+        let leftmost = hf_texts.is_some();
         let encoder = encoder::Encoder::new(encoding, &vocab)?;
         let spelling = encoder.spelling();
         let specials = vocab.special_order();
@@ -159,6 +165,7 @@ impl Tokenizer {
             encoder,
             specials,
             finders,
+            leftmost,
             spellings,
             pieces,
         })
@@ -296,6 +303,9 @@ impl Tokenizer {
         if text.is_empty() {
             return frags;
         }
+        if self.leftmost {
+            return self.partition_leftmost(text, cuts, parse_special);
+        }
         frags.push(Frag::Text {
             start: 0,
             len: text.len(),
@@ -346,6 +356,65 @@ impl Tokenizer {
             if changed {
                 std::mem::swap(&mut frags, &mut next);
             }
+        }
+        frags
+    }
+
+    /// The partition of Hugging Face's `tokenizers`: the leftmost occurrence of any special
+    /// token is cut out, the longest where several start there, and the search goes on after
+    /// it, so a token that starts inside a cut one is no match. Cuts and `parse_special` are
+    /// [`Tokenizer::partition`]'s. Each token's next occurrence is kept and searched again only
+    /// when a cut passes it, so no byte is scanned more than once a token.
+    fn partition_leftmost(&self, text: &[u8], cuts: &[usize], parse_special: bool) -> Vec<Frag> {
+        let active: Vec<usize> = (0..self.specials.len())
+            .filter(|&k| {
+                parse_special
+                    || self.vocab.attrs[self.specials[k] as usize] & (attr::CONTROL | attr::UNKNOWN)
+                        == 0
+            })
+            .collect();
+        let find = |k: usize, mut from: usize| {
+            let tlen = self.finders[k].needle().len();
+            while let Some(m) = self.finders[k].find(&text[from..]) {
+                let found = from + m;
+                if !spans_cut(cuts, found, found + tlen) {
+                    return Some(found);
+                }
+                from = found + 1;
+            }
+            None
+        };
+        let mut next: Vec<Option<usize>> = active.iter().map(|&k| find(k, 0)).collect();
+        let (mut frags, mut at) = (Vec::new(), 0);
+        // Leftmost, then longest: the order of `specials` is longest first, so the first of
+        // equal starts wins.
+        while let Some((i, start)) = next
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| s.map(|s| (i, s)))
+            .min_by_key(|&(i, s)| (s, i))
+        {
+            let k = active[i];
+            let end = start + self.finders[k].needle().len();
+            if start > at {
+                frags.push(Frag::Text {
+                    start: at,
+                    len: start - at,
+                });
+            }
+            frags.push(Frag::Token(self.specials[k]));
+            at = end;
+            for (i, s) in next.iter_mut().enumerate() {
+                if s.is_some_and(|s| s < at) {
+                    *s = find(active[i], at);
+                }
+            }
+        }
+        if at < text.len() {
+            frags.push(Frag::Text {
+                start: at,
+                len: text.len() - at,
+            });
         }
         frags
     }
@@ -836,6 +905,55 @@ mod tests {
         assert_eq!(tok.encode(b"\xed\xa0\x80", false, false), [237, 160, 128]);
     }
 
+    /// The tree that reads `gpt-4o` (Muse Spark Open's) turns an overlong form and a truncated
+    /// sequence into U+FFFD a byte at a time and passes a surrogate; the trees that read
+    /// `minimax-m2` accept `c0 80` as U+0000. FAIL-first: with `gpt-4o` on the lenient reader its
+    /// row yields a NUL byte for `c0 80`.
+    #[test]
+    fn gpt_4o_decodes_utf8_strictly_and_minimax_m2_leniently() {
+        let bytes = b"\xc0\x80 \xed\xa0\x80 \xf0\x9f\x98";
+        let replaced = |n: usize| "\u{fffd}".repeat(n).into_bytes();
+        let want = |head: Vec<u8>| {
+            [head, b" \xed\xa0\x80 ".to_vec(), replaced(3)]
+                .concat()
+                .into_iter()
+                .map(u32::from)
+                .collect::<Vec<u32>>()
+        };
+        for (pre, head) in [("gpt-4o", replaced(2)), ("minimax-m2", vec![0])] {
+            let mut header = flint_header();
+            header[1].1 = Value::String(pre.into());
+            let tok = from_header(&header).unwrap();
+            assert_eq!(tok.encode(&bytes[..], false, false), want(head), "{pre}");
+        }
+    }
+
+    /// `<|eot|>` is one of the reference's end-of-generation names (Muse
+    /// Spark's template ends its turns with it): a vocabulary carrying it
+    /// ends a generation at it, beside its own eos. FAIL-first: with the name
+    /// out of the EOG list the row below fails.
+    #[test]
+    fn eot_by_name_ends_a_generation() {
+        let texts = ["a", "<|end_of_text|>", "<|eot|>"];
+        let header = vec![
+            ("tokenizer.ggml.model".into(), Value::String("gpt2".into())),
+            ("tokenizer.ggml.pre".into(), Value::String("gpt-4o".into())),
+            (
+                "tokenizer.ggml.tokens".into(),
+                Value::Array(texts.map(|s| Value::String(s.into())).to_vec()),
+            ),
+            (
+                "tokenizer.ggml.token_type".into(),
+                Value::Array([1, 3, 3].map(Value::I32).to_vec()),
+            ),
+            ("tokenizer.ggml.merges".into(), Value::Array(vec![])),
+            ("tokenizer.ggml.eos_token_id".into(), Value::U32(1)),
+        ];
+        let tok = from_header(&header).unwrap();
+        assert_eq!(tok.eog(), &[1, 2]);
+        assert_eq!(tok.specials().eos, Some(1));
+    }
+
     #[test]
     fn explicit_stops_preserve_hf_ids_and_attributes() {
         let texts = [
@@ -1054,7 +1172,8 @@ mod tests {
         );
     }
 
-    /// The explicit stop list selects Hugging Face's encoding, and only for a qwen35 BPE: its
+    /// The explicit stop list selects Hugging Face's encoding, and only for a pre-tokenizer that
+    /// has an HF reading (`qwen35`, `minimax-m2`; `qwen2` has none and is refused): qwen35's
     /// regex folds `ſ` to `s` in a contraction ("'ſx" is `'ſ` and `x`, ids 257 and 120 under
     /// the merges below, where qwen35 merges the one word to 258), and its BPE skips a byte its
     /// vocabulary lacks and merges across it ("acb" is `ab`), and a pair listed twice ranks at its
@@ -1142,6 +1261,21 @@ mod tests {
                 assert_eq!(tok.encode(text, false, false), want, "{text:?}");
             }
         }
+        // The BPE is Hugging Face's under the marker whatever the pre-tokenizer: minimax-m2 skips
+        // the byte its vocabulary lacks and ranks a pair listed twice at its last place too.
+        for (kvs, text, hf, legacy) in [
+            (&sparse, "acb", &[2][..], &[0, 1][..]),
+            (&twice, "abc", &[3, 2][..], &[0, 4][..]),
+        ] {
+            let mut minimax = kvs.clone();
+            minimax[1].1 = Value::String("minimax-m2".into());
+            let mut marked = minimax.clone();
+            marked.push(stop.clone());
+            for (kvs, want) in [(&minimax, legacy), (&marked, hf)] {
+                let tok = from_header(kvs).unwrap();
+                assert_eq!(tok.encode(text, false, false), want, "minimax-m2 {text:?}");
+            }
+        }
         let mut off_vocab = header(["a", "b"].map(String::from).to_vec(), &["a b"], None);
         let mut added_byte = header(
             ["a", "b", "ab"].map(String::from).to_vec(),
@@ -1155,7 +1289,7 @@ mod tests {
         for (kvs, want, unmarked) in [
             (&mut off_vocab, "tokenizer.ggml.merges[0] \"a b\"", true),
             (&mut added_byte, "tokenizer.ggml.tokens[1] \"b\"", true),
-            (&mut qwen2, "not pre-tokenizer \"qwen2\"", true),
+            (&mut qwen2, "pre-tokenizer \"qwen2\" has no reading", true),
             (&mut llama, "not SentencePiece", false),
         ] {
             // Without the marker the first three load; a SentencePiece one here has no byte tokens.
@@ -1270,13 +1404,16 @@ mod tests {
     /// `<0xXX>` tokens, USER_DEFINED tokens (and `<|channel|>`, which the
     /// reference makes one) are cut out without special parsing while
     /// CONTROL ones are not, and BOS is added though the file does not ask.
-    /// Only U+0020 becomes U+2581; a literal U+2581 reads as a space, so it
-    /// does not round-trip; invalid UTF-8 is one U+FFFD per bad byte. A
+    /// Only U+0020 becomes U+2581, and before the text is decoded, so an
+    /// overlong one (C0 A0) stays a space and falls back to `<0x20>`; a
+    /// literal U+2581 reads as a space, so it does not round-trip; invalid
+    /// UTF-8 is one U+FFFD per bad byte. A
     /// header that asks for a BOS or an EOS it cannot name is refused, as the
     /// reference asserts one, and so is a vocabulary missing a byte token,
     /// where the fallback would drop that byte.
     ///
-    /// FAIL-first: without the U+2581 respelling "a b" is `a <0x20> b`;
+    /// FAIL-first: without the U+2581 respelling "a b" is `a <0x20> b`; with
+    /// the respelling after decoding, "a\xC0\xA0b" is `a ▁b`;
     /// without the newline-word lookup "\n\n\n" is three `\n`; with one symbol
     /// per byte "a b" falls back to the three bytes of U+2581; with the file's
     /// `add_bos_token` the BOS is missing; without the BOS-id, EOS-id or
@@ -1334,6 +1471,7 @@ mod tests {
         let cases: &[(&[u8], bool, &[&str])] = &[
             (b"a b", true, &["a", "\u{2581}b"]),
             ("a\u{2581}b".as_bytes(), true, &["a", "\u{2581}b"]),
+            (b"a\xC0\xA0b", true, &["a", "<0x20>", "b"]),
             (b"a\n\n\nb", true, &["a", "\n\n\n", "b"]),
             (b"\n\n", true, &["\n", "\n"]),
             (b"\n\n\n\n", true, &["\n", "\n", "\n", "\n"]),
@@ -1398,6 +1536,88 @@ mod tests {
         assert_eq!(decode(b"a\xF0\x9F b"), "a\u{FFFD}\u{FFFD} b");
         let text = "a b\n\n\nü 한국";
         assert_eq!(decode(text.as_bytes()), text);
+    }
+
+    /// Hugging Face cuts its added tokens leftmost, then longest; the reference cuts the longest
+    /// first. They differ where two special tokens share an edge and the later one is longer: in
+    /// `]~b]!p~[`, bos `]~b]` and pad `]!p~[` share the `]` (HF cuts bos and leaves `!p~[`, the
+    /// reference cuts pad and leaves `]~b`); a shorter later token (eos `[e~[` over pad's `[`) is
+    /// cut alike. A vocabulary marked as HF's cuts as HF does, and one that is not keeps the
+    /// reference's order. The ids are `tokenizers` 0.21.0's on the same tokens, no merges, bytes
+    /// as ByteLevel spells them.
+    ///
+    /// FAIL-first: a marked vocabulary that cuts longest-first gives the reference's ids on the
+    /// rows where they differ.
+    #[test]
+    fn the_hf_marker_cuts_added_tokens_leftmost_longest() {
+        let header = |marked: bool| {
+            let bytes = crate::unicode::byte_to_cpt_table()
+                .into_iter()
+                .map(|cp| char::from_u32(cp).unwrap().to_string());
+            let tokens: Vec<Value> = bytes
+                .chain(["]!p~[", "]~b]", "[e~["].map(String::from))
+                .map(Value::String)
+                .collect();
+            let types: Vec<Value> = (0..tokens.len())
+                .map(|i| Value::I32(if i < 256 { 1 } else { 3 }))
+                .collect();
+            let mut kvs = vec![
+                (
+                    "tokenizer.ggml.model".to_string(),
+                    Value::String("gpt2".into()),
+                ),
+                (
+                    "tokenizer.ggml.pre".to_string(),
+                    Value::String("minimax-m2".into()),
+                ),
+                ("tokenizer.ggml.tokens".to_string(), Value::Array(tokens)),
+                ("tokenizer.ggml.token_type".to_string(), Value::Array(types)),
+                ("tokenizer.ggml.merges".to_string(), Value::Array(vec![])),
+            ];
+            if marked {
+                kvs.push((
+                    "tokenizer.bloomery.eog_token_ids".to_string(),
+                    Value::Array(vec![Value::U32(258)]),
+                ));
+            }
+            kvs
+        };
+        let (hf, reference) = (
+            from_header(&header(true)).unwrap(),
+            from_header(&header(false)).unwrap(),
+        );
+        // text, HF's ids, the reference's.
+        let cases: &[(&str, &[u32], &[u32])] = &[
+            ("]~b]!p~[", &[257, 33, 112, 126, 91], &[93, 126, 98, 256]),
+            (
+                "x]~b]!p~[y",
+                &[120, 257, 33, 112, 126, 91, 121],
+                &[120, 93, 126, 98, 256, 121],
+            ),
+            (
+                "]~b]!p~[e~[",
+                &[257, 33, 112, 126, 258],
+                &[93, 126, 98, 256, 101, 126, 91],
+            ),
+            ("]!p~[e~[", &[256, 101, 126, 91], &[256, 101, 126, 91]),
+            ("]~b]]!p~[", &[257, 256], &[257, 256]),
+            ("[e~[]~b]", &[258, 257], &[258, 257]),
+        ];
+        for &(text, want_hf, want_reference) in cases {
+            assert_eq!(hf.encode(text, false, true), want_hf, "hf {text:?}");
+            assert_eq!(
+                reference.encode(text, false, true),
+                want_reference,
+                "reference {text:?}"
+            );
+        }
+        // Without `parse_special` a control token is no cut, in either order.
+        assert_eq!(hf.encode("]~b]", false, false), [93, 126, 98, 93]);
+        // A cut inside the leftmost token leaves it no match, and the next one is cut.
+        assert_eq!(
+            hf.encode_marked("]\u{1}~b]!p~[", "\u{1}", false, true),
+            [93, 126, 98, 256]
+        );
     }
 }
 

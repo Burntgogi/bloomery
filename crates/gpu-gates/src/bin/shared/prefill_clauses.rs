@@ -29,6 +29,10 @@ pub struct Case {
     /// top-4 near tie can flip between the batch's GEMM sum order and the step's gemv, and a
     /// flip is a discrete exchange of experts, not a Gaussian, so no sigma derives from it.
     pub logit_bound: Option<f64>,
+    /// The standard deviation, in logit units, of one id's logit between two implementations of the family's quantized model: the
+    /// σ of the logprob band ([`sigma_lp`]). A family that has not measured its own carries V4.1's
+    /// (`prompts::SIGMA_LOGIT_V41`).
+    pub sigma_logit: f64,
     /// The model's vocabulary.
     pub vocab: usize,
     /// The model's width.
@@ -94,18 +98,19 @@ fn by_prompt(seat: &mut dyn Seat, ids: &[u32]) -> Result<Left, GateError> {
 }
 
 /// The batch's row `b` against the steps' row `s` over the steps' top [`TOP`] ids: whether every id's
-/// `|Δ logprob| / σ_i` ([`sigma_lp`] by the steps' probabilities) is within [`k_of`], and the line that says so.
+/// `|Δ logprob| / σ_i` ([`sigma_lp`] at `sigma_logit`, by the steps' probabilities) is within [`k_of`], and the line that says so.
 // PIN(2026-10-20): was bit for bit; the batch keeps its GEMM sites and f16 flash (performance first), so the band is
-// two implementations' ([`SIGMA_LOGIT`]: the batch and the steps are two once their seed has grown to the q8 step, module
+// two implementations' ([`Case::sigma_logit`]: the batch and the steps are two once their seed has grown to the q8 step, module
 // doc). FAIL-first: the K and V planes swapped in the batch's appends are past it on the next step.
-fn logprobs_near(s: &[f32], b: &[f32], bound: Option<f64>) -> (bool, String) {
+fn logprobs_near(s: &[f32], b: &[f32], bound: Option<f64>, sigma_logit: f64) -> (bool, String) {
     let (ls, lb) = (log_softmax(s), log_softmax(b));
     let sq: f64 = ls.iter().map(|&v| (2.0 * v).exp()).sum();
     let top = top_ids(s, TOP);
     let k = bound.unwrap_or_else(|| k_of(top.len()));
     // A NaN distance is out of band and wins the fold.
     let (z, at) = top.iter().fold((0.0f64, 0usize), |w, &id| {
-        let z = (lb[id] - ls[id]).abs() / sigma_lp(ls[id].exp(), sq).max(f64::MIN_POSITIVE);
+        let z = (lb[id] - ls[id]).abs()
+            / sigma_lp(sigma_logit, ls[id].exp(), sq).max(f64::MIN_POSITIVE);
         if z.is_nan() || z > w.0 { (z, id) } else { w }
     });
     // A deferred comparison still refuses a row that holds a NaN or an infinity.
@@ -120,7 +125,7 @@ fn logprobs_near(s: &[f32], b: &[f32], bound: Option<f64>) -> (bool, String) {
     let line = format!(
         "logits worst z {z:.2} at id {at} (|dlogprob| {:.4}, sigma {:.4}) over the steps' top {}, {bound_line}{} {}",
         (lb[at] - ls[at]).abs(),
-        sigma_lp(ls[at].exp(), sq),
+        sigma_lp(sigma_logit, ls[at].exp(), sq),
         top.len(),
         if finite { "" } else { ", a non-finite value" },
         verdict(pass)
@@ -189,7 +194,8 @@ fn prefill_near_steps(seat: &mut dyn Seat, case: &Case) -> Result<bool, GateErro
     for p in &case.lengths {
         let ids = walk(*p, case.vocab);
         let (s, b) = (by_steps(seat, &ids)?, by_prompt(seat, &ids)?);
-        let (logits, l_line) = logprobs_near(&s.logits, &b.logits, case.logit_bound);
+        let (logits, l_line) =
+            logprobs_near(&s.logits, &b.logits, case.logit_bound, case.sigma_logit);
         let (layers, t_line) = layers_near(&s.taps, &b.taps, case);
         let (same, differ) = store_lists(&s.stores, &b.stores);
         let pass = logits && layers && same && s.pos == b.pos && b.pos == u32::try_from(*p)?;
@@ -216,7 +222,8 @@ fn prefill_then_step_near_steps(seat: &mut dyn Seat, case: &Case) -> Result<bool
         seat.prompt(&ids[..*p])?;
         let row = seat.step(ids[*p])?;
         let taps = seat.taps()?;
-        let (logits, l_line) = logprobs_near(&steps.logits, &row, case.logit_bound);
+        let (logits, l_line) =
+            logprobs_near(&steps.logits, &row, case.logit_bound, case.sigma_logit);
         let (layers, t_line) = layers_near(&steps.taps, &taps, case);
         let pass = logits && layers;
         println!(

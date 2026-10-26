@@ -3,10 +3,12 @@
 //! ModelOpt writes `hf_quant_config.json`: `quant_algo`, the per-module `quantized_layers` of a
 //! MIXED_PRECISION export and `exclude_modules` globs. transformers' `fp8` (`config.json`
 //! `quantization_config`) gives `weight_block_size` and `modules_to_not_convert`;
-//! compressed-tensors gives `config_groups` and `ignore`. MLX's own block (`config.json`
-//! `quantization`, what mlx-lm's convert writes, with a verbatim copy at `quantization_config`)
-//! gives `group_size`, `bits`, `mode` and per-module `{group_size, bits}` overrides keyed as the
-//! tensor names minus `.weight`. [`Config`] reads them into the formats
+//! compressed-tensors gives `config_groups` and `ignore`; the `mxfp8` method gives MXFP8 to every
+//! module outside `ignored_layers` and, with `moe_quant_algo`, NVFP4 pack-quantized
+//! ([`Format::Nvfp4Ct`]) to the routed experts. MLX's own block (`config.json` `quantization`,
+//! what mlx-lm's convert writes, with a verbatim copy at `quantization_config`) gives
+//! `group_size`, `bits`, `mode` and per-module `{group_size, bits}` overrides keyed as the tensor
+//! names minus `.weight`. [`Config`] reads them into the formats
 //! each module is declared, and [`plan`] gives every tensor of a checkpoint one [`Format`]: each
 //! weight's stored tensors (dtype, shape and companion scales) are matched against the formats
 //! its module is declared.
@@ -29,7 +31,7 @@ use serde_json::Value;
 
 use crate::schema::{
     self, Fields,
-    Rule::{Need, Read},
+    Rule::{Need, Only, Read},
 };
 use safetensors::Dtype;
 
@@ -59,6 +61,11 @@ pub enum Format {
     /// [`Format::Nvfp4`] with its `weight_scale` stored compressed as `csf_32x2_v1`: the
     /// `csf32_bases`, `_codes`, `_page_bases`, `_offsets` and `_exceptions` parts.
     Nvfp4Csf32,
+    /// compressed-tensors `nvfp4-pack-quantized`: U8 E2M1 pairs in `weight_packed`, F8_E4M3
+    /// `weight_scale` a 16 values, F32 `weight_global_scale` a matrix, a divisor of the block
+    /// scales where ModelOpt's `weight_scale_2` is a multiplier of them, and an F32
+    /// `input_global_scale`, the scale of a 4-bit activation.
+    Nvfp4Ct,
     /// OCP MXFP8: F8_E4M3 values, one E8M0 scale (U8 or F8_E8M0) a 32 values.
     Mxfp8,
     /// F8_E4M3 with one scale a `rows` by `cols` block.
@@ -93,6 +100,7 @@ impl fmt::Display for Format {
             Format::Nvfp4 => f.write_str("NVFP4-ModelOpt"),
             Format::Nvfp4Csf => f.write_str("NVFP4-csf"),
             Format::Nvfp4Csf32 => f.write_str("NVFP4-csf32"),
+            Format::Nvfp4Ct => f.write_str("NVFP4-compressed-tensors"),
             Format::Mxfp8 => f.write_str("MXFP8"),
             Format::Fp8Block { rows, cols } => write!(f, "FP8-block {rows}x{cols}"),
             Format::Fp8Channel => f.write_str("FP8-channel"),
@@ -128,7 +136,9 @@ impl Format {
     #[must_use]
     pub fn card_type(self) -> Option<GgmlType> {
         match self {
-            Format::Nvfp4 | Format::Nvfp4Csf | Format::Nvfp4Csf32 => Some(GgmlType::NVFP4),
+            Format::Nvfp4 | Format::Nvfp4Csf | Format::Nvfp4Csf32 | Format::Nvfp4Ct => {
+                Some(GgmlType::NVFP4)
+            }
             Format::Fp8Channel | Format::Fp8Tensor => Some(GgmlType::FP8_B128),
             Format::Mxfp8 => Some(GgmlType::MXFP8),
             Format::Fp8Block { rows, cols } if rows > 0 && cols > 0 => {
@@ -200,7 +210,9 @@ impl Format {
         }
         gguf::tensor_bytes(row.blck, row.bytes, dims)?;
         let whole_bytes = match self {
-            Format::Nvfp4 | Format::Nvfp4Csf | Format::Nvfp4Csf32 => matrices.checked_mul(4)?,
+            Format::Nvfp4 | Format::Nvfp4Csf | Format::Nvfp4Csf32 | Format::Nvfp4Ct => {
+                matrices.checked_mul(4)?
+            }
             _ => 0,
         };
         Some(Held { whole_bytes, block })
@@ -214,7 +226,11 @@ impl Format {
     pub fn logical(self, stored: &[usize]) -> Vec<usize> {
         let mut s = stored.to_vec();
         let per = match self {
-            Format::Nvfp4 | Format::Nvfp4Csf | Format::Nvfp4Csf32 | Format::Mxfp4 => 2,
+            Format::Nvfp4
+            | Format::Nvfp4Csf
+            | Format::Nvfp4Csf32
+            | Format::Nvfp4Ct
+            | Format::Mxfp4 => 2,
             Format::Int4Pack { .. } => 8,
             Format::MlxAffine { bits, .. } => 32 / bits,
             _ => 1,
@@ -268,6 +284,9 @@ enum Other {
         groups: Vec<(Vec<Target>, Format)>,
         ignore: Vec<Target>,
     },
+    /// `quant_method` `mxfp8`: MXFP8 on every module outside `ignored`, and with `nvfp4` the
+    /// routed experts' pack-quantized NVFP4 beside it.
+    Mxfp8 { nvfp4: bool, ignored: Vec<String> },
 }
 
 /// The module classes a model's checkpoint map can identify for class-name targets.
@@ -377,6 +396,7 @@ impl Config {
             (_, None | Some("modelopt")) => None,
             (Some(q), Some("fp8")) => Some(Other::fp8(q)?),
             (Some(q), Some("compressed-tensors")) => Some(Other::compressed_tensors(q)?),
+            (Some(q), Some("mxfp8")) => Some(Other::mxfp8(q)?),
             (_, Some(m)) => {
                 return Err(bad(format!(
                     "quant_method {m} is not one this reader knows"
@@ -421,16 +441,21 @@ impl Config {
                 not_convert,
                 convert,
             }) => {
-                let skip = |ps: &[String]| {
-                    ps.iter()
-                        .any(|p| module.starts_with(p.as_str()) || module.ends_with(p.as_str()))
-                };
-                if skip(not_convert) && !skip(convert) {
+                if skipped(module, not_convert) && !skipped(module, convert) {
                     vec![]
                 } else if *mxfp4 {
                     vec![*block, Format::Mxfp4]
                 } else {
                     vec![*block]
+                }
+            }
+            Some(Other::Mxfp8 { nvfp4, ignored }) => {
+                if skipped(module, ignored) {
+                    vec![]
+                } else if *nvfp4 {
+                    vec![Format::Mxfp8, Format::Nvfp4Ct]
+                } else {
+                    vec![Format::Mxfp8]
                 }
             }
             Some(Other::CompressedTensors { groups, ignore }) => {
@@ -531,6 +556,18 @@ fn mlx_format(what: &str, entry: &Value) -> Result<Format, Error> {
         group: group.unwrap() as usize,
     })
 }
+
+/// An `mxfp8` `quantization_config`'s keys, each read by [`Other::mxfp8`]. The activations are
+/// quantized at run time (`dynamic`), as this engine does whatever the scheme.
+const MXFP8: &Fields = &[
+    ("quant_method", Read),
+    ("activation_scheme", Only(r#"["dynamic"]"#)),
+    ("weight_block_size", Read),
+    ("ignored_layers", Read),
+    ("group_size", Read),
+    ("moe_quant_algo", Read),
+    ("moe_quant_format", Read),
+];
 
 impl Modelopt {
     fn parse(q: &Value) -> Result<Modelopt, Error> {
@@ -672,21 +709,57 @@ impl Other {
         let mut not_convert = list("modules_to_not_convert")?;
         not_convert.extend(list("ignored_layers")?);
         let convert = list("modules_to_convert")?;
-        // transformers matches a pattern as a regex from the start or a suffix; these are taken
-        // literally, so a pattern with another regex character is refused.
-        if let Some(p) = not_convert
-            .iter()
-            .chain(&convert)
-            .find(|p| p.contains(|c: char| "*?[]()|+^$\\{}".contains(c)))
-        {
-            return Err(refuse(&format!("module pattern {p}")));
-        }
+        literal_patterns("fp8", not_convert.iter().chain(&convert))?;
         Ok(Other::Fp8 {
             block,
             mxfp4,
             not_convert,
             convert,
         })
+    }
+
+    fn mxfp8(q: &Value) -> Result<Other, Error> {
+        schema::check(q, "mxfp8 quantization_config", &[MXFP8]).map_err(bad)?;
+        // MXFP8 is one E8M0 a 32 values; a config that names its block names that one.
+        if let Some(b) = q.get("weight_block_size")
+            && block_of(Some(b)) != Some(Format::Fp8Block { rows: 1, cols: 32 })
+        {
+            return Err(bad(format!(
+                "mxfp8 weight_block_size {b} is not [1, 32], the one block MXFP8 is stored in"
+            )));
+        }
+        let moe = |key: &str| {
+            q.get(key)
+                .map(|v| {
+                    v.as_str()
+                        .ok_or_else(|| bad(format!("mxfp8 {key} {v} is not a string")))
+                })
+                .transpose()
+        };
+        let nvfp4 = match (
+            moe("moe_quant_algo")?,
+            moe("moe_quant_format")?,
+            q.get("group_size"),
+        ) {
+            (None, None, None) => false,
+            (Some("NVFP4"), Some("nvfp4-pack-quantized"), group)
+                if group.is_none_or(|g| g.as_u64() == Some(16)) =>
+            {
+                true
+            }
+            (algo, format, group) => {
+                return Err(bad(format!(
+                    "mxfp8 moe_quant_algo {algo:?}, moe_quant_format {format:?} and group_size \
+                     {group:?} are not NVFP4 pack-quantized with group 16, the one expert format \
+                     this reader places"
+                )));
+            }
+        };
+        let ignored = q
+            .get("ignored_layers")
+            .map_or(Ok(vec![]), |v| strings(v, "mxfp8 ignored_layers"))?;
+        literal_patterns("mxfp8", &ignored)?;
+        Ok(Other::Mxfp8 { nvfp4, ignored })
     }
 
     fn compressed_tensors(q: &Value) -> Result<Other, Error> {
@@ -760,7 +833,9 @@ impl Other {
 #[derive(Debug, PartialEq)]
 pub struct Placed {
     pub format: Format,
-    /// Scales and the packed shape, by name; `input_scale` is listed in [`Plan::input_scales`].
+    /// Scales and the packed shape, by name; ModelOpt's `input_scale` is listed in
+    /// [`Plan::input_scales`], compressed-tensors NVFP4's `input_global_scale` stays here, last,
+    /// as it is read with the weight.
     pub companions: Vec<String>,
 }
 
@@ -776,14 +851,16 @@ pub struct Plan {
 }
 
 /// The companion suffixes a weight's format reads.
-const COMPANIONS: [&str; 9] = [
+const COMPANIONS: [&str; 11] = [
     "weight_scale",
     "weight_scale_2",
     "weight_scale_inv",
+    "weight_global_scale",
     "scale",
     "scales",
     "biases",
     "input_scale",
+    "input_global_scale",
     "weight_shape",
     "weight_zero_point",
 ];
@@ -981,11 +1058,34 @@ fn layout(
             }
             out.push(find(
                 module,
-                &["weight_scale"],
+                &["weight_scale", "weight_scale_inv"],
                 &[Dtype::U8, Dtype::F8E8M0],
                 &fits,
             )?);
             input(&mut out);
+        }
+        Format::Nvfp4Ct => {
+            let k = cols.checked_mul(2)?;
+            if !name.ends_with(".weight_packed") || dtype != Dtype::U8 || k % 16 != 0 {
+                return None;
+            }
+            out.push(find(module, &["weight_scale"], &[Dtype::F8E4M3], &|s| {
+                s == [rows, k / 16]
+            })?);
+            out.push(find(
+                module,
+                &["weight_global_scale"],
+                &[Dtype::F32],
+                &scalar,
+            )?);
+            // The input scale is read and checked with the weight ([`crate::modelopt`]), so
+            // it is a companion, not an `input_scales` entry.
+            out.extend(find(
+                module,
+                &["input_global_scale"],
+                &[Dtype::F32],
+                &scalar,
+            ));
         }
         Format::Mxfp4 => {
             let k = cols.checked_mul(2)?;
@@ -1076,6 +1176,31 @@ fn mlx_layout(
             .map(|_| n)
     };
     Some(vec![find("scales")?, find("biases")?])
+}
+
+/// Whether a pattern of `patterns` starts or ends `module`, as transformers matches a module
+/// name against `modules_to_not_convert` and `ignored_layers`.
+fn skipped(module: &str, patterns: &[String]) -> bool {
+    patterns
+        .iter()
+        .any(|p| module.starts_with(p.as_str()) || module.ends_with(p.as_str()))
+}
+
+/// Refuses a module pattern of `patterns` with a regex character: [`skipped`] takes them
+/// literally, as the checkpoint's own config lists whole names.
+fn literal_patterns<'a>(
+    what: &str,
+    patterns: impl IntoIterator<Item = &'a String>,
+) -> Result<(), Error> {
+    match patterns
+        .into_iter()
+        .find(|p| p.contains(|c: char| "*?[]()|+^$\\{}".contains(c)))
+    {
+        Some(p) => Err(bad(format!(
+            "{what} module pattern {p} is not one this reader places"
+        ))),
+        None => Ok(()),
+    }
 }
 
 /// Whether `module` is `key` or inside it.
@@ -1416,6 +1541,387 @@ mod tests {
         );
     }
 
+    /// MiniMax-M3.1-Flash's own `quantization_config`: a module outside its `ignored_layers`
+    /// is declared MXFP8 and NVFP4 compressed-tensors, the tensors it stores choosing between
+    /// them; the router gates, the head, the embedding and the vision modules are left
+    /// unquantized, the head and the embedding by the config's names without the checkpoint's
+    /// `language_model.` prefix.
+    #[test]
+    fn the_minimax_m31_config_declares_mxfp8_and_nvfp4_compressed_tensors() {
+        let c = config("MiniMaxAI__MiniMax-M3.1-Flash").unwrap_or_else(|e| panic!("{e}"));
+        let lm = "language_model.model.layers";
+        let declared = |module: &str| c.declared(module, || None).0;
+        let both = [Format::Mxfp8, Format::Nvfp4Ct];
+        for module in [
+            format!("{lm}.0.self_attn.q_proj"),
+            format!("{lm}.0.self_attn.index_k_proj"),
+            format!("{lm}.0.mlp.gate_proj"),
+            format!("{lm}.3.block_sparse_moe.shared_experts.up_proj"),
+            format!("{lm}.3.block_sparse_moe.experts.127.w2"),
+            format!("{lm}.59.block_sparse_moe.experts.0.w1"),
+        ] {
+            assert_eq!(declared(&module), both, "{module}");
+        }
+        for module in [
+            format!("{lm}.3.block_sparse_moe.gate"),
+            format!("{lm}.59.block_sparse_moe.gate"),
+            "language_model.lm_head".to_string(),
+            "language_model.model.embed_tokens".to_string(),
+            "vision_tower.vision_model.encoder.layers.0.self_attn.q_proj".to_string(),
+            "multi_modal_projector.linear_1".to_string(),
+            "patch_merge_mlp.linear_2".to_string(),
+        ] {
+            assert_eq!(declared(&module), [], "{module}");
+        }
+        // Layer 3's router entry is no prefix of layer 30's modules.
+        assert_eq!(
+            declared(&format!("{lm}.30.block_sparse_moe.shared_experts.up_proj")),
+            both
+        );
+    }
+
+    /// An `mxfp8` config this reader does not place is refused by name when read: a block other
+    /// than [1, 32], a scheme other than dynamic, an expert format other than NVFP4
+    /// pack-quantized at group 16 (or one half of it), a pattern with a regex character and a key
+    /// nothing reads; a config without experts declares MXFP8 alone.
+    #[test]
+    fn an_mxfp8_config_this_reader_does_not_place_is_refused_by_name() {
+        let base = || {
+            serde_json::json!({
+                "quant_method": "mxfp8", "activation_scheme": "dynamic",
+                "weight_block_size": [1, 32], "ignored_layers": ["lm_head"],
+                "group_size": 16, "moe_quant_algo": "NVFP4",
+                "moe_quant_format": "nvfp4-pack-quantized",
+            })
+        };
+        let parse =
+            |q: Value| Config::parse(&serde_json::json!({ "quantization_config": q }), None);
+        let c = parse(base()).unwrap();
+        assert_eq!(c.declared("m", || None).0, [Format::Mxfp8, Format::Nvfp4Ct]);
+        assert!(c.declared("lm_head", || None).0.is_empty());
+        for (key, value, want) in [
+            (
+                "weight_block_size",
+                serde_json::json!([1, 64]),
+                "mxfp8 weight_block_size [1,64] is not [1, 32]",
+            ),
+            (
+                "weight_block_size",
+                serde_json::json!([1, 16]),
+                "mxfp8 weight_block_size [1,16] is not [1, 32]",
+            ),
+            (
+                "weight_block_size",
+                serde_json::json!([32, 32]),
+                "mxfp8 weight_block_size [32,32] is not [1, 32]",
+            ),
+            (
+                "weight_block_size",
+                serde_json::json!([128, 128]),
+                "mxfp8 weight_block_size [128,128] is not [1, 32]",
+            ),
+            (
+                "weight_block_size",
+                serde_json::json!([32]),
+                "mxfp8 weight_block_size [32] is not [1, 32]",
+            ),
+            (
+                "weight_block_size",
+                serde_json::json!("32"),
+                "mxfp8 weight_block_size \"32\" is not [1, 32]",
+            ),
+            (
+                "activation_scheme",
+                serde_json::json!("static"),
+                "activation_scheme \"static\" is unsupported",
+            ),
+            (
+                "moe_quant_algo",
+                serde_json::json!("MXFP4"),
+                "moe_quant_algo Some(\"MXFP4\")",
+            ),
+            (
+                "moe_quant_algo",
+                serde_json::json!(4),
+                "mxfp8 moe_quant_algo 4 is not a string",
+            ),
+            (
+                "moe_quant_format",
+                serde_json::json!("pack-quantized"),
+                "moe_quant_format Some(\"pack-quantized\")",
+            ),
+            (
+                "group_size",
+                serde_json::json!(32),
+                "group_size Some(Number(32))",
+            ),
+            (
+                "ignored_layers",
+                serde_json::json!(["a.*"]),
+                "mxfp8 module pattern a.* is not one this reader places",
+            ),
+            (
+                "ignored_layers",
+                serde_json::json!("lm_head"),
+                "mxfp8 ignored_layers is not a list of strings",
+            ),
+            (
+                "kv_cache_scheme",
+                serde_json::json!({}),
+                "mxfp8 quantization_config.kv_cache_scheme is not a key this converter reads",
+            ),
+        ] {
+            let mut q = base();
+            q[key] = value;
+            let e = parse(q).unwrap_err().to_string();
+            assert!(e.contains(want), "{key}: {e}");
+        }
+        for (gone, want) in [
+            ("moe_quant_format", "moe_quant_format None"),
+            ("moe_quant_algo", "moe_quant_algo None"),
+        ] {
+            let mut q = base();
+            q.as_object_mut().unwrap().remove(gone);
+            let e = parse(q).unwrap_err().to_string();
+            assert!(e.contains(want), "{gone}: {e}");
+        }
+        // A config without experts: the group size has no tensor to describe.
+        let mut q = base();
+        for key in ["moe_quant_algo", "moe_quant_format"] {
+            q.as_object_mut().unwrap().remove(key);
+        }
+        let e = parse(q.clone()).unwrap_err().to_string();
+        assert!(e.contains("group_size Some(Number(16))"), "{e}");
+        q.as_object_mut().unwrap().remove("group_size");
+        q.as_object_mut().unwrap().remove("weight_block_size");
+        let c = parse(q).unwrap();
+        assert_eq!(c.declared("m", || None).0, [Format::Mxfp8]);
+    }
+
+    /// MiniMax-M3.1-Flash's tensors under its config: an MXFP8 projection is F8_E4M3 with its
+    /// `weight_scale_inv` (an E8M0 byte a 32 values), an expert is `weight_packed` with its block
+    /// scale, `weight_global_scale` and `input_global_scale` (all three its companions, the input
+    /// scale being read with the weight), and the router, bias and head stay as stored. A
+    /// quantized weight in an ignored module, an expert stored as `.weight`, a global scale of
+    /// another dtype and an orphaned scale are refused by name.
+    #[test]
+    fn minimax_m31_tensors_place_as_their_config_declares() {
+        use Dtype::*;
+        let c = config("MiniMaxAI__MiniMax-M3.1-Flash").unwrap();
+        let attn = "language_model.model.layers.3.self_attn";
+        let moe = "language_model.model.layers.3.block_sparse_moe";
+        let expert = |e: u32, w: &str, part: &str| format!("{moe}.experts.{e}.{w}.{part}");
+        let mut t: Vec<(String, Dtype, Vec<usize>)> = vec![
+            (format!("{attn}.q_proj.weight"), F8E4M3, vec![64, 128]),
+            (format!("{attn}.q_proj.weight_scale_inv"), U8, vec![64, 4]),
+            (
+                format!("{moe}.shared_experts.up_proj.weight"),
+                F8E4M3,
+                vec![32, 64],
+            ),
+            (
+                format!("{moe}.shared_experts.up_proj.weight_scale_inv"),
+                U8,
+                vec![32, 2],
+            ),
+            (format!("{moe}.gate.weight"), F32, vec![128, 64]),
+            (format!("{moe}.e_score_correction_bias"), F32, vec![128]),
+            ("language_model.lm_head.weight".into(), Bf16, vec![16, 64]),
+            (
+                "vision_tower.vision_model.fc.weight".into(),
+                F8E4M3,
+                vec![32, 64],
+            ),
+            (
+                "vision_tower.vision_model.fc.weight_scale_inv".into(),
+                U8,
+                vec![32, 2],
+            ),
+        ];
+        for e in 0..2 {
+            t.extend([
+                (expert(e, "w1", "weight_packed"), U8, vec![16, 32]),
+                (expert(e, "w1", "weight_scale"), F8E4M3, vec![16, 4]),
+                (expert(e, "w1", "weight_global_scale"), F32, vec![]),
+                (expert(e, "w1", "input_global_scale"), F32, vec![]),
+            ]);
+        }
+        t.extend([
+            // Stored as `.weight`, not `weight_packed`.
+            (expert(2, "w1", "weight"), U8, vec![16, 32]),
+            (expert(2, "w1", "weight_scale"), F8E4M3, vec![16, 4]),
+            (expert(2, "w1", "weight_global_scale"), F32, vec![]),
+            // A global scale that is no F32.
+            (expert(3, "w2", "weight_packed"), U8, vec![16, 32]),
+            (expert(3, "w2", "weight_scale"), F8E4M3, vec![16, 4]),
+            (expert(3, "w2", "weight_global_scale"), Bf16, vec![]),
+            // No weight.
+            (expert(4, "w3", "weight_global_scale"), F32, vec![]),
+        ]);
+        let p = plan(
+            &c,
+            t.iter().map(|(n, d, s)| (n.as_str(), *d, s.as_slice())),
+            |_| None,
+        );
+        let got = |n: &str| p.placed.get(n).map(|pl| (pl.format, pl.companions.clone()));
+        assert_eq!(
+            got(&format!("{attn}.q_proj.weight")).unwrap(),
+            (
+                Format::Mxfp8,
+                vec![format!("{attn}.q_proj.weight_scale_inv")]
+            )
+        );
+        assert_eq!(
+            got(&format!("{moe}.shared_experts.up_proj.weight"))
+                .unwrap()
+                .0,
+            Format::Mxfp8
+        );
+        for e in 0..2 {
+            assert_eq!(
+                got(&expert(e, "w1", "weight_packed")).unwrap(),
+                (
+                    Format::Nvfp4Ct,
+                    ["weight_scale", "weight_global_scale", "input_global_scale"]
+                        .map(|part| expert(e, "w1", part))
+                        .to_vec()
+                )
+            );
+        }
+        for (name, format) in [
+            (format!("{moe}.gate.weight"), Format::F32),
+            (format!("{moe}.e_score_correction_bias"), Format::F32),
+            ("language_model.lm_head.weight".to_string(), Format::Bf16),
+        ] {
+            assert_eq!(got(&name).unwrap(), (format, vec![]), "{name}");
+        }
+        assert!(p.input_scales.is_empty(), "{:?}", p.input_scales);
+        let refused = |n: &str, why: &str| assert!(p.refused[n].contains(why), "{n}: {p:?}");
+        refused(
+            "vision_tower.vision_model.fc.weight",
+            "the config leaves vision_tower.vision_model.fc unquantized",
+        );
+        refused(
+            "vision_tower.vision_model.fc.weight_scale_inv",
+            "a companion no placed weight reads",
+        );
+        let both = "fits none of [\"MXFP8\", \"NVFP4-compressed-tensors\"]";
+        refused(&expert(2, "w1", "weight"), both);
+        refused(&expert(3, "w2", "weight_packed"), both);
+        refused(
+            &expert(4, "w3", "weight_global_scale"),
+            "a companion no placed weight reads",
+        );
+        for part in ["weight_scale", "weight_global_scale"] {
+            refused(&expert(2, "w1", part), "a companion no placed weight reads");
+        }
+        // Seven weights and other tensors placed, eight scales they claim, nine refused.
+        assert_eq!((p.placed.len(), p.refused.len()), (7, 9), "{p:?}");
+        assert_eq!(t.len(), 7 + 8 + 9);
+    }
+
+    /// The config and the tensors of MiniMax-M3.1-Flash's names through [`plan`] and
+    /// [`normalize`]: a dense projection is MXFP8 blocks (the E8M0 byte of `weight_scale_inv`,
+    /// then 32 values as stored), and a stack of two experts is NVFP4 whose `.scale` is each
+    /// expert's `1 / weight_global_scale`.
+    #[test]
+    fn minimax_m31_tensors_normalize_through_their_plan() {
+        use crate::modelopt::{Plain, Use, normalize};
+        use safetensors::{Safetensors, write};
+        let c = config("MiniMaxAI__MiniMax-M3.1-Flash").unwrap();
+        let attn = "language_model.model.layers.3.self_attn.q_proj";
+        let moe = "language_model.model.layers.3.block_sparse_moe.experts";
+        let values: Vec<u8> = (0..4 * 64).map(|i| (i * 7 % 120) as u8).collect();
+        let exponents = [120u8, 121, 122, 123, 124, 125, 126, 127];
+        let codes: Vec<u8> = (0..16 * 32).map(|i| (i * 37 % 251) as u8).collect();
+        let scales: Vec<u8> = (0..16 * 4).map(|i| (i % 126) as u8).collect();
+        let globals = [8548.7f32, 4248.1];
+        let mut list: Vec<(String, &str, Vec<usize>, Vec<u8>)> = vec![
+            (
+                format!("{attn}.weight"),
+                "F8_E4M3",
+                vec![4, 64],
+                values.clone(),
+            ),
+            (
+                format!("{attn}.weight_scale_inv"),
+                "U8",
+                vec![4, 2],
+                exponents[..8].to_vec(),
+            ),
+        ];
+        for (e, g) in globals.iter().enumerate() {
+            let part = |p: &str| format!("{moe}.{e}.w1.{p}");
+            list.extend([
+                (part("weight_packed"), "U8", vec![16, 32], codes.clone()),
+                (part("weight_scale"), "F8_E4M3", vec![16, 4], scales.clone()),
+                (
+                    part("weight_global_scale"),
+                    "F32",
+                    vec![],
+                    g.to_le_bytes().to_vec(),
+                ),
+                (
+                    part("input_global_scale"),
+                    "F32",
+                    vec![],
+                    1.0f32.to_le_bytes().to_vec(),
+                ),
+            ]);
+        }
+        let refs: Vec<(&str, &str, &[usize], &[u8])> = list
+            .iter()
+            .map(|(n, d, s, b)| (n.as_str(), *d, s.as_slice(), b.as_slice()))
+            .collect();
+        let st = Safetensors::parse(write(&refs)).unwrap();
+        let entries: Vec<(&str, Dtype, Vec<usize>)> = st
+            .names()
+            .map(|n| {
+                let r = st.raw(n).unwrap();
+                (n, r.dtype, r.shape.to_vec())
+            })
+            .collect();
+        let p = plan(
+            &c,
+            entries.iter().map(|(n, d, s)| (*n, *d, s.as_slice())),
+            |_| None,
+        );
+        assert!(p.refused.is_empty(), "{:?}", p.refused);
+        let m = Use::Matrix(Plain::Q8_0);
+
+        let q = format!("{attn}.weight");
+        let dense = normalize(|n| st.raw(n), &[(&q, &p.placed[&q])], m).unwrap();
+        assert_eq!(
+            (dense.type_id, &dense.dims),
+            (GgmlType::MXFP8.as_u32(), &vec![64, 4])
+        );
+        let want: Vec<u8> = (0..4 * 2)
+            .flat_map(|b| {
+                let mut block = vec![exponents[b]];
+                block.extend_from_slice(&values[b * 32..][..32]);
+                block
+            })
+            .collect();
+        assert_eq!(dense.bytes, want);
+        assert!(dense.scale.is_empty());
+
+        let names: Vec<String> = (0..2)
+            .map(|e| format!("{moe}.{e}.w1.weight_packed"))
+            .collect();
+        let sources: Vec<(&str, &Placed)> =
+            names.iter().map(|n| (n.as_str(), &p.placed[n])).collect();
+        let stack = normalize(|n| st.raw(n), &sources, m).unwrap();
+        assert_eq!(
+            (stack.type_id, &stack.dims),
+            (GgmlType::NVFP4.as_u32(), &vec![64, 16, 2])
+        );
+        let want: Vec<u32> = globals.iter().map(|g| (1.0f32 / g).to_bits()).collect();
+        assert_eq!(
+            stack.scale.iter().map(|s| s.to_bits()).collect::<Vec<_>>(),
+            want
+        );
+    }
+
     /// Every tensor of a table gets one format or a refusal naming it: each format's layout is
     /// matched with its companions, a tensor scale is shared from the module the config names,
     /// input scales are reported, and a scale with no weight, a quantized weight the config leaves
@@ -1696,7 +2202,12 @@ mod tests {
     #[test]
     fn each_format_holds_its_values_and_plain_scales() {
         let expert = [2048, 4096, 288];
-        for f in [Format::Nvfp4, Format::Nvfp4Csf, Format::Nvfp4Csf32] {
+        for f in [
+            Format::Nvfp4,
+            Format::Nvfp4Csf,
+            Format::Nvfp4Csf32,
+            Format::Nvfp4Ct,
+        ] {
             assert_eq!(
                 f.held(&expert),
                 Some(Held {
@@ -1773,6 +2284,7 @@ mod tests {
         assert_eq!(Format::Bf16.held(&[u64::MAX / 2, 4]), None);
         assert_eq!(Format::Mxfp8.held(&[1 << 40, 1 << 40]), None);
         assert_eq!(Format::Nvfp4Csf32.logical(&[2048, 1024]), [2048, 2048]);
+        assert_eq!(Format::Nvfp4Ct.logical(&[2048, 1024]), [2048, 2048]);
         assert_eq!(Format::Mxfp8.logical(&[2048, 1024]), [2048, 1024]);
     }
 

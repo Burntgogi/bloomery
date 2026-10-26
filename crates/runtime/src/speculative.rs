@@ -1623,6 +1623,7 @@ mod tests {
                     yarn: None,
                 },
                 qk_norm: true,
+                o_norm: false,
                 out_gate: OutGate::Packed,
                 select: None,
                 window: None,

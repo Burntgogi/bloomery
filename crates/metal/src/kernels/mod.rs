@@ -49,6 +49,7 @@ pub use attention::{
 pub use delta::DeltaParams;
 pub use delta::DeltaRowStrides;
 pub use delta::DeltaRowsParams;
+pub use delta::DeltaSnaps;
 pub use delta::HeadMap;
 pub use delta::Q_SCALE;
 pub use delta::channels;
@@ -60,6 +61,7 @@ pub use delta::state_index;
 pub use delta_geom::CONV_TAPS;
 pub use delta_geom::PASS_ROWS;
 pub use delta_geom::RING_ROWS;
+pub use delta_geom::SNAPS;
 pub use embed::EmbedParams;
 pub use experts::{FoldParams, PairParams, SharedPlan};
 pub use experts_geom::{EXPERT_K, EXPERT_SLOTS, ROUTED_IDS, SHARED_SLOT};
@@ -68,13 +70,13 @@ pub use geometry::{
     BLOCK_VALUES, HEAD_COLS, MAX_SEGMENTS, PARTIALS_PER_HEAD, ROWS_PER_GROUP, ROWS_PER_SIMD_GROUP,
     SIMD_GROUPS_PER_GROUP, THREADS_PER_GROUP, VALUE_HEADS,
 };
-pub use head::{HEAD_GROUPS, HEAD_K, HEAD_SIMD_GROUPS, HEAD_THREADS, HEAD_VOCAB, HeadParams};
+pub use head::{HEAD_K, HEAD_SIMD_GROUPS, HEAD_THREADS, HeadParams, head_groups};
 pub use headnorm::HeadNormParams;
 pub use matvec::{MatvecParams, Mode, NormOnLoad, Quant};
 pub use norm::NormRowsParams;
 pub use routed::{
     CombineParams, F32GemmParams, HeadNormRowsParams, LOGIT_STRIDE, ROUTE_TILE, ROUTED_ROWS,
-    RouteSelectParams, RouteTableParams, RoutedKind, RoutedParams, SLOTS_PER_ROW,
+    RouteSelectParams, RouteTableParams, RoutedKind, RoutedParams, SLOTS_PER_ROW, TABLE_THREADS,
     route_table_words, route_tiles,
 };
 pub use seg::{SegParams, Segment};
@@ -82,7 +84,7 @@ pub use seg::{SegParams, Segment};
 use bloomery_device::DeviceError;
 
 use crate::device::MetalDevice;
-use crate::library::{Library, Pipeline};
+use crate::library::{GemmPath, Library, Pipeline};
 
 /// The pipelines of one mat-vec type: the plain entry, the entry that norms its
 /// input as it loads it, the one that adds into its output, and the segmented
@@ -115,17 +117,30 @@ pub struct Kernels {
     q4k: MatvecPipelines,
     q6k: MatvecPipelines,
     a4: MatvecPipelines,
+    q8_0: MatvecPipelines,
+    q5k: MatvecPipelines,
     /// The dense GEMM of each weight type: every epilogue and operand,
-    /// plain and segmented (`gemm.metal`).
+    /// plain and segmented (`gemm.metal`, or `gemm_tensor.metal` on the
+    /// tensor-op path).
     q4k_gemm: gemm::GemmPipelines,
     q6k_gemm: gemm::GemmPipelines,
     a4_gemm: gemm::GemmPipelines,
-    /// The gated delta net's out projection: the Q4_K entry (A4's is
-    /// `headnorm_a4`; Q6_K has none).
+    q8_0_gemm: gemm::GemmPipelines,
+    q5k_gemm: gemm::GemmPipelines,
+    /// The program the dense and the grouped GEMMs run: the library's
+    /// [`Library::gemm_path`].
+    gemm_path: GemmPath,
+    /// The gated delta net's out projection: the Q4_K entry (A4's, Q8_0's
+    /// and Q5_K's are `headnorm_a4`, `headnorm_q8_0` and `headnorm_q5k`;
+    /// Q6_K has none).
     headnorm: Pipeline,
     headnorm_a4: Pipeline,
+    headnorm_q8_0: Pipeline,
+    headnorm_q5k: Pipeline,
     embed_q4k: Pipeline,
     embed_a4: Pipeline,
+    embed_q8_0: Pipeline,
+    embed_q5k: Pipeline,
     router: Pipeline,
     /// The RMS norm over rows.
     norm_rows: Pipeline,
@@ -138,9 +153,12 @@ pub struct Kernels {
     /// The gated delta step over rows, and the ring commit after it.
     delta_rows: delta::RowsPipelines,
     attention: attention::AttentionPipelines,
-    /// The output head: the Q6_K entry (A4's is `head_a4`; Q4_K has none).
+    /// The output head: the Q6_K entry (A4's, Q8_0's and Q5_K's are
+    /// `head_a4`, `head_q8_0` and `head_q5k`; Q4_K has none).
     head_q6k: Pipeline,
     head_a4: Pipeline,
+    head_q8_0: Pipeline,
+    head_q5k: Pipeline,
     /// The SIMD groups in a mat-vec's threadgroup: the kernels' function
     /// constant, and the geometry of every launch.
     simdgroups: usize,
@@ -280,13 +298,40 @@ impl Kernels {
                 ],
                 count,
             )?,
-            q4k_gemm: gemm::GemmPipelines::new(library, "gemm_q4k")?,
-            q6k_gemm: gemm::GemmPipelines::new(library, "gemm_q6k")?,
-            a4_gemm: gemm::GemmPipelines::new(library, "gemm_a4")?,
+            q8_0: MatvecPipelines::new(
+                library,
+                [
+                    "q8_0_matvec",
+                    "q8_0_matvec_norm",
+                    "q8_0_matvec_resid",
+                    "q8_0_matvec_seg",
+                ],
+                count,
+            )?,
+            q5k: MatvecPipelines::new(
+                library,
+                [
+                    "q5k_matvec",
+                    "q5k_matvec_norm",
+                    "q5k_matvec_resid",
+                    "q5k_matvec_seg",
+                ],
+                count,
+            )?,
+            q4k_gemm: gemm::GemmPipelines::new(library.gemm_library(), "gemm_q4k")?,
+            q6k_gemm: gemm::GemmPipelines::new(library.gemm_library(), "gemm_q6k")?,
+            a4_gemm: gemm::GemmPipelines::new(library.gemm_library(), "gemm_a4")?,
+            q8_0_gemm: gemm::GemmPipelines::new(library.gemm_library(), "gemm_q8_0")?,
+            q5k_gemm: gemm::GemmPipelines::new(library.gemm_library(), "gemm_q5k")?,
+            gemm_path: library.gemm_path(),
             headnorm: library.pipeline_with_simdgroups("q4k_matvec_headnorm_resid", count)?,
             headnorm_a4: library.pipeline_with_simdgroups("a4_matvec_headnorm_resid", count)?,
+            headnorm_q8_0: library.pipeline_with_simdgroups("q8_0_matvec_headnorm_resid", count)?,
+            headnorm_q5k: library.pipeline_with_simdgroups("q5k_matvec_headnorm_resid", count)?,
             embed_q4k: library.pipeline("embed_q4k")?,
             embed_a4: library.pipeline("embed_a4")?,
+            embed_q8_0: library.pipeline("embed_q8_0")?,
+            embed_q5k: library.pipeline("embed_q5k")?,
             router: library.pipeline("router35")?,
             norm_rows: library.pipeline("norm_rows")?,
             routed: routed::RoutedPipelines::new(library)?,
@@ -306,6 +351,16 @@ impl Kernels {
                 u32::try_from(head::HEAD_SIMD_GROUPS)
                     .expect("the head's SIMD-group count fits u32"),
             )?,
+            head_q8_0: library.pipeline_with_simdgroups(
+                "q8_0_head_argmax",
+                u32::try_from(head::HEAD_SIMD_GROUPS)
+                    .expect("the head's SIMD-group count fits u32"),
+            )?,
+            head_q5k: library.pipeline_with_simdgroups(
+                "q5k_head_argmax",
+                u32::try_from(head::HEAD_SIMD_GROUPS)
+                    .expect("the head's SIMD-group count fits u32"),
+            )?,
             simdgroups,
             rows_per_simd_group: rows,
             router_threads,
@@ -313,6 +368,12 @@ impl Kernels {
             // over the SIMD groups the source names.
             router_groups: router_geom::ROWS.div_ceil(router_sg),
         })
+    }
+
+    /// The program the dense and the grouped GEMMs run.
+    #[must_use]
+    pub fn gemm_path(&self) -> GemmPath {
+        self.gemm_path
     }
 
     /// The SIMD groups in a mat-vec's threadgroup.

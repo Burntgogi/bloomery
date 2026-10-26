@@ -75,20 +75,18 @@ gated block selects a split gate/up and sizes the down's q8_1 scratch from the
 actual activation form. Its column walk and the shared wide-prompt owner use
 those same sites. IQ4_XS is not relabeled as a routed expert or requantized.
 
-A compiled public `file_site` consumer on the pinned header refused all three
-layer42 shared matrices before this change and accepts their IQ4_XS/Q8x128
-bindings after it. This reads no payload and proves neither loading nor arithmetic.
 `hw_iq4_shared_loads_and_runs_narrow_columns_and_wide_replay`, owned by
-`gate-gpu-ds41-lib`, covers real packed-weight loading, unequal matrix widths,
-one/eight-column block execution and the wide-prompt transition/captured replay.
-Its nonnegative constant-weight case derives a scalar floating-operation bound;
-it is not a whole-model accuracy pin. The hardware case has not been run here.
+`gate-gpu-ds41-lib`, covers real packed-weight loading, unchanged stored words,
+the ordinary `SharedExpert` layout, unequal matrix widths, one/eight-column block
+execution and the wide-prompt transition/captured replay. Wide scratch holds only
+the q8_1 input and down forms these sites read. Its nonnegative constant-weight
+case derives a scalar floating-operation bound; it is not a whole-model accuracy
+pin. Exact-head hardware execution is required before claiming arithmetic or
+capture/replay support.
 
-Existing program-specific admission remains unchanged: in particular the legacy
-Qwen projection/shared dispatch does not gain this site automatically. Flint
-still has no Program, attention/router binding, body or serve seat. Run the new
-consumer gate and the affected regressions on NVIDIA before claiming device
-support; reconcile full-model coverage only with the actual body integration.
+Program-specific admission remains unchanged: in particular the legacy Qwen
+projection/shared dispatch does not gain this site automatically. This common
+site contract adds no model admission or kernel.
 
 
 

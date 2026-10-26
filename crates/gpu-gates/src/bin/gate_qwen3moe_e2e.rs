@@ -136,7 +136,14 @@
 //!   refused by name), and the wide prefill of [`WIDE_IDS`] ids continues the
 //!   pass prefill's tokens, or differs first only where the pass run's margin
 //!   is under [`MARGIN_FLOOR`]. FAIL-first: the wide combine leaving out the
-//!   host sum (mutant) turns the wide prefill red. The bands are the card's: a host expert runs ik's own 8-bit rule (q8_2 per
+//!   host sum (mutant) turns the wide prefill red.
+//!   (o8) two slots of the placed load in one pass (`GpuModel::step_slots`)
+//!   give the greedy ids of the same two prompts stepped in turn, in graph
+//!   mode and in eager mode: the prose's first 8 ids and ids 40..48, each
+//!   prefilled on the pass path and then 4 steps. FAIL-first: serving both
+//!   columns from one prompt, or swapping the columns, reddens the id
+//!   compare; `step_slots` still refused on the placed load fails the clause
+//!   by name. The bands are the card's: a host expert runs ik's own 8-bit rule (q8_2 per
 //!   32 values for Q4_K-Q6_K and the 32-block types, Q8_K per 256 for the
 //!   rest) where the card runs q8_1, so no layer's error grows.
 //!   (o7) the file planned under no budget, a plan that keeps every routed
@@ -1166,7 +1173,7 @@ mod gate {
         let plan = q.plan(
             CTX,
             &PlanLevers {
-                card_budget_bytes: Some(PLACED_BUDGET),
+                card_budget_bytes: Some(PLACED_BUDGET).into(),
             },
         )?;
         let line = q
@@ -1196,7 +1203,7 @@ mod gate {
             (
                 "a budget above free",
                 PlanLevers {
-                    card_budget_bytes: Some(usable),
+                    card_budget_bytes: Some(usable).into(),
                 },
             ),
         ];
@@ -1264,7 +1271,7 @@ mod gate {
     ) -> Result<Option<Qwen3moeModel>, GateError> {
         let q = PlaceQ3::qwen3(&file, Place::parse("cuda0")?, ctx, KvQ8::F16)?;
         let levers = PlanLevers {
-            card_budget_bytes: Some(PLACED_BUDGET),
+            card_budget_bytes: Some(PLACED_BUDGET).into(),
         };
         let plan = q.plan(ctx, &levers)?;
         for line in q.records(&plan, None)? {
@@ -1431,7 +1438,57 @@ mod gate {
             verdict(served)
         );
         let wide = placed_wide(&mut m)?;
-        Ok(ok && served && wide)
+        let slots = placed_slots(&mut m)?;
+        Ok(ok && served && wide && slots)
+    }
+
+    /// (o8) (module doc): two slots of this placed load, one pass against
+    /// each prompt stepped in turn. The model is the clause's.
+    fn placed_slots(m: &mut Qwen3moeModel) -> Result<bool, GateError> {
+        const SLOT_STEPS: usize = 4;
+        let prose = prose(80)?;
+        let (a, b) = (&prose[..8], &prose[40..48]);
+        if a == b {
+            return Err("(o8): the two prompts are the same".into());
+        }
+        m.add_slots(2)?;
+        let mut ok = true;
+        for mode in [StepMode::Graph, StepMode::Eager] {
+            m.set_mode(mode);
+            let solo = |m: &mut Qwen3moeModel, prompt: &[u32]| -> Result<Vec<u32>, GateError> {
+                m.select_slot(0)?;
+                m.reset()?;
+                let mut ids = vec![m.prefill_with(prompt, PrefillPath::Pass)?];
+                for t in 0..SLOT_STEPS {
+                    ids.push(m.step(&[ids[t]])?);
+                }
+                Ok(ids)
+            };
+            let sa = solo(m, a)?;
+            let sb = solo(m, b)?;
+            m.select_slot(0)?;
+            m.reset()?;
+            let mut ga = vec![m.prefill_with(a, PrefillPath::Pass)?];
+            m.select_slot(1)?;
+            m.reset()?;
+            let mut gb = vec![m.prefill_with(b, PrefillPath::Pass)?];
+            let mut same = ga[0] == sa[0] && gb[0] == sb[0];
+            for t in 0..SLOT_STEPS {
+                let out = m.step_slots(&[(0, &[ga[t]]), (1, &[gb[t]])])?;
+                let &[ia, ib] = out.ids.as_slice() else {
+                    return Err(format!("(o8): a pass gave {:?}", out.ids).into());
+                };
+                same &= ia == sa[t + 1] && ib == sb[t + 1];
+                ga.push(ia);
+                gb.push(ib);
+            }
+            println!(
+                "placed slots ({mode:?}): one pass of two slots vs each prompt stepped in turn {}",
+                verdict(same)
+            );
+            ok &= same;
+        }
+        Ok(ok)
     }
 
     // ------------------------------------------- (y) the Q5_K routed path
@@ -1681,7 +1738,7 @@ mod gate {
         let q = PlaceQ3::qwen3(&file, Place::parse("cuda0")?, CTX, KvQ8::F16)?;
         let budget = pick(&q)?;
         let levers = PlanLevers {
-            card_budget_bytes: Some(budget),
+            card_budget_bytes: Some(budget).into(),
         };
         let plan = q.plan(CTX, &levers)?;
         for line in q.records(&plan, None)? {

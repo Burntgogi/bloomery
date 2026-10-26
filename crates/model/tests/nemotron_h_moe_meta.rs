@@ -418,7 +418,7 @@ fn hw_nemotron_h_moe_plans_the_host_tier() {
                 let budget = host_split::half_expert_budget(card);
                 println!("{name}: the partial arm's budget B = {budget}");
                 let levers = PlanLevers {
-                    card_budget_bytes: Some(budget),
+                    card_budget_bytes: Some(budget).into(),
                 };
                 inputs
                     .plan_with(&machine, CTX, &levers, Experts::Placed)
@@ -433,7 +433,7 @@ fn hw_nemotron_h_moe_plans_the_host_tier() {
         }
 
         let room = PlanLevers {
-            card_budget_bytes: Some(ROOM_3060),
+            card_budget_bytes: Some(ROOM_3060).into(),
         };
         let small = inputs
             .plan_with(&machine, CTX, &room, Experts::Placed)

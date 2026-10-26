@@ -1,0 +1,48 @@
+# Round speed039: the MiniMax-M3.1-Flash checkpoint folder's load runs the residency machine as a GGUF
+# file's does (the tiered seat's folder branch is gone; a plan that pages NVFP4 planes turns the unset
+# word off by name). Base int039s 951220e39 (residency=off why=fixed_place on the folder) against
+# bloomery-speed039 (unset: mid-p0-s1 on the plan, xstream=admit on bp), bloomery-serve at the serving
+# defaults, --place unset (bp: stage RTX A6000, the RTX 3090 an expert tier).
+# Decode [derived, /Users/hckim/.cache/bloomery/placegen/speed039-decomp.md]: the base step is
+# 61.1 ms at D=512 (16.36 tok/s measured), of which the host leg is 172.1 host slots x 225 us = 38.7 ms
+# (the per-slot cost measured by the A6000-alone vs bp tapes, 68.5 vs 63.4 ms for 22.7 slots: DRAM-bound,
+# 142 GB/s). The card's moving share is 1063 of 7296 experts (0.146, 0.139 with one spare a layer); the
+# machine's decode heat lifts it to h_ss 0.25..0.45 (V4.1's rule-only lift at an 18 % share, 0.17 to
+# 0.47, scaled by share), reached over the 127 timed steps of a fresh server at ~84 % (decay 0.9 every
+# 4 rows, cap 24 a plan; MiniMax's body counts no prompt heat). Host slots saved 21..60 a token = 4.8..13.4 ms,
+# less flips at their bytes' DRAM time (31.85 MB, ~0.22 ms each, 1..6 a token in the ramp) 0.3..1.0 ms;
+# the card's extra routed reads (0.7..1.9 GB) stay under the host leg's shadow (per layer 0.17..0.20 ms
+# card against 0.41..0.54 ms host). New step 48.0..57.3 ms: +6..+28 %, central +17 %. D=4096 the same
+# (the MSA step is depth-flat, +0.7 ms 512 to 4096 measured).
+# Prefill [derived]: no prompt heat on this body; the spares lend 57 card experts to the host,
+# pp512/pp4096 -0.5..-1 %, read on the same rows, not the term.
+# Ruler: sd 1.2 % from the base's three D=512 rows (16.15 cold, 16.46, 16.48); at 3 rounds the pooled
+# half-width is 2.776 x 1.2 x sqrt(2/3) = 2.7 %, under the band's lower edge.
+# Wall [derived]: 12 servers (2 trees x 2 depths x 3 rounds) x (load 172 s measured, +~20 s for the
+# hosted churn pool on the changed arm, + 5 s) + requests 3 x 2 x (13 + 49) s: ~45 min. Two rounds
+# (~31 min, half-width 5.2 %) still clears the lower edge.
+kind: ab
+question: does the M3.1 checkpoint folder's load decode faster on bp when it runs the residency machine
+  (unset mid-p0-s1, xstream admit) instead of off?
+term: decode tok/s @ n=128 after D=512 prose ids, MiniMax-M3.1-Flash NVFP4 folder, bloomery-serve serving
+  defaults, --ctx-size 4300, RTX A6000 + RTX 3090 (bp) - (speed039 - int039s) / int039s
+unit: %
+predict: +6..+28
+rounds: 3
+sd: 1.2 % ds-minimax-m3.log (rel039-headline sitting, 2026-10-24), the base's three D=512 rows
+condition: one lease, BLOOMERY_MODEL=minimax-m3 BLOOMERY_AB_ROUNDS=3
+  BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/speed039-folder-residency.card
+  BLOOMERY_TIMING_CARDS=a6000+3090 DEPTH_SERVE_CTX=4300' just depth-serve bloomery-int039s:512
+  bloomery-speed039:512 bloomery-int039s:4096 bloomery-speed039:4096; the arms rotate every round, each a
+  fresh server with both cards in view and every lever unset; the changed arm's server.err must name
+  residency lever residency=mid-p<P>-s1 (why place or pool_shrunk), its residency host record and
+  xstream=admit, the base's residency=off why=fixed_place, read before the rates
+decide-in: land the change (gate-gpu-minimaxm3-serve, gate-gpu-minimaxm3-twocard, gate-gpu-musespark-serve,
+  the levers lib tests), then price the tier card's set under the machine (the 3090's 726 experts stay
+  static today) as the next M3.1 lever
+decide-below: under +6 %: read the changed arm's residency lines; if the word ran, the routing is flatter
+  than V4.1's: take a route trace of one request (the minimaxm3 trace builder) and replay it in
+  tools/ref/router-residency.py before any other residency lever, and land the change only as the
+  lever surface (a set word on a folder) if it is not slower
+decide-above: beyond +28 %: read the plan, need and witness lines of both arms (a card or host change
+  beside the word) before landing

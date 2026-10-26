@@ -17,15 +17,15 @@ use std::collections::BTreeMap;
 use std::ops::Range;
 
 use gguf::Value;
-use hf::modelopt::{self, Normal, Plain, Use};
-use hf::quant_config::{Placed, Plan};
+use hf::modelopt::{Normal, Plain, Use};
 use hf::schema::{self, Fields, Rule::*, Type};
-use safetensors::Raw;
 use serde_json::Value as Json;
 
 use model::arch::names as common;
 use model::arch::qwen35moe::hparams::{MAX_PLE_HEADS, MAX_PLE_NGRAM};
 use model::arch::qwen35moe::names::{self, Sub};
+
+use crate::folder::{FolderMap, Mapping, Origin, PlusOne, VocabSpec};
 
 pub mod folder;
 
@@ -36,17 +36,6 @@ pub enum Error {
     Config(String),
     #[error("qwen35moe hf: {name}: {what}")]
     Tensor { name: String, what: String },
-}
-
-/// The plan's place of the tensor `name`, or its refusal by name.
-fn place<'p>(plan: &'p Plan, name: &str) -> Result<&'p Placed, Error> {
-    plan.placed.get(name).ok_or_else(|| {
-        let why = plan
-            .refused
-            .get(name)
-            .map_or("not a weight of the plan", String::as_str);
-        refuse(name, why)
-    })
 }
 
 fn refuse(name: &str, what: impl Into<String>) -> Error {
@@ -115,14 +104,18 @@ impl Family {
         }
     }
 
+    /// The checkpoint's prefix of the vision tower's tensors.
+    fn vision(self) -> &'static str {
+        match self {
+            Family::Qwen38 => "model.visual.",
+            Family::Qwen36 => "vision_tower.",
+        }
+    }
+
     /// Whether `name` is a tensor the map leaves out: the vision tower by its prefix, and the
     /// next-token layers (`mtp.*`) in the target's map or everything else in the draft's.
     fn leaves_out(self, name: &str, draft: bool) -> bool {
-        let vision = match self {
-            Family::Qwen38 => "model.visual.",
-            Family::Qwen36 => "vision_tower.",
-        };
-        name.starts_with(vision) || name.starts_with("mtp.") != draft
+        name.starts_with(self.vision()) || name.starts_with("mtp.") != draft
     }
 
     /// The `config.json` keys the family has beside [`ROOT_SHARED`].
@@ -979,6 +972,104 @@ impl Checkpoint {
     }
 }
 
+impl From<Error> for crate::folder::Error {
+    fn from(e: Error) -> crate::folder::Error {
+        crate::folder::Error::Model(Box::new(e))
+    }
+}
+
+/// Why the checkpoint tensor `name` of `family` is left out of the header, when the map reads no
+/// part of it: the next-token layers, the vision tower, and the PLE hash constants, which are
+/// header keys ([`Checkpoint::header`]).
+fn skip_reason(family: Family, name: &str) -> Option<&'static str> {
+    if name.starts_with("mtp.") {
+        return Some(MTP);
+    }
+    if name.starts_with(family.vision()) {
+        return Some(VISION);
+    }
+    let (layer, rest) = name
+        .strip_prefix(family.text())?
+        .strip_prefix("layers.")?
+        .split_once('.')?;
+    layer.parse::<usize>().ok()?;
+    let constant = rest.strip_prefix("ple.ple_embedding.")?;
+    PLE_CONSTANTS
+        .iter()
+        .any(|(c, _)| *c == constant)
+        .then_some("a PLE hash constant, read as a header key")
+}
+
+// Where a name below is `Checkpoint`'s own (`parse`, `map`, `header`), the inherent function is the
+// one called: the trait's wrap it in the folder's error.
+impl FolderMap for Checkpoint {
+    type Step = Step;
+
+    const MODEL_TYPES: &'static [&'static str] = &["qwen4_exp", "qwen3_5_moe"];
+
+    fn parse(config: &Json) -> Result<Self, crate::folder::Error> {
+        Ok(Checkpoint::parse(config)?)
+    }
+
+    fn module_class(&self, module: &str) -> Option<hf::quant_config::ModuleClass> {
+        crate::arch::module_class(module)
+    }
+
+    fn map<'a>(
+        &self,
+        tensors: &[(&'a str, &'a [usize])],
+    ) -> Result<Mapping<Step>, crate::folder::Error> {
+        let tensors_of = tensors.iter().copied();
+        let skipped = tensors
+            .iter()
+            .filter_map(|(n, _)| {
+                Some((
+                    n.to_string(),
+                    skip_reason(self.geometry.family, n)?.to_string(),
+                ))
+            })
+            .collect();
+        Ok(Mapping {
+            tensors: Checkpoint::map(self, tensors_of)?,
+            skipped,
+        })
+    }
+
+    fn mover(&self, name: &str, steps: &[Step]) -> Option<crate::part::Step> {
+        (!steps.is_empty()).then(|| {
+            let (g, name, steps) = (self.geometry.clone(), name.to_string(), steps.to_vec());
+            Box::new(move |n: &mut Normal| {
+                steps
+                    .iter()
+                    .try_for_each(|s| s.apply(&g, &name, n))
+                    .map_err(|e| e.to_string())
+            }) as crate::part::Step
+        })
+    }
+
+    fn header(
+        &self,
+        planned: &[(&str, &[u64])],
+        folder: &safetensors::Folder,
+    ) -> Result<Vec<(String, Value)>, crate::folder::Error> {
+        Ok(Checkpoint::header(self, planned.iter().copied(), folder)?)
+    }
+
+    fn vocab(&self) -> &VocabSpec {
+        &self.vocab
+    }
+
+    fn draft(
+        &self,
+        path: &std::path::Path,
+        files: &safetensors::Folder,
+        plan: &hf::quant_config::Plan,
+        kvs: &[(String, Value)],
+    ) -> Result<Option<(gguf::Split, Vec<folder::Planned>)>, crate::folder::Error> {
+        folder::mtp(path, self, (files, plan), kvs)
+    }
+}
+
 /// A move of a normalized tensor into the program's layout.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Step {
@@ -994,62 +1085,14 @@ pub enum Step {
     /// The one unit dim of a 3-D tensor dropped: Qwen3.6's conv taps are stored `[channels,
     /// kernel, 1]` (ggml dims `[1, kernel, channels]`), rows of `kernel` values once it is gone.
     Squeeze,
-    /// `x + 1`, on F32.
+    /// `x + 1`, on F32: [`PlusOne`].
     PlusOne,
     /// `-exp(x)`, on F32, computed in f64 and rounded once.
     NegExp,
 }
 
 /// One qwen4exp tensor.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Mapped {
-    /// The checkpoint tensors it is made from: one, a stack's experts in expert order, or the
-    /// PLE table's parts in part order.
-    pub sources: Vec<String>,
-    pub role: Use,
-    pub steps: Vec<Step>,
-    /// ggml's dims, the fastest axis first.
-    pub dims: Vec<u64>,
-}
-
-impl Mapped {
-    /// Each source with its place in `plan`, in source order: what [`modelopt::normalize`]
-    /// reads, and [`modelopt::format_of`] the one format of.
-    pub fn placed<'p>(&'p self, plan: &'p Plan) -> Result<Vec<(&'p str, &'p Placed)>, Error> {
-        self.sources
-            .iter()
-            .map(|s| Ok((s.as_str(), place(plan, s)?)))
-            .collect()
-    }
-
-    /// A row table's parts, one at a time in order: each normalized by its place in `plan`, and
-    /// refused when its type or tensor scale is not the first part's, as the table keeps one.
-    pub fn parts<'s, 'a: 's>(
-        &'s self,
-        plan: &'s Plan,
-        get: impl Fn(&str) -> Result<Raw<'a>, safetensors::Error> + Copy + 's,
-    ) -> impl Iterator<Item = Result<Normal, Error>> + 's {
-        let mut table: Option<(u32, Vec<f32>)> = None;
-        self.sources.iter().map(move |src| {
-            let p = place(plan, src)?;
-            let n = modelopt::normalize(get, &[(src.as_str(), p)], self.role)
-                .map_err(|e| refuse(src, e.to_string()))?;
-            match &table {
-                Some((ty, scale)) if (*ty, scale) != (n.type_id, &n.scale) => Err(refuse(
-                    src,
-                    format!(
-                        "type {} scale {:?}, the table's type {ty} scale {scale:?}",
-                        n.type_id, n.scale
-                    ),
-                )),
-                _ => {
-                    table.get_or_insert_with(|| (n.type_id, n.scale.clone()));
-                    Ok(n)
-                }
-            }
-        })
-    }
-}
+pub type Mapped = crate::folder::Mapped<Step>;
 
 /// Tensors stored in parts by index (a layer's experts, the PLE table's shards): name and shape.
 type Parts<'a> = BTreeMap<usize, (&'a str, &'a [usize])>;
@@ -1102,6 +1145,7 @@ fn map<'a>(
             role,
             steps,
             dims,
+            origin: Origin::Made,
         };
         if left_out {
             continue;
@@ -1265,6 +1309,7 @@ fn map<'a>(
                 role: Use::Matrix(Plain::Q8_0),
                 steps: vec![Step::JoinColumns],
                 dims: vec![(cols * 2) as u64, rows as u64],
+                origin: Origin::Made,
             },
         )?;
     }
@@ -1283,6 +1328,7 @@ fn map<'a>(
                 role: Use::Matrix(Plain::Q8_0),
                 steps: vec![],
                 dims: dims.into_iter().map(|d| d as u64).collect(),
+                origin: Origin::Made,
             },
         )?;
     }
@@ -1322,6 +1368,7 @@ fn map<'a>(
                 role: Use::Rows,
                 steps: vec![],
                 dims: vec![cols as u64, rows as u64],
+                origin: Origin::Made,
             },
         )?;
     }
@@ -1343,6 +1390,7 @@ fn layer(
         role: Use::Matrix(plain),
         steps,
         dims,
+        origin: Origin::Made,
     };
     let one = |to: String, plain: Plain, steps: Vec<Step>| {
         Ok(vec![(to, mapped(plain, steps, dims.clone()))])
@@ -1647,9 +1695,12 @@ impl Step {
                 t.dims = vec![width as u64, keep.len() as u64];
                 return Ok(());
             }
-            Step::PlusOne | Step::NegExp => {
+            Step::PlusOne => {
+                PlusOne.apply(t).map_err(|why| refuse(name, why))?;
+                return Ok(());
+            }
+            Step::NegExp => {
                 f32s(t)?;
-                let neg = matches!(self, Step::NegExp);
                 for (src, dst) in t
                     .bytes
                     .as_chunks::<4>()
@@ -1657,22 +1708,8 @@ impl Step {
                     .iter()
                     .zip(moved.as_chunks_mut::<4>().0)
                 {
-                    let x = f32::from_le_bytes(*src);
-                    let y = if neg {
-                        super::neg_exp(x).map_err(|why| refuse(name, format!("{self:?}: {why}")))?
-                    } else {
-                        if !x.is_finite() {
-                            return Err(refuse(name, format!("{self:?}: non-finite input {x}")));
-                        }
-                        let y = x + 1.0;
-                        if !y.is_finite() {
-                            return Err(refuse(
-                                name,
-                                format!("{self:?}: result {y} is outside its F32 range"),
-                            ));
-                        }
-                        y
-                    };
+                    let y = super::neg_exp(f32::from_le_bytes(*src))
+                        .map_err(|why| refuse(name, format!("{self:?}: {why}")))?;
                     *dst = y.to_le_bytes();
                 }
             }
@@ -1687,10 +1724,71 @@ mod tests {
     use std::io::Read;
 
     use gguf::GgmlType;
+    use hf::modelopt;
     use hf::quant_config::{Config, plan};
     use safetensors::Dtype;
 
     use super::*;
+
+    /// The next-token layers, the vision tower and the PLE hash constants are skipped with their
+    /// reason; the PLE table's parts and every other tensor are the map's to read.
+    #[test]
+    fn the_tensors_the_map_leaves_out_are_named() {
+        let text = Family::Qwen38.text();
+        let ple = |p: &str| format!("{text}layers.1.ple.ple_embedding.{p}");
+        for (family, name, why) in [
+            (
+                Family::Qwen38,
+                "mtp.layers.0.mlp.gate.weight".to_string(),
+                MTP,
+            ),
+            (
+                Family::Qwen38,
+                "model.visual.blocks.0.attn.qkv.weight".to_string(),
+                VISION,
+            ),
+            (
+                Family::Qwen36,
+                "vision_tower.blocks.0.attn.qkv.weight".to_string(),
+                VISION,
+            ),
+            (
+                Family::Qwen38,
+                ple("layer_multipliers"),
+                "a PLE hash constant, read as a header key",
+            ),
+            (
+                Family::Qwen38,
+                ple("ngram_heads_offsets"),
+                "a PLE hash constant, read as a header key",
+            ),
+            (
+                Family::Qwen38,
+                ple("ngram_heads_vocab_sizes"),
+                "a PLE hash constant, read as a header key",
+            ),
+        ] {
+            assert_eq!(skip_reason(family, &name), Some(why), "{name}");
+        }
+        for (family, name) in [
+            (Family::Qwen38, ple("ngram_embedding.shard_0.weight")),
+            (
+                Family::Qwen38,
+                format!("{text}layers.x.ple.ple_embedding.layer_multipliers"),
+            ),
+            (
+                Family::Qwen38,
+                format!("{text}layers.1.ple.key_proj.weight"),
+            ),
+            (Family::Qwen38, "lm_head.weight".to_string()),
+            (
+                Family::Qwen36,
+                "model.visual.blocks.0.attn.qkv.weight".to_string(),
+            ),
+        ] {
+            assert_eq!(skip_reason(family, &name), None, "{name}");
+        }
+    }
 
     fn fixture(name: &str) -> Vec<u8> {
         let path = format!("{}/../hf/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"));
@@ -2626,6 +2724,7 @@ mod tests {
             role: Use::Rows,
             steps: vec![],
             dims: vec![160, 4],
+            origin: Origin::Made,
         };
         let (inf, nan) = (f32::INFINITY.to_le_bytes(), f32::NAN.to_le_bytes());
         let mut missed = vec![];
@@ -3352,7 +3451,7 @@ mod tests {
         for file in ["tokenizer_config.json", "generation_config.json"] {
             std::fs::write(dir.join(file), "{}").unwrap();
         }
-        let opened = folder::open(&dir).unwrap();
+        let opened = crate::folder::open(&dir).unwrap();
         let hp = Hparams::read(&opened.header).unwrap();
         assert_eq!(hp.kinds, [Kind::DeltaRule, Kind::Attention]);
         assert_eq!(hp.interval, 2);

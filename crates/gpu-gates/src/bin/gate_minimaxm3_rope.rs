@@ -1,7 +1,7 @@
 //! GPU gate for the head kernel of MiniMax-M3's attention,
 //! `rope_neox::head_norm_neox_append_128_partial`, model-less at the model's
 //! shapes: 64 query heads over 4 key heads of 128 values, a NEOX rope over the
-//! first 64 values of each head (`rope.dimension_count`) at θ 5e6, RMS eps
+//! first 64 values of each head (`rope.dimension_count`) at θ 1e7, RMS eps
 //! 1e-6. Inputs are seeded (`rope_gate::seeded_inputs`); nothing is read from a model
 //! file.
 //!
@@ -37,7 +37,7 @@ mod gate {
     /// The model's attention shape.
     const N_HEAD: usize = 64;
     const N_KV: usize = 4;
-    const THETA: f32 = 5.0e6;
+    const THETA: f32 = 1.0e7;
     const EPS: f32 = 1.0e-6;
 
     /// The tokens, first position and cache height of a launch.

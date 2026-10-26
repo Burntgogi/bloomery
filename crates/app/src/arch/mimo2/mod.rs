@@ -63,9 +63,10 @@ impl Open for Body {
     }
 
     /// The plan on `machine` counting `cfg.slots` sequences, refused unless
-    /// its layers sit on one card: the chain runs on one. A placement that
-    /// hangs an expert tier card is refused by the plan itself: every routed
-    /// expert is the host's.
+    /// its layers sit on one card: the chain runs on one. An expert tier card
+    /// beside it holds routed experts the plan puts there, which the load
+    /// hangs under the host tier (one sequence only: the body refuses a tier
+    /// beside several by name).
     fn plan<'a>(
         inputs: &'a PlanInputs,
         machine: &'a Machine,

@@ -139,23 +139,27 @@
 //!     its own copy of the `_p4` segment pass (`seg_mma_ps`), which differs in
 //!     the count bound, the staging load and the pack's twelve heads in one
 //!     tile, so the clause holds the copy to the dense body's bits. Every
-//!     launch of 11 to 13 runs the fold as well
-//!     (`flash_gqa::enqueue_fold_256_p12_sel`: the segment pass's segments
-//!     and the merge's fold in one block a row and key head), each output bit
-//!     for bit the two launches'.
+//!     launch of 11 to 13 runs the listed prefill flash as well
+//!     (`flash_gqa_prefill::enqueue_256_p12_sel`: the dense prefill walk over
+//!     each row's list, one block a row and key head, the ubatch walk's
+//!     entry), here bit for bit the dense pack-of-four prefill flash
+//!     (`enqueue_256_p4`) at the same counts: the same tiles, scores, softmax
+//!     and value products, its work split over the block's warps.
 //! 12. Past 2,051: each row within the dense clause's band of the exact
-//!     attention over its listed keys, NaN in every cache row no list names
-//!     changing no bit, a rerun, each verify row and each of twenty rows its
-//!     one-row launch; the
+//!     attention over its listed keys (the listed prefill flash within the
+//!     prefill band, `prefill_bound` over the list's tiles), NaN in every
+//!     cache row no list names changing no bit, a rerun, each verify row and
+//!     each of twenty rows its one-row launch, for both entries; the
 //!     captured chain (pool, score, top-k, segment pass, merge: five nodes)
 //!     the eager bits, the segment pass one block of 384 threads a (row, key
 //!     head, segment); the ubatch walk's chain on the twenty rows (pool,
-//!     score, top-k, fold: four nodes) the eager bits, the fold one block of
-//!     384 threads a (row, key head).
+//!     score, top-k, listed prefill: four nodes) the eager bits, the listed
+//!     prefill one block of 256 threads a (row, key head).
 //! 13. A list entry at the cache's height raising `pool_select`, a length of
 //!     zero or past the width raising `key_count`: that row NaN, the other bit
-//!     for bit clean, the fold raising the same word; a group that is not
-//!     twelve heads a key head refused by name by both entries.
+//!     for bit its clean output, in both entries, each raising the same word;
+//!     a group that is not twelve heads a key head refused by name by both
+//!     entries.
 //! 14. The selector's three entries and the two selected flashes compile with
 //!     no local depot.
 //! 15. Deep: the selector and the selected flash at a cache of 262,144 rows
@@ -168,8 +172,9 @@
 //!     `runtime::qsa`'s rule over the full span of 65,536 pools, every list
 //!     holding rows past 65,535 and a tail ending at its position; the selected
 //!     flash, both passes, within the band of the exact attention over the
-//!     listed rows, with NaN in every unlisted cache row changing no bit, the
-//!     fold its bits.
+//!     listed rows, with NaN in every unlisted cache row changing no bit, and
+//!     the listed prefill flash within its band, the same NaN rows changing
+//!     none of its bits.
 //!     The counts reach the kernels as their `u32` arguments, the list
 //!     entries as `u32` cache rows: a count or a row cut to 16 bits, or the
 //!     context clamped at 65,535, reads other rows or refuses the count.
@@ -196,8 +201,43 @@
 //!     [`SEED_Q8`]: bit for bit the f16 twin, a rerun, each row its one-row
 //!     launch, the fault, the captured launch (one node), a head count
 //!     refused.
+//! 17. Nanbeige4.3-33B's layer (56 query heads over 8, group 7, heads of 128,
+//!     a NORM rope over all 128 values at θ 1.2e8, no head norm), model-less.
+//!     The NORM append (`rope_norm::enqueue_rope_norm_append`) on a decode row
+//!     at position 5 and a seven-token chunk from position 3: q and k turned in
+//!     place and the planes' rows the f16 (nearest even) of the turned key and
+//!     of the value, bit for bit this binary's transcription of the rule
+//!     (`y0 = x0·c − x1·s`, `y1 = x0·s + x1·c` on the adjacent pairs, each
+//!     product and sum rounded on its own), a rerun bit for bit, and a position
+//!     at the cache's height raising `cache_pos` with that token's heads NaN and
+//!     nothing appended. Its q8_0 append (`enqueue_rope_norm_append_q8`): the
+//!     heads the f16 entry's bit for bit, the planes the two planes of
+//!     `quantize_q8_0` over the same values, a rerun, and a value holding a NaN
+//!     refusing its block (`kv_quant`).
+//! 18. The group-7 decode flash (`flash_gqa::enqueue_pass_g7`, the tensor-core
+//!     pass only) at [`NB_DEC_KEYS`] (one key, a segment's end and the key past
+//!     it, 1,025 and 4,096): each output within the tensor-core band of the
+//!     exact attention in f64 on the same f16 keys and values (clause 2's model
+//!     at a head of 128), a rerun, NaN in the rows past the count changing no
+//!     bit, and a pad row's partial and output tails — one more head's row of
+//!     sentinel bits past the launch's buffers — untouched; the q8 entry
+//!     (`enqueue_pass_g7_q8`) bit for bit the f16 entry on the synthesized f16
+//!     cache of the dequantized values and so within the same band; eight rows
+//!     in one launch each its one-row launch, a count past the cache and a zero
+//!     raising `key_count` with NaN in exactly those rows, the captured launch
+//!     (two nodes) the eager bits, and the scalar pass refused by name.
+//! 19. The group-7 prefill flash (`flash_gqa_prefill::enqueue_g7`) at
+//!     [`NB_SEED_PREFILL`] `(p0, T)` — T = 1, 7, 8 and 512 from the first
+//!     position with the causal counts `p0 + t + 1`, and launches crossing the
+//!     64-key tile edges: each row within the prefill band, a rerun, NaN
+//!     padding changing no bit, the output tail untouched, sampled rows each
+//!     the row launched alone; the q8 entry (`enqueue_g7_q8`) bit for bit the
+//!     f16 entry on the dequantized cache and within the band; then the fault
+//!     (a count past the cache and a zero), the captured launch (one node) and a
+//!     head count the kernel is not built for refused by name.
+//! 20. The six new entries compile with no local depot.
 //!
-//! Tiers (`BLOOMERY_TIER`): the gate reads a model file and a set of ik's in clause 6 alone. Clauses 1–5 and 7–16 run
+//! Tiers (`BLOOMERY_TIER`): the gate reads a model file and a set of ik's in clause 6 alone. Clauses 1–5 and 7–20 run
 //! on synthetic inputs and are self-consistency clauses (`tier::sc`), run on either tier. Clause 6 is `Tag::Oracle` on
 //! the real batch set and the Q4_K_M file in the real tier, which the fixture tier leaves to the real tier by name, and
 //! `Tag::FixtureOracle` in the fixture tier, on the batch set of ik's dumped on the fixture file (refset's
@@ -208,12 +248,13 @@
 //!
 //! `--bench-kernels` runs no clause: it times a 4,096-position prompt's
 //! selecting rows (counts up to 4,096 over a cache of [`BENCH_CTX`] rows) the
-//! two ways a walk runs them, a selection and a segment pass with its merge a
-//! run of eight rows, or a selection and a fold a run of every row
-//! (`bench sel rows=`, wall milliseconds of the enqueued chain to its
-//! synchronize, the least and the median of seven rounds), over the first 8,
-//! 64, 256 and every selecting row, and prints whether the two outputs have
-//! the same bits. Nothing there asserts on a result.
+//! two ways a walk can run them, a selection and a segment pass with its merge
+//! a run of eight rows (a pass's), or a selection and the listed prefill flash
+//! a run of every row (the ubatch walk's) (`bench sel rows=`, wall
+//! milliseconds of the enqueued chain to its synchronize, the least and the
+//! median of seven rounds), over the first 8, 64, 256 and every selecting row,
+//! and prints the largest difference of the two outputs. Nothing there
+//! asserts on a result.
 
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
@@ -224,9 +265,10 @@ fn main() -> std::process::ExitCode {
 mod gate {
     use bloomery_gpu::fault::{Fault, FaultSink, FaultSite, LAYER_NONE};
     use bloomery_gpu::flash_gqa::{
-        FlashGqaKernels, GROUP, GqaArgs, GqaFoldArgs, GqaQ8Args, GqaSelArgs, HEAD_256 as HEAD,
-        KEY_TILE, PACK_2, PACK_4, PACK_12, SEG_KEYS, SEGMENTS, listed_partials_ms_len,
-        listed_partials_v_len_256, listed_segments, partials_ms_len, partials_v_len_256, seg_span,
+        FlashGqaKernels, GROUP, GROUP_7, GqaArgs, GqaListArgs, GqaQ8Args, GqaSelArgs,
+        HEAD_256 as HEAD, KEY_TILE, PACK_2, PACK_4, PACK_12, SEG_KEYS, SEGMENTS,
+        listed_partials_ms_len, listed_partials_v_len_256, listed_segments, partials_ms_len,
+        partials_v_len, partials_v_len_256, seg_span,
     };
     use bloomery_gpu::flash_gqa_prefill::{
         FlashGqaPrefill, GqaPrefillArgs, GqaPrefillQ8Args, KEY_TILE as PREF_TILE,
@@ -240,17 +282,18 @@ mod gate {
     use bloomery_gpu::rope_neox::{
         PartialNeoxArgs, ROT_256 as ROT, RopeNeoxKernels, q8_plane_lens,
     };
+    use bloomery_gpu::rope_norm::{NormQ8Args, RopeNormKernels};
     use bloomery_gpu::rope_table::{Direction, RopeSpec, RopeTable};
     use bloomery_gpu::route_core::sigmoid;
     use bloomery_gpu::weights::q8_0_planes;
     use bloomery_gpu::{Gpu, GpuError, Q8Act};
-    use bloomery_gpu_gates::flash_band::{ExactAttn, exact_attn, prefill_bound};
+    use bloomery_gpu_gates::flash_band::{ExactAttn, exact_attn, judge_prefill, prefill_bound};
     use bloomery_gpu_gates::prefill_gate::{
         HostCache, WindowCase, Windows, cache, window_refusals,
     };
     use bloomery_gpu_gates::qwen3moe::dev::{SENTINEL_Q8_CODE, SENTINEL_Q8_SCALE};
     use bloomery_gpu_gates::rope_gate::{self, RopeIn, RopeOut, RopeShape, SENTINEL};
-    use bloomery_gpu_gates::rounding::{U, U_F32, butterfly, gamma, neox_head};
+    use bloomery_gpu_gates::rounding::{U, U_F32, butterfly, gamma, neox_head, norm_head};
     use bloomery_gpu_gates::tier::{self, Tag};
     use bloomery_gpu_gates::{
         GateError, Layout, RefManifest, RowKind, activations, bits_equal, checks_failed, data_dir,
@@ -261,7 +304,7 @@ mod gate {
     use gguf::Split;
     use gguf::quant::{Q8Block, f32_to_f16_bits, half_to_f32};
     use model::arch::deepseek2::attn::quantize_q8_0;
-    use model::arch::qwen35moe::hparams::{Hparams, Kind};
+    use model::arch::models::Mixer;
     use refset::arch::qwen35moe::fixture as fx;
     use refset::arch::qwen35moe::{BATCH, IK, MODEL};
     use runtime::qsa::{Qsa, select as qsa_select};
@@ -739,8 +782,13 @@ mod gate {
     /// `gate_qwen3moe_flash`'s model at a head of [`HEAD`] (module doc):
     /// `q` one head's query, `kh`/`vh` its key head's first `n` rows.
     fn exact(q: &[f32], kh: &[f32], vh: &[f32], n: usize, scale: f32) -> Exact {
-        let ex = exact_attn(q, kh, vh, HEAD, n, scale);
-        let bound_pref = prefill_bound(&ex, vh, HEAD, PREF_TILE, 0);
+        exact_at(HEAD, q, kh, vh, n, scale)
+    }
+
+    /// [`exact`] at a head of `head` values (128 for clauses 17–19).
+    fn exact_at(head: usize, q: &[f32], kh: &[f32], vh: &[f32], n: usize, scale: f32) -> Exact {
+        let ex = exact_attn(q, kh, vh, head, n, scale);
+        let bound_pref = prefill_bound(&ex, vh, head, PREF_TILE, 0);
         let ExactAttn {
             o,
             a,
@@ -758,16 +806,16 @@ mod gate {
         let r_ours = (n.div_ceil(KEY_TILE) + segs) as f64;
         // The scalar dot: 64 fused multiply-adds per rotating partial, two
         // combine levels, the scale.
-        let es_o = gamma(HEAD / 4 + 3);
+        let es_o = gamma(head / 4 + 3);
         // Each half's tensor-core chain, their sum, and the query's f16.
-        let es_m = 2f64.powi(-11) + 2.0 * gamma(HEAD + 2);
+        let es_m = 2f64.powi(-11) + 2.0 * gamma(head + 2);
         let acc_o = gamma(span + segs + 8);
-        let mut bo = vec![0.0f64; HEAD];
-        let mut bm = vec![0.0f64; HEAD];
-        for d in 0..HEAD {
+        let mut bo = vec![0.0f64; head];
+        let mut bm = vec![0.0f64; head];
+        for d in 0..head {
             let (mut t_o, mut t_m, mut pv) = (0.0f64, 0.0f64, 0.0f64);
             for j in 0..n {
-                let v = f64::from(vh[j * HEAD + d]);
+                let v = f64::from(vh[j * head + d]);
                 let dev = (v - o[d]).abs();
                 let ee = 4.0 * U + 2.0 * U * x[j];
                 t_o += pb[j] * (es_o * a[j] + ee + 4.0 * U * r_ours + 2.0 * U * xmax) * dev;
@@ -826,6 +874,11 @@ mod gate {
     /// `exacts` the launch's (row, head) units in `y`'s order. Returns whether
     /// every value is within its bound and the largest measured over bound.
     fn judge(exacts: &[Exact], y: &[f32], pass: Pass) -> (bool, f64) {
+        judge_at(HEAD, exacts, y, pass)
+    }
+
+    /// [`judge`] at a head of `head` values.
+    fn judge_at(head: usize, exacts: &[Exact], y: &[f32], pass: Pass) -> (bool, f64) {
         let (mut ok, mut worst) = (true, 0.0f64);
         for (i, ex) in exacts.iter().enumerate() {
             let bound = match pass {
@@ -833,8 +886,8 @@ mod gate {
                 Pass::Mma => &ex.bound_mma,
                 Pass::Prefill => &ex.bound_pref,
             };
-            for d in 0..HEAD {
-                let e = (f64::from(y[i * HEAD + d]) - ex.o[d]).abs();
+            for d in 0..head {
+                let e = (f64::from(y[i * head + d]) - ex.o[d]).abs();
                 worst = worst.max(e / bound[d]);
                 ok &= e <= bound[d];
             }
@@ -1679,13 +1732,24 @@ mod gate {
         live: usize,
         seed: u32,
     ) -> Result<Q8Cache, GateError> {
+        cache_q8_at(stream, (HEAD, N_KV), ctx, live, seed)
+    }
+
+    /// [`cache_q8`] at `n_kv` key heads of `head` values.
+    fn cache_q8_at(
+        stream: &CudaStream,
+        (head, n_kv): (usize, usize),
+        ctx: usize,
+        live: usize,
+        seed: u32,
+    ) -> Result<Q8Cache, GateError> {
         let build = |v: &[f32]| -> (Vec<u32>, Vec<u16>, Vec<u16>) {
-            let n = v.len() / HEAD;
-            let mut codes = Vec::with_capacity(n * HEAD / 4);
-            let mut scales = Vec::with_capacity(n * HEAD / 32);
+            let n = v.len() / head;
+            let mut codes = Vec::with_capacity(n * head / 4);
+            let mut scales = Vec::with_capacity(n * head / 32);
             let mut f16 = Vec::with_capacity(v.len());
             for row in 0..n {
-                let blocks: Vec<Q8Block> = v[row * HEAD..(row + 1) * HEAD]
+                let blocks: Vec<Q8Block> = v[row * head..(row + 1) * head]
                     .chunks(32)
                     .map(quantize_q8_0)
                     .collect();
@@ -1702,18 +1766,18 @@ mod gate {
             }
             (codes, scales, f16)
         };
-        let (kc, kd, k16) = build(&from16(&to16(&activations(HEAD, N_KV * ctx, seed))));
-        let (vc, vd, v16) = build(&from16(&to16(&activations(HEAD, N_KV * ctx, seed + 1))));
+        let (kc, kd, k16) = build(&from16(&to16(&activations(head, n_kv * ctx, seed))));
+        let (vc, vd, v16) = build(&from16(&to16(&activations(head, n_kv * ctx, seed + 1))));
         // Every key head's rows at or past `live` the sentinel bits: the
-        // planes are `[N_KV][ctx][HEAD]`, so a key head's dead rows are
+        // planes are `[n_kv][ctx][head]`, so a key head's dead rows are
         // `live..ctx` of its own plane.
         let pad = |codes: &[u32], scales: &[u16]| -> (Vec<u32>, Vec<u16>) {
             let mut q = codes.to_vec();
             let mut d = scales.to_vec();
-            for kh in 0..N_KV {
+            for kh in 0..n_kv {
                 for row in kh * ctx + live..(kh + 1) * ctx {
-                    q[row * HEAD / 4..(row + 1) * HEAD / 4].fill(SENTINEL_Q8_CODE);
-                    d[row * HEAD / 32..(row + 1) * HEAD / 32].fill(SENTINEL_Q8_SCALE);
+                    q[row * head / 4..(row + 1) * head / 4].fill(SENTINEL_Q8_CODE);
+                    d[row * head / 32..(row + 1) * head / 32].fill(SENTINEL_Q8_SCALE);
                 }
             }
             (q, d)
@@ -2470,12 +2534,14 @@ mod gate {
             )
             .into());
         }
-        let kind = Hparams::read(&split)?.kinds.get(MODEL_LAYER).copied();
-        if kind != Some(Kind::Attention) {
+        let spec = model::arch::spec(&split)?.spec;
+        let mixer = spec.layers.get(MODEL_LAYER).map(|layer| &layer.mixer);
+        if !matches!(mixer, Some(Mixer::Gqa(_))) {
             return Err(format!(
-                "layer {MODEL_LAYER} of {} is {kind:?}, not an attention layer: the clause reads \
-                 its Qaux, Kcur and fa taps",
-                path.display()
+                "layer {MODEL_LAYER} of {} is {}, not an attention layer: the clause reads its \
+                 Qaux, Kcur and fa taps",
+                path.display(),
+                mixer.map_or("absent", Mixer::what)
             )
             .into());
         }
@@ -3154,10 +3220,10 @@ mod gate {
                 &mut scratch,
             )?;
             grouped &= bits_equal(&one.q_out, &s.q_out[g0 * qw..g1 * qw]);
-            for t in g0..g1 {
+            for (t, &count) in counts.iter().enumerate().take(g1).skip(g0) {
                 let r = t - g0;
-                let nb = if qsa_shape().scored(counts[t], SEL_CTX) {
-                    counts[t] / POOL
+                let nb = if qsa_shape().scored(count, SEL_CTX) {
+                    count / POOL
                 } else {
                     0
                 };
@@ -3319,12 +3385,12 @@ mod gate {
     }
 
     /// A selected-flash entry: the segment pass and its merge
-    /// (`enqueue_pass_256_p12_sel`), or the one-launch fold
-    /// (`enqueue_fold_256_p12_sel`).
+    /// (`enqueue_pass_256_p12_sel`), or the prefill flash over each row's
+    /// list (`flash_gqa_prefill::enqueue_256_p12_sel`).
     #[derive(Clone, Copy)]
     enum SelFlash {
         Pass,
-        Fold,
+        Listed,
     }
 
     /// One selected-flash launch of `m` rows through `entry` over the lists
@@ -3334,7 +3400,7 @@ mod gate {
         reason = "the kernels, the stream and sink, the entry, the rows, the lists, the cache and its height"
     )]
     fn run_sel(
-        k: &FlashGqaKernels,
+        (k, kp): (&FlashGqaKernels, &FlashGqaPrefill),
         stream: &CudaStream,
         fault: FaultSink,
         entry: SelFlash,
@@ -3346,7 +3412,7 @@ mod gate {
     ) -> Result<Vec<f32>, GateError> {
         let qd = DeviceBuffer::from_host(stream, q)?;
         let mut y = DeviceBuffer::<f32>::zeroed(stream, m * Q38.width())?;
-        let attn = GqaFoldArgs {
+        let attn = GqaListArgs {
             q: &qd,
             kc,
             vc,
@@ -3380,7 +3446,7 @@ mod gate {
                     N_HEAD_Q38,
                 )?;
             }
-            SelFlash::Fold => k.enqueue_fold_256_p12_sel(stream, attn, N_HEAD_Q38)?,
+            SelFlash::Listed => kp.enqueue_256_p12_sel(stream, attn, N_HEAD_Q38)?,
         }
         stream.synchronize()?;
         Ok(y.to_host_vec(stream)?)
@@ -3405,7 +3471,12 @@ mod gate {
     }
 
     /// The selected flash's clauses (module doc, 11–13).
-    fn sel_flash_check(gpu: &Gpu, k: &FlashGqaKernels, qk: &QsaKernels) -> Result<bool, GateError> {
+    fn sel_flash_check(
+        gpu: &Gpu,
+        ks: (&FlashGqaKernels, &FlashGqaPrefill),
+        qk: &QsaKernels,
+    ) -> Result<bool, GateError> {
+        let (k, kp) = ks;
         let stream = gpu.stream();
         let unl = gpu.unlabelled_sink();
         let idx = idx_inputs(stream, SEL_CTX, 601, false)?;
@@ -3416,7 +3487,8 @@ mod gate {
         let mut ok = true;
 
         // 11. At counts up to 2,051 the list is every token; the selected
-        // flash's own body must give the dense pack-of-four body's bits.
+        // pass must give the dense pack-of-four pass's bits, and the listed
+        // prefill flash the dense pack-of-four prefill flash's.
         let dense_rows: Vec<usize> = (WIDTH - 7..=WIDTH).collect();
         for (name, counts) in [("one-row", SEL_DENSE.to_vec()), ("rows", dense_rows)] {
             let one_row = name == "one-row";
@@ -3446,7 +3518,7 @@ mod gate {
                     .map(|v| v * SEED_Q_SCALE)
                     .collect();
                 let ys = run_sel(
-                    k,
+                    ks,
                     stream,
                     unl,
                     SelFlash::Pass,
@@ -3456,11 +3528,11 @@ mod gate {
                     (&c.kc, &c.vc),
                     SEL_CTX,
                 )?;
-                let yf = run_sel(
-                    k,
+                let yl = run_sel(
+                    ks,
                     stream,
                     unl,
-                    SelFlash::Fold,
+                    SelFlash::Listed,
                     &q,
                     (&scratch.list, &scratch.n_sel),
                     m,
@@ -3468,13 +3540,14 @@ mod gate {
                     SEL_CTX,
                 )?;
                 let yd = run_dec(k, stream, unl, Q38, &q, &cu, (&c.kc, &c.vc), SEL_CTX, true)?;
-                let (same, fold) = (bits_equal(&ys, &yd), bits_equal(&yf, &ys));
+                let yp = run_pref(kp, gpu, Q38, &q, &cu, (&c.kc, &c.vc), SEL_CTX)?;
+                let (same, listed) = (bits_equal(&ys, &yd), bits_equal(&yl, &yp));
                 println!(
                     "qsa flash dense edge pass=mma counts={cs:?}: selected = dense p4 bit for \
-                     bit {same} fold = selected bit for bit {fold} {}",
-                    verdict(same && fold)
+                     bit {same} listed = dense p4 prefill bit for bit {listed} {}",
+                    verdict(same && listed)
                 );
-                ok &= same && fold;
+                ok &= same && listed;
             }
         }
 
@@ -3530,7 +3603,7 @@ mod gate {
                 let exacts = exact_listed(&q, &lists, &c.host);
                 let lsel = (&scratch.list, &scratch.n_sel);
                 let y = run_sel(
-                    k,
+                    ks,
                     stream,
                     unl,
                     SelFlash::Pass,
@@ -3541,7 +3614,7 @@ mod gate {
                     SEL_CTX,
                 )?;
                 let y2 = run_sel(
-                    k,
+                    ks,
                     stream,
                     unl,
                     SelFlash::Pass,
@@ -3552,7 +3625,7 @@ mod gate {
                     SEL_CTX,
                 )?;
                 let yn = run_sel(
-                    k,
+                    ks,
                     stream,
                     unl,
                     SelFlash::Pass,
@@ -3562,32 +3635,25 @@ mod gate {
                     (&kn, &vn),
                     SEL_CTX,
                 )?;
-                let yf = run_sel(
-                    k,
-                    stream,
-                    unl,
-                    SelFlash::Fold,
-                    &q,
-                    lsel,
-                    m,
-                    (&c.kc, &c.vc),
-                    SEL_CTX,
-                )?;
-                let yfn = run_sel(
-                    k,
-                    stream,
-                    unl,
-                    SelFlash::Fold,
-                    &q,
-                    lsel,
-                    m,
-                    (&kn, &vn),
-                    SEL_CTX,
-                )?;
+                let mut yl = Vec::new();
+                for kv in [(&c.kc, &c.vc), (&c.kc, &c.vc), (&kn, &vn)] {
+                    yl.push(run_sel(
+                        ks,
+                        stream,
+                        unl,
+                        SelFlash::Listed,
+                        &q,
+                        lsel,
+                        m,
+                        kv,
+                        SEL_CTX,
+                    )?);
+                }
                 let (band, worst) = judge(&exacts, &y, Pass::Mma);
                 let (rerun, nan_same) = (bits_equal(&y, &y2), bits_equal(&y, &yn));
-                let fold = bits_equal(&yf, &y) && bits_equal(&yfn, &y);
-                let mut alone = true;
+                let (l_band, l_worst) = judge(&exacts, &yl[0], Pass::Prefill);
+                let l_same = bits_equal(&yl[0], &yl[1]) && bits_equal(&yl[0], &yl[2]);
+                let (mut alone, mut l_alone) = (true, true);
                 if m > 1 {
                     let qw = IDX_HEADS * IDX_DIM;
                     for t in 0..m {
@@ -3602,7 +3668,7 @@ mod gate {
                             &mut scratch,
                         )?;
                         let yo = run_sel(
-                            k,
+                            ks,
                             stream,
                             unl,
                             SelFlash::Pass,
@@ -3613,20 +3679,34 @@ mod gate {
                             SEL_CTX,
                         )?;
                         alone &= bits_equal(&yo, &y[t * w..(t + 1) * w]);
+                        let yo = run_sel(
+                            ks,
+                            stream,
+                            unl,
+                            SelFlash::Listed,
+                            &q[t * w..(t + 1) * w],
+                            (&scratch.list, &scratch.n_sel),
+                            1,
+                            (&c.kc, &c.vc),
+                            SEL_CTX,
+                        )?;
+                        l_alone &= bits_equal(&yo, &yl[0][t * w..(t + 1) * w]);
                     }
                     // The m-row selection again, for the clause's later checks.
                     run_select(qk, stream, unl, &idx, &pooled, &qi, &cu, &mut scratch)?;
                 }
-                let pass_ok = band && rerun && nan_same && alone && fold;
+                let pass_ok = band && rerun && nan_same && alone;
+                let l_ok = l_band && l_same && l_alone;
                 println!(
                     "qsa flash {name} pass=mma counts={cs:?} lengths={:?}: measured/bound \
                      {worst:.3e} band={band} rerun={rerun} nan_in_unlisted_rows_same={nan_same} \
-                     rows = one-row launches={alone} fold = selected bit for bit (and with the \
-                     NaN rows)={fold} {}",
+                     rows = one-row launches={alone}; listed prefill measured/bound \
+                     {l_worst:.3e} band={l_band} rerun and nan_in_unlisted_rows_same={l_same} \
+                     rows = one-row launches={l_alone} {}",
                     s.n_sel,
-                    verdict(pass_ok)
+                    verdict(pass_ok && l_ok)
                 );
-                ok &= pass_ok;
+                ok &= pass_ok && l_ok;
             }
         }
 
@@ -3641,7 +3721,7 @@ mod gate {
         )?;
         for (entry, counts, seed) in [
             (SelFlash::Pass, (SEL_ROWS0..=SEL_N).collect::<Vec<_>>(), 631),
-            (SelFlash::Fold, wide_counts(), 633),
+            (SelFlash::Listed, wide_counts(), 633),
         ] {
             let cs: Vec<u32> = counts
                 .into_iter()
@@ -3690,7 +3770,7 @@ mod gate {
                         scratch: &mut scratch,
                     },
                 )?;
-                let attn = GqaFoldArgs {
+                let attn = GqaListArgs {
                     q: &qa,
                     kc: &c.kc,
                     vc: &c.vc,
@@ -3714,7 +3794,7 @@ mod gate {
                         },
                         N_HEAD_Q38,
                     ),
-                    SelFlash::Fold => k.enqueue_fold_256_p12_sel(s, attn, N_HEAD_Q38),
+                    SelFlash::Listed => kp.enqueue_256_p12_sel(s, attn, N_HEAD_Q38),
                 }
             };
             chain(stream, &mut ya)?;
@@ -3724,12 +3804,17 @@ mod gate {
             graph.launch(stream)?;
             stream.synchronize()?;
             let same = bits_equal(&yg.to_host_vec(stream)?, &eager);
-            let (kernel, nodes, segments) = match entry {
-                SelFlash::Pass => ("gqa_flash_seg_mma_256_p12_sel", 5, listed_segments(WIDTH)),
-                SelFlash::Fold => ("gqa_flash_fold_mma_256_p12_sel", 4, 1),
+            let (kernel, nodes, segments, threads) = match entry {
+                SelFlash::Pass => (
+                    "gqa_flash_seg_mma_256_p12_sel",
+                    5,
+                    listed_segments(WIDTH),
+                    PACK_12 * 32,
+                ),
+                SelFlash::Listed => ("gqa_prefill_flash_256_p12_sel", 4, 1, 256),
             };
             let grid = [u32::try_from(m * N_KV * segments)?, 1, 1];
-            let block = [u32::try_from(PACK_12 * 32)?, 1, 1];
+            let block = [u32::try_from(threads)?, 1, 1];
             let shape = graph
                 .nodes()?
                 .into_iter()
@@ -3765,10 +3850,21 @@ mod gate {
         let clean_l = DeviceBuffer::from_host(stream, &s.list)?;
         let clean_n = DeviceBuffer::from_host(stream, &s.n_sel)?;
         let clean = run_sel(
-            k,
+            ks,
             stream,
             unl,
             SelFlash::Pass,
+            &q,
+            (&clean_l, &clean_n),
+            2,
+            (&c.kc, &c.vc),
+            SEL_CTX,
+        )?;
+        let clean_ls = run_sel(
+            ks,
+            stream,
+            unl,
+            SelFlash::Listed,
             &q,
             (&clean_l, &clean_n),
             2,
@@ -3805,7 +3901,7 @@ mod gate {
             let nd = DeviceBuffer::from_host(stream, &n)?;
             let before = gpu.fault()?;
             let y = run_sel(
-                k,
+                ks,
                 stream,
                 gpu.layer_sink(LAYER)?,
                 SelFlash::Pass,
@@ -3816,18 +3912,18 @@ mod gate {
                 SEL_CTX,
             )?;
             let raised = gpu.take_fault()?;
-            let yf = run_sel(
-                k,
+            let yl = run_sel(
+                ks,
                 stream,
                 gpu.layer_sink(LAYER)?,
-                SelFlash::Fold,
+                SelFlash::Listed,
                 &q,
                 (&ld, &nd),
                 2,
                 (&c.kc, &c.vc),
                 SEL_CTX,
             )?;
-            let raised_fold = gpu.take_fault()?;
+            let raised_l = gpu.take_fault()?;
             let want = Some(Fault::at(u32::try_from(LAYER)?, site));
             let other = 1 - bad_row;
             let nan = y[bad_row * w..(bad_row + 1) * w].iter().all(|v| v.is_nan());
@@ -3835,13 +3931,20 @@ mod gate {
                 &y[other * w..(other + 1) * w],
                 &clean[other * w..(other + 1) * w],
             );
-            let fold = raised_fold == want && bits_equal(&yf, &y);
-            let f_ok = before.is_none() && raised == want && nan && others && fold;
+            let l_nan = yl[bad_row * w..(bad_row + 1) * w]
+                .iter()
+                .all(|v| v.is_nan());
+            let l_others = bits_equal(
+                &yl[other * w..(other + 1) * w],
+                &clean_ls[other * w..(other + 1) * w],
+            );
+            let listed = raised_l == want && l_nan && l_others;
+            let f_ok = before.is_none() && raised == want && nan && others && listed;
             println!(
                 "qsa flash fault pass=mma: {what} at row {bad_row}, layer {LAYER}: word \
                  {raised:?} (want {want:?}), that row NaN {nan}, the other row bit-identical \
-                 {others}; fold word {raised_fold:?}, both rows the selected bits {} {}",
-                bits_equal(&yf, &y),
+                 {others}; listed prefill word {raised_l:?}, that row NaN {l_nan}, the other \
+                 row bit-identical {l_others} {}",
                 verdict(f_ok)
             );
             ok &= f_ok;
@@ -3855,8 +3958,8 @@ mod gate {
             let mut pv = DeviceBuffer::<f32>::zeroed(stream, 1)?;
             let mut pms = DeviceBuffer::<f32>::zeroed(stream, 1)?;
             let mut y = DeviceBuffer::<f32>::zeroed(stream, 1)?;
-            for entry in [SelFlash::Pass, SelFlash::Fold] {
-                let attn = GqaFoldArgs {
+            for entry in [SelFlash::Pass, SelFlash::Listed] {
+                let attn = GqaListArgs {
                     q: &qd,
                     kc: &c.kc,
                     vc: &c.vc,
@@ -3884,10 +3987,10 @@ mod gate {
                             n_head,
                         ),
                     ),
-                    SelFlash::Fold => (
-                        "fold",
-                        "flash_gqa::enqueue_fold_256_p12_sel",
-                        k.enqueue_fold_256_p12_sel(stream, attn, n_head),
+                    SelFlash::Listed => (
+                        "listed prefill",
+                        "flash_gqa_prefill::enqueue_256_p12_sel",
+                        kp.enqueue_256_p12_sel(stream, attn, n_head),
                     ),
                 };
                 // The buffers are too short as well, so the group's own
@@ -3905,6 +4008,40 @@ mod gate {
                 ok &= named;
             }
         }
+        ok &= window_refusals(
+            gpu,
+            "flash_gqa_prefill::enqueue_256_p12_sel",
+            "qsa listed prefill",
+            WindowCase {
+                q: &q,
+                planes: (&c.kb, &c.vb),
+                counts: &s.n_sel,
+                y: &clean_ls,
+                heads: (N_HEAD_Q38, N_KV),
+                ctx: SEL_CTX,
+                scale: scale(),
+            },
+            |stream, args| {
+                kp.enqueue_256_p12_sel(
+                    stream,
+                    GqaListArgs {
+                        q: args.q,
+                        kc: args.kc,
+                        vc: args.vc,
+                        list: &clean_l,
+                        n_sel: args.n_keys,
+                        width: WIDTH,
+                        scale: args.scale,
+                        n_kv: args.n_kv,
+                        ctx: args.ctx,
+                        m: args.t,
+                        fault: args.fault,
+                        y: args.y,
+                    },
+                    args.n_head,
+                )
+            },
+        )?;
         Ok(ok)
     }
 
@@ -3919,7 +4056,12 @@ mod gate {
 
     /// The deep clause (module doc, 15): the selector and the selected flash
     /// at [`DEEP_CTX`] on synthetic keys, no model loaded.
-    fn deep_check(gpu: &Gpu, k: &FlashGqaKernels, qk: &QsaKernels) -> Result<bool, GateError> {
+    fn deep_check(
+        gpu: &Gpu,
+        ks: (&FlashGqaKernels, &FlashGqaPrefill),
+        qk: &QsaKernels,
+    ) -> Result<bool, GateError> {
+        let k = ks.0;
         let t0 = std::time::Instant::now();
         let stream = gpu.stream();
         let unl = gpu.unlabelled_sink();
@@ -4006,7 +4148,7 @@ mod gate {
             let exacts = exact_listed(&q, &rows, &host);
             let lsel = (&scratch.list, &scratch.n_sel);
             let y = run_sel(
-                k,
+                ks,
                 stream,
                 unl,
                 SelFlash::Pass,
@@ -4017,7 +4159,7 @@ mod gate {
                 DEEP_CTX,
             )?;
             let yn = run_sel(
-                k,
+                ks,
                 stream,
                 unl,
                 SelFlash::Pass,
@@ -4027,24 +4169,29 @@ mod gate {
                 (&kn, &vn),
                 DEEP_CTX,
             )?;
-            let yf = run_sel(
-                k,
-                stream,
-                unl,
-                SelFlash::Fold,
-                &q,
-                lsel,
-                m,
-                (&kc, &vc),
-                DEEP_CTX,
-            )?;
+            let mut yl = Vec::new();
+            for kv in [(&kc, &vc), (&kn, &vn)] {
+                yl.push(run_sel(
+                    ks,
+                    stream,
+                    unl,
+                    SelFlash::Listed,
+                    &q,
+                    lsel,
+                    m,
+                    kv,
+                    DEEP_CTX,
+                )?);
+            }
             let (band, worst) = judge(&exacts, &y, Pass::Mma);
-            let (nan_same, fold) = (bits_equal(&y, &yn), bits_equal(&yf, &y));
-            let pass_ok = band && nan_same && fold;
+            let (l_band, l_worst) = judge(&exacts, &yl[0], Pass::Prefill);
+            let nan_same = bits_equal(&y, &yn);
+            let l_nan_same = bits_equal(&yl[0], &yl[1]);
+            let pass_ok = band && nan_same && l_band && l_nan_same;
             println!(
                 "qsa deep flash {name} pass=mma counts={counts:?}: measured/bound \
-                 {worst:.3e} band={band} nan_in_unlisted_rows_same={nan_same} fold = selected \
-                 bit for bit {fold} {}",
+                 {worst:.3e} band={band} nan_in_unlisted_rows_same={nan_same}; listed prefill \
+                 measured/bound {l_worst:.3e} band={l_band} nan_in_unlisted_rows_same={l_nan_same} {}",
                 verdict(pass_ok)
             );
             ok &= pass_ok;
@@ -4156,6 +4303,892 @@ mod gate {
         Ok(ok)
     }
 
+    // ------------------------------------- Nanbeige4.3's layout (17-20)
+    //
+    // The dense Llama layer of Nanbeige4.3-33B, model-less: 56 query heads
+    // over 8 key heads (group 7) of 128 values, a NORM rope over all 128
+    // values at θ 1.2e8 and no head norm. The harness is clauses 2, 4 and
+    // 16's at a head of 128 (`exact_at`, `judge_at`, `cache`, `cache_q8_at`,
+    // `judge_prefill`); each launch's output buffers carry one more head's
+    // row of sentinel bits past the launch's own, which no block of the
+    // launch may touch — the form a block with a pad row would break.
+
+    const NB_HEAD: usize = 128;
+    const NB_N_HEAD: usize = 56;
+    const NB_N_KV: usize = 8;
+    const NB_THETA: f32 = 1.2e8;
+    const _: () = assert!(NB_HEAD == bloomery_gpu::flash_gqa::HEAD);
+    const _: () = assert!(NB_HEAD == bloomery_gpu::rope_neox::HEAD);
+    const _: () = assert!(NB_N_HEAD == NB_N_KV * GROUP_7);
+
+    /// The rope clause's cache height, and its launches `(first position,
+    /// tokens)`: a decode row and a prompt chunk.
+    const NB_ROPE_CTX: usize = 40;
+    const NB_ROPE_LAUNCHES: [(usize, usize); 2] = [(5, 1), (3, 7)];
+    /// Decode counts: one key, a segment's end and the key past it, and the
+    /// depths the other clauses read.
+    const NB_DEC_KEYS: [usize; 6] = [1, 5, 64, 65, 1025, 4096];
+    /// Prefill launches `(p0, T)`: the prompt sizes 1, 7, 8 and 512 from the
+    /// first position, then launches crossing the 64-key tile edges.
+    const NB_SEED_PREFILL: [(usize, usize); 6] =
+        [(0, 1), (0, 7), (0, 8), (0, 512), (63, 65), (1000, 8)];
+    /// The bits the tail rows start from.
+    const NB_TAIL: u32 = 0x7fc0_5a5a;
+
+    fn nb_scale() -> f32 {
+        1.0f32 / (NB_HEAD as f32).sqrt()
+    }
+
+    fn nb_rope_shape() -> RopeShape {
+        RopeShape {
+            head: NB_HEAD,
+            n_head: NB_N_HEAD,
+            n_kv: NB_N_KV,
+            ctx: NB_ROPE_CTX,
+            eps: 0.0,
+        }
+    }
+
+    /// The rope launch's inputs for `m` tokens from position `p0`: the table
+    /// of `NB_ROPE_CTX` rows at θ 1.2e8 over the whole head, seeded rows, and
+    /// the positions.
+    fn nb_rope_inputs(p0: usize, m: usize) -> Result<(rope_gate::NormIn, Vec<u32>), GateError> {
+        let rt = RopeTable::new(&RopeSpec::window(NB_THETA, NB_HEAD))?;
+        let mut table = Vec::with_capacity(NB_ROPE_CTX * NB_HEAD);
+        for p in 0..NB_ROPE_CTX {
+            rt.push(u32::try_from(p)?, Direction::Forward, &mut table);
+        }
+        let scaled = |v: Vec<f32>| v.into_iter().map(|x| 4.0 * x).collect::<Vec<_>>();
+        let inp = rope_gate::NormIn {
+            q: scaled(activations(NB_HEAD, m * NB_N_HEAD, 11)),
+            k: scaled(activations(NB_HEAD, m * NB_N_KV, 12)),
+            v: activations(NB_HEAD, m * NB_N_KV, 13),
+            table,
+        };
+        let pos = (0..m)
+            .map(|t| u32::try_from(p0 + t))
+            .collect::<Result<_, _>>()?;
+        Ok((inp, pos))
+    }
+
+    fn nb_rope_run(
+        kern: &RopeNormKernels,
+        stream: &CudaStream,
+        inp: &rope_gate::NormIn,
+        pos: &[u32],
+        fault: FaultSink,
+    ) -> Result<RopeOut, GateError> {
+        rope_gate::run_norm(stream, inp, pos, nb_rope_shape(), fault, |s, args| {
+            kern.enqueue_rope_norm_append(s, args)
+        })
+    }
+
+    /// The NORM append clause (module doc, 17), f16 planes: per launch the
+    /// heads turned in place and the planes' rows bit for bit the host rule,
+    /// a rerun, and a position at the cache's height refused by name.
+    fn nb_rope_check(gpu: &Gpu, kern: &RopeNormKernels) -> Result<bool, GateError> {
+        let mut ok = true;
+        for (p0, m) in NB_ROPE_LAUNCHES {
+            let (inp, pos) = nb_rope_inputs(p0, m)?;
+            ok &= rope_gate::check_norm::<NB_HEAD>(
+                gpu,
+                &inp,
+                &pos,
+                nb_rope_shape(),
+                LAYER,
+                |p, f| nb_rope_run(kern, gpu.stream(), &inp, p, f),
+            )?;
+        }
+        Ok(ok)
+    }
+
+    fn nb_rope_q8_run(
+        kern: &RopeNormKernels,
+        stream: &CudaStream,
+        inp: &rope_gate::NormIn,
+        pos: &[u32],
+        fault: FaultSink,
+    ) -> Result<RopeQ8Out, GateError> {
+        rope_gate::check_cache_positions(pos, NB_ROPE_CTX, NB_ROPE_CTX)?;
+        let m = pos.len();
+        let mut q = DeviceBuffer::from_host(stream, &inp.q)?;
+        let mut k = DeviceBuffer::from_host(stream, &inp.k)?;
+        let v = DeviceBuffer::from_host(stream, &inp.v)?;
+        let table = DeviceBuffer::from_host(stream, &inp.table)?;
+        let posd = DeviceBuffer::from_host(stream, pos)?;
+        let (words, scales) = q8_plane_lens(NB_HEAD, NB_N_KV, NB_ROPE_CTX);
+        let codes = vec![SENTINEL_Q8_CODE; words];
+        let sc = vec![SENTINEL_Q8_SCALE; scales];
+        let mut kq = DeviceBuffer::from_host(stream, &codes)?;
+        let mut kd = DeviceBuffer::from_host(stream, &sc)?;
+        let mut vq = DeviceBuffer::from_host(stream, &codes)?;
+        let mut vd = DeviceBuffer::from_host(stream, &sc)?;
+        kern.enqueue_rope_norm_append_q8(
+            stream,
+            NormQ8Args {
+                q: &mut q,
+                k: &mut k,
+                v: &v,
+                table: &table,
+                pos: &posd,
+                n_head: NB_N_HEAD,
+                n_kv: NB_N_KV,
+                ctx: NB_ROPE_CTX,
+                m,
+                fault,
+                kq: &mut kq,
+                kd: &mut kd,
+                vq: &mut vq,
+                vd: &mut vd,
+            },
+        )?;
+        stream.synchronize()?;
+        Ok(RopeQ8Out {
+            q: q.to_host_vec(stream)?,
+            k: k.to_host_vec(stream)?,
+            kq: kq.to_host_vec(stream)?,
+            kd: kd.to_host_vec(stream)?,
+            vq: vq.to_host_vec(stream)?,
+            vd: vd.to_host_vec(stream)?,
+        })
+    }
+
+    /// The q8_0 append's expected planes: the host rule's turned keys and the
+    /// values through `quantize_q8_0` and `q8_0_planes`, every other slot the
+    /// sentinel.
+    fn nb_rope_q8_host(
+        inp: &rope_gate::NormIn,
+        pos: &[u32],
+    ) -> (Vec<u32>, Vec<u16>, Vec<u32>, Vec<u16>) {
+        let (words, scales) = q8_plane_lens(NB_HEAD, NB_N_KV, NB_ROPE_CTX);
+        let mut kq = vec![SENTINEL_Q8_CODE; words];
+        let mut kd = vec![SENTINEL_Q8_SCALE; scales];
+        let mut vq = kq.clone();
+        let mut vd = kd.clone();
+        let pack = |vals: &[f32], q: &mut [u32], d: &mut [u16], row: usize| {
+            let blocks: Vec<Q8Block> = vals.chunks(32).map(quantize_q8_0).collect();
+            let (qs, ds) = q8_0_planes(&blocks);
+            q[row * (NB_HEAD / 4)..row * (NB_HEAD / 4) + qs.len()].copy_from_slice(&qs);
+            d[row * (NB_HEAD / 32)..row * (NB_HEAD / 32) + ds.len()].copy_from_slice(&ds);
+        };
+        for (t, &p) in pos.iter().enumerate() {
+            let p = p as usize;
+            let cs = &inp.table[p * NB_HEAD..(p + 1) * NB_HEAD];
+            for j in 0..NB_N_KV {
+                let at = (t * NB_N_KV + j) * NB_HEAD;
+                let y = norm_head::<NB_HEAD>(&inp.k[at..at + NB_HEAD], cs);
+                let row = j * NB_ROPE_CTX + p;
+                pack(&y, &mut kq, &mut kd, row);
+                pack(&inp.v[at..at + NB_HEAD], &mut vq, &mut vd, row);
+            }
+        }
+        (kq, kd, vq, vd)
+    }
+
+    /// The q8_0 NORM append clause (module doc, 17): per launch the heads the
+    /// f16 entry's bit for bit, the planes the host rule's through the
+    /// engine's one Q8_0 quantizer, a rerun, and a value holding a NaN
+    /// refusing its block.
+    fn nb_rope_q8_check(gpu: &Gpu, kern: &RopeNormKernels) -> Result<bool, GateError> {
+        let stream = gpu.stream();
+        let unl = gpu.unlabelled_sink();
+        let mut ok = true;
+        for (p0, m) in NB_ROPE_LAUNCHES {
+            let (inp, pos) = nb_rope_inputs(p0, m)?;
+            let f16 = nb_rope_run(kern, stream, &inp, &pos, unl)?;
+            let a = nb_rope_q8_run(kern, stream, &inp, &pos, unl)?;
+            let b = nb_rope_q8_run(kern, stream, &inp, &pos, unl)?;
+            let heads = bits_equal(&a.q, &f16.q) && bits_equal(&a.k, &f16.k);
+            let (wkq, wkd, wvq, wvd) = nb_rope_q8_host(&inp, &pos);
+            let planes = a.kq == wkq && a.kd == wkd && a.vq == wvq && a.vd == wvd;
+            let rerun = bits_equal(&a.q, &b.q)
+                && bits_equal(&a.k, &b.k)
+                && a.kq == b.kq
+                && a.kd == b.kd
+                && a.vq == b.vq
+                && a.vd == b.vd;
+            let pass = heads && planes && rerun;
+            println!(
+                "rope norm q8 m={m} positions {p0}.. ctx={NB_ROPE_CTX} head {NB_HEAD}: q/k the f16 \
+                 append's bits {heads} planes_exact={planes} rerun={rerun} {}",
+                verdict(pass)
+            );
+            ok &= pass;
+
+            // A value row holding a NaN: the block that holds it refused.
+            let (bad_t, bad_j, bad_val) = (m / 2, 5usize, 70usize);
+            let bad_block = bad_val / 32;
+            let mut bad_inp = inp.clone();
+            bad_inp.v[(bad_t * NB_N_KV + bad_j) * NB_HEAD + bad_val] = f32::NAN;
+            let before = gpu.fault()?;
+            let bad = nb_rope_q8_run(kern, stream, &bad_inp, &pos, gpu.layer_sink(LAYER)?)?;
+            let raised = gpu.take_fault()?;
+            let want_fault = Some(Fault::at(u32::try_from(LAYER)?, FaultSite::KvQuant));
+            let row = bad_j * NB_ROPE_CTX + pos[bad_t] as usize;
+            let (mut wvq, mut wvd) = (a.vq.clone(), a.vd.clone());
+            let w0 = row * (NB_HEAD / 4) + 8 * bad_block;
+            wvq[w0..w0 + 8].fill(0);
+            wvd[row * (NB_HEAD / 32) + bad_block] = f32_to_f16_bits(f32::NAN);
+            let others = bad.kq == a.kq
+                && bad.kd == a.kd
+                && bits_equal(&bad.q, &a.q)
+                && bits_equal(&bad.k, &a.k);
+            let refused = bad.vq == wvq && bad.vd == wvd;
+            let again = nb_rope_q8_run(kern, stream, &inp, &pos, unl)?;
+            let clean_after =
+                gpu.fault()?.is_none() && bits_equal(&again.q, &a.q) && again.vd == a.vd;
+            let fault_ok =
+                before.is_none() && raised == want_fault && others && refused && clean_after;
+            println!(
+                "rope norm q8 fault: token {bad_t} head {bad_j} value {bad_val} NaN, layer \
+                 {LAYER}: word {raised:?} (want {want_fault:?}), the block a NaN scale and zero \
+                 codes {refused}, every other bit the clean run's {others}, clean rerun and word \
+                 clean {clean_after} {}",
+                verdict(fault_ok)
+            );
+            ok &= fault_ok;
+        }
+        Ok(ok)
+    }
+
+    /// Which cache a group-7 launch reads: the f16 planes, or the q8_0
+    /// planes (`true`: their sentinel twins, the dead rows holding the q8
+    /// sentinel bits).
+    #[derive(Clone, Copy)]
+    enum NbKv<'a> {
+        F16(&'a DeviceBuffer<u16>, &'a DeviceBuffer<u16>),
+        Q8(&'a Q8Cache, bool),
+    }
+
+    /// `body` zeros followed by `extra` sentinel words: an output buffer with
+    /// a tail the launch must leave alone.
+    fn nb_with_tail(body: usize, extra: usize) -> Vec<f32> {
+        let mut v = vec![0.0f32; body];
+        v.resize(body + extra, f32::from_bits(NB_TAIL));
+        v
+    }
+
+    fn nb_tail_untouched(tail: &[f32]) -> bool {
+        tail.iter().all(|v| v.to_bits() == NB_TAIL)
+    }
+
+    /// The exact attention of every (row, head) of a group-7 launch.
+    fn nb_exact_rows(q: &[f32], counts: &[usize], cache: &HostCache) -> Vec<Exact> {
+        par_map(counts.len() * NB_N_HEAD, |i| {
+            let (t, h) = (i / NB_N_HEAD, i % NB_N_HEAD);
+            let n = counts[t];
+            let plane = (h / GROUP_7) * cache.ctx * NB_HEAD;
+            exact_at(
+                NB_HEAD,
+                &q[i * NB_HEAD..(i + 1) * NB_HEAD],
+                &cache.kf[plane..plane + n * NB_HEAD],
+                &cache.vf[plane..plane + n * NB_HEAD],
+                n,
+                nb_scale(),
+            )
+        })
+    }
+
+    /// A q8 cache's synthesized f16 planes as host values.
+    fn nb_host_of(stream: &CudaStream, c: &Q8Cache, ctx: usize) -> Result<HostCache, GateError> {
+        Ok(HostCache {
+            kf: from16(&c.k16.to_host_vec(stream)?),
+            vf: from16(&c.v16.to_host_vec(stream)?),
+            ctx,
+        })
+    }
+
+    /// One group-7 decode launch of `n_keys.len()` rows, read back, with
+    /// whether the tails of `y` and both partials kept their sentinel bits.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the kernels, the stream and sink, the rows, the cache and its height, the pass"
+    )]
+    fn nb_run_dec(
+        k: &FlashGqaKernels,
+        stream: &CudaStream,
+        fault: FaultSink,
+        q: &[f32],
+        n_keys: &[u32],
+        kv: NbKv<'_>,
+        ctx: usize,
+        mma: bool,
+    ) -> Result<(Vec<f32>, bool), GateError> {
+        let m = n_keys.len();
+        let qd = DeviceBuffer::from_host(stream, q)?;
+        let nk = DeviceBuffer::from_host(stream, n_keys)?;
+        let (lv, lms, ly) = (
+            partials_v_len(m, NB_N_HEAD),
+            partials_ms_len(m, NB_N_HEAD),
+            m * NB_N_HEAD * NB_HEAD,
+        );
+        let mut pv = DeviceBuffer::from_host(stream, &nb_with_tail(lv, SEGMENTS * NB_HEAD))?;
+        let mut pms = DeviceBuffer::from_host(stream, &nb_with_tail(lms, 2 * SEGMENTS))?;
+        let mut y = DeviceBuffer::from_host(stream, &nb_with_tail(ly, NB_HEAD))?;
+        match kv {
+            NbKv::F16(kc, vc) => k.enqueue_pass_g7(
+                stream,
+                GqaArgs {
+                    q: &qd,
+                    kc,
+                    vc,
+                    n_keys: &nk,
+                    scale: nb_scale(),
+                    n_kv: NB_N_KV,
+                    ctx,
+                    m,
+                    part_v: &mut pv,
+                    part_ms: &mut pms,
+                    fault,
+                    y: &mut y,
+                },
+                mma,
+            )?,
+            NbKv::Q8(c, sentinel) => {
+                let (kq, kd, vq, vd) = if sentinel {
+                    (&c.knq, &c.knd, &c.vnq, &c.vnd)
+                } else {
+                    (&c.kq, &c.kd, &c.vq, &c.vd)
+                };
+                k.enqueue_pass_g7_q8(
+                    stream,
+                    GqaQ8Args {
+                        q: &qd,
+                        kq,
+                        kd,
+                        vq,
+                        vd,
+                        n_keys: &nk,
+                        scale: nb_scale(),
+                        n_kv: NB_N_KV,
+                        ctx,
+                        m,
+                        part_v: &mut pv,
+                        part_ms: &mut pms,
+                        fault,
+                        y: &mut y,
+                    },
+                )?;
+            }
+        }
+        stream.synchronize()?;
+        let (yh, pvh, pmsh) = (
+            y.to_host_vec(stream)?,
+            pv.to_host_vec(stream)?,
+            pms.to_host_vec(stream)?,
+        );
+        let tails = nb_tail_untouched(&yh[ly..])
+            && nb_tail_untouched(&pvh[lv..])
+            && nb_tail_untouched(&pmsh[lms..]);
+        Ok((yh[..ly].to_vec(), tails))
+    }
+
+    /// The eight-row launch through `kv` and each of its rows launched alone
+    /// (`name` labels the line): whether each row is its one-row launch bit
+    /// for bit and every tail stayed untouched, with the eight-row output.
+    fn nb_rows_alone(
+        k: &FlashGqaKernels,
+        (stream, unl): (&CudaStream, FaultSink),
+        name: &str,
+        (rows, counts): (&[f32], &[u32]),
+        kv: NbKv<'_>,
+        ctx: usize,
+    ) -> Result<(Vec<f32>, bool), GateError> {
+        let w = NB_N_HEAD * NB_HEAD;
+        let (all, mut tails) = nb_run_dec(k, stream, unl, rows, counts, kv, ctx, true)?;
+        let mut alone = true;
+        for t in 0..counts.len() {
+            let (one, t1) = nb_run_dec(
+                k,
+                stream,
+                unl,
+                &rows[t * w..(t + 1) * w],
+                &counts[t..=t],
+                kv,
+                ctx,
+                true,
+            )?;
+            alone &= bits_equal(&all[t * w..(t + 1) * w], &one);
+            tails &= t1;
+        }
+        println!(
+            "decode g7 rows {name} m={} keys={counts:?} ctx={ctx}: each row = its one-row launch \
+             bit for bit {alone} tails_untouched={tails} {}",
+            counts.len(),
+            verdict(alone && tails)
+        );
+        Ok((all, alone && tails))
+    }
+
+    /// The group-7 decode clause (module doc, 18): per count the f16 entry
+    /// within the tensor-core band of the exact attention, a rerun, NaN
+    /// padding changing no bit and the tails untouched, the q8 entry bit for
+    /// bit the f16 entry on the dequantized cache (and so within the same
+    /// band); then the eight-row launch, the fault, the graph and the
+    /// refusal of the scalar pass.
+    fn nb_decode_check(gpu: &Gpu, k: &FlashGqaKernels) -> Result<bool, GateError> {
+        let stream = gpu.stream();
+        let unl = gpu.unlabelled_sink();
+        let w = NB_N_HEAD * NB_HEAD;
+        let mut ok = true;
+        for (i, &live) in NB_DEC_KEYS.iter().enumerate() {
+            let ctx = live + PAD;
+            let seed = 1200 + 10 * u32::try_from(i)?;
+            let c = cache(stream, NB_HEAD, NB_N_KV, ctx, live, seed)?;
+            let c8 = cache_q8_at(stream, (NB_HEAD, NB_N_KV), ctx, live, seed)?;
+            let q: Vec<f32> = activations(NB_HEAD, NB_N_HEAD, seed + 5)
+                .iter()
+                .map(|v| v * SEED_Q_SCALE)
+                .collect();
+            let nk = [u32::try_from(live)?];
+            let f16 = NbKv::F16(&c.kc, &c.vc);
+            let (y, t0) = nb_run_dec(k, stream, unl, &q, &nk, f16, ctx, true)?;
+            let (y2, t1) = nb_run_dec(k, stream, unl, &q, &nk, f16, ctx, true)?;
+            let (yn, t2) = nb_run_dec(k, stream, unl, &q, &nk, NbKv::F16(&c.kn, &c.vn), ctx, true)?;
+            let (rerun, nan_same) = (bits_equal(&y, &y2), bits_equal(&y, &yn));
+            let tails = t0 && t1 && t2;
+            let (band, worst) =
+                judge_at(NB_HEAD, &nb_exact_rows(&q, &[live], &c.host), &y, Pass::Mma);
+            let pass_ok = band && rerun && nan_same && tails;
+            println!(
+                "decode g7 pass=mma keys={live} ctx={ctx} segments={SEGMENTS} span={}: \
+                 measured/bound {worst:.3e} band={band} rerun={rerun} nan_padding_same={nan_same} \
+                 tails_untouched={tails} {}",
+                seg_span(live, SEGMENTS, SEG_KEYS),
+                verdict(pass_ok)
+            );
+            ok &= pass_ok;
+
+            let (yq, q0) = nb_run_dec(k, stream, unl, &q, &nk, NbKv::Q8(&c8, false), ctx, true)?;
+            let (yqs, q1) = nb_run_dec(k, stream, unl, &q, &nk, NbKv::Q8(&c8, true), ctx, true)?;
+            let (tw, _) = nb_run_dec(
+                k,
+                stream,
+                unl,
+                &q,
+                &nk,
+                NbKv::F16(&c8.k16, &c8.v16),
+                ctx,
+                true,
+            )?;
+            let host8 = nb_host_of(stream, &c8, ctx)?;
+            let (band8, worst8) =
+                judge_at(NB_HEAD, &nb_exact_rows(&q, &[live], &host8), &yq, Pass::Mma);
+            let (twin, sentinel) = (bits_equal(&yq, &tw), bits_equal(&yq, &yqs));
+            let q8_ok = twin && sentinel && band8 && q0 && q1;
+            println!(
+                "decode g7 q8 pass=mma keys={live} ctx={ctx}: = the f16 g7 entry on the \
+                 synthesized f16 cache bit for bit {twin} sentinel_same={sentinel} \
+                 measured/bound {worst8:.3e} band={band8} tails_untouched={} {}",
+                q0 && q1,
+                verdict(q8_ok)
+            );
+            ok &= q8_ok;
+        }
+
+        // Eight rows in one launch at counts spread over a 1025-key cache,
+        // row t the query with its heads rotated by t.
+        let live = 1025usize;
+        let ctx = live + PAD;
+        let c = cache(stream, NB_HEAD, NB_N_KV, ctx, live, 1300)?;
+        let c8 = cache_q8_at(stream, (NB_HEAD, NB_N_KV), ctx, live, 1300)?;
+        let q1 = activations(NB_HEAD, NB_N_HEAD, 1305);
+        let rows: Vec<f32> = (0..ROWS)
+            .flat_map(|t| {
+                let q1 = &q1;
+                (0..NB_N_HEAD).flat_map(move |h| {
+                    q1[((h + t) % NB_N_HEAD) * NB_HEAD..][..NB_HEAD]
+                        .iter()
+                        .map(|v| v * SEED_Q_SCALE)
+                })
+            })
+            .collect();
+        let counts: Vec<u32> = (0..ROWS)
+            .map(|t| u32::try_from(1 + t * (live - 1) / (ROWS - 1)))
+            .collect::<Result<_, _>>()?;
+        let f16 = NbKv::F16(&c.kc, &c.vc);
+        let (eager, pass) = nb_rows_alone(k, (stream, unl), "f16", (&rows, &counts), f16, ctx)?;
+        ok &= pass;
+        let q8 = NbKv::Q8(&c8, false);
+        let (_, pass) = nb_rows_alone(k, (stream, unl), "q8", (&rows, &counts), q8, ctx)?;
+        ok &= pass;
+
+        // Row 3's count past the cache and row 5's zero, labelled.
+        let (bad_hi, bad_zero) = (3usize, 5usize);
+        let mut bad = counts.clone();
+        bad[bad_hi] = u32::try_from(ctx + 1)?;
+        bad[bad_zero] = 0;
+        let before = gpu.fault()?;
+        let (yb, _) = nb_run_dec(
+            k,
+            stream,
+            gpu.layer_sink(LAYER)?,
+            &rows,
+            &bad,
+            f16,
+            ctx,
+            true,
+        )?;
+        let raised = gpu.take_fault()?;
+        let want = Some(Fault::at(u32::try_from(LAYER)?, FaultSite::KeyCount));
+        let (mut others, mut nan) = (true, true);
+        for r in 0..ROWS {
+            let (a, b) = (&eager[r * w..(r + 1) * w], &yb[r * w..(r + 1) * w]);
+            if r == bad_hi || r == bad_zero {
+                nan &= b.iter().all(|v| v.is_nan());
+            } else {
+                others &= bits_equal(a, b);
+            }
+        }
+        let fault_ok = before.is_none() && raised == want && nan && others;
+        println!(
+            "decode g7 fault: counts {} and 0 at rows {bad_hi}, {bad_zero}: word {raised:?} (want \
+             {want:?}), those rows NaN {nan}, other rows bit-identical {others} {}",
+            ctx + 1,
+            verdict(fault_ok)
+        );
+        ok &= fault_ok;
+
+        // The captured launch: two nodes, the eager bits; the scalar pass
+        // refused by name.
+        let qd = DeviceBuffer::from_host(stream, &rows)?;
+        let nkd = DeviceBuffer::from_host(stream, &counts)?;
+        let mut pv = DeviceBuffer::<f32>::zeroed(stream, partials_v_len(ROWS, NB_N_HEAD))?;
+        let mut pms = DeviceBuffer::<f32>::zeroed(stream, partials_ms_len(ROWS, NB_N_HEAD))?;
+        let mut yg = DeviceBuffer::<f32>::zeroed(stream, ROWS * w)?;
+        let graph = gpu.capture(|s| {
+            k.enqueue_pass_g7(
+                s,
+                GqaArgs {
+                    q: &qd,
+                    kc: &c.kc,
+                    vc: &c.vc,
+                    n_keys: &nkd,
+                    scale: nb_scale(),
+                    n_kv: NB_N_KV,
+                    ctx,
+                    m: ROWS,
+                    part_v: &mut pv,
+                    part_ms: &mut pms,
+                    fault: gpu.unlabelled_sink(),
+                    y: &mut yg,
+                },
+                true,
+            )
+        })?;
+        graph.launch(stream)?;
+        stream.synchronize()?;
+        let same = bits_equal(&yg.to_host_vec(stream)?, &eager);
+        let nodes = graph.node_count();
+        let graph_ok = same && nodes == 2;
+        println!(
+            "decode g7 graph m={ROWS}: eager_vs_graph_bit_identical={same} graph_nodes={nodes} {}",
+            verdict(graph_ok)
+        );
+        ok &= graph_ok;
+        let r = k.enqueue_pass_g7(
+            stream,
+            GqaArgs {
+                q: &qd,
+                kc: &c.kc,
+                vc: &c.vc,
+                n_keys: &nkd,
+                scale: nb_scale(),
+                n_kv: NB_N_KV,
+                ctx,
+                m: ROWS,
+                part_v: &mut pv,
+                part_ms: &mut pms,
+                fault: gpu.unlabelled_sink(),
+                y: &mut yg,
+            },
+            false,
+        );
+        let named = matches!(
+            r,
+            Err(GpuError::Shape {
+                what: "flash_gqa::enqueue_g7",
+                ..
+            })
+        );
+        println!(
+            "decode g7 refusal pass=scalar: {} {}",
+            r.err().map_or("accepted".to_string(), |e| e.to_string()),
+            verdict(named)
+        );
+        ok &= named;
+        Ok(ok)
+    }
+
+    /// One group-7 prefill launch of `n_keys.len()` rows, read back, with
+    /// whether the tail of `y` kept its sentinel bits.
+    fn nb_run_pref(
+        kp: &FlashGqaPrefill,
+        gpu: &Gpu,
+        fault: FaultSink,
+        q: &[f32],
+        n_keys: &[u32],
+        kv: NbKv<'_>,
+        ctx: usize,
+    ) -> Result<(Vec<f32>, bool), GateError> {
+        let stream = gpu.stream();
+        let t = n_keys.len();
+        let qd = DeviceBuffer::from_host(stream, q)?;
+        let nk = DeviceBuffer::from_host(stream, n_keys)?;
+        let ly = t * NB_N_HEAD * NB_HEAD;
+        let mut y = DeviceBuffer::from_host(stream, &nb_with_tail(ly, NB_HEAD))?;
+        match kv {
+            NbKv::F16(kc, vc) => kp.enqueue_g7(
+                stream,
+                GqaPrefillArgs {
+                    q: &qd,
+                    kc,
+                    vc,
+                    n_keys: &nk,
+                    scale: nb_scale(),
+                    n_head: NB_N_HEAD,
+                    n_kv: NB_N_KV,
+                    ctx,
+                    t,
+                    fault,
+                    y: &mut y,
+                },
+            )?,
+            NbKv::Q8(c, _) => kp.enqueue_g7_q8(
+                stream,
+                GqaPrefillQ8Args {
+                    q: &qd,
+                    kq: &c.kq,
+                    kd: &c.kd,
+                    vq: &c.vq,
+                    vd: &c.vd,
+                    n_keys: &nk,
+                    scale: nb_scale(),
+                    n_head: NB_N_HEAD,
+                    n_kv: NB_N_KV,
+                    ctx,
+                    t,
+                    fault,
+                    y: &mut y,
+                },
+            )?,
+        }
+        stream.synchronize()?;
+        let yh = y.to_host_vec(stream)?;
+        Ok((yh[..ly].to_vec(), nb_tail_untouched(&yh[ly..])))
+    }
+
+    /// The group-7 prefill clause (module doc, 19): per launch `(p0, T)` the
+    /// f16 entry within the prefill band of the exact attention under the
+    /// causal counts `p0 + t + 1`, a rerun, NaN padding changing no bit, the
+    /// tail untouched, sampled rows each the row launched alone, and the q8
+    /// entry bit for bit the f16 entry on the dequantized cache within the
+    /// same band; then the fault, the graph and a head count refused.
+    fn nb_prefill_check(gpu: &Gpu, kp: &FlashGqaPrefill) -> Result<bool, GateError> {
+        let stream = gpu.stream();
+        let unl = gpu.unlabelled_sink();
+        let w = NB_N_HEAD * NB_HEAD;
+        let mut ok = true;
+        for (i, &(p0, t)) in NB_SEED_PREFILL.iter().enumerate() {
+            let ctx = p0 + t + PAD;
+            let live = p0 + t;
+            let seed = 1500 + 10 * u32::try_from(i)?;
+            let c = cache(stream, NB_HEAD, NB_N_KV, ctx, live, seed)?;
+            let c8 = cache_q8_at(stream, (NB_HEAD, NB_N_KV), ctx, live, seed)?;
+            let q: Vec<f32> = activations(NB_HEAD, t * NB_N_HEAD, seed + 3)
+                .iter()
+                .map(|v| v * SEED_Q_SCALE)
+                .collect();
+            let counts: Vec<u32> = (0..t)
+                .map(|j| u32::try_from(p0 + j + 1))
+                .collect::<Result<_, _>>()?;
+            let cu: Vec<usize> = counts.iter().map(|&n| n as usize).collect();
+            let f16 = NbKv::F16(&c.kc, &c.vc);
+            let (y, t0) = nb_run_pref(kp, gpu, unl, &q, &counts, f16, ctx)?;
+            let (y2, t1) = nb_run_pref(kp, gpu, unl, &q, &counts, f16, ctx)?;
+            let (yn, t2) = nb_run_pref(kp, gpu, unl, &q, &counts, NbKv::F16(&c.kn, &c.vn), ctx)?;
+            let (rerun, nan_same) = (bits_equal(&y, &y2), bits_equal(&y, &yn));
+            let (band, worst) = judge_prefill::<NB_HEAD, PREF_TILE>(
+                &q,
+                &cu,
+                &c.host,
+                &y,
+                nb_scale(),
+                (NB_N_HEAD, NB_N_KV),
+                0,
+            );
+            // Rows spread over the launch, each launched alone.
+            let sample = [0, 1, t / 3, t / 2, t.saturating_sub(2), t - 1];
+            let mut differ = 0usize;
+            let mut seen = Vec::new();
+            for &r in &sample {
+                if r >= t || seen.contains(&r) {
+                    continue;
+                }
+                seen.push(r);
+                let (one, t3) = nb_run_pref(
+                    kp,
+                    gpu,
+                    unl,
+                    &q[r * w..(r + 1) * w],
+                    &counts[r..=r],
+                    f16,
+                    ctx,
+                )?;
+                differ += usize::from(!bits_equal(&y[r * w..(r + 1) * w], &one) || !t3);
+            }
+            let tails = t0 && t1 && t2;
+            let pass_ok = band && rerun && nan_same && tails && differ == 0;
+            println!(
+                "prefill g7 seeded T={t} p0={p0} ctx={ctx}: measured/bound {worst:.3e} band={band} \
+                 sampled_rows_alone_differing={differ} rerun={rerun} nan_padding_same={nan_same} \
+                 tails_untouched={tails} {}",
+                verdict(pass_ok)
+            );
+            ok &= pass_ok;
+
+            let (yq, q0) = nb_run_pref(kp, gpu, unl, &q, &counts, NbKv::Q8(&c8, false), ctx)?;
+            let (tw, _) = nb_run_pref(kp, gpu, unl, &q, &counts, NbKv::F16(&c8.k16, &c8.v16), ctx)?;
+            let host8 = nb_host_of(stream, &c8, ctx)?;
+            let (band8, worst8) = judge_prefill::<NB_HEAD, PREF_TILE>(
+                &q,
+                &cu,
+                &host8,
+                &yq,
+                nb_scale(),
+                (NB_N_HEAD, NB_N_KV),
+                0,
+            );
+            let twin = bits_equal(&yq, &tw);
+            let q8_ok = twin && band8 && q0;
+            println!(
+                "prefill g7 q8 T={t} p0={p0} ctx={ctx}: twin_f16_bit_identical={twin} \
+                 measured/bound {worst8:.3e} band={band8} tails_untouched={q0} {}",
+                verdict(q8_ok)
+            );
+            ok &= q8_ok;
+        }
+
+        // A count of zero and one past the cache, on a 17-row launch at 63.
+        let (t, p0) = (17usize, 63usize);
+        let ctx = p0 + t + PAD;
+        let c = cache(stream, NB_HEAD, NB_N_KV, ctx, p0 + t, 91)?;
+        let q = activations(NB_HEAD, t * NB_N_HEAD, 94);
+        let clean: Vec<u32> = (0..t)
+            .map(|i| u32::try_from(p0 + i + 1))
+            .collect::<Result<_, _>>()?;
+        let (bad_hi, bad_zero) = (3usize, 10usize);
+        let mut bad = clean.clone();
+        bad[bad_hi] = u32::try_from(ctx + 1)?;
+        bad[bad_zero] = 0;
+        let f16 = NbKv::F16(&c.kc, &c.vc);
+        let before = gpu.fault()?;
+        let (y, _) = nb_run_pref(kp, gpu, unl, &q, &clean, f16, ctx)?;
+        let after_clean = gpu.fault()?;
+        let (yb, _) = nb_run_pref(kp, gpu, unl, &q, &bad, f16, ctx)?;
+        let raised = gpu.take_fault()?;
+        let (mut others, mut nan) = (true, true);
+        for r in 0..t {
+            let (a, b) = (&y[r * w..(r + 1) * w], &yb[r * w..(r + 1) * w]);
+            if r == bad_hi || r == bad_zero {
+                nan &= b.iter().all(|v| v.is_nan());
+            } else {
+                others &= bits_equal(a, b);
+            }
+        }
+        let want = Fault::at(LAYER_NONE, FaultSite::KeyCount);
+        let fault_ok =
+            before.is_none() && after_clean.is_none() && raised == Some(want) && nan && others;
+        println!(
+            "prefill g7 fault: counts {} (past ctx {ctx}) and 0 at rows {bad_hi}, {bad_zero}: \
+             word {raised:?} (want {want:?}), those rows NaN {nan}, other rows bit-identical \
+             {others} {}",
+            ctx + 1,
+            verdict(fault_ok)
+        );
+        ok &= fault_ok;
+
+        // The captured launch: one node, the eager bits; a head count the
+        // kernel is not built for, refused by name.
+        let qd = DeviceBuffer::from_host(stream, &q)?;
+        let nk = DeviceBuffer::from_host(stream, &clean)?;
+        let mut yg = DeviceBuffer::<f32>::zeroed(stream, t * w)?;
+        let graph = gpu.capture(|s| {
+            kp.enqueue_g7(
+                s,
+                GqaPrefillArgs {
+                    q: &qd,
+                    kc: &c.kc,
+                    vc: &c.vc,
+                    n_keys: &nk,
+                    scale: nb_scale(),
+                    n_head: NB_N_HEAD,
+                    n_kv: NB_N_KV,
+                    ctx,
+                    t,
+                    fault: gpu.unlabelled_sink(),
+                    y: &mut yg,
+                },
+            )
+        })?;
+        graph.launch(stream)?;
+        stream.synchronize()?;
+        let same = bits_equal(&yg.to_host_vec(stream)?, &y);
+        let nodes = graph.node_count();
+        let graph_ok = same && nodes == 1;
+        println!(
+            "prefill g7 graph T={t} p0={p0}: eager_vs_graph_bit_identical={same} \
+             graph_nodes={nodes} {}",
+            verdict(graph_ok)
+        );
+        ok &= graph_ok;
+        let refused = kp.enqueue_g7(
+            stream,
+            GqaPrefillArgs {
+                q: &qd,
+                kc: &c.kc,
+                vc: &c.vc,
+                n_keys: &nk,
+                scale: nb_scale(),
+                n_head: NB_N_HEAD - 1,
+                n_kv: NB_N_KV,
+                ctx,
+                t,
+                fault: gpu.unlabelled_sink(),
+                y: &mut yg,
+            },
+        );
+        let refuse_ok = matches!(
+            refused,
+            Err(GpuError::Shape {
+                what: "flash_gqa_prefill::enqueue_g7",
+                ..
+            })
+        );
+        println!(
+            "prefill g7 refusal n_head={} over n_kv={NB_N_KV}: {} {}",
+            NB_N_HEAD - 1,
+            refused
+                .err()
+                .map_or("accepted".to_string(), |e| e.to_string()),
+            verdict(refuse_ok)
+        );
+        ok &= refuse_ok;
+        Ok(ok)
+    }
+
+    /// The new entries compile with no local depot (module doc, 20).
+    fn nb_shapes() -> Result<bool, GateError> {
+        no_local_depot(&[
+            "rope_norm_append",
+            "rope_norm_append_q8",
+            "gqa_flash_seg_mma_g7",
+            "gqa_flash_seg_mma_g7_q8",
+            "gqa_prefill_flash_g7",
+            "gqa_prefill_flash_g7_q8",
+        ])
+    }
+
     /// The bench's cache height: a 4,096-position prompt and 128 more, one of
     /// four sequences of a 16,896-position load.
     const BENCH_CTX: usize = 4224;
@@ -4171,7 +5204,12 @@ mod gate {
     }
 
     /// `--bench-kernels` (module doc).
-    fn bench_select(gpu: &Gpu, k: &FlashGqaKernels, qk: &QsaKernels) -> Result<(), GateError> {
+    fn bench_select(
+        gpu: &Gpu,
+        k: &FlashGqaKernels,
+        kp: &FlashGqaPrefill,
+        qk: &QsaKernels,
+    ) -> Result<(), GateError> {
         const N: usize = 4096;
         const ROUNDS: usize = 7;
         let stream = gpu.stream();
@@ -4199,7 +5237,7 @@ mod gate {
         )?;
         for rows in [8, 64, 256, counts.len()] {
             let mut outs = Vec::new();
-            for (arm, run, fold) in [("pass8", MAX_ROWS, false), ("fold", rows, true)] {
+            for (arm, run, listed) in [("pass8", MAX_ROWS, false), ("listed", rows, true)] {
                 let mut runs = Vec::new();
                 for t0 in (0..rows).step_by(run) {
                     let m = run.min(rows - t0);
@@ -4232,7 +5270,7 @@ mod gate {
                                 scratch: &mut scratch,
                             },
                         )?;
-                        let attn = GqaFoldArgs {
+                        let attn = GqaListArgs {
                             q: &r.q,
                             kc: &c.kc,
                             vc: &c.vc,
@@ -4246,8 +5284,8 @@ mod gate {
                             fault: unl,
                             y: &mut r.y,
                         };
-                        if fold {
-                            k.enqueue_fold_256_p12_sel(stream, attn, N_HEAD_Q38)?;
+                        if listed {
+                            kp.enqueue_256_p12_sel(stream, attn, N_HEAD_Q38)?;
                         } else {
                             k.enqueue_pass_256_p12_sel(
                                 stream,
@@ -4278,22 +5316,31 @@ mod gate {
                 }
                 outs.push(y);
             }
+            let big = outs[0].iter().fold(0.0f32, |a, v| a.max(v.abs()));
+            let diff = outs[0]
+                .iter()
+                .zip(&outs[1])
+                .fold(0.0f32, |a, (x, y)| a.max((x - y).abs()));
             println!(
-                "bench sel rows={rows}: the two arms' outputs the same bits {}",
-                bits_equal(&outs[0], &outs[1])
+                "bench sel rows={rows}: listed against pass8 max abs difference {diff:.3e} of \
+                 max {big:.3e}, every value finite {}",
+                outs[1].iter().all(|v| v.is_finite())
             );
         }
         Ok(())
     }
 
     /// The new entries compile with no local depot (module doc, 14).
+    // PIN(2026-10-24): gqa_flash_fold_mma_256_p12_sel left the list with its
+    // kernel; the ubatch walk's selected rows run gqa_prefill_flash_256_p12_sel,
+    // which every clause that ran the fold now runs.
     fn sel_shapes() -> Result<bool, GateError> {
         no_local_depot(&[
             "qsa_pool",
             "qsa_score",
             "qsa_topk",
             "gqa_flash_seg_mma_256_p12_sel",
-            "gqa_flash_fold_mma_256_p12_sel",
+            "gqa_prefill_flash_256_p12_sel",
         ])
     }
 
@@ -4301,12 +5348,13 @@ mod gate {
         let gpu = Gpu::new()?;
         let ctx = gpu.context();
         let rope = RopeNeoxKernels::load(ctx)?;
+        let rope_norm = RopeNormKernels::load(ctx)?;
         let k = FlashGqaKernels::load(ctx)?;
         let kp = FlashGqaPrefill::load(ctx)?;
         let gq = GatedQuantKernels::load(ctx)?;
         let qk = QsaKernels::load(ctx)?;
         if std::env::args().any(|a| a == "--bench-kernels") {
-            return bench_select(&gpu, &k, &qk);
+            return bench_select(&gpu, &k, &kp, &qk);
         }
         println!(
             "gate_qwen35moe_attn: device {} — {N_HEAD}/{N_KV} heads of {HEAD}, rope over {ROT} at \
@@ -4343,6 +5391,18 @@ mod gate {
         let q = decode_q8_check(&gpu, &k, &DEC_KEYS_Q8)?;
         println!("decode flash 256 q8 {}", verdict(q));
         ok &= q;
+        tier::sc("17 rope-norm: the NORM append against the host rule")?;
+        let r = nb_rope_check(&gpu, &rope_norm)?;
+        println!("rope-norm {}", verdict(r));
+        ok &= r;
+        tier::sc("17 rope-norm q8: the q8_0 append against the f16 entry and the host rule")?;
+        let r = nb_rope_q8_check(&gpu, &rope_norm)?;
+        println!("rope-norm q8 {}", verdict(r));
+        ok &= r;
+        tier::sc("18 decode flash g7: 56/8 heads of 128 against the exact attention")?;
+        let d = nb_decode_check(&gpu, &k)?;
+        println!("decode flash g7 {}", verdict(d));
+        ok &= d;
         tier::sc("3 score order: the two kernels' one score order")?;
         let t = tie_check(&gpu, &k, &kp)?;
         println!("score order {}", verdict(t));
@@ -4367,11 +5427,11 @@ mod gate {
         println!("qsa select {}", verdict(s));
         ok &= s;
         tier::sc("11-13 qsa selected flash: against the dense flash and the exact attention")?;
-        let s = sel_flash_check(&gpu, &k, &qk)?;
+        let s = sel_flash_check(&gpu, (&k, &kp), &qk)?;
         println!("qsa selected flash {}", verdict(s));
         ok &= s;
         tier::sc("15 qsa deep: the selector and the flashes at a cache of 262,144 rows")?;
-        let s = deep_check(&gpu, &k, &qk)?;
+        let s = deep_check(&gpu, (&k, &kp), &qk)?;
         println!("qsa deep {}", verdict(s));
         ok &= s;
         tier::sc("4 prefill flash 256: against the exact attention")?;
@@ -4386,6 +5446,14 @@ mod gate {
         let q = prefill_q8_check(&gpu, &kp, &SEED_Q8)?;
         println!("prefill flash 256 q8 {}", verdict(q));
         ok &= q;
+        tier::sc("19 prefill flash g7: 56/8 heads of 128 against the exact attention")?;
+        let p = nb_prefill_check(&gpu, &kp)?;
+        println!("prefill flash g7 {}", verdict(p));
+        ok &= p;
+        tier::sc("20 g7 and NORM shapes: the new entries compile with no local depot")?;
+        let s = nb_shapes()?;
+        println!("g7 and NORM shapes {}", verdict(s));
+        ok &= s;
         // Last: the window refusals, whose failure would be a sticky error.
         for (sh, win) in [(Q36, &win36), (Q38, &win38)] {
             tier::sc(&format!(

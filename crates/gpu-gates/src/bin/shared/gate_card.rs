@@ -6,7 +6,9 @@
 //! `RTX_3090` in the real tier and takes the visible card's name, by which the open finds the
 //! device, so on the 3090 the machine is `plan_gate`'s exactly and on the A6000 or RTX 5090 it
 //! plans the 3090's usable bytes. A census of other than one visible card, or a card outside
-//! the named workstation cards and RTX 5090, is refused by name before any load.
+//! the named workstation cards and RTX 5090, is refused by name before any load. A two-card arm
+//! plans its own machine with both cards in view and never reads the gate card
+//! (`lcpp_e2e::Arm::machine`'s `bp`).
 
 use std::sync::OnceLock;
 

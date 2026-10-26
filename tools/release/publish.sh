@@ -13,11 +13,16 @@
 #   3. the artifacts: on the box, where readelf and the ELF binary run — the release's
 #      own .sha256, build.sh's four checks on the unpacked binary, and its --version;
 #      then the tarball and .sha256 come here for the upload and the tap's digest;
-#   4. the upload: `gh release upload --clobber` with exactly the names build.sh
-#      wrote (bloomery-<v>-linux-x86_64-cuda-sm86.tar.gz and .sha256) — it refuses
-#      to upload a file under any other name — then curls both URLs for a 200;
-#   5. the Homebrew tap: bumps Formula/bloomery.rb's version, url and sha256 in
-#      ~/repo/homebrew-tap, commits and pushes;
+#   3b. the Apple Silicon artifacts, which tools/release/build-mac.sh wrote into this tree's
+#      target/mac-release/dist/ from this commit: their .sha256, build-mac.sh's binary checks
+#      on the unpacked binaries, a Developer ID signature on each, and the commit the
+#      archive's README names;
+#   4. the upload: `gh release upload --clobber` with exactly the names the build scripts
+#      wrote (bloomery-<v>-linux-x86_64-cuda-sm86.tar.gz, bloomery-<v>-macos-arm64-metal.tar.gz
+#      and their .sha256) — it refuses to upload a file under any other name — then curls
+#      every URL for a 200;
+#   5. the Homebrew tap: bumps Formula/bloomery.rb's version and each platform's url and
+#      sha256 in ~/repo/homebrew-tap, commits and pushes;
 #   6. prints what is left to the lead: the release notes (gh release edit --notes-file)
 #      and the ghcr image — the v* tag push already triggered .github/workflows/container.yml.
 #
@@ -39,6 +44,7 @@ REPO=midagedev/bloomery
 BOX=${BLOOMERY_BOX:-ws}
 REMOTE=${BLOOMERY_REMOTE:-"~/repo/$(basename "$ROOT")"}
 NAME="bloomery-$VERSION-linux-x86_64-cuda-sm86"
+MAC_NAME="bloomery-$VERSION-macos-arm64-metal"
 TAG="v$VERSION"
 
 fail() { echo "publish.sh: $*" >&2; exit 1; }
@@ -78,42 +84,62 @@ GOT=$(shasum -a 256 "$TMP/$NAME.tar.gz" | awk '{print $1}')
 [ "$GOT" = "$SHA" ] || fail "the fetched tarball hashes $GOT, the release's .sha256 says $SHA"
 echo "publish.sh: $NAME.tar.gz $(stat -f %z "$TMP/$NAME.tar.gz") bytes, sha256 $SHA, checks and --version ok on the box"
 
+# 3b. the Apple Silicon artifacts, built here by tools/release/build-mac.sh
+for f in "$MAC_NAME.tar.gz" "$MAC_NAME.tar.gz.sha256"; do
+    [ -f "target/mac-release/dist/$f" ] || fail "no target/mac-release/dist/$f (MAC_SIGN_IDENTITY=… MAC_NOTARY_PROFILE=… tools/release/build-mac.sh $VERSION first)"
+    cp "target/mac-release/dist/$f" "$TMP/$f"
+done
+MAC_SHA=$(grep -o '[0-9a-f]\{64\}' "$TMP/$MAC_NAME.tar.gz.sha256" | head -1)
+[ "$(shasum -a 256 "$TMP/$MAC_NAME.tar.gz" | awk '{print $1}')" = "$MAC_SHA" ] || fail "$MAC_NAME.tar.gz does not hash to its .sha256"
+mkdir "$TMP/mac" && tar -xzf "$TMP/$MAC_NAME.tar.gz" -C "$TMP/mac" --strip-components=1
+bash tools/release/build-mac.sh --check "$TMP/mac/bin" || fail "the Apple Silicon binaries failed build-mac.sh --check"
+for b in "$TMP"/mac/bin/*; do
+    sig=$(codesign -dvv "$b" 2>&1)
+    grep -q '^Authority=Developer ID Application' <<< "$sig" || fail "$(basename "$b") is not signed by a Developer ID (build-mac.sh without MAC_SIGN_IDENTITY)"
+done
+grep -qF "$(git rev-parse HEAD)" "$TMP/mac/README.md" || fail "$MAC_NAME's README names another commit than HEAD"
+echo "publish.sh: $MAC_NAME.tar.gz $(stat -f %z "$TMP/$MAC_NAME.tar.gz") bytes, sha256 $MAC_SHA, checks and Developer ID ok"
+
 # 4. the upload
 if [ "$DRY" = 1 ]; then
-    echo "publish.sh: dry run: would upload $NAME.tar.gz and .sha256 to $TAG and curl both URLs"
+    echo "publish.sh: dry run: would upload $NAME and $MAC_NAME (.tar.gz and .sha256) to $TAG and curl every URL"
 else
     gh release upload "$TAG" --repo "$REPO" --clobber "$TMP/$NAME.tar.gz" "$TMP/$NAME.tar.gz.sha256" \
+        "$TMP/$MAC_NAME.tar.gz" "$TMP/$MAC_NAME.tar.gz.sha256" \
         || fail "gh release upload failed (does release $TAG exist? gh release create $TAG first)"
-    for u in "$NAME.tar.gz" "$NAME.tar.gz.sha256"; do
+    for u in "$NAME.tar.gz" "$NAME.tar.gz.sha256" "$MAC_NAME.tar.gz" "$MAC_NAME.tar.gz.sha256"; do
         code=$(curl -fsSI -o /dev/null -w '%{http_code}' "https://github.com/$REPO/releases/download/$TAG/$u" || echo err)
         [ "$code" = 302 ] || [ "$code" = 200 ] || fail "the asset URL answers $code: $u"
     done
-    echo "publish.sh: uploaded and both URLs resolve"
+    echo "publish.sh: uploaded and every URL resolves"
 fi
 
 # 5. the tap
 TAPDIR="$HOME/repo/homebrew-tap"
 if [ "$TAP" = 1 ]; then
     if [ "$DRY" = 1 ]; then
-        echo "publish.sh: dry run: would bump $TAPDIR/Formula/bloomery.rb to $VERSION / $SHA and push"
+        echo "publish.sh: dry run: would bump $TAPDIR/Formula/bloomery.rb to $VERSION / $SHA (linux) / $MAC_SHA (macos) and push"
     else
         [ -d "$TAPDIR/Formula" ] || fail "no tap checkout at $TAPDIR (clone midagedev/homebrew-tap)"
         git -C "$TAPDIR" fetch -q origin && git -C "$TAPDIR" reset -q --hard origin/HEAD
         [ -z "$(git -C "$TAPDIR" status --porcelain)" ] || fail "the tap checkout is dirty"
         F="$TAPDIR/Formula/bloomery.rb"
-        python3 - "$F" "$VERSION" "$SHA" <<'PY'
+        python3 - "$F" "$VERSION" "$SHA" "$MAC_SHA" <<'PY'
 import re, sys
-f, v, sha = sys.argv[1:4]
+f, v, sha, mac_sha = sys.argv[1:5]
 s = open(f).read()
-s2, n1 = re.subn(r'version "[^"]*"', f'version "{v}"', s, count=1)
-s2, n2 = re.subn(r'sha256 "[0-9a-f]{64}"', f'sha256 "{sha}"', s2, count=1)
-s2, n3 = re.subn(r'releases/download/v[^/]*/bloomery-[^"/]*\.tar\.gz',
-                 f'releases/download/v{v}/bloomery-{v}-linux-x86_64-cuda-sm86.tar.gz', s2, count=1)
-assert n1 == n2 == n3 == 1, (n1, n2, n3)
-open(f, 'w').write(s2)
+s, n = re.subn(r'version "[^"]*"', f'version "{v}"', s, count=1)
+assert n == 1, "no version line"
+# Each platform's url and the sha256 on the line after it.
+for kind, digest in (("linux-x86_64-cuda-sm86", sha), ("macos-arm64-metal", mac_sha)):
+    s, n = re.subn(r'(url "[^"]*/releases/download/)v[^/]*/bloomery-[^"/]*-' + re.escape(kind) +
+                   r'\.tar\.gz"(\s+)sha256 "[0-9a-f]{64}"',
+                   lambda m: f'{m.group(1)}v{v}/bloomery-{v}-{kind}.tar.gz"{m.group(2)}sha256 "{digest}"', s)
+    assert n == 1, (kind, n)
+open(f, 'w').write(s)
 PY
         git -C "$TAPDIR" add Formula/bloomery.rb
-        git -C "$TAPDIR" commit -q -m "bloomery v$VERSION (sha256 $SHA)"
+        git -C "$TAPDIR" commit -q -m "bloomery v$VERSION (linux sha256 $SHA, macos sha256 $MAC_SHA)"
         git -C "$TAPDIR" push -q origin HEAD
         echo "publish.sh: tap bumped to $VERSION"
     fi

@@ -6,8 +6,12 @@
 //! shared expert as one more slot of joined stacks, every dense layer's FFN a
 //! stack of one expert on the arena's fixed one-slot route. The head counts
 //! are the file's; their group selects the flash (eight a block, or pairs).
+//! An attention layer's kind comes from the description (`plan::gqa_fits`):
+//! the gated head-256 layer, or a head-128 layer turned by NORM pairs with no
+//! head norm (a dense Llama's), whose flash is the group's of eight or of
+//! seven.
 //!
-//! Load reads the file's description once (`model::arch::qwen35moe`): each
+//! Load reads the file's description once (`model::arch::spec`): each
 //! layer's kind from its tensors, never from its number, checked against
 //! the geometry the kernels take; each layer's shared expert joined into its
 //! routed stacks and its gate into the router (`Weights::join_rows`: the
@@ -84,9 +88,9 @@ use super::image::{
 };
 use super::mtp35::Mtp35;
 use super::placed::{
-    BatchWalk, CommonForms, PLACED_ROWS, Placed, PlacedOpen, StepWalk, WalkParts, apart_plans,
-    common_forms as placed_forms, counted_arena, placed_bytes, placed_scratch, prompt_rows,
-    tally_shape,
+    BatchWalk, CommonForms, PLACED_ROWS, Placed, PlacedOpen, StepWalk, WalkParts, WideRoute,
+    apart_plans, common_forms as placed_forms, counted_arena, placed_bytes, placed_scratch,
+    prompt_rows, tally_shape,
 };
 use super::plan::{
     FfnPlan, FfnRoute, Flash, GqaKind, Kind35, LayerPlan, MixerPlan, SharedPlan, SiteTy, down_sel,
@@ -96,7 +100,7 @@ use super::prefill::{PrefillPath, PrefillPlan, PrefillStep, WIDE_FROM};
 use super::program::{Program, Tail};
 use super::scratch::{
     ApartForms, Arena, Dims, Forms, KvPlanes, LANE, LaneWord, LayerStore, PassRecord, RecStore,
-    RopeRows, StepParams, Wants,
+    RopeRows, StepParams,
 };
 use super::slot_pass::SlotIn;
 use super::swap35;
@@ -104,7 +108,6 @@ use super::ubatch::UBATCH;
 use super::wide::{GEMV_COLS, arena_bytes};
 use super::wide38::STREAM_FLOOR;
 use crate::checkpoint::{self, Checkpoints};
-use crate::flash_gqa::HEAD_256;
 use crate::head::Head;
 use crate::host::prompt_stream::PromptStream;
 use crate::host::swap::{CallPick, CallReport, Residency};
@@ -128,11 +131,11 @@ use bloomery_levers::{ChurnHosting, HostCfg};
 use chain::arch::qwen3moe::read::{
     PlanDims, Read35, Sites35, joint, joint_gate_inp, layer_plans, plan_ffn, plan_gqa,
 };
-use cuda_core::{CudaStream, DeviceBuffer};
+use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 use gguf::Split;
 use model::arch::Arch;
 use model::arch::models::shape::MoeShape;
-use model::arch::models::{Ffn, LayerSpec, Mixer, ModelSpec, MtpDraft};
+use model::arch::models::{Ffn, LayerSpec, Mixer, ModelSpec, MtpDraft, OutGate};
 pub(super) use model::arch::names::blk;
 use model::placement::{Plan, WholeLoad};
 use runtime::seqstate::{Kept, Price};
@@ -229,10 +232,27 @@ fn checkpoint_lens(kinds: &[Kind35]) -> Vec<usize> {
         .iter()
         .filter_map(|k| match k {
             Kind35::Delta(shape) => Some(shape.lens(PLAIN_LANES)),
-            Kind35::Gqa(_) => None,
+            Kind35::Gqa(..) => None,
         })
         .flatten()
         .collect()
+}
+
+/// One sequence's checkpoints of stores of `lens` f32s: the ledger's
+/// ([`Checkpoints::sequence`]), or — when the description holds no recurrent
+/// layer, so `lens` is empty — none to take ([`Checkpoints::stateless`]): the
+/// K/V planes are cut by position and a cut keeps every position it asks for.
+fn sequence_checkpoints(
+    cuda: &Arc<CudaContext>,
+    lens: Vec<usize>,
+    ctx: usize,
+    every: u32,
+) -> Result<Checkpoints, GpuError> {
+    if lens.is_empty() {
+        Ok(Checkpoints::stateless(cuda, every))
+    } else {
+        Checkpoints::sequence(cuda, lens, ctx, every)
+    }
 }
 
 /// What one checkpoint of a load of `spec`'s model costs on the host and how
@@ -251,7 +271,12 @@ pub fn checkpoint_price35(spec: &ModelSpec, asked: usize) -> Result<Price, GpuEr
 /// positions (a slot's share) of `spec`'s model asked for ubatches of
 /// `asked` tokens ([`Price::budget`] of [`checkpoint_price35`]).
 pub fn checkpoint_budget35(spec: &ModelSpec, asked: usize, ctx: u64) -> Result<u64, GpuError> {
-    checkpoint::budget(checkpoint_price35(spec, asked)?, ctx)
+    let price = checkpoint_price35(spec, asked)?;
+    if price.point_bytes == 0 {
+        // No layer holds a recurrent store: nothing is copied, nothing pinned.
+        return Ok(0);
+    }
+    checkpoint::budget(price, ctx)
 }
 
 /// The rows and the device bytes of the ubatch arena of `d` for ubatches of
@@ -330,7 +355,7 @@ pub struct DecodeInput35 {
 /// Every Qwen3.6 layer's kind, as a gate lists them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LayerKind35 {
-    /// Gated GQA at head 256 over the layer's K/V planes.
+    /// Grouped-query attention over the layer's K/V planes.
     Attention,
     /// The gated delta rule over the layer's recurrent store.
     Delta,
@@ -384,7 +409,8 @@ pub struct Body35 {
     /// load that did not ask for it.
     pub(super) mtp: Option<Mtp35>,
     /// Lanes of every delta store: 1 on a plain load, [`Body35::VERIFY_LANES`]
-    /// on a load that verifies drafted rows ([`GpuModel::open_verifying`]).
+    /// on a load that verifies drafted rows ([`GpuModel::open_verifying`],
+    /// [`GpuModel::open_mtp`]).
     lanes: usize,
     /// The word naming the committed lane of every delta launch's walk; `Some`
     /// iff `lanes > 1`. The arenas hold views of it ([`Arena::run_lanes`]).
@@ -575,8 +601,10 @@ fn check_resident(w: &Weights, d: &Dims, p: &LayerPlan, stacks: bool) -> Result<
         MixerPlan::Gqa(g) => {
             let (kv, att) = (d.kv_len(), d.attn_len());
             f32_site(w, &g.attn_norm, 1, h)?;
-            f32_site(w, &g.attn_q_norm, 1, d.head)?;
-            f32_site(w, &g.attn_k_norm, 1, d.head)?;
+            if g.kind.head_norm() {
+                f32_site(w, &g.attn_q_norm, 1, d.head)?;
+                f32_site(w, &g.attn_k_norm, 1, d.head)?;
+            }
             on(&g.attn_q, d.q_rows, h, g.q_ty)?;
             on(&g.attn_k, kv, h, g.k_ty)?;
             on(&g.attn_v, kv, h, g.v_ty)?;
@@ -703,17 +731,23 @@ impl Forms {
                 alone(f.down_ty, d.hidden);
             }
         }
-        let wants = |tys: &[SiteTy]| {
-            let (q128, q32) = crate::site::WideActs::wants_of(tys);
-            Wants { q128, q32 }
-        };
+        let wants = crate::site::WideActs::wants_of;
         Forms {
-            hid: wants(&hid),
-            attn: wants(&attn),
+            // An input's f32 rows are the arena's own normed rows.
+            hid: wants(&hid).without_f32(),
+            attn: wants(&attn).without_f32(),
             h: wants(&h),
             glu,
             cols,
-            apart: (!apart.is_empty()).then(|| ApartForms { h: wants(&apart) }),
+            // The shared expert's f32 rows are held whatever its down reads: the
+            // wide part counts them (`wide::arena_bytes`), and the plan's card
+            // bytes with it.
+            apart: (!apart.is_empty()).then(|| ApartForms {
+                h: crate::site::WideForms {
+                    f32: true,
+                    ..wants(&apart)
+                },
+            }),
             out_gate,
         }
     }
@@ -732,6 +766,8 @@ struct Pre35 {
     d: Dims,
     ubatch: NonZeroUsize,
     base: f32,
+    /// Values of a head the rope turns, the description's.
+    rope_dims: usize,
     /// The file's IMROPE sections and `rope.section_order`, read when the
     /// load takes media.
     sections: Option<([u32; 4], vision::mrope::SectionOrder)>,
@@ -763,7 +799,7 @@ impl Pre35 {
             media,
             ..
         } = o;
-        let read = model::arch::qwen35moe::spec::read(file).map_err(|e| GpuError::plan(WHAT, e))?;
+        let read = model::arch::spec(file).map_err(|e| GpuError::plan(WHAT, e))?;
         let spec = read.spec;
         if ctx == 0 {
             return Err(GpuError::shape(
@@ -774,11 +810,11 @@ impl Pre35 {
         let kinds = kinds35(&spec.layers)?;
         let d = dims(&spec, &kinds, ctx)?;
         let ubatch = ubatch_of(&d, ubatch)?;
-        let base = spec
+        let (base, rope_dims) = spec
             .layers
             .iter()
             .find_map(|s| match &s.mixer {
-                Mixer::Gqa(g) => Some(g.rope.base),
+                Mixer::Gqa(g) => Some((g.rope.base, g.rope.dims as usize)),
                 _ => None,
             })
             .ok_or(GpuError::shape(
@@ -798,13 +834,29 @@ impl Pre35 {
                 Ok::<_, GpuError>((sections, section_order(order)))
             })
             .transpose()?;
-        if mma && kinds.contains(&Kind35::Gqa(Flash::Pairs)) {
+        let has = |flash: Flash| {
+            kinds
+                .iter()
+                .any(|k| matches!(k, Kind35::Gqa(_, f) if *f == flash))
+        };
+        if mma && has(Flash::Pairs) {
             return Err(GpuError::shape(
                 WHAT,
                 format!(
                     "the tensor-core decode flash at {}/{} heads: the pairs' pass is scalar only \
                      (open with mma false)",
                     d.n_head, d.n_kv
+                ),
+            ));
+        }
+        if !mma && has(Flash::Seven) {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "the scalar decode flash at {}/{} heads of {} (a group of seven): the shape \
+                     table's pack-7 row has the tensor-core entry gqa_flash_seg_mma_g7 only and \
+                     no scalar one (open with mma true)",
+                    d.n_head, d.n_kv, d.head
                 ),
             ));
         }
@@ -829,6 +881,7 @@ impl Pre35 {
             d,
             ubatch,
             base,
+            rope_dims,
             sections,
             common,
         })
@@ -836,8 +889,9 @@ impl Pre35 {
 }
 
 /// The arena's dims of `spec`, whose kinds `kinds` the plan checked: the
-/// attention layers' head of 256 with a gate beside each query (every
-/// attention layer of a file shares one head count), the FFN's — the router
+/// attention layers' head from the description, with a gate beside each query
+/// when the layers carry one (every attention layer of a file shares one
+/// head count, head and gate), the FFN's — the router
 /// the routed shape selects (every layer of a file shares it), or a dense
 /// width every layer shares, never both kinds in one file — and the delta
 /// layers' one shape (every delta layer of a file shares it). A delta
@@ -846,7 +900,7 @@ impl Pre35 {
 fn dims(spec: &ModelSpec, kinds: &[Kind35], ctx: usize) -> Result<Dims, GpuError> {
     let mut shapes = kinds.iter().filter_map(|k| match k {
         Kind35::Delta(s) => Some(*s),
-        Kind35::Gqa(_) => None,
+        Kind35::Gqa(..) => None,
     });
     let lin = shapes.next();
     if let Some(s) = lin
@@ -857,19 +911,25 @@ fn dims(spec: &ModelSpec, kinds: &[Kind35], ctx: usize) -> Result<Dims, GpuError
             format!("two delta shapes, {s:?} and {other:?}; one arena serves one"),
         ));
     }
-    let mut heads = spec.layers.iter().filter_map(|l| match &l.mixer {
-        Mixer::Gqa(g) => Some((g.heads as usize, g.kv_heads as usize)),
+    let mut attn = spec.layers.iter().filter_map(|l| match &l.mixer {
+        Mixer::Gqa(g) => Some((
+            g.heads as usize,
+            g.kv_heads as usize,
+            g.head_dim as usize,
+            g.out_gate == OutGate::Packed,
+        )),
         _ => None,
     });
-    let (n_head, n_kv) = heads.next().ok_or(GpuError::shape(
+    let (n_head, n_kv, head, packed) = attn.next().ok_or(GpuError::shape(
         WHAT,
         "no attention layer to size the attention rows for",
     ))?;
-    if let Some(other) = heads.find(|o| *o != (n_head, n_kv)) {
+    if let Some(other) = attn.find(|o| *o != (n_head, n_kv, head, packed)) {
         return Err(GpuError::shape(
             WHAT,
             format!(
-                "two attention head counts, {n_head}/{n_kv} and {other:?}; one arena serves one"
+                "two attention shapes, {n_head}/{n_kv} heads of {head} (gate {packed}) and \
+                 {other:?}; one arena serves one"
             ),
         ));
     }
@@ -878,8 +938,8 @@ fn dims(spec: &ModelSpec, kinds: &[Kind35], ctx: usize) -> Result<Dims, GpuError
         hidden: spec.hidden as usize,
         n_head,
         n_kv,
-        head: HEAD_256,
-        q_rows: 2 * n_head * HEAD_256,
+        head,
+        q_rows: n_head * head * if packed { 2 } else { 1 },
         ff,
         router,
         lin,
@@ -947,11 +1007,11 @@ fn ffn_dims(spec: &ModelSpec) -> Result<(Option<super::router::RouterDims>, usiz
 }
 
 /// The layers a load of `file` runs: its trunk, the blocks before the
-/// next-token layers its header declares (read as unused).
+/// next-token layers its header declares (read as unused), as the file's
+/// role table counts them.
 fn trunk_count(file: &Split, what: &'static str) -> Result<usize, GpuError> {
-    let hp = model::arch::qwen35moe::hparams::Hparams::read(file)
-        .map_err(|e| GpuError::plan(what, e))?;
-    Ok(hp.n_trunk)
+    let read = model::arch::spec(file).map_err(|e| GpuError::plan(what, e))?;
+    Ok(read.tensors.layers)
 }
 
 /// The next-token layer `file` carries, or why it has none: the family's
@@ -989,7 +1049,7 @@ fn draft_layer(
     draft: &MtpDraft,
 ) -> Result<(Weights, LayerPlan), GpuError> {
     let l = draft.index as usize;
-    let Kind35::Gqa(flash) = kind35(&draft.layer, l)? else {
+    let Kind35::Gqa(kind, flash) = kind35(&draft.layer, l)? else {
         return Err(GpuError::shape(
             WHAT,
             format!("layer {l}: the next-token layer is full attention, not a delta rule"),
@@ -997,7 +1057,7 @@ fn draft_layer(
     };
     let pd = plan_dims(d);
     let plan = LayerPlan {
-        mixer: MixerPlan::Gqa(plan_gqa(file, WHAT, &pd, l, flash, &Sites35::CARD)?),
+        mixer: MixerPlan::Gqa(plan_gqa(file, WHAT, &pd, l, (kind, flash), &Sites35::CARD)?),
         ffn: plan_ffn(
             file,
             WHAT,
@@ -1033,15 +1093,21 @@ impl GpuModel<Body35> {
     /// whether it carries a draft — the reason a file with none is refused is
     /// `model::arch::draft::draft_usable`'s, before any upload — and a media
     /// load, whose rotation tables are per sequence, is refused by name.
+    ///
+    /// The load holds [`Body35::VERIFY_LANES`] lanes a delta store, as
+    /// [`GpuModel::open_verifying`]'s does, with its refusals: the layer's
+    /// every proposal is verified by a pass of several rows, whose commit
+    /// keeps any `1..=m` of them, and one lane holds only the last row's
+    /// state.
     pub fn open_mtp(gpu: Gpu, file: Split, o: Open35) -> Result<GpuModel<Body35>, GpuError> {
-        GpuModel::open_lanes(gpu, file, o, PLAIN_LANES, true)
+        GpuModel::open_lanes(gpu, file, o, Body35::VERIFY_LANES, true)
     }
 
     /// [`GpuModel::open`] for a load that will verify drafted rows
     /// ([`Rows`]): each delta layer keeps [`Body35::VERIFY_LANES`] stamped
     /// lanes of state, so a verify of up to that many rows keeps any `1..=m`
     /// of them at its commit without a re-feed or a copy (module doc). The
-    /// plan prices the lanes through `KvLayout::of_lanes` at the same count
+    /// plan prices the lanes through `KvLayout::of_spec_lanes` at the same count
     /// (`model::arch::qwen35moe::place::PlanInputs::with_lanes`); the load's
     /// delta layers' stores, with their stamps, are held to those bytes by
     /// name ([`Body35::store_bytes`]). A plain [`GpuModel::open`] keeps its one lane
@@ -1203,12 +1269,16 @@ impl GpuModel<Body35> {
         let counted = model::placement::workstation::counted_arena_bytes(card);
         let specs = pre.layers.clone();
         let (top_k, max_rows) = tally_shape(&pre.d)?;
-        // The stack table checks only the layers the plan gives card experts:
-        // the machine keeps each layer's card count.
+        // The stack table checks only the layers the plan gives the stage card
+        // experts. The tier cards are named so a routed segment on one is the
+        // tier's, not a card the map refuses.
         let n_expert = usize::try_from(plan.model.experts).map_err(|_| {
             GpuError::shape(WHAT_P, "a plan of more experts than the host addresses")
         })?;
-        let carded = SlotMap::of_plan(plan, 0, None, 0..n_layers, n_expert)?;
+        let tier_cards: Vec<usize> = (0..plan.machine.expert_tiers().count())
+            .map(|i| plan.machine.cards.len() + i)
+            .collect();
+        let carded = SlotMap::of_plan_tiers(plan, 0, &tier_cards, 0..n_layers, n_expert)?;
         let residency = ResidencySpec {
             lever: residency,
             pool: ChurnHosting::Hosted,
@@ -1241,6 +1311,7 @@ impl GpuModel<Body35> {
                     set,
                     glue,
                     arch: "qwen35moe",
+                    family: &super::tier_leg::QWEN35_FAMILY,
                     rows: PLACED_ROWS,
                 };
                 let mut body =
@@ -1309,6 +1380,7 @@ impl Body35 {
             d,
             ubatch,
             base,
+            rope_dims,
             sections,
             common,
         } = pre;
@@ -1318,7 +1390,7 @@ impl Body35 {
         for (kind, plan) in kinds.iter().zip(&plans) {
             check_resident(w, &d, plan, placed.is_none())?;
             stores.push(match *kind {
-                Kind35::Gqa(_) => LayerStore::Kv(KvPlanes::new(stream, &d, o.kv)?),
+                Kind35::Gqa(..) => LayerStore::Kv(KvPlanes::new(stream, &d, o.kv)?),
                 Kind35::Delta(shape) if lanes > PLAIN_LANES => {
                     LayerStore::Rec(RecStore::stamped(stream, shape.lens(lanes), lanes)?)
                 }
@@ -1328,19 +1400,18 @@ impl Body35 {
             });
         }
         let forms = Forms::of(&plans, &d);
-        let table = RopeTable::new(&RopeSpec::window(base, q35::ROPE_DIMS as usize))?;
-        let rope = RopeRows::new(stream, &table, q35::ROPE_DIMS as usize, ctx)?;
+        let table = RopeTable::new(&RopeSpec::window(base, rope_dims))?;
+        let rope = RopeRows::new(stream, &table, rope_dims, ctx)?;
         let (seq_rope, rope_base) = match sections {
             Some((sections, order)) => {
-                let base: Arc<[f32]> =
-                    RopeRows::host_rows(&table, q35::ROPE_DIMS as usize, ctx)?.into();
+                let base: Arc<[f32]> = RopeRows::host_rows(&table, rope_dims, ctx)?.into();
                 let base = RopeBase::new(base, sections, order);
                 (Some(base.seq(stream, ctx)?), Some(base))
             }
             None => (None, None),
         };
         let every = checkpoint_every(asked, &d)?;
-        let ckpt = Checkpoints::sequence(gpu.context(), checkpoint_lens(&kinds), ctx, every)?;
+        let ckpt = sequence_checkpoints(gpu.context(), checkpoint_lens(&kinds), ctx, every)?;
         let (lane, views) = if lanes > PLAIN_LANES {
             let (word, views) = LaneWord::with_views(stream, lanes, 3)?;
             (Some(word), views)
@@ -1461,6 +1532,18 @@ impl Body35 {
         self.placed.as_ref()
     }
 
+    /// The placed load's wide card route as its last prompt unit left it
+    /// ([`Placed::wide_route`]): the ubatch arena's routed ids beside every
+    /// layer's map and table and the last walked layer's places, a blocking
+    /// read on `stream` for gates and diagnostics. `None` on a load that is
+    /// not a placed one.
+    pub fn wide_route(&self, stream: &CudaStream) -> Result<Option<WideRoute>, GpuError> {
+        let Some(placed) = &self.placed else {
+            return Ok(None);
+        };
+        Ok(Some(placed.wide_route(stream, self.u.route.ids())?))
+    }
+
     /// Device bytes of the layer stores: the attention layers' K/V planes
     /// and the delta layers' states and conv rings.
     #[must_use]
@@ -1475,9 +1558,9 @@ impl Body35 {
     }
 
     /// Lanes of a delta store on a load that verifies drafted rows
-    /// ([`GpuModel::open_verifying`]): a lane for each of a pass's
-    /// [`MAX_PASS_ROWS`] rows, which is the count the plan prices
-    /// (`KvLayout::of_lanes`).
+    /// ([`GpuModel::open_verifying`], [`GpuModel::open_mtp`]): a lane for
+    /// each of a pass's [`MAX_PASS_ROWS`] rows, which is the count the plan
+    /// prices (`KvLayout::of_spec_lanes`).
     pub const VERIFY_LANES: usize = MAX_PASS_ROWS;
 
     /// Lanes of every delta store: 1, or [`Body35::VERIFY_LANES`] on a load
@@ -2697,7 +2780,7 @@ impl Slots for Body35 {
                 })
                 .collect::<Result<Vec<_>, GpuError>>()?;
         let ckpt =
-            Checkpoints::sequence(gpu.context(), self.ckpt.lens().to_vec(), d.ctx, self.every)?;
+            sequence_checkpoints(gpu.context(), self.ckpt.lens().to_vec(), d.ctx, self.every)?;
         let rope = self
             .rope_base
             .as_ref()
@@ -2915,7 +2998,7 @@ impl Instrumented for Body35 {
 
 #[cfg(test)]
 mod tests {
-    use super::{Flash, Kind35, checkpoint_lens};
+    use super::{Flash, GqaKind, Kind35, checkpoint_lens};
     use crate::checkpoint::{point_bytes, price};
     use crate::linear::{KHeadMap, LinearShape};
 
@@ -2935,7 +3018,7 @@ mod tests {
         let kinds: Vec<Kind35> = (0..40)
             .map(|l| {
                 if l % 4 == 3 {
-                    Kind35::Gqa(Flash::Group)
+                    Kind35::Gqa(GqaKind::Gated256, Flash::Group)
                 } else {
                     delta
                 }

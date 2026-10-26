@@ -3,8 +3,9 @@
 //! over its own live key count `n_keys[t]`, `PACK` query heads of a block
 //! sharing one key/value head over the cache planes `[n_kv][ctx][512]` f16
 //! that `rope_neox::head_norm_neox_append_512` writes. An encoder layer gives
-//! every row the whole input (`n_keys[t] = T`); the walk keeps the per-row
-//! counts of the 256 entries.
+//! every row the whole input (`n_keys[t] = T`) on `gqa_prefill_flash_512_p4`.
+//! `gqa_prefill_flash_512_p4_lower` attends `[k_first[t], n_keys[t])`. The walk
+//! keeps the per-row counts of the 256 entries.
 //!
 //! The 256 entries' block does not fit at this width: their query fragments
 //! live in registers and their 64-key tiles take 96 KB of shared memory at
@@ -27,7 +28,7 @@
 //!    warp publishes `S_w` and adds its partner's (`w ^ SLICES`): `S = S_lo +
 //!    S_hi`, one rounded add, commutative, so both warps of a pair hold the
 //!    same bits; then `s = S · scale` rounded. A key at or past the row's
-//!    count is `−inf`.
+//!    count is `−inf`, and on the lower-bound entry so is a key below its first key.
 //! 2. The online softmax of every prefill body (`flash_gqa_prefill`'s
 //!    `prefill_softmax!`): the tile max over the row's four lanes,
 //!    a rescale `f = dev_exp(m − m')` on a bump (0 for the first), the
@@ -49,9 +50,10 @@
 //! row's arithmetic depends only on its own query row, the key and value rows
 //! below its count and the fixed tile partition, and not on `T`, the rows
 //! that share its block, the grid or the value half. Keys at or past the block's
-//! largest count are never loaded (zeros are staged); keys between a row's
-//! count and the block's largest are loaded and masked, so a non-finite value
-//! there reaches the masking row through its zero weight. A count of zero or
+//! largest count are never loaded (zeros are staged); on the lower-bound entry,
+//! keys below the block's smallest first key are not loaded either. Keys between
+//! a row's count and the block's largest are loaded and masked, so a non-finite
+//! value there reaches the masking row through its zero weight. A count of zero or
 //! past `ctx` on a row below `T` raises [`FaultSite::KeyCount`], and that
 //! row's output is NaN.
 
@@ -64,7 +66,7 @@ use crate::flash_gqa_prefill::{
 };
 use crate::rope_neox::HEAD_512;
 use crate::{GpuError, launch_u32};
-use cuda_core::{CudaContext, CudaStream, LaunchConfig1D};
+use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::async_copy::{cp_async_cg_16, cp_async_commit_group, cp_async_wait_group};
 use cuda_device::float::{add_rn_f32, mul_rn_f32};
 use cuda_device::vector::U32x4;
@@ -162,12 +164,16 @@ const _: () = assert!(pack_rows_hold::<PACK_4>(SLICES));
 /// half's outputs written at `y[(t · n_head + head0 + j)·512 + 256·vh ..]`.
 /// Every guard around a shuffle or a barrier is block- or warp-pair-uniform:
 /// `live` and the unmasked path read the slice's largest and smallest
-/// counts; a lane's two rows mask by their own.
+/// counts; a lane's two rows mask by their own. With `LOWER`, row `t` attends
+/// over keys `[k_first_buf[t], n_keys[t])` and `k_first_buf` holds `t_rows`
+/// first keys; without it, `k_first_buf` is never read and every row starts at
+/// key 0.
 ///
 /// # Safety
 ///
 /// The launch holds the entry's contract at `n_kv · packs · PACK` query heads:
-/// `n_keys_buf` holds `t_rows` counts, `q` and `y` hold `t_rows` rows of
+/// `n_keys_buf` holds `t_rows` counts, and with `LOWER` so does `k_first_buf`,
+/// `q` and `y` hold `t_rows` rows of
 /// `n_kv · packs · PACK` heads of 512 values, `kc` and `vc` hold `n_kv · ctx`
 /// rows of 512 f16 each, `q` starts 8-byte and `kc`, `vc` 16-byte aligned.
 /// The block is [`THREADS`] threads with [`DYN_BYTES`] bytes of dynamic shared
@@ -182,11 +188,12 @@ const _: () = assert!(pack_rows_hold::<PACK_4>(SLICES));
     clippy::needless_range_loop,
     reason = "a range `for` is the loop the unroller recognizes; an iterator loop keeps its array in a local depot"
 )]
-unsafe fn prefill_512_p(
+unsafe fn prefill_512_p<const LOWER: bool>(
     q: &[f32],
     kc: &[u16],
     vc: &[u16],
     n_keys_buf: &[u32],
+    k_first_buf: &[u32],
     scale: f32,
     n_kv: u32,
     ctx: u32,
@@ -245,8 +252,12 @@ unsafe fn prefill_512_p(
         shape: (SLICES, SLICE_POS, PACK),
         rows: (t0, rows, rs, g),
         counts: (n_keys_buf, ctx),
-        lower: (false, n_keys_buf),
-        first: (_lo, _warp_first_lo, _warp_first_hi, _first),
+        lower: (LOWER, k_first_buf),
+        first: (lo, warp_first_lo, warp_first_hi, first),
+    }
+    // The false monomorph never reads the first-key bounds.
+    if !LOWER {
+        let _ = (lo, warp_first_lo, warp_first_hi, first);
     }
     if lane == 0 && dh == 0 && vh == 0 && any_bad {
         fault.raise(FaultSite::KeyCount);
@@ -292,7 +303,14 @@ unsafe fn prefill_512_p(
     let k_src = k_rows.wrapping_add(plane0);
     let v_src = v_rows.wrapping_add(plane0 + V_ROW_WORDS * vh);
     let tiles = hi.div_ceil(KEY_TILE_U32);
-    // Stage tile `kb`; `full` means every staged key is below `hi`.
+    // The walk's first tile: the one holding the block's smallest first key.
+    let kb_first = if LOWER {
+        (lo / KEY_TILE_U32).min(tiles)
+    } else {
+        0
+    };
+    // Stage tile `kb`; `full` means every staged key is below `hi` and, with
+    // `LOWER`, at or above `lo`. A key below `lo` is staged as a key past `hi` is.
     macro_rules! stage {
         ($dst:ident, $src:ident, $words:ident, $chunks:ident, $copies:ident, $kb:expr, $full:literal) => {{
             let kb: u32 = $kb;
@@ -303,7 +321,13 @@ unsafe fn prefill_512_p(
                 // SAFETY: row < KEY_TILE_512; this thread owns one aligned
                 // four-word chunk inside the staged row.
                 let d = unsafe { $dst.add(staged(row, col, $words)) };
-                if $full || kb * KEY_TILE_U32 + (row as u32) < hi {
+                let key = kb * KEY_TILE_U32 + (row as u32);
+                let inside = if LOWER {
+                    key < hi && key >= lo
+                } else {
+                    key < hi
+                };
+                if $full || inside {
                     // SAFETY: the key is below hi <= ctx; rows are 1,024 bytes,
                     // value halves start 512 bytes in, and kc, vc are 16-byte
                     // aligned (host-checked), as is this thread's chunk.
@@ -323,11 +347,24 @@ unsafe fn prefill_512_p(
             unsafe { cp_async_commit_group() };
         }};
     }
-    if tiles > 0 {
-        if KEY_TILE_U32 <= hi {
-            stage!(kt, k_src, ROW_WORDS, K_ROW_CHUNKS, K_CHUNKS, 0, true);
+    if kb_first < tiles {
+        let full = if LOWER {
+            KEY_TILE_U32 * (kb_first + 1) <= hi && KEY_TILE_U32 * kb_first >= lo
         } else {
-            stage!(kt, k_src, ROW_WORDS, K_ROW_CHUNKS, K_CHUNKS, 0, false);
+            KEY_TILE_U32 * (kb_first + 1) <= hi
+        };
+        if full {
+            stage!(kt, k_src, ROW_WORDS, K_ROW_CHUNKS, K_CHUNKS, kb_first, true);
+        } else {
+            stage!(
+                kt,
+                k_src,
+                ROW_WORDS,
+                K_ROW_CHUNKS,
+                K_CHUNKS,
+                kb_first,
+                false
+            );
         }
     }
 
@@ -374,7 +411,7 @@ unsafe fn prefill_512_p(
     let mut m = [f32::NEG_INFINITY; 2];
     let mut l = [0.0f32; 2];
     let mut o = [[0.0f32; 4]; 2 * DIM_PAIRS];
-    let mut kb = 0u32;
+    let mut kb = kb_first;
     while kb < tiles {
         let end = KEY_TILE_U32 * (kb + 1);
         // Key tile kb has landed (and, on the first, the query rows are
@@ -384,13 +421,22 @@ unsafe fn prefill_512_p(
         // then publishes every thread's copies.
         unsafe { cp_async_wait_group(0) };
         thread::sync_threads();
-        if end <= hi {
+        let full_v = if LOWER {
+            end <= hi && KEY_TILE_U32 * kb >= lo
+        } else {
+            end <= hi
+        };
+        if full_v {
             stage!(vt, v_src, V_ROW_WORDS, V_ROW_CHUNKS, V_CHUNKS, kb, true);
         } else {
             stage!(vt, v_src, V_ROW_WORDS, V_ROW_CHUNKS, V_CHUNKS, kb, false);
         }
         // Both warps of a pair hold the same rows, so the same `live`.
-        let live = KEY_TILE_U32 * kb < warp_hi;
+        let live = if LOWER {
+            KEY_TILE_U32 * kb < warp_hi && end > warp_first_lo
+        } else {
+            KEY_TILE_U32 * kb < warp_hi
+        };
 
         // ---- S_w = Q·Kᵀ over the warp's half, published.
         let mut sc = [[0.0f32; 4]; KEY_NT];
@@ -449,15 +495,29 @@ unsafe fn prefill_512_p(
                 }
             }
 
-            prefill_softmax! {
-                unmasked: end <= warp_lo,
-                key0: KEY_TILE_U32 * kb + t4k,
-                tiles: (KEY_NT, PV_STEPS),
-                scores: sc,
-                counts: cnt,
-                scale: scale,
-                state: (m, l, f),
-                weights: pa,
+            if LOWER {
+                prefill_softmax! {
+                    unmasked: end <= warp_lo && KEY_TILE_U32 * kb >= warp_first_hi,
+                    key0: KEY_TILE_U32 * kb + t4k,
+                    tiles: (KEY_NT, PV_STEPS),
+                    scores: sc,
+                    counts: cnt,
+                    lower: (LOWER, first),
+                    scale: scale,
+                    state: (m, l, f),
+                    weights: pa,
+                }
+            } else {
+                prefill_softmax! {
+                    unmasked: end <= warp_lo,
+                    key0: KEY_TILE_U32 * kb + t4k,
+                    tiles: (KEY_NT, PV_STEPS),
+                    scores: sc,
+                    counts: cnt,
+                    scale: scale,
+                    state: (m, l, f),
+                    weights: pa,
+                }
             }
 
             if warp::any(f[0] != 1.0 || f[1] != 1.0) {
@@ -479,7 +539,12 @@ unsafe fn prefill_512_p(
         unsafe { cp_async_wait_group(0) };
         thread::sync_threads();
         if kb + 1 < tiles {
-            if end + KEY_TILE_U32 <= hi {
+            let full_next = if LOWER {
+                end + KEY_TILE_U32 <= hi && KEY_TILE_U32 * (kb + 1) >= lo
+            } else {
+                end + KEY_TILE_U32 <= hi
+            };
+            if full_next {
                 stage!(kt, k_src, ROW_WORDS, K_ROW_CHUNKS, K_CHUNKS, kb + 1, true);
             } else {
                 stage!(kt, k_src, ROW_WORDS, K_ROW_CHUNKS, K_CHUNKS, kb + 1, false);
@@ -564,14 +629,73 @@ mod flash_gqa_prefill_512_kernels {
         y: DisjointSlice<f32>,
     ) {
         // SAFETY: the launch contract is `prefill_512_p`'s at `packs · PACK_4`
-        // heads per key head, and the block is THREADS threads with
+        // heads per key head with `LOWER` false, so the first-key buffer is
+        // not read (the counts stand in). The block is THREADS threads with
         // DYN_BYTES bytes of dynamic shared memory.
         unsafe {
-            prefill_512_p(
+            prefill_512_p::<false>(
                 q,
                 kc,
                 vc,
                 n_keys_buf,
+                n_keys_buf,
+                scale,
+                n_kv,
+                ctx,
+                t_rows,
+                packs as usize,
+                fault,
+                y,
+            )
+        };
+    }
+
+    /// [`gqa_prefill_flash_512_p4`] with a first key a row ([`prefill_512_p`]
+    /// with `LOWER`): row `t` attends over keys `[k_first[t], n_keys[t])`.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(128, 1)]
+    #[launch_contract(
+        domain = 1,
+        block = (128, 1, 1),
+        dynamic_shared = 90112,
+        requires = (
+            n_keys_buf.len() >= t_rows,
+            k_first_buf.len() >= t_rows,
+            q.len() >= t_rows * n_kv * packs * 4 * 512,
+            kc.len() >= n_kv * ctx * 512,
+            vc.len() >= n_kv * ctx * 512,
+            y.len() >= t_rows * n_kv * packs * 4 * 512
+        )
+    )]
+    pub fn gqa_prefill_flash_512_p4_lower(
+        q: &[f32],
+        kc: &[u16],
+        vc: &[u16],
+        n_keys_buf: &[u32],
+        k_first_buf: &[u32],
+        scale: f32,
+        n_kv: u32,
+        ctx: u32,
+        t_rows: u32,
+        packs: u32,
+        fault: FaultSink,
+        y: DisjointSlice<f32>,
+    ) {
+        // SAFETY: the launch contract is `prefill_512_p`'s at `packs · PACK_4`
+        // heads per key head with `k_first_buf` bound at `t_rows`, and the
+        // block is THREADS threads with DYN_BYTES bytes of dynamic shared
+        // memory.
+        unsafe {
+            prefill_512_p::<true>(
+                q,
+                kc,
+                vc,
+                n_keys_buf,
+                k_first_buf,
                 scale,
                 n_kv,
                 ctx,
@@ -644,6 +768,61 @@ impl FlashGqaPrefill512 {
             ))?;
         self.module.gqa_prefill_flash_512_p4(
             stream, &prep, q, kc, vc, n_keys, scale, n_kv, ctx, t, packs, fault, y,
+        )?;
+        Ok(())
+    }
+
+    /// [`FlashGqaPrefill512::enqueue_p4`] with a first key a row: row `t`
+    /// attends over keys `[k_first[t], n_keys[t])`, `k_first` on the device,
+    /// `t` of them (refused by name when shorter). A first key at or past its
+    /// row's count raises [`FaultSite::KeyCount`] and leaves that row NaN.
+    /// The grid, the block and the refusals are [`FlashGqaPrefill512::enqueue_p4`]'s.
+    /// Asynchronous, allocation-free, capturable.
+    pub fn enqueue_p4_lower(
+        &self,
+        stream: &CudaStream,
+        args: GqaPrefillArgs<'_>,
+        k_first: &DeviceBuffer<u32>,
+    ) -> Result<(), GpuError> {
+        let what = "flash_gqa_prefill_512::enqueue_p4_lower";
+        if k_first.len() < args.t {
+            return Err(GpuError::shape(
+                what,
+                format!("k_first.len() {} < {}", k_first.len(), args.t),
+            ));
+        }
+        let packs = crate::flash_gqa_prefill::checked_packed(
+            what,
+            &args,
+            (HEAD_512, KEY_TILE_512, PACK_4),
+        )?;
+        let GqaPrefillArgs {
+            q,
+            kc,
+            vc,
+            n_keys,
+            scale,
+            n_head: _,
+            n_kv,
+            ctx,
+            t,
+            fault,
+            y,
+        } = args;
+        let grid = launch_u32(what, "grid", 2 * t.div_ceil(Q_ROWS / PACK_4) * n_kv * packs)?;
+        let packs = launch_u32(what, "packs", packs)?;
+        let n_kv = launch_u32(what, "n_kv", n_kv)?;
+        let ctx = launch_u32(what, "ctx", ctx)?;
+        let t = launch_u32(what, "t", t)?;
+        let prep = self
+            .module
+            .prepare_gqa_prefill_flash_512_p4_lower(LaunchConfig1D::new(
+                grid,
+                THREADS_U32,
+                DYN_BYTES_U32,
+            ))?;
+        self.module.gqa_prefill_flash_512_p4_lower(
+            stream, &prep, q, kc, vc, n_keys, k_first, scale, n_kv, ctx, t, packs, fault, y,
         )?;
         Ok(())
     }

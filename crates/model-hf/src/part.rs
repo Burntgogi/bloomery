@@ -5,17 +5,22 @@
 //! headers alone before any value is read.
 //!
 //! A folder's tensor is normalized into its card type (`hf::modelopt`), each weight and block
-//! scale cut first, so a part reads only its own stored values; a tensor the model moves into its
-//! layout after normalizing is made whole, moved, and then cut.
+//! scale cut first, so a part reads only its own stored values: a stack's experts, along its
+//! experts or by a list, are the experts' own sources normalized in the part's order. A tensor
+//! the model moves into its layout after normalizing is made whole, moved, and then cut.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::ops::Range;
 
+use engram::EngramError;
+use engram::direct::{DIRECT_ALIGN, DirectFile, aligned_span};
 use gguf::{GgmlType, TensorInfo};
 use hf::modelopt::{self, Normal, Use};
 use hf::quant_config::{Placed, Plan};
-use model::part::{self, Part, Planned, Source, Take};
-use model::placement::tp::{TpError, part_of};
-use safetensors::Folder;
+use model::part::{self, At, Part, Planned, Source, Take};
+use model::placement::ExpertList;
+use model::placement::tp::TpError;
+use safetensors::{Dtype, Folder, Raw};
 
 /// Why a part was refused.
 #[derive(Debug, thiserror::Error)]
@@ -32,6 +37,8 @@ pub enum Error {
     Release(#[from] model::placement::PlacementError),
     #[error(transparent)]
     Tensors(#[from] safetensors::Error),
+    #[error(transparent)]
+    Direct(#[from] engram::EngramError),
 }
 
 impl From<TpError> for Error {
@@ -105,6 +112,54 @@ impl Checkpoint {
             .collect()
     }
 
+    /// The sources of the experts `list` names of the stack `name`, made as `m`, in the list's
+    /// order; an expert past its sources is refused by name.
+    fn listed<'s>(
+        &'s self,
+        name: &str,
+        m: &'s Made,
+        list: &ExpertList,
+    ) -> Result<Vec<(&'s str, &'s Placed)>, Error> {
+        let placed = self.placed(m);
+        list.ids()
+            .iter()
+            .map(|&e| {
+                placed.get(e as usize).copied().ok_or_else(|| {
+                    refuse(
+                        name,
+                        format!("expert {e} is past the stack's {} sources", placed.len()),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    /// The sources part `p` of `name`, made as `m`, reads its values from: a stack's experts'
+    /// own, along its experts or by a list; every source for any other part and for a tensor the
+    /// model moves after normalizing, which is made whole.
+    fn read_from<'s>(
+        &'s self,
+        name: &str,
+        m: &'s Made,
+        p: &Planned,
+    ) -> Result<Vec<(&'s str, &'s Placed)>, Error> {
+        let placed = self.placed(m);
+        match (&p.at, &m.step) {
+            (Some(At::Experts(list)), None) => self.listed(name, m, list),
+            (Some(At::Along(2, r)), None)
+                if m.dims.len() == 3 && placed.len() as u64 == m.dims[2] =>
+            {
+                let r = usize::try_from(r.start)
+                    .ok()
+                    .zip(usize::try_from(r.end).ok());
+                r.and_then(|(a, b)| placed.get(a..b))
+                    .map(<[_]>::to_vec)
+                    .ok_or_else(|| refuse(name, format!("experts {:?} of its sources", p.at)))
+            }
+            _ => Ok(placed),
+        }
+    }
+
     /// The card type `name`, made as `m`, is normalized into.
     fn card_type(&self, name: &str, m: &Made) -> Result<GgmlType, Error> {
         let format = modelopt::format_of(&self.placed(m))?;
@@ -134,21 +189,82 @@ impl Source for Checkpoint {
             let Some(at) = part::take(&rule, &whole)? else {
                 continue;
             };
-            let (info, _) = part_of(&whole, at.clone())?;
-            // A moved tensor, or a whole row table, is checked whole as it is made in read.
+            let (info, _) = part::part_at(&whole, at.as_ref())?;
+            // A moved tensor, or a whole row table, is checked whole as it is made in read; a
+            // stack's listed experts each as the cut along its experts that reads it alone.
             if m.step.is_none() && (at.is_some() || m.role != Use::Rows) {
-                let cut = at.clone().unwrap_or((0, 0..m.dims[0]));
-                modelopt::check_part(
-                    |n| self.folder.raw(n),
-                    &self.placed(m),
-                    m.role,
-                    &m.dims,
-                    cut,
-                )?;
+                let cuts = match &at {
+                    None => vec![(0, 0..m.dims[0])],
+                    Some(At::Along(dim, r)) => vec![(*dim, r.clone())],
+                    Some(At::Experts(list)) => list
+                        .ids()
+                        .iter()
+                        .map(|&e| (2, u64::from(e)..u64::from(e) + 1))
+                        .collect(),
+                };
+                for cut in cuts {
+                    modelopt::check_part(
+                        |n| self.folder.raw(n),
+                        &self.placed(m),
+                        m.role,
+                        &m.dims,
+                        cut,
+                    )?;
+                }
             }
             out.push(Planned { at, info });
         }
         Ok(out)
+    }
+
+    fn read_bytes(&self, p: &Planned) -> Result<u64, Error> {
+        let name = &p.info.name;
+        let m = self
+            .made
+            .get(name)
+            .ok_or_else(|| refuse(name, "is not one the map makes"))?;
+        let placed = self.placed(m);
+        let ty = self.card_type(name, m)?;
+        let whole = whole(name, ty, &m.dims)?;
+        let cut = p.at.is_some() && m.step.is_none();
+        let format = modelopt::format_of(&placed)?;
+        let compressed = matches!(
+            format,
+            hf::quant_config::Format::Nvfp4Csf | hf::quant_config::Format::Nvfp4Csf32
+        );
+        let plain = matches!(
+            format,
+            hf::quant_config::Format::Bf16 | hf::quant_config::Format::F32
+        );
+        // Direct inputs, or growing cut buffers; decoded companion words and widened plain
+        // values coexist with them. A step may shrink the tensor, so its pre-step output is
+        // bounded from the stored bytes too. Output capacity can grow to twice its length.
+        let mut bytes = 0u64;
+        for n in stored(&placed) {
+            let companion = !m.sources.iter().any(|source| source == n);
+            let factor = if cut { 2u64 } else { 1 }
+                + u64::from(compressed) * 2
+                + u64::from(m.step.is_some()) * 3
+                + u64::from(plain || companion) * 4;
+            let (_, range) = self.folder.file_range(n)?;
+            bytes = range
+                .end
+                .checked_sub(range.start)
+                .and_then(|n| n.checked_mul(factor))
+                .and_then(|n| n.checked_add((2 * DIRECT_ALIGN) as u64))
+                .and_then(|n| bytes.checked_add(n))
+                .ok_or_else(|| refuse(name, "stored read bytes pass u64"))?;
+        }
+        let normal = if cut { p.info.nbytes } else { whole.nbytes };
+        let moved = if m.step.is_some() { whole.nbytes } else { 0 };
+        normal
+            .checked_mul(2)
+            .and_then(|n| n.checked_add(moved))
+            .and_then(|n| n.checked_add(p.info.nbytes))
+            .and_then(|n| n.checked_add(if compressed { whole.nbytes } else { 0 }))
+            .and_then(|n| n.checked_add((m.sources.len() as u64).checked_mul(8)?))
+            .and_then(|n| bytes.checked_add(n))
+            .ok_or_else(|| refuse(name, "normalized read bytes pass u64"))
     }
 
     /// A tensor its format refuses, or that does not normalize into the planned type and bytes,
@@ -159,12 +275,28 @@ impl Source for Checkpoint {
             .made
             .get(name)
             .ok_or_else(|| refuse(name, "is not one the map makes"))?;
-        let get = |n: &str| self.folder.raw(n);
         let placed = self.placed(m);
         let ty = self.card_type(name, m)?;
+        // A whole tensor's stored bytes are read into memory of the read's own ([`read_whole`]);
+        // a part reads only its rows through the mapping.
+        let mut read = HashMap::new();
+        if p.at.is_none() || m.step.is_some() {
+            for n in stored(&placed) {
+                if let Some(w) = read_whole(&self.folder, n)? {
+                    read.insert(n, w);
+                }
+            }
+        }
+        let get = |n: &str| match read.get(n) {
+            Some(w) => Ok(w.raw()),
+            None => self.folder.raw(n),
+        };
         let n = match (&p.at, &m.step) {
-            (Some(at), None) => {
-                modelopt::normalize_part(get, &placed, m.role, &m.dims, at.clone())?
+            (Some(At::Along(dim, r)), None) => {
+                modelopt::normalize_part(get, &placed, m.role, &m.dims, (*dim, r.clone()))?
+            }
+            (Some(At::Experts(list)), None) => {
+                modelopt::normalize(get, &self.listed(name, m, list)?, m.role)?
             }
             _ => {
                 let mut n = modelopt::normalize(get, &placed, m.role)?;
@@ -194,33 +326,42 @@ impl Source for Checkpoint {
                 ),
             ));
         }
-        let bytes = match (&p.at, &m.step) {
-            (Some(_), Some(_)) => {
-                let (_, runs) = part_of(&whole, p.at.clone())?;
-                runs.into_iter()
+        let (bytes, scale) = match (&p.at, &m.step) {
+            (Some(at), Some(_)) => {
+                let (_, runs) = part::part_at(&whole, Some(at))?;
+                let bytes = runs
+                    .into_iter()
                     .flat_map(|r| &n.bytes[r])
                     .copied()
-                    .collect()
+                    .collect();
+                let scale = if ty.reads_scale() {
+                    part::scales_at(name, &whole.dims, n.scale, Some(at))?
+                } else {
+                    n.scale
+                };
+                (bytes, scale)
             }
-            _ => n.bytes,
+            _ => (n.bytes, n.scale),
         };
         Ok(Part::made(
             p.info.clone(),
             bytes,
-            ty.reads_scale().then_some(n.scale),
+            ty.reads_scale().then_some(scale),
         ))
     }
 
     /// Every stored tensor the part was read from, its values and its companions (scales, the
     /// packed shape), each the whole pages inside its bytes: a read normalizes into bytes of its
-    /// own ([`Part::made`]), so no later reader of the part takes them from the file.
+    /// own ([`Part::made`]), so no later reader of the part takes them from the file. A part of
+    /// a stack's experts releases those experts' alone: the rest stay where a host or another
+    /// part reads them.
     fn release(&self, p: &Planned) -> Result<(), Error> {
         let name = p.info.name.as_str();
         let m = self
             .made
             .get(name)
             .ok_or_else(|| refuse(name, "is not one the map makes"))?;
-        for (source, placed) in self.placed(m) {
+        for (source, placed) in self.read_from(name, m, p)? {
             for stored in
                 std::iter::once(source).chain(placed.companions.iter().map(String::as_str))
             {
@@ -231,6 +372,71 @@ impl Source for Checkpoint {
         }
         Ok(())
     }
+}
+
+/// A stored tensor read whole into memory of its own ([`read_whole`]).
+struct Whole {
+    dtype: Dtype,
+    shape: Vec<usize>,
+    buf: Vec<u8>,
+    /// The tensor's bytes in `buf`.
+    at: Range<usize>,
+}
+
+impl Whole {
+    fn raw(&self) -> Raw<'_> {
+        Raw {
+            dtype: self.dtype,
+            shape: &self.shape,
+            bytes: &self.buf[self.at.clone()],
+        }
+    }
+}
+
+/// Stored tensor `name` read whole from its shard past the page cache (engram's direct reader)
+/// into new memory advised onto huge pages, so the read takes the drive's rate, faults once each
+/// 2 MiB and leaves the page cache as it was. `None` only when the shard's filesystem refuses
+/// direct reads as invalid or unsupported ([`DirectFile::open`]); other I/O errors propagate.
+fn read_whole(folder: &Folder, name: &str) -> Result<Option<Whole>, Error> {
+    let (path, range) = folder.file_range(name)?;
+    let file = match DirectFile::open(&path) {
+        Ok(file) => file,
+        Err(EngramError::OpenDirect { source, .. } | EngramError::DirectProbe { source, .. })
+            if matches!(
+                source.kind(),
+                std::io::ErrorKind::InvalidInput | std::io::ErrorKind::Unsupported
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let raw = folder.raw(name)?;
+    let (start, span, need) = aligned_span(range.start, range.end - range.start);
+    let mut buf = vec![0u8; span + DIRECT_ALIGN];
+    os::advise_huge_within(&mut buf);
+    let lead = buf.as_ptr().align_offset(DIRECT_ALIGN);
+    if file.read_span(&mut buf[lead..lead + span], start)? < need {
+        return Err(refuse(
+            name,
+            format!("{} ends inside its bytes", path.display()),
+        ));
+    }
+    let skip = need - raw.bytes.len();
+    Ok(Some(Whole {
+        dtype: raw.dtype,
+        shape: raw.shape.to_vec(),
+        buf,
+        at: lead + skip..lead + need,
+    }))
+}
+
+/// The stored tensors a tensor placed as `placed` is made of: each source, then the companions
+/// its place names (scales, the packed shape).
+fn stored<'s>(placed: &[(&'s str, &'s Placed)]) -> impl Iterator<Item = &'s str> {
+    placed.iter().flat_map(|&(source, placed)| {
+        std::iter::once(source).chain(placed.companions.iter().map(String::as_str))
+    })
 }
 
 /// The whole tensor `name` of `ty` and `dims` as a header entry; dims that are not whole blocks
@@ -704,6 +910,266 @@ pub(crate) mod tests {
             assert_eq!(after, before, "{name} read again after its pages' release");
         }
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A stack of four compressed-tensors NVFP4 experts (codes, block scales, a divisor and an
+    /// input scale each, as MiniMax-M3.1 stores them), with its GGUF, and the 2-D `lone.weight`.
+    fn stack_of_four(dir: &std::path::Path) -> (Checkpoint, Split) {
+        let f32s = |v: f32| v.to_le_bytes().to_vec();
+        let mut t: Vec<Stored> = vec![(
+            "lone.w".into(),
+            "U8",
+            vec![8, 64],
+            bytes(512, |i| (i * 5) as u8),
+        )];
+        t.push((
+            "lone.s".into(),
+            "F8_E4M3",
+            vec![8, 8],
+            bytes(64, |i| 0x38 + (i % 5) as u8),
+        ));
+        t.push(("lone.g".into(), "F32", vec![], f32s(2.0)));
+        t.push(("lone.i".into(), "F32", vec![], f32s(1.0)));
+        for e in 0..4 {
+            t.push((
+                format!("ex.{e}.w"),
+                "U8",
+                vec![32, 64],
+                bytes(2048, |i| (i * 13 + 41 * e) as u8),
+            ));
+            t.push((
+                format!("ex.{e}.s"),
+                "F8_E4M3",
+                vec![32, 8],
+                bytes(256, |i| 0x30 + ((i + 3 * e) % 11) as u8),
+            ));
+            t.push((
+                format!("ex.{e}.g"),
+                "F32",
+                vec![],
+                f32s(4.0 * (e + 1) as f32),
+            ));
+            t.push((format!("ex.{e}.i"), "F32", vec![], f32s(1.0)));
+        }
+        let entries: Vec<_> = t
+            .iter()
+            .map(|(n, d, s, b)| (n.as_str(), *d, s.as_slice(), b.as_slice()))
+            .collect();
+        std::fs::write(dir.join("model.safetensors"), safetensors::write(&entries)).unwrap();
+        let map: BTreeMap<_, _> = t
+            .iter()
+            .map(|(n, ..)| (n.as_str(), "model.safetensors"))
+            .collect();
+        std::fs::write(
+            dir.join(Folder::INDEX),
+            serde_json::json!({ "weight_map": map }).to_string(),
+        )
+        .unwrap();
+        let ct = |stem: &str| Placed {
+            format: Format::Nvfp4Ct,
+            companions: ["s", "g", "i"]
+                .iter()
+                .map(|c| format!("{stem}.{c}"))
+                .collect(),
+        };
+        let mut placed = BTreeMap::from([("lone.w".to_string(), ct("lone"))]);
+        for e in 0..4 {
+            placed.insert(format!("ex.{e}.w"), ct(&format!("ex.{e}")));
+        }
+        let plan = Plan {
+            placed,
+            ..Plan::default()
+        };
+        let made = |sources: Vec<String>, dims: &[u64]| Made {
+            sources,
+            role: Use::Matrix(Plain::F32),
+            dims: dims.to_vec(),
+            step: None,
+        };
+        let made = BTreeMap::from([
+            (
+                "ex.weight".to_string(),
+                made((0..4).map(|e| format!("ex.{e}.w")).collect(), &[128, 32, 4]),
+            ),
+            ("lone.weight".into(), made(vec!["lone.w".into()], &[128, 8])),
+        ]);
+        let c = Checkpoint::new(Folder::open(dir).unwrap(), plan, made).unwrap();
+        let file = gguf_of(&c, &dir.join("model.gguf"));
+        (c, file)
+    }
+
+    /// The experts a list names of a stack are read by the folder and by its GGUF as the same
+    /// part: each expert's bytes and tensor scale, in the list's order, the experts the list
+    /// leaves out unread; one expert is the stack's cut along its experts. A list on a tensor
+    /// that is no stack, and one naming an expert past the stack, are refused by name by both
+    /// sources before a value is read. Releasing the listed part releases the listed experts'
+    /// sources alone. Mutants (`split-mutants/`): the folder's list read in reverse, the
+    /// GGUF's listed scales left whole, the release of a listed part over every source.
+    #[test]
+    fn a_stack_s_listed_experts_are_the_same_part_from_the_folder_and_its_gguf() {
+        let dir = temp_dir("listed");
+        let (f, g) = stack_of_four(&dir);
+        let list = |ids: &[u32], n: u64| ExpertList::new(ids.to_vec(), n).unwrap();
+        let listed = |name: &'static str, l: ExpertList| {
+            move |t: &str, _: GgmlType, _: &[u64]| {
+                Ok::<_, String>(if t == name {
+                    Take::Experts(l.clone())
+                } else {
+                    Take::Skip
+                })
+            }
+        };
+        let one = |e: u64| read_one(&f, rule_part("ex.weight", 2, e..e + 1)).unwrap();
+        for ids in [&[0, 2, 3][..], &[1], &[0, 1, 2, 3], &[3]] {
+            let got = read_one(&f, listed("ex.weight", list(ids, 4))).unwrap();
+            assert_eq!(
+                read_one(&g, listed("ex.weight", list(ids, 4))).unwrap(),
+                got,
+                "{ids:?}: the GGUF's part"
+            );
+            assert_eq!(got.2, [128, 32, ids.len() as u64], "{ids:?}");
+            let each: Vec<Read> = ids.iter().map(|&e| one(u64::from(e))).collect();
+            assert_eq!(
+                got.3,
+                each.iter().flat_map(|r| r.3.clone()).collect::<Vec<u8>>(),
+                "{ids:?}: the experts' bytes in the list's order"
+            );
+            assert_eq!(
+                got.4,
+                Some(each.iter().flat_map(|r| r.4.clone().unwrap()).collect()),
+                "{ids:?}: the experts' tensor scales in the list's order"
+            );
+        }
+        let scales = read_one(&f, listed("ex.weight", list(&[1, 3], 4)))
+            .unwrap()
+            .4;
+        assert_eq!(scales, Some(vec![1.0 / 8.0, 1.0 / 16.0]));
+        for (name, l, says) in [
+            ("lone.weight", list(&[0], 4), "not a stack of experts"),
+            (
+                "ex.weight",
+                list(&[1, 4], 5),
+                "expert 4 is past the stack's 4",
+            ),
+        ] {
+            for (by, e) in [
+                (
+                    "folder",
+                    f.plan(listed(name, l.clone())).err().map(|e| e.to_string()),
+                ),
+                (
+                    "gguf",
+                    g.plan(listed(name, l.clone())).err().map(|e| e.to_string()),
+                ),
+            ] {
+                let e = e.unwrap_or_else(|| panic!("{by} planned {name} at {l:?}"));
+                assert!(e.contains(name) && e.contains(says), "{by}: {e}");
+            }
+        }
+        let [p] = &f.plan(listed("ex.weight", list(&[0, 2], 4))).unwrap()[..] else {
+            panic!("one part planned")
+        };
+        let m = &f.made()["ex.weight"];
+        let from: Vec<&str> = f
+            .read_from("ex.weight", m, p)
+            .unwrap()
+            .into_iter()
+            .map(|(s, _)| s)
+            .collect();
+        assert_eq!(from, ["ex.0.w", "ex.2.w"]);
+        f.release(p).unwrap();
+        let again = read_one(&f, listed("ex.weight", list(&[0, 2], 4))).unwrap();
+        assert_eq!(
+            again.3,
+            [one(0).3, one(2).3].concat(),
+            "read again after release"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The part along `dim` at `at` of tensor `name`, every other skipped.
+    fn rule_part(
+        name: &'static str,
+        dim: usize,
+        at: std::ops::Range<u64>,
+    ) -> impl Fn(&str, GgmlType, &[u64]) -> Result<Take, String> {
+        move |t, _, _| {
+            Ok(if t == name {
+                Take::Part(dim, at.clone())
+            } else {
+                Take::Skip
+            })
+        }
+    }
+
+    #[test]
+    fn read_peaks_cover_the_owned_inputs_and_results() {
+        let dir = temp_dir("read-peak");
+        let mut c = checkpoint(&dir);
+        let shrinking = c.made.get_mut("mx.weight").unwrap();
+        shrinking.dims[1] = 1;
+        shrinking.step = Some(Box::new(|n| {
+            let row = n.bytes.len() / n.dims[1] as usize;
+            n.bytes.truncate(row);
+            n.dims[1] = 1;
+            Ok(())
+        }));
+        let planned = c.plan(|_, _, _| Ok::<_, String>(Take::Whole)).unwrap();
+        for p in &planned {
+            let read_bytes = c.read_bytes(p).unwrap();
+            let part = c.read(p).unwrap();
+            let output: u64 = part.spans().iter().map(|s| s.len() as u64).sum();
+            let made = &c.made[&p.info.name];
+            let placed = c.placed(made);
+            let before = modelopt::normalize(|n| c.folder.raw(n), &placed, made.role).unwrap();
+            let output = output.max(before.bytes.capacity() as u64);
+            let stored: u64 = stored(&placed)
+                .map(|n| {
+                    let (_, r) = c.folder.file_range(n).unwrap();
+                    let (_, span, _) = aligned_span(r.start, r.end - r.start);
+                    (span + DIRECT_ALIGN) as u64
+                })
+                .sum();
+            assert!(
+                read_bytes >= stored + output,
+                "{}: {read_bytes} < {}",
+                p.info.name,
+                stored + output
+            );
+        }
+        let p = planned.iter().find(|p| p.info.name == "v.weight").unwrap();
+        c.made.get_mut("v.weight").unwrap().dims = vec![u64::MAX, 2];
+        assert!(
+            c.read_bytes(p)
+                .unwrap_err()
+                .to_string()
+                .contains("v.weight")
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_mapped_shard_does_not_hide_a_direct_open_error() {
+        let dir = temp_dir("direct-error");
+        let c = checkpoint(&dir);
+        let (path, _) = c.folder.file_range("bf.w").unwrap();
+        std::fs::rename(&path, path.with_extension("moved")).unwrap();
+        let parts = c.plan(rule("bf.weight", 0, 0, 1)).unwrap();
+        assert_eq!(parts.len(), 1);
+        for p in parts {
+            match c.read(&p) {
+                Err(Error::Direct(EngramError::OpenDirect {
+                    path: found,
+                    source,
+                })) => {
+                    assert_eq!(found, path);
+                    assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
+                }
+                Err(e) => panic!("unexpected error: {e}"),
+                Ok(_) => panic!("the mapping hid the missing shard"),
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// Before any value is read, a source the plan does not place, a refusal of the rule and a
