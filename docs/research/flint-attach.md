@@ -113,7 +113,8 @@ each candidate. Fixed-reserve cards need no selected-form cache.
 
 The Solar budget regression starts from a typed mixed GGUF description and exercises
 the planner's one-byte refusal/success boundary without overwriting its described
-prompt reserve. The exact dense-and-prompt budget leaves no room for expert weights.
+prompt reserve. With byte granules (no reusable dense padding), the exact dense-and-prompt
+budget leaves no room for expert weights.
 The real mixed-wrapper hardware case also checks allocation of a configured empty tier.
 
 Historical exact-source proof at `3071a9f0d8ed4773692e0c040dece222b90f6bec`:
