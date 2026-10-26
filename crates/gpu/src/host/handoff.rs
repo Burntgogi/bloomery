@@ -1634,8 +1634,7 @@ fn check_tier(lay: &HandoffLayout, tl: &TierImageLayout) -> Result<HandoffSlots,
     if !matches!(
         slots,
         Ok(HandoffSlots::Four | HandoffSlots::Six | HandoffSlots::Eight)
-    )
-        || tl.n_used != lay.n_used
+    ) || tl.n_used != lay.n_used
         || tl.x_len != lay.hidden
         || tl.q3_words != 0
         || tl.d8_len != 0
