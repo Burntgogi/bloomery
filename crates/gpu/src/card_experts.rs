@@ -1214,7 +1214,13 @@ mod tests {
         assert!(
             matches!(
                 LegTier::new(
-                    &gpu, &specs, &set, &w, family.shape(N, FF, 2), program, tier_act,
+                    &gpu,
+                    &specs,
+                    &set,
+                    &w,
+                    family.shape(N, FF, 2),
+                    program,
+                    tier_act,
                 ),
                 Err(GpuError::Tensor { .. }),
             ),

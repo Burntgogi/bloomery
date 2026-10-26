@@ -70,7 +70,6 @@ fn qwen_act(moe: &Moe) -> Result<Act, GpuError> {
     }
 }
 
-
 /// The host views of the routed layers `run`, the refusal naming the run as
 /// `word`'s. `n_layer` is the description's layer count, so a trunk layer is
 /// not refused for sitting past a next-token block.
@@ -155,7 +154,6 @@ impl LegFamily for Qwen3 {
     fn tier_act(moe: &Moe) -> Result<Act, GpuError> {
         qwen_act(moe)
     }
-
 }
 
 /// Qwen3.6's facts for the common tier node service. The description's
@@ -214,7 +212,6 @@ impl LegFamily for Qwen35 {
     fn tier_act(moe: &Moe) -> Result<Act, GpuError> {
         qwen_act(moe)
     }
-
 }
 
 /// Qwen3-30B's tier node service ([`leg_tier::node_family`]).

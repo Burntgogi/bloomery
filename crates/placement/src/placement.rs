@@ -3165,7 +3165,8 @@ impl Fill<'_, '_> {
             .map(|l| self.model.layer_experts(l))
             .collect();
         spread(n_l, held, self.eligible, &caps, budget, |n| {
-            footprint.at(n)?
+            footprint
+                .at(n)?
                 .checked_add(scratch(n)?)
                 .ok_or_else(|| card.bytes_past_u64())
         })

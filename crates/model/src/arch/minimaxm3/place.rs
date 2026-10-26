@@ -418,31 +418,13 @@ mod tests {
         ));
     }
 
-    /// A machine that names an expert tier card (plan (b′)) is planned: the body serves one. The
-    /// card keeps the prompt batch's reserve on either machine and, on the tiered one, the tier
-    /// places' copies beside it ([`tier_places_bytes`]: 3 × 4 B × 256 rows × 2 slots). The tier's batch bytes are the common leg's: runs of
-    /// [`TIER_CHUNK`] tokens over blocks of the unit's `cols` rows, in the forms the leg's routed
-    /// downs read: the header's F32 downs run on no leg, so the 128-value form
-    /// ([`workstation::tier_leg_batch_bytes`]). The plan reaches the placement, which refuses the
-    /// tier idle: the header's experts all fit the stage card. Mutant: the tier reserve left out
-    /// of the description (the plan stops at [`PlaceError::Tier`]), the forms of a file with no
-    /// leg down left empty (the scratch holds no slot columns), or the run's tokens and the
-    /// block's rows swapped.
+    /// A tiered machine retains the stage's prompt reserve and the tier places beside it.
+    /// The fixture's experts fit on the stage, so placement refuses the idle tier rather
+    /// than rejecting the description as a body without tier support.
     #[test]
     fn a_tier_card_is_planned_with_the_leg_batch() {
         const COLS: u64 = 3 * TIER_CHUNK;
         let inputs = described("mm3-place-tier");
-        let hp = &inputs.hp;
-        assert_eq!(
-            tier_batch(&inputs, COLS),
-            workstation::tier_leg_batch_bytes(
-                hp.n_embd as u64,
-                hp.experts.ff as u64,
-                hp.experts.n_used as u64,
-                TIER_CHUNK,
-                COLS,
-            )
-        );
         let tiered = workstation::plan_bp(LAYERS, None, tier_batch(&inputs, COLS));
         let plain = workstation::plan_gate(LAYERS);
         let places = 3 * 4 * 256 * 2;

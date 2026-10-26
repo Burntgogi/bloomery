@@ -1880,7 +1880,7 @@ mod tests {
             use GgmlType::{IQ3_S, IQ4_XS, NVFP4, Q4_K, Q5_K, Q6_K, Q8_0};
             let q8 = DownForms::of(DownAct::Q8Act);
             let b32 = DownForms::of(DownAct::Q8Blocks32);
-            let base = tier_batch(&inputs());
+            let base = tier_batch(&inputs()).expect("valid tier batch");
             let hp = inputs().hp;
             let leg = |forms| {
                 leg_bytes(
@@ -1908,7 +1908,7 @@ mod tests {
                     q8.with(DownAct::Q8Blocks32),
                 ),
             ] {
-                let batch = tier_batch(&routed_types(&layers));
+                let batch = tier_batch(&routed_types(&layers)).expect("valid selected tier batch");
                 assert_eq!(batch.scratch, leg(forms), "{layers:?}");
                 assert_eq!(batch.staging, base.staging, "{layers:?}");
                 assert_eq!(batch.host, base.host, "{layers:?}");

@@ -505,7 +505,8 @@ impl Tiered for MiniMax {
         place: Place,
         inputs: &PlanInputs<Self::H>,
     ) -> Result<Option<TierBatchBytes>, GateError> {
-        Ok((!place.tier_cards().is_empty()).then(|| bloomery_gpu_minimaxm3::tier::tier_batch(inputs)))
+        Ok((!place.tier_cards().is_empty())
+            .then(|| bloomery_gpu_minimaxm3::tier::tier_batch(inputs)))
     }
 
     /// The tags the model's description names for its think span.
