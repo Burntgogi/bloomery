@@ -2,8 +2,30 @@
 
 Design snapshot: **`e53cabebbb9b16249c81b7c26a026da1670f7d9d`**, requested by
 [#632](https://github.com/midagedev/bloomery/issues/632). The source-gap observations below describe
-that snapshot. The current tree additionally has a **header-only reader**; it still has no Flint
-body, app session or serve seat. No GPU, inference, performance or weight-content validation is claimed.
+that snapshot. This component tree additionally has a header-only reader and shared tier-handoff
+work, but no Flint body, app session or serve seat. Primitive GPU evidence is not Flint model admission.
+
+## Six-slot handoff closure checks — 2026-10-26
+
+The existing #781 branch was ordinarily merged with main
+`15778e2cb2dd7af428d2dd14259e6b0ea8ca6b89`; its published history was not rewritten.
+On source `9bfa55adc257f7e6aae4952aca06246eddaeef70`, the owning DS41 library ran on
+Hikari's RTX 3090 (GPU0): **38 passed, 0 failed, 0 ignored**, in 28.75 seconds.
+`hw_f32_tier_handoffs_conserve_consumed_routes` exercised four, six and eight routes,
+including partial widths, invalid IDs, poisoned unconsumed rows and changed-input graph replay.
+The following host-only changes format the guard and replace a redundant slot-dependent
+error label with the common `F32 tier handoff` context. The measured common-name census
+falls from 39 to 37; the ABI-stable generated kernel names and dispatch stay unchanged.
+The earlier GPU run is not relabeled as a run of these later commits.
+
+The original remote request timed out while its child continued; a separate read-only
+collector recovered the original successful log rather than replaying the run.
+Original-request credential cleanup remains unconfirmed and is not implied by test success.
+Raw evidence is retained outside Git under
+`/home/jmtai04/flint-completion-4dadee0-20261025T205648Z/evidence/closure-20261026/`;
+local receipts are under `flint-closure-20261026` in the contribution workspace.
+Resource-table admission still requires actual measurements for the new entry.
+Accessible cards establish only cc8.6, not physical cc12.1; do not synthesize the latter pins.
 
 ## Host reader status
 
