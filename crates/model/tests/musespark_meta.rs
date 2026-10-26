@@ -368,7 +368,7 @@ fn hw_musespark_plan() {
             workstation::A6000,
             &[workstation::RTX_3090],
             None,
-            place::tier_batch(&hp).expect("tier batch bytes"),
+            place::tier_batch(&hp),
         )
         .unwrap_or_else(|e| panic!("the tiered machine: {e}"));
         place::stage_placed(&mut m).unwrap_or_else(|e| panic!("the tiered machine's stage: {e}"));

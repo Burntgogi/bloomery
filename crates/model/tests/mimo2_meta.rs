@@ -401,7 +401,7 @@ fn hw_mimo2_plan() {
     let tiered = workstation::plan_bp(
         layers,
         None,
-        model::arch::mimo2::place::tier_batch(&inputs.hp, 512).expect("tier batch bytes"),
+        model::arch::mimo2::place::tier_batch(&inputs.hp, 512),
     );
     let bp = inputs
         .plan(&tiered, ctx, &PlanLevers::default())

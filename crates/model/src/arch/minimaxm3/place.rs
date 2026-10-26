@@ -244,7 +244,6 @@ mod tests {
     use super::{PROMPT_ROWS, PlaceError, PlanInputs, TIER_CHUNK, stream_bytes, tier_batch};
     use crate::arch::place_hybrid::ring_pass_bytes;
     use crate::arch::synthetic::{V, header_shaped};
-    use crate::placement::kernels::{DownAct, DownForms};
     use crate::placement::{PlacementError, PlanLevers, workstation};
 
     /// The small header's global keys: the pre-tokenizer and a template the description reads.
