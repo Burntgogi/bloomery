@@ -1147,6 +1147,7 @@ impl CardLeg {
             act_x,
             h,
             act_h,
+            protection,
             ..
         } = bufs;
         let scratch = Scratch {
@@ -1154,6 +1155,7 @@ impl CardLeg {
             act_x,
             h,
             act_h,
+            protection,
         };
         self.launch(
             gpu,
@@ -1323,7 +1325,8 @@ impl CardLeg {
         if let Some(p) = protection {
             p.kernels.normalize(
                 gpu,
-                (h, run.normed, &mut p.scales),
+                // Gate/up already activated h; None leaves the second operand unread.
+                (h, &*down, &mut p.scales),
                 &selected,
                 ff,
                 None,
@@ -2131,6 +2134,104 @@ pub(crate) mod tests {
                     "{case}"
                 );
                 assert_hand_rows(&case, &got, &want);
+            }
+        }
+    }
+
+    /// Prequantized inputs preserve the loaded protection policy and changed-input replay.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_prequantized_leg_preserves_protection_and_replay() {
+        let gpu = Gpu::new().expect("a GPU");
+        let stream = gpu.stream();
+        let leg = CardLeg::load(&gpu).expect("the leg");
+        let ty = GgmlType::Q5_K;
+        let weights = weights(&gpu, SHAPE, &[ty]);
+        let names = [
+            stack_name("gate", ty),
+            stack_name("up", ty),
+            stack_name("down", ty),
+        ];
+        let stacks =
+            LegStacks::of(&weights, [&names[0], &names[1], &names[2]]).expect("the stacks");
+        let mut ordinary = LegBufs::new(stream, SHAPE).expect("ordinary buffers");
+        let mut quantized = LegBufs::new(stream, SHAPE).expect("quantized buffers");
+        let mut host = vec![0.0f32; CAP * N];
+        let mut normed = DeviceBuffer::zeroed(stream, host.len()).expect("normed rows");
+        let mut act = Q8Act::with_tier_cols(stream, CAP, N).expect("quantized input");
+        let sel = DeviceBuffer::from_host(stream, &SEL).expect("places");
+        let sentinel = vec![SENT; CAP * SPC * N];
+        let mut expected = DeviceBuffer::from_host(stream, &sentinel).expect("ordinary output");
+        let mut actual = DeviceBuffer::from_host(stream, &sentinel).expect("quantized output");
+        for policy in [ExpertInput::Direct, ExpertInput::AmaxF16] {
+            ordinary
+                .set_expert_input(&gpu, policy)
+                .expect("ordinary policy");
+            quantized
+                .set_expert_input(&gpu, policy)
+                .expect("quantized policy");
+            for m in [CAP, CAP - 1] {
+                let graph = gpu
+                    .capture(|_| {
+                        gpu.enqueue_quantize_q8_1_cols(&normed, &mut act, m, 0)?;
+                        leg.enqueue_rows_quantized(
+                            &gpu,
+                            &mut quantized,
+                            &QuantRun {
+                                layer: 0,
+                                stacks: &stacks,
+                                act: &act,
+                                m,
+                                sel: &sel,
+                                n_card: N_CARD,
+                                rule: Act::SiluMul,
+                            },
+                            &mut actual,
+                        )
+                    })
+                    .expect("capture quantized input and protected leg");
+                let amplitudes = match policy {
+                    ExpertInput::Direct => [1.0f32, 2.0],
+                    ExpertInput::AmaxF16 => [1.0f32, 8192.0],
+                };
+                for amplitude in amplitudes {
+                    for (i, value) in host.iter_mut().enumerate() {
+                        *value = (((i * 2654435761usize) % 2001) as f32 / 1000.0 - 1.0) * amplitude;
+                    }
+                    normed.copy_from_host(stream, &host).expect("changed input");
+                    expected
+                        .copy_from_host(stream, &sentinel)
+                        .expect("reference canaries");
+                    actual
+                        .copy_from_host(stream, &sentinel)
+                        .expect("replay canaries");
+                    leg.enqueue_rows(
+                        &gpu,
+                        &mut ordinary,
+                        &LegRun {
+                            layer: 0,
+                            stacks: &stacks,
+                            normed: &normed,
+                            m,
+                            sel: &sel,
+                            n_card: N_CARD,
+                            rule: Act::SiluMul,
+                        },
+                        &mut expected,
+                    )
+                    .expect("ordinary input with the same policy");
+                    graph.launch(stream).expect("changed-input replay");
+                    let want = expected.to_host_vec(stream).expect("ordinary rows");
+                    let got = actual.to_host_vec(stream).expect("quantized rows");
+                    assert!(gpu.take_fault().expect("fault word").is_none());
+                    let active = m * SPC * N;
+                    let case = format!("{policy:?}, {m} tokens, amplitude {amplitude}");
+                    assert_hand_rows(&case, &got[..active], &want[..active]);
+                    assert!(
+                        got[active..].iter().all(|&value| value == SENT),
+                        "{case}: tail"
+                    );
+                }
             }
         }
     }

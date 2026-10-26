@@ -1371,11 +1371,7 @@ impl HandoffKernels {
     ) -> Result<(), GpuError> {
         let (lay, tl) = (target.layout, ttarget.layout);
         let slots = check_tier(&lay, &tl)?;
-        let what = match slots {
-            HandoffSlots::Four => "ds41_ffn_handoff_4_tier",
-            HandoffSlots::Six => "ffn_handoff_6_tier",
-            _ => "ds41_ffn_handoff_8_tier",
-        };
+        let what = "F32 tier handoff";
         let n = lay.hidden;
         let grid = launch_u32(what, "grid", n.div_ceil(HANDOFF_THREADS as usize))?;
         let cfg = LaunchConfig1D::new(grid, HANDOFF_THREADS, 0);
