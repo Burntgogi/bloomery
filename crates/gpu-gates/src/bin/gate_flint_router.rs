@@ -166,7 +166,7 @@ mod gate {
         };
         let clean = cx.gpu.take_fault()?.is_none();
         let mut expected = true;
-        for t in 0..TOKENS {
+        for (t, &factor) in factors.iter().enumerate() {
             let scores = &single.scores[t * EXPERTS..(t + 1) * EXPERTS];
             let keys: Vec<f32> = scores
                 .iter()
@@ -180,7 +180,7 @@ mod gate {
                     .iter()
                     .enumerate()
                     .map(|(e, &logit)| {
-                        let p = sigmoid(logit * factors[t]);
+                        let p = sigmoid(logit * factor);
                         bias.map_or(p, |b| p + b[e])
                     })
                     .collect();
