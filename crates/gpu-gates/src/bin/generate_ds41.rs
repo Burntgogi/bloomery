@@ -1034,7 +1034,18 @@ mod drive {
         } else {
             None
         };
-        let call = log.call.take();
+        // The load may feed a prompt the batch cannot read as steps: the
+        // feed, and whether its call is planned, follow the body's mode.
+        let feed_mode = if check_finite {
+            body::PrefillMode::Steps
+        } else {
+            s.model().body("generate_ds41")?.prefill_mode()
+        };
+        let batched = feed_mode == body::PrefillMode::Batch;
+        let call = log.call.take().filter(|_| batched);
+        if let Some(c) = &call {
+            c.print(false, &hp, &[]);
+        }
         let pre = Prelude {
             cfg: &cfg,
             hp: &hp,
@@ -2018,8 +2029,10 @@ mod drive {
             let called = depth - usize::from(a.diag.serve_feed);
             let call = (self.batched && self.draft != Draft::Dspark && a.arms.is_empty())
                 .then(|| CallView::of(self.cfg, &inputs.hp, ctx_max, called));
-            if let Some(c) = &call {
-                c.print(a.plan, &inputs.hp, &plan.n_l);
+            if a.plan
+                && let Some(c) = &call
+            {
+                c.print(true, &inputs.hp, &plan.n_l);
             }
             self.hp = Some(inputs.hp.clone());
             self.ctx_max = ctx_max;
@@ -2056,7 +2069,8 @@ mod drive {
             if let Some((card, rate)) = &self.lane {
                 record::lane(card, rate).print();
             }
-            load.u("ctx", a.ctx)
+            let load = load
+                .u("ctx", a.ctx)
                 .u("layers", hp.n_layer)
                 .u("top_k", top_k)
                 .w("mode", mode_name(a.mode))
@@ -2071,8 +2085,12 @@ mod drive {
                         b.prefill_mode().name()
                     },
                 )
-                .w("ced", b.ced())
-                .u("group", b.prefill_group_lever())
+                .w("ced", b.ced());
+            let load = match b.batch_refusal() {
+                Some(why) => load.w("prefill_refusal", why),
+                None => load,
+            };
+            load.u("group", b.prefill_group_lever())
                 .f("load_s", total.as_secs_f64())
                 .print();
             if let Some(times) = m.load_times() {

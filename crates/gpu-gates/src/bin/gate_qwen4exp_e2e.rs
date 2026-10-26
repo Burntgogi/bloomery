@@ -589,9 +589,9 @@ mod gate {
         let path = ref_model_path()?;
         let file = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
         let inputs = PlanInputs::describe(&file)?;
-        let shape = crate::q38_arch::shape_of(&inputs.hp)?;
+        let shape = crate::q38_arch::shape_of(&inputs.spec)?;
         let plan_levers = tier::plan_levers(&file, &levers, 0)?;
-        let n_expert = inputs.hp.n_expert;
+        let n_expert = inputs.spec.routed().map_or(0, |m| m.experts as usize);
         let cfg = Cfg {
             path,
             host: levers.host(),
@@ -681,8 +681,8 @@ mod gate {
     /// commit, so a select that scores one raises `pool_select` by name.
     const POOL_POISON: u16 = 0x7e00;
 
-    /// The selecting layers the header's interval names (`(il + 1) % interval
-    /// == 0`): every fourth on the real file, every second on the fixture.
+    /// The selecting layers the description names: every fourth on the real
+    /// file, every second on the fixture.
     fn qsa_layers() -> Vec<usize> {
         shape().qsa.clone()
     }
@@ -5470,13 +5470,13 @@ mod gate {
         );
         let mut ok = ids_ok;
         let mut past = Vec::new();
-        for l in 0..n_layer() {
+        for (l, ik_route) in ik_routes.iter().enumerate().take(n_layer()) {
             let worst = (0..n)
                 .map(|t| {
                     routes
                         .get(t)
                         .and_then(|r| r.get(l))
-                        .map_or(f64::INFINITY, |o| rel(&o.logits, ik_routes[l].at(t).0))
+                        .map_or(f64::INFINITY, |o| rel(&o.logits, ik_route.at(t).0))
                 })
                 .fold(0.0f64, f64::max);
             let band = bands.router[l];

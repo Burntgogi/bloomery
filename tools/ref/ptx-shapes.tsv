@@ -90,8 +90,10 @@ generate_ds41   ds41_ffn_replace                         0           0
 generate_ds41   ds41_ffn_sel_merge                       0           0
 generate_ds41   ds41_glue_embed                          0           0
 generate_ds41   ds41_glue_embed_q3k                      0           0
+generate_ds41   ds41_glue_embed_q5k                      0           0
 generate_ds41   ds41_glue_engram_rows                    0           0
 generate_ds41   ds41_glue_engram_rows_q3k                0           0
+generate_ds41   ds41_glue_engram_rows_iq4nl              0           0
 generate_ds41   ds41_groups_to_tokens                    0           0
 generate_ds41   ds41_hc_fold                             0           0
 generate_ds41   ds41_hc_mean                             0           0
@@ -109,6 +111,7 @@ generate_ds41   ds41_q3k_gemv_heads_groups               0           0
 generate_ds41   ds41_q3k_gemv_heads_mcol                 0           0
 generate_ds41   ds41_q5k_gemv_f32                        0           0
 generate_ds41   ds41_q5k_gemv_f32_mcol                   0           0
+generate_ds41   ds41_q5k_gemv_heads                      0           0
 generate_ds41   ds41_r8_q3k                              0           0
 generate_ds41   ds41_r8_q3k_groups                       0           0
 generate_ds41   ds41_ring_commit                         0           0
@@ -119,6 +122,7 @@ generate_ds41   ds41_rows_to_tokens                      0           0
 generate_ds41   ds41_shexp_gate_up                       0           0
 generate_ds41   ds41_shexp_gate_up_q3k                   0           0
 generate_ds41   ds41_shexp_gate_up_q3k_mcol              0           0
+generate_ds41   ds41_shexp_gate_up_q5k                   0           0
 generate_ds41   ds41_shexp_gate_up_q8_0_mcol             0           0
 generate_ds41   ds41_tap_means                           0           0
 generate_ds41   embed_rows                               0           0
@@ -150,7 +154,9 @@ generate_ds41   gate_up_swiglu_q3k                       0           0
 generate_ds41   gather_pairs                             0           0
 generate_ds41   gdn_carry_keep                           0           0
 generate_ds41   gdn_chunk_prepare                        0           0
-generate_ds41   gdn_conv_prep                            0           0
+# PIN(2026-10-26): 0 -> 8 spill bytes and 0 -> 8 JIT local bytes (sm_86 ptxas 13.3.73, cc 8.6 JIT of gate-ptx-spill's run). 56 -> 72 registers,
+# 9 -> 7 blocks an SM in the no-JIT scan. cuda-oxide moved from the fork's rev to NVIDIA/cuda-rust 9df9e7cef561 (stable 1.99.1), and the PTX of 1507 of 1585 scanned entries moved with it (just canon-check; 1483 of them by `ld.global.nc` loads and the placement they allow).
+generate_ds41   gdn_conv_prep                            8           8
 generate_ds41   gdn_delta                                0           0
 generate_ds41   gdn_delta_lanes                          0           0
 generate_ds41   gdn_delta_recovery                       0           0
@@ -158,6 +164,10 @@ generate_ds41   gdn_delta_prepared                       0           0
 generate_ds41   gdn_norm_gate                            0           0
 generate_ds41   gdn_norm_gate_sigmoid                    0           0
 generate_ds41   geglu_tanh                               0           0
+generate_ds41   gemm_iq1m                                0           0
+generate_ds41   gemm_iq1s                                0           0
+generate_ds41   gemm_iq2s                                0           0
+generate_ds41   gemm_iq2xs                               0           0
 generate_ds41   gemm_iq2xxs              0  0
 # PIN(2026-10-25): 0 -> 8 spill bytes and 0 -> 8 JIT local bytes (sm_86 ptxas 13.3.73 and the cc 8.6 JIT of the
 # release batch's A6000). 7d4d5f6d8 (juliankang4) walks a plain tile twice: in F32, then exactly for a tile that
@@ -205,6 +215,12 @@ generate_ds41   gqa_flash_seg_h128_swa                   0           0
 generate_ds41   gqa_flash_seg_k192                       0           0
 generate_ds41   gqa_flash_seg_k192_ring                  0           0
 generate_ds41   gqa_flash_seg_mma                        0           0
+generate_ds41   gqa_flash_seg_mma_g7                     0           0
+generate_ds41   gqa_flash_seg_mma_g7_q8                  0           0
+generate_ds41   gqa_prefill_flash_g7                     0           0
+generate_ds41   gqa_prefill_flash_g7_q8                  0           0
+generate_ds41   rope_norm_append                         0           0
+generate_ds41   rope_norm_append_q8                      0           0
 generate_ds41   gqa_flash_seg_mma_256                    0           0
 generate_ds41   gqa_flash_seg_mma_256_p12_sel            0           0
 generate_ds41   gqa_flash_seg_mma_256_p4                 0           0
@@ -263,11 +279,16 @@ generate_ds41   hc_gated_up_mix_4x320                    0           0
 # through the 484 step. The spill pin stands (484 read again). The entry launches only where dense_mma holds, cc 12.1
 # (q8f32.rs Q8F32Kernels::load), so these cc 8.6 bytes are never run.
 # PIN(2026-10-25): HC up BF16 input: sm_86 spill 484 -> 608 B, GB10 JIT local unchanged at 88 B; native sm_121/sm_121a spill 364 -> 332 B; deferred flags and u32 columns each measured 532 B spill / 96 B JIT local.
-# The cc 8.6 JIT was not measured; its historical 104 B pin is retained.
-generate_ds41   hc_gated_up_mma_mix_4                  608         104
+# PIN(2026-10-26): hc_gated_up_mma_mix_4 jit_local 104 -> 216 on cc 8.6 (gate-ptx-spill on the box's RTX card, the
+# type train's union batch): a534227ca raised its sm_86 spill 484 -> 608 with the BF16 head-norm finish and kept the
+# older jit_local, which a GB10 cannot measure; the entry's PTX is main's (ptx-compare 43073091b: changed none).
+# PIN(2026-10-26): spill 608 -> 536 B and cc 8.6 JIT local 216 -> 184 B, both measured by gate-ptx-spill (sm_86 ptxas 13.3.73). cuda-oxide moved from the fork's rev to NVIDIA/cuda-rust 9df9e7cef561 (stable 1.99.1), and the PTX of 1507 of 1585 scanned entries moved with it (just canon-check; 1483 of them by `ld.global.nc` loads and the placement they allow).
+generate_ds41   hc_gated_up_mma_mix_4                  536         184
 # PIN(2026-10-25): the new entry uses sm_86 ptxas 13.3.73 spill/stack (676/192). The cc 8.6 JIT was not measured (the
 # GB10 JIT reads 88 B of local for this PTX); this new entry's jit_local pin uses the measured ptxas stack frame.
-generate_ds41   hc_gated_up_mma_mix_4_bf16             676         192
+# PIN(2026-10-26): spill 676 -> 628 B and cc 8.6 JIT local 192 -> 200 B, both measured by gate-ptx-spill (sm_86 ptxas
+# 13.3.73, the RTX A6000's JIT): cuda-oxide moved to NVIDIA/cuda-rust 9df9e7cef561 with #1648, and the PTX moved with it.
+generate_ds41   hc_gated_up_mma_mix_4_bf16             628         200
 generate_ds41   hc_gated_up_mix_bf16_1col                0           0
 generate_ds41   hc_gated_up_mix_bf16_4x320               0           0
 generate_ds41   hc_pre_q8_0                              0           0
@@ -281,6 +302,12 @@ generate_ds41   head_norm_neox_append_q8                 0           0
 generate_ds41   head_norm_neox_append_rows               0           0
 generate_ds41   index_key_ln_append                      0           0
 generate_ds41   index_pool                               0           0
+generate_ds41   iq1_m_gate_up_sel                        0           0
+generate_ds41   iq1_m_gemv_sel                           0           0
+generate_ds41   iq1_s_gate_up_sel                        0           0
+generate_ds41   iq1_s_gemv_sel                           0           0
+generate_ds41   iq2_s_gate_up_sel                        0           0
+generate_ds41   iq2_s_gemv_sel                           0           0
 generate_ds41   iq2_xs_gate_up_sel                       0           0
 generate_ds41   iq2_xs_gemv_sel                          0           0
 generate_ds41   iq2_xs_rows                              0           0
@@ -295,8 +322,10 @@ generate_ds41   iq4_nl_gemv_sel32                        0           0
 generate_ds41   iq4_xs_gate_up_sel                       0           0
 generate_ds41   iq4_xs_gemv_sel                          0           0
 generate_ds41   iq4_xs_rows                              0           0
-generate_ds41   kda_conv_prep                            0           0
-generate_ds41   kda_conv_prep_sp2                        0           0
+# PIN(2026-10-26): kda_conv_prep and kda_conv_prep_sp2: 0 -> 16 spill bytes and 0 -> 8 JIT local bytes each (sm_86 ptxas 13.3.73, cc 8.6 JIT
+# of gate-ptx-spill's run). 56 -> 64 and 54 -> 64 registers, 9 -> 8 blocks an SM in the no-JIT scan. cuda-oxide moved from the fork's rev to NVIDIA/cuda-rust 9df9e7cef561 (stable 1.99.1), and the PTX of 1507 of 1585 scanned entries moved with it (just canon-check; 1483 of them by `ld.global.nc` loads and the placement they allow).
+generate_ds41   kda_conv_prep                           16           8
+generate_ds41   kda_conv_prep_sp2                       16           8
 generate_ds41   kda_delta                                0           0
 generate_ds41   kda_delta_lanes                          0           0
 generate_ds41   kda_write_gate                           0           0
@@ -332,7 +361,9 @@ generate_ds41   mxfp8_gemv                               0           0
 # scans of three trees since read it at 64 registers (four blocks of 256 an SM) and 28 spill bytes, where
 # q8_0_gemv_ids_mcol, the same body over Q8_0, takes 70 registers and mxfp8_gemv_mcol 72, both with none. The spill
 # is the contributor's own sm_86 reading (sm_86-cc12.1.tsv).
-generate_ds41   mxfp8_gemv_ids                          28          16
+# PIN(2026-10-26): 28 -> 60 spill bytes and 16 -> 24 JIT local bytes (sm_86 ptxas 13.3.73, cc 8.6 JIT of gate-ptx-spill's run). The
+# entry sits at the 64-register cap of four blocks of 256 an SM; cuda-oxide moved from the fork's rev to NVIDIA/cuda-rust 9df9e7cef561 (stable 1.99.1), and the PTX of 1507 of 1585 scanned entries moved with it (just canon-check; 1483 of them by `ld.global.nc` loads and the placement they allow).
+generate_ds41   mxfp8_gemv_ids                          60          24
 generate_ds41   mxfp8_gemv_mcol                          0           0
 generate_ds41   mxfp8_mma_gemm                           0           0
 generate_ds41   mxfp8_tile_gemm                          0           0
@@ -404,7 +435,9 @@ generate_ds41   q8_0_gemv                                0           0
 generate_ds41   q8_0_gemv_heads                          0           0
 generate_ds41   q8_0_gemv_heads_mcol                     0           0
 generate_ds41   q8_0_gemv_ids                            0           0
-generate_ds41   q8_0_gemv_ids_mcol                       0           0
+# PIN(2026-10-26): 0 -> 16 spill bytes and 0 -> 8 JIT local bytes (sm_86 ptxas 13.3.73, cc 8.6 JIT of gate-ptx-spill's run). 70 -> 64
+# registers, 3 -> 4 blocks an SM in the no-JIT scan: the body now fits the four-block cap by spilling. cuda-oxide moved from the fork's rev to NVIDIA/cuda-rust 9df9e7cef561 (stable 1.99.1), and the PTX of 1507 of 1585 scanned entries moved with it (just canon-check; 1483 of them by `ld.global.nc` loads and the placement they allow).
+generate_ds41   q8_0_gemv_ids_mcol                      16           8
 generate_ds41   q8_0_gemv_mcol                           0           0
 generate_ds41   q8_0_gemv_sel                            0           0
 generate_ds41   q8_0_gemv_sel32                          0           0

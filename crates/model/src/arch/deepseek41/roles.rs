@@ -2,12 +2,15 @@
 //! names first, then the per-layer rules in order, the first match winning —
 //! the rule list of `docs/research/v41-placement/derive.py` `role()`, after
 //! the never-loaded names ([`Role::Unused`]: a multi-token-prediction head's
-//! `nextn.*` and `*.mtp.*`). A name no rule matches fails the file with every
+//! `nextn.*` and `*.mtp.*`) and the Engram hash constants a publisher stores
+//! as tensors ([`Role::EngramHash`]: read once at the header, never loaded).
+//! A name no rule matches fails the file with every
 //! such name listed; there is no catch-all role. V4.1 has no dense FFN, so
 //! no rule gives [`Role::DenseFfn`]: a dense `ffn_{gate,up,down}` here is a
 //! file this classifier refuses.
 
 use gguf::Split;
+use gguf::arch::deepseek41::is_hash_tensor;
 
 use super::hparams::Hparams;
 use super::names;
@@ -63,6 +66,9 @@ fn role(name: &str, n_layer: usize) -> Option<(Role, Option<usize>)> {
     if name.starts_with("mtp.") || (!name.starts_with("blk.") && name.contains(".mtp.")) {
         return Some((Role::Unused, None));
     }
+    if is_hash_tensor(name) {
+        return Some((Role::EngramHash, None));
+    }
     if name.starts_with("token_embd") {
         return Some((Role::TokenEmbedding, None));
     }
@@ -88,7 +94,22 @@ pub fn classify(split: &Split, hp: &Hparams) -> Result<ModelTensors, PlacementEr
     for t in &mut model.tensors {
         t.gathered_rows = gathered_rows(split, t)?;
     }
+    model.bf16_words = bf16_words;
     Ok(model)
+}
+
+/// Whether `name` is a compressor or an indexer matrix: the attention
+/// tensors whose dense sites (`gpu-deepseek41` `Dense::of`) take BF16 in its
+/// words, where the other attention matrices take the K-quants and q8_0.
+pub fn is_side_matrix(name: &str) -> bool {
+    name.contains("compressor") || name.contains("indexer")
+}
+
+/// Whether the chain reads BF16 tensor `t` in its words
+/// ([`ModelTensors::bf16_words`]): a compressor or indexer matrix, whose dense
+/// site takes them; every other BF16 tensor loads widened to f32.
+fn bf16_words(t: &ModelTensor) -> bool {
+    t.role == Role::Attention && is_side_matrix(&t.name)
 }
 
 /// Rows one token reads from a row-gathered table: one row of the token
@@ -122,8 +143,55 @@ fn gathered_rows(split: &Split, t: &ModelTensor) -> Result<Option<u64>, Placemen
 
 #[cfg(test)]
 mod tests {
-    use super::role;
-    use crate::placement::Role;
+    use super::{bf16_words, role};
+    use crate::placement::{CardFormat, ModelTensor, ModelTensors, Role};
+    use gguf::GgmlType;
+    use gguf::arch::deepseek41::HASH_TENSORS;
+
+    /// A BF16 compressor or indexer matrix loads in its words, where another
+    /// BF16 attention matrix, a router and a gain load widened to f32.
+    #[test]
+    fn bf16_compressor_and_indexer_matrices_load_as_words() {
+        let model = ModelTensors {
+            tensors: Vec::new(),
+            layers: 9,
+            experts: 0,
+            experts_used: 0,
+            bf16_words,
+        };
+        let format = |name: &str, role: Role| {
+            model.card_format(&ModelTensor {
+                name: name.to_string(),
+                shard: 0,
+                layer: Some(2),
+                role,
+                ty: GgmlType::BF16,
+                dims: vec![5120, 512],
+                file_bytes: 0,
+                gathered_rows: None,
+            })
+        };
+        for name in [
+            "blk.2.attn_compressor_kv.weight",
+            "blk.2.attn_compressor_gate.weight",
+            "blk.7.indexer.attn_q_b.weight",
+            "blk.7.indexer.proj.weight",
+            "blk.4.indexer.attn_k.weight",
+        ] {
+            assert_eq!(
+                format(name, Role::Attention),
+                Some(CardFormat::Bf16Raw),
+                "{name}"
+            );
+        }
+        for (name, role) in [
+            ("blk.0.attn_q_a.weight", Role::Attention),
+            ("blk.0.ffn_gate_inp.weight", Role::Router),
+            ("blk.1.engram_k.weight", Role::EngramGain),
+        ] {
+            assert_eq!(format(name, role), Some(CardFormat::Bf16AsF32), "{name}");
+        }
+    }
 
     /// A multi-token-prediction head's tensors are never loaded, whatever
     /// their layer and whatever decode name follows the prefix; a name no rule
@@ -141,6 +209,9 @@ mod tests {
             ("model.mtp.norm.weight", None),
         ] {
             assert_eq!(role(name, 43), Some((Role::Unused, layer)), "{name}");
+        }
+        for name in HASH_TENSORS {
+            assert_eq!(role(name, 43), Some((Role::EngramHash, None)), "{name}");
         }
         assert_eq!(
             role("blk.0.exp_probs_b.bias", 43),

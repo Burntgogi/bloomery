@@ -94,6 +94,7 @@ pub mod quant_sel;
 pub(crate) mod recur;
 pub(crate) mod ring_gemm;
 pub mod rope_neox;
+pub mod rope_norm;
 pub mod rope_table;
 pub mod route_body;
 pub mod route_core;
@@ -332,6 +333,18 @@ impl GpuError {
 pub fn launch_u32(what: &'static str, name: &'static str, v: usize) -> Result<u32, GpuError> {
     u32::try_from(v)
         .map_err(|_| GpuError::shape(what, format!("{name} = {v} does not fit the kernel's u32")))
+}
+
+/// The first of `lens`' `(name, len, need)` buffers shorter than a launch
+/// reads or writes, as a `Shape` error of the entry point `what`.
+pub(crate) fn short(what: &'static str, lens: &[(&str, usize, usize)]) -> Result<(), GpuError> {
+    match lens.iter().find(|(_, got, need)| got < need) {
+        Some((name, got, need)) => Err(GpuError::shape(
+            what,
+            format!("{name}.len() {got} < {need}"),
+        )),
+        None => Ok(()),
+    }
 }
 
 /// Columns a group of [`ColGroups`] holds at most: the m-column cores'.

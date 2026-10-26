@@ -261,7 +261,7 @@ pub static NEED: Kind = Kind {
 pub static LOAD: Kind = Kind {
     name: "load",
     head: "load",
-    doc: "The load: device bytes, the ring shadows' host bytes, the cards it loaded (an expert tier card's experts and resident bytes), the context, and the modes and levers the body holds.",
+    doc: "The load: device bytes, the ring shadows' host bytes, the cards it loaded (an expert tier card's experts and resident bytes), the context, and the modes and levers the body holds; prefill_refusal, when the batch feed was asked for and the load fed prompts as steps, the refusal of the first layer tensor the batch's launches do not read.",
     parts: &[
         key("resident_bytes", U64, "B"),
         key("shadow", Word, ""),
@@ -280,6 +280,7 @@ pub static LOAD: Kind = Kind {
         key("pinned", Bool, ""),
         key("prefill", Word, ""),
         key("ced", Text, ""),
+        opt("prefill_refusal", Text, ""),
         key("group", U64, "batches"),
         lit(" in "),
         pos("load_s", F64(1), "s"),
@@ -4250,7 +4251,7 @@ mod tests {
 
     #[test]
     fn host_only_records_name_causes_and_skip_an_all_host_choice() {
-        use gguf::GgmlType::{IQ2_XS, MXFP4, Q4_K, Q5_K, Q6_K};
+        use gguf::GgmlType::{MXFP4, Q4_K, Q5_K, Q6_K};
         use model::placement::accepts::{Program, routed_rule};
         use model::placement::{ModelTensor, ModelTensors, Role};
         let mut model = ModelTensors {
@@ -4263,12 +4264,14 @@ mod tests {
         // PIN(2026-10-22): the Q8_0 down and the Q6_K gate and up the layers named
         // here once were refused by the qwen35moe card leg; the common leg runs the
         // Q8_0 down now, so the layers take types the leg still has no GEMM for
-        // (an MXFP4 down, an IQ2_XS gate and up); the causes and their order are
+        // (an MXFP4 down, an MXFP4 gate and up); the causes and their order are
         // the ones the test held.
+        // PIN(2026-10-25): an IQ2_XS gate and up stood where the MXFP4 pair is until
+        // IQ2_XS had a prompt GEMM.
         for (layer, types) in [
             [Q4_K, Q4_K, Q6_K],
             [Q4_K, Q4_K, MXFP4],
-            [IQ2_XS, IQ2_XS, Q6_K],
+            [MXFP4, MXFP4, Q6_K],
             [Q4_K, Q5_K, Q4_K],
         ]
         .into_iter()

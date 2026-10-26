@@ -49,6 +49,7 @@ use super::clauses_router;
 use super::common::{self, LAYER};
 use super::fixture::Fixture;
 use super::oracle::{self, U};
+use super::synthetic;
 use super::{Harness, SENTINEL_BITS};
 
 /// The hidden width every row has.
@@ -497,6 +498,21 @@ fn experts_of(fix: &Fixture, quant: Quant) -> Result<Experts, String> {
     })
 }
 
+/// A weight type's stacks of synthetic rows ([`synthetic::matrix`]), for a
+/// quant no fixture holds: every expert its own rows, each stack and shared
+/// tensor from its own seed.
+fn synthetic_experts(quant: Quant, seed: u64) -> Experts {
+    Experts {
+        quant,
+        gate: synthetic::matrix(quant, EXPERTS * EXPERT_K, K, seed),
+        up: synthetic::matrix(quant, EXPERTS * EXPERT_K, K, seed + 1),
+        down: synthetic::matrix(quant, EXPERTS * HIDDEN, EXPERT_K, seed + 2),
+        shared_gate: synthetic::matrix(quant, EXPERT_K, K, seed + 3),
+        shared_up: synthetic::matrix(quant, EXPERT_K, K, seed + 4),
+        shared_down: synthetic::matrix(quant, HIDDEN, EXPERT_K, seed + 5),
+    }
+}
+
 impl Experts {
     /// The bytes of expert `e` of a stack (or the shared tensor for the
     /// table's last group), `one` bytes each.
@@ -798,8 +814,8 @@ fn check_grouped(
         let down = Experts::of(&ex.down, &ex.shared_down, e);
         let rd = oracle::reference(ex.quant, down, HIDDEN, EXPERT_K, &hx)?;
         let wd = abs.of(2, e, down, HIDDEN, EXPERT_K)?.to_vec();
-        for n in 0..HIDDEN {
-            let width = dot_width(f_down, ops_down, sub, rd.magnitude[n], h_abs, wd[n]);
+        for (n, &wd_n) in wd.iter().enumerate().take(HIDDEN) {
+            let width = dot_width(f_down, ops_down, sub, rd.magnitude[n], h_abs, wd_n);
             let got = f64::from(run.y[p * HIDDEN + n]);
             let err = (got - rd.y[n]).abs();
             if !got.is_finite() || err > width {
@@ -1033,6 +1049,12 @@ pub fn tensor_grouped_q6k(h: &Harness<'_>, fixture: &Fixture) -> Clause {
 
 pub fn tensor_grouped_a4(h: &Harness<'_>, mlx: &Fixture) -> Clause {
     grouped_arms(h, &experts_of(mlx, Quant::A4)?)
+}
+
+/// Every grouped arm of `quant` on `h`'s kernels over synthetic stacks:
+/// [`grouped_arms`]'s cases.
+pub fn grouped_synthetic(h: &Harness<'_>, quant: Quant, seed: u64) -> Clause {
+    grouped_arms(h, &synthetic_experts(quant, seed))
 }
 
 // ------------------------------------------------------------ grouped oracle

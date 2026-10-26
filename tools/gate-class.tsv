@@ -22,6 +22,7 @@ gate-ds41-host	family	deepseek41	host	-
 gate-ds41-kld	family	deepseek41	host	-
 gate-ds41-load	family	deepseek41	host	-
 gate-ds41-meta	family	deepseek41	meta	arch_registry
+gate-ds41-open	family	deepseek41	meta	arch_registry
 gate-ds41-oracle	tooling		harness	-
 gate-ds41-place	family	glm5next	place	placement_sizing+tier_legs
 gate-ds41-plan	family	deepseek41	host	-
@@ -112,6 +113,8 @@ gate-gpu-kquant	common		kernel	quant_q4k+quant_q5k+quant_q8
 gate-gpu-lev-serve	family	qwen35	serve	seats_serve_engine+constrain
 gate-gpu-lib	common		lib	graph_fault+weights_load+kv_pool_checkpoint+tier_legs
 gate-gpu-linear	common		kernel	attn_linear_gdn_kda
+gate-gpu-llama-dense	family	llama	e2e	attn_gqa+graph_fault
+gate-gpu-llama-serve	family	llama	serve	seats_serve_engine+serve_http_api+serve_toolcall
 gate-gpu-mamba2	common		kernel	recur_mamba2
 gate-gpu-mamba2-ssd	common		kernel	recur_mamba2
 gate-gpu-mcol	common		kernel	quant_q4k+quant_q6k
@@ -209,6 +212,7 @@ gate-kv	family	deepseek2	host	kv_pool_checkpoint
 gate-levers	common		lever	levers
 gate-device	common		device	device_seam
 gate-gpu-device	common		device	device_seam
+gate-llama-meta	family	llama	meta	arch_registry
 gate-mimo2-meta	family	mimo2	meta	arch_registry
 gate-minimax31-folder	family	minimax-m3	host	arch_registry
 gate-model-hf	common		host	arch_registry+checkpoint_folder

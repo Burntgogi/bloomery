@@ -310,6 +310,12 @@ blk_macremote() { tool_selftest mac-remote.sh; }
 # read's pass, the `--hold up|down` rules and a looping caller stopping at its next call, on a scratch copy under a fake HOME with
 # ssh and rsync stubs, no box.
 blk_boxsh() { tool_selftest box.sh; }
+# oxide-host.sh writes the generated .cargo/cuda-oxide.toml for a triple and refuses an llc that is unset, missing, of another
+# major or without a version banner, each by name: its cases run on scratch trees and stub llc scripts, no build and no card.
+blk_oxidehost() { tool_selftest oxide-host.sh; }
+# oxide-backend.sh builds the patched backend and refuses, by name, one without this tree's patch, with another rev or missing: its cases
+# run on a scratch tree with stub cargo and rustc, no build and no card.
+blk_oxidebackend() { tool_selftest oxide-backend.sh; }
 # seed-target.sh clones a warm tree's target/ into a new worktree and restores the seed's mtime on the files that are equal:
 # its refusals (a DST with a target, a SRC without one, two volumes, a host that cannot clone) and the mtime pass (only
 # equal files) are tested on two scratch trees, no cargo.
@@ -512,7 +518,8 @@ blk_fixturevariants() {
       awk -F'\t' -v f="$family" '$0 !~ /^#/ && $1 == f && $2 != "self" { found = 1 } END { exit !found }' "$dirs" ||
         { echo "check-recipes: $file: family $family has no fixture directory row in $dirs" >&2; return 1; }
       for r in $recipes; do
-        grep -qE "^$r:" "$jf" || { echo "check-recipes: $file: $r is no recipe of the justfile" >&2; return 1; }
+        # A recipe with parameters (`gate-gpu-ds41-step *ARGS=…:`) is a recipe too.
+        grep -qE "^$r([ :]|\$)" "$jf" || { echo "check-recipes: $file: $r is no recipe of the justfile" >&2; return 1; }
       done
     done < "$file"
     [ "$n" -gt 0 ] || { echo "check-recipes: $file holds no variant" >&2; return 1; }
@@ -559,7 +566,7 @@ blk_fixturevariants() {
   want "a tag the table does not name, exit" "rc=64" BLOOMERY_MODEL="$family" BLOOMERY_TIER=fixture BLOOMERY_FIXTURE_VARIANT=nosuchtag || return 1
   want "a variant of another family" "is a variant of $family" BLOOMERY_MODEL=qwen4exp BLOOMERY_TIER=fixture BLOOMERY_FIXTURE_VARIANT="$tag" || return 1
   want "a string that is no tag" "lower-case letters and digits" BLOOMERY_MODEL="$family" BLOOMERY_TIER=fixture BLOOMERY_FIXTURE_VARIANT='../x' || return 1
-  want "a family with no fixture file" "has no fixture file to be a variant of" BLOOMERY_MODEL=qwen3moe BLOOMERY_TIER=fixture BLOOMERY_FIXTURE_VARIANT="$tag" || return 1
+  want "a family with no fixture file" "has no fixture file to be a variant of" BLOOMERY_MODEL=deepseek2 BLOOMERY_TIER=fixture BLOOMERY_FIXTURE_VARIANT="$tag" || return 1
   rm -f "$d/fixture-variants/$tag/glm5next/"*.gguf
   want "a variant file that is not there" "fixture-requant $family $tag" BLOOMERY_MODEL="$family" BLOOMERY_TIER=fixture BLOOMERY_FIXTURE_VARIANT="$tag" || return 1
   want "a variant file that is not there, exit" "rc=66" BLOOMERY_MODEL="$family" BLOOMERY_TIER=fixture BLOOMERY_FIXTURE_VARIANT="$tag" || return 1
@@ -619,6 +626,33 @@ blk_fixturevariants() {
   case $err in *"$two"*) ;; *) echo "check-recipes: dspark_model, two drafts: wanted $two in: $err" >&2; return 1 ;; esac
   ds '. "$1" && dspark_model' BLOOMERY_DSPARK_MODEL=/x.gguf
   [ "$ds_rc" = 0 ] && [ "$ds_out" = /x.gguf ] || { echo "check-recipes: dspark_model, caller draft: rc=$ds_rc out='$ds_out', want /x.gguf" >&2; return 1; }
+  # A deepseek41 variant: its map never retypes the draft, so a variant directory with no draft answers the fixture's one, one with
+  # an identical draft of its own answers that, and one whose draft differs from the fixture's, or a variant over a fixture with no
+  # draft, is refused by name (dspark_model, exit 66).
+  local vtag vdir
+  vtag=$(awk -F'\t' '$0 !~ /^#/ && $2 == "deepseek41" { print $1; exit }' "$tsv")
+  [ -n "$vtag" ] || { echo "check-recipes: $tsv names no deepseek41 variant: the draft rules of a variant have no case to run on" >&2; return 1; }
+  vdir=$d/fixture-variants/$vtag/v41
+  rm -f "$two"
+  mkdir -p "$vdir"
+  touch "$vdir/t-00001-of-00001.gguf"
+  ds '. "$1" && dspark_model' BLOOMERY_FIXTURE_VARIANT="$vtag"
+  [ "$ds_rc" = 0 ] && [ "$ds_out" = "$one" ] || { echo "check-recipes: dspark_model, a variant with no draft: rc=$ds_rc out='$ds_out', want the fixture's $one" >&2; return 1; }
+  mkdir -p "$vdir/draft"
+  cp "$one" "$vdir/draft/one.gguf"
+  ds '. "$1" && dspark_model' BLOOMERY_FIXTURE_VARIANT="$vtag"
+  [ "$ds_rc" = 0 ] && [ "$ds_out" = "$vdir/draft/one.gguf" ] || { echo "check-recipes: dspark_model, a variant with the fixture's draft: rc=$ds_rc out='$ds_out', want $vdir/draft/one.gguf" >&2; return 1; }
+  printf x > "$vdir/draft/one.gguf"
+  ds '. "$1" && dspark_model' BLOOMERY_FIXTURE_VARIANT="$vtag"
+  err=$(cat "$d/ds.err")
+  [ "$ds_rc" = 66 ] && [ -z "$ds_out" ] || { echo "check-recipes: dspark_model, a variant with another draft: rc=$ds_rc out='$ds_out', want 66 and nothing: $err" >&2; return 1; }
+  case $err in *"the variant $vtag holds the draft $vdir/draft/one.gguf, which differs from the fixture's $one"*) ;; *) echo "check-recipes: dspark_model, a variant with another draft: wanted the variant and both drafts in: $err" >&2; return 1 ;; esac
+  rm -rf "$vdir/draft" "$one"
+  ds '. "$1" && dspark_model' BLOOMERY_FIXTURE_VARIANT="$vtag"
+  err=$(cat "$d/ds.err")
+  [ "$ds_rc" = 66 ] && [ -z "$ds_out" ] || { echo "check-recipes: dspark_model, a variant over a fixture with no draft: rc=$ds_rc out='$ds_out', want 66 and nothing: $err" >&2; return 1; }
+  case $err in *"$vdir/draft"*"the fixture's own draft directory holds"*) ;; *) echo "check-recipes: dspark_model, a variant over a fixture with no draft: wanted both draft directories in: $err" >&2; return 1 ;; esac
+  echo "check-recipes: deepseek41 variant draft: the fixture's, an identical own, a differing own refused, none refused"
   local prof line real f_rc f_out
   prof=$(dirname "$0")/ref/models/deepseek41.sh
   line=$(sed -n '215p' "$prof")
@@ -1141,7 +1175,7 @@ proc_leg_gpu() {
 }
 
 BLOCKS=(prelude recipescheck gateclass selftest smoke cardorder cardtests lease boxtracks unsafecount archscan loadscan commentscan leverscan loadgroups lcppfit coldblocks leverarms slotsarm binlabel lcppwarm q38srv
-  maccheck gatebatch gpugate stackwatch ptxscan ptxspill scanargs narrowscan canoncheck ptxcompare ldsscan mutantrun macstatic macremote boxsh seedtarget carry releasebuild pytools boxqcodes fixturevariants fixturedirs dsparkread
+  maccheck gatebatch gpugate stackwatch ptxscan ptxspill scanargs narrowscan canoncheck ptxcompare ldsscan mutantrun macstatic macremote boxsh oxidehost oxidebackend seedtarget carry releasebuild pytools boxqcodes fixturevariants fixturedirs dsparkread
   refsetpublish orphan archowner treecommit archivepipe fnowner wt macgate boundedscan gatebound dumpdequant tokoracle ikpintree qdotrefargs)
 # blk_keyspec NAME: what a block's input key reads (tools/recipes.py static-key). Every block's is the whole tree: a
 # narrower key needs proof that the block reads nothing outside it, and a green run on a copy whose other files are

@@ -599,18 +599,31 @@ gguf 7 2 0
 # `refuse_or`; nvfp4mma.rs `Mxfp8Out::block`; hc_gated.rs `up_mma_mix_body` with its read-back of the tile's
 # mixed values, and the two new entries' calls of their bodies), counted by tools/check-unsafe.sh. Each new
 # block has its SAFETY line.
-# PIN(2026-10-25): gpu 2418 -> 2420 blocks, the six-slot F32 tier entry adds two
-# handoff body calls under its checked launch contract; the newmain baseline is preserved.
-# PIN(2026-10-24): gpu 2420 -> 2475 blocks, 311 -> 315 fns, new code: checked
-# head128 ring append/attention, optional-bias floor router, expert-input scaling
-# and common loaded launchers. Existing entries retain their contracts; each new site states SAFETY.
-# PIN(2026-10-25): gpu 2621 -> 2678 blocks, 326 -> 330 fns: current-main integration
-# retains the six-slot F32 tier entry, head128 ring attention, floor router and
-# expert-input scaling above; recounted by tools/check-unsafe.sh, with each new site's SAFETY contract.
-# PIN(2026-10-26): gpu 2640 -> 2697 blocks, 334 -> 338 fns: Flint's same 57 blocks
-# and four functions over af74ea4's MXFP8/HC epilogue baseline, recounted by tools/check-unsafe.sh.
-# Both histories above retain their SAFETY contracts; no spare allowance is added.
-gpu 2697 338 10
+# PIN(2026-10-25): gpu 2640 -> 2652 blocks, new code, not old code relaxed: the card kernels of IQ2_S, IQ1_S and IQ1_M and
+# the prompt GEMM of IQ2_XS, IQ2_S, IQ1_S and IQ1_M: five grid-table reads in iq.rs (`iq2xs_grid_half`, `iq2s_grid_half`,
+# `iq2s_group`, `iq1_group`, `iq1_group_half`), the three raw-block window reads of iq_sel.rs (`RawSb::sub` of the
+# three) and the four load macros of grouped.rs, each with its SAFETY line; recounted by tools/check-unsafe.sh.
+# PIN(2026-10-25): gpu 2652 -> 2653 blocks, 334 -> 335 fns, new code, not old code relaxed: the IQ4_NL Engram row
+# decode (elem.rs `iq4nl_embed_value`, an unsafe fn, and its one window read), with its SAFETY line.
+# PIN(2026-10-26): gpu 2653 -> 2655 blocks, 335 -> 336 fns, new kernel entries, not old code relaxed: the Nanbeige
+# landing's net, as on its own base (1994/223 -> 1996/224). The group-of-7 tensor-core flash shares seg_mma at a pack
+# and the head-128 prompt walk is one macro body (prefill_128) each entry expands, the two static entries one block
+# each for their tiles (+2); the NORM rope append and its q8 twin hold one unsafe fn (rope_norm.rs, +1). Each block
+# has its SAFETY line.
+# PIN(2026-10-26): gpu 2655 -> 2691 blocks, 336 -> 346 fns, new code, not old code relaxed: the prefill
+# flash's raw query rows (flash_gqa_prefill.rs: `QueryRows::head` and `value` declared with their two impls,
+# the pack-of-four and listed bodies' scale and position slots and their reads and value calls, the gated
+# entries' norm reads, the hw test's query norm launch) and rope_neox.rs's one-warp query norm
+# (`query_scale_256`, `query_value_256` and their reads), counted by tools/check-unsafe.sh. Each new block has
+# its SAFETY line.
+# PIN(2026-10-26): gpu 2655 -> 2691 blocks, new code, not old code relaxed: the HC norm's read of its gains
+# ahead of the sum for a stream of one chunk a thread (hc_gated.rs `norm_stream`), counted by
+# tools/check-unsafe.sh. The block has its SAFETY line.
+# PIN(2026-10-26): gpu 2655 -> 2691 blocks, 336 -> 346 fns, new code, not old code relaxed: a native NVFP4
+# route tile's column slots and input scales in shared memory (nvfp4mma.rs `TileColumns::put` and `get`, the two
+# kernels' column allocations, their writes ahead of the K walk and their epilogues' reads), counted by
+# tools/check-unsafe.sh. Each new block has its SAFETY line.
+gpu 2691 346 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.
@@ -633,12 +646,11 @@ gpu 2697 338 10
 # PIN(2026-10-24): gpu-deepseek41 382 -> 384 blocks, new code, not old code relaxed: the four-slot tier card sum
 # (chain/ffn/batch.rs: ds41_ffn_card_acc_4_tier's card_acc_tier_at call and its store, 2 blocks), each block with its
 # SAFETY line.
-# PIN(2026-10-24): gpu-deepseek41 384 -> 386 blocks: load the configured
-# residual module and launch its checked output rows, each with SAFETY.
-gpu-deepseek41 386 44 0
-# PIN(2026-10-24): gpu-flint starts at 2 blocks, 0 fns and 0 impls: step and prompt
-# call the checked common attention binding with staged distinct positions, each with SAFETY.
-gpu-flint 2 0 0
+# PIN(2026-10-25): gpu-deepseek41 384 -> 395 blocks, new code, not old code relaxed: ISTA's dense types (the Q5_K
+# selector partials of dense.rs and experts.rs, `q5k_lane_partial`'s calls and their row stores) and the glue's Q5_K
+# token rows and IQ4_NL Engram rows (glue.rs: the value reads, the stream and input stores, the shared module), each
+# with its SAFETY line; counted by tools/check-unsafe.sh.
+gpu-deepseek41 395 44 0
 # PIN(2026-10-01): gpu-gates 60 -> 61 blocks, new code, not old code relaxed: gate_glm5next_serve starts
 # bloomery-serve with PR_SET_PDEATHSIG set between fork and exec (one pre_exec block, its SAFETY line), as the
 # Qwen3.8 serve gate does, so a bound that ends the gate does not leave the server holding the card.
@@ -906,7 +918,10 @@ placement 0 0 0
 # entry's tile on offset codes, its column prep (nvfp4_prep_avx2), the x4 lane sums both share (nvfp4_group_sums, an
 # `#[inline(always)]` fn) and the run walk (nvfp4_planes_tiled; nvfp4_tile_run replaces nvfp4_planes_tile), each with
 # its SAFETY line.
-qdot 255 115 0
+# PIN(2026-10-25): qdot 255 -> 261 blocks, 115 -> 120 fns, new code, not old code relaxed: the generic AVX2 dots of
+# IQ1_S, IQ1_M and IQ2_S (generic.rs: `signed_by_bits`, `iq1_codes_avx2` and the three types' `codes_avx2`, each an
+# unsafe fn with its body block), each with its SAFETY line.
+qdot 261 120 0
 record 0 0 0
 refset 0 0 0
 runtime 0 0 0
