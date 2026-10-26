@@ -935,6 +935,12 @@ mod tests {
         ]
     }
 
+    fn tier_act(moe: &Moe) -> Result<Act, GpuError> {
+        Ok(Act::SwigluClamp {
+            limit: moe.act.swiglu_limit(),
+        })
+    }
+
     fn weights(gpu: &Gpu, triples: &[[GgmlType; 3]]) -> Weights {
         let mut decls = Vec::new();
         let mut data = Vec::new();
