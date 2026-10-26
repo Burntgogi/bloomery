@@ -404,7 +404,7 @@ mod tests {
             &inputs.model,
             &machine,
             64,
-            &inputs.seq_terms(),
+            &inputs.seq_terms().slots_of(1),
             &levers,
         )
         .expect("the host-only reference plans");
