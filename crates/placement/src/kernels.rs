@@ -634,7 +634,13 @@ mod tests {
         );
     }
 
-    // PIN(2026-10-27): IQ4_XS adds the existing selected GEMV as an ordinary site.
+    // PIN(2026-10-16): the dense pairs gain NVFP4 (`nvfp4_gemv` through
+    // `site::kgemv`); every other pair is unchanged.
+    // PIN(2026-10-19): and bloomery's own MXFP8 (`mxfp8_gemv` through
+    // `site::gemv`); every other pair is unchanged.
+    // PIN(2026-10-20): and bloomery's own FP8_B128 (`fp8_b128_gemv` through
+    // `site::gemv`); BF16 also uses `bf16_gemv` and `bf16_tile_gemm` over its words.
+    // PIN(2026-10-26): IQ4_XS adds the existing selected GEMV as an ordinary site (UTC).
     #[test]
     fn dense_admits_exactly_the_pinned_pairs() {
         assert_eq!(
@@ -743,7 +749,7 @@ mod tests {
     // columns); every other pair is unchanged.
     // PIN(2026-10-25): IQ2_XS, IQ1_S, IQ2_S and IQ1_M load as the file's
     // blocks, as IQ2_XXS does; every other pair is unchanged.
-    // PIN(2026-10-27): ordinary IQ4_XS matrices retain their file blocks.
+    // PIN(2026-10-26): ordinary IQ4_XS matrices retain their file blocks (UTC).
     #[test]
     fn the_card_layouts_are_the_pinned_pairs() {
         assert_eq!(
