@@ -885,6 +885,7 @@ mod tests {
     use gguf::GgmlType;
     use gguf::write::{Layout, TensorDecl, Writer};
     use model::arch::models::{self, Mixer, Moe, Residual, Router, RouterNorm, Score};
+    use model::placement::{self, ExpertList, ModelTensor, ModelTensors, Role};
 
     use crate::card_leg::tests::stack_bytes;
     use crate::host::leg_tier::LegTier;
@@ -936,10 +937,21 @@ mod tests {
     fn weights(gpu: &Gpu, triples: &[[GgmlType; 3]]) -> Weights {
         let mut decls = Vec::new();
         let mut data = Vec::new();
+        let mut tensors = Vec::new();
         for (l, triple) in triples.iter().enumerate() {
             for (part, (name, &ty)) in (FAMILY.stacks)(l).into_iter().zip(triple).enumerate() {
                 let (rows, k) = if part == 2 { (N, FF) } else { (FF, N) };
                 let bytes = stack_bytes(ty, CARD * rows, k, 7 + (3 * l + part) as u64);
+                tensors.push(ModelTensor {
+                    name: name.clone(),
+                    shard: 0,
+                    layer: Some(l),
+                    role: Role::RoutedExperts,
+                    ty,
+                    dims: vec![k as u64, rows as u64, CARD as u64],
+                    file_bytes: bytes.len() as u64,
+                    gathered_rows: None,
+                });
                 decls.push(TensorDecl {
                     name,
                     dims: vec![k as u64, rows as u64, CARD as u64],
@@ -963,7 +975,32 @@ mod tests {
         }
         writer.finish().expect("a finished file");
         let file = gguf::Split::open(&path).expect("the file");
-        let weights = Weights::load_where(gpu.stream(), &file, |_| true).expect("resident stacks");
+        // IQ3_S has a selected expert row arm, not a generic device format.
+        // Load the role-qualified placement as a real resident expert load does.
+        let model = ModelTensors {
+            tensors,
+            layers: triples.len(),
+            experts: EXPERTS as u64,
+            experts_used: USED as u64,
+            bf16_words: |_| false,
+        };
+        let rows = model
+            .tensors
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                placement::routed_row(
+                    i,
+                    t,
+                    0,
+                    ExpertList::prefix(CARD as u64).expect("the card prefix"),
+                    &model,
+                )
+                .expect("the resident expert row")
+            })
+            .collect::<Vec<_>>();
+        let weights = Weights::load_rows(gpu.stream(), &file, &model, &rows, 0)
+            .expect("resident expert stacks");
         std::fs::remove_file(path).expect("remove the fixture");
         weights
     }
