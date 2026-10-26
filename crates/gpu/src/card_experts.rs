@@ -41,11 +41,9 @@ use std::mem::ManuallyDrop;
 
 use cuda_core::{CudaStream, DeviceBuffer};
 use model::arch::models::{Ffn, LayerSpec};
-use model::placement::accepts::{self, LegArms, Program};
-use model::placement::kernels::{self, DownForms};
-
 use model::arch::place_hybrid::RingForms;
-use model::placement::kernels::DownAct;
+use model::placement::accepts::{self, LegArms, Program};
+use model::placement::kernels::{self, DownAct, DownForms};
 
 use crate::card_leg::ExpertInput;
 use crate::card_leg::{
@@ -762,7 +760,7 @@ impl CardExperts {
                 sel,
             )
         };
-        let stacks = LegStacks::of(w, layer.names())?;
+        let stacks = LegStacks::of_arms(w, layer.names(), self.k.arms, STACK_ROLES)?;
         places(map.buf(), row_off, &mut *sel)?;
         let card = LegRun {
             layer: l,
@@ -890,6 +888,7 @@ mod tests {
         Segment,
     };
 
+
     use crate::card_leg::tests::stack_bytes;
     use crate::host::leg_tier::LegTier;
     use crate::host::tier::{TierBlock, TierExperts, TierInput, TierIo, TierSet};
@@ -987,7 +986,7 @@ mod tests {
             experts_used: USED as u64,
             bf16_words: |_| false,
         };
-        let RoutedRule::Leg { gate_up, down } = accepts::routed_rule(FAMILY.program) else {
+        let RoutedRule::Leg { gate_up, down, .. } = accepts::routed_rule(FAMILY.program) else {
             panic!("the fixture family must select a card leg");
         };
         let rows = model

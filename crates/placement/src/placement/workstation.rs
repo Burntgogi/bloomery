@@ -19,7 +19,9 @@ use super::nodes::{Fabric, Nodes};
 use super::{
     Card, Device, Host, HostTotals, Machine, Node, PlacementError, Plan, Reserve, UnifiedPool,
 };
-use crate::kernels::{DownForms, leg_bytes, q8_act_bytes, try_leg_bytes, try_q8_act_bytes};
+use crate::kernels::{
+    DownAct, DownForms, leg_bytes, q8_act_bytes, try_leg_bytes, try_q8_act_bytes,
+};
 
 pub const MIB: u64 = 1 << 20;
 
@@ -535,8 +537,8 @@ pub const fn walk_a_tile_scratch_bytes(n_embd: u64, ff: u64, n_used: u64, cols: 
 /// The tier's chunk scratch for blocks of rows of `n_embd`, `n_used` slots a
 /// token, through experts of `ff`, cut in chunks of `chunk` tokens: one run of
 /// the card leg's buffers (`bloomery_gpu::card_leg::LegBufs`) with its slots'
-/// columns in exactly the forms the selected downs read ([`leg_bytes`]),
-/// in place of the tile path's scratch.
+/// columns in the 128-value form ([`leg_bytes`]), in place of the tile path's
+/// scratch. Selected-form callers use [`tier_leg_batch_bytes_of`].
 #[must_use]
 pub const fn tier_chunk_scratch_bytes(
     n_embd: u64,
@@ -568,16 +570,47 @@ pub const fn tier_batch_bytes(n_embd: u64, ff: u64, n_used: u64, cols: u64) -> T
     }
 }
 
-/// [`tier_batch_bytes`] for a tier on the common card leg (`bloomery_gpu::host::leg_tier`): the
-/// scratch is one run of the leg's buffers for `chunk` tokens ([`tier_chunk_scratch_bytes`]), in
-/// place of the tile path's. The one formula of those bytes for every family whose tier is the card
-/// leg; a family names its own `chunk` and widths.
+/// [`tier_batch_bytes`] for a fixed common-leg reserve in the 128-value form.
+#[must_use]
 pub fn tier_leg_batch_bytes(
     n_embd: u64,
     ff: u64,
     n_used: u64,
     chunk: u64,
     cols: u64,
+) -> TierBatchBytes {
+    TierBatchBytes {
+        staging: tier_batch_staging_bytes(n_embd, n_used, cols),
+        scratch: tier_chunk_scratch_bytes(n_embd, ff, n_used, chunk),
+        host: tier_batch_host_bytes(n_embd, n_used, cols),
+        leg: None,
+    }
+}
+
+/// The common leg's buffers in `downs`, with the same checked geometry and
+/// candidate-dependent reserve as [`try_tier_leg_batch_bytes_of`].
+///
+/// # Panics
+/// Panics on invalid geometry or overflowing byte counts.
+#[must_use]
+pub fn tier_leg_batch_bytes_of(
+    n_embd: u64,
+    ff: u64,
+    n_used: u64,
+    shape: (u64, u64),
+    downs: DownForms,
+) -> TierBatchBytes {
+    try_tier_leg_batch_bytes_of(n_embd, ff, n_used, shape, downs, false)
+        .expect("valid common leg batch geometry and byte counts")
+}
+
+/// The common leg's staging, host rows and selected-form scratch, refusing
+/// invalid geometry or overflowing byte counts before placement.
+pub fn try_tier_leg_batch_bytes_of(
+    n_embd: u64,
+    ff: u64,
+    n_used: u64,
+    (chunk, cols): (u64, u64),
     downs: DownForms,
     input_scales: bool,
 ) -> Result<TierBatchBytes, PlacementError> {
@@ -1713,9 +1746,9 @@ mod tests {
         let both = DownForms::of(DownAct::Q8Act).with(DownAct::Q8Blocks32);
         for chunk in [1, 8, 16] {
             for downs in [DownForms::NONE, DownForms::of(DownAct::Q8Act), both] {
-                let direct = super::tier_leg_batch_bytes(256, 256, 6, chunk, 32, downs, false)
+                let direct = super::try_tier_leg_batch_bytes_of(256, 256, 6, (chunk, 32), downs, false)
                     .expect("direct descriptor");
-                let scaled = super::tier_leg_batch_bytes(256, 256, 6, chunk, 32, downs, true)
+                let scaled = super::try_tier_leg_batch_bytes_of(256, 256, 6, (chunk, 32), downs, true)
                     .expect("scaled descriptor");
                 assert_eq!(scaled.staging, direct.staging);
                 assert_eq!(scaled.host, direct.host);

@@ -190,6 +190,7 @@ impl LegFamily for Qwen35 {
             n_used: moe.top_k as usize,
             n_embd: inputs.spec.hidden as usize,
             ff: moe.expert_ff as usize,
+            program: Program::Qwen35Body,
         }
     }
 

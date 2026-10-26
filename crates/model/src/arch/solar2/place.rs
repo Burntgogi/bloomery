@@ -47,12 +47,11 @@ pub const TIER_CHUNK: u64 = 8;
 /// checks its allocations against them.
 pub fn tier_batch(inputs: &PlanInputs) -> Result<TierBatchBytes, PlacementError> {
     let hp = &inputs.hp;
-    workstation::tier_leg_batch_bytes(
+    workstation::try_tier_leg_batch_bytes_of(
         hp.n_embd as u64,
         hp.experts.ff as u64,
         hp.experts.n_used as u64,
-        TIER_CHUNK,
-        crate::moe::UNION_MAX_COLS as u64,
+        (TIER_CHUNK, crate::moe::UNION_MAX_COLS as u64),
         leg_down_forms(Program::Solar2Body, &inputs.model),
         false,
     )

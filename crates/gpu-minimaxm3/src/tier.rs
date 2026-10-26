@@ -38,7 +38,8 @@ pub const CHUNK: usize = place::TIER_CHUNK as usize;
 /// The tier's prompt-batch bytes the plan reserves on the tier card and the host for the file
 /// `inputs` describes: [`place::tier_batch`] over blocks of a prompt unit's rows ([`T_MAX`]), the
 /// columns the load makes the tier's batch legs for.
-pub fn tier_batch(inputs: &PlanInputs) -> Result<TierBatchBytes, PlacementError> {
+#[must_use]
+pub fn tier_batch(inputs: &PlanInputs) -> TierBatchBytes {
     place::tier_batch(inputs, T_MAX as u64)
 }
 

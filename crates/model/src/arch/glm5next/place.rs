@@ -151,19 +151,16 @@ fn down_forms(downs: impl Iterator<Item = GgmlType>) -> DownForms {
 /// to its own constant.
 pub const TIER_CHUNK: u64 = 8;
 
-/// The expert tier's prompt-batch bytes ([`TierBatchBytes`]) for blocks of
-/// the host union's columns: the tier card's staging, the chunked card
-/// path's scratch ([`workstation::tier_chunk_scratch_bytes`]) and the host's
-/// rows and places, which the plan reserves on the tier card and the host
-/// and the load checks its allocations against.
+/// The expert tier's prompt-batch bytes for the selected program's routed
+/// layers: staging, the common leg's candidate-dependent scratch and the
+/// host rows and places. The load checks its allocations against the plan.
 pub fn tier_batch(inputs: &PlanInputs) -> Result<TierBatchBytes, PlacementError> {
     let hp = &inputs.hp;
-    workstation::tier_leg_batch_bytes(
+    workstation::try_tier_leg_batch_bytes_of(
         hp.n_embd as u64,
         hp.expert_ff as u64,
         hp.n_used as u64,
-        TIER_CHUNK,
-        crate::moe::UNION_MAX_COLS as u64,
+        (TIER_CHUNK, crate::moe::UNION_MAX_COLS as u64),
         crate::placement::accepts::leg_down_forms(Program::Glm5nextBody, &inputs.model),
         false,
     )
@@ -1884,7 +1881,7 @@ mod tests {
             use GgmlType::{IQ3_S, IQ4_XS, NVFP4, Q4_K, Q5_K, Q6_K, Q8_0};
             let q8 = DownForms::of(DownAct::Q8Act);
             let b32 = DownForms::of(DownAct::Q8Blocks32);
-            let base = tier_batch(&inputs()).expect("the described tier geometry");
+            let base = tier_batch(&inputs()).expect("valid tier batch");
             let hp = inputs().hp;
             let leg = |forms| {
                 leg_bytes(
@@ -1911,7 +1908,7 @@ mod tests {
                     q8.with(DownAct::Q8Blocks32),
                 ),
             ] {
-                let batch = tier_batch(&routed_types(&layers)).expect("the selected tier geometry");
+                let batch = tier_batch(&routed_types(&layers)).expect("valid selected tier batch");
                 assert_eq!(batch.scratch, leg(forms), "{layers:?}");
                 assert_eq!(batch.staging, base.staging, "{layers:?}");
                 assert_eq!(batch.host, base.host, "{layers:?}");

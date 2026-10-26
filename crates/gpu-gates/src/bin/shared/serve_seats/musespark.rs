@@ -462,9 +462,7 @@ impl Tiered for Muse {
         place: Place,
         inputs: &PlanInputs<Self::H>,
     ) -> Result<Option<TierBatchBytes>, GateError> {
-        Ok((!place.tier_cards().is_empty())
-            .then(|| place::tier_batch(&inputs.hp))
-            .transpose()?)
+        Ok((!place.tier_cards().is_empty()).then(|| place::tier_batch(&inputs.hp)))
     }
 
     /// The ring is kept out of the expert budget where the common rule starts

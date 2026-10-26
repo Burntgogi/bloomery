@@ -3239,6 +3239,40 @@ impl Fill<'_, '_> {
             .routed
             .unwrap_or(RoutedRule::PerType(CardFormat::of_routed));
         let uploads = card_uploads(self.model, self.c, self.rows, self.eligible, format)?;
+        let mut down_acts = if card.tier_leg.is_some() {
+            vec![None; self.model.layers]
+        } else {
+            Vec::new()
+        };
+        if card.tier_leg.is_some() {
+            for t in &self.model.tensors {
+                if t.role == Role::RoutedExperts
+                    && ExpertPart::of_name(&t.name) == Some(ExpertPart::Down)
+                    && let Some(l) = t.layer
+                    && let Some((_, act)) = crate::kernels::down(t.ty)
+                {
+                    down_acts[l] = Some(act);
+                }
+            }
+        }
+        let scratch = |counts: &[u64]| {
+            card.tier_leg.map_or(Ok(0), |leg| {
+                let forms = counts
+                    .iter()
+                    .zip(&down_acts)
+                    .filter_map(|(&n, &act)| (n > 0).then_some(act).flatten())
+                    .fold(crate::kernels::DownForms::NONE, |forms, act| {
+                        forms.with(act)
+                    });
+                leg.bytes(forms)
+            })
+        };
+        let bound = card
+            .tier_leg
+            .map(|leg| leg.bytes(leg.downs))
+            .transpose()?
+            .unwrap_or(0);
+        let reserves = card.selected_reserve_bytes(self.model, n_l)?;
         let footprint = Footprint::new(card.granule_bytes, &uploads);
         let mut down_acts = if card.tier_leg.is_some() {
             vec![None; self.model.layers]
@@ -3307,8 +3341,9 @@ impl Fill<'_, '_> {
 /// the plan ([`Fill::reserve`]): [`Card::floor_bytes`] with the margin and
 /// those as its `past`. Both floor checks ([`check_floor`],
 /// [`check_free_floor`]) and the share split's floors ([`resolve_shares`])
-/// take it from here, so the floor they name is the least budget at which
-/// the expert rule's own budget reaches the dense uploads. `None` past u64 bytes.
+/// take it from here, using each candidate's selected reserves, so the floor
+/// is the least budget at which its uploads and scratch fit beside the
+/// fixed terms. `None` past u64 bytes.
 fn plan_floor(card: &Card, dense: u64, kv: u64, beside: u64, reserves: u64) -> Option<u64> {
     card.margin_bytes
         .checked_add(beside)
@@ -6574,7 +6609,7 @@ mod tests {
     #[test]
     fn a_union_recounts_uploads_selected_forms_and_capacity() {
         use crate::kernels::{DownAct, DownForms};
-        use workstation::{TIER_BATCH_RESERVE, tier_leg_batch_bytes};
+        use workstation::{TIER_BATCH_RESERVE, try_tier_leg_batch_bytes_of};
 
         let mut model = legged(&[
             [GgmlType::IQ3_S, GgmlType::IQ3_S, GgmlType::Q5_K],
@@ -6582,7 +6617,7 @@ mod tests {
         ]);
         model.experts_used = 6;
         let forms = DownForms::of(DownAct::Q8Act).with(DownAct::Q8Blocks32);
-        let batch = tier_leg_batch_bytes(256, 256, 6, 2, 3, forms, false).unwrap();
+        let batch = try_tier_leg_batch_bytes_of(256, 256, 6, (2, 3), forms, false).unwrap();
         let mut stage = bytes_card("stage", 1 << 30, 0..2);
         stage.tier_leg = batch.leg;
         stage
@@ -6720,10 +6755,10 @@ mod tests {
         use crate::accepts::{Program, routed_rule};
         use crate::kernels::{DownAct, DownForms};
         use GgmlType::{Q5_K, Q8_0};
-        use workstation::{TIER_BATCH_RESERVE, tier_leg_batch_bytes};
+        use workstation::{TIER_BATCH_RESERVE, try_tier_leg_batch_bytes_of};
 
         let both = DownForms::of(DownAct::Q8Act).with(DownAct::Q8Blocks32);
-        let batch = tier_leg_batch_bytes(256, 256, 1, 2, 3, both, false).expect("tier bytes");
+        let batch = try_tier_leg_batch_bytes_of(256, 256, 1, (2, 3), both, false).expect("tier bytes");
         let leg = batch.leg.expect("a tier leg descriptor");
         let rule = routed_rule(Program::Qwen35Body);
         for (downs, first) in [
@@ -6796,10 +6831,10 @@ mod tests {
     fn a_tier_refuses_invalid_scratch_descriptors_before_placement() {
         use crate::accepts::{Program, routed_rule};
         use crate::kernels::{DownAct, DownForms};
-        use workstation::{TIER_BATCH_RESERVE, TierLegScratch, tier_leg_batch_bytes};
+        use workstation::{TIER_BATCH_RESERVE, TierLegScratch, try_tier_leg_batch_bytes_of};
 
         let forms = DownForms::of(DownAct::Q8Act);
-        let batch = tier_leg_batch_bytes(256, 256, 1, 1, 1, forms, false).expect("valid batch");
+        let batch = try_tier_leg_batch_bytes_of(256, 256, 1, (1, 1), forms, false).expect("valid batch");
         let good = batch.leg.expect("a leg descriptor");
         let mut model = legged(&[[GgmlType::Q5_K; 3]]);
         model.experts_used = 1;
@@ -6858,15 +6893,15 @@ mod tests {
             );
             assert!(
                 matches!(
-                    tier_leg_batch_bytes(
-                        leg.n_embd, leg.ff, leg.n_used, leg.chunk, 1, leg.downs, leg.input_scales,
+                    try_tier_leg_batch_bytes_of(
+                        leg.n_embd, leg.ff, leg.n_used, (leg.chunk, 1), leg.downs, leg.input_scales,
                     ),
                     Err(PlacementError::Metadata { key, .. }) if key == "tier leg scratch"
                 ),
                 "{leg:?}"
             );
         }
-        assert!(tier_leg_batch_bytes(256, 256, 8, 1, 1 << 61, forms, false).is_err());
+        assert!(try_tier_leg_batch_bytes_of(256, 256, 8, (1, 1 << 61), forms, false).is_err());
         let inconsistent = workstation::TierBatchBytes {
             scratch: 0,
             ..batch

@@ -512,7 +512,12 @@ pub fn leg_runs(p: Program, [gate, up, down]: [GgmlType; 3]) -> Option<bool> {
 pub fn leg_down_forms(p: Program, model: &crate::placement::ModelTensors) -> kernels::DownForms {
     use crate::placement::{ExpertPart, Role};
 
-    let RoutedRule::Leg { gate_up, down } = routed_rule(p) else {
+    let RoutedRule::Leg {
+        gate_up,
+        down,
+        pair,
+    } = routed_rule(p)
+    else {
         return kernels::DownForms::NONE;
     };
     let mut forms = kernels::DownForms::NONE;
@@ -535,6 +540,7 @@ pub fn leg_down_forms(p: Program, model: &crate::placement::ModelTensors) -> ker
             && g == u
             && gate_up(g).is_some()
             && down(d).is_some()
+            && pair.is_none_or(|pair| pair(g, d, false))
             && let Some((_, act)) = kernels::down(d)
         {
             forms = forms.with(act);

@@ -229,12 +229,11 @@ pub fn configure_group(inputs: &mut PlanInputs, group: usize) -> Result<(), Plac
 pub fn tier_batch(inputs: &PlanInputs) -> Result<TierBatchBytes, PlacementError> {
     let batch = routed_batch(&inputs.spec, &inputs.model, TIER_CHUNK, true, false)?;
     let leg = batch.card.ok_or_else(overflow)?;
-    workstation::tier_leg_batch_bytes(
+    workstation::try_tier_leg_batch_bytes_of(
         leg.n_embd,
         leg.ff,
         leg.n_used,
-        TIER_CHUNK,
-        PROMPT_ROWS as u64,
+        (TIER_CHUNK, PROMPT_ROWS as u64),
         leg.downs,
         true,
     )

@@ -121,6 +121,12 @@ checked sizing arithmetic is used by allocation and planning; malformed or overf
 descriptors are refused by name. The plan records the selected reserve, and loaders check that amount
 instead of the machine descriptor's upper bound. No always-both allocation or reserve-equality waiver
 is used.
+
+The wrapper fixture loads each expert part through the selected program's `routed_rule` format,
+`Segment::buffer_bytes` and `Weights::load_rows`, including selected-only IQ3_S. Its mixed loads
+compare real step, pass, batch and tier allocations and rows against the common leg. A mismatched
+gate/up pair remains refused; Solar's admitted Q6_K down is not a rejection case. Tier activation
+selection remains the family's contract, independently of the program-owned stack admission.
 Host-only projections intentionally have no card totals: fixed reserves remain owned by their machine.
 Only a dynamic tier-leg descriptor requires the plan's selected card totals. The existing node paging
 budget regression exercises this distinction without a GPU, including OS reserve and constrained host room.

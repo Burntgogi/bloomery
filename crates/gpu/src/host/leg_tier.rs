@@ -8,9 +8,9 @@
 //!
 //! The tier's layer is the card leg ([`CardLeg::enqueue_rows`]) over the
 //! tier's stacks: the q8_1 of the activation, the gate·up `_sel` with the
-//! routed activation the family names (clamped SwiGLU unless it names
-//! another), the selected down forms of the tier slots' columns and the down
-//! `_sel` into the tier's rows; over a prompt batch's block, the same run
+//! routed activation the family names, the selected down form of the tier
+//! slots' columns and the down `_sel` into the tier's rows; over a prompt
+//! batch's block, the same run
 //! chunk by chunk of `shape.cap` tokens. Each slot's down output is the one
 //! the stage card would write for it, so the card sum over both cards' slots
 //! in slot order is the one-card sum over their union. The row's tier image
@@ -180,7 +180,7 @@ impl TierLayer {
 /// block, the same chunk by chunk. Its scratch, one [`LegBufs`] for
 /// `shape.cap` tokens that a step's one token and each chunk share, is made
 /// at load. The activation is the family's ([`LegFamily::tier_act`]); the
-/// selected program names the stack arms.
+/// selected program owns the stack arms ([`accepts::leg_arms`]).
 pub struct LegTier {
     leg: CardLeg,
     bufs: LegBufs,
@@ -195,12 +195,12 @@ impl LegTier {
     /// The tier's computation on `gpu` over `set`, whose stacks `w` holds,
     /// for the description `layers`, through the leg of `shape` (`cap` tokens
     /// of `slots_per_col` slots a run, `n` wide, experts `ff` wide). The
-    /// activation is supplied by the family's [`LegFamily::tier_act`] and the
-    /// selected program names the stack arms. A tier layer whose three stacks
-    /// are absent, of a type those arms do not read, or of other rows than its
-    /// experts', and a layer off the tier with resident stacks, are refused by name. The
+    /// activation is the family's `act` ([`LegFamily::tier_act`]) and the
+    /// stacks are read by the selected `program`'s arms. Missing or unreadable
+    /// stacks, rows that differ from the tier's experts, and resident stacks
+    /// on a layer off the tier are refused by name. The
     /// leg's buffers hold the columns in the forms the tier layers' downs
-    /// read ([`kernels::down`]), the 128-value form on a tier of no layer.
+    /// read ([`kernels::down`]), no down form on a tier of no layer.
     /// Load-time only.
     pub fn new(
         gpu: &Gpu,
@@ -209,7 +209,7 @@ impl LegTier {
         w: &Weights,
         shape: LegShape,
         program: Program,
-        activation: fn(&Moe) -> Result<Act, GpuError>,
+        act: fn(&Moe) -> Result<Act, GpuError>,
     ) -> Result<LegTier, GpuError> {
         let arms = accepts::leg_arms(program).ok_or(GpuError::state(
             WHAT,
@@ -240,7 +240,7 @@ impl LegTier {
             };
             let layer = TierLayer {
                 k,
-                rule: activation(m)?,
+                rule: act(m)?,
                 names,
             };
             let stacks = LegStacks::of_arms(w, layer.names(), arms, STACK_ROLES)?;
@@ -251,9 +251,6 @@ impl LegTier {
             ))?;
             downs = downs.with(act);
             cfg.push(Some(layer));
-        }
-        if downs == DownForms::NONE {
-            downs = DownForms::of(DownAct::Q8Act);
         }
         Ok(LegTier {
             leg: CardLeg::load(gpu)?,
@@ -270,7 +267,6 @@ impl LegTier {
         self.bufs.set_expert_input(gpu, policy)
     }
 }
-
 /// Layer `layer`'s tier experts of `cfg` (the tier's layers from
 /// `layers.start`); a layer the tier holds none of is refused by name as
 /// `what`.
