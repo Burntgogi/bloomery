@@ -684,12 +684,17 @@ unchanged generic refusal, conflicting formats and insufficient union capacity.
 ### CPU and GPU use one forced-ID diagnostic artifact layout
 
 `tools/ref/flint_trace.cpp` and the `bloomery-gpu-flint` example `trace_flint` consume exactly
-96 whitespace-separated decimal IDs: one 22-ID batched prefill, then 74 one-ID calls.
-They do not retokenize, sample, or stop at an input EOG. Each observation saves the latest
-processed row: prompt position 21, then positions 22 through 95, predicting positions
-22 through 96. Earlier prompt rows are not claimed as captured history.
+96 whitespace-separated decimal IDs. The original HTTP `Slot::close_call` in
+`crates/serve/src/genloop.rs` prefills the first 21 prompt IDs, then calls `next` for the
+22nd ID before the 74 forced continuation IDs. Both consumers reproduce that boundary.
+They do not retokenize, sample, or stop at an input EOG. The 75 observations save processed
+positions 21 through 95, predicting positions 22 through 96; the prefix itself is not an
+observation. `--prompt 22` names the complete prompt, not a 22-ID batched submission.
 
-The diagnostic format is `flint-trajectory-v1`, not a reference-set family or accuracy gate:
+The format is `flint-trajectory-v2`, not a reference-set family or accuracy gate.
+The former v1 consumer submitted all 22 prompt IDs as one batch: its controls remain
+historical evidence but do not reproduce the actual HTTP prompt/step boundary. Do not
+relabel v1 arrays or compare them as if the submission contracts matched.
 
 - `tokens.ids` and `steps.tsv`: exact inputs and each call's processed/predicted position
   and raw argmax.
@@ -715,7 +720,7 @@ CUDA_VISIBLE_DEVICES= "$CPU_TRACE" -m "$MODEL" --ids "$IDS" \
   --prompt 22 --ctx 1024 --out "$CPU_OUT"
 ```
 
-The CPU callback arm was actually run on the complete model: 75 calls, 3,675 layer vectors,
+The preserved **v1** CPU callback arm was actually run on the complete model: 75 calls, 3,675 layer vectors,
 zero preceding argmax mismatches, and final argmax 26007. Its complete final-logit SHA-256
 is `083c8aa95aab025c0183c2ee3c4788642499533d5a2ee4e280c1125302c23bf9`, bit-identical
 to the preserved callback-free original row. The model was rehashed in this round.
@@ -723,6 +728,13 @@ The separate untapped control also ran: all 75 complete 150,144-logit rows are
 bit-identical to the callback arm, whole-file SHA-256
 `7f2e476bd7fbf33faf6548eedadbb89b1844c50e0a55d7fc8aa25b297fbaff4a`.
 These are results of the first candidate's CPU consumer, not new GPU results.
+
+The corrected **v2** CPU callback and callback-free consumers also ran on the complete
+model. Their 75 full-logit rows are bit-identical, SHA-256
+`4ef35ee7390341e640a6d38c39a010643f51a853fe743b29a5da989c7b8357b5`.
+At next position96 the argmax is26007 and its margin over29263 is+0.238318443.
+V1/v2 CPU arrays are not bit-identical; call16 has a different argmax. This is evidence
+that the submission boundary matters, not a GPU fix or permission to waive the oracle.
 
 The GPU build uses the pinned oxide toolchain. Actual capture runs belong inside an
 authorized runner configuration with its normal card locks and bounds; `TRACE` names

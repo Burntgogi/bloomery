@@ -885,7 +885,10 @@ mod tests {
     use gguf::GgmlType;
     use gguf::write::{Layout, TensorDecl, Writer};
     use model::arch::models::{self, Mixer, Moe, Residual, Router, RouterNorm, Score};
-    use model::placement::{self, ExpertList, ModelTensor, ModelTensors, Role};
+    use model::placement::{
+        Device, ExpertList, ExpertPart, Format, ModelTensor, ModelTensors, Role, RoutedRule, Row,
+        Segment,
+    };
 
     use crate::card_leg::tests::stack_bytes;
     use crate::host::leg_tier::LegTier;
@@ -976,7 +979,7 @@ mod tests {
         writer.finish().expect("a finished file");
         let file = gguf::Split::open(&path).expect("the file");
         // IQ3_S has a selected expert row arm, not a generic device format.
-        // Load the role-qualified placement as a real resident expert load does.
+        // Use the selected program's formats, not the generic type/role table.
         let model = ModelTensors {
             tensors,
             layers: triples.len(),
@@ -984,19 +987,36 @@ mod tests {
             experts_used: USED as u64,
             bf16_words: |_| false,
         };
+        let RoutedRule::Leg { gate_up, down } = accepts::routed_rule(FAMILY.program) else {
+            panic!("the fixture family must select a card leg");
+        };
         let rows = model
             .tensors
             .iter()
             .enumerate()
             .map(|(i, t)| {
-                placement::routed_row(
-                    i,
-                    t,
-                    0,
-                    ExpertList::prefix(CARD as u64).expect("the card prefix"),
-                    &model,
-                )
-                .expect("the resident expert row")
+                let format = match ExpertPart::of_name(&t.name).expect("a routed part") {
+                    ExpertPart::Gate | ExpertPart::Up => gate_up(t.ty),
+                    ExpertPart::Down => down(t.ty),
+                }
+                .expect("the selected arm's format");
+                let mut segment = Segment {
+                    device: Device::Card(0),
+                    format: Format::Card(format),
+                    experts: Some(ExpertList::prefix(CARD as u64).expect("the card prefix")),
+                    resident_bytes: 0,
+                };
+                segment.resident_bytes = segment
+                    .buffer_bytes(t, model.experts_of(t))
+                    .expect("the selected format's buffers")
+                    .into_iter()
+                    .sum();
+                Row {
+                    tensor: i,
+                    segments: vec![segment],
+                    read_bytes: t.file_bytes,
+                    stage: 0,
+                }
             })
             .collect::<Vec<_>>();
         let weights = Weights::load_rows(gpu.stream(), &file, &model, &rows, 0)

@@ -28,7 +28,7 @@ const CALLS: usize = TOTAL - PROMPT + 1;
 const CTX: usize = 1024;
 const SLOTS: usize = 2;
 const USAGE: &str = "Usage: trace_flint -m MODEL --ids FILE --prompt 22 --out NEWDIR --ctx 1024 --slots 2 --mode eager|graph [--taps]\n\
-Captures flint-trajectory-v1: one 22-ID batched prefill, then 74 forced one-ID steps.\n\
+Captures flint-trajectory-v2: 21-ID prefix prefill, then the last prompt ID and 74 forced one-ID steps.\n\
 FILE must contain exactly 96 decimal token IDs; no tokenization, sampling or EOG stopping.\n\
 --ctx is per-slot (total context 2048); exactly one CUDA device must be visible.\n\
 --taps captures each call's last-position layer outputs and result_norm.\n\
@@ -304,7 +304,7 @@ impl Capture {
             .into());
         }
         let captured = m.has_capture();
-        if m.mode() == StepMode::Graph && call != 0 && !captured {
+        if m.mode() == StepMode::Graph && !captured {
             return Err(format!("call {call}: graph mode did not capture a decode chain").into());
         }
         if m.mode() == StepMode::Eager && captured {
@@ -410,16 +410,16 @@ fn run(args: Args) -> Result<()> {
     m.set_mode(args.mode);
     placement(&out, &plan, &m)?;
     let mut capture = Capture::new(&out, args.taps)?;
-    let argmax = prompt_pass(&mut m, |m| {
-        m.run_rows(PROMPT, WHAT, |gpu, weights, body, head, at| {
-            prefill(gpu, weights, body, head, &ids[..PROMPT], at)
+    // The HTTP Slot::close_call prefills all but the last prompt ID, then calls next.
+    prompt_pass(&mut m, |m| {
+        m.run_rows(PROMPT - 1, WHAT, |gpu, weights, body, head, at| {
+            prefill(gpu, weights, body, head, &ids[..PROMPT - 1], at)
         })
     })?
-    .ok_or("batched prompt produced no final argmax")?;
-    capture.call(&m, 0, ids[PROMPT - 1], argmax)?;
-    for (offset, &id) in ids[PROMPT..].iter().enumerate() {
+    .ok_or("batched prompt prefix produced no final argmax")?;
+    for (call, &id) in ids[PROMPT - 1..].iter().enumerate() {
         let argmax = m.step(&[id])?;
-        capture.call(&m, offset + 1, id, argmax)?;
+        capture.call(&m, call, id, argmax)?;
     }
     let mut nodes = create(&out.join("graph-nodes.tsv"))?;
     writeln!(nodes, "node\tdescriptor")?;
@@ -452,7 +452,7 @@ fn run(args: Args) -> Result<()> {
     };
     writeln!(
         manifest,
-        "protocol\tflint-trajectory-v1\nmodel\t{}\nids_source\t{}\nengine\tbloomery-gpu-flint\nmode\t{mode}\ninstrumentation\t{instrumentation}\nctx_per_slot\t{CTX}\nctx_total\t{}\nslots\t{SLOTS}\nactive_slot\t0\nwidth\t{WIDTH}\nlayers\t{LAYERS}\nvocab\t{VOCAB}\nprompt\t{PROMPT}\ntotal_ids\t{TOTAL}\ncalls\t{CALLS}\nlogits\tlogits.f32\nlayers_file\t{layers_file}\nnorm_file\t{norm_file}\nlogits_layout\tf32le[call][150144]\nlayers_layout\tf32le[call][49][2048]\nnorm_layout\tf32le[call][2048]\nresidency\toff\nhost_populate\tfalse\nhost_lock\tfalse\ncard_dontneed\tfalse\nr8\tfalse\nroute_trace\tfalse\nprefill_group\t1\nprompt_submission\tone-batched-prefill\nprompt_mode\teager-batched\ndecode_graph_captured\t{}\nplacement\tplacement.tsv\nloaded_expert_slots\texpert-slots.tsv\nplacement_counters\tplacement.txt\ndevice\tdevice.txt\ngraph_state\tgraph.tsv\ngraph_nodes\tgraph-nodes.tsv\nruntime_counters\tcounters.tsv\nprovenance\texternal-receipt-required\ncomplete\t1",
+        "protocol\tflint-trajectory-v2\nmodel\t{}\nids_source\t{}\nengine\tbloomery-gpu-flint\nmode\t{mode}\ninstrumentation\t{instrumentation}\nctx_per_slot\t{CTX}\nctx_total\t{}\nslots\t{SLOTS}\nactive_slot\t0\nwidth\t{WIDTH}\nlayers\t{LAYERS}\nvocab\t{VOCAB}\nprompt\t{PROMPT}\ntotal_ids\t{TOTAL}\ncalls\t{CALLS}\nlogits\tlogits.f32\nlayers_file\t{layers_file}\nnorm_file\t{norm_file}\nlogits_layout\tf32le[call][150144]\nlayers_layout\tf32le[call][49][2048]\nnorm_layout\tf32le[call][2048]\nresidency\toff\nhost_populate\tfalse\nhost_lock\tfalse\ncard_dontneed\tfalse\nr8\tfalse\nroute_trace\tfalse\nprefill_group\t1\nprompt_submission\tprefix-prefill-then-next\nprefix_prefill_ids\t21\nfirst_observed_call\tone-id-next\nprompt_mode\teager-batched-prefix\ndecode_graph_captured\t{}\nplacement\tplacement.tsv\nloaded_expert_slots\texpert-slots.tsv\nplacement_counters\tplacement.txt\ndevice\tdevice.txt\ngraph_state\tgraph.tsv\ngraph_nodes\tgraph-nodes.tsv\nruntime_counters\tcounters.tsv\nprovenance\texternal-receipt-required\ncomplete\t1",
         tsv_path(&model)?,
         tsv_path(&ids_path)?,
         CTX * SLOTS,

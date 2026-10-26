@@ -180,6 +180,7 @@ int main(int argc, char ** argv) {
             if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
                 std::fputs(usage, stdout);
                 std::fputs("Read exactly 96 whitespace-separated decimal token IDs; never retokenize or stop on EOG.\n"
+                           "Matches HTTP: 21-ID prefix prefill, last prompt ID as next, then 74 forced steps.\n"
                            "Default: CPU layer/norm node taps and full logits. --no-taps: full logits only.\n"
                            "NEWDIR must not exist; MANIFEST.tsv is installed only after complete capture.\n", stdout);
                 return 0;
@@ -201,7 +202,7 @@ int main(int argc, char ** argv) {
             else throw std::runtime_error(std::string("unknown/incomplete argument: ") + argv[i]);
         }
         require(!model_arg.empty() && !ids_arg.empty() && !out_arg.empty(), usage);
-        require(prompt == 22 && capacity == 1024, "flint-trajectory-v1 requires --prompt 22 --ctx 1024");
+        require(prompt == 22 && capacity == 1024, "flint-trajectory-v2 requires --prompt 22 --ctx 1024");
         const uint32_t endian = 1;
         require(*reinterpret_cast<const uint8_t *>(&endian) == 1 && sizeof(float) == 4 &&
                 std::numeric_limits<float>::is_iec559, "requires little-endian IEEE754 f32 host");
@@ -258,13 +259,14 @@ int main(int argc, char ** argv) {
             layers_out = output(out / "layers.f32", true);
             norm_out = output(out / "norm.f32", true);
         }
-        manifest << "protocol\tflint-trajectory-v1\nmodel\t" << model_path << "\narch\t" << arch
+        manifest << "protocol\tflint-trajectory-v2\nmodel\t" << model_path << "\narch\t" << arch
                  << "\nmodel_name\t" << model_name << "\nmodel_bytes\t" << model_stat.st_size
                  << "\nmodel_identity_validation\tmetadata-and-file-size;SHA256-in-external-receipt\n"
                  << "mode\tcpu\ninstrumentation\t" << (taps ? "node-taps" : "no-taps")
                  << "\nids_source\t" << ids_path << "\nwidth\t" << width << "\nlayers\t" << layers
                  << "\nvocab\t" << vocab << "\nprompt\t" << prompt << "\ntotal_ids\t" << ids.size()
                  << "\ncalls\t" << calls << "\nlogits\tlogits.f32\nlayers_file\t" << (taps ? "layers.f32" : "absent:not-requested")
+                 << "\nprompt_submission\tprefix-prefill-then-next\nprefix_prefill_ids\t21\nfirst_observed_call\tone-id-next"
                  << "\nnorm_file\t" << (taps ? "norm.f32" : "absent:not-requested")
                  << "\nlogits_layout\t[call][vocab];little-endian-f32\nlayers_layout\t[call][layer][width];little-endian-f32"
                  << "\nnorm_layout\t[call][width];little-endian-f32\ntensor_metadata\ttensors.tsv"
@@ -302,9 +304,10 @@ int main(int argc, char ** argv) {
         tokens.close();
         steps << "call\tprocessed_pos\tpredict_pos\tinput_id\targmax\n";
         batch_guard batch;
-        for (int call = 0; call < calls; ++call) {
-            const int at = call == 0 ? 0 : prompt + call - 1;
-            const int count = call == 0 ? prompt : 1;
+        // Match HTTP Slot::close_call: the prefix has no observation; the last prompt ID is next.
+        for (int call = -1; call < calls; ++call) {
+            const int at = call < 0 ? 0 : prompt - 1 + call;
+            const int count = call < 0 ? prompt - 1 : 1;
             auto & b = batch.batch;
             b.n_tokens = count;
             for (int i = 0; i < count; ++i) {
@@ -314,10 +317,11 @@ int main(int argc, char ** argv) {
                 b.seq_id[i][0] = 0;
                 b.logits[i] = i == count - 1;
             }
-            if (taps) state.begin(call, count);
+            if (taps && call >= 0) state.begin(call, count);
             const int status = llama_decode(ctx.get(), b);
-            if (taps) state.finish();
+            if (taps && call >= 0) state.finish();
             require(status == 0, "llama_decode failed at call " + std::to_string(call) + ": " + std::to_string(status));
+            if (call < 0) continue;
             const float * row = llama_get_logits_ith(ctx.get(), -1);
             require(row != nullptr, "missing logits at call " + std::to_string(call));
             int argmax = 0;
