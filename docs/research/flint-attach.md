@@ -654,9 +654,12 @@ residency/NVMe, streamed HTTP and spontaneous tool selection are not established
 
 ## 11. Current-main integration and trajectory instruments
 
-The linear integration candidate starts at main
-`43073091be21e48cda40d79fe6dae1dfcfd643d5`; it preserves the published behavioral
-and resource evidence in section 10 as historical evidence, not acceptance of a new head.
+The first linear integration candidate, `4dadee0195fb652608be59ffecc033a4643ad1eb`,
+starts at main `43073091be21e48cda40d79fe6dae1dfcfd643d5`. The follow-up replay
+starts at main `af74ea46b7f3e47692c2afae09eb64fdddf71461`; neither replay replaces
+the published #799 head. Fixed-source numerical comparisons keep the original production
+and first-candidate images separate from the later replay, and receipts name each image.
+Section 10 remains historical evidence, not acceptance of either integration candidate.
 The placement integration keeps both the cached upload `Footprint` and candidate-selected
 tier scratch/reserves. No compiler pin, numerical band or model admission was widened.
 
@@ -716,6 +719,10 @@ The CPU callback arm was actually run on the complete model: 75 calls, 3,675 lay
 zero preceding argmax mismatches, and final argmax 26007. Its complete final-logit SHA-256
 is `083c8aa95aab025c0183c2ee3c4788642499533d5a2ee4e280c1125302c23bf9`, bit-identical
 to the preserved callback-free original row. The model was rehashed in this round.
+The separate untapped control also ran: all 75 complete 150,144-logit rows are
+bit-identical to the callback arm, whole-file SHA-256
+`7f2e476bd7fbf33faf6548eedadbb89b1844c50e0a55d7fc8aa25b297fbaff4a`.
+These are results of the first candidate's CPU consumer, not new GPU results.
 
 The GPU build uses the pinned oxide toolchain. Actual capture runs belong inside an
 authorized runner configuration with its normal card locks and bounds; `TRACE` names
@@ -727,12 +734,19 @@ bash tools/gpu-gate.sh --executable "$TRACE" -m "$MODEL" --ids "$IDS" \
   --prompt 22 --ctx 1024 --slots 2 --mode graph --out "$GPU_OUT"
 ```
 
-Use separate new output directories for Graph/untapped, Eager/untapped and Eager/tapped
-(`--taps`) arms. Arming taps forces Eager; the consumer explicitly restores the requested
-mode afterwards, and Graph decode must actually capture. The instrument admits only
-the existing card-budget lever; do not assume other inherited levers were applied.
+Use separate new output directories for all four mode/instrumentation combinations:
+Eager/untapped, Eager/tapped, Graph/untapped and Graph/tapped (`--taps`).
+Check full-logit neutrality within each mode as well as Eager/Graph agreement.
+Arming taps forces Eager; the consumer explicitly restores the requested mode afterwards,
+and Graph decode must actually capture. The instrument admits only the existing
+card-budget lever; do not assume other inherited levers were applied.
 Context 1024 is per slot, two slots total 2048, matching the original HTTP setup.
 Compare the actual per-layer placement, not just model identity or aggregate counts.
+The diagnostic's all-false `HostCfg` matches the original `r8=off` and `HOST_LOCK=0`
+settings, but page population/discard differ from the original HTTP defaults. Record that
+difference; it is neither an established numerical cause nor permission to skip direct-B
+boundary reproduction. `norm.f32` is the weighted RMS output before head activation
+quantization, not an RMS-only row or quantized activation bytes.
 
 Diagnose the original `313b9f0` production source with the separately recorded example
 overlay first; then bridge the same controls onto the integration candidate. A new binary
@@ -757,9 +771,10 @@ refuse the fixture tier. The two-card recipe takes the existing `both`/big-load 
 path and has a derived host-resource ceiling, not a measured RSS claim. It does not prove
 dynamic residency/NVMe, loss/deadline recovery or a Korean oracle result.
 
-The new GPU diagnostic and two-card case require fresh NVIDIA execution. Hikari's existing
-work was explicitly left undisturbed; the new window waits for its owner. No cc12.1 values
-were inferred and the remaining resource/oracle acceptance stays open.
+Require fresh NVIDIA evidence tied to each candidate's actual source, model, placement
+and executed hardware case; compiled/ignored tests are not such evidence. Preserve
+existing workloads unless their owner authorizes a separate window. Physical cc12.1
+resource values must be measured, never inferred from an sm_86 build or cc8.6 run.
 
 
 
