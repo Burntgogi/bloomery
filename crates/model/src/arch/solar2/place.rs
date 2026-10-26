@@ -402,7 +402,7 @@ mod tests {
         let mut machine = workstation::plan_gate(LAYERS);
         // Rounded dense padding may hold experts for no extra card bytes.
         // Byte granules isolate the reserve's exact no-expert-room boundary.
-        machine.cards[0].granule_bytes = 1;
+        machine.cards[0].granule_bytes = std::num::NonZeroU64::MIN;
         let host_only = crate::placement::plan_host_routed(
             &inputs.model,
             &machine,
