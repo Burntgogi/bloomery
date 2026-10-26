@@ -109,7 +109,7 @@ pub fn run(path: &Path, levers: &bloomery_levers::Levers) -> Result<bool, GateEr
     let layers = inputs.model.layers;
     let walk = crate::e2e::walk(TWO_WALK, inputs.hp.n_vocab);
     let prompt = crate::e2e::walk(TWO_PROMPT, inputs.hp.n_vocab);
-    let two = workstation::plan_bp(layers, None, bloomery_gpu_mimo2::tier::tier_batch(&inputs));
+    let two = workstation::plan_bp(layers, None, bloomery_gpu_mimo2::tier::tier_batch(&inputs)?);
     let flat = Machine {
         tiers: Vec::new(),
         ..two.clone()

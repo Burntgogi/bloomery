@@ -529,7 +529,7 @@ mod gate {
         tier_now: Tier,
     ) -> Result<(Model, bool, Vec<usize>), GateError> {
         let inputs = PlanInputs::read(&open_split(Arch::MuseSpark, RECIPE)?)?;
-        let mut two = lcpp_e2e::Arm::Bp.machine(hp.n_layer, place::tier_batch(hp))?;
+        let mut two = lcpp_e2e::Arm::Bp.machine(hp.n_layer, place::tier_batch(hp)?)?;
         place::stage_placed(&mut two)?;
         let ctx = u64::try_from(ctx)?;
         // The stage card alone, the reference's machine: the budget reads its unbudgeted plan, which a plan of the two

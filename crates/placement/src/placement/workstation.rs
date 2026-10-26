@@ -487,8 +487,38 @@ const TILE_COLS: u64 = 8;
 /// activations, the tier places, their q8_1 form, the down outputs by slot.
 #[must_use]
 pub const fn tier_batch_staging_bytes(n_embd: u64, n_used: u64, cols: u64) -> u64 {
-    let slots = cols * n_used;
-    4 * cols * n_embd + 4 * slots + q8_act_bytes(cols, n_embd) + 4 * slots * n_embd
+    match try_tier_batch_staging_bytes(n_embd, n_used, cols) {
+        Some(bytes) => bytes,
+        None => panic!("tier_batch_staging_bytes: staging bytes overflow u64"),
+    }
+}
+
+const fn try_tier_batch_staging_bytes(n_embd: u64, n_used: u64, cols: u64) -> Option<u64> {
+    let Some(slots) = cols.checked_mul(n_used) else {
+        return None;
+    };
+    let Some(places) = 4u64.checked_mul(slots) else {
+        return None;
+    };
+    let Some(down) = places.checked_mul(n_embd) else {
+        return None;
+    };
+    let Some(rows) = 4u64.checked_mul(cols) else {
+        return None;
+    };
+    let Some(rows) = rows.checked_mul(n_embd) else {
+        return None;
+    };
+    let Some(bytes) = rows.checked_add(places) else {
+        return None;
+    };
+    let Some(q8) = try_q8_act_bytes(cols, n_embd) else {
+        return None;
+    };
+    let Some(bytes) = bytes.checked_add(q8) else {
+        return None;
+    };
+    bytes.checked_add(down)
 }
 
 /// The tile path's scratch for blocks of up to `slots` slots of rows of
@@ -538,7 +568,7 @@ pub const fn walk_a_tile_scratch_bytes(n_embd: u64, ff: u64, n_used: u64, cols: 
 /// token, through experts of `ff`, cut in chunks of `chunk` tokens: one run of
 /// the card leg's buffers (`bloomery_gpu::card_leg::LegBufs`) with its slots'
 /// columns in the 128-value form ([`leg_bytes`]), in place of the tile path's
-/// scratch. Selected-form callers use [`tier_leg_batch_bytes_of`].
+/// scratch. Selected-form callers use [`try_tier_leg_batch_bytes_of`].
 #[must_use]
 pub const fn tier_chunk_scratch_bytes(n_embd: u64, ff: u64, n_used: u64, chunk: u64) -> u64 {
     leg_bytes(chunk, n_used, n_embd, ff, DownForms::of(DownAct::Q8Act))
@@ -548,8 +578,26 @@ pub const fn tier_chunk_scratch_bytes(n_embd: u64, ff: u64, n_used: u64, chunk: 
 /// rows the tier hands back and the places it reads.
 #[must_use]
 pub const fn tier_batch_host_bytes(n_embd: u64, n_used: u64, cols: u64) -> u64 {
-    let slots = cols * n_used;
-    2 * (4 * slots * n_embd + 4 * slots)
+    match try_tier_batch_host_bytes(n_embd, n_used, cols) {
+        Some(bytes) => bytes,
+        None => panic!("tier_batch_host_bytes: host bytes overflow u64"),
+    }
+}
+
+const fn try_tier_batch_host_bytes(n_embd: u64, n_used: u64, cols: u64) -> Option<u64> {
+    let Some(slots) = cols.checked_mul(n_used) else {
+        return None;
+    };
+    let Some(places) = 4u64.checked_mul(slots) else {
+        return None;
+    };
+    let Some(down) = places.checked_mul(n_embd) else {
+        return None;
+    };
+    let Some(rows_and_places) = down.checked_add(places) else {
+        return None;
+    };
+    2u64.checked_mul(rows_and_places)
 }
 
 /// The expert tier's prompt-batch bytes for blocks of up to `cols` tokens of
@@ -566,41 +614,24 @@ pub const fn tier_batch_bytes(n_embd: u64, ff: u64, n_used: u64, cols: u64) -> T
 
 /// [`tier_batch_bytes`] for a candidate-selected common leg in the 128-value form.
 ///
-/// # Panics
-/// Panics on invalid geometry or overflowing byte counts.
-#[must_use]
+/// Refuses invalid geometry or overflowing byte counts before placement.
 pub fn tier_leg_batch_bytes(
     n_embd: u64,
     ff: u64,
     n_used: u64,
     chunk: u64,
     cols: u64,
-) -> TierBatchBytes {
-    tier_leg_batch_bytes_of(
+) -> Result<TierBatchBytes, PlacementError> {
+    try_tier_leg_batch_bytes_of(
         n_embd,
         ff,
         n_used,
         (chunk, cols),
         DownForms::of(DownAct::Q8Act),
+        false,
     )
 }
 
-/// The common leg's buffers in `downs`, with the same checked geometry and
-/// candidate-dependent reserve as [`try_tier_leg_batch_bytes_of`].
-///
-/// # Panics
-/// Panics on invalid geometry or overflowing byte counts.
-#[must_use]
-pub fn tier_leg_batch_bytes_of(
-    n_embd: u64,
-    ff: u64,
-    n_used: u64,
-    shape: (u64, u64),
-    downs: DownForms,
-) -> TierBatchBytes {
-    try_tier_leg_batch_bytes_of(n_embd, ff, n_used, shape, downs, false)
-        .expect("valid common leg batch geometry and byte counts")
-}
 
 /// The common leg's staging, host rows and selected-form scratch, refusing
 /// invalid geometry or overflowing byte counts before placement.
@@ -625,17 +656,10 @@ pub fn try_tier_leg_batch_bytes_of(
         if cols == 0 {
             return None;
         }
-        let slots = cols.checked_mul(n_used)?;
-        let places = 4u64.checked_mul(slots)?;
-        let down = places.checked_mul(n_embd)?;
-        let staging = 4u64
-            .checked_mul(cols)?
-            .checked_mul(n_embd)?
-            .checked_add(places)?
-            .checked_add(try_q8_act_bytes(cols, n_embd)?)?
-            .checked_add(down)?;
-        let host = 2u64.checked_mul(down.checked_add(places)?)?;
-        Some((staging, host))
+        Some((
+            try_tier_batch_staging_bytes(n_embd, n_used, cols)?,
+            try_tier_batch_host_bytes(n_embd, n_used, cols)?,
+        ))
     };
     let (staging, host) = counted().ok_or_else(|| PlacementError::Metadata {
         key: "tier leg batch".into(),

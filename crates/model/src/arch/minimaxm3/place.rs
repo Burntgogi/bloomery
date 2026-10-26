@@ -22,10 +22,10 @@ use crate::arch::names::routed_stacks;
 use crate::arch::place_hybrid::{
     self, ring_pass_bytes, route_bytes, stream_ring_bytes, tier_places_bytes, wide_bytes,
 };
-use crate::placement::accepts::planes_leg_down;
+use crate::placement::PlacementError;
+use crate::placement::accepts::{self, Program};
 use crate::placement::kernels::{self, DownAct, DownForms};
 use crate::placement::workstation::{self, TierBatchBytes};
-use crate::placement::{PlacementError, Role};
 
 pub use place_hybrid::{KvLayout, PlaceError};
 
@@ -134,39 +134,15 @@ pub const TIER_CHUNK: u64 = 16;
 /// (an NVFP4 down's 32-value blocks, a K- or i-quant down's 128-value form) and the host's rows
 /// and places. The plan reserves them on the tier card and the host, and the load checks its
 /// allocations against them.
-#[must_use]
-pub fn tier_batch(inputs: &PlanInputs, cols: u64) -> TierBatchBytes {
+pub fn tier_batch(inputs: &PlanInputs, cols: u64) -> Result<TierBatchBytes, PlacementError> {
     let hp = &inputs.hp;
-    workstation::tier_leg_batch_bytes_of(
+    workstation::try_tier_leg_batch_bytes_of(
         hp.n_embd as u64,
         hp.experts.ff as u64,
         hp.experts.n_used as u64,
         (TIER_CHUNK, cols),
-        leg_downs(inputs),
+        accepts::leg_down_forms(Program::MiniMaxM3Body, &inputs.model),
     )
-}
-
-/// The forms the card leg's routed downs of `inputs` read: each routed layer's down stack whose
-/// type the leg runs ([`planes_leg_down`]), by its kernel table row ([`kernels::down`]); the
-/// 128-value form on a file with none.
-fn leg_downs(inputs: &PlanInputs) -> DownForms {
-    let downs = (0..inputs.model.layers)
-        .map(|l| routed_stacks(l)[2].clone())
-        .filter_map(|name| {
-            inputs
-                .model
-                .tensors
-                .iter()
-                .find(|t| t.role == Role::RoutedExperts && t.name == name)
-        })
-        .filter(|t| planes_leg_down(t.ty))
-        .filter_map(|t| kernels::down(t.ty))
-        .fold(DownForms::NONE, |forms, (_, act)| forms.with(act));
-    if downs == DownForms::NONE {
-        DownForms::of(DownAct::Q8Act)
-    } else {
-        downs
-    }
 }
 
 /// The slots of each half of the expert stream's ring a streaming plan keeps room for
@@ -425,7 +401,11 @@ mod tests {
     fn a_tier_card_is_planned_with_the_leg_batch() {
         const COLS: u64 = 3 * TIER_CHUNK;
         let inputs = described("mm3-place-tier");
-        let tiered = workstation::plan_bp(LAYERS, None, tier_batch(&inputs, COLS));
+        let tiered = workstation::plan_bp(
+            LAYERS,
+            None,
+            tier_batch(&inputs, COLS).expect("valid tier geometry"),
+        );
         let plain = workstation::plan_gate(LAYERS);
         let places = 3 * 4 * 256 * 2;
         assert_eq!(inputs.tier_reserve, Some(places));

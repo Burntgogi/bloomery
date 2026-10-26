@@ -76,8 +76,7 @@ pub const fn pass_rows_max(n_used: usize) -> usize {
 /// placed pass's rows ([`pass_rows_max`]): the experts run in the latent, so
 /// the tier's rows and its staging are the latent's width, through the card
 /// leg in chunks of [`TIER_CHUNK`].
-#[must_use]
-pub fn tier_batch(hp: &Hparams) -> TierBatchBytes {
+pub fn tier_batch(hp: &Hparams) -> Result<TierBatchBytes, PlacementError> {
     let ff = hp.expert_width();
     workstation::tier_leg_batch_bytes(
         hp.latent as u64,

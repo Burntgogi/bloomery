@@ -284,20 +284,14 @@ impl Card {
         let Some(leg) = self.tier_leg else {
             return Ok(None);
         };
-        let forms = model
-            .tensors
-            .iter()
-            .filter(|t| {
-                t.role == Role::RoutedExperts
-                    && t.layer
-                        .is_some_and(|l| counts.get(l).is_some_and(|&n| n > 0))
-                    && ExpertPart::of_name(&t.name) == Some(ExpertPart::Down)
-            })
-            .filter_map(|t| crate::kernels::down(t.ty))
-            .fold(crate::kernels::DownForms::NONE, |forms, (_, act)| {
-                forms.with(act)
-            });
-        Ok(Some((leg.bytes(leg.downs)?, leg.bytes(forms)?)))
+        Ok(Some((
+            leg.bytes(leg.downs)?,
+            selected_leg_scratch(
+                leg,
+                counts,
+                routed_down_acts(model).map(|(l, act)| (l, crate::kernels::DownForms::of(act))),
+            )?,
+        )))
     }
 
     fn selected_reserve_bytes(
@@ -367,6 +361,41 @@ impl Card {
             .map_or(self.usable_bytes, |free| self.usable_bytes.min(free));
         budget.map_or(usable, |b| usable.min(b))
     }
+}
+
+/// Routed down forms with their layers, before a placement selects any experts.
+fn routed_down_acts(
+    model: &ModelTensors,
+) -> impl Iterator<Item = (usize, crate::kernels::DownAct)> + '_ {
+    model.tensors.iter().filter_map(|t| {
+        if t.role != Role::RoutedExperts || ExpertPart::of_name(&t.name) != Some(ExpertPart::Down) {
+            return None;
+        }
+        Some((t.layer?, crate::kernels::down(t.ty)?.1))
+    })
+}
+
+/// Price the actual selected union, from tensors or cached per-layer forms.
+/// Empty counts and layers with no down keep the descriptor's empty-form scratch.
+fn selected_leg_scratch(
+    leg: workstation::TierLegScratch,
+    counts: &[u64],
+    downs: impl IntoIterator<Item = (usize, crate::kernels::DownForms)>,
+) -> Result<u64, PlacementError> {
+    use crate::kernels::{DownAct, DownForms};
+
+    let forms = downs
+        .into_iter()
+        .filter(|(l, _)| counts.get(*l).is_some_and(|&n| n > 0))
+        .fold(DownForms::NONE, |mut forms, (_, down)| {
+            for act in [DownAct::Q8Act, DownAct::Q8Blocks32] {
+                if down.holds(act) {
+                    forms = forms.with(act);
+                }
+            }
+            forms
+        });
+    leg.bytes(forms)
 }
 
 /// The host tier: its usable bytes and what is set aside before any tensor.
@@ -3239,33 +3268,23 @@ impl Fill<'_, '_> {
             .routed
             .unwrap_or(RoutedRule::PerType(CardFormat::of_routed));
         let uploads = card_uploads(self.model, self.c, self.rows, self.eligible, format)?;
-        let footprint = Footprint::new(card.granule_bytes, &uploads);
-        let mut down_acts = if card.tier_leg.is_some() {
-            vec![None; self.model.layers]
+        // Only tier legs prepare the per-layer forms. Candidates reuse these
+        // rather than scanning tensors, including when a layer has several downs.
+        let mut down_forms = if card.tier_leg.is_some() {
+            vec![crate::kernels::DownForms::NONE; self.model.layers]
         } else {
             Vec::new()
         };
         if card.tier_leg.is_some() {
-            for t in &self.model.tensors {
-                if t.role == Role::RoutedExperts
-                    && ExpertPart::of_name(&t.name) == Some(ExpertPart::Down)
-                    && let Some(l) = t.layer
-                    && let Some((_, act)) = crate::kernels::down(t.ty)
-                {
-                    down_acts[l] = Some(act);
+            for (l, act) in routed_down_acts(self.model) {
+                if let Some(forms) = down_forms.get_mut(l) {
+                    *forms = forms.with(act);
                 }
             }
         }
         let scratch = |counts: &[u64]| {
             card.tier_leg.map_or(Ok(0), |leg| {
-                let forms = counts
-                    .iter()
-                    .zip(&down_acts)
-                    .filter_map(|(&n, &act)| (n > 0).then_some(act).flatten())
-                    .fold(crate::kernels::DownForms::NONE, |forms, act| {
-                        forms.with(act)
-                    });
-                leg.bytes(forms)
+                selected_leg_scratch(leg, counts, down_forms.iter().copied().enumerate())
             })
         };
         let bound = card
@@ -3273,7 +3292,13 @@ impl Fill<'_, '_> {
             .map(|leg| leg.bytes(leg.downs))
             .transpose()?
             .unwrap_or(0);
-        let reserves = card.selected_reserve_bytes(self.model, n_l)?;
+        let selected = scratch(n_l)?;
+        let reserves = card
+            .reserve_bytes()
+            .and_then(|fixed| fixed.checked_sub(bound))
+            .and_then(|fixed| fixed.checked_add(selected))
+            .ok_or_else(|| card.bytes_past_u64())?;
+        let footprint = Footprint::new(card.granule_bytes, &uploads);
         let budget = i128::from(capped(card, self.card_budget))
             - i128::from(self.kv)
             - i128::from(
@@ -6733,7 +6758,7 @@ mod tests {
             (
                 [Q5_K; 2],
                 DownAct::Q8Act,
-                workstation::tier_leg_batch_bytes(256, 256, 1, 2, 3),
+                workstation::tier_leg_batch_bytes(256, 256, 1, 2, 3).expect("valid tier bytes"),
             ),
         ] {
             let scratch = |forms| crate::kernels::leg_bytes(2, 1, 256, 256, forms);

@@ -1498,11 +1498,12 @@ pub const LEG_TIER_CHUNK: u64 = 8;
 /// card's staging, one chunk of the leg's scratch and the host's rows, for
 /// blocks of the host union's columns. [`tier_batch`] is the qwen4exp plan's
 /// figure.
-#[must_use]
-pub fn leg_tier_batch(spec: &ModelSpec) -> TierBatchBytes {
-    let (expert_ff, n_used) = spec
-        .routed()
-        .map_or((0, 0), |m| (u64::from(m.expert_ff), u64::from(m.top_k)));
+pub fn leg_tier_batch(spec: &ModelSpec) -> Result<TierBatchBytes, PlacementError> {
+    let moe = spec.routed().ok_or_else(|| PlacementError::Metadata {
+        key: "Qwen3.6 expert tier".into(),
+        detail: "a dense model has no routed experts for an expert tier".into(),
+    })?;
+    let (expert_ff, n_used) = (u64::from(moe.expert_ff), u64::from(moe.top_k));
     workstation::tier_leg_batch_bytes(
         u64::from(spec.hidden),
         expert_ff,
