@@ -1480,8 +1480,7 @@ mod tests {
         use super::super::super::hparams::{Hc, Hparams, Indexer};
         use super::super::{
             DenseForms, KdaLanes, Kind, KvLayout, NextnInputs, NextnKv, PlaceError, PlanInputs,
-            TIER_CHUNK, card_leg_bytes, card_leg_forms, prompt_reserve_bytes, row_bytes,
-            tier_batch,
+            card_leg_bytes, card_leg_forms, prompt_reserve_bytes, row_bytes,
         };
         use crate::placement::churn::ChurnPool;
         use crate::placement::workstation::{HostNeed, HostRead};
