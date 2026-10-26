@@ -1235,40 +1235,37 @@ mod tests {
             }
             assert!(gpu.take_fault().expect("the fault word").is_none());
         }
-        for (triple, program) in [
-            ([IQ3_S, Q5_K, Q8_0], Program::Qwen35Body),
-            ([Q5_K, Q5_K, Q6_K], Program::Solar2Body),
-        ] {
-            let w = weights(&gpu, &[triple]);
-            let specs = layers(1);
-            let map = SlotMap::prefix(0..1, EXPERTS, CARD).expect("a map");
-            let family = CardFamily { program, ..FAMILY };
-            assert!(
-                matches!(
-                    CardExperts::new(&gpu, &w, family, &specs, &map, (N, FF), CAP),
-                    Err(GpuError::Tensor { .. }),
+        let triple = [IQ3_S, Q5_K, Q8_0];
+        let program = Program::Qwen35Body;
+        let w = weights(&gpu, &[triple]);
+        let specs = layers(1);
+        let map = SlotMap::prefix(0..1, EXPERTS, CARD).expect("a map");
+        let family = CardFamily { program, ..FAMILY };
+        assert!(
+            matches!(
+                CardExperts::new(&gpu, &w, family, &specs, &map, (N, FF), CAP),
+                Err(GpuError::Tensor { .. }),
+            ),
+            "{program:?}: {triple:?}"
+        );
+        let set =
+            TierSet::new(0..1, EXPERTS, vec![(0..CARD as u32).collect()]).expect("a tier set");
+        assert!(
+            matches!(
+                LegTier::new(
+                    &gpu,
+                    &specs,
+                    &set,
+                    &w,
+                    family.shape(N, FF, 2),
+                    program,
+                    |moe| Ok(Act::SwigluClamp {
+                        limit: moe.act.swiglu_limit()
+                    }),
                 ),
-                "{program:?}: {triple:?}"
-            );
-            let set =
-                TierSet::new(0..1, EXPERTS, vec![(0..CARD as u32).collect()]).expect("a tier set");
-            assert!(
-                matches!(
-                    LegTier::new(
-                        &gpu,
-                        &specs,
-                        &set,
-                        &w,
-                        family.shape(N, FF, 2),
-                        program,
-                        |moe| Ok(Act::SwigluClamp {
-                            limit: moe.act.swiglu_limit()
-                        }),
-                    ),
-                    Err(GpuError::Tensor { .. }),
-                ),
-                "{program:?}: {triple:?}"
-            );
-        }
+                Err(GpuError::Tensor { .. }),
+            ),
+            "{program:?}: {triple:?}"
+        );
     }
 }

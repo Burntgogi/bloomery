@@ -681,6 +681,14 @@ the assigned rows, with no plan violations. This is real-file planning, not devi
 The pure regression also covers mixed selected down forms, heap/reserve recounting,
 unchanged generic refusal, conflicting formats and insufficient union capacity.
 
+The common mixed card/tier hardware consumer stages its fixture through `Weights::load_rows`
+using `accepts::routed_rule(FAMILY.program)` and the shared segment buffer arithmetic.
+Neither `Weights::load_where` nor the generic `routed_row` admits selected-only IQ3_S:
+assigning a routed role alone is insufficient. The fixture keeps all mixed-format
+step/pass/batch/tier bit comparisons and byte conservation, without widening generic
+admission. The obsolete Solar2 Q6_K-down rejection is removed: the current selected owner
+already admits that arm. Mismatched gate/up rejection remains exercised.
+
 ### CPU and GPU use one forced-ID diagnostic artifact layout
 
 `tools/ref/flint_trace.cpp` and the `bloomery-gpu-flint` example `trace_flint` consume exactly
