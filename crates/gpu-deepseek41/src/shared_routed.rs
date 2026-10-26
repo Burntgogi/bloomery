@@ -1189,7 +1189,8 @@ fn no_batch() -> GpuError {
 mod tests {
     use super::SharedWide;
     use crate::block::{
-        Block, BlockIo, BlockKernels, BlockPlan, BlockScratch, KBlockKernels, enqueue_block_cols_act,
+        Block, BlockIo, BlockKernels, BlockPlan, BlockScratch, KBlockKernels,
+        enqueue_block_cols_act,
     };
     use crate::experts::ExpertKernels;
     use bloomery_gpu::Gpu;

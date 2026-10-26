@@ -676,7 +676,10 @@ mod tests {
         assert_eq!(plan([Q6K, Q6K, Q5K]).unwrap().gate_up, split(Q6K, Q6K));
         assert_eq!(plan([Q4K, Q5K, Q4K]).unwrap().gate_up, split(Q4K, Q5K));
         assert_eq!(plan([Q3K, Q3K, Q6K]).unwrap().gate_up, split(Q3K, Q3K));
-        assert_eq!(plan([Iq4Xs, Iq4Xs, Iq4Xs]).unwrap().gate_up, split(Iq4Xs, Iq4Xs));
+        assert_eq!(
+            plan([Iq4Xs, Iq4Xs, Iq4Xs]).unwrap().gate_up,
+            split(Iq4Xs, Iq4Xs)
+        );
         assert_eq!(
             plan([Mxfp8, Mxfp8, Mxfp8]).unwrap().gate_up,
             GateUp::Site {

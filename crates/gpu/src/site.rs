@@ -1765,7 +1765,13 @@ mod tests {
             limit: 7.0,
         };
         let launch = |ty, rule| swiglu_launch((ty, "down"), rule);
-        for ty in [SiteTy::Q3K, SiteTy::Q4K, SiteTy::Q5K, SiteTy::Q6K, SiteTy::Iq4Xs] {
+        for ty in [
+            SiteTy::Q3K,
+            SiteTy::Q4K,
+            SiteTy::Q5K,
+            SiteTy::Q6K,
+            SiteTy::Iq4Xs,
+        ] {
             for rule in [Act::SiluMul, clamp, oai] {
                 assert_eq!(launch(ty, rule).ok(), Some(SwigluLaunch::Q128), "{ty}");
             }
@@ -1842,7 +1848,12 @@ mod tests {
             (SiteTy::Mxfp8, GgmlType::MXFP8, "MXFP8", None),
             (SiteTy::Fp8B128, GgmlType::FP8_B128, "FP8_B128", None),
             (SiteTy::Bf16, GgmlType::BF16, "BF16", None),
-            (SiteTy::Iq4Xs, GgmlType::IQ4_XS, "IQ4_XS", Some(GemmWeight::Iq4Xs)),
+            (
+                SiteTy::Iq4Xs,
+                GgmlType::IQ4_XS,
+                "IQ4_XS",
+                Some(GemmWeight::Iq4Xs),
+            ),
         ];
         assert_eq!(SiteTy::ALL.len(), expected.len());
         for (&s, (want, ty, label, grouped)) in SiteTy::ALL.iter().zip(expected) {
