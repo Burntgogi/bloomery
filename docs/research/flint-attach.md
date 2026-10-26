@@ -2,8 +2,8 @@
 
 Design snapshot: **`e53cabebbb9b16249c81b7c26a026da1670f7d9d`**, requested by
 [#632](https://github.com/midagedev/bloomery/issues/632). The source-gap observations below describe
-that snapshot. The current tree additionally has a **header-only reader**; it still has no Flint
-body, app session or serve seat. No GPU, inference, performance or weight-content validation is claimed.
+that snapshot. This component tree has a header-only reader and the ordinary IQ4_XS shared site,
+not a Flint body, app session or serve seat. Primitive GPU evidence below is not model admission.
 
 ## Host reader status
 
@@ -80,13 +80,26 @@ those same sites. IQ4_XS is not relabeled as a routed expert or requantized.
 the ordinary `SharedExpert` layout, unequal matrix widths, one/eight-column block
 execution and the wide-prompt transition/captured replay. Wide scratch holds only
 the q8_1 input and down forms these sites read. Its nonnegative constant-weight
-case derives a scalar floating-operation bound; it is not a whole-model accuracy
-pin. Exact-head hardware execution is required before claiming arithmetic or
-capture/replay support.
+case derives a scalar floating-operation bound; it is not a whole-model accuracy pin.
 
 Program-specific admission remains unchanged: in particular the legacy Qwen
 projection/shared dispatch does not gain this site automatically. This common
 site contract adds no model admission or kernel.
+
+On 2026-10-26, source `203f5125a3c48a5b700c6f43318cfcb9c77ff169` executed the owning
+DS41 library on Hikari GPU0 (RTX3090 cc8.6, driver595.91.07):38 passed,0 failed,0 ignored,
+28.61s, including the named IQ4 consumer above. Rust1.99.1 / pinned cuda-oxide9df9e7ce
+with repository patch31ab6a1d3f58 and LLVM21.1.8 were used.
+Its canonical comparison to main15778e2c covered4bins/8carriers/1657entries: all identical,
+non-JIT resource rows equal; no JIT-resource comparison is claimed.
+All-target native Clippy/formatting and current-head GitHub T0/lint passed.
+The original execution request5a907e86-7ac6-4219-a3b6-e3cf1de84e03 exited0 but credential
+cleanup remains unconfirmed; test success does not certify credential revocation.
+Raw logs and canonical manifests remain in the contribution workspace's
+`flint-closure-20261026` and its matching remote evidence directory. GPU1 was not stopped.
+Later documentation-only commits are not a new GPU execution. Wider affected real-model,
+placement and residency coverage remains explicit for maintainer review; #782 is review-ready,
+not merged, and this does not establish a Flint oracle, physical cc12.1, ROCm or performance.
 
 
 
