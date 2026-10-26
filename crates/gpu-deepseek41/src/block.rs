@@ -121,14 +121,13 @@ impl BlockPlan {
         !matches!(self.gate_up, GateUp::Split { .. })
     }
 
-    /// The plan of a block whose gate, up and down are `tys`: the q8_0 pair,
-    /// two sites over 128-value q8_1 blocks (the same Q4_K or Q5_K fused,
-    /// else split), or two f32-form sites. A split pair needs a down over
-    /// the same q8_1 form.
+    /// The plan of a block whose gate, up and down are `tys`: the q8_0 pair, two sites over
+    /// 128-value q8_1 blocks (the same Q4_K or Q5_K fused, else split), or two types that read
+    /// the f32 row for gate·up. A split pair needs a down over the same q8_1 activation form.
+    /// Another mix is refused by name as `what`'s.
     ///
     /// # Errors
-    /// A gate/up pair with incompatible activation forms, or a split pair
-    /// over a down of another form.
+    /// A gate and up whose activation forms disagree, or a split pair over a down of another form.
     pub fn of_types(
         what: &'static str,
         [gate, up, down]: [SiteTy; 3],
@@ -147,7 +146,7 @@ impl BlockPlan {
                     what,
                     format!(
                         "gate is {gate} and up is {up}: a block takes two q8_0, two sites over \
-                         128-value q8_1, or two types that read the f32 row"
+                         128-value q8_1 or two types that read the f32 row"
                     ),
                 ));
             }
@@ -668,7 +667,7 @@ mod tests {
     /// the types it came from. Mutant: the f32-form arm dropped — the MXFP8 triple is refused.
     #[test]
     fn the_plan_is_the_types_dispatch() {
-        use SiteTy::{Mxfp8, Q3K, Q4K, Q5K, Q6K, Q8_0};
+        use SiteTy::{Iq4Xs, Mxfp8, Q3K, Q4K, Q5K, Q6K, Q8_0};
         assert_eq!(plan([Q8_0, Q8_0, Q8_0]).unwrap(), BlockPlan::Q8);
         assert_eq!(plan([Q8_0, Q8_0, Q6K]).unwrap().gate_up, GateUp::Ds41);
         assert_eq!(plan([Q4K, Q4K, Q6K]).unwrap().gate_up, GateUp::Fused(Q4K));
@@ -677,6 +676,10 @@ mod tests {
         assert_eq!(plan([Q6K, Q6K, Q5K]).unwrap().gate_up, split(Q6K, Q6K));
         assert_eq!(plan([Q4K, Q5K, Q4K]).unwrap().gate_up, split(Q4K, Q5K));
         assert_eq!(plan([Q3K, Q3K, Q6K]).unwrap().gate_up, split(Q3K, Q3K));
+        assert_eq!(
+            plan([Iq4Xs, Iq4Xs, Iq4Xs]).unwrap().gate_up,
+            split(Iq4Xs, Iq4Xs)
+        );
         assert_eq!(
             plan([Mxfp8, Mxfp8, Mxfp8]).unwrap().gate_up,
             GateUp::Site {

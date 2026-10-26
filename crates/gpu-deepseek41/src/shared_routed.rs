@@ -1544,6 +1544,20 @@ mod tests {
         let gpu = Gpu::new().expect("card");
         let stream = gpu.stream();
         let weights = Weights::load_where(stream, &split, |name| NAMES.contains(&name)).unwrap();
+        assert_eq!(
+            model::placement::card_format_of_role(GgmlType::IQ4_XS, models::Role::SharedExpert),
+            Some(model::placement::CardFormat::KQuant)
+        );
+        for name in NAMES {
+            let Some(bloomery_gpu::weights::DevWeight::KQuant { ty, w, .. }) = weights.get(name)
+            else {
+                panic!("{name} must retain its IQ4_XS words");
+            };
+            assert_eq!(*ty, GgmlType::IQ4_XS);
+            let words = w.buf().to_host_vec(stream).unwrap();
+            let stored: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+            assert_eq!(stored, split.data(name).unwrap(), "{name}");
+        }
         let plan = BlockPlan::of_file(&split, "IQ4_XS shared", NAMES, (FF, N)).unwrap();
         plan.check_resident(&weights, "IQ4_XS shared", NAMES, (FF, N))
             .unwrap();
@@ -1588,6 +1602,9 @@ mod tests {
                 let types = plan.types();
                 let mut wide =
                     SharedWide::new(&gpu, (&types[..2], &types[2..]), (cols, N, FF)).unwrap();
+                assert!(wide.x.q128.is_some() && wide.h.q128.is_some());
+                assert!(wide.x.q32.is_none() && wide.h.q32.is_none());
+                assert!(wide.x.f32.is_none() && wide.h.f32.is_none());
                 wide.run(
                     (&gpu, &weights, &g32),
                     (&block, Act::SiluMul),

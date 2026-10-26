@@ -1141,6 +1141,7 @@ mod tests {
         assert_eq!(qwen3moe_dense(GgmlType::Q5_0), None);
         assert_eq!(qwen3moe_dense(GgmlType::NVFP4), None);
         assert_eq!(qwen3moe_dense(GgmlType::BF16), None);
+        assert_eq!(qwen3moe_dense(GgmlType::IQ4_XS), None);
         assert_eq!(head_of_widened(GgmlType::BF16), None);
         assert_eq!(embed_of_widened(GgmlType::BF16), None);
         assert!(head_of_widened(GgmlType::Q8_0).is_some());

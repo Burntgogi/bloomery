@@ -982,6 +982,11 @@ mod site_tests {
         let (q32, q128, q256) = (Some(32), Some(Q8_1_BLOCK), Some(QK_K));
         for arm in [Arm::Gemv, Arm::Gemm, Arm::Expert] {
             assert_eq!(site_rel(GgmlType::Q3_K, arm), q(q256, q128), "Q3_K {arm:?}");
+            assert_eq!(
+                site_rel(GgmlType::IQ4_XS, arm),
+                q(q256, q128),
+                "IQ4_XS {arm:?}"
+            );
             for ty in [GgmlType::Q4_K, GgmlType::Q5_K, GgmlType::Q6_K] {
                 assert_eq!(site_rel(ty, arm), q(q32, q128), "{ty} {arm:?}");
             }

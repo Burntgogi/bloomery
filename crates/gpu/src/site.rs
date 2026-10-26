@@ -23,7 +23,7 @@
 //! - [`kgemv`], a site at most eight columns over the q8_1 rows: Q3_K, Q4_K
 //!   and Q6_K their gemvs, row-major (`m` outputs a row; a Q6_K row of an odd
 //!   super-block count the down `_sel` over one expert, one column); Q5_K
-//!   the K-quant down `_sel` over a stack of one expert, token-major (a slot
+//!   and IQ4_XS the down `_sel` over a stack of one expert, token-major (a slot
 //!   a column); NVFP4 `nvfp4_gemv` over its planes times the tensor's scale,
 //!   token-major. [`kgemv_order`] is this family's layout and is
 //!   `None` for Q5_0. Where a body copies a row-major output token-major,
@@ -616,7 +616,7 @@ impl KGemvKernels {
 
 /// `y = W · act` for site `name` of type `ty` over the `act.m()` columns of
 /// the q8_1 rows `act`, laid out as [`kgemv_order`] says: Q4_K, Q6_K
-/// and Q3_K their gemvs, row-major; Q5_K the down `_sel` over the site as
+/// and Q3_K their gemvs, row-major; Q5_K and IQ4_XS the down `_sel` over the site as
 /// one expert, token-major, an id past it raising on `fault`; NVFP4 its gemv
 /// times the tensor's scale, token-major. Q8_0, F32, MXFP8, FP8_B128 and BF16 are [`gemv`];
 /// Q5_0 is [`blocks32_gemv`]. Each is refused here by name.
@@ -733,10 +733,10 @@ pub fn blocks32_gemv(
 }
 
 /// Where a site reads its weight: the resident tensor of a name
-/// (`Weights`), rows of it, or the K-quant words a caller holds — a window
-/// of experts laid out as the resident stack of the site's type, kept
+/// (`Weights`), rows of it, or the K-quant or IQ4_XS words a caller holds — a
+/// window of experts laid out as the resident stack of the site's type, kept
 /// outside `Weights`. Each carries the site's name, which a refusal names.
-/// Words under any other type than a K-quant's, and rows of a site whose
+/// Words under a type with no grouped GEMM, and rows of a site whose
 /// launch reads neither the f32 rows nor q8 blocks of 32, are refused by
 /// name ([`gemm`], [`gated`], [`resident_gemv_rows`]).
 #[derive(Clone, Copy)]
@@ -764,7 +764,7 @@ impl<'a> SiteWeight<'a> {
         }
     }
 
-    /// Words under a type that is not a K-quant's, and rows of a type whose
+    /// Words under a type with no grouped GEMM, and rows of a type whose
     /// launch reads neither the f32 rows nor q8 blocks of 32, refused by
     /// name as `what`.
     fn check(self, what: &'static str, ty: SiteTy) -> Result<(), GpuError> {
@@ -1464,8 +1464,8 @@ impl<'a> Gated<'a> {
         (ty, self.w, src)
     }
 
-    /// What the block refuses whatever the rows: words under a type that is
-    /// not a K-quant's, and a rule the down's SwiGLU launch lacks
+    /// What the block refuses whatever the rows: words under a type with no
+    /// grouped GEMM, and a rule the down's SwiGLU launch lacks
     /// ([`swiglu_launch`]) — checked before the first launch, so a block
     /// refused here has launched nothing.
     fn check(&self) -> Result<(), GpuError> {
@@ -1692,6 +1692,7 @@ mod tests {
     use gguf::Split;
     use gguf::quant::GgmlType;
     use gguf::write::{Layout, TensorDecl};
+    use model::placement::kernels;
 
     #[test]
     fn iq4_sites_keep_shape_and_launch_admission_separate() {
@@ -1705,11 +1706,36 @@ mod tests {
             &[],
             vec![
                 decl("shared", GgmlType::IQ4_XS, 2 * 136),
+                TensorDecl {
+                    name: "q8".to_owned(),
+                    dims: vec![64, 2],
+                    type_id: GgmlType::Q8_0.as_u32(),
+                    nbytes: 2 * 2 * 34,
+                },
+                decl("q3", GgmlType::Q3_K, 2 * 110),
+                decl("q5", GgmlType::Q5_K, 2 * 176),
+                decl("q50", GgmlType::Q5_0, 2 * 8 * 22),
+                decl("mx", GgmlType::MXFP8, 2 * 8 * 33),
+                decl("bf", GgmlType::BF16, 2 * 256 * 2),
                 decl("unsupported", GgmlType::IQ3_S, 2 * 110),
             ],
         )
         .unwrap();
         let file = Split::header_only("sites.gguf".into(), &layout).unwrap();
+        for (name, k, want) in [
+            ("q8", 64, SiteTy::Q8_0),
+            ("q3", 256, SiteTy::Q3K),
+            ("q5", 256, SiteTy::Q5K),
+            ("q50", 256, SiteTy::Q5_0),
+            ("mx", 256, SiteTy::Mxfp8),
+            ("bf", 256, SiteTy::Bf16),
+        ] {
+            assert_eq!(
+                file_site(&file, "test", name, (2, k), SiteTy::ALL).ok(),
+                Some(want),
+                "{name}"
+            );
+        }
         assert_eq!(
             file_site(&file, "test", "shared", (2, 256), SiteTy::ALL).ok(),
             Some(SiteTy::Iq4Xs)
@@ -1738,7 +1764,13 @@ mod tests {
             limit: 7.0,
         };
         let launch = |ty, rule| swiglu_launch((ty, "down"), rule);
-        for ty in [SiteTy::Q3K, SiteTy::Q4K, SiteTy::Q5K, SiteTy::Q6K] {
+        for ty in [
+            SiteTy::Q3K,
+            SiteTy::Q4K,
+            SiteTy::Q5K,
+            SiteTy::Q6K,
+            SiteTy::Iq4Xs,
+        ] {
             for rule in [Act::SiluMul, clamp, oai] {
                 assert_eq!(launch(ty, rule).ok(), Some(SwigluLaunch::Q128), "{ty}");
             }
@@ -1782,6 +1814,66 @@ mod tests {
         }
     }
 
+    /// Every site family is the common table's dense row, with its form and wide launch.
+    #[test]
+    fn every_family_is_the_tables_dense_row_of_one_type() {
+        let own = [
+            GgmlType::F8E4M3_ROWS,
+            GgmlType::MXFP8,
+            GgmlType::NVFP4_ROWS,
+            GgmlType::FP8_B128,
+        ];
+        for ty in gguf::QROWS.iter().map(|r| r.ty).chain(own) {
+            let family = SiteTy::of_ggml(ty);
+            if ty == GgmlType::F16 {
+                assert_eq!(family, Some(SiteTy::F32));
+                assert_eq!(kernels::dense(ty), None);
+                continue;
+            }
+            assert_eq!(family.is_some(), kernels::dense(ty).is_some(), "{ty}");
+            if let Some(s) = family {
+                assert_eq!(s.ggml(), ty, "{s}");
+            }
+        }
+        let expected = [
+            (SiteTy::Q3K, GgmlType::Q3_K, "Q3_K", Some(GemmWeight::Q3K)),
+            (SiteTy::Q4K, GgmlType::Q4_K, "Q4_K", Some(GemmWeight::Q4K)),
+            (SiteTy::Q5K, GgmlType::Q5_K, "Q5_K", Some(GemmWeight::Q5K)),
+            (SiteTy::Q6K, GgmlType::Q6_K, "Q6_K", Some(GemmWeight::Q6K)),
+            (SiteTy::Q5_0, GgmlType::Q5_0, "Q5_0", None),
+            (SiteTy::Q8_0, GgmlType::Q8_0, "Q8_0", None),
+            (SiteTy::F32, GgmlType::F32, "F32", None),
+            (SiteTy::Nvfp4, GgmlType::NVFP4, "NVFP4", None),
+            (SiteTy::Mxfp8, GgmlType::MXFP8, "MXFP8", None),
+            (SiteTy::Fp8B128, GgmlType::FP8_B128, "FP8_B128", None),
+            (SiteTy::Bf16, GgmlType::BF16, "BF16", None),
+            (
+                SiteTy::Iq4Xs,
+                GgmlType::IQ4_XS,
+                "IQ4_XS",
+                Some(GemmWeight::Iq4Xs),
+            ),
+        ];
+        assert_eq!(SiteTy::ALL.len(), expected.len());
+        for (&s, (want, ty, label, grouped)) in SiteTy::ALL.iter().zip(expected) {
+            assert_eq!(s, want);
+            assert_eq!(s.ggml(), ty);
+            assert_eq!(s.to_string(), label);
+            assert_eq!(gemm_weight(s), grouped);
+            assert_eq!(kgemv_order(s).is_some(), s.reads() == Form::Q8x128);
+            let by_name = model::placement::accepts::dense_by_name(ty);
+            assert_eq!(super::BY_NAME.contains(&s), by_name.is_some(), "{s}");
+            if let Some(entry) = by_name {
+                assert_eq!(SiteTy::of_entry(entry), Some(s), "{s}");
+            }
+        }
+        assert_eq!(SiteTy::Q5_0.reads(), Form::Q8Blocks32);
+        assert_eq!(kgemv_order(SiteTy::Q5_0), None);
+        assert_eq!(SiteTy::Nvfp4.reads(), Form::Q8x128);
+        assert_eq!(kgemv_order(SiteTy::Nvfp4), Some(Order::TokenMajor));
+        assert_eq!(SiteTy::Mxfp8.reads(), Form::F32);
+        assert_eq!(kgemv_order(SiteTy::Iq4Xs), Some(Order::TokenMajor));
+    }
     #[test]
     fn a_bf16_site_reads_the_f32_rows_and_is_a_gemv() {
         assert_eq!(SiteTy::of_ggml(GgmlType::BF16), Some(SiteTy::Bf16));
