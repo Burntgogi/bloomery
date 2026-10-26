@@ -127,6 +127,13 @@ The wrapper fixture loads each expert part through the selected program's `route
 compare real step, pass, batch and tier allocations and rows against the common leg. A mismatched
 gate/up pair remains refused; Solar's admitted Q6_K down is not a rejection case. Tier activation
 selection remains the family's contract, independently of the program-owned stack admission.
+
+The 2026-10-26 cutover removes the obsolete always-Q8 tier-reserve regression:
+selected mixed-layer and mismatched-gate/up coverage remains in
+`tier_scratch_follows_selected_mixed_layers`, with allocation and budget boundaries
+covered by the placement and GPU wrapper consumers. The MiniMax planner test retains
+its reserve and idle-tier behavior checks rather than comparing descriptor representation
+against a different constructor.
 Host-only projections intentionally have no card totals: fixed reserves remain owned by their machine.
 Only a dynamic tier-leg descriptor requires the plan's selected card totals. The existing node paging
 budget regression exercises this distinction without a GPU, including OS reserve and constrained host room.

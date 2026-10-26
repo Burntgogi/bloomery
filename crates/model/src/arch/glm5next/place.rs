@@ -1868,52 +1868,6 @@ mod tests {
             }
         }
 
-        /// The expert tier's prompt-batch reserve follows the down forms of the file's card layers:
-        /// its scratch is the card leg's one formula (`kernels::leg_bytes`, which `LegBufs::for_downs`
-        /// allocates by) over `TIER_CHUNK` tokens in each form a layer's down reads, the staging and
-        /// host terms beside it moved by no form. A K-quant file, a Q6_K down and a file with no card
-        /// layer reserve the 128-value form alone; an NVFP4 layer or a Q8_0 down the 32-value form; layers
-        /// of both, both, the tiles' layers (Q4_K gate and up over a Q5_K down) counted with the rest.
-        /// Mutants: the reserve of the 128-value form alone; the tiles' layers left out of the forms.
-        #[test]
-        fn the_tier_reserve_follows_the_routed_downs() {
-            use crate::placement::kernels::{DownAct, DownForms, leg_bytes};
-            use GgmlType::{IQ3_S, IQ4_XS, NVFP4, Q4_K, Q5_K, Q6_K, Q8_0};
-            let q8 = DownForms::of(DownAct::Q8Act);
-            let b32 = DownForms::of(DownAct::Q8Blocks32);
-            let base = tier_batch(&inputs()).expect("valid tier batch");
-            let hp = inputs().hp;
-            let leg = |forms| {
-                leg_bytes(
-                    TIER_CHUNK,
-                    hp.n_used as u64,
-                    hp.n_embd as u64,
-                    hp.expert_ff as u64,
-                    forms,
-                )
-            };
-            assert_ne!(leg(q8), leg(b32));
-            for (layers, forms) in [
-                (vec![[Q4_K, Q4_K, Q5_K]], q8),
-                (vec![[Q5_K, Q5_K, Q6_K]], q8),
-                (vec![[IQ3_S, IQ3_S, IQ4_XS]], q8),
-                (vec![[NVFP4; 3]], b32),
-                (vec![[Q4_K, Q4_K, Q8_0]], b32),
-                (
-                    vec![[IQ3_S, IQ3_S, IQ4_XS], [NVFP4; 3]],
-                    q8.with(DownAct::Q8Blocks32),
-                ),
-                (
-                    vec![[Q4_K, Q4_K, Q5_K], [NVFP4; 3]],
-                    q8.with(DownAct::Q8Blocks32),
-                ),
-            ] {
-                let batch = tier_batch(&routed_types(&layers)).expect("valid selected tier batch");
-                assert_eq!(batch.scratch, leg(forms), "{layers:?}");
-                assert_eq!(batch.staging, base.staging, "{layers:?}");
-                assert_eq!(batch.host, base.host, "{layers:?}");
-            }
-        }
 
         /// A Q5_K gate and up with a Q6_K down takes every expert on a card
         /// with room for the stack; a Q6_K gate and up takes none.
