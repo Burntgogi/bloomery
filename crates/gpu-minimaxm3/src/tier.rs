@@ -20,8 +20,8 @@ use gguf::Split;
 use model::arch::minimaxm3::host as minimax_host;
 use model::arch::minimaxm3::place::{self, PlanInputs};
 use model::moe::HostLayer;
+use model::placement::ModelTensors;
 use model::placement::workstation::TierBatchBytes;
-use model::placement::{ModelTensors, PlacementError};
 use model::r8file::R8Source;
 use models::{LayerSpec, Moe};
 

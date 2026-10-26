@@ -3239,40 +3239,6 @@ impl Fill<'_, '_> {
             .routed
             .unwrap_or(RoutedRule::PerType(CardFormat::of_routed));
         let uploads = card_uploads(self.model, self.c, self.rows, self.eligible, format)?;
-        let mut down_acts = if card.tier_leg.is_some() {
-            vec![None; self.model.layers]
-        } else {
-            Vec::new()
-        };
-        if card.tier_leg.is_some() {
-            for t in &self.model.tensors {
-                if t.role == Role::RoutedExperts
-                    && ExpertPart::of_name(&t.name) == Some(ExpertPart::Down)
-                    && let Some(l) = t.layer
-                    && let Some((_, act)) = crate::kernels::down(t.ty)
-                {
-                    down_acts[l] = Some(act);
-                }
-            }
-        }
-        let scratch = |counts: &[u64]| {
-            card.tier_leg.map_or(Ok(0), |leg| {
-                let forms = counts
-                    .iter()
-                    .zip(&down_acts)
-                    .filter_map(|(&n, &act)| (n > 0).then_some(act).flatten())
-                    .fold(crate::kernels::DownForms::NONE, |forms, act| {
-                        forms.with(act)
-                    });
-                leg.bytes(forms)
-            })
-        };
-        let bound = card
-            .tier_leg
-            .map(|leg| leg.bytes(leg.downs))
-            .transpose()?
-            .unwrap_or(0);
-        let reserves = card.selected_reserve_bytes(self.model, n_l)?;
         let footprint = Footprint::new(card.granule_bytes, &uploads);
         let mut down_acts = if card.tier_leg.is_some() {
             vec![None; self.model.layers]

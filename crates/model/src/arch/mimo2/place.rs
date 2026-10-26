@@ -19,7 +19,6 @@ use super::{roles, spec};
 use crate::arch::chat_of;
 use crate::arch::place_hybrid;
 use crate::placement::PlacementError;
-use crate::placement::kernels::{DownAct, DownForms};
 use crate::placement::workstation::{self, TierBatchBytes};
 
 // The ring rule's owner is `runtime::stores`; these names stay on this path for
@@ -102,7 +101,6 @@ pub fn prompt_shared_bytes(hp: &Hparams, cap: usize, card: bool) -> u64 {
             hp.expert_ff as u64,
             hp.n_used as u64,
             cap as u64,
-            DownForms::of(DownAct::Q8Act),
         ) as usize;
         leg + 2 * size_of::<f32>() * cap * n + size_of::<u32>() * cap * hp.n_used
     } else {
@@ -214,7 +212,6 @@ mod tests {
         prompt_unit_bytes, tier_batch, tier_reserve_bytes,
     };
     use crate::arch::synthetic::{V, header_shaped};
-    use crate::placement::kernels::{DownAct, DownForms};
     use crate::placement::{KvBytes, PlacementError, PlanLevers, workstation};
 
     /// A file whose next-token layers carry tensors is refused at

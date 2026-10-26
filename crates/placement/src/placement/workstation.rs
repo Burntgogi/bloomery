@@ -540,14 +540,8 @@ pub const fn walk_a_tile_scratch_bytes(n_embd: u64, ff: u64, n_used: u64, cols: 
 /// columns in the 128-value form ([`leg_bytes`]), in place of the tile path's
 /// scratch. Selected-form callers use [`tier_leg_batch_bytes_of`].
 #[must_use]
-pub const fn tier_chunk_scratch_bytes(
-    n_embd: u64,
-    ff: u64,
-    n_used: u64,
-    chunk: u64,
-    downs: DownForms,
-) -> u64 {
-    leg_bytes(chunk, n_used, n_embd, ff, downs)
+pub const fn tier_chunk_scratch_bytes(n_embd: u64, ff: u64, n_used: u64, chunk: u64) -> u64 {
+    leg_bytes(chunk, n_used, n_embd, ff, DownForms::of(DownAct::Q8Act))
 }
 
 /// The host's part of the tier's prompt-batch service: per exchange set, the

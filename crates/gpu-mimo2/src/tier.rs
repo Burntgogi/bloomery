@@ -34,8 +34,8 @@ use gguf::Split;
 use model::ModelError;
 use model::arch::mimo2::place::{self, PlanInputs};
 use model::moe::HostLayer;
+use model::placement::ModelTensors;
 use model::placement::workstation::TierBatchBytes;
-use model::placement::{ModelTensors, PlacementError};
 use model::r8file::R8Source;
 use models::LayerSpec;
 

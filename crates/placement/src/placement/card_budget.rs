@@ -209,7 +209,6 @@ mod tests {
     fn card(name: &str, ordinal: Option<u32>) -> Card {
         Card {
             name: name.to_owned(),
-            tier_leg: None,
             device: ordinal.map(|o| DeviceId {
                 ordinal: o,
                 uuid: [u8::try_from(o).expect("small") + 1; 16],
