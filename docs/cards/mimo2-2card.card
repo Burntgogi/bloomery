@@ -1,0 +1,57 @@
+# Round tierfam: MiMo-V2.6-Flash on both cards, plan (b′) (`--place bp`; the seat's unset `--place` takes it when two
+# cards are in view and the plan's tier holds at least the TIER_RULE's break-even): the A6000 the stage card (every
+# layer, the head, its hot routed experts under the residency machine), the 3090 an expert tier holding each routed
+# layer's next ids on the common card leg (MXFP4 planes, the Q8Act down), the host the rest. One sequence (the body
+# serves its tier beside one; `--parallel` past 1 runs `a`). Serving defaults, depth-serve rows.
+# Bytes [derived from the file's shapes, docs/cards/mimo2-r5.card]: an MXFP4 expert is 13,369,344 B; 47 routed layers
+# of 256 = 12,032 experts, 160.86 GB; a token's 376 picks (top 8) read 5.03 GB.
+# Measured at (a) (A6000 + host, the seat at its defaults, 0.3.1, README MiMo rows): 36.1 tok/s on a short prompt =
+# 27.7 ms a token; 34.8 after a 5,620-token prompt. The card side (dense gemvs, small kernels, nodes, 47 syncs) is
+# 10.82..13.79 ms [mimo2-r5.card]; the rest, 13.9..16.9 ms, is the 47 host legs: 296..360 us a layer, less the 21..36 us
+# floor, at 92.2..102.8 us an expert (13.37 MB at 130..145 GB/s): k_host = 2.5..3.6 host slots a layer under the
+# residency machine [derived from the measured row]. The host's ids (12,032 less the stage's ~3,150, 74 %) carry
+# 31..45 % of the picks.
+# Plan (b′) [derived from the placement's rule; gate-mimo2-meta pins the band]: the 3090's usable 25,350,373,376 B less
+# its 1,600 MiB set-aside, the tier batch's card bytes (86,312,960 B at 512 columns) and the scalar prompt reserve
+# (316,919,808 + the tier reserve 97,312 B) holds 1,690..1,740 experts on all 47 routed layers: 14.5 % of the ids,
+# ~20 % of the host's. The machine never admits a tier expert to the stage card (bloomery_gpu::host::swap, "The tier").
+# Decode, one token, D = 512 (serial per layer: the next layer's dense waits for this layer's sum):
+#   host DRAM   the tier takes 0.45..0.9 slots a layer off k_host (its ~20 % of the host's ids, the cold set's skew
+#               unmeasured): 41..93 us a layer, -1.9..-4.3 ms a token
+#   card SM     the A6000's dense side unchanged, 10.82..13.79 ms
+#   tier SM     0.45..0.9 slots a layer, 6..12 MB on the 3090 at ~700 GB/s (250 W): 9..17 us and its leg's launches,
+#               ~35..50 us a layer with the hand-off, inside the host leg's 0.2..0.3 ms: 0 on the wall
+#   PCIe        a layer's x row out (16 KB f32) and the tier's rows back (<1 slot x 16 KB): ~1.5 MB a token, under the
+#               host's shadow (0)
+#   step path   the tier back's wait and join (`ds41_ffn_card_acc_8_tier`, the add of x1): two launches a layer more
+#               than (a)'s wait-add, 0.1..0.3 ms; V4.1's bp steps sat 1.9..2.5 ms over its (a) calibration
+#               (docs/cards/glmbp-ab.card, c_two, source open): c = 0.1..2.5 ms
+#   NVMe        0 (every expert resident)
+#   => 27.7 - (1.9..4.3) + (0.1..2.5) = 23.5..28.3 ms: 35.3..42.6 tok/s; 38.0..42.6 when c is the launches alone.
+# Break-even E* [derived]: a host-set expert is picked 0.31..0.45 x 8 / (0.74 x 256) = 0.013..0.019 times a
+# token-layer, 1.61 us of host time a token at 97.6 us (uniform: 8/256, 3.05 us). E* = ceil(c / s): c = 2.5 ms, s =
+# 1.61 us gives 1,553 (uniform 820; c = 0.5 ms gives 311). The seat's TIER_RULE takes 1,553; the plan's 1,690..1,740
+# clears it, so an unset `--place` on the two cards runs bp.
+# Prompt (not this card's term): pp512 and pp4096 move by the tier's share of each unit's host union, ~20 % of the
+# host's experts; the measured (a) rows are the line.
+# Sitting (on the lead's go, both cards in the timing witness, after gate-gpu-mimo2-twocard is green):
+#   BLOOMERY_MODEL=mimo2 BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/mimo2-2card.card
+#     BLOOMERY_TIMING_CARDS=a6000+3090 DEPTH_SERVE_LOAD_EST=41' just depth-serve <this tree>:512 <this tree>:4096
+kind: baseline
+question: what does the MiMo-V2.6-Flash seat decode at depth 512 on plan (b′), the A6000 the stage and the 3090 an
+  expert tier beside the host, at the serving defaults?
+term: tg tok/s @ n=1, D = 512, bloomery-serve --model mimo2 at the serving defaults (place unset -> bp), A6000 + 3090
+  + host, depth-serve rows (timings.predicted_per_second over 127 steps)
+unit: tok/s
+predict: 35.3..42.6
+condition: depth-serve under BLOOMERY_TIMING_CARDS=a6000+3090 in its own lease, one fresh server a row; the server's
+  `place unset` record names bp and its `plan` record a tier0 card holding experts, else the row is void; the witness
+  (both cards, mem, pgmajfault) shows no other model load and the host's experts resident (majflt near 0)
+reason: the user asked that every supported model take the second card; this is the first row of MiMo's two-card plan,
+  and it decides whether the TIER_RULE's break-even stands
+decide-in: write the two-card row with its lease and witness beside the (a) row in the README's MiMo table
+decide-below: read the plan record's tier experts against 1,690..1,740 and the step's per-layer tier wait; a tier
+  hand-off past the host leg's 0.2..0.3 ms a layer, or c past 2.5 ms a token, is the finding, and the TIER_RULE's
+  break-even moves up (or to None) by it
+decide-above: re-derive the host term: the tier's ids carried more of the picks than their share of the host's ids
+  (the cold set's skew), or the host leg ran faster at the smaller k_host than its bytes say

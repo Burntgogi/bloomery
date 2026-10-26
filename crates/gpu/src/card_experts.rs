@@ -7,8 +7,9 @@
 //! One run is six launches, over `m` tokens of a layer's normed rows:
 //! - the card leg's four (`card_leg`): the normed rows in q8_1, the gate·up
 //!   `_sel` with the routed SwiGLU (slot `s` against column `s / n_used`), the
-//!   q8_1 of the card slots' `h` columns (the host's slots are left alone) and
-//!   the down `_sel`;
+//!   card slots' `h` columns in the form the layer's down reads (q8_1 blocks of
+//!   128 or q8 blocks of 32; the host's slots are left alone) and the down
+//!   `_sel`;
 //! - the card slots' weighted sum, a token's slots in slot order (the leg's
 //!   sum stage, `card_slots`);
 //! - the sum plus the base the layer's back adds the host's sum to
@@ -28,16 +29,31 @@
 //! stage card's slots' downs stay in the leg's rows ([`TierJoin`]) and the
 //! layer's join sums them with the tier's rows in one slot order. [`CardExperts::new`]
 //! refuses a map that names a tier by name: those experts hang none.
+//!
+//! Under the expert stream ([`CardExperts::enqueue_rows_ring`]) the streamed
+//! experts' slots of a prompt batch run as route GEMMs over the ring's half
+//! (`card_leg::RouteBlock`, the 32-value GEMM over the half's planes), one
+//! GEMM batch a landing batch of the stream behind that batch's copies, each
+//! expert's weights read once a tile of up to 64 of its slots; the card's own
+//! slots stay on the leg's `_sel` launches, whose rows are the step's.
+
+use std::mem::ManuallyDrop;
 
 use cuda_core::{CudaStream, DeviceBuffer};
 use model::arch::models::{Ffn, LayerSpec};
+use model::arch::place_hybrid::RingForms;
 use model::placement::accepts::{self, LegArms, Program};
-use model::placement::kernels::{self, DownForms};
+use model::placement::kernels::{self, DownAct, DownForms};
 
-use crate::card_leg::{CardLeg, LegBufs, LegRun, LegShape, LegStacks, LegSum};
+use crate::card_leg::{
+    self, CardLeg, LegBufs, LegRun, LegShape, LegStacks, LegSum, RouteBlock, RouteW,
+};
 use crate::card_slots::{CardSlotKernels, Places};
+use crate::gemm::Gemm32Kernels;
+use crate::host::xstream::RingLayer;
 use crate::hybrid::SlotMap;
 use crate::kquant::Act;
+use crate::ring_gemm::RingGemm;
 use crate::weights::Weights;
 use crate::{DeviceTensor, Gpu, GpuError};
 
@@ -93,13 +109,12 @@ struct CardBufs {
 
 impl CardBufs {
     /// The buffers for runs of up to `cap` tokens of `n` values through
-    /// experts of `ff` rows. Load-time or first-prompt only.
+    /// experts of `ff` rows, the slots' columns held in each form of `downs`.
+    /// Load-time or first-prompt only.
     fn new(
         stream: &CudaStream,
         family: &CardFamily,
-        n: usize,
-        ff: usize,
-        cap: usize,
+        (n, ff, cap): (usize, usize, usize),
         downs: DownForms,
     ) -> Result<CardBufs, GpuError> {
         Ok(CardBufs {
@@ -136,14 +151,18 @@ impl CardBufs {
 pub struct CardBatch {
     bufs: CardBufs,
     sel: DeviceBuffer<u32>,
+    /// The ring pass's GEMM buffers in the 32-value form, once the expert
+    /// stream armed them ([`CardExperts::arm_ring`]).
+    ring: Option<RingGemm>,
 }
 
 impl CardBatch {
     /// Device bytes of the buffers: what [`CardExperts::batch`] allocates,
-    /// counted before it does by [`CardExperts::batch_bytes`].
+    /// counted before it does by [`CardExperts::batch_bytes`], and the ring
+    /// pass's once armed.
     #[must_use]
     pub fn bytes(&self) -> usize {
-        self.bufs.bytes() + self.sel.num_bytes()
+        self.bufs.bytes() + self.sel.num_bytes() + self.ring.as_ref().map_or(0, RingGemm::bytes)
     }
 
     /// The sum plus the base of the last run over the batch, `t` rows.
@@ -193,6 +212,33 @@ impl CardLayer {
     /// The stacks' names, as the card leg reads them.
     fn names(&self) -> [&str; 3] {
         self.names.each_ref().map(String::as_str)
+    }
+}
+
+/// The form the down stack of `layer`, of type `ty`, reads ([`kernels::down`]);
+/// a type the table names no down entry for is refused by name (`what`).
+fn down_act(
+    what: &'static str,
+    layer: &CardLayer,
+    ty: gguf::GgmlType,
+) -> Result<DownAct, GpuError> {
+    kernels::down(ty)
+        .map(|(_, act)| act)
+        .ok_or_else(|| GpuError::Tensor {
+            what,
+            name: layer.names[2].clone(),
+            need: "a down stack of a type the kernel table names a down entry for",
+        })
+}
+
+/// The forms a load's leg buffers hold: the forms `downs` the card layers'
+/// downs read, or the 128-value [`DownAct::Q8Act`] on a load with no card
+/// layer (a tier card's join reads only the buffers' down rows).
+fn card_downs(downs: DownForms) -> DownForms {
+    if downs == DownForms::NONE {
+        DownForms::of(DownAct::Q8Act)
+    } else {
+        downs
     }
 }
 
@@ -330,13 +376,10 @@ impl CardExperts {
             }
             let stacks = LegStacks::of_arms(w, layer.names(), arms, STACK_ROLES)?;
             stacks.check(n_card, family.shape(n, ff, 1))?;
-            let (_, act) = kernels::down(stacks.down_ty()).ok_or(GpuError::state(
-                what,
-                "the selected card down's activation form",
-            ))?;
-            downs = downs.with(act);
+            downs = downs.with(down_act(what, &layer, stacks.down_ty())?);
             per.push(Some(layer));
         }
+        let downs = card_downs(downs);
         Ok(CardExperts {
             family,
             k: CardKernels {
@@ -349,9 +392,9 @@ impl CardExperts {
             ff,
             n,
             downs,
-            step: CardBufs::new(gpu.stream(), &family, n, ff, 1, downs)?,
+            step: CardBufs::new(gpu.stream(), &family, (n, ff, 1), downs)?,
             pass: (rows > 1)
-                .then(|| CardBufs::new(gpu.stream(), &family, n, ff, rows, downs))
+                .then(|| CardBufs::new(gpu.stream(), &family, (n, ff, rows), downs))
                 .transpose()?,
         })
     }
@@ -437,24 +480,58 @@ impl CardExperts {
     pub fn batch(&self, gpu: &Gpu, cap: usize) -> Result<CardBatch, GpuError> {
         let stream = gpu.stream();
         Ok(CardBatch {
-            bufs: CardBufs::new(stream, &self.family, self.n, self.ff, cap, self.downs)?,
+            bufs: CardBufs::new(stream, &self.family, (self.n, self.ff, cap), self.downs)?,
             sel: DeviceBuffer::zeroed(stream, cap * self.family.n_used)?,
+            ring: None,
         })
     }
 
+    /// The ring pass's GEMM buffers in `cb` for a half of `half_slots` slots
+    /// of the expert stream's ring ([`RingGemm`], in the 32-value form the
+    /// ring pass reads): made once, when the stream starts; a second arming at
+    /// the same half is nothing. Refused by name: a re-arming at another half,
+    /// and buffers whose made bytes are not `place_hybrid::ring_pass_bytes` of
+    /// their widths. Load-time or first-prompt only.
+    pub fn arm_ring(
+        &self,
+        gpu: &Gpu,
+        cb: &mut CardBatch,
+        half_slots: usize,
+    ) -> Result<(), GpuError> {
+        let what = self.family.what;
+        if let Some(r) = &cb.ring {
+            if r.half_slots() == half_slots {
+                return Ok(());
+            }
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "the ring pass's buffers armed for a half of {} slots, asked for {half_slots}",
+                    r.half_slots()
+                ),
+            ));
+        }
+        let shape = (cb.bufs.cap(), self.family.n_used, self.n, self.ff);
+        let ring = RingGemm::new(gpu, shape, half_slots, RingForms::BLOCKS32)?;
+        cb.ring = Some(ring);
+        Ok(())
+    }
+
     /// Device bytes of [`CardExperts::batch`]'s buffers for `cap` tokens
-    /// ([`CardBatch::bytes`]'s formula): the card leg's, the
-    /// card sum and the sum plus the base, and the places.
+    /// ([`CardBatch::bytes`]'s formula): the card leg's in the card layers'
+    /// down forms ([`kernels::leg_bytes`]), the card sum and the sum plus the
+    /// base, and the places.
     #[must_use]
     pub fn batch_bytes(&self, cap: usize) -> usize {
+        let shape = self.family.shape(self.n, self.ff, cap);
         let leg = kernels::leg_bytes(
-            cap as u64,
-            self.family.n_used as u64,
-            self.n as u64,
-            self.ff as u64,
+            shape.cap as u64,
+            shape.slots_per_col as u64,
+            shape.n as u64,
+            shape.ff as u64,
             self.downs,
         );
-        usize::try_from(leg).expect("the card leg's bytes fit a usize")
+        usize::try_from(leg).expect("the leg's bytes fit a usize")
             + 2 * size_of::<f32>() * cap * self.n
             + size_of::<u32>() * cap * self.family.n_used
     }
@@ -562,6 +639,162 @@ impl CardExperts {
             &cb.sel,
         )
     }
+
+    /// [`CardExperts::enqueue_rows`] with the expert stream's ring `r` of
+    /// layer `l` beside the card's stacks (a walk under `split`): the card's
+    /// slots run over its stacks under the slot map's places (the leg's
+    /// `_sel` launches); then the streamed experts' slots, one GEMM batch a
+    /// landing batch of `r` ([`RingLayer::batches`]): the route table of the
+    /// batch's map row (its experts at their ring slots, every other
+    /// [`crate::hybrid::HOST`]), the engine stream's wait on the batch's
+    /// copies, and the gate, up, SwiGLU under `rule` and down GEMMs over the
+    /// half's stacks ([`card_leg::with_ring`], `RouteBlock`), each slot's down
+    /// rows into the leg's rows beside the card's; then the card sum over the
+    /// union row's places — the layer's `n_card` and the `r.n` streamed
+    /// experts, a token's slots in slot order — plus the base into `cb`'s
+    /// `pre`. A batch's GEMMs run while the copies of the batches after it
+    /// land. The places share `cb`'s, each written after the run before it on
+    /// the one stream. Refused by name: a layer an expert tier holds experts
+    /// of (the ring serves the stage card of a load with no tier), a half
+    /// holding more experts than its slots, a batch whose ring pass buffers
+    /// were not armed ([`CardExperts::arm_ring`]) or were armed for another
+    /// half, and ring stacks the 32-value GEMM does not read.
+    pub fn enqueue_rows_ring(
+        &self,
+        (gpu, w, g32): (&Gpu, &Weights, &Gemm32Kernels),
+        cb: &mut CardBatch,
+        (l, rule): (usize, Act),
+        io: &Io<'_>,
+        (ids, map, row_off): (&DeviceBuffer<u32>, &DeviceTensor<u32>, usize),
+        r: &RingLayer,
+    ) -> Result<(), GpuError> {
+        let what = self.family.what;
+        let layer = layer_of(what, &self.layers, l)?;
+        if io.m == 0 || io.m > cb.bufs.cap() {
+            return Err(GpuError::Shape {
+                what,
+                detail: format!("a batch of {} tokens in buffers of {}", io.m, cb.bufs.cap()),
+            });
+        }
+        if self.tier.get(l).is_some_and(|&k| k > 0) {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "layer {l}: the expert stream's ring on a layer the expert tier holds experts of"
+                ),
+            ));
+        }
+        if r.n > r.half_slots {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "layer {l}: a ring of {} experts in a half of {} slots",
+                    r.n, r.half_slots
+                ),
+            ));
+        }
+        let CardBatch { bufs, sel, ring } = cb;
+        let rg = ring.as_mut().ok_or(GpuError::State {
+            what,
+            missing: "the ring pass's GEMM buffers (CardExperts::arm_ring at the stream's start)",
+        })?;
+        if rg.half_slots() != r.half_slots {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "layer {l}: the ring pass's buffers armed for a half of {} slots, the ring's \
+                     is {}",
+                    rg.half_slots(),
+                    r.half_slots
+                ),
+            ));
+        }
+        let (stream, ctx) = (gpu.stream(), gpu.context());
+        let fault = gpu.layer_sink(l)?;
+        let (n_expert, n_used) = (self.family.n_expert, self.family.n_used);
+        let n_slots = io.m * n_used;
+        let places = |map: &DeviceBuffer<u32>, row_off: usize, sel: &mut DeviceBuffer<u32>| {
+            self.k.places.enqueue_places(
+                stream,
+                &Places {
+                    ids,
+                    n: n_slots,
+                    map,
+                    row_off,
+                    n_expert,
+                },
+                fault,
+                sel,
+            )
+        };
+        let stacks = LegStacks::of_arms(w, layer.names(), self.k.arms, STACK_ROLES)?;
+        places(map.buf(), row_off, &mut *sel)?;
+        let card = LegRun {
+            layer: l,
+            stacks: &stacks,
+            normed: io.normed,
+            m: io.m,
+            sel: &*sel,
+            n_card: layer.n_card,
+            rule,
+        };
+        self.k.leg.enqueue(gpu, &mut bufs.leg, &card, None)?;
+        rg.enqueue_rows(gpu, g32, io.normed, io.m, fault)?;
+        card_leg::with_ring(&stacks, layer.n_card, r, ctx, |half| {
+            let [gate, up, down] = half.routes()?;
+            if [gate, up, down]
+                .iter()
+                .any(|w| matches!(w, RouteW::Grouped(..)))
+            {
+                return Err(GpuError::shape(
+                    what,
+                    format!(
+                        "layer {l}: ring stacks the grouped GEMM reads; the ring pass runs the \
+                         32-value GEMM alone"
+                    ),
+                ));
+            }
+            let blk = RouteBlock {
+                gate,
+                up,
+                down,
+                ff: self.ff,
+                hidden: self.n,
+            };
+            for b in &r.batches {
+                rg.enqueue_batch(
+                    gpu,
+                    (None, g32),
+                    &blk,
+                    b,
+                    (ids, n_slots, n_used, n_expert),
+                    (bufs.leg.down_mut(), rule),
+                    fault,
+                )?;
+            }
+            Ok(())
+        })?;
+        // SAFETY: the union row is `n_expert` words of the stream's mapped
+        // rows (`XStream::ring_layer`), allocated while the stream lives, past
+        // these launches; the window is given back below.
+        let union_map = unsafe { crate::tensor::window::<u32>(r.union_map, n_expert, ctx) };
+        let ran = (|| {
+            places(&union_map, 0, &mut *sel)?;
+            let CardBufs { leg, acc, pre } = &mut *bufs;
+            let sum = LegSum {
+                w: io.weights,
+                acc: &mut *acc,
+            };
+            let n_card = layer.n_card + r.n;
+            self.k
+                .leg
+                .sum_rows(gpu, leg, &*sel, (l, io.m, n_card), sum)?;
+            gpu.elem()
+                .enqueue_add(stream, acc, io.x1, io.m * self.n, pre)
+        })();
+        drop(ManuallyDrop::into_inner(union_map).into_raw_parts());
+        ran
+    }
 }
 
 impl CardKernels {
@@ -614,6 +847,10 @@ mod tests {
     use gguf::GgmlType;
     use gguf::write::{Layout, TensorDecl, Writer};
     use model::arch::models::{self, Mixer, Moe, Residual, Router, RouterNorm, Score};
+    use model::placement::{
+        Device, ExpertList, ExpertPart, Format, ModelTensor, ModelTensors, Role, RoutedRule, Row,
+        Segment,
+    };
 
     use crate::card_leg::tests::stack_bytes;
     use crate::host::leg_tier::LegTier;
@@ -660,13 +897,30 @@ mod tests {
         ]
     }
 
+    fn tier_act(moe: &Moe) -> Result<Act, GpuError> {
+        Ok(Act::SwigluClamp {
+            limit: moe.act.swiglu_limit(),
+        })
+    }
+
     fn weights(gpu: &Gpu, triples: &[[GgmlType; 3]]) -> Weights {
         let mut decls = Vec::new();
         let mut data = Vec::new();
+        let mut tensors = Vec::new();
         for (l, triple) in triples.iter().enumerate() {
             for (part, (name, &ty)) in (FAMILY.stacks)(l).into_iter().zip(triple).enumerate() {
                 let (rows, k) = if part == 2 { (N, FF) } else { (FF, N) };
                 let bytes = stack_bytes(ty, CARD * rows, k, 7 + (3 * l + part) as u64);
+                tensors.push(ModelTensor {
+                    name: name.clone(),
+                    shard: 0,
+                    layer: Some(l),
+                    role: Role::RoutedExperts,
+                    ty,
+                    dims: vec![k as u64, rows as u64, CARD as u64],
+                    file_bytes: bytes.len() as u64,
+                    gathered_rows: None,
+                });
                 decls.push(TensorDecl {
                     name,
                     dims: vec![k as u64, rows as u64, CARD as u64],
@@ -690,7 +944,48 @@ mod tests {
         }
         writer.finish().expect("a finished file");
         let file = gguf::Split::open(&path).expect("the file");
-        let weights = Weights::load_where(gpu.stream(), &file, |_| true).expect("resident stacks");
+        // IQ3_S has a selected expert row arm, not a generic device format.
+        let model = ModelTensors {
+            tensors,
+            layers: triples.len(),
+            experts: EXPERTS as u64,
+            experts_used: USED as u64,
+            bf16_words: |_| false,
+        };
+        let RoutedRule::Leg { gate_up, down, .. } = accepts::routed_rule(FAMILY.program) else {
+            panic!("the fixture family must select a card leg");
+        };
+        let rows = model
+            .tensors
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                let format = match ExpertPart::of_name(&t.name).expect("a routed part") {
+                    ExpertPart::Gate | ExpertPart::Up => gate_up(t.ty),
+                    ExpertPart::Down => down(t.ty),
+                }
+                .expect("the selected arm's format");
+                let mut segment = Segment {
+                    device: Device::Card(0),
+                    format: Format::Card(format),
+                    experts: Some(ExpertList::prefix(CARD as u64).expect("the card prefix")),
+                    resident_bytes: 0,
+                };
+                segment.resident_bytes = segment
+                    .buffer_bytes(t, model.experts_of(t))
+                    .expect("the selected format's buffers")
+                    .into_iter()
+                    .sum();
+                Row {
+                    tensor: i,
+                    segments: vec![segment],
+                    read_bytes: t.file_bytes,
+                    stage: 0,
+                }
+            })
+            .collect::<Vec<_>>();
+        let weights = Weights::load_rows(gpu.stream(), &file, &model, &rows, 0)
+            .expect("resident expert stacks");
         std::fs::remove_file(path).expect("remove the fixture");
         weights
     }
@@ -753,7 +1048,7 @@ mod tests {
                 vec![(0..CARD as u32).collect(); triples.len()],
             )
             .expect("the tier set");
-            let mut tier = LegTier::new(&gpu, &specs, &set, &w, shape, FAMILY.program)
+            let mut tier = LegTier::new(&gpu, &specs, &set, &w, shape, FAMILY.program, tier_act)
                 .expect("the tier wrapper");
             assert_eq!(tier.block_bytes(), counted(shape.cap));
             let host_x: Vec<f32> = (0..CAP * N).map(|i| (i % 71) as f32 / 71.0 - 0.5).collect();
@@ -901,30 +1196,46 @@ mod tests {
             }
             assert!(gpu.take_fault().expect("the fault word").is_none());
         }
-        for (triple, program) in [
-            ([IQ3_S, Q5_K, Q8_0], Program::Qwen35Body),
-            ([Q5_K, Q5_K, Q6_K], Program::Solar2Body),
-        ] {
-            let w = weights(&gpu, &[triple]);
-            let specs = layers(1);
-            let map = SlotMap::prefix(0..1, EXPERTS, CARD).expect("a map");
-            let family = CardFamily { program, ..FAMILY };
-            assert!(
-                matches!(
-                    CardExperts::new(&gpu, &w, family, &specs, &map, (N, FF), CAP),
-                    Err(GpuError::Tensor { .. }),
+        let triple = [IQ3_S, Q5_K, Q8_0];
+        let program = Program::Qwen35Body;
+        let w = weights(&gpu, &[triple]);
+        let specs = layers(1);
+        let map = SlotMap::prefix(0..1, EXPERTS, CARD).expect("a map");
+        let family = CardFamily { program, ..FAMILY };
+        assert!(
+            matches!(
+                CardExperts::new(&gpu, &w, family, &specs, &map, (N, FF), CAP),
+                Err(GpuError::Tensor { .. }),
+            ),
+            "{program:?}: {triple:?}"
+        );
+        let set =
+            TierSet::new(0..1, EXPERTS, vec![(0..CARD as u32).collect()]).expect("a tier set");
+        assert!(
+            matches!(
+                LegTier::new(
+                    &gpu, &specs, &set, &w, family.shape(N, FF, 2), program, tier_act,
                 ),
-                "{program:?}: {triple:?}"
-            );
-            let set =
-                TierSet::new(0..1, EXPERTS, vec![(0..CARD as u32).collect()]).expect("a tier set");
-            assert!(
-                matches!(
-                    LegTier::new(&gpu, &specs, &set, &w, family.shape(N, FF, 2), program),
-                    Err(GpuError::Tensor { .. }),
-                ),
-                "{program:?}: {triple:?}"
-            );
-        }
+                Err(GpuError::Tensor { .. }),
+            ),
+            "{program:?}: {triple:?}"
+        );
+    }
+
+    /// A load's leg buffers hold the forms its card layers' downs read — the
+    /// 32-value form for NVFP4's, both for a mix — and the 128-value form on a
+    /// load with no card layer. Mutant: the buffers back on the 128-value form
+    /// alone (an NVFP4 layer's down finds no q8 blocks of 32 and is refused at
+    /// its first run).
+    #[test]
+    fn the_leg_buffers_hold_the_card_downs_forms() {
+        let q8 = DownForms::of(DownAct::Q8Act);
+        let b32 = DownForms::of(DownAct::Q8Blocks32);
+        assert_eq!(card_downs(DownForms::NONE), q8);
+        assert_eq!(card_downs(q8), q8);
+        assert_eq!(card_downs(b32), b32);
+        assert!(!card_downs(b32).holds(DownAct::Q8Act));
+        let both = q8.with(DownAct::Q8Blocks32);
+        assert_eq!(card_downs(both), both);
     }
 }

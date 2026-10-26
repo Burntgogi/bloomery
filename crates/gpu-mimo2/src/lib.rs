@@ -6,8 +6,8 @@
 //! shared-expert gate·up and the 256-expert sigmoid router
 //! `bloomery-gpu-deepseek41`'s, and the card experts the common per-slot pair
 //! of the kernel table (`bloomery-gpu`). The routed experts the plan puts on
-//! the card run there, in the host leg's shadow; the rest run on the host
-//! tier.
+//! the card run there, in the host leg's shadow; those the plan puts on an
+//! expert tier card run on its common leg; the rest run on the host tier.
 //!
 //! - [`body`]: the load, the stores, the step's buffers and [`body::Body`]
 //!   behind `GpuModel`;
@@ -15,11 +15,15 @@
 //! - `body::slots`: the pass of several slots' rows, one walk over their
 //!   columns;
 //! - [`body::prefill`]: the prompt fed in batches, bit for bit the steps;
+//! - [`body::seq`]: a sequence's K and V rows on the host, what a prompt
+//!   cache resumes;
 //! - `attn`: the attention sub-layer;
 //! - `ffn`: the dense block and the routed block around its host leg;
 //! - `card`: the routed block's card experts, one run for the step and for a
 //!   prompt batch;
-//! - `swap`: the stack table the residency machine's file source reads.
+//! - `swap`: the stack table the residency machine's file source reads;
+//! - [`tier`]: the expert tier card's leg family and the stage card's side of
+//!   it, for the step and for a prompt batch.
 //!
 //! What each layer's launches take, and the step's node counts, are facts of
 //! the file's description (`model::arch::mimo2::program`), where their tests
@@ -33,9 +37,11 @@ mod card;
 mod ffn;
 mod program;
 pub mod swap;
+pub mod tier;
 
 pub use body::prefill::{
     FLASH_ROWS, PrefillMode, PromptBytes, T_MAX, feed, prefill, prefill_group, prefill_mode,
     prompt_bytes, set_prefill, set_prefill_group,
 };
+pub use body::seq::{MimoSeq, seq_bytes, seq_resume, seq_resume_prefix, seq_save};
 pub use body::{Body, Mimo2Model, StepInput, set_taps};

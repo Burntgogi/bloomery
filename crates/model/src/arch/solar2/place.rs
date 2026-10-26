@@ -1,8 +1,9 @@
 //! A Solar-Open2 file planned onto a machine: the common hybrid owner's plan
 //! ([`place_hybrid`]) over this family's reading. What each layer holds is read off the
 //! description (a KDA layer's state, a NoPE GQA layer's planes), and the card experts' formats are
-//! the common leg's; the expert tier card a machine names holds the next ids of each card layer on
-//! that leg. The family's own is the reading.
+//! the common leg's. A Q6_K down beside a gate and up the leg runs is a card layer; the down reads
+//! the leg's `Q8Act` columns. The expert tier card a machine names holds the next ids of each card
+//! layer on that leg. The family's own is the reading.
 
 use std::collections::BTreeSet;
 
@@ -18,7 +19,8 @@ use crate::placement::kernels::q8_act_bytes;
 use crate::placement::workstation::TierBatchBytes;
 use crate::placement::{ModelTensors, PlacementError, workstation};
 
-pub use place_hybrid::{KvLayout, PlaceError};
+pub use place_hybrid::{GEMM_TILE_COLS, GEMM32_STEP, KvLayout, PlaceError};
+use place_hybrid::{route_bytes, tier_places_bytes, wide_bytes};
 
 /// What a plan of a Solar-Open2 file is made from, read from its headers.
 pub type PlanInputs = place_hybrid::PlanInputs<Hparams>;
@@ -34,11 +36,6 @@ pub const PROMPT_ROWS: usize = crate::moe::UNION_MAX_COLS;
 pub const FLASH_SEGMENTS: usize = 80;
 /// See [`FLASH_SEGMENTS`].
 pub const PARTIAL_ROWS: usize = 8;
-/// The columns a GEMM tile holds (the route's tile table) and the values a 32-value form's step
-/// covers; the body holds them equal to the kernels' by assertion.
-pub const GEMM_TILE_COLS: usize = 64;
-/// See [`GEMM_TILE_COLS`].
-pub const GEMM32_STEP: usize = 64;
 
 /// Tokens a chunk of the tier's prompt-batch service runs at most: the card leg's launch group of
 /// the stage card's card experts, which the body binds to its own constant.
@@ -50,50 +47,13 @@ pub const TIER_CHUNK: u64 = 8;
 /// checks its allocations against them.
 pub fn tier_batch(inputs: &PlanInputs) -> Result<TierBatchBytes, PlacementError> {
     let hp = &inputs.hp;
-    workstation::tier_leg_batch_bytes(
+    workstation::try_tier_leg_batch_bytes_of(
         hp.n_embd as u64,
         hp.experts.ff as u64,
         hp.experts.n_used as u64,
-        TIER_CHUNK,
-        crate::moe::UNION_MAX_COLS as u64,
+        (TIER_CHUNK, crate::moe::UNION_MAX_COLS as u64),
         leg_down_forms(Program::Solar2Body, &inputs.model),
     )
-}
-
-/// The card bytes a tiered load makes beside [`prompt_reserve_bytes`]: per routed slot of the
-/// prompt batch's `rows` rows (`n_used` a row), the tier place, the copy of it the join reads and
-/// the copy of the slot's route weight, three four-byte words.
-#[must_use]
-pub fn tier_places_bytes(hp: &Hparams, rows: usize) -> u64 {
-    3 * 4 * (rows * hp.experts.n_used) as u64
-}
-
-/// Card bytes of the q8 blocks of 32 of `cols` columns of `k` values (Q8_0 and Q5_0 sites' input,
-/// `GemmAct32`): per column `16 + 2 + 2` words a step of [`GEMM32_STEP`] values.
-const fn act32_bytes(cols: usize, k: usize) -> usize {
-    4 * cols * 20 * k.div_ceil(GEMM32_STEP)
-}
-
-/// The most card bytes the forms a GEMM reads take at `k` values a column, `cols` columns: both,
-/// where the width allows them. The load makes the ones its sites' types read.
-const fn wide_bytes(cols: usize, k: usize) -> usize {
-    let q128 = if k.is_multiple_of(256) {
-        q8_act_bytes(cols as u64, k as u64) as usize
-    } else {
-        0
-    };
-    let q32 = if k.is_multiple_of(32) {
-        act32_bytes(cols, k)
-    } else {
-        0
-    };
-    q128 + q32
-}
-
-/// Card bytes of the GEMM route's table of `cols` slots over one expert: the slot list, the tiles
-/// (a [`GEMM_TILE_COLS`] column tile each, and the expert's), the two counts and the all-zero ids.
-const fn route_bytes(cols: usize) -> usize {
-    4 * (cols + 2 * (cols / GEMM_TILE_COLS + 1) + 2 + cols)
 }
 
 /// The most card bytes the single-column activation forms of one step take at width `k`: the q8_1
@@ -201,7 +161,7 @@ impl PlanInputs {
         // No parser is declared: see `spec`.
         let spec = spec::spec_of(&hp, chat_of(split, None, None)?)?;
         let reserve = prompt_reserve_bytes(&hp, &spec, &model, PROMPT_ROWS)?;
-        let tier = tier_places_bytes(&hp, PROMPT_ROWS);
+        let tier = tier_places_bytes(PROMPT_ROWS, hp.experts.n_used);
         Ok(PlanInputs::new(ENGINE, hp, model, spec)?
             .with_prompt_reserve(reserve)
             .with_tier_reserve(tier))
@@ -215,11 +175,9 @@ mod tests {
     use gguf::Split;
 
     use super::super::hparams::tests::{LAYERS, keys, tensors};
-    use super::{
-        PROMPT_ROWS, PlaceError, PlanInputs, prompt_reserve_bytes, tier_batch, tier_places_bytes,
-    };
+    use super::{PROMPT_ROWS, PlaceError, PlanInputs, prompt_reserve_bytes, tier_batch};
     use crate::arch::synthetic::{V, header_shaped};
-    use crate::placement::{PlacementError, PlanLevers, Violation, workstation};
+    use crate::placement::{Device, PlacementError, PlanLevers, Violation, workstation};
 
     /// The small header's file, described; each test names its own file (the tests run in
     /// threads of one process).
@@ -305,13 +263,15 @@ mod tests {
         let tiered = workstation::plan_bp(LAYERS, None, tier_batch(&inputs).expect("tier bytes"));
         let plain = workstation::plan_gate(LAYERS);
         let places = 12 * 512 * inputs.hp.experts.n_used as u64;
-        assert_eq!(tier_places_bytes(&inputs.hp, PROMPT_ROWS), places);
+        assert_eq!(inputs.tier_reserve, Some(places));
         assert_eq!(
-            inputs.reserve_on(&plain).expect("a plain machine"),
+            inputs.prompt_batch_bytes(&plain).expect("a plain machine"),
             inputs.prompt_reserve
         );
         assert_eq!(
-            inputs.reserve_on(&tiered).expect("a tiered machine"),
+            inputs
+                .prompt_batch_bytes(&tiered)
+                .expect("a tiered machine"),
             inputs.prompt_reserve + places
         );
         // The small header's experts all fit the stage card, so the plan passes the body's tier
@@ -330,6 +290,24 @@ mod tests {
                  for hangs no expert tier"
             ),
             other => panic!("{other:?}, not the tier refusal"),
+        }
+        // A reserve-only member (the card a draft sits on) is no tier card: the prompt reserve
+        // is the plain one, for a body that serves no tier too, and no card that holds experts
+        // pays the tier's places for it.
+        let held = workstation::plan_holding(
+            LAYERS,
+            workstation::A6000,
+            &[],
+            &[workstation::RTX_3090],
+            Some(workstation::draft_reserve(Device::Card(1), 7)),
+            workstation::NO_TIER_BATCH,
+        )
+        .expect("a holder after the stage card");
+        for body in [&inputs, &untiered] {
+            assert_eq!(
+                body.prompt_batch_bytes(&held).expect("no tier card"),
+                inputs.prompt_reserve
+            );
         }
     }
 

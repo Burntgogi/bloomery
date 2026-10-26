@@ -20,8 +20,10 @@ use gguf::Split;
 /// half the value projections and expert down stacks, Q5_0 low-rank KDA up projections.
 const Q4KM: &str = "/models/Solar-Open2-250B-Q4_K_M/Solar-Open2-250B-Q4_K_M-00001-of-00004.gguf";
 
-/// The IQ4_XS file (four shards): the same 1,083 tensors at other types.
-const IQ4XS: &str = "/models/Solar-Open2-250B-IQ4_XS/Solar-Open2-250B-IQ4_XS-00001-of-00004.gguf";
+/// The IQ4_XS file (four shards): the same 1,083 tensors at other types. Read as the type census's
+/// header stub (`tools/type-census.py build` writes `<root>/<org>/<repo>/<file>`: a sparse file of
+/// the real header, every tensor byte zero); the gate reads headers only.
+const IQ4XS: &str = "/models/census-stubs-a134239f/prometheusAIR/Solar-Open2-250B-GGUF/IQ4_XS/Solar-Open2-250B-IQ4_XS-00001-of-00004.gguf";
 
 // PIN(2026-10-20): the file's description as `arch::solar2::spec` reads it, line by line (the
 // key values checked against the Q4_K_M header dump, 48 layers; `attention.head_count_kv` is 8 at
@@ -150,7 +152,7 @@ fn compare_file(path: &str, tensors: &[&str], specimens: &[(&str, &str)]) {
 // q5_0 low-rank matrices and, for IQ4_XS, every type no card format loads). The program's rows
 // cover the GQA flash (head 128, group 8), the gate projection, the softplus-decay β-2 KDA, the
 // shared expert, the recurrent state and the mixed trunk; its routed arm is the common leg's
-// (`kernels::card_runs`, else a host qdot kernel: both files pass, the Q6_K downs and the IQ4_XS
+// (each part by its arm, else a host qdot kernel: both files pass, the Q6_K downs and the IQ4_XS
 // stacks at k 1,280 and 4,096 among them), its token embedding the host's rows. What is left is
 // the router (the shape table has no 320-expert instance until so3 adds `sigmoid_320_8`), the
 // `solar-open` pre-tokenizer the tokenizer does not know and the tool parser of a template with
@@ -195,13 +197,17 @@ fn hw_solar_open2_spec_iq4_xs() {
 // 128 x 128 f32 (4,194,304 B) + the conv ring 11 rows x 3 x 64 x 128 f32 (1,081,344 B) + one
 // lane's u32 stamp = 5,275,652 B, 36 layers; no rope rows (NoPE). Mutants: the stamp or the pass
 // rows of the ring left out, a window ring on a full layer, a rope table counted.
-// The experts: the common card leg has no Q6_K down arm, so the 24 layers whose down stacks are
-// Q6_K (TENSORS_Q4KM) keep all their experts on the host and the other 24 are the card's candidates.
+// The experts: the plan's rule is per role (`routed_rule`'s arms), so a Q6_K down no longer keeps
+// its layer off the card: every layer's gate and up are q4_K and its down q4_K or q6_K
+// (TENSORS_Q4KM), each a type its arm runs, so all 48 layers are the card's candidates.
 #[test]
 #[ignore = "needs the Solar-Open2-250B Q4_K_M shards on the box"]
 fn hw_solar_open2_plan_a() {
+    use std::collections::BTreeSet;
+
+    use gguf::GgmlType;
     use model::arch::solar2::place::{PlaceError, PlanInputs};
-    use model::placement::kernels::card_runs;
+    use model::placement::accepts::{program_of, routed_rule};
     use model::placement::workstation::{self, TierBatchBytes};
     use model::placement::{PlanLevers, Role};
 
@@ -210,7 +216,22 @@ fn hw_solar_open2_plan_a() {
     const KDA_LAYERS: u64 = 36;
     const GQA_POSITION: u64 = 8 * (128 + 128) * 2;
     const KDA_STATE: u64 = 4_194_304 + 1_081_344 + 4;
-    const CANDIDATES: usize = 24;
+    // PIN(2026-10-22): CANDIDATES 24 -> 48: the plan's rule is per role now (`routed_rule`'s
+    // arms), so a Q6_K down no longer keeps its layer off the card. Every layer's gate and up
+    // are q4_K (`card_gate_up_runs`) and its down q4_K or q6_K (`card_down_runs` took Q6_K in),
+    // so all 48 layers qualify [derived from TENSORS_Q4KM: routed q4_K 120 and q6_K 24].
+    // Mutant: the common arms back on `card_runs` (the every-role set, Q6_K out) — 24 again.
+    const CANDIDATES: usize = 48;
+    // PIN(2026-10-23): 10,199,040 -> 10,207,232: an expert's bytes on the card, the figure the
+    // plan's expert bytes count, not the file's [derived from gguf's block sizes, Q4_K 144 B and
+    // Q6_K 210 B a 256-value block (`gguf::qtype`), at 4,096 x 1,280 values a stack, and the
+    // KQuant layout's whole-u32-word rows (`gguf`'s `CardFormat::buffer_bytes`): the q6_K down's
+    // 1,050 B rows take 1,052 B, +8,192 B an expert's 4,096 rows; a Q4_K-down layer's rows
+    // (2,304 B and 720 B) are whole words already]. A Q4_K-down layer's expert: 3 x 2,949,120 =
+    // 8,847,360 B; a Q6_K-down layer's: 5,898,240 + 4,308,992 = 10,207,232 B. Mutant: the padding
+    // left out (the file's 10,199,040) — the tier-bytes clause below reads 1,202 x 8,192 B short.
+    const EXPERT_Q4_DOWN: u64 = 8_847_360;
+    const EXPERT_Q6_DOWN: u64 = 10_207_232;
 
     let mut o = String::new();
     let mut b = Vec::new();
@@ -270,14 +291,20 @@ fn hw_solar_open2_plan_a() {
         card.stage_rows_bytes,
         0,
     );
-    // A layer is a candidate when each of its routed stacks is of a type the card leg runs.
+    // A layer is a candidate when the plan's own rule runs it: the refusals the planner's
+    // eligibility reads (`RoutedRule::host_only`), never a second reading of the rule here.
+    let rule = routed_rule(program_of(inputs.spec.arch).expect("the family's program"));
+    let off_card = rule
+        .host_only(&inputs.model)
+        .expect("the routed stacks name their parts");
+    let off_card: BTreeSet<usize> = off_card.iter().map(|t| t.layer).collect();
     let candidate = |l: usize| {
         inputs
             .model
             .tensors
             .iter()
-            .filter(|t| t.role == Role::RoutedExperts && t.layer == Some(l))
-            .all(|t| card_runs(t.ty))
+            .any(|t| t.role == Role::RoutedExperts && t.layer == Some(l))
+            && !off_card.contains(&l)
     };
     let candidates: Vec<usize> = (0..layers).filter(|&l| candidate(l)).collect();
     row(
@@ -288,11 +315,22 @@ fn hw_solar_open2_plan_a() {
         CANDIDATES,
     );
     let held = |l: usize| plan.n_l[l];
+    // The file's only q6_K routed stacks are downs (TENSORS_Q4KM), so this names the Q6_K-down
+    // layers.
+    // PIN(2026-10-22): the per-role rule flips this clause's side: a Q6_K-down layer held none
+    // while the down arm refused Q6_K; it now holds its experts beside the card's gate and up.
+    // Mutant: the rule's down arm back on `card_runs` — the 24 Q6_K-down layers hold 0 again.
+    let q6_down =
+        |l: usize| {
+            inputs.model.tensors.iter().any(|t| {
+                t.role == Role::RoutedExperts && t.layer == Some(l) && t.ty == GgmlType::Q6_K
+            })
+        };
     row(
         &mut o,
         &mut b,
-        "no expert on the card in a Q6_K-down layer",
-        (0..layers).filter(|&l| !candidate(l)).all(|l| held(l) == 0),
+        "the Q6_K-down layers hold their experts on the card",
+        (0..layers).filter(|&l| q6_down(l)).all(|l| held(l) >= 1),
         true,
     );
     let on_card: Vec<u64> = candidates.iter().map(|&l| held(l)).collect();
@@ -305,11 +343,21 @@ fn hw_solar_open2_plan_a() {
         true,
     );
     let n: u64 = plan.n_l.iter().sum();
-    // PIN(2026-10-20): the reserve displaces card experts: the same plan with no reserve holds
-    // `RESERVE / 8,847,360` more [derived]: an expert is a Q4_K gate, up and down of 4,096 x 1,280 values,
-    // 3 x 4,096 x 1,280 x 144 / 256 = 8,847,360 B, so 558,471,268 / 8,847,360 = 63.12 and the count
-    // drops by 63 or 64 (the budget's remainder decides which). Mutant: the reserve left out of the
-    // plan (the drop is 0).
+    // PIN(2026-10-23): 57..=60 -> 46..=48 [derived]: the old band set the displaced tail's file
+    // bytes — a round 457,113,600 B, 101,357,668 B under the reserve — against the reserve, but
+    // the budget the spread fits is the uploads' footprint, each stack whole 2 MiB granules
+    // (`GRANULE`, the placement's Heap), so an expert's marginal cost is quantized: a Q4_K-down
+    // layer's expert takes 1+1+1 = 3 granules going 90 -> 91 and 2+2+2 = 6 going 91 -> 92, a
+    // Q6_K-down layer's (its down 4,308,992 B = 2.05 granules) 4 and 7. The round the reserve
+    // displaces — 15 layers 90 -> 91, then 33 layers 91 -> 92, the 24 Q6_K downs split a + b
+    // between the groups — costs (45 + b) + (198 + a) = 267 granules = 559,939,584 B whatever
+    // the split, over the reserve 558,471,268 B by 1,468,316 B: one round of footprint covers it,
+    // so the tail is at most a round. Short of a round, every expert left in place costs at least
+    // 3 granules (6,291,456 B), and the unreserved plan's slack is under its stop's next expert
+    // (at most 7 granules = 14,680,064 B): overhang and slack together cover at most two of them
+    // (18,874,368 B past 16,148,380 B is the third) — 46 at the least. The box reads 48, one
+    // expert a layer.
+    // Mutant: the reserve left out of the plan (the drop is 0).
     let unreserved = inputs.clone().with_prompt_reserve(0);
     let free = unreserved
         .plan(&machine, CTX, &PlanLevers::default())
@@ -324,7 +372,7 @@ fn hw_solar_open2_plan_a() {
         &mut o,
         &mut b,
         "card experts the reserve displaces",
-        (63..=64).contains(&n_free.saturating_sub(n)),
+        (46..=48).contains(&n_free.saturating_sub(n)),
         true,
     );
     let _ = writeln!(
@@ -341,11 +389,13 @@ fn hw_solar_open2_plan_a() {
     // ([`PlanInputs::tier_reserve`], the places of the prompt batch): the stage card keeps
     // 3 x 4 x 512 x 8 = 49,152 B more than plan a [derived: a place, the join's copy of it and of the
     // slot's weight, four bytes each, for each of 8 used experts of 512 rows], which displaces at
-    // most one expert of 8,847,360 B [derived above], so the stage holds `n` or `n - 1` experts;
-    // the tier holds experts on candidate layers only, of the same size, at most a layer's 320
-    // with the stage's, and its bytes are its experts' times that size. Mutant: the body's tier
-    // reserve left out of `describe` (the plan is refused by name), or the tier planned on a
-    // layer the card leg cannot run.
+    // most one expert, the smaller an expert 8,847,360 B [derived above], so the stage holds `n`
+    // or `n - 1` experts; the tier holds experts on candidate layers only, at most a layer's 320
+    // with the stage's. Mutant: the body's tier reserve left out of `describe` (the plan is
+    // refused by name), or the tier planned on a layer the card leg cannot run.
+    // PIN(2026-10-22): the experts are two sizes now (8,847,360 B at a Q4_K down, 10,207,232 B at
+    // a Q6_K one, the card's figure above); the smaller still covers the places' 49,152 B, so the
+    // stage keeps `n` or `n - 1`, and the tier's bytes are its layers' counts at their own sizes.
     let tier_batch = TierBatchBytes {
         staging: 0,
         scratch: 0,
@@ -365,13 +415,13 @@ fn hw_solar_open2_plan_a() {
          the stage reserve {} B",
         tiered.cards[1].expert_bytes,
         tiered.host.experts,
-        inputs.reserve_on(&bp).unwrap_or(0)
+        inputs.prompt_batch_bytes(&bp).unwrap_or(0)
     );
     row(
         &mut o,
         &mut b,
         "plan bp: the stage's reserve is plan a's and the tier places",
-        inputs.reserve_on(&bp).ok(),
+        inputs.prompt_batch_bytes(&bp).ok(),
         Some(RESERVE + 3 * 4 * 512 * 8),
     );
     row(
@@ -403,7 +453,16 @@ fn hw_solar_open2_plan_a() {
         &mut b,
         "plan bp: the tier's expert bytes",
         tiered.cards[1].expert_bytes,
-        tier_experts * 8_847_360,
+        (0..layers)
+            .map(|l| {
+                tier_n[l]
+                    * if q6_down(l) {
+                        EXPERT_Q6_DOWN
+                    } else {
+                        EXPERT_Q4_DOWN
+                    }
+            })
+            .sum::<u64>(),
     );
     // The body that hangs no tier card refuses the same machine by name, the card and the missing
     // tier named.

@@ -1,7 +1,10 @@
 //! bloomery-gpu-gemma-embedding2: the EmbeddingGemma v1 and v2 encoders
 //! (`gemma-embedding` and `gemma-embedding2`): one
 //! pass over an input's token ids, every position attending both ways, to
-//! the token rows of the output projection and their mean. It has no device
+//! the token rows of the output projection and their mean. A packed pass
+//! ([`Encoder::pass_packed`]) runs several inputs as one token sequence:
+//! token-wise work covers every row, attention stays inside each input, and
+//! pooling is per input. It has no device
 //! code of its own: every launch is `bloomery-gpu`'s.
 //!
 //! V2's pass, in the graph's order:
@@ -34,7 +37,7 @@ mod pass;
 
 use config::Hparams;
 
-pub use pass::{Pass, Taps};
+pub use pass::{Packed, Pass, Taps};
 
 use std::collections::BTreeMap;
 

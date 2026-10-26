@@ -117,6 +117,7 @@ pub fn spec() -> FixtureSpec {
         card_budget: CardBudget::Planned(Budget {
             ctx: BUDGET_CTX,
             card_experts,
+            card_set_aside: None,
         }),
         window: Window::new(D_MIN, D_MAX).expect("[2^-13, 2^-9] is inside the normal f16 values"),
         ff: Some(FIXTURE_FF),
@@ -142,7 +143,7 @@ fn card_experts(split: &Split, budget: Option<u64>) -> Result<CardExperts, Fixtu
     let inputs = PlanInputs::describe(split)?;
     let machine = workstation::plan_gate(inputs.model.layers);
     let levers = PlanLevers {
-        card_budget_bytes: budget,
+        card_budget_bytes: budget.into(),
     };
     let plan = inputs
         .plan(&machine, BUDGET_CTX, &levers)

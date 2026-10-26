@@ -57,7 +57,9 @@ use bloomery_gpu::gemm::{
     GemmKernels, GemmRoute,
 };
 use bloomery_gpu::kquant::Act;
-use bloomery_gpu::site::{self, Form, Gated, GatedIo, SiteWeight, SwigluRows, WideIn, WideKernels};
+use bloomery_gpu::site::{
+    self, Form, Gated, GatedIo, SiteWeight, WideActs, WideForms, WideIn, WideKernels,
+};
 use bloomery_gpu::weights::Weights;
 use bloomery_gpu::{DeviceTensor, Gpu, GpuError};
 use bloomery_gpu_deepseek41::block::Block;
@@ -142,12 +144,10 @@ struct Proj<'a, 'y> {
     y: &'y mut DeviceBuffer<f32>,
 }
 
-/// A dense block's scratch: the SwiGLU rows in the form each down type reads, and the gate's and up's f32 rows.
+/// A dense block's scratch: the SwiGLU rows in the form each down type reads (q8 blocks of 32 values for a
+/// Q8_0 down, q8_1 blocks of 128 for a K-quant one), and the gate's and up's f32 rows.
 struct FfScratch {
-    /// q8 blocks of 32 values, for a Q8_0 down.
-    rows32: Option<GemmAct32>,
-    /// q8_1 blocks of 128 values, for a K-quant down.
-    rows128: Option<GemmAct>,
+    rows: WideActs,
     g: DeviceBuffer<f32>,
     u: DeviceBuffer<f32>,
 }
@@ -189,16 +189,12 @@ impl GemmFront {
         let ff = match w.ff {
             0 => None,
             ff => Some(FfScratch {
-                rows32: w
-                    .forms
-                    .rows32
-                    .then(|| GemmAct32::new(stream, cols, ff))
-                    .transpose()?,
-                rows128: w
-                    .forms
-                    .rows128
-                    .then(|| GemmAct::new(stream, cols, ff))
-                    .transpose()?,
+                rows: WideActs::new(
+                    stream,
+                    WideForms::q8(w.forms.rows128, w.forms.rows32),
+                    cols,
+                    ff,
+                )?,
                 g: rows(ff)?,
                 u: rows(ff)?,
             }),
@@ -254,12 +250,10 @@ impl GemmFront {
             .iter()
             .map(|a| a.bytes())
             .sum::<usize>();
-        let ff = self.ff.as_ref().map_or(0, |s| {
-            s.rows32.as_ref().map_or(0, GemmAct32::bytes)
-                + s.rows128.as_ref().map_or(0, GemmAct::bytes)
-                + s.g.num_bytes()
-                + s.u.num_bytes()
-        });
+        let ff = self
+            .ff
+            .as_ref()
+            .map_or(0, |s| s.rows.bytes() + s.g.num_bytes() + s.u.num_bytes());
         let in128 = self.in128.as_ref().map_or(0, GemmAct::bytes);
         self.dense.bytes() + acts + in128 + ff + self.q.num_bytes() + self.av.num_bytes()
     }
@@ -453,12 +447,7 @@ impl GemmFront {
             what: WHAT,
             missing,
         };
-        let FfScratch {
-            rows32,
-            rows128,
-            g,
-            u,
-        } = ff.as_mut().ok_or(missing("the dense block's scratch"))?;
+        let FfScratch { rows, g, u } = ff.as_mut().ok_or(missing("the dense block's scratch"))?;
         let x = if gate.reads() == Form::Q8x128 {
             let act = in128
                 .as_mut()
@@ -477,19 +466,6 @@ impl GemmFront {
                 f32: None,
             }
         };
-        let rows = if down.reads() == Form::Q8x128 {
-            SwigluRows {
-                q128: rows128.as_mut(),
-                q32: None,
-                f32: None,
-            }
-        } else {
-            SwigluRows {
-                q128: None,
-                q32: rows32.as_mut(),
-                f32: None,
-            }
-        };
         let block = Gated {
             w,
             route: &*dense,
@@ -505,7 +481,7 @@ impl GemmFront {
             x: &x,
             gate: g,
             up: u,
-            rows,
+            rows: rows.swiglu_rows(),
             y,
         };
         let k = WideKernels {
@@ -571,11 +547,14 @@ impl GemmFront {
         if gate.reads() == Form::Q8x128 {
             has(self.in128.is_some(), gate, "gate and up")?;
         }
-        if down.reads() == Form::Q8x128 {
-            has(ff.rows128.is_some(), down, "down")
-        } else {
-            has(ff.rows32.is_some(), down, "down")
-        }
+        let want = WideActs::wants(down);
+        has(
+            (!want.q128 || ff.rows.q128.is_some())
+                && (!want.q32 || ff.rows.q32.is_some())
+                && (!want.f32 || ff.rows.f32.is_some()),
+            down,
+            "down",
+        )
     }
 
     /// The scratch input `which` quantizes into.

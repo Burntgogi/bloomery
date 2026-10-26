@@ -43,13 +43,16 @@
 use bloomery_placement::slots::{SeqTerms, Stores};
 use gguf::{GgmlType, Split};
 use models::headpick::{HeadRowsError, HeadSet, vocab_sha256};
-use models::{DraftSpec, Ffn, HcKind, Mixer, ModelSpec, MtpDraft, MtpSource, OutGate, Role};
+use models::{
+    DeltaKind, DeltaRule, DraftSpec, EngramSpec, Extra, Ffn, HcKind, Mixer, ModelSpec, MtpDraft,
+    MtpSource, NgramRule, OutGate, Role, Selector,
+};
 
-use super::hparams::{Hparams, Kind};
-use super::{mtp, names, roles, spec};
-use crate::arch::coverage;
+use super::hparams::Kind;
+use super::{mtp, names};
+use crate::arch::{architecture_is, coverage};
 use crate::placement::accepts::{
-    Program, leg_card_format, qwen38_down, qwen38_gate_up, routed_rule,
+    Program, leg_card_format, program_of, qwen38_down, qwen38_gate_up, routed_rule,
 };
 use crate::placement::ctx::{CtxLimit, PastLimit, check_slot_ctx};
 use crate::placement::ctx_ask::PlanRefusal;
@@ -65,8 +68,8 @@ use crate::placement::{
 use gguf::digest::hex;
 
 use runtime::stores::{
-    DELTA_LANES, F32_BYTES, delta_lane_bytes, dense_kv_bytes, kv_plane_bytes, ple_ring_bytes,
-    recurrent_bytes, selecting_bytes,
+    DELTA_LANES, F32_BYTES, delta_carry_bytes, delta_lane_bytes, dense_kv_bytes, kv_plane_bytes,
+    ple_ring_bytes, recurrent_bytes, selecting_bytes,
 };
 pub use runtime::stores::{PASS_ROWS, conv_ring_rows, ple_ring_rows};
 
@@ -75,14 +78,14 @@ pub use runtime::stores::{PASS_ROWS, conv_ring_rows, ple_ring_rows};
 /// cache rows, so a context past this is one those launches cannot name.
 pub const KERNEL_POSITIONS: u64 = u32::MAX as u64;
 
-/// The most positions a load of the file `hp` describes serves: its
-/// `context_length`, the context it was trained at (the rope runs unscaled;
+/// The most positions a load of the file `spec` describes serves: its
+/// `ctx_train`, the context it was trained at (the rope runs unscaled;
 /// YaRN scaling is not built), within [`KERNEL_POSITIONS`]. `ctx` past it is
 /// refused by name ([`check_slot_ctx`]); else the cap. `generate_qwen3moe`
 /// and the Qwen3.8 seat take the rule here.
-pub fn serve_ctx(ctx: u64, hp: &Hparams) -> Result<u64, PlaceError> {
+pub fn serve_ctx(ctx: u64, spec: &ModelSpec) -> Result<u64, PlaceError> {
     let bounds = CtxLimit {
-        trained: u64::try_from(hp.n_ctx_train).unwrap_or(u64::MAX),
+        trained: u64::from(spec.ctx_train),
         kernel: Some((KERNEL_POSITIONS, "KERNEL_POSITIONS")),
         verified: None,
     };
@@ -170,11 +173,11 @@ impl<'a> Beside<'a> {
 /// What a plan of a qwen4exp file is made from, read from its headers.
 #[derive(Debug)]
 pub struct PlanInputs {
-    /// The file's hyperparameters.
-    pub hp: Hparams,
     /// Every tensor with its role, and the model's layer and expert counts.
     pub model: ModelTensors,
-    /// The typed model description the coverage check reads.
+    /// The typed model description: the one owner of the file's shape. The
+    /// coverage check, the layout of each layer's bytes and every reader of
+    /// a width, a count or a context read it.
     pub spec: ModelSpec,
     /// Each layer's recurrent and cache bytes.
     pub kv: KvLayout,
@@ -247,8 +250,9 @@ pub enum PlaceError {
         /// The planner's own refusal of the tier card.
         origin: Box<PlacementError>,
     },
-    /// A machine with an expert tier card, under a card rule whose program
-    /// hangs no tier ([`PlanInputs::plan_rule`]).
+    /// A machine with an expert tier card. [`PlanInputs::plan_rule`] does not
+    /// return it: a tier machine is planned. Callers that match every refusal
+    /// still name it.
     #[error(
         "the machine has the expert tier card {tier}; the program this plan is for hangs no \
          expert tier"
@@ -334,12 +338,27 @@ fn tier_host(e: PlacementError) -> PlaceError {
     }
 }
 
+/// A description run by the Qwen3.5 body or the Qwen3.8 body, which these
+/// inputs plan; any other program, or none, is refused naming it.
+fn refuse_other_program(spec: &ModelSpec) -> Result<(), PlacementError> {
+    let program = program_of(spec.arch);
+    if matches!(program, Some(Program::Qwen35Body | Program::Qwen38Body)) {
+        return Ok(());
+    }
+    Err(architecture_is(&format!(
+        "{}, run by {}; this plan is for the programs {} and {}",
+        spec.arch.name(),
+        program.map_or("no program", Program::name),
+        Program::Qwen35Body.name(),
+        Program::Qwen38Body.name()
+    )))
+}
+
 impl PlanInputs {
-    /// `split`'s hyperparameters, then its tensors' roles, then its
-    /// description, then the host's room ([`PlanInputs::describe`]), the
-    /// first that fails being the error; then the file is refused if it has
-    /// a feature the engine does not run ([`PlacementError::Unimplemented`],
-    /// every one listed).
+    /// `split`'s description and its tensors' roles, then the host's room
+    /// ([`PlanInputs::describe`]), the first that fails being the error; then
+    /// the file is refused if it has a feature the engine does not run
+    /// ([`PlacementError::Unimplemented`], every one listed).
     pub fn read(split: &Split) -> Result<PlanInputs, PlacementError> {
         let inputs = PlanInputs::describe(split)?;
         let missing = inputs.unimplemented();
@@ -398,22 +417,22 @@ impl PlanInputs {
         Self::describe_with(split, || Ok(room))
     }
 
-    /// The file's hyperparameters, roles, chat surface, spec and KV layout,
-    /// then the room `room` gives, then the arena, the first that fails
-    /// being the error.
+    /// The file's description and roles (`arch::spec_placed`, the one read of
+    /// its headers) and the KV layout they give, then the room `room` gives,
+    /// then the arena, the first that fails being the error. A file whose
+    /// description runs on neither the Qwen3.5 nor the Qwen3.8 body is
+    /// refused by name.
     fn describe_with(
         split: &Split,
         room: impl FnOnce() -> Result<(u64, HostRead), PlacementError>,
     ) -> Result<PlanInputs, PlacementError> {
-        let hp = Hparams::read(split)?;
-        let model = roles::classify(split, &hp)?;
-        let chat = spec::chat(split)?;
-        let spec = spec::spec_of(&hp, &model, chat)?;
-        let kv = KvLayout::of(&hp);
+        let read = crate::arch::spec_placed(split)?;
+        let (spec, model) = (read.spec, read.tensors);
+        refuse_other_program(&spec)?;
+        let kv = KvLayout::of_spec(&spec)?;
         let room = room()?;
         let arena = workstation::nvtier_arena_given().map_err(PlacementError::HostRoom)?;
         Ok(PlanInputs {
-            hp,
             model,
             spec,
             kv,
@@ -428,20 +447,23 @@ impl PlanInputs {
     }
 
     /// The inputs of a load whose GDN layers keep `lanes` stamped lanes of
-    /// state ([`KvLayout::of_lanes`]): a Qwen3.6 load that verifies drafted
+    /// state ([`KvLayout::of_spec_lanes`]): a Qwen3.6 load that verifies drafted
     /// rows asks for `MAX_PASS_ROWS` of them, and the plan, the whole-fit
     /// verdict and the sequences' stores all price the one count. The layout's
     /// q8_0 form ([`KvLayout::in_q8`]) is kept.
     ///
+    /// # Errors
+    ///
+    /// The layout's refusal of the description ([`KvLayout::of_spec_lanes`]).
+    ///
     /// # Panics
     ///
     /// On no lane, by name.
-    #[must_use]
-    pub fn with_lanes(mut self, lanes: usize) -> PlanInputs {
+    pub fn with_lanes(mut self, lanes: usize) -> Result<PlanInputs, PlacementError> {
         let q8 = self.kv.q8;
-        self.kv = KvLayout::of_lanes(&self.hp, lanes);
+        self.kv = KvLayout::of_spec_lanes(&self.spec, lanes)?;
         self.kv.q8 = q8;
-        self
+        Ok(self)
     }
 
     /// Every feature of the file the engine does not run, as
@@ -583,7 +605,7 @@ impl PlanInputs {
                 count: self.model.layers,
             },
             draft: mtp.map(MtpInputs::stores),
-            beside: slot_resident_bytes(&self.hp),
+            beside: slot_resident_bytes(&self.spec),
         }
     }
 
@@ -597,8 +619,8 @@ impl PlanInputs {
     #[must_use]
     pub fn seq_state_bytes(&self, positions: u64, mtp: Option<&MtpInputs>) -> u64 {
         let draft = mtp.map_or(0, |m| {
-            let point_row = streams(&self.hp) * self.hp.n_embd * std::mem::size_of::<f32>();
-            m.kv.layer_bytes(0, positions) + slot_resident_bytes(&self.hp)
+            let point_row = streams(&self.spec) * hidden(&self.spec) * std::mem::size_of::<f32>();
+            m.kv.layer_bytes(0, positions) + slot_resident_bytes(&self.spec)
                 - runtime::stores::U32_BYTES
                 + point_row as u64
         });
@@ -743,8 +765,10 @@ impl PlanInputs {
     /// `levers`, the routed experts by the expert rule over the layers whose
     /// three routed stacks `rule` loads — the card rule of the program that
     /// runs the plan ([`routed_rule`]: [`PROGRAM`]'s, or the qwen35moe body's
-    /// for a qwen35moe file) — the rest on the host. Refused as [`PlanInputs::plan_with`]
-    /// refuses; a machine with an expert tier card is refused by name.
+    /// for a qwen35moe file) — the rest on the host, a stage card's id prefix
+    /// first and each expert tier's next ids after it. Refused as
+    /// [`PlanInputs::plan_with`] refuses. A plan with no draft wants no
+    /// [`MTP_RESERVE`] row ([`check_draft_reserve`]).
     pub fn plan_rule<'a>(
         &'a self,
         machine: &'a Machine,
@@ -754,11 +778,6 @@ impl PlanInputs {
     ) -> Result<Plan<'a>, PlaceError> {
         if ctx_max == 0 || ctx_max > KERNEL_POSITIONS {
             return Err(PlaceError::Positions { ctx_max });
-        }
-        if let Some(tier) = machine.tiers.first() {
-            return Err(PlaceError::Tier {
-                tier: tier.name.clone(),
-            });
         }
         check_draft_reserve(machine, None)?;
         let plan = self.target_rule(machine, ctx_max, levers, Some(rule), Beside::none())?;
@@ -844,18 +863,12 @@ impl PlanInputs {
         // The draft's term is the reserve the expert rule spread within, so
         // the bound and the budget count one number. The stage rope rows are
         // the target card's, beside the cache.
-        let total = [
-            t.dense_bytes,
-            t.expert_bytes,
-            t.rounding_bytes,
-            t.kv_bytes,
-            t.stage_rows_bytes,
-            t.scratch_bytes,
-            t.context_bytes,
-            reserve,
-        ]
-        .iter()
-        .sum::<u64>();
+        let total =
+            t.bytes()
+                .checked_add(reserve)
+                .ok_or_else(|| PlacementError::CardBytesPastU64 {
+                    card: card.name.clone(),
+                })?;
         let usable = plan.usable_bytes(card);
         let limit = usable.saturating_sub(card.margin_bytes);
         let mut broken: Vec<Violation> = plan
@@ -961,18 +974,12 @@ impl PlanInputs {
         // As in [`PlanInputs::plan_mtp_with`]: the draft's term is the
         // reserve the expert rule spread within, and the stage rope rows are
         // the target card's.
-        let total = [
-            t.dense_bytes,
-            t.expert_bytes,
-            t.rounding_bytes,
-            t.kv_bytes,
-            t.stage_rows_bytes,
-            t.scratch_bytes,
-            t.context_bytes,
-            reserve,
-        ]
-        .iter()
-        .sum::<u64>();
+        let total =
+            t.bytes()
+                .checked_add(reserve)
+                .ok_or_else(|| PlacementError::CardBytesPastU64 {
+                    card: card.name.clone(),
+                })?;
         let usable = plan.usable_bytes(card);
         let limit = usable.saturating_sub(card.margin_bytes);
         let mut broken: Vec<Violation> = plan
@@ -1047,20 +1054,21 @@ fn draft_card_bytes(d: &placement::CardTotals, map_bytes: u64) -> u64 {
 /// `vocab` f32; the readback 18 u32, its ticket count, the stand-in map word
 /// and the chain's 10 words; the taps none (the engine's walk arms none) —
 /// 1,212,160 + 8 · `vocab` f32 and 793 u32; then the store walk's arena for 64
-/// rows, 5,039,634 values: the hidden rows 655,360, the embedding 163,840 and
+/// rows, 5,049,938 values: the hidden rows 655,360, the embedding 163,840 and
 /// its positions and key counts 128, the pack 1,310,720 and its 32-value q8
 /// blocks over 256 columns of 5,120 (codes, scales and sums, 20 words a
 /// 64-value step) 409,600, the streams 655,360, the wide mix's scratch
-/// 1,563,392 (the normed streams and the up's rows 655,360 each, the q8 of the
+/// 1,573,696 (the normed streams and the up's rows 655,360 each, the q8 of the
 /// normed streams 204,800, the down's dots and the bottleneck 20,480 each, its
-/// q8 6,400, the inject's dots and the weights 256 each), the mix 163,840 and
+/// q8 6,400, its BF16 pairs 10,240 and refusals 64, the inject's dots and
+/// the weights 256 each), the mix 163,840 and
 /// its q8 51,200, the keys and values 65,536, and the two one-expert tables
 /// of 256 and 64 slots, 524 and 134 words — four bytes a value].
 ///
 /// [`MtpArena::new`]: bloomery_gpu::arch::qwen3moe::Mtp38
 #[must_use]
 pub fn mtp_arena_bytes(vocab: u64) -> u64 {
-    4 * (1_212_160 + 8 * vocab + 49_536 * MTP_FLASH_SEGMENTS + 793 + 5_039_634)
+    4 * (1_212_160 + 8 * vocab + 49_536 * MTP_FLASH_SEGMENTS + 793 + 5_049_938)
 }
 
 /// The decode flash's segments a row of the MTP program's arena holds
@@ -1139,18 +1147,22 @@ impl MtpPlan<'_> {
 pub const UBATCH_PLANNED: u64 = 4096;
 
 /// Card bytes a qwen4exp ubatch walk holds a position [derived: the ubatch
-/// arena's token-major rows, 136,996 f32 and 12 u32 a position — the
+/// arena's token-major rows, 130,852 f32 and 12 u32 a position — the
 /// embedding, the two stream buffers, the mix and sub-layer outputs, the
-/// attention and flash rows, the delta layer's, the selecting layer's and the
-/// PLE site's intermediates, the shared expert's — 548,032 B; the walk's own
-/// buffers, 110,000.125 B — the 32-value activations of the model-width, the
+/// attention rows, the delta layer's, the selecting layer's and the PLE
+/// site's intermediates, the shared expert's — 523,456 B; the walk's own
+/// buffers, 110,644.125 B — the 32-value activations of the model-width, the
 /// attention-width and the SwiGLU rows (3,200, 7,680 and 800 B), the wide
-/// mixes' scratch (97,712 B: the normed streams and the up's rows at 40,960 B
+/// mixes' scratch (98,356 B: the normed streams and the up's rows at 40,960 B
 /// each, their activations, the down's and inject's dots, the bottleneck and
-/// its activations, the weights), the indexer keys, the slots and the
-/// one-expert table; the record's id word and the host sums (10,244 B);
+/// its Q8 activations, BF16 pairs and refusal, the weights), the indexer
+/// keys, the slots and the one-expert table; the record's id word and the
+/// host sums (10,244 B);
 /// rounded up].
-pub const UBATCH_TOKEN_BYTES: u64 = 668_277;
+// PIN(2026-10-24): the HC bottleneck adds 320 BF16 values and one refusal word per column, 644 B.
+// PIN(2026-10-25): 644,345 (was 668,921): the prefill flash stores the selecting layer's rows
+// under their gate, so the arena holds no flash rows, 6,144 f32 a position.
+pub const UBATCH_TOKEN_BYTES: u64 = 644_345;
 
 /// Card bytes a qwen4exp ubatch walk's selection holds for one run of its
 /// selecting rows: the walk takes as many rows a run as these bytes hold at
@@ -1164,8 +1176,9 @@ pub const SELECT_RUN_BYTES: u64 = 22_000_000;
 /// up to 2,000,000 positions [derived, an upper bound: the router's buffers
 /// for 2,048 tokens, 8,577,028 B; the eight-column mix scratch, 379,520 B;
 /// the selection's run, at most [`SELECT_RUN_BYTES`] (the least run, eight
-/// rows, holds 16,082,048 B at 2,000,000); 30,956,548 B, rounded up to
-/// 32 MiB]. A load whose ubatch arena passes it refuses the arena by name.
+/// rows, holds 16,082,048 B at 2,000,000); the delta layers' chunk records
+/// past the q·k·v rows of a walk of up to five positions, at most 133,124 B;
+/// 31,089,672 B, rounded up to 32 MiB]. A load whose ubatch arena passes it refuses the arena by name.
 pub const UBATCH_FIXED_BYTES: u64 = 32 << 20;
 
 /// The card bytes a qwen4exp ubatch walk of up to `u` positions holds: what
@@ -1477,6 +1490,28 @@ pub fn machine_for_experts(
 /// ([`MtpInputs::card_bytes`]).
 pub const MTP_RESERVE: &str = "MTP draft";
 
+/// Tokens one chunk of the Qwen3.6 card leg's prompt-batch service runs.
+/// [`tier_batch`] is the qwen4exp plan's figure, not this one.
+pub const LEG_TIER_CHUNK: u64 = 8;
+
+/// The Qwen3.6 card leg's prompt-batch bytes ([`TierBatchBytes`]): the tier
+/// card's staging, one chunk of the leg's scratch and the host's rows, for
+/// blocks of the host union's columns. [`tier_batch`] is the qwen4exp plan's
+/// figure.
+#[must_use]
+pub fn leg_tier_batch(spec: &ModelSpec) -> TierBatchBytes {
+    let (expert_ff, n_used) = spec
+        .routed()
+        .map_or((0, 0), |m| (u64::from(m.expert_ff), u64::from(m.top_k)));
+    workstation::tier_leg_batch_bytes(
+        u64::from(spec.hidden),
+        expert_ff,
+        n_used,
+        LEG_TIER_CHUNK,
+        crate::moe::UNION_MAX_COLS as u64,
+    )
+}
+
 /// The expert tier's prompt-batch bytes a qwen4exp plan (b′) reserves
 /// ([`machine_bp`]) for a load whose ubatches take up to `ubatch` positions.
 /// The host tier's batch port is made for blocks as wide as the ubatch
@@ -1492,8 +1527,9 @@ pub const MTP_RESERVE: &str = "MTP draft";
 /// through, into the staging's down outputs, and writes its slots' rows
 /// into the host's rows itself.
 #[must_use]
-pub fn tier_batch(hp: &Hparams, ubatch: u64) -> TierBatchBytes {
-    tier_batch_of(hp.n_embd as u64, hp.n_used as u64, ubatch)
+pub fn tier_batch(spec: &ModelSpec, ubatch: u64) -> TierBatchBytes {
+    let n_used = spec.routed().map_or(0, |m| u64::from(m.top_k));
+    tier_batch_of(u64::from(spec.hidden), n_used, ubatch)
 }
 
 /// [`tier_batch`] for rows of `n_embd` routed to `n_used` experts.
@@ -1571,7 +1607,7 @@ pub fn machine_bp_on(
     m.cards[0]
         .reserves
         .extend(draft.map(|b| (MTP_RESERVE.to_string(), b)));
-    m.tiers.push(workstation::tier_card(tier, None, batch));
+    m.tiers.push(workstation::tier_card(tier, batch));
     m.host_mut()
         .reserves
         .push((TIER_BATCH_HOST_RESERVE.to_string(), batch.host));
@@ -1614,8 +1650,9 @@ fn check_draft_reserve(machine: &Machine, want: Option<u64>) -> Result<(), Place
 ///   channels, `2·k_heads·state + v_heads·state`, in f32), both fixed by the
 ///   file; on a qwen4exp file its state keeps
 ///   `runtime::stores::DELTA_LANES` lanes, each stamped
-///   (`runtime::stores::delta_lane_bytes`); a qwen35moe load that verifies
-///   drafted rows asks for its own count ([`KvLayout::of_lanes`]);
+///   (`runtime::stores::delta_lane_bytes`), and a carry
+///   (`runtime::stores::delta_carry_bytes`); a qwen35moe load that verifies
+///   drafted rows asks for its own count ([`KvLayout::of_spec_lanes`]);
 /// - the PLE site's layer, beside that: the PLE conv ring
 ///   (`(taps − 1)·dilation + PASS_ROWS` rows of `streams · n_embd` f32);
 /// - an attention layer: a position's K and V (`2 · kv_heads · head_dim`
@@ -1632,7 +1669,8 @@ pub struct KvLayout {
     /// A GDN layer's state and conv ring, in bytes.
     recurrent: u64,
     /// What one checkpoint copies of a GDN layer: the committed state lane
-    /// and the conv ring ([`recurrent_bytes`], without the other lanes).
+    /// and the conv ring ([`recurrent_bytes`], without the other lanes), and
+    /// the carry on a qwen4exp file.
     copy: u64,
     /// The PLE site's layer and its conv ring's bytes.
     ple: Option<(usize, u64)>,
@@ -1651,44 +1689,112 @@ pub struct KvLayout {
 }
 
 impl KvLayout {
-    /// The layout `hp` describes, its GDN layers keeping the lanes the file's
-    /// family verifies by: [`DELTA_LANES`] on a qwen4exp file (its drafted
-    /// rows always verify), one on a qwen35moe file (a load that verifies
-    /// drafted rows asks for more, [`KvLayout::of_lanes`]).
-    #[must_use]
-    pub fn of(hp: &Hparams) -> KvLayout {
-        let lanes = hp.exp.as_ref().map_or(1, |_| DELTA_LANES);
-        KvLayout::of_lanes(hp, lanes)
+    /// The layout `spec` describes, its GDN layers keeping the lanes the
+    /// file's program verifies by: [`DELTA_LANES`] under [`PROGRAM`] (its
+    /// drafted rows always verify), one under the Qwen3.5 body (a load that
+    /// verifies drafted rows asks for more, [`KvLayout::of_spec_lanes`]).
+    ///
+    /// # Errors
+    ///
+    /// The layout's refusal of the description ([`KvLayout::of_spec_lanes`]).
+    pub fn of_spec(spec: &ModelSpec) -> Result<KvLayout, PlacementError> {
+        let lanes = if program_of(spec.arch) == Some(PROGRAM) {
+            DELTA_LANES
+        } else {
+            1
+        };
+        KvLayout::of_spec_lanes(spec, lanes)
     }
 
-    /// The layout `hp` describes with every GDN layer keeping `lanes` stamped
-    /// lanes of state (`runtime::stores::delta_lane_bytes`): one lane is the
-    /// state in place with no stamps, more are a verify's rows, one lane a
-    /// row. The lane count is an input of the layout, whichever model.
+    /// The layout `spec` describes with every GDN layer keeping `lanes`
+    /// stamped lanes of state (`runtime::stores::delta_lane_bytes`): one lane
+    /// is the state in place with no stamps, more are a verify's rows, one
+    /// lane a row. The lane count is an input of the layout, whichever model.
+    /// A layer is a GQA layer (a plane of every position, or the token-pool
+    /// selector's pooled keys) or a gated-delta-rule layer; the layers of one
+    /// kind share one shape.
+    ///
+    /// # Errors
+    ///
+    /// A layer whose stores this layout does not size, or whose shape is not
+    /// its kind's first, by layer ([`PlacementError::Unimplemented`]).
     ///
     /// # Panics
     ///
     /// On no lane, by name.
-    #[must_use]
-    pub fn of_lanes(hp: &Hparams, lanes: usize) -> KvLayout {
-        let exp = hp.exp.as_ref();
-        let (recurrent, copy) = gdn_bytes(hp.v_heads, hp.k_heads, hp.state, hp.conv, lanes);
-        KvLayout {
-            kinds: hp.kinds.clone(),
-            recurrent,
-            copy,
-            ple: exp.and_then(|e| e.ple).map(|p| {
-                (
-                    p.layer,
-                    ple_ring_bytes(p.conv, p.ngram, streams(hp), hp.n_embd),
-                )
-            }),
-            kv_heads: hp.n_head_kv,
-            head_dim: hp.head_dim,
-            select: exp.map(|e| (e.idx_dim, e.ratios.clone())),
-            q8: false,
-            rope_row: hp.rope_dims as u64 * F32_BYTES,
+    pub fn of_spec_lanes(spec: &ModelSpec, lanes: usize) -> Result<KvLayout, PlacementError> {
+        assert!(
+            lanes >= 1,
+            "KvLayout::of_spec_lanes: a state of at least one lane"
+        );
+        let mut kinds = Vec::with_capacity(spec.layers.len());
+        let mut pools = Vec::with_capacity(spec.layers.len());
+        let mut gdn: Option<&DeltaRule> = None;
+        let mut attn = None;
+        for (layer, l) in spec.layers.iter().enumerate() {
+            let refuse = |what: &str| unsized_layer(layer, what);
+            match &l.mixer {
+                Mixer::Gqa(g) => {
+                    if g.window.is_some() || g.value_dim != g.head_dim {
+                        return Err(refuse(
+                            "a windowed GQA layer or one with its own value width",
+                        ));
+                    }
+                    let (pool, idx_dim) = match &g.select {
+                        None => (0, None),
+                        Some(Selector::TokenPool { pool: 0, .. }) => {
+                            return Err(refuse("a token-pool selector of no positions a pool"));
+                        }
+                        Some(Selector::TokenPool { d, pool, .. }) => (*pool as usize, Some(*d)),
+                        Some(_) => return Err(refuse("a GQA layer selecting by another rule")),
+                    };
+                    let shape = (g.kv_heads, g.head_dim, idx_dim);
+                    if *attn.get_or_insert(shape) != shape {
+                        return Err(refuse("a GQA layer of another shape than the first's"));
+                    }
+                    kinds.push(Kind::Attention);
+                    pools.push(pool);
+                }
+                Mixer::DeltaRule(d) if matches!(d.kind, DeltaKind::Gdn { .. }) => {
+                    if *gdn.get_or_insert(d) != d {
+                        return Err(refuse(
+                            "a delta-rule layer of another shape than the first's",
+                        ));
+                    }
+                    kinds.push(Kind::DeltaRule);
+                    pools.push(0);
+                }
+                other => return Err(refuse(other.what())),
+            }
         }
+        let (recurrent, copy) = gdn.map_or((0, 0), |d| {
+            gdn_bytes(
+                d.v_heads as usize,
+                d.k_heads as usize,
+                d.d as usize,
+                d.conv as usize,
+                lanes,
+            )
+        });
+        // The Qwen3.8 body's chunked prompt rule keeps a chunk's rows beside
+        // each GDN layer's lanes; a checkpoint copies them with the state.
+        let carry = gdn
+            .filter(|_| program_of(spec.arch) == Some(PROGRAM))
+            .map_or(0, |d| {
+                delta_carry_bytes(d.v_heads as usize, d.k_heads as usize, d.d as usize)
+            });
+        let (kv_heads, head_dim, idx_dim) = attn.unwrap_or((0, 0, None));
+        Ok(KvLayout {
+            kinds,
+            recurrent: recurrent + carry,
+            copy: copy + carry,
+            ple: ple_site(spec)?,
+            kv_heads: kv_heads as usize,
+            head_dim: head_dim as usize,
+            select: idx_dim.map(|d| (d as usize, pools)),
+            q8: false,
+            rope_row: spec.gqa().map_or(0, |g| u64::from(g.rope.dims)) * F32_BYTES,
+        })
     }
 
     /// The same layout with a plain attention layer's planes in q8_0's
@@ -1697,6 +1803,22 @@ impl KvLayout {
     pub const fn in_q8(mut self) -> KvLayout {
         self.q8 = true;
         self
+    }
+
+    /// The bytes the whole trunk `spec` describes holds at `ctx_max` positions: every layer's
+    /// ([`KvLayout::of_spec`]), its plain attention layers' planes in q8_0's two-plane layout
+    /// when `q8` ([`KvLayout::in_q8`]). A GDN layer's stores are the same either way, so one
+    /// sum serves a trunk of any layers.
+    ///
+    /// # Errors
+    ///
+    /// The layout's refusal of the description ([`KvLayout::of_spec_lanes`]).
+    pub fn trunk_bytes(spec: &ModelSpec, ctx_max: u64, q8: bool) -> Result<u64, PlacementError> {
+        let layout = KvLayout::of_spec(spec)?;
+        let layout = if q8 { layout.in_q8() } else { layout };
+        Ok((0..spec.layers.len())
+            .map(|layer| layout.layer_bytes(layer, ctx_max))
+            .sum())
     }
 }
 
@@ -1725,9 +1847,63 @@ fn gdn_bytes(
     (copy + lane_bytes, copy)
 }
 
-/// The hyper-connection streams of a qwen4exp file (1 without).
-fn streams(hp: &Hparams) -> usize {
-    hp.exp.as_ref().map_or(1, |e| e.hc_streams)
+/// The refusal of layer `layer`, whose `what` this layout does not size.
+fn unsized_layer(layer: usize, what: &str) -> PlacementError {
+    PlacementError::Unimplemented(vec![Unimplemented {
+        layer: Some(layer),
+        feature: format!(
+            "{what}: this plan sizes the stores of the GQA layers of one shape (a plane of every \
+             position, or the token-pool selector's pooled keys) and the gated-delta-rule layers \
+             of one shape"
+        ),
+    }])
+}
+
+/// The PLE site's layer and its conv ring's bytes: the one layer that carries
+/// [`Extra::Ple`], with the ring the engram dimensions give it; `None` for a
+/// file with no site. A second site, or a site without its dimensions, is
+/// refused by layer.
+fn ple_site(spec: &ModelSpec) -> Result<Option<(usize, u64)>, PlacementError> {
+    let mut sites = spec
+        .layers
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.extras.contains(&Extra::Ple))
+        .map(|(layer, _)| layer);
+    let Some(layer) = sites.next() else {
+        return Ok(None);
+    };
+    if let Some(second) = sites.next() {
+        return Err(unsized_layer(second, "a second PLE site"));
+    }
+    let Some(EngramSpec {
+        max_ngram,
+        rule: NgramRule::Ple { conv, .. },
+        ..
+    }) = spec.engram
+    else {
+        return Err(unsized_layer(
+            layer,
+            "a PLE site without the PLE dimensions",
+        ));
+    };
+    let ring = ple_ring_bytes(
+        conv as usize,
+        max_ngram as usize,
+        streams(spec),
+        hidden(spec),
+    );
+    Ok(Some((layer, ring)))
+}
+
+/// The hyper-connection streams of a residual row (1 without).
+fn streams(spec: &ModelSpec) -> usize {
+    spec.hc.map_or(1, |hc| hc.streams as usize)
+}
+
+/// The values of a residual row of one stream.
+fn hidden(spec: &ModelSpec) -> usize {
+    spec.hidden as usize
 }
 
 /// Card bytes one resident sequence of a qwen4exp load holds beside its
@@ -1740,8 +1916,8 @@ fn streams(hp: &Hparams) -> usize {
 /// owner of the rows term is `Body38`'s `seq38_bytes`; the gate holds the two
 /// equal.
 #[must_use]
-pub fn slot_resident_bytes(hp: &Hparams) -> u64 {
-    ((1 + PASS_ROWS) * streams(hp) * hp.n_embd * std::mem::size_of::<f32>() + 4) as u64
+pub fn slot_resident_bytes(spec: &ModelSpec) -> u64 {
+    ((1 + PASS_ROWS) * streams(spec) * hidden(spec) * std::mem::size_of::<f32>() + 4) as u64
 }
 
 impl KvLayout {
@@ -1751,7 +1927,7 @@ impl KvLayout {
             Some((idx_dim, pools)) => {
                 let pool =
                     pools.get(layer).copied().filter(|&p| p > 0).expect(
-                        "KvLayout: an attention layer's pool (Hparams::read refuses 0 there)",
+                        "KvLayout: an attention layer's pool (of_spec_lanes refuses 0 there)",
                     );
                 let ctx = usize::try_from(ctx_max).expect("KvLayout: a context of usize");
                 selecting_bytes(self.kv_heads, self.head_dim, *idx_dim, pool, ctx)
@@ -2345,6 +2521,7 @@ fn draft_machine() -> Machine {
             layers: 0..1,
             head: true,
             token_embedding: false,
+            reserve_only: false,
             reserves: Vec::new(),
         }],
         tiers: Vec::new(),
@@ -2380,21 +2557,104 @@ impl KvBytes for MtpKv {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        DELTA_LANES, Kind, KvBytes, KvLayout, delta_lane_bytes, gdn_bytes, ple_ring_bytes,
-        recurrent_bytes,
+    use models::{
+        Act, Arch, ChatSpec, DeltaKind, DeltaRule, GdnGate, Gqa, KHeadMap, LayerSpec, Residual,
+        Rope, RopeMode,
     };
 
+    use super::{
+        DELTA_LANES, Ffn, Kind, KvBytes, KvLayout, Mixer, ModelSpec, OutGate, PlacementError,
+        delta_carry_bytes, delta_lane_bytes, gdn_bytes, ple_ring_bytes, recurrent_bytes,
+        refuse_other_program,
+    };
+
+    /// A GQA mixer of `kv_heads` key heads of 256 values, rotating `rope_dims` values of
+    /// each, a plane of every position.
+    fn gqa(kv_heads: u32, rope_dims: u32) -> Mixer {
+        Mixer::Gqa(Gqa {
+            heads: kv_heads,
+            kv_heads,
+            head_dim: 256,
+            value_dim: 256,
+            rope: Rope {
+                mode: RopeMode::Imrope {
+                    sections: [0, 0, 0, 0],
+                },
+                dims: rope_dims,
+                base: 1e7,
+                yarn: None,
+            },
+            qk_norm: false,
+            o_norm: false,
+            out_gate: OutGate::None,
+            select: None,
+            window: None,
+            sinks: false,
+            value_scale: None,
+        })
+    }
+
+    /// A GDN mixer of 2 key heads and 4 value heads of 128 values, a 4-tap conv.
+    fn gdn() -> Mixer {
+        Mixer::DeltaRule(DeltaRule {
+            kind: DeltaKind::Gdn {
+                khead_map: KHeadMap::Tiled,
+                gate: GdnGate::Silu,
+            },
+            k_heads: 2,
+            v_heads: 4,
+            d: 128,
+            conv: 4,
+        })
+    }
+
+    /// The description of `arch`'s file with one dense layer for each of `mixers`, on a plain
+    /// residual.
+    fn plain(arch: Arch, mixers: Vec<Mixer>) -> ModelSpec {
+        ModelSpec {
+            arch,
+            hidden: 256,
+            vocab: 2,
+            ctx_train: 8,
+            rms_eps: 1e-6,
+            layers: mixers
+                .into_iter()
+                .map(|mixer| LayerSpec {
+                    mixer,
+                    ffn: Ffn::Dense {
+                        ff: 1,
+                        act: Act::SwiGlu { limit: None },
+                    },
+                    residual: Residual::Plain,
+                    extras: Vec::new(),
+                })
+                .collect(),
+            mtp: Vec::new(),
+            hc: None,
+            engram: None,
+            encoder: None,
+            logit_epilogue: None,
+            chat: ChatSpec {
+                pre: String::new(),
+                template: None,
+                tools: None,
+                reasoning: None,
+            },
+        }
+    }
+
     /// Qwen3.8's layers by kind (the sizes themselves are
-    /// `runtime::stores`'s, pinned there): a GDN layer's state lanes and conv ring,
-    /// the PLE ring beside it on its layer, an attention layer's K/V, raw and
+    /// `runtime::stores`'s, pinned there): a GDN layer's state lanes, conv
+    /// ring and carry, the PLE ring beside it on its layer, an attention layer's K/V, raw and
     /// pooled keys at a context of whole pools and one past.
     #[test]
     fn qwen38_layer_bytes() {
         let kv = KvLayout {
             kinds: vec![Kind::DeltaRule, Kind::DeltaRule, Kind::Attention],
-            recurrent: recurrent_bytes(48, 16, 128, 4) + delta_lane_bytes(48, 128, DELTA_LANES),
-            copy: recurrent_bytes(48, 16, 128, 4),
+            recurrent: recurrent_bytes(48, 16, 128, 4)
+                + delta_lane_bytes(48, 128, DELTA_LANES)
+                + delta_carry_bytes(48, 16, 128),
+            copy: recurrent_bytes(48, 16, 128, 4) + delta_carry_bytes(48, 16, 128),
             ple: Some((1, ple_ring_bytes(4, 3, 4, 2560))),
             kv_heads: 2,
             head_dim: 256,
@@ -2402,8 +2662,11 @@ mod tests {
             q8: false,
             rope_row: 64 * 4,
         };
-        assert_eq!(kv.layer_bytes(0, 4096), 3_596_288 + 9_437_200);
-        assert_eq!(kv.layer_bytes(1, 4096), 3_596_288 + 9_437_200 + 696_320);
+        assert_eq!(kv.layer_bytes(0, 4096), 3_596_288 + 9_437_200 + 497_296);
+        assert_eq!(
+            kv.layer_bytes(1, 4096),
+            3_596_288 + 9_437_200 + 497_296 + 696_320
+        );
         assert_eq!(kv.layer_bytes(2, 4096), 4096 * 2304 + 1024 * 256);
         assert_eq!(kv.layer_bytes(2, 4097), 4097 * 2304 + 1025 * 256);
         assert_eq!(kv.layer_bytes(3, 4096), 0);
@@ -2478,7 +2741,7 @@ mod tests {
             .expect("the folder header describes");
         let machine = super::machine(super::A6000, inputs.model.layers, 8);
         let levers = PlanLevers {
-            card_budget_bytes: None,
+            card_budget_bytes: Default::default(),
         };
         for (input, tier) in [
             (&inputs, placement::Device::Host),
@@ -2525,9 +2788,9 @@ mod tests {
     /// One saved sequence state of Qwen3.8's 48 layers (36 GDN, every fourth
     /// one attention, the PLE ring on layer 1) at a context of whole pools
     /// [derived]: twelve attention layers' 2,304 B a position and 256 B a
-    /// pool of four, and two checkpoints of 36 · 3,596,288 B (the committed
-    /// lane and conv ring, not the four lanes a layer holds) and the PLE
-    /// ring's 696,320 B.
+    /// pool of four, and two checkpoints of 36 · 4,093,584 B (the committed
+    /// lane, conv ring and carry, not the four lanes a layer holds) and the
+    /// PLE ring's 696,320 B.
     #[test]
     fn qwen38_state_bytes() {
         let kv = KvLayout {
@@ -2540,8 +2803,10 @@ mod tests {
                     }
                 })
                 .collect(),
-            recurrent: recurrent_bytes(48, 16, 128, 4) + delta_lane_bytes(48, 128, DELTA_LANES),
-            copy: recurrent_bytes(48, 16, 128, 4),
+            recurrent: recurrent_bytes(48, 16, 128, 4)
+                + delta_lane_bytes(48, 128, DELTA_LANES)
+                + delta_carry_bytes(48, 16, 128),
+            copy: recurrent_bytes(48, 16, 128, 4) + delta_carry_bytes(48, 16, 128),
             ple: Some((1, ple_ring_bytes(4, 3, 4, 2560))),
             kv_heads: 2,
             head_dim: 256,
@@ -2552,13 +2817,13 @@ mod tests {
             q8: false,
             rope_row: 64 * 4,
         };
-        let checkpoint = 36 * 3_596_288 + 696_320;
+        let checkpoint = 36 * 4_093_584 + 696_320;
         assert_eq!(kv.state_bytes(0), 2 * checkpoint);
         assert_eq!(
             kv.state_bytes(262_144),
             12 * (262_144 * 2304 + 65_536 * 256) + 2 * checkpoint
         );
-        assert_eq!(kv.state_bytes(262_144), 7_709_409_280);
+        assert_eq!(kv.state_bytes(262_144), 7_745_214_592);
         assert_eq!(
             kv.state_bytes(4097),
             12 * (4097 * 2304 + 1025 * 256) + 2 * checkpoint
@@ -2649,49 +2914,74 @@ mod tests {
 
     #[test]
     fn the_stage_rope_row_is_rope_dims_not_the_head() {
-        use super::super::hparams::{FfnKind, Hparams, SectionOrder, Variant};
-
-        let hp = Hparams {
-            variant: Variant::Qwen35Moe,
-            n_layer: 1,
-            n_trunk: 1,
-            n_embd: 256,
-            n_head: 1,
-            n_head_kv: 1,
-            head_dim: 256,
-            rope_dims: 64,
-            rope_sections: [0, 0, 0, 0],
-            rope_order: SectionOrder::Tyxz,
-            rope_base: 1e7,
-            rms_eps: 1e-6,
-            n_vocab: 2,
-            n_ctx_train: 8,
-            n_expert: 0,
-            n_used: 0,
-            expert_ff: 0,
-            shared_ff: None,
-            ff: None,
-            conv: 4,
-            state: 1,
-            v_heads: 1,
-            k_heads: 1,
-            interval: 1,
-            kinds: vec![Kind::Attention],
-            ffns: vec![FfnKind::Dense],
-            exp: None,
-            defaults: Vec::new(),
+        let layout = |rope_dims| {
+            KvLayout::of_spec(&plain(Arch::Qwen35Moe, vec![gqa(1, rope_dims)]))
+                .expect("a GQA layer is sized")
         };
-        let narrow = KvLayout::of(&hp);
+        let narrow = layout(64);
         assert_eq!(narrow.stage_position_bytes(8), 64 * 4 * 8);
         assert_eq!(narrow.in_q8().stage_position_bytes(8), 64 * 4 * 8);
-        assert_eq!(
-            KvLayout::of(&Hparams {
-                rope_dims: 128,
-                ..hp
-            })
-            .stage_position_bytes(8),
-            128 * 4 * 8
-        );
+        assert_eq!(layout(128).stage_position_bytes(8), 128 * 4 * 8);
+    }
+
+    /// A trunk of GQA layers alone (a dense file's) holds a plane of every position a layer and
+    /// nothing past its layers: K and V of 2 heads of 256 values in f16 [derived: `4096 · 2 · 2 ·
+    /// 2 · 256` B].
+    #[test]
+    fn an_attention_trunk_holds_planes_alone() {
+        let kv = KvLayout::of_spec(&plain(Arch::Llama, vec![gqa(2, 64), gqa(2, 64)]))
+            .expect("a GQA layer is sized");
+        assert_eq!(kv.layer_bytes(0, 4096), 4096 * 2 * 2 * 2 * 256);
+        assert_eq!(kv.layer_bytes(1, 4097), 4097 * 2 * 2 * 2 * 256);
+        assert_eq!(kv.layer_bytes(2, 4096), 0);
+    }
+
+    /// The cache of a trunk of one GDN layer and one GQA layer is the sum of its layers' bytes, the
+    /// attention planes in q8_0's layout when the cache runs in it and the GDN layer's state the
+    /// same in both [derived: the layer's `recurrent_bytes(4, 2, 128, 4)`; the attention layer's `4096
+    /// · 2 · 2 · 256` values, 2 B each in f16, 17/16 B each in q8_0].
+    #[test]
+    fn a_hybrid_trunk_prices_its_attention_planes_in_the_cache_format() {
+        let spec = plain(Arch::Qwen35, vec![gdn(), gqa(2, 64)]);
+        let ctx = 4096;
+        let state = recurrent_bytes(4, 2, 128, 4);
+        let f16 = KvLayout::trunk_bytes(&spec, ctx, false).expect("a hybrid trunk is sized");
+        let q8 = KvLayout::trunk_bytes(&spec, ctx, true).expect("a hybrid trunk is sized");
+        assert_eq!(f16, state + ctx * 2 * 2 * 256 * 2);
+        assert_eq!(q8, state + ctx * 2 * 2 * 256 * 17 / 16);
+        let layout = KvLayout::of_spec(&spec).expect("a hybrid trunk is sized");
+        let sum = |kv: &KvLayout| (0..2).map(|l| kv.layer_bytes(l, ctx)).sum::<u64>();
+        assert_eq!(f16, sum(&layout));
+        assert_eq!(q8, sum(&layout.in_q8()));
+    }
+
+    /// A layer whose stores the layout does not size, and a layer of another shape than the first of
+    /// its kind, are refused by their index.
+    #[test]
+    fn the_layout_refuses_a_layer_it_does_not_size() {
+        let refused = |mixers| match KvLayout::of_spec(&plain(Arch::Qwen35Moe, mixers)) {
+            Err(PlacementError::Unimplemented(list)) => list,
+            other => panic!("want the layout's refusal, got {other:?}"),
+        };
+        let none = refused(vec![gqa(2, 64), Mixer::None]);
+        assert_eq!(none.iter().map(|u| u.layer).collect::<Vec<_>>(), [Some(1)]);
+        let wider = refused(vec![gqa(2, 64), gqa(2, 64), gqa(4, 64)]);
+        assert_eq!(wider.iter().map(|u| u.layer).collect::<Vec<_>>(), [Some(2)]);
+    }
+
+    /// The plan is for the Qwen3.5 and Qwen3.8 bodies' files; another program's description is
+    /// refused naming its architecture and program.
+    #[test]
+    fn a_description_of_another_program_is_refused_by_name() {
+        for arch in [Arch::Qwen35Moe, Arch::Qwen35, Arch::Qwen4Exp, Arch::Llama] {
+            let spec = plain(arch, vec![gqa(2, 64)]);
+            assert!(refuse_other_program(&spec).is_ok(), "{arch:?}");
+        }
+        let err = refuse_other_program(&plain(Arch::Qwen3Moe, vec![gqa(2, 64)]))
+            .expect_err("the qwen3moe body's file is not this plan's");
+        let text = err.to_string();
+        assert!(text.contains("is qwen3moe, run by qwen3moe"), "{text}");
+        assert!(text.contains("the programs qwen35moe and qwen38"), "{text}");
     }
 
     /// The card rule over Qwen3.8's routed stacks ([`super::routed_rule`]) on
@@ -2816,6 +3106,7 @@ mod tests {
                     layers: 0..6,
                     head: true,
                     token_embedding: false,
+                    reserve_only: false,
                     reserves: Vec::new(),
                 }],
                 tiers: Vec::new(),
@@ -2857,17 +3148,23 @@ mod tests {
                 GgmlType::Q5_K,
                 GgmlType::Q5_1,
                 GgmlType::Q8_0,
+                GgmlType::IQ2_XS,
+                GgmlType::IQ2_S,
                 GgmlType::IQ3_XXS,
+                GgmlType::IQ1_S,
                 GgmlType::IQ4_XS,
+                GgmlType::IQ1_M,
                 GgmlType::IQ4_NL,
             ] {
                 assert_eq!(card_routed(ty), Some(CardFormat::KQuant), "{ty}");
             }
+            // PIN(2026-10-25): iq2_s stood in this list until it had card kernels (the gate·up
+            // and prompt GEMM `qwen38_gate_up` reads); tq2_0 has none.
             for ty in [
                 GgmlType::Q6_K,
                 GgmlType::Q5_0,
                 GgmlType::Q3_K,
-                GgmlType::IQ2_S,
+                GgmlType::TQ2_0,
             ] {
                 assert_eq!(card_routed(ty), None, "{ty}");
             }
@@ -2974,7 +3271,7 @@ mod tests {
             let (model, machine) = (model(), machine(131 * MIB));
             let plan = card_plan(&model, &machine, &PlanLevers::default(), 3 * MIB);
             assert_eq!(plan.n_l, N_L_RESERVED);
-            assert_eq!(plan.card_budget, None);
+            assert!(!plan.card_budget.is_set());
             let c = &plan.cards[0];
             assert_eq!(
                 c.dense_bytes + c.expert_bytes + c.rounding_bytes,
@@ -2990,7 +3287,7 @@ mod tests {
         fn a_card_plan_of_no_expert_is_the_host_plan() {
             let (model, machine) = (model(), machine(131 * MIB));
             let levers = PlanLevers {
-                card_budget_bytes: Some(2 * MIB),
+                card_budget_bytes: Some(2 * MIB).into(),
             };
             let card = card_plan(&model, &machine, &levers, 0);
             let host = placement::plan_host_routed(&model, &machine, 4096, &NoKv, &levers)
@@ -3005,7 +3302,7 @@ mod tests {
                         p.nvme_bytes,
                         &p.n_l,
                         p.ctx_max,
-                        p.card_budget
+                        &p.card_budget
                     )
                 )
             };
@@ -3042,12 +3339,13 @@ mod tests {
         // PIN(2026-10-24): the store walk holds no query rows or turned
         // queries, 4,718,592 B fewer [derived: 64 rows · (12,288 + 6,144) f32
         // · 4 B; 53,526,700 - 4,718,592 = 48,808,108 B].
+        // PIN(2026-10-24): the HC bottleneck's BF16 pairs and refusal add 64 · 644 = 41,216 B.
         #[test]
         fn the_mtp_arena_formula() {
-            assert_eq!(mtp_arena_bytes(248_320), 48_808_108);
+            assert_eq!(mtp_arena_bytes(248_320), 48_849_324);
             assert_eq!(
                 mtp_arena_bytes(248_320),
-                4 * (1_212_160 + 8 * 248_320 + 49_536 * 80 + 793 + 5_039_634)
+                4 * (1_212_160 + 8 * 248_320 + 49_536 * 80 + 793 + 5_049_938)
             );
             assert_eq!(mtp_arena_bytes(248_321) - mtp_arena_bytes(248_320), 4 * 8);
         }
@@ -3078,6 +3376,7 @@ mod tests {
                             yarn: None,
                         },
                         qk_norm: true,
+                        o_norm: false,
                         out_gate: OutGate::Packed,
                         select: None,
                         window: None,
@@ -3089,6 +3388,8 @@ mod tests {
                         top_k: 10,
                         expert_ff: 640,
                         latent: None,
+                        pre_exp_norm: false,
+                        post_exp_norm: None,
                         act: Act::SwiGlu { limit: None },
                         router: Router {
                             score: Score::Softmax,
@@ -3436,7 +3737,11 @@ mod tests {
 
         use gguf::GgmlType;
         use models::headpick::HeadSet;
-        use models::{Arch, ChatSpec, ModelSpec};
+        use models::{
+            Act, Arch, ChatSpec, DeltaKind, DeltaRule, EngramSpec, Extra, Ffn, GdnGate, Gqa,
+            HcKind, HcSpec, KHeadMap, LayerSpec, Mixer, ModelSpec, Moe, NgramRule, OutGate,
+            PoolRule, Residual, Rope, RopeMode, Router, Score, Selector, Shared,
+        };
 
         use super::super::{
             Beside, Experts, KvLayout, MtpInputs, PlaceError, PlanInputs, ROUTE_UNIT_RESERVE,
@@ -3444,9 +3749,6 @@ mod tests {
             tensor_places, tier_batch_of, widen_card_route,
         };
         use super::mtp::{draft, file};
-        use crate::arch::qwen35moe::hparams::{
-            Exp, FfnKind, Hparams, Kind, Ple, SectionOrder, Variant,
-        };
         use crate::placement::workstation::HostRead;
         use crate::placement::{
             self, Card, CardFormat, Host, KvBytes, Machine, ModelTensor, ModelTensors, Node,
@@ -3456,67 +3758,119 @@ mod tests {
         const CTX: u64 = 4096;
         const LAYERS: usize = 4;
 
-        /// The file's hyperparameters: the stores' terms of the qwen38 layer
-        /// test's layout; the rest Qwen3.8's, which no plan reads.
-        fn hparams() -> Hparams {
-            Hparams {
-                variant: Variant::Qwen4Exp,
-                n_layer: LAYERS,
-                n_trunk: LAYERS,
-                n_embd: 2560,
-                n_head: 16,
-                n_head_kv: 2,
-                head_dim: 256,
-                rope_dims: 64,
-                rope_sections: [11, 11, 10, 0],
-                rope_order: SectionOrder::Tyxz,
-                rope_base: 1e7,
-                rms_eps: 1e-6,
-                n_vocab: 248_320,
-                n_ctx_train: 262_144,
-                n_expert: 512,
-                n_used: 10,
-                expert_ff: 640,
-                shared_ff: Some(640),
-                ff: None,
-                conv: 4,
-                state: 128,
-                v_heads: 48,
+        /// The file's description: the stores' terms of the qwen38 layer
+        /// test's layout (three GDN layers and a selecting attention layer,
+        /// the PLE site on layer 1, four hyper-connection streams); the rest
+        /// Qwen3.8's, which no plan reads.
+        fn description() -> ModelSpec {
+            let rope = Rope {
+                mode: RopeMode::Imrope {
+                    sections: [11, 11, 10, 0],
+                },
+                dims: 64,
+                base: 1e7,
+                yarn: None,
+            };
+            let gdn = Mixer::DeltaRule(DeltaRule {
+                kind: DeltaKind::Gdn {
+                    khead_map: KHeadMap::Tiled,
+                    gate: GdnGate::Sigmoid,
+                },
                 k_heads: 16,
-                interval: LAYERS,
-                kinds: vec![
-                    Kind::DeltaRule,
-                    Kind::DeltaRule,
-                    Kind::DeltaRule,
-                    Kind::Attention,
-                ],
-                ffns: vec![FfnKind::Routed; LAYERS],
-                exp: Some(Exp {
-                    hc_streams: 4,
-                    hc_rank: 320,
-                    idx_heads: 4,
-                    idx_dim: 128,
-                    idx_top_k: 2048,
-                    ratios: vec![0, 0, 0, 4],
-                    ple: Some(Ple {
-                        layer: 1,
-                        ngram: 3,
-                        heads_per_ngram: 4,
-                        conv: 4,
-                        eos: 0,
-                        image: None,
-                        row: 256,
+                v_heads: 48,
+                d: 128,
+                conv: 4,
+            });
+            let attention = Mixer::Gqa(Gqa {
+                heads: 16,
+                kv_heads: 2,
+                head_dim: 256,
+                value_dim: 256,
+                rope,
+                qk_norm: true,
+                o_norm: false,
+                out_gate: OutGate::Packed,
+                select: Some(Selector::TokenPool {
+                    heads: 4,
+                    d: 128,
+                    top_k: 2048,
+                    pool: 4,
+                    rule: PoolRule::Mean { rope },
+                }),
+                window: None,
+                sinks: false,
+                value_scale: None,
+            });
+            let layer = |l: usize, mixer: Mixer| LayerSpec {
+                mixer,
+                ffn: Ffn::Moe(Moe {
+                    experts: 512,
+                    top_k: 10,
+                    expert_ff: 640,
+                    latent: None,
+                    pre_exp_norm: false,
+                    post_exp_norm: None,
+                    act: Act::SwiGlu { limit: None },
+                    router: Router {
+                        score: Score::Softmax,
+                        bias: false,
+                        norm: models::RouterNorm::SelectedSum,
+                        scale: 1.0,
+                        hash: false,
+                    },
+                    shared: Some(Shared {
+                        ff: 640,
+                        act: Act::SwiGlu { limit: None },
+                        sigmoid_gate: true,
                     }),
                 }),
-                defaults: Vec::new(),
+                residual: Residual::Hc,
+                extras: if l == 1 { vec![Extra::Ple] } else { Vec::new() },
+            };
+            ModelSpec {
+                arch: Arch::Qwen4Exp,
+                hidden: 2560,
+                vocab: 248_320,
+                ctx_train: 262_144,
+                rms_eps: 1e-6,
+                layers: vec![
+                    layer(0, gdn.clone()),
+                    layer(1, gdn.clone()),
+                    layer(2, gdn),
+                    layer(3, attention),
+                ],
+                mtp: Vec::new(),
+                hc: Some(HcSpec {
+                    streams: 4,
+                    kind: HcKind::Gated { rank: 320 },
+                }),
+                engram: Some(EngramSpec {
+                    heads: 4,
+                    max_ngram: 3,
+                    key_length: 256,
+                    rule: NgramRule::Ple {
+                        eos: 0,
+                        image: None,
+                        conv: 4,
+                        dilation: 3,
+                    },
+                }),
+                encoder: None,
+                logit_epilogue: None,
+                chat: ChatSpec {
+                    pre: String::new(),
+                    template: None,
+                    tools: None,
+                    reasoning: None,
+                },
             }
         }
 
-        /// The plan's inputs: a norm a layer for the tensors, and a
-        /// description of no layer, which no plan reads.
+        /// The plan's inputs: a norm a layer for the tensors, and the file's
+        /// description ([`description`]).
         fn inputs() -> PlanInputs {
-            let hp = hparams();
-            let kv = KvLayout::of(&hp);
+            let spec = description();
+            let kv = KvLayout::of_spec(&spec).expect("the description's layout");
             let tensors = (0..LAYERS)
                 .map(|l| ModelTensor {
                     name: format!("blk.{l}.attn_norm.weight"),
@@ -3529,26 +3883,7 @@ mod tests {
                     gathered_rows: None,
                 })
                 .collect();
-            let spec = ModelSpec {
-                arch: Arch::Qwen4Exp,
-                hidden: 2560,
-                vocab: 248_320,
-                ctx_train: 262_144,
-                rms_eps: 1e-6,
-                layers: Vec::new(),
-                mtp: Vec::new(),
-                hc: None,
-                engram: None,
-                encoder: None,
-                chat: ChatSpec {
-                    pre: String::new(),
-                    template: None,
-                    tools: None,
-                    reasoning: None,
-                },
-            };
             PlanInputs {
-                hp,
                 model: ModelTensors {
                     tensors,
                     layers: LAYERS,
@@ -3562,6 +3897,24 @@ mod tests {
                 row_source: placement::RowTableSource::Split,
                 arena: None,
             }
+        }
+
+        /// The layout the description gives is the one `qwen38_layer_bytes` pins layer by layer: a
+        /// GDN layer's state lanes, conv ring and carry, the PLE ring on layer 1, the selecting
+        /// layer's K/V and pooled keys at a context of whole pools and one past.
+        #[test]
+        fn the_description_gives_the_qwen38_layer_bytes() {
+            let kv = KvLayout::of_spec(&description()).expect("the description's layout");
+            assert_eq!(kv.layer_bytes(0, 4096), 3_596_288 + 9_437_200 + 497_296);
+            assert_eq!(
+                kv.layer_bytes(1, 4096),
+                3_596_288 + 9_437_200 + 497_296 + 696_320
+            );
+            assert_eq!(kv.layer_bytes(2, 4096), 3_596_288 + 9_437_200 + 497_296);
+            assert_eq!(kv.layer_bytes(3, 4096), 4096 * 2304 + 1024 * 256);
+            assert_eq!(kv.layer_bytes(3, 4097), 4097 * 2304 + 1025 * 256);
+            assert_eq!(kv.layer_bytes(4, 4096), 0);
+            assert_eq!(kv.stage_position_bytes(4096), 64 * 4 * 4096);
         }
 
         /// One card running every layer, with room for every plan here; a
@@ -3582,6 +3935,7 @@ mod tests {
                     layers: 0..LAYERS,
                     head: true,
                     token_embedding: false,
+                    reserve_only: false,
                     reserves: Vec::new(),
                 }],
                 tiers: Vec::new(),
@@ -3627,7 +3981,7 @@ mod tests {
             slots: u64,
             reserve: u64,
         ) -> Plan<'a> {
-            let rows = slot_resident_bytes(&inputs.hp) * (slots - 1);
+            let rows = slot_resident_bytes(&inputs.spec) * (slots - 1);
             let kv = Times {
                 kv: &inputs.kv,
                 slots,
@@ -3677,7 +4031,7 @@ mod tests {
                     &p.n_l,
                     &p.tier_n_l,
                     p.ctx_max,
-                    p.card_budget
+                    &p.card_budget
                 )
             )
         }
@@ -3832,6 +4186,70 @@ mod tests {
             }
         }
 
+        /// A stage card with a named reserve (an integrated card's
+        /// activation forms): the drafted plan's headroom is the card's usable
+        /// bytes less every term the plan counts, the reserve and the draft's
+        /// bytes included, for one slot and for several.
+        #[test]
+        fn drafted_headroom_counts_the_stage_cards_reserves() {
+            let (inputs, mut machine) = (inputs(), machine());
+            machine.cards[0].reserves.push((
+                crate::arch::qwen35moe::place::ACT_FORMS_RESERVE.to_string(),
+                64 << 20,
+            ));
+            let mtp =
+                MtpInputs::from_parts(draft(HeadSet::Full), &file()).expect("the draft's inputs");
+            let levers = PlanLevers::default();
+            for n in [1usize, 2] {
+                let drafted = inputs
+                    .plan_mtp_with_slots(&machine, CTX, &levers, &mtp, Experts::Host, n)
+                    .expect("the drafted plan");
+                let (_, reserve) = draft_of(&mtp, n as u64);
+                let t = &drafted.plan.cards[0];
+                assert_eq!(t.reserve_bytes, 64 << 20, "{n} slots");
+                assert_eq!(
+                    drafted.headroom_bytes,
+                    i128::from(drafted.plan.usable_bytes(&machine.cards[0]))
+                        - i128::from(t.bytes())
+                        - i128::from(reserve),
+                    "{n} slots"
+                );
+            }
+        }
+
+        /// A named reserve that makes the target fit a card of `u64::MAX`
+        /// bytes exactly leaves no room for the draft's reserve: the sum past
+        /// the bound is refused by name, for one slot and for several, and not
+        /// saturated into a plan with no headroom.
+        #[test]
+        fn a_draft_reserve_past_u64_is_refused_by_name() {
+            let (inputs, mut machine) = (inputs(), machine());
+            machine.cards[0].usable_bytes = u64::MAX;
+            let mtp =
+                MtpInputs::from_parts(draft(HeadSet::Full), &file()).expect("the draft's inputs");
+            let levers = PlanLevers::default();
+            for n in [1usize, 2] {
+                let reserve = crate::arch::qwen35moe::place::ACT_FORMS_RESERVE.to_string();
+                machine.cards[0].reserves = vec![(reserve.clone(), 0)];
+                let others = inputs
+                    .plan_mtp_with_slots(&machine, CTX, &levers, &mtp, Experts::Host, n)
+                    .expect("the plan")
+                    .plan
+                    .cards[0]
+                    .bytes();
+                machine.cards[0].reserves = vec![(reserve, u64::MAX - others)];
+                assert!(
+                    matches!(
+                        inputs.plan_mtp_with_slots(&machine, CTX, &levers, &mtp, Experts::Host, n),
+                        Err(PlaceError::Placement(
+                            PlacementError::CardBytesPastU64 { .. }
+                        ))
+                    ),
+                    "{n} slots"
+                );
+            }
+        }
+
         /// The stage card's headroom past the bytes a plan of several slots
         /// adds to its kv class after the totals (the bytes beside every
         /// slot's stores) is the card's usable bytes less every term: on the
@@ -3897,7 +4315,7 @@ mod tests {
             let mut inputs = routed(inputs());
             inputs.room = (pool, HostRead::Given);
             let whole = PlanLevers {
-                card_budget_bytes: Some(u64::MAX),
+                card_budget_bytes: Some(u64::MAX).into(),
             };
             for n in [1, 2] {
                 match inputs.plan_with_slots(&machine, CTX, &whole, Experts::Card, n) {
@@ -3911,7 +4329,7 @@ mod tests {
                 let plan = inputs
                     .plan_with_slots(&machine, CTX, &PlanLevers::default(), Experts::Card, n)
                     .unwrap_or_else(|e| panic!("{n} slot(s): {e}"));
-                let budget = plan.card_budget.expect("a card budget");
+                let budget = plan.card_budget.every().expect("a card budget");
                 assert!(
                     plan.budget_from_pool && budget < pool,
                     "{n} slot(s): the pool's budget, {budget} B"
@@ -3938,7 +4356,7 @@ mod tests {
         #[test]
         fn nvme_room_is_capped_by_the_unified_pool() {
             let levers = PlanLevers {
-                card_budget_bytes: Some(1 << 30),
+                card_budget_bytes: bloomery_levers::CardBudget::Every(1 << 30),
             };
             let mut inputs = routed(inputs());
             for slots in [1, 2, 4] {
@@ -3975,7 +4393,7 @@ mod tests {
         #[test]
         fn node_nvme_room_is_capped_by_the_unified_pool() {
             let levers = PlanLevers {
-                card_budget_bytes: Some(1 << 30),
+                card_budget_bytes: bloomery_levers::CardBudget::Every(1 << 30),
             };
             let mut inputs = routed(inputs());
             for ranks in [1, 2, 4] {
@@ -4049,7 +4467,7 @@ mod tests {
             assert_eq!(plan.tier_n_l, vec![vec![256; LAYERS]]);
             for budget in [None, Some(64 << 20), Some(u64::MAX)] {
                 let levers = PlanLevers {
-                    card_budget_bytes: budget,
+                    card_budget_bytes: budget.into(),
                 };
                 for owned in [[0, 512], [256, 256], [511, 1]] {
                     let result = inputs.plan_nodes(&machine, CTX, &levers, &owned);
@@ -4099,7 +4517,7 @@ mod tests {
                         &machine,
                         CTX,
                         &PlanLevers {
-                            card_budget_bytes: Some(0),
+                            card_budget_bytes: Some(0).into(),
                         },
                         &[256, 256],
                     )
@@ -4133,7 +4551,7 @@ mod tests {
                     &machine,
                     CTX,
                     &PlanLevers {
-                        card_budget_bytes: Some(u64::MAX),
+                        card_budget_bytes: Some(u64::MAX).into(),
                     },
                     &[0, 512],
                 ),

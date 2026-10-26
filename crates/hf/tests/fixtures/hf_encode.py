@@ -14,14 +14,11 @@ emoji and long digit runs; and one codepoint of every 211 assigned ones (private
 contexts.
 """
 import codecs
-import hashlib
-import json
 import sys
 import unicodedata
 from pathlib import Path
 
-import tokenizers
-from tokenizers import Tokenizer
+import hf_corpus
 
 REV = "fc694b54fb0174e0913e6adf86691ef85a4ead47"
 
@@ -115,18 +112,9 @@ def corpus():
 
 
 def main():
-    folder = sys.argv[1]
-    data = open(f"{folder}/tokenizer.json", "rb").read()
-    tok = Tokenizer.from_str(data.decode("utf-8"))
-    head = {
-        "tokenizers": tokenizers.__version__,
-        "unicode": unicodedata.unidata_version,
-        "source": f"nvidia/Qwen3.8-Flash-Next-NVFP4@{REV}/tokenizer.json",
-        "sha256": hashlib.sha256(data).hexdigest(),
-    }
-    cases = [json.dumps({"text": t, "ids": tok.encode(t, add_special_tokens=False).ids}, ensure_ascii=False)
-             for t in corpus()]
-    sys.stdout.write(json.dumps(head, ensure_ascii=False)[:-1] + ', "cases": [\n' + ",\n".join(cases) + "\n]}\n")
+    data, tok = hf_corpus.read_tokenizer(sys.argv[1])
+    source = f"nvidia/Qwen3.8-Flash-Next-NVFP4@{REV}/tokenizer.json"
+    hf_corpus.emit(data, source, hf_corpus.encoded(tok, corpus()), unicode=unicodedata.unidata_version)
 
 
 if __name__ == "__main__":

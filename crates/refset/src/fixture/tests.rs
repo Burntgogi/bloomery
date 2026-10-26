@@ -1,7 +1,8 @@
 use super::{
-    DEFAULT_ROOT, DIRS_TABLE, KEY_SUBSET, KEY_VARIANT, KEY_VERSION, ROOT_ENV, SELF, VARIANT_ENV,
-    dir_of, dirs, first_shard, first_shard_in, keys, line, parse_dirs, render, root_of,
-    selected_of, variant_of, variant_root, variant_set_name, with_root, with_variant,
+    DEFAULT_ROOT, DIRS_TABLE, KEY_SUBSET, KEY_VARIANT, KEY_VERSION, LINE_PREFIX, ROOT_ENV, SELF,
+    VARIANT_ENV, check_stated, dir_of, dirs, first_shard, first_shard_in, keys, line, parse_dirs,
+    render, root_of, selected_of, variant_of, variant_root, variant_set_name, with_root,
+    with_variant,
 };
 use crate::RefError;
 use crate::arch::named;
@@ -1325,4 +1326,222 @@ fn a_variants_sets_are_named_and_checked_apart_from_the_bases() -> Result<(), Re
     remove(&data)?;
     remove(&none)?;
     remove(&set)
+}
+
+/// A safetensors shard at `path`: one 1-byte tensor and `meta` as its string `__metadata__`.
+fn write_shard(path: &Path, meta: &[(&str, &str)]) {
+    let pairs: Vec<String> = meta
+        .iter()
+        .map(|(k, v)| format!("{}:{}", json_str(k), json_str(v)))
+        .collect();
+    write_shard_text(path, &pairs.join(","));
+}
+
+fn json_str(s: &str) -> String {
+    serde_json::to_string(s).expect("a string serializes")
+}
+
+/// A shard whose `__metadata__` object body is `meta_body`, written as given.
+fn write_shard_text(path: &Path, meta_body: &str) {
+    let mut header = format!(
+        r#"{{"__metadata__":{{{meta_body}}},"t":{{"dtype":"U8","shape":[1],"data_offsets":[0,1]}}}}"#
+    );
+    while !header.len().is_multiple_of(8) {
+        header.push(' ');
+    }
+    let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+    bytes.extend_from_slice(header.as_bytes());
+    bytes.push(0);
+    std::fs::write(path, bytes).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+}
+
+/// The keys of a cut folder's first shard, as `tools/fixture-cuts/*.json` and the cutter write them.
+const CUT_META: [(&str, &str); 8] = [
+    ("format", "pt"),
+    ("bloomery.fixture.version", "1"),
+    ("bloomery.fixture.source", "MiniMaxAI/MiniMax-M3.1-Flash"),
+    ("bloomery.fixture.rev", "76faee1b"),
+    ("bloomery.fixture.layers", "0,3,59"),
+    ("bloomery.fixture.ff", "512"),
+    ("bloomery.fixture.manifest_sha256", "ab12"),
+    ("bloomery.fixture.card_budget", "8589934592"),
+];
+
+/// A checkpoint folder's fixture is the folder's first shard beside its index: `first_shard_in`
+/// takes the one `*-00001-of-*.safetensors` of a directory that holds `model.safetensors.index.json`,
+/// refuses by name none, two, and a folder beside a GGUF first shard, and a shard with no index
+/// beside it is no fixture; the GGUF rule of a directory with no index is as it was.
+#[test]
+fn a_cut_folders_first_shard_is_the_one_beside_its_index() -> Result<(), RefError> {
+    let root = temp("folder-shard")?;
+    let rs = root.display().to_string();
+    let dir = root.join("minimaxm31");
+    std::fs::create_dir_all(&dir).map_err(|e| RefError::missing(&dir, e.to_string()))?;
+    let put = |name: &str| {
+        write_shard(&dir.join(name), &CUT_META);
+    };
+    put("model-00001-of-00002.safetensors");
+    put("model-00002-of-00002.safetensors");
+    let named = |e: RefError| e.to_string();
+
+    let e = named(first_shard_in(&rs, "minimax-m3").expect_err("no index"));
+    assert!(
+        e.contains("holds 0 first shards (*-00001-of-*.gguf)"),
+        "a shard with no index is no fixture: {e}"
+    );
+
+    std::fs::write(dir.join("model.safetensors.index.json"), b"{}")
+        .map_err(|e| RefError::missing(&dir, e.to_string()))?;
+    assert_eq!(
+        first_shard_in(&rs, "minimax-m3")?,
+        format!("{rs}/minimaxm31/model-00001-of-00002.safetensors")
+    );
+
+    put("other-00001-of-00003.safetensors");
+    let e = named(first_shard_in(&rs, "minimax-m3").expect_err("two first shards"));
+    assert!(
+        e.contains("holds 2 first shards (*-00001-of-*.safetensors)")
+            && e.contains("model-00001-of-00002.safetensors")
+            && e.contains("other-00001-of-00003.safetensors")
+            && e.contains("fixture cut"),
+        "{e}"
+    );
+    std::fs::remove_file(dir.join("other-00001-of-00003.safetensors"))
+        .map_err(|e| RefError::missing(&dir, e.to_string()))?;
+
+    std::fs::write(dir.join("x-00001-of-00001.gguf"), b"")
+        .map_err(|e| RefError::missing(&dir, e.to_string()))?;
+    let e = named(first_shard_in(&rs, "minimax-m3").expect_err("both"));
+    assert!(
+        e.contains("holds both") && e.contains("x-00001-of-00001.gguf"),
+        "{e}"
+    );
+    remove(&root)
+}
+
+/// The line of a cut folder is its first shard's `__metadata__` keys under `bloomery.fixture.`
+/// sorted, as a GGUF's header keys are, without the card budget and the keys of other prefixes,
+/// and a set dumped from it is current for the same keys and stale for any key that moved.
+#[test]
+fn a_cut_folders_line_is_its_first_shards_metadata_keys() -> Result<(), RefError> {
+    let dir = temp("folder-line")?;
+    let shard = dir.join("model-00001-of-00002.safetensors");
+    write_shard(&shard, &CUT_META);
+    let want = "# fixture\tbloomery.fixture.ff=512 bloomery.fixture.layers=0,3,59 \
+                bloomery.fixture.manifest_sha256=ab12 bloomery.fixture.rev=76faee1b \
+                bloomery.fixture.source=MiniMaxAI/MiniMax-M3.1-Flash bloomery.fixture.version=1";
+    assert_eq!(line(&shard)?, want);
+    assert_eq!(variant_of(&shard)?, None, "a folder fixture has no variant");
+
+    let stated = want.strip_prefix(LINE_PREFIX).expect("a fixture line");
+    check_stated(Path::new("set"), Some(stated), &shard)?;
+    let mut moved = CUT_META;
+    moved[5] = ("bloomery.fixture.ff", "256");
+    write_shard(&shard, &moved);
+    let e = check_stated(Path::new("set"), Some(stated), &shard).expect_err("ff moved");
+    assert!(
+        matches!(e, RefError::Stale { .. }) && e.to_string().contains("bloomery.fixture.ff=256"),
+        "{e}"
+    );
+    remove(&dir)
+}
+
+/// The refusals of a cut folder's line, each by name, the message naming the file and the key: no
+/// metadata or no version key (not a fixture), a subset key, a value that is empty or holds
+/// whitespace, `=` or a control character, a key given twice, and a file that is no safetensors
+/// header.
+#[test]
+fn a_cut_folders_line_refuses_what_it_cannot_state() -> Result<(), RefError> {
+    let dir = temp("folder-refuse")?;
+    let shard = dir.join("model-00001-of-00001.safetensors");
+    fn with<'a>(extra: &[(&'a str, &'a str)]) -> Vec<(&'a str, &'a str)> {
+        let mut v = CUT_META.to_vec();
+        v.extend_from_slice(extra);
+        v
+    }
+    let refused = |what: &str| -> String {
+        let e = line(&shard).expect_err(what).to_string();
+        assert!(e.contains(&shard.display().to_string()), "{what}: {e}");
+        e
+    };
+
+    write_shard(&shard, &[("format", "pt")]);
+    assert!(matches!(line(&shard), Err(RefError::Missing { .. })));
+    assert!(refused("no version").contains("bloomery.fixture.version"));
+
+    write_shard(&shard, &with(&[("bloomery.fixture.subset", "x")]));
+    assert!(matches!(line(&shard), Err(RefError::Malformed { .. })));
+    assert!(refused("subset").contains("bloomery.fixture.subset"));
+
+    for (value, why) in [
+        ("", "empty"),
+        ("a b", "whitespace"),
+        ("a=b", "="),
+        ("a\u{1}b", "control"),
+    ] {
+        write_shard(&shard, &with(&[("bloomery.fixture.bad", value)]));
+        assert!(
+            matches!(line(&shard), Err(RefError::Malformed { .. })),
+            "{why}"
+        );
+        assert!(refused(why).contains("bloomery.fixture.bad"), "{why}");
+    }
+
+    let twice = CUT_META
+        .iter()
+        .map(|(k, v)| format!("{}:{}", json_str(k), json_str(v)))
+        .chain([format!("{}:\"2\"", json_str("bloomery.fixture.version"))])
+        .collect::<Vec<_>>()
+        .join(",");
+    write_shard_text(&shard, &twice);
+    assert!(refused("twice").contains("given twice"));
+
+    write_shard_text(&shard, r#""bloomery.fixture.version":1"#);
+    assert!(refused("a number").contains("bloomery.fixture.version"));
+
+    std::fs::write(&shard, b"not a safetensors header at all")
+        .map_err(|e| RefError::missing(&shard, e.to_string()))?;
+    assert!(matches!(line(&shard), Err(RefError::Malformed { .. })));
+    let gone = dir.join("gone.safetensors");
+    assert!(matches!(line(&gone), Err(RefError::Missing { .. })));
+    remove(&dir)
+}
+
+/// The arch of a cut folder's row resolves through the table to the folder's first shard and the
+/// shell's variant check holds: with no variant selected it is the shard, with one selected the
+/// shard (which carries no variant key) is refused by name as a GGUF with no key is.
+#[test]
+fn a_cut_folder_resolves_through_the_table_and_takes_no_variant() -> Result<(), RefError> {
+    let top = temp("folder-table")?;
+    let root = top.join("fixtures");
+    let dir = root.join(dir_of("minimax-m3").expect("the table's minimax-m3 row"));
+    std::fs::create_dir_all(&dir).map_err(|e| RefError::missing(&dir, e.to_string()))?;
+    write_shard(&dir.join("model-00001-of-00001.safetensors"), &CUT_META);
+    std::fs::write(dir.join("model.safetensors.index.json"), b"{}")
+        .map_err(|e| RefError::missing(&dir, e.to_string()))?;
+    let first = with_root(&root, || first_shard("minimax-m3"))?;
+    assert!(
+        first.ends_with("/model-00001-of-00001.safetensors"),
+        "{first}"
+    );
+    let variants = top
+        .join("fixture-variants/iq4xs")
+        .join(dir.file_name().expect("a dir name"));
+    std::fs::create_dir_all(&variants).map_err(|e| RefError::missing(&variants, e.to_string()))?;
+    write_shard(
+        &variants.join("model-00001-of-00001.safetensors"),
+        &CUT_META,
+    );
+    std::fs::write(variants.join("model.safetensors.index.json"), b"{}")
+        .map_err(|e| RefError::missing(&variants, e.to_string()))?;
+    let e = with_root(&root, || {
+        with_variant("iq4xs", || first_shard("minimax-m3"))
+    })
+    .expect_err("a variant of a folder fixture")
+    .to_string();
+    assert!(
+        e.contains(VARIANT_ENV) && e.contains("\"iq4xs\"") && e.contains("none"),
+        "{e}"
+    );
+    remove(&top)
 }

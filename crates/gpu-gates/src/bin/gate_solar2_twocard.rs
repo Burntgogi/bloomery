@@ -288,7 +288,7 @@ mod gate {
         // half of each card-eligible layer's experts on a card.
         let place_levers = match Tier::from_env()? {
             Tier::Real => PlanLevers {
-                card_budget_bytes: Some(BUDGET),
+                card_budget_bytes: Some(BUDGET).into(),
             },
             Tier::Fixture => tier::plan_levers(&split, &levers, 0)?,
         };
@@ -319,6 +319,7 @@ mod gate {
         let budget = cfg
             .place
             .card_budget_bytes
+            .every()
             .ok_or("the gate plans under a card budget")?;
         let splits = layer_splits(&plan);
         let tier_layers: Vec<usize> = splits.iter().filter(|o| o.2 > 0).map(|o| o.0).collect();

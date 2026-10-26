@@ -463,13 +463,29 @@ def pass_swaps(counts, resident, pend_in, pend_out, n_l, rule, per_layer_cap, ti
     return out
 
 
+class ReplayState:
+    """Where a replay stopped: the card set, the counts, the flips planned and not yet live (heap entries
+    (live pass, order, layer, in, out), live passes numbered from the first replay of the chain), the
+    order counter, the kept rows past the last plan (clock kept) and the passes run. replay(...,
+    state0=...) continues from it, so requests chain in serve order."""
+
+    def __init__(self, resident, counts, pend_in, pend_out, heap, seq, since, passes):
+        self.resident, self.counts, self.pend_in, self.pend_out = resident, counts, pend_in, pend_out
+        self.heap, self.seq, self.since, self.passes = heap, seq, since, passes
+
+    def copy(self):
+        return ReplayState(self.resident.copy(), self.counts.copy(), self.pend_in.copy(), self.pend_out.copy(),
+                           list(self.heap), self.seq, self.since, self.passes)
+
+
 class Replay:
-    def __init__(self, hits_layer, per_row, swaps, plans):
+    def __init__(self, hits_layer, per_row, swaps, plans, state=None):
         self.hits_layer, self.per_row, self.swaps, self.plans = hits_layer, per_row, swaps, plans
+        self.state = state
 
 
 def replay(X, resident0, n_l, E, rule=None, *, sem="flip", spares=1, in_flight_cap=True, d=1, link=None,
-           counts0=None, record=None, passes=None, on_flip=None, ties=None, pinned=None, away=None):
+           counts0=None, record=None, passes=None, on_flip=None, ties=None, pinned=None, away=None, state0=None):
     """The card set over X [rows, L, K]. passes: None (one row a pass, counted) or (r0, r1, kept) per pass;
     every row of a pass is served by the set in force at its start, its first `kept` rows are counted.
     rule None is the static set. sem "hole": the victim leaves at the decision; "flip": it stays live
@@ -479,20 +495,34 @@ def replay(X, resident0, n_l, E, rule=None, *, sem="flip", spares=1, in_flight_c
     plans. in_flight_cap False is the adaptres window scripts' order: at most `spares` new flips a layer
     a boundary however many are in flight, and the rule plans before the flips live at b land. pinned
     [L, E] bool: residents never a victim (crates/runtime's pinned seed ranks). away [L, E] bool: ids on
-    another device, never admitted (crates/runtime's away experts)."""
+    another device, never admitted (crates/runtime's away experts). state0 (a ReplayState, in place of
+    resident0 and counts0): continue from it, passes numbered on from its own; the result's `state` is
+    where this replay stopped."""
     L = X.shape[1]
     ar = np.arange(L)[:, None]
-    resident = resident0.copy()
-    counts = np.zeros((L, E)) if counts0 is None else counts0.copy()
-    pend_in = np.zeros((L, E), dtype=bool)
-    pend_out = np.zeros((L, E), dtype=bool)
-    heap = []
-    seq = swaps = plans = 0
-    since = 0  # kept rows the ended passes have kept past the last plan's (clock kept)
+    if state0 is None:
+        resident = resident0.copy()
+        counts = np.zeros((L, E)) if counts0 is None else counts0.copy()
+        pend_in = np.zeros((L, E), dtype=bool)
+        pend_out = np.zeros((L, E), dtype=bool)
+        heap = []
+        seq = since = p0 = 0  # since: kept rows the ended passes have kept past the last plan's (clock kept)
+    else:
+        if resident0 is not None or counts0 is not None:
+            raise ToolError("replay: state0 holds the card set and the counts; resident0 and counts0 go with none")
+        resident, counts = state0.resident.copy(), state0.counts.copy()
+        pend_in, pend_out = state0.pend_in.copy(), state0.pend_out.copy()
+        heap = list(state0.heap)
+        heapq.heapify(heap)
+        seq, since, p0 = state0.seq, state0.since, state0.passes
+    swaps = plans = 0
     hits = np.zeros(L, dtype=np.int64)
     per_row = np.zeros(X.shape[0])
     per_layer_cap = spares if sem == "flip" else None
     flying = {} if sem == "flip" and in_flight_cap else None
+    if flying is not None:
+        for entry in heap:
+            flying[entry[2]] = flying.get(entry[2], 0) + 1
 
     def land(b):
         while heap and heap[0][0] <= b:
@@ -507,7 +537,7 @@ def replay(X, resident0, n_l, E, rule=None, *, sem="flip", spares=1, in_flight_c
 
     npass = X.shape[0] if passes is None else len(passes)
     for p in range(npass):
-        land(p)
+        land(p0 + p)
         r0, r1, kept = (p, p + 1, 1) if passes is None else passes[p]
         for r in range(r0, r1):
             sel = X[r]
@@ -520,7 +550,7 @@ def replay(X, resident0, n_l, E, rule=None, *, sem="flip", spares=1, in_flight_c
                 counts[ar, sel] += 1.0
         if rule is None:
             continue
-        b = p + 1
+        b = p0 + p + 1
         if rule.clock == "pass":
             due = b % rule.every == 0
         else:
@@ -551,7 +581,8 @@ def replay(X, resident0, n_l, E, rule=None, *, sem="flip", spares=1, in_flight_c
             if on_flip is not None:
                 on_flip(b, i, e_out, e_in, live)
         counts *= rule.decay
-    return Replay(hits, per_row, swaps, plans)
+    state = ReplayState(resident, counts, pend_in, pend_out, sorted(heap), seq, since, p0 + npass)
+    return Replay(hits, per_row, swaps, plans, state)
 
 
 def adaptive(X, seed, n_l, E, rule, link=None, record=None):

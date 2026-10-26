@@ -14,14 +14,17 @@
 //! The buffers' resources are untracked, so the queue's order alone does not
 //! keep one buffer's dispatches from overlapping the next one's. Work that
 //! must follow the work before it opens with a token encoder
-//! ([`Recording::token_encoder`]): its buffer waits for the stream's token
-//! boundary, a device event every signalled buffer signals at its end.
+//! ([`Recording::token_encoder`], or [`Recording::open_token_encoder`] for a
+//! caller that holds the encoder across calls): its buffer waits for the
+//! stream's token boundary, a device event every signalled buffer signals at
+//! its end.
 //!
 //! [`MetalStream::settle`] waits for one signalled buffer, not for every
 //! pending one: it wakes on the stream's event at the value that buffer
 //! signals, and returns the proof ([`Settled`]) a host read of what the
 //! buffer wrote takes. Every host wait, a settle or a sync, is counted
-//! ([`MetalStream::waits`]).
+//! ([`MetalStream::waits`]), and so is every committed buffer
+//! ([`MetalStream::submits`]).
 
 use core::sync::atomic::{AtomicU64, Ordering};
 use core::time::Duration;
@@ -38,7 +41,7 @@ use objc2_metal::{
 use bloomery_device::{DeviceError, Event, Stream};
 
 use crate::device::MetalDevice;
-use crate::encode::ComputeEncoder;
+use crate::encode::{ComputeEncoder, EncodeCount};
 use crate::handle::{CommandBufferHandle, Handle};
 use crate::residency::Residency;
 
@@ -88,6 +91,8 @@ struct Committed {
     boundary: u64,
     /// The committed command buffers not yet seen complete.
     pending: Vec<CommandBufferHandle>,
+    /// The command buffers committed so far.
+    submits: u64,
 }
 
 impl Committed {
@@ -97,7 +102,10 @@ impl Committed {
     fn commit(&mut self, buffer: Retained<ProtocolObject<dyn MTLCommandBuffer>>) {
         self.pending
             .retain(|b| b.0.status() != MTLCommandBufferStatus::Completed);
+        #[cfg(feature = "encode-trace")]
+        crate::trace::commit(&buffer);
         buffer.commit();
+        self.submits += 1;
         self.pending.push(CommandBufferHandle(buffer));
     }
 
@@ -138,7 +146,7 @@ pub struct Recording<'s> {
     stream: &'s MetalStream,
 }
 
-impl Recording<'_> {
+impl<'s> Recording<'s> {
     /// A compute encoder on the recording's command buffer. The recording is
     /// borrowed exclusively while the encoder lives: Metal ends one encoder
     /// before it starts another, and a recording cannot be submitted mid-encode.
@@ -162,12 +170,64 @@ impl Recording<'_> {
     /// token committed ahead starts before the token it embeds the pick of
     /// is done, and the e2e gate's `b_chain` is red.
     pub fn token_encoder(&mut self) -> Result<ComputeEncoder<'_>, DeviceError> {
+        self.wait_for_boundary();
+        ComputeEncoder::concurrent(&self.buffer)
+    }
+
+    /// [`Recording::token_encoder`], with the encoder kept beside the
+    /// recording instead of borrowing it, so a caller holds the pair across
+    /// calls and commits it when it chooses.
+    pub fn open_token_encoder(self) -> Result<TokenRecording<'s>, DeviceError> {
+        self.wait_for_boundary();
+        let encoder = ComputeEncoder::concurrent_detached(&self.buffer)?;
+        Ok(TokenRecording {
+            encoder,
+            recording: self,
+        })
+    }
+
+    /// The buffer's first command: wait for the boundary's last value, when
+    /// a signalled buffer has set one.
+    fn wait_for_boundary(&self) {
         let last = self.stream.committed().boundary;
         if last > 0 {
+            #[cfg(feature = "encode-trace")]
+            crate::trace::wait_event(&self.buffer, "boundary", last);
             self.buffer
                 .encodeWaitForEvent_value(&self.stream.boundary, last);
         }
-        ComputeEncoder::concurrent(&self.buffer)
+    }
+}
+
+/// A recording and its token encoder, open together: made by
+/// [`Recording::open_token_encoder`], encoded into through
+/// [`TokenRecording::encoder`], and closed by [`TokenRecording::finish`],
+/// which ends the encoder and hands back the recording to commit. A
+/// recording cannot be committed with its encoder open, so this type is the
+/// only holder of both and ends the encoder before it gives the recording up.
+pub struct TokenRecording<'s> {
+    // Declared first, so a dropped pair ends its encoder before the buffer
+    // goes.
+    encoder: ComputeEncoder<'static>,
+    recording: Recording<'s>,
+}
+
+impl<'s> TokenRecording<'s> {
+    /// `f` over the open encoder. The encoder reaches `f` at a lifetime of
+    /// its own, so it cannot leave the call or trade places with another
+    /// pair's: a pair's `finish` always ends its own encoder.
+    pub fn encoder<R>(&mut self, f: impl for<'e> FnOnce(&mut ComputeEncoder<'e>) -> R) -> R {
+        f(&mut self.encoder)
+    }
+
+    /// End the encoder: the recording, ready to commit, and what the encoder
+    /// encoded.
+    #[must_use]
+    pub fn finish(self) -> (Recording<'s>, EncodeCount) {
+        let Self { encoder, recording } = self;
+        let count = encoder.count();
+        encoder.end();
+        (recording, count)
     }
 }
 
@@ -350,6 +410,7 @@ impl MetalStream {
                 // The list starts with capacity, so no commit from the first
                 // step on grows it; a sync drops finished buffers in place.
                 pending: Vec::with_capacity(PENDING),
+                submits: 0,
             }),
             waits: AtomicU64::new(0),
             residency: None,
@@ -385,8 +446,15 @@ impl MetalStream {
         self.waits.load(Ordering::Relaxed)
     }
 
+    /// The command buffers this stream has committed so far: every submit,
+    /// `record` and `wait`.
+    #[must_use]
+    pub fn submits(&self) -> u64 {
+        self.committed().submits
+    }
+
     /// The committed state. A panic while it was held left it whole (every
-    /// change to it is one push or one retain), so a poisoned lock is taken
+    /// change to it is one push, one retain or one count), so a poisoned lock is taken
     /// as it stands.
     fn committed(&self) -> MutexGuard<'_, Committed> {
         self.committed
@@ -398,12 +466,17 @@ impl MetalStream {
     fn command_buffer(
         &self,
     ) -> Result<Retained<ProtocolObject<dyn MTLCommandBuffer>>, DeviceError> {
-        self.queue.commandBuffer().ok_or_else(|| {
+        let made = self.queue.commandBuffer().ok_or_else(|| {
             DeviceError::backend(
                 "command buffer",
                 "the queue made no command buffer".to_string(),
             )
-        })
+        });
+        #[cfg(feature = "encode-trace")]
+        if let Ok(buffer) = &made {
+            crate::trace::command_buffer_made(buffer);
+        }
+        made
     }
 
     /// A recording for the next piece of work.
@@ -450,6 +523,11 @@ impl MetalStream {
         self.keep_resident();
         let mut c = self.committed();
         let value = c.next_value();
+        #[cfg(feature = "encode-trace")]
+        {
+            crate::trace::signal_event(&recording.buffer, "boundary", value);
+            crate::trace::signal_event(&recording.buffer, "timeline", value);
+        }
         recording
             .buffer
             .encodeSignalEvent_value(&self.boundary, value);
@@ -470,6 +548,8 @@ impl MetalStream {
     pub fn settle(&self, signalled: Signalled) -> Result<Settled, DeviceError> {
         self.waits.fetch_add(1, Ordering::Relaxed);
         let value = signalled.value;
+        #[cfg(feature = "encode-trace")]
+        crate::trace::host(|| format!("settle {value}"));
         let deadline = Instant::now() + SYNC_TIMEOUT;
         while !self
             .timeline
@@ -515,6 +595,8 @@ impl MetalStream {
     pub fn sync_for(&self, timeout: Duration) -> Result<(), DeviceError> {
         use std::sync::TryLockError::{Poisoned, WouldBlock};
         self.waits.fetch_add(1, Ordering::Relaxed);
+        #[cfg(feature = "encode-trace")]
+        crate::trace::host(|| "sync".to_string());
         let deadline = Instant::now() + timeout;
         let not_done = || {
             DeviceError::backend(
@@ -585,6 +667,8 @@ impl Stream for MetalStream {
         let buffer = self.command_buffer()?;
         let mut committed = self.committed();
         let value = committed.next_value();
+        #[cfg(feature = "encode-trace")]
+        crate::trace::signal_event(&buffer, "timeline", value);
         buffer.encodeSignalEvent_value(ProtocolObject::from_ref(&*self.timeline), value);
         committed.commit(buffer);
         Ok(MetalEvent {
@@ -595,6 +679,8 @@ impl Stream for MetalStream {
 
     fn wait(&self, e: &Self::Event) -> Result<(), DeviceError> {
         let buffer = self.command_buffer()?;
+        #[cfg(feature = "encode-trace")]
+        crate::trace::wait_event(&buffer, "timeline", e.value);
         buffer.encodeWaitForEvent_value(ProtocolObject::from_ref(&*e.event), e.value);
         self.committed().commit(buffer);
         Ok(())

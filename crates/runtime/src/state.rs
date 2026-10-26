@@ -172,6 +172,8 @@ mod tests {
             top_k: 8,
             expert_ff: 512,
             latent: None,
+            pre_exp_norm: false,
+            post_exp_norm: None,
             act: Act::SwiGlu { limit: None },
             router: Router {
                 score: Score::Softmax,
@@ -315,6 +317,7 @@ mod tests {
                             64,
                         ),
                         qk_norm: true,
+                        o_norm: false,
                         out_gate: OutGate::Packed,
                         select: None,
                         window: None,

@@ -126,6 +126,7 @@ pub fn spec_of_device(d: &DeviceInfo) -> CardSpec {
         free_bytes: free,
         held_by,
         integrated: d.integrated,
+        margin_bytes: None,
     }
 }
 

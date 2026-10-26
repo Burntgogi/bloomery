@@ -1,0 +1,27 @@
+# speed039's A/B (2026-10-24): the M3.1 folder's residency lifted decode 16.52 -> 21.97 tok/s at D=512
+# (+33 %) and 16.24 -> 19.48 at D=4096, and dropped pp512 101.82 -> 88.38 (-13.2 %), pp4096 101.69 ->
+# 97.88 (-3.7 %), where the card predicted -0.5..-1 %. Beside the residency word the changed arm runs
+# xstream=admit (the base xstream=off): admit moves the residency's pool toward each ubatch's hottest host
+# experts during the prompt. Each move is a 31.85 MB expert over PCIe (~2.5 ms at ~13 GB/s) [derived];
+# a 512-id prompt is one pass of ~5.0 s, so ~0.67 s of moves (~260 flips, ~4.5 a layer) would reproduce
+# the drop, and a 4096-id prompt amortizes the same per-pass ramp over 8 passes (-3.7 %) [derived].
+# Same binary, xstream off against unset: if admit is the term, off brings pp back to the base's
+# (101.8 / 101.7) and keeps decode (admit acts on the prompt only) at 21.9 / 19.5.
+# Wall [derived]: 8 servers (2 arms x 2 depths x 2 rounds) x (load 182 s + 5 s) + requests: ~28 min.
+kind: profile
+question: is xstream=admit the term that took M3.1's folder pp512 from 101.8 to 88.4 tok/s once the residency
+  machine runs, and does xstream=off keep the decode gain?
+term: pp tok/s @ P=512 prose ids, MiniMax-M3.1-Flash NVFP4 folder, bloomery-serve serving defaults, --ctx-size 4300,
+  RTX A6000 + RTX 3090 (bp), speed039 tree, arm env=BLOOMERY_XSTREAM=off against the unset arm, (off - unset) / unset
+unit: %
+predict: +10..+17
+condition: one lease, BLOOMERY_MODEL=minimax-m3 BLOOMERY_AB_ROUNDS=2
+  BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/speed039-m31-xstream.card
+  BLOOMERY_TIMING_CARDS=a6000+3090 DEPTH_SERVE_CTX=4300' just depth-serve bloomery-speed039:512
+  env=BLOOMERY_XSTREAM=off:bloomery-speed039:512 bloomery-speed039:4096 env=BLOOMERY_XSTREAM=off:bloomery-speed039:4096;
+  each arm's server log names its xstream word, the off arm's residency word stays mid-p0-s1
+decide-in: off restores pp within 2 % of the base and keeps decode within 2 % of 21.97 / 19.48: the unset rule picks
+  off for a folder whose expert is that large (a bytes-a-flip term in the xstream rule, common owner), re-derived
+decide-below: under +10 %: admit is not the whole term; read the off arm's prompt records (flips, ring passes) and
+  the residency host record's pinned pool before any default change
+decide-above: above +17 %: off is faster than the base too; read both arms' plan and need lines

@@ -11,7 +11,9 @@
 //! gated-residual streams, a selecting attention, every routed expert on the
 //! host tier); [`Placed`], the placed side `Body` and `Body35` carry on a
 //! load whose plan puts part of each layer's routed experts on the host tier
-//! (`placed`, its launches around the host leg in `hostleg`); and the kernels
+//! and, when it hangs one expert tier, that tier's experts on the common
+//! card leg (`placed`, `tier_leg`, the launches around the host leg in
+//! `hostleg`); and the kernels
 //! whose constants are this family's and nothing else's — the attention
 //! projections, the routers, the experts' gate·up and combine, and the head's
 //! projection with its argmax. The shape kernels it runs over — the Q4_K embedding row, the
@@ -49,6 +51,7 @@ pub mod swap38;
 mod taps;
 mod taps35;
 mod tier38;
+mod tier_leg;
 pub mod ubatch;
 mod wide;
 mod wide38;
@@ -63,12 +66,12 @@ pub use body38::{
     checkpoint_bytes, checkpoint_price38, point_row_budget38, seq_positional_bytes, seq38_bytes,
 };
 pub use draft_taps::TapRowsSink;
-pub use mtp35::{Mtp35, addresses};
+pub use mtp35::{Mtp35, MtpArena, addresses, mtp_chain, mtp_walk, prompt_with35};
 pub use mtp38::{
     BorrowedPlanes, DraftRows38, MTP_GRAPH_ROWS, MTP_ROWS, MTP_STORE_ROWS, Mtp38, MtpDraft,
     MtpNode, MtpTaps, TargetRows, walk_launches,
 };
-pub use placed::Placed;
+pub use placed::{Placed, WideRoute, WideRouteLayer};
 pub use taps35::{Delta35Run, Ffn35Run, Gqa35Run, Layer35Run, Mixer35Run, StoreHost};
 pub use tier38::NODE_FAMILY;
 pub use wide38::{SPLIT_COSTS, SplitWalk};

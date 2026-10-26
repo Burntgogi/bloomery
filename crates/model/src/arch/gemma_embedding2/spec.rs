@@ -99,6 +99,7 @@ pub fn spec_of(hp: &Hparams, chat: ChatSpec) -> Result<ModelSpec, PlacementError
             post_norms: true,
             layer_scale: true,
         }),
+        logit_epilogue: None,
         chat,
     })
 }

@@ -1085,7 +1085,7 @@ fn hw_placement_unified_pool_lowers_the_card_budget() {
         V41Inputs::describe_in(&split, room).unwrap_or_else(|e| panic!("plan inputs: {e}"));
     let machine = workstation::plan_on(spec, inputs.model.layers);
     let whole = PlanLevers {
-        card_budget_bytes: Some(u64::MAX),
+        card_budget_bytes: Some(u64::MAX).into(),
     };
     let mut bad = Vec::new();
     for slots in [NonZeroUsize::MIN, NonZeroUsize::new(2).expect("two")] {
@@ -1239,9 +1239,12 @@ fn card_tensor_without_card_format_is_refused_by_name() {
 }
 
 /// Which routed stacks go on the card is the program's: under glm5next's
-/// card experts ([`routed_rule`]) a q5_K stack keeps experts on the card, in
-/// its file bytes, where V4.1's rule ([`placement::plan_with`]) keeps it on
-/// the host; a q6_K stack stays on the host under both.
+/// card experts ([`routed_rule`]) a q5_K or q6_K down stack keeps experts on
+/// the card, in its card bytes, where V4.1's rule ([`placement::plan_with`])
+/// keeps it on the host.
+// PIN(2026-10-23): q6_K moved to the card side: the common card leg's down
+// arm runs a Q6_K down (`kernels::card_down_runs`). Mutant: that arm back
+// without Q6_K — the q6_K row plans 0 on the card.
 #[test]
 fn routed_card_format_is_the_programs() {
     let machine = workstation::plan_a(1);
@@ -1249,7 +1252,7 @@ fn routed_card_format_is_the_programs() {
     for (ty, on_card) in [
         (GgmlType::Q4_K, true),
         (GgmlType::Q5_K, true),
-        (GgmlType::Q6_K, false),
+        (GgmlType::Q6_K, true),
     ] {
         let stack = synthetic_model(vec![synthetic(
             "blk.0.ffn_down_exps.weight",
@@ -1380,6 +1383,7 @@ fn byte_card(name: &str, usable: u64, layers: Range<usize>) -> Card {
         head: !layers.is_empty(),
         layers,
         token_embedding: false,
+        reserve_only: false,
         reserves: Vec::new(),
     }
 }

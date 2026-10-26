@@ -18,8 +18,9 @@
 //! one launch ([`HandoffKernels::enqueue_handoff_cols`]);
 //! [`HandoffKernels::enqueue_places_cols`] writes the places alone of such a
 //! row, for a walk whose routing reaches the host by a download, through
-//! `crate::card_slots`' `ds41_ffn_places`. `ds41_ffn_handoff_8_tier` is
-//! the eight-slot handoff of a layer an expert tier holds experts of: the
+//! `crate::card_slots`' `ds41_ffn_places`. `ds41_ffn_handoff_8_tier` and
+//! `ds41_ffn_handoff_4_tier` are the eight- and four-slot handoffs of a layer
+//! an expert tier holds experts of: the
 //! same writes, and the slots' tier places and the activation in f32 into
 //! the row's tier image ([`HandoffKernels::enqueue_handoff_tier`]);
 //! `ds41_ffn_handoff_10_cols_tier` is `_10_cols`'s of such a layer, every
@@ -367,6 +368,89 @@ mod handoff_kernels {
         // SAFETY: d < n, and the launch contract is `handoff_tier_at`'s at
         // SLOTS_8 slots; thread d is the launch's only thread at d.
         unsafe { handoff_tier_at::<SLOTS_8>(&a, &t, d, &mut timage, &mut tsel) };
+    }
+
+    /// [`ds41_ffn_handoff_8_tier`] at four slots a token: [`ds41_ffn_handoff_4`]
+    /// and the row's f32 tier image ([`handoff_tier_at`]), threads `s < 4`
+    /// writing the slots' tier places.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            ids_in.len() >= 4,
+            w_in.len() >= 4,
+            map.len() >= row_off + n_expert,
+            tmap.len() >= row_off + n_expert,
+            x.len() >= n,
+            seq.len() >= 1,
+            n >= 4,
+            ids_at >= seq_at + 1,
+            wts_at >= ids_at + 4,
+            x_at >= wts_at + 4,
+            image.len() >= x_at + n,
+            tx_at >= tsel_at + 4,
+            timage.len() >= tx_at + n,
+            sel.len() >= 4,
+            tsel.len() >= 4
+        )
+    )]
+    pub fn ds41_ffn_handoff_4_tier(
+        ids_in: &[u32],
+        w_in: &[f32],
+        map: &[u32],
+        tmap: &[u32],
+        row_off: u32,
+        n_expert: u32,
+        x: &[f32],
+        seq: &[u32],
+        n: u32,
+        seq_at: u32,
+        ids_at: u32,
+        wts_at: u32,
+        x_at: u32,
+        tsel_at: u32,
+        tx_at: u32,
+        fault: FaultSink,
+        mut image: DisjointSlice<u32>,
+        mut timage: DisjointSlice<u32>,
+        mut sel: DisjointSlice<u32>,
+        mut tsel: DisjointSlice<u32>,
+    ) {
+        let d = thread::index_1d().get();
+        if d >= n as usize {
+            return;
+        }
+        let a = HandoffIn {
+            ids_in,
+            w_in,
+            map,
+            row_off,
+            n_expert,
+            x,
+            seq,
+            seq_at,
+            ids_at,
+            wts_at,
+            x_at,
+            fault,
+        };
+        // SAFETY: d < n, and the launch contract is `handoff_at`'s at
+        // SLOTS_4 slots; thread d is the launch's only thread at d.
+        unsafe { handoff_at::<SLOTS_4>(&a, d, &mut image, &mut sel) };
+        let t = TierIn {
+            tmap,
+            tsel_at,
+            tx_at,
+        };
+        // SAFETY: d < n, and the launch contract is `handoff_tier_at`'s at
+        // SLOTS_4 slots; thread d is the launch's only thread at d.
+        unsafe { handoff_tier_at::<SLOTS_4>(&a, &t, d, &mut timage, &mut tsel) };
     }
 
     /// [`ds41_ffn_handoff`] of four slots a token ([`handoff_at`]): threads
@@ -1181,8 +1265,8 @@ impl HandoffKernels {
 }
 
 impl HandoffKernels {
-    /// Enqueue the handoff of a tier layer of eight slots a token
-    /// (`ds41_ffn_handoff_8_tier`): [`HandoffKernels::enqueue_handoff`]'s
+    /// Enqueue the handoff of a tier layer of four or eight slots a token
+    /// (`ds41_ffn_handoff_4_tier`, `ds41_ffn_handoff_8_tier`): [`HandoffKernels::enqueue_handoff`]'s
     /// writes into `target`, and each slot's tier place (from `tmap`, the
     /// slot map's tier copy at the card copy's row offsets) into `tsel` and
     /// with the activation into the f32 tier image `ttarget`. A layout of
@@ -1202,10 +1286,10 @@ impl HandoffKernels {
         fault: FaultSink,
         (sel, tsel): (&mut DeviceBuffer<u32>, &mut DeviceBuffer<u32>),
     ) -> Result<(), GpuError> {
-        const WHAT: &str = "ds41_ffn_handoff_8_tier";
+        const WHAT: &str = "ds41_ffn_handoff_tier";
         let (lay, tl) = (target.layout, ttarget.layout);
-        if lay.n_used != SLOTS_8
-            || tl.n_used != SLOTS_8
+        if !matches!(lay.n_used, SLOTS_4 | SLOTS_8)
+            || tl.n_used != lay.n_used
             || tl.x_len != lay.hidden
             || tl.q3_words != 0
             || tl.d8_len != 0
@@ -1214,8 +1298,8 @@ impl HandoffKernels {
                 what: WHAT,
                 detail: format!(
                     "the boundary carries {} slots of {} values and the tier image {} slots, {} \
-                     f32, {} code words, {} scales; the entry hands over {SLOTS_8} slots and the \
-                     activation in f32",
+                     f32, {} code words, {} scales; the entries hand over {SLOTS_4} or {SLOTS_8} \
+                     slots, the tier image the boundary's, and the activation in f32",
                     lay.n_used, lay.hidden, tl.n_used, tl.x_len, tl.q3_words, tl.d8_len
                 ),
             });
@@ -1223,31 +1307,59 @@ impl HandoffKernels {
         let n = lay.hidden;
         let grid = launch_u32(WHAT, "grid", n.div_ceil(HANDOFF_THREADS as usize))?;
         let cfg = LaunchConfig1D::new(grid, HANDOFF_THREADS, 0);
-        let prep = self.module.prepare_ds41_ffn_handoff_8_tier(cfg)?;
-        self.module.ds41_ffn_handoff_8_tier(
-            stream,
-            &prep,
-            h.ids,
-            h.weights,
-            h.map,
-            tmap,
-            launch_u32(WHAT, "row_off", h.row_off)?,
-            launch_u32(WHAT, "n_expert", h.n_expert)?,
-            target.x,
-            target.seq,
-            launch_u32(WHAT, "n", n)?,
-            launch_u32(WHAT, "seq_at", lay.seq)?,
-            launch_u32(WHAT, "ids_at", lay.ids)?,
-            launch_u32(WHAT, "wts_at", lay.weights)?,
-            launch_u32(WHAT, "x_at", lay.x)?,
-            launch_u32(WHAT, "tsel_at", tl.sel)?,
-            launch_u32(WHAT, "tx_at", tl.x)?,
-            fault,
-            target.image,
-            ttarget.image,
-            sel,
-            tsel,
-        )?;
+        if lay.n_used == SLOTS_4 {
+            let prep = self.module.prepare_ds41_ffn_handoff_4_tier(cfg)?;
+            self.module.ds41_ffn_handoff_4_tier(
+                stream,
+                &prep,
+                h.ids,
+                h.weights,
+                h.map,
+                tmap,
+                launch_u32(WHAT, "row_off", h.row_off)?,
+                launch_u32(WHAT, "n_expert", h.n_expert)?,
+                target.x,
+                target.seq,
+                launch_u32(WHAT, "n", n)?,
+                launch_u32(WHAT, "seq_at", lay.seq)?,
+                launch_u32(WHAT, "ids_at", lay.ids)?,
+                launch_u32(WHAT, "wts_at", lay.weights)?,
+                launch_u32(WHAT, "x_at", lay.x)?,
+                launch_u32(WHAT, "tsel_at", tl.sel)?,
+                launch_u32(WHAT, "tx_at", tl.x)?,
+                fault,
+                target.image,
+                ttarget.image,
+                sel,
+                tsel,
+            )?;
+        } else {
+            let prep = self.module.prepare_ds41_ffn_handoff_8_tier(cfg)?;
+            self.module.ds41_ffn_handoff_8_tier(
+                stream,
+                &prep,
+                h.ids,
+                h.weights,
+                h.map,
+                tmap,
+                launch_u32(WHAT, "row_off", h.row_off)?,
+                launch_u32(WHAT, "n_expert", h.n_expert)?,
+                target.x,
+                target.seq,
+                launch_u32(WHAT, "n", n)?,
+                launch_u32(WHAT, "seq_at", lay.seq)?,
+                launch_u32(WHAT, "ids_at", lay.ids)?,
+                launch_u32(WHAT, "wts_at", lay.weights)?,
+                launch_u32(WHAT, "x_at", lay.x)?,
+                launch_u32(WHAT, "tsel_at", tl.sel)?,
+                launch_u32(WHAT, "tx_at", tl.x)?,
+                fault,
+                target.image,
+                ttarget.image,
+                sel,
+                tsel,
+            )?;
+        }
         Ok(())
     }
 

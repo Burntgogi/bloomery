@@ -1,7 +1,6 @@
 //! The seat of a body that runs one chain on one card, fed in prompt batches:
 //! the one owner of the open, the load record, the seat's calls and the think
-//! tags, for the families whose body holds one sequence ([`solar2`](super::solar2),
-//! [`minimaxm3`](super::minimaxm3)).
+//! tags, for the family whose body holds one sequence ([`solar2`](super::solar2)).
 //!
 //! A seat gives its family the facts the run needs — the architectures it
 //! accepts, its plan inputs, the words its refusals name and the records it

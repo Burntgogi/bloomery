@@ -28,3 +28,6 @@ unicode-normalization-alignments = "=0.1.12"
 [dev-dependencies]
 # The oracle sets the tests compare with open through their refset family.
 bloomery-refset = { path = "../refset" }
+# Hugging Face's pre-tokenizer pieces, pinned in crates/hf/tests/fixtures, are kept gzipped.
+flate2 = "1.1.10"
+serde_json = "=1.0.151"

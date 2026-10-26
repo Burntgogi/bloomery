@@ -131,9 +131,18 @@ fn carded_layers(model: &ModelTensors) -> impl Iterator<Item = (usize, [GgmlType
 /// layer is a tile layer, and the plan then reserves no leg buffers beside the
 /// tiles' scratch ([`card_leg_bytes`]).
 fn card_leg_forms(model: &ModelTensors) -> DownForms {
-    carded_layers(model)
-        .filter(|&(_, [g, _, d])| !card_tiles_run(g, d))
-        .filter_map(|(_, [_, _, d])| kernels::down(d))
+    down_forms(
+        carded_layers(model)
+            .filter(|&(_, [g, _, d])| !card_tiles_run(g, d))
+            .map(|(_, [_, _, d])| d),
+    )
+}
+
+/// The activation forms the down stacks of types `downs` read ([`kernels::down`]); a type with no
+/// down entry adds none.
+fn down_forms(downs: impl Iterator<Item = GgmlType>) -> DownForms {
+    downs
+        .filter_map(kernels::down)
         .fold(DownForms::NONE, |forms, (_, act)| forms.with(act))
 }
 
@@ -142,19 +151,16 @@ fn card_leg_forms(model: &ModelTensors) -> DownForms {
 /// to its own constant.
 pub const TIER_CHUNK: u64 = 8;
 
-/// The expert tier's prompt-batch bytes ([`TierBatchBytes`]) for blocks of
-/// the host union's columns: the tier card's staging, the chunked card
-/// path's scratch ([`workstation::tier_chunk_scratch_bytes`]) and the host's
-/// rows and places, which the plan reserves on the tier card and the host
-/// and the load checks its allocations against.
+/// The expert tier's prompt-batch bytes for the selected program's routed
+/// layers: staging, the common leg's candidate-dependent scratch and the
+/// host rows and places. The load checks its allocations against the plan.
 pub fn tier_batch(inputs: &PlanInputs) -> Result<TierBatchBytes, PlacementError> {
     let hp = &inputs.hp;
-    workstation::tier_leg_batch_bytes(
+    workstation::try_tier_leg_batch_bytes_of(
         hp.n_embd as u64,
         hp.expert_ff as u64,
         hp.n_used as u64,
-        TIER_CHUNK,
-        crate::moe::UNION_MAX_COLS as u64,
+        (TIER_CHUNK, crate::moe::UNION_MAX_COLS as u64),
         crate::placement::accepts::leg_down_forms(Program::Glm5nextBody, &inputs.model),
     )
 }
@@ -640,7 +646,7 @@ impl PlanInputs {
         let terms = self.seq_terms(&kv, None);
         let n = slots as u64;
         let beside = terms.plan_beside(n);
-        let front = prompt_reserve_bytes(self, ctx_max, !machine.tiers.is_empty());
+        let front = prompt_reserve_bytes(self, ctx_max, machine.expert_tiers().next().is_some());
         let plan = placement::plan_in_pool(machine, levers, |levers| {
             let mut plan = placement::nodes::loaded_routed(
                 &self.model,
@@ -813,6 +819,7 @@ fn nextn_machine() -> Machine {
             layers: 0..1,
             head: true,
             token_embedding: false,
+            reserve_only: false,
             reserves: Vec::new(),
         }],
         tiers: Vec::new(),
@@ -997,7 +1004,7 @@ impl PlanInputs {
             &PlanLevers::default(),
         )?;
         let arena = NEXTN_ARENA_BYTES;
-        let front = prompt_reserve_bytes(self, ctx_max, !machine.tiers.is_empty());
+        let front = prompt_reserve_bytes(self, ctx_max, machine.expert_tiers().next().is_some());
         let nextn_card = nextn_card_bytes(&draft.cards[0]);
         let reserve = (nextn_card + arena + front).saturating_add(beside);
         // The draft layer's routed experts are the host's beside the trunk's,
@@ -1473,7 +1480,8 @@ mod tests {
         use super::super::super::hparams::{Hc, Hparams, Indexer};
         use super::super::{
             DenseForms, KdaLanes, Kind, KvLayout, NextnInputs, NextnKv, PlaceError, PlanInputs,
-            card_leg_bytes, card_leg_forms, prompt_reserve_bytes, row_bytes,
+            TIER_CHUNK, card_leg_bytes, card_leg_forms, prompt_reserve_bytes, row_bytes,
+            tier_batch,
         };
         use crate::placement::churn::ChurnPool;
         use crate::placement::workstation::{HostNeed, HostRead};
@@ -1572,6 +1580,7 @@ mod tests {
                     layers: 0..layers,
                     head: true,
                     token_embedding: false,
+                    reserve_only: false,
                     reserves: vec![("draft".to_string(), 3 << 20)],
                 }],
                 tiers: Vec::new(),
@@ -1644,6 +1653,7 @@ mod tests {
                     hc: None,
                     engram: None,
                     encoder: None,
+                    logit_epilogue: None,
                     chat: ChatSpec {
                         pre: String::new(),
                         template: None,
@@ -1673,6 +1683,29 @@ mod tests {
                     gathered_rows: None,
                 })
                 .collect()
+        }
+
+        /// [`inputs`] with a routed layer of three stacks of types `layers[l]` (gate, up, down) at each layer `l`.
+        fn routed_types(layers: &[[GgmlType; 3]]) -> PlanInputs {
+            let mut i = inputs();
+            for (l, tys) in layers.iter().enumerate() {
+                for (stem, &ty) in ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"]
+                    .into_iter()
+                    .zip(tys)
+                {
+                    i.model.tensors.push(ModelTensor {
+                        name: format!("blk.{l}.{stem}.weight"),
+                        shard: 0,
+                        layer: Some(l),
+                        role: Role::RoutedExperts,
+                        ty,
+                        dims: vec![4096, 2048, 64],
+                        file_bytes: 0,
+                        gathered_rows: None,
+                    });
+                }
+            }
+            i
         }
 
         /// The forms the front holds follow the dense tensors' types in the header, over every dense layer: Q8_0
@@ -1781,49 +1814,26 @@ mod tests {
         }
 
         /// The card leg's reserve follows the card layers' types: a file whose
-        /// card layers are all tile layers (a Q4_K or Q5_K gate·up and down),
-        /// or whose leg-typed layer keeps its experts on the host (a Q6_K
-        /// down), reserves the prompt batch's bytes it reserved before; one
-        /// with a card layer the tiles do not run reserves the card leg's
-        /// buffers in its down's form beside them: an IQ3_S gate·up or an
-        /// IQ4_XS down the 128-value form, an NVFP4 layer or a Q8_0 down the
+        /// card layers are all tile layers (a Q4_K or Q5_K gate·up and down)
+        /// reserves the prompt batch's bytes it reserved before; one with a
+        /// card layer the tiles do not run reserves the card leg's buffers in
+        /// its down's form beside them: an IQ3_S gate·up, an IQ4_XS down or a
+        /// Q6_K down the 128-value form, an NVFP4 layer or a Q8_0 down the
         /// 32-value form, an IQ3_S layer and an NVFP4 layer together both.
-        /// Mutants: the reserve without the leg term; the forms read per
-        /// stack, not per card layer (the IQ3_S layer beside a Q6_K down
-        /// reserves the leg); the NVFP4 layer's form left out.
+        /// Mutants: the reserve without the leg term; the down arm without
+        /// Q6_K (the Q6_K-down layers reserve nothing); the NVFP4 layer's form
+        /// left out.
+        // PIN(2026-10-22): a Q6_K down is a card layer the tiles do not run
+        // (`card_down_runs` admits it over the 128-value form), so the Q5_K
+        // and IQ3_S layers beside one reserve the leg's 128-value buffers. The
+        // old pin kept both on the plain reserve while a Q6_K down was host-only.
         #[test]
         fn the_card_leg_reserve_follows_the_routed_types() {
             use crate::placement::kernels::{DownAct, DownForms};
             use GgmlType::{IQ3_S, IQ4_XS, NVFP4, Q4_K, Q5_K, Q6_K, Q8_0};
-            let routed = |layers: &[[GgmlType; 3]]| {
-                let mut i = inputs();
-                for (l, tys) in layers.iter().enumerate() {
-                    for (stem, &ty) in ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"]
-                        .into_iter()
-                        .zip(tys)
-                    {
-                        i.model.tensors.push(ModelTensor {
-                            name: format!("blk.{l}.{stem}.weight"),
-                            shard: 0,
-                            layer: Some(l),
-                            role: Role::RoutedExperts,
-                            ty,
-                            dims: vec![4096, 2048, 64],
-                            file_bytes: 0,
-                            gathered_rows: None,
-                        });
-                    }
-                }
-                i
-            };
             let plain = prompt_reserve_bytes(&inputs(), CTX, false);
-            for tys in [
-                [Q4_K, Q4_K, Q5_K],
-                [Q5_K, Q5_K, Q6_K],
-                [Q4_K, Q4_K, Q4_K],
-                [IQ3_S, IQ3_S, Q6_K],
-            ] {
-                let i = routed(&[tys]);
+            for tys in [[Q4_K, Q4_K, Q5_K], [Q4_K, Q4_K, Q4_K]] {
+                let i = routed_types(&[tys]);
                 assert_eq!(card_leg_forms(&i.model), DownForms::NONE, "{tys:?}");
                 assert_eq!(prompt_reserve_bytes(&i, CTX, false), plain, "{tys:?}");
             }
@@ -1838,6 +1848,8 @@ mod tests {
             for (layers, forms) in [
                 (vec![[IQ3_S, IQ3_S, IQ4_XS]], q8),
                 (vec![[Q4_K, Q4_K, IQ4_XS]], q8),
+                (vec![[Q5_K, Q5_K, Q6_K]], q8),
+                (vec![[IQ3_S, IQ3_S, Q6_K]], q8),
                 (vec![[NVFP4; 3]], b32),
                 (vec![[Q4_K, Q4_K, Q8_0]], b32),
                 (
@@ -1845,7 +1857,7 @@ mod tests {
                     q8.with(DownAct::Q8Blocks32),
                 ),
             ] {
-                let i = routed(&layers);
+                let i = routed_types(&layers);
                 assert_eq!(card_leg_forms(&i.model), forms, "{layers:?}");
                 assert_eq!(
                     prompt_reserve_bytes(&i, CTX, false),
@@ -1853,6 +1865,91 @@ mod tests {
                     "{layers:?}"
                 );
             }
+        }
+
+        /// The expert tier's prompt-batch reserve follows the down forms of the file's card layers:
+        /// its scratch is the card leg's one formula (`kernels::leg_bytes`, which `LegBufs::for_downs`
+        /// allocates by) over `TIER_CHUNK` tokens in each form a layer's down reads, the staging and
+        /// host terms beside it moved by no form. A K-quant file, a Q6_K down and a file with no card
+        /// layer reserve the 128-value form alone; an NVFP4 layer or a Q8_0 down the 32-value form; layers
+        /// of both, both, the tiles' layers (Q4_K gate and up over a Q5_K down) counted with the rest.
+        /// Mutants: the reserve of the 128-value form alone; the tiles' layers left out of the forms.
+        #[test]
+        fn the_tier_reserve_follows_the_routed_downs() {
+            use crate::placement::kernels::{DownAct, DownForms, leg_bytes};
+            use GgmlType::{IQ3_S, IQ4_XS, NVFP4, Q4_K, Q5_K, Q6_K, Q8_0};
+            let q8 = DownForms::of(DownAct::Q8Act);
+            let b32 = DownForms::of(DownAct::Q8Blocks32);
+            let base = tier_batch(&inputs());
+            let hp = inputs().hp;
+            let leg = |forms| {
+                leg_bytes(
+                    TIER_CHUNK,
+                    hp.n_used as u64,
+                    hp.n_embd as u64,
+                    hp.expert_ff as u64,
+                    forms,
+                )
+            };
+            assert_ne!(leg(q8), leg(b32));
+            for (layers, forms) in [
+                (vec![], q8),
+                (vec![[Q4_K, Q4_K, Q5_K]], q8),
+                (vec![[Q5_K, Q5_K, Q6_K]], q8),
+                (vec![[IQ3_S, IQ3_S, IQ4_XS]], q8),
+                (vec![[NVFP4; 3]], b32),
+                (vec![[Q4_K, Q4_K, Q8_0]], b32),
+                (
+                    vec![[IQ3_S, IQ3_S, IQ4_XS], [NVFP4; 3]],
+                    q8.with(DownAct::Q8Blocks32),
+                ),
+                (
+                    vec![[Q4_K, Q4_K, Q5_K], [NVFP4; 3]],
+                    q8.with(DownAct::Q8Blocks32),
+                ),
+            ] {
+                let batch = tier_batch(&routed_types(&layers));
+                assert_eq!(batch.scratch, leg(forms), "{layers:?}");
+                assert_eq!(batch.staging, base.staging, "{layers:?}");
+                assert_eq!(batch.host, base.host, "{layers:?}");
+            }
+        }
+
+        /// A Q5_K gate and up with a Q6_K down takes every expert on a card
+        /// with room for the stack; a Q6_K gate and up takes none.
+        /// PIN(2026-10-22): the down arm admits Q6_K, so the layer is
+        /// card-eligible. It was host-only while both arms read `card_runs`
+        /// (those 288 experts stayed on the host). This card holds the whole
+        /// stack; the A6000 serving count is the file's plan, not 288.
+        #[test]
+        fn a_q6k_down_layer_takes_the_cards_experts() {
+            use GgmlType::{Q5_K, Q6_K};
+            let mut i = inputs();
+            let push = |model: &mut ModelTensors, l: usize, tys: [GgmlType; 3]| {
+                for (stem, ty) in ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"]
+                    .into_iter()
+                    .zip(tys)
+                {
+                    model.tensors.push(ModelTensor {
+                        name: format!("blk.{l}.{stem}.weight"),
+                        shard: 0,
+                        layer: Some(l),
+                        role: Role::RoutedExperts,
+                        ty,
+                        dims: vec![4096, 2048, 288],
+                        file_bytes: 0,
+                        gathered_rows: None,
+                    });
+                }
+            };
+            push(&mut i.model, 1, [Q5_K, Q5_K, Q6_K]);
+            push(&mut i.model, 2, [Q6_K, Q6_K, Q6_K]);
+            let machine = machine(LAYERS);
+            let plan = i
+                .plan(&machine, CTX, &PlanLevers::default())
+                .expect("the plan");
+            assert_eq!(plan.n_l[1], 288, "the Q6_K down");
+            assert_eq!(plan.n_l[2], 0, "the Q6_K gate");
         }
 
         /// A card's headroom and its terms: the plan's `headroom_bytes`, and
@@ -2012,7 +2109,7 @@ mod tests {
         #[test]
         fn nvme_room_is_capped_by_the_unified_pool() {
             let levers = PlanLevers {
-                card_budget_bytes: Some(1 << 30),
+                card_budget_bytes: bloomery_levers::CardBudget::Every(1 << 30),
             };
             for slots in [1, 2, 4] {
                 let ample = unified(1 << 40);
@@ -2048,7 +2145,7 @@ mod tests {
         #[test]
         fn nextn_nvme_room_is_capped_by_the_unified_pool() {
             let levers = PlanLevers {
-                card_budget_bytes: Some(1 << 30),
+                card_budget_bytes: bloomery_levers::CardBudget::Every(1 << 30),
             };
             let nextn = nextn();
             for slots in [1, 2, 4] {
@@ -2089,7 +2186,7 @@ mod tests {
         #[test]
         fn node_nvme_room_is_capped_by_the_unified_pool() {
             let levers = PlanLevers {
-                card_budget_bytes: Some(1 << 30),
+                card_budget_bytes: bloomery_levers::CardBudget::Every(1 << 30),
             };
             for ranks in [1, 2, 4] {
                 let wide = routed(1 << 40);
@@ -2238,7 +2335,7 @@ mod tests {
         fn a_nextn_plan_leaves_the_draft_experts_in_its_host_headroom() {
             let (m, nextn) = (machine(LAYERS), nextn());
             let levers = PlanLevers {
-                card_budget_bytes: Some(1 << 30),
+                card_budget_bytes: Some(1 << 30).into(),
             };
             let ample = routed(u64::MAX);
             let whole = ample
@@ -2273,7 +2370,7 @@ mod tests {
         fn slot_plans_on_one_pool_lower_the_card_budget_to_the_tiers_floor() {
             let unset = PlanLevers::default();
             let whole = PlanLevers {
-                card_budget_bytes: Some(u64::MAX),
+                card_budget_bytes: Some(u64::MAX).into(),
             };
             let nextn = nextn();
             let draft = nextn.model.tensors[1].file_bytes;
@@ -2284,7 +2381,7 @@ mod tests {
                     assert!(plan.budget_from_pool, "{at}: the pool's budget");
                     assert!(plan.host.nvme_expert_bytes > 0, "{at}: paged experts");
                     assert!(plan.n_l.iter().any(|&n| n > 0), "{at}: card experts");
-                    let budget = plan.card_budget.expect("a card budget");
+                    let budget = plan.card_budget.every().expect("a card budget");
                     assert!(budget < pool, "{at}: {budget} B, not under the pool");
                     assert!(
                         floor().is_some(),

@@ -3,7 +3,8 @@
 //!
 //! The server reads a request as llama-server's embeddings handler does and tokenizes its text
 //! with the model's own vocabulary ([`Embed::tokenizer`]); the model runs one pass over one input's
-//! ids, including its pooling and learned projections ([`Embed::embed`]). The cut to a
+//! ids, including its pooling and learned projections ([`Embed::embed`]), or one call over several
+//! ([`Embed::embed_batch`]). The cut to a
 //! `dimensions` width, the normalization
 //! ([`normalize`], llama.cpp's `common_embd_normalize`) and the answer's shape belong to `bloomery-embed`.
 
@@ -56,6 +57,15 @@ pub trait Embed: Send {
     /// One pass over one input: at least one id and at most [`Embed::ctx`], each below the
     /// vocabulary's size. The pooled vector, the full width (the last of [`Embed::dims`]).
     fn embed(&mut self, ids: &[u32]) -> Result<Vec<f32>, EmbedError>;
+    /// Several inputs, one pooled vector each, in the inputs' order. The default is one
+    /// [`Embed::embed`] per input. A model may pack them into fewer passes.
+    fn embed_batch(&mut self, inputs: &[&[u32]]) -> Result<Vec<Vec<f32>>, EmbedError> {
+        let mut out = Vec::with_capacity(inputs.len());
+        for ids in inputs {
+            out.push(self.embed(ids)?);
+        }
+        Ok(out)
+    }
     /// One pass with prepared images and audio chunks replacing the positions they occupy.
     fn embed_media(
         &mut self,

@@ -391,10 +391,12 @@ pub trait Family {
         Vec::new()
     }
 
-    /// Whether the file keeps routed layers on the host in a number the tier can page (the family's
-    /// count over the file's types, never the plan's placement): the clauses that read the paged
-    /// experts are left by name ([`tier::host_clause`]) on a fixture where it is false. An
-    /// approximation of the plan's own condition; a miss is a red clause, never a deferral.
+    /// Whether the file keeps routed layers on the host in a number the tier can page: the clauses that
+    /// read the paged experts are left by name ([`tier::host_clause`]) on a fixture where it is false.
+    /// The count is over the placement the gate's own arms run — its card budget included — never the
+    /// file's types alone: a layer the card leg runs is a layer the plan may card, so the types no
+    /// longer decide which experts are the host's. An approximation of the plan's own condition; a
+    /// miss is a red clause, never a deferral.
     ///
     /// # Errors
     /// A file the count cannot be read from.

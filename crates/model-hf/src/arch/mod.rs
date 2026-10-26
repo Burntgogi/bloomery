@@ -1,7 +1,33 @@
 //! One module per model architecture whose checkpoint the hub holds.
 
+use std::path::Path;
+
+use serde_json::Value as Json;
+
+use crate::folder::{self, FolderMap};
+
 pub mod glm5next;
+pub mod minimaxm3;
 pub mod qwen35moe;
+
+/// A folder map's row in [`MAPS`]: the `model_type`s it reads and the open of a folder it reads.
+pub struct MapRow {
+    pub model_types: &'static [&'static str],
+    pub open: fn(&Path, &Json) -> Result<folder::Opened, folder::Error>,
+}
+
+/// Every checkpoint folder map ([`FolderMap`]): [`folder::open`] picks the row whose `model_type`
+/// is the folder's config's.
+pub const MAPS: &[MapRow] = &[
+    MapRow {
+        model_types: <qwen35moe::Checkpoint as FolderMap>::MODEL_TYPES,
+        open: folder::open_as::<qwen35moe::Checkpoint>,
+    },
+    MapRow {
+        model_types: <minimaxm3::Checkpoint as FolderMap>::MODEL_TYPES,
+        open: folder::open_as::<minimaxm3::Checkpoint>,
+    },
+];
 
 /// A checkpoint's `-exp(x)`, computed in f64 and rounded once to finite nonzero F32.
 fn neg_exp(x: f32) -> Result<f32, String> {

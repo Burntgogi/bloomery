@@ -86,6 +86,7 @@ fn family_of(arch: Arch) -> Option<&'static dyn Adapter> {
         Arch::MiMo2 => Some(&mimo2::Row),
         Arch::Deepseek41 | Arch::Deepseek4 => Some(&deepseek41::Row),
         Arch::Qwen35
+        | Arch::Llama
         | Arch::MiniMaxM3
         | Arch::Raon1
         | Arch::SolarOpen2
@@ -93,16 +94,17 @@ fn family_of(arch: Arch) -> Option<&'static dyn Adapter> {
         | Arch::NemotronHMoe
         | Arch::GemmaEmbedding
         | Arch::GemmaEmbedding2
-        | Arch::Flint => None,
+        | Arch::Flint
+        | Arch::MuseSpark => None,
     }
 }
 
-/// Why a set the gate does not plan is skipped: the Qwen3.5 dense trunk
-/// and the EmbeddingGemma 2 encoder route nothing, and an architecture no
-/// adapter plans is never planned as a model.
+/// Why a set the gate does not plan is skipped: the Qwen3.5 and Llama dense
+/// trunks and the EmbeddingGemma 2 encoder route nothing, and an architecture
+/// no adapter plans is never planned as a model.
 fn skip_of(arch: Arch) -> &'static str {
     match arch {
-        Arch::Qwen35 => "dense trunk",
+        Arch::Qwen35 | Arch::Llama => "dense trunk",
         Arch::GemmaEmbedding2 => "no routed expert",
         Arch::Qwen3Moe
         | Arch::Qwen35Moe
@@ -117,7 +119,8 @@ fn skip_of(arch: Arch) -> &'static str {
         | Arch::NemotronH
         | Arch::NemotronHMoe
         | Arch::GemmaEmbedding
-        | Arch::Flint => "no program",
+        | Arch::Flint
+        | Arch::MuseSpark => "no program",
     }
 }
 
@@ -1041,7 +1044,7 @@ fn rooms_of(
 /// The levers of a forced room: one card budget, everything else default.
 fn budget(bytes: u64) -> PlanLevers {
     PlanLevers {
-        card_budget_bytes: Some(bytes),
+        card_budget_bytes: Some(bytes).into(),
     }
 }
 
@@ -1534,7 +1537,6 @@ fn place35_of(p: &Place35Error) -> Outcome {
 fn place3_of(p: &Place3Error) -> Outcome {
     let kind = match p {
         Place3Error::Positions => "positions",
-        Place3Error::Tier { .. } => "tier",
         Place3Error::Placement(e) => return refused_of(e),
         _ => return Outcome::Red(p.to_string()),
     };

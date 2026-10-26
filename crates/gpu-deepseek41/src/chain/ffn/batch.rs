@@ -51,6 +51,7 @@
 
 use std::mem::size_of;
 
+use bloomery_gpu::card_leg::LegRun;
 use bloomery_gpu::card_slots::CardSlotKernels;
 use bloomery_gpu::cores::q3k_row_dot;
 use bloomery_gpu::hybrid::{BatchKey, ServeTimes};
@@ -652,6 +653,60 @@ mod ffn_batch_kernels {
         // SAFETY: i < n·m <= acc.len(); thread i is acc[i]'s only writer.
         unsafe { *acc.get_unchecked_mut(i) = v };
     }
+
+    /// [`ds41_ffn_card_acc_8_tier`] at four slots a token
+    /// ([`card_acc_tier_at`]): the one-card sum of four slots over the
+    /// union of the stage card's and the expert tier's.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            down.len() >= 4 * n * m,
+            trows.len() >= 4 * n * m,
+            w.len() >= 4 * m,
+            sel.len() >= 4 * m,
+            tsel.len() >= 4 * m,
+            acc.len() >= n * m
+        )
+    )]
+    pub fn ds41_ffn_card_acc_4_tier(
+        down: &[f32],
+        trows: &[f32],
+        w: &[f32],
+        sel: &[u32],
+        tsel: &[u32],
+        n: u32,
+        m: u32,
+        n_card: u32,
+        n_tier: u32,
+        mut acc: DisjointSlice<f32>,
+    ) {
+        let (n, m) = (n as usize, m as usize);
+        let i = thread::index_1d().get();
+        if i >= n * m {
+            return;
+        }
+        let a = AccTierIn {
+            down,
+            trows,
+            w,
+            sel,
+            tsel,
+            n_card,
+            n_tier,
+        };
+        // SAFETY: i < n·m, and the launch contract gives every length the
+        // helper's contract asks for at SLOTS_4 slots.
+        let v = unsafe { card_acc_tier_at::<SLOTS_4>(&a, n, i) };
+        // SAFETY: i < n·m <= acc.len(); thread i is acc[i]'s only writer.
+        unsafe { *acc.get_unchecked_mut(i) = v };
+    }
 }
 
 /// The step's Q3_K gate·up·SwiGLU as a tile entry's work
@@ -894,6 +949,63 @@ pub fn enqueue_tiled_experts(
     )
 }
 
+/// Tokens one run of the common card leg covers in a block of a layer on it
+/// ([`enqueue_leg_block`]): the leg's buffers are sized for this many.
+pub const LEG_PIECE: usize = 64;
+
+/// What the leg path reads for one block ([`enqueue_leg_block`]): the layer's
+/// stacks as the common card leg reads them, the f32 normed rows of the
+/// block's `cols` tokens (`n_embd` values a token), each of its `N_USED ·
+/// cols` slots' place in the stacks (`sel`: a stack slot, or [`HOST`] for a
+/// slot another device computes), the layer, its SwiGLU clamp and the experts
+/// the stacks hold.
+pub struct LegBlock<'a> {
+    pub stacks: &'a LegStacks<'a>,
+    pub x: &'a DeviceBuffer<f32>,
+    pub sel: &'a DeviceBuffer<u32>,
+    pub cols: usize,
+    pub layer: usize,
+    pub limit: f32,
+    pub n_card: usize,
+}
+
+/// A block's routed experts on one card through the common card leg, for a
+/// layer whose types the tile path does not read: the block cut in pieces of
+/// at most [`LEG_PIECE`] tokens, each piece the leg's four launches over its
+/// tokens' slots (`CardLeg::enqueue_rows`), the down rows into `down`
+/// (slot-major, `n_embd` a slot); a slot whose place is [`HOST`] is left as
+/// it was. The launches are slot-local, so a slot's rows are the step's for
+/// the same slot. Asynchronous, allocation-free.
+pub fn enqueue_leg_block(
+    gpu: &Gpu,
+    leg: &mut (CardLeg, LegBufs),
+    t: &LegBlock<'_>,
+    down: &mut DeviceBuffer<f32>,
+) -> Result<(), GpuError> {
+    let (card, bufs) = leg;
+    let n = bufs.shape().n;
+    let rule = Act::SwigluClamp { limit: t.limit };
+    let mut t0 = 0;
+    while t0 < t.cols {
+        let m = (t.cols - t0).min(LEG_PIECE);
+        let x = span(WHAT, t.x, t0 * n, m * n)?;
+        let sel = span(WHAT, t.sel, t0 * N_USED, m * N_USED)?;
+        let mut rows = span_mut(WHAT, down, t0 * N_USED * n, m * N_USED * n)?;
+        let run = LegRun {
+            layer: t.layer,
+            stacks: t.stacks,
+            normed: &x,
+            m,
+            sel: &sel,
+            n_card: t.n_card,
+            rule,
+        };
+        card.enqueue_rows(gpu, bufs, &run, &mut rows)?;
+        t0 += m;
+    }
+    Ok(())
+}
+
 /// The batch's kernels: loaded once by [`FfnBatch::new`], or alone by a gate
 /// that drives the launches with inputs a batch's route cannot produce.
 pub struct FfnBatchKernels {
@@ -1035,7 +1147,8 @@ impl FfnBatchKernels {
     }
 
     /// Enqueue the gather of `g.n_used` slots a token (`ds41_card_gather` for
-    /// 6, `ds41_card_gather_8` for 8; any other count is refused by name):
+    /// 6, `ds41_card_gather_8` for 8; any other count, four included, is
+    /// refused by name):
     /// the q8_1 planes of `g`'s table entries into columns `0 .. g.n_slots`
     /// of `q3` and `d8`. One launch. Asynchronous, allocation-free.
     pub fn enqueue_card_gather(
@@ -1048,6 +1161,7 @@ impl FfnBatchKernels {
     ) -> Result<(), GpuError> {
         let slots = slots_of("ds41_card_gather", g.n_used)?;
         let what = match slots {
+            Slots::Four => return Err(no_entry("ds41_card_gather", slots)),
             Slots::Six => "ds41_card_gather",
             Slots::Eight => "ds41_card_gather_8",
         };
@@ -1062,6 +1176,7 @@ impl FfnBatchKernels {
         ];
         let m = &self.module;
         match slots {
+            Slots::Four => return Err(no_entry(what, slots)),
             Slots::Six => {
                 let prep = m.prepare_ds41_card_gather(cfg)?;
                 m.ds41_card_gather(
@@ -1097,9 +1212,10 @@ impl FfnBatchKernels {
     /// Enqueue `ds41_ffn_card_acc_tier`: the card sums of `a.m` tokens over
     /// the stage card's and the tier's slots, value `i` of token `t = i / a.n`
     /// into `acc[i]`: `ds41_ffn_card_acc_tier` for six slots a token,
-    /// `ds41_ffn_card_acc_8_tier` (the fma chain of `ds41_ffn_card_acc_8`)
-    /// for eight; any other count is refused by name. One launch.
-    /// Asynchronous, allocation-free, capturable.
+    /// `ds41_ffn_card_acc_4_tier` and `ds41_ffn_card_acc_8_tier` (the fma
+    /// chains of `ds41_ffn_card_acc_4` and `_8`) for four and eight; any
+    /// other count is refused by name. One launch. Asynchronous,
+    /// allocation-free, capturable.
     pub fn enqueue_card_acc_tier(
         &self,
         stream: &CudaStream,
@@ -1108,6 +1224,7 @@ impl FfnBatchKernels {
     ) -> Result<(), GpuError> {
         let slots = slots_of("ds41_ffn_card_acc_tier", a.n_used)?;
         let what = match slots {
+            Slots::Four => "ds41_ffn_card_acc_4_tier",
             Slots::Six => "ds41_ffn_card_acc_tier",
             Slots::Eight => "ds41_ffn_card_acc_8_tier",
         };
@@ -1120,6 +1237,12 @@ impl FfnBatchKernels {
             launch_u32(what, "n_tier", a.n_tier)?,
         );
         match slots {
+            Slots::Four => {
+                let prep = self.module.prepare_ds41_ffn_card_acc_4_tier(cfg)?;
+                self.module.ds41_ffn_card_acc_4_tier(
+                    stream, &prep, a.down, a.trows, a.w, a.sel, a.tsel, n, m, n_card, n_tier, acc,
+                )?;
+            }
             Slots::Six => {
                 let prep = self.module.prepare_ds41_ffn_card_acc_tier(cfg)?;
                 self.module.ds41_ffn_card_acc_tier(
@@ -1322,6 +1445,9 @@ pub struct FfnBatch {
     /// ([`FfnPiece::enqueue_batch_replace`]); made by
     /// [`FfnBatch::enable_stream`].
     ssel: Option<DeviceBuffer<u32>>,
+    /// The common card leg's launches and buffers, for a block of a layer on
+    /// it ([`FfnBatch::prepare_leg`]).
+    leg: Option<(CardLeg, LegBufs)>,
 }
 
 /// A tiered block's routing as the shadow left it for the post's card sum
@@ -1452,6 +1578,7 @@ impl FfnBatch {
                 Vec::new()
             },
             ssel: None,
+            leg: None,
         })
     }
 
@@ -1509,6 +1636,25 @@ impl FfnBatch {
         self.hc.iter().map(DeviceBuffer::num_bytes).sum()
     }
 
+    /// The common card leg for the blocks of layers whose types it runs
+    /// ([`CardStacks::fused`] false): its launches and buffers for pieces of
+    /// [`LEG_PIECE`] tokens. A batch over a file whose card layers are all
+    /// fused needs none, and a block of a layer that does refuses by name
+    /// until this has run. Load-time only.
+    pub fn prepare_leg(&mut self, gpu: &Gpu) -> Result<(), GpuError> {
+        if self.leg.is_some() {
+            return Ok(());
+        }
+        let shape = LegShape {
+            cap: LEG_PIECE,
+            slots_per_col: N_USED,
+            n: self.n_embd,
+            ff: self.ff,
+        };
+        self.leg = Some((CardLeg::load(gpu)?, LegBufs::new(gpu.stream(), shape)?));
+        Ok(())
+    }
+
     /// Device bytes of the buffers, the chunk scratch's included; the
     /// page-locked host copies are not counted.
     #[must_use]
@@ -1536,6 +1682,7 @@ impl FfnBatch {
             + self.tile.device_bytes()
             + self.tsel.as_ref().map_or(0, DeviceBuffer::num_bytes)
             + self.ssel.as_ref().map_or(0, DeviceBuffer::num_bytes)
+            + self.leg.as_ref().map_or(0, |(_, b)| b.bytes())
             + self
                 .held
                 .iter()
@@ -2284,6 +2431,24 @@ impl FfnPiece {
             };
             let sel = span(WHAT, places, at * N_USED, slots_n)?;
             let mut down = span_mut(WHAT, &mut b.down_all, at * N_USED * n, slots_n * n)?;
+            if let Some(legs) = s.legs() {
+                let leg = b.leg.as_mut().ok_or(GpuError::State {
+                    what: WHAT,
+                    missing: "the common card leg of a block of a layer of types it runs \
+                              (FfnBatch::prepare_leg)",
+                })?;
+                let x = span(WHAT, &b.x, at * n, (u - at) * n)?;
+                let t = LegBlock {
+                    stacks: legs,
+                    x: &x,
+                    sel: &sel,
+                    cols: u - at,
+                    layer,
+                    limit: c.limit,
+                    n_card: c.n_card,
+                };
+                return enqueue_leg_block(gpu, leg, &t, &mut down);
+            }
             let t = TiledBlock {
                 stacks: s,
                 q3: &b.q3_all,
@@ -2359,7 +2524,7 @@ impl FfnPiece {
         let c = &self.cfg[i];
         let fault = gpu.layer_sink(layer)?;
         {
-            let pre = HcPreArgs {
+            let pre = HcFnArgs {
                 params: &lw.hc,
                 x: io.streams,
                 tokens: m,
@@ -2373,7 +2538,7 @@ impl FfnPiece {
                 m * HC_MIX,
             )?;
             self.hc
-                .enqueue_pre(stream, &pre, &mut self.hc_scratch, &mut b.mixes, &mut hc)?;
+                .enqueue_pre_fn(stream, &pre, &mut self.hc_scratch, &mut b.mixes, &mut hc)?;
             drop(hc);
             let act_x = count_of(&mut b.act_x, m)?;
             self.fused.enqueue_norm_quant(

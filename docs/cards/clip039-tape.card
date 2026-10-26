@@ -1,0 +1,10 @@
+kind: baseline
+question: what do the 0.3.9 candidate's served tapes show for Muse Spark Open and MiniMax-M3.1-Flash at the serving defaults on both cards?
+term: prompt tok/s of Muse Spark Open's P4 tape (~5.6K tokens), int039r bloomery-serve, RTX A6000 + RTX 3090, --place unset
+unit: tok/s
+predict: 35..100
+condition: one lease; arms muse then mm31, each a fresh load with both cards visible, every lever unset, two discarded warm-ups, the P4 tape, greedy, thinking off
+reason: [derived] Muse bp pp512 38.5..44 with the route-GEMM ring dark and 83..92 with it lit (m_min ~386 columns, a P4 pass of 512 rows reaches it); M3.1's P4 prompt is derived at ~370 tok/s on the A6000 (host-bound, the ring dark at the default group).
+decide-in: publish both P4 tapes to the tape site with titles naming the model, placement and cards
+decide-below: under 35: read the serve's plan, xstream and residency lines before publishing
+decide-above: beyond 100: read the witness block and the xstream line before publishing

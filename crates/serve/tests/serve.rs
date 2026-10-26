@@ -2068,6 +2068,241 @@ fn hw_solar_template_renders_as_jinja2() {
     }
 }
 
+/// MiniMax-M3.1-Flash's chat template (the checkpoint folder's `chat_template.jinja`) renders as
+/// Hugging Face's jinja2 does: every case of the fixture through `/apply-template` equals its
+/// reference render byte for byte. The case jinja2 refuses for want of an object (tool-call
+/// `arguments` given as a JSON string, which the template walks with `.items()`) renders as the
+/// same body with the string parsed does, and the case the template refuses itself
+/// (`raise_exception`) is refused naming its message. The cases reach the system turn (the root
+/// turn's date and location, the default identity), a system or developer turn at any position
+/// rendered as a developer turn, the span split out of an answer (`split`, `strip('\n')`) and the
+/// span closed empty, `reasoning_effort` and its `effort` twin, the tool turn that groups its
+/// results, and the recursive `to_xml` over nested, null, boolean and non-ASCII arguments.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_minimaxm31_template_renders_as_jinja2() {
+    let addr = common::start_templated(
+        Box::new(serve::MockEngine::new(4096)),
+        include_str!("fixtures/minimaxm31-chat-template.jinja"),
+    );
+    let fixture: Value = serde_json::from_str(include_str!("fixtures/minimaxm31-renders.json"))
+        .expect("fixture JSON");
+    let cases = fixture["cases"].as_array().expect("cases");
+    assert_eq!(cases.len(), 20, "{fixture}");
+    for case in cases {
+        let r = post(addr, "/apply-template", &case["body"]);
+        if let Some(error) = case["error"].as_str() {
+            if let Some(refused) = error.strip_prefix("TemplateError: ") {
+                assert_ne!(r.status, 200, "{}: {}", case["name"], r.body);
+                assert!(r.body.contains(refused), "{}: {}", case["name"], r.body);
+                continue;
+            }
+            assert_eq!(r.status, 200, "{}: {}", case["name"], r.body);
+            let parsed = post(addr, "/apply-template", &arguments_parsed(&case["body"]));
+            assert_eq!(parsed.status, 200, "{}: {}", case["name"], parsed.body);
+            assert_eq!(
+                r.json()["prompt"],
+                parsed.json()["prompt"],
+                "{}",
+                case["name"]
+            );
+            assert!(
+                r.json()["prompt"]
+                    .as_str()
+                    .is_some_and(|p| p.contains("get_time")),
+                "{}: {}",
+                case["name"],
+                r.body
+            );
+            continue;
+        }
+        assert_eq!(r.status, 200, "{}: {}", case["name"], r.body);
+        assert_eq!(r.json()["prompt"], case["prompt"], "{}", case["name"]);
+    }
+}
+
+/// The text a template sets its variable `name` to: `{%- set name = '<text>' -%}`.
+fn template_tag(template: &'static str, name: &str) -> &'static str {
+    template
+        .lines()
+        .find(|l| l.contains(&format!("set {name} ")))
+        .and_then(|l| l.split('\'').nth(1))
+        .unwrap_or_else(|| panic!("the template sets no {name}"))
+}
+
+/// A chat completion's `(reasoning, content)`, from the reply of a request that was streamed or not.
+fn reasoning_and_content(r: &common::Reply, stream: bool) -> (String, String) {
+    assert_eq!(r.status, 200, "{}", r.body);
+    if !stream {
+        let m = &r.json()["choices"][0]["message"];
+        return (
+            m["reasoning_content"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned(),
+            m["content"].as_str().unwrap_or_default().to_owned(),
+        );
+    }
+    let (mut reasoning, mut content) = (String::new(), String::new());
+    for e in r.events().iter().filter(|e| *e != "[DONE]") {
+        let v: Value = serde_json::from_str(e).expect("a chunk");
+        let d = &v["choices"][0]["delta"];
+        reasoning.push_str(d["reasoning_content"].as_str().unwrap_or_default());
+        content.push_str(d["content"].as_str().unwrap_or_default());
+    }
+    (reasoning, content)
+}
+
+/// MiniMax-M3.1-Flash's reply is split where the model writes its reasoning: between the tags its
+/// template spells (`think_begin_token`, `think_end_token`), which the seat hands the server. The
+/// generation prompt ends `ai` and opens no span, so the model opens it itself, or answers with
+/// none; the same reply on a server that splits on `<think>` has no reasoning.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_minimaxm31_reasoning_splits_at_its_tags() {
+    const TEMPLATE: &str = include_str!("fixtures/minimaxm31-chat-template.jinja");
+    let think = serve::reasoning::ThinkTags {
+        open: "<mm:think>",
+        close: "</mm:think>",
+    };
+    assert_eq!(think.open, template_tag(TEMPLATE, "think_begin_token"));
+    assert_eq!(think.close, template_tag(TEMPLATE, "think_end_token"));
+    let spans = "<mm:think>The user greets.</mm:think>Hello!";
+    let ask = |script: &str, tags: Option<serve::reasoning::ThinkTags>, stream: bool| {
+        let engine = Box::new(serve::ScriptedEngine::new(4096, script));
+        let addr = match tags {
+            Some(tags) => common::start_tagged(engine, TEMPLATE, tags),
+            None => common::start_templated(engine, TEMPLATE),
+        };
+        let r = post(
+            addr,
+            "/v1/chat/completions",
+            &json!({
+                "model": "m",
+                "messages": [
+                    {"role": "system", "content": "You are terse."},
+                    {"role": "user", "content": "Hi"},
+                ],
+                "temperature": 0,
+                "stream": stream,
+            }),
+        );
+        reasoning_and_content(&r, stream)
+    };
+    for stream in [false, true] {
+        assert_eq!(
+            ask(spans, Some(think), stream),
+            ("The user greets.".to_owned(), "Hello!".to_owned()),
+            "stream {stream}"
+        );
+        assert_eq!(
+            ask("Hello!", Some(think), stream),
+            (String::new(), "Hello!".to_owned()),
+            "no span, stream {stream}"
+        );
+        assert_eq!(
+            ask(spans, None, stream),
+            (String::new(), spans.to_owned()),
+            "default tags, stream {stream}"
+        );
+    }
+}
+
+/// Muse Spark Open's chat template (the specimen file's `tokenizer.chat_template`, 16,295 bytes,
+/// which differs from llama.cpp's own: the effort map is low 8, medium 32, high 256, xhigh 512)
+/// renders as Hugging Face's jinja2 does: every case of the fixture through `/apply-template`
+/// equals its reference render byte for byte; the cases the template refuses itself
+/// (`raise_exception`: an effort outside its map, a tool result no call names) are refused naming
+/// its message. The cases reach the system turn (the default identity, the cutoff and the date as
+/// kwargs, instructions that name the effort rewritten to its strength, a developer turn sent as
+/// system, a system turn after the first), the `to=self` message of an assistant turn's reasoning
+/// under both of its keys and the turn that wrote only reasoning, the recipient of an assistant
+/// message and its end token, `reasoning_effort` (and its `"none"` sent as `"low"`), the escape of
+/// control sequences in caller text, a timestamped user turn, the tool definitions (deferred and
+/// eager, and a namespace of them whose members' flags the template reads by identity with
+/// `false`) with the valid recipients they add, and the tool turn that names its result by call id
+/// over the ATEM markup of nested, null and non-ASCII arguments.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_musespark_template_renders_as_jinja2() {
+    let addr = common::start_templated(
+        Box::new(serve::MockEngine::new(4096)),
+        include_str!("fixtures/musespark-chat-template.jinja"),
+    );
+    let fixture: Value = serde_json::from_str(include_str!("fixtures/musespark-renders.json"))
+        .expect("fixture JSON");
+    let cases = fixture["cases"].as_array().expect("cases");
+    assert_eq!(cases.len(), 27, "{fixture}");
+    for case in cases {
+        let r = post(addr, "/apply-template", &case["body"]);
+        if let Some(error) = case["error"].as_str() {
+            let refused = error.strip_prefix("TemplateError: ").unwrap_or_else(|| {
+                panic!(
+                    "{}: an error that is not the template's: {error}",
+                    case["name"]
+                )
+            });
+            assert_ne!(r.status, 200, "{}: {}", case["name"], r.body);
+            assert!(r.body.contains(refused), "{}: {}", case["name"], r.body);
+            continue;
+        }
+        assert_eq!(r.status, 200, "{}: {}", case["name"], r.body);
+        assert_eq!(r.json()["prompt"], case["prompt"], "{}", case["name"]);
+    }
+}
+
+/// Muse Spark's reply is split where the model writes it: the `to=self` message is the reasoning
+/// and the `to=user` message (or any message to `commentary`) the content, whether or not the
+/// request carries tools. The generation prompt ends `<|start|>assistant`, so the model writes its
+/// own ` to=…<|message|>`; its template names no think tag, so the server's default `<think>`
+/// split has nothing to find, and a reply scanned only when tools are asked for would leave the
+/// whole protocol in `content`. The same reply streamed is split the same way.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_musespark_reply_splits_at_the_recipient_span() {
+    const TEMPLATE: &str = include_str!("fixtures/musespark-chat-template.jinja");
+    let ask = |script: &str, stream: bool| {
+        let engine = Box::new(serve::ScriptedEngine::new(4096, script));
+        let addr = common::start_templated(engine, TEMPLATE);
+        let r = post(
+            addr,
+            "/v1/chat/completions",
+            &json!({
+                "model": "m",
+                "messages": [
+                    {"role": "system", "content": "You are terse."},
+                    {"role": "user", "content": "Hi"},
+                ],
+                "temperature": 0,
+                "stream": stream,
+            }),
+        );
+        reasoning_and_content(&r, stream)
+    };
+    let reasoned =
+        " to=self<|message|>The user greets.<|eom|><|start|>assistant to=user<|message|>Hello!";
+    let plain = " to=user<|message|>Hello!";
+    let updated = " to=self<|message|>Plan.<|eom|><|start|>assistant to=commentary<|message|>On it.\
+                   <|eom|><|start|>assistant to=user<|message|>Done.";
+    for stream in [false, true] {
+        assert_eq!(
+            ask(reasoned, stream),
+            ("The user greets.".to_owned(), "Hello!".to_owned()),
+            "reasoning then the answer, stream {stream}"
+        );
+        assert_eq!(
+            ask(plain, stream),
+            (String::new(), "Hello!".to_owned()),
+            "the answer alone, stream {stream}"
+        );
+        assert_eq!(
+            ask(updated, stream),
+            ("Plan.".to_owned(), "On it.Done.".to_owned()),
+            "a commentary message is content, stream {stream}"
+        );
+    }
+}
+
 /// Every id the vocabulary names as a stop ends a generation, not only its
 /// EOS: with GLM-5.3-Flash's three (the header's eos, eot and eom), a
 /// generation that emits any one of them stops there, reports `stopped_eos`,

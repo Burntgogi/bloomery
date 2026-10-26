@@ -32,6 +32,7 @@ pub fn describe(split: &Split) -> Result<PlanInputs, PlacementError> {
         model: read.tensors,
         spec: read.spec,
         kv: kv_layout(&hp),
+        prompt_reserve: 0,
     })
 }
 

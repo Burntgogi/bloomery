@@ -1,0 +1,10 @@
+kind: baseline
+question: what are 0.3.9's headline pp512, pp4096 and decode for Muse Spark Open and MiniMax-M3.1-Flash at the serving defaults on both cards?
+term: decode tok/s of Muse Spark Open UD-IQ2_XXS at D=512, int039s bloomery-serve, RTX A6000 + RTX 3090, --place unset (bp)
+unit: tok/s
+predict: 12..17
+condition: one lease; tools/ref/depth-serve.sh, arms D=512 and D=4096 per model, 3 rounds, DEPTH_SERVE_CTX 4300, N 128, each round a fresh server with both cards visible and every lever unset
+reason: [measured] the 0.3.9 candidate tapes at the same defaults: Muse decode 14.2 tok/s and prompt 94.4 tok/s at 5,554 ids, M3.1 decode 15.8 and prompt 98.3 at 5,617 ids; a shorter depth reads no fewer KV bytes per step than it saves, so decode at 512 sits at or a little above the tape's.
+decide-in: write the four numbers per model into the release notes' table with these conditions
+decide-below: under 12: read the plan, residency and xstream lines and the witness block before writing a number
+decide-above: beyond 17: read the witness block and the plan line before writing a number

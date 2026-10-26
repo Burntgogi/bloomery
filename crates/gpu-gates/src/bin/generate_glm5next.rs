@@ -90,6 +90,13 @@
 //! at `main`; every line is a record of a kind `bloomery_gpu_gates::record`
 //! declares (`--records-schema` prints them).
 //!
+//! llama-server's placement flags (`-dev`, `-sm`, `-mg`, `-ts`, `-ngl`, `-fit`, `-fitt` and kin) and
+//! their `LLAMA_ARG_*` variables are read first in `run` as `bloomery-serve` reads them
+//! (`bloomery_gpu_gates::llama_launch`): the cards they name become the `--place` word (`--place`
+//! beside them is refused), the levers they are replace the environment's, and a flag this run has
+//! no thing for (`--cpu-moe`, `-devd`) is refused by name. `--list-devices` prints the devices and
+//! exits.
+//!
 //! Under `BLOOMERY_DRAFT=mtp` the load carries the file's next-token layer
 //! beside the target (`app::arch::glm5next::open_nextn`) and the generated
 //! tokens run through the shared MTP window (`app::mtp::MtpDraft<Body>`,
@@ -238,11 +245,12 @@ mod cli {
     use bloomery_gpu::host::swap::Residency;
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu_gates::generate::{
-        Diag, Lane, NoEog, Place, Residence, ServeFeed, TopRows, before_path, card_table,
-        dump_table, lane_at, place_table, read_table, repeat_runs, seed_path, slot_table,
-        with_cards, write_table,
+        Diag, Known, Lane, NoEog, Place, Residence, ServeFeed, TopRows, before_path, card_table,
+        dump_table, lane_at, place_table, read_table, refuse_unknown, repeat_runs, seed_path,
+        slot_table, with_cards, write_table,
     };
     use bloomery_gpu_gates::host_stats::{Probe, print_stats};
+    use bloomery_gpu_gates::llama_launch::{self, Launcher};
     use bloomery_gpu_gates::need;
     use bloomery_gpu_gates::record::{self, Record};
     use bloomery_gpu_gates::residency38::{
@@ -292,9 +300,26 @@ mod cli {
     /// lanes of two columns or more, which the GLM step port does not serve.
     const PLAIN_PASS_SLOTS: usize = 2;
 
+    /// The flags this binary reads, with the shared diagnosis flags ([`Diag`]): any other argument
+    /// is refused by name. `--model` is named so its refusal below says what it is.
+    const FLAGS: Known<'static> = Known {
+        bare: &["--time", "--pair", "--last-step", "--logits", "--plan"],
+        valued: &[
+            "--tokens",
+            "-n",
+            "--warm",
+            "--ctx",
+            "--place",
+            "--mode",
+            "--prefill",
+            "--model",
+        ],
+        diag: true,
+    };
+
     /// The last value of flag `name`, if given.
     fn flag(name: &str) -> Result<Option<String>, GateError> {
-        let args: Vec<String> = std::env::args().collect();
+        let args = llama_launch::args();
         let mut out = None;
         for (i, a) in args.iter().enumerate() {
             if a == name {
@@ -309,7 +334,7 @@ mod cli {
     }
 
     fn has(name: &str) -> bool {
-        std::env::args().any(|a| a == name)
+        llama_launch::args().into_iter().any(|a| a == name)
     }
 
     /// Comma-separated ids.
@@ -522,9 +547,22 @@ mod cli {
     }
 
     pub fn run() -> Result<(), GateError> {
+        // llama-server's placement flags and variables come out of the arguments, and the levers
+        // they are replace the environment's, before any lever is read.
+        let seat = || -> Result<&'static str, GateError> { Ok("glm") };
+        let launcher = Launcher {
+            bin: "generate_glm5next",
+            seat: &seat,
+            layers: &llama_launch::file_layers,
+            reads: llama_launch::NONE,
+        };
+        if launcher.start()? {
+            return Ok(());
+        }
         let levers = bloomery_levers::at_main(ACTS_ON)?;
         model::ops::set_lane_prefetch(levers.lane_prefetch());
         record::at_main("generate_glm5next", record::GENERATE_GLM5NEXT);
+        refuse_unknown("generate_glm5next", &llama_launch::args(), FLAGS)?;
         let ids = ids_of(&flag("--tokens")?.ok_or("--tokens a,b,c is required")?)?;
         if ids.is_empty() {
             return Err("--tokens holds no id".into());
@@ -573,7 +611,7 @@ mod cli {
         // their cross-flag refusals are `Diag::finish`'s.
         let mut diag = Diag::default();
         {
-            let mut it = std::env::args().skip(1);
+            let mut it = llama_launch::args().into_iter().skip(1);
             while let Some(flag) = it.next() {
                 diag.take(&flag, &mut it)?;
             }
@@ -1638,9 +1676,10 @@ mod cli {
                 ("place".to_owned(), place.to_owned()),
                 (
                     "card_budget".to_owned(),
-                    levers
-                        .card_budget_bytes()
-                        .map_or_else(|| "each card's own".to_owned(), |b| b.to_string()),
+                    match levers.card_budget() {
+                        bloomery_levers::CardBudget::Unset => "each card's own".to_owned(),
+                        b => b.to_string(),
+                    },
                 ),
                 ("prefill".to_owned(), prefill.name().to_owned()),
                 ("chunk".to_owned(), chunk.to_string()),
@@ -1671,6 +1710,7 @@ mod cli {
                 free_bytes: Some(100 << 30),
                 held_by: None,
                 integrated: true,
+                margin_bytes: None,
             };
             let tensors = [
                 TpTensor {

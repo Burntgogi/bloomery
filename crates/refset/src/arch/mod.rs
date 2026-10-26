@@ -12,38 +12,51 @@ pub mod deepseek41;
 pub mod deepseek41v;
 pub mod dequant;
 pub mod draft;
+pub mod forced_logits;
 pub mod gemma_embedding;
 pub mod gemma_embedding2;
 pub mod glm5next;
+pub mod llama;
 pub mod mimo2;
 pub mod minicpmv4_7;
 pub mod minimaxm3;
+pub mod minimaxm31;
+pub mod musespark;
 pub mod nemotron_h;
 pub mod nemotron_h_moe;
 pub mod prompt_tables;
 pub mod quant;
 pub mod qwen35;
 pub mod qwen35moe;
+pub mod qwen3moe;
 pub mod qwen4exp;
 pub mod raon1;
 pub mod solar2;
 pub mod tokenizer;
 
+/// The families of the architecture MiniMax-M3 and M3.1 share, the GGUF set's llama.cpp dumps first ([`node_dumps`] answers with
+/// them) and the checkpoint folder's transformers dumps after: [`minimaxm3::FAMILIES`] then [`minimaxm31::FAMILIES`], which
+/// `minimax_rows_are_both_modules_families` holds.
+static MINIMAX_M3: &[&Family] = &[&minimaxm3::LCPP, &minimaxm31::TF, &minimaxm31::POOLED];
+
 /// Each architecture's families, by the architecture's name.
 static BY_ARCH: &[(&str, &[&Family])] = &[
     (deepseek41::ARCH, deepseek41::FAMILIES),
     (deepseek41v::ARCH, deepseek41v::FAMILIES),
+    (qwen3moe::ARCH, qwen3moe::FAMILIES),
     (qwen35moe::ARCH, qwen35moe::FAMILIES),
     (qwen35::ARCH, qwen35::FAMILIES),
+    (llama::ARCH, llama::FAMILIES),
     (glm5next::ARCH, glm5next::FAMILIES),
     (mimo2::ARCH, mimo2::FAMILIES),
-    (minimaxm3::ARCH, minimaxm3::FAMILIES),
+    (minimaxm3::ARCH, MINIMAX_M3),
     (solar2::ARCH, solar2::FAMILIES),
     (minicpmv4_7::ARCH, minicpmv4_7::FAMILIES),
     (qwen4exp::ARCH, qwen4exp::FAMILIES),
     (raon1::ARCH, raon1::FAMILIES),
     (nemotron_h::ARCH, nemotron_h::FAMILIES),
     (nemotron_h_moe::ARCH, nemotron_h_moe::FAMILIES),
+    (musespark::ARCH, musespark::FAMILIES),
     (tokenizer::ARCH, tokenizer::FAMILIES),
     (dequant::ARCH, dequant::FAMILIES),
     (quant::ARCH, quant::FAMILIES),
@@ -91,8 +104,55 @@ mod qwen_vis_tests;
 
 #[cfg(test)]
 mod tests {
-    use super::{all, named, node_dumps};
+    use super::{BY_ARCH, all, families, minimaxm3, minimaxm31, named, node_dumps};
     use crate::family::Identity;
+
+    /// The fixture families whose real file's sets have no refset family: the card gates open
+    /// those by name. Each is checked in its own module.
+    const STANDALONE: [&str; 1] = ["fx-ik-qwen3moe"];
+
+    /// One row an architecture: `families` answers with the first row of a name, so a second row would hide its families.
+    #[test]
+    fn each_architecture_has_one_row() {
+        for (i, (arch, _)) in BY_ARCH.iter().enumerate() {
+            assert!(
+                BY_ARCH[..i].iter().all(|(a, _)| a != arch),
+                "{arch} has two rows in BY_ARCH: merge them into one slice"
+            );
+        }
+    }
+
+    /// MiniMax-M3 and M3.1 share an architecture name, so one row holds both modules' families, M3's first: the gates' node dumps
+    /// stay the llama.cpp ones, and a family a module gains is in the table or this is red.
+    #[test]
+    fn minimax_rows_are_both_modules_families() {
+        let want: Vec<&str> = minimaxm3::FAMILIES
+            .iter()
+            .chain(minimaxm31::FAMILIES)
+            .map(|f| f.name)
+            .collect();
+        let got: Vec<&str> = families(minimaxm3::ARCH).iter().map(|f| f.name).collect();
+        assert_eq!(got, want);
+        assert_eq!(
+            got,
+            ["lcpp-minimaxm3", "tf-minimaxm31", "tf-minimaxm31-pooled"]
+        );
+        assert_eq!(minimaxm31::ARCH, minimaxm3::ARCH);
+        for set in minimaxm31::SETS {
+            assert!(
+                !minimaxm3::SETS.contains(set),
+                "{set} is a minimaxm3 set: one data directory holds both families"
+            );
+        }
+        assert_eq!(
+            node_dumps(minimaxm3::ARCH).map(|f| f.name),
+            Some("lcpp-minimaxm3")
+        );
+        assert!(
+            named("tf-minimaxm31").is_some_and(|f| std::ptr::eq(f, &minimaxm31::TF)),
+            "tf-minimaxm31 is not in the table"
+        );
+    }
 
     /// Every family's sets in place pass their family's check: each states
     /// the file the tree runs, names its family's ik build where the family
@@ -133,7 +193,8 @@ mod tests {
     /// identity, a draft file when the real family has one and no per-file set
     /// name; each set is the real family's set under the `fx_` prefix
     /// (`ref-mtp/fx_` for an MTP set). The real family's node dumps stay the
-    /// architecture's.
+    /// architecture's. [`STANDALONE`] are the fixture families whose real sets
+    /// have no family, held by their own module's test.
     #[test]
     fn each_fixture_family_mirrors_a_real_one() {
         let sets_of = [
@@ -147,7 +208,7 @@ mod tests {
             ("fx-ref-nemotron-moe-logits", 1),
         ];
         let mut found: Vec<&str> = all()
-            .filter(|f| f.name.starts_with("fx-"))
+            .filter(|f| f.name.starts_with("fx-") && !STANDALONE.contains(&f.name))
             .map(|f| f.name)
             .collect();
         found.sort_unstable();

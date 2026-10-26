@@ -67,6 +67,7 @@ pub fn spec_of(hp: &Hparams, chat: models::ChatSpec) -> Result<ModelSpec, Placem
         hc: None,
         engram: None,
         encoder: None,
+        logit_epilogue: None,
         chat,
     })
 }

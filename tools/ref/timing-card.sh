@@ -50,12 +50,13 @@ source "${BASH_SOURCE[0]%/*}/lease.sh"
 TIMING_GPU=${BLOOMERY_TIMING_GPU:-$GPU_A6000}
 if [ "$TIMING_GPU" = "$GPU_3090" ]; then OTHER_GPU=$GPU_A6000; else OTHER_GPU=$GPU_3090; fi
 export CUDA_VISIBLE_DEVICES=$TIMING_GPU
-# A DSpark run (BLOOMERY_DRAFT=dspark) puts its draft on the other card — the placement's tier card
-# under bp, else BLOOMERY_DSPARK_CARD's pick, else the smallest visible card (dspark::draft_spec) — so
-# that card must be visible too; the timing card stays device 0. The draft file
-# is the profile's DSPARK_MODEL unless the caller names one. dspark_env prints the same two
-# assignments for a runner that sets the lever per arm (depth-ds41.sh); in the two-card mode the cards
-# are the mode's two (the draft sits on the 3090 beside the expert tier).
+# A DSpark run (BLOOMERY_DRAFT=dspark) puts its draft on the other card — BLOOMERY_DSPARK_CARD's pick, else
+# the placement's tier card under bp, else the smallest visible card (Place::draft_on), which joins the plan
+# as a holder (a card with the draft and no expert) when it is none of the placement's — so that card must
+# be visible too; the timing card stays device 0. The draft file is the profile's DSPARK_MODEL unless the
+# caller names one. dspark_env prints the same two assignments for a runner that sets the lever per arm
+# (depth-ds41.sh); in the two-card mode the cards are the mode's two (the draft sits on the 3090 beside the
+# expert tier).
 # An empty draft path is refused by name (exit 66), never exported: on the fixture tier a fixture with
 # no single draft leaves DSPARK_MODEL empty and its reason in DSPARK_MODEL_WHY (ref-paths.sh).
 # shellcheck source=tools/ref/dspark-path.sh
@@ -594,7 +595,8 @@ guard_cards() {
 # devices (an engine whose log names none, or one whose cards the caller checks: tools/ref/arm-place.sh's
 # place_arm_cards). With `ours` the log is one of our binaries': its first `load` record's `cards` (read by
 # tools/bloomery/records.py), the devices' own names, must be exactly two, the A6000's then the 3090's (the
-# stage card, then the tier). TWOCARD_DEVS is `<device 0> + <device 1>` for the row (the one device under
+# stage card, then the tier). With `serve` the log is bloomery-serve's: its first `need` record's `cards`, `<name>:<bytes>`
+# in the devices' order, held to the same two names. TWOCARD_DEVS is `<device 0> + <device 1>` for the row (the one device under
 # stage). In local mode the Xid checks alone, then 1 when the timing card no longer answers nvidia-smi by its
 # UUID; the second argument and the devices are not checked.
 timing_cards_arm() {
@@ -638,6 +640,22 @@ timing_cards_arm() {
         return 0
       fi
       TWOCARD_WHY="the engine's load record names cards ${CARDS:-(none)}, not the A6000 and the 3090: a one-card run in the two-card table"
+      return 1
+      ;;
+    serve)
+      rec=$(python3 "${BASH_SOURCE[0]%/*}/../bloomery/records.py" sh - CARDS=need.cards <<< "$1") || {
+        TWOCARD_WHY="records.py did not read the server's need record"
+        return 1
+      }
+      eval "$rec"
+      # The record's cards are `<name>:<bytes>` in the devices' order, each space in a name written `_`.
+      d0=${CARDS#\[} d0=${d0%\]} d0=$(sed -E 's/:[0-9]+//g' <<< "${d0//_/ }")
+      if [[ $d0 =~ ^[^,]*A6000[^,]*,[^,]*3090[^,]*$ ]]; then
+        # shellcheck disable=SC2034 # TWOCARD_DEVS is read by the runners that source this file
+        TWOCARD_DEVS="${d0//,/ + }"
+        return 0
+      fi
+      TWOCARD_WHY="the server's need record names cards ${CARDS:-(none)}, not the A6000 and the 3090: a one-card run in the two-card table"
       return 1
       ;;
   esac

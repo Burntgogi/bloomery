@@ -18,15 +18,22 @@
 //! marks: it is cut at its end alone. Per layer:
 //! - the front: the attention sub-layer over the batch's rows, then either
 //!   the dense block whole, or the routed block's norm, its router over the
-//!   rows and the download of the rows, ids and weights to the host;
+//!   rows and the download of the rows, ids and weights to the host (on a
+//!   layer the expert tier holds experts of, each slot's tier place with
+//!   them, [`crate::tier::TierParts::enqueue_download_rows`]);
 //! - the shadow: the card experts, where the slot map puts any
 //!   ([`bloomery_gpu::card_experts`]: every slot's place in one launch, then the common pair
 //!   over the batch's `t · N_USED` slots, one launch each — the steps'
 //!   one-token launches' rows for each slot, so the sums are the steps'); the
-//!   routed block has no shared expert, so nothing else;
+//!   routed block has no shared expert, so nothing else; a tier layer keeps
+//!   the unit's weights and tier places for its join, which runs after the
+//!   next unit's front has routed over the shared buffers;
 //! - the back: the host's sums (the walk's serve uploaded them) plus the
 //!   shadow's card sum and the residual after the attention (`x1` alone on a
-//!   layer with no card experts).
+//!   layer with no card experts). A tier layer joins first: the card sum over
+//!   the stage card's and the tier's slots, once the port has landed the
+//!   tier's rows, which then uploads the host's sums
+//!   ([`BatchLeg::join_tiered`]).
 //!
 //! The head runs after the last layer of the batch that holds the call's last
 //! position, for that position alone.
@@ -61,6 +68,7 @@ use bloomery_gpu::host::run::HostRun;
 use bloomery_gpu::host::served::{prompt_pass, read_fault, refuse_steps_feed};
 use bloomery_gpu::host::shell::TierShell;
 use bloomery_gpu::kquant::Act;
+use bloomery_gpu::model::refuse_reserve_past;
 use bloomery_gpu::rope_neox::K192Args;
 use bloomery_gpu::routed_block::{RouteBlock, RoutedRows};
 use bloomery_gpu::site;
@@ -70,6 +78,8 @@ use bloomery_gpu_deepseek41::block::{Block, BlockIo, BlockKernels, enqueue_block
 use bloomery_gpu_deepseek41::router::mimo2::{N_EXPERT, N_USED, RouterKernels};
 use bloomery_gpu_deepseek41::span::{span, span_mut};
 use cuda_core::DeviceBuffer;
+use model::arch::mimo2::hparams::Hparams;
+use model::arch::mimo2::place;
 use model::moe::UNION_MAX_COLS;
 use runtime::layer::FfnKind;
 pub use runtime::prompt::PrefillMode;
@@ -82,6 +92,7 @@ use runtime::sched::{self, At, LayerProgram, Overlap, PortKind};
 use super::{Body, Dims, Kernels, LayerCfg, LayerNames, Mimo2Model, RopeBase, Store, WHAT, shape};
 use crate::attn::{enqueue_append, enqueue_pass};
 use crate::ffn::FfnNames;
+use crate::tier::{TierBatch, TierParts};
 
 /// Positions one batch runs at most: the host union's columns.
 pub const T_MAX: usize = UNION_MAX_COLS;
@@ -93,9 +104,23 @@ pub const FLASH_ROWS: usize = 16;
 const GROUP_MAX: usize = bloomery_levers::PREFILL_GROUP_MAX as usize;
 const _: () = assert!(GROUP_MAX as u64 == bloomery_levers::PREFILL_GROUP_MAX);
 
+// The plan's reserve for the batch is the formula of `place::prompt_shared_bytes`, which counts
+// these sizes as the kernels fix them.
+const _: () = assert!(T_MAX == place::PROMPT_ROWS);
+const _: () = assert!(FLASH_ROWS == place::FLASH_ROWS);
+const _: () = assert!(COL_GROUP == place::COL_GROUP);
+const _: () = assert!(bloomery_gpu::flash_gqa::SEGMENTS == place::FLASH_SEGMENTS);
+const _: () = assert!(bloomery_gpu::flash_gqa::SEG_KEYS == place::SEGMENT_KEYS);
+
 /// The body's prompt feed: its mode, the batches a group runs, the batch's
 /// buffers once a batch feed made them, and whether a call runs.
 pub(crate) struct PromptState {
+    /// The file's hyperparameters, which the batch's bytes are counted from
+    /// ([`place::prompt_shared_bytes`]).
+    hp: Hparams,
+    /// The card bytes the load's plan kept for the batch's shared buffers and
+    /// first unit ([`place::prompt_reserve_bytes`]).
+    reserve: u64,
     mode: PrefillMode,
     /// Batches a group runs layer by layer ([`set_prefill_group`]): one until
     /// set.
@@ -106,9 +131,12 @@ pub(crate) struct PromptState {
 }
 
 impl PromptState {
-    /// The steps feed with no buffers: what a load starts as.
-    pub(crate) fn new() -> PromptState {
+    /// The steps feed with no buffers: what a load starts as, under the plan's
+    /// `reserve` for the batch.
+    pub(crate) fn new(hp: &Hparams, reserve: u64) -> PromptState {
         PromptState {
+            hp: hp.clone(),
+            reserve,
             mode: PrefillMode::Steps,
             group: 1,
             batch: None,
@@ -120,16 +148,29 @@ impl PromptState {
     pub(crate) fn bytes(&self) -> usize {
         self.batch.as_ref().map_or(0, |b| b.bytes())
     }
+
+    /// The batch's bytes for positions up to `cap` by the plan's formula: the
+    /// shared buffers (with the card experts' batch when `card`) and one
+    /// unit's.
+    fn formula(&self, cap: usize, card: bool) -> (u64, u64) {
+        (
+            place::prompt_shared_bytes(&self.hp, cap, card),
+            place::prompt_unit_bytes(&self.hp, cap),
+        )
+    }
 }
 
 /// The batch's buffers: the walk's shared ones, one set a unit of a group,
-/// the host sums the batch port uploads (lent to the port apart from them) and
-/// the card experts' buffers, on a load with card experts.
+/// the host sums the batch port uploads (lent to the port apart from them),
+/// the card experts' buffers, on a load with card experts, and the tier's
+/// places and join copies, on a load that hangs an expert tier card (held to
+/// the plan's tier reserve at the load, so [`Batch::bytes`] leaves them out).
 struct Batch {
     bufs: Bufs,
     units: Vec<UnitBufs>,
     hsum: DeviceBuffer<f32>,
     card: Option<CardBatch>,
+    tier: Option<TierBatch>,
 }
 
 impl Batch {
@@ -183,17 +224,12 @@ impl UnitBufs {
     fn bytes(&self) -> usize {
         self.x.num_bytes() + self.x1.num_bytes() + self.pos.num_bytes() + self.n_keys.num_bytes()
     }
-
-    /// Card bytes of one unit's buffers for up to `cap` tokens of `n` values:
-    /// what [`UnitBufs::new`] allocates, counted before it does.
-    fn planned(n: usize, cap: usize) -> usize {
-        size_of::<f32>() * 2 * cap * n + size_of::<u32>() * 2 * cap
-    }
 }
 
 /// Every buffer a group's units share besides the host sums, in values: the
-/// one place the sizes are read, by the allocation and by the bytes the
-/// refusal counts. Each buffer is written and read inside one part of one
+/// sizes the allocation reads, whose bytes are held to the plan's formula
+/// ([`place::prompt_shared_bytes`]) when the batch is made. Each buffer is
+/// written and read inside one part of one
 /// item, or by an item's front and read by its back with no front between
 /// them, so the units use it one after another in stream order.
 struct Lens {
@@ -250,24 +286,6 @@ impl Lens {
             part_v: launch(HEAD),
             part_ms: launch(2),
         }
-    }
-
-    /// The device bytes of the buffers these lengths make (every value is
-    /// four bytes).
-    fn bytes(&self) -> usize {
-        size_of::<f32>()
-            * (self.xn
-                + self.out
-                + self.normed
-                + self.probs
-                + self.ids
-                + self.weights
-                + self.qkv
-                + self.q
-                + self.y
-                + self.h
-                + self.part_v
-                + self.part_ms)
     }
 }
 
@@ -422,8 +440,9 @@ pub struct PromptBytes {
     pub total: usize,
     /// The units made: as many as the group holds batches.
     pub units: usize,
-    /// The card's free device bytes after them ([`Gpu::alloc_room`]), which
-    /// the load's plan reserved none of them out of.
+    /// The card's free device bytes after them ([`Gpu::alloc_room`]): the
+    /// load's plan reserved the shared buffers and the first unit out of the
+    /// expert budget, and the units a group past one adds come out of this.
     pub free: usize,
 }
 
@@ -541,24 +560,24 @@ impl Body {
         Ok(())
     }
 
-    /// Refused by name when `units` more units of `cap` tokens and `shared`
-    /// more bytes pass the card's free device bytes ([`Gpu::alloc_room`]): the
-    /// load's plan reserves none for the prompt batch, so its buffers come out
-    /// of what the load left free, and a batch that does not fit is refused
-    /// here, not by the driver.
-    fn refuse_unreserved(&self, gpu: &Gpu, units: usize, shared: usize) -> Result<(), GpuError> {
-        let cap = cap_of(self.ctx);
-        let need = shared + units * UnitBufs::planned(self.dims.embd, cap);
+    /// Refused by name when `units` more units of the batch pass the card's free
+    /// device bytes ([`Gpu::alloc_room`]): the load's plan reserves the shared
+    /// buffers and the first unit ([`place::prompt_reserve_bytes`]), and the units
+    /// a prompt group past one adds come out of what the load left free, so a
+    /// group that does not fit is refused here, not by the driver.
+    fn refuse_unreserved(&self, gpu: &Gpu, units: usize) -> Result<(), GpuError> {
+        let need = units as u64 * place::prompt_unit_bytes(&self.prompt.hp, cap_of(self.ctx));
         if need == 0 {
             return Ok(());
         }
-        let free = gpu.alloc_room()?;
+        let free = gpu.alloc_room()? as u64;
         if need <= free {
             return Ok(());
         }
         Err(shape(format!(
-            "a prompt batch of {cap} positions, a group of {} batches: {need} B of buffers, and \
-             the card has {free} B free; the plan reserves none for the prompt batch",
+            "a prompt group of {} batches: {units} more units of the batch need {need} B, and the \
+             card has {free} B free; the plan reserves the batch's shared buffers and its first \
+             unit",
             self.prompt.group
         )))
     }
@@ -567,7 +586,9 @@ impl Body {
     /// group of the body's size holds ([`group_sets`]) — the host tier's
     /// batch sets for as many tokens and the host union's slabs, made once.
     /// Refused by name for a group of 2 or more on a load with a dense layer
-    /// past a routed one, and for buffers past the card's free bytes.
+    /// past a routed one, for the shared buffers and the first unit past the
+    /// plan's reserve, and for the units past the first beyond the card's free
+    /// bytes.
     fn make_batch(&mut self, gpu: &Gpu) -> Result<(), GpuError> {
         if self.prompt.batch.is_some() {
             return Ok(());
@@ -578,25 +599,39 @@ impl Body {
         let n = self.dims.embd;
         let lens = Lens::of(&self.dims, &self.cfg, cap);
         let sets = group_sets(self.prompt.group);
-        let card = self.card.any().then(|| self.card.batch_bytes(cap));
-        let shared = lens.bytes() + size_of::<f32>() * cap * n + card.unwrap_or(0);
-        let planned = shared + sets * UnitBufs::planned(n, cap);
-        self.refuse_unreserved(gpu, sets, shared)?;
+        let has_card = self.card.any() || self.card.any_tier();
+        let (shared, unit) = self.prompt.formula(cap, has_card);
+        let planned = shared + sets as u64 * unit;
+        refuse_reserve_past(
+            WHAT,
+            "prompt batch buffers",
+            self.prompt.reserve,
+            shared + unit,
+            "the walk's shared rows, the host sums, the card experts' batch and the first unit",
+        )?;
+        self.refuse_unreserved(gpu, sets - 1)?;
         let bufs = Bufs::new(gpu, &lens, cap)?;
         let units = (0..sets)
             .map(|_| UnitBufs::new(gpu, n, cap))
             .collect::<Result<Vec<_>, _>>()?;
         let hsum = DeviceBuffer::zeroed(gpu.stream(), cap * n)?;
-        let card = card.map(|_| self.card.batch(gpu, cap)).transpose()?;
+        let card = has_card.then(|| self.card.batch(gpu, cap)).transpose()?;
+        let tier = self
+            .card
+            .any_tier()
+            .then(|| TierBatch::new(gpu.stream(), cap, N_USED))
+            .transpose()?;
         let batch = Batch {
             bufs,
             units,
             hsum,
             card,
+            tier,
         };
-        if batch.bytes() != planned {
+        if batch.bytes() as u64 != planned {
             return Err(shape(format!(
-                "the prompt batch takes {} B; the sizes the refusal counts add to {planned}",
+                "the prompt batch takes {} B; the plan's formula (place::prompt_shared_bytes) \
+                 counts {planned}",
                 batch.bytes()
             )));
         }
@@ -617,7 +652,7 @@ impl Body {
             .batch
             .as_deref()
             .map_or(0, |b| need.saturating_sub(b.units.len()));
-        self.refuse_unreserved(gpu, more, 0)?;
+        self.refuse_unreserved(gpu, more)?;
         let n = self.dims.embd;
         if let Some(b) = self.prompt.batch.as_deref_mut()
             && more > 0
@@ -667,6 +702,7 @@ impl Body {
                 stores,
                 ropes,
                 routed,
+                tier,
                 embd,
                 prompt,
                 ctx,
@@ -678,6 +714,7 @@ impl Body {
                 units,
                 hsum,
                 card: card_batch,
+                tier: tier_batch,
             } = prompt.batch.as_deref_mut().ok_or(GpuError::State {
                 what: WHAT,
                 missing: "the batch's buffers (set_prefill)",
@@ -733,6 +770,8 @@ impl Body {
                 routed,
                 card,
                 card_batch: card_batch.as_mut(),
+                tier: tier.as_ref(),
+                tier_batch: tier_batch.as_mut(),
                 ctx: *ctx,
                 b: bufs,
                 u: &mut units[..g],
@@ -777,6 +816,10 @@ struct PromptProgram<'a> {
     /// load with card experts.
     card: &'a CardExperts,
     card_batch: Option<&'a mut CardBatch>,
+    /// The stage card's side of the expert tier card and the batch's tier
+    /// places and join copies, on a load that hangs one.
+    tier: Option<&'a TierParts>,
+    tier_batch: Option<&'a mut TierBatch>,
     ctx: usize,
     b: &'a mut Bufs,
     u: &'a mut [UnitBufs],
@@ -936,7 +979,8 @@ impl PromptProgram<'_> {
     /// Layer `l`'s routed block up to its host leg for `at`'s unit
     /// (`ffn::front`'s launches over the batch's rows): the norm into
     /// `normed`, the router over every row (the scores, then each row's
-    /// picks), and the download of the rows, weights and ids to the host.
+    /// picks), and the download of the rows, weights and ids to the host,
+    /// with each slot's tier place on a tier layer.
     fn route(&mut self, port: &mut BatchLeg<'_, HostRun>, at: At) -> Result<(), GpuError> {
         let l = at.layer;
         let (gpu, w, t) = (self.gpu, self.w, self.t[at.unit]);
@@ -949,6 +993,16 @@ impl PromptProgram<'_> {
         self.routed
             .route_rows((gpu, w), (l, t), &ub.x1, (&mut b.normed, rows))?;
         let key = port.key(at);
+        if self.card.tier_k(l) > 0 {
+            let (tier, tb) = tier_parts(self.tier, self.tier_batch.as_deref_mut())?;
+            return tier.enqueue_download_rows(
+                gpu,
+                (self.routed, port.hybrid()),
+                (key, t),
+                (&b.normed, &b.weights, &b.ids),
+                tb,
+            );
+        }
         port.hybrid()
             .enqueue_download(gpu.stream(), [&b.normed, &b.weights], &b.ids, key)
     }
@@ -968,6 +1022,18 @@ impl PromptProgram<'_> {
             .copy_from_device_async(&row, self.gpu.stream())?;
         head.enqueue(self.gpu, self.w)
     }
+}
+
+/// The tier's parts and the batch's tier buffers a tier layer reads; refused
+/// by name on a batch made without them.
+fn tier_parts<'t>(
+    tier: Option<&'t TierParts>,
+    tb: Option<&'t mut TierBatch>,
+) -> Result<(&'t TierParts, &'t mut TierBatch), GpuError> {
+    tier.zip(tb).ok_or(GpuError::State {
+        what: WHAT,
+        missing: "the tier side and the batch's tier places of a load with a tier",
+    })
 }
 
 /// `l`'s names as the other kind's, by name.
@@ -997,7 +1063,8 @@ impl<'a> LayerProgram for PromptProgram<'a> {
     }
 
     /// A routed layer's card experts, where the slot map puts any, under its
-    /// host leg.
+    /// host leg; on a tier layer, then the copies of the unit's weights and
+    /// tier places its join reads.
     fn shadow(&mut self, _port: &mut BatchLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
         let (l, u) = (at.layer, at.unit);
         let (gpu, w, t) = (self.gpu, self.w, self.t[u]);
@@ -1011,19 +1078,36 @@ impl<'a> LayerProgram for PromptProgram<'a> {
             (l, t),
             (&ub.x1, rule),
             (&b.normed, &b.weights, &b.ids),
-        )
+        )?;
+        if self.card.tier_k(l) == 0 {
+            return Ok(());
+        }
+        let (_, tb) = tier_parts(self.tier, self.tier_batch.as_deref_mut())?;
+        tb.keep(gpu.stream(), t * N_USED, &b.weights)
     }
 
     /// A routed layer's host sums (the walk's serve uploaded them) plus the
     /// shadow's card sum and the residual after the attention (`x1` alone on
-    /// a layer with no card experts), into the unit's `x`.
+    /// a layer with no card experts), into the unit's `x`. A tier layer joins
+    /// first (module doc), and the port uploads the host's sums after it.
     fn back(&mut self, port: &mut BatchLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
         if !self.cfg[at.layer].kind.host_leg() {
             return Ok(());
         }
-        let t = self.t[at.unit];
+        let (gpu, l, t) = (self.gpu, at.layer, self.t[at.unit]);
         let ub = &mut self.u[at.unit];
-        let shadowed = if self.card.has(at.layer) {
+        if self.card.tier_k(l) > 0 {
+            let (tier, tb) = tier_parts(self.tier, self.tier_batch.as_deref_mut())?;
+            let cb = self.card_batch.as_deref_mut().ok_or(GpuError::State {
+                what: WHAT,
+                missing: "the card experts' batch buffers",
+            })?;
+            let (card, x1) = (self.card, &ub.x1);
+            port.join_tiered(at, |_, trows| {
+                tier.enqueue_join_rows(gpu, (card, l, t), (cb, tb), (trows, x1))
+            })?;
+        }
+        let shadowed = if self.card.sums(l) {
             self.card_batch
                 .as_deref()
                 .ok_or(GpuError::State {

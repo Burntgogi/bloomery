@@ -6,14 +6,15 @@
 //! and the tensor scales it reads.
 //!
 //! A GGUF file holds its tensors in their card types: a part is runs of its rows' bytes
-//! ([`part_of`]), and a scaled tensor's scales are the `.scale` beside it, one an expert along a
-//! cut of a stack's experts.
+//! ([`part_at`]), and a scaled tensor's scales are the `.scale` beside it, one an expert along a
+//! cut of a stack's experts or of the experts a list names ([`scales_at`]).
 
 use std::ops::Range;
 use std::path::PathBuf;
 
 use gguf::{GgmlType, Split, TensorInfo};
 
+use crate::placement::ExpertList;
 use crate::placement::tp::{TpError, part_of};
 
 /// Why a part was refused.
@@ -35,8 +36,15 @@ pub fn refuse(name: &str, what: impl Into<String>) -> Error {
     }
 }
 
-/// The indices of a tensor a part holds: a dim and the range along it; `None` the whole tensor.
-pub type At = Option<(usize, Range<u64>)>;
+/// The indices of a tensor a part holds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum At {
+    /// The indices `.1` along dim `.0`.
+    Along(usize, Range<u64>),
+    /// The experts the list names of a stack (`[k, rows, n_expert]`), in the list's order: a
+    /// card's slots, expert `ids()[s]` in slot `s`.
+    Experts(ExpertList),
+}
 
 /// What a load reads of a tensor.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -45,29 +53,151 @@ pub enum Take {
     Whole,
     /// The indices `.1` along dim `.0`.
     Part(usize, Range<u64>),
+    /// The experts of a stack the list names, in its order ([`At::Experts`]).
+    Experts(ExpertList),
 }
 
-/// What `rule` takes of tensor `t`: `None` skipped, else the indices it reads; a refusal of
-/// `rule` names the tensor.
+/// What `rule` takes of tensor `t`: `None` skipped, else the indices it reads (`None` the whole
+/// tensor); a refusal of `rule` names the tensor.
 pub fn take<E: std::fmt::Display>(
     rule: &impl Fn(&str, GgmlType, &[u64]) -> Result<Take, E>,
     t: &TensorInfo,
-) -> Result<Option<At>, Error> {
+) -> Result<Option<Option<At>>, Error> {
     Ok(
         match rule(&t.name, t.ty, &t.dims).map_err(|e| refuse(&t.name, e.to_string()))? {
             Take::Skip => None,
             Take::Whole => Some(None),
-            Take::Part(dim, at) => Some(Some((dim, at))),
+            Take::Part(dim, at) => Some(Some(At::Along(dim, at))),
+            Take::Experts(list) => Some(Some(At::Experts(list))),
         },
     )
 }
 
-/// One part a load reads ([`Source::plan`]): the indices it holds and its header entry (name,
-/// card type, dims and bytes).
+/// The part of the tensor `t` (a header entry of its whole bytes) at `at`, the whole tensor for
+/// `None`: the part's header entry and the byte ranges of its rows in the tensor's bytes, in the
+/// part's order. Indices along a dim are [`part_of`]'s; a stack's listed experts are each
+/// expert's run, in the list's order. A list of no expert, a list of a tensor that is not a stack
+/// of experts and an expert past the stack's are refused by name, besides [`part_of`]'s
+/// refusals.
+pub fn part_at(t: &TensorInfo, at: Option<&At>) -> Result<(TensorInfo, Vec<Range<usize>>), Error> {
+    let list = match at {
+        None => return Ok(part_of(t, None)?),
+        Some(At::Along(dim, r)) => return Ok(part_of(t, Some((*dim, r.clone())))?),
+        Some(At::Experts(list)) => list,
+    };
+    let &[_, _, n] = t.dims.as_slice() else {
+        return Err(refuse(
+            &t.name,
+            format!(
+                "{:?} is not a stack of experts, which a list of experts is taken of",
+                t.dims
+            ),
+        ));
+    };
+    if list.is_empty() {
+        return Err(refuse(&t.name, "a list of no expert takes nothing"));
+    }
+    let (mut runs, mut nbytes) = (Vec::with_capacity(list.ids().len()), 0u64);
+    for &e in list.ids() {
+        let e = u64::from(e);
+        if e >= n {
+            return Err(refuse(
+                &t.name,
+                format!("expert {e} is past the stack's {n}"),
+            ));
+        }
+        let (one, run) = part_of(t, Some((2, e..e + 1)))?;
+        nbytes += one.nbytes;
+        runs.extend(run);
+    }
+    let mut dims = t.dims.clone();
+    dims[2] = list.len();
+    Ok((
+        TensorInfo {
+            name: t.name.clone(),
+            dims,
+            ty: t.ty,
+            offset: t.offset,
+            nbytes,
+        },
+        runs,
+    ))
+}
+
+/// The tensor scales of the part at `at` of tensor `name` of `dims`, of the tensor's scales `all`
+/// (one, or one an expert of a stack): a stack's experts' own in the part's order, along its
+/// experts or by a list; `all` for any other part. An expert past `all` is refused by name.
+pub fn scales_at(
+    name: &str,
+    dims: &[u64],
+    all: Vec<f32>,
+    at: Option<&At>,
+) -> Result<Vec<f32>, Error> {
+    let pick = |e: u64| {
+        usize::try_from(e)
+            .ok()
+            .and_then(|e| all.get(e).copied())
+            .ok_or_else(|| {
+                refuse(
+                    name,
+                    format!("expert {e} is past its {} tensor scales", all.len()),
+                )
+            })
+    };
+    match at {
+        Some(At::Along(2, r)) if dims.len() == 3 => r.clone().map(pick).collect(),
+        Some(At::Experts(list)) => list.ids().iter().map(|&e| pick(u64::from(e))).collect(),
+        _ => Ok(all),
+    }
+}
+
+/// One part a load reads ([`Source::plan`]): the indices it holds (`None` the whole tensor) and
+/// its header entry (name, card type, dims and bytes).
 #[derive(Clone, Debug)]
 pub struct Planned {
-    pub at: At,
+    pub at: Option<At>,
     pub info: TensorInfo,
+}
+
+/// One read's leading parts, bounded by normalized payload and owned host room. An oversized
+/// first part runs alone; the caller checks its returned peak before allocating it.
+/// `costs` holds each part's owned read peak and serial packing peak. Reads coexist;
+/// packing holds only one part's buffers at a time.
+pub fn read_ahead(
+    planned: &[Planned],
+    costs: &[(u64, u64)],
+    room: u64,
+) -> Result<(usize, u64), Error> {
+    const PAYLOAD: u64 = 8 << 30;
+    if planned.len() != costs.len() {
+        return Err(refuse(
+            "read-ahead",
+            "the parts and their costs differ in length",
+        ));
+    }
+    let (mut n, mut bytes, mut payload) = (0, 0u64, 0u64);
+    let (mut reads, mut packing) = (0u64, 0u64);
+    for (p, &(read, pack)) in planned.iter().zip(costs) {
+        let next_reads = reads
+            .checked_add(read)
+            .ok_or_else(|| refuse(&p.info.name, "read-ahead bytes pass u64"))?;
+        let next_packing = packing.max(pack);
+        let next = next_reads
+            .checked_add(next_packing)
+            .ok_or_else(|| refuse(&p.info.name, "read-ahead bytes pass u64"))?;
+        let more = payload
+            .checked_add(p.info.nbytes)
+            .ok_or_else(|| refuse(&p.info.name, "read-ahead payload passes u64"))?;
+        if n > 0 && (more > PAYLOAD || next > room) {
+            break;
+        }
+        (reads, packing, bytes, payload) = (next_reads, next_packing, next, more);
+        n += 1;
+        if payload > PAYLOAD || bytes > room {
+            break;
+        }
+    }
+    Ok((n, bytes))
 }
 
 /// A part's bytes in its card type ([`Source::read`]), with its header entry and the tensor
@@ -137,6 +267,11 @@ pub trait Source {
         rule: impl Fn(&str, GgmlType, &[u64]) -> Result<Take, E>,
     ) -> Result<Vec<Planned>, Self::Error>;
 
+    /// An upper bound on the owned payload bytes a read of `p` holds, including its result,
+    /// normalization scratch, stored inputs and a contiguous copy for a packed upload.
+    /// Borrowed file pages are not owned bytes.
+    fn read_bytes(&self, p: &Planned) -> Result<u64, Self::Error>;
+
     /// The bytes of the part `p` planned ([`Source::plan`]) and the tensor scales its type reads;
     /// a tensor no longer in the source is refused by name.
     fn read(&self, p: &Planned) -> Result<Part<'_>, Self::Error>;
@@ -172,6 +307,10 @@ impl<S: Source, F: Fn(&str) -> bool> Source for Filtered<'_, S, F> {
         })
     }
 
+    fn read_bytes(&self, p: &Planned) -> Result<u64, Self::Error> {
+        self.source.read_bytes(p)
+    }
+
     fn read(&self, p: &Planned) -> Result<Part<'_>, Self::Error> {
         self.source.read(p)
     }
@@ -195,11 +334,34 @@ impl Source for Split {
                 continue;
             }
             if let Some(at) = take(&rule, t)? {
-                let (info, _) = part_of(t, at.clone())?;
+                let (info, _) = part_at(t, at.as_ref())?;
                 out.push(Planned { at, info });
             }
         }
         Ok(out)
+    }
+
+    fn read_bytes(&self, p: &Planned) -> Result<u64, Error> {
+        let name = &p.info.name;
+        let (_, t) = self
+            .find(name)
+            .ok_or_else(|| refuse(name, "is not in the file"))?;
+        // A noncontiguous rank cut needs a contiguous copy when its upload packs planes.
+        // tensor_scales may also hold the whole scale vector beside a rank's cut of it.
+        let scales = if t.ty.reads_scale() {
+            t.dims
+                .last()
+                .copied()
+                .unwrap_or(1)
+                .checked_mul(8)
+                .ok_or_else(|| refuse(name, "scale read bytes pass u64"))?
+        } else {
+            0
+        };
+        p.info
+            .nbytes
+            .checked_add(scales)
+            .ok_or_else(|| refuse(name, "row copy and scale read bytes pass u64"))
     }
 
     /// A scale the file lacks or does not hold as its type reads it is refused by name.
@@ -212,15 +374,14 @@ impl Source for Split {
             .shard(shard)
             .ok_or_else(|| refuse(name, format!("names shard {shard}")))?
             .data(t)?;
-        let (info, runs) = part_of(t, p.at.clone())?;
+        let (info, runs) = part_at(t, p.at.as_ref())?;
         let find = |n: &str| {
             let (s, t) = self.find(n)?;
             Some((self.shard(s)?, t))
         };
-        let scale = gguf::tensor_scales(t, find)?.map(|s| match &p.at {
-            Some((2, r)) if t.dims.len() == 3 => s[r.start as usize..r.end as usize].to_vec(),
-            _ => s,
-        });
+        let scale = gguf::tensor_scales(t, find)?
+            .map(|s| scales_at(name, &t.dims, s, p.at.as_ref()))
+            .transpose()?;
         Ok(Part {
             info,
             bytes: Bytes::File(runs.into_iter().map(|r| &data[r]).collect()),
@@ -233,6 +394,57 @@ impl Source for Split {
 mod tests {
     use super::*;
     use gguf::write::{Layout, TensorDecl};
+
+    #[test]
+    fn a_read_takes_the_parts_that_fit_and_at_least_one() {
+        let part = |nbytes| Planned {
+            at: None,
+            info: TensorInfo {
+                name: "p".into(),
+                dims: vec![1],
+                ty: GgmlType::F32,
+                offset: 0,
+                nbytes,
+            },
+        };
+        let gib = 1u64 << 30;
+        let parts = [part(3 * gib), part(5 * gib), part(4)];
+        assert_eq!(
+            read_ahead(&parts, &[(6 * gib, 0), (10 * gib, 0), (8, 0)], 16 * gib).unwrap(),
+            (2, 16 * gib)
+        );
+        assert_eq!(
+            read_ahead(&parts, &[(6 * gib, 0), (10 * gib, 0), (8, 0)], 16 * gib - 1).unwrap(),
+            (1, 6 * gib)
+        );
+        assert_eq!(
+            read_ahead(&[part(9 * gib), part(4)], &[(9 * gib, 0), (4, 0)], 20 * gib).unwrap(),
+            (1, 9 * gib)
+        );
+        assert_eq!(
+            read_ahead(&[part(gib)], &[(gib, gib)], gib).unwrap(),
+            (1, 2 * gib)
+        );
+        assert_eq!(read_ahead(&[], &[], 0).unwrap(), (0, 0));
+        let small = vec![part(32 << 20); 256];
+        let costs = vec![(128 << 20, 64 << 20); 256];
+        assert_eq!(
+            read_ahead(&small, &costs, (1024 - 96) << 20).unwrap(),
+            (6, 832 << 20)
+        );
+        assert_eq!(
+            read_ahead(&small, &costs, 48 * gib).unwrap(),
+            (256, 32 * gib + (64 << 20))
+        );
+        assert!(read_ahead(&parts, &[], gib).is_err());
+        let small = [part(4), part(4), part(4)];
+        let costs = [(1, 2), (1, 8), (1, 4)];
+        assert_eq!(read_ahead(&small, &costs, 10).unwrap(), (2, 10));
+        assert_eq!(read_ahead(&small, &costs, 9).unwrap(), (1, 3));
+        assert!(read_ahead(&small[..2], &[(1, 0), (u64::MAX, 0)], u64::MAX).is_err());
+        assert!(read_ahead(&small[..1], &[(1, u64::MAX)], u64::MAX).is_err());
+        assert!(read_ahead(&[part(4), part(u64::MAX)], &[(1, 0), (1, 0)], u64::MAX).is_err());
+    }
 
     #[test]
     fn shared_parts_are_planned_only_for_the_selected_component() {
@@ -259,6 +471,8 @@ mod tests {
             let parts = selected
                 .plan(|_, _, _| Ok::<_, std::convert::Infallible>(Take::Whole))
                 .unwrap();
+            assert_eq!(source.read_bytes(&parts[0]).unwrap(), 4);
+            assert_eq!(selected.read_bytes(&parts[0]).unwrap(), 4);
             assert_eq!(
                 parts
                     .iter()

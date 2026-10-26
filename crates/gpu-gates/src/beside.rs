@@ -8,7 +8,7 @@
 
 use std::fmt::Display;
 
-use model::placement::{Card, Machine};
+use model::placement::{Card, Device, Machine, Reserve};
 
 /// What the plan's reserve for the image encoder's tower is called, as the plan's terms name it
 /// (beside `workstation`'s draft and tier-batch reserves).
@@ -36,11 +36,18 @@ impl Beside {
     }
 }
 
-/// `machine` with `beside`'s reserves on its stage card. The one place they enter a machine: a
-/// placed plan's builder and a whole-fit probe both call it, so both fit the same bytes.
+/// `machine` with `beside`'s reserves on its stage card ([`Machine::reserve`]). The one place
+/// they enter a machine: a placed plan's builder and a whole-fit probe both call it, so both fit
+/// the same bytes.
 pub fn reserve_on(machine: &mut Machine, beside: Beside) {
     for (name, bytes) in beside.named() {
-        machine.cards[0].reserves.push((name.to_owned(), bytes));
+        machine
+            .reserve(Reserve {
+                on: Device::Card(0),
+                name,
+                bytes,
+            })
+            .expect("a machine has a stage card");
     }
 }
 

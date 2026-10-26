@@ -16,8 +16,12 @@ pub use super::devices::{
 };
 #[cfg(test)]
 use super::nodes::{Fabric, Nodes};
-use super::{Card, Host, HostTotals, Machine, Node, PlacementError, Plan, UnifiedPool};
-use crate::kernels::{DownForms, leg_bytes, q8_act_bytes, try_leg_bytes, try_q8_act_bytes};
+use super::{
+    Card, Device, Host, HostTotals, Machine, Node, PlacementError, Plan, Reserve, UnifiedPool,
+};
+use crate::kernels::{
+    DownAct, DownForms, leg_bytes, q8_act_bytes, try_leg_bytes, try_q8_act_bytes,
+};
 
 pub const MIB: u64 = 1 << 20;
 
@@ -47,9 +51,23 @@ pub struct CardSpec {
     /// its free reading is the host's room, and a machine of it plans
     /// against one pool ([`unified_of`]). False for a card by name.
     pub integrated: bool,
+    /// The bytes the card keeps free past its context and scratch
+    /// (`BLOOMERY_CARD_MARGIN`, [`super::card_budget::keep_free`]); `None`
+    /// keeps [`MARGIN`]. A plan's [`Card::margin_bytes`] takes it from
+    /// [`CardSpec::margin`].
+    pub margin_bytes: Option<u64>,
 }
 
 impl CardSpec {
+    /// The bytes the card keeps free: its own, or [`MARGIN`].
+    #[must_use]
+    pub const fn margin(&self) -> u64 {
+        match self.margin_bytes {
+            Some(m) => m,
+            None => MARGIN,
+        }
+    }
+
     /// What the driver leaves for us.
     #[must_use]
     pub const fn usable_bytes(&self) -> u64 {
@@ -76,6 +94,7 @@ pub const A6000: CardSpec = CardSpec {
     free_bytes: None,
     held_by: None,
     integrated: false,
+    margin_bytes: None,
 };
 
 /// The RTX 3090 [measured, `nvidia-smi`].
@@ -87,6 +106,7 @@ pub const RTX_3090: CardSpec = CardSpec {
     free_bytes: None,
     held_by: None,
     integrated: false,
+    margin_bytes: None,
 };
 
 /// Every card a plan names by name, the most usable bytes first: the names
@@ -169,11 +189,12 @@ fn card(spec: CardSpec, layers: Range<usize>, head: bool) -> Card {
         usable_bytes: spec.usable_bytes(),
         context_bytes: CONTEXT,
         scratch_bytes: SCRATCH,
-        margin_bytes: MARGIN,
+        margin_bytes: spec.margin(),
         granule_bytes: GRANULE,
         layers,
         head,
         token_embedding: false,
+        reserve_only: false,
         reserves: Vec::new(),
         free_bytes: spec.free_bytes,
         held_by: spec.held_by,
@@ -181,12 +202,11 @@ fn card(spec: CardSpec, layers: Range<usize>, head: bool) -> Card {
 }
 
 /// `spec` as an expert tier card with no stage or head: the context,
-/// scratch, margin, batch service and optional draft resident bytes.
+/// scratch, margin and batch service. A reserve beside them enters through
+/// [`Machine::reserve`].
 #[must_use]
-pub fn tier_card(spec: CardSpec, draft_bytes: Option<u64>, batch: TierBatchBytes) -> Card {
+pub fn tier_card(spec: CardSpec, batch: TierBatchBytes) -> Card {
     let mut tier = card(spec, 0..0, false);
-    tier.reserves
-        .extend(draft_bytes.map(|bytes| (DRAFT_RESERVE.to_string(), bytes)));
     tier.reserves.push((
         TIER_BATCH_RESERVE.to_string(),
         batch
@@ -195,6 +215,17 @@ pub fn tier_card(spec: CardSpec, draft_bytes: Option<u64>, batch: TierBatchBytes
     ));
     tier.tier_leg = batch.leg;
     tier
+}
+
+/// `spec` as a reserve-only member of a plan ([`Card::reserve_only`]): a card
+/// with no stage, no head and no expert, only what is reserved on it
+/// ([`Machine::reserve`]). It serves no tier, so it carries no batch service.
+#[must_use]
+pub fn holder_card(spec: CardSpec) -> Card {
+    Card {
+        reserve_only: true,
+        ..card(spec, 0..0, false)
+    }
 }
 
 /// The host tier with its reserves: the OS's alone. What a plan's own
@@ -295,22 +326,17 @@ pub fn plan_a(layers: usize) -> Machine {
 
 /// Plan (a) asked for the DSpark draft's resident bytes.
 ///
-/// The plan is one stage card and no tier ([`plan_a`]). A draft asked here
-/// is [`plan_tiers`] of that card over no tier, so [`check_tiers`] either
-/// names [`DRAFT_RESERVE`] or returns [`PlacementError::DraftOffPlan`],
-/// before any device alloc. `None` is [`plan_a`].
+/// The plan is one stage card and no tier ([`plan_a`]); the draft sits on the
+/// stage card, so its bytes leave the card's budget as [`DRAFT_RESERVE`]
+/// before any expert. It is [`plan_tiers`] of that card over no tier. `None`
+/// is [`plan_a`].
 pub fn plan_a_draft(layers: usize, draft_bytes: Option<u64>) -> Result<Machine, PlacementError> {
     plan_tiers(
         layers,
         A6000,
         &[],
-        draft_bytes.map(|bytes| TierDraft { on: 0, bytes }),
-        TierBatchBytes {
-            staging: 0,
-            scratch: 0,
-            host: 0,
-            leg: None,
-        },
+        draft_bytes.map(|bytes| draft_reserve(Device::Card(0), bytes)),
+        NO_TIER_BATCH,
     )
 }
 
@@ -333,6 +359,26 @@ pub fn plan_b(layers: usize) -> Machine {
 
 /// What the DSpark draft's reserve on a card is called.
 pub const DRAFT_RESERVE: &str = "DSpark draft";
+
+/// The DSpark draft's resident bytes as a reserve on `on`, a card of the
+/// plan's whole device list ([`Machine::all_cards`], the stage first).
+#[must_use]
+pub const fn draft_reserve(on: Device, bytes: u64) -> Reserve {
+    Reserve {
+        on,
+        name: DRAFT_RESERVE,
+        bytes,
+    }
+}
+
+/// The prompt-batch bytes of a plan with no tier card: none is held, so the
+/// plan reserves none.
+pub const NO_TIER_BATCH: TierBatchBytes = TierBatchBytes {
+    staging: 0,
+    scratch: 0,
+    host: 0,
+    leg: None,
+};
 
 /// What the expert tier's prompt-batch service is called as a reserve: on
 /// the tier card, its staging and its tile scratch; on the host, the rows it
@@ -480,17 +526,16 @@ pub const fn walk_a_tile_scratch_bytes(n_embd: u64, ff: u64, n_used: u64, cols: 
 /// The tier's chunk scratch for blocks of rows of `n_embd`, `n_used` slots a
 /// token, through experts of `ff`, cut in chunks of `chunk` tokens: one run of
 /// the card leg's buffers (`bloomery_gpu::card_leg::LegBufs`) with its slots'
-/// columns in exactly the forms the selected downs read ([`leg_bytes`]),
-/// in place of the tile path's scratch.
+/// columns in the 128-value form ([`leg_bytes`]), in place of the tile path's
+/// scratch. Selected-form callers use [`tier_leg_batch_bytes_of`].
 #[must_use]
 pub const fn tier_chunk_scratch_bytes(
     n_embd: u64,
     ff: u64,
     n_used: u64,
     chunk: u64,
-    downs: DownForms,
 ) -> u64 {
-    leg_bytes(chunk, n_used, n_embd, ff, downs)
+    leg_bytes(chunk, n_used, n_embd, ff, DownForms::of(DownAct::Q8Act))
 }
 
 /// The host's part of the tier's prompt-batch service: per exchange set, the
@@ -513,16 +558,47 @@ pub const fn tier_batch_bytes(n_embd: u64, ff: u64, n_used: u64, cols: u64) -> T
     }
 }
 
-/// [`tier_batch_bytes`] for a tier on the common card leg (`bloomery_gpu::host::leg_tier`): the
-/// scratch is one run of the leg's buffers for `chunk` tokens ([`tier_chunk_scratch_bytes`]), in
-/// place of the tile path's. The one formula of those bytes for every family whose tier is the card
-/// leg; a family names its own `chunk` and widths.
+/// [`tier_batch_bytes`] for a fixed common-leg reserve in the 128-value form.
+#[must_use]
 pub fn tier_leg_batch_bytes(
     n_embd: u64,
     ff: u64,
     n_used: u64,
     chunk: u64,
     cols: u64,
+) -> TierBatchBytes {
+    TierBatchBytes {
+        staging: tier_batch_staging_bytes(n_embd, n_used, cols),
+        scratch: tier_chunk_scratch_bytes(n_embd, ff, n_used, chunk),
+        host: tier_batch_host_bytes(n_embd, n_used, cols),
+        leg: None,
+    }
+}
+
+/// The common leg's buffers in `downs`, with the same checked geometry and
+/// candidate-dependent reserve as [`try_tier_leg_batch_bytes_of`].
+///
+/// # Panics
+/// Panics on invalid geometry or overflowing byte counts.
+#[must_use]
+pub fn tier_leg_batch_bytes_of(
+    n_embd: u64,
+    ff: u64,
+    n_used: u64,
+    shape: (u64, u64),
+    downs: DownForms,
+) -> TierBatchBytes {
+    try_tier_leg_batch_bytes_of(n_embd, ff, n_used, shape, downs)
+        .expect("valid common leg batch geometry and byte counts")
+}
+
+/// The common leg's staging, host rows and selected-form scratch, refusing
+/// invalid geometry or overflowing byte counts before placement.
+pub fn try_tier_leg_batch_bytes_of(
+    n_embd: u64,
+    ff: u64,
+    n_used: u64,
+    (chunk, cols): (u64, u64),
     downs: DownForms,
 ) -> Result<TierBatchBytes, PlacementError> {
     let leg = TierLegScratch {
@@ -565,41 +641,55 @@ pub fn tier_leg_batch_bytes(
 /// the 3090 is an expert tier beside the host, holding each layer's next ids
 /// after the stage's prefix, with `draft_bytes` — the DSpark draft's resident bytes
 /// (`model::arch::dspark::card_bytes`), when the draft lives there — as a
-/// named reserve, and the tier's prompt-batch service `batch`
+/// named reserve on the tier (card 1), and the tier's prompt-batch service `batch`
 /// ([`tier_batch_bytes`]) as named reserves on the tier and the host.
 /// It is [`plan_tiers`] of the A6000 over the one tier card, the 3090.
 #[must_use]
 pub fn plan_bp(layers: usize, draft_bytes: Option<u64>, batch: TierBatchBytes) -> Machine {
-    let draft = draft_bytes.map(|bytes| TierDraft { on: 0, bytes });
-    tiered(layers, A6000, &[RTX_3090], draft, batch, batch.host)
-}
-
-/// A draft model's resident bytes on one of plan (b′)'s tier cards: the
-/// tier's index in the plan's tier list, and the bytes its plan reserves.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TierDraft {
-    pub on: usize,
-    pub bytes: u64,
+    let draft = draft_bytes.map(|bytes| draft_reserve(Device::Card(1), bytes));
+    tiered(layers, A6000, &[RTX_3090], &[], draft, batch, batch.host)
 }
 
 /// Plan (b′) over `tiers`: `stage` runs all `layers` and the head as in
 /// [`plan_on`]; each tier card, in order, is an expert tier beside the host
 /// holding each layer's next ids after the cards before it
 /// ([`super::Machine::tiers`]), with the prompt-batch service `batch`
-/// ([`tier_batch_bytes`]) reserved on it, and `draft` on the tier it names;
-/// the host reserves the batch's rows once per tier. A card listed twice
-/// ([`PlacementError::DeviceTwice`]) and a draft on a tier past the list
-/// ([`PlacementError::DraftOffPlan`]) are refused ([`check_tiers`]). With no
-/// tier it is [`plan_on`].
+/// ([`tier_batch_bytes`]) reserved on it; `draft` is reserved on the card it
+/// names, the stage or a tier, and the host reserves the batch's rows once
+/// per tier. A card listed twice ([`PlacementError::DeviceTwice`]) and a
+/// draft on a card past the device list ([`PlacementError::ReserveOffPlan`])
+/// are refused ([`check_tiers`]). With no tier it is [`plan_on`], with the
+/// draft's reserve on the stage card.
 pub fn plan_tiers(
     layers: usize,
     stage: CardSpec,
     tiers: &[CardSpec],
-    draft: Option<TierDraft>,
+    draft: Option<Reserve>,
     batch: TierBatchBytes,
 ) -> Result<Machine, PlacementError> {
-    let host_rows = check_tiers(stage, tiers, draft, batch)?;
-    Ok(tiered(layers, stage, tiers, draft, batch, host_rows))
+    plan_holding(layers, stage, tiers, &[], draft, batch)
+}
+
+/// [`plan_tiers`] with `holders` joining the plan after the tier cards, each a
+/// reserve-only member ([`holder_card`]): the card has no expert and carries
+/// no batch service, only what is reserved on it. The device list is the
+/// stage, the tiers, then the holders, in this order; a holder with nothing
+/// reserved on it is the idle tier's refusal at the plan
+/// ([`PlacementError::IdleTier`]). A holder is how a draft sits on a card the
+/// plan's experts do not use without leaving the plan: the cards that hold
+/// experts keep every expert they held.
+pub fn plan_holding(
+    layers: usize,
+    stage: CardSpec,
+    tiers: &[CardSpec],
+    holders: &[CardSpec],
+    draft: Option<Reserve>,
+    batch: TierBatchBytes,
+) -> Result<Machine, PlacementError> {
+    let host_rows = check_holding(stage, tiers, holders, draft, batch)?;
+    Ok(tiered(
+        layers, stage, tiers, holders, draft, batch, host_rows,
+    ))
 }
 
 /// The node a machine of `spec` alone plans on: its host and unified pool
@@ -629,13 +719,13 @@ pub fn plan_node_tiers(
     remotes: &[CardSpec],
     batch: TierBatchBytes,
 ) -> Result<Vec<Machine>, PlacementError> {
-    let host_rows = tier_service(remotes.len(), None, batch)?;
-    let mut machines = vec![tiered(layers, stage, &[], None, batch, host_rows)];
+    let host_rows = tier_service(remotes.len(), 0, None, batch)?;
+    let mut machines = vec![tiered(layers, stage, &[], &[], None, batch, host_rows)];
     for &spec in remotes {
         let mut remote = plan_on(spec, layers);
         remote.cards[0]
             .reserves
-            .extend(tier_card(spec, None, batch).reserves);
+            .extend(tier_card(spec, batch).reserves);
         remote.cards[0].tier_leg = batch.leg;
         machines.push(remote);
     }
@@ -644,16 +734,29 @@ pub fn plan_node_tiers(
 
 /// What [`plan_tiers`] refuses of its cards, before any layer count: a card
 /// listed twice — one device ([`CardSpec::same_device`]), whose usable bytes
-/// the plan would count once a listing — and a draft on a tier past the list. Returns the host's
-/// prompt-batch rows, one set a tier.
+/// the plan would count once a listing — and a draft on a card past the
+/// stage and tier list. Returns the host's prompt-batch rows, one set a tier.
 pub fn check_tiers(
     stage: CardSpec,
     tiers: &[CardSpec],
-    draft: Option<TierDraft>,
+    draft: Option<Reserve>,
+    batch: TierBatchBytes,
+) -> Result<u64, PlacementError> {
+    check_holding(stage, tiers, &[], draft, batch)
+}
+
+/// [`check_tiers`] over the stage, the tiers and the `holders` after them
+/// ([`plan_holding`]): the device list a draft's index runs over.
+pub fn check_holding(
+    stage: CardSpec,
+    tiers: &[CardSpec],
+    holders: &[CardSpec],
+    draft: Option<Reserve>,
     batch: TierBatchBytes,
 ) -> Result<u64, PlacementError> {
     let all: Vec<CardSpec> = std::iter::once(stage)
         .chain(tiers.iter().copied())
+        .chain(holders.iter().copied())
         .collect();
     for (i, spec) in all.iter().enumerate() {
         let n = all.iter().filter(|s| s.same_device(spec)).count();
@@ -670,17 +773,27 @@ pub fn check_tiers(
             });
         }
     }
-    tier_service(tiers.len(), draft, batch)
+    tier_service(tiers.len(), holders.len(), draft, batch)
 }
 
-/// The draft's tier and the host's batch-row sum for local or remote tiers.
+/// The draft's card and the host's batch-row sum for local or remote tiers.
 fn tier_service(
     tiers: usize,
-    draft: Option<TierDraft>,
+    holders: usize,
+    draft: Option<Reserve>,
     batch: TierBatchBytes,
 ) -> Result<u64, PlacementError> {
-    if let Some(d) = draft.filter(|d| d.on >= tiers) {
-        return Err(PlacementError::DraftOffPlan { on: d.on, tiers });
+    let cards = 1 + tiers + holders;
+    if let Some(d) = draft.filter(|d| match d.on {
+        Device::Card(i) => i >= cards,
+        Device::Host => false,
+        Device::Nvme | Device::Unused => true,
+    }) {
+        return Err(PlacementError::ReserveOffPlan {
+            reserve: d.name.to_string(),
+            on: d.on,
+            cards,
+        });
     }
     if tiers != 0 {
         batch.card()?;
@@ -694,34 +807,43 @@ fn tier_service(
         })
 }
 
-/// The stage machine, its local expert tiers and the returned batch rows
-/// from all local or remote tiers (`host_rows`).
+/// The stage machine, its local expert tiers, its reserve-only `holders` and
+/// the returned batch rows from all local or remote tiers (`host_rows`), with
+/// the draft's reserve on the card it names (checked by [`tier_service`]).
 fn tiered(
     layers: usize,
     stage: CardSpec,
     tiers: &[CardSpec],
-    draft: Option<TierDraft>,
+    holders: &[CardSpec],
+    draft: Option<Reserve>,
     batch: TierBatchBytes,
     host_rows: u64,
 ) -> Machine {
+    let expert_tiers = tiers.len();
     let tiers: Vec<Card> = tiers
         .iter()
-        .enumerate()
-        .map(|(i, &spec)| tier_card(spec, draft.filter(|d| d.on == i).map(|d| d.bytes), batch))
+        .map(|&spec| tier_card(spec, batch))
+        .chain(holders.iter().map(|&spec| holder_card(spec)))
         .collect();
     let mut h = host_of(&stage);
-    if !tiers.is_empty() || host_rows != 0 {
+    if expert_tiers != 0 || host_rows != 0 {
         h.reserves
             .push((TIER_BATCH_HOST_RESERVE.to_string(), host_rows));
     }
-    Machine {
+    let mut machine = Machine {
         cards: vec![card(stage, 0..layers, true)],
         tiers,
         nodes: vec![Node {
             host: h,
             unified: unified_of(&stage),
         }],
+    };
+    if let Some(d) = draft {
+        machine
+            .reserve(d)
+            .expect("tier_service checked the draft's card against the device list");
     }
+    machine
 }
 
 /// The gate placement: the 3090 runs all `layers` and the head, so the V4.1
@@ -831,9 +953,12 @@ pub fn spec_of(card: &Card) -> Option<CardSpec> {
 pub struct HostNeed {
     pub experts: u64,
     pub tables: u64,
+    /// Pinned ring buffers, including the part loader's upload staging at load time.
     pub shadows: u64,
     pub reserves: u64,
     pub extra: u64,
+    /// Owned part results and their concurrent read/normalization scratch during loading.
+    pub read_ahead: u64,
     /// The plan's NVMe expert tier arena (`HostTotals::nvme_arena_bytes`):
     /// the bytes the tier's slots fill beside these terms, anonymous or
     /// pinned, 0 without one. [`HostNeed::bytes`] counts it;
@@ -858,7 +983,7 @@ impl HostNeed {
         HostNeed::of_totals(
             plan.machine.host(),
             &plan.host,
-            plan.card_budget.is_some() && !plan.budget_from_pool,
+            plan.card_budget.is_set() && !plan.budget_from_pool,
             extra,
         )
     }
@@ -874,6 +999,7 @@ impl HostNeed {
             shadows: totals.shadow_bytes,
             reserves: totals.reserve_bytes,
             extra,
+            read_ahead: 0,
             arena: totals.nvme_arena_bytes,
             cards: totals.pool_card_bytes,
             os: os_reserve(host),
@@ -902,6 +1028,7 @@ impl HostNeed {
             self.shadows,
             self.reserves,
             self.extra,
+            self.read_ahead,
             if arena { self.arena } else { 0 },
             self.cards,
         ]
@@ -1066,6 +1193,9 @@ impl fmt::Display for HostShort {
         if n.extra > 0 {
             write!(f, " + residency churn pool {} B", n.extra)?;
         }
+        if n.read_ahead > 0 {
+            write!(f, " + part read-ahead {} B", n.read_ahead)?;
+        }
         if n.arena > 0 {
             write!(f, " + NVMe tier arena {} B", n.arena)?;
             if let Some(floor) = self.floor {
@@ -1155,7 +1285,7 @@ pub enum NeedTerm {
     /// The row-gathered tables the host holds ([`HostNeed::tables`]): the
     /// same mapping as the experts.
     Tables,
-    /// The cards' ring shadows ([`HostNeed::shadows`]).
+    /// The cards' pinned ring buffers and load-time upload staging ([`HostNeed::shadows`]).
     Shadows,
     /// The expert tier's prompt batch rows and places
     /// ([`TIER_BATCH_HOST_RESERVE`]), allocated with `cuMemAllocHost`.
@@ -1176,6 +1306,8 @@ pub enum NeedTerm {
     /// The residency churn pool ([`HostNeed::extra`]): runs of the host set,
     /// read in and locked with it.
     Extra,
+    /// Owned part results and read/normalization scratch ([`HostNeed::read_ahead`]).
+    PartReads,
     /// The NVMe tier's RAM arena ([`HostNeed::arena`]).
     Arena,
     /// The cards' share of a unified pool ([`HostNeed::cards`]).
@@ -1184,7 +1316,7 @@ pub enum NeedTerm {
 
 impl NeedTerm {
     /// Every term, in the order [`HostNeed::classes`] adds them.
-    pub const ALL: [NeedTerm; 11] = [
+    pub const ALL: [NeedTerm; 12] = [
         NeedTerm::Experts,
         NeedTerm::Tables,
         NeedTerm::Shadows,
@@ -1194,6 +1326,7 @@ impl NeedTerm {
         NeedTerm::RowCache,
         NeedTerm::RunAhead,
         NeedTerm::Extra,
+        NeedTerm::PartReads,
         NeedTerm::Arena,
         NeedTerm::Cards,
     ];
@@ -1214,6 +1347,7 @@ impl NeedTerm {
             | NeedTerm::Checkpoints
             | NeedTerm::PointRows => PageClass::Pinned,
             NeedTerm::RowCache | NeedTerm::RunAhead => PageClass::Cache,
+            NeedTerm::PartReads => PageClass::Anon,
             NeedTerm::Arena => {
                 if how.arena_pinned {
                     PageClass::Pinned
@@ -1346,6 +1480,7 @@ impl HostNeed {
         add(NeedTerm::RowCache, rows);
         add(NeedTerm::RunAhead, window);
         add(NeedTerm::Extra, self.extra);
+        add(NeedTerm::PartReads, self.read_ahead);
         add(NeedTerm::Arena, self.arena);
         add(NeedTerm::Cards, self.cards);
         Ok(classes)
@@ -1581,13 +1716,13 @@ pub fn host_room(
 #[cfg(test)]
 mod tests {
     use super::{
-        A6000, ArenaGrant, CONTEXT, Card, CardSpec, CgroupLevel, DRAFT_RESERVE, DeviceId,
-        DeviceInfo, GRANULE, HOST_DRIFT, Host, HostNeed, HostRead, MARGIN, Machine, Node,
-        PLAN_ROOM, PlacementError, RTX_3090, SCRATCH, TIER_BATCH_HOST_RESERVE, TIER_BATCH_RESERVE,
-        TierBatchBytes, TierDraft, UnifiedPool, card, cgroup_room, cgroup_v2_path,
-        counted_arena_bytes, gb10, host, host_of, host_room, placed_with_arena, plan_a,
-        plan_a_draft, plan_bp, plan_gate, plan_node_tiers, plan_on, plan_room, plan_tiers,
-        spec_of_device, tier_batch_bytes, unified_of,
+        A6000, ArenaGrant, CONTEXT, Card, CardSpec, CgroupLevel, DRAFT_RESERVE, Device, DeviceId,
+        DeviceInfo, GRANULE, HOST_DRIFT, Host, HostNeed, HostRead, MARGIN, Machine, NO_TIER_BATCH,
+        Node, PLAN_ROOM, PlacementError, RTX_3090, SCRATCH, TIER_BATCH_HOST_RESERVE,
+        TIER_BATCH_RESERVE, TierBatchBytes, UnifiedPool, card, cgroup_room, cgroup_v2_path,
+        counted_arena_bytes, draft_reserve, gb10, holder_card, host, host_of, host_room,
+        placed_with_arena, plan_a, plan_a_draft, plan_bp, plan_gate, plan_holding, plan_node_tiers,
+        plan_on, plan_room, plan_tiers, spec_of_device, tier_batch_bytes, unified_of,
     };
 
     /// One plan room: `tools/ref/plan-room.sh --room`, the room
@@ -1631,12 +1766,12 @@ mod tests {
 
     fn base_bp(layers: usize, draft_bytes: Option<u64>, batch: TierBatchBytes) -> Machine {
         let mut t = card(RTX_3090, 0..0, false);
-        t.reserves
-            .extend(draft_bytes.map(|b| (DRAFT_RESERVE.to_string(), b)));
         t.reserves.push((
             TIER_BATCH_RESERVE.to_string(),
             batch.card().expect("card reserve"),
         ));
+        t.reserves
+            .extend(draft_bytes.map(|b| (DRAFT_RESERVE.to_string(), b)));
         let mut h = host();
         h.reserves
             .push((TIER_BATCH_HOST_RESERVE.to_string(), batch.host));
@@ -1679,7 +1814,7 @@ mod tests {
                 for draft in [None, Some(1), Some(1_843_200_000), Some(u64::MAX)] {
                     let base = base_bp(layers, draft, batch);
                     assert_eq!(plan_bp(layers, draft, batch), base, "{layers} {draft:?}");
-                    let on = draft.map(|bytes| TierDraft { on: 0, bytes });
+                    let on = draft.map(|bytes| draft_reserve(Device::Card(1), bytes));
                     let tiers = plan_tiers(layers, A6000, &[RTX_3090], on, batch)
                         .unwrap_or_else(|e| panic!("{layers} {draft:?}: {e}"));
                     assert_eq!(tiers, base, "{layers} {draft:?}");
@@ -1688,32 +1823,95 @@ mod tests {
         }
     }
 
-    /// A one-card plan asked for the DSpark draft either names
-    /// [`DRAFT_RESERVE`] on the stage card or refuses
-    /// [`PlacementError::DraftOffPlan`] before any device alloc.
+    /// A one-card plan asked for the DSpark draft names [`DRAFT_RESERVE`] on
+    /// its stage card and nowhere else: the plan is [`plan_a`] with that one
+    /// reserve, and no other field moves.
     #[test]
     fn place_a_names_the_draft_or_refuses() {
         let bytes = 7;
         assert_eq!(plan_a_draft(43, None).expect("no draft"), plan_a(43));
-        match plan_a_draft(43, Some(bytes)) {
-            Ok(m) => {
-                let on_stage = m.cards.iter().any(|c| {
-                    c.reserves
-                        .iter()
-                        .any(|(n, b)| n == DRAFT_RESERVE && *b == bytes)
-                });
-                assert!(
-                    on_stage,
-                    "an Ok plan names {DRAFT_RESERVE} on the stage card"
-                );
-            }
-            Err(e @ PlacementError::DraftOffPlan { on: 0, tiers: 0 }) => assert_eq!(
-                e.to_string(),
-                "the draft's reserve is on tier 0, and the plan has 0 tier cards: the draft's \
-                 card is outside the plan"
-            ),
-            other => panic!("{other:?}, not a named reserve or DraftOffPlan"),
+        let m = match plan_a_draft(43, Some(bytes)) {
+            Ok(m) => m,
+            other => panic!("{other:?}, not a plan with the draft on its stage card"),
+        };
+        assert_eq!(m.cards[0].reserves, [(DRAFT_RESERVE.to_string(), bytes)]);
+        let mut want = plan_a(43);
+        want.cards[0].reserves = m.cards[0].reserves.clone();
+        assert_eq!(m, want, "the draft's reserve is the only difference");
+    }
+
+    /// The draft's card is its place in the whole device list, the stage
+    /// first: on the stage it leaves the tier cards' reserves as they were,
+    /// on a tier it leaves the stage's, and the batch reserve stays on every
+    /// tier either way.
+    #[test]
+    fn the_draft_is_reserved_on_the_card_its_index_names() {
+        let batch = tier_batch_bytes(5120, 2304, 6, 512);
+        let at = |on: usize| {
+            let reserve = Some(draft_reserve(Device::Card(on), 7));
+            plan_tiers(43, A6000, &[RTX_3090], reserve, batch).expect("a card of the list")
+        };
+        let named = [(DRAFT_RESERVE.to_string(), 7)];
+        let tier_batch = [(
+            TIER_BATCH_RESERVE.to_string(),
+            batch.card().expect("card reserve"),
+        )];
+        let on_stage = at(0);
+        assert_eq!(on_stage.cards[0].reserves, named);
+        assert_eq!(on_stage.tiers[0].reserves, tier_batch);
+        let on_tier = at(1);
+        assert!(on_tier.cards[0].reserves.is_empty());
+        assert_eq!(on_tier.tiers[0].reserves.len(), 2);
+        assert_eq!(
+            on_tier.tiers[0].reserve_bytes(),
+            Some(7 + batch.card().expect("card reserve"))
+        );
+        assert_eq!(on_tier, plan_bp(43, Some(7), batch));
+    }
+
+    /// A holder joins the plan after the tiers as a reserve-only member: the
+    /// machine is [`plan_a`]'s with that member listed and the draft reserved
+    /// on it, no batch service on it or on the host, and the draft's index runs
+    /// over the stage, the tiers and the holders. A holder that is the stage's
+    /// device is listed twice, and an index past the holders is off the plan.
+    #[test]
+    fn a_holder_is_a_member_with_the_draft_and_nothing_else() {
+        let held = |on: usize| {
+            plan_holding(
+                43,
+                A6000,
+                &[],
+                &[RTX_3090],
+                Some(draft_reserve(Device::Card(on), 7)),
+                NO_TIER_BATCH,
+            )
+        };
+        let machine = held(1).expect("the holder is card 1");
+        let mut member = holder_card(RTX_3090);
+        member.reserves.push((DRAFT_RESERVE.to_string(), 7));
+        assert_eq!(machine.tiers, [member]);
+        assert_eq!(machine.cards, plan_a(43).cards, "the stage is plan (a)'s");
+        assert_eq!(
+            machine.nodes,
+            plan_a(43).nodes,
+            "no tier service on the host"
+        );
+        assert_eq!(machine.expert_tiers().count(), 0);
+        let on_stage = held(0).expect("the stage is card 0");
+        assert_eq!(on_stage.cards[0].reserves, [(DRAFT_RESERVE.to_string(), 7)]);
+        assert!(on_stage.tiers[0].reserves.is_empty());
+        match held(2) {
+            Err(PlacementError::ReserveOffPlan { cards: 2, .. }) => {}
+            other => panic!("{other:?}, not ReserveOffPlan"),
         }
+        match plan_holding(43, A6000, &[], &[A6000], None, NO_TIER_BATCH) {
+            Err(PlacementError::DeviceTwice { cards: 2, .. }) => {}
+            other => panic!("{other:?}, not DeviceTwice"),
+        }
+        assert_eq!(
+            plan_holding(43, A6000, &[], &[], None, NO_TIER_BATCH).expect("no holder"),
+            plan_a(43)
+        );
     }
 
     /// `plan_tiers` refuses a card listed twice and a draft on a tier past
@@ -1721,7 +1919,7 @@ mod tests {
     #[test]
     fn plan_tiers_refuses_by_name() {
         let batch = tier_batch_bytes(5120, 2304, 6, 512);
-        let draft = |on| Some(TierDraft { on, bytes: 7 });
+        let on_card = |on| Some(draft_reserve(Device::Card(on), 7));
         match plan_tiers(43, A6000, &[A6000], None, batch) {
             Err(PlacementError::DeviceTwice {
                 card,
@@ -1741,18 +1939,19 @@ mod tests {
             plan_tiers(43, A6000, &[RTX_3090, RTX_3090], None, batch),
             Err(PlacementError::DeviceTwice { cards: 2, .. })
         ));
-        match plan_tiers(43, A6000, &[RTX_3090], draft(1), batch) {
-            Err(e @ PlacementError::DraftOffPlan { on: 1, tiers: 1 }) => assert_eq!(
+        match plan_tiers(43, A6000, &[RTX_3090], on_card(2), batch) {
+            Err(e @ PlacementError::ReserveOffPlan { cards: 2, .. }) => assert_eq!(
                 e.to_string(),
-                "the draft's reserve is on tier 1, and the plan has 1 tier cards: the draft's \
-                 card is outside the plan"
+                "the DSpark draft reserve is on Card(2), outside the plan: a reserve sits on \
+                 one of the plan's 2 cards, stage first, or on the host"
             ),
-            other => panic!("{other:?}, not DraftOffPlan"),
+            other => panic!("{other:?}, not ReserveOffPlan"),
         }
         assert!(matches!(
-            plan_tiers(43, A6000, &[], draft(0), batch),
-            Err(PlacementError::DraftOffPlan { on: 0, tiers: 0 })
+            plan_tiers(43, A6000, &[], on_card(1), batch),
+            Err(PlacementError::ReserveOffPlan { cards: 1, .. })
         ));
+        assert!(plan_tiers(43, A6000, &[], on_card(0), batch).is_ok());
         let huge = TierBatchBytes {
             staging: u64::MAX,
             scratch: 1,
@@ -1780,7 +1979,7 @@ mod tests {
             plan_node_tiers(4, A6000, &[], huge).expect("no remote"),
             vec![plan_on(A6000, 4)]
         );
-        let swapped = plan_tiers(43, RTX_3090, &[A6000], draft(0), batch).expect("3090+a6000");
+        let swapped = plan_tiers(43, RTX_3090, &[A6000], on_card(1), batch).expect("3090+a6000");
         assert_eq!(swapped.cards[0].name, RTX_3090.name);
         assert_eq!(swapped.tiers.len(), 1);
         assert_eq!(swapped.tiers[0].name, A6000.name);
@@ -1982,6 +2181,7 @@ mod tests {
                 layers: 0..40,
                 head: true,
                 token_embedding: true,
+                reserve_only: false,
                 reserves: Vec::new(),
             };
             assert_eq!(m.cards, vec![want], "{}", spec.name);
@@ -2013,7 +2213,6 @@ mod tests {
     fn tier_card_refuses_an_overflowing_batch() {
         let _ = super::tier_card(
             A6000,
-            None,
             TierBatchBytes {
                 staging: u64::MAX,
                 scratch: 1,
@@ -2243,6 +2442,7 @@ mod tests {
             shadows: 10,
             reserves: 500,
             extra: 50,
+            read_ahead: 0,
             arena: 0,
             cards: 0,
             os: 400,
@@ -2273,11 +2473,35 @@ mod tests {
             shadows: 0,
             reserves: 11_955_785_728,
             extra: 0,
+            read_ahead: 0,
             arena: 20_335_071_232,
             cards: 0,
             os: 6_694_629_376,
             card_budget: false,
         }
+    }
+
+    #[test]
+    fn a_parts_load_reserves_its_read_ahead_before_allocating() {
+        let base = unpaged_need();
+        let need = HostNeed {
+            read_ahead: 8 << 30,
+            ..base
+        };
+        let available = base.bytes() + (1 << 30);
+        assert!(base.check(available).is_ok());
+        let short = need
+            .grant(available, 0)
+            .expect_err("owned parts exceed the host limit");
+        assert_eq!(short.need.read_ahead, 8 << 30);
+        assert!(short.to_string().contains("part read-ahead 8589934592 B"));
+        assert!(need.check(base.bytes() + (8 << 30)).is_ok());
+        assert!(need.check(base.bytes() + (8 << 30) - 1).is_err());
+        let overflow = HostNeed {
+            read_ahead: u64::MAX,
+            ..base
+        };
+        assert!(overflow.check(u64::MAX).is_err());
     }
 
     const PAGED_AVAILABLE: u64 = 27_499_458_560;
@@ -2360,6 +2584,7 @@ mod tests {
             shadows: 0,
             reserves: 8_533_127_168,
             extra: 0,
+            read_ahead: 0,
             arena: 0,
             cards: 0,
             os: 6_694_629_376,

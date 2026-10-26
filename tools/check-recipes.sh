@@ -206,7 +206,8 @@ blk_scancheck() { tool_selftest "check-$1.sh"; }
 # (a build.rs that is a link, and a broken one), no tree walk.
 blk_unsafecount() { blk_scancheck unsafe; }
 # check-arch.sh scans the tree for the architecture split's five rules: a scan whose grep or find cannot read ends the
-# check with no verdict. The architecture listing and each scan are tested here on a missing path.
+# check with no verdict. The architecture listing and each scan are tested here on a missing path, and rule 2's literal
+# scan on fixed lines.
 blk_archscan() { blk_scancheck arch; }
 # check-loads.sh scans crates/*/src for a generated module load outside the shared slot: a source file it cannot list
 # or read ends the check with 70. The family and load scans are tested here on fixed input and a missing file.
@@ -309,6 +310,12 @@ blk_macremote() { tool_selftest mac-remote.sh; }
 # read's pass, the `--hold up|down` rules and a looping caller stopping at its next call, on a scratch copy under a fake HOME with
 # ssh and rsync stubs, no box.
 blk_boxsh() { tool_selftest box.sh; }
+# oxide-host.sh writes the generated .cargo/cuda-oxide.toml for a triple and refuses an llc that is unset, missing, of another
+# major or without a version banner, each by name: its cases run on scratch trees and stub llc scripts, no build and no card.
+blk_oxidehost() { tool_selftest oxide-host.sh; }
+# oxide-backend.sh builds the patched backend and refuses, by name, one without this tree's patch, with another rev or missing: its cases
+# run on a scratch tree with stub cargo and rustc, no build and no card.
+blk_oxidebackend() { tool_selftest oxide-backend.sh; }
 # seed-target.sh clones a warm tree's target/ into a new worktree and restores the seed's mtime on the files that are equal:
 # its refusals (a DST with a target, a SRC without one, two volumes, a host that cannot clone) and the mtime pass (only
 # equal files) are tested on two scratch trees, no cargo.
@@ -379,6 +386,7 @@ pytools_list() {
     "tools/flow/pplb.py --self-test"
     "tools/flow/q38_step.py --self-test"
     "tools/flow/q38width.py --self-test"
+    "tools/flow/resplay.py --self-test"
     "tools/flow/routes.py --self-test"
     "tools/gate_class.py --self-test"
     "tools/gate-paths-merge.py --self-test"
@@ -479,32 +487,58 @@ blk_boxqcodes() {
 }
 # The fixture variants' table (tools/fixture-variants.tsv) against the tree, and the rules ref-paths.sh applies to a variant, on a
 # temporary fixture root: six columns a row, unique tags of lower-case letters and digits, a family that has a fixture directory in
-# fixture-dirs.tsv's table, recipes that are recipes of the justfile; then the paths (a variant's root, its set prefix, the directory a
+# fixture-dirs.tsv's table, a non-empty map and recipes column (the reader's own refusal, crates/model/src/fixture/variant.rs),
+# recipes that are recipes of the justfile; then the paths (a variant's root, its set prefix, the directory a
 # writer is given) and each refusal by name and exit code: a real tier, a tag the table does not name, one of another family, one
 # that is no tag, a family with no fixture file, a variant file that is not there.
 blk_fixturevariants() {
-  local jf=$JF tsv rp dirs d n=0 out vars
+  local jf=$JF tsv rp dirs d out vars summary
   tsv=$(dirname "$0")/fixture-variants.tsv rp=$(dirname "$0")/ref/ref-paths.sh dirs=$(dirname "$0")/fixture-dirs.tsv
   d=$(mktemp -d)
   # shellcheck disable=SC2064
   trap "rm -rf '$d'" RETURN
-  local tags="" line tag family recipes r cols
-  while IFS= read -r line; do
-    case $line in '' | '#'*) continue ;; esac
-    n=$((n + 1))
-    cols=$(awk -F'\t' '{ print NF }' <<< "$line")
-    [ "$cols" = 6 ] || { echo "check-recipes: $tsv row $n has $cols columns, want 6 (tag family scope map recipes why)" >&2; return 1; }
-    IFS=$'\t' read -r tag family _ _ recipes _ <<< "$line"
-    case $tag in '' | *[!a-z0-9]*) echo "check-recipes: $tsv: '$tag' is not lower-case letters and digits" >&2; return 1 ;; esac
-    case " $tags " in *" $tag "*) echo "check-recipes: $tsv names the tag $tag twice" >&2; return 1 ;; esac
-    tags="$tags $tag"
-    awk -F'\t' -v f="$family" '$0 !~ /^#/ && $1 == f && $2 != "self" { found = 1 } END { exit !found }' "$dirs" ||
-      { echo "check-recipes: $tsv: family $family has no fixture directory row in $dirs" >&2; return 1; }
-    for r in $recipes; do
-      grep -qE "^$r:" "$jf" || { echo "check-recipes: $tsv: $r is no recipe of the justfile" >&2; return 1; }
-    done
-  done < "$tsv"
-  [ "$n" -gt 0 ] || { echo "check-recipes: $tsv holds no variant" >&2; return 1; }
+  # rows TSV: the table's row shape. The reader (crates/model/src/fixture/variant.rs) refuses a row
+  # whose map or recipes column is empty at run time ("the map and the recipes are not empty"); the
+  # checker refuses it here first, by name. bash's read folds an empty tab-separated column into the
+  # next one, so the columns come out by awk.
+  rows() {
+    local file=$1 n=0 tags="" line tag family map recipes r cols
+    while IFS= read -r line; do
+      case $line in '' | '#'*) continue ;; esac
+      n=$((n + 1))
+      cols=$(awk -F'\t' '{ print NF }' <<< "$line")
+      [ "$cols" = 6 ] || { echo "check-recipes: $file row $n has $cols columns, want 6 (tag family scope map recipes why)" >&2; return 1; }
+      tag=$(awk -F'\t' '{ print $1 }' <<< "$line") family=$(awk -F'\t' '{ print $2 }' <<< "$line")
+      map=$(awk -F'\t' '{ print $4 }' <<< "$line") recipes=$(awk -F'\t' '{ print $5 }' <<< "$line")
+      case $tag in '' | *[!a-z0-9]*) echo "check-recipes: $file: '$tag' is not lower-case letters and digits" >&2; return 1 ;; esac
+      case " $tags " in *" $tag "*) echo "check-recipes: $file names the tag $tag twice" >&2; return 1 ;; esac
+      tags="$tags $tag"
+      [ -n "$map" ] || { echo "check-recipes: $file row $n: the map column is empty (the reader refuses it: \"the map and the recipes are not empty\")" >&2; return 1; }
+      [ -n "$recipes" ] || { echo "check-recipes: $file row $n: the recipes column is empty (the reader refuses it: \"the map and the recipes are not empty\")" >&2; return 1; }
+      awk -F'\t' -v f="$family" '$0 !~ /^#/ && $1 == f && $2 != "self" { found = 1 } END { exit !found }' "$dirs" ||
+        { echo "check-recipes: $file: family $family has no fixture directory row in $dirs" >&2; return 1; }
+      for r in $recipes; do
+        # A recipe with parameters (`gate-gpu-ds41-step *ARGS=…:`) is a recipe too.
+        grep -qE "^$r([ :]|\$)" "$jf" || { echo "check-recipes: $file: $r is no recipe of the justfile" >&2; return 1; }
+      done
+    done < "$file"
+    [ "$n" -gt 0 ] || { echo "check-recipes: $file holds no variant" >&2; return 1; }
+    printf '%s row(s):%s\n' "$n" "$tags"
+  }
+  summary=$(rows "$tsv") || return 1
+  # The empty-column refusal, proven on a one-row table whose other columns are well-formed.
+  for bad in map recipes; do
+    if [ "$bad" = map ]; then
+      printf 'badrec\tglm5next\tall\t\tgate-x\tself-test\n' > "$d/bad.tsv"
+    else
+      printf 'badrec\tglm5next\tall\tffn_gate=q4_K\t\tself-test\n' > "$d/bad.tsv"
+    fi
+    out=$(rows "$d/bad.tsv" 2>&1) && { echo "check-recipes: fixture-variants.tsv: an empty $bad column read as fine: $out" >&2; return 1; }
+    case $out in
+      *"row 1: the $bad column is empty"*) ;;
+      *) echo "check-recipes: fixture-variants.tsv: wanted 'row 1: the $bad column is empty' in: $out" >&2; return 1 ;;
+    esac
+  done
   grep -qE '^fixture-requant FAMILY TAG:' "$jf" || { echo "check-recipes: the justfile has no fixture-requant recipe" >&2; return 1; }
   # The tier's paths on a temporary root: $d/fixtures/<dir>/ the fixture, $d/fixture-variants/<tag>/<dir>/ its variant.
   tag=$(awk -F'\t' '$0 !~ /^#/ && NF { print $1; exit }' "$tsv") family=$(awk -F'\t' '$0 !~ /^#/ && NF { print $2; exit }' "$tsv")
@@ -532,7 +566,7 @@ blk_fixturevariants() {
   want "a tag the table does not name, exit" "rc=64" BLOOMERY_MODEL="$family" BLOOMERY_TIER=fixture BLOOMERY_FIXTURE_VARIANT=nosuchtag || return 1
   want "a variant of another family" "is a variant of $family" BLOOMERY_MODEL=qwen4exp BLOOMERY_TIER=fixture BLOOMERY_FIXTURE_VARIANT="$tag" || return 1
   want "a string that is no tag" "lower-case letters and digits" BLOOMERY_MODEL="$family" BLOOMERY_TIER=fixture BLOOMERY_FIXTURE_VARIANT='../x' || return 1
-  want "a family with no fixture file" "has no fixture file to be a variant of" BLOOMERY_MODEL=qwen3moe BLOOMERY_TIER=fixture BLOOMERY_FIXTURE_VARIANT="$tag" || return 1
+  want "a family with no fixture file" "has no fixture file to be a variant of" BLOOMERY_MODEL=deepseek2 BLOOMERY_TIER=fixture BLOOMERY_FIXTURE_VARIANT="$tag" || return 1
   rm -f "$d/fixture-variants/$tag/glm5next/"*.gguf
   want "a variant file that is not there" "fixture-requant $family $tag" BLOOMERY_MODEL="$family" BLOOMERY_TIER=fixture BLOOMERY_FIXTURE_VARIANT="$tag" || return 1
   want "a variant file that is not there, exit" "rc=66" BLOOMERY_MODEL="$family" BLOOMERY_TIER=fixture BLOOMERY_FIXTURE_VARIANT="$tag" || return 1
@@ -592,6 +626,33 @@ blk_fixturevariants() {
   case $err in *"$two"*) ;; *) echo "check-recipes: dspark_model, two drafts: wanted $two in: $err" >&2; return 1 ;; esac
   ds '. "$1" && dspark_model' BLOOMERY_DSPARK_MODEL=/x.gguf
   [ "$ds_rc" = 0 ] && [ "$ds_out" = /x.gguf ] || { echo "check-recipes: dspark_model, caller draft: rc=$ds_rc out='$ds_out', want /x.gguf" >&2; return 1; }
+  # A deepseek41 variant: its map never retypes the draft, so a variant directory with no draft answers the fixture's one, one with
+  # an identical draft of its own answers that, and one whose draft differs from the fixture's, or a variant over a fixture with no
+  # draft, is refused by name (dspark_model, exit 66).
+  local vtag vdir
+  vtag=$(awk -F'\t' '$0 !~ /^#/ && $2 == "deepseek41" { print $1; exit }' "$tsv")
+  [ -n "$vtag" ] || { echo "check-recipes: $tsv names no deepseek41 variant: the draft rules of a variant have no case to run on" >&2; return 1; }
+  vdir=$d/fixture-variants/$vtag/v41
+  rm -f "$two"
+  mkdir -p "$vdir"
+  touch "$vdir/t-00001-of-00001.gguf"
+  ds '. "$1" && dspark_model' BLOOMERY_FIXTURE_VARIANT="$vtag"
+  [ "$ds_rc" = 0 ] && [ "$ds_out" = "$one" ] || { echo "check-recipes: dspark_model, a variant with no draft: rc=$ds_rc out='$ds_out', want the fixture's $one" >&2; return 1; }
+  mkdir -p "$vdir/draft"
+  cp "$one" "$vdir/draft/one.gguf"
+  ds '. "$1" && dspark_model' BLOOMERY_FIXTURE_VARIANT="$vtag"
+  [ "$ds_rc" = 0 ] && [ "$ds_out" = "$vdir/draft/one.gguf" ] || { echo "check-recipes: dspark_model, a variant with the fixture's draft: rc=$ds_rc out='$ds_out', want $vdir/draft/one.gguf" >&2; return 1; }
+  printf x > "$vdir/draft/one.gguf"
+  ds '. "$1" && dspark_model' BLOOMERY_FIXTURE_VARIANT="$vtag"
+  err=$(cat "$d/ds.err")
+  [ "$ds_rc" = 66 ] && [ -z "$ds_out" ] || { echo "check-recipes: dspark_model, a variant with another draft: rc=$ds_rc out='$ds_out', want 66 and nothing: $err" >&2; return 1; }
+  case $err in *"the variant $vtag holds the draft $vdir/draft/one.gguf, which differs from the fixture's $one"*) ;; *) echo "check-recipes: dspark_model, a variant with another draft: wanted the variant and both drafts in: $err" >&2; return 1 ;; esac
+  rm -rf "$vdir/draft" "$one"
+  ds '. "$1" && dspark_model' BLOOMERY_FIXTURE_VARIANT="$vtag"
+  err=$(cat "$d/ds.err")
+  [ "$ds_rc" = 66 ] && [ -z "$ds_out" ] || { echo "check-recipes: dspark_model, a variant over a fixture with no draft: rc=$ds_rc out='$ds_out', want 66 and nothing: $err" >&2; return 1; }
+  case $err in *"$vdir/draft"*"the fixture's own draft directory holds"*) ;; *) echo "check-recipes: dspark_model, a variant over a fixture with no draft: wanted both draft directories in: $err" >&2; return 1 ;; esac
+  echo "check-recipes: deepseek41 variant draft: the fixture's, an identical own, a differing own refused, none refused"
   local prof line real f_rc f_out
   prof=$(dirname "$0")/ref/models/deepseek41.sh
   line=$(sed -n '215p' "$prof")
@@ -601,7 +662,7 @@ blk_fixturevariants() {
   f_out=$(env -i PATH="$PATH" BLOOMERY_MODEL=deepseek41 bash -c '. "$1" && dspark_model' _ "$rp" 2>"$d/f.err") || f_rc=$?
   [ "$f_rc" = 0 ] && [ "$f_out" = "$real" ] || { echo "check-recipes: dspark_model, real tier: rc=$f_rc out='$f_out', want '$real' ($(cat "$d/f.err"))" >&2; return 1; }
   echo "check-recipes: deepseek41 fixture draft: source stays up, dspark_model refuses"
-  echo "check-recipes: fixture variants ok ($n row(s): $tags )"
+  echo "check-recipes: fixture variants ok ($summary)"
 }
 
 # The fixture directory table (tools/fixture-dirs.tsv) as ref-paths.sh reads it, on a temporary fixture root: a row with a directory
@@ -1114,7 +1175,7 @@ proc_leg_gpu() {
 }
 
 BLOCKS=(prelude recipescheck gateclass selftest smoke cardorder cardtests lease boxtracks unsafecount archscan loadscan commentscan leverscan loadgroups lcppfit coldblocks leverarms slotsarm binlabel lcppwarm q38srv
-  maccheck gatebatch gpugate stackwatch ptxscan ptxspill scanargs narrowscan canoncheck ptxcompare ldsscan mutantrun macstatic macremote boxsh seedtarget carry releasebuild pytools boxqcodes fixturevariants fixturedirs dsparkread
+  maccheck gatebatch gpugate stackwatch ptxscan ptxspill scanargs narrowscan canoncheck ptxcompare ldsscan mutantrun macstatic macremote boxsh oxidehost oxidebackend seedtarget carry releasebuild pytools boxqcodes fixturevariants fixturedirs dsparkread
   refsetpublish orphan archowner treecommit archivepipe fnowner wt macgate boundedscan gatebound dumpdequant tokoracle ikpintree qdotrefargs)
 # blk_keyspec NAME: what a block's input key reads (tools/recipes.py static-key). Every block's is the whole tree: a
 # narrower key needs proof that the block reads nothing outside it, and a green run on a copy whose other files are

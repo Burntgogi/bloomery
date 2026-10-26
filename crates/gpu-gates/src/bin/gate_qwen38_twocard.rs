@@ -708,7 +708,7 @@ mod gate {
         gib: u64,
     ) -> Result<(Option<Plan<'a>>, Option<String>), GateError> {
         let levers = PlanLevers {
-            card_budget_bytes: Some(gib << 30),
+            card_budget_bytes: Some(gib << 30).into(),
         };
         match inputs.plan_with(bp, ctx as u64, &levers, Experts::Card) {
             Ok(plan) => {
@@ -964,7 +964,7 @@ mod gate {
             .into());
         }
         let layers = inputs.spec.layers.len();
-        let bp = machine_bp(layers, ub as u64, None, tier_batch(&inputs.hp, ub as u64));
+        let bp = machine_bp(layers, ub as u64, None, tier_batch(&inputs.spec, ub as u64));
         let Chosen { plan, tight, .. } = chosen_plan(inputs, &bp, CTX_4K)?;
         let tl = tier_layers(&plan);
         let ids = prose_ids("qwen4exp", PROMPT_4K)?;
@@ -1117,7 +1117,7 @@ mod gate {
         /// gate's budget: one slot is [`PlanInputs::plan_with`] itself.
         fn plan(&self, slots: usize) -> Result<Plan<'a>, GateError> {
             let levers = PlanLevers {
-                card_budget_bytes: Some(self.gib << 30),
+                card_budget_bytes: Some(self.gib << 30).into(),
             };
             Ok(self
                 .inputs
@@ -1155,7 +1155,9 @@ mod gate {
         let mut h = Fnv1a64::default();
         for s in &stores {
             match s {
-                Store38Host::Rec { state, ring } => h = h.f32s(state).f32s(ring),
+                Store38Host::Rec { state, ring, carry } => {
+                    h = h.f32s(state).f32s(ring).f32s(carry);
+                }
                 Store38Host::Qsa { k, v, raw, pooled } => {
                     h = u16s(u16s(u16s(u16s(h, k), v), raw), pooled);
                 }
@@ -1546,7 +1548,7 @@ mod gate {
             gib,
             host,
             ub,
-            shape: crate::q38_arch::shape_of(&inputs.hp)?,
+            shape: crate::q38_arch::shape_of(&inputs.spec)?,
             windows: [a0.to_vec(), a1.to_vec()],
         };
         let plan = a.plan(slots_gate::STREAMS)?;
@@ -1597,7 +1599,7 @@ mod gate {
         tier::plan_levers(&split, &levers, 0)?;
         let ub = ubatch_for(CTX)?;
         let layers = inputs.spec.layers.len();
-        let bp = machine_bp(layers, ub as u64, None, tier_batch(&inputs.hp, ub as u64));
+        let bp = machine_bp(layers, ub as u64, None, tier_batch(&inputs.spec, ub as u64));
         let Chosen {
             plan,
             tight: tight_3k,

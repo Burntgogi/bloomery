@@ -16,18 +16,25 @@
 //! past its id window (the adjacent record slot for a device-fed token), the
 //! head storing no pick (the last row's stale slot), and the delta step
 //! writing the lane it read (the token a mark's take drops leaving its
-//! update in the lane the point copies). The host edits themselves are
-//! one-off edits recorded in the round that proves the clause.
+//! update in the lane the point copies). `q_layers`'s defects — a pass that
+//! commits a command buffer an op, one buffer for the whole pass, and a layer's
+//! buffer that skips the token boundary's wait — are the host's too and have
+//! no kernel side. The host edits themselves are one-off edits recorded in the
+//! round that proves the clause.
 
-use bloomery_metal::library::SOURCE;
+#[path = "../shared/mutants.rs"]
+mod program;
 
-/// A defect and the clause that must be red on it.
-pub struct Mutant {
-    pub name: &'static str,
-    pub clause: &'static str,
-    pub why: &'static str,
-    /// `(find, replace, occurrences of find)`, applied in order.
-    pub edits: &'static [(&'static str, &'static str, usize)],
+pub use program::{Mutant, Program, source_of};
+
+/// Every mutant of both tables, with the program it edits.
+pub fn all() -> impl Iterator<Item = (&'static Mutant, Program)> {
+    program::all(MUTANTS, TENSOR_MUTANTS)
+}
+
+/// The mutant of this name, and the program it edits.
+pub fn find(name: &str) -> Option<(&'static Mutant, Program)> {
+    all().find(|(m, _)| m.name == name)
 }
 
 pub const MUTANTS: &[Mutant] = &[
@@ -99,6 +106,26 @@ pub const MUTANTS: &[Mutant] = &[
         )],
     },
     Mutant {
+        name: "mark_row_late",
+        clause: "q_mark",
+        why: "a pass copies a delta layer's state lane one row after the row its copy names",
+        edits: &[(
+            "if (copy < copies && r == snaps->after[copy]) {",
+            "if (copy < copies && r == snaps->after[copy] + 1u) {",
+            1,
+        )],
+    },
+    Mutant {
+        name: "mark_ring_dropped",
+        clause: "q_mark",
+        why: "a pass leaves a copy's conv ring unwritten",
+        edits: &[(
+            "    snap[(ulong)k * snaps.ring_len + s * args.ch + c] = v;",
+            "    (void)v;",
+            1,
+        )],
+    },
+    Mutant {
         name: "prefill_ring_last_row",
         clause: "q_state",
         why: "the ring commit of a pass writes the rows before the last: the last row's \
@@ -122,22 +149,11 @@ pub const MUTANTS: &[Mutant] = &[
     },
 ];
 
-pub fn find(name: &str) -> Option<&'static Mutant> {
-    MUTANTS.iter().find(|m| m.name == name)
-}
-
-/// The kernels' source with the mutant's edits applied.
-pub fn source_of(mutant: &Mutant) -> Result<String, String> {
-    let mut text = SOURCE.to_string();
-    for (find, replace, count) in mutant.edits {
-        let found = text.matches(find).count();
-        if found != *count {
-            return Err(format!(
-                "mutant {}: {find:?} occurs {found} times, not {count}",
-                mutant.name
-            ));
-        }
-        text = text.replace(find, replace);
-    }
-    Ok(text)
-}
+/// The tensor-op GEMMs' defects `q_tensor` must catch: the program it forces
+/// is the one its pass runs.
+pub const TENSOR_MUTANTS: &[Mutant] = &[Mutant {
+    name: "tensor_pass_pair_swapped",
+    clause: "q_tensor",
+    why: "the routed pair's gate and up accumulators swap places in the tensor-op SwiGLU",
+    edits: &[("pair_swiglu(cg[i], cu[i])", "pair_swiglu(cu[i], cg[i])", 1)],
+}];

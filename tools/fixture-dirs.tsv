@@ -7,6 +7,9 @@
 #          one name `fixture fetch` takes as its family; lower-case letters, digits and `-`. `self` is not a directory: the family
 #          has no fixture file, a command runs on the profile's file and the gate fence (Tier::check_file) refuses that file as not
 #          a fixture. An architecture this table does not name has no fixture yet (ref-paths.sh exits 66, never a run on the real file).
+#          A directory that holds model.safetensors.index.json is a checkpoint folder cut in its stored bits (`fixture cut`, its rules
+#          tools/fixture-cuts/<dir>.json), its first shard the `*-00001-of-*.safetensors` beside the index; any other holds GGUF shards
+#          (`fixture generate`).
 qwen4exp	qwen38
 deepseek41	v41
 glm5next	glm5next
@@ -16,5 +19,8 @@ qwen35moe	qwen35moe
 solar-open2	solar2
 deepseek2	self
 qwen38d	self
-qwen3moe	self
+qwen3moe	qwen3moe
 qwen35	self
+nanbeige43	self
+muse-spark	musespark
+minimax-m3	minimaxm31

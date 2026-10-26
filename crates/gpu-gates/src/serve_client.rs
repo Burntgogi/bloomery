@@ -7,6 +7,7 @@
 //! through curl, a `/metrics` value, the server's stderr read by its binary's
 //! record kinds ([`server_log`]), and the requests the seat gates share: the
 //! chat turn's ids ([`rendered`], [`tokenized`]), a greedy completion ([`greedy`]), the
+//! ids the decode CLI prints for the same prompt ([`generate_arms`]), the
 //! chat answer held to a completion's ids ([`chat_is_those_ids`]), a greedy chat with its
 //! runner-up logprobs read against an oracle's ids ([`greedy_chat`], [`answered`],
 //! [`ChatReply::follows`]), an image
@@ -429,16 +430,80 @@ impl SeatGate {
         file: &Path,
         args: &[&str],
     ) -> Result<(std::process::ExitStatus, Log, String), GateError> {
+        self.plan_under((dir, name), file, args, &[])
+    }
+
+    /// [`SeatGate::plan`] with each of `levers` set on the server to its
+    /// value, or removed from its environment where the value is `None`, so a
+    /// value in this binary's environment cannot stand in for unset; the
+    /// text printed when the run fails. A gate names each lever at its call,
+    /// a `(lever, value)` pair, where `tools/check-defaults.py` reads its pins.
+    pub fn plan_under(
+        &self,
+        (dir, name): (&Path, &str),
+        file: &Path,
+        args: &[&str],
+        levers: &[(&str, Option<&str>)],
+    ) -> Result<(std::process::ExitStatus, Log, String), GateError> {
         let d = dir.join(name);
         std::fs::create_dir_all(&d)?;
-        let (cmd, mut all) = self.command(file)?;
+        let (mut cmd, mut all) = self.command(file)?;
+        for &(lever, value) in levers {
+            match value {
+                Some(v) => cmd.env(lever, v),
+                None => cmd.env_remove(lever),
+            };
+        }
         all.extend(args.iter().map(|a| (*a).to_owned()));
         let all: Vec<&str> = all.iter().map(String::as_str).collect();
         let err = d.join("server.err");
         let (status, lines) = plan_run(cmd, &all, &err)?;
         println!("{name}: {} --plan: {status}", args.join(" "));
-        Ok((status, server_log(&err, self.kinds)?, lines.join("\n")))
+        let text = lines.join("\n");
+        if !status.success() {
+            println!("{name} stderr:\n{text}");
+        }
+        Ok((status, server_log(&err, self.kinds)?, text))
     }
+}
+
+/// The `residency lever` record is `word` with why `why`.
+pub fn residency_lever_is(log: &Log, word: &str, why: &str) -> Result<bool, GateError> {
+    Ok(match log.first(&record::RESIDENCY_LEVER)? {
+        Some(l) => l.word("residency")? == word && l.word("why")? == why,
+        None => false,
+    })
+}
+
+/// No `residency host` record: the load holds no churn pool.
+pub fn no_residency_host(log: &Log) -> Result<bool, GateError> {
+    Ok(log.first(&record::RESIDENCY_HOST)?.is_none())
+}
+
+/// The `residency lever` record of an unset word on a serving placement: a word the plan
+/// resolved (its why is neither `set` nor `fixed_place`), ahead of the plan, and the churn pool's
+/// `residency host` record after the plan exactly where the word is not `off`; the word is the
+/// serving word ([`bloomery_levers::RESIDENCY_SERVING`]) where its why is `place`.
+pub fn residency_lever_resolved(log: &Log) -> Result<bool, GateError> {
+    let (lever, plan, host) = (
+        log.first(&record::RESIDENCY_LEVER)?,
+        log.first(&record::PLAN)?,
+        log.first(&record::RESIDENCY_HOST)?,
+    );
+    let (Some(l), Some(p)) = (&lever, &plan) else {
+        return Ok(false);
+    };
+    let (word, why) = (l.word("residency")?, l.word("why")?);
+    let pool = match &host {
+        Some(h) => p.at() < h.at(),
+        None => false,
+    };
+    Ok(l.at() < p.at()
+        && why != "set"
+        && why != "fixed_place"
+        && (why != "place" || word == bloomery_levers::RESIDENCY_SERVING)
+        && ((word == "off") == host.is_none())
+        && (word == "off" || pool))
 }
 
 /// `ids` agree with `reference`, a run that did not stop at the
@@ -449,6 +514,67 @@ pub fn agree(ids: &[u32], stop: &str, reference: &[u32]) -> bool {
         "eos" => !ids.is_empty() && reference.starts_with(ids),
         _ => ids == reference,
     }
+}
+
+/// `<exe> --arm <prompt>/<n> … --ctx <ctx> --last-step` beside this binary on `model` (`exe`: the decode CLI
+/// of the Qwen-family engines), one arm a prompt in `prompts`: the ids each arm prints on its `tokens` line, in
+/// order, the CLI's output saved as `<dir>/gen.log` and `<dir>/gen.err`. `--last-step` is the server's cut (the
+/// prompt less its last id, then a step), so a server's greedy completion of the same ids is compared with these.
+/// `ctx` is the server's loaded context: the CLI's own default plans a different split of the routed experts,
+/// and the two legs do not sum in one order.
+pub fn generate_arms(
+    exe: &str,
+    model: &Path,
+    prompts: &[&[u32]],
+    n: usize,
+    ctx: u64,
+    dir: &Path,
+) -> Result<Vec<Vec<u32>>, GateError> {
+    let exe = beside(exe)?;
+    let mut args = Vec::new();
+    for p in prompts {
+        let ids: Vec<String> = p.iter().map(u32::to_string).collect();
+        args.push("--arm".to_owned());
+        args.push(format!("{}/{n}", ids.join(",")));
+    }
+    // The server's context, so the CLI's plan is the server's split.
+    args.push("--ctx".to_owned());
+    args.push(ctx.to_string());
+    args.push("--last-step".to_owned());
+    let out = Command::new(&exe)
+        .args(&args)
+        .env("BLOOMERY_REF_MODEL", model)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("spawn {}: {e}", exe.display()))?;
+    let log = dir.join("gen.log");
+    std::fs::write(&log, &out.stdout)?;
+    std::fs::write(dir.join("gen.err"), &out.stderr)?;
+    if !out.status.success() {
+        return Err(format!(
+            "{} {}: {}",
+            exe.display(),
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        )
+        .into());
+    }
+    let text = String::from_utf8(out.stdout)?;
+    let lines: Vec<Vec<u32>> = text
+        .lines()
+        .filter_map(|l| l.strip_prefix("tokens "))
+        .map(parse_ids)
+        .collect::<Result<_, _>>()?;
+    if lines.len() != prompts.len() {
+        return Err(format!(
+            "{}: {} `tokens` lines for {} arms",
+            log.display(),
+            lines.len(),
+            prompts.len()
+        )
+        .into());
+    }
+    Ok(lines)
 }
 
 /// `/tokenize` of `text` without BOS.
@@ -474,6 +600,285 @@ pub fn rendered(url: &dyn Fn(&str) -> String, messages: Value) -> Result<Vec<u32
         .ok_or("/apply-template: no prompt")?
         .to_owned();
     tokenized(url, &text)
+}
+
+/// The terms of one whole-fit line (`whole fit at ctx …: the whole load
+/// on …`): its `need`, its `cache` term (the planes' bytes), that need
+/// less the cache (the terms no context moves at or past the floor),
+/// what the card had, the census reading inside its parentheses, and
+/// whether it says the load fits. A line without its terms is a named
+/// error.
+pub struct WholeTerms<'a> {
+    pub need: u64,
+    pub cache: u64,
+    pub rest: u64,
+    pub budget: u64,
+    pub census: &'a str,
+    pub fits: bool,
+}
+
+/// The terms of `line`, the whole-fit verdict's own words.
+pub fn whole_terms(line: &str) -> Result<WholeTerms<'_>, GateError> {
+    let term = |after: &str| -> Result<u64, GateError> {
+        line.split(after)
+            .nth(1)
+            .and_then(|t| t.split(" B").next())
+            .and_then(|t| t.parse().ok())
+            .ok_or_else(|| format!("the whole-fit line names no `{after}… B`: {line}").into())
+    };
+    let (need, cache) = (term(": need ")?, term(" + cache ")?);
+    let (had, census) = line
+        .split_once(" B the card had (")
+        .ok_or_else(|| format!("the whole-fit line names no bytes the card had: {line}"))?;
+    let budget: u64 = had
+        .rsplit(", of ")
+        .next()
+        .and_then(|t| t.parse().ok())
+        .ok_or_else(|| format!("the whole-fit line names no bytes the card had: {line}"))?;
+    let rest = need
+        .checked_sub(cache)
+        .ok_or_else(|| format!("the whole-fit line's cache passes its need: {line}"))?;
+    Ok(WholeTerms {
+        need,
+        cache,
+        rest,
+        budget,
+        census: census.trim_end_matches(')'),
+        fits: line.contains(": fits: "),
+    })
+}
+
+/// `body` through `/v1/chat/completions` (a 200), the answer saved as `<dir>/<name>.json`.
+pub fn chatted(
+    url: &dyn Fn(&str) -> String,
+    dir: &Path,
+    name: &str,
+    body: &Value,
+) -> Result<Value, GateError> {
+    let (st, text) = curl(&url("/v1/chat/completions"), Some(body), false)?;
+    std::fs::write(dir.join(format!("{name}.json")), &text)?;
+    json_of("/v1/chat/completions", st, &text)
+}
+
+/// The turn the tool-call clauses ask.
+const TOOL_ASK: &str = "What is the weather in Seoul right now? Use the tool.";
+
+/// The reply the scripted engine of [`scripted_call`] gives every prompt: the template's XML call
+/// format, one call.
+const SCRIPTED_CALL: &str = "<tool_call>\n<function=get_weather>\n<parameter=city>\nSeoul\n</parameter>\n</function>\n</tool_call>";
+
+/// The scripted engine's context, and the tokens its reply may run: its vocabulary is a byte a
+/// token, so a tool prompt is a few thousand ids.
+const SCRIPT_CTX: usize = 16_384;
+const SCRIPT_TOKENS: u64 = 256;
+
+/// The one function the tool clauses list.
+fn tools() -> Value {
+    json!([{ "type": "function", "function": {
+        "name": "get_weather",
+        "description": "The current weather of a city.",
+        "parameters": {
+            "type": "object",
+            "properties": { "city": { "type": "string", "description": "the city's name" } },
+            "required": ["city"],
+        },
+    } }])
+}
+
+/// The tool turn the clauses ask, thinking off.
+pub fn tool_turn() -> Value {
+    json!({
+        "messages": [{ "role": "user", "content": TOOL_ASK }], "tools": tools(),
+        "chat_template_kwargs": { "enable_thinking": false },
+    })
+}
+
+/// [`tool_turn`] as a chat request at temperature 0 whose reply runs at most `max_tokens`.
+pub fn tool_chat(max_tokens: u64) -> Value {
+    let mut body = tool_turn();
+    body["max_tokens"] = json!(max_tokens);
+    body["temperature"] = json!(0);
+    body["stream"] = json!(false);
+    body
+}
+
+/// A server over a scripted engine (`serve::ScriptedEngine`, whose every reply is the template's XML
+/// call format) with the chat template `template`, asked [`tool_turn`]: it answers 200 with
+/// `finish_reason` `tool_calls` and one call, `get_weather` with the arguments `{"city":"Seoul"}`.
+/// It runs the server's own template read, think-span entry, XML scanner and response, with no
+/// model behind them, so the clause reads nothing a model chose to reply. The answer is saved as
+/// `<dir>/scripted.json`.
+pub fn scripted_call(template: &str, dir: &Path) -> Result<bool, GateError> {
+    let addr = scripted_server(template)?;
+    let url = |p: &str| format!("http://{addr}{p}");
+    let answer = chatted(&url, dir, "scripted", &tool_chat(SCRIPT_TOKENS))?;
+    let choice = &answer["choices"][0];
+    let calls = choice["message"]["tool_calls"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let function = calls.first().map(|c| &c["function"]);
+    let name = function.and_then(|f| f["name"].as_str());
+    let arguments: Option<Value> = function
+        .and_then(|f| f["arguments"].as_str())
+        .and_then(|a| serde_json::from_str(a).ok());
+    println!(
+        "scripted call: finish {:?}, {} call(s), function {name:?}, arguments {arguments:?}; content {:?}",
+        choice["finish_reason"],
+        calls.len(),
+        choice["message"]["content"]
+    );
+    Ok(choice["finish_reason"] == "tool_calls"
+        && calls.len() == 1
+        && name == Some("get_weather")
+        && arguments == Some(json!({ "city": "Seoul" })))
+}
+
+/// A server over a scripted engine whose every reply is [`SCRIPTED_CALL`], with the chat template
+/// `template`: its address.
+fn scripted_server(template: &str) -> Result<std::net::SocketAddr, GateError> {
+    let config = serve::ServerConfig {
+        model_alias: "scripted".to_owned(),
+        model_path: "scripted.gguf".to_owned(),
+        chat_template: template.to_owned(),
+        sampler: None,
+        fatal_linger: serve::FATAL_LINGER,
+        slot_save_path: None,
+        api_keys: serve::flag::ApiKeys::default(),
+        chat_preparation: None,
+    };
+    let engine = serve::ScriptedEngine::new(SCRIPT_CTX, SCRIPTED_CALL);
+    Ok(serve::Server::bind("127.0.0.1:0", Box::new(engine), config)
+        .map_err(|e| format!("the scripted server: {e}"))?
+        .spawn()?)
+}
+
+/// What a chat answer holds of a cut generation, whole or folded from its stream.
+struct Cut {
+    /// The error the answer was, empty when it was one.
+    error: String,
+    finish: String,
+    content: String,
+    /// Each call's name and arguments, by index.
+    calls: Vec<(String, String)>,
+}
+
+/// `body` of a chat request as [`Cut`] reads it: a non-stream answer's choice, or the deltas of a stream
+/// folded; a status but 200, an error event or text that is not the answer's shape is the `error`.
+fn cut_of(status: u16, body: &str, stream: bool) -> Cut {
+    let mut cut = Cut {
+        error: String::new(),
+        finish: String::new(),
+        content: String::new(),
+        calls: Vec::new(),
+    };
+    if status != 200 {
+        cut.error = format!("HTTP {status}: {body}");
+        return cut;
+    }
+    let events: Vec<Value> = if stream {
+        body.split("\n\n")
+            .filter_map(|e| e.strip_prefix("data: "))
+            .filter(|e| *e != "[DONE]")
+            .filter_map(|e| serde_json::from_str(e).ok())
+            .collect()
+    } else {
+        serde_json::from_str(body).into_iter().collect()
+    };
+    for v in &events {
+        if let Some(e) = v["error"]["message"].as_str() {
+            cut.error = e.to_owned();
+        }
+        let Some(choice) = v["choices"].get(0) else {
+            continue;
+        };
+        if let Some(f) = choice["finish_reason"].as_str() {
+            cut.finish = f.to_owned();
+        }
+        let part = if stream {
+            &choice["delta"]
+        } else {
+            &choice["message"]
+        };
+        cut.content.push_str(part["content"].as_str().unwrap_or(""));
+        for call in part["tool_calls"].as_array().into_iter().flatten() {
+            let at = call["index"]
+                .as_u64()
+                .and_then(|i| usize::try_from(i).ok())
+                .unwrap_or(cut.calls.len());
+            if cut.calls.len() <= at {
+                cut.calls.resize(at + 1, (String::new(), String::new()));
+            }
+            if let Some(n) = call["function"]["name"].as_str() {
+                cut.calls[at].0.push_str(n);
+            }
+            if let Some(a) = call["function"]["arguments"].as_str() {
+                cut.calls[at].1.push_str(a);
+            }
+        }
+    }
+    if events.is_empty() && cut.error.is_empty() {
+        cut.error = format!("no answer in {body:?}");
+    }
+    cut
+}
+
+/// The server of [`scripted_call`] asked [`tool_turn`] with a `max_tokens` that ends the generation inside the call
+/// (the scripted vocabulary is a byte a token), whole and as a stream. llama-server parses the end of the text as the
+/// end of the input, so a cut call is no fault there: it answers 200 with `finish_reason` `length`, the text read as
+/// `content` while the call's name is not whole, and the call with the arguments read (`{`) once it is. The same
+/// here, each answer saved as `<dir>/cut-<where>-<whole|stream>.txt`.
+pub fn cut_call(template: &str, dir: &Path) -> Result<bool, GateError> {
+    let addr = scripted_server(template)?;
+    let url = |p: &str| format!("http://{addr}{p}");
+    let inside = |tag: &str| {
+        SCRIPTED_CALL
+            .find(tag)
+            .map(|at| at + tag.len() / 2)
+            .ok_or_else(|| format!("the scripted call holds no {tag}"))
+    };
+    let named = ("get_weather".to_owned(), "{".to_owned());
+    let cuts = [
+        ("before-name", inside("<function=")?, None),
+        ("after-name", inside("<parameter=")?, Some(named)),
+    ];
+    let mut ok = true;
+    for (place, bytes, call) in cuts {
+        for stream in [false, true] {
+            let mut body = tool_chat(u64::try_from(bytes)?);
+            body["stream"] = json!(stream);
+            let (status, text) = curl(&url("/v1/chat/completions"), Some(&body), stream)?;
+            let way = if stream { "stream" } else { "whole" };
+            std::fs::write(dir.join(format!("cut-{place}-{way}.txt")), &text)?;
+            let cut = cut_of(status, &text, stream);
+            let (calls, content) = match &call {
+                Some(c) => (vec![c.clone()], ""),
+                None => (Vec::new(), &SCRIPTED_CALL[..bytes]),
+            };
+            let good = cut.error.is_empty()
+                && cut.finish == "length"
+                && cut.calls == calls
+                && cut.content == content;
+            println!(
+                "cut call {place} ({bytes} tokens, {way}): error {:?}, finish {:?}, calls {:?}, content {:?}; wants \
+                 calls {calls:?}, content {content:?} {good}",
+                cut.error, cut.finish, cut.calls, cut.content
+            );
+            ok &= good;
+        }
+    }
+    Ok(ok)
+}
+
+/// `POST /v1/chat/completions/input_tokens` of `body`: how many ids the prompt the same chat request renders holds,
+/// counted without generating, as llama-server's `handle_count_tokens` does.
+pub fn input_tokens(url: &dyn Fn(&str) -> String, body: &Value) -> Result<usize, GateError> {
+    const ROUTE: &str = "/v1/chat/completions/input_tokens";
+    let (st, text) = curl(&url(ROUTE), Some(body), false)?;
+    let n = json_of(ROUTE, st, &text)?["input_tokens"]
+        .as_u64()
+        .ok_or_else(|| format!("{ROUTE}: no input_tokens in {text}"))?;
+    Ok(usize::try_from(n)?)
 }
 
 /// One greedy `/completion` of `ids`, `n` tokens, at temperature 0 — `cache`
@@ -540,6 +945,56 @@ pub fn greedy(
         },
         v,
     ))
+}
+
+/// How long the request `v` answered held its slot, in milliseconds: the
+/// server's `timings.prompt_ms` plus `predicted_ms`, the window a request
+/// posted beside it has to arrive in to take the other slot. A timings object
+/// that lacks either is refused by name.
+pub fn held_ms(name: &str, v: &Value) -> Result<f64, GateError> {
+    ["prompt_ms", "predicted_ms"]
+        .iter()
+        .map(|k| {
+            v["timings"][k]
+                .as_f64()
+                .ok_or_else(|| format!("{name}: the answer's timings carry no {k}"))
+        })
+        .sum::<Result<f64, String>>()
+        .map_err(Into::into)
+}
+
+/// Two requests in flight on `addr`, both posted at once: the engine thread
+/// admits the second while the first holds its slot, so it takes the other
+/// slot whatever the body's speed (a gap between the posts outlives a fixture
+/// body's whole run, and the second then takes the first's freed slot).
+/// `request` runs each, given the server's URL maker, the request's name and
+/// its prompt ids; a panic or an error of either is the call's error.
+pub fn together<R: Send>(
+    addr: &str,
+    first: (&str, &[u32]),
+    second: (&str, &[u32]),
+    request: impl Fn(&dyn Fn(&str) -> String, &str, &[u32]) -> Result<R, GateError> + Sync,
+) -> Result<[R; 2], GateError> {
+    std::thread::scope(|sc| {
+        let a = sc.spawn(|| post(addr, first, &request));
+        let b = sc.spawn(|| post(addr, second, &request));
+        let a = a.join().map_err(|_| "a round's first request panicked")??;
+        let b = b
+            .join()
+            .map_err(|_| "a round's second request panicked")??;
+        Ok([a, b])
+    })
+}
+
+/// One request of [`together`], its error as text (a [`GateError`] is not
+/// `Send`).
+fn post<R>(
+    addr: &str,
+    (name, prompt): (&str, &[u32]),
+    request: &impl Fn(&dyn Fn(&str) -> String, &str, &[u32]) -> Result<R, GateError>,
+) -> Result<R, String> {
+    let url = |p: &str| format!("http://{addr}{p}");
+    request(&url, name, prompt).map_err(|e| e.to_string())
 }
 
 /// `/v1/chat/completions` of `messages` at temperature 0 and `max_tokens` `n`
@@ -661,12 +1116,12 @@ impl ChatReply {
         if self.ids.len() < agree {
             return (self.ids.len(), None, false);
         }
-        for k in 0..agree {
-            if self.ids[k] == want[k] {
+        for (k, &wanted) in want.iter().enumerate().take(agree) {
+            if self.ids[k] == wanted {
                 continue;
             }
             let gap = self.second[k]
-                .filter(|&(id, _)| id == want[k])
+                .filter(|&(id, _)| id == wanted)
                 .map(|(_, g)| g);
             return (k, gap, gap.is_some_and(|g| g < near_tie));
         }
@@ -825,7 +1280,7 @@ pub struct PrefixRestore<'a> {
 }
 
 /// `text` repeated until it holds `len` ids, cut to them.
-fn repeated_ids(
+pub fn repeated_ids(
     url: &dyn Fn(&str) -> String,
     text: &str,
     len: usize,
@@ -910,8 +1365,69 @@ pub fn prefix_restore(
 
 #[cfg(test)]
 mod tests {
-    use super::{LookupCompletion, draft_counts, slot_erased};
+    use std::time::{Duration, Instant};
+
+    use super::{LookupCompletion, draft_counts, held_ms, slot_erased, together};
     use serde_json::json;
+
+    /// The two requests of a round start together: the second is posted while the first still
+    /// holds its slot, however short the body's whole run is, so the second starts within
+    /// `WITHIN` of the first, a fraction of a gap a fixture body outlives. Mutant: a gap between
+    /// the posts.
+    #[test]
+    fn together_posts_both_requests_at_once() {
+        const WITHIN: Duration = Duration::from_millis(150);
+        let t0 = Instant::now();
+        let ran = together(
+            "127.0.0.1:0",
+            ("first", &[1]),
+            ("second", &[2]),
+            |url, name, prompt| {
+                let start = t0.elapsed();
+                assert_eq!(url("/completion"), "http://127.0.0.1:0/completion");
+                Ok((name.to_owned(), prompt.to_vec(), start))
+            },
+        )
+        .expect("both requests ran");
+        assert_eq!(
+            ran.each_ref().map(|r| (r.0.as_str(), r.1.as_slice())),
+            [("first", &[1][..]), ("second", &[2][..])]
+        );
+        let apart = ran[1].2.abs_diff(ran[0].2);
+        assert!(apart < WITHIN, "the posts were {apart:?} apart");
+    }
+
+    /// An error of either request is the call's error, in the request's own words.
+    #[test]
+    fn together_returns_the_request_error() {
+        let ran = together("a:0", ("one", &[1]), ("two", &[2]), |_, name, _| {
+            if name == "two" {
+                Err(format!("{name} refused").into())
+            } else {
+                Ok(name.len())
+            }
+        });
+        assert_eq!(
+            ran.expect_err("the second failed").to_string(),
+            "two refused"
+        );
+    }
+
+    /// A request's held time is its prompt and predicted milliseconds; either missing is refused
+    /// by name.
+    #[test]
+    fn held_ms_sums_the_two_timings_and_refuses_a_missing_one() {
+        let timings = json!({ "timings": {"prompt_ms": 12.5, "predicted_ms": 30.0} });
+        let held = held_ms("r", &timings).expect("both present");
+        assert!((held - 42.5).abs() < 1e-9, "{held}");
+        for gone in ["prompt_ms", "predicted_ms"] {
+            let mut bad = timings.clone();
+            bad["timings"].as_object_mut().unwrap().remove(gone);
+            let e = held_ms("r", &bad).expect_err("one missing").to_string();
+            assert_eq!(e, format!("r: the answer's timings carry no {gone}"));
+        }
+        assert!(held_ms("r", &json!({})).is_err());
+    }
 
     /// A completion's draft counts: both or neither, unsigned, at least one
     /// proposal and no more accepted than proposed.

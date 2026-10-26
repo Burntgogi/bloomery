@@ -1,26 +1,51 @@
 //! `bloomery-serve-qwen38` — the llama-server-compatible HTTP API on the
 //! Qwen3.8-Flash-Next (qwen4exp) engine: [`qwen38`]'s seat, whose module doc
 //! holds the contract (the flags, the records, the keep rule and the exit
-//! codes). `bloomery-serve --model qwen38` serves the same seat.
+//! codes). `bloomery-serve --model qwen38` serves the same seat. llama-server's placement flags,
+//! their `LLAMA_ARG_*` variables and `--list-devices` are read as `bloomery-serve` reads them
+//! (`bloomery_gpu_gates::llama_launch`).
+
+#[cfg(feature = "gpu")]
+const NAME: &str = "bloomery-serve-qwen38";
 
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
+    use bloomery_gpu_gates::llama_launch::{self, Launcher};
+
     let args: Vec<String> = std::env::args().skip(1).collect();
+    match llama_launch::answer_list_devices(&args) {
+        Ok(true) => return std::process::ExitCode::SUCCESS,
+        Ok(false) => {}
+        Err(e) => return bloomery_gpu_gates::exit_with(NAME, Err(e)),
+    }
+    // llama-server's placement flags and variables, read once the seat's own flags are out.
+    let seat = || -> Result<&'static str, bloomery_gpu_gates::GateError> { Ok("qwen38") };
+    let launcher = Launcher {
+        bin: NAME,
+        seat: &seat,
+        layers: &llama_launch::file_layers,
+        reads: llama_launch::SEAT,
+    };
     let side = bloomery_gpu_gates::side_seat::Flags::take(&args);
-    match side.and_then(|(side, rest)| qwen38::run(&rest, &side)) {
+    match side.and_then(|(side, rest)| qwen38::run(&launcher.placed(&rest)?, &side)) {
         // EX_SOFTWARE: the engine, not the listener or the load, ended the run.
         Ok(serve::ServeError::Engine(f)) => {
-            eprintln!("bloomery-serve-qwen38: {f}");
+            eprintln!("{NAME}: {f}");
             std::process::ExitCode::from(70)
         }
-        Ok(e) => bloomery_gpu_gates::exit_with("bloomery-serve-qwen38", Err(e.into())),
-        Err(e) => bloomery_gpu_gates::exit_with("bloomery-serve-qwen38", Err(e)),
+        Ok(e) => bloomery_gpu_gates::exit_with(NAME, Err(e.into())),
+        Err(e) => bloomery_gpu_gates::exit_with(NAME, Err(e)),
     }
 }
 
 #[cfg(feature = "gpu")]
 #[path = "shared/serve_seats/qwen38.rs"]
 mod qwen38;
+
+// The expert stream's rule the seat runs, its sibling as in `bloomery-serve`.
+#[cfg(feature = "gpu")]
+#[path = "shared/xstream_rule.rs"]
+mod xstream_rule;
 
 // A Qwen3.8 checkpoint folder, which the seat opens, a sibling of the seat as in `bloomery-serve`.
 #[cfg(feature = "gpu")]
@@ -50,10 +75,11 @@ mod tests {
     use bloomery_gpu::arch::qwen3moe::Prompt38;
     use bloomery_gpu_gates::GateError;
     use bloomery_levers::Draft38Off;
+    use model::placement::workstation::{A6000, RTX_3090};
 
     use super::qwen38::{
-        ACTS_ON, Feed38, draft_for_slots, draft_off_for, folder_draft_for, prompt_cuts,
-        refuse_feed, refuse_lookup_feed, refuse_media_feed,
+        ACTS_ON, Feed38, Kind38, Place38, draft_for_slots, draft_off_for, folder_draft_for,
+        prompt_cuts, refuse_feed, refuse_lookup_feed, refuse_media_feed,
     };
 
     const STEPS: Feed38 = Feed38 {
@@ -79,6 +105,64 @@ mod tests {
         match refuse_feed(feed, run, residency) {
             Err(e) => e.to_string(),
             Ok(()) => panic!("refused nothing: slots {}, draft {}", run.0, run.1),
+        }
+    }
+
+    /// The seat reads `--place` as the shared grammar with the one tier card
+    /// its body serves. The words it took before (`a`, `gate`, `bp`) parse to
+    /// the same placement and kind; a card list of this workstation's cards
+    /// spelled as an alias is that alias, and a list of other cards or of
+    /// ordinals now parses, its kind read by structure (a tier card is `bp`,
+    /// the word `gate` the gate card, any other single card `a` on that
+    /// card's own bytes). What the body cannot serve (`tp`, more than one tier card, a word no card or
+    /// ordinal spells) is refused by name at parse.
+    #[test]
+    fn the_place_word_is_the_shared_grammar_with_the_qwen38_tier_count() {
+        for (word, kind, cards) in [
+            ("a", Kind38::A, vec![A6000.name]),
+            ("gate", Kind38::Gate, vec![RTX_3090.name]),
+            ("bp", Kind38::Bp, vec![A6000.name, RTX_3090.name]),
+        ] {
+            let p = Place38::parse(word).unwrap_or_else(|e| panic!("{word}: {e}"));
+            assert_eq!(
+                (p.kind, p.name(), p.cards.cards()),
+                (kind, word, cards),
+                "{word}"
+            );
+            assert_eq!(p.tiered(), kind == Kind38::Bp, "{word}");
+            assert_eq!(p.stage_a(), kind != Kind38::Gate, "{word}");
+        }
+        for (spelled, alias) in [("a6000", "a"), ("3090", "gate"), ("a6000+3090", "bp")] {
+            let p = Place38::parse(spelled).unwrap_or_else(|e| panic!("{spelled}: {e}"));
+            let q = Place38::parse(alias).expect(alias);
+            assert_eq!((p.kind, p.name()), (q.kind, q.name()), "{spelled}");
+        }
+        for (word, kind, cards) in [
+            ("cuda1", Kind38::A, vec!["cuda1"]),
+            ("cuda0", Kind38::A, vec!["cuda0"]),
+            ("cuda1+cuda0", Kind38::Bp, vec!["cuda1", "cuda0"]),
+            ("0+1", Kind38::Bp, vec!["cuda0", "cuda1"]),
+            ("3090+a6000", Kind38::Bp, vec![RTX_3090.name, A6000.name]),
+        ] {
+            let p = Place38::parse(word).unwrap_or_else(|e| panic!("{word}: {e}"));
+            assert_eq!(
+                (p.kind, p.name(), p.cards.cards()),
+                (kind, word, cards),
+                "{word}"
+            );
+            assert_eq!(p.tiered(), kind == Kind38::Bp, "{word}");
+            assert_eq!(p.stage_a(), kind != Kind38::Gate, "{word}");
+        }
+        for (word, why) in [
+            ("tp", "--place tp: a tensor-parallel run"),
+            (
+                "cuda0+cuda1+cuda2",
+                "--place cuda0+cuda1+cuda2: 2 expert tier cards, and the qwen4exp body serves 1 at most",
+            ),
+            ("b2", "--place is a, gate, bp"),
+        ] {
+            let e = Place38::parse(word).expect_err(word).to_string();
+            assert!(e.starts_with(why), "{word}: {e}");
         }
     }
 

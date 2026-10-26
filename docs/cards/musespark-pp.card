@@ -1,0 +1,25 @@
+# Round musec3: Muse Spark Open's prompt batch (crates/gpu/src/arch/musespark/body/prefill.rs), the first pp row.
+# Decomposition per 512-row pass and layer, the placed body (one card + the host tier; the body hosts no tier card):
+#   host CPU   the union of the hosted experts' columns, m = 512 * 8 / 256 = 16 a hosted expert:
+#              t = max(94.7 us, 28.1 + 38.4 * (1.0..1.5) * 16 us) = 0.64..0.95 ms an expert, 163..245 ms a layer
+#              (muse-spark-attach.md section 5's terms); 62 layers -> 10.1..15.2 s a pass.
+#   card SM    dense GEMMs 285 MMAC a row -> 146 GMAC a layer, ~10 ms; attention at P = 512 under 1 ms; tiles
+#              and copies ~0.2 ms: ~0.6 s a pass, serial with the host (the walk is one unit a pass).
+#   PCIe       the experts' rows, weights and ids down, the host sums up: ~17 MB a layer, 0.7 ms.
+#   host DRAM  each hosted expert's 12.98 MB read once a pass: 3.3 GB a layer in 163..245 ms, 13..20 GB/s.
+#   => host-CPU bound: pp512 34..51 tok/s with every routed expert on the host; the plan's card share (the
+#      card's experts run in the host's shadow) lifts it toward 60. pp4096 the same per pass plus the
+#      attention's K/V reads (~2.5 s over 8 passes): 33..50 tok/s.
+kind: baseline
+question: what is our Muse Spark Open pp512 on the A6000 + host placed body with the prompt batch?
+term: pp tok/s @ P = 512, bloomery prompt call (app::Prompt for Body -> GpuModel::prefill), A6000 + host,
+  serve defaults, the warm second repetition
+unit: tok/s
+predict: 34..60
+condition: one load, two prompt calls of 512 ids from a reset in its own lease, the second counts; the
+  witness around the arm (mem, pgmajfault) shows no other model load and the host tier's pages resident
+reason: the 0.3.9 release states measured pp512 / pp4096 / decode for Muse; the batch replaces one step an id
+decide-in: write the row into the Muse table with its lease and witness, and sit pp4096 next
+decide-below: read the host union's per-expert time against the 0.64..0.95 ms term; a miss there is the
+  finding (the union tail's column cap, the pass rows the room allowed)
+decide-above: re-derive the host term: the plan's card share or the union's MAC rate was under-counted

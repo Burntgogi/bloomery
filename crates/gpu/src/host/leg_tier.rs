@@ -8,14 +8,18 @@
 //!
 //! The tier's layer is the card leg ([`CardLeg::enqueue_rows`]) over the
 //! tier's stacks: the q8_1 of the activation, the gate·up `_sel` with the
-//! routed clamped SwiGLU, the selected down form of the tier slots' columns
-//! and the down `_sel` into the tier's rows; over a prompt batch's block, the same run
+//! routed activation the family names, the selected down form of the tier
+//! slots' columns and the down `_sel` into the tier's rows; over a prompt
+//! batch's block, the same run
 //! chunk by chunk of `shape.cap` tokens. Each slot's down output is the one
 //! the stage card would write for it, so the card sum over both cards' slots
 //! in slot order is the one-card sum over their union. The row's tier image
 //! carries the normed activation in f32 ([`TierAct::F32`]): the tier
-//! quantizes it with the kernel the stage card quantizes with.
+//! quantizes it with the kernel the stage card quantizes with. The leg's
+//! buffers hold the slots' columns in each form the tier layers' downs read
+//! (an NVFP4 down's 32-value blocks among them).
 
+use std::error::Error;
 use std::mem::size_of;
 use std::ops::Range;
 use std::sync::Arc;
@@ -23,7 +27,7 @@ use std::sync::Arc;
 use cuda_core::DeviceBuffer;
 use gguf::Split;
 use model::ModelError;
-use model::arch::models::{Ffn, LayerSpec};
+use model::arch::models::{Ffn, LayerSpec, Moe};
 use model::arch::names::routed_stacks;
 use model::moe::HostLayer;
 use model::placement::accepts::{self, LegArms, Program};
@@ -39,6 +43,7 @@ use super::tier::{
 use crate::card_leg::{CardLeg, LegBufs, LegRun, LegShape, LegStacks};
 use crate::hybrid::{Hybrid, SlotMap};
 use crate::kquant::Act;
+use crate::model::CardBytes;
 use crate::weights::Weights;
 use crate::{DeviceTensor, Gpu, GpuError, Window, WindowMut};
 
@@ -155,10 +160,11 @@ fn past_rows(n: usize, row: usize) -> GpuError {
     }
 }
 
-/// A tier layer's experts, its routed SwiGLU limit and its stacks' names.
+/// A tier layer's experts, the activation the family named for it and its
+/// stacks' names.
 struct TierLayer {
     k: usize,
-    limit: f32,
+    rule: Act,
     names: [String; 3],
 }
 
@@ -173,7 +179,8 @@ impl TierLayer {
 /// leg over the tier's stacks into the tier's rows; over a prompt batch's
 /// block, the same chunk by chunk. Its scratch, one [`LegBufs`] for
 /// `shape.cap` tokens that a step's one token and each chunk share, is made
-/// at load.
+/// at load. The activation is the family's ([`LegFamily::tier_act`]); the
+/// selected program owns the stack arms ([`accepts::leg_arms`]).
 pub struct LegTier {
     leg: CardLeg,
     bufs: LegBufs,
@@ -187,10 +194,14 @@ pub struct LegTier {
 impl LegTier {
     /// The tier's computation on `gpu` over `set`, whose stacks `w` holds,
     /// for the description `layers`, through the leg of `shape` (`cap` tokens
-    /// of `slots_per_col` slots a run, `n` wide, experts `ff` wide). A tier
-    /// layer whose three stacks are absent, of a type the card experts do not
-    /// read, or of other rows than its experts', and a layer off the tier
-    /// with resident stacks, are refused by name. Load-time only.
+    /// of `slots_per_col` slots a run, `n` wide, experts `ff` wide). The
+    /// activation is the family's `act` ([`LegFamily::tier_act`]) and the
+    /// stacks are read by the selected `program`'s arms. Missing or unreadable
+    /// stacks, rows that differ from the tier's experts, and resident stacks
+    /// on a layer off the tier are refused by name. The
+    /// leg's buffers hold the columns in the forms the tier layers' downs
+    /// read ([`kernels::down`]), no down form on a tier of no layer.
+    /// Load-time only.
     pub fn new(
         gpu: &Gpu,
         layers: &[LayerSpec],
@@ -198,14 +209,15 @@ impl LegTier {
         w: &Weights,
         shape: LegShape,
         program: Program,
+        act: fn(&Moe) -> Result<Act, GpuError>,
     ) -> Result<LegTier, GpuError> {
         let arms = accepts::leg_arms(program).ok_or(GpuError::state(
             WHAT,
             "the selected program's card leg arms",
         ))?;
-        let mut downs = DownForms::NONE;
         let run = set.layers();
         let mut cfg = Vec::with_capacity(run.len());
+        let mut downs = DownForms::NONE;
         for l in run.clone() {
             let k = set.on_tier(l)?;
             let names = routed_stacks(l);
@@ -228,16 +240,17 @@ impl LegTier {
             };
             let layer = TierLayer {
                 k,
-                limit: m.act.swiglu_limit(),
+                rule: act(m)?,
                 names,
             };
             let stacks = LegStacks::of_arms(w, layer.names(), arms, STACK_ROLES)?;
             stacks.check(k, shape)?;
-            let (_, act) = kernels::down(stacks.down_ty()).ok_or(GpuError::state(
-                WHAT,
-                "the selected tier down's activation form",
-            ))?;
-            downs = downs.with(act);
+            let (_, form) = kernels::down(stacks.down_ty()).ok_or_else(|| GpuError::Tensor {
+                what: WHAT,
+                name: layer.names[2].clone(),
+                need: "a down stack of a type the kernel table names a down entry for",
+            })?;
+            downs = downs.with(form);
             cfg.push(Some(layer));
         }
         Ok(LegTier {
@@ -294,6 +307,7 @@ impl TierExperts for LegTier {
             shape,
             arms,
         } = self;
+        let arms = *arms;
         let LegShape {
             cap,
             slots_per_col,
@@ -301,7 +315,7 @@ impl TierExperts for LegTier {
             ..
         } = *shape;
         let tl = layer_of(layers, cfg, layer, W)?;
-        let stacks = LegStacks::of_arms(weights, tl.names(), *arms, STACK_ROLES)?;
+        let stacks = LegStacks::of_arms(weights, tl.names(), arms, STACK_ROLES)?;
         for c0 in (0..io.cols).step_by(cap) {
             let cn = cap.min(io.cols - c0);
             let slots = cn * slots_per_col;
@@ -319,7 +333,7 @@ impl TierExperts for LegTier {
                 m: cn,
                 sel: &sel,
                 n_card: tl.k,
-                rule: Act::SwigluClamp { limit: tl.limit },
+                rule: tl.rule,
             };
             leg.enqueue_rows(gpu, bufs, &run, &mut down)?;
         }
@@ -336,6 +350,7 @@ impl TierExperts for LegTier {
         io: TierIo<'_>,
     ) -> Result<(), GpuError> {
         const W: &str = "LegTier::enqueue_layer";
+        let arms = self.arms;
         let tl = layer_of(&self.layers, &self.cfg, layer, W)?;
         let TierInput::F32(x) = io.act else {
             return Err(GpuError::Shape {
@@ -344,7 +359,7 @@ impl TierExperts for LegTier {
                     .to_string(),
             });
         };
-        let stacks = LegStacks::of_arms(weights, tl.names(), self.arms, STACK_ROLES)?;
+        let stacks = LegStacks::of_arms(weights, tl.names(), arms, STACK_ROLES)?;
         let run = LegRun {
             layer,
             stacks: &stacks,
@@ -352,7 +367,7 @@ impl TierExperts for LegTier {
             m: 1,
             sel: io.sel,
             n_card: tl.k,
-            rule: Act::SwigluClamp { limit: tl.limit },
+            rule: tl.rule,
         };
         self.leg.enqueue_rows(gpu, &mut self.bufs, &run, io.rows)
     }
@@ -404,13 +419,14 @@ impl LegOpen {
 
 /// The tier card `t` of `plan`, tier `tier` of `map`, for the stage card
 /// `stage`'s load, opened in this process or on its node through the common
-/// node owner ([`NodeOpen::open_tier`]): its set the map's rows of that
-/// tier, the family's tier computation over them (`family`, the open
-/// `open`), `card_dontneed` as for the stage card's segments. The stage
-/// card's context is current again on return. Load-time only.
+/// node owner ([`NodeOpen::open_tier_from`]): its set the map's rows of that
+/// tier, its segments from `bytes` as the stage card's come, the family's
+/// tier computation over them (`family`, the open `open`), `card_dontneed`
+/// as for the stage card's segments. The stage card's context is current
+/// again on return. Load-time only.
 pub fn open_tier(
     stage: &Gpu,
-    file: &Arc<Split>,
+    (file, bytes): (&Arc<Split>, &CardBytes<'_>),
     plan: &Plan<'_>,
     (t, tier): (&TierOpen, usize),
     map: &SlotMap,
@@ -434,14 +450,17 @@ pub fn open_tier(
         name: t.name.clone(),
         device: t.device,
         card: t.card,
-        rows: NodeOpen::rows_of(plan, file, t.card)?,
+        rows: match bytes {
+            CardBytes::File => NodeOpen::rows_of(plan, file, t.card)?,
+            CardBytes::Parts(_) => NodeOpen::rows_unhashed(plan, t.card)?,
+        },
         set: TierSet::of_map(map, tier)?,
         shape: open.shape(),
         cols: 1,
         layers: open.layers,
         block: (0, 0),
     }
-    .open_tier(stage, file, plan, t.node, family, card_dontneed)
+    .open_tier_from(stage, (file, bytes), plan, t.node, family, card_dontneed)
 }
 
 /// The routed block's widths a family's description gives the tier.
@@ -500,12 +519,41 @@ pub trait LegFamily {
     fn widths(inputs: &Self::Inputs) -> LegWidths;
     /// The host views of the routed layers `run`, each from the family's
     /// host reader; a layer of the run that does not route is refused by
-    /// name. Load-time only.
+    /// name. Load-time only. A family whose reader does not return
+    /// [`ModelError`] serves the views through [`LegFamily::routed_views`]
+    /// and leaves this to its default.
     fn routed(
         src: R8Source<'_>,
         inputs: &Self::Inputs,
         run: Range<usize>,
-    ) -> Result<Vec<HostLayer>, ModelError>;
+    ) -> Result<Vec<HostLayer>, ModelError> {
+        let _ = (src, inputs, run);
+        panic!(
+            "{}: the family serves its host views through LegFamily::routed_views",
+            Self::WHAT
+        )
+    }
+
+    /// [`LegFamily::routed`] as the node host run boxes it. The default
+    /// boxes that reader's [`ModelError`]; a family whose reader returns
+    /// another error overrides this and leaves [`LegFamily::routed`] to its
+    /// default.
+    fn routed_views(
+        src: R8Source<'_>,
+        inputs: &Self::Inputs,
+        run: Range<usize>,
+    ) -> Result<Vec<HostLayer>, Box<dyn Error + Send + Sync + 'static>> {
+        Self::routed(src, inputs, run).map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)
+    }
+
+    /// The activation a tier layer of `moe` runs. The default is the card
+    /// leg's clamped SwiGLU at the block's limit; a block that is not
+    /// SwiGLU panics by name, as the limit's own reader does.
+    fn tier_act(moe: &Moe) -> Result<Act, GpuError> {
+        Ok(Act::SwigluClamp {
+            limit: moe.act.swiglu_limit(),
+        })
+    }
 }
 
 /// The family `F`'s tier node service: the placement tensors of a file, the
@@ -557,6 +605,7 @@ fn node_experts<F: LegFamily>(
         w,
         shape,
         widths.program,
+        F::tier_act,
     )?))
 }
 
@@ -574,7 +623,10 @@ fn node_host<F: LegFamily>(file: Arc<Split>, open: &NodeOpen) -> Result<HostRun,
             ff: w.ff,
             n_used: w.n_used,
         },
-        |src| F::routed(src, &inputs, run),
+        |src| {
+            F::routed_views(src, &inputs, run)
+                .map_err(|e| GpuError::shape(F::WHAT, format!("the node host run's views: {e}")))
+        },
     )
 }
 
@@ -593,6 +645,10 @@ pub struct Hang<'a> {
     /// The release of the tier's file pages, as for the stage card's
     /// segments.
     pub card_dontneed: bool,
+    /// Where the tier's card tensors come from: the stage card's source
+    /// (`GpuModel::load_placed_from`'s), the file's segments or a checkpoint
+    /// folder's part source.
+    pub bytes: CardBytes<'a>,
 }
 
 /// Open every expert tier card of `hang` for the stage card `gpu`'s load of
@@ -618,7 +674,7 @@ pub fn hang_tiers(
         .map(|(i, t)| {
             open_tier(
                 gpu,
-                file,
+                (file, &hang.bytes),
                 plan,
                 (t, i),
                 hybrid.slots(),

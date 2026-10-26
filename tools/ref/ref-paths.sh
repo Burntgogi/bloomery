@@ -31,12 +31,16 @@
 # the second profile's set name, tokens and lease would be applied to the first profile's file.
 #
 # The tier. BLOOMERY_TIER is `real` (unset is the same: every name here is as the profile defines it) or `fixture`: the
-# model file is the family's fixture — the small file `fixture generate` writes (crates/model-hf/src/bin/fixture.rs), whose header
-# names the card budget that forces the plan to offload (`fixture_budget`, below; tools/box.sh exports it as BLOOMERY_CARD_BUDGET).
+# model is the family's fixture — the small file `fixture generate` writes (crates/model-hf/src/bin/fixture.rs), or the small
+# checkpoint folder `fixture cut` writes (crates/model-hf/src/cut.rs), whose header names the card budget that forces the plan
+# to offload (`fixture_budget`, below; tools/box.sh exports it as BLOOMERY_CARD_BUDGET).
 # What the fixture tier does is the family's, one row of tools/fixture-dirs.tsv:
-#   a fixture directory    the first shard `*-00001-of-*.gguf` of the one directory under $BLOOMERY_FIXTURE_ROOT
-#                          (default /models/fixtures), one a family; MODEL becomes it unless BLOOMERY_REF_MODEL names a file
-#                          already (a caller's own wins), and FIXTURE_FILE names it either way. Not one file there: 66.
+#   a fixture directory    the one directory under $BLOOMERY_FIXTURE_ROOT (default /models/fixtures) a family has. It holds GGUF
+#                          shards, the first `*-00001-of-*.gguf`, or, with a model.safetensors.index.json beside them, a checkpoint
+#                          folder, the first shard `*-00001-of-*.safetensors`; both kinds, or not one first shard there: 66.
+#                          FIXTURE_FILE names the first shard either way (`fixture_line` and `fixture_budget` read it), and
+#                          FIXTURE_MODEL what the model is: the first shard of a GGUF fixture, the folder of a cut. MODEL becomes
+#                          FIXTURE_MODEL unless BLOOMERY_REF_MODEL names a model already (a caller's own wins).
 #   self                   the family has no fixture file: FIXTURE_FILE stays empty and a command runs on the profile's file, and
 #                          one that opens no model runs as in the real tier; the gate fence (Tier::check_file, crates/gpu-gates/src/tier.rs)
 #                          refuses that file as not a fixture, so tools/gate-batch.sh defers, as real-file, a recipe whose targets reach it.
@@ -77,6 +81,7 @@ IKBIN=${IKBIN:-$IK/build/bin/llama-bench}
 REF_PATHS_DIR=${BASH_SOURCE[0]%/*}
 FIXTURE_FILE=
 FIXTURE_DIR=
+FIXTURE_MODEL=
 FIXTURE_VARIANT=${BLOOMERY_FIXTURE_VARIANT:-}
 case $FIXTURE_VARIANT in
   *[!a-z0-9]*)
@@ -126,17 +131,32 @@ case "${BLOOMERY_TIER:-real}" in
         fi
         FIXTURE_DIR=$__fixture_root/$__fixture_dir
         if [ -z "${FIXTURE_NEW:-}" ]; then
+          # A directory that holds a checkpoint folder's index is a folder fixture (`fixture cut`), its first shard the
+          # safetensors one and the model the folder; any other holds GGUF shards (`fixture generate`), the model the first
+          # shard. refset's fixture::first_shard_in is this rule's twin, down to a directory that holds both kinds.
+          __fixture_ext=gguf
+          __fixture_verb=generate
           __fixture_files=("$__fixture_root/$__fixture_dir"/*-00001-of-*.gguf)
+          if [ -f "$FIXTURE_DIR/model.safetensors.index.json" ]; then
+            if [ -e "${__fixture_files[0]}" ]; then
+              echo "ref-paths.sh: BLOOMERY_TIER=fixture: $FIXTURE_DIR holds both a checkpoint folder's index and GGUF first shards (${__fixture_files[*]}), which are two fixtures in one directory (exit 66)" >&2
+              exit 66
+            fi
+            __fixture_ext=safetensors
+            __fixture_verb="cut"
+            __fixture_files=("$FIXTURE_DIR"/*-00001-of-*.safetensors)
+          fi
           if [ ! -e "${__fixture_files[0]}" ]; then
-            echo "ref-paths.sh: BLOOMERY_TIER=fixture: the family '$BLOOMERY_MODEL' has no fixture file, no $__fixture_root/$__fixture_dir/*-00001-of-*.gguf (\`fixture generate\` writes it${FIXTURE_VARIANT:+, \`just fixture-requant $BLOOMERY_MODEL $FIXTURE_VARIANT\` writes the variant file}); not running it on its real file (exit 66)" >&2
+            echo "ref-paths.sh: BLOOMERY_TIER=fixture: the family '$BLOOMERY_MODEL' has no fixture file, no $FIXTURE_DIR/*-00001-of-*.$__fixture_ext (\`fixture $__fixture_verb\` writes it${FIXTURE_VARIANT:+, \`just fixture-requant $BLOOMERY_MODEL $FIXTURE_VARIANT\` writes the variant file}); not running it on its real file (exit 66)" >&2
             exit 66
           fi
           if [ "${#__fixture_files[@]}" != 1 ]; then
-            echo "ref-paths.sh: BLOOMERY_TIER=fixture: $__fixture_root/$__fixture_dir holds ${#__fixture_files[@]} first shards (${__fixture_files[*]}), not one (exit 66)" >&2
+            echo "ref-paths.sh: BLOOMERY_TIER=fixture: $FIXTURE_DIR holds ${#__fixture_files[@]} first shards (${__fixture_files[*]}), not one (exit 66)" >&2
             exit 66
           fi
           FIXTURE_FILE=${__fixture_files[0]}
-          [ -n "${BLOOMERY_REF_MODEL:-}" ] || MODEL=$FIXTURE_FILE
+          if [ "$__fixture_ext" = safetensors ]; then FIXTURE_MODEL=$FIXTURE_DIR; else FIXTURE_MODEL=$FIXTURE_FILE; fi
+          [ -n "${BLOOMERY_REF_MODEL:-}" ] || MODEL=$FIXTURE_MODEL
         fi
         # A family whose fixture has a DSpark draft keeps it in a directory of its own beside the target's shards (the glob above sees
         # the target's first shard only): the fixture tier's draft is that file, never the real draft the profile names. A caller's own
@@ -148,15 +168,32 @@ case "${BLOOMERY_TIER:-real}" in
           DSPARK_MODEL=
           DSPARK_MODEL_WHY=
           __fixture_drafts=("$__fixture_root/$__fixture_dir"/draft/*.gguf)
-          if [ -e "${__fixture_drafts[0]}" ] && [ "${#__fixture_drafts[@]}" = 1 ]; then
+          # A variant's map retypes the target's tensors and never the draft, so a variant directory with no draft of its own answers
+          # the fixture's one; a draft of its own that differs from the fixture's is refused (`cmp`), by name.
+          __fixture_base=()
+          if [ -n "$FIXTURE_VARIANT" ]; then
+            __fixture_base=("${BLOOMERY_FIXTURE_ROOT:-/models/fixtures}/$__fixture_dir"/draft/*.gguf)
+            if [ ! -e "${__fixture_drafts[0]}" ] && [ -e "${__fixture_base[0]}" ] && [ "${#__fixture_base[@]}" = 1 ]; then
+              __fixture_drafts=("${__fixture_base[@]}")
+            elif [ -e "${__fixture_drafts[0]}" ] && [ "${#__fixture_drafts[@]}" = 1 ] && [ -e "${__fixture_base[0]}" ] &&
+              [ "${#__fixture_base[@]}" = 1 ] && ! cmp -s "${__fixture_drafts[0]}" "${__fixture_base[0]}"; then
+              DSPARK_MODEL_WHY="ref-paths.sh: BLOOMERY_TIER=fixture: the variant $FIXTURE_VARIANT holds the draft ${__fixture_drafts[0]}, which differs from the fixture's ${__fixture_base[0]}; a variant's map never retypes the draft (exit 66)"
+            fi
+          fi
+          if [ -n "$DSPARK_MODEL_WHY" ]; then
+            :
+          elif [ -e "${__fixture_drafts[0]}" ] && [ "${#__fixture_drafts[@]}" = 1 ]; then
             DSPARK_MODEL=${__fixture_drafts[0]}
           else
             DSPARK_MODEL_WHY="ref-paths.sh: BLOOMERY_TIER=fixture: $__fixture_root/$__fixture_dir/draft holds ${#__fixture_drafts[@]} files (${__fixture_drafts[*]}), want the one DSpark fixture draft (\`fixture generate\` writes it); not running a draft on the real file (exit 66)"
+            if [ -n "$FIXTURE_VARIANT" ]; then
+              DSPARK_MODEL_WHY="${DSPARK_MODEL_WHY%(exit 66)}and the fixture's own draft directory holds ${#__fixture_base[@]} files (${__fixture_base[*]}) (exit 66)"
+            fi
           fi
         fi
         ;;
     esac
-    unset __fixture_dir __fixture_root __fixture_files __fixture_drafts __variant_family
+    unset __fixture_dir __fixture_root __fixture_files __fixture_drafts __fixture_base __fixture_ext __fixture_verb __variant_family
     ;;
   *)
     echo "ref-paths.sh: BLOOMERY_TIER is real (unset: the same) or fixture, got '${BLOOMERY_TIER}'" >&2
@@ -178,19 +215,22 @@ dspark_model() {
 
 # fixture_budget: what a command under the fixture tier needs of the fixture's header, once per command (tools/box.sh calls it):
 # the card budget the generator recorded (bloomery.fixture.card_budget, bytes) on stdout, nothing for a family whose real file
-# stands (FIXTURE_FILE empty). The header is read through tools/ref/gguf-ranges.py's reader; a file that is not a whole fixture
-# — no bloomery.fixture.version key, a bloomery.fixture.subset key (it holds some of the planned tensors only), no
+# stands (FIXTURE_FILE empty). A GGUF header is read through tools/ref/gguf-ranges.py's reader, a cut folder's first shard through
+# its safetensors `__metadata__` (every bloomery.fixture.* value a string, the budget decimal digits); a file that is not a whole
+# fixture — no bloomery.fixture.version key, a bloomery.fixture.subset key (it holds some of the planned tensors only), no
 # positive integer card budget, or no readable header — is a named 65 (or the reader's own code), never a plan without a budget.
 fixture_budget() {
   [ -n "$FIXTURE_FILE" ] || return 0
   python3 -I - "$REF_PATHS_DIR/gguf-ranges.py" "$FIXTURE_FILE" << 'PY'
 import importlib.util
+import json
 import sys
 
 spec = importlib.util.spec_from_file_location("gguf_ranges", sys.argv[1])
 reader = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(reader)
 path = sys.argv[2]
+MAX_HEADER = 64 << 20  # refset::fixture's bound: a longer length word is a corrupt file
 
 
 def refuse(code, why):
@@ -198,15 +238,48 @@ def refuse(code, why):
     sys.exit(code)
 
 
-try:
-    meta = reader.header(path)[0]
-except reader.Refusal as e:
-    refuse(e.code, str(e))
+def safetensors_meta(path):
+    """The `__metadata__` of a safetensors shard, the fixture keys of a folder fixture's first shard."""
+    try:
+        with open(path, "rb") as fh:
+            word = fh.read(8)
+            if len(word) != 8:
+                refuse(65, f"{path} is not a readable safetensors header: no length word")
+            n = int.from_bytes(word, "little")
+            if n > MAX_HEADER:
+                refuse(65, f"{path} is not a readable safetensors header: it claims {n} bytes, over {MAX_HEADER}")
+            text = fh.read(n)
+    except OSError as e:
+        refuse(65, f"{path} is not a readable safetensors header: {e}")
+    if len(text) != n:
+        refuse(65, f"{path} is not a readable safetensors header: {len(text)} of {n} bytes")
+    try:
+        header = json.loads(text)
+    except ValueError as e:
+        refuse(65, f"{path} is not a readable safetensors header: {e}")
+    if not isinstance(header, dict) or not isinstance(header.get("__metadata__"), dict):
+        refuse(65, f"{path} is not a readable safetensors header: no __metadata__ object")
+    for k, v in header["__metadata__"].items():
+        if k.startswith("bloomery.fixture.") and not isinstance(v, str):
+            refuse(65, f"{path}: {k}: {v!r} is not a string, which a safetensors metadata value is")
+    return header["__metadata__"]
+
+
+folder = path.endswith(".safetensors")
+if folder:
+    meta = safetensors_meta(path)
+else:
+    try:
+        meta = reader.header(path)[0]
+    except reader.Refusal as e:
+        refuse(e.code, str(e))
 if "bloomery.fixture.version" not in meta:
     refuse(65, f"{path} has no bloomery.fixture.version key: it is not a fixture file")
 if "bloomery.fixture.subset" in meta:
     refuse(65, f"{path} carries bloomery.fixture.subset: it holds only some of the planned tensors, and the engine must not run it")
 budget = meta.get("bloomery.fixture.card_budget")
+if folder and isinstance(budget, str) and budget.isascii() and budget.isdecimal():
+    budget = int(budget)  # a safetensors metadata value is text
 if not isinstance(budget, int) or isinstance(budget, bool) or budget <= 0:
     refuse(65, f"{path} records no positive bloomery.fixture.card_budget (read {budget!r})")
 print(budget)
@@ -217,10 +290,10 @@ PY
 # SET_PREFIX: `fx_` under the fixture tier, where a set is the fixture file's and carries its real twin's name behind that
 # prefix (the fixture families of crates/refset name them), `fx_<tag>_` for a variant's (refset's fixture::variant_set_name is
 # its twin), and nothing in the real tier. In the fixture tier it refuses, by
-# name: a family whose real file stands (no fixture file, 66), and a model that is not the fixture first shard (64) — a caller's
+# name: a family whose real file stands (no fixture file, 66), and a model that is not the fixture (FIXTURE_MODEL, 64) — a caller's
 # own BLOOMERY_REF_MODEL wins over the fixture in ref-paths.sh above, and an `fx_` set of another file would be a wrong answer
-# under a right name. The model string is the one refset's `fixture::first_shard` returns, so the dumper's `# model` line is
-# the string the fixture family checks.
+# under a right name. A GGUF fixture's model string is the one refset's `fixture::first_shard` returns, so the dumper's `# model`
+# line is the string the fixture family checks; a cut folder's dumper writes that line from the folder's first shard itself.
 fixture_dump_tier() {
   SET_PREFIX=
   [ "${BLOOMERY_TIER:-real}" = fixture ] || return 0
@@ -228,8 +301,8 @@ fixture_dump_tier() {
     echo "$1: BLOOMERY_TIER=fixture, but the $MODEL_NAME profile's real file stands in the fixture tier (it has no fixture file of its own), so there is no fixture set to dump; run it in the real tier (exit 66)" >&2
     exit 66
   fi
-  if [ "$MODEL" != "$FIXTURE_FILE" ]; then
-    echo "$1: BLOOMERY_TIER=fixture, but the model is $MODEL, not the fixture $FIXTURE_FILE (a BLOOMERY_REF_MODEL of the caller's?): an fx_ set is the fixture file's, never another file's (exit 64)" >&2
+  if [ "$MODEL" != "$FIXTURE_MODEL" ]; then
+    echo "$1: BLOOMERY_TIER=fixture, but the model is $MODEL, not the fixture $FIXTURE_MODEL (a BLOOMERY_REF_MODEL of the caller's?): an fx_ set is the fixture file's, never another file's (exit 64)" >&2
     exit 64
   fi
   SET_PREFIX=fx_${FIXTURE_VARIANT:+${FIXTURE_VARIANT}_}

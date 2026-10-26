@@ -2,7 +2,7 @@
 //! runs them: [`Pre::DeepseekV3`] (`deepseek-v3`, `hunyuan-dense`,
 //! `joyai-llm`), [`Pre::Qwen2`] (`qwen2`, `solar-open`), [`Pre::Glm4`] (`glm4`),
 //! [`Pre::Qwen35`] (`qwen35`), [`Pre::Pixtral`] (`pixtral`),
-//! [`Pre::MiniMaxM2`] (`minimax-m2`), [`Pre::Gemma4`] (`gemma4`),
+//! [`Pre::MiniMaxM2`] (`minimax-m2`), [`Pre::Gpt4o`] (`gpt-4o`), [`Pre::Gemma4`] (`gemma4`),
 //! [`Pre::Raon`] (`raon`) and [`Pre::Flint`] (`flint`).
 //!
 //! ## deepseek-v3
@@ -157,13 +157,17 @@
 //! the split and merges raw UTF-8 characters ([`Spelling::Metaspace`]).
 
 use crate::spelling::Spelling;
-use crate::unicode::{collapse, collapse_hf};
+use crate::unicode::{collapse, collapse_hf, letter_case};
 
 const NUMBER: u8 = 0xD1;
 const LETTER: u8 = 0xD2;
 const PUNCT: u8 = 0xD3;
 const MARK: u8 = 0xD4;
 const SYMBOL: u8 = 0xD5;
+/// A letter of Unicode 14.0's `Lu` or `Lt`, and one of its `Ll`, where a regex tells them apart
+/// ([`collapse_cased`]); `Lm` and `Lo` stay [`LETTER`], a member of both.
+const UPPER_LETTER: u8 = 0xD6;
+const LOWER_LETTER: u8 = 0xD7;
 
 fn is_space(c: u8) -> bool {
     // std::regex `\s` on a `char` in the C locale; non-ASCII whitespace has
@@ -212,12 +216,12 @@ fn run(c: &[u8], i: usize, hi: usize, pred: impl Fn(u8) -> bool) -> usize {
     c[i..hi].iter().take_while(|&&x| pred(x)).count()
 }
 
-/// Regex 1 at `i`: one to three numbers.
-fn match_number(c: &[u8], i: usize, hi: usize) -> usize {
-    run(c, i, hi, is_number).min(3)
+/// `\p{N}{1,max}` at `i`: one to `max` numbers, 0 for none.
+fn match_number(c: &[u8], i: usize, hi: usize, max: usize) -> usize {
+    run(c, i, hi, is_number).min(max)
 }
 
-/// `[^\s\p{L}\p{N}]`: the "other" run's class of qwen2, glm4 and minimax-m2.
+/// `[^\s\p{L}\p{N}]`: the "other" run's class of qwen2 and glm4.
 fn is_other(c: u8) -> bool {
     !is_space(c) && !is_letter(c) && !is_number(c)
 }
@@ -260,6 +264,45 @@ fn match_space(c: &[u8], i: usize, hi: usize) -> usize {
     if w > 1 { w - 1 } else { w }
 }
 
+/// `P?[\p{L}\p{M}]+` at `i`, the word alternative of qwen35 and of deepseek-v3's regex 3: the
+/// prefix first (a greedy `?` backs off only when the run after it fails), then the run alone.
+/// `prefix(x)` is whether `x` is a codepoint of `P`.
+fn match_prefixed_word(c: &[u8], i: usize, hi: usize, prefix: impl Fn(u8) -> bool) -> usize {
+    if prefix(c[i]) && i + 1 < hi {
+        let n = run(c, i + 1, hi, is_letter_or_mark);
+        if n > 0 {
+            return 1 + n;
+        }
+    }
+    run(c, i, hi, is_letter_or_mark)
+}
+
+/// The alternatives every regex here ends with, at `i`: `\p{N}{1,digits}` (none when `digits` is
+/// 0), ` ?[other]+[tail]*` and `\s*[\r\n]+|\s+(?!\S)|\s+`. A space is none of `other`, so backing
+/// the optional space off never helps.
+fn match_tail(
+    c: &[u8],
+    i: usize,
+    hi: usize,
+    digits: usize,
+    other: impl Fn(u8) -> bool,
+    tail: impl Fn(u8) -> bool,
+) -> usize {
+    let n = match_number(c, i, hi, digits);
+    if n > 0 {
+        return n;
+    }
+    let start = if c[i] == b' ' { i + 1 } else { i };
+    if start < hi {
+        let n = run(c, start, hi, other);
+        if n > 0 {
+            let end = start + n;
+            return end + run(c, end, hi, tail) - i;
+        }
+    }
+    match_space(c, i, hi)
+}
+
 /// The `qwen35` regex at `i`: the first of its alternatives that matches,
 /// under ECMAScript semantics (alternatives in order, greedy quantifiers that
 /// back off). None of them can match the empty string, and a mark is a plain
@@ -267,57 +310,31 @@ fn match_space(c: &[u8], i: usize, hi: usize) -> usize {
 /// `fold(k)` is the lowercase ASCII letter the codepoint at `k` matches in a
 /// contraction.
 fn match_qwen35(c: &[u8], i: usize, hi: usize, fold: impl Fn(usize) -> u8) -> usize {
-    let at = |k: usize| c[k];
-
     // `(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])`
     let n = contraction(c, i, hi, fold);
     if n > 0 {
         return n;
     }
 
-    // `[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+` — the prefix first (a greedy `?`
-    // backs off only when the run after it fails), then the run alone. The
-    // prefix class takes a mark, a space or an apostrophe as readily as
-    // qwen2's does.
-    let x = at(i);
-    if !is_newline(x) && !is_letter(x) && !is_number(x) && i + 1 < hi {
-        let n = run(c, i + 1, hi, is_letter_or_mark);
-        if n > 0 {
-            return 1 + n;
-        }
-    }
-    let n = run(c, i, hi, is_letter_or_mark);
+    // `[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+`: the prefix class takes a mark, a space or an
+    // apostrophe as readily as qwen2's does.
+    let n = match_prefixed_word(c, i, hi, |x| {
+        !is_newline(x) && !is_letter(x) && !is_number(x)
+    });
     if n > 0 {
         return n;
     }
 
-    // `\p{N}` — one number, however long the run.
-    if is_number(x) {
-        return 1;
-    }
-
-    // ` ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*` — a space is none of the four, so
-    // backing the space off never helps.
-    let start = if x == b' ' { i + 1 } else { i };
-    if start < hi {
-        let n = run(c, start, hi, is_other_qwen35);
-        if n > 0 {
-            let end = start + n;
-            return end + run(c, end, hi, is_newline) - i;
-        }
-    }
-
+    // `\p{N}` (one number, however long the run), ` ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*` and
     // `\s*[\r\n]+|\s+(?!\S)|\s+`
-    match_space(c, i, hi)
+    match_tail(c, i, hi, 1, is_other_qwen35, is_newline)
 }
 
 /// Regex 3 at `i`: the first of its six alternatives that matches.
 fn match_word(c: &[u8], i: usize, hi: usize) -> usize {
-    let at = |k: usize| c[k];
-
     // `[<ascii punctuation>][A-Za-z]+` — the class is written out literally
     // and holds every ASCII punctuation byte, `~` included.
-    if at(i).is_ascii_punctuation() && i + 1 < hi {
+    if c[i].is_ascii_punctuation() && i + 1 < hi {
         let n = run(c, i + 1, hi, |x| x.is_ascii_alphabetic());
         if n > 0 {
             return 1 + n;
@@ -325,106 +342,149 @@ fn match_word(c: &[u8], i: usize, hi: usize) -> usize {
     }
 
     // `[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+`
-    let x = at(i);
-    if !is_newline(x) && !is_letter(x) && !is_punct_or_symbol(x) && i + 1 < hi {
-        let n = run(c, i + 1, hi, is_letter_or_mark);
-        if n > 0 {
-            return 1 + n;
-        }
-    }
-    let n = run(c, i, hi, is_letter_or_mark);
+    let n = match_prefixed_word(c, i, hi, |x| {
+        !is_newline(x) && !is_letter(x) && !is_punct_or_symbol(x)
+    });
     if n > 0 {
         return n;
     }
 
-    // ` ?[\p{P}\p{S}]+[\r\n]*` — a space is not P or S, so backing the space
-    // off never helps.
-    let start = if x == b' ' { i + 1 } else { i };
-    if start < hi {
-        let n = run(c, start, hi, is_punct_or_symbol);
-        if n > 0 {
-            let end = start + n;
-            return end + run(c, end, hi, is_newline) - i;
-        }
+    // ` ?[\p{P}\p{S}]+[\r\n]*` and `\s*[\r\n]+|\s+(?!\S)|\s+`
+    match_tail(c, i, hi, 0, is_punct_or_symbol, is_newline)
+}
+
+/// [`collapse_hf`], with a letter of Unicode 14.0 told by its category: `Lu` and `Lt` collapse to
+/// [`UPPER_LETTER`], `Ll` to [`LOWER_LETTER`], `Lm` and `Lo` stay [`LETTER`].
+fn collapse_cased(cpt: u32) -> u8 {
+    match collapse_hf(cpt) {
+        LETTER => match letter_case(cpt) {
+            1 => UPPER_LETTER,
+            2 => LOWER_LETTER,
+            _ => LETTER,
+        },
+        c => c,
+    }
+}
+
+/// `\p{L}` over [`collapse_cased`]'s bytes.
+fn is_letter_cased(c: u8) -> bool {
+    matches!(c, LETTER | UPPER_LETTER | LOWER_LETTER) || c.is_ascii_alphabetic()
+}
+
+/// What a reading of the `minimax-m2` regex tells apart in a letter. Its word alternatives are
+/// `P? U* L+ C?` and `P? U+ L* C?` for the classes below, `C` a contraction and `P` the prefix
+/// `[^\r\n\p{L}\p{N}]` (a mark is one).
+trait M2Letters {
+    /// Whether the reading folds `ſ` (U+017F) to `s` in a contraction, as Hugging Face's
+    /// Unicode folding does.
+    const HF: bool;
+
+    /// `\p{L}`.
+    fn letter(c: u8) -> bool;
+    /// `U`, which the word alternatives open with.
+    fn upper(c: u8) -> bool;
+    /// `L`, which they continue with.
+    fn lower(c: u8) -> bool;
+}
+
+/// The regex as the reference spells it, `((?=[\p{L}])([^a-z]))` for `U` and
+/// `((?=[\p{L}])([^A-Z]))` for `L`, over [`collapse`]'s bytes. A non-ASCII letter is one byte,
+/// [`LETTER`], that is in neither `a-z` nor `A-Z`, so it is `U` and `L` at once; a mark is no
+/// letter here.
+struct M2Reference;
+
+impl M2Letters for M2Reference {
+    const HF: bool = false;
+
+    fn letter(c: u8) -> bool {
+        is_letter(c)
     }
 
-    // `\s*[\r\n]+|\s+(?!\S)|\s+`
-    match_space(c, i, hi)
+    fn upper(c: u8) -> bool {
+        c.is_ascii_uppercase() || c == LETTER
+    }
+
+    fn lower(c: u8) -> bool {
+        c.is_ascii_lowercase() || c == LETTER
+    }
 }
 
-/// A capital or a non-ASCII letter: what `((?=[\p{L}])([^a-z]))` takes. A
-/// non-ASCII letter collapses to [`LETTER`], which is in neither `a-z` nor
-/// `A-Z`, so it is this and [`is_lower_m2`] at once.
-fn is_upper_m2(c: u8) -> bool {
-    c.is_ascii_uppercase() || c == LETTER
+/// The regex as MiniMax's `tokenizer.json` spells it, over [`collapse_cased`]'s bytes: `U` is
+/// `[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]` and `L` is `[\p{Ll}\p{Lm}\p{Lo}\p{M}]`, a mark in both.
+struct M2Hf;
+
+impl M2Letters for M2Hf {
+    const HF: bool = true;
+
+    fn letter(c: u8) -> bool {
+        is_letter_cased(c)
+    }
+
+    fn upper(c: u8) -> bool {
+        matches!(c, LETTER | UPPER_LETTER | MARK) || c.is_ascii_uppercase()
+    }
+
+    fn lower(c: u8) -> bool {
+        matches!(c, LETTER | LOWER_LETTER | MARK) || c.is_ascii_lowercase()
+    }
 }
 
-/// A lowercase or a non-ASCII letter: what `((?=[\p{L}])([^A-Z]))` takes.
-fn is_lower_m2(c: u8) -> bool {
-    c.is_ascii_lowercase() || c == LETTER
-}
-
-/// The `minimax-m2` regex at `i`: the first of its seven alternatives that
-/// matches, under ECMAScript semantics (alternatives in order, greedy
-/// quantifiers that back off). None of them can match the empty string, and a
-/// mark is a plain codepoint of its own class here: the regex runs on the
-/// collapsed bytes.
-fn match_minimax_m2(c: &[u8], i: usize, hi: usize) -> usize {
+/// The `minimax-m2` regex at `i`, as the reading `K` spells it: the first of its seven
+/// alternatives that matches, under ECMAScript semantics (alternatives in order, greedy
+/// quantifiers that back off, the optional prefix taken first). None of them can match the empty
+/// string, and a mark is a plain codepoint of its own class: the regex runs on the collapsed
+/// bytes. `fold(k)` is the lowercase ASCII letter the codepoint at `k` matches in a contraction.
+///
+/// A mark can be both a prefix and a word codepoint, so the prefix is tried taken and not taken.
+/// `U*` gives back until `L+` can start: at the lowercase letter that ended the run, else at the
+/// run's last codepoint that is an `L` too (a capital is not). The second word alternative runs
+/// only when the first did not: capitals alone. Past the words the alternatives are qwen2's, but
+/// the symbol run's tail is `[\r\n/]*`, a slash as well as the newlines.
+fn match_minimax_m2<K: M2Letters>(
+    c: &[u8],
+    i: usize,
+    hi: usize,
+    fold: impl Fn(usize) -> u8,
+) -> usize {
     let x = c[i];
-
-    // `[^\r\n\p{L}\p{N}]?` opens both word alternatives: a letter at `i` is
-    // never the prefix, anything else but a newline or a number is, and with
-    // no letter after it the alternatives fail at `i` altogether.
-    let word = if is_letter(x) {
-        Some(i)
-    } else if !is_newline(x) && !is_number(x) && i + 1 < hi {
-        Some(i + 1)
+    let starts: &[usize] = if !is_newline(x) && !K::letter(x) && !is_number(x) && i + 1 < hi {
+        &[i + 1, i]
     } else {
-        None
+        &[i]
     };
-    if let Some(s) = word {
-        let ups = run(c, s, hi, is_upper_m2);
-        // `((?=[\p{L}])([^a-z]))*((?=[\p{L}])([^A-Z]))+`: the star takes all
-        // `ups`, and gives back until the plus can start: at the lowercase
-        // letter that ended the run, else at its last non-ASCII letter (a
-        // capital is no lowercase letter). Nothing to give back fails it.
-        let plus_at = if s + ups < hi && is_lower_m2(c[s + ups]) {
-            Some(ups)
+    let contract = |end: usize| end + contraction(c, end, hi, &fold) - i;
+    // `P? U* L+ C?`
+    for &s in starts {
+        let ups = run(c, s, hi, K::upper);
+        let from = if s + ups < hi && K::lower(c[s + ups]) {
+            Some(s + ups)
         } else {
-            c[s..s + ups].iter().rposition(|&b| b == LETTER)
+            c[s..s + ups]
+                .iter()
+                .rposition(|&b| K::lower(b))
+                .map(|p| s + p)
         };
-        // `((?=[\p{L}])([^a-z]))+((?=[\p{L}])([^A-Z]))*`: only capitals are left
-        // (no lowercase letter follows them, or the first alternative would
-        // have matched), so the star takes nothing.
-        let end = match plus_at {
-            Some(j) => s + j + run(c, s + j, hi, is_lower_m2),
-            None => s + ups,
-        };
-        if end > s {
-            // `(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?`
-            let fold = |k: usize| c[k].to_ascii_lowercase();
-            return end + contraction(c, end, hi, fold) - i;
+        if let Some(from) = from {
+            return contract(from + run(c, from, hi, K::lower));
+        }
+    }
+    // `P? U+ L* C?`
+    for &s in starts {
+        let ups = run(c, s, hi, K::upper);
+        if ups > 0 {
+            return contract(s + ups + run(c, s + ups, hi, K::lower));
         }
     }
 
-    // `\p{N}{1,3}`
-    if is_number(x) {
-        return match_number(c, i, hi);
-    }
-
-    // ` ?[^\s\p{L}\p{N}]+[\r\n/]*` — a space is none of the three, so
-    // backing the space off never helps.
-    let start = if x == b' ' { i + 1 } else { i };
-    if start < hi {
-        let n = run(c, start, hi, is_other);
-        if n > 0 {
-            let end = start + n;
-            return end + run(c, end, hi, |b| is_newline(b) || b == b'/') - i;
-        }
-    }
-
-    // `\s*[\r\n]+|\s+(?!\S)|\s+`
-    match_space(c, i, hi)
+    // `\p{N}{1,3}`, ` ?[^\s\p{L}\p{N}]+[\r\n/]*` and `\s*[\r\n]+|\s+(?!\S)|\s+`
+    match_tail(
+        c,
+        i,
+        hi,
+        3,
+        |b| !is_space(b) && !K::letter(b) && !is_number(b),
+        |b| is_newline(b) || b == b'/',
+    )
 }
 
 /// Flint's final regex on collapsed text: both case classes are `L|M` in
@@ -514,6 +574,13 @@ pub(crate) enum Pre {
     Pixtral,
     /// `minimax-m2`: GPT4O's one regex, run as a regex over the collapsed text.
     MiniMaxM2,
+    /// `gpt-4o`: [`Pre::MiniMaxM2`]'s regex under the name of a tree whose UTF-8 reader is the
+    /// strict one ([`Pre::strict_utf8`]).
+    Gpt4o,
+    /// `minimax-m2` as a Hugging Face `tokenizer.json` spells and runs it: the letter
+    /// categories apart, `\p{M}` in the word classes, and Unicode 14.0's classes. Never named
+    /// in a header; a vocabulary with `tokenizer.bloomery.eog_token_ids` gets it.
+    MiniMaxM2Hf,
     /// `gemma4`: runs of newlines and runs of the rest, over metaspace text.
     Gemma4,
     /// `raon`: the reference's hand-written splitter with the CJK run, the letter run joined by
@@ -525,7 +592,7 @@ pub(crate) enum Pre {
 
 impl Pre {
     /// The names this crate runs, as `tokenizer.ggml.pre` spells them.
-    pub(crate) const NAMES: [(&'static str, Pre); 12] = [
+    pub(crate) const NAMES: [(&'static str, Pre); 13] = [
         ("deepseek-v3", Pre::DeepseekV3),
         ("hunyuan-dense", Pre::DeepseekV3),
         ("joyai-llm", Pre::DeepseekV3),
@@ -535,10 +602,31 @@ impl Pre {
         ("qwen35", Pre::Qwen35),
         ("pixtral", Pre::Pixtral),
         ("minimax-m2", Pre::MiniMaxM2),
+        ("gpt-4o", Pre::Gpt4o),
         ("gemma4", Pre::Gemma4),
         ("raon", Pre::Raon),
         ("flint", Pre::Flint),
     ];
+
+    /// The reading of this pre-tokenizer that runs as a Hugging Face `tokenizer.json` does, its
+    /// own case; `None` for a name no folder's `tokenizer.json` spells.
+    pub(crate) fn hf_reading(self) -> Option<Pre> {
+        match self {
+            Pre::Qwen35 => Some(Pre::Qwen35Hf),
+            Pre::MiniMaxM2 | Pre::Gpt4o => Some(Pre::MiniMaxM2Hf),
+            _ => None,
+        }
+    }
+
+    /// The names in [`Pre::NAMES`] that have an HF reading, comma-separated.
+    pub(crate) fn hf_names() -> String {
+        let names: Vec<&str> = Self::NAMES
+            .iter()
+            .filter(|(_, pre)| pre.hf_reading().is_some())
+            .map(|&(name, _)| name)
+            .collect();
+        names.join(", ")
+    }
 
     /// Whether a word that is itself a vocabulary token is taken whole,
     /// before merges. Any pre can carry it; `pixtral` does.
@@ -553,14 +641,11 @@ impl Pre {
     }
 
     /// Whether the reference decodes UTF-8 strictly, independently of NFC.
-    /// An overlong form is not a codepoint there; older readers accept it.
+    /// An overlong form is not a codepoint there; older readers accept it. The trees that read
+    /// `gpt-4o`, `raon` and `flint` reject it; the trees the other names' sets are read by
+    /// (ik, the Solar-Open2 patch, mainline before the check) accept it.
     pub(crate) fn strict_utf8(self) -> bool {
-        matches!(self, Pre::Raon | Pre::Flint)
-    }
-
-    /// Whether BPE runs as Hugging Face's does ([`crate::bpe::Bpe::new`]).
-    pub(crate) fn hf(self) -> bool {
-        matches!(self, Pre::Qwen35Hf)
+        matches!(self, Pre::Raon | Pre::Flint | Pre::Gpt4o)
     }
 
     /// How this pre-tokenizer's words are spelled in the vocabulary.
@@ -572,8 +657,10 @@ impl Pre {
             | Pre::Glm4
             | Pre::Qwen35
             | Pre::Qwen35Hf
+            | Pre::MiniMaxM2Hf
             | Pre::Pixtral
             | Pre::MiniMaxM2
+            | Pre::Gpt4o
             | Pre::Raon
             | Pre::Flint => Spelling::ByteLevel,
         }
@@ -584,7 +671,11 @@ impl Pre {
 /// under `pre`; returns each word's length in codepoints, in order.
 pub(crate) fn split<'s>(pre: Pre, cpts: &[u32], s: &'s mut Scratch) -> &'s [usize] {
     s.collapsed.clear();
-    let class = if pre.hf() { collapse_hf } else { collapse };
+    let class: fn(u32) -> u8 = match pre {
+        Pre::Qwen35Hf => collapse_hf,
+        Pre::MiniMaxM2Hf => collapse_cased,
+        _ => collapse,
+    };
     s.collapsed.extend(cpts.iter().map(|&cp| class(cp)));
     match pre {
         Pre::DeepseekV3 => split_ordered(cpts, s, match_word),
@@ -599,10 +690,8 @@ pub(crate) fn split<'s>(pre: Pre, cpts: &[u32], s: &'s mut Scratch) -> &'s [usiz
         }
         Pre::Qwen35 => split_qwen35(cpts, s, false),
         Pre::Qwen35Hf => split_qwen35(cpts, s, true),
-        Pre::MiniMaxM2 => {
-            split_one_piece(cpts.len(), s, match_minimax_m2);
-            &s.b
-        }
+        Pre::MiniMaxM2 | Pre::Gpt4o => split_minimax_m2::<M2Reference>(cpts, s),
+        Pre::MiniMaxM2Hf => split_minimax_m2::<M2Hf>(cpts, s),
         Pre::Gemma4 => {
             split_newlines(cpts, &mut s.b);
             &s.b
@@ -721,19 +810,30 @@ fn split_one_piece(len: usize, s: &mut Scratch, mut m: impl FnMut(&[u8], usize, 
     resplit(&s.a, &mut s.b, |i, hi| m(c, i, hi));
 }
 
+/// The lowercase ASCII letter a contraction compares the codepoint at `k` with: its ASCII
+/// lowercase, and under Hugging Face's Unicode folding (`hf`) `ſ` as `s`.
+fn fold_at(cpts: &[u32], c: &[u8], k: usize, hf: bool) -> u8 {
+    if hf && cpts[k] == 0x17F {
+        b's'
+    } else {
+        c[k].to_ascii_lowercase()
+    }
+}
+
 /// [`split`] for [`Pre::Qwen35`], and with `hf` for [`Pre::Qwen35Hf`]: its one
 /// regex over the collapsed bytes.
 fn split_qwen35<'s>(cpts: &[u32], s: &'s mut Scratch, hf: bool) -> &'s [usize] {
     split_one_piece(cpts.len(), s, |c, i, hi| {
-        // The lowercase ASCII letter a contraction compares the codepoint at `k` with.
-        let fold = |k: usize| {
-            if hf && cpts[k] == 0x17F {
-                b's'
-            } else {
-                c[k].to_ascii_lowercase()
-            }
-        };
-        match_qwen35(c, i, hi, fold)
+        match_qwen35(c, i, hi, |k| fold_at(cpts, c, k, hf))
+    });
+    &s.b
+}
+
+/// [`split`] for [`Pre::MiniMaxM2`], and with the reading `K` for [`Pre::MiniMaxM2Hf`]: its one
+/// regex over the collapsed bytes.
+fn split_minimax_m2<'s, K: M2Letters>(cpts: &[u32], s: &'s mut Scratch) -> &'s [usize] {
+    split_one_piece(cpts.len(), s, |c, i, hi| {
+        match_minimax_m2::<K>(c, i, hi, |k| fold_at(cpts, c, k, K::HF))
     });
     &s.b
 }
@@ -751,7 +851,7 @@ fn split_ordered<'s>(
     if !cpts.is_empty() {
         s.a.push(cpts.len());
     }
-    resplit(&s.a, &mut s.b, |i, hi| match_number(c, i, hi));
+    resplit(&s.a, &mut s.b, |i, hi| match_number(c, i, hi, 3));
     resplit(&s.b, &mut s.a, |i, hi| {
         cpts[i..hi].iter().take_while(|&&cp| is_cjk(cp)).count()
     });
@@ -881,12 +981,12 @@ mod tests {
     /// refusal of another lists.
     #[test]
     fn names_have_one_table() {
-        let refusal = crate::Error::UnsupportedPre("gpt-4o".to_string()).to_string();
+        let refusal = crate::Error::UnsupportedPre("o200k_harmony".to_string()).to_string();
         for (name, _) in Pre::NAMES {
             assert!(crate::runs_pre_tokenizer(name), "{name}");
             assert!(refusal.contains(name), "{name} not in: {refusal}");
         }
-        assert!(!crate::runs_pre_tokenizer("gpt-4o"));
+        assert!(!crate::runs_pre_tokenizer("o200k_harmony"));
     }
 
     /// `solar-open` runs the qwen2 splitter: Solar-Open2's `tokenizer.json`
@@ -894,6 +994,16 @@ mod tests {
     #[test]
     fn solar_open_is_qwen2() {
         assert_eq!(crate::named(&Pre::NAMES, "solar-open"), Some(Pre::Qwen2));
+    }
+
+    /// `gpt-4o` is a row of its own (the UTF-8 reader of its tree is the strict one) that runs the
+    /// minimax-m2 splitter: the reference maps both names to GPT4O's one expression, so Muse
+    /// Spark's `gpt-4o` header splits as `minimax-m2`'s does. `minimax_m2_cases` runs its whole
+    /// table under both rows. FAIL-first: a `gpt-4o` row that runs another splitter fails that
+    /// table.
+    #[test]
+    fn gpt_4o_is_minimax_m2() {
+        assert_eq!(crate::named(&Pre::NAMES, "gpt-4o"), Some(Pre::Gpt4o));
     }
 
     fn words(pre: Pre, text: &str) -> Vec<String> {
@@ -1122,6 +1232,64 @@ mod tests {
         }
     }
 
+    /// MiniMax's regex split as Hugging Face's `tokenizers` runs it: every text of the pinned corpus
+    /// (`hf_pieces_minimax.py`: contractions in every case, letters of every category against
+    /// each other, marks, digits, spaces, symbols, every Unicode version's codepoints) is cut into
+    /// pieces of the byte lengths its pre-tokenizer gives. Token ids show a split only where a merge
+    /// crosses it; the pieces show it everywhere.
+    ///
+    /// FAIL-first: with the reference's `minimax-m2` regex, which has no `\p{M}` in its words
+    /// and tells only ASCII letters' case apart, the Devanagari and case-change texts fail; with
+    /// the letters not told by category, the case-change texts; with no `ſ` fold, the contraction
+    /// texts; with the prefix never left out or the capitals never given back, the mark texts.
+    #[test]
+    fn minimax_m2_hf_pieces_are_hugging_faces() {
+        let path = format!(
+            "{}/../hf/tests/fixtures/minimax-hf-pieces.json.gz",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let corpus: serde_json::Value = serde_json::from_reader(flate2::read::GzDecoder::new(
+            std::fs::File::open(&path).unwrap_or_else(|e| panic!("{path}: {e}")),
+        ))
+        .unwrap();
+        let cases = corpus["cases"].as_array().unwrap();
+        assert!(cases.len() >= 11_000, "{} cases in {path}", cases.len());
+        let mut s = Scratch::default();
+        let mut failures = Vec::new();
+        for case in cases {
+            let text = case["text"].as_str().unwrap();
+            let want: Vec<u64> = serde_json::from_value(case["pieces"].clone()).unwrap();
+            let cpts: Vec<u32> = text.chars().map(u32::from).collect();
+            let mut at = 0;
+            let ours: Vec<u64> = split(Pre::MiniMaxM2Hf, &cpts, &mut s)
+                .iter()
+                .map(|&n| {
+                    let bytes: usize = cpts[at..at + n]
+                        .iter()
+                        .map(|&c| char::from_u32(c).unwrap().len_utf8())
+                        .sum();
+                    at += n;
+                    bytes as u64
+                })
+                .collect();
+            if ours != want {
+                failures.push(format!("{text:?}: ours {ours:?}, HF {want:?}"));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "{} of {} texts:\n{}",
+            failures.len(),
+            cases.len(),
+            failures
+                .iter()
+                .take(20)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
     /// The `minimax-m2` regex's alternatives, one case each, derived from the
     /// reference's rule (the expression run on the collapsed bytes, where a
     /// non-ASCII letter is both a capital and a lowercase letter): a word is
@@ -1178,8 +1346,10 @@ mod tests {
             ("e\u{301}x", &["e", "\u{301}x"]),
             ("\u{301}.", &["\u{301}."]),
         ];
-        for &(text, want) in cases {
-            assert_eq!(words(Pre::MiniMaxM2, text), want, "{text:?}");
+        for pre in [Pre::MiniMaxM2, Pre::Gpt4o] {
+            for &(text, want) in cases {
+                assert_eq!(words(pre, text), want, "{pre:?} {text:?}");
+            }
         }
     }
 

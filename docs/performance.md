@@ -86,7 +86,7 @@ language is not one of the reasons: the kernels are Rust (274 of them, through
 - **One CUDA graph a decode step, the CPU experts inside it.** Where experts run on the host, the card waits on
   a counter in pinned memory that the CPU workers write, not on a host synchronization. Not isolated by a
   measurement on today's models.
-- **Speculative decoding** with greedy output unchanged: DSpark for V4.1 (the draft on a second card), the MTP
+- **Speculative decoding** with greedy output unchanged: DSpark for V4.1 (the draft on the plan's tier card, a holder card, or the stage on one card), the MTP
   head for Qwen3.8 and GLM-5.3.
 - **Loads stream through a pinned ring** with one sync: a warm V4.1 load went from 36.3–36.6 s to 15.9–16.6 s
   ([rig-log](https://github.com/midagedev/rig-log/blob/main/log/2026-09-30.md#v41-load-upload)).

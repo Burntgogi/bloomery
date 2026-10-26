@@ -244,6 +244,7 @@ mod tests {
                 hc: None,
                 engram: None,
                 encoder: None,
+                logit_epilogue: None,
                 chat: ChatSpec {
                     pre: String::new(),
                     template: None,
@@ -275,6 +276,7 @@ mod tests {
                 head: true,
                 token_embedding: false,
                 reserves: Vec::new(),
+                reserve_only: false,
             }],
             tiers: Vec::new(),
             nodes: vec![Node {
@@ -286,7 +288,7 @@ mod tests {
             }],
         };
         let levers = PlanLevers {
-            card_budget_bytes: Some(2 << 20),
+            card_budget_bytes: bloomery_levers::CardBudget::Every(2 << 20),
         };
         let expected = inputs
             .plan(&machine, 64, &levers)

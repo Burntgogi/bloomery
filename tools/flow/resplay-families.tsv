@@ -1,0 +1,57 @@
+# Residency replay constants: every constant tools/flow/resplay.py reads that no other owner holds, one per row. Family rows carry the
+# prefix v41., q38., glm. or muse.; a row without one is common. Format and kinds as q38-constants.tsv (read by q38_step.load_constants):
+# kind measured (a recorded run), derived (arithmetic on recorded numbers, code or datasheets), assumed (no record). Facts another owner
+# holds are read there, not copied: n_expert, top-k, expert bytes, eligible layers, the card plan, the decode step for link pacing and
+# the opening cap from tools/ref/router-residency.py FAMILY (v41, glm); Qwen3.8's experts, ubatch, card plan, prompt rate and step from
+# tools/flow/q38-constants.tsv through q38_step.
+name	value	lo	hi	unit	kind	conditions	source	anchor	note
+pcie_gbps	26.28	26.28	26.28	GB/s	measured	A6000, pinned host to device	https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan.md 「비용 모델」		a prompt move's copy rate (the rule's flips are never link-bound: crates/levers/src/registry.rs RESIDENCY doc)
+nvme_gbps	2.51	2.51	5.0	GB/s	measured	one expert part at QD 1 (~5 at QD 3)	docs/research/tierengine.md §3(b)		an off-arena slot's read under ram=
+heat_half_life	32	32	32	columns	derived	the NVMe arena's heat eviction	crates/gpu/src/host/nvtier.rs HEAT_HALF_LIFE		ram=G:heat
+v41.slots_token	240	240	240	slots/token	derived	40 layers x top-6; layers 0-1 are not card eligible	https://github.com/midagedev/rig-log/blob/main/tools/clip/residency/data.json meta		the line's h is card slots over these
+v41.live_delay	4	4	4	passes	derived	a flip's copy behind the rule's plan	crates/gpu-deepseek41/src/swap.rs LIVE_DELAY		
+v41.spares	1	1	1	slots/layer	derived	the serving default mid-p0-s1	crates/levers/src/registry.rs RESIDENCY		
+v41.pinned	0	0	0	experts/layer	derived	the serving default mid-p0-s1	crates/levers/src/registry.rs RESIDENCY		
+v41.line_t0	38.94	38.55	39.33	ms	derived	A6000, plan (a), prose P 512, depth <= 608; least squares over 282 steps of three arms	docs/research/residency-general.md §1.2 (data.json arms)	cost_v41_clip	t = t0 - slope h + flip F
+v41.line_slope	25.99	22.0	26.83	ms/share	derived	as line_t0; band: the within-range fits 21.1-23.6 and the joint +-0.84	docs/research/residency-general.md §1.2	cost_v41_clip	h is the card share of slots_token
+v41.line_flip	0.0993	0.0767	0.1219	ms/flip	derived	as line_t0; flips landing at a step	docs/research/residency-general.md §1.2	cost_v41_clip	
+v41.pp512	190.5	190.5	193.1	tok/s	measured	A6000, plan (a), prose P 512, prompt streaming on	https://github.com/midagedev/rig-log/blob/main/tools/clip/residency/data.json arms.stream.pp_tps		a call's wall for link pacing
+v41.pp4096	373.6	367.2	373.6	tok/s	measured	A6000, plan (a), prose P 4096, prompt streaming on	https://github.com/midagedev/rig-log/blob/main/tools/clip/residency/data.json arms.stream.pp_tps		log-linear in P between, clamped outside
+v41.engine_call	1	1	1	flag	derived	the engine streams a prompt call (HOSTSTREAM on a/bp)	crates/gpu-deepseek41/src/body/prefill.rs stream_begin		
+v41.call_min_p	128	128	128	ids	derived	the shortest prompt a call streams	crates/gpu-deepseek41/src/body/prefill.rs STREAM_MIN_P		
+v41.call_floor	32	32	32	count/batch	derived	the least count admitted, per batch of the group	crates/gpu-deepseek41/src/body/prefill.rs STREAM_FLOOR		
+v41.call_batch	512	512	512	rows	derived	a prompt batch (T_MAX = UNION_MAX_COLS)	crates/model/src/moe.rs UNION_MAX_COLS		the pick counts its group's first batch
+v41.call_group	2	2	2	batches	derived	BLOOMERY_PREFILL_GROUP unset	crates/levers/src/registry.rs PREFILL_GROUP_DEFAULT		
+v41.end_return	0	0	0	flag	derived	the call's picks stay for the decode on every call	crates/gpu-deepseek41/src/body/prefill.rs stream_end(.., done.is_ok())		
+q38.live_delay	2	2	2	passes	derived	the common delay	crates/gpu/src/host/swap_source.rs LIVE_DELAY		
+q38.spares	1	1	1	slots/layer	derived	the serving default mid-p0-s1	crates/levers/src/registry.rs RESIDENCY		
+q38.pinned	0	0	0	experts/layer	derived	the serving default mid-p0-s1	crates/levers/src/registry.rs RESIDENCY		
+q38.engine_call	1	1	1	flag	derived	XSTREAM admit/split streams a prompt call	crates/gpu/src/arch/qwen3moe/wide38.rs		the split walk's cost floor is not modelled: the admit floor stands for it
+q38.call_min_p	32	32	32	ids	derived	a prompt call of fewer ids opens no call	crates/gpu/src/arch/qwen3moe/wide38.rs STREAM_FLOOR		
+q38.call_floor	32	32	32	count/unit	derived	the admit floor	crates/gpu/src/arch/qwen3moe/wide38.rs STREAM_FLOOR		
+q38.call_group	1	1	1	units	derived	one pick a walk of one unit	crates/gpu/src/host/prompt_stream.rs PromptStream::pick		the unit is q38-constants ubatch_max
+q38.end_return	1	1	1	flag	derived	the picks go back when the rule holds a decode history	crates/gpu/src/arch/qwen3moe/body38.rs prompt38_fed		
+glm.slots_token	312	312	312	slots/token	derived	39 card-eligible layers x top-8	tools/ref/router-residency.py FAMILY glm		
+glm.live_delay	2	2	2	passes	derived	the common delay	crates/gpu/src/host/swap_source.rs LIVE_DELAY		
+glm.spares	1	1	1	slots/layer	derived	the serving default mid-p0-s1	crates/levers/src/registry.rs RESIDENCY		
+glm.pinned	0	0	0	experts/layer	derived	the serving default mid-p0-s1	crates/levers/src/registry.rs RESIDENCY		
+glm.engine_call	0	0	0	flag	derived	a prompt call is one pass, no call heat	crates/gpu/src/host/served.rs prompt_pass		
+glm.call_min_p	1	1	1	ids	assumed	the policy words' call (no engine call)	none		
+glm.call_floor	32	32	32	count/batch	assumed	the common floor	crates/runtime: the three STREAM_FLOOR copies		
+glm.call_batch	512	512	512	rows	assumed	a prompt batch	crates/model/src/moe.rs UNION_MAX_COLS		
+glm.call_group	2	2	2	batches	derived	BLOOMERY_PREFILL_GROUP unset	crates/levers/src/registry.rs PREFILL_GROUP_DEFAULT		
+glm.end_return	0	0	0	flag	assumed	the policy words' call keeps its picks	none		
+glm.pp	150	80	400	tok/s	assumed	a call's wall for link pacing	no record		
+glm.t_serial_A	16.5	10.0	24.0	ms	assumed	reading (A); a 40 ms step at the static h 0.49	tools/ref/router-residency.py FAMILY glm step_ms; rig-log docs/bloomery/plan-triage.md 「사용자 결정 대기」 "GLM 49.1 대 63.4 %"		t = t_serial + N_s((1-h)c_h + h c_c)
+glm.t_serial_B	24.4	18.0	30.0	ms	assumed	reading (B); the same step	as glm.t_serial_A		t = t_serial + N_s(1-h)c_h
+glm.c_h_A	0.1233	0.1233	0.1233	ms/slot	derived	V4.1's reading (A) c_h x 15,204,352 / 16,773,120	docs/research/residency-general.md §1.2		
+glm.c_c_A	0.0254	0.0254	0.0254	ms/slot	derived	V4.1's reading (A) c_c x the bytes ratio	docs/research/residency-general.md §1.2		
+glm.c_h_B	0.0982	0.0834	0.0982	ms/slot	derived	V4.1's slope a slot x the bytes ratio; lo the within-range slope	docs/research/residency-general.md §1.2		
+glm.c_f	0.0900	0.0695	0.1105	ms/flip	derived	V4.1's line_flip x the bytes ratio	docs/research/residency-general.md §1.2		
+muse.slots_token	496	496	496	slots/token	derived	62 layers x top-8	docs/research/residency-general.md §1.1		predict only: no router set
+muse.expert_b	12976128	12976128	12976128	B	derived	3 x 4096^2 IQ2_XXS	docs/research/residency-general.md §1.1		
+muse.t_serial	32.9	29.3	36.5	ms	derived	bp shape, n = 1, depth <= 4096: card dense, bridge, launches	docs/research/residency-general.md §7.3		
+muse.c_h_A	0.1055	0.1055	0.1055	ms/slot	derived	V4.1's reading (A) rate, 123 GB/s	docs/research/residency-general.md §7.3		
+muse.c_c_A	0.0216	0.0216	0.0216	ms/slot	derived	V4.1's reading (A) c_c x the bytes ratio	docs/research/residency-general.md §7.3		
+muse.c_h_B	0.0838	0.0838	0.0838	ms/slot	derived	V4.1's slope a slot x the bytes ratio 0.774	docs/research/residency-general.md §7.3		
+muse.c_f	0.077	0.077	0.077	ms/flip	derived	V4.1's line_flip x 0.774	docs/research/residency-general.md §1.1		

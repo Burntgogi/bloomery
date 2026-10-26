@@ -48,7 +48,7 @@ dumps, real-file gates, timed runs).
 | 5 | Card body | `crates/gpu-<arch>/` (or `crates/gpu/src/arch/...` for a variant); root `Cargo.toml:3`, `crates/gpu-gates/Cargo.toml` | G to build and run |
 | 6 | App session | `crates/app/src/arch/<arch>/mod.rs`, feature in `crates/app/Cargo.toml` | G (feature-gated); L for default-feature tests |
 | 7 | Serve seat | `crates/gpu-gates/src/bin/shared/serve_seats/<seat>.rs`, `serve_seats/mod.rs`, `bloomery_serve.rs:206-226` | G, then B for the seat gates |
-| 8 | Placement sizing | `crates/model/src/arch/<arch>/place.rs` over `crates/placement/src/placement.rs:1821` | A (placement is pure) and L |
+| 8 | Placement sizing | `crates/model/src/arch/<arch>/place.rs` over `plan_host_routed` in `crates/placement/src/placement.rs` | A (placement is pure) and L |
 | 9 | Levers | `crates/levers/src/registry.rs` | A |
 | 10 | Gates and recipes | `justfile`, `tools/gate-paths.tsv`, `tools/gate-batch-resources.tsv`, `tools/ref/ptx-shapes.tsv`, `tools/unsafe-ratchet.txt` | A for `just check-recipes`; running the gates is G or B |
 
@@ -162,7 +162,7 @@ Gate: `gate-gpu-glm5next-serve` (`justfile:2143`) is the pattern; it needs cards
 ### 8. Placement sizing
 
 `place.rs` states which bytes go where on a machine: the reader's `PlanInputs`, the KV bytes per layer, and the common
-planner (`crates/placement/src/placement.rs`, `plan_host_routed` at `:1821` for a model whose routed experts all sit on
+planner (`plan_host_routed` in `crates/placement/src/placement.rs`, for a model whose routed experts all sit on
 the host). MiMo's is 407 lines (`38b71576`). The machine description is `model::placement::workstation` (the cards and
 RAM of the maintainers' box, `crates/model/src/placement/workstation.rs`); a plan names what holds the bytes, never a
 copied shape from another card.
@@ -227,7 +227,7 @@ MiMo's first card-expert design skipped two rows, with these results:
 
 | Owner | Where it lives | How a model attaches |
 |---|---|---|
-| Placement plan | `placement::plan_routed` (`crates/placement/src/placement.rs:1771`) | Pass the model's card rule; no model-owned planner |
+| Placement plan | `placement::plan_routed` in `crates/placement/src/placement.rs` | Pass the model's card rule; no model-owned planner |
 | Kernel table | The card columns of each type's `QROWS` row (`crates/gguf/src/qtype.rs`), read by operation in `crates/placement/src/kernels.rs` | A quant type gets its card columns in its row; the body dispatches through `kernels`, never by matching `GgmlType` itself |
 | Card expert leg | Each family's own today (the three files above) | Call an existing leg, or lift it to a common owner in `crates/gpu`; never add a copy |
 | Residency (hot experts move to the card at run time) | `crates/gpu/src/host/served.rs` (`TierBody::residency_parts`, `ResidencyParts`) | The body's `residency_parts` returns `Some`; glue like GLM's `crates/gpu-glm5next/src/swap.rs` (72 lines) |

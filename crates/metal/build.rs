@@ -1,7 +1,7 @@
 //! The build of the Metal backend: the kernels' one source, and the
 //! metallib when the Metal Toolchain is installed.
 //!
-//! Two outputs land in `OUT_DIR`:
+//! Three outputs land in `OUT_DIR`:
 //!
 //! - `bloomery.metal`: the kernels' source with the fault site's table
 //!   written in front of it, from `bloomery-device`'s table — the one owner
@@ -10,6 +10,9 @@
 //! - `bloomery.metallib`: the same source compiled by `xcrun metal`, when
 //!   the Metal Toolchain is installed. Its presence is the `metal_lib`
 //!   cfg, and the runtime loads it instead of the source.
+//! - `bloomery_tensor.metal`: the tensor-op GEMMs' source, the same table in
+//!   front of the files it reads, which the runtime compiles at Metal 4 on a
+//!   GPU that takes them (`library.rs`).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -26,7 +29,7 @@ mod geometry {
 /// The gated delta step's geometry, from the file the host module reads.
 #[allow(
     dead_code,
-    reason = "the host module reads every constant; the header emits the ring length"
+    reason = "the host module reads every constant; the header emits the ring length and the copies"
 )]
 mod delta_geom {
     include!("src/kernels/delta_geom.rs");
@@ -100,6 +103,7 @@ fn geometry_header() -> String {
          #define BLOOMERY_DELTA_COLS_PER_BLOCK {per}\n\
          // The conv ring, from src/kernels/delta_geom.rs.\n\
          #define BLOOMERY_DELTA_RING_ROWS {ring}\n\
+         #define BLOOMERY_DELTA_SNAPS {snaps}\n\
          // The router, from src/kernels/router_geom.rs.\n\
          #define BLOOMERY_ROUTER_ROWS {rrows}\n\
          #define BLOOMERY_ROUTER_EXPERTS {rexperts}\n\
@@ -137,6 +141,7 @@ fn geometry_header() -> String {
         blocks = geometry::PARTIALS_PER_HEAD,
         per = geometry::HEAD_COLS / geometry::PARTIALS_PER_HEAD,
         ring = delta_geom::RING_ROWS,
+        snaps = delta_geom::SNAPS,
         rrows = router_geom::ROWS,
         rexperts = router_geom::EXPERTS,
         rk = router_geom::K,
@@ -253,17 +258,20 @@ fn main() {
     // The order is the dependency order: norm defines the argument block the
     // mat-vecs read, quant the block layouts and the decode owners every
     // quantized kernel reads (embed's too), matvec_q4k the row loop and the
-    // entry templates the Q6_K, A4, experts and head files instantiate.
+    // entry templates the Q6_K, A4, Q8_0, Q5_K, experts and head files instantiate.
     for name in [
         "fault",
         "copy",
         "probe",
         "norm",
         "quant",
+        "gemm_shared",
         "gemm",
         "matvec_q4k",
         "matvec_q6k",
         "matvec_a4",
+        "matvec_q8_0",
+        "matvec_q5k",
         "embed",
         // Ticket's helpers are what the router and the head call, so ticket
         // comes before either kernel.
@@ -286,6 +294,24 @@ fn main() {
     let combined = combined_source(&header, &kernels);
     let source_path = out_dir.join("bloomery.metal");
     std::fs::write(&source_path, &combined).expect("the source is written");
+
+    // The tensor-op GEMMs read the fault's raise, the quant owners and the
+    // shared GEMM ABI, the engine source's own files, in its order.
+    let tensor: Vec<(&str, String)> = kernels
+        .iter()
+        .filter(|(name, _)| ["fault", "quant", "gemm_shared"].contains(name))
+        .cloned()
+        .chain(std::iter::once((
+            "gemm_tensor",
+            std::fs::read_to_string(kernels_dir.join("gemm_tensor.metal"))
+                .expect("kernels/gemm_tensor.metal is read"),
+        )))
+        .collect();
+    std::fs::write(
+        out_dir.join("bloomery_tensor.metal"),
+        combined_source(&header, &tensor),
+    )
+    .expect("the tensor source is written");
 
     match build_metallib(&source_path, &out_dir) {
         Some(_) => println!("cargo:rustc-cfg=metal_lib=\"metallib\""),
