@@ -888,7 +888,6 @@ mod tests {
         Segment,
     };
 
-
     use crate::card_leg::tests::stack_bytes;
     use crate::host::leg_tier::LegTier;
     use crate::host::tier::{TierBlock, TierExperts, TierInput, TierIo, TierSet};

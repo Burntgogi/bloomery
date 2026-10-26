@@ -6758,7 +6758,8 @@ mod tests {
         use workstation::{TIER_BATCH_RESERVE, try_tier_leg_batch_bytes_of};
 
         let both = DownForms::of(DownAct::Q8Act).with(DownAct::Q8Blocks32);
-        let batch = try_tier_leg_batch_bytes_of(256, 256, 1, (2, 3), both, false).expect("tier bytes");
+        let batch =
+            try_tier_leg_batch_bytes_of(256, 256, 1, (2, 3), both, false).expect("tier bytes");
         let leg = batch.leg.expect("a tier leg descriptor");
         let rule = routed_rule(Program::Qwen35Body);
         for (downs, first) in [
@@ -6834,7 +6835,8 @@ mod tests {
         use workstation::{TIER_BATCH_RESERVE, TierLegScratch, try_tier_leg_batch_bytes_of};
 
         let forms = DownForms::of(DownAct::Q8Act);
-        let batch = try_tier_leg_batch_bytes_of(256, 256, 1, (1, 1), forms, false).expect("valid batch");
+        let batch =
+            try_tier_leg_batch_bytes_of(256, 256, 1, (1, 1), forms, false).expect("valid batch");
         let good = batch.leg.expect("a leg descriptor");
         let mut model = legged(&[[GgmlType::Q5_K; 3]]);
         model.experts_used = 1;

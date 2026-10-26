@@ -537,12 +537,7 @@ fn qwen36_tier(stage: CardSpec, tier: CardSpec) -> Result<(u64, u64, u64), Place
 #[test]
 fn qwen3_30b_q8_bp_tier_experts() {
     let inputs = qwen3_inputs();
-    let machine = tiered(
-        Q3_LAYERS,
-        A6000,
-        RTX_3090,
-        q3::tier_batch(&inputs.hp),
-    );
+    let machine = tiered(Q3_LAYERS, A6000, RTX_3090, q3::tier_batch(&inputs.hp));
     let plan = inputs
         .plan(&machine, CTX, &PlanLevers::default())
         .expect("the A6000 stage plans a tier");

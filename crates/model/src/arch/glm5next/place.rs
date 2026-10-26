@@ -1867,7 +1867,6 @@ mod tests {
             }
         }
 
-
         /// A Q5_K gate and up with a Q6_K down takes every expert on a card
         /// with room for the stack; a Q6_K gate and up takes none.
         /// PIN(2026-10-22): the down arm admits Q6_K, so the layer is

@@ -1746,10 +1746,12 @@ mod tests {
         let both = DownForms::of(DownAct::Q8Act).with(DownAct::Q8Blocks32);
         for chunk in [1, 8, 16] {
             for downs in [DownForms::NONE, DownForms::of(DownAct::Q8Act), both] {
-                let direct = super::try_tier_leg_batch_bytes_of(256, 256, 6, (chunk, 32), downs, false)
-                    .expect("direct descriptor");
-                let scaled = super::try_tier_leg_batch_bytes_of(256, 256, 6, (chunk, 32), downs, true)
-                    .expect("scaled descriptor");
+                let direct =
+                    super::try_tier_leg_batch_bytes_of(256, 256, 6, (chunk, 32), downs, false)
+                        .expect("direct descriptor");
+                let scaled =
+                    super::try_tier_leg_batch_bytes_of(256, 256, 6, (chunk, 32), downs, true)
+                        .expect("scaled descriptor");
                 assert_eq!(scaled.staging, direct.staging);
                 assert_eq!(scaled.host, direct.host);
                 assert_eq!(scaled.scratch, direct.scratch + 4 * chunk * 6);
