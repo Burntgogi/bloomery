@@ -19,8 +19,9 @@
 //! [`HandoffKernels::enqueue_places_cols`] writes the places alone of such a
 //! row, for a walk whose routing reaches the host by a download, through
 //! `crate::card_slots`' `ds41_ffn_places`. `ds41_ffn_handoff_4_tier`,
-//! `ffn_handoff_6_tier` and `ds41_ffn_handoff_8_tier` hand over four, six or
-//! eight slots of a tier layer: the same writes, its tier places and f32 activation into
+//! `ffn_handoff_6_tier` and `ds41_ffn_handoff_8_tier` hand over four, six or eight
+//! slots of a layer an expert tier holds experts of: the same writes, the slots'
+//! tier places and the activation in f32 into
 //! the row's tier image ([`HandoffKernels::enqueue_handoff_tier`]);
 //! `ds41_ffn_handoff_10_cols_tier` is `_10_cols`'s of such a layer, every
 //! column's tier places and activation into the row's tier image
@@ -281,8 +282,8 @@ mod handoff_kernels {
         unsafe { handoff_at::<SLOTS_8>(&a, d, &mut image, &mut sel) };
     }
 
-    /// Six slots' f32 tier image, with the same per-thread writes and
-    /// following go as the four- and eight-slot tier entries.
+    /// [`ds41_ffn_handoff`] and the row's f32 tier image, with the same
+    /// per-thread writes and following go as [`ds41_ffn_handoff_8_tier`].
     #[allow(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
@@ -1347,7 +1348,7 @@ impl HandoffKernels {
 
 impl HandoffKernels {
     /// Enqueue the handoff of a tier layer of four, six or eight slots a token
-    /// (`ds41_ffn_handoff_4_tier`, `ffn_handoff_6_tier`, `ds41_ffn_handoff_8_tier`):
+    /// (`ds41_ffn_handoff_4_tier`, `ffn_handoff_6_tier` or `ds41_ffn_handoff_8_tier`):
     /// [`HandoffKernels::enqueue_handoff`]'s
     /// writes into `target`, and each slot's tier place (from `tmap`, the
     /// slot map's tier copy at the card copy's row offsets) into `tsel` and
@@ -1626,7 +1627,7 @@ impl HandoffKernels {
     }
 }
 
-/// The single-token F32 tier handoff's layout contract, shared by the
+/// The single-token F32 tier handoff's layout contract, shared by its
 /// slot entries. The generated launch checks the input and output spans.
 fn check_tier(lay: &HandoffLayout, tl: &TierImageLayout) -> Result<HandoffSlots, GpuError> {
     let slots = HandoffSlots::of(lay.n_used);
@@ -1789,7 +1790,7 @@ mod tests {
     }
 
     #[test]
-    fn a_token_tier_handoff_requires_matching_f32_four_six_or_eight_slot_images() {
+    fn a_token_tier_handoff_requires_matching_f32_slot_images() {
         for n_used in 0..=10 {
             let lay = HandoffLayout {
                 n_used,

@@ -2788,7 +2788,7 @@ mod tests {
     /// blocks, eagerly and on replay. Invalid ids must still raise.
     #[test]
     #[ignore = "needs a CUDA device; `just gate-gpu-ds41-lib` runs it on the box"]
-    fn hw_f32_tier_handoffs_conserve_six_and_eight_consumed_routes() {
+    fn hw_f32_tier_handoffs_conserve_consumed_routes() {
         const EXPERTS: usize = 16;
         const ROW_OFF: usize = 3;
         const LAYER: usize = 7;
@@ -2804,7 +2804,7 @@ mod tests {
         }
         let map = DeviceBuffer::from_host(stream, &map).expect("card map");
         let tmap = DeviceBuffer::from_host(stream, &tmap).expect("tier map");
-        for n_used in [6, 8] {
+        for n_used in [4, 6, 8] {
             for hidden in [n_used, 256, 257] {
                 for bad in [None, Some(EXPERTS as u32), Some(u32::MAX)] {
                     let mut ids = vec![15, 0, 10, 5, 8, 1, 2, 7];
@@ -2812,7 +2812,7 @@ mod tests {
                     if let Some(id) = bad {
                         ids[n_used - 1] = id;
                     }
-                    // Neither handoff may read the router's trailing lane.
+                    // No handoff may read the router's trailing lane.
                     ids.push(u32::MAX);
                     let weights: Vec<f32> = (0..n_used)
                         .map(|s| (s + 1) as f32 / 16.0)
