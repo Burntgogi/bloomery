@@ -31,7 +31,7 @@ use model::arch::models::{Ffn, LayerSpec, Moe};
 use model::arch::names::routed_stacks;
 use model::moe::HostLayer;
 use model::placement::accepts::{self, LegArms, Program};
-use model::placement::kernels::{self, DownAct, DownForms};
+use model::placement::kernels::{self, DownForms};
 use model::placement::{ModelTensors, Plan};
 use model::r8file::R8Source;
 

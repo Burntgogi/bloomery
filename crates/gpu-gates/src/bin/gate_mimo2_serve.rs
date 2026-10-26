@@ -892,9 +892,8 @@ mod gate {
         let mut inputs = PlanInputs::describe(&split)?;
         inputs.room = (PLAN_ROOM, HostRead::Given);
         let place = unset_place(cards).on_host()?;
-        let batch = (!place.tier_cards().is_empty())
-            .then(|| bloomery_gpu_mimo2::tier::tier_batch(&inputs))
-            .transpose()?;
+        let batch =
+            (!place.tier_cards().is_empty()).then(|| bloomery_gpu_mimo2::tier::tier_batch(&inputs));
         let machine = place.machine(None, batch)?(inputs.model.layers);
         let slots = NonZeroUsize::new(usize::try_from(DEFAULT_SLOTS)?).ok_or("no default slot")?;
         let plan =
