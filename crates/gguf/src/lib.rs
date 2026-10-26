@@ -36,8 +36,11 @@
 //! Errors, not panics: every file-derived value is bounds-checked — a
 //! truncated or hostile file yields [`LoadError`].
 
+pub mod arch;
 pub mod card;
 pub mod digest;
+pub mod engram;
+pub mod facts;
 pub mod iq_tables;
 pub mod qtype;
 pub mod quant;
@@ -53,6 +56,7 @@ pub use quant::{
 
 use std::collections::HashMap;
 use std::fs::File;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use memmap2::{Mmap, MmapMut};
@@ -201,6 +205,27 @@ pub enum LoadError {
     /// The tensor scales beside a tensor of a type that reads them ([`tensor_scales`]).
     #[error("tensor {name}: {detail}")]
     Scale { name: String, detail: String },
+    /// A read of bytes no run of the mapping holds: a tensor of a located split that is a stack
+    /// or is made, or a name the split does not have ([`Split::data`]).
+    #[error("tensor {name:?}: {what}")]
+    Unread { name: String, what: &'static str },
+    /// A [`Split::located`] argument that does not describe a split.
+    #[error("located split: {detail}")]
+    Located { detail: String },
+    /// The Engram companion file of a set ([`engram::attach_companion`]).
+    #[error("engram companion {path}: {detail}")]
+    Companion { path: String, detail: String },
+    /// A header fact the file states wrongly or twice ([`facts`]).
+    #[error("{0}")]
+    Fact(Box<facts::FactError>),
+}
+
+/// Boxed: a fact's error names its keys and values, and a large error variant
+/// would widen every `Result` that carries a `LoadError`.
+impl From<facts::FactError> for LoadError {
+    fn from(e: facts::FactError) -> Self {
+        LoadError::Fact(Box::new(e))
+    }
 }
 
 /// A parsed, mmap-backed GGUF file.
@@ -210,10 +235,16 @@ pub struct Gguf {
     _file: Option<File>,
     map: Backing,
     meta: Vec<(String, Value)>,
+    /// The file offset of each `meta` pair's value first byte, one per pair
+    /// in the same order.
+    offsets: Vec<u64>,
     tensors: Vec<TensorInfo>,
     /// File offset where the (aligned) tensor data section starts.
     data_base: u64,
     alignment: u64,
+    /// The tensors of a located shard ([`Split::located`]) that no run of its mapping holds,
+    /// each with why; empty for a file.
+    unread: HashMap<String, &'static str>,
 }
 
 /// Where the file's bytes live while the model runs.
@@ -295,10 +326,7 @@ impl Gguf {
     ) -> Result<Gguf, LoadError> {
         let file = File::open(path)?;
         let len = file.metadata()?.len();
-        // SAFETY: the file is opened read-only and nothing maps it writable;
-        // a concurrent truncation would surface as SIGBUS, the same contract
-        // ik_llama.cpp's own mmap loader accepts.
-        let file_map = unsafe { memmap2::MmapOptions::new().map(&file)? };
+        let file_map = map_read_only(&file)?;
         let h = parse_header(&file_map, len)?;
         let tensors = strict_tensors(h.tensors, h.data_base, len, private, own)?;
         let map = match weights {
@@ -329,9 +357,11 @@ impl Gguf {
             _file: Some(file),
             map,
             meta: h.meta,
+            offsets: h.offsets,
             tensors,
             data_base: h.data_base,
             alignment: h.alignment,
+            unread: HashMap::new(),
         })
     }
 
@@ -358,6 +388,15 @@ impl Gguf {
     /// Raw metadata lookup by exact key.
     pub fn value(&self, key: &str) -> Option<&Value> {
         self.meta.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+    }
+
+    /// The file offset of `key`'s value first byte: for a scalar the value
+    /// itself, for a string its length prefix, for an array its element tag.
+    /// Recorded while the header parsed, so no bytes are walked again; `None`
+    /// when the header does not name `key`.
+    pub fn value_offset(&self, key: &str) -> Option<u64> {
+        let i = self.meta.iter().position(|(k, _)| k == key)?;
+        Some(self.offsets[i])
     }
 
     /// `general.architecture` (e.g. "deepseek2").
@@ -470,6 +509,12 @@ impl Gguf {
     /// slice arithmetic is checked again here, so a stale `TensorInfo` from
     /// another file errors instead of panicking.
     pub fn data<'a>(&'a self, t: &TensorInfo) -> Result<&'a [u8], LoadError> {
+        if let Some(&what) = self.unread.get(&t.name) {
+            return Err(LoadError::Unread {
+                name: t.name.clone(),
+                what,
+            });
+        }
         // A closure, so the name is cloned only for a refusal.
         let out_of_bounds = || LoadError::OutOfBounds {
             name: t.name.clone(),
@@ -542,16 +587,171 @@ pub struct Split {
     paths: Vec<PathBuf>,
     /// Tensor name to (shard, index in that shard's table).
     by_name: HashMap<String, (usize, usize)>,
+    /// Every tensor's place, for a split made by [`Split::located`]; empty for any other.
+    places: HashMap<String, Place>,
+}
+
+/// How a stack's matrices lie in their bytes. A tensor's type says how a row encodes its values;
+/// the layout says which bytes a row is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StackLayout {
+    /// Row after row, each in the declared type's own blocks: one run a matrix.
+    Rows,
+    /// A matrix is two runs, its codes for every row and its block scales, wherever the file
+    /// keeps them: side by side, or a layer's worth of other tensors apart.
+    Planes,
+}
+
+/// Where a tensor of a [`Split`] keeps its bytes.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Place {
+    /// The declared type's bytes, at `range` (file offsets) of shard `shard`: [`Split::data`] is
+    /// those bytes.
+    File { shard: usize, range: Range<u64> },
+    /// A stack of equal matrices in shard `shard`, each read where the file keeps it
+    /// ([`Split::matrix`]); [`Split::data`] refuses the stack as one run. Matrix `e`'s codes are
+    /// the `codes_per` bytes at file offset `codes_at[e]`. Under [`StackLayout::Planes`] its
+    /// block scales are the `scales_per` bytes at `scales_at[e]`, and `scales[e]` is the factor
+    /// its results are multiplied by (what the `.scale` tensor of the stack holds for it, one
+    /// finite positive value an expert); under [`StackLayout::Rows`] all three are empty or 0.
+    /// No two runs overlap, and no order of codes and scales is assumed.
+    Stack {
+        shard: usize,
+        codes_at: Vec<u64>,
+        scales_at: Vec<u64>,
+        codes_per: u64,
+        scales_per: u64,
+        layout: StackLayout,
+        scales: Vec<f32>,
+    },
+    /// Bytes a step makes of the file's tensors (a cast, a `+1`, a normalize): no file run holds
+    /// them, so [`Split::data`] refuses them and the part source makes them.
+    Made,
+}
+
+/// One matrix of a [`Place::Stack`], as its file holds it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StackMatrix<'a> {
+    pub codes: &'a [u8],
+    /// The block-scale plane; empty for [`StackLayout::Rows`].
+    pub block_scales: &'a [u8],
+}
+
+const UNREAD_STACK: &str =
+    "is a stack of matrices read one at a time (Split::matrix), not one run of bytes";
+const UNREAD_MADE: &str = "is made by a step from the file's tensors: no run of any file holds it";
+
+impl Place {
+    /// Whether this place describes `nbytes` declared bytes inside a file of `file_len` bytes
+    /// (the shard's; unread for [`Place::Made`]): the refusal names what is wrong.
+    fn check(&self, name: &str, file_len: u64, nbytes: u64) -> Result<(), String> {
+        match self {
+            Place::Made => Ok(()),
+            Place::File { shard, range } => {
+                if range.start > range.end || range.end > file_len {
+                    return Err(format!(
+                        "{name}: bytes {range:?} lie outside shard {shard}'s {file_len}"
+                    ));
+                }
+                if range.end - range.start != nbytes {
+                    return Err(format!(
+                        "{name}: {} bytes at {range:?}, the declared {nbytes}",
+                        range.end - range.start
+                    ));
+                }
+                Ok(())
+            }
+            Place::Stack {
+                shard,
+                codes_at,
+                scales_at,
+                codes_per,
+                scales_per,
+                layout,
+                scales,
+            } => {
+                let n = codes_at.len() as u64;
+                if n == 0 || *codes_per == 0 {
+                    return Err(format!("{name}: a stack of no matrix, or of no bytes"));
+                }
+                match layout {
+                    StackLayout::Rows => {
+                        if !scales_at.is_empty() || *scales_per != 0 || !scales.is_empty() {
+                            return Err(format!(
+                                "{name}: a stack of rows has no scale plane and no tensor scales"
+                            ));
+                        }
+                    }
+                    StackLayout::Planes => {
+                        if scales_at.len() as u64 != n || *scales_per == 0 {
+                            return Err(format!(
+                                "{name}: {n} matrices, {} scale planes of {scales_per} bytes",
+                                scales_at.len()
+                            ));
+                        }
+                        if scales.len() as u64 != n {
+                            return Err(format!("{name}: {n} matrices, {} scales", scales.len()));
+                        }
+                    }
+                }
+                if let Some((e, s)) = scales
+                    .iter()
+                    .enumerate()
+                    .find(|(_, s)| !(s.is_finite() && **s > 0.0))
+                {
+                    return Err(format!(
+                        "{name}: the scale of matrix {e} is {s}, not finite and positive"
+                    ));
+                }
+                let per = codes_per.checked_add(*scales_per);
+                if per.and_then(|per| per.checked_mul(n)) != Some(nbytes) {
+                    return Err(format!(
+                        "{name}: {n} matrices of {codes_per} + {scales_per} bytes, the declared {nbytes}"
+                    ));
+                }
+                let mut runs: Vec<(u64, u64)> = codes_at
+                    .iter()
+                    .map(|&at| (at, *codes_per))
+                    .chain(scales_at.iter().map(|&at| (at, *scales_per)))
+                    .collect();
+                runs.sort_unstable();
+                for (i, &(start, len)) in runs.iter().enumerate() {
+                    let end = start
+                        .checked_add(len)
+                        .filter(|&e| e <= file_len)
+                        .ok_or_else(|| {
+                            format!(
+                                "{name}: the run at {start} runs outside shard {shard}'s {file_len}"
+                            )
+                        })?;
+                    if runs.get(i + 1).is_some_and(|&(next, _)| next < end) {
+                        return Err(format!("{name}: the run at {start} overlaps the next"));
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
 }
 
 impl Split {
     /// Open the model whose first shard is `first`. A file without
-    /// `split.count` is a one-shard model.
+    /// `split.count` is a one-shard model. A set whose Engram tables are
+    /// in a file of their own gets that companion as a further shard
+    /// ([`engram::attach_companion`]): its tensors are the split's, and
+    /// `split.tensors.count` still counts the model shards' alone.
     pub fn open(first: impl AsRef<Path>) -> Result<Split, LoadError> {
-        let first = first.as_ref().to_path_buf();
+        let mut split = Split::open_model(first.as_ref())?;
+        engram::attach_companion(&mut split)?;
+        Ok(split)
+    }
+
+    /// The model shards `split.count` names, checked against each other.
+    fn open_model(first: &Path) -> Result<Split, LoadError> {
+        let first = first.to_path_buf();
         let head = open_shard(&first)?;
         let Some(count) = head.value(SPLIT_COUNT) else {
-            return Split::assemble(vec![head], vec![first]);
+            return Split::assemble(vec![head], vec![first], None);
         };
         let count = split_int(&first, SPLIT_COUNT, Some(count))?;
         if count == 0 {
@@ -586,7 +786,7 @@ impl Split {
             let detail = format!("is {want}, but the {count} shards hold {got} tensors");
             return Err(split_key(&paths[0], SPLIT_TENSORS, detail));
         }
-        Split::assemble(shards, paths)
+        Split::assemble(shards, paths, None)
     }
 
     /// The header `layout` lays out, as one shard named `path`, holding no tensor's bytes: the
@@ -603,33 +803,172 @@ impl Split {
             _file: None,
             map: Backing::Header(bytes),
             meta: h.meta,
+            offsets: h.offsets,
             tensors,
             data_base: h.data_base,
             alignment: h.alignment,
+            unread: HashMap::new(),
         };
-        Split::assemble(vec![shard], vec![path])
+        Split::assemble(vec![shard], vec![path], None)
     }
 
-    /// Index every tensor by name, refusing a name that appears twice.
-    fn assemble(shards: Vec<Gguf>, paths: Vec<PathBuf>) -> Result<Split, LoadError> {
-        let mut by_name: HashMap<String, (usize, usize)> = HashMap::new();
-        for (s, g) in shards.iter().enumerate() {
-            for (i, t) in g.iter_tensors().enumerate() {
-                if let Some(&(first, _)) = by_name.get(&t.name) {
-                    return Err(LoadError::DuplicateTensor {
-                        name: t.name.clone(),
-                        first: paths[first].display().to_string(),
-                        second: paths[s].display().to_string(),
-                    });
-                }
-                by_name.insert(t.name.clone(), (s, i));
+    /// The header `layout` lays out, over the files that hold the tensors' bytes where they
+    /// are: shard `i` is `files[i]`, mapped read-only as a GGUF shard is, and `places[i]` is
+    /// where the `i`-th tensor of `layout` keeps its bytes ([`Place`]). The keys are shard 0's,
+    /// so `path`, which names the split ([`Split::shard_path`] of shard 0), is `files[0]`. Every
+    /// tensor is checked as a shard's is (its type, block alignment and size, against the file
+    /// `layout` would write), then against its place: a file run must lie inside its file and
+    /// be as long as the declared bytes, a stack's matrices must lie inside their file, not
+    /// overlap, and add up to the declared bytes. A [`Place::File`] tensor's `info.offset` is its
+    /// file offset (`data_base` is 0), a stack's or a made tensor's is `u64::MAX`: no file offset
+    /// names it. With no file the split is [`Split::header_only`], every tensor of it
+    /// [`Place::Made`].
+    pub fn located(
+        path: PathBuf,
+        layout: &write::Layout,
+        files: &[PathBuf],
+        places: Vec<Place>,
+    ) -> Result<Split, LoadError> {
+        let bad = |detail: String| LoadError::Located { detail };
+        let bytes = layout.header_bytes().to_vec();
+        let h = parse_header(&bytes, layout.file_len())?;
+        let tensors = strict_tensors(h.tensors, h.data_base, layout.file_len(), &[], true)?;
+        if places.len() != tensors.len() {
+            return Err(bad(format!(
+                "{} places for the header's {} tensors",
+                places.len(),
+                tensors.len()
+            )));
+        }
+        if files.is_empty() {
+            let kept = tensors.iter().zip(&places).find_map(|(t, p)| match p {
+                Place::File { shard, .. } | Place::Stack { shard, .. } => Some((&t.name, *shard)),
+                Place::Made => None,
+            });
+            if let Some((name, shard)) = kept {
+                return Err(bad(format!("{name}: shard {shard}, of 0 files")));
             }
+            return Split::header_only(path, layout);
+        }
+        if files.first().is_some_and(|first| *first != path) {
+            return Err(bad(format!(
+                "the split is named {}, its first file is {}",
+                path.display(),
+                files[0].display()
+            )));
+        }
+        let mut handles = Vec::with_capacity(files.len());
+        for f in files {
+            let open = || -> Result<(File, Mmap), LoadError> {
+                let file = File::open(f)?;
+                let map = map_read_only(&file)?;
+                Ok((file, map))
+            };
+            handles.push(open().map_err(|e| match e {
+                LoadError::Io(io) if io.kind() == std::io::ErrorKind::NotFound => {
+                    LoadError::MissingShard {
+                        path: f.display().to_string(),
+                    }
+                }
+                other => LoadError::Shard {
+                    path: f.display().to_string(),
+                    source: Box::new(other),
+                },
+            })?);
+        }
+        let lens: Vec<u64> = handles.iter().map(|(_, m)| m.len() as u64).collect();
+        let n = files.len();
+        let mut tables: Vec<Vec<TensorInfo>> = vec![vec![]; n];
+        let mut unread: Vec<HashMap<String, &'static str>> = vec![HashMap::new(); n];
+        let mut placed = HashMap::with_capacity(places.len());
+        for (mut info, place) in tensors.into_iter().zip(places) {
+            let name = info.name.clone();
+            let shard = match &place {
+                Place::File { shard, .. } | Place::Stack { shard, .. } => *shard,
+                Place::Made => 0,
+            };
+            let len = if matches!(place, Place::Made) {
+                0
+            } else {
+                lens.get(shard).copied().ok_or_else(|| {
+                    bad(format!("{name}: shard {shard}, of {} files", files.len()))
+                })?
+            };
+            place.check(&name, len, info.nbytes).map_err(bad)?;
+            match &place {
+                Place::File { range, .. } => info.offset = range.start,
+                Place::Stack { .. } => {
+                    info.offset = u64::MAX;
+                    unread[shard].insert(name.clone(), UNREAD_STACK);
+                }
+                Place::Made => {
+                    info.offset = u64::MAX;
+                    unread[0].insert(name.clone(), UNREAD_MADE);
+                }
+            }
+            tables[shard].push(info);
+            placed.insert(name, place);
+        }
+        let mut meta = Some((h.meta, h.offsets));
+        let shards = tables
+            .into_iter()
+            .zip(unread)
+            .zip(handles)
+            .map(|((table, unread), (file, map))| {
+                let (meta, offsets) = meta.take().unwrap_or_default();
+                Gguf {
+                    _file: Some(file),
+                    map: Backing::File(map),
+                    meta,
+                    offsets,
+                    tensors: table,
+                    data_base: 0,
+                    alignment: h.alignment,
+                    unread,
+                }
+            })
+            .collect();
+        Split::assemble(shards, files.to_vec(), Some(placed))
+    }
+
+    /// Index every tensor by name, refusing a name that appears twice. `placed` is the places a
+    /// located split was given; any other split keeps each tensor's run of its file, or
+    /// [`Place::Made`] where the shard is a header alone.
+    fn assemble(
+        shards: Vec<Gguf>,
+        paths: Vec<PathBuf>,
+        placed: Option<HashMap<String, Place>>,
+    ) -> Result<Split, LoadError> {
+        let mut by_name: HashMap<String, (usize, usize)> = HashMap::new();
+        let mut places = placed.unwrap_or_default();
+        let given = !places.is_empty();
+        for (s, g) in shards.iter().enumerate() {
+            index_shard(&mut by_name, &mut places, &paths, s, g, !given)?;
         }
         Ok(Split {
             shards,
             paths,
             by_name,
+            places,
         })
+    }
+
+    /// Add `shard`, the file at `path`, after the shards the split has: its tensors are the
+    /// split's, and a name the split already holds is refused. The shard is no part of the
+    /// model's `split.count` set.
+    pub(crate) fn attach_shard(&mut self, shard: Gguf, path: PathBuf) -> Result<(), LoadError> {
+        let s = self.shards.len();
+        self.paths.push(path);
+        index_shard(
+            &mut self.by_name,
+            &mut self.places,
+            &self.paths,
+            s,
+            &shard,
+            true,
+        )?;
+        self.shards.push(shard);
+        Ok(())
     }
 
     /// Number of shards (1 for a single file).
@@ -637,7 +976,8 @@ impl Split {
         self.shards.len()
     }
 
-    /// Whether tensors are supplied by a part source rather than this split's mappings.
+    /// Whether tensors are supplied by a part source rather than this split's mappings: a header
+    /// alone ([`Split::header_only`], or [`Split::located`] over no file).
     pub fn is_header_only(&self) -> bool {
         matches!(&self.shards[0].map, Backing::Header(_))
     }
@@ -669,6 +1009,64 @@ impl Split {
             .iter()
             .enumerate()
             .flat_map(|(s, g)| g.iter_tensors().map(move |t| (s, t)))
+    }
+
+    /// Where tensor `name` keeps its bytes: the place a [`Split::located`] split was given it; in
+    /// a file, the run of its bytes; in a header alone ([`Split::header_only`]), nowhere
+    /// ([`Place::Made`]). `None` for a name the split does not have.
+    pub fn place(&self, name: &str) -> Option<&Place> {
+        self.places.get(name)
+    }
+
+    /// The bytes of tensor `name`, in its shard's mapping: [`Gguf::data`] of the tensor's shard. A
+    /// stack or a made tensor of a located split is refused by name.
+    pub fn data(&self, name: &str) -> Result<&[u8], LoadError> {
+        let (shard, info) = self.find(name).ok_or_else(|| LoadError::Unread {
+            name: name.to_string(),
+            what: "is not a tensor of the split",
+        })?;
+        self.shards[shard].data(info)
+    }
+
+    /// Matrix `e` of the stack `name` of a located split ([`Place::Stack`]): its runs where the
+    /// file keeps them.
+    pub fn matrix(&self, name: &str, e: usize) -> Result<StackMatrix<'_>, LoadError> {
+        let unread = |what| LoadError::Unread {
+            name: name.to_string(),
+            what,
+        };
+        let Some(Place::Stack {
+            shard,
+            codes_at,
+            scales_at,
+            codes_per,
+            scales_per,
+            ..
+        }) = self.places.get(name)
+        else {
+            return Err(unread("is not a stack of a located split"));
+        };
+        let codes_at = codes_at
+            .get(e)
+            .ok_or_else(|| unread("has no matrix of that index"))?;
+        let map = self.shards[*shard].mapping();
+        // `located` checked every run inside its file.
+        let run = |at: u64, len: u64| {
+            let end = at.checked_add(len)?;
+            map.get(usize::try_from(at).ok()?..usize::try_from(end).ok()?)
+        };
+        let codes = run(*codes_at, *codes_per);
+        let block_scales = match scales_at.get(e) {
+            Some(at) => run(*at, *scales_per),
+            None => Some(&[][..]),
+        };
+        codes
+            .zip(block_scales)
+            .map(|(codes, block_scales)| StackMatrix {
+                codes,
+                block_scales,
+            })
+            .ok_or_else(|| unread("has a matrix outside its file"))
     }
 
     /// Raw metadata lookup by exact key, in the first shard.
@@ -717,10 +1115,58 @@ impl Split {
     }
 }
 
+/// Index shard `s` (`g`, whose path is `paths[s]`) into `by_name`, refusing a tensor name the
+/// index already holds; with `keep_runs`, record each tensor's run of its file in `places`
+/// ([`Place::File`], or [`Place::Made`] for a header alone).
+fn index_shard(
+    by_name: &mut HashMap<String, (usize, usize)>,
+    places: &mut HashMap<String, Place>,
+    paths: &[PathBuf],
+    s: usize,
+    g: &Gguf,
+    keep_runs: bool,
+) -> Result<(), LoadError> {
+    let in_file = !matches!(g.map, Backing::Header(_));
+    for (i, t) in g.iter_tensors().enumerate() {
+        if let Some(&(first, _)) = by_name.get(&t.name) {
+            return Err(LoadError::DuplicateTensor {
+                name: t.name.clone(),
+                first: paths[first].display().to_string(),
+                second: paths[s].display().to_string(),
+            });
+        }
+        by_name.insert(t.name.clone(), (s, i));
+        if keep_runs {
+            // `open` checked the run inside its file.
+            let start = g.data_base() + t.offset;
+            places.insert(
+                t.name.clone(),
+                if in_file {
+                    Place::File {
+                        shard: s,
+                        range: start..start + t.nbytes,
+                    }
+                } else {
+                    Place::Made
+                },
+            );
+        }
+    }
+    Ok(())
+}
+
 /// `-%05d-of-%05d.gguf` for shard `i` of `count`, the part `llama_split_path`
 /// appends to the prefix (numbered from 1).
 fn shard_suffix(i: u64, count: u64) -> String {
     format!("-{:05}-of-{count:05}.gguf", i + 1)
+}
+
+/// `file`'s read-only mapping, whole.
+fn map_read_only(file: &File) -> std::io::Result<Mmap> {
+    // SAFETY: the file is opened read-only and nothing maps it writable;
+    // a concurrent truncation would surface as SIGBUS, the same contract
+    // ik_llama.cpp's own mmap loader accepts.
+    unsafe { memmap2::MmapOptions::new().map(file) }
 }
 
 /// The strict open of one shard, its error naming the file.
@@ -781,6 +1227,9 @@ pub struct Inventory {
     pub data_base: u64,
     pub alignment: u64,
     pub file_len: u64,
+    /// The file the header was read from, where a tensor's bytes are read
+    /// ([`facts::hash_constant`]); `None` for a header built in memory.
+    pub path: Option<PathBuf>,
 }
 
 impl Inventory {
@@ -795,7 +1244,8 @@ impl Inventory {
 /// touched only as far as the tensor-info section reaches, so a multi-
 /// hundred-GiB split shards in seconds without reading tensor bytes.
 pub fn inventory_of(path: impl AsRef<Path>) -> Result<Inventory, LoadError> {
-    let file = File::open(path)?;
+    let path = path.as_ref().to_path_buf();
+    let file = File::open(&path)?;
     let len = file.metadata()?.len();
     // SAFETY: read-only mapping, nothing maps it writable — the same
     // contract `Gguf::open_backed` accepts.
@@ -809,6 +1259,7 @@ pub fn inventory_of(path: impl AsRef<Path>) -> Result<Inventory, LoadError> {
         data_base: h.data_base,
         alignment: h.alignment,
         file_len: len,
+        path: Some(path),
     })
 }
 
@@ -1113,6 +1564,9 @@ fn strict_tensors(
 struct Header {
     version: u32,
     meta: Vec<(String, Value)>,
+    /// The file offset of each `meta` pair's value first byte, aligned with
+    /// `meta` by construction: one is pushed per pair.
+    offsets: Vec<u64>,
     tensors: Vec<RawTensorInfo>,
     header_end: u64,
     alignment: u64,
@@ -1138,11 +1592,15 @@ fn parse_header(b: &[u8], len: u64) -> Result<Header, LoadError> {
     let n_kv = rd.u64()?;
 
     let mut meta = Vec::new();
+    let mut offsets = Vec::new();
     for _ in 0..n_kv {
         let key = rd.string()?;
         let tag = rd.u32()?;
+        // The value starts at the reader's position; `read_value` moves past it.
+        let at = rd.pos as u64;
         let val = read_value(&mut rd, &key, tag)?;
         meta.push((key, val));
+        offsets.push(at);
     }
 
     let mut tensors = Vec::new();
@@ -1183,6 +1641,7 @@ fn parse_header(b: &[u8], len: u64) -> Result<Header, LoadError> {
     Ok(Header {
         version,
         meta,
+        offsets,
         tensors,
         header_end,
         alignment,
@@ -1301,7 +1760,7 @@ fn read_value(rd: &mut Reader<'_>, key: &str, tag: u32) -> Result<Value, LoadErr
 
 #[cfg(test)]
 mod split_tests {
-    use super::{GENERAL_ARCHITECTURE, Gguf, LoadError, Split, Value};
+    use super::{GENERAL_ARCHITECTURE, Gguf, LoadError, Place, Split, Value};
     use crate::write::{TensorDecl, write_file};
     use std::path::{Path, PathBuf};
 
@@ -1383,6 +1842,13 @@ mod split_tests {
         let (i, t) = s.find("c").unwrap();
         assert_eq!(i, 1);
         assert_eq!(s.shard(i).unwrap().data(t).unwrap().len(), 16);
+        let base = s.shard(i).unwrap().data_base() + t.offset;
+        let run = Place::File {
+            shard: 1,
+            range: base..base + 16,
+        };
+        assert_eq!(s.place("c"), Some(&run));
+        assert_eq!(s.place("e"), None);
         assert_eq!(s.shard_path(2).unwrap(), shard_path(&d, 2));
         assert!(s.find("e").is_none());
         assert_eq!(s.architecture(), Some("test"));
@@ -1427,6 +1893,7 @@ mod split_tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(infos(&head), infos(&file));
+        assert_eq!(head.place("a"), Some(&Place::Made));
         assert_eq!(head.shard_path(0), Some(d.as_path()));
         let shard = head.shard(0).unwrap();
         assert!(!shard.file_backed());
@@ -1841,6 +2308,446 @@ mod private_tests {
                 Err(LoadError::KnownPrivateType { id: got, .. }) if got == id
             ));
         }
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod value_offset_tests {
+    use super::{GENERAL_ARCHITECTURE, Gguf, Split, Value};
+    use crate::write::{TensorDecl, write_file};
+
+    /// A written header's recorded value offsets read back each value's own bytes: a scalar's
+    /// bytes at the offset, a string's length prefix at it, an array's element tag and count, a
+    /// key no header names has no offset, and a split's shared keys sit at each shard's own
+    /// offset in its own file.
+    #[test]
+    fn a_written_headers_value_offset_reads_back_the_value() {
+        let d = std::env::temp_dir().join(format!("gguf-offset-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let kv = |k: &str, v: Value| (k.to_string(), v);
+        let decl = |name: &str| TensorDecl {
+            name: name.to_string(),
+            dims: vec![4],
+            type_id: 0,
+            nbytes: 16,
+        };
+        let p = d.join("one.gguf");
+        write_file(
+            &p,
+            &[
+                kv("scalar.u64", Value::U64(0x0102_0304_0506_0708)),
+                kv("scalar.f32", Value::F32(1.5)),
+                kv("scalar.bool", Value::Bool(true)),
+                kv("a.string", Value::String("an id".into())),
+                kv(
+                    "an.array",
+                    Value::Array(vec![Value::String("a".into()), Value::String("bcd".into())]),
+                ),
+            ],
+            &[(decl("t"), vec![0; 16])],
+        );
+        let g = Gguf::open(&p).unwrap();
+        let m = g.mapping();
+        let le64 = |b: &[u8]| u64::from_le_bytes(b.try_into().unwrap());
+        let le32 = |b: &[u8]| u32::from_le_bytes(b.try_into().unwrap());
+        let at = |key: &str| usize::try_from(g.value_offset(key).unwrap()).unwrap();
+        assert_eq!(le64(&m[at("scalar.u64")..][..8]), 0x0102_0304_0506_0708);
+        assert_eq!(f32::from_bits(le32(&m[at("scalar.f32")..][..4])), 1.5);
+        assert_eq!(m[at("scalar.bool")], 1);
+        let s = at("a.string");
+        assert_eq!(le64(&m[s..][..8]), 5, "the string's length prefix");
+        assert_eq!(&m[s + 8..][..5], b"an id");
+        let a = at("an.array");
+        assert_eq!(le32(&m[a..][..4]), 8, "the array's string element tag");
+        assert_eq!(le64(&m[a + 4..][..8]), 2);
+        assert_eq!(g.value_offset("absent.key"), None);
+        // A split's shared keys sit at each shard's own offset: shard 0's header
+        // carries one more pair, so the same key lands elsewhere in each file.
+        for i in 0..2u16 {
+            let mut kvs = vec![
+                kv("split.no", Value::U16(i)),
+                kv("split.count", Value::U16(2)),
+                kv("split.tensors.count", Value::I32(2)),
+            ];
+            if i == 0 {
+                kvs.insert(0, kv(GENERAL_ARCHITECTURE, Value::String("test".into())));
+            }
+            write_file(
+                &d.join(format!("s-{:05}-of-00002.gguf", i + 1)),
+                &kvs,
+                &[(decl(if i == 0 { "a" } else { "b" }), vec![0; 16])],
+            );
+        }
+        let s = Split::open(d.join("s-00001-of-00002.gguf")).unwrap();
+        for i in 0..2u16 {
+            let shard = s.shard(i as usize).unwrap();
+            let at = usize::try_from(shard.value_offset("split.no").unwrap()).unwrap();
+            let m = shard.mapping();
+            assert_eq!(u16::from_le_bytes(m[at..][..2].try_into().unwrap()), i);
+        }
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod located_tests {
+    use super::{GENERAL_ARCHITECTURE, LoadError, Place, Split, StackLayout, Value, write};
+    use std::fmt::Debug;
+    use std::path::{Path, PathBuf};
+
+    const A_LEN: usize = 64;
+    const B_LEN: usize = 96;
+
+    /// The two files' bytes: file A holds `i`, file B `100 + i`, at offset `i`.
+    fn file_bytes(shard: usize) -> Vec<u8> {
+        let (len, base) = if shard == 0 { (A_LEN, 0) } else { (B_LEN, 100) };
+        (0..len).map(|i| base + i as u8).collect()
+    }
+
+    fn dir(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("gguf-located-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn files(d: &Path) -> Vec<PathBuf> {
+        (0..2)
+            .map(|i| {
+                let p = d.join(format!("s-{i}.bin"));
+                std::fs::write(&p, file_bytes(i)).unwrap();
+                p
+            })
+            .collect()
+    }
+
+    fn f32s(name: &str, dims: &[u64]) -> write::TensorDecl {
+        write::TensorDecl {
+            name: name.to_string(),
+            dims: dims.to_vec(),
+            type_id: 0,
+            nbytes: 4 * dims.iter().product::<u64>(),
+        }
+    }
+
+    /// The header of the five tensors the places below keep: `f.weight` and `g.weight` in a file
+    /// each, the stacks `s.weight` (three matrices of 12 + 4 bytes) and `t.weight` (two of
+    /// 8 + 4), and `m.weight`, which no file holds.
+    fn layout() -> write::Layout {
+        let kvs = [(
+            GENERAL_ARCHITECTURE.to_string(),
+            Value::String("test".into()),
+        )];
+        write::Layout::new(
+            &kvs,
+            vec![
+                f32s("f.weight", &[4]),
+                f32s("g.weight", &[2]),
+                f32s("s.weight", &[4, 3]),
+                f32s("t.weight", &[6]),
+                f32s("m.weight", &[2]),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// A stack of planes in file B: matrices `codes_at`, `scales_at` apart as given.
+    fn planes(
+        codes_at: &[u64],
+        scales_at: &[u64],
+        (codes_per, scales_per): (u64, u64),
+        scales: &[f32],
+    ) -> Place {
+        Place::Stack {
+            shard: 1,
+            codes_at: codes_at.to_vec(),
+            scales_at: scales_at.to_vec(),
+            codes_per,
+            scales_per,
+            layout: StackLayout::Planes,
+            scales: scales.to_vec(),
+        }
+    }
+
+    /// The places of the five: `s.weight`'s block scales each directly after its codes, the
+    /// matrices out of order; `t.weight`'s a gap away from its codes, before and after them.
+    fn places() -> Vec<Place> {
+        vec![
+            Place::File {
+                shard: 0,
+                range: 8..24,
+            },
+            Place::File {
+                shard: 1,
+                range: 56..64,
+            },
+            planes(&[64, 0, 16], &[76, 12, 28], (12, 4), &[0.5, 2.0, 0.25]),
+            planes(&[32, 44], &[88, 80], (8, 4), &[4.0, 0.125]),
+            Place::Made,
+        ]
+    }
+
+    fn located(d: &Path, places: Vec<Place>) -> Result<Split, LoadError> {
+        let files = files(d);
+        Split::located(files[0].clone(), &layout(), &files, places)
+    }
+
+    fn refused(d: &Path, places: Vec<Place>) -> String {
+        match located(d, places) {
+            Ok(_) => panic!("the places must be refused"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    fn named<T: Debug>(r: Result<T, LoadError>, parts: &[&str]) {
+        let e = r.expect_err("refused").to_string();
+        assert!(parts.iter().all(|p| e.contains(p)), "{e}");
+    }
+
+    /// A two-file folder's split holds each file tensor's bytes where the file keeps them, reads
+    /// a stack's matrices out of order with their block scales both next to their codes and a
+    /// gap away, and refuses a made tensor and a stack as one run by name. A header alone, for
+    /// the same header, ends every read in `OutOfBounds`.
+    #[test]
+    fn a_located_split_reads_the_files_bytes_in_place() {
+        let d = dir("reads");
+        let s = located(&d, places()).unwrap();
+        let (a, b) = (file_bytes(0), file_bytes(1));
+        assert_eq!(s.shard_count(), 2);
+        assert_eq!(s.shard_path(0).unwrap(), d.join("s-0.bin"));
+        assert_eq!(s.shard_path(1).unwrap(), d.join("s-1.bin"));
+        assert_eq!(s.architecture(), Some("test"));
+        assert_eq!(s.tensor_count(), 5);
+        assert!(!s.is_header_only());
+        assert_eq!(s.data("f.weight").unwrap(), &a[8..24]);
+        assert_eq!(s.data("g.weight").unwrap(), &b[56..64]);
+        let (shard, info) = s.find("g.weight").unwrap();
+        assert_eq!((shard, info.offset), (1, 56));
+        assert_eq!(s.shard(shard).unwrap().data_base() + info.offset, 56);
+        assert_eq!(s.shard(shard).unwrap().data(info).unwrap(), &b[56..64]);
+        // Adjacent: each matrix's scales begin where its codes end.
+        for (e, at) in [64usize, 0, 16].into_iter().enumerate() {
+            let m = s.matrix("s.weight", e).unwrap();
+            assert_eq!(m.codes, &b[at..at + 12]);
+            assert_eq!(m.block_scales, &b[at + 12..at + 16]);
+        }
+        // Separated: the planes of one matrix lie in different regions, scales before codes.
+        for (e, (codes, scales)) in [(32usize, 88usize), (44, 80)].into_iter().enumerate() {
+            let m = s.matrix("t.weight", e).unwrap();
+            assert_eq!(m.codes, &b[codes..codes + 8]);
+            assert_eq!(m.block_scales, &b[scales..scales + 4]);
+        }
+        named(s.data("m.weight"), &["m.weight", "made"]);
+        named(s.data("s.weight"), &["s.weight", "stack"]);
+        named(s.data("t.weight"), &["t.weight", "stack"]);
+        named(s.data("absent"), &["absent", "not a tensor"]);
+        let (shard, info) = s.find("m.weight").unwrap();
+        named(s.shard(shard).unwrap().data(info), &["m.weight", "made"]);
+        named(s.matrix("s.weight", 3), &["s.weight", "no matrix"]);
+        named(s.matrix("f.weight", 0), &["f.weight", "not a stack"]);
+        let ps = places();
+        assert_eq!(s.place("f.weight"), Some(&ps[0]));
+        assert_eq!(s.place("s.weight"), Some(&ps[2]));
+        assert_eq!(s.place("t.weight"), Some(&ps[3]));
+        assert_eq!(s.place("m.weight"), Some(&Place::Made));
+        assert_eq!(s.place("absent"), None);
+
+        let alone = Split::header_only(d.join("s-0.bin"), &layout()).unwrap();
+        let (shard, info) = alone.find("f.weight").unwrap();
+        let e = alone.shard(shard).unwrap().data(info).unwrap_err();
+        assert!(matches!(e, LoadError::OutOfBounds { .. }), "{e}");
+        assert!(alone.is_header_only());
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// A located split over no file is the header alone, its tensors all made; a place a file
+    /// does not hold, a run of the wrong length, a stack with a run off its file, overlapping
+    /// another, short of the declared bytes or with a scale that is no finite positive factor,
+    /// and a split not named by its first file are refused by name. A stack of rows has no scale
+    /// plane and no scales.
+    #[test]
+    fn places_that_do_not_describe_the_files_are_refused_by_name() {
+        let d = dir("refuses");
+        let l = layout();
+        let path = d.join("s-0.bin");
+        let alone = Split::located(path.clone(), &l, &[], vec![Place::Made; 5]).unwrap();
+        let plain = Split::header_only(path.clone(), &l).unwrap();
+        assert!(alone.is_header_only());
+        assert_eq!(alone.shard_path(0).unwrap(), path);
+        assert_eq!(alone.keys(), plain.keys());
+        let tensors = |s: &Split| -> Vec<(usize, String, Vec<u64>, u64, u64)> {
+            s.iter_tensors()
+                .map(|(i, t)| (i, t.name.clone(), t.dims.clone(), t.offset, t.nbytes))
+                .collect()
+        };
+        assert_eq!(tensors(&alone), tensors(&plain));
+        assert_eq!(alone.place("f.weight"), Some(&Place::Made));
+        let e = alone.data("f.weight").unwrap_err();
+        assert!(matches!(e, LoadError::OutOfBounds { .. }), "{e}");
+        let e = Split::located(path.clone(), &l, &[], places())
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(e.contains("f.weight: shard 0, of 0 files"), "{e}");
+
+        let with = |i: usize, p: Place| {
+            let mut ps = places();
+            ps[i] = p;
+            ps
+        };
+        let file = |shard, range| Place::File { shard, range };
+        let (codes, scales) = ([64, 0, 16], [76, 12, 28]);
+        let three = |codes: &[u64], scales: &[u64], s: &[f32]| planes(codes, scales, (12, 4), s);
+        let ok = [0.5, 2.0, 0.25];
+        let stack_in_file_a = Place::Stack {
+            shard: 0,
+            codes_at: vec![0, 16, 52],
+            scales_at: vec![12, 28, 64],
+            codes_per: 12,
+            scales_per: 4,
+            layout: StackLayout::Planes,
+            scales: ok.to_vec(),
+        };
+        let rows_with_planes = Place::Stack {
+            shard: 1,
+            codes_at: vec![32, 48],
+            scales_at: vec![88, 92],
+            codes_per: 12,
+            scales_per: 0,
+            layout: StackLayout::Rows,
+            scales: vec![],
+        };
+        let rows_with_scales = Place::Stack {
+            shard: 1,
+            codes_at: vec![32, 48],
+            scales_at: vec![],
+            codes_per: 12,
+            scales_per: 0,
+            layout: StackLayout::Rows,
+            scales: vec![1.0, 1.0],
+        };
+        for (i, p, want) in [
+            (0, file(2, 8..24), "f.weight: shard 2, of 2 files"),
+            (
+                0,
+                file(0, 8..20),
+                "f.weight: 12 bytes at 8..20, the declared 16",
+            ),
+            (
+                0,
+                file(0, 56..72),
+                "f.weight: bytes 56..72 lie outside shard 0's 64",
+            ),
+            (
+                2,
+                planes(&[64, 0], &[76, 12], (12, 4), &[0.5, 2.0]),
+                "s.weight: 2 matrices of 12 + 4 bytes, the declared 48",
+            ),
+            (
+                2,
+                three(&[64, 0, 88], &scales, &ok),
+                "s.weight: the run at 88 runs outside shard 1's 96",
+            ),
+            (
+                2,
+                three(&[64, 0, u64::MAX], &scales, &ok),
+                "s.weight: the run at 18446744073709551615 runs outside shard 1's 96",
+            ),
+            (
+                2,
+                three(&[0, 8, 32], &scales, &ok),
+                "s.weight: the run at 0 overlaps the next",
+            ),
+            (
+                2,
+                three(&[0, 16, 64], &[14, 28, 76], &ok),
+                "s.weight: the run at 14 overlaps the next",
+            ),
+            (
+                2,
+                planes(&[], &[], (12, 4), &[]),
+                "s.weight: a stack of no matrix",
+            ),
+            (
+                2,
+                planes(&codes, &scales, (0, 4), &ok),
+                "s.weight: a stack of no matrix, or of no bytes",
+            ),
+            (
+                2,
+                stack_in_file_a,
+                "s.weight: the run at 64 runs outside shard 0's 64",
+            ),
+            (
+                2,
+                three(&codes, &scales[..2], &ok),
+                "s.weight: 3 matrices, 2 scale planes of 4 bytes",
+            ),
+            (
+                2,
+                three(&codes, &scales, &ok[..2]),
+                "s.weight: 3 matrices, 2 scales",
+            ),
+            (
+                2,
+                three(&codes, &scales, &[0.5, 0.0, 0.25]),
+                "s.weight: the scale of matrix 1 is 0, not finite and positive",
+            ),
+            (
+                2,
+                three(&codes, &scales, &[f32::NAN, 2.0, 0.25]),
+                "s.weight: the scale of matrix 0 is NaN, not finite and positive",
+            ),
+            (
+                2,
+                three(&codes, &scales, &[0.5, 2.0, -0.25]),
+                "s.weight: the scale of matrix 2 is -0.25, not finite and positive",
+            ),
+            (
+                2,
+                three(&codes, &scales, &[0.5, f32::INFINITY, 0.25]),
+                "s.weight: the scale of matrix 1 is inf, not finite and positive",
+            ),
+            (
+                3,
+                rows_with_planes,
+                "t.weight: a stack of rows has no scale plane and no tensor scales",
+            ),
+            (
+                3,
+                rows_with_scales,
+                "t.weight: a stack of rows has no scale plane and no tensor scales",
+            ),
+        ] {
+            let e = refused(&d, with(i, p));
+            assert!(e.contains(want), "{want}: {e}");
+        }
+        let rows = Place::Stack {
+            shard: 1,
+            codes_at: vec![32, 48],
+            scales_at: vec![],
+            codes_per: 12,
+            scales_per: 0,
+            layout: StackLayout::Rows,
+            scales: vec![],
+        };
+        let s = located(&d, with(3, rows)).unwrap();
+        let m = s.matrix("t.weight", 1).unwrap();
+        assert_eq!(m.codes, &file_bytes(1)[48..60]);
+        assert!(m.block_scales.is_empty());
+        let e = refused(&d, places()[..3].to_vec());
+        assert!(e.contains("3 places for the header's 5 tensors"), "{e}");
+        let fs = files(&d);
+        let e = Split::located(fs[1].clone(), &l, &fs, places())
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(e.contains("its first file is"), "{e}");
+        let missing = [d.join("absent.bin")];
+        let e = Split::located(missing[0].clone(), &l, &missing, places())
+            .err()
+            .unwrap();
+        assert!(matches!(e, LoadError::MissingShard { .. }), "{e}");
         std::fs::remove_dir_all(&d).unwrap();
     }
 }

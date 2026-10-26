@@ -5,6 +5,7 @@
 use unicode_normalization_alignments::UnicodeNormalization;
 
 use crate::collapse_table::RUNS;
+use crate::letter_case_table::RUNS as LETTER_CASE_RUNS;
 
 /// U+FFFD, what the reference substitutes for a byte it cannot decode.
 pub(crate) const REPLACEMENT: u32 = 0xFFFD;
@@ -176,6 +177,21 @@ pub(crate) fn collapse_hf(cpt: u32) -> u8 {
     match AFTER_UNICODE_14.get(i) {
         Some(&(first, _)) if first <= cpt => 0xD0,
         _ => collapse(cpt),
+    }
+}
+
+/// A letter's category class in Unicode 14.0, the version Hugging Face's regex classes are: 1 for
+/// `Lu` and `Lt`, 2 for `Ll`, 3 for `Lm` and `Lo`, 0 for a codepoint that is no letter.
+pub(crate) fn letter_case(cpt: u32) -> u8 {
+    match u8::try_from(cpt) {
+        Ok(b) if b < 0x80 => {
+            u8::from(b.is_ascii_uppercase()) + 2 * u8::from(b.is_ascii_lowercase())
+        }
+        _ => {
+            let i = LETTER_CASE_RUNS.partition_point(|&(start, _)| start <= cpt);
+            // The runs start at 0x80 and `cpt` is at least that, so `i >= 1`.
+            LETTER_CASE_RUNS[i - 1].1
+        }
     }
 }
 

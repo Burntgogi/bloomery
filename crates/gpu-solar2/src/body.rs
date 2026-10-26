@@ -54,7 +54,7 @@ use bloomery_gpu::linear::mixer_kda::{KdaDecay, KdaDims, KdaRule};
 use bloomery_gpu::linear::{CONV_TAPS, HEAD, KHeadMap, LinearShape};
 use bloomery_gpu::model::{
     ChainBody, HostServed, MAX_PASS_ROWS, Rollback, StepMode, agreed, hosted_hybrid_tiered,
-    refuse_scratch_past, stage_run,
+    refuse_reserve_past, refuse_scratch_past, stage_run,
 };
 use bloomery_gpu::site::{self, SiteTy, WideActs};
 use bloomery_gpu::weights::Weights;
@@ -382,19 +382,6 @@ pub struct Body {
     /// The KDA layers' stores on the host at chosen positions.
     ckpt: Checkpoints,
     residency: Residency,
-}
-
-/// Refused by name when the prompt batch's buffers, `made` device bytes, pass the `reserve` the
-/// plan kept for them (`place::prompt_reserve_bytes`): the plan counts those bytes by that
-/// formula alone, no sum of the body's, so the load holds them to it.
-fn refuse_prompt_past(reserve: u64, made: usize) -> Result<(), GpuError> {
-    if made as u64 > reserve {
-        return Err(shape(format!(
-            "the load's prompt batch holds {made} device bytes (the rows and wide forms, the units \
-             and kernels, the routed blocks' rows); the plan reserves {reserve} for them"
-        )));
-    }
-    Ok(())
 }
 
 /// A shape the kernels have no geometry for, by name.
@@ -777,6 +764,7 @@ impl Body {
             },
             cols: T_MAX,
             card_dontneed: host.card_dontneed,
+            bytes: bloomery_gpu::model::CardBytes::File,
         };
         let mut hybrid = hosted_hybrid_tiered(
             (gpu, file, plan),
@@ -848,9 +836,15 @@ impl Body {
              kernels, the host boundary, the slot map's copy",
         )?;
         let reserve = inputs
-            .reserve_on(plan.machine)
+            .prompt_batch_bytes(plan.machine)
             .map_err(|e| GpuError::plan(WHAT, e))?;
-        refuse_prompt_past(reserve, body.prompt_bytes())?;
+        refuse_reserve_past(
+            WHAT,
+            "prompt batch buffers",
+            reserve,
+            body.prompt_bytes() as u64,
+            "the rows and wide forms, the units and kernels, the routed blocks' rows",
+        )?;
         // Last: the machine frees each layer's spare slots, and every piece
         // above sized itself from the load's map, capacity = live.
         body.start_residency(gpu)?;

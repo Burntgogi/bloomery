@@ -215,9 +215,9 @@ fn hw_mimo2_spec() {
 /// reads — the routed experts on the card as far as its budget holds them
 /// (every routed layer's prefix) and the rest on the host. The engine default
 /// keeps a window layer on the ring and a full layer on the plane; the same
-/// plan with `Rows::Plane` keeps today's full-plane KV pins. The named
-/// refusals stay: a machine that hangs an expert tier card, and a context of
-/// no position.
+/// plan with `Rows::Plane` keeps today's full-plane KV pins. Plan (b′) (the
+/// A6000 the stage, the 3090 an expert tier) gives the tier the next ids of
+/// every routed layer, and a context of no position is refused by name.
 #[test]
 #[ignore = "needs the MiMo-V2.6-Flash-RL shards on the box (just gate-mimo2-meta)"]
 fn hw_mimo2_plan() {
@@ -255,6 +255,20 @@ fn hw_mimo2_plan() {
         "ring kv bytes at the gate context",
         inputs.kv.bytes(0..layers, ctx),
         249_200_640,
+    );
+    // PIN(2026-10-23): the prompt batch's reserve, 316,919,808 B [derived] from the file's widths at
+    // the union's 512 positions, four bytes a value (`place::prompt_reserve_bytes`): the walk's shared
+    // rows 141,197,312 (3 x 4,096 + 256 + 2 x 8 + 14,848 + 64 x 192 + 64 x 128 a position, the dense
+    // chunk 8 x 16,384, the partials' widest launch a full layer's 16 x 64 x 80 x 128 = 10,485,760 values
+    // and the (max, sum) pairs 163,840) + the host sums 8,388,608 + the card experts' batch 150,552,576
+    // + one unit 16,781,312 (the units a prompt group past one adds come out of the margin). Mutant: a
+    // term left out, or the reserve left out of `describe` (the plan below reads it 0).
+    row(
+        &mut o,
+        &mut b,
+        "prompt reserve bytes",
+        inputs.prompt_reserve,
+        316_919_808,
     );
     let mut plane = inputs.clone();
     plane.kv = inputs
@@ -343,28 +357,76 @@ fn hw_mimo2_plan() {
                 );
             }
         };
-        check(&plane, "plane", ctx * 222_720, 1_203..=1_264, 3_118..=3_179);
-        check(&inputs, "ring", 249_200_640, 1_254..=1_315, 3_169..=3_230);
+        // PIN(2026-10-23): the bounds fall 24 experts each: the reserve is 316,919,808 B = 23.705
+        // experts of 13,369,344 B [derived], taken out of the budget numerators above before the
+        // floor. Upper: plane 1,264.58 - 23.705 -> 1,240 on the 3090's bytes and 3,179.56 - 23.705 ->
+        // 3,155 on the A6000's; ring 1,315.24 - 23.705 -> 1,291 and 3,230.22 - 23.705 -> 3,206. Each
+        // lower bound is the upper less the same 61 of the allocator's granules.
+        check(&plane, "plane", ctx * 222_720, 1_179..=1_240, 3_094..=3_155);
+        check(&inputs, "ring", 249_200_640, 1_230..=1_291, 3_145..=3_206);
+    }
+    // PIN(2026-10-23): the reserve displaces 16..=27 card experts on the gate machine [derived]. An
+    // expert is three MXFP4 stacks of 4,456,448 B a layer, 2.125 granules of 2 MiB each, so a layer's
+    // next expert costs 6 granules and 9 once in eight, and 316,919,808 B is 151.1 granules: at the
+    // dearest 17 experts (151.1 / 9 = 16.8), at the cheapest 26 (151.1 / 6 = 25.2), one more for the
+    // slack either plan leaves under its stop. Mutant: the reserve left out of the plan (0 displaced).
+    {
+        let machine = workstation::plan_gate(layers);
+        let unreserved = inputs.clone().with_prompt_reserve(0);
+        let free = unreserved
+            .plan(&machine, ctx, &PlanLevers::default())
+            .unwrap_or_else(|e| panic!("plan with no reserve at ctx {ctx}: {e}"));
+        let kept = inputs
+            .plan(&machine, ctx, &PlanLevers::default())
+            .unwrap_or_else(|e| panic!("plan with the reserve at ctx {ctx}: {e}"));
+        let (n_free, n_kept): (u64, u64) = (free.n_l.iter().sum(), kept.n_l.iter().sum());
+        let _ = writeln!(
+            o,
+            "  card experts with no reserve {n_free}, with the reserve {n_kept}: {} fewer",
+            n_free.saturating_sub(n_kept)
+        );
+        row(
+            &mut o,
+            &mut b,
+            "card experts the reserve displaces",
+            (16..=27).contains(&n_free.saturating_sub(n_kept)),
+            true,
+        );
     }
     let machine = workstation::plan_gate(layers);
-    let mut tiered = workstation::plan_gate(layers);
-    let mut tier = tiered.cards[0].clone();
-    tier.layers = 0..0;
-    tier.head = false;
-    tier.token_embedding = false;
-    tiered.tiers.push(tier);
-    let err = inputs
+    // Plan (b′): the 3090's usable 25,350,373,376 B less the context, scratch and margin (1,600
+    // MiB), the tier batch's card bytes at the union's 512 columns (86,312,960) and the scalar
+    // reserve every card keeps (the prompt batch's 316,919,808 and the tier's 97,312) hold
+    // 1,740 experts of 13,369,344 B, less what the granules round off over 47 layers [derived].
+    let tiered = workstation::plan_bp(
+        layers,
+        None,
+        model::arch::mimo2::place::tier_batch(&inputs.hp, 512),
+    );
+    let bp = inputs
         .plan(&tiered, ctx, &PlanLevers::default())
-        .expect_err("a machine that hangs an expert tier card is refused by name")
-        .to_string();
-    let _ = writeln!(o, "  as the plan refuses a tier card: {err}");
-    // PIN(2026-10-10): the tier refusal is the program's own (`PlaceError::Tier`): it names the card
-    // and that the program hangs no expert tier on its card experts.
-    if !(err.contains("expert tier card 3090") && err.contains("hangs no expert tier")) {
-        b.push(format!(
-            "the tier refusal names neither the card nor the missing tier: {err}"
-        ));
-    }
+        .unwrap_or_else(|e| panic!("plan (b′) at ctx {ctx}: {e}"));
+    let on_tier: Vec<u64> = bp.tier_n_l.first().cloned().unwrap_or_default();
+    let tier_total: u64 = on_tier.iter().sum();
+    let tier_layers = on_tier.iter().filter(|&&n| n > 0).count();
+    let _ = writeln!(
+        o,
+        "  plan (b′): the tier holds {tier_total} experts on {tier_layers} layers"
+    );
+    row(
+        &mut o,
+        &mut b,
+        "plan (b′)'s tier experts",
+        (1_690..=1_740).contains(&tier_total),
+        true,
+    );
+    row(
+        &mut o,
+        &mut b,
+        "plan (b′)'s tier on every routed layer",
+        tier_layers == 47,
+        true,
+    );
     let err = inputs
         .plan(&machine, 0, &PlanLevers::default())
         .expect_err("a context of no position is refused by name")

@@ -192,6 +192,29 @@ pub fn assert_keys(obj: &Value, section: &str) {
     }
 }
 
+/// Starts a server on `engine` and the chat template `template`, its reasoning split on the
+/// model's own `tags` ([`Server::with_think_tags`]).
+pub fn start_tagged(
+    engine: Box<dyn Engine>,
+    template: &str,
+    tags: serve::reasoning::ThinkTags,
+) -> SocketAddr {
+    let config = ServerConfig {
+        model_alias: "mock".to_owned(),
+        model_path: "mock.gguf".to_owned(),
+        chat_template: template.to_owned(),
+        chat_preparation: None,
+        sampler: None,
+        fatal_linger: FATAL_LINGER,
+        slot_save_path: None,
+        api_keys: serve::flag::ApiKeys::default(),
+    };
+    let server = Server::bind("127.0.0.1:0", engine, config)
+        .unwrap_or_else(|e| panic!("bind: {e}"))
+        .with_think_tags(tags);
+    server.spawn().expect("spawn")
+}
+
 /// Starts a server of `parallel` slots on `engine`, the V4.1 template and the
 /// sampler factory `sampler`.
 pub fn start_sampling(

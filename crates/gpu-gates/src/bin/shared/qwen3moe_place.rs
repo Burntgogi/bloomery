@@ -1,9 +1,11 @@
 //! A placed load of qwen3moe (Qwen3-30B-A3B), qwen35moe
 //! (Qwen3.6-35B-A3B), or dense qwen35, as `generate_qwen3moe` and the qwen3 serve seat
-//! open one under `--place`: the placement word's stage card
-//! (`generate::Place`, an alias or a card list of one card; a tier card is
-//! refused by name, the program hangs none), the machine
-//! `model::placement::workstation::placed_with_arena` lays out on it with the scratch
+//! open one under `--place`: the placement word's cards
+//! (`generate::Place`; one expert tier is planned, and more than one is
+//! refused by name), the machine [`laid`] lays out — one card as
+//! `workstation::placed_with_arena`, a stage and one tier as
+//! `workstation::plan_tiers` with this model's tier batch and the stage held
+//! as the placed load holds it — with the scratch
 //! the body's placed load holds past the m = 1 scratch, the plan by the
 //! expert rule over the stacks `routed_rule` loads — the trunk on the card,
 //! each layer's routed id prefix as the budget holds, the rest on the host
@@ -28,24 +30,27 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use bloomery_gpu::arch::qwen3moe::ubatch::{UBATCH, UBATCH_ENV, ubatch_asked};
 use bloomery_gpu::arch::qwen3moe::{
     Body, Body35, KvQ8, Open35, OpenOpts, Qwen35moeModel, checkpoint_price35,
 };
+use bloomery_gpu::host::SERVED_TIERS;
 use bloomery_gpu::linear::{KHeadMap, LinearShape};
 use bloomery_gpu::model::{GpuModel, Slots};
-use bloomery_gpu::rope_neox::q8_plane_lens;
 use bloomery_gpu::{Gpu, Qwen3moeModel};
 use bloomery_gpu_gates::GateError;
 use bloomery_gpu_gates::beside::{self, Beside};
-use bloomery_gpu_gates::generate::{Place, PlaceWhy, choose_ctx, short_in};
+use bloomery_gpu_gates::generate::{Place, PlaceWhy, SEAT_STEPS, TierRule, choose_ctx, short_in};
 use bloomery_gpu_gates::image_plan;
+use bloomery_gpu_gates::kv_planes::layer_planes;
 use bloomery_gpu_gates::qwen_seat::{Family, decode_mma};
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::residency38::{checkpoints_pinned, reserve_checkpoints};
+use bloomery_gpu_gates::ubatch_pick::{self, Ask, Rule, Step};
 use bloomery_levers::{HostCfg, Levers};
 use gguf::Split;
+use model::arch::models::{Ffn, Mixer, ModelSpec};
 use model::arch::qwen3moe::place as q3;
-use model::arch::qwen35moe::hparams::Kind;
 use model::arch::qwen35moe::place as q35;
 use model::placement::accepts::{Program, routed_rule};
 use model::placement::ctx_ask::{Chosen, Probe};
@@ -100,9 +105,16 @@ pub const PLACED_LEVERS: [&str; 4] = [
     bloomery_levers::CARD_DONTNEED,
 ];
 
+/// The tier cards this body serves, and no break-even: no sitting has shown
+/// the tier not slower, so two cards run `a` and the plan is not asked.
+const TIER_RULE: TierRule = TierRule {
+    tiers: SERVED_TIERS,
+    break_even: None,
+    basis: "",
+};
+
 /// The placement a qwen3moe or qwen35moe binary's `--place` names, and why,
-/// on `census` (`Place::choose_untiered`: the body serves no tier card):
-/// `flag` as given when set,
+/// on `census` (`Place::choose` by [`TIER_RULE`]): `flag` as given when set,
 /// else `a`, the plan never asked. An unset load still takes
 /// [`PlaceQ3::unplaced_on`]'s pick, the same card; the caller prints
 /// [`PlaceWhy::record`].
@@ -111,7 +123,13 @@ pub const PLACED_LEVERS: [&str; 4] = [
     reason = "the CLI and the qwen3 seat choose by the rule; the e2e gates include the planner without it"
 )]
 pub fn choose(flag: Option<Place>, census: &[DeviceInfo]) -> Result<PlaceWhy, GateError> {
-    Place::choose_untiered(flag, census, "qwen3")
+    Place::choose(flag, census, TIER_RULE, |offer| {
+        Err(format!(
+            "--place unset: no sitting has shown the tier not slower, so the plan is not asked for {}",
+            offer.name()
+        )
+        .into())
+    })
 }
 
 /// The plan inputs of one of the two architectures; the qwen35moe ones,
@@ -132,6 +150,13 @@ fn plan_inputs<'a>(
     let ctx = u64::try_from(ctx)?;
     Ok(match inputs {
         Inputs::Qwen3(i) => i.plan(machine, ctx, levers)?,
+        Inputs::Qwen35(i) if attention_only(&i.spec) => {
+            return Err(
+                "a trunk of attention layers alone has only the whole load on a card: it has no \
+                 routed expert to place, so no plan"
+                    .into(),
+            );
+        }
         Inputs::Qwen35(i) => i.plan_rule(machine, ctx, levers, routed_rule(Program::Qwen35Body))?,
     })
 }
@@ -146,6 +171,13 @@ pub struct PlaceQ3 {
     /// The cache format this load counts in — the same choice `inputs.kv`
     /// carries, kept beside it for the plane list [`kv_bytes`] splits.
     kv: KvQ8,
+    /// The delta lanes this load's whole-fit verdict prices a qwen35 family
+    /// file's delta layers at ([`delta_planes`]): one on a plain load, the
+    /// load's verify lanes on a load that verifies drafted rows
+    /// (`GpuModel::open_verifying`, `GpuModel::open_mtp`) — the serve seat's,
+    /// from its draft word. A qwen3moe file has no delta layer, and the
+    /// CLI's and the gates' loads are plain.
+    lanes: usize,
     /// The sequences the load holds, whose rows every machine of it carries
     /// ([`laid`]).
     seqs: Seqs,
@@ -162,16 +194,23 @@ pub struct PlaceQ3 {
 /// context a slot is laid for ([`laid`]).
 pub use bloomery_gpu_gates::residency38::Seqs;
 
-/// A qwen35moe file's `slots` resident sequences, each taking checkpoints
+/// A Body35 file's `slots` resident sequences, each taking checkpoints
 /// priced by the body's own derivation (`checkpoint_price35`) at the ubatch
-/// `ubatch` the load is asked for, which sets their spacing: the seat's.
+/// `ubatch` the load is asked for, which sets their spacing: the seat's. A
+/// trunk with no recurrent store has no point to copy, so its sequences take
+/// none.
 #[allow(
     dead_code,
     reason = "the serve seat's qwen35moe loads take checkpoints; the CLI and the e2e gates take none"
 )]
 pub fn seqs_qwen35(file: &Split, ubatch: usize, slots: usize) -> Result<Seqs, GateError> {
-    let spec = model::arch::qwen35moe::spec::read(file)?.spec;
-    Ok(Seqs::priced(slots, checkpoint_price35(&spec, ubatch)?))
+    let spec = model::arch::spec(file)?.spec;
+    let price = checkpoint_price35(&spec, ubatch)?;
+    Ok(if price.point_bytes == 0 {
+        Seqs::none(slots)
+    } else {
+        Seqs::priced(slots, price)
+    })
 }
 
 /// The card reserve of a load's resident sequences past the live one
@@ -188,7 +227,7 @@ pub use bloomery_gpu_gates::image_plan::TABLES_RESERVE;
 fn layers_of(inputs: &Inputs) -> usize {
     match inputs {
         Inputs::Qwen3(i) => i.hp.n_layer,
-        Inputs::Qwen35(i) => i.hp.n_trunk,
+        Inputs::Qwen35(i) => i.spec.layers.len(),
     }
 }
 
@@ -204,9 +243,12 @@ fn fixed_seq_bytes(inputs: &Inputs) -> u64 {
     (0..layers_of(inputs)).map(|l| kv.layer_bytes(l, 0)).sum()
 }
 
-/// The machine a placed load of `inputs`'s file lays out on `spec`'s card
-/// over `arena` ([`workstation::placed_with_arena`]), with the rows of what `seqs` holds past the
-/// plan's one-sequence terms: on the card, a [`SLOTS_RESERVE`] of every
+/// The machine a placed load of `inputs`'s file lays out on `specs`' cards
+/// over `arena`: one card as [`workstation::placed_with_arena`], or a stage
+/// and one expert tier as [`workstation::plan_tiers`] with this model's tier
+/// batch and the stage held as the placed load holds it
+/// ([`q3::stage_placed`]). Then the rows of what `seqs` holds past the
+/// plan's one-sequence terms: on the stage card, a [`SLOTS_RESERVE`] of every
 /// resident sequence's fixed stores ([`fixed_seq_bytes`]) but the live one's
 /// — the plan's KV term at the total counts the per-position rows of every
 /// slot's share and the fixed stores once — none where they are 0; on the
@@ -217,14 +259,33 @@ fn fixed_seq_bytes(inputs: &Inputs) -> u64 {
 /// context the machine is laid for; on a media load each slot's rotation
 /// table holds as many positions.
 fn laid(
-    spec: CardSpec,
+    specs: &[CardSpec],
     inputs: &Inputs,
     arena: u64,
     seqs: Seqs,
     slot_ctx: u64,
     media: Media,
 ) -> Result<Machine, GateError> {
-    let mut machine = workstation::placed_with_arena(spec, layers_of(inputs), arena);
+    let layers = layers_of(inputs);
+    let mut machine = match specs {
+        [stage] => workstation::placed_with_arena(*stage, layers, arena),
+        [stage, tier] => {
+            let batch = match inputs {
+                Inputs::Qwen3(i) => q3::tier_batch(&i.hp),
+                Inputs::Qwen35(i) => q35::leg_tier_batch(&i.spec),
+            };
+            let mut machine = workstation::plan_tiers(layers, *stage, &[*tier], None, batch)?;
+            q3::stage_placed(&mut machine, arena);
+            machine
+        }
+        other => {
+            return Err(format!(
+                "a qwen plan runs one stage card and at most one expert tier; {} cards were named",
+                other.len()
+            )
+            .into());
+        }
+    };
     let past = u64::try_from(seqs.slots.saturating_sub(1))
         .map_or(u64::MAX, |n| n.saturating_mul(fixed_seq_bytes(inputs)));
     if past > 0 {
@@ -273,11 +334,11 @@ pub fn share(o: &Open35, ctx: usize, slots: usize) -> Open35 {
 }
 
 impl PlaceQ3 {
-    /// `place` resolved against `census`, refused by name when it names an
-    /// expert tier card.
-    fn resolve(place: Place, census: &[DeviceInfo]) -> Result<Place, GateError> {
+    /// `place` resolved against `census`. More than one expert tier card is
+    /// refused by name: `arch`'s body serves [`SERVED_TIERS`].
+    fn resolve(place: Place, census: &[DeviceInfo], arch: &str) -> Result<Place, GateError> {
         let place = place.on(census)?;
-        place.serves("qwen3moe", 0)?;
+        place.serves(arch, SERVED_TIERS)?;
         Ok(place)
     }
 
@@ -301,7 +362,7 @@ impl PlaceQ3 {
         kv: KvQ8,
         beside: Beside,
     ) -> Result<PlaceQ3, GateError> {
-        let place = PlaceQ3::resolve(place, census)?;
+        let place = PlaceQ3::resolve(place, census, "qwen3moe")?;
         let mut inputs = q3::PlanInputs::read(file)?;
         if kv == KvQ8::Q8 {
             inputs.kv = inputs.kv.in_q8();
@@ -313,7 +374,7 @@ impl PlaceQ3 {
             tables: None,
         };
         let machine = laid(
-            place.card_specs()?[0],
+            &place.card_specs()?,
             &inputs,
             arena,
             Seqs::ONE,
@@ -325,6 +386,7 @@ impl PlaceQ3 {
             arch: "qwen3moe",
             inputs,
             kv,
+            lanes: 1,
             seqs: Seqs::ONE,
             media,
             machine,
@@ -356,16 +418,37 @@ impl PlaceQ3 {
         seqs: Seqs,
         beside: Beside,
     ) -> Result<PlaceQ3, GateError> {
-        let place = PlaceQ3::resolve(place, census)?;
+        PlaceQ3::qwen35_lanes(file, place, census, o, seqs, beside, 1)
+    }
+
+    /// [`PlaceQ3::qwen35_on`] with the delta lanes (`lanes`, at least one)
+    /// its whole-fit verdict prices a delta layer at ([`delta_planes`]): the
+    /// serve seat's, which opens loads that verify drafted rows.
+    fn qwen35_lanes(
+        file: &Split,
+        place: Place,
+        census: &[DeviceInfo],
+        o: Open35,
+        seqs: Seqs,
+        beside: Beside,
+        lanes: usize,
+    ) -> Result<PlaceQ3, GateError> {
         let mut inputs = q35::PlanInputs::describe(file)?;
+        let arch = Family::of_spec(&inputs.spec).map_or(Program::Qwen35Body.name(), Family::name);
+        let place = PlaceQ3::resolve(place, census, arch)?;
         if o.kv == KvQ8::Q8 {
             inputs.kv = inputs.kv.in_q8();
         }
-        let media = Media {
-            beside,
-            tables: o.media.then_some(inputs.hp.rope_dims),
+        let tables = if o.media {
+            let head = inputs.spec.gqa().ok_or(
+                "the description holds no attention layer to rotate an image's positions by",
+            )?;
+            Some(head.rope.dims as usize)
+        } else {
+            None
         };
-        let arena = if inputs.hp.n_expert == 0 {
+        let media = Media { beside, tables };
+        let arena = if inputs.spec.routed().is_none() {
             match Qwen35moeModel::whole_load(file, o)? {
                 WholeLoad::Checked { arena, .. } => arena,
                 WholeLoad::Unchecked => 0,
@@ -375,7 +458,7 @@ impl PlaceQ3 {
         };
         let inputs = Inputs::Qwen35(Box::new(inputs));
         let machine = laid(
-            place.card_specs()?[0],
+            &place.card_specs()?,
             &inputs,
             arena,
             seqs,
@@ -384,13 +467,10 @@ impl PlaceQ3 {
         )?;
         Ok(PlaceQ3 {
             place,
-            arch: if file.architecture() == Some("qwen35") {
-                "qwen35"
-            } else {
-                "qwen35moe"
-            },
+            arch,
             inputs,
             kv: o.kv,
+            lanes,
             seqs,
             media,
             machine,
@@ -424,7 +504,7 @@ impl PlaceQ3 {
     ) -> Result<u64, GateError> {
         let card_experts = |budget: u64| -> Result<Option<u64>, GateError> {
             let levers = PlanLevers {
-                card_budget_bytes: Some(budget),
+                card_budget_bytes: Some(budget).into(),
             };
             match self.plan(ctx, &levers) {
                 Ok(plan) => Ok(Some(plan.cards.first().ok_or("a plan of no card")?.experts)),
@@ -486,7 +566,14 @@ impl PlaceQ3 {
         load: Result<WholeLoad, String>,
     ) -> Result<Whole, GateError> {
         let layers = 0..self.layers();
-        let kv = kv_bytes(&layers, &self.inputs, (self.kv, self.media), slots, ctx);
+        let kv = kv_bytes(
+            &layers,
+            &self.inputs,
+            (self.kv, self.media),
+            self.lanes,
+            slots,
+            ctx,
+        );
         whole_on(
             self.place.card_specs()?[0],
             inputs_model(&self.inputs),
@@ -512,7 +599,8 @@ impl PlaceQ3 {
 
     /// The `plan` record of `plan`: the card, the architecture, the expert
     /// rule, the routed experts on the card and the host, the fewest and
-    /// the most one layer keeps on the card, the card's free bytes when the
+    /// the most one layer keeps on the card, the expert tier card and the
+    /// experts it holds when the plan has one, the card's free bytes when the
     /// census read them, the host room the plan was made at when it had
     /// one, and its device. `why` names what made a run with `--place`
     /// unset take this placed plan.
@@ -542,6 +630,12 @@ impl PlaceQ3 {
                     plan.n_l.iter().max().copied().unwrap_or(0)
                 ),
             );
+        let r = match (self.machine.tiers.first(), plan.tier_n_l.first()) {
+            (Some(t), Some(n)) => r
+                .w("tier", &t.name)
+                .u("tier_experts", n.iter().sum::<u64>()),
+            _ => r,
+        };
         let r = match self.machine.cards.first().and_then(|c| c.free_bytes) {
             Some(free) => r.u("card_free", free),
             None => r,
@@ -565,6 +659,7 @@ impl PlaceQ3 {
         let r = r
             .csv("devices", record::plan_devices(plan.machine))
             .w("cuda_order", record::cuda_order());
+        let r = record::with_requantized(r, plan.model);
         let program = match self.inputs {
             Inputs::Qwen3(_) => Program::Qwen3moeBody,
             Inputs::Qwen35(_) => Program::Qwen35Body,
@@ -583,7 +678,8 @@ impl PlaceQ3 {
 /// slot, layer by layer, holds the planes this function lists through the
 /// card's allocation granule ([`placement::allocator_bytes`]) — the engine allocates
 /// each plane its own buffer per layer (`KvPlanes::new`, mirrored by
-/// [`gqa_planes`]) and each added slot repeats the set
+/// [`layer_planes`], and a delta layer's `RecStore`, mirrored by
+/// [`delta_planes`] at the load's `lanes`) and each added slot repeats the set
 /// ([`Slots::new_seq`]), so the verdict counts the granules those
 /// allocations round to, not the raw sum a `KvBytes` layer gives. One slot
 /// is the one-sequence load, plus that rounding. `slots` is at least one;
@@ -593,6 +689,7 @@ fn kv_bytes(
     layers: &std::ops::Range<usize>,
     inputs: &Inputs,
     (kv, media): (KvQ8, Media),
+    lanes: usize,
     slots: usize,
     ctx: u64,
 ) -> u64 {
@@ -602,26 +699,42 @@ fn kv_bytes(
         for l in layers.clone() {
             match inputs {
                 Inputs::Qwen3(i) => {
-                    gqa_planes(&mut planes, i.hp.n_head_kv, i.hp.head_dim, kv, rows);
+                    layer_planes(
+                        &mut planes,
+                        i.hp.n_head_kv,
+                        i.hp.head_dim,
+                        kv == KvQ8::Q8,
+                        rows,
+                    );
                 }
-                Inputs::Qwen35(i) => match i.hp.kinds.get(l) {
-                    Some(Kind::Attention) => {
-                        gqa_planes(&mut planes, i.hp.n_head_kv, i.hp.head_dim, kv, rows);
+                Inputs::Qwen35(i) => match i.spec.layers.get(l).map(|layer| &layer.mixer) {
+                    Some(Mixer::Gqa(g)) => {
+                        layer_planes(
+                            &mut planes,
+                            g.kv_heads as usize,
+                            g.head_dim as usize,
+                            kv == KvQ8::Q8,
+                            rows,
+                        );
                     }
-                    // The shape of the file's own delta layers, its lengths
-                    // the two buffers `RecStore::new` zeroes; the head map
-                    // enters neither length, and a qwen3.6 delta layer is
+                    // The shape of the file's own delta layers; the head map
+                    // enters none of its lengths, and a qwen3.6 delta layer is
                     // the tiled one (`delta_shape` of the gpu side's plan).
-                    Some(Kind::DeltaRule) => {
-                        let shape = LinearShape {
-                            n_k: i.hp.k_heads,
-                            n_v: i.hp.v_heads,
-                            map: KHeadMap::Tiled,
-                        };
-                        // One state lane, `Body35`'s `LANES`.
-                        planes.push(4 * shape.state_len() as u64);
-                        planes.push(4 * shape.ring_len() as u64);
+                    Some(Mixer::DeltaRule(d)) => {
+                        delta_planes(
+                            &mut planes,
+                            LinearShape {
+                                n_k: d.k_heads as usize,
+                                n_v: d.v_heads as usize,
+                                map: KHeadMap::Tiled,
+                            },
+                            lanes,
+                        );
                     }
+                    Some(other) => panic!(
+                        "kv_bytes: layer {l} mixes with {}, which the plan inputs refuse",
+                        other.what()
+                    ),
                     None => {}
                 },
             }
@@ -635,25 +748,22 @@ fn kv_bytes(
     placement::allocator_bytes(GRANULE, planes)
 }
 
-/// The GQA cache planes' bytes at `rows` positions onto `planes`, in the
-/// order the body allocates them: f16's `k` and `v`, q8_0's `kq,kd,vq,vd` —
-/// the buffers `KvPlanes::new` zeroes, their lengths and widths
-/// (`q8_plane_lens`'s u32 words and u16 scales) that owner's own.
-fn gqa_planes(planes: &mut Vec<u64>, n_kv: usize, head: usize, kv: KvQ8, rows: u64) {
-    match kv {
-        KvQ8::F16 => {
-            let bytes = n_kv as u64 * rows * head as u64 * 2;
-            planes.push(bytes);
-            planes.push(bytes);
-        }
-        KvQ8::Q8 => {
-            let rows = usize::try_from(rows).expect("a cache of usize rows");
-            let (words, scales) = q8_plane_lens(head, n_kv, rows);
-            planes.push(4 * words as u64);
-            planes.push(2 * scales as u64);
-            planes.push(4 * words as u64);
-            planes.push(2 * scales as u64);
-        }
+/// The plane bytes a delta layer of `shape` holds at `lanes` lanes onto
+/// `planes`: the two buffers `RecStore::new` zeroes — the state, a lane, and
+/// the conv ring once (`LinearShape::lens`) — and, on a load that keeps a
+/// lane a verify row, the `lanes` u32 stamps its stamped store holds
+/// (`RecStore::stamped`); the engine's layout prices the same count
+/// (`KvLayout::of_spec_lanes`, `runtime::stores`'s terms).
+///
+/// # Panics
+///
+/// On no lane, by name.
+fn delta_planes(planes: &mut Vec<u64>, shape: LinearShape, lanes: usize) {
+    assert!(lanes >= 1, "delta_planes: a state of at least one lane");
+    planes.push(4 * lanes as u64 * shape.state_len() as u64);
+    planes.push(4 * shape.ring_len() as u64);
+    if lanes > 1 {
+        planes.push(4 * lanes as u64);
     }
 }
 
@@ -698,6 +808,14 @@ impl Whole {
     /// Whether the whole load is the load.
     fn fits(&self) -> bool {
         matches!(self, Whole::Fits(_))
+    }
+
+    /// The need and what the card had, when the verdict has terms.
+    fn terms(&self) -> Option<(u64, u64)> {
+        match self {
+            Whole::Fits(n) | Whole::Short(n) => Some((n.need, n.budget)),
+            Whole::Refused(_) => None,
+        }
     }
 
     /// The verdict at `ctx` positions in one line: the card, the answer,
@@ -746,6 +864,57 @@ impl Whole {
         )
         .into()
     }
+}
+
+/// The rule a dense load settles its prompt ubatch by (the decide seat's backbone probe passes
+/// [`Rule::of`] the same lever): the user's size, `flag` (`-ub`, `--ubatch-size`) over `BLOOMERY_QWEN3_UBATCH`,
+/// else the card's room.
+pub fn ubatch_rule(flag: Option<usize>) -> Result<Rule, GateError> {
+    let env = ubatch_asked()?.map(|size| (size, UBATCH_ENV));
+    Ok(Rule::of(flag, env, UBATCH)?)
+}
+
+/// The refusal of a ubatch flag on a load whose ubatch no verdict settles ([`Rule`]): `what`
+/// takes its size from `BLOOMERY_QWEN3_UBATCH`, and the flag sizes the whole load of a file with no
+/// routed expert.
+fn refuse_flag(flag: Option<usize>, what: &str) -> Result<(), GateError> {
+    match flag {
+        Some(size) => Err(format!(
+            "--ubatch-size {size}: {what} takes its ubatch from BLOOMERY_QWEN3_UBATCH, and the flag \
+             sizes the whole load of a file with no routed expert"
+        )
+        .into()),
+        None => Ok(()),
+    }
+}
+
+/// A dense whole load's verdict at the ubatch `rule` settles on ([`ubatch_pick::settle`]), with what
+/// the caller kept of that size's load. `verdict(u)` takes the whole-fit verdict at the size `u`; the
+/// walk ends at the first that fits, at a refusal of the file (no size changes one) or at the last
+/// size, whose verdict is then the one the caller refuses with.
+fn settle<T>(
+    rule: Rule,
+    key: (usize, usize, usize),
+    mut verdict: impl FnMut(usize) -> Result<(Whole, T), GateError>,
+) -> Result<(usize, Whole, T), GateError> {
+    let (u, step) = ubatch_pick::settle(rule, key, |u| {
+        let (whole, kept) = verdict(u)?;
+        Ok::<_, GateError>(Step {
+            terms: whole.terms(),
+            fits: whole.fits(),
+            refused: matches!(whole, Whole::Refused(_)),
+            kept: (whole, kept),
+        })
+    })?;
+    let (whole, kept) = step.kept;
+    Ok((u, whole, kept))
+}
+
+/// Whether no layer of `spec` has a routed FFN: the file's only load is the whole one.
+fn dense_ffn(spec: &ModelSpec) -> bool {
+    spec.layers
+        .iter()
+        .all(|l| matches!(l.ffn, Ffn::Dense { .. }))
 }
 
 /// The whole-fit verdict of a load of the whole of `model` — `layers`
@@ -913,14 +1082,39 @@ pub fn unplaced_qwen35_slots(
     seqs: Seqs,
     beside: Beside,
 ) -> Result<Unplaced, GateError> {
+    unplaced_qwen35_lanes(file, census, o, seqs, beside, 1)
+}
+
+/// [`unplaced_qwen35_slots`] with the delta lanes (`lanes`, at least one)
+/// its whole-fit verdict prices a delta layer at ([`delta_planes`]): the
+/// serve seat's, which opens loads that verify drafted rows.
+fn unplaced_qwen35_lanes(
+    file: &Split,
+    census: &[DeviceInfo],
+    o: &Open35,
+    seqs: Seqs,
+    beside: Beside,
+    lanes: usize,
+) -> Result<Unplaced, GateError> {
+    if attention_only(&model::arch::spec(file)?.spec) {
+        return whole_dense(
+            (file, census),
+            (o, seqs.slots, beside),
+            lanes,
+            None,
+            Rule::Open,
+        )
+        .map(|(card, _)| Unplaced::Whole(card));
+    }
     let at = share(o, o.ctx, seqs.slots);
-    let probe = PlaceQ3::qwen35_on(
+    let probe = PlaceQ3::qwen35_lanes(
         file,
         PlaceQ3::unplaced_on(census)?,
         census,
         at,
         seqs,
         beside,
+        lanes,
     )?;
     let whole = probe.whole_at(u64::try_from(o.ctx)?, seqs.slots, qwen35_whole(file, at))?;
     probe.unplaced(o.ctx, &whole)
@@ -931,7 +1125,7 @@ pub fn unplaced_qwen35_slots(
 /// `--mmproj` the media flag (every sequence holds the rotation table an
 /// image's positions rewrite), and the reserves of what the process serves
 /// beside the model on the stage card (the encoder's, a side seat's embedding
-/// model's).
+/// model's), and the prompt ubatch the user's flag asks for (`ubatch`).
 #[allow(
     dead_code,
     reason = "the serve seat, the routed legs and the types gate read it; the CLI and the e2e gates include the planner without it"
@@ -943,6 +1137,9 @@ pub struct ServeOpts<'a> {
     pub kv: KvQ8,
     pub media: bool,
     pub beside: Beside,
+    /// `-ub` / `--ubatch-size`: the whole load of a file with no routed expert takes exactly this
+    /// size or is refused by name ([`serve_load`]); any other load refuses the flag.
+    pub ubatch: Option<usize>,
 }
 
 /// What the serve seat's file loads as, decided once before the open at the
@@ -955,7 +1152,7 @@ pub struct ServeOpts<'a> {
 pub enum ServeLoad {
     /// The whole model on this card, `a`'s: `--place` unset, and the
     /// whole-fit verdict at the total on it takes the whole load.
-    Whole(CardSpec),
+    Whole(WholeOn),
     /// The placed plan made at `total` positions on `q`'s card: `--place`'s
     /// (no `why`), or `a`'s card's when the whole load does not fit at the
     /// total (`why` names that, [`WHY_NOT_WHOLE`]). Under `--place` whose
@@ -969,6 +1166,50 @@ pub enum ServeLoad {
     },
 }
 
+/// A whole-card load decided before the open: the card, and for a file with no routed expert,
+/// whose verdict settles the ubatch ([`Rule`]), the size the open takes.
+#[allow(
+    dead_code,
+    reason = "the serve seat opens through it; the routed legs and the types gate read its card"
+)]
+#[derive(Clone, Copy)]
+pub struct WholeOn {
+    pub card: CardSpec,
+    pub ubatch: Option<usize>,
+}
+
+impl ServeLoad {
+    /// `o`, a Body35 serve open, with the ubatch this load's verdict settled when it settled one.
+    #[allow(
+        dead_code,
+        reason = "the serve seat opens through it; the routed legs and the types gate only decide"
+    )]
+    pub fn open35(&self, o: Open35) -> Open35 {
+        match self {
+            ServeLoad::Whole(WholeOn {
+                ubatch: Some(ubatch),
+                ..
+            }) => Open35 {
+                ubatch: *ubatch,
+                ..o
+            },
+            _ => o,
+        }
+    }
+
+    /// The ubatch this load's verdict settled, when it settled one.
+    #[allow(
+        dead_code,
+        reason = "the serve seat prices a sequence's checkpoints by it; the routed legs and the types gate only decide"
+    )]
+    pub fn ubatch(&self) -> Option<usize> {
+        match self {
+            ServeLoad::Whole(w) => w.ubatch,
+            ServeLoad::Placed { .. } => None,
+        }
+    }
+}
+
 /// What a Body35 file's serve load opens at with a `ctx`-row cache: the
 /// decode flash selected from its head shape, the levers' ubatch and the `kv` planes, as
 /// `generate_qwen3moe` opens it, with `media`'s rotation tables.
@@ -980,20 +1221,142 @@ pub enum ServeLoad {
     reason = "the serve seat, the routed legs and the types gate read it; the CLI and the e2e gates include the planner without it"
 )]
 pub fn serve_open35(split: &Split, ctx: usize, kv: KvQ8, media: bool) -> Result<Open35, GateError> {
-    let hp = model::arch::qwen35moe::hparams::Hparams::read(split)?;
+    let spec = model::arch::spec(split)?.spec;
+    // Every attention layer of a Body35 file shares one head shape; the body holds the file to it.
+    let (heads, kv_heads, head) = spec
+        .layers
+        .iter()
+        .find_map(|l| match &l.mixer {
+            Mixer::Gqa(g) => Some((g.heads as usize, g.kv_heads as usize, g.head_dim as usize)),
+            _ => None,
+        })
+        .ok_or("the description holds no attention layer to choose the decode flash by")?;
     Ok(Open35 {
         ctx,
-        mma: decode_mma(hp.head_dim, hp.n_head / hp.n_head_kv)?,
+        mma: decode_mma(head, heads / kv_heads)?,
         ubatch: bloomery_gpu::arch::qwen3moe::ubatch::ubatch_size()?,
         kv,
         media,
     })
 }
 
+/// Whether every layer of `spec` is a GQA layer: a trunk whose stores are K/V planes alone, with
+/// no recurrent state to checkpoint.
+fn attention_only(spec: &ModelSpec) -> bool {
+    spec.layers.iter().all(|l| matches!(l.mixer, Mixer::Gqa(_)))
+}
+
+/// The card a dense trunk (no routed expert to place on the host tier) loads whole on, with the
+/// ubatch the load opens at: `place`'s card, else `a`'s ([`PlaceQ3::unplaced_on`]), while the
+/// whole-fit verdict at `o.ctx` positions for `slots` resident sequences takes it at the size
+/// `rule` settles ([`settle`]), each size priced with the checkpoints its spacing sets (a trunk of
+/// attention layers alone has no recurrent store to copy, so its sequences take none:
+/// [`seqs_qwen35`]) and its delta layers at `lanes` lanes ([`delta_planes`]), else the verdict's
+/// refusal with its terms. The verdict's line goes to stderr, as [`PlaceQ3::unplaced`] prints it.
+///
+/// # Errors
+/// An image input on a trunk of attention layers alone (it has no rotation table for one), the
+/// verdict's refusal, or the plan's or the load's own refusal of the file.
+fn whole_dense(
+    (file, census): (&Split, &[DeviceInfo]),
+    (o, slots, beside): (&Open35, usize, Beside),
+    lanes: usize,
+    place: Option<Place>,
+    rule: Rule,
+) -> Result<(CardSpec, usize), GateError> {
+    if o.media && attention_only(&model::arch::spec(file)?.spec) {
+        return Err("a trunk of attention layers alone takes no image input".into());
+    }
+    let place = match place {
+        Some(p) => p,
+        None => PlaceQ3::unplaced_on(census)?,
+    };
+    let (ubatch, whole, probe) = settle(rule, (o.ubatch, o.ctx, slots), |u| {
+        let at = share(&Open35 { ubatch: u, ..*o }, o.ctx, slots);
+        let probe = PlaceQ3::qwen35_lanes(
+            file,
+            place,
+            census,
+            at,
+            seqs_qwen35(file, u, slots)?,
+            beside,
+            lanes,
+        )?;
+        let whole = probe.whole_at(u64::try_from(o.ctx)?, slots, qwen35_whole(file, at))?;
+        Ok((whole, probe))
+    })?;
+    match probe.unplaced(o.ctx, &whole)? {
+        Unplaced::Whole(card) => Ok((card, ubatch)),
+        Unplaced::Placed(_) => Err("a trunk with no routed expert was given a placed plan".into()),
+    }
+}
+
+/// `o`, a one-sequence Body35 open of the CLI, with the ubatch a file with no routed expert settles
+/// for its whole load ([`Rule`]): `BLOOMERY_QWEN3_UBATCH` as asked, else the largest of
+/// [`ubatch_pick::LADDER`] the card holds at `o.ctx`; `o` as it stands for any other file. `place` is
+/// `--place`'s word, `None` for the unset default.
+///
+/// # Errors
+/// The verdict's refusal, as [`whole_dense`]'s.
+#[allow(
+    dead_code,
+    reason = "the CLI opens through it; the serve seat settles in serve_load and the e2e gates name their size"
+)]
+pub fn dense_open35(file: &Split, o: Open35, place: Option<Place>) -> Result<Open35, GateError> {
+    let read = model::arch::spec(file)?;
+    let attention = attention_only(&read.spec);
+    if !dense_ffn(&read.spec) || !(attention || place.is_none()) {
+        return Ok(o);
+    }
+    let census = census()?;
+    let rule = ubatch_rule(None)?;
+    let (_, ubatch) = whole_dense((file, &census), (&o, 1, Beside::default()), 1, place, rule)?;
+    Ok(Open35 { ubatch, ..o })
+}
+
+/// The card a one-sequence load of `file` under `--place`'s `place` takes whole, when `file` is an
+/// attention-only trunk ([`whole_dense`]); `None` for a file whose placement is the plan's
+/// ([`PlaceQ3::qwen35`]).
+///
+/// # Errors
+/// As [`whole_dense`].
+#[allow(
+    dead_code,
+    reason = "the CLI's `--place` load; the serve seat and the e2e gates plan on one census"
+)]
+pub fn whole_card_attention(
+    file: &Split,
+    place: Place,
+    o: &Open35,
+) -> Result<Option<CardSpec>, GateError> {
+    let read = model::arch::spec(file)?;
+    if !attention_only(&read.spec) {
+        return Ok(None);
+    }
+    let census = census()?;
+    whole_dense(
+        (file, &census),
+        (o, 1, Beside::default()),
+        1,
+        Some(place),
+        Rule::Open,
+    )
+    .map(|(card, _)| Some(card))
+}
+
 /// The serve seat's load of `slots` resident sequences at `total` positions,
 /// decided on one census reading: under `--place`, the placed plan there;
 /// unset, the whole model while the whole-fit verdict takes it, else the
-/// placed plan ([`unplaced_qwen3_slots`], [`unplaced_qwen35_slots`]).
+/// placed plan ([`unplaced_qwen3_slots`], [`unplaced_qwen35_lanes`]). The
+/// file's family is its description's program ([`Family::of`]). The
+/// verdict prices a qwen35 family file's delta layers at `lanes` lanes
+/// (at least one): one on a plain load, the load's verify lanes on a load
+/// that verifies drafted rows — the seat's, from its draft word. A file
+/// with no routed expert has only the whole load, and its verdict settles
+/// the ubatch the open takes: the user's (`o.ubatch`, else
+/// `BLOOMERY_QWEN3_UBATCH`) or the largest of [`ubatch_pick::LADDER`] the card holds
+/// ([`Rule`]); any other load takes the levers' ubatch and refuses
+/// `o.ubatch` by name.
 ///
 /// # Errors
 /// The plan's or the verdict's refusal.
@@ -1005,15 +1368,30 @@ pub fn serve_load(
     (split, census): (&Split, &[DeviceInfo]),
     (total, slots): (usize, usize),
     o: ServeOpts<'_>,
+    lanes: usize,
 ) -> Result<ServeLoad, GateError> {
-    let unplaced = match (
-        Family::from_name(split.architecture().unwrap_or("<missing>")),
-        o.place,
-    ) {
-        (Some(Family::Qwen35moe | Family::Qwen35), Some(p)) => {
-            let at = share(&serve_open35(split, total, o.kv, o.media)?, total, slots);
-            let seqs = seqs_qwen35(split, at.ubatch, slots)?;
-            let q = PlaceQ3::qwen35_on(split, p, census, at, seqs, o.beside)?;
+    let unplaced = match (Family::of(split)?, o.place) {
+        (Family::Qwen35moe | Family::Qwen35, Some(p)) => {
+            let open = serve_open35(split, total, o.kv, o.media)?;
+            let seqs = seqs_qwen35(split, open.ubatch, slots)?;
+            let read = model::arch::spec(split)?;
+            if attention_only(&read.spec) {
+                let rule = ubatch_rule(o.ubatch)?;
+                let (card, ubatch) = whole_dense(
+                    (split, census),
+                    (&open, slots, o.beside),
+                    lanes,
+                    Some(p),
+                    rule,
+                )?;
+                return Ok(ServeLoad::Whole(WholeOn {
+                    card,
+                    ubatch: Some(ubatch),
+                }));
+            }
+            refuse_flag(o.ubatch, "a file placed by the plan")?;
+            let at = share(&open, total, slots);
+            let q = PlaceQ3::qwen35_lanes(split, p, census, at, seqs, o.beside, lanes)?;
             let plan = q.plan(total, o.levers)?;
             let whole = q.whole_card_qwen35(split, &plan, (total, slots), at)?;
             return Ok(ServeLoad::Placed {
@@ -1023,12 +1401,24 @@ pub fn serve_load(
                 whole,
             });
         }
-        (Some(Family::Qwen35moe | Family::Qwen35), None) => {
+        (Family::Qwen35moe | Family::Qwen35, None) => {
             let open = serve_open35(split, total, o.kv, o.media)?;
             let seqs = seqs_qwen35(split, open.ubatch, slots)?;
-            unplaced_qwen35_slots(split, census, &open, seqs, o.beside)?
+            let read = model::arch::spec(split)?;
+            if dense_ffn(&read.spec) {
+                let rule = ubatch_rule(o.ubatch)?;
+                let (card, ubatch) =
+                    whole_dense((split, census), (&open, slots, o.beside), lanes, None, rule)?;
+                return Ok(ServeLoad::Whole(WholeOn {
+                    card,
+                    ubatch: Some(ubatch),
+                }));
+            }
+            refuse_flag(o.ubatch, "a routed file")?;
+            unplaced_qwen35_lanes(split, census, &open, seqs, o.beside, lanes)?
         }
-        (Some(Family::Qwen3moe), Some(p)) => {
+        (Family::Qwen3moe, Some(p)) => {
+            refuse_flag(o.ubatch, "a qwen3moe file")?;
             let q = PlaceQ3::qwen3_on(split, p, census, total, o.kv, o.beside)?;
             let plan = q.plan(total, o.levers)?;
             let whole = q.whole_card_qwen3(split, &plan, (total, slots))?;
@@ -1039,19 +1429,13 @@ pub fn serve_load(
                 whole,
             });
         }
-        (Some(Family::Qwen3moe), None) => {
+        (Family::Qwen3moe, None) => {
+            refuse_flag(o.ubatch, "a qwen3moe file")?;
             unplaced_qwen3_slots(split, census, total, slots, (o.kv, o.beside))?
-        }
-        (None, _) => {
-            return Err(format!(
-                "the Qwen generative planner refuses architecture {:?}",
-                split.architecture()
-            )
-            .into());
         }
     };
     Ok(match unplaced {
-        Unplaced::Whole(card) => ServeLoad::Whole(card),
+        Unplaced::Whole(card) => ServeLoad::Whole(WholeOn { card, ubatch: None }),
         Unplaced::Placed(q) => ServeLoad::Placed {
             q,
             total,
@@ -1080,15 +1464,50 @@ pub fn serve_choice(
     (set, slots): (Option<usize>, usize),
     o: ServeOpts<'_>,
 ) -> Result<(Chosen<ServeLoad>, Reads), GateError> {
+    serve_choice_lanes(split, (set, slots), o, 1)
+}
+
+/// [`serve_choice`] with the delta lanes (`lanes`, at least one) the
+/// whole-fit verdict prices a qwen35 family file's delta layers at
+/// ([`delta_planes`]): the serve seat's, which opens loads that verify
+/// drafted rows.
+#[allow(
+    dead_code,
+    reason = "the serve seat reads it; the routed legs and the types gate read the plain count, and the CLI and the e2e gates include the planner without it"
+)]
+pub fn serve_choice_lanes(
+    split: &Split,
+    (set, slots): (Option<usize>, usize),
+    o: ServeOpts<'_>,
+    lanes: usize,
+) -> Result<(Chosen<ServeLoad>, Reads), GateError> {
     let before = census_reads();
     let census = census()?;
     let mut probes = 0;
+    let asked = if dense_ffn(&model::arch::spec(split)?.spec) {
+        ubatch_rule(o.ubatch)?.asked()
+    } else {
+        None
+    };
     let plan_at = |c: u64| -> Result<Probe<ServeLoad>, GateError> {
         probes += 1;
         let total = usize::try_from(c)?.saturating_mul(slots);
-        let load = match serve_load((split, &census), (total, slots), o) {
+        let load = match serve_load((split, &census), (total, slots), o, lanes) {
             Ok(load) => load,
-            Err(e) => return short_or(e),
+            Err(e) => {
+                // The load asked at a ladder size: it fits, or is short of the card.
+                let fits = |u: usize| {
+                    let at = ServeOpts {
+                        ubatch: Some(u),
+                        ..o
+                    };
+                    match serve_load((split, &census), (total, slots), at, lanes) {
+                        Ok(_) => Ok(true),
+                        Err(e) => short_or(e).map(|_| false),
+                    }
+                };
+                return short_or(e).and_then(|p| named_size(p, asked, (c, slots), fits));
+            }
         };
         if let ServeLoad::Placed { q, total, .. } = &load
             && let Err(e) = q.plan(*total, o.levers)
@@ -1100,6 +1519,34 @@ pub fn serve_choice(
     let chosen = choose_ctx(split, (set, slots), (None, None), plan_at)?;
     let censuses = census_reads() - before;
     Ok((chosen, Reads { censuses, probes }))
+}
+
+/// A short probe of a load whose ubatch the user named (`ask`), at the least context the ladder tries
+/// (`c` positions a slot over `slots`): no smaller context helps, so the refusal is that size's
+/// ([`ubatch_pick::asked_short`]), where the context ladder's own words ask for fewer slots or a
+/// smaller file, with the largest size of the ladder that load holds at this context and slots
+/// (`fits(u)`: whether the load asked at the size `u` fits, [`ubatch_pick::largest_fit`]). A probe
+/// above the floor stays short, for the ladder to step down on.
+#[allow(
+    dead_code,
+    reason = "the serve seat, the routed legs and the types gate read it; the CLI and the e2e gates include the planner without it"
+)]
+fn named_size(
+    probe: Probe<ServeLoad>,
+    ask: Option<Ask>,
+    (c, slots): (u64, usize),
+    fits: impl FnMut(usize) -> Result<bool, GateError>,
+) -> Result<Probe<ServeLoad>, GateError> {
+    match (probe, ask) {
+        (Probe::Short(s), Some(a)) if c <= SEAT_STEPS.floor => {
+            let largest = ubatch_pick::largest_fit(fits)?;
+            Err(
+                ubatch_pick::asked_short(a, (usize::try_from(c)?, slots), s.need, s.room, largest)
+                    .into(),
+            )
+        }
+        (probe, _) => Ok(probe),
+    }
 }
 
 /// A plan's refusal as a short memory ([`Probe::Short`]), else the refusal
@@ -1383,6 +1830,56 @@ pub(super) mod tests {
     use bloomery_gpu_gates::generate::choose_ctx_of;
     use model::placement::ModelTensor;
 
+    /// A drafted verdict's delta bytes are the engine's lane formula
+    /// ([`delta_planes`]): at Qwen3.6's shape (32 value heads of 128, 16 key
+    /// heads, a 4-tap conv) one lane is the state in place with the ring and
+    /// no stamp, and `Body35::VERIFY_LANES` lanes hold the other lanes and a
+    /// u32 stamp a lane — `runtime::stores`'s own terms, the ones
+    /// `KvLayout::of_spec_lanes` sums and the load's stamped stores hold
+    /// (`RecStore::stamped`).
+    #[allow(
+        dead_code,
+        reason = "`generate_qwen3moe`'s test calls it; every other bin that includes this file leaves it unused"
+    )]
+    pub(crate) fn a_drafted_verdict_prices_the_engines_lanes() {
+        use runtime::stores::{U32_BYTES, delta_lane_bytes, recurrent_bytes};
+        const V: usize = 32;
+        const K: usize = 16;
+        const D: usize = 128;
+        const CONV: usize = 4;
+        let shape = LinearShape {
+            n_k: K,
+            n_v: V,
+            map: KHeadMap::Tiled,
+        };
+        let sum = |lanes: usize| {
+            let mut planes = Vec::new();
+            delta_planes(&mut planes, shape, lanes);
+            planes.iter().sum::<u64>()
+        };
+        // The engine's bytes at the same count: `gdn_bytes`'s own terms, the
+        // ones `KvLayout::of_spec_lanes` puts in a delta layer's `recurrent`.
+        let engine = |lanes: usize| {
+            recurrent_bytes(V, K, D, CONV)
+                + if lanes > 1 {
+                    delta_lane_bytes(V, D, lanes)
+                } else {
+                    0
+                }
+        };
+        let lanes = Body35::VERIFY_LANES;
+        assert_eq!(sum(1), engine(1), "one lane: the state in place, no stamp");
+        assert_eq!(
+            sum(lanes),
+            engine(lanes),
+            "the verdict prices every lane a drafted load's store holds"
+        );
+        assert_eq!(
+            sum(lanes) - sum(1),
+            (lanes as u64 - 1) * 4 * V as u64 * D as u64 * D as u64 + U32_BYTES * lanes as u64
+        );
+    }
+
     #[allow(
         dead_code,
         reason = "`generate_qwen3moe`'s test calls it; every other bin that includes this file leaves it unused"
@@ -1426,7 +1923,10 @@ pub(super) mod tests {
                 probes.push(ctx);
                 let need = placement::whole_need(&model, &card, ctx * 1024, load)?;
                 if need.fits() {
-                    return Ok(Probe::Holds(ServeLoad::Whole(workstation::A6000)));
+                    return Ok(Probe::Holds(ServeLoad::Whole(WholeOn {
+                        card: workstation::A6000,
+                        ubatch: None,
+                    })));
                 }
                 let error = Whole::Short(need.clone()).dense_refusal(ctx as usize);
                 let Some(PlacementError::CardBudgetFloor {
@@ -1473,5 +1973,170 @@ pub(super) mod tests {
         }
         let refused = Whole::Refused("unsupported tensor".into()).dense_refusal(TARGET as usize);
         assert!(short_or(refused).is_err());
+    }
+
+    /// A dense qwen35 header of the body's smallest shapes, written to `path` over a sparse file
+    /// of its full length: hidden 256, three gated-delta layers (16 key and 32 value heads of
+    /// 128) and a gated attention layer (16 query and 2 key heads of 256), a SwiGLU FFN of 256 in
+    /// each and no expert key; every projection Q4_K, the head Q6_K, the norms, β, α and the
+    /// conv F32.
+    fn dense_header(path: &std::path::Path) -> Split {
+        use gguf::Value as V;
+        const H: u64 = 256;
+        const FF: u64 = 256;
+        const VOCAB: u64 = 256;
+        const CHANNELS: u64 = (2 * 16 + 32) * 128;
+        const ATTN: u64 = 32 * 128;
+        let u = |k: &str, v: u32| (format!("qwen35.{k}"), V::U32(v));
+        let kvs = vec![
+            (
+                gguf::GENERAL_ARCHITECTURE.to_owned(),
+                V::String("qwen35".to_owned()),
+            ),
+            u("block_count", 4),
+            u("embedding_length", H as u32),
+            u("context_length", 4096),
+            u("feed_forward_length", FF as u32),
+            u("attention.head_count", 16),
+            u("attention.head_count_kv", 2),
+            u("attention.key_length", 256),
+            u("attention.value_length", 256),
+            (
+                "qwen35.attention.layer_norm_rms_epsilon".to_owned(),
+                V::F32(1e-6),
+            ),
+            u("rope.dimension_count", 64),
+            (
+                "qwen35.rope.dimension_sections".to_owned(),
+                V::Array([11, 11, 10, 0].map(V::I32).to_vec()),
+            ),
+            ("qwen35.rope.freq_base".to_owned(), V::F32(1e7)),
+            u("ssm.conv_kernel", 4),
+            u("ssm.state_size", 128),
+            u("ssm.group_count", 16),
+            u("ssm.time_step_rank", 32),
+            u("ssm.inner_size", ATTN as u32),
+            u("full_attention_interval", 4),
+            (
+                "tokenizer.ggml.model".to_owned(),
+                V::String("gpt2".to_owned()),
+            ),
+            (
+                "tokenizer.ggml.pre".to_owned(),
+                V::String("qwen35".to_owned()),
+            ),
+            (
+                "tokenizer.ggml.tokens".to_owned(),
+                V::Array((0..VOCAB).map(|i| V::String(i.to_string())).collect()),
+            ),
+        ];
+        let (q4, q6, f32) = (
+            gguf::GgmlType::Q4_K,
+            gguf::GgmlType::Q6_K,
+            gguf::GgmlType::F32,
+        );
+        let mut tensors = vec![
+            ("token_embd.weight".to_owned(), vec![H, VOCAB], q4),
+            ("output_norm.weight".to_owned(), vec![H], f32),
+            ("output.weight".to_owned(), vec![H, VOCAB], q6),
+        ];
+        for l in 0..4 {
+            let mixer: &[(&str, &[u64], gguf::GgmlType)] = if l < 3 {
+                &[
+                    ("attn_qkv.weight", &[H, CHANNELS], q4),
+                    ("attn_gate.weight", &[H, ATTN], q4),
+                    ("ssm_conv1d.weight", &[4, CHANNELS], f32),
+                    ("ssm_dt.bias", &[32], f32),
+                    ("ssm_a", &[32], f32),
+                    ("ssm_alpha.weight", &[H, 32], f32),
+                    ("ssm_beta.weight", &[H, 32], f32),
+                    ("ssm_norm.weight", &[128], f32),
+                    ("ssm_out.weight", &[ATTN, H], q4),
+                ]
+            } else {
+                &[
+                    ("attn_q.weight", &[H, 2 * ATTN], q4),
+                    ("attn_k.weight", &[H, 512], q4),
+                    ("attn_v.weight", &[H, 512], q4),
+                    ("attn_q_norm.weight", &[256], f32),
+                    ("attn_k_norm.weight", &[256], f32),
+                    ("attn_output.weight", &[ATTN, H], q4),
+                ]
+            };
+            let block: [(&str, &[u64], gguf::GgmlType); 5] = [
+                ("attn_norm.weight", &[H], f32),
+                ("post_attention_norm.weight", &[H], f32),
+                ("ffn_gate.weight", &[H, FF], q4),
+                ("ffn_up.weight", &[H, FF], q4),
+                ("ffn_down.weight", &[FF, H], q4),
+            ];
+            for &(stem, dims, ty) in mixer.iter().chain(&block) {
+                tensors.push((format!("blk.{l}.{stem}"), dims.to_vec(), ty));
+            }
+        }
+        let decls = tensors
+            .into_iter()
+            .map(|(name, dims, ty)| {
+                let (Some(blck), Some(tsz)) = (ty.blck_size(), ty.type_size()) else {
+                    panic!("{name}: {ty:?} has no block info");
+                };
+                let nbytes = gguf::tensor_bytes(blck, tsz, &dims).expect("small tensors");
+                gguf::write::TensorDecl {
+                    name,
+                    dims,
+                    type_id: ty.as_u32(),
+                    nbytes,
+                }
+            })
+            .collect();
+        let layout = gguf::write::Layout::new(&kvs, decls).expect("the dense layout");
+        let len = layout.file_len();
+        let mut file = std::fs::File::create(path).expect("the header file");
+        drop(gguf::write::Writer::new(&mut file, layout).expect("the header"));
+        file.set_len(len).expect("the file's length");
+        Split::open(path).expect("the dense header opens")
+    }
+
+    /// A dense qwen35 file (no router) plans through [`PlaceQ3::qwen35_on`]: its machine counts
+    /// the whole load's ubatch arena, as the load sizes it, not a placed arena, which a file with
+    /// no router refuses; and the plan answers at the load's context.
+    #[allow(
+        dead_code,
+        reason = "`generate_qwen3moe`'s test calls it; every other bin that includes this file leaves it unused"
+    )]
+    pub(crate) fn a_dense_header_plans_through_qwen35_on() {
+        let path =
+            std::env::temp_dir().join(format!("bloomery-q35-dense-{}.gguf", std::process::id()));
+        let split = dense_header(&path);
+        let o = Open35 {
+            ctx: 4096,
+            mma: false,
+            ubatch: 512,
+            kv: KvQ8::F16,
+            media: false,
+        };
+        let census = [DeviceInfo {
+            ordinal: 0,
+            name: "NVIDIA RTX A6000".to_owned(),
+            total_bytes: 50_952_536_064,
+            free_bytes: 50_000_000_000,
+            uuid: [1; 16],
+            pci_bus: "0000:41:00.0".to_owned(),
+            held_by: None,
+            integrated: false,
+        }];
+        let place = Place::parse("cuda0").expect("a card word");
+        let q = PlaceQ3::qwen35_on(&split, place, &census, o, Seqs::ONE, Beside::default())
+            .unwrap_or_else(|e| panic!("a dense file plans: {e}"));
+        let WholeLoad::Checked { arena, .. } =
+            Qwen35moeModel::whole_load(&split, o).expect("the whole load reads the file")
+        else {
+            panic!("a qwen35 whole load checks its arena");
+        };
+        assert_eq!(q.arch, "qwen35");
+        assert_eq!(workstation::counted_arena_bytes(&q.machine.cards[0]), arena);
+        q.plan(o.ctx, &PlanLevers::default())
+            .unwrap_or_else(|e| panic!("the dense plan at {}: {e}", o.ctx));
+        std::fs::remove_file(&path).expect("the header file");
     }
 }

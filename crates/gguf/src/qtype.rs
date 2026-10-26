@@ -94,7 +94,7 @@ pub const QROWS: &[QRow] = &[
     QRow { ty: T::Q4_K, name: "q4_K", blck: 256, bytes: 144, dequant: true, host_act: H::Q8_2X4,
            card: card!(KQuant        KQuant        Q4k     (Q4k, Q8Act)        Q4k    Q4k     Q4k  Q4k) },
     QRow { ty: T::Q5_K, name: "q5_K", blck: 256, bytes: 176, dequant: true, host_act: H::Q8_2X4,
-           card: card!(KQuant        -             Q5k     (Q5k, Q8Act)        Q5k    Q5k     -    Q5k) },
+           card: card!(KQuant        -             Q5k     (Q5k, Q8Act)        Q5k    Q5k     Q5k  Q5k) },
     QRow { ty: T::Q6_K, name: "q6_K", blck: 256, bytes: 210, dequant: true, host_act: H::Q8_2X4,
            card: card!(KQuant        KQuant        Q6k     (Q6k, Q8Act)        Q6k    Q6k     Q6k  Q6k) },
     // q8_K: ggml's activation form, mainline's block (llama.cpp 36a73916 ggml-common.h:371-376, ggml.c:880): float d, 256 int8
@@ -103,17 +103,19 @@ pub const QROWS: &[QRow] = &[
     // The i-quants, QK_K = 256 (ggml.c:1055-1293): block_iq2_xxs ggml-common.h:443, iq2_xs :458, iq3_xxs :492,
     // iq1_s :526, iq3_s :510, iq2_s :474, iq4_xs :608. iq4_nl is QK4_NL = 32 (ggml.c:1276), :590.
     QRow { ty: T::IQ2_XXS, name: "iq2_xxs", blck: 256, bytes: 66, dequant: true, host_act: H::Q8K,
-           card: card!(KQuant        KQuant        -       -                   Iq2xxs -       -    -) },
+           card: card!(KQuant        KQuant        Iq2xxs  (Iq2xxs, Q8Act)      Iq2xxs -       -    -) },
     QRow { ty: T::IQ2_XS, name: "iq2_xs", blck: 256, bytes: 74, dequant: true, host_act: H::Q8K,
-           card: card!(-             -             Iq2xs   (Iq2xs, Q8Act)      -      -       -    -) },
+           card: card!(KQuant        KQuant        Iq2xs   (Iq2xs, Q8Act)      Iq2xs  -       -    -) },
     QRow { ty: T::IQ3_XXS, name: "iq3_xxs", blck: 256, bytes: 98, dequant: true, host_act: H::Q8K,
            card: card!(-             -             Iq3xxs  (Iq3xxs, Q8Act)     Iq3xxs -       -    -) },
-    QRow { ty: T::IQ1_S, name: "iq1_s", blck: 256, bytes: 50, dequant: false, host_act: H::None, card: Card::NONE },
+    QRow { ty: T::IQ1_S, name: "iq1_s", blck: 256, bytes: 50, dequant: true, host_act: H::Q8K,
+           card: card!(KQuant        KQuant        Iq1s    (Iq1s, Q8Act)       Iq1s   -       -    -) },
     QRow { ty: T::IQ4_NL, name: "iq4_nl", blck: 32, bytes: 18, dequant: true, host_act: H::Q8_2X4,
            card: card!(-             -             -       (Iq4nl, Q8Blocks32) Iq4nl  -       -    -) },
     QRow { ty: T::IQ3_S, name: "iq3_s", blck: 256, bytes: 110, dequant: true, host_act: H::Q8K,
            card: card!(-             -             Iq3s    (Iq3s, Q8Act)       Iq3s   -       -    -) },
-    QRow { ty: T::IQ2_S, name: "iq2_s", blck: 256, bytes: 82, dequant: false, host_act: H::None, card: Card::NONE },
+    QRow { ty: T::IQ2_S, name: "iq2_s", blck: 256, bytes: 82, dequant: true, host_act: H::Q8K,
+           card: card!(KQuant        KQuant        Iq2s    (Iq2s, Q8Act)       Iq2s   -       -    -) },
     QRow { ty: T::IQ4_XS, name: "iq4_xs", blck: 256, bytes: 136, dequant: true, host_act: H::Q8K,
            card: card!(-             -             Iq4xs   (Iq4xs, Q8Act)      Iq4xs  -       -    -) },
     // The C scalars: ggml.c:621-649.
@@ -124,7 +126,8 @@ pub const QROWS: &[QRow] = &[
     QRow { ty: T::F64, name: "f64", blck: 1, bytes: 8, dequant: false, host_act: H::None, card: Card::NONE },
     // iq1_m: ggml-common.h:540. bf16 is one `uint16_t` (ggml.h:380, ggml.c:1485); ggml quantizes its
     // activations to bf16, a form this engine does not encode.
-    QRow { ty: T::IQ1_M, name: "iq1_m", blck: 256, bytes: 56, dequant: false, host_act: H::None, card: Card::NONE },
+    QRow { ty: T::IQ1_M, name: "iq1_m", blck: 256, bytes: 56, dequant: true, host_act: H::Q8K,
+           card: card!(KQuant        KQuant        Iq1m    (Iq1m, Q8Act)       Iq1m   -       -    -) },
     QRow { ty: T::BF16, name: "bf16", blck: 1, bytes: 2, dequant: true, host_act: H::None,
            card: card!(Bf16AsF32     Bf16AsF32     -       -                   -      Bf16    Bf16 Bf16) },
     // Mainline's alone (llama.cpp 930e2fa59): block_tq1_0 ggml-common.h:281, block_tq2_0 :288, ggml.c:912/920.
@@ -135,8 +138,9 @@ pub const QROWS: &[QRow] = &[
     QRow { ty: T::MXFP4, name: "mxfp4", blck: 32, bytes: 17, dequant: true, host_act: H::Q8_2X4,
            card: card!(-             -             Mxfp4   (Mxfp4, Q8Act)      -      -       -    -) },
     // nvfp4: mainline's (llama.cpp-mainline ggml.c:760-764, ggml-common.h:221-227), four UE4M3 sub-block scales
-    // then 32 bytes of 4-bit codes; it has a reference decode and no CPU matmul here.
-    QRow { ty: T::NVFP4, name: "nvfp4", blck: 64, bytes: 36, dequant: true, host_act: H::None,
+    // then 32 bytes of 4-bit codes. Mainline pairs it with Q8_0; qdot's dot reads the Q8_2_X4 column MXFP4's does, and
+    // leaves the tensor's `.scale` to its caller.
+    QRow { ty: T::NVFP4, name: "nvfp4", blck: 64, bytes: 36, dequant: true, host_act: H::Q8_2X4,
            card: card!(Nvfp4Planes   Nvfp4Planes   Nvfp4   (Nvfp4, Q8Blocks32) Nvfp4  Nvfp4   -    -) },
     // q1_0: mainline's (llama.cpp 36a73916 ggml-common.h:180-185, ggml.c:677), one f16 d then 16 bytes of 1-bit codes; ik's
     // q1_0_g128 is the same block at the same id (ggml-common.h:553-558). Its dot takes Q8_0 (ggml-cpu.c:228); sized only here.
@@ -163,8 +167,12 @@ pub(crate) const OWN_ROWS: &[QRow] = &[
     // code bytes in ModelOpt's order (value 2i in the low nibble of byte i, 2i + 1 in the high),
     // each value e2m1 x scale times its tensor's one f32 `<stem>.scale` (`quant::Nvfp4Rows`), so
     // `dequant_row` does not decode it. A row of any multiple of 16 values is whole groups, where
-    // GGUF's NVFP4 block needs 64.
-    QRow { ty: T::NVFP4_ROWS, name: "nvfp4_rows", blck: 16, bytes: 9, dequant: false, host_act: H::None, card: Card::NONE },
+    // GGUF's NVFP4 block needs 64. Its host dot is qdot's (`dot_row`, or `dot_nvfp4_planes_row` over a
+    // row's code and scale planes), against Q8_2_X4 as MXFP4's is, and leaves the tensor scale to the caller.
+    // A routed stack loads on the card as NVFP4 does, its nibbles moved into GGUF's order by the part source:
+    // NVFP4's routed columns. No dense site reads it.
+    QRow { ty: T::NVFP4_ROWS, name: "nvfp4_rows", blck: 16, bytes: 9, dequant: false, host_act: H::Q8_2X4,
+           card: card!(Nvfp4Planes   Nvfp4Planes   Nvfp4   (Nvfp4, Q8Blocks32) Nvfp4  -       -    -) },
     // fp8_b128: F8_E4M3 values in blocks of 128 along the row, the block's f32 scale (little-endian)
     // then its 128 value bytes (`quant::check_fp8_b128`, `dequant_fp8_b128`); a checkpoint's one scale
     // a 128 by 128 square is written into each row's block of it. No CPU matmul here.

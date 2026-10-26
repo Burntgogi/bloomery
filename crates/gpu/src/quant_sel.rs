@@ -5,7 +5,8 @@
 //! - Raw blocks ([`crate::iq_sel`]'s `RawSb`): the format's own sub-block
 //!   decode feeds the plane rule's `dp4a` chains. A type takes a `gate_up`
 //!   entry ([`gate_up_sel_body`], one stack pair and a rule as a launch
-//!   argument), a `down` entry ([`down_sel_body`], slot `s` against column
+//!   argument), a `gate_up_tab` entry (the gate·up of a format with a shared
+//!   table), a `down` entry ([`down_sel_body`], slot `s` against column
 //!   `s`) or a `down_tab` entry (the down of a format with a shared table,
 //!   slot `s` against column `s / slots_per_col`).
 //! - Walk A ([`crate::kquant::walk::SbDecode`]): the decoder feeds
@@ -48,8 +49,8 @@ use crate::GpuError;
 use crate::fault::FaultSink;
 use crate::iq::{IQ2XXS_TAB_WORDS, Iq2XxsTab};
 use crate::iq_sel::{
-    Iq2Xs, Iq2Xxs, Iq3S, Iq3Xxs, Iq4Xs, RawDownLaunch, RawGateUpLaunch, RawSb, blk32_kernels,
-    down_sel_body, gate_up_sel_body,
+    Iq1M, Iq1S, Iq2S, Iq2Xs, Iq2Xxs, Iq3S, Iq3Xxs, Iq4Xs, RawDownLaunch, RawGateUpLaunch, RawSb,
+    blk32_kernels, down_sel_body, gate_up_sel_body,
 };
 use crate::kquant::sel::{
     ARENA_PARTS, Fmt, GateUpAct, GateUpAt, SelDown, SelDownAt, down_at_dims, down_dims,
@@ -103,6 +104,9 @@ macro_rules! quant_sel_module {
                         gate_up: $gu:ident, $gup:ident,
                     )?
                     $(
+                        gate_up_tab: $gut:ident, $gutp:ident, $GTab:ident, $gtabw:ident,
+                    )?
+                    $(
                         down: $dn:ident, $dnp:ident,
                     )?
                     $(
@@ -132,18 +136,22 @@ macro_rules! quant_sel_module {
     ) => {
         $( const _: () = assert!(<$RTy as RawSb>::BB == $bb); )*
         $( const _: () = assert!(<$WTy as SbDecode>::WORDS == $ww); )*
-        // A raw line has a `gate_up` entry exactly where `kernels::gate_up` has
-        // a row for its type and a `down` entry exactly where `kernels::down`
-        // has one; a Walk A line has a `walk_gate_up` entry exactly where
-        // `kernels::gate_up` has a row.
+        // A raw line has a `gate_up` or `gate_up_tab` entry exactly where
+        // `kernels::gate_up` has a row for its type and a `down` or `down_tab`
+        // entry exactly where `kernels::down` has one; a Walk A line has a
+        // `walk_gate_up` entry exactly where `kernels::gate_up` has a row.
         $(
             const _: () = assert!(
                 kernels::gate_up(GgmlType::$rggml).is_some()
-                    == (<[&str]>::len(&[$( stringify!($gu) ),*]) == 1)
+                    == (<[&str]>::len(&[$( stringify!($gu) ),*])
+                        + <[&str]>::len(&[$( stringify!($gut) ),*])
+                        == 1)
             );
             const _: () = assert!(
                 kernels::down(GgmlType::$rggml).is_some()
-                    == (<[&str]>::len(&[$( stringify!($dn) ),*]) == 1)
+                    == (<[&str]>::len(&[$( stringify!($dn) ),*])
+                        + <[&str]>::len(&[$( stringify!($dt) ),*])
+                        == 1)
             );
         )*
         $(
@@ -233,6 +241,88 @@ macro_rules! quant_sel_module {
                             fault,
                             row,
                             &mut h,
+                            (),
+                        );
+                    }
+                )?
+
+                $(
+                    /// The gate·up `_sel` over raw blocks of a format with a
+                    /// shared table ([`gate_up_sel_body`]): the table is
+                    /// filled into shared memory ahead of any return, the
+                    /// rule is a launch argument, and `m_cols` only bounds
+                    /// the activation in the launch contract.
+                    #[allow(
+                        clippy::too_many_arguments,
+                        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+                    )]
+                    #[kernel]
+                    #[launch_bounds(256)]
+                    #[launch_contract(
+                        domain = 1,
+                        block = (256, 1, 1),
+                        requires = (
+                            4 * wg.len() >= n_experts * rows_per_expert * $bb * n_sb,
+                            4 * wu.len() >= n_experts * rows_per_expert * $bb * n_sb,
+                            slots_per_col >= 1,
+                            n_slots <= m_cols * slots_per_col,
+                            q.len() >= m_cols * 256 * n_grp,
+                            d8.len() >= m_cols * 2 * n_sb,
+                            sel.len() >= n_slots,
+                            h.len() >= n_slots * rows_per_expert
+                        )
+                    )]
+                    pub fn $gut(
+                        wg: &[u32],
+                        wu: &[u32],
+                        q: &[u32],
+                        d8: &[f32],
+                        sel: &[u32],
+                        n_experts: u32,
+                        rows_per_expert: u32,
+                        n_slots: u32,
+                        m_cols: u32,
+                        slots_per_col: u32,
+                        n_sb: u32,
+                        n_grp: u32,
+                        act: u32,
+                        limit: f32,
+                        fault: FaultSink,
+                        mut h: DisjointSlice<f32>,
+                    ) {
+                        static mut TAB: SharedArray<u32, $gtabw> = SharedArray::UNINIT;
+                        // SAFETY: TAB is this block's alone; every thread of the
+                        // 256-thread block fills it here, before any return.
+                        let tab = unsafe { $GTab::fill(SharedArray::as_raw_mut_ptr(&raw mut TAB)) };
+                        // m_cols only bounds the activation in the launch contract.
+                        let _ = m_cols;
+                        let t = thread::index_1d().get() % THREADS as usize;
+                        let row = (thread::index_1d().get() / THREADS as usize) * ROWS_PER_BLOCK + t / 32;
+                        if row >= n_slots as usize * rows_per_expert as usize {
+                            return;
+                        }
+                        // The launch contract is the body's (`bb` bytes a
+                        // super-block); the host passes n_grp = ceil(n_sb/4)
+                        // and one of Act::code's codes; the return above is
+                        // warp-uniform (a warp's lanes share `row`) and keeps
+                        // row in range.
+                        gate_up_sel_body::<$RTy>(
+                            wg,
+                            wu,
+                            q,
+                            d8,
+                            sel,
+                            n_experts,
+                            rows_per_expert,
+                            slots_per_col,
+                            n_sb,
+                            n_grp,
+                            act,
+                            limit,
+                            fault,
+                            row,
+                            &mut h,
+                            tab,
                         );
                     }
                 )?
@@ -697,7 +787,9 @@ macro_rules! quant_sel_module {
                         ty: GgmlType::$rggml,
                         name: stringify!($rggml),
                         bb: $bb,
-                        gate_up: <[&str]>::len(&[$( stringify!($gu) ),*]) == 1,
+                        gate_up: <[&str]>::len(&[$( stringify!($gu) ),*])
+                            + <[&str]>::len(&[$( stringify!($gut) ),*])
+                            == 1,
                         down_cols: <[&str]>::len(&[$( stringify!($dt) ),*]) == 1,
                     },
                 )*
@@ -720,6 +812,30 @@ macro_rules! quant_sel_module {
                         GgmlType::$rggml => {
                             let prep = self.module.$gup(cfg)?;
                             self.module.$gu(
+                                stream,
+                                &prep,
+                                a.wg,
+                                a.wu,
+                                a.q,
+                                a.d8,
+                                a.sel,
+                                a.n_experts,
+                                a.rows_per_expert,
+                                a.n_slots,
+                                a.m_cols,
+                                a.slots_per_col,
+                                a.n_sb,
+                                a.n_grp,
+                                a.act,
+                                a.limit,
+                                fault,
+                                h,
+                            )?;
+                        }
+                    )? $(
+                        GgmlType::$rggml => {
+                            let prep = self.module.$gutp(cfg)?;
+                            self.module.$gut(
                                 stream,
                                 &prep,
                                 a.wg,
@@ -992,11 +1108,24 @@ quant_sel_module! {
     hand: blk32_kernels,
     raw {
         Iq2Xxs IQ2_XXS bb 66 {
+            gate_up_tab: iq2_xxs_gate_up_sel, prepare_iq2_xxs_gate_up_sel, Iq2XxsTab, IQ2XXS_TAB_WORDS,
             down_tab: iq2_xxs_gemv_sel, prepare_iq2_xxs_gemv_sel, Iq2XxsTab, IQ2XXS_TAB_WORDS,
         }
         Iq2Xs IQ2_XS bb 74 {
             gate_up: iq2_xs_gate_up_sel, prepare_iq2_xs_gate_up_sel,
             down: iq2_xs_gemv_sel, prepare_iq2_xs_gemv_sel,
+        }
+        Iq2S IQ2_S bb 82 {
+            gate_up: iq2_s_gate_up_sel, prepare_iq2_s_gate_up_sel,
+            down: iq2_s_gemv_sel, prepare_iq2_s_gemv_sel,
+        }
+        Iq1S IQ1_S bb 50 {
+            gate_up: iq1_s_gate_up_sel, prepare_iq1_s_gate_up_sel,
+            down: iq1_s_gemv_sel, prepare_iq1_s_gemv_sel,
+        }
+        Iq1M IQ1_M bb 56 {
+            gate_up: iq1_m_gate_up_sel, prepare_iq1_m_gate_up_sel,
+            down: iq1_m_gemv_sel, prepare_iq1_m_gemv_sel,
         }
         Iq3Xxs IQ3_XXS bb 98 {
             gate_up: iq3_xxs_gate_up_sel, prepare_iq3_xxs_gate_up_sel,

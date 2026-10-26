@@ -1,0 +1,25 @@
+# Round speed039's open term: is Muse Spark Open's host leg on bp DRAM-bound or IQ2_XXS compute-bound?
+# Decomposition: /Users/hckim/.cache/bloomery/placegen/speed039-decomp.md §2, §4. The host leg is 23..28 ms of
+# a 60.7 ms step (16.47 tok/s measured at D=512). IQ2_XXS one column is 337.5 half-instructions per 66 B block
+# (5.1 instr/B, 300 of them the grid/sign pack) [derived]: at 142 GB/s that asks 724 G instr/s against the
+# 32 cores' 335..484, so compute-bound by 1.5..2.2x, unless the pack retires faster than counted. Three
+# same-binary arms at D=512 separate the two readings: compute-bound, 16 threads add 23..28 ms to the step
+# (~-28 % tok/s) and 64 (SMT) take 3..6 ms off (+5..+11 %); DRAM-bound, 16 threads add 2..5 ms (-3..-8 %)
+# and 64 move ~0. The 64-thread arm is the decision term.
+# Wall [derived]: 6 servers (3 arms x 2 rounds) x (load 57 s measured + 5 s) + requests 6 x (6 + 8) s: ~8 min.
+kind: profile
+question: on bp, does Muse Spark Open's decode move with the host's thread count as a compute-bound IQ2_XXS
+  host leg would (16 threads much slower, 64 SMT threads faster) or as a DRAM-bound one (both near 0)?
+term: decode tok/s @ n=128 after D=512 prose ids, Muse Spark Open UD-IQ2_XXS, bloomery-serve serving defaults,
+  --ctx-size 4300, RTX A6000 + RTX 3090 (bp), arm env=BLOOMERY_THREADS=64 against the unset arm, (64 - unset) / unset
+unit: %
+predict: -1..+11
+condition: one lease, BLOOMERY_MODEL=muse-spark BLOOMERY_AB_ROUNDS=2
+  BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/speed039-muse-threads.card
+  BLOOMERY_TIMING_CARDS=a6000+3090 DEPTH_SERVE_CTX=4300' just depth-serve bloomery-speed039:512
+  env=BLOOMERY_THREADS=16:bloomery-speed039:512 env=BLOOMERY_THREADS=64:bloomery-speed039:512
+decide-in: +5..+11 % at 64 with the 16-thread arm near -28 %: compute-bound; open the IQ2_XXS pack lever
+  (a grid/sign pack shared across a slot's columns) and price the 64-thread default
+decide-below: under +2 % at 64 with the 16-thread arm within -8 %: DRAM-bound; the IQ2_XXS kernel lever is worth 0,
+  Muse's next term is the card serial (dense GEMV at 520..600 GB/s) and the tier card's moving set
+decide-above: above +11 %: read the pool's pin record and the cpu-freq witness of the 64 arm before any default change

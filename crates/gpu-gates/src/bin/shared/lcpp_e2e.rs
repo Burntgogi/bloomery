@@ -16,16 +16,20 @@
 //! - `top_logprobs_in_band` (oracle): on each prompt, over the ids both our top 40 and the oracle's top 40 hold, the log-softmax
 //!   of the logits row within the error model's band of the oracle's logprob ([`sigma_lp`] an id, the worst of the ids within
 //!   [`k_of`]), and our top 10 sharing at least [`overlap_floor`] ids with the oracle's. Both are two implementations' difference
-//!   of one quantized model ([`SIGMA_LOGIT`]); the argmax is printed, not a clause.
+//!   of one quantized model ([`Gate::sigma_logit`]); the argmax is printed, not a clause.
 //! - `forced_greedy_count_pin` (oracle): the oracle's greedy tokens fed as input (teacher-forced), our argmax at each position;
 //!   the disagreements at an oracle margin of at least `MARGIN_FLOOR` are held to the pin derived from the margins themselves
-//!   ([`forced_pin`]). A set with no greedy continuation is left out.
+//!   ([`forced_pin`]). A set with no greedy continuation is left out; a family whose routing carries any rounding into a
+//!   discrete exchange defers it by name ([`Gate::greedy_deferred`]).
 //! - `forced_layers_near_<slug>` (oracle, declared only by a gate whose seat runs a layer alone, [`Gate::has_forced`]): every layer
 //!   run alone at every position on the oracle's own input, and the feed-forward half alone on the oracle's own feed-forward
 //!   input: the layer's update and the block's increment against the oracle's, the flip-free sites' error held to the ratio of
 //!   the activation quantization's gap ([`RATIO_BAND`]), the router's picks against the oracle's (a flip at a margin past the f32
 //!   sum-order band is red), and the free chain's own layers held to the band the arm's error gives over the layers before the
 //!   first flip ([`Gate::free_ceil`]).
+//! - `head_near_<slug>` (oracle, declared only by a gate whose seat runs the head alone, [`Gate::has_head`]): the head over the
+//!   oracle's own last-layer row at the last position, its logits row within [`HEAD_REL`] of the oracle's and its argmax the
+//!   oracle's or a tie inside the head's rounding.
 //! - `prefill_near_<slug>` (oracle, declared only by a gate whose seat has a prompt batch, [`Gate::has_prefill`]): the same
 //!   prompts fed by the prompt batch ([`Seat::prompt`]) from a reset, their layer outputs and logprobs held to the bands the
 //!   steps are.
@@ -40,15 +44,15 @@
 use crate::e2e::{argmax, ik_last, rel, tap, top_ids};
 use bloomery_gpu_gates::flip;
 use bloomery_gpu_gates::prompts::{
-    GreedyRow, MARGIN_FLOOR, SIGMA_LOGIT, compare_forced, k_of, log_softmax, sigma_lp,
-    std_normal_cdf,
+    GreedyRow, MARGIN_FLOOR, compare_forced, k_of, log_softmax, sigma_lp, std_normal_cdf,
 };
 use bloomery_gpu_gates::tier::{self, Tag, Tier};
 use bloomery_gpu_gates::{
-    GateError, RefError, RefManifest, bits_equal, checks_failed, ref_model_path,
+    GateError, RefError, RefManifest, bits_equal, checks_failed, model_arch, ref_model_path,
     ref_tensor_logical_in, topk_ids_logical_within, verdict,
 };
-use gguf::Split;
+use model::placement::Machine;
+use model::placement::workstation::{self, TierBatchBytes};
 use refset::arch::prompt_tables::{self as read, Greedy, Top};
 use refset::family::Family;
 use std::path::{Path, PathBuf};
@@ -142,6 +146,12 @@ pub trait Seat {
     fn route_ids(&mut self) -> Result<Vec<Vec<u32>>, GateError> {
         Ok(Vec::new())
     }
+
+    /// The head alone (the final norm and the projection) over the one row `x` (`embd` values):
+    /// its logits row. A seat whose model does not run the head alone refuses by name.
+    fn head_row(&mut self, _x: &[f32]) -> Result<Vec<f32>, GateError> {
+        Err("this seat has no head row: its model does not run the head alone".into())
+    }
 }
 
 /// The placement arm a gate runs: plan (a), the largest card the stage with the experts that fit on it and the rest on the host,
@@ -168,6 +178,24 @@ impl Arm {
             Arm::A => "a",
             Arm::Bp => "bp",
         }
+    }
+
+    /// The machine the arm plans a model of `layers` layers on: for `a` the gate plan on the gate card
+    /// (`gate_card::plan_gate`, after `gate_card::init` reads the census of the one card the runner put in view); for `bp`
+    /// plan (b′) (`workstation::plan_bp`, the tier card reserving `batch`, the tier's prompt-batch bytes), which runs with
+    /// both cards in view and so reads no gate card, as every two-card gate plans its own machine. The including gate
+    /// declares `shared/gate_card.rs` as `gate_card`.
+    ///
+    /// # Errors
+    /// `a`'s census refusal.
+    pub fn machine(self, layers: usize, batch: TierBatchBytes) -> Result<Machine, GateError> {
+        Ok(match self {
+            Arm::A => {
+                crate::gate_card::init()?;
+                crate::gate_card::plan_gate(layers)
+            }
+            Arm::Bp => workstation::plan_bp(layers, None, batch),
+        })
     }
 }
 
@@ -196,22 +224,18 @@ pub fn fnv1a(bytes: &[u8]) -> u64 {
     })
 }
 
-/// The model file the profile names, checked before anything loads: an `arch` file, and under the fixture tier a whole fixture
-/// (`tier::Tier::check_file`). `recipe` is the `just` recipe that picks the profile.
+/// The model the profile names, checked before anything loads: an `arch` file or checkpoint folder, and under the fixture tier a
+/// whole fixture (`bloomery_gpu_gates::model_arch`, the owner `ref_model_path` checks a fixture by). `recipe` is the `just` recipe
+/// that picks the profile.
 pub fn model_path(tier_now: Tier, recipe: &str, arch: &str) -> Result<PathBuf, GateError> {
     let path = ref_model_path()?;
-    let file = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
-    if file.architecture() != Some(arch) {
+    let named = model_arch(tier_now, &path)?;
+    if named.as_deref() != Some(arch) {
         return Err(format!(
-            "the model file is {:?}, want {arch} — run through `just {recipe}`, which picks the {arch} profile",
-            file.architecture()
+            "the model file is {named:?}, want {arch} — run through `just {recipe}`, which picks the {arch} profile"
         )
         .into());
     }
-    let keys = [tier::VERSION_KEY, tier::SUBSET_KEY]
-        .into_iter()
-        .filter(|k| file.value(k).is_some());
-    tier_now.check_file(&path, keys)?;
     Ok(path)
 }
 
@@ -248,11 +272,22 @@ pub struct Gate {
     /// Whether the seat runs a layer alone on the caller's rows: the `forced_layers_near_<slug>`
     /// clause is declared only then.
     pub has_forced: bool,
+    /// Whether the seat runs the head alone on the caller's row ([`Seat::head_row`]): the
+    /// `head_near_<slug>` clause is declared only then.
+    pub has_head: bool,
     /// The experts the model's router scores: the bound the oracle's picks are read at.
     pub n_expert: usize,
     /// The reason the `top_logprobs_in_band` clause is deferred, when it is: the clause is named
     /// and the reason printed, and it holds nothing. `None` for a family the band is derived for.
     pub top_deferred: Option<&'static str>,
+    /// The reason the `forced_greedy_count_pin` clause is deferred, when it is: the clause is named
+    /// and the reason printed, and it holds nothing. `None` for a family whose teacher-forced argmax
+    /// two implementations' Gaussian error bounds ([`forced_pin`]).
+    pub greedy_deferred: Option<&'static str>,
+    /// The standard deviation, in logit units, of one id's logit between two implementations of the family's quantized model: the
+    /// σ of the logprob band ([`sigma_lp`]), the overlap floor ([`overlap_floor`]) and the greedy pin ([`forced_pin`]). A family
+    /// that has not measured its own carries V4.1's (`prompts::SIGMA_LOGIT_V41`).
+    pub sigma_logit: f64,
     /// The free chain's ceiling of a layer's output distance, when the family's own band depends on
     /// the run's routing: the layers before the prefix the routing holds, at `free_ceil(prefix,
     /// layer)`, and the layers from it on are held to nothing (a flip is a discrete exchange, not
@@ -271,10 +306,11 @@ enum Clause {
     Top,
     Forced,
     Prefill,
+    Head,
 }
 
 impl Clause {
-    const ALL: [Clause; 8] = [
+    const ALL: [Clause; 9] = [
         Clause::Finite,
         Clause::Reset,
         Clause::ForcedLayers,
@@ -283,6 +319,7 @@ impl Clause {
         Clause::Top,
         Clause::Forced,
         Clause::Prefill,
+        Clause::Head,
     ];
 
     fn name(self, slug: &str) -> String {
@@ -295,6 +332,7 @@ impl Clause {
             Clause::Forced => "forced_greedy_count_pin".to_string(),
             Clause::ForcedLayers => format!("forced_layers_near_{slug}"),
             Clause::Prefill => format!("prefill_near_{slug}"),
+            Clause::Head => format!("head_near_{slug}"),
         }
     }
 
@@ -306,7 +344,8 @@ impl Clause {
             | Clause::Layers
             | Clause::Top
             | Clause::Forced
-            | Clause::Prefill => Tag::Oracle,
+            | Clause::Prefill
+            | Clause::Head => Tag::Oracle,
         }
     }
 
@@ -316,6 +355,7 @@ impl Clause {
             Clause::LayersFx => g.fixture.is_some(),
             Clause::Prefill => g.has_prefill,
             Clause::ForcedLayers => g.has_forced,
+            Clause::Head => g.has_head,
             _ => true,
         }
     }
@@ -329,6 +369,7 @@ impl Clause {
             Clause::Forced => forced_greedy(seat, case),
             Clause::ForcedLayers => forced_layers(seat, case),
             Clause::Prefill => prefill_near(seat, case),
+            Clause::Head => head_near(seat, case),
         }
     }
 }
@@ -336,9 +377,11 @@ impl Clause {
 /// Positions of the cache beyond the longest prompt and its continuation.
 const CTX_SPARE: usize = 16;
 
-/// The standard deviation of the top1-top2 margin of ours against the oracle's: two implementations ([`SIGMA_LOGIT`]; the
-/// oracle's CPU dump is the second), each σ from the exact one.
-const SIGMA_PAIR: f64 = SIGMA_LOGIT * std::f64::consts::SQRT_2;
+/// The standard deviation of the top1-top2 margin of ours against the oracle's: two implementations (`sigma_logit`, the family's
+/// [`Gate::sigma_logit`]; the oracle's CPU dump is the second), each σ from the exact one.
+fn sigma_pair(sigma_logit: f64) -> f64 {
+    sigma_logit * std::f64::consts::SQRT_2
+}
 
 /// The draws [`overlap_floor`] takes.
 const DRAWS: usize = 20_000;
@@ -346,11 +389,11 @@ const DRAWS: usize = 20_000;
 /// The top-10 overlap floor against the row `lp` (log-probabilities) over its ranked ids `top`, and the mean overlap the
 /// model expects.
 ///
-/// [derived]: two implementations' logits differ by an independent N(0, σ²) an id ([`SIGMA_LOGIT`]). The ten of `top`
+/// [derived]: two implementations' logits differ by an independent N(0, σ²) an id (`sigma_logit`, [`Gate::sigma_logit`]). The ten of `top`
 /// so moved are drawn [`DRAWS`] times (a fixed seed, so the floor is the row's alone; the ids past `top` trail its last by
 /// more), and the floor is the least overlap the draws fall below no more often than one Gaussian past three standard
 /// deviations, Φ(−3).
-fn overlap_floor(lp: &[f64], top: &[usize]) -> (f64, usize) {
+fn overlap_floor(lp: &[f64], top: &[usize], sigma_logit: f64) -> (f64, usize) {
     let ten = top.len().min(10);
     let mut state = 0x9e37_79b9_7f4a_7c15u64;
     // splitmix64, and its top 53 bits as a uniform in (0, 1).
@@ -368,7 +411,7 @@ fn overlap_floor(lp: &[f64], top: &[usize]) -> (f64, usize) {
         for (rank, &id) in top.iter().enumerate() {
             // Box-Muller: one standard normal from two uniforms.
             let g = (-2.0 * unit().ln()).sqrt() * (std::f64::consts::TAU * unit()).cos();
-            moved.push((lp[id] + SIGMA_LOGIT * g, rank));
+            moved.push((lp[id] + sigma_logit * g, rank));
         }
         moved.sort_by(|x, y| y.0.total_cmp(&x.0));
         hist[moved[..ten].iter().filter(|m| m.1 < ten).count()] += 1;
@@ -712,6 +755,68 @@ fn layer_outputs_of(label: &str, case: &Case, runs: &[Run]) -> Result<bool, Gate
     Ok(ok)
 }
 
+/// The relative distance band of the head's logits row on the oracle's own row.
+// PIN(2026-10-23): provisional, an E4M3 weight's RMS rounding (2^-4/√3, 0.036) with headroom (a BF16 head occupies MXFP8
+// planes, `placement::file_card_format`); the first run printed 1.50e-2 to 2.43e-2. FAIL-first: the head's norm without its +1.
+const HEAD_REL: f64 = 0.05;
+
+/// The head alone over the oracle's own last-layer row at the last position, against the oracle's logits row: the relative
+/// distance within [`HEAD_REL`], and our argmax the oracle's or one it ranks within twice the row's widest distance of its own
+/// (a tie inside the head's rounding).
+fn head_near(seat: &mut dyn Seat, case: &Case) -> Result<bool, GateError> {
+    let Dims { layers, embd, .. } = case.dims;
+    let label = format!("head_near_{}", case.gate.slug);
+    let mut ok = true;
+    for o in case
+        .oracles
+        .iter()
+        .filter(|o| o.layer_outputs && !o.logits.is_empty())
+    {
+        let last = tap(&o.man, &format!("l_out-{}", layers - 1))?;
+        let at = last.len().checked_sub(embd).ok_or_else(|| {
+            format!(
+                "{}: l_out-{} holds {} values, a layer output is {embd}",
+                o.name,
+                layers - 1,
+                last.len()
+            )
+        })?;
+        let ours = seat.head_row(&last[at..])?;
+        let theirs = &o.logits;
+        if ours.len() != theirs.len() {
+            return Err(format!(
+                "{}: our head gives {} logits, the oracle's row holds {}",
+                o.name,
+                ours.len(),
+                theirs.len()
+            )
+            .into());
+        }
+        let d = rel(&ours, theirs);
+        let wide = ours
+            .iter()
+            .zip(theirs)
+            .map(|(a, b)| f64::from((a - b).abs()))
+            .fold(0.0f64, f64::max);
+        let (mine, theirs_at) = (
+            usize::try_from(argmax(&ours))?,
+            usize::try_from(argmax(theirs))?,
+        );
+        let gap = f64::from(theirs[theirs_at] - theirs[mine]);
+        let pass = d <= HEAD_REL && gap <= 2.0 * wide;
+        println!(
+            "{label}: prompt {} ({} ids): rel {d:.3e} (band {HEAD_REL}), widest {wide:.4}, argmax ours {mine} the oracle's \
+             {theirs_at} (the oracle's gap {gap:.4}) {}",
+            o.name,
+            o.ids.len(),
+            verdict(pass)
+        );
+        ok &= pass;
+    }
+    seat.reset()?;
+    Ok(ok)
+}
+
 fn top_logprobs(_seat: &mut dyn Seat, case: &Case) -> Result<bool, GateError> {
     if let Some(reason) = case.gate.top_deferred {
         println!("top_logprobs_in_band: deferred by name: {reason}");
@@ -727,6 +832,7 @@ fn top_logprobs(_seat: &mut dyn Seat, case: &Case) -> Result<bool, GateError> {
 // M1, M2 and M4 share at most one top-10 id, under every floor.
 fn top_logprobs_of(label: &str, case: &Case, runs: &[Run]) -> Result<bool, GateError> {
     let slug = case.gate.slug;
+    let sigma = case.gate.sigma_logit;
     let mut ok = true;
     for (o, r) in case.oracles.iter().zip(runs) {
         // The oracle's side from its own logits row, which `open_oracle` held its top table to.
@@ -742,11 +848,11 @@ fn top_logprobs_of(label: &str, case: &Case, runs: &[Run]) -> Result<bool, GateE
         let k = k_of(shared.len());
         // A NaN distance is out of band and wins the fold.
         let (z, at) = shared.iter().fold((0.0f64, 0usize), |w, &id| {
-            let z =
-                (lp[id] - theirs[id]).abs() / sigma_lp(theirs[id].exp(), sq).max(f64::MIN_POSITIVE);
+            let z = (lp[id] - theirs[id]).abs()
+                / sigma_lp(sigma, theirs[id].exp(), sq).max(f64::MIN_POSITIVE);
             if z.is_nan() || z > w.0 { (z, id) } else { w }
         });
-        let (e, floor) = overlap_floor(&theirs, &their_top);
+        let (e, floor) = overlap_floor(&theirs, &their_top, sigma);
         let overlap = their_top
             .iter()
             .take(10)
@@ -759,7 +865,7 @@ fn top_logprobs_of(label: &str, case: &Case, runs: &[Run]) -> Result<bool, GateE
             o.name,
             o.ids.len(),
             (lp[at] - theirs[at]).abs(),
-            sigma_lp(theirs[at].exp(), sq),
+            sigma_lp(sigma, theirs[at].exp(), sq),
             shared.len(),
             o.top.len(),
             ours[0],
@@ -799,21 +905,25 @@ fn prefill_near(seat: &mut dyn Seat, case: &Case) -> Result<bool, GateError> {
 /// The disagreements the Gaussian error of two implementations predicts at the clear positions, and the pin that follows:
 /// the expected count plus three standard deviations of it (Poisson), rounded up.
 ///
-/// [derived]: at an oracle margin `m` the argmax flips with probability Φ(−m/σ_pair) ([`SIGMA_PAIR`]); the sum over the
-/// positions at `m >= MARGIN_FLOOR` is the expected count of disagreements the floor classifies as clear.
-// PIN(2026-10-20): provisional with `SIGMA_LOGIT`; the pin is computed from the set's margins, not a literal.
-fn forced_pin(rows: &[GreedyRow]) -> (f64, usize) {
+/// [derived]: at an oracle margin `m` the argmax flips with probability Φ(−m/σ_pair) ([`sigma_pair`] of `sigma_logit`); the sum
+/// over the positions at `m >= MARGIN_FLOOR` is the expected count of disagreements the floor classifies as clear.
+// PIN(2026-10-20): provisional with the family's `sigma_logit`; the pin is computed from the set's margins, not a literal.
+fn forced_pin(rows: &[GreedyRow], sigma_logit: f64) -> (f64, usize) {
     let expected: f64 = rows
         .iter()
         .flat_map(|r| &r.gen_margins)
         .filter(|&&m| m >= MARGIN_FLOOR)
-        .map(|&m| std_normal_cdf(-f64::from(m) / SIGMA_PAIR))
+        .map(|&m| std_normal_cdf(-f64::from(m) / sigma_pair(sigma_logit)))
         .sum();
     let pin = (expected + 3.0 * expected.sqrt()).ceil();
     (expected, pin as usize)
 }
 
 fn forced_greedy(seat: &mut dyn Seat, case: &Case) -> Result<bool, GateError> {
+    if let Some(reason) = case.gate.greedy_deferred {
+        println!("forced_greedy_count_pin: deferred by name: {reason}");
+        return Ok(true);
+    }
     let slug = case.gate.slug;
     let (mut rows, mut ours) = (Vec::new(), Vec::new());
     for o in case.oracles.iter().filter(|o| !o.greedy.ids.is_empty()) {
@@ -835,7 +945,7 @@ fn forced_greedy(seat: &mut dyn Seat, case: &Case) -> Result<bool, GateError> {
         });
     }
     let report = compare_forced(&ours, &rows, MARGIN_FLOOR);
-    let (expected, pin) = forced_pin(&rows);
+    let (expected, pin) = forced_pin(&rows, case.gate.sigma_logit);
     let pass = report.disagree_ge_floor <= pin;
     println!(
         "forced_greedy: positions={} disagree={} buckets={:?} ge_floor={} expected {expected:.2}, pin {pin}, max margin {:?} {}",

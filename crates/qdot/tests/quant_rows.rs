@@ -82,7 +82,9 @@ const CHAIN_EXTRA: usize = 8;
 /// another order (or contracts a step the other does not) and is held to the band.
 // PIN(2026-10-19): the first run of this gate (`bit_equal` equals `pairs` for exactly these three); a type here that stops
 // being bit-equal is red, and a type that becomes bit-equal is listed by the change that made it so.
-const BIT_EQUAL: &[&str] = &["q2_K", "iq2_xxs", "iq4_xs"];
+// PIN(2026-10-24): iq2_xxs leaves the list: its dot takes the signs on the weight side and the column offset out of
+// the lanes (ik's IQ_N form, the host tile's), another sum order than mainline's; the type stays held to the band.
+const BIT_EQUAL: &[&str] = &["q2_K", "iq4_xs"];
 
 fn set() -> &'static QuantSet {
     static SET: OnceLock<QuantSet> = OnceLock::new();

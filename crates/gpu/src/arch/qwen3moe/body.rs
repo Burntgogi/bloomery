@@ -3,12 +3,12 @@
 //! and the K/V planes allocated once, and the per-step parameters refreshed
 //! before every enqueue or replay (docs/arch-split.md).
 
-use super::dispatch::{self, PassCtx};
+use super::dispatch::{self, Ctx, PassCtx};
 use super::experts::ExpertKernels;
 use super::head_argmax::{HeadArgmaxKernels, HeadArgmaxState};
 use super::placed::{
-    CommonForms, PLACED_ROWS, Placed, PlacedOpen, StepWalk, WalkParts, common_forms, counted_arena,
-    placed_bytes, placed_scratch,
+    ColsMix, ColsWalk, CommonForms, PLACED_ROWS, Placed, PlacedOpen, StepWalk, WalkParts,
+    common_forms, counted_arena, placed_bytes, placed_scratch, slot_chain,
 };
 use super::plan::{
     FfnPlan, FfnRoute, Flash, GqaKind, GqaPlan, LayerPlan, MixerPlan, SiteTy, down_entry,
@@ -18,10 +18,13 @@ use super::prefill::Prefill;
 use super::program::Tail;
 use super::proj::ProjKernels;
 use super::router::{RouterDims, RouterKernels, gated};
-use super::scratch::{Arena, Dims, Forms, KvPlanes, RopeRows, StepParams, f32_view};
+use super::scratch::{
+    Append128, Arena, Dims, FlashPass, Forms, KvPlanes, RopeRows, StepParams, f32_view,
+};
 use super::slot_pass::{SlotIn, SlotPass};
 use super::ubatch::{Q32, Ubatch, ubatch_size};
-use crate::flash_gqa::{FlashGqaKernels, GROUP, HEAD};
+use super::wide::GEMV_COLS;
+use crate::flash_gqa::{FlashGqaKernels, GROUP, HEAD, RowTable, partials_ms_len, partials_v_len};
 use crate::flash_gqa_prefill::FlashGqaPrefill;
 use crate::gated_quant::GatedQuantKernels;
 use crate::gemm::{Gemm32Kernels, GemmKernels};
@@ -29,6 +32,7 @@ use crate::head::Head;
 use crate::host::StepLeg;
 use crate::host::swap_source::ResidencyGlue;
 use crate::linear::LinearKernels;
+use crate::model::lookup::f32_gain;
 use crate::model::{
     ChainBody, GpuModel, Instrumented, Rollback, RowHeads, SlotRange, SlotRows, Slots, block_count,
     refuse_stage_rows_past,
@@ -36,9 +40,10 @@ use crate::model::{
 use crate::q6k_sel::Q6kSelKernels;
 use crate::q38::Q38Kernels;
 use crate::rope_neox::RopeNeoxKernels;
+use crate::rope_norm::RopeNormKernels;
 use crate::rope_table::{RopeSpec, RopeTable};
 use crate::site::{self, KGemvKernels};
-use crate::tensor::WindowMut;
+use crate::tensor::{Window, WindowMut};
 use crate::weights::{DevWeight, Weights};
 use crate::{Gpu, GpuError, Graph};
 use bloomery_levers::HostCfg;
@@ -68,7 +73,8 @@ pub(super) const ATTN_SCALE_256: f32 = 0.0625;
 const _: () = assert!(crate::flash_gqa::HEAD_256 == 256);
 
 /// The kernels only Qwen3.6's layers launch: the delta rule's three, the
-/// gated router and the gated output projection's quantizer; and what a
+/// gated router and the gated output projection's quantizer, the NORM rope
+/// append of a head-128 layer with no head norm; and what a
 /// site that is not one of the fused Q4_K groups launches — the 32-value
 /// GEMM family with its quantizers and the F32 tile, the K-quant gemv beyond
 /// the `Gpu`'s own (Q5_K), the Q8_0 embedding and the f32 out gate (a Q8_0
@@ -81,6 +87,8 @@ pub(super) struct Q35Kernels {
     pub(super) gated: GatedQuantKernels,
     pub(super) g32: Gemm32Kernels,
     pub(super) q38: Q38Kernels,
+    /// The NORM turn and cache append of a head-128 layer with no head norm.
+    pub(super) norm: RopeNormKernels,
     /// A K-quant site's gemv beyond the `Gpu`'s own (the Q5_K one).
     pub(super) kgemv: KGemvKernels,
     /// The FFN's K-quant `_sel` family and its combine with a host sum.
@@ -128,6 +136,7 @@ impl Kernels {
                     gated: GatedQuantKernels::load(ctx)?,
                     g32: Gemm32Kernels::load(ctx)?,
                     q38: Q38Kernels::load(ctx)?,
+                    norm: RopeNormKernels::load(ctx)?,
                     kgemv: KGemvKernels::load(gpu)?,
                     ffn: dispatch::FfnKernels::load(gpu)?,
                 })
@@ -770,6 +779,7 @@ impl GpuModel<Body> {
                     set,
                     glue: ResidencyGlue::off(),
                     arch: "qwen3moe",
+                    family: &super::tier_leg::QWEN3_FAMILY,
                     rows: PLACED_ROWS,
                 };
                 Body::load(
@@ -1058,14 +1068,13 @@ impl SlotRows for Body {
     /// ([`RowHeads::One`]).
     const HEADS: RowHeads = RowHeads::One;
 
-    /// Never read: a whole-card load serves no host work, and a placed load
-    /// refuses the pass in [`SlotRows::plan_slots`].
-    fn chain_of(_rows: &[SlotRange]) -> crate::hybrid::Chain {
-        crate::hybrid::Chain::Step
+    /// The chain the placed replay serves ([`slot_chain`]). A whole-card
+    /// load has no host service of the pass.
+    fn chain_of(rows: &[SlotRange]) -> crate::hybrid::Chain {
+        slot_chain(rows)
     }
 
-    /// Each busy slot's input record, in one copy ([`SlotIn`]). A placed
-    /// load is refused by name.
+    /// Each busy slot's input record, in one copy ([`SlotIn`]).
     fn plan_slots(
         &mut self,
         stream: &CudaStream,
@@ -1073,13 +1082,13 @@ impl SlotRows for Body {
         rows: &[SlotRange],
         ids: &[u32],
     ) -> Result<(), GpuError> {
-        self.whole_card("qwen3moe::Body::plan_slots")?;
         self.slot_in.write(stream, rows, ids)
     }
 
-    /// The pass on the prompt arena ([`SlotPass`]): the live planes are slot
-    /// 0's, each parked sequence's its own. A placed load is refused by
-    /// name.
+    /// The pass on the prompt arena. A whole-card load is [`SlotPass`]. A
+    /// placed load is the same attention, then the placed FFN over the
+    /// rows ([`enqueue_placed_slots`]). The live planes are slot 0's, each
+    /// parked sequence's its own.
     fn enqueue_slots(
         &mut self,
         gpu: &Gpu,
@@ -1088,7 +1097,9 @@ impl SlotRows for Body {
         parked: &mut [&mut Seq],
         rows: &[SlotRange],
     ) -> Result<(), GpuError> {
-        self.whole_card("qwen3moe::Body::enqueue_slots")?;
+        if self.placed.is_some() {
+            return enqueue_placed_slots(gpu, w, self, heads, parked, rows);
+        }
         let Body {
             hp,
             plans,
@@ -1123,22 +1134,6 @@ impl SlotRows for Body {
             state: head_state,
         }
         .enqueue()
-    }
-}
-
-impl Body {
-    /// Refused by name on a placed load: its prompt runs through the host
-    /// tier's batch port and its step through the placed chain, one
-    /// sequence each, and neither runs a pass of several slots.
-    fn whole_card(&self, what: &'static str) -> Result<(), GpuError> {
-        if self.placed.is_some() {
-            return Err(GpuError::shape(
-                what,
-                "a pass of several slots on a placed load: its host tier's batch port and its \
-                 placed chain run one sequence",
-            ));
-        }
-        Ok(())
     }
 }
 
@@ -1200,6 +1195,304 @@ fn enqueue_placed_chain(
         },
     }
     .walk(&mut leg)
+}
+
+/// What a placed pass of several slots' refusals name.
+const WHAT_PASS: &str = "qwen3moe placed slots";
+
+/// The K/V planes a placed pass's sequence-bound launches read and write:
+/// one busy slot's, or every busy slot's through the per-row table.
+enum PassPlanes<'k, 't> {
+    Slot(&'k mut KvPlanes),
+    Rows(&'k RowTable<'t>),
+}
+
+/// Layer `layer`'s attention of a placed pass: the whole-card pass's
+/// launches ([`SlotPass`]), over the live planes and the parked sequences'
+/// planes, then the placed FFN ([`ColsWalk`]).
+struct Mix30<'a, 'p> {
+    live: &'a mut [KvPlanes],
+    parked: &'a mut [&'p mut [KvPlanes]],
+    rows: &'a [SlotRange],
+    per_row: bool,
+    total: usize,
+}
+
+impl ColsMix for Mix30<'_, '_> {
+    fn mix_layer(&mut self, layer: usize, c: &PassCtx<'_>, s: &mut Arena) -> Result<(), GpuError> {
+        let p = c
+            .plans
+            .get(layer)
+            .ok_or(GpuError::state(WHAT_PASS, "a plan for every layer"))?;
+        let lc = Ctx::new(c.gpu, c.w, (p, layer), c.k, c.mma, c.eps, c.table)?;
+        let g = match &p.mixer {
+            MixerPlan::Gqa(g) if g.kind == GqaKind::Neox128 => g,
+            _ => {
+                return Err(GpuError::shape(
+                    WHAT_PASS,
+                    format!(
+                        "layer {layer} is not head-128 attention over K/V planes, the one mixer \
+                         a pass of slots binds per slot"
+                    ),
+                ));
+            }
+        };
+        dispatch::attn_in(&lc, g, s, self.total)?;
+        if self.per_row {
+            let mut table = RowTable::default();
+            for slot in pass_planes(self.live, self.parked, self.rows, layer) {
+                let (r, kv) = slot?;
+                kv.put_rows(&mut table, r.rows.clone())?;
+            }
+            pass_attention(&lc, g, PassPlanes::Rows(&table), s, &(0..self.total))?;
+        } else {
+            for slot in pass_planes(self.live, self.parked, self.rows, layer) {
+                let (r, kv) = slot?;
+                pass_attention(&lc, g, PassPlanes::Slot(kv), s, &r.rows)?;
+            }
+        }
+        let i = s.col(self.total)?;
+        c.gpu
+            .enqueue_quantize_q8_1_layer(&s.attn, &mut s.act_attn[i], layer)?;
+        dispatch::attn_out(&lc, g, s, self.total)
+    }
+}
+
+/// Enqueue a placed load's pass of `rows` on the prompt arena: each slot's
+/// embedding, then [`ColsWalk`] over the pass rows' places, into one head
+/// of every row.
+fn enqueue_placed_slots(
+    gpu: &Gpu,
+    w: &Weights,
+    b: &mut Body,
+    heads: &mut [Head],
+    parked: &mut [&mut Seq],
+    rows: &[SlotRange],
+) -> Result<(), GpuError> {
+    let [head] = heads else {
+        return Err(GpuError::shape(
+            WHAT_PASS,
+            format!(
+                "{} heads; a pass of several slots runs into one head of every row",
+                heads.len()
+            ),
+        ));
+    };
+    let Body {
+        hp,
+        plans,
+        kv,
+        rope,
+        prefill,
+        slot_in,
+        k,
+        head_state,
+        mma,
+        placed,
+        ..
+    } = b;
+    let Some(Placed {
+        hybrid, side, pass, ..
+    }) = placed
+    else {
+        return Err(GpuError::state(WHAT_PASS, "a placed side (a placed load)"));
+    };
+    let mut planes: Vec<&mut [KvPlanes]> =
+        parked.iter_mut().map(|seq| seq.kv.as_mut_slice()).collect();
+    let total = pass_check(rows, prefill.a.rows.min(GEMV_COLS), 1, planes.len())?;
+    let per_row = rows.len() > 1 && kv.first().is_some_and(|p| p.rows_serve(*mma));
+    let c = PassCtx {
+        gpu,
+        w,
+        plans,
+        k,
+        mma: *mma,
+        eps: hp.rms_eps,
+        table: &rope.table,
+    };
+    let hidden = prefill.a.dims.hidden;
+    for (j, r) in rows.iter().enumerate() {
+        let rec = slot_in.io(j, r)?;
+        let Arena { x, pos, n_keys, .. } = &mut prefill.a;
+        let mut x = pass_rows_mut(x, &r.rows, hidden)?;
+        let mut pos = pass_rows_mut(pos, &r.rows, 1)?;
+        let mut n_keys = pass_rows_mut(n_keys, &r.rows, 1)?;
+        dispatch::embed_into(c.gpu, c.w, c.k, &rec.io(), (&mut x, &mut pos, &mut n_keys))?;
+    }
+    let mut leg = StepLeg::new(gpu.stream(), hybrid);
+    ColsWalk {
+        c: &c,
+        s: &mut prefill.a,
+        m: total,
+        side,
+        rows: pass,
+        mix: Mix30 {
+            live: kv,
+            parked: &mut planes,
+            rows,
+            per_row,
+            total,
+        },
+        tail: Tail::One {
+            head,
+            state: head_state,
+        },
+    }
+    .walk(&mut leg)
+}
+
+/// The pass's rows `R`, once `rows` tile `0..R` in order with no empty
+/// range, `R` is at most `most`, and the head is one with the parked
+/// sequences as many as the ranges past slot 0; else refused by name.
+fn pass_check(
+    rows: &[SlotRange],
+    most: usize,
+    heads: usize,
+    parked: usize,
+) -> Result<usize, GpuError> {
+    let mut at = 0;
+    for r in rows {
+        if r.rows.start != at || r.rows.is_empty() {
+            return Err(GpuError::shape(
+                WHAT_PASS,
+                format!(
+                    "slot {}'s rows {:?}; the ranges tile the pass in order from row 0",
+                    r.slot, r.rows
+                ),
+            ));
+        }
+        at = r.rows.end;
+    }
+    let others = rows.iter().filter(|r| r.slot != 0).count();
+    if at == 0 || at > most || heads != 1 || parked != others {
+        return Err(GpuError::shape(
+            WHAT_PASS,
+            format!(
+                "a pass of {at} rows (1..={most}) with {heads} heads and {parked} parked \
+                 sequences for {others} slots past slot 0; the pass runs into one head of \
+                 every row"
+            ),
+        ));
+    }
+    Ok(at)
+}
+
+/// Each busy slot of `rows` with its planes of layer `l`, in pass order:
+/// slot 0's are the live ones, every other slot's the next parked
+/// sequence's; a slot whose planes are missing is refused by name.
+fn pass_planes<'a>(
+    live: &'a mut [KvPlanes],
+    parked: &'a mut [&mut [KvPlanes]],
+    rows: &'a [SlotRange],
+    l: usize,
+) -> impl Iterator<Item = Result<(&'a SlotRange, &'a mut KvPlanes), GpuError>> {
+    let mut live = Some(live);
+    let mut others = parked.iter_mut();
+    rows.iter().map(move |r| {
+        let planes = if r.slot == 0 {
+            live.take().and_then(|p| p.get_mut(l))
+        } else {
+            others.next().and_then(|p| p.get_mut(l))
+        };
+        planes.map(|kv| (r, kv)).ok_or_else(|| {
+            GpuError::shape(WHAT_PASS, format!("slot {}'s planes of layer {l}", r.slot))
+        })
+    })
+}
+
+/// Rows `r` of `parent`, `width` values a row, shared.
+fn pass_rows<'a, T>(
+    parent: &'a DeviceBuffer<T>,
+    r: &Range<usize>,
+    width: usize,
+) -> Result<Window<'a, T>, GpuError> {
+    Window::of(parent, r.start * width * size_of::<T>(), r.len() * width)
+}
+
+/// Rows `r` of `parent`, `width` values a row, to write through.
+fn pass_rows_mut<'a, T>(
+    parent: &'a mut DeviceBuffer<T>,
+    r: &Range<usize>,
+    width: usize,
+) -> Result<WindowMut<'a, T>, GpuError> {
+    WindowMut::of_mut(parent, r.start * width * size_of::<T>(), r.len() * width)
+}
+
+/// The sequence-bound attention of rows `r` of the arena over `planes`: the
+/// head norm and rope with the cache append, then the flash. One slot's
+/// launches over its row window, or the per-row launches over all the
+/// pass's rows.
+fn pass_attention(
+    c: &Ctx<'_>,
+    n: &GqaPlan,
+    mut planes: PassPlanes<'_, '_>,
+    s: &mut Arena,
+    r: &Range<usize>,
+) -> Result<(), GpuError> {
+    let d = s.dims;
+    let m = r.len();
+    let stream = c.gpu.stream();
+    let Arena {
+        q,
+        k,
+        v,
+        pos,
+        n_keys,
+        part_v,
+        part_ms,
+        attn,
+        ..
+    } = s;
+    let mut q = pass_rows_mut(q, r, d.q_rows)?;
+    let mut k = pass_rows_mut(k, r, d.kv_len())?;
+    let v = pass_rows(v, r, d.kv_len())?;
+    let pos = pass_rows(pos, r, 1)?;
+    let append = Append128 {
+        q: &mut q,
+        k: &mut k,
+        v: &v,
+        gq: f32_gain(c.w, &n.attn_q_norm)?,
+        gk: f32_gain(c.w, &n.attn_k_norm)?,
+        table: c.table,
+        pos: &pos,
+        eps: c.eps,
+        n_head: d.n_head,
+        n_kv: d.n_kv,
+        ctx: d.ctx,
+        m,
+        fault: c.sink,
+    };
+    match &mut planes {
+        // SAFETY: the sequence uploads consecutive positions for its rows; different sequences use disjoint planes.
+        PassPlanes::Slot(kv) => unsafe { kv.append_128(&c.k.neox, stream, append) }?,
+        PassPlanes::Rows(table) => {
+            // SAFETY: the sequence uploads consecutive positions for its rows; different sequences use disjoint
+            // planes.
+            unsafe { KvPlanes::append_128_rows(&c.k.neox, stream, table, append) }?
+        }
+    }
+    let n_keys = pass_rows(n_keys, r, 1)?;
+    let mut part_v = pass_rows_mut(part_v, r, partials_v_len(1, d.n_head))?;
+    let mut part_ms = pass_rows_mut(part_ms, r, partials_ms_len(1, d.n_head))?;
+    let mut y = pass_rows_mut(attn, r, d.attn_len())?;
+    let flash = FlashPass {
+        q: &q,
+        n_keys: &n_keys,
+        scale: ATTN_SCALE,
+        n_kv: d.n_kv,
+        ctx: d.ctx,
+        m,
+        part_v: &mut part_v,
+        part_ms: &mut part_ms,
+        fault: c.sink,
+        y: &mut y,
+    };
+    match planes {
+        PassPlanes::Slot(kv) => kv.flash_128(&c.k.flash, stream, flash, c.mma),
+        PassPlanes::Rows(table) => {
+            KvPlanes::flash_128_rows(&c.k.flash, stream, table, flash, c.mma)
+        }
+    }
 }
 
 impl Instrumented for Body {

@@ -192,18 +192,30 @@ pub const GLM5NEXT: &[FaultSite] = &[
     Mamba2Scan,
 ];
 
+/// [`MIMO2`]'s list, under a name no architecture owns, so a family with no
+/// program, or whose step raises the same sites in the same order, can
+/// decode a fault word without another family's word on the line.
+const SHARED_ORDER: &[FaultSite] = MIMO2;
+
 /// No program runs `nemotron_h`. The order is [`MIMO2`]'s so a fault word
 /// still decodes; it is not a step this architecture runs.
-pub const NEMOTRON_H: &[FaultSite] = MIMO2;
+pub const NEMOTRON_H: &[FaultSite] = SHARED_ORDER;
 
 /// The Gemma encoders have no step order of their own. The order is
 /// [`MIMO2`]'s so a fault word still decodes; it is not the order the
 /// `gemma-embedding2` encoder's pass raises its sites in.
-pub const GEMMA_ENCODER: &[FaultSite] = MIMO2;
+pub const GEMMA_ENCODER: &[FaultSite] = SHARED_ORDER;
 
 /// No program runs `nemotron_h_moe`. The order is [`MIMO2`]'s so a fault
 /// word still decodes; it is not a step this architecture runs.
-pub const NEMOTRON_H_MOE: &[FaultSite] = MIMO2;
+pub const NEMOTRON_H_MOE: &[FaultSite] = SHARED_ORDER;
+
+/// Muse Spark (`gpu/src/arch/musespark`): the token id checked on the
+/// host before the step; a layer's cache append (position) and its flash
+/// (visible key count); the router and the `_sel` launches' id check;
+/// the norms' scales; the head's logits last. The order is [`MIMO2`]'s
+/// (a valid decode of those raises), the same list it has always been.
+pub const MUSE_SPARK: &[FaultSite] = SHARED_ORDER;
 
 /// MiMo-V2.6-Flash (`gpu-mimo2`): the token id checked on the host before
 /// the step; a layer's cache append (position) and its flash (visible
@@ -330,6 +342,7 @@ pub fn of(arch: model::arch::Arch) -> StepOrder {
         Arch::NemotronHMoe => ("NemotronHMoe", NEMOTRON_H_MOE),
         Arch::GemmaEmbedding => ("GemmaEmbedding", GEMMA_ENCODER),
         Arch::GemmaEmbedding2 => ("GemmaEmbedding2", GEMMA_ENCODER),
+        Arch::MuseSpark => ("MuseSpark", MUSE_SPARK),
         // Reader only: neutral decoding order, not a runnable step.
         Arch::Flint => ("Flint", FaultSite::ALL),
     };
@@ -343,7 +356,7 @@ mod tests {
 
     /// Every architecture; a new one is a compile error here until it is
     /// listed (and [`of`] gives it a table).
-    fn every_arch() -> [Arch; 14] {
+    fn every_arch() -> [Arch; 15] {
         let all = [
             Arch::Deepseek2,
             Arch::Deepseek41,
@@ -359,6 +372,7 @@ mod tests {
             Arch::GemmaEmbedding,
             Arch::GemmaEmbedding2,
             Arch::Flint,
+            Arch::MuseSpark,
         ];
         for a in all {
             match a {
@@ -375,7 +389,8 @@ mod tests {
                 | Arch::NemotronHMoe
                 | Arch::GemmaEmbedding
                 | Arch::GemmaEmbedding2
-                | Arch::Flint => {}
+                | Arch::Flint
+                | Arch::MuseSpark => {}
             }
         }
         all

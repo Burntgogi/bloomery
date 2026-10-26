@@ -11,10 +11,12 @@
 //! 3. `ffn_latent_down` (Q8_0, `hidden → latent`, :307-309), where the file
 //!    has a latent; a file without one (Lightning) has the experts act on
 //!    the normed row itself;
-//! 4. each kept expert on the latent: the up rows of its id (IQ2_XXS,
-//!    `latent → w`, the slots' one column), the squared ReLU, the down rows
-//!    (`w → latent`), every expert by `iq2_xxs_gemv_sel` (llama-graph.cpp
-//!    :2321, :2422-2430, :2435);
+//! 4. each kept expert on the latent: the up rows of its id (`latent → w`,
+//!    the slots' one column), the squared ReLU, the down rows (`w → latent`)
+//!    (llama-graph.cpp :2321, :2422-2430, :2435): IQ2_XXS stacks (Bolt) by
+//!    `iq2_xxs_gemv_sel`, 32-value-block stacks (Lightning's IQ4_NL, Q8_0 and
+//!    Q5_1) by the card leg's relu² form ([`Relu2Leg`]), both stacks of a
+//!    layer one form ([`Form`]);
 //! 5. the slots' downs times their weights, summed in slot order
 //!    (:2451-2480);
 //! 6. `ffn_latent_up` (Q8_0, `latent → hidden`, :332-334), where the file
@@ -29,19 +31,21 @@
 
 use super::router::{RouteOut, Routers};
 use crate::arch::hybrid::{self, Acts, Cx, Names, Site, residual};
+use crate::card_leg::{LegShape, Relu2Bufs, Relu2Leg, Relu2Run, Relu2Stacks};
 use crate::kquant::SelDown;
 use crate::quant_sel::QuantSelKernels;
 use crate::site::SiteTy;
 use crate::weights::{DevWeight, Weights};
 use crate::{DeviceTensor, GpuError};
 use cuda_core::{CudaStream, DeviceBuffer};
-use gguf::GgmlType;
+use gguf::{GgmlType, Split};
 use model::arch::names::blk as layer_name;
 use model::arch::nemotron_h_moe::hparams::Hparams;
 use model::arch::nemotron_h_moe::names::{
     EXP_PROBS_B, FFN_DOWN_EXPS, FFN_DOWN_SHEXP, FFN_GATE_INP, FFN_LATENT_DOWN, FFN_LATENT_UP,
     FFN_UP_EXPS, FFN_UP_SHEXP,
 };
+use model::placement::{CardFormat, kernels};
 
 /// The latent pair's site types: Q8_0 through the f32 gemv.
 const LATENT_TYPES: &[SiteTy] = &[SiteTy::Q8_0];
@@ -57,6 +61,67 @@ pub(super) enum Shared {
     Sel { up: String, down: String },
     /// The Q8_0 sites.
     Site { up: Site, down: Site },
+}
+
+/// The form a layer's card experts run in: the routed up and down are one form.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Form {
+    /// IQ2_XXS stacks, which `iq2_xxs_gemv_sel` reads.
+    Iq2,
+    /// Stacks of a 32-value-block type ([`kernels::card_sel32_runs`]: Q5_1,
+    /// Q8_0, IQ4_NL), which the card leg's relu² form ([`Relu2Leg`]) and the
+    /// 32-value GEMM read.
+    Sel32,
+}
+
+/// The form layer `l`'s routed stacks in `file` take on the card: both
+/// IQ2_XXS, or both of a 32-value-block type. A stack absent from the file,
+/// of another type, or a pair of two forms is refused by name.
+fn form_of(file: &Split, l: usize, what: &'static str) -> Result<Form, GpuError> {
+    let ty = |stem: &str| {
+        let name = layer_name(l, stem);
+        file.find(&name)
+            .map(|(_, t)| t.ty)
+            .ok_or_else(|| GpuError::tensor(what, &name, "a routed stack of the file"))
+    };
+    let (up, down) = (ty(FFN_UP_EXPS)?, ty(FFN_DOWN_EXPS)?);
+    match (up, down) {
+        (GgmlType::IQ2_XXS, GgmlType::IQ2_XXS) => Ok(Form::Iq2),
+        (u, d) if kernels::card_sel32_runs(u) && kernels::card_sel32_runs(d) => Ok(Form::Sel32),
+        (u, d) => Err(GpuError::shape(
+            what,
+            format!(
+                "layer {l}: the routed up is {u:?} and the down {d:?}; the card runs a layer's \
+                 two stacks as IQ2_XXS or as 32-value-block types (Q5_1, Q8_0, IQ4_NL), one form"
+            ),
+        )),
+    }
+}
+
+/// The routed stacks of `hp`'s MoE layers in `file` that a whole-card load
+/// lays out other than in the file's blocks (Q8_0's planes, Q5_1's packed
+/// words), uploaded again as words: what the relu² form's `_sel`s and the
+/// 32-value GEMM read. An IQ4_NL stack has no whole-card layout, so a
+/// whole-card load of it is refused by name before this runs; a placed load
+/// takes the plan's format, the file's blocks. Load-time only.
+pub(super) fn sel32_words(
+    stream: &CudaStream,
+    file: &Split,
+    w: &mut Weights,
+    hp: &Hparams,
+) -> Result<(), GpuError> {
+    for l in (0..hp.n_trunk).filter(|&l| hp.experts[l].is_some()) {
+        for stem in [FFN_UP_EXPS, FFN_DOWN_EXPS] {
+            let name = layer_name(l, stem);
+            let Some((_, t)) = file.find(&name) else {
+                continue;
+            };
+            if kernels::card_sel32_runs(t.ty) && CardFormat::of(t.ty) != Some(CardFormat::KQuant) {
+                w.relayout(stream, file, &name, CardFormat::KQuant)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// One MoE layer's resident pieces.
@@ -78,10 +143,11 @@ pub(super) struct MoeLayer {
     /// `n_card` experts' rows, in the plan's order: slot `s` is the `s`-th
     /// expert the plan puts on the card).
     pub(super) n_card: usize,
-    /// The IQ2_XXS stacks of those experts, in the file's blocks; `None`
-    /// where `n_card` is 0, which has no tensor.
+    /// The stacks of those experts, in the file's blocks, and the form they
+    /// run in; `None` where `n_card` is 0, which has no tensor.
     up_exps: Option<String>,
     down_exps: Option<String>,
+    form: Option<Form>,
     /// The shared expert's two projections.
     pub(super) shared: Shared,
     pub(super) route: RouteOut,
@@ -101,10 +167,22 @@ pub(super) struct MoeShape {
     pub(super) scale: f32,
 }
 
-/// The kernels a MoE layer launches beyond the trunk's.
+/// The kernels a MoE layer launches beyond the trunk's: the relu² form's
+/// where a layer's card experts are 32-value stacks.
 pub(super) struct MoeKernels {
     pub(super) routers: Routers,
     pub(super) iq: QuantSelKernels,
+    pub(super) relu2: Option<Relu2Leg>,
+}
+
+impl MoeKernels {
+    /// The relu² form's modules; a load that made none is refused by name.
+    fn relu2(&self) -> Result<&Relu2Leg, GpuError> {
+        self.relu2.as_ref().ok_or(GpuError::state(
+            "nemotron_h_moe::MoeKernels",
+            "the relu² form's modules (a load whose card holds no 32-value stack makes none)",
+        ))
+    }
 }
 
 /// The buffers a MoE layer runs over, m = 1.
@@ -125,16 +203,20 @@ pub(super) struct MoeScratch {
     pub(super) sum: DeviceBuffer<f32>,
     /// The one id of a one-expert stack (the shared expert's).
     pub(super) zero_id: DeviceBuffer<u32>,
+    /// The relu² form's buffers for one token, one an expert width of the
+    /// layers whose card experts are 32-value stacks.
+    relu2: Vec<Relu2Bufs>,
 }
 
 impl MoeScratch {
     /// The scratch for `sh` over a `hidden`-value row, the widest expert
-    /// width `ff`. Load-time only.
+    /// width `ff`, and the relu² form's buffers for each width of `relu2`.
+    /// Load-time only.
     pub(super) fn new(
         stream: &CudaStream,
         sh: MoeShape,
-        hidden: usize,
-        ff: usize,
+        (hidden, ff): (usize, usize),
+        relu2: &[usize],
     ) -> Result<MoeScratch, GpuError> {
         let z = |n: usize| -> Result<DeviceBuffer<f32>, GpuError> {
             Ok(DeviceBuffer::zeroed(stream, n.max(1))?)
@@ -150,6 +232,10 @@ impl MoeScratch {
             sh: z(hidden)?,
             sum: z(hidden)?,
             zero_id: DeviceBuffer::zeroed(stream, 1)?,
+            relu2: relu2
+                .iter()
+                .map(|&ff| Relu2Bufs::new(stream, relu2_shape(sh, ff)))
+                .collect::<Result<_, _>>()?,
         })
     }
 
@@ -168,7 +254,55 @@ impl MoeScratch {
         .map(|b| b.num_bytes())
         .sum::<usize>()
             + self.zero_id.num_bytes()
+            + self.relu2.iter().map(Relu2Bufs::bytes).sum::<usize>()
     }
+
+    /// The rows a layer's card slots write ([`card_slots`]).
+    pub(super) fn slots(&mut self) -> SlotBufs<'_> {
+        SlotBufs {
+            up: &mut self.up,
+            down: &mut self.down,
+            relu2: &mut self.relu2,
+        }
+    }
+
+    /// The latent down's row, the experts' input on a file with a latent,
+    /// beside the rows the card slots write.
+    pub(super) fn lat_and_slots(&mut self) -> (&DeviceBuffer<f32>, SlotBufs<'_>) {
+        let slots = SlotBufs {
+            up: &mut self.up,
+            down: &mut self.down,
+            relu2: &mut self.relu2,
+        };
+        (&self.lat, slots)
+    }
+}
+
+/// The rows a layer's card slots write ([`card_slots`]), borrowed apart from
+/// the rest of [`MoeScratch`]: the IQ2_XXS slots' up and down rows, and the
+/// relu² form's buffers.
+pub(super) struct SlotBufs<'a> {
+    up: &'a mut DeviceBuffer<f32>,
+    down: &'a mut DeviceBuffer<f32>,
+    relu2: &'a mut [Relu2Bufs],
+}
+
+/// The one-token shape of the relu² form over experts `ff` wide: `top_k`
+/// slots of `width` values.
+fn relu2_shape(sh: MoeShape, ff: usize) -> LegShape {
+    LegShape {
+        cap: 1,
+        slots_per_col: sh.top_k,
+        n: sh.width,
+        ff,
+    }
+}
+
+fn relu2_missing(ff: usize) -> GpuError {
+    GpuError::shape(
+        "nemotron_h_moe::MoeScratch",
+        format!("no relu² buffers for experts {ff} wide"),
+    )
 }
 
 /// The resident IQ2_XXS weight `name` of `rows` rows of `k` values, in the
@@ -285,6 +419,39 @@ impl MoeLayer {
                 ));
             }
         };
+        // The card's stacks, in the form their two types take; a layer with
+        // no expert on the card holds none and reads no type.
+        let form = (n_card > 0)
+            .then(|| form_of(names.file, l, what))
+            .transpose()?;
+        let (up_exps, down_exps) = match form {
+            None => (None, None),
+            Some(Form::Iq2) => (
+                Some(iq2_xxs(
+                    w,
+                    what,
+                    &layer_name(l, FFN_UP_EXPS),
+                    (n_card * ff, width),
+                )?),
+                Some(iq2_xxs(
+                    w,
+                    what,
+                    &layer_name(l, FFN_DOWN_EXPS),
+                    (n_card * width, ff),
+                )?),
+            ),
+            Some(Form::Sel32) => {
+                let (up, down) = (layer_name(l, FFN_UP_EXPS), layer_name(l, FFN_DOWN_EXPS));
+                let shape = LegShape {
+                    cap: 1,
+                    slots_per_col: x.top_k,
+                    n: width,
+                    ff,
+                };
+                Relu2Stacks::of(w, [&up, &down])?.check(n_card, shape)?;
+                (Some(up), Some(down))
+            }
+        };
         let layer = MoeLayer {
             router,
             bias: names.vector(l, EXP_PROBS_B, n)?,
@@ -293,12 +460,9 @@ impl MoeLayer {
             latent_down,
             latent_up,
             n_card,
-            up_exps: (n_card > 0)
-                .then(|| iq2_xxs(w, what, &layer_name(l, FFN_UP_EXPS), (n_card * ff, width)))
-                .transpose()?,
-            down_exps: (n_card > 0)
-                .then(|| iq2_xxs(w, what, &layer_name(l, FFN_DOWN_EXPS), (n_card * width, ff)))
-                .transpose()?,
+            up_exps,
+            down_exps,
+            form,
             shared,
             route,
             norm,
@@ -306,10 +470,17 @@ impl MoeLayer {
         Ok(layer)
     }
 
-    /// The q8_1 forms (values, columns) the layer's launches read.
+    /// The q8_1 forms (values, columns) the layer's launches read: the
+    /// experts' only where they are IQ2_XXS stacks (the relu² form quantizes
+    /// into its own buffers).
     pub(super) fn forms(&self, hp: &Hparams) -> Vec<(usize, usize)> {
+        let iq2_card = if self.form == Some(Form::Iq2) {
+            self.n_card
+        } else {
+            0
+        };
         forms_of(
-            (self.n_card, self.shared_is_sel()),
+            (iq2_card, self.shared_is_sel()),
             (
                 hp.experts_width() as usize,
                 self.ff,
@@ -354,11 +525,110 @@ impl MoeLayer {
     pub(super) fn down(&self) -> Result<&str, GpuError> {
         stack_name(&self.down_exps)
     }
+
+    /// The form the layer's card experts run in; a layer with none is
+    /// refused by name.
+    pub(super) fn form(&self) -> Result<Form, GpuError> {
+        self.form.ok_or_else(no_card_stack)
+    }
+
+    /// The width of the relu² form's buffers the layer runs in: its experts'
+    /// where they are 32-value stacks on the card, else none.
+    pub(super) fn relu2_ff(&self) -> Option<usize> {
+        (self.form == Some(Form::Sel32)).then_some(self.ff)
+    }
+}
+
+/// Layer `l`'s card slots over the one token's experts' input `input`
+/// (`width` values) at the places `sel` (an id below `m.n_card` a card
+/// expert; a [`HOST`](crate::hybrid::HOST) place is left alone): each slot's
+/// down rows, which [`card_down`] names. IQ2_XXS stacks: the input's q8_1, the
+/// up `_sel` into `s.up`, the squared ReLU's q8_1, the down `_sel` into
+/// `s.down`; 32-value stacks: the relu² form's four launches into its own
+/// buffers. A layer with no card expert is refused by name. Asynchronous.
+pub(super) fn card_slots(
+    cx: &Cx<'_>,
+    (k, sh): (&MoeKernels, MoeShape),
+    (l, m): (usize, &MoeLayer),
+    (input, sel): (&DeviceBuffer<f32>, &DeviceBuffer<u32>),
+    (s, acts): (SlotBufs<'_>, &mut Acts),
+) -> Result<(), GpuError> {
+    let (gpu, what) = (cx.gpu, cx.what);
+    match m.form()? {
+        Form::Iq2 => {
+            let stream = gpu.stream();
+            let fault = gpu.layer_sink(l)?;
+            let act = acts.q8_1_at(what, sh.width, 1)?;
+            gpu.enqueue_quantize_q8_1_layer(input, act, l)?;
+            let up = SelDown {
+                w: stack(cx.w, what, m.up()?)?,
+                act,
+                sel,
+                n_slots: sh.top_k,
+                rows_per_expert: m.ff,
+            };
+            k.iq.enqueue_gemv_sel_cols(stream, GgmlType::IQ2_XXS, &up, sh.top_k, fault, s.up)?;
+            let act = acts.q8_1_at(what, m.ff, sh.top_k)?;
+            gpu.enqueue_quantize_q8_1_layer_relu_sqr(s.up, act, l)?;
+            let down = SelDown {
+                w: stack(cx.w, what, m.down()?)?,
+                act,
+                sel,
+                n_slots: sh.top_k,
+                rows_per_expert: sh.width,
+            };
+            k.iq.enqueue_gemv_sel(stream, GgmlType::IQ2_XXS, &down, fault, s.down)
+        }
+        Form::Sel32 => {
+            let stacks = Relu2Stacks::of(cx.w, [m.up()?, m.down()?])?;
+            let run = Relu2Run {
+                layer: l,
+                stacks: &stacks,
+                normed: input,
+                m: 1,
+                sel,
+                n_card: m.n_card,
+            };
+            let bufs = s
+                .relu2
+                .iter_mut()
+                .find(|b| b.shape().ff == m.ff)
+                .ok_or_else(|| relu2_missing(m.ff))?;
+            k.relu2()?.enqueue(gpu, bufs, &run, None)
+        }
+    }
+}
+
+/// The down rows [`card_slots`] left for layer `m`'s slots, `width` a slot,
+/// slot-major: `s.down` for IQ2_XXS stacks, the relu² form's own for
+/// 32-value ones.
+pub(super) fn card_down<'s>(
+    m: &MoeLayer,
+    s: &'s MoeScratch,
+) -> Result<&'s DeviceBuffer<f32>, GpuError> {
+    down_of(m, &s.down, &s.relu2)
+}
+
+/// [`card_down`] over the scratch's fields, so a caller can hold the sum's
+/// buffer mutably beside it.
+fn down_of<'s>(
+    m: &MoeLayer,
+    down: &'s DeviceBuffer<f32>,
+    relu2: &'s [Relu2Bufs],
+) -> Result<&'s DeviceBuffer<f32>, GpuError> {
+    match m.form()? {
+        Form::Iq2 => Ok(down),
+        Form::Sel32 => relu2
+            .iter()
+            .find(|b| b.shape().ff == m.ff)
+            .map(Relu2Bufs::down)
+            .ok_or_else(|| relu2_missing(m.ff)),
+    }
 }
 
 /// The q8_1 forms (values, columns) a MoE layer's launches read: the
-/// experts' input and the slots' squared ReLU where the card holds experts
-/// of the layer (`n_card` above 0), and the normed row and the shared
+/// experts' input and the slots' squared ReLU where the card holds IQ2_XXS
+/// experts of the layer (`n_card` above 0), and the normed row and the shared
 /// expert's where the shared expert is an IQ2_XXS stack (`shared_is_sel`).
 /// A launch that reads no q8_1 form asks for none: the form's block is the
 /// K-quant's 256 values, and a width no K-quant form takes (a file whose
@@ -387,10 +657,15 @@ fn forms_of(
 /// A card stack's name, or the refusal of a layer that holds no expert on
 /// the card (a placed load's walks skip such a layer's card slots).
 fn stack_name(name: &Option<String>) -> Result<&str, GpuError> {
-    name.as_deref().ok_or(GpuError::state(
+    name.as_deref().ok_or_else(no_card_stack)
+}
+
+/// The refusal of a layer that holds no expert on the card.
+fn no_card_stack() -> GpuError {
+    GpuError::state(
         "nemotron_h_moe::MoeLayer",
         "a routed stack on the card (a layer with no card expert holds none)",
-    ))
+    )
 }
 
 /// `y = W · col` for the one-expert IQ2_XXS stack `name` of `rows` rows: the
@@ -491,43 +766,29 @@ pub(super) fn moe_layer(
     if let Some(site) = &m.latent_down {
         site.project(&cx.gqa(), acts, l, &t.buf.xn, &mut s.lat)?;
     }
-    {
-        let act = acts.q8_1_at(what, width, 1)?;
-        let input = if m.latent_down.is_some() {
-            &s.lat
-        } else {
-            &t.buf.xn
-        };
-        gpu.enqueue_quantize_q8_1_layer(input, act, l)?;
-        let up = SelDown {
-            w: stack(cx.w, what, m.up()?)?,
-            act,
-            sel: m.route.ids(),
-            n_slots: top_k,
-            rows_per_expert: m.ff,
-        };
-        k.iq.enqueue_gemv_sel_cols(stream, GgmlType::IQ2_XXS, &up, top_k, fault, &mut s.up)?;
+    if m.latent_down.is_some() {
+        let (lat, slots) = s.lat_and_slots();
+        card_slots(cx, (k, sh), (l, &*m), (lat, m.route.ids()), (slots, acts))?;
+    } else {
+        card_slots(
+            cx,
+            (k, sh),
+            (l, &*m),
+            (&t.buf.xn, m.route.ids()),
+            (s.slots(), acts),
+        )?;
     }
-    {
-        let act = acts.q8_1_at(what, m.ff, top_k)?;
-        gpu.enqueue_quantize_q8_1_layer_relu_sqr(&s.up, act, l)?;
-        let down = SelDown {
-            w: stack(cx.w, what, m.down()?)?,
-            act,
-            sel: m.route.ids(),
-            n_slots: top_k,
-            rows_per_expert: width,
-        };
-        k.iq.enqueue_gemv_sel(stream, GgmlType::IQ2_XXS, &down, fault, &mut s.down)?;
-    }
+    let MoeScratch {
+        down, relu2, moe, ..
+    } = &mut *s;
     gpu.elem().enqueue_weighted_sum(
         stream,
-        &s.down,
+        down_of(m, down, relu2)?,
         m.route.weights(),
         width,
         top_k as u32,
         1,
-        &mut s.moe,
+        moe,
     )?;
     // The layer's delta: the latent up's projection, or the experts' sum
     // itself where the file has no latent.

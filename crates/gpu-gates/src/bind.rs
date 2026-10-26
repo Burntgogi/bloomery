@@ -57,6 +57,7 @@ use std::process::Command;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use bloomery_gpu::GpuError;
 use bloomery_gpu::checkpoint::saved::{Pending as Saving, SeqView};
@@ -235,11 +236,29 @@ pub fn slots_given(
     Ok((slots, from))
 }
 
+/// A serving seat's `--place` word, the one reader of the placement grammar:
+/// [`Place::parse`](crate::generate::Place::parse) (`a`, `gate`, `bp`, `tp`, or a card
+/// list `<stage>[+<tier>…]` of card names and device ordinals). `serves` is the
+/// `(body, tiers)` of a body that serves a fixed count of expert tier cards: a
+/// list of more is refused by name here, before any plan. `None` leaves the
+/// count to the seat's plan, which refuses a tier its body cannot serve.
+pub fn place_word(
+    v: &str,
+    serves: Option<(&str, usize)>,
+) -> Result<crate::generate::Place, GateError> {
+    let place = crate::generate::Place::parse(v)?;
+    if let Some((body, tiers)) = serves {
+        place.serves(body, tiers)?;
+    }
+    Ok(place)
+}
+
 /// The flags every serving seat takes beside its own: the listener (`--host`,
 /// `--port`, `--queue-depth`), the keys (`--api-key`, `--api-key-file`), the
 /// context (`--ctx`, under every spelling `serve::flag::CTX` lists), the
-/// placement word (`--place`), the alias, the chat template file, `--parallel`
-/// (and `-np`) and `--plan`.
+/// placement word (`--place`, read by [`place_word`]), the alias, the chat
+/// template file, the slot actions' directory (`--slot-save-path`),
+/// `--parallel` (and `-np`) and `--plan`.
 pub struct SeatFlags {
     pub host: String,
     pub port: u16,
@@ -255,6 +274,9 @@ pub struct SeatFlags {
     /// `--api-key`/`--api-key-file`: the keys every request is checked
     /// against ([`serve::flag::ApiKeys`]).
     pub api_keys: serve::flag::ApiKeys,
+    /// `--slot-save-path`: the directory the slot actions answer from; `None`
+    /// refuses every one.
+    pub slot_save_path: Option<PathBuf>,
 }
 
 impl SeatFlags {
@@ -278,6 +300,7 @@ impl SeatFlags {
             parallel: None,
             queue_depth: None,
             api_keys: serve::flag::ApiKeys::default(),
+            slot_save_path: None,
         };
         let mut it = args.iter().map(String::as_str);
         while let Some(flag) = it.next() {
@@ -295,11 +318,12 @@ impl SeatFlags {
                 "--host" => a.host = v.to_owned(),
                 "--port" => a.port = serve::flag::number(flag, v)?,
                 f if serve::flag::CTX.contains(&f) => a.ctx = Some(serve::flag::number(flag, v)?),
-                "--place" => a.place = Some(crate::generate::Place::parse(v)?),
+                "--place" => a.place = Some(place_word(v, None)?),
                 "--alias" => a.alias = Some(v.to_owned()),
                 TemplateFile::FLAG => a.template_file.set(v),
                 "--parallel" | "-np" => a.parallel = Some(serve::flag::number(flag, v)?),
                 "--queue-depth" => a.queue_depth = Some(serve::flag::number(flag, v)?),
+                "--slot-save-path" => a.slot_save_path = Some(PathBuf::from(v)),
                 f if serve::flag::KEYS.contains(&f) => a.api_keys.add(f, v)?,
                 other => {
                     if !own(other, v)? {
@@ -318,9 +342,9 @@ impl SeatFlags {
     }
 
     /// [`bind_server`] over `engine` with these flags: the alias the flag
-    /// gave or `chat`'s, `chat`'s template, no request preparation, no slot
-    /// file path, `slots` slots the seat made at its open, the server
-    /// settings from `levers`, and the side model beside it.
+    /// gave or `chat`'s, `chat`'s template, no request preparation, the slot
+    /// file path the flag gave, `slots` slots the seat made at its open, the
+    /// server settings from `levers`, and the side model beside it.
     pub fn bind(
         self,
         engine: SeatEngine,
@@ -336,6 +360,7 @@ impl SeatFlags {
             alias,
             api_keys,
             queue_depth,
+            slot_save_path,
             ..
         } = self;
         bind_server(
@@ -347,7 +372,7 @@ impl SeatFlags {
                 path,
                 template: chat.template,
                 preparation: None,
-                slot_save_path: None,
+                slot_save_path,
                 api_keys,
                 parallel: slots,
                 queue_depth,
@@ -479,7 +504,7 @@ fn class_of(role: Role) -> &'static str {
         Role::Attention => "attention",
         Role::Router | Role::HashTable | Role::SharedExpert | Role::RoutedExperts => "experts",
         Role::FfnNorm | Role::DenseFfn => "ffn",
-        Role::EngramDense | Role::EngramGain | Role::EngramTable => "ngram",
+        Role::EngramDense | Role::EngramGain | Role::EngramTable | Role::EngramHash => "ngram",
         Role::TokenEmbedding => "embeddings",
         Role::Head => "output",
         Role::HyperConnection | Role::Unread | Role::Unused => "other",
@@ -505,7 +530,11 @@ pub fn model_props(split: &Split, model: &ModelTensors) -> ModelProps {
     for t in &model.tensors {
         let gathered_or_unread = matches!(
             t.role,
-            Role::TokenEmbedding | Role::EngramTable | Role::Unread | Role::Unused
+            Role::TokenEmbedding
+                | Role::EngramTable
+                | Role::EngramHash
+                | Role::Unread
+                | Role::Unused
         );
         if let (false, Some(name)) = (gathered_or_unread, t.ty.name()) {
             *by_type.entry(name).or_default() += t.file_bytes;
@@ -674,7 +703,7 @@ impl CacheRam {
     /// The `flag`'s value (`--cache-ram`, `--park-ram`), `mib` MiB, in
     /// bytes; refused by name past u64.
     pub fn parse_mib(flag: &str, mib: &str) -> Result<u64, GateError> {
-        let n: u64 = mib.parse()?;
+        let n: u64 = serve::flag::number(flag, mib)?;
         Ok(n.checked_mul(1 << 20)
             .ok_or_else(|| format!("{flag} {n} MiB passes u64 bytes"))?)
     }
@@ -1055,6 +1084,10 @@ pub trait Seat: 'static {
     /// one step per id), the draft fed as the call hands its rows over; the
     /// argmax after the last.
     fn prefill(&mut self, ids: &[u32]) -> Result<u32, GateError>;
+    /// Prompt positions whose output is unused. A batched seat can omit its head.
+    fn prefill_only(&mut self, ids: &[u32]) -> Result<(), GateError> {
+        self.prefill(ids).map(|_| ())
+    }
     /// [`Seat::prefill`] where the slice carries images
     /// ([`Engine::prefill_media`]'s contract): each feed's `at` is its span's
     /// first position in `ids`, every span lies whole inside the slice, and
@@ -1421,7 +1454,7 @@ impl SeatEngine {
                 // seat's selection unspecified until the server selects again
                 // (`serve::Engine::step_slots`).
                 let mut selected = Some(0);
-                for cmd in cmds {
+                while let Ok(cmd) = receive_command(&cmds) {
                     let call = one_slot_call(&cmd);
                     let select = match &cmd {
                         Cmd::Select(slot) => Some(*slot),
@@ -1601,6 +1634,26 @@ impl SeatEngine {
     pub fn slots(&self) -> usize {
         self.slots
     }
+}
+
+/// How long the engine thread polls for the next command before it parks:
+/// a decode step's reply and the server's next call cross in less, and a
+/// parked thread's wake-up would sit on every token's path.
+const RECEIVE_SPIN: Duration = Duration::from_millis(1);
+
+/// The engine thread's next command: polled for until [`RECEIVE_SPIN`] has
+/// passed since the call, then waited for parked. Commands sent before the
+/// server's end are all received before the end is.
+fn receive_command(rx: &Receiver<Cmd>) -> Result<Cmd, mpsc::RecvError> {
+    let started = Instant::now();
+    while started.elapsed() < RECEIVE_SPIN {
+        match rx.try_recv() {
+            Ok(cmd) => return Ok(cmd),
+            Err(mpsc::TryRecvError::Disconnected) => return Err(mpsc::RecvError),
+            Err(mpsc::TryRecvError::Empty) => std::hint::spin_loop(),
+        }
+    }
+    rx.recv()
 }
 
 impl Link {
@@ -2089,9 +2142,11 @@ fn serve_cmd<S: Seat>(
         Cmd::Prefill(ids) => {
             let refuse =
                 |e: String| format!("prefill of {} ids from position {at}: {e}", ids.len());
-            check_feed(g, ids.len())
-                .map_err(refuse)
-                .and_then(|()| g.prefill(&ids).map_err(|e| refuse(e.to_string())))
+            check_feed(g, ids.len()).map_err(refuse).and_then(|()| {
+                g.prefill_only(&ids)
+                    .map(|()| 0)
+                    .map_err(|e| refuse(e.to_string()))
+            })
         }
         Cmd::PrefillMedia(ids, feeds) => {
             let refuse = |e: String| {
@@ -2176,7 +2231,7 @@ fn next_row<S: Seat>(
     next_lent_row(g, last, row)
 }
 
-/// [`Seat::prefill_row`]'s default: [`Seat::prefill`] of all but the last of
+/// [`Seat::prefill_row`]'s default: [`Seat::prefill_only`] of all but the last of
 /// `ids` (none for one id) and [`Seat::step`], or [`Seat::step_row`] into
 /// `row`, of the last.
 pub fn prefill_then_step<S: Seat + ?Sized>(
@@ -2188,7 +2243,7 @@ pub fn prefill_then_step<S: Seat + ?Sized>(
         return Err("a prefill and its step of no ids".into());
     };
     if !run.is_empty() {
-        g.prefill(run)?;
+        g.prefill_only(run)?;
     }
     match row {
         Some(row) => g.step_row(last, row),
@@ -3093,7 +3148,8 @@ mod tests {
         let (tx, cmds) = mpsc::channel::<Cmd>();
         let (replies, rx) = mpsc::channel::<Reply>();
         let worker = std::thread::spawn(move || {
-            for (at, cmd) in cmds.into_iter().enumerate() {
+            let received = std::iter::from_fn(|| super::receive_command(&cmds).ok());
+            for (at, cmd) in received.enumerate() {
                 let reply = match cmd {
                     Cmd::Next { last, mut logits } => {
                         if let Some(row) = logits.as_deref_mut() {
@@ -3149,6 +3205,48 @@ mod tests {
             scratch: Vec::new(),
         };
         (link, worker)
+    }
+
+    /// The engine thread's receiver ([`super::receive_command`]) takes a
+    /// command that arrives long after its poll has ended, parked meanwhile
+    /// (its thread's CPU time over a wait far longer than the poll stays
+    /// near the poll's), and every command sent before the sender's end
+    /// before it reports the end.
+    #[test]
+    fn the_command_receiver_parks_and_takes_every_command_before_the_end() {
+        let thread_cpu = || {
+            let stat = std::fs::read_to_string("/proc/thread-self/schedstat")
+                .expect("the thread's schedstat");
+            let ns = stat.split_whitespace().next().expect("its run time");
+            std::time::Duration::from_nanos(ns.parse().expect("a count of ns"))
+        };
+        let idle = std::time::Duration::from_millis(200);
+        let (tx, cmds) = mpsc::channel::<Cmd>();
+        let (done, ended) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let before = thread_cpu();
+            let mut taken = 0usize;
+            while let Ok(cmd) = super::receive_command(&cmds) {
+                assert!(matches!(cmd, Cmd::Reset), "the commands as sent");
+                taken += 1;
+            }
+            done.send((taken, thread_cpu() - before))
+                .expect("the test waits");
+        });
+        tx.send(Cmd::Reset).expect("the receiver runs");
+        std::thread::sleep(idle);
+        tx.send(Cmd::Reset).expect("the receiver runs");
+        tx.send(Cmd::Reset).expect("the receiver runs");
+        drop(tx);
+        let (taken, cpu) = ended
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the receiver reports the end");
+        worker.join().expect("the receiver thread");
+        assert_eq!(taken, 3, "every command before the end");
+        assert!(
+            cpu < idle / 4,
+            "the receiver parked through the wait: {cpu:?} of CPU over {idle:?}"
+        );
     }
 
     /// A round of several slots is one command whose reply sets each row's
@@ -3573,6 +3671,7 @@ mod tests {
                 shadows: 0,
                 reserves: 0,
                 extra: 0,
+                read_ahead: 0,
                 arena: 0,
                 cards: 0,
                 os: 0,
@@ -3603,6 +3702,81 @@ mod tests {
             i128::from(available) - i128::from(terms) - i128::from(2 * slot)
         );
         assert_eq!(pool.mem_left, i128::from(available) - i128::from(two));
+    }
+
+    /// The nemotron, raon1 and tiered seats read `--place` through
+    /// [`SeatFlags`], which reads it as [`place_word`] does: every word
+    /// `Place::parse` takes parses to the placement it names, a list of tier
+    /// cards stays the seat's plan to refuse (`None`), a body that serves a
+    /// count refuses more by name, and a word no card or ordinal spells is
+    /// refused.
+    #[test]
+    fn the_seats_read_the_place_word_as_one_grammar() {
+        use super::{SeatFlags, place_word};
+        use model::placement::workstation::{A6000, RTX_3090};
+        let usage = "usage";
+        let seat = |word: &str| {
+            let args = ["--place".to_owned(), word.to_owned()];
+            SeatFlags::parse(&args, usage, |_, _| Ok(false))
+        };
+        for (word, name, cards) in [
+            ("a", "a", vec![A6000.name]),
+            ("gate", "gate", vec![RTX_3090.name]),
+            ("bp", "bp", vec![A6000.name, RTX_3090.name]),
+            ("a6000+3090", "bp", vec![A6000.name, RTX_3090.name]),
+            ("3090+a6000", "3090+a6000", vec![RTX_3090.name, A6000.name]),
+            ("cuda1+0", "cuda1+0", vec!["cuda1", "cuda0"]),
+            ("tp", "tp", vec![A6000.name]),
+        ] {
+            let p = place_word(word, None).unwrap_or_else(|e| panic!("{word}: {e}"));
+            assert_eq!((p.name(), p.cards()), (name, cards), "{word}");
+            let flags = seat(word).unwrap_or_else(|e| panic!("{word}: {e}"));
+            assert_eq!(flags.place, Some(p), "{word}");
+        }
+        let many = "cuda0+cuda1+cuda2";
+        assert_eq!(place_word(many, None).expect(many).tier_cards().len(), 2);
+        assert_eq!(
+            seat(many).expect(many).place.map(|p| p.tier_cards().len()),
+            Some(2)
+        );
+        place_word("bp", Some(("body", 1))).expect("one tier card");
+        let e = place_word(many, Some(("body", 1)))
+            .expect_err(many)
+            .to_string();
+        assert_eq!(
+            e,
+            "--place cuda0+cuda1+cuda2: 2 expert tier cards, and the body body serves 1 at most"
+        );
+        for refused in [place_word("b2", None).map(|_| ()), seat("b2").map(|_| ())] {
+            let e = refused.expect_err("b2").to_string();
+            assert!(e.starts_with("--place is a, gate, bp"), "{e}");
+        }
+    }
+
+    /// The seats that read their flags through [`SeatFlags`] take `--slot-save-path` as one flag:
+    /// unset it is `None`, which refuses every slot action, and given it is the directory; with no
+    /// value the flag is refused by name.
+    #[test]
+    fn the_seats_take_the_slot_save_path_through_the_common_flags() {
+        use super::SeatFlags;
+        let parse = |args: &[&str]| {
+            let args: Vec<String> = args.iter().map(|a| (*a).to_owned()).collect();
+            SeatFlags::parse(&args, "usage", |_, _| Ok(false))
+        };
+        assert_eq!(parse(&[]).expect("unset").slot_save_path, None);
+        assert_eq!(
+            parse(&["--slot-save-path", "/slots"])
+                .expect("given")
+                .slot_save_path,
+            Some(std::path::PathBuf::from("/slots"))
+        );
+        let Err(e) = parse(&["--slot-save-path"]) else {
+            panic!("a --slot-save-path with no value was taken");
+        };
+        assert!(
+            e.to_string().starts_with("--slot-save-path needs a value"),
+            "{e}"
+        );
     }
 
     mod media {
@@ -4883,24 +5057,24 @@ mod tests {
         /// past the need is the reading less the plan's own terms less that
         /// row, the budget half of it, and `checkpoints` is the term the
         /// `cache` line prints, not a second subtraction. One Qwen3.8 slot
-        /// at a context of 16,384 positions pins five points of 130,162,688
-        /// B spaced 4,096 apart (650,813,440 B) inside the need of
-        /// 27,631,529,984 B: the same plan with no reserve leaves that much
+        /// at a context of 16,384 positions pins five points of 148,065,344
+        /// B spaced 4,096 apart (740,326,720 B) inside the need of
+        /// 27,721,043,264 B: the same plan with no reserve leaves that much
         /// more room, and half of it more budget. The line's own terms
         /// (`available`, `need`, `pool`) reproduce the budget it prints.
         #[test]
         fn a_default_budget_counts_the_checkpoint_reserve_once() {
             const Q38: Price = Price {
-                point_bytes: 130_162_688,
+                point_bytes: 148_065_344,
                 every: 4_096,
             };
             let mut m = machine(0);
             reserve_checkpoints(&mut m, Seqs::priced(1, Q38), 16_384).expect("a reserve");
             let reserved = checkpoints_reserved(&m);
-            assert_eq!(reserved, 5 * 130_162_688);
+            assert_eq!(reserved, 5 * 148_065_344);
             let (terms, pool, available) = (26_980_716_544u64, 0u64, 40_000_000_000u64);
             let need = terms + reserved;
-            assert_eq!(need, 27_631_529_984);
+            assert_eq!(need, 27_721_043_264);
             let at = |need: u64, checkpoints: u64| {
                 CacheRam::at(
                     None,
@@ -4979,13 +5153,13 @@ mod tests {
         /// spacing (`checkpoint_price35`, `checkpoint_price38`, pinned where
         /// they are made: `gate-gpu-lib`) and the budget one sequence's
         /// `Checkpoints` is made with is the price's at the slot's context.
-        /// A point of 73,728,000 B (Qwen3.6-35B-A3B) or 130,162,688 B
+        /// A point of 73,728,000 B (Qwen3.6-35B-A3B) or 148,065,344 B
         /// (Qwen3.8-Flash-Next) spaced 4,096 apart takes two points in a slot
         /// of 2,048 positions and four in 10,240 (a whole call's points and
         /// the previous call's end) — not the 4 GiB of the default a slot.
         #[test]
         fn a_qwen_machine_reserves_its_familys_budget_at_each_context() {
-            for point_bytes in [73_728_000u64, 130_162_688] {
+            for point_bytes in [73_728_000u64, 148_065_344] {
                 let price = Price {
                     point_bytes,
                     every: 4_096,
@@ -5019,7 +5193,7 @@ mod tests {
         #[test]
         fn a_deeper_probe_never_reserves_less() {
             let qwen38 = Price {
-                point_bytes: 130_162_688,
+                point_bytes: 148_065_344,
                 every: 4_096,
             };
             for price in [qwen38, GLM_PRICE] {

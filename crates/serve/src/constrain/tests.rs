@@ -623,6 +623,10 @@ fn markup(format: ToolFormat) -> [String; 2] {
             "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"unit\" string=\"true\">celsius</｜DSML｜parameter>\n<｜DSML｜parameter name=\"days\" string=\"false\">2</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
             "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"search\">\n<｜DSML｜parameter name=\"query\" string=\"true\">cats</｜DSML｜parameter>\n<｜DSML｜parameter name=\"deep\" string=\"false\">false</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
         ],
+        ToolFormat::MuseSpark => [
+            " to=get_weather<|message|><atem:function_calls>\n<atem:invoke name=\"get_weather\">\n<atem:parameter name=\"unit\">celsius</atem:parameter>\n<atem:parameter name=\"days\">2</atem:parameter>\n</atem:invoke>\n</atem:function_calls>",
+            " to=search<|message|><atem:function_calls>\n<atem:invoke name=\"search\">\n<atem:parameter name=\"query\">cats</atem:parameter>\n<atem:parameter name=\"deep\">false</atem:parameter>\n</atem:invoke>\n</atem:function_calls>",
+        ],
         ToolFormat::Unparsed => unreachable!("no markup"),
     };
     texts.map(|t| match format {
@@ -662,6 +666,12 @@ fn scanned(format: ToolFormat, tools: &Value, text: &str) -> Vec<(String, Value)
             out.calls.extend(s.finish().calls);
             out
         }
+        ToolFormat::MuseSpark => {
+            let mut s = crate::museatem::MuseScan::default();
+            let mut out = s.push(text);
+            out.calls.extend(s.finish().calls);
+            out
+        }
         ToolFormat::Unparsed => unreachable!("no markup"),
     };
     assert!(
@@ -697,6 +707,7 @@ fn each_formats_inverse_reads_back_through_its_scanner() {
         SOLAR,
         ToolFormat::Dsml(Spelling::Joined),
         ToolFormat::Dsml(Spelling::Spaced),
+        ToolFormat::MuseSpark,
     ] {
         let [weather, search] = markup(format);
         let required = json!({"tools": tools, "tool_choice": "required"});
@@ -759,6 +770,7 @@ fn a_forced_call_obeys_the_tools_when_greedy_does_not() {
         SOLAR,
         ToolFormat::Dsml(Spelling::Joined),
         ToolFormat::Dsml(Spelling::Spaced),
+        ToolFormat::MuseSpark,
     ] {
         let c = build(
             &tok,
@@ -1125,6 +1137,7 @@ fn parsed(format: ToolFormat, tools: &Value, text: &str) -> Result<(String, usiz
             Tools::KvMarkup(spelling, ArgTypes::of_tools(Some(tools)))
         }
         ToolFormat::Dsml(spelling) => Tools::Dsml(spelling),
+        ToolFormat::MuseSpark => Tools::MuseSpark,
         ToolFormat::Unparsed => unreachable!("no markup"),
     };
     let mut p = ChatParser::with_tools("", ReasoningFormat::None, Some(scan));

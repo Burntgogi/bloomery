@@ -1,0 +1,11 @@
+# The Python of tools/ref/mm31/dump_tf.py: the releases its tests (test_dump_tf.py) ran at, on a CPU-only torch. The box's
+# /home/user/hfref-venv names the same torch and transformers; the dump's `# build` line carries both release numbers, so a
+# venv at other numbers writes sets the family (crates/refset/src/arch/minimaxm31) refuses by name. compressed-tensors is the
+# NVFP4 reference the dequantization is checked against bit for bit (its release is printed by `--dequant-selftest` and kept
+# in each set's `# checks` line); transformers' own Fp8Dequantize is the MXFP8 reference.
+torch==2.14.1
+transformers==5.12.1
+safetensors==0.8.0
+numpy==2.5.4
+tokenizers==0.22.2
+compressed-tensors==0.19.0

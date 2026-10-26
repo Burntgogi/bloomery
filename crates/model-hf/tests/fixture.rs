@@ -42,7 +42,9 @@
 //! 10. the card budget: the plan of the written file under its recorded budget holds half of the
 //!     experts (256) on every layer `routed_rule` admits and none on the others, its budgetless
 //!     plan all of them; a budget one step either side of the recorded one is refused by name, and
-//!     `verify` refuses a header whose recorded budget is not the plan's;
+//!     `verify` refuses a header whose recorded budget is not the plan's; on a unified card, whose
+//!     stage sets aside the activations' MMA forms, the recorded budget alone holds fewer, and the
+//!     recorded budget plus the family's set-aside on that card holds the same half;
 //! 11. the silent traps of ik's reader: a per-layer array one short, a missing `ple.layers`, and
 //!     a missing `full_attention_interval` are refused by name, in the source and in the written
 //!     file, as is a draft's ratios array one short of its layers.
@@ -150,6 +152,24 @@
 //!     layers, its budgetless plan all of them on the eligible ones; a budget 64 MiB below and 1 GiB
 //!     above and an edited record are refused by name.
 //!
+//! The Qwen3-30B-A3B spec (`model::arch::qwen3moe::fixture`), the uniform trunk whose layers all
+//! route 128 experts with no shared one and whose source is one file. The synthetic clauses plan a
+//! small `qwen3moe` source of eight layers (the Q6_K and the Q4_K `attn_v` and `ffn_down_exps` sets
+//! the real file's layers hold one or the other of) through the family's own rules; the real header
+//! on the box:
+//!
+//! 36. the written fixture of the synthetic source is one file with no `split.*` keys, `verify`
+//!     passes, the engine's reader reads its layers and routed block, the layers keep the types
+//!     they were mapped from, and the family's constants land: every norm's gain 1, the router a
+//!     matrix draw;
+//! 37. a layer map that loses a (stem, type) pair is refused by name at the plan, beside a control
+//!     map that plans; a source key no rule covers and a written fixture read against a source of
+//!     other heads are refused by name;
+//! 38. the real header: the plan of the four layers `[6, 8, 9, 47]` (every tensor at its source's
+//!     dims and type, every (stem, type) pair of the source, 1,940,326,400 bytes of tensor data
+//!     in one shard) read back by the engine's reader, the written file verified, and the maps
+//!     that lose a pair refused.
+//!
 //! Files go under this crate's `CARGO_TARGET_TMPDIR` and are removed.
 
 use std::collections::{BTreeMap, HashMap};
@@ -173,6 +193,8 @@ use model::arch::nemotron_h_moe::fixture as bolt;
 use model::arch::nemotron_h_moe::hparams::{
     Experts as BoltExperts, Hparams as BoltHparams, Kind as BoltKind,
 };
+use model::arch::qwen3moe::fixture as q3;
+use model::arch::qwen3moe::hparams::Hparams as Q3Hparams;
 use model::arch::qwen35moe::fixture as q38;
 use model::arch::qwen35moe::fixture::qwen35moe as q36;
 use model::arch::qwen35moe::hparams::{Hparams, Kind};
@@ -187,7 +209,7 @@ use model::fixture::{
     Window, rule_for,
 };
 use model::placement::PlanLevers;
-use model::placement::workstation::{self, HostRead, RTX_3090};
+use model::placement::workstation::{self, CardSpec, HostRead, RTX_3090};
 use sha2::{Digest, Sha256};
 
 const ARCH: &str = "deepseek41";
@@ -1304,7 +1326,7 @@ fn hw_fixture_v41_budget() {
     let machine = workstation::plan_gate(layers);
     let at = |budget: Option<u64>, ctx: u64, slots: usize| -> Result<Vec<u64>, String> {
         let levers = PlanLevers {
-            card_budget_bytes: budget,
+            card_budget_bytes: budget.into(),
         };
         let slots = NonZeroUsize::new(slots).unwrap();
         inputs
@@ -2716,15 +2738,15 @@ fn hw_fixture_q38_budget() {
             .iter()
             .map(|h| h.layer)
             .collect();
-    let machine = machine_for_experts(
-        RTX_3090,
-        layers,
-        UBATCH_PLANNED.min(q38::BUDGET_CTX),
-        Experts::Card,
-    );
-    let at = |budget: Option<u64>| -> Vec<u64> {
+    let at = |card: CardSpec, budget: Option<u64>| -> Vec<u64> {
+        let machine = machine_for_experts(
+            card,
+            layers,
+            UBATCH_PLANNED.min(q38::BUDGET_CTX),
+            Experts::Card,
+        );
         let levers = PlanLevers {
-            card_budget_bytes: budget,
+            card_budget_bytes: budget.into(),
         };
         inputs
             .plan_with_slots(&machine, q38::BUDGET_CTX, &levers, Experts::Card, 1)
@@ -2738,23 +2760,60 @@ fn hw_fixture_q38_budget() {
             .collect()
     };
     assert_eq!(
-        at(None),
+        at(RTX_3090, None),
         want(experts),
         "the budgetless plan holds every expert it can"
     );
     assert_eq!(
-        at(Some(recorded)),
+        at(RTX_3090, Some(recorded)),
         want(experts / 2),
         "the plan under {recorded}"
+    );
+
+    // A DGX Spark's card as its census gives it: its stage reserves the activations' MMA forms
+    // beside the 3090's terms, so the recorded budget alone leaves it short; the family's
+    // set-aside on it, held beside the budget as the fixture tier does, keeps the half.
+    let unified = CardSpec {
+        name: "GB10",
+        total_bytes: 130_661_765_120,
+        driver_reserve_bytes: 806_912,
+        free_bytes: Some(124_626_137_088),
+        integrated: true,
+        ..RTX_3090
+    };
+    let CardBudget::Planned(planner) = spec.card_budget else {
+        panic!("the q38 spec plans its card budget");
+    };
+    let set_aside = planner
+        .card_set_aside
+        .expect("the q38 spec names what a card sets aside")(&fx, unified)
+    .unwrap();
+    assert_eq!(
+        (planner.card_set_aside.unwrap())(&fx, RTX_3090).unwrap(),
+        0,
+        "the 3090 sets aside what the recorded budget was planned beside"
+    );
+    assert_ne!(
+        at(unified, Some(recorded)),
+        want(experts / 2),
+        "the recorded budget alone on a unified card"
+    );
+    assert_eq!(
+        at(unified, Some(recorded + set_aside)),
+        want(experts / 2),
+        "the plan on a unified card under {recorded} + {set_aside}"
     );
 
     let bad = budget_round_trip("q38", &spec, &src, &p, &fx);
     println!(
         "q38 budget: recorded {recorded} B ({} MiB); layers {layers}; host-only {host_only:?}; \
-         unbounded {:?}; recorded {:?}",
+         unbounded {:?}; recorded {:?}; a unified card sets aside {set_aside} B more: {:?} \
+         under the recorded budget alone, {:?} beside it",
         recorded / (1 << 20),
-        at(None),
-        at(Some(recorded)),
+        at(RTX_3090, None),
+        at(RTX_3090, Some(recorded)),
+        at(unified, Some(recorded)),
+        at(unified, Some(recorded + set_aside)),
     );
     assert!(bad.is_empty(), "\n  {}", bad.join("\n  "));
 }
@@ -3203,8 +3262,8 @@ fn hw_fixture_glm_plan() {
 
 /// Contract 17: the recorded card budget makes the plan of the written file
 /// with its NextN layer loaded, at the e2e gate's context, hold half of the
-/// experts (144 of 288) on every card-eligible layer (f2 to f4) and none on the
-/// dense layers and the Q6_K-down layer, as `verify` re-plans it. The condition
+/// experts (144 of 288) on every card-eligible layer (f2 to f5, the Q6_K-down
+/// layer among them) and none on the dense layers, as `verify` re-plans it. The condition
 /// table is printed: the budget is the NextN plan at [`glm::BUDGET_CTX`].
 #[test]
 #[ignore = "needs the box and the GLM-5.3-Flash file (just gate-fixture)"]
@@ -3228,7 +3287,7 @@ fn hw_fixture_glm_budget() {
     let machine = workstation::plan_gate(layers);
     let with_nextn = |budget: Option<u64>, ctx: u64| -> Result<Vec<u64>, String> {
         let levers = PlanLevers {
-            card_budget_bytes: budget,
+            card_budget_bytes: budget.into(),
         };
         inputs
             .plan_nextn(&machine, ctx, &levers, &nextn)
@@ -3237,7 +3296,7 @@ fn hw_fixture_glm_budget() {
     };
     let plain = |budget: Option<u64>, ctx: u64| -> Result<Vec<u64>, String> {
         let levers = PlanLevers {
-            card_budget_bytes: budget,
+            card_budget_bytes: budget.into(),
         };
         inputs
             .plan(&machine, ctx, &levers)
@@ -3245,9 +3304,12 @@ fn hw_fixture_glm_budget() {
             .map_err(|e| e.to_string())
     };
     let ctx = glm::BUDGET_CTX;
-    // Dense f0 and f1, and f5 (a Q6_K down no card kernel runs), hold none on
-    // the card; f2 to f4 are the card-eligible layers.
-    let want = |n: u64| vec![0, 0, n, n, n, 0];
+    // Dense f0 and f1 hold none on the card; f2 to f5 are the card-eligible
+    // layers.
+    // PIN(2026-10-23): f5 joined them: the common card leg's down arm runs its
+    // Q6_K down (`kernels::card_down_runs`). Mutant: that arm without Q6_K —
+    // f5 holds 0 again.
+    let want = |n: u64| vec![0, 0, n, n, n, n];
     assert_eq!(
         with_nextn(None, ctx).unwrap(),
         want(experts),
@@ -5238,8 +5300,8 @@ fn hw_fixture_solar_plan() {
 }
 
 /// Contract 35: the recorded card budget makes the plan of the written file, at the end-to-end
-/// gate's context, hold half of the experts (160 of 320) on every card-eligible layer (f2 and f3,
-/// the Q4_K set) and none on the Q6_K-down layers (f0 and f1: no card kernel runs that stack), as
+/// gate's context, hold half of the experts (160 of 320) on every card-eligible layer (all four:
+/// the Q4_K set f2 and f3, and the Q6_K-down layers f0 and f1, whose down the card leg runs), as
 /// `verify` re-plans it; the budgetless plan holds all of them on the eligible layers. A budget
 /// 64 MiB below and 1 GiB above and an edited record are refused by name ([`budget_round_trip`]).
 #[test]
@@ -5259,7 +5321,7 @@ fn hw_fixture_solar_budget() {
     let ctx = solar::BUDGET_CTX;
     let counts = |budget: Option<u64>| -> Vec<u64> {
         let levers = PlanLevers {
-            card_budget_bytes: budget,
+            card_budget_bytes: budget.into(),
         };
         inputs
             .plan(&machine, ctx, &levers)
@@ -5267,8 +5329,10 @@ fn hw_fixture_solar_budget() {
             .n_l
             .clone()
     };
-    // The Q6_K-down layers (f0, f1) keep every expert on the host: no card kernel runs that stack.
-    let want = |n: u64| vec![0, 0, n, n];
+    // PIN(2026-10-23): the Q6_K-down layers (f0, f1) are card-eligible: the common card leg's
+    // down arm runs a Q6_K down (`kernels::card_down_runs`). Mutant: that arm without Q6_K — f0 and
+    // f1 hold 0 again.
+    let want = |n: u64| vec![n, n, n, n];
     assert_eq!(
         counts(None),
         want(experts),
@@ -5287,4 +5351,429 @@ fn hw_fixture_solar_budget() {
         counts(Some(recorded)),
     );
     assert!(bad.is_empty(), "\n  {}", bad.join("\n  "));
+}
+
+// ------------------------------------------------------------------ Qwen3-30B-A3B
+
+/// A synthetic `qwen3moe` source of eight layers at small widths, one unsplit file: 4 query heads
+/// over 2 KV heads of width 64, 8 experts of width 256 with 2 used. The Q6_K set of `attn_v` and
+/// `ffn_down_exps` is on layers 0, 1, 4 and 7, the Q4_K set on 2, 3, 5 and 6. `edits` replace a
+/// key (or add it). The tensors are zeros: the generator reads the header alone.
+fn q3_source(path: &Path, edits: &[(&str, Value)]) -> Split {
+    use GgmlType::{F32, Q4_K, Q6_K};
+    let mut tensors: Vec<(String, Vec<u64>, GgmlType)> = vec![
+        ("token_embd.weight".into(), vec![256, 64], Q4_K),
+        ("output_norm.weight".into(), vec![256], F32),
+        ("output.weight".into(), vec![256, 64], Q6_K),
+    ];
+    for l in 0..8 {
+        let more = matches!(l, 0 | 1 | 4 | 7);
+        let ty = if more { Q6_K } else { Q4_K };
+        tensors.extend([
+            (format!("blk.{l}.attn_norm.weight"), vec![256], F32),
+            (format!("blk.{l}.attn_q.weight"), vec![256, 256], Q4_K),
+            (format!("blk.{l}.attn_k.weight"), vec![256, 128], Q4_K),
+            (format!("blk.{l}.attn_v.weight"), vec![256, 128], ty),
+            (format!("blk.{l}.attn_q_norm.weight"), vec![64], F32),
+            (format!("blk.{l}.attn_k_norm.weight"), vec![64], F32),
+            (format!("blk.{l}.attn_output.weight"), vec![256, 256], Q4_K),
+            (format!("blk.{l}.ffn_norm.weight"), vec![256], F32),
+            (format!("blk.{l}.ffn_gate_inp.weight"), vec![256, 8], F32),
+            (
+                format!("blk.{l}.ffn_gate_exps.weight"),
+                vec![256, 256, 8],
+                Q4_K,
+            ),
+            (
+                format!("blk.{l}.ffn_up_exps.weight"),
+                vec![256, 256, 8],
+                Q4_K,
+            ),
+            (
+                format!("blk.{l}.ffn_down_exps.weight"),
+                vec![256, 256, 8],
+                ty,
+            ),
+        ]);
+    }
+    let tokens = Value::Array((0..64).map(|i| Value::String(format!("t{i}"))).collect());
+    let mut kvs: Vec<(String, Value)> = vec![
+        (
+            gguf::GENERAL_ARCHITECTURE.to_string(),
+            Value::String("qwen3moe".into()),
+        ),
+        (
+            "general.name".to_string(),
+            Value::String("synthetic".into()),
+        ),
+        ("tokenizer.ggml.tokens".to_string(), tokens),
+        ("qwen3moe.block_count".to_string(), Value::U32(8)),
+        ("qwen3moe.context_length".to_string(), Value::U32(4096)),
+        ("qwen3moe.embedding_length".to_string(), Value::U32(256)),
+        ("qwen3moe.feed_forward_length".to_string(), Value::U32(1024)),
+        ("qwen3moe.attention.head_count".to_string(), Value::U32(4)),
+        (
+            "qwen3moe.attention.head_count_kv".to_string(),
+            Value::U32(2),
+        ),
+        ("qwen3moe.attention.key_length".to_string(), Value::U32(64)),
+        (
+            "qwen3moe.attention.value_length".to_string(),
+            Value::U32(64),
+        ),
+        (
+            "qwen3moe.attention.layer_norm_rms_epsilon".to_string(),
+            Value::F32(1e-6),
+        ),
+        ("qwen3moe.rope.freq_base".to_string(), Value::F32(1e7)),
+        ("qwen3moe.expert_count".to_string(), Value::U32(8)),
+        ("qwen3moe.expert_used_count".to_string(), Value::U32(2)),
+        (
+            "qwen3moe.expert_feed_forward_length".to_string(),
+            Value::U32(256),
+        ),
+    ];
+    for (key, v) in edits {
+        match kvs.iter_mut().find(|(k, _)| k == key) {
+            Some(slot) => slot.1 = v.clone(),
+            None => kvs.push((key.to_string(), v.clone())),
+        }
+    }
+    zero_source(path, &kvs, &tensors)
+}
+
+/// The production family on the synthetic source's layers: the Q4_K set, the Q6_K set, the Q4_K
+/// set and the Q6_K set (source layers 2, 4, 5 and 7), as the real map holds both sets and both
+/// transitions.
+fn q3_spec() -> FixtureSpec {
+    FixtureSpec {
+        layers: vec![2, 4, 5, 7],
+        ..q3::spec()
+    }
+}
+
+/// Contract 36: the synthetic source's fixture is one file with no `split.*` keys, verified against
+/// the source (Q4_K and Q6_K blocks, the F32 constants), read by the engine's reader as four layers
+/// of the source's heads and routed block, each layer of the type set it was mapped from, and the
+/// family's constants land: every norm a gain of 1 (the per-head `attn_q_norm` and `attn_k_norm`
+/// included), the router `ffn_gate_inp` a matrix draw at `1/√256`, and the bytes of a norm are the
+/// constant, read back from the file.
+#[test]
+fn fixture_qwen3moe_round_trip() {
+    let guard = dir("q3-round-trip");
+    let d = &guard.0;
+    let src = q3_source(&d.join("src.gguf"), &[]);
+    let spec = q3_spec();
+    let plan = fixture::plan(&spec, &src, None, &spec.options()).unwrap();
+    for leaf in [
+        "attn_norm.weight",
+        "attn_q_norm.weight",
+        "attn_k_norm.weight",
+        "ffn_norm.weight",
+    ] {
+        match rule_of(&plan, leaf) {
+            Rule::Const { value } if *value == 1.0 => {}
+            other => panic!("{leaf}: {}, want constant 1", other.describe()),
+        }
+    }
+    match rule_of(&plan, "ffn_gate_inp.weight") {
+        Rule::Uniform { half_width, .. } => {
+            let want = (3.0f64.sqrt() / 16.0) as f32;
+            assert!((half_width - want).abs() < 1e-6, "{half_width}");
+        }
+        other => panic!("ffn_gate_inp.weight: {}", other.describe()),
+    }
+    let out = d.join("fx");
+    fixture::generate(&spec, &src, None, &out, &spec.options(), &mut |_| {}).unwrap();
+    let first = out.join("qwen3moe-fixture-00001-of-00001.gguf");
+    let fx = Split::open(&first).unwrap();
+    assert_eq!(fx.shard_count(), 1);
+    let split_keys: Vec<&str> = fx
+        .iter_kv()
+        .map(|(k, _)| k)
+        .filter(|k| k.starts_with("split."))
+        .collect();
+    assert!(split_keys.is_empty(), "{split_keys:?}");
+    fixture::verify(&spec, &fx, &src, None, &mut |_, _| {}).unwrap();
+    let hp = Q3Hparams::read(&fx).unwrap();
+    assert_eq!(
+        (hp.n_layer, hp.n_head, hp.n_head_kv, hp.head_dim, hp.n_vocab),
+        (4, 4, 2, 64, 64)
+    );
+    assert_eq!(
+        (hp.experts.n_expert, hp.experts.n_used, hp.experts.ff),
+        (8, 2, 256)
+    );
+    for (f, want) in [
+        GgmlType::Q4_K,
+        GgmlType::Q6_K,
+        GgmlType::Q4_K,
+        GgmlType::Q6_K,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for stem in ["attn_v.weight", "ffn_down_exps.weight"] {
+            let name = format!("blk.{f}.{stem}");
+            assert_eq!(fx.find(&name).unwrap().1.ty, want, "{name}");
+        }
+    }
+    let (s, info) = fx.find("blk.1.attn_q_norm.weight").unwrap();
+    let at = fx.shard(s).unwrap().data_base() as usize + info.offset as usize;
+    let gains = floats(&fx.shard(s).unwrap().mapping()[at..at + 64 * 4]);
+    assert_eq!(gains, [1.0; 64]);
+}
+
+/// Contract 37: a layer map that loses a (stem, type) pair the source holds is refused by name at
+/// the plan, as the source's layer that holds it (the Q6_K set is layers 0, 1, 4 and 7, the Q4_K
+/// set 2, 3, 5 and 6), beside a control map that plans; a source key no rule covers is refused by
+/// name; and a written fixture read against a source of other heads is refused by the kinds check,
+/// naming the key.
+#[test]
+fn fixture_qwen3moe_refuses_a_map_that_loses_a_pair() {
+    let guard = dir("q3-map");
+    let d = &guard.0;
+    let src = q3_source(&d.join("src.gguf"), &[]);
+    let mut bad = Vec::new();
+    let control = q3_spec();
+    if let Err(e) = fixture::plan(&control, &src, None, &control.options()) {
+        bad.push(format!("the control map: {e}"));
+    }
+    for (what, layers, want) in [
+        (
+            "the Q6_K set dropped",
+            vec![2, 3, 5, 6],
+            vec!["attn_v.weight", "q6_K", "source layer 0"],
+        ),
+        (
+            "the Q4_K set dropped",
+            vec![0, 1, 4, 7],
+            vec!["attn_v.weight", "q4_K", "source layer 2"],
+        ),
+    ] {
+        let s = FixtureSpec {
+            layers,
+            ..q3::spec()
+        };
+        refused_with(
+            &mut bad,
+            "qwen3moe map",
+            what,
+            fixture::plan(&s, &src, None, &s.options()),
+            &want,
+        );
+    }
+    let stray = q3_source(
+        &d.join("stray.gguf"),
+        &[("qwen3moe.nextn_predict_layers", Value::U32(0))],
+    );
+    refused_with(
+        &mut bad,
+        "qwen3moe map",
+        "a key no rule covers",
+        fixture::plan(&control, &stray, None, &control.options()),
+        &["qwen3moe.nextn_predict_layers"],
+    );
+    let plan = fixture::plan(&control, &src, None, &control.options()).unwrap();
+    let fx = Split::open(header_only(&plan.target, &d.join("fx"))).unwrap();
+    if let Err(e) = q3::check_kinds(&control, &fx, &src) {
+        bad.push(format!("the kinds check of the control: {e}"));
+    }
+    let wider = q3_source(
+        &d.join("wider.gguf"),
+        &[
+            ("qwen3moe.attention.head_count", Value::U32(8)),
+            ("qwen3moe.attention.head_count_kv", Value::U32(2)),
+        ],
+    );
+    refused_with(
+        &mut bad,
+        "qwen3moe map",
+        "a fixture of other heads",
+        q3::check_kinds(&control, &fx, &wider),
+        &["attention.head_count"],
+    );
+    assert!(bad.is_empty(), "\n  {}", bad.join("\n  "));
+}
+
+fn q3_real() -> Split {
+    Split::open(q3::DEFAULT_MODEL)
+        .unwrap_or_else(|e| panic!("open the Qwen3-30B-A3B file {}: {e}", q3::DEFAULT_MODEL))
+}
+
+/// Contract 38: the plan of the real header: four layers from source layers 6, 8, 9 and 47 read
+/// back by the engine's reader as 48 → 4 layers of 32 heads over 4, width 128, 128 experts of
+/// width 768 with 8 used, one shard with no `split.*` keys, 51 tensors at 1,940,326,400 bytes
+/// [derived from the header's dims and the block sizes], every tensor its source's at its dims and
+/// type, the layers' `attn_v` and `ffn_down_exps` types [Q4_K, Q6_K, Q4_K, Q6_K], every (stem, type)
+/// pair of the source's layers held, the globals at the real 151,936 rows; then the written
+/// header-only fixture is verified by the kinds check, and the maps that lose a pair are refused.
+#[test]
+#[ignore = "needs the box and the Qwen3-30B-A3B file (just gate-fixture)"]
+fn hw_fixture_qwen3moe_plan() {
+    let src = q3_real();
+    let spec = q3::spec();
+    let p = fixture::plan(&spec, &src, None, &spec.options()).expect("the plan of the real file");
+    let t = &p.target;
+    assert_eq!(
+        unsigned_items(
+            &t.kvs
+                .iter()
+                .find(|(k, _)| k == KEY_SOURCE_LAYERS)
+                .unwrap()
+                .1
+        ),
+        [6, 8, 9, 47]
+    );
+    assert_eq!(t.shards.len(), 1, "one shard");
+    assert!(
+        t.kvs.iter().all(|(k, _)| !k.starts_with("split.")),
+        "no split keys"
+    );
+    assert_eq!(t.tensors.len(), 3 + 4 * 12);
+    let payload: u64 = t.tensors.iter().map(|pt| pt.nbytes).sum();
+    assert_eq!(payload, 1_940_326_400, "tensor payload");
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    for pt in &t.tensors {
+        let info = src
+            .find(&pt.source)
+            .unwrap_or_else(|| panic!("no source tensor {}", pt.source))
+            .1;
+        assert_eq!((pt.ty, &pt.dims), (info.ty, &info.dims), "{}", pt.name);
+        if let Some(f) = pt.layer {
+            let l = q3::LAYER_MAP[f];
+            assert_eq!(
+                pt.name,
+                format!("blk.{f}.{}", leaf_of(&pt.source)),
+                "{}",
+                pt.name
+            );
+            assert!(pt.source.starts_with(&format!("blk.{l}.")), "{}", pt.source);
+            pairs.push((leaf_of(&pt.name).to_string(), pt.ty.to_string()));
+        } else if pt.name == "token_embd.weight" || pt.name == "output.weight" {
+            assert_eq!(pt.dims, [2048, 151_936], "{}", pt.name);
+        }
+    }
+    pairs.sort();
+    pairs.dedup();
+    let held: Vec<(&str, &str)> = pairs
+        .iter()
+        .map(|(a, b)| (a.as_str(), b.as_str()))
+        .collect();
+    let mut want: Vec<(&str, &str)> = vec![
+        ("attn_k.weight", "q4_K"),
+        ("attn_k_norm.weight", "f32"),
+        ("attn_norm.weight", "f32"),
+        ("attn_output.weight", "q4_K"),
+        ("attn_q.weight", "q4_K"),
+        ("attn_q_norm.weight", "f32"),
+        ("attn_v.weight", "q4_K"),
+        ("attn_v.weight", "q6_K"),
+        ("ffn_down_exps.weight", "q4_K"),
+        ("ffn_down_exps.weight", "q6_K"),
+        ("ffn_gate_exps.weight", "q4_K"),
+        ("ffn_gate_inp.weight", "f32"),
+        ("ffn_norm.weight", "f32"),
+        ("ffn_up_exps.weight", "q4_K"),
+    ];
+    want.sort();
+    assert_eq!(
+        held, want,
+        "every (stem, type) pair of the real file's layers"
+    );
+    let guard = dir("q3-plan");
+    let fx = Split::open(header_only(t, &guard.0)).unwrap();
+    let hp = q3::check_kinds(&spec, &fx, &src).unwrap();
+    assert_eq!(
+        (hp.n_layer, hp.n_embd, hp.n_head, hp.n_head_kv, hp.head_dim),
+        (4, 2048, 32, 4, 128)
+    );
+    assert_eq!(
+        (hp.experts.n_expert, hp.experts.n_used, hp.experts.ff),
+        (128, 8, 768)
+    );
+    for (f, want) in [
+        GgmlType::Q4_K,
+        GgmlType::Q6_K,
+        GgmlType::Q4_K,
+        GgmlType::Q6_K,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for stem in ["attn_v.weight", "ffn_down_exps.weight"] {
+            let name = format!("blk.{f}.{stem}");
+            assert_eq!(fx.find(&name).unwrap().1.ty, want, "{name}");
+        }
+    }
+    let total: u64 = t.layouts().unwrap().iter().map(|(_, l)| l.file_len()).sum();
+    println!(
+        "qwen3moe plan: {} layers; {} tensors, payload {payload} B, file {total} B ({:.3} GB), card budget {}",
+        hp.n_layer,
+        t.tensors.len(),
+        total as f64 / 1e9,
+        p.card_budget
+    );
+    let mut bad = Vec::new();
+    for (what, layers, want) in [
+        (
+            "the Q6_K set dropped",
+            vec![6, 7, 9, 10],
+            vec!["attn_v.weight", "q6_K", "source layer 0"],
+        ),
+        (
+            "the Q4_K set dropped",
+            vec![8, 11, 47, 46],
+            vec!["attn_v.weight", "q4_K", "source layer 6"],
+        ),
+    ] {
+        let s = FixtureSpec {
+            layers,
+            ..q3::spec()
+        };
+        refused_with(
+            &mut bad,
+            "qwen3moe refusals",
+            what,
+            fixture::plan(&s, &src, None, &s.options()),
+            &want,
+        );
+    }
+    assert!(bad.is_empty(), "\n  {}", bad.join("\n  "));
+}
+
+/// Contract 38: the fixture written from the real header is verified against it, and a flipped
+/// byte of a Q6_K tensor is refused by name.
+#[test]
+#[ignore = "needs the box and the Qwen3-30B-A3B file (just gate-fixture)"]
+fn hw_fixture_qwen3moe_end_to_end() {
+    let src = q3_real();
+    let spec = q3::spec();
+    let guard = dir("q3-e2e");
+    let out = guard.0.join("fx");
+    let t0 = Instant::now();
+    let stats = fixture::generate(&spec, &src, None, &out, &spec.options(), &mut |_| {}).unwrap();
+    println!(
+        "qwen3moe e2e: generate {stats:?} in {:.1} s",
+        t0.elapsed().as_secs_f64()
+    );
+    let first = out.join("qwen3moe-fixture-00001-of-00001.gguf");
+    let fx = Split::open(&first).unwrap();
+    let (v, _) = fixture::verify(&spec, &fx, &src, None, &mut |_, _| {}).unwrap();
+    println!("qwen3moe e2e: verify {v:?}");
+    assert_eq!(v.tensors, 51);
+    println!(
+        "qwen3moe e2e: file {} B",
+        std::fs::metadata(&first).unwrap().len()
+    );
+    let name = "blk.1.ffn_down_exps.weight";
+    let (s, info) = fx.find(name).unwrap();
+    let at = fx.shard(s).unwrap().data_base() + info.offset;
+    drop(fx);
+    flip(&first, at);
+    let fx = Split::open(&first).unwrap();
+    match fixture::verify(&spec, &fx, &src, None, &mut |_, _| {}) {
+        Err(e) if e.to_string().contains(name) => println!("qwen3moe e2e: a flipped byte: {e}"),
+        other => panic!("a flipped byte of {name}: {other:?}"),
+    }
 }

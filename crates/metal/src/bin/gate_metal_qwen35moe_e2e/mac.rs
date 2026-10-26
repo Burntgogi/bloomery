@@ -70,13 +70,19 @@
 //!   site lists — and `generate` over `Plain` emits the session's own
 //!   host-fed picks (`t_target`'s greedy pattern on that session).
 //!
-//! - `q_short`, `q_state`, `q_chunk`, `q_ref`, `q_free`, `q_fault`: the batched prompt
-//!   pass (`pass.rs`): a prompt of at most a step's window is the step path;
-//!   one pass against the stepped ids leaves layer 0's state and ring within a
-//!   derived band; the pass size moves no bit; the step at the prompt's depth
-//!   against ik's `l_out` and logits, the pass run's distance over the stepped
-//!   run's within a ratio; the greedy tokens teacher-forced through both; an
-//!   id past the vocabulary in a pass raises the token-id site and poisons.
+//! - `q_short`, `q_state`, `q_chunk`, `q_ref`, `q_free`, `q_fault`, `q_layers`,
+//!   `q_mark`, `q_mark_cut`: the batched prompt pass (`pass.rs`): a prompt of at
+//!   most a step's window is the step path; one pass against the stepped ids
+//!   leaves layer 0's state and ring within a derived band; the pass size moves
+//!   no bit; the step at the prompt's depth against ik's `l_out` and logits, the
+//!   pass run's distance over the stepped run's within a ratio; the greedy tokens
+//!   teacher-forced through both; an id past the vocabulary in a pass raises the
+//!   token-id site and poisons; a pass is one command buffer a layer and leaves
+//!   the profiled pass's bits; a pass's copies at rows inside it move none of its
+//!   bits and are its state there, and a prompt cut back to a mark inside its
+//!   pass continues the same every time, within the teacher-forced band.
+//! - `q_tensor`: `q_free` with the pass's GEMMs forced onto the tensor-op
+//!   kernels, on any device that builds them (`pass.rs`).
 //!
 //! - `r_resident`: the session's kernel buffers are held in one residency set
 //!   (`resident.rs`): the set holds every byte the open and the first pass
@@ -100,13 +106,13 @@ use std::process::{Command, ExitCode};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::{Duration, Instant};
 
+use bloomery_device::DeviceError;
 use bloomery_device::conformance::{Clause, Report, Verdict, why};
 use bloomery_device::fault::{Fault, FaultSite};
-use bloomery_device::{Device, DeviceError};
 use bloomery_metal::arch::qwen3moe::count::{LiveKeys, Ticket, token_count};
 use bloomery_metal::arch::qwen3moe::session::{Session, SessionError, StepMode};
 use bloomery_metal::device::MetalDevice;
-use bloomery_metal::library::Library;
+use bloomery_metal::library::{Library, TENSOR_SOURCE};
 
 #[path = "ahead.rs"]
 mod ahead;
@@ -298,16 +304,16 @@ fn spread(mut walls: Vec<Duration>) -> (f64, f64) {
 /// step.
 fn d_count(s: &mut Session, device: &MetalDevice) -> Clause {
     let want = token_count(s.token_layers(), LiveKeys::Within64, Ticket::Folded);
-    let before = device.info().map_err(why)?.free_bytes;
+    let before = device.allocated_bytes().map_err(why)?;
     let host = d_run(s, StepMode::HostFed)?;
     let stats0 = s.stats();
     let chain = d_run(s, StepMode::Chain)?;
     let stats = chain::moved(s, stats0);
-    let after = device.info().map_err(why)?.free_bytes;
+    let after = device.allocated_bytes().map_err(why)?;
     if after != before {
         return Err(format!(
-            "the device's free bytes moved from {before} to {after} across {} steps: a step \
-             allocated",
+            "the device's allocated bytes moved from {before} to {after} across {} steps: a \
+             step allocated",
             2 * s.ctx()
         ));
     }
@@ -431,19 +437,29 @@ fn e_token_id(s: &mut Session) -> Clause {
 }
 
 /// The library the session's kernels come from: the device's, or the
-/// source with a mutant's edits in.
+/// source with a mutant's edits in. A tensor-op mutant leaves it the
+/// device's: its edits are in the program `q_tensor` forces.
 fn library_of(
     device: &MetalDevice,
-    mutant: Option<&mutants::Mutant>,
+    mutant: Option<(&mutants::Mutant, mutants::Program)>,
 ) -> Result<Option<Library>, String> {
     match mutant {
-        None => Ok(None),
-        Some(m) => {
-            let text = mutants::source_of(m)?;
+        Some((m, mutants::Program::Main)) => {
+            let text = mutants::source_of(m, mutants::Program::Main)?;
             Library::from_source_text(device, &text)
                 .map(Some)
                 .map_err(why)
         }
+        _ => Ok(None),
+    }
+}
+
+/// The tensor-op program `q_tensor` forces: the shipped one, or a tensor-op
+/// mutant's.
+fn tensor_text_of(mutant: Option<(&mutants::Mutant, mutants::Program)>) -> Result<String, String> {
+    match mutant {
+        Some((m, mutants::Program::Tensor)) => mutants::source_of(m, mutants::Program::Tensor),
+        _ => Ok(TENSOR_SOURCE.to_string()),
     }
 }
 
@@ -456,7 +472,7 @@ pub fn main() -> ExitCode {
         println!("{GATE}: {name} takes a value");
         return ExitCode::from(64);
     }
-    const NAMES: [&str; 20] = [
+    const NAMES: [&str; 24] = [
         "d_count",
         "e_token_id",
         "b_chain",
@@ -475,7 +491,11 @@ pub fn main() -> ExitCode {
         "q_chunk",
         "q_ref",
         "q_free",
+        "q_tensor",
         "q_fault",
+        "q_layers",
+        "q_mark",
+        "q_mark_cut",
         "r_resident",
     ];
     if args.iter().any(|a| a == "--list") {
@@ -516,10 +536,17 @@ pub fn main() -> ExitCode {
         }
     };
     let library = mutated.as_ref().unwrap_or_else(|| device.library());
-    if let Some(m) = mutant {
+    let tensor_text = match tensor_text_of(mutant) {
+        Ok(text) => text,
+        Err(e) => {
+            println!("{GATE}: the mutant does not build: {e}");
+            return ExitCode::from(64);
+        }
+    };
+    if let Some((m, _)) = mutant {
         println!("mutant: {} ({})", m.name, m.why);
     }
-    let only = mutant.map(|m| m.clause).or(flag(&args, "--only"));
+    let only = mutant.map(|(m, _)| m.clause).or(flag(&args, "--only"));
     if let Some(name) = only
         && !NAMES.contains(&name)
     {
@@ -600,14 +627,18 @@ pub fn main() -> ExitCode {
             "q_chunk" => pass::q_chunk(&device, library, &path),
             "q_ref" => pass::q_ref(&device, library, &path),
             "q_free" => pass::q_free(&device, library, &path),
+            "q_tensor" => pass::q_tensor(&device, library, &tensor_text, &path),
             "q_fault" => pass::q_fault(&device, library, &path),
+            "q_layers" => pass::q_layers(&device, library, &path),
+            "q_mark" => pass::q_mark(&device, library, &path),
+            "q_mark_cut" => pass::q_mark_cut(&device, library, &path),
             "r_resident" => resident::r_resident(&device, library, &path),
             _ => free::a_free(&mut session),
         };
         report.clause(name, result);
     }
     let scope = match (mutant, only) {
-        (Some(m), _) => format!(" (mutant {})", m.name),
+        (Some((m, _)), _) => format!(" (mutant {})", m.name),
         (None, Some(name)) => format!(" (only {name})"),
         (None, None) => String::new(),
     };
@@ -625,7 +656,9 @@ fn mutants_all() -> ExitCode {
         }
     };
     let mut green = Vec::new();
-    for mutant in mutants::MUTANTS {
+    let mut count = 0usize;
+    for (mutant, _) in mutants::all() {
+        count += 1;
         let out = match Command::new(&exe).args(["--mutant", mutant.name]).output() {
             Ok(out) => out,
             Err(e) => {
@@ -647,10 +680,7 @@ fn mutants_all() -> ExitCode {
         }
     }
     if green.is_empty() {
-        println!(
-            "{GATE} --mutants-all: PASS ({} mutants, each red on its clause)",
-            mutants::MUTANTS.len()
-        );
+        println!("{GATE} --mutants-all: PASS ({count} mutants, each red on its clause)");
         return ExitCode::SUCCESS;
     }
     println!("{GATE} --mutants-all: FAIL (not red: {})", green.join(", "));

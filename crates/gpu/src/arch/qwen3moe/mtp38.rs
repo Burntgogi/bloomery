@@ -260,7 +260,7 @@ impl Mtp38 {
     pub fn open(
         gpu: &Gpu,
         target_w: &Weights,
-        (draft_file, parts): (&Split, Option<&crate::model::PartsLoad<'_>>),
+        (draft_file, parts): (&Split, Option<&dyn crate::model::PartsLoad>),
         mtp: &model::arch::qwen35moe::place::MtpInputs,
         plan: &model::arch::qwen35moe::place::MtpPlan<'_>,
         card_dontneed: bool,
@@ -309,7 +309,13 @@ impl Mtp38 {
         )?;
         let rows = file_rows(&plan.draft);
         let mut w = match parts {
-            Some(load) => load(stream, &rows, 0, card_dontneed)?,
+            Some(parts) => {
+                let available = model::placement::workstation::host_available()
+                    .map_err(|e| GpuError::plan(WHAT, e))?;
+                let (need, room) = parts.host_need(&rows, 0, 0, available)?;
+                need.check(available).map_err(|e| GpuError::plan(WHAT, e))?;
+                parts.load(stream, &rows, 0, card_dontneed, room)?
+            }
             None => Weights::load_placed(stream, draft_file, &rows, 0, card_dontneed)?,
         };
         for t in &mtp.tensors {
@@ -807,7 +813,9 @@ pub fn walk_launches(m: usize, q6k_head: bool) -> usize {
 /// walk must have left them final, the last layer's combine applied: the
 /// head's mix applies it over the rows it covers (a step, a verify, a
 /// prompt's last pass or ubatch, a split walk's last unit), and a prompt
-/// call with a tap applies it alone to every other row it walks.
+/// call with a tap applies it alone to every other row it walks. A prompt
+/// call without a tap leaves a ubatch's last row alone final where the
+/// last layer runs without a host leg (`wide38`'s `WideParts::kept`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TargetRows {
     /// The step's one row.
@@ -2443,6 +2451,7 @@ impl Mtp38 {
                 q8f32: gpu.q8f32(),
                 dense: &s.rows,
                 mixed: &mut s.mixed,
+                out: None,
             },
         )?;
         site::resident_quantize(

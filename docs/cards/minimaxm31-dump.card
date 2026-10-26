@@ -1,0 +1,29 @@
+# The MiniMax-M3.1-Flash oracle's CPU dumps (tools/ref/mm31/dump_tf.py through tools/ref/mm31-dump.sh, `just dump-ref-minimaxm31`):
+# transformers' f32 forward over the vendor's 48-shard safetensors folder (/models/MiniMax-M3.1-Flash), one decoder layer
+# resident at a time, the MXFP8 and NVFP4 matrices dequantized on the fly. Two jobs, each under this card and its own bound
+# (prefill, then greedy); the six sets are installed when the second ends.
+# Predicted wall [derived from the dumper's loops and the weights' shapes; the rates are the one term derivation does not fix]:
+#   weights    4.2 GB a layer (128 NVFP4 experts at 0.5 B plus their scales, the MXFP8 attention, indexer and shared expert), read
+#              once for all prompts in the layer-major prefill, the next layer's span read ahead (posix_fadvise); 60 layers,
+#              ~250 GB from /models (nvme0) at 3-5 GB/s: 50-85 s of reading, under the compute
+#   dequant    ~430 G values over the prefill (413 G of them the experts', every layer's 128 stacks once): at 1.3-5 G values/s
+#              on the 32 Zen 3 cores (8 threads of a loaded Mac measure 1.3 G/s over a whole expert fill, read and scale
+#              checks included, and 2.2-3.4 G/s over the bare matrix; the box is the one unmeasured term): 86-330 s
+#   gemm       6,868 token-forwards (4,308 ids and e's 2,560 again under the per-head rule) x 2 x ~25.7 G MACs
+#              = ~353 TFLOP at 1.0-1.5 TFLOP/s sgemm (the Mac measures 1.12): 235-353 s
+#   other      f32 eager attention over 2,560 positions, the indexer's per-head scores, the taps' rows (a 6144-wide row per
+#              node and layer, ~6 GB written), the vendor's expert loop: the term under the 2x margin below
+#   prefill    dequant and gemm run on the same cores, so the wall is their sum plus the rest: 5.5-12 min derived, 8-20 min held
+#   greedy     64 steps over a, b, c in one token-major pass: a step reads and dequantizes the experts its 3 tokens hit
+#              (<= 12 of 128 a layer: ~38.8 G values, ~22 GB read over 57 layers), 8-30 s a step at 1.3-5 G values/s: 8-32 min,
+#              with the reads and the cached layers' f32 matvecs (~43 GB a step at DRAM speed, 0.4 s): 9-35 min. A step is
+#              saved, so a job cut at its 1800 s bound continues with MM31_RESUME=1 (a second sitting of the same card)
+#   total      15-55 min over two or three jobs, each bound 1800 s.
+# What the run guarantees: CUDA hidden, the CPU lease held through the dumper's life, the staged directory installed only
+# when all six manifests carry their `# complete` trailer, and the dequantization checked bit for bit against
+# compressed-tensors and Fp8Dequantize before the first layer.
+kind: exclusive
+reason: dump_tf.py runs a torch f32 forward on every CPU core over a ~250 GB folder read through the page cache; beside a
+  timed run or a gate batch it would take their cores and evict their page cache, so it holds the lease; why now: the
+  MiniMax-M3.1-Flash oracle sets without llama.cpp, which the M3.1 attach rounds' gates read
+minutes: 8..30

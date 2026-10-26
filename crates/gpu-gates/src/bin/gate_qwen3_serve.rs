@@ -188,10 +188,11 @@
 //!   total, and the second sequence does not fit past the first (the auto
 //!   default spent the card's free bytes on the one-sequence cache): the
 //!   server never listens, which the clause names as the split's check red;
-//!   a placed load kept on the turns leaves the placed arm's (v2) and (v3)
-//!   red and its round clause's `placed_slots_rounds_hold_a_round_of_both`
-//!   red, no `placed slots` line, and `ctx_default`'s placed arm's
-//!   `placed_slots_are_resident` and `placed_ctx_is_the_plans_ctx_max` red.
+//!   a placed load kept on the turns leaves the placed arm's (v2)
+//!   `placed_slots_rounds_carry_both_slots` at ~1.0 and
+//!   `placed_slots_rounds_run_one_pass` red (`passes=rows`). The hold
+//!   clause still sees a record of `rows=2`, and `placed_slots_are_resident`
+//!   and `placed_ctx_is_the_plans_ctx_max` do not move.
 //! - `slots_set_total_is_its_whole_fit`, the whole slots arm: its one
 //!   whole-fit line is at the arm's set total `t` and says the load fits. The
 //!   line's need less its cache term is the rest no context moves, and the
@@ -204,20 +205,20 @@
 //!   puts its line at half the total.
 //! - `slots_rounds_run_one_pass`, on both arms (a qwen3moe file's `Body`, a
 //!   qwen35moe file's `Body35`), and the seat's `parallel` line names the
-//!   shape the open decided. The no-flag arm is one pass when it prints no
-//!   plan (`slots_parallel_line_names_one_pass`: the whole model) and turns
-//!   when it prints one (`slots_parallel_line_names_turns`: the whole load
-//!   does not fit, so `qwen3::pass_of` names the fallback loop). The placed
-//!   arm (`placed_slots_parallel_line_names_turns`) is that loop. FAIL-first:
-//!   the word printed flipped, red on the arm and on the one-slot arm's
-//!   `one_slot_parallel_line_names_one_pass`. A server
+//!   shape the open decided. Both arms are one pass
+//!   (`slots_parallel_line_names_one_pass`,
+//!   `placed_slots_parallel_line_names_one_pass`): a placed load serves
+//!   several slots' rows as one pass (`Body3::serves_one_pass`), and a
+//!   printed plan does not name turns. The lookup draft stays turns in
+//!   `pass_of` and is not this clause. FAIL-first: the word `turns`, red
+//!   on that arm. A server
 //!   of `--parallel 2` under `BLOOMERY_STEP_STATS=1` prints a `slots round`
 //!   record a round of several slots — two greedy streamed requests of the
 //!   slots clause's prompts, each first run alone on that server and then
 //!   both together — and over the together run every record holds the
 //!   shape the line named: `passes=1` over `rows` of 2..=`MAX_TOKENS` on
-//!   `slots=2` when the arm printed no plan (`slots_rounds_run_one_pass`),
-//!   and `passes=rows` when it printed one (`slots_rounds_run_in_turn`);
+//!   `slots=2` (`slots_rounds_run_one_pass`, and
+//!   `placed_slots_rounds_run_one_pass` on the placed arm);
 //!   the window holds a round of both
 //!   (`slots_rounds_hold_a_round_of_both`: at least one record of `rows=2`)
 //!   — the one thing the records can see of both advancing in the same
@@ -231,10 +232,9 @@
 //!   records and the two prompt-call bookings) prints beside it,
 //!   unpinned: a round server's solo rounds are the two requests'
 //!   admission skew and its mirror at the tail, a race the worker counts
-//!   in passes, which no code bounds. No pass-count condition on the
-//!   clause (the placed arm steps
-//!   in turn inside a round, `passes=rows`, by design, and the whole
-//!   arm's one pass is the clause above's own pin); and the rows the
+//!   in passes, which no code bounds. The hold clause is not a pass-count
+//!   pin (a turns mutant still prints a record of `rows=2`; the pass count
+//!   is `slots_rounds_run_one_pass`); and the rows the
 //!   records carry plus
 //!   the solo rounds between them (a round of one row is a select and a
 //!   `next`, no record; their count the `/metrics` `n_decode_total` deltas
@@ -245,12 +245,12 @@
 //!   (`slots_rounds_rows_sum_the_decoded_tokens`). The same clause on the
 //!   placed arm (`slots-rounds-placed`,
 //!   `--place a` under the slots clause's budget, the lever on too) holds
-//!   `passes=rows`, the default loop (`placed_slots_rounds_run_in_turn`),
+//!   `passes=1` (`placed_slots_rounds_run_one_pass`),
 //!   and its window holds a round of both
 //!   (`placed_slots_rounds_hold_a_round_of_both`).
-//!   FAIL-first: a load that prints no plan and `passes=rows` is red on
-//!   `slots_rounds_run_one_pass`; a load that prints a plan and `passes=1`
-//!   is red on `slots_rounds_run_in_turn`. A seat that serves one slot at a
+//!   FAIL-first: a together record of `passes=rows`, or the word `turns`,
+//!   is red on `slots_rounds_run_one_pass` or
+//!   `placed_slots_rounds_run_one_pass`. A seat that serves one slot at a
 //!   time prints no record of both and the hold clause is red on both arms,
 //!   while a server that only stretches one-slot runs between two-row rounds
 //!   is the (v2) busy ratio's red, not the records'.
@@ -442,13 +442,14 @@
 //! - `records_name_the_files_architecture`, every file: the `load` and the `listening` record
 //!   name the header's architecture word. FAIL-first: a seat that prints `qwen35moe` for the
 //!   dense file leaves both records red.
-//! - `tool_call_is_parsed`, a `Body35` file: `/v1/chat/completions` of [`TOOL_ASK`] with one
-//!   function listed, at temperature 0 and thinking off, answers 200 with `finish_reason`
-//!   `tool_calls` and one call of the listed function whose `arguments` is a JSON object with a
-//!   non-empty string `city`: the markup the file's template teaches (`<tool_call><function=…>`)
-//!   is the format the reader binds (`qwen35moe::spec`) and the server parses. FAIL-first: a
-//!   server that parses no tool markup for the template refuses the request or answers the markup
-//!   as text.
+//! - `tool_call_is_parsed`, a `Body35` file: a server over a scripted engine (no model behind it)
+//!   whose every reply is the file's template's XML call (`<tool_call><function=…>`), asked one tool
+//!   turn with the file's own chat template, answers 200 with `finish_reason` `tool_calls` and one
+//!   call of the listed function with the arguments the script gave
+//!   (`serve_client::scripted_call`, which `gate_llama_serve` runs too): the markup the template
+//!   teaches is the format the reader binds (`qwen35moe::spec`) and the server parses, and the
+//!   clause reads nothing the model chose to reply. FAIL-first: a scanner that drops a call's
+//!   parameters answers `{}` and the clause is red.
 //! - `dense_below_its_floor_is_refused_by_name`, the dense file: `--plan` on `--place a` under
 //!   [`PLACED_BUDGET`] exits non-zero with the context ladder's refusal (the least the default
 //!   tries takes more bytes than the budget's, `ask fewer slots or a smaller model file`) and
@@ -489,6 +490,15 @@
 //! `bloomery_placement::placement::ctx_ask`'s tests; a set share past the
 //! file's limit, by `bloomery_placement::placement::ctx`'s.
 //!
+//! - `mtp_ids_match_the_plain_path`: on a file whose header carries the in-file
+//!   next-token layer, greedy output under `BLOOMERY_DRAFT=mtp` equals the same
+//!   prompt under `BLOOMERY_DRAFT=off` for [`MTP_N`] tokens, and the drafted
+//!   completion's `draft_n_accepted` is above 0. A file without the layer prints
+//!   that the clause is pinned to [`MTP_FILE`] and starts no second server. The
+//!   pinned file with no layer is red. FAIL-first: dropping the id compare leaves
+//!   a draft that changes tokens green; treating accepted as `>= 0` leaves a
+//!   server that proposes nothing green.
+//!
 //! The server is stopped by the handle this binary spawned it with before
 //! the CLI loads. Logs per file in `<dir>/<n>/` (`server.err`, `gen.log`,
 //! the responses).
@@ -521,7 +531,7 @@ mod gate {
 
     use bloomery_gpu::arch::qwen3moe::router::MAX_TOKENS;
     use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_size;
-    use bloomery_gpu::arch::qwen3moe::{KvQ8, Qwen35moeModel, checkpoint_budget35};
+    use bloomery_gpu::arch::qwen3moe::{Body35, KvQ8, Open35, Qwen35moeModel, checkpoint_budget35};
     use bloomery_gpu::linear::{KHeadMap, LinearShape};
     use bloomery_gpu_gates::beside;
     use bloomery_gpu_gates::ctx_ladder::{
@@ -531,14 +541,16 @@ mod gate {
     use bloomery_gpu_gates::qwen_seat::{self, decode_mma};
     use bloomery_gpu_gates::record::{self, Fields};
     use bloomery_gpu_gates::serve_client::{
-        self, Answer, PrefixTurns, Served, agree, answered, chat_is_those_ids, check, curl,
-        edit_and_extension, greedy_chat, ids_of, json_of, metric, parse_ids, rendered, serve_cmd,
-        server_log, tokenized,
+        self, Answer, PrefixTurns, Served, WholeTerms, agree, answered, chat_is_those_ids, check,
+        curl, edit_and_extension, greedy_chat, ids_of, json_of, metric, rendered, scripted_call,
+        serve_cmd, server_log, tokenized, whole_terms,
     };
+    use bloomery_gpu_gates::ubatch_pick;
     use bloomery_gpu_gates::vision_seat::{self, EncoderSeat};
     use bloomery_gpu_gates::{GateError, checks_failed};
     use gguf::{Gguf, Split};
-    use model::arch::qwen35moe::hparams::{Hparams, Kind};
+    use model::arch::models::Mixer;
+    use model::arch::qwen35moe::mtp::{InFile, in_file};
     use model::placement::WholeLoad;
     use model::placement::workstation::{A6000, DeviceInfo, GRANULE, RTX_3090};
     use refset::arch::qwen35moe::vis::{self, CHATIDS, DECODE};
@@ -546,6 +558,7 @@ mod gate {
     use refset::family::Family;
     use serde_json::{Value, json};
     use threads::helper::{Placement, spawn_helper};
+    use tokenizer::Tokenizer;
     use vision::arch::card::CardBytes;
     use vision::arch::qwen3vl::{self, TokenLimits};
 
@@ -564,6 +577,14 @@ mod gate {
 
     /// The raw prompt every file continues.
     const PROSE: &str = "The lighthouse keeper counted the steps as he climbed: one hundred and twelve, the same as every night, until the hundred and thirteenth";
+
+    /// How many greedy tokens the drafted and undrafted runs are compared over.
+    /// A comparison length, not a measured result.
+    const MTP_N: usize = 16;
+
+    /// The file `gate_qwen35moe_mtp` loads: the one whose header carries the
+    /// next-token layer. Fixture files do not, and the clause is pinned here.
+    const MTP_FILE: &str = "/models/qwen36-hf/unsloth-mtp/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf";
 
     /// The edit clause's turn, and the same turn with its user message
     /// changed: the resend diverges inside the rows the first run's prompt
@@ -623,14 +644,11 @@ mod gate {
     /// behind are a whole fresh run's.
     const GEMM_FROM: usize = app::arch::qwen3moe::GEMM_FROM;
 
-    /// The seat's family of `model`, from the architecture its header names;
+    /// The seat's family of `model`, from the program its header's description names;
     /// a file the Qwen seat takes none of is a named error.
     fn seat_of(model: &Path) -> Result<qwen_seat::Family, GateError> {
         let split = Split::open(model).map_err(|e| format!("open {}: {e}", model.display()))?;
-        let arch = split.architecture().unwrap_or("<missing>");
-        qwen_seat::Family::from_name(arch).ok_or_else(|| {
-            format!("{}: the Qwen seat takes no {arch:?} file", model.display()).into()
-        })
+        qwen_seat::Family::of(&split).map_err(|e| format!("{}: {e}", model.display()).into())
     }
 
     /// Whether the family's body is `Body35`: GDN layers beside gated
@@ -1344,8 +1362,14 @@ mod gate {
     /// tensor-core pass, the eight-head layout's (`decode_mma`), is the one that
     /// reads a q8_0 K cache; the scalar pair pass of a group of six has none.
     fn flash_has_q8(split: &Split) -> Result<bool, GateError> {
-        let hp = Hparams::read(split).map_err(|e| format!("{e}"))?;
-        decode_mma(hp.head_dim, hp.n_head / hp.n_head_kv)
+        let spec = model::arch::spec(split)?.spec;
+        let head = spec
+            .gqa()
+            .ok_or("the description holds no attention layer to choose the decode flash by")?;
+        decode_mma(
+            head.head_dim as usize,
+            (head.heads / head.kv_heads) as usize,
+        )
     }
 
     /// `q8_cache_is_refused_on_the_scalar_pair_flash` (module header), on a
@@ -1404,52 +1428,6 @@ mod gate {
         Ok(())
     }
 
-    /// The terms of one whole-fit line (`whole fit at ctx …: the whole load
-    /// on …`): its `need`, its `cache` term (the planes' bytes), that need
-    /// less the cache (the terms no context moves at or past the floor),
-    /// what the card had, the census reading inside its parentheses, and
-    /// whether it says the load fits. A line without its terms is a named
-    /// error.
-    struct WholeTerms<'a> {
-        need: u64,
-        cache: u64,
-        rest: u64,
-        budget: u64,
-        census: &'a str,
-        fits: bool,
-    }
-
-    /// The terms of `line`, the whole-fit verdict's own words.
-    fn whole_terms(line: &str) -> Result<WholeTerms<'_>, GateError> {
-        let term = |after: &str| -> Result<u64, GateError> {
-            line.split(after)
-                .nth(1)
-                .and_then(|t| t.split(" B").next())
-                .and_then(|t| t.parse().ok())
-                .ok_or_else(|| format!("the whole-fit line names no `{after}… B`: {line}").into())
-        };
-        let (need, cache) = (term(": need ")?, term(" + cache ")?);
-        let (had, census) = line
-            .split_once(" B the card had (")
-            .ok_or_else(|| format!("the whole-fit line names no bytes the card had: {line}"))?;
-        let budget: u64 = had
-            .rsplit(", of ")
-            .next()
-            .and_then(|t| t.parse().ok())
-            .ok_or_else(|| format!("the whole-fit line names no bytes the card had: {line}"))?;
-        let rest = need
-            .checked_sub(cache)
-            .ok_or_else(|| format!("the whole-fit line's cache passes its need: {line}"))?;
-        Ok(WholeTerms {
-            need,
-            cache,
-            rest,
-            budget,
-            census: census.trim_end_matches(')'),
-            fits: line.contains(": fits: "),
-        })
-    }
-
     /// `ctx_default_is_the_highest_rung_held`, on the default arm's server
     /// (no `--ctx`, `--parallel 1`, its stderr `log`, its default `n`): the
     /// default is the first rung of the halving ladder from the target
@@ -1489,7 +1467,7 @@ mod gate {
         } = whole_terms(line)?;
         // The whole load's need at `ctx` positions, the line's other terms kept.
         let need_at = |ctx: u64| -> Result<u64, GateError> {
-            let planes = cache_planes(model, split, ctx)?;
+            let planes = cache_planes(model, split, ctx, default_lanes(split))?;
             rest.checked_add(model::placement::allocator_bytes(GRANULE, planes))
                 .ok_or_else(|| format!("the whole load's need at {ctx} passes u64 bytes").into())
         };
@@ -1541,10 +1519,21 @@ mod gate {
             .lines()
             .find(|l| l.starts_with(&head))
             .ok_or_else(|| format!("the default arm's seat printed no whole-fit line at {n}"))?;
-        let held = match qwen_seat::Family::from_name(arch) {
+        let held = match qwen_seat::Family::of(split).ok() {
             Some(seat) if body35(seat) => {
-                // The open the serve seat makes, from its one owner.
-                let o = q3place::serve_open35(split, usize::try_from(n)?, KvQ8::F16, false)?;
+                // The open the serve seat makes, from its one owner; a file with no routed expert
+                // settles its ubatch in the verdict, which the seat's `ubatch` line at `n` names.
+                let at = usize::try_from(n)?;
+                let o = q3place::serve_open35(split, at, KvQ8::F16, false)?;
+                let o = match ubatch_pick::choices(log)
+                    .iter()
+                    .rev()
+                    .find(|c| c.ctx == at)
+                    .and_then(|c| c.pick)
+                {
+                    Some(ubatch) => Open35 { ubatch, ..o },
+                    None => o,
+                };
                 let WholeLoad::Checked { arena, reserve } = Qwen35moeModel::whole_load(split, o)?
                 else {
                     return Err(format!("a {arch} whole load carries no arena term").into());
@@ -1594,7 +1583,7 @@ mod gate {
         ok: &mut bool,
     ) -> Result<(), GateError> {
         let split = Split::open(model).map_err(|e| format!("open {}: {e}", model.display()))?;
-        let planes = cache_planes(model, &split, GRANULE_CTX as u64)?;
+        let planes = cache_planes(model, &split, GRANULE_CTX as u64, default_lanes(&split))?;
         let expected = model::placement::allocator_bytes(GRANULE, planes.iter().copied());
         let raw: u64 = planes.iter().sum();
         let d = dir.join("ctx-granule");
@@ -1648,15 +1637,33 @@ mod gate {
         Ok(())
     }
 
+    /// The lanes a delta store of the seat's default load holds on `split`: a
+    /// file that carries a usable next-token layer serves the MTP draft with
+    /// the draft unset (one slot, the whole load, no media), and that load
+    /// verifies on [`Body35::VERIFY_LANES`] lanes; any other file one lane.
+    fn default_lanes(split: &Split) -> usize {
+        if matches!(in_file(split), Ok(InFile::Draft(_))) {
+            Body35::VERIFY_LANES
+        } else {
+            1
+        }
+    }
+
     /// The cache planes the body allocates for one sequence of `ctx` rows of
     /// `model`'s file (`split`), in its allocation order — the order the
     /// allocator's shared granules are counted in: f16's `k` and `v` a
     /// plain-attention layer, a qwen35moe file's recurrent layers' `state`
-    /// and `ring` (`LinearShape`'s lengths, one lane as `Body35` allocates
-    /// them), which no context moves. A qwen35moe file's layers are the
-    /// reader's trunk (`Hparams::kinds`): a next-token layer past the trunk
-    /// holds no sequence plane.
-    fn cache_planes(model: &Path, split: &Split, ctx: u64) -> Result<Vec<u64>, GateError> {
+    /// and `ring` (`LinearShape`'s lengths), which no context moves: the
+    /// state `lanes` times, and a load of more than one lane a word a lane
+    /// past the ring (`RecStore`'s stamps), as `Body35` allocates them. A
+    /// qwen35moe file's layers are the description's trunk: a next-token
+    /// layer past the trunk holds no sequence plane.
+    fn cache_planes(
+        model: &Path,
+        split: &Split,
+        ctx: u64,
+        lanes: usize,
+    ) -> Result<Vec<u64>, GateError> {
         let num = |key: &str| -> Result<u64, GateError> {
             split
                 .arch_get_u64(key)
@@ -1686,17 +1693,29 @@ mod gate {
                     // file's delta layers are the tiled ones.
                     map: KHeadMap::Tiled,
                 };
-                let trunk =
-                    Hparams::read(split).map_err(|e| format!("{}: {e}", model.display()))?;
-                for kind in &trunk.kinds {
-                    match kind {
-                        Kind::DeltaRule => {
-                            planes.push(4 * shape.state_len() as u64);
+                let trunk = model::arch::spec(split)
+                    .map_err(|e| format!("{}: {e}", model.display()))?
+                    .spec;
+                for (l, layer) in trunk.layers.iter().enumerate() {
+                    match &layer.mixer {
+                        Mixer::DeltaRule(_) => {
+                            planes.push(4 * lanes as u64 * shape.state_len() as u64);
                             planes.push(4 * shape.ring_len() as u64);
+                            if lanes > 1 {
+                                planes.push(4 * lanes as u64);
+                            }
                         }
-                        Kind::Attention => {
+                        Mixer::Gqa(_) => {
                             planes.push(plane);
                             planes.push(plane);
+                        }
+                        other => {
+                            return Err(format!(
+                                "{}: layer {l} mixes with {}, which holds no planes listed here",
+                                model.display(),
+                                other.what()
+                            )
+                            .into());
                         }
                     }
                 }
@@ -1894,72 +1913,21 @@ mod gate {
         Ok(())
     }
 
-    /// The turn the tool-call clause asks.
-    const TOOL_ASK: &str = "What is the weather in Seoul right now? Use the tool.";
-
-    /// The tokens the tool-call clause allows: a call is a few dozen.
-    const TOOL_TOKENS: usize = 256;
-
-    /// `tool_call_is_parsed` (module header), on the default server of a
-    /// `Body35` file: `/v1/chat/completions` of [`TOOL_ASK`] with one function
-    /// listed, at temperature 0 and thinking off, answers 200 with
-    /// `finish_reason` `tool_calls` and one call of the listed function whose
-    /// `arguments` is a JSON object with a non-empty string `city`. The markup
-    /// is the file's template's (`<tool_call><function=…>`), the format the
-    /// reader binds and the server parses. FAIL-first: a server that parses
-    /// no tool markup for this template refuses the request or answers the
-    /// markup as text, and the clause is red.
-    fn tool_call_is_parsed(
-        url: &dyn Fn(&str) -> String,
-        dir: &Path,
-        ok: &mut bool,
-    ) -> Result<(), GateError> {
-        let body = json!({
-            "messages": [{ "role": "user", "content": TOOL_ASK }],
-            "tools": [{ "type": "function", "function": {
-                "name": "get_weather",
-                "description": "The current weather of a city.",
-                "parameters": {
-                    "type": "object",
-                    "properties": { "city": { "type": "string", "description": "the city's name" } },
-                    "required": ["city"],
-                },
-            } }],
-            "max_tokens": TOOL_TOKENS,
-            "temperature": 0,
-            "stream": false,
-            "chat_template_kwargs": { "enable_thinking": false },
-        });
-        let (st, text) = curl(&url("/v1/chat/completions"), Some(&body), false)?;
-        std::fs::write(dir.join("tools.json"), &text)?;
-        let answer: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
-        let choice = &answer["choices"][0];
-        let calls = choice["message"]["tool_calls"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
-        let function = calls.first().map(|c| &c["function"]);
-        let name = function.and_then(|f| f["name"].as_str());
-        let arguments: Option<Value> = function
-            .and_then(|f| f["arguments"].as_str())
-            .and_then(|a| serde_json::from_str(a).ok());
-        let city = arguments.as_ref().and_then(|a| a["city"].as_str());
-        println!(
-            "tool call: HTTP {st}, finish {:?}, {} call(s), function {name:?}, city {city:?}; \
-             content {:?}",
-            choice["finish_reason"],
-            calls.len(),
-            choice["message"]["content"]
-        );
-        check(
-            ok,
-            "tool_call_is_parsed",
-            st == 200
-                && choice["finish_reason"] == "tool_calls"
-                && calls.len() == 1
-                && name == Some("get_weather")
-                && city.is_some_and(|c| !c.trim().is_empty()),
-        );
+    /// `tool_call_is_parsed` (module header), on a `Body35` file's chat template: a server over a
+    /// scripted engine whose every reply is the template's XML call, asked one tool turn at
+    /// temperature 0 and thinking off, answers 200 with `finish_reason` `tool_calls` and one call of
+    /// the listed function with the arguments the script gave (`serve_client::scripted_call`). The
+    /// markup is the file's template's (`<tool_call><function=…>`), the format the reader binds and the
+    /// server parses; the clause reads nothing the model chose to reply. FAIL-first: a scanner that
+    /// drops a call's parameters answers `{}` and the clause is red.
+    fn tool_call_is_parsed(split: &Split, dir: &Path, ok: &mut bool) -> Result<(), GateError> {
+        let template = model::arch::spec(split)
+            .map_err(|e| format!("the header: {e}"))?
+            .spec
+            .chat
+            .template
+            .ok_or("the file carries no chat template")?;
+        check(ok, "tool_call_is_parsed", scripted_call(&template, dir)?);
         Ok(())
     }
 
@@ -2373,8 +2341,8 @@ mod gate {
         // the total, as the allocator rounds them.
         let need2 = |x: u64| -> Result<u64, GateError> {
             let rows = x / 2;
-            let mut planes = cache_planes(model, &split, rows)?;
-            planes.extend(cache_planes(model, &split, rows)?);
+            let mut planes = cache_planes(model, &split, rows, 1)?;
+            planes.extend(cache_planes(model, &split, rows, 1)?);
             rest.checked_add(model::placement::allocator_bytes(GRANULE, planes))
                 .ok_or_else(|| {
                     format!("the two-slot whole load's need at {x} passes u64 bytes").into()
@@ -2397,11 +2365,10 @@ mod gate {
     /// started with `BLOOMERY_STEP_STATS=1` and the arm's flags and
     /// environment into its own directory: two greedy streamed requests of
     /// the slots clause's prompts, each first run alone on that server and
-    /// then both together, the `slots round` records between read back. The
-    /// no-flag arm follows the load it printed: no plan, and every
-    /// together-run record holds `passes=1` (`slots_rounds_run_one_pass`);
-    /// a plan, and every record holds `passes=rows`
-    /// (`slots_rounds_run_in_turn`). On both arms the window holds a round
+    /// then both together, the `slots round` records between read back.
+    /// Both arms are one pass: every together-run record holds `passes=1`
+    /// (`slots_rounds_run_one_pass`, `placed_slots_rounds_run_one_pass` on
+    /// the placed arm). On both arms the window holds a round
     /// of both ([`rounds_hold_a_round_of_both`]: at least one record of
     /// `rows=2` — the records carry no round of one stepping slot, so the
     /// records cannot see one-slot stretches, and the window's solo count
@@ -2409,9 +2376,8 @@ mod gate {
     /// and the rows the records carry, with
     /// the solo rounds the `/metrics` decode deltas count, sum to the
     /// tokens the two requests decoded beyond their prompts' first
-    /// (`slots_rounds_rows_sum_the_decoded_tokens`); on the placed arm
-    /// every record holds `passes=rows`, the default loop
-    /// (`placed_slots_rounds_run_in_turn`).
+    /// (`slots_rounds_rows_sum_the_decoded_tokens`). A printed plan names
+    /// the split and does not choose turns.
     /// `BLOOMERY_STEP_STATS=1` moves no computation on this server — the seat
     /// and the fallback loop branch on it only to print the record — so the
     /// together-equals-alone bits of these runs stand for the default server.
@@ -2438,7 +2404,7 @@ mod gate {
             "placed_",
             &["--place", "a"],
             &[("BLOOMERY_CARD_BUDGET", PLACED_BUDGET)],
-            false,
+            true,
         );
         let mut arms = vec![whole];
         if routed(seat) {
@@ -2474,26 +2440,20 @@ mod gate {
             let addr = s.address(&err_log, 600, Duration::from_secs(1))?;
             let url = |p: &str| format!("http://{addr}{p}");
             // The shape the seat's open decided, by the line it printed before its load: one pass
-            // of the busy rows on the whole-card load, a select and a step a slot beside the host
-            // tier (`qwen3::pass_of`); the rounds below hold the records to the same shape.
+            // of the busy rows (`qwen3::pass_of`, `Body3::serves_one_pass`), whole-card and
+            // placed. The rounds below hold the records to that shape. A printed plan is still
+            // read: it names the split and does not choose turns.
             let log = std::fs::read_to_string(&err_log)?;
-            // PIN(2026-10-22): the no-flag arm is one pass only while it
-            // prints no plan (the whole model). A plan is the placed load —
-            // the whole load does not fit at this total, the same fact
-            // `unplaced_default_names_itself` holds — and `pass_of` names
-            // turns. The word and the records follow that line.
-            // FAIL-first: a load with no plan whose records hold `passes=rows`,
-            // or a load with a plan whose records hold `passes=1`.
-            let one_pass = if one_pass {
-                let plan = routed_split(&seat_records(&log, &err_log))?;
-                println!(
-                    "{dir_name}: plan (host, card, ctx) {plan:?}; a round is {}",
-                    if plan.is_none() { "one pass" } else { "turns" }
-                );
-                plan.is_none()
-            } else {
-                one_pass
-            };
+            // PIN(2026-10-22): a placed load of `Body` or `Body35` serves
+            // several slots' rows as one pass. A printed plan is that load
+            // and names `one`, the same as a whole-card load. Lookup stays
+            // turns in `pass_of` and is not an arm here.
+            // FAIL-first: the word `turns`, or a together record of `passes=rows`.
+            let plan = routed_split(&seat_records(&log, &err_log))?;
+            println!(
+                "{dir_name}: plan (host, card, ctx) {plan:?}; a round is {}",
+                if one_pass { "one pass" } else { "turns" }
+            );
             let parallel = log.lines().find(|l| l.starts_with("parallel rule="));
             println!("{dir_name}: {parallel:?}");
             check(
@@ -2611,10 +2571,9 @@ mod gate {
     /// ≥ 1.5, pulled to ~1.0 by one busy a round). The solo count is
     /// printed, not pinned: on a round server it is the two requests'
     /// admission skew and its mirror at the tail (equal `n_predict`), a
-    /// race the worker counts in passes, which no code bounds. No
-    /// pass-count condition either: the placed arm steps in turn inside a
-    /// round (`passes=rows`) by design, and the whole-card arm's one pass
-    /// is `slots_rounds_run_one_pass`'s own pin.
+    /// race the worker counts in passes, which no code bounds. The hold
+    /// is not a pass-count pin: a turns mutant still prints a record of
+    /// `rows=2`. The pass count is `slots_rounds_run_one_pass`.
     // PIN(2026-10-06): the criterion reads the engine's own `slots round`
     // records, not the SSE arrival timestamps it read before — a client-side
     // clock on a shared box clumps one stream's events under load (the same
@@ -2792,9 +2751,9 @@ mod gate {
         // at the slot ctx held, one slot's planes at no position reserved
         // (named only where not 0), the count its KV term plus that reserve.
         let split = Split::open(model).map_err(|e| format!("open {}: {e}", model.display()))?;
-        let fixed: u64 = cache_planes(model, &split, 0)?.iter().sum();
+        let fixed: u64 = cache_planes(model, &split, 0, 1)?.iter().sum();
         let both = match slot {
-            Some(s) => Some(2 * cache_planes(model, &split, s)?.iter().sum::<u64>()),
+            Some(s) => Some(2 * cache_planes(model, &split, s, 1)?.iter().sum::<u64>()),
             None => None,
         };
         let (kv, reserve) = (num("(its KV term "), num(" reserve "));
@@ -2853,12 +2812,18 @@ mod gate {
             println!("{arm}: checkpoints lines {lines:?}");
             held &= match &spec {
                 Some(spec) => {
+                    // The size the load opened at: a file with no routed expert settles it in its
+                    // verdict (the seat's last `ubatch` line), any other takes the levers'.
+                    let ubatch = match ubatch_pick::choices(&log).last().and_then(|c| c.pick) {
+                        Some(u) => u,
+                        None => ubatch_size()?,
+                    };
                     let slot_ctx = log
                         .lines()
                         .filter(|l| l.starts_with("parallel "))
                         .find_map(|l| parallel_word(l, "slot_ctx")?.parse::<u64>().ok());
                     let each = slot_ctx
-                        .map(|c| checkpoint_budget35(spec, ubatch_size()?, c))
+                        .map(|c| checkpoint_budget35(spec, ubatch, c))
                         .transpose()?;
                     let want = each.zip(slot_ctx).map(|(each, c)| {
                         format!(
@@ -3286,7 +3251,7 @@ mod gate {
         }
         if body35(seat) {
             prefix35(&url, dir, ok)?;
-            tool_call_is_parsed(&url, dir, ok)?;
+            tool_call_is_parsed(&split, dir, ok)?;
         }
         *ok &= serve_client::shared_system_prompt(&url, dir, SYSTEM_MSG, [EDIT_A, EDIT_B], N)?;
         *ok &= crate::systemone_clause::is_the_schema_path(&url, dir)?;
@@ -3464,63 +3429,6 @@ mod gate {
             ))),
             _ => Err(format!("{} plan records, the clause wants one split", plans.len()).into()),
         }
-    }
-
-    /// `generate_qwen3moe --arm <prompt>/N --ctx <ctx> … --last-step` on
-    /// `model`, an arm a prompt; its `tokens` lines in order. `ctx` is the
-    /// server's loaded context: the CLI's own default plans a different
-    /// split of the routed experts, and the two legs do not sum in one order.
-    fn cli(
-        model: &Path,
-        prompts: &[&[u32]],
-        ctx: u64,
-        dir: &Path,
-    ) -> Result<Vec<Vec<u32>>, GateError> {
-        let exe = beside("generate_qwen3moe")?;
-        let mut args = Vec::new();
-        for p in prompts {
-            let ids: Vec<String> = p.iter().map(u32::to_string).collect();
-            args.push("--arm".to_owned());
-            args.push(format!("{}/{N}", ids.join(",")));
-        }
-        // The server's context, so the CLI's plan is the server's split.
-        args.push("--ctx".to_owned());
-        args.push(ctx.to_string());
-        args.push("--last-step".to_owned());
-        let out = Command::new(&exe)
-            .args(&args)
-            .env("BLOOMERY_REF_MODEL", model)
-            .stdin(Stdio::null())
-            .output()
-            .map_err(|e| format!("spawn {}: {e}", exe.display()))?;
-        let log = dir.join("gen.log");
-        std::fs::write(&log, &out.stdout)?;
-        std::fs::write(dir.join("gen.err"), &out.stderr)?;
-        if !out.status.success() {
-            return Err(format!(
-                "{} {}: {}",
-                exe.display(),
-                out.status,
-                String::from_utf8_lossy(&out.stderr)
-            )
-            .into());
-        }
-        let text = String::from_utf8(out.stdout)?;
-        let lines: Vec<Vec<u32>> = text
-            .lines()
-            .filter_map(|l| l.strip_prefix("tokens "))
-            .map(parse_ids)
-            .collect::<Result<_, _>>()?;
-        if lines.len() != prompts.len() {
-            return Err(format!(
-                "{}: {} `tokens` lines for {} arms",
-                log.display(),
-                lines.len(),
-                prompts.len()
-            )
-            .into());
-        }
-        Ok(lines)
     }
 
     /// The cache flag's own surface (`--cache-type-k`): a word outside the
@@ -4176,7 +4084,7 @@ mod gate {
         let rows = total / slots;
         let mut planes = Vec::new();
         for _ in 0..slots {
-            planes.extend(cache_planes(model, &split, rows)?);
+            planes.extend(cache_planes(model, &split, rows, 1)?);
             planes.push(rows * rope * 4);
         }
         let want = model::placement::allocator_bytes(GRANULE, planes);
@@ -4468,6 +4376,133 @@ mod gate {
         }
     }
 
+    /// Greedy drafted ids equal the plain path's, and the drafted completion
+    /// accepted at least one token. A file with no in-file next-token layer
+    /// prints the pin and starts no server; the pinned path with no layer is red.
+    /// A spawn, tokenize or completion failure is red and does not stop the
+    /// file's later clauses or the next file.
+    fn mtp_ids_match_the_plain_path(
+        model: &Path,
+        dir: &Path,
+        ok: &mut bool,
+    ) -> Result<(), GateError> {
+        let file = match Split::open(model) {
+            Ok(file) => file,
+            Err(e) => {
+                println!("mtp open {}: {e}", model.display());
+                check(ok, "mtp_ids_match_the_plain_path", false);
+                return Ok(());
+            }
+        };
+        let drafted = matches!(in_file(&file), Ok(InFile::Draft(_)));
+        let passed = if !drafted {
+            if model == Path::new(MTP_FILE) {
+                println!(
+                    "{}: the pinned file carries no in-file next-token layer",
+                    model.display()
+                );
+                Some(false)
+            } else {
+                println!(
+                    "{}: no in-file next-token layer; mtp_ids_match_the_plain_path is pinned to \
+                     {MTP_FILE}",
+                    model.display()
+                );
+                None
+            }
+        } else {
+            Some(mtp_pair(model, dir))
+        };
+        if let Some(passed) = passed {
+            check(ok, "mtp_ids_match_the_plain_path", passed);
+        }
+        Ok(())
+    }
+
+    /// The two serves, one after the other so one card is free for the second.
+    /// `false` when either fails to listen or to complete.
+    fn mtp_pair(model: &Path, dir: &Path) -> bool {
+        let ids = match Tokenizer::from_gguf(model) {
+            Ok(tok) => tok.encode(PROSE, false, true),
+            Err(e) => {
+                println!("mtp tokenize {}: {e}", model.display());
+                return false;
+            }
+        };
+        let utf8 = match model.to_str() {
+            Some(m) => m,
+            None => {
+                println!("mtp: the model path is not UTF-8");
+                return false;
+            }
+        };
+        let once = |name: &str, word: &str| -> Option<(Answer, Value)> {
+            let sub = dir.join(name);
+            if let Err(e) = std::fs::create_dir_all(&sub) {
+                println!("mtp {name} dir: {e}");
+                return None;
+            }
+            let mut cmd = match serve_cmd() {
+                Ok(cmd) => cmd,
+                Err(e) => {
+                    println!("mtp {name} command: {e}");
+                    return None;
+                }
+            };
+            cmd.env("BLOOMERY_DRAFT", word);
+            let mut s = match Served::spawn_cmd(
+                cmd,
+                &[
+                    "--model",
+                    "qwen3",
+                    "--port",
+                    "0",
+                    "--parallel",
+                    "1",
+                    "-m",
+                    utf8,
+                ],
+                &sub,
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    println!("mtp {name} spawn: {e}");
+                    return None;
+                }
+            };
+            let err_log = sub.join("server.err");
+            let addr = match s.address(&err_log, 600, Duration::from_secs(1)) {
+                Ok(addr) => addr,
+                Err(e) => {
+                    println!("mtp {name} never listened: {e}");
+                    return None;
+                }
+            };
+            let url = |p: &str| format!("http://{addr}{p}");
+            match serve_client::greedy(&url, ids.clone(), MTP_N, &sub, name, false) {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    println!("mtp {name} greedy: {e}");
+                    None
+                }
+            }
+        };
+        let Some((on, on_body)) = once("mtp-on", "mtp") else {
+            return false;
+        };
+        let Some((off, _)) = once("mtp-off", "off") else {
+            return false;
+        };
+        let accepted = on_body["timings"]["draft_n_accepted"].as_u64();
+        let same = on.tokens == off.tokens;
+        println!(
+            "mtp drafted {} ids, plain {} ids, draft_n_accepted {accepted:?}",
+            on.tokens.len(),
+            off.tokens.len()
+        );
+        same && accepted.is_some_and(|n| n > 0)
+    }
+
     pub fn run() -> Result<(), GateError> {
         bloomery_levers::at_main(&[])?;
         let a = parse_args()?;
@@ -4486,7 +4521,14 @@ mod gate {
                 continue;
             };
             let prompts: Vec<&[u32]> = answers.iter().map(|a| a.prompt.as_slice()).collect();
-            let references = cli(model, &prompts, default_n, &dir)?;
+            let references = serve_client::generate_arms(
+                "generate_qwen3moe",
+                model,
+                &prompts,
+                N,
+                default_n,
+                &dir,
+            )?;
             let mut agree_all = true;
             for (ans, reference) in answers.iter().zip(&references) {
                 println!("cli tokens {reference:?}");
@@ -4566,6 +4608,7 @@ mod gate {
                 // walk.
                 placed_answers_a_prompt_past_the_gemm_walk(model, &dir, &mut ok)?;
             }
+            mtp_ids_match_the_plain_path(model, &dir, &mut ok)?;
             if a.images {
                 images(model, &dir, &mut ok)?;
             }

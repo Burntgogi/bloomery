@@ -42,10 +42,12 @@ fn retired() -> impl Iterator<Item = &'static LeverSpec> {
 /// Whether the pool reads it: it is on every binary's list.
 /// The rows read below every binary's `main` (the pool's two, the host's
 /// room, the NVMe tier's four, [`nvtier_levers`], the tier link,
-/// [`tier_link`], the tiers' nodes, [`tier_nodes`], and the need hook,
-/// [`need_levers`]), which no `at_main` list refuses.
+/// [`tier_link`], the tiers' nodes, [`tier_nodes`], the need hook,
+/// [`need_levers`], and the cards' margin, [`card_margin`]), which no
+/// `at_main` list refuses.
 fn pool(r: &LeverSpec) -> bool {
-    r.name == THREADS
+    r.name == CARD_MARGIN
+        || r.name == THREADS
         || r.name == SPIN
         || r.name == HOST_ROOM
         || r.name == NEED_HOOK
@@ -75,6 +77,7 @@ fn sample(kind: Kind) -> String {
         Kind::Count { min, .. } => min.to_string(),
         Kind::Multiple { of } => of.to_string(),
         Kind::Bytes => "38G".into(),
+        Kind::CardBytes => "CUDA0=38G,cuda1=20G".into(),
         Kind::Path => "/data/set".into(),
         Kind::PathOr(words) => words[0].into(),
         Kind::File | Kind::Program => A_FILE.into(),
@@ -133,6 +136,34 @@ fn garbage(kind: Kind) -> Vec<String> {
         Kind::Bytes => {
             g.extend(["38g", "38 G", "-1", "38GB", "1.5G", "G", "17179869184G"].map(String::from))
         }
+        Kind::CardBytes => g.extend(
+            [
+                "38g",
+                "17179869184G",
+                "CUDA0=38G,",
+                "CUDA0=38G,CUDA0=20G",
+                "CUDA0=38G,cuda0=20G",
+                "CUDA01=38G",
+                "CUDA=38G",
+                "CUDA-1=38G",
+                "GPU0=38G",
+                "0=38G",
+                "CUDA0=",
+                "CUDA0=38g",
+                "CUDA0 =38G",
+                "CUDA0=38G CUDA1=20G",
+                "CUDA0=17179869184G",
+                "CUDA4294967296=38G",
+                "38G,CUDA1=20G",
+                "CUDA0=3x,CUDA1=20G",
+                "CUDA0=0x,CUDA1=0x",
+                "CUDA0=x",
+                "CUDA0=03x",
+                "CUDA0=3x,CUDA0=1x",
+                "3x",
+            ]
+            .map(String::from),
+        ),
         Kind::File => g.extend([
             "/no/such/file".to_string(),
             env!("CARGO_MANIFEST_DIR").to_string(),
@@ -389,7 +420,8 @@ fn accessors_read_their_rows() {
     assert_eq!(unset.prefill_group(), 2);
     assert!(unset.engram_helper());
     assert!(!unset.step_stats());
-    assert_eq!(unset.card_budget_bytes(), None);
+    assert_eq!(unset.card_budget(), CardBudget::Unset);
+    assert_eq!(unset.card_margin(), CardBudget::Unset);
     assert!(unset.pin_main());
     assert_eq!(unset.draft(), None);
     assert_eq!(unset.mtp_head_rows(), None);
@@ -427,6 +459,7 @@ fn accessors_read_their_rows() {
             (ENGRAM_HELPER, "0"),
             (STEP_STATS, "1"),
             (CARD_BUDGET, "38G"),
+            (CARD_MARGIN, "1G"),
             (PIN_MAIN, "0"),
             (DRAFT, "dspark"),
             (MTP_HEAD_ROWS, "/data/rows.txt"),
@@ -463,7 +496,8 @@ fn accessors_read_their_rows() {
     assert_eq!(set.prefill_group(), 8);
     assert!(!set.engram_helper());
     assert!(set.step_stats());
-    assert_eq!(set.card_budget_bytes(), Some(38 << 30));
+    assert_eq!(set.card_budget(), CardBudget::Every(38 << 30));
+    assert_eq!(set.card_margin(), CardBudget::Every(1 << 30));
     assert!(!set.pin_main());
     assert_eq!(set.draft(), Some("dspark"));
     assert_eq!(
@@ -527,6 +561,7 @@ fn accessors_read_their_rows() {
             ENGRAM_HELPER,
             STEP_STATS,
             CARD_BUDGET,
+            CARD_MARGIN,
             HOST_ROOM,
             NVTIER_BYTES,
             NVTIER_READ,
@@ -667,6 +702,122 @@ fn nvtier_evict_takes_tick_or_heat_and_refuses_the_rest() {
             "{text}"
         );
     }
+}
+
+/// `BLOOMERY_CARD_BUDGET` takes one byte count for every card or one per
+/// card by CUDA ordinal, prints back as it is spelled, refuses a card named
+/// twice, a key that names no device and bytes that are none by the entry,
+/// and is read alone where a placement meets the census
+/// ([`Scope::CardBudget`]).
+#[test]
+fn card_budget_takes_one_value_or_one_per_card() {
+    assert_eq!(card_budget_value("38G"), Ok(CardBudget::Every(38 << 30)));
+    let per = card_budget_value("CUDA0=38G,cuda1=20480M").expect("a list");
+    assert_eq!(per, CardBudget::Per(vec![(0, 38 << 30), (1, 20 << 30)]));
+    assert_eq!(per.to_string(), "CUDA0=40802189312,CUDA1=21474836480");
+    assert_eq!(card_budget_value(&per.to_string()), Ok(per.clone()));
+    assert_eq!(per.every(), None);
+    assert!(per.is_set() && !CardBudget::Unset.is_set());
+    assert_eq!(CardBudget::from(Some(7)), CardBudget::Every(7));
+    assert_eq!(CardBudget::from(None), CardBudget::Unset);
+    for (v, why) in [
+        ("CUDA0=38G,CUDA0=20G", "CUDA0 is given twice"),
+        ("CUDA2=1G,cuda2=2G", "CUDA2 is given twice"),
+        ("GPU0=38G", "\"GPU0\" names no device as CUDA<N>"),
+        ("CUDA0=38g", "\"38g\" for CUDA0 is no bytes"),
+        ("CUDA0=38G,", "\"\" is no CUDA<N>=<bytes> entry"),
+    ] {
+        let e = read(&env(&[(CARD_BUDGET, v)]), Scope::Every)
+            .expect_err(v)
+            .to_string();
+        assert!(e.contains(CARD_BUDGET) && e.contains(why), "{v}: {e}");
+    }
+    let alone = read(
+        &env(&[(CARD_BUDGET, "CUDA1=20G"), (THREADS, "nope")]),
+        Scope::CardBudget,
+    )
+    .expect("only the card budget is read");
+    assert_eq!(alone.card_budget(), CardBudget::Per(vec![(1, 20 << 30)]));
+}
+
+/// `BLOOMERY_CARD_BUDGET` also takes shares, `CUDA<N>=<n>x` per card: whole
+/// parts, a list all bytes or all shares, one share above 0 at least, printed
+/// back as spelled.
+#[test]
+fn card_budget_takes_shares_per_card() {
+    let shares = card_budget_value("CUDA0=3x,cuda1=1X").expect("shares");
+    assert_eq!(shares, CardBudget::Shares(vec![(0, 3), (1, 1)]));
+    assert_eq!(shares.to_string(), "CUDA0=3x,CUDA1=1x");
+    assert_eq!(card_budget_value(&shares.to_string()), Ok(shares.clone()));
+    assert_eq!(shares.every(), None);
+    assert_eq!(shares.listed(), Some(&[(0, 3), (1, 1)][..]));
+    assert!(shares.is_set());
+    let held = card_budget_value("CUDA1=1x,CUDA0=0x").expect("a zero share beside a share");
+    assert_eq!(held, CardBudget::Shares(vec![(1, 1), (0, 0)]));
+    assert_eq!(
+        card_budget_value("CUDA0=1G").expect("bytes").listed(),
+        Some(&[(0, 1 << 30)][..])
+    );
+    assert_eq!(CardBudget::Every(1).listed(), None);
+    for (v, why) in [
+        (
+            "CUDA0=3x,CUDA1=20G",
+            "CUDA1: a list is all bytes or all shares",
+        ),
+        (
+            "CUDA0=20G,CUDA1=3x",
+            "CUDA1: a list is all bytes or all shares",
+        ),
+        ("CUDA0=0x,CUDA1=0x", "every share is 0"),
+        ("CUDA0=x", "\"x\" for CUDA0 is no share"),
+        ("CUDA0=03x", "\"03x\" for CUDA0 is no share"),
+        ("CUDA0=1.5x", "\"1.5x\" for CUDA0 is no share"),
+        ("CUDA0=3x,CUDA0=1x", "CUDA0 is given twice"),
+        (
+            "CUDA0=18446744073709551615x,CUDA1=1x",
+            "the shares sum to more than a u64 holds",
+        ),
+    ] {
+        let e = read(&env(&[(CARD_BUDGET, v)]), Scope::Every)
+            .expect_err(v)
+            .to_string();
+        assert!(e.contains(CARD_BUDGET) && e.contains(why), "{v}: {e}");
+    }
+}
+
+/// `BLOOMERY_CARD_MARGIN` reads the card budget's spelling for the bytes a
+/// card keeps free, is acted on by every binary, is read with the card
+/// budget where a placement meets the census, and unset is none.
+#[test]
+fn card_margin_is_read_with_the_card_budget_and_acted_on_by_every_binary() {
+    let main = |pairs: &[(&str, &str)]| {
+        read(
+            &env(pairs),
+            Scope::Main {
+                bin: "x",
+                acts_on: &[],
+            },
+        )
+        .expect("read")
+    };
+    assert_eq!(main(&[]).card_margin(), CardBudget::Unset);
+    assert_eq!(
+        main(&[(CARD_MARGIN, "1G")]).card_margin(),
+        CardBudget::Every(1 << 30)
+    );
+    let list = main(&[(CARD_MARGIN, "CUDA0=512M,CUDA1=2G")]).card_margin();
+    assert_eq!(list, CardBudget::Per(vec![(0, 512 << 20), (1, 2 << 30)]));
+    let alone = read(
+        &env(&[(CARD_MARGIN, "CUDA1=1G"), (THREADS, "nope")]),
+        Scope::CardBudget,
+    )
+    .expect("only the card levers are read");
+    assert_eq!(alone.card_margin(), CardBudget::Per(vec![(1, 1 << 30)]));
+    assert_eq!(alone.card_budget(), CardBudget::Unset);
+    let e = read(&env(&[(CARD_MARGIN, "lots")]), Scope::Every)
+        .expect_err("not bytes")
+        .to_string();
+    assert!(e.contains(CARD_MARGIN), "{e}");
 }
 
 /// `BLOOMERY_HOST_ROOM` takes bytes (`M` and `G` binary units) where the
@@ -1184,8 +1335,8 @@ fn room_for_keeps_the_word_where_the_plan_has_room() {
 /// word `mid-p0-s1` wherever the plan's card slots hold the rule at all —
 /// its P 0 fits every plan but a one-expert layer — raised to the first P
 /// whose churn pool fits where the host does not take the pool at 0, `off`
-/// where neither side leaves a count; a set word and every other why pass
-/// through untouched.
+/// where neither side leaves a count or the plan holds no host expert; a set
+/// word and every other why pass through untouched.
 #[test]
 fn residency_at_plan_moves_the_unset_word_to_what_the_plan_leaves() {
     let pool = |fewest: usize| move |p: usize| Ok::<u64, ()>(10 * (fewest - p) as u64);
@@ -1193,18 +1344,20 @@ fn residency_at_plan_moves_the_unset_word_to_what_the_plan_leaves() {
         word: RESIDENCY_SERVING,
         why: ResidencyWhy::Place,
     };
-    let at = |n_l: &[u64], headroom: i128, mem_left: i128| {
+    let at_host = |n_l: &[u64], host: u64, headroom: i128, mem_left: i128| {
         let fewest = n_l.iter().copied().filter(|&n| n > 0).min().unwrap_or(0) as usize;
         residency_at_plan(
             UnhostedPool::Carried,
             unset,
             n_l.iter().copied(),
+            host,
             pool(fewest),
             headroom,
             mem_left,
         )
         .expect("no pool error")
     };
+    let at = |n_l: &[u64], headroom: i128, mem_left: i128| at_host(n_l, 30, headroom, mem_left);
     let big = 1 << 40;
     // The serving word wherever the plan's layers hold the rule.
     assert_eq!(at(&[42, 43], big, big), unset);
@@ -1221,6 +1374,25 @@ fn residency_at_plan_moves_the_unset_word_to_what_the_plan_leaves() {
         }
     );
     assert_eq!(at(&[0, 0], big, big).why, ResidencyWhy::NoCardExperts);
+    // A plan whose card holds every expert has none on the host for the
+    // machine to move in: its spares would only displace card experts, so the
+    // word is `off` with why, the card check first (a plan with no expert at
+    // all is the card's).
+    let whole = at_host(&[16, 16, 16, 16], 0, big, big);
+    assert_eq!(
+        (whole.word, whole.why),
+        ("off", ResidencyWhy::NoHostExperts)
+    );
+    assert_eq!(whole.why.name(), "no_host_experts");
+    assert_eq!(
+        whole.why.detail().expect("the no-host why details"),
+        "unset: the plan holds no routed expert on the host"
+    );
+    assert_eq!(
+        at_host(&[0, 0], 0, big, big).why,
+        ResidencyWhy::NoCardExperts
+    );
+    assert_eq!(at_host(&[16, 16], 1, big, big), unset);
     assert_eq!(
         at(&[1, 9], big, big)
             .why
@@ -1242,6 +1414,7 @@ fn residency_at_plan_moves_the_unset_word_to_what_the_plan_leaves() {
             UnhostedPool::Carried,
             pick,
             [30u64],
+            0,
             |_| Err::<u64, ()>(()),
             0,
             0,
@@ -1264,6 +1437,52 @@ fn residency_at_plan_moves_the_unset_word_to_what_the_plan_leaves() {
         .why,
         ResidencyWhy::FixedPlace
     );
+}
+
+/// [`RESIDENCY`] unset beside the NVMe tier over NVFP4 planes
+/// ([`residency_beside_paged_planes`]): the serving word turns `off` with why
+/// `nvme_planes` on a plan that pages while a routed stack loads in planes,
+/// and the pair rule passes that `off` on; the serving word on any other plan,
+/// a set word and every other why pass through untouched.
+#[test]
+fn residency_beside_paged_planes_turns_the_unset_word_off() {
+    let unset = ResidencyPick {
+        word: RESIDENCY_SERVING,
+        why: ResidencyWhy::Place,
+    };
+    let paged = residency_beside_paged_planes(unset, true);
+    assert_eq!((paged.word, paged.why), ("off", ResidencyWhy::NvmePlanes));
+    assert_eq!(paged.why.name(), "nvme_planes");
+    assert!(
+        paged
+            .why
+            .detail()
+            .expect("the nvme-planes why details")
+            .contains("NVFP4"),
+        "the detail names the planes"
+    );
+    let big = 1 << 40;
+    let pair = residency_at_plan(
+        UnhostedPool::NotCarried,
+        paged,
+        [42u64, 43],
+        30,
+        |_| Ok::<u64, ()>(0),
+        big,
+        big,
+    )
+    .expect("no pool error");
+    assert_eq!(pair, paged, "the pair rule passes the off on");
+    assert_eq!(residency_beside_paged_planes(unset, false), unset);
+    let set = ResidencyPick {
+        word: RESIDENCY_SERVING,
+        why: ResidencyWhy::Set,
+    };
+    assert_eq!(residency_beside_paged_planes(set, true), set);
+    for why in [ResidencyWhy::FixedPlace, ResidencyWhy::NoHostExperts] {
+        let off = ResidencyPick { word: "off", why };
+        assert_eq!(residency_beside_paged_planes(off, true), off);
+    }
 }
 
 /// `BLOOMERY_DRAFT` unset on a qwen4exp file in `generate_qwen3moe`: the MTP
@@ -1644,7 +1863,7 @@ fn an_unset_word_climbs_on_a_body_that_carries_an_unhosted_pool() {
     });
     // 10 B an expert past P on 50: the first count whose pool fits 50 B is
     // 45.
-    let v41 = residency_at_plan(UnhostedPool::Carried, serving, [50u64], pool, 50, big)
+    let v41 = residency_at_plan(UnhostedPool::Carried, serving, [50u64], 1, pool, 50, big)
         .expect("no pool error");
     assert_eq!(
         (v41.word, v41.why, v41.pool()),
@@ -2349,6 +2568,7 @@ fn a_load_that_hosts_its_pool_climbs_through_every_family_rule() {
             UnhostedPool::NotCarried,
             serving,
             [50u64],
+            1,
             pool,
             headroom,
             big,
@@ -2416,4 +2636,140 @@ fn a_load_that_hosts_its_pool_climbs_through_every_family_rule() {
     );
     // PIN(2026-10-13): the closing check that a carrying body keeps P 0 on the same plan is gone; the carrying body now
     // climbs like these, pinned by `an_unset_word_climbs_on_a_body_that_carries_an_unhosted_pool`.
+}
+
+/// `names` as override pairs.
+fn pairs<'a>(names: &[(&'a str, &str)]) -> Vec<(&'a str, String)> {
+    names
+        .iter()
+        .map(|&(name, value)| (name, value.to_owned()))
+        .collect()
+}
+
+/// An override replaces the environment's value and says so (nothing when the two are the
+/// same), and a reading of the environment with the overrides after it takes the override.
+#[test]
+fn an_override_replaces_the_environment_value_and_says_so() {
+    let held = env(&[(CARD_BUDGET, "8G"), (QWEN38_EXPERTS, "host")]);
+    let (set, notes) = checked_overrides(
+        &pairs(&[(CARD_BUDGET, "1073741824"), (QWEN38_EXPERTS, "host")]),
+        &held,
+    )
+    .expect("two Parsed levers with values their kinds take");
+    assert_eq!(
+        set,
+        [
+            (CARD_BUDGET, "1073741824".to_owned()),
+            (QWEN38_EXPERTS, "host".to_owned())
+        ]
+    );
+    assert_eq!(
+        notes,
+        ["BLOOMERY_CARD_BUDGET: the environment's value \"8G\" is replaced by \"1073741824\""]
+    );
+    let levers = read(&merged(held, &set), Scope::Every).expect("a reading under the overrides");
+    assert_eq!(levers.card_budget(), CardBudget::Every(1 << 30));
+    let (_, none) = checked_overrides(&pairs(&[(CARD_BUDGET, "1G")]), &[]).expect("no environment");
+    assert!(none.is_empty());
+}
+
+/// Every override a reading cannot honour is refused by name, all at once: a name no row names, a
+/// retired name, a value its kind refuses, a Parsed lever a file still reads in place, a Direct
+/// lever whose reader does not take overrides, and a name that is no lever.
+#[test]
+fn an_override_that_cannot_be_honoured_is_refused_by_name() {
+    let retired = retired().next().expect("a retired row").name;
+    let in_place = REGISTRY
+        .iter()
+        .find(|r| matches!(r.site, Site::Parsed { left, .. } if !left.is_empty()))
+        .expect("a Parsed lever a file still reads in place")
+        .name;
+    let direct = REGISTRY
+        .iter()
+        .find(|r| matches!(r.site, Site::Direct { .. }) && !READ_WITH_OVERRIDE.contains(&r.name))
+        .expect("a Direct lever whose reader takes no override")
+        .name;
+    let no_lever = REGISTRY
+        .iter()
+        .find(|r| matches!(r.site, Site::Env { .. }))
+        .expect("a name that is no lever")
+        .name;
+    let asked = pairs(&[
+        ("BLOOMERY_CARD_BUDGT", "1G"),
+        (retired, "1"),
+        (CARD_BUDGET, "lots"),
+        (in_place, "1"),
+        (direct, "1"),
+        (no_lever, "1"),
+    ]);
+    let text = checked_overrides(&asked, &[])
+        .expect_err("six overrides it cannot honour")
+        .to_string();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 6, "{text}");
+    assert!(
+        lines[0].contains("the nearest is BLOOMERY_CARD_BUDGET"),
+        "{text}"
+    );
+    assert!(lines[1].contains("it is no lever:"), "{text}");
+    assert!(
+        lines[2].starts_with("BLOOMERY_CARD_BUDGET=\"lots\" is refused: it takes"),
+        "{text}"
+    );
+    for line in &lines[3..] {
+        assert!(line.contains("a flag cannot set it"), "{text}");
+    }
+}
+
+/// A Direct lever whose reader asks `override_of` is overridden by a value its kind takes (a Text
+/// lever's is its owner's to check), and each such reader does ask: its file names the call.
+#[test]
+fn a_direct_lever_is_overridden_only_where_its_reader_asks() {
+    assert!(!READ_WITH_OVERRIDE.is_empty());
+    for &name in READ_WITH_OVERRIDE {
+        let row = spec(name).expect(name);
+        let Site::Direct { at, .. } = row.site else {
+            panic!("{name} is not a Direct lever");
+        };
+        for place in at {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../..")
+                .join(place.file);
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            assert!(
+                source.contains(&format!("override_of(\"{name}\")")),
+                "{} reads {name} without asking override_of",
+                place.file
+            );
+        }
+        let (set, _) = checked_overrides(&pairs(&[(name, "cuda1")]), &[])
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(set, [(row.name, "cuda1".to_owned())]);
+    }
+}
+
+/// The one test that hands overrides to the process: they reach every reading of the process
+/// environment and the in-place readers of a Direct lever, a second hand-over is refused by name,
+/// and an empty one is not a hand-over. Nothing else here reads the process environment, so the
+/// store this fills reaches no other test.
+#[test]
+fn the_process_hands_its_overrides_once() {
+    assert_eq!(override_of(CARD_BUDGET), None);
+    let notes = override_with(&pairs(&[
+        (CARD_BUDGET, "1G"),
+        ("BLOOMERY_DSPARK_CARD", "cuda1"),
+    ]))
+    .expect("a Parsed lever and a Direct one that asks");
+    assert!(
+        notes.iter().all(|n| !n.is_empty()),
+        "a note a line: {notes:?}"
+    );
+    assert_eq!(override_of("BLOOMERY_DSPARK_CARD"), Some("cuda1"));
+    let levers = Levers::from_env().expect("the process environment under the overrides");
+    assert_eq!(levers.card_budget(), CardBudget::Every(1 << 30));
+    assert_eq!(override_with(&[]), Ok(Vec::new()));
+    let again = override_with(&pairs(&[(CARD_BUDGET, "2G")])).expect_err("a second hand-over");
+    assert!(again.to_string().contains("handed over once already"));
+    assert_eq!(override_of(CARD_BUDGET), Some("1G"));
 }

@@ -420,6 +420,7 @@ pub(in crate::arch) fn nope_gqa(a: &Attn, kv: usize) -> Result<Gqa, PlacementErr
             yarn: None,
         },
         qk_norm: false,
+        o_norm: false,
         out_gate: OutGate::None,
         select: None,
         window: None,
@@ -452,6 +453,10 @@ pub struct PlanInputs {
     pub spec: ModelSpec,
     /// Each layer's store bytes.
     pub kv: KvLayout,
+    /// The card bytes the load makes beside the plan's terms, its prompt pass's buffers: the
+    /// card keeps them out of the expert budget ([`placement::plan_routed_reserving`]) and the
+    /// body holds its pass to them. 0 for a family whose body sizes its pass apart from the plan.
+    pub prompt_reserve: u64,
 }
 
 /// Where a plan puts the routed experts.
@@ -559,7 +564,7 @@ impl PlanInputs {
         if ctx_max == 0 {
             return Err(PlaceError::CtxZero);
         }
-        if let Some((tier, card)) = machine.tiers.iter().enumerate().next() {
+        if let Some((tier, card)) = machine.expert_tiers().enumerate().next() {
             return Err(PlaceError::Tier {
                 card: card.name.clone(),
                 tier,
@@ -572,17 +577,23 @@ impl PlanInputs {
         let program = program_of(self.spec.arch)
             .ok_or_else(|| PlacementError::Unimplemented(self.unimplemented()))?;
         let plan = match experts {
-            Experts::Card | Experts::Placed => placement::plan_routed(
+            Experts::Card | Experts::Placed => placement::plan_routed_reserving(
                 &self.model,
                 machine,
                 ctx_max,
                 &self.kv,
                 levers,
                 routed_rule(program),
+                self.prompt_reserve,
             )?,
-            Experts::Host => {
-                placement::plan_host_routed(&self.model, machine, ctx_max, &self.kv, levers)?
-            }
+            Experts::Host => placement::plan_host_routed_reserving(
+                &self.model,
+                machine,
+                ctx_max,
+                &self.kv,
+                levers,
+                self.prompt_reserve,
+            )?,
         };
         // Under `Card` the body uploads every expert stack, so the host leg
         // must hold none.

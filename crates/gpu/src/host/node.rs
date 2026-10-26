@@ -54,6 +54,7 @@ use super::tier::{
     TierWork, chain_slot,
 };
 use crate::fault::{FAULT_NONE, Fault};
+use crate::model::CardBytes;
 use crate::weights::{SegmentFile, Weights};
 use crate::{Gpu, GpuError};
 use wire::{Channel, In, Out, Polled, Tag};
@@ -352,7 +353,7 @@ impl NodeOpen {
 
     /// Open the assigned tier locally or on its node, with the same paging projection.
     pub fn open_tier(
-        mut self,
+        self,
         stage: &Gpu,
         file: &Arc<Split>,
         plan: &Plan<'_>,
@@ -360,11 +361,50 @@ impl NodeOpen {
         family: &NodeFamily,
         card_dontneed: bool,
     ) -> Result<TierCard, GpuError> {
+        self.open_tier_from(
+            stage,
+            (file, &CardBytes::File),
+            plan,
+            node,
+            family,
+            card_dontneed,
+        )
+    }
+
+    /// [`NodeOpen::open_tier`] whose card tensors come from `bytes`: the file's own segments, or
+    /// a checkpoint folder's part source, which loads the tier's segments as it loads the stage
+    /// card's. A part source's tier runs in this process: a node reads its own model file, and a
+    /// paged tier its file's runs, so either is refused by name for one.
+    pub fn open_tier_from(
+        mut self,
+        stage: &Gpu,
+        (file, bytes): (&Arc<Split>, &CardBytes<'_>),
+        plan: &Plan<'_>,
+        node: Option<SocketAddr>,
+        family: &NodeFamily,
+        card_dontneed: bool,
+    ) -> Result<TierCard, GpuError> {
+        let parts = match bytes {
+            CardBytes::File => None,
+            CardBytes::Parts(load) => Some(*load),
+        };
+        if parts.is_some() && node.is_some() {
+            return Err(GpuError::shape(
+                WHAT,
+                "a tier node of a checkpoint folder: a node loads its tier from its own GGUF file",
+            ));
+        }
         let census = match node {
             Some(addr) => TierNode::census_of(addr)?,
             None => NodeCensus::here()?,
         };
         self.project(plan, &census)?;
+        if parts.is_some() && self.nvme.is_some() {
+            return Err(GpuError::shape(
+                WHAT,
+                "a paged tier of a checkpoint folder: the paged tier reads its GGUF file's runs",
+            ));
+        }
         let card = if let Some(addr) = node {
             TierCard::on_node(TierNode::open(addr, &self)?, self.name, self.set)
         } else {
@@ -373,7 +413,17 @@ impl NodeOpen {
             let (w, experts) = if self.nvme.is_some() {
                 self.load_host(&gpu, file, &tensors, family)?
             } else {
-                let w = Weights::load_placed(gpu.stream(), file, plan, self.card, card_dontneed)?;
+                let w = match parts {
+                    None => {
+                        Weights::load_placed(gpu.stream(), file, plan, self.card, card_dontneed)?
+                    }
+                    Some(load) => {
+                        let available =
+                            workstation::host_available().map_err(|e| GpuError::plan(WHAT, e))?;
+                        let room = load.host_bytes(plan, self.card, available)?;
+                        load.load(gpu.stream(), plan, self.card, card_dontneed, room)?
+                    }
+                };
                 let experts = (family.experts)(&gpu, file, &tensors, &w, &self)?;
                 (w, experts)
             };
@@ -472,6 +522,25 @@ impl NodeOpen {
     /// name and file identity and the sha256 of its header and bytes in `file`, the
     /// model file the plan was made from.
     pub fn rows_of(plan: &Plan<'_>, file: &Split, card: usize) -> Result<Vec<NodeRow>, GpuError> {
+        Self::rows_by(plan, card, |t, s| {
+            segment_sha256(file, plan.model.experts, t, s)
+        })
+    }
+
+    /// [`NodeOpen::rows_of`] for a tier whose segments a part source loads
+    /// ([`NodeOpen::open_tier_from`]): no digest, which only a node that
+    /// reads its own file checks, and a part source's tier runs in this
+    /// process.
+    pub fn rows_unhashed(plan: &Plan<'_>, card: usize) -> Result<Vec<NodeRow>, GpuError> {
+        Self::rows_by(plan, card, |_, _| Ok(String::new()))
+    }
+
+    /// The segments `plan` puts on card `card`, each row's digest `digest`'s.
+    fn rows_by(
+        plan: &Plan<'_>,
+        card: usize,
+        digest: impl Fn(&ModelTensor, &Segment) -> Result<String, GpuError>,
+    ) -> Result<Vec<NodeRow>, GpuError> {
         let mut rows = Vec::new();
         for row in &plan.rows {
             let t = plan.model.tensors.get(row.tensor).ok_or_else(|| {
@@ -491,7 +560,7 @@ impl NodeOpen {
                     format: s.format.to_string(),
                     experts: s.experts.as_ref().map(|e| e.ids().to_vec()),
                     resident_bytes: s.resident_bytes,
-                    sha256: segment_sha256(file, plan.model.experts, t, s)?,
+                    sha256: digest(t, s)?,
                 });
             }
         }
@@ -1510,7 +1579,7 @@ impl Session<'_> {
         match tag {
             Tag::Open => self.handle_open(&mut i, bad)?,
             Tag::Bind => {
-                let mode = i.u8("bind mode").map_err(&bad)?;
+                let mode = i.u8("bind mode").map_err(bad)?;
                 match mode {
                     0 => {
                         if !self.local_ip.is_loopback() {
@@ -1519,22 +1588,22 @@ impl Session<'_> {
                             )
                             .into());
                         }
-                        let path = i.str("path").map_err(&bad)?;
+                        let path = i.str("path").map_err(bad)?;
                         let (bytes, tiers, index) = (
-                            i.len("bytes").map_err(&bad)?,
-                            i.len("tiers").map_err(&bad)?,
-                            i.len("index").map_err(&bad)?,
+                            i.len("bytes").map_err(bad)?,
+                            i.len("tiers").map_err(bad)?,
+                            i.len("index").map_err(bad)?,
                         );
-                        i.end().map_err(&bad)?;
+                        i.end().map_err(bad)?;
                         self.opened()?
                             .work
                             .bind_opened(Path::new(&path), bytes, tiers, index)?;
                     }
                     1 => {
-                        let tiers = i.len("tiers").map_err(&bad)?;
-                        let index = i.len("index").map_err(&bad)?;
-                        let remote = read_endpoint(&mut i).map_err(&bad)?;
-                        i.end().map_err(&bad)?;
+                        let tiers = i.len("tiers").map_err(bad)?;
+                        let index = i.len("index").map_err(bad)?;
+                        let remote = read_endpoint(&mut i).map_err(bad)?;
+                        i.end().map_err(bad)?;
                         let ip = self.local_ip;
                         let endpoint =
                             self.opened()?.work.bind_remote(tiers, index, &remote, ip)?;
@@ -1547,8 +1616,8 @@ impl Session<'_> {
                 self.asked = p;
             }
             Tag::Reset => {
-                let phase = i.u8("reset phase").map_err(&bad)?;
-                i.end().map_err(&bad)?;
+                let phase = i.u8("reset phase").map_err(bad)?;
+                i.end().map_err(bad)?;
                 if phase != self.reset_phase || phase > 2 {
                     return Err(bad(format!(
                         "remote reset phase {phase}, expected {}",

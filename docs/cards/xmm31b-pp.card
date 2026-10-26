@@ -1,0 +1,46 @@
+# Round xmm31b: MiniMax-M3.1's expert stream pays. The ring pass runs the streamed slots as route GEMMs over the
+# ring's half (the 32-value GEMM over the NVFP4 planes, one weight read a tile of up to 64 slots of a unit) instead of
+# the `_sel` gemv that read the whole expert again for every slot; one GEMM batch a landing batch, behind its own
+# copies; the plan keeps the ring's room (PlanInputs::with_stream, 2 x 32 slots + the pass's buffers); the serve
+# seat resolves BLOOMERY_XSTREAM by the common rule (unset + place a + residency -> split).
+#
+# Decomposition per routed layer of one walk (group 2 x 128-row units = 256 columns, 1,024 slots over 128 experts),
+# A6000 plan a, base measured pp4096 91.9 tok/s (int039 32f6dae33, 128-row units) -> ~46 ms a layer-walk, the host
+# union the wall (~433 host slots a unit at c = 66..80 us; card front ~2 ms and PCIe ~0.25 ms under it).
+#   The stream rule's crossover m* = (b/r + f)/(c - k): b/r = 31.85 MB / 26.28 GB/s = 1,210 us (the lane alone;
+#   beside the union ~1.6x that), f = 90 us (one read of the expert's planes by each of the walk's two units at the
+#   card's DRAM rate), k = 2 us a column (the expert's int8 MMAs), c = 73 us -> m* = 18 (lane) .. 29 (beside).
+#   With the `_sel` ring pass (k = 45, f = 0) m* was 43..72: nothing past the hot tail streamed.
+#   The host experts left by residency are the colder ones: ~110 a layer averaging ~8 columns a walk; the tail past
+#   m* is ~3..12 experts of ~20..30 columns -> 60..360 of the walk's ~866 host columns move to the card.
+#   Per layer-walk after: host 866 - moved columns at c (~33..44 ms); PCIe 3..12 x 1.21 ms at the beside rate
+#   (6..23 ms) under it; card ring pass 3..12 x 90 us + moved x 2 us (< 2 ms) and the card's own `_sel` route
+#   (~7 ms a unit) under it. Wall = host. The plan's 2.06 GB ring room takes ~6 % of the card's experts back to the
+#   host (+~1.5 % host columns). => pp4096 +10..+60 %; pp512 (two walks) read beside, same mechanism.
+# The one term the derivation cannot fix: how many host experts a walk routes past m* (the count tail), which the
+# run measures through the wall.
+# Runner (lead, after a base build of bloomery-serve at int039 b1bdd271d in <base-dir>, this tree in bloomery-xmm31b):
+# BLOOMERY_REMOTE='~/repo/bloomery-xmm31b' BLOOMERY_MODEL=minimax-m3 BLOOMERY_AB_ROUNDS=2
+# BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/xmm31b-pp.card DEPTH_SERVE_CTX=4224 BLOOMERY_MODEL=minimax-m3'
+# just depth-serve <base-dir>:512 bloomery-xmm31b:512 <base-dir>:4096 bloomery-xmm31b:4096
+# Wall [derived]: build ~8 min + 4 arms x 2 rounds x (load ~120 s + pp ~10..50 s + 128 steps ~9 s), 25..35 min.
+kind: ab
+question: does the ring pass as a route GEMM (with the plan's ring room and the serve seat's split default) lift
+  MiniMax-M3.1's pp4096 over int039 b1bdd271d at the serving defaults by the derived band?
+term: pp tok/s @ P = 4096, bloomery-serve at the serving defaults (place a, BLOOMERY_RESIDENCY unset = the serving
+  word, so a residency), RTX A6000 + host
+  experts, ctx 4224; this tree (BLOOMERY_XSTREAM unset -> split) against int039 b1bdd271d (no stream), paired by
+  round; pp512 read beside, not judged
+unit: %
+predict: +10..+60
+rounds: 2
+condition: one lease, the box quiet, the A6000, a fresh server an arm and a round; the changed arm's stderr shows
+  `xstream=split (unset: --place a with a residency)` (not the XSTREAM_ROOM fallback to admit) and its load line's
+  plan with the ring's room; distinct tokens of the 128 steps equal between the arms within the greedy margin
+decide-in: land; then the ring pass's per-column cost k and the count tail from a BLOOMERY_STEP_STATS=1 generate
+  run's stream records as the next card (the costs' f and k from records, not derivation)
+decide-below: read the stream records first (gate_minimaxm3_prefill's stream arm at the real tier, or a generate
+  run with BLOOMERY_STEP_STATS=1): streamed near 0 a layer means the rule's m* or the beside rate cut the tail,
+  streamed in the band with the wall unmoved means the copies beside the union bind (price r from lane_gbs)
+decide-above: check the distinct tokens and the base arm's rate (91.9 at 32f6dae33) before believing it; then
+  re-derive the host columns a walk keeps from the records

@@ -24,10 +24,10 @@
 //!
 //! The attention half splits by the plan's kind, as the gemv arm does: head
 //! 256 with its gate ([`GqaKind::Gated256`]) and head 128
-//! ([`GqaKind::Neox128`]), whose three parts run over buffer views
-//! ([`Neox128Rows`]), so the arena of this arm and the whole-card GEMM
-//! prefill's (`ubatch.rs`, through [`neox_128_rows`]) both lend them their
-//! rows.
+//! ([`GqaKind::Neox128`], [`GqaKind::Head128`]), whose three parts run over
+//! buffer views ([`Neox128Rows`]), so the arena of this arm and the
+//! whole-card GEMM prefill's (`ubatch.rs`, through [`neox_128_rows`]) both
+//! lend them their rows.
 //!
 //! Numeric class. A wide op computes a token's values from that token's
 //! inputs alone — the GEMM accumulates each (slot, row) on its own, the
@@ -43,22 +43,22 @@ use super::body35::Body35;
 use super::dispatch::{Ctx, PassCtx};
 use super::experts::CombineArgs;
 use super::hostleg::{HostCombineArgs, HostLegKernels};
-use super::plan::{DeltaPlan, FfnPlan, FfnRoute, GqaKind, GqaPlan, SharedPlan, SiteTy};
+use super::plan::{DeltaPlan, FfnPlan, FfnRoute, GqaKind, GqaPlan, Pairs, SharedPlan, SiteTy};
 use super::program::{Program, Tail};
 use super::router::MAX_TOKENS;
 use super::scratch::{
-    ApartForms, Append128, Append256, Arena, Dims, Forms, GdnArena, KvPlanes, PrefillFlash, Route,
-    Wants,
+    ApartForms, Append128, Append256, AppendNorm, Arena, Dims, Forms, GdnArena, KvPlanes,
+    PrefillFlash, Route,
 };
 use super::taps35::Ffn35Run;
 use crate::flash_gqa::{HEAD, HEAD_256, partials_ms_len, partials_v_len, partials_v_len_256};
 use crate::gated_quant::GateLayout;
 use crate::gemm::{GEMM_MAX_SLOTS, Gemm32Kernels, GemmInput, GemmRoute};
-use crate::host::xstream::RingLayer;
+pub(super) use crate::host::xstream::{RingStacks, with_ring_windows};
 use crate::hybrid::HOST;
 use crate::kquant::Act;
 use crate::linear::{self, LinearShape};
-use crate::model::fit::{act_col_bytes, act32_col_bytes, route_bytes};
+use crate::model::fit::{act_col_bytes, route_bytes};
 use crate::model::lookup::{f32_gain, f32_tensor};
 use crate::model::{GpuModel, MAX_PASS_ROWS};
 use crate::q38::OutGateArgs;
@@ -67,9 +67,7 @@ use crate::tensor::{DeviceTensor, WindowMut};
 use crate::weights::Weights;
 use crate::{FaultSink, Gpu, GpuError};
 use chain::arch::qwen3moe::walk;
-use cuda_core::{CudaContext, CudaEvent, CudaStream, DeviceBuffer};
-use std::mem::ManuallyDrop;
-use std::sync::Arc;
+use cuda_core::{CudaEvent, CudaStream, DeviceBuffer};
 
 /// The most rows an op runs through its gemv arm — ik's matrix-vector cut
 /// (`ne[1] <= 8`), and the rows of a captured pass. Past it, the wide arm.
@@ -108,9 +106,9 @@ pub(super) struct Wide {
 
 /// The wide part's buffers of a layer that keeps its shared expert apart
 /// from its routed stacks: the routed table and its map, the slots' card
-/// list the combine reads, the shared expert's gate, up and SwiGLU rows with
-/// the SwiGLU's forms its downs read, its output and the zero host sum
-/// (`scratch::ApartRows`, the gemv arm's twin).
+/// list the combine reads, the shared expert's gate and up rows, its
+/// SwiGLU's forms its downs read (the f32 rows among them), its output and
+/// the zero host sum (`scratch::ApartRows`, the gemv arm's twin).
 struct WideApart {
     /// Expert `e`'s place in the routed stacks: `e` for each routed id,
     /// [`HOST`] for the shared expert's (the routed count), so the routed
@@ -122,7 +120,6 @@ struct WideApart {
     sel: DeviceBuffer<u32>,
     g: DeviceBuffer<f32>,
     u: DeviceBuffer<f32>,
-    h: DeviceBuffer<f32>,
     act_h: WideActs,
     y: DeviceBuffer<f32>,
     zero: DeviceBuffer<f32>,
@@ -149,15 +146,14 @@ impl WideApart {
             sel: DeviceBuffer::zeroed(stream, slots)?,
             g: f(rows * d.ff)?,
             u: f(rows * d.ff)?,
-            h: f(rows * d.ff)?,
-            act_h: WideActs::new(stream, (forms.h.q128, forms.h.q32), rows, d.ff)?,
+            act_h: WideActs::new(stream, forms.h, rows, d.ff)?,
             y: f(rows * d.hidden)?,
             zero: f(rows * d.hidden)?,
         })
     }
 
     fn bytes(&self) -> usize {
-        [&self.g, &self.u, &self.h, &self.y, &self.zero]
+        [&self.g, &self.u, &self.y, &self.zero]
             .iter()
             .map(|b| b.num_bytes())
             .sum::<usize>()
@@ -191,14 +187,9 @@ impl Wide {
         }
         let f = |n: usize| DeviceBuffer::<f32>::zeroed(stream, n);
         Ok(Wide {
-            act_hid: WideActs::new(stream, (forms.hid.q128, forms.hid.q32), rows, d.hidden)?,
-            act_attn: WideActs::new(
-                stream,
-                (forms.attn.q128, forms.attn.q32),
-                rows,
-                d.attn_len(),
-            )?,
-            act_h: WideActs::new(stream, (forms.h.q128, forms.h.q32), slots, d.ff)?,
+            act_hid: WideActs::new(stream, forms.hid, rows, d.hidden)?,
+            act_attn: WideActs::new(stream, forms.attn, rows, d.attn_len())?,
+            act_h: WideActs::new(stream, forms.h, slots, d.ff)?,
             up: f(slots * d.ff)?,
             attn_o: f(rows * d.hidden)?,
             dense: GemmRoute::new(stream, rows, 1)?,
@@ -224,11 +215,6 @@ impl Wide {
             + self.moe.as_ref().map_or(0, GemmRoute::bytes)
             + self.apart.as_ref().map_or(0, WideApart::bytes)
     }
-}
-
-/// Bytes of one wide input's forms `want` over `cols` columns of `k`.
-fn wants_bytes(want: Wants, cols: usize, k: usize) -> usize {
-    cols * (usize::from(want.q128) * act_col_bytes(k) + usize::from(want.q32) * act32_col_bytes(k))
 }
 
 /// Bytes of a delta layer's intermediates for `rows` tokens
@@ -276,9 +262,9 @@ pub(super) fn arena_bytes(d: &Dims, rows: usize, forms: Forms) -> usize {
     };
     let wide = if rows > GEMV_COLS {
         let s = rows * slots;
-        wants_bytes(forms.hid, rows, d.hidden)
-            + wants_bytes(forms.attn, rows, att)
-            + wants_bytes(forms.h, s, d.ff)
+        forms.hid.bytes(rows, d.hidden)
+            + forms.attn.bytes(rows, att)
+            + forms.h.bytes(s, d.ff)
             + (s * d.ff + rows * d.hidden) * 4
             + route_bytes(rows, 1)
             + d.router.map_or(0, |r| route_bytes(s, r.logits()))
@@ -295,8 +281,8 @@ pub(super) fn arena_bytes(d: &Dims, rows: usize, forms: Forms) -> usize {
                 + (1..=n).map(|m| m * act_col_bytes(d.ff)).sum::<usize>();
             let wide = if rows > GEMV_COLS {
                 let s = rows * slots;
-                (s + r.experts() + 1 + 3 * rows * d.ff + 2 * rows * d.hidden) * 4
-                    + wants_bytes(a.h, rows, d.ff)
+                (s + r.experts() + 1 + 2 * rows * d.ff + 2 * rows * d.hidden) * 4
+                    + a.h.bytes(rows, d.ff)
                     + route_bytes(s, r.experts())
             } else {
                 0
@@ -390,7 +376,7 @@ pub(super) fn route_dense(c: &Ctx<'_>, s: &mut Arena, m: usize) -> Result<(), Gp
 pub(super) fn attn_in(c: &Ctx<'_>, n: &GqaPlan, s: &mut Arena, m: usize) -> Result<(), GpuError> {
     match n.kind {
         GqaKind::Gated256 => gated_256_in(c, n, s, m),
-        GqaKind::Neox128 => {
+        GqaKind::Neox128 | GqaKind::Head128 { .. } => {
             let d = s.dims;
             let env = (c.gpu, c.w, c.k);
             neox_128_in(env, (c.eps, c.sink), n, (&d, m), &mut neox_rows(s)?)
@@ -412,7 +398,7 @@ pub(super) fn attn_core(
 ) -> Result<(), GpuError> {
     match n.kind {
         GqaKind::Gated256 => gated_256_core(c, n, kv, s, m),
-        GqaKind::Neox128 => {
+        GqaKind::Neox128 | GqaKind::Head128 { .. } => {
             let d = s.dims;
             let env = (c.gpu, c.w, c.k);
             let at = (c.table, c.eps, c.sink);
@@ -427,7 +413,7 @@ pub(super) fn attn_core(
 pub(super) fn attn_out(c: &Ctx<'_>, n: &GqaPlan, s: &mut Arena, m: usize) -> Result<(), GpuError> {
     match n.kind {
         GqaKind::Gated256 => gated_256_out(c, n, s, m),
-        GqaKind::Neox128 => {
+        GqaKind::Neox128 | GqaKind::Head128 { .. } => {
             let d = s.dims;
             neox_128_out((c.gpu, c.w, c.k), n, (&d, m), &mut neox_rows(s)?)
         }
@@ -628,7 +614,7 @@ fn gated_256_out(c: &Ctx<'_>, n: &GqaPlan, s: &mut Arena, m: usize) -> Result<()
 }
 
 /// The arena's buffers as a head-128 attention half's views
-/// ([`GqaKind::Neox128`], [`Neox128Rows`]).
+/// ([`GqaKind::Neox128`], [`GqaKind::Head128`], [`Neox128Rows`]).
 fn neox_rows(s: &mut Arena) -> Result<Neox128Rows<'_>, GpuError> {
     let Arena {
         x,
@@ -754,9 +740,12 @@ fn neox_128_in(
     Ok(())
 }
 
-/// The head-128 half's middle at `t` rows over `b`'s views: the q/k norm and
-/// rope with the K/V rows appended to the layer's planes, the prefill flash,
-/// and the flash rows quantized into the forms the output projection reads.
+/// The head-128 half's middle at `t` rows over `b`'s views: the turn with the
+/// K/V rows appended to the layer's planes, the prefill flash at the layer's
+/// layout (`n.flash`), and the flash rows quantized into the forms the output
+/// projection reads. The turn follows the plan's kind: the head norm with the
+/// NEOX turn ([`GqaKind::Neox128`]) or the NORM turn with no head norm
+/// ([`GqaKind::Head128`]); any other kind is refused by name.
 fn neox_128_core(
     (gpu, w, k): (&Gpu, &Weights, &Kernels),
     (table, eps, sink): (&DeviceBuffer<f32>, f32, FaultSink),
@@ -764,30 +753,60 @@ fn neox_128_core(
     (d, t): (&Dims, usize),
     b: &mut Neox128Rows<'_>,
 ) -> Result<(), GpuError> {
+    const WHAT_N: &str = "qwen3moe::wide::neox_128_core";
     let stream = gpu.stream();
-    // SAFETY: the sequence uploads consecutive positions for its rows; different sequences use disjoint planes.
-    unsafe {
-        kv.append_128(
-            &k.neox,
+    match n.kind {
+        GqaKind::Neox128 => {
+            // SAFETY: the sequence uploads consecutive positions for its rows; different sequences use disjoint planes.
+            unsafe {
+                kv.append_128(
+                    &k.neox,
+                    stream,
+                    Append128 {
+                        q: &mut *b.q,
+                        k: &mut *b.k,
+                        v: &*b.v,
+                        gq: f32_gain(w, &n.attn_q_norm)?,
+                        gk: f32_gain(w, &n.attn_k_norm)?,
+                        table,
+                        pos: b.pos,
+                        eps,
+                        n_head: d.n_head,
+                        n_kv: d.n_kv,
+                        ctx: d.ctx,
+                        m: t,
+                        fault: sink,
+                    },
+                )
+            }?
+        }
+        GqaKind::Head128 {
+            pairs: Pairs::Norm,
+            head_norm: false,
+        } => kv.append_norm(
+            &k.q35(WHAT_N)?.norm,
             stream,
-            Append128 {
+            AppendNorm {
                 q: &mut *b.q,
                 k: &mut *b.k,
                 v: &*b.v,
-                gq: f32_gain(w, &n.attn_q_norm)?,
-                gk: f32_gain(w, &n.attn_k_norm)?,
                 table,
                 pos: b.pos,
-                eps,
                 n_head: d.n_head,
                 n_kv: d.n_kv,
                 ctx: d.ctx,
                 m: t,
                 fault: sink,
             },
-        )
-    }?;
-    kv.prefill_128(
+        )?,
+        other => {
+            return Err(GpuError::shape(
+                WHAT_N,
+                format!("the {other:?} kind in a head-128 attention half"),
+            ));
+        }
+    }
+    kv.prefill_head128(
         &k.prefill,
         stream,
         PrefillFlash {
@@ -801,6 +820,7 @@ fn neox_128_core(
             fault: sink,
             y: &mut *b.attn,
         },
+        n.flash,
     )?;
     b.out
         .quantize(gpu, &wide_kernels(k), sink, b.attn, t, &[n.o_ty])
@@ -1165,12 +1185,10 @@ pub(super) struct CardRoute<'a> {
 }
 
 /// The shared expert's rows in the wide part of a layer that keeps it apart:
-/// its gate, up and SwiGLU rows with the SwiGLU's forms its down reads, and
-/// its output.
+/// its gate and up rows, the SwiGLU's forms its down reads, and its output.
 struct SharedRows<'a> {
     g: &'a mut DeviceBuffer<f32>,
     u: &'a mut DeviceBuffer<f32>,
-    h: &'a mut DeviceBuffer<f32>,
     act_h: &'a mut WideActs,
     y: &'a mut DeviceBuffer<f32>,
 }
@@ -1222,7 +1240,6 @@ pub(super) fn ffn_card(
             moe,
             g,
             u,
-            h: sh_h,
             act_h: sh_act,
             y,
             ..
@@ -1230,7 +1247,6 @@ pub(super) fn ffn_card(
         let shared = SharedRows {
             g,
             u,
-            h: sh_h,
             act_h: sh_act,
             y,
         };
@@ -1261,7 +1277,6 @@ pub(super) fn ffn_card(
     let SharedRows {
         g,
         u,
-        h: sh_h,
         act_h: sh_act,
         y: sh_y,
     } = shared.ok_or(GpuError::state(
@@ -1283,7 +1298,7 @@ pub(super) fn ffn_card(
         x: &hid,
         gate: g,
         up: u,
-        rows: sh_act.swiglu_rows(Some(sh_h)),
+        rows: sh_act.swiglu_rows(),
         y: sh_y,
     };
     site::gated(gpu, &wide_kernels(c.k), &shared, (m, m), io, c.sink)
@@ -1384,56 +1399,6 @@ pub(super) fn ffn_combine(
     )
 }
 
-/// A half of the expert stream's ring as the routed GEMMs read a layer's
-/// stacks ([`ffn_ring`]): its gate, up and down, each a stack of the half's
-/// slots at the layer's own types and row words.
-pub(super) struct RingStacks<'a> {
-    pub(super) gate: &'a DeviceTensor<u32>,
-    pub(super) up: &'a DeviceTensor<u32>,
-    pub(super) down: &'a DeviceTensor<u32>,
-}
-
-/// Layer `r`'s stream on the card for the length of `f`: its union map of
-/// `n_expert` words, and its half's gate, up and down ([`RingStacks`]),
-/// `half_slots` experts of `rows[p]` rows of `cols[p]` words in each part
-/// `p`; the windows are given back after `f` on every path.
-pub(super) fn with_ring_windows<T>(
-    r: &RingLayer,
-    ctx: &Arc<CudaContext>,
-    n_expert: usize,
-    rows: [usize; 3],
-    cols: [usize; 3],
-    f: impl FnOnce(&DeviceBuffer<u32>, &RingStacks<'_>) -> Result<T, GpuError>,
-) -> Result<T, GpuError> {
-    // SAFETY: the stream's union row is `n_expert` words of its mapped host
-    // rows, and its half holds `half_slots` experts of the layer's part bytes
-    // in each part from the half's first slot — its gate and up rows of the
-    // card stacks' words, its down rows likewise (`XStream::ring_layer`); all
-    // stay allocated while the stream lives, past `f`'s launches, and the
-    // windows are given back below.
-    let (union_map, gate, up, down) = unsafe {
-        (
-            crate::tensor::window::<u32>(r.union_map, n_expert, ctx),
-            DeviceTensor::<u32>::window(r.parts[0], r.half_slots * rows[0], cols[0], ctx),
-            DeviceTensor::<u32>::window(r.parts[1], r.half_slots * rows[1], cols[1], ctx),
-            DeviceTensor::<u32>::window(r.parts[2], r.half_slots * rows[2], cols[2], ctx),
-        )
-    };
-    let ran = f(
-        &union_map,
-        &RingStacks {
-            gate: &gate,
-            up: &up,
-            down: &down,
-        },
-    );
-    drop(ManuallyDrop::into_inner(union_map).into_raw_parts());
-    for w in [gate, up, down] {
-        DeviceTensor::release(w);
-    }
-    ran
-}
-
 /// The ring's part of the apart arm of [`experts`] over `m` rows, after
 /// [`ffn_card`] and before [`ffn_combine`]: one GEMM batch of a layer's
 /// stream — the routed table over the ring's half from the batch's map
@@ -1521,7 +1486,7 @@ fn slots_gemm(
         x: hid,
         gate: h,
         up,
-        rows: act_h.swiglu_rows(None),
+        rows: act_h.swiglu_rows(),
         y: down,
     };
     site::gated(

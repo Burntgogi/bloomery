@@ -14,7 +14,7 @@ An input is an ELF binary (objdump runs on it; the box) or a saved listing (any 
                                           functions one side lacks
     asm-census.py tile-units LISTING RELOCS QDOT_LIB OPS_RS
                                           the host expert tier's tile cost rows, derived from the disassembly
-                                          of qdot's tile kernels and compared with `tile_units` in ops.rs
+                                          of qdot's tile and wide kernels and compared with `tile_units` in ops.rs
                                           (rc 1 when a type's row is missing, stale or off); tools/ref/tile-units.sh
                                           builds the inputs
     asm-census.py --self-test             canned listings
@@ -144,10 +144,18 @@ def diff(a, b):
 # latch (`add $s, %r; cmp $n, %r; jne header` from a zeroed %r); a trip count the code does not show is a named
 # error, never a guess. The failure mode this blocks: a qdot tile change (a kernel, a column count, the inlining
 # around it) that leaves the balancer's table stale, so the lanes are cut by a cost the code no longer has.
+#
+# A type with a wide kernel (qdot's `has_wide`) is priced at runs of up to qdot::WIDE_COLS columns, so its row is
+# fitted through the wide kernel's block loop at WIDE_FIT columns instead. That kernel takes its column count at run
+# time: its block loop holds a group loop whose trip dispatches on the group's width, and at a whole number of groups
+# every trip runs the full group's arm. So a trip of the group loop is its heaviest path (its inner loops at their
+# trips), the group loop runs C / WIDE_GROUP trips, and the block loop's trip is its own heaviest path around it.
 
 FIT_COLS = (2, 4)       # the column counts the rows are fitted through (two points, the form the table's first rows were derived in)
 LIN_COLS = (3, 5, 6)    # read back against the fit: a loop that stops being straight-line code shows here
 TILE_COLS = 8           # qdot::TILE_COLS: the widest run a tile takes
+WIDE_FIT = (16, 32)     # a wide kernel's rows are fitted through these runs (whole groups of qdot::WIDE_GROUP)
+WIDE_FNS = ("qdot::dot_{t}_q8k_wide_avx2", "qdot::wide_{t}", "qdot::dot_row_cols_wide")  # the first one the listing holds: inlining moves the kernel up its callers
 TOL = 0.05              # a table row stands while its cost, at every run width 1..TILE_COLS, is within this
 X4_BLOCKS = 4           # a 32-value type's block loop takes one x4 group (qdot::Q82X4) of four blocks an iteration
 ROW_FMT = "        GgmlType::{ty} => Some(({fixed}, {per_col})),"
@@ -203,14 +211,16 @@ def operands(ins):
 
 class Cfg:
     """The basic blocks of one function, their dominators and natural loops. The function's one indirect jump is
-    its jump table's dispatch (`table`: entry offsets); a second one is not modelled."""
+    its jump table's dispatch (`table`: entry offsets); a function with neither has no dispatch, and a second
+    indirect jump is not modelled."""
 
     def __init__(self, body, table):
         self.body = body
         self.pos = {a: i for i, (a, _) in enumerate(body)}
         ind = [i for i, (_, ins) in enumerate(body) if re.match(r"jmpq?\s+\*", ins)]
-        if len(ind) != 1 or not table:
-            raise TileError(f"want one indirect jump and its jump table, found {len(ind)} jumps and {len(table)} entries")
+        if (len(ind), bool(table)) not in ((1, True), (0, False)):
+            raise TileError(f"want one indirect jump and its jump table, or neither; found {len(ind)} jumps and "
+                            f"{len(table)} entries")
         self.entries = []
         for t in table:
             if t not in self.pos:
@@ -359,13 +369,51 @@ class Cfg:
             outside = self.pred[outside[0]]
         return False
 
+    def inner_loops(self, header):
+        """The headers of the loops directly inside the loop at `header`."""
+        blocks = self.loops[header]
+        inner = [h for h, b in self.loops.items() if h != header and h in blocks and b < blocks]
+        return [h for h in inner if not any(g != h and h in self.loops[g] and self.loops[h] < self.loops[g] for g in inner)]
+
     def dynamic(self, header):
         """Instructions one trip of the loop at `header` runs: its blocks once, an inner loop by its trips."""
         blocks = self.loops[header]
-        inner = [h for h, b in self.loops.items() if h != header and h in blocks and b < blocks]
-        top = [h for h in inner if not any(g != h and h in self.loops[g] and self.loops[h] < self.loops[g] for g in inner)]
+        top = self.inner_loops(header)
         own = blocks - set().union(*[self.loops[h] for h in top]) if top else blocks
         return self.count(own) + sum(self.trips(h) * self.dynamic(h) for h in top)
+
+    def heaviest(self, header, inner):
+        """Instructions on the heaviest path of one trip of the loop at `header`, from the header to a back edge:
+        a loop directly inside it is one step of `inner(its header)` instructions, every other block its own count.
+        A trip that takes one of several arms runs the heaviest."""
+        blocks = self.loops[header]
+        top = set(self.inner_loops(header))
+        rep = {b: b for b in blocks}
+        for h in top:
+            for b in self.loops[h]:
+                rep[b] = h
+        succ = collections.defaultdict(set)
+        for u in blocks:
+            for v in self.succ[u]:
+                if v in blocks and v != header and rep[v] != rep[u]:
+                    succ[rep[u]].add(rep[v])
+        latch = {rep[u] for u in blocks if header in self.succ[u]}
+        where = f"the loop at {self.body[self.blocks[header][0]][0]:#x}"
+        memo, walking = {}, set()
+
+        def best(r):
+            if r not in memo:
+                if r in walking:
+                    raise TileError(f"{where}: a cycle no loop inside it accounts for")
+                walking.add(r)
+                ways = [best(w) for w in succ[r]] + ([0] if r in latch else [])
+                if not ways:
+                    raise TileError(f"{where}: the block at {self.body[self.blocks[r][0]][0]:#x} reaches no back edge")
+                walking.discard(r)
+                memo[r] = (inner(r) if r in top else self.count([r])) + max(ways)
+            return memo[r]
+
+        return best(header)
 
 
 def tile_arms(lines, rel_lines, c, nkinds):
@@ -402,6 +450,47 @@ def qdot_tiles(src):
     return kinds, ty_kind, gran
 
 
+def qdot_wide(src):
+    """({GgmlType names qdot's `has_wide` takes}, WIDE_COLS, WIDE_GROUP) from qdot's source; a qdot with no
+    `has_wide` has no wide kernel (an empty set)."""
+    m = re.search(r"pub fn has_wide\(.*?\{(.*?)\n\}", src, re.S)
+    if not m:
+        return set(), None, None
+    tys = set(re.findall(r"GgmlType::(\w+)", m.group(1)))
+    cols = re.search(r"pub const WIDE_COLS: usize = (\d+);", src)
+    group = re.search(r"const WIDE_GROUP: usize = (\d+);", src)
+    if not tys or not cols or not group:
+        raise TileError("qdot's has_wide, WIDE_COLS or WIDE_GROUP is not in the shape the derivation reads")
+    cols, group = int(cols.group(1)), int(group.group(1))
+    if any(c % group or c > cols for c in WIDE_FIT):
+        raise TileError(f"the wide runs {WIDE_FIT} are not whole groups of WIDE_GROUP = {group} within WIDE_COLS = {cols}")
+    return tys, cols, group
+
+
+def wide_units(lines, rel_lines, ty, group):
+    """(function, {C: instructions the wide kernel's block loop runs a trip at C columns}) for each C of WIDE_FIT. The
+    kernel is the first of WIDE_FNS the listing holds; its block loop is its outer loop with the most instructions,
+    the group loop the loop directly inside that with the most."""
+    fns, secs = functions(lines), text_sections(lines)
+    names = [n.format(t=ty.lower().replace("_", "")) for n in WIDE_FNS]
+    held = [n for n in names if n in fns]
+    if not held:
+        raise TileError(f"{ty} has a wide kernel and the listing holds none of {', '.join(names)}")
+    name = held[0]
+    cfg = Cfg(fns[name], jump_table(rel_lines, secs[name]))
+    outer = [h for h in cfg.loops if not any(g != h and h in cfg.loops[g] and cfg.loops[h] < cfg.loops[g] for g in cfg.loops)]
+    if not outer:
+        raise TileError(f"{name}: no loop")
+    block = max(outer, key=lambda h: cfg.count(cfg.loops[h]))
+    inner = cfg.inner_loops(block)
+    if not inner:
+        raise TileError(f"{name}: the block loop holds no group loop")
+    grp = max(inner, key=lambda h: cfg.count(cfg.loops[h]))
+    trip = cfg.heaviest(grp, lambda h: cfg.trips(h) * cfg.dynamic(h))
+    return name, {c: cfg.heaviest(block, lambda h, c=c: c // group * trip if h == grp else cfg.trips(h) * cfg.dynamic(h))
+                  for c in WIDE_FIT}
+
+
 def ops_tile_units(src):
     """{GgmlType name: (fixed, per_col)} from `tile_units` in ops.rs."""
     m = re.search(r"fn tile_units\(ty: GgmlType\) -> Option<\(u64, u64\)> \{\s*match ty \{(.*?)\n    \}", src, re.S)
@@ -422,6 +511,7 @@ def tile_units(lines, rel_lines, qdot_src, ops_src):
     """(rows, red): one row per type a tile kernel serves, `{ty, kind, gran, counts, fixed, per_col, lin, table,
     dev, status}`, and the number of rows that are not green."""
     kinds, ty_kind, gran = qdot_tiles(qdot_src)
+    wide_tys, wide_cols, group = qdot_wide(qdot_src)
     table = ops_tile_units(ops_src)
     cs = sorted(FIT_COLS + LIN_COLS)
     per_c = {c: tile_arms(lines, rel_lines, c, len(kinds)) for c in cs}
@@ -439,12 +529,17 @@ def tile_units(lines, rel_lines, qdot_src, ops_src):
         row = {"ty": ty, "kind": kind, "gran": gran[ty], "counts": {c: per_c[c][k][0] for c in cs},
                "fixed": round(f), "per_col": round(p),
                "lin": max(abs(f + c * p - units[c]) / units[c] for c in LIN_COLS), "table": table.get(ty)}
+        runs = TILE_COLS
+        if ty in wide_tys:
+            row["wide_fn"], row["wide"] = wide_units(lines, rel_lines, ty, group)
+            f, p = fit([(c, 2 * row["wide"][c]) for c in WIDE_FIT])
+            row["fixed"], row["per_col"], runs = round(f), round(p), wide_cols
         if row["table"] is None:
             row["dev"], row["status"] = None, "MISSING"
         else:
             tf, tp = row["table"]
             row["dev"] = max(abs((tf + c * tp) - (row["fixed"] + c * row["per_col"])) / (row["fixed"] + c * row["per_col"])
-                             for c in range(1, TILE_COLS + 1))
+                             for c in range(1, runs + 1))
             row["status"] = "ok" if row["dev"] <= TOL else "STALE"
         red += row["status"] != "ok"
         rows.append(row)
@@ -464,6 +559,11 @@ def tile_units_report(rows, red):
         tab = f"({r['table'][0]}, {r['table'][1]})" if r["table"] else "-"
         dev = f"{100 * r['dev']:.1f}%" if r["dev"] is not None else "-"
         out.append(f"{r['ty']:8} {r['kind']:7} {r['gran']:>4} {counts:28} {fit_s:>20} {100 * r['lin']:5.1f}% {tab:>10} {dev:>6}  {r['status']}")
+    for r in rows:
+        if "wide" in r:
+            out.append(f"{r['ty']}: fitted through its wide kernel {r['wide_fn']}, block loop instrs C="
+                       + ",".join(map(str, WIDE_FIT)) + " " + ",".join(str(r["wide"][c]) for c in WIDE_FIT)
+                       + "; the row stands at runs up to WIDE_COLS")
     out.append("rows (derived):")
     out += [ROW_FMT.format(ty=r["ty"], fixed=r["fixed"], per_col=r["per_col"]) for r in rows if r["fixed"] is not None]
     out.append(f"tile-units: {len(rows) - red} of {len(rows)} rows within {int(TOL * 100)} % of the derivation" if not red else
@@ -517,6 +617,59 @@ def canned_tile(cs=(2, 3, 4, 5, 6), trip_cmp="cmpq\t$0x20, %rax", tail=True):
     return lst, rel
 
 
+def canned_wide(name="qdot::dot_q4k_q8k_wide_avx2"):
+    """(listing lines, relocation lines) of a wide kernel shaped as qdot's: a block loop holding a pack loop of eight
+    trips and a group loop, whose trip takes a range check to the full group's arm or a jump table to arms 1..7 (the
+    full arm an inner loop of eight trips); a short reduction loop after. A block trip runs 105 instructions besides
+    its groups and a full group's trip 160 (the heaviest arm), so C = 16 runs 425 and C = 32 745: fixed 210, per_col
+    40 in units."""
+    prog = []
+
+    def fill(n):
+        prog.extend((None, "vaddps\t%ymm0, %ymm1, %ymm2") for _ in range(n))
+
+    prog += [(None, "pushq\t%rbp"), (None, "xorl\t%r8d, %r8d")]
+    prog.append(("OUTER", "vxorps\t%xmm0, %xmm0, %xmm0"))
+    fill(37)
+    prog.append((None, "xorl\t%eax, %eax"))
+    prog.append(("PACK", "vaddps\t%ymm0, %ymm1, %ymm2"))
+    fill(3)
+    prog += [(None, "addq\t$0x4, %rax"), (None, "cmpq\t$0x20, %rax"), (None, "jne\tPACK")]
+    fill(5)
+    prog += [(None, "testq\t%rdx, %rdx"), (None, "je\tBLATCH")]
+    prog.append(("GROUP", "vaddps\t%ymm0, %ymm1, %ymm2"))
+    fill(1)
+    prog += [(None, "cmpq\t$0x6, %rcx"), (None, "ja\tARM8"), (None, "leaq\t(%rip), %rdi"),
+             (None, "movslq\t(%rdi,%rcx,4), %rcx"), (None, "addq\t%rdi, %rcx"), (None, "jmpq\t*%rcx")]
+    for g in range(1, 8):
+        prog.append((f"ARM{g}", "vaddps\t%ymm0, %ymm1, %ymm2"))
+        fill(10 * g - 1)
+        prog.append((None, "jmp\tGLATCH"))
+    prog.append(("ARM8", "vaddps\t%ymm0, %ymm1, %ymm2"))
+    fill(39)
+    prog.append((None, "xorl\t%eax, %eax"))
+    prog.append(("A8", "vaddps\t%ymm0, %ymm1, %ymm2"))
+    fill(10)
+    prog += [(None, "addq\t$0x4, %rax"), (None, "cmpq\t$0x20, %rax"), (None, "jne\tA8")]
+    prog += [("GLATCH", "addq\t$0x8, %r8"), (None, "cmpq\t%rdx, %r8"), (None, "jne\tGROUP")]
+    prog += [("BLATCH", "vaddps\t%ymm0, %ymm1, %ymm2"), (None, "cmpq\t%rdx, %rsi"), (None, "jne\tOUTER")]
+    prog.append(("HSUM", "vaddps\t%ymm0, %ymm1, %ymm2"))
+    fill(2)
+    prog += [(None, "cmpq\t%rdx, %rsi"), (None, "jne\tHSUM"), (None, "retq")]
+    at = {lab: 4 * i for i, (lab, _) in enumerate(prog) if lab}
+    sec = ".text._RNwide"
+    lst = [f"Disassembly of section {sec}:", "", f"0000000000000000 <{name}>:"]
+    for i, (_, text) in enumerate(prog):
+        m = re.fullmatch(r"(j\w+)\t(\w+)", text)
+        if m:
+            text = f"{m.group(1)}\t{at[m.group(2)]:#x} <{name}+{at[m.group(2)]:#x}>"
+        lst.append(f"{4 * i:8x}:      \t{text}")
+    lst.append("")
+    rel = ["RELOCATION RECORDS FOR [.rodata._RNwide]:", "OFFSET           TYPE                     VALUE"]
+    rel += [f"{4 * (g - 1):016x} R_X86_64_PC32            {sec}+{at[f'ARM{g}'] + 4 * (g - 1):#x}" for g in range(1, 8)]
+    return lst, rel
+
+
 CANNED_QDOT = """enum TileKind {
     Qa,
     Qb,
@@ -534,6 +687,13 @@ pub fn k_granularity(w: GgmlType) -> usize {
         GgmlType::Q5_0 | GgmlType::Q8_0 => 32,
         _ => 256,
     }
+}
+"""
+CANNED_WIDE = """pub const WIDE_COLS: usize = 32;
+#[cfg(target_arch = "x86_64")]
+const WIDE_GROUP: usize = 8;
+pub fn has_wide(w: GgmlType) -> bool {
+    matches!(w, GgmlType::Q4_K) && has_features(w)
 }
 """
 CANNED_OPS = """fn tile_units(ty: GgmlType) -> Option<(u64, u64)> {
@@ -573,8 +733,35 @@ def tile_units_self_test():
         if n != red or any(seen.get(t) != s for t, s in status.items()):
             print(f"asm-census self-test: tile-units {what}: {seen}, {n} red; want {status}, {red}")
             return 1
+    # a wide type's row is fitted through its wide kernel's runs and holds up to WIDE_COLS: the canned kernel's
+    # fixed 210, per_col 40 stand, the tile's (200, 10) is stale, as is a row that holds only to TILE_COLS
+    wl, wr = canned_wide()
+    wq = CANNED_QDOT + CANNED_WIDE
+    for what, ops, status, red in (
+        ("wide row", CANNED_OPS.replace("(200, 10)", "(210, 40)"), "ok", 0),
+        ("wide row from the tile", CANNED_OPS, "STALE", 1),
+        ("wide row held only to TILE_COLS", CANNED_OPS.replace("(200, 10)", "(222, 37)"), "STALE", 1),
+    ):
+        rows, n = tile_units(lst + wl, rel + wr, wq, ops)
+        q = {r["ty"]: r for r in rows}["Q4_K"]
+        got = (q["fixed"], q["per_col"], q.get("wide"), q.get("wide_fn"), q["status"], n)
+        want = (210, 40, {16: 425, 32: 745}, "qdot::dot_q4k_q8k_wide_avx2", status, red)
+        if got != want:
+            print(f"asm-census self-test: tile-units {what}: {got} != {want}")
+            return 1
+    # the derivation reads GNU objdump's jump spelling of the wide kernel the same
+    gnu = [re.sub(r"(\tj\w+\t)0x", r"\1", l) for l in lst + wl]
+    if tile_units(gnu, rel + wr, wq, CANNED_OPS)[0] != tile_units(lst + wl, rel + wr, wq, CANNED_OPS)[0]:
+        print("asm-census self-test: tile-units reads GNU objdump's wide kernel differently")
+        return 1
     # a shape the derivation does not read is a named error, never a guess
     for what, args in (
+        ("a wide type with no wide kernel in the listing", (lst, rel, wq, CANNED_OPS)),
+        ("a wide kernel named for another type", (lst + canned_wide("qdot::dot_q8_0_q8k_wide_avx2")[0], rel + wr, wq,
+                                                  CANNED_OPS)),
+        ("wide runs that are not whole groups", (lst + wl, rel + wr, wq.replace("WIDE_GROUP: usize = 8", "WIDE_GROUP: usize = 12"),
+                                                 CANNED_OPS)),
+        ("a wide kernel whose jump table is gone", (lst + wl, rel, wq, CANNED_OPS)),
         ("a latch that is no counted loop", (canned_tile(trip_cmp="cmpq\t%rbx, %rax")[0], rel, CANNED_QDOT, CANNED_OPS)),
         ("a 32-value type with no tail loop", (canned_tile(tail=False)[0], rel, CANNED_QDOT, CANNED_OPS)),
         ("a jump table of another size", (lst, rel, CANNED_QDOT.replace("Qb,\n", "Qb,\n    Qc,\n"), CANNED_OPS)),

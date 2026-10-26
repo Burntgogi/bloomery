@@ -8,9 +8,10 @@
 //! rows of `n_embd` values each) and down (`n_embd` rows of `ff`). The
 //! parts are each layer's own as the file holds them.
 //! The body's plan rule (`placement::accepts::routed_rule`) admits each part
-//! by the card leg's arm for it, and a layer takes card slots only when every
-//! one of its stacks is routable, so a layer with a stack of another type (a
-//! Q6_K down, which the leg has no down arm for) keeps its experts whole on
+//! by the card leg's arm for it (a Q6_K down among the downs), and a layer
+//! takes card slots only when every one of its stacks is routable, so a layer
+//! with a stack of another type (a Q6_K gate and up, which the leg's gate·up
+//! arm does not run) keeps its experts whole on
 //! the host. On the
 //! card each part of slot `s` is the file's bytes of that expert at byte
 //! `s · part` of its layer's stack, which the placed load uploads as file

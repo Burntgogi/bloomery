@@ -2,7 +2,9 @@
 //! positions ([`prefill`]), which leaves the model where `P` decode steps over
 //! the same ids leave it in everything a later step reads: every layer's key
 //! and value rows at those positions, every sparse layer's index keys, and the
-//! last position's logits.
+//! last position's logits. The flash of both kinds of layer runs in launches
+//! of at most [`FLASH_ROWS`] rows (a sparse layer's as many as the partials
+//! hold), so the partials are sized for a launch and the unit for its rows.
 //!
 //! The walk is the common owner's ([`prompt_walk`]): the units of a group, the
 //! host staging of their rows, the routed block over the unit's slots, the
@@ -18,12 +20,13 @@
 //! ones the blocks their indexer picks.
 
 use bloomery_gpu::arch::hybrid::{Site, WideCx, wide_acts_at};
-use bloomery_gpu::flash_gqa::{GROUP_16, HEAD};
+use bloomery_gpu::flash_gqa::{GROUP_16, GqaArgs, HEAD, SEGMENTS, partials_ms_len, partials_v_len};
 use bloomery_gpu::gemm::{GemmKernels, GemmRoute};
 use bloomery_gpu::head::Head;
 use bloomery_gpu::host::run::HostRun;
 use bloomery_gpu::hybrid::Hybrid;
 use bloomery_gpu::model::GpuModel;
+use bloomery_gpu::prompt_timing::PromptStats;
 use bloomery_gpu::rope_neox::PartialNeoxArgs;
 use bloomery_gpu::rope_table::RopeRows;
 use bloomery_gpu::site::{WideActs, WideKernels};
@@ -32,13 +35,17 @@ use bloomery_gpu::{Gpu, GpuError};
 use bloomery_gpu_deepseek41::prompt_walk::{
     self, Batch as Walk, BatchAttention, BatchBufs, UnitRows,
 };
+use bloomery_gpu_deepseek41::span::{span, span_mut};
 use cuda_core::DeviceBuffer;
+use model::arch::minimaxm3::place;
+use model::arch::place_hybrid::{GEMM_TILE_COLS, GEMM32_STEP};
 use model::embed::EmbedTable;
 use runtime::layer::{FfnKind, Layer};
+use runtime::prompt::chunks;
 
 use crate::attn::{
     AttnArgs, IndexArgs, MsaScratch, MsaShape, PickArgs, ScoreArgs, attn_scale, blocks_for,
-    enqueue_attention, enqueue_index, partials_lens,
+    enqueue_attention, enqueue_index, partials_lens, rows_held,
 };
 use crate::body::{Body, Dims, Store};
 use crate::ffn::Routed;
@@ -47,15 +54,28 @@ use crate::step::{FLASH_MMA, Kernels};
 /// What this file's refusals name.
 const WHAT: &str = "minimaxm3 prefill";
 
-/// The most positions a unit of the prompt batch holds.
+/// The most positions a unit of the prompt batch holds: the plan's
+/// [`place::PROMPT_ROWS`], which says why this many.
 ///
-/// The plan's scratch term (67,108,864 B on the gate card's plan) holds the
-/// step's scratch and the unit's rows: a row's scratch is 2,932,000 B, of
-/// which the dense layers' flash partials are 2,621,440 B (the decode flash
-/// cuts every row's keys into 80 segments a head, so a row's partials are
-/// `64 · 80 · 128` f32). Sixteen rows take 46,912,000 B and the step's
-/// scratch the rest of the term; thirty-two rows do not fit beside it.
-pub const T_MAX: usize = 16;
+/// The unit's buffers are the plan's reserve ([`place::prompt_reserve_bytes`]), not its scratch
+/// term. The flash's partials are sized for [`FLASH_ROWS`] rows, not for the unit: the decode
+/// flash cuts every row's keys into [`SEGMENTS`] segments a head, so a dense layer's row takes
+/// `n_head · 80 · 128` f32 of partials, several times the rest of a row.
+pub const T_MAX: usize = place::PROMPT_ROWS;
+
+/// The most rows one flash launch of the batch runs: the plan's
+/// [`place::FLASH_ROWS`].
+pub const FLASH_ROWS: usize = place::FLASH_ROWS;
+
+// The plan's reserve counts the partials by the kernels' segments and the wide forms by the
+// kernels' tiles; a sparse layer's listed launch cuts a row into no more than the decode flash
+// does, so the dense layers' size the buffers.
+const _: () = assert!(place::FLASH_SEGMENTS == SEGMENTS);
+const _: () = assert!(GEMM_TILE_COLS == bloomery_gpu::gemm::GEMM_BN);
+const _: () = assert!(GEMM32_STEP == bloomery_gpu::gemm::GEMM32_STEP);
+const _: () = assert!(
+    crate::attn::MAX_TOP_K * crate::attn::BLOCK <= SEGMENTS * bloomery_gpu::flash_gqa::SEG_KEYS
+);
 
 fn shape(detail: impl Into<String>) -> GpuError {
     GpuError::Shape {
@@ -65,8 +85,8 @@ fn shape(detail: impl Into<String>) -> GpuError {
 }
 
 /// The prompt batch's rows: the normed rows, the projections' rows, the
-/// flash's output and partials, the index heads' rows and the selection's
-/// scratch, at [`T_MAX`] rows.
+/// flash's output, the index heads' rows and the selection's scratch, at
+/// [`T_MAX`] rows, and the flash's partials, at [`FLASH_ROWS`].
 pub struct BatchRows {
     pub xn: DeviceBuffer<f32>,
     /// A sub-layer's output before its residual add.
@@ -77,8 +97,8 @@ pub struct BatchRows {
     pub k: DeviceBuffer<f32>,
     pub v: DeviceBuffer<f32>,
     pub attn: DeviceBuffer<f32>,
-    /// The flash's partials: the decode flash's over every position, the listed flash's over the
-    /// picked blocks.
+    /// The flash's partials of one launch ([`FLASH_ROWS`] rows of the decode flash's, over every
+    /// position; the listed flash's over the picked blocks take fewer values a row).
     pub part_v: DeviceBuffer<f32>,
     pub part_ms: DeviceBuffer<f32>,
     /// The index heads' projection, their normed and turned heads, the index key row.
@@ -99,7 +119,8 @@ impl BatchRows {
     ) -> Result<BatchRows, GpuError> {
         let z = |n: usize| DeviceBuffer::<f32>::zeroed(stream, rows * n);
         let (q_width, kv_width) = (d.heads * HEAD, d.kv_heads * HEAD);
-        let (msa_v, msa_ms) = partials_lens(shape, rows);
+        let launch = rows.min(FLASH_ROWS);
+        let (msa_v, msa_ms) = partials_lens(shape, launch);
         Ok(BatchRows {
             xn: z(d.embd)?,
             delta: z(d.embd)?,
@@ -108,15 +129,8 @@ impl BatchRows {
             k: z(kv_width)?,
             v: z(kv_width)?,
             attn: z(q_width)?,
-            // The flash's partials are the rows' own (the length is over the rows already).
-            part_v: DeviceBuffer::zeroed(
-                stream,
-                bloomery_gpu::flash_gqa::partials_v_len(rows, d.heads).max(msa_v),
-            )?,
-            part_ms: DeviceBuffer::zeroed(
-                stream,
-                bloomery_gpu::flash_gqa::partials_ms_len(rows, d.heads).max(msa_ms),
-            )?,
+            part_v: DeviceBuffer::zeroed(stream, partials_v_len(launch, d.heads).max(msa_v))?,
+            part_ms: DeviceBuffer::zeroed(stream, partials_ms_len(launch, d.heads).max(msa_ms))?,
             iq_raw: z(crate::attn::HEADS * crate::attn::DIM)?,
             iq: z(crate::attn::HEADS * crate::attn::DIM)?,
             ik: z(crate::attn::DIM)?,
@@ -124,7 +138,7 @@ impl BatchRows {
         })
     }
 
-    /// Device bytes of the rows and the selection's scratch.
+    /// Device bytes of the rows, the flash's partials and the selection's scratch.
     #[must_use]
     pub fn bytes(&self) -> usize {
         [
@@ -185,6 +199,14 @@ impl Batch {
         })
     }
 
+    /// Device bytes of the selection's block scores: they grow with the context, so the plan's scratch
+    /// term holds them; the rest of the batch is the plan's prompt reserve
+    /// ([`place::prompt_reserve_bytes`]).
+    #[must_use]
+    pub fn scores_bytes(&self) -> usize {
+        self.msa.scores.num_bytes()
+    }
+
     /// Device bytes of the buffers.
     #[must_use]
     pub fn bytes(&self) -> usize {
@@ -210,6 +232,21 @@ pub fn set_prefill_group(m: &mut GpuModel<Body>, g: usize) -> Result<bool, GpuEr
         detail: r.to_string(),
     })?;
     body.units.set_group(gpu, body.dims.embd, g)
+}
+
+/// Arm (or disarm) the prompt walks' timing ([`BatchBufs::set_stats`]): one
+/// event a part boundary a (layer, unit), the serves' host times and the
+/// call's fault wall, which [`take_prompt_stats`] reads. Unarmed, a walk
+/// records nothing and waits for nothing beyond its own serves.
+pub fn set_prompt_stats(m: &mut GpuModel<Body>, on: bool) -> Result<(), GpuError> {
+    let (gpu, _, body) = m.body_parts(WHAT)?;
+    body.units.set_stats(gpu, body.cfg.len(), on)
+}
+
+/// The prompt's walk stats, taken: the next prompt starts clean. `Ok(None)`
+/// with the timing unarmed or no batch walked (a prompt by steps keeps none).
+pub fn take_prompt_stats(m: &mut GpuModel<Body>) -> Result<Option<PromptStats>, GpuError> {
+    Ok(m.body_parts(WHAT)?.2.units.take_stats())
 }
 
 /// Feed `ids` from position `at` in units of up to [`T_MAX`] positions and
@@ -530,24 +567,34 @@ impl Attention<'_> {
                     },
                 )?;
             } else {
-                self.k.flash.enqueue_pass::<GROUP_16>(
-                    stream,
-                    bloomery_gpu::flash_gqa::GqaArgs {
-                        q,
-                        kc: store.gqa.kc.buf(),
-                        vc: store.gqa.vc.buf(),
-                        n_keys: rows.n_keys,
-                        scale: attn_scale(),
-                        n_kv: d.kv_heads,
-                        ctx: d.ctx,
-                        m,
-                        part_v,
-                        part_ms,
-                        fault,
-                        y: attn,
-                    },
-                    FLASH_MMA,
-                )?;
+                // The decode flash's partials are the largest of any launch, so the rows go in
+                // chunks the partials hold; a row's flash is its own, so the chunks write the
+                // bits one launch over all the rows would.
+                let one = (partials_v_len(1, d.heads), partials_ms_len(1, d.heads));
+                let held = rows_held(part_v.len(), part_ms.len(), one);
+                for (c0, cn) in chunks(m, held) {
+                    let q = span(WHAT, &*q, c0 * q_width, cn * q_width)?;
+                    let keys = span(WHAT, rows.n_keys, c0, cn)?;
+                    let mut y = span_mut(WHAT, &mut *attn, c0 * q_width, cn * q_width)?;
+                    self.k.flash.enqueue_pass::<GROUP_16>(
+                        stream,
+                        GqaArgs {
+                            q: &q,
+                            kc: store.gqa.kc.buf(),
+                            vc: store.gqa.vc.buf(),
+                            n_keys: &keys,
+                            scale: attn_scale(),
+                            n_kv: d.kv_heads,
+                            ctx: d.ctx,
+                            m: cn,
+                            part_v: &mut *part_v,
+                            part_ms: &mut *part_ms,
+                            fault,
+                            y: &mut y,
+                        },
+                        FLASH_MMA,
+                    )?;
+                }
             }
         }
         let store = &self.stores[l];

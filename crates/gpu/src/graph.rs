@@ -202,6 +202,85 @@ impl Graph {
     /// function with a sync mode, a stream memory operation) became, and for
     /// a kernel node the entry it launches and its geometry.
     pub fn nodes(&self) -> Result<Vec<NodeInfo>, GpuError> {
+        self.handles()?
+            .into_iter()
+            // SAFETY: every handle is a node of this template, which lives
+            // as long as `self`.
+            .map(|node| unsafe { node_info(node) })
+            .collect()
+    }
+
+    /// The most nodes on one dependency path of the template: the node count
+    /// of a capture on one stream, less what each fork's shorter side
+    /// ([`Branch`]) runs beside its longer one.
+    pub fn span(&self) -> Result<usize, GpuError> {
+        const WHAT: &str = "Graph::span";
+        let handles = self.handles()?;
+        let mut n_edges = 0usize;
+        // SAFETY: with both node arrays null the call writes only the edge
+        // count of this live template.
+        let rc = unsafe {
+            sys::cuGraphGetEdges_v2(
+                self.graph,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                &mut n_edges,
+            )
+        };
+        cu(rc, "cuGraphGetEdges_v2")?;
+        let mut from: Vec<sys::CUgraphNode> = vec![ptr::null_mut(); n_edges];
+        let mut to: Vec<sys::CUgraphNode> = vec![ptr::null_mut(); n_edges];
+        // SAFETY: both arrays hold `n_edges` slots, the count just reported
+        // for this template; the call writes at most that many edges.
+        let rc = unsafe {
+            sys::cuGraphGetEdges_v2(
+                self.graph,
+                from.as_mut_ptr(),
+                to.as_mut_ptr(),
+                ptr::null_mut(),
+                &mut n_edges,
+            )
+        };
+        cu(rc, "cuGraphGetEdges_v2")?;
+        let index: std::collections::HashMap<sys::CUgraphNode, usize> =
+            handles.iter().enumerate().map(|(i, &h)| (h, i)).collect();
+        let at = |h: &sys::CUgraphNode| {
+            index.get(h).copied().ok_or(GpuError::state(
+                WHAT,
+                "an edge between the template's nodes",
+            ))
+        };
+        let mut after: Vec<Vec<usize>> = vec![Vec::new(); handles.len()];
+        let mut waits = vec![0usize; handles.len()];
+        for (f, t) in from.iter().zip(&to).take(n_edges) {
+            let (f, t) = (at(f)?, at(t)?);
+            after[f].push(t);
+            waits[t] += 1;
+        }
+        // Longest path by topological order: a node's depth is one more than
+        // its deepest dependency's.
+        let mut depth = vec![1usize; handles.len()];
+        let mut ready: Vec<usize> = (0..handles.len()).filter(|&i| waits[i] == 0).collect();
+        let mut done = 0usize;
+        while let Some(v) = ready.pop() {
+            done += 1;
+            for &w in &after[v] {
+                depth[w] = depth[w].max(depth[v] + 1);
+                waits[w] -= 1;
+                if waits[w] == 0 {
+                    ready.push(w);
+                }
+            }
+        }
+        if done != handles.len() {
+            return Err(GpuError::state(WHAT, "an acyclic template"));
+        }
+        Ok(depth.into_iter().max().unwrap_or(0))
+    }
+
+    /// The template's node handles, in the order `cuGraphGetNodes` returns them.
+    fn handles(&self) -> Result<Vec<sys::CUgraphNode>, GpuError> {
         let mut handles: Vec<sys::CUgraphNode> = vec![ptr::null_mut(); self.nodes];
         let mut n = self.nodes;
         // SAFETY: the array holds `n` slots, the count the driver reported
@@ -209,12 +288,7 @@ impl Graph {
         let rc = unsafe { sys::cuGraphGetNodes(self.graph, handles.as_mut_ptr(), &mut n) };
         cu(rc, "cuGraphGetNodes")?;
         handles.truncate(n);
-        handles
-            .into_iter()
-            // SAFETY: every handle is a node of this template, which lives
-            // as long as `self`.
-            .map(|node| unsafe { node_info(node) })
-            .collect()
+        Ok(handles)
     }
 }
 
@@ -1131,6 +1205,7 @@ mod tests {
     /// A branch that kept its node of the round before as a dependency would
     /// carry one edge more on every fork after the first. The middle round
     /// drops its fork instead of joining it, and the drop records the join.
+    /// The span counts one of each round's two parallel nodes.
     #[test]
     #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
     fn hw_a_branch_forks_one_at_a_time_from_its_fork_point() {
@@ -1175,6 +1250,11 @@ mod tests {
         };
         cu(rc, "cuGraphGetEdges_v2").expect("the edges");
         assert_eq!(graph.node_count(), 1 + 3 * ROUNDS, "the captured nodes");
+        assert_eq!(
+            graph.span().expect("the span"),
+            1 + 2 * ROUNDS,
+            "a round's two parallel nodes add one to the span"
+        );
         assert_eq!(
             n,
             4 * ROUNDS,

@@ -11,7 +11,8 @@ use std::num::NonZeroUsize;
 use bloomery_gpu_deepseek41::body::Deepseek41Model;
 use bloomery_gpu_gates::GateError;
 use bloomery_gpu_gates::beside::{self, Beside};
-use bloomery_gpu_gates::generate::{Place, PlaceWhy, TierRule, choose_ctx};
+use bloomery_gpu_gates::bind::place_word;
+use bloomery_gpu_gates::generate::{DraftSeat, Place, PlaceWhy, TierRule, choose_ctx};
 use bloomery_gpu_gates::gpu_census;
 use bloomery_gpu_gates::record::Record;
 use bloomery_gpu_gates::residency38::{Seqs, reserve_checkpoints};
@@ -50,12 +51,10 @@ pub fn choose(flag: Option<Place>) -> Result<PlaceWhy, GateError> {
     })
 }
 
-/// A V4.1 binary's `--place` word (`Place::parse`), refused by name before
+/// A V4.1 binary's `--place` word (`bind::place_word`), refused by name before
 /// any plan when it lists more tier cards than the V4.1 body serves.
 pub fn parse(v: &str) -> Result<Place, GateError> {
-    let place = Place::parse(v)?;
-    place.serves("deepseek41", SERVED_TIERS)?;
-    Ok(place)
+    place_word(v, Some(("deepseek41", SERVED_TIERS)))
 }
 
 /// The expert tier's prompt-batch bytes `place`'s plan reserves for the file
@@ -91,7 +90,7 @@ pub fn ctx_choice(
     split: &Split,
     inputs: &PlanInputs,
     place: Place,
-    (reserve, tier_batch, held): (Option<u64>, Option<TierBatchBytes>, Beside),
+    (reserve, tier_batch, held): (Option<DraftSeat>, Option<TierBatchBytes>, Beside),
     (set, slots): (Option<usize>, NonZeroUsize),
     levers: &PlanLevers,
 ) -> Result<Chosen<()>, GateError> {

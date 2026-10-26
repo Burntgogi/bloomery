@@ -1,0 +1,13 @@
+# The MiniMax-M3.1-Flash oracle's dump of the fixture cut (/models/fixtures/minimaxm31) through tools/ref/mm31-dump.sh all, with
+# BLOOMERY_MM31_FOLDER naming the cut: the same dumper, loops and flow as the real dump (docs/cards/minimaxm31-dump.card), on
+# the cut's layers and experts. Its log lines carry the term the real dump's wall depends on and derivation does not fix: the
+# box's dequantization rate, as `G values/s` on each prefill layer's line and `dequant G values` over the step's seconds on each
+# greedy line. Expected [derived: 8 threads of a loaded Mac measure 1.3-3.4 G values/s]: 1.3-5 G values/s on the box.
+# Predicted wall [derived from the cut's size, which mm31fixture sets]: seconds to a few minutes; bound 1800 s.
+# What the run guarantees: CUDA hidden, the CPU lease held through the dumper's life, the sets installed under the fx_ prefix
+# (the cut's `# fixture` line decides it) only when all six manifests carry their `# complete` trailer.
+kind: exclusive
+reason: dump_tf.py runs a torch f32 forward on every CPU core; beside a timed run or a gate batch it would take their
+  cores, so it holds the lease; why now: the first run of the oracle on the box, whose dequantization rate fixes the wall of
+  the real dump before its two long jobs
+minutes: 1..10

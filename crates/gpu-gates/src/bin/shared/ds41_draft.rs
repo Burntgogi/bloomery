@@ -11,7 +11,7 @@ use app::arch::deepseek41::{Ds41Draft, open_draft};
 use app::{Loaded, Session};
 use bloomery_gpu_deepseek41::body::Body;
 use bloomery_gpu_gates::GateError;
-use bloomery_gpu_gates::generate::Place;
+use bloomery_gpu_gates::generate::{DraftSeat, Place};
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_levers::Levers;
 use gguf::Split;
@@ -63,22 +63,25 @@ impl Draft {
 /// — the target opened from `target`, nothing captured yet — and its `load
 /// draft=dspark` record for the caller to print; `what` names the caller to
 /// the body. The load's own buffer count is held to the plan's formula term
-/// by term (`DraftCardBytes::check_held`) whatever the placement. With
-/// `reserve`, the bytes the placement's plan set aside for the draft on its
-/// card ([`dspark::draft_reserve`]), a draft whose resident bytes are more is
-/// refused by name: it would sit in the tier's margin. The card's loss around
-/// the load is recorded as `taken` and never refuses: another process's
-/// allocation on the card lands in it.
+/// by term (`DraftCardBytes::check_held`) whatever the placement. `seat`
+/// is what the placement's plan set aside for the draft on its card
+/// ([`dspark::draft_seat`]): the load opens on that card, else it is
+/// refused by name before any allocation, and a draft whose resident bytes
+/// are more is refused by name: it would sit in the card's margin. The
+/// card's loss around the load is recorded as `taken` and never refuses:
+/// another process's allocation on the card lands in it.
 pub fn open_dspark(
     loaded: &mut Loaded<Body>,
     file: &(Split, DraftHparams),
     target: &Path,
     what: &'static str,
     place: Place,
-    reserve: Option<u64>,
+    seat: DraftSeat,
 ) -> Result<(Ds41Draft, Record), GateError> {
     let t = Instant::now();
-    let card = dspark::draft_card(place)?;
+    let on = dspark::draft_card(place)?;
+    place.check_draft_card(seat, &on)?;
+    let (reserve, card) = (seat.reserve, on.spec);
     let (draft_split, hp) = file;
     let target =
         Arc::new(Split::open(target).map_err(|e| format!("open {}: {e}", target.display()))?);
@@ -92,28 +95,26 @@ pub fn open_dspark(
     dspark::plan_bytes(draft_split, &target)?.check_held(d.held(), GRANULE, card.name)?;
     let (free, total) = d.mem_info()?;
     let resident = d.resident_bytes() as u64;
-    if let Some(reserve) = reserve.filter(|&r| resident > r) {
+    if resident > reserve.bytes {
         return Err(format!(
-            "the DSpark draft holds {resident} B on {}, past the {reserve} B its plan reserved \
-             there under --place {}",
+            "the DSpark draft holds {resident} B on {}, past the {} B its plan reserved there \
+             under --place {}",
             card.name,
+            reserve.bytes,
             place.name()
         )
         .into());
     }
     let b = loaded.model().body(what)?;
-    let mut r = Record::new(&record::LOAD_DRAFT)
+    let r = Record::new(&record::LOAD_DRAFT)
         .w("draft", "dspark")
         .w("card", d.card())
         .u("width", <Ds41Draft as runtime::Draft<Session<Body>>>::WIDTH)
         .list("target_layers", b.feature_layers().unwrap_or_default())
         .u("feature_width", b.feature_width())
         .u("resident", resident)
-        .u("working", d.held().working);
-    if let Some(reserve) = reserve {
-        r = r.u("reserve", reserve);
-    }
-    let r = r
+        .u("working", d.held().working)
+        .u("reserve", reserve.bytes)
         .u("taken", d.taken_bytes() as u64)
         .u("draft_card_free", free)
         .u("draft_card_total", total)

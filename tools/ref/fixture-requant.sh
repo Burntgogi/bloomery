@@ -5,7 +5,8 @@
 # every other tensor kept bit for bit: a quant type's train gate then runs on a small file instead of the family's download. It is
 # written to fixture-variants/TAG/<fixture dir>/ beside the fixture root (tools/ref/ref-paths.sh owns the path), in the same shards as the fixture,
 # named <fixture stem>-TAG-0000N-of-0000M.gguf, with the header key bloomery.fixture.variant = TAG and every other
-# bloomery.fixture.* key of the fixture.
+# bloomery.fixture.* key of the fixture but the card budget: a variant's own file plans it (step 3), so its experts' bytes decide it,
+# not its trunk's.
 #
 #   1. `fixture variant-rules` (crates/model-hf/src/bin/fixture.rs) expands the row's map over the fixture's tensor names and prints
 #      the quantizer's --custom-q argument, which names every tensor of the fixture at the type it takes (the map's at the new type,
@@ -16,10 +17,14 @@
 #      those types without one, and the variant needs the type, not the quality. The matrix is part of the variant's identity: the
 #      row's why column names it (`imatrix=sha256:<16 hex>`, flat-imatrix.py --check-row), and a row of a map that needs none names none.
 #   2. llama-quantize --allow-requantize --keep-split --leave-output-tensor writes into <dir>.tmp.<pid>.
-#   3. `fixture variant-check` holds the written file to the fixture: every tensor's name, shape and shard equal, the type equal
+#   3. `fixture variant-budget` plans the card budget on the written temporary file by the family's own planner and records it
+#      in place (bloomery.fixture.card_budget, eight bytes: the quantizer copied the trunk's, whose experts are another size);
+#      a family with a fixed budget keeps the trunk's value and writes nothing.
+#   4. `fixture variant-check` holds the written file to the fixture: every tensor's name, shape and shard equal, the type equal
 #      but where the map names it (and then the map's), every other tensor's bytes equal, every bloomery.fixture.* key kept and
-#      the tag added. Any other difference refuses by name and removes the temporary directory.
-#   4. The directory is renamed into place; an existing <dir> is refused, as `fixture generate` refuses one, and nothing is
+#      the tag added, and the card budget the planner's value for the written file. Any other difference refuses by name and
+#      removes the temporary directory.
+#   5. The directory is renamed into place; an existing <dir> is refused, as `fixture generate` refuses one, and nothing is
 #      written over it.
 #
 # general.file_type and general.quantization_version are the quantizer's own words (its type argument and format version), not
@@ -112,6 +117,9 @@ grep -c 'converting to' "$LOG" | xargs echo "fixture-requant.sh: tensors the qua
 FIRSTS=("$TMP"/*-00001-of-*.gguf)
 [ "${#FIRSTS[@]}" = 1 ] && [ -e "${FIRSTS[0]}" ] || die "$TMP holds no single first shard (${FIRSTS[*]})" 65
 FIRST=${FIRSTS[0]}
+# The variant's budget is its own file's plan, planned and recorded before the check holds it there.
+"$FIXTURE_BIN" variant-budget "$FIRST" ||
+  die "fixture variant-budget refused $TAG: the card budget does not plan on the written file" 65
 "$FIXTURE_BIN" variant-check "$FIRST" --source "$SRC" --tag "$TAG" --table "$TABLE" > "$LOG.check" ||
   { tail -5 "$LOG.check" >&2; die "fixture variant-check refused the variant (log $LOG.check)" 65; }
 tail -1 "$LOG.check"

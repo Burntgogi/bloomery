@@ -38,6 +38,20 @@
 //!    (3 over 1, 4 over 2) refused by the group's error, and windows at
 //!    aligned offsets accepted while `q` at 4 bytes past 8 and `kc`/`vc` at 8
 //!    bytes past 16 are refused by name.
+//! 3. The lower-bound entry ([`FlashGqaPrefill512::enqueue_p4_lower`]): row
+//!    `t` attends `[first[t], counts[t])`. A sweep whose row `r` attends
+//!    `[r, 72 + r)` — every offset mod 32 within one launch, windows crossing
+//!    tiles and blocks — at the model's shape and at [`GROUP`] heads, and a
+//!    packed launch, the encoder's own shape, whose inputs of lengths
+//!    [`PACKED_LENS`] sit at their packed offsets so every row of one input
+//!    shares its window while blocks straddle inputs. Each row against the
+//!    exact attention over its own window (the cache cut to it,
+//!    `judge_prefill` at `first = lo`), each row bit for bit the same row
+//!    launched alone, a rerun and the NaN-padded planes bit for bit, and one
+//!    captured launch (one node) the eager bits. Then a first key at its
+//!    count, one past it, a count of zero and one past the cache
+//!    (`key_count`, NaN in those rows, the rest the clean run's) and a short
+//!    first-key buffer refused by name.
 
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
@@ -52,7 +66,9 @@ mod gate {
     use bloomery_gpu::rope_neox::{HEAD_512 as HEAD, RopeNeoxKernels};
     use bloomery_gpu::{Gpu, GpuError};
     use bloomery_gpu_gates::flash_band::judge_prefill;
-    use bloomery_gpu_gates::prefill_gate::{WindowCase, Windows, cache, window_refusals};
+    use bloomery_gpu_gates::prefill_gate::{
+        HostCache, WindowCase, Windows, cache, window_refusals,
+    };
     use bloomery_gpu_gates::rope_gate::{self, RopeIn, RopeOut, RopeShape};
     use bloomery_gpu_gates::{GateError, activations, bits_equal, checks_failed, verdict};
     use cuda_core::{CudaStream, DeviceBuffer};
@@ -81,6 +97,13 @@ mod gate {
     const SEED_CAUSAL: [(usize, usize); 5] = [(0, 17), (31, 9), (32, 40), (1000, 9), (2047, 5)];
     /// The scattered launch's rows: counts `(37·t mod 97) + 1`.
     const SCATTER_T: usize = 24;
+    /// The lower sweep's rows: row `r` attends `[r, SWEEP_REACH + r)` — every
+    /// offset mod 32 in one launch, windows crossing tiles and blocks.
+    const SWEEP_T: usize = 40;
+    const SWEEP_REACH: usize = 72;
+    /// The packed launch's input lengths, one window an input at its packed
+    /// offset, so blocks straddle inputs as the encoder's packed pass's do.
+    const PACKED_LENS: [usize; 9] = [2, 3, 4, 5, 6, 7, 8, 29, 33];
     /// Rows past the largest count in each cache, NaN in the padded copy.
     const PAD: usize = 40;
     /// The seeded query's scale: scores of a few tens, as a normed head's.
@@ -421,6 +444,306 @@ mod gate {
         Ok((ok, win))
     }
 
+    // ------------------------------------------------------------ lower
+
+    /// One `enqueue_p4_lower` launch over `n_keys.len()` rows into an output
+    /// that starts NaN, read back.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one launch's inputs, each a value the callers vary"
+    )]
+    fn run_lower(
+        kp: &FlashGqaPrefill512,
+        gpu: &Gpu,
+        q: &[f32],
+        first: &[u32],
+        n_keys: &[u32],
+        (kc, vc): (&DeviceBuffer<u16>, &DeviceBuffer<u16>),
+        ctx: usize,
+        scale: f32,
+        (n_head, n_kv): (usize, usize),
+    ) -> Result<Vec<f32>, GateError> {
+        let stream = gpu.stream();
+        let qd = DeviceBuffer::from_host(stream, q)?;
+        let t = n_keys.len();
+        let fd = DeviceBuffer::from_host(stream, first)?;
+        let nd = DeviceBuffer::from_host(stream, n_keys)?;
+        let mut y = DeviceBuffer::from_host(stream, &vec![f32::NAN; t * n_head * HEAD])?;
+        kp.enqueue_p4_lower(
+            stream,
+            GqaPrefillArgs {
+                q: &qd,
+                kc,
+                vc,
+                n_keys: &nd,
+                scale,
+                n_head,
+                n_kv,
+                ctx,
+                t,
+                fault: gpu.unlabelled_sink(),
+                y: &mut y,
+            },
+            &fd,
+        )?;
+        stream.synchronize()?;
+        Ok(y.to_host_vec(stream)?)
+    }
+
+    /// The lower clause's seeded launches: a name, its rows' first keys and
+    /// counts, its cache height, its scale, its heads and whether every row
+    /// is also launched alone.
+    type Lowered = (String, Vec<u32>, Vec<u32>, usize, f32, (usize, usize), bool);
+
+    fn lowered() -> Result<Vec<Lowered>, GateError> {
+        let mut sweep = Vec::with_capacity(SWEEP_T);
+        for r in 0..SWEEP_T {
+            sweep.push((u32::try_from(r)?, u32::try_from(SWEEP_REACH + r)?));
+        }
+        let (sweep_first, sweep_counts): (Vec<u32>, Vec<u32>) = sweep.iter().copied().unzip();
+        let (mut first, mut counts) = (Vec::new(), Vec::new());
+        for &len in &PACKED_LENS {
+            let lo = u32::try_from(first.len())?;
+            let end = lo + u32::try_from(len)?;
+            for _ in 0..len {
+                first.push(lo);
+                counts.push(end);
+            }
+        }
+        let packed_ctx = counts.iter().copied().max().unwrap_or(0) as usize + PAD;
+        Ok(vec![
+            (
+                format!("sweep T={SWEEP_T} windows [r, {SWEEP_REACH}+r)"),
+                sweep_first.clone(),
+                sweep_counts.clone(),
+                SWEEP_REACH + SWEEP_T + PAD,
+                SCALE,
+                (N_HEAD, N_KV),
+                true,
+            ),
+            (
+                format!("sweep T={SWEEP_T} heads {}/{}", GROUP.0, GROUP.1),
+                sweep_first,
+                sweep_counts,
+                SWEEP_REACH + SWEEP_T + PAD,
+                SCALE,
+                GROUP,
+                false,
+            ),
+            (
+                format!("packed T={} lens {PACKED_LENS:?}", first.len()),
+                first,
+                counts,
+                packed_ctx,
+                SCALE,
+                (N_HEAD, N_KV),
+                true,
+            ),
+        ])
+    }
+
+    /// The lower-bound clause (module doc, 3).
+    fn lower_check(gpu: &Gpu, kp: &FlashGqaPrefill512) -> Result<bool, GateError> {
+        let stream = gpu.stream();
+        let mut ok = true;
+        for (name, first, counts, ctx, scale, heads, alone) in lowered()? {
+            let (n_head, n_kv) = heads;
+            let w = n_head * HEAD;
+            let t = first.len();
+            let live = counts.iter().copied().max().unwrap_or(0) as usize;
+            let c = cache(stream, HEAD, n_kv, ctx, live, 721)?;
+            let q = activations(HEAD, t * n_head, 724);
+            let y = run_lower(
+                kp,
+                gpu,
+                &q,
+                &first,
+                &counts,
+                (&c.kc, &c.vc),
+                ctx,
+                scale,
+                heads,
+            )?;
+            let y2 = run_lower(
+                kp,
+                gpu,
+                &q,
+                &first,
+                &counts,
+                (&c.kc, &c.vc),
+                ctx,
+                scale,
+                heads,
+            )?;
+            let yn = run_lower(
+                kp,
+                gpu,
+                &q,
+                &first,
+                &counts,
+                (&c.kn, &c.vn),
+                ctx,
+                scale,
+                heads,
+            )?;
+            let (rerun, nan_same) = (bits_equal(&y, &y2), bits_equal(&y, &yn));
+            let (mut band, mut worst) = (true, 0.0f64);
+            for r in 0..t {
+                let (lo, hi) = (first[r] as usize, counts[r] as usize);
+                let cut = |p: &[f32]| {
+                    p.chunks(ctx * HEAD)
+                        .flat_map(|h| h[lo * HEAD..hi * HEAD].iter().copied())
+                        .collect()
+                };
+                let host = HostCache {
+                    kf: cut(&c.host.kf),
+                    vf: cut(&c.host.vf),
+                    ctx: hi - lo,
+                };
+                let (pass, ratio) = judge_prefill::<HEAD, KEY_TILE_512>(
+                    &q[r * w..(r + 1) * w],
+                    &[hi - lo],
+                    &host,
+                    &y[r * w..(r + 1) * w],
+                    scale,
+                    heads,
+                    lo,
+                );
+                band &= pass;
+                worst = worst.max(ratio);
+            }
+            let mut differ = 0usize;
+            if alone {
+                for r in 0..t {
+                    let one = run_lower(
+                        kp,
+                        gpu,
+                        &q[r * w..(r + 1) * w],
+                        &[first[r]],
+                        &[counts[r]],
+                        (&c.kc, &c.vc),
+                        ctx,
+                        scale,
+                        heads,
+                    )?;
+                    differ += usize::from(!bits_equal(&y[r * w..(r + 1) * w], &one));
+                }
+            }
+            let pass = rerun && nan_same && band && differ == 0 && gpu.fault()?.is_none();
+            println!(
+                "lower {name} ctx={ctx}: measured/bound {worst:.3e} band={band} \
+                 rows_alone_differing={differ} rerun={rerun} nan_padding_same={nan_same} {}",
+                verdict(pass)
+            );
+            ok &= pass;
+        }
+
+        // First keys at and past their counts, and counts of zero and past
+        // the cache, on a 17-row launch of windows at 63.
+        let (t, p0) = (17usize, 63usize);
+        let ctx = p0 + t + PAD;
+        let w = WIDTH;
+        let c = cache(stream, HEAD, N_KV, ctx, p0 + t, 731)?;
+        let q = activations(HEAD, t * N_HEAD, 734);
+        let first: Vec<u32> = (0..t)
+            .map(|i| u32::try_from(p0 + i.saturating_sub(8)))
+            .collect::<Result<_, _>>()?;
+        let counts: Vec<u32> = (0..t)
+            .map(|i| u32::try_from(p0 + i + 1))
+            .collect::<Result<_, _>>()?;
+        let y = run_lower(
+            kp,
+            gpu,
+            &q,
+            &first,
+            &counts,
+            (&c.kc, &c.vc),
+            ctx,
+            SCALE,
+            (N_HEAD, N_KV),
+        )?;
+        let qd = DeviceBuffer::from_host(stream, &q)?;
+        let fd = DeviceBuffer::from_host(stream, &first)?;
+        let nd = DeviceBuffer::from_host(stream, &counts)?;
+        let mut yd = DeviceBuffer::from_host(stream, &vec![f32::NAN; t * w])?;
+        let launch =
+            |first: &DeviceBuffer<u32>, counts: &DeviceBuffer<u32>, y: &mut DeviceBuffer<f32>| {
+                kp.enqueue_p4_lower(
+                    stream,
+                    GqaPrefillArgs {
+                        q: &qd,
+                        kc: &c.kc,
+                        vc: &c.vc,
+                        n_keys: counts,
+                        scale: SCALE,
+                        n_head: N_HEAD,
+                        n_kv: N_KV,
+                        ctx,
+                        t,
+                        fault: gpu.unlabelled_sink(),
+                        y,
+                    },
+                    first,
+                )
+            };
+        let want = Fault::at(LAYER_NONE, FaultSite::KeyCount);
+        for (row, lo, hi) in [
+            (3, counts[3], counts[3]),
+            (10, counts[10] + 1, counts[10]),
+            (5, first[5], 0),
+            (12, first[12], u32::try_from(ctx + 1)?),
+        ] {
+            let mut bad_first = first.clone();
+            let mut bad_counts = counts.clone();
+            bad_first[row] = lo;
+            bad_counts[row] = hi;
+            let bd = DeviceBuffer::from_host(stream, &bad_first)?;
+            let bn = DeviceBuffer::from_host(stream, &bad_counts)?;
+            yd.copy_from_host(stream, &y)?;
+            launch(&bd, &bn, &mut yd)?;
+            let out = yd.to_host_vec(stream)?;
+            let fault = gpu.take_fault()?;
+            let isolated = out
+                .chunks(w)
+                .zip(y.chunks(w))
+                .enumerate()
+                .all(|(r, (a, b))| {
+                    if r == row {
+                        a.iter().all(|v| v.is_nan())
+                    } else {
+                        bits_equal(a, b)
+                    }
+                });
+            let pass = fault == Some(want) && isolated;
+            println!(
+                "lower refusal row={row} first={lo} count={hi}: word {fault:?} (want {want:?}), \
+                 that row NaN and the rest bit-identical {isolated} {}",
+                verdict(pass)
+            );
+            ok &= pass;
+        }
+        let short = DeviceBuffer::from_host(stream, &first[..t - 1])?;
+        let refused = launch(&short, &nd, &mut yd);
+        let named = matches!(refused, Err(GpuError::Shape { ref detail, .. }) if detail.starts_with("k_first.len()"));
+        println!("lower short first-key buffer: {}", verdict(named));
+        ok &= named;
+
+        // The captured launch: one node, the eager bits.
+        let graph = gpu.capture(|_| launch(&fd, &nd, &mut yd))?;
+        yd.copy_from_host(stream, &vec![f32::NAN; t * w])?;
+        graph.launch(stream)?;
+        stream.synchronize()?;
+        let same = bits_equal(&yd.to_host_vec(stream)?, &y);
+        let nodes = graph.node_count();
+        let graph_ok = same && nodes == 1;
+        println!(
+            "lower graph T={t} p0={p0}: eager_vs_graph_bit_identical={same} graph_nodes={nodes} {}",
+            verdict(graph_ok)
+        );
+        ok &= graph_ok;
+        Ok(ok)
+    }
+
     fn misaligned(kp: &FlashGqaPrefill512, gpu: &Gpu, win: &Windows) -> Result<bool, GateError> {
         window_refusals(
             gpu,
@@ -458,6 +781,9 @@ mod gate {
         let (p, win) = prefill_check(&gpu, &kp)?;
         println!("prefill flash 512 p4 {}", verdict(p));
         ok &= p;
+        let l = lower_check(&gpu, &kp)?;
+        println!("prefill flash 512 p4 lower {}", verdict(l));
+        ok &= l;
         // Last: the window refusals, whose failure would be a sticky error.
         let m = misaligned(&kp, &gpu, &win)?;
         println!("prefill windows {}", verdict(m));

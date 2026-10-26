@@ -1,0 +1,43 @@
+# Round tierfam2: Nemotron 3.5 Lightning 30B-A3B UD-Q4_K_XL's routed experts on the card. Before this tree the
+# latent MoE body's card arm ran IQ2_XXS alone (Bolt's), so the plan left all 2,944 of Lightning's experts on the
+# host on any card; this tree runs its 32-value stacks (IQ4_NL ups beside IQ4_NL, Q8_0 and Q5_1 downs) through the
+# card leg's relu² form in the step and the 32-value GEMMs in the prompt, and the plan arm admits them.
+# Measured at the base (0.3.8's release check, docs/models.md): RTX A6000 at the serving defaults (--ctx-size 16384,
+# 2,944 experts on the host) 89.2 tok/s after a 25-token prompt = 11.2 ms a token; 79.9 after 5,866.
+# Bytes [derived from the shapes: hidden 2,688, experts 1,856 wide, 23 routed layers of 128, top 6]: an expert's up
+# is 4,988,928 values at IQ4_NL (2.81 MB), its down 2.81 (IQ4_NL), 3.74 (Q5_1) or 5.30 MB (Q8_0): 5.6..8.1 MB; the
+# file's 25.5 GB less a ~2.3 GB trunk gives 7.9 MB on average, 23.2 GB in all. A token's 138 picks read 1.09 GB.
+# Resource timeline, one token at D = 512, A6000 (the wall is the sum along the layers: each layer's experts wait for
+# its trunk, the next layer's trunk for its sum):
+#   base   host DRAM 1.09 GB at 97..145 GB/s = 7.5..11.2 ms, in series with the card's trunk; the measured 11.2 ms
+#          leaves the trunk 2.5..3.7 ms (its 1.5..1.9 GB at ~700 GB/s is 2.1..2.7 ms, plus its nodes)
+#   here   card SM: the trunk 2.5..3.7 ms (unchanged) + the routed 1.09 GB through the relu² form's `_sel`s at
+#          450..700 GB/s = 1.6..2.4 ms; host DRAM 0 (no expert left there); PCIe 0 (no hand-off, the step stays
+#          on the card); NVMe 0. Launches: the relu² form's four a layer replace the host leg's go, wait and add.
+#   => 4.1..6.1 ms: 164..244 tok/s. The flow lever is the bulk move of the experts from host DRAM to the card's
+#      DRAM (7x its bandwidth); no term of the trunk moves.
+# Plan (b′) for this family is worth 0 on the box [derived]: the A6000 holds the whole file here, so a tier card
+# holds no expert the stage card does not; Bolt-24GB fits one card as well. The seat keeps `TierRule::UNTIERED`.
+# Sitting (on the lead's go, after gate-gpu-nemotron-h-moe-card32 is green), one lease, base and this tree:
+#   BLOOMERY_MODEL=nemotron_h_moe BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/lightning-card32-a6000.card
+#     BLOOMERY_REF_MODEL=<the Lightning file>' just depth-serve <base tree>:512 <this tree>:512
+#   (the base tree holds its own bloomery-serve build; depth-serve rotates the two arms over BLOOMERY_AB_ROUNDS=4)
+kind: baseline
+question: what does the nemotron seat decode on Nemotron 3.5 Lightning UD-Q4_K_XL at depth 512 on the A6000 once
+  its routed experts run on the card?
+term: tg tok/s @ n=1, D = 512, bloomery-serve --model nemotron (place unset -> a, DEPTH_SERVE_CTX 4160), RTX A6000
+  alone, depth-serve rows (timings.predicted_per_second over 127 steps)
+unit: tok/s
+predict: 164..244
+condition: depth-serve in its own lease on the A6000, one fresh server a row, base and this tree in the same lease;
+  this tree's `plan` record holds every one of the 2,944 experts on the card and none on the host, else the row is
+  void; the base row reads 80..95 tok/s, else the window is void; the witness shows no other model load
+reason: the user asked that every supported model gain from the placement work; Lightning's experts sat on the host
+  only because the card arm ran IQ2_XXS alone, and this row decides whether the card's relu² form lands as the
+  family's default path
+decide-in: write the row beside the base's in docs/models.md's Lightning row and the README's table, with its lease
+  and witness
+decide-below: read the relu² form's `_sel` time per layer (nsys on the step graph) against 1.6..2.4 ms a token: an
+  IQ4_NL up at K = 2,688 under 450 GB/s is the finding, and the next round is that kernel's geometry
+decide-above: re-derive the trunk term: the base's host leg ran faster than 97 GB/s, so the trunk is shorter than
+  2.5 ms, and the plan's other families' (a) rows are re-read with that trunk

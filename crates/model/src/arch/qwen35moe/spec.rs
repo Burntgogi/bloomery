@@ -116,6 +116,7 @@ pub fn spec_of(
                         rope,
                         qk_norm: has(format!("blk.{l}.attn_q_norm.weight"))
                             && has(format!("blk.{l}.attn_k_norm.weight")),
+                        o_norm: false,
                         out_gate,
                         select: match exp {
                             None => None,
@@ -201,6 +202,7 @@ pub fn spec_of(
         hc,
         engram,
         encoder: None,
+        logit_epilogue: None,
         chat,
     })
 }
@@ -250,6 +252,8 @@ pub(super) fn routed_at(
         top_k: spec_u32("expert_used_count", hp.n_used)?,
         expert_ff: spec_u32("expert_feed_forward_length", hp.expert_ff)?,
         latent: None,
+        pre_exp_norm: false,
+        post_exp_norm: None,
         act: Act::SwiGlu { limit: None },
         router: Router {
             score: Score::Softmax,

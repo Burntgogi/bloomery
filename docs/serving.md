@@ -78,7 +78,10 @@ Your OpenAI client works unchanged. bloomery speaks llama-server's HTTP API and 
   its own) and MiMo-V2.6 (the same tags, a value bare between them: `<parameter=KEY>VALUE</parameter>`) parse into
   `tool_calls` and `tool_use` blocks, so agent clients work against each of them. Which of the two framings a
   template uses is read from the call it renders, not from its name, and a `tool_choice` that forces a call writes
-  it in that framing.
+  it in that framing. A generation the token limit cuts inside a call is an answer, as llama-server answers it:
+  200 with `finish_reason` `length` (`stop_reason` `max_tokens`), the call's text as `content` while its name is not
+  whole and, on the chat route, the call with the arguments read so far once it is; a generation that ends on its own
+  inside a call is a 500 naming the call.
   DeepSeek-V4.1 writes its DSML tags with a space after the token (`<｜DSML｜ calls>`, `<｜DSML｜ invoke>`,
   `<｜DSML｜ parameter>`), V4 without (`<｜DSML｜tool_calls>`). The V4.1 GGUFs carry V4's template, so a
   `general.architecture` `deepseek41` file is served with that template respelled as V4.1's (the template llama.cpp
@@ -135,13 +138,19 @@ Your OpenAI client works unchanged. bloomery speaks llama-server's HTTP API and 
 - **The flags**: `-m`/`--model-file`, `--hf <repo>[:<quant>]` (download, resume, sha256 check, never fetched
   twice; it also fetches the model's MTP draft when the repo publishes it, as unsloth's Qwen3.8-Flash-Next GGUFs
   do under `MTP/`, landing it beside the set, where the run picks it up), `--parallel/-np`, `--queue-depth`,
-  `--cache-ram`, `--ctx/--ctx-size` (unset, every generative seat and the decide seat take one slot at the lesser of
+  `--cache-ram/-cram` (MiB; `0` turns the prompt cache off; llama-server's `-1`, no limit, is refused by name: the
+  cache is host memory beside the load), `--ctx/--ctx-size` (unset, every generative seat and the decide seat take one slot at the lesser of
   262,144 and the file's limit, and halve that while the plan is short of the card — and of the host, where the body
   keeps no tier past it — down to 4,096; one `ctx` line names the rule. A set value is the total the slots split, and
   one that does not fit is refused, never cut. PIN(2026-10-14): `generate::choose_ctx` over `ctx_ask::choose`),
   `--cache-type-k f16|q8_0` (the qwen3
   seats; llama-server's spelling, also the `BLOOMERY_QWEN3_KV` lever — q8_0 halves the KV bytes a position, so the
   auto context nearly doubles on the same card; `--cache-type-v` does not exist, both planes quantize together),
+  `-ub/--ubatch-size N` (the qwen3 seat and the decide seat, on a file with no routed expert, whose only load is the
+  whole one: that many tokens a prompt ubatch, or a refusal by name with the bytes it needs and a smaller size as
+  the remedy; unset, the load takes the largest of 4096, 2048, 1024 and 512 the card holds at the asked context and
+  slots, and one `ubatch` line names the sizes it tried; a routed file takes `BLOOMERY_QWEN3_UBATCH` and refuses
+  the flag),
   `--host/--port`, `--alias`, `--mmproj <file>` and `--no-mmproj` (image input, below).
 - **The model's name** (`/v1/models` `id`, the `model` of every answer, `/props` `model_alias`) is `--alias`, else the
   GGUF's `general.name`, else the seat's own default. llama-server's default is the model file's name; this server
@@ -151,8 +160,9 @@ Your OpenAI client works unchanged. bloomery speaks llama-server's HTTP API and 
   visible card, a split onto the CPU when the file does not fit it, and on GLM-5.3 the second card as an expert
   tier when its plan puts enough experts there to pay for it (the GLM row of the
   [A6000 + 3090 table](../README.md#numbers)). The plan line names what was picked.
-- **Two-card serving like `-ts`**: `--place a` for the largest visible card, `--place bp` to add the next one
-  as an expert tier, or a list (`0+1`) by CUDA index (not on the qwen38 seat, which takes `a`, `gate` or `bp`).
+- **llama-server's placement flags**: `-dev`, `-sm`, `-mg`, `-ts`, `-ngl`, `--cpu-moe`, `-fit`, `-devd` and
+  `--list-devices` place the model as they do there where bloomery has the thing the flag names, and are refused by
+  name where it has not. [Placement](#placement) lists each flag and what the load plans for it.
 - **Clef-Flash's `/v1/systemone`** follows llama.cpp's decision server wire (`model` optional, `/v1/models`,
   501 for video, and for an image when the seat has no encoder, upstream's `confidence` formula).
 - **`/v1/systemone` on a generative seat**: the same route, request and body as the decision models', answered by
@@ -188,6 +198,204 @@ Your OpenAI client works unchanged. bloomery speaks llama-server's HTTP API and 
 
 Where it ends today: one model a server, sm_86+ GPUs, and the seats' own defaults where llama-server has none
 (see [Limits](#limits)).
+
+## Placement
+
+`bloomery-serve` places a model with the flags llama-server places it with. Name a card and the plan is made on that
+card. Name nothing and the load picks (see "No placement flag needed" above). The flags that name cards or set a lever print a line on stderr saying what they were read as, and a flag
+bloomery cannot honor ends the start with a refusal that names it; none is ignored. llama-server's `LLAMA_ARG_*`
+variables for these flags are read too ([The environment](#the-environment)), and so are the flags on the other
+launchers of ours ([The other launchers](#the-other-launchers)).
+
+`bloomery-serve --list-devices` prints the devices as llama-server does and exits, before any model is read:
+
+    Available devices:
+      CUDA0: NVIDIA RTX A6000 (… MiB, … MiB free)
+      CUDA1: NVIDIA GeForce RTX 3090 (… MiB, … MiB free)
+
+The first figure is the bytes a plan may use of the device, the second what it had free at the start. `CUDA<N>` is
+the device's CUDA ordinal in this process, which `-dev`, `-mg`, `-ts` and `-devd` count by.
+
+| Flag | What bloomery does |
+|---|---|
+| `-dev CUDA0,CUDA1` | The cards the plan may use; default every visible card. `none` is refused: no seat runs on the CPU alone. |
+| `-sm layer` (default) | Every listed card takes part: the largest runs every layer and the head, the others hold experts under the host tier. bloomery does not split layers; one line says so. |
+| `-sm none -mg N` | The one card at index N of the list (`-mg` default 0). |
+| `-sm row`, `-sm tensor` | Refused: bloomery has no row split, and its tensor parallel is `--place tp` over `BLOOMERY_TP_NODES`, whose ranks are other nodes. |
+| `-ts 3,1` | The cards that stay: a zero or missing share leaves the card out, as there. With two or more cards left the shares are also each card's share of the routed experts: `BLOOMERY_CARD_BUDGET` is set to shares by CUDA ordinal in whole millionths of the total (`CUDA0=750000x,CUDA1=250000x`), and the plan turns them into a budget per card from its own terms: each card plans with its floor (dense tensors, cache, context, scratch, reserves, margin) and its part of the routed experts' bytes, the parts in the proportion of the shares and as many in all as the card whose room is tightest for its share holds (so the ratio is kept, never bent), the host tier taking the rest. The plan line prints the resolved bytes. A share that rounds to no millionth is refused with its terms; so is, by the plan, a card whose floor passes its bytes, and shares on a seat whose plan puts no routed expert on a card. One card left, or `-sm none`, sets nothing. |
+| `-mg N` under `-sm layer` | Refused unless N is 0: llama-server names no card by it there, and the stage here is the largest listed card. |
+| `-ngl` | `all`, `auto`, a negative count, or a count of at least the file's layers + 1 (llama-server counts the output layer as one more): as the load is. A smaller count is refused: every layer runs on the stage card. |
+| `--cpu-moe`, `-ncmoe N`, `-ot <experts>=CPU` | The qwen38 seat sets `BLOOMERY_QWEN38_EXPERTS=host`: every routed expert is planned on the host tier. `-ncmoe` counts only as every layer (N of at least the file's layers; 0 is nothing). `-ot` reads only the all-experts patterns (`exps`, `ffn_.*_exps`, `.ffn_.*_exps.`, `\.ffn_.*_exps\.`, `--cpu-moe`'s own regex) to `CPU`. Every other seat is refused: its plan puts on each card the experts the card's budget holds and leaves the rest to the host. |
+| `-fit on` (default) | The plan always fits. `-fit off` is refused: there is no unfitted load. Size the load with `-dev` or `-sm none -mg N` (the card), `-fitt` (the margin kept free on it) and `--ctx` (the context). |
+| `-fitc N` | N must be 4096, the least context an unset `--ctx` steps down to on every seat; pin a context with `--ctx`. |
+| `-fitt MiB[,MiB…]` | The margin kept free on each card, as llama-server reads it: one value is every device's, a list one per listed device (`-dev`'s order, else CUDA order). Sets `BLOOMERY_CARD_MARGIN` (one value for every card, or `CUDA<N>=<bytes>` for the cards the flags name, or for every visible card when they name none): the card keeps that many bytes free past its context and scratch, which the expert rule never plans into. It is the plan's own margin (1024 MiB unless set, which is also llama-server's default, so `-fitt 1024` changes nothing) replaced, and no budget: the card's usable bytes stay whole, and `BLOOMERY_CARD_BUDGET` still sets a cap beside it. With no card named the load picks the cards as it does unset, each with its margin, and may take the second card as an expert tier where the model's rule does. One line says so. Refused by name: a list that is neither one value nor one per listed device, and a margin that leaves a card no usable byte. |
+| `-devd CUDA1` | Sets `BLOOMERY_DSPARK_CARD=cuda1`, the card the V4.1 seat's DSpark draft (`BLOOMERY_DRAFT=dspark`) opens on. Unset, the draft sits on the tier card under `bp`, else on the smallest visible card (below). Another seat is refused. |
+
+A lever a flag sets (`BLOOMERY_QWEN38_EXPERTS`, `BLOOMERY_DSPARK_CARD`, `BLOOMERY_CARD_BUDGET`, `BLOOMERY_CARD_MARGIN`) replaces the environment's value, as a
+command-line flag replaces its `LLAMA_ARG_*` variable in llama-server. Giving a flag twice is refused. The cards
+the flags name become the `--place` word the seat parses (`a` and `bp` where the cards are theirs, else `cuda1` or
+`cuda1+cuda0`, the stage first), so a seat's own refusal of that word reaches you as a `--place` refusal after the
+line that says what the flags were read as: a seat whose body serves no expert tier card, or fewer than the listed
+cards, refuses the tier by name (the qwen38 seat serves one).
+
+Six command lines (`model.gguf` stands for your file; the cards are the A6000 as CUDA0 and the 3090 as CUDA1):
+
+    bloomery-serve -m model.gguf -sm none -mg 1
+
+One card. The plan runs on CUDA1 alone (`--place cuda1`): that card runs every layer and the head and holds the
+experts its budget allows, the host tier holds the rest, and CUDA0 is outside the plan. `-dev CUDA1` is the same.
+
+    bloomery-serve -m model.gguf -sm none -mg 1 -fitt 4096
+
+One card and its memory. The plan runs on CUDA1 with 4096 MiB kept free: the card's margin is that many bytes
+(`BLOOMERY_CARD_MARGIN=4294967296`, and one line prints it), its usable bytes stay whole, and the host tier holds the
+experts that no longer fit. `-dev CUDA0,CUDA1 -fitt 2048,4096` keeps 2048 MiB free on CUDA0 and 4096 MiB on CUDA1, and
+`-fitt 4096` alone keeps 4096 MiB free on every visible card and leaves the choice of cards to the load.
+
+The same margin without llama's flags: `BLOOMERY_CARD_MARGIN=4G` keeps 4 GiB free on every card, and
+`BLOOMERY_CARD_MARGIN=CUDA0=2G,CUDA1=4G` gives each card named its own (a card it does not name keeps the plan's own).
+A device the census does not list, a card named twice, shares, a list beside tier nodes (whose cards no ordinal of this
+process names) and a margin that leaves a card no usable byte are refused by name.
+
+A budget is a different thing, a cap on the bytes a card plans with: `BLOOMERY_CARD_BUDGET=38G` plans every card with at
+most 38 GiB, and `BLOOMERY_CARD_BUDGET=CUDA0=38G,CUDA1=20G` gives each card named its own (a card it does not name keeps
+its own bytes). It sizes the cards; `--place` (or the load's own pick) still chooses them. A device the census does not
+list, a card named twice, and a budget below what a card needs with no expert on it are refused by name. A list of
+shares, `BLOOMERY_CARD_BUDGET=CUDA0=3x,CUDA1=1x` (what `-ts 3,1` sets), splits the routed experts instead, as above.
+
+    bloomery-serve -m model.gguf -dev CUDA0,CUDA1
+
+All cards (the default of `-sm layer` with `-dev` naming both). The plan is `bp`: CUDA0, the larger, runs every layer
+and the head and CUDA1 is its expert tier under the host tier. The order of the list does not matter; the stage is
+the largest. The seat refuses the tier by name when its body serves none.
+
+    bloomery-serve -m model.gguf -dev CUDA1,CUDA0 -ts 1,0
+
+Two named devices and a split. The list is CUDA1 then CUDA0; `-ts` indexes that list, so the share of 1 is CUDA1's and
+the 0 leaves CUDA0 out: the plan runs on CUDA1 alone. With `-ts 3,1` both stay, the plan is `bp`, and the cards hold the
+routed experts in the proportion 3:1 (`BLOOMERY_CARD_BUDGET=CUDA0=750000x,CUDA1=250000x`, one line prints it): the
+stage keeps its dense tensors and its cache beside its 3 parts, the tier its 1, and the host tier the experts the
+tightest card cannot hold in that proportion.
+
+    bloomery-serve --model qwen38 -m model.gguf --cpu-moe
+
+Experts on the CPU, on the qwen38 seat: every routed expert is planned on the host tier (the
+`BLOOMERY_QWEN38_EXPERTS=host` arm). The same flag on another seat is refused by name.
+
+    BLOOMERY_DRAFT=dspark BLOOMERY_DSPARK_MODEL=draft.gguf bloomery-serve -m model.gguf -devd CUDA1
+
+A draft on a named device, on the V4.1 seat: the draft opens on CUDA1 (`BLOOMERY_DSPARK_CARD=cuda1`). The plan sets the
+draft's bytes aside on the card it opens on, before any expert there, so that card is on the plan: a card of the
+placement at its place, any other visible device as a card that holds the draft and no expert. Without `-devd` (or
+`BLOOMERY_DSPARK_CARD`, which also takes a card name) the draft sits:
+
+- under `bp`, on the tier card: the stage keeps the experts it holds without a draft and the tier holds fewer;
+- elsewhere, on the smallest visible card. When that is the stage (one visible card, or `gate`), the stage holds fewer
+  experts. Under `a` beside a smaller card, that card joins the plan to hold the draft and no expert, and the stage
+  keeps its experts.
+
+A device that is not visible, a card name two devices carry and a list are refused by name.
+
+**The older spelling.** `--place a` (the largest visible card), `--place gate` (the 3090's bytes alone), `--place bp`
+(the next-largest card as the largest's expert tier) and a list by card name or CUDA index (`0+1`, `cuda1+cuda0`, the
+stage first) keep their meaning. `--place` together with any flag above is refused by name.
+
+### The environment
+
+llama-server reads a variable for each of these flags, and so does every launcher here: the variable's value is read
+as the flag with that value, under llama-server's name for it.
+
+| Flag | Variable |
+|---|---|
+| `-dev` | `LLAMA_ARG_DEVICE` |
+| `-sm` | `LLAMA_ARG_SPLIT_MODE` |
+| `-ts` | `LLAMA_ARG_TENSOR_SPLIT` |
+| `-mg` | `LLAMA_ARG_MAIN_GPU` |
+| `-ngl` | `LLAMA_ARG_N_GPU_LAYERS` |
+| `--cpu-moe` | `LLAMA_ARG_CPU_MOE` |
+| `-ncmoe` | `LLAMA_ARG_N_CPU_MOE` |
+| `-ot` | `LLAMA_ARG_OVERRIDE_TENSOR` |
+| `-fit` | `LLAMA_ARG_FIT` |
+| `-fitt` | `LLAMA_ARG_FIT_TARGET` |
+| `-fitc` | `LLAMA_ARG_FIT_CTX` |
+
+The names are the `.set_env(...)` of each flag in llama.cpp's `common/arg.cpp` (commit f5027fb). `-devd` has no
+variable there, so it has none here. `LLAMA_ARG_DEVICE=CUDA1 LLAMA_ARG_N_GPU_LAYERS=99 bloomery-serve -m model.gguf`
+is `-dev CUDA1 -ngl 99`.
+
+- **The command line wins.** A flag on the command line replaces its variable, as in llama-server, and one line says
+  so. `--place` replaces the variables that name cards (`LLAMA_ARG_DEVICE`, `LLAMA_ARG_SPLIT_MODE`,
+  `LLAMA_ARG_TENSOR_SPLIT`, `LLAMA_ARG_MAIN_GPU`), also with a line; the other variables are read beside it.
+  `--place` beside a placement flag on the command line is refused, as above.
+- **Refused by name, as the flag is.** A variable whose flag would be refused ends the start under the variable's
+  name with the flag's reason, for instance `LLAMA_ARG_SPLIT_MODE=row`.
+- **`LLAMA_ARG_CPU_MOE` is a switch**: on for `on`, `enabled`, `true`, `1`, off for `off`, `disabled`, `false`, `0`.
+  Any other value is refused, where llama-server ignores it. The routed experts' place is named once: `--cpu-moe`,
+  `-ncmoe`, `-ot` and their variables are one place, and a second source of it is refused.
+- **The other flags a server takes under llama's spelling** are read from their variables too, on the
+  launchers whose seats take them (`bloomery-serve` and the single-seat servers): the variable's value is carried as
+  the flag, unless the command line gives it in any of its spellings, and one line says which.
+
+  | Flag | Variable |
+  |---|---|
+  | `-c`, `--ctx-size` | `LLAMA_ARG_CTX_SIZE` |
+  | `-ub`, `--ubatch-size` | `LLAMA_ARG_UBATCH` |
+  | `-cram`, `--cache-ram` | `LLAMA_ARG_CACHE_RAM` |
+  | `-mm`, `--mmproj` | `LLAMA_ARG_MMPROJ` |
+  | `--image-min-tokens`, `--image-max-tokens` | `LLAMA_ARG_IMAGE_MIN_TOKENS`, `LLAMA_ARG_IMAGE_MAX_TOKENS` |
+  | `-np`, `--parallel` | `LLAMA_ARG_N_PARALLEL` |
+  | `-a`, `--alias` | `LLAMA_ARG_ALIAS` |
+  | `--host`, `--port` | `LLAMA_ARG_HOST`, `LLAMA_ARG_PORT` |
+  | `--api-key` | `LLAMA_API_KEY` |
+  | `--api-key-file` | `LLAMA_ARG_API_KEY_FILE` |
+  | `--slot-save-path` | `LLAMA_ARG_SLOT_SAVE_PATH` |
+  | `--chat-template-file` | `LLAMA_ARG_CHAT_TEMPLATE_FILE` |
+  | `-m` (the model file), `-hf` (`--hf`) | `LLAMA_ARG_MODEL`, `LLAMA_ARG_HF_REPO` (`bloomery-serve` only; both set is refused) |
+
+  The names are the same `.set_env(...)` lines of `common/arg.cpp` (commit f5027fb). A seat that takes none of a flag
+  refuses it by its name after the line that says which variable it came from. The decision seat of `bloomery-serve`
+  reads them too, for the flags it takes, and names each placement variable that is set (`LLAMA_ARG_DEVICE` and the
+  rest of the table above) as one it does not act on: that seat places no card.
+- **The keys add.** `LLAMA_API_KEY` is `--api-key` (the one name in the table with no `LLAMA_ARG_` prefix, line 3542)
+  and `LLAMA_ARG_API_KEY_FILE` is `--api-key-file`. llama-server reads the variables before the command line and adds
+  every key it is given, so here too the variable's keys count beside the command line's: a key flag does not replace
+  them. The line that says a variable was read never prints a key. A variable that names no key (`LLAMA_API_KEY=`) ends
+  the start by name, as `--api-key ""` does, and does not leave the server open.
+- **Short spellings.** The command line's `-c`, `-ub`, `-np`, `-a`, `-mm` and `-cram` are respelled as `--ctx-size`,
+  `--ubatch-size`, `--parallel`, `--alias`, `--mmproj` and `--cache-ram` before a seat parses
+  (`llama_launch::respell`); a seat that takes none of the flag refuses it by the long name.
+- **`-cram -1` is refused by name.** llama-server reads a negative count as a prompt cache with no limit (`-cram`,
+  line 1719: "-1 - no limit, 0 - disable"). The cache here is host memory beside the load's host set, so it always has
+  a budget: MiB, `0` for none, or unset for the default (half of what the host leaves past the load, at most
+  llama-server's 8192 MiB). A negative count is refused with that, as `--cache-ram`, `-cram` or `LLAMA_ARG_CACHE_RAM`.
+- **A variable bloomery does not read has a line saying so.** `LLAMA_ARG_FLASH_ATTN`, `LLAMA_ARG_THREADS` and the rest
+  of llama-server's names that no flag of ours stands for are named, one line each, never silently dropped; so is a
+  server variable on a launcher that takes none (the generate launchers), `LLAMA_API_KEY` among them.
+
+### The other launchers
+
+`bloomery-serve-ds41`, `bloomery-serve-qwen38`, `bloomery-chat`, `generate_ds41`, `generate_glm5next` and
+`generate_qwen3moe` read the same flags and variables the same way, before any lever of theirs
+(`bloomery_gpu_gates::llama_launch`), and `--list-devices` prints the devices on each. Their model is
+`$BLOOMERY_REF_MODEL` as before, which `-ngl N` compares with. What a launcher has no thing for is refused by name:
+
+| Launcher | `--cpu-moe`, `-ncmoe`, `-ot` | `-devd` |
+|---|---|---|
+| `bloomery-serve` (by seat) | the qwen38 seat | the V4.1 seat |
+| `bloomery-serve-ds41`, `generate_ds41` | refused | accepted |
+| `bloomery-serve-qwen38` | accepted | refused |
+| `generate_qwen3moe` | on a qwen4exp file; refused on any other | refused |
+| `generate_glm5next`, `bloomery-chat` | refused | refused |
+
+`-ts`'s shares set a budget only on a load that names its card: on `generate_qwen3moe` it is refused (by the lever's
+name) unless a flag that names cards (`-dev`, `-sm`, `-ts`, `-mg`) gives the load a `--place`, which `-ts` does when two
+cards stay. `-fitt`'s margin is read wherever a placement is resolved, on every launcher. Each launcher parses the
+`--place` word the cards come to, so a stage its body does not serve is refused there, as before.
+
+`generate_glm5next` and `generate_qwen3moe` read their own flags by name and refuse any other argument by name, with the
+flags they have; before, a misspelled flag ran the default. The other launchers read their flags in one pass that
+refuses an argument it has no flag for, by name, with the usage (`bloomery-chat` and `generate_ds41` in their own parse,
+`bloomery-serve` and the single-seat servers in the seat's).
 
 ## The seats
 
@@ -226,7 +434,7 @@ bartowski/Cloudflare_clef-flash-GGUF:Q5_K_M` needs no head flag. The earlier `qw
 file: `--head joint_head.safetensors`, its `joint_head_config.json` beside it. A `--head` beside a `clef` file names the
 head instead of the file's own.
 
-**Concurrent requests.** Every generative seat but nemotron, raon1, solar2 and minimaxm3 (one slot each, above) takes `--parallel N` (unset, one slot; a set
+**Concurrent requests.** Every generative seat but nemotron, raon1 and solar2 (one slot each, above) takes `--parallel N` (unset, one slot; a set
 `--ctx-size` with no `--parallel` serves one slot at the whole of it — the flag is one request's context, as
 llama-server reads it, and the startup line says so). A count you set is never lowered. The N slots are resident sequences
 inside the one model, switched by pointer exchange: nothing parks, and each round advances every busy slot by one
@@ -237,7 +445,7 @@ Qwen3.8 also batches sampled steps on a drafting load, with every slot's draft b
 before the round's pass. A round that leaves slot 0 out runs as one pass too and keeps slot 0's waiting hidden rows
 intact. A
 placed Qwen3-30B or Qwen3.6 (`--place a`), a sampled request on a drafting GLM-5.3 load, V4.1 with the
-lookup draft and Qwen3.8 under `--place bp` step their slots in turn, a select and a step a slot each round. At a
+lookup draft, Qwen3.8 under `--place bp` and MiniMax-M3 step their slots in turn, a select and a step a slot each round. At a
 fixed expert placement each request answers the tokens of its run alone on the same server; under adaptive residency
 the placement follows every stream's passes (see [Limits](#limits)). Under more slots than one the context splits as
 llama-server splits it with `-np N` and no `-kvu`: a set `--ctx-size` is the total and each slot holds `total / N`
@@ -297,12 +505,17 @@ counters; a load that attached no tier prints none). Limits of a paged load, as 
   gives the same bits). The release uses no sidecar.
 
 **Speculative decoding.** `BLOOMERY_DRAFT=mtp` drafts with the model's own MTP head (Qwen3.8 and GLM-5.3, on by
-default in their servers); `BLOOMERY_DRAFT=dspark` drafts V4.1 with DeepSeek's DSpark head on a second card
-(`--place bp`). On the qwen3 seat, `BLOOMERY_DRAFT=dspark` with `BLOOMERY_DSPARK_MODEL` naming an HF draft
-directory serves a whole-card `qwen35moe` target from one slot: RedHat's Qwen3.6 speculator carries its own
-reduced head and id map, and MiniCPM-V 4.7's full-vocabulary draft borrows the target's Q6_K `output.weight` in
-place and its `token_embd.weight` rows, so neither file is copied. A draft whose ids, mask or taps do not fit
-the target is refused by name before a weight is read; a placed load and `--parallel > 1` are refused by name.
+default in their servers); on the qwen3 seat, `BLOOMERY_DRAFT=mtp` drafts a `qwen35moe` or `qwen35` file's
+own next-token layer on a whole-card load of one sequence, and a media load, a placed load and `--parallel`
+above 1 refuse it by name; a `qwen3moe` file keeps the plain path, `mtp` refused by name (no such layer,
+no verify pass). `BLOOMERY_DRAFT=dspark` drafts V4.1 with DeepSeek's DSpark head. The draft sits on the tier card
+under `--place bp`, else on the smallest visible card: the stage itself, or a second card that joins the plan to hold
+the draft and no expert; `-devd` names it (Placement, above). On the qwen3 seat, `BLOOMERY_DRAFT=dspark` with
+`BLOOMERY_DSPARK_MODEL` naming an HF draft directory serves a whole-card `qwen35moe` target from one slot: RedHat's
+Qwen3.6 speculator carries its own reduced head and id map, and MiniCPM-V 4.7's full-vocabulary draft borrows the
+target's Q6_K `output.weight` in place and its `token_embd.weight` rows, so neither file is copied. A draft whose
+ids, mask or taps do not fit the target is refused by name before a weight is read; a placed load and
+`--parallel > 1` are refused by name.
 The draft fits a target by its facts, not by the file's name: a fine-tune that carries Qwen3.6's shapes (Sage-A1.5,
 Ornith-1.5) takes the same draft, and a reduced draft borrows nothing from the target, so a target whose own head
 is not a Q6_K projection serves it too. On the same seat, `BLOOMERY_DRAFT=lookup` serves the n-gram lookup draft
@@ -327,15 +540,17 @@ decode starts warm (on by default, with `--place` unset, `a` or `bp`). On Qwen3.
 decode has routed experts of its own puts the pool back where it found it at its end, so a long prompt does not
 reset the placement its reply decodes from; a fresh server's calls keep it.
 
-**Prompt cache (V4.1, Qwen3.8, GLM-5.3).** `--cache-ram` (MiB; 0 turns it off) keeps saved sequence states in host RAM.
+**Prompt cache (V4.1, Qwen3.8, GLM-5.3, MiMo, MiniMax-M3, Muse Spark).** `--cache-ram` (MiB; 0 turns it off) keeps saved sequence states in host RAM.
 By default the budget is the lesser of 8 GiB and half the host RAM the plan leaves, with every slot's checkpoints and
 the residency's churn pool counted in; the checkpoint budget follows the slot context. A request that continues an
 earlier conversation (its prompt holds the whole earlier prompt) restores that state even after another request used
 the slot. A request that shares only part of an earlier prompt, such as the same system prompt with another question,
 restores too: a saved state keeps checkpoints at 512·2^i positions below its end and the last one, and a shared
 prefix restores at the largest of them inside it. On Qwen3.8 the card's own checkpoints are 4,096 positions
-apart, so there a shared prefix shorter than 4,096 tokens does not restore. Saving runs off the request path. The
-MiMo and Qwen3 seats keep only the longest prefix the live slot holds; they run no saved prompt cache, and a
+apart, so there a shared prefix shorter than 4,096 tokens does not restore. Saving runs off the request path. On
+MiniMax-M3 and Muse Spark a saved state is the K and V rows of the held positions (and MiniMax's index keys), with no
+checkpoints: a request that shares any prefix with a saved state restores that prefix, and only those rows go back to
+the card. The Qwen3 seats keep only the longest prefix the live slot holds; they run no saved prompt cache, and a
 save is refused by name. For Qwen3.5 and Qwen3.6, when the vocabulary and chat template both carry
 `<|im_start|>`, the seat cuts prompt calls at message starts, so a shared system prompt stays in the live slot
 for another question. Reuse still requires that slot to hold the shared prefix; another conversation can replace it. `timings.cache_ms` and `/metrics`'
@@ -427,7 +642,7 @@ and the model fits) states no need and consults no hook; a set hook is named on 
 - One model a server; one expert tier card at most (`--place bp`).
 - Concurrent streams run as one pass on a whole-card Qwen3-30B or Qwen3.6, on V4.1, MiMo-V2.6-Flash, GLM-5.3 and Qwen3.8; a placed
   Qwen3-30B or Qwen3.6 and a sampled request on a drafting load step in turn. A new request's prompt runs whole while the other
-  streams wait. The decide seat serves one request at a time, and the nemotron, raon1, solar2 and minimaxm3 seats one
+  streams wait. The decide seat serves one request at a time, and the nemotron, raon1 and solar2 seats one
   slot each; DSpark drafts never rejoin — `--parallel > 1` with
   `BLOOMERY_DRAFT=dspark` is refused by name.
 - With adaptive residency on, a request's tokens follow the placement its passes ran on, and the placement follows
@@ -477,7 +692,7 @@ and the model fits) states no need and consults no hook; a set hook is named on 
   written as `\u003c` in both, which reads back as the same string. A string written raw in a tool call's XML markup is
   one line (Qwen) or holds no `<` (GLM, DSML), since the value ends at the text after it, and a raw constant or enum
   option with a `<` is a 400.
-- A pinned nightly with a pinned cuda-oxide revision from our fork ([`BUILD.md`](BUILD.md)).
+- A pinned toolchain with a pinned cuda-oxide revision ([`BUILD.md`](BUILD.md)).
 
 In progress: serving on N cards for every model; Clef from the IQ and Q2_K files; DeepSeek-V4-Flash-0731.
 

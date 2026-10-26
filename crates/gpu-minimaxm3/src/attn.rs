@@ -33,6 +33,7 @@
 //! No silent failure: a score that is not finite raises [`FaultSite::PoolSelect`] (the value is
 //! written as computed), a row whose own block the selection lost raises it too and gets length 0,
 //! and a count of 0 or past the cache gets length 0, which the flash's merge refuses by name.
+//! [`enqueue_attention`] refuses a scratch whose `top_k` is not the launch's.
 
 use bloomery_gpu::fault::{FaultSink, FaultSite};
 use bloomery_gpu::flash::{f32_to_f16_bits, half_bits_to_f32};
@@ -43,6 +44,7 @@ use bloomery_gpu::flash_gqa::{
 use bloomery_gpu::qsa::order_key;
 use bloomery_gpu::rope_neox::{PartialNeoxArgs, ROT_PARTIAL, RopeNeoxKernels};
 use bloomery_gpu::{GpuError, launch_u32};
+use bloomery_gpu_deepseek41::span::{span, span_mut};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::{
     DisjointSlice, SharedArray, kernel, launch_bounds, launch_contract, thread, warp,
@@ -50,6 +52,7 @@ use cuda_device::{
 use cuda_host::cuda_module;
 use model::arch::minimaxm3::hparams::{Hparams, Msa as HparamsMsa};
 use runtime::msa::{FORCE, Msa};
+use runtime::prompt::chunks;
 use std::sync::Arc;
 
 /// Index heads (`attention.indexer.head_count`), one for each key head.
@@ -723,8 +726,8 @@ impl MsaKernels {
     }
 }
 
-/// The checks the two passes share: a row count within the scratch's, the scratch built for this
-/// shape and a cache of this height.
+/// The checks the score, pick and attention passes share: a row count within the scratch's, the
+/// scratch built for this shape (`top_k`) and a cache of this height.
 fn check_scratch(
     what: &'static str,
     shape: &MsaShape,
@@ -832,8 +835,9 @@ pub unsafe fn enqueue_index(
 
 /// [`enqueue_attention`]'s arguments: the rows' query heads normed and turned (`[m][N_HEAD][DIM]`
 /// f32, the main head kernel's output), the layer's key and value planes (`[4][ctx][DIM]` f16,
-/// the rows of the call written), the flash's partials ([`partials_lens`]) and the output
-/// (`[m][N_HEAD][DIM]`). The blocks and key counts are the scratch's, the selection's.
+/// the rows of the call written), the flash's partials (whole rows of [`partials_lens`], as many as
+/// a launch runs) and the output (`[m][N_HEAD][DIM]`). The blocks and key counts are the scratch's,
+/// the selection's.
 pub struct AttnArgs<'a> {
     pub q: &'a DeviceBuffer<f32>,
     pub kc: &'a DeviceBuffer<u16>,
@@ -856,10 +860,24 @@ pub fn partials_lens(shape: &MsaShape, m: usize) -> (usize, usize) {
     )
 }
 
+/// The rows a launch runs on partials of `part_v` and `part_ms` values, a row taking `one` (its
+/// [`partials_lens`] at one row, or the dense flash's): every launch of a pass over more rows than
+/// that is cut to this many, so the partials are sized for one launch, not for the pass. At least 1:
+/// partials shorter than one row are the launch's own refusal.
+#[must_use]
+pub fn rows_held(part_v: usize, part_ms: usize, one: (usize, usize)) -> usize {
+    (part_v / one.0).min(part_ms / one.1).max(1)
+}
+
 /// Enqueue the flash over the blocks `scratch` holds for `args.m` rows ([`MsaKernels::enqueue_pick`]
 /// ran for them): each key head's sixteen query heads attend the key head's own kept blocks, at the
-/// scale [`attn_scale`]. Two launches. A row of length 0 (a refused count, or a selection that lost
-/// the own block) is NaN with [`FaultSite::KeyCount`] raised.
+/// scale [`attn_scale`]. Two launches for each [`rows_held`] rows of the partials (a row's flash is
+/// its own, so the cut writes the bits one launch would). Refused by name ([`GpuError::Shape`], site
+/// `minimaxm3::attn::enqueue_attention`) when the scratch's `top_k` is not the launch's (both
+/// counts are in the detail), or the row count or cache height is outside the scratch. A scratch
+/// of another `top_k` can pass the flash's length checks and is then read at the wrong stride.
+/// A row of length 0 (a refused count, or a selection that lost the own block) is NaN with
+/// [`FaultSite::KeyCount`] raised.
 pub fn enqueue_attention(
     flash: &FlashGqaKernels,
     stream: &CudaStream,
@@ -867,6 +885,7 @@ pub fn enqueue_attention(
     scratch: &MsaScratch,
     args: AttnArgs<'_>,
 ) -> Result<(), GpuError> {
+    let what = "minimaxm3::attn::enqueue_attention";
     let AttnArgs {
         q,
         kc,
@@ -878,24 +897,35 @@ pub fn enqueue_attention(
         fault,
         y,
     } = args;
-    flash.enqueue_pass_p16_blocks(
-        stream,
-        GqaBlocksArgs {
-            q,
-            kc,
-            vc,
-            ids: &scratch.ids,
-            n_keys: &scratch.n_sel,
-            blocks: shape.top_k(),
-            scale: attn_scale(),
-            n_kv: HEADS,
-            ctx,
-            m,
-            part_v,
-            part_ms,
-            fault,
-            y,
-        },
-        N_HEAD,
-    )
+    check_scratch(what, shape, scratch, ctx, m)?;
+    let (v1, ms1) = partials_lens(shape, 1);
+    let held = rows_held(part_v.len(), part_ms.len(), (v1, ms1));
+    let (row, list) = (N_HEAD * DIM, HEADS * shape.top_k());
+    for (c0, cn) in chunks(m, held) {
+        let q = span(what, q, c0 * row, cn * row)?;
+        let ids = span(what, &scratch.ids, c0 * list, cn * list)?;
+        let n_keys = span(what, &scratch.n_sel, c0, cn)?;
+        let mut y = span_mut(what, &mut *y, c0 * row, cn * row)?;
+        flash.enqueue_pass_p16_blocks(
+            stream,
+            GqaBlocksArgs {
+                q: &q,
+                kc,
+                vc,
+                ids: &ids,
+                n_keys: &n_keys,
+                blocks: shape.top_k(),
+                scale: attn_scale(),
+                n_kv: HEADS,
+                ctx,
+                m: cn,
+                part_v: &mut *part_v,
+                part_ms: &mut *part_ms,
+                fault,
+                y: &mut y,
+            },
+            N_HEAD,
+        )?;
+    }
+    Ok(())
 }

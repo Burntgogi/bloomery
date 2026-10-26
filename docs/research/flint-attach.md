@@ -69,22 +69,22 @@ existing epsilon-added selected sum. Flint's distinct floor mapping stays in its
 ### Six-slot F32 tier handoff implementation
 
 `HandoffKernels::enqueue_handoff_tier` now selects a genuine six-slot F32 entry
-beside the existing eight-slot entry. Both host and tier layouts must have the
+beside the existing four- and eight-slot entries. Both host and tier layouts must have the
 same supported slot count and activation width; compressed tier images remain
 refused. The entry uses the existing copy/place/fault helpers and the existing
 subsequent go/publication protocol; no Flint router or Program is registered.
 
-The pure layout contract passed locally after an oxide build.
-`hw_f32_tier_handoffs_conserve_six_and_eight_consumed_routes`, owned by
-`gate-gpu-ds41-lib`, consumes the handoff's weights and emitted places through
-the production tier accumulator and adds the host sum. It covers partial widths,
-invalid ids, poisoned non-owning rows, trailing sentinels and changed replay
+`hw_f32_tier_handoffs_conserve_consumed_routes`, owned by
+`gate-gpu-ds41-lib`, consumes the four-, six- and eight-slot handoffs' weights and emitted
+places through the production tier accumulator and adds the host sum. It covers partial
+widths, invalid ids, poisoned non-owning rows, trailing sentinels and changed replay
 weights. Its host sum is precomputed and activation images are checked by
 readback: it is not expert execution or two-card completion/publication proof.
-The hardware case has not been run here.
+Earlier integrated-source results do not verify this branch after its merge with current
+main; the final-source hardware result must be recorded separately.
 
 The new `ffn_handoff_6_tier` entry needs add-class PTX/JIT/resource and
-owning-gate evidence; the eight-slot and other existing entries must remain
+owning-gate evidence; the four-slot, eight-slot and other existing entries must remain
 unchanged. No PTX resource pin is added without an observed NVIDIA JIT run.
 Actual six-slot body/tier and two-card completion remain integration work, not
 capabilities inferred from this primitive.

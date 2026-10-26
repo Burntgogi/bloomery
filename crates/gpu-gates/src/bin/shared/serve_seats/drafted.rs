@@ -589,6 +589,30 @@ where
         )
     }
 
+    /// The same prompt and draft-store walk without the target's head.
+    pub(crate) fn prefill_only(
+        &mut self,
+        s: &mut Session<B>,
+        slot: usize,
+        ids: &[u32],
+        path: B::Path,
+    ) -> Result<(), GateError> {
+        self.prefill_by(
+            s,
+            slot,
+            ids,
+            |s| {
+                s.prefill(ids, path)?;
+                Ok(0)
+            },
+            |spec, s| {
+                spec.draft_mut().prompt_by(|d| d.prefill(s, ids))?;
+                Ok(0)
+            },
+        )
+        .map(|_| ())
+    }
+
     /// [`SlotDrafts::prefill`] of a prompt that holds an image: `spans` are the
     /// body's spans of the image's rows, spliced in place of their positions'
     /// embeddings. Under the draft the draft's own media prompt call
@@ -1159,6 +1183,18 @@ mod tests {
     /// The medians of a plain step's and a verify's own walls.
     fn walls() -> Vec<Option<f64>> {
         [STEP, VERIFY].map(|w| Some(w.as_secs_f64() * 1e3)).to_vec()
+    }
+
+    /// A table of no draft runs every slot's pass as one plain step, none of
+    /// its slots off: the condition the Qwen3.8 seat reads a step's PLE rows
+    /// ahead on.
+    #[test]
+    fn a_table_of_no_draft_passes_one_row_on_every_slot() {
+        let none = SlotDrafts::<bloomery_gpu::arch::qwen3moe::Body38, 2>::none();
+        for slot in 0..3 {
+            assert_eq!(none.pass_rows(slot), 1, "slot {slot}");
+            assert!(!none.is_off(slot), "slot {slot}");
+        }
     }
 
     #[test]

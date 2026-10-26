@@ -6,8 +6,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use gguf::write::{Layout, TensorDecl, Writer};
 use gguf::{GENERAL_ARCHITECTURE, GgmlType, Split, Value};
 
-use super::{Row, Scope, check, custom_q, expand, override_kv, parse_table, row};
-use crate::fixture::{FixtureError, KEY_VARIANT};
+use super::{Row, Scope, check, custom_q, expand, override_kv, parse_table, record_budget, row};
+use crate::fixture::{Budget, CardBudget, CardExperts, FixtureError, KEY_CARD_BUDGET, KEY_VARIANT};
 
 const TABLE_ROW: &str = "v1\tfam\ttrunk\tffn_gate_exps=iq3_s ffn_up_exps=iq3_s ffn_down_exps=iq4_xs\tgate-a gate-b\ta reason";
 
@@ -98,13 +98,51 @@ fn source_kvs() -> Vec<(String, Value)> {
         ("general.file_type".into(), Value::U32(15)),
         ("tokenizer.ggml.model".into(), Value::String("gpt2".into())),
         ("bloomery.fixture.version".into(), Value::U32(1)),
-        ("bloomery.fixture.card_budget".into(), Value::U64(1 << 20)),
+        // The planner's value for the trunk: 4 bytes an expert, half of 8, cap 16.
+        (
+            "bloomery.fixture.card_budget".into(),
+            Value::U64(TRUNK_BUDGET),
+        ),
         (
             "quantize.imatrix.file".into(),
             Value::String("source.imatrix".into()),
         ),
         ("quantize.imatrix.entries_count".into(), Value::U32(7)),
     ]
+}
+
+/// The trunk's recorded card budget, what the planner of [`card_budget`] finds for the source.
+const TRUNK_BUDGET: u64 = 16;
+/// The variant's own, the same planner over the variant's smaller stacks.
+const VARIANT_BUDGET: u64 = 8;
+
+/// The family's budget the checks plan with: an expert costs 4 bytes on the trunk and 2 on the
+/// variant (its stacks take the map's smaller types), so the smallest cap holding half of the 8
+/// experts on each of the two card-eligible layers is 16 for the trunk and 8 for the variant (the
+/// whole-MiB rounding keeps neither).
+fn card_budget() -> CardBudget {
+    CardBudget::Planned(Budget {
+        ctx: 1,
+        card_experts: |split, cap| {
+            let per = if split.value(KEY_VARIANT).is_some() {
+                2
+            } else {
+                4
+            };
+            let n = match cap {
+                None => 8,
+                Some(0) => {
+                    return Err(FixtureError::Budget("no room for dense weights".into()));
+                }
+                Some(c) => (c / per).min(8),
+            };
+            Ok(CardExperts {
+                per_layer: vec![n, 0, n],
+                experts: 8,
+            })
+        },
+        card_set_aside: None,
+    })
 }
 
 /// The variant `source` gives under the table row: the trunk stacks at the map's types.
@@ -128,13 +166,39 @@ fn variant_tensors(source: &[T]) -> Vec<T> {
     out
 }
 
+/// Set `key`'s value in `kvs`, which must hold it.
+fn set(kvs: &mut [(String, Value)], key: &str, v: Value) {
+    kvs.iter_mut()
+        .find(|(k, _)| k == key)
+        .unwrap_or_else(|| panic!("{key} is not in the kvs"))
+        .1 = v;
+}
+
 fn variant_kvs() -> Vec<(String, Value)> {
     let mut kvs = source_kvs();
-    kvs[1].1 = Value::U32(14);
+    set(&mut kvs, "general.file_type", Value::U32(14));
     // The quantizer's own words about the matrix it was given, not the file's content.
-    kvs[5].1 = Value::String("flat.imatrix".into());
-    kvs[6].1 = Value::U32(6);
+    set(
+        &mut kvs,
+        "quantize.imatrix.file",
+        Value::String("flat.imatrix".into()),
+    );
+    set(&mut kvs, "quantize.imatrix.entries_count", Value::U32(6));
+    // The budget the quantizer copies is the trunk's; the variant's own replaces it
+    // (`record_budget`).
+    set(
+        &mut kvs,
+        "bloomery.fixture.card_budget",
+        Value::U64(VARIANT_BUDGET),
+    );
     kvs.push((KEY_VARIANT.into(), Value::String("v1".into())));
+    kvs
+}
+
+/// The variant's header with `budget` recorded, the quantizer's own state at `TRUNK_BUDGET`.
+fn variant_kvs_at(budget: u64) -> Vec<(String, Value)> {
+    let mut kvs = variant_kvs();
+    set(&mut kvs, "bloomery.fixture.card_budget", Value::U64(budget));
     kvs
 }
 
@@ -334,6 +398,56 @@ fn a_map_that_bites_nothing_is_refused() {
     );
 }
 
+/// A role that names a tensor outside the layers (`token_embd`) reaches that tensor in either scope,
+/// beside the layers' tensors of the map's other roles; one already at the type is refused as a layer's is.
+#[test]
+fn a_role_outside_the_layers_reaches_its_tensor() {
+    let d = Dir::new();
+    let mut tensors = source_tensors();
+    tensors.insert(
+        0,
+        t("token_embd.weight".into(), &[256, 4], GgmlType::Q3_K, 0, 13),
+    );
+    let src = open(&write(&d.0, "s", &source_kvs(), &tensors, 2));
+    let with = |scope: Scope, ty: GgmlType| Row {
+        scope,
+        map: vec![
+            ("token_embd".to_string(), ty),
+            ("ffn_gate_exps".to_string(), GgmlType::IQ3_S),
+        ],
+        ..the_row()
+    };
+    for scope in [Scope::Trunk, Scope::All] {
+        let got = expand(&with(scope, GgmlType::Q5_K), &src).expect("an expansion");
+        let first = got.first().expect("a retyped tensor");
+        assert_eq!(
+            (first.name.as_str(), first.from, first.to),
+            ("token_embd.weight", GgmlType::Q3_K, GgmlType::Q5_K),
+            "the tensor outside the layers leads the source's order"
+        );
+        assert!(
+            got.iter()
+                .skip(1)
+                .all(|r| r.name.ends_with("ffn_gate_exps.weight")),
+            "the layers' tensors of the other role follow"
+        );
+    }
+    red(
+        expand(&with(Scope::Trunk, GgmlType::Q3_K), &src),
+        &["token_embd.weight", "already at q3_K"],
+    );
+    let arg = custom_q(
+        "v1",
+        &src,
+        &expand(&with(Scope::Trunk, GgmlType::Q5_K), &src).expect("an expansion"),
+    )
+    .expect("an argument");
+    assert!(
+        arg.starts_with("^token_embd\\.weight$=q5_K,"),
+        "the quantizer's argument retypes it by its exact name: {arg}"
+    );
+}
+
 /// A tensor already at the map's type, beside another of its role that is not, is left out of the
 /// expansion; the quantizer's argument keeps it at its own type.
 #[test]
@@ -401,8 +515,10 @@ fn a_variant_that_differs_by_the_map_alone_passes() {
         2,
     ));
     let mut lines = Vec::new();
-    let stats =
-        check(&the_row(), &src, &var, &mut |l| lines.push(l.to_string())).expect("a variant");
+    let stats = check(&the_row(), &src, &var, card_budget(), &mut |l| {
+        lines.push(l.to_string())
+    })
+    .expect("a variant");
     assert_eq!((stats.tensors, stats.retyped, stats.shards), (12, 6, 2));
     let stacks = ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"];
     let copied: usize = tensors
@@ -425,7 +541,10 @@ fn a_variant_that_differs_otherwise_is_refused_by_name() {
     let mut run = |kvs: Vec<(String, Value)>, ts: Vec<T>, shards: usize, parts: &[&str]| {
         n += 1;
         let var = open(&write(&d.0, &format!("v{n}"), &kvs, &ts, shards));
-        red(check(&the_row(), &src, &var, &mut |_| {}), parts);
+        red(
+            check(&the_row(), &src, &var, card_budget(), &mut |_| {}),
+            parts,
+        );
     };
     let mutate = |name: &str, f: &dyn Fn(&mut T)| {
         let mut ts = good.clone();
@@ -504,7 +623,7 @@ fn a_variant_that_differs_otherwise_is_refused_by_name() {
     kvs[tag].1 = Value::String("v2".into());
     run(kvs, good.clone(), 2, &[KEY_VARIANT, "\"v2\""]);
     let mut kvs = variant_kvs();
-    kvs.remove(4);
+    kvs.retain(|(k, _)| k != "bloomery.fixture.card_budget");
     run(
         kvs,
         good.clone(),
@@ -512,7 +631,11 @@ fn a_variant_that_differs_otherwise_is_refused_by_name() {
         &["bloomery.fixture.card_budget", "missing"],
     );
     let mut kvs = variant_kvs();
-    kvs[2].1 = Value::String("llama".into());
+    set(
+        &mut kvs,
+        "tokenizer.ggml.model",
+        Value::String("llama".into()),
+    );
     run(kvs, good.clone(), 2, &["tokenizer.ggml.model", "\"llama\""]);
     let mut kvs = variant_kvs();
     kvs.push(("bloomery.fixture.seed".into(), Value::U64(2)));
@@ -521,5 +644,150 @@ fn a_variant_that_differs_otherwise_is_refused_by_name() {
         good.clone(),
         2,
         &["bloomery.fixture.seed", "not in the source"],
+    );
+}
+
+/// A variant's card budget is its own file's plan, not its trunk's copied: the check holds a
+/// planned family's variant to the planner's value for the written file — the trunk's is another
+/// number — and a fixed family's to the trunk's. Mutants: the budget clause dropped (the trunk's
+/// passes); the key held equal to the source's again (the variant's own refuses).
+#[test]
+fn a_variants_card_budget_is_its_own_not_its_trunks() {
+    let d = Dir::new();
+    let tensors = source_tensors();
+    let src = open(&write(&d.0, "s", &source_kvs(), &tensors, 2));
+    // The planner's value for this file.
+    let var = open(&write(
+        &d.0,
+        "v",
+        &variant_kvs(),
+        &variant_tensors(&tensors),
+        2,
+    ));
+    check(&the_row(), &src, &var, card_budget(), &mut |_| {}).expect("the variant's own budget");
+    // The trunk's, which the quantizer copies: refused by name, both numbers in the message.
+    let var = open(&write(
+        &d.0,
+        "w",
+        &variant_kvs_at(TRUNK_BUDGET),
+        &variant_tensors(&tensors),
+        2,
+    ));
+    red(
+        check(&the_row(), &src, &var, card_budget(), &mut |_| {}),
+        &[
+            KEY_CARD_BUDGET,
+            "U64(16)",
+            "the planner's 8",
+            "its own file",
+        ],
+    );
+    // A missing key.
+    let mut kvs = variant_kvs();
+    kvs.retain(|(k, _)| k != KEY_CARD_BUDGET);
+    let var = open(&write(&d.0, "x", &kvs, &variant_tensors(&tensors), 2));
+    red(
+        check(&the_row(), &src, &var, card_budget(), &mut |_| {}),
+        &[KEY_CARD_BUDGET, "missing", "the planner's 8"],
+    );
+    // A fixed family keeps the trunk's value: it passes, and the variant's own is a changed key.
+    let var = open(&write(
+        &d.0,
+        "y",
+        &variant_kvs_at(TRUNK_BUDGET),
+        &variant_tensors(&tensors),
+        2,
+    ));
+    check(
+        &the_row(),
+        &src,
+        &var,
+        CardBudget::Fixed(1 << 20),
+        &mut |_| {},
+    )
+    .expect("the trunk's value");
+    let var = open(&write(
+        &d.0,
+        "z",
+        &variant_kvs(),
+        &variant_tensors(&tensors),
+        2,
+    ));
+    red(
+        check(
+            &the_row(),
+            &src,
+            &var,
+            CardBudget::Fixed(1 << 20),
+            &mut |_| {},
+        ),
+        &["the header:", KEY_CARD_BUDGET, "the source's is U64(16)"],
+    );
+}
+
+/// The written set's shard `i` of `n` named `stem`.
+fn shard(dir: &Path, stem: &str, i: usize, n: usize) -> PathBuf {
+    dir.join(format!("{stem}-{:05}-of-{:05}.gguf", i + 1, n))
+}
+
+/// `record_budget` replaces the trunk's budget the quantizer copied with the variant's own: the
+/// bytes that move stay inside the value's eight, on every shard that holds the key, and the
+/// reopened set reads the new value. Mutants: the offset off by one (a byte outside the window
+/// moves, and the reopened value is wrong); the value written big-endian (the reopened value is
+/// wrong); the type check dropped (a shard holding the key as a string is patched instead of
+/// refused).
+#[test]
+fn record_budget_rewrites_only_the_value() {
+    let d = Dir::new();
+    let tensors = source_tensors();
+    let src = open(&write(&d.0, "s", &source_kvs(), &tensors, 2));
+    drop(src);
+    let first = write(
+        &d.0,
+        "v",
+        &variant_kvs_at(TRUNK_BUDGET),
+        &variant_tensors(&tensors),
+        2,
+    );
+    let before: Vec<Vec<u8>> = (0..2)
+        .map(|i| std::fs::read(shard(&d.0, "v", i, 2)).expect("the shard before"))
+        .collect();
+    // A value that differs from the trunk's 16 at both ends of the u64, so a write at a wrong
+    // offset moves a byte the window does not hold.
+    const TO: u64 = 0x0100_0000_0000_0008;
+    let var = open(&first);
+    let was = record_budget("v1", &var, TO).expect("the trunk's budget");
+    assert_eq!(was, TRUNK_BUDGET, "the quantizer copied the trunk's");
+    drop(var);
+    for (i, before) in before.iter().enumerate() {
+        let after = std::fs::read(shard(&d.0, "v", i, 2)).expect("the shard after");
+        let at: Vec<usize> = before
+            .iter()
+            .zip(&after)
+            .enumerate()
+            .filter(|(_, (a, b))| a != b)
+            .map(|(at, _)| at)
+            .collect();
+        assert!(!at.is_empty(), "the value's bytes move");
+        assert!(
+            at.len() <= 8,
+            "no more than the value's eight bytes move: {at:?}"
+        );
+        let lo = at[0];
+        assert!(at.iter().all(|&x| x < lo + 8), "inside the value: {at:?}");
+    }
+    assert_eq!(open(&first).value(KEY_CARD_BUDGET), Some(&Value::U64(TO)));
+    // A shard holding the key as another type: refused by name, nothing written.
+    let mut kvs = variant_kvs_at(TRUNK_BUDGET);
+    set(&mut kvs, KEY_CARD_BUDGET, Value::String("sixteen".into()));
+    let strung = write(&d.0, "u", &kvs, &variant_tensors(&tensors), 1);
+    red(
+        record_budget("v1", &open(&strung), TO),
+        &[KEY_CARD_BUDGET, "not a u64"],
+    );
+    assert_eq!(
+        open(&strung).value(KEY_CARD_BUDGET),
+        Some(&Value::String("sixteen".into())),
+        "the refusal writes nothing"
     );
 }

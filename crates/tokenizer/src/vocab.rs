@@ -95,6 +95,7 @@ const FIM_REP_NAMES: &[&str] = &[
 const FIM_SEP_NAMES: &[&str] = &["<|file_sep|>"];
 const EOG_NAMES: &[&str] = &[
     "<|eot_id|>",
+    "<|eot|>",
     "<|im_end|>",
     "<|end|>",
     "<|return|>",
@@ -165,6 +166,9 @@ pub(crate) enum Encoding {
         pre: Pre,
         merges: Vec<String>,
         nfc: bool,
+        /// A Hugging Face tokenizer, as the explicit stop list says: its BPE and its
+        /// added-token split are `tokenizers`'.
+        hf: bool,
     },
     Spm {
         scores: Vec<f32>,
@@ -392,15 +396,18 @@ impl Vocab {
                 };
                 let pre = crate::named(&Pre::NAMES, name)
                     .ok_or_else(|| Error::UnsupportedPre(name.to_string()))?;
-                // Only the private stop key marks a Hugging Face tokenizer.
-                let pre = match (pre, explicit_stops.is_some()) {
-                    (Pre::Qwen35, true) => Pre::Qwen35Hf,
+                // Only the private stop key marks a Hugging Face tokenizer, whose pre-tokenizer
+                // runs as its tokenizer.json does.
+                let hf = explicit_stops.is_some();
+                let pre = match (pre, hf) {
                     (pre, false) => pre,
-                    (_, true) => {
-                        return Err(Error::InvalidStops(format!(
-                            "tokenizer.bloomery.eog_token_ids marks a Hugging Face qwen35 tokenizer, not pre-tokenizer {name:?}"
-                        )));
-                    }
+                    (pre, true) => pre.hf_reading().ok_or_else(|| {
+                        Error::InvalidStops(format!(
+                            "tokenizer.bloomery.eog_token_ids marks a Hugging Face tokenizer, and \
+                             pre-tokenizer {name:?} has no reading that runs as tokenizers does ({})",
+                            Pre::hf_names()
+                        ))
+                    })?,
                 };
                 let merges = m
                     .strings("tokenizer.ggml.merges")?
@@ -408,11 +415,19 @@ impl Vocab {
                 // The reference NFC-normalizes the text of a pre-tokenizer that names it
                 // ([`Pre::nfc`]) whatever the header says.
                 let nfc = nfc || pre.nfc();
-                (name.to_string(), Encoding::Bpe { pre, merges, nfc })
+                (
+                    name.to_string(),
+                    Encoding::Bpe {
+                        pre,
+                        merges,
+                        nfc,
+                        hf,
+                    },
+                )
             }
             Model::Spm if explicit_stops.is_some() => {
                 return Err(Error::InvalidStops(
-                    "tokenizer.bloomery.eog_token_ids marks a Hugging Face qwen35 tokenizer, not SentencePiece".into(),
+                    "tokenizer.bloomery.eog_token_ids marks a Hugging Face byte-level BPE tokenizer, not SentencePiece".into(),
                 ));
             }
             Model::Spm => (

@@ -7,6 +7,7 @@
 //!     generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C]
 //!                    [--print-ids] [--profile [N]] [--profile-layers]
 //!                    [--step-times [N]] [--prefill batch|steps] [--pass-times U]
+//!     generate_metal --plan [--ctx C]
 //!
 //! Defaults: N 32, C the smaller of 4096 and the file's `context_length`. A
 //! flag given twice takes its last value. `--prompt` tokenizes the text with
@@ -22,8 +23,13 @@
 //! `--tokens` spelling, so a run's output feeds back as an input), for
 //! gates. The summary lines go to stderr, `key=value` one a line:
 //!
-//!     model=<path> open_s=<the open's wall> device_allocated_bytes=<the
-//!     driver's live device bytes after the open> prompt_ids=<count>
+//!     model=<path> gemm_path=<simdgroup|tensor: the prompt pass's GEMMs,
+//!     the device's matrix-unit rule's pick> open_s=<the open's wall>
+//!     open_load_s=<the plan read and the weights copied> open_rows_ms=<the
+//!     rows arena allocated> open_residency_ms=<the residency set's commit>
+//!     open_pipelines_ms=<the pipelines built> device_allocated_bytes=<the
+//!     driver's live device bytes after the open> rows_arena_bytes=<the rows
+//!     arena's bytes> prompt_ids=<count>
 //!     prompt_s=<the prompt's wall> prompt_tok_s=<rate> decode_tokens=<count>
 //!     decode_passes=<count> decode_s=<the loop's wall> decode_tok_s=<rate>
 //!     stop=<eog|length|ctx> decode_first_ms=<the loop's first pass>
@@ -34,13 +40,16 @@
 //! comes from the prompt call and is in `decode_tokens`, not in the rate. A
 //! run of one token has no pass, and its rate prints `none`.
 //!
-//! `--pass-times U` times the ops of one pass of U prompt ids, each on a
-//! command buffer of its own waited before the next, as per-class sums.
+//! `--pass-times U[,U…]` times, for each U, the ops of one pass of U prompt
+//! ids, each on a command buffer of its own waited before the next, as
+//! per-class sums, beside the wall of the same pass as the prompt runs it
+//! (`pass_wall`); then the wall of one checkpoint after a pass of the last U
+//! and of the whole prompt's call from position 0, both warm.
 //!
 //! `--prefill steps` feeds the prompt a decode step an id, the same-binary arm
 //! of the default (`batch`: the prompt in passes of up to
-//! [`Session::pass_rows`] ids, a short one by steps); the summary prints the
-//! rows arena's bytes (`rows_arena_bytes`) once a pass has opened it.
+//! [`Session::pass_rows`] ids, a short one by steps). The session opens its
+//! rows arena either way.
 //!
 //! `--profile [N]` (default N 32; `--profile-layers` implies it) steps N
 //! more tokens after the summary, each group of each token on a command
@@ -62,10 +71,24 @@
 //! profiled token runs one command buffer a group, waited, which the real
 //! step's single buffer does not.
 //!
+//! `--plan` reads the file's header and tensor table alone (no weight byte, no
+//! device buffer) and prints, on stdout, what the open would find: the
+//! description, the room the device and the host report beside the bytes the
+//! open would make buffers of, every refusal the open's checks meet (not the
+//! first alone), and a last line, `plan: opens` (exit 0) or `plan: refused, N
+//! items` (exit 3). A file whose data section is cut short is read as a header
+//! alone; a header the plan cannot read is a named error and exit 64. It takes
+//! no generation flag.
+//!
 //! A bad flag or a bad value is a named error and exit 2; a refusal of the
 //! device, the session or the tokenizer, or a fault the device raised, is a
 //! named error and exit 1 — never a partial result presented as success.
 //! The body is macOS only; elsewhere it refuses and exits 78.
+//!
+//! A build with `--features encode-trace` also takes `--encode-trace FILE`:
+//! the run after the open (the prompt's passes and the decode steps) writes
+//! every dispatch, binding and commit/wait/event it asks of Metal to FILE
+//! (`bloomery_metal::trace`), which `metal_scan --compare-trace` compares.
 
 #[cfg(target_os = "macos")]
 fn main() -> std::process::ExitCode {
@@ -79,44 +102,62 @@ mod cli {
     use std::process::ExitCode;
     use std::time::{Duration, Instant};
 
-    use bloomery_device::Device;
-    use bloomery_metal::arch::qwen3moe::count::{GroupKind, KINDS};
-    use bloomery_metal::arch::qwen3moe::generate::greedy;
-    use bloomery_metal::arch::qwen3moe::session::{
-        Op, PassOut, PassSample, ProfileGroup, Session, StepMode,
+    use bloomery_metal::arch::qwen3moe::{
+        check,
+        count::{GroupKind, KINDS},
+        generate::greedy,
+        plan,
+        session::{Op, PassOut, PassSample, ProfileGroup, Session, StateOut, StepMode},
     };
     use bloomery_metal::device::MetalDevice;
     use bloomery_metal::kernels::PASS_ROWS;
     use runtime::prompt::PrefillMode;
+    use runtime::{Target, Want};
 
     /// The model file, as the CUDA generate CLIs name it.
     const MODEL_ENV: &str = "BLOOMERY_REF_MODEL";
+
+    /// The model file `MODEL_ENV` names, or why there is none.
+    fn model_path() -> Result<PathBuf, String> {
+        match std::env::var_os(MODEL_ENV) {
+            Some(p) if !p.is_empty() => Ok(PathBuf::from(p)),
+            _ => Err(format!(
+                "no model file: set {MODEL_ENV} to the qwen35moe file (the first shard)"
+            )),
+        }
+    }
 
     /// The cache rows' default cap.
     const CTX_DEFAULT: usize = 4096;
 
     const USAGE: &str = "\
-generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids] [--profile [N]] [--profile-layers] [--step-times [N]] [--prefill batch|steps] [--pass-times U]
+generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids] [--profile [N]] [--profile-layers] [--step-times [N]] [--prefill batch|steps] [--pass-times U[,U…]]
+generate_metal --plan [--ctx C]
   the file is $BLOOMERY_REF_MODEL; defaults N 32, --ctx the smaller of 4096
-  and the file's context_length; --print-ids prints the ids, not the text;
+  and the file's context_length; --plan reads the header alone and prints
+  every refusal the open would make, the bytes it would allocate and the
+  room (exit 0 opens, 3 refused, 64 a header it cannot read); --print-ids prints the ids, not the text;
   --profile [N] (default 32) steps N more tokens after the summary, each
   group's GPU time and bytes printed; --profile-layers adds a layer each;
   --step-times [N] (default 32) steps N more tokens in each mode, the step
   clock's phases a mode printed; --prefill steps feeds the prompt a step an
-  id, batch (the default) in passes; --pass-times U times the ops of one pass
-  of the first U prompt ids, one command buffer at a time";
+  id, batch (the default) in passes; --pass-times U[,U…] times the ops of one
+  pass of the first U prompt ids, one command buffer at a time, beside the
+  pass's own wall";
 
     /// The flags that take a value.
-    const VALUE_FLAGS: [&str; 6] = [
+    const VALUE_FLAGS: &[&str] = &[
         "--prompt",
         "--tokens",
         "-n",
         "--ctx",
         "--prefill",
         "--pass-times",
+        #[cfg(feature = "encode-trace")]
+        "--encode-trace",
     ];
     /// The flags that stand alone.
-    const BARE_FLAGS: [&str; 3] = ["--print-ids", "--help", "--profile-layers"];
+    const BARE_FLAGS: [&str; 4] = ["--print-ids", "--help", "--profile-layers", "--plan"];
     /// The profile tokens' default count, and the step-times' per mode.
     const PROFILE_DEFAULT: usize = 32;
 
@@ -144,8 +185,12 @@ generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids]
         /// `--step-times [N]`: the step clock's tokens a mode.
         step_times: Option<usize>,
         prefill: PrefillMode,
-        /// `--pass-times U`: the rows of the pass whose ops are timed alone.
-        pass_times: Option<usize>,
+        /// `--pass-times U[,U…]`: the rows of each pass whose ops are timed
+        /// alone.
+        pass_times: Option<Vec<usize>>,
+        /// `--encode-trace FILE`: where the run's encode trace is written.
+        #[cfg(feature = "encode-trace")]
+        encode_trace: Option<PathBuf>,
         model: PathBuf,
     }
 
@@ -255,16 +300,7 @@ generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids]
                 "-n 0: a generation of 0 tokens: token 0 comes out of the prompt call".into(),
             );
         }
-        let ctx = match flag("--ctx")? {
-            None => None,
-            Some(s) => {
-                let c: usize = s.parse().map_err(|e| format!("--ctx {s}: {e}"))?;
-                if c == 0 {
-                    return Err(format!("--ctx {s}: a cache of no rows"));
-                }
-                Some(c)
-            }
-        };
+        let ctx = ctx_flag()?;
         let print_ids = has_flag("--print-ids");
         // `--profile-layers` alone implies the profile.
         let profile_n = count_flag("--profile");
@@ -293,13 +329,20 @@ generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids]
         let pass_times = match flag("--pass-times")? {
             None => None,
             Some(s) => {
-                let u: usize = s.parse().map_err(|e| format!("--pass-times {s}: {e}"))?;
-                if u <= PASS_ROWS {
-                    return Err(format!(
-                        "--pass-times {u}: a pass holds more than {PASS_ROWS} rows"
-                    ));
+                let mut us = Vec::new();
+                for v in s.split(',') {
+                    let u: usize = v
+                        .trim()
+                        .parse()
+                        .map_err(|e| format!("--pass-times {s}: {e}"))?;
+                    if u <= PASS_ROWS {
+                        return Err(format!(
+                            "--pass-times {u}: a pass holds more than {PASS_ROWS} rows"
+                        ));
+                    }
+                    us.push(u);
                 }
-                Some(u)
+                Some(us)
             }
         };
         let prefill = match flag("--prefill")? {
@@ -307,14 +350,7 @@ generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids]
             Some(s) => PrefillMode::from_name(&s)
                 .ok_or_else(|| format!("--prefill {s}: batch or steps"))?,
         };
-        let model = match std::env::var_os(MODEL_ENV) {
-            Some(p) if !p.is_empty() => PathBuf::from(p),
-            _ => {
-                return Err(format!(
-                    "no model file: set {MODEL_ENV} to the qwen35moe file (the first shard)"
-                ));
-            }
-        };
+        let model = model_path()?;
         Ok(Args {
             prompt,
             n: n_gen,
@@ -324,6 +360,8 @@ generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids]
             step_times,
             prefill,
             pass_times,
+            #[cfg(feature = "encode-trace")]
+            encode_trace: flag("--encode-trace")?.map(PathBuf::from),
             model,
         })
     }
@@ -337,19 +375,38 @@ generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids]
             None => {
                 let split = gguf::Split::open(&a.model)
                     .map_err(|e| format!("{}: {e}", a.model.display()))?;
-                let train = split
-                    .arch_get_u64("context_length")
-                    .and_then(|v| usize::try_from(v).ok())
-                    .ok_or_else(|| {
-                        format!(
-                            "{}: {} is absent or not a count",
-                            a.model.display(),
-                            split.arch_key("context_length")
-                        )
-                    })?;
-                Ok(CTX_DEFAULT.min(train))
+                default_ctx(&split, &a.model)
             }
         }
+    }
+
+    /// The `--ctx` value: absent, or a count of at least one row.
+    fn ctx_flag() -> Result<Option<usize>, String> {
+        match flag("--ctx")? {
+            None => Ok(None),
+            Some(s) => {
+                let c: usize = s.parse().map_err(|e| format!("--ctx {s}: {e}"))?;
+                if c == 0 {
+                    return Err(format!("--ctx {s}: a cache of no rows"));
+                }
+                Ok(Some(c))
+            }
+        }
+    }
+
+    /// The smaller of the default cap and `split`'s `context_length`.
+    fn default_ctx(split: &gguf::Split, model: &std::path::Path) -> Result<usize, String> {
+        let train = split
+            .arch_get_u64("context_length")
+            .and_then(|v| usize::try_from(v).ok())
+            .ok_or_else(|| {
+                format!(
+                    "{}: {} is absent or not a count",
+                    model.display(),
+                    split.arch_key("context_length")
+                )
+            })?;
+        Ok(CTX_DEFAULT.min(train))
     }
 
     /// The generated text as it completes: the tokenizer's streaming
@@ -512,14 +569,19 @@ generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids]
             .unwrap_or_else(|| panic!("generate_metal: the kind {kind:?} sits in no kind table"))
     }
 
+    /// Timed runs of each `--pass-times` measurement, after one warm run.
+    const PASS_TIMES_RUNS: usize = 3;
+
     /// The pass over the first `u` ids of the prompt with every op on a
     /// command buffer of its own, waited before the next is committed: the
     /// op's GPU seconds are its own and never a queued buffer's overlap. One
     /// warm pass and `PASS_TIMES_RUNS` timed ones from position 0, each op's
-    /// median; the sums per class print as lines, in milliseconds. The
-    /// session is reset before and after.
+    /// median; the sums per class print as lines, in milliseconds. Then the
+    /// same pass as the prompt runs it, its host wall from the call to its
+    /// return, the median of `PASS_TIMES_RUNS` after a warm one, beside the
+    /// ops' sum: the gap is what the pass pays outside its ops' own GPU
+    /// time. The session is reset before each pass and after the last.
     fn pass_times_run(s: &mut Session, prompt: &[u32], u: usize) -> Result<(), String> {
-        const PASS_TIMES_RUNS: usize = 3;
         if prompt.len() < u {
             return Err(format!(
                 "--pass-times {u}: the prompt holds {} ids",
@@ -556,8 +618,7 @@ generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids]
         let mut total = 0.0;
         for i in 0..n {
             let mut t: Vec<f64> = runs.iter().map(|r| r[i].gpu_s).collect();
-            t.sort_by(f64::total_cmp);
-            let med = t[t.len() / 2];
+            let med = median(&mut t);
             let class = match runs[0][i].op {
                 Op::AttnIn(_) | Op::AttnOut(_) | Op::DeltaIn(_) | Op::DeltaOut(_) => "gemm",
                 Op::Route(_) => "route",
@@ -585,6 +646,65 @@ generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids]
             "pass_times total_ms={:.2} rows_per_s={:.0}",
             total * 1e3,
             u as f64 / total
+        );
+        let mut walls = Vec::new();
+        for run in 0..=PASS_TIMES_RUNS {
+            s.reset().map_err(|e| e.to_string())?;
+            let t0 = Instant::now();
+            s.pass(ids, PassOut::Last, StateOut::default())
+                .map_err(|e| e.to_string())?;
+            if run > 0 {
+                walls.push(t0.elapsed().as_secs_f64());
+            }
+        }
+        s.reset().map_err(|e| e.to_string())?;
+        let wall = median(&mut walls);
+        eprintln!(
+            "pass_wall rows={u} wall_ms={:.2} ops_gpu_ms={:.2} gap_ms={:.2} gap_per_op_us={:.1}",
+            wall * 1e3,
+            total * 1e3,
+            (wall - total) * 1e3,
+            (wall - total) / n as f64 * 1e6
+        );
+        Ok(())
+    }
+
+    /// The median of `v`, which holds at least one value.
+    fn median(v: &mut [f64]) -> f64 {
+        v.sort_by(f64::total_cmp);
+        v[v.len() / 2]
+    }
+
+    /// The fixed work around a pass, warm: one checkpoint's wall after a
+    /// pass of the first `u` ids, and the whole prompt's call from position
+    /// 0 (`Target::prompt`: its passes and its checkpoints), each the median
+    /// of `PASS_TIMES_RUNS` after a warm one. The session is reset before
+    /// each and after the last.
+    fn call_times_run(s: &mut Session, prompt: &[u32], u: usize) -> Result<(), String> {
+        let (mut takes, mut calls) = (Vec::new(), Vec::new());
+        for run in 0..=PASS_TIMES_RUNS {
+            s.reset().map_err(|e| e.to_string())?;
+            s.pass(&prompt[..u], PassOut::Last, StateOut::default())
+                .map_err(|e| e.to_string())?;
+            let t0 = Instant::now();
+            s.checkpoint().map_err(|e| e.to_string())?;
+            let take = t0.elapsed().as_secs_f64();
+            s.reset().map_err(|e| e.to_string())?;
+            let t0 = Instant::now();
+            Target::prompt(s, prompt, Want::Argmax).map_err(|e| e.to_string())?;
+            let call = t0.elapsed().as_secs_f64();
+            if run > 0 {
+                takes.push(take);
+                calls.push(call);
+            }
+        }
+        s.reset().map_err(|e| e.to_string())?;
+        eprintln!(
+            "call_times rows={u} checkpoint_ms={:.2} checkpoint_bytes={} prompt_ids={} prompt_warm_ms={:.2}",
+            median(&mut takes) * 1e3,
+            s.checkpoint_bytes(),
+            prompt.len(),
+            median(&mut calls) * 1e3
         );
         Ok(())
     }
@@ -652,6 +772,9 @@ generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids]
             eprintln!("generate_metal: {e}");
             return ExitCode::from(1);
         }
+        if has_flag("--plan") {
+            return plan_run();
+        }
         let a = match parse() {
             Ok(a) => a,
             Err(e) => {
@@ -666,6 +789,73 @@ generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids]
                 ExitCode::from(1)
             }
         }
+    }
+
+    /// `--plan`: the header's plan on stdout, the code it ends with. It takes
+    /// `--ctx` and no other flag but `--help`, which `parse` answers first
+    /// in a generation run: a flag that would do nothing here is refused by
+    /// name.
+    fn plan_run() -> ExitCode {
+        if let Some(name) = unknown_flag() {
+            eprintln!("generate_metal: {name} is not a flag of this CLI");
+            return ExitCode::from(2);
+        }
+        if has_flag("--help") {
+            print!("{USAGE}");
+            return ExitCode::SUCCESS;
+        }
+        let other = std::env::args().skip(1).find(|a| {
+            (VALUE_FLAGS.contains(&a.as_str()) && a != "--ctx")
+                || (BARE_FLAGS.contains(&a.as_str()) && a != "--plan")
+                || COUNT_FLAGS.contains(&a.as_str())
+        });
+        if let Some(name) = other {
+            eprintln!("generate_metal: --plan reads the header alone; {name} is a generation flag");
+            return ExitCode::from(2);
+        }
+        let ctx = match ctx_flag() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("generate_metal: {e}");
+                return ExitCode::from(2);
+            }
+        };
+        let model = match model_path() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("generate_metal: {e}");
+                return ExitCode::from(2);
+            }
+        };
+        match plan_of(&model, ctx) {
+            Ok(printed) => {
+                for line in &printed.lines {
+                    println!("{line}");
+                }
+                ExitCode::from(printed.code)
+            }
+            Err(e) => {
+                eprintln!("generate_metal: --plan: {e}");
+                ExitCode::from(plan::EXIT_UNREADABLE)
+            }
+        }
+    }
+
+    fn plan_of(model: &std::path::Path, ctx: Option<usize>) -> Result<plan::Printed, String> {
+        let header = plan::open_header(model)?;
+        let ctx = match ctx {
+            Some(c) => c,
+            None => default_ctx(&header.split, model)?,
+        };
+        let outcome = check::check(&header.split, ctx);
+        Ok(plan::render(
+            model,
+            header.data,
+            ctx,
+            &outcome,
+            &plan::device_room(),
+            &plan::HostMemory::probe(),
+        ))
     }
 
     fn generate(a: &Args) -> Result<(), String> {
@@ -687,18 +877,30 @@ generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids]
             Session::open(&device, device.library(), &a.model, ctx).map_err(|e| e.to_string())?;
         session.set_prefill(a.prefill);
         let open_s = t0.elapsed().as_secs_f64();
-        // The census's free bytes are the working set less the driver's own
-        // `currentAllocatedSize`, the one count of the live device buffers
-        // this process holds; the arena keeps no sum of its own.
-        let allocated = device
-            .info()
-            .map(|i| i.total_bytes - i.free_bytes)
-            .map_err(|e| e.to_string())?;
+        #[cfg(feature = "encode-trace")]
+        if a.encode_trace.is_some() {
+            bloomery_metal::trace::start();
+        }
+        // The driver's own `currentAllocatedSize` is the one count of the
+        // live device buffers this process holds; the arena keeps no sum of
+        // its own.
+        let allocated = device.allocated_bytes().map_err(|e| e.to_string())?;
         let mut stream = Stream {
             decoder: (!a.print_ids).then(|| tokenizer::Decoder::new(&tok, true)),
         };
         let out = greedy(&mut session, &prompt, a.n, tok.eog(), |id| stream.id(id))
             .map_err(|e| e.to_string())?;
+        #[cfg(feature = "encode-trace")]
+        if let Some(path) = &a.encode_trace {
+            let mut text = bloomery_metal::trace::finish();
+            text.push_str(&format!(
+                "# run prompt_ids={} decode_tokens={} gemm_path={}\n",
+                prompt.len(),
+                out.tokens(),
+                device.library().gemm_path().name()
+            ));
+            std::fs::write(path, text).map_err(|e| format!("{}: {e}", path.display()))?;
+        }
         if a.print_ids {
             let ids: Vec<String> = out.ids.iter().map(u32::to_string).collect();
             println!("{}", ids.join(","));
@@ -709,13 +911,23 @@ generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids]
         let decode_s = out.decode_wall.as_secs_f64();
         eprintln!("# development-loop numbers: no lease, no witness");
         eprintln!("model={}", a.model.display());
+        eprintln!("gemm_path={}", device.library().gemm_path().name());
         eprintln!("open_s={open_s:.3}");
+        let split = session.open_split();
+        eprintln!("open_load_s={:.3}", split.load.as_secs_f64());
+        eprintln!("open_rows_ms={:.2}", split.rows.as_secs_f64() * 1e3);
+        eprintln!(
+            "open_residency_ms={:.2}",
+            split.residency.as_secs_f64() * 1e3
+        );
+        eprintln!(
+            "open_pipelines_ms={:.2}",
+            split.pipelines.as_secs_f64() * 1e3
+        );
         eprintln!("device_allocated_bytes={allocated}");
         let resident = session.residency();
         eprintln!("resident_bytes={}", resident.bytes);
-        if let Some(bytes) = session.rows_arena_bytes() {
-            eprintln!("rows_arena_bytes={bytes}");
-        }
+        eprintln!("rows_arena_bytes={}", session.rows_arena_bytes());
         eprintln!("prompt_ids={}", prompt.len());
         eprintln!("prompt_s={prompt_s:.3}");
         eprintln!("prompt_tok_s={:.1}", prompt.len() as f64 / prompt_s);
@@ -744,8 +956,13 @@ generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids]
             let decode_ms = (out.passes > 0).then(|| decode_s / out.passes as f64 * 1e3);
             profile_run(&mut session, p, id, decode_ms)?;
         }
-        if let Some(u) = a.pass_times {
-            pass_times_run(&mut session, &prompt, u)?;
+        if let Some(us) = &a.pass_times {
+            for &u in us {
+                pass_times_run(&mut session, &prompt, u)?;
+            }
+            if let Some(&u) = us.last() {
+                call_times_run(&mut session, &prompt, u)?;
+            }
         }
         if let Some(n) = a.step_times {
             let id = *out

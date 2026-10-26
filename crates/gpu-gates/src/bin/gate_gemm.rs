@@ -25,7 +25,7 @@
 //! at the route table's 40,960-slot cap — with the same checks, the T = 1 outputs against
 //! the i-quant row cores (`iq3_xxs_rows`, `iq4_xs_rows`) over the repacked
 //! stack as a diagnostic, a NaN `d` super-block's outputs NaN, and
-//! `from_ggml`'s acceptance of the two types beside its refusal of IQ2_XS.
+//! `from_ggml`'s acceptance of the two types.
 //!
 //! The Bolt IQ2_XXS cases (`iq2xxs_*`): a synthetic stack of a routed gate
 //! shape (64 experts of 640 rows, K 2560, top 9, every slot its token's
@@ -43,8 +43,17 @@
 //! (odd super-blocks a row: each row padded to whole words, every other
 //! super-block at 2 mod 4), each under the four routings — with the same
 //! checks, a NaN `d` super-block's outputs NaN, `from_ggml`'s acceptance of
-//! IQ3_S beside its refusal of IQ2_XS, and the host API's refusal of IQ3_XXS
+//! IQ3_S beside its refusal of Q2_K, and the host API's refusal of IQ3_XXS
 //! and IQ4_XS on the stack by its row size.
+//!
+//! The IQ2_XS, IQ2_S, IQ1_S and IQ1_M cases (`iq2xs_*`, `iq2s_*`, `iq1s_*`,
+//! `iq1m_*`): per type a synthetic gate stack (64 experts of 640 rows, K 2560,
+//! top 9, every slot its token's column), a down stack (64 experts of 2048
+//! rows, K 512, each slot its own column) and a 400-row ragged slab at K 1280,
+//! each under the four routings — with the same checks, the decode held to
+//! ggml's `dequantize_row_*` (the gate's port for IQ2_S, IQ1_S and IQ1_M), a
+//! NaN `d` super-block's outputs NaN, `from_ggml`'s acceptance of the type and
+//! the host API's refusal of the IQ3_XXS row size on the gate and down stacks.
 //!
 //! Checks per run:
 //! 1. Every output of every slot written (`y` starts at a sentinel).
@@ -288,6 +297,13 @@
 //!   the eager bits, an input value or a weight scale byte the tensor cores
 //!   cannot take sending its column or row to the exact tile, and stale or
 //!   misplaced forms refused by name.
+//! - `zgate`: the BF16 and (native build) MXFP8 W8A8 projections' sigmoid
+//!   norm epilogue against the separate product and norm, bit for bit at
+//!   M=1/8/9/129/4095, including exact replay of a refused column or weight
+//!   row, non-finite inputs, graph replay, sentinel tails and a token-unit cut.
+//!   `--bench-kernels --bench-arm zgate` prices both arms of each form at 48
+//!   heads of 128, K=2560 and M=4095 through the shared burst and graph timing
+//!   owner.
 //! - `g32_refuse`: the host API's refusals, each an error holding its own
 //!   message (another check refusing first does not pass): the scratch's
 //!   K and columns, the quantizer's input and columns, an unfilled table,
@@ -322,6 +338,7 @@ mod gate {
     use bloomery_gpu::q6k_sel::Q6kSelKernels;
     use bloomery_gpu::{DeviceTensor, Fault, FaultSite, Gpu, GpuError, LAYER_NONE, Q8Act};
     use bloomery_gpu_gates::act_rule::q8_1_codes;
+    use bloomery_gpu_gates::iq_rows::{ref_dequant, set_d};
     use bloomery_gpu_gates::rounding::{gamma, scaled_sum};
     use bloomery_gpu_gates::swiglu_host;
     use bloomery_gpu_gates::{
@@ -330,7 +347,8 @@ mod gate {
     };
     use cuda_core::DeviceBuffer;
     use gguf::iq_tables::{
-        IQ2XXS_GRID, IQ3S_GRID, IQ3XXS_GRID, KMASK_IQ2XS, KSIGNS_IQ2XS, KVALUES_IQ4NL,
+        IQ1S_GRID, IQ2S_GRID, IQ2XS_GRID, IQ2XXS_GRID, IQ3S_GRID, IQ3XXS_GRID, KMASK_IQ2XS,
+        KSIGNS_IQ2XS, KVALUES_IQ4NL,
     };
     use gguf::quant::{GgmlType, dequant_row, half_to_f32};
     use model::arch::models::shape::{MoeShape, rules};
@@ -488,8 +506,13 @@ mod gate {
             | GemmWeight::Iq2Xxs
             | GemmWeight::Iq3Xxs
             | GemmWeight::Iq3S
+            | GemmWeight::Iq1S
             | GemmWeight::Iq4Xs => 32,
-            GemmWeight::Q6K | GemmWeight::Q3K => 16,
+            GemmWeight::Q6K
+            | GemmWeight::Q3K
+            | GemmWeight::Iq2Xs
+            | GemmWeight::Iq2S
+            | GemmWeight::Iq1M => 16,
         };
         let mut dec = Dec {
             grp,
@@ -644,6 +667,116 @@ mod gate {
                         }
                     }
                 }
+                GemmWeight::Iq2Xs => {
+                    // The kernel keeps `2s + 1` whole in the integer scale and
+                    // scales by d/8; ggml forms `d·(0.5 + s)·0.25·grid`, the
+                    // same product with d/8 exact in f64. One scale a 16-value
+                    // half of each 32-value group.
+                    dec.d.push(f16(&b[0..2]) / 8.0);
+                    dec.dmin.push(0.0);
+                    for c in 0..8 {
+                        for half in 0..2 {
+                            dec.sc
+                                .push(2 * i32::from((b[66 + c] >> (4 * half)) & 0x0f) + 1);
+                        }
+                        for v in 0..32 {
+                            let (l, j) = (v / 8, v % 8);
+                            let code =
+                                u16::from_le_bytes([b[2 + 8 * c + 2 * l], b[3 + 8 * c + 2 * l]]);
+                            let g = i32::from(IQ2XS_GRID[usize::from(code & 511)].to_le_bytes()[j]);
+                            let sgn = if KSIGNS_IQ2XS[usize::from(code >> 9)] & KMASK_IQ2XS[j] != 0
+                            {
+                                -1
+                            } else {
+                                1
+                            };
+                            dec.q.push((g * sgn) as i8);
+                        }
+                    }
+                }
+                GemmWeight::Iq2S => {
+                    // As IQ2_XS in the scales; the grid index takes its top two
+                    // bits from `qh` and the signs are the raw bytes after the
+                    // grid bytes.
+                    dec.d.push(f16(&b[0..2]) / 8.0);
+                    dec.dmin.push(0.0);
+                    let (qs, signs, qh, scales) = (&b[2..34], &b[34..66], &b[66..74], &b[74..82]);
+                    for c in 0..8 {
+                        for half in 0..2 {
+                            dec.sc
+                                .push(2 * i32::from((scales[c] >> (4 * half)) & 0x0f) + 1);
+                        }
+                        for v in 0..32 {
+                            let (l, j) = (v / 8, v % 8);
+                            let index = usize::from(qs[4 * c + l])
+                                | ((usize::from(qh[c]) << (8 - 2 * l)) & 0x300);
+                            let g = i32::from(IQ2S_GRID[index].to_le_bytes()[j]);
+                            let sgn = if signs[4 * c + l] & KMASK_IQ2XS[j] != 0 {
+                                -1
+                            } else {
+                                1
+                            };
+                            dec.q.push((g * sgn) as i8);
+                        }
+                    }
+                }
+                GemmWeight::Iq1S => {
+                    // ggml forms `d·(2s + 1)·(grid ± 1/8)`; the kernel keeps the
+                    // int8 weight `8·grid ± 1` and scales by d/8, the same
+                    // product with d/8 exact in f64.
+                    dec.d.push(f16(&b[0..2]) / 8.0);
+                    dec.dmin.push(0.0);
+                    for c in 0..8 {
+                        let qh = u16::from_le_bytes([b[34 + 2 * c], b[35 + 2 * c]]);
+                        dec.sc.push(2 * i32::from((qh >> 12) & 7) + 1);
+                        let delta = if qh & 0x8000 != 0 { -1 } else { 1 };
+                        for v in 0..32 {
+                            let (l, j) = (v / 8, v % 8);
+                            let index = usize::from(b[2 + 4 * c + l])
+                                | (usize::from((qh >> (3 * l)) & 7) << 8);
+                            let g = i32::from(IQ1S_GRID[index].to_le_bytes()[j] as i8);
+                            dec.q.push((8 * g + delta) as i8);
+                        }
+                    }
+                }
+                GemmWeight::Iq1M => {
+                    // As IQ1_S in the weights, one scale a 16-value half of
+                    // each 32-value group (three bits each of the four scale
+                    // halfwords) and one delta sign an 8-value row of the
+                    // grid; `d` is the f16 spread over the halfwords' top
+                    // nibbles, the C's expression.
+                    let sc: [u16; 4] =
+                        std::array::from_fn(|i| u16::from_le_bytes([b[48 + 2 * i], b[49 + 2 * i]]));
+                    let bits = (sc[0] >> 12)
+                        | ((sc[1] >> 8) & 0x00f0)
+                        | ((sc[2] >> 4) & 0x0f00)
+                        | (sc[3] & 0xf000);
+                    dec.d.push(f64::from(half_to_f32(bits)) / 8.0);
+                    dec.dmin.push(0.0);
+                    for c in 0..8 {
+                        let s16 = sc[c / 2] >> (6 * (c % 2));
+                        dec.sc.push(2 * i32::from(s16 & 7) + 1);
+                        dec.sc.push(2 * i32::from((s16 >> 3) & 7) + 1);
+                        let (qh0, qh1) = (b[32 + 2 * c], b[33 + 2 * c]);
+                        let idx = [
+                            usize::from(b[4 * c]) | ((usize::from(qh0) << 8) & 0x700),
+                            usize::from(b[4 * c + 1]) | ((usize::from(qh0) << 4) & 0x700),
+                            usize::from(b[4 * c + 2]) | ((usize::from(qh1) << 8) & 0x700),
+                            usize::from(b[4 * c + 3]) | ((usize::from(qh1) << 4) & 0x700),
+                        ];
+                        let delta = [
+                            if qh0 & 0x08 != 0 { -1 } else { 1 },
+                            if qh0 & 0x80 != 0 { -1 } else { 1 },
+                            if qh1 & 0x08 != 0 { -1 } else { 1 },
+                            if qh1 & 0x80 != 0 { -1 } else { 1 },
+                        ];
+                        for v in 0..32 {
+                            let (l, j) = (v / 8, v % 8);
+                            let g = i32::from(IQ1S_GRID[idx[l]].to_le_bytes()[j] as i8);
+                            dec.q.push((8 * g + delta[l]) as i8);
+                        }
+                    }
+                }
                 GemmWeight::Iq4Xs => {
                     dec.d.push(f16(&b[0..2]));
                     dec.dmin.push(0.0);
@@ -674,7 +807,14 @@ mod gate {
     fn decode_matches(ty: GgmlType, row: &[u8], dec: &Dec) -> Result<bool, GateError> {
         let k = dec.q.len();
         let mut want = vec![0.0f32; k];
-        dequant_row(ty, row, &mut want)?;
+        match ty {
+            // `dequant_row` has no decode for these three: the gate's own
+            // port of ggml's `dequantize_row_*`.
+            GgmlType::IQ2_S => ref_dequant(IqFormat::Iq2S, row, &mut want)?,
+            GgmlType::IQ1_S => ref_dequant(IqFormat::Iq1S, row, &mut want)?,
+            GgmlType::IQ1_M => ref_dequant(IqFormat::Iq1M, row, &mut want)?,
+            _ => dequant_row(ty, row, &mut want)?,
+        }
         Ok((0..k).all(|v| {
             let sb = v / 256;
             let a = dec.d[sb] * f64::from(dec.sc[v / dec.grp]) * f64::from(dec.q[v]);
@@ -794,6 +934,10 @@ mod gate {
             GemmWeight::Q5K => GgmlType::Q5_K,
             GemmWeight::Q6K => GgmlType::Q6_K,
             GemmWeight::Iq2Xxs => GgmlType::IQ2_XXS,
+            GemmWeight::Iq2Xs => GgmlType::IQ2_XS,
+            GemmWeight::Iq2S => GgmlType::IQ2_S,
+            GemmWeight::Iq1S => GgmlType::IQ1_S,
+            GemmWeight::Iq1M => GgmlType::IQ1_M,
             GemmWeight::Iq3Xxs => GgmlType::IQ3_XXS,
             GemmWeight::Iq3S => GgmlType::IQ3_S,
             GemmWeight::Iq4Xs => GgmlType::IQ4_XS,
@@ -977,6 +1121,10 @@ mod gate {
                 // The i-quant types' diagnostic is `iq_rows_diag`, not a
                 // `_sel` gemv.
                 (GemmWeight::Iq2Xxs, _)
+                | (GemmWeight::Iq2Xs, _)
+                | (GemmWeight::Iq2S, _)
+                | (GemmWeight::Iq1S, _)
+                | (GemmWeight::Iq1M, _)
                 | (GemmWeight::Iq3Xxs, _)
                 | (GemmWeight::Iq3S, _)
                 | (GemmWeight::Iq4Xs, _) => {
@@ -1058,7 +1206,14 @@ mod gate {
                     .q6s
                     .enqueue_gemv_q6k_sel(stream, &res.w, act, &sel, m, st.rows, &mut y)?,
                 GemmWeight::Q5K => return Err("Q5_K has no _sel gemv".into()),
-                GemmWeight::Iq2Xxs | GemmWeight::Iq3Xxs | GemmWeight::Iq3S | GemmWeight::Iq4Xs => {
+                GemmWeight::Iq2Xxs
+                | GemmWeight::Iq2Xs
+                | GemmWeight::Iq2S
+                | GemmWeight::Iq1S
+                | GemmWeight::Iq1M
+                | GemmWeight::Iq3Xxs
+                | GemmWeight::Iq3S
+                | GemmWeight::Iq4Xs => {
                     return Err("an i-quant stack has no _sel gemv".into());
                 }
             }
@@ -1387,6 +1542,17 @@ mod gate {
         Ok(ok && pass)
     }
 
+    /// Write the f16 `d` (`bits`) of one i-quant super-block at the start of
+    /// `blk`. IQ1_M has no `d` field: its f16 is spread over the top nibbles
+    /// of the four scale halfwords.
+    fn put_d(ty: GemmWeight, blk: &mut [u8], bits: u16) {
+        if ty == GemmWeight::Iq1M {
+            set_d(IqFormat::Iq1M, blk, bits);
+        } else {
+            blk[..2].copy_from_slice(&bits.to_le_bytes());
+        }
+    }
+
     /// Synthetic super-blocks of `ty` with finite f16 scales: every other
     /// byte from the LCG, `d`/`dmin` of exponent 3..=9 (2^-12 .. 2^-5).
     fn synthetic(ty: GemmWeight, n_sb_total: usize, seed: u64) -> Vec<u8> {
@@ -1410,9 +1576,14 @@ mod gate {
                 }
                 GemmWeight::Q6K => sb[208..210].copy_from_slice(&a),
                 GemmWeight::Q3K => sb[108..110].copy_from_slice(&a),
-                GemmWeight::Iq2Xxs | GemmWeight::Iq3Xxs | GemmWeight::Iq3S | GemmWeight::Iq4Xs => {
-                    sb[0..2].copy_from_slice(&a)
-                }
+                GemmWeight::Iq2Xxs
+                | GemmWeight::Iq2Xs
+                | GemmWeight::Iq2S
+                | GemmWeight::Iq1S
+                | GemmWeight::Iq1M
+                | GemmWeight::Iq3Xxs
+                | GemmWeight::Iq3S
+                | GemmWeight::Iq4Xs => put_d(ty, sb, u16::from_le_bytes(a)),
             }
         }
         v
@@ -1593,10 +1764,7 @@ mod gate {
         let mut y = DeviceBuffer::<f32>::zeroed(stream, 64 * rows)?;
         let mut refusals: Vec<(&str, bool)> = vec![
             ("type_q8_0", GemmWeight::from_ggml(GgmlType::Q8_0).is_err()),
-            (
-                "type_iq2_xs",
-                GemmWeight::from_ggml(GgmlType::IQ2_XS).is_err(),
-            ),
+            ("type_q2_k", GemmWeight::from_ggml(GgmlType::Q2_K).is_err()),
             ("k_not_256", GemmAct::new(stream, 8, 1000).is_err()),
             (
                 "slots_over_limit",
@@ -2401,7 +2569,14 @@ mod gate {
 
         if matches!(
             case_filter().as_deref(),
-            Some("dense_mma" | "mxfp8_w8a8" | "nvfp4_native" | "nvfp4_swiglu" | "nvfp4_gate_up")
+            Some(
+                "dense_mma"
+                    | "mxfp8_w8a8"
+                    | "nvfp4_native"
+                    | "nvfp4_swiglu"
+                    | "nvfp4_gate_up"
+                    | "zgate"
+            )
         ) {
             return if g32::run(&gpu, &dev.gk)? {
                 Ok(())
@@ -2520,6 +2695,7 @@ mod gate {
         ok &= q38_cases(&dev)?;
         ok &= iq2xxs_cases(&dev)?;
         ok &= iq3s_cases(&dev)?;
+        ok &= iq_card_cases(&dev)?;
         ok &= dense_case(&dev)?;
         ok &= route_table_case(&dev)?;
         ok &= swiglu_case(&dev)?;
@@ -2666,7 +2842,7 @@ mod gate {
         let bb = st.ty.block_bytes() * st.k / 256;
         let mut bytes = st.bytes.to_vec();
         for r in 0..st.rows {
-            bytes[r * bb..r * bb + 2].copy_from_slice(&0x7e00u16.to_le_bytes());
+            put_d(st.ty, &mut bytes[r * bb..], 0x7e00);
         }
         let st = Stack {
             name: format!("{}_nan_d", st.name),
@@ -2874,7 +3050,7 @@ mod gate {
     /// 400 rows an expert (a partial 128-row slab) at K 1280, whose odd five
     /// super-blocks a row pad each row to 550 bytes and put every other
     /// super-block at 2 mod 4. Each runs the four routings at [`TOKENS`],
-    /// `from_ggml`'s acceptance of IQ3_S beside its refusal of IQ2_XS, a NaN
+    /// `from_ggml`'s acceptance of IQ3_S beside its refusal of Q2_K, a NaN
     /// `d` super-block's outputs NaN, and the host API's refusal of the other
     /// i-quant types on the stack.
     fn iq3s_cases(dev: &Dev<'_>) -> Result<bool, GateError> {
@@ -2889,9 +3065,9 @@ mod gate {
             return Ok(true);
         }
         let accept = GemmWeight::from_ggml(GgmlType::IQ3_S).is_ok_and(|t| t == GemmWeight::Iq3S)
-            && GemmWeight::from_ggml(GgmlType::IQ2_XS).is_err();
+            && GemmWeight::from_ggml(GgmlType::Q2_K).is_err();
         println!(
-            "gemm case=iq3s_types from_ggml(iq3_s, iq2_xs)={} {}",
+            "gemm case=iq3s_types from_ggml(iq3_s, q2_k)={} {}",
             if accept { "accepted, refused" } else { "WRONG" },
             verdict(accept)
         );
@@ -2969,6 +3145,99 @@ mod gate {
         Ok(ok)
     }
 
+    /// The IQ2_XS, IQ2_S, IQ1_S and IQ1_M cases (the routed stacks of the
+    /// V4.1 sets and of Unsloth's UD-IQ1_S / UD-IQ2_M files): per type a
+    /// synthetic gate stack of a routed shape — 64 experts of 640 rows, K
+    /// 2560, top 9, every slot its token's column — a down stack of the
+    /// shape the files that hold these types in a down take (64 experts of
+    /// 2048 rows, K 512, each slot its own column) and a stack of 400 rows an
+    /// expert (a partial 128-row slab) at K 1280, whose odd five super-blocks
+    /// a row put every other super-block at 2 mod 4 bytes (all but IQ1_M's
+    /// 56-byte block). Each runs the four routings at [`TOKENS`] through
+    /// [`run_case`], whose decode is checked against ggml's own
+    /// `dequantize_row_*` (the gate's port for IQ2_S, IQ1_S and IQ1_M, which
+    /// `dequant_row` does not decode). The gate and down stacks also check a
+    /// NaN `d` super-block's outputs NaN and the host API's refusal of the
+    /// IQ3_XXS row size on the stack; `from_ggml` accepts the type.
+    fn iq_card_cases(dev: &Dev<'_>) -> Result<bool, GateError> {
+        let mut ok = true;
+        for (tag, ty, ggml, seed) in [
+            ("iq2xs", GemmWeight::Iq2Xs, GgmlType::IQ2_XS, 0x601u64),
+            ("iq2s", GemmWeight::Iq2S, GgmlType::IQ2_S, 0x611),
+            ("iq1s", GemmWeight::Iq1S, GgmlType::IQ1_S, 0x621),
+            ("iq1m", GemmWeight::Iq1M, GgmlType::IQ1_M, 0x631),
+        ] {
+            let shapes = [
+                ("gate", 64usize, 640usize, 2560usize, Input::Shared(9)),
+                ("down", 64, 2048, 512, Input::PerSlot(8)),
+                ("ragged_rows", 16, 400, 1280, Input::Shared(4)),
+            ];
+            if !shapes
+                .iter()
+                .any(|(shape, ..)| wanted(&format!("{tag}_{shape}_synth")))
+            {
+                continue;
+            }
+            let accept = GemmWeight::from_ggml(ggml).is_ok_and(|t| t == ty);
+            println!(
+                "gemm case={tag}_types from_ggml({tag})={} {}",
+                if accept { "accepted" } else { "REFUSED" },
+                verdict(accept)
+            );
+            ok &= accept;
+            for (i, (shape, n_exp, rows, k, input)) in shapes.into_iter().enumerate() {
+                let name = format!("{tag}_{shape}_synth");
+                if !wanted(&name) {
+                    continue;
+                }
+                let seed = seed + i as u64;
+                let st = Stack {
+                    name: name.clone(),
+                    ty,
+                    bytes: synthetic(ty, n_exp * rows * k / 256, seed).into(),
+                    n_exp,
+                    rows,
+                    k,
+                    input,
+                };
+                ok &= run_case(dev, &st, seed ^ 0x61)?;
+                if shape == "ragged_rows" {
+                    continue;
+                }
+                ok &= iq_nan_d(dev, &st, seed)?;
+                // The host API refuses another i-quant type on this stack, by
+                // the row size: the route is filled first, so no other check
+                // refuses before the type's.
+                let stream = dev.gpu.stream();
+                let top_k = st.input.top_k();
+                let mut res = dev.resident_at(&st, top_k)?;
+                let ids = route_ids(Routing::Uniform, 1, top_k, n_exp, seed ^ 0xd1a6);
+                let x = activations(k, st.input.cols(ids.len()), (seed as u32) ^ 0xd1a7);
+                dev.run(&st, &mut res, &DeviceBuffer::from_host(stream, &x)?, &ids)?;
+                let mut y = DeviceBuffer::<f32>::zeroed(stream, top_k * rows)?;
+                let outcome = dev.gk.enqueue_gemm(
+                    stream,
+                    GemmArgs {
+                        ty: GemmWeight::Iq3Xxs,
+                        w: &res.w,
+                        rows_per_expert: rows,
+                        act: &res.act,
+                        route: &res.route,
+                        input: st.input.gemm(),
+                        y: &mut y,
+                    },
+                );
+                let refused = outcome.is_err_and(|e| e.to_string().contains("rows at K"));
+                println!(
+                    "gemm case={name} other_iq_type_on_stack_refused={refused} {}",
+                    verdict(refused)
+                );
+                ok &= refused;
+            }
+        }
+        Ok(ok)
+    }
+
     /// `--bench-kernels`: the grouped int8 GEMM's launch cost, the eager
     /// burst and the graph replay of each arm (`bench op=` rows), timed by
     /// `tools/ref/time-gate.sh` under the machine lease. Weight and activation
@@ -3003,6 +3272,13 @@ mod gate {
                         )?),
                     }
                 };
+            if only.as_deref() == Some("zgate") {
+                return if super::g32::norm_gate_case(gpu, true)? {
+                    Ok(())
+                } else {
+                    Err(super::checks_failed())
+                };
+            }
             if let Some(arm) = only.as_deref() {
                 return if gemm_arms(gpu, Some(arm))?
                     || iq_gemm_arms(gpu, Some(arm))?
@@ -3487,7 +3763,9 @@ mod gate {
                 .sum::<f64>()
                 .sqrt();
             println!(
-                "bench op={arm} slots={slots} k={k} experts={experts} invalid={invalid} l2={norm:.9} sample={:?}",
+                "bench op={arm} slots={slots} k={k} experts={experts} invalid={invalid} l2={norm:.9} \
+                 y_fnv={:016x} sample={:?}",
+                bloomery_gpu_gates::Fnv1a64::default().f32s(&out).value(),
                 &out[..8]
             );
             if invalid != 0 || gpu.take_fault()?.is_some() {
@@ -3501,7 +3779,7 @@ mod gate {
         /// gate and up GEMMs and `swiglu_quant32_sel`, the other
         /// `enqueue_gate_up_sel32` (one launch and the FP4 pack on a native
         /// build). Both arms first run both forms once and print whether their
-        /// Q8 bytes agree.
+        /// Q8 bytes agree, and the bytes' hash.
         fn nvfp4_gate_up_arm(gpu: &bloomery_gpu::Gpu, arm: &str) -> Result<bool, GateError> {
             use bloomery_gpu::gemm::{
                 GateUp32Args, Gemm32Args, Gemm32Kernels, Gemm32Weight, GemmAct32, GemmInput,
@@ -3603,7 +3881,10 @@ mod gate {
                 (2 * experts * rows * k * 9 / 16 + tokens * k + slots * rows * 5 / 4) as u64;
             print_arm(arm, rows, bytes, graph.node_count(), eager, timed);
             let q8_eq = q8[0] == q8[1];
-            println!("bench op={arm} slots={slots} k={k} experts={experts} q8_eq={q8_eq}");
+            println!(
+                "bench op={arm} slots={slots} k={k} experts={experts} q8_eq={q8_eq} q8_fnv={:016x}",
+                bloomery_gpu_gates::Fnv1a64::default().u32s(&q8[0]).value()
+            );
             if !q8_eq || gpu.take_fault()?.is_some() {
                 return Err("NVFP4 gate and up benchmark forms disagree".into());
             }
@@ -3952,13 +4233,13 @@ mod gate {
             let d = act.d().to_host_vec(stream)?;
             let s = act.s().to_host_vec(stream)?;
             Ok(q[..n * 16 * st] == want.0[..]
-                && scales_equal(&d[..n * 2 * st], &want.1)
+                && nan_bits_equal(&d[..n * 2 * st], &want.1)
                 && s[..n * 2 * st] == want.2[..])
         }
 
-        /// Two scale planes equal: each pair the same bits, or both NaN (a
-        /// refused block's scale, whatever its payload).
-        fn scales_equal(a: &[f32], b: &[f32]) -> bool {
+        /// Two planes equal: each pair the same bits, or both NaN (a refused
+        /// block's scale or output, whatever its payload).
+        fn nan_bits_equal(a: &[f32], b: &[f32]) -> bool {
             a.len() == b.len()
                 && a.iter()
                     .zip(b)
@@ -4383,7 +4664,7 @@ mod gate {
                     let st = fused.steps();
                     let same = fused.q().to_host_vec(stream)?[..n * 16 * st]
                         == split.q().to_host_vec(stream)?[..n * 16 * st]
-                        && scales_equal(
+                        && nan_bits_equal(
                             &fused.d().to_host_vec(stream)?[..n * 2 * st],
                             &split.d().to_host_vec(stream)?[..n * 2 * st],
                         )
@@ -4477,13 +4758,13 @@ mod gate {
                 let mut card = 0usize;
                 let mut host_ok = true;
                 let mut card_ok = true;
-                for c in 0..n {
+                for (c, &sel_c) in sel.iter().enumerate().take(n) {
                     let same = eq(&got.0, &want.0, c)
                         && got.1[c * 2 * steps..][..2 * steps]
                             == want.1[c * 2 * steps..][..2 * steps]
                         && got.2[c * 2 * steps..][..2 * steps]
                             == want.2[c * 2 * steps..][..2 * steps];
-                    if sel[c] == HOST {
+                    if sel_c == HOST {
                         let kept = eq(&got.0, &before.0, c)
                             && got.1[c * 2 * steps..][..2 * steps]
                                 == before.1[c * 2 * steps..][..2 * steps]
@@ -5820,7 +6101,7 @@ mod gate {
             let max_t = NV_MS[NV_MS.len() - 1];
             let max_slots = max_t * top_k;
             let same =
-                |a: &Planes32, b: &Planes32| a.0 == b.0 && scales_equal(&a.1, &b.1) && a.2 == b.2;
+                |a: &Planes32, b: &Planes32| a.0 == b.0 && nan_bits_equal(&a.1, &b.1) && a.2 == b.2;
             for rows in [640usize, 160] {
                 let n_rows = n_card * rows;
                 let (w, _) = weights_nvfp4(n_rows, k, 0x5100 + rows as u64)?;
@@ -7222,6 +7503,558 @@ mod gate {
             Ok(all)
         }
 
+        /// The product epilogue equals the separate projection and norm,
+        /// including exact replay, faults, graph replay and token-unit cuts,
+        /// for a BF16 weight and, on a native block-scaled build, an MXFP8
+        /// weight's planes as stored, whose epilogue also writes the
+        /// output's MXFP8 form: a next MXFP8 product reads it bit for bit as
+        /// it reads `enqueue_mxfp8_cols`' form of the split output.
+        pub(super) fn norm_gate_case(gpu: &Gpu, timed: bool) -> Result<bool, GateError> {
+            if !timed && !wanted("zgate") {
+                return Ok(true);
+            }
+            use crate::bench_arm::{N, burst, print_arm, replay};
+            use bloomery_gpu::gemm::{MmaForm, Mxfp8NormGateArgs};
+            use bloomery_gpu::linear::norm_gate::{NormGateArgs, NormGateKernels, NormGateTail};
+            use bloomery_gpu::q8f32::{E4m3Scales, E4m3Weight};
+            use gguf::quant::fp32_to_bf16_bits;
+            let stream = gpu.stream();
+            let g32 = Gemm32Kernels::load(gpu.context())?;
+            let norm = NormGateKernels::load(gpu.context())?;
+            let sink = gpu.unlabelled_sink();
+            let bundles = bloomery_gpu_gates::ptx::current_exe_bundles()?;
+            let native = bloomery_gpu_gates::ptx::modules(&bundles)?.iter().any(|m| {
+                bloomery_gpu_gates::ptx::body(std::slice::from_ref(m), "mxfp8_w8a8_norm_gate")
+                    .is_some()
+            });
+            let forms: &[MmaForm] = if native {
+                &[MmaForm::Bf16, MmaForm::Mxfp8]
+            } else {
+                &[MmaForm::Bf16]
+            };
+            let mut ok = true;
+            for &form in forms {
+                let mx = form == MmaForm::Mxfp8;
+                let cases: &[(usize, usize, usize, &str)] = if timed {
+                    &[(6144, 2560, 4095, "normal")]
+                } else {
+                    &[
+                        (128, 64, 1, "normal"),
+                        (256, 128, 8, "normal"),
+                        (256, 128, 9, "normal"),
+                        (256, 192, 129, "normal"),
+                        (6144, 2560, 4095, "normal"),
+                        (256, 128, 9, "nan_x"),
+                        (256, 128, 9, "range_x"),
+                        (256, 128, 9, "overflow_z"),
+                        (256, 128, 9, "nan_o"),
+                        (256, 128, 9, "square_overflow"),
+                        (256, 128, 9, "nan_gain"),
+                        (256, 128, 9, "big_gain"),
+                    ]
+                };
+                for &(rows, k, n, edge) in cases {
+                    // An MXFP8 column holds whole 128-value scale words.
+                    let k = if mx { k.next_multiple_of(128) } else { k };
+                    // MXFP8: random E4M3 codes (no NaN code) on block scales
+                    // 2^-7 .. 2^0; overflow_z puts row 0's first block past the
+                    // tensor cores' range, so the row replays to an infinite z.
+                    let mx_planes = |rows: usize,
+                                     k: usize,
+                                     edit: &dyn Fn(&mut [u8], &mut [u8])|
+                     -> Result<_, GateError> {
+                        let mut rng = bloomery_gpu_gates::GateRng(0x7a67_6174 + (rows * k) as u64);
+                        let mut codes: Vec<u8> = (0..rows * k)
+                            .map(|_| (rng.below(0x7f) as u8) | ((rng.below(2) as u8) << 7))
+                            .collect();
+                        let mut scales: Vec<u8> = (0..rows * k / 32)
+                            .map(|_| 120 + rng.below(8) as u8)
+                            .collect();
+                        edit(&mut codes, &mut scales);
+                        Ok((
+                            DeviceTensor::upload(stream, &bytes_to_words(&codes), rows, k / 4)?,
+                            DeviceTensor::upload(stream, &bytes_to_words(&scales), rows, k / 128)?,
+                        ))
+                    };
+                    let (w, e) = if mx {
+                        let (qs, e) = mx_planes(rows, k, &|codes, scales| {
+                            if edge == "overflow_z" {
+                                codes[..k].fill(0);
+                                codes[0] = 0x7e;
+                                codes[1] = 0x7e;
+                                scales[0] = 254;
+                            }
+                        })?;
+                        (qs, Some(e))
+                    } else {
+                        let mut bits: Vec<u16> = activations(k, rows, 1101)
+                            .into_iter()
+                            .map(fp32_to_bf16_bits)
+                            .collect();
+                        if edge == "overflow_z" {
+                            bits[..k].fill(0);
+                            bits[0] = 0x7f00;
+                            bits[1] = 0x7f00;
+                        }
+                        let words: Vec<u32> = bits
+                            .as_chunks::<2>()
+                            .0
+                            .iter()
+                            .map(|p| u32::from(p[0]) | (u32::from(p[1]) << 16))
+                            .collect();
+                        (DeviceTensor::upload(stream, &words, rows, k / 2)?, None)
+                    };
+                    let planes = e.as_ref().map(|e| E4m3Weight {
+                        qs: &w,
+                        e,
+                        scales: E4m3Scales::Mxfp8,
+                    });
+                    let mut xh = activations(k, n, 1102);
+                    let mut oh = activations(rows, n, 1103);
+                    let mut gh = activations(128, 1, 1104);
+                    match edge {
+                        "nan_x" => xh[8 * k + 31] = f32::NAN,
+                        "range_x" => xh[8 * k + 31] = f32::from_bits(0x200),
+                        "overflow_z" => {
+                            xh[8 * k] = 1.0;
+                            xh[8 * k + 1] = 1.0;
+                        }
+                        "nan_o" => oh[8 * rows + 127] = f32::NAN,
+                        "square_overflow" => oh[8 * rows + 127] = f32::MAX,
+                        "nan_gain" => gh[127] = f32::NAN,
+                        // Row 0 of every head leaves the tensor cores' range
+                        // except column 8's first head, so its output form
+                        // refuses each column by its other heads.
+                        "big_gain" => {
+                            gh[0] = 2f32.powi(60);
+                            oh[8 * rows] = 0.0;
+                        }
+                        _ => {}
+                    }
+                    let x = DeviceBuffer::from_host(stream, &xh)?;
+                    let o = DeviceBuffer::from_host(stream, &oh)?;
+                    let gain = DeviceBuffer::from_host(stream, &gh)?;
+                    let formed = |xx: &DeviceBuffer<f32>,
+                                  count: usize|
+                     -> Result<GemmAct32, GateError> {
+                        let mut aa = GemmAct32::new(stream, count, k)?.with_form(stream, form)?;
+                        g32.enqueue_form_cols(stream, form, xx, count, &mut aa)?;
+                        Ok(aa)
+                    };
+                    let act = formed(&x, n)?;
+                    let product =
+                        |s: &cuda_core::CudaStream, z: &mut DeviceBuffer<f32>| match planes {
+                            Some(p) => g32.enqueue_mxfp8_w8a8(s, p, &x, &act, n, z),
+                            None => g32.enqueue_bf16_mma_cols(s, &w, &x, &act, n, z),
+                        };
+                    // The output's MXFP8 form, which only the MXFP8 entry writes.
+                    let room = |count: usize| -> Result<GemmAct32, GateError> {
+                        Ok(GemmAct32::new(stream, count, rows)?
+                            .with_form(stream, MmaForm::Mxfp8)?)
+                    };
+                    let fused = |s: &cuda_core::CudaStream,
+                                 (xx, aa, count): (&DeviceBuffer<f32>, &GemmAct32, usize),
+                                 o: &DeviceBuffer<f32>,
+                                 z: &mut DeviceBuffer<f32>,
+                                 y: &mut DeviceBuffer<f32>,
+                                 out: &mut GemmAct32| {
+                        let tail = NormGateTail {
+                            o,
+                            w: &gain,
+                            eps: 1e-6,
+                            fault: sink,
+                            y,
+                        };
+                        match planes {
+                            Some(w) => g32.enqueue_mxfp8_w8a8_norm_gate(
+                                s,
+                                Mxfp8NormGateArgs {
+                                    w,
+                                    x: xx,
+                                    act: aa,
+                                    n_cols: count,
+                                    z,
+                                    tail,
+                                    out,
+                                },
+                            ),
+                            None => g32.enqueue_bf16_mma_norm_gate(s, &w, xx, aa, count, z, tail),
+                        }
+                    };
+                    let mut z = DeviceBuffer::from_host(stream, &vec![SENT; rows * n + 32])?;
+                    let mut y = DeviceBuffer::from_host(stream, &vec![SENT; rows * n + 32])?;
+                    let mut split = DeviceBuffer::from_host(stream, &vec![SENT; rows * n + 32])?;
+                    gpu.clear_fault()?;
+                    product(stream, &mut z)?;
+                    norm.enqueue_norm_gate_sigmoid(
+                        stream,
+                        NormGateArgs {
+                            o: &o,
+                            z: &z,
+                            w: &gain,
+                            eps: 1e-6,
+                            n_v: rows / 128,
+                            m: n,
+                            fault: sink,
+                            y: &mut split,
+                        },
+                    )?;
+                    stream.synchronize()?;
+                    let expected_fault = gpu.take_fault()?;
+                    let expected = split.to_host_vec(stream)?;
+                    let overflow_reached =
+                        edge != "overflow_z" || z.to_host_vec(stream)?[8 * rows].is_infinite();
+                    z.copy_from_host(stream, &vec![SENT; z.len()])?;
+                    let mut out = room(n)?;
+                    let enqueue = |s: &cuda_core::CudaStream,
+                                   z: &mut DeviceBuffer<f32>,
+                                   y: &mut DeviceBuffer<f32>,
+                                   out: &mut GemmAct32| {
+                        fused(s, (&x, &act, n), &o, z, y, out)
+                    };
+                    gpu.clear_fault()?;
+                    enqueue(stream, &mut z, &mut y, &mut out)?;
+                    stream.synchronize()?;
+                    let fault = gpu.take_fault()?;
+                    let eager = y.to_host_vec(stream)?;
+                    let same = nan_bits_equal(&eager, &expected);
+                    // The next MXFP8 product over an epilogue's form against
+                    // the one over the split output's quantizer form.
+                    let next = if mx {
+                        let (qs2, e2) = mx_planes(128, rows, &|_, _| {})?;
+                        let mut quantized = room(n)?;
+                        g32.enqueue_mxfp8_cols(stream, &split, n, &mut quantized)?;
+                        let mut want = DeviceBuffer::from_host(stream, &vec![SENT; 128 * n])?;
+                        let w = E4m3Weight {
+                            qs: &qs2,
+                            e: &e2,
+                            scales: E4m3Scales::Mxfp8,
+                        };
+                        g32.enqueue_mxfp8_w8a8(stream, w, &split, &quantized, n, &mut want)?;
+                        let want = want.to_host_vec(stream)?;
+                        Some((qs2, e2, want))
+                    } else {
+                        None
+                    };
+                    let next_bits =
+                        |y: &DeviceBuffer<f32>, out: &GemmAct32| -> Result<bool, GateError> {
+                            let Some((qs, e, want)) = &next else {
+                                return Ok(true);
+                            };
+                            let w = E4m3Weight {
+                                qs,
+                                e,
+                                scales: E4m3Scales::Mxfp8,
+                            };
+                            let mut got = DeviceBuffer::from_host(stream, &vec![SENT; 128 * n])?;
+                            Ok(g32
+                                .enqueue_mxfp8_w8a8(stream, w, y, out, n, &mut got)
+                                .is_ok()
+                                && nan_bits_equal(&got.to_host_vec(stream)?, want))
+                        };
+                    let form_bits = next_bits(&y, &out)?;
+                    let scratch_kept = edge == "nan_x"
+                        || edge == "range_x"
+                        || edge == "overflow_z"
+                        || z.to_host_vec(stream)?
+                            .iter()
+                            .all(|v| v.to_bits() == SENT.to_bits());
+                    let graph = gpu.capture(|s| enqueue(s, &mut z, &mut y, &mut out))?;
+                    y.copy_from_host(stream, &vec![SENT; y.len()])?;
+                    graph.launch(stream)?;
+                    stream.synchronize()?;
+                    let graph_bits = bits_equal(&eager, &y.to_host_vec(stream)?);
+                    let mut cut_bits = true;
+                    if n == 9 && edge == "normal" {
+                        let mut cut = Vec::new();
+                        for (start, count) in [(0, 1), (1, 8)] {
+                            let xx = DeviceBuffer::from_host(
+                                stream,
+                                &xh[start * k..(start + count) * k],
+                            )?;
+                            let oo = DeviceBuffer::from_host(
+                                stream,
+                                &oh[start * rows..(start + count) * rows],
+                            )?;
+                            let aa = formed(&xx, count)?;
+                            let mut zz = DeviceBuffer::<f32>::zeroed(stream, rows * count)?;
+                            let mut yy = DeviceBuffer::<f32>::zeroed(stream, rows * count)?;
+                            let mut out = room(count)?;
+                            fused(stream, (&xx, &aa, count), &oo, &mut zz, &mut yy, &mut out)?;
+                            cut.extend(yy.to_host_vec(stream)?);
+                        }
+                        cut_bits = bits_equal(&cut, &eager[..rows * n]);
+                    }
+                    // One output scratch through a launch whose subnormal
+                    // outputs refuse its columns and then this case's launch,
+                    // eagerly and replayed: the scratch holds the second
+                    // launch's form alone.
+                    let mut reuse_bits = true;
+                    if mx && n == 9 && edge == "normal" {
+                        let tiny = DeviceBuffer::from_host(stream, &vec![1e-42f32; rows * n])?;
+                        let mut reused = room(n)?;
+                        let both = |s: &cuda_core::CudaStream,
+                                    z: &mut DeviceBuffer<f32>,
+                                    y: &mut DeviceBuffer<f32>,
+                                    out: &mut GemmAct32| {
+                            fused(s, (&x, &act, n), &tiny, z, y, out)?;
+                            fused(s, (&x, &act, n), &o, z, y, out)
+                        };
+                        both(stream, &mut z, &mut y, &mut reused)?;
+                        stream.synchronize()?;
+                        reuse_bits = next_bits(&y, &reused)?;
+                        let graph = gpu.capture(|s| both(s, &mut z, &mut y, &mut reused))?;
+                        graph.launch(stream)?;
+                        stream.synchronize()?;
+                        reuse_bits &= next_bits(&y, &reused)?;
+                    }
+                    let fault_expected = matches!(
+                        edge,
+                        "nan_x" | "overflow_z" | "nan_o" | "square_overflow" | "nan_gain"
+                    );
+                    let fault_ok = fault == expected_fault
+                        && fault
+                            == fault_expected.then(|| Fault::at(LAYER_NONE, FaultSite::LinearGate));
+                    let pass = same
+                        && form_bits
+                        && graph_bits
+                        && scratch_kept
+                        && cut_bits
+                        && reuse_bits
+                        && fault_ok
+                        && overflow_reached;
+                    println!(
+                        "zgate form={form:?} rows={rows} K={k} M={n} edge={edge} split_bits={same} out_form_bits={form_bits} eager_graph={graph_bits} scratch_kept={scratch_kept} unit_cut={cut_bits} scratch_reuse={reuse_bits} fault_ok={fault_ok} overflow_reached={overflow_reached} {}",
+                        verdict(pass)
+                    );
+                    ok &= pass;
+                    if timed {
+                        for joined in [false, true] {
+                            // The split MXFP8 arm also quantizes the output
+                            // for the next site, which the epilogue writes.
+                            let mut enq = |s: &cuda_core::CudaStream| {
+                                if joined {
+                                    enqueue(s, &mut z, &mut y, &mut out)
+                                } else {
+                                    product(s, &mut z)?;
+                                    norm.enqueue_norm_gate_sigmoid(
+                                        s,
+                                        NormGateArgs {
+                                            o: &o,
+                                            z: &z,
+                                            w: &gain,
+                                            eps: 1e-6,
+                                            n_v: rows / 128,
+                                            m: n,
+                                            fault: sink,
+                                            y: &mut y,
+                                        },
+                                    )?;
+                                    if mx {
+                                        g32.enqueue_mxfp8_cols(s, &y, n, &mut out)?;
+                                    }
+                                    Ok(())
+                                }
+                            };
+                            let eager = burst(stream, &mut enq)?;
+                            let graph = gpu.capture(|s| {
+                                for _ in 0..N {
+                                    enq(s)?;
+                                }
+                                Ok(())
+                            })?;
+                            let graph = replay(stream, &graph)?;
+                            let arm = match (mx, joined) {
+                                (false, false) => "zgate_split",
+                                (false, true) => "zgate_fused",
+                                (true, false) => "zgate_mxfp8_split",
+                                (true, true) => "zgate_mxfp8_fused",
+                            };
+                            // Graph nodes: the MXFP8 epilogue's refusal
+                            // memset precedes its kernel.
+                            let nodes = match (mx, joined) {
+                                (false, true) => 1,
+                                (true, true) | (false, false) => 2,
+                                (true, false) => 3,
+                            };
+                            print_arm(arm, n, 0, nodes, eager, graph);
+                        }
+                    }
+                }
+            }
+            let x = DeviceBuffer::from_host(stream, &vec![1.0f32; 128])?;
+            let o = DeviceBuffer::from_host(stream, &vec![1.0f32; 128])?;
+            let gain = DeviceBuffer::from_host(stream, &vec![1.0f32; 128])?;
+            let mut z = DeviceBuffer::<f32>::zeroed(stream, 128)?;
+            let mut y = DeviceBuffer::<f32>::zeroed(stream, 128)?;
+            let says = |r: Result<(), GpuError>, need: &str| {
+                r.is_err_and(|e| e.to_string().contains(need))
+            };
+            let partial = |r: Result<(), GpuError>| says(r, "whole 128-value heads");
+            // The column and room checks `GemmAct32::room` owns, as each
+            // quantizer reaches them: no columns, more than the scratch holds
+            // and a scratch without the form are refused; all of its columns
+            // pass.
+            let cols_refused = |form: MmaForm| -> Result<bool, GateError> {
+                let quantize =
+                    |act: &mut GemmAct32, n: usize| g32.enqueue_form_cols(stream, form, &x, n, act);
+                let mut act = GemmAct32::new(stream, 1, 128)?.with_form(stream, form)?;
+                let none = says(quantize(&mut act, 0), "got 0");
+                let past = says(quantize(&mut act, 2), "act.cols() = 1, got 2");
+                let no_room = says(
+                    quantize(&mut GemmAct32::new(stream, 1, 128)?, 1),
+                    "with_form",
+                );
+                let all = quantize(&mut act, 1).is_ok();
+                let pass = none && past && no_room && all;
+                println!(
+                    "zgate case=cols_refused form={form:?} no_cols={none} past_cols={past} no_room={no_room} all_cols={all} {}",
+                    verdict(pass)
+                );
+                Ok(pass)
+            };
+            let mut cols_ok = cols_refused(MmaForm::Bf16)?;
+            let mut act = GemmAct32::new(stream, 1, 64)?.with_form(stream, MmaForm::Bf16)?;
+            g32.enqueue_bf16_cols(stream, &x, 1, &mut act)?;
+            let w = DeviceTensor::upload(stream, &vec![0x3f80_3f80u32; 127 * 32], 127, 32)?;
+            let mut partial_head = partial(g32.enqueue_bf16_mma_norm_gate(
+                stream,
+                &w,
+                &x,
+                &act,
+                1,
+                &mut z,
+                NormGateTail {
+                    o: &o,
+                    w: &gain,
+                    eps: 1e-6,
+                    fault: sink,
+                    y: &mut y,
+                },
+            ));
+            // The MXFP8 entry refuses as the product entry does: a partial
+            // head, a misaligned value plane, other scales and a stale form;
+            // and an output scratch of another K or without the MXFP8 form.
+            let mut mx_refused = true;
+            if native {
+                let mut act = GemmAct32::new(stream, 1, 128)?.with_form(stream, MmaForm::Mxfp8)?;
+                g32.enqueue_mxfp8_cols(stream, &x, 1, &mut act)?;
+                let mut bf16 = GemmAct32::new(stream, 1, 128)?.with_form(stream, MmaForm::Bf16)?;
+                g32.enqueue_bf16_cols(stream, &x, 1, &mut bf16)?;
+                let upload = |rows: usize| -> Result<_, GateError> {
+                    Ok((
+                        DeviceTensor::upload(stream, &vec![0x3838_3838u32; rows * 32], rows, 32)?,
+                        DeviceTensor::upload(stream, &vec![0x7f7f_7f7fu32; rows], rows, 1)?,
+                    ))
+                };
+                let (qs127, e127) = upload(127)?;
+                let (qs, e) = upload(128)?;
+                let words = DeviceBuffer::from_host(stream, &vec![0x3838_3838u32; 128 * 32 + 1])?;
+                let shifted = DeviceTensor::<u32>::window_of(&words, 4, 128, 32)?;
+                let mut out = GemmAct32::new(stream, 1, 128)?.with_form(stream, MmaForm::Mxfp8)?;
+                let mut out_k =
+                    GemmAct32::new(stream, 1, 256)?.with_form(stream, MmaForm::Mxfp8)?;
+                let mut out_bf16 =
+                    GemmAct32::new(stream, 1, 128)?.with_form(stream, MmaForm::Bf16)?;
+                let mut run = |qs: &DeviceTensor<u32>,
+                               e: &DeviceTensor<u32>,
+                               scales: E4m3Scales,
+                               act: &GemmAct32,
+                               out: &mut GemmAct32| {
+                    g32.enqueue_mxfp8_w8a8_norm_gate(
+                        stream,
+                        Mxfp8NormGateArgs {
+                            w: E4m3Weight { qs, e, scales },
+                            x: &x,
+                            act,
+                            n_cols: 1,
+                            z: &mut z,
+                            tail: NormGateTail {
+                                o: &o,
+                                w: &gain,
+                                eps: 1e-6,
+                                fault: sink,
+                                y: &mut y,
+                            },
+                            out,
+                        },
+                    )
+                };
+                let mx = E4m3Scales::Mxfp8;
+                partial_head &= partial(run(&qs127, &e127, mx, &act, &mut out));
+                let unaligned = says(
+                    run(&shifted, &e, mx, &act, &mut out),
+                    "is not 16-byte aligned",
+                );
+                let other_scales = says(
+                    run(&qs, &e, E4m3Scales::Fp8B128, &act, &mut out),
+                    "not MXFP8's",
+                );
+                let stale = says(run(&qs, &e, mx, &bf16, &mut out), "MXFP8 form");
+                let other_k = says(run(&qs, &e, mx, &act, &mut out_k), "not 128");
+                let no_room = says(run(&qs, &e, mx, &act, &mut out_bf16), "with_form");
+                let fresh = run(&qs, &e, mx, &act, &mut out).is_ok();
+                // An output scratch of fewer columns than the product's, with
+                // the input, z, o and y room for all of them; the scratch of
+                // all of them passes.
+                let x2 = DeviceBuffer::from_host(stream, &vec![1.0f32; 256])?;
+                let o2 = DeviceBuffer::from_host(stream, &vec![1.0f32; 256])?;
+                let mut z2 = DeviceBuffer::<f32>::zeroed(stream, 256)?;
+                let mut y2 = DeviceBuffer::<f32>::zeroed(stream, 256)?;
+                let mut act2 = GemmAct32::new(stream, 2, 128)?.with_form(stream, MmaForm::Mxfp8)?;
+                g32.enqueue_mxfp8_cols(stream, &x2, 2, &mut act2)?;
+                let mut out2 = GemmAct32::new(stream, 2, 128)?.with_form(stream, MmaForm::Mxfp8)?;
+                let mut run2 = |out: &mut GemmAct32| {
+                    g32.enqueue_mxfp8_w8a8_norm_gate(
+                        stream,
+                        Mxfp8NormGateArgs {
+                            w: E4m3Weight {
+                                qs: &qs,
+                                e: &e,
+                                scales: mx,
+                            },
+                            x: &x2,
+                            act: &act2,
+                            n_cols: 2,
+                            z: &mut z2,
+                            tail: NormGateTail {
+                                o: &o2,
+                                w: &gain,
+                                eps: 1e-6,
+                                fault: sink,
+                                y: &mut y2,
+                            },
+                            out,
+                        },
+                    )
+                };
+                let out_cols = says(run2(&mut out), "act.cols() = 1, got 2");
+                let out_all = run2(&mut out2).is_ok();
+                mx_refused = unaligned
+                    && other_scales
+                    && stale
+                    && other_k
+                    && no_room
+                    && fresh
+                    && out_cols
+                    && out_all;
+                println!(
+                    "zgate case=mxfp8_refused unaligned_weight={unaligned} other_scales={other_scales} stale_form={stale} out_other_k={other_k} out_no_room={no_room} fresh_read={fresh} out_past_cols={out_cols} out_all_cols={out_all} {}",
+                    verdict(mx_refused)
+                );
+                cols_ok &= cols_refused(MmaForm::Mxfp8)?;
+            }
+            let overflow = matches!(norm.enqueue_norm_gate_sigmoid(stream, NormGateArgs {
+                o: &o, z: &z, w: &gain, eps: 1e-6, n_v: 2, m: usize::MAX,
+                fault: sink, y: &mut y,
+            }), Err(e) if e.to_string().contains("overflows"));
+            println!(
+                "zgate native={native} partial_head_refused={partial_head} size_overflow_refused={overflow} {}",
+                verdict(partial_head && overflow)
+            );
+            Ok(ok && partial_head && overflow && mx_refused && cols_ok)
+        }
+
         /// Ragged dense MMA tiles, tails, repeatability and graph replay.
         fn dense_mma_case(dev: &Dev<'_>) -> Result<bool, GateError> {
             if !wanted("dense_mma") {
@@ -8090,10 +8923,13 @@ mod gate {
                 (16usize, 14usize, 128usize, Native::Pattern),
                 (128, 73, 64, Native::Pattern),
                 (144, 129, 256, Native::Pattern),
+                (128, 129, 256, Native::Pattern),
                 (48, 73, 64, Native::OneHot),
                 (16, 14, 20_480, Native::Pattern),
                 (16, 14, 64, Native::Tiny),
                 (16, 14, 64, Native::Varied),
+                (16, 14, 192, Native::Varied),
+                (16, 14, 448, Native::Varied),
                 (16, 3, 64, Native::Refused),
                 (
                     16,
@@ -8423,6 +9259,8 @@ mod gate {
             for (rows, k, tokens, refused, poison) in [
                 (64usize, 64usize, 9usize, false, None),
                 (128, 128, 50, true, None),
+                (64, 192, 23, false, None),
+                (64, 448, 23, false, None),
                 (192, 256, 37, false, Some(5usize)),
                 (640, 2560, 131, false, None),
             ] {
@@ -8678,6 +9516,7 @@ mod gate {
             ok &= remap_case(&dev)?;
             ok &= f32tile_case(&dev)?;
             ok &= dense_mma_case(&dev)?;
+            ok &= norm_gate_case(gpu, false)?;
             ok &= mxfp8_w8a8_case(&dev)?;
             ok &= refusals(&dev)?;
             println!("gemm32 wall_s={:.1}", t0.elapsed().as_secs_f64());
@@ -8828,6 +9667,18 @@ mod gate {
                 a[0] = 1;
                 let contract = dot_ref(&dec, &a, &[f32::from_bits(1)]).2;
                 assert_eq!(contract.to_bits(), 1);
+            }
+
+            /// The scale and norm-gate checks lean on [`nan_bits_equal`]: a
+            /// shorter side is a difference, `-0.0` is not `0.0`, and any NaN
+            /// matches any NaN.
+            #[test]
+            fn nan_bits_equal_takes_the_length_and_any_nan() {
+                let nan = f32::from_bits(0x7fc0_0001);
+                assert!(nan_bits_equal(&[1.0, -0.0, nan], &[1.0, -0.0, f32::NAN]));
+                assert!(!nan_bits_equal(&[1.0, nan], &[1.0]));
+                assert!(!nan_bits_equal(&[1.0], &[1.0, nan]));
+                assert!(!nan_bits_equal(&[-0.0], &[0.0]));
             }
         }
     }

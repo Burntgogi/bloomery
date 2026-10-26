@@ -1727,6 +1727,7 @@ impl Body {
             },
             cols: prefill::T_MAX.min(ctx),
             card_dontneed: host.card_dontneed,
+            bytes: bloomery_gpu::model::CardBytes::File,
         };
         leg_tier::hang_tiers((gpu, &file, plan), &hang, &mut hybrid)?;
         // The residency machine frees arena slots between passes, which a
@@ -1739,19 +1740,7 @@ impl Body {
             ctx,
             CHECKPOINT_EVERY,
         )?;
-        let who = Identity {
-            arch: "glm5next",
-            file: embd
-                .file
-                .shard_path(0)
-                .ok_or(GpuError::State {
-                    what: WHAT,
-                    missing: "the file's first shard",
-                })?
-                .to_path_buf(),
-            card: gpu.device_name()?,
-            ctx,
-        };
+        let who = Identity::of_load("glm5next", &embd.file, gpu, ctx)?;
         let lane = [0u32];
         let mut body = Body {
             shell: TierShell::new(hybrid, glue, HC_STREAMS * dims.embd, WHAT),

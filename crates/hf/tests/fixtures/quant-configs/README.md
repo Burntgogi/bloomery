@@ -1,6 +1,6 @@
 # Quantization configs
 
-`config.json` and, for ModelOpt exports that ship one, `hf_quant_config.json` of eleven quantized checkpoints, gzipped, for `crates/hf/src/quant_config.rs`. Each file is named `<owner>__<repo>__<file>.gz` and is the file at the revision below, unchanged except where noted.
+`config.json` and, for ModelOpt exports that ship one, `hf_quant_config.json` of twelve quantized checkpoints, gzipped, for `crates/hf/src/quant_config.rs`. Each file is named `<owner>__<repo>__<file>.gz` and is the file at the revision below, unchanged except where noted.
 
 | checkpoint | revision | producer, scheme |
 |---|---|---|
@@ -15,6 +15,7 @@
 | `deepseek-ai/DeepSeek-V4.1-Flash` | `314113f8a7dadb388215396ba5fbee2c610a04d6` | fp8, 32x32 blocks, MXFP4 experts |
 | `openbmb/MiniCPM-V-4.7-35B-A3B-FP8` | `25f6715c91b8e528d45532d4a3cbcb206c59fb47` | compressed-tensors FP8 per channel |
 | `openbmb/MiniCPM-V-4.7-35B-A3B-int4` | `1fe0fee8ba1e05a3180fb306b05ccc4a75cc4c86` | compressed-tensors pack-quantized int4, group 128 |
+| `MiniMaxAI/MiniMax-M3.1-Flash` | `76faee1b4ac0f412e547781172e94548a6526a88` | `mxfp8` method: MXFP8 dense, `nvfp4-pack-quantized` experts (compressed-tensors tensor names) |
 
 Bolt's two files list 27,921 modules (15 MB); they are cut to the first module of each algorithm (`quantized_layers`) and the first group (`config_groups`), the rest unchanged.
 

@@ -21,11 +21,12 @@
 //!
 //! A load whose slot map names an expert tier card ([`TierSide`]) runs a layer the tier holds experts of as a tier
 //! layer: the front's handoff also writes the tier's image and each slot's tier place and the go is the host's and the
-//! tier's; the shadow runs the card slots' downs but not their sum; the back waits for the host and the tier, then sums
-//! the card's and the tier's rows in one weighted sum (`ds41_ffn_card_acc_8_tier`, the card sum's order with the tier's
-//! slots in it) plus the shadow's base, and adds the host's sum. A unit of the batch does the same through
-//! [`Routed::download_rows`], [`Routed::shadow_rows`] and [`Routed::join_rows`] (the host leg's
-//! [`bloomery_gpu::host::BatchLeg::join_tiered`] hands the tier's rows to the join, then [`Routed::back_rows`]).
+//! tier's; the shadow runs the card slots' downs but not their sum; the back is the common step join
+//! ([`crate::tier_join`]): it waits for the host and the tier, then sums the card's and the tier's rows in one weighted
+//! sum (`ds41_ffn_card_acc_8_tier`, the card sum's order with the tier's slots in it) plus the shadow's base, and adds
+//! the host's sum. A unit of the batch does the same through [`Routed::download_rows`], [`Routed::shadow_rows`] and
+//! [`Routed::join_rows`] (the host leg's [`bloomery_gpu::host::BatchLeg::join_tiered`] hands the tier's rows to the
+//! join, then [`Routed::back_rows`]).
 //!
 //! What a family fixes is its router instance, its [`CardFamily`] (stack names, counts) and what its description
 //! says: the routed experts' and the shared expert's activation ([`rule_of`]: a SwiGLU clamp or SwiGLU-OAI), the
@@ -39,6 +40,7 @@ use bloomery_gpu::card_experts::{CardBatch, CardExperts, CardFamily};
 use bloomery_gpu::gemm::{Gemm32Kernels, GemmInput, GemmKernels, GemmRoute};
 use bloomery_gpu::host::leg_tier::TierSide;
 use bloomery_gpu::host::run::HostRun;
+use bloomery_gpu::host::xstream::{LandBatch, RingLayer};
 use bloomery_gpu::hybrid::{BatchKey, Boundary, Hybrid, SlotMap};
 use bloomery_gpu::kquant::Act;
 use bloomery_gpu::model::agreed;
@@ -52,9 +54,10 @@ use crate::block::{
     Block, BlockIo, BlockKernels, BlockPlan, BlockScratch, DenseIo, KBlockKernels,
     enqueue_block_act, enqueue_block_cols_act, enqueue_dense_layer,
 };
-use crate::chain::ffn::{CardAccTier, FfnBatchKernels};
+use crate::chain::ffn::FfnBatchKernels;
 use crate::experts::ExpertKernels;
 use crate::span::{span, span_mut};
+use crate::tier_join::{self, TierBatch, TierSlots};
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::Split;
 use model::arch::names;
@@ -200,7 +203,7 @@ impl SharedWide {
         Ok(SharedWide {
             gemm: GemmKernels::load(gpu.context())?,
             route: GemmRoute::new(stream, cap, 1)?,
-            x: WideActs::new(stream, WideActs::wants_of(gate_up), cap, embd)?,
+            x: WideActs::new(stream, WideActs::wants_of(gate_up).without_f32(), cap, embd)?,
             h: WideActs::new(stream, WideActs::wants_of(down), cap, ff)?,
             g: DeviceBuffer::zeroed(stream, cap * ff)?,
             u: DeviceBuffer::zeroed(stream, cap * ff)?,
@@ -261,7 +264,7 @@ impl SharedWide {
             x: &input,
             gate: g,
             up: u,
-            rows: h.swiglu_rows(None),
+            rows: h.swiglu_rows(),
             y,
         };
         site::gated(gpu, &kernels, &block, (m, m), io, fault)
@@ -295,7 +298,7 @@ struct BatchBufs {
     /// Made when the plan holds a dense block and a unit can reach [`GATED_FROM`] rows.
     dense_wide: Option<SharedWide>,
     /// The tier layers' places and the join's copies, on a load with an expert tier card.
-    tier: Option<TierBufs>,
+    tier: Option<TierBatch>,
 }
 
 /// The types the blocks' gate and up read, and the types their down reads, of the plans `plans` names.
@@ -309,30 +312,6 @@ fn block_types<'a>(plans: impl Iterator<Item = &'a BlockPlan>) -> (Vec<SiteTy>, 
         down.push(d);
     }
     (gate_up, down)
-}
-
-/// A tier layer's unit buffers: each slot's tier place as the route's download carries it, and the copies of the
-/// weights and tier places the join reads. The next unit's front (the batch walk's order) overwrites the route's own
-/// before this unit's join, so the shadow, which runs before it, keeps these.
-struct TierBufs {
-    places: DeviceBuffer<u32>,
-    join_places: DeviceBuffer<u32>,
-    join_weights: DeviceBuffer<f32>,
-}
-
-impl TierBufs {
-    /// Buffers for up to `cap` rows of `n_used` slots. Load-time only.
-    fn new(stream: &CudaStream, cap: usize, n_used: usize) -> Result<TierBufs, GpuError> {
-        Ok(TierBufs {
-            places: DeviceBuffer::zeroed(stream, cap * n_used)?,
-            join_places: DeviceBuffer::zeroed(stream, cap * n_used)?,
-            join_weights: DeviceBuffer::zeroed(stream, cap * n_used)?,
-        })
-    }
-
-    fn bytes(&self) -> usize {
-        self.places.num_bytes() + self.join_places.num_bytes() + self.join_weights.num_bytes()
-    }
 }
 
 impl BatchBufs {
@@ -367,7 +346,7 @@ impl BatchBufs {
                 .then(|| SharedWide::new(gpu, (&dense_gate_up, &dense_down), (cap, embd, dense_ff)))
                 .transpose()?,
             tier: tiered
-                .then(|| TierBufs::new(stream, cap, R::N_USED))
+                .then(|| TierBatch::new(stream, cap, R::N_USED))
                 .transpose()?,
         })
     }
@@ -391,7 +370,7 @@ impl BatchBufs {
             + self.card.as_ref().map_or(0, CardBatch::bytes)
             + self.wide.as_ref().map_or(0, SharedWide::bytes)
             + self.dense_wide.as_ref().map_or(0, SharedWide::bytes)
-            + self.tier.as_ref().map_or(0, TierBufs::bytes)
+            + self.tier.as_ref().map_or(0, TierBatch::bytes)
     }
 
     /// `m` rows are a unit this buffer set holds.
@@ -663,6 +642,13 @@ impl<R: RouterEntry> Routed<R> {
         })
     }
 
+    /// Layer `l` computes routed experts on the card: the layers a
+    /// residency machine holds stage stacks of.
+    #[must_use]
+    pub fn card_has(&self, l: usize) -> bool {
+        self.card.has(l)
+    }
+
     /// The experts of layer `l` the expert tier holds: 0 off the tier, and on
     /// every layer of a load with none.
     #[must_use]
@@ -696,6 +682,18 @@ impl<R: RouterEntry> Routed<R> {
     #[must_use]
     pub fn batch_bytes(&self) -> usize {
         self.batch.as_ref().map_or(0, BatchBufs::bytes)
+    }
+
+    /// The ring pass's GEMM buffers of the batch's card experts for a half of
+    /// `half_slots` slots of the expert stream's ring
+    /// ([`CardExperts::arm_ring`]), made when the stream starts. Nothing on a
+    /// load with no batch or no card experts in it: the ring pass then
+    /// refuses by name.
+    pub fn arm_ring(&mut self, gpu: &Gpu, half_slots: usize) -> Result<(), GpuError> {
+        match self.batch.as_mut().and_then(|b| b.card.as_mut()) {
+            Some(cb) => self.card.arm_ring(gpu, cb, half_slots),
+            None => Ok(()),
+        }
     }
 
     /// The last token's routed expert ids, in router rank order: the picks
@@ -817,33 +815,25 @@ pub fn back<R: RouterEntry>(
         return r.route.back(gpu, hybrid, &r.card, l, (&r.step.x1s, dest));
     }
     const W: &str = "shared routed back (tier layer)";
-    let stream = gpu.stream();
-    let n = r.d.embd;
-    hybrid.enqueue_tier_back(stream, l, 0)?;
     let (side, kernels) = r.tier.as_ref().ok_or(GpuError::State {
         what: W,
         missing: "the stage card's tier side",
     })?;
-    let tsel = side.tsel(0)?;
-    let n_card = r.card.n_card(l);
-    let join = r.card.step_join(r.step.route.sel());
-    let acc = CardAccTier {
-        down: join.down,
-        trows: hybrid.tier_rows(0)?,
+    let slots = TierSlots {
         w: r.step.route.weights(),
-        sel: join.sel,
-        tsel,
-        n,
-        m: 1,
-        n_card,
+        tsel: side.tsel(0)?,
+        n: r.d.embd,
+        n_card: r.card.n_card(l),
         n_tier,
         n_used: R::N_USED,
     };
-    kernels.enqueue_card_acc_tier(stream, &acc, join.acc)?;
-    gpu.elem()
-        .enqueue_add(stream, join.acc, &r.step.x1s, n, join.pre)?;
-    gpu.elem()
-        .enqueue_add(stream, hybrid.boundary().hsum_of(0)?, join.pre, n, dest)
+    tier_join::enqueue_step_join(
+        gpu,
+        kernels,
+        (hybrid, l, 0),
+        (r.card.step_join(r.step.route.sel()), &slots),
+        (&r.step.x1s, dest),
+    )
 }
 
 /// Enqueue dense layer `l`'s feed-forward sub-layer of the step: `dest = x1 + block(rms_norm(x1))` through `xn` and
@@ -896,9 +886,9 @@ pub fn dense<R: RouterEntry>(
 }
 
 /// The batch: the parts of a unit of `m` rows, the step's launches over its
-/// rows. A unit runs `front_rows`, `download`, `shadow_rows` and `back_rows`
-/// in that order, no other unit's `front_rows` between the first two and the
-/// next two.
+/// rows. A unit runs `front_rows`, `download`, `shadow_rows` (or its two
+/// halves, `shared_rows` then `card_rows`) and `back_rows` in that order, no
+/// other unit's `front_rows` between the first two and the next two.
 impl<R: RouterEntry> Routed<R> {
     /// Layer `l`'s `ffn_norm` of the unit's `m` rows of the residual `x1` and
     /// the router over them, into the batch's buffers.
@@ -953,16 +943,29 @@ impl<R: RouterEntry> Routed<R> {
             missing: "the tier places of a batch made with a tier",
         })?;
         self.route
-            .tier_places_rows(gpu, (l, m), &b.ids, (side.places(), &mut tb.places))?;
-        hybrid.enqueue_download_tiered(stream, [&b.normed, &b.weights], &b.ids, &[&tb.places], key)
+            .tier_places_rows(gpu, (l, m), &b.ids, (side.places(), tb.places_mut()))?;
+        hybrid.enqueue_download_tiered(stream, [&b.normed, &b.weights], &b.ids, &[tb.places()], key)
     }
 
     /// Layer `l`'s shared expert and, where the slot map puts any, card
     /// experts over the `m` rows [`Routed::front_rows`] wrote, under the host
-    /// leg: the shared expert's rows (per column below [`GATED_FROM`] rows, on
-    /// `site::gated` from it), `x1s = x1 + shared`, and the card sum plus
-    /// `x1s`.
+    /// leg: [`Routed::shared_rows`], then [`Routed::card_rows`] with no
+    /// landing to wait for.
     pub fn shadow_rows(
+        &mut self,
+        gw: (&Gpu, &Weights),
+        lm: (usize, usize),
+        x1: &DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        self.shared_rows(gw, lm, x1)?;
+        self.card_rows(gw, lm, (&[], None))
+    }
+
+    /// Layer `l`'s shared expert over the `m` rows [`Routed::front_rows`]
+    /// wrote: the shared expert's rows (per column below [`GATED_FROM`] rows,
+    /// on `site::gated` from it) and `x1s = x1 + shared`, the base
+    /// [`Routed::card_rows`] adds the card sum to.
+    pub fn shared_rows(
         &mut self,
         (gpu, w): (&Gpu, &Weights),
         (l, m): (usize, usize),
@@ -971,8 +974,6 @@ impl<R: RouterEntry> Routed<R> {
         let Routed {
             layers,
             k,
-            route,
-            card,
             rules,
             shared_ff,
             block,
@@ -1007,15 +1008,54 @@ impl<R: RouterEntry> Routed<R> {
             )?;
         }
         gpu.elem()
-            .enqueue_add(gpu.stream(), x1, &b.sh, m * n, &mut b.x1s)?;
+            .enqueue_add(gpu.stream(), x1, &b.sh, m * n, &mut b.x1s)
+    }
+
+    /// Layer `l`'s card experts, where the slot map puts any, over the `m`
+    /// rows [`Routed::front_rows`] wrote: the card sum plus the base
+    /// [`Routed::shared_rows`] wrote, after the engine stream has waited each
+    /// landing batch's event of the layer's pick (`land`, the residency
+    /// machine's admits into the stage stacks, which the slot map's card
+    /// copy the route reads names already). One route over the whole map,
+    /// each slot's rows the step's under the same map. With the expert
+    /// stream's `ring` of the layer (a walk under `split`) the streamed
+    /// experts' slots run over the ring's half into the same card sum, one
+    /// GEMM batch a landing batch of the ring, each behind its own batch's
+    /// copies, so a batch computes while the next lands
+    /// ([`RouteBlock::card_rows_ring`]); the host's sum leaves them out.
+    pub fn card_rows(
+        &mut self,
+        (gpu, w): (&Gpu, &Weights),
+        (l, m): (usize, usize),
+        (land, ring): (&[LandBatch], Option<&RingLayer>),
+    ) -> Result<(), GpuError> {
+        let Routed {
+            route,
+            card,
+            rules,
+            batch,
+            k,
+            ..
+        } = self;
+        let b = batch.as_mut().ok_or_else(no_batch)?;
+        b.check(l, m)?;
+        for event in land.iter().filter_map(|lb| lb.event.as_deref()) {
+            gpu.stream().wait(event)?;
+        }
         let rule = rules.0;
-        route.card_rows(
-            (gpu, w),
-            (card, b.card.as_mut()),
-            (l, m),
-            (&b.x1s, rule),
-            (&b.normed, &b.weights, &b.ids),
-        )?;
+        let cb = b.card.as_mut();
+        let rows = (&b.normed, &b.weights, &b.ids);
+        match ring {
+            Some(r) => route.card_rows_ring(
+                (gpu, w, &k.g32),
+                (card, cb),
+                (l, m),
+                (&b.x1s, rule),
+                rows,
+                r,
+            )?,
+            None => route.card_rows((gpu, w), (card, cb), (l, m), (&b.x1s, rule), rows)?,
+        }
         if card.tier_k(l) == 0 {
             return Ok(());
         }
@@ -1024,19 +1064,14 @@ impl<R: RouterEntry> Routed<R> {
             what: WHAT,
             missing: "the tier places of a batch made with a tier",
         })?;
-        let (stream, slots) = (gpu.stream(), m * R::N_USED);
-        span_mut(WHAT, &mut tb.join_weights, 0, slots)?
-            .copy_from_device_async(&*span(WHAT, &b.weights, 0, slots)?, stream)?;
-        span_mut(WHAT, &mut tb.join_places, 0, slots)?
-            .copy_from_device_async(&*span(WHAT, &tb.places, 0, slots)?, stream)?;
-        Ok(())
+        tb.keep(gpu.stream(), m * R::N_USED, &b.weights)
     }
 
     /// Layer `l`'s join of a tier layer over the unit's `m` rows, once the host leg has landed the tier's rows `trows`
-    /// ([`bloomery_gpu::host::BatchLeg::join_tiered`], which hands them over, then uploads the host sums): every
-    /// token's slots in slot order from the stage card's downs or the tier's rows (`ds41_ffn_card_acc_8_tier`), then
-    /// the shadow's base added — the card sum plus the base of a one-card layer, which [`Routed::back_rows`] reads.
-    /// A layer the tier holds no expert of, and a load with no tier, are refused by name.
+    /// ([`bloomery_gpu::host::BatchLeg::join_tiered`], which hands them over, then uploads the host sums): the common
+    /// join ([`tier_join::enqueue_join`]) of every token's slots in slot order from the stage card's downs or the
+    /// tier's rows, then the shadow's base added — the card sum plus the base of a one-card layer, which
+    /// [`Routed::back_rows`] reads. A layer the tier holds no expert of, and a load with no tier, are refused by name.
     pub fn join_rows(
         &mut self,
         gpu: &Gpu,
@@ -1052,7 +1087,7 @@ impl<R: RouterEntry> Routed<R> {
             ));
         };
         let n_card = self.card.n_card(l);
-        let (n, stream) = (self.d.embd, gpu.stream());
+        let n = self.d.embd;
         let b = self.batch.as_mut().ok_or_else(no_batch)?;
         b.check(l, m)?;
         let (Some(tb), Some(cb)) = (b.tier.as_ref(), b.card.as_mut()) else {
@@ -1061,22 +1096,14 @@ impl<R: RouterEntry> Routed<R> {
                 missing: "the batch's tier places and card buffers",
             });
         };
-        let join = cb.join();
-        let acc = CardAccTier {
-            down: join.down,
-            trows,
-            w: &tb.join_weights,
-            sel: join.sel,
-            tsel: &tb.join_places,
-            n,
-            m,
-            n_card,
-            n_tier,
-            n_used: R::N_USED,
-        };
-        kernels.enqueue_card_acc_tier(stream, &acc, join.acc)?;
-        gpu.elem()
-            .enqueue_add(stream, join.acc, &b.x1s, m * n, join.pre)
+        let slots = tb.slots(n, (n_card, n_tier, R::N_USED));
+        tier_join::enqueue_join(
+            gpu,
+            (gpu.stream(), kernels),
+            (&mut cb.join(), &slots),
+            (trows, m),
+            &b.x1s,
+        )
     }
 
     /// `x = hsum +` the shadow's rows (the card sum plus `x1s`, or `x1s` on a

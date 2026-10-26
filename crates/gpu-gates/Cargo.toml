@@ -1,6 +1,6 @@
 [package]
 name = "bloomery-gpu-gates"
-version = "0.3.8"
+version = "0.3.9"
 edition = "2024"
 publish = false
 license = "MIT"
@@ -397,7 +397,7 @@ required-features = ["solar2"]
 
 [[bin]]
 name = "gate_minimaxm3_prefill"
-required-features = ["minimaxm3"]
+required-features = ["minimaxm3", "checkpoint"]
 
 [[bin]]
 name = "gate_solar2_twocard"
@@ -512,6 +512,26 @@ name = "gate_nemotron_h_moe_e2e"
 required-features = ["gpu"]
 
 [[bin]]
+name = "gate_nemotron_h_moe_card32"
+required-features = ["gpu"]
+
+[[bin]]
+name = "gate_musespark_e2e"
+required-features = ["gpu"]
+
+[[bin]]
+name = "gate_musespark_prefill"
+required-features = ["gpu"]
+
+[[bin]]
+name = "gate_musespark_load"
+required-features = ["gpu"]
+
+[[bin]]
+name = "gate_musespark_serve"
+required-features = ["deepseek41"]
+
+[[bin]]
 name = "gate_nemotron_serve"
 required-features = ["deepseek41"]
 
@@ -600,6 +620,18 @@ name = "gate_mimo2_flash"
 required-features = ["gpu"]
 
 [[bin]]
+name = "gate_flint_attn"
+required-features = ["gpu"]
+
+[[bin]]
+name = "gate_flint_router"
+required-features = ["gpu"]
+
+[[bin]]
+name = "gate_muse_router"
+required-features = ["gpu"]
+
+[[bin]]
 name = "gate_qwen3moe_flash"
 required-features = ["gpu"]
 
@@ -645,7 +677,7 @@ required-features = ["minimaxm3"]
 
 [[bin]]
 name = "gate_minimaxm3_e2e"
-required-features = ["minimaxm3"]
+required-features = ["minimaxm3", "checkpoint"]
 
 [[bin]]
 name = "gate_gemma_embedding2_e2e"
@@ -700,6 +732,14 @@ name = "gate_qwen35_dense"
 required-features = ["gpu"]
 
 [[bin]]
+name = "gate_llama_dense"
+required-features = ["gpu"]
+
+[[bin]]
+name = "gate_llama_serve"
+required-features = ["deepseek41"]
+
+[[bin]]
 name = "clef_hidden"
 required-features = ["gpu"]
 
@@ -713,6 +753,10 @@ required-features = ["gpu"]
 
 [[bin]]
 name = "gate_qwen38_twocard"
+required-features = ["gpu"]
+
+[[bin]]
+name = "gate_qwen3moe_twocard"
 required-features = ["gpu"]
 
 [[bin]]

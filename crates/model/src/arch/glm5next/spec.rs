@@ -104,6 +104,8 @@ pub fn spec_of(
                 top_k: spec_u32("expert_used_count", hp.n_used)?,
                 expert_ff: spec_u32("expert_feed_forward_length", hp.expert_ff)?,
                 latent: None,
+                pre_exp_norm: false,
+                post_exp_norm: None,
                 act: Act::SwiGlu {
                     limit: Some(hp.limit_exp[l]),
                 },
@@ -166,6 +168,7 @@ pub fn spec_of(
         }),
         engram: None,
         encoder: None,
+        logit_epilogue: None,
         chat,
     })
 }

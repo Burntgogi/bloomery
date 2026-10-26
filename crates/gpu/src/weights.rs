@@ -58,10 +58,11 @@ pub fn head_tensor(split: &Split) -> &'static str {
 /// travel as a file tensor.
 pub enum DevWeight {
     /// A file tensor as the file stores its rows (`CardFormat::KQuant`): a
-    /// Q3_K/Q4_K/Q5_K/Q6_K tensor, or a routed Q5_1, Q8_0, IQ2_XS, IQ3_XXS,
-    /// IQ4_XS, IQ4_NL or MXFP4 stack a program's plan
+    /// Q3_K/Q4_K/Q5_K/Q6_K tensor, or a routed Q5_1, Q8_0, IQ2_XS, IQ2_S, IQ1_S,
+    /// IQ1_M, IQ3_XXS, IQ4_XS, IQ4_NL or MXFP4 stack a program's plan
     /// puts on the card in the file's `block_q5_1`s, `block_q8_0`s,
-    /// `block_iq2_xs`es, `block_iq3_xxs`es, `block_iq4_xs`es, `block_iq4_nl`s or
+    /// `block_iq2_xs`es, `block_iq2_s`es, `block_iq1_s`es, `block_iq1_m`s,
+    /// `block_iq3_xxs`es, `block_iq4_xs`es, `block_iq4_nl`s or
     /// `block_mxfp4`s,
     /// which its `_sel` and GEMM entries read (`ty` says which). The raw row
     /// stream as little-endian u32 words, zero-padded at its end to a whole
@@ -908,6 +909,14 @@ impl Weights {
             name
         };
         self.by_name.get(name)
+    }
+
+    /// The resident set's own copy of the name `name` holds a weight under,
+    /// which a view of the weight (a [`crate::card_leg::LegStacks`]) keeps
+    /// for its refusals; `None` where [`Weights::get`] finds nothing by
+    /// exactly that name.
+    pub fn name_of(&self, name: &str) -> Option<&str> {
+        self.by_name.get_key_value(name).map(|(k, _)| k.as_str())
     }
 
     /// Move the weight `name` out of the resident set: the caller owns its
